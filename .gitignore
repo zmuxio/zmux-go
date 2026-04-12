@@ -16,6 +16,12 @@
 coverage.*
 *.coverprofile
 profile.cov
+/testjson.log
+/.gocache*/
+/.golangci-lint-cache*/
+/.root-test-json.log
+/.claude/
+/CLAUDE.md
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -28,5 +34,5 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
