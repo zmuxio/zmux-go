@@ -1,0 +1,13 @@
+// Package quicmux adapts quic-go connections into the repository-default zmux
+// Session / Stream interfaces without pulling QUIC dependencies into the main
+// zmux module.
+//
+// Mapping rules:
+//   - bidirectional and unidirectional stream open / accept map directly to
+//     QUIC streams
+//   - QUIC stream cancelation codes surface as zmux ApplicationError values
+//   - open-time zmux metadata is carried through a tiny per-stream prelude:
+//     varint(metadata_len) followed by metadata TLVs
+//   - post-open metadata updates are not representable on the QUIC wire and
+//     return ErrAdapterUnsupported joined with ErrPriorityUpdateUnavailable
+package quicmux

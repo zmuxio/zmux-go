@@ -1,0 +1,71 @@
+# quicmux
+
+`quicmux` adapts `quic-go` sessions / connections to the repository-default
+`zmux.Session` interface without adding any QUIC dependency to the main
+`zmux-go` module.
+
+## Usage
+
+```go
+import (
+	quic "github.com/quic-go/quic-go"
+	"github.com/zmuxio/zmux-go/adapter/quicmux"
+)
+
+var qconn *quic.Conn
+var session = quicmux.WrapSession(qconn)
+```
+
+`WrapSession` accepts the QUIC connection shape directly, so the result of
+`quic.DialAddr`, `Transport.Dial`, or `Listener.Accept` can be wrapped without
+any extra shim object.
+
+## Mapping
+
+- `AcceptStream` / `OpenStream` map to QUIC bidirectional streams directly.
+- `AcceptUniStream` / `OpenUniStream` map to QUIC unidirectional streams directly.
+- `CloseRead` maps to `CancelRead(CANCELLED)`.
+- `CloseWrite` maps to QUIC's send-side `Close`.
+- `Reset*` and `CancelWrite*` map to QUIC `CancelWrite`.
+- `Abort*` and `CloseWithError*` are best-effort local termination helpers that
+  cancel both readable and writable directions with the same application code.
+- QUIC stream / connection application errors are normalized to
+  `*zmux.ApplicationError`.
+- QUIC stream-limit errors are normalized to `zmux.ErrOpenLimited`.
+- QUIC idle / stateless-reset / version-negotiation / local no-error close
+  conditions are normalized to `zmux.ErrSessionClosed`.
+- `Closed()` reports whether the wrapped QUIC connection context has already
+  terminated.
+- `Accept*` / `Open*` treat `nil` contexts as `context.Background()`.
+
+## Metadata Support
+
+`quicmux` carries the zmux open-time metadata subset by prepending a tiny
+adapter header to each QUIC stream:
+
+- prelude format: `varint(metadata_len) + TLV...`
+- `OpenStreamWithOptions` and `OpenUniStreamWithOptions` support `OpenInfo`,
+  `InitialPriority`, and `InitialGroup`
+- `OpenInfo()` and `Metadata()` expose the decoded opener metadata on accepted
+  streams
+- `UpdateMetadata(...)` is supported only before the prelude has been emitted;
+  this lets callers set priority / group just before the stream first becomes
+  peer-visible on the QUIC wire
+
+Once the prelude has been emitted, later metadata updates are not representable
+on the QUIC wire. The adapter then returns
+`errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.
+
+## Partial Surfaces
+
+- `Stats()` only reports the coarse session `State`; queue / pressure /
+  keepalive counters remain zero.
+- stream error reasons are limited to the QUIC application code surface; QUIC
+  stream cancellation does not carry a free-form reason string.
+
+## Non-goals
+
+- Translating QUIC streams into full native zmux wire behavior. This adapter
+  only presents the repository-default `zmux` API over an existing QUIC mux.
+- Implementing post-open zmux advisory frames such as native
+  `PRIORITY_UPDATE`; the adapter only supports the open-time metadata subset.

@@ -1,0 +1,443 @@
+package quicmux
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"io"
+	"math/big"
+	"testing"
+	"time"
+
+	quic "github.com/quic-go/quic-go"
+	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/adaptertest"
+)
+
+func TestQUICSessionContract(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	serverTLS, clientTLS := testTLSConfigs(t)
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, nil)
+	if err != nil {
+		t.Fatalf("ListenAddr err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+
+	type acceptResult struct {
+		conn *quic.Conn
+		err  error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		conn, err := listener.Accept(ctx)
+		acceptCh <- acceptResult{conn: conn, err: err}
+	}()
+
+	clientConn, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, nil)
+	if err != nil {
+		t.Fatalf("DialAddr err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientConn.CloseWithError(0, "")
+	})
+
+	serverResult := <-acceptCh
+	if serverResult.err != nil {
+		t.Fatalf("Accept err = %v", serverResult.err)
+	}
+	t.Cleanup(func() {
+		_ = serverResult.conn.CloseWithError(0, "")
+	})
+
+	adaptertest.RunSessionContract(t, WrapSession(clientConn), WrapSession(serverResult.conn))
+}
+
+func TestWrapSessionCloseReadUsesCancelledCode(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	clientStream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if _, err := clientStream.Write([]byte("p")); err != nil {
+		t.Fatalf("initial Write err = %v", err)
+	}
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+
+	if err := accepted.stream.CloseRead(); err != nil {
+		t.Fatalf("CloseRead err = %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	_ = clientStream.SetWriteDeadline(deadline)
+	for time.Now().Before(deadline) {
+		_, err := clientStream.Write([]byte("x"))
+		if err == nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		var appErr *zmux.ApplicationError
+		if !errors.As(err, &appErr) {
+			t.Fatalf("Write err = %v, want ApplicationError(CodeCancelled)", err)
+		}
+		if appErr.Code != uint64(zmux.CodeCancelled) {
+			t.Fatalf("Write code = %d, want %d", appErr.Code, uint64(zmux.CodeCancelled))
+		}
+		return
+	}
+	t.Fatal("client write did not observe CANCELLED after peer CloseRead")
+}
+
+func TestWrapSessionUniCloseMatchesAvailableDirection(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type acceptResult struct {
+		stream zmux.RecvStream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptUniStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	send, err := client.OpenUniStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenUniStream err = %v", err)
+	}
+	payload := []byte("uni-close")
+	if _, err := send.Write(payload[:1]); err != nil {
+		t.Fatalf("initial Write err = %v", err)
+	}
+	recv := <-acceptCh
+	if recv.err != nil {
+		t.Fatalf("AcceptUniStream err = %v", recv.err)
+	}
+	if _, err := send.Write(payload[1:]); err != nil {
+		t.Fatalf("Write err = %v", err)
+	}
+	if err := send.Close(); err != nil {
+		t.Fatalf("send Close err = %v", err)
+	}
+
+	got, err := io.ReadAll(recv.stream)
+	if err != nil {
+		t.Fatalf("ReadAll err = %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("ReadAll = %q, want %q", got, payload)
+	}
+
+	if err := recv.stream.Close(); err != nil {
+		t.Fatalf("recv Close err = %v", err)
+	}
+}
+
+func TestWrapSessionOpenMetadataVisibleOnAccept(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	priority := uint64(7)
+	group := uint64(11)
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	stream, err := client.OpenStreamWithOptions(ctx, zmux.OpenOptions{
+		InitialPriority: &priority,
+		InitialGroup:    &group,
+		OpenInfo:        []byte("ssh"),
+	})
+	if err != nil {
+		t.Fatalf("OpenStreamWithOptions err = %v", err)
+	}
+
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+
+	meta := accepted.stream.Metadata()
+	if meta.Priority != priority {
+		t.Fatalf("accepted Priority = %d, want %d", meta.Priority, priority)
+	}
+	if meta.Group == nil || *meta.Group != group {
+		t.Fatalf("accepted Group = %v, want %d", meta.Group, group)
+	}
+	if got := string(meta.OpenInfo); got != "ssh" {
+		t.Fatalf("accepted OpenInfo = %q, want %q", got, "ssh")
+	}
+	if got := string(accepted.stream.OpenInfo()); got != "ssh" {
+		t.Fatalf("accepted OpenInfo() = %q, want %q", got, "ssh")
+	}
+
+	_ = accepted.stream.Close()
+	_ = stream.Close()
+}
+
+func TestWrapSessionUpdateMetadataBeforeVisibilityUsesPrelude(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	priority := uint64(5)
+	group := uint64(9)
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if err := stream.UpdateMetadata(zmux.MetadataUpdate{
+		Priority: &priority,
+		Group:    &group,
+	}); err != nil {
+		t.Fatalf("UpdateMetadata err = %v", err)
+	}
+
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+
+	meta := accepted.stream.Metadata()
+	if meta.Priority != priority {
+		t.Fatalf("accepted Priority = %d, want %d", meta.Priority, priority)
+	}
+	if meta.Group == nil || *meta.Group != group {
+		t.Fatalf("accepted Group = %v, want %d", meta.Group, group)
+	}
+	if meta.OpenInfo != nil {
+		t.Fatalf("accepted OpenInfo = %v, want nil", meta.OpenInfo)
+	}
+
+	_ = accepted.stream.Close()
+	_ = stream.Close()
+}
+
+func TestWrapSessionUpdateMetadataAfterVisibilityUnavailable(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if _, err := stream.Write([]byte("x")); err != nil {
+		t.Fatalf("Write err = %v", err)
+	}
+
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+
+	priority := uint64(13)
+	err = stream.UpdateMetadata(zmux.MetadataUpdate{Priority: &priority})
+	if !errors.Is(err, zmux.ErrPriorityUpdateUnavailable) {
+		t.Fatalf("UpdateMetadata err = %v, want %v", err, zmux.ErrPriorityUpdateUnavailable)
+	}
+	if !errors.Is(err, zmux.ErrAdapterUnsupported) {
+		t.Fatalf("UpdateMetadata err = %v, want %v", err, zmux.ErrAdapterUnsupported)
+	}
+
+	_ = accepted.stream.Close()
+	_ = stream.Close()
+}
+
+func TestWrapSessionUniOpenMetadataVisibleOnAccept(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	priority := uint64(3)
+	group := uint64(21)
+
+	type acceptResult struct {
+		stream zmux.RecvStream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptUniStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	stream, err := client.OpenUniStreamWithOptions(ctx, zmux.OpenOptions{
+		InitialPriority: &priority,
+		InitialGroup:    &group,
+		OpenInfo:        []byte("rpc"),
+	})
+	if err != nil {
+		t.Fatalf("OpenUniStreamWithOptions err = %v", err)
+	}
+
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptUniStream err = %v", accepted.err)
+	}
+
+	meta := accepted.stream.Metadata()
+	if meta.Priority != priority {
+		t.Fatalf("accepted Priority = %d, want %d", meta.Priority, priority)
+	}
+	if meta.Group == nil || *meta.Group != group {
+		t.Fatalf("accepted Group = %v, want %d", meta.Group, group)
+	}
+	if got := string(meta.OpenInfo); got != "rpc" {
+		t.Fatalf("accepted OpenInfo = %q, want %q", got, "rpc")
+	}
+
+	_ = accepted.stream.Close()
+	_ = stream.Close()
+}
+
+func newWrappedPair(t *testing.T) (zmux.Session, zmux.Session) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	serverTLS, clientTLS := testTLSConfigs(t)
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, nil)
+	if err != nil {
+		t.Fatalf("ListenAddr err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+
+	type acceptResult struct {
+		conn *quic.Conn
+		err  error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		conn, err := listener.Accept(ctx)
+		acceptCh <- acceptResult{conn: conn, err: err}
+	}()
+
+	clientConn, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, nil)
+	if err != nil {
+		t.Fatalf("DialAddr err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientConn.CloseWithError(0, "")
+	})
+
+	serverResult := <-acceptCh
+	if serverResult.err != nil {
+		t.Fatalf("Accept err = %v", serverResult.err)
+	}
+	t.Cleanup(func() {
+		_ = serverResult.conn.CloseWithError(0, "")
+	})
+
+	return WrapSession(clientConn), WrapSession(serverResult.conn)
+}
+
+func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
+	t.Helper()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("GenerateKey err = %v", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "localhost",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           nil,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate err = %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("X509KeyPair err = %v", err)
+	}
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"zmux-quicmux-test"},
+	}
+	clientTLS := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"zmux-quicmux-test"},
+	}
+	return serverTLS, clientTLS
+}
