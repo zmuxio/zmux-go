@@ -10,4 +10,6 @@
 //     varint(metadata_len) followed by metadata TLVs
 //   - post-open metadata updates are not representable on the QUIC wire and
 //     return ErrAdapterUnsupported joined with ErrPriorityUpdateUnavailable
+//   - stream-level reason strings are advisory-only in the zmux API and are
+//     not carried by QUIC stream cancellation; only the numeric code survives
 package quicmux

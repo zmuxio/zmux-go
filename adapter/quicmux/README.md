@@ -56,12 +56,26 @@ Once the prelude has been emitted, later metadata updates are not representable
 on the QUIC wire. The adapter then returns
 `errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.
 
-## Partial Surfaces
+## Unsupported Or Degraded Methods
 
-- `Stats()` only reports the coarse session `State`; queue / pressure /
-  keepalive counters remain zero.
-- stream error reasons are limited to the QUIC application code surface; QUIC
-  stream cancellation does not carry a free-form reason string.
+- `UpdateMetadata(...)` only works before the adapter prelude has been emitted.
+  After the stream becomes peer-visible, the adapter returns
+  `errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.
+- `ResetWithReason(code, reason)` cannot put `reason` on the QUIC stream wire.
+  QUIC stream cancellation carries only the numeric application code.
+- `AbortWithError(err)`, `AbortWithErrorCode(code, reason)`,
+  `CloseWithError(err)`, and `CloseWithErrorCode(code, reason)` on streams can
+  only propagate the numeric code on the wire. A free-form reason string is not
+  available on QUIC stream cancellation.
+- `Stats()` only reports the coarse session `State`. Queue, pressure,
+  keepalive, and similar repository-default counters stay zero because
+  `quic-go` does not expose matching per-session mux diagnostics.
+
+## Error Surface
+
+- connection-level QUIC application closes preserve both code and reason text
+  and are mapped to `*zmux.ApplicationError`
+- stream-level QUIC cancellations preserve only the numeric application code
 
 ## Non-goals
 
