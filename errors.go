@@ -19,6 +19,7 @@ var (
 	ErrOpenMetadataTooLarge      = wire.ErrOpenMetadataTooLarge
 	ErrOpenLimited               = errors.New("zmux: too many provisional local opens")
 	ErrOpenExpired               = errors.New("zmux: provisional local open expired before first-frame commit")
+	ErrAdapterUnsupported        = errors.New("zmux: feature not supported by adapter")
 	ErrPriorityUpdateUnavailable = errors.New("zmux: metadata update requires negotiated priority_update and matching semantic capability")
 	ErrPriorityUpdateTooLarge    = errors.New("zmux: priority update exceeds peer max_extension_payload_bytes")
 	ErrEmptyMetadataUpdate       = errors.New("zmux: metadata update has no fields")
@@ -480,7 +481,7 @@ func sessionErrorSourceLocked(c *Conn, err error) Source {
 	return sessionErrorSourceWithPeerClose(err, peerClose)
 }
 
-func (s *Stream) readSurfaceErrLocked(err error) error {
+func (s *nativeStream) readSurfaceErrLocked(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -502,7 +503,7 @@ func (s *Stream) readSurfaceErrLocked(err error) error {
 	return wrapStructuredError(err, meta)
 }
 
-func (s *Stream) writeSurfaceErrLocked(err error) error {
+func (s *nativeStream) writeSurfaceErrLocked(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -528,7 +529,7 @@ func (s *Stream) writeSurfaceErrLocked(err error) error {
 	return wrapStructuredError(err, meta)
 }
 
-func (s *Stream) closeSurfaceErr(err error) error {
+func (s *nativeStream) closeSurfaceErr(err error) error {
 	if err == nil {
 		return nil
 	}
@@ -555,7 +556,7 @@ func (s *Stream) closeSurfaceErr(err error) error {
 	return wrapStructuredError(err, meta)
 }
 
-func (s *Stream) closeOperationErr(err error) error {
+func (s *nativeStream) closeOperationErr(err error) error {
 	if err == nil {
 		return nil
 	}

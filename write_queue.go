@@ -37,7 +37,7 @@ type writeRequest struct {
 	// request while it waits to enter or leave the writer path.
 	queueReserved    bool
 	queuedBytes      uint64
-	reservedStream   *Stream
+	reservedStream   *nativeStream
 	urgentReserved   bool
 	advisoryReserved bool
 	// requestMetaReady guards cached stream/terminal classification derived
@@ -562,7 +562,7 @@ type frameLaneRequestOptions struct {
 	lane           writeLane
 	terminalPolicy terminalWritePolicy
 	origin         writeRequestOrigin
-	stream         *Stream
+	stream         *nativeStream
 }
 
 type streamWriteDispatchOptions struct {
@@ -918,7 +918,7 @@ type preparedReleaseSnapshot struct {
 	streamCredit  uint64
 }
 
-func (c *Conn) preparedRequestStreamLocked(req *writeRequest) *Stream {
+func (c *Conn) preparedRequestStreamLocked(req *writeRequest) *nativeStream {
 	if c == nil || req == nil {
 		return nil
 	}
@@ -935,7 +935,7 @@ func (c *Conn) preparedRequestStreamLocked(req *writeRequest) *Stream {
 	return c.registry.streams[streamID]
 }
 
-func (c *Conn) rollbackPreparedSendLocked(stream *Stream, req *writeRequest) {
+func (c *Conn) rollbackPreparedSendLocked(stream *nativeStream, req *writeRequest) {
 	if c == nil || stream == nil || req == nil {
 		return
 	}
@@ -957,7 +957,7 @@ func (c *Conn) rollbackPreparedSendLocked(stream *Stream, req *writeRequest) {
 	}
 }
 
-func (c *Conn) capturePreparedReleaseSnapshotLocked(stream *Stream) preparedReleaseSnapshot {
+func (c *Conn) capturePreparedReleaseSnapshotLocked(stream *nativeStream) preparedReleaseSnapshot {
 	snapshot := preparedReleaseSnapshot{
 		tracked:       c.trackedSessionMemoryLocked(),
 		sessionQueued: c.flow.queuedDataBytes,
@@ -970,7 +970,7 @@ func (c *Conn) capturePreparedReleaseSnapshotLocked(stream *Stream) preparedRele
 	return snapshot
 }
 
-func (c *Conn) releasePreparedWriteRequestLocked(req *writeRequest) (*Stream, rt.ReleaseWakePlan) {
+func (c *Conn) releasePreparedWriteRequestLocked(req *writeRequest) (*nativeStream, rt.ReleaseWakePlan) {
 	if c == nil || req == nil {
 		return nil, rt.ReleaseWakePlan{}
 	}
@@ -1039,7 +1039,7 @@ func (c *Conn) releaseRejectedPreparedRequests(rejected []rejectedWriteRequest) 
 	}
 
 	var (
-		streamWakes   []*Stream
+		streamWakes   []*nativeStream
 		needBroadcast bool
 		needControl   bool
 	)
@@ -1300,7 +1300,7 @@ func (c *Conn) preflightAdvisoryWriteRequestLocked(req *writeRequest) advisoryWr
 	return advisoryWritePreflight{memoryErr: c.reserveAdvisoryQueueLocked(req)}
 }
 
-func (c *Conn) preflightStreamWriteRequestLocked(stream *Stream, req *writeRequest, opts streamWriteDispatchOptions) streamWritePreflight {
+func (c *Conn) preflightStreamWriteRequestLocked(stream *nativeStream, req *writeRequest, opts streamWriteDispatchOptions) streamWritePreflight {
 	preflight := streamWritePreflight{}
 	refresh := c.refreshQueuedWriteRequestLocked(stream, req, opts)
 	preflight.deadline = refresh.deadline
@@ -1329,7 +1329,7 @@ func (c *Conn) queueRequestDoneErr(err error) error {
 	return queueVisibleSessionErr(c, err)
 }
 
-func (s *Stream) releasePreparedWriteRequestForFailure(req *writeRequest) {
+func (s *nativeStream) releasePreparedWriteRequestForFailure(req *writeRequest) {
 	if s == nil || s.conn == nil || req == nil {
 		return
 	}
@@ -1338,7 +1338,7 @@ func (s *Stream) releasePreparedWriteRequestForFailure(req *writeRequest) {
 	req.clearRetainedRefs()
 }
 
-func (s *Stream) rollbackPreparedWriteRequest(req *writeRequest, err error) error {
+func (s *nativeStream) rollbackPreparedWriteRequest(req *writeRequest, err error) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1346,7 +1346,7 @@ func (s *Stream) rollbackPreparedWriteRequest(req *writeRequest, err error) erro
 	return err
 }
 
-func (s *Stream) closePreparedWriteRequestForMemory(req *writeRequest, memoryErr error) error {
+func (s *nativeStream) closePreparedWriteRequestForMemory(req *writeRequest, memoryErr error) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1355,7 +1355,7 @@ func (s *Stream) closePreparedWriteRequestForMemory(req *writeRequest, memoryErr
 	return queueVisibleSessionErr(s.conn, s.conn.err())
 }
 
-func (s *Stream) refreshQueuedWriteCompletion() (notifyCh <-chan struct{}, deadline time.Time, cerr error) {
+func (s *nativeStream) refreshQueuedWriteCompletion() (notifyCh <-chan struct{}, deadline time.Time, cerr error) {
 	if s == nil || s.conn == nil {
 		return nil, time.Time{}, ErrSessionClosed
 	}
@@ -1368,7 +1368,7 @@ func (s *Stream) refreshQueuedWriteCompletion() (notifyCh <-chan struct{}, deadl
 	return
 }
 
-func (s *Stream) enqueueWriteRequestUntilDeadline(req *writeRequest, opts streamWriteDispatchOptions) error {
+func (s *nativeStream) enqueueWriteRequestUntilDeadline(req *writeRequest, opts streamWriteDispatchOptions) error {
 	if s == nil || s.conn == nil || req == nil {
 		return ErrSessionClosed
 	}
@@ -1396,7 +1396,7 @@ func (s *Stream) enqueueWriteRequestUntilDeadline(req *writeRequest, opts stream
 	}
 }
 
-func (s *Stream) waitQueuedWriteCompletion(req *writeRequest) error {
+func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) error {
 	completion := queuedWriteCompletionRefresh{}
 	notifyCh, deadline, cerr := s.refreshQueuedWriteCompletion()
 	completion.notifyCh = notifyCh
@@ -1443,7 +1443,7 @@ func (s *Stream) waitQueuedWriteCompletion(req *writeRequest) error {
 	}
 }
 
-func (c *Conn) streamWriteDeadlineLocked(stream *Stream, opts streamWriteDispatchOptions) time.Time {
+func (c *Conn) streamWriteDeadlineLocked(stream *nativeStream, opts streamWriteDispatchOptions) time.Time {
 	if !opts.deadlinePolicy.usesStreamDeadline() {
 		return opts.deadlineOverride
 	}
@@ -1457,7 +1457,7 @@ func (c *Conn) streamWriteDeadlineLocked(stream *Stream, opts streamWriteDispatc
 	return opts.deadlineOverride
 }
 
-func (c *Conn) refreshQueuedWriteCompletionLocked(stream *Stream) queuedWriteCompletionRefresh {
+func (c *Conn) refreshQueuedWriteCompletionLocked(stream *nativeStream) queuedWriteCompletionRefresh {
 	refresh := queuedWriteCompletionRefresh{
 		deadline: c.streamWriteDeadlineLocked(stream, streamWriteDispatchOptions{}),
 	}
@@ -1470,7 +1470,7 @@ func (c *Conn) refreshQueuedWriteCompletionLocked(stream *Stream) queuedWriteCom
 	return refresh
 }
 
-func (c *Conn) refreshQueuedWriteRequestLocked(stream *Stream, req *writeRequest, opts streamWriteDispatchOptions) queuedWriteRequestRefresh {
+func (c *Conn) refreshQueuedWriteRequestLocked(stream *nativeStream, req *writeRequest, opts streamWriteDispatchOptions) queuedWriteRequestRefresh {
 	refresh := queuedWriteRequestRefresh{
 		deadline: c.streamWriteDeadlineLocked(stream, opts),
 	}
@@ -1482,7 +1482,7 @@ func (c *Conn) refreshQueuedWriteRequestLocked(stream *Stream, req *writeRequest
 	return refresh
 }
 
-func (s *Stream) sendQueuedWriteRequestUntilDeadline(req *writeRequest, lane chan writeRequest, notifyCh <-chan struct{}, deadline time.Time, opts streamWriteDispatchOptions) error {
+func (s *nativeStream) sendQueuedWriteRequestUntilDeadline(req *writeRequest, lane chan writeRequest, notifyCh <-chan struct{}, deadline time.Time, opts streamWriteDispatchOptions) error {
 	if s == nil || s.conn == nil || req == nil {
 		return ErrSessionClosed
 	}
@@ -1734,7 +1734,7 @@ func ensureRequestQueuedBytes(req *writeRequest) uint64 {
 	return req.queuedBytes
 }
 
-func (c *Conn) writeQueueBlockedLocked(stream *Stream, reqBytes uint64, trackedAdditional uint64) bool {
+func (c *Conn) writeQueueBlockedLocked(stream *nativeStream, reqBytes uint64, trackedAdditional uint64) bool {
 	if c == nil || stream == nil || reqBytes == 0 {
 		return false
 	}
@@ -1748,7 +1748,7 @@ func (c *Conn) writeQueueBlockedLocked(stream *Stream, reqBytes uint64, trackedA
 	)
 }
 
-func (c *Conn) reserveWriteQueueLocked(stream *Stream, req *writeRequest, lane writeLane) queueReservationResult {
+func (c *Conn) reserveWriteQueueLocked(stream *nativeStream, req *writeRequest, lane writeLane) queueReservationResult {
 	if c == nil || stream == nil || req == nil || lane.isUrgent() || !req.origin.isStreamGenerated() || req.queueReserved {
 		return queueReservationResult{}
 	}
@@ -1997,10 +1997,10 @@ func (c *Conn) releaseBatchReservations(batch []writeRequest) {
 
 	plan := rt.PlanLaneReleaseWake(prevTracked, c.trackedSessionMemoryLocked(), c.sessionMemoryHighThresholdLocked(), urgentReleased)
 	plan.Broadcast = plan.Broadcast || rt.CrossedLowWatermark(prevSession, c.flow.queuedDataBytes, c.sessionDataLWMLocked())
-	var streamWakes []*Stream
+	var streamWakes []*nativeStream
 	if !plan.Broadcast {
 		lowWatermark := c.perStreamDataLWMLocked()
-		streamPrev.Range(func(stream *Stream, prev uint64) {
+		streamPrev.Range(func(stream *nativeStream, prev uint64) {
 			if rt.CrossedLowWatermark(prev, stream.queuedDataBytes, lowWatermark) {
 				streamWakes = append(streamWakes, stream)
 			}
@@ -2040,7 +2040,7 @@ func (c *Conn) broadcastWriteWakeLocked() {
 }
 
 func (c *Conn) clearWriteQueueReservationsLocked() {
-	c.forEachKnownStreamLocked(func(stream *Stream) {
+	c.forEachKnownStreamLocked(func(stream *nativeStream) {
 		c.clearQueuedDataStreamStateLocked(stream)
 	})
 	c.flow.queuedDataBytes = 0
@@ -2050,17 +2050,17 @@ func (c *Conn) clearWriteQueueReservationsLocked() {
 	c.flow.queuedDataStreams = nil
 }
 
-func (c *Conn) trackQueuedDataStreamLocked(stream *Stream) {
+func (c *Conn) trackQueuedDataStreamLocked(stream *nativeStream) {
 	if c == nil || stream == nil || stream.queuedDataBytes == 0 {
 		return
 	}
 	if c.flow.queuedDataStreams == nil {
-		c.flow.queuedDataStreams = make(map[*Stream]struct{})
+		c.flow.queuedDataStreams = make(map[*nativeStream]struct{})
 	}
 	c.flow.queuedDataStreams[stream] = struct{}{}
 }
 
-func (c *Conn) untrackQueuedDataStreamLocked(stream *Stream) {
+func (c *Conn) untrackQueuedDataStreamLocked(stream *nativeStream) {
 	if c == nil || stream == nil || c.flow.queuedDataStreams == nil {
 		return
 	}
@@ -2078,7 +2078,7 @@ func (p queuedDataWakePolicy) shouldWake() bool {
 	return p == queuedDataWakeOnRelease
 }
 
-func (c *Conn) releaseQueuedDataStreamStateLocked(stream *Stream, wake queuedDataWakePolicy) {
+func (c *Conn) releaseQueuedDataStreamStateLocked(stream *nativeStream, wake queuedDataWakePolicy) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -2105,7 +2105,7 @@ func (c *Conn) releaseQueuedDataStreamStateLocked(stream *Stream, wake queuedDat
 	}
 }
 
-func (c *Conn) clearQueuedDataStreamStateLocked(stream *Stream) {
+func (c *Conn) clearQueuedDataStreamStateLocked(stream *nativeStream) {
 	if c == nil || stream == nil {
 		return
 	}

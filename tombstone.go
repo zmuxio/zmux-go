@@ -124,7 +124,7 @@ func (c *Conn) markUsedStreamLocked(streamID uint64, marker usedStreamMarker) {
 	c.registry.usedStreamData[streamID] = marker
 }
 
-func tombstoneStateForStream(stream *Stream) state.StreamTombstone {
+func tombstoneStateForStream(stream *nativeStream) state.StreamTombstone {
 	return stream.tombstoneStateLocked()
 }
 
@@ -157,7 +157,7 @@ func (c *Conn) enforceTerminalBookkeepingMemoryCapLocked() {
 	}
 }
 
-func (c *Conn) maybeCompactTerminalLocked(stream *Stream) {
+func (c *Conn) maybeCompactTerminalLocked(stream *nativeStream) {
 	if stream == nil {
 		return
 	}

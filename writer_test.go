@@ -48,7 +48,7 @@ func TestCollectWriteBatchDrainsReadyFrames(t *testing.T) {
 func TestCollectWriteBatchInterleavesStreamsByDefault(t *testing.T) {
 	t.Parallel()
 	c := &Conn{
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, registry: connRegistryState{streams: map[uint64]*Stream{
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true},
 		}},
@@ -84,7 +84,7 @@ func TestCollectWriteBatchKeepsSameStreamBurstOrder(t *testing.T) {
 	t.Parallel()
 
 	c := &Conn{
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, registry: connRegistryState{streams: map[uint64]*Stream{
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 		}},
 	}
@@ -122,7 +122,7 @@ func TestCollectWriteBatchRotatesFlatBatchHeadAcrossBatches(t *testing.T) {
 	t.Parallel()
 
 	c := &Conn{
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, registry: connRegistryState{streams: map[uint64]*Stream{
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true},
 		}},
@@ -164,7 +164,7 @@ func TestCollectWriteBatchPrefersLowerCostPeerWithinSingleExplicitGroup(t *testi
 				MaxFramePayload: 16384,
 				SchedulerHints:  SchedulerGroupFair,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true, group: 7, groupExplicit: true},
 			8: {id: 8, idSet: true, group: 7, groupExplicit: true},
 		}},
@@ -199,7 +199,7 @@ func TestCollectWriteBatchPrefersLowerCostGroupAcrossExplicitGroups(t *testing.T
 				MaxFramePayload: 16384,
 				SchedulerHints:  SchedulerGroupFair,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true, group: 7, groupExplicit: true},
 			8: {id: 8, idSet: true, group: 9, groupExplicit: true},
 		}},
@@ -233,7 +233,7 @@ func TestCollectWriteBatchPrefersHigherPriorityShortFlow(t *testing.T) {
 			Settings: Settings{
 				MaxFramePayload: 16384,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true, priority: 20},
 		}},
@@ -268,7 +268,7 @@ func TestCollectWriteBatchBulkThroughputRetainsPriorityUnderWFQ(t *testing.T) {
 				MaxFramePayload: 16384,
 				SchedulerHints:  SchedulerBulkThroughput,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true, priority: 20},
 		}},
@@ -302,7 +302,7 @@ func TestCollectWriteBatchRetainsHigherPriorityHeadAcrossBatches(t *testing.T) {
 			Settings: Settings{
 				MaxFramePayload: 16384,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true, priority: 20},
 		}},
@@ -344,7 +344,7 @@ func TestCollectWriteBatchSessionScopedOrdinaryDoesNotConsumeRetainedWFQHead(t *
 			Settings: Settings{
 				MaxFramePayload: 16384,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true, priority: 20},
 		}},
@@ -494,7 +494,7 @@ func TestCollectWriteBatchSessionScopedControlDoesNotPolluteRetainedSchedulerSta
 	t.Parallel()
 
 	c := &Conn{
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, registry: connRegistryState{streams: map[uint64]*Stream{
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 		}},
 	}
@@ -654,7 +654,7 @@ func TestCollectWriteBatchMixedSessionScopedOrdinaryAndRealStreamOnlyAdvancesRea
 			Settings: Settings{
 				MaxFramePayload: 16384,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true, priority: 20},
 		}},
 	}
@@ -684,7 +684,7 @@ func TestCollectWriteBatchInterleavesExplicitGroupsWhenGroupFair(t *testing.T) {
 	c := &Conn{
 		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)},
 
-		config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4:  {id: 4, idSet: true, group: 7, groupExplicit: true},
 			8:  {id: 8, idSet: true, group: 7, groupExplicit: true},
 			12: {id: 12, idSet: true, group: 9, groupExplicit: true},
@@ -729,7 +729,7 @@ func TestCollectWriteBatchKeepsPerGroupHeadAsBoundedNextBatchBias(t *testing.T) 
 	c := &Conn{
 		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)},
 
-		config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4:  {id: 4, idSet: true, group: 7, groupExplicit: true},
 			8:  {id: 8, idSet: true, group: 7, groupExplicit: true},
 			12: {id: 12, idSet: true, group: 9, groupExplicit: true},
@@ -776,7 +776,7 @@ func TestCollectWriteBatchInterleavesStreamsWithinSingleExplicitGroup(t *testing
 	c := &Conn{
 		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)},
 
-		config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true, group: 7, groupExplicit: true},
 			8: {id: 8, idSet: true, group: 7, groupExplicit: true},
 		}},
@@ -813,7 +813,7 @@ func TestCollectWriteBatchCapsExplicitGroupCardinality(t *testing.T) {
 	c := &Conn{
 		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 32)},
 
-		config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 
 	newReq := func(streamID uint64, tag byte) writeRequest {
@@ -886,7 +886,7 @@ func TestCollectWriteBatchOrdersPriorityUpdateAheadOfSameStreamData(t *testing.T
 			Settings: Settings{
 				SchedulerHints: SchedulerBalancedFair,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true},
 		}},
@@ -941,7 +941,7 @@ func TestCollectWriteBatchMergesAdvisoryAndDataLanes(t *testing.T) {
 			Settings: Settings{
 				SchedulerHints: SchedulerBalancedFair,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true},
 		}},
@@ -1009,7 +1009,7 @@ func TestCollectWriteBatchDoesNotStarveOrdinaryLaneWhenAdvisoryFlooded(t *testin
 				MaxExtensionPayloadBytes: 4096,
 				SchedulerHints:           SchedulerBalancedFair,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true},
 		}},
@@ -1077,7 +1077,7 @@ func TestCollectWriteBatchGivesOneCrossStreamAdvisoryHeadOpportunity(t *testing.
 				MaxExtensionPayloadBytes: 4096,
 				SchedulerHints:           SchedulerBalancedFair,
 			},
-		}}, registry: connRegistryState{streams: map[uint64]*Stream{
+		}}, registry: connRegistryState{streams: map[uint64]*nativeStream{
 			4: {id: 4, idSet: true},
 			8: {id: 8, idSet: true},
 		}},
@@ -1436,7 +1436,7 @@ func newWriteLoopControlTestConn(conn *captureWriteCloser) *Conn {
 			aggregateLateDataCap: aggregateLateDataCapFor(settings.MaxFramePayload),
 		}, config: connConfigState{local: Preface{Settings: settings},
 			peer:       Preface{Settings: settings},
-			negotiated: Negotiated{Proto: ProtoVersion, LocalRole: RoleInitiator, PeerRole: RoleResponder}}, flow: connFlowState{sendSessionMax: settings.InitialMaxData}, registry: connRegistryState{streams: make(map[uint64]*Stream),
+			negotiated: Negotiated{Proto: ProtoVersion, LocalRole: RoleInitiator, PeerRole: RoleResponder}}, flow: connFlowState{sendSessionMax: settings.InitialMaxData}, registry: connRegistryState{streams: make(map[uint64]*nativeStream),
 
 			nextLocalBidi: state.FirstLocalStreamID(RoleInitiator, true),
 			nextLocalUni:  state.FirstLocalStreamID(RoleInitiator, false),
@@ -3849,7 +3849,7 @@ func TestPrepareOwnedWriteRequestReclassifiesReusedRequest(t *testing.T) {
 	}
 }
 
-func configurePendingPriorityUpdateForTest(t *testing.T, c *Conn, s *Stream, priority uint64) []byte {
+func configurePendingPriorityUpdateForTest(t *testing.T, c *Conn, s *nativeStream, priority uint64) []byte {
 	t.Helper()
 
 	caps := CapabilityPriorityUpdate | CapabilityPriorityHints
@@ -3868,7 +3868,7 @@ func configurePendingPriorityUpdateForTest(t *testing.T, c *Conn, s *Stream, pri
 	return payload
 }
 
-func newBlockedWriterConnWithStreams(t *testing.T) (*Conn, *Stream, *Stream, *stallingWriteCloser) {
+func newBlockedWriterConnWithStreams(t *testing.T) (*Conn, *nativeStream, *nativeStream, *stallingWriteCloser) {
 	t.Helper()
 
 	writer := newStallingWriteCloser()
@@ -3878,10 +3878,10 @@ func newBlockedWriterConnWithStreams(t *testing.T) (*Conn, *Stream, *Stream, *st
 		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, flow: connFlowState{sendSessionMax: 1024}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, flow: connFlowState{sendSessionMax: 1024}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 
-	newStream := func(id uint64) *Stream {
+	newStream := func(id uint64) *nativeStream {
 		return testVisibleBidiStream(c, id, testWithSendMax(1024))
 	}
 
@@ -3901,7 +3901,7 @@ func newBlockedWriterConnWithStreams(t *testing.T) (*Conn, *Stream, *Stream, *st
 	return c, first, second, writer
 }
 
-func startBlockedFirstWrite(t *testing.T, first *Stream, writer *stallingWriteCloser) <-chan error {
+func startBlockedFirstWrite(t *testing.T, first *nativeStream, writer *stallingWriteCloser) <-chan error {
 	t.Helper()
 
 	firstErrCh := make(chan error, 1)
@@ -4896,16 +4896,16 @@ func newUrgentBackpressureConn() *Conn {
 		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
 		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 1), urgentWriteCh: make(chan writeRequest, 1)},
 		config: connConfigState{local: Preface{Settings: settings},
-			peer: Preface{Settings: settings}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+			peer: Preface{Settings: settings}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 }
 
-func newQueueBackpressureTestStream() *Stream {
+func newQueueBackpressureTestStream() *nativeStream {
 	c := &Conn{
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 1), urgentWriteCh: make(chan writeRequest, 1)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16384}}}, flow: connFlowState{sendSessionMax: 1 << 20}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 1), urgentWriteCh: make(chan writeRequest, 1)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16384}}}, flow: connFlowState{sendSessionMax: 1 << 20}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	return testVisibleBidiStream(c, 4, testWithSendMax(1<<20))
 }
@@ -5759,7 +5759,7 @@ func TestClearWriteQueueReservationsLockedUsesTrackedSet(t *testing.T) {
 	stream.inflightQueued = 5
 	other.queuedDataBytes = 0
 	other.inflightQueued = 7
-	stream.conn.flow.queuedDataStreams = map[*Stream]struct{}{
+	stream.conn.flow.queuedDataStreams = map[*nativeStream]struct{}{
 		stream: {},
 	}
 	stream.conn.clearWriteQueueReservationsLocked()
@@ -5801,7 +5801,7 @@ func TestClearWriteQueueReservationsLockedRebuildsTrackedSetFromSeededStreams(t 
 	provisional.queuedDataBytes = 7
 	provisional.inflightQueued = 6
 	stream.conn.flow.queuedDataBytes = 18
-	stream.conn.queues.provisionalBidi.items = []*Stream{provisional}
+	stream.conn.queues.provisionalBidi.items = []*nativeStream{provisional}
 	stream.conn.clearWriteQueueReservationsLocked()
 	stream.conn.mu.Unlock()
 

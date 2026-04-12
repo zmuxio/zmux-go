@@ -30,7 +30,7 @@ type connPendingControlState struct {
 
 const minPendingControlBudget = 64 << 10
 
-type pendingStreamControlVisitFn func(stream *Stream, value uint64) (remove bool, stop bool)
+type pendingStreamControlVisitFn func(stream *nativeStream, value uint64) (remove bool, stop bool)
 
 func storePendingControlPayload(existing, payload []byte) []byte {
 	return storeRetainedBytes(existing, payload, retainedBytesBorrowed)
@@ -201,7 +201,7 @@ func (v pendingStreamControlValue) bytes(streamID uint64) uint64 {
 	return pendingStreamControlBytes(streamID, v.value)
 }
 
-func shouldFlushPendingStreamControlLocked(kind streamControlKind, stream *Stream) (flush bool, keep bool) {
+func shouldFlushPendingStreamControlLocked(kind streamControlKind, stream *nativeStream) (flush bool, keep bool) {
 	if stream == nil {
 		return false, false
 	}
@@ -302,7 +302,7 @@ func (c *Conn) clearPendingGoAwayLocked() {
 	c.sessionControl.hasPendingGoAway = false
 }
 
-func (c *Conn) pendingTargetStreamLocked(streamID uint64) *Stream {
+func (c *Conn) pendingTargetStreamLocked(streamID uint64) *nativeStream {
 	if c == nil || c.registry.streams == nil {
 		return nil
 	}
@@ -350,7 +350,7 @@ func (p *connPendingControlState) streamQueueCount(kind pendingStreamQueueKind) 
 	return queueState.count
 }
 
-func findQueuedStreamByID(q indexedStreamQueue, streamID uint64) *Stream {
+func findQueuedStreamByID(q indexedStreamQueue, streamID uint64) *nativeStream {
 	if !q.ready() || streamID == 0 {
 		return nil
 	}
@@ -364,8 +364,8 @@ func findQueuedStreamByID(q indexedStreamQueue, streamID uint64) *Stream {
 }
 
 type pendingStreamQueueSpec struct {
-	getIndex func(*Stream) int32
-	setIndex func(*Stream, int32)
+	getIndex func(*nativeStream) int32
+	setIndex func(*nativeStream, int32)
 }
 
 var pendingStreamQueueSpecs = [...]pendingStreamQueueSpec{
@@ -399,12 +399,12 @@ func (c *Conn) ensurePendingStreamQueueLocked(kind pendingStreamQueueKind) {
 	if !queue.ready() {
 		return
 	}
-	ensureIndexedStreamQueueFromStreams(queue, c.registry.streams, func(stream *Stream) bool {
+	ensureIndexedStreamQueueFromStreams(queue, c.registry.streams, func(stream *nativeStream) bool {
 		return stream.inPendingQueueLocked(kind)
 	})
 }
 
-func (c *Conn) pendingQueuedTargetStreamLocked(kind pendingStreamQueueKind, streamID uint64) *Stream {
+func (c *Conn) pendingQueuedTargetStreamLocked(kind pendingStreamQueueKind, streamID uint64) *nativeStream {
 	if c == nil || streamID == 0 {
 		return nil
 	}
@@ -584,7 +584,7 @@ func (c *Conn) visitPendingStreamControlTxFramesLocked(kind streamControlKind, s
 	if frameType == 0 {
 		return false
 	}
-	return c.visitPendingStreamControlLocked(kind, func(stream *Stream, value uint64) (bool, bool) {
+	return c.visitPendingStreamControlLocked(kind, func(stream *nativeStream, value uint64) (bool, bool) {
 		if *stop {
 			return false, true
 		}
@@ -599,11 +599,11 @@ func (c *Conn) releasePendingStreamControlLocked(kind streamControlKind) {
 	if c == nil {
 		return
 	}
-	c.forEachKnownStreamLocked(func(stream *Stream) {
+	c.forEachKnownStreamLocked(func(stream *nativeStream) {
 		stream.clearPendingControlValueLocked(kind)
 	})
 	queue := c.pendingStreamControlQueueLocked(kind)
-	queue.clear(func(stream *Stream) {
+	queue.clear(func(stream *nativeStream) {
 		stream.setPendingQueueIndex(pendingStreamQueueKindForControl(kind), invalidStreamQueueIndex)
 	})
 	queue.state.items = nil
@@ -666,7 +666,7 @@ func (c *Conn) ensurePendingPriorityUpdateQueueLocked() {
 	c.ensurePendingStreamQueueLocked(pendingStreamQueuePriority)
 }
 
-func (c *Conn) pendingPriorityTargetStreamLocked(streamID uint64) *Stream {
+func (c *Conn) pendingPriorityTargetStreamLocked(streamID uint64) *nativeStream {
 	return c.pendingQueuedTargetStreamLocked(pendingStreamQueuePriority, streamID)
 }
 
@@ -698,12 +698,12 @@ func (c *Conn) clearPendingPriorityUpdateStateLocked() {
 	if c == nil {
 		return
 	}
-	c.forEachKnownStreamLocked(func(stream *Stream) {
+	c.forEachKnownStreamLocked(func(stream *nativeStream) {
 		stream.clearPendingPriorityUpdateLocked()
 		stream.setPendingQueueIndex(pendingStreamQueuePriority, invalidStreamQueueIndex)
 	})
 	queue := c.pendingPriorityQueueLocked()
-	queue.clear(func(stream *Stream) {
+	queue.clear(func(stream *nativeStream) {
 		stream.setPendingQueueIndex(pendingStreamQueuePriority, invalidStreamQueueIndex)
 	})
 	queue.state.items = nil
@@ -739,7 +739,7 @@ func (c *Conn) clearPendingNonCloseControlStateLocked() {
 	c.clearSessionBlockedStateLocked()
 }
 
-func (c *Conn) queueResolvedStreamControlAsync(kind streamControlKind, stream *Stream, v uint64, drop func()) {
+func (c *Conn) queueResolvedStreamControlAsync(kind streamControlKind, stream *nativeStream, v uint64, drop func()) {
 	if c == nil {
 		return
 	}
@@ -781,7 +781,7 @@ func (c *Conn) queueStreamMaxDataAsync(streamID, v uint64) {
 	})
 }
 
-func (c *Conn) queueStreamBlockedAsync(stream *Stream, v uint64) {
+func (c *Conn) queueStreamBlockedAsync(stream *nativeStream, v uint64) {
 	if stream == nil {
 		return
 	}
@@ -1213,7 +1213,7 @@ func (c *Conn) handleDroppedPriorityUpdateFrame() error {
 	return nil
 }
 
-func (c *Conn) finishPriorityUpdateLocked(stream *Stream, meta streamMetadata, oldGroup uint64, oldExplicit bool, now time.Time) error {
+func (c *Conn) finishPriorityUpdateLocked(stream *nativeStream, meta streamMetadata, oldGroup uint64, oldExplicit bool, now time.Time) error {
 	if !c.applyReceivedMetadataLocked(stream, meta, receivedMetadataOnUpdate) {
 		return c.recordNoOpPriorityUpdateLocked(now)
 	}
@@ -1296,7 +1296,7 @@ func buildPendingPriorityUpdateFrame(streamID uint64, payload []byte) txFrame {
 	return frame
 }
 
-func (c *Conn) resolvePendingPriorityTargetLocked(streamID uint64, requireIdentified bool) (target *Stream, flush bool, keep bool, release sessionMemoryRelease) {
+func (c *Conn) resolvePendingPriorityTargetLocked(streamID uint64, requireIdentified bool) (target *nativeStream, flush bool, keep bool, release sessionMemoryRelease) {
 	if c == nil || c.registry.streams == nil || streamID == 0 {
 		return nil, false, false, sessionMemoryUnchanged
 	}

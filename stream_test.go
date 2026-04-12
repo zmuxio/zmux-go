@@ -118,8 +118,8 @@ func TestJoinedConnHalfAccessors(t *testing.T) {
 	writeStream := c.newLocalStreamWithIDLocked(state.FirstLocalStreamID(c.config.negotiated.LocalRole, false), streamArityUni, OpenOptions{}, nil)
 	c.registry.streams[readStream.id] = readStream
 	c.registry.streams[writeStream.id] = writeStream
-	readHalf := &RecvStream{stream: readStream}
-	writeHalf := &SendStream{stream: writeStream}
+	readHalf := &nativeRecvStream{stream: readStream}
+	writeHalf := &nativeSendStream{stream: writeStream}
 	c.mu.Unlock()
 
 	conn := JoinConn(readHalf, writeHalf)
@@ -146,10 +146,10 @@ func TestJoinedConnPauseHandlesCanSwapAndDetachHalves(t *testing.T) {
 	c.registry.streams[readBStream.id] = readBStream
 	c.registry.streams[writeAStream.id] = writeAStream
 	c.registry.streams[writeBStream.id] = writeBStream
-	readA := &RecvStream{stream: readAStream}
-	readB := &RecvStream{stream: readBStream}
-	writeA := &SendStream{stream: writeAStream}
-	writeB := &SendStream{stream: writeBStream}
+	readA := &nativeRecvStream{stream: readAStream}
+	readB := &nativeRecvStream{stream: readBStream}
+	writeA := &nativeSendStream{stream: writeAStream}
+	writeB := &nativeSendStream{stream: writeBStream}
 	c.mu.Unlock()
 
 	conn := JoinConn(readA, writeA)
@@ -300,7 +300,7 @@ func TestJoinedConnNilReadHalf(t *testing.T) {
 	c.mu.Lock()
 	writeStream := c.newLocalStreamWithIDLocked(state.FirstLocalStreamID(c.config.negotiated.LocalRole, false), streamArityUni, OpenOptions{}, nil)
 	c.registry.streams[writeStream.id] = writeStream
-	writeHalf := &SendStream{stream: writeStream}
+	writeHalf := &nativeSendStream{stream: writeStream}
 	c.mu.Unlock()
 
 	conn := JoinConn(nil, writeHalf)
@@ -324,7 +324,7 @@ func TestJoinedConnNilWriteHalf(t *testing.T) {
 	c.mu.Lock()
 	readStream := c.newPeerStreamLocked(state.FirstPeerStreamID(c.config.negotiated.LocalRole, false))
 	c.registry.streams[readStream.id] = readStream
-	readHalf := &RecvStream{stream: readStream}
+	readHalf := &nativeRecvStream{stream: readStream}
 	c.mu.Unlock()
 
 	conn := JoinConn(readHalf, nil)
@@ -409,7 +409,7 @@ func TestJoinedConnCloseClosesPresentHalves(t *testing.T) {
 		t.Fatalf("Close err = %v, want nil", err)
 	}
 
-	awaitStreamWriteState(t, clientSend.stream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, clientSend.stream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.localReadStop || s.sendStop != nil || s.sendAbort != nil || s.sendReset != nil || s.sendFinReached()
 	}, "timed out waiting for sender to observe JoinedConn CloseRead")
 
@@ -476,7 +476,7 @@ func TestJoinedConnCloseWriteProducesEOFOnPeerRead(t *testing.T) {
 		t.Fatalf("client OpenUniStream: %v", err)
 	}
 	type acceptResult struct {
-		stream *RecvStream
+		stream *nativeRecvStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -1288,7 +1288,7 @@ func TestStreamNetConnReadWriteAndClose(t *testing.T) {
 	defer cancel()
 
 	type acceptResult struct {
-		stream *Stream
+		stream *nativeStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -1337,7 +1337,7 @@ func TestStreamNetConnDeadlineViaInterface(t *testing.T) {
 	defer cancel()
 
 	type acceptResult struct {
-		stream *Stream
+		stream *nativeStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -1450,7 +1450,7 @@ func TestSendStreamImplementsWriterAtRuntime(t *testing.T) {
 	c.mu.Lock()
 	stream := c.newLocalStreamWithIDLocked(state.FirstLocalStreamID(c.config.negotiated.LocalRole, false), streamArityUni, OpenOptions{}, nil)
 	c.registry.streams[stream.id] = stream
-	send := &SendStream{stream: stream}
+	send := &nativeSendStream{stream: stream}
 	c.mu.Unlock()
 
 	var v any = send
@@ -1472,7 +1472,7 @@ func TestRecvStreamImplementsReaderAtRuntime(t *testing.T) {
 	c.mu.Lock()
 	stream := c.newPeerStreamLocked(state.FirstPeerStreamID(c.config.negotiated.LocalRole, false))
 	c.registry.streams[stream.id] = stream
-	recv := &RecvStream{stream: stream}
+	recv := &nativeRecvStream{stream: stream}
 	c.mu.Unlock()
 
 	var v any = recv
@@ -1493,7 +1493,7 @@ func TestUniStreamsReadWriteViaIOInterfaces(t *testing.T) {
 	defer cancel()
 
 	type acceptResult struct {
-		stream *RecvStream
+		stream *nativeRecvStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -1537,7 +1537,7 @@ func TestUniStreamsReadWriteViaIOInterfaces(t *testing.T) {
 func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	t.Parallel()
 
-	var s Stream
+	var s Stream = (*nativeStream)(nil)
 
 	if got := s.Metadata(); got.Priority != 0 || got.Group != nil || got.OpenInfo != nil {
 		t.Fatalf("Metadata() = %#v, want zero-value fields", got)
@@ -1688,7 +1688,7 @@ func TestStreamGettersConcurrentWithCommit(t *testing.T) {
 	defer cancel()
 
 	type acceptResult struct {
-		stream *Stream
+		stream *nativeStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -2508,7 +2508,7 @@ func TestCloseReadStopsPeerWritesButPreservesReverseRead(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	acceptErrCh := make(chan error, 1)
 	go func() {
 		accepted, err := server.AcceptStream(ctx)
@@ -2527,7 +2527,7 @@ func TestCloseReadStopsPeerWritesButPreservesReverseRead(t *testing.T) {
 		t.Fatalf("initial write: %v", err)
 	}
 
-	var serverStream *Stream
+	var serverStream *nativeStream
 	select {
 	case err := <-acceptErrCh:
 		t.Fatalf("accept failed: %v", err)
@@ -2551,7 +2551,7 @@ func TestCloseReadStopsPeerWritesButPreservesReverseRead(t *testing.T) {
 		t.Fatalf("server reverse write after CloseRead: %v", err)
 	}
 
-	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.localReadStop || s.sendStop != nil || s.sendAbort != nil || s.sendFinReached() || s.sendReset != nil
 	}, "timed out waiting for peer CloseRead visibility")
 
@@ -2575,7 +2575,7 @@ func TestCancelReadAlias(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		accepted, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -2617,7 +2617,7 @@ func TestCancelWriteAlias(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		accepted, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -2658,7 +2658,7 @@ func TestCloseReadDoesNotBlockExplicitCloseWrite(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	acceptErrCh := make(chan error, 1)
 	go func() {
 		accepted, err := server.AcceptStream(ctx)
@@ -2677,7 +2677,7 @@ func TestCloseReadDoesNotBlockExplicitCloseWrite(t *testing.T) {
 		t.Fatalf("initial write: %v", err)
 	}
 
-	var serverStream *Stream
+	var serverStream *nativeStream
 	select {
 	case err := <-acceptErrCh:
 		t.Fatalf("accept failed: %v", err)
@@ -2693,7 +2693,7 @@ func TestCloseReadDoesNotBlockExplicitCloseWrite(t *testing.T) {
 		t.Fatalf("server CloseRead: %v", err)
 	}
 
-	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.localReadStop || s.sendStop != nil || s.sendAbort != nil || s.sendFinReached() || s.sendReset != nil
 	}, "timed out waiting for peer CloseRead visibility")
 
@@ -2777,7 +2777,7 @@ func TestPeerFinDoesNotOverrideLocalReadStopError(t *testing.T) {
 func TestSessionMaxDataIncreaseBroadcastsConnWriteWake(t *testing.T) {
 	c := &Conn{
 
-		lifecycle: connLifecycleState{closedCh: make(chan struct{})}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	streamA := testLocalSendStream(c, 4)
 	streamB := testLocalSendStream(c, 8)
@@ -3066,7 +3066,7 @@ func TestNewStreamsDeferNotifyChannelAllocation(t *testing.T) {
 	peer := client.newPeerStreamLocked(client.registry.nextPeerBidi)
 	client.mu.Unlock()
 
-	for _, stream := range []*Stream{local, peer} {
+	for _, stream := range []*nativeStream{local, peer} {
 		if stream.readNotify != nil {
 			t.Fatal("new stream should defer read notify channel allocation")
 		}
@@ -3270,7 +3270,7 @@ func TestStreamReadDeadlineExpires(t *testing.T) {
 		t.Fatalf("open stream: %v", err)
 	}
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	errCh := make(chan error, 1)
 	go func() {
 		accepted, err := server.AcceptStream(ctx)
@@ -3285,7 +3285,7 @@ func TestStreamReadDeadlineExpires(t *testing.T) {
 		t.Fatalf("write opener: %v", err)
 	}
 
-	var peer *Stream
+	var peer *nativeStream
 	select {
 	case err := <-errCh:
 		t.Fatalf("accept failed: %v", err)
@@ -3337,7 +3337,7 @@ func TestStreamWriteDeadlineExpiresOnFlowControlWait(t *testing.T) {
 		acceptDone <- nil
 	}()
 
-	if err := stream.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+	if err := stream.SetWriteDeadline(time.Now().Add(testSignalTimeout)); err != nil {
 		t.Fatalf("SetWriteDeadline: %v", err)
 	}
 
@@ -3367,7 +3367,7 @@ func TestSetReadDeadlineWakesBlockedRead(t *testing.T) {
 		t.Fatalf("open stream: %v", err)
 	}
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	acceptErrCh := make(chan error, 1)
 	go func() {
 		accepted, err := server.AcceptStream(ctx)
@@ -3382,7 +3382,7 @@ func TestSetReadDeadlineWakesBlockedRead(t *testing.T) {
 		t.Fatalf("write opener: %v", err)
 	}
 
-	var peer *Stream
+	var peer *nativeStream
 	select {
 	case err := <-acceptErrCh:
 		t.Fatalf("accept failed: %v", err)
@@ -3458,7 +3458,7 @@ func TestStreamWriteDeadlineExpiresWhileWriterIsBlocked(t *testing.T) {
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, flow: connFlowState{sendSessionMax: 1024}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, flow: connFlowState{sendSessionMax: 1024}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	stream := testVisibleBidiStream(c, 4, testWithSendMax(1024))
 
@@ -3499,7 +3499,7 @@ func TestSetWriteDeadlineWakesBlockedQueuedWrite(t *testing.T) {
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, flow: connFlowState{sendSessionMax: 1024}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, flow: connFlowState{sendSessionMax: 1024}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	stream := testVisibleBidiStream(c, 4, testWithSendMax(1024))
 
@@ -3540,7 +3540,7 @@ func TestCloseSessionFailsBlockedQueuedWrite(t *testing.T) {
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, flow: connFlowState{sendSessionMax: 1024}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, flow: connFlowState{sendSessionMax: 1024}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	stream := testVisibleBidiStream(c, 4, testWithSendMax(1024))
 
@@ -4159,7 +4159,7 @@ func TestSendStreamResetWriteWithCodeAliasesReset(t *testing.T) {
 	})
 	testMarkLocalOpenVisible(stream)
 
-	send := &SendStream{stream: stream}
+	send := &nativeSendStream{stream: stream}
 	if err := send.ResetWriteWithCode(77); err != nil {
 		t.Fatalf("ResetWriteWithCode err = %v", err)
 	}
@@ -4212,7 +4212,7 @@ func TestRecvStreamAbortWithErrorCodeAliasesWholeStreamAbort(t *testing.T) {
 		RecvHalf: "recv_open",
 	})
 
-	recv := &RecvStream{stream: stream}
+	recv := &nativeRecvStream{stream: stream}
 	if err := recv.AbortWithErrorCode(55, "bye"); err != nil {
 		t.Fatalf("AbortWithErrorCode err = %v", err)
 	}
@@ -4434,7 +4434,7 @@ func newMetadataBenchConn() *Conn {
 		},
 		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})}, config: connConfigState{local: Preface{Settings: settings},
 			peer:       Preface{Settings: settings},
-			negotiated: Negotiated{Capabilities: CapabilityOpenMetadata | CapabilityPriorityUpdate | CapabilityPriorityHints | CapabilityStreamGroups, LocalRole: RoleInitiator, PeerRole: RoleResponder}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+			negotiated: Negotiated{Capabilities: CapabilityOpenMetadata | CapabilityPriorityUpdate | CapabilityPriorityHints | CapabilityStreamGroups, LocalRole: RoleInitiator, PeerRole: RoleResponder}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	conn.bootstrapRuntimeQueuesLocked()
 	return conn
@@ -4508,14 +4508,14 @@ func TestTransportWrongSideStopSendingOnLocalRecvOnlyUniAbortsStreamState(t *tes
 	assertSessionStillOpen(t, server)
 }
 
-func openServerToClientUniPair(t *testing.T) (*Conn, *Conn, *RecvStream, *SendStream) {
+func openServerToClientUniPair(t *testing.T) (*Conn, *Conn, *nativeRecvStream, *nativeSendStream) {
 	t.Helper()
 
 	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
 	t.Cleanup(cancel)
 
-	acceptCh := make(chan *RecvStream, 1)
+	acceptCh := make(chan *nativeRecvStream, 1)
 	acceptErrCh := make(chan error, 1)
 	go func() {
 		stream, err := client.AcceptUniStream(ctx)
@@ -4547,14 +4547,14 @@ func openServerToClientUniPair(t *testing.T) (*Conn, *Conn, *RecvStream, *SendSt
 	return nil, nil, nil, nil
 }
 
-func openClientToServerUniPair(t *testing.T) (*Conn, *Conn, *SendStream, *RecvStream) {
+func openClientToServerUniPair(t *testing.T) (*Conn, *Conn, *nativeSendStream, *nativeRecvStream) {
 	t.Helper()
 
 	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
 	t.Cleanup(cancel)
 
-	acceptCh := make(chan *RecvStream, 1)
+	acceptCh := make(chan *nativeRecvStream, 1)
 	acceptErrCh := make(chan error, 1)
 	go func() {
 		stream, err := server.AcceptUniStream(ctx)
@@ -4591,8 +4591,8 @@ func waitForAbortCode(t *testing.T, conn *Conn, stream any, want ErrorCode) {
 
 	deadline := time.Now().Add(testSignalTimeout)
 	switch s := stream.(type) {
-	case *RecvStream:
-		awaitStreamReadState(t, s.stream, time.Until(deadline), func(stream *Stream) bool {
+	case *nativeRecvStream:
+		awaitStreamReadState(t, s.stream, time.Until(deadline), func(stream *nativeStream) bool {
 			return stream.recvAbort != nil
 		}, "timed out waiting for expected recv abort")
 
@@ -4605,8 +4605,8 @@ func waitForAbortCode(t *testing.T, conn *Conn, stream any, want ErrorCode) {
 		if recvAbort.Code != uint64(want) {
 			t.Fatalf("recv abort code = %d, want %d", recvAbort.Code, uint64(want))
 		}
-	case *SendStream:
-		awaitStreamWriteState(t, s.stream, time.Until(deadline), func(stream *Stream) bool {
+	case *nativeSendStream:
+		awaitStreamWriteState(t, s.stream, time.Until(deadline), func(stream *nativeStream) bool {
 			return stream.sendAbort != nil
 		}, "timed out waiting for expected send abort")
 
@@ -4653,7 +4653,7 @@ func TestStructuredErrorAfterLocalCloseRead(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -4700,7 +4700,7 @@ func TestStructuredErrorAfterPeerReset(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -4835,7 +4835,7 @@ func TestStructuredErrorAfterLocalCloseWrite(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -5131,12 +5131,12 @@ func TestStructuredErrorAfterWriteOpenMetadataTooLarge(t *testing.T) {
 
 		pending: connPendingControlState{controlNotify: make(chan struct{}, 1)}, config: connConfigState{peer: Preface{Settings: Settings{
 			MaxFramePayload: 4,
-		}}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		}}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	s := testOpenedBidiStream(
 		c,
 		state.FirstLocalStreamID(c.config.negotiated.LocalRole, true),
-		func(stream *Stream) {
+		func(stream *nativeStream) {
 			stream.openMetadataPrefix = []byte("oversized")
 		},
 	)
@@ -5160,7 +5160,7 @@ func TestStructuredErrorAfterLocalAbortRead(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -5212,7 +5212,7 @@ func TestStructuredErrorAfterPeerAbortWrite(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -5240,7 +5240,7 @@ func TestStructuredErrorAfterPeerAbortWrite(t *testing.T) {
 		t.Fatalf("server abort: %v", err)
 	}
 
-	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.sendAbort != nil || s.recvAbort != nil
 	}, "timed out waiting for peer abort to be observed before Write")
 
@@ -5292,7 +5292,7 @@ func TestStructuredErrorAfterPeerFinCloseRead(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -5341,7 +5341,7 @@ func TestStructuredErrorAfterRepeatedLocalCloseWrite(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -5388,7 +5388,7 @@ func TestStructuredErrorAfterPeerAbortCloseWrite(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
 		if err != nil {
@@ -5416,7 +5416,7 @@ func TestStructuredErrorAfterPeerAbortCloseWrite(t *testing.T) {
 		t.Fatalf("server abort: %v", err)
 	}
 
-	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.sendAbort != nil || s.recvAbort != nil
 	}, "timed out waiting for peer abort to be observed before CloseWrite")
 

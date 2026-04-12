@@ -51,7 +51,7 @@ const (
 	streamRuntimeAllPending  = streamRuntimeSendPending | streamRuntimeRecvFlow
 )
 
-func (s *Stream) localSendActionErrLocked(action state.LocalSendAction) error {
+func (s *nativeStream) localSendActionErrLocked(action state.LocalSendAction) error {
 	switch action {
 	case state.LocalSendActionNotWritable:
 		return ErrStreamNotWritable
@@ -64,7 +64,7 @@ func (s *Stream) localSendActionErrLocked(action state.LocalSendAction) error {
 	}
 }
 
-func (s *Stream) localRecvActionErrLocked(action state.LocalRecvAction) error {
+func (s *nativeStream) localRecvActionErrLocked(action state.LocalRecvAction) error {
 	switch action {
 	case state.LocalRecvActionNotReadable:
 		return ErrStreamNotReadable
@@ -77,7 +77,7 @@ func (s *Stream) localRecvActionErrLocked(action state.LocalRecvAction) error {
 	}
 }
 
-func (s *Stream) readErrLocked() error {
+func (s *nativeStream) readErrLocked() error {
 	if s == nil {
 		return nil
 	}
@@ -103,7 +103,7 @@ func (s *Stream) readErrLocked() error {
 	}
 }
 
-func (s *Stream) readClosedTerminationLocked() (Source, TerminationKind) {
+func (s *nativeStream) readClosedTerminationLocked() (Source, TerminationKind) {
 	if s == nil {
 		return SourceLocal, TerminationStopped
 	}
@@ -140,7 +140,7 @@ func (m streamTerminationMeta) ready() bool {
 	return m.present
 }
 
-func (s *Stream) readTerminationMetaLocked() streamTerminationMeta {
+func (s *nativeStream) readTerminationMetaLocked() streamTerminationMeta {
 	if s == nil {
 		return streamTerminationMeta{}
 	}
@@ -160,7 +160,7 @@ func (s *Stream) readTerminationMetaLocked() streamTerminationMeta {
 	}
 }
 
-func (s *Stream) writeTerminationMetaLocked(err error) streamTerminationMeta {
+func (s *nativeStream) writeTerminationMetaLocked(err error) streamTerminationMeta {
 	if s == nil || err == nil {
 		return streamTerminationMeta{}
 	}
@@ -171,7 +171,7 @@ func (s *Stream) writeTerminationMetaLocked(err error) streamTerminationMeta {
 	return s.abortOrResetTerminationLocked(err)
 }
 
-func (s *Stream) closeTerminationMetaLocked(err error) streamTerminationMeta {
+func (s *nativeStream) closeTerminationMetaLocked(err error) streamTerminationMeta {
 	if s == nil || err == nil {
 		return streamTerminationMeta{}
 	}
@@ -187,7 +187,7 @@ func (s *Stream) closeTerminationMetaLocked(err error) streamTerminationMeta {
 	}
 }
 
-func (s *Stream) writeClosedTerminationLocked() (Source, TerminationKind) {
+func (s *nativeStream) writeClosedTerminationLocked() (Source, TerminationKind) {
 	if s == nil {
 		return SourceLocal, TerminationStopped
 	}
@@ -214,7 +214,7 @@ func (p writeAdmissionPolicy) allowsStopSeenFinal() bool {
 	return p == writeAdmissionTerminalChunk
 }
 
-func (s *Stream) writeAdmissionRawLocked(policy writeAdmissionPolicy) (state.SendHalfState, error) {
+func (s *nativeStream) writeAdmissionRawLocked(policy writeAdmissionPolicy) (state.SendHalfState, error) {
 	if s == nil {
 		return state.SendHalfAbsent, nil
 	}
@@ -233,7 +233,7 @@ func (s *Stream) writeAdmissionRawLocked(policy writeAdmissionPolicy) (state.Sen
 	return sendHalf, nil
 }
 
-func (s *Stream) writeAdmissionStateLocked(policy writeAdmissionPolicy) (state.SendHalfState, error) {
+func (s *nativeStream) writeAdmissionStateLocked(policy writeAdmissionPolicy) (state.SendHalfState, error) {
 	sendHalf, err := s.writeAdmissionRawLocked(policy)
 	if err != nil {
 		return sendHalf, s.writeSurfaceErrLocked(err)
@@ -241,7 +241,7 @@ func (s *Stream) writeAdmissionStateLocked(policy writeAdmissionPolicy) (state.S
 	return sendHalf, nil
 }
 
-func (s *Stream) metadataUpdateErrLocked() error {
+func (s *nativeStream) metadataUpdateErrLocked() error {
 	if s == nil {
 		return ErrSessionClosed
 	}
@@ -268,7 +268,7 @@ func (a peerDataArrival) hasFIN() bool {
 	return a == peerDataArrivalFinal
 }
 
-func (s *Stream) peerDataPlanLocked(arrival peerDataArrival) state.PeerDataPlan {
+func (s *nativeStream) peerDataPlanLocked(arrival peerDataArrival) state.PeerDataPlan {
 	if s == nil {
 		return state.PeerDataPlan{Outcome: state.PeerDataIgnore}
 	}
@@ -287,7 +287,7 @@ func (s *Stream) peerDataPlanLocked(arrival peerDataArrival) state.PeerDataPlan 
 	)
 }
 
-func (s *Stream) shouldReclaimUnseenLocalLocked(peerGoAwayBidi, peerGoAwayUni uint64) bool {
+func (s *nativeStream) shouldReclaimUnseenLocalLocked(peerGoAwayBidi, peerGoAwayUni uint64) bool {
 	if s == nil {
 		return false
 	}
@@ -304,7 +304,7 @@ func (s *Stream) shouldReclaimUnseenLocalLocked(peerGoAwayBidi, peerGoAwayUni ui
 	)
 }
 
-func (s *Stream) shouldFinalizePeerActiveLocked() bool {
+func (s *nativeStream) shouldFinalizePeerActiveLocked() bool {
 	if s == nil {
 		return false
 	}
@@ -318,7 +318,7 @@ func (s *Stream) shouldFinalizePeerActiveLocked() bool {
 	)
 }
 
-func (s *Stream) recvAbortiveLocked() bool {
+func (s *nativeStream) recvAbortiveLocked() bool {
 	switch s.effectiveRecvHalfStateLocked() {
 	case state.RecvHalfReset, state.RecvHalfAborted:
 		return true
@@ -327,22 +327,22 @@ func (s *Stream) recvAbortiveLocked() bool {
 	}
 }
 
-func (s *Stream) stopSeenLocked() bool {
+func (s *nativeStream) stopSeenLocked() bool {
 	return s != nil && s.effectiveSendHalfStateLocked() == state.SendHalfStopSeen
 }
 
-func (s *Stream) stopSeenWriteFinalBurstEligibleLocked(totalRemaining, currentRemaining int) bool {
+func (s *nativeStream) stopSeenWriteFinalBurstEligibleLocked(totalRemaining, currentRemaining int) bool {
 	return s.stopSeenLocked() && totalRemaining == currentRemaining
 }
 
-func (s *Stream) stopSeenWriteFinalNeedsImmediateCompletionLocked(totalRemaining, frameCap, availableSession, availableStream uint64) bool {
+func (s *nativeStream) stopSeenWriteFinalNeedsImmediateCompletionLocked(totalRemaining, frameCap, availableSession, availableStream uint64) bool {
 	if !s.stopSeenLocked() {
 		return false
 	}
 	return frameCap < totalRemaining || availableSession < totalRemaining || availableStream < totalRemaining
 }
 
-func (s *Stream) allowsTerminalWriteRequestLocked(req *writeRequest) bool {
+func (s *nativeStream) allowsTerminalWriteRequestLocked(req *writeRequest) bool {
 	if s == nil {
 		return true
 	}
@@ -353,14 +353,14 @@ func (s *Stream) allowsTerminalWriteRequestLocked(req *writeRequest) bool {
 	return req != nil && req.allowsTerminalSendHalf(sendHalf, s.id)
 }
 
-func (s *Stream) allowsQueuedGracefulFinDrainLocked(req *writeRequest) bool {
+func (s *nativeStream) allowsQueuedGracefulFinDrainLocked(req *writeRequest) bool {
 	if s == nil {
 		return false
 	}
 	return req != nil && req.allowsQueuedGracefulFinDrainForStream(s.id)
 }
 
-func (s *Stream) allowsCloseWriteNoOpAfterStopResetLocked() bool {
+func (s *nativeStream) allowsCloseWriteNoOpAfterStopResetLocked() bool {
 	if s == nil {
 		return false
 	}
@@ -377,7 +377,7 @@ func (s *Stream) allowsCloseWriteNoOpAfterStopResetLocked() bool {
 	return s.sendStop != nil
 }
 
-func (s *Stream) suppressWriteRequestErrLocked(req *writeRequest) error {
+func (s *nativeStream) suppressWriteRequestErrLocked(req *writeRequest) error {
 	if s == nil || !s.localSend {
 		return nil
 	}
@@ -397,7 +397,7 @@ func (s *Stream) suppressWriteRequestErrLocked(req *writeRequest) error {
 	return s.terminalErrLocked()
 }
 
-func (s *Stream) ignoreLateNonOpeningControlLocked() bool {
+func (s *nativeStream) ignoreLateNonOpeningControlLocked() bool {
 	if s == nil {
 		return false
 	}
@@ -409,7 +409,7 @@ func (s *Stream) ignoreLateNonOpeningControlLocked() bool {
 	)
 }
 
-func (s *Stream) abortOrResetTerminationLocked(err error) streamTerminationMeta {
+func (s *nativeStream) abortOrResetTerminationLocked(err error) streamTerminationMeta {
 	switch {
 	case s.sendAbortErrLocked() != nil && errors.Is(err, s.sendAbortErrLocked()):
 		if s.sendAbortFromPeerLocked() {
@@ -430,7 +430,7 @@ func (s *Stream) abortOrResetTerminationLocked(err error) streamTerminationMeta 
 	}
 }
 
-func (s *Stream) clearOpeningBarrierLocked() {
+func (s *nativeStream) clearOpeningBarrierLocked() {
 	if s == nil {
 		return
 	}
@@ -439,40 +439,40 @@ func (s *Stream) clearOpeningBarrierLocked() {
 	}
 }
 
-func (s *Stream) isLocalOpenedLocked() bool {
+func (s *nativeStream) isLocalOpenedLocked() bool {
 	return s != nil && s.visibilityPhaseLocked().IsLocal()
 }
 
-func (s *Stream) isSendCommittedLocked() bool {
+func (s *nativeStream) isSendCommittedLocked() bool {
 	return s != nil && s.localOpen.committed
 }
 
-func (s *Stream) isPeerVisibleLocked() bool {
+func (s *nativeStream) isPeerVisibleLocked() bool {
 	return s != nil && s.visibilityPhaseLocked() == state.LocalOpenPhasePeerVisible
 }
 
-func (s *Stream) markSendCommittedLocked() {
+func (s *nativeStream) markSendCommittedLocked() {
 	if s == nil {
 		return
 	}
 	s.localOpen.committed = true
 }
 
-func (s *Stream) markOpenerQueuedLocked() {
+func (s *nativeStream) markOpenerQueuedLocked() {
 	if s == nil || s.localOpen.phase == state.LocalOpenPhasePeerVisible {
 		return
 	}
 	s.localOpen.phase = state.LocalOpenPhaseQueued
 }
 
-func (s *Stream) setPeerVisibleLocked() {
+func (s *nativeStream) setPeerVisibleLocked() {
 	if s == nil {
 		return
 	}
 	s.localOpen.phase = state.LocalOpenPhasePeerVisible
 }
 
-func (s *Stream) localOpenVisibilityLocked() state.LocalOpenVisibility {
+func (s *nativeStream) localOpenVisibilityLocked() state.LocalOpenVisibility {
 	if s == nil {
 		return state.LocalOpenVisibility{}
 	}
@@ -484,35 +484,35 @@ func (s *Stream) localOpenVisibilityLocked() state.LocalOpenVisibility {
 	}
 }
 
-func (s *Stream) visibilityPhaseLocked() state.LocalOpenPhase {
+func (s *nativeStream) visibilityPhaseLocked() state.LocalOpenPhase {
 	return s.localOpenVisibilityLocked().Phase()
 }
 
-func (s *Stream) needsLocalOpenerLocked() bool {
+func (s *nativeStream) needsLocalOpenerLocked() bool {
 	return s.visibilityPhaseLocked().NeedsLocalOpener()
 }
 
-func (s *Stream) awaitingPeerVisibilityLocked() bool {
+func (s *nativeStream) awaitingPeerVisibilityLocked() bool {
 	return s.visibilityPhaseLocked().AwaitingPeerVisibility()
 }
 
-func (s *Stream) shouldEmitOpenerFrameLocked() bool {
+func (s *nativeStream) shouldEmitOpenerFrameLocked() bool {
 	return s.visibilityPhaseLocked().ShouldEmitOpenerFrame()
 }
 
-func (s *Stream) shouldMarkPeerVisibleLocked() bool {
+func (s *nativeStream) shouldMarkPeerVisibleLocked() bool {
 	return s.visibilityPhaseLocked().ShouldMarkPeerVisible()
 }
 
-func (s *Stream) shouldQueueStreamBlockedLocked(availableStream uint64) bool {
+func (s *nativeStream) shouldQueueStreamBlockedLocked(availableStream uint64) bool {
 	return s.visibilityPhaseLocked().ShouldQueueStreamBlocked(availableStream)
 }
 
-func (s *Stream) readStopSentLocked() bool {
+func (s *nativeStream) readStopSentLocked() bool {
 	return (s != nil && s.localReadStop) || state.ReadStopped(s.effectiveRecvHalfStateLocked())
 }
 
-func (s *Stream) sendResetMatchesCodeLocked(code uint64) bool {
+func (s *nativeStream) sendResetMatchesCodeLocked(code uint64) bool {
 	resetCode := s.sendResetCodeLocked()
 	return s != nil &&
 		s.effectiveSendHalfStateLocked() == state.SendHalfReset &&
@@ -538,7 +538,7 @@ func (t terminalTrackingState) stillTracked() bool {
 	return t == terminalTrackingRetained
 }
 
-func (s *Stream) shouldCompactTerminalLocked(tracking terminalTrackingState) bool {
+func (s *nativeStream) shouldCompactTerminalLocked(tracking terminalTrackingState) bool {
 	if s == nil {
 		return false
 	}
@@ -554,14 +554,14 @@ func (s *Stream) shouldCompactTerminalLocked(tracking terminalTrackingState) boo
 	)
 }
 
-func (s *Stream) tombstoneLateDataActionLocked() lateDataAction {
+func (s *nativeStream) tombstoneLateDataActionLocked() lateDataAction {
 	if s == nil {
 		return lateDataIgnore
 	}
 	return state.TombstoneLateDataAction(s.localReceive, s.effectiveRecvHalfStateLocked())
 }
 
-func (s *Stream) tombstoneStateLocked() state.StreamTombstone {
+func (s *nativeStream) tombstoneStateLocked() state.StreamTombstone {
 	if s == nil {
 		return state.StreamTombstone{DataAction: lateDataIgnore}
 	}
@@ -576,7 +576,7 @@ func (s *Stream) tombstoneStateLocked() state.StreamTombstone {
 	)
 }
 
-func (s *Stream) lateDataCauseLocked() lateDataCause {
+func (s *nativeStream) lateDataCauseLocked() lateDataCause {
 	if s == nil {
 		return lateDataCauseNone
 	}
@@ -592,7 +592,7 @@ func (s *Stream) lateDataCauseLocked() lateDataCause {
 	}
 }
 
-func (s *Stream) terminalErrLocked() error {
+func (s *nativeStream) terminalErrLocked() error {
 	switch state.TerminalErrorPriority(s.effectiveSendHalfStateLocked(), s.effectiveRecvHalfStateLocked()) {
 	case state.TerminalErrorSendAbort:
 		return s.sendAbortErrLocked()
@@ -611,7 +611,7 @@ func (s *Stream) terminalErrLocked() error {
 	}
 }
 
-func (c *Conn) releaseStreamRetainedStateLocked(stream *Stream) {
+func (c *Conn) releaseStreamRetainedStateLocked(stream *nativeStream) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -637,7 +637,7 @@ type transientStreamReleaseOptions struct {
 	receive    streamReceiveReleaseMode
 }
 
-func (c *Conn) releaseTerminalStreamStateLocked(stream *Stream, opts transientStreamReleaseOptions) {
+func (c *Conn) releaseTerminalStreamStateLocked(stream *nativeStream, opts transientStreamReleaseOptions) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -654,7 +654,7 @@ func (c *Conn) releaseTerminalStreamStateLocked(stream *Stream, opts transientSt
 	c.releaseStreamRetainedStateLocked(stream)
 }
 
-func (c *Conn) finalizeTerminalStreamLocked(stream *Stream, releaseOpts transientStreamReleaseOptions, notifyMask streamNotifyMask, finalizePeer bool) {
+func (c *Conn) finalizeTerminalStreamLocked(stream *nativeStream, releaseOpts transientStreamReleaseOptions, notifyMask streamNotifyMask, finalizePeer bool) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -705,7 +705,7 @@ func wrapMetadataUpdateStructuredError(err error) error {
 	})
 }
 
-func (s *Stream) Metadata() StreamMetadata {
+func (s *nativeStream) Metadata() StreamMetadata {
 	if s == nil || s.conn == nil {
 		return StreamMetadata{}
 	}
@@ -724,7 +724,7 @@ func (s *Stream) Metadata() StreamMetadata {
 	}
 }
 
-func (s *Stream) metadataUpdateRouteLocked(caps Capabilities, update MetadataUpdate) (metadataUpdateRoute, error) {
+func (s *nativeStream) metadataUpdateRouteLocked(caps Capabilities, update MetadataUpdate) (metadataUpdateRoute, error) {
 	if s == nil {
 		return metadataUpdateRoutePriorityFrame, nil
 	}
@@ -738,7 +738,7 @@ func (s *Stream) metadataUpdateRouteLocked(caps Capabilities, update MetadataUpd
 	return metadataUpdateRoutePriorityFrame, nil
 }
 
-func (s *Stream) applyOpenMetadataUpdateLocked(caps Capabilities, update MetadataUpdate) error {
+func (s *nativeStream) applyOpenMetadataUpdateLocked(caps Capabilities, update MetadataUpdate) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -786,7 +786,7 @@ func (s *Stream) applyOpenMetadataUpdateLocked(caps Capabilities, update Metadat
 	return nil
 }
 
-func (s *Stream) queuePendingMetadataUpdateLocked(caps Capabilities, update MetadataUpdate) error {
+func (s *nativeStream) queuePendingMetadataUpdateLocked(caps Capabilities, update MetadataUpdate) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -813,7 +813,7 @@ func (s *Stream) queuePendingMetadataUpdateLocked(caps Capabilities, update Meta
 	return nil
 }
 
-func (s *Stream) UpdateMetadata(update MetadataUpdate) error {
+func (s *nativeStream) UpdateMetadata(update MetadataUpdate) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -861,7 +861,7 @@ func validateOpenMetadataUpdateCapability(caps Capabilities, update MetadataUpda
 	return nil
 }
 
-func (c *Conn) releaseStreamRuntimeStateLocked(stream *Stream, mask streamRuntimeStateMask) bool {
+func (c *Conn) releaseStreamRuntimeStateLocked(stream *nativeStream, mask streamRuntimeStateMask) bool {
 	if c == nil || stream == nil || mask == 0 {
 		return false
 	}
@@ -899,7 +899,7 @@ func (c *Conn) releaseStreamRuntimeStateLocked(stream *Stream, mask streamRuntim
 	return released
 }
 
-func (c *Conn) lookupExistingPeerStreamLocked(frameName string, streamID uint64) (*Stream, error) {
+func (c *Conn) lookupExistingPeerStreamLocked(frameName string, streamID uint64) (*nativeStream, error) {
 	if c == nil {
 		return nil, nil
 	}
@@ -916,9 +916,9 @@ func (c *Conn) lookupExistingPeerStreamLocked(frameName string, streamID uint64)
 	)
 }
 
-func (c *Conn) newPeerStreamLocked(id uint64) *Stream {
+func (c *Conn) newPeerStreamLocked(id uint64) *nativeStream {
 	localSend, localRecv := state.StreamKindForLocal(c.config.negotiated.LocalRole, id)
-	stream := &Stream{
+	stream := &nativeStream{
 		conn:             c,
 		id:               id,
 		idSet:            true,
@@ -948,7 +948,7 @@ func (v peerStreamVisibility) isVisibleOnData() bool {
 	return v == peerStreamVisibleOnData
 }
 
-func (c *Conn) refusePeerStreamLocked(streamID uint64, stream *Stream, visibility peerStreamVisibility) error {
+func (c *Conn) refusePeerStreamLocked(streamID uint64, stream *nativeStream, visibility peerStreamVisibility) error {
 	if c == nil {
 		return nil
 	}
@@ -968,7 +968,7 @@ func (c *Conn) refusePeerStreamLocked(streamID uint64, stream *Stream, visibilit
 	return err
 }
 
-func (c *Conn) openPeerStreamLocked(streamID uint64, visibility peerStreamVisibility) (*Stream, error) {
+func (c *Conn) openPeerStreamLocked(streamID uint64, visibility peerStreamVisibility) (*nativeStream, error) {
 	if err := state.ValidateStreamIDForRole(c.config.negotiated.LocalRole, streamID); err != nil {
 		return nil, wireError(CodeProtocol, "open peer stream", err)
 	}
@@ -1055,7 +1055,7 @@ func (c *Conn) receivedMetadataPolicyLocked(carriage receivedMetadataCarriage) r
 	}
 }
 
-func (c *Conn) applyReceivedMetadataLocked(stream *Stream, meta streamMetadata, carriage receivedMetadataCarriage) bool {
+func (c *Conn) applyReceivedMetadataLocked(stream *nativeStream, meta streamMetadata, carriage receivedMetadataCarriage) bool {
 	if stream == nil {
 		return false
 	}
@@ -1081,7 +1081,7 @@ func (c *Conn) applyReceivedMetadataLocked(stream *Stream, meta streamMetadata, 
 	return changed
 }
 
-func (c *Conn) enqueueAcceptedLocked(stream *Stream) {
+func (c *Conn) enqueueAcceptedLocked(stream *nativeStream) {
 	if stream == nil || !state.ShouldEnqueueAccepted(stream.applicationVisible, stream.acceptedFlag(), stream.enqueued) {
 		return
 	}
@@ -1091,7 +1091,7 @@ func (c *Conn) enqueueAcceptedLocked(stream *Stream) {
 	notify(c.signals.acceptCh)
 }
 
-func (c *Conn) markPeerVisibleLocked(stream *Stream) {
+func (c *Conn) markPeerVisibleLocked(stream *nativeStream) {
 	if stream == nil || !stream.shouldMarkPeerVisibleLocked() {
 		return
 	}
@@ -1100,128 +1100,128 @@ func (c *Conn) markPeerVisibleLocked(stream *Stream) {
 	c.removeUnseenLocalLocked(stream)
 }
 
-func (s *Stream) sendHalfState() state.SendHalfState {
+func (s *nativeStream) sendHalfState() state.SendHalfState {
 	if s == nil {
 		return state.SendHalfAbsent
 	}
 	return state.NormalizeSendHalfState(s.localSend, s.loadSendHalf())
 }
 
-func (s *Stream) recvHalfState() state.RecvHalfState {
+func (s *nativeStream) recvHalfState() state.RecvHalfState {
 	if s == nil {
 		return state.RecvHalfAbsent
 	}
 	return state.NormalizeRecvHalfState(s.localReceive, s.loadRecvHalf())
 }
 
-func (s *Stream) effectiveSendHalfStateLocked() state.SendHalfState {
+func (s *nativeStream) effectiveSendHalfStateLocked() state.SendHalfState {
 	if s == nil {
 		return state.SendHalfAbsent
 	}
 	return state.NormalizeSendHalfState(s.localSend, s.loadSendHalf())
 }
 
-func (s *Stream) effectiveRecvHalfStateLocked() state.RecvHalfState {
+func (s *nativeStream) effectiveRecvHalfStateLocked() state.RecvHalfState {
 	if s == nil {
 		return state.RecvHalfAbsent
 	}
 	return state.NormalizeRecvHalfState(s.localReceive, s.loadRecvHalf())
 }
 
-func (s *Stream) sendFinReached() bool {
+func (s *nativeStream) sendFinReached() bool {
 	return s.sendFinReachedLocked()
 }
 
-func (s *Stream) recvFinReached() bool {
+func (s *nativeStream) recvFinReached() bool {
 	return s.recvFinReachedLocked()
 }
 
-func (s *Stream) sendFinReachedLocked() bool {
+func (s *nativeStream) sendFinReachedLocked() bool {
 	return s != nil && s.effectiveSendHalfStateLocked() == state.SendHalfFin
 }
 
-func (s *Stream) recvFinReachedLocked() bool {
+func (s *nativeStream) recvFinReachedLocked() bool {
 	return s != nil && s.effectiveRecvHalfStateLocked() == state.RecvHalfFin
 }
 
-func (s *Stream) loadSendHalf() state.SendHalfState {
+func (s *nativeStream) loadSendHalf() state.SendHalfState {
 	if s == nil {
 		return state.SendHalfAbsent
 	}
 	return state.SendHalfState(atomic.LoadUint32((*uint32)(&s.sendHalf)))
 }
 
-func (s *Stream) storeSendHalf(v state.SendHalfState) {
+func (s *nativeStream) storeSendHalf(v state.SendHalfState) {
 	if s == nil {
 		return
 	}
 	atomic.StoreUint32((*uint32)(&s.sendHalf), uint32(v))
 }
 
-func (s *Stream) loadRecvHalf() state.RecvHalfState {
+func (s *nativeStream) loadRecvHalf() state.RecvHalfState {
 	if s == nil {
 		return state.RecvHalfAbsent
 	}
 	return state.RecvHalfState(atomic.LoadUint32((*uint32)(&s.recvHalf)))
 }
 
-func (s *Stream) storeRecvHalf(v state.RecvHalfState) {
+func (s *nativeStream) storeRecvHalf(v state.RecvHalfState) {
 	if s == nil {
 		return
 	}
 	atomic.StoreUint32((*uint32)(&s.recvHalf), uint32(v))
 }
 
-func (s *Stream) sendAbortErrLocked() error {
+func (s *nativeStream) sendAbortErrLocked() error {
 	if s == nil || s.sendAbort == nil {
 		return nil
 	}
 	return s.sendAbort
 }
 
-func (s *Stream) recvAbortErrLocked() error {
+func (s *nativeStream) recvAbortErrLocked() error {
 	if s == nil || s.recvAbort == nil {
 		return nil
 	}
 	return s.recvAbort
 }
 
-func (s *Stream) sendResetErrLocked() error {
+func (s *nativeStream) sendResetErrLocked() error {
 	if s == nil || s.sendReset == nil {
 		return nil
 	}
 	return s.sendReset
 }
 
-func (s *Stream) recvResetErrLocked() error {
+func (s *nativeStream) recvResetErrLocked() error {
 	if s == nil || s.recvReset == nil {
 		return nil
 	}
 	return s.recvReset
 }
 
-func (s *Stream) sendAbortCodeLocked() *uint64 {
+func (s *nativeStream) sendAbortCodeLocked() *uint64 {
 	if s == nil {
 		return nil
 	}
 	return appErrorCodePtr(s.sendAbort)
 }
 
-func (s *Stream) recvAbortCodeLocked() *uint64 {
+func (s *nativeStream) recvAbortCodeLocked() *uint64 {
 	if s == nil {
 		return nil
 	}
 	return appErrorCodePtr(s.recvAbort)
 }
 
-func (s *Stream) sendResetCodeLocked() *uint64 {
+func (s *nativeStream) sendResetCodeLocked() *uint64 {
 	if s == nil {
 		return nil
 	}
 	return appErrorCodePtr(s.sendReset)
 }
 
-func (s *Stream) recvResetCodeLocked() *uint64 {
+func (s *nativeStream) recvResetCodeLocked() *uint64 {
 	if s == nil {
 		return nil
 	}
@@ -1235,19 +1235,19 @@ const (
 	terminalAbortFromPeer
 )
 
-func (s *Stream) sendAbortFromPeerLocked() bool {
+func (s *nativeStream) sendAbortFromPeerLocked() bool {
 	return s != nil && s.sendAbort != nil && s.sendAbortSource == terminalAbortFromPeer
 }
 
-func (s *Stream) recvAbortFromPeerLocked() bool {
+func (s *nativeStream) recvAbortFromPeerLocked() bool {
 	return s != nil && s.recvAbort != nil && s.recvAbortSource == terminalAbortFromPeer
 }
 
-func (s *Stream) sendResetFromStopLocked() bool {
+func (s *nativeStream) sendResetFromStopLocked() bool {
 	return s != nil && s.sendReset != nil && s.sendResetSource == terminalResetFromStopSending
 }
 
-func (s *Stream) initHalfStates() {
+func (s *nativeStream) initHalfStates() {
 	if s == nil {
 		return
 	}
@@ -1255,7 +1255,7 @@ func (s *Stream) initHalfStates() {
 	s.storeRecvHalf(state.BaseRecvHalfState(s.localReceive))
 }
 
-func (s *Stream) setSendStopSeen(err *ApplicationError) {
+func (s *nativeStream) setSendStopSeen(err *ApplicationError) {
 	if s == nil {
 		return
 	}
@@ -1266,7 +1266,7 @@ func (s *Stream) setSendStopSeen(err *ApplicationError) {
 	}
 }
 
-func (s *Stream) setSendFin() {
+func (s *nativeStream) setSendFin() {
 	if s == nil {
 		return
 	}
@@ -1280,7 +1280,7 @@ func (s *Stream) setSendFin() {
 	}
 }
 
-func (s *Stream) clearSendFin() {
+func (s *nativeStream) clearSendFin() {
 	if s == nil {
 		return
 	}
@@ -1295,7 +1295,7 @@ func (s *Stream) clearSendFin() {
 	}
 }
 
-func (s *Stream) setSendResetWithSource(err *ApplicationError, source terminalResetSource) {
+func (s *nativeStream) setSendResetWithSource(err *ApplicationError, source terminalResetSource) {
 	if s == nil {
 		return
 	}
@@ -1310,7 +1310,7 @@ func (s *Stream) setSendResetWithSource(err *ApplicationError, source terminalRe
 	}
 }
 
-func (s *Stream) setSendAbortWithSource(err *ApplicationError, source terminalAbortSource) {
+func (s *nativeStream) setSendAbortWithSource(err *ApplicationError, source terminalAbortSource) {
 	if s == nil {
 		return
 	}
@@ -1326,7 +1326,7 @@ func (s *Stream) setSendAbortWithSource(err *ApplicationError, source terminalAb
 	}
 }
 
-func (s *Stream) setRecvStopSent() {
+func (s *nativeStream) setRecvStopSent() {
 	if s == nil {
 		return
 	}
@@ -1337,7 +1337,7 @@ func (s *Stream) setRecvStopSent() {
 	}
 }
 
-func (s *Stream) setRecvFin() {
+func (s *nativeStream) setRecvFin() {
 	if s == nil {
 		return
 	}
@@ -1347,7 +1347,7 @@ func (s *Stream) setRecvFin() {
 	}
 }
 
-func (s *Stream) setRecvReset(err *ApplicationError) {
+func (s *nativeStream) setRecvReset(err *ApplicationError) {
 	if s == nil {
 		return
 	}
@@ -1358,7 +1358,7 @@ func (s *Stream) setRecvReset(err *ApplicationError) {
 	}
 }
 
-func (s *Stream) setRecvAbortWithSource(err *ApplicationError, source terminalAbortSource) {
+func (s *nativeStream) setRecvAbortWithSource(err *ApplicationError, source terminalAbortSource) {
 	if s == nil {
 		return
 	}
@@ -1370,7 +1370,7 @@ func (s *Stream) setRecvAbortWithSource(err *ApplicationError, source terminalAb
 	}
 }
 
-func (s *Stream) setAbortedWithSource(err *ApplicationError, source terminalAbortSource) {
+func (s *nativeStream) setAbortedWithSource(err *ApplicationError, source terminalAbortSource) {
 	if s == nil {
 		return
 	}
@@ -1405,7 +1405,7 @@ func releaseStreamReadChunk(chunk *streamReadChunk) {
 	streamReadChunkPool.Put(chunk)
 }
 
-type Stream struct {
+type nativeStream struct {
 	conn *Conn
 
 	sendReset *ApplicationError
@@ -1531,7 +1531,7 @@ const (
 	streamFlagLocalReadSignalPending
 )
 
-func (s *Stream) clearQueueMembershipState() {
+func (s *nativeStream) clearQueueMembershipState() {
 	if s == nil {
 		return
 	}
@@ -1541,7 +1541,7 @@ func (s *Stream) clearQueueMembershipState() {
 	s.enqueued = false
 }
 
-func (s *Stream) clearBlockedState() {
+func (s *nativeStream) clearBlockedState() {
 	if s == nil {
 		return
 	}
@@ -1549,7 +1549,7 @@ func (s *Stream) clearBlockedState() {
 	s.blockedSet = false
 }
 
-func (s *Stream) markBlockedState(v uint64) {
+func (s *nativeStream) markBlockedState(v uint64) {
 	if s == nil {
 		return
 	}
@@ -1557,14 +1557,14 @@ func (s *Stream) markBlockedState(v uint64) {
 	s.blockedSet = true
 }
 
-func (s *Stream) provisionalCreatedAt() time.Time {
+func (s *nativeStream) provisionalCreatedAt() time.Time {
 	if s == nil || s.provisional == nil {
 		return time.Time{}
 	}
 	return s.provisional.created
 }
 
-func (s *Stream) setProvisionalCreated(t time.Time) {
+func (s *nativeStream) setProvisionalCreated(t time.Time) {
 	if s == nil {
 		return
 	}
@@ -1578,130 +1578,130 @@ func (s *Stream) setProvisionalCreated(t time.Time) {
 	s.provisional.created = t
 }
 
-func (s *Stream) clearProvisionalState() {
+func (s *nativeStream) clearProvisionalState() {
 	if s == nil {
 		return
 	}
 	s.provisional = nil
 }
 
-func (s *Stream) streamFlag(mask uint8) bool {
+func (s *nativeStream) streamFlag(mask uint8) bool {
 	return s != nil && s.lifecycleFlags&mask != 0
 }
 
-func (s *Stream) markStreamFlag(mask uint8) {
+func (s *nativeStream) markStreamFlag(mask uint8) {
 	if s == nil {
 		return
 	}
 	s.lifecycleFlags |= mask
 }
 
-func (s *Stream) clearStreamFlag(mask uint8) {
+func (s *nativeStream) clearStreamFlag(mask uint8) {
 	if s == nil {
 		return
 	}
 	s.lifecycleFlags &^= mask
 }
 
-func (s *Stream) acceptedFlag() bool {
+func (s *nativeStream) acceptedFlag() bool {
 	return s.streamFlag(streamFlagAccepted)
 }
 
-func (s *Stream) markAccepted() {
+func (s *nativeStream) markAccepted() {
 	s.markStreamFlag(streamFlagAccepted)
 }
 
-func (s *Stream) churnCountedFlag() bool {
+func (s *nativeStream) churnCountedFlag() bool {
 	return s.streamFlag(streamFlagChurnCounted)
 }
 
-func (s *Stream) markChurnCounted() {
+func (s *nativeStream) markChurnCounted() {
 	s.markStreamFlag(streamFlagChurnCounted)
 }
 
-func (s *Stream) openedEventSentFlag() bool {
+func (s *nativeStream) openedEventSentFlag() bool {
 	return s.streamFlag(streamFlagOpenedEventSent)
 }
 
-func (s *Stream) markOpenedEventSent() {
+func (s *nativeStream) markOpenedEventSent() {
 	s.markStreamFlag(streamFlagOpenedEventSent)
 }
 
-func (s *Stream) acceptedEventSentFlag() bool {
+func (s *nativeStream) acceptedEventSentFlag() bool {
 	return s.streamFlag(streamFlagAcceptedEventSent)
 }
 
-func (s *Stream) markAcceptedEventSent() {
+func (s *nativeStream) markAcceptedEventSent() {
 	s.markStreamFlag(streamFlagAcceptedEventSent)
 }
 
-func (s *Stream) activeCountedFlag() bool {
+func (s *nativeStream) activeCountedFlag() bool {
 	return s.streamFlag(streamFlagActiveCounted)
 }
 
-func (s *Stream) markActiveCounted() {
+func (s *nativeStream) markActiveCounted() {
 	s.markStreamFlag(streamFlagActiveCounted)
 }
 
-func (s *Stream) clearActiveCounted() {
+func (s *nativeStream) clearActiveCounted() {
 	s.clearStreamFlag(streamFlagActiveCounted)
 }
 
-func (s *Stream) localReadSignalPendingFlag() bool {
+func (s *nativeStream) localReadSignalPendingFlag() bool {
 	return s.streamFlag(streamFlagLocalReadSignalPending)
 }
 
-func (s *Stream) markLocalReadSignalPending() {
+func (s *nativeStream) markLocalReadSignalPending() {
 	s.markStreamFlag(streamFlagLocalReadSignalPending)
 }
 
-func (s *Stream) clearLocalReadSignalPending() {
+func (s *nativeStream) clearLocalReadSignalPending() {
 	s.clearStreamFlag(streamFlagLocalReadSignalPending)
 }
 
-func setProvisionalIndex(stream *Stream, idx int32) {
+func setProvisionalIndex(stream *nativeStream, idx int32) {
 	if stream == nil {
 		return
 	}
 	stream.provisionalIndex = idx
 }
 
-func getProvisionalIndex(stream *Stream) int32 {
+func getProvisionalIndex(stream *nativeStream) int32 {
 	if stream == nil {
 		return invalidStreamQueueIndex
 	}
 	return stream.provisionalIndex
 }
 
-func setAcceptIndex(stream *Stream, idx int32) {
+func setAcceptIndex(stream *nativeStream, idx int32) {
 	if stream == nil {
 		return
 	}
 	stream.acceptIndex = idx
 }
 
-func getAcceptIndex(stream *Stream) int32 {
+func getAcceptIndex(stream *nativeStream) int32 {
 	if stream == nil {
 		return invalidStreamQueueIndex
 	}
 	return stream.acceptIndex
 }
 
-func setUnseenLocalIndex(stream *Stream, idx int32) {
+func setUnseenLocalIndex(stream *nativeStream, idx int32) {
 	if stream == nil {
 		return
 	}
 	stream.unseenLocalIndex = idx
 }
 
-func getUnseenLocalIndex(stream *Stream) int32 {
+func getUnseenLocalIndex(stream *nativeStream) int32 {
 	if stream == nil {
 		return invalidStreamQueueIndex
 	}
 	return stream.unseenLocalIndex
 }
 
-func (s *Stream) pendingControlValueLocked(kind streamControlKind) pendingStreamControlValue {
+func (s *nativeStream) pendingControlValueLocked(kind streamControlKind) pendingStreamControlValue {
 	if s == nil {
 		return pendingStreamControlValue{}
 	}
@@ -1712,7 +1712,7 @@ func (s *Stream) pendingControlValueLocked(kind streamControlKind) pendingStream
 	return pendingStreamControlValue{value: s.pending.control[kind], present: true}
 }
 
-func (s *Stream) setPendingControlValueLocked(kind streamControlKind, v uint64) {
+func (s *nativeStream) setPendingControlValueLocked(kind streamControlKind, v uint64) {
 	if s == nil {
 		return
 	}
@@ -1724,7 +1724,7 @@ func (s *Stream) setPendingControlValueLocked(kind streamControlKind, v uint64) 
 	s.pending.flags |= flag
 }
 
-func (s *Stream) clearPendingControlValueLocked(kind streamControlKind) {
+func (s *nativeStream) clearPendingControlValueLocked(kind streamControlKind) {
 	if s == nil {
 		return
 	}
@@ -1736,7 +1736,7 @@ func (s *Stream) clearPendingControlValueLocked(kind streamControlKind) {
 	s.pending.flags &^= flag
 }
 
-func (s *Stream) pendingControlFlushStateLocked(kind streamControlKind) (flush bool, keep bool) {
+func (s *nativeStream) pendingControlFlushStateLocked(kind streamControlKind) (flush bool, keep bool) {
 	if s == nil {
 		return false, false
 	}
@@ -1762,7 +1762,7 @@ func (s *Stream) pendingControlFlushStateLocked(kind streamControlKind) (flush b
 	}
 }
 
-func (s *Stream) skipPendingControlQueueLocked(kind streamControlKind, v uint64) bool {
+func (s *nativeStream) skipPendingControlQueueLocked(kind streamControlKind, v uint64) bool {
 	if s == nil {
 		return true
 	}
@@ -1777,7 +1777,7 @@ func (s *Stream) skipPendingControlQueueLocked(kind streamControlKind, v uint64)
 	}
 }
 
-func (s *Stream) notePendingControlQueuedLocked(kind streamControlKind, v uint64) {
+func (s *nativeStream) notePendingControlQueuedLocked(kind streamControlKind, v uint64) {
 	if s == nil {
 		return
 	}
@@ -1786,7 +1786,7 @@ func (s *Stream) notePendingControlQueuedLocked(kind streamControlKind, v uint64
 	}
 }
 
-func (s *Stream) pendingPriorityFlushStateLocked() (flush bool, keep bool) {
+func (s *nativeStream) pendingPriorityFlushStateLocked() (flush bool, keep bool) {
 	if s == nil {
 		return false, false
 	}
@@ -1796,11 +1796,11 @@ func (s *Stream) pendingPriorityFlushStateLocked() (flush bool, keep bool) {
 	)
 }
 
-func (s *Stream) hasPendingPriorityUpdateLocked() bool {
+func (s *nativeStream) hasPendingPriorityUpdateLocked() bool {
 	return s != nil && s.pending.flags&streamPendingPriorityUpdate != 0 && len(s.pending.priority) > 0
 }
 
-func (s *Stream) setPendingPriorityUpdateLocked(payload []byte) {
+func (s *nativeStream) setPendingPriorityUpdateLocked(payload []byte) {
 	if s == nil {
 		return
 	}
@@ -1812,25 +1812,25 @@ func (s *Stream) setPendingPriorityUpdateLocked(payload []byte) {
 	s.pending.flags |= streamPendingPriorityUpdate
 }
 
-func (s *Stream) clearPendingPriorityUpdateLocked() {
+func (s *nativeStream) clearPendingPriorityUpdateLocked() {
 	s.setPendingPriorityUpdateLocked(nil)
 }
 
-func (s *Stream) pendingQueueIndex(kind pendingStreamQueueKind) int32 {
+func (s *nativeStream) pendingQueueIndex(kind pendingStreamQueueKind) int32 {
 	if s == nil || kind >= pendingStreamQueueCount {
 		return invalidStreamQueueIndex
 	}
 	return s.pending.queueIndex[kind]
 }
 
-func (s *Stream) setPendingQueueIndex(kind pendingStreamQueueKind, idx int32) {
+func (s *nativeStream) setPendingQueueIndex(kind pendingStreamQueueKind, idx int32) {
 	if s == nil || kind >= pendingStreamQueueCount {
 		return
 	}
 	s.pending.queueIndex[kind] = idx
 }
 
-func (s *Stream) inPendingQueueLocked(kind pendingStreamQueueKind) bool {
+func (s *nativeStream) inPendingQueueLocked(kind pendingStreamQueueKind) bool {
 	if s == nil {
 		return false
 	}
@@ -1846,35 +1846,35 @@ func (s *Stream) inPendingQueueLocked(kind pendingStreamQueueKind) bool {
 	}
 }
 
-func setPendingMaxDataIndex(stream *Stream, idx int32) {
+func setPendingMaxDataIndex(stream *nativeStream, idx int32) {
 	stream.setPendingQueueIndex(pendingStreamQueueMaxData, idx)
 }
 
-func getPendingMaxDataIndex(stream *Stream) int32 {
+func getPendingMaxDataIndex(stream *nativeStream) int32 {
 	return stream.pendingQueueIndex(pendingStreamQueueMaxData)
 }
 
-func setPendingBlockedIndex(stream *Stream, idx int32) {
+func setPendingBlockedIndex(stream *nativeStream, idx int32) {
 	stream.setPendingQueueIndex(pendingStreamQueueBlocked, idx)
 }
 
-func getPendingBlockedIndex(stream *Stream) int32 {
+func getPendingBlockedIndex(stream *nativeStream) int32 {
 	return stream.pendingQueueIndex(pendingStreamQueueBlocked)
 }
 
-func setPendingPriorityIndex(stream *Stream, idx int32) {
+func setPendingPriorityIndex(stream *nativeStream, idx int32) {
 	stream.setPendingQueueIndex(pendingStreamQueuePriority, idx)
 }
 
-func getPendingPriorityIndex(stream *Stream) int32 {
+func getPendingPriorityIndex(stream *nativeStream) int32 {
 	return stream.pendingQueueIndex(pendingStreamQueuePriority)
 }
 
-func streamMatchesID(stream *Stream, streamID uint64) bool {
+func streamMatchesID(stream *nativeStream, streamID uint64) bool {
 	return stream != nil && stream.idSet && stream.id == streamID
 }
 
-func streamBelongsToConn(stream *Stream, c *Conn) bool {
+func streamBelongsToConn(stream *nativeStream, c *Conn) bool {
 	return stream != nil && (stream.conn == nil || stream.conn == c)
 }
 
@@ -1884,7 +1884,7 @@ type writeStep struct {
 	openerVisibility openerVisibilityMark
 }
 
-func (s *Stream) StreamID() uint64 {
+func (s *nativeStream) StreamID() uint64 {
 	if s == nil || s.conn == nil {
 		return 0
 	}
@@ -1896,11 +1896,11 @@ func (s *Stream) StreamID() uint64 {
 	return s.id
 }
 
-func (s *Stream) ID() uint64 {
+func (s *nativeStream) ID() uint64 {
 	return s.StreamID()
 }
 
-func (s *Stream) OpenInfo() []byte {
+func (s *nativeStream) OpenInfo() []byte {
 	if s == nil || s.conn == nil {
 		return nil
 	}
@@ -1971,7 +1971,7 @@ func (t dataFrameTraits) includesOpenMetadata() bool {
 	return t&dataFrameTraitOpenMetadata != 0
 }
 
-func (s *Stream) dataFrameLocked(app []byte, traits dataFrameTraits) txFrame {
+func (s *nativeStream) dataFrameLocked(app []byte, traits dataFrameTraits) txFrame {
 	frame := makeTxFrame(FrameTypeDATA, 0, s.id)
 	if traits.includesOpenMetadata() && len(s.openMetadataPrefix) > 0 {
 		frame.Flags |= FrameFlagOpenMetadata
@@ -1987,7 +1987,7 @@ func (s *Stream) dataFrameLocked(app []byte, traits dataFrameTraits) txFrame {
 	return frame
 }
 
-func (s *Stream) dataFrameFromPartsLocked(parts [][]byte, idx, off, n int, traits dataFrameTraits) txFrame {
+func (s *nativeStream) dataFrameFromPartsLocked(parts [][]byte, idx, off, n int, traits dataFrameTraits) txFrame {
 	frame := makeTxFrame(FrameTypeDATA, 0, s.id)
 	payloadLen := n
 	if traits.includesOpenMetadata() && len(s.openMetadataPrefix) > 0 {

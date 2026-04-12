@@ -35,11 +35,11 @@ func (a streamAddr) String() string {
 	return fmt.Sprintf("%s/stream/pending", a.endpoint)
 }
 
-func (s *Stream) LocalAddr() net.Addr {
+func (s *nativeStream) LocalAddr() net.Addr {
 	return s.streamAddr(streamAddrEndpointLocal)
 }
 
-func (s *Stream) RemoteAddr() net.Addr {
+func (s *nativeStream) RemoteAddr() net.Addr {
 	return s.streamAddr(streamAddrEndpointRemote)
 }
 
@@ -67,7 +67,7 @@ func (e streamAddrEndpoint) providerAddr(provider streamAddrProvider) net.Addr {
 	return provider.RemoteAddr()
 }
 
-func (s *Stream) streamAddr(endpoint streamAddrEndpoint) net.Addr {
+func (s *nativeStream) streamAddr(endpoint streamAddrEndpoint) net.Addr {
 	var (
 		provider streamAddrProvider
 		streamID uint64
@@ -98,310 +98,310 @@ func (s *Stream) streamAddr(endpoint streamAddrEndpoint) net.Addr {
 	}
 }
 
-type SendStream struct {
-	stream *Stream
+type nativeSendStream struct {
+	stream *nativeStream
 }
 
-func (s *SendStream) StreamID() uint64 {
+func (s *nativeSendStream) StreamID() uint64 {
 	if s == nil || s.stream == nil {
 		return 0
 	}
 	return s.stream.StreamID()
 }
 
-func (s *SendStream) ID() uint64 {
+func (s *nativeSendStream) ID() uint64 {
 	return s.StreamID()
 }
 
-func (s *SendStream) OpenInfo() []byte {
+func (s *nativeSendStream) OpenInfo() []byte {
 	if s == nil || s.stream == nil {
 		return nil
 	}
 	return s.stream.OpenInfo()
 }
 
-func (s *SendStream) LocalAddr() net.Addr {
+func (s *nativeSendStream) LocalAddr() net.Addr {
 	if s == nil || s.stream == nil {
 		return streamAddr{endpoint: "local"}
 	}
 	return s.stream.LocalAddr()
 }
 
-func (s *SendStream) RemoteAddr() net.Addr {
+func (s *nativeSendStream) RemoteAddr() net.Addr {
 	if s == nil || s.stream == nil {
 		return streamAddr{endpoint: "remote"}
 	}
 	return s.stream.RemoteAddr()
 }
 
-func (s *SendStream) Metadata() StreamMetadata {
+func (s *nativeSendStream) Metadata() StreamMetadata {
 	if s == nil || s.stream == nil {
 		return StreamMetadata{}
 	}
 	return s.stream.Metadata()
 }
 
-func (s *SendStream) UpdateMetadata(update MetadataUpdate) error {
+func (s *nativeSendStream) UpdateMetadata(update MetadataUpdate) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.UpdateMetadata(update)
 }
 
-func (s *SendStream) Write(p []byte) (int, error) {
+func (s *nativeSendStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, ErrSessionClosed
 	}
 	return s.stream.Write(p)
 }
 
-func (s *SendStream) WriteFinal(p []byte) (int, error) {
+func (s *nativeSendStream) WriteFinal(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, ErrSessionClosed
 	}
 	return s.stream.WriteFinal(p)
 }
 
-func (s *SendStream) WritevFinal(parts ...[]byte) (int, error) {
+func (s *nativeSendStream) WritevFinal(parts ...[]byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, ErrSessionClosed
 	}
 	return s.stream.WritevFinal(parts...)
 }
 
-func (s *SendStream) CloseWrite() error {
+func (s *nativeSendStream) CloseWrite() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseWrite()
 }
 
-func (s *SendStream) Reset(code uint64) error {
+func (s *nativeSendStream) Reset(code uint64) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.Reset(code)
 }
 
-func (s *SendStream) CancelWrite() error {
+func (s *nativeSendStream) CancelWrite() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CancelWrite()
 }
 
-func (s *SendStream) CancelWriteWithCode(code uint64) error {
+func (s *nativeSendStream) CancelWriteWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CancelWriteWithCode(code)
 }
 
-func (s *SendStream) ResetWrite() error {
+func (s *nativeSendStream) ResetWrite() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.ResetWrite()
 }
 
-func (s *SendStream) ResetWriteWithCode(code uint64) error {
+func (s *nativeSendStream) ResetWriteWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.ResetWriteWithCode(code)
 }
 
-func (s *SendStream) ResetWithReason(code uint64, reason string) error {
+func (s *nativeSendStream) ResetWithReason(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.ResetWithReason(code, reason)
 }
 
-func (s *SendStream) Abort() error {
+func (s *nativeSendStream) Abort() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.Abort()
 }
 
-func (s *SendStream) AbortWithError(err error) error {
+func (s *nativeSendStream) AbortWithError(err error) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.AbortWithError(err)
 }
 
-func (s *SendStream) AbortWithErrorCode(code uint64, reason string) error {
+func (s *nativeSendStream) AbortWithErrorCode(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.AbortWithErrorCode(code, reason)
 }
 
-func (s *SendStream) CloseWithError(err error) error {
+func (s *nativeSendStream) CloseWithError(err error) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseWithError(err)
 }
 
-func (s *SendStream) CloseWithErrorCode(code uint64, reason string) error {
+func (s *nativeSendStream) CloseWithErrorCode(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseWithErrorCode(code, reason)
 }
 
-func (s *SendStream) Close() error {
+func (s *nativeSendStream) Close() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.Close()
 }
 
-func (s *SendStream) SetDeadline(t time.Time) error {
+func (s *nativeSendStream) SetDeadline(t time.Time) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.SetDeadline(t)
 }
 
-func (s *SendStream) SetWriteDeadline(t time.Time) error {
+func (s *nativeSendStream) SetWriteDeadline(t time.Time) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.SetWriteDeadline(t)
 }
 
-type RecvStream struct {
-	stream *Stream
+type nativeRecvStream struct {
+	stream *nativeStream
 }
 
-func (s *RecvStream) StreamID() uint64 {
+func (s *nativeRecvStream) StreamID() uint64 {
 	if s == nil || s.stream == nil {
 		return 0
 	}
 	return s.stream.StreamID()
 }
 
-func (s *RecvStream) ID() uint64 {
+func (s *nativeRecvStream) ID() uint64 {
 	return s.StreamID()
 }
 
-func (s *RecvStream) OpenInfo() []byte {
+func (s *nativeRecvStream) OpenInfo() []byte {
 	if s == nil || s.stream == nil {
 		return nil
 	}
 	return s.stream.OpenInfo()
 }
 
-func (s *RecvStream) LocalAddr() net.Addr {
+func (s *nativeRecvStream) LocalAddr() net.Addr {
 	if s == nil || s.stream == nil {
 		return streamAddr{endpoint: "local"}
 	}
 	return s.stream.LocalAddr()
 }
 
-func (s *RecvStream) RemoteAddr() net.Addr {
+func (s *nativeRecvStream) RemoteAddr() net.Addr {
 	if s == nil || s.stream == nil {
 		return streamAddr{endpoint: "remote"}
 	}
 	return s.stream.RemoteAddr()
 }
 
-func (s *RecvStream) Metadata() StreamMetadata {
+func (s *nativeRecvStream) Metadata() StreamMetadata {
 	if s == nil || s.stream == nil {
 		return StreamMetadata{}
 	}
 	return s.stream.Metadata()
 }
 
-func (s *RecvStream) Read(p []byte) (int, error) {
+func (s *nativeRecvStream) Read(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, ErrSessionClosed
 	}
 	return s.stream.Read(p)
 }
 
-func (s *RecvStream) CloseRead() error {
+func (s *nativeRecvStream) CloseRead() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseRead()
 }
 
-func (s *RecvStream) CancelRead() error {
+func (s *nativeRecvStream) CancelRead() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CancelRead()
 }
 
-func (s *RecvStream) CloseReadWithCode(code uint64) error {
+func (s *nativeRecvStream) CloseReadWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseReadWithCode(code)
 }
 
-func (s *RecvStream) CancelReadWithCode(code uint64) error {
+func (s *nativeRecvStream) CancelReadWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CancelReadWithCode(code)
 }
 
-func (s *RecvStream) Abort() error {
+func (s *nativeRecvStream) Abort() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.Abort()
 }
 
-func (s *RecvStream) AbortWithError(err error) error {
+func (s *nativeRecvStream) AbortWithError(err error) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.AbortWithError(err)
 }
 
-func (s *RecvStream) AbortWithErrorCode(code uint64, reason string) error {
+func (s *nativeRecvStream) AbortWithErrorCode(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.AbortWithErrorCode(code, reason)
 }
 
-func (s *RecvStream) CloseWithError(err error) error {
+func (s *nativeRecvStream) CloseWithError(err error) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseWithError(err)
 }
 
-func (s *RecvStream) CloseWithErrorCode(code uint64, reason string) error {
+func (s *nativeRecvStream) CloseWithErrorCode(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseWithErrorCode(code, reason)
 }
 
-func (s *RecvStream) Close() error {
+func (s *nativeRecvStream) Close() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.Close()
 }
 
-func (s *RecvStream) SetDeadline(t time.Time) error {
+func (s *nativeRecvStream) SetDeadline(t time.Time) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.SetDeadline(t)
 }
 
-func (s *RecvStream) SetReadDeadline(t time.Time) error {
+func (s *nativeRecvStream) SetReadDeadline(t time.Time) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
@@ -467,7 +467,7 @@ func (c *Conn) releaseReadChunkLocked(chunk *streamReadChunk) {
 	releaseStreamReadChunk(chunk)
 }
 
-func (s *Stream) syncReadBufLocked() {
+func (s *nativeStream) syncReadBufLocked() {
 	if s == nil {
 		return
 	}
@@ -480,7 +480,7 @@ func (s *Stream) syncReadBufLocked() {
 	s.readBuf = s.readHead.data
 }
 
-func (s *Stream) ensureReadQueueHeadLocked(c *Conn) {
+func (s *nativeStream) ensureReadQueueHeadLocked(c *Conn) {
 	if s == nil || s.readHead != nil || len(s.readBuf) == 0 {
 		return
 	}
@@ -496,7 +496,7 @@ func (s *Stream) ensureReadQueueHeadLocked(c *Conn) {
 	s.syncReadBufLocked()
 }
 
-func (s *Stream) appendReadChunkLocked(c *Conn, data, backing []byte, handle *wire.FrameReadBufferHandle) {
+func (s *nativeStream) appendReadChunkLocked(c *Conn, data, backing []byte, handle *wire.FrameReadBufferHandle) {
 	if s == nil || len(data) == 0 {
 		releaseReadFrameBuffer(backing, handle)
 		return
@@ -523,7 +523,7 @@ func (s *Stream) appendReadChunkLocked(c *Conn, data, backing []byte, handle *wi
 	s.readTail = chunk
 }
 
-func (c *Conn) clearReadChunksLocked(stream *Stream) {
+func (c *Conn) clearReadChunksLocked(stream *nativeStream) {
 	if stream == nil {
 		return
 	}
@@ -537,7 +537,7 @@ func (c *Conn) clearReadChunksLocked(stream *Stream) {
 	stream.readBuf = nil
 }
 
-func (s *Stream) bufferedReadLenLocked() int {
+func (s *nativeStream) bufferedReadLenLocked() int {
 	if s == nil {
 		return 0
 	}
@@ -551,7 +551,7 @@ func (s *Stream) bufferedReadLenLocked() int {
 	return total
 }
 
-func (s *Stream) consumeReadChunkLocked(c *Conn, n int) {
+func (s *nativeStream) consumeReadChunkLocked(c *Conn, n int) {
 	if s == nil || n <= 0 {
 		return
 	}
@@ -586,7 +586,7 @@ func (s *Stream) consumeReadChunkLocked(c *Conn, n int) {
 	s.syncReadBufLocked()
 }
 
-func (s *Stream) Read(p []byte) (int, error) {
+func (s *nativeStream) Read(p []byte) (int, error) {
 	if s == nil || s.conn == nil {
 		return 0, ErrSessionClosed
 	}
@@ -621,7 +621,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 	}
 }
 
-func (s *Stream) Write(p []byte) (int, error) {
+func (s *nativeStream) Write(p []byte) (int, error) {
 	if s == nil || s.conn == nil {
 		return 0, ErrSessionClosed
 	}
@@ -643,15 +643,15 @@ func (s *Stream) Write(p []byte) (int, error) {
 	return written, nil
 }
 
-func (s *Stream) WriteFinal(p []byte) (int, error) {
+func (s *nativeStream) WriteFinal(p []byte) (int, error) {
 	return s.writevFinal([][]byte{p})
 }
 
-func (s *Stream) WritevFinal(parts ...[]byte) (int, error) {
+func (s *nativeStream) WritevFinal(parts ...[]byte) (int, error) {
 	return s.writevFinal(parts)
 }
 
-func (s *Stream) writevFinal(parts [][]byte) (int, error) {
+func (s *nativeStream) writevFinal(parts [][]byte) (int, error) {
 	if s == nil || s.conn == nil {
 		return 0, ErrSessionClosed
 	}
@@ -681,18 +681,18 @@ func (s *Stream) writevFinal(parts [][]byte) (int, error) {
 	return written, nil
 }
 
-func (s *Stream) SetDeadline(t time.Time) error {
+func (s *nativeStream) SetDeadline(t time.Time) error {
 	if err := s.SetReadDeadline(t); err != nil {
 		return err
 	}
 	return s.SetWriteDeadline(t)
 }
 
-func (s *Stream) SetReadDeadline(t time.Time) error {
+func (s *nativeStream) SetReadDeadline(t time.Time) error {
 	return s.setWaitDeadline(t, OperationRead)
 }
 
-func (s *Stream) SetWriteDeadline(t time.Time) error {
+func (s *nativeStream) SetWriteDeadline(t time.Time) error {
 	return s.setWaitDeadline(t, OperationWrite)
 }
 
@@ -703,21 +703,21 @@ type streamWaitState struct {
 	writeWaiters  uint32
 }
 
-func (s *Stream) ensureReadNotifyLocked() chan struct{} {
+func (s *nativeStream) ensureReadNotifyLocked() chan struct{} {
 	if s == nil {
 		return nil
 	}
 	return ensureNotifyChan(&s.readNotify)
 }
 
-func (s *Stream) ensureWriteNotifyLocked() chan struct{} {
+func (s *nativeStream) ensureWriteNotifyLocked() chan struct{} {
 	if s == nil {
 		return nil
 	}
 	return ensureNotifyChan(&s.writeNotify)
 }
 
-func (s *Stream) readNotifyChan() <-chan struct{} {
+func (s *nativeStream) readNotifyChan() <-chan struct{} {
 	if s == nil || s.conn == nil {
 		return nil
 	}
@@ -727,7 +727,7 @@ func (s *Stream) readNotifyChan() <-chan struct{} {
 	return ch
 }
 
-func (s *Stream) writeNotifyChan() <-chan struct{} {
+func (s *nativeStream) writeNotifyChan() <-chan struct{} {
 	if s == nil || s.conn == nil {
 		return nil
 	}
@@ -737,7 +737,7 @@ func (s *Stream) writeNotifyChan() <-chan struct{} {
 	return ch
 }
 
-func (s *Stream) readWaitSnapshotLocked() (<-chan struct{}, time.Time) {
+func (s *nativeStream) readWaitSnapshotLocked() (<-chan struct{}, time.Time) {
 	if s == nil {
 		return nil, time.Time{}
 	}
@@ -748,7 +748,7 @@ func (s *Stream) readWaitSnapshotLocked() (<-chan struct{}, time.Time) {
 	return s.ensureReadNotifyLocked(), deadline
 }
 
-func (s *Stream) writeWaitSnapshotLocked() (<-chan struct{}, time.Time) {
+func (s *nativeStream) writeWaitSnapshotLocked() (<-chan struct{}, time.Time) {
 	if s == nil {
 		return nil, time.Time{}
 	}
@@ -775,7 +775,7 @@ func (m streamNotifyMask) includesWrite() bool {
 	return m&streamNotifyWrite != 0
 }
 
-func notifyStreamLocked(stream *Stream, mask streamNotifyMask) {
+func notifyStreamLocked(stream *nativeStream, mask streamNotifyMask) {
 	if stream == nil {
 		return
 	}
@@ -825,7 +825,7 @@ func (m streamReceiveReleaseMode) clearsReadBuf() bool {
 	return m == streamReceiveClearReadBufOnly || m == streamReceiveReleaseAndClearReadBuf
 }
 
-func (c *Conn) clearStreamReceiveBufferStateLocked(stream *Stream, mode streamReceiveReleaseMode) {
+func (c *Conn) clearStreamReceiveBufferStateLocked(stream *nativeStream, mode streamReceiveReleaseMode) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -838,7 +838,7 @@ func (c *Conn) clearStreamReceiveBufferStateLocked(stream *Stream, mode streamRe
 	}
 }
 
-func (c *Conn) releaseStreamReceiveStateLocked(stream *Stream, mode streamReceiveReleaseMode) {
+func (c *Conn) releaseStreamReceiveStateLocked(stream *nativeStream, mode streamReceiveReleaseMode) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -846,7 +846,7 @@ func (c *Conn) releaseStreamReceiveStateLocked(stream *Stream, mode streamReceiv
 	c.clearStreamReceiveBufferStateLocked(stream, mode)
 }
 
-func (c *Conn) applyReceiveReleasePlanLocked(stream *Stream, mode streamReceiveReleaseMode) {
+func (c *Conn) applyReceiveReleasePlanLocked(stream *nativeStream, mode streamReceiveReleaseMode) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -861,7 +861,7 @@ func (c *Conn) applyReceiveReleasePlanLocked(stream *Stream, mode streamReceiveR
 	}
 }
 
-func (s *Stream) ensureWaitStateLocked() *streamWaitState {
+func (s *nativeStream) ensureWaitStateLocked() *streamWaitState {
 	if s == nil {
 		return nil
 	}
@@ -871,14 +871,14 @@ func (s *Stream) ensureWaitStateLocked() *streamWaitState {
 	return s.waitState
 }
 
-func (s *Stream) waitStateLocked() *streamWaitState {
+func (s *nativeStream) waitStateLocked() *streamWaitState {
 	if s == nil {
 		return nil
 	}
 	return s.waitState
 }
 
-func (s *Stream) loadReadWaiters() uint32 {
+func (s *nativeStream) loadReadWaiters() uint32 {
 	if s == nil || s.conn == nil {
 		return 0
 	}
@@ -891,7 +891,7 @@ func (s *Stream) loadReadWaiters() uint32 {
 	return atomic.LoadUint32(&ws.readWaiters)
 }
 
-func (s *Stream) loadWriteWaiters() uint32 {
+func (s *nativeStream) loadWriteWaiters() uint32 {
 	if s == nil || s.conn == nil {
 		return 0
 	}
@@ -904,7 +904,7 @@ func (s *Stream) loadWriteWaiters() uint32 {
 	return atomic.LoadUint32(&ws.writeWaiters)
 }
 
-func (s *Stream) setWaitDeadline(t time.Time, op Operation) error {
+func (s *nativeStream) setWaitDeadline(t time.Time, op Operation) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -923,37 +923,37 @@ func (s *Stream) setWaitDeadline(t time.Time, op Operation) error {
 	return nil
 }
 
-func (s *Stream) waitRead(deadline time.Time) error {
+func (s *nativeStream) waitRead(deadline time.Time) error {
 	return s.waitWithDeadline(s.readNotifyChan(), deadline, OperationRead)
 }
 
-func (s *Stream) waitWrite(deadline time.Time) error {
+func (s *nativeStream) waitWrite(deadline time.Time) error {
 	return s.waitWriteWithWakeTracked(deadline, nil)
 }
 
-func (s *Stream) waitWriteWithWakeTracked(deadline time.Time, wakeCh <-chan struct{}) error {
+func (s *nativeStream) waitWriteWithWakeTracked(deadline time.Time, wakeCh <-chan struct{}) error {
 	start := time.Now()
 	err := s.waitWriteWithWake(deadline, wakeCh)
 	s.conn.noteBlockedWrite(time.Since(start))
 	return err
 }
 
-func (s *Stream) waitWithDeadlineAndWakeTracked(notifyCh <-chan struct{}, wakeCh <-chan struct{}, deadline time.Time, op Operation) error {
+func (s *nativeStream) waitWithDeadlineAndWakeTracked(notifyCh <-chan struct{}, wakeCh <-chan struct{}, deadline time.Time, op Operation) error {
 	start := time.Now()
 	err := s.waitWithDeadlineAndWake(notifyCh, wakeCh, deadline, op)
 	s.conn.noteBlockedWrite(time.Since(start))
 	return err
 }
 
-func (s *Stream) waitWriteWithWake(deadline time.Time, wakeCh <-chan struct{}) error {
+func (s *nativeStream) waitWriteWithWake(deadline time.Time, wakeCh <-chan struct{}) error {
 	return s.waitWithDeadlineAndWake(s.writeNotifyChan(), wakeCh, deadline, OperationWrite)
 }
 
-func (s *Stream) waitWithDeadline(notifyCh <-chan struct{}, deadline time.Time, op Operation) error {
+func (s *nativeStream) waitWithDeadline(notifyCh <-chan struct{}, deadline time.Time, op Operation) error {
 	return s.waitWithDeadlineAndWake(notifyCh, nil, deadline, op)
 }
 
-func (s *Stream) waitWithDeadlineAndWake(notifyCh <-chan struct{}, wakeCh <-chan struct{}, deadline time.Time, op Operation) error {
+func (s *nativeStream) waitWithDeadlineAndWake(notifyCh <-chan struct{}, wakeCh <-chan struct{}, deadline time.Time, op Operation) error {
 	var (
 		timer   *time.Timer
 		timeout <-chan time.Time
@@ -982,7 +982,7 @@ func (s *Stream) waitWithDeadlineAndWake(notifyCh <-chan struct{}, wakeCh <-chan
 	}
 }
 
-func (s *Stream) beginWait(op Operation) func() {
+func (s *nativeStream) beginWait(op Operation) func() {
 	if s == nil {
 		return func() {}
 	}
@@ -1014,7 +1014,7 @@ func (s *Stream) beginWait(op Operation) func() {
 	}
 }
 
-func (s *Stream) sessionCloseErr() error {
+func (s *nativeStream) sessionCloseErr() error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1027,14 +1027,14 @@ func (s *Stream) sessionCloseErr() error {
 	return nil
 }
 
-func (s *Stream) sessionWaitErr(op Operation) error {
+func (s *nativeStream) sessionWaitErr(op Operation) error {
 	if err := s.sessionCloseErr(); err != nil {
 		return sessionOperationErr(s.conn, op, err)
 	}
 	return sessionOperationErr(s.conn, op, ErrSessionClosed)
 }
 
-func (s *Stream) waitReadyErr(op Operation) error {
+func (s *nativeStream) waitReadyErr(op Operation) error {
 	if err := s.sessionCloseErr(); err != nil {
 		return sessionOperationErr(s.conn, op, err)
 	}
@@ -1062,7 +1062,7 @@ func resetTimer(timer *time.Timer, delay time.Duration) *time.Timer {
 	return timer
 }
 
-func (s *Stream) CloseRead() error {
+func (s *nativeStream) CloseRead() error {
 	return s.closeReadWithCode(uint64(CodeCancelled))
 }
 
@@ -1079,7 +1079,7 @@ func (r terminalLocalOpenerResult) finished() bool {
 	return r.disposition == terminalLocalOpenerFinished
 }
 
-func (s *Stream) prepareTerminalLocalOpenerLocked(appErr *ApplicationError, policy terminalOpenerPolicy) terminalLocalOpenerResult {
+func (s *nativeStream) prepareTerminalLocalOpenerLocked(appErr *ApplicationError, policy terminalOpenerPolicy) terminalLocalOpenerResult {
 	if s == nil || s.conn == nil || !s.needsLocalOpenerLocked() {
 		return terminalLocalOpenerResult{}
 	}
@@ -1096,11 +1096,11 @@ func (s *Stream) prepareTerminalLocalOpenerLocked(appErr *ApplicationError, poli
 	return result
 }
 
-func (s *Stream) CancelRead() error {
+func (s *nativeStream) CancelRead() error {
 	return s.CancelReadWithCode(uint64(CodeCancelled))
 }
 
-func (s *Stream) CancelReadWithCode(code uint64) error {
+func (s *nativeStream) CancelReadWithCode(code uint64) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1113,7 +1113,7 @@ func (s *Stream) CancelReadWithCode(code uint64) error {
 	return s.CloseReadWithCode(code)
 }
 
-func (s *Stream) CloseReadWithCode(code uint64) error {
+func (s *nativeStream) CloseReadWithCode(code uint64) error {
 	return s.closeReadWithCode(code)
 }
 
@@ -1240,7 +1240,7 @@ func (e terminalQueueExecution) wrapErr(err error) error {
 	return err
 }
 
-func (e terminalQueueExecution) handleLockedPostQueue(s *Stream, err error) {
+func (e terminalQueueExecution) handleLockedPostQueue(s *nativeStream, err error) {
 	if s == nil || s.conn == nil {
 		return
 	}
@@ -1266,7 +1266,7 @@ func (e terminalQueueExecution) handleLockedPostQueue(s *Stream, err error) {
 	}
 }
 
-func (e terminalQueueExecution) queue(s *Stream) error {
+func (e terminalQueueExecution) queue(s *nativeStream) error {
 	if s == nil || s.conn == nil || len(e.frames) == 0 {
 		return nil
 	}
@@ -1302,7 +1302,7 @@ const (
 	localCloseReadCommitted
 )
 
-func (s *Stream) commitLocalCloseReadLocked() {
+func (s *nativeStream) commitLocalCloseReadLocked() {
 	if s == nil || s.conn == nil {
 		return
 	}
@@ -1313,7 +1313,7 @@ func (s *Stream) commitLocalCloseReadLocked() {
 	s.markLocalReadSignalPending()
 }
 
-func (s *Stream) ensureLocalCloseReadCommittedLocked(commitState localCloseReadCommitState) (localCloseReadCommitState, error) {
+func (s *nativeStream) ensureLocalCloseReadCommittedLocked(commitState localCloseReadCommitState) (localCloseReadCommitState, error) {
 	if s == nil {
 		return localCloseReadPending, ErrSessionClosed
 	}
@@ -1327,7 +1327,7 @@ func (s *Stream) ensureLocalCloseReadCommittedLocked(commitState localCloseReadC
 	return localCloseReadCommitted, nil
 }
 
-func (p closeReadPlan) queue(s *Stream) error {
+func (p closeReadPlan) queue(s *nativeStream) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1350,7 +1350,7 @@ func (p closeReadPlan) queue(s *Stream) error {
 	return nil
 }
 
-func (s *Stream) prepareCloseReadPlanLocked(code uint64) (plan closeReadPlan, err error) {
+func (s *nativeStream) prepareCloseReadPlanLocked(code uint64) (plan closeReadPlan, err error) {
 	if s == nil || s.conn == nil {
 		return closeReadPlan{}, ErrSessionClosed
 	}
@@ -1377,7 +1377,7 @@ func (s *Stream) prepareCloseReadPlanLocked(code uint64) (plan closeReadPlan, er
 	return plan, nil
 }
 
-func (s *Stream) closeReadWithCode(code uint64) error {
+func (s *nativeStream) closeReadWithCode(code uint64) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1408,11 +1408,11 @@ func (s *Stream) closeReadWithCode(code uint64) error {
 	}
 }
 
-func (s *Stream) CloseWrite() error {
+func (s *nativeStream) CloseWrite() error {
 	return s.closeWriteUntil(time.Time{})
 }
 
-func (s *Stream) appendCloseWritePriorityFrameLocked(frames []txFrame, visibility openerVisibilityMark) []txFrame {
+func (s *nativeStream) appendCloseWritePriorityFrameLocked(frames []txFrame, visibility openerVisibilityMark) []txFrame {
 	if s == nil || s.conn == nil || visibility.marksPeerVisible() {
 		return frames
 	}
@@ -1423,7 +1423,7 @@ func (s *Stream) appendCloseWritePriorityFrameLocked(frames []txFrame, visibilit
 	return priority.append(frames)
 }
 
-func (s *Stream) closeWriteUntil(deadlineOverride time.Time) error {
+func (s *nativeStream) closeWriteUntil(deadlineOverride time.Time) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1458,23 +1458,23 @@ func (s *Stream) closeWriteUntil(deadlineOverride time.Time) error {
 	}
 }
 
-func (s *Stream) CancelWrite() error {
+func (s *nativeStream) CancelWrite() error {
 	return s.ResetWrite()
 }
 
-func (s *Stream) CancelWriteWithCode(code uint64) error {
+func (s *nativeStream) CancelWriteWithCode(code uint64) error {
 	return s.resetWriteWithCodeIfNeeded(code)
 }
 
-func (s *Stream) ResetWrite() error {
+func (s *nativeStream) ResetWrite() error {
 	return s.resetWriteWithCodeIfNeeded(uint64(CodeCancelled))
 }
 
-func (s *Stream) ResetWriteWithCode(code uint64) error {
+func (s *nativeStream) ResetWriteWithCode(code uint64) error {
 	return s.resetWriteWithCodeIfNeeded(code)
 }
 
-func (s *Stream) resetWriteWithCodeIfNeeded(code uint64) error {
+func (s *nativeStream) resetWriteWithCodeIfNeeded(code uint64) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1490,28 +1490,28 @@ func (s *Stream) resetWriteWithCodeIfNeeded(code uint64) error {
 	})
 }
 
-func (s *Stream) Reset(code uint64) error {
+func (s *nativeStream) Reset(code uint64) error {
 	return s.executeTerminalSignal(terminalSignalReset, code, "", terminalSignalOptions{
 		openerPolicy: terminalOpenerRejectUnopened,
 		resetSource:  terminalResetDirect,
 	})
 }
 
-func (s *Stream) ResetWithReason(code uint64, reason string) error {
+func (s *nativeStream) ResetWithReason(code uint64, reason string) error {
 	return s.executeTerminalSignal(terminalSignalReset, code, reason, terminalSignalOptions{
 		openerPolicy: terminalOpenerRejectUnopened,
 		resetSource:  terminalResetDirect,
 	})
 }
 
-func (s *Stream) resetAfterStopSending(code uint64) error {
+func (s *nativeStream) resetAfterStopSending(code uint64) error {
 	return s.executeTerminalSignal(terminalSignalReset, code, "", terminalSignalOptions{
 		openerPolicy: terminalOpenerAllow,
 		resetSource:  terminalResetFromStopSending,
 	})
 }
 
-func (c *Conn) failUnopenedLocalStreamLocked(stream *Stream, appErr *ApplicationError) {
+func (c *Conn) failUnopenedLocalStreamLocked(stream *nativeStream, appErr *ApplicationError) {
 	if c == nil || stream == nil || !stream.isLocalOpenedLocked() || !stream.idSet || stream.isSendCommittedLocked() {
 		return
 	}
@@ -1537,7 +1537,7 @@ func (c *Conn) abortStreamState(streamID uint64) error {
 	return c.abortWithCode(streamID, CodeStreamState)
 }
 
-func (s *Stream) Close() error {
+func (s *nativeStream) Close() error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1567,7 +1567,7 @@ func (s *Stream) Close() error {
 	return nil
 }
 
-func (s *Stream) CloseWithError(err error) error {
+func (s *nativeStream) CloseWithError(err error) error {
 	if err == nil {
 		return s.CloseWithErrorCode(uint64(CodeNoError), "")
 	}
@@ -1578,25 +1578,25 @@ func (s *Stream) CloseWithError(err error) error {
 	return s.CloseWithErrorCode(uint64(CodeInternal), err.Error())
 }
 
-func (s *Stream) Abort() error {
+func (s *nativeStream) Abort() error {
 	return s.CloseWithErrorCode(uint64(CodeCancelled), "")
 }
 
-func (s *Stream) AbortWithError(err error) error {
+func (s *nativeStream) AbortWithError(err error) error {
 	return s.CloseWithError(err)
 }
 
-func (s *Stream) AbortWithErrorCode(code uint64, reason string) error {
+func (s *nativeStream) AbortWithErrorCode(code uint64, reason string) error {
 	return s.CloseWithErrorCode(code, reason)
 }
 
-func (s *Stream) CloseWithErrorCode(code uint64, reason string) error {
+func (s *nativeStream) CloseWithErrorCode(code uint64, reason string) error {
 	return s.executeTerminalSignal(terminalSignalAbort, code, reason, terminalSignalOptions{
 		openerPolicy: terminalOpenerAllow,
 	})
 }
 
-func (p terminalFramePlan) queue(s *Stream, opts queuedWriteOptions, commit queuedWriteCommit, rollback terminalFrameRollbackKind) error {
+func (p terminalFramePlan) queue(s *nativeStream, opts queuedWriteOptions, commit queuedWriteCommit, rollback terminalFrameRollbackKind) error {
 	return terminalQueueExecution{
 		frames: p.frames,
 		opts:   opts,
@@ -1608,7 +1608,7 @@ func (p terminalFramePlan) queue(s *Stream, opts queuedWriteOptions, commit queu
 	}.queue(s)
 }
 
-func (p terminalFramePlan) queueCloseReadOpener(s *Stream) error {
+func (p terminalFramePlan) queueCloseReadOpener(s *nativeStream) error {
 	return p.queue(s, queuedWriteOptions{
 		ownership:        frameOwned,
 		openerVisibility: p.openerVisibility,
@@ -1617,7 +1617,7 @@ func (p terminalFramePlan) queueCloseReadOpener(s *Stream) error {
 	}, terminalFrameRollbackNone)
 }
 
-func (p terminalFramePlan) queueCloseWrite(s *Stream, deadlineOverride time.Time) error {
+func (p terminalFramePlan) queueCloseWrite(s *nativeStream, deadlineOverride time.Time) error {
 	return p.queue(s, queuedWriteOptions{
 		terminalPolicy:   terminalWriteAllow,
 		deadlineOverride: deadlineOverride,
@@ -1629,7 +1629,7 @@ func (p terminalFramePlan) queueCloseWrite(s *Stream, deadlineOverride time.Time
 	}, terminalFrameRollbackCloseWrite)
 }
 
-func (s *Stream) prepareTerminalFramePlanLocked(spec terminalDataPrepareSpec) (plan terminalFramePlan, err error) {
+func (s *nativeStream) prepareTerminalFramePlanLocked(spec terminalDataPrepareSpec) (plan terminalFramePlan, err error) {
 	if s == nil || s.conn == nil {
 		return terminalFramePlan{}, ErrSessionClosed
 	}
@@ -1676,7 +1676,7 @@ func (s *Stream) prepareTerminalFramePlanLocked(spec terminalDataPrepareSpec) (p
 	return plan, nil
 }
 
-func (s *Stream) prepareTerminalSignalPlanLocked(kind terminalSignalKind, code uint64, reason string, appErr *ApplicationError, opts terminalSignalOptions) (plan terminalSignalPlan, err error) {
+func (s *nativeStream) prepareTerminalSignalPlanLocked(kind terminalSignalKind, code uint64, reason string, appErr *ApplicationError, opts terminalSignalOptions) (plan terminalSignalPlan, err error) {
 	if s == nil || s.conn == nil {
 		return terminalSignalPlan{}, ErrSessionClosed
 	}
@@ -1700,7 +1700,7 @@ func (s *Stream) prepareTerminalSignalPlanLocked(kind terminalSignalKind, code u
 	return plan, nil
 }
 
-func (s *Stream) applyPreparedTerminalSignalLocked(kind terminalSignalKind, code uint64, appErr *ApplicationError, opts terminalSignalOptions) (frameType FrameType, writeWake terminalWriteWakePolicy) {
+func (s *nativeStream) applyPreparedTerminalSignalLocked(kind terminalSignalKind, code uint64, appErr *ApplicationError, opts terminalSignalOptions) (frameType FrameType, writeWake terminalWriteWakePolicy) {
 	if s == nil || s.conn == nil {
 		return 0, terminalWriteWakeSkip
 	}
@@ -1727,7 +1727,7 @@ func (s *Stream) applyPreparedTerminalSignalLocked(kind terminalSignalKind, code
 	}
 }
 
-func (p terminalSignalPlan) queue(s *Stream) error {
+func (p terminalSignalPlan) queue(s *nativeStream) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1763,7 +1763,7 @@ func (p terminalSignalPlan) queue(s *Stream) error {
 	}.queue(s)
 }
 
-func (s *Stream) executeTerminalSignal(kind terminalSignalKind, code uint64, reason string, opts terminalSignalOptions) error {
+func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint64, reason string, opts terminalSignalOptions) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -1795,14 +1795,14 @@ func (s *Stream) executeTerminalSignal(kind terminalSignalKind, code uint64, rea
 }
 
 var (
-	_ net.Conn  = (*Stream)(nil)
+	_ net.Conn  = (*nativeStream)(nil)
 	_ net.Conn  = (*JoinedConn)(nil)
-	_ io.Reader = (*Stream)(nil)
-	_ io.Writer = (*Stream)(nil)
-	_ io.Reader = (*RecvStream)(nil)
-	_ io.Writer = (*SendStream)(nil)
-	_ ReadHalf  = (*Stream)(nil)
-	_ WriteHalf = (*Stream)(nil)
-	_ ReadHalf  = (*RecvStream)(nil)
-	_ WriteHalf = (*SendStream)(nil)
+	_ io.Reader = (*nativeStream)(nil)
+	_ io.Writer = (*nativeStream)(nil)
+	_ io.Reader = (*nativeRecvStream)(nil)
+	_ io.Writer = (*nativeSendStream)(nil)
+	_ ReadHalf  = (*nativeStream)(nil)
+	_ WriteHalf = (*nativeStream)(nil)
+	_ ReadHalf  = (*nativeRecvStream)(nil)
+	_ WriteHalf = (*nativeSendStream)(nil)
 )

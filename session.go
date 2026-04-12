@@ -73,7 +73,7 @@ type Event struct {
 	Type               EventType
 	SessionState       SessionState
 	StreamID           uint64
-	Stream             *Stream
+	Stream             Stream
 	Local              bool
 	Bidi               bool
 	Time               time.Time
@@ -125,6 +125,30 @@ func (c *Conn) State() SessionState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return publicSessionState(c.lifecycle.sessionState)
+}
+
+// Closed reports whether the session has terminated and can no longer be used
+// for application-visible operations.
+func (c *Conn) Closed() bool {
+	if c == nil {
+		return true
+	}
+	c.mu.Lock()
+	current := c.lifecycle.sessionState
+	closedCh := c.lifecycle.closedCh
+	c.mu.Unlock()
+	if state.IsSessionFinished(current) {
+		return true
+	}
+	if closedCh == nil {
+		return true
+	}
+	select {
+	case <-closedCh:
+		return true
+	default:
+		return false
+	}
 }
 
 func publicSessionState(current connState) SessionState {
@@ -223,7 +247,7 @@ func (a streamArity) acceptQueuedBytes(queues *connQueueState) *uint64 {
 	return &queues.acceptUniBytes
 }
 
-func (s *Stream) streamArity() streamArity {
+func (s *nativeStream) streamArity() streamArity {
 	if s != nil && s.bidi {
 		return streamArityBidi
 	}
@@ -282,19 +306,19 @@ func (c *Conn) lockPeerNonCloseFrameHandling() bool {
 	return true
 }
 
-func (c *Conn) AcceptStream(ctx context.Context) (*Stream, error) {
+func (c *Conn) AcceptStream(ctx context.Context) (*nativeStream, error) {
 	return c.acceptStream(ctx, streamArityBidi)
 }
 
-func (c *Conn) AcceptUniStream(ctx context.Context) (*RecvStream, error) {
+func (c *Conn) AcceptUniStream(ctx context.Context) (*nativeRecvStream, error) {
 	stream, err := c.acceptStream(ctx, streamArityUni)
 	if err != nil {
 		return nil, err
 	}
-	return &RecvStream{stream: stream}, nil
+	return &nativeRecvStream{stream: stream}, nil
 }
 
-func (c *Conn) acceptStream(ctx context.Context, arity streamArity) (*Stream, error) {
+func (c *Conn) acceptStream(ctx context.Context, arity streamArity) (*nativeStream, error) {
 	if c == nil {
 		return nil, ErrSessionClosed
 	}
@@ -366,7 +390,7 @@ func (d streamEventDispatch) shouldEmit() bool {
 	return d.emit
 }
 
-func (c *Conn) takeStreamEventLocked(stream *Stream, typ EventType, err error) streamEventDispatch {
+func (c *Conn) takeStreamEventLocked(stream *nativeStream, typ EventType, err error) streamEventDispatch {
 	if c == nil || c.observer.eventHandler == nil || stream == nil {
 		return streamEventDispatch{}
 	}
@@ -400,31 +424,31 @@ func (c *Conn) takeStreamEventLocked(stream *Stream, typ EventType, err error) s
 	}
 }
 
-func (c *Conn) OpenStream(ctx context.Context) (*Stream, error) {
+func (c *Conn) OpenStream(ctx context.Context) (*nativeStream, error) {
 	return c.OpenStreamWithOptions(ctx, OpenOptions{})
 }
 
-func (c *Conn) OpenUniStream(ctx context.Context) (*SendStream, error) {
+func (c *Conn) OpenUniStream(ctx context.Context) (*nativeSendStream, error) {
 	return c.OpenUniStreamWithOptions(ctx, OpenOptions{})
 }
 
-func (c *Conn) OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (*Stream, error) {
+func (c *Conn) OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (*nativeStream, error) {
 	return c.openStream(ctx, streamArityBidi, opts)
 }
 
-func (c *Conn) OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (*SendStream, error) {
+func (c *Conn) OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (*nativeSendStream, error) {
 	stream, err := c.openStream(ctx, streamArityUni, opts)
 	if err != nil {
 		return nil, err
 	}
-	return &SendStream{stream: stream}, nil
+	return &nativeSendStream{stream: stream}, nil
 }
 
-func (c *Conn) OpenAndSend(ctx context.Context, p []byte) (*Stream, int, error) {
+func (c *Conn) OpenAndSend(ctx context.Context, p []byte) (*nativeStream, int, error) {
 	return c.OpenAndSendWithOptions(ctx, OpenOptions{}, p)
 }
 
-func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*Stream, int, error) {
+func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*nativeStream, int, error) {
 	stream, err := c.OpenStreamWithOptions(ctx, opts)
 	if err != nil {
 		return nil, 0, err
@@ -433,11 +457,11 @@ func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p [
 	return stream, n, err
 }
 
-func (c *Conn) OpenUniAndSend(ctx context.Context, p []byte) (*SendStream, int, error) {
+func (c *Conn) OpenUniAndSend(ctx context.Context, p []byte) (*nativeSendStream, int, error) {
 	return c.OpenUniAndSendWithOptions(ctx, OpenOptions{}, p)
 }
 
-func (c *Conn) OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*SendStream, int, error) {
+func (c *Conn) OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*nativeSendStream, int, error) {
 	stream, err := c.OpenUniStreamWithOptions(ctx, opts)
 	if err != nil {
 		return nil, 0, err
@@ -446,7 +470,7 @@ func (c *Conn) OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, 
 	return stream, n, err
 }
 
-func (c *Conn) openStream(ctx context.Context, arity streamArity, opts OpenOptions) (*Stream, error) {
+func (c *Conn) openStream(ctx context.Context, arity streamArity, opts OpenOptions) (*nativeStream, error) {
 	if c == nil {
 		return nil, ErrSessionClosed
 	}
@@ -1124,8 +1148,12 @@ func closeTransportDrainDelay(err error) time.Duration {
 	switch {
 	case errors.Is(err, ErrKeepaliveTimeout):
 		return 100 * time.Millisecond
-	default:
+	case err == nil || errors.Is(err, ErrSessionClosed):
 		return 0
+	default:
+		// Give the peer a brief chance to observe the emitted CLOSE before a
+		// transport without half-close support turns it into bare EOF/closed-pipe.
+		return 10 * time.Millisecond
 	}
 }
 
@@ -1266,7 +1294,7 @@ func closeSessionStreamErr(finalState connState, err error) *ApplicationError {
 	return closeMappedApplicationError(err)
 }
 
-func (c *Conn) releaseSendLocked(stream *Stream) {
+func (c *Conn) releaseSendLocked(stream *nativeStream) {
 	if stream == nil || stream.sendSent == 0 {
 		return
 	}
@@ -1290,7 +1318,7 @@ func (c *Conn) releaseSendLocked(stream *Stream) {
 	}
 }
 
-func (c *Conn) abortLiveStreamLocked(stream *Stream, code ErrorCode, reason string) error {
+func (c *Conn) abortLiveStreamLocked(stream *nativeStream, code ErrorCode, reason string) error {
 	if c == nil || stream == nil {
 		return nil
 	}
@@ -1328,7 +1356,7 @@ type sessionCloseOptions struct {
 	finalize    bool
 }
 
-func (s *Stream) applySessionCloseStateLocked(appErr *ApplicationError, source terminalAbortSource) {
+func (s *nativeStream) applySessionCloseStateLocked(appErr *ApplicationError, source terminalAbortSource) {
 	if s == nil {
 		return
 	}
@@ -1353,7 +1381,7 @@ func (s *Stream) applySessionCloseStateLocked(appErr *ApplicationError, source t
 	}
 }
 
-func (c *Conn) closeStreamOnSessionWithOptionsLocked(stream *Stream, appErr *ApplicationError, opts sessionCloseOptions) {
+func (c *Conn) closeStreamOnSessionWithOptionsLocked(stream *nativeStream, appErr *ApplicationError, opts sessionCloseOptions) {
 	if stream == nil {
 		return
 	}
@@ -1379,7 +1407,7 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 		sessionErr.Reason == c.sessionControl.peerCloseErr.Reason {
 		source = terminalAbortFromPeer
 	}
-	c.forEachKnownStreamLocked(func(stream *Stream) {
+	c.forEachKnownStreamLocked(func(stream *nativeStream) {
 		c.closeStreamOnSessionWithOptionsLocked(stream, sessionErr, sessionCloseOptions{
 			abortSource: source,
 			finalize:    false,
@@ -2132,7 +2160,7 @@ type connFlowState struct {
 	sendSessionMax        uint64
 	sendSessionUsed       uint64
 	queuedDataBytes       uint64
-	queuedDataStreams     map[*Stream]struct{}
+	queuedDataStreams     map[*nativeStream]struct{}
 	advisoryQueuedBytes   uint64
 	urgentQueuedBytes     uint64
 	sessionMemoryCap      uint64
@@ -2148,7 +2176,7 @@ type sparseQueueState[T any] struct {
 	init  bool
 }
 
-type streamSparseQueueState = sparseQueueState[*Stream]
+type streamSparseQueueState = sparseQueueState[*nativeStream]
 
 type connQueueState struct {
 	provisionalBidi streamSparseQueueState
@@ -2217,7 +2245,7 @@ type connAbuseState struct {
 }
 
 type connRegistryState struct {
-	streams              map[uint64]*Stream
+	streams              map[uint64]*nativeStream
 	liveStreamCount      int
 	liveStreamsInit      bool
 	tombstones           map[uint64]streamTombstone
@@ -2602,7 +2630,7 @@ func storeRetainedBytes(existing, payload []byte, ownership retainedBytesOwnersh
 	return clonePayloadBytes(payload)
 }
 
-func (c *Conn) setStreamOpenInfoLocked(stream *Stream, openInfo []byte) bool {
+func (c *Conn) setStreamOpenInfoLocked(stream *nativeStream, openInfo []byte) bool {
 	if c == nil || stream == nil {
 		return false
 	}
@@ -2620,7 +2648,7 @@ func (c *Conn) setStreamOpenInfoLocked(stream *Stream, openInfo []byte) bool {
 	return !same
 }
 
-func (c *Conn) releaseStreamOpenMetadataPrefixLocked(stream *Stream) {
+func (c *Conn) releaseStreamOpenMetadataPrefixLocked(stream *nativeStream) {
 	if stream == nil || len(stream.openMetadataPrefix) == 0 {
 		return
 	}
@@ -2711,7 +2739,7 @@ func (c *Conn) releasePeerReasonBytesLocked(bytes uint64) {
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleased)
 }
 
-func (c *Conn) releaseStreamPeerReasonBudgetLocked(stream *Stream) {
+func (c *Conn) releaseStreamPeerReasonBudgetLocked(stream *nativeStream) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -2847,6 +2875,9 @@ func (c *Conn) Ping(ctx context.Context, echo []byte) (time.Duration, error) {
 	ctx = contextOrBackground(ctx)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		done, sentAt, err := c.beginGeneratedPing(echo, "build PING")
 		if err == nil {
 			select {
@@ -3270,7 +3301,7 @@ func (l sparseQueueLookup[T]) found() bool {
 	return l.present
 }
 
-func streamQueueEntryNonNil(stream *Stream, _ int) bool {
+func streamQueueEntryNonNil(stream *nativeStream, _ int) bool {
 	return stream != nil
 }
 
@@ -3389,7 +3420,7 @@ type indexedQueue[T comparable] struct {
 	setIndex func(T, int32)
 }
 
-type indexedStreamQueue = indexedQueue[*Stream]
+type indexedStreamQueue = indexedQueue[*nativeStream]
 
 func newIndexedQueue[T comparable](state *sparseQueueState[T], getIndex func(T) int32, setIndex func(T, int32)) indexedQueue[T] {
 	return indexedQueue[T]{
@@ -3399,8 +3430,8 @@ func newIndexedQueue[T comparable](state *sparseQueueState[T], getIndex func(T) 
 	}
 }
 
-func newIndexedStreamQueue(state *streamSparseQueueState, getIndex func(*Stream) int32, setIndex func(*Stream, int32)) indexedStreamQueue {
-	return newIndexedQueue[*Stream](state, getIndex, setIndex)
+func newIndexedStreamQueue(state *streamSparseQueueState, getIndex func(*nativeStream) int32, setIndex func(*nativeStream, int32)) indexedStreamQueue {
+	return newIndexedQueue[*nativeStream](state, getIndex, setIndex)
 }
 
 func (q indexedQueue[T]) ready() bool {
@@ -3541,18 +3572,18 @@ func (q indexedQueue[T]) clear(visit func(T)) {
 	q.state.init = false
 }
 
-func resetIndexedStreamQueueFromStreams(q indexedStreamQueue, streams map[uint64]*Stream, include func(*Stream) bool) {
+func resetIndexedStreamQueueFromStreams(q indexedStreamQueue, streams map[uint64]*nativeStream, include func(*nativeStream) bool) {
 	if !q.ready() {
 		return
 	}
-	q.clear(func(stream *Stream) {
+	q.clear(func(stream *nativeStream) {
 		q.setIndex(stream, invalidStreamQueueIndex)
 	})
 	if include == nil {
 		q.state.init = true
 		return
 	}
-	items := make([]*Stream, 0, len(streams))
+	items := make([]*nativeStream, 0, len(streams))
 	for id, stream := range streams {
 		if !streamMatchesID(stream, id) || !include(stream) {
 			continue
@@ -3569,7 +3600,7 @@ func resetIndexedStreamQueueFromStreams(q indexedStreamQueue, streams map[uint64
 	q.state.init = true
 }
 
-func ensureIndexedStreamQueueFromStreams(q indexedStreamQueue, streams map[uint64]*Stream, include func(*Stream) bool) {
+func ensureIndexedStreamQueueFromStreams(q indexedStreamQueue, streams map[uint64]*nativeStream, include func(*nativeStream) bool) {
 	if !q.ready() || q.state.init {
 		return
 	}
@@ -3605,7 +3636,7 @@ func (c *Conn) hasLiveStreamsLocked() bool {
 	return c.liveStreamCountLocked() > 0
 }
 
-func (c *Conn) forEachKnownStreamLocked(fn func(*Stream)) {
+func (c *Conn) forEachKnownStreamLocked(fn func(*nativeStream)) {
 	if c == nil || fn == nil {
 		return
 	}
@@ -3626,12 +3657,12 @@ func (c *Conn) forEachKnownStreamLocked(fn func(*Stream)) {
 	}
 }
 
-func (c *Conn) storeLiveStreamLocked(stream *Stream) {
+func (c *Conn) storeLiveStreamLocked(stream *nativeStream) {
 	if c == nil || stream == nil || !stream.idSet {
 		return
 	}
 	if c.registry.streams == nil {
-		c.registry.streams = make(map[uint64]*Stream)
+		c.registry.streams = make(map[uint64]*nativeStream)
 	}
 	if !c.registry.liveStreamsInit {
 		c.liveStreamCountLocked()
@@ -3643,7 +3674,7 @@ func (c *Conn) storeLiveStreamLocked(stream *Stream) {
 	c.registry.liveStreamsInit = true
 }
 
-func (c *Conn) dropLiveStreamLocked(streamID uint64) *Stream {
+func (c *Conn) dropLiveStreamLocked(streamID uint64) *nativeStream {
 	if c == nil || streamID == 0 || len(c.registry.streams) == 0 {
 		return nil
 	}
@@ -3668,21 +3699,21 @@ func (c *Conn) resetLiveStreamsLocked() {
 	c.registry.liveStreamsInit = true
 }
 
-func (c *Conn) newLocalStreamLocked(id uint64, arity streamArity, opts OpenOptions, openMetadataPrefix []byte) *Stream {
+func (c *Conn) newLocalStreamLocked(id uint64, arity streamArity, opts OpenOptions, openMetadataPrefix []byte) *nativeStream {
 	return c.newLocalStreamWithIDAndPrefixRetentionLocked(id, arity, opts, openMetadataPrefix, retainedBytesBorrowed)
 }
 
-func (c *Conn) newLocalStreamWithIDLocked(id uint64, arity streamArity, opts OpenOptions, openMetadataPrefix []byte) *Stream {
+func (c *Conn) newLocalStreamWithIDLocked(id uint64, arity streamArity, opts OpenOptions, openMetadataPrefix []byte) *nativeStream {
 	return c.newLocalStreamWithIDAndPrefixRetentionLocked(id, arity, opts, openMetadataPrefix, retainedBytesBorrowed)
 }
 
-func (c *Conn) newLocalStreamWithIDAndPrefixRetentionLocked(id uint64, arity streamArity, opts OpenOptions, openMetadataPrefix []byte, ownership retainedBytesOwnership) *Stream {
+func (c *Conn) newLocalStreamWithIDAndPrefixRetentionLocked(id uint64, arity streamArity, opts OpenOptions, openMetadataPrefix []byte, ownership retainedBytesOwnership) *nativeStream {
 	initialPriority := derefUint64(opts.InitialPriority)
 	initialPrioritySet := opts.InitialPriority != nil
 	initialGroup := derefUint64(opts.InitialGroup)
 	initialGroupSet := opts.InitialGroup != nil
 	prefix := storeOpenMetadataPrefixBytes(nil, openMetadataPrefix, ownership)
-	stream := &Stream{
+	stream := &nativeStream{
 		conn:               c,
 		id:                 id,
 		idSet:              true,
@@ -3715,7 +3746,7 @@ func (c *Conn) newLocalStreamWithIDAndPrefixRetentionLocked(id uint64, arity str
 	return stream
 }
 
-func (c *Conn) newProvisionalLocalStreamLocked(arity streamArity, opts OpenOptions, openMetadataPrefix []byte) *Stream {
+func (c *Conn) newProvisionalLocalStreamLocked(arity streamArity, opts OpenOptions, openMetadataPrefix []byte) *nativeStream {
 	stream := c.newLocalStreamWithIDAndPrefixRetentionLocked(0, arity, opts, openMetadataPrefix, retainedBytesBorrowed)
 	stream.id = 0
 	stream.idSet = false
@@ -3724,7 +3755,7 @@ func (c *Conn) newProvisionalLocalStreamLocked(arity streamArity, opts OpenOptio
 	return stream
 }
 
-func (c *Conn) newProvisionalLocalStreamOwnedLocked(arity streamArity, opts OpenOptions, openMetadataPrefix []byte) *Stream {
+func (c *Conn) newProvisionalLocalStreamOwnedLocked(arity streamArity, opts OpenOptions, openMetadataPrefix []byte) *nativeStream {
 	stream := c.newLocalStreamWithIDAndPrefixRetentionLocked(0, arity, opts, openMetadataPrefix, retainedBytesOwned)
 	stream.id = 0
 	stream.idSet = false
@@ -3777,7 +3808,7 @@ func provisionalQueueShouldCompact(head, length, count int) bool {
 }
 
 type streamQueueLookup struct {
-	stream *Stream
+	stream *nativeStream
 }
 
 func (l streamQueueLookup) found() bool {
@@ -3832,7 +3863,7 @@ func (c *Conn) provisionalTailLocked(arity streamArity) streamQueueLookup {
 	return streamQueueLookup{stream: c.provisionalQueueLocked(arity).tailItem(streamQueueEntryNonNil)}
 }
 
-func (c *Conn) appendProvisionalLocked(stream *Stream) {
+func (c *Conn) appendProvisionalLocked(stream *nativeStream) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -3857,7 +3888,7 @@ func (c *Conn) clearProvisionalQueuesLocked() {
 	c.provisionalQueueLocked(streamArityUni).clear(nil)
 }
 
-func (c *Conn) removeProvisionalLocked(stream *Stream) bool {
+func (c *Conn) removeProvisionalLocked(stream *nativeStream) bool {
 	if stream == nil || stream.idSet {
 		return false
 	}
@@ -3880,7 +3911,7 @@ func (c *Conn) notifyProvisionalWaitersLocked(arity streamArity) {
 	}
 }
 
-func (c *Conn) provisionalCommitWaitLocked(stream *Stream, now time.Time) (provisionalCommitWait, error) {
+func (c *Conn) provisionalCommitWaitLocked(stream *nativeStream, now time.Time) (provisionalCommitWait, error) {
 	if stream == nil || stream.idSet || !stream.needsLocalOpenerLocked() {
 		return provisionalCommitWait{}, nil
 	}
@@ -3906,7 +3937,7 @@ func (c *Conn) provisionalCommitWaitLocked(stream *Stream, now time.Time) (provi
 	}, nil
 }
 
-func (s *Stream) waitForProvisionalOpenTurnLocked(wrap func(error) error) (retry bool, err error) {
+func (s *nativeStream) waitForProvisionalOpenTurnLocked(wrap func(error) error) (retry bool, err error) {
 	if s == nil || s.conn == nil {
 		return false, ErrSessionClosed
 	}
@@ -3938,7 +3969,7 @@ func (s *Stream) waitForProvisionalOpenTurnLocked(wrap func(error) error) (retry
 	return true, nil
 }
 
-func (c *Conn) commitLocalOpenLocked(stream *Stream) (localOpenCommitState, error) {
+func (c *Conn) commitLocalOpenLocked(stream *nativeStream) (localOpenCommitState, error) {
 	if stream == nil || stream.idSet || !stream.needsLocalOpenerLocked() {
 		return localOpenUnchanged, nil
 	}
@@ -3974,7 +4005,7 @@ func (c *Conn) commitLocalOpenLocked(stream *Stream) (localOpenCommitState, erro
 	return localOpenCommitted, nil
 }
 
-func (c *Conn) prepareLocalOpeningLocked(stream *Stream) (localOpenCommitState, error) {
+func (c *Conn) prepareLocalOpeningLocked(stream *nativeStream) (localOpenCommitState, error) {
 	if stream == nil || !stream.needsLocalOpenerLocked() {
 		return localOpenUnchanged, nil
 	}
@@ -3988,11 +4019,11 @@ func (c *Conn) prepareLocalOpeningLocked(stream *Stream) (localOpenCommitState, 
 	return c.commitLocalOpenLocked(stream)
 }
 
-func (c *Conn) failProvisionalLocked(stream *Stream, err error) {
+func (c *Conn) failProvisionalLocked(stream *nativeStream, err error) {
 	c.failProvisionalWithSourceLocked(stream, err, terminalAbortLocal)
 }
 
-func (c *Conn) failProvisionalWithSourceLocked(stream *Stream, err error, source terminalAbortSource) {
+func (c *Conn) failProvisionalWithSourceLocked(stream *nativeStream, err error, source terminalAbortSource) {
 	if stream == nil || stream.idSet {
 		return
 	}
@@ -4099,7 +4130,7 @@ func (c *Conn) reclaimProvisionalLocked(arity streamArity, nextID, maxID uint64)
 	}
 }
 
-func (c *Conn) maybeFinalizePeerActiveLocked(stream *Stream) {
+func (c *Conn) maybeFinalizePeerActiveLocked(stream *nativeStream) {
 	if stream == nil {
 		return
 	}
@@ -4114,14 +4145,14 @@ func (c *Conn) maybeFinalizePeerActiveLocked(stream *Stream) {
 	notify(c.signals.livenessCh)
 }
 
-func shouldTrackUnseenLocalStream(stream *Stream) bool {
+func shouldTrackUnseenLocalStream(stream *nativeStream) bool {
 	return stream != nil &&
 		stream.idSet &&
 		stream.awaitingPeerVisibilityLocked() &&
 		!state.FullyTerminal(stream.localSend, stream.localReceive, stream.effectiveSendHalfStateLocked(), stream.effectiveRecvHalfStateLocked())
 }
 
-func unseenLocalQueueEntryValid(stream *Stream, idx int) bool {
+func unseenLocalQueueEntryValid(stream *nativeStream, idx int) bool {
 	return stream != nil && stream.unseenLocalIndex == int32(idx) && shouldTrackUnseenLocalStream(stream)
 }
 
@@ -4191,7 +4222,7 @@ func (c *Conn) unseenLocalTailLocked(arity streamArity) streamQueueLookup {
 	return streamQueueLookup{stream: c.unseenLocalQueueLocked(arity).tailItem(unseenLocalQueueEntryValid)}
 }
 
-func (c *Conn) appendUnseenLocalLocked(stream *Stream) {
+func (c *Conn) appendUnseenLocalLocked(stream *nativeStream) {
 	if c == nil || !shouldTrackUnseenLocalStream(stream) {
 		return
 	}
@@ -4204,7 +4235,7 @@ func (c *Conn) appendUnseenLocalLocked(stream *Stream) {
 	queue.append(stream)
 }
 
-func (c *Conn) removeUnseenLocalLocked(stream *Stream) bool {
+func (c *Conn) removeUnseenLocalLocked(stream *nativeStream) bool {
 	if c == nil || stream == nil {
 		return false
 	}
@@ -4234,7 +4265,7 @@ func (c *Conn) clearUnseenLocalQueuesLocked() {
 	c.unseenLocalQueueLocked(streamArityUni).clear(nil)
 }
 
-func (c *Conn) markApplicationVisibleLocked(stream *Stream) {
+func (c *Conn) markApplicationVisibleLocked(stream *nativeStream) {
 	if c == nil || stream == nil || stream.applicationVisible {
 		return
 	}
@@ -4289,7 +4320,7 @@ func (c *Conn) acceptQueuedBytesLocked(arity streamArity) *uint64 {
 	return arity.acceptQueuedBytes(&c.queues)
 }
 
-func (c *Conn) addAcceptQueuedBytesLocked(stream *Stream, n uint64) {
+func (c *Conn) addAcceptQueuedBytesLocked(stream *nativeStream, n uint64) {
 	if c == nil || stream == nil || !stream.enqueued || n == 0 {
 		return
 	}
@@ -4297,7 +4328,7 @@ func (c *Conn) addAcceptQueuedBytesLocked(stream *Stream, n uint64) {
 	*queued = saturatingAdd(*queued, n)
 }
 
-func (c *Conn) releaseAcceptQueuedBytesLocked(stream *Stream, n uint64) {
+func (c *Conn) releaseAcceptQueuedBytesLocked(stream *nativeStream, n uint64) {
 	if c == nil || stream == nil || !stream.enqueued || n == 0 {
 		return
 	}
@@ -4305,7 +4336,7 @@ func (c *Conn) releaseAcceptQueuedBytesLocked(stream *Stream, n uint64) {
 	*queued = csub(*queued, n)
 }
 
-func (c *Conn) finishAcceptedRemovalLocked(stream *Stream) {
+func (c *Conn) finishAcceptedRemovalLocked(stream *nativeStream) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -4341,7 +4372,7 @@ func (c *Conn) ensureAcceptQueueLocked(arity streamArity) {
 	c.acceptQueueLocked(arity).initFromItems(streamQueueEntryNonNil)
 }
 
-func (c *Conn) appendAcceptedLocked(stream *Stream) {
+func (c *Conn) appendAcceptedLocked(stream *nativeStream) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -4381,17 +4412,17 @@ func (c *Conn) clearAcceptQueuesLocked() {
 	if c == nil {
 		return
 	}
-	c.acceptQueueLocked(streamArityBidi).clear(func(stream *Stream) {
+	c.acceptQueueLocked(streamArityBidi).clear(func(stream *nativeStream) {
 		stream.clearQueueMembershipState()
 	})
-	c.acceptQueueLocked(streamArityUni).clear(func(stream *Stream) {
+	c.acceptQueueLocked(streamArityUni).clear(func(stream *nativeStream) {
 		stream.clearQueueMembershipState()
 	})
 	c.queues.acceptBidiBytes = 0
 	c.queues.acceptUniBytes = 0
 }
 
-func (c *Conn) dequeueAcceptedLocked(arity streamArity) *Stream {
+func (c *Conn) dequeueAcceptedLocked(arity streamArity) *nativeStream {
 	if c == nil {
 		return nil
 	}
@@ -4415,7 +4446,7 @@ func (c *Conn) dequeueAcceptedLocked(arity streamArity) *Stream {
 	return stream
 }
 
-func (c *Conn) removeAcceptedLocked(stream *Stream) bool {
+func (c *Conn) removeAcceptedLocked(stream *nativeStream) bool {
 	if c == nil || stream == nil || !stream.enqueued {
 		return false
 	}

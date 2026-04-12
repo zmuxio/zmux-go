@@ -332,18 +332,18 @@ func lateDataTrackingFrom(trackPerStream bool) lateDataTracking {
 }
 
 type lateDiscardPlan struct {
-	stream *Stream
+	stream *nativeStream
 	cause  lateDataCause
 }
 
-func ignoredPeerDataLateDiscard(stream *Stream, tracking lateDataTracking) lateDiscardPlan {
+func ignoredPeerDataLateDiscard(stream *nativeStream, tracking lateDataTracking) lateDiscardPlan {
 	if stream == nil || tracking != lateDataTrackingPerStream {
 		return lateDiscardPlan{}
 	}
 	return lateDiscardPlan{stream: stream, cause: stream.lateDataCauseLocked()}
 }
 
-func (c *Conn) discardPeerDataLocked(stream *Stream, appLen uint64, cause lateDataCause) error {
+func (c *Conn) discardPeerDataLocked(stream *nativeStream, appLen uint64, cause lateDataCause) error {
 	if c.sessionReceiveLimitExceededLocked(appLen) {
 		return wireError(CodeFlowControl, "handle DATA", fmt.Errorf("session receive window exceeded"))
 	}
@@ -355,7 +355,7 @@ func (c *Conn) discardPeerDataLocked(stream *Stream, appLen uint64, cause lateDa
 	return nil
 }
 
-func (c *Conn) bufferPeerDataLocked(stream *Stream, appData []byte) {
+func (c *Conn) bufferPeerDataLocked(stream *nativeStream, appData []byte) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -372,7 +372,7 @@ func (c *Conn) bufferPeerDataLocked(stream *Stream, appData []byte) {
 	}
 }
 
-func (c *Conn) retainPeerDataLocked(stream *Stream, appData, backing []byte, handle *wire.FrameReadBufferHandle) {
+func (c *Conn) retainPeerDataLocked(stream *nativeStream, appData, backing []byte, handle *wire.FrameReadBufferHandle) {
 	if c == nil || stream == nil {
 		releaseReadFrameBuffer(backing, handle)
 		return
@@ -611,7 +611,7 @@ func (c *Conn) recordIgnoredPeerTerminalControlLocked(op string, now time.Time) 
 	return c.recordNoOpControlLocked(now, "handle "+op)
 }
 
-func (c *Conn) finishPeerVisibleTerminalControlLocked(stream *Stream, op string, now time.Time, notifyMask streamNotifyMask) error {
+func (c *Conn) finishPeerVisibleTerminalControlLocked(stream *nativeStream, op string, now time.Time, notifyMask streamNotifyMask) error {
 	if c == nil || stream == nil {
 		return nil
 	}
@@ -922,7 +922,7 @@ func (c *Conn) accountDiscardedSessionReceiveLocked(n uint64) {
 	c.flow.recvSessionReceived = saturatingAdd(c.flow.recvSessionReceived, n)
 }
 
-func (c *Conn) releaseReceiveLocked(stream *Stream, n uint64) {
+func (c *Conn) releaseReceiveLocked(stream *nativeStream, n uint64) {
 	if n == 0 {
 		return
 	}
@@ -960,7 +960,7 @@ func (c *Conn) releaseReceiveLocked(stream *Stream, n uint64) {
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(sessionN > 0))
 }
 
-func (c *Conn) releaseLateDiscardLocked(stream *Stream, n uint64, cause lateDataCause) {
+func (c *Conn) releaseLateDiscardLocked(stream *nativeStream, n uint64, cause lateDataCause) {
 	if n == 0 {
 		return
 	}
@@ -989,7 +989,7 @@ func (c *Conn) recordLateDiscardCauseLocked(cause lateDataCause, n uint64) {
 	}
 }
 
-func (c *Conn) lateDataCapExceededLocked(stream *Stream) bool {
+func (c *Conn) lateDataCapExceededLocked(stream *nativeStream) bool {
 	if c.ingress.aggregateLateDataCap > 0 && c.ingress.aggregateLateData > c.ingress.aggregateLateDataCap {
 		return true
 	}
@@ -1011,7 +1011,7 @@ func (c lateDataPerStreamCap) exceeded(received uint64) bool {
 	return c.enabled && received > c.value
 }
 
-func (c *Conn) effectiveLateDataPerStreamCapLocked(stream *Stream) lateDataPerStreamCap {
+func (c *Conn) effectiveLateDataPerStreamCapLocked(stream *nativeStream) lateDataPerStreamCap {
 	if c == nil || stream == nil || !stream.localReceive || !stream.idSet {
 		return lateDataPerStreamCap{}
 	}
@@ -1064,7 +1064,7 @@ func (c *Conn) finishPeerMaxDataFrameLocked(update peerMaxDataUpdate, now time.T
 	return c.recordNoOpMaxDataLocked(now)
 }
 
-func (c *Conn) finishPeerBlockedFrameLocked(stream *Stream, now time.Time) error {
+func (c *Conn) finishPeerBlockedFrameLocked(stream *nativeStream, now time.Time) error {
 	hasPending := c.flow.recvSessionPending != 0
 	if stream != nil {
 		hasPending = hasPending || stream.recvPending != 0
@@ -1245,7 +1245,7 @@ func (c *Conn) handleStreamBlockedFrame(streamID uint64) error {
 	return nil
 }
 
-func (c *Conn) consumeReceiveLocked(stream *Stream, n uint64) {
+func (c *Conn) consumeReceiveLocked(stream *nativeStream, n uint64) {
 	if n == 0 {
 		return
 	}
@@ -1272,7 +1272,7 @@ func (c *Conn) consumeReceiveLocked(stream *Stream, n uint64) {
 	c.maybeReplenishReceiveLocked(stream)
 }
 
-func (c *Conn) maybeReplenishReceiveLocked(stream *Stream) {
+func (c *Conn) maybeReplenishReceiveLocked(stream *nativeStream) {
 	c.maybeReplenishSessionLocked()
 	c.maybeReplenishStreamLocked(stream)
 }
@@ -1314,11 +1314,11 @@ func (c *Conn) replenishSessionLocked(target uint64) {
 	c.queuePendingSessionControlAsync(sessionControlMaxData, clampVarint62(c.flow.recvSessionAdvertised))
 }
 
-func (c *Conn) maybeReplenishStreamLocked(stream *Stream) {
+func (c *Conn) maybeReplenishStreamLocked(stream *nativeStream) {
 	c.maybeReplenishStreamLockedWithPolicy(stream, windowReplenishIfNeeded)
 }
 
-func (c *Conn) maybeReplenishStreamLockedWithPolicy(stream *Stream, policy windowReplenishPolicy) {
+func (c *Conn) maybeReplenishStreamLockedWithPolicy(stream *nativeStream, policy windowReplenishPolicy) {
 	if stream == nil || stream.recvPending == 0 {
 		return
 	}
@@ -1341,7 +1341,7 @@ func (c *Conn) maybeReplenishStreamLockedWithPolicy(stream *Stream, policy windo
 	c.replenishStreamLocked(stream, target)
 }
 
-func (c *Conn) replenishStreamLocked(stream *Stream, target uint64) {
+func (c *Conn) replenishStreamLocked(stream *nativeStream, target uint64) {
 	floor := rt.SaturatingAdd(stream.recvAdvertised, stream.recvPending)
 	desired := floor
 	if c.streamStandingGrowthAllowedLocked(stream) {
@@ -1360,7 +1360,7 @@ func (c *Conn) sessionWindowTargetLocked() uint64 {
 	return rt.MaxUint64(c.config.local.Settings.InitialMaxData, rt.SaturatingMul(c.sessionDataHWMLocked(), 4))
 }
 
-func (c *Conn) streamWindowTargetLocked(stream *Stream) uint64 {
+func (c *Conn) streamWindowTargetLocked(stream *nativeStream) uint64 {
 	if stream == nil || !stream.idSet {
 		return 0
 	}
@@ -1461,7 +1461,7 @@ func (c *Conn) sessionStandingGrowthAllowedLocked() bool {
 	return saturatingAdd(c.flow.recvSessionUsed, c.flow.recvSessionPending) < hwm
 }
 
-func (c *Conn) streamStandingGrowthAllowedLocked(stream *Stream) bool {
+func (c *Conn) streamStandingGrowthAllowedLocked(stream *nativeStream) bool {
 	if stream == nil {
 		return false
 	}
@@ -1697,7 +1697,7 @@ func (c *Conn) recordHiddenAbortChurnLocked(now time.Time) error {
 	)
 }
 
-func (c *Conn) recordVisibleTerminalChurnLocked(stream *Stream, now time.Time, op string) error {
+func (c *Conn) recordVisibleTerminalChurnLocked(stream *nativeStream, now time.Time, op string) error {
 	if c == nil || !shouldRecordVisibleTerminalChurnLocked(stream) {
 		return nil
 	}
@@ -1713,7 +1713,7 @@ func (c *Conn) recordVisibleTerminalChurnLocked(stream *Stream, now time.Time, o
 	)
 }
 
-func shouldRecordVisibleTerminalChurnLocked(stream *Stream) bool {
+func shouldRecordVisibleTerminalChurnLocked(stream *nativeStream) bool {
 	if stream == nil {
 		return false
 	}
@@ -1991,7 +1991,7 @@ func (c *Conn) inboundExtByteBudgetLocked() uint64 {
 	return budget
 }
 
-func (c *Conn) shouldRecordGroupRebucketChurnLocked(stream *Stream, oldGroup uint64, oldExplicit bool) bool {
+func (c *Conn) shouldRecordGroupRebucketChurnLocked(stream *nativeStream, oldGroup uint64, oldExplicit bool) bool {
 	if c == nil || stream == nil {
 		return false
 	}

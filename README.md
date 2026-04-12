@@ -101,3 +101,23 @@ single `net.Conn`-compatible object with `JoinConn`:
 joined := zmux.JoinConn(readHalf, writeHalf)
 session, err := zmux.New(joined, nil)
 ```
+
+## Stable Session Interface
+
+If you want to code against a transport-agnostic session surface, use the
+repository-default `zmux.Session` interface:
+
+```go
+var session zmux.Session
+session, err := zmux.ClientSession(rawConn, nil)
+```
+
+The native constructors (`New`, `Client`, `Server`) still return `*Conn`, and
+`zmux.AsSession(conn)` exposes an existing native connection through the stable
+interface.
+
+## QUIC Adapter
+
+The QUIC adapter lives in the separate submodule
+`github.com/zmuxio/zmux-go/adapter/quicmux` so importing the main `zmux-go`
+module does not pull in `quic-go`.

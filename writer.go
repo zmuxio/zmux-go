@@ -18,8 +18,8 @@ type writeBatchScratch struct {
 	encodedHandle    *writeBatchEncodedBuffer
 	explicitGroups   map[uint64]struct{}
 	explicitGroupIDs []uint64
-	queuedByStream   map[*Stream]uint64
-	queuedStreams    []*Stream
+	queuedByStream   map[*nativeStream]uint64
+	queuedStreams    []*nativeStream
 }
 
 type rejectedWriteRequest struct {
@@ -44,9 +44,9 @@ type dequeuedWriteWork struct {
 type streamValueAccumulator struct {
 	scratch      *writeBatchScratch
 	capHint      int
-	singleStream *Stream
+	singleStream *nativeStream
 	singleValue  uint64
-	values       map[*Stream]uint64
+	values       map[*nativeStream]uint64
 }
 
 type writeBatchEncodedBuffer struct {
@@ -154,9 +154,9 @@ func (s *writeBatchScratch) addExplicitGroup(groupID uint64) {
 	s.explicitGroupIDs = append(s.explicitGroupIDs, groupID)
 }
 
-func (s *writeBatchScratch) queuedStreamScratch(capHint int) map[*Stream]uint64 {
+func (s *writeBatchScratch) queuedStreamScratch(capHint int) map[*nativeStream]uint64 {
 	if s.queuedByStream == nil {
-		s.queuedByStream = make(map[*Stream]uint64, capHint)
+		s.queuedByStream = make(map[*nativeStream]uint64, capHint)
 	} else {
 		for _, stream := range s.queuedStreams {
 			delete(s.queuedByStream, stream)
@@ -167,7 +167,7 @@ func (s *writeBatchScratch) queuedStreamScratch(capHint int) map[*Stream]uint64 
 	return s.queuedByStream
 }
 
-func (s *writeBatchScratch) addQueuedStream(stream *Stream, queued uint64) {
+func (s *writeBatchScratch) addQueuedStream(stream *nativeStream, queued uint64) {
 	if stream == nil || queued == 0 {
 		return
 	}
@@ -197,7 +197,7 @@ func (a *streamValueAccumulator) promote() {
 	a.singleValue = 0
 }
 
-func (a *streamValueAccumulator) Add(stream *Stream, value uint64) {
+func (a *streamValueAccumulator) Add(stream *nativeStream, value uint64) {
 	if a == nil || stream == nil || value == 0 {
 		return
 	}
@@ -218,7 +218,7 @@ func (a *streamValueAccumulator) Add(stream *Stream, value uint64) {
 	a.scratch.addQueuedStream(stream, value)
 }
 
-func (a *streamValueAccumulator) RememberFirst(stream *Stream, value uint64) {
+func (a *streamValueAccumulator) RememberFirst(stream *nativeStream, value uint64) {
 	if a == nil || stream == nil || value == 0 {
 		return
 	}
@@ -243,7 +243,7 @@ func (a *streamValueAccumulator) RememberFirst(stream *Stream, value uint64) {
 	a.scratch.queuedStreams = append(a.scratch.queuedStreams, stream)
 }
 
-func (a *streamValueAccumulator) Range(fn func(stream *Stream, value uint64)) {
+func (a *streamValueAccumulator) Range(fn func(stream *nativeStream, value uint64)) {
 	if fn == nil {
 		return
 	}
@@ -457,7 +457,7 @@ func (c *Conn) suppressWriteRequest(req writeRequest) error {
 	return err
 }
 
-func (c *Conn) suppressWriteRequestForStreamLocked(req *writeRequest, stream *Stream) error {
+func (c *Conn) suppressWriteRequestForStreamLocked(req *writeRequest, stream *nativeStream) error {
 	if req == nil || !req.origin.isStreamGenerated() {
 		return nil
 	}
@@ -491,7 +491,7 @@ func (c *Conn) suppressWriteBatch(batch []writeRequest) []writeRequest {
 		}
 		filtered = append(filtered, *req)
 	}
-	inflightQueued.Range(func(stream *Stream, queued uint64) {
+	inflightQueued.Range(func(stream *nativeStream, queued uint64) {
 		stream.inflightQueued = saturatingAdd(stream.inflightQueued, queued)
 	})
 	c.mu.Unlock()
@@ -689,7 +689,7 @@ func (c *Conn) trackedExplicitGroupCountLocked() int {
 	return c.writer.scheduler.TrackedExplicitGroupCount()
 }
 
-func (c *Conn) trackedGroupBucketLocked(stream *Stream) uint64 {
+func (c *Conn) trackedGroupBucketLocked(stream *nativeStream) uint64 {
 	if stream == nil {
 		return 0
 	}
@@ -702,7 +702,7 @@ func (c *Conn) trackedGroupBucketLocked(stream *Stream) uint64 {
 	return 0
 }
 
-func (c *Conn) selectTrackedGroupBucketLocked(stream *Stream) uint64 {
+func (c *Conn) selectTrackedGroupBucketLocked(stream *nativeStream) uint64 {
 	if !c.tracksExplicitGroupLocked(stream) {
 		return 0
 	}
@@ -718,7 +718,7 @@ func (c *Conn) selectTrackedGroupBucketLocked(stream *Stream) uint64 {
 	return rt.FallbackGroupBucket
 }
 
-func (c *Conn) tracksExplicitGroupLocked(stream *Stream) bool {
+func (c *Conn) tracksExplicitGroupLocked(stream *nativeStream) bool {
 	if c == nil || stream == nil {
 		return false
 	}
@@ -730,7 +730,7 @@ func (c *Conn) tracksExplicitGroupLocked(stream *Stream) bool {
 		stream.group != 0
 }
 
-func (c *Conn) maybeTrackStreamGroupLocked(stream *Stream) {
+func (c *Conn) maybeTrackStreamGroupLocked(stream *nativeStream) {
 	if c == nil || stream == nil || stream.groupTracked {
 		return
 	}
@@ -743,7 +743,7 @@ func (c *Conn) maybeTrackStreamGroupLocked(stream *Stream) {
 	stream.trackedGroup = groupBucket
 }
 
-func (c *Conn) untrackStreamGroupLocked(stream *Stream) {
+func (c *Conn) untrackStreamGroupLocked(stream *nativeStream) {
 	if c == nil || stream == nil || !stream.groupTracked {
 		return
 	}
@@ -755,7 +755,7 @@ func (c *Conn) untrackStreamGroupLocked(stream *Stream) {
 	}
 }
 
-func (c *Conn) setStreamGroupLocked(stream *Stream, group uint64, explicit bool) {
+func (c *Conn) setStreamGroupLocked(stream *nativeStream, group uint64, explicit bool) {
 	if stream == nil {
 		return
 	}
@@ -766,7 +766,7 @@ func (c *Conn) setStreamGroupLocked(stream *Stream, group uint64, explicit bool)
 	c.maybeTrackStreamGroupLocked(stream)
 }
 
-func (c *Conn) dropWriteBatchStateLocked(stream *Stream) {
+func (c *Conn) dropWriteBatchStateLocked(stream *nativeStream) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -782,7 +782,7 @@ func (c *Conn) clearWriteBatchStateLocked() {
 	c.writer.scheduler.Clear()
 }
 
-func (c *Conn) streamBatchGroupKeyLocked(stream *Stream, streamID uint64, explicitGroups map[uint64]struct{}, groupFair bool) rt.GroupKey {
+func (c *Conn) streamBatchGroupKeyLocked(stream *nativeStream, streamID uint64, explicitGroups map[uint64]struct{}, groupFair bool) rt.GroupKey {
 	groupKey := rt.GroupKey{Kind: 0, Value: streamID}
 	if stream == nil || !groupFair || !stream.groupExplicit || stream.group == 0 {
 		return groupKey

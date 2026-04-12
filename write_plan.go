@@ -80,7 +80,7 @@ func (r localOpenerPrepareResult) shouldRetry() bool {
 	return r.status == localOpenerRetry
 }
 
-func (s *Stream) prepareRetriableLocalOpenerLocked(wrap func(error) error) (localOpenerPrepareResult, error) {
+func (s *nativeStream) prepareRetriableLocalOpenerLocked(wrap func(error) error) (localOpenerPrepareResult, error) {
 	if s == nil || s.conn == nil {
 		return localOpenerPrepareResult{}, ErrSessionClosed
 	}
@@ -111,7 +111,7 @@ func (s *Stream) prepareRetriableLocalOpenerLocked(wrap func(error) error) (loca
 	return result, nil
 }
 
-func (s *Stream) openerPrefixLenLocked(visibility openerVisibilityMark) (uint64, error) {
+func (s *nativeStream) openerPrefixLenLocked(visibility openerVisibilityMark) (uint64, error) {
 	if s == nil || s.conn == nil || !visibility.marksPeerVisible() {
 		return 0, nil
 	}
@@ -122,7 +122,7 @@ func (s *Stream) openerPrefixLenLocked(visibility openerVisibilityMark) (uint64,
 	return prefixLen, nil
 }
 
-func (s *Stream) validateOpenedFramesLocked(frames []txFrame, visibility openerVisibilityMark) error {
+func (s *nativeStream) validateOpenedFramesLocked(frames []txFrame, visibility openerVisibilityMark) error {
 	if s == nil || s.conn == nil || !visibility.marksPeerVisible() {
 		return nil
 	}
@@ -132,7 +132,7 @@ func (s *Stream) validateOpenedFramesLocked(frames []txFrame, visibility openerV
 	return validateOutboundTxFramesWithLimits(frames, s.conn.localLimitsView(), s.conn.peerLimitsView())
 }
 
-func (s *Stream) markSendCommittedAndMaybeBarrierLocked(visibility openerVisibilityMark) {
+func (s *nativeStream) markSendCommittedAndMaybeBarrierLocked(visibility openerVisibilityMark) {
 	if s == nil {
 		return
 	}
@@ -142,7 +142,7 @@ func (s *Stream) markSendCommittedAndMaybeBarrierLocked(visibility openerVisibil
 	}
 }
 
-func (s *Stream) currentWritePrepareWindowLocked(visibility openerVisibilityMark, prefixLen uint64) writePrepareWindow {
+func (s *nativeStream) currentWritePrepareWindowLocked(visibility openerVisibilityMark, prefixLen uint64) writePrepareWindow {
 	if s == nil || s.conn == nil {
 		return writePrepareWindow{}
 	}
@@ -155,7 +155,7 @@ func (s *Stream) currentWritePrepareWindowLocked(visibility openerVisibilityMark
 	}
 }
 
-func (s *Stream) validateWriteAdmissionLocked(policy writeAdmissionPolicy) error {
+func (s *nativeStream) validateWriteAdmissionLocked(policy writeAdmissionPolicy) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -197,7 +197,7 @@ type writePrepareAttempt struct {
 
 // acquireWritePrepareWindowLocked returns with conn.mu still held on success.
 // Any retry/fallback/error path returns with the mutex already released.
-func (s *Stream) acquireWritePrepareWindowLocked(mode writePrepareWindowMode, policy writeAdmissionPolicy) (writePrepareAttempt, error) {
+func (s *nativeStream) acquireWritePrepareWindowLocked(mode writePrepareWindowMode, policy writeAdmissionPolicy) (writePrepareAttempt, error) {
 	if s == nil || s.conn == nil {
 		return writePrepareAttempt{}, ErrSessionClosed
 	}
@@ -303,7 +303,7 @@ func (r preparedWriteStepBuild) hasStep() bool {
 	return r.ready
 }
 
-func (s *Stream) buildPreparedWriteStepLocked(
+func (s *nativeStream) buildPreparedWriteStepLocked(
 	parts [][]byte,
 	idx, off, totalRemaining int,
 	mode writeChunkMode,
@@ -350,7 +350,7 @@ func (s *Stream) buildPreparedWriteStepLocked(
 	}
 }
 
-func (s *Stream) prepareWritePartsLocked(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) (writeStep, error) {
+func (s *nativeStream) prepareWritePartsLocked(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) (writeStep, error) {
 	if s == nil || s.conn == nil {
 		return writeStep{}, ErrSessionClosed
 	}
@@ -382,7 +382,7 @@ func (s *Stream) prepareWritePartsLocked(parts [][]byte, idx, off, totalRemainin
 	}
 }
 
-func (s *Stream) reserveWriteChunkLocked(chunk uint64) {
+func (s *nativeStream) reserveWriteChunkLocked(chunk uint64) {
 	if s == nil || s.conn == nil || chunk == 0 {
 		return
 	}
@@ -393,7 +393,7 @@ func (s *Stream) reserveWriteChunkLocked(chunk uint64) {
 	s.conn.clearSessionBlockedStateLocked()
 }
 
-func (s *Stream) finishPreparedWriteStepLocked(frame txFrame, appN int, chunk uint64, visibility openerVisibilityMark, finReservation writeFinReservation) writeStep {
+func (s *nativeStream) finishPreparedWriteStepLocked(frame txFrame, appN int, chunk uint64, visibility openerVisibilityMark, finReservation writeFinReservation) writeStep {
 	if s != nil {
 		if chunk > 0 {
 			s.reserveWriteChunkLocked(chunk)
@@ -409,7 +409,7 @@ func (s *Stream) finishPreparedWriteStepLocked(frame txFrame, appN int, chunk ui
 	return writeStep{frame: frame, appN: appN, openerVisibility: visibility}
 }
 
-func (s *Stream) waitForWriteCreditLocked(availableSession, availableStream uint64) error {
+func (s *nativeStream) waitForWriteCreditLocked(availableSession, availableStream uint64) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
@@ -427,7 +427,7 @@ func (s *Stream) waitForWriteCreditLocked(availableSession, availableStream uint
 	return s.waitWithDeadlineAndWakeTracked(notifyCh, writeWake, deadline, OperationWrite)
 }
 
-func (s *Stream) prepareOwnedWriteRequestFallback(req *writeRequest, localLimits Limits, peerLimits Limits) error {
+func (s *nativeStream) prepareOwnedWriteRequestFallback(req *writeRequest, localLimits Limits, peerLimits Limits) error {
 	if err := validateOutboundTxFramesWithLimits(req.frames, localLimits, peerLimits); err != nil {
 		return err
 	}
@@ -436,7 +436,7 @@ func (s *Stream) prepareOwnedWriteRequestFallback(req *writeRequest, localLimits
 	return nil
 }
 
-func (s *Stream) prepareOwnedWriteRequest(req *writeRequest) error {
+func (s *nativeStream) prepareOwnedWriteRequest(req *writeRequest) error {
 	if req != nil {
 		clearWriteRequestClassification(req)
 		clearPreparedWriteRequestState(req)
@@ -459,7 +459,7 @@ type ownedDataWritePreparation struct {
 	err     error
 }
 
-func (s *Stream) prepareOwnedDataWriteRequest(req *writeRequest, maxPayload uint64) ownedDataWritePreparation {
+func (s *nativeStream) prepareOwnedDataWriteRequest(req *writeRequest, maxPayload uint64) ownedDataWritePreparation {
 	if s == nil || req == nil || len(req.frames) == 0 {
 		return ownedDataWritePreparation{handled: true}
 	}
@@ -518,7 +518,7 @@ func (s *Stream) prepareOwnedDataWriteRequest(req *writeRequest, maxPayload uint
 	return ownedDataWritePreparation{handled: true}
 }
 
-func (s *Stream) annotatePreparedOwnedRollback(req *writeRequest) {
+func (s *nativeStream) annotatePreparedOwnedRollback(req *writeRequest) {
 	if s == nil || req == nil || len(req.frames) == 0 {
 		return
 	}
@@ -553,7 +553,7 @@ func (s *Stream) annotatePreparedOwnedRollback(req *writeRequest) {
 	}
 }
 
-func (s *Stream) commitQueuedWrite(commit queuedWriteCommit) {
+func (s *nativeStream) commitQueuedWrite(commit queuedWriteCommit) {
 	if s == nil || s.conn == nil || commit.empty() {
 		return
 	}
@@ -583,7 +583,7 @@ func (s *Stream) commitQueuedWrite(commit queuedWriteCommit) {
 	}
 }
 
-func (s *Stream) queueFramesUntilDeadlineAndOptionsOwned(frames []txFrame, opts queuedWriteOptions) error {
+func (s *nativeStream) queueFramesUntilDeadlineAndOptionsOwned(frames []txFrame, opts queuedWriteOptions) error {
 	if s == nil || s.conn == nil || len(frames) == 0 {
 		return nil
 	}
@@ -643,7 +643,7 @@ type writeBatchStart struct {
 	queueByteCap uint64
 }
 
-func (s *Stream) beginWriteBatchStartLocked() writeBatchStart {
+func (s *nativeStream) beginWriteBatchStartLocked() writeBatchStart {
 	start := writeBatchStart{burstLimit: defaultWriteBurstFrames}
 	if s == nil || s.conn == nil {
 		return start
@@ -656,11 +656,11 @@ func (s *Stream) beginWriteBatchStartLocked() writeBatchStart {
 	return start
 }
 
-func (s *Stream) writeBurstLimitLocked() int {
+func (s *nativeStream) writeBurstLimitLocked() int {
 	return rt.WriteBurstLimit(s.priority, s.conn.config.peer.Settings.SchedulerHints)
 }
 
-func (s *Stream) writeRequestQueueCapLocked() uint64 {
+func (s *nativeStream) writeRequestQueueCapLocked() uint64 {
 	if s == nil || s.conn == nil {
 		return 0
 	}
@@ -678,7 +678,7 @@ func (start writeBatchStart) allowsNextQueuedFrame(currentQueued uint64, nextFra
 	return saturatingAdd(currentQueued, nextFrameBytes) <= start.queueByteCap
 }
 
-func (s *Stream) txFragmentCapLocked(prefixLen uint64) uint64 {
+func (s *nativeStream) txFragmentCapLocked(prefixLen uint64) uint64 {
 	baseCap := rt.FragmentCap(s.conn.config.peer.Settings.MaxFramePayload, prefixLen, s.priority, s.conn.config.peer.Settings.SchedulerHints)
 	return rt.RateLimitedFragmentCap(baseCap, s.conn.metrics.sendRateEstimate, s.priority, s.conn.config.peer.Settings.SchedulerHints)
 }
@@ -731,19 +731,19 @@ func (state *writeBurstState) hasFrames() bool {
 	return len(state.frames) > 0
 }
 
-func (s *Stream) commitBurstPeerVisible(state writeBurstState) {
+func (s *nativeStream) commitBurstPeerVisible(state writeBurstState) {
 	if state.commit.openerVisibility.marksPeerVisible() {
 		s.commitQueuedWrite(queuedWriteCommit{openerVisibility: state.commit.openerVisibility})
 	}
 }
 
-func (s *Stream) commitBurstProgress(state writeBurstState) {
+func (s *nativeStream) commitBurstProgress(state writeBurstState) {
 	if state.commit.progress > 0 {
 		s.commitQueuedWrite(queuedWriteCommit{progress: state.commit.progress})
 	}
 }
 
-func (s *Stream) commitBurstSuccess(state writeBurstState) {
+func (s *nativeStream) commitBurstSuccess(state writeBurstState) {
 	s.commitQueuedWrite(state.commit)
 }
 
@@ -757,7 +757,7 @@ type writeBurstBatchPreparation struct {
 	handled     bool
 }
 
-func (s *Stream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) writeBurstBatchPreparation {
+func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) writeBurstBatchPreparation {
 	prepared := writeBurstBatchPreparation{
 		start:      writeBatchStart{burstLimit: defaultWriteBurstFrames},
 		finalState: writeBurstNotFinalized,
@@ -863,7 +863,7 @@ func (s *Stream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, totalRema
 	}
 }
 
-func (s *Stream) resetStopSeenWriteFinal() error {
+func (s *nativeStream) resetStopSeenWriteFinal() error {
 	if err := s.Reset(uint64(CodeCancelled)); err != nil {
 		return err
 	}
@@ -888,7 +888,7 @@ const (
 	writeBurstFlushReady
 )
 
-func (s *Stream) queueBurstFramesWithAdmission(state writeBurstState, mode writeChunkMode, deadlinePolicy writeDeadlinePolicy) error {
+func (s *nativeStream) queueBurstFramesWithAdmission(state writeBurstState, mode writeChunkMode, deadlinePolicy writeDeadlinePolicy) error {
 	opts := queuedWriteOptions{
 		terminalPolicy:   terminalWriteReject,
 		ownership:        frameOwned,
@@ -914,7 +914,7 @@ func (s *Stream) queueBurstFramesWithAdmission(state writeBurstState, mode write
 	return s.queueFramesUntilDeadlineAndOptionsOwned(state.frames, opts)
 }
 
-func (s *Stream) finishBurstQueueErr(state writeBurstState, err error) writeBurstResult {
+func (s *nativeStream) finishBurstQueueErr(state writeBurstState, err error) writeBurstResult {
 	if state.commit.progress > 0 {
 		s.commitBurstProgress(state)
 		return writeBurstResult{progress: state.commit.progress, err: err}
@@ -922,7 +922,7 @@ func (s *Stream) finishBurstQueueErr(state writeBurstState, err error) writeBurs
 	return writeBurstResult{err: err}
 }
 
-func (s *Stream) flushWriteBurst(state writeBurstState, chunkMode writeChunkMode, mode writeBurstFlushMode, burstErr error) writeBurstResult {
+func (s *nativeStream) flushWriteBurst(state writeBurstState, chunkMode writeChunkMode, mode writeBurstFlushMode, burstErr error) writeBurstResult {
 	if burstErr != nil {
 		if !state.hasFrames() {
 			return writeBurstResult{err: burstErr}
@@ -975,7 +975,7 @@ func (s *Stream) flushWriteBurst(state writeBurstState, chunkMode writeChunkMode
 	}
 }
 
-func (s *Stream) executeWriteBurst(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) writeBurstResult {
+func (s *nativeStream) executeWriteBurst(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) writeBurstResult {
 	prepared := s.prepareWritePartsBurstBatch(parts, idx, off, totalRemaining, mode)
 	var (
 		state    writeBurstState
@@ -1016,14 +1016,14 @@ func (s *Stream) executeWriteBurst(parts [][]byte, idx, off, totalRemaining int,
 	return s.flushWriteBurst(state, mode, writeBurstFlushReady, nil)
 }
 
-func (s *Stream) writeBurst(remaining []byte) (progress int, stop bool, err error) {
+func (s *nativeStream) writeBurst(remaining []byte) (progress int, stop bool, err error) {
 	var parts [1][]byte
 	parts[0] = remaining
 	result := s.executeWriteBurst(parts[:], 0, 0, len(remaining), writeChunkStreaming)
 	return result.progress, result.stop, result.err
 }
 
-func (s *Stream) writeFinalBurst(parts [][]byte, idx, off, totalRemaining int) (progress int, finalState writeBurstFinalState, stop bool, err error) {
+func (s *nativeStream) writeFinalBurst(parts [][]byte, idx, off, totalRemaining int) (progress int, finalState writeBurstFinalState, stop bool, err error) {
 	result := s.executeWriteBurst(parts, idx, off, totalRemaining, writeChunkFinal)
 	return result.progress, result.finalState, result.stop, result.err
 }

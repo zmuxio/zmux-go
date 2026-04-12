@@ -22,7 +22,7 @@ func TestBidiStreamWriteReadAndCloseWrite(t *testing.T) {
 	defer cancel()
 
 	type acceptResult struct {
-		stream *Stream
+		stream *nativeStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -70,7 +70,7 @@ func TestUniStreamWriteReadAndCloseWrite(t *testing.T) {
 	defer cancel()
 
 	type acceptResult struct {
-		stream *RecvStream
+		stream *nativeRecvStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -115,7 +115,7 @@ func TestSendStreamCloseIgnoresAbsentReadHalf(t *testing.T) {
 	defer cancel()
 
 	type acceptResult struct {
-		stream *RecvStream
+		stream *nativeRecvStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -148,7 +148,7 @@ func TestRecvStreamCloseIgnoresAbsentWriteHalf(t *testing.T) {
 	defer cancel()
 
 	type acceptResult struct {
-		stream *RecvStream
+		stream *nativeRecvStream
 		err    error
 	}
 	acceptCh := make(chan acceptResult, 1)
@@ -173,7 +173,7 @@ func TestRecvStreamCloseIgnoresAbsentWriteHalf(t *testing.T) {
 		t.Fatalf("close recv-only stream: %v", err)
 	}
 
-	awaitStreamWriteState(t, stream.stream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, stream.stream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.localReadStop || s.sendStop != nil || s.sendAbort != nil || s.sendReset != nil || s.sendFinReached()
 	}, "timed out waiting for send-only peer to observe recv-side close")
 
@@ -188,7 +188,7 @@ func TestCloseReadStopsPeerWrites(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		s, _ := server.AcceptStream(ctx)
 		acceptCh <- s
@@ -209,7 +209,7 @@ func TestCloseReadStopsPeerWrites(t *testing.T) {
 		t.Fatalf("close read: %v", err)
 	}
 
-	awaitStreamWriteState(t, stream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, stream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.localReadStop || s.sendStop != nil || s.sendAbort != nil || s.sendReset != nil || s.sendFinReached()
 	}, "timed out waiting for write stop state after peer CloseRead")
 
@@ -225,7 +225,7 @@ func TestCloseWithErrorPropagatesAbort(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		s, _ := server.AcceptStream(ctx)
 		acceptCh <- s
@@ -246,7 +246,7 @@ func TestCloseWithErrorPropagatesAbort(t *testing.T) {
 		t.Fatalf("close with error: %v", err)
 	}
 
-	awaitStreamWriteState(t, stream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, stream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.sendAbort != nil || s.sendReset != nil
 	}, "timed out waiting for peer abort to be observed")
 
@@ -269,7 +269,7 @@ func TestPeerAbortMakesReadReturnApplicationError(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		s, _ := server.AcceptStream(ctx)
 		acceptCh <- s
@@ -294,7 +294,7 @@ func TestPeerAbortMakesReadReturnApplicationError(t *testing.T) {
 		t.Fatalf("server abort: %v", err)
 	}
 
-	awaitStreamReadState(t, clientStream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamReadState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.recvAbort != nil
 	}, "timed out waiting for peer abort to be observed")
 
@@ -537,7 +537,6 @@ func TestProvisionalCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
 }
 
 func TestGoAwayRefusesFutureOpens(t *testing.T) {
-	t.Parallel()
 	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
 	defer cancel()
@@ -594,7 +593,7 @@ func TestPeerGoAwayReclaimsNeverPeerVisibleLocalStream(t *testing.T) {
 		t.Fatalf("server sessionControl: %v", err)
 	}
 
-	awaitStreamWriteState(t, stream, testSignalTimeout, func(s *Stream) bool {
+	awaitStreamWriteState(t, stream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.sendAbort != nil
 	}, "timed out waiting for unseen local stream to be reclaimed by peer GOAWAY")
 
@@ -645,19 +644,19 @@ func TestSuppressWriteRequestRejectsTerminalLocalSend(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		seed  func(*Stream)
+		seed  func(*nativeStream)
 		state state.SendHalfState
 	}{
 		{
 			name: "send_fin",
-			seed: func(stream *Stream) {
+			seed: func(stream *nativeStream) {
 				stream.setSendFin()
 			},
 			state: state.SendHalfFin,
 		},
 		{
 			name: "send_stop_seen",
-			seed: func(stream *Stream) {
+			seed: func(stream *nativeStream) {
 				stream.setSendStopSeen(&ApplicationError{Code: uint64(CodeCancelled)})
 			},
 			state: state.SendHalfStopSeen,
@@ -992,7 +991,7 @@ func TestWriteLoopSuppressesTerminalRequestsInBatch(t *testing.T) {
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 
 	c.mu.Lock()
@@ -1045,7 +1044,7 @@ func TestWriteLoopSuppressesLeadingTerminalRequestWithoutClobberingLaterAccepted
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 
 	c.mu.Lock()
@@ -1098,7 +1097,7 @@ func TestWriteLoopAllowsTerminalResetAndSuppressesOtherTerminalData(t *testing.T
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 
 	c.mu.Lock()
@@ -1166,7 +1165,7 @@ func TestWriteLoopSuppressRejectedDataRollsBackPreparedSendCredit(t *testing.T) 
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 4)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 4)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 
 	c.mu.Lock()
@@ -1233,7 +1232,7 @@ func TestWriteLoopSuppressRejectedFinalClearsPreparedFin(t *testing.T) {
 
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 4)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 4)}, config: connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 
 	c.mu.Lock()
@@ -1316,7 +1315,7 @@ func TestPeerVisibleLocalStreamSurvivesGoAwayReclaim(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	acceptCh := make(chan *Stream, 1)
+	acceptCh := make(chan *nativeStream, 1)
 	go func() {
 		s, _ := server.AcceptStream(ctx)
 		acceptCh <- s
@@ -1960,8 +1959,8 @@ func TestWriteLoopClearsBatchScratchOnExit(t *testing.T) {
 				encoded:        encoded,
 				encodedHandle:  encodedHandle,
 				explicitGroups: map[uint64]struct{}{1: {}},
-				queuedByStream: map[*Stream]uint64{testBuildDetachedStream(nil, 0): 1},
-				queuedStreams:  []*Stream{testBuildDetachedStream(nil, 0)},
+				queuedByStream: map[*nativeStream]uint64{testBuildDetachedStream(nil, 0): 1},
+				queuedStreams:  []*nativeStream{testBuildDetachedStream(nil, 0)},
 			},
 		},
 	}
@@ -2089,7 +2088,7 @@ func TestSuppressWriteBatchClearsRejectedTailRequestRefs(t *testing.T) {
 	t.Parallel()
 
 	c := &Conn{
-		lifecycle: connLifecycleState{closedCh: make(chan struct{})}, registry: connRegistryState{streams: make(map[uint64]*Stream)},
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	stream := testBuildStream(c, 4, testWithLocalSend(), testWithNotifications())
 	stream.setSendFin()
