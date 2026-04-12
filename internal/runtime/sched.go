@@ -220,16 +220,12 @@ func AdjustWeightForLag(base uint64, lag int64, window int64, fresh bool) uint64
 		return max64(base, 1)
 	}
 
-	switch {
-	case lag > 0:
+	if lag > 0 {
 		boost := uint64((int64(base) * min64(lag, window)) / window)
 		return max64(SaturatingAdd(base, max64(boost, 1)), 1)
-	case lag < 0:
-		penalty := uint64((int64(base) * min64(-lag, window)) / (2 * window))
-		return base - penalty
-	default:
-		return max64(base, 1)
 	}
+	penalty := uint64((int64(base) * min64(-lag, window)) / (2 * window))
+	return base - penalty
 }
 
 func GroupWeight(groupKey GroupKey, streamWeight uint64, hint wire.SchedulerHint) uint64 {

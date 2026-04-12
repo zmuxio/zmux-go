@@ -1272,24 +1272,18 @@ func (c *Conn) releaseSendLocked(stream *Stream) {
 	}
 	prevSessionCredit := csub(c.flow.sendSessionMax, c.flow.sendSessionUsed)
 	prevStreamCredit := csub(stream.sendMax, stream.sendSent)
-	prevTracked := c.trackedSessionMemoryLocked()
 	c.flow.sendSessionUsed = csub(c.flow.sendSessionUsed, stream.sendSent)
 	stream.sendSent = 0
 	sessionWake := prevSessionCredit == 0 && csub(c.flow.sendSessionMax, c.flow.sendSessionUsed) > 0
 	streamWake := prevStreamCredit == 0 && csub(stream.sendMax, stream.sendSent) > 0
-	releasedPendingSessionBlocked := false
 	if sessionWake {
 		c.clearSessionBlockedStateLocked()
-		releasedPendingSessionBlocked = c.dropPendingSessionControlLocked(sessionControlBlocked)
+		c.dropPendingSessionControlLocked(sessionControlBlocked)
 	}
 	if streamWake {
 		stream.clearBlockedState()
 	}
-	shouldBroadcast := sessionWake
-	if !shouldBroadcast && releasedPendingSessionBlocked && c.sessionMemoryWakeNeededLocked(prevTracked) {
-		shouldBroadcast = true
-	}
-	if shouldBroadcast {
+	if sessionWake {
 		c.broadcastWriteWakeLocked()
 	} else if streamWake {
 		notify(stream.writeNotify)
