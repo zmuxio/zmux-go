@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -115,7 +116,7 @@ func TestSessionConstructorsRejectNilConn(t *testing.T) {
 			if conn != nil {
 				t.Fatalf("%s returned non-nil conn for nil transport", tc.name)
 			}
-			if err != ErrNilConn {
+			if !errors.Is(err, ErrNilConn) {
 				t.Fatalf("%s err = %v, want %v", tc.name, err, ErrNilConn)
 			}
 		}
@@ -138,7 +139,7 @@ func TestSessionConstructorsRejectNilConn(t *testing.T) {
 			if session != nil {
 				t.Fatalf("%s returned non-nil session for nil transport", tc.name)
 			}
-			if err != ErrNilConn {
+			if !errors.Is(err, ErrNilConn) {
 				t.Fatalf("%s err = %v, want %v", tc.name, err, ErrNilConn)
 			}
 		}
