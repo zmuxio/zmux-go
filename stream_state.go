@@ -331,8 +331,8 @@ func (s *nativeStream) stopSeenLocked() bool {
 	return s != nil && s.effectiveSendHalfStateLocked() == state.SendHalfStopSeen
 }
 
-func (s *nativeStream) stopSeenWriteFinalBurstEligibleLocked(totalRemaining, currentRemaining int) bool {
-	return s.stopSeenLocked() && totalRemaining == currentRemaining
+func (s *nativeStream) stopSeenWriteFinalBurstEligibleLocked(totalRemaining int) bool {
+	return s.stopSeenLocked() && totalRemaining > 0
 }
 
 func (s *nativeStream) stopSeenWriteFinalNeedsImmediateCompletionLocked(totalRemaining, frameCap, availableSession, availableStream uint64) bool {
@@ -1089,6 +1089,11 @@ func (c *Conn) enqueueAcceptedLocked(stream *nativeStream) {
 	c.addAcceptQueuedBytesLocked(stream, stream.recvBuffer)
 	c.appendAcceptedLocked(stream)
 	notify(c.signals.acceptCh)
+	if stream.bidi {
+		notify(c.signals.acceptBidiCh)
+	} else {
+		notify(c.signals.acceptUniCh)
+	}
 }
 
 func (c *Conn) markPeerVisibleLocked(stream *nativeStream) {

@@ -93,6 +93,7 @@ type RecvStream interface {
 // Session defines the repository-default session surface used by native zmux
 // and transport adapters.
 type Session interface {
+	io.Closer
 	AcceptStream(ctx context.Context) (Stream, error)
 	AcceptUniStream(ctx context.Context) (RecvStream, error)
 	OpenStream(ctx context.Context) (Stream, error)
@@ -103,7 +104,6 @@ type Session interface {
 	OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (Stream, int, error)
 	OpenUniAndSend(ctx context.Context, p []byte) (SendStream, int, error)
 	OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (SendStream, int, error)
-	Close() error
 	Wait(ctx context.Context) error
 	Closed() bool
 	State() SessionState
@@ -128,7 +128,8 @@ func NewSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 		}
 		return nil, err
 	}
-	return AsSession(session), nil
+	conn = nil
+	return nativeSession{conn: session}, nil
 }
 
 // ClientSession establishes an initiator-native session and returns it through
@@ -141,7 +142,8 @@ func ClientSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 		}
 		return nil, err
 	}
-	return AsSession(session), nil
+	conn = nil
+	return nativeSession{conn: session}, nil
 }
 
 // ServerSession establishes a responder-native session and returns it through
@@ -154,7 +156,8 @@ func ServerSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 		}
 		return nil, err
 	}
-	return AsSession(session), nil
+	conn = nil
+	return nativeSession{conn: session}, nil
 }
 
 type nativeSession struct {

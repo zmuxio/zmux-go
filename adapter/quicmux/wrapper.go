@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/quic-go/quic-go"
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -116,20 +116,14 @@ func (s *quicSession) OpenStreamWithOptions(ctx context.Context, opts zmux.OpenO
 	if err != nil {
 		return nil, translateError(err)
 	}
-	success := false
-	defer func() {
-		if success {
-			return
-		}
+	wrapped := &quicStream{stream: stream}
+	initLocalStreamBase(&wrapped.quicStreamBase, s.conn, stream, stream, opts)
+	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeInternal))
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		_ = stream.Close()
-	}()
-	wrapped := newLocalBidiStream(s.conn, stream, opts)
-	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
 		return nil, err
 	}
-	success = true
 	return wrapped, nil
 }
 
@@ -141,19 +135,13 @@ func (s *quicSession) OpenUniStreamWithOptions(ctx context.Context, opts zmux.Op
 	if err != nil {
 		return nil, translateError(err)
 	}
-	success := false
-	defer func() {
-		if success {
-			return
-		}
+	wrapped := &quicSendStream{stream: stream}
+	initLocalStreamBase(&wrapped.quicStreamBase, s.conn, nil, stream, opts)
+	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		_ = stream.Close()
-	}()
-	wrapped := newLocalSendStream(s.conn, stream, opts)
-	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
 		return nil, err
 	}
-	success = true
 	return wrapped, nil
 }
 
@@ -525,12 +513,6 @@ type quicStream struct {
 	stream *quic.Stream
 }
 
-func newLocalBidiStream(conn SessionConn, stream *quic.Stream, opts zmux.OpenOptions) *quicStream {
-	wrapped := &quicStream{stream: stream}
-	initLocalStreamBase(&wrapped.quicStreamBase, conn, stream, stream, opts)
-	return wrapped
-}
-
 func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream) (*quicStream, error) {
 	reader := bufio.NewReader(stream)
 	meta, err := readAcceptedStreamMetadata(reader)
@@ -561,13 +543,13 @@ func (s *quicStream) Write(p []byte) (int, error) {
 	if err := s.ensureOpenPrelude(); err != nil {
 		return 0, err
 	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if s.localWriteClosed.Load() {
 		return 0, zmux.ErrWriteClosed
 	}
 	n, err := s.stream.Write(p)
+	if err != nil && s.localWriteClosed.Load() {
+		return n, zmux.ErrWriteClosed
+	}
 	return n, translateError(err)
 }
 
@@ -672,9 +654,6 @@ func (s *quicStream) CloseWrite() error {
 	if err := s.ensureOpenPrelude(); err != nil {
 		return err
 	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if s.localWriteClosed.Load() {
 		return zmux.ErrWriteClosed
 	}
@@ -745,12 +724,6 @@ type quicSendStream struct {
 	stream *quic.SendStream
 }
 
-func newLocalSendStream(conn SessionConn, stream *quic.SendStream, opts zmux.OpenOptions) *quicSendStream {
-	wrapped := &quicSendStream{stream: stream}
-	initLocalStreamBase(&wrapped.quicStreamBase, conn, nil, stream, opts)
-	return wrapped
-}
-
 func (s *quicSendStream) StreamID() uint64 {
 	if s == nil || s.stream == nil {
 		return 0
@@ -780,13 +753,13 @@ func (s *quicSendStream) Write(p []byte) (int, error) {
 	if err := s.ensureOpenPrelude(); err != nil {
 		return 0, err
 	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if s.localWriteClosed.Load() {
 		return 0, zmux.ErrWriteClosed
 	}
 	n, err := s.stream.Write(p)
+	if err != nil && s.localWriteClosed.Load() {
+		return n, zmux.ErrWriteClosed
+	}
 	return n, translateError(err)
 }
 
@@ -820,9 +793,6 @@ func (s *quicSendStream) CloseWrite() error {
 	if err := s.ensureOpenPrelude(); err != nil {
 		return err
 	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	if s.localWriteClosed.Load() {
 		return zmux.ErrWriteClosed
 	}

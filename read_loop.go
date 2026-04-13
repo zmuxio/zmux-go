@@ -84,15 +84,7 @@ func (c *Conn) handleFrameBuffered(frame Frame, backing []byte, handle *wire.Fra
 			return false, err
 		}
 		replyPayload := clonePayloadBytes(frame.Payload)
-		if err := c.queueImmutableFrame(flatTxFrame(Frame{Type: FrameTypePONG, Payload: replyPayload})); err != nil {
-			c.mu.Lock()
-			current := c.lifecycle.sessionState
-			c.mu.Unlock()
-			if state.IsBenignSessionError(current, err, ErrSessionClosed) {
-				return false, nil
-			}
-			return false, err
-		}
+		c.queueReadLoopFrameAsync(flatTxFrame(Frame{Type: FrameTypePONG, Payload: replyPayload}))
 		return false, nil
 	case FrameTypePONG:
 		return false, c.handlePongFrame(frame)
@@ -138,6 +130,46 @@ func (c *Conn) readLoop() {
 			return
 		}
 	}
+}
+
+func (c *Conn) runReadLoopProtocolActionAsync(action func() error) {
+	if c == nil || action == nil {
+		return
+	}
+	go func() {
+		if err := action(); err != nil {
+			c.mu.Lock()
+			current := c.lifecycle.sessionState
+			c.mu.Unlock()
+			if state.IsBenignSessionError(current, err, ErrSessionClosed) {
+				return
+			}
+			c.closeSession(err)
+		}
+	}()
+}
+
+func (c *Conn) queueReadLoopFrameAsync(frame txFrame) {
+	c.runReadLoopProtocolActionAsync(func() error {
+		return c.queueImmutableFrame(frame)
+	})
+}
+
+func (c *Conn) abortWithCodeAsync(streamID uint64, code ErrorCode) error {
+	payload, err := buildCodePayload(uint64(code), "", 0)
+	if err != nil {
+		return wireError(CodeInternal, "queue ABORT", err)
+	}
+	c.queueReadLoopFrameAsync(flatTxFrame(Frame{
+		Type:     FrameTypeABORT,
+		StreamID: streamID,
+		Payload:  payload,
+	}))
+	return nil
+}
+
+func (c *Conn) abortStreamStateAsync(streamID uint64) error {
+	return c.abortWithCodeAsync(streamID, CodeStreamState)
 }
 
 func (c *Conn) validatePeerGoAwayPayloadLocked(payload goAwayPayload) error {
@@ -446,6 +478,7 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 		}
 		if dataPlan.AdvanceRecvFin {
 			stream.setRecvFin()
+			c.maybeFinalizePeerActiveLocked(stream)
 		}
 		c.mu.Unlock()
 		return false, nil
@@ -526,6 +559,13 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 		c.markApplicationVisibleLocked(stream)
 		c.enqueueAcceptedLocked(stream)
 	}
+	if c.flow.sessionMemoryCap > 0 {
+		if memoryErr := c.sessionMemoryCapErrorLocked("handle DATA"); memoryErr != nil {
+			c.mu.Unlock()
+			c.closeSession(memoryErr)
+			return retained, memoryErr
+		}
+	}
 	var refusedVisibleStreamIDs []uint64
 	if stream.applicationVisible && !stream.acceptedFlag() {
 		refusedVisibleStreamIDs = c.enforceVisibleAcceptBacklogLocked()
@@ -535,7 +575,7 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 			}
 			c.mu.Unlock()
 			for _, refusedID := range refusedVisibleStreamIDs {
-				if err := c.abortWithCode(refusedID, CodeRefusedStream); err != nil {
+				if err := c.abortWithCodeAsync(refusedID, CodeRefusedStream); err != nil {
 					return retained, err
 				}
 			}
@@ -554,7 +594,7 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 	c.maybeFinalizePeerActiveLocked(stream)
 	c.mu.Unlock()
 	for _, refusedID := range refusedVisibleStreamIDs {
-		if err := c.abortWithCode(refusedID, CodeRefusedStream); err != nil {
+		if err := c.abortWithCodeAsync(refusedID, CodeRefusedStream); err != nil {
 			return retained, err
 		}
 	}
@@ -586,9 +626,9 @@ func (c *Conn) handleTerminalDataPayload(frame Frame, appData []byte, dispositio
 	}
 	switch disposition.action {
 	case lateDataAbortClosed:
-		return c.abortWithCode(frame.StreamID, CodeStreamClosed)
+		return c.abortWithCodeAsync(frame.StreamID, CodeStreamClosed)
 	case lateDataAbortState:
-		return c.abortStreamState(frame.StreamID)
+		return c.abortStreamStateAsync(frame.StreamID)
 	default:
 		if !c.lockPeerNonCloseFrameHandling() {
 			return nil
@@ -725,6 +765,7 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		if !errors.Is(err, os.ErrDeadlineExceeded) {
 			return err
 		}
+		return stream.resetAfterStopSending(uint64(CodeCancelled))
 	}
 	return stream.resetAfterStopSending(uint64(CodeCancelled))
 }

@@ -300,6 +300,17 @@ func cloneConfig(cfg *Config) Config {
 	}
 	if out.Settings == (Settings{}) {
 		out.Settings = DefaultSettings()
+	} else {
+		defaults := DefaultSettings()
+		if out.Settings.MaxFramePayload == 0 {
+			out.Settings.MaxFramePayload = defaults.MaxFramePayload
+		}
+		if out.Settings.MaxControlPayloadBytes == 0 {
+			out.Settings.MaxControlPayloadBytes = defaults.MaxControlPayloadBytes
+		}
+		if out.Settings.MaxExtensionPayloadBytes == 0 {
+			out.Settings.MaxExtensionPayloadBytes = defaults.MaxExtensionPayloadBytes
+		}
 	}
 	if out.NonceSource == nil {
 		out.NonceSource = rand.Reader

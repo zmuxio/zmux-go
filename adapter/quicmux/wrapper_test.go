@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	quic "github.com/quic-go/quic-go"
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/quic-go/quic-go"
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/adaptertest"
 )
 

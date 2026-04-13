@@ -584,6 +584,9 @@ func (s *nativeStream) consumeReadChunkLocked(c *Conn, n int) {
 	}
 
 	if shouldTightenReadBufAfterConsume(chunk.data[n:]) {
+		if chunk.handle != nil {
+			releaseReadFrameBuffer(chunk.backing, chunk.handle)
+		}
 		chunk.data = clonePayloadBytes(chunk.data[n:])
 		chunk.backing = nil
 		chunk.handle = nil
@@ -1545,22 +1548,22 @@ func (c *Conn) abortWithCode(streamID uint64, code ErrorCode) error {
 	return c.queueImmutableFrame(flatTxFrame(Frame{Type: FrameTypeABORT, StreamID: streamID, Payload: payload}))
 }
 
-func (c *Conn) abortStreamState(streamID uint64) error {
-	return c.abortWithCode(streamID, CodeStreamState)
-}
-
 func (s *nativeStream) Close() error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
 	}
+	var needsCloseWrite bool
+	var needsCloseRead bool
 	s.conn.mu.Lock()
 	if s.conn.lifecycle.closeErr != nil {
 		err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
 		s.conn.mu.Unlock()
 		return sessionOperationErrLocked(s.conn, OperationClose, err)
 	}
+	needsCloseWrite = s.localSend && !state.SendTerminal(s.effectiveSendHalfStateLocked())
+	needsCloseRead = s.localReceive && !state.RecvTerminal(s.effectiveRecvHalfStateLocked()) && !s.readStopSentLocked()
 	s.conn.mu.Unlock()
-	if s.localSend && !state.SendTerminal(s.effectiveSendHalfStateLocked()) {
+	if needsCloseWrite {
 		if err := s.CloseWrite(); err != nil &&
 			!errors.Is(err, ErrStreamNotWritable) &&
 			!errors.Is(err, ErrWriteClosed) &&
@@ -1568,7 +1571,7 @@ func (s *nativeStream) Close() error {
 			return err
 		}
 	}
-	if s.localReceive && !state.RecvTerminal(s.effectiveRecvHalfStateLocked()) && !s.readStopSentLocked() {
+	if needsCloseRead {
 		if err := s.CloseRead(); err != nil &&
 			!errors.Is(err, ErrStreamNotReadable) &&
 			!errors.Is(err, ErrReadClosed) &&

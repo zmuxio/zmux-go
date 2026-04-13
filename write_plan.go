@@ -24,19 +24,6 @@ func totalPartLen(parts [][]byte) int {
 	return total
 }
 
-func sliceRemaining(parts [][]byte, idx, off int) []byte {
-	for idx < len(parts) {
-		part := parts[idx]
-		if off >= len(part) {
-			idx++
-			off = 0
-			continue
-		}
-		return part[off:]
-	}
-	return nil
-}
-
 func advanceParts(parts [][]byte, idx, off, n int) (int, int) {
 	for n > 0 && idx < len(parts) {
 		part := parts[idx]
@@ -766,10 +753,8 @@ func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, tot
 		return prepared
 	}
 
-	currentRemainingLen := 0
 	if mode.isFinal() {
-		currentRemainingLen = len(sliceRemaining(parts, idx, off))
-		if currentRemainingLen == 0 {
+		if totalRemaining == 0 {
 			return prepared
 		}
 	}
@@ -791,7 +776,7 @@ func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, tot
 			prepared.start = s.beginWriteBatchStartLocked()
 			startReady = true
 		}
-		if mode.isFinal() && s.stopSeenLocked() && !s.stopSeenWriteFinalBurstEligibleLocked(totalRemaining, currentRemainingLen) {
+		if mode.isFinal() && s.stopSeenLocked() && !s.stopSeenWriteFinalBurstEligibleLocked(totalRemaining) {
 			s.conn.mu.Unlock()
 			return prepared
 		}

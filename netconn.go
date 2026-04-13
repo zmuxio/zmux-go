@@ -412,25 +412,16 @@ func (p *PausedReadHalf) Resume() error {
 		return ErrSessionClosed
 	}
 	deadline := p.conn.readDeadline
-	p.conn.mu.Unlock()
-
-	if p.current != nil {
-		if err := p.current.SetReadDeadline(deadline); err != nil {
-			return err
-		}
-	}
-
-	p.conn.mu.Lock()
-	if p.conn.closed {
-		p.conn.mu.Unlock()
-		p.resumed = true
-		return ErrSessionClosed
-	}
 	p.conn.readHalf = p.current
 	p.conn.readPaused = false
 	p.conn.broadcastReadLocked()
 	p.conn.mu.Unlock()
 	p.resumed = true
+	if p.current != nil {
+		if err := p.current.SetReadDeadline(deadline); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -469,25 +460,16 @@ func (p *PausedWriteHalf) Resume() error {
 		return ErrSessionClosed
 	}
 	deadline := p.conn.writeDeadline
-	p.conn.mu.Unlock()
-
-	if p.current != nil {
-		if err := p.current.SetWriteDeadline(deadline); err != nil {
-			return err
-		}
-	}
-
-	p.conn.mu.Lock()
-	if p.conn.closed {
-		p.conn.mu.Unlock()
-		p.resumed = true
-		return ErrSessionClosed
-	}
 	p.conn.writeHalf = p.current
 	p.conn.writePaused = false
 	p.conn.broadcastWriteLocked()
 	p.conn.mu.Unlock()
 	p.resumed = true
+	if p.current != nil {
+		if err := p.current.SetWriteDeadline(deadline); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

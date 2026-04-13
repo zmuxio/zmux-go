@@ -345,7 +345,7 @@ func (c *Conn) acceptStream(ctx context.Context, arity streamArity) (*nativeStre
 			}
 			return stream, nil
 		}
-		acceptCh := ensureNotifyChan(&c.signals.acceptCh)
+		acceptCh := c.ensureAcceptNotifyLocked(arity)
 		closedCh := c.lifecycle.closedCh
 		c.mu.Unlock()
 
@@ -1010,19 +1010,21 @@ func (c *Conn) Wait(ctx context.Context) error {
 		return nil
 	}
 	ctx = contextOrBackground(ctx)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.lifecycle.closedCh:
-			return c.waitCloseOperationErr()
-		case <-c.pending.controlNotify:
-			err := c.waitCloseOperationErr()
-			if err == nil {
-				continue
-			}
-			return err
-		}
+	c.mu.Lock()
+	if c.lifecycle.closeErr != nil {
+		c.mu.Unlock()
+		return c.waitCloseOperationErr()
+	}
+	terminalCh := c.ensureTerminalChLocked()
+	closedCh := c.lifecycle.closedCh
+	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-closedCh:
+		return c.waitCloseOperationErr()
+	case <-terminalCh:
+		return c.waitCloseOperationErr()
 	}
 }
 
@@ -1108,6 +1110,7 @@ func (c *Conn) closeSessionWithPolicy(err error, closePolicy closeFramePolicy) {
 
 		sessionErr := closeSessionStreamErr(c.lifecycle.sessionState, err)
 		c.releaseAllStreamsForSessionCloseLocked(sessionErr)
+		c.closeTerminalChLocked()
 		c.notifyAcceptControlAndLiveness()
 		c.mu.Unlock()
 
@@ -1263,6 +1266,16 @@ func (c *Conn) closeClosedChLocked() {
 	close(c.lifecycle.closedCh)
 }
 
+func (c *Conn) closeTerminalChLocked() {
+	if c.lifecycle.terminalCh == nil {
+		c.lifecycle.terminalCh = make(chan struct{})
+	}
+	defer func() {
+		_ = recover()
+	}()
+	close(c.lifecycle.terminalCh)
+}
+
 func (c *Conn) emitCloseFrame(payload []byte) {
 	if c == nil || len(payload) == 0 {
 		return
@@ -1337,18 +1350,14 @@ func (c *Conn) abortLiveStreamLocked(stream *nativeStream, code ErrorCode, reaso
 		c.mu.Unlock()
 		return wireError(CodeInternal, "queue ABORT", payloadErr)
 	}
-	c.mu.Unlock()
-	var frameBuf [1]txFrame
-	frames := frameBuf[:1]
-	frames[0] = flatTxFrame(Frame{
+	frame := flatTxFrame(Frame{
 		Type:     FrameTypeABORT,
 		StreamID: stream.id,
 		Payload:  payload,
 	})
-	return stream.queueFramesUntilDeadlineAndOptionsOwned(frames, queuedWriteOptions{
-		terminalPolicy: terminalWriteAllow,
-		ownership:      frameOwned,
-	})
+	c.mu.Unlock()
+	c.queueReadLoopFrameAsync(frame)
+	return nil
 }
 
 type sessionCloseOptions struct {
@@ -1952,6 +1961,7 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 		lifecycle: connLifecycleState{
 			sessionState: connStateReady,
 			closedCh:     make(chan struct{}),
+			terminalCh:   make(chan struct{}),
 		},
 		signals: connRuntimeSignalState{
 			livenessCh: livenessCh,
@@ -2120,14 +2130,17 @@ type connShutdownRuntimeState struct {
 
 type connLifecycleState struct {
 	closedCh     chan struct{}
+	terminalCh   chan struct{}
 	sessionState connState
 	closeErr     error
 }
 
 type connRuntimeSignalState struct {
-	writeWakeCh chan struct{}
-	acceptCh    chan struct{}
-	livenessCh  chan struct{}
+	writeWakeCh  chan struct{}
+	acceptCh     chan struct{}
+	acceptBidiCh chan struct{}
+	acceptUniCh  chan struct{}
+	livenessCh   chan struct{}
 }
 
 type connIOState struct {
@@ -2328,6 +2341,30 @@ func (c *Conn) ensureLivenessNotifyLocked() chan struct{} {
 	return ensureNotifyChan(&c.signals.livenessCh)
 }
 
+func (c *Conn) ensureAcceptNotifyLocked(arity streamArity) chan struct{} {
+	if c == nil {
+		return nil
+	}
+	ensureNotifyChan(&c.signals.acceptCh)
+	if arity.isBidi() {
+		return ensureNotifyChan(&c.signals.acceptBidiCh)
+	}
+	return ensureNotifyChan(&c.signals.acceptUniCh)
+}
+
+func (c *Conn) ensureTerminalChLocked() chan struct{} {
+	if c == nil {
+		return nil
+	}
+	if c.lifecycle.terminalCh == nil {
+		c.lifecycle.terminalCh = make(chan struct{})
+		if c.lifecycle.closeErr != nil {
+			close(c.lifecycle.terminalCh)
+		}
+	}
+	return c.lifecycle.terminalCh
+}
+
 func (c *Conn) notifyControlAndLiveness() {
 	if c == nil {
 		return
@@ -2341,6 +2378,8 @@ func (c *Conn) notifyAcceptControlAndLiveness() {
 		return
 	}
 	notify(c.signals.acceptCh)
+	notify(c.signals.acceptBidiCh)
+	notify(c.signals.acceptUniCh)
 	c.notifyControlAndLiveness()
 }
 
