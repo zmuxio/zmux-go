@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
@@ -38,43 +39,65 @@ type SessionConn interface {
 // repository-default zmux Session interface.
 func WrapSession(conn SessionConn) zmux.Session {
 	if conn == nil {
-		return nil
+		return &quicSession{}
 	}
 	return &quicSession{conn: conn}
 }
 
 type quicSession struct {
-	conn SessionConn
+	conn     SessionConn
+	bidiOnce sync.Once
+	uniOnce  sync.Once
+	bidiCh   chan bidiAcceptResult
+	uniCh    chan uniAcceptResult
+}
+
+type bidiAcceptResult struct {
+	stream zmux.Stream
+	err    error
+}
+
+type uniAcceptResult struct {
+	stream zmux.RecvStream
+	err    error
 }
 
 func (s *quicSession) AcceptStream(ctx context.Context) (zmux.Stream, error) {
 	if s == nil || s.conn == nil {
 		return nil, zmux.ErrSessionClosed
 	}
-	stream, err := s.conn.AcceptStream(defaultContext(ctx))
-	if err != nil {
-		return nil, translateError(err)
+	ctx = defaultContext(ctx)
+	ch := s.ensureBidiAcceptLoop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.conn.Context().Done():
+		if err := translateWaitError(context.Cause(s.conn.Context())); err != nil {
+			return nil, err
+		}
+		return nil, zmux.ErrSessionClosed
+	case result := <-ch:
+		return result.stream, result.err
 	}
-	wrapped, err := newAcceptedBidiStream(s.conn, stream)
-	if err != nil {
-		return nil, err
-	}
-	return wrapped, nil
 }
 
 func (s *quicSession) AcceptUniStream(ctx context.Context) (zmux.RecvStream, error) {
 	if s == nil || s.conn == nil {
 		return nil, zmux.ErrSessionClosed
 	}
-	stream, err := s.conn.AcceptUniStream(defaultContext(ctx))
-	if err != nil {
-		return nil, translateError(err)
+	ctx = defaultContext(ctx)
+	ch := s.ensureUniAcceptLoop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.conn.Context().Done():
+		if err := translateWaitError(context.Cause(s.conn.Context())); err != nil {
+			return nil, err
+		}
+		return nil, zmux.ErrSessionClosed
+	case result := <-ch:
+		return result.stream, result.err
 	}
-	wrapped, err := newAcceptedRecvStream(s.conn, stream)
-	if err != nil {
-		return nil, err
-	}
-	return wrapped, nil
 }
 
 func (s *quicSession) OpenStream(ctx context.Context) (zmux.Stream, error) {
@@ -97,6 +120,7 @@ func (s *quicSession) OpenStreamWithOptions(ctx context.Context, opts zmux.OpenO
 	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeInternal))
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
+		_ = stream.Close()
 		return nil, err
 	}
 	return wrapped, nil
@@ -113,6 +137,7 @@ func (s *quicSession) OpenUniStreamWithOptions(ctx context.Context, opts zmux.Op
 	wrapped := newLocalSendStream(s.conn, stream, opts)
 	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
+		_ = stream.Close()
 		return nil, err
 	}
 	return wrapped, nil
@@ -162,7 +187,7 @@ func (s *quicSession) Wait(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.conn.Context().Done():
-		return translateError(context.Cause(s.conn.Context()))
+		return translateWaitError(context.Cause(s.conn.Context()))
 	}
 }
 
@@ -189,6 +214,80 @@ func (s *quicSession) Stats() zmux.SessionStats {
 	}
 }
 
+func (s *quicSession) ensureBidiAcceptLoop() <-chan bidiAcceptResult {
+	if s == nil || s.conn == nil {
+		return nil
+	}
+	s.bidiOnce.Do(func() {
+		s.bidiCh = make(chan bidiAcceptResult, 32)
+		go s.acceptBidiLoop()
+	})
+	return s.bidiCh
+}
+
+func (s *quicSession) ensureUniAcceptLoop() <-chan uniAcceptResult {
+	if s == nil || s.conn == nil {
+		return nil
+	}
+	s.uniOnce.Do(func() {
+		s.uniCh = make(chan uniAcceptResult, 32)
+		go s.acceptUniLoop()
+	})
+	return s.uniCh
+}
+
+func (s *quicSession) acceptBidiLoop() {
+	for {
+		stream, err := s.conn.AcceptStream(context.Background())
+		if err != nil {
+			s.publishBidiAcceptResult(bidiAcceptResult{err: translateError(err)})
+			return
+		}
+		go s.finishAcceptedBidiStream(stream)
+	}
+}
+
+func (s *quicSession) acceptUniLoop() {
+	for {
+		stream, err := s.conn.AcceptUniStream(context.Background())
+		if err != nil {
+			s.publishUniAcceptResult(uniAcceptResult{err: translateError(err)})
+			return
+		}
+		go s.finishAcceptedUniStream(stream)
+	}
+}
+
+func (s *quicSession) finishAcceptedBidiStream(stream *quic.Stream) {
+	wrapped, err := newAcceptedBidiStream(s.conn, stream)
+	s.publishBidiAcceptResult(bidiAcceptResult{stream: wrapped, err: err})
+}
+
+func (s *quicSession) finishAcceptedUniStream(stream *quic.ReceiveStream) {
+	wrapped, err := newAcceptedRecvStream(s.conn, stream)
+	s.publishUniAcceptResult(uniAcceptResult{stream: wrapped, err: err})
+}
+
+func (s *quicSession) publishBidiAcceptResult(result bidiAcceptResult) {
+	if s == nil || s.conn == nil || s.bidiCh == nil {
+		return
+	}
+	select {
+	case s.bidiCh <- result:
+	case <-s.conn.Context().Done():
+	}
+}
+
+func (s *quicSession) publishUniAcceptResult(result uniAcceptResult) {
+	if s == nil || s.conn == nil || s.uniCh == nil {
+		return
+	}
+	select {
+	case s.uniCh <- result:
+	case <-s.conn.Context().Done():
+	}
+}
+
 type quicStreamBase struct {
 	conn          SessionConn
 	reader        io.Reader
@@ -198,12 +297,17 @@ type quicStreamBase struct {
 	writeMu sync.Mutex
 	metaMu  sync.Mutex
 
-	preludeSent  bool
-	priority     uint64
-	prioritySet  bool
-	group        uint64
-	groupEncoded bool
-	openInfo     []byte
+	prelude       []byte
+	preludeSent   bool
+	preludeFrozen bool
+	priority      uint64
+	prioritySet   bool
+	group         uint64
+	groupEncoded  bool
+	openInfo      []byte
+
+	localReadClosed  atomic.Bool
+	localWriteClosed atomic.Bool
 }
 
 func initLocalStreamBase(base *quicStreamBase, conn SessionConn, reader io.Reader, writer io.Writer, opts zmux.OpenOptions) {
@@ -262,7 +366,13 @@ func (b *quicStreamBase) readFrom(src io.Reader, p []byte) (int, error) {
 	if src == nil {
 		return 0, zmux.ErrSessionClosed
 	}
+	if b != nil && b.localReadClosed.Load() {
+		return 0, zmux.ErrReadClosed
+	}
 	n, err := src.Read(p)
+	if err != nil && b != nil && b.localReadClosed.Load() {
+		return n, zmux.ErrReadClosed
+	}
 	return n, translateReadError(err)
 }
 
@@ -299,12 +409,15 @@ func (b *quicStreamBase) UpdateMetadata(update zmux.MetadataUpdate) error {
 	if b == nil {
 		return zmux.ErrSessionClosed
 	}
+	if b.localWriteClosed.Load() {
+		return zmux.ErrWriteClosed
+	}
 	if update.Priority == nil && update.Group == nil {
 		return zmux.ErrEmptyMetadataUpdate
 	}
 
 	b.metaMu.Lock()
-	if !b.sendPrelude || b.preludeSent {
+	if !b.sendPrelude || b.preludeSent || b.preludeFrozen {
 		b.metaMu.Unlock()
 		return errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)
 	}
@@ -343,35 +456,54 @@ func (b *quicStreamBase) ensureOpenPrelude() error {
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()
 
-	b.metaMu.Lock()
-	defer b.metaMu.Unlock()
-	if b.preludeSent {
+	prelude, err := b.prepareOpenPrelude()
+	if err != nil {
+		return err
+	}
+	if prelude == nil {
 		return nil
-	}
-
-	prefix, err := wire.BuildOpenMetadataPrefix(
-		quicmuxOpenCaps,
-		uint64PtrIf(b.prioritySet, b.priority),
-		uint64PtrIf(b.groupEncoded, b.group),
-		b.openInfo,
-		quicmuxStreamPreludeMaxPayload,
-	)
-	if err != nil {
-		return err
-	}
-	prelude, err := buildStreamPrelude(prefix)
-	if err != nil {
-		return err
 	}
 	if err := writeAll(b.preludeWriter, prelude); err != nil {
 		return translateError(err)
 	}
+	b.metaMu.Lock()
 	b.preludeSent = true
+	b.metaMu.Unlock()
 	return nil
 }
 
 func (b *quicStreamBase) hasPeerVisibleOpenMetadataLocked() bool {
 	return b.prioritySet || b.groupEncoded || len(b.openInfo) > 0
+}
+
+func (b *quicStreamBase) prepareOpenPrelude() ([]byte, error) {
+	if b == nil {
+		return nil, zmux.ErrSessionClosed
+	}
+	b.metaMu.Lock()
+	defer b.metaMu.Unlock()
+	if b.preludeSent {
+		return nil, nil
+	}
+	if !b.preludeFrozen {
+		prefix, err := wire.BuildOpenMetadataPrefix(
+			quicmuxOpenCaps,
+			uint64PtrIf(b.prioritySet, b.priority),
+			uint64PtrIf(b.groupEncoded, b.group),
+			b.openInfo,
+			quicmuxStreamPreludeMaxPayload,
+		)
+		if err != nil {
+			return nil, err
+		}
+		prelude, err := buildStreamPrelude(prefix)
+		if err != nil {
+			return nil, err
+		}
+		b.prelude = prelude
+		b.preludeFrozen = true
+	}
+	return b.prelude, nil
 }
 
 type quicStream struct {
@@ -409,12 +541,18 @@ func (s *quicStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
+	if s.localWriteClosed.Load() {
+		return 0, zmux.ErrWriteClosed
+	}
 	if err := s.ensureOpenPrelude(); err != nil {
 		return 0, err
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.localWriteClosed.Load() {
+		return 0, zmux.ErrWriteClosed
+	}
 	n, err := s.stream.Write(p)
 	return n, translateError(err)
 }
@@ -498,9 +636,10 @@ func (s *quicStream) CloseReadWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
-	if err := s.ensureOpenPrelude(); err != nil {
-		return err
+	if s.localReadClosed.Load() {
+		return zmux.ErrReadClosed
 	}
+	s.localReadClosed.Store(true)
 	s.stream.CancelRead(quic.StreamErrorCode(code))
 	return nil
 }
@@ -513,13 +652,23 @@ func (s *quicStream) CloseWrite() error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	if s.localWriteClosed.Load() {
+		return zmux.ErrWriteClosed
+	}
 	if err := s.ensureOpenPrelude(); err != nil {
 		return err
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return translateError(s.stream.Close())
+	if s.localWriteClosed.Load() {
+		return zmux.ErrWriteClosed
+	}
+	if err := translateError(s.stream.Close()); err != nil {
+		return err
+	}
+	s.localWriteClosed.Store(true)
+	return nil
 }
 
 func (s *quicStream) Reset(code uint64) error {
@@ -533,9 +682,6 @@ func (s *quicStream) CancelWrite() error {
 func (s *quicStream) CancelWriteWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
-	}
-	if err := s.ensureOpenPrelude(); err != nil {
-		return err
 	}
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
@@ -565,9 +711,6 @@ func (s *quicStream) AbortWithError(err error) error {
 func (s *quicStream) AbortWithErrorCode(code uint64, _ string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
-	}
-	if err := s.ensureOpenPrelude(); err != nil {
-		return err
 	}
 	s.stream.CancelRead(quic.StreamErrorCode(code))
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
@@ -617,12 +760,18 @@ func (s *quicSendStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
+	if s.localWriteClosed.Load() {
+		return 0, zmux.ErrWriteClosed
+	}
 	if err := s.ensureOpenPrelude(); err != nil {
 		return 0, err
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	if s.localWriteClosed.Load() {
+		return 0, zmux.ErrWriteClosed
+	}
 	n, err := s.stream.Write(p)
 	return n, translateError(err)
 }
@@ -651,13 +800,23 @@ func (s *quicSendStream) CloseWrite() error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	if s.localWriteClosed.Load() {
+		return zmux.ErrWriteClosed
+	}
 	if err := s.ensureOpenPrelude(); err != nil {
 		return err
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return translateError(s.stream.Close())
+	if s.localWriteClosed.Load() {
+		return zmux.ErrWriteClosed
+	}
+	if err := translateError(s.stream.Close()); err != nil {
+		return err
+	}
+	s.localWriteClosed.Store(true)
+	return nil
 }
 
 func (s *quicSendStream) Reset(code uint64) error {
@@ -671,9 +830,6 @@ func (s *quicSendStream) CancelWrite() error {
 func (s *quicSendStream) CancelWriteWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
-	}
-	if err := s.ensureOpenPrelude(); err != nil {
-		return err
 	}
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
@@ -786,6 +942,10 @@ func (s *quicRecvStream) CloseReadWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	if s.localReadClosed.Load() {
+		return zmux.ErrReadClosed
+	}
+	s.localReadClosed.Store(true)
 	s.stream.CancelRead(quic.StreamErrorCode(code))
 	return nil
 }
@@ -932,6 +1092,16 @@ func protocolPreludeErr(op string, err error) error {
 func translateReadError(err error) error {
 	if errors.Is(err, io.EOF) {
 		return io.EOF
+	}
+	return translateError(err)
+}
+
+func translateWaitError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if appErr, ok := findError[*quic.ApplicationError](err); ok && appErr.ErrorCode == 0 && appErr.ErrorMessage == "" {
+		return nil
 	}
 	return translateError(err)
 }

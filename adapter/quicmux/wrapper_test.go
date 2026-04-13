@@ -62,6 +62,33 @@ func TestQUICSessionContract(t *testing.T) {
 	adaptertest.RunSessionContract(t, WrapSession(clientConn), WrapSession(serverResult.conn))
 }
 
+func TestWrapSessionNilIsClosedSafeSession(t *testing.T) {
+	session := WrapSession(nil)
+	if session == nil {
+		t.Fatal("WrapSession(nil) = nil, want closed session wrapper")
+	}
+	if !session.Closed() {
+		t.Fatal("WrapSession(nil).Closed() = false, want true")
+	}
+	if session.State() != zmux.SessionStateInvalid {
+		t.Fatalf("WrapSession(nil).State() = %v, want %v", session.State(), zmux.SessionStateInvalid)
+	}
+}
+
+func TestWrapSessionWaitReturnsNilAfterGracefulClose(t *testing.T) {
+	client, _ := newWrappedPair(t)
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close err = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Wait(ctx); err != nil {
+		t.Fatalf("Wait err = %v, want nil", err)
+	}
+}
+
 func TestWrapSessionCloseReadUsesCancelledCode(t *testing.T) {
 	client, server := newWrappedPair(t)
 
@@ -299,6 +326,128 @@ func TestWrapSessionUpdateMetadataAfterVisibilityUnavailable(t *testing.T) {
 	}
 	if !errors.Is(err, zmux.ErrAdapterUnsupported) {
 		t.Fatalf("UpdateMetadata err = %v, want %v", err, zmux.ErrAdapterUnsupported)
+	}
+
+	_ = accepted.stream.Close()
+	_ = stream.Close()
+}
+
+func TestWrapSessionAcceptStreamSkipsStalledPrelude(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stalled, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream stalled err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = stalled.Close()
+	})
+
+	ready, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream ready err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = ready.Close()
+	})
+	if _, err := ready.Write([]byte("x")); err != nil {
+		t.Fatalf("ready Write err = %v", err)
+	}
+
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("AcceptStream err = %v", err)
+	}
+	if accepted.StreamID() != ready.StreamID() {
+		t.Fatalf("accepted StreamID = %d, want %d", accepted.StreamID(), ready.StreamID())
+	}
+
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(accepted, buf); err != nil {
+		t.Fatalf("ReadFull err = %v", err)
+	}
+	if !bytes.Equal(buf, []byte("x")) {
+		t.Fatalf("ReadFull = %q, want %q", buf, []byte("x"))
+	}
+
+	_ = accepted.Close()
+}
+
+func TestWrapSessionCloseReadReturnsErrReadClosedLocally(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if _, err := stream.Write([]byte("x")); err != nil {
+		t.Fatalf("Write err = %v", err)
+	}
+
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+	if err := accepted.stream.CloseRead(); err != nil {
+		t.Fatalf("CloseRead err = %v", err)
+	}
+	if _, err := accepted.stream.Read(make([]byte, 1)); !errors.Is(err, zmux.ErrReadClosed) {
+		t.Fatalf("Read err = %v, want %v", err, zmux.ErrReadClosed)
+	}
+
+	_ = accepted.stream.Close()
+	_ = stream.Close()
+}
+
+func TestWrapSessionCloseWriteReturnsErrWriteClosedLocally(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if _, err := stream.Write([]byte("x")); err != nil {
+		t.Fatalf("Write err = %v", err)
+	}
+
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+	if err := stream.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite err = %v", err)
+	}
+	if _, err := stream.Write([]byte("y")); !errors.Is(err, zmux.ErrWriteClosed) {
+		t.Fatalf("Write err = %v, want %v", err, zmux.ErrWriteClosed)
 	}
 
 	_ = accepted.stream.Close()

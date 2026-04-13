@@ -481,12 +481,19 @@ func (c *Conn) dropPendingStreamControlEntryLocked(kind streamControlKind, strea
 	queue := c.pendingStreamControlQueueLocked(kind)
 	queueKind := pendingStreamQueueKindForControl(kind)
 	removed := false
-	if live := c.pendingTargetStreamLocked(streamID); live != nil {
+	if live := c.registry.streams[streamID]; streamMatchesID(live, streamID) {
 		live.clearPendingControlValueLocked(kind)
 		removed = queue.remove(live, live.pendingQueueIndex(queueKind), streamQueueEntryNonNil)
-	} else if queued := findQueuedStreamByID(queue, streamID); queued != nil {
-		queued.clearPendingControlValueLocked(kind)
-		removed = queue.remove(queued, queued.pendingQueueIndex(queueKind), streamQueueEntryNonNil)
+	} else {
+		for i := queue.state.head; i < len(queue.state.items); i++ {
+			queued := queue.state.items[i]
+			if !streamMatchesID(queued, streamID) {
+				continue
+			}
+			queued.clearPendingControlValueLocked(kind)
+			removed = queue.remove(queued, int32(i), streamQueueEntryNonNil)
+			break
+		}
 	}
 	if !value.present {
 		if removed {
