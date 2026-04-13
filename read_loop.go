@@ -114,7 +114,7 @@ func (c *Conn) readLoop() {
 			if scratch == nil && handle != nil {
 				releaseReadFrameBuffer(buf, handle)
 			}
-			c.closeSession(err)
+			c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
 			return
 		}
 		c.noteInboundFrame(time.Now())
@@ -126,7 +126,7 @@ func (c *Conn) readLoop() {
 			}
 		}
 		if err != nil {
-			c.closeSession(err)
+			c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
 			return
 		}
 	}
@@ -165,7 +165,7 @@ func (c *Conn) handleReadLoopProtocolActionErr(err error) {
 	if state.IsBenignSessionError(current, err, ErrSessionClosed) {
 		return
 	}
-	c.closeSession(err)
+	c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
 }
 
 func (c *Conn) readLoopProtocolLoop(wakeCh, closedCh chan struct{}) {
@@ -192,11 +192,23 @@ func (c *Conn) readLoopProtocolLoop(wakeCh, closedCh chan struct{}) {
 	}
 }
 
+const maxPendingReadLoopProtocolJobs = 256
+
 func (c *Conn) runReadLoopProtocolActionAsync(action func() error) {
 	if c == nil || action == nil {
 		return
 	}
 	c.mu.Lock()
+	if len(c.protocol.jobs) >= maxPendingReadLoopProtocolJobs {
+		c.metrics.protocolBacklogClose = saturatingAdd(c.metrics.protocolBacklogClose, 1)
+		c.mu.Unlock()
+		c.closeSessionWithOptions(
+			wireError(CodeInternal, "queue protocol action", fmt.Errorf("pending protocol backlog exceeded")),
+			closeOriginReadLoop,
+			closeFrameDefault,
+		)
+		return
+	}
 	c.startReadLoopProtocolLoopLocked()
 	c.protocol.jobs = append(c.protocol.jobs, action)
 	wakeCh := c.protocol.wakeCh
@@ -332,7 +344,7 @@ func (c *Conn) handleCloseFrame(frame Frame) error {
 	c.sessionControl.peerCloseView.Store(cloneApplicationError(closeErr))
 	c.mu.Unlock()
 
-	c.closeSession(closeErr)
+	c.closeSessionWithOptions(closeErr, closeOriginReadLoop, closeFrameDefault)
 	notify(c.pending.controlNotify)
 	return closeErr
 }
@@ -512,9 +524,23 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 	dataPlan := stream.peerDataPlanLocked(arrival)
 	switch dataPlan.Outcome {
 	case state.PeerDataAbortState:
-		return false, c.abortLiveStreamLocked(stream, CodeStreamState, "")
+		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
+		if err != nil {
+			c.mu.Unlock()
+			return false, err
+		}
+		c.mu.Unlock()
+		c.queueReadLoopFrameAsync(frame)
+		return false, nil
 	case state.PeerDataAbortClosed:
-		return false, c.abortLiveStreamLocked(stream, CodeStreamClosed, "")
+		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamClosed, "")
+		if err != nil {
+			c.mu.Unlock()
+			return false, err
+		}
+		c.mu.Unlock()
+		c.queueReadLoopFrameAsync(frame)
+		return false, nil
 	case state.PeerDataIgnore:
 		if frame.Flags&FrameFlagOpenMetadata != 0 {
 			c.mu.Unlock()
@@ -588,7 +614,14 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 		return false, err
 	}
 	if receiveWindowExceeded(stream.recvReceived, stream.recvAdvertised, appLen) {
-		return false, c.abortLiveStreamLocked(stream, CodeFlowControl, "")
+		frame, err := c.planAbortLiveStreamLocked(stream, CodeFlowControl, "")
+		if err != nil {
+			c.mu.Unlock()
+			return false, err
+		}
+		c.mu.Unlock()
+		c.queueReadLoopFrameAsync(frame)
+		return false, nil
 	}
 	if c.sessionReceiveLimitExceededLocked(appLen) {
 		c.mu.Unlock()
@@ -617,7 +650,7 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 	if c.flow.sessionMemoryCap > 0 {
 		if memoryErr := c.sessionMemoryCapErrorLocked("handle DATA"); memoryErr != nil {
 			c.mu.Unlock()
-			c.closeSession(memoryErr)
+			c.closeSessionWithOptions(memoryErr, closeOriginReadLoop, closeFrameDefault)
 			return retained, memoryErr
 		}
 	}
@@ -639,7 +672,7 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 	}
 	if memoryErr := c.sessionMemoryCapErrorLocked("handle DATA"); memoryErr != nil {
 		c.mu.Unlock()
-		c.closeSession(memoryErr)
+		c.closeSessionWithOptions(memoryErr, closeOriginReadLoop, closeFrameDefault)
 		return retained, memoryErr
 	}
 	if frame.Flags&FrameFlagFIN != 0 {
@@ -749,7 +782,14 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		return nil
 	}
 	if !stream.localSend {
-		return c.abortLiveStreamLocked(stream, CodeStreamState, "")
+		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
+		if err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		c.mu.Unlock()
+		c.queueReadLoopFrameAsync(frame)
+		return nil
 	}
 	now := time.Now()
 	c.markPeerVisibleLocked(stream)
@@ -798,9 +838,8 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		}
 	}
 	notify(stream.writeNotify)
-	c.mu.Unlock()
-
 	if gracefulFinish {
+		c.mu.Unlock()
 		deadline := time.Now().Add(rt.StopSendingDrainWindow(0))
 		if conn := stream.conn; conn != nil {
 			deadline = time.Now().Add(rt.StopSendingDrainWindow(conn.terminalPolicy.stopSendingDrainWindow))
@@ -832,13 +871,30 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		})
 		return nil
 	}
-	resetPlan, err := stream.prepareResetAfterStopSendingPlan(uint64(CodeCancelled))
+
+	appErr := applicationErr(uint64(CodeCancelled), "")
+	resetPlan, err := stream.prepareTerminalSignalPlanLocked(terminalSignalReset, uint64(CodeCancelled), "", appErr, terminalSignalOptions{
+		openerPolicy: terminalOpenerAllow,
+		resetSource:  terminalResetFromStopSending,
+	})
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
-	c.runReadLoopProtocolActionAsync(func() error {
-		return resetPlan.queuePrepared(stream)
-	})
+	dispatch, queued, err := stream.enqueuePendingTerminalSignalLocked(resetPlan)
+	c.mu.Unlock()
+	if err != nil {
+		c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
+		return nil
+	}
+	if queued {
+		notify(c.pending.terminalNotify)
+		notify(c.pending.controlNotify)
+	}
+	if resetPlan.shouldNotifyWrite() {
+		notify(stream.writeNotify)
+	}
+	emitStreamDispatch(c, dispatch)
 	return nil
 }
 
@@ -872,7 +928,14 @@ func (c *Conn) handleResetFrame(frame Frame) error {
 		return nil
 	}
 	if !stream.localReceive {
-		return c.abortLiveStreamLocked(stream, CodeStreamState, "")
+		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
+		if err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		c.mu.Unlock()
+		c.queueReadLoopFrameAsync(frame)
+		return nil
 	}
 	now := time.Now()
 	c.markPeerVisibleLocked(stream)
@@ -1278,7 +1341,14 @@ func (c *Conn) handleStreamMaxDataFrame(streamID uint64, value uint64) error {
 		c.mu.Unlock()
 		return nil
 	case state.PeerStreamControlAbortState:
-		return c.abortLiveStreamLocked(stream, CodeStreamState, "")
+		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
+		if err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		c.mu.Unlock()
+		c.queueReadLoopFrameAsync(frame)
+		return nil
 	default:
 	}
 	c.markPeerVisibleLocked(stream)
@@ -1346,7 +1416,14 @@ func (c *Conn) handleStreamBlockedFrame(streamID uint64) error {
 		c.mu.Unlock()
 		return nil
 	case state.PeerStreamControlAbortState:
-		return c.abortLiveStreamLocked(stream, CodeStreamState, "")
+		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
+		if err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		c.mu.Unlock()
+		c.queueReadLoopFrameAsync(frame)
+		return nil
 	default:
 	}
 	c.markPeerVisibleLocked(stream)

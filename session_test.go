@@ -468,7 +468,7 @@ func TestPeerGoAwayTransitionsSessionToDraining(t *testing.T) {
 
 func TestPeerGoAwayNotifiesControlPlane(t *testing.T) {
 	t.Parallel()
-	c, _, stop := newHandlerTestConn(t)
+	c, _, stop := newHandlerTestConnWithOptions(t, false)
 	defer stop()
 
 	select {
@@ -2176,7 +2176,7 @@ func TestEventStreamOpenedByCloseRead(t *testing.T) {
 	}
 }
 
-func TestEventStreamOpenedByCloseWithError(t *testing.T) {
+func TestEventStreamOpenedByAbortWithError(t *testing.T) {
 	t.Parallel()
 
 	clientEvents := make(chan Event, 8)
@@ -2194,12 +2194,25 @@ func TestEventStreamOpenedByCloseWithError(t *testing.T) {
 	go func() {
 		defer close(writeDone)
 		select {
+		case <-client.pending.controlNotify:
+			client.mu.Lock()
+			result := client.takePendingControlWriteRequestLocked()
+			client.mu.Unlock()
+			if result.hasRequest() && result.request.done != nil {
+				result.request.done <- nil
+			}
 		case req := <-client.writer.urgentWriteCh:
-			req.done <- nil
+			if req.done != nil {
+				req.done <- nil
+			}
 		case req := <-client.writer.writeCh:
-			req.done <- nil
+			if req.done != nil {
+				req.done <- nil
+			}
 		case req := <-client.writer.advisoryWriteCh:
-			req.done <- nil
+			if req.done != nil {
+				req.done <- nil
+			}
 		case <-time.After(testSignalTimeout):
 		}
 	}()
@@ -2210,7 +2223,7 @@ func TestEventStreamOpenedByCloseWithError(t *testing.T) {
 	client.appendUnseenLocalLocked(stream)
 	client.mu.Unlock()
 
-	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.AbortWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("close with error: %v", err)
 	}
 
@@ -2829,7 +2842,7 @@ func TestCloseStartsByClosingLocalAdmission(t *testing.T) {
 func TestGracefulCloseTransitionsThroughDrainingAndBlocksLocalOpen(t *testing.T) {
 	t.Parallel()
 
-	frames := make(chan Frame, 8)
+	frames := make(chan Frame, 64)
 	releaseFirst := make(chan struct{})
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -2839,7 +2852,7 @@ func TestGracefulCloseTransitionsThroughDrainingAndBlocksLocalOpen(t *testing.T)
 	peerRole := RoleResponder
 	c := &Conn{
 
-		pending: connPendingControlState{controlNotify: make(chan struct{}, 1)},
+		pending: connPendingControlState{controlNotify: make(chan struct{}, 1), terminalNotify: make(chan struct{}, 1)},
 		signals: connRuntimeSignalState{livenessCh: make(chan struct{}, 1), acceptCh: make(chan struct{}, 1)},
 		writer:  connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)},
 
@@ -3035,7 +3048,7 @@ func TestCloseConcurrentCallsEmitSingleCloseFrame(t *testing.T) {
 func TestConcurrentLocalGoAwayKeepsOnlyMostRestrictivePendingReplacement(t *testing.T) {
 	t.Parallel()
 
-	frames := make(chan Frame, 8)
+	frames := make(chan Frame, 64)
 	releaseFirst := make(chan struct{})
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -4685,7 +4698,7 @@ func TestBlockedUrgentQueueReturnsSessionErrorBeforeClosedChOnCloseSession(t *te
 	}
 }
 
-func TestWaitReturnsSessionErrorBeforeClosedChOnCloseSession(t *testing.T) {
+func TestWaitReturnsSessionErrorAfterClosedChOnCloseSession(t *testing.T) {
 	t.Parallel()
 
 	c, sent, release, handlerDone := newStalledCloseSignalConn(t)
@@ -4712,14 +4725,14 @@ func TestWaitReturnsSessionErrorBeforeClosedChOnCloseSession(t *testing.T) {
 		if !IsErrorCode(err, CodeInternal) {
 			t.Fatalf("Wait err = %v, want %s", err, CodeInternal)
 		}
-	case <-time.After(testCloseWakeTimeout):
-		t.Fatal("Wait did not return before closedCh on closeSession")
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Wait did not return on closeSession")
 	}
 
 	select {
 	case <-c.lifecycle.closedCh:
-		t.Fatal("closedCh closed before Wait returned")
 	default:
+		t.Fatal("closedCh still open when Wait returned on closeSession")
 	}
 
 	close(release)
@@ -4737,7 +4750,7 @@ func TestWaitReturnsSessionErrorBeforeClosedChOnCloseSession(t *testing.T) {
 	}
 }
 
-func TestAbortReturnsWaitBeforeClosedChWhenCloseFrameSendStalls(t *testing.T) {
+func TestAbortReturnsWaitAfterClosedChWhenCloseFrameSendStalls(t *testing.T) {
 	t.Parallel()
 
 	c, sent, release, handlerDone := newStalledCloseSignalConn(t)
@@ -4764,14 +4777,14 @@ func TestAbortReturnsWaitBeforeClosedChWhenCloseFrameSendStalls(t *testing.T) {
 		if !IsErrorCode(err, CodeProtocol) {
 			t.Fatalf("Wait err = %v, want %s", err, CodeProtocol)
 		}
-	case <-time.After(testCloseWakeTimeout):
-		t.Fatal("Wait did not return before closedCh on Abort")
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Wait did not return on Abort")
 	}
 
 	select {
 	case <-c.lifecycle.closedCh:
-		t.Fatal("closedCh closed before Wait returned")
 	default:
+		t.Fatal("closedCh still open when Wait returned on Abort")
 	}
 
 	close(release)
@@ -8036,7 +8049,7 @@ func TestDuplicateAbortIgnored(t *testing.T) {
 		t.Fatalf("server read: %v", err)
 	}
 
-	if err := clientStream.CloseWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
+	if err := clientStream.AbortWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
 		t.Fatalf("client abort: %v", err)
 	}
 
@@ -8816,7 +8829,7 @@ func TestStreamTerminalOpsReturnPeerCloseErrorWhenSessionClosedWithoutRuntimeClo
 		},
 		{
 			name: "CloseWithError",
-			fn:   func() error { return stream.CloseWithErrorCode(uint64(CodeProtocol), "protocol") },
+			fn:   func() error { return stream.AbortWithErrorCode(uint64(CodeProtocol), "protocol") },
 		},
 		{
 			name: "Close",
@@ -9484,8 +9497,10 @@ func TestConfigStopSendingDrainWindowOverrideAffectsConvergence(t *testing.T) {
 func newDelayedStopSendingPolicyConn(t *testing.T, delay time.Duration) (*Conn, <-chan Frame, func()) {
 	t.Helper()
 
-	frames := make(chan Frame, 8)
+	frames := make(chan Frame, 64)
 	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	flushDone := make(chan struct{})
 	settings := DefaultSettings()
 	localRole := RoleInitiator
 	peerRole := RoleResponder
@@ -9493,7 +9508,11 @@ func newDelayedStopSendingPolicyConn(t *testing.T, delay time.Duration) (*Conn, 
 
 		pending: connPendingControlState{controlNotify: make(chan struct{}, 1)},
 		signals: connRuntimeSignalState{acceptCh: make(chan struct{}, 1)},
-		writer:  connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)},
+		writer: connWriterRuntimeState{
+			writeCh:         make(chan writeRequest),
+			urgentWriteCh:   make(chan writeRequest),
+			advisoryWriteCh: make(chan writeRequest),
+		},
 
 		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})},
 		sessionControl: connSessionControlState{
@@ -9518,6 +9537,7 @@ func newDelayedStopSendingPolicyConn(t *testing.T, delay time.Duration) (*Conn, 
 	}
 
 	go func() {
+		defer close(writerDone)
 		for {
 			select {
 			case <-stop:
@@ -9526,7 +9546,9 @@ func newDelayedStopSendingPolicyConn(t *testing.T, delay time.Duration) (*Conn, 
 				for _, frame := range req.frames {
 					frames <- testPublicFrame(frame)
 				}
-				req.done <- nil
+				if req.done != nil {
+					req.done <- nil
+				}
 			case <-time.After(delay):
 				select {
 				case <-stop:
@@ -9535,14 +9557,62 @@ func newDelayedStopSendingPolicyConn(t *testing.T, delay time.Duration) (*Conn, 
 					for _, frame := range req.frames {
 						frames <- testPublicFrame(frame)
 					}
-					req.done <- nil
+					if req.done != nil {
+						req.done <- nil
+					}
 				default:
 				}
 			}
 		}
 	}()
+	go func() {
+		defer close(flushDone)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-c.lifecycle.closedCh:
+				return
+			case <-c.pending.controlNotify:
+				c.mu.Lock()
+				result := takePendingTerminalControlRequestForTest(c)
+				c.mu.Unlock()
+				if result.err != nil {
+					c.closeSession(result.err)
+					return
+				}
+				if !result.hasRequest() {
+					continue
+				}
+				select {
+				case <-stop:
+					return
+				case <-c.lifecycle.closedCh:
+					return
+				case c.writer.urgentWriteCh <- result.request:
+				}
+			}
+		}
+	}()
 
-	return c, frames, func() { close(stop) }
+	return c, frames, func() {
+		select {
+		case <-c.lifecycle.closedCh:
+		default:
+			close(c.lifecycle.closedCh)
+		}
+		close(stop)
+		select {
+		case <-writerDone:
+		case <-time.After(testSignalTimeout):
+			t.Fatal("delayed stop-sending writer consumer did not exit")
+		}
+		select {
+		case <-flushDone:
+		case <-time.After(testSignalTimeout):
+			t.Fatal("delayed stop-sending control flush loop did not exit")
+		}
+	}
 }
 
 const (
@@ -9852,20 +9922,53 @@ func invalidUint64Ptr(v uint64) *uint64 {
 	return &v
 }
 
-func newHandlerTestConn(t *testing.T) (*Conn, <-chan Frame, func()) {
+func takePendingTerminalControlRequestForTest(c *Conn) pendingWriteRequestResult {
+	if c == nil || !c.pendingTerminalControlHasEntriesLocked() {
+		return pendingWriteRequestResult{}
+	}
+
+	maxBytes := c.urgentLaneCapLocked()
+	prevTracked := c.trackedSessionMemoryLocked()
+	var frameBuf [maxWriteBatchFrames]txFrame
+	collector := newPendingTxFrameCollector(frameBuf[:0], maxWriteBatchFrames, maxBytes)
+	released := c.visitPendingTerminalControlTxFramesLocked(&collector.stopped, &collector)
+
+	if collector.empty() {
+		c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
+		return pendingWriteRequestResult{}
+	}
+	if err := c.sessionMemoryCapErrorWithAdditionalLocked("queue urgent terminal control", collector.queuedBytes); err != nil {
+		c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
+		return pendingWriteRequestResult{err: err}
+	}
+	c.flow.urgentQueuedBytes = saturatingAdd(c.flow.urgentQueuedBytes, collector.queuedBytes)
+	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
+	return pendingWriteRequestResult{
+		request: buildPendingControlWriteRequest(collector.frames, collector.queuedBytes, writeLaneUrgent),
+		ready:   true,
+	}
+}
+
+func newHandlerTestConnWithOptions(t *testing.T, autoFlushTerminalControl bool) (*Conn, chan Frame, func()) {
 	t.Helper()
 
 	frames := make(chan Frame, 8)
 	stop := make(chan struct{})
 	var stopOnce sync.Once
+	writerDone := make(chan struct{})
+	flushDone := make(chan struct{})
 	settings := DefaultSettings()
 	localRole := RoleInitiator
 	peerRole := RoleResponder
 	c := &Conn{
 
-		pending: connPendingControlState{controlNotify: make(chan struct{}, 1)},
+		pending: connPendingControlState{controlNotify: make(chan struct{}, 1), terminalNotify: make(chan struct{}, 1)},
 		signals: connRuntimeSignalState{acceptCh: make(chan struct{}, 1)},
-		writer:  connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)},
+		writer: connWriterRuntimeState{
+			writeCh:         make(chan writeRequest),
+			urgentWriteCh:   make(chan writeRequest),
+			advisoryWriteCh: make(chan writeRequest),
+		},
 
 		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})},
 		sessionControl: connSessionControlState{
@@ -9889,6 +9992,7 @@ func newHandlerTestConn(t *testing.T) (*Conn, <-chan Frame, func()) {
 			nextPeerUni:   state.FirstPeerStreamID(localRole, false)},
 	}
 	go func() {
+		defer close(writerDone)
 		for {
 			select {
 			case <-stop:
@@ -9897,16 +10001,75 @@ func newHandlerTestConn(t *testing.T) (*Conn, <-chan Frame, func()) {
 				for _, frame := range req.frames {
 					frames <- testPublicFrame(frame)
 				}
-				req.done <- nil
+				if req.done != nil {
+					req.done <- nil
+				}
 			case req := <-c.writer.urgentWriteCh:
 				for _, frame := range req.frames {
 					frames <- testPublicFrame(frame)
 				}
-				req.done <- nil
+				if req.done != nil {
+					req.done <- nil
+				}
 			}
 		}
 	}()
-	return c, frames, func() { stopOnce.Do(func() { close(stop) }) }
+	if autoFlushTerminalControl {
+		go func() {
+			defer close(flushDone)
+			for {
+				select {
+				case <-stop:
+					return
+				case <-c.lifecycle.closedCh:
+					return
+				case <-c.pending.terminalNotify:
+					c.mu.Lock()
+					result := takePendingTerminalControlRequestForTest(c)
+					c.mu.Unlock()
+					if result.err != nil {
+						c.closeSession(result.err)
+						return
+					}
+					if !result.hasRequest() {
+						continue
+					}
+					select {
+					case <-stop:
+						return
+					case <-c.lifecycle.closedCh:
+						return
+					case c.writer.urgentWriteCh <- result.request:
+					}
+				}
+			}
+		}()
+	} else {
+		close(flushDone)
+	}
+	return c, frames, func() {
+		select {
+		case <-c.lifecycle.closedCh:
+		default:
+			close(c.lifecycle.closedCh)
+		}
+		stopOnce.Do(func() { close(stop) })
+		select {
+		case <-writerDone:
+		case <-time.After(testSignalTimeout):
+			t.Fatal("handler test writer consumer did not exit")
+		}
+		select {
+		case <-flushDone:
+		case <-time.After(testSignalTimeout):
+			t.Fatal("handler test control flush loop did not exit")
+		}
+	}
+}
+
+func newHandlerTestConn(t *testing.T) (*Conn, chan Frame, func()) {
+	t.Helper()
+	return newHandlerTestConnWithOptions(t, true)
 }
 
 func configureTestConnHandshakeLocked(c *Conn, localRole, peerRole Role, capabilities Capabilities) {
@@ -10986,7 +11149,7 @@ func TestPrecommitAbortDoesNotConsumeFirstStreamID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open first stream: %v", err)
 	}
-	if err := first.CloseWithErrorCode(uint64(CodeCancelled), ""); err != nil {
+	if err := first.AbortWithErrorCode(uint64(CodeCancelled), ""); err != nil {
 		t.Fatalf("abort provisional stream: %v", err)
 	}
 	if got := first.StreamID(); got != 0 {
@@ -12125,7 +12288,7 @@ func TestLaterProvisionalWriteUsesFirstIDAfterEarlierCancel(t *testing.T) {
 	}
 	assertNoQueuedFrame(t, frames)
 
-	if err := first.CloseWithErrorCode(uint64(CodeCancelled), ""); err != nil {
+	if err := first.AbortWithErrorCode(uint64(CodeCancelled), ""); err != nil {
 		t.Fatalf("cancel first provisional: %v", err)
 	}
 	assertNoQueuedFrame(t, frames)
@@ -15622,14 +15785,20 @@ func newStopSendingDrainTimeoutConn(t *testing.T) (*Conn, <-chan Frame, func()) 
 
 	frames := make(chan Frame, 8)
 	stop := make(chan struct{})
+	writerDone := make(chan struct{})
+	flushDone := make(chan struct{})
 	settings := DefaultSettings()
 	localRole := RoleInitiator
 	peerRole := RoleResponder
 	c := &Conn{
 
-		pending: connPendingControlState{controlNotify: make(chan struct{}, 1)},
+		pending: connPendingControlState{controlNotify: make(chan struct{}, 1), terminalNotify: make(chan struct{}, 1)},
 		signals: connRuntimeSignalState{acceptCh: make(chan struct{}, 1)},
-		writer:  connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)},
+		writer: connWriterRuntimeState{
+			writeCh:         make(chan writeRequest),
+			urgentWriteCh:   make(chan writeRequest),
+			advisoryWriteCh: make(chan writeRequest),
+		},
 
 		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})},
 		sessionControl: connSessionControlState{
@@ -15653,6 +15822,7 @@ func newStopSendingDrainTimeoutConn(t *testing.T) (*Conn, <-chan Frame, func()) 
 			nextPeerUni:   state.FirstPeerStreamID(localRole, false)},
 	}
 	go func() {
+		defer close(writerDone)
 		for {
 			select {
 			case <-stop:
@@ -15661,11 +15831,59 @@ func newStopSendingDrainTimeoutConn(t *testing.T) (*Conn, <-chan Frame, func()) 
 				for _, frame := range req.frames {
 					frames <- testPublicFrame(frame)
 				}
-				req.done <- nil
+				if req.done != nil {
+					req.done <- nil
+				}
 			}
 		}
 	}()
-	return c, frames, func() { close(stop) }
+	go func() {
+		defer close(flushDone)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-c.lifecycle.closedCh:
+				return
+			case <-c.pending.controlNotify:
+				c.mu.Lock()
+				result := takePendingTerminalControlRequestForTest(c)
+				c.mu.Unlock()
+				if result.err != nil {
+					c.closeSession(result.err)
+					return
+				}
+				if !result.hasRequest() {
+					continue
+				}
+				select {
+				case <-stop:
+					return
+				case <-c.lifecycle.closedCh:
+					return
+				case c.writer.urgentWriteCh <- result.request:
+				}
+			}
+		}
+	}()
+	return c, frames, func() {
+		select {
+		case <-c.lifecycle.closedCh:
+		default:
+			close(c.lifecycle.closedCh)
+		}
+		close(stop)
+		select {
+		case <-writerDone:
+		case <-time.After(testSignalTimeout):
+			t.Fatal("stop-sending drain-timeout writer consumer did not exit")
+		}
+		select {
+		case <-flushDone:
+		case <-time.After(testSignalTimeout):
+			t.Fatal("stop-sending drain-timeout control flush loop did not exit")
+		}
+	}
 }
 
 func TestCloseReadLateDataIsDiscardedAndSessionBudgetRestored(t *testing.T) {
@@ -17450,9 +17668,26 @@ func TestPeerOpenedResetDoesNotAbortWholeStream(t *testing.T) {
 		t.Fatalf("client read code = %d, want %d", appErr.Code, uint64(CodeCancelled))
 	}
 
-	if _, err := clientStream.Write([]byte("ok")); err != nil {
+	n, err = clientStream.Write([]byte("ok"))
+	if err != nil {
 		t.Fatalf("client write after peer reset: %v", err)
 	}
+	if n != 2 {
+		t.Fatalf("client write after peer reset n = %d, want 2", n)
+	}
+
+	server.mu.Lock()
+	if got := server.registry.streams[serverStream.id]; got != serverStream {
+		server.mu.Unlock()
+		t.Fatalf("server stream %d dropped from registry after local reset", serverStream.id)
+	}
+	if !serverStream.localReceive || state.RecvTerminal(serverStream.effectiveRecvHalfStateLocked()) {
+		sendHalf := serverStream.effectiveSendHalfStateLocked()
+		recvHalf := serverStream.effectiveRecvHalfStateLocked()
+		server.mu.Unlock()
+		t.Fatalf("server stream halves after local reset = (%v,%v), want recv path to remain open", sendHalf, recvHalf)
+	}
+	server.mu.Unlock()
 
 	n, err = serverStream.Read(buf)
 	if err != nil {
@@ -18077,14 +18312,14 @@ var supportedStateFixtureIDs = map[string]bool{
 	"session_graceful_close_reclaims_committed_never_peer_visible_local_stream":                     true,
 	"session_graceful_close_reclaims_provisional_never_peer_visible_local_stream":                   true,
 	"session_abort_clears_streams_and_session_pending_state":                                        true,
-	"session_close_returns_wait_before_closed_ch_when_close_frame_send_stalls":                      true,
+	"session_close_returns_wait_after_closed_ch_when_close_frame_send_stalls":                       true,
 	"session_close_returns_accept_before_closed_ch_when_close_frame_send_stalls":                    true,
 	"session_close_returns_blocked_read_before_closed_ch_when_close_frame_send_stalls":              true,
 	"session_close_returns_blocked_write_before_closed_ch_when_close_frame_send_stalls":             true,
 	"session_close_returns_blocked_write_final_before_closed_ch_when_close_frame_send_stalls":       true,
 	"session_close_returns_accept_uni_before_closed_ch_when_close_frame_send_stalls":                true,
 	"session_close_returns_provisional_commit_waiter_before_closed_ch_when_close_frame_send_stalls": true,
-	"session_abort_returns_wait_before_closed_ch_when_close_frame_send_stalls":                      true,
+	"session_abort_returns_wait_after_closed_ch_when_close_frame_send_stalls":                       true,
 	"session_abort_returns_accept_before_closed_ch_when_close_frame_send_stalls":                    true,
 	"session_abort_returns_accept_uni_before_closed_ch_when_close_frame_send_stalls":                true,
 	"session_abort_returns_blocked_read_before_closed_ch_when_close_frame_send_stalls":              true,
@@ -18386,13 +18621,13 @@ func newStateFixtureEnv(t *testing.T, fixture stateFixture) *stateFixtureEnv {
 	case "session_close_returns_accept_before_closed_ch_when_close_frame_send_stalls",
 		"session_close_signals_control_notify_before_closed_ch_when_close_frame_send_stalls",
 		"session_blocked_urgent_queue_returns_session_error_before_closed_ch_on_closeSession",
-		"session_close_returns_wait_before_closed_ch_when_close_frame_send_stalls",
+		"session_close_returns_wait_after_closed_ch_when_close_frame_send_stalls",
 		"session_close_returns_blocked_read_before_closed_ch_when_close_frame_send_stalls",
 		"session_close_returns_blocked_write_before_closed_ch_when_close_frame_send_stalls",
 		"session_close_returns_blocked_write_final_before_closed_ch_when_close_frame_send_stalls",
 		"session_close_returns_accept_uni_before_closed_ch_when_close_frame_send_stalls",
 		"session_close_returns_provisional_commit_waiter_before_closed_ch_when_close_frame_send_stalls",
-		"session_abort_returns_wait_before_closed_ch_when_close_frame_send_stalls",
+		"session_abort_returns_wait_after_closed_ch_when_close_frame_send_stalls",
 		"session_abort_returns_accept_before_closed_ch_when_close_frame_send_stalls",
 		"session_abort_returns_accept_uni_before_closed_ch_when_close_frame_send_stalls",
 		"session_abort_returns_blocked_read_before_closed_ch_when_close_frame_send_stalls",
@@ -19221,7 +19456,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		}
 		return e.seedConcreteLocalStream(opts, prefix).CloseWrite()
 	case "local_concrete_id_close_with_error":
-		return e.seedConcreteLocalStream(OpenOptions{}, nil).CloseWithErrorCode(uint64(CodeInternal), "bye")
+		return e.seedConcreteLocalStream(OpenOptions{}, nil).AbortWithErrorCode(uint64(CodeInternal), "bye")
 	case "local_Close":
 		return e.conn.Close()
 	case "repeat_noop_session_BLOCKED_threshold_plus_one":
@@ -22468,7 +22703,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		}
 		e.stream = stream
 		e.streamID = state.FirstLocalStreamID(e.conn.config.negotiated.LocalRole, true)
-		return stream.CloseWithErrorCode(uint64(CodeCancelled), "")
+		return stream.AbortWithErrorCode(uint64(CodeCancelled), "")
 	case "next_local_open_commits_first_frame":
 		ctx := context.Background()
 		stream, err := e.conn.OpenStream(ctx)
@@ -23220,17 +23455,17 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 			t.Fatalf("event %q closedCh not closed by termination", step.Event)
 		}
 		assertNoQueuedFrame(t, env.frames)
-	case "session_wait_returns_before_closed_ch":
+	case "session_wait_returns_after_closed_ch":
 		if err != nil {
 			t.Fatalf("event %q err = %v, want nil", step.Event, err)
 		}
-		if !IsErrorCode(env.waiterErr, CodeProtocol) {
-			t.Fatalf("event %q Wait err = %v, want %s", step.Event, env.waiterErr, CodeProtocol)
-		}
 		select {
 		case <-env.conn.lifecycle.closedCh:
-			t.Fatalf("event %q closedCh closed before Wait returned", step.Event)
 		default:
+			t.Fatalf("event %q closedCh not closed before Wait returned", step.Event)
+		}
+		if !IsErrorCode(env.waiterErr, CodeProtocol) {
+			t.Fatalf("event %q Wait err = %v, want %s", step.Event, env.waiterErr, CodeProtocol)
 		}
 		releaseFixtureClose(t, env)
 	case "session_accept_waiter_returns_before_closed_ch":

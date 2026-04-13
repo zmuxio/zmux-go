@@ -242,7 +242,7 @@ func TestCloseWithErrorPropagatesAbort(t *testing.T) {
 	if accepted == nil {
 		t.Fatal("expected accepted stream")
 	}
-	if err := accepted.CloseWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
+	if err := accepted.AbortWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
 		t.Fatalf("close with error: %v", err)
 	}
 
@@ -290,7 +290,7 @@ func TestPeerAbortMakesReadReturnApplicationError(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.CloseWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
+	if err := serverStream.AbortWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
 		t.Fatalf("server abort: %v", err)
 	}
 
@@ -456,7 +456,7 @@ func TestCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
 	c.registry.streams[stream.id] = stream
 	c.mu.Unlock()
 
-	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.AbortWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("CloseWithErrorCode err = %v", err)
 	}
 	frame := awaitQueuedFrame(t, frames)
@@ -514,7 +514,7 @@ func TestProvisionalCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
 	c.flow.sendSessionUsed = 10
 	c.mu.Unlock()
 
-	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.AbortWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("provisional close with error err = %v", err)
 	}
 	assertNoQueuedFrame(t, frames)
@@ -1815,6 +1815,9 @@ func TestClientEstablishmentInvalidPeerPrefaceEmitsFatalClose(t *testing.T) {
 	}
 
 	written := conn.bytes()
+	if len(written) < len(wantPreface) {
+		t.Fatalf("establishment writes len = %d, want at least client preface len %d", len(written), len(wantPreface))
+	}
 	if !bytes.Equal(written[:len(wantPreface)], wantPreface) {
 		t.Fatalf("client preface = %x, want %x", written[:len(wantPreface)], wantPreface)
 	}

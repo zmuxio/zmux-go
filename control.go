@@ -14,6 +14,7 @@ import (
 // and the runtime queues used to drain those stream/session-scoped updates.
 type connPendingControlState struct {
 	controlNotify         chan struct{}
+	terminalNotify        chan struct{}
 	pendingControlBudget  uint64
 	pendingPriorityBudget uint64
 	controlBytes          uint64
@@ -319,6 +320,7 @@ const (
 	pendingStreamQueueMaxData pendingStreamQueueKind = iota
 	pendingStreamQueueBlocked
 	pendingStreamQueuePriority
+	pendingStreamQueueTerminal
 	pendingStreamQueueCount
 )
 
@@ -380,6 +382,10 @@ var pendingStreamQueueSpecs = [...]pendingStreamQueueSpec{
 	pendingStreamQueuePriority: {
 		getIndex: getPendingPriorityIndex,
 		setIndex: setPendingPriorityIndex,
+	},
+	pendingStreamQueueTerminal: {
+		getIndex: getPendingTerminalIndex,
+		setIndex: setPendingTerminalIndex,
 	},
 }
 
@@ -665,16 +671,32 @@ func (c *Conn) pendingPriorityQueueLocked() indexedStreamQueue {
 	return c.pendingStreamQueueLocked(pendingStreamQueuePriority)
 }
 
+func (c *Conn) pendingTerminalQueueLocked() indexedStreamQueue {
+	return c.pendingStreamQueueLocked(pendingStreamQueueTerminal)
+}
+
 func (c *Conn) pendingPriorityQueueCountLocked() int {
 	return c.pending.streamQueueCount(pendingStreamQueuePriority)
+}
+
+func (c *Conn) pendingTerminalQueueCountLocked() int {
+	return c.pending.streamQueueCount(pendingStreamQueueTerminal)
 }
 
 func (c *Conn) ensurePendingPriorityUpdateQueueLocked() {
 	c.ensurePendingStreamQueueLocked(pendingStreamQueuePriority)
 }
 
+func (c *Conn) ensurePendingTerminalControlQueueLocked() {
+	c.ensurePendingStreamQueueLocked(pendingStreamQueueTerminal)
+}
+
 func (c *Conn) pendingPriorityTargetStreamLocked(streamID uint64) *nativeStream {
 	return c.pendingQueuedTargetStreamLocked(pendingStreamQueuePriority, streamID)
+}
+
+func (c *Conn) pendingTerminalTargetStreamLocked(streamID uint64) *nativeStream {
+	return c.pendingQueuedTargetStreamLocked(pendingStreamQueueTerminal, streamID)
 }
 
 func (c *Conn) dropPendingPriorityUpdateEntryLocked(streamID uint64) bool {
@@ -701,6 +723,119 @@ func (c *Conn) dropPendingPriorityUpdateEntryLocked(streamID uint64) bool {
 	return released || c.pending.priorityBytes < prevBytes
 }
 
+func (c *Conn) pendingTerminalControlHasEntriesLocked() bool {
+	if c == nil {
+		return false
+	}
+	c.ensurePendingTerminalControlQueueLocked()
+	return c.pendingTerminalQueueLocked().countValue() > 0
+}
+
+func (c *Conn) pendingTerminalControlBytesLocked() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.ensurePendingTerminalControlQueueLocked()
+	queue := c.pendingTerminalQueueLocked()
+	total := uint64(0)
+	for i := queue.state.head; i < len(queue.state.items); i++ {
+		stream := queue.state.items[i]
+		if stream == nil || stream.pendingQueueIndex(pendingStreamQueueTerminal) != int32(i) {
+			continue
+		}
+		total = saturatingAdd(total, stream.pendingTerminalControlBytesLocked())
+	}
+	return total
+}
+
+func (c *Conn) dropPendingTerminalControlEntryLocked(streamID uint64) bool {
+	if c == nil || streamID == 0 {
+		return false
+	}
+	queue := c.pendingTerminalQueueLocked()
+	stream := c.pendingTerminalTargetStreamLocked(streamID)
+	if stream == nil {
+		return false
+	}
+	currentIndex := invalidStreamQueueIndex
+	if streamBelongsToConn(stream, c) {
+		currentIndex = stream.pendingQueueIndex(pendingStreamQueueTerminal)
+	}
+	if currentIndex == invalidStreamQueueIndex {
+		currentIndex = queue.getIndex(stream)
+	}
+	if currentIndex == invalidStreamQueueIndex || !stream.hasPendingTerminalControlLocked() {
+		stream.setPendingQueueIndex(pendingStreamQueueTerminal, invalidStreamQueueIndex)
+		return false
+	}
+
+	oldBytes := stream.pendingTerminalControlBytesLocked()
+	removed := queue.remove(stream, currentIndex, streamQueueEntryNonNil)
+	if !removed {
+		stream.setPendingQueueIndex(pendingStreamQueueTerminal, invalidStreamQueueIndex)
+		return false
+	}
+	stream.clearPendingTerminalControlLocked()
+	c.replacePendingControlBytesLocked(oldBytes, 0, pendingControlReplaceOptions{
+		mode:   pendingControlReplaceForced,
+		notify: pendingControlNotifySkip,
+	})
+	stream.setPendingQueueIndex(pendingStreamQueueTerminal, invalidStreamQueueIndex)
+	return true
+}
+
+func (c *Conn) releasePendingTerminalControlLocked() {
+	if c == nil {
+		return
+	}
+	c.ensurePendingTerminalControlQueueLocked()
+	queue := c.pendingTerminalQueueLocked()
+	queue.clear(func(stream *nativeStream) {
+		if stream == nil {
+			return
+		}
+		stream.clearPendingTerminalControlLocked()
+		stream.setPendingQueueIndex(pendingStreamQueueTerminal, invalidStreamQueueIndex)
+	})
+}
+
+type pendingTerminalControlResult struct {
+	changed  bool
+	accepted bool
+}
+
+func (c *Conn) setPendingTerminalControlLocked(stream *nativeStream, apply func(*nativeStream) (changed bool, coalesced bool, superseded bool)) pendingTerminalControlResult {
+	if c == nil || stream == nil || apply == nil {
+		return pendingTerminalControlResult{}
+	}
+	oldFlags := stream.pending.flags & (streamPendingTerminalStop | streamPendingTerminalReset | streamPendingTerminalAbort)
+	oldState := stream.pending.terminal
+	oldBytes := stream.pendingTerminalControlBytesLocked()
+	changed, coalesced, superseded := apply(stream)
+	if coalesced {
+		c.metrics.coalescedTerminalSignals = saturatingAdd(c.metrics.coalescedTerminalSignals, 1)
+	}
+	if superseded {
+		c.metrics.droppedSupersededControls = saturatingAdd(c.metrics.droppedSupersededControls, 1)
+	}
+	if !changed {
+		return pendingTerminalControlResult{accepted: true}
+	}
+	stream.recomputePendingTerminalControlBytesLocked()
+	newBytes := stream.pendingTerminalControlBytesLocked()
+	if !c.replacePendingControlBytesLocked(oldBytes, newBytes, pendingControlReplaceOptions{
+		mode:   pendingControlReplaceChecked,
+		notify: pendingControlNotifyAvailable,
+	}) {
+		stream.pending.terminal = oldState
+		stream.pending.flags &^= streamPendingTerminalStop | streamPendingTerminalReset | streamPendingTerminalAbort
+		stream.pending.flags |= oldFlags
+		return pendingTerminalControlResult{}
+	}
+	c.pendingTerminalQueueLocked().append(stream)
+	return pendingTerminalControlResult{changed: true, accepted: true}
+}
+
 func (c *Conn) clearPendingPriorityUpdateStateLocked() {
 	if c == nil {
 		return
@@ -722,7 +857,7 @@ func (c *Conn) ensurePendingNonCloseControlLocked() bool {
 	if c == nil {
 		return false
 	}
-	if state.AllowLocalNonCloseControl(c.lifecycle.sessionState, c.lifecycle.closeErr != nil, c.sessionControl.peerCloseErr != nil, c.shutdown.closeFrameSent) {
+	if c.allowLocalNonCloseControlLocked() {
 		return true
 	}
 	c.clearPendingNonCloseControlStateLocked()
@@ -742,6 +877,7 @@ func (c *Conn) clearPendingNonCloseControlStateLocked() {
 	c.clearPendingSessionControlValueLocked(sessionControlBlocked)
 	c.releasePendingStreamControlLocked(streamControlBlocked)
 	c.clearPendingPriorityUpdateStateLocked()
+	c.releasePendingTerminalControlLocked()
 	c.pending.controlBytes = keepControlBytes
 	c.clearSessionBlockedStateLocked()
 }
@@ -810,8 +946,65 @@ func (c *Conn) queueStreamBlockedAsync(stream *nativeStream, v uint64) {
 	})
 }
 
-func (c *Conn) visitPendingUrgentControlTxFramesLocked(stop *bool, appendFrame func(txFrame) bool) bool {
-	if c == nil || appendFrame == nil {
+func (c *Conn) visitPendingTerminalControlTxFramesLocked(stop *bool, collector *pendingTxFrameCollector) bool {
+	if c == nil || collector == nil {
+		return false
+	}
+	if stop == nil {
+		stop = new(bool)
+	}
+	c.ensurePendingTerminalControlQueueLocked()
+	queue := c.pendingTerminalQueueLocked()
+	if !queue.ready() || queue.countValue() == 0 {
+		return false
+	}
+
+	released := false
+	for i := queue.state.head; i < len(queue.state.items); {
+		if *stop {
+			break
+		}
+		stream := queue.state.items[i]
+		if stream == nil || stream.pendingQueueIndex(pendingStreamQueueTerminal) != int32(i) {
+			i++
+			continue
+		}
+		id := stream.id
+		target := c.pendingTerminalTargetStreamLocked(id)
+		if target == nil {
+			if c.dropPendingTerminalControlEntryLocked(id) {
+				released = true
+			}
+			continue
+		}
+		flush, keep := target.pendingTerminalFlushStateLocked()
+		if !flush {
+			if !keep && c.dropPendingTerminalControlEntryLocked(id) {
+				released = true
+			}
+			i++
+			continue
+		}
+		frames := target.pendingTerminalFramesLocked()
+		if len(frames) == 0 {
+			if c.dropPendingTerminalControlEntryLocked(id) {
+				released = true
+			}
+			continue
+		}
+		if !collector.appendFrames(frames) {
+			*stop = true
+			break
+		}
+		if c.dropPendingTerminalControlEntryLocked(id) {
+			released = true
+		}
+	}
+	return released
+}
+
+func (c *Conn) visitPendingUrgentControlTxFramesLocked(stop *bool, collector *pendingTxFrameCollector) bool {
+	if c == nil || collector == nil {
 		return false
 	}
 	if stop == nil {
@@ -819,26 +1012,32 @@ func (c *Conn) visitPendingUrgentControlTxFramesLocked(stop *bool, appendFrame f
 	}
 
 	released := false
+	if c.pendingTerminalControlHasEntriesLocked() && !*stop {
+		if c.visitPendingTerminalControlTxFramesLocked(stop, collector) {
+			released = true
+		}
+	}
+
 	if c.pending.hasSessionMaxData && !*stop {
-		if c.visitPendingSessionControlTxFramesLocked(sessionControlMaxData, stop, appendFrame) {
+		if c.visitPendingSessionControlTxFramesLocked(sessionControlMaxData, stop, collector.append) {
 			released = true
 		}
 	}
 
 	if c.pendingStreamControlHasEntriesLocked(streamControlMaxData) && !*stop {
-		if c.visitPendingStreamControlTxFramesLocked(streamControlMaxData, stop, appendFrame) {
+		if c.visitPendingStreamControlTxFramesLocked(streamControlMaxData, stop, collector.append) {
 			released = true
 		}
 	}
 
 	if c.pending.hasSessionBlocked && !*stop {
-		if c.visitPendingSessionControlTxFramesLocked(sessionControlBlocked, stop, appendFrame) {
+		if c.visitPendingSessionControlTxFramesLocked(sessionControlBlocked, stop, collector.append) {
 			released = true
 		}
 	}
 
 	if c.pendingStreamControlHasEntriesLocked(streamControlBlocked) && !*stop {
-		if c.visitPendingStreamControlTxFramesLocked(streamControlBlocked, stop, appendFrame) {
+		if c.visitPendingStreamControlTxFramesLocked(streamControlBlocked, stop, collector.append) {
 			released = true
 		}
 	}
@@ -849,7 +1048,7 @@ func (c *Conn) drainPendingUrgentControlTxFramesLocked() (urgent []txFrame) {
 	prevTracked := c.trackedSessionMemoryLocked()
 	var frameBuf [4]txFrame
 	collector := newPendingTxFrameCollector(frameBuf[:0], 0, 0)
-	released := c.visitPendingUrgentControlTxFramesLocked(&collector.stopped, collector.append)
+	released := c.visitPendingUrgentControlTxFramesLocked(&collector.stopped, &collector)
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
 	return collector.frames
 }
@@ -954,6 +1153,44 @@ func (c *pendingTxFrameCollector) append(frame txFrame) bool {
 	return true
 }
 
+func (c *pendingTxFrameCollector) canAppendFrames(frames []txFrame) bool {
+	if c == nil {
+		return false
+	}
+	if len(frames) == 0 {
+		return true
+	}
+	if len(c.frames) > 0 && c.maxFrames > 0 && len(c.frames)+len(frames) > c.maxFrames {
+		return false
+	}
+	if len(c.frames) > 0 && c.maxBytes > 0 {
+		total := c.queuedBytes
+		for _, frame := range frames {
+			total = saturatingAdd(total, txFrameBufferedBytes(frame))
+		}
+		if total > c.maxBytes {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *pendingTxFrameCollector) appendFrames(frames []txFrame) bool {
+	if c == nil {
+		return false
+	}
+	if !c.canAppendFrames(frames) {
+		c.stopped = true
+		return false
+	}
+	for _, frame := range frames {
+		if !c.append(frame) {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *pendingTxFrameCollector) empty() bool {
 	return c == nil || len(c.frames) == 0
 }
@@ -1022,7 +1259,8 @@ func (c *Conn) takePendingUrgentControlRequestLocked() pendingWriteRequestResult
 	if c == nil {
 		return pendingWriteRequestResult{}
 	}
-	if !c.pending.hasSessionMaxData &&
+	if !c.pendingTerminalControlHasEntriesLocked() &&
+		!c.pending.hasSessionMaxData &&
 		!c.pendingStreamControlHasEntriesLocked(streamControlMaxData) &&
 		!c.pending.hasSessionBlocked &&
 		!c.pendingStreamControlHasEntriesLocked(streamControlBlocked) {
@@ -1033,7 +1271,7 @@ func (c *Conn) takePendingUrgentControlRequestLocked() pendingWriteRequestResult
 	prevTracked := c.trackedSessionMemoryLocked()
 	var frameBuf [maxWriteBatchFrames]txFrame
 	collector := newPendingTxFrameCollector(frameBuf[:0], maxWriteBatchFrames, maxBytes)
-	released := c.visitPendingUrgentControlTxFramesLocked(&collector.stopped, collector.append)
+	released := c.visitPendingUrgentControlTxFramesLocked(&collector.stopped, &collector)
 
 	if collector.empty() {
 		c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
@@ -1513,7 +1751,7 @@ func (c *Conn) restorePreparedPriorityUpdateLocked(req *writeRequest) {
 	}
 	req.preparedPriorityQueued = false
 
-	if !state.AllowLocalNonCloseControl(c.lifecycle.sessionState, c.lifecycle.closeErr != nil, c.sessionControl.peerCloseErr != nil, c.shutdown.closeFrameSent) {
+	if !c.allowLocalNonCloseControlLocked() {
 		clearPreparedPriorityRollback(req)
 		return
 	}

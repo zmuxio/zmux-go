@@ -1768,6 +1768,27 @@ func TestDequeueWriteWorkPrefersUrgentBeforeControlNotify(t *testing.T) {
 	}
 }
 
+func TestDequeueWriteWorkPrefersControlBeforeAdvisoryWhenReady(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
+		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), advisoryWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 1)},
+	}
+
+	c.pending.controlNotify <- struct{}{}
+	c.writer.advisoryWriteCh <- writeRequest{
+		done:   make(chan error, 1),
+		frames: testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("advisory")}}),
+	}
+
+	work := c.dequeueWriteWork()
+	if work.kind != dequeuedWriteWorkControl {
+		t.Fatalf("dequeueWriteWork kind = %v, want control wake", work.kind)
+	}
+}
+
 func TestHandleWriteBatchDoesNotWriteTransportAfterClose(t *testing.T) {
 	t.Parallel()
 
@@ -1799,6 +1820,55 @@ func TestHandleWriteBatchDoesNotWriteTransportAfterClose(t *testing.T) {
 
 	if got := writer.bytes(); len(got) != 0 {
 		t.Fatalf("transport bytes = %x, want none after closedCh close", got)
+	}
+}
+
+func TestHandleWriteBatchTransportErrorDoesNotEnqueueCloseFrameFromWriterLoop(t *testing.T) {
+	t.Parallel()
+
+	c := newWriteLoopControlTestConn(&captureWriteCloser{})
+	c.io.conn = &zeroProgressWriteCloser{}
+	c.writer.urgentWriteCh = make(chan writeRequest, 1)
+
+	req := writeRequest{
+		done: make(chan error, 1),
+		frames: testTxFramesFrom([]Frame{{
+			Type:    FrameTypePING,
+			Payload: []byte("12345678"),
+		}}),
+	}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- c.handleWriteBatch([]writeRequest{req})
+	}()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("handleWriteBatch() = true, want false after transport error")
+		}
+	case <-time.After(testCloseWakeTimeout):
+		t.Fatal("handleWriteBatch blocked on writer-loop close path")
+	}
+
+	if got := len(c.writer.urgentWriteCh); got != 0 {
+		t.Fatalf("urgent queue len = %d, want 0 after writer transport error", got)
+	}
+
+	select {
+	case err := <-req.done:
+		if !errors.Is(err, io.ErrNoProgress) {
+			t.Fatalf("done err = %v, want %v", err, io.ErrNoProgress)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("handleWriteBatch did not signal done after transport error")
+	}
+
+	select {
+	case <-c.lifecycle.closedCh:
+	default:
+		t.Fatal("closedCh not closed after writer transport error")
 	}
 }
 

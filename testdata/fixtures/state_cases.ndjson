@@ -868,7 +868,7 @@
   ]
 }
 {
-  "id": "session_close_returns_wait_before_closed_ch_when_close_frame_send_stalls",
+  "id": "session_close_returns_wait_after_closed_ch_when_close_frame_send_stalls",
   "source": "state_corpus",
   "category": "state_scenario",
   "stream_kind": null,
@@ -878,7 +878,7 @@
   "steps": [
     {
       "event": "local_closeSession_then_Wait_waiter",
-      "expect_result": "session_wait_returns_before_closed_ch"
+      "expect_result": "session_wait_returns_after_closed_ch"
     }
   ]
 }
@@ -973,7 +973,7 @@
   ]
 }
 {
-  "id": "session_abort_returns_wait_before_closed_ch_when_close_frame_send_stalls",
+  "id": "session_abort_returns_wait_after_closed_ch_when_close_frame_send_stalls",
   "source": "state_corpus",
   "category": "state_scenario",
   "stream_kind": null,
@@ -983,7 +983,7 @@
   "steps": [
     {
       "event": "local_Abort_then_Wait_waiter",
-      "expect_result": "session_wait_returns_before_closed_ch"
+      "expect_result": "session_wait_returns_after_closed_ch"
     }
   ]
 }

@@ -36,6 +36,9 @@ const (
 	streamPendingMaxData uint8 = 1 << iota
 	streamPendingBlocked
 	streamPendingPriorityUpdate
+	streamPendingTerminalStop
+	streamPendingTerminalReset
+	streamPendingTerminalAbort
 )
 
 type streamRuntimeStateMask uint8
@@ -510,14 +513,6 @@ func (s *nativeStream) shouldQueueStreamBlockedLocked(availableStream uint64) bo
 
 func (s *nativeStream) readStopSentLocked() bool {
 	return (s != nil && s.localReadStop) || state.ReadStopped(s.effectiveRecvHalfStateLocked())
-}
-
-func (s *nativeStream) sendResetMatchesCodeLocked(code uint64) bool {
-	resetCode := s.sendResetCodeLocked()
-	return s != nil &&
-		s.effectiveSendHalfStateLocked() == state.SendHalfReset &&
-		resetCode != nil &&
-		*resetCode == code
 }
 
 type terminalTrackingState uint8
@@ -1499,10 +1494,22 @@ type streamLocalOpenState struct {
 type streamPendingState struct {
 	priority []byte
 	control  [streamControlCount]uint64
+	terminal streamPendingTerminalState
 
 	queueIndex [pendingStreamQueueCount]int32
 
 	flags uint8
+}
+
+type streamPendingTerminalState struct {
+	opener    txFrame
+	openerSet bool
+
+	stopPayload  []byte
+	resetPayload []byte
+	abortPayload []byte
+
+	bufferedBytes uint64
 }
 
 const invalidStreamQueueIndex int32 = -1
@@ -1846,6 +1853,8 @@ func (s *nativeStream) inPendingQueueLocked(kind pendingStreamQueueKind) bool {
 		return s.pending.flags&streamPendingControlFlag(streamControlBlocked) != 0
 	case pendingStreamQueuePriority:
 		return s.hasPendingPriorityUpdateLocked()
+	case pendingStreamQueueTerminal:
+		return s.hasPendingTerminalControlLocked()
 	default:
 		return false
 	}
@@ -1875,6 +1884,118 @@ func getPendingPriorityIndex(stream *nativeStream) int32 {
 	return stream.pendingQueueIndex(pendingStreamQueuePriority)
 }
 
+func setPendingTerminalIndex(stream *nativeStream, idx int32) {
+	stream.setPendingQueueIndex(pendingStreamQueueTerminal, idx)
+}
+
+func getPendingTerminalIndex(stream *nativeStream) int32 {
+	return stream.pendingQueueIndex(pendingStreamQueueTerminal)
+}
+
+func (s *nativeStream) hasPendingTerminalControlLocked() bool {
+	if s == nil {
+		return false
+	}
+	mask := streamPendingTerminalStop | streamPendingTerminalReset | streamPendingTerminalAbort
+	return s.pending.flags&mask != 0
+}
+
+func (s *nativeStream) pendingTerminalControlBytesLocked() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.pending.terminal.bufferedBytes
+}
+
+func (s *nativeStream) recomputePendingTerminalControlBytesLocked() {
+	if s == nil {
+		return
+	}
+	var frameBuf [3]txFrame
+	frames := frameBuf[:0]
+	if s.pending.terminal.openerSet {
+		frames = append(frames, s.pending.terminal.opener)
+	}
+	if s.pending.flags&streamPendingTerminalAbort != 0 {
+		frames = append(frames, flatTxFrame(Frame{
+			Type:     FrameTypeABORT,
+			StreamID: s.id,
+			Payload:  s.pending.terminal.abortPayload,
+		}))
+		s.pending.terminal.bufferedBytes = txFramesBufferedBytes(frames)
+		return
+	}
+	if s.pending.flags&streamPendingTerminalStop != 0 {
+		frames = append(frames, flatTxFrame(Frame{
+			Type:     FrameTypeStopSending,
+			StreamID: s.id,
+			Payload:  s.pending.terminal.stopPayload,
+		}))
+	}
+	if s.pending.flags&streamPendingTerminalReset != 0 {
+		frames = append(frames, flatTxFrame(Frame{
+			Type:     FrameTypeRESET,
+			StreamID: s.id,
+			Payload:  s.pending.terminal.resetPayload,
+		}))
+	}
+	s.pending.terminal.bufferedBytes = txFramesBufferedBytes(frames)
+}
+
+func (s *nativeStream) pendingTerminalFramesLocked() []txFrame {
+	if s == nil || !s.hasPendingTerminalControlLocked() {
+		return nil
+	}
+	var frameBuf [3]txFrame
+	frames := frameBuf[:0]
+	if s.pending.terminal.openerSet {
+		frames = append(frames, s.pending.terminal.opener)
+	}
+	if s.pending.flags&streamPendingTerminalAbort != 0 {
+		frames = append(frames, flatTxFrame(Frame{
+			Type:     FrameTypeABORT,
+			StreamID: s.id,
+			Payload:  s.pending.terminal.abortPayload,
+		}))
+		return frames
+	}
+	if s.pending.flags&streamPendingTerminalStop != 0 {
+		frames = append(frames, flatTxFrame(Frame{
+			Type:     FrameTypeStopSending,
+			StreamID: s.id,
+			Payload:  s.pending.terminal.stopPayload,
+		}))
+	}
+	if s.pending.flags&streamPendingTerminalReset != 0 {
+		frames = append(frames, flatTxFrame(Frame{
+			Type:     FrameTypeRESET,
+			StreamID: s.id,
+			Payload:  s.pending.terminal.resetPayload,
+		}))
+	}
+	return frames
+}
+
+func (s *nativeStream) pendingTerminalFlushStateLocked() (flush bool, keep bool) {
+	if s == nil || !s.hasPendingTerminalControlLocked() {
+		return false, false
+	}
+	return true, false
+}
+
+func (s *nativeStream) clearPendingTerminalControlLocked() {
+	if s == nil {
+		return
+	}
+	s.pending.terminal.opener = txFrame{}
+	s.pending.terminal.openerSet = false
+	s.pending.terminal.stopPayload = nil
+	s.pending.terminal.resetPayload = nil
+	s.pending.terminal.abortPayload = nil
+	s.pending.terminal.bufferedBytes = 0
+	s.pending.flags &^= streamPendingTerminalStop | streamPendingTerminalReset | streamPendingTerminalAbort
+}
+
 func streamMatchesID(stream *nativeStream, streamID uint64) bool {
 	return stream != nil && stream.idSet && stream.id == streamID
 }
@@ -1899,10 +2020,6 @@ func (s *nativeStream) StreamID() uint64 {
 		return 0
 	}
 	return s.id
-}
-
-func (s *nativeStream) ID() uint64 {
-	return s.StreamID()
 }
 
 func (s *nativeStream) OpenInfo() []byte {

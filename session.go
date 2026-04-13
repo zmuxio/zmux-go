@@ -584,6 +584,10 @@ type DiagnosticStats struct {
 	LateDataAfterCloseRead uint64
 	LateDataAfterReset     uint64
 	LateDataAfterAbort     uint64
+	CoalescedTerminal      uint64
+	SupersededTerminal     uint64
+	SkippedCloseOnDeadIO   uint64
+	ProtocolBacklogClose   uint64
 }
 
 type RetainedBucketStats struct {
@@ -619,6 +623,9 @@ type PressureStats struct {
 	PendingControl         uint64
 	PendingAdvisory        uint64
 	PreparedAdvisory       uint64
+	PendingTerminal        uint64
+	PendingTerminalCount   int
+	PendingProtocolJobs    int
 }
 
 // SessionStats is a read-only snapshot of repository-default liveness and
@@ -811,6 +818,9 @@ func (c *Conn) Stats() SessionStats {
 		PendingControl:         c.pending.controlBytes,
 		PendingAdvisory:        c.pending.priorityBytes,
 		PreparedAdvisory:       c.pending.preparedPriorityBytes,
+		PendingTerminal:        c.pendingTerminalControlBytesLocked(),
+		PendingTerminalCount:   c.pendingTerminalQueueCountLocked(),
+		PendingProtocolJobs:    len(c.protocol.jobs),
 	}
 	hiddenRetained := c.hiddenControlStateRetainedLocked()
 	hiddenSoftCap := state.AdmissionSoftCap(c.pendingInboundLimitLocked())
@@ -894,6 +904,10 @@ func (c *Conn) Stats() SessionStats {
 			LateDataAfterCloseRead: c.ingress.lateDataAfterClose,
 			LateDataAfterReset:     c.ingress.lateDataAfterReset,
 			LateDataAfterAbort:     c.ingress.lateDataAfterAbort,
+			CoalescedTerminal:      c.metrics.coalescedTerminalSignals,
+			SupersededTerminal:     c.metrics.droppedSupersededControls,
+			SkippedCloseOnDeadIO:   c.metrics.skippedCloseOnDeadIO,
+			ProtocolBacklogClose:   c.metrics.protocolBacklogClose,
 		},
 	}
 }
@@ -985,7 +999,7 @@ func (c *Conn) Close() error {
 	if plan.Outcome == state.BeginCloseGraceful {
 		if err := c.closeWithGoAwayAndClose(initialGoAwayPolicy, initialGoAwayBidi, initialGoAwayUni); err == nil {
 			gracefulClose = true
-			c.closeSession(nil)
+			c.closeSessionWithOptions(nil, closeOriginApp, closeFrameDefault)
 		}
 	}
 
@@ -1002,7 +1016,7 @@ func (c *Conn) Abort(err error) {
 	if err == nil {
 		err = ErrSessionClosed
 	}
-	c.closeSessionWithPolicy(err, closeFrameAlways)
+	c.closeSessionWithOptions(err, closeOriginApp, closeFrameAlways)
 }
 
 func (c *Conn) Wait(ctx context.Context) error {
@@ -1011,19 +1025,12 @@ func (c *Conn) Wait(ctx context.Context) error {
 	}
 	ctx = contextOrBackground(ctx)
 	c.mu.Lock()
-	if c.lifecycle.closeErr != nil {
-		c.mu.Unlock()
-		return c.waitCloseOperationErr()
-	}
-	terminalCh := c.ensureTerminalChLocked()
 	closedCh := c.lifecycle.closedCh
 	c.mu.Unlock()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-closedCh:
-		return c.waitCloseOperationErr()
-	case <-terminalCh:
 		return c.waitCloseOperationErr()
 	}
 }
@@ -1067,7 +1074,7 @@ func waitSessionState(c *Conn) connState {
 }
 
 func (c *Conn) closeSession(err error) {
-	c.closeSessionWithPolicy(err, closeFrameDefault)
+	c.closeSessionWithOptions(err, closeOriginInternal, closeFrameDefault)
 }
 
 type closeFramePolicy uint8
@@ -1081,7 +1088,21 @@ func (p closeFramePolicy) forcesCloseFrame() bool {
 	return p == closeFrameAlways
 }
 
-func (c *Conn) closeSessionWithPolicy(err error, closePolicy closeFramePolicy) {
+type closeOrigin uint8
+
+const (
+	closeOriginInternal closeOrigin = iota
+	closeOriginApp
+	closeOriginReadLoop
+	closeOriginWriteLoop
+	closeOriginEstablish
+)
+
+func (o closeOrigin) allowsQueuedCloseFrame() bool {
+	return o != closeOriginWriteLoop
+}
+
+func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolicy closeFramePolicy) {
 	if err == nil {
 		err = ErrSessionClosed
 	}
@@ -1094,14 +1115,20 @@ func (c *Conn) closeSessionWithPolicy(err error, closePolicy closeFramePolicy) {
 		} else {
 			err = c.lifecycle.closeErr
 		}
-		if (closePolicy.forcesCloseFrame() || !state.IsBenignSessionError(c.lifecycle.sessionState, err, ErrSessionClosed)) && c.sessionControl.peerCloseErr == nil && !c.shutdown.closeFrameSent {
+		shouldQueueCloseFrame := (closePolicy.forcesCloseFrame() || !state.IsBenignSessionError(c.lifecycle.sessionState, err, ErrSessionClosed)) &&
+			c.sessionControl.peerCloseErr == nil &&
+			!c.closeFrameOutstandingLocked()
+		if !origin.allowsQueuedCloseFrame() && shouldQueueCloseFrame {
+			c.metrics.skippedCloseOnDeadIO = saturatingAdd(c.metrics.skippedCloseOnDeadIO, 1)
+		}
+		if origin.allowsQueuedCloseFrame() && shouldQueueCloseFrame {
 			payload, payloadErr := buildClosePayload(c, err)
 			if payloadErr != nil {
 				err = payloadErr
 			} else {
 				closeFramePayload = payload
 				emitCloseFrame = true
-				c.shutdown.closeFrameSent = true
+				c.shutdown.closeFramePending = true
 			}
 		}
 		if !state.IsSessionFinished(c.lifecycle.sessionState) {
@@ -1116,9 +1143,14 @@ func (c *Conn) closeSessionWithPolicy(err error, closePolicy closeFramePolicy) {
 		c.mu.Unlock()
 
 		if emitCloseFrame {
-			c.emitCloseFrame(closeFramePayload)
-			if delay := closeTransportDrainDelay(err); delay > 0 {
-				time.Sleep(delay)
+			closeFrameSent := c.emitCloseFrame(closeFramePayload)
+			c.mu.Lock()
+			c.finishCloseFrameEnqueueLocked(closeFrameSent)
+			c.mu.Unlock()
+			if closeFrameSent {
+				if delay := closeTransportDrainDelay(err); delay > 0 {
+					time.Sleep(delay)
+				}
 			}
 		}
 
@@ -1146,6 +1178,35 @@ func (c *Conn) closeSessionWithPolicy(err error, closePolicy closeFramePolicy) {
 			})
 		}
 	})
+}
+
+func (c *Conn) closeFrameOutstandingLocked() bool {
+	if c == nil {
+		return false
+	}
+	return c.shutdown.closeFramePending || c.shutdown.closeFrameSent
+}
+
+func (c *Conn) allowLocalNonCloseControlLocked() bool {
+	if c == nil {
+		return false
+	}
+	return state.AllowLocalNonCloseControl(
+		c.lifecycle.sessionState,
+		c.lifecycle.closeErr != nil,
+		c.sessionControl.peerCloseErr != nil,
+		c.closeFrameOutstandingLocked(),
+	)
+}
+
+func (c *Conn) finishCloseFrameEnqueueLocked(sent bool) {
+	if c == nil {
+		return
+	}
+	c.shutdown.closeFramePending = false
+	if sent {
+		c.shutdown.closeFrameSent = true
+	}
 }
 
 func closeTransportDrainDelay(err error) time.Duration {
@@ -1274,7 +1335,6 @@ func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error
 		_ = conn.Close()
 	case <-timer.C:
 		_ = conn.Close()
-		<-writeErrCh
 	}
 }
 
@@ -1298,16 +1358,16 @@ func (c *Conn) closeTerminalChLocked() {
 	close(c.lifecycle.terminalCh)
 }
 
-func (c *Conn) emitCloseFrame(payload []byte) {
+func (c *Conn) emitCloseFrame(payload []byte) bool {
 	if c == nil || len(payload) == 0 {
-		return
+		return false
 	}
 	lane := c.writer.urgentWriteCh
 	if lane == nil {
 		lane = c.writer.writeCh
 	}
 	if lane == nil || c.lifecycle.closedCh == nil {
-		return
+		return false
 	}
 
 	req := writeRequest{
@@ -1317,9 +1377,10 @@ func (c *Conn) emitCloseFrame(payload []byte) {
 
 	deadline := time.Now().Add(sessionCloseFrameSendTimeout)
 	if !rt.SendByDeadline(deadline, c.lifecycle.closedCh, lane, req) {
-		return
+		return false
 	}
 	rt.WaitByDeadline(deadline, c.lifecycle.closedCh, req.done)
+	return true
 }
 
 func closeSessionStreamErr(finalState connState, err error) *ApplicationError {
@@ -1353,9 +1414,9 @@ func (c *Conn) releaseSendLocked(stream *nativeStream) {
 	}
 }
 
-func (c *Conn) abortLiveStreamLocked(stream *nativeStream, code ErrorCode, reason string) error {
+func (c *Conn) planAbortLiveStreamLocked(stream *nativeStream, code ErrorCode, reason string) (txFrame, error) {
 	if c == nil || stream == nil {
-		return nil
+		return txFrame{}, nil
 	}
 
 	c.markPeerVisibleLocked(stream)
@@ -1369,17 +1430,13 @@ func (c *Conn) abortLiveStreamLocked(stream *nativeStream, code ErrorCode, reaso
 
 	payload, payloadErr := buildCodePayload(uint64(code), reason, c.config.peer.Settings.MaxControlPayloadBytes)
 	if payloadErr != nil {
-		c.mu.Unlock()
-		return wireError(CodeInternal, "queue ABORT", payloadErr)
+		return txFrame{}, wireError(CodeInternal, "queue ABORT", payloadErr)
 	}
-	frame := flatTxFrame(Frame{
+	return flatTxFrame(Frame{
 		Type:     FrameTypeABORT,
 		StreamID: stream.id,
 		Payload:  payload,
-	})
-	c.mu.Unlock()
-	c.queueReadLoopFrameAsync(frame)
-	return nil
+	}), nil
 }
 
 type sessionCloseOptions struct {
@@ -1569,30 +1626,29 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	}
 	c.beginSessionClosingLocked()
 	c.shutdown.gracefulCloseActive = false
-	if c.shutdown.closeFrameSent {
+	if c.closeFrameOutstandingLocked() {
 		c.mu.Unlock()
 		return nil
 	}
-	c.shutdown.closeFrameSent = true
+	c.shutdown.closeFramePending = true
 	c.mu.Unlock()
 
 	closePayload, closePayloadErr := buildClosePayload(c, nil)
 	if closePayloadErr != nil {
 		c.mu.Lock()
-		if c.lifecycle.closeErr == nil {
-			c.shutdown.closeFrameSent = false
-		}
+		c.finishCloseFrameEnqueueLocked(false)
 		c.mu.Unlock()
 		return closeOperationErr(c, closePayloadErr)
 	}
 	if err := c.queueImmutableFrame(flatTxFrame(Frame{Type: FrameTypeCLOSE, Payload: closePayload})); err != nil {
 		c.mu.Lock()
-		if c.lifecycle.closeErr == nil {
-			c.shutdown.closeFrameSent = false
-		}
+		c.finishCloseFrameEnqueueLocked(false)
 		c.mu.Unlock()
 		return closeOperationErr(c, err)
 	}
+	c.mu.Lock()
+	c.finishCloseFrameEnqueueLocked(true)
+	c.mu.Unlock()
 
 	return nil
 }
@@ -1647,7 +1703,7 @@ func (c *Conn) GoAwayWithError(lastAcceptedBidi, lastAcceptedUni, code uint64, r
 		c.mu.Unlock()
 		return sessionOperationErrLocked(c, OperationClose, err)
 	}
-	if !state.AllowLocalNonCloseControl(c.lifecycle.sessionState, c.lifecycle.closeErr != nil, c.sessionControl.peerCloseErr != nil, c.shutdown.closeFrameSent) {
+	if !c.allowLocalNonCloseControlLocked() {
 		err := visibleSessionErrLocked(c, ErrSessionClosed)
 		c.mu.Unlock()
 		return sessionOperationErrLocked(c, OperationClose, err)
@@ -1724,7 +1780,7 @@ func (c *Conn) waitForLocalGoAwaySend(lastAcceptedBidi, lastAcceptedUni uint64) 
 				c.mu.Unlock()
 				return sessionOperationErrLocked(c, OperationClose, err)
 			}
-			if !state.AllowLocalNonCloseControl(c.lifecycle.sessionState, c.lifecycle.closeErr != nil, c.sessionControl.peerCloseErr != nil, c.shutdown.closeFrameSent) {
+			if !c.allowLocalNonCloseControlLocked() {
 				err := visibleSessionErrLocked(c, ErrSessionClosed)
 				c.mu.Unlock()
 				return sessionOperationErrLocked(c, OperationClose, err)
@@ -1777,7 +1833,7 @@ func (c *Conn) flushPendingLocalGoAway() error {
 			c.notifyControlAndLiveness()
 			return sessionOperationErrLocked(c, OperationClose, err)
 		}
-		if !state.AllowLocalNonCloseControl(c.lifecycle.sessionState, c.lifecycle.closeErr != nil, c.sessionControl.peerCloseErr != nil, c.shutdown.closeFrameSent) {
+		if !c.allowLocalNonCloseControlLocked() {
 			err := visibleSessionErrLocked(c, ErrSessionClosed)
 			c.clearPendingGoAwayLocked()
 			c.sessionControl.goAwaySendActive = false
@@ -1961,6 +2017,7 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 		},
 		pending: connPendingControlState{
 			controlNotify:         make(chan struct{}, 1),
+			terminalNotify:        make(chan struct{}, 1),
 			pendingControlBudget:  cfg.PendingControlBytesBudget,
 			pendingPriorityBudget: cfg.PendingPriorityBytesBudget,
 		},
@@ -1977,7 +2034,7 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 			scheduler:       rt.NewBatchScheduler(),
 			writeCh:         make(chan writeRequest),
 			advisoryWriteCh: advisoryWriteCh,
-			urgentWriteCh:   make(chan writeRequest),
+			urgentWriteCh:   make(chan writeRequest, 1),
 		},
 		lifecycle: connLifecycleState{
 			sessionState: connStateReady,
@@ -2104,6 +2161,11 @@ type connRuntimeMetricsState struct {
 	sendRateEstimate uint64
 	blockedWriteTime time.Duration
 	lastOpenLatency  time.Duration
+
+	coalescedTerminalSignals  uint64
+	droppedSupersededControls uint64
+	skippedCloseOnDeadIO      uint64
+	protocolBacklogClose      uint64
 }
 
 type connLivenessState struct {
@@ -2150,6 +2212,7 @@ type connSessionControlState struct {
 
 type connShutdownRuntimeState struct {
 	gracefulCloseActive bool
+	closeFramePending   bool
 	closeFrameSent      bool
 	closeOnce           sync.Once
 	asyncCloseOnce      sync.Once
@@ -2378,19 +2441,6 @@ func (c *Conn) ensureAcceptNotifyLocked(arity streamArity) chan struct{} {
 		return ensureNotifyChan(&c.signals.acceptBidiCh)
 	}
 	return ensureNotifyChan(&c.signals.acceptUniCh)
-}
-
-func (c *Conn) ensureTerminalChLocked() chan struct{} {
-	if c == nil {
-		return nil
-	}
-	if c.lifecycle.terminalCh == nil {
-		c.lifecycle.terminalCh = make(chan struct{})
-		if c.lifecycle.closeErr != nil {
-			close(c.lifecycle.terminalCh)
-		}
-	}
-	return c.lifecycle.terminalCh
 }
 
 func (c *Conn) notifyControlAndLiveness() {
@@ -3025,7 +3075,7 @@ func (c *Conn) beginPingPayloadLocked(payload []byte, ownership retainedBytesOwn
 	if c.lifecycle.closeErr != nil {
 		return nil, time.Time{}, nil, visibleSessionErrLocked(c, c.lifecycle.closeErr)
 	}
-	if !state.AllowLocalNonCloseControl(c.lifecycle.sessionState, c.lifecycle.closeErr != nil, c.sessionControl.peerCloseErr != nil, c.shutdown.closeFrameSent) {
+	if !c.allowLocalNonCloseControlLocked() {
 		return nil, time.Time{}, nil, visibleSessionErrLocked(c, ErrSessionClosed)
 	}
 	if c.liveness.pingOutstanding {
@@ -3055,7 +3105,7 @@ func (c *Conn) beginGeneratedPing(echo []byte, op string) (<-chan struct{}, time
 		c.mu.Unlock()
 		return nil, time.Time{}, err
 	}
-	if !state.AllowLocalNonCloseControl(c.lifecycle.sessionState, c.lifecycle.closeErr != nil, c.sessionControl.peerCloseErr != nil, c.shutdown.closeFrameSent) {
+	if !c.allowLocalNonCloseControlLocked() {
 		err := visibleSessionErrLocked(c, ErrSessionClosed)
 		c.mu.Unlock()
 		return nil, time.Time{}, err
@@ -3116,7 +3166,7 @@ func (c *Conn) sendKeepalivePing() error {
 	}
 	if err != nil && c != nil {
 		c.mu.Lock()
-		suppress := !state.AllowLocalNonCloseControl(c.lifecycle.sessionState, c.lifecycle.closeErr != nil, c.sessionControl.peerCloseErr != nil, c.shutdown.closeFrameSent)
+		suppress := !c.allowLocalNonCloseControlLocked()
 		c.mu.Unlock()
 		if suppress {
 			return nil

@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -121,10 +122,6 @@ func (s *nativeSendStream) StreamID() uint64 {
 	return s.stream.StreamID()
 }
 
-func (s *nativeSendStream) ID() uint64 {
-	return s.StreamID()
-}
-
 func (s *nativeSendStream) OpenInfo() []byte {
 	if s == nil || s.stream == nil {
 		return nil
@@ -195,34 +192,6 @@ func (s *nativeSendStream) Reset(code uint64) error {
 	return s.stream.Reset(code)
 }
 
-func (s *nativeSendStream) CancelWrite() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CancelWrite()
-}
-
-func (s *nativeSendStream) CancelWriteWithCode(code uint64) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CancelWriteWithCode(code)
-}
-
-func (s *nativeSendStream) ResetWrite() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.ResetWrite()
-}
-
-func (s *nativeSendStream) ResetWriteWithCode(code uint64) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.ResetWriteWithCode(code)
-}
-
 func (s *nativeSendStream) ResetWithReason(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
@@ -249,20 +218,6 @@ func (s *nativeSendStream) AbortWithErrorCode(code uint64, reason string) error 
 		return ErrSessionClosed
 	}
 	return s.stream.AbortWithErrorCode(code, reason)
-}
-
-func (s *nativeSendStream) CloseWithError(err error) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWithError(err)
-}
-
-func (s *nativeSendStream) CloseWithErrorCode(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWithErrorCode(code, reason)
 }
 
 func (s *nativeSendStream) Close() error {
@@ -295,10 +250,6 @@ func (s *nativeRecvStream) StreamID() uint64 {
 		return 0
 	}
 	return s.stream.StreamID()
-}
-
-func (s *nativeRecvStream) ID() uint64 {
-	return s.StreamID()
 }
 
 func (s *nativeRecvStream) OpenInfo() []byte {
@@ -343,25 +294,11 @@ func (s *nativeRecvStream) CloseRead() error {
 	return s.stream.CloseRead()
 }
 
-func (s *nativeRecvStream) CancelRead() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CancelRead()
-}
-
 func (s *nativeRecvStream) CloseReadWithCode(code uint64) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseReadWithCode(code)
-}
-
-func (s *nativeRecvStream) CancelReadWithCode(code uint64) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CancelReadWithCode(code)
 }
 
 func (s *nativeRecvStream) Abort() error {
@@ -383,20 +320,6 @@ func (s *nativeRecvStream) AbortWithErrorCode(code uint64, reason string) error 
 		return ErrSessionClosed
 	}
 	return s.stream.AbortWithErrorCode(code, reason)
-}
-
-func (s *nativeRecvStream) CloseWithError(err error) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWithError(err)
-}
-
-func (s *nativeRecvStream) CloseWithErrorCode(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWithErrorCode(code, reason)
 }
 
 func (s *nativeRecvStream) Close() error {
@@ -1111,23 +1034,6 @@ func (s *nativeStream) prepareTerminalLocalOpenerLocked(appErr *ApplicationError
 	return result
 }
 
-func (s *nativeStream) CancelRead() error {
-	return s.CancelReadWithCode(uint64(CodeCancelled))
-}
-
-func (s *nativeStream) CancelReadWithCode(code uint64) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	s.conn.mu.Lock()
-	alreadyStopped := s.readStopSentLocked()
-	s.conn.mu.Unlock()
-	if alreadyStopped {
-		return nil
-	}
-	return s.CloseReadWithCode(code)
-}
-
 func (s *nativeStream) CloseReadWithCode(code uint64) error {
 	return s.closeReadWithCode(code)
 }
@@ -1310,6 +1216,26 @@ func (p closeReadPlan) shouldRetry() bool {
 	return p.opener.shouldRetry()
 }
 
+func (p closeReadPlan) queue(s *nativeStream) error {
+	if s == nil || s.conn == nil {
+		return ErrSessionClosed
+	}
+	if len(p.opener.frames) > 0 {
+		if err := p.opener.queueCloseReadOpener(s); err != nil {
+			return err
+		}
+	}
+	if err := s.queueFramesUntilDeadlineAndOptionsOwned([]txFrame{p.stopFrame}, queuedWriteOptions{
+		ownership: frameOwned,
+	}); err != nil {
+		return err
+	}
+	s.conn.mu.Lock()
+	s.clearLocalReadSignalPending()
+	s.conn.mu.Unlock()
+	return nil
+}
+
 type localCloseReadCommitState uint8
 
 const (
@@ -1342,27 +1268,15 @@ func (s *nativeStream) ensureLocalCloseReadCommittedLocked(commitState localClos
 	return localCloseReadCommitted, nil
 }
 
-func (p closeReadPlan) queue(s *nativeStream) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
+func terminalPendingQueueError(op string) error {
+	return wireError(CodeInternal, op, fmt.Errorf("pending terminal control budget exceeded"))
+}
+
+func emitStreamDispatch(conn *Conn, dispatch streamEventDispatch) {
+	if conn == nil || !dispatch.shouldEmit() {
+		return
 	}
-	if p.opener.openerVisibility.marksPeerVisible() {
-		if err := p.opener.queueCloseReadOpener(s); err != nil {
-			return err
-		}
-	}
-	var stopFrameBuf [1]txFrame
-	stopFrames := stopFrameBuf[:1]
-	stopFrames[0] = p.stopFrame
-	if err := s.queueFramesUntilDeadlineAndOptionsOwned(stopFrames, queuedWriteOptions{
-		ownership: frameOwned,
-	}); err != nil {
-		return s.closeOperationErr(err)
-	}
-	s.conn.mu.Lock()
-	s.clearLocalReadSignalPending()
-	s.conn.mu.Unlock()
-	return nil
+	conn.emitEvent(dispatch.event)
 }
 
 func (s *nativeStream) prepareCloseReadPlanLocked(stopPayload []byte) (plan closeReadPlan, err error) {
@@ -1405,6 +1319,12 @@ func (s *nativeStream) closeReadWithCode(code uint64) error {
 			return sessionOperationErrLocked(s.conn, OperationClose, err)
 		}
 		var err error
+		if commitState == localCloseReadPending && !s.localReadSignalPendingFlag() {
+			if err := s.localRecvActionErrLocked(state.LocalCloseReadAction(s.localReceive, s.effectiveRecvHalfStateLocked())); err != nil {
+				s.conn.mu.Unlock()
+				return s.closeOperationErr(err)
+			}
+		}
 		commitState, err = s.ensureLocalCloseReadCommittedLocked(commitState)
 		if err != nil {
 			s.conn.mu.Unlock()
@@ -1507,58 +1427,6 @@ func (s *nativeStream) prepareAsyncCloseWritePlan() (terminalFramePlan, error) {
 	}
 }
 
-func (s *nativeStream) prepareResetAfterStopSendingPlan(code uint64) (terminalSignalPlan, error) {
-	if s == nil || s.conn == nil {
-		return terminalSignalPlan{}, ErrSessionClosed
-	}
-	s.conn.mu.Lock()
-	defer s.conn.mu.Unlock()
-	if s.conn.lifecycle.closeErr != nil {
-		err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
-		return terminalSignalPlan{}, sessionOperationErrLocked(s.conn, OperationClose, err)
-	}
-	if err := s.localSendActionErrLocked(state.LocalResetAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {
-		return terminalSignalPlan{}, s.closeOperationErr(err)
-	}
-	appErr := applicationErr(code, "")
-	return s.prepareTerminalSignalPlanLocked(terminalSignalReset, code, "", appErr, terminalSignalOptions{
-		openerPolicy: terminalOpenerAllow,
-		resetSource:  terminalResetFromStopSending,
-	})
-}
-
-func (s *nativeStream) CancelWrite() error {
-	return s.ResetWrite()
-}
-
-func (s *nativeStream) CancelWriteWithCode(code uint64) error {
-	return s.resetWriteWithCodeIfNeeded(code)
-}
-
-func (s *nativeStream) ResetWrite() error {
-	return s.resetWriteWithCodeIfNeeded(uint64(CodeCancelled))
-}
-
-func (s *nativeStream) ResetWriteWithCode(code uint64) error {
-	return s.resetWriteWithCodeIfNeeded(code)
-}
-
-func (s *nativeStream) resetWriteWithCodeIfNeeded(code uint64) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	s.conn.mu.Lock()
-	alreadyReset := s.sendResetMatchesCodeLocked(code)
-	s.conn.mu.Unlock()
-	if alreadyReset {
-		return nil
-	}
-	return s.executeTerminalSignal(terminalSignalReset, code, "", terminalSignalOptions{
-		openerPolicy: terminalOpenerAllow,
-		resetSource:  terminalResetDirect,
-	})
-}
-
 func (s *nativeStream) Reset(code uint64) error {
 	return s.executeTerminalSignal(terminalSignalReset, code, "", terminalSignalOptions{
 		openerPolicy: terminalOpenerRejectUnopened,
@@ -1636,30 +1504,22 @@ func (s *nativeStream) Close() error {
 	return nil
 }
 
-func (s *nativeStream) CloseWithError(err error) error {
-	if err == nil {
-		return s.CloseWithErrorCode(uint64(CodeNoError), "")
-	}
-	var appErr *ApplicationError
-	if errors.As(err, &appErr) {
-		return s.CloseWithErrorCode(appErr.Code, appErr.Reason)
-	}
-	return s.CloseWithErrorCode(uint64(CodeInternal), err.Error())
-}
-
 func (s *nativeStream) Abort() error {
-	return s.CloseWithErrorCode(uint64(CodeCancelled), "")
+	return s.AbortWithErrorCode(uint64(CodeCancelled), "")
 }
 
 func (s *nativeStream) AbortWithError(err error) error {
-	return s.CloseWithError(err)
+	if err == nil {
+		return s.AbortWithErrorCode(uint64(CodeNoError), "")
+	}
+	var appErr *ApplicationError
+	if errors.As(err, &appErr) {
+		return s.AbortWithErrorCode(appErr.Code, appErr.Reason)
+	}
+	return s.AbortWithErrorCode(uint64(CodeInternal), err.Error())
 }
 
 func (s *nativeStream) AbortWithErrorCode(code uint64, reason string) error {
-	return s.CloseWithErrorCode(code, reason)
-}
-
-func (s *nativeStream) CloseWithErrorCode(code uint64, reason string) error {
 	return s.executeTerminalSignal(terminalSignalAbort, code, reason, terminalSignalOptions{
 		openerPolicy: terminalOpenerAllow,
 	})
@@ -1796,47 +1656,56 @@ func (s *nativeStream) applyPreparedTerminalSignalLocked(kind terminalSignalKind
 	}
 }
 
-func (p terminalSignalPlan) queue(s *nativeStream) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	if p.finished() {
-		s.conn.mu.Unlock()
-		return nil
-	}
-	s.conn.mu.Unlock()
-	return p.queuePrepared(s)
-}
-
-func (p terminalSignalPlan) queuePrepared(s *nativeStream) error {
+func (s *nativeStream) enqueuePendingTerminalSignalLocked(p terminalSignalPlan) (streamEventDispatch, bool, error) {
 	if s == nil || s.conn == nil || p.finished() {
-		return nil
+		return streamEventDispatch{}, false, nil
 	}
-	var frameBuf [1]txFrame
-	frames := frameBuf[:1]
-	frames[0] = flatTxFrame(Frame{
-		Type:     p.frameType,
-		StreamID: s.id,
-		Payload:  p.payload,
+	dispatch := streamEventDispatch{}
+	if p.openerVisibility.marksPeerVisible() {
+		s.conn.markPeerVisibleLocked(s)
+		dispatch = s.conn.takeStreamEventLocked(s, EventStreamOpened, nil)
+	}
+	s.conn.maybeFinalizePeerActiveLocked(s)
+	result := s.conn.setPendingTerminalControlLocked(s, func(stream *nativeStream) (changed bool, coalesced bool, superseded bool) {
+		switch p.frameType {
+		case FrameTypeRESET:
+			if stream.pending.flags&streamPendingTerminalAbort != 0 {
+				return false, true, false
+			}
+			if stream.pending.flags&streamPendingTerminalReset != 0 && bytes.Equal(stream.pending.terminal.resetPayload, p.payload) {
+				return false, true, false
+			}
+			stream.pending.terminal.resetPayload = clonePayloadBytes(p.payload)
+			stream.pending.flags |= streamPendingTerminalReset
+			return true, false, false
+		case FrameTypeABORT:
+			if stream.pending.flags&streamPendingTerminalAbort != 0 && bytes.Equal(stream.pending.terminal.abortPayload, p.payload) {
+				return false, true, false
+			}
+			superseded = stream.pending.flags&(streamPendingTerminalStop|streamPendingTerminalReset) != 0 || stream.pending.terminal.openerSet
+			stream.pending.terminal.opener = txFrame{}
+			stream.pending.terminal.openerSet = false
+			stream.pending.terminal.stopPayload = nil
+			stream.pending.terminal.resetPayload = nil
+			stream.pending.flags &^= streamPendingTerminalStop | streamPendingTerminalReset
+			stream.pending.terminal.abortPayload = clonePayloadBytes(p.payload)
+			stream.pending.flags |= streamPendingTerminalAbort
+			return true, false, superseded
+		default:
+			return false, false, false
+		}
 	})
-	return terminalQueueExecution{
-		frames: frames,
-		opts: queuedWriteOptions{
-			terminalPolicy:   terminalWriteAllow,
-			ownership:        frameOwned,
-			openerVisibility: p.openerVisibility,
-		},
-		commit: queuedWriteCommit{
-			openerVisibility: p.openerVisibility,
-			finalize:         true,
-		},
-		errorCommit: queuedWriteCommit{finalize: true},
-		hooks: terminalQueueHooks{
-			clearPeerVisibleOnErr: true,
-			notifyWrite:           p.shouldNotifyWrite(),
-		},
-		errWrap: s.closeOperationErr,
-	}.queue(s)
+	if !result.accepted {
+		switch p.frameType {
+		case FrameTypeRESET:
+			return streamEventDispatch{}, false, terminalPendingQueueError("queue RESET")
+		case FrameTypeABORT:
+			return streamEventDispatch{}, false, terminalPendingQueueError("queue ABORT")
+		default:
+			return streamEventDispatch{}, false, terminalPendingQueueError("queue terminal control")
+		}
+	}
+	return dispatch, result.changed, nil
 }
 
 func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint64, reason string, opts terminalSignalOptions) error {
@@ -1867,7 +1736,21 @@ func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint6
 		s.conn.mu.Unlock()
 		return s.closeOperationErr(err)
 	}
-	return plan.queue(s)
+	dispatch, queued, err := s.enqueuePendingTerminalSignalLocked(plan)
+	s.conn.mu.Unlock()
+	if err != nil {
+		s.conn.closeSessionWithOptions(err, closeOriginInternal, closeFrameDefault)
+		return s.closeOperationErr(err)
+	}
+	if queued {
+		notify(s.conn.pending.terminalNotify)
+		notify(s.conn.pending.controlNotify)
+	}
+	if plan.shouldNotifyWrite() {
+		notify(s.writeNotify)
+	}
+	emitStreamDispatch(s.conn, dispatch)
+	return nil
 }
 
 var (

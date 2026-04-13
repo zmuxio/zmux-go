@@ -361,7 +361,7 @@ func (c *Conn) handlePendingControlWake() bool {
 		result := c.takePendingControlWriteRequestLocked()
 		c.mu.Unlock()
 		if result.err != nil {
-			c.closeSession(result.err)
+			c.closeSessionWithOptions(result.err, closeOriginWriteLoop, closeFrameDefault)
 			return false
 		}
 		if !result.hasRequest() {
@@ -400,7 +400,7 @@ func (c *Conn) handleWriteBatch(batch []writeRequest) bool {
 	err := c.writeBatch(batch)
 	if err != nil {
 		c.completeWriteBatch(batch, err)
-		c.closeSession(err)
+		c.closeSessionWithOptions(err, closeOriginWriteLoop, closeFrameDefault)
 		return false
 	}
 	c.completeWriteBatch(batch, nil)
@@ -413,6 +413,13 @@ func (c *Conn) tryDequeueWriteWork() (dequeuedWriteWork, bool) {
 		return dequeuedWriteWork{kind: dequeuedWriteWorkClosed}, true
 	case req := <-c.writer.urgentWriteCh:
 		return dequeuedWriteWork{req: req, lane: writeLaneUrgent, kind: dequeuedWriteWorkRequest}, true
+	default:
+	}
+	select {
+	case <-c.pending.terminalNotify:
+		return dequeuedWriteWork{kind: dequeuedWriteWorkControl}, true
+	case <-c.pending.controlNotify:
+		return dequeuedWriteWork{kind: dequeuedWriteWorkControl}, true
 	default:
 	}
 	advisory := c.writer.advisoryWriteCh
@@ -429,6 +436,8 @@ func (c *Conn) waitDequeueWriteWork() dequeuedWriteWork {
 	select {
 	case <-c.lifecycle.closedCh:
 		return dequeuedWriteWork{kind: dequeuedWriteWorkClosed}
+	case <-c.pending.terminalNotify:
+		return dequeuedWriteWork{kind: dequeuedWriteWorkControl}
 	case <-c.pending.controlNotify:
 		return dequeuedWriteWork{kind: dequeuedWriteWorkControl}
 	case req := <-c.writer.urgentWriteCh:

@@ -24,10 +24,10 @@ any extra shim object.
 
 - `AcceptStream` / `OpenStream` map to QUIC bidirectional streams directly.
 - `AcceptUniStream` / `OpenUniStream` map to QUIC unidirectional streams directly.
-- `CloseRead` maps to `CancelRead(CANCELLED)`.
+- `CloseRead` maps to QUIC `CancelRead(CANCELLED)`.
 - `CloseWrite` maps to QUIC's send-side `Close`.
-- `Reset*` and `CancelWrite*` map to QUIC `CancelWrite`.
-- `Abort*` and `CloseWithError*` are best-effort local termination helpers that
+- `Reset` / `ResetWithReason` map to QUIC `CancelWrite`.
+- `Abort*` are best-effort local termination helpers that
   cancel both readable and writable directions with the same application code.
 - QUIC stream / connection application errors are normalized to
   `*zmux.ApplicationError`.
@@ -63,8 +63,7 @@ on the QUIC wire. The adapter then returns
   `errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.
 - `ResetWithReason(code, reason)` cannot put `reason` on the QUIC stream wire.
   QUIC stream cancellation carries only the numeric application code.
-- `AbortWithError(err)`, `AbortWithErrorCode(code, reason)`,
-  `CloseWithError(err)`, and `CloseWithErrorCode(code, reason)` on streams can
+- `AbortWithError(err)` and `AbortWithErrorCode(code, reason)` on streams can
   only propagate the numeric code on the wire. A free-form reason string is not
   available on QUIC stream cancellation.
 - `Stats()` only reports the coarse session `State`. Queue, pressure,

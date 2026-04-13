@@ -8,6 +8,7 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/zmuxio/zmux-go v0.0.0-20260412233857-b89a6360834e h1:VPp5D1lEGxYxZ78y4nuAExniN8sET6uyRjoWAeYeGJs=
 github.com/zmuxio/zmux-go v0.0.0-20260412233857-b89a6360834e/go.mod h1:BT+jCtoUz6kjgHgOHxYWD9C0Xlw16wbsgDUgp14KEPU=
+github.com/zmuxio/zmux-go v1.0.0/go.mod h1:BT+jCtoUz6kjgHgOHxYWD9C0Xlw16wbsgDUgp14KEPU=
 go.uber.org/mock v0.5.2 h1:LbtPTcP8A5k9WPXj54PPPbjcI4Y6lhyOZXn+VS7wNko=
 go.uber.org/mock v0.5.2/go.mod h1:wLlUxC2vVTPTaE3UD51E0BGOAElKrILxhVSDYQLld5o=
 golang.org/x/crypto v0.41.0 h1:WKYxWedPGCTVVl5+WHSSrOBT0O8lx32+zxmHxijgXp4=

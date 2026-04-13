@@ -1577,8 +1577,8 @@ func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	if err := s.Reset(uint64(CodeCancelled)); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("Reset() err = %v, want %v", err, ErrSessionClosed)
 	}
-	if err := s.CloseWithErrorCode(uint64(CodeCancelled), ""); !errors.Is(err, ErrSessionClosed) {
-		t.Fatalf("CloseWithErrorCode() err = %v, want %v", err, ErrSessionClosed)
+	if err := s.AbortWithErrorCode(uint64(CodeCancelled), ""); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("AbortWithErrorCode() err = %v, want %v", err, ErrSessionClosed)
 	}
 	if err := s.Close(); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("Close() err = %v, want %v", err, ErrSessionClosed)
@@ -1612,7 +1612,7 @@ func TestCloseReadInvalidCodeDoesNotLeakConnLock(t *testing.T) {
 		{
 			name: "CancelReadWithCode",
 			call: func(s *nativeStream) error {
-				return s.CancelReadWithCode(MaxVarint62 + 1)
+				return s.CloseReadWithCode(MaxVarint62 + 1)
 			},
 		},
 	}
@@ -1766,7 +1766,7 @@ func TestStreamGettersConcurrentWithCommit(t *testing.T) {
 				return
 			default:
 				_ = stream.StreamID()
-				_ = stream.ID()
+				_ = stream.StreamID()
 				_ = stream.OpenInfo()
 			}
 		}
@@ -1792,8 +1792,8 @@ func TestStreamGettersConcurrentWithCommit(t *testing.T) {
 	if got := stream.StreamID(); got == 0 {
 		t.Fatal("stream StreamID() = 0, want committed id")
 	}
-	if got := stream.ID(); got != stream.StreamID() {
-		t.Fatalf("stream ID() = %d, want %d", got, stream.StreamID())
+	if got := stream.StreamID(); got == 0 {
+		t.Fatal("stream StreamID() = 0, want committed id")
 	}
 	if got := stream.OpenInfo(); !bytes.Equal(got, []byte("ssh")) {
 		t.Fatalf("stream OpenInfo() = %q, want %q", got, []byte("ssh"))
@@ -1963,7 +1963,7 @@ func TestCloseWithErrorOnConcreteLocalIDQueuesOpeningAbort(t *testing.T) {
 	c.appendUnseenLocalLocked(stream)
 	c.mu.Unlock()
 
-	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.AbortWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("CloseWithErrorCode err = %v, want nil", err)
 	}
 
@@ -2623,7 +2623,7 @@ func TestCloseReadStopsPeerWritesButPreservesReverseRead(t *testing.T) {
 	}
 }
 
-func TestCancelReadAlias(t *testing.T) {
+func TestCloseReadRepeatedCallReturnsReadClosed(t *testing.T) {
 	t.Parallel()
 	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
@@ -2653,11 +2653,11 @@ func TestCancelReadAlias(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.CancelRead(); err != nil {
-		t.Fatalf("cancel read: %v", err)
+	if err := serverStream.CloseRead(); err != nil {
+		t.Fatalf("close read: %v", err)
 	}
-	if err := serverStream.CancelRead(); err != nil {
-		t.Fatalf("second cancel read: %v", err)
+	if err := serverStream.CloseRead(); !errors.Is(err, ErrReadClosed) {
+		t.Fatalf("second close read err = %v, want %v", err, ErrReadClosed)
 	}
 
 	if _, err := serverStream.Read(buf); !errors.Is(err, ErrReadClosed) {
@@ -2665,7 +2665,7 @@ func TestCancelReadAlias(t *testing.T) {
 	}
 }
 
-func TestCancelWriteAlias(t *testing.T) {
+func TestResetRepeatedCallReturnsLocalTerminalError(t *testing.T) {
 	t.Parallel()
 	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
@@ -2695,14 +2695,19 @@ func TestCancelWriteAlias(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := clientStream.CancelWrite(); err != nil {
-		t.Fatalf("cancel write: %v", err)
+	if err := clientStream.Reset(uint64(CodeCancelled)); err != nil {
+		t.Fatalf("reset: %v", err)
 	}
 	if _, err := clientStream.Write([]byte("y")); !isWriteStoppedErr(err) {
-		t.Fatalf("write after cancel write err = %v, want write-stopped error", err)
+		t.Fatalf("write after reset err = %v, want write-stopped error", err)
 	}
-	if err := clientStream.ResetWrite(); err != nil {
-		t.Fatalf("reset-write alias: %v", err)
+	err = clientStream.Reset(uint64(CodeCancelled))
+	var appErr *ApplicationError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("second reset err = %v, want ApplicationError", err)
+	}
+	if appErr.Code != uint64(CodeCancelled) {
+		t.Fatalf("second reset code = %d, want %d", appErr.Code, uint64(CodeCancelled))
 	}
 }
 
@@ -4192,7 +4197,7 @@ func TestStreamCancelWriteWithCodeAliasesReset(t *testing.T) {
 	})
 	testMarkLocalOpenVisible(stream)
 
-	if err := stream.CancelWriteWithCode(99); err != nil {
+	if err := stream.Reset(99); err != nil {
 		t.Fatalf("CancelWriteWithCode err = %v", err)
 	}
 
@@ -4214,7 +4219,7 @@ func TestSendStreamResetWriteWithCodeAliasesReset(t *testing.T) {
 	testMarkLocalOpenVisible(stream)
 
 	send := &nativeSendStream{stream: stream}
-	if err := send.ResetWriteWithCode(77); err != nil {
+	if err := send.Reset(77); err != nil {
 		t.Fatalf("ResetWriteWithCode err = %v", err)
 	}
 
@@ -5238,7 +5243,7 @@ func TestStructuredErrorAfterLocalAbortRead(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := clientStream.CloseWithErrorCode(uint64(CodeInternal), "local abort"); err != nil {
+	if err := clientStream.AbortWithErrorCode(uint64(CodeInternal), "local abort"); err != nil {
 		t.Fatalf("client abort: %v", err)
 	}
 
@@ -5290,7 +5295,7 @@ func TestStructuredErrorAfterPeerAbortWrite(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.CloseWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
+	if err := serverStream.AbortWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
 		t.Fatalf("server abort: %v", err)
 	}
 
@@ -5466,7 +5471,7 @@ func TestStructuredErrorAfterPeerAbortCloseWrite(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.CloseWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
+	if err := serverStream.AbortWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
 		t.Fatalf("server abort: %v", err)
 	}
 
@@ -5506,7 +5511,7 @@ func TestStreamCloseWithErrorCodeTruncatesReasonTextToControlLimit(t *testing.T)
 	c.registry.streams[4] = stream
 
 	reason := "abcdefghijklmnopqrst"
-	if err := stream.CloseWithErrorCode(uint64(CodeRefusedStream), reason); err != nil {
+	if err := stream.AbortWithErrorCode(uint64(CodeRefusedStream), reason); err != nil {
 		t.Fatalf("close with long reason: %v", err)
 	}
 
@@ -5581,7 +5586,7 @@ func TestStreamCloseWithErrorCodePreservesUTF8BoundaryWhenTruncating(t *testing.
 	c.registry.streams[4] = stream
 
 	reason := "😀😀😀"
-	if err := stream.CloseWithErrorCode(uint64(CodeInternal), reason); err != nil {
+	if err := stream.AbortWithErrorCode(uint64(CodeInternal), reason); err != nil {
 		t.Fatalf("close with utf8 reason: %v", err)
 	}
 
