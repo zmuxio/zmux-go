@@ -132,21 +132,76 @@ func (c *Conn) readLoop() {
 	}
 }
 
+func (c *Conn) startReadLoopProtocolLoopLocked() {
+	if c == nil {
+		return
+	}
+	if c.protocol.wakeCh == nil {
+		c.protocol.wakeCh = make(chan struct{}, 1)
+	}
+	wakeCh := c.protocol.wakeCh
+	closedCh := c.lifecycle.closedCh
+	c.protocol.startOnce.Do(func() {
+		go c.readLoopProtocolLoop(wakeCh, closedCh)
+	})
+}
+
+func (c *Conn) takeReadLoopProtocolJobsLocked() []func() error {
+	if c == nil || len(c.protocol.jobs) == 0 {
+		return nil
+	}
+	jobs := c.protocol.jobs
+	c.protocol.jobs = nil
+	return jobs
+}
+
+func (c *Conn) handleReadLoopProtocolActionErr(err error) {
+	if c == nil || err == nil {
+		return
+	}
+	c.mu.Lock()
+	current := c.lifecycle.sessionState
+	c.mu.Unlock()
+	if state.IsBenignSessionError(current, err, ErrSessionClosed) {
+		return
+	}
+	c.closeSession(err)
+}
+
+func (c *Conn) readLoopProtocolLoop(wakeCh, closedCh chan struct{}) {
+	for {
+		select {
+		case <-closedCh:
+			return
+		case <-wakeCh:
+		}
+		for {
+			c.mu.Lock()
+			jobs := c.takeReadLoopProtocolJobsLocked()
+			c.mu.Unlock()
+			if len(jobs) == 0 {
+				break
+			}
+			for _, job := range jobs {
+				if job == nil {
+					continue
+				}
+				c.handleReadLoopProtocolActionErr(job())
+			}
+		}
+	}
+}
+
 func (c *Conn) runReadLoopProtocolActionAsync(action func() error) {
 	if c == nil || action == nil {
 		return
 	}
-	go func() {
-		if err := action(); err != nil {
-			c.mu.Lock()
-			current := c.lifecycle.sessionState
-			c.mu.Unlock()
-			if state.IsBenignSessionError(current, err, ErrSessionClosed) {
-				return
-			}
-			c.closeSession(err)
-		}
-	}()
+	c.mu.Lock()
+	c.startReadLoopProtocolLoopLocked()
+	c.protocol.jobs = append(c.protocol.jobs, action)
+	wakeCh := c.protocol.wakeCh
+	c.mu.Unlock()
+	notify(wakeCh)
 }
 
 func (c *Conn) queueReadLoopFrameAsync(frame txFrame) {
@@ -750,24 +805,41 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		if conn := stream.conn; conn != nil {
 			deadline = time.Now().Add(rt.StopSendingDrainWindow(conn.terminalPolicy.stopSendingDrainWindow))
 		}
-		err := stream.closeWriteUntil(deadline)
-		if err == nil || errors.Is(err, ErrWriteClosed) {
-			return nil
-		}
-		if conn := stream.conn; conn != nil {
-			conn.mu.Lock()
-			sendTerminal := state.SendTerminal(stream.effectiveSendHalfStateLocked())
-			conn.mu.Unlock()
-			if sendTerminal {
-				return nil
-			}
-		}
-		if !errors.Is(err, os.ErrDeadlineExceeded) {
+		closePlan, err := stream.prepareAsyncCloseWritePlan()
+		if err != nil {
 			return err
 		}
-		return stream.resetAfterStopSending(uint64(CodeCancelled))
+		if len(closePlan.frames) == 0 {
+			return nil
+		}
+		c.runReadLoopProtocolActionAsync(func() error {
+			err := closePlan.queueCloseWrite(stream, deadline)
+			if err == nil || errors.Is(err, ErrWriteClosed) {
+				return nil
+			}
+			if conn := stream.conn; conn != nil {
+				conn.mu.Lock()
+				sendTerminal := state.SendTerminal(stream.effectiveSendHalfStateLocked())
+				conn.mu.Unlock()
+				if sendTerminal {
+					return nil
+				}
+			}
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				return err
+			}
+			return stream.resetAfterStopSending(uint64(CodeCancelled))
+		})
+		return nil
 	}
-	return stream.resetAfterStopSending(uint64(CodeCancelled))
+	resetPlan, err := stream.prepareResetAfterStopSendingPlan(uint64(CodeCancelled))
+	if err != nil {
+		return err
+	}
+	c.runReadLoopProtocolActionAsync(func() error {
+		return resetPlan.queuePrepared(stream)
+	})
+	return nil
 }
 
 func (c *Conn) handleResetFrame(frame Frame) error {

@@ -1365,7 +1365,7 @@ func (p closeReadPlan) queue(s *nativeStream) error {
 	return nil
 }
 
-func (s *nativeStream) prepareCloseReadPlanLocked(code uint64) (plan closeReadPlan, err error) {
+func (s *nativeStream) prepareCloseReadPlanLocked(stopPayload []byte) (plan closeReadPlan, err error) {
 	if s == nil || s.conn == nil {
 		return closeReadPlan{}, ErrSessionClosed
 	}
@@ -1380,14 +1380,10 @@ func (s *nativeStream) prepareCloseReadPlanLocked(code uint64) (plan closeReadPl
 		return plan, nil
 	}
 
-	payload, payloadErr := buildCodePayload(code, "", 0)
-	if payloadErr != nil {
-		return closeReadPlan{}, s.closeOperationErr(payloadErr)
-	}
 	plan.stopFrame = flatTxFrame(Frame{
 		Type:     FrameTypeStopSending,
 		StreamID: s.id,
-		Payload:  payload,
+		Payload:  stopPayload,
 	})
 	return plan, nil
 }
@@ -1395,6 +1391,10 @@ func (s *nativeStream) prepareCloseReadPlanLocked(code uint64) (plan closeReadPl
 func (s *nativeStream) closeReadWithCode(code uint64) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
+	}
+	stopPayload, err := buildCodePayload(code, "", 0)
+	if err != nil {
+		return s.closeOperationErr(err)
 	}
 	commitState := localCloseReadPending
 	for {
@@ -1411,7 +1411,7 @@ func (s *nativeStream) closeReadWithCode(code uint64) error {
 			return s.closeOperationErr(err)
 		}
 
-		plan, err := s.prepareCloseReadPlanLocked(code)
+		plan, err := s.prepareCloseReadPlanLocked(stopPayload)
 		if err != nil {
 			return err
 		}
@@ -1471,6 +1471,60 @@ func (s *nativeStream) closeWriteUntil(deadlineOverride time.Time) error {
 		s.conn.mu.Unlock()
 		return plan.queueCloseWrite(s, deadlineOverride)
 	}
+}
+
+func (s *nativeStream) prepareAsyncCloseWritePlan() (terminalFramePlan, error) {
+	if s == nil || s.conn == nil {
+		return terminalFramePlan{}, ErrSessionClosed
+	}
+	for {
+		s.conn.mu.Lock()
+		if s.conn.lifecycle.closeErr != nil {
+			err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
+			s.conn.mu.Unlock()
+			return terminalFramePlan{}, sessionOperationErrLocked(s.conn, OperationClose, err)
+		}
+		if s.allowsCloseWriteNoOpAfterStopResetLocked() {
+			s.conn.mu.Unlock()
+			return terminalFramePlan{}, nil
+		}
+		if err := s.localSendActionErrLocked(state.LocalCloseWriteAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {
+			s.conn.mu.Unlock()
+			return terminalFramePlan{}, s.closeOperationErr(err)
+		}
+		plan, err := s.prepareTerminalFramePlanLocked(terminalDataPrepareSpec{
+			intent: terminalDataCloseWrite,
+			wrap:   s.closeOperationErr,
+		})
+		if err != nil {
+			return terminalFramePlan{}, err
+		}
+		if plan.shouldRetry() {
+			continue
+		}
+		s.conn.mu.Unlock()
+		return plan, nil
+	}
+}
+
+func (s *nativeStream) prepareResetAfterStopSendingPlan(code uint64) (terminalSignalPlan, error) {
+	if s == nil || s.conn == nil {
+		return terminalSignalPlan{}, ErrSessionClosed
+	}
+	s.conn.mu.Lock()
+	defer s.conn.mu.Unlock()
+	if s.conn.lifecycle.closeErr != nil {
+		err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
+		return terminalSignalPlan{}, sessionOperationErrLocked(s.conn, OperationClose, err)
+	}
+	if err := s.localSendActionErrLocked(state.LocalResetAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {
+		return terminalSignalPlan{}, s.closeOperationErr(err)
+	}
+	appErr := applicationErr(code, "")
+	return s.prepareTerminalSignalPlanLocked(terminalSignalReset, code, "", appErr, terminalSignalOptions{
+		openerPolicy: terminalOpenerAllow,
+		resetSource:  terminalResetFromStopSending,
+	})
 }
 
 func (s *nativeStream) CancelWrite() error {
@@ -1751,6 +1805,13 @@ func (p terminalSignalPlan) queue(s *nativeStream) error {
 		return nil
 	}
 	s.conn.mu.Unlock()
+	return p.queuePrepared(s)
+}
+
+func (p terminalSignalPlan) queuePrepared(s *nativeStream) error {
+	if s == nil || s.conn == nil || p.finished() {
+		return nil
+	}
 	var frameBuf [1]txFrame
 	frames := frameBuf[:1]
 	frames[0] = flatTxFrame(Frame{

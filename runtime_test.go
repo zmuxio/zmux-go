@@ -1874,6 +1874,106 @@ func TestClientEstablishmentRoleConflictEmitsFatalClose(t *testing.T) {
 	}
 }
 
+func TestClientEstablishmentInvalidPeerPrefaceDoesNotWaitForBlockedLocalPrefaceWrite(t *testing.T) {
+	t.Parallel()
+
+	left, right := net.Pipe()
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+
+	invalidPeer := append([]byte(nil), testPrefaceBytesForRole(t, RoleResponder)...)
+	invalidPeer[5] = 7
+
+	peerWriteDone := make(chan error, 1)
+	go func() {
+		_, err := right.Write(invalidPeer)
+		peerWriteDone <- err
+	}()
+
+	type result struct {
+		conn *Conn
+		err  error
+	}
+	clientCh := make(chan result, 1)
+	go func() {
+		conn, err := Client(left, nil)
+		clientCh <- result{conn: conn, err: err}
+	}()
+
+	select {
+	case err := <-peerWriteDone:
+		if err != nil {
+			t.Fatalf("write invalid peer preface: %v", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("timed out delivering invalid peer preface")
+	}
+
+	select {
+	case res := <-clientCh:
+		if res.conn != nil {
+			_ = res.conn.Close()
+			t.Fatal("expected client establish to fail after invalid peer preface")
+		}
+		if res.err == nil {
+			t.Fatal("expected client establish error after invalid peer preface")
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("client establish blocked waiting for local preface write after invalid peer preface")
+	}
+}
+
+func TestClientEstablishmentRoleConflictDoesNotWaitForBlockedLocalPrefaceWrite(t *testing.T) {
+	t.Parallel()
+
+	left, right := net.Pipe()
+	t.Cleanup(func() {
+		_ = left.Close()
+		_ = right.Close()
+	})
+
+	conflictingPeer := testPrefaceBytesForRole(t, RoleInitiator)
+	peerWriteDone := make(chan error, 1)
+	go func() {
+		_, err := right.Write(conflictingPeer)
+		peerWriteDone <- err
+	}()
+
+	type result struct {
+		conn *Conn
+		err  error
+	}
+	clientCh := make(chan result, 1)
+	go func() {
+		conn, err := Client(left, nil)
+		clientCh <- result{conn: conn, err: err}
+	}()
+
+	select {
+	case err := <-peerWriteDone:
+		if err != nil {
+			t.Fatalf("write conflicting peer preface: %v", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("timed out delivering conflicting peer preface")
+	}
+
+	select {
+	case res := <-clientCh:
+		if res.conn != nil {
+			_ = res.conn.Close()
+			t.Fatal("expected client establish to fail after role conflict")
+		}
+		if res.err == nil {
+			t.Fatal("expected client establish error after role conflict")
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("client establish blocked waiting for local preface write after role conflict")
+	}
+}
+
 func TestRetainReadFrameBufferKeepsSmallBuffer(t *testing.T) {
 	t.Parallel()
 

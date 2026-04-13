@@ -1167,6 +1167,24 @@ func TestCloseSessionEmitsCloseFrameForFatalError(t *testing.T) {
 	assertNoQueuedFrame(t, frames)
 }
 
+func TestCloseSessionDoesNotMarkCloseFrameSentWhenPayloadBuildFails(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+	c.io.conn = &countingWriteCloser{}
+
+	c.closeSession(&ApplicationError{Code: MaxVarint62 + 1, Reason: "fatal"})
+
+	assertNoQueuedFrame(t, frames)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.shutdown.closeFrameSent {
+		t.Fatal("closeFrameSent = true after CLOSE payload build failure, want false")
+	}
+}
+
 func TestCloseStreamOnSessionGracefulCloseFinishesStopSeenHalves(t *testing.T) {
 	t.Parallel()
 
@@ -13278,7 +13296,6 @@ func TestCloseWriteCarriesPendingPriorityUpdateBeforeFin(t *testing.T) {
 	}
 
 	c := &Conn{
-
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 1), urgentWriteCh: make(chan writeRequest, 1)}, config: connConfigState{negotiated: Negotiated{
 			Capabilities: caps,
@@ -14966,6 +14983,95 @@ func TestStopSendingWithNoQueuedTailStillPrefersResetBeforeCommit(t *testing.T) 
 	}
 	if stream.sendFinReached() {
 		t.Fatal("sendFinReached() = true, want reset when no committed tail exists")
+	}
+}
+
+func TestHandleStopSendingQueuesTerminalFollowupWithoutWriterAdmission(t *testing.T) {
+	t.Parallel()
+
+	settings := DefaultSettings()
+	localRole := RoleInitiator
+	peerRole := RoleResponder
+	c := &Conn{
+		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
+		signals:   connRuntimeSignalState{acceptCh: make(chan struct{}, 1)},
+		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 1), urgentWriteCh: make(chan writeRequest, 1)},
+		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})},
+		sessionControl: connSessionControlState{
+			peerGoAwayBidi:  MaxVarint62,
+			peerGoAwayUni:   MaxVarint62,
+			localGoAwayBidi: MaxVarint62,
+			localGoAwayUni:  MaxVarint62,
+		},
+		ingress: connIngressAccountingState{
+			aggregateLateDataCap: aggregateLateDataCapFor(settings.MaxFramePayload),
+		},
+		config: connConfigState{
+			local:      Preface{PrefaceVersion: PrefaceVersion, Role: localRole, MinProto: ProtoVersion, MaxProto: ProtoVersion, Settings: settings},
+			peer:       Preface{PrefaceVersion: PrefaceVersion, Role: peerRole, MinProto: ProtoVersion, MaxProto: ProtoVersion, Settings: settings},
+			negotiated: Negotiated{Proto: ProtoVersion, Capabilities: 0, LocalRole: localRole, PeerRole: peerRole, PeerSettings: settings},
+		},
+		flow: connFlowState{
+			recvSessionAdvertised: settings.InitialMaxData,
+			sendSessionMax:        settings.InitialMaxData,
+		},
+		registry: connRegistryState{
+			streams:        make(map[uint64]*nativeStream),
+			tombstones:     make(map[uint64]streamTombstone),
+			usedStreamData: make(map[uint64]usedStreamMarker),
+			nextLocalBidi:  state.FirstLocalStreamID(localRole, true),
+			nextLocalUni:   state.FirstLocalStreamID(localRole, false),
+			nextPeerBidi:   state.FirstPeerStreamID(localRole, true),
+			nextPeerUni:    state.FirstPeerStreamID(localRole, false),
+		},
+	}
+
+	streamID := state.FirstLocalStreamID(c.config.negotiated.LocalRole, true)
+	stream := seedStateFixtureStream(t, c, streamID, "bidi", "local_owned", stateHalfExpect{
+		SendHalf: "send_open",
+		RecvHalf: "recv_open",
+	})
+	testMarkLocalOpenCommitted(stream)
+	stream.sendSent = 3
+	c.flow.sendSessionUsed = 3
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.handleStopSendingFrame(Frame{
+			Type:     FrameTypeStopSending,
+			StreamID: streamID,
+			Payload:  mustEncodeVarint(uint64(CodeCancelled)),
+		})
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("handle STOP_SENDING err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("handle STOP_SENDING blocked on writer admission")
+	}
+
+	select {
+	case req := <-c.writer.writeCh:
+		if len(req.frames) == 0 {
+			t.Fatal("queued request has no frames")
+		}
+		queued := testPublicFrame(req.frames[len(req.frames)-1])
+		if queued.Type != FrameTypeDATA || queued.Flags&FrameFlagFIN == 0 {
+			t.Fatalf("queued frame = %+v, want DATA|FIN", queued)
+		}
+	case req := <-c.writer.urgentWriteCh:
+		if len(req.frames) == 0 {
+			t.Fatal("queued request has no frames")
+		}
+		queued := testPublicFrame(req.frames[len(req.frames)-1])
+		if queued.Type != FrameTypeRESET {
+			t.Fatalf("queued frame = %+v, want RESET", queued)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("terminal follow-up was not queued asynchronously")
 	}
 }
 

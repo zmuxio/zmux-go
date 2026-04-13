@@ -1096,12 +1096,13 @@ func (c *Conn) closeSessionWithPolicy(err error, closePolicy closeFramePolicy) {
 		}
 		if (closePolicy.forcesCloseFrame() || !state.IsBenignSessionError(c.lifecycle.sessionState, err, ErrSessionClosed)) && c.sessionControl.peerCloseErr == nil && !c.shutdown.closeFrameSent {
 			payload, payloadErr := buildClosePayload(c, err)
-			closeFramePayload = payload
 			if payloadErr != nil {
 				err = payloadErr
+			} else {
+				closeFramePayload = payload
+				emitCloseFrame = true
+				c.shutdown.closeFrameSent = true
 			}
-			emitCloseFrame = true
-			c.shutdown.closeFrameSent = true
 		}
 		if !state.IsSessionFinished(c.lifecycle.sessionState) {
 			c.lifecycle.sessionState = state.CloseSessionState(c.lifecycle.sessionState, err, ErrSessionClosed)
@@ -1242,6 +1243,8 @@ func establishmentCloseDrainDelay(err error) time.Duration {
 	return 10 * time.Millisecond
 }
 
+const establishmentFailureWriteWait = 10 * time.Millisecond
+
 func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer *Preface, err error) {
 	if conn == nil {
 		return
@@ -1254,6 +1257,25 @@ func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer
 		}
 	}
 	_ = conn.Close()
+}
+
+func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error, local Preface, peer *Preface, err error) {
+	if conn == nil {
+		return
+	}
+	timer := time.NewTimer(establishmentFailureWriteWait)
+	defer stopTimer(timer)
+	select {
+	case writeErr := <-writeErrCh:
+		if writeErr == nil {
+			closeAfterEstablishmentFailure(conn, local, peer, err)
+			return
+		}
+		_ = conn.Close()
+	case <-timer.C:
+		_ = conn.Close()
+		<-writeErrCh
+	}
 }
 
 func (c *Conn) closeClosedChLocked() {
@@ -1870,6 +1892,9 @@ func Server(conn io.ReadWriteCloser, cfg *Config) (*Conn, error) {
 const connReadBufferSize = 512
 
 func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
+	if conn == nil {
+		return nil, ErrNilConn
+	}
 	local, err := cfg.LocalPreface()
 	if err != nil {
 		_ = conn.Close()
@@ -1887,22 +1912,18 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 
 	peer, readErr := ReadPreface(reader)
 	if readErr != nil {
-		if writeErr := <-writeErrCh; writeErr == nil {
-			closeAfterEstablishmentFailure(conn, local, nil, readErr)
-		} else {
-			_ = conn.Close()
-		}
+		finishEstablishmentFailure(conn, writeErrCh, local, nil, readErr)
 		return nil, readErr
-	}
-	if writeErr := <-writeErrCh; writeErr != nil {
-		_ = conn.Close()
-		return nil, writeErr
 	}
 
 	negotiated, err := NegotiatePrefaces(local, peer)
 	if err != nil {
-		closeAfterEstablishmentFailure(conn, local, &peer, err)
+		finishEstablishmentFailure(conn, writeErrCh, local, &peer, err)
 		return nil, err
+	}
+	if writeErr := <-writeErrCh; writeErr != nil {
+		_ = conn.Close()
+		return nil, writeErr
 	}
 
 	now := time.Now()
@@ -2050,6 +2071,12 @@ type connWriterRuntimeState struct {
 	writeCh         chan writeRequest
 	advisoryWriteCh chan writeRequest
 	urgentWriteCh   chan writeRequest
+}
+
+type connProtocolRuntimeState struct {
+	startOnce sync.Once
+	wakeCh    chan struct{}
+	jobs      []func() error
 }
 
 type connIngressAccountingState struct {
@@ -2296,6 +2323,7 @@ type Conn struct {
 	retention      connRetentionState
 	terminalPolicy connTerminationPolicyState
 	writer         connWriterRuntimeState
+	protocol       connProtocolRuntimeState
 	ingress        connIngressAccountingState
 	metrics        connRuntimeMetricsState
 	liveness       connLivenessState

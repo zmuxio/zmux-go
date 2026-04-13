@@ -1596,6 +1596,60 @@ func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	}
 }
 
+func TestCloseReadInvalidCodeDoesNotLeakConnLock(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		call func(*nativeStream) error
+	}{
+		{
+			name: "CloseReadWithCode",
+			call: func(s *nativeStream) error {
+				return s.CloseReadWithCode(MaxVarint62 + 1)
+			},
+		},
+		{
+			name: "CancelReadWithCode",
+			call: func(s *nativeStream) error {
+				return s.CancelReadWithCode(MaxVarint62 + 1)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, _, stop := newHandlerTestConn(t)
+			defer stop()
+
+			c.mu.Lock()
+			stream := c.newLocalStreamWithIDLocked(state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), streamArityBidi, OpenOptions{}, nil)
+			stream.idSet = true
+			c.registry.streams[stream.id] = stream
+			c.mu.Unlock()
+
+			if err := tc.call(stream); err == nil {
+				t.Fatalf("%s err = nil, want invalid code error", tc.name)
+			}
+
+			lockReleased := make(chan struct{})
+			go func() {
+				_ = c.State()
+				close(lockReleased)
+			}()
+
+			select {
+			case <-lockReleased:
+			case <-time.After(testSignalTimeout):
+				t.Fatalf("%s left conn.mu locked after returning", tc.name)
+			}
+		})
+	}
+}
+
 func TestStreamAddrsConcurrentWithIDCommit(t *testing.T) {
 	t.Parallel()
 

@@ -10,6 +10,7 @@ import (
 )
 
 var (
+	ErrNilConn                   = errors.New("zmux: nil conn")
 	ErrSessionClosed             = errors.New("zmux: session closed")
 	ErrReadClosed                = errors.New("zmux: read side closed")
 	ErrWriteClosed               = errors.New("zmux: write side closed")

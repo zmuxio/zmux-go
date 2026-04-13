@@ -94,3 +94,53 @@ func TestPublicProtocolAliasesRemainPinned(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionConstructorsRejectNilConn(t *testing.T) {
+	t.Parallel()
+
+	t.Run("native", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name string
+			call func() (*Conn, error)
+		}{
+			{name: "New", call: func() (*Conn, error) { return New(nil, nil) }},
+			{name: "Client", call: func() (*Conn, error) { return Client(nil, nil) }},
+			{name: "Server", call: func() (*Conn, error) { return Server(nil, nil) }},
+		}
+
+		for _, tc := range cases {
+			conn, err := tc.call()
+			if conn != nil {
+				t.Fatalf("%s returned non-nil conn for nil transport", tc.name)
+			}
+			if err != ErrNilConn {
+				t.Fatalf("%s err = %v, want %v", tc.name, err, ErrNilConn)
+			}
+		}
+	})
+
+	t.Run("session", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name string
+			call func() (Session, error)
+		}{
+			{name: "NewSession", call: func() (Session, error) { return NewSession(nil, nil) }},
+			{name: "ClientSession", call: func() (Session, error) { return ClientSession(nil, nil) }},
+			{name: "ServerSession", call: func() (Session, error) { return ServerSession(nil, nil) }},
+		}
+
+		for _, tc := range cases {
+			session, err := tc.call()
+			if session != nil {
+				t.Fatalf("%s returned non-nil session for nil transport", tc.name)
+			}
+			if err != ErrNilConn {
+				t.Fatalf("%s err = %v, want %v", tc.name, err, ErrNilConn)
+			}
+		}
+	})
+}
