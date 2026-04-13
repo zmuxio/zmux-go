@@ -102,8 +102,8 @@ func TestWrapSessionCloseReadUsesCancelledCode(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		var appErr *zmux.ApplicationError
-		if !errors.As(err, &appErr) {
+		appErr, ok := findError[*zmux.ApplicationError](err)
+		if !ok {
 			t.Fatalf("Write err = %v, want ApplicationError(CodeCancelled)", err)
 		}
 		if appErr.Code != uint64(zmux.CodeCancelled) {

@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/adaptertest"
 )
 

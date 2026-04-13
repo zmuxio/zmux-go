@@ -121,35 +121,30 @@ func AsSession(conn *Conn) Session {
 // NewSession establishes a native zmux session and returns it through the
 // stable Session interface.
 func NewSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
-	c, err := New(conn, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return AsSession(c), nil
+	return sessionFromNativeResult(New(conn, cfg))
 }
 
 // ClientSession establishes an initiator-native session and returns it through
 // the stable Session interface.
 func ClientSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
-	c, err := Client(conn, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return AsSession(c), nil
+	return sessionFromNativeResult(Client(conn, cfg))
 }
 
 // ServerSession establishes a responder-native session and returns it through
 // the stable Session interface.
 func ServerSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
-	c, err := Server(conn, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return AsSession(c), nil
+	return sessionFromNativeResult(Server(conn, cfg))
 }
 
 type nativeSession struct {
 	conn *Conn
+}
+
+func sessionFromNativeResult(conn *Conn, err error) (Session, error) {
+	if err != nil {
+		return nil, err
+	}
+	return AsSession(conn), nil
 }
 
 func (s nativeSession) AcceptStream(ctx context.Context) (Stream, error) {

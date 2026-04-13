@@ -43,6 +43,18 @@ func (s *nativeStream) RemoteAddr() net.Addr {
 	return s.streamAddr(streamAddrEndpointRemote)
 }
 
+// NativeStream is the concrete repository-default bidirectional stream type
+// returned by the native *Conn API.
+type NativeStream = nativeStream
+
+// NativeSendStream is the concrete repository-default send-only stream type
+// returned by the native *Conn API.
+type NativeSendStream = nativeSendStream
+
+// NativeRecvStream is the concrete repository-default receive-only stream type
+// returned by the native *Conn API.
+type NativeRecvStream = nativeRecvStream
+
 type streamAddrEndpoint uint8
 
 const (

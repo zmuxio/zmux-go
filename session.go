@@ -306,11 +306,11 @@ func (c *Conn) lockPeerNonCloseFrameHandling() bool {
 	return true
 }
 
-func (c *Conn) AcceptStream(ctx context.Context) (*nativeStream, error) {
+func (c *Conn) AcceptStream(ctx context.Context) (*NativeStream, error) {
 	return c.acceptStream(ctx, streamArityBidi)
 }
 
-func (c *Conn) AcceptUniStream(ctx context.Context) (*nativeRecvStream, error) {
+func (c *Conn) AcceptUniStream(ctx context.Context) (*NativeRecvStream, error) {
 	stream, err := c.acceptStream(ctx, streamArityUni)
 	if err != nil {
 		return nil, err
@@ -424,19 +424,19 @@ func (c *Conn) takeStreamEventLocked(stream *nativeStream, typ EventType, err er
 	}
 }
 
-func (c *Conn) OpenStream(ctx context.Context) (*nativeStream, error) {
+func (c *Conn) OpenStream(ctx context.Context) (*NativeStream, error) {
 	return c.OpenStreamWithOptions(ctx, OpenOptions{})
 }
 
-func (c *Conn) OpenUniStream(ctx context.Context) (*nativeSendStream, error) {
+func (c *Conn) OpenUniStream(ctx context.Context) (*NativeSendStream, error) {
 	return c.OpenUniStreamWithOptions(ctx, OpenOptions{})
 }
 
-func (c *Conn) OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (*nativeStream, error) {
+func (c *Conn) OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (*NativeStream, error) {
 	return c.openStream(ctx, streamArityBidi, opts)
 }
 
-func (c *Conn) OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (*nativeSendStream, error) {
+func (c *Conn) OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (*NativeSendStream, error) {
 	stream, err := c.openStream(ctx, streamArityUni, opts)
 	if err != nil {
 		return nil, err
@@ -444,11 +444,11 @@ func (c *Conn) OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (
 	return &nativeSendStream{stream: stream}, nil
 }
 
-func (c *Conn) OpenAndSend(ctx context.Context, p []byte) (*nativeStream, int, error) {
+func (c *Conn) OpenAndSend(ctx context.Context, p []byte) (*NativeStream, int, error) {
 	return c.OpenAndSendWithOptions(ctx, OpenOptions{}, p)
 }
 
-func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*nativeStream, int, error) {
+func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*NativeStream, int, error) {
 	stream, err := c.OpenStreamWithOptions(ctx, opts)
 	if err != nil {
 		return nil, 0, err
@@ -457,11 +457,11 @@ func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p [
 	return stream, n, err
 }
 
-func (c *Conn) OpenUniAndSend(ctx context.Context, p []byte) (*nativeSendStream, int, error) {
+func (c *Conn) OpenUniAndSend(ctx context.Context, p []byte) (*NativeSendStream, int, error) {
 	return c.OpenUniAndSendWithOptions(ctx, OpenOptions{}, p)
 }
 
-func (c *Conn) OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*nativeSendStream, int, error) {
+func (c *Conn) OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*NativeSendStream, int, error) {
 	stream, err := c.OpenUniStreamWithOptions(ctx, opts)
 	if err != nil {
 		return nil, 0, err

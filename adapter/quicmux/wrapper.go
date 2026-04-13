@@ -95,6 +95,8 @@ func (s *quicSession) OpenStreamWithOptions(ctx context.Context, opts zmux.OpenO
 	}
 	wrapped := newLocalBidiStream(s.conn, stream, opts)
 	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
+		stream.CancelRead(quic.StreamErrorCode(zmux.CodeInternal))
+		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		return nil, err
 	}
 	return wrapped, nil
@@ -110,6 +112,7 @@ func (s *quicSession) OpenUniStreamWithOptions(ctx context.Context, opts zmux.Op
 	}
 	wrapped := newLocalSendStream(s.conn, stream, opts)
 	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
+		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		return nil, err
 	}
 	return wrapped, nil
@@ -203,8 +206,11 @@ type quicStreamBase struct {
 	openInfo     []byte
 }
 
-func newLocalStreamBase(conn SessionConn, reader io.Reader, writer io.Writer, opts zmux.OpenOptions) quicStreamBase {
-	base := quicStreamBase{
+func initLocalStreamBase(base *quicStreamBase, conn SessionConn, reader io.Reader, writer io.Writer, opts zmux.OpenOptions) {
+	if base == nil {
+		return
+	}
+	*base = quicStreamBase{
 		conn:          conn,
 		reader:        reader,
 		preludeWriter: writer,
@@ -219,11 +225,13 @@ func newLocalStreamBase(conn SessionConn, reader io.Reader, writer io.Writer, op
 		base.group = *opts.InitialGroup
 		base.groupEncoded = true
 	}
-	return base
 }
 
-func newAcceptedStreamBase(conn SessionConn, reader io.Reader, meta acceptedStreamMetadata) quicStreamBase {
-	return quicStreamBase{
+func initAcceptedStreamBase(base *quicStreamBase, conn SessionConn, reader io.Reader, meta acceptedStreamMetadata) {
+	if base == nil {
+		return
+	}
+	*base = quicStreamBase{
 		conn:         conn,
 		reader:       reader,
 		sendPrelude:  false,
@@ -372,10 +380,9 @@ type quicStream struct {
 }
 
 func newLocalBidiStream(conn SessionConn, stream *quic.Stream, opts zmux.OpenOptions) *quicStream {
-	return &quicStream{
-		quicStreamBase: newLocalStreamBase(conn, stream, stream, opts),
-		stream:         stream,
-	}
+	wrapped := &quicStream{stream: stream}
+	initLocalStreamBase(&wrapped.quicStreamBase, conn, stream, stream, opts)
+	return wrapped
 }
 
 func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream) (*quicStream, error) {
@@ -386,10 +393,9 @@ func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream) (*quicStream, 
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeProtocol))
 		return nil, err
 	}
-	return &quicStream{
-		quicStreamBase: newAcceptedStreamBase(conn, reader, meta),
-		stream:         stream,
-	}, nil
+	wrapped := &quicStream{stream: stream}
+	initAcceptedStreamBase(&wrapped.quicStreamBase, conn, reader, meta)
+	return wrapped, nil
 }
 
 func (s *quicStream) Read(p []byte) (int, error) {
@@ -583,10 +589,9 @@ type quicSendStream struct {
 }
 
 func newLocalSendStream(conn SessionConn, stream *quic.SendStream, opts zmux.OpenOptions) *quicSendStream {
-	return &quicSendStream{
-		quicStreamBase: newLocalStreamBase(conn, nil, stream, opts),
-		stream:         stream,
-	}
+	wrapped := &quicSendStream{stream: stream}
+	initLocalStreamBase(&wrapped.quicStreamBase, conn, nil, stream, opts)
+	return wrapped
 }
 
 func (s *quicSendStream) StreamID() uint64 {
@@ -738,10 +743,9 @@ func newAcceptedRecvStream(conn SessionConn, stream *quic.ReceiveStream) (*quicR
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeProtocol))
 		return nil, err
 	}
-	return &quicRecvStream{
-		quicStreamBase: newAcceptedStreamBase(conn, reader, meta),
-		stream:         stream,
-	}, nil
+	wrapped := &quicRecvStream{stream: stream}
+	initAcceptedStreamBase(&wrapped.quicStreamBase, conn, reader, meta)
+	return wrapped, nil
 }
 
 func (s *quicRecvStream) StreamID() uint64 {
@@ -940,41 +944,34 @@ func translateError(err error) error {
 		return err
 	}
 
-	var appErr *quic.ApplicationError
-	if errors.As(err, &appErr) {
+	if appErr, ok := findError[*quic.ApplicationError](err); ok {
 		if appErr.ErrorCode == 0 && appErr.ErrorMessage == "" {
 			return errors.Join(zmux.ErrSessionClosed, err)
 		}
 		return &zmux.ApplicationError{Code: uint64(appErr.ErrorCode), Reason: appErr.ErrorMessage}
 	}
 
-	var streamErr *quic.StreamError
-	if errors.As(err, &streamErr) {
+	if streamErr, ok := findError[*quic.StreamError](err); ok {
 		return &zmux.ApplicationError{Code: uint64(streamErr.ErrorCode)}
 	}
 
-	var limitErr quic.StreamLimitReachedError
-	if errors.As(err, &limitErr) {
+	if _, ok := findError[quic.StreamLimitReachedError](err); ok {
 		return errors.Join(zmux.ErrOpenLimited, err)
 	}
 
-	var idleErr *quic.IdleTimeoutError
-	if errors.As(err, &idleErr) {
+	if _, ok := findError[*quic.IdleTimeoutError](err); ok {
 		return errors.Join(zmux.ErrSessionClosed, err)
 	}
 
-	var handshakeErr *quic.HandshakeTimeoutError
-	if errors.As(err, &handshakeErr) {
+	if _, ok := findError[*quic.HandshakeTimeoutError](err); ok {
 		return errors.Join(zmux.ErrSessionClosed, err)
 	}
 
-	var statelessResetErr *quic.StatelessResetError
-	if errors.As(err, &statelessResetErr) {
+	if _, ok := findError[*quic.StatelessResetError](err); ok {
 		return errors.Join(zmux.ErrSessionClosed, err)
 	}
 
-	var versionErr *quic.VersionNegotiationError
-	if errors.As(err, &versionErr) {
+	if _, ok := findError[*quic.VersionNegotiationError](err); ok {
 		return errors.Join(zmux.ErrSessionClosed, err)
 	}
 
@@ -989,11 +986,32 @@ func mappedApplicationError(err error, defaultCode uint64) (uint64, string) {
 	if err == nil {
 		return defaultCode, ""
 	}
-	var appErr *zmux.ApplicationError
-	if errors.As(err, &appErr) {
+	if appErr, ok := findError[*zmux.ApplicationError](err); ok {
 		return appErr.Code, appErr.Reason
 	}
 	return defaultCode, err.Error()
+}
+
+func findError[T any](err error) (T, bool) {
+	var zero T
+	if err == nil {
+		return zero, false
+	}
+	if target, ok := any(err).(T); ok {
+		return target, true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range wrapped.Unwrap() {
+			if target, ok := findError[T](child); ok {
+				return target, true
+			}
+		}
+		return zero, false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return findError[T](wrapped.Unwrap())
+	}
+	return zero, false
 }
 
 func defaultContext(ctx context.Context) context.Context {

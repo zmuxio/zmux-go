@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go"
 )
 
 const defaultTimeout = 5 * time.Second
