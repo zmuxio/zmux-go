@@ -116,13 +116,20 @@ func (s *quicSession) OpenStreamWithOptions(ctx context.Context, opts zmux.OpenO
 	if err != nil {
 		return nil, translateError(err)
 	}
-	wrapped := newLocalBidiStream(s.conn, stream, opts)
-	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
+	success := false
+	defer func() {
+		if success {
+			return
+		}
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeInternal))
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		_ = stream.Close()
+	}()
+	wrapped := newLocalBidiStream(s.conn, stream, opts)
+	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
 		return nil, err
 	}
+	success = true
 	return wrapped, nil
 }
 
@@ -134,12 +141,19 @@ func (s *quicSession) OpenUniStreamWithOptions(ctx context.Context, opts zmux.Op
 	if err != nil {
 		return nil, translateError(err)
 	}
-	wrapped := newLocalSendStream(s.conn, stream, opts)
-	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
+	success := false
+	defer func() {
+		if success {
+			return
+		}
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		_ = stream.Close()
+	}()
+	wrapped := newLocalSendStream(s.conn, stream, opts)
+	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
 		return nil, err
 	}
+	success = true
 	return wrapped, nil
 }
 

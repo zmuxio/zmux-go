@@ -123,6 +123,9 @@ func AsSession(conn *Conn) Session {
 func NewSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 	session, err := New(conn, cfg)
 	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, err
 	}
 	return AsSession(session), nil
@@ -133,6 +136,9 @@ func NewSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 func ClientSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 	session, err := Client(conn, cfg)
 	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, err
 	}
 	return AsSession(session), nil
@@ -143,6 +149,9 @@ func ClientSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 func ServerSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 	session, err := Server(conn, cfg)
 	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, err
 	}
 	return AsSession(session), nil
