@@ -728,7 +728,7 @@
   "steps": [
     {
       "event": "local_Close",
-      "expect_result": "graceful_close_emits_goaway_then_close"
+      "expect_result": "graceful_close_emits_goaway_then_close_timeout"
     }
   ]
 }
@@ -743,7 +743,7 @@
   "steps": [
     {
       "event": "local_Close_recomputes_final_GOAWAY_after_drain_interval",
-      "expect_result": "graceful_close_recomputes_final_goaway_after_drain_interval"
+      "expect_result": "graceful_close_recomputes_final_goaway_after_drain_interval_timeout"
     }
   ]
 }

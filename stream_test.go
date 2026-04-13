@@ -1537,7 +1537,7 @@ func TestUniStreamsReadWriteViaIOInterfaces(t *testing.T) {
 func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	t.Parallel()
 
-	var s Stream = (*nativeStream)(nil)
+	var s *NativeStream
 
 	if got := s.Metadata(); got.Priority != 0 || got.Group != nil || got.OpenInfo != nil {
 		t.Fatalf("Metadata() = %#v, want zero-value fields", got)

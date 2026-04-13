@@ -197,7 +197,7 @@ Use the canonical stream termination methods:
 
 - `CloseWrite()` for send-half graceful finish
 - `WriteFinal(...)` / `WritevFinal(...)` to send final bytes and finish in one call
-- `CloseRead()` or `CloseReadWithCode(...)` to stop reading
+- `CloseRead()` to stop reading
 - `Close()` to close both local halves when they exist
 
 ```go
@@ -210,25 +210,41 @@ if err := stream.CloseRead(); err != nil {
 }
 ```
 
-`CloseReadWithCode(code)` lets you choose the read-stop application code:
-
-```go
-if err := stream.CloseReadWithCode(uint64(zmux.CodeCancelled)); err != nil {
-	return err
-}
-```
-
 ## Abortive Stream Termination
 
 Use:
 
-- `Reset(code)` or `ResetWithReason(code, reason)` to abort the local write side
-- `Abort()` to abort the whole stream with the default cancelled code
-- `AbortWithError(err)` or `AbortWithErrorCode(code, reason)` to abort with a
-  specific application error
+- `Reset(code)` to abort the local write side
+- `Abort()` to abort the whole bidirectional stream with the default cancelled code
 
 ```go
 if err := stream.Reset(uint64(zmux.CodeCancelled)); err != nil {
+	return err
+}
+```
+
+## Native Stream Extensions
+
+The stable `zmux.Stream` / `zmux.SendStream` / `zmux.RecvStream` interfaces keep
+only the canonical operations above. If you use native constructors that return
+`*zmux.Conn`, the exported native stream types also expose richer variants:
+
+- `(*zmux.NativeStream).CloseReadWithCode(code)`
+- `(*zmux.NativeStream).ResetWithReason(code, reason)`
+- `(*zmux.NativeStream).AbortWithErrorCode(code, reason)`
+- `(*zmux.NativeSendStream).ResetWithReason(code, reason)`
+- `(*zmux.NativeRecvStream).CloseReadWithCode(code)`
+
+Example:
+
+```go
+native, err := zmux.New(rawConn, nil)
+if err != nil {
+	return err
+}
+
+stream, err := native.OpenStream(ctx)
+if err != nil {
 	return err
 }
 
@@ -254,7 +270,6 @@ _ = stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
 Useful session-level methods:
 
 - `Close()` for graceful session shutdown
-- `Abort(err)` for abortive session shutdown
 - `Wait(ctx)` to block until the session is fully terminated
 - `Closed()` to check whether shutdown has completed
 - `State()` to read the current public session lifecycle state
@@ -267,6 +282,17 @@ go func() {
 	}
 }()
 ```
+
+## Native Session Extensions
+
+The stable `zmux.Session` interface stays transport-agnostic. Native `*zmux.Conn`
+adds protocol and shutdown helpers such as:
+
+- `Abort(err)` for abortive session shutdown
+- `Ping(ctx, echo)`
+- `GoAway(...)` / `GoAwayWithError(...)`
+- `PeerGoAwayError()` / `PeerCloseError()`
+- `LocalPreface()` / `PeerPreface()` / `Negotiated()`
 
 ## PING / GOAWAY / Peer Close State
 

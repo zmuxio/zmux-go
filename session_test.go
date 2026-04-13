@@ -2445,6 +2445,13 @@ func TestEventSurfaceOptInLeavesFlagsUnsetWithoutHandler(t *testing.T) {
 	}
 	server.mu.Unlock()
 
+	if err := accepted.Close(); err != nil {
+		t.Fatalf("accepted close: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("stream close: %v", err)
+	}
+
 	if err := client.Close(); err != nil {
 		t.Fatalf("client close: %v", err)
 	}
@@ -2662,8 +2669,8 @@ func TestCloseWithOpenStreamsSendsGoAwayBeforeClose(t *testing.T) {
 	expectedUni := acceptedPeerGoAwayWatermark(c.config.negotiated.LocalRole, streamArityUni, c.registry.nextPeerUni)
 	c.mu.Unlock()
 
-	if err := c.Close(); err != nil {
-		t.Fatalf("Close() = %v", err)
+	if err := c.Close(); !errors.Is(err, ErrGracefulCloseTimeout) {
+		t.Fatalf("Close() = %v, want %v", err, ErrGracefulCloseTimeout)
 	}
 
 	frame := awaitQueuedFrame(t, frames)
@@ -2770,8 +2777,8 @@ func TestCloseRecomputesFinalGoAwayAfterDrainInterval(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("Close() = %v", err)
+		if !errors.Is(err, ErrGracefulCloseTimeout) {
+			t.Fatalf("Close() = %v, want %v", err, ErrGracefulCloseTimeout)
 		}
 	case <-time.After(testSignalTimeout):
 		t.Fatal("Close() did not finish after recomputed final GOAWAY")
@@ -10070,6 +10077,50 @@ func newHandlerTestConnWithOptions(t *testing.T, autoFlushTerminalControl bool) 
 func newHandlerTestConn(t *testing.T) (*Conn, chan Frame, func()) {
 	t.Helper()
 	return newHandlerTestConnWithOptions(t, true)
+}
+
+func (c *Conn) flushPendingControlBatches() (fatal bool, err error) {
+	if c == nil {
+		return false, nil
+	}
+	for {
+		c.mu.Lock()
+		result := c.takePendingControlWriteRequestLocked()
+		c.mu.Unlock()
+		if result.err != nil {
+			return true, result.err
+		}
+		if !result.hasRequest() {
+			return false, nil
+		}
+		req := result.request
+		prepareWriteRequestForSend(&req)
+		switch {
+		case req.urgentReserved:
+			c.writer.urgentWriteCh <- req
+		case req.advisoryReserved:
+			c.writer.advisoryWriteCh <- req
+		default:
+			c.writer.writeCh <- req
+		}
+	}
+}
+
+func (c *Conn) controlFlushLoop() {
+	for {
+		select {
+		case <-c.lifecycle.closedCh:
+			return
+		case <-c.pending.controlNotify:
+			fatal, err := c.flushPendingControlBatches()
+			if err != nil {
+				if fatal {
+					c.closeSession(err)
+				}
+				return
+			}
+		}
+	}
 }
 
 func configureTestConnHandshakeLocked(c *Conn, localRole, peerRole Role, capabilities Capabilities) {
@@ -23222,9 +23273,9 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 		if env.conn.pending.priorityBytes != 0 {
 			t.Fatalf("event %q pendingPriorityBytes = %d, want 0", step.Event, env.conn.pending.priorityBytes)
 		}
-	case "graceful_close_recomputes_final_goaway_after_drain_interval":
-		if err != nil {
-			t.Fatalf("event %q err = %v, want nil", step.Event, err)
+	case "graceful_close_recomputes_final_goaway_after_drain_interval_timeout":
+		if !errors.Is(err, ErrGracefulCloseTimeout) {
+			t.Fatalf("event %q err = %v, want %v", step.Event, err, ErrGracefulCloseTimeout)
 		}
 		if len(env.capturedFrames) != 3 {
 			t.Fatalf("event %q captured frame count = %d, want 3", step.Event, len(env.capturedFrames))
@@ -23290,9 +23341,9 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 			t.Fatalf("event %q sendSessionMax = %d, want 256", step.Event, env.conn.flow.sendSessionMax)
 		}
 		assertNoQueuedFrame(t, env.frames)
-	case "graceful_close_emits_goaway_then_close":
-		if err != nil {
-			t.Fatalf("event %q err = %v, want nil", step.Event, err)
+	case "graceful_close_emits_goaway_then_close_timeout":
+		if !errors.Is(err, ErrGracefulCloseTimeout) {
+			t.Fatalf("event %q err = %v, want %v", step.Event, err, ErrGracefulCloseTimeout)
 		}
 		assertGracefulCloseSequence(t, env)
 	case "graceful_close_blocks_local_open_while_draining":
@@ -23310,7 +23361,10 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 		initialBidi := maxPeerGoAwayWatermark(env.conn.config.negotiated.LocalRole, streamArityBidi)
 		initialUni := maxPeerGoAwayWatermark(env.conn.config.negotiated.LocalRole, streamArityUni)
 		assertQueuedGoAwayFrame(t, awaitQueuedFrame(t, env.frames), initialBidi, initialUni)
-		releaseFixtureClose(t, env)
+		if env.closeRelease != nil {
+			close(env.closeRelease)
+			env.closeRelease = nil
+		}
 		finalBidi := acceptedPeerGoAwayWatermark(env.conn.config.negotiated.LocalRole, streamArityBidi, env.conn.registry.nextPeerBidi)
 		finalUni := acceptedPeerGoAwayWatermark(env.conn.config.negotiated.LocalRole, streamArityUni, env.conn.registry.nextPeerUni)
 		assertQueuedGoAwayFrame(t, awaitQueuedFrame(t, env.frames), finalBidi, finalUni)
@@ -23319,6 +23373,26 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 			t.Fatalf("event %q trailing frame type = %v, want %v", step.Event, frame.Type, FrameTypeCLOSE)
 		}
 		assertNoQueuedFrame(t, env.frames)
+		if env.closeResult == nil {
+			t.Fatalf("event %q missing close result", step.Event)
+		}
+		select {
+		case closeErr := <-env.closeResult:
+			if !errors.Is(closeErr, ErrGracefulCloseTimeout) {
+				t.Fatalf("event %q close result = %v, want %v", step.Event, closeErr, ErrGracefulCloseTimeout)
+			}
+		case <-time.After(testSignalTimeout):
+			t.Fatalf("event %q timed out waiting for close result", step.Event)
+		}
+		env.closeResult = nil
+		if env.closeHandlerDone != nil {
+			select {
+			case <-env.closeHandlerDone:
+			case <-time.After(testSignalTimeout):
+				t.Fatalf("event %q timed out waiting for stalled close handler", step.Event)
+			}
+			env.closeHandlerDone = nil
+		}
 		env.conn.mu.Lock()
 		defer env.conn.mu.Unlock()
 		if env.conn.shutdown.gracefulCloseActive {

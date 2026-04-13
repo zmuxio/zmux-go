@@ -23,6 +23,7 @@ var (
 	ErrAdapterUnsupported        = errors.New("zmux: feature not supported by adapter")
 	ErrPriorityUpdateUnavailable = errors.New("zmux: metadata update requires negotiated priority_update and matching semantic capability")
 	ErrPriorityUpdateTooLarge    = errors.New("zmux: priority update exceeds peer max_extension_payload_bytes")
+	ErrGracefulCloseTimeout      = errors.New("zmux: graceful close drain timed out")
 	ErrEmptyMetadataUpdate       = errors.New("zmux: metadata update has no fields")
 	ErrKeepaliveTimeout          = errors.New("zmux: keepalive timeout")
 )

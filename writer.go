@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"net"
 	"sync"
 	"time"
 
@@ -40,6 +41,8 @@ type dequeuedWriteWork struct {
 	lane writeLane
 	kind dequeuedWriteWorkKind
 }
+
+const maxControlBatchesPerWake = 4
 
 type streamValueAccumulator struct {
 	scratch      *writeBatchScratch
@@ -356,7 +359,7 @@ func (c *Conn) writeLoop() {
 }
 
 func (c *Conn) handlePendingControlWake() bool {
-	for {
+	for handled := 0; ; handled++ {
 		c.mu.Lock()
 		result := c.takePendingControlWriteRequestLocked()
 		c.mu.Unlock()
@@ -371,6 +374,17 @@ func (c *Conn) handlePendingControlWake() bool {
 		batch[0] = result.request
 		if !c.handleWriteBatch(batch) {
 			return false
+		}
+		if handled+1 >= maxControlBatchesPerWake {
+			c.mu.Lock()
+			more := c.hasPendingControlWorkLocked()
+			c.mu.Unlock()
+			if more {
+				c.writer.yieldOrdinary = true
+				notify(c.pending.terminalNotify)
+				notify(c.pending.controlNotify)
+			}
+			return true
 		}
 	}
 }
@@ -414,6 +428,15 @@ func (c *Conn) tryDequeueWriteWork() (dequeuedWriteWork, bool) {
 	case req := <-c.writer.urgentWriteCh:
 		return dequeuedWriteWork{req: req, lane: writeLaneUrgent, kind: dequeuedWriteWorkRequest}, true
 	default:
+	}
+	if c.writer.yieldOrdinary {
+		select {
+		case req := <-c.writer.writeCh:
+			c.writer.yieldOrdinary = false
+			return dequeuedWriteWork{req: req, lane: writeLaneOrdinary, kind: dequeuedWriteWorkRequest}, true
+		default:
+			c.writer.yieldOrdinary = false
+		}
 	}
 	select {
 	case <-c.pending.terminalNotify:
@@ -521,36 +544,50 @@ func (c *Conn) writeBatch(batch []writeRequest) error {
 		return nil
 	}
 
-	total := 0
+	totalEncoded := 0
 	frameCount := 0
+	payloadBytes := 0
 	for i := range batch {
 		req := &batch[i]
 		classifyWriteRequest(req)
 		frameCount += len(req.frames)
-		total += int(req.requestBufferedBytes)
-		total += (maxEncodedFrameOverhead - 1) * len(req.frames)
-	}
-
-	buf := c.writer.scratch.encodedBuffer(total)
-	defer func() {
-		c.writer.scratch.releaseEncodedBuffer(buf)
-	}()
-	for _, req := range batch {
 		for _, frame := range req.frames {
-			var err error
-			buf, err = appendFrameBinaryTrusted(buf, frame)
-			if err != nil {
-				return err
-			}
+			totalEncoded += int(txFrameEncodedBytes(frame))
+			payloadBytes += frame.payloadLength()
 		}
 	}
+
 	start := time.Now()
-	if err := rt.WriteAll(c.io.conn, buf); err != nil {
+	written, err := 0, error(nil)
+	if c.useScatterGatherWrite(payloadBytes, frameCount) {
+		written, err = c.writeBatchScatterGather(batch)
+	} else {
+		buf := c.writer.scratch.encodedBuffer(totalEncoded)
+		defer func() {
+			c.writer.scratch.releaseEncodedBuffer(buf)
+		}()
+		for _, req := range batch {
+			for _, frame := range req.frames {
+				buf, err = appendFrameBinaryTrusted(buf, frame)
+				if err != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		if err == nil {
+			written = len(buf)
+			err = rt.WriteAll(c.io.conn, buf)
+		}
+	}
+	if err != nil {
 		return err
 	}
 	now := time.Now()
 	c.mu.Lock()
-	c.noteFlushAndRateLocked(frameCount, len(buf), now, now.Sub(start))
+	c.noteFlushAndRateLocked(frameCount, written, now, now.Sub(start))
 	c.mu.Unlock()
 	notify(c.signals.livenessCh)
 	return nil
@@ -558,6 +595,7 @@ func (c *Conn) writeBatch(batch []writeRequest) error {
 
 const maxWriteBatchFrames = 32
 const maxEncodedFrameOverhead = 17
+const minScatterGatherPayloadBytes = 16 << 10
 
 var maxRetainedWriteBatchBytes = maxWriteBatchFrames * int(DefaultSettings().MaxFramePayload)
 
@@ -623,6 +661,66 @@ func appendFrameBinaryTrusted(dst []byte, frame txFrame) ([]byte, error) {
 		return nil, err
 	}
 	return frame.appendPayload(dst), nil
+}
+
+func (c *Conn) useScatterGatherWrite(payloadBytes, frameCount int) bool {
+	return c != nil && c.io.conn != nil && payloadBytes >= minScatterGatherPayloadBytes && frameCount > 0
+}
+
+func (c *Conn) writeBatchScatterGather(batch []writeRequest) (int, error) {
+	if c == nil || c.io.conn == nil {
+		return 0, ErrSessionClosed
+	}
+	headers := make([][]byte, 0, maxWriteBatchFrames)
+	buffers := make(net.Buffers, 0, maxWriteBatchFrames*4)
+	for _, req := range batch {
+		for _, frame := range req.frames {
+			header, err := wire.AppendFrameHeaderTrustedCachedStreamID(
+				nil,
+				frame.Code(),
+				frame.StreamID,
+				frame.streamIDPacked,
+				frame.streamIDLen,
+				uint64(frame.payloadLength()),
+			)
+			if err != nil {
+				return 0, err
+			}
+			headers = append(headers, header)
+			buffers = append(buffers, header)
+			if frame.hasPayloadPrefix() && len(frame.payloadPrefix) > 0 {
+				buffers = append(buffers, frame.payloadPrefix)
+			}
+			if frame.hasPayloadParts() {
+				idx := frame.payloadPartIdx
+				off := frame.payloadPartOff
+				remaining := frame.payloadPartLen
+				for remaining > 0 && idx < len(frame.payloadParts) {
+					part := frame.payloadParts[idx]
+					if off >= len(part) {
+						idx++
+						off = 0
+						continue
+					}
+					take := len(part) - off
+					if take > remaining {
+						take = remaining
+					}
+					buffers = append(buffers, part[off:off+take])
+					remaining -= take
+					idx++
+					off = 0
+				}
+				continue
+			}
+			if len(frame.Payload) > 0 {
+				buffers = append(buffers, frame.Payload)
+			}
+		}
+	}
+	written, err := buffers.WriteTo(c.io.conn)
+	_ = headers
+	return int(written), err
 }
 
 func sameStreamBurstKeepsOrder(batch []writeRequest, lane writeLane) bool {

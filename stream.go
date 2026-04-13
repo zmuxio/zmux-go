@@ -1103,6 +1103,7 @@ type terminalFramePlan struct {
 	frames           []txFrame
 	openerVisibility openerVisibilityMark
 	status           terminalFramePlanStatus
+	wait             provisionalOpenTurnWait
 }
 
 func (p terminalFramePlan) shouldRetry() bool {
@@ -1333,9 +1334,15 @@ func (s *nativeStream) closeReadWithCode(code uint64) error {
 
 		plan, err := s.prepareCloseReadPlanLocked(stopPayload)
 		if err != nil {
+			s.conn.mu.Unlock()
 			return err
 		}
 		if plan.shouldRetry() {
+			wait := plan.opener.wait
+			s.conn.mu.Unlock()
+			if err := wait.wait(s, s.closeOperationErr); err != nil {
+				return err
+			}
 			continue
 		}
 		s.conn.mu.Unlock()
@@ -1383,9 +1390,15 @@ func (s *nativeStream) closeWriteUntil(deadlineOverride time.Time) error {
 			wrap:   s.closeOperationErr,
 		})
 		if err != nil {
+			s.conn.mu.Unlock()
 			return err
 		}
 		if plan.shouldRetry() {
+			wait := plan.wait
+			s.conn.mu.Unlock()
+			if err := wait.wait(s, s.closeOperationErr); err != nil {
+				return err
+			}
 			continue
 		}
 		s.conn.mu.Unlock()
@@ -1417,9 +1430,15 @@ func (s *nativeStream) prepareAsyncCloseWritePlan() (terminalFramePlan, error) {
 			wrap:   s.closeOperationErr,
 		})
 		if err != nil {
+			s.conn.mu.Unlock()
 			return terminalFramePlan{}, err
 		}
 		if plan.shouldRetry() {
+			wait := plan.wait
+			s.conn.mu.Unlock()
+			if err := wait.wait(s, s.closeOperationErr); err != nil {
+				return terminalFramePlan{}, err
+			}
 			continue
 		}
 		s.conn.mu.Unlock()
@@ -1566,13 +1585,14 @@ func (s *nativeStream) prepareTerminalFramePlanLocked(spec terminalDataPrepareSp
 		return terminalFramePlan{}, nil
 	}
 
-	openerResult, err := s.prepareRetriableLocalOpenerLocked(spec.wrap)
+	openerResult, err := s.prepareRetriableLocalOpenerLocked()
 	if err != nil {
-		return plan, err
+		return plan, spec.wrap(err)
 	}
 	if openerResult.shouldRetry() {
 		plan.openerVisibility = openerResult.visibility
 		plan.status = terminalFramePlanRetry
+		plan.wait = openerResult.wait
 		return plan, nil
 	}
 	if spec.intent.requiresLocalSend() && !openerResult.visibility.marksPeerVisible() {
@@ -1593,7 +1613,6 @@ func (s *nativeStream) prepareTerminalFramePlanLocked(spec terminalDataPrepareSp
 	}
 	frames = append(frames, s.dataFrameLocked(nil, traits))
 	if err := s.validateOpenedFramesLocked(frames, openerResult.visibility); err != nil {
-		s.conn.mu.Unlock()
 		return terminalFramePlan{}, spec.wrap(err)
 	}
 	s.markSendCommittedAndMaybeBarrierLocked(openerResult.visibility)

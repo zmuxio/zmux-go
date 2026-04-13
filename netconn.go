@@ -53,8 +53,10 @@ type JoinedConn struct {
 	readPaused  bool
 	writePaused bool
 
-	activeReadOps  int
-	activeWriteOps int
+	activeReadOps          int
+	activeWriteOps         int
+	activeReadDeadlineOps  int
+	activeWriteDeadlineOps int
 
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -272,13 +274,23 @@ func (c *JoinedConn) SetReadDeadline(t time.Time) error {
 	}
 	c.readDeadline = t
 	readHalf := c.readHalf
+	if readHalf != nil {
+		c.activeReadDeadlineOps++
+	}
 	c.broadcastReadLocked()
 	c.mu.Unlock()
 
 	if readHalf == nil {
 		return nil
 	}
-	return readHalf.SetReadDeadline(t)
+	err := readHalf.SetReadDeadline(t)
+	c.mu.Lock()
+	if c.activeReadDeadlineOps > 0 {
+		c.activeReadDeadlineOps--
+	}
+	c.broadcastReadLocked()
+	c.mu.Unlock()
+	return err
 }
 
 func (c *JoinedConn) SetWriteDeadline(t time.Time) error {
@@ -294,13 +306,23 @@ func (c *JoinedConn) SetWriteDeadline(t time.Time) error {
 	}
 	c.writeDeadline = t
 	writeHalf := c.writeHalf
+	if writeHalf != nil {
+		c.activeWriteDeadlineOps++
+	}
 	c.broadcastWriteLocked()
 	c.mu.Unlock()
 
 	if writeHalf == nil {
 		return nil
 	}
-	return writeHalf.SetWriteDeadline(t)
+	err := writeHalf.SetWriteDeadline(t)
+	c.mu.Lock()
+	if c.activeWriteDeadlineOps > 0 {
+		c.activeWriteDeadlineOps--
+	}
+	c.broadcastWriteLocked()
+	c.mu.Unlock()
+	return err
 }
 
 func (c *JoinedConn) LocalAddr() net.Addr {
@@ -405,6 +427,7 @@ func (p *PausedReadHalf) Resume() error {
 		return nil
 	}
 
+	current := p.current
 	p.conn.mu.Lock()
 	if p.conn.closed {
 		p.conn.mu.Unlock()
@@ -412,16 +435,23 @@ func (p *PausedReadHalf) Resume() error {
 		return ErrSessionClosed
 	}
 	deadline := p.conn.readDeadline
-	p.conn.readHalf = p.current
+	p.conn.mu.Unlock()
+	if current != nil {
+		if err := current.SetReadDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	p.conn.mu.Lock()
+	if p.conn.closed {
+		p.conn.mu.Unlock()
+		p.resumed = true
+		return ErrSessionClosed
+	}
+	p.conn.readHalf = current
 	p.conn.readPaused = false
 	p.conn.broadcastReadLocked()
 	p.conn.mu.Unlock()
 	p.resumed = true
-	if p.current != nil {
-		if err := p.current.SetReadDeadline(deadline); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -453,6 +483,7 @@ func (p *PausedWriteHalf) Resume() error {
 		return nil
 	}
 
+	current := p.current
 	p.conn.mu.Lock()
 	if p.conn.closed {
 		p.conn.mu.Unlock()
@@ -460,16 +491,23 @@ func (p *PausedWriteHalf) Resume() error {
 		return ErrSessionClosed
 	}
 	deadline := p.conn.writeDeadline
-	p.conn.writeHalf = p.current
+	p.conn.mu.Unlock()
+	if current != nil {
+		if err := current.SetWriteDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	p.conn.mu.Lock()
+	if p.conn.closed {
+		p.conn.mu.Unlock()
+		p.resumed = true
+		return ErrSessionClosed
+	}
+	p.conn.writeHalf = current
 	p.conn.writePaused = false
 	p.conn.broadcastWriteLocked()
 	p.conn.mu.Unlock()
 	p.resumed = true
-	if p.current != nil {
-		if err := p.current.SetWriteDeadline(deadline); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -621,7 +659,7 @@ func (c *JoinedConn) pauseReadHalf(ctx context.Context) (ReadHalf, error) {
 			ownedPause = true
 			c.broadcastReadLocked()
 			c.mu.Unlock()
-		case c.activeReadOps == 0:
+		case c.activeReadOps == 0 && c.activeReadDeadlineOps == 0:
 			current := c.readHalf
 			c.readHalf = nil
 			c.broadcastReadLocked()
@@ -665,7 +703,7 @@ func (c *JoinedConn) pauseWriteHalf(ctx context.Context) (WriteHalf, error) {
 			ownedPause = true
 			c.broadcastWriteLocked()
 			c.mu.Unlock()
-		case c.activeWriteOps == 0:
+		case c.activeWriteOps == 0 && c.activeWriteDeadlineOps == 0:
 			current := c.writeHalf
 			c.writeHalf = nil
 			c.broadcastWriteLocked()

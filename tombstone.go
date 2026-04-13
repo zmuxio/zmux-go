@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"sort"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/state"
@@ -17,6 +18,12 @@ const (
 type usedStreamMarker struct {
 	action lateDataAction
 	cause  lateDataCause
+}
+
+type usedStreamRange struct {
+	start  uint64
+	end    uint64
+	marker usedStreamMarker
 }
 
 type terminalDataDisposition struct {
@@ -75,10 +82,7 @@ func (c *Conn) terminalDataDispositionForLocked(streamID uint64) terminalDataLoo
 			present:     true,
 		}
 	}
-	if c.registry.usedStreamData == nil {
-		return terminalDataLookup{}
-	}
-	marker, ok := c.registry.usedStreamData[streamID]
+	marker, ok := c.usedStreamMarkerForLocked(streamID)
 	if !ok {
 		return terminalDataLookup{}
 	}
@@ -122,6 +126,105 @@ func (c *Conn) markUsedStreamLocked(streamID uint64, marker usedStreamMarker) {
 		c.registry.usedStreamData = make(map[uint64]usedStreamMarker)
 	}
 	c.registry.usedStreamData[streamID] = marker
+	c.compactMarkerOnlyRangesLocked()
+}
+
+func sameUsedStreamMarker(a, b usedStreamMarker) bool {
+	return a.action == b.action && a.cause == b.cause
+}
+
+func usedStreamRangeContains(r usedStreamRange, streamID uint64) bool {
+	if streamID < r.start || streamID > r.end {
+		return false
+	}
+	return (streamID-r.start)%4 == 0
+}
+
+func usedStreamRangeMergeable(a, b usedStreamRange) bool {
+	if !sameUsedStreamMarker(a.marker, b.marker) {
+		return false
+	}
+	if a.start%4 != b.start%4 {
+		return false
+	}
+	return a.end+4 >= b.start && b.end+4 >= a.start
+}
+
+func insertUsedStreamRange(ranges []usedStreamRange, next usedStreamRange) []usedStreamRange {
+	if len(ranges) == 0 {
+		return append(ranges, next)
+	}
+	out := make([]usedStreamRange, 0, len(ranges)+1)
+	inserted := false
+	for _, current := range ranges {
+		if usedStreamRangeMergeable(current, next) {
+			if current.start < next.start {
+				next.start = current.start
+			}
+			if current.end > next.end {
+				next.end = current.end
+			}
+			continue
+		}
+		if !inserted && current.start > next.end {
+			out = append(out, next)
+			inserted = true
+		}
+		out = append(out, current)
+	}
+	if !inserted {
+		out = append(out, next)
+	}
+	return out
+}
+
+func (c *Conn) usedStreamMarkerForLocked(streamID uint64) (usedStreamMarker, bool) {
+	if c == nil {
+		return usedStreamMarker{}, false
+	}
+	if c.registry.usedStreamData != nil {
+		if marker, ok := c.registry.usedStreamData[streamID]; ok {
+			return marker, true
+		}
+	}
+	for _, r := range c.registry.usedStreamRanges {
+		if usedStreamRangeContains(r, streamID) {
+			return r.marker, true
+		}
+	}
+	return usedStreamMarker{}, false
+}
+
+func (c *Conn) compactMarkerOnlyRangesLocked() {
+	if c == nil || len(c.registry.usedStreamData) == 0 {
+		return
+	}
+	markerOnlyCount := c.markerOnlyMapCountLocked()
+	if markerOnlyCount <= c.markerOnlyHardCapLocked() && markerOnlyCount < 64 {
+		return
+	}
+	ids := make([]uint64, 0, markerOnlyCount)
+	for streamID := range c.registry.usedStreamData {
+		if _, ok := c.registry.tombstones[streamID]; ok {
+			continue
+		}
+		ids = append(ids, streamID)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	ranges := append([]usedStreamRange(nil), c.registry.usedStreamRanges...)
+	for _, streamID := range ids {
+		marker := c.registry.usedStreamData[streamID]
+		ranges = insertUsedStreamRange(ranges, usedStreamRange{
+			start:  streamID,
+			end:    streamID,
+			marker: marker,
+		})
+		delete(c.registry.usedStreamData, streamID)
+	}
+	c.registry.usedStreamRanges = ranges
 }
 
 func tombstoneStateForStream(stream *nativeStream) state.StreamTombstone {
@@ -148,6 +251,7 @@ func (c *Conn) enforceTerminalBookkeepingMemoryCapLocked() {
 	if c == nil || c.lifecycle.closeErr != nil {
 		return
 	}
+	c.compactMarkerOnlyRangesLocked()
 	if err := c.markerOnlyCapErrorLocked("compact terminal state"); err != nil {
 		c.closeSessionAsyncLocked(err)
 		return
@@ -385,7 +489,6 @@ func (c *Conn) removeTombstoneOrderSlotLocked(i int) bool {
 		c.advanceTombstoneHeadLocked()
 	}
 	c.maybeCompactTombstoneQueueLocked()
-	c.enforceTerminalBookkeepingMemoryCapLocked()
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleased)
 	return true
 }
@@ -573,7 +676,7 @@ func (c *Conn) enforceHiddenControlStateBudgetLocked(now time.Time) {
 			return
 		}
 	}
-	for c.trackedSessionMemoryLocked() > c.sessionMemoryHardCapLocked() {
+	for c.hiddenControlStateBytesLocked() > c.sessionMemoryHardCapLocked() {
 		if !c.reapNewestHiddenControlStateLocked() {
 			return
 		}
@@ -582,6 +685,13 @@ func (c *Conn) enforceHiddenControlStateBudgetLocked(now time.Time) {
 
 func (c *Conn) hiddenControlStateRetainedLocked() int {
 	return c.hiddenTombstoneCountLocked()
+}
+
+func (c *Conn) hiddenControlStateBytesLocked() uint64 {
+	if c == nil {
+		return 0
+	}
+	return saturatingMul(uint64(c.hiddenControlStateRetainedLocked()), c.retainedStateUnitLocked())
 }
 
 func (c *Conn) reapExpiredHiddenControlStateLocked(now time.Time) {

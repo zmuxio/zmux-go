@@ -61,13 +61,14 @@ const localOpenerRetry localOpenerPrepareStatus = 1
 type localOpenerPrepareResult struct {
 	visibility openerVisibilityMark
 	status     localOpenerPrepareStatus
+	wait       provisionalOpenTurnWait
 }
 
 func (r localOpenerPrepareResult) shouldRetry() bool {
 	return r.status == localOpenerRetry
 }
 
-func (s *nativeStream) prepareRetriableLocalOpenerLocked(wrap func(error) error) (localOpenerPrepareResult, error) {
+func (s *nativeStream) prepareRetriableLocalOpenerLocked() (localOpenerPrepareResult, error) {
 	if s == nil || s.conn == nil {
 		return localOpenerPrepareResult{}, ErrSessionClosed
 	}
@@ -75,16 +76,16 @@ func (s *nativeStream) prepareRetriableLocalOpenerLocked(wrap func(error) error)
 	if s.needsLocalOpenerLocked() {
 		openState, err := s.conn.prepareLocalOpeningLocked(s)
 		if err != nil {
-			s.conn.mu.Unlock()
-			return localOpenerPrepareResult{}, wrap(err)
+			return localOpenerPrepareResult{}, err
 		}
 		if openState.awaitingTurn() {
-			retry, waitErr := s.waitForProvisionalOpenTurnLocked(wrap)
+			wait, blocked, waitErr := s.provisionalOpenTurnWaitLocked()
 			if waitErr != nil {
 				return localOpenerPrepareResult{}, waitErr
 			}
-			if retry {
+			if blocked {
 				result.status = localOpenerRetry
+				result.wait = wait
 			}
 			return result, nil
 		}
@@ -201,11 +202,17 @@ func (s *nativeStream) acquireWritePrepareWindowLocked(mode writePrepareWindowMo
 
 	visibility := openerVisibilityUnchanged
 	if mode == writePrepareWindowStep {
-		openerResult, err := s.prepareRetriableLocalOpenerLocked(s.writeSurfaceErrLocked)
+		openerResult, err := s.prepareRetriableLocalOpenerLocked()
 		if err != nil {
-			return writePrepareAttempt{}, err
+			s.conn.mu.Unlock()
+			return writePrepareAttempt{}, s.writeSurfaceErrLocked(err)
 		}
 		if openerResult.shouldRetry() {
+			wait := openerResult.wait
+			s.conn.mu.Unlock()
+			if err := wait.wait(s, s.writeSurfaceErrLocked); err != nil {
+				return writePrepareAttempt{}, err
+			}
 			return writePrepareAttempt{outcome: writePrepareRetry}, nil
 		}
 		visibility = openerResult.visibility

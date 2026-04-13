@@ -340,16 +340,45 @@ func (f *txFrame) setPrefixedPartsPayload(prefix []byte, parts [][]byte, idx, of
 	f.payloadPartLen = n
 }
 
-func txFrameBufferedBytes(frame txFrame) uint64 {
+// txFrameQueueCost is the coarse queued-byte accounting used by admission,
+// HWM/LWM thresholds, and queue reservation. It intentionally tracks only the
+// type byte plus payload bytes so queue pressure remains stable across later
+// encoding strategy changes.
+func txFrameQueueCost(frame txFrame) uint64 {
 	return uint64(1 + frame.payloadLength())
 }
 
-func txFramesBufferedBytes(frames []txFrame) uint64 {
+func txFrameBufferedBytes(frame txFrame) uint64 {
+	return txFrameQueueCost(frame)
+}
+
+func txFramesQueueCost(frames []txFrame) uint64 {
 	total := uint64(0)
 	for _, frame := range frames {
-		total = saturatingAdd(total, txFrameBufferedBytes(frame))
+		total = saturatingAdd(total, txFrameQueueCost(frame))
 	}
 	return total
+}
+
+func txFramesBufferedBytes(frames []txFrame) uint64 {
+	return txFramesQueueCost(frames)
+}
+
+func txFrameEncodedBytes(frame txFrame) uint64 {
+	streamIDLen := int(frame.streamIDLen)
+	if streamIDLen == 0 {
+		n, err := wire.VarintLen(frame.StreamID)
+		if err != nil {
+			return txFrameQueueCost(frame)
+		}
+		streamIDLen = n
+	}
+	bodyLen := uint64(1+streamIDLen) + uint64(frame.payloadLength())
+	frameLenLen, err := wire.VarintLen(bodyLen)
+	if err != nil {
+		return bodyLen
+	}
+	return uint64(frameLenLen) + bodyLen
 }
 
 func cloneTxFramesIfNeeded(frames []txFrame, clone bool) ([]txFrame, bool) {

@@ -804,6 +804,42 @@ type pendingTerminalControlResult struct {
 	accepted bool
 }
 
+type pendingPriorityQueueStatus uint8
+
+const (
+	pendingPriorityQueueDropped pendingPriorityQueueStatus = iota
+	pendingPriorityQueueAccepted
+	pendingPriorityQueueDroppedBudget
+	pendingPriorityQueueDroppedMemory
+	pendingPriorityQueueDroppedUnavailable
+)
+
+type pendingPriorityQueueResult struct {
+	status           pendingPriorityQueueStatus
+	projectedTracked uint64
+}
+
+func (r pendingPriorityQueueResult) accepted() bool {
+	return r.status == pendingPriorityQueueAccepted
+}
+
+func (r pendingPriorityQueueResult) structuredErr(c *Conn) error {
+	switch r.status {
+	case pendingPriorityQueueDroppedBudget:
+		return wireError(CodeInternal, "queue PRIORITY_UPDATE", fmt.Errorf("pending priority update budget exceeded"))
+	case pendingPriorityQueueDroppedMemory:
+		hardCap := uint64(0)
+		if c != nil {
+			hardCap = c.sessionMemoryHardCapLocked()
+		}
+		return wireError(CodeInternal, "queue PRIORITY_UPDATE", errSessionMemoryCapExceeded(r.projectedTracked, hardCap))
+	case pendingPriorityQueueDroppedUnavailable:
+		return ErrSessionClosed
+	default:
+		return wireError(CodeInternal, "queue PRIORITY_UPDATE", fmt.Errorf("pending priority update rejected"))
+	}
+}
+
 func (c *Conn) setPendingTerminalControlLocked(stream *nativeStream, apply func(*nativeStream) (changed bool, coalesced bool, superseded bool)) pendingTerminalControlResult {
 	if c == nil || stream == nil || apply == nil {
 		return pendingTerminalControlResult{}
@@ -1195,15 +1231,6 @@ func (c *pendingTxFrameCollector) empty() bool {
 	return c == nil || len(c.frames) == 0
 }
 
-type pendingControlFlushBatch struct {
-	urgent   []txFrame
-	advisory []writeRequest
-}
-
-func (b pendingControlFlushBatch) empty() bool {
-	return len(b.urgent) == 0 && len(b.advisory) == 0
-}
-
 func buildPendingControlWriteRequest(frames []txFrame, queuedBytes uint64, lane writeLane) writeRequest {
 	req := writeRequest{
 		frames:                frames,
@@ -1253,6 +1280,19 @@ func (c *Conn) takePendingControlWriteRequestLocked() pendingWriteRequestResult 
 		return result
 	}
 	return c.takePendingPriorityUpdateRequestLocked()
+}
+
+func (c *Conn) hasPendingControlWorkLocked() bool {
+	if c == nil {
+		return false
+	}
+	c.ensurePendingPriorityUpdateQueueLocked()
+	return c.pendingTerminalControlHasEntriesLocked() ||
+		c.pending.hasSessionMaxData ||
+		c.pendingStreamControlHasEntriesLocked(streamControlMaxData) ||
+		c.pending.hasSessionBlocked ||
+		c.pendingStreamControlHasEntriesLocked(streamControlBlocked) ||
+		c.pendingPriorityQueueCountLocked() > 0
 }
 
 func (c *Conn) takePendingUrgentControlRequestLocked() pendingWriteRequestResult {
@@ -1330,77 +1370,6 @@ func (c *Conn) takePendingPriorityUpdateRequestLocked() pendingWriteRequestResul
 	return pendingWriteRequestResult{
 		request: buildPendingControlWriteRequest(batch.frames, batch.queuedBytes, writeLaneAdvisory),
 		ready:   true,
-	}
-}
-
-func (c *Conn) takePendingControlFlushBatchLocked() (pendingControlFlushBatch, error) {
-	if c == nil || !c.ensurePendingNonCloseControlLocked() {
-		return pendingControlFlushBatch{}, nil
-	}
-	advisory, err := c.takePendingPriorityUpdateRequestsLocked()
-	if err != nil {
-		return pendingControlFlushBatch{}, err
-	}
-	return pendingControlFlushBatch{
-		urgent:   c.drainPendingUrgentControlTxFramesLocked(),
-		advisory: advisory,
-	}, nil
-}
-
-func (c *Conn) dispatchPendingControlFlushBatch(batch pendingControlFlushBatch) error {
-	if c == nil || batch.empty() {
-		return nil
-	}
-	if len(batch.urgent) > 0 {
-		if err := c.queueTxFrameChunksToLane(batch.urgent, frameLaneRequestOptions{
-			lane: writeLaneUrgent,
-		}, frameImmutable, c.urgentLaneCapLocked()); err != nil {
-			return err
-		}
-	}
-	if len(batch.advisory) == 0 {
-		return nil
-	}
-	return c.dispatchPreparedQueueRequests(batch.advisory, preparedQueueDispatchOptions{
-		lane:      writeLaneAdvisory,
-		ownership: frameImmutable,
-	})
-}
-
-func (c *Conn) flushPendingControlBatches() (fatal bool, err error) {
-	if c == nil {
-		return false, nil
-	}
-	for {
-		c.mu.Lock()
-		batch, err := c.takePendingControlFlushBatchLocked()
-		c.mu.Unlock()
-		if err != nil {
-			return true, err
-		}
-		if batch.empty() {
-			return false, nil
-		}
-		if err := c.dispatchPendingControlFlushBatch(batch); err != nil {
-			return false, err
-		}
-	}
-}
-
-func (c *Conn) controlFlushLoop() {
-	for {
-		select {
-		case <-c.lifecycle.closedCh:
-			return
-		case <-c.pending.controlNotify:
-			fatal, err := c.flushPendingControlBatches()
-			if err != nil {
-				if fatal {
-					c.closeSession(err)
-				}
-				return
-			}
-		}
 	}
 }
 
@@ -1647,21 +1616,21 @@ func (c *Conn) takePendingPriorityUpdateRequestsLocked() ([]writeRequest, error)
 	return collectPendingWriteRequestsLocked(capHint, c.takePendingPriorityUpdateRequestLocked)
 }
 
-func (c *Conn) queuePriorityUpdateAsync(streamID uint64, payload []byte, ownership retainedBytesOwnership) {
+func (c *Conn) queuePriorityUpdateAsync(streamID uint64, payload []byte, ownership retainedBytesOwnership) pendingPriorityQueueResult {
 	if len(payload) == 0 {
-		return
+		return pendingPriorityQueueResult{}
 	}
 	if !c.ensurePendingNonCloseControlLocked() {
-		return
+		return pendingPriorityQueueResult{status: pendingPriorityQueueDroppedUnavailable}
 	}
 	stream, flush, keep, _ := c.resolvePendingPriorityTargetLocked(streamID, true)
 	if stream == nil || (!flush && !keep) {
-		return
+		return pendingPriorityQueueResult{status: pendingPriorityQueueDroppedUnavailable}
 	}
 	prevTracked := c.trackedSessionMemoryLocked()
 	budget := c.pendingPriorityBudgetLocked()
 	if budget == 0 {
-		return
+		return pendingPriorityQueueResult{status: pendingPriorityQueueDroppedBudget}
 	}
 	oldLen := uint64(0)
 	if stream.hasPendingPriorityUpdateLocked() {
@@ -1676,12 +1645,16 @@ func (c *Conn) queuePriorityUpdateAsync(streamID uint64, payload []byte, ownersh
 		c.sessionMemoryHardCapLocked(),
 	)
 	if !plan.Accept {
-		return
+		if plan.NextPendingBytes > budget {
+			return pendingPriorityQueueResult{status: pendingPriorityQueueDroppedBudget, projectedTracked: plan.ProjectedTracked}
+		}
+		return pendingPriorityQueueResult{status: pendingPriorityQueueDroppedMemory, projectedTracked: plan.ProjectedTracked}
 	}
 	c.replacePendingPriorityUpdateLocked(streamID, payload, ownership)
 	c.pending.priorityBytes = plan.NextPendingBytes
 	c.notifySessionMemoryAvailableLocked(prevTracked)
 	notify(c.pending.controlNotify)
+	return pendingPriorityQueueResult{status: pendingPriorityQueueAccepted, projectedTracked: plan.ProjectedTracked}
 }
 
 func (c *Conn) takePendingPriorityUpdateFrameLocked(streamID uint64) preparedPriorityUpdate {

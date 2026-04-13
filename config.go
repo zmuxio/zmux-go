@@ -258,6 +258,10 @@ type Config struct {
 	// unavoidable tail, in bytes, that may still converge via DATA|FIN after
 	// peer STOP_SENDING. Zero uses the repository default.
 	StopSendingGracefulTailCap uint64
+	// GracefulCloseDrainTimeout overrides the repository-default bounded
+	// graceful-close drain wait before Close reports timeout to the caller.
+	// Zero uses the repository default.
+	GracefulCloseDrainTimeout time.Duration
 
 	// EventHandler receives lightweight connection/stream lifecycle notifications.
 	EventHandler EventHandler

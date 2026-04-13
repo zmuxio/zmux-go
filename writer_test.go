@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +43,70 @@ func TestCollectWriteBatchDrainsReadyFrames(t *testing.T) {
 	}
 	if batch[0].frames[0].Type != FrameTypePING || batch[1].frames[0].Type != FrameTypePONG || batch[2].frames[0].Payload[7] != 3 {
 		t.Fatalf("unexpected batch ordering: %+v", batch)
+	}
+}
+
+func BenchmarkCollectWriteBatchLaneBuffering(b *testing.B) {
+	payload := bytes.Repeat([]byte("x"), 32)
+	proto := writeRequest{
+		frames: testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: 4, Payload: payload}}),
+	}
+
+	for _, tc := range []struct {
+		name          string
+		ordinaryCap   int
+		advisoryCap   int
+	}{
+		{name: "unbuffered", ordinaryCap: 0, advisoryCap: 0},
+		{name: "buffered", ordinaryCap: 64, advisoryCap: 16},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			c := &Conn{
+				writer: connWriterRuntimeState{
+					writeCh:         make(chan writeRequest, tc.ordinaryCap),
+					advisoryWriteCh: make(chan writeRequest, tc.advisoryCap),
+				},
+				registry: connRegistryState{streams: map[uint64]*nativeStream{
+					4: {id: 4, idSet: true},
+				}},
+			}
+
+			var (
+				totalRequests uint64
+				totalBatches  uint64
+			)
+			consumerDone := make(chan struct{})
+			go func() {
+				defer close(consumerDone)
+				for first := range c.writer.writeCh {
+					batch := c.collectWriteBatch(first, writeLaneOrdinary)
+					atomic.AddUint64(&totalRequests, uint64(len(batch)))
+					atomic.AddUint64(&totalBatches, 1)
+				}
+			}()
+
+			var blocked time.Duration
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				start := time.Now()
+				c.writer.writeCh <- proto
+				blocked += time.Since(start)
+			}
+			b.StopTimer()
+
+			close(c.writer.writeCh)
+			<-consumerDone
+
+			requests := atomic.LoadUint64(&totalRequests)
+			batches := atomic.LoadUint64(&totalBatches)
+			if batches > 0 {
+				b.ReportMetric(float64(requests)/float64(batches), "reqs_per_batch")
+			}
+			b.ReportMetric(float64(batches), "flushes")
+			if b.N > 0 {
+				b.ReportMetric(float64(blocked.Nanoseconds())/float64(b.N), "send_block_ns/op")
+			}
+		})
 	}
 }
 

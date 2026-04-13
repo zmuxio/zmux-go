@@ -136,23 +136,14 @@ func (c *Conn) startReadLoopProtocolLoopLocked() {
 	if c == nil {
 		return
 	}
-	if c.protocol.wakeCh == nil {
-		c.protocol.wakeCh = make(chan struct{}, 1)
+	if c.protocol.taskCh == nil {
+		c.protocol.taskCh = make(chan func() error, maxPendingReadLoopProtocolJobs)
 	}
-	wakeCh := c.protocol.wakeCh
+	taskCh := c.protocol.taskCh
 	closedCh := c.lifecycle.closedCh
 	c.protocol.startOnce.Do(func() {
-		go c.readLoopProtocolLoop(wakeCh, closedCh)
+		go c.readLoopProtocolLoop(taskCh, closedCh)
 	})
-}
-
-func (c *Conn) takeReadLoopProtocolJobsLocked() []func() error {
-	if c == nil || len(c.protocol.jobs) == 0 {
-		return nil
-	}
-	jobs := c.protocol.jobs
-	c.protocol.jobs = nil
-	return jobs
 }
 
 func (c *Conn) handleReadLoopProtocolActionErr(err error) {
@@ -168,26 +159,16 @@ func (c *Conn) handleReadLoopProtocolActionErr(err error) {
 	c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
 }
 
-func (c *Conn) readLoopProtocolLoop(wakeCh, closedCh chan struct{}) {
+func (c *Conn) readLoopProtocolLoop(taskCh <-chan func() error, closedCh chan struct{}) {
 	for {
 		select {
 		case <-closedCh:
 			return
-		case <-wakeCh:
-		}
-		for {
-			c.mu.Lock()
-			jobs := c.takeReadLoopProtocolJobsLocked()
-			c.mu.Unlock()
-			if len(jobs) == 0 {
-				break
+		case job := <-taskCh:
+			if job == nil {
+				continue
 			}
-			for _, job := range jobs {
-				if job == nil {
-					continue
-				}
-				c.handleReadLoopProtocolActionErr(job())
-			}
+			c.handleReadLoopProtocolActionErr(job())
 		}
 	}
 }
@@ -199,21 +180,24 @@ func (c *Conn) runReadLoopProtocolActionAsync(action func() error) {
 		return
 	}
 	c.mu.Lock()
-	if len(c.protocol.jobs) >= maxPendingReadLoopProtocolJobs {
-		c.metrics.protocolBacklogClose = saturatingAdd(c.metrics.protocolBacklogClose, 1)
-		c.mu.Unlock()
-		c.closeSessionWithOptions(
-			wireError(CodeInternal, "queue protocol action", fmt.Errorf("pending protocol backlog exceeded")),
-			closeOriginReadLoop,
-			closeFrameDefault,
-		)
-		return
-	}
 	c.startReadLoopProtocolLoopLocked()
-	c.protocol.jobs = append(c.protocol.jobs, action)
-	wakeCh := c.protocol.wakeCh
+	taskCh := c.protocol.taskCh
+	closedCh := c.lifecycle.closedCh
 	c.mu.Unlock()
-	notify(wakeCh)
+	select {
+	case <-closedCh:
+		return
+	case taskCh <- action:
+		return
+	default:
+		c.mu.Lock()
+		c.metrics.protocolBacklogBlocked = saturatingAdd(c.metrics.protocolBacklogBlocked, 1)
+		c.mu.Unlock()
+	}
+	select {
+	case <-closedCh:
+	case taskCh <- action:
+	}
 }
 
 func (c *Conn) queueReadLoopFrameAsync(frame txFrame) {
@@ -1439,6 +1423,7 @@ func (c *Conn) consumeReceiveLocked(stream *nativeStream, n uint64) {
 	if n == 0 {
 		return
 	}
+	prevTracked := c.trackedSessionMemoryLocked()
 
 	sessionN := n
 	if sessionN > c.flow.recvSessionUsed {
@@ -1460,6 +1445,7 @@ func (c *Conn) consumeReceiveLocked(stream *nativeStream, n uint64) {
 	}
 
 	c.maybeReplenishReceiveLocked(stream)
+	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(sessionN > 0))
 }
 
 func (c *Conn) maybeReplenishReceiveLocked(stream *nativeStream) {

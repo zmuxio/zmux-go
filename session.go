@@ -337,6 +337,9 @@ func (c *Conn) acceptStream(ctx context.Context, arity streamArity) (*nativeStre
 				c.mu.Unlock()
 				continue
 			}
+			if c.acceptCountLocked(arity) > 0 {
+				notify(c.ensureAcceptNotifyLocked(arity))
+			}
 			stream.markAccepted()
 			dispatch := c.takeStreamEventLocked(stream, EventStreamAccepted, nil)
 			c.mu.Unlock()
@@ -580,14 +583,20 @@ type ReasonStats struct {
 // DiagnosticStats exposes repository-default ingress/drop counters.
 // Late-data counters are absorbed application-byte totals.
 type DiagnosticStats struct {
-	DroppedPriorityUpdates uint64
-	LateDataAfterCloseRead uint64
-	LateDataAfterReset     uint64
-	LateDataAfterAbort     uint64
-	CoalescedTerminal      uint64
-	SupersededTerminal     uint64
-	SkippedCloseOnDeadIO   uint64
-	ProtocolBacklogClose   uint64
+	DroppedPriorityUpdates      uint64
+	DroppedLocalPriorityUpdates uint64
+	LateDataAfterCloseRead      uint64
+	LateDataAfterReset          uint64
+	LateDataAfterAbort          uint64
+	CoalescedTerminal           uint64
+	SupersededTerminal          uint64
+	SkippedCloseOnDeadIO        uint64
+	CloseFrameAdmissionTimeouts uint64
+	CloseFrameFlushTimeouts     uint64
+	CloseFrameFlushErrors       uint64
+	ProtocolBacklogClose        uint64
+	ProtocolBacklogBlocked      uint64
+	MarkerOnlyRangeCount        int
 }
 
 type RetainedBucketStats struct {
@@ -820,7 +829,7 @@ func (c *Conn) Stats() SessionStats {
 		PreparedAdvisory:       c.pending.preparedPriorityBytes,
 		PendingTerminal:        c.pendingTerminalControlBytesLocked(),
 		PendingTerminalCount:   c.pendingTerminalQueueCountLocked(),
-		PendingProtocolJobs:    len(c.protocol.jobs),
+		PendingProtocolJobs:    len(c.protocol.taskCh),
 	}
 	hiddenRetained := c.hiddenControlStateRetainedLocked()
 	hiddenSoftCap := state.AdmissionSoftCap(c.pendingInboundLimitLocked())
@@ -900,14 +909,20 @@ func (c *Conn) Stats() SessionStats {
 			Abort: copyReasonCounts(c.retention.abortReasonCount),
 		},
 		Diagnostics: DiagnosticStats{
-			DroppedPriorityUpdates: c.ingress.droppedPriorityUpdate,
-			LateDataAfterCloseRead: c.ingress.lateDataAfterClose,
-			LateDataAfterReset:     c.ingress.lateDataAfterReset,
-			LateDataAfterAbort:     c.ingress.lateDataAfterAbort,
-			CoalescedTerminal:      c.metrics.coalescedTerminalSignals,
-			SupersededTerminal:     c.metrics.droppedSupersededControls,
-			SkippedCloseOnDeadIO:   c.metrics.skippedCloseOnDeadIO,
-			ProtocolBacklogClose:   c.metrics.protocolBacklogClose,
+			DroppedPriorityUpdates:      c.ingress.droppedPriorityUpdate,
+			DroppedLocalPriorityUpdates: c.ingress.droppedLocalPriority,
+			LateDataAfterCloseRead:      c.ingress.lateDataAfterClose,
+			LateDataAfterReset:          c.ingress.lateDataAfterReset,
+			LateDataAfterAbort:          c.ingress.lateDataAfterAbort,
+			CoalescedTerminal:           c.metrics.coalescedTerminalSignals,
+			SupersededTerminal:          c.metrics.droppedSupersededControls,
+			SkippedCloseOnDeadIO:        c.metrics.skippedCloseOnDeadIO,
+			CloseFrameAdmissionTimeouts: c.metrics.closeFrameAdmissionTO,
+			CloseFrameFlushTimeouts:     c.metrics.closeFrameFlushTO,
+			CloseFrameFlushErrors:       c.metrics.closeFrameFlushErr,
+			ProtocolBacklogClose:        c.metrics.protocolBacklogClose,
+			ProtocolBacklogBlocked:      c.metrics.protocolBacklogBlocked,
+			MarkerOnlyRangeCount:        c.markerOnlyRangeCountLocked(),
 		},
 	}
 }
@@ -996,17 +1011,26 @@ func (c *Conn) Close() error {
 	c.mu.Unlock()
 
 	gracefulClose := false
+	var gracefulErr error
 	if plan.Outcome == state.BeginCloseGraceful {
-		if err := c.closeWithGoAwayAndClose(initialGoAwayPolicy, initialGoAwayBidi, initialGoAwayUni); err == nil {
+		if err := c.closeWithGoAwayAndClose(initialGoAwayPolicy, initialGoAwayBidi, initialGoAwayUni); err == nil || errors.Is(err, ErrGracefulCloseTimeout) {
 			gracefulClose = true
+			gracefulErr = err
 			c.closeSessionWithOptions(nil, closeOriginApp, closeFrameDefault)
 		}
 	}
 
 	if !gracefulClose {
 		c.Abort(nil)
+		return completeCloseErr(c, c.Wait(context.Background()))
 	}
-	return completeCloseErr(c, c.Wait(context.Background()))
+	if err := completeCloseErr(c, c.Wait(context.Background())); err != nil {
+		return err
+	}
+	if gracefulErr != nil {
+		return closeOperationErr(c, gracefulErr)
+	}
+	return nil
 }
 
 func (c *Conn) Abort(err error) {
@@ -1101,6 +1125,17 @@ func (o closeOrigin) allowsQueuedCloseFrame() bool {
 	return o != closeOriginWriteLoop
 }
 
+type closeFrameSendResult struct {
+	admitted  bool
+	completed bool
+	timedOut  bool
+	err       error
+}
+
+func (r closeFrameSendResult) sent() bool {
+	return r.completed && r.err == nil
+}
+
 func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolicy closeFramePolicy) {
 	if err == nil {
 		err = ErrSessionClosed
@@ -1142,11 +1177,11 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		c.mu.Unlock()
 
 		if emitCloseFrame {
-			closeFrameSent := c.emitCloseFrame(closeFramePayload)
+			sendResult := c.emitCloseFrame(closeFramePayload)
 			c.mu.Lock()
-			c.finishCloseFrameEnqueueLocked(closeFrameSent)
+			c.finishCloseFrameEnqueueLocked(sendResult.sent())
 			c.mu.Unlock()
-			if closeFrameSent {
+			if sendResult.sent() {
 				if delay := closeTransportDrainDelay(err); delay > 0 {
 					time.Sleep(delay)
 				}
@@ -1167,6 +1202,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		c.clearTombstoneQueueLocked()
 		c.clearHiddenTombstonesLocked()
 		c.registry.usedStreamData = nil
+		c.registry.usedStreamRanges = nil
 		c.mu.Unlock()
 		if c != nil && c.observer.eventHandler != nil {
 			c.emitEvent(Event{
@@ -1304,6 +1340,7 @@ func establishmentCloseDrainDelay(err error) time.Duration {
 }
 
 const establishmentFailureWriteWait = 10 * time.Millisecond
+const establishmentFailureFastWriteWait = time.Millisecond
 
 func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer *Preface, err error) {
 	if conn == nil {
@@ -1323,17 +1360,22 @@ func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error
 	if conn == nil {
 		return
 	}
-	timer := time.NewTimer(establishmentFailureWriteWait)
-	defer stopTimer(timer)
+	fastTimer := time.NewTimer(establishmentFailureFastWriteWait)
+	defer stopTimer(fastTimer)
 	select {
 	case writeErr := <-writeErrCh:
 		if writeErr == nil {
 			closeAfterEstablishmentFailure(conn, local, peer, err)
 			return
 		}
-		_ = conn.Close()
+	case <-fastTimer.C:
+	}
+	_ = conn.Close()
+	timer := time.NewTimer(establishmentFailureWriteWait)
+	defer stopTimer(timer)
+	select {
+	case <-writeErrCh:
 	case <-timer.C:
-		_ = conn.Close()
 	}
 }
 
@@ -1357,16 +1399,16 @@ func (c *Conn) closeTerminalChLocked() {
 	close(c.lifecycle.terminalCh)
 }
 
-func (c *Conn) emitCloseFrame(payload []byte) bool {
+func (c *Conn) emitCloseFrame(payload []byte) closeFrameSendResult {
 	if c == nil || len(payload) == 0 {
-		return false
+		return closeFrameSendResult{}
 	}
 	lane := c.writer.urgentWriteCh
 	if lane == nil {
 		lane = c.writer.writeCh
 	}
 	if lane == nil || c.lifecycle.closedCh == nil {
-		return false
+		return closeFrameSendResult{}
 	}
 
 	req := writeRequest{
@@ -1376,10 +1418,32 @@ func (c *Conn) emitCloseFrame(payload []byte) bool {
 
 	deadline := time.Now().Add(sessionCloseFrameSendTimeout)
 	if !rt.SendByDeadline(deadline, c.lifecycle.closedCh, lane, req) {
-		return false
+		c.mu.Lock()
+		c.metrics.closeFrameAdmissionTO = saturatingAdd(c.metrics.closeFrameAdmissionTO, 1)
+		c.mu.Unlock()
+		return closeFrameSendResult{timedOut: true}
 	}
-	rt.WaitByDeadline(deadline, c.lifecycle.closedCh, req.done)
-	return true
+	result := closeFrameSendResult{admitted: true}
+	timer := time.NewTimer(time.Until(deadline))
+	defer stopTimer(timer)
+	select {
+	case err := <-req.done:
+		result.completed = true
+		result.err = err
+		if err != nil {
+			c.mu.Lock()
+			c.metrics.closeFrameFlushErr = saturatingAdd(c.metrics.closeFrameFlushErr, 1)
+			c.mu.Unlock()
+		}
+	case <-c.lifecycle.closedCh:
+		result.err = c.err()
+	case <-timer.C:
+		result.timedOut = true
+		c.mu.Lock()
+		c.metrics.closeFrameFlushTO = saturatingAdd(c.metrics.closeFrameFlushTO, 1)
+		c.mu.Unlock()
+	}
+	return result
 }
 
 func closeSessionStreamErr(finalState connState, err error) *ApplicationError {
@@ -1531,6 +1595,8 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 
 const sessionGoAwayDrainInterval = 10 * time.Millisecond
 const sessionGracefulCloseDrainTimeout = 25 * time.Millisecond
+const writerLaneBuffer = 128
+const advisoryLaneBuffer = 32
 
 func acceptedPeerGoAwayWatermark(localRole Role, arity streamArity, nextPeerID uint64) uint64 {
 	firstPeerID := state.FirstPeerStreamID(localRole, arity.isBidi())
@@ -1577,6 +1643,7 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	if c == nil {
 		return nil
 	}
+	var drainErr error
 
 	if initialPolicy.sendsInitial() {
 		if err := c.GoAway(initialBidi, initialUni); err != nil {
@@ -1613,8 +1680,11 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	}
 	c.reclaimGracefulCloseLocalStreamsLocked()
 	c.mu.Unlock()
-	if err := c.waitForGracefulCloseDrain(sessionGracefulCloseDrainTimeout); err != nil {
-		return err
+	if err := c.waitForGracefulCloseDrain(c.gracefulCloseDrainTimeout()); err != nil {
+		if !errors.Is(err, ErrGracefulCloseTimeout) {
+			return err
+		}
+		drainErr = err
 	}
 
 	c.mu.Lock()
@@ -1639,17 +1709,27 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 		c.mu.Unlock()
 		return closeOperationErr(c, closePayloadErr)
 	}
-	if err := c.queueImmutableFrame(flatTxFrame(Frame{Type: FrameTypeCLOSE, Payload: closePayload})); err != nil {
+	sendResult := c.emitCloseFrame(closePayload)
+	if !sendResult.admitted {
 		c.mu.Lock()
 		c.finishCloseFrameEnqueueLocked(false)
 		c.mu.Unlock()
-		return closeOperationErr(c, err)
+		if sendResult.timedOut {
+			return closeOperationErr(c, ErrGracefulCloseTimeout)
+		}
+		return closeOperationErr(c, ErrSessionClosed)
 	}
 	c.mu.Lock()
-	c.finishCloseFrameEnqueueLocked(true)
+	c.finishCloseFrameEnqueueLocked(sendResult.sent())
 	c.mu.Unlock()
+	if sendResult.err != nil {
+		return closeOperationErr(c, sendResult.err)
+	}
+	if !sendResult.completed {
+		return closeOperationErr(c, ErrGracefulCloseTimeout)
+	}
 
-	return nil
+	return drainErr
 }
 
 func (c *Conn) GoAway(lastAcceptedBidi, lastAcceptedUni uint64) error {
@@ -1879,7 +1959,7 @@ func (c *Conn) waitForGracefulCloseDrain(timeout time.Duration) error {
 		return ErrSessionClosed
 	}
 	if timeout <= 0 {
-		return nil
+		timeout = sessionGracefulCloseDrainTimeout
 	}
 
 	timer := time.NewTimer(timeout)
@@ -1904,7 +1984,7 @@ func (c *Conn) waitForGracefulCloseDrain(timeout time.Duration) error {
 		case <-closedCh:
 		case <-livenessCh:
 		case <-timer.C:
-			return nil
+			return ErrGracefulCloseTimeout
 		}
 	}
 }
@@ -1984,7 +2064,7 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 	now := time.Now()
 	var advisoryWriteCh chan writeRequest
 	if negotiated.Capabilities.SupportsPriorityUpdateCarriage() {
-		advisoryWriteCh = make(chan writeRequest)
+		advisoryWriteCh = make(chan writeRequest, advisoryLaneBuffer)
 	}
 	var livenessCh chan struct{}
 	if cfg.KeepaliveInterval > 0 {
@@ -2028,10 +2108,11 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 		terminalPolicy: connTerminationPolicyState{
 			stopSendingDrainWindow: cfg.StopSendingGracefulDrainWindow,
 			stopSendingTailCap:     cfg.StopSendingGracefulTailCap,
+			gracefulCloseTimeout:   cfg.GracefulCloseDrainTimeout,
 		},
 		writer: connWriterRuntimeState{
 			scheduler:       rt.NewBatchScheduler(),
-			writeCh:         make(chan writeRequest),
+			writeCh:         make(chan writeRequest, writerLaneBuffer),
 			advisoryWriteCh: advisoryWriteCh,
 			urgentWriteCh:   make(chan writeRequest, 1),
 		},
@@ -2127,12 +2208,12 @@ type connWriterRuntimeState struct {
 	writeCh         chan writeRequest
 	advisoryWriteCh chan writeRequest
 	urgentWriteCh   chan writeRequest
+	yieldOrdinary   bool
 }
 
 type connProtocolRuntimeState struct {
 	startOnce sync.Once
-	wakeCh    chan struct{}
-	jobs      []func() error
+	taskCh    chan func() error
 }
 
 type connIngressAccountingState struct {
@@ -2143,6 +2224,7 @@ type connIngressAccountingState struct {
 	lateDataAfterReset    uint64
 	lateDataAfterAbort    uint64
 	droppedPriorityUpdate uint64
+	droppedLocalPriority  uint64
 	readBufferOverhead    uint64
 
 	hiddenStreamsRefused       uint64
@@ -2165,6 +2247,10 @@ type connRuntimeMetricsState struct {
 	droppedSupersededControls uint64
 	skippedCloseOnDeadIO      uint64
 	protocolBacklogClose      uint64
+	protocolBacklogBlocked    uint64
+	closeFrameAdmissionTO     uint64
+	closeFrameFlushTO         uint64
+	closeFrameFlushErr        uint64
 }
 
 type connLivenessState struct {
@@ -2244,6 +2330,7 @@ type connObserverState struct {
 type connTerminationPolicyState struct {
 	stopSendingDrainWindow time.Duration
 	stopSendingTailCap     uint64
+	gracefulCloseTimeout   time.Duration
 }
 
 type connConfigState struct {
@@ -2357,6 +2444,7 @@ type connRegistryState struct {
 	tombstonesInit       bool
 	hiddenTombstoneOrder []uint64
 	usedStreamData       map[uint64]usedStreamMarker
+	usedStreamRanges     []usedStreamRange
 	tombstoneLimit       int
 	hiddenTombstonesInit bool
 
@@ -2499,6 +2587,7 @@ func (c *Conn) applyConfigRuntimePolicy(cfg Config) {
 	c.retention.markerOnlyLimit = cfg.MarkerOnlyUsedStreamLimit
 	c.terminalPolicy.stopSendingDrainWindow = cfg.StopSendingGracefulDrainWindow
 	c.terminalPolicy.stopSendingTailCap = cfg.StopSendingGracefulTailCap
+	c.terminalPolicy.gracefulCloseTimeout = cfg.GracefulCloseDrainTimeout
 	c.queues.acceptBacklogLimit = cfg.AcceptBacklogLimit
 	c.queues.acceptBacklogBytesLimit = cfg.AcceptBacklogBytesLimit
 	c.registry.tombstoneLimit = cfg.TombstoneLimit
@@ -2524,6 +2613,13 @@ func (c *Conn) applyConfigRuntimePolicy(cfg Config) {
 	if cfg.AggregateLateDataCap > 0 {
 		c.ingress.aggregateLateDataCap = cfg.AggregateLateDataCap
 	}
+}
+
+func (c *Conn) gracefulCloseDrainTimeout() time.Duration {
+	if c == nil || c.terminalPolicy.gracefulCloseTimeout <= 0 {
+		return sessionGracefulCloseDrainTimeout
+	}
+	return c.terminalPolicy.gracefulCloseTimeout
 }
 
 func (c *Conn) localLimitsView() Limits {
@@ -2913,10 +3009,31 @@ func (c *Conn) visibleTombstoneRetainedLocked() int {
 }
 
 func (c *Conn) markerOnlyRetainedLocked() int {
+	if c == nil {
+		return 0
+	}
+	return c.markerOnlyMapCountLocked() + len(c.registry.usedStreamRanges)
+}
+
+func (c *Conn) markerOnlyMapCountLocked() int {
 	if c == nil || len(c.registry.usedStreamData) == 0 {
 		return 0
 	}
-	return nonNegativeCountDiff(len(c.registry.usedStreamData), len(c.registry.tombstones))
+	count := 0
+	for streamID := range c.registry.usedStreamData {
+		if _, ok := c.registry.tombstones[streamID]; ok {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (c *Conn) markerOnlyRangeCountLocked() int {
+	if c == nil {
+		return 0
+	}
+	return len(c.registry.usedStreamRanges)
 }
 
 func (c *Conn) markerOnlyHardCapLocked() int {
@@ -3386,6 +3503,28 @@ type provisionalCommitWait struct {
 
 func (w provisionalCommitWait) blocked() bool {
 	return w.blockedFlag
+}
+
+type provisionalOpenTurnWait struct {
+	notifyCh       <-chan struct{}
+	deadline       time.Time
+	retryOnTimeout bool
+}
+
+func (w provisionalOpenTurnWait) wait(stream *nativeStream, wrap func(error) error) error {
+	if stream == nil {
+		return ErrSessionClosed
+	}
+	if err := stream.waitWithDeadline(w.notifyCh, w.deadline, OperationWrite); err != nil {
+		if w.retryOnTimeout && errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil
+		}
+		if wrap != nil {
+			return wrap(err)
+		}
+		return err
+	}
+	return nil
 }
 
 type localOpenCommitState uint8
@@ -4053,19 +4192,17 @@ func (c *Conn) provisionalCommitWaitLocked(stream *nativeStream, now time.Time) 
 	}, nil
 }
 
-func (s *nativeStream) waitForProvisionalOpenTurnLocked(wrap func(error) error) (retry bool, err error) {
+func (s *nativeStream) provisionalOpenTurnWaitLocked() (provisionalOpenTurnWait, bool, error) {
 	if s == nil || s.conn == nil {
-		return false, ErrSessionClosed
+		return provisionalOpenTurnWait{}, false, ErrSessionClosed
 	}
 
-	wait, waitErr := s.conn.provisionalCommitWaitLocked(s, time.Now())
-	if waitErr != nil {
-		s.conn.mu.Unlock()
-		return false, wrap(waitErr)
+	wait, err := s.conn.provisionalCommitWaitLocked(s, time.Now())
+	if err != nil {
+		return provisionalOpenTurnWait{}, false, err
 	}
 	if !wait.blocked() {
-		s.conn.mu.Unlock()
-		return true, nil
+		return provisionalOpenTurnWait{}, false, nil
 	}
 
 	notifyCh, writeDeadline := s.writeWaitSnapshotLocked()
@@ -4075,14 +4212,11 @@ func (s *nativeStream) waitForProvisionalOpenTurnLocked(wrap func(error) error) 
 		deadline = writeDeadline
 		retryOnTimeout = false
 	}
-	s.conn.mu.Unlock()
-	if waitErr := s.waitWithDeadline(notifyCh, deadline, OperationWrite); waitErr != nil {
-		if retryOnTimeout && errors.Is(waitErr, os.ErrDeadlineExceeded) {
-			return true, nil
-		}
-		return false, wrap(waitErr)
-	}
-	return true, nil
+	return provisionalOpenTurnWait{
+		notifyCh:       notifyCh,
+		deadline:       deadline,
+		retryOnTimeout: retryOnTimeout,
+	}, true, nil
 }
 
 func (c *Conn) commitLocalOpenLocked(stream *nativeStream) (localOpenCommitState, error) {

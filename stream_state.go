@@ -798,7 +798,11 @@ func (s *nativeStream) queuePendingMetadataUpdateLocked(caps Capabilities, updat
 	if err != nil {
 		return err
 	}
-	s.conn.queuePriorityUpdateAsync(s.id, payload, retainedBytesOwned)
+	result := s.conn.queuePriorityUpdateAsync(s.id, payload, retainedBytesOwned)
+	if !result.accepted() {
+		s.conn.ingress.droppedLocalPriority = saturatingAdd(s.conn.ingress.droppedLocalPriority, 1)
+		return result.structuredErr(s.conn)
+	}
 	if update.Priority != nil {
 		s.priority = *update.Priority
 	}
