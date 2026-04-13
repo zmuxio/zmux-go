@@ -1095,7 +1095,6 @@ const (
 	closeOriginApp
 	closeOriginReadLoop
 	closeOriginWriteLoop
-	closeOriginEstablish
 )
 
 func (o closeOrigin) allowsQueuedCloseFrame() bool {
