@@ -2684,9 +2684,9 @@ func TestStatsProgressViewMirrorsLegacyTimestamps(t *testing.T) {
 		return !stats.LastTransportWrite.IsZero() &&
 			!stats.LastStreamProgress.IsZero() &&
 			!stats.LastAppProgress.IsZero() &&
-			stats.Progress.TransportProgressAt == stats.LastTransportWrite &&
-			stats.Progress.StreamProgressAt == stats.LastStreamProgress &&
-			stats.Progress.ApplicationProgressAt == stats.LastAppProgress
+			stats.Progress.TransportProgressAt.Equal(stats.LastTransportWrite) &&
+			stats.Progress.StreamProgressAt.Equal(stats.LastStreamProgress) &&
+			stats.Progress.ApplicationProgressAt.Equal(stats.LastAppProgress)
 	}, "progress view did not mirror legacy timestamps")
 }
 
@@ -21642,10 +21642,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 			done <- err
 		}()
 		deadline := time.Now().Add(testSignalTimeout)
-		for {
-			if stream.loadWriteWaiters() > 0 {
-				break
-			}
+		for stream.loadWriteWaiters() == 0 {
 			if time.Now().After(deadline) {
 				return fmt.Errorf("blocked write did not enter wait state")
 			}
@@ -24152,7 +24149,7 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 			t.Fatalf("event %q did not converge local sender to RESET or FIN", step.Event)
 		}
 		frame := awaitQueuedFrame(t, env.frames)
-		if frame.Type != FrameTypeRESET && !(frame.Type == FrameTypeDATA && frame.Flags&FrameFlagFIN != 0) {
+		if frame.Type != FrameTypeRESET && (frame.Type != FrameTypeDATA || frame.Flags&FrameFlagFIN == 0) {
 			t.Fatalf("event %q queued frame = %+v, want RESET or DATA|FIN", step.Event, frame)
 		}
 	case "local_invalid":
@@ -24548,35 +24545,35 @@ func streamHalfStateNames(stream *nativeStream) (sendHalf, recvHalf string) {
 	sendHalfState := stream.sendHalfState()
 	recvHalfState := stream.recvHalfState()
 
-	switch {
-	case sendHalfState == state.SendHalfAbsent:
+	switch sendHalfState {
+	case state.SendHalfAbsent:
 		sendHalf = "absent"
-	case sendHalfState == state.SendHalfAborted:
+	case state.SendHalfAborted:
 		sendHalf = "send_aborted"
-	case sendHalfState == state.SendHalfReset:
+	case state.SendHalfReset:
 		sendHalf = "send_reset"
-	case sendHalfState == state.SendHalfFin:
+	case state.SendHalfFin:
 		sendHalf = "send_fin"
-	case sendHalfState == state.SendHalfStopSeen:
+	case state.SendHalfStopSeen:
 		sendHalf = "send_stop_seen"
-	case sendHalfState == state.SendHalfOpen:
+	case state.SendHalfOpen:
 		sendHalf = "send_open"
 	default:
 		sendHalf = "send_open"
 	}
 
-	switch {
-	case recvHalfState == state.RecvHalfAbsent:
+	switch recvHalfState {
+	case state.RecvHalfAbsent:
 		recvHalf = "absent"
-	case recvHalfState == state.RecvHalfAborted:
+	case state.RecvHalfAborted:
 		recvHalf = "recv_aborted"
-	case recvHalfState == state.RecvHalfReset:
+	case state.RecvHalfReset:
 		recvHalf = "recv_reset"
-	case recvHalfState == state.RecvHalfStopSent:
+	case state.RecvHalfStopSent:
 		recvHalf = "recv_stop_sent"
-	case recvHalfState == state.RecvHalfFin:
+	case state.RecvHalfFin:
 		recvHalf = "recv_fin"
-	case recvHalfState == state.RecvHalfOpen:
+	case state.RecvHalfOpen:
 		recvHalf = "recv_open"
 	default:
 		recvHalf = "recv_open"

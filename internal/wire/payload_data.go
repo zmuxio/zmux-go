@@ -94,10 +94,6 @@ func ParseStreamMetadataTLVsView(tlvs []TLV) (ParsedStreamMetadata, bool, error)
 	return parseStreamMetadataTLVs(tlvs, false)
 }
 
-func ParseStreamMetadataBytes(src []byte) (ParsedStreamMetadata, bool, error) {
-	return parseStreamMetadataBytes(src, true)
-}
-
 func ParseStreamMetadataBytesView(src []byte) (ParsedStreamMetadata, bool, error) {
 	return parseStreamMetadataBytes(src, false)
 }

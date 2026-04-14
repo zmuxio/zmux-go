@@ -2949,7 +2949,7 @@ func TestResetKeepaliveDueUsesFreshJitterPerDeadline(t *testing.T) {
 	second := c.liveness.keepaliveDueAt
 	c.mu.Unlock()
 
-	if first == second {
+	if first.Equal(second) {
 		t.Fatalf("keepaliveDueAt repeated identical jitter = %v, want per-deadline resample", first)
 	}
 }

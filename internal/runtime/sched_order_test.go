@@ -556,7 +556,7 @@ func TestBuildBatchGroupsDropsOversizedGroupQueueCache(t *testing.T) {
 	state.scratch.lastBuildCapHint = oversizedLen
 	state.scratch.groupQueues = make([]map[uint64][]int, oversizedLen)
 	for i := range state.scratch.groupQueues {
-		state.scratch.groupQueues[i] = map[uint64][]int{uint64(i + 1): []int{i}}
+		state.scratch.groupQueues[i] = map[uint64][]int{uint64(i + 1): {i}}
 	}
 
 	prepared := buildBatchGroups(state, []BatchItem{
