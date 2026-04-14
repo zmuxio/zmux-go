@@ -69,6 +69,15 @@ func TestOpenAdmissionHelpers(t *testing.T) {
 	if got := ProvisionalAvailableCount(25, 21); got != 0 {
 		t.Fatalf("available provisional count above watermark = %d, want 0", got)
 	}
+	maxInt := int(^uint(0) >> 1)
+	hugeCount := ((^uint64(0) - 0) / 4) + 1
+	want := maxInt
+	if hugeCount <= uint64(maxInt) {
+		want = int(hugeCount)
+	}
+	if got := ProvisionalAvailableCount(0, ^uint64(0)); got != want {
+		t.Fatalf("available provisional count saturation = %d, want %d", got, want)
+	}
 	if got := AdmissionSoftCap(128); got != 32 {
 		t.Fatalf("admission soft cap = %d, want 32", got)
 	}

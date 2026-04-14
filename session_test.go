@@ -24686,6 +24686,12 @@ func TestPendingStreamMaxDataDeferredUntilLocalOpenCommit(t *testing.T) {
 	}
 	testMarkLocalOpenCommitted(stream)
 	urgent, advisory = testDrainPendingControlFrames(c)
+	if len(urgent) != 0 || len(advisory) != 0 {
+		c.mu.Unlock()
+		t.Fatalf("post-commit drain urgent=%d advisory=%d, want 0/0 while awaiting peer visibility", len(urgent), len(advisory))
+	}
+	testMarkLocalOpenVisible(stream)
+	urgent, advisory = testDrainPendingControlFrames(c)
 	c.mu.Unlock()
 
 	if len(advisory) != 0 {
@@ -24732,6 +24738,12 @@ func TestPendingStreamBlockedDeferredUntilLocalOpenCommit(t *testing.T) {
 		t.Fatalf("blocked state = (%t,%d), want (true,64)", stream.blockedSet, stream.blockedAt)
 	}
 	testMarkLocalOpenCommitted(stream)
+	urgent, advisory = testDrainPendingControlFrames(c)
+	if len(urgent) != 0 || len(advisory) != 0 {
+		c.mu.Unlock()
+		t.Fatalf("post-commit drain urgent=%d advisory=%d, want 0/0 while awaiting peer visibility", len(urgent), len(advisory))
+	}
+	testMarkLocalOpenVisible(stream)
 	urgent, advisory = testDrainPendingControlFrames(c)
 	c.mu.Unlock()
 

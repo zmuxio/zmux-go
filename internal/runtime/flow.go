@@ -116,9 +116,6 @@ func MemoryWakeNeeded(prevTracked, nextTracked, threshold uint64) bool {
 }
 
 func ProjectedExceedsThreshold(current, additional, threshold uint64) bool {
-	if current == 0 {
-		return false
-	}
 	return SaturatingAdd(current, additional) > threshold
 }
 

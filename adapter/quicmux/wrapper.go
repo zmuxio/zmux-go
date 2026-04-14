@@ -17,9 +17,10 @@ import (
 )
 
 const quicmuxStreamPreludeMaxPayload = 16 << 10
-const quicmuxAcceptedPreludeReadTimeout = 5 * time.Second
 
 const quicmuxOpenCaps = wire.CapabilityOpenMetadata | wire.CapabilityPriorityHints | wire.CapabilityStreamGroups
+
+var acceptedPreludeReadTimeout = 5 * time.Second
 
 // SessionConn is the quic-go connection shape required by the adapter.
 //
@@ -254,7 +255,8 @@ func (s *quicSession) acceptBidiLoop() {
 			s.publishBidiAcceptResult(bidiAcceptResult{err: translateError(err)})
 			return
 		}
-		go s.finishAcceptedBidiStream(stream)
+		wrapped, wrapErr := newAcceptedBidiStream(s.conn, stream)
+		s.publishBidiAcceptResult(bidiAcceptResult{stream: wrapped, err: wrapErr})
 	}
 }
 
@@ -265,18 +267,9 @@ func (s *quicSession) acceptUniLoop() {
 			s.publishUniAcceptResult(uniAcceptResult{err: translateError(err)})
 			return
 		}
-		go s.finishAcceptedUniStream(stream)
+		wrapped, wrapErr := newAcceptedRecvStream(s.conn, stream)
+		s.publishUniAcceptResult(uniAcceptResult{stream: wrapped, err: wrapErr})
 	}
-}
-
-func (s *quicSession) finishAcceptedBidiStream(stream *quic.Stream) {
-	wrapped, err := newAcceptedBidiStream(s.conn, stream)
-	s.publishBidiAcceptResult(bidiAcceptResult{stream: wrapped, err: err})
-}
-
-func (s *quicSession) finishAcceptedUniStream(stream *quic.ReceiveStream) {
-	wrapped, err := newAcceptedRecvStream(s.conn, stream)
-	s.publishUniAcceptResult(uniAcceptResult{stream: wrapped, err: err})
 }
 
 func (s *quicSession) publishBidiAcceptResult(result bidiAcceptResult) {
@@ -307,10 +300,12 @@ type quicStreamBase struct {
 
 	writeMu sync.Mutex
 	metaMu  sync.Mutex
+	termMu  sync.Mutex
 
 	prelude       []byte
 	preludeSent   bool
 	preludeFrozen bool
+	preludeOffset int
 	priority      uint64
 	prioritySet   bool
 	group         uint64
@@ -319,6 +314,8 @@ type quicStreamBase struct {
 
 	localReadClosed  atomic.Bool
 	localWriteClosed atomic.Bool
+	localReadErr     error
+	localWriteErr    error
 }
 
 func initLocalStreamBase(base *quicStreamBase, conn SessionConn, reader io.Reader, writer io.Writer, opts zmux.OpenOptions) {
@@ -377,10 +374,20 @@ func (b *quicStreamBase) readFrom(src io.Reader, p []byte) (int, error) {
 	if src == nil {
 		return 0, zmux.ErrSessionClosed
 	}
+	if b != nil {
+		if err := b.loadLocalReadErr(); err != nil {
+			return 0, err
+		}
+	}
 	if b != nil && b.localReadClosed.Load() {
 		return 0, zmux.ErrReadClosed
 	}
 	n, err := src.Read(p)
+	if err != nil && b != nil {
+		if localErr := b.loadLocalReadErr(); localErr != nil {
+			return n, localErr
+		}
+	}
 	if err != nil && b != nil && b.localReadClosed.Load() {
 		return n, zmux.ErrReadClosed
 	}
@@ -474,8 +481,17 @@ func (b *quicStreamBase) ensureOpenPrelude() error {
 	if prelude == nil {
 		return nil
 	}
-	if err := writeAll(b.preludeWriter, prelude); err != nil {
-		return translateError(err)
+	for b.preludeOffset < len(prelude) {
+		n, err := b.preludeWriter.Write(prelude[b.preludeOffset:])
+		if n > 0 {
+			b.preludeOffset += n
+		}
+		if err != nil {
+			return translateError(err)
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
 	b.metaMu.Lock()
 	b.preludeSent = true
@@ -517,6 +533,42 @@ func (b *quicStreamBase) prepareOpenPrelude() ([]byte, error) {
 	return b.prelude, nil
 }
 
+func (b *quicStreamBase) loadLocalReadErr() error {
+	if b == nil {
+		return nil
+	}
+	b.termMu.Lock()
+	defer b.termMu.Unlock()
+	return b.localReadErr
+}
+
+func (b *quicStreamBase) loadLocalWriteErr() error {
+	if b == nil {
+		return nil
+	}
+	b.termMu.Lock()
+	defer b.termMu.Unlock()
+	return b.localWriteErr
+}
+
+func (b *quicStreamBase) storeLocalReadErr(err error) {
+	if b == nil || err == nil {
+		return
+	}
+	b.termMu.Lock()
+	b.localReadErr = err
+	b.termMu.Unlock()
+}
+
+func (b *quicStreamBase) storeLocalWriteErr(err error) {
+	if b == nil || err == nil {
+		return
+	}
+	b.termMu.Lock()
+	b.localWriteErr = err
+	b.termMu.Unlock()
+}
+
 type quicStream struct {
 	quicStreamBase
 	stream *quic.Stream
@@ -524,7 +576,7 @@ type quicStream struct {
 
 func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream) (*quicStream, error) {
 	reader := bufio.NewReader(stream)
-	_ = stream.SetReadDeadline(time.Now().Add(quicmuxAcceptedPreludeReadTimeout))
+	_ = stream.SetReadDeadline(time.Now().Add(acceptedPreludeReadTimeout))
 	defer func() {
 		_ = stream.SetReadDeadline(time.Time{})
 	}()
@@ -532,6 +584,7 @@ func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream) (*quicStream, 
 	if err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeProtocol))
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeProtocol))
+		_ = stream.Close()
 		return nil, err
 	}
 	wrapped := &quicStream{stream: stream}
@@ -550,6 +603,9 @@ func (s *quicStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
+	if err := s.loadLocalWriteErr(); err != nil {
+		return 0, err
+	}
 	if s.localWriteClosed.Load() {
 		return 0, zmux.ErrWriteClosed
 	}
@@ -560,6 +616,11 @@ func (s *quicStream) Write(p []byte) (int, error) {
 		return 0, zmux.ErrWriteClosed
 	}
 	n, err := s.stream.Write(p)
+	if err != nil {
+		if localErr := s.loadLocalWriteErr(); localErr != nil {
+			return n, localErr
+		}
+	}
 	if err != nil && s.localWriteClosed.Load() {
 		return n, zmux.ErrWriteClosed
 	}
@@ -570,7 +631,17 @@ func (s *quicStream) Close() error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
-	return errors.Join(s.CloseWrite(), s.CloseRead())
+	if err := s.CloseWrite(); err != nil &&
+		!errors.Is(err, zmux.ErrWriteClosed) &&
+		!errors.Is(err, zmux.ErrReadClosed) {
+		return err
+	}
+	if err := s.CloseRead(); err != nil &&
+		!errors.Is(err, zmux.ErrReadClosed) &&
+		!errors.Is(err, zmux.ErrWriteClosed) {
+		return err
+	}
+	return nil
 }
 
 func (s *quicStream) StreamID() uint64 {
@@ -669,38 +740,30 @@ func (s *quicStream) Reset(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	appErr := &zmux.ApplicationError{Code: code}
+	s.localWriteClosed.Store(true)
+	s.storeLocalWriteErr(appErr)
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
-}
-
-func (s *quicStream) ResetWithReason(code uint64, _ string) error {
-	return s.Reset(code)
 }
 
 func (s *quicStream) CloseWithError(err error) error {
-	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
+	code, reason := mappedApplicationError(err, uint64(zmux.CodeNoError))
 	return s.CloseWithErrorCode(code, reason)
 }
 
-func (s *quicStream) CloseWithErrorCode(code uint64, _ string) error {
+func (s *quicStream) CloseWithErrorCode(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
+	s.localReadClosed.Store(true)
+	s.localWriteClosed.Store(true)
+	s.storeLocalReadErr(appErr)
+	s.storeLocalWriteErr(appErr)
 	s.stream.CancelRead(quic.StreamErrorCode(code))
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
-}
-
-func (s *quicStream) Abort() error {
-	return s.CloseWithErrorCode(uint64(zmux.CodeCancelled), "")
-}
-
-func (s *quicStream) AbortWithError(err error) error {
-	return s.CloseWithError(err)
-}
-
-func (s *quicStream) AbortWithErrorCode(code uint64, reason string) error {
-	return s.CloseWithErrorCode(code, reason)
 }
 
 type quicSendStream struct {
@@ -727,6 +790,9 @@ func (s *quicSendStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
+	if err := s.loadLocalWriteErr(); err != nil {
+		return 0, err
+	}
 	if s.localWriteClosed.Load() {
 		return 0, zmux.ErrWriteClosed
 	}
@@ -737,6 +803,11 @@ func (s *quicSendStream) Write(p []byte) (int, error) {
 		return 0, zmux.ErrWriteClosed
 	}
 	n, err := s.stream.Write(p)
+	if err != nil {
+		if localErr := s.loadLocalWriteErr(); localErr != nil {
+			return n, localErr
+		}
+	}
 	if err != nil && s.localWriteClosed.Load() {
 		return n, zmux.ErrWriteClosed
 	}
@@ -787,37 +858,35 @@ func (s *quicSendStream) Reset(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	appErr := &zmux.ApplicationError{Code: code}
+	s.localWriteClosed.Store(true)
+	s.storeLocalWriteErr(appErr)
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
 }
 
-func (s *quicSendStream) ResetWithReason(code uint64, _ string) error {
-	return s.Reset(code)
-}
-
 func (s *quicSendStream) CloseWithError(err error) error {
-	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
+	code, reason := mappedApplicationError(err, uint64(zmux.CodeNoError))
 	return s.CloseWithErrorCode(code, reason)
 }
 
-func (s *quicSendStream) CloseWithErrorCode(code uint64, _ string) error {
-	return s.Reset(code)
-}
-
-func (s *quicSendStream) Abort() error {
-	return s.CloseWithErrorCode(uint64(zmux.CodeCancelled), "")
-}
-
-func (s *quicSendStream) AbortWithError(err error) error {
-	return s.CloseWithError(err)
-}
-
-func (s *quicSendStream) AbortWithErrorCode(code uint64, reason string) error {
-	return s.CloseWithErrorCode(code, reason)
+func (s *quicSendStream) CloseWithErrorCode(code uint64, reason string) error {
+	if s == nil || s.stream == nil {
+		return zmux.ErrSessionClosed
+	}
+	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
+	s.localWriteClosed.Store(true)
+	s.storeLocalWriteErr(appErr)
+	s.stream.CancelWrite(quic.StreamErrorCode(code))
+	return nil
 }
 
 func (s *quicSendStream) Close() error {
-	return s.CloseWrite()
+	err := s.CloseWrite()
+	if errors.Is(err, zmux.ErrWriteClosed) {
+		return nil
+	}
+	return err
 }
 
 func (s *quicSendStream) SetDeadline(t time.Time) error {
@@ -841,7 +910,7 @@ type quicRecvStream struct {
 
 func newAcceptedRecvStream(conn SessionConn, stream *quic.ReceiveStream) (*quicRecvStream, error) {
 	reader := bufio.NewReader(stream)
-	_ = stream.SetReadDeadline(time.Now().Add(quicmuxAcceptedPreludeReadTimeout))
+	_ = stream.SetReadDeadline(time.Now().Add(acceptedPreludeReadTimeout))
 	defer func() {
 		_ = stream.SetReadDeadline(time.Time{})
 	}()
@@ -894,28 +963,27 @@ func (s *quicRecvStream) CloseReadWithCode(code uint64) error {
 }
 
 func (s *quicRecvStream) CloseWithError(err error) error {
-	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
+	code, reason := mappedApplicationError(err, uint64(zmux.CodeNoError))
 	return s.CloseWithErrorCode(code, reason)
 }
 
-func (s *quicRecvStream) CloseWithErrorCode(code uint64, _ string) error {
-	return s.CloseReadWithCode(code)
-}
-
-func (s *quicRecvStream) Abort() error {
-	return s.CloseWithErrorCode(uint64(zmux.CodeCancelled), "")
-}
-
-func (s *quicRecvStream) AbortWithError(err error) error {
-	return s.CloseWithError(err)
-}
-
-func (s *quicRecvStream) AbortWithErrorCode(code uint64, reason string) error {
-	return s.CloseWithErrorCode(code, reason)
+func (s *quicRecvStream) CloseWithErrorCode(code uint64, reason string) error {
+	if s == nil || s.stream == nil {
+		return zmux.ErrSessionClosed
+	}
+	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
+	s.localReadClosed.Store(true)
+	s.storeLocalReadErr(appErr)
+	s.stream.CancelRead(quic.StreamErrorCode(code))
+	return nil
 }
 
 func (s *quicRecvStream) Close() error {
-	return s.CloseRead()
+	err := s.CloseRead()
+	if errors.Is(err, zmux.ErrReadClosed) {
+		return nil
+	}
+	return err
 }
 
 func (s *quicRecvStream) SetDeadline(t time.Time) error {
@@ -987,22 +1055,6 @@ func buildStreamPrelude(openPrefix []byte) ([]byte, error) {
 		return openPrefix, nil
 	}
 	return wire.EncodeVarint(0)
-}
-
-func writeAll(w io.Writer, payload []byte) error {
-	for len(payload) > 0 {
-		n, err := w.Write(payload)
-		if n > 0 {
-			payload = payload[n:]
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
 }
 
 func cloneBytes(src []byte) []byte {

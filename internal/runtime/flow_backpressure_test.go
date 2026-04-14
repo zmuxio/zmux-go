@@ -66,7 +66,7 @@ func TestProjectedExceedsThreshold(t *testing.T) {
 	if !ProjectedExceedsThreshold(7, 2, 8) {
 		t.Fatal("ProjectedExceedsThreshold(7, 2, 8) = false, want true")
 	}
-	if ProjectedExceedsThreshold(0, 9, 8) {
-		t.Fatal("ProjectedExceedsThreshold(0, 9, 8) = true, want false")
+	if !ProjectedExceedsThreshold(0, 9, 8) {
+		t.Fatal("ProjectedExceedsThreshold(0, 9, 8) = false, want true")
 	}
 }

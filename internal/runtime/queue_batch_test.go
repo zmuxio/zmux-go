@@ -36,6 +36,45 @@ func TestDequeuePreferUrgentAdvisoryOrder(t *testing.T) {
 			t.Fatalf("urgent-first dequeue = (%d,%v,%v), want (1, urgent, true)", got, lane, ok)
 		}
 	})
+
+	t.Run("closed advisory lane falls back to normal", func(t *testing.T) {
+		closed := make(chan struct{})
+		urgent := make(chan int)
+		advisory := make(chan int)
+		normal := make(chan int, 1)
+		close(advisory)
+		normal <- 7
+
+		if got, lane, ok := DequeuePreferUrgentAdvisory(closed, urgent, advisory, normal); !ok || lane != normal || got != 7 {
+			t.Fatalf("closed advisory dequeue = (%d,%v,%v), want (7, normal, true)", got, lane, ok)
+		}
+	})
+}
+
+func TestCollectReadyBatchIntoStopsOnClosedLane(t *testing.T) {
+	t.Parallel()
+
+	lane := make(chan int)
+	close(lane)
+
+	got := CollectReadyBatchInto([]int{1}, lane, 4, nil)
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("CollectReadyBatchInto closed lane = %v, want [1]", got)
+	}
+}
+
+func TestCollectAlternatingReadyBatchIntoStopsOnClosedLane(t *testing.T) {
+	t.Parallel()
+
+	primary := make(chan int)
+	secondary := make(chan int, 1)
+	close(primary)
+	secondary <- 2
+
+	got := CollectAlternatingReadyBatchInto([]int{1}, primary, secondary, false, 4, nil)
+	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("CollectAlternatingReadyBatchInto closed lane = %v, want [1 2]", got)
+	}
 }
 
 func TestFrameAndFramesBufferedBytes(t *testing.T) {

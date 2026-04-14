@@ -27,8 +27,9 @@ any extra shim object.
 - `CloseRead` maps to QUIC `CancelRead(CANCELLED)`.
 - `CloseWrite` maps to QUIC's send-side `Close`.
 - `Reset` maps to QUIC `CancelWrite`.
-- `Abort` is a best-effort local termination helper that
-  cancel both readable and writable directions with the same application code.
+- `CloseWithError` / `CloseWithErrorCode` are best-effort local termination
+  helpers that cancel the locally readable and writable directions with the
+  same application code.
 - QUIC stream / connection application errors are normalized to
   `*zmux.ApplicationError`.
 - QUIC stream-limit errors are normalized to `zmux.ErrOpenLimited`.

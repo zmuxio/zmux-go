@@ -73,11 +73,11 @@ func ShouldFlushStreamMaxData(idSet, localReceive bool, phase LocalOpenPhase, re
 	if !idSet || !localReceive {
 		return false, false
 	}
-	if phase.NeedsLocalOpener() {
-		return false, true
-	}
 	if readStopped || recvTerminal {
 		return false, false
+	}
+	if phase.AwaitingPeerVisibility() {
+		return false, true
 	}
 	return true, false
 }
@@ -86,11 +86,11 @@ func ShouldFlushStreamBlocked(idSet, localSend bool, phase LocalOpenPhase, sendH
 	if !idSet || !localSend {
 		return false, false
 	}
-	if phase.NeedsLocalOpener() {
-		return false, true
-	}
 	if sendHalf != SendHalfOpen {
 		return false, false
+	}
+	if phase.AwaitingPeerVisibility() {
+		return false, true
 	}
 	return true, false
 }

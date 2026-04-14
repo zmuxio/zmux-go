@@ -81,7 +81,12 @@ func ProvisionalAvailableCount(nextID, maxID uint64) int {
 	if nextID > maxID {
 		return 0
 	}
-	return int(((maxID - nextID) / 4) + 1)
+	count := ((maxID - nextID) / 4) + 1
+	maxInt := uint64(^uint(0) >> 1)
+	if count > maxInt {
+		return int(maxInt)
+	}
+	return int(count)
 }
 
 func PeerOpenRefusedByGoAway(streamID uint64, localGoAwayBidi, localGoAwayUni uint64) bool {

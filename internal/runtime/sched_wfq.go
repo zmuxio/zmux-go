@@ -93,7 +93,9 @@ func activeGroupSlice(state *BatchState, capHint int) []wfqActiveGroup {
 	if cap(state.scratch.activeGroups) < capHint {
 		state.scratch.activeGroups = make([]wfqActiveGroup, 0, capHint)
 	} else {
-		clear(state.scratch.activeGroups)
+		if cap(state.scratch.activeGroups) > 0 {
+			clear(state.scratch.activeGroups[:cap(state.scratch.activeGroups)])
+		}
 		state.scratch.activeGroups = state.scratch.activeGroups[:0]
 	}
 	return state.scratch.activeGroups

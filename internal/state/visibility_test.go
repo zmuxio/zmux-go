@@ -89,11 +89,19 @@ func TestPendingControlFlushPredicates(t *testing.T) {
 	}
 
 	phase = testPhase(true, true, false, false)
-	if flush, keep := ShouldFlushStreamMaxData(true, true, phase, false, false); !flush || keep {
-		t.Fatalf("stream MAX_DATA after opener commit = (%v,%v), want (true,false)", flush, keep)
+	if flush, keep := ShouldFlushStreamMaxData(true, true, phase, false, false); flush || !keep {
+		t.Fatalf("stream MAX_DATA while awaiting peer visibility = (%v,%v), want (false,true)", flush, keep)
 	}
-	if flush, keep := ShouldFlushStreamBlocked(true, true, phase, SendHalfOpen); !flush || keep {
-		t.Fatalf("stream BLOCKED after opener commit = (%v,%v), want (true,false)", flush, keep)
+	if flush, keep := ShouldFlushStreamBlocked(true, true, phase, SendHalfOpen); flush || !keep {
+		t.Fatalf("stream BLOCKED while awaiting peer visibility = (%v,%v), want (false,true)", flush, keep)
+	}
+
+	phase = testPhase(true, true, false, true)
+	if flush, keep := ShouldFlushStreamMaxData(true, true, phase, false, false); flush || !keep {
+		t.Fatalf("stream MAX_DATA while opener queued = (%v,%v), want (false,true)", flush, keep)
+	}
+	if flush, keep := ShouldFlushStreamBlocked(true, true, phase, SendHalfOpen); flush || !keep {
+		t.Fatalf("stream BLOCKED while opener queued = (%v,%v), want (false,true)", flush, keep)
 	}
 
 	if flush, keep := ShouldFlushPriorityUpdate(phase, SendHalfOpen); flush || !keep {
@@ -101,6 +109,12 @@ func TestPendingControlFlushPredicates(t *testing.T) {
 	}
 
 	phase = testPhase(true, true, true, false)
+	if flush, keep := ShouldFlushStreamMaxData(true, true, phase, false, false); !flush || keep {
+		t.Fatalf("stream MAX_DATA after peer visibility = (%v,%v), want (true,false)", flush, keep)
+	}
+	if flush, keep := ShouldFlushStreamBlocked(true, true, phase, SendHalfOpen); !flush || keep {
+		t.Fatalf("stream BLOCKED after peer visibility = (%v,%v), want (true,false)", flush, keep)
+	}
 	if flush, keep := ShouldFlushPriorityUpdate(phase, SendHalfOpen); !flush || keep {
 		t.Fatalf("PRIORITY_UPDATE after peer visibility = (%v,%v), want (true,false)", flush, keep)
 	}

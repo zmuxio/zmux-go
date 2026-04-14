@@ -111,7 +111,13 @@ func stopTimer(timer *time.Timer) {
 func CollectReadyBatchInto[T any](batch []T, lane <-chan T, max int, order func([]T) []T) []T {
 	for len(batch) < max {
 		select {
-		case req := <-lane:
+		case req, ok := <-lane:
+			if !ok {
+				if order != nil {
+					return order(batch)
+				}
+				return batch
+			}
 			batch = append(batch, req)
 		default:
 			if order != nil {
@@ -130,18 +136,32 @@ func CollectAlternatingReadyBatchInto[T any](batch []T, primary <-chan T, second
 	for len(batch) < max {
 		if preferSecondary {
 			select {
-			case req := <-secondary:
+			case req, ok := <-secondary:
+				if !ok {
+					secondary = nil
+					break
+				}
 				batch = append(batch, req)
 				preferSecondary = false
 				continue
 			default:
 			}
 			select {
-			case req := <-primary:
+			case req, ok := <-primary:
+				if !ok {
+					primary = nil
+					break
+				}
 				batch = append(batch, req)
 				preferSecondary = true
 				continue
 			default:
+				if primary == nil && secondary == nil {
+					if order != nil {
+						return order(batch)
+					}
+					return batch
+				}
 				if order != nil {
 					return order(batch)
 				}
@@ -150,18 +170,32 @@ func CollectAlternatingReadyBatchInto[T any](batch []T, primary <-chan T, second
 		}
 
 		select {
-		case req := <-primary:
+		case req, ok := <-primary:
+			if !ok {
+				primary = nil
+				break
+			}
 			batch = append(batch, req)
 			preferSecondary = true
 			continue
 		default:
 		}
 		select {
-		case req := <-secondary:
+		case req, ok := <-secondary:
+			if !ok {
+				secondary = nil
+				break
+			}
 			batch = append(batch, req)
 			preferSecondary = false
 			continue
 		default:
+			if primary == nil && secondary == nil {
+				if order != nil {
+					return order(batch)
+				}
+				return batch
+			}
 			if order != nil {
 				return order(batch)
 			}
@@ -177,33 +211,63 @@ func CollectAlternatingReadyBatchInto[T any](batch []T, primary <-chan T, second
 func DequeuePreferUrgentAdvisory[T any](closed <-chan struct{}, urgent <-chan T, advisory <-chan T, normal <-chan T) (T, <-chan T, bool) {
 	var zero T
 
-	select {
-	case <-closed:
-		return zero, nil, false
-	case req := <-urgent:
-		return req, urgent, true
-	default:
-	}
+	for {
+		select {
+		case <-closed:
+			return zero, nil, false
+		case req, ok := <-urgent:
+			if !ok {
+				urgent = nil
+				break
+			}
+			return req, urgent, true
+		default:
+		}
 
-	select {
-	case <-closed:
-		return zero, nil, false
-	case req := <-urgent:
-		return req, urgent, true
-	case req := <-advisory:
-		return req, advisory, true
-	default:
-	}
+		select {
+		case <-closed:
+			return zero, nil, false
+		case req, ok := <-urgent:
+			if !ok {
+				urgent = nil
+				break
+			}
+			return req, urgent, true
+		case req, ok := <-advisory:
+			if !ok {
+				advisory = nil
+				break
+			}
+			return req, advisory, true
+		default:
+		}
 
-	select {
-	case <-closed:
-		return zero, nil, false
-	case req := <-urgent:
-		return req, urgent, true
-	case req := <-advisory:
-		return req, advisory, true
-	case req := <-normal:
-		return req, normal, true
+		if urgent == nil && advisory == nil && normal == nil {
+			return zero, nil, false
+		}
+
+		select {
+		case <-closed:
+			return zero, nil, false
+		case req, ok := <-urgent:
+			if !ok {
+				urgent = nil
+				continue
+			}
+			return req, urgent, true
+		case req, ok := <-advisory:
+			if !ok {
+				advisory = nil
+				continue
+			}
+			return req, advisory, true
+		case req, ok := <-normal:
+			if !ok {
+				normal = nil
+				continue
+			}
+			return req, normal, true
+		}
 	}
 }
 

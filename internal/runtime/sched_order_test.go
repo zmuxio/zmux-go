@@ -493,29 +493,42 @@ func TestActiveGroupSliceClearsRetainedNestedReferences(t *testing.T) {
 	t.Parallel()
 
 	state := &BatchState{}
-	state.scratch.activeGroups = []wfqActiveGroup{{
+	state.scratch.activeGroups = make([]wfqActiveGroup, 1, 3)
+	state.scratch.activeGroups[0] = wfqActiveGroup{
 		queues:  map[uint64][]int{4: {0, 1}},
 		streams: []uint64{4, 8},
 		hasTop:  true,
-	}}
+	}
+	backing := state.scratch.activeGroups[:cap(state.scratch.activeGroups)]
+	backing[1] = wfqActiveGroup{
+		queues:  map[uint64][]int{9: {2}},
+		streams: []uint64{9},
+		hasTop:  true,
+	}
+	backing[2] = wfqActiveGroup{
+		queues:  map[uint64][]int{10: {3}},
+		streams: []uint64{10},
+		hasTop:  true,
+	}
 
 	got := activeGroupSlice(state, 1)
 	if len(got) != 0 {
 		t.Fatalf("active group scratch len = %d, want 0", len(got))
 	}
 
-	backing := state.scratch.activeGroups[:cap(state.scratch.activeGroups)]
 	if len(backing) == 0 {
 		t.Fatal("expected retained scratch backing")
 	}
-	if backing[0].queues != nil {
-		t.Fatalf("active group scratch retained queues: %#v", backing[0].queues)
-	}
-	if backing[0].streams != nil {
-		t.Fatalf("active group scratch retained streams: %#v", backing[0].streams)
-	}
-	if backing[0].hasTop {
-		t.Fatal("active group scratch retained top marker")
+	for i := range backing {
+		if backing[i].queues != nil {
+			t.Fatalf("active group scratch[%d] retained queues: %#v", i, backing[i].queues)
+		}
+		if backing[i].streams != nil {
+			t.Fatalf("active group scratch[%d] retained streams: %#v", i, backing[i].streams)
+		}
+		if backing[i].hasTop {
+			t.Fatalf("active group scratch[%d] retained top marker", i)
+		}
 	}
 }
 

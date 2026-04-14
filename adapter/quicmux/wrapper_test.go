@@ -21,45 +21,7 @@ import (
 )
 
 func TestQUICSessionContract(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	serverTLS, clientTLS := testTLSConfigs(t)
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, nil)
-	if err != nil {
-		t.Fatalf("ListenAddr err = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = listener.Close()
-	})
-
-	type acceptResult struct {
-		conn *quic.Conn
-		err  error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		conn, err := listener.Accept(ctx)
-		acceptCh <- acceptResult{conn: conn, err: err}
-	}()
-
-	clientConn, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, nil)
-	if err != nil {
-		t.Fatalf("DialAddr err = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = clientConn.CloseWithError(0, "")
-	})
-
-	serverResult := <-acceptCh
-	if serverResult.err != nil {
-		t.Fatalf("Accept err = %v", serverResult.err)
-	}
-	t.Cleanup(func() {
-		_ = serverResult.conn.CloseWithError(0, "")
-	})
-
-	adaptertest.RunSessionContract(t, WrapSession(clientConn), WrapSession(serverResult.conn))
+	adaptertest.RunSessionContract(t, newWrappedPair)
 }
 
 func TestWrapSessionNilIsClosedSafeSession(t *testing.T) {
@@ -332,17 +294,27 @@ func TestWrapSessionUpdateMetadataAfterVisibilityUnavailable(t *testing.T) {
 	_ = stream.Close()
 }
 
-func TestWrapSessionAcceptStreamSkipsStalledPrelude(t *testing.T) {
-	client, server := newWrappedPair(t)
+func TestWrapSessionAcceptStreamPreservesOrderAcrossStalledPreludeTimeout(t *testing.T) {
+	clientConn, serverConn := newQUICConnPair(t)
+	client := WrapSession(clientConn)
+	server := WrapSession(serverConn)
+
+	prevTimeout := acceptedPreludeReadTimeout
+	acceptedPreludeReadTimeout = 100 * time.Millisecond
+	t.Cleanup(func() {
+		acceptedPreludeReadTimeout = prevTimeout
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	stalled, err := client.OpenStream(ctx)
+	stalled, err := clientConn.OpenStreamSync(ctx)
 	if err != nil {
-		t.Fatalf("OpenStream stalled err = %v", err)
+		t.Fatalf("raw OpenStreamSync stalled err = %v", err)
 	}
 	t.Cleanup(func() {
+		stalled.CancelRead(0)
+		stalled.CancelWrite(0)
 		_ = stalled.Close()
 	})
 
@@ -357,9 +329,17 @@ func TestWrapSessionAcceptStreamSkipsStalledPrelude(t *testing.T) {
 		t.Fatalf("ready Write err = %v", err)
 	}
 
+	firstAccepted, err := server.AcceptStream(ctx)
+	if err == nil {
+		t.Fatalf("first AcceptStream = (%v, nil), want protocol error", firstAccepted)
+	}
+	if !zmux.IsErrorCode(err, zmux.CodeProtocol) {
+		t.Fatalf("first AcceptStream err = %v, want protocol error", err)
+	}
+
 	accepted, err := server.AcceptStream(ctx)
 	if err != nil {
-		t.Fatalf("AcceptStream err = %v", err)
+		t.Fatalf("second AcceptStream err = %v", err)
 	}
 	if accepted.StreamID() != ready.StreamID() {
 		t.Fatalf("accepted StreamID = %d, want %d", accepted.StreamID(), ready.StreamID())
@@ -374,6 +354,118 @@ func TestWrapSessionAcceptStreamSkipsStalledPrelude(t *testing.T) {
 	}
 
 	_ = accepted.Close()
+}
+
+func TestWrapSessionResetMakesLocalWriteFailImmediately(t *testing.T) {
+	client, _ := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if err := stream.Reset(44); err != nil {
+		t.Fatalf("Reset err = %v", err)
+	}
+	if _, err := stream.Write([]byte("x")); err == nil {
+		t.Fatal("Write after Reset err = nil, want application error")
+	} else {
+		var appErr *zmux.ApplicationError
+		if !errors.As(err, &appErr) || appErr.Code != 44 {
+			t.Fatalf("Write after Reset err = %v, want ApplicationError(44)", err)
+		}
+	}
+}
+
+func TestWrapSessionCloseWithErrorMakesLocalBidiOpsFailImmediately(t *testing.T) {
+	client, _ := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if err := stream.CloseWithErrorCode(55, "bye"); err != nil {
+		t.Fatalf("CloseWithErrorCode err = %v", err)
+	}
+	if _, err := stream.Read(make([]byte, 1)); err == nil {
+		t.Fatal("Read after CloseWithErrorCode err = nil, want application error")
+	} else {
+		var appErr *zmux.ApplicationError
+		if !errors.As(err, &appErr) || appErr.Code != 55 || appErr.Reason != "bye" {
+			t.Fatalf("Read after CloseWithErrorCode err = %v, want ApplicationError(55, \"bye\")", err)
+		}
+	}
+	if _, err := stream.Write([]byte("x")); err == nil {
+		t.Fatal("Write after CloseWithErrorCode err = nil, want application error")
+	} else {
+		var appErr *zmux.ApplicationError
+		if !errors.As(err, &appErr) || appErr.Code != 55 || appErr.Reason != "bye" {
+			t.Fatalf("Write after CloseWithErrorCode err = %v, want ApplicationError(55, \"bye\")", err)
+		}
+	}
+}
+
+func TestWrapSessionCloseWithErrorMakesLocalSendWriteFailImmediately(t *testing.T) {
+	client, _ := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := client.OpenUniStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenUniStream err = %v", err)
+	}
+	if err := stream.CloseWithErrorCode(66, "bye"); err != nil {
+		t.Fatalf("CloseWithErrorCode err = %v", err)
+	}
+	if _, err := stream.Write([]byte("x")); err == nil {
+		t.Fatal("Write after CloseWithErrorCode err = nil, want application error")
+	} else {
+		var appErr *zmux.ApplicationError
+		if !errors.As(err, &appErr) || appErr.Code != 66 || appErr.Reason != "bye" {
+			t.Fatalf("Write after CloseWithErrorCode err = %v, want ApplicationError(66, \"bye\")", err)
+		}
+	}
+}
+
+func TestEnsureOpenPreludeResumesAfterPartialWriteError(t *testing.T) {
+	writer := &partialPreludeWriter{
+		failAfter: 3,
+		failErr:   io.ErrUnexpectedEOF,
+	}
+	base := &quicStreamBase{}
+	priority := uint64(7)
+	group := uint64(9)
+	initLocalStreamBase(base, nil, nil, writer, zmux.OpenOptions{
+		InitialPriority: &priority,
+		InitialGroup:    &group,
+		OpenInfo:        []byte("ssh"),
+	})
+
+	prelude, err := base.prepareOpenPrelude()
+	if err != nil {
+		t.Fatalf("prepareOpenPrelude err = %v", err)
+	}
+	if err := base.ensureOpenPrelude(); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("first ensureOpenPrelude err = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+	if err := base.ensureOpenPrelude(); err != nil {
+		t.Fatalf("second ensureOpenPrelude err = %v", err)
+	}
+	if got := writer.Bytes(); !bytes.Equal(got, prelude) {
+		t.Fatalf("written prelude = %x, want %x", got, prelude)
+	}
+	if base.preludeOffset != len(prelude) {
+		t.Fatalf("preludeOffset = %d, want %d", base.preludeOffset, len(prelude))
+	}
+	if !base.preludeSent {
+		t.Fatal("preludeSent = false, want true")
+	}
 }
 
 func TestWrapSessionCloseReadReturnsErrReadClosedLocally(t *testing.T) {
@@ -505,6 +597,13 @@ func TestWrapSessionUniOpenMetadataVisibleOnAccept(t *testing.T) {
 func newWrappedPair(t *testing.T) (zmux.Session, zmux.Session) {
 	t.Helper()
 
+	clientConn, serverConn := newQUICConnPair(t)
+	return WrapSession(clientConn), WrapSession(serverConn)
+}
+
+func newQUICConnPair(t *testing.T) (*quic.Conn, *quic.Conn) {
+	t.Helper()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	t.Cleanup(cancel)
 
@@ -543,7 +642,29 @@ func newWrappedPair(t *testing.T) (zmux.Session, zmux.Session) {
 		_ = serverResult.conn.CloseWithError(0, "")
 	})
 
-	return WrapSession(clientConn), WrapSession(serverResult.conn)
+	return clientConn, serverResult.conn
+}
+
+type partialPreludeWriter struct {
+	bytes.Buffer
+	failAfter int
+	failErr   error
+	failed    bool
+}
+
+func (w *partialPreludeWriter) Write(p []byte) (int, error) {
+	if !w.failed && w.failAfter > 0 {
+		n := w.failAfter
+		if n > len(p) {
+			n = len(p)
+		}
+		if n > 0 {
+			_, _ = w.Buffer.Write(p[:n])
+		}
+		w.failed = true
+		return n, w.failErr
+	}
+	return w.Buffer.Write(p)
 }
 
 func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
