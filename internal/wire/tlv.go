@@ -1,5 +1,7 @@
 package wire
 
+import "errors"
+
 type TLV struct {
 	Type  uint64
 	Value []byte
@@ -25,6 +27,10 @@ func ParseTLVs(src []byte) ([]TLV, error) {
 	return parseTLVs(src, true)
 }
 
+func ParseTLVsView(src []byte) ([]TLV, error) {
+	return parseTLVs(src, false)
+}
+
 func parseTLVsView(src []byte) ([]TLV, error) {
 	return parseTLVs(src, false)
 }
@@ -33,12 +39,18 @@ func walkTLVs(src []byte, visit tlvVisitor) error {
 	for len(src) > 0 {
 		typ, nType, err := ParseVarint(src)
 		if err != nil {
-			return ErrTruncatedTLV
+			if errors.Is(err, ErrTruncatedVarint) {
+				return ErrTruncatedTLV
+			}
+			return err
 		}
 		src = src[nType:]
 		length, nLen, err := ParseVarint(src)
 		if err != nil {
-			return ErrTruncatedTLV
+			if errors.Is(err, ErrTruncatedVarint) {
+				return ErrTruncatedTLV
+			}
+			return err
 		}
 		src = src[nLen:]
 		if uint64(len(src)) < length {

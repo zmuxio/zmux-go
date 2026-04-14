@@ -47,6 +47,27 @@ func TestParseStreamMetadataTLVsRejectsDuplicateSingleton(t *testing.T) {
 	}
 }
 
+func TestParseStreamMetadataTLVsViewAliasesOpenInfo(t *testing.T) {
+	t.Parallel()
+
+	tlvs := []TLV{
+		{Type: uint64(MetadataOpenInfo), Value: []byte("ssh")},
+	}
+
+	parsed, ok, err := ParseStreamMetadataTLVsView(tlvs)
+	if err != nil {
+		t.Fatalf("ParseStreamMetadataTLVsView err = %v", err)
+	}
+	if !ok {
+		t.Fatal("ParseStreamMetadataTLVsView ok = false, want true")
+	}
+
+	tlvs[0].Value[2] = 'x'
+	if !bytes.Equal(parsed.OpenInfo, []byte("ssx")) {
+		t.Fatalf("OpenInfo after source mutation = %q, want %q", parsed.OpenInfo, "ssx")
+	}
+}
+
 func TestParseDataPayloadRetainsOpenInfoAfterSourceMutation(t *testing.T) {
 	t.Parallel()
 

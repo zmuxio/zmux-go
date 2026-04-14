@@ -79,7 +79,10 @@ func ParseFrame(src []byte, limits Limits) (Frame, int, error) {
 		return Frame{}, 0, WrapError(CodeProtocol, "parse frame code", ErrInvalidFrameType)
 	}
 
-	total := n + int(frameLen)
+	total, err := frameTotalLen(frameLen, n)
+	if err != nil {
+		return Frame{}, 0, err
+	}
 	frame, err := parseBufferedFrame(src, frameLen, n, total, code, frameType, flags, limits)
 	if err != nil {
 		return Frame{}, 0, err
@@ -141,7 +144,10 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 		return Frame{}, dst, nil, FrameSizeError("read frame_length", ErrShortFrame)
 	}
 
-	total := n + int(frameLen)
+	total, err := frameTotalLen(frameLen, n)
+	if err != nil {
+		return Frame{}, dst, nil, err
+	}
 	var handle *FrameReadBufferHandle
 	if cap(dst) < total {
 		dst, handle = acquireFrameReadBuffer(total)
@@ -168,6 +174,17 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 		return Frame{}, dst, handle, err
 	}
 	return frame, dst, handle, nil
+}
+
+func frameTotalLen(frameLen uint64, n int) (int, error) {
+	maxInt := int(^uint(0) >> 1)
+	if n < 0 || n > maxInt {
+		return 0, FrameSizeError("parse frame_length", ErrPayloadTooLarge)
+	}
+	if frameLen > uint64(maxInt-n) {
+		return 0, FrameSizeError("parse frame_length", ErrPayloadTooLarge)
+	}
+	return n + int(frameLen), nil
 }
 
 func ReadFrame(r io.Reader, limits Limits) (Frame, error) {

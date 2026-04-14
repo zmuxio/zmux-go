@@ -1,6 +1,9 @@
 package wire
 
-import "unicode/utf8"
+import (
+	"errors"
+	"unicode/utf8"
+)
 
 func BuildOpenMetadataPrefix(caps Capabilities, priority *uint64, group *uint64, openInfo []byte, maxFramePayload uint64) ([]byte, error) {
 	return AppendOpenMetadataPrefix(nil, caps, priority, group, openInfo, maxFramePayload)
@@ -217,13 +220,19 @@ func ParseDIAGReason(payload []byte) (string, error) {
 	for len(payload) > 0 {
 		typ, nType, err := ParseVarint(payload)
 		if err != nil {
-			return "", ErrTruncatedTLV
+			if errors.Is(err, ErrTruncatedVarint) {
+				return "", ErrTruncatedTLV
+			}
+			return "", err
 		}
 		payload = payload[nType:]
 
 		length, nLen, err := ParseVarint(payload)
 		if err != nil {
-			return "", ErrTruncatedTLV
+			if errors.Is(err, ErrTruncatedVarint) {
+				return "", ErrTruncatedTLV
+			}
+			return "", err
 		}
 		payload = payload[nLen:]
 		if uint64(len(payload)) < length {

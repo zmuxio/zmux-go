@@ -1029,11 +1029,11 @@ func readAcceptedStreamMetadata(reader *bufio.Reader) (acceptedStreamMetadata, e
 		return acceptedStreamMetadata{}, protocolPreludeErr("read stream metadata", err)
 	}
 
-	tlvs, err := wire.ParseTLVs(payload)
+	tlvs, err := wire.ParseTLVsView(payload)
 	if err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("parse stream metadata tlvs", err)
 	}
-	parsed, ok, err := wire.ParseStreamMetadataTLVs(tlvs)
+	parsed, ok, err := wire.ParseStreamMetadataTLVsView(tlvs)
 	if err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("parse stream metadata", err)
 	}
