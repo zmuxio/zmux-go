@@ -31,7 +31,8 @@ session := quicmux.WrapSessionWithOptions(qconn, quicmux.SessionOptions{
 
 ## Stable API Coverage
 
-The wrapper returns the stable `zmux.Session` surface, so callers use the same methods as other adapters or native `AsSession(...)` values:
+The wrapper returns the stable `zmux.Session` surface, so callers use the same methods as other adapters or native
+`AsSession(...)` values:
 
 - `AcceptStream` / `AcceptUniStream`
 - `OpenStream` / `OpenUniStream`
@@ -56,7 +57,8 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
 - `CancelRead(code)` maps to QUIC `CancelRead(code)`
 - `CloseWrite` maps to QUIC send-side `Close`
 - `CancelWrite(code)` maps to QUIC `CancelWrite(code)`
-- `CloseWithError(code, reason)` is best-effort: bidirectional streams cancel both local directions; unidirectional streams cancel only the locally meaningful direction QUIC exposes
+- `CloseWithError(code, reason)` is best-effort: bidirectional streams cancel both local directions; unidirectional
+  streams cancel only the locally meaningful direction QUIC exposes
 - `Closed()` reports whether the wrapped QUIC connection context has terminated
 - `Accept*` and `Open*` treat `nil` contexts as `context.Background()`
 
@@ -69,22 +71,26 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
 - `OpenInfo()` and `Metadata()` expose decoded opener metadata on accepted streams
 - `UpdateMetadata(...)` works only before the prelude is emitted
 
-Once the prelude is emitted, further metadata updates are not representable on the QUIC wire. The adapter returns `errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.
+Once the prelude is emitted, further metadata updates are not representable on the QUIC wire. The adapter returns
+`errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.
 
 ## Errors
 
 - QUIC stream and connection application errors are normalized to `*zmux.ApplicationError`
 - QUIC stream-limit errors are normalized to `zmux.ErrOpenLimited`
-- QUIC idle, stateless-reset, version-negotiation, and local no-error close conditions are normalized to `zmux.ErrSessionClosed`
+- QUIC idle, stateless-reset, version-negotiation, and local no-error close conditions are normalized to
+  `zmux.ErrSessionClosed`
 - connection-level QUIC closes preserve code and reason text
 - stream-level QUIC cancellations preserve only the numeric application code
 
 ## Unsupported Or Reduced Behavior
 
-- native zmux session helpers such as `Ping`, `GoAway`, `PeerGoAwayError`, `PeerCloseError`, `LocalPreface`, `PeerPreface`, and `Negotiated`
+- native zmux session helpers such as `Ping`, `GoAway`, `PeerGoAwayError`, `PeerCloseError`, `LocalPreface`,
+  `PeerPreface`, and `Negotiated`
 - native stream queries such as `OpenedLocally`, `Bidirectional`, `ReadClosed`, and `WriteClosed`
 - post-open native advisory frames such as `PRIORITY_UPDATE`
-- detailed runtime counters in `Stats()`: the adapter only reports coarse session state because `quic-go` does not expose matching mux internals
+- detailed runtime counters in `Stats()`: the adapter only reports coarse session state because `quic-go` does not
+  expose matching mux internals
 
 ## Non-goals
 

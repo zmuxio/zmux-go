@@ -179,7 +179,8 @@ type NativeSession interface {
 }
 ```
 
-`NativeStream`, `NativeSendStream`, and `NativeRecvStream` extend the stable stream interfaces with local/native queries:
+`NativeStream`, `NativeSendStream`, and `NativeRecvStream` extend the stable stream interfaces with local/native
+queries:
 
 ```go
 type NativeStream interface {
@@ -298,7 +299,8 @@ err := stream.UpdateMetadata(zmux.MetadataUpdate{
 })
 ```
 
-If metadata can no longer be represented on the wire, the call returns an error such as `zmux.ErrPriorityUpdateUnavailable` or `zmux.ErrAdapterUnsupported`.
+If metadata can no longer be represented on the wire, the call returns an error such as
+`zmux.ErrPriorityUpdateUnavailable` or `zmux.ErrAdapterUnsupported`.
 
 ## Stream Close And Cancel
 
@@ -332,7 +334,8 @@ if err := stream.CloseWithError(uint64(zmux.CodeInternal), "backend failed"); er
 }
 ```
 
-Native zmux treats whole-stream abort as a first-class operation on bidirectional and unidirectional streams, so `CloseWithError` exists on `Stream`, `SendStream`, and `RecvStream`.
+Native zmux treats whole-stream abort as a first-class operation on bidirectional and unidirectional streams, so
+`CloseWithError` exists on `Stream`, `SendStream`, and `RecvStream`.
 
 ## Deadlines
 
@@ -427,7 +430,8 @@ Common surface errors include:
 
 ## Configuration
 
-Pass `*zmux.Config` to control capabilities, settings, keepalive, close timeouts, queue budgets, memory budgets, and event hooks:
+Pass `*zmux.Config` to control capabilities, settings, keepalive, close timeouts, queue budgets, memory budgets, and
+event hooks:
 
 ```go
 cfg := &zmux.Config{
@@ -464,4 +468,5 @@ var qconn *quic.Conn
 session := quicmux.WrapSession(qconn)
 ```
 
-It implements the stable `zmux.Session` surface and maps the supported subset of metadata and termination semantics onto `quic-go`. See `adapter/quicmux/README.md` for adapter details.
+It implements the stable `zmux.Session` surface and maps the supported subset of metadata and termination semantics onto
+`quic-go`. See `adapter/quicmux/README.md` for adapter details.
