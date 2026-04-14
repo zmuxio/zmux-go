@@ -1594,7 +1594,7 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 }
 
 const sessionGoAwayDrainInterval = 10 * time.Millisecond
-const sessionGracefulCloseDrainTimeout = 25 * time.Millisecond
+const sessionGracefulCloseDrainTimeout = 100 * time.Millisecond
 const writerLaneBuffer = 128
 const advisoryLaneBuffer = 32
 

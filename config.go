@@ -260,7 +260,10 @@ type Config struct {
 	StopSendingGracefulTailCap uint64
 	// GracefulCloseDrainTimeout overrides the repository-default bounded
 	// graceful-close drain wait before Close reports timeout to the caller.
-	// Zero uses the repository default.
+	// This bounds how long Close will keep waiting for already-visible local
+	// streams and provisionals to converge after GOAWAY, so it should usually be
+	// tuned from application shutdown behavior rather than raw RTT alone. Zero
+	// uses the repository default.
 	GracefulCloseDrainTimeout time.Duration
 
 	// EventHandler receives lightweight connection/stream lifecycle notifications.

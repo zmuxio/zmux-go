@@ -344,13 +344,15 @@ Pass a `*zmux.Config` to constructors to customize behavior such as:
 - negotiated capabilities
 - local settings / limits
 - keepalive behavior
+- graceful close / STOP_SENDING drain windows
 - queue budgets and backlog limits
 - event handling
 - memory and control buffering budgets
 
 ```go
 cfg := &zmux.Config{
-	KeepaliveInterval: 15 * time.Second,
+	KeepaliveInterval:         15 * time.Second,
+	GracefulCloseDrainTimeout: 100 * time.Millisecond,
 	EventHandler: func(ev zmux.Event) {
 		// observe stream/session lifecycle
 	},
@@ -358,6 +360,14 @@ cfg := &zmux.Config{
 
 session, err := zmux.New(rawConn, cfg)
 ```
+
+`GracefulCloseDrainTimeout` should normally be picked from shutdown behavior,
+not just RTT:
+
+- `25-100ms` for low-latency intra-DC request/response traffic
+- `100-500ms` for typical service meshes and moderate fan-out
+- higher values only when graceful shutdown must give active streams more time
+  to finish before falling back to a bounded timeout
 
 ## Joined Read/Write Halves
 
