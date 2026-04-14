@@ -197,7 +197,7 @@ Use the canonical stream termination methods:
 
 - `CloseWrite()` for send-half graceful finish
 - `WriteFinal(...)` / `WritevFinal(...)` to send final bytes and finish in one call
-- `CloseRead()` to stop reading
+- `CloseRead()` / `CloseReadWithCode(code)` to stop reading
 - `Close()` to close both local halves when they exist
 
 ```go
@@ -215,25 +215,35 @@ if err := stream.CloseRead(); err != nil {
 Use:
 
 - `Reset(code)` to abort the local write side
-- `Abort()` to abort the whole bidirectional stream with the default cancelled code
+- `CloseWithError(err)` / `CloseWithErrorCode(code, reason)` as the preferred
+  whole-stream abortive helpers
+- `Abort()` / `AbortWithError(...)` / `AbortWithErrorCode(...)` as compatibility
+  aliases for the same whole-stream abortive semantics
 
 ```go
 if err := stream.Reset(uint64(zmux.CodeCancelled)); err != nil {
+	return err
+}
+
+if err := stream.CloseWithErrorCode(uint64(zmux.CodeInternal), "backend failed"); err != nil {
 	return err
 }
 ```
 
 ## Native Stream Extensions
 
-The stable `zmux.Stream` / `zmux.SendStream` / `zmux.RecvStream` interfaces keep
-only the canonical operations above. If you use native constructors that return
-`*zmux.Conn`, the exported native stream types also expose richer variants:
+The stable `zmux.Stream` / `zmux.SendStream` / `zmux.RecvStream` interfaces
+already expose the repository-default close, reset, read-stop, and whole-stream
+abort helpers. If you use native constructors that return `*zmux.Conn`, the
+exported native stream types also expose richer native variants:
 
 - `(*zmux.NativeStream).CloseReadWithCode(code)`
 - `(*zmux.NativeStream).ResetWithReason(code, reason)`
-- `(*zmux.NativeStream).AbortWithErrorCode(code, reason)`
+- `(*zmux.NativeStream).CloseWithErrorCode(code, reason)`
 - `(*zmux.NativeSendStream).ResetWithReason(code, reason)`
 - `(*zmux.NativeRecvStream).CloseReadWithCode(code)`
+- `Abort*` remains available everywhere as compatibility aliases for
+  `CloseWithError*`
 
 Example:
 
@@ -248,7 +258,7 @@ if err != nil {
 	return err
 }
 
-if err := stream.AbortWithErrorCode(uint64(zmux.CodeInternal), "backend failed"); err != nil {
+if err := stream.CloseWithErrorCode(uint64(zmux.CodeInternal), "backend failed"); err != nil {
 	return err
 }
 ```

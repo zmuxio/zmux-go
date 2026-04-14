@@ -1963,7 +1963,7 @@ func TestCloseWithErrorOnConcreteLocalIDQueuesOpeningAbort(t *testing.T) {
 	c.appendUnseenLocalLocked(stream)
 	c.mu.Unlock()
 
-	if err := stream.AbortWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("CloseWithErrorCode err = %v, want nil", err)
 	}
 
@@ -1993,6 +1993,76 @@ func TestCloseWithErrorOnConcreteLocalIDQueuesOpeningAbort(t *testing.T) {
 	}
 	if stream.sendAbort == nil || stream.sendAbort.Code != uint64(CodeInternal) {
 		t.Fatalf("sendAbort = %v, want code %d", stream.sendAbort, uint64(CodeInternal))
+	}
+}
+
+func TestAbortAliasesPreferredCloseWithErrorMethods(t *testing.T) {
+	t.Parallel()
+
+	queueAbort := func(t *testing.T, invoke func(*nativeStream) error) Frame {
+		t.Helper()
+
+		c, frames, stop := newInvalidFrameConn(t, 0)
+		t.Cleanup(stop)
+
+		stream := seedStateFixtureStream(t, c, state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), "bidi", "local_owned", stateHalfExpect{
+			SendHalf: "send_open",
+			RecvHalf: "recv_open",
+		})
+
+		if err := invoke(stream); err != nil {
+			t.Fatalf("invoke err = %v", err)
+		}
+		return awaitQueuedFrame(t, frames)
+	}
+
+	cancelAlias := queueAbort(t, func(stream *nativeStream) error {
+		return stream.Abort()
+	})
+	cancelPreferred := queueAbort(t, func(stream *nativeStream) error {
+		return stream.CloseWithErrorCode(uint64(CodeCancelled), "")
+	})
+	if cancelAlias.Type != cancelPreferred.Type {
+		t.Fatalf("Abort frame type = %v, want %v", cancelAlias.Type, cancelPreferred.Type)
+	}
+	if cancelAlias.StreamID != cancelPreferred.StreamID {
+		t.Fatalf("Abort stream-id = %d, want %d", cancelAlias.StreamID, cancelPreferred.StreamID)
+	}
+	if !bytes.Equal(cancelAlias.Payload, cancelPreferred.Payload) {
+		t.Fatalf("Abort payload = %x, want %x", cancelAlias.Payload, cancelPreferred.Payload)
+	}
+
+	appErr := &ApplicationError{Code: uint64(CodeInternal), Reason: "backend failed"}
+	errorAlias := queueAbort(t, func(stream *nativeStream) error {
+		return stream.AbortWithError(appErr)
+	})
+	errorPreferred := queueAbort(t, func(stream *nativeStream) error {
+		return stream.CloseWithError(appErr)
+	})
+	if errorAlias.Type != errorPreferred.Type {
+		t.Fatalf("AbortWithError frame type = %v, want %v", errorAlias.Type, errorPreferred.Type)
+	}
+	if errorAlias.StreamID != errorPreferred.StreamID {
+		t.Fatalf("AbortWithError stream-id = %d, want %d", errorAlias.StreamID, errorPreferred.StreamID)
+	}
+	if !bytes.Equal(errorAlias.Payload, errorPreferred.Payload) {
+		t.Fatalf("AbortWithError payload = %x, want %x", errorAlias.Payload, errorPreferred.Payload)
+	}
+
+	codeAlias := queueAbort(t, func(stream *nativeStream) error {
+		return stream.AbortWithErrorCode(55, "bye")
+	})
+	codePreferred := queueAbort(t, func(stream *nativeStream) error {
+		return stream.CloseWithErrorCode(55, "bye")
+	})
+	if codeAlias.Type != codePreferred.Type {
+		t.Fatalf("AbortWithErrorCode frame type = %v, want %v", codeAlias.Type, codePreferred.Type)
+	}
+	if codeAlias.StreamID != codePreferred.StreamID {
+		t.Fatalf("AbortWithErrorCode stream-id = %d, want %d", codeAlias.StreamID, codePreferred.StreamID)
+	}
+	if !bytes.Equal(codeAlias.Payload, codePreferred.Payload) {
+		t.Fatalf("AbortWithErrorCode payload = %x, want %x", codeAlias.Payload, codePreferred.Payload)
 	}
 }
 
@@ -5295,7 +5365,7 @@ func TestStructuredErrorAfterPeerAbortWrite(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.AbortWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
+	if err := serverStream.CloseWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
 		t.Fatalf("server abort: %v", err)
 	}
 
@@ -5511,7 +5581,7 @@ func TestStreamCloseWithErrorCodeTruncatesReasonTextToControlLimit(t *testing.T)
 	c.registry.streams[4] = stream
 
 	reason := "abcdefghijklmnopqrst"
-	if err := stream.AbortWithErrorCode(uint64(CodeRefusedStream), reason); err != nil {
+	if err := stream.CloseWithErrorCode(uint64(CodeRefusedStream), reason); err != nil {
 		t.Fatalf("close with long reason: %v", err)
 	}
 
@@ -5586,7 +5656,7 @@ func TestStreamCloseWithErrorCodePreservesUTF8BoundaryWhenTruncating(t *testing.
 	c.registry.streams[4] = stream
 
 	reason := "😀😀😀"
-	if err := stream.AbortWithErrorCode(uint64(CodeInternal), reason); err != nil {
+	if err := stream.CloseWithErrorCode(uint64(CodeInternal), reason); err != nil {
 		t.Fatalf("close with utf8 reason: %v", err)
 	}
 

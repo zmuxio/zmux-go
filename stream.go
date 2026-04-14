@@ -199,6 +199,20 @@ func (s *nativeSendStream) ResetWithReason(code uint64, reason string) error {
 	return s.stream.ResetWithReason(code, reason)
 }
 
+func (s *nativeSendStream) CloseWithError(err error) error {
+	if s == nil || s.stream == nil {
+		return ErrSessionClosed
+	}
+	return s.stream.CloseWithError(err)
+}
+
+func (s *nativeSendStream) CloseWithErrorCode(code uint64, reason string) error {
+	if s == nil || s.stream == nil {
+		return ErrSessionClosed
+	}
+	return s.stream.CloseWithErrorCode(code, reason)
+}
+
 func (s *nativeSendStream) Abort() error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
@@ -299,6 +313,20 @@ func (s *nativeRecvStream) CloseReadWithCode(code uint64) error {
 		return ErrSessionClosed
 	}
 	return s.stream.CloseReadWithCode(code)
+}
+
+func (s *nativeRecvStream) CloseWithError(err error) error {
+	if s == nil || s.stream == nil {
+		return ErrSessionClosed
+	}
+	return s.stream.CloseWithError(err)
+}
+
+func (s *nativeRecvStream) CloseWithErrorCode(code uint64, reason string) error {
+	if s == nil || s.stream == nil {
+		return ErrSessionClosed
+	}
+	return s.stream.CloseWithErrorCode(code, reason)
 }
 
 func (s *nativeRecvStream) Abort() error {
@@ -1524,24 +1552,32 @@ func (s *nativeStream) Close() error {
 }
 
 func (s *nativeStream) Abort() error {
-	return s.AbortWithErrorCode(uint64(CodeCancelled), "")
+	return s.CloseWithErrorCode(uint64(CodeCancelled), "")
 }
 
-func (s *nativeStream) AbortWithError(err error) error {
+func (s *nativeStream) CloseWithError(err error) error {
 	if err == nil {
-		return s.AbortWithErrorCode(uint64(CodeNoError), "")
+		return s.CloseWithErrorCode(uint64(CodeNoError), "")
 	}
 	var appErr *ApplicationError
 	if errors.As(err, &appErr) {
-		return s.AbortWithErrorCode(appErr.Code, appErr.Reason)
+		return s.CloseWithErrorCode(appErr.Code, appErr.Reason)
 	}
-	return s.AbortWithErrorCode(uint64(CodeInternal), err.Error())
+	return s.CloseWithErrorCode(uint64(CodeInternal), err.Error())
 }
 
-func (s *nativeStream) AbortWithErrorCode(code uint64, reason string) error {
+func (s *nativeStream) CloseWithErrorCode(code uint64, reason string) error {
 	return s.executeTerminalSignal(terminalSignalAbort, code, reason, terminalSignalOptions{
 		openerPolicy: terminalOpenerAllow,
 	})
+}
+
+func (s *nativeStream) AbortWithError(err error) error {
+	return s.CloseWithError(err)
+}
+
+func (s *nativeStream) AbortWithErrorCode(code uint64, reason string) error {
+	return s.CloseWithErrorCode(code, reason)
 }
 
 func (p terminalFramePlan) queue(s *nativeStream, opts queuedWriteOptions, commit queuedWriteCommit, rollback terminalFrameRollbackKind) error {

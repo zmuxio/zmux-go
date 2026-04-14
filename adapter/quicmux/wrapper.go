@@ -664,22 +664,30 @@ func (s *quicStream) ResetWithReason(code uint64, _ string) error {
 	return s.Reset(code)
 }
 
-func (s *quicStream) Abort() error {
-	return s.AbortWithErrorCode(uint64(zmux.CodeCancelled), "")
-}
-
-func (s *quicStream) AbortWithError(err error) error {
+func (s *quicStream) CloseWithError(err error) error {
 	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
-	return s.AbortWithErrorCode(code, reason)
+	return s.CloseWithErrorCode(code, reason)
 }
 
-func (s *quicStream) AbortWithErrorCode(code uint64, _ string) error {
+func (s *quicStream) CloseWithErrorCode(code uint64, _ string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
 	s.stream.CancelRead(quic.StreamErrorCode(code))
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
+}
+
+func (s *quicStream) Abort() error {
+	return s.CloseWithErrorCode(uint64(zmux.CodeCancelled), "")
+}
+
+func (s *quicStream) AbortWithError(err error) error {
+	return s.CloseWithError(err)
+}
+
+func (s *quicStream) AbortWithErrorCode(code uint64, reason string) error {
+	return s.CloseWithErrorCode(code, reason)
 }
 
 type quicSendStream struct {
@@ -774,17 +782,25 @@ func (s *quicSendStream) ResetWithReason(code uint64, _ string) error {
 	return s.Reset(code)
 }
 
+func (s *quicSendStream) CloseWithError(err error) error {
+	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
+	return s.CloseWithErrorCode(code, reason)
+}
+
+func (s *quicSendStream) CloseWithErrorCode(code uint64, _ string) error {
+	return s.Reset(code)
+}
+
 func (s *quicSendStream) Abort() error {
-	return s.AbortWithErrorCode(uint64(zmux.CodeCancelled), "")
+	return s.CloseWithErrorCode(uint64(zmux.CodeCancelled), "")
 }
 
 func (s *quicSendStream) AbortWithError(err error) error {
-	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
-	return s.AbortWithErrorCode(code, reason)
+	return s.CloseWithError(err)
 }
 
-func (s *quicSendStream) AbortWithErrorCode(code uint64, _ string) error {
-	return s.Reset(code)
+func (s *quicSendStream) AbortWithErrorCode(code uint64, reason string) error {
+	return s.CloseWithErrorCode(code, reason)
 }
 
 func (s *quicSendStream) Close() error {
@@ -860,17 +876,25 @@ func (s *quicRecvStream) CloseReadWithCode(code uint64) error {
 	return nil
 }
 
+func (s *quicRecvStream) CloseWithError(err error) error {
+	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
+	return s.CloseWithErrorCode(code, reason)
+}
+
+func (s *quicRecvStream) CloseWithErrorCode(code uint64, _ string) error {
+	return s.CloseReadWithCode(code)
+}
+
 func (s *quicRecvStream) Abort() error {
-	return s.AbortWithErrorCode(uint64(zmux.CodeCancelled), "")
+	return s.CloseWithErrorCode(uint64(zmux.CodeCancelled), "")
 }
 
 func (s *quicRecvStream) AbortWithError(err error) error {
-	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
-	return s.AbortWithErrorCode(code, reason)
+	return s.CloseWithError(err)
 }
 
-func (s *quicRecvStream) AbortWithErrorCode(code uint64, _ string) error {
-	return s.CloseReadWithCode(code)
+func (s *quicRecvStream) AbortWithErrorCode(code uint64, reason string) error {
+	return s.CloseWithErrorCode(code, reason)
 }
 
 func (s *quicRecvStream) Close() error {

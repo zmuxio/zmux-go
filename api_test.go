@@ -145,3 +145,89 @@ func TestSessionConstructorsRejectNilConn(t *testing.T) {
 		}
 	})
 }
+
+func TestStableSessionInterfacesExposeDocumentedAbortiveSurface(t *testing.T) {
+	t.Parallel()
+
+	client, server := newConnPair(t)
+	ctx, cancel := testContext(t)
+	defer cancel()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+
+	clientSession := AsSession(client)
+	serverSession := AsSession(server)
+
+	type bidiResult struct {
+		stream Stream
+		err    error
+	}
+	bidiAcceptCh := make(chan bidiResult, 1)
+	go func() {
+		stream, err := serverSession.AcceptStream(ctx)
+		bidiAcceptCh <- bidiResult{stream: stream, err: err}
+	}()
+
+	bidi, _, err := clientSession.OpenAndSend(ctx, []byte("x"))
+	if err != nil {
+		t.Fatalf("OpenAndSend err = %v", err)
+	}
+	defer func() { _ = bidi.Close() }()
+
+	acceptedBidi := <-bidiAcceptCh
+	if acceptedBidi.err != nil {
+		t.Fatalf("AcceptStream err = %v", acceptedBidi.err)
+	}
+	defer func() { _ = acceptedBidi.stream.Close() }()
+
+	type recvResult struct {
+		stream RecvStream
+		err    error
+	}
+	recvAcceptCh := make(chan recvResult, 1)
+	go func() {
+		stream, err := serverSession.AcceptUniStream(ctx)
+		recvAcceptCh <- recvResult{stream: stream, err: err}
+	}()
+
+	send, _, err := clientSession.OpenUniAndSend(ctx, []byte("y"))
+	if err != nil {
+		t.Fatalf("OpenUniAndSend err = %v", err)
+	}
+	defer func() { _ = send.Close() }()
+
+	acceptedRecv := <-recvAcceptCh
+	if acceptedRecv.err != nil {
+		t.Fatalf("AcceptUniStream err = %v", acceptedRecv.err)
+	}
+	defer func() { _ = acceptedRecv.stream.Close() }()
+
+	type streamSurface interface {
+		CloseReadWithCode(code uint64) error
+		CloseWithError(err error) error
+		CloseWithErrorCode(code uint64, reason string) error
+		Abort() error
+		AbortWithError(err error) error
+		AbortWithErrorCode(code uint64, reason string) error
+	}
+	type sendSurface interface {
+		CloseWithError(err error) error
+		CloseWithErrorCode(code uint64, reason string) error
+		Abort() error
+		AbortWithError(err error) error
+		AbortWithErrorCode(code uint64, reason string) error
+	}
+	type recvSurface interface {
+		CloseReadWithCode(code uint64) error
+		CloseWithError(err error) error
+		CloseWithErrorCode(code uint64, reason string) error
+		Abort() error
+		AbortWithError(err error) error
+		AbortWithErrorCode(code uint64, reason string) error
+	}
+
+	var _ streamSurface = bidi
+	var _ streamSurface = acceptedBidi.stream
+	var _ sendSurface = send
+	var _ recvSurface = acceptedRecv.stream
+}

@@ -242,7 +242,7 @@ func TestCloseWithErrorPropagatesAbort(t *testing.T) {
 	if accepted == nil {
 		t.Fatal("expected accepted stream")
 	}
-	if err := accepted.AbortWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
+	if err := accepted.CloseWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
 		t.Fatalf("close with error: %v", err)
 	}
 
@@ -290,7 +290,7 @@ func TestPeerAbortMakesReadReturnApplicationError(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.AbortWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
+	if err := serverStream.CloseWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
 		t.Fatalf("server abort: %v", err)
 	}
 
@@ -456,7 +456,7 @@ func TestCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
 	c.registry.streams[stream.id] = stream
 	c.mu.Unlock()
 
-	if err := stream.AbortWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("CloseWithErrorCode err = %v", err)
 	}
 	frame := awaitQueuedFrame(t, frames)
@@ -514,7 +514,7 @@ func TestProvisionalCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
 	c.flow.sendSessionUsed = 10
 	c.mu.Unlock()
 
-	if err := stream.AbortWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("provisional close with error err = %v", err)
 	}
 	assertNoQueuedFrame(t, frames)
@@ -1763,6 +1763,32 @@ func TestCloseAfterEstablishmentFailureWritesFatalClose(t *testing.T) {
 	local := testPrefaceForRole(t, RoleInitiator)
 
 	closeAfterEstablishmentFailure(conn, local, nil, wireError(CodeProtocol, "parse preface", errInvalidRole))
+
+	frames := decodeFramesForTest(t, conn.bytes())
+	if len(frames) != 1 {
+		t.Fatalf("frame count = %d, want 1 CLOSE", len(frames))
+	}
+	if frames[0].Type != FrameTypeCLOSE {
+		t.Fatalf("frame type = %s, want %s", frames[0].Type, FrameTypeCLOSE)
+	}
+	code, _, err := parseErrorPayload(frames[0].Payload)
+	if err != nil {
+		t.Fatalf("parse close payload: %v", err)
+	}
+	if code != uint64(CodeProtocol) {
+		t.Fatalf("close code = %d, want %d", code, uint64(CodeProtocol))
+	}
+}
+
+func TestFinishEstablishmentFailureWaitsForLocalPrefaceWriteBeforeFatalClose(t *testing.T) {
+	t.Parallel()
+
+	conn := newScriptedDuplexConn(nil)
+	local := testPrefaceForRole(t, RoleInitiator)
+	writeErrCh := make(chan error, 1)
+	writeErrCh <- nil
+
+	finishEstablishmentFailure(conn, writeErrCh, local, nil, wireError(CodeProtocol, "parse preface", errInvalidRole))
 
 	frames := decodeFramesForTest(t, conn.bytes())
 	if len(frames) != 1 {

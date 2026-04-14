@@ -807,8 +807,7 @@ type pendingTerminalControlResult struct {
 type pendingPriorityQueueStatus uint8
 
 const (
-	pendingPriorityQueueDropped pendingPriorityQueueStatus = iota
-	pendingPriorityQueueAccepted
+	pendingPriorityQueueAccepted pendingPriorityQueueStatus = iota + 1
 	pendingPriorityQueueDroppedBudget
 	pendingPriorityQueueDroppedMemory
 	pendingPriorityQueueDroppedUnavailable

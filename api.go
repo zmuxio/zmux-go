@@ -20,9 +20,14 @@ type Stream interface {
 	WriteFinal(p []byte) (int, error)
 	WritevFinal(parts ...[]byte) (int, error)
 	CloseRead() error
+	CloseReadWithCode(code uint64) error
 	CloseWrite() error
 	Reset(code uint64) error
+	CloseWithError(err error) error
+	CloseWithErrorCode(code uint64, reason string) error
 	Abort() error
+	AbortWithError(err error) error
+	AbortWithErrorCode(code uint64, reason string) error
 }
 
 // SendStream defines the repository-default send-only stream surface.
@@ -39,6 +44,11 @@ type SendStream interface {
 	WritevFinal(parts ...[]byte) (int, error)
 	CloseWrite() error
 	Reset(code uint64) error
+	CloseWithError(err error) error
+	CloseWithErrorCode(code uint64, reason string) error
+	Abort() error
+	AbortWithError(err error) error
+	AbortWithErrorCode(code uint64, reason string) error
 	SetDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error
 }
@@ -53,6 +63,12 @@ type RecvStream interface {
 	RemoteAddr() net.Addr
 	Metadata() StreamMetadata
 	CloseRead() error
+	CloseReadWithCode(code uint64) error
+	CloseWithError(err error) error
+	CloseWithErrorCode(code uint64, reason string) error
+	Abort() error
+	AbortWithError(err error) error
+	AbortWithErrorCode(code uint64, reason string) error
 	SetDeadline(t time.Time) error
 	SetReadDeadline(t time.Time) error
 }

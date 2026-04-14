@@ -1340,7 +1340,6 @@ func establishmentCloseDrainDelay(err error) time.Duration {
 }
 
 const establishmentFailureWriteWait = 10 * time.Millisecond
-const establishmentFailureFastWriteWait = time.Millisecond
 
 func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer *Preface, err error) {
 	if conn == nil {
@@ -1360,22 +1359,17 @@ func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error
 	if conn == nil {
 		return
 	}
-	fastTimer := time.NewTimer(establishmentFailureFastWriteWait)
-	defer stopTimer(fastTimer)
+	timer := time.NewTimer(establishmentFailureWriteWait)
+	defer stopTimer(timer)
 	select {
 	case writeErr := <-writeErrCh:
 		if writeErr == nil {
 			closeAfterEstablishmentFailure(conn, local, peer, err)
 			return
 		}
-	case <-fastTimer.C:
-	}
-	_ = conn.Close()
-	timer := time.NewTimer(establishmentFailureWriteWait)
-	defer stopTimer(timer)
-	select {
-	case <-writeErrCh:
+		_ = conn.Close()
 	case <-timer.C:
+		_ = conn.Close()
 	}
 }
 
