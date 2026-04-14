@@ -52,15 +52,17 @@ type quicSession struct {
 	uniOnce  sync.Once
 	bidiCh   chan bidiAcceptResult
 	uniCh    chan uniAcceptResult
+	bidiGate chan struct{}
+	uniGate  chan struct{}
 }
 
 type bidiAcceptResult struct {
-	stream zmux.Stream
+	stream *quic.Stream
 	err    error
 }
 
 type uniAcceptResult struct {
-	stream zmux.RecvStream
+	stream *quic.ReceiveStream
 	err    error
 }
 
@@ -69,7 +71,11 @@ func (s *quicSession) AcceptStream(ctx context.Context) (zmux.Stream, error) {
 		return nil, zmux.ErrSessionClosed
 	}
 	ctx = defaultContext(ctx)
-	ch := s.ensureBidiAcceptLoop()
+	ch, gate := s.ensureBidiAcceptLoop()
+	if err := acquireAcceptGate(ctx, s.conn.Context(), gate); err != nil {
+		return nil, err
+	}
+	defer releaseAcceptGate(gate)
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -79,7 +85,13 @@ func (s *quicSession) AcceptStream(ctx context.Context) (zmux.Stream, error) {
 		}
 		return nil, zmux.ErrSessionClosed
 	case result := <-ch:
-		return result.stream, result.err
+		if result.err != nil {
+			return nil, result.err
+		}
+		if result.stream == nil {
+			return nil, zmux.ErrSessionClosed
+		}
+		return newAcceptedBidiStream(s.conn, result.stream)
 	}
 }
 
@@ -88,7 +100,11 @@ func (s *quicSession) AcceptUniStream(ctx context.Context) (zmux.RecvStream, err
 		return nil, zmux.ErrSessionClosed
 	}
 	ctx = defaultContext(ctx)
-	ch := s.ensureUniAcceptLoop()
+	ch, gate := s.ensureUniAcceptLoop()
+	if err := acquireAcceptGate(ctx, s.conn.Context(), gate); err != nil {
+		return nil, err
+	}
+	defer releaseAcceptGate(gate)
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -98,7 +114,13 @@ func (s *quicSession) AcceptUniStream(ctx context.Context) (zmux.RecvStream, err
 		}
 		return nil, zmux.ErrSessionClosed
 	case result := <-ch:
-		return result.stream, result.err
+		if result.err != nil {
+			return nil, result.err
+		}
+		if result.stream == nil {
+			return nil, zmux.ErrSessionClosed
+		}
+		return newAcceptedRecvStream(s.conn, result.stream)
 	}
 }
 
@@ -226,26 +248,30 @@ func (s *quicSession) Stats() zmux.SessionStats {
 	}
 }
 
-func (s *quicSession) ensureBidiAcceptLoop() <-chan bidiAcceptResult {
+func (s *quicSession) ensureBidiAcceptLoop() (<-chan bidiAcceptResult, chan struct{}) {
 	if s == nil || s.conn == nil {
-		return nil
+		return nil, nil
 	}
 	s.bidiOnce.Do(func() {
 		s.bidiCh = make(chan bidiAcceptResult, 32)
+		s.bidiGate = make(chan struct{}, 1)
+		s.bidiGate <- struct{}{}
 		go s.acceptBidiLoop()
 	})
-	return s.bidiCh
+	return s.bidiCh, s.bidiGate
 }
 
-func (s *quicSession) ensureUniAcceptLoop() <-chan uniAcceptResult {
+func (s *quicSession) ensureUniAcceptLoop() (<-chan uniAcceptResult, chan struct{}) {
 	if s == nil || s.conn == nil {
-		return nil
+		return nil, nil
 	}
 	s.uniOnce.Do(func() {
 		s.uniCh = make(chan uniAcceptResult, 32)
+		s.uniGate = make(chan struct{}, 1)
+		s.uniGate <- struct{}{}
 		go s.acceptUniLoop()
 	})
-	return s.uniCh
+	return s.uniCh, s.uniGate
 }
 
 func (s *quicSession) acceptBidiLoop() {
@@ -255,8 +281,7 @@ func (s *quicSession) acceptBidiLoop() {
 			s.publishBidiAcceptResult(bidiAcceptResult{err: translateError(err)})
 			return
 		}
-		wrapped, wrapErr := newAcceptedBidiStream(s.conn, stream)
-		s.publishBidiAcceptResult(bidiAcceptResult{stream: wrapped, err: wrapErr})
+		s.publishBidiAcceptResult(bidiAcceptResult{stream: stream})
 	}
 }
 
@@ -267,8 +292,7 @@ func (s *quicSession) acceptUniLoop() {
 			s.publishUniAcceptResult(uniAcceptResult{err: translateError(err)})
 			return
 		}
-		wrapped, wrapErr := newAcceptedRecvStream(s.conn, stream)
-		s.publishUniAcceptResult(uniAcceptResult{stream: wrapped, err: wrapErr})
+		s.publishUniAcceptResult(uniAcceptResult{stream: stream})
 	}
 }
 
@@ -290,6 +314,30 @@ func (s *quicSession) publishUniAcceptResult(result uniAcceptResult) {
 	case s.uniCh <- result:
 	case <-s.conn.Context().Done():
 	}
+}
+
+func acquireAcceptGate(ctx context.Context, connCtx context.Context, gate chan struct{}) error {
+	if gate == nil {
+		return zmux.ErrSessionClosed
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-connCtx.Done():
+		if err := translateWaitError(context.Cause(connCtx)); err != nil {
+			return err
+		}
+		return zmux.ErrSessionClosed
+	case <-gate:
+		return nil
+	}
+}
+
+func releaseAcceptGate(gate chan struct{}) {
+	if gate == nil {
+		return
+	}
+	gate <- struct{}{}
 }
 
 type quicStreamBase struct {
@@ -631,17 +679,15 @@ func (s *quicStream) Close() error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
-	if err := s.CloseWrite(); err != nil &&
-		!errors.Is(err, zmux.ErrWriteClosed) &&
-		!errors.Is(err, zmux.ErrReadClosed) {
-		return err
+	errWrite := s.CloseWrite()
+	if errors.Is(errWrite, zmux.ErrWriteClosed) || errors.Is(errWrite, zmux.ErrReadClosed) {
+		errWrite = nil
 	}
-	if err := s.CloseRead(); err != nil &&
-		!errors.Is(err, zmux.ErrReadClosed) &&
-		!errors.Is(err, zmux.ErrWriteClosed) {
-		return err
+	errRead := s.CloseRead()
+	if errors.Is(errRead, zmux.ErrReadClosed) || errors.Is(errRead, zmux.ErrWriteClosed) {
+		errRead = nil
 	}
-	return nil
+	return errors.Join(errWrite, errRead)
 }
 
 func (s *quicStream) StreamID() uint64 {

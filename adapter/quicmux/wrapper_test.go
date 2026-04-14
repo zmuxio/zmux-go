@@ -356,6 +356,83 @@ func TestWrapSessionAcceptStreamPreservesOrderAcrossStalledPreludeTimeout(t *tes
 	_ = accepted.Close()
 }
 
+func TestWrapSessionConcurrentAcceptStreamDoesNotOvertakeStalledPrelude(t *testing.T) {
+	clientConn, serverConn := newQUICConnPair(t)
+	client := WrapSession(clientConn)
+	server := WrapSession(serverConn)
+
+	prevTimeout := acceptedPreludeReadTimeout
+	acceptedPreludeReadTimeout = 100 * time.Millisecond
+	t.Cleanup(func() {
+		acceptedPreludeReadTimeout = prevTimeout
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stalled, err := clientConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("raw OpenStreamSync stalled err = %v", err)
+	}
+	t.Cleanup(func() {
+		stalled.CancelRead(0)
+		stalled.CancelWrite(0)
+		_ = stalled.Close()
+	})
+
+	ready, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream ready err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = ready.Close()
+	})
+	if _, err := ready.Write([]byte("x")); err != nil {
+		t.Fatalf("ready Write err = %v", err)
+	}
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 2)
+	for range 2 {
+		go func() {
+			stream, err := server.AcceptStream(ctx)
+			acceptCh <- acceptResult{stream: stream, err: err}
+		}()
+	}
+
+	first := <-acceptCh
+	if first.err == nil {
+		t.Fatalf("first concurrent AcceptStream = (%v, nil), want protocol error", first.stream)
+	}
+	if !zmux.IsErrorCode(first.err, zmux.CodeProtocol) {
+		t.Fatalf("first concurrent AcceptStream err = %v, want protocol error", first.err)
+	}
+
+	second := <-acceptCh
+	if second.err != nil {
+		t.Fatalf("second concurrent AcceptStream err = %v", second.err)
+	}
+	if second.stream == nil {
+		t.Fatal("second concurrent AcceptStream stream = nil, want ready stream")
+	}
+	if second.stream.StreamID() != ready.StreamID() {
+		t.Fatalf("accepted StreamID = %d, want %d", second.stream.StreamID(), ready.StreamID())
+	}
+
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(second.stream, buf); err != nil {
+		t.Fatalf("ReadFull err = %v", err)
+	}
+	if !bytes.Equal(buf, []byte("x")) {
+		t.Fatalf("ReadFull = %q, want %q", buf, []byte("x"))
+	}
+
+	_ = second.stream.Close()
+}
+
 func TestWrapSessionResetMakesLocalWriteFailImmediately(t *testing.T) {
 	client, _ := newWrappedPair(t)
 
