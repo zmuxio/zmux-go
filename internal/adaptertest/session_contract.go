@@ -334,8 +334,7 @@ func waitForClosedResult(t *testing.T, session zmux.Session) (error, bool) {
 	defer cancel()
 	err := session.Wait(ctx)
 	if err != nil && !errors.Is(err, zmux.ErrSessionClosed) {
-		var appErr *zmux.ApplicationError
-		if !errors.As(err, &appErr) {
+		if _, ok := findError[*zmux.ApplicationError](err); !ok {
 			t.Fatalf("Wait err = %v", err)
 		}
 	}
@@ -346,11 +345,33 @@ func waitForClosedResult(t *testing.T, session zmux.Session) (error, bool) {
 }
 
 func matchesApplicationError(err error, code uint64, reason string) bool {
-	var appErr *zmux.ApplicationError
-	return errors.As(err, &appErr) && appErr.Code == code && appErr.Reason == reason
+	appErr, ok := findError[*zmux.ApplicationError](err)
+	return ok && appErr.Code == code && appErr.Reason == reason
 }
 
 func matchesApplicationErrorCode(err error, code uint64) bool {
-	var appErr *zmux.ApplicationError
-	return errors.As(err, &appErr) && appErr.Code == code
+	appErr, ok := findError[*zmux.ApplicationError](err)
+	return ok && appErr.Code == code
+}
+
+func findError[T any](err error) (T, bool) {
+	var zero T
+	if err == nil {
+		return zero, false
+	}
+	if target, ok := any(err).(T); ok {
+		return target, true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range wrapped.Unwrap() {
+			if target, ok := findError[T](child); ok {
+				return target, true
+			}
+		}
+		return zero, false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return findError[T](wrapped.Unwrap())
+	}
+	return zero, false
 }

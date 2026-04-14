@@ -10,7 +10,7 @@ const (
 	DefaultAdmissionSoftCap       = 32
 	DefaultAdmissionHardCap       = 64
 	DefaultProvisionalOpenHardCap = DefaultAdmissionHardCap
-	ProvisionalOpenMaxAge         = 250 * time.Millisecond
+	ProvisionalOpenMaxAge         = 5 * time.Second
 )
 
 func LocalOpenRefusedByGoAway(id uint64, bidi bool, peerGoAwayBidi, peerGoAwayUni uint64) bool {

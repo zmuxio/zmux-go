@@ -49,6 +49,24 @@ type streamTombstone struct {
 	LateDataCause lateDataCause
 }
 
+func (t streamTombstone) queueIndex(hidden bool) int {
+	if hidden {
+		return t.HiddenIndex
+	}
+	return t.OrderIndex
+}
+
+func (t *streamTombstone) setQueueIndex(hidden bool, idx int) {
+	if t == nil {
+		return
+	}
+	if hidden {
+		t.HiddenIndex = idx
+		return
+	}
+	t.OrderIndex = idx
+}
+
 type streamTombstoneLookup struct {
 	tombstone streamTombstone
 	present   bool
@@ -501,21 +519,13 @@ func (c *Conn) appendTombstoneLocked(streamID uint64) {
 		return
 	}
 	c.ensureTombstoneQueueLocked()
-	tombstone, ok := c.registry.tombstones[streamID]
-	if !ok {
-		return
-	}
-	if idx := c.tombstoneIndexLocked(streamID, tombstone.OrderIndex); idx.found() {
-		if tombstone.OrderIndex != idx.index {
-			tombstone.OrderIndex = idx.index
-			c.registry.tombstones[streamID] = tombstone
-		}
-		return
-	}
-	tombstone.OrderIndex = len(c.registry.tombstoneOrder)
-	c.registry.tombstones[streamID] = tombstone
-	c.registry.tombstoneOrder = append(c.registry.tombstoneOrder, streamID)
-	c.registry.tombstoneCount++
+	c.appendIndexedTombstoneLocked(
+		streamID,
+		false,
+		&c.registry.tombstoneOrder,
+		&c.registry.tombstoneCount,
+		c.tombstoneIndexLocked,
+	)
 }
 
 func (c *Conn) removeTombstoneOrderSlotLocked(i int) bool {
@@ -553,31 +563,14 @@ func (c *Conn) maybeCompactTombstoneQueueLocked() {
 		return
 	}
 	c.ensureTombstoneQueueLocked()
-	if c.registry.tombstoneCount == 0 {
-		c.registry.tombstoneOrder = nil
-		c.registry.tombstoneHead = 0
-		c.registry.tombstoneCount = 0
-		c.registry.tombstonesInit = true
-		return
-	}
-	if c.registry.tombstoneHead == 0 && len(c.registry.tombstoneOrder) <= 2*c.registry.tombstoneCount {
-		return
-	}
-	writeIdx := 0
-	for i := c.registry.tombstoneHead; i < len(c.registry.tombstoneOrder); i++ {
-		entry := c.tombstoneOrderEntryLocked(i)
-		if !entry.found() {
-			continue
-		}
-		entry.tombstone.OrderIndex = writeIdx
-		c.registry.tombstones[entry.streamID] = entry.tombstone
-		c.registry.tombstoneOrder[writeIdx] = entry.streamID
-		writeIdx++
-	}
-	c.registry.tombstoneOrder = c.registry.tombstoneOrder[:writeIdx]
-	c.registry.tombstoneHead = 0
-	c.registry.tombstoneCount = writeIdx
-	c.registry.tombstonesInit = true
+	c.compactIndexedTombstoneQueueLocked(
+		false,
+		&c.registry.tombstoneOrder,
+		&c.registry.tombstoneHead,
+		&c.registry.tombstoneCount,
+		&c.registry.tombstonesInit,
+		c.tombstoneOrderEntryLocked,
+	)
 }
 
 func (c *Conn) clearTombstoneQueueLocked() {
@@ -710,21 +703,13 @@ func (c *Conn) appendHiddenTombstoneLocked(streamID uint64) {
 		return
 	}
 	c.ensureHiddenTombstonesLocked()
-	tombstone, ok := c.registry.tombstones[streamID]
-	if !ok || !tombstone.Hidden {
-		return
-	}
-	if idx := c.hiddenTombstoneIndexLocked(streamID, tombstone.HiddenIndex); idx.found() {
-		if tombstone.HiddenIndex != idx.index {
-			tombstone.HiddenIndex = idx.index
-			c.registry.tombstones[streamID] = tombstone
-		}
-		return
-	}
-	tombstone.HiddenIndex = len(c.registry.hiddenTombstoneOrder)
-	c.registry.tombstones[streamID] = tombstone
-	c.registry.hiddenTombstoneOrder = append(c.registry.hiddenTombstoneOrder, streamID)
-	c.registry.hiddenTombstoneCount++
+	c.appendIndexedTombstoneLocked(
+		streamID,
+		true,
+		&c.registry.hiddenTombstoneOrder,
+		&c.registry.hiddenTombstoneCount,
+		c.hiddenTombstoneIndexLocked,
+	)
 }
 
 func (c *Conn) removeHiddenTombstoneLocked(streamID uint64, tombstone streamTombstone) {
@@ -752,32 +737,14 @@ func (c *Conn) maybeCompactHiddenTombstoneQueueLocked() {
 	if c == nil {
 		return
 	}
-	if c.registry.hiddenTombstoneCount == 0 {
-		c.registry.hiddenTombstoneOrder = nil
-		c.registry.hiddenTombstoneHead = 0
-		c.registry.hiddenTombstoneCount = 0
-		c.registry.hiddenTombstonesInit = true
-		return
-	}
-	if c.registry.hiddenTombstoneHead == 0 && len(c.registry.hiddenTombstoneOrder) <= 2*c.registry.hiddenTombstoneCount {
-		return
-	}
-	writeIdx := 0
-	for i := c.registry.hiddenTombstoneHead; i < len(c.registry.hiddenTombstoneOrder); i++ {
-		entry := c.hiddenTombstoneOrderEntryLocked(i)
-		if !entry.found() {
-			continue
-		}
-		entry.tombstone.HiddenIndex = writeIdx
-		c.registry.tombstones[entry.streamID] = entry.tombstone
-		c.registry.hiddenTombstoneOrder[writeIdx] = entry.streamID
-		writeIdx++
-	}
-	clear(c.registry.hiddenTombstoneOrder[writeIdx:])
-	c.registry.hiddenTombstoneOrder = c.registry.hiddenTombstoneOrder[:writeIdx]
-	c.registry.hiddenTombstoneHead = 0
-	c.registry.hiddenTombstoneCount = writeIdx
-	c.registry.hiddenTombstonesInit = true
+	c.compactIndexedTombstoneQueueLocked(
+		true,
+		&c.registry.hiddenTombstoneOrder,
+		&c.registry.hiddenTombstoneHead,
+		&c.registry.hiddenTombstoneCount,
+		&c.registry.hiddenTombstonesInit,
+		c.hiddenTombstoneOrderEntryLocked,
+	)
 }
 
 func (c *Conn) clearHiddenTombstonesLocked() {
@@ -788,6 +755,66 @@ func (c *Conn) clearHiddenTombstonesLocked() {
 	c.registry.hiddenTombstoneHead = 0
 	c.registry.hiddenTombstoneCount = 0
 	c.registry.hiddenTombstonesInit = false
+}
+
+func (c *Conn) appendIndexedTombstoneLocked(
+	streamID uint64,
+	hidden bool,
+	order *[]uint64,
+	count *int,
+	indexLookup func(uint64, int) queueIndexLookup,
+) {
+	tombstone, ok := c.registry.tombstones[streamID]
+	if !ok || (hidden && !tombstone.Hidden) {
+		return
+	}
+	if idx := indexLookup(streamID, tombstone.queueIndex(hidden)); idx.found() {
+		if tombstone.queueIndex(hidden) != idx.index {
+			tombstone.setQueueIndex(hidden, idx.index)
+			c.registry.tombstones[streamID] = tombstone
+		}
+		return
+	}
+	tombstone.setQueueIndex(hidden, len(*order))
+	c.registry.tombstones[streamID] = tombstone
+	*order = append(*order, streamID)
+	*count++
+}
+
+func (c *Conn) compactIndexedTombstoneQueueLocked(
+	hidden bool,
+	order *[]uint64,
+	head *int,
+	count *int,
+	init *bool,
+	entryLookup func(int) tombstoneOrderLookup,
+) {
+	if *count == 0 {
+		*order = nil
+		*head = 0
+		*count = 0
+		*init = true
+		return
+	}
+	if *head == 0 && len(*order) <= 2*(*count) {
+		return
+	}
+	writeIdx := 0
+	for i := *head; i < len(*order); i++ {
+		entry := entryLookup(i)
+		if !entry.found() {
+			continue
+		}
+		entry.tombstone.setQueueIndex(hidden, writeIdx)
+		c.registry.tombstones[entry.streamID] = entry.tombstone
+		(*order)[writeIdx] = entry.streamID
+		writeIdx++
+	}
+	clear((*order)[writeIdx:])
+	*order = (*order)[:writeIdx]
+	*head = 0
+	*count = writeIdx
+	*init = true
 }
 
 func (c *Conn) enforceHiddenControlStateBudgetLocked(now time.Time) {

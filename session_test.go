@@ -8633,7 +8633,7 @@ func TestPeerCloseTerminatesWrites(t *testing.T) {
 
 func TestPeerCloseFrameTerminatesSessionAndStreamWrites(t *testing.T) {
 	t.Parallel()
-	client, server := newConnPair(t)
+	client, _ := newConnPair(t)
 	ctx, cancel := testContext(t)
 	defer cancel()
 
@@ -8646,12 +8646,12 @@ func TestPeerCloseFrameTerminatesSessionAndStreamWrites(t *testing.T) {
 	}
 
 	payload := mustClosePayload(t, uint64(CodeProtocol), "bye")
-	if err := testQueueFrame(server, Frame{
+	if err := client.handleCloseFrame(Frame{
 		Type:     FrameTypeCLOSE,
 		StreamID: 0,
 		Payload:  payload,
-	}); err != nil && !errors.Is(err, ErrSessionClosed) {
-		t.Fatalf("queue peer close: %v", err)
+	}); err == nil {
+		t.Fatal("handle peer close err = nil, want non-nil")
 	}
 
 	select {
@@ -8685,7 +8685,7 @@ func TestPeerCloseFrameTerminatesSessionAndStreamWrites(t *testing.T) {
 
 func TestPeerCloseNoErrorCompletesSessionAndWakesBlockedAccept(t *testing.T) {
 	t.Parallel()
-	client, server := newConnPair(t)
+	client, _ := newConnPair(t)
 	ctx, cancel := testContext(t)
 	defer cancel()
 
@@ -8696,12 +8696,12 @@ func TestPeerCloseNoErrorCompletesSessionAndWakesBlockedAccept(t *testing.T) {
 	}()
 
 	payload := mustClosePayload(t, uint64(CodeNoError), "complete")
-	if err := testQueueFrame(server, Frame{
+	if err := client.handleCloseFrame(Frame{
 		Type:     FrameTypeCLOSE,
 		StreamID: 0,
 		Payload:  payload,
-	}); err != nil && !errors.Is(err, ErrSessionClosed) {
-		t.Fatalf("queue peer close: %v", err)
+	}); err == nil {
+		t.Fatal("handle peer close err = nil, want non-nil")
 	}
 
 	select {
@@ -24436,7 +24436,26 @@ func releaseFixtureClose(t *testing.T, env *stateFixtureEnv) {
 func assertPendingBlockedFrames(t *testing.T, env *stateFixtureEnv, streamID uint64) {
 	t.Helper()
 
-	assertNoQueuedFrame(t, env.frames)
+	deadline := time.Now().Add(testSignalTimeout)
+	for {
+		if frame, ok := drainQueuedFrameNow(env.frames); ok {
+			t.Fatalf("unexpected queued frame while waiting for pending BLOCKED frames: %+v", frame)
+		}
+
+		env.conn.mu.Lock()
+		sessionPending := env.conn.pending.sessionBlockedSet
+		stream := env.conn.registry.streams[streamID]
+		streamPending := stream != nil && stream.inPendingQueueLocked(pendingStreamQueueBlocked)
+		env.conn.mu.Unlock()
+
+		if sessionPending && streamPending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for pending BLOCKED frames on stream %d", streamID)
+		}
+		runtime.Gosched()
+	}
 
 	env.conn.mu.Lock()
 	urgent, advisory := testDrainPendingControlFrames(env.conn)

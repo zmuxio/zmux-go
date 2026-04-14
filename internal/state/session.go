@@ -217,8 +217,7 @@ func IgnorePeerClose(closeErr error, peerCloseErrPresent bool, closedSentinel er
 	if errors.As(closeErr, &coded) {
 		return true
 	}
-	var wireErr *wire.Error
-	if errors.As(closeErr, &wireErr) {
+	if _, ok := wire.ErrorCodeOf(closeErr); ok {
 		return true
 	}
 	return !isTransportClose(closeErr)

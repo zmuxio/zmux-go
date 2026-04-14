@@ -942,7 +942,7 @@ func copyReasonCounts(src map[uint64]uint64) map[uint64]uint64 {
 	return dst
 }
 
-const sessionCloseFrameSendTimeout = 25 * time.Millisecond
+const sessionCloseFrameSendTimeout = 100 * time.Millisecond
 
 func closeOperationErr(c *Conn, err error) error {
 	return sessionOperationErr(c, OperationClose, err)
@@ -1594,7 +1594,7 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 }
 
 const sessionGoAwayDrainInterval = 10 * time.Millisecond
-const sessionGracefulCloseDrainTimeout = 100 * time.Millisecond
+const sessionGracefulCloseDrainTimeout = 500 * time.Millisecond
 const writerLaneBuffer = 128
 const advisoryLaneBuffer = 32
 

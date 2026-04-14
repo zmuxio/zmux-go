@@ -242,24 +242,31 @@ type batchTiePrefs struct {
 	streams  map[GroupKey]uint64
 }
 
+func betterEligibleWindow(leftEligible bool, leftStart, leftFinish, rightStart, rightFinish uint64) (bool, bool) {
+	if !leftEligible {
+		if leftStart != rightStart {
+			return leftStart < rightStart, true
+		}
+		if leftFinish != rightFinish {
+			return leftFinish < rightFinish, true
+		}
+		return false, false
+	}
+	if leftFinish != rightFinish {
+		return leftFinish < rightFinish, true
+	}
+	if leftStart != rightStart {
+		return leftStart < rightStart, true
+	}
+	return false, false
+}
+
 func betterGroupCandidate(prefs batchTiePrefs, left, right wfqGroupCandidate) bool {
 	if left.eligible != right.eligible {
 		return left.eligible
 	}
-	if !left.eligible {
-		if left.groupStart != right.groupStart {
-			return left.groupStart < right.groupStart
-		}
-		if left.groupFinish != right.groupFinish {
-			return left.groupFinish < right.groupFinish
-		}
-	} else {
-		if left.groupFinish != right.groupFinish {
-			return left.groupFinish < right.groupFinish
-		}
-		if left.groupStart != right.groupStart {
-			return left.groupStart < right.groupStart
-		}
+	if better, ok := betterEligibleWindow(left.eligible, left.groupStart, left.groupFinish, right.groupStart, right.groupFinish); ok {
+		return better
 	}
 	if prefs.hasGroup {
 		leftPreferred := left.groupKey == prefs.group
@@ -290,20 +297,8 @@ func betterStreamCandidate(preferred uint64, left, right wfqStreamCandidate) boo
 	if left.eligible != right.eligible {
 		return left.eligible
 	}
-	if !left.eligible {
-		if left.streamStart != right.streamStart {
-			return left.streamStart < right.streamStart
-		}
-		if left.streamFinish != right.streamFinish {
-			return left.streamFinish < right.streamFinish
-		}
-	} else {
-		if left.streamFinish != right.streamFinish {
-			return left.streamFinish < right.streamFinish
-		}
-		if left.streamStart != right.streamStart {
-			return left.streamStart < right.streamStart
-		}
+	if better, ok := betterEligibleWindow(left.eligible, left.streamStart, left.streamFinish, right.streamStart, right.streamFinish); ok {
+		return better
 	}
 	if preferred != 0 {
 		leftPreferred := left.streamID == preferred

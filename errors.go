@@ -253,8 +253,8 @@ func IsErrorCode(err error, code ErrorCode) bool {
 	if wire.IsErrorCode(err, code) {
 		return true
 	}
-	var appErr *ApplicationError
-	return errors.As(err, &appErr) && appErr.Code == uint64(code)
+	appErr, ok := findError[*ApplicationError](err)
+	return ok && appErr.Code == uint64(code)
 }
 
 var (
@@ -356,8 +356,7 @@ func wrapStructuredError(err error, meta errorMeta) error {
 }
 
 func errorDetails(err error) (uint64, string) {
-	var appErr *ApplicationError
-	if errors.As(err, &appErr) {
+	if appErr, ok := findError[*ApplicationError](err); ok {
 		return appErr.Code, appErr.Reason
 	}
 	if code, ok := ErrorCodeOf(err); ok {
@@ -402,16 +401,14 @@ func openOperationErrLocked(c *Conn, err error) error {
 		source:    SourceLocal,
 		direction: DirectionBoth,
 	}
-	var appErr *ApplicationError
-	ok := errors.As(err, &appErr)
+	appErr, ok := findError[*ApplicationError](err)
 	switch {
 	case ok && appErr.Code == uint64(CodeRefusedStream):
 		meta.source = SourceRemote
 	case ok:
 		meta.source = SourceLocal
 	default:
-		var wireErr *wire.Error
-		if errors.As(err, &wireErr) {
+		if _, ok := findError[*wire.Error](err); ok {
 			meta.source = sessionErrorSourceLocked(c, err)
 		}
 	}
@@ -419,8 +416,8 @@ func openOperationErrLocked(c *Conn, err error) error {
 }
 
 func sessionWireErrorSource(err error) (Source, bool) {
-	var wireErr *wire.Error
-	if !errors.As(err, &wireErr) {
+	wireErr, ok := findError[*wire.Error](err)
+	if !ok {
 		return SourceUnknown, false
 	}
 	switch {
@@ -451,8 +448,7 @@ func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Sou
 		return source
 	}
 
-	var appErr *ApplicationError
-	if errors.As(err, &appErr) {
+	if appErr, ok := findError[*ApplicationError](err); ok {
 		if peerClose != nil && peerClose.Code == appErr.Code && peerClose.Reason == appErr.Reason {
 			return SourceRemote
 		}
@@ -465,6 +461,28 @@ func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Sou
 		return SourceUnknown
 	}
 	return SourceTransport
+}
+
+func findError[T any](err error) (T, bool) {
+	var zero T
+	if err == nil {
+		return zero, false
+	}
+	if target, ok := any(err).(T); ok {
+		return target, true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range wrapped.Unwrap() {
+			if target, ok := findError[T](child); ok {
+				return target, true
+			}
+		}
+		return zero, false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return findError[T](wrapped.Unwrap())
+	}
+	return zero, false
 }
 
 func sessionErrorSource(c *Conn, err error) Source {
