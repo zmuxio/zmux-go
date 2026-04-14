@@ -38,12 +38,15 @@ func buildBatchGroups(state *BatchState, items []BatchItem) batchBuildResult {
 			result.groupOrder = append(result.groupOrder, req.GroupKey)
 			queues = nextGroupQueueMap(state)
 			result.groupState[req.GroupKey] = queues
+			result.streamOrder[req.GroupKey] = nextStreamOrderSlice(state)
 		}
 		streamKey := syntheticStreamKey(req, i)
-		if _, ok := queues[streamKey]; !ok {
+		queue, ok := queues[streamKey]
+		if !ok {
 			result.streamOrder[req.GroupKey] = append(result.streamOrder[req.GroupKey], streamKey)
+			queue = nextGroupQueueEntrySlice(state)
 		}
-		queues[streamKey] = append(queues[streamKey], i)
+		queues[streamKey] = append(queue, i)
 		result.queuedBytes[streamKey] = SaturatingAdd(result.queuedBytes[streamKey], uint64(normalizeCost(req.Cost)))
 		if req.StreamScoped {
 			if result.streamMeta == nil {

@@ -310,7 +310,7 @@ func TestWrapSessionUpdateMetadataAfterVisibilityUnavailable(t *testing.T) {
 	_ = stream.Close()
 }
 
-func TestWrapSessionAcceptStreamPreservesOrderAcrossStalledPreludeTimeout(t *testing.T) {
+func TestWrapSessionAcceptStreamReturnsReadyStreamAheadOfStalledPrelude(t *testing.T) {
 	client, server := newWrappedPairWithOptions(t, SessionOptions{}, SessionOptions{
 		AcceptedPreludeReadTimeout: 100 * time.Millisecond,
 	})
@@ -344,17 +344,9 @@ func TestWrapSessionAcceptStreamPreservesOrderAcrossStalledPreludeTimeout(t *tes
 		t.Fatalf("ready Write err = %v", err)
 	}
 
-	firstAccepted, err := server.AcceptStream(ctx)
-	if err == nil {
-		t.Fatalf("first AcceptStream = (%v, nil), want protocol error", firstAccepted)
-	}
-	if !zmux.IsErrorCode(err, zmux.CodeProtocol) {
-		t.Fatalf("first AcceptStream err = %v, want protocol error", err)
-	}
-
 	accepted, err := server.AcceptStream(ctx)
 	if err != nil {
-		t.Fatalf("second AcceptStream err = %v", err)
+		t.Fatalf("first AcceptStream err = %v", err)
 	}
 	if accepted.StreamID() != ready.StreamID() {
 		t.Fatalf("accepted StreamID = %d, want %d", accepted.StreamID(), ready.StreamID())
@@ -367,11 +359,32 @@ func TestWrapSessionAcceptStreamPreservesOrderAcrossStalledPreludeTimeout(t *tes
 	if !bytes.Equal(buf, []byte("x")) {
 		t.Fatalf("ReadFull = %q, want %q", buf, []byte("x"))
 	}
-
 	_ = accepted.Close()
+
+	time.Sleep(250 * time.Millisecond)
+
+	next, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream next err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = next.Close()
+	})
+	if _, err := next.Write([]byte("y")); err != nil {
+		t.Fatalf("next Write err = %v", err)
+	}
+
+	acceptedNext, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("second AcceptStream err = %v", err)
+	}
+	if acceptedNext.StreamID() != next.StreamID() {
+		t.Fatalf("second accepted StreamID = %d, want %d", acceptedNext.StreamID(), next.StreamID())
+	}
+	_ = acceptedNext.Close()
 }
 
-func TestWrapSessionConcurrentAcceptStreamDoesNotOvertakeStalledPrelude(t *testing.T) {
+func TestWrapSessionConcurrentAcceptStreamAllowsReadyStreamsToBypassStalledPrelude(t *testing.T) {
 	client, server := newWrappedPairWithOptions(t, SessionOptions{}, SessionOptions{
 		AcceptedPreludeReadTimeout: 100 * time.Millisecond,
 	})
@@ -403,6 +416,16 @@ func TestWrapSessionConcurrentAcceptStreamDoesNotOvertakeStalledPrelude(t *testi
 	})
 	if _, err := ready.Write([]byte("x")); err != nil {
 		t.Fatalf("ready Write err = %v", err)
+	}
+	secondReady, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream second ready err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = secondReady.Close()
+	})
+	if _, err := secondReady.Write([]byte("y")); err != nil {
+		t.Fatalf("second ready Write err = %v", err)
 	}
 
 	type acceptResult struct {
@@ -418,33 +441,81 @@ func TestWrapSessionConcurrentAcceptStreamDoesNotOvertakeStalledPrelude(t *testi
 	}
 
 	first := <-acceptCh
-	if first.err == nil {
-		t.Fatalf("first concurrent AcceptStream = (%v, nil), want protocol error", first.stream)
-	}
-	if !zmux.IsErrorCode(first.err, zmux.CodeProtocol) {
-		t.Fatalf("first concurrent AcceptStream err = %v, want protocol error", first.err)
-	}
-
 	second := <-acceptCh
-	if second.err != nil {
-		t.Fatalf("second concurrent AcceptStream err = %v", second.err)
+	results := []acceptResult{first, second}
+	wantIDs := map[uint64]struct{}{
+		ready.StreamID():       {},
+		secondReady.StreamID(): {},
 	}
-	if second.stream == nil {
-		t.Fatal("second concurrent AcceptStream stream = nil, want ready stream")
+	for i, result := range results {
+		if result.err != nil {
+			t.Fatalf("accept result %d err = %v", i, result.err)
+		}
+		if result.stream == nil {
+			t.Fatalf("accept result %d stream = nil, want ready stream", i)
+		}
+		if _, ok := wantIDs[result.stream.StreamID()]; !ok {
+			t.Fatalf("accept result %d StreamID = %d, want one of %v", i, result.stream.StreamID(), []uint64{ready.StreamID(), secondReady.StreamID()})
+		}
+		delete(wantIDs, result.stream.StreamID())
+		_ = result.stream.Close()
 	}
-	if second.stream.StreamID() != ready.StreamID() {
-		t.Fatalf("accepted StreamID = %d, want %d", second.stream.StreamID(), ready.StreamID())
+	if len(wantIDs) != 0 {
+		t.Fatalf("missing accepted StreamIDs: %v", wantIDs)
+	}
+}
+
+func TestWrapSessionAcceptLoopBoundsConcurrentPreludePreparation(t *testing.T) {
+	clientConn, serverConn := newQUICConnPair(t)
+	countedServerConn := &countingSessionConn{SessionConn: serverConn}
+	serverSession := WrapSessionWithOptions(countedServerConn, SessionOptions{
+		AcceptedPreludeReadTimeout: -1,
+	})
+	serverAdapter, _ := serverSession.(*quicSession)
+	if serverAdapter == nil {
+		t.Fatal("wrapped server session = nil adapter session, want quicSession")
+	}
+	_ = serverAdapter.ensureBidiAcceptLoop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	streams := make([]*quic.Stream, 0, acceptedPreludePrepareWorkers+8)
+	for i := 0; i < acceptedPreludePrepareWorkers+8; i++ {
+		stream, err := clientConn.OpenStreamSync(ctx)
+		if err != nil {
+			t.Fatalf("OpenStreamSync %d err = %v", i, err)
+		}
+		if _, err := stream.Write([]byte{0x40}); err != nil {
+			t.Fatalf("stream %d partial prelude write err = %v", i, err)
+		}
+		streams = append(streams, stream)
+	}
+	for _, stream := range streams {
+		stream := stream
+		t.Cleanup(func() {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			_ = stream.Close()
+		})
 	}
 
-	buf := make([]byte, 1)
-	if _, err := io.ReadFull(second.stream, buf); err != nil {
-		t.Fatalf("ReadFull err = %v", err)
-	}
-	if !bytes.Equal(buf, []byte("x")) {
-		t.Fatalf("ReadFull = %q, want %q", buf, []byte("x"))
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if countedServerConn.bidiAcceptCount() >= acceptedPreludePrepareWorkers {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	_ = second.stream.Close()
+	if got := countedServerConn.bidiAcceptCount(); got < acceptedPreludePrepareWorkers {
+		t.Fatalf("accepted bidi stream count = %d, want at least %d active worker handoffs", got, acceptedPreludePrepareWorkers)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	if got := countedServerConn.bidiAcceptCount(); got > acceptedPreludePrepareWorkers+1 {
+		t.Fatalf("accepted bidi stream count = %d, want at most %d with fixed prelude worker pool", got, acceptedPreludePrepareWorkers+1)
+	}
 }
 
 func TestWrapSessionCancelWriteMakesLocalWriteFailImmediately(t *testing.T) {
@@ -588,6 +659,43 @@ func TestEnsureOpenPreludeWithContextCancelsBlockedWrite(t *testing.T) {
 	}
 	if deadlines[0].IsZero() {
 		t.Fatalf("first deadline = %v, want non-zero cancellation deadline", deadlines[0])
+	}
+	if !deadlines[len(deadlines)-1].IsZero() {
+		t.Fatalf("last deadline = %v, want cleared zero deadline", deadlines[len(deadlines)-1])
+	}
+}
+
+func TestInstallContextWriteDeadlineDoesNotLeaveStaleExpiredDeadline(t *testing.T) {
+	setter := newBlockedWriteDeadlineSetter()
+	ctx, cancel := context.WithCancel(context.Background())
+	restore := installContextWriteDeadline(ctx, setter)
+
+	cancel()
+	<-setter.nonZeroStarted
+
+	restoreDone := make(chan struct{})
+	go func() {
+		defer close(restoreDone)
+		restore()
+	}()
+
+	select {
+	case <-restoreDone:
+		t.Fatal("restore returned before in-flight cancellation deadline write was released")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(setter.releaseNonZero)
+
+	select {
+	case <-restoreDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("restore did not finish after releasing cancellation deadline write")
+	}
+
+	deadlines := setter.deadlineCalls()
+	if len(deadlines) < 2 {
+		t.Fatalf("deadline call count = %d, want at least 2", len(deadlines))
 	}
 	if !deadlines[len(deadlines)-1].IsZero() {
 		t.Fatalf("last deadline = %v, want cleared zero deadline", deadlines[len(deadlines)-1])
@@ -789,6 +897,28 @@ func newQUICConnPair(t *testing.T) (*quic.Conn, *quic.Conn) {
 	return clientConn, serverResult.conn
 }
 
+type countingSessionConn struct {
+	SessionConn
+	mu              sync.Mutex
+	bidiAcceptCalls int
+}
+
+func (c *countingSessionConn) AcceptStream(ctx context.Context) (*quic.Stream, error) {
+	stream, err := c.SessionConn.AcceptStream(ctx)
+	if err == nil {
+		c.mu.Lock()
+		c.bidiAcceptCalls++
+		c.mu.Unlock()
+	}
+	return stream, err
+}
+
+func (c *countingSessionConn) bidiAcceptCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bidiAcceptCalls
+}
+
 type partialPreludeWriter struct {
 	bytes.Buffer
 	failAfter int
@@ -851,6 +981,41 @@ func (w *deadlineAwareWriter) deadlineCalls() []time.Time {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]time.Time(nil), w.deadlines...)
+}
+
+type blockedWriteDeadlineSetter struct {
+	mu             sync.Mutex
+	deadlines      []time.Time
+	nonZeroStarted chan struct{}
+	releaseNonZero chan struct{}
+}
+
+func newBlockedWriteDeadlineSetter() *blockedWriteDeadlineSetter {
+	return &blockedWriteDeadlineSetter{
+		nonZeroStarted: make(chan struct{}),
+		releaseNonZero: make(chan struct{}),
+	}
+}
+
+func (s *blockedWriteDeadlineSetter) SetWriteDeadline(t time.Time) error {
+	if !t.IsZero() {
+		select {
+		case <-s.nonZeroStarted:
+		default:
+			close(s.nonZeroStarted)
+		}
+		<-s.releaseNonZero
+	}
+	s.mu.Lock()
+	s.deadlines = append(s.deadlines, t)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *blockedWriteDeadlineSetter) deadlineCalls() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.deadlines...)
 }
 
 func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {

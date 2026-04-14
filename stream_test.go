@@ -36,6 +36,22 @@ func (h *addrOnlyWriteHalf) SetWriteDeadline(time.Time) error { return nil }
 func (h *addrOnlyWriteHalf) LocalAddr() net.Addr              { return h.local }
 func (h *addrOnlyWriteHalf) RemoteAddr() net.Addr             { return h.remote }
 
+type closeErrReadHalf struct{ err error }
+
+func (h *closeErrReadHalf) Read(_ []byte) (int, error)      { return 0, io.EOF }
+func (h *closeErrReadHalf) CloseRead() error                { return h.err }
+func (h *closeErrReadHalf) SetReadDeadline(time.Time) error { return nil }
+func (h *closeErrReadHalf) LocalAddr() net.Addr             { return nil }
+func (h *closeErrReadHalf) RemoteAddr() net.Addr            { return nil }
+
+type closeErrWriteHalf struct{ err error }
+
+func (h *closeErrWriteHalf) Write(p []byte) (int, error)      { return len(p), nil }
+func (h *closeErrWriteHalf) CloseWrite() error                { return h.err }
+func (h *closeErrWriteHalf) SetWriteDeadline(time.Time) error { return nil }
+func (h *closeErrWriteHalf) LocalAddr() net.Addr              { return nil }
+func (h *closeErrWriteHalf) RemoteAddr() net.Addr             { return nil }
+
 type blockingCloseReadHalf struct {
 	closeStarted chan struct{}
 	releaseClose chan struct{}
@@ -477,6 +493,22 @@ func TestJoinedConnCloseClosesPresentHalves(t *testing.T) {
 
 	if _, err := clientSend.Write([]byte("x")); err == nil {
 		t.Fatal("expected Write to fail after peer JoinedConn Close")
+	}
+}
+
+func TestJoinedConnCloseJoinsHalfCloseErrors(t *testing.T) {
+	t.Parallel()
+
+	readErr := io.ErrClosedPipe
+	writeErr := os.ErrDeadlineExceeded
+	conn := JoinConn(&closeErrReadHalf{err: readErr}, &closeErrWriteHalf{err: writeErr})
+
+	err := conn.Close()
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Close err = %v, want joined read error %v", err, readErr)
+	}
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("Close err = %v, want joined write error %v", err, writeErr)
 	}
 }
 
@@ -3567,6 +3599,40 @@ func (c *stallingWriteCloser) Close() error {
 		close(c.release)
 	}
 	return nil
+}
+
+func TestCloseStillStopsReadAndTerminatesWriteAfterCloseWriteDeadline(t *testing.T) {
+	t.Parallel()
+
+	c, first, stream, writer := newBlockedWriterConnWithStreams(t)
+	firstErrCh := startBlockedFirstWrite(t, first, writer)
+	defer func() {
+		if err := releaseBlockedFirstWrite(t, writer, firstErrCh); err != nil {
+			t.Fatalf("release blocked first write: %v", err)
+		}
+	}()
+
+	if err := stream.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline second: %v", err)
+	}
+	if err := stream.Close(); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Close err = %v, want deadline exceeded", err)
+	}
+	if _, err := stream.Read(make([]byte, 1)); !errors.Is(err, ErrReadClosed) && !appErrorIs(err, CodeCancelled) {
+		t.Fatalf("Read after Close deadline err = %v, want %v or %s", err, ErrReadClosed, CodeCancelled)
+	}
+
+	c.mu.Lock()
+	readStopped := stream.readStopSentLocked()
+	sendTerminal := state.SendTerminal(stream.effectiveSendHalfStateLocked())
+	c.mu.Unlock()
+
+	if !readStopped {
+		t.Fatal("Close did not stop the read side after CloseWrite deadline")
+	}
+	if !sendTerminal {
+		t.Fatal("Close did not terminate the write side after CloseWrite deadline")
+	}
 }
 
 func TestStreamReadDeadlineExpires(t *testing.T) {

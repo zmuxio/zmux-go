@@ -103,24 +103,32 @@ func ExpectedNextPeerStreamID(streamID, nextPeerBidi, nextPeerUni uint64) uint64
 	return nextPeerUni
 }
 
-func PeerStreamWithinLimit(bidi bool, activePeerBidi, activePeerUni, maxIncomingBidi, maxIncomingUni uint64) bool {
+func ActiveStreamWithinLimit(bidi bool, activeBidi, activeUni, maxIncomingBidi, maxIncomingUni uint64) bool {
 	if bidi {
-		return activePeerBidi < maxIncomingBidi
+		return activeBidi < maxIncomingBidi
 	}
-	return activePeerUni < maxIncomingUni
+	return activeUni < maxIncomingUni
+}
+
+func PeerStreamWithinLimit(bidi bool, activePeerBidi, activePeerUni, maxIncomingBidi, maxIncomingUni uint64) bool {
+	return ActiveStreamWithinLimit(bidi, activePeerBidi, activePeerUni, maxIncomingBidi, maxIncomingUni)
+}
+
+func DecrementActiveStreamCount(bidi bool, activeBidi, activeUni uint64) (uint64, uint64) {
+	if bidi {
+		if activeBidi > 0 {
+			activeBidi--
+		}
+		return activeBidi, activeUni
+	}
+	if activeUni > 0 {
+		activeUni--
+	}
+	return activeBidi, activeUni
 }
 
 func DecrementActivePeerCount(bidi bool, activePeerBidi, activePeerUni uint64) (uint64, uint64) {
-	if bidi {
-		if activePeerBidi > 0 {
-			activePeerBidi--
-		}
-		return activePeerBidi, activePeerUni
-	}
-	if activePeerUni > 0 {
-		activePeerUni--
-	}
-	return activePeerBidi, activePeerUni
+	return DecrementActiveStreamCount(bidi, activePeerBidi, activePeerUni)
 }
 
 func InitialSendWindow(localRole wire.Role, peer wire.Settings, streamID uint64) uint64 {

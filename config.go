@@ -157,8 +157,8 @@ type Config struct {
 	NonceSource       io.Reader
 	KeepaliveInterval time.Duration
 	// KeepaliveTimeout bounds how long an outstanding keepalive ping may remain
-	// unanswered before the session is aborted. When left at the repository
-	// default, the runtime may raise the effective timeout from observed RTT
+	// unanswered before the session is aborted. When left at zero, the runtime
+	// derives an adaptive default from the keepalive interval and observed RTT
 	// within bounded caps so very high latency links remain usable.
 	KeepaliveTimeout time.Duration
 

@@ -314,6 +314,13 @@ func (s *nativeStream) shouldFinalizePeerActiveLocked() bool {
 	)
 }
 
+func (s *nativeStream) shouldFinalizeLocalActiveLocked() bool {
+	return s != nil &&
+		s.activeCountedFlag() &&
+		s.isLocalOpenedLocked() &&
+		state.FullyTerminal(s.localSend, s.localReceive, s.effectiveSendHalfStateLocked(), s.effectiveRecvHalfStateLocked())
+}
+
 func (s *nativeStream) recvAbortiveLocked() bool {
 	switch s.effectiveRecvHalfStateLocked() {
 	case state.RecvHalfReset, state.RecvHalfAborted:

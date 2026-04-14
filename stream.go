@@ -589,8 +589,9 @@ func (s *nativeStream) Read(p []byte) (int, error) {
 		}
 		if err := s.readErrLocked(); err != nil {
 			s.conn.maybeFinalizePeerActiveLocked(s)
+			surfaceErr := s.readSurfaceErrLocked(err)
 			s.conn.mu.Unlock()
-			return 0, s.readSurfaceErrLocked(err)
+			return 0, surfaceErr
 		}
 		notifyCh, deadline := s.readWaitSnapshotLocked()
 		s.conn.mu.Unlock()
@@ -1539,12 +1540,22 @@ func (s *nativeStream) Close() error {
 	needsCloseWrite = s.localSend && !state.SendTerminal(s.effectiveSendHalfStateLocked())
 	needsCloseRead = s.localReceive && !state.RecvTerminal(s.effectiveRecvHalfStateLocked()) && !s.readStopSentLocked()
 	s.conn.mu.Unlock()
+	var errs []error
 	if needsCloseWrite {
 		if err := s.CloseWrite(); err != nil &&
 			!errors.Is(err, ErrStreamNotWritable) &&
 			!errors.Is(err, ErrWriteClosed) &&
 			!errors.Is(err, ErrReadClosed) {
-			return err
+			errs = append(errs, err)
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				if cancelErr := s.CancelWrite(uint64(CodeCancelled)); cancelErr != nil &&
+					!errors.Is(cancelErr, ErrStreamNotWritable) &&
+					!errors.Is(cancelErr, ErrWriteClosed) &&
+					!errors.Is(cancelErr, ErrReadClosed) &&
+					!errors.Is(cancelErr, ErrSessionClosed) {
+					errs = append(errs, cancelErr)
+				}
+			}
 		}
 	}
 	if needsCloseRead {
@@ -1552,10 +1563,10 @@ func (s *nativeStream) Close() error {
 			!errors.Is(err, ErrStreamNotReadable) &&
 			!errors.Is(err, ErrReadClosed) &&
 			!errors.Is(err, ErrWriteClosed) {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *nativeStream) CloseWithError(code uint64, reason string) error {

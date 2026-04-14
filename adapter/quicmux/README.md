@@ -28,6 +28,7 @@ session := quicmux.WrapSessionWithOptions(qconn, quicmux.SessionOptions{
 
 - `0`: use `quicmux.DefaultAcceptedPreludeReadTimeout`
 - `< 0`: disable the adapter-managed timeout
+- accepted QUIC streams whose adapter prelude never arrives in time are dropped instead of blocking later ready streams
 
 ## Stable API Coverage
 
@@ -53,6 +54,8 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
 
 - `AcceptStream` / `OpenStream` map to QUIC bidirectional streams
 - `AcceptUniStream` / `OpenUniStream` map to QUIC unidirectional streams
+- accepted-stream prelude parsing runs in the background, so later ready streams can be accepted before stalled or invalid
+  adapter preludes time out
 - `CloseRead` maps to QUIC `CancelRead(CANCELLED)`
 - `CancelRead(code)` maps to QUIC `CancelRead(code)`
 - `CloseWrite` maps to QUIC send-side `Close`

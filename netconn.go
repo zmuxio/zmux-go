@@ -241,16 +241,18 @@ func (c *JoinedConn) Close() error {
 	c.broadcastWriteLocked()
 	c.mu.Unlock()
 
-	var readErr error
+	var errs []error
 	if readHalf != nil {
-		readErr = readHalf.CloseRead()
-	}
-	if writeHalf != nil {
-		if err := writeHalf.CloseWrite(); err != nil && readErr == nil {
-			return err
+		if err := readHalf.CloseRead(); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	return readErr
+	if writeHalf != nil {
+		if err := writeHalf.CloseWrite(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (c *JoinedConn) SetDeadline(t time.Time) error {

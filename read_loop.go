@@ -242,6 +242,18 @@ type protocolTask struct {
 	deadline  time.Time
 }
 
+func (t protocolTask) dropOnOverflow() bool {
+	if t.kind != protocolTaskQueueFrame {
+		return false
+	}
+	switch t.frame.Type {
+	case FrameTypePONG, FrameTypeABORT:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *Conn) executeReadLoopProtocolTask(task protocolTask) error {
 	if c == nil {
 		return ErrSessionClosed
@@ -287,6 +299,10 @@ func (c *Conn) enqueueReadLoopProtocolTask(task protocolTask) error {
 	c.startReadLoopProtocolLoopLocked()
 	if len(c.protocol.tasks) >= maxPendingReadLoopProtocolJobs {
 		c.metrics.protocolBacklogBlocked = saturatingAdd(c.metrics.protocolBacklogBlocked, 1)
+		if task.dropOnOverflow() {
+			c.mu.Unlock()
+			return nil
+		}
 		c.mu.Unlock()
 		return wireError(CodeInternal, "queue protocol action", fmt.Errorf("pending read-loop protocol backlog exceeded"))
 	}

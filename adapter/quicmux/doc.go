@@ -8,6 +8,8 @@
 //   - QUIC stream cancelation codes surface as zmux ApplicationError values
 //   - open-time zmux metadata is carried through a tiny per-stream prelude:
 //     varint(metadata_len) followed by metadata TLVs
+//   - accepted-stream prelude parsing runs in the background so stalled or
+//     invalid adapter preludes do not block later ready streams
 //   - post-open metadata updates are not representable on the QUIC wire and
 //     return ErrAdapterUnsupported joined with ErrPriorityUpdateUnavailable
 //   - stream-level reason strings are advisory-only in the zmux API and are

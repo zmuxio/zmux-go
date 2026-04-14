@@ -2321,6 +2321,44 @@ func TestEventSessionClosed(t *testing.T) {
 	}
 }
 
+func TestEventSessionClosedHandlerCanReenterClose(t *testing.T) {
+	t.Parallel()
+
+	var client *Conn
+	handlerDone := make(chan struct{}, 1)
+	clientCfg := &Config{
+		EventHandler: func(ev Event) {
+			if ev.Type != EventSessionClosed {
+				return
+			}
+			_ = client.Close()
+			select {
+			case handlerDone <- struct{}{}:
+			default:
+			}
+		},
+	}
+	client, _ = newConnPairWithConfig(t, clientCfg, nil)
+
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		client.CloseWithError(&ApplicationError{Code: uint64(CodeInternal), Reason: "close test"})
+	}()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("session closed handler did not finish after reentering Close")
+	}
+
+	select {
+	case <-closeDone:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("CloseWithError deadlocked while session closed handler reentered Close")
+	}
+}
+
 func TestEventStreamOpenedEmittedOnce(t *testing.T) {
 	t.Parallel()
 
@@ -4607,7 +4645,7 @@ func TestPeerPingReplyDroppedWhenSessionClosesDuringReplyQueue(t *testing.T) {
 	}
 }
 
-func TestReadLoopProtocolQueueDoesNotBlockWhenWorkerStalls(t *testing.T) {
+func TestReadLoopProtocolQueueDropsBestEffortFramesWhenWorkerStalls(t *testing.T) {
 	t.Parallel()
 
 	settings := DefaultSettings()
@@ -4646,6 +4684,7 @@ func TestReadLoopProtocolQueueDoesNotBlockWhenWorkerStalls(t *testing.T) {
 	}
 
 	pongFrame := flatTxFrame(Frame{Type: FrameTypePONG, Payload: []byte{0, 1, 2, 3, 4, 5, 6, 7}})
+	abortFrame := flatTxFrame(Frame{Type: FrameTypeABORT, StreamID: 4, Payload: mustEncodeVarint(uint64(CodeStreamClosed))})
 	firstDone := make(chan struct{}, 1)
 	go func() {
 		c.queueReadLoopFrameAsync(pongFrame)
@@ -4676,6 +4715,7 @@ func TestReadLoopProtocolQueueDoesNotBlockWhenWorkerStalls(t *testing.T) {
 	go func() {
 		for i := 0; i < 512; i++ {
 			c.queueReadLoopFrameAsync(pongFrame)
+			c.queueReadLoopFrameAsync(abortFrame)
 		}
 		floodDone <- struct{}{}
 	}()
@@ -4692,11 +4732,14 @@ func TestReadLoopProtocolQueueDoesNotBlockWhenWorkerStalls(t *testing.T) {
 		backlogBlocked := c.metrics.protocolBacklogBlocked
 		closeErr := c.lifecycle.closeErr
 		c.mu.Unlock()
-		if backlogBlocked > 0 && closeErr != nil {
+		if backlogBlocked > 0 {
+			if closeErr != nil {
+				t.Fatalf("protocol backlog overflow closeErr = %v, want nil for droppable frames", closeErr)
+			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for protocol backlog overflow to close the session")
+			t.Fatal("timed out waiting for protocol backlog overflow to drop best-effort frames")
 		}
 		runtime.Gosched()
 	}
@@ -10658,6 +10701,65 @@ func TestCheckLocalOpenPossibleLimitedByTrackedMemoryCap(t *testing.T) {
 	}
 }
 
+func TestCheckLocalOpenPossibleRefusesWhenPeerIncomingBidiSlotsAreExhausted(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	c.mu.Lock()
+	c.config.peer.Settings.MaxIncomingStreamsBidi = 1
+	c.registry.activeLocalBidi = 1
+	err := c.checkLocalOpenPossibleLocked(streamArityBidi)
+	c.mu.Unlock()
+
+	var appErr *ApplicationError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("checkLocalOpenPossibleLocked err = %v, want ApplicationError", err)
+	}
+	if appErr.Code != uint64(CodeRefusedStream) {
+		t.Fatalf("checkLocalOpenPossibleLocked code = %d, want %d", appErr.Code, uint64(CodeRefusedStream))
+	}
+}
+
+func TestCheckLocalOpenPossibleCountsPendingProvisionalsAgainstPeerIncomingLimit(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	c.mu.Lock()
+	c.config.peer.Settings.MaxIncomingStreamsBidi = 1
+	stream := &nativeStream{}
+	stream.setProvisionalCreated(time.Now())
+	c.queues.provisionalBidi.items = []*nativeStream{stream}
+	err := c.checkLocalOpenPossibleLocked(streamArityBidi)
+	c.mu.Unlock()
+
+	var appErr *ApplicationError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("checkLocalOpenPossibleLocked err = %v, want ApplicationError", err)
+	}
+	if appErr.Code != uint64(CodeRefusedStream) {
+		t.Fatalf("checkLocalOpenPossibleLocked code = %d, want %d", appErr.Code, uint64(CodeRefusedStream))
+	}
+}
+
+func TestMaybeFinalizePeerActiveLockedReleasesLocalActiveSlots(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	stream := testOpenedBidiStream(c, state.FirstLocalStreamID(c.config.negotiated.LocalRole, true))
+	testMarkLocalOpenVisible(stream)
+	stream.markActiveCounted()
+	stream.setSendFin()
+	stream.setRecvFin()
+
+	c.mu.Lock()
+	c.registry.activeLocalBidi = 1
+	c.maybeFinalizePeerActiveLocked(stream)
+	active := c.registry.activeLocalBidi
+	counted := stream.activeCountedFlag()
+	c.mu.Unlock()
+
+	if active != 0 {
+		t.Fatalf("activeLocalBidi after finalize = %d, want 0", active)
+	}
+	if counted {
+		t.Fatal("local stream remained active-counted after finalize")
+	}
+}
+
 func TestEnforceHiddenControlStateBudgetShedsHiddenStateUnderTrackedMemoryCap(t *testing.T) {
 	c := newSessionMemoryTestConn()
 	c.mu.Lock()
@@ -12069,18 +12171,13 @@ func TestPeerOpenedBidiStreamRetainsIncomingSlotUntilLocalSendHalfTerminates(t *
 		t.Fatalf("activePeerBidi after peer FIN = %d, want 1", activeBeforeCloseWrite)
 	}
 
-	second, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("open second bidi stream before slot release: %v", err)
+	_, err = client.OpenStream(ctx)
+	var appErr *ApplicationError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("open second bidi stream before slot release err = %v, want ApplicationError", err)
 	}
-	if _, err := second.Write([]byte("no")); err != nil && !IsErrorCode(err, CodeRefusedStream) {
-		t.Fatalf("write second bidi stream before slot release: %v", err)
-	}
-	awaitStreamReadState(t, requireNativeStreamImpl(t, second), testSignalTimeout, func(stream *nativeStream) bool {
-		return stream.recvAbort != nil
-	}, "peer-opened bidi slot limit did not refuse the second stream before local send-half termination")
-	if _, err := second.Read(buf); !IsErrorCode(err, CodeRefusedStream) {
-		t.Fatalf("second bidi read err = %v, want %s", err, CodeRefusedStream)
+	if appErr.Code != uint64(CodeRefusedStream) {
+		t.Fatalf("open second bidi stream error code = %d, want %d", appErr.Code, uint64(CodeRefusedStream))
 	}
 
 	server.mu.Lock()
@@ -26459,6 +26556,28 @@ func TestNextKeepaliveActionUsesObservedRTTFloorBeforeTimeout(t *testing.T) {
 	}
 	if !c.liveness.pingOutstanding {
 		t.Fatal("nextKeepaliveAction cleared outstanding ping before adaptive timeout elapsed")
+	}
+}
+
+func TestEffectiveKeepaliveTimeoutLockedUsesAdaptiveDefaultWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	c.liveness.keepaliveInterval = 10 * time.Second
+
+	if got := c.effectiveKeepaliveTimeoutLocked(); got != 20*time.Second {
+		t.Fatalf("effectiveKeepaliveTimeoutLocked() = %v, want %v", got, 20*time.Second)
+	}
+
+	c.liveness.lastPingRTT = 8 * time.Second
+	want := 4*(8*time.Second) + rttAdaptiveSlack
+	if got := c.effectiveKeepaliveTimeoutLocked(); got != want {
+		t.Fatalf("effectiveKeepaliveTimeoutLocked() with RTT floor = %v, want %v", got, want)
+	}
+
+	c.liveness.lastPingRTT = 20 * time.Second
+	if got := c.effectiveKeepaliveTimeoutLocked(); got != defaultKeepaliveTimeoutMax {
+		t.Fatalf("effectiveKeepaliveTimeoutLocked() cap = %v, want %v", got, defaultKeepaliveTimeoutMax)
 	}
 }
 

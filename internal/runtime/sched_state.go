@@ -64,7 +64,11 @@ type batchScratch struct {
 	groupState                map[GroupKey]map[uint64][]int
 	groupQueues               []map[uint64][]int
 	groupQueueCount           int
+	groupQueueEntries         [][]int
+	groupQueueEntryCount      int
 	streamOrder               map[GroupKey][]uint64
+	streamOrderEntries        [][]uint64
+	streamOrderEntryCount     int
 	queuedBytes               map[uint64]uint64
 	streamMeta                map[uint64]StreamMeta
 	activeGroups              []wfqActiveGroup
@@ -304,7 +308,11 @@ func prepareBatchScratchForBuild(state *BatchState, capHint int) {
 		state.scratch.groupState = nil
 		state.scratch.groupQueues = nil
 		state.scratch.groupQueueCount = 0
+		state.scratch.groupQueueEntries = nil
+		state.scratch.groupQueueEntryCount = 0
 		state.scratch.streamOrder = nil
+		state.scratch.streamOrderEntries = nil
+		state.scratch.streamOrderEntryCount = 0
 		state.scratch.queuedBytes = nil
 		state.scratch.streamMeta = nil
 		state.scratch.transientStreamFinish = nil
@@ -390,8 +398,14 @@ func groupStateMap(state *BatchState, capHint int) map[GroupKey]map[uint64][]int
 		return make(map[GroupKey]map[uint64][]int, capHint)
 	}
 	state.scratch.groupQueueCount = 0
+	state.scratch.groupQueueEntryCount = 0
 	if batchScratchOversized(len(state.scratch.groupQueues), capHint) {
 		state.scratch.groupQueues = nil
+	}
+	if batchScratchOversized(len(state.scratch.groupQueueEntries), capHint) {
+		state.scratch.groupQueueEntries = nil
+	} else if state.scratch.groupQueueEntries != nil {
+		state.scratch.groupQueueEntries = state.scratch.groupQueueEntries[:0]
 	}
 	if state.scratch.groupState == nil {
 		state.scratch.groupState = make(map[GroupKey]map[uint64][]int, capHint)
@@ -407,6 +421,7 @@ func nextGroupQueueMap(state *BatchState) map[uint64][]int {
 	}
 	if state.scratch.groupQueueCount < len(state.scratch.groupQueues) {
 		out := state.scratch.groupQueues[state.scratch.groupQueueCount]
+		recycleGroupQueueEntrySlices(state, out)
 		clear(out)
 		state.scratch.groupQueueCount++
 		return out
@@ -421,12 +436,67 @@ func streamOrderMap(state *BatchState, capHint int) map[GroupKey][]uint64 {
 	if state == nil {
 		return make(map[GroupKey][]uint64, capHint)
 	}
+	state.scratch.streamOrderEntryCount = 0
+	if batchScratchOversized(len(state.scratch.streamOrderEntries), capHint) {
+		state.scratch.streamOrderEntries = nil
+	} else if state.scratch.streamOrderEntries != nil {
+		state.scratch.streamOrderEntries = state.scratch.streamOrderEntries[:0]
+	}
 	if state.scratch.streamOrder == nil {
 		state.scratch.streamOrder = make(map[GroupKey][]uint64, capHint)
 	} else {
+		recycleStreamOrderSlices(state, state.scratch.streamOrder)
 		clear(state.scratch.streamOrder)
 	}
 	return state.scratch.streamOrder
+}
+
+func recycleGroupQueueEntrySlices(state *BatchState, queues map[uint64][]int) {
+	if state == nil {
+		return
+	}
+	for _, queue := range queues {
+		if batchScratchOversized(cap(queue), state.scratch.lastBuildCapHint) {
+			continue
+		}
+		state.scratch.groupQueueEntries = append(state.scratch.groupQueueEntries, queue[:0])
+	}
+}
+
+func nextGroupQueueEntrySlice(state *BatchState) []int {
+	if state == nil {
+		return nil
+	}
+	if state.scratch.groupQueueEntryCount >= len(state.scratch.groupQueueEntries) {
+		return nil
+	}
+	out := state.scratch.groupQueueEntries[state.scratch.groupQueueEntryCount]
+	state.scratch.groupQueueEntryCount++
+	return out[:0]
+}
+
+func recycleStreamOrderSlices(state *BatchState, orders map[GroupKey][]uint64) {
+	if state == nil {
+		return
+	}
+	for _, order := range orders {
+		if batchScratchOversized(cap(order), state.scratch.lastBuildCapHint) {
+			continue
+		}
+		state.scratch.streamOrderEntries = append(state.scratch.streamOrderEntries, order[:0])
+	}
+}
+
+func nextStreamOrderSlice(state *BatchState) []uint64 {
+	if state == nil {
+		return nil
+	}
+	if state.scratch.streamOrderEntryCount >= len(state.scratch.streamOrderEntries) {
+		return nil
+	}
+	out := state.scratch.streamOrderEntries[state.scratch.streamOrderEntryCount]
+	state.scratch.streamOrderEntryCount++
+	return out[:0]
 }
 
 func queuedBytesMap(state *BatchState) map[uint64]uint64 {

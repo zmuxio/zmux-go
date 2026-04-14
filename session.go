@@ -812,8 +812,9 @@ func (c *Conn) Stats() SessionStats {
 	}
 
 	stalled := false
-	if c.liveness.pingOutstanding && c.liveness.keepaliveTimeout > 0 {
-		stalled = time.Since(c.liveness.lastPingSentAt) > c.liveness.keepaliveTimeout/2
+	if c.liveness.pingOutstanding {
+		timeout := c.effectiveKeepaliveTimeoutLocked()
+		stalled = timeout > 0 && time.Since(c.liveness.lastPingSentAt) > timeout/2
 	}
 
 	queues := QueueStats{
@@ -1173,6 +1174,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 	}
 	var emitCloseFrame bool
 	var closeFramePayload []byte
+	var closeEvent *Event
 	c.shutdown.closeOnce.Do(func() {
 		c.mu.Lock()
 		if c.lifecycle.closeErr == nil {
@@ -1237,14 +1239,18 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		c.registry.usedStreamRangeMode = false
 		c.mu.Unlock()
 		if c != nil && c.observer.eventHandler != nil {
-			c.emitEvent(Event{
+			ev := Event{
 				Type:         EventSessionClosed,
 				SessionState: c.State(),
 				Err:          err,
 				Time:         time.Now(),
-			})
+			}
+			closeEvent = &ev
 		}
 	})
+	if closeEvent != nil {
+		c.emitEvent(*closeEvent)
+	}
 }
 
 func (c *Conn) closeFrameOutstandingLocked() bool {
@@ -1610,6 +1616,8 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 	c.sessionControl.goAwaySendActive = false
 	c.clearWriteQueueReservationsLocked()
 	c.clearWriteBatchStateLocked()
+	c.registry.activeLocalBidi = 0
+	c.registry.activeLocalUni = 0
 	c.registry.activePeerBidi = 0
 	c.registry.activePeerUni = 0
 
@@ -1632,6 +1640,8 @@ const sessionGracefulCloseDrainTimeout = 500 * time.Millisecond
 const sessionGracefulCloseDrainTimeoutMax = 5 * time.Second
 const stopSendingAdaptiveDrainWindowMax = 2 * time.Second
 const rttAdaptiveSlack = 50 * time.Millisecond
+const defaultKeepaliveTimeoutMin = 5 * time.Second
+const defaultKeepaliveTimeoutMax = 60 * time.Second
 const writerLaneBuffer = 128
 const advisoryLaneBuffer = 32
 
@@ -2504,8 +2514,10 @@ type connRegistryState struct {
 	nextPeerBidi  uint64
 	nextPeerUni   uint64
 
-	activePeerBidi uint64
-	activePeerUni  uint64
+	activeLocalBidi uint64
+	activeLocalUni  uint64
+	activePeerBidi  uint64
+	activePeerUni   uint64
 
 	nextVisibilitySeq uint64
 }
@@ -3616,9 +3628,16 @@ func (c *Conn) resetKeepaliveDueLocked(now time.Time) {
 }
 
 func (c *Conn) effectiveKeepaliveTimeoutLocked() time.Duration {
+	if c == nil {
+		return 0
+	}
 	timeout := c.liveness.keepaliveTimeout
 	if timeout <= 0 {
-		return 0
+		timeout = c.liveness.keepaliveInterval * 2
+		if timeout < defaultKeepaliveTimeoutMin {
+			timeout = defaultKeepaliveTimeoutMin
+		}
+		return adaptiveRTTTimeout(c.liveness.lastPingRTT, timeout, defaultKeepaliveTimeoutMax, 4, rttAdaptiveSlack)
 	}
 	if c.liveness.lastPingRTT > 0 {
 		floor := 4*c.liveness.lastPingRTT + rttAdaptiveSlack
@@ -4171,6 +4190,9 @@ func (c *Conn) checkLocalOpenAllowedLocked(id uint64, arity streamArity) error {
 	if state.LocalOpenRefusedByGoAway(id, arity.isBidi(), c.sessionControl.peerGoAwayBidi, c.sessionControl.peerGoAwayUni) {
 		return refusedStreamAppErr()
 	}
+	if !c.localOpenWithinPeerLimitLocked(arity, 0) {
+		return refusedStreamAppErr()
+	}
 	return nil
 }
 
@@ -4195,8 +4217,35 @@ func (c *Conn) checkLocalOpenPossibleWithOpenInfoLocked(arity streamArity, openI
 		c.ingress.provisionalLimited = saturatingAdd(c.ingress.provisionalLimited, 1)
 		return ErrOpenLimited
 	}
+	if !c.localOpenWithinPeerLimitLocked(arity, queueLen) {
+		return refusedStreamAppErr()
+	}
 	projected := state.ProjectedLocalOpenID(id, queueLen)
 	return c.checkLocalOpenAllowedLocked(projected, arity)
+}
+
+func (c *Conn) localOpenWithinPeerLimitLocked(arity streamArity, provisionalCount int) bool {
+	if c == nil {
+		return false
+	}
+	var (
+		active uint64
+		limit  uint64
+	)
+	if arity.isBidi() {
+		active = c.registry.activeLocalBidi
+		limit = c.config.peer.Settings.MaxIncomingStreamsBidi
+	} else {
+		active = c.registry.activeLocalUni
+		limit = c.config.peer.Settings.MaxIncomingStreamsUni
+	}
+	if active >= limit {
+		return false
+	}
+	if provisionalCount <= 0 {
+		return true
+	}
+	return saturatingAdd(active, uint64(provisionalCount)) < limit
 }
 
 func provisionalQueueShouldCompact(head, length, count int) bool {
@@ -4385,6 +4434,12 @@ func (c *Conn) commitLocalOpenLocked(stream *nativeStream) (localOpenCommitState
 	stream.id = id
 	stream.idSet = true
 	c.storeLiveStreamLocked(stream)
+	if stream.bidi {
+		c.registry.activeLocalBidi++
+	} else {
+		c.registry.activeLocalUni++
+	}
+	stream.markActiveCounted()
 	c.appendUnseenLocalLocked(stream)
 	c.maybeTrackStreamGroupLocked(stream)
 	createdAt := stream.provisionalCreatedAt()
@@ -4555,9 +4610,13 @@ func (c *Conn) maybeFinalizePeerActiveLocked(stream *nativeStream) {
 	if stream.isLocalOpenedLocked() && state.FullyTerminal(stream.localSend, stream.localReceive, stream.effectiveSendHalfStateLocked(), stream.effectiveRecvHalfStateLocked()) {
 		c.removeUnseenLocalLocked(stream)
 	}
+	if stream.shouldFinalizeLocalActiveLocked() {
+		stream.clearActiveCounted()
+		c.registry.activeLocalBidi, c.registry.activeLocalUni = state.DecrementActiveStreamCount(stream.bidi, c.registry.activeLocalBidi, c.registry.activeLocalUni)
+	}
 	if stream.shouldFinalizePeerActiveLocked() {
 		stream.clearActiveCounted()
-		c.registry.activePeerBidi, c.registry.activePeerUni = state.DecrementActivePeerCount(stream.bidi, c.registry.activePeerBidi, c.registry.activePeerUni)
+		c.registry.activePeerBidi, c.registry.activePeerUni = state.DecrementActiveStreamCount(stream.bidi, c.registry.activePeerBidi, c.registry.activePeerUni)
 	}
 	c.maybeCompactTerminalLocked(stream)
 	notify(c.signals.livenessCh)

@@ -446,6 +446,35 @@ func TestBuildBatchGroupsReusesAndClearsNestedQueueMaps(t *testing.T) {
 	}
 }
 
+func TestBuildBatchGroupsRecyclesNestedQueueAndOrderSlices(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	firstItems := []BatchItem{
+		{Request: RequestMeta{GroupKey: GroupKey{Kind: 0, Value: 4}, StreamID: 4, StreamScoped: true, Cost: 1}},
+		{Request: RequestMeta{GroupKey: GroupKey{Kind: 0, Value: 4}, StreamID: 8, StreamScoped: true, Cost: 1}},
+	}
+	buildBatchGroups(state, firstItems)
+
+	secondItems := []BatchItem{
+		{Request: RequestMeta{GroupKey: GroupKey{Kind: 0, Value: 4}, StreamID: 4, StreamScoped: true, Cost: 1}},
+	}
+	buildBatchGroups(state, secondItems)
+
+	if len(state.scratch.groupQueueEntries) == 0 {
+		t.Fatal("expected recycled nested queue slices after second build")
+	}
+	if state.scratch.groupQueueEntryCount == 0 {
+		t.Fatal("expected second build to reuse a recycled nested queue slice")
+	}
+	if len(state.scratch.streamOrderEntries) == 0 {
+		t.Fatal("expected recycled stream-order slices after second build")
+	}
+	if state.scratch.streamOrderEntryCount == 0 {
+		t.Fatal("expected second build to reuse a recycled stream-order slice")
+	}
+}
+
 func TestBuildBatchGroupsAccumulatesQueuedBytesDuringGrouping(t *testing.T) {
 	t.Parallel()
 

@@ -18,6 +18,8 @@ import (
 const quicmuxStreamPreludeMaxPayload = 16 << 10
 const metadataPayloadPoolInitCap = 128
 const metadataPayloadPoolMaxRetainedCap = 2 << 10
+const acceptedPreludeResultQueueCap = 32
+const acceptedPreludePrepareWorkers = 8
 
 const quicmuxOpenCaps = wire.CapabilityOpenMetadata | wire.CapabilityPriorityHints | wire.CapabilityStreamGroups
 
@@ -37,9 +39,9 @@ var emptyStreamPrelude = []byte{0}
 // SessionOptions configures adapter-local behavior that does not exist on the
 // stable zmux Session surface itself.
 type SessionOptions struct {
-	// AcceptedPreludeReadTimeout bounds how long AcceptStream / AcceptUniStream
-	// will wait for the peer's adapter prelude. Zero uses the default. Negative
-	// values disable the adapter-managed timeout.
+	// AcceptedPreludeReadTimeout bounds how long the adapter will wait for each
+	// accepted QUIC stream prelude before dropping that stream. Zero uses the
+	// default. Negative values disable the adapter-managed timeout.
 	AcceptedPreludeReadTimeout time.Duration
 }
 
@@ -73,6 +75,7 @@ func WrapSessionWithOptions(conn SessionConn, opts SessionOptions) zmux.Session 
 	return &quicSession{
 		conn:                       conn,
 		acceptedPreludeReadTimeout: normalizeAcceptedPreludeReadTimeout(opts.AcceptedPreludeReadTimeout),
+		prepareTasks:               make(chan acceptedPrepareTask),
 	}
 }
 
@@ -90,21 +93,26 @@ func normalizeAcceptedPreludeReadTimeout(timeout time.Duration) time.Duration {
 type quicSession struct {
 	conn                       SessionConn
 	acceptedPreludeReadTimeout time.Duration
+	prepareOnce                sync.Once
+	prepareTasks               chan acceptedPrepareTask
 	bidiOnce                   sync.Once
 	uniOnce                    sync.Once
 	bidiCh                     chan bidiAcceptResult
 	uniCh                      chan uniAcceptResult
-	bidiGate                   chan struct{}
-	uniGate                    chan struct{}
+}
+
+type acceptedPrepareTask struct {
+	bidi *quic.Stream
+	uni  *quic.ReceiveStream
 }
 
 type bidiAcceptResult struct {
-	stream *quic.Stream
+	stream zmux.Stream
 	err    error
 }
 
 type uniAcceptResult struct {
-	stream *quic.ReceiveStream
+	stream zmux.RecvStream
 	err    error
 }
 
@@ -113,11 +121,7 @@ func (s *quicSession) AcceptStream(ctx context.Context) (zmux.Stream, error) {
 		return nil, zmux.ErrSessionClosed
 	}
 	ctx = defaultContext(ctx)
-	ch, gate := s.ensureBidiAcceptLoop()
-	if err := acquireAcceptGate(ctx, s.conn.Context(), gate); err != nil {
-		return nil, err
-	}
-	defer releaseAcceptGate(gate)
+	ch := s.ensureBidiAcceptLoop()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -130,10 +134,7 @@ func (s *quicSession) AcceptStream(ctx context.Context) (zmux.Stream, error) {
 		if result.err != nil {
 			return nil, result.err
 		}
-		if result.stream == nil {
-			return nil, zmux.ErrSessionClosed
-		}
-		return newAcceptedBidiStream(s.conn, result.stream, s.acceptedPreludeReadTimeout)
+		return result.stream, nil
 	}
 }
 
@@ -142,11 +143,7 @@ func (s *quicSession) AcceptUniStream(ctx context.Context) (zmux.RecvStream, err
 		return nil, zmux.ErrSessionClosed
 	}
 	ctx = defaultContext(ctx)
-	ch, gate := s.ensureUniAcceptLoop()
-	if err := acquireAcceptGate(ctx, s.conn.Context(), gate); err != nil {
-		return nil, err
-	}
-	defer releaseAcceptGate(gate)
+	ch := s.ensureUniAcceptLoop()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -159,10 +156,7 @@ func (s *quicSession) AcceptUniStream(ctx context.Context) (zmux.RecvStream, err
 		if result.err != nil {
 			return nil, result.err
 		}
-		if result.stream == nil {
-			return nil, zmux.ErrSessionClosed
-		}
-		return newAcceptedRecvStream(s.conn, result.stream, s.acceptedPreludeReadTimeout)
+		return result.stream, nil
 	}
 }
 
@@ -295,52 +289,119 @@ func (s *quicSession) Stats() zmux.SessionStats {
 	}
 }
 
-func (s *quicSession) ensureBidiAcceptLoop() (<-chan bidiAcceptResult, chan struct{}) {
+func (s *quicSession) ensureBidiAcceptLoop() <-chan bidiAcceptResult {
 	if s == nil || s.conn == nil {
-		return nil, nil
+		return nil
 	}
 	s.bidiOnce.Do(func() {
-		s.bidiCh = make(chan bidiAcceptResult, 32)
-		s.bidiGate = make(chan struct{}, 1)
-		s.bidiGate <- struct{}{}
+		s.bidiCh = make(chan bidiAcceptResult, acceptedPreludeResultQueueCap)
 		go s.acceptBidiLoop()
 	})
-	return s.bidiCh, s.bidiGate
+	return s.bidiCh
 }
 
-func (s *quicSession) ensureUniAcceptLoop() (<-chan uniAcceptResult, chan struct{}) {
+func (s *quicSession) ensureUniAcceptLoop() <-chan uniAcceptResult {
 	if s == nil || s.conn == nil {
-		return nil, nil
+		return nil
 	}
 	s.uniOnce.Do(func() {
-		s.uniCh = make(chan uniAcceptResult, 32)
-		s.uniGate = make(chan struct{}, 1)
-		s.uniGate <- struct{}{}
+		s.uniCh = make(chan uniAcceptResult, acceptedPreludeResultQueueCap)
 		go s.acceptUniLoop()
 	})
-	return s.uniCh, s.uniGate
+	return s.uniCh
 }
 
 func (s *quicSession) acceptBidiLoop() {
+	s.ensurePrepareWorkers()
 	for {
 		stream, err := s.conn.AcceptStream(context.Background())
 		if err != nil {
 			s.publishBidiAcceptResult(bidiAcceptResult{err: translateError(err)})
 			return
 		}
-		s.publishBidiAcceptResult(bidiAcceptResult{stream: stream})
+		if !s.enqueuePrepareTask(acceptedPrepareTask{bidi: stream}) {
+			return
+		}
 	}
 }
 
 func (s *quicSession) acceptUniLoop() {
+	s.ensurePrepareWorkers()
 	for {
 		stream, err := s.conn.AcceptUniStream(context.Background())
 		if err != nil {
 			s.publishUniAcceptResult(uniAcceptResult{err: translateError(err)})
 			return
 		}
-		s.publishUniAcceptResult(uniAcceptResult{stream: stream})
+		if !s.enqueuePrepareTask(acceptedPrepareTask{uni: stream}) {
+			return
+		}
 	}
+}
+
+func (s *quicSession) ensurePrepareWorkers() {
+	if s == nil || s.conn == nil || s.prepareTasks == nil {
+		return
+	}
+	s.prepareOnce.Do(func() {
+		for range acceptedPreludePrepareWorkers {
+			go s.acceptPrepareLoop()
+		}
+	})
+}
+
+func (s *quicSession) enqueuePrepareTask(task acceptedPrepareTask) bool {
+	if s == nil || s.conn == nil || s.prepareTasks == nil {
+		return false
+	}
+	select {
+	case s.prepareTasks <- task:
+		return true
+	case <-s.conn.Context().Done():
+		return false
+	}
+}
+
+func (s *quicSession) acceptPrepareLoop() {
+	if s == nil || s.conn == nil || s.prepareTasks == nil {
+		return
+	}
+	for {
+		select {
+		case <-s.conn.Context().Done():
+			return
+		case task := <-s.prepareTasks:
+			if task.bidi != nil {
+				s.prepareAcceptedBidiStream(task.bidi)
+				continue
+			}
+			if task.uni != nil {
+				s.prepareAcceptedUniStream(task.uni)
+			}
+		}
+	}
+}
+
+func (s *quicSession) prepareAcceptedBidiStream(stream *quic.Stream) {
+	if s == nil || stream == nil {
+		return
+	}
+	wrapped, err := newAcceptedBidiStream(s.conn, stream, s.acceptedPreludeReadTimeout)
+	if err != nil {
+		return
+	}
+	s.publishBidiAcceptResult(bidiAcceptResult{stream: wrapped})
+}
+
+func (s *quicSession) prepareAcceptedUniStream(stream *quic.ReceiveStream) {
+	if s == nil || stream == nil {
+		return
+	}
+	wrapped, err := newAcceptedRecvStream(s.conn, stream, s.acceptedPreludeReadTimeout)
+	if err != nil {
+		return
+	}
+	s.publishUniAcceptResult(uniAcceptResult{stream: wrapped})
 }
 
 func (s *quicSession) publishBidiAcceptResult(result bidiAcceptResult) {
@@ -361,30 +422,6 @@ func (s *quicSession) publishUniAcceptResult(result uniAcceptResult) {
 	case s.uniCh <- result:
 	case <-s.conn.Context().Done():
 	}
-}
-
-func acquireAcceptGate(ctx context.Context, connCtx context.Context, gate chan struct{}) error {
-	if gate == nil {
-		return zmux.ErrSessionClosed
-	}
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-connCtx.Done():
-		if err := translateWaitError(context.Cause(connCtx)); err != nil {
-			return err
-		}
-		return zmux.ErrSessionClosed
-	case <-gate:
-		return nil
-	}
-}
-
-func releaseAcceptGate(gate chan struct{}) {
-	if gate == nil {
-		return
-	}
-	gate <- struct{}{}
 }
 
 type quicStreamBase struct {
@@ -867,8 +904,8 @@ func (s *quicStream) CancelWrite(code uint64) error {
 		return zmux.ErrSessionClosed
 	}
 	appErr := &zmux.ApplicationError{Code: code}
-	s.localWriteClosed.Store(true)
 	s.storeLocalWriteErr(appErr)
+	s.localWriteClosed.Store(true)
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
 }
@@ -878,10 +915,10 @@ func (s *quicStream) CloseWithError(code uint64, reason string) error {
 		return zmux.ErrSessionClosed
 	}
 	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
-	s.localReadClosed.Store(true)
-	s.localWriteClosed.Store(true)
 	s.storeLocalReadErr(appErr)
 	s.storeLocalWriteErr(appErr)
+	s.localReadClosed.Store(true)
+	s.localWriteClosed.Store(true)
 	s.stream.CancelRead(quic.StreamErrorCode(code))
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
@@ -981,8 +1018,8 @@ func (s *quicSendStream) CancelWrite(code uint64) error {
 		return zmux.ErrSessionClosed
 	}
 	appErr := &zmux.ApplicationError{Code: code}
-	s.localWriteClosed.Store(true)
 	s.storeLocalWriteErr(appErr)
+	s.localWriteClosed.Store(true)
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
 }
@@ -992,8 +1029,8 @@ func (s *quicSendStream) CloseWithError(code uint64, reason string) error {
 		return zmux.ErrSessionClosed
 	}
 	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
-	s.localWriteClosed.Store(true)
 	s.storeLocalWriteErr(appErr)
+	s.localWriteClosed.Store(true)
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
 }
@@ -1085,8 +1122,8 @@ func (s *quicRecvStream) CloseWithError(code uint64, reason string) error {
 		return zmux.ErrSessionClosed
 	}
 	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
-	s.localReadClosed.Store(true)
 	s.storeLocalReadErr(appErr)
+	s.localReadClosed.Store(true)
 	s.stream.CancelRead(quic.StreamErrorCode(code))
 	return nil
 }
@@ -1330,11 +1367,37 @@ func installContextWriteDeadline(ctx context.Context, deadlineSetter writeDeadli
 		_ = deadlineSetter.SetWriteDeadline(deadline)
 		clearOnReturn = true
 	}
+	var (
+		mu     sync.Mutex
+		cond   = sync.NewCond(&mu)
+		done   bool
+		firing bool
+		fired  bool
+	)
 	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		if done {
+			mu.Unlock()
+			return
+		}
+		firing = true
+		mu.Unlock()
 		_ = deadlineSetter.SetWriteDeadline(time.Now())
+		mu.Lock()
+		firing = false
+		fired = true
+		cond.Broadcast()
+		mu.Unlock()
 	})
 	return func() {
-		if stop() {
+		stopped := stop()
+		mu.Lock()
+		done = true
+		for firing && !fired {
+			cond.Wait()
+		}
+		mu.Unlock()
+		if stopped {
 			if clearOnReturn {
 				_ = deadlineSetter.SetWriteDeadline(time.Time{})
 			}
