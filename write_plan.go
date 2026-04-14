@@ -856,7 +856,7 @@ func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, tot
 }
 
 func (s *nativeStream) resetStopSeenWriteFinal() error {
-	if err := s.Reset(uint64(CodeCancelled)); err != nil {
+	if err := s.CancelWrite(uint64(CodeCancelled)); err != nil {
 		return err
 	}
 	s.conn.mu.Lock()

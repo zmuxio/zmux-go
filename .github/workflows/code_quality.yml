@@ -8,6 +8,44 @@ on:
       - 'releases/*' # The release branches
 
 jobs:
+  go-checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - name: root
+            path: .
+          - name: adapter-quicmux
+            path: adapter/quicmux
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module.path }}/go.mod
+          cache-dependency-path: |
+            ${{ matrix.module.path }}/go.sum
+            go.work.sum
+      - name: Download dependencies
+        working-directory: ${{ matrix.module.path }}
+        run: go mod download
+      - name: Run tests
+        working-directory: ${{ matrix.module.path }}
+        run: go test ./...
+      - name: Run race tests
+        working-directory: ${{ matrix.module.path }}
+        run: go test -race ./...
+      - name: Run vet
+        working-directory: ${{ matrix.module.path }}
+        run: go vet ./...
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          working-directory: ${{ matrix.module.path }}
+
   qodana:
     runs-on: ubuntu-latest
     permissions:
@@ -15,9 +53,9 @@ jobs:
       pull-requests: write
       checks: write
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}  # to check out the actual pull request commit, not the merge commit
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0  # a full history is required for pull request analysis
       - name: 'Qodana Scan'
         uses: JetBrains/qodana-action@v2025.3

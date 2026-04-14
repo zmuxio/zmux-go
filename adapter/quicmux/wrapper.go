@@ -1,7 +1,6 @@
 package quicmux
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +16,8 @@ import (
 )
 
 const quicmuxStreamPreludeMaxPayload = 16 << 10
+const metadataPayloadPoolInitCap = 128
+const metadataPayloadPoolMaxRetainedCap = 2 << 10
 
 const quicmuxOpenCaps = wire.CapabilityOpenMetadata | wire.CapabilityPriorityHints | wire.CapabilityStreamGroups
 
@@ -26,10 +27,12 @@ const DefaultAcceptedPreludeReadTimeout = 5 * time.Second
 
 var metadataPayloadPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, 0, 128)
+		buf := make([]byte, 0, metadataPayloadPoolInitCap)
 		return &buf
 	},
 }
+
+var emptyStreamPrelude = []byte{0}
 
 // SessionOptions configures adapter-local behavior that does not exist on the
 // stable zmux Session surface itself.
@@ -236,12 +239,15 @@ func (s *quicSession) OpenUniAndSendWithOptions(ctx context.Context, opts zmux.O
 
 func (s *quicSession) Close() error {
 	if s == nil || s.conn == nil {
-		return zmux.ErrSessionClosed
+		return nil
+	}
+	if s.conn.Context().Err() != nil {
+		return translateWaitError(context.Cause(s.conn.Context()))
 	}
 	return translateError(s.conn.CloseWithError(0, ""))
 }
 
-func (s *quicSession) Abort(err error) {
+func (s *quicSession) CloseWithError(err error) {
 	if s == nil || s.conn == nil {
 		return
 	}
@@ -251,7 +257,7 @@ func (s *quicSession) Abort(err error) {
 
 func (s *quicSession) Wait(ctx context.Context) error {
 	if s == nil || s.conn == nil {
-		return zmux.ErrSessionClosed
+		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -405,6 +411,21 @@ type quicStreamBase struct {
 	localWriteErr    error
 }
 
+type singleByteReader struct {
+	reader io.Reader
+	buf    [1]byte
+}
+
+func (r *singleByteReader) ReadByte() (byte, error) {
+	if r == nil || r.reader == nil {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if _, err := io.ReadFull(r.reader, r.buf[:]); err != nil {
+		return 0, err
+	}
+	return r.buf[0], nil
+}
+
 func initLocalStreamBase(base *quicStreamBase, conn SessionConn, reader io.Reader, writer io.Writer, opts zmux.OpenOptions) {
 	if base == nil {
 		return
@@ -439,7 +460,7 @@ func initAcceptedStreamBase(base *quicStreamBase, conn SessionConn, reader io.Re
 		prioritySet:  meta.prioritySet,
 		group:        meta.group,
 		groupEncoded: meta.groupEncoded,
-		openInfo:     cloneBytes(meta.openInfo),
+		openInfo:     meta.openInfo,
 	}
 }
 
@@ -461,21 +482,17 @@ func (b *quicStreamBase) readFrom(src io.Reader, p []byte) (int, error) {
 	if src == nil {
 		return 0, zmux.ErrSessionClosed
 	}
-	if b != nil {
+	if b != nil && b.localReadClosed.Load() {
 		if err := b.loadLocalReadErr(); err != nil {
 			return 0, err
 		}
-	}
-	if b != nil && b.localReadClosed.Load() {
 		return 0, zmux.ErrReadClosed
 	}
 	n, err := src.Read(p)
-	if err != nil && b != nil {
+	if err != nil && b != nil && b.localReadClosed.Load() {
 		if localErr := b.loadLocalReadErr(); localErr != nil {
 			return n, localErr
 		}
-	}
-	if err != nil && b != nil && b.localReadClosed.Load() {
 		return n, zmux.ErrReadClosed
 	}
 	return n, translateReadError(err)
@@ -662,14 +679,13 @@ type quicStream struct {
 }
 
 func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream, timeout time.Duration) (*quicStream, error) {
-	reader := bufio.NewReader(stream)
 	if timeout > 0 {
 		_ = stream.SetReadDeadline(time.Now().Add(timeout))
 		defer func() {
 			_ = stream.SetReadDeadline(time.Time{})
 		}()
 	}
-	meta, err := readAcceptedStreamMetadata(reader)
+	meta, err := readAcceptedStreamMetadata(stream)
 	if err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeProtocol))
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeProtocol))
@@ -677,7 +693,7 @@ func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream, timeout time.D
 		return nil, err
 	}
 	wrapped := &quicStream{stream: stream}
-	initAcceptedStreamBase(&wrapped.quicStreamBase, conn, reader, meta)
+	initAcceptedStreamBase(&wrapped.quicStreamBase, conn, stream, meta)
 	return wrapped, nil
 }
 
@@ -692,25 +708,26 @@ func (s *quicStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
-	if err := s.loadLocalWriteErr(); err != nil {
-		return 0, err
-	}
 	if s.localWriteClosed.Load() {
+		if err := s.loadLocalWriteErr(); err != nil {
+			return 0, err
+		}
 		return 0, zmux.ErrWriteClosed
 	}
 	if err := s.ensureOpenPrelude(); err != nil {
 		return 0, err
 	}
 	if s.localWriteClosed.Load() {
+		if err := s.loadLocalWriteErr(); err != nil {
+			return 0, err
+		}
 		return 0, zmux.ErrWriteClosed
 	}
 	n, err := s.stream.Write(p)
-	if err != nil {
+	if err != nil && s.localWriteClosed.Load() {
 		if localErr := s.loadLocalWriteErr(); localErr != nil {
 			return n, localErr
 		}
-	}
-	if err != nil && s.localWriteClosed.Load() {
 		return n, zmux.ErrWriteClosed
 	}
 	return n, translateError(err)
@@ -788,10 +805,10 @@ func (s *quicStream) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *quicStream) CloseRead() error {
-	return s.CloseReadWithCode(uint64(zmux.CodeCancelled))
+	return s.CancelRead(uint64(zmux.CodeCancelled))
 }
 
-func (s *quicStream) CloseReadWithCode(code uint64) error {
+func (s *quicStream) CancelRead(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
@@ -823,7 +840,7 @@ func (s *quicStream) CloseWrite() error {
 	return nil
 }
 
-func (s *quicStream) Reset(code uint64) error {
+func (s *quicStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
@@ -834,12 +851,7 @@ func (s *quicStream) Reset(code uint64) error {
 	return nil
 }
 
-func (s *quicStream) CloseWithError(err error) error {
-	code, reason := mappedApplicationError(err, uint64(zmux.CodeNoError))
-	return s.CloseWithErrorCode(code, reason)
-}
-
-func (s *quicStream) CloseWithErrorCode(code uint64, reason string) error {
+func (s *quicStream) CloseWithError(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
@@ -877,25 +889,26 @@ func (s *quicSendStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
-	if err := s.loadLocalWriteErr(); err != nil {
-		return 0, err
-	}
 	if s.localWriteClosed.Load() {
+		if err := s.loadLocalWriteErr(); err != nil {
+			return 0, err
+		}
 		return 0, zmux.ErrWriteClosed
 	}
 	if err := s.ensureOpenPrelude(); err != nil {
 		return 0, err
 	}
 	if s.localWriteClosed.Load() {
+		if err := s.loadLocalWriteErr(); err != nil {
+			return 0, err
+		}
 		return 0, zmux.ErrWriteClosed
 	}
 	n, err := s.stream.Write(p)
-	if err != nil {
+	if err != nil && s.localWriteClosed.Load() {
 		if localErr := s.loadLocalWriteErr(); localErr != nil {
 			return n, localErr
 		}
-	}
-	if err != nil && s.localWriteClosed.Load() {
 		return n, zmux.ErrWriteClosed
 	}
 	return n, translateError(err)
@@ -941,7 +954,7 @@ func (s *quicSendStream) CloseWrite() error {
 	return nil
 }
 
-func (s *quicSendStream) Reset(code uint64) error {
+func (s *quicSendStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
@@ -952,12 +965,7 @@ func (s *quicSendStream) Reset(code uint64) error {
 	return nil
 }
 
-func (s *quicSendStream) CloseWithError(err error) error {
-	code, reason := mappedApplicationError(err, uint64(zmux.CodeNoError))
-	return s.CloseWithErrorCode(code, reason)
-}
-
-func (s *quicSendStream) CloseWithErrorCode(code uint64, reason string) error {
+func (s *quicSendStream) CloseWithError(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
@@ -996,20 +1004,19 @@ type quicRecvStream struct {
 }
 
 func newAcceptedRecvStream(conn SessionConn, stream *quic.ReceiveStream, timeout time.Duration) (*quicRecvStream, error) {
-	reader := bufio.NewReader(stream)
 	if timeout > 0 {
 		_ = stream.SetReadDeadline(time.Now().Add(timeout))
 		defer func() {
 			_ = stream.SetReadDeadline(time.Time{})
 		}()
 	}
-	meta, err := readAcceptedStreamMetadata(reader)
+	meta, err := readAcceptedStreamMetadata(stream)
 	if err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeProtocol))
 		return nil, err
 	}
 	wrapped := &quicRecvStream{stream: stream}
-	initAcceptedStreamBase(&wrapped.quicStreamBase, conn, reader, meta)
+	initAcceptedStreamBase(&wrapped.quicStreamBase, conn, stream, meta)
 	return wrapped, nil
 }
 
@@ -1036,10 +1043,10 @@ func (s *quicRecvStream) Read(p []byte) (int, error) {
 }
 
 func (s *quicRecvStream) CloseRead() error {
-	return s.CloseReadWithCode(uint64(zmux.CodeCancelled))
+	return s.CancelRead(uint64(zmux.CodeCancelled))
 }
 
-func (s *quicRecvStream) CloseReadWithCode(code uint64) error {
+func (s *quicRecvStream) CancelRead(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
@@ -1051,12 +1058,7 @@ func (s *quicRecvStream) CloseReadWithCode(code uint64) error {
 	return nil
 }
 
-func (s *quicRecvStream) CloseWithError(err error) error {
-	code, reason := mappedApplicationError(err, uint64(zmux.CodeNoError))
-	return s.CloseWithErrorCode(code, reason)
-}
-
-func (s *quicRecvStream) CloseWithErrorCode(code uint64, reason string) error {
+func (s *quicRecvStream) CloseWithError(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
@@ -1097,12 +1099,22 @@ type acceptedStreamMetadata struct {
 	openInfo     []byte
 }
 
-func readAcceptedStreamMetadata(reader *bufio.Reader) (acceptedStreamMetadata, error) {
+func readAcceptedStreamMetadata(reader io.Reader) (acceptedStreamMetadata, error) {
 	if reader == nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("missing stream prelude reader", io.ErrUnexpectedEOF)
 	}
 
-	metadataLen, prefixLen, err := wire.ReadVarint(reader)
+	var (
+		metadataLen uint64
+		prefixLen   int
+		err         error
+	)
+	if byteReader, ok := reader.(io.ByteReader); ok {
+		metadataLen, prefixLen, err = wire.ReadVarint(byteReader)
+	} else {
+		byteReader := singleByteReader{reader: reader}
+		metadataLen, prefixLen, err = wire.ReadVarint(&byteReader)
+	}
 	if err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("read stream prelude length", err)
 	}
@@ -1121,18 +1133,18 @@ func readAcceptedStreamMetadata(reader *bufio.Reader) (acceptedStreamMetadata, e
 		payload = payload[:int(metadataLen)]
 	}
 	defer func() {
-		*ptr = payload[:0]
+		if cap(payload) > metadataPayloadPoolMaxRetainedCap {
+			*ptr = make([]byte, 0, metadataPayloadPoolInitCap)
+		} else {
+			*ptr = payload[:0]
+		}
 		metadataPayloadPool.Put(ptr)
 	}()
 	if _, err := io.ReadFull(reader, payload); err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("read stream metadata", err)
 	}
 
-	tlvs, err := wire.ParseTLVsView(payload)
-	if err != nil {
-		return acceptedStreamMetadata{}, protocolPreludeErr("parse stream metadata tlvs", err)
-	}
-	parsed, ok, err := wire.ParseStreamMetadataTLVsView(tlvs)
+	parsed, ok, err := wire.ParseStreamMetadataBytesView(payload)
 	if err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("parse stream metadata", err)
 	}
@@ -1153,7 +1165,7 @@ func buildStreamPrelude(openPrefix []byte) ([]byte, error) {
 	if len(openPrefix) != 0 {
 		return openPrefix, nil
 	}
-	return wire.EncodeVarint(0)
+	return emptyStreamPrelude, nil
 }
 
 func cloneBytes(src []byte) []byte {

@@ -7,10 +7,7 @@ import (
 	"time"
 )
 
-// Stream defines the repository-default bidirectional stream surface.
-//
-// Native zmux implements every method directly. Adapters may provide a
-// best-effort mapping for methods that don't have a protocol-native equivalent.
+// Stream is the stable bidirectional stream interface.
 type Stream interface {
 	net.Conn
 	StreamID() uint64
@@ -20,14 +17,13 @@ type Stream interface {
 	WriteFinal(p []byte) (int, error)
 	WritevFinal(parts ...[]byte) (int, error)
 	CloseRead() error
-	CloseReadWithCode(code uint64) error
+	CancelRead(code uint64) error
 	CloseWrite() error
-	Reset(code uint64) error
-	CloseWithError(err error) error
-	CloseWithErrorCode(code uint64, reason string) error
+	CancelWrite(code uint64) error
+	CloseWithError(code uint64, reason string) error
 }
 
-// SendStream defines the repository-default send-only stream surface.
+// SendStream is the stable send-only stream interface.
 type SendStream interface {
 	io.Writer
 	io.Closer
@@ -40,14 +36,13 @@ type SendStream interface {
 	WriteFinal(p []byte) (int, error)
 	WritevFinal(parts ...[]byte) (int, error)
 	CloseWrite() error
-	Reset(code uint64) error
-	CloseWithError(err error) error
-	CloseWithErrorCode(code uint64, reason string) error
+	CancelWrite(code uint64) error
+	CloseWithError(code uint64, reason string) error
 	SetDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error
 }
 
-// RecvStream defines the repository-default receive-only stream surface.
+// RecvStream is the stable receive-only stream interface.
 type RecvStream interface {
 	io.Reader
 	io.Closer
@@ -57,15 +52,13 @@ type RecvStream interface {
 	RemoteAddr() net.Addr
 	Metadata() StreamMetadata
 	CloseRead() error
-	CloseReadWithCode(code uint64) error
-	CloseWithError(err error) error
-	CloseWithErrorCode(code uint64, reason string) error
+	CancelRead(code uint64) error
+	CloseWithError(code uint64, reason string) error
 	SetDeadline(t time.Time) error
 	SetReadDeadline(t time.Time) error
 }
 
-// Session defines the repository-default session surface used by native zmux
-// and transport adapters.
+// Session is the stable session interface used by native zmux and adapters.
 type Session interface {
 	io.Closer
 	AcceptStream(ctx context.Context) (Stream, error)
@@ -78,14 +71,70 @@ type Session interface {
 	OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (Stream, int, error)
 	OpenUniAndSend(ctx context.Context, p []byte) (SendStream, int, error)
 	OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (SendStream, int, error)
-	Abort(err error)
+	CloseWithError(err error)
 	Wait(ctx context.Context) error
 	Closed() bool
 	State() SessionState
 	Stats() SessionStats
 }
 
-// AsSession exposes a native *Conn through the stable Session interface.
+// NativeSession is the native zmux session interface.
+//
+// It repeats open and accept methods with native stream return types because Go
+// does not support covariant interface return types.
+type NativeSession interface {
+	AcceptStream(ctx context.Context) (NativeStream, error)
+	AcceptUniStream(ctx context.Context) (NativeRecvStream, error)
+	OpenStream(ctx context.Context) (NativeStream, error)
+	OpenUniStream(ctx context.Context) (NativeSendStream, error)
+	OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (NativeStream, error)
+	OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (NativeSendStream, error)
+	OpenAndSend(ctx context.Context, p []byte) (NativeStream, int, error)
+	OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (NativeStream, int, error)
+	OpenUniAndSend(ctx context.Context, p []byte) (NativeSendStream, int, error)
+	OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (NativeSendStream, int, error)
+	Close() error
+	CloseWithError(err error)
+	Wait(ctx context.Context) error
+	Closed() bool
+	State() SessionState
+	Stats() SessionStats
+	Ping(ctx context.Context, echo []byte) (time.Duration, error)
+	GoAway(lastAcceptedBidi, lastAcceptedUni uint64) error
+	GoAwayWithError(lastAcceptedBidi, lastAcceptedUni, code uint64, reason string) error
+	PeerGoAwayError() *ApplicationError
+	PeerCloseError() *ApplicationError
+	LocalPreface() Preface
+	PeerPreface() Preface
+	Negotiated() Negotiated
+}
+
+// NativeStream is the native bidirectional stream interface.
+type NativeStream interface {
+	Stream
+	OpenedLocally() bool
+	Bidirectional() bool
+	ReadClosed() bool
+	WriteClosed() bool
+}
+
+// NativeSendStream is the native send-only stream interface.
+type NativeSendStream interface {
+	SendStream
+	OpenedLocally() bool
+	Bidirectional() bool
+	WriteClosed() bool
+}
+
+// NativeRecvStream is the native receive-only stream interface.
+type NativeRecvStream interface {
+	RecvStream
+	OpenedLocally() bool
+	Bidirectional() bool
+	ReadClosed() bool
+}
+
+// AsSession wraps a native *Conn as a stable Session.
 func AsSession(conn *Conn) Session {
 	if conn == nil {
 		return nativeSession{}
@@ -93,45 +142,30 @@ func AsSession(conn *Conn) Session {
 	return nativeSession{conn: conn}
 }
 
-// NewSession establishes a native zmux session and returns it through the
-// stable Session interface.
+// NewSession returns a stable Session backed by native zmux.
 func NewSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 	session, err := New(conn, cfg)
 	if err != nil {
-		if conn != nil {
-			_ = conn.Close()
-		}
 		return nil, err
 	}
-	conn = nil
 	return nativeSession{conn: session}, nil
 }
 
-// ClientSession establishes an initiator-native session and returns it through
-// the stable Session interface.
+// ClientSession returns a stable initiator Session backed by native zmux.
 func ClientSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 	session, err := Client(conn, cfg)
 	if err != nil {
-		if conn != nil {
-			_ = conn.Close()
-		}
 		return nil, err
 	}
-	conn = nil
 	return nativeSession{conn: session}, nil
 }
 
-// ServerSession establishes a responder-native session and returns it through
-// the stable Session interface.
+// ServerSession returns a stable responder Session backed by native zmux.
 func ServerSession(conn io.ReadWriteCloser, cfg *Config) (Session, error) {
 	session, err := Server(conn, cfg)
 	if err != nil {
-		if conn != nil {
-			_ = conn.Close()
-		}
 		return nil, err
 	}
-	conn = nil
 	return nativeSession{conn: session}, nil
 }
 
@@ -211,21 +245,21 @@ func (s nativeSession) OpenUniAndSendWithOptions(ctx context.Context, opts OpenO
 
 func (s nativeSession) Close() error {
 	if s.conn == nil {
-		return ErrSessionClosed
+		return nil
 	}
 	return s.conn.Close()
 }
 
-func (s nativeSession) Abort(err error) {
+func (s nativeSession) CloseWithError(err error) {
 	if s.conn == nil {
 		return
 	}
-	s.conn.Abort(err)
+	s.conn.CloseWithError(err)
 }
 
 func (s nativeSession) Wait(ctx context.Context) error {
 	if s.conn == nil {
-		return ErrSessionClosed
+		return nil
 	}
 	return s.conn.Wait(ctx)
 }
@@ -246,14 +280,18 @@ func (s nativeSession) State() SessionState {
 
 func (s nativeSession) Stats() SessionStats {
 	if s.conn == nil {
-		return SessionStats{}
+		return SessionStats{State: SessionStateInvalid}
 	}
 	return s.conn.Stats()
 }
 
 var (
-	_ Session    = nativeSession{}
-	_ Stream     = (*nativeStream)(nil)
-	_ SendStream = (*nativeSendStream)(nil)
-	_ RecvStream = (*nativeRecvStream)(nil)
+	_ Session          = nativeSession{}
+	_ NativeSession    = (*Conn)(nil)
+	_ Stream           = (*nativeStream)(nil)
+	_ NativeStream     = (*nativeStream)(nil)
+	_ SendStream       = (*nativeSendStream)(nil)
+	_ NativeSendStream = (*nativeSendStream)(nil)
+	_ RecvStream       = (*nativeRecvStream)(nil)
+	_ NativeRecvStream = (*nativeRecvStream)(nil)
 )

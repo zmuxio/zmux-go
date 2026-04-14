@@ -63,12 +63,12 @@ var conformanceChecklistEvidence = map[string][]string{
 	},
 	"document and implement the repository-default stream lifecycle surface from API_SEMANTICS.md": {
 		"TestCloseReadStopsPeerWritesButPreservesReverseRead",
-		"TestCloseWithErrorPropagatesAbort",
+		"TestCloseWithErrorPropagatesWholeStreamAbort",
 	},
 	"cover Close, CloseRead, CloseWrite, and Reset behavior": {
 		"TestCloseReadStopsPeerWritesButPreservesReverseRead",
 		"TestBidiStreamWriteReadAndCloseWrite",
-		"TestCloseWithErrorPropagatesAbort",
+		"TestCloseWithErrorPropagatesWholeStreamAbort",
 	},
 	"preserve structured error surfacing, open/cancel behavior, and accept visibility rules": {
 		"TestStructuredErrorAfterLocalCloseWrite",
@@ -192,7 +192,7 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestCloseReadWithZeroWindowQueuesOpeningDataBeforeStopSending",
 	},
 	"Close acts as a full local close helper": {
-		"TestCloseWithErrorPropagatesAbort",
+		"TestCloseWithErrorPropagatesWholeStreamAbort",
 	},
 	"Close on a unidirectional stream silently ignores the locally absent direction instead of failing solely because that half does not exist": {
 		"TestSendStreamCloseIgnoresAbsentReadHalf",

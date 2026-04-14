@@ -12,21 +12,14 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// StreamMetadata exposes the repository-default advisory metadata currently
-// known for a stream.
-//
-// Priority defaults to 0. Group is nil when the stream has no explicit group
-// assignment. OpenInfo is the opener's opaque byte string when present.
+// StreamMetadata is the advisory metadata currently known for a stream.
 type StreamMetadata struct {
 	Priority uint64
 	Group    *uint64
 	OpenInfo []byte
 }
 
-// MetadataUpdate carries post-open advisory metadata updates for a stream.
-//
-// Only Priority and Group have standardized update semantics in zmux v1.
-// Open-time opaque metadata remains carried only through OPEN_METADATA.
+// MetadataUpdate carries post-open advisory metadata changes.
 type MetadataUpdate struct {
 	Priority *uint64
 	Group    *uint64

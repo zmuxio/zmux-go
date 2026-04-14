@@ -49,7 +49,10 @@ type streamTombstone struct {
 	LateDataCause lateDataCause
 }
 
-func (t streamTombstone) queueIndex(hidden bool) int {
+func (t *streamTombstone) queueIndex(hidden bool) int {
+	if t == nil {
+		return -1
+	}
 	if hidden {
 		return t.HiddenIndex
 	}

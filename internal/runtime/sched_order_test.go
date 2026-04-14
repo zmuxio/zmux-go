@@ -532,6 +532,45 @@ func TestActiveGroupSliceClearsRetainedNestedReferences(t *testing.T) {
 	}
 }
 
+func TestActiveGroupSliceDropsOversizedBacking(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	oversizedCap := batchScratchRetainLimit(1) + 1
+	state.scratch.activeGroups = make([]wfqActiveGroup, 0, oversizedCap)
+
+	got := activeGroupSlice(state, 1)
+	if len(got) != 0 {
+		t.Fatalf("active group scratch len = %d, want 0", len(got))
+	}
+	if cap(got) >= oversizedCap {
+		t.Fatalf("active group scratch cap = %d, want drop below %d", cap(got), oversizedCap)
+	}
+}
+
+func TestBuildBatchGroupsDropsOversizedGroupQueueCache(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	oversizedLen := batchScratchRetainLimit(1) + 1
+	state.scratch.lastBuildCapHint = oversizedLen
+	state.scratch.groupQueues = make([]map[uint64][]int, oversizedLen)
+	for i := range state.scratch.groupQueues {
+		state.scratch.groupQueues[i] = map[uint64][]int{uint64(i + 1): []int{i}}
+	}
+
+	prepared := buildBatchGroups(state, []BatchItem{
+		{Request: RequestMeta{GroupKey: GroupKey{Kind: 0, Value: 4}, StreamID: 4, StreamScoped: true, Cost: 1}},
+	})
+
+	if len(prepared.groupOrder) != 1 {
+		t.Fatalf("groupOrder len = %d, want 1", len(prepared.groupOrder))
+	}
+	if got := len(state.scratch.groupQueues); got != 1 {
+		t.Fatalf("retained group queue cache len = %d, want 1 after oversized cache drop", got)
+	}
+}
+
 func streamReq(streamID uint64, cost int64) RequestMeta {
 	return RequestMeta{
 		GroupKey:     GroupKey{Kind: 0, Value: streamID},

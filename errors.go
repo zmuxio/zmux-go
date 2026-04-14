@@ -28,6 +28,7 @@ var (
 	ErrKeepaliveTimeout          = errors.New("zmux: keepalive timeout")
 )
 
+// ApplicationError carries an application code and optional reason text.
 type ApplicationError struct {
 	Code   uint64
 	Reason string
@@ -77,6 +78,7 @@ func (e *ApplicationError) ApplicationCode() uint64 {
 	return e.Code
 }
 
+// Scope identifies whether an error belongs to the session or a stream.
 type Scope uint8
 
 const (
@@ -96,6 +98,7 @@ func (s Scope) String() string {
 	}
 }
 
+// Operation identifies the API operation that failed.
 type Operation uint8
 
 const (
@@ -124,6 +127,7 @@ func (o Operation) String() string {
 	}
 }
 
+// Source identifies where the error came from.
 type Source uint8
 
 const (
@@ -146,6 +150,7 @@ func (s Source) String() string {
 	}
 }
 
+// Direction identifies which stream direction the error applies to.
 type Direction uint8
 
 const (
@@ -168,6 +173,7 @@ func (d Direction) String() string {
 	}
 }
 
+// TerminationKind identifies how the operation terminated.
 type TerminationKind uint8
 
 const (
@@ -196,10 +202,7 @@ func (k TerminationKind) String() string {
 	}
 }
 
-// Error is the repository-default structured local error shape.
-//
-// It wraps the underlying exported sentinel or ApplicationError so
-// errors.Is/errors.As continue to work through the structured repository error.
+// Error is the structured error wrapper returned by public APIs.
 type Error struct {
 	Scope           Scope
 	Operation       Operation
@@ -231,6 +234,7 @@ func (e *Error) Unwrap() error {
 	return e.Err
 }
 
+// AsStructuredError returns the structured error wrapper when present.
 func AsStructuredError(err error) (*Error, bool) {
 	var out *Error
 	if !errors.As(err, &out) {
@@ -245,10 +249,12 @@ func wireError(code ErrorCode, op string, err error) error {
 	return wire.WrapError(code, op, err)
 }
 
+// ErrorCodeOf returns the wire or application error code when one is present.
 func ErrorCodeOf(err error) (ErrorCode, bool) {
 	return wire.ErrorCodeOf(err)
 }
 
+// IsErrorCode reports whether err carries the given wire or application code.
 func IsErrorCode(err error, code ErrorCode) bool {
 	if wire.IsErrorCode(err, code) {
 		return true

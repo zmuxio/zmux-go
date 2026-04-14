@@ -191,8 +191,8 @@ func runStreamAbortiveCloseContract(t *testing.T, client, server zmux.Session) {
 
 	const abortCode = 55
 	const abortReason = "adapter-contract-abort"
-	if err := clientStream.CloseWithErrorCode(abortCode, abortReason); err != nil {
-		t.Fatalf("CloseWithErrorCode err = %v", err)
+	if err := clientStream.CloseWithError(abortCode, abortReason); err != nil {
+		t.Fatalf("CloseWithError err = %v", err)
 	}
 
 	buf := make([]byte, 1)
@@ -244,8 +244,8 @@ func runReadStopContract(t *testing.T, client, server zmux.Session) {
 	}
 
 	const stopCode = 77
-	if err := accepted.stream.CloseReadWithCode(stopCode); err != nil {
-		t.Fatalf("CloseReadWithCode err = %v", err)
+	if err := accepted.stream.CancelRead(stopCode); err != nil {
+		t.Fatalf("CancelRead err = %v", err)
 	}
 	if _, err := accepted.stream.Read(make([]byte, 1)); !errors.Is(err, zmux.ErrReadClosed) {
 		t.Fatalf("post-stop Read err = %v, want %v", err, zmux.ErrReadClosed)
@@ -298,22 +298,22 @@ func runAbortContract(t *testing.T, client, server zmux.Session) {
 
 	const abortCode = 91
 	const abortReason = "adapter-contract-session-abort"
-	client.Abort(&zmux.ApplicationError{Code: abortCode, Reason: abortReason})
+	client.CloseWithError(&zmux.ApplicationError{Code: abortCode, Reason: abortReason})
 
 	clientWaitErr, ok := waitForClosedResult(t, client)
 	if !ok {
-		t.Fatal("client Wait after Abort did not complete")
+		t.Fatal("client Wait after CloseWithError did not complete")
 	}
 	if clientWaitErr != nil && !errors.Is(clientWaitErr, zmux.ErrSessionClosed) && !matchesApplicationError(clientWaitErr, abortCode, abortReason) {
-		t.Fatalf("client Wait after Abort err = %v", clientWaitErr)
+		t.Fatalf("client Wait after CloseWithError err = %v", clientWaitErr)
 	}
 
 	serverWaitErr, ok := waitForClosedResult(t, server)
 	if !ok {
-		t.Fatal("server Wait after peer Abort did not complete")
+		t.Fatal("server Wait after peer CloseWithError did not complete")
 	}
 	if serverWaitErr != nil && !errors.Is(serverWaitErr, zmux.ErrSessionClosed) && !matchesApplicationErrorCode(serverWaitErr, abortCode) {
-		t.Fatalf("server Wait after peer Abort err = %v", serverWaitErr)
+		t.Fatalf("server Wait after peer CloseWithError err = %v", serverWaitErr)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)

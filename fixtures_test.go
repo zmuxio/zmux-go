@@ -1384,7 +1384,7 @@ func runInvalidBlockedWrongSideUni(t *testing.T) error {
 	}); err != nil {
 		return err
 	}
-	if err := expectInvalidQueuedAbort(frames, streamID, CodeStreamState); err != nil {
+	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -1412,7 +1412,7 @@ func runInvalidMaxDataWrongSideUni(t *testing.T) error {
 	}); err != nil {
 		return err
 	}
-	if err := expectInvalidQueuedAbort(frames, streamID, CodeStreamState); err != nil {
+	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -1440,7 +1440,7 @@ func runInvalidStopSendingWrongSideUni(t *testing.T) error {
 	}); err != nil {
 		return err
 	}
-	if err := expectInvalidQueuedAbort(frames, streamID, CodeStreamState); err != nil {
+	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -1468,7 +1468,7 @@ func runInvalidResetWrongSideUni(t *testing.T) error {
 	}); err != nil {
 		return err
 	}
-	if err := expectInvalidQueuedAbort(frames, streamID, CodeStreamState); err != nil {
+	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -1517,7 +1517,7 @@ func awaitInvalidFixtureFrame(frames <-chan Frame) (Frame, error) {
 	}
 }
 
-func expectInvalidQueuedAbort(frames <-chan Frame, streamID uint64, code ErrorCode) error {
+func expectInvalidQueuedCloseWithError(frames <-chan Frame, streamID uint64, code ErrorCode) error {
 	frame, err := awaitInvalidFixtureFrame(frames)
 	if err != nil {
 		return err
@@ -1542,7 +1542,7 @@ func runInvalidLocalProvisionalOpenCancelMustNotBurnID(t *testing.T) error {
 	if err != nil {
 		return err
 	}
-	if err := first.CloseWithErrorCode(uint64(CodeCancelled), ""); err != nil {
+	if err := first.CloseWithError(uint64(CodeCancelled), ""); err != nil {
 		return err
 	}
 	if got := first.StreamID(); got != 0 {

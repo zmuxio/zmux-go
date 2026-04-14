@@ -23,6 +23,7 @@ func transientBatchState(state *BatchState, capHint int) batchTransientState {
 }
 
 func buildBatchGroups(state *BatchState, items []BatchItem) batchBuildResult {
+	prepareBatchScratchForBuild(state, len(items))
 	result := batchBuildResult{
 		groupOrder:  groupOrderSlice(state, 0, len(items)),
 		groupState:  groupStateMap(state, len(items)),

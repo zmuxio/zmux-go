@@ -90,6 +90,9 @@ func activeGroupSlice(state *BatchState, capHint int) []wfqActiveGroup {
 	if state == nil {
 		return make([]wfqActiveGroup, 0, capHint)
 	}
+	if batchScratchOversized(cap(state.scratch.activeGroups), capHint) {
+		state.scratch.activeGroups = nil
+	}
 	if cap(state.scratch.activeGroups) < capHint {
 		state.scratch.activeGroups = make([]wfqActiveGroup, 0, capHint)
 	} else {
@@ -104,6 +107,9 @@ func activeGroupSlice(state *BatchState, capHint int) []wfqActiveGroup {
 func groupCandidateSlice(state *BatchState, n int, capHint int) []wfqGroupCandidate {
 	if state == nil {
 		return make([]wfqGroupCandidate, n, capHint)
+	}
+	if batchScratchOversized(cap(state.scratch.groupCandidates), capHint) {
+		state.scratch.groupCandidates = nil
 	}
 	if cap(state.scratch.groupCandidates) < capHint {
 		state.scratch.groupCandidates = make([]wfqGroupCandidate, n, capHint)

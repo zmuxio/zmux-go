@@ -18,6 +18,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/adaptertest"
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 func TestQUICSessionContract(t *testing.T) {
@@ -26,6 +27,7 @@ func TestQUICSessionContract(t *testing.T) {
 
 func TestWrapSessionNilIsClosedSafeSession(t *testing.T) {
 	session := WrapSession(nil)
+	var nilCtx context.Context
 	if session == nil {
 		t.Fatal("WrapSession(nil) = nil, want closed session wrapper")
 	}
@@ -34,6 +36,15 @@ func TestWrapSessionNilIsClosedSafeSession(t *testing.T) {
 	}
 	if session.State() != zmux.SessionStateInvalid {
 		t.Fatalf("WrapSession(nil).State() = %v, want %v", session.State(), zmux.SessionStateInvalid)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("WrapSession(nil).Close() err = %v, want nil", err)
+	}
+	if err := session.Wait(nilCtx); err != nil {
+		t.Fatalf("WrapSession(nil).Wait(nil) err = %v, want nil", err)
+	}
+	if got := session.Stats().State; got != zmux.SessionStateInvalid {
+		t.Fatalf("WrapSession(nil).Stats().State = %v, want %v", got, zmux.SessionStateInvalid)
 	}
 }
 
@@ -48,6 +59,9 @@ func TestWrapSessionWaitReturnsNilAfterGracefulClose(t *testing.T) {
 	defer cancel()
 	if err := client.Wait(ctx); err != nil {
 		t.Fatalf("Wait err = %v, want nil", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("second Close err = %v, want nil", err)
 	}
 }
 
@@ -431,7 +445,7 @@ func TestWrapSessionConcurrentAcceptStreamDoesNotOvertakeStalledPrelude(t *testi
 	_ = second.stream.Close()
 }
 
-func TestWrapSessionResetMakesLocalWriteFailImmediately(t *testing.T) {
+func TestWrapSessionCancelWriteMakesLocalWriteFailImmediately(t *testing.T) {
 	client, _ := newWrappedPair(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -441,15 +455,15 @@ func TestWrapSessionResetMakesLocalWriteFailImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream err = %v", err)
 	}
-	if err := stream.Reset(44); err != nil {
-		t.Fatalf("Reset err = %v", err)
+	if err := stream.CancelWrite(44); err != nil {
+		t.Fatalf("CancelWrite err = %v", err)
 	}
 	if _, err := stream.Write([]byte("x")); err == nil {
-		t.Fatal("Write after Reset err = nil, want application error")
+		t.Fatal("Write after CancelWrite err = nil, want application error")
 	} else {
 		appErr, ok := findError[*zmux.ApplicationError](err)
 		if !ok || appErr.Code != 44 {
-			t.Fatalf("Write after Reset err = %v, want ApplicationError(44)", err)
+			t.Fatalf("Write after CancelWrite err = %v, want ApplicationError(44)", err)
 		}
 	}
 }
@@ -464,23 +478,23 @@ func TestWrapSessionCloseWithErrorMakesLocalBidiOpsFailImmediately(t *testing.T)
 	if err != nil {
 		t.Fatalf("OpenStream err = %v", err)
 	}
-	if err := stream.CloseWithErrorCode(55, "bye"); err != nil {
-		t.Fatalf("CloseWithErrorCode err = %v", err)
+	if err := stream.CloseWithError(55, "bye"); err != nil {
+		t.Fatalf("CloseWithError err = %v", err)
 	}
 	if _, err := stream.Read(make([]byte, 1)); err == nil {
-		t.Fatal("Read after CloseWithErrorCode err = nil, want application error")
+		t.Fatal("Read after CloseWithError err = nil, want application error")
 	} else {
 		appErr, ok := findError[*zmux.ApplicationError](err)
 		if !ok || appErr.Code != 55 || appErr.Reason != "bye" {
-			t.Fatalf("Read after CloseWithErrorCode err = %v, want ApplicationError(55, \"bye\")", err)
+			t.Fatalf("Read after CloseWithError err = %v, want ApplicationError(55, \"bye\")", err)
 		}
 	}
 	if _, err := stream.Write([]byte("x")); err == nil {
-		t.Fatal("Write after CloseWithErrorCode err = nil, want application error")
+		t.Fatal("Write after CloseWithError err = nil, want application error")
 	} else {
 		appErr, ok := findError[*zmux.ApplicationError](err)
 		if !ok || appErr.Code != 55 || appErr.Reason != "bye" {
-			t.Fatalf("Write after CloseWithErrorCode err = %v, want ApplicationError(55, \"bye\")", err)
+			t.Fatalf("Write after CloseWithError err = %v, want ApplicationError(55, \"bye\")", err)
 		}
 	}
 }
@@ -495,15 +509,15 @@ func TestWrapSessionCloseWithErrorMakesLocalSendWriteFailImmediately(t *testing.
 	if err != nil {
 		t.Fatalf("OpenUniStream err = %v", err)
 	}
-	if err := stream.CloseWithErrorCode(66, "bye"); err != nil {
-		t.Fatalf("CloseWithErrorCode err = %v", err)
+	if err := stream.CloseWithError(66, "bye"); err != nil {
+		t.Fatalf("CloseWithError err = %v", err)
 	}
 	if _, err := stream.Write([]byte("x")); err == nil {
-		t.Fatal("Write after CloseWithErrorCode err = nil, want application error")
+		t.Fatal("Write after CloseWithError err = nil, want application error")
 	} else {
 		appErr, ok := findError[*zmux.ApplicationError](err)
 		if !ok || appErr.Code != 66 || appErr.Reason != "bye" {
-			t.Fatalf("Write after CloseWithErrorCode err = %v, want ApplicationError(66, \"bye\")", err)
+			t.Fatalf("Write after CloseWithError err = %v, want ApplicationError(66, \"bye\")", err)
 		}
 	}
 }
@@ -792,4 +806,40 @@ func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
 		NextProtos:         []string{"zmux-quicmux-test"},
 	}
 	return serverTLS, clientTLS
+}
+
+func BenchmarkReadAcceptedStreamMetadata(b *testing.B) {
+	priority := uint64(7)
+	group := uint64(9)
+	openInfo := []byte("bench-open-info")
+	prelude, err := wire.BuildOpenMetadataPrefix(
+		quicmuxOpenCaps,
+		&priority,
+		&group,
+		openInfo,
+		quicmuxStreamPreludeMaxPayload,
+	)
+	if err != nil {
+		b.Fatalf("BuildOpenMetadataPrefix err = %v", err)
+	}
+
+	var reader bytes.Reader
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		reader.Reset(prelude)
+		meta, err := readAcceptedStreamMetadata(&reader)
+		if err != nil {
+			b.Fatalf("readAcceptedStreamMetadata err = %v", err)
+		}
+		if !meta.prioritySet || meta.priority != priority {
+			b.Fatalf("priority = (%v, %d), want (%v, %d)", meta.prioritySet, meta.priority, true, priority)
+		}
+		if !meta.groupEncoded || meta.group != group {
+			b.Fatalf("group = (%v, %d), want (%v, %d)", meta.groupEncoded, meta.group, true, group)
+		}
+		if !bytes.Equal(meta.openInfo, openInfo) {
+			b.Fatalf("openInfo = %q, want %q", meta.openInfo, openInfo)
+		}
+	}
 }

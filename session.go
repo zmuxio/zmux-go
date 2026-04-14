@@ -18,11 +18,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/state"
 )
 
-// SessionState is the public lifecycle state of a zmux session.
-//
-// Current public constructors complete establishment before returning, so
-// ordinary callers will observe sessions beginning in SessionStateReady rather
-// than an establishing state.
+// SessionState is the public session lifecycle state.
 type SessionState uint8
 
 const (
@@ -44,30 +40,22 @@ const (
 	connStateFailed   = state.SessionStateFailed
 )
 
-// EventHandler receives opt-in lifecycle notifications when a connection
-// registers notable stream/session events. Callers should keep handlers fast.
-// Callbacks execute without holding internal locks, but they are invoked
-// synchronously when a handler is configured.
+// EventHandler receives opt-in stream and session events.
 type EventHandler func(Event)
 
-// EventType identifies the kind of lifecycle event.
+// EventType identifies an event kind.
 type EventType int
 
 const (
-	// EventStreamOpened is emitted when a local stream is given a stream ID and
-	// becomes commit-visible for on-wire operations.
-	// The event is emitted once per stream when local stream metadata is
-	// successfully committed for the first time, including commit attempts via
-	// Write, CloseWrite, CloseRead, and opening-terminal CloseWithError paths.
+	// EventStreamOpened is emitted when a local stream becomes peer-visible.
 	EventStreamOpened EventType = iota + 1
-	// EventStreamAccepted is emitted when a peer-opened stream is returned from
-	// AcceptStream / AcceptUniStream.
+	// EventStreamAccepted is emitted when a peer-opened stream is accepted.
 	EventStreamAccepted
 	// EventSessionClosed is emitted when the session terminates.
 	EventSessionClosed
 )
 
-// Event is the payload published to user-defined handlers.
+// Event is delivered to EventHandler.
 type Event struct {
 	Type               EventType
 	SessionState       SessionState
@@ -97,7 +85,7 @@ func (s SessionState) String() string {
 	}
 }
 
-// Valid reports whether s is one of the defined public session states.
+// Valid reports whether s is a defined public session state.
 func (s SessionState) Valid() bool {
 	switch s {
 	case SessionStateReady,
@@ -111,23 +99,25 @@ func (s SessionState) Valid() bool {
 	}
 }
 
-// Terminal reports whether s is a final session state.
+// Terminal reports whether s is final.
 func (s SessionState) Terminal() bool {
 	return s == SessionStateClosed || s == SessionStateFailed
 }
 
-// State returns the current public lifecycle state of the session.
+// State returns the current public session state.
 func (c *Conn) State() SessionState {
 	if c == nil {
 		return SessionStateInvalid
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.publicLifecycleReadyLocked() {
+		return SessionStateInvalid
+	}
 	return publicSessionState(c.lifecycle.sessionState)
 }
 
-// Closed reports whether the session has terminated and can no longer be used
-// for application-visible operations.
+// Closed reports whether the session has terminated.
 func (c *Conn) Closed() bool {
 	if c == nil {
 		return true
@@ -148,6 +138,14 @@ func (c *Conn) Closed() bool {
 	default:
 		return false
 	}
+}
+
+func (c *Conn) publicLifecycleReadyLocked() bool {
+	return c != nil && c.lifecycle.closedCh != nil
+}
+
+func (c *Conn) publicWritePathReadyLocked() bool {
+	return c.publicLifecycleReadyLocked() && c.writer.writeCh != nil && c.writer.urgentWriteCh != nil && c.pending.controlNotify != nil
 }
 
 func publicSessionState(current connState) SessionState {
@@ -305,11 +303,15 @@ func (c *Conn) lockPeerNonCloseFrameHandling() bool {
 	return true
 }
 
-func (c *Conn) AcceptStream(ctx context.Context) (*NativeStream, error) {
-	return c.acceptStream(ctx, streamArityBidi)
+func (c *Conn) AcceptStream(ctx context.Context) (NativeStream, error) {
+	stream, err := c.acceptStream(ctx, streamArityBidi)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
 }
 
-func (c *Conn) AcceptUniStream(ctx context.Context) (*NativeRecvStream, error) {
+func (c *Conn) AcceptUniStream(ctx context.Context) (NativeRecvStream, error) {
 	stream, err := c.acceptStream(ctx, streamArityUni)
 	if err != nil {
 		return nil, err
@@ -325,6 +327,10 @@ func (c *Conn) acceptStream(ctx context.Context, arity streamArity) (*nativeStre
 
 	for {
 		c.mu.Lock()
+		if !c.publicLifecycleReadyLocked() {
+			c.mu.Unlock()
+			return nil, ErrSessionClosed
+		}
 		if c.lifecycle.closeErr != nil {
 			err := sessionOperationErrLocked(c, OperationAccept, visibleSessionErrLocked(c, c.lifecycle.closeErr))
 			c.mu.Unlock()
@@ -367,8 +373,7 @@ func (c *Conn) acceptStream(ctx context.Context, arity streamArity) (*nativeStre
 	}
 }
 
-// emitEvent synchronously invokes the configured handler with the event payload.
-// It intentionally ignores handler panics to avoid crashing the connection runtime.
+// emitEvent invokes the configured handler and ignores handler panics.
 func (c *Conn) emitEvent(ev Event) {
 	if c == nil || c.observer.eventHandler == nil {
 		return
@@ -426,19 +431,23 @@ func (c *Conn) takeStreamEventLocked(stream *nativeStream, typ EventType, err er
 	}
 }
 
-func (c *Conn) OpenStream(ctx context.Context) (*NativeStream, error) {
+func (c *Conn) OpenStream(ctx context.Context) (NativeStream, error) {
 	return c.OpenStreamWithOptions(ctx, OpenOptions{})
 }
 
-func (c *Conn) OpenUniStream(ctx context.Context) (*NativeSendStream, error) {
+func (c *Conn) OpenUniStream(ctx context.Context) (NativeSendStream, error) {
 	return c.OpenUniStreamWithOptions(ctx, OpenOptions{})
 }
 
-func (c *Conn) OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (*NativeStream, error) {
-	return c.openStream(ctx, streamArityBidi, opts)
+func (c *Conn) OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (NativeStream, error) {
+	stream, err := c.openStream(ctx, streamArityBidi, opts)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
 }
 
-func (c *Conn) OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (*NativeSendStream, error) {
+func (c *Conn) OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (NativeSendStream, error) {
 	stream, err := c.openStream(ctx, streamArityUni, opts)
 	if err != nil {
 		return nil, err
@@ -446,11 +455,11 @@ func (c *Conn) OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (
 	return &nativeSendStream{stream: stream}, nil
 }
 
-func (c *Conn) OpenAndSend(ctx context.Context, p []byte) (*NativeStream, int, error) {
+func (c *Conn) OpenAndSend(ctx context.Context, p []byte) (NativeStream, int, error) {
 	return c.OpenAndSendWithOptions(ctx, OpenOptions{}, p)
 }
 
-func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*NativeStream, int, error) {
+func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (NativeStream, int, error) {
 	stream, err := c.OpenStreamWithOptions(ctx, opts)
 	if err != nil {
 		return nil, 0, err
@@ -459,11 +468,11 @@ func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p [
 	return stream, n, err
 }
 
-func (c *Conn) OpenUniAndSend(ctx context.Context, p []byte) (*NativeSendStream, int, error) {
+func (c *Conn) OpenUniAndSend(ctx context.Context, p []byte) (NativeSendStream, int, error) {
 	return c.OpenUniAndSendWithOptions(ctx, OpenOptions{}, p)
 }
 
-func (c *Conn) OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (*NativeSendStream, int, error) {
+func (c *Conn) OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (NativeSendStream, int, error) {
 	stream, err := c.OpenUniStreamWithOptions(ctx, opts)
 	if err != nil {
 		return nil, 0, err
@@ -478,18 +487,11 @@ func (c *Conn) openStream(ctx context.Context, arity streamArity, opts OpenOptio
 	}
 	ctx = contextOrBackground(ctx)
 
-	prefix, err := buildOpenMetadataPrefix(c.config.negotiated.Capabilities, opts, c.config.peer.Settings.MaxFramePayload)
-	if err != nil {
-		return nil, wrapStructuredError(err, errorMeta{
-			scope:     ScopeSession,
-			operation: OperationOpen,
-			source:    SourceLocal,
-			direction: DirectionBoth,
-		})
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.publicWritePathReadyLocked() {
+		return nil, sessionOperationErrLocked(c, OperationOpen, ErrSessionClosed)
+	}
 	switch state.PlanLocalOpen(c.lifecycle.sessionState, c.shutdown.gracefulCloseActive, c.lifecycle.closeErr != nil) {
 	case state.LocalOpenReturnExisting:
 		return nil, sessionOperationErrLocked(c, OperationOpen, visibleSessionErrLocked(c, c.lifecycle.closeErr))
@@ -501,6 +503,16 @@ func (c *Conn) openStream(ctx context.Context, arity streamArity, opts OpenOptio
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
+	}
+
+	prefix, err := buildOpenMetadataPrefix(c.config.negotiated.Capabilities, opts, c.config.peer.Settings.MaxFramePayload)
+	if err != nil {
+		return nil, wrapStructuredError(err, errorMeta{
+			scope:     ScopeSession,
+			operation: OperationOpen,
+			source:    SourceLocal,
+			direction: DirectionBoth,
+		})
 	}
 
 	if err := c.checkLocalOpenPossibleWithOpenInfoLocked(arity, uint64(len(opts.OpenInfo))); err != nil {
@@ -517,6 +529,7 @@ const (
 	maxDuration               = time.Duration(1<<63 - 1)
 )
 
+// QueueStats reports writer queue depths.
 type QueueStats struct {
 	Urgent   int
 	Advisory int
@@ -524,6 +537,7 @@ type QueueStats struct {
 	Total    int
 }
 
+// FlushStats reports the most recent writer flush.
 type FlushStats struct {
 	Count      uint64
 	LastAt     time.Time
@@ -531,8 +545,7 @@ type FlushStats struct {
 	LastBytes  int
 }
 
-// ProgressStats is a read-only snapshot of the repository-default liveness
-// progress buckets described in IMPLEMENTATION.md.
+// ProgressStats reports recent transport, mux, stream, and app activity times.
 type ProgressStats struct {
 	TransportProgressAt   time.Time
 	MuxControlProgressAt  time.Time
@@ -540,6 +553,7 @@ type ProgressStats struct {
 	ApplicationProgressAt time.Time
 }
 
+// HiddenStats reports hidden-stream counters and limits.
 type HiddenStats struct {
 	Refused              uint64
 	Reaped               uint64
@@ -551,6 +565,7 @@ type HiddenStats struct {
 	AtHardCap            bool
 }
 
+// AcceptBacklogStats reports accepted-stream backlog usage.
 type AcceptBacklogStats struct {
 	Count      int
 	CountLimit int
@@ -561,6 +576,7 @@ type AcceptBacklogStats struct {
 	Refused    uint64
 }
 
+// ProvisionalStats reports provisional-open counts and limits.
 type ProvisionalStats struct {
 	Bidi       int
 	Uni        int
@@ -574,13 +590,13 @@ type ProvisionalStats struct {
 	Expired    uint64
 }
 
+// ReasonStats counts observed reset and abort codes.
 type ReasonStats struct {
 	Reset map[uint64]uint64
 	Abort map[uint64]uint64
 }
 
-// DiagnosticStats exposes repository-default ingress/drop counters.
-// Late-data counters are absorbed application-byte totals.
+// DiagnosticStats reports ingress, drop, and late-data counters.
 type DiagnosticStats struct {
 	DroppedPriorityUpdates      uint64
 	DroppedLocalPriorityUpdates uint64
@@ -597,11 +613,13 @@ type DiagnosticStats struct {
 	MarkerOnlyRangeCount        int
 }
 
+// RetainedBucketStats reports retained item and byte counts.
 type RetainedBucketStats struct {
 	Count int
 	Bytes uint64
 }
 
+// RetainedStateBreakdown reports retained bytes by category.
 type RetainedStateBreakdown struct {
 	HiddenControl    RetainedBucketStats
 	AcceptBacklog    RetainedBucketStats
@@ -610,6 +628,7 @@ type RetainedStateBreakdown struct {
 	MarkerOnly       RetainedBucketStats
 }
 
+// PressureStats reports queue, memory, and retention pressure.
 type PressureStats struct {
 	ReceiveBacklog         uint64
 	ReceiveBacklogHigh     bool
@@ -635,8 +654,7 @@ type PressureStats struct {
 	PendingProtocolJobs    int
 }
 
-// SessionStats is a read-only snapshot of repository-default liveness and
-// local diagnostic counters.
+// SessionStats is a snapshot of session state and runtime counters.
 type SessionStats struct {
 	State               SessionState
 	KeepaliveInterval   time.Duration
@@ -789,6 +807,9 @@ func (c *Conn) Stats() SessionStats {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.publicLifecycleReadyLocked() {
+		return SessionStats{State: SessionStateInvalid}
+	}
 
 	stalled := false
 	if c.liveness.pingOutstanding && c.liveness.keepaliveTimeout > 0 {
@@ -981,6 +1002,10 @@ func (c *Conn) Close() error {
 	}
 
 	c.mu.Lock()
+	if !c.publicLifecycleReadyLocked() {
+		c.mu.Unlock()
+		return nil
+	}
 	hasOpenStreams := c.hasLiveStreamsLocked() || c.totalProvisionalCountLocked() > 0
 	plan := state.PlanBeginClose(c.lifecycle.sessionState, c.shutdown.gracefulCloseActive, c.lifecycle.closeErr != nil, hasOpenStreams)
 	nextState := plan.NextState
@@ -1016,14 +1041,14 @@ func (c *Conn) Close() error {
 			gracefulErr = err
 			c.closeSessionWithOptions(nil, closeOriginApp, closeFrameDefault)
 		} else {
-			c.Abort(err)
+			c.CloseWithError(err)
 			_ = c.Wait(context.Background())
 			return closeOperationErr(c, err)
 		}
 	}
 
 	if !gracefulClose {
-		c.Abort(nil)
+		c.CloseWithError(nil)
 		return completeCloseErr(c, c.Wait(context.Background()))
 	}
 	if err := completeCloseErr(c, c.Wait(context.Background())); err != nil {
@@ -1035,7 +1060,7 @@ func (c *Conn) Close() error {
 	return nil
 }
 
-func (c *Conn) Abort(err error) {
+func (c *Conn) CloseWithError(err error) {
 	if c == nil {
 		return
 	}
@@ -1051,6 +1076,10 @@ func (c *Conn) Wait(ctx context.Context) error {
 	}
 	ctx = contextOrBackground(ctx)
 	c.mu.Lock()
+	if !c.publicLifecycleReadyLocked() {
+		c.mu.Unlock()
+		return nil
+	}
 	closedCh := c.lifecycle.closedCh
 	c.mu.Unlock()
 	select {
@@ -1378,7 +1407,7 @@ func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error
 
 func (c *Conn) closeClosedChLocked() {
 	if c.lifecycle.closedCh == nil {
-		return
+		c.lifecycle.closedCh = make(chan struct{})
 	}
 	defer func() {
 		_ = recover()
@@ -1749,6 +1778,12 @@ func (c *Conn) GoAwayWithError(lastAcceptedBidi, lastAcceptedUni, code uint64, r
 	if c == nil {
 		return ErrSessionClosed
 	}
+	c.mu.Lock()
+	if !c.publicWritePathReadyLocked() {
+		c.mu.Unlock()
+		return closeOperationErr(c, ErrSessionClosed)
+	}
+	c.mu.Unlock()
 	if err := validateGoAwayWatermarkForDirection(lastAcceptedBidi, true); err != nil {
 		return closeOperationErr(c, wireError(CodeProtocol, "send GOAWAY", err))
 	}
@@ -1825,10 +1860,7 @@ func (c *Conn) GoAwayWithError(lastAcceptedBidi, lastAcceptedUni, code uint64, r
 	return c.waitForLocalGoAwaySend(lastAcceptedBidi, lastAcceptedUni)
 }
 
-// PeerGoAwayError returns the last GOAWAY payload from the peer, if any.
-//
-// It does not alter session state. The returned value is a copy so callers can
-// inspect code and reason safely without mutating connection internals.
+// PeerGoAwayError returns the last peer GOAWAY error, if any.
 func (c *Conn) PeerGoAwayError() *ApplicationError {
 	if c == nil {
 		return nil
@@ -1998,8 +2030,7 @@ func (c *Conn) waitForGracefulCloseDrain(timeout time.Duration) error {
 	}
 }
 
-// DuplexByteStream is the minimal underlying transport shape expected by the
-// current session constructors.
+// DuplexByteStream is the minimal transport shape accepted by session constructors.
 type DuplexByteStream interface {
 	io.Reader
 	io.Writer
@@ -2012,10 +2043,12 @@ var closedSignalCh = func() <-chan struct{} {
 	return ch
 }()
 
+// New establishes a native zmux session.
 func New(conn io.ReadWriteCloser, cfg *Config) (*Conn, error) {
 	return establish(conn, cloneConfig(cfg))
 }
 
+// Client establishes a native initiator session.
 func Client(conn io.ReadWriteCloser, cfg *Config) (*Conn, error) {
 	c := cloneConfig(cfg)
 	c.Role = RoleInitiator
@@ -2023,6 +2056,7 @@ func Client(conn io.ReadWriteCloser, cfg *Config) (*Conn, error) {
 	return establish(conn, c)
 }
 
+// Server establishes a native responder session.
 func Server(conn io.ReadWriteCloser, cfg *Config) (*Conn, error) {
 	c := cloneConfig(cfg)
 	c.Role = RoleResponder
@@ -2473,6 +2507,7 @@ type connRegistryState struct {
 	nextVisibilitySeq uint64
 }
 
+// Conn is the native zmux session implementation.
 type Conn struct {
 	mu sync.Mutex
 
@@ -3188,6 +3223,12 @@ func (c *Conn) Ping(ctx context.Context, echo []byte) (time.Duration, error) {
 		return 0, ErrSessionClosed
 	}
 	ctx = contextOrBackground(ctx)
+	c.mu.Lock()
+	if !c.publicWritePathReadyLocked() {
+		c.mu.Unlock()
+		return 0, ErrSessionClosed
+	}
+	c.mu.Unlock()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -3527,7 +3568,7 @@ func (c *Conn) nextKeepaliveAction(now time.Time) keepaliveAction {
 		timeout := c.effectiveKeepaliveTimeoutLocked()
 		if timeout > 0 && now.Sub(c.liveness.lastPingSentAt) > timeout {
 			c.mu.Unlock()
-			c.Abort(ErrKeepaliveTimeout)
+			c.CloseWithError(ErrKeepaliveTimeout)
 			c.mu.Lock()
 			return keepaliveAction{}
 		}
@@ -3589,8 +3630,9 @@ const (
 	acceptQueueCompactMinHead      = 64
 	provisionalQueueCompactMinHead = 64
 
-	provisionalOpenHardCap = state.DefaultProvisionalOpenHardCap
-	provisionalOpenMaxAge  = state.ProvisionalOpenMaxAge
+	provisionalOpenHardCap           = state.DefaultProvisionalOpenHardCap
+	provisionalOpenMaxAge            = state.ProvisionalOpenMaxAge
+	provisionalOpenMaxAgeAdaptiveCap = 20 * time.Second
 )
 
 type provisionalCommitWait struct {
@@ -4284,7 +4326,7 @@ func (c *Conn) provisionalCommitWaitLocked(stream *nativeStream, now time.Time) 
 		return provisionalCommitWait{blockedFlag: true}, nil
 	}
 	return provisionalCommitWait{
-		deadline:    headCreated.Add(provisionalOpenMaxAge),
+		deadline:    headCreated.Add(c.provisionalOpenMaxAgeLocked()),
 		blockedFlag: true,
 	}, nil
 }
@@ -4406,12 +4448,30 @@ func (c *Conn) failProvisionalWithSourceLocked(stream *nativeStream, err error, 
 func (c *Conn) reapExpiredProvisionalsLocked(arity streamArity, now time.Time) {
 	for {
 		head := c.provisionalHeadLocked(arity)
-		if !head.found() || !state.ProvisionalExpired(head.stream.idSet, head.stream.provisionalCreatedAt(), now) {
+		if !head.found() || !c.provisionalExpiredLocked(head.stream, now) {
 			return
 		}
 		c.ingress.provisionalExpired = saturatingAdd(c.ingress.provisionalExpired, 1)
 		c.failProvisionalLocked(head.stream, ErrOpenExpired)
 	}
+}
+
+func (c *Conn) provisionalExpiredLocked(stream *nativeStream, now time.Time) bool {
+	if stream == nil || stream.idSet {
+		return false
+	}
+	created := stream.provisionalCreatedAt()
+	if created.IsZero() {
+		return false
+	}
+	return now.Sub(created) > c.provisionalOpenMaxAgeLocked()
+}
+
+func (c *Conn) provisionalOpenMaxAgeLocked() time.Duration {
+	if c == nil {
+		return provisionalOpenMaxAge
+	}
+	return adaptiveRTTTimeout(c.liveness.lastPingRTT, provisionalOpenMaxAge, provisionalOpenMaxAgeAdaptiveCap, 6, 250*time.Millisecond)
 }
 
 func (c *Conn) reclaimUnseenLocalStreamsLocked() {

@@ -53,9 +53,9 @@ func BenchmarkCollectWriteBatchLaneBuffering(b *testing.B) {
 	}
 
 	for _, tc := range []struct {
-		name          string
-		ordinaryCap   int
-		advisoryCap   int
+		name        string
+		ordinaryCap int
+		advisoryCap int
 	}{
 		{name: "unbuffered", ordinaryCap: 0, advisoryCap: 0},
 		{name: "buffered", ordinaryCap: 64, advisoryCap: 16},
@@ -6351,18 +6351,21 @@ func TestStreamPriorityAffectsLocalBurstAndFragmentPolicy(t *testing.T) {
 	strong := uint64(6)
 	saturated := uint64(20)
 
-	mildStream, err := client.OpenStreamWithOptions(ctx, OpenOptions{InitialPriority: &mild})
+	mildStreamRaw, err := client.OpenStreamWithOptions(ctx, OpenOptions{InitialPriority: &mild})
 	if err != nil {
 		t.Fatalf("open mild stream: %v", err)
 	}
-	strongStream, err := client.OpenStreamWithOptions(ctx, OpenOptions{InitialPriority: &strong})
+	mildStream := requireNativeStreamImpl(t, mildStreamRaw)
+	strongStreamRaw, err := client.OpenStreamWithOptions(ctx, OpenOptions{InitialPriority: &strong})
 	if err != nil {
 		t.Fatalf("open strong stream: %v", err)
 	}
-	saturatedStream, err := client.OpenStreamWithOptions(ctx, OpenOptions{InitialPriority: &saturated})
+	strongStream := requireNativeStreamImpl(t, strongStreamRaw)
+	saturatedStreamRaw, err := client.OpenStreamWithOptions(ctx, OpenOptions{InitialPriority: &saturated})
 	if err != nil {
 		t.Fatalf("open saturated stream: %v", err)
 	}
+	saturatedStream := requireNativeStreamImpl(t, saturatedStreamRaw)
 
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -6397,10 +6400,11 @@ func TestSchedulerLatencyHintBiasesDefaultBurstAndFragmentPolicy(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	stream, err := client.OpenStream(ctx)
+	streamRaw, err := client.OpenStream(ctx)
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
+	stream := requireNativeStreamImpl(t, streamRaw)
 
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -6426,13 +6430,14 @@ func TestPriorityPolicyRespectsOpeningMetadataPrefix(t *testing.T) {
 	defer cancel()
 
 	priority := uint64(20)
-	stream, err := client.OpenStreamWithOptions(ctx, OpenOptions{
+	streamRaw, err := client.OpenStreamWithOptions(ctx, OpenOptions{
 		InitialPriority: &priority,
 		OpenInfo:        []byte("ssh"),
 	})
 	if err != nil {
 		t.Fatalf("open stream with metadata: %v", err)
 	}
+	stream := requireNativeStreamImpl(t, streamRaw)
 
 	client.mu.Lock()
 	defer client.mu.Unlock()

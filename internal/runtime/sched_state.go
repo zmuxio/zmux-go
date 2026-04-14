@@ -77,6 +77,33 @@ type batchScratch struct {
 	tiePrefStreams            map[GroupKey]uint64
 	ordered                   []int
 	selected                  []bool
+	lastBuildCapHint          int
+}
+
+const (
+	batchScratchRetainMinCap = 256
+	batchScratchRetainFactor = 4
+)
+
+func batchScratchRetainLimit(hint int) int {
+	if hint <= 0 {
+		return batchScratchRetainMinCap
+	}
+	if hint < batchScratchRetainMinCap {
+		return batchScratchRetainMinCap
+	}
+	maxInt := int(^uint(0) >> 1)
+	if hint > maxInt/batchScratchRetainFactor {
+		return maxInt
+	}
+	return hint * batchScratchRetainFactor
+}
+
+func batchScratchOversized(retainedCap, hint int) bool {
+	if retainedCap <= 0 {
+		return false
+	}
+	return retainedCap > batchScratchRetainLimit(hint)
 }
 
 type batchTransientState struct {
@@ -269,6 +296,27 @@ func normalizeBatchState(state *BatchState) *BatchState {
 	return state
 }
 
+func prepareBatchScratchForBuild(state *BatchState, capHint int) {
+	if state == nil {
+		return
+	}
+	if batchScratchOversized(state.scratch.lastBuildCapHint, capHint) {
+		state.scratch.groupState = nil
+		state.scratch.groupQueues = nil
+		state.scratch.groupQueueCount = 0
+		state.scratch.streamOrder = nil
+		state.scratch.queuedBytes = nil
+		state.scratch.streamMeta = nil
+		state.scratch.transientStreamFinish = nil
+		state.scratch.transientStreamLastServed = nil
+		state.scratch.transientGroupVirtual = nil
+		state.scratch.transientGroupFinish = nil
+		state.scratch.transientGroupLastServed = nil
+		state.scratch.tiePrefStreams = nil
+	}
+	state.scratch.lastBuildCapHint = capHint
+}
+
 func hasRetainedRealBatchState(state *BatchState) bool {
 	if state == nil {
 		return false
@@ -342,6 +390,9 @@ func groupStateMap(state *BatchState, capHint int) map[GroupKey]map[uint64][]int
 		return make(map[GroupKey]map[uint64][]int, capHint)
 	}
 	state.scratch.groupQueueCount = 0
+	if batchScratchOversized(len(state.scratch.groupQueues), capHint) {
+		state.scratch.groupQueues = nil
+	}
 	if state.scratch.groupState == nil {
 		state.scratch.groupState = make(map[GroupKey]map[uint64][]int, capHint)
 	} else {
@@ -466,6 +517,9 @@ func orderedSlice(state *BatchState, n int, capHint int) []int {
 	if state == nil {
 		return make([]int, n, capHint)
 	}
+	if batchScratchOversized(cap(state.scratch.ordered), capHint) {
+		state.scratch.ordered = nil
+	}
 	if cap(state.scratch.ordered) < capHint {
 		state.scratch.ordered = make([]int, n, capHint)
 	} else {
@@ -478,6 +532,9 @@ func groupOrderSlice(state *BatchState, n int, capHint int) []GroupKey {
 	if state == nil {
 		return make([]GroupKey, n, capHint)
 	}
+	if batchScratchOversized(cap(state.scratch.groupOrder), capHint) {
+		state.scratch.groupOrder = nil
+	}
 	if cap(state.scratch.groupOrder) < capHint {
 		state.scratch.groupOrder = make([]GroupKey, n, capHint)
 	} else {
@@ -489,6 +546,9 @@ func groupOrderSlice(state *BatchState, n int, capHint int) []GroupKey {
 func selectedSlice(state *BatchState, n int) []bool {
 	if state == nil {
 		return make([]bool, n)
+	}
+	if batchScratchOversized(cap(state.scratch.selected), n) {
+		state.scratch.selected = nil
 	}
 	if cap(state.scratch.selected) < n {
 		state.scratch.selected = make([]bool, n)

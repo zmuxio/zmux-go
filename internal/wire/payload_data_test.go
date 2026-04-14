@@ -68,6 +68,31 @@ func TestParseStreamMetadataTLVsViewAliasesOpenInfo(t *testing.T) {
 	}
 }
 
+func TestParseStreamMetadataBytesViewAliasesOpenInfoSource(t *testing.T) {
+	t.Parallel()
+
+	raw, err := BuildOpenMetadataPrefix(CapabilityOpenMetadata|CapabilityPriorityHints|CapabilityStreamGroups, nil, nil, []byte("ssh"), 1024)
+	if err != nil {
+		t.Fatalf("BuildOpenMetadataPrefix err = %v", err)
+	}
+	metadataLen, n, err := ParseVarint(raw)
+	if err != nil {
+		t.Fatalf("ParseVarint err = %v", err)
+	}
+	parsed, ok, err := ParseStreamMetadataBytesView(raw[n : n+int(metadataLen)])
+	if err != nil {
+		t.Fatalf("ParseStreamMetadataBytesView err = %v", err)
+	}
+	if !ok {
+		t.Fatal("ParseStreamMetadataBytesView ok = false, want true")
+	}
+
+	raw[len(raw)-1] = 'x'
+	if !bytes.Equal(parsed.OpenInfo, []byte("ssx")) {
+		t.Fatalf("OpenInfo after source mutation = %q, want %q", parsed.OpenInfo, "ssx")
+	}
+}
+
 func TestParseDataPayloadRetainsOpenInfoAfterSourceMutation(t *testing.T) {
 	t.Parallel()
 

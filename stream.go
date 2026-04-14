@@ -44,17 +44,52 @@ func (s *nativeStream) RemoteAddr() net.Addr {
 	return s.streamAddr(streamAddrEndpointRemote)
 }
 
-// NativeStream is the concrete repository-default bidirectional stream type
-// returned by the native *Conn API.
-type NativeStream = nativeStream
+func (s *nativeStream) OpenedLocally() bool {
+	if s == nil {
+		return false
+	}
+	if s.conn == nil {
+		return s.isLocalOpenedLocked()
+	}
+	s.conn.mu.Lock()
+	defer s.conn.mu.Unlock()
+	return s.isLocalOpenedLocked()
+}
 
-// NativeSendStream is the concrete repository-default send-only stream type
-// returned by the native *Conn API.
-type NativeSendStream = nativeSendStream
+func (s *nativeStream) Bidirectional() bool {
+	return s != nil && s.bidi
+}
 
-// NativeRecvStream is the concrete repository-default receive-only stream type
-// returned by the native *Conn API.
-type NativeRecvStream = nativeRecvStream
+func (s *nativeStream) ReadClosed() bool {
+	if s == nil {
+		return true
+	}
+	if s.conn != nil {
+		s.conn.mu.Lock()
+		defer s.conn.mu.Unlock()
+	}
+	if !s.localReceive {
+		return true
+	}
+	if s.readStopSentLocked() {
+		return true
+	}
+	return state.RecvTerminal(s.effectiveRecvHalfStateLocked())
+}
+
+func (s *nativeStream) WriteClosed() bool {
+	if s == nil {
+		return true
+	}
+	if s.conn != nil {
+		s.conn.mu.Lock()
+		defer s.conn.mu.Unlock()
+	}
+	if !s.localSend {
+		return true
+	}
+	return s.effectiveSendHalfStateLocked() != state.SendHalfOpen
+}
 
 type streamAddrEndpoint uint8
 
@@ -122,6 +157,27 @@ func (s *nativeSendStream) StreamID() uint64 {
 	return s.stream.StreamID()
 }
 
+func (s *nativeSendStream) OpenedLocally() bool {
+	if s == nil || s.stream == nil {
+		return false
+	}
+	return s.stream.OpenedLocally()
+}
+
+func (s *nativeSendStream) Bidirectional() bool {
+	if s == nil || s.stream == nil {
+		return false
+	}
+	return s.stream.Bidirectional()
+}
+
+func (s *nativeSendStream) WriteClosed() bool {
+	if s == nil || s.stream == nil {
+		return true
+	}
+	return s.stream.WriteClosed()
+}
+
 func (s *nativeSendStream) OpenInfo() []byte {
 	if s == nil || s.stream == nil {
 		return nil
@@ -185,25 +241,18 @@ func (s *nativeSendStream) CloseWrite() error {
 	return s.stream.CloseWrite()
 }
 
-func (s *nativeSendStream) Reset(code uint64) error {
+func (s *nativeSendStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
-	return s.stream.Reset(code)
+	return s.stream.CancelWrite(code)
 }
 
-func (s *nativeSendStream) CloseWithError(err error) error {
+func (s *nativeSendStream) CloseWithError(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
-	return s.stream.CloseWithError(err)
-}
-
-func (s *nativeSendStream) CloseWithErrorCode(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWithErrorCode(code, reason)
+	return s.stream.CloseWithError(code, reason)
 }
 
 func (s *nativeSendStream) Close() error {
@@ -236,6 +285,27 @@ func (s *nativeRecvStream) StreamID() uint64 {
 		return 0
 	}
 	return s.stream.StreamID()
+}
+
+func (s *nativeRecvStream) OpenedLocally() bool {
+	if s == nil || s.stream == nil {
+		return false
+	}
+	return s.stream.OpenedLocally()
+}
+
+func (s *nativeRecvStream) Bidirectional() bool {
+	if s == nil || s.stream == nil {
+		return false
+	}
+	return s.stream.Bidirectional()
+}
+
+func (s *nativeRecvStream) ReadClosed() bool {
+	if s == nil || s.stream == nil {
+		return true
+	}
+	return s.stream.ReadClosed()
 }
 
 func (s *nativeRecvStream) OpenInfo() []byte {
@@ -280,25 +350,18 @@ func (s *nativeRecvStream) CloseRead() error {
 	return s.stream.CloseRead()
 }
 
-func (s *nativeRecvStream) CloseReadWithCode(code uint64) error {
+func (s *nativeRecvStream) CancelRead(code uint64) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
-	return s.stream.CloseReadWithCode(code)
+	return s.stream.CancelRead(code)
 }
 
-func (s *nativeRecvStream) CloseWithError(err error) error {
+func (s *nativeRecvStream) CloseWithError(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
 	}
-	return s.stream.CloseWithError(err)
-}
-
-func (s *nativeRecvStream) CloseWithErrorCode(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWithErrorCode(code, reason)
+	return s.stream.CloseWithError(code, reason)
 }
 
 func (s *nativeRecvStream) Close() error {
@@ -980,7 +1043,7 @@ func resetTimer(timer *time.Timer, delay time.Duration) *time.Timer {
 }
 
 func (s *nativeStream) CloseRead() error {
-	return s.closeReadWithCode(uint64(CodeCancelled))
+	return s.CancelRead(uint64(CodeCancelled))
 }
 
 type terminalLocalOpenerDisposition uint8
@@ -1013,7 +1076,7 @@ func (s *nativeStream) prepareTerminalLocalOpenerLocked(appErr *ApplicationError
 	return result
 }
 
-func (s *nativeStream) CloseReadWithCode(code uint64) error {
+func (s *nativeStream) CancelRead(code uint64) error {
 	return s.closeReadWithCode(code)
 }
 
@@ -1425,7 +1488,7 @@ func (s *nativeStream) prepareAsyncCloseWritePlan() (terminalFramePlan, error) {
 	}
 }
 
-func (s *nativeStream) Reset(code uint64) error {
+func (s *nativeStream) CancelWrite(code uint64) error {
 	return s.executeTerminalSignal(terminalSignalReset, code, "", terminalSignalOptions{
 		openerPolicy: terminalOpenerRejectUnopened,
 		resetSource:  terminalResetDirect,
@@ -1495,18 +1558,7 @@ func (s *nativeStream) Close() error {
 	return nil
 }
 
-func (s *nativeStream) CloseWithError(err error) error {
-	if err == nil {
-		return s.CloseWithErrorCode(uint64(CodeNoError), "")
-	}
-	var appErr *ApplicationError
-	if errors.As(err, &appErr) {
-		return s.CloseWithErrorCode(appErr.Code, appErr.Reason)
-	}
-	return s.CloseWithErrorCode(uint64(CodeInternal), err.Error())
-}
-
-func (s *nativeStream) CloseWithErrorCode(code uint64, reason string) error {
+func (s *nativeStream) CloseWithError(code uint64, reason string) error {
 	return s.executeTerminalSignal(terminalSignalAbort, code, reason, terminalSignalOptions{
 		openerPolicy: terminalOpenerAllow,
 	})

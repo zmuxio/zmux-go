@@ -1,86 +1,215 @@
 # zmux-go
 
-`zmux-go` is the Go implementation of the `zmux v1` single-link stream
-multiplexing protocol.
+`zmux-go` implements the `zmux v1` single-link stream multiplexing protocol in Go.
 
-It exposes:
+It provides:
 
-- native constructors that return `*zmux.Conn`
-- a stable transport-agnostic `zmux.Session` interface
-- bidirectional, send-only, and receive-only stream surfaces
-- a separate QUIC adapter submodule at
-  `github.com/zmuxio/zmux-go/adapter/quicmux`
+- a native API on `*zmux.Conn`
+- stable transport-agnostic interfaces: `Session`, `Stream`, `SendStream`, `RecvStream`
+- native-only interfaces: `NativeSession`, `NativeStream`, `NativeSendStream`, `NativeRecvStream`
+- a QUIC adapter in `github.com/zmuxio/zmux-go/adapter/quicmux`
 
-## Create A Session
+## Constructors
 
-Use `zmux.New`, `zmux.Client`, or `zmux.Server` with any
-`io.ReadWriteCloser` transport.
+Use the native constructors when you want the full zmux API:
 
 ```go
-package main
-
-import (
-	"context"
-	"net"
-
-	zmux "github.com/zmuxio/zmux-go"
-)
-
-func main() {
-	rawConn, err := net.Dial("tcp", "127.0.0.1:9000")
-	if err != nil {
-		panic(err)
-	}
-
-	session, err := zmux.New(rawConn, nil)
-	if err != nil {
-		panic(err)
-	}
-	defer session.Close()
-
-	stream, err := session.OpenStream(context.Background())
-	if err != nil {
-		panic(err)
-	}
-	defer stream.Close()
-
-	if _, err := stream.Write([]byte("hello")); err != nil {
-		panic(err)
-	}
-}
+conn, err := zmux.New(rwc, cfg)
+client, err := zmux.Client(rwc, cfg)
+server, err := zmux.Server(rwc, cfg)
 ```
 
-Use explicit role constructors when the transport already dictates which side is
-the initiator or responder:
+Use `New` when the transport does not already fix the initiator/responder role.
+Use `Client` or `Server` when the role is already known.
+
+Use the stable constructors when you want the transport-agnostic surface:
 
 ```go
-client, err := zmux.Client(rawConn, nil)
-server, err := zmux.Server(rawConn, nil)
+session, err := zmux.NewSession(rwc, cfg)
+session, err := zmux.ClientSession(rwc, cfg)
+session, err := zmux.ServerSession(rwc, cfg)
 ```
 
-## Stable Session Interface
-
-If you want to code against the repository-default interface instead of native
-`*Conn`, use:
+You can also expose an existing native connection through the stable session interface:
 
 ```go
-var session zmux.Session
-
-session, err = zmux.NewSession(rawConn, nil)
-session, err = zmux.ClientSession(rawConn, nil)
-session, err = zmux.ServerSession(rawConn, nil)
-```
-
-To expose an existing native connection through the stable interface:
-
-```go
-native, err := zmux.New(rawConn, nil)
+native, err := zmux.New(rwc, cfg)
 session := zmux.AsSession(native)
 ```
 
-## Open And Accept Streams
+## Stable Interfaces
 
-Bidirectional streams behave like `net.Conn`.
+`Session` is the stable session surface:
+
+```go
+type Session interface {
+	io.Closer
+
+	AcceptStream(ctx context.Context) (Stream, error)
+	AcceptUniStream(ctx context.Context) (RecvStream, error)
+
+	OpenStream(ctx context.Context) (Stream, error)
+	OpenUniStream(ctx context.Context) (SendStream, error)
+
+	OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (Stream, error)
+	OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (SendStream, error)
+
+	OpenAndSend(ctx context.Context, p []byte) (Stream, int, error)
+	OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (Stream, int, error)
+
+	OpenUniAndSend(ctx context.Context, p []byte) (SendStream, int, error)
+	OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (SendStream, int, error)
+
+	CloseWithError(err error)
+	Wait(ctx context.Context) error
+	Closed() bool
+	State() SessionState
+	Stats() SessionStats
+}
+```
+
+`Stream` is the stable bidirectional stream surface:
+
+```go
+type Stream interface {
+	net.Conn
+
+	StreamID() uint64
+	OpenInfo() []byte
+	Metadata() StreamMetadata
+	UpdateMetadata(update MetadataUpdate) error
+
+	WriteFinal(p []byte) (int, error)
+	WritevFinal(parts ...[]byte) (int, error)
+
+	CloseRead() error
+	CancelRead(code uint64) error
+
+	CloseWrite() error
+	CancelWrite(code uint64) error
+
+	CloseWithError(code uint64, reason string) error
+}
+```
+
+`SendStream` and `RecvStream` are the stable unidirectional stream surfaces:
+
+```go
+type SendStream interface {
+	io.Writer
+	io.Closer
+
+	StreamID() uint64
+	OpenInfo() []byte
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+
+	Metadata() StreamMetadata
+	UpdateMetadata(update MetadataUpdate) error
+
+	WriteFinal(p []byte) (int, error)
+	WritevFinal(parts ...[]byte) (int, error)
+
+	CloseWrite() error
+	CancelWrite(code uint64) error
+	CloseWithError(code uint64, reason string) error
+
+	SetDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+}
+
+type RecvStream interface {
+	io.Reader
+	io.Closer
+
+	StreamID() uint64
+	OpenInfo() []byte
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+
+	Metadata() StreamMetadata
+
+	CloseRead() error
+	CancelRead(code uint64) error
+	CloseWithError(code uint64, reason string) error
+
+	SetDeadline(t time.Time) error
+	SetReadDeadline(t time.Time) error
+}
+```
+
+## Native Interfaces
+
+Native constructors return `*zmux.Conn`, which satisfies `NativeSession`.
+
+`NativeSession` repeats open/accept methods with native stream return types and adds native session controls:
+
+```go
+type NativeSession interface {
+	AcceptStream(ctx context.Context) (NativeStream, error)
+	AcceptUniStream(ctx context.Context) (NativeRecvStream, error)
+
+	OpenStream(ctx context.Context) (NativeStream, error)
+	OpenUniStream(ctx context.Context) (NativeSendStream, error)
+
+	OpenStreamWithOptions(ctx context.Context, opts OpenOptions) (NativeStream, error)
+	OpenUniStreamWithOptions(ctx context.Context, opts OpenOptions) (NativeSendStream, error)
+
+	OpenAndSend(ctx context.Context, p []byte) (NativeStream, int, error)
+	OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (NativeStream, int, error)
+
+	OpenUniAndSend(ctx context.Context, p []byte) (NativeSendStream, int, error)
+	OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (NativeSendStream, int, error)
+
+	Close() error
+	CloseWithError(err error)
+	Wait(ctx context.Context) error
+	Closed() bool
+	State() SessionState
+	Stats() SessionStats
+
+	Ping(ctx context.Context, echo []byte) (time.Duration, error)
+	GoAway(lastAcceptedBidi, lastAcceptedUni uint64) error
+	GoAwayWithError(lastAcceptedBidi, lastAcceptedUni, code uint64, reason string) error
+	PeerGoAwayError() *ApplicationError
+	PeerCloseError() *ApplicationError
+	LocalPreface() Preface
+	PeerPreface() Preface
+	Negotiated() Negotiated
+}
+```
+
+`NativeStream`, `NativeSendStream`, and `NativeRecvStream` extend the stable stream interfaces with local/native queries:
+
+```go
+type NativeStream interface {
+	Stream
+	OpenedLocally() bool
+	Bidirectional() bool
+	ReadClosed() bool
+	WriteClosed() bool
+}
+
+type NativeSendStream interface {
+	SendStream
+	OpenedLocally() bool
+	Bidirectional() bool
+	WriteClosed() bool
+}
+
+type NativeRecvStream interface {
+	RecvStream
+	OpenedLocally() bool
+	Bidirectional() bool
+	ReadClosed() bool
+}
+```
+
+These interfaces are specific to native zmux. Adapters only need to implement the stable surfaces.
+
+## Basic Use
+
+Open and use a bidirectional stream:
 
 ```go
 ctx := context.Background()
@@ -99,7 +228,7 @@ buf := make([]byte, 4096)
 n, err := stream.Read(buf)
 ```
 
-Accept them on the peer side:
+Accept the peer side:
 
 ```go
 stream, err := session.AcceptStream(ctx)
@@ -109,10 +238,7 @@ if err != nil {
 defer stream.Close()
 ```
 
-## Unidirectional Streams
-
-Use `OpenUniStream` / `OpenUniStreamWithOptions` for local send-only streams and
-`AcceptUniStream` for peer-opened receive-only streams.
+Use unidirectional streams when only one side writes:
 
 ```go
 send, err := session.OpenUniStream(ctx)
@@ -132,30 +258,18 @@ if err != nil {
 defer recv.Close()
 ```
 
-## Open Helpers
-
-If you want to open and immediately send payload bytes in one call:
+Open and send in one call:
 
 ```go
 stream, n, err := session.OpenAndSend(ctx, []byte("hello"))
 send, n, err := session.OpenUniAndSend(ctx, []byte("hello"))
 ```
 
-The `WithOptions` variants combine open metadata with the initial payload:
+Use `OpenAndSendWithOptions` or `OpenUniAndSendWithOptions` when the opener also carries metadata.
 
-```go
-stream, n, err := session.OpenAndSendWithOptions(ctx, zmux.OpenOptions{
-	OpenInfo: []byte("ssh"),
-}, []byte("client hello"))
-```
+## Open Metadata
 
-## Open Metadata And Initial Hints
-
-Use `OpenOptions` when opening a stream with:
-
-- `OpenInfo`
-- `InitialPriority`
-- `InitialGroup`
+Use `OpenOptions` to send opener metadata:
 
 ```go
 priority := uint64(7)
@@ -168,17 +282,14 @@ stream, err := session.OpenStreamWithOptions(ctx, zmux.OpenOptions{
 })
 ```
 
-Once a stream exists, inspect the received opener metadata through:
+Read opener metadata from the receiving side:
 
 ```go
 info := stream.OpenInfo()
 meta := stream.Metadata()
 ```
 
-## Update Metadata
-
-Before a stream becomes peer-visible on the wire, callers can update the local
-metadata view:
+Update local metadata before the stream becomes peer-visible:
 
 ```go
 priority := uint64(9)
@@ -187,18 +298,21 @@ err := stream.UpdateMetadata(zmux.MetadataUpdate{
 })
 ```
 
-If the stream or adapter cannot carry that update on the wire anymore, the call
-returns an error such as `zmux.ErrPriorityUpdateUnavailable` or
-`zmux.ErrAdapterUnsupported`.
+If metadata can no longer be represented on the wire, the call returns an error such as `zmux.ErrPriorityUpdateUnavailable` or `zmux.ErrAdapterUnsupported`.
 
-## Graceful Stream Close
+## Stream Close And Cancel
 
-Use the canonical stream termination methods:
+Stable stream methods mean:
 
-- `CloseWrite()` for send-half graceful finish
-- `WriteFinal(...)` / `WritevFinal(...)` to send final bytes and finish in one call
-- `CloseRead()` / `CloseReadWithCode(code)` to stop reading
-- `Close()` to close both local halves when they exist
+- `WriteFinal` / `WritevFinal`: write the final payload and finish the write side
+- `CloseWrite`: graceful write-side finish
+- `CancelWrite(code)`: abort the local write side
+- `CloseRead`: stop the local read side with the default cancel code
+- `CancelRead(code)`: stop the local read side with an explicit code
+- `CloseWithError(code, reason)`: abort the whole stream
+- `Close`: local helper that closes both existing halves
+
+Examples:
 
 ```go
 if _, err := stream.WriteFinal([]byte("goodbye")); err != nil {
@@ -208,58 +322,21 @@ if _, err := stream.WriteFinal([]byte("goodbye")); err != nil {
 if err := stream.CloseRead(); err != nil {
 	return err
 }
-```
 
-## Abortive Stream Termination
-
-Use:
-
-- `Reset(code)` to abort the local write side
-- `CloseWithError(err)` / `CloseWithErrorCode(code, reason)` for whole-stream
-  abortive close
-
-```go
-if err := stream.Reset(uint64(zmux.CodeCancelled)); err != nil {
+if err := stream.CancelWrite(uint64(zmux.CodeCancelled)); err != nil {
 	return err
 }
 
-if err := stream.CloseWithErrorCode(uint64(zmux.CodeInternal), "backend failed"); err != nil {
+if err := stream.CloseWithError(uint64(zmux.CodeInternal), "backend failed"); err != nil {
 	return err
 }
 ```
 
-## Native Stream Extensions
-
-The stable `zmux.Stream` / `zmux.SendStream` / `zmux.RecvStream` interfaces
-already expose the repository-default close, reset, read-stop, and whole-stream
-abort helpers. If you use native constructors that return `*zmux.Conn`, the
-exported native stream types also expose richer native variants:
-
-- `(*zmux.NativeStream).CloseReadWithCode(code)`
-- `(*zmux.NativeStream).CloseWithErrorCode(code, reason)`
-- `(*zmux.NativeRecvStream).CloseReadWithCode(code)`
-
-Example:
-
-```go
-native, err := zmux.New(rawConn, nil)
-if err != nil {
-	return err
-}
-
-stream, err := native.OpenStream(ctx)
-if err != nil {
-	return err
-}
-
-if err := stream.CloseWithErrorCode(uint64(zmux.CodeInternal), "backend failed"); err != nil {
-	return err
-}
-```
+Native zmux treats whole-stream abort as a first-class operation on bidirectional and unidirectional streams, so `CloseWithError` exists on `Stream`, `SendStream`, and `RecvStream`.
 
 ## Deadlines
 
-Bidirectional streams expose the usual `net.Conn` deadlines:
+`Stream` exposes the usual `net.Conn` deadlines:
 
 ```go
 _ = stream.SetDeadline(time.Now().Add(5 * time.Second))
@@ -267,18 +344,20 @@ _ = stream.SetReadDeadline(time.Now().Add(5 * time.Second))
 _ = stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
 ```
 
-`SendStream` exposes write deadlines, and `RecvStream` exposes read deadlines.
+`SendStream` exposes write deadlines. `RecvStream` exposes read deadlines.
 
 ## Session Lifecycle
 
-Useful session-level methods:
+Stable session methods mean:
 
-- `Close()` for graceful session shutdown
-- `Abort(err)` for abortive session shutdown
-- `Wait(ctx)` to block until the session is fully terminated
-- `Closed()` to check whether shutdown has completed
-- `State()` to read the current public session lifecycle state
-- `Stats()` to inspect queue, flow-control, and runtime counters
+- `Close()`: graceful session close
+- `CloseWithError(err)`: abortive session close
+- `Wait(ctx)`: wait for termination
+- `Closed()`: report whether the session has terminated
+- `State()`: return the public session state
+- `Stats()`: return runtime counters and pressure snapshots
+
+Example:
 
 ```go
 go func() {
@@ -288,19 +367,9 @@ go func() {
 }()
 ```
 
-## Native Session Extensions
+## Native Session Helpers
 
-The stable `zmux.Session` interface stays transport-agnostic. Native `*zmux.Conn`
-adds protocol helpers such as:
-
-- `Ping(ctx, echo)`
-- `GoAway(...)` / `GoAwayWithError(...)`
-- `PeerGoAwayError()` / `PeerCloseError()`
-- `LocalPreface()` / `PeerPreface()` / `Negotiated()`
-
-## PING / GOAWAY / Peer Close State
-
-Native `*zmux.Conn` also exposes protocol helpers:
+On native `*zmux.Conn`, you also have:
 
 - `Ping(ctx, echo)`
 - `GoAway(lastAcceptedBidi, lastAcceptedUni)`
@@ -311,12 +380,22 @@ Native `*zmux.Conn` also exposes protocol helpers:
 - `PeerPreface()`
 - `Negotiated()`
 
-These are available on the native connection type, not on the stable
-`zmux.Session` interface.
+Example:
+
+```go
+conn, err := zmux.New(rwc, cfg)
+if err != nil {
+	return err
+}
+
+if _, err := conn.Ping(ctx, []byte("probe")); err != nil {
+	return err
+}
+```
 
 ## Errors
 
-Use Go error inspection helpers instead of direct equality:
+Use standard Go error inspection:
 
 ```go
 if errors.Is(err, zmux.ErrSessionClosed) {
@@ -327,6 +406,11 @@ var appErr *zmux.ApplicationError
 if errors.As(err, &appErr) {
 	// inspect appErr.Code / appErr.Reason
 }
+
+var structured *zmux.Error
+if errors.As(err, &structured) {
+	// inspect Scope / Operation / Source / Direction / TerminationKind
+}
 ```
 
 Common surface errors include:
@@ -335,19 +419,15 @@ Common surface errors include:
 - `zmux.ErrReadClosed`
 - `zmux.ErrWriteClosed`
 - `zmux.ErrOpenLimited`
+- `zmux.ErrOpenExpired`
 - `zmux.ErrPriorityUpdateUnavailable`
+- `zmux.ErrAdapterUnsupported`
+
+`ApplicationError` carries peer-visible application close codes and reason text.
 
 ## Configuration
 
-Pass a `*zmux.Config` to constructors to customize behavior such as:
-
-- negotiated capabilities
-- local settings / limits
-- keepalive behavior
-- graceful close / STOP_SENDING drain windows
-- queue budgets and backlog limits
-- event handling
-- memory and control buffering budgets
+Pass `*zmux.Config` to control capabilities, settings, keepalive, close timeouts, queue budgets, memory budgets, and event hooks:
 
 ```go
 cfg := &zmux.Config{
@@ -358,28 +438,12 @@ cfg := &zmux.Config{
 	},
 }
 
-session, err := zmux.New(rawConn, cfg)
+session, err := zmux.New(rwc, cfg)
 ```
 
-`GracefulCloseDrainTimeout` should normally be picked from shutdown behavior,
-not just RTT:
+## JoinConn
 
-- `25-100ms` for low-latency intra-DC request/response traffic
-- `100-500ms` for typical service meshes and moderate fan-out
-- higher values only when graceful shutdown must give active streams more time
-  to finish before falling back to a bounded timeout
-
-With zero-valued close/drain overrides, the runtime keeps repository defaults
-that are tuned for ordinary moderate-latency links. Once a session has observed
-ping RTT, it may widen the effective close-frame, GOAWAY, STOP_SENDING, and
-keepalive timeout windows within bounded caps so very high latency links remain
-usable without retuning the default profile. Explicit config overrides still
-win.
-
-## Joined Read/Write Halves
-
-If your transport exposes separate read and write halves, join them into a
-single `net.Conn`-compatible object first:
+If your transport exposes separate read and write halves, combine them first:
 
 ```go
 joined := zmux.JoinConn(readHalf, writeHalf)
@@ -388,8 +452,7 @@ session, err := zmux.New(joined, nil)
 
 ## QUIC Adapter
 
-The QUIC adapter lives in the separate submodule
-`github.com/zmuxio/zmux-go/adapter/quicmux`.
+The QUIC adapter lives in `github.com/zmuxio/zmux-go/adapter/quicmux`:
 
 ```go
 import (
@@ -401,7 +464,4 @@ var qconn *quic.Conn
 session := quicmux.WrapSession(qconn)
 ```
 
-The adapter exposes the same stable `zmux.Session` interface while translating
-the supported subset of stream metadata and termination semantics onto
-`quic-go`.
-
+It implements the stable `zmux.Session` surface and maps the supported subset of metadata and termination semantics onto `quic-go`. See `adapter/quicmux/README.md` for adapter details.

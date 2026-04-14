@@ -465,10 +465,7 @@ func (c *Conn) handleExtFrame(frame Frame) error {
 	}
 }
 
-// PeerCloseError returns the last CLOSE payload from the peer, if any.
-//
-// It does not alter session state. The returned value is a copy so callers can
-// inspect code and reason safely without mutating connection internals.
+// PeerCloseError returns the last peer CLOSE error, if any.
 func (c *Conn) PeerCloseError() *ApplicationError {
 	if c == nil {
 		return nil

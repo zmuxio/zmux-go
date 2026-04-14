@@ -471,7 +471,7 @@ func TestJoinedConnCloseClosesPresentHalves(t *testing.T) {
 		t.Fatalf("Close err = %v, want nil", err)
 	}
 
-	awaitStreamWriteState(t, clientSend.stream, testSignalTimeout, func(s *nativeStream) bool {
+	awaitStreamWriteState(t, requireNativeSendStreamImpl(t, clientSend).stream, testSignalTimeout, func(s *nativeStream) bool {
 		return s.localReadStop || s.sendStop != nil || s.sendAbort != nil || s.sendReset != nil || s.sendFinReached()
 	}, "timed out waiting for sender to observe JoinedConn CloseRead")
 
@@ -544,7 +544,7 @@ func TestJoinedConnCloseWriteProducesEOFOnPeerRead(t *testing.T) {
 	acceptCh := make(chan acceptResult, 1)
 	go func() {
 		s, err := server.AcceptUniStream(ctx)
-		acceptCh <- acceptResult{stream: s, err: err}
+		acceptCh <- acceptResult{stream: mustNativeRecvStreamImpl(s), err: err}
 	}()
 
 	conn := JoinConn(nil, clientSend)
@@ -778,7 +778,7 @@ func TestJoinedConnPauseReadWaitsForInflightReadToDrain(t *testing.T) {
 			err error
 		}{n: n, err: err}
 	}()
-	awaitStreamReadWaiter(t, clientRecv.stream, testSignalTimeout, "timed out waiting for in-flight JoinedConn Read")
+	awaitStreamReadWaiter(t, requireNativeRecvStreamImpl(t, clientRecv).stream, testSignalTimeout, "timed out waiting for in-flight JoinedConn Read")
 
 	pauseDone := make(chan *PausedReadHalf, 1)
 	go func() {
@@ -908,7 +908,7 @@ func TestJoinedConnPauseReadContextCanCancel(t *testing.T) {
 		_, err := clientConn.Read(readDone)
 		doneCh <- err
 	}()
-	awaitStreamReadWaiter(t, clientRecv.stream, testSignalTimeout, "timed out waiting for in-flight read before PauseRead cancel")
+	awaitStreamReadWaiter(t, requireNativeRecvStreamImpl(t, clientRecv).stream, testSignalTimeout, "timed out waiting for in-flight read before PauseRead cancel")
 
 	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer pauseCancel()
@@ -1472,7 +1472,7 @@ func TestStreamNetConnReadWriteAndClose(t *testing.T) {
 	acceptCh := make(chan acceptResult, 1)
 	go func() {
 		s, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: s, err: err}
+		acceptCh <- acceptResult{stream: mustNativeStreamImpl(s), err: err}
 	}()
 
 	stream, err := client.OpenStream(ctx)
@@ -1521,7 +1521,7 @@ func TestStreamNetConnDeadlineViaInterface(t *testing.T) {
 	acceptCh := make(chan acceptResult, 1)
 	go func() {
 		s, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: s, err: err}
+		acceptCh <- acceptResult{stream: mustNativeStreamImpl(s), err: err}
 	}()
 
 	stream, err := client.OpenStream(ctx)
@@ -1677,7 +1677,7 @@ func TestUniStreamsReadWriteViaIOInterfaces(t *testing.T) {
 	acceptCh := make(chan acceptResult, 1)
 	go func() {
 		s, err := server.AcceptUniStream(ctx)
-		acceptCh <- acceptResult{stream: s, err: err}
+		acceptCh <- acceptResult{stream: mustNativeRecvStreamImpl(s), err: err}
 	}()
 
 	send, err := client.OpenUniStream(ctx)
@@ -1715,7 +1715,7 @@ func TestUniStreamsReadWriteViaIOInterfaces(t *testing.T) {
 func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	t.Parallel()
 
-	var s *NativeStream
+	var s NativeStream = (*nativeStream)(nil)
 
 	if got := s.Metadata(); got.Priority != 0 || got.Group != nil || got.OpenInfo != nil {
 		t.Fatalf("Metadata() = %#v, want zero-value fields", got)
@@ -1736,6 +1736,18 @@ func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	if _, err := s.Write(nil); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("Write(nil) err = %v, want %v", err, ErrSessionClosed)
 	}
+	if s.OpenedLocally() {
+		t.Fatal("OpenedLocally() = true, want false")
+	}
+	if s.Bidirectional() {
+		t.Fatal("Bidirectional() = true, want false")
+	}
+	if !s.ReadClosed() {
+		t.Fatal("ReadClosed() = false, want true")
+	}
+	if !s.WriteClosed() {
+		t.Fatal("WriteClosed() = false, want true")
+	}
 	if _, err := s.WriteFinal([]byte("x")); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("WriteFinal() err = %v, want %v", err, ErrSessionClosed)
 	}
@@ -1746,17 +1758,17 @@ func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	if err := s.CloseRead(); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("CloseRead() err = %v, want %v", err, ErrSessionClosed)
 	}
-	if err := s.CloseReadWithCode(uint64(CodeCancelled)); !errors.Is(err, ErrSessionClosed) {
-		t.Fatalf("CloseReadWithCode() err = %v, want %v", err, ErrSessionClosed)
+	if err := s.CancelRead(uint64(CodeCancelled)); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("CancelRead() err = %v, want %v", err, ErrSessionClosed)
 	}
 	if err := s.CloseWrite(); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("CloseWrite() err = %v, want %v", err, ErrSessionClosed)
 	}
-	if err := s.Reset(uint64(CodeCancelled)); !errors.Is(err, ErrSessionClosed) {
+	if err := s.CancelWrite(uint64(CodeCancelled)); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("Reset() err = %v, want %v", err, ErrSessionClosed)
 	}
-	if err := s.CloseWithErrorCode(uint64(CodeCancelled), ""); !errors.Is(err, ErrSessionClosed) {
-		t.Fatalf("CloseWithErrorCode() err = %v, want %v", err, ErrSessionClosed)
+	if err := s.CloseWithError(uint64(CodeCancelled), ""); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("CloseWithError() err = %v, want %v", err, ErrSessionClosed)
 	}
 	if err := s.Close(); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("Close() err = %v, want %v", err, ErrSessionClosed)
@@ -1784,13 +1796,13 @@ func TestCloseReadInvalidCodeDoesNotLeakConnLock(t *testing.T) {
 		{
 			name: "CloseReadWithCode",
 			call: func(s *nativeStream) error {
-				return s.CloseReadWithCode(MaxVarint62 + 1)
+				return s.CancelRead(MaxVarint62 + 1)
 			},
 		},
 		{
 			name: "CancelReadWithCode",
 			call: func(s *nativeStream) error {
-				return s.CloseReadWithCode(MaxVarint62 + 1)
+				return s.CancelRead(MaxVarint62 + 1)
 			},
 		},
 	}
@@ -1926,7 +1938,7 @@ func TestStreamGettersConcurrentWithCommit(t *testing.T) {
 	acceptCh := make(chan acceptResult, 1)
 	go func() {
 		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
+		acceptCh <- acceptResult{stream: mustNativeStreamImpl(stream), err: err}
 	}()
 
 	stream, err := client.OpenStreamWithOptions(ctx, OpenOptions{OpenInfo: []byte("ssh")})
@@ -2129,7 +2141,7 @@ func TestCloseReadWithZeroWindowQueuesOpeningDataBeforeStopSending(t *testing.T)
 	assertNoQueuedFrame(t, frames)
 }
 
-func TestCloseWithErrorOnConcreteLocalIDQueuesOpeningAbort(t *testing.T) {
+func TestCloseWithErrorOnConcreteLocalIDQueuesOpeningCloseWithError(t *testing.T) {
 	t.Parallel()
 
 	c, frames, stop := newInvalidFrameConn(t, 0)
@@ -2141,7 +2153,7 @@ func TestCloseWithErrorOnConcreteLocalIDQueuesOpeningAbort(t *testing.T) {
 	c.appendUnseenLocalLocked(stream)
 	c.mu.Unlock()
 
-	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.CloseWithError(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("CloseWithErrorCode err = %v, want nil", err)
 	}
 
@@ -2177,7 +2189,7 @@ func TestCloseWithErrorOnConcreteLocalIDQueuesOpeningAbort(t *testing.T) {
 func TestCloseWithErrorHelpersQueueExpectedAbortFrames(t *testing.T) {
 	t.Parallel()
 
-	queueAbort := func(t *testing.T, invoke func(*nativeStream) error) Frame {
+	queueCloseWithError := func(t *testing.T, invoke func(*nativeStream) error) Frame {
 		t.Helper()
 
 		c, frames, stop := newInvalidFrameConn(t, 0)
@@ -2194,8 +2206,8 @@ func TestCloseWithErrorHelpersQueueExpectedAbortFrames(t *testing.T) {
 		return awaitQueuedFrame(t, frames)
 	}
 
-	cancelFrame := queueAbort(t, func(stream *nativeStream) error {
-		return stream.CloseWithErrorCode(uint64(CodeCancelled), "")
+	cancelFrame := queueCloseWithError(t, func(stream *nativeStream) error {
+		return stream.CloseWithError(uint64(CodeCancelled), "")
 	})
 	if cancelFrame.Type != FrameTypeABORT {
 		t.Fatalf("CloseWithErrorCode frame type = %v, want %v", cancelFrame.Type, FrameTypeABORT)
@@ -2209,22 +2221,22 @@ func TestCloseWithErrorHelpersQueueExpectedAbortFrames(t *testing.T) {
 	}
 
 	appErr := &ApplicationError{Code: uint64(CodeInternal), Reason: "backend failed"}
-	errorPreferred := queueAbort(t, func(stream *nativeStream) error {
-		return stream.CloseWithError(appErr)
+	errorPreferred := queueCloseWithError(t, func(stream *nativeStream) error {
+		return stream.CloseWithError(appErr.Code, appErr.Reason)
 	})
 	if errorPreferred.Type != FrameTypeABORT {
-		t.Fatalf("CloseWithError frame type = %v, want %v", errorPreferred.Type, FrameTypeABORT)
+		t.Fatalf("CloseWithErrorCode frame type = %v, want %v", errorPreferred.Type, FrameTypeABORT)
 	}
 	code, reason, err = parseErrorPayload(errorPreferred.Payload)
 	if err != nil {
-		t.Fatalf("parse CloseWithError payload: %v", err)
+		t.Fatalf("parse CloseWithErrorCode payload: %v", err)
 	}
 	if code != appErr.Code || reason != appErr.Reason {
-		t.Fatalf("CloseWithError payload = (%d, %q), want (%d, %q)", code, reason, appErr.Code, appErr.Reason)
+		t.Fatalf("CloseWithErrorCode payload = (%d, %q), want (%d, %q)", code, reason, appErr.Code, appErr.Reason)
 	}
 
-	codePreferred := queueAbort(t, func(stream *nativeStream) error {
-		return stream.CloseWithErrorCode(55, "bye")
+	codePreferred := queueCloseWithError(t, func(stream *nativeStream) error {
+		return stream.CloseWithError(55, "bye")
 	})
 	code, reason, err = parseErrorPayload(codePreferred.Payload)
 	if err != nil {
@@ -2520,7 +2532,7 @@ func TestResetAfterSendFinReturnsWriteClosedWithoutQueueingReset(t *testing.T) {
 	})
 	testMarkLocalOpenCommitted(stream)
 
-	err := stream.Reset(uint64(CodeCancelled))
+	err := stream.CancelWrite(uint64(CodeCancelled))
 	if !isWriteStoppedErr(err) {
 		t.Fatalf("Reset err = %v, want write-stopped error", err)
 	}
@@ -2553,7 +2565,7 @@ func TestResetOnConcreteLocalIDBeforeCommitFailsLocallyWithoutQueueingReset(t *t
 	c.appendUnseenLocalLocked(stream)
 	c.mu.Unlock()
 
-	if err := stream.Reset(uint64(CodeCancelled)); err != nil {
+	if err := stream.CancelWrite(uint64(CodeCancelled)); err != nil {
 		t.Fatalf("Reset err = %v, want nil", err)
 	}
 	assertNoQueuedFrame(t, frames)
@@ -2683,7 +2695,7 @@ func TestResetAfterSendTerminalReturnsLocalErrorWithoutQueueingReset(t *testing.
 			})
 			testMarkLocalOpenCommitted(stream)
 
-			err := stream.Reset(uint64(CodeCancelled))
+			err := stream.CancelWrite(uint64(CodeCancelled))
 			if tc.wantWriteStop {
 				if !isWriteStoppedErr(err) {
 					t.Fatalf("Reset err = %v, want write-stopped error", err)
@@ -2809,7 +2821,7 @@ func TestCloseReadStopsPeerWritesButPreservesReverseRead(t *testing.T) {
 			acceptErrCh <- err
 			return
 		}
-		acceptCh <- accepted
+		acceptCh <- mustNativeStreamImpl(accepted)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -2844,7 +2856,7 @@ func TestCloseReadStopsPeerWritesButPreservesReverseRead(t *testing.T) {
 		t.Fatalf("server reverse write after CloseRead: %v", err)
 	}
 
-	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
+	awaitStreamWriteState(t, requireNativeStreamImpl(t, clientStream), testSignalTimeout, func(s *nativeStream) bool {
 		return s.localReadStop || s.sendStop != nil || s.sendAbort != nil || s.sendFinReached() || s.sendReset != nil
 	}, "timed out waiting for peer CloseRead visibility")
 
@@ -2875,7 +2887,7 @@ func TestCloseReadRepeatedCallReturnsReadClosed(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- accepted
+		acceptCh <- mustNativeStreamImpl(accepted)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -2917,7 +2929,7 @@ func TestResetRepeatedCallReturnsLocalTerminalError(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- accepted
+		acceptCh <- mustNativeStreamImpl(accepted)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -2934,13 +2946,13 @@ func TestResetRepeatedCallReturnsLocalTerminalError(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := clientStream.Reset(uint64(CodeCancelled)); err != nil {
+	if err := clientStream.CancelWrite(uint64(CodeCancelled)); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
 	if _, err := clientStream.Write([]byte("y")); !isWriteStoppedErr(err) {
 		t.Fatalf("write after reset err = %v, want write-stopped error", err)
 	}
-	err = clientStream.Reset(uint64(CodeCancelled))
+	err = clientStream.CancelWrite(uint64(CodeCancelled))
 	var appErr *ApplicationError
 	if !errors.As(err, &appErr) {
 		t.Fatalf("second reset err = %v, want ApplicationError", err)
@@ -2964,7 +2976,7 @@ func TestCloseReadDoesNotBlockExplicitCloseWrite(t *testing.T) {
 			acceptErrCh <- err
 			return
 		}
-		acceptCh <- accepted
+		acceptCh <- mustNativeStreamImpl(accepted)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -2991,7 +3003,7 @@ func TestCloseReadDoesNotBlockExplicitCloseWrite(t *testing.T) {
 		t.Fatalf("server CloseRead: %v", err)
 	}
 
-	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
+	awaitStreamWriteState(t, requireNativeStreamImpl(t, clientStream), testSignalTimeout, func(s *nativeStream) bool {
 		return s.localReadStop || s.sendStop != nil || s.sendAbort != nil || s.sendFinReached() || s.sendReset != nil
 	}, "timed out waiting for peer CloseRead visibility")
 
@@ -3576,7 +3588,7 @@ func TestStreamReadDeadlineExpires(t *testing.T) {
 			errCh <- err
 			return
 		}
-		acceptCh <- accepted
+		acceptCh <- mustNativeStreamImpl(accepted)
 	}()
 
 	if _, err := stream.Write([]byte("x")); err != nil {
@@ -3673,7 +3685,7 @@ func TestSetReadDeadlineWakesBlockedRead(t *testing.T) {
 			acceptErrCh <- err
 			return
 		}
-		acceptCh <- accepted
+		acceptCh <- mustNativeStreamImpl(accepted)
 	}()
 
 	if _, err := stream.Write([]byte("x")); err != nil {
@@ -4436,7 +4448,7 @@ func TestStreamCancelWriteWithCodeAliasesReset(t *testing.T) {
 	})
 	testMarkLocalOpenVisible(stream)
 
-	if err := stream.Reset(99); err != nil {
+	if err := stream.CancelWrite(99); err != nil {
 		t.Fatalf("CancelWriteWithCode err = %v", err)
 	}
 
@@ -4458,7 +4470,7 @@ func TestSendStreamResetWriteWithCodeAliasesReset(t *testing.T) {
 	testMarkLocalOpenVisible(stream)
 
 	send := &nativeSendStream{stream: stream}
-	if err := send.Reset(77); err != nil {
+	if err := send.CancelWrite(77); err != nil {
 		t.Fatalf("ResetWriteWithCode err = %v", err)
 	}
 
@@ -4476,7 +4488,7 @@ func TestStreamCloseWithErrorCodeUsesCancelledCode(t *testing.T) {
 		RecvHalf: "recv_open",
 	})
 
-	if err := stream.CloseWithErrorCode(uint64(CodeCancelled), ""); err != nil {
+	if err := stream.CloseWithError(uint64(CodeCancelled), ""); err != nil {
 		t.Fatalf("CloseWithErrorCode err = %v", err)
 	}
 
@@ -4499,7 +4511,7 @@ func TestStreamCloseWithErrorCodeUsesCancelledCode(t *testing.T) {
 	}
 }
 
-func TestRecvStreamCloseWithErrorCodeQueuesWholeStreamAbort(t *testing.T) {
+func TestRecvStreamCloseWithErrorCodeQueuesWholeStreamCloseWithError(t *testing.T) {
 	t.Parallel()
 
 	c, frames, stop := newInvalidFrameConn(t, 0)
@@ -4511,7 +4523,7 @@ func TestRecvStreamCloseWithErrorCodeQueuesWholeStreamAbort(t *testing.T) {
 	})
 
 	recv := &nativeRecvStream{stream: stream}
-	if err := recv.CloseWithErrorCode(55, "bye"); err != nil {
+	if err := recv.CloseWithError(55, "bye"); err != nil {
 		t.Fatalf("CloseWithErrorCode err = %v", err)
 	}
 
@@ -4821,7 +4833,7 @@ func openServerToClientUniPair(t *testing.T) (*Conn, *Conn, *nativeRecvStream, *
 			acceptErrCh <- err
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeRecvStreamImpl(stream)
 	}()
 
 	serverStream, err := server.OpenUniStream(ctx)
@@ -4836,7 +4848,7 @@ func openServerToClientUniPair(t *testing.T) (*Conn, *Conn, *nativeRecvStream, *
 	case err := <-acceptErrCh:
 		t.Fatalf("client accept uni failed: %v", err)
 	case clientStream := <-acceptCh:
-		return client, server, clientStream, serverStream
+		return client, server, clientStream, mustNativeSendStreamImpl(serverStream)
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for client uni accept")
 		return nil, nil, nil, nil
@@ -4860,7 +4872,7 @@ func openClientToServerUniPair(t *testing.T) (*Conn, *Conn, *nativeSendStream, *
 			acceptErrCh <- err
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeRecvStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenUniStream(ctx)
@@ -4875,7 +4887,7 @@ func openClientToServerUniPair(t *testing.T) (*Conn, *Conn, *nativeSendStream, *
 	case err := <-acceptErrCh:
 		t.Fatalf("server accept uni failed: %v", err)
 	case serverStream := <-acceptCh:
-		return client, server, clientStream, serverStream
+		return client, server, mustNativeSendStreamImpl(clientStream), serverStream
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for server uni accept")
 		return nil, nil, nil, nil
@@ -4958,7 +4970,7 @@ func TestStructuredErrorAfterLocalCloseRead(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -5005,7 +5017,7 @@ func TestStructuredErrorAfterPeerReset(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -5022,7 +5034,7 @@ func TestStructuredErrorAfterPeerReset(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.Reset(uint64(CodeCancelled)); err != nil {
+	if err := serverStream.CancelWrite(uint64(CodeCancelled)); err != nil {
 		t.Fatalf("Reset: %v", err)
 	}
 
@@ -5140,7 +5152,7 @@ func TestStructuredErrorAfterLocalCloseWrite(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -5331,8 +5343,9 @@ func TestStructuredErrorAfterExpiredProvisionalWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open provisional stream: %v", err)
 	}
+	firstImpl := requireNativeStreamImpl(t, first)
 	client.mu.Lock()
-	first.setProvisionalCreated(time.Now().Add(-provisionalOpenMaxAge - time.Second))
+	firstImpl.setProvisionalCreated(time.Now().Add(-provisionalOpenMaxAge - time.Second))
 	client.mu.Unlock()
 
 	_, err = first.Write([]byte("x"))
@@ -5501,7 +5514,7 @@ func TestStructuredErrorAfterLocalAbortRead(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -5518,7 +5531,7 @@ func TestStructuredErrorAfterLocalAbortRead(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := clientStream.CloseWithErrorCode(uint64(CodeInternal), "local abort"); err != nil {
+	if err := clientStream.CloseWithError(uint64(CodeInternal), "local abort"); err != nil {
 		t.Fatalf("client abort: %v", err)
 	}
 
@@ -5553,7 +5566,7 @@ func TestStructuredErrorAfterPeerAbortWrite(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -5570,11 +5583,11 @@ func TestStructuredErrorAfterPeerAbortWrite(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.CloseWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
+	if err := serverStream.CloseWithError(uint64(CodeRefusedStream), "peer abort"); err != nil {
 		t.Fatalf("server abort: %v", err)
 	}
 
-	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
+	awaitStreamWriteState(t, requireNativeStreamImpl(t, clientStream), testSignalTimeout, func(s *nativeStream) bool {
 		return s.sendAbort != nil || s.recvAbort != nil
 	}, "timed out waiting for peer abort to be observed before Write")
 
@@ -5633,7 +5646,7 @@ func TestStructuredErrorAfterPeerFinCloseRead(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -5682,7 +5695,7 @@ func TestStructuredErrorAfterRepeatedLocalCloseWrite(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -5729,7 +5742,7 @@ func TestStructuredErrorAfterPeerAbortCloseWrite(t *testing.T) {
 			t.Errorf("accept stream: %v", err)
 			return
 		}
-		acceptCh <- stream
+		acceptCh <- mustNativeStreamImpl(stream)
 	}()
 
 	clientStream, err := client.OpenStream(ctx)
@@ -5746,11 +5759,11 @@ func TestStructuredErrorAfterPeerAbortCloseWrite(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.CloseWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
+	if err := serverStream.CloseWithError(uint64(CodeRefusedStream), "peer abort"); err != nil {
 		t.Fatalf("server abort: %v", err)
 	}
 
-	awaitStreamWriteState(t, clientStream, testSignalTimeout, func(s *nativeStream) bool {
+	awaitStreamWriteState(t, requireNativeStreamImpl(t, clientStream), testSignalTimeout, func(s *nativeStream) bool {
 		return s.sendAbort != nil || s.recvAbort != nil
 	}, "timed out waiting for peer abort to be observed before CloseWrite")
 
@@ -5786,7 +5799,7 @@ func TestStreamCloseWithErrorCodeTruncatesReasonTextToControlLimit(t *testing.T)
 	c.registry.streams[4] = stream
 
 	reason := "abcdefghijklmnopqrst"
-	if err := stream.CloseWithErrorCode(uint64(CodeRefusedStream), reason); err != nil {
+	if err := stream.CloseWithError(uint64(CodeRefusedStream), reason); err != nil {
 		t.Fatalf("close with long reason: %v", err)
 	}
 
@@ -5824,7 +5837,7 @@ func TestStreamCloseWithErrorCodePreservesUTF8BoundaryWhenTruncating(t *testing.
 	c.registry.streams[4] = stream
 
 	reason := "😀😀😀"
-	if err := stream.CloseWithErrorCode(uint64(CodeInternal), reason); err != nil {
+	if err := stream.CloseWithError(uint64(CodeInternal), reason); err != nil {
 		t.Fatalf("close with utf8 reason: %v", err)
 	}
 
@@ -5855,7 +5868,7 @@ func TestSessionAbortPayloadTruncatesReasonTextToControlLimit(t *testing.T) {
 	c.config.peer.Settings.MaxControlPayloadBytes = 16
 
 	reason := "abcdefghijklmnopqrst"
-	c.Abort(&ApplicationError{Code: uint64(CodeInternal), Reason: reason})
+	c.CloseWithError(&ApplicationError{Code: uint64(CodeInternal), Reason: reason})
 
 	frame := awaitQueuedFrame(t, frames)
 	if frame.Type != FrameTypeCLOSE {
@@ -5941,7 +5954,7 @@ func TestSessionAbortPayloadPreservesWireErrorCode(t *testing.T) {
 	defer stop()
 	c.config.peer.Settings.MaxControlPayloadBytes = 32
 
-	c.Abort(frameSizeError("close", errors.New("bad frame")))
+	c.CloseWithError(frameSizeError("close", errors.New("bad frame")))
 
 	frame := awaitQueuedFrame(t, frames)
 	if frame.Type != FrameTypeCLOSE {
@@ -5966,7 +5979,7 @@ func TestSessionAbortPayloadMapsKeepaliveTimeoutToIdleTimeout(t *testing.T) {
 	defer stop()
 	c.config.peer.Settings.MaxControlPayloadBytes = 32
 
-	c.Abort(ErrKeepaliveTimeout)
+	c.CloseWithError(ErrKeepaliveTimeout)
 
 	frame := awaitQueuedFrame(t, frames)
 	if frame.Type != FrameTypeCLOSE {
@@ -5991,7 +6004,7 @@ func TestSessionAbortDoesNotEmitDuplicateCloseFrame(t *testing.T) {
 	defer stop()
 	c.io.conn = &countingWriteCloser{}
 
-	c.Abort(&ApplicationError{Code: uint64(CodeInternal), Reason: "fatal"})
+	c.CloseWithError(&ApplicationError{Code: uint64(CodeInternal), Reason: "fatal"})
 
 	frame := awaitQueuedFrame(t, frames)
 	if frame.Type != FrameTypeCLOSE {
@@ -6110,7 +6123,7 @@ func TestHandleResetFrameDuplicateStandardDIAGDropsReasonKeepsReset(t *testing.T
 	}
 }
 
-func TestHandleAbortFrameDuplicateStandardDIAGDropsReasonKeepsAbort(t *testing.T) {
+func TestHandleAbortFrameDuplicateStandardDIAGDropsReasonKeepsCloseWithError(t *testing.T) {
 	t.Parallel()
 
 	c, _, stop := newHandlerTestConn(t)

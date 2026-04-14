@@ -23,20 +23,33 @@ func MarshalSettingsTLV(s Settings) ([]byte, error) {
 		{SettingSchedulerHints, uint64(s.SchedulerHints), uint64(defaults.SchedulerHints)},
 	}
 	var out []byte
+	var err error
 	for _, entry := range entries {
 		if entry.value == entry.def {
 			continue
 		}
-		value, err := EncodeVarint(entry.value)
-		if err != nil {
-			return nil, WrapError(CodeProtocol, "marshal settings", err)
-		}
-		out, err = AppendTLV(out, uint64(entry.id), value)
+		out, err = appendSettingVarintTLV(out, entry.id, entry.value)
 		if err != nil {
 			return nil, WrapError(CodeProtocol, "marshal settings", err)
 		}
 	}
 	return out, nil
+}
+
+func appendSettingVarintTLV(dst []byte, id SettingID, value uint64) ([]byte, error) {
+	valueLen, err := VarintLen(value)
+	if err != nil {
+		return nil, err
+	}
+	dst, err = AppendVarint(dst, uint64(id))
+	if err != nil {
+		return nil, err
+	}
+	dst, err = AppendVarint(dst, uint64(valueLen))
+	if err != nil {
+		return nil, err
+	}
+	return AppendVarint(dst, value)
 }
 
 func ParseSettingsTLV(src []byte) (Settings, error) {

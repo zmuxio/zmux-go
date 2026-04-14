@@ -94,6 +94,14 @@ func ParseStreamMetadataTLVsView(tlvs []TLV) (ParsedStreamMetadata, bool, error)
 	return parseStreamMetadataTLVs(tlvs, false)
 }
 
+func ParseStreamMetadataBytes(src []byte) (ParsedStreamMetadata, bool, error) {
+	return parseStreamMetadataBytes(src, true)
+}
+
+func ParseStreamMetadataBytesView(src []byte) (ParsedStreamMetadata, bool, error) {
+	return parseStreamMetadataBytes(src, false)
+}
+
 var errDuplicateMetadataSingleton = errors.New("duplicate metadata singleton")
 
 func parseStreamMetadataTLVs(tlvs []TLV, copyOpenInfo bool) (ParsedStreamMetadata, bool, error) {
