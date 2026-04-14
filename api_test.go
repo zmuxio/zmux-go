@@ -7,6 +7,11 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
+var _ Stream = (*NativeStream)(nil)
+var _ SendStream = (*NativeSendStream)(nil)
+var _ RecvStream = (*NativeRecvStream)(nil)
+var _ Session = nativeSession{}
+
 func TestPublicProtocolAliasesRemainPinned(t *testing.T) {
 	t.Parallel()
 

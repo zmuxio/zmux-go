@@ -2448,6 +2448,8 @@ type connRegistryState struct {
 	tombstoneCount       int
 	tombstonesInit       bool
 	hiddenTombstoneOrder []uint64
+	hiddenTombstoneHead  int
+	hiddenTombstoneCount int
 	usedStreamData       map[uint64]usedStreamMarker
 	usedStreamRanges     []usedStreamRange
 	usedStreamRangeMode  bool

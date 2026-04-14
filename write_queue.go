@@ -1213,15 +1213,18 @@ func (c *Conn) waitPreparedQueueRequest(req *writeRequest) error {
 	if c == nil || req == nil {
 		return ErrSessionClosed
 	}
+	defer req.clearRetainedRefs()
 	allowEarlyCloseErr := !req.carriesOnlyCloseFrames()
 	notifyCh, closeErr := c.refreshPreparedQueueRequestCompletion()
 	if allowEarlyCloseErr && closeErr != nil {
+		if err, ok := req.tryTakeDoneErr(); ok && err != nil {
+			return c.queueRequestDoneErr(err)
+		}
 		return queueVisibleSessionErr(c, closeErr)
 	}
-	defer req.clearRetainedRefs()
 	select {
 	case <-c.lifecycle.closedCh:
-		if err, ok := req.tryTakeDoneErr(); ok {
+		if err, ok := req.tryTakeDoneErr(); ok && err != nil {
 			return c.queueRequestDoneErr(err)
 		}
 		return queueVisibleSessionErr(c, c.err())
@@ -1230,7 +1233,7 @@ func (c *Conn) waitPreparedQueueRequest(req *writeRequest) error {
 	for {
 		select {
 		case <-c.lifecycle.closedCh:
-			if err, ok := req.tryTakeDoneErr(); ok {
+			if err, ok := req.tryTakeDoneErr(); ok && err != nil {
 				return c.queueRequestDoneErr(err)
 			}
 			return queueVisibleSessionErr(c, c.err())
@@ -1240,6 +1243,9 @@ func (c *Conn) waitPreparedQueueRequest(req *writeRequest) error {
 		case <-notifyCh:
 			notifyCh, closeErr = c.refreshPreparedQueueRequestCompletion()
 			if allowEarlyCloseErr && closeErr != nil {
+				if err, ok := req.tryTakeDoneErr(); ok && err != nil {
+					return c.queueRequestDoneErr(err)
+				}
 				return queueVisibleSessionErr(c, closeErr)
 			}
 		}
@@ -1426,15 +1432,21 @@ func (s *nativeStream) enqueueWriteRequestUntilDeadline(req *writeRequest, opts 
 }
 
 func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) error {
+	if s == nil || s.conn == nil {
+		return ErrSessionClosed
+	}
+	defer req.clearRetainedRefs()
 	completion := queuedWriteCompletionRefresh{}
 	notifyCh, deadline, cerr := s.refreshQueuedWriteCompletion()
 	completion.notifyCh = notifyCh
 	completion.deadline = deadline
 	completion.closeErr = cerr
 	if completion.closeErr != nil {
+		if err, ok := req.tryTakeDoneErr(); ok && err != nil {
+			return s.conn.queueRequestDoneErr(err)
+		}
 		return queueVisibleSessionErr(s.conn, completion.closeErr)
 	}
-	defer req.clearRetainedRefs()
 	var timer *time.Timer
 	defer stopTimer(timer)
 	for {
@@ -1442,6 +1454,9 @@ func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) error {
 		if !completion.deadline.IsZero() {
 			delay := time.Until(completion.deadline)
 			if delay <= 0 {
+				if err, ok := req.tryTakeDoneErr(); ok && err != nil {
+					return s.conn.queueRequestDoneErr(err)
+				}
 				return os.ErrDeadlineExceeded
 			}
 			timer = resetTimer(timer, delay)
@@ -1450,7 +1465,7 @@ func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) error {
 
 		select {
 		case <-s.conn.lifecycle.closedCh:
-			if err, ok := req.tryTakeDoneErr(); ok {
+			if err, ok := req.tryTakeDoneErr(); ok && err != nil {
 				return s.conn.queueRequestDoneErr(err)
 			}
 			return queueVisibleSessionErr(s.conn, s.conn.err())
@@ -1460,11 +1475,14 @@ func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) error {
 		case <-completion.notifyCh:
 			completion.notifyCh, completion.deadline, completion.closeErr = s.refreshQueuedWriteCompletion()
 			if completion.closeErr != nil {
+				if err, ok := req.tryTakeDoneErr(); ok && err != nil {
+					return s.conn.queueRequestDoneErr(err)
+				}
 				return queueVisibleSessionErr(s.conn, completion.closeErr)
 			}
 			continue
 		case <-timeout:
-			if err, ok := req.tryTakeDoneErr(); ok {
+			if err, ok := req.tryTakeDoneErr(); ok && err != nil {
 				return s.conn.queueRequestDoneErr(err)
 			}
 			return os.ErrDeadlineExceeded

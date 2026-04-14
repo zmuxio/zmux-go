@@ -1594,7 +1594,7 @@ func runInvalidHiddenControlOpenedHardCap(t *testing.T) error {
 	if _, ok := c.registry.tombstones[newestID]; ok {
 		return fmt.Errorf("newest hidden control-opened tombstone %d retained past hard cap", newestID)
 	}
-	if _, ok := c.registry.usedStreamData[newestID]; !ok {
+	if _, ok := c.usedStreamMarkerForLocked(newestID); !ok {
 		return fmt.Errorf("newest hidden control-opened marker %d was not preserved after reap", newestID)
 	}
 	return nil

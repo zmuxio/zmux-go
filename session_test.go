@@ -17197,21 +17197,30 @@ func TestRemoveHiddenTombstoneFallsBackWhenHiddenIndexStale(t *testing.T) {
 		12: {Hidden: true, HiddenIndex: 2},
 	}
 	c.registry.hiddenTombstoneOrder = []uint64{4, 8, 12}
+	c.registry.hiddenTombstoneCount = 3
 	c.registry.hiddenTombstonesInit = true
 
 	tombstone := c.registry.tombstones[8]
 	c.removeHiddenTombstoneLocked(8, tombstone)
 
 	order := append([]uint64(nil), c.registry.hiddenTombstoneOrder...)
+	count := c.registry.hiddenTombstoneCount
+	head := c.registry.hiddenTombstoneHead
 	first := c.registry.tombstones[4]
 	last := c.registry.tombstones[12]
 	c.mu.Unlock()
 
-	if len(order) != 2 || order[0] != 4 || order[1] != 12 {
-		t.Fatalf("hiddenTombstoneOrder = %v, want [4 12]", order)
+	if len(order) != 3 || order[0] != 4 || order[1] != 0 || order[2] != 12 {
+		t.Fatalf("hiddenTombstoneOrder = %v, want [4 0 12]", order)
 	}
-	if first.HiddenIndex != 0 || last.HiddenIndex != 1 {
-		t.Fatalf("hidden indexes = (%d,%d), want (0,1)", first.HiddenIndex, last.HiddenIndex)
+	if count != 2 {
+		t.Fatalf("hiddenTombstoneCount = %d, want 2", count)
+	}
+	if head != 0 {
+		t.Fatalf("hiddenTombstoneHead = %d, want 0", head)
+	}
+	if first.HiddenIndex != 0 || last.HiddenIndex != 2 {
+		t.Fatalf("hidden indexes = (%d,%d), want (0,2)", first.HiddenIndex, last.HiddenIndex)
 	}
 }
 
@@ -17253,6 +17262,7 @@ func TestAppendHiddenTombstoneLockedNormalizesStaleHiddenIndexWithoutDuplicate(t
 		8: {Hidden: true, HiddenIndex: 0},
 	}
 	c.registry.hiddenTombstoneOrder = []uint64{4, 8}
+	c.registry.hiddenTombstoneCount = 2
 	c.registry.hiddenTombstonesInit = true
 
 	c.appendHiddenTombstoneLocked(8)
@@ -17266,6 +17276,41 @@ func TestAppendHiddenTombstoneLockedNormalizesStaleHiddenIndexWithoutDuplicate(t
 	}
 	if second.HiddenIndex != 1 {
 		t.Fatalf("tombstone HiddenIndex = %d, want normalized index 1", second.HiddenIndex)
+	}
+}
+
+func TestMaybeCompactHiddenTombstoneQueuePreservesLiveOrderAndIndices(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	c.mu.Lock()
+	c.registry.tombstones = map[uint64]streamTombstone{
+		12: {Hidden: true, HiddenIndex: 2},
+		16: {Hidden: true, HiddenIndex: 4},
+	}
+	c.registry.hiddenTombstoneOrder = []uint64{0, 0, 12, 0, 16}
+	c.registry.hiddenTombstoneHead = 2
+	c.registry.hiddenTombstoneCount = 2
+	c.registry.hiddenTombstonesInit = true
+
+	c.maybeCompactHiddenTombstoneQueueLocked()
+
+	order := append([]uint64(nil), c.registry.hiddenTombstoneOrder...)
+	first := c.registry.tombstones[12]
+	second := c.registry.tombstones[16]
+	head := c.registry.hiddenTombstoneHead
+	count := c.registry.hiddenTombstoneCount
+	c.mu.Unlock()
+
+	if len(order) != 2 || order[0] != 12 || order[1] != 16 {
+		t.Fatalf("hiddenTombstoneOrder = %v, want [12 16]", order)
+	}
+	if head != 0 {
+		t.Fatalf("hiddenTombstoneHead = %d, want 0", head)
+	}
+	if count != 2 {
+		t.Fatalf("hiddenTombstoneCount = %d, want 2", count)
+	}
+	if first.HiddenIndex != 0 || second.HiddenIndex != 1 {
+		t.Fatalf("hidden indexes = (%d,%d), want (0,1)", first.HiddenIndex, second.HiddenIndex)
 	}
 }
 

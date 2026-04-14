@@ -618,6 +618,8 @@ func (c *Conn) ensureHiddenTombstonesLocked() {
 		return
 	}
 	c.ensureTombstoneQueueLocked()
+	c.registry.hiddenTombstoneHead = 0
+	c.registry.hiddenTombstoneCount = 0
 	c.registry.hiddenTombstoneOrder = c.registry.hiddenTombstoneOrder[:0]
 	if len(c.registry.tombstones) == 0 || c.tombstoneCountLocked() == 0 {
 		c.registry.hiddenTombstonesInit = true
@@ -636,6 +638,7 @@ func (c *Conn) ensureHiddenTombstonesLocked() {
 		entry.tombstone.HiddenIndex = len(c.registry.hiddenTombstoneOrder)
 		c.registry.tombstones[entry.streamID] = entry.tombstone
 		c.registry.hiddenTombstoneOrder = append(c.registry.hiddenTombstoneOrder, entry.streamID)
+		c.registry.hiddenTombstoneCount++
 	}
 	c.registry.hiddenTombstonesInit = true
 }
@@ -645,7 +648,34 @@ func (c *Conn) hiddenTombstoneCountLocked() int {
 		return 0
 	}
 	c.ensureHiddenTombstonesLocked()
-	return len(c.registry.hiddenTombstoneOrder)
+	return c.registry.hiddenTombstoneCount
+}
+
+func (c *Conn) hiddenTombstoneOrderEntryLocked(idx int) tombstoneOrderLookup {
+	if c == nil || idx < 0 || idx >= len(c.registry.hiddenTombstoneOrder) {
+		return tombstoneOrderLookup{}
+	}
+	streamID := c.registry.hiddenTombstoneOrder[idx]
+	if streamID == 0 {
+		return tombstoneOrderLookup{}
+	}
+	tombstone, ok := c.registry.tombstones[streamID]
+	if !ok || !tombstone.Hidden || tombstone.HiddenIndex != idx {
+		return tombstoneOrderLookup{}
+	}
+	return tombstoneOrderLookup{streamID: streamID, tombstone: tombstone, present: true}
+}
+
+func (c *Conn) advanceHiddenTombstoneHeadLocked() {
+	if c == nil {
+		return
+	}
+	for c.registry.hiddenTombstoneHead < len(c.registry.hiddenTombstoneOrder) {
+		if c.hiddenTombstoneOrderEntryLocked(c.registry.hiddenTombstoneHead).found() {
+			return
+		}
+		c.registry.hiddenTombstoneHead++
+	}
 }
 
 func (c *Conn) hiddenTombstoneHeadLocked() tombstoneIDLookup {
@@ -653,10 +683,12 @@ func (c *Conn) hiddenTombstoneHeadLocked() tombstoneIDLookup {
 		return tombstoneIDLookup{}
 	}
 	c.ensureHiddenTombstonesLocked()
-	if len(c.registry.hiddenTombstoneOrder) == 0 {
-		return tombstoneIDLookup{}
+	c.advanceHiddenTombstoneHeadLocked()
+	entry := c.hiddenTombstoneOrderEntryLocked(c.registry.hiddenTombstoneHead)
+	if entry.found() {
+		return tombstoneIDLookup{streamID: entry.streamID, present: true}
 	}
-	return tombstoneIDLookup{streamID: c.registry.hiddenTombstoneOrder[0], present: true}
+	return tombstoneIDLookup{}
 }
 
 func (c *Conn) hiddenTombstoneTailLocked() tombstoneIDLookup {
@@ -664,10 +696,13 @@ func (c *Conn) hiddenTombstoneTailLocked() tombstoneIDLookup {
 		return tombstoneIDLookup{}
 	}
 	c.ensureHiddenTombstonesLocked()
-	if len(c.registry.hiddenTombstoneOrder) == 0 {
-		return tombstoneIDLookup{}
+	for i := len(c.registry.hiddenTombstoneOrder) - 1; i >= c.registry.hiddenTombstoneHead; i-- {
+		entry := c.hiddenTombstoneOrderEntryLocked(i)
+		if entry.found() {
+			return tombstoneIDLookup{streamID: entry.streamID, present: true}
+		}
 	}
-	return tombstoneIDLookup{streamID: c.registry.hiddenTombstoneOrder[len(c.registry.hiddenTombstoneOrder)-1], present: true}
+	return tombstoneIDLookup{}
 }
 
 func (c *Conn) appendHiddenTombstoneLocked(streamID uint64) {
@@ -689,6 +724,7 @@ func (c *Conn) appendHiddenTombstoneLocked(streamID uint64) {
 	tombstone.HiddenIndex = len(c.registry.hiddenTombstoneOrder)
 	c.registry.tombstones[streamID] = tombstone
 	c.registry.hiddenTombstoneOrder = append(c.registry.hiddenTombstoneOrder, streamID)
+	c.registry.hiddenTombstoneCount++
 }
 
 func (c *Conn) removeHiddenTombstoneLocked(streamID uint64, tombstone streamTombstone) {
@@ -700,14 +736,48 @@ func (c *Conn) removeHiddenTombstoneLocked(streamID uint64, tombstone streamTomb
 	if !idx.found() {
 		return
 	}
-	copy(c.registry.hiddenTombstoneOrder[idx.index:], c.registry.hiddenTombstoneOrder[idx.index+1:])
-	c.registry.hiddenTombstoneOrder = c.registry.hiddenTombstoneOrder[:len(c.registry.hiddenTombstoneOrder)-1]
-	for i := idx.index; i < len(c.registry.hiddenTombstoneOrder); i++ {
-		id := c.registry.hiddenTombstoneOrder[i]
-		next := c.registry.tombstones[id]
-		next.HiddenIndex = i
-		c.registry.tombstones[id] = next
+	c.registry.hiddenTombstoneOrder[idx.index] = 0
+	tombstone.HiddenIndex = -1
+	c.registry.tombstones[streamID] = tombstone
+	if c.registry.hiddenTombstoneCount > 0 {
+		c.registry.hiddenTombstoneCount--
 	}
+	if idx.index == c.registry.hiddenTombstoneHead {
+		c.advanceHiddenTombstoneHeadLocked()
+	}
+	c.maybeCompactHiddenTombstoneQueueLocked()
+}
+
+func (c *Conn) maybeCompactHiddenTombstoneQueueLocked() {
+	if c == nil {
+		return
+	}
+	if c.registry.hiddenTombstoneCount == 0 {
+		c.registry.hiddenTombstoneOrder = nil
+		c.registry.hiddenTombstoneHead = 0
+		c.registry.hiddenTombstoneCount = 0
+		c.registry.hiddenTombstonesInit = true
+		return
+	}
+	if c.registry.hiddenTombstoneHead == 0 && len(c.registry.hiddenTombstoneOrder) <= 2*c.registry.hiddenTombstoneCount {
+		return
+	}
+	writeIdx := 0
+	for i := c.registry.hiddenTombstoneHead; i < len(c.registry.hiddenTombstoneOrder); i++ {
+		entry := c.hiddenTombstoneOrderEntryLocked(i)
+		if !entry.found() {
+			continue
+		}
+		entry.tombstone.HiddenIndex = writeIdx
+		c.registry.tombstones[entry.streamID] = entry.tombstone
+		c.registry.hiddenTombstoneOrder[writeIdx] = entry.streamID
+		writeIdx++
+	}
+	clear(c.registry.hiddenTombstoneOrder[writeIdx:])
+	c.registry.hiddenTombstoneOrder = c.registry.hiddenTombstoneOrder[:writeIdx]
+	c.registry.hiddenTombstoneHead = 0
+	c.registry.hiddenTombstoneCount = writeIdx
+	c.registry.hiddenTombstonesInit = true
 }
 
 func (c *Conn) clearHiddenTombstonesLocked() {
@@ -715,6 +785,8 @@ func (c *Conn) clearHiddenTombstonesLocked() {
 		return
 	}
 	c.registry.hiddenTombstoneOrder = nil
+	c.registry.hiddenTombstoneHead = 0
+	c.registry.hiddenTombstoneCount = 0
 	c.registry.hiddenTombstonesInit = false
 }
 
@@ -760,8 +832,14 @@ func (c *Conn) reapExpiredHiddenControlStateLocked(now time.Time) {
 		}
 		tombstone, ok := c.registry.tombstones[head.streamID]
 		if !ok || !tombstone.Hidden {
-			c.registry.hiddenTombstonesInit = false
-			c.ensureHiddenTombstonesLocked()
+			if !ok {
+				c.registry.hiddenTombstoneOrder[c.registry.hiddenTombstoneHead] = 0
+				if c.registry.hiddenTombstoneCount > 0 {
+					c.registry.hiddenTombstoneCount--
+				}
+			}
+			c.advanceHiddenTombstoneHeadLocked()
+			c.maybeCompactHiddenTombstoneQueueLocked()
 			continue
 		}
 		if tombstone.CreatedAt.IsZero() || now.Sub(tombstone.CreatedAt) <= hiddenControlRetainedMaxAge {

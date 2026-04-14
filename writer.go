@@ -90,7 +90,9 @@ func (s *writeBatchScratch) batchSlice(n int, capHint int) []writeRequest {
 	if capHint < n {
 		capHint = n
 	}
-	clearWriteRequests(s.batch)
+	if cap(s.batch) > 0 {
+		clearWriteRequests(s.batch[:cap(s.batch)])
+	}
 	if cap(s.batch) < capHint {
 		s.batch = make([]writeRequest, n, capHint)
 	} else {
@@ -100,7 +102,9 @@ func (s *writeBatchScratch) batchSlice(n int, capHint int) []writeRequest {
 }
 
 func (s *writeBatchScratch) orderedSlice(n int) []writeRequest {
-	clearWriteRequests(s.ordered)
+	if cap(s.ordered) > 0 {
+		clearWriteRequests(s.ordered[:cap(s.ordered)])
+	}
 	if cap(s.ordered) < n {
 		s.ordered = make([]writeRequest, n)
 	}
@@ -109,7 +113,9 @@ func (s *writeBatchScratch) orderedSlice(n int) []writeRequest {
 }
 
 func (s *writeBatchScratch) rejectedSlice(capHint int) []rejectedWriteRequest {
-	clearRejectedWriteRequests(s.rejected)
+	if cap(s.rejected) > 0 {
+		clearRejectedWriteRequests(s.rejected[:cap(s.rejected)])
+	}
 	if cap(s.rejected) < capHint {
 		s.rejected = make([]rejectedWriteRequest, 0, capHint)
 	} else {

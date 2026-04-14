@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	rt "github.com/zmuxio/zmux-go/internal/runtime"
 	"github.com/zmuxio/zmux-go/internal/state"
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 func TestBidiStreamWriteReadAndCloseWrite(t *testing.T) {
@@ -2131,25 +2133,60 @@ func TestWriteBatchScratchBatchSliceClearsRetainedRequestRefsOnReuse(t *testing.
 
 	var scratch writeBatchScratch
 	reserved := testBuildDetachedStream(nil, 0)
-	old := scratch.batchSlice(2, 2)
-	old[0] = writeRequest{
+	old := scratch.batchSlice(2, 4)
+	backing := old[:cap(old)]
+	backing[0] = writeRequest{
 		frames:                  testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("payload")}}),
 		done:                    make(chan error, 1),
 		reservedStream:          reserved,
 		preparedPriorityPayload: []byte("prio"),
 	}
-	old[1] = writeRequest{
+	backing[1] = writeRequest{
 		frames: testTxFramesFrom([]Frame{{Type: FrameTypePONG, Payload: []byte("pong")}}),
+		done:   make(chan error, 1),
+	}
+	backing[2] = writeRequest{
+		frames:         testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: 4, Payload: []byte("tail")}}),
+		done:           make(chan error, 1),
+		reservedStream: reserved,
+	}
+	backing[3] = writeRequest{
+		frames: testTxFramesFrom([]Frame{{Type: FrameTypeCLOSE, Payload: []byte("close")}}),
 		done:   make(chan error, 1),
 	}
 
 	_ = scratch.batchSlice(0, 0)
 
-	if old[0].frames != nil || old[0].done != nil || old[0].reservedStream != nil || old[0].preparedPriorityPayload != nil {
-		t.Fatal("batchSlice reuse did not clear retained refs from prior request")
+	for i := range backing {
+		if backing[i].frames != nil || backing[i].done != nil || backing[i].reservedStream != nil || backing[i].preparedPriorityPayload != nil {
+			t.Fatalf("batchSlice reuse did not clear retained refs from slot %d", i)
+		}
 	}
-	if old[1].frames != nil || old[1].done != nil {
-		t.Fatal("batchSlice reuse did not clear retained refs from prior tail request")
+}
+
+func TestWriteBatchScratchOrderedSliceClearsRetainedRequestRefsPastLength(t *testing.T) {
+	t.Parallel()
+
+	var scratch writeBatchScratch
+	reserved := testBuildDetachedStream(nil, 0)
+	ordered := scratch.orderedSlice(2)
+	backing := ordered[:cap(ordered)]
+	if len(backing) < 4 {
+		scratch.ordered = make([]writeRequest, 2, 4)
+		ordered = scratch.orderedSlice(2)
+		backing = ordered[:cap(ordered)]
+	}
+	backing[0] = writeRequest{frames: testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("a")}}), done: make(chan error, 1)}
+	backing[1] = writeRequest{frames: testTxFramesFrom([]Frame{{Type: FrameTypePONG, Payload: []byte("b")}}), done: make(chan error, 1)}
+	backing[2] = writeRequest{frames: testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: 8, Payload: []byte("tail")}}), done: make(chan error, 1), reservedStream: reserved}
+	backing[3] = writeRequest{frames: testTxFramesFrom([]Frame{{Type: FrameTypeCLOSE, Payload: []byte("tail-close")}}), done: make(chan error, 1)}
+
+	_ = scratch.orderedSlice(1)
+
+	for i := range backing {
+		if backing[i].frames != nil || backing[i].done != nil || backing[i].reservedStream != nil {
+			t.Fatalf("orderedSlice reuse did not clear retained refs from slot %d", i)
+		}
 	}
 }
 
@@ -2168,15 +2205,166 @@ func TestWriteBatchScratchRejectedSliceClearsRetainedRequestRefsOnReuse(t *testi
 		},
 		err: io.ErrNoProgress,
 	})
+	rejected = append(rejected, rejectedWriteRequest{
+		req: writeRequest{
+			frames:         testTxFramesFrom([]Frame{{Type: FrameTypePONG, Payload: []byte("tail")}}),
+			done:           make(chan error, 1),
+			reservedStream: reserved,
+		},
+		err: os.ErrDeadlineExceeded,
+	})
 	scratch.rejected = rejected
+	backing := scratch.rejected[:cap(scratch.rejected)]
 
 	_ = scratch.rejectedSlice(0)
 
-	if rejected[0].req.frames != nil || rejected[0].req.done != nil || rejected[0].req.reservedStream != nil || rejected[0].req.preparedPriorityPayload != nil {
-		t.Fatal("rejectedSlice reuse did not clear retained refs from prior rejected request")
+	for i := range backing {
+		if backing[i].req.frames != nil || backing[i].req.done != nil || backing[i].req.reservedStream != nil || backing[i].req.preparedPriorityPayload != nil {
+			t.Fatalf("rejectedSlice reuse did not clear retained refs from slot %d", i)
+		}
+		if backing[i].err != nil {
+			t.Fatalf("rejectedSlice reuse did not clear retained error ref from slot %d", i)
+		}
 	}
-	if rejected[0].err != nil {
-		t.Fatal("rejectedSlice reuse did not clear retained error ref")
+}
+
+func TestWaitPreparedQueueRequestClearsRetainedRefsOnEarlyClose(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{
+			closeErr:   ErrSessionClosed,
+			closedCh:   make(chan struct{}),
+			terminalCh: make(chan struct{}),
+		},
+	}
+	req := writeRequest{
+		frames:                  testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("queued")}}),
+		done:                    make(chan error, 1),
+		preparedNotify:          make(chan struct{}),
+		reservedStream:          testBuildDetachedStream(c, 4),
+		queuedBytes:             7,
+		queueReserved:           true,
+		urgentReserved:          true,
+		advisoryReserved:        true,
+		cloneFramesBeforeSend:   true,
+		preparedPriorityPayload: []byte("priority"),
+	}
+
+	err := c.waitPreparedQueueRequest(&req)
+	if !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("waitPreparedQueueRequest() err = %v, want %v", err, ErrSessionClosed)
+	}
+	if req.frames != nil || req.done != nil || req.preparedNotify != nil || req.reservedStream != nil || req.preparedPriorityPayload != nil {
+		t.Fatal("waitPreparedQueueRequest did not clear retained request refs on early close")
+	}
+}
+
+func TestWaitQueuedWriteCompletionClearsRetainedRefsOnInitialClose(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{
+			closeErr: ErrSessionClosed,
+			closedCh: make(chan struct{}),
+		},
+	}
+	stream := testBuildDetachedStream(c, 4)
+	req := writeRequest{
+		frames:                  testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: 4, Payload: []byte("queued")}}),
+		done:                    make(chan error, 1),
+		preparedNotify:          make(chan struct{}),
+		reservedStream:          stream,
+		preparedPriorityPayload: []byte("priority"),
+	}
+
+	err := stream.waitQueuedWriteCompletion(&req)
+	if !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("waitQueuedWriteCompletion() err = %v, want %v", err, ErrSessionClosed)
+	}
+	if req.frames != nil || req.done != nil || req.preparedNotify != nil || req.reservedStream != nil || req.preparedPriorityPayload != nil {
+		t.Fatal("waitQueuedWriteCompletion did not clear retained request refs on early close")
+	}
+}
+
+func TestReadLoopReleasesSupersededScratchHandle(t *testing.T) {
+	oldReadFrameBuffered := readLoopReadFrameBuffered
+	oldHandleFrameBuffered := readLoopHandleFrameBuffered
+	oldRetain := readLoopRetainReadFrameBufferForPayload
+	oldRelease := readLoopReleaseReadFrameBuffer
+	oldClose := readLoopCloseSessionWithOptionsForReadErr
+	defer func() {
+		readLoopHooksMu.Lock()
+		readLoopReadFrameBuffered = oldReadFrameBuffered
+		readLoopHandleFrameBuffered = oldHandleFrameBuffered
+		readLoopRetainReadFrameBufferForPayload = oldRetain
+		readLoopReleaseReadFrameBuffer = oldRelease
+		readLoopCloseSessionWithOptionsForReadErr = oldClose
+		readLoopHooksMu.Unlock()
+	}()
+
+	oldBuf := []byte("old-buffer")
+	newBuf := []byte("new-buffer")
+	oldHandle := &wire.FrameReadBufferHandle{}
+	newHandle := &wire.FrameReadBufferHandle{}
+	errBoom := errors.New("boom")
+
+	var released []*wire.FrameReadBufferHandle
+	var closeErr error
+	call := 0
+	readLoopHooksMu.Lock()
+	readLoopReadFrameBuffered = func(_ io.Reader, _ Limits, dst []byte) (Frame, []byte, *wire.FrameReadBufferHandle, error) {
+		call++
+		switch call {
+		case 1:
+			if dst != nil {
+				t.Fatalf("first read received scratch %v, want nil", dst)
+			}
+			return Frame{}, oldBuf, oldHandle, nil
+		case 2:
+			if cap(dst) != cap(oldBuf) {
+				t.Fatalf("second read scratch cap = %d, want %d", cap(dst), cap(oldBuf))
+			}
+			return Frame{}, newBuf, newHandle, errBoom
+		default:
+			t.Fatalf("unexpected readLoopReadFrameBuffered call %d", call)
+			return Frame{}, nil, nil, errBoom
+		}
+	}
+	readLoopHandleFrameBuffered = func(_ *Conn, _ Frame, _ []byte, handle *wire.FrameReadBufferHandle) (bool, error) {
+		if handle != oldHandle {
+			t.Fatalf("first frame handle = %p, want %p", handle, oldHandle)
+		}
+		return false, nil
+	}
+	readLoopRetainReadFrameBufferForPayload = func(buf []byte, _ uint64) []byte {
+		if len(buf) == 0 {
+			return nil
+		}
+		if &buf[0] == &oldBuf[0] {
+			return buf[:0]
+		}
+		return nil
+	}
+	readLoopReleaseReadFrameBuffer = func(_ []byte, handle *wire.FrameReadBufferHandle) {
+		released = append(released, handle)
+	}
+	readLoopCloseSessionWithOptionsForReadErr = func(_ *Conn, err error) {
+		closeErr = err
+	}
+	readLoopHooksMu.Unlock()
+
+	c := &Conn{}
+	c.readLoop()
+
+	if !errors.Is(closeErr, errBoom) {
+		t.Fatalf("readLoop close err = %v, want %v", closeErr, errBoom)
+	}
+	if len(released) != 2 {
+		t.Fatalf("released handle count = %d, want 2", len(released))
+	}
+	if released[0] != oldHandle || released[1] != newHandle {
+		t.Fatalf("released handles = %p, %p; want %p, %p", released[0], released[1], oldHandle, newHandle)
 	}
 }
 

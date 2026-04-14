@@ -17,6 +17,7 @@ import (
 )
 
 const quicmuxStreamPreludeMaxPayload = 16 << 10
+const quicmuxAcceptedPreludeReadTimeout = 5 * time.Second
 
 const quicmuxOpenCaps = wire.CapabilityOpenMetadata | wire.CapabilityPriorityHints | wire.CapabilityStreamGroups
 
@@ -523,6 +524,10 @@ type quicStream struct {
 
 func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream) (*quicStream, error) {
 	reader := bufio.NewReader(stream)
+	_ = stream.SetReadDeadline(time.Now().Add(quicmuxAcceptedPreludeReadTimeout))
+	defer func() {
+		_ = stream.SetReadDeadline(time.Time{})
+	}()
 	meta, err := readAcceptedStreamMetadata(reader)
 	if err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeProtocol))
@@ -836,6 +841,10 @@ type quicRecvStream struct {
 
 func newAcceptedRecvStream(conn SessionConn, stream *quic.ReceiveStream) (*quicRecvStream, error) {
 	reader := bufio.NewReader(stream)
+	_ = stream.SetReadDeadline(time.Now().Add(quicmuxAcceptedPreludeReadTimeout))
+	defer func() {
+		_ = stream.SetReadDeadline(time.Time{})
+	}()
 	meta, err := readAcceptedStreamMetadata(reader)
 	if err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeProtocol))

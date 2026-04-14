@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	rt "github.com/zmuxio/zmux-go/internal/runtime"
@@ -17,6 +18,17 @@ import (
 // - stream MAX_DATA/BLOCKED plus receive accounting/replenish
 // - stream STOP_SENDING/RESET/ABORT handling
 // - inbound abuse/flood guard budgets
+
+var (
+	readLoopHooksMu             sync.RWMutex
+	readLoopReadFrameBuffered   = readFrameBuffered
+	readLoopHandleFrameBuffered = func(c *Conn, frame Frame, backing []byte, handle *wire.FrameReadBufferHandle) (bool, error) {
+		return c.handleFrameBuffered(frame, backing, handle)
+	}
+	readLoopRetainReadFrameBufferForPayload   = retainReadFrameBufferForPayloadLimit
+	readLoopReleaseReadFrameBuffer            = releaseReadFrameBuffer
+	readLoopCloseSessionWithOptionsForReadErr = func(c *Conn, err error) { c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault) }
+)
 
 func (c *Conn) handleFrame(frame Frame) error {
 	_, err := c.handleFrameBuffered(frame, nil, nil)
@@ -104,29 +116,44 @@ func (c *Conn) handleFrameBuffered(frame Frame, backing []byte, handle *wire.Fra
 func (c *Conn) readLoop() {
 	limits := c.localLimitsView()
 	var scratch []byte
+	var scratchHandle *wire.FrameReadBufferHandle
 	for {
+		readLoopHooksMu.RLock()
+		readFrameBufferedFn := readLoopReadFrameBuffered
+		handleFrameBufferedFn := readLoopHandleFrameBuffered
+		retainReadFrameBufferFn := readLoopRetainReadFrameBufferForPayload
+		releaseReadFrameBufferFn := readLoopReleaseReadFrameBuffer
+		closeSessionFn := readLoopCloseSessionWithOptionsForReadErr
+		readLoopHooksMu.RUnlock()
 		// Reuse one bounded frame buffer per active connection to avoid
 		// per-frame pool churn without pinning oversized backings indefinitely.
-		frame, buf, handle, err := readFrameBuffered(c.io.reader, limits, scratch)
+		frame, buf, handle, err := readFrameBufferedFn(c.io.reader, limits, scratch)
+		if handle == nil {
+			handle = scratchHandle
+		} else if scratchHandle != nil && handle != scratchHandle {
+			releaseReadFrameBufferFn(scratch, scratchHandle)
+		}
 		scratch = nil
+		scratchHandle = nil
 		if err != nil {
-			scratch = retainReadFrameBufferForPayloadLimit(buf, limits.MaxFramePayload)
-			if scratch == nil && handle != nil {
-				releaseReadFrameBuffer(buf, handle)
+			if handle != nil {
+				releaseReadFrameBufferFn(buf, handle)
 			}
-			c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
+			closeSessionFn(c, err)
 			return
 		}
 		c.noteInboundFrame(time.Now())
-		retained, err := c.handleFrameBuffered(frame, buf, handle)
+		retained, err := handleFrameBufferedFn(c, frame, buf, handle)
 		if !retained {
-			scratch = retainReadFrameBufferForPayloadLimit(buf, limits.MaxFramePayload)
-			if scratch == nil && handle != nil {
-				releaseReadFrameBuffer(buf, handle)
+			scratch = retainReadFrameBufferFn(buf, limits.MaxFramePayload)
+			if scratch != nil {
+				scratchHandle = handle
+			} else if handle != nil {
+				releaseReadFrameBufferFn(buf, handle)
 			}
 		}
 		if err != nil {
-			c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
+			closeSessionFn(c, err)
 			return
 		}
 	}
