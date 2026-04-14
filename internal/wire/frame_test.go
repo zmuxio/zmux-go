@@ -14,7 +14,7 @@ func TestReadFrameBufferedRejectsOversizedPayloadBeforeReadingBody(t *testing.T)
 		MaxControlPayloadBytes:   16,
 		MaxExtensionPayloadBytes: 16,
 	}
-	frameLen := uint64(1 + 1 + limits.MaxControlPayloadBytes + 1)
+	frameLen := limits.MaxControlPayloadBytes + 3
 	raw, err := AppendVarint(nil, frameLen)
 	if err != nil {
 		t.Fatalf("AppendVarint err = %v", err)
