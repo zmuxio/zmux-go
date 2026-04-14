@@ -449,8 +449,8 @@ func TestWrapSessionResetMakesLocalWriteFailImmediately(t *testing.T) {
 	if _, err := stream.Write([]byte("x")); err == nil {
 		t.Fatal("Write after Reset err = nil, want application error")
 	} else {
-		var appErr *zmux.ApplicationError
-		if !errors.As(err, &appErr) || appErr.Code != 44 {
+		appErr, ok := findError[*zmux.ApplicationError](err)
+		if !ok || appErr.Code != 44 {
 			t.Fatalf("Write after Reset err = %v, want ApplicationError(44)", err)
 		}
 	}
@@ -472,16 +472,16 @@ func TestWrapSessionCloseWithErrorMakesLocalBidiOpsFailImmediately(t *testing.T)
 	if _, err := stream.Read(make([]byte, 1)); err == nil {
 		t.Fatal("Read after CloseWithErrorCode err = nil, want application error")
 	} else {
-		var appErr *zmux.ApplicationError
-		if !errors.As(err, &appErr) || appErr.Code != 55 || appErr.Reason != "bye" {
+		appErr, ok := findError[*zmux.ApplicationError](err)
+		if !ok || appErr.Code != 55 || appErr.Reason != "bye" {
 			t.Fatalf("Read after CloseWithErrorCode err = %v, want ApplicationError(55, \"bye\")", err)
 		}
 	}
 	if _, err := stream.Write([]byte("x")); err == nil {
 		t.Fatal("Write after CloseWithErrorCode err = nil, want application error")
 	} else {
-		var appErr *zmux.ApplicationError
-		if !errors.As(err, &appErr) || appErr.Code != 55 || appErr.Reason != "bye" {
+		appErr, ok := findError[*zmux.ApplicationError](err)
+		if !ok || appErr.Code != 55 || appErr.Reason != "bye" {
 			t.Fatalf("Write after CloseWithErrorCode err = %v, want ApplicationError(55, \"bye\")", err)
 		}
 	}
@@ -503,8 +503,8 @@ func TestWrapSessionCloseWithErrorMakesLocalSendWriteFailImmediately(t *testing.
 	if _, err := stream.Write([]byte("x")); err == nil {
 		t.Fatal("Write after CloseWithErrorCode err = nil, want application error")
 	} else {
-		var appErr *zmux.ApplicationError
-		if !errors.As(err, &appErr) || appErr.Code != 66 || appErr.Reason != "bye" {
+		appErr, ok := findError[*zmux.ApplicationError](err)
+		if !ok || appErr.Code != 66 || appErr.Reason != "bye" {
 			t.Fatalf("Write after CloseWithErrorCode err = %v, want ApplicationError(66, \"bye\")", err)
 		}
 	}
