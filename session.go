@@ -1048,7 +1048,7 @@ func (c *Conn) Close() error {
 	}
 
 	if !gracefulClose {
-		c.CloseWithError(nil)
+		c.closeSessionWithOptions(applicationErr(uint64(CodeNoError), ""), closeOriginApp, closeFrameAlways)
 		return completeCloseErr(c, c.Wait(context.Background()))
 	}
 	if err := completeCloseErr(c, c.Wait(context.Background())); err != nil {
@@ -1282,11 +1282,14 @@ func closeTransportDrainDelay(err error) time.Duration {
 		return 100 * time.Millisecond
 	case err == nil || errors.Is(err, ErrSessionClosed):
 		return 0
-	default:
-		// Give the peer a brief chance to observe the emitted CLOSE before a
-		// transport without half-close support turns it into bare EOF/closed-pipe.
-		return 10 * time.Millisecond
 	}
+	var appErr *ApplicationError
+	if errors.As(err, &appErr) && appErr.Code == uint64(CodeNoError) {
+		return 0
+	}
+	// Give the peer a brief chance to observe the emitted CLOSE before a
+	// transport without half-close support turns it into bare EOF/closed-pipe.
+	return 10 * time.Millisecond
 }
 
 func closeMappedApplicationError(err error) *ApplicationError {

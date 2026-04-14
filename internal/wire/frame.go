@@ -7,6 +7,8 @@ import (
 	"io"
 )
 
+const maxInboundFrameHeaderOverhead = 9
+
 func (f Frame) MarshalBinary() ([]byte, error) {
 	return f.AppendBinary(nil)
 }
@@ -143,6 +145,58 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 	if frameLen < 2 {
 		return Frame{}, dst, nil, FrameSizeError("read frame_length", ErrShortFrame)
 	}
+	if frameLen > maxInboundFrameLen(limits) {
+		return Frame{}, dst, nil, FrameSizeError("read frame_length", ErrPayloadTooLarge)
+	}
+
+	var prefix [maxInboundFrameHeaderOverhead]byte
+	code, err := br.ReadByte()
+	if err != nil {
+		if err == io.EOF {
+			return Frame{}, dst, nil, io.ErrUnexpectedEOF
+		}
+		return Frame{}, dst, nil, err
+	}
+	prefix[0] = code
+	frameType := FrameType(code & 0x1f)
+	flags := code & 0xe0
+	if !frameType.Valid() {
+		return Frame{}, dst, nil, WrapError(CodeProtocol, "parse frame code", ErrInvalidFrameType)
+	}
+
+	firstStreamByte, err := br.ReadByte()
+	if err != nil {
+		if err == io.EOF {
+			return Frame{}, dst, nil, io.ErrUnexpectedEOF
+		}
+		return Frame{}, dst, nil, err
+	}
+	prefix[1] = firstStreamByte
+	streamLen := 1 << (firstStreamByte >> 6)
+	for i := 1; i < streamLen; i++ {
+		b, err := br.ReadByte()
+		if err != nil {
+			if err == io.EOF {
+				return Frame{}, dst, nil, io.ErrUnexpectedEOF
+			}
+			return Frame{}, dst, nil, err
+		}
+		prefix[1+i] = b
+	}
+	_, parsedStreamLen, err := ParseVarint(prefix[1 : 1+streamLen])
+	if err != nil {
+		if errors.Is(err, ErrTruncatedVarint) {
+			return Frame{}, dst, nil, io.ErrUnexpectedEOF
+		}
+		return Frame{}, dst, nil, WrapError(CodeProtocol, "parse stream_id", err)
+	}
+	if frameLen < uint64(1+parsedStreamLen) {
+		return Frame{}, dst, nil, FrameSizeError("read frame", ErrShortFrame)
+	}
+	payloadLen := frameLen - uint64(1+parsedStreamLen)
+	if payloadLen > InboundPayloadLimit(frameType, limits) {
+		return Frame{}, dst, nil, FrameSizeError("read frame", ErrPayloadTooLarge)
+	}
 
 	total, err := frameTotalLen(frameLen, n)
 	if err != nil {
@@ -158,15 +212,9 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 	if err != nil {
 		return Frame{}, dst, handle, WrapError(CodeProtocol, "read frame", err)
 	}
-	if _, err := io.ReadFull(r, dst[len(header):]); err != nil {
+	copy(dst[len(header):len(header)+1+parsedStreamLen], prefix[:1+parsedStreamLen])
+	if _, err := io.ReadFull(r, dst[len(header)+1+parsedStreamLen:]); err != nil {
 		return Frame{}, dst, handle, err
-	}
-
-	code := dst[n]
-	frameType := FrameType(code & 0x1f)
-	flags := code & 0xe0
-	if !frameType.Valid() {
-		return Frame{}, dst, handle, WrapError(CodeProtocol, "parse frame code", ErrInvalidFrameType)
 	}
 
 	frame, err := parseBufferedFrame(dst, frameLen, n, total, code, frameType, flags, limits)
@@ -174,6 +222,20 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 		return Frame{}, dst, handle, err
 	}
 	return frame, dst, handle, nil
+}
+
+func maxInboundFrameLen(limits Limits) uint64 {
+	maxPayload := limits.MaxFramePayload
+	if limits.MaxControlPayloadBytes > maxPayload {
+		maxPayload = limits.MaxControlPayloadBytes
+	}
+	if limits.MaxExtensionPayloadBytes > maxPayload {
+		maxPayload = limits.MaxExtensionPayloadBytes
+	}
+	if maxPayload > MaxVarint62-maxInboundFrameHeaderOverhead {
+		return MaxVarint62
+	}
+	return maxPayload + maxInboundFrameHeaderOverhead
 }
 
 func frameTotalLen(frameLen uint64, n int) (int, error) {

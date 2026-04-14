@@ -2423,6 +2423,80 @@ func TestReadLoopReleasesSupersededScratchHandle(t *testing.T) {
 	}
 }
 
+func TestReadLoopDoesNotReuseRetainedScratchBuffer(t *testing.T) {
+	oldReadFrameBuffered := readLoopReadFrameBuffered
+	oldHandleFrameBuffered := readLoopHandleFrameBuffered
+	oldRetain := readLoopRetainReadFrameBufferForPayload
+	oldRelease := readLoopReleaseReadFrameBuffer
+	oldClose := readLoopCloseSessionWithOptionsForReadErr
+	defer func() {
+		readLoopHooksMu.Lock()
+		readLoopReadFrameBuffered = oldReadFrameBuffered
+		readLoopHandleFrameBuffered = oldHandleFrameBuffered
+		readLoopRetainReadFrameBufferForPayload = oldRetain
+		readLoopReleaseReadFrameBuffer = oldRelease
+		readLoopCloseSessionWithOptionsForReadErr = oldClose
+		readLoopHooksMu.Unlock()
+	}()
+
+	retainedBuf := []byte("retained-buffer")
+	retainedHandle := &wire.FrameReadBufferHandle{}
+	errBoom := errors.New("boom")
+
+	var released []*wire.FrameReadBufferHandle
+	var closeErr error
+	call := 0
+	readLoopHooksMu.Lock()
+	readLoopReadFrameBuffered = func(_ io.Reader, _ Limits, dst []byte) (Frame, []byte, *wire.FrameReadBufferHandle, error) {
+		call++
+		switch call {
+		case 1:
+			if dst != nil {
+				t.Fatalf("first read received scratch %v, want nil", dst)
+			}
+			return Frame{}, retainedBuf, retainedHandle, nil
+		case 2:
+			if dst != nil {
+				t.Fatalf("second read received retained scratch %v, want nil", dst)
+			}
+			return Frame{}, nil, nil, errBoom
+		default:
+			t.Fatalf("unexpected readLoopReadFrameBuffered call %d", call)
+			return Frame{}, nil, nil, errBoom
+		}
+	}
+	readLoopHandleFrameBuffered = func(_ *Conn, _ Frame, _ []byte, handle *wire.FrameReadBufferHandle) (bool, error) {
+		if call != 1 {
+			t.Fatalf("handleFrameBuffered call = %d, want 1", call)
+		}
+		if handle != retainedHandle {
+			t.Fatalf("retained frame handle = %p, want %p", handle, retainedHandle)
+		}
+		return true, nil
+	}
+	readLoopRetainReadFrameBufferForPayload = func(_ []byte, _ uint64) []byte {
+		t.Fatal("retainReadFrameBufferForPayload called for retained frame")
+		return nil
+	}
+	readLoopReleaseReadFrameBuffer = func(_ []byte, handle *wire.FrameReadBufferHandle) {
+		released = append(released, handle)
+	}
+	readLoopCloseSessionWithOptionsForReadErr = func(_ *Conn, err error) {
+		closeErr = err
+	}
+	readLoopHooksMu.Unlock()
+
+	c := &Conn{}
+	c.readLoop()
+
+	if !errors.Is(closeErr, errBoom) {
+		t.Fatalf("readLoop close err = %v, want %v", closeErr, errBoom)
+	}
+	if len(released) != 0 {
+		t.Fatalf("released retained handles = %v, want none", released)
+	}
+}
+
 func TestWriteBatchScratchQueuedStreamScratchClearsRetainedStreamRefsOnReuse(t *testing.T) {
 	t.Parallel()
 

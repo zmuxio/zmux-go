@@ -12,6 +12,8 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -557,6 +559,52 @@ func TestEnsureOpenPreludeResumesAfterPartialWriteError(t *testing.T) {
 	}
 }
 
+func TestEnsureOpenPreludeWithContextCancelsBlockedWrite(t *testing.T) {
+	writer := newDeadlineAwareWriter()
+	base := &quicStreamBase{}
+	initLocalStreamBase(base, nil, nil, writer, zmux.OpenOptions{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- base.ensureOpenPreludeWithContext(ctx, writer)
+	}()
+
+	<-writer.started
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("ensureOpenPreludeWithContext err = %v, want %v", err, os.ErrDeadlineExceeded)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ensureOpenPreludeWithContext did not unblock after context cancellation")
+	}
+
+	deadlines := writer.deadlineCalls()
+	if len(deadlines) < 2 {
+		t.Fatalf("deadline call count = %d, want at least 2", len(deadlines))
+	}
+	if deadlines[0].IsZero() {
+		t.Fatalf("first deadline = %v, want non-zero cancellation deadline", deadlines[0])
+	}
+	if !deadlines[len(deadlines)-1].IsZero() {
+		t.Fatalf("last deadline = %v, want cleared zero deadline", deadlines[len(deadlines)-1])
+	}
+}
+
+func TestPreferLocalWriteErrorReturnsLocalApplicationError(t *testing.T) {
+	base := &quicStreamBase{}
+	appErr := &zmux.ApplicationError{Code: 77, Reason: "local-abort"}
+	base.localWriteClosed.Store(true)
+	base.storeLocalWriteErr(appErr)
+
+	if got := base.preferLocalWriteError(io.ErrUnexpectedEOF); got != appErr {
+		t.Fatalf("preferLocalWriteError = %v, want %v", got, appErr)
+	}
+}
+
 func TestWrapSessionCloseReadReturnsErrReadClosedLocally(t *testing.T) {
 	client, server := newWrappedPair(t)
 
@@ -761,6 +809,48 @@ func (w *partialPreludeWriter) Write(p []byte) (int, error) {
 		return n, w.failErr
 	}
 	return w.Buffer.Write(p)
+}
+
+type deadlineAwareWriter struct {
+	mu          sync.Mutex
+	started     chan struct{}
+	deadlineSet chan struct{}
+	startOnce   sync.Once
+	setOnce     sync.Once
+	deadlines   []time.Time
+}
+
+func newDeadlineAwareWriter() *deadlineAwareWriter {
+	return &deadlineAwareWriter{
+		started:     make(chan struct{}),
+		deadlineSet: make(chan struct{}),
+	}
+}
+
+func (w *deadlineAwareWriter) Write(_ []byte) (int, error) {
+	w.startOnce.Do(func() {
+		close(w.started)
+	})
+	<-w.deadlineSet
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (w *deadlineAwareWriter) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	w.deadlines = append(w.deadlines, t)
+	w.mu.Unlock()
+	if !t.IsZero() {
+		w.setOnce.Do(func() {
+			close(w.deadlineSet)
+		})
+	}
+	return nil
+}
+
+func (w *deadlineAwareWriter) deadlineCalls() []time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]time.Time(nil), w.deadlines...)
 }
 
 func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {

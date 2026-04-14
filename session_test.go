@@ -2845,6 +2845,13 @@ func TestCloseWithoutOpenStreamsOnlySendsClose(t *testing.T) {
 	if frame.StreamID != 0 {
 		t.Fatalf("close frame stream-id = %d, want 0", frame.StreamID)
 	}
+	code, reason, err := parseErrorPayload(frame.Payload)
+	if err != nil {
+		t.Fatalf("parseErrorPayload err = %v", err)
+	}
+	if code != uint64(CodeNoError) || reason != "" {
+		t.Fatalf("close payload = (%d, %q), want (%d, %q)", code, reason, uint64(CodeNoError), "")
+	}
 	assertNoQueuedFrame(t, frames)
 }
 

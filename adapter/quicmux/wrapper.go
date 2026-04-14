@@ -178,13 +178,14 @@ func (s *quicSession) OpenStreamWithOptions(ctx context.Context, opts zmux.OpenO
 	if s == nil || s.conn == nil {
 		return nil, zmux.ErrSessionClosed
 	}
-	stream, err := s.conn.OpenStreamSync(defaultContext(ctx))
+	ctx = defaultContext(ctx)
+	stream, err := s.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, translateError(err)
 	}
 	wrapped := &quicStream{stream: stream}
 	initLocalStreamBase(&wrapped.quicStreamBase, s.conn, stream, stream, opts)
-	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
+	if err := wrapped.maybeSendOpenPreludeOnOpen(ctx, stream); err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeInternal))
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		_ = stream.Close()
@@ -197,13 +198,14 @@ func (s *quicSession) OpenUniStreamWithOptions(ctx context.Context, opts zmux.Op
 	if s == nil || s.conn == nil {
 		return nil, zmux.ErrSessionClosed
 	}
-	stream, err := s.conn.OpenUniStreamSync(defaultContext(ctx))
+	ctx = defaultContext(ctx)
+	stream, err := s.conn.OpenUniStreamSync(ctx)
 	if err != nil {
 		return nil, translateError(err)
 	}
 	wrapped := &quicSendStream{stream: stream}
 	initLocalStreamBase(&wrapped.quicStreamBase, s.conn, nil, stream, opts)
-	if err := wrapped.maybeSendOpenPreludeOnOpen(); err != nil {
+	if err := wrapped.maybeSendOpenPreludeOnOpen(ctx, stream); err != nil {
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		_ = stream.Close()
 		return nil, err
@@ -411,6 +413,10 @@ type quicStreamBase struct {
 	localWriteErr    error
 }
 
+type writeDeadlineSetter interface {
+	SetWriteDeadline(time.Time) error
+}
+
 type singleByteReader struct {
 	reader io.Reader
 	buf    [1]byte
@@ -555,10 +561,10 @@ func (b *quicStreamBase) UpdateMetadata(update zmux.MetadataUpdate) error {
 
 	// In the adapter, a pre-data UpdateMetadata acts as the peer-visible open
 	// advisory point. Once emitted, later updates are intentionally unsupported.
-	return b.ensureOpenPrelude()
+	return b.preferLocalWriteError(b.ensureOpenPrelude())
 }
 
-func (b *quicStreamBase) maybeSendOpenPreludeOnOpen() error {
+func (b *quicStreamBase) maybeSendOpenPreludeOnOpen(ctx context.Context, deadlineSetter writeDeadlineSetter) error {
 	if b == nil {
 		return zmux.ErrSessionClosed
 	}
@@ -568,7 +574,7 @@ func (b *quicStreamBase) maybeSendOpenPreludeOnOpen() error {
 	if !needs {
 		return nil
 	}
-	return b.ensureOpenPrelude()
+	return b.ensureOpenPreludeWithContext(ctx, deadlineSetter)
 }
 
 func (b *quicStreamBase) ensureOpenPrelude() error {
@@ -601,6 +607,12 @@ func (b *quicStreamBase) ensureOpenPrelude() error {
 	b.preludeSent = true
 	b.metaMu.Unlock()
 	return nil
+}
+
+func (b *quicStreamBase) ensureOpenPreludeWithContext(ctx context.Context, deadlineSetter writeDeadlineSetter) error {
+	restore := installContextWriteDeadline(ctx, deadlineSetter)
+	defer restore()
+	return b.ensureOpenPrelude()
 }
 
 func (b *quicStreamBase) hasPeerVisibleOpenMetadataLocked() bool {
@@ -673,6 +685,16 @@ func (b *quicStreamBase) storeLocalWriteErr(err error) {
 	b.termMu.Unlock()
 }
 
+func (b *quicStreamBase) preferLocalWriteError(err error) error {
+	if err == nil || b == nil || !b.localWriteClosed.Load() {
+		return err
+	}
+	if localErr := b.loadLocalWriteErr(); localErr != nil {
+		return localErr
+	}
+	return zmux.ErrWriteClosed
+}
+
 type quicStream struct {
 	quicStreamBase
 	stream *quic.Stream
@@ -714,7 +736,7 @@ func (s *quicStream) Write(p []byte) (int, error) {
 		}
 		return 0, zmux.ErrWriteClosed
 	}
-	if err := s.ensureOpenPrelude(); err != nil {
+	if err := s.preferLocalWriteError(s.ensureOpenPrelude()); err != nil {
 		return 0, err
 	}
 	if s.localWriteClosed.Load() {
@@ -827,7 +849,7 @@ func (s *quicStream) CloseWrite() error {
 	if s.localWriteClosed.Load() {
 		return zmux.ErrWriteClosed
 	}
-	if err := s.ensureOpenPrelude(); err != nil {
+	if err := s.preferLocalWriteError(s.ensureOpenPrelude()); err != nil {
 		return err
 	}
 	if s.localWriteClosed.Load() {
@@ -895,7 +917,7 @@ func (s *quicSendStream) Write(p []byte) (int, error) {
 		}
 		return 0, zmux.ErrWriteClosed
 	}
-	if err := s.ensureOpenPrelude(); err != nil {
+	if err := s.preferLocalWriteError(s.ensureOpenPrelude()); err != nil {
 		return 0, err
 	}
 	if s.localWriteClosed.Load() {
@@ -941,7 +963,7 @@ func (s *quicSendStream) CloseWrite() error {
 	if s.localWriteClosed.Load() {
 		return zmux.ErrWriteClosed
 	}
-	if err := s.ensureOpenPrelude(); err != nil {
+	if err := s.preferLocalWriteError(s.ensureOpenPrelude()); err != nil {
 		return err
 	}
 	if s.localWriteClosed.Load() {
@@ -1290,6 +1312,36 @@ func defaultContext(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return ctx
+}
+
+func installContextWriteDeadline(ctx context.Context, deadlineSetter writeDeadlineSetter) func() {
+	if ctx == nil || deadlineSetter == nil {
+		return func() {}
+	}
+	if ctx.Err() != nil {
+		_ = deadlineSetter.SetWriteDeadline(time.Now())
+		return func() {
+			_ = deadlineSetter.SetWriteDeadline(time.Time{})
+		}
+	}
+
+	clearOnReturn := false
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = deadlineSetter.SetWriteDeadline(deadline)
+		clearOnReturn = true
+	}
+	stop := context.AfterFunc(ctx, func() {
+		_ = deadlineSetter.SetWriteDeadline(time.Now())
+	})
+	return func() {
+		if stop() {
+			if clearOnReturn {
+				_ = deadlineSetter.SetWriteDeadline(time.Time{})
+			}
+			return
+		}
+		_ = deadlineSetter.SetWriteDeadline(time.Time{})
+	}
 }
 
 var (

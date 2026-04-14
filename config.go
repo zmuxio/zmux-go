@@ -143,6 +143,10 @@ type Limits = wire.Limits
 type Preface = wire.Preface
 type Negotiated = wire.Negotiated
 
+// Config controls session establishment and runtime behavior.
+//
+// Prefer starting from DefaultConfig(). The zero value is not the repository
+// default configuration because Role zero is RoleInitiator, not RoleAuto.
 type Config struct {
 	Role              Role
 	TieBreakerNonce   uint64
@@ -291,6 +295,7 @@ type OpenOptions struct {
 	OpenInfo        []byte
 }
 
+// DefaultConfig returns the repository-default configuration template.
 func DefaultConfig() *Config {
 	return &Config{
 		Role:         RoleAuto,

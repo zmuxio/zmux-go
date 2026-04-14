@@ -434,7 +434,22 @@ Pass `*zmux.Config` to control capabilities, settings, keepalive, close timeouts
 event hooks:
 
 ```go
+cfg := zmux.DefaultConfig()
+cfg.KeepaliveInterval = 15 * time.Second
+cfg.GracefulCloseDrainTimeout = 100 * time.Millisecond
+cfg.EventHandler = func(ev zmux.Event) {
+	// observe stream/session lifecycle
+}
+
+session, err := zmux.New(rwc, cfg)
+```
+
+Start from `DefaultConfig()` unless you intentionally want to override fields
+that have non-default zero values such as `Role`.
+
+```go
 cfg := &zmux.Config{
+	Role:                      zmux.RoleAuto,
 	KeepaliveInterval:         15 * time.Second,
 	GracefulCloseDrainTimeout: 100 * time.Millisecond,
 	EventHandler: func(ev zmux.Event) {

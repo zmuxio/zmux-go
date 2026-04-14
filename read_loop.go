@@ -117,14 +117,14 @@ func (c *Conn) readLoop() {
 	limits := c.localLimitsView()
 	var scratch []byte
 	var scratchHandle *wire.FrameReadBufferHandle
+	readLoopHooksMu.RLock()
+	readFrameBufferedFn := readLoopReadFrameBuffered
+	handleFrameBufferedFn := readLoopHandleFrameBuffered
+	retainReadFrameBufferFn := readLoopRetainReadFrameBufferForPayload
+	releaseReadFrameBufferFn := readLoopReleaseReadFrameBuffer
+	closeSessionFn := readLoopCloseSessionWithOptionsForReadErr
+	readLoopHooksMu.RUnlock()
 	for {
-		readLoopHooksMu.RLock()
-		readFrameBufferedFn := readLoopReadFrameBuffered
-		handleFrameBufferedFn := readLoopHandleFrameBuffered
-		retainReadFrameBufferFn := readLoopRetainReadFrameBufferForPayload
-		releaseReadFrameBufferFn := readLoopReleaseReadFrameBuffer
-		closeSessionFn := readLoopCloseSessionWithOptionsForReadErr
-		readLoopHooksMu.RUnlock()
 		// Reuse one bounded frame buffer per active connection to avoid
 		// per-frame pool churn without pinning oversized backings indefinitely.
 		frame, buf, handle, err := readFrameBufferedFn(c.io.reader, limits, scratch)
