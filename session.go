@@ -4293,6 +4293,9 @@ func (c *Conn) failProvisionalWithSourceLocked(stream *nativeStream, err error, 
 		var existing *ApplicationError
 		if errors.As(err, &existing) {
 			appErr = existing
+			if _, bare := err.(*ApplicationError); !bare {
+				surfaceErr = err
+			}
 		} else {
 			appErr = cancelledAppErr(err.Error())
 			surfaceErr = errors.Join(err, appErr)

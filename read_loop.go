@@ -165,7 +165,7 @@ func (c *Conn) startReadLoopProtocolLoopLocked() {
 	}
 	if c.protocol.notifyCh == nil {
 		c.protocol.notifyCh = make(chan struct{}, 1)
-		c.protocol.tasks = make([]protocolTask, 0, initialPendingReadLoopProtocolJobsCap)
+		c.protocol.tasks = make([]protocolTask, 0, maxPendingReadLoopProtocolJobs)
 	}
 	notifyCh := c.protocol.notifyCh
 	closedCh := c.lifecycle.closedCh
@@ -202,21 +202,30 @@ func (c *Conn) readLoopProtocolLoop(notifyCh <-chan struct{}, closedCh chan stru
 				c.mu.Unlock()
 				break
 			}
-			tasks := append(reusable[:0], c.protocol.tasks...)
-			clear(c.protocol.tasks)
-			c.protocol.tasks = c.protocol.tasks[:0]
+			tasks := c.protocol.tasks
+			if cap(reusable) > 0 {
+				c.protocol.tasks = reusable[:0]
+				reusable = nil
+			} else {
+				c.protocol.tasks = make([]protocolTask, 0, maxPendingReadLoopProtocolJobs)
+			}
 			c.mu.Unlock()
 
 			for i := range tasks {
 				c.handleReadLoopProtocolActionErr(c.executeReadLoopProtocolTask(tasks[i]))
 				tasks[i] = protocolTask{}
 			}
-			reusable = tasks[:0]
+			if cap(tasks) <= maxReusablePendingReadLoopProtocolJobsCap {
+				reusable = tasks[:0]
+			}
 		}
 	}
 }
 
-const initialPendingReadLoopProtocolJobsCap = 256
+const (
+	maxPendingReadLoopProtocolJobs            = 256
+	maxReusablePendingReadLoopProtocolJobsCap = 1024
+)
 
 type protocolTaskKind uint8
 
@@ -276,6 +285,11 @@ func (c *Conn) enqueueReadLoopProtocolTask(task protocolTask) error {
 		return err
 	}
 	c.startReadLoopProtocolLoopLocked()
+	if len(c.protocol.tasks) >= maxPendingReadLoopProtocolJobs {
+		c.metrics.protocolBacklogBlocked = saturatingAdd(c.metrics.protocolBacklogBlocked, 1)
+		c.mu.Unlock()
+		return wireError(CodeInternal, "queue protocol action", fmt.Errorf("pending read-loop protocol backlog exceeded"))
+	}
 	c.protocol.tasks = append(c.protocol.tasks, task)
 	notifyCh := c.protocol.notifyCh
 	c.mu.Unlock()

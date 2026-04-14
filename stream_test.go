@@ -5355,6 +5355,39 @@ func TestStructuredErrorAfterExpiredProvisionalWrite(t *testing.T) {
 	}
 }
 
+func TestFailProvisionalPreservesWrappedApplicationErrorSurface(t *testing.T) {
+	t.Parallel()
+
+	c := newSessionMemoryTestConn()
+	inner := &ApplicationError{Code: uint64(CodeRefusedStream), Reason: "peer rejected"}
+	wrapped := &Error{
+		Scope:           ScopeStream,
+		Operation:       OperationOpen,
+		Source:          SourceRemote,
+		WireCode:        inner.Code,
+		ReasonText:      inner.Reason,
+		Direction:       DirectionBoth,
+		TerminationKind: TerminationAbort,
+		Err:             inner,
+	}
+
+	c.mu.Lock()
+	stream := c.newProvisionalLocalStreamLocked(streamArityBidi, OpenOptions{}, nil)
+	c.failProvisionalWithSourceLocked(stream, wrapped, terminalAbortFromPeer)
+	sendErr := stream.sendAbortErrLocked()
+	recvErr := stream.recvAbortErrLocked()
+	c.mu.Unlock()
+
+	for _, err := range []error{sendErr, recvErr} {
+		se := requireStructuredError(t, err)
+		if se.Operation != OperationOpen || se.Source != SourceRemote ||
+			se.WireCode != inner.Code || se.ReasonText != inner.Reason ||
+			se.Direction != DirectionBoth || se.TerminationKind != TerminationAbort {
+			t.Fatalf("structured error = %+v", *se)
+		}
+	}
+}
+
 func TestStructuredErrorAfterPeerGoAwayOnProvisionalWrite(t *testing.T) {
 	t.Parallel()
 

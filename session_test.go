@@ -4636,14 +4636,75 @@ func TestReadLoopProtocolQueueDoesNotBlockWhenWorkerStalls(t *testing.T) {
 		t.Fatal("timed out waiting for protocol task flood to enqueue without blocking")
 	}
 
+	deadline = time.Now().Add(testSignalTimeout)
+	for {
+		c.mu.Lock()
+		backlogBlocked := c.metrics.protocolBacklogBlocked
+		closeErr := c.lifecycle.closeErr
+		c.mu.Unlock()
+		if backlogBlocked > 0 && closeErr != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for protocol backlog overflow to close the session")
+		}
+		runtime.Gosched()
+	}
+
 	c.mu.Lock()
-	pendingJobs := len(c.protocol.tasks)
-	c.lifecycle.closeErr = ErrSessionClosed
-	c.lifecycle.sessionState = connStateClosing
-	close(c.lifecycle.closedCh)
+	select {
+	case <-c.lifecycle.closedCh:
+	default:
+		c.lifecycle.closeErr = ErrSessionClosed
+		c.lifecycle.sessionState = connStateClosing
+		close(c.lifecycle.closedCh)
+	}
 	c.mu.Unlock()
-	if pendingJobs == 0 {
-		t.Fatal("expected stalled protocol worker to leave queued protocol jobs behind")
+}
+
+func TestReadLoopProtocolQueueReleasesOversizedBackingAfterDrain(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+	}
+	c.protocol.notifyCh = make(chan struct{}, 1)
+	c.protocol.tasks = make([]protocolTask, 0, maxReusablePendingReadLoopProtocolJobsCap*2)
+	for i := 0; i < maxReusablePendingReadLoopProtocolJobsCap*2; i++ {
+		c.protocol.tasks = append(c.protocol.tasks, protocolTask{kind: protocolTaskCloseWrite})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.readLoopProtocolLoop(c.protocol.notifyCh, c.lifecycle.closedCh)
+	}()
+
+	notify(c.protocol.notifyCh)
+
+	deadline := time.Now().Add(testSignalTimeout)
+	for {
+		c.mu.Lock()
+		pendingJobs := len(c.protocol.tasks)
+		taskCap := cap(c.protocol.tasks)
+		c.mu.Unlock()
+		if pendingJobs == 0 {
+			if taskCap != maxPendingReadLoopProtocolJobs {
+				t.Fatalf("protocol task backing cap after drain = %d, want %d", taskCap, maxPendingReadLoopProtocolJobs)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for oversized protocol task backlog to drain")
+		}
+		runtime.Gosched()
+	}
+
+	close(c.lifecycle.closedCh)
+	select {
+	case <-done:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("timed out waiting for protocol loop shutdown")
 	}
 }
 

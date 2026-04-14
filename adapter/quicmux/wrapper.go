@@ -24,6 +24,13 @@ const quicmuxOpenCaps = wire.CapabilityOpenMetadata | wire.CapabilityPriorityHin
 // an accepted QUIC stream to produce its zmux adapter prelude.
 const DefaultAcceptedPreludeReadTimeout = 5 * time.Second
 
+var metadataPayloadPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 128)
+		return &buf
+	},
+}
+
 // SessionOptions configures adapter-local behavior that does not exist on the
 // stable zmux Session surface itself.
 type SessionOptions struct {
@@ -1106,16 +1113,26 @@ func readAcceptedStreamMetadata(reader *bufio.Reader) (acceptedStreamMetadata, e
 		return acceptedStreamMetadata{}, zmux.ErrOpenMetadataTooLarge
 	}
 
-	payload := make([]byte, int(metadataLen))
+	ptr := metadataPayloadPool.Get().(*[]byte)
+	payload := *ptr
+	if uint64(cap(payload)) < metadataLen {
+		payload = make([]byte, int(metadataLen))
+	} else {
+		payload = payload[:int(metadataLen)]
+	}
+	defer func() {
+		*ptr = payload[:0]
+		metadataPayloadPool.Put(ptr)
+	}()
 	if _, err := io.ReadFull(reader, payload); err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("read stream metadata", err)
 	}
 
-	tlvs, err := wire.ParseTLVs(payload)
+	tlvs, err := wire.ParseTLVsView(payload)
 	if err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("parse stream metadata tlvs", err)
 	}
-	parsed, ok, err := wire.ParseStreamMetadataTLVs(tlvs)
+	parsed, ok, err := wire.ParseStreamMetadataTLVsView(tlvs)
 	if err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("parse stream metadata", err)
 	}
