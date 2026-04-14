@@ -943,6 +943,7 @@ func copyReasonCounts(src map[uint64]uint64) map[uint64]uint64 {
 }
 
 const sessionCloseFrameSendTimeout = 100 * time.Millisecond
+const sessionCloseFrameSendTimeoutMax = 2 * time.Second
 
 func closeOperationErr(c *Conn, err error) error {
 	return sessionOperationErr(c, OperationClose, err)
@@ -1341,7 +1342,7 @@ func establishmentCloseDrainDelay(err error) time.Duration {
 	return 10 * time.Millisecond
 }
 
-const establishmentFailureWriteWait = 50 * time.Millisecond
+const establishmentFailureWriteWait = 250 * time.Millisecond
 
 func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer *Preface, err error) {
 	if conn == nil {
@@ -1412,7 +1413,7 @@ func (c *Conn) emitCloseFrame(payload []byte) closeFrameSendResult {
 		done:   make(chan error, 1),
 	}
 
-	deadline := time.Now().Add(sessionCloseFrameSendTimeout)
+	deadline := time.Now().Add(c.closeFrameSendTimeout())
 	if !rt.SendByDeadline(deadline, c.lifecycle.closedCh, lane, req) {
 		c.mu.Lock()
 		c.metrics.closeFrameAdmissionTO = saturatingAdd(c.metrics.closeFrameAdmissionTO, 1)
@@ -1594,7 +1595,11 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 }
 
 const sessionGoAwayDrainInterval = 10 * time.Millisecond
+const sessionGoAwayDrainIntervalMax = 250 * time.Millisecond
 const sessionGracefulCloseDrainTimeout = 500 * time.Millisecond
+const sessionGracefulCloseDrainTimeoutMax = 5 * time.Second
+const stopSendingAdaptiveDrainWindowMax = 2 * time.Second
+const rttAdaptiveSlack = 50 * time.Millisecond
 const writerLaneBuffer = 128
 const advisoryLaneBuffer = 32
 
@@ -1652,7 +1657,7 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 		if err := c.GoAway(initialBidi, initialUni); err != nil {
 			return err
 		}
-		timer := time.NewTimer(sessionGoAwayDrainInterval)
+		timer := time.NewTimer(c.goAwayDrainInterval())
 		if c.lifecycle.closedCh != nil {
 			select {
 			case <-c.lifecycle.closedCh:
@@ -2625,10 +2630,78 @@ func (c *Conn) applyConfigRuntimePolicy(cfg Config) {
 }
 
 func (c *Conn) gracefulCloseDrainTimeout() time.Duration {
-	if c == nil || c.terminalPolicy.gracefulCloseTimeout <= 0 {
+	if c == nil {
 		return sessionGracefulCloseDrainTimeout
 	}
-	return c.terminalPolicy.gracefulCloseTimeout
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.terminalPolicy.gracefulCloseTimeout > 0 {
+		return c.terminalPolicy.gracefulCloseTimeout
+	}
+	return adaptiveRTTTimeout(c.liveness.lastPingRTT, sessionGracefulCloseDrainTimeout, sessionGracefulCloseDrainTimeoutMax, 4, 100*time.Millisecond)
+}
+
+func (c *Conn) closeFrameSendTimeout() time.Duration {
+	if c == nil {
+		return sessionCloseFrameSendTimeout
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return adaptiveRTTTimeout(c.liveness.lastPingRTT, sessionCloseFrameSendTimeout, sessionCloseFrameSendTimeoutMax, 4, rttAdaptiveSlack)
+}
+
+func (c *Conn) goAwayDrainInterval() time.Duration {
+	if c == nil {
+		return sessionGoAwayDrainInterval
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	interval := sessionGoAwayDrainInterval
+	if c.liveness.lastPingRTT > 0 {
+		if candidate := c.liveness.lastPingRTT / 4; candidate > interval {
+			interval = candidate
+		}
+	}
+	if interval > sessionGoAwayDrainIntervalMax {
+		return sessionGoAwayDrainIntervalMax
+	}
+	return interval
+}
+
+func (c *Conn) stopSendingDrainWindow() time.Duration {
+	if c == nil {
+		return rt.StopSendingDrainWindow(0)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stopSendingDrainWindowLocked()
+}
+
+func adaptiveRTTTimeout(rtt, base, max time.Duration, multiplier int, slack time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	timeout := base
+	if rtt > 0 && multiplier > 0 {
+		candidate := time.Duration(multiplier)*rtt + slack
+		if candidate > timeout {
+			timeout = candidate
+		}
+	}
+	if max > 0 && timeout > max {
+		return max
+	}
+	return timeout
+}
+
+func (c *Conn) stopSendingDrainWindowLocked() time.Duration {
+	if c == nil {
+		return rt.StopSendingDrainWindow(0)
+	}
+	if c.terminalPolicy.stopSendingDrainWindow > 0 {
+		return c.terminalPolicy.stopSendingDrainWindow
+	}
+	return adaptiveRTTTimeout(c.liveness.lastPingRTT, rt.StopSendingDrainWindow(0), stopSendingAdaptiveDrainWindowMax, 2, 0)
 }
 
 func (c *Conn) localLimitsView() Limits {
@@ -3451,14 +3524,15 @@ func (c *Conn) nextKeepaliveAction(now time.Time) keepaliveAction {
 		return keepaliveAction{}
 	}
 	if c.liveness.pingOutstanding {
-		if c.liveness.keepaliveTimeout > 0 && now.Sub(c.liveness.lastPingSentAt) > c.liveness.keepaliveTimeout {
+		timeout := c.effectiveKeepaliveTimeoutLocked()
+		if timeout > 0 && now.Sub(c.liveness.lastPingSentAt) > timeout {
 			c.mu.Unlock()
 			c.Abort(ErrKeepaliveTimeout)
 			c.mu.Lock()
 			return keepaliveAction{}
 		}
-		remaining := c.liveness.keepaliveTimeout - now.Sub(c.liveness.lastPingSentAt)
-		if remaining <= 0 || c.liveness.keepaliveTimeout <= 0 {
+		remaining := timeout - now.Sub(c.liveness.lastPingSentAt)
+		if remaining <= 0 || timeout <= 0 {
 			remaining = c.liveness.keepaliveInterval
 		}
 		return keepaliveAction{delay: remaining}
@@ -3495,6 +3569,20 @@ func (c *Conn) resetKeepaliveDueLocked(now time.Time) {
 		return
 	}
 	c.liveness.keepaliveDueAt = now.Add(c.liveness.keepaliveInterval + rt.NextKeepaliveJitter(c.liveness.keepaliveInterval, &c.liveness.keepaliveJitterState))
+}
+
+func (c *Conn) effectiveKeepaliveTimeoutLocked() time.Duration {
+	timeout := c.liveness.keepaliveTimeout
+	if timeout <= 0 {
+		return 0
+	}
+	if c.liveness.lastPingRTT > 0 {
+		floor := 4*c.liveness.lastPingRTT + rttAdaptiveSlack
+		if floor > timeout {
+			timeout = floor
+		}
+	}
+	return timeout
 }
 
 const (

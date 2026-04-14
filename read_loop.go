@@ -905,7 +905,7 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 			if stream.conn != nil {
 				sendRateEstimate = stream.conn.metrics.sendRateEstimate
 				stopTailCap = stream.conn.terminalPolicy.stopSendingTailCap
-				drainWindow = stream.conn.terminalPolicy.stopSendingDrainWindow
+				drainWindow = stream.conn.stopSendingDrainWindowLocked()
 			}
 			gracefulFinish = rt.EvaluateStopSendingGraceful(rt.StopSendingGracefulInput{
 				RecvAbortive:     stream.recvAbortiveLocked(),
@@ -926,7 +926,7 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		c.mu.Unlock()
 		deadline := time.Now().Add(rt.StopSendingDrainWindow(0))
 		if conn := stream.conn; conn != nil {
-			deadline = time.Now().Add(rt.StopSendingDrainWindow(conn.terminalPolicy.stopSendingDrainWindow))
+			deadline = time.Now().Add(conn.stopSendingDrainWindow())
 		}
 		closePlan, err := stream.prepareAsyncCloseWritePlan()
 		if err != nil {

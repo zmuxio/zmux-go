@@ -152,7 +152,11 @@ type Config struct {
 	Settings          Settings
 	NonceSource       io.Reader
 	KeepaliveInterval time.Duration
-	KeepaliveTimeout  time.Duration
+	// KeepaliveTimeout bounds how long an outstanding keepalive ping may remain
+	// unanswered before the session is aborted. When left at the repository
+	// default, the runtime may raise the effective timeout from observed RTT
+	// within bounded caps so very high latency links remain usable.
+	KeepaliveTimeout time.Duration
 
 	// SessionMemoryCap overrides the repository-default tracked-session-memory
 	// hard cap. Zero uses the repository default.
@@ -252,7 +256,9 @@ type Config struct {
 	InboundPingFloodThreshold uint32
 	// StopSendingGracefulDrainWindow overrides the repository-default bounded
 	// graceful-drain admission window used after peer STOP_SENDING before
-	// falling back to RESET(CANCELLED). Zero uses the repository default.
+	// falling back to RESET(CANCELLED). Zero uses the repository default. When
+	// left unset, the runtime may widen the effective window from observed RTT
+	// within bounded caps so high latency links do not spuriously reset streams.
 	StopSendingGracefulDrainWindow time.Duration
 	// StopSendingGracefulTailCap overrides the repository-default maximum
 	// unavoidable tail, in bytes, that may still converge via DATA|FIN after
@@ -263,7 +269,9 @@ type Config struct {
 	// This bounds how long Close will keep waiting for already-visible local
 	// streams and provisionals to converge after GOAWAY, so it should usually be
 	// tuned from application shutdown behavior rather than raw RTT alone. Zero
-	// uses the repository default.
+	// uses the repository default; when left unset, the runtime may widen the
+	// effective wait from observed RTT within bounded caps while keeping the
+	// default tuned for ordinary moderate-latency links.
 	GracefulCloseDrainTimeout time.Duration
 
 	// EventHandler receives lightweight connection/stream lifecycle notifications.

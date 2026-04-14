@@ -369,6 +369,13 @@ not just RTT:
 - higher values only when graceful shutdown must give active streams more time
   to finish before falling back to a bounded timeout
 
+With zero-valued close/drain overrides, the runtime keeps repository defaults
+that are tuned for ordinary moderate-latency links. Once a session has observed
+ping RTT, it may widen the effective close-frame, GOAWAY, STOP_SENDING, and
+keepalive timeout windows within bounded caps so very high latency links remain
+usable without retuning the default profile. Explicit config overrides still
+win.
+
 ## Joined Read/Write Halves
 
 If your transport exposes separate read and write halves, join them into a

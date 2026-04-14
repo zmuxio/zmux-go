@@ -26314,3 +26314,90 @@ func TestReleaseStreamReceiveStateClearsPendingWithoutBufferedBytes(t *testing.T
 		t.Fatalf("stream readBuf len = %d, want 0", got)
 	}
 }
+
+func TestCloseFrameSendTimeoutUsesObservedRTTCap(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	c.liveness.lastPingRTT = 700 * time.Millisecond
+
+	if got := c.closeFrameSendTimeout(); got != sessionCloseFrameSendTimeoutMax {
+		t.Fatalf("closeFrameSendTimeout = %v, want %v", got, sessionCloseFrameSendTimeoutMax)
+	}
+}
+
+func TestGracefulCloseDrainTimeoutUsesObservedRTTFloorWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	c.liveness.lastPingRTT = 600 * time.Millisecond
+
+	want := 4*(600*time.Millisecond) + 100*time.Millisecond
+	if got := c.gracefulCloseDrainTimeout(); got != want {
+		t.Fatalf("gracefulCloseDrainTimeout = %v, want %v", got, want)
+	}
+}
+
+func TestGracefulCloseDrainTimeoutOverrideWinsOverObservedRTT(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	c.liveness.lastPingRTT = 2 * time.Second
+	c.terminalPolicy.gracefulCloseTimeout = 200 * time.Millisecond
+
+	if got := c.gracefulCloseDrainTimeout(); got != 200*time.Millisecond {
+		t.Fatalf("gracefulCloseDrainTimeout = %v, want 200ms override", got)
+	}
+}
+
+func TestStopSendingDrainWindowUsesObservedRTTFloorWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	c.liveness.lastPingRTT = 900 * time.Millisecond
+
+	if got := c.stopSendingDrainWindow(); got != 1800*time.Millisecond {
+		t.Fatalf("stopSendingDrainWindow = %v, want 1800ms", got)
+	}
+}
+
+func TestGoAwayDrainIntervalUsesObservedRTTQuarter(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	c.liveness.lastPingRTT = 800 * time.Millisecond
+
+	if got := c.goAwayDrainInterval(); got != 200*time.Millisecond {
+		t.Fatalf("goAwayDrainInterval = %v, want 200ms", got)
+	}
+
+	c.liveness.lastPingRTT = 2 * time.Second
+	if got := c.goAwayDrainInterval(); got != sessionGoAwayDrainIntervalMax {
+		t.Fatalf("goAwayDrainInterval = %v, want %v cap", got, sessionGoAwayDrainIntervalMax)
+	}
+}
+
+func TestNextKeepaliveActionUsesObservedRTTFloorBeforeTimeout(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	base := time.Unix(1_700_000_000, 0)
+	c.liveness.keepaliveInterval = time.Second
+	c.liveness.keepaliveTimeout = 200 * time.Millisecond
+	c.liveness.lastPingRTT = 500 * time.Millisecond
+	c.liveness.pingOutstanding = true
+	c.liveness.lastPingSentAt = base
+
+	action := c.nextKeepaliveAction(base.Add(300 * time.Millisecond))
+
+	if action.sendPing {
+		t.Fatal("nextKeepaliveAction requested ping while previous ping is still outstanding")
+	}
+	want := 4*(500*time.Millisecond) + rttAdaptiveSlack - 300*time.Millisecond
+	if action.delay != want {
+		t.Fatalf("keepalive delay = %v, want %v", action.delay, want)
+	}
+	if !c.liveness.pingOutstanding {
+		t.Fatal("nextKeepaliveAction cleared outstanding ping before adaptive timeout elapsed")
+	}
+}
