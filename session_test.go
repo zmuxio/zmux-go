@@ -4557,6 +4557,96 @@ func TestPeerPingReplyDroppedWhenSessionClosesDuringReplyQueue(t *testing.T) {
 	}
 }
 
+func TestReadLoopProtocolQueueDoesNotBlockWhenWorkerStalls(t *testing.T) {
+	t.Parallel()
+
+	settings := DefaultSettings()
+	localRole := RoleInitiator
+	peerRole := RoleResponder
+	c := &Conn{
+		pending: connPendingControlState{controlNotify: make(chan struct{}, 1)},
+		writer:  connWriterRuntimeState{urgentWriteCh: make(chan writeRequest)},
+		lifecycle: connLifecycleState{
+			sessionState: connStateReady,
+			closedCh:     make(chan struct{}),
+		},
+		config: connConfigState{
+			local: Preface{
+				PrefaceVersion: PrefaceVersion,
+				Role:           localRole,
+				MinProto:       ProtoVersion,
+				MaxProto:       ProtoVersion,
+				Settings:       settings,
+			},
+			peer: Preface{
+				PrefaceVersion: PrefaceVersion,
+				Role:           peerRole,
+				MinProto:       ProtoVersion,
+				MaxProto:       ProtoVersion,
+				Settings:       settings,
+			},
+			negotiated: Negotiated{
+				Proto:        ProtoVersion,
+				Capabilities: 0,
+				LocalRole:    localRole,
+				PeerRole:     peerRole,
+				PeerSettings: settings,
+			},
+		},
+	}
+
+	pongFrame := flatTxFrame(Frame{Type: FrameTypePONG, Payload: []byte{0, 1, 2, 3, 4, 5, 6, 7}})
+	firstDone := make(chan struct{}, 1)
+	go func() {
+		c.queueReadLoopFrameAsync(pongFrame)
+		firstDone <- struct{}{}
+	}()
+
+	deadline := time.Now().Add(testSignalTimeout)
+	for {
+		c.mu.Lock()
+		blocked := c.flow.urgentQueuedBytes > 0
+		c.mu.Unlock()
+		if blocked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for stalled protocol worker")
+		}
+		runtime.Gosched()
+	}
+
+	select {
+	case <-firstDone:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("timed out waiting for first protocol task enqueue to return")
+	}
+
+	floodDone := make(chan struct{}, 1)
+	go func() {
+		for i := 0; i < 512; i++ {
+			c.queueReadLoopFrameAsync(pongFrame)
+		}
+		floodDone <- struct{}{}
+	}()
+
+	select {
+	case <-floodDone:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("timed out waiting for protocol task flood to enqueue without blocking")
+	}
+
+	c.mu.Lock()
+	pendingJobs := len(c.protocol.tasks)
+	c.lifecycle.closeErr = ErrSessionClosed
+	c.lifecycle.sessionState = connStateClosing
+	close(c.lifecycle.closedCh)
+	c.mu.Unlock()
+	if pendingJobs == 0 {
+		t.Fatal("expected stalled protocol worker to leave queued protocol jobs behind")
+	}
+}
+
 type nopCloseSignalStream struct{}
 
 func (nopCloseSignalStream) Read(_ []byte) (int, error)  { return 0, io.EOF }
@@ -9293,6 +9383,17 @@ func TestConfigQueueOverridesAffectBackpressure(t *testing.T) {
 		t.Fatal("expected per-stream queued-data override to block additional ordinary write bytes")
 	}
 
+	tooLargeFirst := &writeRequest{queuedBytes: clientCfg.UrgentQueuedBytesCap + 1}
+	tooLargeFirstReserve := client.reserveUrgentQueueLocked(tooLargeFirst)
+	if tooLargeFirstReserve.memoryErr != nil {
+		client.mu.Unlock()
+		t.Fatalf("reserve oversized first urgent request err = %v, want nil", tooLargeFirstReserve.memoryErr)
+	}
+	if !tooLargeFirstReserve.blocked() {
+		client.mu.Unlock()
+		t.Fatal("expected first urgent request beyond the configured cap to block")
+	}
+
 	first := &writeRequest{queuedBytes: clientCfg.UrgentQueuedBytesCap}
 	firstReserve := client.reserveUrgentQueueLocked(first)
 	if firstReserve.blocked() || firstReserve.memoryErr != nil {
@@ -12089,6 +12190,9 @@ func TestExpiredProvisionalOpenReleasedWithoutConsumingID(t *testing.T) {
 	}
 	if appErr.Reason != ErrOpenExpired.Error() {
 		t.Fatalf("expired provisional write reason = %q, want %q", appErr.Reason, ErrOpenExpired.Error())
+	}
+	if !errors.Is(err, ErrOpenExpired) {
+		t.Fatalf("expired provisional write err = %v, want errors.Is(..., %v)", err, ErrOpenExpired)
 	}
 
 	acceptCh := make(chan *nativeStream, 1)

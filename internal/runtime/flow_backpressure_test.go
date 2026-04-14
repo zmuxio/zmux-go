@@ -23,7 +23,7 @@ func TestQueueWouldBlock(t *testing.T) {
 		{name: "memory_blocked", blocked: true, req: 1, sessionHWM: 8, streamHWM: 4, want: true},
 		{name: "session_crosses_hwm", session: 4, req: 5, sessionHWM: 8, streamHWM: 8, want: true},
 		{name: "stream_crosses_hwm", stream: 2, req: 3, sessionHWM: 8, streamHWM: 4, want: true},
-		{name: "session_at_zero_ignores_limit", session: 0, req: 9, sessionHWM: 8, streamHWM: 8, want: false},
+		{name: "session_at_zero_still_respects_limit", session: 0, req: 9, sessionHWM: 8, streamHWM: 8, want: true},
 		{name: "below_limits", session: 3, stream: 1, req: 2, sessionHWM: 8, streamHWM: 4, want: false},
 	}
 	for _, tc := range tests {

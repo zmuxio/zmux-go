@@ -11,6 +11,7 @@ github.com/zmuxio/zmux-go v0.0.0-20260412233857-b89a6360834e/go.mod h1:BT+jCtoUz
 github.com/zmuxio/zmux-go v1.0.0/go.mod h1:BT+jCtoUz6kjgHgOHxYWD9C0Xlw16wbsgDUgp14KEPU=
 github.com/zmuxio/zmux-go v1.0.1 h1:YzVB2a7Gdma6Xq64ldfVaUW3Y5mo1w+nPQlWcu/VRa8=
 github.com/zmuxio/zmux-go v1.0.1/go.mod h1:BT+jCtoUz6kjgHgOHxYWD9C0Xlw16wbsgDUgp14KEPU=
+github.com/zmuxio/zmux-go v1.0.2 h1:E5gXg7XGKyJPn6aIRy60kO9CSGA1tJd5Qcycy5T35ww=
 github.com/zmuxio/zmux-go v1.0.2/go.mod h1:BT+jCtoUz6kjgHgOHxYWD9C0Xlw16wbsgDUgp14KEPU=
 go.uber.org/mock v0.5.2 h1:LbtPTcP8A5k9WPXj54PPPbjcI4Y6lhyOZXn+VS7wNko=
 go.uber.org/mock v0.5.2/go.mod h1:wLlUxC2vVTPTaE3UD51E0BGOAElKrILxhVSDYQLld5o=

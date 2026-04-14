@@ -91,10 +91,10 @@ func QueueWouldBlock(sessionMemoryBlocked bool, sessionQueued, streamQueued, req
 	if sessionMemoryBlocked || reqBytes == 0 {
 		return sessionMemoryBlocked
 	}
-	if sessionQueued > 0 && SaturatingAdd(sessionQueued, reqBytes) > sessionHWM {
+	if SaturatingAdd(sessionQueued, reqBytes) > sessionHWM {
 		return true
 	}
-	if streamQueued > 0 && SaturatingAdd(streamQueued, reqBytes) > streamHWM {
+	if SaturatingAdd(streamQueued, reqBytes) > streamHWM {
 		return true
 	}
 	return false

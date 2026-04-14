@@ -1845,7 +1845,7 @@ func (c *Conn) reserveUrgentQueueLocked(req *writeRequest) queueReservationResul
 	if err := c.sessionMemoryCapErrorWithAdditionalLocked("queue urgent control", bytes); err != nil {
 		return queueReservationResult{memoryErr: err}
 	}
-	if c.pending.controlNotify != nil && c.flow.urgentQueuedBytes > 0 && saturatingAdd(c.flow.urgentQueuedBytes, bytes) > c.urgentLaneCapLocked() {
+	if saturatingAdd(c.flow.urgentQueuedBytes, bytes) > c.urgentLaneCapLocked() {
 		return queueReservationResult{state: queueReservationBlocked}
 	}
 

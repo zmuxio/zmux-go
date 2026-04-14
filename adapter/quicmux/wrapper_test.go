@@ -295,20 +295,19 @@ func TestWrapSessionUpdateMetadataAfterVisibilityUnavailable(t *testing.T) {
 }
 
 func TestWrapSessionAcceptStreamPreservesOrderAcrossStalledPreludeTimeout(t *testing.T) {
-	clientConn, serverConn := newQUICConnPair(t)
-	client := WrapSession(clientConn)
-	server := WrapSession(serverConn)
-
-	prevTimeout := acceptedPreludeReadTimeout
-	acceptedPreludeReadTimeout = 100 * time.Millisecond
-	t.Cleanup(func() {
-		acceptedPreludeReadTimeout = prevTimeout
+	client, server := newWrappedPairWithOptions(t, SessionOptions{}, SessionOptions{
+		AcceptedPreludeReadTimeout: 100 * time.Millisecond,
 	})
+	clientConn, _ := client.(*quicSession)
+	serverConn, _ := server.(*quicSession)
+	if clientConn == nil || serverConn == nil {
+		t.Fatal("wrapped sessions = nil adapter sessions, want quicSession")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	stalled, err := clientConn.OpenStreamSync(ctx)
+	stalled, err := clientConn.conn.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatalf("raw OpenStreamSync stalled err = %v", err)
 	}
@@ -357,20 +356,19 @@ func TestWrapSessionAcceptStreamPreservesOrderAcrossStalledPreludeTimeout(t *tes
 }
 
 func TestWrapSessionConcurrentAcceptStreamDoesNotOvertakeStalledPrelude(t *testing.T) {
-	clientConn, serverConn := newQUICConnPair(t)
-	client := WrapSession(clientConn)
-	server := WrapSession(serverConn)
-
-	prevTimeout := acceptedPreludeReadTimeout
-	acceptedPreludeReadTimeout = 100 * time.Millisecond
-	t.Cleanup(func() {
-		acceptedPreludeReadTimeout = prevTimeout
+	client, server := newWrappedPairWithOptions(t, SessionOptions{}, SessionOptions{
+		AcceptedPreludeReadTimeout: 100 * time.Millisecond,
 	})
+	clientConn, _ := client.(*quicSession)
+	serverConn, _ := server.(*quicSession)
+	if clientConn == nil || serverConn == nil {
+		t.Fatal("wrapped sessions = nil adapter sessions, want quicSession")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	stalled, err := clientConn.OpenStreamSync(ctx)
+	stalled, err := clientConn.conn.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatalf("raw OpenStreamSync stalled err = %v", err)
 	}
@@ -676,6 +674,13 @@ func newWrappedPair(t *testing.T) (zmux.Session, zmux.Session) {
 
 	clientConn, serverConn := newQUICConnPair(t)
 	return WrapSession(clientConn), WrapSession(serverConn)
+}
+
+func newWrappedPairWithOptions(t *testing.T, clientOpts, serverOpts SessionOptions) (zmux.Session, zmux.Session) {
+	t.Helper()
+
+	clientConn, serverConn := newQUICConnPair(t)
+	return WrapSessionWithOptions(clientConn, clientOpts), WrapSessionWithOptions(serverConn, serverOpts)
 }
 
 func newQUICConnPair(t *testing.T) (*quic.Conn, *quic.Conn) {

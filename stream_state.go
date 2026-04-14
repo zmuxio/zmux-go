@@ -1177,14 +1177,26 @@ func (s *nativeStream) storeRecvHalf(v state.RecvHalfState) {
 }
 
 func (s *nativeStream) sendAbortErrLocked() error {
-	if s == nil || s.sendAbort == nil {
+	if s == nil {
+		return nil
+	}
+	if s.sendAbortSurface != nil {
+		return s.sendAbortSurface
+	}
+	if s.sendAbort == nil {
 		return nil
 	}
 	return s.sendAbort
 }
 
 func (s *nativeStream) recvAbortErrLocked() error {
-	if s == nil || s.recvAbort == nil {
+	if s == nil {
+		return nil
+	}
+	if s.recvAbortSurface != nil {
+		return s.recvAbortSurface
+	}
+	if s.recvAbort == nil {
 		return nil
 	}
 	return s.recvAbort
@@ -1322,6 +1334,7 @@ func (s *nativeStream) setSendAbortWithSource(err *ApplicationError, source term
 		s.conn.untrackStreamGroupLocked(s)
 	}
 	s.sendAbort = err
+	s.sendAbortSurface = nil
 	s.sendAbortSource = source
 	s.sendResetSource = terminalResetDirect
 	s.storeSendHalf(state.SendHalfAborted)
@@ -1367,6 +1380,7 @@ func (s *nativeStream) setRecvAbortWithSource(err *ApplicationError, source term
 		return
 	}
 	s.recvAbort = err
+	s.recvAbortSurface = nil
 	s.recvAbortSource = source
 	s.storeRecvHalf(state.RecvHalfAborted)
 	if s.conn != nil {
@@ -1380,6 +1394,14 @@ func (s *nativeStream) setAbortedWithSource(err *ApplicationError, source termin
 	}
 	s.setSendAbortWithSource(err, source)
 	s.setRecvAbortWithSource(err, source)
+}
+
+func (s *nativeStream) setAbortSurfaceErr(err error) {
+	if s == nil {
+		return
+	}
+	s.sendAbortSurface = err
+	s.recvAbortSurface = err
 }
 
 type streamReadChunk struct {
@@ -1417,6 +1439,9 @@ type nativeStream struct {
 	sendStop  *ApplicationError
 	recvReset *ApplicationError
 	recvAbort *ApplicationError
+
+	sendAbortSurface error
+	recvAbortSurface error
 
 	openMetadataPrefix []byte
 	readBuf            []byte

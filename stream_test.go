@@ -5343,6 +5343,9 @@ func TestStructuredErrorAfterExpiredProvisionalWrite(t *testing.T) {
 	if appErr.Code != uint64(CodeCancelled) || appErr.Reason != ErrOpenExpired.Error() {
 		t.Fatalf("expired provisional write app error = %+v, want code=%d reason=%q", *appErr, uint64(CodeCancelled), ErrOpenExpired.Error())
 	}
+	if !errors.Is(err, ErrOpenExpired) {
+		t.Fatalf("expired provisional write err = %v, want errors.Is(..., %v)", err, ErrOpenExpired)
+	}
 
 	se := requireStructuredError(t, err)
 	if se.Scope != ScopeStream || se.Operation != OperationWrite || se.Source != SourceLocal ||

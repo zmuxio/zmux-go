@@ -163,13 +163,14 @@ func (c *Conn) startReadLoopProtocolLoopLocked() {
 	if c == nil {
 		return
 	}
-	if c.protocol.taskCh == nil {
-		c.protocol.taskCh = make(chan func() error, maxPendingReadLoopProtocolJobs)
+	if c.protocol.notifyCh == nil {
+		c.protocol.notifyCh = make(chan struct{}, 1)
+		c.protocol.tasks = make([]protocolTask, 0, initialPendingReadLoopProtocolJobsCap)
 	}
-	taskCh := c.protocol.taskCh
+	notifyCh := c.protocol.notifyCh
 	closedCh := c.lifecycle.closedCh
 	c.protocol.startOnce.Do(func() {
-		go c.readLoopProtocolLoop(taskCh, closedCh)
+		go c.readLoopProtocolLoop(notifyCh, closedCh)
 	})
 }
 
@@ -186,51 +187,109 @@ func (c *Conn) handleReadLoopProtocolActionErr(err error) {
 	c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
 }
 
-func (c *Conn) readLoopProtocolLoop(taskCh <-chan func() error, closedCh chan struct{}) {
+func (c *Conn) readLoopProtocolLoop(notifyCh <-chan struct{}, closedCh chan struct{}) {
+	var reusable []protocolTask
 	for {
 		select {
 		case <-closedCh:
 			return
-		case job := <-taskCh:
-			if job == nil {
-				continue
+		case <-notifyCh:
+		}
+
+		for {
+			c.mu.Lock()
+			if len(c.protocol.tasks) == 0 {
+				c.mu.Unlock()
+				break
 			}
-			c.handleReadLoopProtocolActionErr(job())
+			tasks := append(reusable[:0], c.protocol.tasks...)
+			clear(c.protocol.tasks)
+			c.protocol.tasks = c.protocol.tasks[:0]
+			c.mu.Unlock()
+
+			for i := range tasks {
+				c.handleReadLoopProtocolActionErr(c.executeReadLoopProtocolTask(tasks[i]))
+				tasks[i] = protocolTask{}
+			}
+			reusable = tasks[:0]
 		}
 	}
 }
 
-const maxPendingReadLoopProtocolJobs = 256
+const initialPendingReadLoopProtocolJobsCap = 256
 
-func (c *Conn) runReadLoopProtocolActionAsync(action func() error) {
-	if c == nil || action == nil {
-		return
+type protocolTaskKind uint8
+
+const (
+	protocolTaskQueueFrame protocolTaskKind = iota
+	protocolTaskCloseWrite
+)
+
+type protocolTask struct {
+	kind      protocolTaskKind
+	frame     txFrame
+	closePlan terminalFramePlan
+	stream    *nativeStream
+	deadline  time.Time
+}
+
+func (c *Conn) executeReadLoopProtocolTask(task protocolTask) error {
+	if c == nil {
+		return ErrSessionClosed
 	}
-	c.mu.Lock()
-	c.startReadLoopProtocolLoopLocked()
-	taskCh := c.protocol.taskCh
-	closedCh := c.lifecycle.closedCh
-	c.mu.Unlock()
-	select {
-	case <-closedCh:
-		return
-	case taskCh <- action:
-		return
+	switch task.kind {
+	case protocolTaskQueueFrame:
+		return c.queueImmutableFrame(task.frame)
+	case protocolTaskCloseWrite:
+		if task.stream == nil {
+			return nil
+		}
+		err := task.closePlan.queueCloseWrite(task.stream, task.deadline)
+		if err == nil || errors.Is(err, ErrWriteClosed) {
+			return nil
+		}
+		if conn := task.stream.conn; conn != nil {
+			conn.mu.Lock()
+			sendTerminal := state.SendTerminal(task.stream.effectiveSendHalfStateLocked())
+			conn.mu.Unlock()
+			if sendTerminal {
+				return nil
+			}
+		}
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			return err
+		}
+		return task.stream.resetAfterStopSending(uint64(CodeCancelled))
 	default:
-		c.mu.Lock()
-		c.metrics.protocolBacklogBlocked = saturatingAdd(c.metrics.protocolBacklogBlocked, 1)
-		c.mu.Unlock()
-	}
-	select {
-	case <-closedCh:
-	case taskCh <- action:
+		return nil
 	}
 }
 
+func (c *Conn) enqueueReadLoopProtocolTask(task protocolTask) error {
+	if c == nil {
+		return ErrSessionClosed
+	}
+	c.mu.Lock()
+	if c.lifecycle.closeErr != nil {
+		err := visibleSessionErrLocked(c, c.lifecycle.closeErr)
+		c.mu.Unlock()
+		return err
+	}
+	c.startReadLoopProtocolLoopLocked()
+	c.protocol.tasks = append(c.protocol.tasks, task)
+	notifyCh := c.protocol.notifyCh
+	c.mu.Unlock()
+	notify(notifyCh)
+	return nil
+}
+
 func (c *Conn) queueReadLoopFrameAsync(frame txFrame) {
-	c.runReadLoopProtocolActionAsync(func() error {
-		return c.queueImmutableFrame(frame)
-	})
+	if err := c.enqueueReadLoopProtocolTask(protocolTask{
+		kind:  protocolTaskQueueFrame,
+		frame: frame,
+	}); err != nil {
+		c.handleReadLoopProtocolActionErr(err)
+	}
 }
 
 func (c *Conn) abortWithCodeAsync(streamID uint64, code ErrorCode) error {
@@ -862,24 +921,14 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		if len(closePlan.frames) == 0 {
 			return nil
 		}
-		c.runReadLoopProtocolActionAsync(func() error {
-			err := closePlan.queueCloseWrite(stream, deadline)
-			if err == nil || errors.Is(err, ErrWriteClosed) {
-				return nil
-			}
-			if conn := stream.conn; conn != nil {
-				conn.mu.Lock()
-				sendTerminal := state.SendTerminal(stream.effectiveSendHalfStateLocked())
-				conn.mu.Unlock()
-				if sendTerminal {
-					return nil
-				}
-			}
-			if !errors.Is(err, os.ErrDeadlineExceeded) {
-				return err
-			}
-			return stream.resetAfterStopSending(uint64(CodeCancelled))
-		})
+		if err := c.enqueueReadLoopProtocolTask(protocolTask{
+			kind:      protocolTaskCloseWrite,
+			closePlan: closePlan,
+			stream:    stream,
+			deadline:  deadline,
+		}); err != nil {
+			c.handleReadLoopProtocolActionErr(err)
+		}
 		return nil
 	}
 

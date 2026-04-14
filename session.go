@@ -827,7 +827,7 @@ func (c *Conn) Stats() SessionStats {
 		PreparedAdvisory:       c.pending.preparedPriorityBytes,
 		PendingTerminal:        c.pendingTerminalControlBytesLocked(),
 		PendingTerminalCount:   c.pendingTerminalQueueCountLocked(),
-		PendingProtocolJobs:    len(c.protocol.taskCh),
+		PendingProtocolJobs:    len(c.protocol.tasks),
 	}
 	hiddenRetained := c.hiddenControlStateRetainedLocked()
 	hiddenSoftCap := state.AdmissionSoftCap(c.pendingInboundLimitLocked())
@@ -1341,7 +1341,7 @@ func establishmentCloseDrainDelay(err error) time.Duration {
 	return 10 * time.Millisecond
 }
 
-const establishmentFailureWriteWait = 10 * time.Millisecond
+const establishmentFailureWriteWait = 50 * time.Millisecond
 
 func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer *Preface, err error) {
 	if conn == nil {
@@ -2218,7 +2218,8 @@ type connWriterRuntimeState struct {
 
 type connProtocolRuntimeState struct {
 	startOnce sync.Once
-	taskCh    chan func() error
+	notifyCh  chan struct{}
+	tasks     []protocolTask
 }
 
 type connIngressAccountingState struct {
@@ -4287,15 +4288,20 @@ func (c *Conn) failProvisionalWithSourceLocked(stream *nativeStream, err error, 
 	}
 	removed := c.removeProvisionalLocked(stream)
 	appErr := cancelledAppErr("")
+	var surfaceErr error
 	if err != nil {
 		var existing *ApplicationError
 		if errors.As(err, &existing) {
 			appErr = existing
 		} else {
 			appErr = cancelledAppErr(err.Error())
+			surfaceErr = errors.Join(err, appErr)
 		}
 	}
 	stream.setAbortedWithSource(appErr, source)
+	if surfaceErr != nil {
+		stream.setAbortSurfaceErr(surfaceErr)
+	}
 	c.finalizeTerminalStreamLocked(stream, transientStreamReleaseOptions{
 		send:    true,
 		receive: streamReceiveReleaseAndClearReadBuf,

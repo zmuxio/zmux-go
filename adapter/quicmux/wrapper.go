@@ -20,7 +20,18 @@ const quicmuxStreamPreludeMaxPayload = 16 << 10
 
 const quicmuxOpenCaps = wire.CapabilityOpenMetadata | wire.CapabilityPriorityHints | wire.CapabilityStreamGroups
 
-var acceptedPreludeReadTimeout = 5 * time.Second
+// DefaultAcceptedPreludeReadTimeout bounds how long the adapter will wait for
+// an accepted QUIC stream to produce its zmux adapter prelude.
+const DefaultAcceptedPreludeReadTimeout = 5 * time.Second
+
+// SessionOptions configures adapter-local behavior that does not exist on the
+// stable zmux Session surface itself.
+type SessionOptions struct {
+	// AcceptedPreludeReadTimeout bounds how long AcceptStream / AcceptUniStream
+	// will wait for the peer's adapter prelude. Zero uses the default. Negative
+	// values disable the adapter-managed timeout.
+	AcceptedPreludeReadTimeout time.Duration
+}
 
 // SessionConn is the quic-go connection shape required by the adapter.
 //
@@ -40,20 +51,41 @@ type SessionConn interface {
 // WrapSession exposes a quic-go session / connection through the
 // repository-default zmux Session interface.
 func WrapSession(conn SessionConn) zmux.Session {
+	return WrapSessionWithOptions(conn, SessionOptions{})
+}
+
+// WrapSessionWithOptions exposes a quic-go session / connection through the
+// repository-default zmux Session interface with adapter-local options.
+func WrapSessionWithOptions(conn SessionConn, opts SessionOptions) zmux.Session {
 	if conn == nil {
 		return &quicSession{}
 	}
-	return &quicSession{conn: conn}
+	return &quicSession{
+		conn:                       conn,
+		acceptedPreludeReadTimeout: normalizeAcceptedPreludeReadTimeout(opts.AcceptedPreludeReadTimeout),
+	}
+}
+
+func normalizeAcceptedPreludeReadTimeout(timeout time.Duration) time.Duration {
+	switch {
+	case timeout < 0:
+		return 0
+	case timeout == 0:
+		return DefaultAcceptedPreludeReadTimeout
+	default:
+		return timeout
+	}
 }
 
 type quicSession struct {
-	conn     SessionConn
-	bidiOnce sync.Once
-	uniOnce  sync.Once
-	bidiCh   chan bidiAcceptResult
-	uniCh    chan uniAcceptResult
-	bidiGate chan struct{}
-	uniGate  chan struct{}
+	conn                       SessionConn
+	acceptedPreludeReadTimeout time.Duration
+	bidiOnce                   sync.Once
+	uniOnce                    sync.Once
+	bidiCh                     chan bidiAcceptResult
+	uniCh                      chan uniAcceptResult
+	bidiGate                   chan struct{}
+	uniGate                    chan struct{}
 }
 
 type bidiAcceptResult struct {
@@ -91,7 +123,7 @@ func (s *quicSession) AcceptStream(ctx context.Context) (zmux.Stream, error) {
 		if result.stream == nil {
 			return nil, zmux.ErrSessionClosed
 		}
-		return newAcceptedBidiStream(s.conn, result.stream)
+		return newAcceptedBidiStream(s.conn, result.stream, s.acceptedPreludeReadTimeout)
 	}
 }
 
@@ -120,7 +152,7 @@ func (s *quicSession) AcceptUniStream(ctx context.Context) (zmux.RecvStream, err
 		if result.stream == nil {
 			return nil, zmux.ErrSessionClosed
 		}
-		return newAcceptedRecvStream(s.conn, result.stream)
+		return newAcceptedRecvStream(s.conn, result.stream, s.acceptedPreludeReadTimeout)
 	}
 }
 
@@ -622,12 +654,14 @@ type quicStream struct {
 	stream *quic.Stream
 }
 
-func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream) (*quicStream, error) {
+func newAcceptedBidiStream(conn SessionConn, stream *quic.Stream, timeout time.Duration) (*quicStream, error) {
 	reader := bufio.NewReader(stream)
-	_ = stream.SetReadDeadline(time.Now().Add(acceptedPreludeReadTimeout))
-	defer func() {
-		_ = stream.SetReadDeadline(time.Time{})
-	}()
+	if timeout > 0 {
+		_ = stream.SetReadDeadline(time.Now().Add(timeout))
+		defer func() {
+			_ = stream.SetReadDeadline(time.Time{})
+		}()
+	}
 	meta, err := readAcceptedStreamMetadata(reader)
 	if err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeProtocol))
@@ -954,12 +988,14 @@ type quicRecvStream struct {
 	stream *quic.ReceiveStream
 }
 
-func newAcceptedRecvStream(conn SessionConn, stream *quic.ReceiveStream) (*quicRecvStream, error) {
+func newAcceptedRecvStream(conn SessionConn, stream *quic.ReceiveStream, timeout time.Duration) (*quicRecvStream, error) {
 	reader := bufio.NewReader(stream)
-	_ = stream.SetReadDeadline(time.Now().Add(acceptedPreludeReadTimeout))
-	defer func() {
-		_ = stream.SetReadDeadline(time.Time{})
-	}()
+	if timeout > 0 {
+		_ = stream.SetReadDeadline(time.Now().Add(timeout))
+		defer func() {
+			_ = stream.SetReadDeadline(time.Time{})
+		}()
+	}
 	meta, err := readAcceptedStreamMetadata(reader)
 	if err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeProtocol))
@@ -1075,11 +1111,11 @@ func readAcceptedStreamMetadata(reader *bufio.Reader) (acceptedStreamMetadata, e
 		return acceptedStreamMetadata{}, protocolPreludeErr("read stream metadata", err)
 	}
 
-	tlvs, err := wire.ParseTLVsView(payload)
+	tlvs, err := wire.ParseTLVs(payload)
 	if err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("parse stream metadata tlvs", err)
 	}
-	parsed, ok, err := wire.ParseStreamMetadataTLVsView(tlvs)
+	parsed, ok, err := wire.ParseStreamMetadataTLVs(tlvs)
 	if err != nil {
 		return acceptedStreamMetadata{}, protocolPreludeErr("parse stream metadata", err)
 	}

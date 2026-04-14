@@ -20,6 +20,20 @@ var session = quicmux.WrapSession(qconn)
 `quic.DialAddr`, `Transport.Dial`, or `Listener.Accept` can be wrapped without
 any extra shim object.
 
+If you need to tune adapter-local behavior such as accepted prelude timeouts,
+use `WrapSessionWithOptions`:
+
+```go
+session := quicmux.WrapSessionWithOptions(qconn, quicmux.SessionOptions{
+	AcceptedPreludeReadTimeout: 2 * time.Second,
+})
+```
+
+An `AcceptedPreludeReadTimeout` of `0` uses the default
+`quicmux.DefaultAcceptedPreludeReadTimeout`; a negative value disables the
+adapter-managed deadline and leaves accepted stream prelude reads to the
+caller's surrounding transport deadlines.
+
 ## Mapping
 
 - `AcceptStream` / `OpenStream` map to QUIC bidirectional streams directly.
