@@ -378,6 +378,8 @@ func (c *Conn) maybeCompactTerminalLocked(stream *nativeStream) {
 	c.reapExcessTombstonesLocked()
 	c.enforceHiddenControlStateBudgetLocked(now)
 	c.enforceTerminalBookkeepingMemoryCapLocked()
+	notify(c.signals.livenessCh)
+	c.broadcastStateWakeLocked()
 }
 
 func (c *Conn) reapExcessTombstonesLocked() {

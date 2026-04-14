@@ -19,13 +19,15 @@ const quicmuxStreamPreludeMaxPayload = 16 << 10
 const metadataPayloadPoolInitCap = 128
 const metadataPayloadPoolMaxRetainedCap = 2 << 10
 const acceptedPreludeResultQueueCap = 32
-const acceptedPreludePrepareWorkers = 8
+const defaultAcceptedPreludeMaxConcurrent = 8
 
 const quicmuxOpenCaps = wire.CapabilityOpenMetadata | wire.CapabilityPriorityHints | wire.CapabilityStreamGroups
 
 // DefaultAcceptedPreludeReadTimeout bounds how long the adapter will wait for
 // an accepted QUIC stream to produce its zmux adapter prelude.
 const DefaultAcceptedPreludeReadTimeout = 5 * time.Second
+
+var defaultAcceptedPreludeMaxConcurrentValue atomic.Int64
 
 var metadataPayloadPool = sync.Pool{
 	New: func() any {
@@ -36,6 +38,30 @@ var metadataPayloadPool = sync.Pool{
 
 var emptyStreamPrelude = []byte{0}
 
+func init() {
+	defaultAcceptedPreludeMaxConcurrentValue.Store(defaultAcceptedPreludeMaxConcurrent)
+}
+
+// DefaultAcceptedPreludeMaxConcurrent returns the package default upper bound
+// for concurrently parsing accepted QUIC stream adapter preludes when a
+// session does not override SessionOptions.AcceptedPreludeMaxConcurrent.
+func DefaultAcceptedPreludeMaxConcurrent() int {
+	if current := int(defaultAcceptedPreludeMaxConcurrentValue.Load()); current > 0 {
+		return current
+	}
+	return 1
+}
+
+// SetDefaultAcceptedPreludeMaxConcurrent updates the package default upper
+// bound for concurrently parsing accepted QUIC stream adapter preludes. Values
+// less than or equal to zero restore the built-in default.
+func SetDefaultAcceptedPreludeMaxConcurrent(max int) {
+	if max <= 0 {
+		max = defaultAcceptedPreludeMaxConcurrent
+	}
+	defaultAcceptedPreludeMaxConcurrentValue.Store(int64(max))
+}
+
 // SessionOptions configures adapter-local behavior that does not exist on the
 // stable zmux Session surface itself.
 type SessionOptions struct {
@@ -43,6 +69,10 @@ type SessionOptions struct {
 	// accepted QUIC stream prelude before dropping that stream. Zero uses the
 	// default. Negative values disable the adapter-managed timeout.
 	AcceptedPreludeReadTimeout time.Duration
+	// AcceptedPreludeMaxConcurrent bounds how many accepted QUIC stream
+	// adapter preludes this wrapped session may parse concurrently. Zero uses
+	// the current package default.
+	AcceptedPreludeMaxConcurrent int
 }
 
 // SessionConn is the quic-go connection shape required by the adapter.
@@ -75,7 +105,7 @@ func WrapSessionWithOptions(conn SessionConn, opts SessionOptions) zmux.Session 
 	return &quicSession{
 		conn:                       conn,
 		acceptedPreludeReadTimeout: normalizeAcceptedPreludeReadTimeout(opts.AcceptedPreludeReadTimeout),
-		prepareTasks:               make(chan acceptedPrepareTask),
+		prepareSem:                 make(chan struct{}, normalizeAcceptedPreludeMaxConcurrent(opts.AcceptedPreludeMaxConcurrent)),
 	}
 }
 
@@ -90,20 +120,21 @@ func normalizeAcceptedPreludeReadTimeout(timeout time.Duration) time.Duration {
 	}
 }
 
+func normalizeAcceptedPreludeMaxConcurrent(max int) int {
+	if max > 0 {
+		return max
+	}
+	return DefaultAcceptedPreludeMaxConcurrent()
+}
+
 type quicSession struct {
 	conn                       SessionConn
 	acceptedPreludeReadTimeout time.Duration
-	prepareOnce                sync.Once
-	prepareTasks               chan acceptedPrepareTask
+	prepareSem                 chan struct{}
 	bidiOnce                   sync.Once
 	uniOnce                    sync.Once
 	bidiCh                     chan bidiAcceptResult
 	uniCh                      chan uniAcceptResult
-}
-
-type acceptedPrepareTask struct {
-	bidi *quic.Stream
-	uni  *quic.ReceiveStream
 }
 
 type bidiAcceptResult struct {
@@ -312,73 +343,58 @@ func (s *quicSession) ensureUniAcceptLoop() <-chan uniAcceptResult {
 }
 
 func (s *quicSession) acceptBidiLoop() {
-	s.ensurePrepareWorkers()
 	for {
 		stream, err := s.conn.AcceptStream(context.Background())
 		if err != nil {
 			s.publishBidiAcceptResult(bidiAcceptResult{err: translateError(err)})
 			return
 		}
-		if !s.enqueuePrepareTask(acceptedPrepareTask{bidi: stream}) {
+		if !s.acquirePrepareSlot() {
 			return
 		}
+		go func() {
+			defer s.releasePrepareSlot()
+			s.prepareAcceptedBidiStream(stream)
+		}()
 	}
 }
 
 func (s *quicSession) acceptUniLoop() {
-	s.ensurePrepareWorkers()
 	for {
 		stream, err := s.conn.AcceptUniStream(context.Background())
 		if err != nil {
 			s.publishUniAcceptResult(uniAcceptResult{err: translateError(err)})
 			return
 		}
-		if !s.enqueuePrepareTask(acceptedPrepareTask{uni: stream}) {
+		if !s.acquirePrepareSlot() {
 			return
 		}
+		go func() {
+			defer s.releasePrepareSlot()
+			s.prepareAcceptedUniStream(stream)
+		}()
 	}
 }
 
-func (s *quicSession) ensurePrepareWorkers() {
-	if s == nil || s.conn == nil || s.prepareTasks == nil {
-		return
-	}
-	s.prepareOnce.Do(func() {
-		for range acceptedPreludePrepareWorkers {
-			go s.acceptPrepareLoop()
-		}
-	})
-}
-
-func (s *quicSession) enqueuePrepareTask(task acceptedPrepareTask) bool {
-	if s == nil || s.conn == nil || s.prepareTasks == nil {
+func (s *quicSession) acquirePrepareSlot() bool {
+	if s == nil || s.conn == nil || s.prepareSem == nil {
 		return false
 	}
 	select {
-	case s.prepareTasks <- task:
+	case s.prepareSem <- struct{}{}:
 		return true
 	case <-s.conn.Context().Done():
 		return false
 	}
 }
 
-func (s *quicSession) acceptPrepareLoop() {
-	if s == nil || s.conn == nil || s.prepareTasks == nil {
+func (s *quicSession) releasePrepareSlot() {
+	if s == nil || s.prepareSem == nil {
 		return
 	}
-	for {
-		select {
-		case <-s.conn.Context().Done():
-			return
-		case task := <-s.prepareTasks:
-			if task.bidi != nil {
-				s.prepareAcceptedBidiStream(task.bidi)
-				continue
-			}
-			if task.uni != nil {
-				s.prepareAcceptedUniStream(task.uni)
-			}
-		}
+	select {
+	case <-s.prepareSem:
+	default:
 	}
 }
 

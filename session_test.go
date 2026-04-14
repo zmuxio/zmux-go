@@ -1038,9 +1038,9 @@ func TestWaitForLocalGoAwaySendReturnsSessionClosedWhenPendingGoAwayDroppedByClo
 	c.mu.Lock()
 	c.lifecycle.sessionState = connStateClosing
 	c.sessionControl.goAwaySendActive = false
+	c.broadcastStateWakeLocked()
 	c.mu.Unlock()
 	notify(c.pending.controlNotify)
-	notify(c.signals.livenessCh)
 
 	select {
 	case err := <-waitDone:
@@ -1049,6 +1049,100 @@ func TestWaitForLocalGoAwaySendReturnsSessionClosedWhenPendingGoAwayDroppedByClo
 		}
 	case <-time.After(testSignalTimeout):
 		t.Fatal("waitForLocalGoAwaySend did not return after pending GOAWAY was dropped by closing")
+	}
+}
+
+func TestWaitForLocalGoAwaySendDoesNotConsumeControlNotify(t *testing.T) {
+	t.Parallel()
+
+	c, _, stop := newHandlerTestConn(t)
+	defer stop()
+
+	waitDone := make(chan error, 1)
+	c.mu.Lock()
+	c.sessionControl.goAwaySendActive = true
+	c.mu.Unlock()
+	go func() {
+		waitDone <- c.waitForLocalGoAwaySend(8, 4)
+	}()
+
+	c.pending.controlNotify <- struct{}{}
+
+	c.mu.Lock()
+	c.sessionControl.goAwaySendActive = false
+	c.sessionControl.hasSentGoAway = true
+	c.sessionControl.sentGoAwayBidi = 8
+	c.sessionControl.sentGoAwayUni = 4
+	c.broadcastStateWakeLocked()
+	c.mu.Unlock()
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("waitForLocalGoAwaySend err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("waitForLocalGoAwaySend did not return after GOAWAY send state advanced")
+	}
+
+	select {
+	case <-c.pending.controlNotify:
+	default:
+		t.Fatal("waitForLocalGoAwaySend consumed conn.controlNotify, want GOAWAY waiter to leave control-flush signal intact")
+	}
+}
+
+func TestStateWakeBroadcastUnblocksGoAwayAndGracefulDrainWaiters(t *testing.T) {
+	t.Parallel()
+
+	c := newSessionMemoryTestConn()
+	c.lifecycle.terminalCh = make(chan struct{})
+	c.lifecycle.sessionState = connStateReady
+
+	stream := &nativeStream{conn: c, id: 1, idSet: true, bidi: true}
+	c.mu.Lock()
+	c.storeLiveStreamLocked(stream)
+	c.sessionControl.goAwaySendActive = true
+	c.currentStateWakeLocked()
+	c.mu.Unlock()
+
+	goAwayDone := make(chan error, 1)
+	drainDone := make(chan error, 1)
+
+	go func() {
+		goAwayDone <- c.waitForLocalGoAwaySend(8, 4)
+	}()
+	go func() {
+		drainDone <- c.waitForGracefulCloseDrain(5 * testSignalTimeout)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+
+	c.mu.Lock()
+	c.sessionControl.goAwaySendActive = false
+	c.sessionControl.hasSentGoAway = true
+	c.sessionControl.sentGoAwayBidi = 8
+	c.sessionControl.sentGoAwayUni = 4
+	c.dropLiveStreamLocked(stream.id)
+	c.broadcastStateWakeLocked()
+	c.mu.Unlock()
+
+	select {
+	case err := <-goAwayDone:
+		if err != nil {
+			t.Fatalf("waitForLocalGoAwaySend err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("waitForLocalGoAwaySend did not return after state wake broadcast")
+	}
+
+	select {
+	case err := <-drainDone:
+		if err != nil {
+			t.Fatalf("waitForGracefulCloseDrain err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("waitForGracefulCloseDrain did not return after state wake broadcast")
 	}
 }
 
@@ -6873,22 +6967,22 @@ func TestTakePendingPriorityUpdateRequestsFailsWhenAdvisoryHandoffWouldExceedTra
 	testSetPendingPriorityUpdate(c, stream.id, append([]byte(nil), payload...))
 	c.flow.sessionMemoryCap = uint64(len(payload))
 	_, err = c.takePendingPriorityUpdateRequestsLocked()
-	if err == nil {
+	if err != nil {
 		c.mu.Unlock()
-		t.Fatal("takePendingPriorityUpdateRequestsLocked() err = nil, want memory-cap error")
+		t.Fatalf("takePendingPriorityUpdateRequestsLocked() err = %v, want nil on advisory drop", err)
 	}
-	if !testHasPendingPriorityUpdate(c, stream.id) {
+	if testHasPendingPriorityUpdate(c, stream.id) {
 		c.mu.Unlock()
-		t.Fatal("pending priority update removed on failed handoff")
+		t.Fatal("pending priority update retained after advisory drop")
 	}
-	if got := c.pending.priorityBytes; got != uint64(len(payload)) {
+	if got := c.pending.priorityBytes; got != 0 {
 		c.mu.Unlock()
-		t.Fatalf("pendingPriorityBytes after failed handoff = %d, want %d", got, len(payload))
+		t.Fatalf("pendingPriorityBytes after advisory drop = %d, want 0", got)
 	}
 	if c.flow.advisoryQueuedBytes != 0 {
 		got := c.flow.advisoryQueuedBytes
 		c.mu.Unlock()
-		t.Fatalf("advisoryQueuedBytes after failed handoff = %d, want 0", got)
+		t.Fatalf("advisoryQueuedBytes after advisory drop = %d, want 0", got)
 	}
 	c.mu.Unlock()
 }
@@ -16730,8 +16824,39 @@ func TestLateDataPerStreamCapForRepositoryDefault(t *testing.T) {
 	if got := lateDataPerStreamCapFor(1<<20, 16*1024); got != 32*1024 {
 		t.Fatalf("lateDataPerStreamCapFor(1MiB, 16KiB) = %d, want %d", got, 32*1024)
 	}
-	if got := lateDataPerStreamCapFor(0, 16*1024); got != 0 {
-		t.Fatalf("lateDataPerStreamCapFor(0, 16KiB) = %d, want 0", got)
+	if got := lateDataPerStreamCapFor(0, 16*1024); got != 1024 {
+		t.Fatalf("lateDataPerStreamCapFor(0, 16KiB) = %d, want 1024", got)
+	}
+}
+
+func TestLateDataAfterRecvAbortedWithZeroInitialWindowUsesMinimumCap(t *testing.T) {
+	c, _, stop := newInvalidFrameConn(t, 0)
+	defer stop()
+
+	c.config.local.Settings.InitialMaxStreamDataBidiPeerOpened = 0
+	stream := seedStateFixtureStream(t, c, state.FirstPeerStreamID(c.config.negotiated.LocalRole, true), "bidi", "peer_owned", stateHalfExpect{
+		SendHalf: "send_open",
+		RecvHalf: "recv_aborted",
+	})
+	c.flow.recvSessionAdvertised = 100
+
+	beforeSessionAdvertised := c.flow.recvSessionAdvertised
+
+	if err := c.handleDataFrame(Frame{
+		Type:     FrameTypeDATA,
+		StreamID: stream.id,
+		Payload:  []byte("x"),
+	}); err != nil {
+		t.Fatalf("late DATA after peer ABORT with zero initial window err = %v, want nil", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.flow.recvSessionAdvertised != beforeSessionAdvertised+1 {
+		t.Fatalf("recvSessionAdvertised = %d, want %d", c.flow.recvSessionAdvertised, beforeSessionAdvertised+1)
+	}
+	if stream.lateDataReceived != 1 {
+		t.Fatalf("lateDataReceived = %d, want 1", stream.lateDataReceived)
 	}
 }
 
@@ -17034,14 +17159,12 @@ func TestDefaultLateDataPerStreamCapAfterCloseReadUsesInitialWindowFraction(t *t
 		t.Fatalf("local CloseRead: %v", err)
 	}
 
-	for i := 0; i < 3; i++ {
-		if err := c.handleDataFrame(Frame{
-			Type:     FrameTypeDATA,
-			StreamID: stream.id,
-			Payload:  []byte("x"),
-		}); err != nil {
-			t.Fatalf("late DATA #%d err = %v, want nil before default cap", i+1, err)
-		}
+	if err := c.handleDataFrame(Frame{
+		Type:     FrameTypeDATA,
+		StreamID: stream.id,
+		Payload:  bytes.Repeat([]byte("x"), 1024),
+	}); err != nil {
+		t.Fatalf("late DATA at default minimum cap err = %v, want nil", err)
 	}
 
 	err := c.handleDataFrame(Frame{
@@ -17055,8 +17178,8 @@ func TestDefaultLateDataPerStreamCapAfterCloseReadUsesInitialWindowFraction(t *t
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if stream.lateDataReceived != 4 {
-		t.Fatalf("lateDataReceived = %d, want 4", stream.lateDataReceived)
+	if stream.lateDataReceived != 1025 {
+		t.Fatalf("lateDataReceived = %d, want 1025", stream.lateDataReceived)
 	}
 }
 
@@ -20606,21 +20729,21 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		testSetPendingPriorityUpdate(c, stream.id, append([]byte(nil), payload...))
 		c.flow.sessionMemoryCap = uint64(len(payload))
 		_, err = c.takePendingPriorityUpdateRequestsLocked()
-		if err == nil {
+		if err != nil {
 			c.mu.Unlock()
-			return fmt.Errorf("takePendingPriorityUpdateRequestsLocked err = nil, want memory-cap error")
+			return fmt.Errorf("takePendingPriorityUpdateRequestsLocked err = %v, want nil on advisory drop", err)
 		}
-		if !testHasPendingPriorityUpdate(c, stream.id) {
+		if testHasPendingPriorityUpdate(c, stream.id) {
 			c.mu.Unlock()
-			return fmt.Errorf("pending priority update removed on failed handoff")
+			return fmt.Errorf("pending priority update retained after advisory drop")
 		}
-		if got := c.pending.priorityBytes; got != uint64(len(payload)) {
+		if got := c.pending.priorityBytes; got != 0 {
 			c.mu.Unlock()
-			return fmt.Errorf("pendingPriorityBytes after failed handoff = %d, want %d", got, len(payload))
+			return fmt.Errorf("pendingPriorityBytes after advisory drop = %d, want 0", got)
 		}
 		if got := c.flow.advisoryQueuedBytes; got != 0 {
 			c.mu.Unlock()
-			return fmt.Errorf("advisoryQueuedBytes after failed handoff = %d, want 0", got)
+			return fmt.Errorf("advisoryQueuedBytes after advisory drop = %d, want 0", got)
 		}
 		c.mu.Unlock()
 		return nil
@@ -26099,6 +26222,54 @@ func TestStandingGrowthFallsBackToReleasedCreditUnderStreamPressure(t *testing.T
 	}
 	if got, want := stream.recvAdvertised, streamTarget+10; got != want {
 		t.Fatalf("stream recvAdvertised = %d, want released-credit fallback %d", got, want)
+	}
+}
+
+func TestReplenishReceivePreservesCreditWhenMaxDataCannotQueue(t *testing.T) {
+	c, _, stop := newInvalidFrameConn(t, 0)
+	defer stop()
+
+	c.config.local.Settings.InitialMaxData = 262144
+	c.config.local.Settings.InitialMaxStreamDataBidiPeerOpened = 65536
+	c.config.local.Settings.MaxFramePayload = 16384
+	c.config.peer.Settings.MaxFramePayload = 16384
+
+	stream := seedStateFixtureStream(t, c, state.FirstPeerStreamID(c.config.negotiated.LocalRole, true), "bidi", "peer_owned", stateHalfExpect{
+		SendHalf: "send_open",
+		RecvHalf: "recv_open",
+	})
+
+	sessionTarget := c.sessionWindowTargetLocked()
+	streamTarget := c.streamWindowTargetLocked(stream)
+
+	c.pending.pendingControlBudget = 1
+	c.pending.controlBytes = 1
+	c.flow.recvSessionAdvertised = sessionTarget
+	c.flow.recvSessionReceived = c.flow.recvSessionAdvertised - quarterThreshold(sessionTarget)
+	c.flow.recvSessionPending = 10
+	stream.recvAdvertised = streamTarget
+	stream.recvReceived = stream.recvAdvertised - quarterThreshold(streamTarget)
+	stream.recvPending = 10
+
+	c.maybeReplenishReceiveLocked(stream)
+
+	if got := c.flow.recvSessionAdvertised; got != sessionTarget {
+		t.Fatalf("recvSessionAdvertised = %d, want unchanged %d when MAX_DATA queueing is blocked", got, sessionTarget)
+	}
+	if got := c.flow.recvSessionPending; got != 10 {
+		t.Fatalf("recvSessionPending = %d, want preserved 10 when MAX_DATA queueing is blocked", got)
+	}
+	if got := stream.recvAdvertised; got != streamTarget {
+		t.Fatalf("stream recvAdvertised = %d, want unchanged %d when MAX_DATA queueing is blocked", got, streamTarget)
+	}
+	if got := stream.recvPending; got != 10 {
+		t.Fatalf("stream recvPending = %d, want preserved 10 when MAX_DATA queueing is blocked", got)
+	}
+	if c.pending.hasSessionMaxData {
+		t.Fatal("session MAX_DATA should not be recorded when control budget rejects the replenish")
+	}
+	if got := testPendingStreamMaxDataCount(c); got != 0 {
+		t.Fatalf("pendingStreamMaxData len = %d, want 0 when control budget rejects the replenish", got)
 	}
 }
 

@@ -1047,10 +1047,14 @@ func (c *Conn) releasePreparedWriteRequest(req *writeRequest) {
 		return
 	}
 
+	urgentReleased := req.urgentReserved && req.queuedBytes > 0
 	c.mu.Lock()
 	stream, plan := c.releasePreparedWriteRequestLocked(req)
 	if plan.Broadcast {
 		c.broadcastWriteWakeLocked()
+	}
+	if urgentReleased {
+		c.broadcastUrgentWakeLocked()
 	}
 	c.mu.Unlock()
 
@@ -1144,8 +1148,12 @@ func (c *Conn) dispatchPreparedQueueRequest(req *writeRequest, opts preparedQueu
 	advisoryReserved := false
 	if opts.lane.isUrgent() && c.pending.controlNotify != nil {
 		for {
+			var wakeCh <-chan struct{}
 			c.mu.Lock()
 			preflight := c.preflightUrgentWriteRequestLocked(req)
+			if preflight.reservation.blocked() {
+				wakeCh = c.currentUrgentWakeLocked()
+			}
 			c.mu.Unlock()
 			if preflight.closeErr != nil {
 				c.releaseUrgentQueueReservation(req)
@@ -1164,7 +1172,7 @@ func (c *Conn) dispatchPreparedQueueRequest(req *writeRequest, opts preparedQueu
 			select {
 			case <-c.lifecycle.closedCh:
 				return queueVisibleSessionErr(c, c.err())
-			case <-c.pending.controlNotify:
+			case <-wakeCh:
 			}
 		}
 	}
@@ -1258,7 +1266,11 @@ func (c *Conn) refreshPreparedQueueRequestCompletion() (<-chan struct{}, error) 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.pending.controlNotify, c.lifecycle.closeErr
+	notifyCh := c.lifecycle.terminalCh
+	if notifyCh == nil {
+		notifyCh = c.lifecycle.closedCh
+	}
+	return notifyCh, c.lifecycle.closeErr
 }
 
 func (req *writeRequest) carriesOnlyCloseFrames() bool {
@@ -1945,6 +1957,7 @@ func (c *Conn) releaseUrgentQueueReservation(req *writeRequest) {
 	if plan.Broadcast {
 		c.broadcastWriteWakeLocked()
 	}
+	c.broadcastUrgentWakeLocked()
 	if plan.Control {
 		notify(c.pending.controlNotify)
 	}
@@ -2056,6 +2069,9 @@ func (c *Conn) releaseBatchReservations(batch []writeRequest) {
 	if plan.Broadcast {
 		c.broadcastWriteWakeLocked()
 	}
+	if urgentReleased {
+		c.broadcastUrgentWakeLocked()
+	}
 	c.mu.Unlock()
 
 	if plan.Control {
@@ -2078,12 +2094,30 @@ func (c *Conn) currentWriteWakeLocked() <-chan struct{} {
 	return c.signals.writeWakeCh
 }
 
+func (c *Conn) currentUrgentWakeLocked() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	if c.signals.urgentWakeCh == nil {
+		c.signals.urgentWakeCh = make(chan struct{})
+	}
+	return c.signals.urgentWakeCh
+}
+
 func (c *Conn) broadcastWriteWakeLocked() {
 	if c == nil || c.signals.writeWakeCh == nil {
 		return
 	}
 	close(c.signals.writeWakeCh)
 	c.signals.writeWakeCh = make(chan struct{})
+}
+
+func (c *Conn) broadcastUrgentWakeLocked() {
+	if c == nil || c.signals.urgentWakeCh == nil {
+		return
+	}
+	close(c.signals.urgentWakeCh)
+	c.signals.urgentWakeCh = make(chan struct{})
 }
 
 func (c *Conn) clearWriteQueueReservationsLocked() {

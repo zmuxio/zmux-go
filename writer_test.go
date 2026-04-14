@@ -2396,18 +2396,29 @@ func TestFlushPendingControlBatchesMarksTakeErrorFatal(t *testing.T) {
 	c.mu.Unlock()
 
 	fatal, err := c.flushPendingControlBatches()
-	if !fatal {
-		t.Fatal("flushPendingControlBatches fatal = false, want true for take-time memory error")
+	if fatal {
+		t.Fatal("flushPendingControlBatches fatal = true, want silent advisory drop")
 	}
-	if !IsErrorCode(err, CodeInternal) {
-		t.Fatalf("flushPendingControlBatches err = %v, want %s", err, CodeInternal)
+	if err != nil {
+		t.Fatalf("flushPendingControlBatches err = %v, want nil on advisory drop", err)
 	}
 
 	select {
 	case req := <-c.writer.advisoryWriteCh:
-		t.Fatalf("unexpected advisory request dispatched on fatal take error: %+v", req)
+		t.Fatalf("unexpected advisory request dispatched after advisory drop: %+v", req)
 	default:
 	}
+
+	c.mu.Lock()
+	if got := testPendingPriorityUpdateCount(c); got != 0 {
+		c.mu.Unlock()
+		t.Fatalf("pending priority updates after advisory drop = %d, want 0", got)
+	}
+	if got := c.pending.priorityBytes; got != 0 {
+		c.mu.Unlock()
+		t.Fatalf("pendingPriorityBytes after advisory drop = %d, want 0", got)
+	}
+	c.mu.Unlock()
 }
 
 func TestTakePendingUrgentControlRequestLockedLeavesOverflowPending(t *testing.T) {
@@ -3033,6 +3044,102 @@ func TestDispatchPreparedQueueRequestClearsPreparedStateOnClosedBeforeAdmission(
 
 	if req.frames != nil || req.done != nil || req.cloneFramesBeforeSend {
 		t.Fatalf("prepared request state retained after closed admission: frames=%v done=%v clone=%v", req.frames, req.done, req.cloneFramesBeforeSend)
+	}
+}
+
+func TestWaitPreparedQueueRequestDoesNotConsumeControlNotify(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
+		lifecycle: connLifecycleState{closedCh: make(chan struct{}), terminalCh: make(chan struct{})},
+	}
+	req := writeRequest{
+		frames: testTxFramesFrom([]Frame{{
+			Type:    FrameTypePING,
+			Payload: []byte("payload"),
+		}}),
+		done: make(chan error, 1),
+	}
+
+	c.pending.controlNotify <- struct{}{}
+	req.done <- nil
+
+	if err := c.waitPreparedQueueRequest(&req); err != nil {
+		t.Fatalf("waitPreparedQueueRequest err = %v, want nil", err)
+	}
+
+	select {
+	case <-c.pending.controlNotify:
+	default:
+		t.Fatal("waitPreparedQueueRequest consumed conn.controlNotify, want prepared-request wait to leave control-flush signal intact")
+	}
+}
+
+func TestDispatchPreparedQueueRequestUrgentWaitUsesUrgentBroadcastWake(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
+		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1)},
+	}
+
+	req := &writeRequest{
+		frames: testTxFramesFrom([]Frame{{
+			Type:    FrameTypePING,
+			Payload: []byte("payload"),
+		}}),
+	}
+	blockedBytes := c.urgentLaneCapLocked()
+	if blockedBytes == 0 {
+		blockedBytes = 1
+	}
+
+	c.mu.Lock()
+	c.flow.urgentQueuedBytes = blockedBytes
+	c.mu.Unlock()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- c.dispatchPreparedQueueRequest(req, preparedQueueDispatchOptions{lane: writeLaneUrgent})
+	}()
+
+	deadline := time.Now().Add(testSignalTimeout)
+	for {
+		c.mu.Lock()
+		armed := c.signals.urgentWakeCh != nil
+		c.mu.Unlock()
+		if armed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("urgent request did not arm urgent wake while blocked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	c.mu.Lock()
+	c.flow.urgentQueuedBytes = 0
+	c.broadcastUrgentWakeLocked()
+	c.mu.Unlock()
+
+	select {
+	case queued := <-c.writer.urgentWriteCh:
+		if len(queued.frames) != 1 || queued.frames[0].Type != FrameTypePING {
+			t.Fatalf("queued urgent request = %+v, want single PING frame", queued)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("urgent request did not resume after urgent wake broadcast")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("dispatchPreparedQueueRequest err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("dispatchPreparedQueueRequest did not finish after urgent wake broadcast")
 	}
 }
 

@@ -25,8 +25,8 @@ func TestLateDataPerStreamCap(t *testing.T) {
 	if got := LateDataPerStreamCap(1<<20, 16*1024); got != 32*1024 {
 		t.Fatalf("LateDataPerStreamCap(1MiB,16KiB) = %d, want %d", got, 32*1024)
 	}
-	if got := LateDataPerStreamCap(0, 16*1024); got != 0 {
-		t.Fatalf("LateDataPerStreamCap(0,16KiB) = %d, want 0", got)
+	if got := LateDataPerStreamCap(0, 16*1024); got != 1024 {
+		t.Fatalf("LateDataPerStreamCap(0,16KiB) = %d, want 1024", got)
 	}
 }
 

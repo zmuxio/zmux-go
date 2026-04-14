@@ -1515,6 +1515,7 @@ func (c *Conn) failUnopenedLocalStreamLocked(stream *nativeStream, appErr *Appli
 	c.dropLiveStreamLocked(stream.id)
 	c.removeUnseenLocalLocked(stream)
 	notify(c.signals.livenessCh)
+	c.broadcastStateWakeLocked()
 }
 
 func (c *Conn) abortWithCode(streamID uint64, code ErrorCode) error {

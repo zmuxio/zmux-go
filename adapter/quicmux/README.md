@@ -21,6 +21,7 @@ Use `WrapSessionWithOptions` when you need adapter-local tuning:
 ```go
 session := quicmux.WrapSessionWithOptions(qconn, quicmux.SessionOptions{
 	AcceptedPreludeReadTimeout: 2 * time.Second,
+	AcceptedPreludeMaxConcurrent: 4,
 })
 ```
 
@@ -29,6 +30,18 @@ session := quicmux.WrapSessionWithOptions(qconn, quicmux.SessionOptions{
 - `0`: use `quicmux.DefaultAcceptedPreludeReadTimeout`
 - `< 0`: disable the adapter-managed timeout
 - accepted QUIC streams whose adapter prelude never arrives in time are dropped instead of blocking later ready streams
+
+`AcceptedPreludeMaxConcurrent`:
+
+- `0`: use `quicmux.DefaultAcceptedPreludeMaxConcurrent()`
+- `> 0`: per-session upper bound for concurrently parsing accepted adapter preludes
+- accepted prelude parsing is on-demand; idle sessions keep no prelude worker goroutines alive
+
+If you want one process-wide default for many wrapped sessions, set it during process init:
+
+```go
+quicmux.SetDefaultAcceptedPreludeMaxConcurrent(2)
+```
 
 ## Stable API Coverage
 

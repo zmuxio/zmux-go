@@ -151,6 +151,10 @@ func LateDataPerStreamCap(initialStreamWindow, maxFramePayload uint64) uint64 {
 	if windowCap := initialStreamWindow / 8; windowCap < limit {
 		limit = windowCap
 	}
+	const minLateDataPerStreamCap = 1024
+	if limit < minLateDataPerStreamCap {
+		limit = minLateDataPerStreamCap
+	}
 	return limit
 }
 

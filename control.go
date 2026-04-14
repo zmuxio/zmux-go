@@ -917,44 +917,48 @@ func (c *Conn) clearPendingNonCloseControlStateLocked() {
 	c.clearSessionBlockedStateLocked()
 }
 
-func (c *Conn) queueResolvedStreamControlAsync(kind streamControlKind, stream *nativeStream, v uint64, drop func()) {
+func (c *Conn) queueResolvedStreamControlAsync(kind streamControlKind, stream *nativeStream, v uint64, drop func()) bool {
 	if c == nil {
-		return
+		return false
 	}
 	if stream == nil {
 		if drop != nil {
 			drop()
 		}
-		return
+		return false
 	}
 	flush, keep := stream.pendingControlFlushStateLocked(kind)
 	if !flush && !keep {
 		if drop != nil {
 			drop()
 		}
-		return
+		return false
 	}
 	if stream.skipPendingControlQueueLocked(kind, v) {
-		return
+		return true
 	}
 	if !c.setPendingStreamControlLocked(kind, stream.id, v) {
-		return
+		if drop != nil {
+			drop()
+		}
+		return false
 	}
 	stream.notePendingControlQueuedLocked(kind, v)
 	notify(c.pending.controlNotify)
+	return true
 }
 
-func (c *Conn) queueStreamMaxDataAsync(streamID, v uint64) {
+func (c *Conn) queueStreamMaxDataAsync(streamID, v uint64) bool {
 	if !c.ensurePendingNonCloseControlLocked() {
-		return
+		return false
 	}
 	v = clampVarint62(v)
 	stream := c.registry.streams[streamID]
 	if !streamMatchesID(stream, streamID) {
 		c.clearPendingStreamControlEntryLocked(streamControlMaxData, streamID)
-		return
+		return false
 	}
-	c.queueResolvedStreamControlAsync(streamControlMaxData, stream, v, func() {
+	return c.queueResolvedStreamControlAsync(streamControlMaxData, stream, v, func() {
 		c.clearPendingStreamControlEntryLocked(streamControlMaxData, streamID)
 	})
 }
@@ -1114,6 +1118,52 @@ func (c *Conn) queuePendingSessionControlAsync(kind sessionControlKind, v uint64
 	if kind == sessionControlBlocked {
 		c.markSessionBlockedStateLocked(v)
 	}
+	notify(c.pending.controlNotify)
+	return true
+}
+
+func (c *Conn) ensurePendingSessionMaxDataLocked(v uint64) bool {
+	if c == nil || !c.ensurePendingNonCloseControlLocked() {
+		return false
+	}
+	v = clampVarint62(v)
+	current := c.pendingSessionControlValueLocked(sessionControlMaxData)
+	if current.present && v <= current.value {
+		return true
+	}
+	if !c.setPendingSessionControlLocked(sessionControlMaxData, v) {
+		return false
+	}
+	notify(c.pending.controlNotify)
+	return true
+}
+
+func (c *Conn) ensurePendingStreamMaxDataLocked(stream *nativeStream, v uint64) bool {
+	if c == nil || stream == nil || !c.ensurePendingNonCloseControlLocked() {
+		return false
+	}
+	if !stream.idSet {
+		return false
+	}
+	v = clampVarint62(v)
+	live := c.registry.streams[stream.id]
+	if !streamMatchesID(live, stream.id) {
+		c.clearPendingStreamControlEntryLocked(streamControlMaxData, stream.id)
+		return false
+	}
+	stream = live
+	flush, keep := stream.pendingControlFlushStateLocked(streamControlMaxData)
+	if !flush && !keep {
+		c.clearPendingStreamControlEntryLocked(streamControlMaxData, stream.id)
+		return false
+	}
+	if stream.skipPendingControlQueueLocked(streamControlMaxData, v) {
+		return true
+	}
+	if !c.setPendingStreamControlLocked(streamControlMaxData, stream.id, v) {
+		return false
+	}
+	stream.notePendingControlQueuedLocked(streamControlMaxData, v)
 	notify(c.pending.controlNotify)
 	return true
 }
@@ -1333,43 +1383,41 @@ func (c *Conn) takePendingPriorityUpdateRequestLocked() pendingWriteRequestResul
 		return pendingWriteRequestResult{}
 	}
 	c.ensurePendingPriorityUpdateQueueLocked()
-	if c.pendingPriorityQueueCountLocked() == 0 {
-		return pendingWriteRequestResult{}
-	}
+	for c.pendingPriorityQueueCountLocked() > 0 {
+		var flushIDs [maxWriteBatchFrames]uint64
+		var chunkBuf [maxWriteBatchFrames]txFrame
+		prevTracked := c.trackedSessionMemoryLocked()
+		batch := c.collectPendingPriorityUpdateBatchLocked(flushIDs[:0], chunkBuf[:0], maxWriteBatchFrames)
+		if len(batch.ids) == 0 {
+			c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(batch.released))
+			return pendingWriteRequestResult{}
+		}
 
-	var flushIDs [maxWriteBatchFrames]uint64
-	var chunkBuf [maxWriteBatchFrames]txFrame
-	prevTracked := c.trackedSessionMemoryLocked()
-	batch := c.collectPendingPriorityUpdateBatchLocked(flushIDs[:0], chunkBuf[:0], maxWriteBatchFrames)
-	if len(batch.ids) == 0 {
-		c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(batch.released))
-		return pendingWriteRequestResult{}
-	}
+		plan := rt.PlanPriorityAdvisoryHandoff(c.trackedSessionMemoryLocked(), batch.removedPendingBytes, batch.queuedBytes, c.sessionMemoryHardCapLocked())
+		released := batch.released
+		if !plan.Accept {
+			for _, id := range batch.ids {
+				if c.dropPendingPriorityUpdateEntryLocked(id) {
+					released = true
+				}
+			}
+			c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
+			continue
+		}
 
-	plan := rt.PlanPriorityAdvisoryHandoff(c.trackedSessionMemoryLocked(), batch.removedPendingBytes, batch.queuedBytes, c.sessionMemoryHardCapLocked())
-	if !plan.Accept {
-		c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(batch.released))
+		for _, id := range batch.ids {
+			if c.dropPendingPriorityUpdateEntryLocked(id) {
+				released = true
+			}
+		}
+		c.flow.advisoryQueuedBytes = saturatingAdd(c.flow.advisoryQueuedBytes, batch.queuedBytes)
+		c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
 		return pendingWriteRequestResult{
-			err: wireError(
-				CodeInternal,
-				"queue advisory control",
-				fmt.Errorf("session memory cap exceeded: tracked=%d cap=%d", plan.ProjectedTracked, c.sessionMemoryHardCapLocked()),
-			),
+			request: buildPendingControlWriteRequest(batch.frames, batch.queuedBytes, writeLaneAdvisory),
+			ready:   true,
 		}
 	}
-
-	released := batch.released
-	for _, id := range batch.ids {
-		if c.dropPendingPriorityUpdateEntryLocked(id) {
-			released = true
-		}
-	}
-	c.flow.advisoryQueuedBytes = saturatingAdd(c.flow.advisoryQueuedBytes, batch.queuedBytes)
-	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
-	return pendingWriteRequestResult{
-		request: buildPendingControlWriteRequest(batch.frames, batch.queuedBytes, writeLaneAdvisory),
-		ready:   true,
-	}
+	return pendingWriteRequestResult{}
 }
 
 const minPendingPriorityBudget = 64 << 10

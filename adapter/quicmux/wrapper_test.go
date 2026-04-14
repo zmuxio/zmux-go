@@ -466,10 +466,12 @@ func TestWrapSessionConcurrentAcceptStreamAllowsReadyStreamsToBypassStalledPrelu
 }
 
 func TestWrapSessionAcceptLoopBoundsConcurrentPreludePreparation(t *testing.T) {
+	limit := 3
 	clientConn, serverConn := newQUICConnPair(t)
 	countedServerConn := &countingSessionConn{SessionConn: serverConn}
 	serverSession := WrapSessionWithOptions(countedServerConn, SessionOptions{
-		AcceptedPreludeReadTimeout: -1,
+		AcceptedPreludeReadTimeout:   -1,
+		AcceptedPreludeMaxConcurrent: limit,
 	})
 	serverAdapter, _ := serverSession.(*quicSession)
 	if serverAdapter == nil {
@@ -480,8 +482,8 @@ func TestWrapSessionAcceptLoopBoundsConcurrentPreludePreparation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	streams := make([]*quic.Stream, 0, acceptedPreludePrepareWorkers+8)
-	for i := 0; i < acceptedPreludePrepareWorkers+8; i++ {
+	streams := make([]*quic.Stream, 0, limit+8)
+	for i := 0; i < limit+8; i++ {
 		stream, err := clientConn.OpenStreamSync(ctx)
 		if err != nil {
 			t.Fatalf("OpenStreamSync %d err = %v", i, err)
@@ -502,19 +504,42 @@ func TestWrapSessionAcceptLoopBoundsConcurrentPreludePreparation(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if countedServerConn.bidiAcceptCount() >= acceptedPreludePrepareWorkers {
+		if len(serverAdapter.prepareSem) == limit {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if got := countedServerConn.bidiAcceptCount(); got < acceptedPreludePrepareWorkers {
-		t.Fatalf("accepted bidi stream count = %d, want at least %d active worker handoffs", got, acceptedPreludePrepareWorkers)
+	if got := len(serverAdapter.prepareSem); got != limit {
+		t.Fatalf("accepted prelude prepare slots in use = %d, want %d", got, limit)
 	}
 
 	time.Sleep(150 * time.Millisecond)
-	if got := countedServerConn.bidiAcceptCount(); got > acceptedPreludePrepareWorkers+1 {
-		t.Fatalf("accepted bidi stream count = %d, want at most %d with fixed prelude worker pool", got, acceptedPreludePrepareWorkers+1)
+	if got := len(serverAdapter.prepareSem); got != limit {
+		t.Fatalf("accepted prelude prepare slots after wait = %d, want still %d while stalled preludes occupy all slots", got, limit)
+	}
+	if got := countedServerConn.bidiAcceptCount(); got > limit+1 {
+		t.Fatalf("accepted bidi stream count = %d, want at most %d while prepare slots are saturated", got, limit+1)
+	}
+}
+
+func TestNormalizeAcceptedPreludeMaxConcurrent(t *testing.T) {
+	previous := DefaultAcceptedPreludeMaxConcurrent()
+	SetDefaultAcceptedPreludeMaxConcurrent(0)
+	t.Cleanup(func() {
+		SetDefaultAcceptedPreludeMaxConcurrent(previous)
+	})
+
+	if got := normalizeAcceptedPreludeMaxConcurrent(0); got != defaultAcceptedPreludeMaxConcurrent {
+		t.Fatalf("normalizeAcceptedPreludeMaxConcurrent(0) = %d, want %d", got, defaultAcceptedPreludeMaxConcurrent)
+	}
+
+	SetDefaultAcceptedPreludeMaxConcurrent(5)
+	if got := normalizeAcceptedPreludeMaxConcurrent(0); got != 5 {
+		t.Fatalf("normalizeAcceptedPreludeMaxConcurrent(0) after default override = %d, want 5", got)
+	}
+	if got := normalizeAcceptedPreludeMaxConcurrent(2); got != 2 {
+		t.Fatalf("normalizeAcceptedPreludeMaxConcurrent(2) = %d, want 2", got)
 	}
 }
 

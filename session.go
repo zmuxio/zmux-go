@@ -1206,7 +1206,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		sessionErr := closeSessionStreamErr(c.lifecycle.sessionState, err)
 		c.releaseAllStreamsForSessionCloseLocked(sessionErr)
 		c.closeTerminalChLocked()
-		c.notifyAcceptControlAndLiveness()
+		c.notifyAcceptControlAndLivenessLocked()
 		c.mu.Unlock()
 
 		if emitCloseFrame {
@@ -1919,21 +1919,13 @@ func (c *Conn) waitForLocalGoAwaySend(lastAcceptedBidi, lastAcceptedUni uint64) 
 				return sessionOperationErrLocked(c, OperationClose, err)
 			}
 		}
-		controlNotify := c.pending.controlNotify
+		stateWakeCh := c.currentStateWakeLocked()
 		closedCh := c.lifecycle.closedCh
 		c.mu.Unlock()
 
-		if controlNotify == nil {
-			if closedCh == nil {
-				return ErrSessionClosed
-			}
-			<-closedCh
-			continue
-		}
-
 		select {
 		case <-closedCh:
-		case <-controlNotify:
+		case <-stateWakeCh:
 		}
 	}
 }
@@ -2030,13 +2022,13 @@ func (c *Conn) waitForGracefulCloseDrain(timeout time.Duration) error {
 			c.mu.Unlock()
 			return nil
 		}
-		livenessCh := c.ensureLivenessNotifyLocked()
+		stateWakeCh := c.currentStateWakeLocked()
 		closedCh := c.lifecycle.closedCh
 		c.mu.Unlock()
 
 		select {
 		case <-closedCh:
-		case <-livenessCh:
+		case <-stateWakeCh:
 		case <-timer.C:
 			return ErrGracefulCloseTimeout
 		}
@@ -2369,6 +2361,8 @@ type connLifecycleState struct {
 
 type connRuntimeSignalState struct {
 	writeWakeCh  chan struct{}
+	urgentWakeCh chan struct{}
+	stateWakeCh  chan struct{}
 	acceptCh     chan struct{}
 	acceptBidiCh chan struct{}
 	acceptUniCh  chan struct{}
@@ -2583,6 +2577,24 @@ func (c *Conn) ensureLivenessNotifyLocked() chan struct{} {
 	return ensureNotifyChan(&c.signals.livenessCh)
 }
 
+func (c *Conn) currentStateWakeLocked() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	if c.signals.stateWakeCh == nil {
+		c.signals.stateWakeCh = make(chan struct{})
+	}
+	return c.signals.stateWakeCh
+}
+
+func (c *Conn) broadcastStateWakeLocked() {
+	if c == nil || c.signals.stateWakeCh == nil {
+		return
+	}
+	close(c.signals.stateWakeCh)
+	c.signals.stateWakeCh = make(chan struct{})
+}
+
 func (c *Conn) ensureAcceptNotifyLocked(arity streamArity) chan struct{} {
 	if c == nil {
 		return nil
@@ -2600,16 +2612,28 @@ func (c *Conn) notifyControlAndLiveness() {
 	}
 	notify(c.pending.controlNotify)
 	notify(c.signals.livenessCh)
+	c.mu.Lock()
+	c.broadcastStateWakeLocked()
+	c.mu.Unlock()
 }
 
-func (c *Conn) notifyAcceptControlAndLiveness() {
+func (c *Conn) notifyControlAndLivenessLocked() {
+	if c == nil {
+		return
+	}
+	notify(c.pending.controlNotify)
+	notify(c.signals.livenessCh)
+	c.broadcastStateWakeLocked()
+}
+
+func (c *Conn) notifyAcceptControlAndLivenessLocked() {
 	if c == nil {
 		return
 	}
 	notify(c.signals.acceptCh)
 	notify(c.signals.acceptBidiCh)
 	notify(c.signals.acceptUniCh)
-	c.notifyControlAndLiveness()
+	c.notifyControlAndLivenessLocked()
 }
 
 func (c *Conn) clearSessionBlockedStateLocked() {
@@ -4348,6 +4372,7 @@ func (c *Conn) removeProvisionalLocked(stream *nativeStream) bool {
 	queue.compact(provisionalQueueShouldCompact, streamQueueEntryNonNil)
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleased)
 	notify(c.signals.livenessCh)
+	c.broadcastStateWakeLocked()
 	return true
 }
 
@@ -4620,6 +4645,7 @@ func (c *Conn) maybeFinalizePeerActiveLocked(stream *nativeStream) {
 	}
 	c.maybeCompactTerminalLocked(stream)
 	notify(c.signals.livenessCh)
+	c.broadcastStateWakeLocked()
 }
 
 func shouldTrackUnseenLocalStream(stream *nativeStream) bool {

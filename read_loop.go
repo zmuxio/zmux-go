@@ -1195,8 +1195,12 @@ func (c *Conn) releaseReceiveLocked(stream *nativeStream, n uint64) {
 		sessionN = c.flow.recvSessionUsed
 	}
 	c.flow.recvSessionUsed -= sessionN
-	c.flow.recvSessionAdvertised = clampVarint62(rt.SaturatingAdd(c.flow.recvSessionAdvertised, sessionN))
-	c.queuePendingSessionControlAsync(sessionControlMaxData, clampVarint62(c.flow.recvSessionAdvertised))
+	sessionDesired := clampVarint62(rt.SaturatingAdd(c.flow.recvSessionAdvertised, sessionN))
+	if c.ensurePendingSessionMaxDataLocked(sessionDesired) {
+		c.flow.recvSessionAdvertised = sessionDesired
+	} else {
+		c.flow.recvSessionPending = saturatingAdd(c.flow.recvSessionPending, sessionN)
+	}
 
 	if stream == nil {
 		c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(sessionN > 0))
@@ -1212,13 +1216,13 @@ func (c *Conn) releaseReceiveLocked(stream *nativeStream, n uint64) {
 	}
 	c.releaseAcceptQueuedBytesLocked(stream, streamN)
 	stream.recvBuffer = csub(stream.recvBuffer, streamN)
-	if stream.recvAdvertised == 0 {
-		c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(sessionN > 0))
-		return
-	}
 	if stream.localReceive && !stream.readStopSentLocked() && !state.RecvTerminal(stream.effectiveRecvHalfStateLocked()) {
-		stream.recvAdvertised = clampVarint62(rt.SaturatingAdd(stream.recvAdvertised, streamN))
-		c.queueStreamMaxDataAsync(stream.id, stream.recvAdvertised)
+		streamDesired := clampVarint62(rt.SaturatingAdd(stream.recvAdvertised, streamN))
+		if c.queueStreamMaxDataAsync(stream.id, streamDesired) {
+			stream.recvAdvertised = streamDesired
+		} else {
+			stream.recvPending = saturatingAdd(stream.recvPending, streamN)
+		}
 	}
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(sessionN > 0))
 }
@@ -1227,8 +1231,12 @@ func (c *Conn) releaseLateDiscardLocked(stream *nativeStream, n uint64, cause la
 	if n == 0 {
 		return
 	}
-	c.flow.recvSessionAdvertised = clampVarint62(rt.SaturatingAdd(c.flow.recvSessionAdvertised, n))
-	c.queuePendingSessionControlAsync(sessionControlMaxData, clampVarint62(c.flow.recvSessionAdvertised))
+	sessionDesired := clampVarint62(rt.SaturatingAdd(c.flow.recvSessionAdvertised, n))
+	if c.ensurePendingSessionMaxDataLocked(sessionDesired) {
+		c.flow.recvSessionAdvertised = sessionDesired
+	} else {
+		c.flow.recvSessionPending = saturatingAdd(c.flow.recvSessionPending, n)
+	}
 	c.ingress.aggregateLateData = rt.SaturatingAdd(c.ingress.aggregateLateData, n)
 	c.recordLateDiscardCauseLocked(cause, n)
 	if stream != nil {
@@ -1588,9 +1596,11 @@ func (c *Conn) replenishSessionLocked(target uint64) {
 		}
 	}
 	desired = clampVarint62(desired)
+	if !c.ensurePendingSessionMaxDataLocked(desired) {
+		return
+	}
 	c.flow.recvSessionAdvertised = desired
 	c.flow.recvSessionPending = 0
-	c.queuePendingSessionControlAsync(sessionControlMaxData, clampVarint62(c.flow.recvSessionAdvertised))
 }
 
 func (c *Conn) maybeReplenishStreamLocked(stream *nativeStream) {
@@ -1630,9 +1640,11 @@ func (c *Conn) replenishStreamLocked(stream *nativeStream, target uint64) {
 		}
 	}
 	desired = clampVarint62(desired)
+	if !c.ensurePendingStreamMaxDataLocked(stream, desired) {
+		return
+	}
 	stream.recvAdvertised = desired
 	stream.recvPending = 0
-	c.queueStreamMaxDataAsync(stream.id, stream.recvAdvertised)
 }
 
 func (c *Conn) sessionWindowTargetLocked() uint64 {
