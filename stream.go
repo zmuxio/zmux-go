@@ -192,13 +192,6 @@ func (s *nativeSendStream) Reset(code uint64) error {
 	return s.stream.Reset(code)
 }
 
-func (s *nativeSendStream) ResetWithReason(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.ResetWithReason(code, reason)
-}
-
 func (s *nativeSendStream) CloseWithError(err error) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
@@ -211,27 +204,6 @@ func (s *nativeSendStream) CloseWithErrorCode(code uint64, reason string) error 
 		return ErrSessionClosed
 	}
 	return s.stream.CloseWithErrorCode(code, reason)
-}
-
-func (s *nativeSendStream) Abort() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.Abort()
-}
-
-func (s *nativeSendStream) AbortWithError(err error) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.AbortWithError(err)
-}
-
-func (s *nativeSendStream) AbortWithErrorCode(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.AbortWithErrorCode(code, reason)
 }
 
 func (s *nativeSendStream) Close() error {
@@ -327,27 +299,6 @@ func (s *nativeRecvStream) CloseWithErrorCode(code uint64, reason string) error 
 		return ErrSessionClosed
 	}
 	return s.stream.CloseWithErrorCode(code, reason)
-}
-
-func (s *nativeRecvStream) Abort() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.Abort()
-}
-
-func (s *nativeRecvStream) AbortWithError(err error) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.AbortWithError(err)
-}
-
-func (s *nativeRecvStream) AbortWithErrorCode(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.AbortWithErrorCode(code, reason)
 }
 
 func (s *nativeRecvStream) Close() error {
@@ -1481,13 +1432,6 @@ func (s *nativeStream) Reset(code uint64) error {
 	})
 }
 
-func (s *nativeStream) ResetWithReason(code uint64, reason string) error {
-	return s.executeTerminalSignal(terminalSignalReset, code, reason, terminalSignalOptions{
-		openerPolicy: terminalOpenerRejectUnopened,
-		resetSource:  terminalResetDirect,
-	})
-}
-
 func (s *nativeStream) resetAfterStopSending(code uint64) error {
 	return s.executeTerminalSignal(terminalSignalReset, code, "", terminalSignalOptions{
 		openerPolicy: terminalOpenerAllow,
@@ -1551,10 +1495,6 @@ func (s *nativeStream) Close() error {
 	return nil
 }
 
-func (s *nativeStream) Abort() error {
-	return s.CloseWithErrorCode(uint64(CodeCancelled), "")
-}
-
 func (s *nativeStream) CloseWithError(err error) error {
 	if err == nil {
 		return s.CloseWithErrorCode(uint64(CodeNoError), "")
@@ -1570,14 +1510,6 @@ func (s *nativeStream) CloseWithErrorCode(code uint64, reason string) error {
 	return s.executeTerminalSignal(terminalSignalAbort, code, reason, terminalSignalOptions{
 		openerPolicy: terminalOpenerAllow,
 	})
-}
-
-func (s *nativeStream) AbortWithError(err error) error {
-	return s.CloseWithError(err)
-}
-
-func (s *nativeStream) AbortWithErrorCode(code uint64, reason string) error {
-	return s.CloseWithErrorCode(code, reason)
 }
 
 func (p terminalFramePlan) queue(s *nativeStream, opts queuedWriteOptions, commit queuedWriteCommit, rollback terminalFrameRollbackKind) error {

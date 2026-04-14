@@ -1542,7 +1542,7 @@ func runInvalidLocalProvisionalOpenCancelMustNotBurnID(t *testing.T) error {
 	if err != nil {
 		return err
 	}
-	if err := first.AbortWithErrorCode(uint64(CodeCancelled), ""); err != nil {
+	if err := first.CloseWithErrorCode(uint64(CodeCancelled), ""); err != nil {
 		return err
 	}
 	if got := first.StreamID(); got != 0 {

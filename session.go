@@ -58,8 +58,7 @@ const (
 	// becomes commit-visible for on-wire operations.
 	// The event is emitted once per stream when local stream metadata is
 	// successfully committed for the first time, including commit attempts via
-	// Write, CloseWrite, CloseRead, and opening-terminal CloseWithError/Abort
-	// paths.
+	// Write, CloseWrite, CloseRead, and opening-terminal CloseWithError paths.
 	EventStreamOpened EventType = iota + 1
 	// EventStreamAccepted is emitted when a peer-opened stream is returned from
 	// AcceptStream / AcceptUniStream.
@@ -594,7 +593,6 @@ type DiagnosticStats struct {
 	CloseFrameAdmissionTimeouts uint64
 	CloseFrameFlushTimeouts     uint64
 	CloseFrameFlushErrors       uint64
-	ProtocolBacklogClose        uint64
 	ProtocolBacklogBlocked      uint64
 	MarkerOnlyRangeCount        int
 }
@@ -920,7 +918,6 @@ func (c *Conn) Stats() SessionStats {
 			CloseFrameAdmissionTimeouts: c.metrics.closeFrameAdmissionTO,
 			CloseFrameFlushTimeouts:     c.metrics.closeFrameFlushTO,
 			CloseFrameFlushErrors:       c.metrics.closeFrameFlushErr,
-			ProtocolBacklogClose:        c.metrics.protocolBacklogClose,
 			ProtocolBacklogBlocked:      c.metrics.protocolBacklogBlocked,
 			MarkerOnlyRangeCount:        c.markerOnlyRangeCountLocked(),
 		},
@@ -1017,6 +1014,10 @@ func (c *Conn) Close() error {
 			gracefulClose = true
 			gracefulErr = err
 			c.closeSessionWithOptions(nil, closeOriginApp, closeFrameDefault)
+		} else {
+			c.Abort(err)
+			_ = c.Wait(context.Background())
+			return closeOperationErr(c, err)
 		}
 	}
 
@@ -1203,6 +1204,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		c.clearHiddenTombstonesLocked()
 		c.registry.usedStreamData = nil
 		c.registry.usedStreamRanges = nil
+		c.registry.usedStreamRangeMode = false
 		c.mu.Unlock()
 		if c != nil && c.observer.eventHandler != nil {
 			c.emitEvent(Event{
@@ -1430,7 +1432,11 @@ func (c *Conn) emitCloseFrame(payload []byte) closeFrameSendResult {
 			c.mu.Unlock()
 		}
 	case <-c.lifecycle.closedCh:
-		result.err = c.err()
+		if err := c.err(); err != nil {
+			result.err = err
+		} else {
+			result.err = ErrSessionClosed
+		}
 	case <-timer.C:
 		result.timedOut = true
 		c.mu.Lock()
@@ -1638,8 +1644,11 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 		return nil
 	}
 	var drainErr error
+	c.mu.Lock()
+	closeFrameOutstanding := c.closeFrameOutstandingLocked()
+	c.mu.Unlock()
 
-	if initialPolicy.sendsInitial() {
+	if initialPolicy.sendsInitial() && !closeFrameOutstanding {
 		if err := c.GoAway(initialBidi, initialUni); err != nil {
 			return err
 		}
@@ -1659,9 +1668,10 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	finalBidi := minGoAwayWatermark(c.sessionControl.localGoAwayBidi, acceptedPeerGoAwayWatermark(c.config.negotiated.LocalRole, streamArityBidi, c.registry.nextPeerBidi))
 	finalUni := minGoAwayWatermark(c.sessionControl.localGoAwayUni, acceptedPeerGoAwayWatermark(c.config.negotiated.LocalRole, streamArityUni, c.registry.nextPeerUni))
 	currentBidi, currentUni := c.sessionControl.localGoAwayBidi, c.sessionControl.localGoAwayUni
+	closeFrameOutstanding = closeFrameOutstanding || c.closeFrameOutstandingLocked()
 	c.mu.Unlock()
 
-	if finalBidi != currentBidi || finalUni != currentUni {
+	if !closeFrameOutstanding && (finalBidi != currentBidi || finalUni != currentUni) {
 		if err := c.GoAway(finalBidi, finalUni); err != nil {
 			return err
 		}
@@ -1689,9 +1699,9 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	}
 	c.beginSessionClosingLocked()
 	c.shutdown.gracefulCloseActive = false
-	if c.closeFrameOutstandingLocked() {
+	if closeFrameOutstanding || c.closeFrameOutstandingLocked() {
 		c.mu.Unlock()
-		return nil
+		return drainErr
 	}
 	c.shutdown.closeFramePending = true
 	c.mu.Unlock()
@@ -2066,8 +2076,9 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 	}
 	c := &Conn{
 		io: connIOState{
-			conn:   conn,
-			reader: reader,
+			conn:            conn,
+			reader:          reader,
+			scatterGatherOK: transportSupportsScatterGather(conn),
 		},
 		config: connConfigState{
 			local:       local,
@@ -2240,7 +2251,6 @@ type connRuntimeMetricsState struct {
 	coalescedTerminalSignals  uint64
 	droppedSupersededControls uint64
 	skippedCloseOnDeadIO      uint64
-	protocolBacklogClose      uint64
 	protocolBacklogBlocked    uint64
 	closeFrameAdmissionTO     uint64
 	closeFrameFlushTO         uint64
@@ -2313,8 +2323,9 @@ type connRuntimeSignalState struct {
 }
 
 type connIOState struct {
-	conn   io.ReadWriteCloser
-	reader *bufio.Reader
+	conn            io.ReadWriteCloser
+	reader          *bufio.Reader
+	scatterGatherOK bool
 }
 
 type connObserverState struct {
@@ -2439,6 +2450,7 @@ type connRegistryState struct {
 	hiddenTombstoneOrder []uint64
 	usedStreamData       map[uint64]usedStreamMarker
 	usedStreamRanges     []usedStreamRange
+	usedStreamRangeMode  bool
 	tombstoneLimit       int
 	hiddenTombstonesInit bool
 

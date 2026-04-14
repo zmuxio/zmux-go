@@ -25,9 +25,6 @@ type Stream interface {
 	Reset(code uint64) error
 	CloseWithError(err error) error
 	CloseWithErrorCode(code uint64, reason string) error
-	Abort() error
-	AbortWithError(err error) error
-	AbortWithErrorCode(code uint64, reason string) error
 }
 
 // SendStream defines the repository-default send-only stream surface.
@@ -46,9 +43,6 @@ type SendStream interface {
 	Reset(code uint64) error
 	CloseWithError(err error) error
 	CloseWithErrorCode(code uint64, reason string) error
-	Abort() error
-	AbortWithError(err error) error
-	AbortWithErrorCode(code uint64, reason string) error
 	SetDeadline(t time.Time) error
 	SetWriteDeadline(t time.Time) error
 }
@@ -66,9 +60,6 @@ type RecvStream interface {
 	CloseReadWithCode(code uint64) error
 	CloseWithError(err error) error
 	CloseWithErrorCode(code uint64, reason string) error
-	Abort() error
-	AbortWithError(err error) error
-	AbortWithErrorCode(code uint64, reason string) error
 	SetDeadline(t time.Time) error
 	SetReadDeadline(t time.Time) error
 }
@@ -87,6 +78,7 @@ type Session interface {
 	OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (Stream, int, error)
 	OpenUniAndSend(ctx context.Context, p []byte) (SendStream, int, error)
 	OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, p []byte) (SendStream, int, error)
+	Abort(err error)
 	Wait(ctx context.Context) error
 	Closed() bool
 	State() SessionState
@@ -222,6 +214,13 @@ func (s nativeSession) Close() error {
 		return ErrSessionClosed
 	}
 	return s.conn.Close()
+}
+
+func (s nativeSession) Abort(err error) {
+	if s.conn == nil {
+		return
+	}
+	s.conn.Abort(err)
 }
 
 func (s nativeSession) Wait(ctx context.Context) error {

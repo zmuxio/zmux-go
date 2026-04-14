@@ -146,7 +146,7 @@ func TestSessionConstructorsRejectNilConn(t *testing.T) {
 	})
 }
 
-func TestStableSessionInterfacesExposeDocumentedAbortiveSurface(t *testing.T) {
+func TestStableSessionInterfacesExposeDocumentedSurface(t *testing.T) {
 	t.Parallel()
 
 	client, server := newConnPair(t)
@@ -202,30 +202,24 @@ func TestStableSessionInterfacesExposeDocumentedAbortiveSurface(t *testing.T) {
 	}
 	defer func() { _ = acceptedRecv.stream.Close() }()
 
+	type sessionSurface interface{ Abort(err error) }
 	type streamSurface interface {
 		CloseReadWithCode(code uint64) error
 		CloseWithError(err error) error
 		CloseWithErrorCode(code uint64, reason string) error
-		Abort() error
-		AbortWithError(err error) error
-		AbortWithErrorCode(code uint64, reason string) error
 	}
 	type sendSurface interface {
 		CloseWithError(err error) error
 		CloseWithErrorCode(code uint64, reason string) error
-		Abort() error
-		AbortWithError(err error) error
-		AbortWithErrorCode(code uint64, reason string) error
 	}
 	type recvSurface interface {
 		CloseReadWithCode(code uint64) error
 		CloseWithError(err error) error
 		CloseWithErrorCode(code uint64, reason string) error
-		Abort() error
-		AbortWithError(err error) error
-		AbortWithErrorCode(code uint64, reason string) error
 	}
 
+	var _ sessionSurface = clientSession
+	var _ sessionSurface = serverSession
 	var _ streamSurface = bidi
 	var _ streamSurface = acceptedBidi.stream
 	var _ sendSurface = send

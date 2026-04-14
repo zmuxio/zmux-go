@@ -2223,7 +2223,7 @@ func TestEventStreamOpenedByAbortWithError(t *testing.T) {
 	client.appendUnseenLocalLocked(stream)
 	client.mu.Unlock()
 
-	if err := stream.AbortWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
+	if err := stream.CloseWithErrorCode(uint64(CodeInternal), "bye"); err != nil {
 		t.Fatalf("close with error: %v", err)
 	}
 
@@ -2803,6 +2803,26 @@ func TestCloseWithoutOpenStreamsOnlySendsClose(t *testing.T) {
 		t.Fatalf("close frame stream-id = %d, want 0", frame.StreamID)
 	}
 	assertNoQueuedFrame(t, frames)
+}
+
+func TestCloseWithOutstandingCloseFrameStillReturnsDrainTimeout(t *testing.T) {
+	t.Parallel()
+
+	c, _, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	streamID := state.FirstLocalStreamID(c.config.negotiated.LocalRole, true)
+	stream := c.newLocalStreamWithIDLocked(streamID, streamArityBidi, OpenOptions{}, nil)
+	stream.idSet = true
+	testMarkLocalOpenVisible(stream)
+	c.registry.streams[streamID] = stream
+	c.shutdown.closeFramePending = true
+	c.mu.Unlock()
+
+	if err := c.closeWithGoAwayAndClose(goAwayInitialSkip, 0, 0); !errors.Is(err, ErrGracefulCloseTimeout) {
+		t.Fatalf("closeWithGoAwayAndClose() = %v, want %v", err, ErrGracefulCloseTimeout)
+	}
 }
 
 func TestCloseStartsByClosingLocalAdmission(t *testing.T) {
@@ -8056,7 +8076,7 @@ func TestDuplicateAbortIgnored(t *testing.T) {
 		t.Fatalf("server read: %v", err)
 	}
 
-	if err := clientStream.AbortWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
+	if err := clientStream.CloseWithErrorCode(uint64(CodeRefusedStream), "no"); err != nil {
 		t.Fatalf("client abort: %v", err)
 	}
 
@@ -8836,7 +8856,7 @@ func TestStreamTerminalOpsReturnPeerCloseErrorWhenSessionClosedWithoutRuntimeClo
 		},
 		{
 			name: "CloseWithError",
-			fn:   func() error { return stream.AbortWithErrorCode(uint64(CodeProtocol), "protocol") },
+			fn:   func() error { return stream.CloseWithErrorCode(uint64(CodeProtocol), "protocol") },
 		},
 		{
 			name: "Close",
@@ -11200,7 +11220,7 @@ func TestPrecommitAbortDoesNotConsumeFirstStreamID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open first stream: %v", err)
 	}
-	if err := first.AbortWithErrorCode(uint64(CodeCancelled), ""); err != nil {
+	if err := first.CloseWithErrorCode(uint64(CodeCancelled), ""); err != nil {
 		t.Fatalf("abort provisional stream: %v", err)
 	}
 	if got := first.StreamID(); got != 0 {
@@ -12339,7 +12359,7 @@ func TestLaterProvisionalWriteUsesFirstIDAfterEarlierCancel(t *testing.T) {
 	}
 	assertNoQueuedFrame(t, frames)
 
-	if err := first.AbortWithErrorCode(uint64(CodeCancelled), ""); err != nil {
+	if err := first.CloseWithErrorCode(uint64(CodeCancelled), ""); err != nil {
 		t.Fatalf("cancel first provisional: %v", err)
 	}
 	assertNoQueuedFrame(t, frames)
@@ -19507,7 +19527,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		}
 		return e.seedConcreteLocalStream(opts, prefix).CloseWrite()
 	case "local_concrete_id_close_with_error":
-		return e.seedConcreteLocalStream(OpenOptions{}, nil).AbortWithErrorCode(uint64(CodeInternal), "bye")
+		return e.seedConcreteLocalStream(OpenOptions{}, nil).CloseWithErrorCode(uint64(CodeInternal), "bye")
 	case "local_Close":
 		return e.conn.Close()
 	case "repeat_noop_session_BLOCKED_threshold_plus_one":
@@ -22754,7 +22774,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		}
 		e.stream = stream
 		e.streamID = state.FirstLocalStreamID(e.conn.config.negotiated.LocalRole, true)
-		return stream.AbortWithErrorCode(uint64(CodeCancelled), "")
+		return stream.CloseWithErrorCode(uint64(CodeCancelled), "")
 	case "next_local_open_commits_first_frame":
 		ctx := context.Background()
 		stream, err := e.conn.OpenStream(ctx)

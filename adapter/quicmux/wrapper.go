@@ -178,6 +178,14 @@ func (s *quicSession) Close() error {
 	return translateError(s.conn.CloseWithError(0, ""))
 }
 
+func (s *quicSession) Abort(err error) {
+	if s == nil || s.conn == nil {
+		return
+	}
+	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
+	_ = s.conn.CloseWithError(quic.ApplicationErrorCode(code), reason)
+}
+
 func (s *quicSession) Wait(ctx context.Context) error {
 	if s == nil || s.conn == nil {
 		return zmux.ErrSessionClosed
@@ -645,10 +653,10 @@ func (s *quicStream) CloseWrite() error {
 	if s.localWriteClosed.Load() {
 		return zmux.ErrWriteClosed
 	}
+	s.localWriteClosed.Store(true)
 	if err := translateError(s.stream.Close()); err != nil {
 		return err
 	}
-	s.localWriteClosed.Store(true)
 	return nil
 }
 
@@ -763,10 +771,10 @@ func (s *quicSendStream) CloseWrite() error {
 	if s.localWriteClosed.Load() {
 		return zmux.ErrWriteClosed
 	}
+	s.localWriteClosed.Store(true)
 	if err := translateError(s.stream.Close()); err != nil {
 		return err
 	}
-	s.localWriteClosed.Store(true)
 	return nil
 }
 

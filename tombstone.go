@@ -122,6 +122,13 @@ func (l tombstoneIDLookup) found() bool {
 }
 
 func (c *Conn) markUsedStreamLocked(streamID uint64, marker usedStreamMarker) {
+	if c == nil {
+		return
+	}
+	if c.registry.usedStreamRangeMode {
+		c.registry.usedStreamRanges = upsertUsedStreamRange(c.registry.usedStreamRanges, streamID, marker)
+		return
+	}
 	if c.registry.usedStreamData == nil {
 		c.registry.usedStreamData = make(map[uint64]usedStreamMarker)
 	}
@@ -150,32 +157,83 @@ func usedStreamRangeMergeable(a, b usedStreamRange) bool {
 	return a.end+4 >= b.start && b.end+4 >= a.start
 }
 
-func insertUsedStreamRange(ranges []usedStreamRange, next usedStreamRange) []usedStreamRange {
+func mergeUsedStreamRangeAround(ranges []usedStreamRange, idx int) []usedStreamRange {
+	if idx < 0 || idx >= len(ranges) {
+		return ranges
+	}
+	for idx > 0 && usedStreamRangeMergeable(ranges[idx-1], ranges[idx]) {
+		if ranges[idx].start < ranges[idx-1].start {
+			ranges[idx-1].start = ranges[idx].start
+		}
+		if ranges[idx].end > ranges[idx-1].end {
+			ranges[idx-1].end = ranges[idx].end
+		}
+		copy(ranges[idx:], ranges[idx+1:])
+		ranges = ranges[:len(ranges)-1]
+		idx--
+	}
+	for idx+1 < len(ranges) && usedStreamRangeMergeable(ranges[idx], ranges[idx+1]) {
+		if ranges[idx+1].end > ranges[idx].end {
+			ranges[idx].end = ranges[idx+1].end
+		}
+		copy(ranges[idx+1:], ranges[idx+2:])
+		ranges = ranges[:len(ranges)-1]
+	}
+	return ranges
+}
+
+func setContainedUsedStreamMarker(ranges []usedStreamRange, idx int, streamID uint64, marker usedStreamMarker) []usedStreamRange {
+	if idx < 0 || idx >= len(ranges) {
+		return ranges
+	}
+	current := ranges[idx]
+	if sameUsedStreamMarker(current.marker, marker) {
+		return ranges
+	}
+	out := append([]usedStreamRange(nil), ranges[:idx]...)
+	insertIdx := len(out)
+	if current.start < streamID {
+		out = append(out, usedStreamRange{
+			start:  current.start,
+			end:    streamID - 4,
+			marker: current.marker,
+		})
+		insertIdx = len(out)
+	}
+	out = append(out, usedStreamRange{
+		start:  streamID,
+		end:    streamID,
+		marker: marker,
+	})
+	if streamID < current.end {
+		out = append(out, usedStreamRange{
+			start:  streamID + 4,
+			end:    current.end,
+			marker: current.marker,
+		})
+	}
+	out = append(out, ranges[idx+1:]...)
+	return mergeUsedStreamRangeAround(out, insertIdx)
+}
+
+func upsertUsedStreamRange(ranges []usedStreamRange, streamID uint64, marker usedStreamMarker) []usedStreamRange {
 	if len(ranges) == 0 {
-		return append(ranges, next)
+		return append(ranges, usedStreamRange{start: streamID, end: streamID, marker: marker})
 	}
-	out := make([]usedStreamRange, 0, len(ranges)+1)
-	inserted := false
-	for _, current := range ranges {
-		if usedStreamRangeMergeable(current, next) {
-			if current.start < next.start {
-				next.start = current.start
-			}
-			if current.end > next.end {
-				next.end = current.end
-			}
-			continue
-		}
-		if !inserted && current.start > next.end {
-			out = append(out, next)
-			inserted = true
-		}
-		out = append(out, current)
+	idx := sort.Search(len(ranges), func(i int) bool {
+		return ranges[i].start > streamID
+	})
+	if idx > 0 && usedStreamRangeContains(ranges[idx-1], streamID) {
+		return setContainedUsedStreamMarker(ranges, idx-1, streamID, marker)
 	}
-	if !inserted {
-		out = append(out, next)
+	ranges = append(ranges, usedStreamRange{})
+	copy(ranges[idx+1:], ranges[idx:])
+	ranges[idx] = usedStreamRange{
+		start:  streamID,
+		end:    streamID,
+		marker: marker,
 	}
-	return out
+	return mergeUsedStreamRangeAround(ranges, idx)
 }
 
 func (c *Conn) usedStreamMarkerForLocked(streamID uint64) (usedStreamMarker, bool) {
@@ -217,14 +275,11 @@ func (c *Conn) compactMarkerOnlyRangesLocked() {
 	ranges := append([]usedStreamRange(nil), c.registry.usedStreamRanges...)
 	for _, streamID := range ids {
 		marker := c.registry.usedStreamData[streamID]
-		ranges = insertUsedStreamRange(ranges, usedStreamRange{
-			start:  streamID,
-			end:    streamID,
-			marker: marker,
-		})
+		ranges = upsertUsedStreamRange(ranges, streamID, marker)
 		delete(c.registry.usedStreamData, streamID)
 	}
 	c.registry.usedStreamRanges = ranges
+	c.registry.usedStreamRangeMode = true
 }
 
 func tombstoneStateForStream(stream *nativeStream) state.StreamTombstone {

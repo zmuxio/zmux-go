@@ -215,10 +215,8 @@ if err := stream.CloseRead(); err != nil {
 Use:
 
 - `Reset(code)` to abort the local write side
-- `CloseWithError(err)` / `CloseWithErrorCode(code, reason)` as the preferred
-  whole-stream abortive helpers
-- `Abort()` / `AbortWithError(...)` / `AbortWithErrorCode(...)` as compatibility
-  aliases for the same whole-stream abortive semantics
+- `CloseWithError(err)` / `CloseWithErrorCode(code, reason)` for whole-stream
+  abortive close
 
 ```go
 if err := stream.Reset(uint64(zmux.CodeCancelled)); err != nil {
@@ -238,12 +236,8 @@ abort helpers. If you use native constructors that return `*zmux.Conn`, the
 exported native stream types also expose richer native variants:
 
 - `(*zmux.NativeStream).CloseReadWithCode(code)`
-- `(*zmux.NativeStream).ResetWithReason(code, reason)`
 - `(*zmux.NativeStream).CloseWithErrorCode(code, reason)`
-- `(*zmux.NativeSendStream).ResetWithReason(code, reason)`
 - `(*zmux.NativeRecvStream).CloseReadWithCode(code)`
-- `Abort*` remains available everywhere as compatibility aliases for
-  `CloseWithError*`
 
 Example:
 
@@ -280,6 +274,7 @@ _ = stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
 Useful session-level methods:
 
 - `Close()` for graceful session shutdown
+- `Abort(err)` for abortive session shutdown
 - `Wait(ctx)` to block until the session is fully terminated
 - `Closed()` to check whether shutdown has completed
 - `State()` to read the current public session lifecycle state
@@ -296,9 +291,8 @@ go func() {
 ## Native Session Extensions
 
 The stable `zmux.Session` interface stays transport-agnostic. Native `*zmux.Conn`
-adds protocol and shutdown helpers such as:
+adds protocol helpers such as:
 
-- `Abort(err)` for abortive session shutdown
 - `Ping(ctx, echo)`
 - `GoAway(...)` / `GoAwayWithError(...)`
 - `PeerGoAwayError()` / `PeerCloseError()`
@@ -393,3 +387,4 @@ session := quicmux.WrapSession(qconn)
 The adapter exposes the same stable `zmux.Session` interface while translating
 the supported subset of stream metadata and termination semantics onto
 `quic-go`.
+

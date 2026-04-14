@@ -72,6 +72,68 @@ func (h *blockingCloseWriteHalf) CloseWrite() error {
 	return nil
 }
 
+type blockingDeadlineReadHalf struct {
+	mu         sync.Mutex
+	deadlines  []time.Time
+	setStarted chan struct{}
+	releaseSet chan struct{}
+}
+
+func (h *blockingDeadlineReadHalf) Read(_ []byte) (int, error) { return 0, io.EOF }
+func (h *blockingDeadlineReadHalf) CloseRead() error           { return nil }
+func (h *blockingDeadlineReadHalf) LocalAddr() net.Addr        { return nil }
+func (h *blockingDeadlineReadHalf) RemoteAddr() net.Addr       { return nil }
+func (h *blockingDeadlineReadHalf) SetReadDeadline(t time.Time) error {
+	h.mu.Lock()
+	h.deadlines = append(h.deadlines, t)
+	first := len(h.deadlines) == 1
+	h.mu.Unlock()
+	if first {
+		select {
+		case h.setStarted <- struct{}{}:
+		default:
+		}
+		<-h.releaseSet
+	}
+	return nil
+}
+func (h *blockingDeadlineReadHalf) snapshotDeadlines() []time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]time.Time(nil), h.deadlines...)
+}
+
+type blockingDeadlineWriteHalf struct {
+	mu         sync.Mutex
+	deadlines  []time.Time
+	setStarted chan struct{}
+	releaseSet chan struct{}
+}
+
+func (h *blockingDeadlineWriteHalf) Write(p []byte) (int, error) { return len(p), nil }
+func (h *blockingDeadlineWriteHalf) CloseWrite() error           { return nil }
+func (h *blockingDeadlineWriteHalf) LocalAddr() net.Addr         { return nil }
+func (h *blockingDeadlineWriteHalf) RemoteAddr() net.Addr        { return nil }
+func (h *blockingDeadlineWriteHalf) SetWriteDeadline(t time.Time) error {
+	h.mu.Lock()
+	h.deadlines = append(h.deadlines, t)
+	first := len(h.deadlines) == 1
+	h.mu.Unlock()
+	if first {
+		select {
+		case h.setStarted <- struct{}{}:
+		default:
+		}
+		<-h.releaseSet
+	}
+	return nil
+}
+func (h *blockingDeadlineWriteHalf) snapshotDeadlines() []time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]time.Time(nil), h.deadlines...)
+}
+
 func TestJoinedConnImplementsNetConnAtRuntime(t *testing.T) {
 	t.Parallel()
 
@@ -1185,6 +1247,122 @@ func TestJoinedConnPauseWriteBlocksCloseWriteUntilDeadline(t *testing.T) {
 	}
 }
 
+func TestJoinedConnResumeReadReplaysDeadlineSetWhilePaused(t *testing.T) {
+	t.Parallel()
+
+	conn := JoinConn(&addrOnlyReadHalf{}, nil)
+	pause, err := conn.PauseRead(context.Background())
+	if err != nil {
+		t.Fatalf("PauseRead: %v", err)
+	}
+
+	replacement := &blockingDeadlineReadHalf{
+		setStarted: make(chan struct{}, 1),
+		releaseSet: make(chan struct{}),
+	}
+	pause.Set(replacement)
+
+	firstDeadline := time.Now().Add(30 * time.Millisecond)
+	secondDeadline := time.Now().Add(60 * time.Millisecond)
+	if err := conn.SetReadDeadline(firstDeadline); err != nil {
+		t.Fatalf("SetReadDeadline(first): %v", err)
+	}
+
+	resumeDone := make(chan error, 1)
+	go func() {
+		resumeDone <- pause.Resume()
+	}()
+
+	select {
+	case <-replacement.setStarted:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Resume did not apply initial read deadline")
+	}
+
+	if err := conn.SetReadDeadline(secondDeadline); err != nil {
+		t.Fatalf("SetReadDeadline(second): %v", err)
+	}
+	close(replacement.releaseSet)
+
+	select {
+	case err := <-resumeDone:
+		if err != nil {
+			t.Fatalf("PauseRead Resume: %v", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("PauseRead Resume did not finish after deadline refresh")
+	}
+
+	got := replacement.snapshotDeadlines()
+	if len(got) != 2 {
+		t.Fatalf("read deadline apply count = %d, want 2", len(got))
+	}
+	if !got[0].Equal(firstDeadline) {
+		t.Fatalf("first applied read deadline = %v, want %v", got[0], firstDeadline)
+	}
+	if !got[1].Equal(secondDeadline) {
+		t.Fatalf("second applied read deadline = %v, want %v", got[1], secondDeadline)
+	}
+}
+
+func TestJoinedConnResumeWriteReplaysDeadlineSetWhilePaused(t *testing.T) {
+	t.Parallel()
+
+	conn := JoinConn(nil, &addrOnlyWriteHalf{})
+	pause, err := conn.PauseWrite(context.Background())
+	if err != nil {
+		t.Fatalf("PauseWrite: %v", err)
+	}
+
+	replacement := &blockingDeadlineWriteHalf{
+		setStarted: make(chan struct{}, 1),
+		releaseSet: make(chan struct{}),
+	}
+	pause.Set(replacement)
+
+	firstDeadline := time.Now().Add(30 * time.Millisecond)
+	secondDeadline := time.Now().Add(60 * time.Millisecond)
+	if err := conn.SetWriteDeadline(firstDeadline); err != nil {
+		t.Fatalf("SetWriteDeadline(first): %v", err)
+	}
+
+	resumeDone := make(chan error, 1)
+	go func() {
+		resumeDone <- pause.Resume()
+	}()
+
+	select {
+	case <-replacement.setStarted:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Resume did not apply initial write deadline")
+	}
+
+	if err := conn.SetWriteDeadline(secondDeadline); err != nil {
+		t.Fatalf("SetWriteDeadline(second): %v", err)
+	}
+	close(replacement.releaseSet)
+
+	select {
+	case err := <-resumeDone:
+		if err != nil {
+			t.Fatalf("PauseWrite Resume: %v", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("PauseWrite Resume did not finish after deadline refresh")
+	}
+
+	got := replacement.snapshotDeadlines()
+	if len(got) != 2 {
+		t.Fatalf("write deadline apply count = %d, want 2", len(got))
+	}
+	if !got[0].Equal(firstDeadline) {
+		t.Fatalf("first applied write deadline = %v, want %v", got[0], firstDeadline)
+	}
+	if !got[1].Equal(secondDeadline) {
+		t.Fatalf("second applied write deadline = %v, want %v", got[1], secondDeadline)
+	}
+}
+
 func TestJoinedConnCloseKeepsDetachedHalfCallerOwned(t *testing.T) {
 	t.Parallel()
 
@@ -1577,8 +1755,8 @@ func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	if err := s.Reset(uint64(CodeCancelled)); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("Reset() err = %v, want %v", err, ErrSessionClosed)
 	}
-	if err := s.AbortWithErrorCode(uint64(CodeCancelled), ""); !errors.Is(err, ErrSessionClosed) {
-		t.Fatalf("AbortWithErrorCode() err = %v, want %v", err, ErrSessionClosed)
+	if err := s.CloseWithErrorCode(uint64(CodeCancelled), ""); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("CloseWithErrorCode() err = %v, want %v", err, ErrSessionClosed)
 	}
 	if err := s.Close(); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("Close() err = %v, want %v", err, ErrSessionClosed)
@@ -1996,7 +2174,7 @@ func TestCloseWithErrorOnConcreteLocalIDQueuesOpeningAbort(t *testing.T) {
 	}
 }
 
-func TestAbortAliasesPreferredCloseWithErrorMethods(t *testing.T) {
+func TestCloseWithErrorHelpersQueueExpectedAbortFrames(t *testing.T) {
 	t.Parallel()
 
 	queueAbort := func(t *testing.T, invoke func(*nativeStream) error) Frame {
@@ -2016,53 +2194,44 @@ func TestAbortAliasesPreferredCloseWithErrorMethods(t *testing.T) {
 		return awaitQueuedFrame(t, frames)
 	}
 
-	cancelAlias := queueAbort(t, func(stream *nativeStream) error {
-		return stream.Abort()
-	})
-	cancelPreferred := queueAbort(t, func(stream *nativeStream) error {
+	cancelFrame := queueAbort(t, func(stream *nativeStream) error {
 		return stream.CloseWithErrorCode(uint64(CodeCancelled), "")
 	})
-	if cancelAlias.Type != cancelPreferred.Type {
-		t.Fatalf("Abort frame type = %v, want %v", cancelAlias.Type, cancelPreferred.Type)
+	if cancelFrame.Type != FrameTypeABORT {
+		t.Fatalf("CloseWithErrorCode frame type = %v, want %v", cancelFrame.Type, FrameTypeABORT)
 	}
-	if cancelAlias.StreamID != cancelPreferred.StreamID {
-		t.Fatalf("Abort stream-id = %d, want %d", cancelAlias.StreamID, cancelPreferred.StreamID)
+	code, reason, err := parseErrorPayload(cancelFrame.Payload)
+	if err != nil {
+		t.Fatalf("parse cancelled ABORT payload: %v", err)
 	}
-	if !bytes.Equal(cancelAlias.Payload, cancelPreferred.Payload) {
-		t.Fatalf("Abort payload = %x, want %x", cancelAlias.Payload, cancelPreferred.Payload)
+	if code != uint64(CodeCancelled) || reason != "" {
+		t.Fatalf("cancelled ABORT payload = (%d, %q), want (%d, %q)", code, reason, uint64(CodeCancelled), "")
 	}
 
 	appErr := &ApplicationError{Code: uint64(CodeInternal), Reason: "backend failed"}
-	errorAlias := queueAbort(t, func(stream *nativeStream) error {
-		return stream.AbortWithError(appErr)
-	})
 	errorPreferred := queueAbort(t, func(stream *nativeStream) error {
 		return stream.CloseWithError(appErr)
 	})
-	if errorAlias.Type != errorPreferred.Type {
-		t.Fatalf("AbortWithError frame type = %v, want %v", errorAlias.Type, errorPreferred.Type)
+	if errorPreferred.Type != FrameTypeABORT {
+		t.Fatalf("CloseWithError frame type = %v, want %v", errorPreferred.Type, FrameTypeABORT)
 	}
-	if errorAlias.StreamID != errorPreferred.StreamID {
-		t.Fatalf("AbortWithError stream-id = %d, want %d", errorAlias.StreamID, errorPreferred.StreamID)
+	code, reason, err = parseErrorPayload(errorPreferred.Payload)
+	if err != nil {
+		t.Fatalf("parse CloseWithError payload: %v", err)
 	}
-	if !bytes.Equal(errorAlias.Payload, errorPreferred.Payload) {
-		t.Fatalf("AbortWithError payload = %x, want %x", errorAlias.Payload, errorPreferred.Payload)
+	if code != appErr.Code || reason != appErr.Reason {
+		t.Fatalf("CloseWithError payload = (%d, %q), want (%d, %q)", code, reason, appErr.Code, appErr.Reason)
 	}
 
-	codeAlias := queueAbort(t, func(stream *nativeStream) error {
-		return stream.AbortWithErrorCode(55, "bye")
-	})
 	codePreferred := queueAbort(t, func(stream *nativeStream) error {
 		return stream.CloseWithErrorCode(55, "bye")
 	})
-	if codeAlias.Type != codePreferred.Type {
-		t.Fatalf("AbortWithErrorCode frame type = %v, want %v", codeAlias.Type, codePreferred.Type)
+	code, reason, err = parseErrorPayload(codePreferred.Payload)
+	if err != nil {
+		t.Fatalf("parse CloseWithErrorCode payload: %v", err)
 	}
-	if codeAlias.StreamID != codePreferred.StreamID {
-		t.Fatalf("AbortWithErrorCode stream-id = %d, want %d", codeAlias.StreamID, codePreferred.StreamID)
-	}
-	if !bytes.Equal(codeAlias.Payload, codePreferred.Payload) {
-		t.Fatalf("AbortWithErrorCode payload = %x, want %x", codeAlias.Payload, codePreferred.Payload)
+	if code != 55 || reason != "bye" {
+		t.Fatalf("CloseWithErrorCode payload = (%d, %q), want (%d, %q)", code, reason, 55, "bye")
 	}
 }
 
@@ -4296,7 +4465,7 @@ func TestSendStreamResetWriteWithCodeAliasesReset(t *testing.T) {
 	assertQueuedResetCode(t, frames, stream.id, ErrorCode(77))
 }
 
-func TestStreamAbortAliasUsesCancelledCode(t *testing.T) {
+func TestStreamCloseWithErrorCodeUsesCancelledCode(t *testing.T) {
 	t.Parallel()
 
 	c, frames, stop := newInvalidFrameConn(t, 0)
@@ -4307,8 +4476,8 @@ func TestStreamAbortAliasUsesCancelledCode(t *testing.T) {
 		RecvHalf: "recv_open",
 	})
 
-	if err := stream.Abort(); err != nil {
-		t.Fatalf("Abort err = %v", err)
+	if err := stream.CloseWithErrorCode(uint64(CodeCancelled), ""); err != nil {
+		t.Fatalf("CloseWithErrorCode err = %v", err)
 	}
 
 	frame := awaitQueuedFrame(t, frames)
@@ -4323,14 +4492,14 @@ func TestStreamAbortAliasUsesCancelledCode(t *testing.T) {
 		t.Fatalf("parse ABORT payload: %v", err)
 	}
 	if code != uint64(CodeCancelled) {
-		t.Fatalf("abort code = %d, want %d", code, uint64(CodeCancelled))
+		t.Fatalf("close-with-error code = %d, want %d", code, uint64(CodeCancelled))
 	}
 	if reason != "" {
-		t.Fatalf("abort reason = %q, want empty", reason)
+		t.Fatalf("close-with-error reason = %q, want empty", reason)
 	}
 }
 
-func TestRecvStreamAbortWithErrorCodeAliasesWholeStreamAbort(t *testing.T) {
+func TestRecvStreamCloseWithErrorCodeQueuesWholeStreamAbort(t *testing.T) {
 	t.Parallel()
 
 	c, frames, stop := newInvalidFrameConn(t, 0)
@@ -4342,8 +4511,8 @@ func TestRecvStreamAbortWithErrorCodeAliasesWholeStreamAbort(t *testing.T) {
 	})
 
 	recv := &nativeRecvStream{stream: stream}
-	if err := recv.AbortWithErrorCode(55, "bye"); err != nil {
-		t.Fatalf("AbortWithErrorCode err = %v", err)
+	if err := recv.CloseWithErrorCode(55, "bye"); err != nil {
+		t.Fatalf("CloseWithErrorCode err = %v", err)
 	}
 
 	frame := awaitQueuedFrame(t, frames)
@@ -5313,7 +5482,7 @@ func TestStructuredErrorAfterLocalAbortRead(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := clientStream.AbortWithErrorCode(uint64(CodeInternal), "local abort"); err != nil {
+	if err := clientStream.CloseWithErrorCode(uint64(CodeInternal), "local abort"); err != nil {
 		t.Fatalf("client abort: %v", err)
 	}
 
@@ -5541,7 +5710,7 @@ func TestStructuredErrorAfterPeerAbortCloseWrite(t *testing.T) {
 		t.Fatalf("server initial read: %v", err)
 	}
 
-	if err := serverStream.AbortWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
+	if err := serverStream.CloseWithErrorCode(uint64(CodeRefusedStream), "peer abort"); err != nil {
 		t.Fatalf("server abort: %v", err)
 	}
 
@@ -5601,43 +5770,6 @@ func TestStreamCloseWithErrorCodeTruncatesReasonTextToControlLimit(t *testing.T)
 	}
 	if parsedReason != reason[:13] {
 		t.Fatalf("reason = %q, want UTF-8-safe truncated %q", parsedReason, reason[:13])
-	}
-}
-
-func TestStreamResetWithReasonOmitsInvalidUTF8Text(t *testing.T) {
-	t.Parallel()
-
-	c, frames, stop := newHandlerTestConn(t)
-	defer stop()
-	c.config.peer.Settings.MaxControlPayloadBytes = 16
-
-	stream := testBuildStream(c, 4,
-		testWithLocalOpen(testLocalOpenOpenedCommittedState()),
-		testWithLocalSend(),
-		testWithLocalReceive(),
-	)
-	c.registry.streams[4] = stream
-
-	if err := stream.ResetWithReason(uint64(CodeCancelled), string([]byte{0xe2, 0x82})); err != nil {
-		t.Fatalf("reset with invalid reason: %v", err)
-	}
-
-	frame := awaitQueuedFrame(t, frames)
-	if frame.Type != FrameTypeRESET {
-		t.Fatalf("frame type = %s, want RESET", frame.Type)
-	}
-	if got := len(frame.Payload); got != 1 {
-		t.Fatalf("payload size = %d, want 1", got)
-	}
-	code, parsedReason, err := parseErrorPayload(frame.Payload)
-	if err != nil {
-		t.Fatalf("parse error payload: %v", err)
-	}
-	if code != uint64(CodeCancelled) {
-		t.Fatalf("error code = %d, want %d", code, uint64(CodeCancelled))
-	}
-	if parsedReason != "" {
-		t.Fatalf("reason = %q, want empty string for invalid utf8", parsedReason)
 	}
 }
 
