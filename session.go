@@ -1393,6 +1393,32 @@ func establishmentCloseDrainDelay(err error) time.Duration {
 
 const establishmentFailureWriteWait = 250 * time.Millisecond
 
+// establishmentSuccessWriteWait bounds how long a successful handshake waits
+// for the already-started local preface write to finish after the peer preface
+// has been parsed. The preface is intentionally tiny; without a bound, a peer
+// that writes its own preface but never drains ours can stall Client/Server/New
+// indefinitely.
+const establishmentSuccessWriteWait = time.Second
+
+var errEstablishmentPrefaceWriteTimeout = errors.New("local preface write stalled during establishment")
+
+func waitEstablishmentWrite(writeErrCh <-chan error, timeout time.Duration) error {
+	if writeErrCh == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		return <-writeErrCh
+	}
+	timer := time.NewTimer(timeout)
+	defer stopTimer(timer)
+	select {
+	case err := <-writeErrCh:
+		return err
+	case <-timer.C:
+		return errEstablishmentPrefaceWriteTimeout
+	}
+}
+
 func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer *Preface, err error) {
 	if conn == nil {
 		return
@@ -1411,16 +1437,10 @@ func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error
 	if conn == nil {
 		return
 	}
-	timer := time.NewTimer(establishmentFailureWriteWait)
-	defer stopTimer(timer)
-	select {
-	case writeErr := <-writeErrCh:
-		if writeErr == nil {
-			closeAfterEstablishmentFailure(conn, local, peer, err)
-			return
-		}
-		_ = conn.Close()
-	case <-timer.C:
+	if writeErr := waitEstablishmentWrite(writeErrCh, establishmentFailureWriteWait); writeErr == nil {
+		closeAfterEstablishmentFailure(conn, local, peer, err)
+		return
+	} else {
 		_ = conn.Close()
 	}
 }
@@ -2115,8 +2135,11 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 		finishEstablishmentFailure(conn, writeErrCh, local, &peer, err)
 		return nil, err
 	}
-	if writeErr := <-writeErrCh; writeErr != nil {
+	if writeErr := waitEstablishmentWrite(writeErrCh, establishmentSuccessWriteWait); writeErr != nil {
 		_ = conn.Close()
+		if errors.Is(writeErr, errEstablishmentPrefaceWriteTimeout) {
+			return nil, wireError(CodeInternal, "write preface", writeErr)
+		}
 		return nil, writeErr
 	}
 
