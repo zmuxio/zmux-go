@@ -1235,7 +1235,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		if c.io.conn != nil {
 			_ = c.io.conn.Close()
 		}
-		drainDetachedWriteLanes(queueVisibleSessionErr(c, c.err()), c.writer.advisoryWriteCh, c.writer.writeCh)
+		drainDetachedWriteLanes(queueVisibleSessionErr(c, c.err()), c.writer.urgentWriteCh, c.writer.advisoryWriteCh, c.writer.writeCh)
 
 		// Clear tombstones after the transport is closed so the ingress
 		// goroutine cannot race against a nil tombstone map.
