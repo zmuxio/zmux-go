@@ -266,7 +266,15 @@ func (c *Conn) usedStreamMarkerForLocked(streamID uint64) (usedStreamMarker, boo
 			return marker, true
 		}
 	}
-	for _, r := range c.registry.usedStreamRanges {
+	ranges := c.registry.usedStreamRanges
+	if len(ranges) == 0 {
+		return usedStreamMarker{}, false
+	}
+	idx := sort.Search(len(ranges), func(i int) bool {
+		return ranges[i].start > streamID
+	})
+	if idx > 0 {
+		r := ranges[idx-1]
 		if usedStreamRangeContains(r, streamID) {
 			return r.marker, true
 		}
