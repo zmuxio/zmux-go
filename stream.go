@@ -549,10 +549,11 @@ func (s *nativeStream) consumeReadChunkLocked(c *Conn, n int) {
 	}
 
 	if shouldTightenReadBufAfterConsume(chunk.data[n:]) {
+		tail := clonePayloadBytes(chunk.data[n:])
 		if chunk.handle != nil {
 			releaseReadFrameBuffer(chunk.backing, chunk.handle)
 		}
-		chunk.data = clonePayloadBytes(chunk.data[n:])
+		chunk.data = tail
 		chunk.backing = nil
 		chunk.handle = nil
 		chunk.retainedBytes = uint64(len(chunk.data))
