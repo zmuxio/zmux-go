@@ -3987,6 +3987,150 @@ func TestWritevFinalOnConcreteLocalIDCoalescesPartsIntoOpeningFinFrame(t *testin
 	}
 }
 
+func TestWriteZeroLengthWithOpenMetadataDoesNotQueueOpeningFrame(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newInvalidFrameConn(t, CapabilityOpenMetadata)
+	defer stop()
+
+	openInfo := []byte("ssh")
+	prefix, err := buildOpenMetadataPrefix(
+		CapabilityOpenMetadata,
+		OpenOptions{OpenInfo: openInfo},
+		c.config.peer.Settings.MaxFramePayload,
+	)
+	if err != nil {
+		t.Fatalf("buildOpenMetadataPrefix err = %v", err)
+	}
+
+	c.mu.Lock()
+	stream := c.newLocalStreamWithIDLocked(
+		state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), streamArityBidi, OpenOptions{OpenInfo: openInfo},
+		prefix,
+	)
+	c.registry.streams[stream.id] = stream
+	c.appendUnseenLocalLocked(stream)
+	c.mu.Unlock()
+
+	n, err := stream.Write(nil)
+	if err != nil {
+		t.Fatalf("Write err = %v, want nil", err)
+	}
+	if n != 0 {
+		t.Fatalf("Write n = %d, want 0", n)
+	}
+
+	assertNoQueuedFrame(t, frames)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if stream.localOpen.committed {
+		t.Fatal("sendCommitted = true, want false after zero-length Write")
+	}
+	if stream.isPeerVisibleLocked() {
+		t.Fatal("peerVisible = true, want false after zero-length Write")
+	}
+}
+
+func TestWritevFinalSplitsWhenOpenMetadataConsumesWholeFirstFrame(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newInvalidFrameConn(t, CapabilityOpenMetadata)
+	defer stop()
+
+	maxFramePayload := int(c.config.peer.Settings.MaxFramePayload)
+	var (
+		openInfo []byte
+		prefix   []byte
+		err      error
+	)
+	for n := 1; n <= maxFramePayload; n++ {
+		candidate := bytes.Repeat([]byte("m"), n)
+		prefix, err = buildOpenMetadataPrefix(
+			CapabilityOpenMetadata,
+			OpenOptions{OpenInfo: candidate},
+			c.config.peer.Settings.MaxFramePayload,
+		)
+		if err != nil {
+			t.Fatalf("buildOpenMetadataPrefix err = %v", err)
+		}
+		if len(prefix) == maxFramePayload {
+			openInfo = candidate
+			break
+		}
+	}
+	if len(openInfo) == 0 {
+		t.Fatal("failed to find open_info length that saturates max_frame_payload")
+	}
+
+	c.mu.Lock()
+	stream := c.newLocalStreamWithIDLocked(
+		state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), streamArityBidi, OpenOptions{OpenInfo: openInfo},
+		prefix,
+	)
+	c.registry.streams[stream.id] = stream
+	c.appendUnseenLocalLocked(stream)
+	c.mu.Unlock()
+
+	n, err := stream.WritevFinal([]byte("x"))
+	if err != nil {
+		t.Fatalf("WritevFinal err = %v, want nil", err)
+	}
+	if n != 1 {
+		t.Fatalf("WritevFinal n = %d, want 1", n)
+	}
+
+	first := awaitQueuedFrame(t, frames)
+	if first.Type != FrameTypeDATA {
+		t.Fatalf("first queued frame type = %v, want %v", first.Type, FrameTypeDATA)
+	}
+	if first.StreamID != stream.id {
+		t.Fatalf("first queued frame stream = %d, want %d", first.StreamID, stream.id)
+	}
+	if first.Flags&FrameFlagOpenMetadata == 0 {
+		t.Fatal("first queued frame missing OPEN_METADATA flag")
+	}
+	if first.Flags&FrameFlagFIN != 0 {
+		t.Fatal("first queued frame unexpectedly carried FIN")
+	}
+	if len(first.Payload) != maxFramePayload {
+		t.Fatalf("first payload len = %d, want %d", len(first.Payload), maxFramePayload)
+	}
+	if !bytes.Equal(first.Payload, prefix) {
+		t.Fatalf("first payload = %x, want %x", first.Payload, prefix)
+	}
+
+	second := awaitQueuedFrame(t, frames)
+	if second.Type != FrameTypeDATA {
+		t.Fatalf("second queued frame type = %v, want %v", second.Type, FrameTypeDATA)
+	}
+	if second.StreamID != stream.id {
+		t.Fatalf("second queued frame stream = %d, want %d", second.StreamID, stream.id)
+	}
+	if second.Flags&FrameFlagOpenMetadata != 0 {
+		t.Fatal("second queued frame unexpectedly carried OPEN_METADATA")
+	}
+	if second.Flags&FrameFlagFIN == 0 {
+		t.Fatal("second queued frame missing FIN")
+	}
+	if !bytes.Equal(second.Payload, []byte("x")) {
+		t.Fatalf("second payload = %x, want %x", second.Payload, []byte("x"))
+	}
+	assertNoQueuedFrame(t, frames)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !stream.localOpen.committed {
+		t.Fatal("sendCommitted = false, want true after opening WritevFinal")
+	}
+	if !stream.isPeerVisibleLocked() {
+		t.Fatal("peerVisible = false, want true after opening WritevFinal")
+	}
+	if !stream.sendFinReached() {
+		t.Fatal("sendFinReached() = false, want true after opening WritevFinal")
+	}
+}
+
 func TestResolveWriteFinalPreparedBurstPropagatesQueueErrWithoutProgress(t *testing.T) {
 	t.Parallel()
 
