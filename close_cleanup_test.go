@@ -71,13 +71,14 @@ func TestCloseSessionClearsProtocolBacklogAndDrainsBufferedDataQueues(t *testing
 	if got := len(advisory); got != 0 {
 		t.Fatalf("advisory write lane still buffered %d request(s)", got)
 	}
-	if got := len(urgent); got != 1 {
-		t.Fatalf("urgent write lane depth = %d, want 1 buffered urgent request", got)
+	if got := len(urgent); got != 0 {
+		t.Fatalf("urgent write lane still buffered %d request(s)", got)
 	}
 
 	for name, done := range map[string]chan error{
 		"ordinary": ordinaryDone,
 		"advisory": advisoryDone,
+		"urgent":   urgentDone,
 	} {
 		select {
 		case err := <-done:
@@ -87,11 +88,6 @@ func TestCloseSessionClearsProtocolBacklogAndDrainsBufferedDataQueues(t *testing
 		default:
 			t.Fatalf("%s drained request did not complete", name)
 		}
-	}
-	select {
-	case err := <-urgentDone:
-		t.Fatalf("urgent request completed unexpectedly with %v", err)
-	default:
 	}
 }
 

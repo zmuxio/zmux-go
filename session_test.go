@@ -5004,8 +5004,8 @@ func TestCloseSessionDoesNotWaitForeverForBufferedCloseDone(t *testing.T) {
 	default:
 		t.Fatal("closedCh not closed after bounded buffered CLOSE wait")
 	}
-	if got := len(c.writer.urgentWriteCh); got != 1 {
-		t.Fatalf("urgent close queue depth = %d, want 1 buffered CLOSE request", got)
+	if got := len(c.writer.urgentWriteCh); got != 0 {
+		t.Fatalf("urgent close queue depth = %d, want 0 after session close drain", got)
 	}
 }
 
@@ -23750,8 +23750,8 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 		default:
 			t.Fatalf("event %q closedCh not closed after buffered CLOSE wait", step.Event)
 		}
-		if got := len(env.conn.writer.urgentWriteCh); got != 1 {
-			t.Fatalf("event %q urgent close queue depth = %d, want 1", step.Event, got)
+		if got := len(env.conn.writer.urgentWriteCh); got != 0 {
+			t.Fatalf("event %q urgent close queue depth = %d, want 0 after close drain", step.Event, got)
 		}
 	case "session_blocked_urgent_queue_returns_session_error_before_closed_ch":
 		if err != nil {
