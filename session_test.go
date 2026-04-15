@@ -18,6 +18,7 @@ import (
 	rt "github.com/zmuxio/zmux-go/internal/runtime"
 	"github.com/zmuxio/zmux-go/internal/state"
 	"github.com/zmuxio/zmux-go/internal/testutil"
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 type testStreamMutator func(*nativeStream)
@@ -1276,6 +1277,13 @@ func TestCloseSessionDoesNotMarkCloseFrameSentWhenPayloadBuildFails(t *testing.T
 	defer c.mu.Unlock()
 	if c.shutdown.closeFrameSent {
 		t.Fatal("closeFrameSent = true after CLOSE payload build failure, want false")
+	}
+	if !errors.Is(c.lifecycle.closeErr, wire.ErrValueTooLarge) {
+		t.Fatalf("closeErr = %v, want ErrValueTooLarge", c.lifecycle.closeErr)
+	}
+	var appErr *ApplicationError
+	if errors.As(c.lifecycle.closeErr, &appErr) {
+		t.Fatalf("closeErr = %v, want payload-build error instead of original ApplicationError", c.lifecycle.closeErr)
 	}
 }
 

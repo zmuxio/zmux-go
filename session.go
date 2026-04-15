@@ -1184,9 +1184,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 	var closeEvent *Event
 	c.shutdown.closeOnce.Do(func() {
 		c.mu.Lock()
-		if c.lifecycle.closeErr == nil {
-			c.lifecycle.closeErr = err
-		} else {
+		if c.lifecycle.closeErr != nil {
 			err = c.lifecycle.closeErr
 		}
 		shouldQueueCloseFrame := (closePolicy.forcesCloseFrame() || !state.IsBenignSessionError(c.lifecycle.sessionState, err, ErrSessionClosed)) &&
@@ -1205,6 +1203,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 				c.shutdown.closeFramePending = true
 			}
 		}
+		c.lifecycle.closeErr = err
 		if !state.IsSessionFinished(c.lifecycle.sessionState) {
 			c.lifecycle.sessionState = state.CloseSessionState(c.lifecycle.sessionState, err, ErrSessionClosed)
 		}
