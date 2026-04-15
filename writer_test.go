@@ -1888,6 +1888,117 @@ func TestHandleWriteBatchDoesNotWriteTransportAfterClose(t *testing.T) {
 	}
 }
 
+func TestHandleWriteBatchClearsScratchBatchRefs(t *testing.T) {
+	t.Parallel()
+
+	writer := &captureWriteCloser{}
+	c := newWriteLoopControlTestConn(writer)
+
+	req := writeRequest{
+		done: make(chan error, 1),
+		frames: testTxFramesFrom([]Frame{{
+			Type:    FrameTypePING,
+			Payload: []byte("batch-retained"),
+		}}),
+	}
+
+	batch := c.writer.scratch.batchSlice(1, 1)
+	batch[0] = req
+	if !c.handleWriteBatch(batch) {
+		t.Fatal("handleWriteBatch() = false, want true")
+	}
+
+	select {
+	case err := <-req.done:
+		if err != nil {
+			t.Fatalf("done err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("handleWriteBatch did not signal done")
+	}
+
+	if len(c.writer.scratch.batch) != 1 {
+		t.Fatalf("scratch batch len = %d, want 1", len(c.writer.scratch.batch))
+	}
+	if c.writer.scratch.batch[0].frames != nil || c.writer.scratch.batch[0].done != nil {
+		t.Fatal("scratch batch retained request refs after write completion")
+	}
+}
+
+func TestHandleWriteBatchClearsScratchOrderedRefs(t *testing.T) {
+	t.Parallel()
+
+	writer := &captureWriteCloser{}
+	c := newWriteLoopControlTestConn(writer)
+
+	req := writeRequest{
+		done: make(chan error, 1),
+		frames: testTxFramesFrom([]Frame{{
+			Type:    FrameTypePING,
+			Payload: []byte("ordered-retained"),
+		}}),
+	}
+
+	ordered := c.writer.scratch.orderedSlice(1)
+	ordered[0] = req
+	if !c.handleWriteBatch(ordered) {
+		t.Fatal("handleWriteBatch() = false, want true")
+	}
+
+	select {
+	case err := <-req.done:
+		if err != nil {
+			t.Fatalf("done err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("handleWriteBatch did not signal done")
+	}
+
+	if len(c.writer.scratch.ordered) != 1 {
+		t.Fatalf("scratch ordered len = %d, want 1", len(c.writer.scratch.ordered))
+	}
+	if c.writer.scratch.ordered[0].frames != nil || c.writer.scratch.ordered[0].done != nil {
+		t.Fatal("scratch ordered retained request refs after write completion")
+	}
+}
+
+func TestHandleWriteBatchClearsScatterGatherRefs(t *testing.T) {
+	t.Parallel()
+
+	writer := &captureWriteCloser{}
+	c := newWriteLoopControlTestConn(writer)
+	c.io.scatterGatherOK = true
+
+	req := writeRequest{
+		done: make(chan error, 1),
+		frames: testTxFramesFrom([]Frame{{
+			Type:    FrameTypePING,
+			Payload: bytes.Repeat([]byte("x"), minScatterGatherPayloadBytes+1),
+		}}),
+	}
+
+	batch := c.writer.scratch.batchSlice(1, 1)
+	batch[0] = req
+	if !c.handleWriteBatch(batch) {
+		t.Fatal("handleWriteBatch() = false, want true")
+	}
+
+	select {
+	case err := <-req.done:
+		if err != nil {
+			t.Fatalf("done err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("handleWriteBatch did not signal done")
+	}
+
+	for i, segment := range c.writer.scratch.sgBuffers[:cap(c.writer.scratch.sgBuffers)] {
+		if segment != nil {
+			t.Fatalf("sgBuffers[%d] retained payload refs after write completion", i)
+		}
+	}
+}
+
 func TestHandleWriteBatchTransportErrorDoesNotEnqueueCloseFrameFromWriterLoop(t *testing.T) {
 	t.Parallel()
 

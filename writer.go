@@ -169,6 +169,24 @@ func (s *writeBatchScratch) reset() {
 	s.queuedStreams = nil
 }
 
+func (s *writeBatchScratch) clearRetainedBatchRefs() {
+	if s == nil {
+		return
+	}
+	if len(s.batch) > 0 {
+		clearWriteRequests(s.batch[:len(s.batch)])
+	}
+	if len(s.ordered) > 0 {
+		clearWriteRequests(s.ordered[:len(s.ordered)])
+	}
+	if len(s.rejected) > 0 {
+		clearRejectedWriteRequests(s.rejected[:len(s.rejected)])
+	}
+	if cap(s.sgBuffers) > 0 {
+		clearNetBuffers(s.sgBuffers[:cap(s.sgBuffers)])
+	}
+}
+
 func (s *writeBatchScratch) dataScratch(n int) ([]rt.BatchItem, map[uint64]struct{}) {
 	items := s.itemSlice(n)
 	if s.explicitGroups == nil {
@@ -433,6 +451,9 @@ func (c *Conn) completeWriteBatch(batch []writeRequest, err error) {
 }
 
 func (c *Conn) handleWriteBatch(batch []writeRequest) bool {
+	if c != nil {
+		defer c.writer.scratch.clearRetainedBatchRefs()
+	}
 	batch = c.suppressWriteBatch(batch)
 	if len(batch) == 0 {
 		return true
