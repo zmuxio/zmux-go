@@ -3562,6 +3562,117 @@ func TestGracefulCloseWaitsForActiveStreamsBeforeCloseFrame(t *testing.T) {
 	}
 }
 
+func TestGracefulCloseIgnoresUnreadPeerUniStream(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, false)
+	stream := c.newPeerStreamLocked(streamID)
+	stream.recvBuffer = 5
+	stream.applicationVisible = true
+	stream.setRecvFin()
+	c.storeLiveStreamLocked(stream)
+	c.enqueueAcceptedLocked(stream)
+	c.mu.Unlock()
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+
+	frame := awaitQueuedFrame(t, frames)
+	if frame.Type != FrameTypeCLOSE {
+		t.Fatalf("final frame type = %s, want %s", frame.Type, FrameTypeCLOSE)
+	}
+	assertNoQueuedFrame(t, frames)
+}
+
+func TestGracefulCloseIgnoresPeerOpenedBidiWithoutLocalSend(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
+	stream := c.newPeerStreamLocked(streamID)
+	stream.recvBuffer = 5
+	stream.applicationVisible = true
+	stream.setRecvFin()
+	c.storeLiveStreamLocked(stream)
+	c.enqueueAcceptedLocked(stream)
+	c.mu.Unlock()
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+
+	frame := awaitQueuedFrame(t, frames)
+	if frame.Type != FrameTypeCLOSE {
+		t.Fatalf("final frame type = %s, want %s", frame.Type, FrameTypeCLOSE)
+	}
+	assertNoQueuedFrame(t, frames)
+}
+
+func TestGracefulCloseWaitsForPeerOpenedBidiWithLocalSend(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
+	stream := c.newPeerStreamLocked(streamID)
+	stream.sendSent = 1
+	stream.applicationVisible = true
+	stream.setRecvFin()
+	c.storeLiveStreamLocked(stream)
+	c.sessionControl.localGoAwayBidi = MaxVarint62
+	c.sessionControl.localGoAwayUni = MaxVarint62
+	c.registry.nextPeerBidi = state.FirstPeerStreamID(c.config.negotiated.LocalRole, true) + 4
+	c.registry.nextPeerUni = state.FirstPeerStreamID(c.config.negotiated.LocalRole, false) + 4
+	c.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Close()
+	}()
+
+	frame := awaitQueuedFrame(t, frames)
+	if frame.Type != FrameTypeGOAWAY {
+		t.Fatalf("first frame type = %s, want %s", frame.Type, FrameTypeGOAWAY)
+	}
+
+	frame = awaitQueuedFrame(t, frames)
+	if frame.Type != FrameTypeGOAWAY {
+		t.Fatalf("second frame type = %s, want %s", frame.Type, FrameTypeGOAWAY)
+	}
+
+	assertNoQueuedFrame(t, frames)
+
+	c.mu.Lock()
+	stream.setSendFin()
+	c.maybeCompactTerminalLocked(stream)
+	c.mu.Unlock()
+	notify(c.signals.livenessCh)
+
+	frame = awaitQueuedFrame(t, frames)
+	if frame.Type != FrameTypeCLOSE {
+		t.Fatalf("final frame type = %s, want %s", frame.Type, FrameTypeCLOSE)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close() = %v", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Close() did not finish after peer-opened bidi local send drained")
+	}
+}
+
 func TestGracefulCloseReclaimsCommittedNeverPeerVisibleLocalStream(t *testing.T) {
 	t.Parallel()
 

@@ -1007,7 +1007,7 @@ func (c *Conn) Close() error {
 		c.mu.Unlock()
 		return nil
 	}
-	hasOpenStreams := c.hasLiveStreamsLocked() || c.totalProvisionalCountLocked() > 0
+	hasOpenStreams := c.hasGracefulCloseLiveStreamsLocked() || c.totalProvisionalCountLocked() > 0
 	plan := state.PlanBeginClose(c.lifecycle.sessionState, c.shutdown.gracefulCloseActive, c.lifecycle.closeErr != nil, hasOpenStreams)
 	nextState := plan.NextState
 	switch plan.Outcome {
@@ -2047,7 +2047,7 @@ func (c *Conn) waitForGracefulCloseDrain(timeout time.Duration) error {
 			c.mu.Unlock()
 			return err
 		}
-		if !c.hasLiveStreamsLocked() && c.totalProvisionalCountLocked() == 0 {
+		if !c.hasGracefulCloseLiveStreamsLocked() && c.totalProvisionalCountLocked() == 0 {
 			c.mu.Unlock()
 			return nil
 		}
@@ -4106,6 +4106,18 @@ func (c *Conn) liveStreamCountLocked() int {
 
 func (c *Conn) hasLiveStreamsLocked() bool {
 	return c.liveStreamCountLocked() > 0
+}
+
+func (c *Conn) hasGracefulCloseLiveStreamsLocked() bool {
+	if c == nil || len(c.registry.streams) == 0 {
+		return false
+	}
+	for _, stream := range c.registry.streams {
+		if stream != nil && stream.blocksGracefulSessionCloseLocked() {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Conn) forEachKnownStreamLocked(fn func(*nativeStream)) {

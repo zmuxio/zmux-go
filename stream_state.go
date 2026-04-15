@@ -499,6 +499,25 @@ func (s *nativeStream) awaitingPeerVisibilityLocked() bool {
 	return s.visibilityPhaseLocked().AwaitingPeerVisibility()
 }
 
+func (s *nativeStream) blocksGracefulSessionCloseLocked() bool {
+	if s == nil {
+		return false
+	}
+	if state.FullyTerminal(s.localSend, s.localReceive, s.effectiveSendHalfStateLocked(), s.effectiveRecvHalfStateLocked()) {
+		return false
+	}
+	if s.isLocalOpenedLocked() {
+		return true
+	}
+	if !s.localSend {
+		return false
+	}
+	if s.sendSent == 0 && s.queuedDataBytes == 0 && s.inflightQueued == 0 && !s.hasPendingTerminalControlLocked() {
+		return false
+	}
+	return s.effectiveSendHalfStateLocked() == state.SendHalfOpen
+}
+
 func (s *nativeStream) shouldEmitOpenerFrameLocked() bool {
 	return s.visibilityPhaseLocked().ShouldEmitOpenerFrame()
 }
