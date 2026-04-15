@@ -1209,6 +1209,8 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 			c.lifecycle.sessionState = state.CloseSessionState(c.lifecycle.sessionState, err, ErrSessionClosed)
 		}
 		c.shutdown.gracefulCloseActive = false
+		c.broadcastWriteWakeLocked()
+		c.broadcastUrgentWakeLocked()
 
 		sessionErr := closeSessionStreamErr(c.lifecycle.sessionState, err)
 		c.releaseAllStreamsForSessionCloseLocked(sessionErr)
@@ -1235,7 +1237,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		if c.io.conn != nil {
 			_ = c.io.conn.Close()
 		}
-		drainDetachedWriteLanes(queueVisibleSessionErr(c, c.err()), c.writer.urgentWriteCh, c.writer.advisoryWriteCh, c.writer.writeCh)
+		drainDetachedWriteLanes(queueVisibleSessionErr(c, c.err()), c.writer.advisoryWriteCh, c.writer.writeCh)
 
 		// Clear tombstones after the transport is closed so the ingress
 		// goroutine cannot race against a nil tombstone map.

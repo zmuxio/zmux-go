@@ -399,10 +399,10 @@ func groupStateMap(state *BatchState, capHint int) map[GroupKey]map[uint64][]int
 	}
 	state.scratch.groupQueueCount = 0
 	state.scratch.groupQueueEntryCount = 0
-	if batchScratchOversized(len(state.scratch.groupQueues), capHint) {
+	if batchScratchOversized(cap(state.scratch.groupQueues), capHint) {
 		state.scratch.groupQueues = nil
 	}
-	if batchScratchOversized(len(state.scratch.groupQueueEntries), capHint) {
+	if batchScratchOversized(cap(state.scratch.groupQueueEntries), capHint) {
 		state.scratch.groupQueueEntries = nil
 	} else if state.scratch.groupQueueEntries != nil {
 		state.scratch.groupQueueEntries = state.scratch.groupQueueEntries[:0]
@@ -437,7 +437,7 @@ func streamOrderMap(state *BatchState, capHint int) map[GroupKey][]uint64 {
 		return make(map[GroupKey][]uint64, capHint)
 	}
 	state.scratch.streamOrderEntryCount = 0
-	if batchScratchOversized(len(state.scratch.streamOrderEntries), capHint) {
+	if batchScratchOversized(cap(state.scratch.streamOrderEntries), capHint) {
 		state.scratch.streamOrderEntries = nil
 	} else if state.scratch.streamOrderEntries != nil {
 		state.scratch.streamOrderEntries = state.scratch.streamOrderEntries[:0]

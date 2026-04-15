@@ -600,6 +600,27 @@ func TestBuildBatchGroupsDropsOversizedGroupQueueCache(t *testing.T) {
 	}
 }
 
+func TestBuildBatchGroupsDropsOversizedZeroLenEntryCaches(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	oversizedCap := batchScratchRetainLimit(1) + 1
+	state.scratch.lastBuildCapHint = 64
+	state.scratch.groupQueueEntries = make([][]int, 0, oversizedCap)
+	state.scratch.streamOrderEntries = make([][]uint64, 0, oversizedCap)
+
+	buildBatchGroups(state, []BatchItem{
+		{Request: RequestMeta{GroupKey: GroupKey{Kind: 0, Value: 4}, StreamID: 4, StreamScoped: true, Cost: 1}},
+	})
+
+	if cap(state.scratch.groupQueueEntries) >= oversizedCap {
+		t.Fatalf("group queue entry cache cap = %d, want drop below %d", cap(state.scratch.groupQueueEntries), oversizedCap)
+	}
+	if cap(state.scratch.streamOrderEntries) >= oversizedCap {
+		t.Fatalf("stream order entry cache cap = %d, want drop below %d", cap(state.scratch.streamOrderEntries), oversizedCap)
+	}
+}
+
 func streamReq(streamID uint64, cost int64) RequestMeta {
 	return RequestMeta{
 		GroupKey:     GroupKey{Kind: 0, Value: streamID},

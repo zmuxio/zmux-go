@@ -5063,6 +5063,56 @@ func TestBlockedUrgentQueueReturnsSessionErrorBeforeClosedChOnCloseSession(t *te
 	}
 }
 
+func TestCloseSessionBroadcastsUrgentWakeBeforeClosedCh(t *testing.T) {
+	t.Parallel()
+
+	c, sent, release, handlerDone := newStalledCloseSignalConn(t)
+
+	c.mu.Lock()
+	urgentWake := c.currentUrgentWakeLocked()
+	c.mu.Unlock()
+
+	closeDone := make(chan struct{})
+	go func() {
+		c.closeSession(&ApplicationError{Code: uint64(CodeProtocol), Reason: "bye"})
+		close(closeDone)
+	}()
+
+	select {
+	case <-sent:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("timed out waiting for stalled CLOSE emission")
+	}
+
+	select {
+	case <-urgentWake:
+	case <-c.lifecycle.closedCh:
+		t.Fatal("closedCh closed before urgent wake broadcast")
+	case <-time.After(testCloseWakeTimeout):
+		t.Fatal("closeSession did not broadcast urgent wake before transport close")
+	}
+
+	select {
+	case <-c.lifecycle.closedCh:
+		t.Fatal("closedCh closed before stalled close emission was released")
+	default:
+	}
+
+	close(release)
+
+	select {
+	case <-closeDone:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("closeSession did not finish after releasing stalled close emission")
+	}
+
+	select {
+	case <-handlerDone:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("stalled close handler did not finish")
+	}
+}
+
 func TestWaitReturnsSessionErrorAfterClosedChOnCloseSession(t *testing.T) {
 	t.Parallel()
 
