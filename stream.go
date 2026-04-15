@@ -638,7 +638,13 @@ func (s *nativeStream) writevFinal(parts [][]byte) (int, error) {
 		return 0, ErrSessionClosed
 	}
 
-	total := totalPartLen(parts)
+	total, ok := totalPartLen(parts)
+	if !ok {
+		s.conn.mu.Lock()
+		err := s.writeSurfaceErrLocked(frameSizeError("send DATA payload", errPayloadTooLarge))
+		s.conn.mu.Unlock()
+		return 0, err
+	}
 	if total == 0 {
 		return 0, s.CloseWrite()
 	}
@@ -891,6 +897,10 @@ func (s *nativeStream) setWaitDeadline(t time.Time, op Operation) error {
 		return ErrSessionClosed
 	}
 	s.conn.mu.Lock()
+	if s.conn.lifecycle.closeErr != nil {
+		s.conn.mu.Unlock()
+		return ErrSessionClosed
+	}
 	ws := s.ensureWaitStateLocked()
 	switch op {
 	case OperationRead:

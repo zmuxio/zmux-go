@@ -1818,6 +1818,34 @@ func TestZeroValueStreamSurfaceReturnsSessionClosed(t *testing.T) {
 	}
 }
 
+func TestSetDeadlineAfterSessionCloseReturnsSessionClosed(t *testing.T) {
+	t.Parallel()
+
+	client, server := newConnPair(t)
+	defer func() { _ = server.Close() }()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+
+	client.CloseWithError(applicationErr(uint64(CodeCancelled), "closed"))
+
+	deadline := time.Now().Add(time.Second)
+	if err := stream.SetReadDeadline(deadline); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("SetReadDeadline() err = %v, want %v", err, ErrSessionClosed)
+	}
+	if err := stream.SetWriteDeadline(deadline); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("SetWriteDeadline() err = %v, want %v", err, ErrSessionClosed)
+	}
+	if err := stream.SetDeadline(deadline); !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("SetDeadline() err = %v, want %v", err, ErrSessionClosed)
+	}
+}
+
 func TestCloseReadInvalidCodeDoesNotLeakConnLock(t *testing.T) {
 	t.Parallel()
 
@@ -4672,6 +4700,24 @@ func TestWritevFinalUni(t *testing.T) {
 	}
 	if _, err := stream.Write([]byte("x")); !errors.Is(err, ErrWriteClosed) {
 		t.Fatalf("post-final write err = %v, want %v", err, ErrWriteClosed)
+	}
+}
+
+func TestTotalPartLenWithinRejectsOverflow(t *testing.T) {
+	t.Parallel()
+
+	if total, ok := totalPartLenWithin([][]byte{
+		[]byte("ab"),
+		[]byte("c"),
+	}, 3); !ok || total != 3 {
+		t.Fatalf("totalPartLenWithin exact-fit = (%d, %v), want (3, true)", total, ok)
+	}
+
+	if total, ok := totalPartLenWithin([][]byte{
+		[]byte("ab"),
+		[]byte("cd"),
+	}, 3); ok || total != 0 {
+		t.Fatalf("totalPartLenWithin overflow = (%d, %v), want (0, false)", total, ok)
 	}
 }
 

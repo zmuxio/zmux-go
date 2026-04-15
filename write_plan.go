@@ -16,12 +16,22 @@ type writePrepareWindow struct {
 	frameCap         uint64
 }
 
-func totalPartLen(parts [][]byte) int {
+func totalPartLen(parts [][]byte) (int, bool) {
+	return totalPartLenWithin(parts, int(^uint(0)>>1))
+}
+
+func totalPartLenWithin(parts [][]byte, limit int) (int, bool) {
+	if limit < 0 {
+		return 0, false
+	}
 	total := 0
 	for _, part := range parts {
+		if len(part) > limit-total {
+			return 0, false
+		}
 		total += len(part)
 	}
-	return total
+	return total, true
 }
 
 func advanceParts(parts [][]byte, idx, off, n int) (int, int) {
