@@ -3143,7 +3143,7 @@ func TestDispatchPreparedQueueRequestUrgentWaitUsesUrgentBroadcastWake(t *testin
 	}
 }
 
-func TestDispatchPreparedQueueRequestsClearsTailAfterWaitError(t *testing.T) {
+func TestDispatchPreparedQueueRequestsWaitsForTailAfterWaitError(t *testing.T) {
 	t.Parallel()
 
 	c := &Conn{
@@ -3170,6 +3170,13 @@ func TestDispatchPreparedQueueRequestsClearsTailAfterWaitError(t *testing.T) {
 	}
 
 	queued[0].done <- errors.New("boom")
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("dispatchPreparedQueueRequests returned before tail request completed: %v", err)
+	default:
+	}
+
 	queued[1].done <- nil
 
 	select {
@@ -3178,14 +3185,14 @@ func TestDispatchPreparedQueueRequestsClearsTailAfterWaitError(t *testing.T) {
 			t.Fatal("dispatchPreparedQueueRequests err = nil, want propagated wait error")
 		}
 	case <-time.After(testSignalTimeout):
-		t.Fatal("dispatchPreparedQueueRequests did not return after first wait error")
+		t.Fatal("dispatchPreparedQueueRequests did not return after tail request completed")
 	}
 
 	if reqs[0].frames != nil || reqs[0].done != nil {
 		t.Fatalf("first request retained refs after wait error: frames=%v done=%v", reqs[0].frames, reqs[0].done)
 	}
 	if reqs[1].frames != nil || reqs[1].done != nil || reqs[1].cloneFramesBeforeSend {
-		t.Fatalf("tail request retained refs after early wait error: frames=%v done=%v clone=%v", reqs[1].frames, reqs[1].done, reqs[1].cloneFramesBeforeSend)
+		t.Fatalf("tail request retained refs after wait-drain error: frames=%v done=%v clone=%v", reqs[1].frames, reqs[1].done, reqs[1].cloneFramesBeforeSend)
 	}
 }
 

@@ -1120,13 +1120,15 @@ func (c *Conn) dispatchPreparedQueueRequests(reqs []writeRequest, opts preparedQ
 		}
 		dispatched++
 	}
+	var firstErr error
 	for i := range reqs {
 		if err := c.waitPreparedQueueRequest(&reqs[i]); err != nil {
-			clearPreparedQueueRequests(reqs[i+1:])
-			return err
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (c *Conn) dispatchPreparedQueueRequest(req *writeRequest, opts preparedQueueDispatchOptions) (err error) {
