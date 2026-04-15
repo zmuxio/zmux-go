@@ -167,29 +167,13 @@ func (s *batchWFQActive) commit(candidate wfqGroupCandidate) {
 		return
 	}
 	group := &s.activeGroups[candidate.groupOrder]
-	previousGroupWeight := group.groupWeight
 	previousStreamWeight := group.totalStreamWeight
 	commitWFQSelection(s.state, s.transient, candidate, s.totalGroupWeight, previousStreamWeight)
 	s.updateFeedback(candidate)
 	group.queues[candidate.stream.streamID] = removeQueueEntry(group.queues[candidate.stream.streamID], candidate.stream.queuePos)
 	s.consumeQueuedBytes(candidate.stream.streamID, candidate.stream.cost)
 	rebuildGroupTop(s, group)
-	switch {
-	case previousGroupWeight == 0:
-		s.totalGroupWeight = SaturatingAdd(s.totalGroupWeight, group.groupWeight)
-	case group.groupWeight == 0:
-		if previousGroupWeight >= s.totalGroupWeight {
-			s.totalGroupWeight = 0
-		} else {
-			s.totalGroupWeight -= previousGroupWeight
-		}
-	default:
-		if previousGroupWeight >= s.totalGroupWeight {
-			s.totalGroupWeight = group.groupWeight
-		} else {
-			s.totalGroupWeight = s.totalGroupWeight - previousGroupWeight + group.groupWeight
-		}
-	}
+	s.refreshGroupWeights()
 }
 
 func (s *batchWFQActive) refreshAdvisoryMode(advisoryHeadArmed bool) {
@@ -198,11 +182,10 @@ func (s *batchWFQActive) refreshAdvisoryMode(advisoryHeadArmed bool) {
 		return
 	}
 	s.advisoryOnly = advisoryOnly
-	s.totalGroupWeight = 0
 	for i := range s.activeGroups {
 		rebuildGroupTop(s, &s.activeGroups[i])
-		s.totalGroupWeight = SaturatingAdd(s.totalGroupWeight, s.activeGroups[i].groupWeight)
 	}
+	s.refreshGroupWeights()
 }
 
 func (s *batchWFQActive) rebuildGroupHeap() {
@@ -254,7 +237,7 @@ func rebuildGroupTop(s *batchWFQActive, group *wfqActiveGroup) {
 		group.totalBaseStreamWeight = SaturatingAdd(group.totalBaseStreamWeight, baseWeight)
 		group.totalStreamWeight = SaturatingAdd(group.totalStreamWeight, effectiveWeight)
 		streamStart := max64(streamFinishTag(s.state, s.transient, streamID), groupVirtual)
-		streamFinish := streamStart + serviceTag(cost, effectiveWeight)
+		streamFinish := SaturatingAdd(streamStart, serviceTag(cost, effectiveWeight))
 		candidate := wfqStreamCandidate{
 			streamID:         streamID,
 			reqIdx:           reqIdx,
@@ -281,6 +264,25 @@ func rebuildGroupTop(s *batchWFQActive, group *wfqActiveGroup) {
 	}
 }
 
+func (s *batchWFQActive) refreshGroupWeights() {
+	if s == nil {
+		return
+	}
+	window := FeedbackWindow(s.cfg.SchedulerHint, s.cfg.MaxFramePayload)
+	s.totalGroupWeight = 0
+	for i := range s.activeGroups {
+		group := &s.activeGroups[i]
+		if !group.hasTop {
+			group.baseGroupWeight = 0
+			group.groupWeight = 0
+			continue
+		}
+		group.baseGroupWeight = GroupWeight(group.key, group.top.baseWeight, s.cfg.SchedulerHint)
+		group.groupWeight = AdjustWeightForLag(group.baseGroupWeight, groupLag(s.state, group.key), window, isFreshGroup(s.state, group.key))
+		s.totalGroupWeight = SaturatingAdd(s.totalGroupWeight, group.groupWeight)
+	}
+}
+
 func groupCandidateFor(state *BatchState, transient batchTransientState, cfg BatchConfig, group wfqActiveGroup) wfqGroupCandidate {
 	groupVirtual := state.RootVirtualTime
 	groupWeight := group.groupWeight
@@ -288,7 +290,7 @@ func groupCandidateFor(state *BatchState, transient batchTransientState, cfg Bat
 		groupWeight = GroupWeight(group.key, group.top.weight, cfg.SchedulerHint)
 	}
 	groupStart := max64(groupFinishTag(state, transient, group.key), groupVirtual)
-	groupFinish := groupStart + serviceTag(group.top.cost, groupWeight)
+	groupFinish := SaturatingAdd(groupStart, serviceTag(group.top.cost, groupWeight))
 	return wfqGroupCandidate{
 		groupKey:        group.key,
 		groupVirtual:    groupVirtual,
@@ -360,14 +362,22 @@ func fairShare(cost int64, weight uint64, totalWeight uint64) int64 {
 	if cost <= 0 || weight == 0 || totalWeight == 0 {
 		return 0
 	}
-	return int64((uint64(cost)*weight + totalWeight - 1) / totalWeight)
+	share := SaturatingMulDivCeil(uint64(cost), weight, totalWeight)
+	const maxInt64 = ^uint64(0) >> 1
+	if share > maxInt64 {
+		return int64(maxInt64)
+	}
+	return int64(share)
 }
 
 func clampLag(value int64, window int64) int64 {
 	if window <= 0 {
 		return 0
 	}
-	limit := window * 2
+	limit := maxSignedInt64
+	if window <= maxSignedInt64/2 {
+		limit = window * 2
+	}
 	switch {
 	case value > limit:
 		return limit

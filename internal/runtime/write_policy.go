@@ -88,7 +88,7 @@ func RateLimitedFragmentCap(baseCap, estimatedSendRateBps, priority uint64, hint
 	if budget <= 0 {
 		return baseCap
 	}
-	rateCap := (estimatedSendRateBps * uint64(budget)) / uint64(time.Second)
+	rateCap := SaturatingMulDivFloor(estimatedSendRateBps, uint64(budget), uint64(time.Second))
 	if rateCap == 0 {
 		rateCap = 1
 	}
@@ -105,7 +105,7 @@ func ScaledFragmentCap(max uint64, num uint64, den uint64) uint64 {
 	if den == 0 {
 		return max
 	}
-	v := (max * num) / den
+	v := SaturatingMulDivFloor(max, num, den)
 	if v == 0 {
 		return 1
 	}

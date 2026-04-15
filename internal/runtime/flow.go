@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"math"
+	"math/bits"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -83,6 +84,42 @@ func SaturatingMul(v uint64, n uint64) uint64 {
 	return v * n
 }
 
+func SaturatingMulDivFloor(x, y, d uint64) uint64 {
+	if x == 0 || y == 0 {
+		return 0
+	}
+	if d == 0 {
+		return math.MaxUint64
+	}
+	hi, lo := bits.Mul64(x, y)
+	if hi >= d {
+		return math.MaxUint64
+	}
+	q, _ := bits.Div64(hi, lo, d)
+	return q
+}
+
+func SaturatingMulDivCeil(x, y, d uint64) uint64 {
+	if x == 0 || y == 0 {
+		return 0
+	}
+	if d == 0 {
+		return math.MaxUint64
+	}
+	hi, lo := bits.Mul64(x, y)
+	if hi >= d {
+		return math.MaxUint64
+	}
+	q, r := bits.Div64(hi, lo, d)
+	if r == 0 {
+		return q
+	}
+	if q == math.MaxUint64 {
+		return math.MaxUint64
+	}
+	return q + 1
+}
+
 func LowWatermark(high uint64) uint64 {
 	return high / 2
 }
@@ -132,11 +169,11 @@ func VisibleAcceptBacklogBytesHardCap(maxFramePayload uint64) uint64 {
 	if maxFramePayload == 0 {
 		maxFramePayload = wire.DefaultSettings().MaxFramePayload
 	}
-	perStream := uint64(visibleAcceptPerStreamHWMFrames) * maxFramePayload
+	perStream := SaturatingMul(uint64(visibleAcceptPerStreamHWMFrames), maxFramePayload)
 	if perStream < visibleAcceptPerStreamHWMMin {
 		perStream = visibleAcceptPerStreamHWMMin
 	}
-	limit := uint64(visibleAcceptSessionHWMFactor) * perStream
+	limit := SaturatingMul(uint64(visibleAcceptSessionHWMFactor), perStream)
 	if limit < visibleAcceptBacklogBytesMin {
 		limit = visibleAcceptBacklogBytesMin
 	}
@@ -147,7 +184,7 @@ func LateDataPerStreamCap(initialStreamWindow, maxFramePayload uint64) uint64 {
 	if maxFramePayload == 0 {
 		maxFramePayload = wire.DefaultSettings().MaxFramePayload
 	}
-	limit := 2 * maxFramePayload
+	limit := SaturatingMul(maxFramePayload, 2)
 	if windowCap := initialStreamWindow / 8; windowCap < limit {
 		limit = windowCap
 	}
@@ -159,7 +196,7 @@ func LateDataPerStreamCap(initialStreamWindow, maxFramePayload uint64) uint64 {
 }
 
 func AggregateLateDataCap(maxFramePayload uint64) uint64 {
-	limit := 4 * maxFramePayload
+	limit := SaturatingMul(maxFramePayload, 4)
 	const minCap = 64 * 1024
 	if limit < minCap {
 		limit = minCap

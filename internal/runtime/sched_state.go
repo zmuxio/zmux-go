@@ -256,13 +256,13 @@ func commitWFQSelection(state *BatchState, transient batchTransientState, candid
 	if candidate.groupStart > rootVirtual {
 		rootVirtual = candidate.groupStart
 	}
-	state.RootVirtualTime = rootVirtual + serviceTag(candidate.stream.cost, max64(activeGroupWeight, 1))
+	state.RootVirtualTime = SaturatingAdd(rootVirtual, serviceTag(candidate.stream.cost, max64(activeGroupWeight, 1)))
 
 	groupVirtual := groupVirtualTime(state, transient, candidate.groupKey)
 	if candidate.stream.streamStart > groupVirtual {
 		groupVirtual = candidate.stream.streamStart
 	}
-	setGroupVirtualTime(state, transient, candidate.groupKey, groupVirtual+serviceTag(candidate.stream.cost, max64(activeStreamWeight, 1)))
+	setGroupVirtualTime(state, transient, candidate.groupKey, SaturatingAdd(groupVirtual, serviceTag(candidate.stream.cost, max64(activeStreamWeight, 1))))
 	setGroupFinishTag(state, transient, candidate.groupKey, candidate.groupFinish)
 	setGroupLastServed(state, transient, candidate.groupKey, seq)
 	setStreamFinishTag(state, transient, candidate.stream.streamID, candidate.stream.streamFinish)

@@ -122,19 +122,14 @@ func (s *BatchScheduler) maybeClearIdleHeadState() {
 }
 
 const wfqTagScale uint64 = 256
+const maxSignedInt64 = int64(^uint64(0) >> 1)
 
 func serviceTag(cost int64, weight uint64) uint64 {
 	c := uint64(normalizeCost(cost))
 	if weight == 0 {
 		weight = 1
 	}
-	whole := (c / weight) * wfqTagScale
-	rem := c % weight
-	frac := uint64(0)
-	if rem != 0 {
-		frac = (rem*wfqTagScale + weight - 1) / weight
-	}
-	total := whole + frac
+	total := SaturatingMulDivCeil(c, wfqTagScale, weight)
 	if total == 0 {
 		return 1
 	}
@@ -194,19 +189,22 @@ func StreamWeight(priority, queuedBytes uint64, hint wire.SchedulerHint, maxPayl
 }
 
 func FeedbackWindow(hint wire.SchedulerHint, maxPayload uint64) int64 {
-	window := int64(SchedulerQuantum(maxPayload))
+	window := SchedulerQuantum(maxPayload)
 	switch hint {
 	case wire.SchedulerLatency:
-		window *= 6
+		window = SaturatingMul(window, 6)
 	case wire.SchedulerBulkThroughput:
-		window *= 2
+		window = SaturatingMul(window, 2)
 	default:
-		window *= 4
+		window = SaturatingMul(window, 4)
 	}
-	if window <= 0 {
+	if window == 0 {
 		return 1
 	}
-	return window
+	if window > uint64(maxSignedInt64) {
+		return maxSignedInt64
+	}
+	return int64(window)
 }
 
 func AdjustWeightForLag(base uint64, lag int64, window int64, fresh bool) uint64 {
@@ -221,11 +219,18 @@ func AdjustWeightForLag(base uint64, lag int64, window int64, fresh bool) uint64
 	}
 
 	if lag > 0 {
-		boost := uint64((int64(base) * min64(lag, window)) / window)
+		boost := lagScaledWeight(base, min64(lag, window), uint64(window))
 		return max64(SaturatingAdd(base, max64(boost, 1)), 1)
 	}
-	penalty := uint64((int64(base) * min64(-lag, window)) / (2 * window))
+	penalty := lagScaledWeight(base, min64(-lag, window), SaturatingMul(uint64(window), 2))
 	return base - penalty
+}
+
+func lagScaledWeight(base uint64, magnitude int64, divisor uint64) uint64 {
+	if base == 0 || magnitude <= 0 || divisor == 0 {
+		return 0
+	}
+	return SaturatingMulDivFloor(base, uint64(magnitude), divisor)
 }
 
 func GroupWeight(groupKey GroupKey, streamWeight uint64, hint wire.SchedulerHint) uint64 {
