@@ -6056,6 +6056,38 @@ func TestCloseSessionReturnsAcceptUniBeforeClosedChWhenCloseFrameSendStalls(t *t
 	}
 }
 
+func TestReleaseRejectedPreparedRequestsBroadcastsUrgentWake(t *testing.T) {
+	t.Parallel()
+
+	c := newSessionMemoryTestConn()
+
+	c.mu.Lock()
+	urgentWake := c.currentUrgentWakeLocked()
+	c.flow.urgentQueuedBytes = 9
+	c.mu.Unlock()
+
+	c.releaseRejectedPreparedRequests([]rejectedWriteRequest{
+		{
+			req: writeRequest{
+				urgentReserved: true,
+				queuedBytes:    9,
+			},
+		},
+	})
+
+	select {
+	case <-urgentWake:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("releaseRejectedPreparedRequests did not broadcast urgent wake")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if got := c.flow.urgentQueuedBytes; got != 0 {
+		t.Fatalf("urgentQueuedBytes = %d, want 0 after rejected urgent release", got)
+	}
+}
+
 func newSessionMemoryTestConn() *Conn {
 	settings := DefaultSettings()
 	return &Conn{

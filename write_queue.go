@@ -1078,9 +1078,11 @@ func (c *Conn) releaseRejectedPreparedRequests(rejected []rejectedWriteRequest) 
 		streamWakes   []*nativeStream
 		needBroadcast bool
 		needControl   bool
+		needUrgent    bool
 	)
 	c.mu.Lock()
 	for i := range rejected {
+		needUrgent = needUrgent || (rejected[i].req.urgentReserved && rejected[i].req.queuedBytes > 0)
 		stream, plan := c.releasePreparedWriteRequestLocked(&rejected[i].req)
 		needBroadcast = needBroadcast || plan.Broadcast
 		needControl = needControl || plan.Control
@@ -1090,6 +1092,9 @@ func (c *Conn) releaseRejectedPreparedRequests(rejected []rejectedWriteRequest) 
 	}
 	if needBroadcast {
 		c.broadcastWriteWakeLocked()
+	}
+	if needUrgent {
+		c.broadcastUrgentWakeLocked()
 	}
 	c.mu.Unlock()
 

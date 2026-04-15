@@ -185,6 +185,7 @@ func (s *writeBatchScratch) clearRetainedBatchRefs() {
 	if cap(s.sgBuffers) > 0 {
 		clearNetBuffers(s.sgBuffers[:cap(s.sgBuffers)])
 	}
+	s.clearQueuedStreamRefs()
 }
 
 func (s *writeBatchScratch) dataScratch(n int) ([]rt.BatchItem, map[uint64]struct{}) {
@@ -212,13 +213,20 @@ func (s *writeBatchScratch) queuedStreamScratch(capHint int) map[*nativeStream]u
 	if s.queuedByStream == nil {
 		s.queuedByStream = make(map[*nativeStream]uint64, capHint)
 	} else {
-		for _, stream := range s.queuedStreams {
-			delete(s.queuedByStream, stream)
-		}
+		s.clearQueuedStreamRefs()
+	}
+	return s.queuedByStream
+}
+
+func (s *writeBatchScratch) clearQueuedStreamRefs() {
+	if s == nil {
+		return
+	}
+	for _, stream := range s.queuedStreams {
+		delete(s.queuedByStream, stream)
 	}
 	clear(s.queuedStreams)
 	s.queuedStreams = s.queuedStreams[:0]
-	return s.queuedByStream
 }
 
 func (s *writeBatchScratch) addQueuedStream(stream *nativeStream, queued uint64) {

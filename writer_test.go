@@ -219,6 +219,34 @@ func TestCollectWriteBatchRotatesFlatBatchHeadAcrossBatches(t *testing.T) {
 	}
 }
 
+func TestWriteBatchScratchClearRetainedBatchRefsDropsQueuedStreamRefs(t *testing.T) {
+	t.Parallel()
+
+	scratch := &writeBatchScratch{}
+	streamA := &nativeStream{id: 4, idSet: true}
+	streamB := &nativeStream{id: 8, idSet: true}
+
+	acc := scratch.streamValueAccumulator(2)
+	acc.Add(streamA, 1)
+	acc.Add(streamB, 2)
+
+	if got := len(scratch.queuedStreams); got != 2 {
+		t.Fatalf("queued stream scratch len = %d, want 2", got)
+	}
+	if got := len(scratch.queuedByStream); got != 2 {
+		t.Fatalf("queued stream scratch map len = %d, want 2", got)
+	}
+
+	scratch.clearRetainedBatchRefs()
+
+	if got := len(scratch.queuedStreams); got != 0 {
+		t.Fatalf("queued stream scratch len after clear = %d, want 0", got)
+	}
+	if got := len(scratch.queuedByStream); got != 0 {
+		t.Fatalf("queued stream scratch map len after clear = %d, want 0", got)
+	}
+}
+
 func TestCollectWriteBatchPrefersLowerCostPeerWithinSingleExplicitGroup(t *testing.T) {
 	t.Parallel()
 	c := &Conn{
