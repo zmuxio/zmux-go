@@ -92,14 +92,27 @@ func activeGroupSlice(state *BatchState, capHint int) []wfqActiveGroup {
 	}
 	if batchScratchOversized(cap(state.scratch.activeGroups), capHint) {
 		state.scratch.activeGroups = nil
+		state.scratch.activeGroupCount = 0
 	}
 	if cap(state.scratch.activeGroups) < capHint {
 		state.scratch.activeGroups = make([]wfqActiveGroup, 0, capHint)
+		state.scratch.activeGroupCount = 0
 	} else {
-		if len(state.scratch.activeGroups) > 0 {
-			clear(state.scratch.activeGroups)
+		clearCount := state.scratch.activeGroupCount
+		if clearCount == 0 && len(state.scratch.activeGroups) > 0 {
+			clearCount = cap(state.scratch.activeGroups)
+		}
+		if clearCount < len(state.scratch.activeGroups) {
+			clearCount = len(state.scratch.activeGroups)
+		}
+		if clearCount > cap(state.scratch.activeGroups) {
+			clearCount = cap(state.scratch.activeGroups)
+		}
+		if clearCount > 0 {
+			clear(state.scratch.activeGroups[:clearCount:clearCount])
 		}
 		state.scratch.activeGroups = state.scratch.activeGroups[:0]
+		state.scratch.activeGroupCount = 0
 	}
 	return state.scratch.activeGroups
 }
@@ -135,6 +148,9 @@ func newBatchWFQActive(
 			queues:  prepared.groupState[groupKey],
 			streams: prepared.streamOrder[groupKey],
 		})
+	}
+	if state != nil {
+		state.scratch.activeGroupCount = len(activeGroups)
 	}
 
 	scheduler := &batchWFQActive{

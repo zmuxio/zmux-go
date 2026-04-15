@@ -72,6 +72,7 @@ type batchScratch struct {
 	queuedBytes               map[uint64]uint64
 	streamMeta                map[uint64]StreamMeta
 	activeGroups              []wfqActiveGroup
+	activeGroupCount          int
 	groupCandidates           []wfqGroupCandidate
 	transientStreamFinish     map[uint64]uint64
 	transientStreamLastServed map[uint64]uint64

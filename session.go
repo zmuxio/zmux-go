@@ -1440,9 +1440,8 @@ func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error
 	if writeErr := waitEstablishmentWrite(writeErrCh, establishmentFailureWriteWait); writeErr == nil {
 		closeAfterEstablishmentFailure(conn, local, peer, err)
 		return
-	} else {
-		_ = conn.Close()
 	}
+	_ = conn.Close()
 }
 
 func (c *Conn) closeClosedChLocked() {
