@@ -1168,6 +1168,13 @@ func (r closeFrameSendResult) sent() bool {
 	return r.completed && r.err == nil
 }
 
+func (c *Conn) clearPostCloseProtocolBacklogLocked() {
+	if c == nil {
+		return
+	}
+	c.protocol.tasks = nil
+}
+
 func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolicy closeFramePolicy) {
 	if err == nil {
 		err = ErrSessionClosed
@@ -1223,10 +1230,12 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 
 		c.mu.Lock()
 		c.closeClosedChLocked()
+		c.clearPostCloseProtocolBacklogLocked()
 		c.mu.Unlock()
 		if c.io.conn != nil {
 			_ = c.io.conn.Close()
 		}
+		drainDetachedWriteLanes(queueVisibleSessionErr(c, c.err()), c.writer.advisoryWriteCh, c.writer.writeCh)
 
 		// Clear tombstones after the transport is closed so the ingress
 		// goroutine cannot race against a nil tombstone map.

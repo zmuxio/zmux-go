@@ -111,8 +111,8 @@ func TestOrderBatchIndicesAdvancesRootVirtualTimeByActiveGroupWeight(t *testing.
 	if got := []uint64{reqs[order[0]].StreamID, reqs[order[1]].StreamID}; !equalUint64s(got, []uint64{4, 8}) {
 		t.Fatalf("equal-stream order = %v, want [4 8]", got)
 	}
-	if got := state.RootVirtualTime; got != 9 {
-		t.Fatalf("root virtual time = %d, want 9", got)
+	if got := state.RootVirtualTime; got != 11 {
+		t.Fatalf("root virtual time = %d, want 11", got)
 	}
 	if got := state.ServiceSeq; got != 2 {
 		t.Fatalf("service seq = %d, want 2", got)

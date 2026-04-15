@@ -45,6 +45,7 @@ type dequeuedWriteWork struct {
 }
 
 const maxControlBatchesPerWake = 4
+const maxRetainedScatterGatherSegments = 2048
 
 type streamValueAccumulator struct {
 	scratch      *writeBatchScratch
@@ -127,6 +128,10 @@ func (s *writeBatchScratch) rejectedSlice(capHint int) []rejectedWriteRequest {
 func (s *writeBatchScratch) scatterGatherBuffers(capHint int) net.Buffers {
 	if capHint < 0 {
 		capHint = 0
+	}
+	if cap(s.sgBuffers) > maxRetainedScatterGatherSegments && capHint <= maxRetainedScatterGatherSegments {
+		clearNetBuffers(s.sgBuffers[:cap(s.sgBuffers)])
+		s.sgBuffers = nil
 	}
 	if cap(s.sgBuffers) > 0 {
 		clearNetBuffers(s.sgBuffers[:cap(s.sgBuffers)])

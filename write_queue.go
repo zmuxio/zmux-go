@@ -2,6 +2,7 @@ package zmux
 
 import (
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -91,6 +92,8 @@ type txFrame struct {
 	payloadPartLen int
 	payloadLen     int
 }
+
+const postCloseQueueDrainWindow = 5 * time.Millisecond
 
 type txPayloadKind uint8
 
@@ -2129,6 +2132,48 @@ func (c *Conn) clearWriteQueueReservationsLocked() {
 	c.flow.urgentQueuedBytes = 0
 	c.pending.preparedPriorityBytes = 0
 	c.flow.queuedDataStreams = nil
+}
+
+func drainDetachedWriteLane(ch chan writeRequest, err error) bool {
+	if ch == nil {
+		return false
+	}
+	drained := false
+	for {
+		select {
+		case req := <-ch:
+			drained = true
+			completeWriteRequest(&req, err)
+			req.clearRetainedRefs()
+		default:
+			return drained
+		}
+	}
+}
+
+func drainDetachedWriteLanes(err error, lanes ...chan writeRequest) {
+	if len(lanes) == 0 {
+		return
+	}
+	deadline := time.Now().Add(postCloseQueueDrainWindow)
+	idlePasses := 0
+	for {
+		progressed := false
+		for _, lane := range lanes {
+			if drainDetachedWriteLane(lane, err) {
+				progressed = true
+			}
+		}
+		if progressed {
+			idlePasses = 0
+			continue
+		}
+		idlePasses++
+		if idlePasses >= 2 || time.Now().After(deadline) {
+			return
+		}
+		runtime.Gosched()
+	}
 }
 
 func (c *Conn) trackQueuedDataStreamLocked(stream *nativeStream) {
