@@ -314,6 +314,11 @@ Stable stream methods mean:
 - `CloseWithError(code, reason)`: abort the whole stream
 - `Close`: local helper that closes both existing halves
 
+Payload buffers passed to `Write`, `WriteFinal`, `WritevFinal`, `OpenAndSend`,
+`OpenAndSendWithOptions`, `OpenUniAndSend`, and `OpenUniAndSendWithOptions` are not
+retained after the call returns. Callers may reuse or mutate their input slices
+immediately after the method returns.
+
 Examples:
 
 ```go
