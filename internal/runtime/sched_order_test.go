@@ -727,65 +727,6 @@ func TestBuildBatchGroupsCapturesStreamMetaAndPriorityUpdate(t *testing.T) {
 	}
 }
 
-func TestActiveGroupSliceClearsRetainedNestedReferences(t *testing.T) {
-	t.Parallel()
-
-	state := &BatchState{}
-	state.scratch.activeGroups = make([]wfqActiveGroup, 1, 3)
-	state.scratch.activeGroups[0] = wfqActiveGroup{
-		queues:  map[uint64][]int{4: {0, 1}},
-		streams: []uint64{4, 8},
-		hasTop:  true,
-	}
-	backing := state.scratch.activeGroups[:cap(state.scratch.activeGroups)]
-	backing[1] = wfqActiveGroup{
-		queues:  map[uint64][]int{9: {2}},
-		streams: []uint64{9},
-		hasTop:  true,
-	}
-	backing[2] = wfqActiveGroup{
-		queues:  map[uint64][]int{10: {3}},
-		streams: []uint64{10},
-		hasTop:  true,
-	}
-
-	got := activeGroupSlice(state, 1)
-	if len(got) != 0 {
-		t.Fatalf("active group scratch len = %d, want 0", len(got))
-	}
-
-	if len(backing) == 0 {
-		t.Fatal("expected retained scratch backing")
-	}
-	for i := range backing {
-		if backing[i].queues != nil {
-			t.Fatalf("active group scratch[%d] retained queues: %#v", i, backing[i].queues)
-		}
-		if backing[i].streams != nil {
-			t.Fatalf("active group scratch[%d] retained streams: %#v", i, backing[i].streams)
-		}
-		if backing[i].hasTop {
-			t.Fatalf("active group scratch[%d] retained top marker", i)
-		}
-	}
-}
-
-func TestActiveGroupSliceDropsOversizedBacking(t *testing.T) {
-	t.Parallel()
-
-	state := &BatchState{}
-	oversizedCap := batchScratchRetainLimit(1) + 1
-	state.scratch.activeGroups = make([]wfqActiveGroup, 0, oversizedCap)
-
-	got := activeGroupSlice(state, 1)
-	if len(got) != 0 {
-		t.Fatalf("active group scratch len = %d, want 0", len(got))
-	}
-	if cap(got) >= oversizedCap {
-		t.Fatalf("active group scratch cap = %d, want drop below %d", cap(got), oversizedCap)
-	}
-}
-
 func TestBuildBatchGroupsDropsOversizedGroupQueueCache(t *testing.T) {
 	t.Parallel()
 

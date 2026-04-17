@@ -82,9 +82,6 @@ type batchScratch struct {
 	bypassSelections          map[uint64]int
 	interactiveActiveStreams  []uint64
 	bulkActiveStreams         []uint64
-	activeGroups              []wfqActiveGroup
-	activeGroupCount          int
-	groupCandidates           []wfqGroupCandidate
 	interactiveCandidates     []wfqGroupCandidate
 	bulkCandidates            []wfqGroupCandidate
 	transientStreamFinish     map[uint64]uint64
