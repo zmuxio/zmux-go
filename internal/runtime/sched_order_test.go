@@ -1,6 +1,63 @@
 package runtime
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
+)
+
+func TestOrderBatchIndicesRotatesFlatBatchHeadAcrossBatches(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	reqs := []RequestMeta{
+		streamReq(4, 1),
+		streamReq(8, 1),
+	}
+	streams := map[uint64]StreamMeta{
+		4: {},
+		8: {},
+	}
+
+	first := append([]int(nil), orderBatchIndices(BatchConfig{MaxFramePayload: 16384}, state, reqs, streams)...)
+	second := append([]int(nil), orderBatchIndices(BatchConfig{MaxFramePayload: 16384}, state, reqs, streams)...)
+
+	if got := []uint64{reqs[first[0]].StreamID, reqs[first[1]].StreamID}; !equalUint64s(got, []uint64{4, 8}) {
+		t.Fatalf("first flat batch order = %v, want [4 8]", got)
+	}
+	if got := []uint64{reqs[second[0]].StreamID, reqs[second[1]].StreamID}; !equalUint64s(got, []uint64{8, 4}) {
+		t.Fatalf("second flat batch order = %v, want [8 4]", got)
+	}
+}
+
+func TestOrderBatchIndicesSessionScopedOrdinaryDoesNotConsumeRetainedFlatHead(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	streams := map[uint64]StreamMeta{
+		4: {},
+		8: {},
+	}
+	firstBatch := []RequestMeta{
+		streamReq(4, 1),
+		streamReq(8, 1),
+	}
+	secondBatch := []RequestMeta{
+		{GroupKey: GroupKey{Kind: 2, Value: 0}, Cost: 1},
+		streamReq(4, 1),
+		streamReq(8, 1),
+	}
+
+	first := append([]int(nil), orderBatchIndices(BatchConfig{MaxFramePayload: 16384}, state, firstBatch, streams)...)
+	second := append([]int(nil), orderBatchIndices(BatchConfig{MaxFramePayload: 16384}, state, secondBatch, streams)...)
+
+	if got := []uint64{firstBatch[first[0]].StreamID, firstBatch[first[1]].StreamID}; !equalUint64s(got, []uint64{4, 8}) {
+		t.Fatalf("seed batch order = %v, want [4 8]", got)
+	}
+	if got := second; len(got) != 3 || got[0] != 0 || secondBatch[got[1]].StreamID != 8 || secondBatch[got[2]].StreamID != 4 {
+		t.Fatalf("session-scoped ordinary order = %v, want [0 2 1]", got)
+	}
+}
 
 func TestOrderUrgentBatchOrdersSameRankStreamScopedByAscendingStreamID(t *testing.T) {
 	t.Parallel()
@@ -139,8 +196,8 @@ func TestOrderBatchIndicesAdvancesGroupVirtualTimeByActiveStreamWeight(t *testin
 	if got := state.RootVirtualTime; got != 19 {
 		t.Fatalf("root virtual time = %d, want 19", got)
 	}
-	if got := state.GroupVirtualTime[groupKey]; got != 11 {
-		t.Fatalf("group virtual time = %d, want 11", got)
+	if got := state.GroupVirtualTime[groupKey]; got != 6 {
+		t.Fatalf("group virtual time = %d, want 6", got)
 	}
 }
 
@@ -416,6 +473,138 @@ func TestOrderBatchIndicesRecordsRetainedWFQStateForRealStreamsOnly(t *testing.T
 	}
 }
 
+func TestOrderBatchIndicesDoesNotRetainSyntheticLagState(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	reqs := []RequestMeta{
+		streamReq(4, 1),
+		{GroupKey: GroupKey{Kind: 2, Value: 1}, Cost: 1},
+		{GroupKey: GroupKey{Kind: 2, Value: 2}, Cost: 1},
+	}
+
+	order := orderBatchIndices(BatchConfig{GroupFair: true, MaxFramePayload: 16384}, state, reqs, map[uint64]StreamMeta{
+		4: {},
+	})
+	if len(order) != len(reqs) {
+		t.Fatalf("order len = %d, want %d", len(order), len(reqs))
+	}
+	for streamID := range state.StreamLag {
+		if isSyntheticStreamKey(streamID) {
+			t.Fatalf("retained synthetic stream lag for stream %d: %#v", streamID, state.StreamLag)
+		}
+	}
+	for groupKey := range state.GroupLag {
+		if isTransientGroupKey(groupKey) {
+			t.Fatalf("retained transient group lag for group %#v: %#v", groupKey, state.GroupLag)
+		}
+	}
+}
+
+func TestOrderBatchIndicesMixedBatchRetainsOnlyRealStreamState(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	reqs := []RequestMeta{
+		{GroupKey: GroupKey{Kind: 2, Value: 1}, Cost: 1},
+		streamReq(4, 1),
+		{GroupKey: GroupKey{Kind: 2, Value: 2}, Cost: 1},
+	}
+
+	order := orderBatchIndices(BatchConfig{MaxFramePayload: 16384}, state, reqs, map[uint64]StreamMeta{
+		4: {},
+	})
+	if len(order) != len(reqs) {
+		t.Fatalf("order len = %d, want %d", len(order), len(reqs))
+	}
+	if len(state.StreamFinishTag) != 1 {
+		t.Fatalf("retained stream finish tags = %#v, want one real-stream entry", state.StreamFinishTag)
+	}
+	if _, ok := state.StreamFinishTag[4]; !ok {
+		t.Fatalf("real stream finish tag missing: %#v", state.StreamFinishTag)
+	}
+	for streamID := range state.StreamFinishTag {
+		if isSyntheticStreamKey(streamID) {
+			t.Fatalf("retained synthetic stream finish tag for stream %d: %#v", streamID, state.StreamFinishTag)
+		}
+	}
+}
+
+func TestOrderBatchIndicesBalancedSchedulerReservesBulkOpportunityWithinFourSelections(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	reqs := []RequestMeta{
+		streamReq(4, 64),
+		streamReq(4, 64),
+		streamReq(4, 64),
+		streamReq(4, 64),
+		streamReq(8, 900),
+		streamReq(8, 900),
+		streamReq(8, 900),
+		streamReq(8, 900),
+	}
+	streams := map[uint64]StreamMeta{
+		4: {},
+		8: {},
+	}
+
+	order := orderBatchIndices(BatchConfig{
+		SchedulerHint:   wire.SchedulerLatency,
+		MaxFramePayload: 1024,
+	}, state, reqs, streams)
+
+	var bulkSelections int
+	for _, idx := range order[:4] {
+		if reqs[idx].StreamID == 8 {
+			bulkSelections++
+		}
+	}
+	if bulkSelections < 1 {
+		t.Fatalf("first four selections = %v, want at least one bulk stream 8", order[:4])
+	}
+}
+
+func TestOrderBatchIndicesRetainedClassHysteresisKeepsMidQueueBulkAcrossBatches(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	streams := map[uint64]StreamMeta{
+		4: {},
+		8: {},
+	}
+
+	orderBatchIndices(BatchConfig{
+		SchedulerHint:   wire.SchedulerBulkThroughput,
+		MaxFramePayload: 1024,
+	}, state, []RequestMeta{
+		streamReq(8, 64),
+		streamReq(4, 900),
+		streamReq(4, 900),
+		streamReq(4, 900),
+	}, streams)
+
+	if got := state.StreamClass[4]; got != trafficClassBulk {
+		t.Fatalf("stream 4 class = %v, want bulk", got)
+	}
+
+	orderBatchIndices(BatchConfig{
+		SchedulerHint:   wire.SchedulerBulkThroughput,
+		MaxFramePayload: 1024,
+	}, state, []RequestMeta{
+		streamReq(4, 768),
+		streamReq(4, 768),
+		streamReq(8, 64),
+	}, streams)
+
+	if got := state.StreamClass[4]; got != trafficClassBulk {
+		t.Fatalf("stream 4 class after hysteresis batch = %v, want bulk", got)
+	}
+	if got := state.StreamClass[8]; got != trafficClassInteractive {
+		t.Fatalf("stream 8 class after hysteresis batch = %v, want interactive", got)
+	}
+}
+
 func TestBuildBatchGroupsReusesAndClearsNestedQueueMaps(t *testing.T) {
 	t.Parallel()
 
@@ -472,6 +661,26 @@ func TestBuildBatchGroupsRecyclesNestedQueueAndOrderSlices(t *testing.T) {
 	}
 	if state.scratch.streamOrderEntryCount == 0 {
 		t.Fatal("expected second build to reuse a recycled stream-order slice")
+	}
+}
+
+func TestOrderBatchIndicesTransientHeadPreservesRecycledQueueCapacity(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	items := []BatchItem{
+		{Request: RequestMeta{GroupKey: GroupKey{Kind: 2, Value: 1}, Cost: 1}},
+		{Request: RequestMeta{GroupKey: GroupKey{Kind: 0, Value: 4}, StreamID: 4, StreamScoped: true, Cost: 1}},
+	}
+
+	buildBatchGroups(state, items)
+	_ = OrderBatchIndices(BatchConfig{GroupFair: true, MaxFramePayload: 1024}, state, items)
+	buildBatchGroups(state, items)
+
+	for i, queue := range state.scratch.groupQueueEntries {
+		if cap(queue) == 0 {
+			t.Fatalf("recycled queue slice %d lost capacity", i)
+		}
 	}
 }
 
@@ -618,6 +827,45 @@ func TestBuildBatchGroupsDropsOversizedZeroLenEntryCaches(t *testing.T) {
 	}
 	if cap(state.scratch.streamOrderEntries) >= oversizedCap {
 		t.Fatalf("stream order entry cache cap = %d, want drop below %d", cap(state.scratch.streamOrderEntries), oversizedCap)
+	}
+}
+
+func TestPrepareBatchScratchForBuildDropsOversizedClassAwareScratch(t *testing.T) {
+	t.Parallel()
+
+	oversizedHint := batchScratchRetainLimit(1) + 1
+	state := &BatchState{}
+	state.scratch.lastBuildCapHint = oversizedHint
+	state.scratch.preparedStreams = map[uint64]batchPreparedStream{4: {class: trafficClassInteractive}}
+	state.scratch.bypassSelections = map[uint64]int{4: 3}
+	state.scratch.groups = make([]batchBuiltGroup, 0, oversizedHint)
+	state.scratch.interactiveActiveStreams = make([]uint64, 0, oversizedHint)
+	state.scratch.bulkActiveStreams = make([]uint64, 0, oversizedHint)
+	state.scratch.interactiveCandidates = make([]wfqGroupCandidate, 0, oversizedHint)
+	state.scratch.bulkCandidates = make([]wfqGroupCandidate, 0, oversizedHint)
+
+	prepareBatchScratchForBuild(state, 1)
+
+	if state.scratch.preparedStreams != nil {
+		t.Fatal("expected oversized preparedStreams scratch to drop")
+	}
+	if state.scratch.bypassSelections != nil {
+		t.Fatal("expected oversized bypassSelections scratch to drop")
+	}
+	if state.scratch.groups != nil {
+		t.Fatal("expected oversized groups scratch to drop")
+	}
+	if state.scratch.interactiveActiveStreams != nil {
+		t.Fatal("expected oversized interactiveActiveStreams scratch to drop")
+	}
+	if state.scratch.bulkActiveStreams != nil {
+		t.Fatal("expected oversized bulkActiveStreams scratch to drop")
+	}
+	if state.scratch.interactiveCandidates != nil {
+		t.Fatal("expected oversized interactiveCandidates scratch to drop")
+	}
+	if state.scratch.bulkCandidates != nil {
+		t.Fatal("expected oversized bulkCandidates scratch to drop")
 	}
 }
 

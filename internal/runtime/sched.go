@@ -82,6 +82,9 @@ func (s *BatchScheduler) DropStream(streamID uint64, explicitGroup bool, groupID
 	delete(s.State.StreamFinishTag, streamID)
 	delete(s.State.StreamLastService, streamID)
 	delete(s.State.StreamLag, streamID)
+	delete(s.State.StreamClass, streamID)
+	delete(s.State.StreamLastSeenBatch, streamID)
+	delete(s.State.SmallBurstDisarmed, streamID)
 	if !explicitGroup || groupID == 0 {
 		delete(s.State.GroupVirtualTime, GroupKey{Kind: 0, Value: streamID})
 		delete(s.State.GroupFinishTag, GroupKey{Kind: 0, Value: streamID})
@@ -107,6 +110,9 @@ func (s *BatchScheduler) maybeClearIdleHeadState() {
 	if len(s.State.StreamFinishTag) != 0 ||
 		len(s.State.StreamLastService) != 0 ||
 		len(s.State.StreamLag) != 0 ||
+		len(s.State.StreamClass) != 0 ||
+		len(s.State.StreamLastSeenBatch) != 0 ||
+		len(s.State.SmallBurstDisarmed) != 0 ||
 		len(s.State.GroupVirtualTime) != 0 ||
 		len(s.State.GroupFinishTag) != 0 ||
 		len(s.State.GroupLastService) != 0 ||
@@ -119,6 +125,9 @@ func (s *BatchScheduler) maybeClearIdleHeadState() {
 	s.State.PreferredGroupHead = GroupKey{}
 	s.State.HasPreferredGroupHead = false
 	s.State.ServiceSeq = 0
+	s.State.BatchSeq = 0
+	s.State.InteractiveStreak = 0
+	s.State.ClassSelectionsSinceBulk = 0
 }
 
 const wfqTagScale uint64 = 256

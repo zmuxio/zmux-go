@@ -308,14 +308,19 @@ func groupCandidateFor(state *BatchState, transient batchTransientState, cfg Bat
 	groupStart := max64(groupFinishTag(state, transient, group.key), groupVirtual)
 	groupFinish := SaturatingAdd(groupStart, serviceTag(group.top.cost, groupWeight))
 	return wfqGroupCandidate{
-		groupKey:        group.key,
-		groupVirtual:    groupVirtual,
-		groupStart:      groupStart,
-		groupFinish:     groupFinish,
-		groupLastServed: groupLastServed(state, transient, group.key),
-		eligible:        groupStart <= groupVirtual && group.top.eligible,
-		groupOrder:      group.order,
-		stream:          group.top,
+		groupKey:              group.key,
+		groupVirtual:          groupVirtual,
+		groupStart:            groupStart,
+		groupFinish:           groupFinish,
+		groupLastServed:       groupLastServed(state, transient, group.key),
+		eligible:              groupStart <= groupVirtual && group.top.eligible,
+		groupOrder:            group.order,
+		class:                 trafficClassInteractive,
+		baseGroupWeight:       group.baseGroupWeight,
+		groupWeight:           max64(groupWeight, 1),
+		totalBaseStreamWeight: group.totalBaseStreamWeight,
+		totalStreamWeight:     group.totalStreamWeight,
+		stream:                group.top,
 	}
 }
 

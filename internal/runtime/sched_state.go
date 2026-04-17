@@ -44,24 +44,31 @@ type BatchConfig struct {
 }
 
 type BatchState struct {
-	RootVirtualTime       uint64
-	GroupVirtualTime      map[GroupKey]uint64
-	GroupFinishTag        map[GroupKey]uint64
-	GroupLastService      map[GroupKey]uint64
-	GroupLag              map[GroupKey]int64
-	StreamFinishTag       map[uint64]uint64
-	StreamLastService     map[uint64]uint64
-	StreamLag             map[uint64]int64
-	PreferredGroupHead    GroupKey
-	HasPreferredGroupHead bool
-	PreferredStreamHead   map[GroupKey]uint64
-	ServiceSeq            uint64
-	scratch               batchScratch
+	RootVirtualTime          uint64
+	GroupVirtualTime         map[GroupKey]uint64
+	GroupFinishTag           map[GroupKey]uint64
+	GroupLastService         map[GroupKey]uint64
+	GroupLag                 map[GroupKey]int64
+	StreamFinishTag          map[uint64]uint64
+	StreamLastService        map[uint64]uint64
+	StreamLag                map[uint64]int64
+	StreamClass              map[uint64]trafficClass
+	StreamLastSeenBatch      map[uint64]uint64
+	SmallBurstDisarmed       map[uint64]struct{}
+	PreferredGroupHead       GroupKey
+	HasPreferredGroupHead    bool
+	PreferredStreamHead      map[GroupKey]uint64
+	ServiceSeq               uint64
+	BatchSeq                 uint64
+	InteractiveStreak        uint32
+	ClassSelectionsSinceBulk uint32
+	scratch                  batchScratch
 }
 
 type batchScratch struct {
 	groupOrder                []GroupKey
 	groupState                map[GroupKey]map[uint64][]int
+	groups                    []batchBuiltGroup
 	groupQueues               []map[uint64][]int
 	groupQueueCount           int
 	groupQueueEntries         [][]int
@@ -71,9 +78,15 @@ type batchScratch struct {
 	streamOrderEntryCount     int
 	queuedBytes               map[uint64]uint64
 	streamMeta                map[uint64]StreamMeta
+	preparedStreams           map[uint64]batchPreparedStream
+	bypassSelections          map[uint64]int
+	interactiveActiveStreams  []uint64
+	bulkActiveStreams         []uint64
 	activeGroups              []wfqActiveGroup
 	activeGroupCount          int
 	groupCandidates           []wfqGroupCandidate
+	interactiveCandidates     []wfqGroupCandidate
+	bulkCandidates            []wfqGroupCandidate
 	transientStreamFinish     map[uint64]uint64
 	transientStreamLastServed map[uint64]uint64
 	transientGroupVirtual     map[GroupKey]uint64
@@ -119,6 +132,14 @@ type batchTransientState struct {
 	groupLastServed  map[GroupKey]uint64
 }
 
+type batchStreamSelection struct {
+	reqIdx           int
+	queuePos         int
+	cost             int64
+	baseWeight       uint64
+	isPriorityUpdate bool
+}
+
 type wfqStreamCandidate struct {
 	streamID         uint64
 	reqIdx           int
@@ -136,14 +157,19 @@ type wfqStreamCandidate struct {
 }
 
 type wfqGroupCandidate struct {
-	groupKey        GroupKey
-	groupVirtual    uint64
-	groupStart      uint64
-	groupFinish     uint64
-	groupLastServed uint64
-	eligible        bool
-	groupOrder      int
-	stream          wfqStreamCandidate
+	groupKey              GroupKey
+	groupVirtual          uint64
+	groupStart            uint64
+	groupFinish           uint64
+	groupLastServed       uint64
+	eligible              bool
+	groupOrder            int
+	class                 trafficClass
+	baseGroupWeight       uint64
+	groupWeight           uint64
+	totalBaseStreamWeight uint64
+	totalStreamWeight     uint64
+	stream                wfqStreamCandidate
 }
 
 func groupVirtualTime(state *BatchState, transient batchTransientState, groupKey GroupKey) uint64 {
@@ -229,7 +255,7 @@ func groupLag(state *BatchState, groupKey GroupKey) int64 {
 }
 
 func setGroupLag(state *BatchState, groupKey GroupKey, value int64) {
-	if state == nil || state.GroupLag == nil {
+	if state == nil || state.GroupLag == nil || isTransientGroupKey(groupKey) {
 		return
 	}
 	state.GroupLag[groupKey] = value
@@ -243,7 +269,7 @@ func streamLag(state *BatchState, streamID uint64) int64 {
 }
 
 func setStreamLag(state *BatchState, streamID uint64, value int64) {
-	if state == nil || state.StreamLag == nil {
+	if state == nil || state.StreamLag == nil || isSyntheticStreamKey(streamID) {
 		return
 	}
 	state.StreamLag[streamID] = value
@@ -295,6 +321,15 @@ func normalizeBatchState(state *BatchState) *BatchState {
 	if state.StreamLag == nil {
 		state.StreamLag = make(map[uint64]int64)
 	}
+	if state.StreamClass == nil {
+		state.StreamClass = make(map[uint64]trafficClass)
+	}
+	if state.StreamLastSeenBatch == nil {
+		state.StreamLastSeenBatch = make(map[uint64]uint64)
+	}
+	if state.SmallBurstDisarmed == nil {
+		state.SmallBurstDisarmed = make(map[uint64]struct{})
+	}
 	if state.PreferredStreamHead == nil {
 		state.PreferredStreamHead = make(map[GroupKey]uint64)
 	}
@@ -307,6 +342,7 @@ func prepareBatchScratchForBuild(state *BatchState, capHint int) {
 	}
 	if batchScratchOversized(state.scratch.lastBuildCapHint, capHint) {
 		state.scratch.groupState = nil
+		state.scratch.groups = nil
 		state.scratch.groupQueues = nil
 		state.scratch.groupQueueCount = 0
 		state.scratch.groupQueueEntries = nil
@@ -316,6 +352,12 @@ func prepareBatchScratchForBuild(state *BatchState, capHint int) {
 		state.scratch.streamOrderEntryCount = 0
 		state.scratch.queuedBytes = nil
 		state.scratch.streamMeta = nil
+		state.scratch.preparedStreams = nil
+		state.scratch.bypassSelections = nil
+		state.scratch.interactiveActiveStreams = nil
+		state.scratch.bulkActiveStreams = nil
+		state.scratch.interactiveCandidates = nil
+		state.scratch.bulkCandidates = nil
 		state.scratch.transientStreamFinish = nil
 		state.scratch.transientStreamLastServed = nil
 		state.scratch.transientGroupVirtual = nil
@@ -335,6 +377,9 @@ func hasRetainedRealBatchState(state *BatchState) bool {
 		len(state.GroupLastService) != 0 ||
 		len(state.StreamFinishTag) != 0 ||
 		len(state.StreamLastService) != 0 ||
+		len(state.StreamClass) != 0 ||
+		len(state.StreamLastSeenBatch) != 0 ||
+		len(state.SmallBurstDisarmed) != 0 ||
 		len(state.PreferredStreamHead) != 0 ||
 		state.HasPreferredGroupHead
 }
@@ -355,7 +400,19 @@ func scrubIdleRetainedBatchState(state *BatchState) {
 	if state.StreamLag != nil {
 		clear(state.StreamLag)
 	}
+	if state.StreamClass != nil {
+		clear(state.StreamClass)
+	}
+	if state.StreamLastSeenBatch != nil {
+		clear(state.StreamLastSeenBatch)
+	}
+	if state.SmallBurstDisarmed != nil {
+		clear(state.SmallBurstDisarmed)
+	}
 	state.ServiceSeq = 0
+	state.BatchSeq = 0
+	state.InteractiveStreak = 0
+	state.ClassSelectionsSinceBulk = 0
 }
 
 func maybeRebaseWFQState(state *BatchState) {
@@ -414,6 +471,21 @@ func groupStateMap(state *BatchState, capHint int) map[GroupKey]map[uint64][]int
 		clear(state.scratch.groupState)
 	}
 	return state.scratch.groupState
+}
+
+func groupBuildSlice(state *BatchState, capHint int) []batchBuiltGroup {
+	if state == nil {
+		return make([]batchBuiltGroup, 0, capHint)
+	}
+	if batchScratchOversized(cap(state.scratch.groups), capHint) {
+		state.scratch.groups = nil
+	}
+	if cap(state.scratch.groups) < capHint {
+		state.scratch.groups = make([]batchBuiltGroup, 0, capHint)
+	} else {
+		state.scratch.groups = state.scratch.groups[:0]
+	}
+	return state.scratch.groups
 }
 
 func nextGroupQueueMap(state *BatchState) map[uint64][]int {
@@ -512,6 +584,60 @@ func queuedBytesMap(state *BatchState) map[uint64]uint64 {
 	return state.scratch.queuedBytes
 }
 
+func preparedStreamMap(state *BatchState, capHint int) map[uint64]batchPreparedStream {
+	if state == nil {
+		return make(map[uint64]batchPreparedStream, capHint)
+	}
+	if state.scratch.preparedStreams == nil {
+		state.scratch.preparedStreams = make(map[uint64]batchPreparedStream, capHint)
+	} else {
+		clear(state.scratch.preparedStreams)
+	}
+	return state.scratch.preparedStreams
+}
+
+func bypassSelectionsMap(state *BatchState, capHint int) map[uint64]int {
+	if state == nil {
+		return make(map[uint64]int, capHint)
+	}
+	if state.scratch.bypassSelections == nil {
+		state.scratch.bypassSelections = make(map[uint64]int, capHint)
+	} else {
+		clear(state.scratch.bypassSelections)
+	}
+	return state.scratch.bypassSelections
+}
+
+func interactiveActiveStreamSlice(state *BatchState, capHint int) []uint64 {
+	if state == nil {
+		return make([]uint64, 0, capHint)
+	}
+	if batchScratchOversized(cap(state.scratch.interactiveActiveStreams), capHint) {
+		state.scratch.interactiveActiveStreams = nil
+	}
+	if cap(state.scratch.interactiveActiveStreams) < capHint {
+		state.scratch.interactiveActiveStreams = make([]uint64, 0, capHint)
+	} else {
+		state.scratch.interactiveActiveStreams = state.scratch.interactiveActiveStreams[:0]
+	}
+	return state.scratch.interactiveActiveStreams
+}
+
+func bulkActiveStreamSlice(state *BatchState, capHint int) []uint64 {
+	if state == nil {
+		return make([]uint64, 0, capHint)
+	}
+	if batchScratchOversized(cap(state.scratch.bulkActiveStreams), capHint) {
+		state.scratch.bulkActiveStreams = nil
+	}
+	if cap(state.scratch.bulkActiveStreams) < capHint {
+		state.scratch.bulkActiveStreams = make([]uint64, 0, capHint)
+	} else {
+		state.scratch.bulkActiveStreams = state.scratch.bulkActiveStreams[:0]
+	}
+	return state.scratch.bulkActiveStreams
+}
+
 func transientStreamFinishMap(state *BatchState, capHint int) map[uint64]uint64 {
 	if state == nil {
 		return make(map[uint64]uint64, capHint)
@@ -597,6 +723,36 @@ func orderedSlice(state *BatchState, n int, capHint int) []int {
 		state.scratch.ordered = state.scratch.ordered[:n]
 	}
 	return state.scratch.ordered
+}
+
+func interactiveCandidateSlice(state *BatchState, capHint int) []wfqGroupCandidate {
+	if state == nil {
+		return make([]wfqGroupCandidate, 0, capHint)
+	}
+	if batchScratchOversized(cap(state.scratch.interactiveCandidates), capHint) {
+		state.scratch.interactiveCandidates = nil
+	}
+	if cap(state.scratch.interactiveCandidates) < capHint {
+		state.scratch.interactiveCandidates = make([]wfqGroupCandidate, 0, capHint)
+	} else {
+		state.scratch.interactiveCandidates = state.scratch.interactiveCandidates[:0]
+	}
+	return state.scratch.interactiveCandidates
+}
+
+func bulkCandidateSlice(state *BatchState, capHint int) []wfqGroupCandidate {
+	if state == nil {
+		return make([]wfqGroupCandidate, 0, capHint)
+	}
+	if batchScratchOversized(cap(state.scratch.bulkCandidates), capHint) {
+		state.scratch.bulkCandidates = nil
+	}
+	if cap(state.scratch.bulkCandidates) < capHint {
+		state.scratch.bulkCandidates = make([]wfqGroupCandidate, 0, capHint)
+	} else {
+		state.scratch.bulkCandidates = state.scratch.bulkCandidates[:0]
+	}
+	return state.scratch.bulkCandidates
 }
 
 func groupOrderSlice(state *BatchState, n int, capHint int) []GroupKey {
