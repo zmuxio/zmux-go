@@ -13,7 +13,6 @@ const (
 	interactiveBurstLimit uint32 = 8
 	bulkReserveWindow     uint32 = 4
 	bulkEntryMultiplier   uint64 = 2
-	bulkQuantumMultiplier uint64 = 4
 	agingRoundThreshold          = 2
 	classScoreScale       uint64 = 8
 )

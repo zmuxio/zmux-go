@@ -244,11 +244,10 @@ func OrderBatchIndices(cfg BatchConfig, state *BatchState, items []BatchItem) []
 		candidate := interactiveBest
 		var candidates []wfqGroupCandidate
 		var totalGroupWeight uint64
-		activeClassStreams := interactiveActive
+		var activeClassStreams []uint64
 		switch selectedClass {
 		case trafficClassBulk:
 			if bulkBest.stream.streamID == 0 && interactiveBest.stream.streamID != 0 {
-				selectedClass = trafficClassInteractive
 				candidate = interactiveBest
 				candidates = interactiveCandidates
 				totalGroupWeight = interactiveGroupWeight
@@ -261,7 +260,6 @@ func OrderBatchIndices(cfg BatchConfig, state *BatchState, items []BatchItem) []
 			}
 		default:
 			if interactiveBest.stream.streamID == 0 && bulkBest.stream.streamID != 0 {
-				selectedClass = trafficClassBulk
 				candidate = bulkBest
 				candidates = bulkCandidates
 				totalGroupWeight = bulkGroupWeight
