@@ -656,20 +656,21 @@ type PressureStats struct {
 
 // SessionStats is a snapshot of session state and runtime counters.
 type SessionStats struct {
-	State               SessionState
-	KeepaliveInterval   time.Duration
-	KeepaliveTimeout    time.Duration
-	PingOutstanding     bool
-	PingStalled         bool
-	Progress            ProgressStats
-	LastInboundFrameAt  time.Time
-	LastControlProgress time.Time
-	LastTransportWrite  time.Time
-	LastStreamProgress  time.Time
-	LastAppProgress     time.Time
-	LastPingSentAt      time.Time
-	LastPongAt          time.Time
-	LastPingRTT         time.Duration
+	State                    SessionState
+	KeepaliveInterval        time.Duration
+	KeepaliveMaxPingInterval time.Duration
+	KeepaliveTimeout         time.Duration
+	PingOutstanding          bool
+	PingStalled              bool
+	Progress                 ProgressStats
+	LastInboundFrameAt       time.Time
+	LastControlProgress      time.Time
+	LastTransportWrite       time.Time
+	LastStreamProgress       time.Time
+	LastAppProgress          time.Time
+	LastPingSentAt           time.Time
+	LastPongAt               time.Time
+	LastPingRTT              time.Duration
 
 	Queues            QueueStats
 	Flush             FlushStats
@@ -864,11 +865,12 @@ func (c *Conn) Stats() SessionStats {
 	provisionalUni := c.provisionalCountLocked(streamArityUni)
 
 	return SessionStats{
-		State:             publicSessionState(c.lifecycle.sessionState),
-		KeepaliveInterval: c.liveness.keepaliveInterval,
-		KeepaliveTimeout:  c.liveness.keepaliveTimeout,
-		PingOutstanding:   c.liveness.pingOutstanding,
-		PingStalled:       stalled,
+		State:                    publicSessionState(c.lifecycle.sessionState),
+		KeepaliveInterval:        c.liveness.keepaliveInterval,
+		KeepaliveMaxPingInterval: c.liveness.keepaliveMaxPingInterval,
+		KeepaliveTimeout:         c.liveness.keepaliveTimeout,
+		PingOutstanding:          c.liveness.pingOutstanding,
+		PingStalled:              stalled,
 		Progress: ProgressStats{
 			TransportProgressAt:   c.liveness.lastTransportWriteAt,
 			MuxControlProgressAt:  c.liveness.lastControlProgressAt,
@@ -1651,7 +1653,10 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 	c.registry.activePeerUni = 0
 
 	c.liveness.keepaliveInterval = 0
-	c.liveness.keepaliveDueAt = time.Time{}
+	c.liveness.keepaliveMaxPingInterval = 0
+	c.liveness.readIdlePingDueAt = time.Time{}
+	c.liveness.writeIdlePingDueAt = time.Time{}
+	c.liveness.maxPingDueAt = time.Time{}
 	c.liveness.pingOutstanding = false
 	c.liveness.pingPayload = nil
 	c.liveness.lastPingSentAt = time.Time{}
@@ -2206,13 +2211,14 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 			livenessCh: livenessCh,
 		},
 		liveness: connLivenessState{
-			keepaliveInterval:     cfg.KeepaliveInterval,
-			keepaliveTimeout:      cfg.KeepaliveTimeout,
-			keepaliveJitterState:  rt.InitKeepaliveJitterState(local.TieBreakerNonce ^ peer.TieBreakerNonce),
-			pingNonceState:        rt.InitSessionNonceState((local.TieBreakerNonce << 1) ^ peer.TieBreakerNonce),
-			lastInboundFrameAt:    now,
-			lastControlProgressAt: now,
-			lastTransportWriteAt:  now,
+			keepaliveInterval:        cfg.KeepaliveInterval,
+			keepaliveMaxPingInterval: cfg.KeepaliveMaxPingInterval,
+			keepaliveTimeout:         cfg.KeepaliveTimeout,
+			keepaliveJitterState:     rt.InitKeepaliveJitterState(local.TieBreakerNonce ^ peer.TieBreakerNonce),
+			pingNonceState:           rt.InitSessionNonceState((local.TieBreakerNonce << 1) ^ peer.TieBreakerNonce),
+			lastInboundFrameAt:       now,
+			lastControlProgressAt:    now,
+			lastTransportWriteAt:     now,
 		},
 		sessionControl: connSessionControlState{
 			peerGoAwayBidi:  MaxVarint62,
@@ -2235,7 +2241,7 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 	}
 	c.bootstrapRuntimeQueuesLocked()
 	c.applyConfigRuntimePolicy(cfg)
-	c.resetKeepaliveDueLocked(now)
+	c.resetKeepaliveSchedulesLocked(now)
 	go c.writeLoop()
 	go c.readLoop()
 	if c.liveness.keepaliveInterval > 0 {
@@ -2335,22 +2341,25 @@ type connRuntimeMetricsState struct {
 }
 
 type connLivenessState struct {
-	keepaliveInterval     time.Duration
-	keepaliveTimeout      time.Duration
-	keepaliveJitterState  uint64
-	pingNonceState        uint64
-	keepaliveDueAt        time.Time
-	lastInboundFrameAt    time.Time
-	lastControlProgressAt time.Time
-	lastTransportWriteAt  time.Time
-	lastStreamProgressAt  time.Time
-	lastAppProgressAt     time.Time
-	lastPingSentAt        time.Time
-	lastPongAt            time.Time
-	lastPingRTT           time.Duration
-	pingOutstanding       bool
-	pingPayload           []byte
-	pingDone              chan struct{}
+	keepaliveInterval        time.Duration
+	keepaliveMaxPingInterval time.Duration
+	keepaliveTimeout         time.Duration
+	keepaliveJitterState     uint64
+	pingNonceState           uint64
+	readIdlePingDueAt        time.Time
+	writeIdlePingDueAt       time.Time
+	maxPingDueAt             time.Time
+	lastInboundFrameAt       time.Time
+	lastControlProgressAt    time.Time
+	lastTransportWriteAt     time.Time
+	lastStreamProgressAt     time.Time
+	lastAppProgressAt        time.Time
+	lastPingSentAt           time.Time
+	lastPongAt               time.Time
+	lastPingRTT              time.Duration
+	pingOutstanding          bool
+	pingPayload              []byte
+	pingDone                 chan struct{}
 }
 
 type connSessionControlState struct {
@@ -3401,6 +3410,7 @@ func (c *Conn) beginPingPayloadLocked(payload []byte, ownership retainedBytesOwn
 		c.liveness.pingPayload = append([]byte(nil), payload...)
 	}
 	c.liveness.lastPingSentAt = sentAt
+	c.resetMaxPingDueLocked(sentAt)
 	c.liveness.pingDone = done
 	return done, sentAt, c.liveness.pingPayload, nil
 }
@@ -3543,7 +3553,8 @@ func (c *Conn) clearPingLocked() {
 		close(c.liveness.pingDone)
 		c.liveness.pingDone = nil
 	}
-	c.resetKeepaliveDueLocked(now)
+	c.resetReadIdlePingDueLocked(now)
+	c.resetWriteIdlePingDueLocked(now)
 	notify(c.signals.livenessCh)
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleased)
 }
@@ -3649,20 +3660,28 @@ func (c *Conn) nextKeepaliveAction(now time.Time) keepaliveAction {
 		}
 		return keepaliveAction{delay: remaining}
 	}
-	if c.liveness.keepaliveDueAt.IsZero() {
-		c.resetKeepaliveDueLocked(now)
+
+	c.ensureKeepaliveSchedulesLocked(now)
+
+	nextDue := earliestNonZeroTime(
+		c.liveness.readIdlePingDueAt,
+		c.liveness.writeIdlePingDueAt,
+		c.liveness.maxPingDueAt,
+	)
+	if nextDue.IsZero() {
+		return keepaliveAction{}
 	}
-	if !c.liveness.keepaliveDueAt.After(now) {
+	if !nextDue.After(now) {
 		return keepaliveAction{sendPing: true}
 	}
-	return keepaliveAction{delay: c.liveness.keepaliveDueAt.Sub(now)}
+	return keepaliveAction{delay: nextDue.Sub(now)}
 }
 
 func (c *Conn) noteInboundFrame(now time.Time) {
 	c.mu.Lock()
 	c.liveness.lastInboundFrameAt = now
 	c.liveness.lastControlProgressAt = now
-	c.resetKeepaliveDueLocked(now)
+	c.resetReadIdlePingDueLocked(now)
 	c.mu.Unlock()
 	notify(c.signals.livenessCh)
 }
@@ -3672,15 +3691,88 @@ func (c *Conn) noteTransportWriteLocked(now time.Time) {
 		return
 	}
 	c.liveness.lastTransportWriteAt = now
-	c.resetKeepaliveDueLocked(now)
+	c.resetWriteIdlePingDueLocked(now)
 }
 
-func (c *Conn) resetKeepaliveDueLocked(now time.Time) {
+func (c *Conn) resetKeepaliveSchedulesLocked(now time.Time) {
+	c.resetReadIdlePingDueLocked(now)
+	c.resetWriteIdlePingDueLocked(now)
+	c.resetMaxPingDueLocked(now)
+}
+
+func (c *Conn) ensureKeepaliveSchedulesLocked(now time.Time) {
 	if c.liveness.keepaliveInterval <= 0 {
-		c.liveness.keepaliveDueAt = time.Time{}
+		c.liveness.readIdlePingDueAt = time.Time{}
+		c.liveness.writeIdlePingDueAt = time.Time{}
+		c.liveness.maxPingDueAt = time.Time{}
 		return
 	}
-	c.liveness.keepaliveDueAt = now.Add(c.liveness.keepaliveInterval + rt.NextKeepaliveJitter(c.liveness.keepaliveInterval, &c.liveness.keepaliveJitterState))
+	if c.liveness.readIdlePingDueAt.IsZero() {
+		base := c.liveness.lastInboundFrameAt
+		if base.IsZero() {
+			base = now
+		}
+		c.resetReadIdlePingDueLocked(base)
+	}
+	if c.liveness.writeIdlePingDueAt.IsZero() {
+		base := c.liveness.lastTransportWriteAt
+		if base.IsZero() {
+			base = now
+		}
+		c.resetWriteIdlePingDueLocked(base)
+	}
+	if c.liveness.maxPingDueAt.IsZero() {
+		c.resetMaxPingDueLocked(now)
+	}
+}
+
+func (c *Conn) resetReadIdlePingDueLocked(now time.Time) {
+	if c.liveness.keepaliveInterval <= 0 {
+		c.liveness.readIdlePingDueAt = time.Time{}
+		return
+	}
+	c.liveness.readIdlePingDueAt = now.Add(keepaliveLeadJitteredDelay(c.liveness.keepaliveInterval, &c.liveness.keepaliveJitterState))
+}
+
+func (c *Conn) resetWriteIdlePingDueLocked(now time.Time) {
+	if c.liveness.keepaliveInterval <= 0 {
+		c.liveness.writeIdlePingDueAt = time.Time{}
+		return
+	}
+	c.liveness.writeIdlePingDueAt = now.Add(keepaliveLeadJitteredDelay(c.liveness.keepaliveInterval, &c.liveness.keepaliveJitterState))
+}
+
+func (c *Conn) resetMaxPingDueLocked(now time.Time) {
+	if c.liveness.keepaliveInterval <= 0 || c.liveness.keepaliveMaxPingInterval <= 0 {
+		c.liveness.maxPingDueAt = time.Time{}
+		return
+	}
+	c.liveness.maxPingDueAt = now.Add(keepaliveLeadJitteredDelay(c.liveness.keepaliveMaxPingInterval, &c.liveness.keepaliveJitterState))
+}
+
+func keepaliveLeadJitteredDelay(base time.Duration, state *uint64) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	jitter := rt.NextKeepaliveJitter(base, state)
+	delay := base - jitter
+	if delay <= 0 {
+		return base
+	}
+	return delay
+}
+
+func earliestNonZeroTime(values ...time.Time) time.Time {
+	var earliest time.Time
+	for _, value := range values {
+		if value.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || value.Before(earliest) {
+			earliest = value
+		}
+	}
+	return earliest
 }
 
 func (c *Conn) effectiveKeepaliveTimeoutLocked() time.Duration {

@@ -1608,7 +1608,13 @@ func TestEstablishedConnUsesTunedReadBufferSize(t *testing.T) {
 func TestEstablishedConnDefersOptionalChannelsUntilNeeded(t *testing.T) {
 	t.Parallel()
 
-	client, server := newConnPair(t)
+	clientCfg := DefaultConfig()
+	clientCfg.KeepaliveInterval = 0
+	clientCfg.KeepaliveMaxPingInterval = 0
+	serverCfg := DefaultConfig()
+	serverCfg.KeepaliveInterval = 0
+	serverCfg.KeepaliveMaxPingInterval = 0
+	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
 
 	for _, conn := range []*Conn{client, server} {
 		if conn.signals.acceptCh != nil {
@@ -1618,7 +1624,19 @@ func TestEstablishedConnDefersOptionalChannelsUntilNeeded(t *testing.T) {
 			t.Fatal("conn.writer.advisoryWriteCh != nil without negotiated priority_update, want nil")
 		}
 		if conn.signals.livenessCh != nil {
-			t.Fatal("conn.signals.livenessCh != nil without keepalive or graceful-close waiters, want lazy allocation")
+			t.Fatal("conn.signals.livenessCh != nil with keepalive disabled and without graceful-close waiters, want lazy allocation")
+		}
+	}
+}
+
+func TestEstablishedConnAllocatesLivenessChannelWithDefaultKeepalive(t *testing.T) {
+	t.Parallel()
+
+	client, server := newConnPair(t)
+
+	for _, conn := range []*Conn{client, server} {
+		if conn.signals.livenessCh == nil {
+			t.Fatal("conn.signals.livenessCh = nil with repository-default keepalive, want channel")
 		}
 	}
 }
@@ -2955,25 +2973,31 @@ func TestOutboundTransportWriteResetsKeepaliveDeadline(t *testing.T) {
 		liveness: connLivenessState{
 			keepaliveInterval:    50 * time.Millisecond,
 			keepaliveJitterState: 1,
-			keepaliveDueAt:       base.Add(20 * time.Millisecond),
+			readIdlePingDueAt:    base.Add(200 * time.Millisecond),
+			writeIdlePingDueAt:   base.Add(20 * time.Millisecond),
 		},
 	}
 
 	c.mu.Lock()
 	c.noteTransportWriteLocked(base.Add(10 * time.Millisecond))
-	due := c.liveness.keepaliveDueAt
+	readDue := c.liveness.readIdlePingDueAt
+	writeDue := c.liveness.writeIdlePingDueAt
 	lastWrite := c.liveness.lastTransportWriteAt
 	c.mu.Unlock()
 
 	if !lastWrite.Equal(base.Add(10 * time.Millisecond)) {
 		t.Fatalf("lastTransportWriteAt = %v, want %v", lastWrite, base.Add(10*time.Millisecond))
 	}
-	minDue := base.Add(60 * time.Millisecond)
-	if due.Before(minDue) {
-		t.Fatalf("keepaliveDueAt = %v, want >= %v after outbound write reset", due, minDue)
+	if !readDue.Equal(base.Add(200 * time.Millisecond)) {
+		t.Fatalf("readIdlePingDueAt = %v, want unchanged %v after outbound write", readDue, base.Add(200*time.Millisecond))
+	}
+	minDue := base.Add(54 * time.Millisecond)
+	maxDue := base.Add(60 * time.Millisecond)
+	if writeDue.Before(minDue) || writeDue.After(maxDue) {
+		t.Fatalf("writeIdlePingDueAt = %v, want within [%v, %v] after outbound write reset", writeDue, minDue, maxDue)
 	}
 
-	action := c.nextKeepaliveAction(base.Add(55 * time.Millisecond))
+	action := c.nextKeepaliveAction(base.Add(40 * time.Millisecond))
 	if action.shouldSendPing() {
 		t.Fatal("nextKeepaliveAction before reset deadline = send, want wait")
 	}
@@ -2982,7 +3006,7 @@ func TestOutboundTransportWriteResetsKeepaliveDeadline(t *testing.T) {
 	}
 }
 
-func TestResetKeepaliveDueAppliesBoundedJitter(t *testing.T) {
+func TestResetReadIdlePingDueAppliesBoundedLeadJitter(t *testing.T) {
 	t.Parallel()
 
 	base := time.Unix(456, 0)
@@ -2994,18 +3018,18 @@ func TestResetKeepaliveDueAppliesBoundedJitter(t *testing.T) {
 	}
 
 	c.mu.Lock()
-	c.resetKeepaliveDueLocked(base)
-	due := c.liveness.keepaliveDueAt
+	c.resetReadIdlePingDueLocked(base)
+	due := c.liveness.readIdlePingDueAt
 	c.mu.Unlock()
 
-	minDue := base.Add(80 * time.Millisecond)
-	maxDue := minDue.Add(10 * time.Millisecond)
+	minDue := base.Add(70 * time.Millisecond)
+	maxDue := base.Add(80 * time.Millisecond)
 	if due.Before(minDue) || due.After(maxDue) {
-		t.Fatalf("keepaliveDueAt = %v, want within [%v, %v]", due, minDue, maxDue)
+		t.Fatalf("readIdlePingDueAt = %v, want within [%v, %v]", due, minDue, maxDue)
 	}
 }
 
-func TestResetKeepaliveDueUsesFreshJitterPerDeadline(t *testing.T) {
+func TestResetReadIdlePingDueUsesFreshJitterPerDeadline(t *testing.T) {
 	t.Parallel()
 
 	base := time.Unix(789, 0)
@@ -3017,14 +3041,14 @@ func TestResetKeepaliveDueUsesFreshJitterPerDeadline(t *testing.T) {
 	}
 
 	c.mu.Lock()
-	c.resetKeepaliveDueLocked(base)
-	first := c.liveness.keepaliveDueAt
-	c.resetKeepaliveDueLocked(base)
-	second := c.liveness.keepaliveDueAt
+	c.resetReadIdlePingDueLocked(base)
+	first := c.liveness.readIdlePingDueAt
+	c.resetReadIdlePingDueLocked(base)
+	second := c.liveness.readIdlePingDueAt
 	c.mu.Unlock()
 
 	if first.Equal(second) {
-		t.Fatalf("keepaliveDueAt repeated identical jitter = %v, want per-deadline resample", first)
+		t.Fatalf("readIdlePingDueAt repeated identical jitter = %v, want per-deadline resample", first)
 	}
 }
 
@@ -3048,13 +3072,13 @@ func TestResetKeepaliveDueDesynchronizesDistinctSessions(t *testing.T) {
 	stayedAligned := true
 	for i := 0; i < 4; i++ {
 		first.mu.Lock()
-		first.resetKeepaliveDueLocked(base)
-		firstDue := first.liveness.keepaliveDueAt
+		first.resetReadIdlePingDueLocked(base)
+		firstDue := first.liveness.readIdlePingDueAt
 		first.mu.Unlock()
 
 		second.mu.Lock()
-		second.resetKeepaliveDueLocked(base)
-		secondDue := second.liveness.keepaliveDueAt
+		second.resetReadIdlePingDueLocked(base)
+		secondDue := second.liveness.readIdlePingDueAt
 		second.mu.Unlock()
 
 		if firstDue != secondDue {
@@ -3065,6 +3089,46 @@ func TestResetKeepaliveDueDesynchronizesDistinctSessions(t *testing.T) {
 
 	if stayedAligned {
 		t.Fatal("distinct sessions kept identical keepalive deadlines across repeated resets, want desynchronization")
+	}
+}
+
+func TestNextKeepaliveActionTriggersOnDirectionalIdle(t *testing.T) {
+	t.Parallel()
+
+	base := time.Unix(901, 0)
+	c := &Conn{
+		liveness: connLivenessState{
+			keepaliveInterval:        time.Minute,
+			keepaliveMaxPingInterval: 5 * time.Minute,
+			readIdlePingDueAt:        base.Add(time.Minute),
+			writeIdlePingDueAt:       base.Add(-time.Second),
+			maxPingDueAt:             base.Add(4 * time.Minute),
+		},
+	}
+
+	action := c.nextKeepaliveAction(base)
+	if !action.shouldSendPing() {
+		t.Fatalf("nextKeepaliveAction() = %+v, want immediate ping for write-idle expiry", action)
+	}
+}
+
+func TestNextKeepaliveActionTriggersOnMaxPingInterval(t *testing.T) {
+	t.Parallel()
+
+	base := time.Unix(902, 0)
+	c := &Conn{
+		liveness: connLivenessState{
+			keepaliveInterval:        time.Minute,
+			keepaliveMaxPingInterval: 5 * time.Minute,
+			readIdlePingDueAt:        base.Add(time.Minute),
+			writeIdlePingDueAt:       base.Add(time.Minute),
+			maxPingDueAt:             base.Add(-time.Second),
+		},
+	}
+
+	action := c.nextKeepaliveAction(base)
+	if !action.shouldSendPing() {
+		t.Fatalf("nextKeepaliveAction() = %+v, want immediate ping for max-ping expiry", action)
 	}
 }
 

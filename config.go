@@ -146,16 +146,26 @@ type Negotiated = wire.Negotiated
 // Config controls session establishment and runtime behavior.
 //
 // Prefer starting from DefaultConfig(). The zero value is not the repository
-// default configuration because Role zero is RoleInitiator, not RoleAuto.
+// default configuration because Role zero is RoleInitiator and the repository
+// defaults also enable low-frequency idle keepalive probing plus a slower RTT
+// sampling cap.
 type Config struct {
-	Role              Role
-	TieBreakerNonce   uint64
-	MinProto          uint64
-	MaxProto          uint64
-	Capabilities      Capabilities
-	Settings          Settings
-	NonceSource       io.Reader
+	Role            Role
+	TieBreakerNonce uint64
+	MinProto        uint64
+	MaxProto        uint64
+	Capabilities    Capabilities
+	Settings        Settings
+	NonceSource     io.Reader
+	// KeepaliveInterval bounds how long inbound or outbound transport activity
+	// may stay idle before the runtime probes with PING. Zero disables automatic
+	// keepalive entirely, including KeepaliveMaxPingInterval.
 	KeepaliveInterval time.Duration
+	// KeepaliveMaxPingInterval bounds how long the runtime may go without
+	// sending any local PING while keepalive is enabled. It is useful for
+	// occasional RTT sampling even on continuously busy sessions. Zero disables
+	// this extra cap and relies only on directional idle probing.
+	KeepaliveMaxPingInterval time.Duration
 	// KeepaliveTimeout bounds how long an outstanding keepalive ping may remain
 	// unanswered before the session is aborted. When left at zero, the runtime
 	// derives an adaptive default from the keepalive interval and observed RTT
@@ -295,15 +305,22 @@ type OpenOptions struct {
 	OpenInfo        []byte
 }
 
+const (
+	defaultIdleKeepaliveInterval    = time.Minute
+	defaultKeepaliveMaxPingInterval = 5 * time.Minute
+)
+
 // DefaultConfig returns the repository-default configuration template.
 func DefaultConfig() *Config {
 	return &Config{
-		Role:         RoleAuto,
-		MinProto:     ProtoVersion,
-		MaxProto:     ProtoVersion,
-		Capabilities: 0,
-		Settings:     DefaultSettings(),
-		NonceSource:  rand.Reader,
+		Role:                     RoleAuto,
+		MinProto:                 ProtoVersion,
+		MaxProto:                 ProtoVersion,
+		Capabilities:             0,
+		Settings:                 DefaultSettings(),
+		NonceSource:              rand.Reader,
+		KeepaliveInterval:        defaultIdleKeepaliveInterval,
+		KeepaliveMaxPingInterval: defaultKeepaliveMaxPingInterval,
 	}
 }
 

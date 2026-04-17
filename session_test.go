@@ -3857,7 +3857,10 @@ func TestAbortClearsStreamsAndSessionPendingState(t *testing.T) {
 	}
 
 	c.liveness.keepaliveInterval = 500 * time.Millisecond
-	c.liveness.keepaliveDueAt = time.Now().Add(time.Second)
+	c.liveness.keepaliveMaxPingInterval = 2 * time.Second
+	c.liveness.readIdlePingDueAt = time.Now().Add(time.Second)
+	c.liveness.writeIdlePingDueAt = time.Now().Add(time.Second)
+	c.liveness.maxPingDueAt = time.Now().Add(2 * time.Second)
 	c.liveness.pingOutstanding = true
 	c.liveness.pingPayload = []byte("ping")
 	c.liveness.lastPingSentAt = time.Now()
@@ -3936,8 +3939,11 @@ func TestAbortClearsStreamsAndSessionPendingState(t *testing.T) {
 	if c.liveness.keepaliveInterval != 0 {
 		t.Fatalf("keepaliveInterval = %v, want 0", c.liveness.keepaliveInterval)
 	}
-	if !c.liveness.keepaliveDueAt.IsZero() {
-		t.Fatalf("keepaliveDueAt = %v, want zero", c.liveness.keepaliveDueAt)
+	if c.liveness.keepaliveMaxPingInterval != 0 {
+		t.Fatalf("keepaliveMaxPingInterval = %v, want 0", c.liveness.keepaliveMaxPingInterval)
+	}
+	if !c.liveness.readIdlePingDueAt.IsZero() || !c.liveness.writeIdlePingDueAt.IsZero() || !c.liveness.maxPingDueAt.IsZero() {
+		t.Fatalf("keepalive due state = (%v, %v, %v), want zero", c.liveness.readIdlePingDueAt, c.liveness.writeIdlePingDueAt, c.liveness.maxPingDueAt)
 	}
 	if c.liveness.pingOutstanding {
 		t.Fatalf("pingOutstanding = %t, want false", c.liveness.pingOutstanding)
@@ -9461,7 +9467,10 @@ func TestPeerCloseClearsActiveStateAndPendingControl(t *testing.T) {
 	c.pending.hasSessionMaxData = true
 
 	c.liveness.keepaliveInterval = time.Second
-	c.liveness.keepaliveDueAt = time.Now().Add(time.Second)
+	c.liveness.keepaliveMaxPingInterval = 2 * time.Second
+	c.liveness.readIdlePingDueAt = time.Now().Add(time.Second)
+	c.liveness.writeIdlePingDueAt = time.Now().Add(time.Second)
+	c.liveness.maxPingDueAt = time.Now().Add(2 * time.Second)
 	c.liveness.pingOutstanding = true
 	c.liveness.pingPayload = []byte("ping")
 	c.liveness.lastPingSentAt = time.Now()
@@ -9525,8 +9534,11 @@ func TestPeerCloseClearsActiveStateAndPendingControl(t *testing.T) {
 	if c.liveness.keepaliveInterval != 0 {
 		t.Fatalf("keepaliveInterval = %v, want 0", c.liveness.keepaliveInterval)
 	}
-	if !c.liveness.keepaliveDueAt.IsZero() {
-		t.Fatalf("keepaliveDueAt = %v, want zero", c.liveness.keepaliveDueAt)
+	if c.liveness.keepaliveMaxPingInterval != 0 {
+		t.Fatalf("keepaliveMaxPingInterval = %v, want 0", c.liveness.keepaliveMaxPingInterval)
+	}
+	if !c.liveness.readIdlePingDueAt.IsZero() || !c.liveness.writeIdlePingDueAt.IsZero() || !c.liveness.maxPingDueAt.IsZero() {
+		t.Fatalf("keepalive due state = (%v, %v, %v), want zero", c.liveness.readIdlePingDueAt, c.liveness.writeIdlePingDueAt, c.liveness.maxPingDueAt)
 	}
 	if c.liveness.pingOutstanding {
 		t.Fatalf("pingOutstanding = %t, want false", c.liveness.pingOutstanding)
@@ -19806,7 +19818,10 @@ func newStateFixtureEnv(t *testing.T, fixture stateFixture) *stateFixtureEnv {
 			},
 		}
 		c.liveness.keepaliveInterval = 500 * time.Millisecond
-		c.liveness.keepaliveDueAt = time.Now().Add(time.Second)
+		c.liveness.keepaliveMaxPingInterval = 2 * time.Second
+		c.liveness.readIdlePingDueAt = time.Now().Add(time.Second)
+		c.liveness.writeIdlePingDueAt = time.Now().Add(time.Second)
+		c.liveness.maxPingDueAt = time.Now().Add(2 * time.Second)
 		c.liveness.pingOutstanding = true
 		c.liveness.pingPayload = []byte("ping")
 		c.liveness.lastPingSentAt = time.Now()
@@ -24225,7 +24240,7 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 			env.conn.writer.scheduler.State.ServiceSeq != 0 {
 			t.Fatalf("event %q write scheduler state not cleared", step.Event)
 		}
-		if env.conn.liveness.keepaliveInterval != 0 || !env.conn.liveness.keepaliveDueAt.IsZero() || env.conn.liveness.pingOutstanding || len(env.conn.liveness.pingPayload) != 0 || env.conn.liveness.lastPingRTT != 0 || env.conn.liveness.pingDone != nil {
+		if env.conn.liveness.keepaliveInterval != 0 || env.conn.liveness.keepaliveMaxPingInterval != 0 || !env.conn.liveness.readIdlePingDueAt.IsZero() || !env.conn.liveness.writeIdlePingDueAt.IsZero() || !env.conn.liveness.maxPingDueAt.IsZero() || env.conn.liveness.pingOutstanding || len(env.conn.liveness.pingPayload) != 0 || env.conn.liveness.lastPingRTT != 0 || env.conn.liveness.pingDone != nil {
 			t.Fatalf("event %q keepalive state not cleared", step.Event)
 		}
 		for i, stream := range env.streams {
