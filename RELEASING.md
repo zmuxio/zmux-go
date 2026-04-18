@@ -41,9 +41,11 @@ Always release in this order:
 
 1. finalize root changes
 2. tag the root module
-3. update the adapter to that root tag
-4. tag the adapter module
-5. push branch and tags
+3. push the root tag
+4. update the adapter to that root tag
+5. tag the adapter module
+6. push `main`
+7. push the adapter tag
 
 Do not tag the adapter first.
 
@@ -56,11 +58,12 @@ go test ./...
 git add .
 git commit -m "release: prepare vX.Y.Z"
 git tag -a vX.Y.Z -m "vX.Y.Z"
-git push origin main vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 Push the root tag before updating the adapter. The adapter module must be able
-to resolve the published root version.
+to resolve the published root version. Push `main` later together with the
+adapter release commit.
 
 ## Adapter Release
 
@@ -78,7 +81,8 @@ Then from the repository root:
 git add adapter/quicmux/go.mod adapter/quicmux/go.sum
 git commit -m "adapter/quicmux: bump zmux-go to vX.Y.Z"
 git tag -a adapter/quicmux/vX.Y.Z -m "adapter/quicmux/vX.Y.Z"
-git push origin main adapter/quicmux/vX.Y.Z
+git push origin main
+git push origin adapter/quicmux/vX.Y.Z
 ```
 
 ## Proxy Lag
@@ -107,7 +111,7 @@ go test ./...
 git add .
 git commit -m "release: prepare vX.Y.Z"
 git tag -a vX.Y.Z -m "vX.Y.Z"
-git push origin main vX.Y.Z
+git push origin vX.Y.Z
 
 # adapter/quicmux
 go get github.com/zmuxio/zmux-go@vX.Y.Z
@@ -118,5 +122,6 @@ go test ./...
 git add adapter/quicmux/go.mod adapter/quicmux/go.sum
 git commit -m "adapter/quicmux: bump zmux-go to vX.Y.Z"
 git tag -a adapter/quicmux/vX.Y.Z -m "adapter/quicmux/vX.Y.Z"
-git push origin main adapter/quicmux/vX.Y.Z
+git push origin main
+git push origin adapter/quicmux/vX.Y.Z
 ```
