@@ -2605,7 +2605,7 @@ func TestResetAfterSendFinReturnsWriteClosedWithoutQueueingReset(t *testing.T) {
 	assertNoQueuedFrame(t, frames)
 }
 
-func TestResetOnConcreteLocalIDBeforeCommitFailsLocallyWithoutQueueingReset(t *testing.T) {
+func TestCancelWriteOnConcreteLocalIDBeforeCommitQueuesOpeningAbort(t *testing.T) {
 	t.Parallel()
 
 	c, frames, stop := newInvalidFrameConn(t, 0)
@@ -2626,7 +2626,22 @@ func TestResetOnConcreteLocalIDBeforeCommitFailsLocallyWithoutQueueingReset(t *t
 	c.mu.Unlock()
 
 	if err := stream.CancelWrite(uint64(CodeCancelled)); err != nil {
-		t.Fatalf("Reset err = %v, want nil", err)
+		t.Fatalf("CancelWrite err = %v, want nil", err)
+	}
+
+	frame := awaitQueuedFrame(t, frames)
+	if frame.Type != FrameTypeABORT {
+		t.Fatalf("queued frame type = %v, want %v", frame.Type, FrameTypeABORT)
+	}
+	if frame.StreamID != stream.id {
+		t.Fatalf("queued frame stream = %d, want %d", frame.StreamID, stream.id)
+	}
+	code, reason, payloadErr := parseErrorPayload(frame.Payload)
+	if payloadErr != nil {
+		t.Fatalf("decode ABORT payload err = %v", payloadErr)
+	}
+	if code != uint64(CodeCancelled) || reason != "" {
+		t.Fatalf("queued ABORT payload = (%d, %q), want (%d, %q)", code, reason, uint64(CodeCancelled), "")
 	}
 	assertNoQueuedFrame(t, frames)
 
@@ -2641,11 +2656,11 @@ func TestResetOnConcreteLocalIDBeforeCommitFailsLocallyWithoutQueueingReset(t *t
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if stream.localOpen.committed {
-		t.Fatal("sendCommitted = true, want false for local-only unopened reset")
+	if !stream.localOpen.committed {
+		t.Fatal("sendCommitted = false, want true after opening ABORT")
 	}
 	if stream.sendReset != nil {
-		t.Fatalf("sendReset = %v, want nil for local-only unopened reset", stream.sendReset)
+		t.Fatalf("sendReset = %v, want nil for opening ABORT", stream.sendReset)
 	}
 	if stream.sendAbort == nil || stream.sendAbort.Code != uint64(CodeCancelled) {
 		t.Fatalf("sendAbort = %v, want code %d", stream.sendAbort, uint64(CodeCancelled))
@@ -2653,8 +2668,8 @@ func TestResetOnConcreteLocalIDBeforeCommitFailsLocallyWithoutQueueingReset(t *t
 	if stream.recvAbort == nil || stream.recvAbort.Code != uint64(CodeCancelled) {
 		t.Fatalf("recvAbort = %v, want code %d", stream.recvAbort, uint64(CodeCancelled))
 	}
-	if _, ok := c.registry.streams[stream.id]; ok {
-		t.Fatalf("stream %d remained live in conn.streams after local-only unopened reset", stream.id)
+	if !stream.isPeerVisibleLocked() {
+		t.Fatal("peerVisible = false, want true after queued opening ABORT")
 	}
 	if c.flow.sendSessionUsed != 0 {
 		t.Fatalf("sendSessionUsed = %d, want 0", c.flow.sendSessionUsed)

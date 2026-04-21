@@ -1780,6 +1780,11 @@ func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint6
 		s.conn.mu.Unlock()
 		return sessionOperationErrLocked(s.conn, OperationClose, err)
 	}
+	if kind == terminalSignalReset && s.needsLocalOpenerLocked() && s.idSet {
+		kind = terminalSignalAbort
+		opts.openerPolicy = terminalOpenerAllow
+		opts.resetSource = terminalResetDirect
+	}
 	switch kind {
 	case terminalSignalReset:
 		if err := s.localSendActionErrLocked(state.LocalResetAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {

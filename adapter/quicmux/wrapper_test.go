@@ -816,6 +816,46 @@ func TestWrapSessionCloseWriteReturnsErrWriteClosedLocally(t *testing.T) {
 	_ = stream.Close()
 }
 
+func TestWrapSessionCancelWriteAfterCloseWriteReturnsErrWriteClosed(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if err := stream.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite err = %v", err)
+	}
+	if err := stream.CancelWrite(77); !errors.Is(err, zmux.ErrWriteClosed) {
+		t.Fatalf("CancelWrite err = %v, want %v", err, zmux.ErrWriteClosed)
+	}
+
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+	buf := make([]byte, 1)
+	if n, err := accepted.stream.Read(buf); n != 0 || err != io.EOF {
+		t.Fatalf("Read after remote CloseWrite = (%d, %v), want (0, EOF)", n, err)
+	}
+
+	_ = accepted.stream.Close()
+	_ = stream.Close()
+}
+
 func TestWrapSessionUniOpenMetadataVisibleOnAccept(t *testing.T) {
 	client, server := newWrappedPair(t)
 

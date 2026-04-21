@@ -919,6 +919,12 @@ func (s *quicStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	if s.localWriteClosed.Load() {
+		if err := s.loadLocalWriteErr(); err != nil {
+			return err
+		}
+		return zmux.ErrWriteClosed
+	}
 	appErr := &zmux.ApplicationError{Code: code}
 	s.storeLocalWriteErr(appErr)
 	s.localWriteClosed.Store(true)
@@ -1032,6 +1038,12 @@ func (s *quicSendStream) CloseWrite() error {
 func (s *quicSendStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
+	}
+	if s.localWriteClosed.Load() {
+		if err := s.loadLocalWriteErr(); err != nil {
+			return err
+		}
+		return zmux.ErrWriteClosed
 	}
 	appErr := &zmux.ApplicationError{Code: code}
 	s.storeLocalWriteErr(appErr)
