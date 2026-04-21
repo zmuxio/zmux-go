@@ -1558,6 +1558,24 @@ func TestTransportEOFFromReadyMarksSessionFailed(t *testing.T) {
 	}
 }
 
+func TestReadLoopValidateFrameErrorIsRemoteReadSessionTermination(t *testing.T) {
+	t.Parallel()
+
+	readLoopErr := readLoopSessionErr(wire.WrapError(wire.CodeProtocol, "validate frame scope", errors.New("bad frame")))
+	inner := requireStructuredError(t, readLoopErr)
+	if inner.Scope != ScopeSession || inner.Source != SourceRemote ||
+		inner.Direction != DirectionRead || inner.TerminationKind != TerminationSessionTermination {
+		t.Fatalf("structured read-loop validation error = %+v", *inner)
+	}
+
+	err := sessionOperationErr(nil, OperationOpen, readLoopErr)
+	se := requireStructuredError(t, err)
+	if se.Scope != ScopeSession || se.Operation != OperationOpen || se.Source != SourceRemote ||
+		se.Direction != DirectionBoth || se.TerminationKind != TerminationSessionTermination {
+		t.Fatalf("structured operation error = %+v", *se)
+	}
+}
+
 func TestTransportEOFFromClosingMarksSessionClosed(t *testing.T) {
 	t.Parallel()
 

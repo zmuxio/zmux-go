@@ -397,6 +397,22 @@ func sessionOperationErrLocked(c *Conn, op Operation, err error) error {
 	})
 }
 
+func readLoopSessionErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var wireErr *wire.Error
+	if !errors.As(err, &wireErr) || !strings.HasPrefix(wireErr.Op, "validate ") {
+		return err
+	}
+	return reframeStructuredError(err, errorMeta{
+		scope:           ScopeSession,
+		source:          SourceRemote,
+		direction:       DirectionRead,
+		terminationKind: TerminationSessionTermination,
+	})
+}
+
 func openOperationErrLocked(c *Conn, err error) error {
 	if err == nil {
 		return nil
@@ -449,6 +465,9 @@ func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Sou
 		return SourceUnknown
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrClosedPipe):
 		return SourceTransport
+	}
+	if structured, ok := findError[*Error](err); ok && structured.Source != SourceUnknown {
+		return structured.Source
 	}
 	if source, ok := sessionWireErrorSource(err); ok {
 		return source

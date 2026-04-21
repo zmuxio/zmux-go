@@ -1180,6 +1180,8 @@ func (c *Conn) clearPostCloseProtocolBacklogLocked() {
 func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolicy closeFramePolicy) {
 	if err == nil {
 		err = ErrSessionClosed
+	} else if origin == closeOriginReadLoop {
+		err = readLoopSessionErr(err)
 	}
 	var emitCloseFrame bool
 	var closeFramePayload []byte
