@@ -464,7 +464,10 @@ func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Sou
 		return SourceRemote
 	}
 	if errors.Is(err, ErrSessionClosed) {
-		return SourceUnknown
+		if peerClose != nil {
+			return SourceRemote
+		}
+		return SourceLocal
 	}
 	return SourceTransport
 }

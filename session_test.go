@@ -3056,6 +3056,29 @@ func TestCloseStartsByClosingLocalAdmission(t *testing.T) {
 	}
 }
 
+func TestOpenAfterCompletedLocalCloseReturnsLocalStructuredError(t *testing.T) {
+	t.Parallel()
+
+	client, _ := newConnPair(t)
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+
+	_, err := client.OpenStream(ctx)
+	if !errors.Is(err, ErrSessionClosed) {
+		t.Fatalf("OpenStream after local close = %v, want %v", err, ErrSessionClosed)
+	}
+
+	se := requireStructuredError(t, err)
+	if se.Scope != ScopeSession || se.Operation != OperationOpen || se.Source != SourceLocal ||
+		se.Direction != DirectionBoth || se.TerminationKind != TerminationSessionTermination {
+		t.Fatalf("structured error = %+v", *se)
+	}
+}
+
 func TestGracefulCloseTransitionsThroughDrainingAndBlocksLocalOpen(t *testing.T) {
 	t.Parallel()
 
