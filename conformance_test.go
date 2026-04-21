@@ -125,10 +125,11 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestOutboundTransportWriteResetsKeepaliveDeadline",
 		"TestResetKeepaliveDueDesynchronizesDistinctSessions",
 	},
-	"satisfy zmux-core-v1": {
+	"satisfy zmux-v1": {
 		"TestWireValidFixtures",
 		"TestClientServerEstablish",
-		"TestCloseWithOpenStreamsSendsGoAwayBeforeClose",
+		"TestOpenMetadataCarriesPriorityAndGroup",
+		"TestPriorityUpdateRoundTrip",
 	},
 	"satisfy every currently active same-version optional surface in this repository": {
 		"TestOpenMetadataCarriesPriorityAndGroup",
@@ -138,14 +139,6 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestOpenMetadataCarriesPriorityAndGroup",
 		"TestPriorityUpdateRoundTrip",
 		"TestPriorityUpdateIgnoredWhenUnnegotiated",
-	},
-	"interoperate cleanly with zmux-core-v1 peers by using only shared negotiated capabilities": {
-		"TestOpenInfoRequiresOpenMetadataCapability",
-		"TestPriorityUpdateIgnoredWhenUnnegotiated",
-	},
-	"satisfy zmux-full-v1": {
-		"TestOpenMetadataCarriesPriorityAndGroup",
-		"TestPriorityUpdateRoundTrip",
 	},
 	"satisfy the repository-defined reference-profile claim gate": {
 		"TestClientEstablishmentOnlyWritesPrefaceBeforePeerPreface",
@@ -374,9 +367,9 @@ func TestClaimRequiredConformanceSuites(t *testing.T) {
 }
 
 func TestImplementationProfileRequiredConformanceSuites(t *testing.T) {
-	full := ProfileFullV1.RequiredConformanceSuites()
-	if len(full) != 10 || full[0] != SuiteCoreWireInteroperability || full[9] != SuiteCoreProfileCompatibility {
-		t.Fatalf("ProfileFullV1.RequiredConformanceSuites() = %#v", full)
+	v1 := ProfileV1.RequiredConformanceSuites()
+	if len(v1) != 10 || v1[0] != SuiteCoreWireInteroperability || v1[9] != SuiteV1ProfileCompatibility {
+		t.Fatalf("ProfileV1.RequiredConformanceSuites() = %#v", v1)
 	}
 
 	reference := ProfileReferenceV1.RequiredConformanceSuites()
@@ -430,16 +423,16 @@ func TestKnownImplementationProfilesReturnsCopy(t *testing.T) {
 	t.Parallel()
 
 	got := KnownImplementationProfiles()
-	if len(got) != 3 {
-		t.Fatalf("len(KnownImplementationProfiles()) = %d, want 3", len(got))
+	if len(got) != 2 {
+		t.Fatalf("len(KnownImplementationProfiles()) = %d, want 2", len(got))
 	}
-	if got[0] != ProfileCoreV1 || got[2] != ProfileReferenceV1 {
+	if got[0] != ProfileV1 || got[1] != ProfileReferenceV1 {
 		t.Fatalf("KnownImplementationProfiles() = %#v", got)
 	}
 
 	got[0] = "changed"
 	again := KnownImplementationProfiles()
-	if again[0] != ProfileCoreV1 {
+	if again[0] != ProfileV1 {
 		t.Fatalf("KnownImplementationProfiles() did not return a defensive copy: %#v", again)
 	}
 }
@@ -454,7 +447,7 @@ func TestClaimAndProfileValidation(t *testing.T) {
 		t.Fatal("unexpected valid result for unknown claim")
 	}
 
-	if !ProfileCoreV1.Valid() || !ProfileReferenceV1.Valid() {
+	if !ProfileV1.Valid() || !ProfileReferenceV1.Valid() {
 		t.Fatal("expected known profiles to validate")
 	}
 	if ImplementationProfile("zmux-unknown").Valid() {
@@ -465,14 +458,9 @@ func TestClaimAndProfileValidation(t *testing.T) {
 func TestImplementationProfileClaims(t *testing.T) {
 	t.Parallel()
 
-	core := ProfileCoreV1.Claims()
-	if len(core) != 1 || core[0] != ClaimWireV1 {
-		t.Fatalf("ProfileCoreV1.Claims() = %#v", core)
-	}
-
-	full := ProfileFullV1.Claims()
-	if len(full) != 3 || full[0] != ClaimWireV1 || full[1] != ClaimOpenMetadata || full[2] != ClaimPriorityUpdate {
-		t.Fatalf("ProfileFullV1.Claims() = %#v", full)
+	v1 := ProfileV1.Claims()
+	if len(v1) != 3 || v1[0] != ClaimWireV1 || v1[1] != ClaimOpenMetadata || v1[2] != ClaimPriorityUpdate {
+		t.Fatalf("ProfileV1.Claims() = %#v", v1)
 	}
 
 	reference := ProfileReferenceV1.Claims()
@@ -528,9 +516,9 @@ func TestClaimAcceptanceChecklist(t *testing.T) {
 func TestImplementationProfileAcceptanceChecklist(t *testing.T) {
 	t.Parallel()
 
-	core := ProfileCoreV1.AcceptanceChecklist()
-	if len(core) != 5 || core[0] != "satisfy zmux-wire-v1" || core[4] != "pass core session-lifecycle scenarios" {
-		t.Fatalf("ProfileCoreV1.AcceptanceChecklist() = %#v", core)
+	v1 := ProfileV1.AcceptanceChecklist()
+	if len(v1) != 7 || v1[0] != "satisfy zmux-wire-v1" || v1[6] != "negotiate and handle open_metadata, priority_update, priority_hints, and stream_groups correctly" {
+		t.Fatalf("ProfileV1.AcceptanceChecklist() = %#v", v1)
 	}
 
 	reference := ProfileReferenceV1.AcceptanceChecklist()
@@ -543,7 +531,7 @@ func TestImplementationProfileAcceptanceChecklist(t *testing.T) {
 
 	reference[0] = "changed"
 	again := ProfileReferenceV1.AcceptanceChecklist()
-	if again[0] != "satisfy zmux-full-v1" {
+	if again[0] != "satisfy zmux-v1" {
 		t.Fatalf("AcceptanceChecklist() did not return a defensive copy: %#v", again)
 	}
 

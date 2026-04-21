@@ -441,8 +441,7 @@ const (
 type ImplementationProfile string
 
 const (
-	ProfileCoreV1      ImplementationProfile = "zmux-core-v1"
-	ProfileFullV1      ImplementationProfile = "zmux-full-v1"
+	ProfileV1          ImplementationProfile = "zmux-v1"
 	ProfileReferenceV1 ImplementationProfile = "zmux-reference-profile-v1"
 )
 
@@ -460,7 +459,7 @@ const (
 	SuiteOpenMetadata                 ConformanceSuite = "open_metadata"
 	SuitePriorityUpdate               ConformanceSuite = "priority_update"
 	SuitePriorityHintsAndStreamGroups ConformanceSuite = "priority-hints-and-stream-groups"
-	SuiteCoreProfileCompatibility     ConformanceSuite = "core-profile-compatibility"
+	SuiteV1ProfileCompatibility       ConformanceSuite = "v1-profile-compatibility"
 	SuiteAPISemanticsProfile          ConformanceSuite = "api-semantics-profile"
 	SuiteStreamAdapterProfile         ConformanceSuite = "stream-adapter-profile"
 	SuiteReferenceProfileClaimGate    ConformanceSuite = "reference-profile-claim-gate"
@@ -476,8 +475,7 @@ var knownClaims = []Claim{
 }
 
 var knownProfiles = []ImplementationProfile{
-	ProfileCoreV1,
-	ProfileFullV1,
+	ProfileV1,
 	ProfileReferenceV1,
 }
 
@@ -491,7 +489,7 @@ var knownConformanceSuites = []ConformanceSuite{
 	SuiteOpenMetadata,
 	SuitePriorityUpdate,
 	SuitePriorityHintsAndStreamGroups,
-	SuiteCoreProfileCompatibility,
+	SuiteV1ProfileCompatibility,
 	SuiteAPISemanticsProfile,
 	SuiteStreamAdapterProfile,
 	SuiteReferenceProfileClaimGate,
@@ -533,21 +531,17 @@ var claimAcceptanceChecklist = map[Claim][]string{
 }
 
 var profileAcceptanceChecklist = map[ImplementationProfile][]string{
-	ProfileCoreV1: {
+	ProfileV1: {
 		"satisfy zmux-wire-v1",
 		"interoperate on explicit-role and role=auto establishment",
 		"pass core stream-lifecycle scenarios",
 		"pass core flow-control scenarios",
 		"pass core session-lifecycle scenarios",
-	},
-	ProfileFullV1: {
-		"satisfy zmux-core-v1",
 		"satisfy every currently active same-version optional surface in this repository",
 		"negotiate and handle open_metadata, priority_update, priority_hints, and stream_groups correctly",
-		"interoperate cleanly with zmux-core-v1 peers by using only shared negotiated capabilities",
 	},
 	ProfileReferenceV1: {
-		"satisfy zmux-full-v1",
+		"satisfy zmux-v1",
 		"satisfy the repository-defined reference-profile claim gate",
 		"preserve the documented repository-default sender, memory, liveness, API, and scheduling behavior closely enough for release claims",
 	},
@@ -589,15 +583,7 @@ var claimRequiredSuites = map[Claim][]ConformanceSuite{
 }
 
 var profileRequiredSuites = map[ImplementationProfile][]ConformanceSuite{
-	ProfileCoreV1: {
-		SuiteCoreWireInteroperability,
-		SuiteInvalidInputHandling,
-		SuiteExtensionTolerance,
-		SuiteCoreStreamLifecycle,
-		SuiteCoreFlowControl,
-		SuiteCoreSessionLifecycle,
-	},
-	ProfileFullV1: {
+	ProfileV1: {
 		SuiteCoreWireInteroperability,
 		SuiteInvalidInputHandling,
 		SuiteExtensionTolerance,
@@ -607,7 +593,7 @@ var profileRequiredSuites = map[ImplementationProfile][]ConformanceSuite{
 		SuiteOpenMetadata,
 		SuitePriorityUpdate,
 		SuitePriorityHintsAndStreamGroups,
-		SuiteCoreProfileCompatibility,
+		SuiteV1ProfileCompatibility,
 	},
 	ProfileReferenceV1: {
 		SuiteCoreWireInteroperability,
@@ -619,7 +605,7 @@ var profileRequiredSuites = map[ImplementationProfile][]ConformanceSuite{
 		SuiteOpenMetadata,
 		SuitePriorityUpdate,
 		SuitePriorityHintsAndStreamGroups,
-		SuiteCoreProfileCompatibility,
+		SuiteV1ProfileCompatibility,
 		SuiteAPISemanticsProfile,
 		SuiteStreamAdapterProfile,
 		SuiteReferenceProfileClaimGate,
@@ -670,7 +656,7 @@ func (c Claim) Valid() bool {
 // set.
 func (p ImplementationProfile) Valid() bool {
 	switch p {
-	case ProfileCoreV1, ProfileFullV1, ProfileReferenceV1:
+	case ProfileV1, ProfileReferenceV1:
 		return true
 	default:
 		return false
@@ -690,7 +676,7 @@ func (s ConformanceSuite) Valid() bool {
 		SuiteOpenMetadata,
 		SuitePriorityUpdate,
 		SuitePriorityHintsAndStreamGroups,
-		SuiteCoreProfileCompatibility,
+		SuiteV1ProfileCompatibility,
 		SuiteAPISemanticsProfile,
 		SuiteStreamAdapterProfile,
 		SuiteReferenceProfileClaimGate,
@@ -706,9 +692,7 @@ func (s ConformanceSuite) Valid() bool {
 // the caller.
 func (p ImplementationProfile) Claims() []Claim {
 	switch p {
-	case ProfileCoreV1:
-		return []Claim{ClaimWireV1}
-	case ProfileFullV1:
+	case ProfileV1:
 		return []Claim{
 			ClaimWireV1,
 			ClaimOpenMetadata,
