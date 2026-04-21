@@ -890,6 +890,12 @@ func (s *quicStream) CancelRead(code uint64) error {
 	if s.localReadClosed.Load() {
 		return zmux.ErrReadClosed
 	}
+	if err := s.ensureOpenPrelude(); err != nil {
+		return err
+	}
+	if s.localReadClosed.Load() {
+		return zmux.ErrReadClosed
+	}
 	s.localReadClosed.Store(true)
 	s.stream.CancelRead(quic.StreamErrorCode(code))
 	return nil

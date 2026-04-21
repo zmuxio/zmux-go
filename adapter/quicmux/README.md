@@ -71,10 +71,16 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
   adapter preludes time out
 - `CloseRead` maps to QUIC `CancelRead(CANCELLED)`
 - `CancelRead(code)` maps to QUIC `CancelRead(code)`
+- a fresh locally opened bidirectional stream submits the zmux metadata prelude
+  before `CloseRead` / `CancelRead` sends QUIC `STOP_SENDING`, so the peer can
+  accept the adapter stream before observing read-side cancellation
 - `CloseWrite` maps to QUIC send-side `Close`
 - `CancelWrite(code)` maps to QUIC `CancelWrite(code)`
 - `CloseWithError(code, reason)` is best-effort: bidirectional streams cancel both local directions; unidirectional
   streams cancel only the locally meaningful direction QUIC exposes
+- fresh write-side reset / abort visibility is intentionally not a portable
+  adapter guarantee because QUIC `RESET_STREAM` can discard earlier
+  unacknowledged stream data, including a just-written prelude
 - `Closed()` reports whether the wrapped QUIC connection context has terminated
 - `Accept*` and `Open*` treat `nil` contexts as `context.Background()`
 
@@ -86,6 +92,8 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
 - `OpenStreamWithOptions` and `OpenUniStreamWithOptions` support `OpenInfo`, `InitialPriority`, and `InitialGroup`
 - `OpenInfo()` and `Metadata()` expose decoded opener metadata on accepted streams
 - `UpdateMetadata(...)` works only before the prelude is emitted
+- fresh locally opened streams submit the prelude before read-side terminal
+  control, including `CloseRead` / `CancelRead` before any application payload
 
 Once the prelude is emitted, further metadata updates are not representable on the QUIC wire. The adapter returns
 `errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.

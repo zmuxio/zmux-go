@@ -119,6 +119,58 @@ func TestWrapSessionCloseReadUsesCancelledCode(t *testing.T) {
 	t.Fatal("client write did not observe CANCELLED after peer CloseRead")
 }
 
+func TestWrapSessionFreshCloseReadSubmitsPreludeBeforeStopSending(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type acceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		acceptCh <- acceptResult{stream: stream, err: err}
+	}()
+
+	clientStream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if err := clientStream.CloseRead(); err != nil {
+		t.Fatalf("CloseRead err = %v", err)
+	}
+
+	accepted := <-acceptCh
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+	if got := accepted.stream.OpenInfo(); len(got) != 0 {
+		t.Fatalf("accepted OpenInfo len = %d, want 0", len(got))
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	_ = accepted.stream.SetWriteDeadline(deadline)
+	for time.Now().Before(deadline) {
+		_, err := accepted.stream.Write([]byte("x"))
+		if err == nil {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		appErr, ok := findError[*zmux.ApplicationError](err)
+		if !ok {
+			t.Fatalf("accepted Write err = %v, want ApplicationError(CodeCancelled)", err)
+		}
+		if appErr.Code != uint64(zmux.CodeCancelled) {
+			t.Fatalf("accepted Write code = %d, want %d", appErr.Code, uint64(zmux.CodeCancelled))
+		}
+		return
+	}
+	t.Fatal("accepted write did not observe CANCELLED after fresh peer CloseRead")
+}
+
 func TestWrapSessionUniCloseMatchesAvailableDirection(t *testing.T) {
 	client, server := newWrappedPair(t)
 

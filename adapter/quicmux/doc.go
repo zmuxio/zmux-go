@@ -8,6 +8,12 @@
 //   - QUIC stream cancelation codes surface as zmux ApplicationError values
 //   - open-time zmux metadata is carried through a tiny per-stream prelude:
 //     varint(metadata_len) followed by metadata TLVs
+//   - a fresh locally opened bidirectional stream that first performs
+//     CloseRead / CancelRead writes that prelude before STOP_SENDING so the
+//     peer can parse the adapter opener before seeing the read-side stop
+//   - fresh write-side reset / abort visibility is intentionally not a portable
+//     adapter guarantee because QUIC RESET_STREAM may discard previously written
+//     but unacknowledged stream data, including a just-written prelude
 //   - accepted-stream prelude parsing runs in the background with bounded,
 //     on-demand concurrency so stalled or invalid adapter preludes do not
 //     block later ready streams without forcing idle sessions to keep worker
