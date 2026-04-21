@@ -57,8 +57,14 @@ func TestMemoryWakeNeeded(t *testing.T) {
 	if !MemoryWakeNeeded(8, 7, 8) {
 		t.Fatal("MemoryWakeNeeded(8, 7, 8) = false, want true")
 	}
-	if MemoryWakeNeeded(7, 6, 8) {
-		t.Fatal("MemoryWakeNeeded(7, 6, 8) = true, want false")
+	if !MemoryWakeNeeded(7, 6, 8) {
+		t.Fatal("MemoryWakeNeeded(7, 6, 8) = false, want true")
+	}
+	if MemoryWakeNeeded(9, 8, 8) {
+		t.Fatal("MemoryWakeNeeded(9, 8, 8) = true, want false")
+	}
+	if MemoryWakeNeeded(8, 8, 8) {
+		t.Fatal("MemoryWakeNeeded(8, 8, 8) = true, want false")
 	}
 }
 

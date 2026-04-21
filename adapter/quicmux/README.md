@@ -71,6 +71,9 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
   adapter preludes time out
 - `CloseRead` maps to QUIC `CancelRead(CANCELLED)`
 - `CancelRead(code)` maps to QUIC `CancelRead(code)`
+- ordinary zero-length `Write` is a local no-op: it does not submit the
+  adapter prelude, make the stream peer-visible, or observe local write-half
+  terminal state
 - a fresh locally opened bidirectional stream submits the zmux metadata prelude
   before `CloseRead` / `CancelRead` sends QUIC `STOP_SENDING`, so the peer can
   accept the adapter stream before observing read-side cancellation

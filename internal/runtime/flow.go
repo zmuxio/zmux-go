@@ -146,7 +146,7 @@ func GainedCredit(prev, next uint64) bool {
 }
 
 func MemoryWakeNeeded(prevTracked, nextTracked, threshold uint64) bool {
-	if prevTracked < threshold {
+	if nextTracked >= prevTracked {
 		return false
 	}
 	return nextTracked < threshold
@@ -220,7 +220,7 @@ func PlanQueueReleaseWake(
 	memoryWake := MemoryWakeNeeded(prevTracked, nextTracked, memoryThreshold)
 	sessionWake := CrossedLowWatermark(prevSessionQueued, nextSessionQueued, sessionLWM)
 	broadcast := sessionWake || memoryWake
-	streamWake := !broadcast && CrossedLowWatermark(prevStreamQueued, nextStreamQueued, streamLWM)
+	streamWake := !sessionWake && CrossedLowWatermark(prevStreamQueued, nextStreamQueued, streamLWM)
 	return ReleaseWakePlan{
 		Broadcast:  broadcast,
 		StreamWake: streamWake,
@@ -241,7 +241,7 @@ func PlanPreparedReleaseWake(
 	sessionWake := CrossedLowWatermark(prevSessionQueued, nextSessionQueued, sessionLWM) ||
 		GainedCredit(prevSessionCredit, nextSessionCredit)
 	broadcast := sessionWake || memoryWake
-	streamWake := !broadcast && (CrossedLowWatermark(prevStreamQueued, nextStreamQueued, streamLWM) ||
+	streamWake := !sessionWake && (CrossedLowWatermark(prevStreamQueued, nextStreamQueued, streamLWM) ||
 		GainedCredit(prevStreamCredit, nextStreamCredit))
 	return ReleaseWakePlan{
 		Broadcast:  broadcast,

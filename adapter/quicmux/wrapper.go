@@ -783,6 +783,9 @@ func (s *quicStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if s.localWriteClosed.Load() {
 		if err := s.loadLocalWriteErr(); err != nil {
 			return 0, err
@@ -975,6 +978,9 @@ func (s *quicSendStream) RemoteAddr() net.Addr {
 func (s *quicSendStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
+	}
+	if len(p) == 0 {
+		return 0, nil
 	}
 	if s.localWriteClosed.Load() {
 		if err := s.loadLocalWriteErr(); err != nil {

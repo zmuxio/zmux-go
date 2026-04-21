@@ -3,7 +3,7 @@ package runtime
 import "testing"
 
 func TestPlanQueueReleaseWake(t *testing.T) {
-	plan := PlanQueueReleaseWake(70, 60, 80, 10, 4, 4, 8, 3, 4, false)
+	plan := PlanQueueReleaseWake(90, 80, 80, 10, 4, 4, 8, 3, 4, false)
 	if !plan.Broadcast {
 		t.Fatal("Broadcast = false, want true when session queue crosses low watermark")
 	}
@@ -25,6 +25,19 @@ func TestPlanPreparedReleaseWakePrefersStreamWakeWhenOnlyStreamCreditReturns(t *
 	}
 	if plan.Control {
 		t.Fatal("Control = true, want false without memory wake or urgent release")
+	}
+}
+
+func TestPlanPreparedReleaseWakeDoesNotLetMemoryWakeSuppressStreamWake(t *testing.T) {
+	plan := PlanPreparedReleaseWake(70, 60, 80, 4, 4, 4, 6, 3, 4, 1, 1, 0, 5, false)
+	if !plan.Broadcast {
+		t.Fatal("Broadcast = false, want true for memory wake")
+	}
+	if !plan.StreamWake {
+		t.Fatal("StreamWake = false, want true when stream credit returns")
+	}
+	if !plan.Control {
+		t.Fatal("Control = false, want true for memory wake")
 	}
 }
 

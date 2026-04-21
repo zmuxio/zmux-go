@@ -6993,7 +6993,7 @@ func TestSessionWriteMemoryBlockedProjectsAcrossHighThreshold(t *testing.T) {
 	}
 }
 
-func TestSessionMemoryWakeNeededRequiresCrossingBelowHighThreshold(t *testing.T) {
+func TestSessionMemoryWakeNeededRequiresReleasedMemoryBelowHighThreshold(t *testing.T) {
 	c := newSessionMemoryTestConn()
 	c.mu.Lock()
 	c.flow.sessionMemoryCap = 16
@@ -7013,6 +7013,15 @@ func TestSessionMemoryWakeNeededRequiresCrossingBelowHighThreshold(t *testing.T)
 
 	if wake {
 		t.Fatal("unexpected wake when tracked session memory stays at the high threshold")
+	}
+
+	c.mu.Lock()
+	c.flow.recvSessionUsed = prevTracked - 2
+	wake = c.sessionMemoryWakeNeededLocked(prevTracked - 1)
+	c.mu.Unlock()
+
+	if !wake {
+		t.Fatal("expected wake when below-threshold release may unblock projected memory waiters")
 	}
 }
 
@@ -10253,6 +10262,7 @@ const (
 	testSignalTimeout      = time.Second
 	testQueuedFrameTimeout = 2 * testSignalTimeout
 	testCloseWakeTimeout   = testSignalTimeout
+	testFrameBufferCap     = 1024
 )
 
 func newConnPair(t *testing.T) (*Conn, *Conn) {
@@ -10586,7 +10596,7 @@ func takePendingTerminalControlRequestForTest(c *Conn) pendingWriteRequestResult
 func newHandlerTestConnWithOptions(t *testing.T, autoFlushTerminalControl bool) (*Conn, chan Frame, func()) {
 	t.Helper()
 
-	frames := make(chan Frame, 8)
+	frames := make(chan Frame, testFrameBufferCap)
 	stop := make(chan struct{})
 	var stopOnce sync.Once
 	writerDone := make(chan struct{})
@@ -16526,7 +16536,7 @@ func TestStopSendingWithSmallQueuedTailMayGracefullyFinishBeforeAnyBytesSent(t *
 func newStopSendingDrainTimeoutConn(t *testing.T) (*Conn, <-chan Frame, func()) {
 	t.Helper()
 
-	frames := make(chan Frame, 8)
+	frames := make(chan Frame, testFrameBufferCap)
 	stop := make(chan struct{})
 	writerDone := make(chan struct{})
 	flushDone := make(chan struct{})
@@ -19274,7 +19284,7 @@ func newStateFixtureStalledCloseSignalConn(t *testing.T) (*Conn, <-chan struct{}
 func newStateFixtureStalledGracefulCloseConn(t *testing.T) (*Conn, <-chan Frame, <-chan struct{}, chan struct{}, func()) {
 	t.Helper()
 
-	frames := make(chan Frame, 8)
+	frames := make(chan Frame, testFrameBufferCap)
 	sent := make(chan struct{}, 1)
 	release := make(chan struct{})
 	done := make(chan struct{})
@@ -19505,6 +19515,13 @@ func newStateFixtureEnv(t *testing.T, fixture stateFixture) *stateFixtureEnv {
 	c.sessionControl.localGoAwayBidi = MaxVarint62
 	c.sessionControl.localGoAwayUni = MaxVarint62
 	c.signals.acceptCh = make(chan struct{}, 1)
+	switch fixture.ID {
+	case "session_hidden_abort_churn_triggers_protocol_close":
+		c.abuse.hiddenAbortChurnWindow = time.Hour
+	case "session_visible_abort_churn_triggers_protocol_close",
+		"session_visible_uni_reset_churn_triggers_protocol_close":
+		c.abuse.visibleChurnWindow = time.Hour
+	}
 
 	env := &stateFixtureEnv{
 		t:                t,

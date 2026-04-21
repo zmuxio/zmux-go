@@ -2066,9 +2066,10 @@ func (c *Conn) releaseBatchReservations(batch []writeRequest) {
 	}
 
 	plan := rt.PlanLaneReleaseWake(prevTracked, c.trackedSessionMemoryLocked(), c.sessionMemoryHighThresholdLocked(), urgentReleased)
-	plan.Broadcast = plan.Broadcast || rt.CrossedLowWatermark(prevSession, c.flow.queuedDataBytes, c.sessionDataLWMLocked())
+	sessionWake := rt.CrossedLowWatermark(prevSession, c.flow.queuedDataBytes, c.sessionDataLWMLocked())
+	plan.Broadcast = plan.Broadcast || sessionWake
 	var streamWakes []*nativeStream
-	if !plan.Broadcast {
+	if !sessionWake {
 		lowWatermark := c.perStreamDataLWMLocked()
 		streamPrev.Range(func(stream *nativeStream, prev uint64) {
 			if rt.CrossedLowWatermark(prev, stream.queuedDataBytes, lowWatermark) {

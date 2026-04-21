@@ -608,6 +608,9 @@ func TestWrapSessionCancelWriteMakesLocalWriteFailImmediately(t *testing.T) {
 	if err := stream.CancelWrite(44); err != nil {
 		t.Fatalf("CancelWrite err = %v", err)
 	}
+	if n, err := stream.Write(nil); err != nil || n != 0 {
+		t.Fatalf("zero-length Write after CancelWrite = (%d, %v), want (0, nil)", n, err)
+	}
 	if _, err := stream.Write([]byte("x")); err == nil {
 		t.Fatal("Write after CancelWrite err = nil, want application error")
 	} else {
@@ -670,6 +673,46 @@ func TestWrapSessionCloseWithErrorMakesLocalSendWriteFailImmediately(t *testing.
 			t.Fatalf("Write after CloseWithError err = %v, want ApplicationError(66, \"bye\")", err)
 		}
 	}
+}
+
+func TestWrapSessionZeroLengthWriteDoesNotSubmitOpenPrelude(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if n, err := stream.Write(nil); err != nil || n != 0 {
+		t.Fatalf("zero-length Write = (%d, %v), want (0, nil)", n, err)
+	}
+
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	if accepted, err := server.AcceptStream(shortCtx); err == nil {
+		_ = accepted.Close()
+		shortCancel()
+		t.Fatal("zero-length Write made stream peer-visible before payload/final intent")
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		shortCancel()
+		t.Fatalf("short AcceptStream err = %v, want context deadline", err)
+	}
+	shortCancel()
+
+	if n, err := stream.Write([]byte("x")); err != nil || n != 1 {
+		t.Fatalf("payload Write = (%d, %v), want (1, nil)", n, err)
+	}
+	accepted, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("AcceptStream after payload err = %v", err)
+	}
+	if got, err := io.ReadAll(io.LimitReader(accepted, 1)); err != nil || string(got) != "x" {
+		t.Fatalf("accepted payload = %q, %v; want x, nil", got, err)
+	}
+
+	_ = accepted.Close()
+	_ = stream.Close()
 }
 
 func TestEnsureOpenPreludeResumesAfterPartialWriteError(t *testing.T) {
@@ -859,6 +902,9 @@ func TestWrapSessionCloseWriteReturnsErrWriteClosedLocally(t *testing.T) {
 	}
 	if err := stream.CloseWrite(); err != nil {
 		t.Fatalf("CloseWrite err = %v", err)
+	}
+	if n, err := stream.Write(nil); err != nil || n != 0 {
+		t.Fatalf("zero-length Write after CloseWrite = (%d, %v), want (0, nil)", n, err)
 	}
 	if _, err := stream.Write([]byte("y")); !errors.Is(err, zmux.ErrWriteClosed) {
 		t.Fatalf("Write err = %v, want %v", err, zmux.ErrWriteClosed)
