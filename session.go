@@ -694,6 +694,13 @@ func saturatingDurationAdd(a, b time.Duration) time.Duration {
 	return a + b
 }
 
+func averageUint64Floor(a, b uint64) uint64 {
+	if a <= b {
+		return a + (b-a)/2
+	}
+	return b + (a-b)/2
+}
+
 func (c *Conn) noteStreamProgressLocked(now time.Time) {
 	if c == nil {
 		return
@@ -728,7 +735,7 @@ func (c *Conn) noteSendRateEstimateLocked(bytes int, writeDuration time.Duration
 		return
 	}
 
-	sample := (uint64(bytes) * uint64(time.Second)) / uint64(writeDuration)
+	sample := rt.SaturatingMulDivFloor(uint64(bytes), uint64(time.Second), uint64(writeDuration))
 	if sample == 0 {
 		sample = 1
 	}
@@ -736,7 +743,7 @@ func (c *Conn) noteSendRateEstimateLocked(bytes int, writeDuration time.Duration
 		c.metrics.sendRateEstimate = sample
 		return
 	}
-	c.metrics.sendRateEstimate = (c.metrics.sendRateEstimate + sample) / 2
+	c.metrics.sendRateEstimate = averageUint64Floor(c.metrics.sendRateEstimate, sample)
 }
 
 func (c *Conn) noteBlockedWrite(d time.Duration) {

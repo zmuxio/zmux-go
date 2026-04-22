@@ -6326,6 +6326,24 @@ func TestNoteFlushIgnoresTinyFastSamplesForSendRateEstimate(t *testing.T) {
 	}
 }
 
+func TestNoteFlushSendRateEstimateSaturatesWithoutOverflow(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	maxInt := int(^uint(0) >> 1)
+	want := rt.SaturatingMulDivFloor(uint64(maxInt), uint64(time.Second), uint64(time.Nanosecond))
+
+	c.noteSendRateEstimateLocked(maxInt, time.Nanosecond)
+	if got := c.metrics.sendRateEstimate; got != want {
+		t.Fatalf("send rate estimate = %d, want %d", got, want)
+	}
+
+	c.noteSendRateEstimateLocked(maxInt, time.Nanosecond)
+	if got := c.metrics.sendRateEstimate; got != want {
+		t.Fatalf("send rate average = %d, want %d", got, want)
+	}
+}
+
 func TestStatsTrackReasonCountersAndHiddenReap(t *testing.T) {
 	t.Parallel()
 
