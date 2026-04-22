@@ -420,6 +420,7 @@ func (c *Conn) writeLoop() {
 func (c *Conn) handlePendingControlWake() bool {
 	for handled := 0; ; handled++ {
 		c.mu.Lock()
+		c.retryReceiveReplenishLocked()
 		result := c.takePendingControlWriteRequestLocked()
 		c.mu.Unlock()
 		if result.err != nil {

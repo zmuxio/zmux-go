@@ -1600,6 +1600,7 @@ func (c *Conn) replenishSessionLocked(target uint64) {
 	}
 	desired = clampVarint62(desired)
 	if !c.ensurePendingSessionMaxDataLocked(desired) {
+		c.flow.recvReplenishRetry = true
 		return
 	}
 	c.flow.recvSessionAdvertised = desired
@@ -1644,10 +1645,36 @@ func (c *Conn) replenishStreamLocked(stream *nativeStream, target uint64) {
 	}
 	desired = clampVarint62(desired)
 	if !c.ensurePendingStreamMaxDataLocked(stream, desired) {
+		c.flow.recvReplenishRetry = true
 		return
 	}
 	stream.recvAdvertised = desired
 	stream.recvPending = 0
+}
+
+func (c *Conn) retryReceiveReplenishLocked() {
+	if c == nil || !c.flow.recvReplenishRetry {
+		return
+	}
+	c.flow.recvReplenishRetry = false
+	if c.flow.recvSessionPending != 0 {
+		c.maybeReplenishSessionLockedWithPolicy(windowReplenishForce)
+	}
+	for _, stream := range c.registry.streams {
+		if stream != nil && stream.recvPending != 0 {
+			c.maybeReplenishStreamLockedWithPolicy(stream, windowReplenishForce)
+		}
+	}
+	if c.flow.recvSessionPending != 0 {
+		c.flow.recvReplenishRetry = true
+		return
+	}
+	for _, stream := range c.registry.streams {
+		if stream != nil && stream.recvPending != 0 {
+			c.flow.recvReplenishRetry = true
+			return
+		}
+	}
 }
 
 func (c *Conn) sessionWindowTargetLocked() uint64 {

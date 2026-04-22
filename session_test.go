@@ -26583,11 +26583,71 @@ func TestReplenishReceivePreservesCreditWhenMaxDataCannotQueue(t *testing.T) {
 	if got := stream.recvPending; got != 10 {
 		t.Fatalf("stream recvPending = %d, want preserved 10 when MAX_DATA queueing is blocked", got)
 	}
+	if !c.flow.recvReplenishRetry {
+		t.Fatal("recvReplenishRetry = false, want retry marker when MAX_DATA queueing is blocked")
+	}
 	if c.pending.hasSessionMaxData {
 		t.Fatal("session MAX_DATA should not be recorded when control budget rejects the replenish")
 	}
 	if got := testPendingStreamMaxDataCount(c); got != 0 {
 		t.Fatalf("pendingStreamMaxData len = %d, want 0 when control budget rejects the replenish", got)
+	}
+}
+
+func TestReceiveReplenishRetryQueuesPendingCreditAfterControlBudgetFrees(t *testing.T) {
+	c, _, stop := newInvalidFrameConn(t, 0)
+	defer stop()
+
+	c.config.local.Settings.InitialMaxData = 262144
+	c.config.local.Settings.InitialMaxStreamDataBidiPeerOpened = 65536
+	c.config.local.Settings.MaxFramePayload = 16384
+	c.config.peer.Settings.MaxFramePayload = 16384
+
+	stream := seedStateFixtureStream(t, c, state.FirstPeerStreamID(c.config.negotiated.LocalRole, true), "bidi", "peer_owned", stateHalfExpect{
+		SendHalf: "send_open",
+		RecvHalf: "recv_open",
+	})
+
+	sessionTarget := c.sessionWindowTargetLocked()
+	streamTarget := c.streamWindowTargetLocked(stream)
+	c.pending.pendingControlBudget = 1
+	c.pending.controlBytes = 1
+	c.flow.recvSessionAdvertised = sessionTarget
+	c.flow.recvSessionReceived = sessionTarget - quarterThreshold(sessionTarget)
+	c.flow.recvSessionPending = 10
+	stream.recvAdvertised = streamTarget
+	stream.recvReceived = streamTarget - quarterThreshold(streamTarget)
+	stream.recvPending = 10
+
+	c.maybeReplenishReceiveLocked(stream)
+	c.pending.pendingControlBudget = 0
+	c.pending.controlBytes = 0
+	c.retryReceiveReplenishLocked()
+
+	wantSessionAdvertised := c.flow.recvSessionReceived + sessionTarget
+	if got := c.flow.recvSessionAdvertised; got != wantSessionAdvertised {
+		t.Fatalf("recvSessionAdvertised = %d, want %d after retry", got, wantSessionAdvertised)
+	}
+	if got := c.flow.recvSessionPending; got != 0 {
+		t.Fatalf("recvSessionPending = %d, want 0 after retry", got)
+	}
+	wantStreamAdvertised := stream.recvReceived + streamTarget
+	if got := stream.recvAdvertised; got != wantStreamAdvertised {
+		t.Fatalf("stream recvAdvertised = %d, want %d after retry", got, wantStreamAdvertised)
+	}
+	if got := stream.recvPending; got != 0 {
+		t.Fatalf("stream recvPending = %d, want 0 after retry", got)
+	}
+	if c.flow.recvReplenishRetry {
+		t.Fatal("recvReplenishRetry = true, want false after successful retry")
+	}
+
+	urgent, advisory := testDrainPendingControlFrames(c)
+	if len(advisory) != 0 {
+		t.Fatalf("advisory len = %d, want 0", len(advisory))
+	}
+	if len(urgent) != 2 {
+		t.Fatalf("drained %d urgent frames, want 2", len(urgent))
 	}
 }
 

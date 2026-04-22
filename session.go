@@ -2441,6 +2441,7 @@ type connFlowState struct {
 	recvSessionReceived   uint64
 	recvSessionUsed       uint64
 	recvSessionPending    uint64
+	recvReplenishRetry    bool
 	sendSessionMax        uint64
 	sendSessionUsed       uint64
 	queuedDataBytes       uint64
