@@ -1930,7 +1930,8 @@ func (c *Conn) releaseWriteQueueReservation(req *writeRequest) {
 		if plan.MemoryWake {
 			notify(c.pending.controlNotify)
 		}
-	} else if plan.StreamWake && stream != nil {
+	}
+	if plan.StreamWake && stream != nil {
 		notify(stream.writeNotify)
 	}
 	c.mu.Unlock()
@@ -2149,7 +2150,10 @@ func drainDetachedWriteLane(ch chan writeRequest, err error) bool {
 	drained := false
 	for {
 		select {
-		case req := <-ch:
+		case req, ok := <-ch:
+			if !ok {
+				return drained
+			}
 			drained = true
 			completeWriteRequest(&req, err)
 			req.clearRetainedRefs()

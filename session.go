@@ -2800,7 +2800,7 @@ func adaptiveRTTTimeout(rtt, base, max time.Duration, multiplier int, slack time
 	}
 	timeout := base
 	if rtt > 0 && multiplier > 0 {
-		candidate := time.Duration(multiplier)*rtt + slack
+		candidate := saturatingDurationMulAdd(rtt, multiplier, slack)
 		if candidate > timeout {
 			timeout = candidate
 		}
@@ -2809,6 +2809,25 @@ func adaptiveRTTTimeout(rtt, base, max time.Duration, multiplier int, slack time
 		return max
 	}
 	return timeout
+}
+
+func saturatingDurationMulAdd(v time.Duration, multiplier int, add time.Duration) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if v <= 0 || multiplier <= 0 {
+		return 0
+	}
+	m := time.Duration(multiplier)
+	if v > maxDuration/m {
+		return maxDuration
+	}
+	out := v * m
+	if add <= 0 {
+		return out
+	}
+	if out > maxDuration-add {
+		return maxDuration
+	}
+	return out + add
 }
 
 func (c *Conn) stopSendingDrainWindowLocked() time.Duration {
@@ -3320,6 +3339,7 @@ func (c *Conn) Ping(ctx context.Context, echo []byte) (time.Duration, error) {
 		if err == nil {
 			select {
 			case <-ctx.Done():
+				c.failPingDone(done)
 				return 0, ctx.Err()
 			case <-c.lifecycle.closedCh:
 				if err := c.err(); err != nil {
@@ -3501,6 +3521,15 @@ func (c *Conn) failPing(payload []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.liveness.pingOutstanding || !bytes.Equal(c.liveness.pingPayload, payload) {
+		return
+	}
+	c.clearPingLocked()
+}
+
+func (c *Conn) failPingDone(done <-chan struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.liveness.pingOutstanding || c.liveness.pingDone != done {
 		return
 	}
 	c.clearPingLocked()
@@ -3783,14 +3812,14 @@ func (c *Conn) effectiveKeepaliveTimeoutLocked() time.Duration {
 	}
 	timeout := c.liveness.keepaliveTimeout
 	if timeout <= 0 {
-		timeout = c.liveness.keepaliveInterval * 2
+		timeout = saturatingDurationMulAdd(c.liveness.keepaliveInterval, 2, 0)
 		if timeout < defaultKeepaliveTimeoutMin {
 			timeout = defaultKeepaliveTimeoutMin
 		}
 		return adaptiveRTTTimeout(c.liveness.lastPingRTT, timeout, defaultKeepaliveTimeoutMax, 4, rttAdaptiveSlack)
 	}
 	if c.liveness.lastPingRTT > 0 {
-		floor := 4*c.liveness.lastPingRTT + rttAdaptiveSlack
+		floor := saturatingDurationMulAdd(c.liveness.lastPingRTT, 4, rttAdaptiveSlack)
 		if floor > timeout {
 			timeout = floor
 		}

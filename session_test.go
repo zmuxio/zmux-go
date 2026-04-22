@@ -7354,6 +7354,50 @@ func TestClearPingLockedWakesWriteWaitersWhenMemoryPressureDrops(t *testing.T) {
 	}
 }
 
+func TestReleaseWriteQueueReservationMemoryWakeDoesNotSuppressStreamWake(t *testing.T) {
+	t.Parallel()
+
+	c := newSessionMemoryTestConn()
+	stream := &nativeStream{
+		conn:        c,
+		id:          8,
+		idSet:       true,
+		localSend:   true,
+		writeNotify: make(chan struct{}, 1),
+	}
+	req := writeRequest{
+		frames:         testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: stream.id, Payload: []byte("held")}}),
+		done:           make(chan error, 1),
+		origin:         writeRequestOriginStream,
+		queueReserved:  true,
+		queuedBytes:    5,
+		reservedStream: stream,
+	}
+
+	c.mu.Lock()
+	c.flow.sessionMemoryCap = 16
+	c.flow.sessionDataHWM = 100
+	c.flow.perStreamDataHWM = 8
+	c.flow.recvSessionUsed = 4
+	c.flow.queuedDataBytes = 10
+	stream.queuedDataBytes = 5
+	wake := c.currentWriteWakeLocked()
+	c.mu.Unlock()
+
+	c.releaseWriteQueueReservation(&req)
+
+	select {
+	case <-wake:
+	default:
+		t.Fatal("expected memory release to broadcast global write wake")
+	}
+	select {
+	case <-stream.writeNotify:
+	default:
+		t.Fatal("expected memory release not to suppress per-stream wake")
+	}
+}
+
 func TestRestorePreparedPriorityUpdateReplacesExistingPendingBytes(t *testing.T) {
 	c := newSessionMemoryTestConn()
 	stream := &nativeStream{conn: c, id: 9, idSet: true}
@@ -26960,6 +27004,40 @@ func TestStopSendingDrainWindowUsesObservedRTTFloorWhenUnset(t *testing.T) {
 
 	if got := c.stopSendingDrainWindow(); got != 1800*time.Millisecond {
 		t.Fatalf("stopSendingDrainWindow = %v, want 1800ms", got)
+	}
+}
+
+func TestAdaptiveRTTTimeoutSaturatesBeforeApplyingMax(t *testing.T) {
+	t.Parallel()
+
+	got := adaptiveRTTTimeout(time.Duration(1<<62), 500*time.Millisecond, 5*time.Second, 4, 50*time.Millisecond)
+	if got != 5*time.Second {
+		t.Fatalf("adaptiveRTTTimeout overflow case = %v, want 5s cap", got)
+	}
+}
+
+func TestEffectiveKeepaliveTimeoutSaturatesConfiguredRTTFloor(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	c.liveness.keepaliveTimeout = 500 * time.Millisecond
+	c.liveness.lastPingRTT = time.Duration(1 << 62)
+
+	got := c.effectiveKeepaliveTimeoutLocked()
+	if got != time.Duration(1<<63-1) {
+		t.Fatalf("effectiveKeepaliveTimeout overflow case = %v, want saturated duration", got)
+	}
+}
+
+func TestEffectiveKeepaliveTimeoutSaturatesDefaultBaseBeforeMax(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	c.liveness.keepaliveInterval = time.Duration(1 << 62)
+
+	got := c.effectiveKeepaliveTimeoutLocked()
+	if got != defaultKeepaliveTimeoutMax {
+		t.Fatalf("effectiveKeepaliveTimeout default base overflow case = %v, want %v", got, defaultKeepaliveTimeoutMax)
 	}
 }
 

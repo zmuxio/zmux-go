@@ -2441,6 +2441,66 @@ func TestReadLoopReleasesSupersededScratchHandle(t *testing.T) {
 	}
 }
 
+func TestReadLoopReleasesScratchHandleOnHandleError(t *testing.T) {
+	oldReadFrameBuffered := readLoopReadFrameBuffered
+	oldHandleFrameBuffered := readLoopHandleFrameBuffered
+	oldRetain := readLoopRetainReadFrameBufferForPayload
+	oldRelease := readLoopReleaseReadFrameBuffer
+	oldClose := readLoopCloseSessionWithOptionsForReadErr
+	defer func() {
+		readLoopHooksMu.Lock()
+		readLoopReadFrameBuffered = oldReadFrameBuffered
+		readLoopHandleFrameBuffered = oldHandleFrameBuffered
+		readLoopRetainReadFrameBufferForPayload = oldRetain
+		readLoopReleaseReadFrameBuffer = oldRelease
+		readLoopCloseSessionWithOptionsForReadErr = oldClose
+		readLoopHooksMu.Unlock()
+	}()
+
+	buf := []byte("bad-control-frame")
+	handle := &wire.FrameReadBufferHandle{}
+	errBoom := errors.New("boom")
+
+	var released []*wire.FrameReadBufferHandle
+	var closeErr error
+	readLoopHooksMu.Lock()
+	readLoopReadFrameBuffered = func(_ io.Reader, _ Limits, dst []byte) (Frame, []byte, *wire.FrameReadBufferHandle, error) {
+		if dst != nil {
+			t.Fatalf("read received scratch %v, want nil", dst)
+		}
+		return Frame{}, buf, handle, nil
+	}
+	readLoopHandleFrameBuffered = func(_ *Conn, _ Frame, _ []byte, got *wire.FrameReadBufferHandle) (bool, error) {
+		if got != handle {
+			t.Fatalf("handleFrameBuffered handle = %p, want %p", got, handle)
+		}
+		return false, errBoom
+	}
+	readLoopRetainReadFrameBufferForPayload = func(got []byte, _ uint64) []byte {
+		if len(got) != len(buf) {
+			t.Fatalf("retain buf len = %d, want %d", len(got), len(buf))
+		}
+		return got[:0]
+	}
+	readLoopReleaseReadFrameBuffer = func(_ []byte, got *wire.FrameReadBufferHandle) {
+		released = append(released, got)
+	}
+	readLoopCloseSessionWithOptionsForReadErr = func(_ *Conn, err error) {
+		closeErr = err
+	}
+	readLoopHooksMu.Unlock()
+
+	c := &Conn{}
+	c.readLoop()
+
+	if !errors.Is(closeErr, errBoom) {
+		t.Fatalf("readLoop close err = %v, want %v", closeErr, errBoom)
+	}
+	if len(released) != 1 || released[0] != handle {
+		t.Fatalf("released handles = %v, want [%p]", released, handle)
+	}
+}
+
 func TestReadLoopDoesNotReuseRetainedScratchBuffer(t *testing.T) {
 	oldReadFrameBuffered := readLoopReadFrameBuffered
 	oldHandleFrameBuffered := readLoopHandleFrameBuffered
@@ -2798,6 +2858,41 @@ func TestPingWaitsForOutstandingSlot(t *testing.T) {
 
 	if client.Stats().PingOutstanding {
 		t.Fatal("PingOutstanding = true after first Ping completed")
+	}
+}
+
+func TestPingContextCancelClearsOwnOutstandingSlot(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := c.Ping(ctx, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Ping err = %v, want deadline exceeded", err)
+	}
+
+	select {
+	case frame := <-frames:
+		if frame.Type != FrameTypePING {
+			t.Fatalf("queued frame = %+v, want PING", frame)
+		}
+	default:
+		t.Fatal("Ping did not queue a PING frame before context deadline")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.liveness.pingOutstanding {
+		t.Fatal("pingOutstanding = true after Ping context deadline")
+	}
+	if c.liveness.pingDone != nil {
+		t.Fatal("pingDone not cleared after Ping context deadline")
+	}
+	if len(c.liveness.pingPayload) != 0 {
+		t.Fatalf("pingPayload len = %d, want 0 after Ping context deadline", len(c.liveness.pingPayload))
 	}
 }
 

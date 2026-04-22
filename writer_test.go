@@ -46,6 +46,26 @@ func TestCollectWriteBatchDrainsReadyFrames(t *testing.T) {
 	}
 }
 
+func TestDrainDetachedWriteLaneStopsOnClosedChannel(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("closed")
+	done := make(chan error, 1)
+	ch := make(chan writeRequest, 1)
+	ch <- writeRequest{done: done}
+	close(ch)
+
+	if !drainDetachedWriteLane(ch, wantErr) {
+		t.Fatal("drainDetachedWriteLane = false, want true after draining buffered request")
+	}
+	if got := <-done; !errors.Is(got, wantErr) {
+		t.Fatalf("completion error = %v, want %v", got, wantErr)
+	}
+	if drainDetachedWriteLane(ch, wantErr) {
+		t.Fatal("drainDetachedWriteLane on empty closed lane = true, want false")
+	}
+}
+
 func BenchmarkCollectWriteBatchLaneBuffering(b *testing.B) {
 	payload := bytes.Repeat([]byte("x"), 32)
 	proto := writeRequest{

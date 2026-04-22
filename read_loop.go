@@ -153,6 +153,9 @@ func (c *Conn) readLoop() {
 			}
 		}
 		if err != nil {
+			if scratchHandle != nil {
+				releaseReadFrameBufferFn(scratch, scratchHandle)
+			}
 			closeSessionFn(c, err)
 			return
 		}
