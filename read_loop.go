@@ -1203,6 +1203,7 @@ func (c *Conn) releaseReceiveLocked(stream *nativeStream, n uint64) {
 		c.flow.recvSessionAdvertised = sessionDesired
 	} else {
 		c.flow.recvSessionPending = saturatingAdd(c.flow.recvSessionPending, sessionN)
+		c.flow.recvReplenishRetry = true
 	}
 
 	if stream == nil {
@@ -1225,6 +1226,7 @@ func (c *Conn) releaseReceiveLocked(stream *nativeStream, n uint64) {
 			stream.recvAdvertised = streamDesired
 		} else {
 			stream.recvPending = saturatingAdd(stream.recvPending, streamN)
+			c.flow.recvReplenishRetry = true
 		}
 	}
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(sessionN > 0))
@@ -1239,6 +1241,7 @@ func (c *Conn) releaseLateDiscardLocked(stream *nativeStream, n uint64, cause la
 		c.flow.recvSessionAdvertised = sessionDesired
 	} else {
 		c.flow.recvSessionPending = saturatingAdd(c.flow.recvSessionPending, n)
+		c.flow.recvReplenishRetry = true
 	}
 	c.ingress.aggregateLateData = rt.SaturatingAdd(c.ingress.aggregateLateData, n)
 	c.recordLateDiscardCauseLocked(cause, n)

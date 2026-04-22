@@ -26277,6 +26277,101 @@ func TestReleaseLateDiscardClampsSessionAdvertisedWindowToVarint62(t *testing.T)
 	}
 }
 
+func TestReleaseReceiveMarksRetryWhenMaxDataCannotQueue(t *testing.T) {
+	t.Parallel()
+
+	settings := DefaultSettings()
+	c := &Conn{
+		pending: connPendingControlState{
+			controlNotify:        make(chan struct{}, 1),
+			pendingControlBudget: 1,
+			controlBytes:         1,
+		},
+		lifecycle: connLifecycleState{sessionState: connStateReady},
+		config: connConfigState{
+			local:      Preface{Settings: settings},
+			peer:       Preface{Settings: settings},
+			negotiated: Negotiated{PeerSettings: settings},
+		},
+		flow: connFlowState{
+			recvSessionAdvertised: 100,
+			recvSessionUsed:       10,
+		},
+		registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
+	}
+	stream := &nativeStream{
+		conn:           c,
+		id:             4,
+		idSet:          true,
+		localReceive:   true,
+		recvAdvertised: 100,
+		recvBuffer:     10,
+	}
+	stream.initHalfStates()
+	c.registry.streams[stream.id] = stream
+
+	c.mu.Lock()
+	c.releaseReceiveLocked(stream, 10)
+	c.mu.Unlock()
+
+	if got := c.flow.recvSessionAdvertised; got != 100 {
+		t.Fatalf("recvSessionAdvertised = %d, want unchanged 100 when MAX_DATA queueing is blocked", got)
+	}
+	if got := c.flow.recvSessionPending; got != 10 {
+		t.Fatalf("recvSessionPending = %d, want 10 when MAX_DATA queueing is blocked", got)
+	}
+	if got := stream.recvAdvertised; got != 100 {
+		t.Fatalf("stream recvAdvertised = %d, want unchanged 100 when MAX_DATA queueing is blocked", got)
+	}
+	if got := stream.recvPending; got != 10 {
+		t.Fatalf("stream recvPending = %d, want 10 when MAX_DATA queueing is blocked", got)
+	}
+	if !c.flow.recvReplenishRetry {
+		t.Fatal("recvReplenishRetry = false, want retry marker when release MAX_DATA queueing is blocked")
+	}
+}
+
+func TestReleaseLateDiscardMarksRetryWhenMaxDataCannotQueue(t *testing.T) {
+	t.Parallel()
+
+	settings := DefaultSettings()
+	c := &Conn{
+		pending: connPendingControlState{
+			controlNotify:        make(chan struct{}, 1),
+			pendingControlBudget: 1,
+			controlBytes:         1,
+		},
+		lifecycle: connLifecycleState{sessionState: connStateReady},
+		config: connConfigState{
+			local:      Preface{Settings: settings},
+			peer:       Preface{Settings: settings},
+			negotiated: Negotiated{PeerSettings: settings},
+		},
+		flow: connFlowState{recvSessionAdvertised: 100},
+	}
+	stream := &nativeStream{id: 4, idSet: true}
+
+	c.mu.Lock()
+	c.releaseLateDiscardLocked(stream, 10, lateDataCauseReset)
+	c.mu.Unlock()
+
+	if got := c.flow.recvSessionAdvertised; got != 100 {
+		t.Fatalf("recvSessionAdvertised = %d, want unchanged 100 when late-discard MAX_DATA queueing is blocked", got)
+	}
+	if got := c.flow.recvSessionPending; got != 10 {
+		t.Fatalf("recvSessionPending = %d, want 10 when late-discard MAX_DATA queueing is blocked", got)
+	}
+	if !c.flow.recvReplenishRetry {
+		t.Fatal("recvReplenishRetry = false, want retry marker when late-discard MAX_DATA queueing is blocked")
+	}
+	if got := c.ingress.aggregateLateData; got != 10 {
+		t.Fatalf("aggregateLateData = %d, want 10", got)
+	}
+	if got := stream.lateDataReceived; got != 10 {
+		t.Fatalf("stream.lateDataReceived = %d, want 10", got)
+	}
+}
+
 func TestReleaseReceiveZeroWindowWakesWriteWaitersWhenMemoryPressureDrops(t *testing.T) {
 	t.Parallel()
 
