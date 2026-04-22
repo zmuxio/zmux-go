@@ -91,6 +91,7 @@ func ParseSettingsTLV(src []byte) (Settings, error) {
 				seenUnknown = make(map[uint64]struct{}, 1)
 			}
 			seenUnknown[typ] = struct{}{}
+			continue
 		}
 
 		value, n, err := ParseVarint(valueBytes)

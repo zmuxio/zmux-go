@@ -77,6 +77,23 @@ func TestParseSettingsTLVRejectsDuplicateUnknownSetting(t *testing.T) {
 	}
 }
 
+func TestParseSettingsTLVSkipsUnknownSettingPayloadWithoutInterpretingValue(t *testing.T) {
+	t.Parallel()
+
+	raw, err := AppendTLV(nil, 99, []byte{0xff, 0x00, 0x01})
+	if err != nil {
+		t.Fatalf("AppendTLV err = %v", err)
+	}
+
+	parsed, err := ParseSettingsTLV(raw)
+	if err != nil {
+		t.Fatalf("ParseSettingsTLV err = %v, want nil", err)
+	}
+	if parsed != DefaultSettings() {
+		t.Fatalf("ParseSettingsTLV = %+v, want defaults", parsed)
+	}
+}
+
 func TestKnownSettingSeenBitRecognizesConfiguredRange(t *testing.T) {
 	t.Parallel()
 
