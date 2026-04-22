@@ -26093,6 +26093,30 @@ func TestOpenMetadataFlowControlStillRejectsTrailingAppByteOverStreamWindow(t *t
 	assertNoQueuedFrame(t, frames)
 }
 
+func TestDataFrameExceedingSessionAndStreamWindowPrefersSessionFlowControl(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.InitialMaxData = 0
+	c.config.local.Settings.InitialMaxStreamDataBidiPeerOpened = 0
+	c.flow.recvSessionAdvertised = 0
+	c.mu.Unlock()
+
+	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
+	err := c.handleDataFrame(Frame{
+		Type:     FrameTypeDATA,
+		StreamID: streamID,
+		Payload:  []byte("x"),
+	})
+	if !IsErrorCode(err, CodeFlowControl) {
+		t.Fatalf("handleDataFrame over session+stream windows err = %v, want %s", err, CodeFlowControl)
+	}
+	assertNoQueuedFrame(t, frames)
+}
+
 func TestPendingControlQueuesRebuildFromStreamPendingState(t *testing.T) {
 	c := &Conn{registry: connRegistryState{streams: map[uint64]*nativeStream{
 		4:  {id: 4, idSet: true, localReceive: true, localSend: true},

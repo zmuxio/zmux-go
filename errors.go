@@ -401,8 +401,8 @@ func readLoopSessionErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	var wireErr *wire.Error
-	if !errors.As(err, &wireErr) || !strings.HasPrefix(wireErr.Op, "validate ") {
+	wireErr, ok := findError[*wire.Error](err)
+	if !ok || !strings.HasPrefix(wireErr.Op, "validate ") {
 		return err
 	}
 	return reframeStructuredError(err, errorMeta{

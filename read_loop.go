@@ -713,6 +713,10 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 		c.mu.Unlock()
 		return false, err
 	}
+	if c.sessionReceiveLimitExceededLocked(appLen) {
+		c.mu.Unlock()
+		return false, wireError(CodeFlowControl, "handle DATA", fmt.Errorf("session receive window exceeded"))
+	}
 	if receiveWindowExceeded(stream.recvReceived, stream.recvAdvertised, appLen) {
 		frame, err := c.planAbortLiveStreamLocked(stream, CodeFlowControl, "")
 		if err != nil {
@@ -722,10 +726,6 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 		c.mu.Unlock()
 		c.queueReadLoopFrameAsync(frame)
 		return false, nil
-	}
-	if c.sessionReceiveLimitExceededLocked(appLen) {
-		c.mu.Unlock()
-		return false, wireError(CodeFlowControl, "handle DATA", fmt.Errorf("session receive window exceeded"))
 	}
 	c.markPeerVisibleLocked(stream)
 	stream.recvReceived = saturatingAdd(stream.recvReceived, appLen)
