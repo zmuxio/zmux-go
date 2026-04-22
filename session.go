@@ -590,10 +590,13 @@ type ProvisionalStats struct {
 	Expired    uint64
 }
 
-// ReasonStats counts observed reset and abort codes.
+// ReasonStats counts observed reset and abort codes. Overflow counters count
+// events folded after the distinct-code map cap is reached.
 type ReasonStats struct {
-	Reset map[uint64]uint64
-	Abort map[uint64]uint64
+	Reset         map[uint64]uint64
+	ResetOverflow uint64
+	Abort         map[uint64]uint64
+	AbortOverflow uint64
 }
 
 // DiagnosticStats reports ingress, drop, and late-data counters.
@@ -767,6 +770,16 @@ func (c *Conn) noteOpenCommitLocked(created time.Time, now time.Time) {
 	notify(c.signals.livenessCh)
 }
 
+const maxReasonStatsCodes = 1024
+
+func noteReasonLocked(counts map[uint64]uint64, overflow *uint64, code uint64) {
+	if _, ok := counts[code]; ok || len(counts) < maxReasonStatsCodes {
+		counts[code] = saturatingAdd(counts[code], 1)
+		return
+	}
+	*overflow = saturatingAdd(*overflow, 1)
+}
+
 func (c *Conn) noteResetReasonLocked(code uint64) {
 	if c == nil {
 		return
@@ -774,7 +787,7 @@ func (c *Conn) noteResetReasonLocked(code uint64) {
 	if c.retention.resetReasonCount == nil {
 		c.retention.resetReasonCount = make(map[uint64]uint64)
 	}
-	c.retention.resetReasonCount[code] = saturatingAdd(c.retention.resetReasonCount[code], 1)
+	noteReasonLocked(c.retention.resetReasonCount, &c.retention.resetReasonOverflow, code)
 }
 
 func (c *Conn) noteAbortReasonLocked(code uint64) {
@@ -784,7 +797,7 @@ func (c *Conn) noteAbortReasonLocked(code uint64) {
 	if c.retention.abortReasonCount == nil {
 		c.retention.abortReasonCount = make(map[uint64]uint64)
 	}
-	c.retention.abortReasonCount[code] = saturatingAdd(c.retention.abortReasonCount[code], 1)
+	noteReasonLocked(c.retention.abortReasonCount, &c.retention.abortReasonOverflow, code)
 }
 
 func (c *Conn) noteHiddenStreamRefusedLocked() {
@@ -934,8 +947,10 @@ func (c *Conn) Stats() SessionStats {
 			Expired:    c.ingress.provisionalExpired,
 		},
 		Reasons: ReasonStats{
-			Reset: copyReasonCounts(c.retention.resetReasonCount),
-			Abort: copyReasonCounts(c.retention.abortReasonCount),
+			Reset:         copyReasonCounts(c.retention.resetReasonCount),
+			ResetOverflow: c.retention.resetReasonOverflow,
+			Abort:         copyReasonCounts(c.retention.abortReasonCount),
+			AbortOverflow: c.retention.abortReasonOverflow,
 		},
 		Diagnostics: DiagnosticStats{
 			DroppedPriorityUpdates:      c.ingress.droppedPriorityUpdate,
@@ -2294,8 +2309,10 @@ type connRetentionState struct {
 	retainedOpenInfoBytes   uint64
 	retainedPeerReasonBytes uint64
 
-	resetReasonCount map[uint64]uint64
-	abortReasonCount map[uint64]uint64
+	resetReasonCount    map[uint64]uint64
+	abortReasonCount    map[uint64]uint64
+	resetReasonOverflow uint64
+	abortReasonOverflow uint64
 }
 
 type connWriterRuntimeState struct {

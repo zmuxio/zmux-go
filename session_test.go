@@ -6383,6 +6383,42 @@ func TestStatsTrackReasonCountersAndHiddenReap(t *testing.T) {
 	}
 }
 
+func TestStatsReasonCountersBoundDistinctCodes(t *testing.T) {
+	t.Parallel()
+
+	c, _, stop := newInvalidFrameConn(t, 0)
+	defer stop()
+
+	c.mu.Lock()
+	for i := uint64(0); i < maxReasonStatsCodes+5; i++ {
+		c.noteResetReasonLocked(10_000 + i)
+		c.noteAbortReasonLocked(20_000 + i)
+	}
+	c.noteResetReasonLocked(10_000)
+	c.noteAbortReasonLocked(20_000)
+	c.mu.Unlock()
+
+	stats := c.Stats()
+	if got := len(stats.Reasons.Reset); got != maxReasonStatsCodes {
+		t.Fatalf("reset reason map size = %d, want %d", got, maxReasonStatsCodes)
+	}
+	if got := len(stats.Reasons.Abort); got != maxReasonStatsCodes {
+		t.Fatalf("abort reason map size = %d, want %d", got, maxReasonStatsCodes)
+	}
+	if got := stats.Reasons.ResetOverflow; got != 5 {
+		t.Fatalf("reset reason overflow = %d, want 5", got)
+	}
+	if got := stats.Reasons.AbortOverflow; got != 5 {
+		t.Fatalf("abort reason overflow = %d, want 5", got)
+	}
+	if got := stats.Reasons.Reset[10_000]; got != 2 {
+		t.Fatalf("reset reason count = %d, want 2", got)
+	}
+	if got := stats.Reasons.Abort[20_000]; got != 2 {
+		t.Fatalf("abort reason count = %d, want 2", got)
+	}
+}
+
 func TestStatsTrackBlockedWriteAndOpenLatency(t *testing.T) {
 	t.Parallel()
 
