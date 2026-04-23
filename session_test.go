@@ -11533,6 +11533,53 @@ func TestCompactTerminalReleasesOpenInfoBytes(t *testing.T) {
 	}
 }
 
+func TestCompactTerminalSkipsUnacceptedQueuedStreamWithOpenInfo(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	stream := testBuildStream(
+		c,
+		4,
+		testWithBidi(),
+		testWithLocalSend(),
+		testWithLocalReceive(),
+		testWithApplicationVisible(),
+		testWithOpenInfo([]byte("ssh")),
+		testWithNotifications(),
+	)
+	stream.setSendFin()
+	stream.setRecvFin()
+
+	c.mu.Lock()
+	c.retention.retainedOpenInfoBytes = uint64(len(stream.openInfo))
+	c.enqueueAcceptedLocked(stream)
+	c.maybeCompactTerminalLocked(stream)
+	gotLive := c.registry.streams[stream.id]
+	_, gotTombstone := c.registry.tombstones[stream.id]
+	gotInfo := clonePayloadBytes(stream.openInfo)
+	gotRetained := c.retention.retainedOpenInfoBytes
+	gotAcceptCount := c.acceptCountLocked(streamArityBidi)
+	gotAccepted := c.dequeueAcceptedLocked(streamArityBidi)
+	c.mu.Unlock()
+
+	if gotLive != stream {
+		t.Fatal("terminal compaction dropped an unaccepted queued stream from live registry")
+	}
+	if gotTombstone {
+		t.Fatal("terminal compaction created tombstone for an unaccepted queued stream")
+	}
+	if string(gotInfo) != "ssh" {
+		t.Fatalf("openInfo = %q, want preserved before accept", gotInfo)
+	}
+	if gotRetained != uint64(len("ssh")) {
+		t.Fatalf("retainedOpenInfoBytes = %d, want %d", gotRetained, len("ssh"))
+	}
+	if gotAcceptCount != 1 {
+		t.Fatalf("accept count = %d, want 1", gotAcceptCount)
+	}
+	if gotAccepted != stream {
+		t.Fatal("accept queue did not retain the unaccepted terminal stream")
+	}
+}
+
 func TestFailProvisionalReleasesOpenInfoBytes(t *testing.T) {
 	c := newSessionMemoryTestConn()
 

@@ -556,6 +556,9 @@ func (s *nativeStream) shouldCompactTerminalLocked(tracking terminalTrackingStat
 	if s == nil {
 		return false
 	}
+	if s.enqueued && len(s.openInfo) > 0 {
+		return false
+	}
 	if s.queuedDataBytes != 0 || s.inflightQueued != 0 {
 		return false
 	}
