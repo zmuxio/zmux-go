@@ -607,17 +607,9 @@ func (c *Conn) writeBatch(batch []writeRequest) error {
 		return nil
 	}
 
-	totalEncoded := 0
-	frameCount := 0
-	payloadBytes := 0
-	for i := range batch {
-		req := &batch[i]
-		classifyWriteRequest(req)
-		frameCount += len(req.frames)
-		for _, frame := range req.frames {
-			totalEncoded += int(txFrameEncodedBytes(frame))
-			payloadBytes += frame.payloadLength()
-		}
+	totalEncoded, payloadBytes, frameCount, err := prepareWriteBatchSize(batch)
+	if err != nil {
+		return err
 	}
 
 	start := time.Now()
@@ -654,6 +646,39 @@ func (c *Conn) writeBatch(batch []writeRequest) error {
 	c.mu.Unlock()
 	notify(c.signals.livenessCh)
 	return nil
+}
+
+func prepareWriteBatchSize(batch []writeRequest) (totalEncoded int, payloadBytes int, frameCount int, err error) {
+	maxInt := int(^uint(0) >> 1)
+	maxUintInt := uint64(maxInt)
+	encodedTotal := uint64(0)
+	payloadTotal := uint64(0)
+
+	for i := range batch {
+		req := &batch[i]
+		classifyWriteRequest(req)
+		if len(req.frames) > maxInt-frameCount {
+			return 0, 0, 0, frameSizeError("send batch", errPayloadTooLarge)
+		}
+		frameCount += len(req.frames)
+		if frameCount > maxInt/maxEncodedFrameOverhead {
+			return 0, 0, 0, frameSizeError("send batch", errPayloadTooLarge)
+		}
+		for _, frame := range req.frames {
+			encoded := txFrameEncodedBytes(frame)
+			if encoded > maxUintInt || encodedTotal > maxUintInt-encoded {
+				return 0, 0, 0, frameSizeError("send batch", errPayloadTooLarge)
+			}
+			encodedTotal += encoded
+
+			payloadLen := uint64(frame.payloadLength())
+			if payloadTotal > maxUintInt-payloadLen {
+				return 0, 0, 0, frameSizeError("send batch", errPayloadTooLarge)
+			}
+			payloadTotal += payloadLen
+		}
+	}
+	return int(encodedTotal), int(payloadTotal), frameCount, nil
 }
 
 const maxWriteBatchFrames = 32

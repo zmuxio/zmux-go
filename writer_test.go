@@ -1756,6 +1756,48 @@ func TestWriteBatchReturnsNoProgressOnZeroWrite(t *testing.T) {
 	}
 }
 
+func TestWriteBatchRejectsSingleFrameEncodedSizeOverflow(t *testing.T) {
+	t.Parallel()
+
+	conn := &countingWriteCloser{}
+	c := &Conn{io: connIOState{conn: conn}}
+	maxInt := int(^uint(0) >> 1)
+	frame := makeTxFrame(FrameTypeDATA, 0, 4)
+	frame.payloadLen = maxInt
+
+	err := c.writeBatch([]writeRequest{{
+		frames: []txFrame{frame},
+		done:   make(chan error, 1),
+	}})
+	if !IsErrorCode(err, CodeFrameSize) {
+		t.Fatalf("writeBatch err = %v, want %s", err, CodeFrameSize)
+	}
+	if got := conn.writeCount(); got != 0 {
+		t.Fatalf("underlying write count = %d, want 0", got)
+	}
+}
+
+func TestWriteBatchRejectsAggregateEncodedSizeOverflow(t *testing.T) {
+	t.Parallel()
+
+	conn := &countingWriteCloser{}
+	c := &Conn{io: connIOState{conn: conn}}
+	maxInt := int(^uint(0) >> 1)
+	frame := makeTxFrame(FrameTypeDATA, 0, 4)
+	frame.payloadLen = maxInt / 2
+
+	err := c.writeBatch([]writeRequest{{
+		frames: []txFrame{frame, frame},
+		done:   make(chan error, 1),
+	}})
+	if !IsErrorCode(err, CodeFrameSize) {
+		t.Fatalf("writeBatch err = %v, want %s", err, CodeFrameSize)
+	}
+	if got := conn.writeCount(); got != 0 {
+		t.Fatalf("underlying write count = %d, want 0", got)
+	}
+}
+
 func TestWriteBatchReturnsSmallEncodingBufferToSharedPool(t *testing.T) {
 	t.Parallel()
 
