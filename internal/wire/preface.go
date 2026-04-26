@@ -1,7 +1,6 @@
 package wire
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 )
@@ -19,9 +18,7 @@ type Preface struct {
 func ReadPreface(r io.Reader) (Preface, error) {
 	br, ok := r.(io.ByteReader)
 	if !ok {
-		buf := bufio.NewReader(r)
-		br = buf
-		r = buf
+		br = &exactByteReader{reader: r}
 	}
 
 	role, fixed, err := readPrefaceFixedHeader(r)

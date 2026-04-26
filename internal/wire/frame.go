@@ -1,7 +1,6 @@
 package wire
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -133,9 +132,7 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 
 	br, ok := r.(io.ByteReader)
 	if !ok {
-		buf := bufio.NewReader(r)
-		br = buf
-		r = buf
+		br = &exactByteReader{reader: r}
 	}
 
 	frameLen, n, err := ReadVarint(br)
@@ -222,6 +219,21 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 		return Frame{}, dst, handle, err
 	}
 	return frame, dst, handle, nil
+}
+
+type exactByteReader struct {
+	reader io.Reader
+	buf    [1]byte
+}
+
+func (r *exactByteReader) ReadByte() (byte, error) {
+	if r == nil || r.reader == nil {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if _, err := io.ReadFull(r.reader, r.buf[:]); err != nil {
+		return 0, err
+	}
+	return r.buf[0], nil
 }
 
 func maxInboundFrameLen(limits Limits) uint64 {

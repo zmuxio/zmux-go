@@ -3,8 +3,22 @@ package wire
 import (
 	"bytes"
 	"errors"
+	"io"
 	"testing"
 )
+
+type greedyReader struct {
+	data []byte
+}
+
+func (r *greedyReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
 
 func TestReadFrameBufferedRejectsOversizedPayloadBeforeReadingBody(t *testing.T) {
 	t.Parallel()
@@ -31,5 +45,76 @@ func TestReadFrameBufferedRejectsOversizedPayloadBeforeReadingBody(t *testing.T)
 	}
 	if handle != nil {
 		t.Fatalf("ReadFrameBuffered handle = %v, want nil", handle)
+	}
+}
+
+func TestReadFrameBufferedNonByteReaderDoesNotOverreadNextFrame(t *testing.T) {
+	t.Parallel()
+
+	first, err := (Frame{Type: FrameTypeDATA, StreamID: 4, Payload: []byte("one")}).AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("AppendBinary(first) err = %v", err)
+	}
+	second, err := (Frame{Type: FrameTypeDATA, StreamID: 8, Payload: []byte("two")}).AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("AppendBinary(second) err = %v", err)
+	}
+	reader := &greedyReader{data: append(append([]byte(nil), first...), second...)}
+
+	frame, buf, handle, err := ReadFrameBuffered(reader, Limits{}, nil)
+	if err != nil {
+		t.Fatalf("ReadFrameBuffered(first) err = %v", err)
+	}
+	if frame.Type != FrameTypeDATA || frame.StreamID != 4 || !bytes.Equal(frame.Payload, []byte("one")) {
+		t.Fatalf("first frame = (%s, %d, %q), want (DATA, 4, %q)", frame.Type, frame.StreamID, frame.Payload, "one")
+	}
+	ReleaseReadFrameBuffer(buf, handle)
+
+	frame, buf, handle, err = ReadFrameBuffered(reader, Limits{}, nil)
+	if err != nil {
+		t.Fatalf("ReadFrameBuffered(second) err = %v", err)
+	}
+	defer ReleaseReadFrameBuffer(buf, handle)
+	if frame.Type != FrameTypeDATA || frame.StreamID != 8 || !bytes.Equal(frame.Payload, []byte("two")) {
+		t.Fatalf("second frame = (%s, %d, %q), want (DATA, 8, %q)", frame.Type, frame.StreamID, frame.Payload, "two")
+	}
+}
+
+func TestReadPrefaceNonByteReaderDoesNotOverreadFollowingFrame(t *testing.T) {
+	t.Parallel()
+
+	want := Preface{
+		PrefaceVersion:  PrefaceVersion,
+		Role:            RoleInitiator,
+		TieBreakerNonce: 1,
+		MinProto:        ProtoVersion,
+		MaxProto:        ProtoVersion,
+		Settings:        DefaultSettings(),
+	}
+	prefaceBytes, err := want.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary err = %v", err)
+	}
+	frameBytes, err := (Frame{Type: FrameTypeDATA, StreamID: 4, Payload: []byte("after-preface")}).AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("AppendBinary(frame) err = %v", err)
+	}
+	reader := &greedyReader{data: append(append([]byte(nil), prefaceBytes...), frameBytes...)}
+
+	got, err := ReadPreface(reader)
+	if err != nil {
+		t.Fatalf("ReadPreface err = %v", err)
+	}
+	if got.Role != want.Role || got.MinProto != want.MinProto || got.MaxProto != want.MaxProto {
+		t.Fatalf("ReadPreface = %#v, want role/proto from %#v", got, want)
+	}
+
+	frame, buf, handle, err := ReadFrameBuffered(reader, Limits{}, nil)
+	if err != nil {
+		t.Fatalf("ReadFrameBuffered(after preface) err = %v", err)
+	}
+	defer ReleaseReadFrameBuffer(buf, handle)
+	if frame.Type != FrameTypeDATA || frame.StreamID != 4 || !bytes.Equal(frame.Payload, []byte("after-preface")) {
+		t.Fatalf("frame after preface = (%s, %d, %q), want (DATA, 4, %q)", frame.Type, frame.StreamID, frame.Payload, "after-preface")
 	}
 }
