@@ -491,7 +491,7 @@ func (s *nativeStream) prepareOwnedDataWriteRequest(req *writeRequest, maxPayloa
 
 		bytes := txFrameBufferedBytes(frame)
 		bufferedBytes = saturatingAdd(bufferedBytes, bytes)
-		requestCost += int64(bytes)
+		requestCost = addRequestCost(requestCost, bytes)
 		preparedSendBytes = saturatingAdd(preparedSendBytes, uint64(frame.payloadLength()))
 		if hasFIN {
 			terminalDataPriority = false

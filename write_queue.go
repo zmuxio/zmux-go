@@ -348,7 +348,7 @@ func (f *txFrame) setPrefixedPartsPayload(prefix []byte, parts [][]byte, idx, of
 // type byte plus payload bytes so queue pressure remains stable across later
 // encoding strategy changes.
 func txFrameQueueCost(frame txFrame) uint64 {
-	return uint64(1 + frame.payloadLength())
+	return saturatingAdd(1, uint64(frame.payloadLength()))
 }
 
 func txFrameBufferedBytes(frame txFrame) uint64 {
@@ -365,6 +365,29 @@ func txFramesQueueCost(frames []txFrame) uint64 {
 
 func txFramesBufferedBytes(frames []txFrame) uint64 {
 	return txFramesQueueCost(frames)
+}
+
+const maxRequestCost = int64(^uint64(0) >> 1)
+
+func requestCostFromBytes(bytes uint64) int64 {
+	if bytes > uint64(maxRequestCost) {
+		return maxRequestCost
+	}
+	return int64(bytes)
+}
+
+func addRequestCost(cost int64, bytes uint64) int64 {
+	if cost >= maxRequestCost {
+		return maxRequestCost
+	}
+	if cost < 0 {
+		cost = 0
+	}
+	delta := requestCostFromBytes(bytes)
+	if delta >= maxRequestCost || cost > maxRequestCost-delta {
+		return maxRequestCost
+	}
+	return cost + delta
 }
 
 func txFrameEncodedBytes(frame txFrame) uint64 {
@@ -828,7 +851,7 @@ func classifyWriteRequest(req *writeRequest) {
 		}
 		bytes := txFrameBufferedBytes(frame)
 		req.requestBufferedBytes = saturatingAdd(req.requestBufferedBytes, bytes)
-		req.requestCost += int64(bytes)
+		req.requestCost = addRequestCost(req.requestCost, bytes)
 
 		if !batchFrameIsStreamScoped(frame) {
 			continue
@@ -866,7 +889,7 @@ func classifySingleFrameWriteRequest(req *writeRequest, frame txFrame) {
 	req.requestAllUrgent = rt.IsUrgentType(frame.Type)
 	req.requestUrgencyRank = rt.UrgencyRank(frame.Type)
 	req.requestBufferedBytes = txFrameBufferedBytes(frame)
-	req.requestCost = int64(req.requestBufferedBytes)
+	req.requestCost = requestCostFromBytes(req.requestBufferedBytes)
 	initTerminalClassification(req)
 	req.requestIsPriorityUpdate = frameIsPriorityUpdate(frame)
 

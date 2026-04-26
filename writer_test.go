@@ -2728,6 +2728,23 @@ func TestWriteAllReturnsNoProgressOnZeroWrite(t *testing.T) {
 	}
 }
 
+func TestRequestCostSaturatesAtMaxInt64(t *testing.T) {
+	t.Parallel()
+
+	if got := requestCostFromBytes(42); got != 42 {
+		t.Fatalf("requestCostFromBytes(42) = %d, want 42", got)
+	}
+	if got := requestCostFromBytes(uint64(maxRequestCost) + 1); got != maxRequestCost {
+		t.Fatalf("requestCostFromBytes(overflow) = %d, want %d", got, maxRequestCost)
+	}
+	if got := addRequestCost(maxRequestCost-1, 2); got != maxRequestCost {
+		t.Fatalf("addRequestCost overflow = %d, want %d", got, maxRequestCost)
+	}
+	if got := addRequestCost(-9, 3); got != 3 {
+		t.Fatalf("addRequestCost negative = %d, want 3", got)
+	}
+}
+
 func TestClassifyWriteRequestSingleFrameDataFIN(t *testing.T) {
 	t.Parallel()
 
@@ -2756,6 +2773,31 @@ func TestClassifyWriteRequestSingleFrameDataFIN(t *testing.T) {
 	}
 	if req.requestCost != int64(rt.FrameBufferedBytes(frame)) {
 		t.Fatalf("requestCost = %d, want %d", req.requestCost, int64(rt.FrameBufferedBytes(frame)))
+	}
+}
+
+func TestClassifyWriteRequestSaturatesHugeSingleFrameCost(t *testing.T) {
+	t.Parallel()
+
+	maxPayloadLen := int(^uint(0) >> 1)
+	frameBytes := uint64(maxPayloadLen) + 1
+	if frameBytes <= uint64(maxRequestCost) {
+		t.Skip("requires an int width large enough to synthesize a frame cost above MaxInt64")
+	}
+
+	req := &writeRequest{frames: []txFrame{{
+		Type:       FrameTypeDATA,
+		StreamID:   4,
+		payloadLen: maxPayloadLen,
+	}}}
+
+	classifyWriteRequest(req)
+
+	if got := req.requestBufferedBytes; got != frameBytes {
+		t.Fatalf("requestBufferedBytes = %d, want %d", got, frameBytes)
+	}
+	if got := req.requestCost; got != maxRequestCost {
+		t.Fatalf("requestCost = %d, want %d", got, maxRequestCost)
 	}
 }
 
@@ -4210,6 +4252,37 @@ func TestPrepareOwnedWriteRequestSingleFrameDataFIN(t *testing.T) {
 	}
 	if !req.preparedSendFin {
 		t.Fatal("preparedSendFin = false, want true")
+	}
+}
+
+func TestPrepareOwnedWriteRequestSaturatesHugeDataCost(t *testing.T) {
+	t.Parallel()
+
+	maxPayloadLen := int(^uint(0) >> 1)
+	frameBytes := uint64(maxPayloadLen) + 1
+	if frameBytes <= uint64(maxRequestCost) {
+		t.Skip("requires an int width large enough to synthesize a frame cost above MaxInt64")
+	}
+
+	stream := &nativeStream{id: 4}
+	req := &writeRequest{frames: []txFrame{{
+		Type:       FrameTypeDATA,
+		StreamID:   stream.id,
+		payloadLen: maxPayloadLen,
+	}}}
+
+	prepared := stream.prepareOwnedDataWriteRequest(req, uint64(maxPayloadLen))
+	if !prepared.handled || prepared.err != nil {
+		t.Fatalf("prepareOwnedDataWriteRequest() = (%v,%v), want handled without error", prepared.handled, prepared.err)
+	}
+	if got := req.requestBufferedBytes; got != frameBytes {
+		t.Fatalf("requestBufferedBytes = %d, want %d", got, frameBytes)
+	}
+	if got := req.requestCost; got != maxRequestCost {
+		t.Fatalf("requestCost = %d, want %d", got, maxRequestCost)
+	}
+	if got := req.preparedSendBytes; got != uint64(maxPayloadLen) {
+		t.Fatalf("preparedSendBytes = %d, want %d", got, uint64(maxPayloadLen))
 	}
 }
 

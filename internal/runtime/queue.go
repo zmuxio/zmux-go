@@ -13,7 +13,7 @@ type ChunkSpan struct {
 }
 
 func FrameBufferedBytes(frame wire.Frame) uint64 {
-	return uint64(1 + len(frame.Payload))
+	return SaturatingAdd(1, uint64(len(frame.Payload)))
 }
 
 func FramesBufferedBytes(frames []wire.Frame) uint64 {
