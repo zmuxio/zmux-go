@@ -2719,6 +2719,99 @@ func TestReadLoopReleasesSupersededScratchHandle(t *testing.T) {
 	}
 }
 
+func TestReadLoopDoesNotAttachScratchHandleToUnpooledReplacement(t *testing.T) {
+	oldReadFrameBuffered := readLoopReadFrameBuffered
+	oldHandleFrameBuffered := readLoopHandleFrameBuffered
+	oldRetain := readLoopRetainReadFrameBufferForPayload
+	oldRelease := readLoopReleaseReadFrameBuffer
+	oldClose := readLoopCloseSessionWithOptionsForReadErr
+	defer func() {
+		readLoopHooksMu.Lock()
+		readLoopReadFrameBuffered = oldReadFrameBuffered
+		readLoopHandleFrameBuffered = oldHandleFrameBuffered
+		readLoopRetainReadFrameBufferForPayload = oldRetain
+		readLoopReleaseReadFrameBuffer = oldRelease
+		readLoopCloseSessionWithOptionsForReadErr = oldClose
+		readLoopHooksMu.Unlock()
+	}()
+
+	oldBuf := []byte("old-buffer")
+	largeBuf := make([]byte, 128)
+	oldHandle := &wire.FrameReadBufferHandle{}
+	errBoom := errors.New("boom")
+
+	var released []*wire.FrameReadBufferHandle
+	var closeErr error
+	call := 0
+	readLoopHooksMu.Lock()
+	readLoopReadFrameBuffered = func(_ io.Reader, _ Limits, dst []byte) (Frame, []byte, *wire.FrameReadBufferHandle, error) {
+		call++
+		switch call {
+		case 1:
+			if dst != nil {
+				t.Fatalf("first read received scratch %v, want nil", dst)
+			}
+			return Frame{}, oldBuf, oldHandle, nil
+		case 2:
+			if cap(dst) != cap(oldBuf) {
+				t.Fatalf("second read scratch cap = %d, want %d", cap(dst), cap(oldBuf))
+			}
+			return Frame{}, largeBuf, nil, nil
+		case 3:
+			if dst != nil {
+				t.Fatalf("third read received retained scratch %v, want nil", dst)
+			}
+			return Frame{}, nil, nil, errBoom
+		default:
+			t.Fatalf("unexpected readLoopReadFrameBuffered call %d", call)
+			return Frame{}, nil, nil, errBoom
+		}
+	}
+	readLoopHandleFrameBuffered = func(_ *Conn, _ Frame, _ []byte, handle *wire.FrameReadBufferHandle) (bool, error) {
+		switch call {
+		case 1:
+			if handle != oldHandle {
+				t.Fatalf("first frame handle = %p, want %p", handle, oldHandle)
+			}
+			return false, nil
+		case 2:
+			if handle != nil {
+				t.Fatalf("unpooled replacement handle = %p, want nil", handle)
+			}
+			return true, nil
+		default:
+			t.Fatalf("unexpected handleFrameBuffered call %d", call)
+			return false, nil
+		}
+	}
+	readLoopRetainReadFrameBufferForPayload = func(buf []byte, _ uint64) []byte {
+		if len(buf) == 0 {
+			return nil
+		}
+		if &buf[0] == &oldBuf[0] {
+			return buf[:0]
+		}
+		return nil
+	}
+	readLoopReleaseReadFrameBuffer = func(_ []byte, handle *wire.FrameReadBufferHandle) {
+		released = append(released, handle)
+	}
+	readLoopCloseSessionWithOptionsForReadErr = func(_ *Conn, err error) {
+		closeErr = err
+	}
+	readLoopHooksMu.Unlock()
+
+	c := &Conn{}
+	c.readLoop()
+
+	if !errors.Is(closeErr, errBoom) {
+		t.Fatalf("readLoop close err = %v, want %v", closeErr, errBoom)
+	}
+	if len(released) != 1 || released[0] != oldHandle {
+		t.Fatalf("released handles = %v, want [%p]", released, oldHandle)
+	}
+}
+
 func TestReadLoopReleasesScratchHandleOnHandleError(t *testing.T) {
 	oldReadFrameBuffered := readLoopReadFrameBuffered
 	oldHandleFrameBuffered := readLoopHandleFrameBuffered

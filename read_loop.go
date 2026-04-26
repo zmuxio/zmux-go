@@ -128,9 +128,10 @@ func (c *Conn) readLoop() {
 		// Reuse one bounded frame buffer per active connection to avoid
 		// per-frame pool churn without pinning oversized backings indefinitely.
 		frame, buf, handle, err := readFrameBufferedFn(c.io.reader, limits, scratch)
-		if handle == nil {
+		if handle == nil && scratchHandle != nil && readLoopBufferUsesScratch(buf, scratch) {
 			handle = scratchHandle
-		} else if scratchHandle != nil && handle != scratchHandle {
+		}
+		if scratchHandle != nil && handle != scratchHandle {
 			releaseReadFrameBufferFn(scratch, scratchHandle)
 		}
 		scratch = nil
@@ -160,6 +161,13 @@ func (c *Conn) readLoop() {
 			return
 		}
 	}
+}
+
+func readLoopBufferUsesScratch(buf, scratch []byte) bool {
+	if cap(buf) == 0 || cap(scratch) == 0 {
+		return false
+	}
+	return &buf[:1][0] == &scratch[:1][0]
 }
 
 func (c *Conn) startReadLoopProtocolLoopLocked() {
