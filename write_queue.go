@@ -170,7 +170,12 @@ func completeWriteRequest(req *writeRequest, err error) {
 	if req == nil || req.done == nil {
 		return
 	}
-	req.done <- err
+	// Completion runs on the single writer path; stale or duplicate completion
+	// signals must not be able to park it indefinitely.
+	select {
+	case req.done <- err:
+	default:
+	}
 }
 
 func encodeStreamIDCached(streamID uint64) (uint64, uint8) {

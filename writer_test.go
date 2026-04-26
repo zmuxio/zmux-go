@@ -66,6 +66,26 @@ func TestDrainDetachedWriteLaneStopsOnClosedChannel(t *testing.T) {
 	}
 }
 
+func TestCompleteWriteRequestDoesNotBlockOnFullDone(t *testing.T) {
+	t.Parallel()
+
+	done := make(chan error, 1)
+	done <- errors.New("already completed")
+	req := writeRequest{done: done}
+	returned := make(chan struct{})
+
+	go func() {
+		completeWriteRequest(&req, errors.New("late completion"))
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("completeWriteRequest blocked on a full done channel")
+	}
+}
+
 func BenchmarkCollectWriteBatchLaneBuffering(b *testing.B) {
 	payload := bytes.Repeat([]byte("x"), 32)
 	proto := writeRequest{
