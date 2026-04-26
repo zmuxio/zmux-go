@@ -287,8 +287,7 @@ func AppendDebugTextTLV(payload []byte, reason string) []byte {
 	if reason == "" {
 		return payload
 	}
-	value := []byte(reason)
-	out, err := AppendTLV(payload, uint64(DIAGDebugText), value)
+	out, err := appendStringTLV(payload, uint64(DIAGDebugText), reason)
 	if err != nil {
 		return payload
 	}
@@ -306,19 +305,43 @@ func AppendDebugTextTLVCapped(payload []byte, reason string, maxPayload uint64) 
 		return payload
 	}
 
-	reasonBytes := []byte(reason)
-	n := cappedDebugTextValueLen(len(reasonBytes), maxPayload-uint64(len(payload)))
-	for n > 0 && !utf8.Valid(reasonBytes[:n]) {
-		n--
-	}
+	n := cappedDebugTextValueLen(len(reason), maxPayload-uint64(len(payload)))
+	n = utf8PrefixLen(reason, n)
 	if n == 0 {
 		return payload
 	}
-	out, err := AppendTLV(payload, uint64(DIAGDebugText), reasonBytes[:n])
+	out, err := appendStringTLV(payload, uint64(DIAGDebugText), reason[:n])
 	if err != nil || uint64(len(out)) > maxPayload {
 		return payload
 	}
 	return out
+}
+
+func appendStringTLV(dst []byte, typ uint64, value string) ([]byte, error) {
+	var err error
+	dst, err = AppendVarint(dst, typ)
+	if err != nil {
+		return nil, err
+	}
+	dst, err = AppendVarint(dst, uint64(len(value)))
+	if err != nil {
+		return nil, err
+	}
+	dst = append(dst, value...)
+	return dst, nil
+}
+
+func utf8PrefixLen(s string, n int) int {
+	if n >= len(s) {
+		return len(s)
+	}
+	if n <= 0 {
+		return 0
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return n
 }
 
 func cappedDebugTextValueLen(reasonLen int, remaining uint64) int {
