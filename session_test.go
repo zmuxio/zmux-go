@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	rt "github.com/zmuxio/zmux-go/internal/runtime"
 	"github.com/zmuxio/zmux-go/internal/state"
@@ -11741,6 +11742,22 @@ func TestRetainPeerReasonBudgetTrimsToRemainingBytes(t *testing.T) {
 	}
 	if c.retention.retainedPeerReasonBytes != budget {
 		t.Fatalf("retainedPeerReasonBytes = %d, want %d", c.retention.retainedPeerReasonBytes, budget)
+	}
+}
+
+func TestRetainPeerReasonBudgetTrimClonesOversizedSource(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.retention.retainedReasonBudget = 2
+	source := "ab" + strings.Repeat("x", 1<<20)
+	got, n := c.retainPeerReasonLocked(0, source)
+	if got != "ab" || n != 2 {
+		t.Fatalf("retainPeerReasonLocked() = (%q, %d), want (%q, %d)", got, n, "ab", 2)
+	}
+	if unsafe.StringData(got) == unsafe.StringData(source) {
+		t.Fatal("trimmed retained peer reason aliases oversized source backing")
 	}
 }
 

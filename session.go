@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2321,9 +2322,10 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 	c.bootstrapRuntimeQueuesLocked()
 	c.applyConfigRuntimePolicy(cfg)
 	c.resetKeepaliveSchedulesLocked(now)
+	keepaliveEnabled := c.liveness.keepaliveInterval > 0
 	go c.writeLoop()
 	go c.readLoop()
-	if c.liveness.keepaliveInterval > 0 {
+	if keepaliveEnabled {
 		go c.keepaliveLoop()
 	}
 	return c, nil
@@ -3200,7 +3202,7 @@ func truncateStringToBytes(s string, limit uint64) string {
 	if cut == 0 {
 		return ""
 	}
-	return s[:cut]
+	return strings.Clone(s[:cut])
 }
 
 func (c *Conn) retainPeerReasonLocked(oldBytes uint64, reason string) (string, uint64) {
