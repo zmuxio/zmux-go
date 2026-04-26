@@ -727,7 +727,9 @@ func (b *quicStreamBase) closeWrite(closer interface{ Close() error }) error {
 	if b.localWriteClosed.Load() {
 		return zmux.ErrWriteClosed
 	}
-	b.localWriteClosed.Store(true)
+	if !b.markLocalWriteClosed(nil) {
+		return zmux.ErrWriteClosed
+	}
 	if err := translateError(closer.Close()); err != nil {
 		return err
 	}
@@ -802,6 +804,22 @@ func (b *quicStreamBase) storeLocalWriteErr(err error) {
 	b.termMu.Lock()
 	b.localWriteErr = err
 	b.termMu.Unlock()
+}
+
+func (b *quicStreamBase) markLocalWriteClosed(err error) bool {
+	if b == nil {
+		return false
+	}
+	b.termMu.Lock()
+	defer b.termMu.Unlock()
+	if b.localWriteClosed.Load() {
+		return false
+	}
+	if err != nil {
+		b.localWriteErr = err
+	}
+	b.localWriteClosed.Store(true)
+	return true
 }
 
 func (b *quicStreamBase) preferLocalWriteError(err error) error {
@@ -956,15 +974,13 @@ func (s *quicStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
-	if s.localWriteClosed.Load() {
+	appErr := &zmux.ApplicationError{Code: code}
+	if !s.markLocalWriteClosed(appErr) {
 		if err := s.loadLocalWriteErr(); err != nil {
 			return err
 		}
 		return zmux.ErrWriteClosed
 	}
-	appErr := &zmux.ApplicationError{Code: code}
-	s.storeLocalWriteErr(appErr)
-	s.localWriteClosed.Store(true)
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
 }
@@ -975,11 +991,12 @@ func (s *quicStream) CloseWithError(code uint64, reason string) error {
 	}
 	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
 	s.storeLocalReadErr(appErr)
-	s.storeLocalWriteErr(appErr)
 	s.localReadClosed.Store(true)
-	s.localWriteClosed.Store(true)
+	cancelWrite := s.markLocalWriteClosed(appErr)
 	s.stream.CancelRead(quic.StreamErrorCode(code))
-	s.stream.CancelWrite(quic.StreamErrorCode(code))
+	if cancelWrite {
+		s.stream.CancelWrite(quic.StreamErrorCode(code))
+	}
 	return nil
 }
 
@@ -1041,15 +1058,13 @@ func (s *quicSendStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
-	if s.localWriteClosed.Load() {
+	appErr := &zmux.ApplicationError{Code: code}
+	if !s.markLocalWriteClosed(appErr) {
 		if err := s.loadLocalWriteErr(); err != nil {
 			return err
 		}
 		return zmux.ErrWriteClosed
 	}
-	appErr := &zmux.ApplicationError{Code: code}
-	s.storeLocalWriteErr(appErr)
-	s.localWriteClosed.Store(true)
 	s.stream.CancelWrite(quic.StreamErrorCode(code))
 	return nil
 }
@@ -1059,9 +1074,9 @@ func (s *quicSendStream) CloseWithError(code uint64, reason string) error {
 		return zmux.ErrSessionClosed
 	}
 	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
-	s.storeLocalWriteErr(appErr)
-	s.localWriteClosed.Store(true)
-	s.stream.CancelWrite(quic.StreamErrorCode(code))
+	if s.markLocalWriteClosed(appErr) {
+		s.stream.CancelWrite(quic.StreamErrorCode(code))
+	}
 	return nil
 }
 

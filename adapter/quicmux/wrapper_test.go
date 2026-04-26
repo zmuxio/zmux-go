@@ -858,6 +858,43 @@ func TestWritePayloadAndCloseWriteSerializeUnderlyingClose(t *testing.T) {
 	}
 }
 
+func TestCloseWriteTerminalStateWinsWhileUnderlyingCloseBlocks(t *testing.T) {
+	base := &quicStreamBase{}
+	writer := newBlockingCloseWriteCloser()
+	defer writer.release()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- base.closeWrite(writer)
+	}()
+
+	select {
+	case <-writer.closeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("underlying Close did not start")
+	}
+
+	if !base.localWriteClosed.Load() {
+		t.Fatal("localWriteClosed = false while underlying Close is blocked")
+	}
+	if base.markLocalWriteClosed(&zmux.ApplicationError{Code: 99}) {
+		t.Fatal("second write terminal action won after graceful CloseWrite started")
+	}
+	if err := base.loadLocalWriteErr(); err != nil {
+		t.Fatalf("localWriteErr = %v, want nil graceful close cause", err)
+	}
+
+	writer.release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("closeWrite err = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("closeWrite did not return after releasing underlying Close")
+	}
+}
+
 func TestInstallContextWriteDeadlineDoesNotLeaveStaleExpiredDeadline(t *testing.T) {
 	setter := newBlockedWriteDeadlineSetter()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1234,6 +1271,34 @@ func (w *concurrentDetectWriteCloser) concurrent() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.overlap
+}
+
+type blockingCloseWriteCloser struct {
+	closeStarted chan struct{}
+	releaseClose chan struct{}
+	startOnce    sync.Once
+	releaseOnce  sync.Once
+}
+
+func newBlockingCloseWriteCloser() *blockingCloseWriteCloser {
+	return &blockingCloseWriteCloser{
+		closeStarted: make(chan struct{}),
+		releaseClose: make(chan struct{}),
+	}
+}
+
+func (w *blockingCloseWriteCloser) Close() error {
+	w.startOnce.Do(func() {
+		close(w.closeStarted)
+	})
+	<-w.releaseClose
+	return nil
+}
+
+func (w *blockingCloseWriteCloser) release() {
+	w.releaseOnce.Do(func() {
+		close(w.releaseClose)
+	})
 }
 
 type deadlineAwareWriter struct {
