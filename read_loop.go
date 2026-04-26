@@ -807,20 +807,27 @@ func (c *Conn) handleTerminalDataPayload(frame Frame, appData []byte, dispositio
 	if !c.lockPeerNonCloseFrameHandling() {
 		return nil
 	}
-	c.mu.Unlock()
 
 	if frame.Flags&FrameFlagOpenMetadata != 0 {
+		c.mu.Unlock()
 		return wireError(CodeProtocol, "handle DATA", fmt.Errorf("OPEN_METADATA on previously used stream %d", frame.StreamID))
 	}
 	switch disposition.action {
 	case lateDataAbortClosed:
+		if err := c.discardPeerDataLocked(nil, uint64(len(appData)), disposition.cause); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		c.mu.Unlock()
 		return c.abortWithCodeAsync(frame.StreamID, CodeStreamClosed)
 	case lateDataAbortState:
+		if err := c.discardPeerDataLocked(nil, uint64(len(appData)), disposition.cause); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		c.mu.Unlock()
 		return c.abortStreamStateAsync(frame.StreamID)
 	default:
-		if !c.lockPeerNonCloseFrameHandling() {
-			return nil
-		}
 		defer c.mu.Unlock()
 		appLen := uint64(len(appData))
 		return c.discardPeerDataLocked(nil, appLen, disposition.cause)
