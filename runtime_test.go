@@ -2945,6 +2945,28 @@ func TestStreamReadReleasesBufferWhenDrained(t *testing.T) {
 	}
 }
 
+func TestBufferPeerDataTracksReadBufCapacityOverhead(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{}
+	stream := testBuildDetachedStream(c, 0)
+	stream.readBuf = make([]byte, 0, 1024)
+
+	c.bufferPeerDataLocked(stream, []byte("x"))
+
+	if stream.readHead == nil {
+		t.Fatal("buffered read data was not promoted to tracked read chunk")
+	}
+	if got, want := c.ingress.readBufferOverhead, uint64(1023); got != want {
+		t.Fatalf("readBufferOverhead = %d, want %d", got, want)
+	}
+
+	c.clearReadChunksLocked(stream)
+	if got := c.ingress.readBufferOverhead; got != 0 {
+		t.Fatalf("readBufferOverhead after release = %d, want 0", got)
+	}
+}
+
 func TestStreamReadTightensOversizedTailBuffer(t *testing.T) {
 	t.Parallel()
 

@@ -568,6 +568,9 @@ func (c *Conn) bufferPeerDataLocked(stream *nativeStream, appData []byte) {
 			return
 		}
 		stream.readBuf = append(stream.readBuf, appData...)
+		if readChunkOverheadBytes(readChunkRetainedBytes(stream.readBuf, nil), len(stream.readBuf)) > 0 {
+			stream.ensureReadQueueHeadLocked(c)
+		}
 	}
 }
 
