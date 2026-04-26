@@ -1125,17 +1125,17 @@ func (c *Conn) waitCloseOperationErr() error {
 		c.mu.Unlock()
 	}
 	err := closeOperationErr(c, waitSessionErr(c, state.VisibleSessionError(current, sessionErr, ErrSessionClosed)))
-	if err == nil || errors.Is(err, ErrSessionClosed) {
+	if err == nil || isError(err, ErrSessionClosed) {
 		return nil
 	}
 	return err
 }
 
 func waitSessionErr(c *Conn, err error) error {
-	if err == nil || errors.Is(err, ErrSessionClosed) {
+	if err == nil || isError(err, ErrSessionClosed) {
 		return err
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+	if isError(err, io.EOF) || isError(err, io.ErrClosedPipe) {
 		return err
 	}
 	if appErr := closeSessionStreamErr(waitSessionState(c), err); appErr != nil {
@@ -1320,13 +1320,12 @@ func (c *Conn) finishCloseFrameEnqueueLocked(sent bool) {
 
 func closeTransportDrainDelay(err error) time.Duration {
 	switch {
-	case errors.Is(err, ErrKeepaliveTimeout):
+	case isError(err, ErrKeepaliveTimeout):
 		return 100 * time.Millisecond
-	case err == nil || errors.Is(err, ErrSessionClosed):
+	case err == nil || isError(err, ErrSessionClosed):
 		return 0
 	}
-	var appErr *ApplicationError
-	if errors.As(err, &appErr) && appErr.Code == uint64(CodeNoError) {
+	if appErr, ok := findError[*ApplicationError](err); ok && appErr.Code == uint64(CodeNoError) {
 		return 0
 	}
 	// Give the peer a brief chance to observe the emitted CLOSE before a
@@ -1338,11 +1337,10 @@ func closeMappedApplicationError(err error) *ApplicationError {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, ErrKeepaliveTimeout) {
+	if isError(err, ErrKeepaliveTimeout) {
 		return applicationErr(uint64(CodeIdleTimeout), ErrKeepaliveTimeout.Error())
 	}
-	var appErr *ApplicationError
-	if errors.As(err, &appErr) {
+	if appErr, ok := findError[*ApplicationError](err); ok {
 		return cloneApplicationError(appErr)
 	}
 	if code, ok := ErrorCodeOf(err); ok {
@@ -4640,8 +4638,7 @@ func (c *Conn) commitLocalOpenLocked(stream *nativeStream) (localOpenCommitState
 	id := stream.streamArity().nextLocalID(&c.registry)
 	if err := c.checkLocalOpenAllowedLocked(id, stream.streamArity()); err != nil {
 		source := terminalAbortLocal
-		var appErr *ApplicationError
-		if errors.As(err, &appErr) && appErr.Code == uint64(CodeRefusedStream) {
+		if appErr, ok := findError[*ApplicationError](err); ok && appErr.Code == uint64(CodeRefusedStream) {
 			source = terminalAbortFromPeer
 		}
 		c.failProvisionalWithSourceLocked(stream, err, source)
@@ -4695,8 +4692,7 @@ func (c *Conn) failProvisionalWithSourceLocked(stream *nativeStream, err error, 
 	appErr := cancelledAppErr("")
 	var surfaceErr error
 	if err != nil {
-		var existing *ApplicationError
-		if errors.As(err, &existing) {
+		if existing, ok := findError[*ApplicationError](err); ok {
 			appErr = existing
 			if _, bare := err.(*ApplicationError); !bare {
 				surfaceErr = err

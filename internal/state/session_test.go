@@ -15,6 +15,18 @@ type codedError struct {
 func (e codedError) Error() string           { return "coded" }
 func (e codedError) ApplicationCode() uint64 { return e.code }
 
+type cyclicError struct {
+	next error
+}
+
+func (e *cyclicError) Error() string {
+	return "cyclic"
+}
+
+func (e *cyclicError) Unwrap() error {
+	return e.next
+}
+
 func TestCloseSessionState(t *testing.T) {
 	t.Parallel()
 
@@ -39,6 +51,24 @@ func TestCloseSessionState(t *testing.T) {
 	}
 	if got := CloseSessionState(SessionStateReady, codedError{code: uint64(wire.CodeInternal)}, closedSentinel); got != SessionStateFailed {
 		t.Fatalf("CloseSessionState(internal app err) = %v, want %v", got, SessionStateFailed)
+	}
+}
+
+func TestSessionErrorHelpersHandleCyclicUnwrap(t *testing.T) {
+	t.Parallel()
+
+	closedSentinel := errors.New("closed")
+	cyclic := &cyclicError{}
+	cyclic.next = cyclic
+
+	if got := CloseSessionState(SessionStateReady, cyclic, closedSentinel); got != SessionStateFailed {
+		t.Fatalf("CloseSessionState(cyclic) = %v, want %v", got, SessionStateFailed)
+	}
+	if got := VisibleSessionError(SessionStateReady, cyclic, closedSentinel); got != cyclic {
+		t.Fatalf("VisibleSessionError(cyclic) = %v, want original cyclic error", got)
+	}
+	if !IgnorePeerClose(cyclic, false, closedSentinel) {
+		t.Fatal("IgnorePeerClose(cyclic) = false, want true")
 	}
 }
 

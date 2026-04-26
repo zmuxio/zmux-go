@@ -1226,6 +1226,27 @@ func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
 	return serverTLS, clientTLS
 }
 
+type cyclicWrappedError struct {
+	next error
+}
+
+func (e *cyclicWrappedError) Error() string {
+	return "cyclic wrapped error"
+}
+
+func (e *cyclicWrappedError) Unwrap() error {
+	return e.next
+}
+
+func TestFindErrorHandlesCyclicUnwrap(t *testing.T) {
+	cyclic := &cyclicWrappedError{}
+	cyclic.next = cyclic
+
+	if appErr, ok := findError[*zmux.ApplicationError](cyclic); ok {
+		t.Fatalf("findError returned %v, want no match for cyclic unwrap", appErr)
+	}
+}
+
 func BenchmarkReadAcceptedStreamMetadata(b *testing.B) {
 	priority := uint64(7)
 	group := uint64(9)

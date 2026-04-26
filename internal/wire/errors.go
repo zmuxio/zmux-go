@@ -39,8 +39,7 @@ func WrapError(code ErrorCode, op string, err error) error {
 }
 
 func ErrorCodeOf(err error) (ErrorCode, bool) {
-	var we *Error
-	if errors.As(err, &we) {
+	if we, ok := findError[*Error](err); ok {
 		return we.Code, true
 	}
 	return 0, false
@@ -70,3 +69,31 @@ var (
 	ErrPriorityUpdateTooLarge    = errors.New("zmux: priority update exceeds peer max_extension_payload_bytes")
 	ErrEmptyMetadataUpdate       = errors.New("zmux: metadata update has no fields")
 )
+
+const maxErrorUnwrapDepth = 64
+
+func findError[T any](err error) (T, bool) {
+	return findErrorDepth[T](err, 0)
+}
+
+func findErrorDepth[T any](err error, depth int) (T, bool) {
+	var zero T
+	if err == nil || depth > maxErrorUnwrapDepth {
+		return zero, false
+	}
+	if target, ok := any(err).(T); ok {
+		return target, true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range wrapped.Unwrap() {
+			if target, ok := findErrorDepth[T](child, depth+1); ok {
+				return target, true
+			}
+		}
+		return zero, false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return findErrorDepth[T](wrapped.Unwrap(), depth+1)
+	}
+	return zero, false
+}

@@ -67,8 +67,8 @@ func (e *ApplicationError) Is(err error) bool {
 	if e == nil {
 		return false
 	}
-	var other *ApplicationError
-	return errors.As(err, &other) && other.Code == e.Code
+	other, ok := findError[*ApplicationError](err)
+	return ok && other.Code == e.Code
 }
 
 func (e *ApplicationError) ApplicationCode() uint64 {
@@ -236,8 +236,8 @@ func (e *Error) Unwrap() error {
 
 // AsStructuredError returns the structured error wrapper when present.
 func AsStructuredError(err error) (*Error, bool) {
-	var out *Error
-	if !errors.As(err, &out) {
+	out, ok := findError[*Error](err)
+	if !ok {
 		return nil, false
 	}
 	return out, true
@@ -284,8 +284,8 @@ func reframeStructuredError(err error, meta errorMeta) error {
 		return nil
 	}
 
-	var existing *Error
-	if !errors.As(err, &existing) {
+	existing, ok := findError[*Error](err)
+	if !ok {
 		return wrapStructuredError(err, meta)
 	}
 
@@ -322,8 +322,7 @@ func wrapStructuredError(err error, meta errorMeta) error {
 
 	code, reason := errorDetails(err)
 
-	var existing *Error
-	if errors.As(err, &existing) {
+	if existing, ok := findError[*Error](err); ok {
 		cloned := *existing
 		if cloned.Scope == ScopeUnknown {
 			cloned.Scope = meta.scope
@@ -463,7 +462,7 @@ func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Sou
 	switch {
 	case err == nil:
 		return SourceUnknown
-	case errors.Is(err, io.EOF), errors.Is(err, io.ErrClosedPipe):
+	case isError(err, io.EOF), isError(err, io.ErrClosedPipe):
 		return SourceTransport
 	}
 	if structured, ok := findError[*Error](err); ok && structured.Source != SourceUnknown {
@@ -482,7 +481,7 @@ func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Sou
 	if _, ok := ErrorCodeOf(err); ok {
 		return SourceRemote
 	}
-	if errors.Is(err, ErrSessionClosed) {
+	if isError(err, ErrSessionClosed) {
 		if peerClose != nil {
 			return SourceRemote
 		}
@@ -491,9 +490,15 @@ func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Sou
 	return SourceTransport
 }
 
+const maxErrorUnwrapDepth = 64
+
 func findError[T any](err error) (T, bool) {
+	return findErrorDepth[T](err, 0)
+}
+
+func findErrorDepth[T any](err error, depth int) (T, bool) {
 	var zero T
-	if err == nil {
+	if err == nil || depth > maxErrorUnwrapDepth {
 		return zero, false
 	}
 	if target, ok := any(err).(T); ok {
@@ -501,16 +506,56 @@ func findError[T any](err error) (T, bool) {
 	}
 	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
 		for _, child := range wrapped.Unwrap() {
-			if target, ok := findError[T](child); ok {
+			if target, ok := findErrorDepth[T](child, depth+1); ok {
 				return target, true
 			}
 		}
 		return zero, false
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return findError[T](wrapped.Unwrap())
+		return findErrorDepth[T](wrapped.Unwrap(), depth+1)
 	}
 	return zero, false
+}
+
+func isError(err, target error) bool {
+	if target == nil {
+		return err == nil
+	}
+	return isErrorDepth(err, target, 0)
+}
+
+func isErrorDepth(err, target error, depth int) bool {
+	if err == nil || depth > maxErrorUnwrapDepth {
+		return false
+	}
+	if sameError(err, target) {
+		return true
+	}
+	if matcher, ok := err.(interface{ Is(error) bool }); ok && matcher.Is(target) {
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range wrapped.Unwrap() {
+			if isErrorDepth(child, target, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return isErrorDepth(wrapped.Unwrap(), target, depth+1)
+	}
+	return false
+}
+
+func sameError(err, target error) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return err == target
 }
 
 func sessionErrorSource(c *Conn, err error) Source {
@@ -533,7 +578,7 @@ func (s *nativeStream) readSurfaceErrLocked(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, io.EOF) {
+	if isError(err, io.EOF) {
 		return err
 	}
 	meta := errorMeta{
@@ -561,7 +606,7 @@ func (s *nativeStream) writeSurfaceErrLocked(err error) error {
 		direction: DirectionWrite,
 	}
 	switch {
-	case errors.Is(err, ErrStreamNotWritable):
+	case isError(err, ErrStreamNotWritable):
 		meta.source = SourceLocal
 	case s != nil:
 		if termination := s.writeTerminationMetaLocked(err); termination.ready() {
@@ -587,9 +632,9 @@ func (s *nativeStream) closeSurfaceErr(err error) error {
 		source:    SourceLocal,
 	}
 	switch {
-	case errors.Is(err, ErrStreamNotReadable):
+	case isError(err, ErrStreamNotReadable):
 		meta.direction = DirectionRead
-	case errors.Is(err, ErrStreamNotWritable):
+	case isError(err, ErrStreamNotWritable):
 		meta.direction = DirectionWrite
 	default:
 		meta.direction = DirectionBoth
@@ -608,8 +653,7 @@ func (s *nativeStream) closeOperationErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	var structured *Error
-	if errors.As(err, &structured) && structured.Scope == ScopeSession {
+	if structured, ok := findError[*Error](err); ok && structured.Scope == ScopeSession {
 		return sessionOperationErr(s.conn, OperationClose, err)
 	}
 	return reframeStructuredError(s.closeSurfaceErr(err), errorMeta{

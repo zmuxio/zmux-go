@@ -354,9 +354,15 @@ func matchesApplicationErrorCode(err error, code uint64) bool {
 	return ok && appErr.Code == code
 }
 
+const maxErrorUnwrapDepth = 64
+
 func findError[T any](err error) (T, bool) {
+	return findErrorDepth[T](err, 0)
+}
+
+func findErrorDepth[T any](err error, depth int) (T, bool) {
 	var zero T
-	if err == nil {
+	if err == nil || depth > maxErrorUnwrapDepth {
 		return zero, false
 	}
 	if target, ok := any(err).(T); ok {
@@ -364,14 +370,14 @@ func findError[T any](err error) (T, bool) {
 	}
 	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
 		for _, child := range wrapped.Unwrap() {
-			if target, ok := findError[T](child); ok {
+			if target, ok := findErrorDepth[T](child, depth+1); ok {
 				return target, true
 			}
 		}
 		return zero, false
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return findError[T](wrapped.Unwrap())
+		return findErrorDepth[T](wrapped.Unwrap(), depth+1)
 	}
 	return zero, false
 }

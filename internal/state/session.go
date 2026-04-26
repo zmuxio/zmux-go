@@ -1,7 +1,6 @@
 package state
 
 import (
-	"errors"
 	"io"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -51,6 +50,74 @@ type PeerClosePlan struct {
 
 type applicationCoder interface {
 	ApplicationCode() uint64
+}
+
+const maxErrorUnwrapDepth = 64
+
+func findError[T any](err error) (T, bool) {
+	return findErrorDepth[T](err, 0)
+}
+
+func findErrorDepth[T any](err error, depth int) (T, bool) {
+	var zero T
+	if err == nil || depth > maxErrorUnwrapDepth {
+		return zero, false
+	}
+	if target, ok := any(err).(T); ok {
+		return target, true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range wrapped.Unwrap() {
+			if target, ok := findErrorDepth[T](child, depth+1); ok {
+				return target, true
+			}
+		}
+		return zero, false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return findErrorDepth[T](wrapped.Unwrap(), depth+1)
+	}
+	return zero, false
+}
+
+func isError(err, target error) bool {
+	if target == nil {
+		return err == nil
+	}
+	return isErrorDepth(err, target, 0)
+}
+
+func isErrorDepth(err, target error, depth int) bool {
+	if err == nil || depth > maxErrorUnwrapDepth {
+		return false
+	}
+	if sameError(err, target) {
+		return true
+	}
+	if matcher, ok := err.(interface{ Is(error) bool }); ok && matcher.Is(target) {
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range wrapped.Unwrap() {
+			if isErrorDepth(child, target, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return isErrorDepth(wrapped.Unwrap(), target, depth+1)
+	}
+	return false
+}
+
+func sameError(err, target error) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	return err == target
 }
 
 func CanOpenLocally(state SessionState) bool {
@@ -137,7 +204,7 @@ func BeginSessionClosing(current SessionState) SessionState {
 }
 
 func isClosedSentinel(err error, closedSentinel error) bool {
-	return closedSentinel != nil && errors.Is(err, closedSentinel)
+	return closedSentinel != nil && isError(err, closedSentinel)
 }
 
 func isOrderlyTransportClose(current SessionState) bool {
@@ -145,7 +212,7 @@ func isOrderlyTransportClose(current SessionState) bool {
 }
 
 func isTransportClose(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe)
+	return isError(err, io.EOF) || isError(err, io.ErrClosedPipe)
 }
 
 func CloseSessionState(current SessionState, err error, closedSentinel error) SessionState {
@@ -157,8 +224,7 @@ func CloseSessionState(current SessionState, err error, closedSentinel error) Se
 		return SessionStateClosed
 	}
 
-	var coded applicationCoder
-	if errors.As(err, &coded) {
+	if coded, ok := findError[applicationCoder](err); ok {
 		if coded.ApplicationCode() == uint64(wire.CodeNoError) {
 			return SessionStateClosed
 		}
@@ -183,8 +249,7 @@ func VisibleSessionError(current SessionState, err error, closedSentinel error) 
 		return closedSentinel
 	}
 
-	var coded applicationCoder
-	if errors.As(err, &coded) && coded.ApplicationCode() == uint64(wire.CodeNoError) {
+	if coded, ok := findError[applicationCoder](err); ok && coded.ApplicationCode() == uint64(wire.CodeNoError) {
 		return closedSentinel
 	}
 
@@ -213,8 +278,7 @@ func IgnorePeerClose(closeErr error, peerCloseErrPresent bool, closedSentinel er
 	if isClosedSentinel(closeErr, closedSentinel) {
 		return true
 	}
-	var coded applicationCoder
-	if errors.As(closeErr, &coded) {
+	if _, ok := findError[applicationCoder](closeErr); ok {
 		return true
 	}
 	if _, ok := wire.ErrorCodeOf(closeErr); ok {
