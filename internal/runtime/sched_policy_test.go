@@ -64,3 +64,17 @@ func TestAdjustWeightForLagPenalizesOverServedFlows(t *testing.T) {
 		t.Fatalf("negative-lag weight = %d, want >= 1", penalized)
 	}
 }
+
+func TestApplyLagFeedbackClampsBeforeInt64Overflow(t *testing.T) {
+	const window int64 = 10
+
+	positive := applyLagFeedback(maxSignedInt64-1, maxSignedInt64, 0, window)
+	if positive != 2*window {
+		t.Fatalf("positive overflow lag = %d, want %d", positive, 2*window)
+	}
+
+	negative := applyLagFeedback(-maxSignedInt64+1, 0, maxSignedInt64, window)
+	if negative != -2*window {
+		t.Fatalf("negative overflow lag = %d, want %d", negative, -2*window)
+	}
+}

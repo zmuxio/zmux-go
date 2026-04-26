@@ -30,6 +30,26 @@ func clampLag(value int64, window int64) int64 {
 	}
 }
 
+func applyLagFeedback(current int64, expected int64, actual int64, window int64) int64 {
+	if window <= 0 {
+		return 0
+	}
+	if expected >= actual {
+		delta := expected - actual
+		if current > maxSignedInt64-delta {
+			return clampLag(maxSignedInt64, window)
+		}
+		return clampLag(current+delta, window)
+	}
+
+	delta := actual - expected
+	floor := -maxSignedInt64
+	if current < floor+delta {
+		return clampLag(floor, window)
+	}
+	return clampLag(current-delta, window)
+}
+
 func isFreshStream(state *BatchState, streamID uint64) bool {
 	if state == nil || isSyntheticStreamKey(streamID) {
 		return false

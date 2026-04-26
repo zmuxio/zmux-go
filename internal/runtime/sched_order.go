@@ -503,7 +503,7 @@ func updateLagFeedback(state *BatchState, prepared batchBuildResult, chosen wfqG
 		if candidate.groupKey == chosen.groupKey {
 			actual = cost
 		}
-		setGroupLag(state, candidate.groupKey, clampLag(groupLag(state, candidate.groupKey)+expected-actual, feedbackWindow))
+		setGroupLag(state, candidate.groupKey, applyLagFeedback(groupLag(state, candidate.groupKey), expected, actual, feedbackWindow))
 	}
 
 	for _, streamID := range prepared.groups[chosen.groupOrder].streams {
@@ -516,7 +516,7 @@ func updateLagFeedback(state *BatchState, prepared batchBuildResult, chosen wfqG
 		if streamID == chosen.stream.streamID {
 			actual = cost
 		}
-		setStreamLag(state, streamID, clampLag(streamLag(state, streamID)+expected-actual, feedbackWindow))
+		setStreamLag(state, streamID, applyLagFeedback(streamLag(state, streamID), expected, actual, feedbackWindow))
 	}
 }
 
