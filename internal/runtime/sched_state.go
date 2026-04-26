@@ -412,6 +412,24 @@ func scrubIdleRetainedBatchState(state *BatchState) {
 	state.ClassSelectionsSinceBulk = 0
 }
 
+func releaseIdleBatchStateStorage(state *BatchState) {
+	if state == nil {
+		return
+	}
+	state.GroupVirtualTime = nil
+	state.GroupFinishTag = nil
+	state.GroupLastService = nil
+	state.GroupLag = nil
+	state.StreamFinishTag = nil
+	state.StreamLastService = nil
+	state.StreamLag = nil
+	state.StreamClass = nil
+	state.StreamLastSeenBatch = nil
+	state.SmallBurstDisarmed = nil
+	state.PreferredStreamHead = nil
+	state.scratch = batchScratch{}
+}
+
 func maybeRebaseWFQState(state *BatchState) {
 	if state == nil || state.RootVirtualTime < 1<<48 {
 		return

@@ -4038,6 +4038,27 @@ func removeSparseQueueSlot[T any](items *[]T, head, count *int, idx int, valid s
 	return true
 }
 
+func compactedQueueRetainLimit(length int) int {
+	maxInt := int(^uint(0) >> 1)
+	if length > maxInt/2 {
+		return maxInt
+	}
+	return length * 2
+}
+
+func shrinkCompactedQueueBacking[T any](items []T) []T {
+	if len(items) == 0 {
+		return nil
+	}
+	if cap(items) <= compactedQueueRetainLimit(len(items)) {
+		if cap(items) > len(items) {
+			clear(items[len(items):cap(items)])
+		}
+		return items
+	}
+	return append([]T(nil), items...)
+}
+
 func compactSparseQueue[T any](items *[]T, head, count *int, shouldCompact sparseQueueCompactFn, valid sparseQueueValidFn[T], move func(T, int)) {
 	if items == nil || head == nil || count == nil {
 		return
@@ -4066,7 +4087,7 @@ func compactSparseQueue[T any](items *[]T, head, count *int, shouldCompact spars
 		writeIdx++
 	}
 	clear((*items)[writeIdx:])
-	*items = (*items)[:writeIdx]
+	*items = shrinkCompactedQueueBacking((*items)[:writeIdx])
 	*head = 0
 	*count = writeIdx
 }

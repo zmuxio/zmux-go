@@ -121,13 +121,8 @@ func (s *BatchScheduler) maybeClearIdleHeadState() {
 		s.State.HasPreferredGroupHead {
 		return
 	}
-	s.State.RootVirtualTime = 0
-	s.State.PreferredGroupHead = GroupKey{}
-	s.State.HasPreferredGroupHead = false
-	s.State.ServiceSeq = 0
-	s.State.BatchSeq = 0
-	s.State.InteractiveStreak = 0
-	s.State.ClassSelectionsSinceBulk = 0
+	scrubIdleRetainedBatchState(&s.State)
+	releaseIdleBatchStateStorage(&s.State)
 }
 
 const wfqTagScale uint64 = 256

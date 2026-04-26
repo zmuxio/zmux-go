@@ -52,8 +52,23 @@ func TestBatchSchedulerDropStreamClearsIdleState(t *testing.T) {
 			GroupVirtualTime:  map[GroupKey]uint64{{Kind: 0, Value: 4}: 5},
 			GroupFinishTag:    map[GroupKey]uint64{{Kind: 0, Value: 4}: 7},
 			GroupLastService:  map[GroupKey]uint64{{Kind: 0, Value: 4}: 8},
+			GroupLag:          map[GroupKey]int64{{Kind: 0, Value: 4}: 1},
 			StreamFinishTag:   map[uint64]uint64{4: 3},
 			StreamLastService: map[uint64]uint64{4: 8},
+			StreamLag:         map[uint64]int64{4: 1},
+			StreamClass:       map[uint64]trafficClass{4: trafficClassInteractive},
+			StreamLastSeenBatch: map[uint64]uint64{
+				4: 1,
+			},
+			SmallBurstDisarmed: map[uint64]struct{}{4: {}},
+			PreferredStreamHead: map[GroupKey]uint64{
+				{Kind: 0, Value: 4}: 4,
+			},
+			scratch: batchScratch{
+				groupOrder:  make([]GroupKey, 0, 1024),
+				queuedBytes: map[uint64]uint64{4: 1},
+				ordered:     make([]int, 0, 1024),
+			},
 		},
 	}
 
@@ -61,13 +76,35 @@ func TestBatchSchedulerDropStreamClearsIdleState(t *testing.T) {
 
 	if len(s.State.StreamFinishTag) != 0 ||
 		len(s.State.StreamLastService) != 0 ||
+		len(s.State.StreamLag) != 0 ||
+		len(s.State.StreamClass) != 0 ||
+		len(s.State.StreamLastSeenBatch) != 0 ||
+		len(s.State.SmallBurstDisarmed) != 0 ||
 		len(s.State.GroupVirtualTime) != 0 ||
 		len(s.State.GroupFinishTag) != 0 ||
-		len(s.State.GroupLastService) != 0 {
+		len(s.State.GroupLastService) != 0 ||
+		len(s.State.GroupLag) != 0 ||
+		len(s.State.PreferredStreamHead) != 0 {
 		t.Fatalf("retained per-stream state not cleared: %#v", s.State)
 	}
 	if s.State.RootVirtualTime != 0 || s.State.ServiceSeq != 0 {
 		t.Fatalf("scheduler clocks = (%d,%d), want (0,0)", s.State.RootVirtualTime, s.State.ServiceSeq)
+	}
+	if s.State.StreamFinishTag != nil ||
+		s.State.StreamLastService != nil ||
+		s.State.StreamLag != nil ||
+		s.State.StreamClass != nil ||
+		s.State.StreamLastSeenBatch != nil ||
+		s.State.SmallBurstDisarmed != nil ||
+		s.State.GroupVirtualTime != nil ||
+		s.State.GroupFinishTag != nil ||
+		s.State.GroupLastService != nil ||
+		s.State.GroupLag != nil ||
+		s.State.PreferredStreamHead != nil {
+		t.Fatalf("idle scheduler map storage retained: %#v", s.State)
+	}
+	if cap(s.State.scratch.groupOrder) != 0 || s.State.scratch.queuedBytes != nil || cap(s.State.scratch.ordered) != 0 {
+		t.Fatalf("idle scheduler scratch retained: %#v", s.State.scratch)
 	}
 }
 

@@ -175,7 +175,11 @@ func OrderBatchIndices(cfg BatchConfig, state *BatchState, items []BatchItem) []
 
 	prepared := buildBatchGroups(state, items)
 	if !prepared.hasRealStreamScoped {
-		return identityOrder(state, len(items))
+		order := identityOrder(state, len(items))
+		if !retainedRealState {
+			releaseIdleBatchStateStorage(state)
+		}
+		return order
 	}
 
 	transient := transientBatchState(state, len(items))

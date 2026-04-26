@@ -748,6 +748,32 @@ func TestEnsureOpenPreludeResumesAfterPartialWriteError(t *testing.T) {
 	if !base.preludeSent {
 		t.Fatal("preludeSent = false, want true")
 	}
+	if base.prelude != nil {
+		t.Fatal("prelude retained after successful send, want released buffer")
+	}
+}
+
+func TestEnsureOpenPreludeKeepsBufferUntilFullySent(t *testing.T) {
+	writer := &partialPreludeWriter{
+		failAfter: 3,
+		failErr:   io.ErrUnexpectedEOF,
+	}
+	base := &quicStreamBase{}
+	priority := uint64(7)
+	initLocalStreamBase(base, nil, nil, writer, zmux.OpenOptions{
+		InitialPriority: &priority,
+		OpenInfo:        bytes.Repeat([]byte("x"), 1024),
+	})
+
+	if err := base.ensureOpenPrelude(); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("ensureOpenPrelude err = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+	if base.prelude == nil {
+		t.Fatal("prelude buffer released after partial write failure, want retained for retry")
+	}
+	if base.preludeSent {
+		t.Fatal("preludeSent = true after partial write failure, want false")
+	}
 }
 
 func TestEnsureOpenPreludeWithContextCancelsBlockedWrite(t *testing.T) {

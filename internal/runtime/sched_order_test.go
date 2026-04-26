@@ -97,6 +97,19 @@ func TestOrderBatchIndicesDoesNotRetainSessionScopedSyntheticState(t *testing.T)
 	if state.RootVirtualTime != 0 || state.ServiceSeq != 0 {
 		t.Fatalf("retained scheduler clock = (%d,%d), want (0,0)", state.RootVirtualTime, state.ServiceSeq)
 	}
+	if state.StreamFinishTag != nil ||
+		state.StreamLastService != nil ||
+		state.StreamLag != nil ||
+		state.GroupVirtualTime != nil ||
+		state.GroupFinishTag != nil ||
+		state.GroupLastService != nil ||
+		state.GroupLag != nil ||
+		state.PreferredStreamHead != nil {
+		t.Fatalf("idle session-scoped batch retained scheduler maps: %#v", state)
+	}
+	if state.scratch.groupState != nil || cap(state.scratch.ordered) != 0 {
+		t.Fatalf("idle session-scoped batch retained scratch: %#v", state.scratch)
+	}
 }
 
 func TestOrderBatchIndicesSessionScopedOrdinaryPreservesRetainedWFQState(t *testing.T) {

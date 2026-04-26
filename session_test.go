@@ -12084,7 +12084,7 @@ func TestMaybeCompactProvisionalQueueClearsStaleBackingPointers(t *testing.T) {
 	c.mu.Lock()
 	first := c.newProvisionalLocalStreamLocked(streamArityBidi, OpenOptions{}, nil)
 	second := c.newProvisionalLocalStreamLocked(streamArityBidi, OpenOptions{}, nil)
-	q := make([]*nativeStream, provisionalQueueCompactMinHead+2)
+	q := make([]*nativeStream, provisionalQueueCompactMinHead+2, provisionalQueueCompactMinHead+2048)
 	q[provisionalQueueCompactMinHead] = first
 	q[provisionalQueueCompactMinHead+1] = second
 	first.provisionalIndex = int32(provisionalQueueCompactMinHead)
@@ -12107,6 +12107,12 @@ func TestMaybeCompactProvisionalQueueClearsStaleBackingPointers(t *testing.T) {
 	}
 	if first.provisionalIndex != 0 || second.provisionalIndex != 1 {
 		t.Fatalf("provisional indexes = (%d,%d), want (0,1)", first.provisionalIndex, second.provisionalIndex)
+	}
+	if cap(queue) > compactedQueueRetainLimit(len(queue)) {
+		t.Fatalf("provisional queue cap = %d, want <= %d", cap(queue), compactedQueueRetainLimit(len(queue)))
+	}
+	if len(queue) > 0 && len(backing) > 0 && &queue[0] == &backing[0] {
+		t.Fatal("provisional queue retained oversized backing after compaction")
 	}
 	for i := len(queue); i < len(backing); i++ {
 		if backing[i] != nil {
@@ -18044,6 +18050,27 @@ func TestHiddenQueueRebuildSkipsSparseRemovedTombstones(t *testing.T) {
 	}
 }
 
+func TestHiddenQueueRebuildDropsBackingWhenNoHiddenTombstones(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	c.mu.Lock()
+	c.registry.tombstones = map[uint64]streamTombstone{
+		4: {},
+	}
+	c.registry.tombstoneOrder = []uint64{4}
+	c.registry.hiddenTombstoneOrder = make([]uint64, 0, 128)
+	c.registry.hiddenTombstonesInit = false
+	count := c.hiddenControlStateRetainedLocked()
+	order := c.registry.hiddenTombstoneOrder
+	c.mu.Unlock()
+
+	if count != 0 {
+		t.Fatalf("hiddenControlStateRetainedLocked() = %d, want 0", count)
+	}
+	if order != nil {
+		t.Fatalf("hiddenTombstoneOrder cap = %d, want nil backing", cap(order))
+	}
+}
+
 func TestRemoveHiddenTombstoneFallsBackWhenHiddenIndexStale(t *testing.T) {
 	c := newSessionMemoryTestConn()
 	c.mu.Lock()
@@ -18201,7 +18228,8 @@ func TestMaybeCompactTombstoneQueuePreservesLiveOrderAndIndices(t *testing.T) {
 		8:  {OrderIndex: 1},
 		16: {OrderIndex: 3},
 	}
-	c.registry.tombstoneOrder = []uint64{4, 8, 12, 16}
+	c.registry.tombstoneOrder = make([]uint64, 4, 128)
+	copy(c.registry.tombstoneOrder, []uint64{4, 8, 12, 16})
 	c.registry.tombstoneHead = 1
 	c.registry.tombstoneCount = 2
 	c.registry.tombstonesInit = true
@@ -18223,6 +18251,9 @@ func TestMaybeCompactTombstoneQueuePreservesLiveOrderAndIndices(t *testing.T) {
 	}
 	if len(order) != 2 || order[0] != 8 || order[1] != 16 {
 		t.Fatalf("tombstoneOrder = %v, want [8 16]", order)
+	}
+	if cap(order) > compactedQueueRetainLimit(len(order)) {
+		t.Fatalf("tombstoneOrder cap = %d, want <= %d", cap(order), compactedQueueRetainLimit(len(order)))
 	}
 	if first.OrderIndex != 0 || second.OrderIndex != 1 {
 		t.Fatalf("order indexes = (%d,%d), want (0,1)", first.OrderIndex, second.OrderIndex)

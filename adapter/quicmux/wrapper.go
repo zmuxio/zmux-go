@@ -658,6 +658,7 @@ func (b *quicStreamBase) ensureOpenPrelude() error {
 	}
 	b.metaMu.Lock()
 	b.preludeSent = true
+	b.prelude = nil
 	b.metaMu.Unlock()
 	return nil
 }
@@ -1399,6 +1400,9 @@ func defaultContext(ctx context.Context) context.Context {
 
 func installContextWriteDeadline(ctx context.Context, deadlineSetter writeDeadlineSetter) func() {
 	if ctx == nil || deadlineSetter == nil {
+		return func() {}
+	}
+	if ctx.Done() == nil {
 		return func() {}
 	}
 	if ctx.Err() != nil {

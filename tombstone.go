@@ -628,6 +628,7 @@ func (c *Conn) ensureHiddenTombstonesLocked() {
 	c.registry.hiddenTombstoneCount = 0
 	c.registry.hiddenTombstoneOrder = c.registry.hiddenTombstoneOrder[:0]
 	if len(c.registry.tombstones) == 0 || c.tombstoneCountLocked() == 0 {
+		c.registry.hiddenTombstoneOrder = nil
 		c.registry.hiddenTombstonesInit = true
 		return
 	}
@@ -646,6 +647,7 @@ func (c *Conn) ensureHiddenTombstonesLocked() {
 		c.registry.hiddenTombstoneOrder = append(c.registry.hiddenTombstoneOrder, entry.streamID)
 		c.registry.hiddenTombstoneCount++
 	}
+	c.registry.hiddenTombstoneOrder = shrinkCompactedQueueBacking(c.registry.hiddenTombstoneOrder)
 	c.registry.hiddenTombstonesInit = true
 }
 
@@ -824,7 +826,7 @@ func (c *Conn) compactIndexedTombstoneQueueLocked(
 		writeIdx++
 	}
 	clear((*order)[writeIdx:])
-	*order = (*order)[:writeIdx]
+	*order = shrinkCompactedQueueBacking((*order)[:writeIdx])
 	*head = 0
 	*count = writeIdx
 	*init = true
