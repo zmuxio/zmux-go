@@ -307,26 +307,55 @@ func AppendDebugTextTLVCapped(payload []byte, reason string, maxPayload uint64) 
 	}
 
 	reasonBytes := []byte(reason)
-	remaining := maxPayload - uint64(len(payload))
-	maxReasonLen := uint64(len(reasonBytes))
-	if remaining < maxReasonLen {
-		maxReasonLen = remaining
+	n := cappedDebugTextValueLen(len(reasonBytes), maxPayload-uint64(len(payload)))
+	for n > 0 && !utf8.Valid(reasonBytes[:n]) {
+		n--
+	}
+	if n == 0 {
+		return payload
+	}
+	out, err := AppendTLV(payload, uint64(DIAGDebugText), reasonBytes[:n])
+	if err != nil || uint64(len(out)) > maxPayload {
+		return payload
+	}
+	return out
+}
+
+func cappedDebugTextValueLen(reasonLen int, remaining uint64) int {
+	if reasonLen <= 0 {
+		return 0
+	}
+	typeLen, err := VarintLen(uint64(DIAGDebugText))
+	if err != nil {
+		return 0
+	}
+	if remaining <= uint64(typeLen) {
+		return 0
 	}
 
-	for n := int(maxReasonLen); n > 0; n-- {
-		if !utf8.Valid(reasonBytes[:n]) {
-			continue
-		}
-		out, err := AppendTLV(payload, uint64(DIAGDebugText), reasonBytes[:n])
+	available := remaining - uint64(typeLen)
+	valueLen := uint64(reasonLen)
+	if valueLen > available {
+		valueLen = available
+	}
+	if valueLen > MaxVarint62 {
+		valueLen = MaxVarint62
+	}
+
+	for valueLen > 0 {
+		lenLen, err := VarintLen(valueLen)
 		if err != nil {
-			return payload
+			return 0
 		}
-		if uint64(len(out)) <= maxPayload {
-			return out
+		if valueLen+uint64(lenLen) <= available {
+			return int(valueLen)
 		}
+		if available <= uint64(lenLen) {
+			return 0
+		}
+		valueLen = available - uint64(lenLen)
 	}
-
-	return payload
+	return 0
 }
 
 func tightPayloadBuildBuffer(dst []byte, totalLen int) []byte {

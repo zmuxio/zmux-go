@@ -71,3 +71,48 @@ func TestAppendOpenMetadataPrefixReusesExactBuffer(t *testing.T) {
 		t.Fatal("AppendOpenMetadataPrefix did not reuse exact-size buffer")
 	}
 }
+
+func TestAppendDebugTextTLVCappedAccountsForLengthVarintGrowth(t *testing.T) {
+	t.Parallel()
+
+	reason := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()"
+	payload := AppendDebugTextTLVCapped(nil, reason, 66)
+	got, err := ParseDIAGReason(payload)
+	if err != nil {
+		t.Fatalf("ParseDIAGReason err = %v", err)
+	}
+
+	if len(got) != 63 {
+		t.Fatalf("reason length = %d, want 63", len(got))
+	}
+	if got != reason[:63] {
+		t.Fatalf("reason = %q, want %q", got, reason[:63])
+	}
+	if uint64(len(payload)) > 66 {
+		t.Fatalf("payload length = %d, want <= 66", len(payload))
+	}
+}
+
+func TestAppendDebugTextTLVCappedTrimsToUTF8Boundary(t *testing.T) {
+	t.Parallel()
+
+	payload := AppendDebugTextTLVCapped(nil, "aa😀", 5)
+	got, err := ParseDIAGReason(payload)
+	if err != nil {
+		t.Fatalf("ParseDIAGReason err = %v", err)
+	}
+
+	if got != "aa" {
+		t.Fatalf("reason = %q, want %q", got, "aa")
+	}
+}
+
+func TestAppendDebugTextTLVCappedSkipsWhenNoTLVRoom(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte{0}
+	payload := AppendDebugTextTLVCapped(prefix, "x", uint64(len(prefix)+1))
+	if !bytes.Equal(payload, prefix) {
+		t.Fatalf("payload = %x, want unchanged %x", payload, prefix)
+	}
+}
