@@ -1917,6 +1917,100 @@ func (c *deadlineBlockingConn) Close() error {
 	return nil
 }
 
+type secondWriteDeadlineBlockingConn struct {
+	readMu         sync.Mutex
+	readBuf        *bytes.Reader
+	mu             sync.Mutex
+	writeCalls     int
+	writeDeadline  time.Time
+	deadlineNotify chan struct{}
+	closed         bool
+	prefaceWritten chan struct{}
+	prefaceOnce    sync.Once
+}
+
+func newSecondWriteDeadlineBlockingConn(inbound []byte) *secondWriteDeadlineBlockingConn {
+	return &secondWriteDeadlineBlockingConn{
+		readBuf:        bytes.NewReader(inbound),
+		deadlineNotify: make(chan struct{}),
+		prefaceWritten: make(chan struct{}),
+	}
+}
+
+func (c *secondWriteDeadlineBlockingConn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if c.readBuf == nil {
+		return 0, io.EOF
+	}
+	return c.readBuf.Read(p)
+}
+
+func (c *secondWriteDeadlineBlockingConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	c.writeCalls++
+	writeCall := c.writeCalls
+	c.mu.Unlock()
+
+	if writeCall == 1 {
+		c.prefaceOnce.Do(func() { close(c.prefaceWritten) })
+		return len(p), nil
+	}
+
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return 0, io.ErrClosedPipe
+		}
+		deadline := c.writeDeadline
+		notifyCh := c.deadlineNotify
+		c.mu.Unlock()
+
+		if deadline.IsZero() {
+			<-notifyCh
+			continue
+		}
+		delay := time.Until(deadline)
+		if delay <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+			return 0, os.ErrDeadlineExceeded
+		case <-notifyCh:
+			stopTimer(timer)
+		}
+	}
+}
+
+func (c *secondWriteDeadlineBlockingConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return io.ErrClosedPipe
+	}
+	c.writeDeadline = t
+	close(c.deadlineNotify)
+	c.deadlineNotify = make(chan struct{})
+	return nil
+}
+
+func (c *secondWriteDeadlineBlockingConn) Close() error {
+	c.mu.Lock()
+	if !c.closed {
+		c.closed = true
+		close(c.deadlineNotify)
+	}
+	c.mu.Unlock()
+	return nil
+}
+
 func establishmentFramesAfterPreface(t *testing.T, raw []byte, prefaceLen int) []Frame {
 	t.Helper()
 	if len(raw) < prefaceLen {
@@ -2119,6 +2213,46 @@ func TestClientEstablishmentWriteDeadlineBoundsBlockedPrefaceWriter(t *testing.T
 	case <-conn.writeDone:
 	case <-time.After(establishmentSuccessWriteWait + testSignalTimeout):
 		t.Fatal("blocked local preface write did not exit after establishment deadline")
+	}
+}
+
+func TestClientEstablishmentFailureCloseDeadlineBoundsBlockedFatalClose(t *testing.T) {
+	t.Parallel()
+
+	invalidPeer := append([]byte(nil), testPrefaceBytesForRole(t, RoleResponder)...)
+	invalidPeer[5] = 7
+	conn := newSecondWriteDeadlineBlockingConn(invalidPeer)
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+
+	type result struct {
+		conn *Conn
+		err  error
+	}
+	clientCh := make(chan result, 1)
+	go func() {
+		client, err := Client(conn, nil)
+		clientCh <- result{conn: client, err: err}
+	}()
+
+	select {
+	case <-conn.prefaceWritten:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("local preface write did not complete before fatal close")
+	}
+
+	select {
+	case res := <-clientCh:
+		if res.conn != nil {
+			_ = res.conn.Close()
+			t.Fatal("expected client establish to fail after invalid peer preface")
+		}
+		if res.err == nil {
+			t.Fatal("expected client establish error after invalid peer preface")
+		}
+	case <-time.After(establishmentFailureWriteWait + testSignalTimeout):
+		t.Fatal("client establish blocked writing fatal close after establishment failure")
 	}
 }
 

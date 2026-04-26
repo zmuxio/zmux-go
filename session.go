@@ -1494,7 +1494,10 @@ func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer
 		return
 	}
 	if err != nil {
-		if emitErr := emitEstablishmentClose(conn, local, peer, err); emitErr == nil {
+		closeDeadline := beginEstablishmentWriteDeadline(conn, establishmentFailureWriteWait)
+		emitErr := emitEstablishmentClose(conn, local, peer, err)
+		_ = closeDeadline.clear()
+		if emitErr == nil {
 			if delay := establishmentCloseDrainDelay(err); delay > 0 {
 				time.Sleep(delay)
 			}
