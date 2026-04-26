@@ -51,6 +51,9 @@ func FrameChunkSpans(frames []wire.Frame, maxFrames int, maxBytes uint64) []Chun
 }
 
 func SendByDeadline[T any](deadline time.Time, closed <-chan struct{}, lane chan<- T, value T) bool {
+	if lane == nil {
+		return false
+	}
 	if deadline.IsZero() {
 		select {
 		case <-closed:
@@ -76,6 +79,9 @@ func SendByDeadline[T any](deadline time.Time, closed <-chan struct{}, lane chan
 }
 
 func WaitByDeadline[T any](deadline time.Time, closed <-chan struct{}, done <-chan T) {
+	if deadline.IsZero() && closed == nil && done == nil {
+		return
+	}
 	if deadline.IsZero() {
 		select {
 		case <-closed:

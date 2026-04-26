@@ -49,10 +49,30 @@ func TestSendAndWaitByDeadline(t *testing.T) {
 		}
 	})
 
+	t.Run("send to nil lane returns", func(t *testing.T) {
+		if SendByDeadline(time.Time{}, nil, nil, 7) {
+			t.Fatal("SendByDeadline() = true, want false")
+		}
+	})
+
 	t.Run("wait returns on done", func(t *testing.T) {
 		closed := make(chan struct{})
 		done := make(chan error, 1)
 		done <- nil
 		WaitByDeadline(time.Now().Add(100*time.Millisecond), closed, done)
+	})
+
+	t.Run("wait with nil signals returns", func(t *testing.T) {
+		returned := make(chan struct{})
+		go func() {
+			defer close(returned)
+			WaitByDeadline[struct{}](time.Time{}, nil, nil)
+		}()
+
+		select {
+		case <-returned:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("WaitByDeadline() blocked with nil signals and no deadline")
+		}
 	})
 }
