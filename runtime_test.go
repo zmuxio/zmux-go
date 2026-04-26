@@ -3517,6 +3517,21 @@ func TestPingRejectsPayloadOverLimit(t *testing.T) {
 	}
 }
 
+func TestPingPayloadLenRejectsIntOverflow(t *testing.T) {
+	t.Parallel()
+
+	maxInt := int(^uint(0) >> 1)
+	if _, ok := pingPayloadLen(-1); ok {
+		t.Fatal("pingPayloadLen accepted negative echo length")
+	}
+	if _, ok := pingPayloadLen(maxInt); ok {
+		t.Fatal("pingPayloadLen accepted echo length that would overflow payload allocation")
+	}
+	if got, ok := pingPayloadLen(maxInt - pingNonceBytes); !ok || got != uint64(maxInt) {
+		t.Fatalf("pingPayloadLen(maxInt - nonce) = %d, %t; want %d, true", got, ok, maxInt)
+	}
+}
+
 func pingPayloadEcho(limit uint64) []byte {
 	if limit < 8 {
 		return nil

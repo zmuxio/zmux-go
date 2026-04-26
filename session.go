@@ -3551,15 +3551,35 @@ func (c *Conn) Ping(ctx context.Context, echo []byte) (time.Duration, error) {
 	}
 }
 
+const pingNonceBytes = 8
+
+func pingPayloadLen(echoLen int) (uint64, bool) {
+	if echoLen < 0 {
+		return 0, false
+	}
+	maxEchoLen := int(^uint(0)>>1) - pingNonceBytes
+	if echoLen > maxEchoLen {
+		return 0, false
+	}
+	return uint64(echoLen) + pingNonceBytes, true
+}
+
 func buildPingPayload(echo []byte, nonce uint64) []byte {
-	payload := make([]byte, 8+len(echo))
-	binary.BigEndian.PutUint64(payload[:8], nonce)
-	copy(payload[8:], echo)
+	total, ok := pingPayloadLen(len(echo))
+	if !ok {
+		panic("PING payload length overflows int")
+	}
+	payload := make([]byte, int(total))
+	binary.BigEndian.PutUint64(payload[:pingNonceBytes], nonce)
+	copy(payload[pingNonceBytes:], echo)
 	return payload
 }
 
 func buildPingPayloadCappedWithNonce(echo []byte, maxPayload, nonce uint64) ([]byte, error) {
-	total := uint64(8 + len(echo))
+	total, ok := pingPayloadLen(len(echo))
+	if !ok {
+		return nil, fmt.Errorf("PING payload length overflows int")
+	}
 	if total > maxPayload {
 		return nil, fmt.Errorf("PING payload %d exceeds control payload limit %d", total, maxPayload)
 	}

@@ -327,6 +327,120 @@ func TestJoinedConnPauseHandlesCanSwapAndDetachHalves(t *testing.T) {
 	}
 }
 
+func TestJoinedConnPausedReadHandleSerializesResumeAndSet(t *testing.T) {
+	t.Parallel()
+
+	read := &addrOnlyReadHalf{}
+	conn := JoinConn(read, nil)
+	pause, err := conn.PauseRead(context.Background())
+	if err != nil {
+		t.Fatalf("PauseRead: %v", err)
+	}
+
+	replacement := &blockingDeadlineReadHalf{
+		setStarted: make(chan struct{}, 1),
+		releaseSet: make(chan struct{}),
+	}
+	if prev := pause.Set(replacement); prev != read {
+		t.Fatal("PauseRead Set did not return previous read half")
+	}
+
+	resumeDone := make(chan error, 1)
+	go func() { resumeDone <- pause.Resume() }()
+	select {
+	case <-replacement.setStarted:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Resume did not start replaying read deadline")
+	}
+
+	setDone := make(chan ReadHalf, 1)
+	next := &addrOnlyReadHalf{}
+	go func() { setDone <- pause.Set(next) }()
+	select {
+	case <-setDone:
+		t.Fatal("Set returned while Resume was still using the pause handle")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(replacement.releaseSet)
+	select {
+	case err := <-resumeDone:
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Resume did not finish after deadline replay was released")
+	}
+	select {
+	case prev := <-setDone:
+		if prev != replacement {
+			t.Fatal("Set after Resume returned the wrong previous read half")
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Set did not finish after Resume completed")
+	}
+	if conn.ReadHalf() != replacement {
+		t.Fatal("Resume did not attach the serialized read half")
+	}
+}
+
+func TestJoinedConnPausedWriteHandleSerializesResumeAndSet(t *testing.T) {
+	t.Parallel()
+
+	write := &addrOnlyWriteHalf{}
+	conn := JoinConn(nil, write)
+	pause, err := conn.PauseWrite(context.Background())
+	if err != nil {
+		t.Fatalf("PauseWrite: %v", err)
+	}
+
+	replacement := &blockingDeadlineWriteHalf{
+		setStarted: make(chan struct{}, 1),
+		releaseSet: make(chan struct{}),
+	}
+	if prev := pause.Set(replacement); prev != write {
+		t.Fatal("PauseWrite Set did not return previous write half")
+	}
+
+	resumeDone := make(chan error, 1)
+	go func() { resumeDone <- pause.Resume() }()
+	select {
+	case <-replacement.setStarted:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Resume did not start replaying write deadline")
+	}
+
+	setDone := make(chan WriteHalf, 1)
+	next := &addrOnlyWriteHalf{}
+	go func() { setDone <- pause.Set(next) }()
+	select {
+	case <-setDone:
+		t.Fatal("Set returned while Resume was still using the pause handle")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(replacement.releaseSet)
+	select {
+	case err := <-resumeDone:
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Resume did not finish after deadline replay was released")
+	}
+	select {
+	case prev := <-setDone:
+		if prev != replacement {
+			t.Fatal("Set after Resume returned the wrong previous write half")
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Set did not finish after Resume completed")
+	}
+	if conn.WriteHalf() != replacement {
+		t.Fatal("Resume did not attach the serialized write half")
+	}
+}
+
 func TestJoinedConnBridgesUniStreamsAsNetConn(t *testing.T) {
 	t.Parallel()
 

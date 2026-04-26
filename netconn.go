@@ -70,6 +70,7 @@ type JoinedConn struct {
 
 // PausedReadHalf owns a detached read half until Resume reattaches it.
 type PausedReadHalf struct {
+	mu      sync.Mutex
 	conn    *JoinedConn
 	current ReadHalf
 	resumed bool
@@ -77,6 +78,7 @@ type PausedReadHalf struct {
 
 // PausedWriteHalf owns a detached write half until Resume reattaches it.
 type PausedWriteHalf struct {
+	mu      sync.Mutex
 	conn    *JoinedConn
 	current WriteHalf
 	resumed bool
@@ -450,6 +452,8 @@ func (p *PausedReadHalf) Current() ReadHalf {
 	if p == nil {
 		return nil
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.current
 }
 
@@ -459,6 +463,8 @@ func (p *PausedReadHalf) Set(next ReadHalf) ReadHalf {
 	if p == nil {
 		return nil
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	prev := p.current
 	p.current = next
 	return prev
@@ -469,6 +475,8 @@ func (p *PausedReadHalf) Resume() error {
 	if p == nil || p.conn == nil {
 		return ErrSessionClosed
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.resumed {
 		return nil
 	}
@@ -513,6 +521,8 @@ func (p *PausedWriteHalf) Current() WriteHalf {
 	if p == nil {
 		return nil
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.current
 }
 
@@ -522,6 +532,8 @@ func (p *PausedWriteHalf) Set(next WriteHalf) WriteHalf {
 	if p == nil {
 		return nil
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	prev := p.current
 	p.current = next
 	return prev
@@ -532,6 +544,8 @@ func (p *PausedWriteHalf) Resume() error {
 	if p == nil || p.conn == nil {
 		return ErrSessionClosed
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.resumed {
 		return nil
 	}
