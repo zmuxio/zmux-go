@@ -1823,6 +1823,100 @@ func (c *scriptedDuplexConn) bytes() []byte {
 	return append([]byte(nil), c.written.Bytes()...)
 }
 
+type recordingDeadlineDuplexConn struct {
+	*scriptedDuplexConn
+	mu        sync.Mutex
+	deadlines []time.Time
+}
+
+func newRecordingDeadlineDuplexConn(inbound []byte) *recordingDeadlineDuplexConn {
+	return &recordingDeadlineDuplexConn{
+		scriptedDuplexConn: newScriptedDuplexConn(inbound),
+	}
+}
+
+func (c *recordingDeadlineDuplexConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadlines = append(c.deadlines, t)
+	return nil
+}
+
+func (c *recordingDeadlineDuplexConn) snapshotWriteDeadlines() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.deadlines...)
+}
+
+type deadlineBlockingConn struct {
+	readMu         sync.Mutex
+	readBuf        *bytes.Reader
+	mu             sync.Mutex
+	writeDeadline  time.Time
+	deadlineNotify chan struct{}
+	writeStarted   chan struct{}
+	writeDone      chan struct{}
+	startOnce      sync.Once
+	doneOnce       sync.Once
+}
+
+func newDeadlineBlockingConn(inbound []byte) *deadlineBlockingConn {
+	return &deadlineBlockingConn{
+		readBuf:        bytes.NewReader(inbound),
+		deadlineNotify: make(chan struct{}),
+		writeStarted:   make(chan struct{}),
+		writeDone:      make(chan struct{}),
+	}
+}
+
+func (c *deadlineBlockingConn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if c.readBuf == nil {
+		return 0, io.EOF
+	}
+	return c.readBuf.Read(p)
+}
+
+func (c *deadlineBlockingConn) Write(_ []byte) (int, error) {
+	c.startOnce.Do(func() { close(c.writeStarted) })
+	defer c.doneOnce.Do(func() { close(c.writeDone) })
+	for {
+		c.mu.Lock()
+		deadline := c.writeDeadline
+		notifyCh := c.deadlineNotify
+		c.mu.Unlock()
+		if deadline.IsZero() {
+			<-notifyCh
+			continue
+		}
+		delay := time.Until(deadline)
+		if delay <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+			return 0, os.ErrDeadlineExceeded
+		case <-notifyCh:
+			stopTimer(timer)
+		}
+	}
+}
+
+func (c *deadlineBlockingConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writeDeadline = t
+	close(c.deadlineNotify)
+	c.deadlineNotify = make(chan struct{})
+	return nil
+}
+
+func (c *deadlineBlockingConn) Close() error {
+	return nil
+}
+
 func establishmentFramesAfterPreface(t *testing.T, raw []byte, prefaceLen int) []Frame {
 	t.Helper()
 	if len(raw) < prefaceLen {
@@ -1863,7 +1957,7 @@ func TestFinishEstablishmentFailureWaitsForLocalPrefaceWriteBeforeFatalClose(t *
 	writeErrCh := make(chan error, 1)
 	writeErrCh <- nil
 
-	finishEstablishmentFailure(conn, writeErrCh, local, nil, wireError(CodeProtocol, "parse preface", errInvalidRole))
+	finishEstablishmentFailure(conn, writeErrCh, establishmentWriteDeadline{}, local, nil, wireError(CodeProtocol, "parse preface", errInvalidRole))
 
 	frames := decodeFramesForTest(t, conn.bytes())
 	if len(frames) != 1 {
@@ -1975,6 +2069,56 @@ func TestClientEstablishmentRoleConflictEmitsFatalClose(t *testing.T) {
 	}
 	if code != uint64(CodeRoleConflict) {
 		t.Fatalf("close code = %d, want %d", code, uint64(CodeRoleConflict))
+	}
+}
+
+func TestClientEstablishmentClearsTemporaryWriteDeadlineOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	conn := newRecordingDeadlineDuplexConn(testPrefaceBytesForRole(t, RoleResponder))
+	client, err := Client(conn, nil)
+	if err != nil {
+		t.Fatalf("Client err = %v, want nil", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	got := conn.snapshotWriteDeadlines()
+	if len(got) < 2 {
+		t.Fatalf("write deadline calls = %d, want at least arm+clear", len(got))
+	}
+	if got[0].IsZero() {
+		t.Fatal("initial establishment write deadline was not armed")
+	}
+	if !got[len(got)-1].IsZero() {
+		t.Fatalf("final write deadline = %v, want cleared zero deadline", got[len(got)-1])
+	}
+}
+
+func TestClientEstablishmentWriteDeadlineBoundsBlockedPrefaceWriter(t *testing.T) {
+	t.Parallel()
+
+	conn := newDeadlineBlockingConn(testPrefaceBytesForRole(t, RoleResponder))
+	client, err := Client(conn, nil)
+	if client != nil {
+		_ = client.Close()
+		t.Fatal("expected client establish to fail after blocked local preface write")
+	}
+	if !errors.Is(err, errEstablishmentPrefaceWriteTimeout) {
+		t.Fatalf("Client err = %v, want establishment preface write timeout", err)
+	}
+
+	select {
+	case <-conn.writeStarted:
+	default:
+		t.Fatal("local preface write never started")
+	}
+
+	select {
+	case <-conn.writeDone:
+	case <-time.After(establishmentSuccessWriteWait + testSignalTimeout):
+		t.Fatal("blocked local preface write did not exit after establishment deadline")
 	}
 }
 

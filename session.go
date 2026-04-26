@@ -1425,6 +1425,53 @@ const establishmentSuccessWriteWait = time.Second
 
 var errEstablishmentPrefaceWriteTimeout = errors.New("local preface write stalled during establishment")
 
+type writeDeadlineSetter interface {
+	SetWriteDeadline(time.Time) error
+}
+
+type establishmentWriteDeadline struct {
+	setter writeDeadlineSetter
+	armed  bool
+}
+
+func beginEstablishmentWriteDeadline(conn io.ReadWriteCloser, timeout time.Duration) establishmentWriteDeadline {
+	if timeout <= 0 || conn == nil {
+		return establishmentWriteDeadline{}
+	}
+	setter, ok := conn.(writeDeadlineSetter)
+	if !ok {
+		return establishmentWriteDeadline{}
+	}
+	if err := setter.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return establishmentWriteDeadline{}
+	}
+	return establishmentWriteDeadline{setter: setter, armed: true}
+}
+
+func (d establishmentWriteDeadline) clear() error {
+	if !d.armed || d.setter == nil {
+		return nil
+	}
+	return d.setter.SetWriteDeadline(time.Time{})
+}
+
+func (d establishmentWriteDeadline) expedite() {
+	if !d.armed || d.setter == nil {
+		return
+	}
+	_ = d.setter.SetWriteDeadline(time.Now())
+}
+
+func normalizeEstablishmentWriteErr(err error, deadline establishmentWriteDeadline) error {
+	if err == nil {
+		return nil
+	}
+	if deadline.armed && errors.Is(err, os.ErrDeadlineExceeded) {
+		return errEstablishmentPrefaceWriteTimeout
+	}
+	return err
+}
+
 func waitEstablishmentWrite(writeErrCh <-chan error, timeout time.Duration) error {
 	if writeErrCh == nil {
 		return nil
@@ -1456,11 +1503,13 @@ func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer
 	_ = conn.Close()
 }
 
-func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error, local Preface, peer *Preface, err error) {
+func finishEstablishmentFailure(conn io.ReadWriteCloser, writeErrCh <-chan error, writeDeadline establishmentWriteDeadline, local Preface, peer *Preface, err error) {
 	if conn == nil {
 		return
 	}
+	writeDeadline.expedite()
 	if writeErr := waitEstablishmentWrite(writeErrCh, establishmentFailureWriteWait); writeErr == nil {
+		_ = writeDeadline.clear()
 		closeAfterEstablishmentFailure(conn, local, peer, err)
 		return
 	}
@@ -2147,25 +2196,30 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 
 	reader := bufio.NewReaderSize(conn, connReadBufferSize)
 	writeErrCh := make(chan error, 1)
+	writeDeadline := beginEstablishmentWriteDeadline(conn, establishmentSuccessWriteWait)
 	go func() { writeErrCh <- rt.WriteAll(conn, payload) }()
 
 	peer, readErr := ReadPreface(reader)
 	if readErr != nil {
-		finishEstablishmentFailure(conn, writeErrCh, local, nil, readErr)
+		finishEstablishmentFailure(conn, writeErrCh, writeDeadline, local, nil, readErr)
 		return nil, readErr
 	}
 
 	negotiated, err := NegotiatePrefaces(local, peer)
 	if err != nil {
-		finishEstablishmentFailure(conn, writeErrCh, local, &peer, err)
+		finishEstablishmentFailure(conn, writeErrCh, writeDeadline, local, &peer, err)
 		return nil, err
 	}
-	if writeErr := waitEstablishmentWrite(writeErrCh, establishmentSuccessWriteWait); writeErr != nil {
+	if writeErr := normalizeEstablishmentWriteErr(waitEstablishmentWrite(writeErrCh, establishmentSuccessWriteWait), writeDeadline); writeErr != nil {
 		_ = conn.Close()
 		if errors.Is(writeErr, errEstablishmentPrefaceWriteTimeout) {
 			return nil, wireError(CodeInternal, "write preface", writeErr)
 		}
 		return nil, writeErr
+	}
+	if err := writeDeadline.clear(); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 
 	now := time.Now()

@@ -209,6 +209,42 @@ func TestJoinedConnHalfAccessors(t *testing.T) {
 	}
 }
 
+func TestJoinedConnSteadyStateDoesNotRotateNotifyChannelsWithoutWaiters(t *testing.T) {
+	t.Parallel()
+
+	conn := JoinConn(&addrOnlyReadHalf{}, &addrOnlyWriteHalf{})
+	conn.mu.Lock()
+	readNotify := conn.readNotify
+	writeNotify := conn.writeNotify
+	conn.mu.Unlock()
+
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read err = %v, want EOF", err)
+	}
+	if _, err := conn.Write([]byte("x")); err != nil {
+		t.Fatalf("Write err = %v, want nil", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		t.Fatalf("SetReadDeadline err = %v, want nil", err)
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		t.Fatalf("SetWriteDeadline err = %v, want nil", err)
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.readNotify != readNotify {
+		t.Fatal("read notify channel rotated without blocked readers")
+	}
+	if conn.writeNotify != writeNotify {
+		t.Fatal("write notify channel rotated without blocked writers")
+	}
+	if conn.readWaiters != 0 || conn.writeWaiters != 0 {
+		t.Fatalf("waiter counts = (%d, %d), want zero", conn.readWaiters, conn.writeWaiters)
+	}
+}
+
 func TestJoinedConnPauseHandlesCanSwapAndDetachHalves(t *testing.T) {
 	t.Parallel()
 

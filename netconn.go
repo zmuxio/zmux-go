@@ -57,6 +57,8 @@ type JoinedConn struct {
 	activeWriteOps         int
 	activeReadDeadlineOps  int
 	activeWriteDeadlineOps int
+	readWaiters            int
+	writeWaiters           int
 
 	readDeadline     time.Time
 	writeDeadline    time.Time
@@ -115,11 +117,25 @@ func (c *JoinedConn) WriteHalf() WriteHalf {
 }
 
 func (c *JoinedConn) broadcastReadLocked() {
+	if c.readNotify == nil {
+		c.readNotify = make(chan struct{})
+		return
+	}
+	if c.readWaiters == 0 {
+		return
+	}
 	close(c.readNotify)
 	c.readNotify = make(chan struct{})
 }
 
 func (c *JoinedConn) broadcastWriteLocked() {
+	if c.writeNotify == nil {
+		c.writeNotify = make(chan struct{})
+		return
+	}
+	if c.writeWaiters == 0 {
+		return
+	}
 	close(c.writeNotify)
 	c.writeNotify = make(chan struct{})
 }
@@ -133,6 +149,30 @@ func (c *JoinedConn) initLocked() {
 	}
 	if c.closedCh == nil {
 		c.closedCh = make(chan struct{})
+	}
+}
+
+func (c *JoinedConn) beginReadWaitLocked() (<-chan struct{}, <-chan struct{}, time.Time) {
+	c.initLocked()
+	c.readWaiters++
+	return c.readNotify, c.closedCh, c.readDeadline
+}
+
+func (c *JoinedConn) endReadWaitLocked() {
+	if c.readWaiters > 0 {
+		c.readWaiters--
+	}
+}
+
+func (c *JoinedConn) beginWriteWaitLocked() (<-chan struct{}, <-chan struct{}, time.Time) {
+	c.initLocked()
+	c.writeWaiters++
+	return c.writeNotify, c.closedCh, c.writeDeadline
+}
+
+func (c *JoinedConn) endWriteWaitLocked() {
+	if c.writeWaiters > 0 {
+		c.writeWaiters--
 	}
 }
 
@@ -540,9 +580,13 @@ func (c *JoinedConn) enterRead() (ReadHalf, error) {
 			c.mu.Unlock()
 			return nil, ErrSessionClosed
 		case c.readPaused:
-			notifyCh, closedCh, deadline := c.readNotify, c.closedCh, c.readDeadline
+			notifyCh, closedCh, deadline := c.beginReadWaitLocked()
 			c.mu.Unlock()
-			if err := waitJoinedStateLocal(notifyCh, closedCh, deadline); err != nil {
+			err := waitJoinedStateLocal(notifyCh, closedCh, deadline)
+			c.mu.Lock()
+			c.endReadWaitLocked()
+			c.mu.Unlock()
+			if err != nil {
 				return nil, err
 			}
 		default:
@@ -572,9 +616,13 @@ func (c *JoinedConn) enterWrite() (WriteHalf, error) {
 			c.mu.Unlock()
 			return nil, ErrSessionClosed
 		case c.writePaused:
-			notifyCh, closedCh, deadline := c.writeNotify, c.closedCh, c.writeDeadline
+			notifyCh, closedCh, deadline := c.beginWriteWaitLocked()
 			c.mu.Unlock()
-			if err := waitJoinedStateLocal(notifyCh, closedCh, deadline); err != nil {
+			err := waitJoinedStateLocal(notifyCh, closedCh, deadline)
+			c.mu.Lock()
+			c.endWriteWaitLocked()
+			c.mu.Unlock()
+			if err != nil {
 				return nil, err
 			}
 		default:
@@ -669,9 +717,13 @@ func (c *JoinedConn) pauseReadHalf(ctx context.Context) (ReadHalf, error) {
 			c.mu.Unlock()
 			return nil, ErrSessionClosed
 		case !ownedPause && c.readPaused:
-			notifyCh, closedCh := c.readNotify, c.closedCh
+			notifyCh, closedCh, _ := c.beginReadWaitLocked()
 			c.mu.Unlock()
-			if err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{}); err != nil {
+			err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{})
+			c.mu.Lock()
+			c.endReadWaitLocked()
+			c.mu.Unlock()
+			if err != nil {
 				return nil, err
 			}
 		case !ownedPause:
@@ -686,10 +738,12 @@ func (c *JoinedConn) pauseReadHalf(ctx context.Context) (ReadHalf, error) {
 			c.mu.Unlock()
 			return current, nil
 		default:
-			notifyCh, closedCh := c.readNotify, c.closedCh
+			notifyCh, closedCh, _ := c.beginReadWaitLocked()
 			c.mu.Unlock()
-			if err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{}); err != nil {
-				c.mu.Lock()
+			err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{})
+			c.mu.Lock()
+			c.endReadWaitLocked()
+			if err != nil {
 				if ownedPause && !c.closed {
 					c.readPaused = false
 					c.broadcastReadLocked()
@@ -697,6 +751,7 @@ func (c *JoinedConn) pauseReadHalf(ctx context.Context) (ReadHalf, error) {
 				c.mu.Unlock()
 				return nil, err
 			}
+			c.mu.Unlock()
 		}
 	}
 }
@@ -713,9 +768,13 @@ func (c *JoinedConn) pauseWriteHalf(ctx context.Context) (WriteHalf, error) {
 			c.mu.Unlock()
 			return nil, ErrSessionClosed
 		case !ownedPause && c.writePaused:
-			notifyCh, closedCh := c.writeNotify, c.closedCh
+			notifyCh, closedCh, _ := c.beginWriteWaitLocked()
 			c.mu.Unlock()
-			if err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{}); err != nil {
+			err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{})
+			c.mu.Lock()
+			c.endWriteWaitLocked()
+			c.mu.Unlock()
+			if err != nil {
 				return nil, err
 			}
 		case !ownedPause:
@@ -730,10 +789,12 @@ func (c *JoinedConn) pauseWriteHalf(ctx context.Context) (WriteHalf, error) {
 			c.mu.Unlock()
 			return current, nil
 		default:
-			notifyCh, closedCh := c.writeNotify, c.closedCh
+			notifyCh, closedCh, _ := c.beginWriteWaitLocked()
 			c.mu.Unlock()
-			if err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{}); err != nil {
-				c.mu.Lock()
+			err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{})
+			c.mu.Lock()
+			c.endWriteWaitLocked()
+			if err != nil {
 				if ownedPause && !c.closed {
 					c.writePaused = false
 					c.broadcastWriteLocked()
@@ -741,6 +802,7 @@ func (c *JoinedConn) pauseWriteHalf(ctx context.Context) (WriteHalf, error) {
 				c.mu.Unlock()
 				return nil, err
 			}
+			c.mu.Unlock()
 		}
 	}
 }
