@@ -1116,14 +1116,31 @@ func newWrappedPair(t *testing.T) (zmux.Session, zmux.Session) {
 	t.Helper()
 
 	clientConn, serverConn := newQUICConnPair(t)
-	return WrapSession(clientConn), WrapSession(serverConn)
+	client, server := WrapSession(clientConn), WrapSession(serverConn)
+	cleanupWrappedPair(t, client, server)
+	return client, server
 }
 
 func newWrappedPairWithOptions(t *testing.T, clientOpts, serverOpts SessionOptions) (zmux.Session, zmux.Session) {
 	t.Helper()
 
 	clientConn, serverConn := newQUICConnPair(t)
-	return WrapSessionWithOptions(clientConn, clientOpts), WrapSessionWithOptions(serverConn, serverOpts)
+	client, server := WrapSessionWithOptions(clientConn, clientOpts), WrapSessionWithOptions(serverConn, serverOpts)
+	cleanupWrappedPair(t, client, server)
+	return client, server
+}
+
+func cleanupWrappedPair(t *testing.T, client, server zmux.Session) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = client.Wait(ctx)
+		_ = server.Wait(ctx)
+	})
 }
 
 func newQUICConnPair(t *testing.T) (*quic.Conn, *quic.Conn) {

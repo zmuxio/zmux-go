@@ -11,7 +11,7 @@ func TestBatchSchedulerTrackAndUntrackExplicitGroup(t *testing.T) {
 			GroupFinishTag:   map[GroupKey]uint64{{Kind: 1, Value: 7}: 13},
 			GroupLastService: map[GroupKey]uint64{{Kind: 1, Value: 7}: 3},
 		},
-		ActiveGroupRefs: map[uint64]uint32{7: 2},
+		ActiveGroupRefs: map[uint64]uint64{7: 2},
 	}
 
 	s.TrackExplicitGroup(9)
@@ -117,7 +117,7 @@ func TestBatchSchedulerClearResetsSchedulerOwnership(t *testing.T) {
 			ServiceSeq:      4,
 			StreamFinishTag: map[uint64]uint64{4: 1},
 		},
-		ActiveGroupRefs: map[uint64]uint32{7: 1},
+		ActiveGroupRefs: map[uint64]uint64{7: 1},
 	}
 
 	s.Clear()
@@ -140,7 +140,7 @@ func TestBatchSchedulerTrackedExplicitGroupCountIgnoresFallbackAndZero(t *testin
 	t.Parallel()
 
 	s := BatchScheduler{
-		ActiveGroupRefs: map[uint64]uint32{
+		ActiveGroupRefs: map[uint64]uint64{
 			0:                   1,
 			7:                   2,
 			9:                   1,
@@ -150,5 +150,23 @@ func TestBatchSchedulerTrackedExplicitGroupCountIgnoresFallbackAndZero(t *testin
 
 	if got := s.TrackedExplicitGroupCount(); got != 2 {
 		t.Fatalf("TrackedExplicitGroupCount() = %d, want 2", got)
+	}
+}
+
+func TestBatchSchedulerExplicitGroupRefsDoNotWrapAtUint32(t *testing.T) {
+	t.Parallel()
+
+	s := BatchScheduler{
+		ActiveGroupRefs: map[uint64]uint64{7: uint64(^uint32(0))},
+	}
+
+	s.TrackExplicitGroup(7)
+	if got, want := s.ActiveGroupRefs[7], uint64(^uint32(0))+1; got != want {
+		t.Fatalf("active group refs after uint32 boundary = %d, want %d", got, want)
+	}
+
+	s.UntrackExplicitGroup(7)
+	if got, want := s.ActiveGroupRefs[7], uint64(^uint32(0)); got != want {
+		t.Fatalf("active group refs after untrack = %d, want %d", got, want)
 	}
 }

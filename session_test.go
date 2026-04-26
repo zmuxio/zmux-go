@@ -3986,7 +3986,7 @@ func TestAbortClearsStreamsAndSessionPendingState(t *testing.T) {
 	c.registry.activePeerBidi = 3
 	c.registry.activePeerUni = 2
 	c.writer.scheduler = rt.BatchScheduler{
-		ActiveGroupRefs: map[uint64]uint32{7: 1},
+		ActiveGroupRefs: map[uint64]uint64{7: 1},
 		State: rt.BatchState{
 			RootVirtualTime:   23,
 			ServiceSeq:        17,
@@ -20222,7 +20222,7 @@ func newStateFixtureEnv(t *testing.T, fixture stateFixture) *stateFixtureEnv {
 		c.registry.activePeerBidi = 3
 		c.registry.activePeerUni = 2
 		c.writer.scheduler = rt.BatchScheduler{
-			ActiveGroupRefs: map[uint64]uint32{7: 1},
+			ActiveGroupRefs: map[uint64]uint64{7: 1},
 			State: rt.BatchState{
 				RootVirtualTime:   23,
 				ServiceSeq:        17,

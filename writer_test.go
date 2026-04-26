@@ -1253,7 +1253,7 @@ func TestSetStreamGroupLockedReleasesOldExplicitGroupStateWhenLastTracked(t *tes
 
 		writer: connWriterRuntimeState{
 			scheduler: rt.BatchScheduler{
-				ActiveGroupRefs: map[uint64]uint32{7: 1},
+				ActiveGroupRefs: map[uint64]uint64{7: 1},
 				State: rt.BatchState{
 					GroupVirtualTime: map[rt.GroupKey]uint64{{Kind: 1, Value: 7}: 11},
 					GroupFinishTag:   map[rt.GroupKey]uint64{{Kind: 1, Value: 7}: 13},
@@ -1286,7 +1286,7 @@ func TestSetStreamGroupLockedPreservesSharedOldExplicitGroupState(t *testing.T) 
 
 		writer: connWriterRuntimeState{
 			scheduler: rt.BatchScheduler{
-				ActiveGroupRefs: map[uint64]uint32{7: 2},
+				ActiveGroupRefs: map[uint64]uint64{7: 2},
 				State: rt.BatchState{
 					GroupVirtualTime: map[rt.GroupKey]uint64{{Kind: 1, Value: 7}: 11},
 					GroupFinishTag:   map[rt.GroupKey]uint64{{Kind: 1, Value: 7}: 13},
@@ -1337,7 +1337,7 @@ func TestSetStreamGroupLockedTracksOverflowGroupInFallbackBucket(t *testing.T) {
 
 		writer: connWriterRuntimeState{
 			scheduler: rt.BatchScheduler{
-				ActiveGroupRefs: make(map[uint64]uint32),
+				ActiveGroupRefs: make(map[uint64]uint64),
 			},
 		}, config: connConfigState{peer: Preface{Settings: Settings{SchedulerHints: SchedulerGroupFair}}},
 	}
@@ -1367,7 +1367,7 @@ func TestSetSendFinDropsExplicitGroupTracking(t *testing.T) {
 	c := &Conn{
 		writer: connWriterRuntimeState{
 			scheduler: rt.BatchScheduler{
-				ActiveGroupRefs: map[uint64]uint32{7: 1},
+				ActiveGroupRefs: map[uint64]uint64{7: 1},
 				State: rt.BatchState{
 					GroupVirtualTime: map[rt.GroupKey]uint64{{Kind: 1, Value: 7}: 11},
 					GroupFinishTag:   map[rt.GroupKey]uint64{{Kind: 1, Value: 7}: 13},

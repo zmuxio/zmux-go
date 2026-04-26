@@ -10,7 +10,7 @@ import "github.com/zmuxio/zmux-go/internal/wire"
 // the ongoing structural refactor.
 type BatchScheduler struct {
 	State           BatchState
-	ActiveGroupRefs map[uint64]uint32
+	ActiveGroupRefs map[uint64]uint64
 }
 
 func NewBatchScheduler() BatchScheduler {
@@ -53,7 +53,7 @@ func (s *BatchScheduler) TrackExplicitGroup(groupID uint64) {
 		return
 	}
 	if s.ActiveGroupRefs == nil {
-		s.ActiveGroupRefs = make(map[uint64]uint32)
+		s.ActiveGroupRefs = make(map[uint64]uint64)
 	}
 	s.ActiveGroupRefs[groupID]++
 }
