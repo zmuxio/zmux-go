@@ -494,6 +494,8 @@ func groupBuildSlice(state *BatchState, capHint int) []batchBuiltGroup {
 	}
 	if batchScratchOversized(cap(state.scratch.groups), capHint) {
 		state.scratch.groups = nil
+	} else if cap(state.scratch.groups) > 0 {
+		clear(state.scratch.groups[:cap(state.scratch.groups)])
 	}
 	if cap(state.scratch.groups) < capHint {
 		state.scratch.groups = make([]batchBuiltGroup, 0, capHint)
@@ -518,6 +520,20 @@ func nextGroupQueueMap(state *BatchState) map[uint64][]int {
 	state.scratch.groupQueues = append(state.scratch.groupQueues, out)
 	state.scratch.groupQueueCount++
 	return out
+}
+
+func clearUnusedGroupQueueMaps(state *BatchState) {
+	if state == nil {
+		return
+	}
+	for i := state.scratch.groupQueueCount; i < len(state.scratch.groupQueues); i++ {
+		queues := state.scratch.groupQueues[i]
+		if len(queues) == 0 {
+			continue
+		}
+		recycleGroupQueueEntrySlices(state, queues)
+		clear(queues)
+	}
 }
 
 func streamOrderMap(state *BatchState, capHint int) map[GroupKey][]uint64 {

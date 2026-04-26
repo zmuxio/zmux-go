@@ -88,6 +88,7 @@ func buildBatchGroups(state *BatchState, items []BatchItem) batchBuildResult {
 			streams: result.streamOrder[groupKey],
 		})
 	}
+	clearUnusedGroupQueueMaps(state)
 	return result
 }
 

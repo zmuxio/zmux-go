@@ -763,6 +763,48 @@ func TestBuildBatchGroupsDropsOversizedGroupQueueCache(t *testing.T) {
 	}
 }
 
+func TestBuildBatchGroupsClearsUnusedGroupQueueCaches(t *testing.T) {
+	t.Parallel()
+
+	state := &BatchState{}
+	var many []BatchItem
+	for i := 0; i < 4; i++ {
+		streamID := uint64(4 + i*4)
+		many = append(many, BatchItem{
+			Request: RequestMeta{
+				GroupKey:     GroupKey{Kind: 1, Value: uint64(i + 1)},
+				StreamID:     streamID,
+				StreamScoped: true,
+				Cost:         1,
+			},
+		})
+	}
+
+	prepared := buildBatchGroups(state, many)
+	if len(prepared.groups) != len(many) {
+		t.Fatalf("initial group count = %d, want %d", len(prepared.groups), len(many))
+	}
+	if len(state.scratch.groupQueues) < len(many) {
+		t.Fatalf("retained group queue cache len = %d, want at least %d", len(state.scratch.groupQueues), len(many))
+	}
+
+	prepared = buildBatchGroups(state, many[:1])
+	if len(prepared.groups) != 1 {
+		t.Fatalf("second group count = %d, want 1", len(prepared.groups))
+	}
+	for i := state.scratch.groupQueueCount; i < len(state.scratch.groupQueues); i++ {
+		if got := len(state.scratch.groupQueues[i]); got != 0 {
+			t.Fatalf("unused group queue map %d retained %d entries, want 0", i, got)
+		}
+	}
+	groupsBacking := state.scratch.groups[:cap(state.scratch.groups)]
+	for i := len(prepared.groups); i < len(groupsBacking); i++ {
+		if groupsBacking[i].queues != nil || groupsBacking[i].streams != nil {
+			t.Fatalf("unused group build slot %d retained refs: %#v", i, groupsBacking[i])
+		}
+	}
+}
+
 func TestBuildBatchGroupsDropsOversizedZeroLenEntryCaches(t *testing.T) {
 	t.Parallel()
 
