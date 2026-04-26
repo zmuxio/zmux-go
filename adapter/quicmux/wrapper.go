@@ -636,7 +636,13 @@ func (b *quicStreamBase) ensureOpenPrelude() error {
 	}
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()
+	return b.ensureOpenPreludeLocked()
+}
 
+func (b *quicStreamBase) ensureOpenPreludeLocked() error {
+	if b == nil || !b.sendPrelude || b.preludeWriter == nil {
+		return nil
+	}
 	prelude, err := b.prepareOpenPrelude()
 	if err != nil {
 		return err
@@ -667,6 +673,65 @@ func (b *quicStreamBase) ensureOpenPreludeWithContext(ctx context.Context, deadl
 	restore := installContextWriteDeadline(ctx, deadlineSetter)
 	defer restore()
 	return b.ensureOpenPrelude()
+}
+
+func (b *quicStreamBase) writePayload(writer io.Writer, p []byte) (int, error) {
+	if writer == nil {
+		return 0, zmux.ErrSessionClosed
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.localWriteClosed.Load() {
+		if err := b.loadLocalWriteErr(); err != nil {
+			return 0, err
+		}
+		return 0, zmux.ErrWriteClosed
+	}
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	if err := b.preferLocalWriteError(b.ensureOpenPreludeLocked()); err != nil {
+		return 0, err
+	}
+	if b.localWriteClosed.Load() {
+		if err := b.loadLocalWriteErr(); err != nil {
+			return 0, err
+		}
+		return 0, zmux.ErrWriteClosed
+	}
+	n, err := writer.Write(p)
+	if err != nil && b.localWriteClosed.Load() {
+		if localErr := b.loadLocalWriteErr(); localErr != nil {
+			return n, localErr
+		}
+		return n, zmux.ErrWriteClosed
+	}
+	return n, translateError(err)
+}
+
+func (b *quicStreamBase) closeWrite(closer interface{ Close() error }) error {
+	if closer == nil {
+		return zmux.ErrSessionClosed
+	}
+	if b.localWriteClosed.Load() {
+		return zmux.ErrWriteClosed
+	}
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	if b.localWriteClosed.Load() {
+		return zmux.ErrWriteClosed
+	}
+	if err := b.preferLocalWriteError(b.ensureOpenPreludeLocked()); err != nil {
+		return err
+	}
+	if b.localWriteClosed.Load() {
+		return zmux.ErrWriteClosed
+	}
+	b.localWriteClosed.Store(true)
+	if err := translateError(closer.Close()); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *quicStreamBase) hasPeerVisibleOpenMetadataLocked() bool {
@@ -784,32 +849,7 @@ func (s *quicStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if s.localWriteClosed.Load() {
-		if err := s.loadLocalWriteErr(); err != nil {
-			return 0, err
-		}
-		return 0, zmux.ErrWriteClosed
-	}
-	if err := s.preferLocalWriteError(s.ensureOpenPrelude()); err != nil {
-		return 0, err
-	}
-	if s.localWriteClosed.Load() {
-		if err := s.loadLocalWriteErr(); err != nil {
-			return 0, err
-		}
-		return 0, zmux.ErrWriteClosed
-	}
-	n, err := s.stream.Write(p)
-	if err != nil && s.localWriteClosed.Load() {
-		if localErr := s.loadLocalWriteErr(); localErr != nil {
-			return n, localErr
-		}
-		return n, zmux.ErrWriteClosed
-	}
-	return n, translateError(err)
+	return s.writePayload(s.stream, p)
 }
 
 func (s *quicStream) Close() error {
@@ -909,20 +949,7 @@ func (s *quicStream) CloseWrite() error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
-	if s.localWriteClosed.Load() {
-		return zmux.ErrWriteClosed
-	}
-	if err := s.preferLocalWriteError(s.ensureOpenPrelude()); err != nil {
-		return err
-	}
-	if s.localWriteClosed.Load() {
-		return zmux.ErrWriteClosed
-	}
-	s.localWriteClosed.Store(true)
-	if err := translateError(s.stream.Close()); err != nil {
-		return err
-	}
-	return nil
+	return s.closeWrite(s.stream)
 }
 
 func (s *quicStream) CancelWrite(code uint64) error {
@@ -980,32 +1007,7 @@ func (s *quicSendStream) Write(p []byte) (int, error) {
 	if s == nil || s.stream == nil {
 		return 0, zmux.ErrSessionClosed
 	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if s.localWriteClosed.Load() {
-		if err := s.loadLocalWriteErr(); err != nil {
-			return 0, err
-		}
-		return 0, zmux.ErrWriteClosed
-	}
-	if err := s.preferLocalWriteError(s.ensureOpenPrelude()); err != nil {
-		return 0, err
-	}
-	if s.localWriteClosed.Load() {
-		if err := s.loadLocalWriteErr(); err != nil {
-			return 0, err
-		}
-		return 0, zmux.ErrWriteClosed
-	}
-	n, err := s.stream.Write(p)
-	if err != nil && s.localWriteClosed.Load() {
-		if localErr := s.loadLocalWriteErr(); localErr != nil {
-			return n, localErr
-		}
-		return n, zmux.ErrWriteClosed
-	}
-	return n, translateError(err)
+	return s.writePayload(s.stream, p)
 }
 
 func (s *quicSendStream) WriteFinal(p []byte) (int, error) {
@@ -1032,20 +1034,7 @@ func (s *quicSendStream) CloseWrite() error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
-	if s.localWriteClosed.Load() {
-		return zmux.ErrWriteClosed
-	}
-	if err := s.preferLocalWriteError(s.ensureOpenPrelude()); err != nil {
-		return err
-	}
-	if s.localWriteClosed.Load() {
-		return zmux.ErrWriteClosed
-	}
-	s.localWriteClosed.Store(true)
-	if err := translateError(s.stream.Close()); err != nil {
-		return err
-	}
-	return nil
+	return s.closeWrite(s.stream)
 }
 
 func (s *quicSendStream) CancelWrite(code uint64) error {

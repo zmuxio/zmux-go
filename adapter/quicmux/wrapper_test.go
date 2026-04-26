@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"os"
@@ -811,6 +812,52 @@ func TestEnsureOpenPreludeWithContextCancelsBlockedWrite(t *testing.T) {
 	}
 }
 
+func TestWritePayloadAndCloseWriteSerializeUnderlyingClose(t *testing.T) {
+	writer := newConcurrentDetectWriteCloser()
+	base := &quicStreamBase{
+		sendPrelude: false,
+		preludeSent: true,
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		n, err := base.writePayload(writer, []byte("x"))
+		if err == nil && n != 1 {
+			err = fmt.Errorf("write n = %d, want 1", n)
+		}
+		writeDone <- err
+	}()
+
+	<-writer.writeStarted
+	closeStarted := make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeDone <- base.closeWrite(writer)
+	}()
+	<-closeStarted
+
+	select {
+	case <-writer.closeCalled:
+		t.Fatal("underlying Close ran concurrently with Write")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(writer.releaseWrite)
+	if err := <-writeDone; err != nil {
+		t.Fatalf("writePayload err = %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("closeWrite err = %v", err)
+	}
+	if writer.concurrent() {
+		t.Fatal("underlying writer observed concurrent Write and Close")
+	}
+	if !base.localWriteClosed.Load() {
+		t.Fatal("localWriteClosed = false, want true")
+	}
+}
+
 func TestInstallContextWriteDeadlineDoesNotLeaveStaleExpiredDeadline(t *testing.T) {
 	setter := newBlockedWriteDeadlineSetter()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1128,6 +1175,65 @@ func (w *partialPreludeWriter) Write(p []byte) (int, error) {
 		return n, w.failErr
 	}
 	return w.Buffer.Write(p)
+}
+
+type concurrentDetectWriteCloser struct {
+	mu           sync.Mutex
+	active       bool
+	overlap      bool
+	writeStarted chan struct{}
+	releaseWrite chan struct{}
+	closeCalled  chan struct{}
+	writeOnce    sync.Once
+	closeOnce    sync.Once
+}
+
+func newConcurrentDetectWriteCloser() *concurrentDetectWriteCloser {
+	return &concurrentDetectWriteCloser{
+		writeStarted: make(chan struct{}),
+		releaseWrite: make(chan struct{}),
+		closeCalled:  make(chan struct{}),
+	}
+}
+
+func (w *concurrentDetectWriteCloser) Write(p []byte) (int, error) {
+	w.enter()
+	w.writeOnce.Do(func() {
+		close(w.writeStarted)
+	})
+	<-w.releaseWrite
+	w.leave()
+	return len(p), nil
+}
+
+func (w *concurrentDetectWriteCloser) Close() error {
+	w.closeOnce.Do(func() {
+		close(w.closeCalled)
+	})
+	w.enter()
+	w.leave()
+	return nil
+}
+
+func (w *concurrentDetectWriteCloser) enter() {
+	w.mu.Lock()
+	if w.active {
+		w.overlap = true
+	}
+	w.active = true
+	w.mu.Unlock()
+}
+
+func (w *concurrentDetectWriteCloser) leave() {
+	w.mu.Lock()
+	w.active = false
+	w.mu.Unlock()
+}
+
+func (w *concurrentDetectWriteCloser) concurrent() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.overlap
 }
 
 type deadlineAwareWriter struct {

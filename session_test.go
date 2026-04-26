@@ -43,6 +43,51 @@ func testTxFramesFrom(frames []Frame) []txFrame {
 	return lowered
 }
 
+type recordingWriteDeadlineSetter struct {
+	mu        sync.Mutex
+	deadline  []time.Time
+	deadlineC chan struct{}
+}
+
+func newRecordingWriteDeadlineSetter() *recordingWriteDeadlineSetter {
+	return &recordingWriteDeadlineSetter{
+		deadlineC: make(chan struct{}, 8),
+	}
+}
+
+func (s *recordingWriteDeadlineSetter) SetWriteDeadline(t time.Time) error {
+	s.mu.Lock()
+	s.deadline = append(s.deadline, t)
+	s.mu.Unlock()
+	select {
+	case s.deadlineC <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (s *recordingWriteDeadlineSetter) deadlineCalls() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.deadline...)
+}
+
+func (s *recordingWriteDeadlineSetter) waitForNonZeroDeadline(t *testing.T) {
+	t.Helper()
+	deadline := time.After(testSignalTimeout)
+	for {
+		calls := s.deadlineCalls()
+		if len(calls) > 0 && !calls[len(calls)-1].IsZero() {
+			return
+		}
+		select {
+		case <-s.deadlineC:
+		case <-deadline:
+			t.Fatalf("timed out waiting for non-zero write deadline; calls=%v", calls)
+		}
+	}
+}
+
 func testPublicFrame(frame txFrame) Frame {
 	if frame.payloadKind == txPayloadFlat {
 		return Frame{
@@ -1990,6 +2035,61 @@ func TestConnPublicSessionAPIsAcceptNilContext(t *testing.T) {
 
 	if _, err := client.Ping(nilCtx, []byte("ok")); err != nil {
 		t.Fatalf("Ping(nil) err = %v, want nil", err)
+	}
+}
+
+func TestBeginContextWriteSetsDeadlineAndClears(t *testing.T) {
+	deadline := time.Now().Add(time.Hour)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	setter := newRecordingWriteDeadlineSetter()
+
+	writeCtx, err := beginContextWrite(ctx, setter)
+	if err != nil {
+		t.Fatalf("beginContextWrite err = %v", err)
+	}
+	if calls := setter.deadlineCalls(); len(calls) != 1 || !calls[0].Equal(deadline) {
+		t.Fatalf("deadline calls after begin = %v, want [%v]", calls, deadline)
+	}
+
+	writeCtx.clear()
+	calls := setter.deadlineCalls()
+	if len(calls) != 2 || !calls[1].IsZero() {
+		t.Fatalf("deadline calls after clear = %v, want trailing zero deadline", calls)
+	}
+}
+
+func TestBeginContextWriteCanceledContextDoesNotTouchDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	setter := newRecordingWriteDeadlineSetter()
+
+	if _, err := beginContextWrite(ctx, setter); !errors.Is(err, context.Canceled) {
+		t.Fatalf("beginContextWrite canceled err = %v, want %v", err, context.Canceled)
+	}
+	if calls := setter.deadlineCalls(); len(calls) != 0 {
+		t.Fatalf("deadline calls = %v, want none", calls)
+	}
+}
+
+func TestContextWriteMapsCancellationDeadlineError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	setter := newRecordingWriteDeadlineSetter()
+
+	writeCtx, err := beginContextWrite(ctx, setter)
+	if err != nil {
+		t.Fatalf("beginContextWrite err = %v", err)
+	}
+	cancel()
+	setter.waitForNonZeroDeadline(t)
+
+	if got := writeCtx.err(os.ErrDeadlineExceeded); !errors.Is(got, context.Canceled) {
+		t.Fatalf("contextWrite.err = %v, want %v", got, context.Canceled)
+	}
+	writeCtx.clear()
+	calls := setter.deadlineCalls()
+	if len(calls) < 2 || !calls[len(calls)-1].IsZero() {
+		t.Fatalf("deadline calls after clear = %v, want trailing zero deadline", calls)
 	}
 }
 

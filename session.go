@@ -465,7 +465,16 @@ func (c *Conn) OpenAndSendWithOptions(ctx context.Context, opts OpenOptions, p [
 	if err != nil {
 		return nil, 0, err
 	}
+	if len(p) == 0 {
+		return stream, 0, nil
+	}
+	writeCtx, err := beginContextWrite(ctx, stream)
+	if err != nil {
+		return stream, 0, err
+	}
+	defer writeCtx.clear()
 	n, err := stream.Write(p)
+	err = writeCtx.err(err)
 	return stream, n, err
 }
 
@@ -478,8 +487,89 @@ func (c *Conn) OpenUniAndSendWithOptions(ctx context.Context, opts OpenOptions, 
 	if err != nil {
 		return nil, 0, err
 	}
+	writeCtx, err := beginContextWrite(ctx, stream)
+	if err != nil {
+		return stream, 0, err
+	}
+	defer writeCtx.clear()
 	n, err := stream.WriteFinal(p)
+	err = writeCtx.err(err)
 	return stream, n, err
+}
+
+type contextWrite struct {
+	ctx         context.Context
+	setter      writeDeadlineSetter
+	stop        func() bool
+	done        chan struct{}
+	deadline    time.Time
+	deadlineSet bool
+}
+
+func beginContextWrite(ctx context.Context, setter writeDeadlineSetter) (contextWrite, error) {
+	ctx = contextOrBackground(ctx)
+	if setter == nil {
+		return contextWrite{}, ErrSessionClosed
+	}
+	select {
+	case <-ctx.Done():
+		return contextWrite{}, ctx.Err()
+	default:
+	}
+
+	cw := contextWrite{
+		ctx:    ctx,
+		setter: setter,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := setter.SetWriteDeadline(deadline); err != nil {
+			return contextWrite{}, err
+		}
+		cw.deadline = deadline
+		cw.deadlineSet = true
+	}
+	if ctx.Done() == nil {
+		return cw, nil
+	}
+
+	cw.done = make(chan struct{})
+	cw.stop = context.AfterFunc(ctx, func() {
+		_ = setter.SetWriteDeadline(time.Now())
+		close(cw.done)
+	})
+	select {
+	case <-ctx.Done():
+		cw.clear()
+		return contextWrite{}, ctx.Err()
+	default:
+		return cw, nil
+	}
+}
+
+func (w contextWrite) clear() {
+	callbackRan := false
+	if w.stop != nil {
+		if !w.stop() {
+			<-w.done
+			callbackRan = true
+		}
+	}
+	if w.setter != nil && (w.deadlineSet || callbackRan) {
+		_ = w.setter.SetWriteDeadline(time.Time{})
+	}
+}
+
+func (w contextWrite) err(err error) error {
+	if err == nil || !errors.Is(err, os.ErrDeadlineExceeded) {
+		return err
+	}
+	if ctxErr := w.ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if w.deadlineSet && !time.Now().Before(w.deadline) {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 
 func (c *Conn) openStream(ctx context.Context, arity streamArity, opts OpenOptions) (*nativeStream, error) {

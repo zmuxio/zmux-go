@@ -4850,6 +4850,46 @@ func TestOpenAndSendHonorsContextCancellationBeforeOpen(t *testing.T) {
 	}
 }
 
+func TestOpenAndSendHonorsContextDeadlineDuringFirstWrite(t *testing.T) {
+	t.Parallel()
+
+	serverCfg := DefaultConfig()
+	serverCfg.Settings.InitialMaxData = 0
+	serverCfg.Settings.InitialMaxStreamDataBidiPeerOpened = 0
+	client, _ := newConnPairWithConfig(t, nil, serverCfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	stream, n, err := client.OpenAndSend(ctx, []byte("hello"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("OpenAndSend err = %v, want context deadline exceeded", err)
+	}
+	if stream == nil || n != 0 {
+		t.Fatalf("OpenAndSend = (%v, %d, %v), want (stream, 0, deadline)", stream, n, err)
+	}
+}
+
+func TestOpenUniAndSendHonorsContextDeadlineDuringFinalWrite(t *testing.T) {
+	t.Parallel()
+
+	serverCfg := DefaultConfig()
+	serverCfg.Settings.InitialMaxData = 0
+	serverCfg.Settings.InitialMaxStreamDataUni = 0
+	client, _ := newConnPairWithConfig(t, nil, serverCfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	stream, n, err := client.OpenUniAndSend(ctx, []byte("hello"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("OpenUniAndSend err = %v, want context deadline exceeded", err)
+	}
+	if stream == nil || n != 0 {
+		t.Fatalf("OpenUniAndSend = (%v, %d, %v), want (stream, 0, deadline)", stream, n, err)
+	}
+}
+
 func BenchmarkStreamUpdateMetadataOpenerReuse(b *testing.B) {
 	conn := newMetadataBenchConn()
 	priority := uint64(7)
