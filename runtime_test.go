@@ -2093,7 +2093,7 @@ func establishmentFramesAfterPreface(t *testing.T, raw []byte, prefaceLen int) [
 func TestCloseAfterEstablishmentFailureWritesFatalClose(t *testing.T) {
 	t.Parallel()
 
-	conn := newScriptedDuplexConn(nil)
+	conn := newRecordingDeadlineDuplexConn(nil)
 	local := testPrefaceForRole(t, RoleInitiator)
 
 	closeAfterEstablishmentFailure(conn, local, nil, wireError(CodeProtocol, "parse preface", errInvalidRole))
@@ -2114,10 +2114,26 @@ func TestCloseAfterEstablishmentFailureWritesFatalClose(t *testing.T) {
 	}
 }
 
-func TestFinishEstablishmentFailureWaitsForLocalPrefaceWriteBeforeFatalClose(t *testing.T) {
+func TestCloseAfterEstablishmentFailureSkipsFatalCloseWithoutWriteDeadline(t *testing.T) {
 	t.Parallel()
 
 	conn := newScriptedDuplexConn(nil)
+	local := testPrefaceForRole(t, RoleInitiator)
+
+	closeAfterEstablishmentFailure(conn, local, nil, wireError(CodeProtocol, "parse preface", errInvalidRole))
+
+	if written := conn.bytes(); len(written) != 0 {
+		t.Fatalf("establishment wrote %d bytes without write deadline support, want 0", len(written))
+	}
+	if _, err := conn.Write([]byte{0}); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("conn Write after close err = %v, want %v", err, io.ErrClosedPipe)
+	}
+}
+
+func TestFinishEstablishmentFailureWaitsForLocalPrefaceWriteBeforeFatalClose(t *testing.T) {
+	t.Parallel()
+
+	conn := newRecordingDeadlineDuplexConn(nil)
 	local := testPrefaceForRole(t, RoleInitiator)
 	writeErrCh := make(chan error, 1)
 	writeErrCh <- nil
@@ -2164,7 +2180,7 @@ func TestClientEstablishmentInvalidPeerPrefaceEmitsFatalClose(t *testing.T) {
 	wantPreface := testPrefaceBytesForRole(t, RoleInitiator)
 	invalidPeer := append([]byte(nil), testPrefaceBytesForRole(t, RoleResponder)...)
 	invalidPeer[5] = 7
-	conn := newScriptedDuplexConn(invalidPeer)
+	conn := newRecordingDeadlineDuplexConn(invalidPeer)
 	client, err := Client(conn, nil)
 	if client != nil {
 		_ = client.Close()
@@ -2206,7 +2222,7 @@ func TestClientEstablishmentRoleConflictEmitsFatalClose(t *testing.T) {
 
 	wantPreface := testPrefaceBytesForRole(t, RoleInitiator)
 	conflictingPeer := testPrefaceBytesForRole(t, RoleInitiator)
-	conn := newScriptedDuplexConn(conflictingPeer)
+	conn := newRecordingDeadlineDuplexConn(conflictingPeer)
 	client, err := Client(conn, nil)
 	if client != nil {
 		_ = client.Close()

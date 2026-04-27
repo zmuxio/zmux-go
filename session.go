@@ -1627,11 +1627,13 @@ func closeAfterEstablishmentFailure(conn io.ReadWriteCloser, local Preface, peer
 	}
 	if err != nil {
 		closeDeadline := beginEstablishmentWriteDeadline(conn, establishmentFailureWriteWait)
-		emitErr := emitEstablishmentClose(conn, local, peer, err)
-		_ = closeDeadline.clear()
-		if emitErr == nil {
-			if delay := establishmentCloseDrainDelay(err); delay > 0 {
-				time.Sleep(delay)
+		if closeDeadline.armed {
+			emitErr := emitEstablishmentClose(conn, local, peer, err)
+			_ = closeDeadline.clear()
+			if emitErr == nil {
+				if delay := establishmentCloseDrainDelay(err); delay > 0 {
+					time.Sleep(delay)
+				}
 			}
 		}
 	}
