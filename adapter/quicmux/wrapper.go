@@ -177,6 +177,7 @@ func (c *quicActiveStreamCounters) add(kind quicActiveStreamKind) {
 		c.peerBidi.Add(1)
 	case quicActiveStreamPeerUni:
 		c.peerUni.Add(1)
+	default:
 	}
 }
 
@@ -193,6 +194,7 @@ func (c *quicActiveStreamCounters) done(kind quicActiveStreamKind) {
 		decrementAtomicUint64(&c.peerBidi)
 	case quicActiveStreamPeerUni:
 		decrementAtomicUint64(&c.peerUni)
+	default:
 	}
 }
 
@@ -707,6 +709,7 @@ func (b *quicStreamBase) maybeFinishActive() {
 		if b.localReadClosed.Load() {
 			b.finishActive()
 		}
+	default:
 	}
 }
 
@@ -1002,15 +1005,6 @@ func (b *quicStreamBase) loadLocalWriteErr() error {
 	b.termMu.Lock()
 	defer b.termMu.Unlock()
 	return b.localWriteErr
-}
-
-func (b *quicStreamBase) storeLocalReadErr(err error) {
-	if b == nil || err == nil {
-		return
-	}
-	b.termMu.Lock()
-	b.localReadErr = err
-	b.termMu.Unlock()
 }
 
 func (b *quicStreamBase) storeLocalWriteErr(err error) {
@@ -1555,8 +1549,8 @@ func quicAdapterTerminalError(err error) bool {
 	if errors.Is(err, zmux.ErrSessionClosed) || errors.Is(err, zmux.ErrReadClosed) || errors.Is(err, zmux.ErrWriteClosed) {
 		return true
 	}
-	var appErr *zmux.ApplicationError
-	return errors.As(err, &appErr)
+	_, ok := findError[*zmux.ApplicationError](err)
+	return ok
 }
 
 func translateWaitError(err error) error {

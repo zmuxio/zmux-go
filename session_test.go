@@ -12354,15 +12354,15 @@ func TestDropPendingStreamControlCompactsSparseQueue(t *testing.T) {
 		streams[i] = c.registry.streams[ids[i]]
 	}
 
-	state := c.pending.streamQueueState(pendingStreamQueueMaxData)
-	backing := state.items[:cap(state.items)]
+	queueState := c.pending.streamQueueState(pendingStreamQueueMaxData)
+	backing := queueState.items[:cap(queueState.items)]
 	for i := 0; i < pendingStreamQueueCompactMinHead; i++ {
 		if !c.dropPendingStreamControlEntryLocked(streamControlMaxData, ids[i]) {
 			t.Fatalf("drop pending MAX_DATA for stream %d failed", ids[i])
 		}
 	}
 
-	queue := state.items
+	queue := queueState.items
 	first := streams[pendingStreamQueueCompactMinHead]
 	second := streams[pendingStreamQueueCompactMinHead+1]
 	if len(queue) != 2 {
@@ -12407,15 +12407,15 @@ func TestDropPendingPriorityUpdateCompactsSparseQueue(t *testing.T) {
 		streams[i] = c.registry.streams[ids[i]]
 	}
 
-	state := c.pending.streamQueueState(pendingStreamQueuePriority)
-	backing := state.items[:cap(state.items)]
+	queueState := c.pending.streamQueueState(pendingStreamQueuePriority)
+	backing := queueState.items[:cap(queueState.items)]
 	for i := 0; i < pendingStreamQueueCompactMinHead; i++ {
 		if !c.dropPendingPriorityUpdateEntryLocked(ids[i]) {
 			t.Fatalf("drop pending priority update for stream %d failed", ids[i])
 		}
 	}
 
-	queue := state.items
+	queue := queueState.items
 	first := streams[pendingStreamQueueCompactMinHead]
 	second := streams[pendingStreamQueueCompactMinHead+1]
 	if len(queue) != 2 {
@@ -12466,15 +12466,15 @@ func TestDropPendingTerminalControlCompactsSparseQueue(t *testing.T) {
 		streams[i] = stream
 	}
 
-	state := c.pending.streamQueueState(pendingStreamQueueTerminal)
-	backing := state.items[:cap(state.items)]
+	queueState := c.pending.streamQueueState(pendingStreamQueueTerminal)
+	backing := queueState.items[:cap(queueState.items)]
 	for i := 0; i < pendingStreamQueueCompactMinHead; i++ {
 		if !c.dropPendingTerminalControlEntryLocked(ids[i]) {
 			t.Fatalf("drop pending terminal control for stream %d failed", ids[i])
 		}
 	}
 
-	queue := state.items
+	queue := queueState.items
 	first := streams[pendingStreamQueueCompactMinHead]
 	second := streams[pendingStreamQueueCompactMinHead+1]
 	if len(queue) != 2 {
