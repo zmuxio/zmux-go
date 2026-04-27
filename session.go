@@ -1867,6 +1867,7 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 	c.liveness.maxPingDueAt = time.Time{}
 	c.liveness.pingOutstanding = false
 	c.liveness.pingPayload = nil
+	c.liveness.canceledPing = pingPayloadFingerprint{}
 	c.liveness.lastPingSentAt = time.Time{}
 	c.liveness.lastPongAt = time.Time{}
 	c.liveness.lastPingRTT = 0
@@ -2583,6 +2584,7 @@ type connLivenessState struct {
 	lastPingRTT              time.Duration
 	pingOutstanding          bool
 	pingPayload              []byte
+	canceledPing             pingPayloadFingerprint
 	pingDone                 chan struct{}
 }
 
@@ -3604,6 +3606,47 @@ func (c *Conn) Ping(ctx context.Context, echo []byte) (time.Duration, error) {
 
 const pingNonceBytes = 8
 
+const (
+	pingPayloadHashOffset64 = 14695981039346656037
+	pingPayloadHashPrime64  = 1099511628211
+)
+
+type pingPayloadFingerprint struct {
+	nonce  uint64
+	hash   uint64
+	length int
+	set    bool
+}
+
+func newPingPayloadFingerprint(payload []byte) pingPayloadFingerprint {
+	if len(payload) < pingNonceBytes {
+		return pingPayloadFingerprint{}
+	}
+	return pingPayloadFingerprint{
+		nonce:  binary.BigEndian.Uint64(payload[:pingNonceBytes]),
+		hash:   pingPayloadHash(payload),
+		length: len(payload),
+		set:    true,
+	}
+}
+
+func (f pingPayloadFingerprint) matches(payload []byte) bool {
+	return f.set &&
+		len(payload) == f.length &&
+		len(payload) >= pingNonceBytes &&
+		binary.BigEndian.Uint64(payload[:pingNonceBytes]) == f.nonce &&
+		pingPayloadHash(payload) == f.hash
+}
+
+func pingPayloadHash(payload []byte) uint64 {
+	h := uint64(pingPayloadHashOffset64)
+	for _, b := range payload {
+		h ^= uint64(b)
+		h *= pingPayloadHashPrime64
+	}
+	return h
+}
+
 func pingPayloadLen(echoLen int) (uint64, bool) {
 	if echoLen < 0 {
 		return 0, false
@@ -3775,7 +3818,7 @@ func (c *Conn) failPingDone(done <-chan struct{}) {
 	if !c.liveness.pingOutstanding || c.liveness.pingDone != done {
 		return
 	}
-	c.clearPingLocked()
+	c.cancelPingLocked()
 }
 
 func (c *Conn) handlePongFrame(frame Frame) error {
@@ -3810,6 +3853,12 @@ func (c *Conn) handlePongFrame(frame Frame) error {
 		c.mu.Unlock()
 		return nil
 	}
+	if c.liveness.canceledPing.matches(frame.Payload) {
+		c.clearCanceledPingLocked()
+		c.clearNoOpControlBudgetsLocked()
+		c.mu.Unlock()
+		return nil
+	}
 	if err := c.recordNoOpControlLocked(now, "handle PONG"); err != nil {
 		c.mu.Unlock()
 		return err
@@ -3831,6 +3880,29 @@ func (c *Conn) clearPingLocked() {
 	c.resetWriteIdlePingDueLocked(now)
 	notify(c.signals.livenessCh)
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleased)
+}
+
+func (c *Conn) cancelPingLocked() {
+	prevTracked := c.trackedSessionMemoryLocked()
+	now := time.Now()
+	c.liveness.pingOutstanding = false
+	c.liveness.canceledPing = newPingPayloadFingerprint(c.liveness.pingPayload)
+	c.liveness.pingPayload = nil
+	if c.liveness.pingDone != nil {
+		close(c.liveness.pingDone)
+		c.liveness.pingDone = nil
+	}
+	c.resetReadIdlePingDueLocked(now)
+	c.resetWriteIdlePingDueLocked(now)
+	notify(c.signals.livenessCh)
+	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleased)
+}
+
+func (c *Conn) clearCanceledPingLocked() {
+	if c == nil || !c.liveness.canceledPing.set {
+		return
+	}
+	c.liveness.canceledPing = pingPayloadFingerprint{}
 }
 
 func (c *Conn) keepaliveLoop() {

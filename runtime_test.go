@@ -3404,6 +3404,63 @@ func TestPingContextCancelClearsOwnOutstandingSlot(t *testing.T) {
 	}
 }
 
+func TestPingContextCancelIgnoresLateMatchingPong(t *testing.T) {
+	c, frames, stop := newInvalidPolicyConn(t)
+	defer stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pingErr := make(chan error, 1)
+	go func() {
+		_, err := c.Ping(ctx, nil)
+		pingErr <- err
+	}()
+
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePING {
+		t.Fatalf("queued frame = %+v, want PING", queued)
+	}
+	payload := append([]byte(nil), queued.Payload...)
+	cancel()
+
+	select {
+	case err := <-pingErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Ping err = %v, want context canceled", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("timed out waiting for canceled Ping to return")
+	}
+
+	unexpected := Frame{Type: FrameTypePONG, Payload: []byte{0, 0, 0, 0, 0, 0, 0, 1}}
+	for i := 0; i < noOpControlFloodThreshold-1; i++ {
+		if err := c.handlePongFrame(unexpected); err != nil {
+			t.Fatalf("pre-late unexpected PONG %d err = %v, want nil", i+1, err)
+		}
+	}
+
+	if err := c.handlePongFrame(Frame{Type: FrameTypePONG, Payload: payload}); err != nil {
+		t.Fatalf("late matching PONG err = %v, want nil", err)
+	}
+
+	c.mu.Lock()
+	if c.liveness.canceledPing.set {
+		c.mu.Unlock()
+		t.Fatal("canceled ping fingerprint retained after matching late PONG")
+	}
+	if c.abuse.noopControlCount != 0 {
+		count := c.abuse.noopControlCount
+		c.mu.Unlock()
+		t.Fatalf("noopControlCount = %d, want reset after matching late PONG", count)
+	}
+	c.mu.Unlock()
+
+	for i := 0; i < noOpControlFloodThreshold; i++ {
+		if err := c.handlePongFrame(unexpected); err != nil {
+			t.Fatalf("post-reset unexpected PONG %d err = %v, want nil", i+1, err)
+		}
+	}
+}
+
 func TestKeepaliveSendsIdlePing(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.KeepaliveInterval = 20 * time.Millisecond
