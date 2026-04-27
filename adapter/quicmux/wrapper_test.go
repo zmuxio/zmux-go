@@ -120,6 +120,55 @@ func TestWrapSessionStatsTracksActiveStreams(t *testing.T) {
 	assertActiveStreams(t, server, zmux.ActiveStreamStats{})
 }
 
+func TestWrapSessionStatsCountsAcceptedBacklogStreams(t *testing.T) {
+	client, server := newWrappedPair(t)
+	serverAdapter, ok := server.(*quicSession)
+	if !ok {
+		t.Fatal("wrapped server session is not quicSession")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	bidiCh := serverAdapter.ensureBidiAcceptLoop()
+	bidi, err := client.OpenStreamWithOptions(ctx, zmux.OpenOptions{OpenInfo: []byte("queued-bidi")})
+	if err != nil {
+		t.Fatalf("OpenStreamWithOptions err = %v", err)
+	}
+	waitActiveStreams(t, server, zmux.ActiveStreamStats{PeerBidi: 1, Total: 1})
+	var acceptedBidi bidiAcceptResult
+	select {
+	case acceptedBidi = <-bidiCh:
+	case <-ctx.Done():
+		t.Fatalf("queued bidi accept timed out: %v", ctx.Err())
+	}
+	if acceptedBidi.err != nil {
+		t.Fatalf("queued bidi accept err = %v", acceptedBidi.err)
+	}
+	_ = acceptedBidi.stream.Close()
+	_ = bidi.Close()
+	waitActiveStreams(t, server, zmux.ActiveStreamStats{})
+
+	uniCh := serverAdapter.ensureUniAcceptLoop()
+	uni, err := client.OpenUniStreamWithOptions(ctx, zmux.OpenOptions{OpenInfo: []byte("queued-uni")})
+	if err != nil {
+		t.Fatalf("OpenUniStreamWithOptions err = %v", err)
+	}
+	waitActiveStreams(t, server, zmux.ActiveStreamStats{PeerUni: 1, Total: 1})
+	var acceptedUni uniAcceptResult
+	select {
+	case acceptedUni = <-uniCh:
+	case <-ctx.Done():
+		t.Fatalf("queued uni accept timed out: %v", ctx.Err())
+	}
+	if acceptedUni.err != nil {
+		t.Fatalf("queued uni accept err = %v", acceptedUni.err)
+	}
+	_ = acceptedUni.stream.Close()
+	_ = uni.Close()
+	waitActiveStreams(t, server, zmux.ActiveStreamStats{})
+}
+
 func TestWrapSessionStatsDropsUniActiveOnTerminalIO(t *testing.T) {
 	client, server := newWrappedPair(t)
 
@@ -179,6 +228,21 @@ func assertActiveStreams(t *testing.T, session zmux.Session, want zmux.ActiveStr
 	if got := session.Stats().ActiveStreams; got != want {
 		t.Fatalf("active stream stats = %+v, want %+v", got, want)
 	}
+}
+
+func waitActiveStreams(t *testing.T, session zmux.Session, want zmux.ActiveStreamStats) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var got zmux.ActiveStreamStats
+	for time.Now().Before(deadline) {
+		got = session.Stats().ActiveStreams
+		if got == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("active stream stats = %+v, want %+v", got, want)
 }
 
 func TestWrapSessionWaitReturnsNilAfterGracefulClose(t *testing.T) {

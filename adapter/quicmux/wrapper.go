@@ -265,9 +265,6 @@ func (s *quicSession) AcceptStream(ctx context.Context) (zmux.Stream, error) {
 		if result.err != nil {
 			return nil, result.err
 		}
-		if stream, ok := result.stream.(*quicStream); ok {
-			stream.activate(&s.active, quicActiveStreamPeerBidi)
-		}
 		return result.stream, nil
 	}
 }
@@ -289,9 +286,6 @@ func (s *quicSession) AcceptUniStream(ctx context.Context) (zmux.RecvStream, err
 	case result := <-ch:
 		if result.err != nil {
 			return nil, result.err
-		}
-		if stream, ok := result.stream.(*quicRecvStream); ok {
-			stream.activate(&s.active, quicActiveStreamPeerUni)
 		}
 		return result.stream, nil
 	}
@@ -546,7 +540,10 @@ func (s *quicSession) prepareAcceptedBidiStream(stream *quic.Stream) {
 	if err != nil {
 		return
 	}
-	s.publishBidiAcceptResult(bidiAcceptResult{stream: wrapped})
+	wrapped.activate(&s.active, quicActiveStreamPeerBidi)
+	if !s.publishBidiAcceptResult(bidiAcceptResult{stream: wrapped}) {
+		_ = wrapped.CloseWithError(uint64(zmux.CodeCancelled), "")
+	}
 }
 
 func (s *quicSession) prepareAcceptedUniStream(stream *quic.ReceiveStream) {
@@ -557,26 +554,33 @@ func (s *quicSession) prepareAcceptedUniStream(stream *quic.ReceiveStream) {
 	if err != nil {
 		return
 	}
-	s.publishUniAcceptResult(uniAcceptResult{stream: wrapped})
+	wrapped.activate(&s.active, quicActiveStreamPeerUni)
+	if !s.publishUniAcceptResult(uniAcceptResult{stream: wrapped}) {
+		_ = wrapped.CloseWithError(uint64(zmux.CodeCancelled), "")
+	}
 }
 
-func (s *quicSession) publishBidiAcceptResult(result bidiAcceptResult) {
+func (s *quicSession) publishBidiAcceptResult(result bidiAcceptResult) bool {
 	if s == nil || s.conn == nil || s.bidiCh == nil {
-		return
+		return false
 	}
 	select {
 	case s.bidiCh <- result:
+		return true
 	case <-s.conn.Context().Done():
+		return false
 	}
 }
 
-func (s *quicSession) publishUniAcceptResult(result uniAcceptResult) {
+func (s *quicSession) publishUniAcceptResult(result uniAcceptResult) bool {
 	if s == nil || s.conn == nil || s.uniCh == nil {
-		return
+		return false
 	}
 	select {
 	case s.uniCh <- result:
+		return true
 	case <-s.conn.Context().Done():
+		return false
 	}
 }
 
