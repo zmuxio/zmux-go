@@ -52,6 +52,26 @@ func (h *closeErrWriteHalf) SetWriteDeadline(time.Time) error { return nil }
 func (h *closeErrWriteHalf) LocalAddr() net.Addr              { return nil }
 func (h *closeErrWriteHalf) RemoteAddr() net.Addr             { return nil }
 
+type invalidProgressReadHalf struct {
+	n int
+}
+
+func (h *invalidProgressReadHalf) Read(_ []byte) (int, error)      { return h.n, nil }
+func (h *invalidProgressReadHalf) CloseRead() error                { return nil }
+func (h *invalidProgressReadHalf) SetReadDeadline(time.Time) error { return nil }
+func (h *invalidProgressReadHalf) LocalAddr() net.Addr             { return nil }
+func (h *invalidProgressReadHalf) RemoteAddr() net.Addr            { return nil }
+
+type invalidProgressWriteHalf struct {
+	n int
+}
+
+func (h *invalidProgressWriteHalf) Write(_ []byte) (int, error)      { return h.n, nil }
+func (h *invalidProgressWriteHalf) CloseWrite() error                { return nil }
+func (h *invalidProgressWriteHalf) SetWriteDeadline(time.Time) error { return nil }
+func (h *invalidProgressWriteHalf) LocalAddr() net.Addr              { return nil }
+func (h *invalidProgressWriteHalf) RemoteAddr() net.Addr             { return nil }
+
 type blockingCloseReadHalf struct {
 	closeStarted chan struct{}
 	releaseClose chan struct{}
@@ -206,6 +226,62 @@ func TestJoinedConnHalfAccessors(t *testing.T) {
 	}
 	if conn.WriteHalf() != writeHalf {
 		t.Fatal("WriteHalf accessor mismatch")
+	}
+}
+
+func TestJoinedConnRejectsInvalidReadProgress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{name: "negative", n: -1},
+		{name: "too-large", n: 4},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			conn := JoinConn(&invalidProgressReadHalf{n: tt.n}, nil)
+			n, err := conn.Read(make([]byte, 3))
+			if n != 0 {
+				t.Fatalf("Read n = %d, want 0 after invalid progress", n)
+			}
+			if !errors.Is(err, io.ErrShortBuffer) {
+				t.Fatalf("Read err = %v, want %v", err, io.ErrShortBuffer)
+			}
+		})
+	}
+}
+
+func TestJoinedConnRejectsInvalidWriteProgress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{name: "negative", n: -1},
+		{name: "too-large", n: 4},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			conn := JoinConn(nil, &invalidProgressWriteHalf{n: tt.n})
+			n, err := conn.Write([]byte("abc"))
+			if n != 0 {
+				t.Fatalf("Write n = %d, want 0 after invalid progress", n)
+			}
+			if !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("Write err = %v, want %v", err, io.ErrShortWrite)
+			}
+		})
 	}
 }
 

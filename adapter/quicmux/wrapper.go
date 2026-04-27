@@ -577,6 +577,9 @@ func (b *quicStreamBase) readFrom(src io.Reader, p []byte) (int, error) {
 		return 0, zmux.ErrReadClosed
 	}
 	n, err := src.Read(p)
+	if n < 0 || n > len(p) {
+		return 0, io.ErrShortBuffer
+	}
 	if err != nil && b != nil && b.localReadClosed.Load() {
 		if localErr := b.loadLocalReadErr(); localErr != nil {
 			return n, localErr

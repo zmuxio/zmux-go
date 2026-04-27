@@ -877,6 +877,30 @@ func TestEnsureOpenPreludeWithContextCancelsBlockedWrite(t *testing.T) {
 	}
 }
 
+func TestReadFromReturnsShortBufferOnInvalidProgress(t *testing.T) {
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{name: "negative", n: -1},
+		{name: "too-large", n: 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := &quicStreamBase{}
+
+			n, err := base.readFrom(invalidProgressReader{n: tt.n}, make([]byte, 3))
+			if n != 0 {
+				t.Fatalf("readFrom n = %d, want 0 after invalid progress", n)
+			}
+			if !errors.Is(err, io.ErrShortBuffer) {
+				t.Fatalf("readFrom err = %v, want %v", err, io.ErrShortBuffer)
+			}
+		})
+	}
+}
+
 func TestWritePayloadReturnsShortWriteOnInvalidProgress(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1362,6 +1386,14 @@ type invalidProgressWriter struct {
 
 func (w invalidProgressWriter) Write(_ []byte) (int, error) {
 	return w.n, nil
+}
+
+type invalidProgressReader struct {
+	n int
+}
+
+func (r invalidProgressReader) Read(_ []byte) (int, error) {
+	return r.n, nil
 }
 
 type concurrentDetectWriteCloser struct {

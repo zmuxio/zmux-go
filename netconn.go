@@ -191,7 +191,11 @@ func (c *JoinedConn) Read(p []byte) (int, error) {
 	if readHalf == nil {
 		return 0, ErrStreamNotReadable
 	}
-	return readHalf.Read(p)
+	n, err := readHalf.Read(p)
+	if n < 0 || n > len(p) {
+		return 0, io.ErrShortBuffer
+	}
+	return n, err
 }
 
 func (c *JoinedConn) Write(p []byte) (int, error) {
@@ -207,7 +211,11 @@ func (c *JoinedConn) Write(p []byte) (int, error) {
 	if writeHalf == nil {
 		return 0, ErrStreamNotWritable
 	}
-	return writeHalf.Write(p)
+	n, err := writeHalf.Write(p)
+	if n < 0 || n > len(p) {
+		return 0, io.ErrShortWrite
+	}
+	return n, err
 }
 
 // CloseRead closes the currently attached read half. If no read half is
