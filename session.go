@@ -1900,10 +1900,15 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 
 	c.liveness.keepaliveInterval = 0
 	c.liveness.keepaliveMaxPingInterval = 0
+	c.liveness.pingPadding = false
+	c.liveness.pingPaddingMin = 0
+	c.liveness.pingPaddingMax = 0
+	c.liveness.lastPingPaddingLen = 0
 	c.liveness.readIdlePingDueAt = time.Time{}
 	c.liveness.writeIdlePingDueAt = time.Time{}
 	c.liveness.maxPingDueAt = time.Time{}
 	c.liveness.pingOutstanding = false
+	c.liveness.pingAcceptsPaddedPong = false
 	c.liveness.pingPayload = nil
 	c.liveness.canceledPing = pingPayloadFingerprint{}
 	c.liveness.lastPingSentAt = time.Time{}
@@ -2364,7 +2369,7 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 		_ = conn.Close()
 		return nil, err
 	}
-	payload, err := local.MarshalBinary()
+	payload, err := marshalLocalPrefacePayload(local, cfg)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -2473,6 +2478,9 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 			keepaliveInterval:        cfg.KeepaliveInterval,
 			keepaliveMaxPingInterval: cfg.KeepaliveMaxPingInterval,
 			keepaliveTimeout:         cfg.KeepaliveTimeout,
+			pingPadding:              cfg.PingPadding,
+			pingPaddingMin:           cfg.PingPaddingMinBytes,
+			pingPaddingMax:           cfg.PingPaddingMaxBytes,
 			keepaliveJitterState:     rt.InitKeepaliveJitterState(local.TieBreakerNonce ^ peer.TieBreakerNonce),
 			pingNonceState:           rt.InitSessionNonceState((local.TieBreakerNonce << 1) ^ peer.TieBreakerNonce),
 			lastInboundFrameAt:       now,
@@ -2606,6 +2614,10 @@ type connLivenessState struct {
 	keepaliveInterval        time.Duration
 	keepaliveMaxPingInterval time.Duration
 	keepaliveTimeout         time.Duration
+	pingPadding              bool
+	pingPaddingMin           uint64
+	pingPaddingMax           uint64
+	lastPingPaddingLen       uint64
 	keepaliveJitterState     uint64
 	pingNonceState           uint64
 	readIdlePingDueAt        time.Time
@@ -2620,6 +2632,7 @@ type connLivenessState struct {
 	lastPongAt               time.Time
 	lastPingRTT              time.Duration
 	pingOutstanding          bool
+	pingAcceptsPaddedPong    bool
 	pingPayload              []byte
 	canceledPing             pingPayloadFingerprint
 	pingDone                 chan struct{}
@@ -3001,6 +3014,9 @@ func (c *Conn) applyConfigRuntimePolicy(cfg Config) {
 	c.abuse.noOpPriorityFloodLimit = cfg.NoOpPriorityUpdateFloodThreshold
 	c.abuse.groupRebucketFloodLimit = cfg.GroupRebucketChurnThreshold
 	c.abuse.pingFloodLimit = cfg.InboundPingFloodThreshold
+	c.liveness.pingPadding = cfg.PingPadding
+	c.liveness.pingPaddingMin = cfg.PingPaddingMinBytes
+	c.liveness.pingPaddingMax = cfg.PingPaddingMaxBytes
 
 	if cfg.AggregateLateDataCap > 0 {
 		c.ingress.aggregateLateDataCap = cfg.AggregateLateDataCap
@@ -3655,31 +3671,40 @@ const (
 	pingPayloadHashPrime64  = 1099511628211
 )
 
+const (
+	pingPaddingTagBytes = 8
+	pingPaddingTagSalt  = 0x6d1d9f6d33f9772d
+)
+
 type pingPayloadFingerprint struct {
-	nonce  uint64
-	hash   uint64
-	length int
-	set    bool
+	nonce        uint64
+	hash         uint64
+	length       int
+	allowPadding bool
+	set          bool
 }
 
-func newPingPayloadFingerprint(payload []byte) pingPayloadFingerprint {
+func newPingPayloadFingerprint(payload []byte, allowPadding bool) pingPayloadFingerprint {
 	if len(payload) < pingNonceBytes {
 		return pingPayloadFingerprint{}
 	}
 	return pingPayloadFingerprint{
-		nonce:  binary.BigEndian.Uint64(payload[:pingNonceBytes]),
-		hash:   pingPayloadHash(payload),
-		length: len(payload),
-		set:    true,
+		nonce:        binary.BigEndian.Uint64(payload[:pingNonceBytes]),
+		hash:         pingPayloadHash(payload),
+		length:       len(payload),
+		allowPadding: allowPadding,
+		set:          true,
 	}
 }
 
 func (f pingPayloadFingerprint) matches(payload []byte) bool {
-	return f.set &&
-		len(payload) == f.length &&
-		len(payload) >= pingNonceBytes &&
-		binary.BigEndian.Uint64(payload[:pingNonceBytes]) == f.nonce &&
-		pingPayloadHash(payload) == f.hash
+	if !f.set || len(payload) < pingNonceBytes || binary.BigEndian.Uint64(payload[:pingNonceBytes]) != f.nonce {
+		return false
+	}
+	if f.allowPadding {
+		return len(payload) >= f.length && pingPayloadHash(payload[:f.length]) == f.hash
+	}
+	return len(payload) == f.length && pingPayloadHash(payload) == f.hash
 }
 
 func pingPayloadHash(payload []byte) uint64 {
@@ -3689,6 +3714,26 @@ func pingPayloadHash(payload []byte) uint64 {
 		h *= pingPayloadHashPrime64
 	}
 	return h
+}
+
+func pongPayloadMatchesPing(pong, ping []byte) bool {
+	return len(pong) >= len(ping) && bytes.Equal(pong[:len(ping)], ping)
+}
+
+func pingPaddingTag(key, nonce uint64) uint64 {
+	z := key ^ nonce ^ pingPaddingTagSalt
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+func hasPingPaddingTag(payload []byte, key uint64) bool {
+	if key == 0 || len(payload) < pingNonceBytes+pingPaddingTagBytes {
+		return false
+	}
+	nonce := binary.BigEndian.Uint64(payload[:pingNonceBytes])
+	tag := binary.BigEndian.Uint64(payload[pingNonceBytes : pingNonceBytes+pingPaddingTagBytes])
+	return tag == pingPaddingTag(key, nonce)
 }
 
 func pingPayloadLen(echoLen int) (uint64, bool) {
@@ -3739,6 +3784,143 @@ func (c *Conn) pingPayloadLimit() uint64 {
 	return minNonZeroUint64(local, peer)
 }
 
+func pingPaddingBounds(maxAllowed, configuredMin, configuredMax uint64) (uint64, uint64) {
+	maxEchoByInt := uint64(int(^uint(0)>>1) - pingNonceBytes)
+	if maxAllowed > maxEchoByInt {
+		maxAllowed = maxEchoByInt
+	}
+	maxPadding := configuredMax
+	if maxPadding == 0 {
+		maxPadding = defaultPingPaddingMaxBytes
+	}
+	if maxPadding > maxAllowed {
+		maxPadding = maxAllowed
+	}
+	if maxPadding == 0 {
+		return 0, 0
+	}
+	minPadding := configuredMin
+	if minPadding == 0 {
+		minPadding = defaultPingPaddingMinBytes
+	}
+	if minPadding > maxPadding {
+		minPadding = maxPadding
+	}
+	return minPadding, maxPadding
+}
+
+func nextUint64nFromState(state *uint64, n uint64) uint64 {
+	if n <= 1 {
+		return 0
+	}
+	limit := ^uint64(0) - (^uint64(0) % n)
+	for {
+		v := rt.NextSessionNonce(state)
+		if v < limit {
+			return v % n
+		}
+	}
+}
+
+func fillPingPaddingFromState(dst []byte, state *uint64) {
+	var block [8]byte
+	for len(dst) > 0 {
+		binary.BigEndian.PutUint64(block[:], rt.NextSessionNonce(state))
+		n := copy(dst, block[:])
+		dst = dst[n:]
+	}
+}
+
+func (c *Conn) makePingPaddingLocked(maxAllowed, minRequired uint64) []byte {
+	if c == nil || !c.liveness.pingPadding {
+		return nil
+	}
+	minPadding, maxPadding := pingPaddingBounds(
+		maxAllowed,
+		c.liveness.pingPaddingMin,
+		c.liveness.pingPaddingMax,
+	)
+	if maxPadding == 0 {
+		return nil
+	}
+	if minRequired > maxPadding {
+		return nil
+	}
+	if minPadding < minRequired {
+		minPadding = minRequired
+	}
+	paddingLen := minPadding
+	if span := maxPadding - minPadding + 1; span > 1 {
+		paddingLen += nextUint64nFromState(&c.liveness.pingNonceState, span)
+		if paddingLen == c.liveness.lastPingPaddingLen {
+			paddingLen = minPadding + ((paddingLen - minPadding + 1) % span)
+		}
+	}
+	c.liveness.lastPingPaddingLen = paddingLen
+	padding := make([]byte, int(paddingLen))
+	fillPingPaddingFromState(padding, &c.liveness.pingNonceState)
+	return padding
+}
+
+func (c *Conn) buildPaddedPingEchoLocked(echo []byte, nonce uint64) ([]byte, bool) {
+	if !c.liveness.pingPadding {
+		return echo, false
+	}
+	limit := c.pingPayloadLimit()
+	minPayloadLen := uint64(len(echo)) + pingNonceBytes + pingPaddingTagBytes
+	if limit < minPayloadLen {
+		return echo, false
+	}
+	maxAllowed := limit - uint64(len(echo)) - pingNonceBytes
+	_, maxPadding := pingPaddingBounds(
+		maxAllowed,
+		c.liveness.pingPaddingMin,
+		c.liveness.pingPaddingMax,
+	)
+	if maxPadding < pingPaddingTagBytes {
+		return echo, false
+	}
+	key := c.config.local.Settings.PingPaddingKey
+	if key == 0 {
+		return echo, false
+	}
+	padding := c.makePingPaddingLocked(maxAllowed, pingPaddingTagBytes)
+	if len(padding) == 0 {
+		return echo, false
+	}
+	binary.BigEndian.PutUint64(padding[:pingPaddingTagBytes], pingPaddingTag(key, nonce))
+	out := make([]byte, 0, len(echo)+len(padding))
+	out = append(out, padding[:pingPaddingTagBytes]...)
+	out = append(out, echo...)
+	out = append(out, padding[pingPaddingTagBytes:]...)
+	return out, true
+}
+
+func (c *Conn) pongPayloadForPing(payload []byte) []byte {
+	if c == nil {
+		return clonePayloadBytes(payload)
+	}
+	c.mu.Lock()
+	if !hasPingPaddingTag(payload, c.config.peer.Settings.PingPaddingKey) {
+		c.mu.Unlock()
+		return clonePayloadBytes(payload)
+	}
+	maxPayload := c.pingPayloadLimit()
+	if uint64(len(payload)) >= maxPayload {
+		c.mu.Unlock()
+		return clonePayloadBytes(payload)
+	}
+	padding := c.makePingPaddingLocked(maxPayload-uint64(len(payload)), 0)
+	c.mu.Unlock()
+	if len(padding) == 0 {
+		return clonePayloadBytes(payload)
+	}
+	reply := make([]byte, 0, len(payload)+len(padding))
+	reply = append(reply, payload...)
+	reply = append(reply, padding...)
+	return reply
+}
+
 func (c *Conn) beginPingPayloadLocked(payload []byte, ownership retainedBytesOwnership) (<-chan struct{}, time.Time, []byte, error) {
 	if c == nil {
 		return nil, time.Time{}, nil, visibleSessionErrLocked(c, ErrSessionClosed)
@@ -3756,6 +3938,7 @@ func (c *Conn) beginPingPayloadLocked(payload []byte, ownership retainedBytesOwn
 	done := make(chan struct{})
 	sentAt := time.Now()
 	c.liveness.pingOutstanding = true
+	c.liveness.pingAcceptsPaddedPong = false
 	if ownership.ownsPayload() {
 		c.liveness.pingPayload = payload
 	} else {
@@ -3786,7 +3969,9 @@ func (c *Conn) beginGeneratedPing(echo []byte, op string) (<-chan struct{}, time
 		c.mu.Unlock()
 		return nil, time.Time{}, errPingBusy
 	}
-	payload, err := buildPingPayloadCappedWithNonce(echo, c.pingPayloadLimit(), rt.NextSessionNonce(&c.liveness.pingNonceState))
+	nonce := rt.NextSessionNonce(&c.liveness.pingNonceState)
+	wireEcho, acceptsPaddedPong := c.buildPaddedPingEchoLocked(echo, nonce)
+	payload, err := buildPingPayloadCappedWithNonce(wireEcho, c.pingPayloadLimit(), nonce)
 	if err != nil {
 		c.mu.Unlock()
 		return nil, time.Time{}, wireError(CodeFrameSize, op, err)
@@ -3796,6 +3981,50 @@ func (c *Conn) beginGeneratedPing(echo []byte, op string) (<-chan struct{}, time
 		c.mu.Unlock()
 		return nil, time.Time{}, err
 	}
+	c.liveness.pingAcceptsPaddedPong = acceptsPaddedPong
+	notify(c.signals.livenessCh)
+	c.mu.Unlock()
+
+	if err := c.queueImmutableFrame(flatTxFrame(Frame{Type: FrameTypePING, Payload: retainedPayload})); err != nil {
+		c.failPing(retainedPayload)
+		return nil, time.Time{}, err
+	}
+
+	return done, sentAt, nil
+}
+
+func (c *Conn) beginKeepalivePing(op string) (<-chan struct{}, time.Time, error) {
+	if c == nil {
+		return nil, time.Time{}, ErrSessionClosed
+	}
+	c.mu.Lock()
+	if c.lifecycle.closeErr != nil {
+		err := visibleSessionErrLocked(c, c.lifecycle.closeErr)
+		c.mu.Unlock()
+		return nil, time.Time{}, err
+	}
+	if !c.allowLocalNonCloseControlLocked() {
+		err := visibleSessionErrLocked(c, ErrSessionClosed)
+		c.mu.Unlock()
+		return nil, time.Time{}, err
+	}
+	if c.liveness.pingOutstanding {
+		c.mu.Unlock()
+		return nil, time.Time{}, errPingBusy
+	}
+	nonce := rt.NextSessionNonce(&c.liveness.pingNonceState)
+	echo, acceptsPaddedPong := c.buildPaddedPingEchoLocked(nil, nonce)
+	payload, err := buildPingPayloadCappedWithNonce(echo, c.pingPayloadLimit(), nonce)
+	if err != nil {
+		c.mu.Unlock()
+		return nil, time.Time{}, wireError(CodeFrameSize, op, err)
+	}
+	done, sentAt, retainedPayload, err := c.beginPingPayloadLocked(payload, retainedBytesOwned)
+	if err != nil {
+		c.mu.Unlock()
+		return nil, time.Time{}, err
+	}
+	c.liveness.pingAcceptsPaddedPong = acceptsPaddedPong
 	notify(c.signals.livenessCh)
 	c.mu.Unlock()
 
@@ -3826,7 +4055,7 @@ func (c *Conn) beginPing(payload []byte) (<-chan struct{}, time.Time, error) {
 }
 
 func (c *Conn) sendKeepalivePing() error {
-	_, _, err := c.beginGeneratedPing(nil, "build keepalive PING")
+	_, _, err := c.beginKeepalivePing("build keepalive PING")
 	current := connStateClosed
 	if c != nil {
 		c.mu.Lock()
@@ -3890,7 +4119,9 @@ func (c *Conn) handlePongFrame(frame Frame) error {
 		return nil
 	}
 	c.liveness.lastPongAt = now
-	if c.liveness.pingOutstanding && bytes.Equal(frame.Payload, c.liveness.pingPayload) {
+	if c.liveness.pingOutstanding &&
+		(bytes.Equal(frame.Payload, c.liveness.pingPayload) ||
+			(c.liveness.pingAcceptsPaddedPong && pongPayloadMatchesPing(frame.Payload, c.liveness.pingPayload))) {
 		c.liveness.lastPingRTT = now.Sub(c.liveness.lastPingSentAt)
 		c.clearPingLocked()
 		c.clearNoOpControlBudgetsLocked()
@@ -3915,6 +4146,7 @@ func (c *Conn) clearPingLocked() {
 	prevTracked := c.trackedSessionMemoryLocked()
 	now := time.Now()
 	c.liveness.pingOutstanding = false
+	c.liveness.pingAcceptsPaddedPong = false
 	c.liveness.pingPayload = nil
 	if c.liveness.pingDone != nil {
 		close(c.liveness.pingDone)
@@ -3930,7 +4162,8 @@ func (c *Conn) cancelPingLocked() {
 	prevTracked := c.trackedSessionMemoryLocked()
 	now := time.Now()
 	c.liveness.pingOutstanding = false
-	c.liveness.canceledPing = newPingPayloadFingerprint(c.liveness.pingPayload)
+	c.liveness.canceledPing = newPingPayloadFingerprint(c.liveness.pingPayload, c.liveness.pingAcceptsPaddedPong)
+	c.liveness.pingAcceptsPaddedPong = false
 	c.liveness.pingPayload = nil
 	if c.liveness.pingDone != nil {
 		close(c.liveness.pingDone)

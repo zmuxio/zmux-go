@@ -94,6 +94,23 @@ func TestParseSettingsTLVSkipsUnknownSettingPayloadWithoutInterpretingValue(t *t
 	}
 }
 
+func TestParseSettingsTLVSkipsPrefacePaddingPayloadWithoutInterpretingValue(t *testing.T) {
+	t.Parallel()
+
+	raw, err := AppendTLV(nil, uint64(SettingPrefacePadding), []byte{0xff, 0x00, 0x01})
+	if err != nil {
+		t.Fatalf("AppendTLV err = %v", err)
+	}
+
+	parsed, err := ParseSettingsTLV(raw)
+	if err != nil {
+		t.Fatalf("ParseSettingsTLV err = %v, want nil", err)
+	}
+	if parsed != DefaultSettings() {
+		t.Fatalf("ParseSettingsTLV = %+v, want defaults", parsed)
+	}
+}
+
 func TestKnownSettingSeenBitRecognizesConfiguredRange(t *testing.T) {
 	t.Parallel()
 
@@ -110,6 +127,8 @@ func TestKnownSettingSeenBitRecognizesConfiguredRange(t *testing.T) {
 		SettingMaxControlPayloadBytes,
 		SettingMaxExtensionPayloadBytes,
 		SettingSchedulerHints,
+		SettingPingPaddingKey,
+		SettingPrefacePadding,
 	} {
 		if bit, ok := knownSettingSeenBit(uint64(id)); !ok || bit == 0 {
 			t.Fatalf("knownSettingSeenBit(%d) = (%d, %v), want non-zero true", id, bit, ok)

@@ -80,6 +80,16 @@ func TestPublicProtocolAliasesRemainPinned(t *testing.T) {
 			want: func() uint64 { return uint64(wire.SettingSchedulerHints) },
 		},
 		{
+			name: "SettingPingPaddingKey",
+			got:  func() uint64 { return uint64(SettingPingPaddingKey) },
+			want: func() uint64 { return uint64(wire.SettingPingPaddingKey) },
+		},
+		{
+			name: "SettingPrefacePadding",
+			got:  func() uint64 { return uint64(SettingPrefacePadding) },
+			want: func() uint64 { return uint64(wire.SettingPrefacePadding) },
+		},
+		{
 			name: "DIAGOffendingStreamID",
 			got:  func() uint64 { return uint64(DIAGOffendingStreamID) },
 			want: func() uint64 { return uint64(wire.DIAGOffendingStreamID) },

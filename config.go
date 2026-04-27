@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/state"
@@ -62,6 +63,8 @@ const (
 	SettingMaxControlPayloadBytes                = wire.SettingMaxControlPayloadBytes
 	SettingMaxExtensionPayloadBytes              = wire.SettingMaxExtensionPayloadBytes
 	SettingSchedulerHints                        = wire.SettingSchedulerHints
+	SettingPingPaddingKey                        = wire.SettingPingPaddingKey
+	SettingPrefacePadding                        = wire.SettingPrefacePadding
 )
 
 type Settings = wire.Settings
@@ -157,6 +160,20 @@ type Config struct {
 	Capabilities    Capabilities
 	Settings        Settings
 	NonceSource     io.Reader
+	// PrefacePadding appends one random ignored setting TLV to the local
+	// establishment preface to vary its encoded length. It does not change
+	// negotiated settings and is intended for transports that already provide
+	// confidentiality, such as TLS, but still expose record-size patterns.
+	PrefacePadding bool
+	// PrefacePaddingMinBytes bounds the lower end of the random padding value
+	// length when PrefacePadding is enabled. Zero uses the repository default.
+	PrefacePaddingMinBytes uint64
+	// PrefacePaddingMaxBytes bounds the upper end of the random padding value
+	// length when PrefacePadding is enabled. Zero uses the repository default;
+	// values above MaxPrefaceSettingsBytes are clamped to the remaining settings
+	// TLV budget. If the effective minimum exceeds the effective maximum, the
+	// runtime uses the maximum.
+	PrefacePaddingMaxBytes uint64
 	// KeepaliveInterval bounds how long inbound or outbound transport activity
 	// may stay idle before the runtime probes with PING. Zero disables automatic
 	// keepalive entirely, including KeepaliveMaxPingInterval.
@@ -171,6 +188,20 @@ type Config struct {
 	// derives an adaptive default from the keepalive interval and observed RTT
 	// within bounded caps so very high latency links remain usable.
 	KeepaliveTimeout time.Duration
+	// PingPadding appends random opaque bytes to local PING frames and
+	// recognized PONG replies to vary liveness frame lengths. It also advertises
+	// a per-session PingPaddingKey in the local preface. It does not change
+	// Ping(ctx, echo) API behavior.
+	PingPadding bool
+	// PingPaddingMinBytes bounds the lower end of the random PING/PONG padding
+	// length when PingPadding is enabled. Zero uses the repository default.
+	PingPaddingMinBytes uint64
+	// PingPaddingMaxBytes bounds the upper end of the random PING/PONG padding
+	// length when PingPadding is enabled. Zero uses the repository default;
+	// values above the negotiated control payload limit are clamped. If the
+	// effective minimum exceeds the effective maximum, the runtime uses the
+	// maximum.
+	PingPaddingMaxBytes uint64
 
 	// SessionMemoryCap overrides the repository-default tracked-session-memory
 	// hard cap. Zero uses the repository default.
@@ -308,11 +339,19 @@ type OpenOptions struct {
 const (
 	defaultIdleKeepaliveInterval    = time.Minute
 	defaultKeepaliveMaxPingInterval = 5 * time.Minute
+	defaultPrefacePaddingMinBytes   = 16
+	defaultPrefacePaddingMaxBytes   = 256
+	defaultPingPaddingMinBytes      = 16
+	defaultPingPaddingMaxBytes      = 64
 )
 
-// DefaultConfig returns the repository-default configuration template.
-func DefaultConfig() *Config {
-	return &Config{
+var (
+	defaultConfigMu       sync.RWMutex
+	defaultConfigTemplate = builtinDefaultConfig()
+)
+
+func builtinDefaultConfig() Config {
+	return Config{
 		Role:                     RoleAuto,
 		MinProto:                 ProtoVersion,
 		MaxProto:                 ProtoVersion,
@@ -324,11 +363,57 @@ func DefaultConfig() *Config {
 	}
 }
 
-func cloneConfig(cfg *Config) Config {
-	if cfg == nil {
-		return *DefaultConfig()
+// DefaultConfig returns a copy of the process-wide default configuration
+// template.
+func DefaultConfig() *Config {
+	defaultConfigMu.RLock()
+	out := defaultConfigTemplate
+	defaultConfigMu.RUnlock()
+	return &out
+}
+
+// ConfigureDefaultConfig mutates the process-wide default configuration
+// template used by DefaultConfig and by constructors called with nil Config.
+//
+// Call it during process initialization before creating sessions. Existing
+// sessions are not affected. Concurrent calls are race-safe, but the last
+// completed update wins rather than merging independent edits.
+//
+// Per-session random fields are not retained in the template: TieBreakerNonce
+// and Settings.PingPaddingKey are cleared after fn returns so each session can
+// generate fresh values.
+func ConfigureDefaultConfig(fn func(*Config)) {
+	if fn == nil {
+		return
 	}
-	out := *cfg
+	defaultConfigMu.RLock()
+	out := defaultConfigTemplate
+	defaultConfigMu.RUnlock()
+
+	fn(&out)
+
+	out = sanitizeDefaultConfigTemplate(out)
+	defaultConfigMu.Lock()
+	defaultConfigTemplate = out
+	defaultConfigMu.Unlock()
+}
+
+// ResetDefaultConfig restores the built-in process-wide default configuration
+// template.
+func ResetDefaultConfig() {
+	defaultConfigMu.Lock()
+	defaultConfigTemplate = builtinDefaultConfig()
+	defaultConfigMu.Unlock()
+}
+
+func sanitizeDefaultConfigTemplate(out Config) Config {
+	out = normalizeConfigDefaults(out)
+	out.TieBreakerNonce = 0
+	out.Settings.PingPaddingKey = 0
+	return out
+}
+
+func normalizeConfigDefaults(out Config) Config {
 	if out.MinProto == 0 {
 		out.MinProto = ProtoVersion
 	}
@@ -355,6 +440,13 @@ func cloneConfig(cfg *Config) Config {
 	return out
 }
 
+func cloneConfig(cfg *Config) Config {
+	if cfg == nil {
+		return *DefaultConfig()
+	}
+	return normalizeConfigDefaults(*cfg)
+}
+
 func (c Config) LocalPreface() (Preface, error) {
 	if !c.Role.Valid() {
 		return Preface{}, wireError(CodeProtocol, "build preface", errInvalidRole)
@@ -374,6 +466,19 @@ func (c Config) LocalPreface() (Preface, error) {
 		}
 	}
 
+	settings := c.Settings
+	if c.PingPadding {
+		if settings.PingPaddingKey == 0 {
+			var err error
+			settings.PingPaddingKey, err = randomVarint62(c.NonceSource)
+			if err != nil {
+				return Preface{}, wireError(CodeInternal, "build preface", err)
+			}
+		}
+	} else {
+		settings.PingPaddingKey = 0
+	}
+
 	return Preface{
 		PrefaceVersion:  PrefaceVersion,
 		Role:            c.Role,
@@ -381,31 +486,133 @@ func (c Config) LocalPreface() (Preface, error) {
 		MinProto:        c.MinProto,
 		MaxProto:        c.MaxProto,
 		Capabilities:    c.Capabilities,
-		Settings:        c.Settings,
+		Settings:        settings,
 	}, nil
 }
 
-func randomVarint62(r io.Reader) (uint64, error) {
-	if r == nil {
-		r = rand.Reader
+func marshalLocalPrefacePayload(local Preface, cfg Config) ([]byte, error) {
+	if !cfg.PrefacePadding {
+		return local.MarshalBinary()
 	}
-	var buf [8]byte
-	for {
-		if _, err := io.ReadFull(r, buf[:]); err != nil {
+	padding, err := randomPrefacePadding(cfg.NonceSource, local.Settings, cfg.PrefacePaddingMinBytes, cfg.PrefacePaddingMaxBytes)
+	if err != nil {
+		return nil, wireError(CodeInternal, "build preface padding", err)
+	}
+	return wire.MarshalPrefaceWithSettingsPadding(local, padding)
+}
+
+func randomPrefacePadding(r io.Reader, settings Settings, configuredMin, configuredMax uint64) ([]byte, error) {
+	maxPayload, err := maxPrefacePaddingPayloadBytes(settings, configuredMax)
+	if err != nil || maxPayload == 0 {
+		return nil, err
+	}
+	minPayload := configuredMin
+	if minPayload == 0 {
+		minPayload = defaultPrefacePaddingMinBytes
+	}
+	if minPayload > maxPayload {
+		minPayload = maxPayload
+	}
+	paddingLen := minPayload
+	if span := maxPayload - minPayload + 1; span > 1 {
+		n, err := randomUint64n(r, span)
+		if err != nil {
+			return nil, err
+		}
+		paddingLen += n
+	}
+	padding := make([]byte, int(paddingLen))
+	if _, err := io.ReadFull(randomReader(r), padding); err != nil {
+		return nil, err
+	}
+	return padding, nil
+}
+
+func maxPrefacePaddingPayloadBytes(settings Settings, configuredMax uint64) (uint64, error) {
+	settingsBuf, err := wire.MarshalSettingsTLV(settings)
+	if err != nil {
+		return 0, err
+	}
+	if len(settingsBuf) >= MaxPrefaceSettingsBytes {
+		return 0, nil
+	}
+	maxPayload := configuredMax
+	if maxPayload == 0 {
+		maxPayload = defaultPrefacePaddingMaxBytes
+	}
+	remaining := uint64(MaxPrefaceSettingsBytes - len(settingsBuf))
+	if maxPayload > remaining {
+		maxPayload = remaining
+	}
+	typeLen, err := wire.VarintLen(uint64(SettingPrefacePadding))
+	if err != nil {
+		return 0, err
+	}
+	for maxPayload > 0 {
+		lenLen, err := wire.VarintLen(maxPayload)
+		if err != nil {
 			return 0, err
 		}
-		v := (uint64(buf[0]&0x3f) << 56) |
-			(uint64(buf[1]) << 48) |
-			(uint64(buf[2]) << 40) |
-			(uint64(buf[3]) << 32) |
-			(uint64(buf[4]) << 24) |
-			(uint64(buf[5]) << 16) |
-			(uint64(buf[6]) << 8) |
-			uint64(buf[7])
+		overhead := uint64(typeLen + lenLen)
+		if overhead <= remaining && maxPayload <= remaining-overhead {
+			return maxPayload, nil
+		}
+		maxPayload--
+	}
+	return 0, nil
+}
+
+func randomUint64n(r io.Reader, n uint64) (uint64, error) {
+	if n == 0 {
+		return 0, nil
+	}
+	if n > MaxVarint62+1 {
+		return 0, fmt.Errorf("random range %d exceeds 62-bit source range", n)
+	}
+	limit := ((MaxVarint62 + 1) / n) * n
+	for {
+		v, err := randomUint62(r)
+		if err != nil {
+			return 0, err
+		}
+		if v < limit {
+			return v % n, nil
+		}
+	}
+}
+
+func randomReader(r io.Reader) io.Reader {
+	if r == nil {
+		return rand.Reader
+	}
+	return r
+}
+
+func randomVarint62(r io.Reader) (uint64, error) {
+	for {
+		v, err := randomUint62(r)
+		if err != nil {
+			return 0, err
+		}
 		if v != 0 {
 			return v, nil
 		}
 	}
+}
+
+func randomUint62(r io.Reader) (uint64, error) {
+	var buf [8]byte
+	if _, err := io.ReadFull(randomReader(r), buf[:]); err != nil {
+		return 0, err
+	}
+	return (uint64(buf[0]&0x3f) << 56) |
+		(uint64(buf[1]) << 48) |
+		(uint64(buf[2]) << 40) |
+		(uint64(buf[3]) << 32) |
+		(uint64(buf[4]) << 24) |
+		(uint64(buf[5]) << 16) |
+		(uint64(buf[6]) << 8) |
+		uint64(buf[7]), nil
 }
 
 func ParsePreface(data []byte) (Preface, error) {

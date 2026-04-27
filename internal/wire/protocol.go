@@ -276,6 +276,8 @@ const (
 	SettingMaxControlPayloadBytes                SettingID = 10
 	SettingMaxExtensionPayloadBytes              SettingID = 11
 	SettingSchedulerHints                        SettingID = 12
+	SettingPingPaddingKey                        SettingID = 13
+	SettingPrefacePadding                        SettingID = 63
 )
 
 type Settings struct {
@@ -291,6 +293,7 @@ type Settings struct {
 	MaxControlPayloadBytes                uint64
 	MaxExtensionPayloadBytes              uint64
 	SchedulerHints                        SchedulerHint
+	PingPaddingKey                        uint64
 }
 
 func DefaultSettings() Settings {

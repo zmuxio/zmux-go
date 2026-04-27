@@ -95,7 +95,7 @@ func (c *Conn) handleFrameBuffered(frame Frame, backing []byte, handle *wire.Fra
 		if err != nil {
 			return false, err
 		}
-		replyPayload := clonePayloadBytes(frame.Payload)
+		replyPayload := c.pongPayloadForPing(frame.Payload)
 		c.queueReadLoopFrameAsync(flatTxFrame(Frame{Type: FrameTypePONG, Payload: replyPayload}))
 		return false, nil
 	case FrameTypePONG:

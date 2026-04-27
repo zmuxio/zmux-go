@@ -442,6 +442,10 @@ event hooks:
 ```go
 cfg := zmux.DefaultConfig()
 cfg.GracefulCloseDrainTimeout = 100 * time.Millisecond
+cfg.PrefacePadding = true
+cfg.PrefacePaddingMinBytes = 16
+cfg.PrefacePaddingMaxBytes = 256
+cfg.PingPadding = true
 cfg.EventHandler = func(ev zmux.Event) {
 	// observe stream/session lifecycle
 }
@@ -452,14 +456,44 @@ session, err := zmux.New(rwc, cfg)
 Start from `DefaultConfig()` unless you intentionally want to override fields
 that have non-default zero values such as `Role`.
 
+Use `ConfigureDefaultConfig` during process initialization to adjust the
+process-wide template used by `DefaultConfig()` and by constructors called with
+nil config:
+
+```go
+zmux.ConfigureDefaultConfig(func(cfg *zmux.Config) {
+	cfg.PrefacePadding = true
+	cfg.PingPadding = true
+})
+```
+
+The global template does not retain per-session random values such as
+`TieBreakerNonce` or `Settings.PingPaddingKey`; each session still generates
+fresh values when needed. Concurrent default-template updates are race-safe, but
+the last completed update wins, so configure it during process initialization.
+`ResetDefaultConfig()` restores the built-in template.
+
 `DefaultConfig()` already enables a low-frequency directional-idle keepalive
 probe plus a slower cap on how long the session may go without sending any
 PING for RTT sampling. Set `KeepaliveInterval = 0` to disable the automatic
 keepalive logic entirely, or lower it when you want faster liveness detection.
 
+Set `PrefacePadding = true` to append one random ignored settings TLV to the
+local establishment preface. This varies the TLS record length of the zmux
+handshake without changing negotiated settings; the default random padding
+value length is 16..256 bytes, and `PrefacePaddingMinBytes` /
+`PrefacePaddingMaxBytes` can tune that range.
+
+Set `PingPadding = true` to append random opaque bytes to local PING frames and
+recognized PONG replies. This also advertises a per-session padding key in the
+local preface; when disabled, the key is omitted. This does not change
+`Ping(ctx, echo)` API behavior; the default padding range is 16..64 bytes.
+
 ```go
 cfg := &zmux.Config{
 	Role:                     zmux.RoleAuto,
+	PrefacePadding:           true,
+	PingPadding:              true,
 	KeepaliveInterval:        30 * time.Second,
 	KeepaliveMaxPingInterval: 2 * time.Minute,
 	GracefulCloseDrainTimeout: 100 * time.Millisecond,

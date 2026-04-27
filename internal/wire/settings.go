@@ -21,6 +21,7 @@ func MarshalSettingsTLV(s Settings) ([]byte, error) {
 		{SettingMaxControlPayloadBytes, s.MaxControlPayloadBytes, defaults.MaxControlPayloadBytes},
 		{SettingMaxExtensionPayloadBytes, s.MaxExtensionPayloadBytes, defaults.MaxExtensionPayloadBytes},
 		{SettingSchedulerHints, uint64(s.SchedulerHints), uint64(defaults.SchedulerHints)},
+		{SettingPingPaddingKey, s.PingPaddingKey, defaults.PingPaddingKey},
 	}
 	var out []byte
 	var err error
@@ -82,6 +83,10 @@ func ParseSettingsTLV(src []byte) (Settings, error) {
 				return Settings{}, WrapError(CodeProtocol, "parse settings", fmt.Errorf("duplicate setting id %d", typ))
 			}
 			seenKnown |= bit
+			if SettingID(typ) == SettingPrefacePadding {
+				// Padding carries arbitrary bytes and intentionally has no semantic value.
+				continue
+			}
 		} else {
 			if seenUnknown != nil {
 				if _, dup := seenUnknown[typ]; dup {
@@ -127,6 +132,8 @@ func ParseSettingsTLV(src []byte) (Settings, error) {
 			settings.MaxExtensionPayloadBytes = value
 		case SettingSchedulerHints:
 			settings.SchedulerHints = SchedulerHint(value)
+		case SettingPingPaddingKey:
+			settings.PingPaddingKey = value
 		default:
 		}
 	}
@@ -159,6 +166,10 @@ func knownSettingSeenBit(typ uint64) (uint16, bool) {
 		return 1 << 10, true
 	case SettingSchedulerHints:
 		return 1 << 11, true
+	case SettingPingPaddingKey:
+		return 1 << 12, true
+	case SettingPrefacePadding:
+		return 1 << 13, true
 	default:
 		return 0, false
 	}

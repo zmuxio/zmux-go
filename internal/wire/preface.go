@@ -125,6 +125,14 @@ func ParsePrefacePrefix(data []byte) (Preface, int, error) {
 }
 
 func (p Preface) MarshalBinary() ([]byte, error) {
+	return marshalPrefaceBinary(p, nil)
+}
+
+func MarshalPrefaceWithSettingsPadding(p Preface, padding []byte) ([]byte, error) {
+	return marshalPrefaceBinary(p, padding)
+}
+
+func marshalPrefaceBinary(p Preface, padding []byte) ([]byte, error) {
 	if err := validatePrefaceForMarshal(p); err != nil {
 		return nil, err
 	}
@@ -132,6 +140,12 @@ func (p Preface) MarshalBinary() ([]byte, error) {
 	settingsBuf, err := MarshalSettingsTLV(p.Settings)
 	if err != nil {
 		return nil, err
+	}
+	if len(padding) > 0 {
+		settingsBuf, err = AppendTLV(settingsBuf, uint64(SettingPrefacePadding), padding)
+		if err != nil {
+			return nil, WrapError(CodeProtocol, "marshal preface", err)
+		}
 	}
 	if len(settingsBuf) > MaxPrefaceSettingsBytes {
 		return nil, WrapError(CodeFrameSize, "marshal preface", fmt.Errorf("settings_tlv exceeds %d bytes", MaxPrefaceSettingsBytes))

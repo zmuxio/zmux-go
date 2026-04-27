@@ -3,6 +3,7 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -3562,6 +3563,369 @@ func TestSendKeepalivePingIsSilentDuringClosing(t *testing.T) {
 	}
 	c.mu.Unlock()
 	assertNoQueuedFrame(t, frames)
+}
+
+func TestSendKeepalivePingAddsConfiguredPingPadding(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.PingPaddingKey = 0x1234
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 16
+	c.mu.Unlock()
+
+	if err := c.sendKeepalivePing(); err != nil {
+		t.Fatalf("sendKeepalivePing with padding: %v", err)
+	}
+
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePING {
+		t.Fatalf("queued frame = %+v, want PING", queued)
+	}
+	if got, want := len(queued.Payload), pingNonceBytes+16; got != want {
+		t.Fatalf("queued payload len = %d, want %d", got, want)
+	}
+	nonce := binary.BigEndian.Uint64(queued.Payload[:pingNonceBytes])
+	if got, want := binary.BigEndian.Uint64(queued.Payload[pingNonceBytes:pingNonceBytes+pingPaddingTagBytes]), pingPaddingTag(0x1234, nonce); got != want {
+		t.Fatalf("queued ping padding tag = %x, want %x", got, want)
+	}
+}
+
+func TestSendKeepalivePingClampsPingPaddingToControlPayloadLimit(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.PingPaddingKey = 0x1234
+	c.config.local.Settings.MaxControlPayloadBytes = pingNonceBytes + pingPaddingTagBytes + 4
+	c.config.peer.Settings.MaxControlPayloadBytes = pingNonceBytes + pingPaddingTagBytes + 4
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 64
+	c.mu.Unlock()
+
+	if err := c.sendKeepalivePing(); err != nil {
+		t.Fatalf("sendKeepalivePing with clamped padding: %v", err)
+	}
+
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePING {
+		t.Fatalf("queued frame = %+v, want PING", queued)
+	}
+	if got, want := len(queued.Payload), pingNonceBytes+pingPaddingTagBytes+4; got != want {
+		t.Fatalf("queued payload len = %d, want clamped len %d", got, want)
+	}
+}
+
+func TestSendKeepalivePingRaisesPingPaddingMinimumToTagLength(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.PingPaddingKey = 0x1234
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 1
+	c.liveness.pingPaddingMax = pingPaddingTagBytes
+	c.mu.Unlock()
+
+	if err := c.sendKeepalivePing(); err != nil {
+		t.Fatalf("sendKeepalivePing with short configured padding minimum: %v", err)
+	}
+
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePING {
+		t.Fatalf("queued frame = %+v, want PING", queued)
+	}
+	if got, want := len(queued.Payload), pingNonceBytes+pingPaddingTagBytes; got != want {
+		t.Fatalf("queued payload len = %d, want tag-only padding len %d", got, want)
+	}
+}
+
+func TestSendKeepalivePingSkipsPingPaddingWhenTagCannotFit(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.PingPaddingKey = 0x1234
+	c.config.local.Settings.MaxControlPayloadBytes = pingNonceBytes + pingPaddingTagBytes - 1
+	c.config.peer.Settings.MaxControlPayloadBytes = pingNonceBytes + pingPaddingTagBytes - 1
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 64
+	c.mu.Unlock()
+
+	if err := c.sendKeepalivePing(); err != nil {
+		t.Fatalf("sendKeepalivePing with too-small padding budget: %v", err)
+	}
+
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePING {
+		t.Fatalf("queued frame = %+v, want PING", queued)
+	}
+	if got, want := len(queued.Payload), pingNonceBytes; got != want {
+		t.Fatalf("queued payload len = %d, want nonce-only len %d", got, want)
+	}
+}
+
+func TestSendKeepalivePingAvoidsConsecutivePaddingLengthReuse(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.PingPaddingKey = 0x1234
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 17
+	c.mu.Unlock()
+
+	if err := c.sendKeepalivePing(); err != nil {
+		t.Fatalf("first sendKeepalivePing: %v", err)
+	}
+	first := awaitQueuedFrame(t, frames)
+	c.failPing(first.Payload)
+
+	if err := c.sendKeepalivePing(); err != nil {
+		t.Fatalf("second sendKeepalivePing: %v", err)
+	}
+	second := awaitQueuedFrame(t, frames)
+
+	if len(first.Payload) == len(second.Payload) {
+		t.Fatalf("consecutive keepalive payload lengths both %d, want different lengths", len(first.Payload))
+	}
+}
+
+func TestHandlePingAddsConfiguredPongPadding(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.peer.Settings.PingPaddingKey = 0x1234
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 16
+	c.mu.Unlock()
+
+	payload := make([]byte, pingNonceBytes+pingPaddingTagBytes)
+	nonce := uint64(0x0102030405060708)
+	binary.BigEndian.PutUint64(payload[:pingNonceBytes], nonce)
+	binary.BigEndian.PutUint64(payload[pingNonceBytes:], pingPaddingTag(0x1234, nonce))
+	if err := c.handleFrame(Frame{Type: FrameTypePING, Payload: payload}); err != nil {
+		t.Fatalf("handleFrame(PING) err = %v", err)
+	}
+
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePONG {
+		t.Fatalf("queued frame = %+v, want PONG", queued)
+	}
+	if got, want := len(queued.Payload), len(payload)+16; got != want {
+		t.Fatalf("queued PONG payload len = %d, want %d", got, want)
+	}
+	if !bytes.Equal(queued.Payload[:len(payload)], payload) {
+		t.Fatalf("queued PONG prefix = %x, want %x", queued.Payload[:len(payload)], payload)
+	}
+}
+
+func TestHandleRecognizedPingDoesNotAddPongPaddingWhenLocalDisabled(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.peer.Settings.PingPaddingKey = 0x1234
+	c.liveness.pingPadding = false
+	c.mu.Unlock()
+
+	payload := make([]byte, pingNonceBytes+pingPaddingTagBytes)
+	nonce := uint64(0x0102030405060708)
+	binary.BigEndian.PutUint64(payload[:pingNonceBytes], nonce)
+	binary.BigEndian.PutUint64(payload[pingNonceBytes:], pingPaddingTag(0x1234, nonce))
+	if err := c.handleFrame(Frame{Type: FrameTypePING, Payload: payload}); err != nil {
+		t.Fatalf("handleFrame(PING) err = %v", err)
+	}
+
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePONG {
+		t.Fatalf("queued frame = %+v, want PONG", queued)
+	}
+	if !bytes.Equal(queued.Payload, payload) {
+		t.Fatalf("queued PONG payload = %x, want original %x", queued.Payload, payload)
+	}
+}
+
+func TestHandlePingReturnsUnrecognizedPongPayloadUnchanged(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 16
+	c.mu.Unlock()
+
+	payload := []byte("plain-user-ping")
+	if err := c.handleFrame(Frame{Type: FrameTypePING, Payload: payload}); err != nil {
+		t.Fatalf("handleFrame(PING) err = %v", err)
+	}
+
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePONG {
+		t.Fatalf("queued frame = %+v, want PONG", queued)
+	}
+	if !bytes.Equal(queued.Payload, payload) {
+		t.Fatalf("queued PONG payload = %x, want original %x", queued.Payload, payload)
+	}
+}
+
+func TestPaddedPingCompletesWithOriginalPong(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.PingPaddingKey = 0x1234
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 16
+	c.mu.Unlock()
+
+	done, _, err := c.beginKeepalivePing("build keepalive PING")
+	if err != nil {
+		t.Fatalf("beginKeepalivePing: %v", err)
+	}
+	queued := awaitQueuedFrame(t, frames)
+
+	if err := c.handlePongFrame(Frame{Type: FrameTypePONG, Payload: queued.Payload}); err != nil {
+		t.Fatalf("handlePongFrame original err = %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("original PONG did not complete padded ping")
+	}
+}
+
+func TestPaddedPongCompletesOutstandingPing(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.PingPaddingKey = 0x1234
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 16
+	c.mu.Unlock()
+
+	done, _, err := c.beginKeepalivePing("build keepalive PING")
+	if err != nil {
+		t.Fatalf("beginKeepalivePing: %v", err)
+	}
+	queued := awaitQueuedFrame(t, frames)
+	pongPayload := append(append([]byte(nil), queued.Payload...), []byte("reply-padding")...)
+
+	if err := c.handlePongFrame(Frame{Type: FrameTypePONG, Payload: pongPayload}); err != nil {
+		t.Fatalf("handlePongFrame padded err = %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("padded PONG did not complete outstanding ping")
+	}
+	if c.Stats().PingOutstanding {
+		t.Fatal("PingOutstanding = true after padded PONG")
+	}
+}
+
+func TestPaddedPongDoesNotCompleteUnpaddedUserPing(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 16
+	c.mu.Unlock()
+
+	done, _, err := c.beginGeneratedPing([]byte("ok"), "build PING")
+	if err != nil {
+		t.Fatalf("beginGeneratedPing: %v", err)
+	}
+	queued := awaitQueuedFrame(t, frames)
+	pongPayload := append(append([]byte(nil), queued.Payload...), []byte("reply-padding")...)
+
+	if err := c.handlePongFrame(Frame{Type: FrameTypePONG, Payload: pongPayload}); err != nil {
+		t.Fatalf("handlePongFrame padded unpadded user ping err = %v", err)
+	}
+	if !c.Stats().PingOutstanding {
+		t.Fatal("PingOutstanding = false after padded PONG for user Ping")
+	}
+	c.failPingDone(done)
+}
+
+func TestConfiguredPingPaddingPreservesUserPingEcho(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	c.config.local.Settings.PingPaddingKey = 0x1234
+	c.liveness.pingPadding = true
+	c.liveness.pingPaddingMin = 16
+	c.liveness.pingPaddingMax = 16
+	c.mu.Unlock()
+
+	done, _, err := c.beginGeneratedPing([]byte("ok"), "build PING")
+	if err != nil {
+		t.Fatalf("beginGeneratedPing: %v", err)
+	}
+	queued := awaitQueuedFrame(t, frames)
+	if queued.Type != FrameTypePING {
+		t.Fatalf("queued frame = %+v, want PING", queued)
+	}
+	if got, want := len(queued.Payload), pingNonceBytes+len("ok")+16; got != want {
+		t.Fatalf("queued payload len = %d, want %d", got, want)
+	}
+	nonce := binary.BigEndian.Uint64(queued.Payload[:pingNonceBytes])
+	if got, want := binary.BigEndian.Uint64(queued.Payload[pingNonceBytes:pingNonceBytes+pingPaddingTagBytes]), pingPaddingTag(0x1234, nonce); got != want {
+		t.Fatalf("queued ping padding tag = %x, want %x", got, want)
+	}
+	echoStart := pingNonceBytes + pingPaddingTagBytes
+	if string(queued.Payload[echoStart:echoStart+len("ok")]) != "ok" {
+		t.Fatalf("queued echo = %q, want ok", queued.Payload[echoStart:echoStart+len("ok")])
+	}
+	pongPayload := append(append([]byte(nil), queued.Payload...), []byte("reply-padding")...)
+	if err := c.handlePongFrame(Frame{Type: FrameTypePONG, Payload: pongPayload}); err != nil {
+		t.Fatalf("handlePongFrame padded user ping err = %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(testSignalTimeout):
+		t.Fatal("padded PONG did not complete configured user Ping")
+	}
 }
 
 func TestKeepaliveTimeoutSignalsIdleTimeoutError(t *testing.T) {

@@ -10025,6 +10025,9 @@ func TestConfigRuntimePolicyOverridesApplied(t *testing.T) {
 		NoOpPriorityUpdateFloodThreshold: 26,
 		GroupRebucketChurnThreshold:      27,
 		InboundPingFloodThreshold:        28,
+		PingPadding:                      true,
+		PingPaddingMinBytes:              29,
+		PingPaddingMaxBytes:              30,
 	}
 
 	client := newConfigPolicyTestConn(clientCfg)
@@ -10130,6 +10133,15 @@ func TestConfigRuntimePolicyOverridesApplied(t *testing.T) {
 	}
 	if got := client.inboundPingFloodThresholdLocked(); got != clientCfg.InboundPingFloodThreshold {
 		t.Fatalf("inboundPingFloodThresholdLocked() = %d, want %d", got, clientCfg.InboundPingFloodThreshold)
+	}
+	if got := client.liveness.pingPadding; got != clientCfg.PingPadding {
+		t.Fatalf("pingPadding = %t, want %t", got, clientCfg.PingPadding)
+	}
+	if got := client.liveness.pingPaddingMin; got != clientCfg.PingPaddingMinBytes {
+		t.Fatalf("pingPaddingMin = %d, want %d", got, clientCfg.PingPaddingMinBytes)
+	}
+	if got := client.liveness.pingPaddingMax; got != clientCfg.PingPaddingMaxBytes {
+		t.Fatalf("pingPaddingMax = %d, want %d", got, clientCfg.PingPaddingMaxBytes)
 	}
 }
 
@@ -10563,6 +10575,138 @@ func newConnPairWithConfig(t *testing.T, clientCfg, serverCfg *Config) (*Conn, *
 	})
 
 	return client.conn, server.conn
+}
+
+func TestEstablishWithPrefacePadding(t *testing.T) {
+	t.Parallel()
+
+	clientCfg := &Config{
+		PrefacePadding:         true,
+		PrefacePaddingMaxBytes: 8,
+		NonceSource:            bytes.NewReader(make([]byte, 8)),
+	}
+	serverCfg := &Config{
+		PrefacePadding:         true,
+		PrefacePaddingMaxBytes: 8,
+		NonceSource:            bytes.NewReader(make([]byte, 8)),
+	}
+
+	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
+	if client.LocalPreface().Settings != DefaultSettings() {
+		t.Fatalf("client local settings = %+v, want defaults", client.LocalPreface().Settings)
+	}
+	if server.PeerPreface().Settings != DefaultSettings() {
+		t.Fatalf("server peer settings = %+v, want defaults", server.PeerPreface().Settings)
+	}
+}
+
+func TestMarshalLocalPrefacePayloadAddsPaddingWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	cfg := cloneConfig(&Config{
+		Role:                   RoleInitiator,
+		PrefacePadding:         true,
+		PrefacePaddingMinBytes: 8,
+		PrefacePaddingMaxBytes: 8,
+		NonceSource:            bytes.NewReader(make([]byte, 8)),
+	})
+	local, err := cfg.LocalPreface()
+	if err != nil {
+		t.Fatalf("LocalPreface err = %v", err)
+	}
+	base, err := local.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary err = %v", err)
+	}
+	payload, err := marshalLocalPrefacePayload(local, cfg)
+	if err != nil {
+		t.Fatalf("marshalLocalPrefacePayload err = %v", err)
+	}
+	if len(payload) <= len(base) {
+		t.Fatalf("padded preface len = %d, want > base len %d", len(payload), len(base))
+	}
+	parsed, err := ParsePreface(payload)
+	if err != nil {
+		t.Fatalf("ParsePreface padded err = %v", err)
+	}
+	if parsed != local {
+		t.Fatalf("ParsePreface padded = %+v, want %+v", parsed, local)
+	}
+}
+
+func TestLocalPrefaceGeneratesPingPaddingKeyWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	cfg := cloneConfig(&Config{
+		Role:        RoleInitiator,
+		PingPadding: true,
+		NonceSource: bytes.NewReader([]byte{0, 0, 0, 0, 0, 0, 0, 0x2a}),
+	})
+	local, err := cfg.LocalPreface()
+	if err != nil {
+		t.Fatalf("LocalPreface err = %v", err)
+	}
+	if got := local.Settings.PingPaddingKey; got != 0x2a {
+		t.Fatalf("PingPaddingKey = %#x, want generated key %#x", got, uint64(0x2a))
+	}
+
+	settings := DefaultSettings()
+	settings.PingPaddingKey = 0x99
+	cfg = cloneConfig(&Config{
+		Role:        RoleInitiator,
+		Settings:    settings,
+		PingPadding: true,
+		NonceSource: bytes.NewReader(nil),
+	})
+	local, err = cfg.LocalPreface()
+	if err != nil {
+		t.Fatalf("LocalPreface with configured key err = %v", err)
+	}
+	if got := local.Settings.PingPaddingKey; got != 0x99 {
+		t.Fatalf("PingPaddingKey = %#x, want configured key %#x", got, uint64(0x99))
+	}
+}
+
+func TestLocalPrefaceClearsPingPaddingKeyWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	settings := DefaultSettings()
+	settings.PingPaddingKey = 0x99
+	cfg := cloneConfig(&Config{
+		Role:     RoleInitiator,
+		Settings: settings,
+	})
+	local, err := cfg.LocalPreface()
+	if err != nil {
+		t.Fatalf("LocalPreface err = %v", err)
+	}
+	if got := local.Settings.PingPaddingKey; got != 0 {
+		t.Fatalf("PingPaddingKey = %#x, want zero when PingPadding is disabled", got)
+	}
+
+	payload, err := marshalLocalPrefacePayload(local, cfg)
+	if err != nil {
+		t.Fatalf("marshalLocalPrefacePayload err = %v", err)
+	}
+	want, err := local.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary err = %v", err)
+	}
+	if !bytes.Equal(payload, want) {
+		t.Fatalf("preface payload with disabled PingPadding = %x, want %x", payload, want)
+	}
+}
+
+func TestRandomPrefacePaddingUsesConfiguredRange(t *testing.T) {
+	t.Parallel()
+
+	padding, err := randomPrefacePadding(bytes.NewReader(make([]byte, 24)), DefaultSettings(), 16, 32)
+	if err != nil {
+		t.Fatalf("randomPrefacePadding err = %v", err)
+	}
+	if got := len(padding); got != 16 {
+		t.Fatalf("len(randomPrefacePadding) = %d, want lower bound 16", got)
+	}
 }
 
 func TestEstablishedConnBootstrapsIncrementalQueues(t *testing.T) {
