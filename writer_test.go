@@ -1812,6 +1812,42 @@ func TestWriteBatchRejectsAggregateEncodedSizeOverflow(t *testing.T) {
 	}
 }
 
+func TestWriteBatchRejectsNegativePayloadLength(t *testing.T) {
+	t.Parallel()
+
+	conn := &countingWriteCloser{}
+	c := &Conn{io: connIOState{conn: conn}}
+	frame := makeTxFrame(FrameTypeDATA, 0, 4)
+	frame.Payload = []byte("abc")
+	frame.payloadLen = -1
+
+	err := c.writeBatch([]writeRequest{{
+		frames: []txFrame{frame},
+		done:   make(chan error, 1),
+	}})
+	if !IsErrorCode(err, CodeFrameSize) {
+		t.Fatalf("writeBatch err = %v, want %s", err, CodeFrameSize)
+	}
+	if got := conn.writeCount(); got != 0 {
+		t.Fatalf("underlying write count = %d, want 0", got)
+	}
+}
+
+func TestWriteBatchEncodedBufferBucketsInitialized(t *testing.T) {
+	t.Parallel()
+
+	if maxRetainedWriteBatchBytes <= 0 {
+		t.Fatalf("maxRetainedWriteBatchBytes = %d, want positive", maxRetainedWriteBatchBytes)
+	}
+	if len(writeBatchEncodedBufferBuckets) == 0 {
+		t.Fatal("writeBatchEncodedBufferBuckets is empty")
+	}
+	last := &writeBatchEncodedBufferBuckets[len(writeBatchEncodedBufferBuckets)-1]
+	if last.size <= 0 || last.size > maxRetainedWriteBatchBytes {
+		t.Fatalf("last encoded buffer bucket size = %d, want within 1..%d", last.size, maxRetainedWriteBatchBytes)
+	}
+}
+
 func TestWriteBatchReturnsSmallEncodingBufferToSharedPool(t *testing.T) {
 	t.Parallel()
 
@@ -2901,6 +2937,30 @@ func TestTxFramePayloadSettersRefreshPayloadLength(t *testing.T) {
 	}
 	if got := string(frame.clonedPayload()); got != "pab" {
 		t.Fatalf("prefixed parts payload = %q, want pab", got)
+	}
+}
+
+func TestTxFramePayloadLengthSaturatesInvalidValues(t *testing.T) {
+	t.Parallel()
+
+	maxInt := int(^uint(0) >> 1)
+	frame := makeTxFrame(FrameTypeDATA, 0, 4)
+	frame.payloadLen = -1
+	if got := frame.payloadLength(); got != maxInt {
+		t.Fatalf("negative payload length = %d, want %d", got, maxInt)
+	}
+
+	frame.setPartsPayload(nil, 0, 0, -1)
+	if got := frame.payloadLength(); got != maxInt {
+		t.Fatalf("negative parts payload length = %d, want %d", got, maxInt)
+	}
+
+	frame.setPrefixedPartsPayload([]byte("p"), nil, 0, 0, maxInt)
+	if got := frame.payloadLength(); got != maxInt {
+		t.Fatalf("overflowing prefixed parts payload length = %d, want %d", got, maxInt)
+	}
+	if got := string(frame.clonedPayload()); got != "p" {
+		t.Fatalf("overflowing prefixed parts clone = %q, want p", got)
 	}
 }
 

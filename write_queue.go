@@ -200,7 +200,6 @@ func makeTxFrame(frameType FrameType, flags byte, streamID uint64) txFrame {
 func flatTxFrame(frame Frame) txFrame {
 	tx := makeTxFrame(frame.Type, frame.Flags, frame.StreamID)
 	tx.setFlatPayload(frame.Payload)
-	tx.payloadLen = len(frame.Payload)
 	return tx
 }
 
@@ -230,7 +229,7 @@ func (f *txFrame) payloadLength() int {
 		return 0
 	}
 	if f.payloadLen < 0 {
-		return 0
+		return maxTxPayloadLength()
 	}
 	return f.payloadLen
 }
@@ -271,10 +270,14 @@ func (f *txFrame) appendPayload(dst []byte) []byte {
 }
 
 func (f *txFrame) clonedPayload() []byte {
-	if f.payloadLength() == 0 {
+	payloadLen := f.payloadLength()
+	if payloadLen == 0 {
 		return nil
 	}
-	dst := make([]byte, 0, f.payloadLength())
+	if payloadLen > maxRetainedWriteBatchBytes {
+		return f.appendPayload(nil)
+	}
+	dst := make([]byte, 0, payloadLen)
 	return f.appendPayload(dst)
 }
 
@@ -310,6 +313,28 @@ func (f *txFrame) setFlatPayload(payload []byte) {
 	f.payloadLen = len(payload)
 }
 
+func maxTxPayloadLength() int {
+	return int(^uint(0) >> 1)
+}
+
+func checkedTxPayloadLength(n int) int {
+	if n < 0 {
+		return maxTxPayloadLength()
+	}
+	return n
+}
+
+func addTxPayloadLengths(a, b int) int {
+	if a < 0 || b < 0 {
+		return maxTxPayloadLength()
+	}
+	maxLen := maxTxPayloadLength()
+	if a > maxLen-b {
+		return maxLen
+	}
+	return a + b
+}
+
 func (f *txFrame) setPrefixedFlatPayload(prefix, payload []byte) {
 	if f == nil {
 		return
@@ -322,7 +347,7 @@ func (f *txFrame) setPrefixedFlatPayload(prefix, payload []byte) {
 	f.payloadKind = txPayloadPrefixFlat
 	f.payloadPrefix = prefix
 	f.Payload = payload
-	f.payloadLen = len(prefix) + len(payload)
+	f.payloadLen = addTxPayloadLengths(len(prefix), len(payload))
 }
 
 func (f *txFrame) setPartsPayload(parts [][]byte, idx, off, n int) {
@@ -335,7 +360,7 @@ func (f *txFrame) setPartsPayload(parts [][]byte, idx, off, n int) {
 	f.payloadPartIdx = idx
 	f.payloadPartOff = off
 	f.payloadPartLen = n
-	f.payloadLen = n
+	f.payloadLen = checkedTxPayloadLength(n)
 }
 
 func (f *txFrame) setPrefixedPartsPayload(prefix []byte, parts [][]byte, idx, off, n int) {
@@ -349,7 +374,7 @@ func (f *txFrame) setPrefixedPartsPayload(prefix []byte, parts [][]byte, idx, of
 	f.payloadPartIdx = idx
 	f.payloadPartOff = off
 	f.payloadPartLen = n
-	f.payloadLen = len(prefix) + n
+	f.payloadLen = addTxPayloadLengths(len(prefix), n)
 }
 
 // txFrameQueueCost is the coarse queued-byte accounting used by admission,
@@ -428,7 +453,6 @@ func cloneTxFramesIfNeeded(frames []txFrame, clone bool) ([]txFrame, bool) {
 	for i := range cloned {
 		payload := cloned[i].clonedPayload()
 		cloned[i].setFlatPayload(payload)
-		cloned[i].payloadLen = len(payload)
 	}
 	return cloned, false
 }

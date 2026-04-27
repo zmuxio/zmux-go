@@ -47,6 +47,8 @@ type dequeuedWriteWork struct {
 const maxControlBatchesPerWake = 4
 const maxRetainedScatterGatherSegments = 2048
 
+var maxRetainedWriteBatchBytes = maxWriteBatchFrames * int(DefaultSettings().MaxFramePayload)
+
 type streamValueAccumulator struct {
 	scratch      *writeBatchScratch
 	capHint      int
@@ -697,8 +699,6 @@ func prepareWriteBatchSize(batch []writeRequest) (totalEncoded int, payloadBytes
 const maxWriteBatchFrames = 32
 const maxEncodedFrameOverhead = 17
 const minScatterGatherPayloadBytes = 16 << 10
-
-var maxRetainedWriteBatchBytes = maxWriteBatchFrames * int(DefaultSettings().MaxFramePayload)
 
 func (c *Conn) collectWriteBatch(first writeRequest, lane writeLane) []writeRequest {
 	if lane == writeLaneOrdinary || lane == writeLaneAdvisory {

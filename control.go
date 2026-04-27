@@ -579,7 +579,6 @@ func makePendingVarintControlTxFrame(frameType FrameType, streamID uint64, value
 	frame := makeTxFrame(frameType, 0, streamID)
 	payload := encodeClampedVarint62(value)
 	frame.setFlatPayload(payload)
-	frame.payloadLen = len(payload)
 	return frame
 }
 
@@ -1552,8 +1551,7 @@ type pendingPriorityUpdateBatch struct {
 
 func buildPendingPriorityUpdateFrame(streamID uint64, payload []byte) txFrame {
 	frame := makeTxFrame(FrameTypeEXT, 0, streamID)
-	frame.Payload = payload
-	frame.payloadLen = len(payload)
+	frame.setFlatPayload(payload)
 	return frame
 }
 

@@ -2149,10 +2149,8 @@ func (s *nativeStream) dataFrameLocked(app []byte, traits dataFrameTraits) txFra
 	if traits.includesOpenMetadata() && len(s.openMetadataPrefix) > 0 {
 		frame.Flags |= FrameFlagOpenMetadata
 		frame.setPrefixedFlatPayload(s.openMetadataPrefix, app)
-		frame.payloadLen = len(s.openMetadataPrefix) + len(app)
 	} else {
 		frame.setFlatPayload(app)
-		frame.payloadLen = len(app)
 	}
 	if traits.sendsFIN() {
 		frame.Flags |= FrameFlagFIN
@@ -2162,15 +2160,12 @@ func (s *nativeStream) dataFrameLocked(app []byte, traits dataFrameTraits) txFra
 
 func (s *nativeStream) dataFrameFromPartsLocked(parts [][]byte, idx, off, n int, traits dataFrameTraits) txFrame {
 	frame := makeTxFrame(FrameTypeDATA, 0, s.id)
-	payloadLen := n
 	if traits.includesOpenMetadata() && len(s.openMetadataPrefix) > 0 {
 		frame.Flags |= FrameFlagOpenMetadata
-		payloadLen += len(s.openMetadataPrefix)
 	}
 	if traits.sendsFIN() {
 		frame.Flags |= FrameFlagFIN
 	}
-	frame.payloadLen = payloadLen
 
 	if frame.Flags&FrameFlagOpenMetadata != 0 && n == 0 {
 		frame.setFlatPayload(s.openMetadataPrefix)
