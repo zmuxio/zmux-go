@@ -14698,6 +14698,40 @@ func newPendingControlTestStream(c *Conn) *nativeStream {
 	return stream
 }
 
+func TestQueuePendingMetadataUpdateMergesUnsentFields(t *testing.T) {
+	caps := CapabilityPriorityUpdate | CapabilityPriorityHints | CapabilityStreamGroups
+	c := newPriorityBudgetTestConn()
+	c.config.negotiated.Capabilities = caps
+	stream := newPendingControlTestStream(c)
+
+	priority := uint64(7)
+	group := uint64(11)
+	if err := stream.queuePendingMetadataUpdateLocked(caps, MetadataUpdate{Priority: &priority}); err != nil {
+		t.Fatalf("queue priority update: %v", err)
+	}
+	if err := stream.queuePendingMetadataUpdateLocked(caps, MetadataUpdate{Group: &group}); err != nil {
+		t.Fatalf("queue group update: %v", err)
+	}
+
+	subtype, payload, ok := parseExtFrame(stream.pending.priority)
+	if !ok || subtype != EXTPriorityUpdate {
+		t.Fatalf("pending EXT subtype = (%v,%v), want PRIORITY_UPDATE", subtype, ok)
+	}
+	meta, ok, err := parsePriorityUpdatePayload(payload)
+	if err != nil {
+		t.Fatalf("parse pending priority update: %v", err)
+	}
+	if !ok {
+		t.Fatal("pending priority update payload was invalid")
+	}
+	if !meta.HasPriority || meta.Priority != priority {
+		t.Fatalf("pending priority = (%v,%d), want (true,%d)", meta.HasPriority, meta.Priority, priority)
+	}
+	if !meta.HasGroup || meta.Group != group {
+		t.Fatalf("pending group = (%v,%d), want (true,%d)", meta.HasGroup, meta.Group, group)
+	}
+}
+
 func TestQueuePriorityUpdateDropsWhenBudgetExceeded(t *testing.T) {
 	c := newPriorityBudgetTestConn()
 	budget := c.pendingPriorityBudgetLocked()

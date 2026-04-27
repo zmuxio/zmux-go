@@ -817,6 +817,23 @@ func (s *nativeStream) queuePendingMetadataUpdateLocked(caps Capabilities, updat
 	}
 	reuse := []byte(nil)
 	if s.hasPendingPriorityUpdateLocked() {
+		subtype, pendingPayload, ok := parseExtFrame(s.pending.priority)
+		if !ok || subtype != EXTPriorityUpdate {
+			return wireError(CodeInternal, "queue priority update", fmt.Errorf("invalid pending priority update payload"))
+		}
+		pending, ok, err := parsePriorityUpdatePayload(pendingPayload)
+		if err != nil {
+			return wireError(CodeInternal, "queue priority update", err)
+		}
+		if !ok {
+			return wireError(CodeInternal, "queue priority update", fmt.Errorf("invalid pending priority update payload"))
+		}
+		if update.Priority == nil && pending.HasPriority {
+			update.Priority = boxedUint64(pending.Priority)
+		}
+		if update.Group == nil && pending.HasGroup {
+			update.Group = boxedUint64(pending.Group)
+		}
 		reuse = s.pending.priority[:0]
 	}
 	payload, err := appendPriorityUpdatePayload(
