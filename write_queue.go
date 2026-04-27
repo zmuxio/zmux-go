@@ -307,6 +307,7 @@ func (f *txFrame) setFlatPayload(payload []byte) {
 	}
 	f.resetPayloadView()
 	f.Payload = payload
+	f.payloadLen = len(payload)
 }
 
 func (f *txFrame) setPrefixedFlatPayload(prefix, payload []byte) {
@@ -321,6 +322,7 @@ func (f *txFrame) setPrefixedFlatPayload(prefix, payload []byte) {
 	f.payloadKind = txPayloadPrefixFlat
 	f.payloadPrefix = prefix
 	f.Payload = payload
+	f.payloadLen = len(prefix) + len(payload)
 }
 
 func (f *txFrame) setPartsPayload(parts [][]byte, idx, off, n int) {
@@ -333,6 +335,7 @@ func (f *txFrame) setPartsPayload(parts [][]byte, idx, off, n int) {
 	f.payloadPartIdx = idx
 	f.payloadPartOff = off
 	f.payloadPartLen = n
+	f.payloadLen = n
 }
 
 func (f *txFrame) setPrefixedPartsPayload(prefix []byte, parts [][]byte, idx, off, n int) {
@@ -346,6 +349,7 @@ func (f *txFrame) setPrefixedPartsPayload(prefix []byte, parts [][]byte, idx, of
 	f.payloadPartIdx = idx
 	f.payloadPartOff = off
 	f.payloadPartLen = n
+	f.payloadLen = len(prefix) + n
 }
 
 // txFrameQueueCost is the coarse queued-byte accounting used by admission,

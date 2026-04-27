@@ -2857,6 +2857,53 @@ func TestWriteAllReturnsShortWriteOnInvalidProgress(t *testing.T) {
 	}
 }
 
+func TestTxFramePayloadSettersRefreshPayloadLength(t *testing.T) {
+	t.Parallel()
+
+	frame := makeTxFrame(FrameTypeDATA, 0, 4)
+	frame.payloadLen = 99
+	frame.setFlatPayload([]byte("abc"))
+	if got := frame.payloadLength(); got != 3 {
+		t.Fatalf("flat payload length = %d, want 3", got)
+	}
+	if got := string(frame.clonedPayload()); got != "abc" {
+		t.Fatalf("flat payload = %q, want abc", got)
+	}
+
+	frame.setPrefixedFlatPayload([]byte("pre"), []byte("data"))
+	if got := frame.payloadLength(); got != len("predata") {
+		t.Fatalf("prefixed flat payload length = %d, want %d", got, len("predata"))
+	}
+	if got := string(frame.clonedPayload()); got != "predata" {
+		t.Fatalf("prefixed flat payload = %q, want predata", got)
+	}
+
+	frame.setPrefixedFlatPayload([]byte("pre"), nil)
+	if got := frame.payloadLength(); got != len("pre") {
+		t.Fatalf("prefix-only flat payload length = %d, want %d", got, len("pre"))
+	}
+	if got := string(frame.clonedPayload()); got != "pre" {
+		t.Fatalf("prefix-only flat payload = %q, want pre", got)
+	}
+
+	parts := [][]byte{[]byte("aa"), []byte("bbb")}
+	frame.setPartsPayload(parts, 0, 1, 4)
+	if got := frame.payloadLength(); got != 4 {
+		t.Fatalf("parts payload length = %d, want 4", got)
+	}
+	if got := string(frame.clonedPayload()); got != "abbb" {
+		t.Fatalf("parts payload = %q, want abbb", got)
+	}
+
+	frame.setPrefixedPartsPayload([]byte("p"), parts, 0, 1, 2)
+	if got := frame.payloadLength(); got != 3 {
+		t.Fatalf("prefixed parts payload length = %d, want 3", got)
+	}
+	if got := string(frame.clonedPayload()); got != "pab" {
+		t.Fatalf("prefixed parts payload = %q, want pab", got)
+	}
+}
+
 func TestRequestCostSaturatesAtMaxInt64(t *testing.T) {
 	t.Parallel()
 

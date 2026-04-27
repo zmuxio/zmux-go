@@ -350,6 +350,7 @@ func (s *quicSession) acceptBidiLoop() {
 			return
 		}
 		if !s.acquirePrepareSlot() {
+			discardAcceptedBidiStream(stream)
 			return
 		}
 		go func() {
@@ -367,6 +368,7 @@ func (s *quicSession) acceptUniLoop() {
 			return
 		}
 		if !s.acquirePrepareSlot() {
+			discardAcceptedUniStream(stream)
 			return
 		}
 		go func() {
@@ -396,6 +398,33 @@ func (s *quicSession) releasePrepareSlot() {
 	case <-s.prepareSem:
 	default:
 	}
+}
+
+type acceptedBidiDiscarder interface {
+	CancelRead(quic.StreamErrorCode)
+	CancelWrite(quic.StreamErrorCode)
+	Close() error
+}
+
+type acceptedUniDiscarder interface {
+	CancelRead(quic.StreamErrorCode)
+}
+
+func discardAcceptedBidiStream(stream acceptedBidiDiscarder) {
+	if stream == nil {
+		return
+	}
+	code := quic.StreamErrorCode(zmux.CodeCancelled)
+	stream.CancelRead(code)
+	stream.CancelWrite(code)
+	_ = stream.Close()
+}
+
+func discardAcceptedUniStream(stream acceptedUniDiscarder) {
+	if stream == nil {
+		return
+	}
+	stream.CancelRead(quic.StreamErrorCode(zmux.CodeCancelled))
 }
 
 func (s *quicSession) prepareAcceptedBidiStream(stream *quic.Stream) {

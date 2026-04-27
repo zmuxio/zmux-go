@@ -576,6 +576,41 @@ func TestWrapSessionAcceptLoopBoundsConcurrentPreludePreparation(t *testing.T) {
 	}
 }
 
+func TestDiscardAcceptedBidiStreamClosesBothDirections(t *testing.T) {
+	stream := &discardTrackingBidiStream{}
+
+	discardAcceptedBidiStream(stream)
+
+	if !stream.readCancelled {
+		t.Fatal("bidi read side was not cancelled")
+	}
+	if !stream.writeCancelled {
+		t.Fatal("bidi write side was not cancelled")
+	}
+	if !stream.closed {
+		t.Fatal("bidi stream was not closed")
+	}
+	if stream.readCode != quic.StreamErrorCode(zmux.CodeCancelled) {
+		t.Fatalf("read cancel code = %d, want %d", stream.readCode, zmux.CodeCancelled)
+	}
+	if stream.writeCode != quic.StreamErrorCode(zmux.CodeCancelled) {
+		t.Fatalf("write cancel code = %d, want %d", stream.writeCode, zmux.CodeCancelled)
+	}
+}
+
+func TestDiscardAcceptedUniStreamCancelsRead(t *testing.T) {
+	stream := &discardTrackingUniStream{}
+
+	discardAcceptedUniStream(stream)
+
+	if !stream.readCancelled {
+		t.Fatal("uni read side was not cancelled")
+	}
+	if stream.readCode != quic.StreamErrorCode(zmux.CodeCancelled) {
+		t.Fatalf("read cancel code = %d, want %d", stream.readCode, zmux.CodeCancelled)
+	}
+}
+
 func TestNormalizeAcceptedPreludeMaxConcurrent(t *testing.T) {
 	previous := DefaultAcceptedPreludeMaxConcurrent()
 	SetDefaultAcceptedPreludeMaxConcurrent(0)
@@ -1264,6 +1299,39 @@ func (c *countingSessionConn) bidiAcceptCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.bidiAcceptCalls
+}
+
+type discardTrackingBidiStream struct {
+	readCancelled  bool
+	writeCancelled bool
+	closed         bool
+	readCode       quic.StreamErrorCode
+	writeCode      quic.StreamErrorCode
+}
+
+func (s *discardTrackingBidiStream) CancelRead(code quic.StreamErrorCode) {
+	s.readCancelled = true
+	s.readCode = code
+}
+
+func (s *discardTrackingBidiStream) CancelWrite(code quic.StreamErrorCode) {
+	s.writeCancelled = true
+	s.writeCode = code
+}
+
+func (s *discardTrackingBidiStream) Close() error {
+	s.closed = true
+	return nil
+}
+
+type discardTrackingUniStream struct {
+	readCancelled bool
+	readCode      quic.StreamErrorCode
+}
+
+func (s *discardTrackingUniStream) CancelRead(code quic.StreamErrorCode) {
+	s.readCancelled = true
+	s.readCode = code
 }
 
 type partialPreludeWriter struct {
