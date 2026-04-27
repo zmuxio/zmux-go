@@ -2203,6 +2203,50 @@ func TestClearRetainedBatchRefsDropsOversizedScatterGatherScratch(t *testing.T) 
 	}
 }
 
+func TestHandleWriteBatchFallsBackForTinyScatterGatherSegments(t *testing.T) {
+	t.Parallel()
+
+	writer := &countingWriteCloser{}
+	c := newWriteLoopControlTestConn(&captureWriteCloser{})
+	c.io.conn = writer
+	c.io.scatterGatherOK = true
+
+	partCount := maxScatterGatherSegments / 2
+	part := bytes.Repeat([]byte("x"), minScatterGatherPayloadBytes/partCount)
+	parts := make([][]byte, partCount)
+	for i := range parts {
+		parts[i] = part
+	}
+	frame := makeTxFrame(FrameTypeDATA, 0, 0)
+	frame.setPartsPayload(parts, 0, 0, len(parts)*len(part))
+	req := writeRequest{
+		done:   make(chan error, 1),
+		frames: []txFrame{frame},
+	}
+
+	batch := c.writer.scratch.batchSlice(1, 1)
+	batch[0] = req
+	if !c.handleWriteBatch(batch) {
+		t.Fatal("handleWriteBatch() = false, want true")
+	}
+
+	select {
+	case err := <-req.done:
+		if err != nil {
+			t.Fatalf("done err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("handleWriteBatch did not signal done")
+	}
+
+	if got := writer.writeCount(); got != 1 {
+		t.Fatalf("underlying write count = %d, want 1 fallback write", got)
+	}
+	if cap(c.writer.scratch.sgBuffers) != 0 {
+		t.Fatalf("scatter-gather scratch cap = %d, want 0 after fallback", cap(c.writer.scratch.sgBuffers))
+	}
+}
+
 func TestHandleWriteBatchTransportErrorDoesNotEnqueueCloseFrameFromWriterLoop(t *testing.T) {
 	t.Parallel()
 

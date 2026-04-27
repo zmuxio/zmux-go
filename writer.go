@@ -632,9 +632,14 @@ func (c *Conn) writeBatch(batch []writeRequest) error {
 
 	start := time.Now()
 	written, err := 0, error(nil)
+	scatterGather := false
 	if c.useScatterGatherWrite(payloadBytes, frameCount) {
-		written, err = c.writeBatchScatterGather(batch)
-	} else {
+		if segmentCount, ok := writeBatchScatterGatherSegmentCount(batch, maxScatterGatherSegments); ok && scatterGatherSegmentDensityOK(payloadBytes, segmentCount) {
+			scatterGather = true
+			written, err = c.writeBatchScatterGather(batch, frameCount, segmentCount)
+		}
+	}
+	if !scatterGather {
 		buf := c.writer.scratch.encodedBuffer(totalEncoded)
 		defer func() {
 			c.writer.scratch.releaseEncodedBuffer(buf)
@@ -702,6 +707,8 @@ func prepareWriteBatchSize(batch []writeRequest) (totalEncoded int, payloadBytes
 const maxWriteBatchFrames = 32
 const maxEncodedFrameOverhead = 17
 const minScatterGatherPayloadBytes = 16 << 10
+const maxScatterGatherSegments = 64
+const minScatterGatherPayloadBytesPerSegment = 1024
 
 func (c *Conn) collectWriteBatch(first writeRequest, lane writeLane) []writeRequest {
 	if lane == writeLaneOrdinary || lane == writeLaneAdvisory {
@@ -771,19 +778,32 @@ func (c *Conn) useScatterGatherWrite(payloadBytes, frameCount int) bool {
 	return c != nil && c.io.conn != nil && c.io.scatterGatherOK && payloadBytes >= minScatterGatherPayloadBytes && frameCount > 0
 }
 
-func (c *Conn) writeBatchScatterGather(batch []writeRequest) (int, error) {
-	if c == nil || c.io.conn == nil {
-		return 0, ErrSessionClosed
+func scatterGatherSegmentDensityOK(payloadBytes, segmentCount int) bool {
+	return segmentCount > 0 && payloadBytes/segmentCount >= minScatterGatherPayloadBytesPerSegment
+}
+
+func writeBatchScatterGatherSegmentCount(batch []writeRequest, maxSegments int) (int, bool) {
+	if maxSegments < 0 {
+		return 0, false
+	}
+	segmentCount := 0
+	addSegment := func() bool {
+		if segmentCount >= maxSegments {
+			return false
+		}
+		segmentCount++
+		return true
 	}
 
-	frameCount := 0
-	segmentCount := 0
 	for _, req := range batch {
 		for _, frame := range req.frames {
-			frameCount++
-			segmentCount++
+			if !addSegment() {
+				return 0, false
+			}
 			if frame.hasPayloadPrefix() && len(frame.payloadPrefix) > 0 {
-				segmentCount++
+				if !addSegment() {
+					return 0, false
+				}
 			}
 			if frame.hasPayloadParts() {
 				idx := frame.payloadPartIdx
@@ -800,7 +820,9 @@ func (c *Conn) writeBatchScatterGather(batch []writeRequest) (int, error) {
 					if take > remaining {
 						take = remaining
 					}
-					segmentCount++
+					if !addSegment() {
+						return 0, false
+					}
 					remaining -= take
 					idx++
 					off = 0
@@ -808,9 +830,18 @@ func (c *Conn) writeBatchScatterGather(batch []writeRequest) (int, error) {
 				continue
 			}
 			if len(frame.Payload) > 0 {
-				segmentCount++
+				if !addSegment() {
+					return 0, false
+				}
 			}
 		}
+	}
+	return segmentCount, true
+}
+
+func (c *Conn) writeBatchScatterGather(batch []writeRequest, frameCount, segmentCount int) (int, error) {
+	if c == nil || c.io.conn == nil {
+		return 0, ErrSessionClosed
 	}
 
 	headerArena := c.writer.scratch.encodedBuffer(frameCount * maxEncodedFrameOverhead)
