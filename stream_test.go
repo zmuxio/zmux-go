@@ -5721,6 +5721,37 @@ func TestStructuredErrorAfterPeerStopWrite(t *testing.T) {
 	}
 }
 
+func TestWriteAfterStopDrivenResetSurfacesPeerStop(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newInvalidFrameConn(t, 0)
+	defer stop()
+
+	stream := seedStateFixtureStream(t, c, state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), "bidi", "local_owned", stateHalfExpect{
+		SendHalf: "send_open",
+		RecvHalf: "recv_open",
+	})
+	testMarkLocalOpenCommitted(stream)
+	stream.setSendStopSeen(&ApplicationError{Code: 77})
+	stream.setSendResetWithSource(&ApplicationError{Code: uint64(CodeCancelled)}, terminalResetFromStopSending)
+
+	_, err := stream.Write([]byte("x"))
+	var appErr *ApplicationError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("Write err = %v, want ApplicationError", err)
+	}
+	if appErr.Code != 77 {
+		t.Fatalf("Write code = %d, want 77 from peer STOP_SENDING", appErr.Code)
+	}
+
+	se := requireStructuredError(t, err)
+	if se.Scope != ScopeStream || se.Operation != OperationWrite || se.Source != SourceRemote ||
+		se.Direction != DirectionWrite || se.TerminationKind != TerminationStopped {
+		t.Fatalf("structured error = %+v", *se)
+	}
+	assertNoQueuedFrame(t, frames)
+}
+
 func TestStructuredErrorAfterUpdateMetadataSendFin(t *testing.T) {
 	t.Parallel()
 

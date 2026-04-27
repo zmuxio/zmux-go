@@ -6375,6 +6375,39 @@ func TestStatsSnapshotIncludesQueueDepths(t *testing.T) {
 	}
 }
 
+func TestStatsSnapshotIncludesActiveStreams(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{closedCh: make(chan struct{}), sessionState: connStateReady},
+	}
+	c.registry.activeLocalBidi = 1
+	c.registry.activeLocalUni = 2
+	c.registry.activePeerBidi = 3
+	c.registry.activePeerUni = 4
+
+	stats := c.Stats().ActiveStreams
+	want := ActiveStreamStats{
+		LocalBidi: 1,
+		LocalUni:  2,
+		PeerBidi:  3,
+		PeerUni:   4,
+		Total:     10,
+	}
+	if stats != want {
+		t.Fatalf("active stream stats = %+v, want %+v", stats, want)
+	}
+}
+
+func TestActiveStreamStatsTotalSaturates(t *testing.T) {
+	t.Parallel()
+
+	stats := makeActiveStreamStats(^uint64(0), 1, 0, 0)
+	if stats.Total != ^uint64(0) {
+		t.Fatalf("active stream total = %d, want saturated %d", stats.Total, ^uint64(0))
+	}
+}
+
 func TestStatsTrackFlushAndReceiveBacklog(t *testing.T) {
 	t.Parallel()
 

@@ -20,6 +20,31 @@ func (r *greedyReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+type countingByteReader struct {
+	data  []byte
+	reads int
+}
+
+func (r *countingByteReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.reads += n
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func (r *countingByteReader) ReadByte() (byte, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	r.reads++
+	b := r.data[0]
+	r.data = r.data[1:]
+	return b, nil
+}
+
 func TestReadFrameBufferedRejectsOversizedPayloadBeforeReadingBody(t *testing.T) {
 	t.Parallel()
 
@@ -45,6 +70,24 @@ func TestReadFrameBufferedRejectsOversizedPayloadBeforeReadingBody(t *testing.T)
 	}
 	if handle != nil {
 		t.Fatalf("ReadFrameBuffered handle = %v, want nil", handle)
+	}
+}
+
+func TestReadFrameBufferedRejectsShortStreamIDBeforeReadingPastFrame(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte{2, byte(FrameTypeDATA), 0xc0}
+	reader := &countingByteReader{data: raw}
+
+	_, _, handle, err := ReadFrameBuffered(reader, Limits{}, nil)
+	if !errors.Is(err, ErrShortFrame) {
+		t.Fatalf("ReadFrameBuffered err = %v, want %v", err, ErrShortFrame)
+	}
+	if handle != nil {
+		t.Fatalf("ReadFrameBuffered handle = %v, want nil", handle)
+	}
+	if reader.reads != len(raw) {
+		t.Fatalf("reader reads = %d, want %d without reading past declared frame", reader.reads, len(raw))
 	}
 }
 

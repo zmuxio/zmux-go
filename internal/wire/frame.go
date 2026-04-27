@@ -170,6 +170,9 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 	}
 	prefix[1] = firstStreamByte
 	streamLen := 1 << (firstStreamByte >> 6)
+	if frameLen < uint64(1+streamLen) {
+		return Frame{}, dst, nil, FrameSizeError("read frame", ErrShortFrame)
+	}
 	for i := 1; i < streamLen; i++ {
 		b, err := br.ReadByte()
 		if err != nil {
@@ -186,9 +189,6 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 			return Frame{}, dst, nil, io.ErrUnexpectedEOF
 		}
 		return Frame{}, dst, nil, WrapError(CodeProtocol, "parse stream_id", err)
-	}
-	if frameLen < uint64(1+parsedStreamLen) {
-		return Frame{}, dst, nil, FrameSizeError("read frame", ErrShortFrame)
 	}
 	payloadLen := frameLen - uint64(1+parsedStreamLen)
 	if payloadLen > InboundPayloadLimit(frameType, limits) {

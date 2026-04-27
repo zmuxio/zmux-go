@@ -364,6 +364,7 @@ Stable session methods mean:
 - `Closed()`: report whether the session has terminated
 - `State()`: return the public session state
 - `Stats()`: return runtime counters and pressure snapshots
+- `Stats().ActiveStreams`: report active stream counts split by local/peer and bidi/uni
 
 Example:
 

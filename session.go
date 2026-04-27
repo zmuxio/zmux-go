@@ -628,6 +628,20 @@ type QueueStats struct {
 	Total    int
 }
 
+// ActiveStreamStats reports active stream slots by opener and direction.
+type ActiveStreamStats struct {
+	// LocalBidi counts active bidirectional streams opened by this endpoint.
+	LocalBidi uint64
+	// LocalUni counts active send-only streams opened by this endpoint.
+	LocalUni uint64
+	// PeerBidi counts active bidirectional streams opened by the peer.
+	PeerBidi uint64
+	// PeerUni counts active receive-only streams opened by the peer.
+	PeerUni uint64
+	// Total is the saturating sum of all active stream counters.
+	Total uint64
+}
+
 // FlushStats reports the most recent writer flush.
 type FlushStats struct {
 	Count      uint64
@@ -766,6 +780,7 @@ type SessionStats struct {
 	LastPongAt               time.Time
 	LastPingRTT              time.Duration
 
+	ActiveStreams     ActiveStreamStats
 	Queues            QueueStats
 	Flush             FlushStats
 	BlockedWriteTotal time.Duration
@@ -776,6 +791,19 @@ type SessionStats struct {
 	Provisionals      ProvisionalStats
 	Reasons           ReasonStats
 	Diagnostics       DiagnosticStats
+}
+
+func makeActiveStreamStats(localBidi, localUni, peerBidi, peerUni uint64) ActiveStreamStats {
+	return ActiveStreamStats{
+		LocalBidi: localBidi,
+		LocalUni:  localUni,
+		PeerBidi:  peerBidi,
+		PeerUni:   peerUni,
+		Total: saturatingAdd(
+			saturatingAdd(localBidi, localUni),
+			saturatingAdd(peerBidi, peerUni),
+		),
+	}
 }
 
 func saturatingDurationAdd(a, b time.Duration) time.Duration {
@@ -974,6 +1002,12 @@ func (c *Conn) Stats() SessionStats {
 	provisionalHardCap := state.ProvisionalHardCap(true, c.pendingInboundLimitLocked())
 	provisionalBidi := c.provisionalCountLocked(streamArityBidi)
 	provisionalUni := c.provisionalCountLocked(streamArityUni)
+	activeStreams := makeActiveStreamStats(
+		c.registry.activeLocalBidi,
+		c.registry.activeLocalUni,
+		c.registry.activePeerBidi,
+		c.registry.activePeerUni,
+	)
 
 	return SessionStats{
 		State:                    publicSessionState(c.lifecycle.sessionState),
@@ -996,6 +1030,7 @@ func (c *Conn) Stats() SessionStats {
 		LastPingSentAt:      c.liveness.lastPingSentAt,
 		LastPongAt:          c.liveness.lastPongAt,
 		LastPingRTT:         c.liveness.lastPingRTT,
+		ActiveStreams:       activeStreams,
 		Queues:              queues,
 		Flush: FlushStats{
 			Count:      c.metrics.flushCount,

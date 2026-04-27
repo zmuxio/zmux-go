@@ -51,6 +51,136 @@ func TestWrapSessionNilIsClosedSafeSession(t *testing.T) {
 	}
 }
 
+func TestWrapSessionStatsTracksActiveStreams(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	type bidiAcceptResult struct {
+		stream zmux.Stream
+		err    error
+	}
+	bidiCh := make(chan bidiAcceptResult, 1)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		bidiCh <- bidiAcceptResult{stream: stream, err: err}
+	}()
+
+	bidi, err := client.OpenStreamWithOptions(ctx, zmux.OpenOptions{OpenInfo: []byte("bidi")})
+	if err != nil {
+		t.Fatalf("OpenStreamWithOptions err = %v", err)
+	}
+	var acceptedBidi bidiAcceptResult
+	select {
+	case acceptedBidi = <-bidiCh:
+	case <-ctx.Done():
+		t.Fatalf("AcceptStream timed out: %v", ctx.Err())
+	}
+	if acceptedBidi.err != nil {
+		t.Fatalf("AcceptStream err = %v", acceptedBidi.err)
+	}
+
+	assertActiveStreams(t, client, zmux.ActiveStreamStats{LocalBidi: 1, Total: 1})
+	assertActiveStreams(t, server, zmux.ActiveStreamStats{PeerBidi: 1, Total: 1})
+	_ = bidi.Close()
+	assertActiveStreams(t, client, zmux.ActiveStreamStats{})
+	_ = acceptedBidi.stream.Close()
+	assertActiveStreams(t, server, zmux.ActiveStreamStats{})
+
+	type uniAcceptResult struct {
+		stream zmux.RecvStream
+		err    error
+	}
+	uniCh := make(chan uniAcceptResult, 1)
+	go func() {
+		stream, err := server.AcceptUniStream(ctx)
+		uniCh <- uniAcceptResult{stream: stream, err: err}
+	}()
+
+	uni, err := client.OpenUniStreamWithOptions(ctx, zmux.OpenOptions{OpenInfo: []byte("uni")})
+	if err != nil {
+		t.Fatalf("OpenUniStreamWithOptions err = %v", err)
+	}
+	var acceptedUni uniAcceptResult
+	select {
+	case acceptedUni = <-uniCh:
+	case <-ctx.Done():
+		t.Fatalf("AcceptUniStream timed out: %v", ctx.Err())
+	}
+	if acceptedUni.err != nil {
+		t.Fatalf("AcceptUniStream err = %v", acceptedUni.err)
+	}
+
+	assertActiveStreams(t, client, zmux.ActiveStreamStats{LocalUni: 1, Total: 1})
+	assertActiveStreams(t, server, zmux.ActiveStreamStats{PeerUni: 1, Total: 1})
+	_ = uni.Close()
+	assertActiveStreams(t, client, zmux.ActiveStreamStats{})
+	_ = acceptedUni.stream.Close()
+	assertActiveStreams(t, server, zmux.ActiveStreamStats{})
+}
+
+func TestWrapSessionStatsDropsUniActiveOnTerminalIO(t *testing.T) {
+	client, server := newWrappedPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	type uniAcceptResult struct {
+		stream zmux.RecvStream
+		err    error
+	}
+	uniCh := make(chan uniAcceptResult, 1)
+	go func() {
+		stream, err := server.AcceptUniStream(ctx)
+		uniCh <- uniAcceptResult{stream: stream, err: err}
+	}()
+
+	uni, err := client.OpenUniStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenUniStream err = %v", err)
+	}
+	assertActiveStreams(t, client, zmux.ActiveStreamStats{LocalUni: 1, Total: 1})
+
+	payload := []byte("terminal-uni")
+	n, err := uni.WriteFinal(payload)
+	if err != nil {
+		t.Fatalf("WriteFinal err = %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("WriteFinal n = %d, want %d", n, len(payload))
+	}
+	assertActiveStreams(t, client, zmux.ActiveStreamStats{})
+
+	var accepted uniAcceptResult
+	select {
+	case accepted = <-uniCh:
+	case <-ctx.Done():
+		t.Fatalf("AcceptUniStream timed out: %v", ctx.Err())
+	}
+	if accepted.err != nil {
+		t.Fatalf("AcceptUniStream err = %v", accepted.err)
+	}
+	assertActiveStreams(t, server, zmux.ActiveStreamStats{PeerUni: 1, Total: 1})
+
+	got, err := io.ReadAll(accepted.stream)
+	if err != nil {
+		t.Fatalf("ReadAll err = %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("ReadAll = %q, want %q", got, payload)
+	}
+	assertActiveStreams(t, server, zmux.ActiveStreamStats{})
+}
+
+func assertActiveStreams(t *testing.T, session zmux.Session, want zmux.ActiveStreamStats) {
+	t.Helper()
+
+	if got := session.Stats().ActiveStreams; got != want {
+		t.Fatalf("active stream stats = %+v, want %+v", got, want)
+	}
+}
+
 func TestWrapSessionWaitReturnsNilAfterGracefulClose(t *testing.T) {
 	client, _ := newWrappedPair(t)
 

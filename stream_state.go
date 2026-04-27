@@ -191,6 +191,9 @@ func (s *nativeStream) writeClosedTerminationLocked() (Source, TerminationKind) 
 	case state.SendHalfStopSeen:
 		return SourceRemote, TerminationStopped
 	case state.SendHalfReset:
+		if s.sendResetFromStopLocked() && s.sendStop != nil {
+			return SourceRemote, TerminationStopped
+		}
 		return SourceLocal, TerminationReset
 	case state.SendHalfFin:
 		return SourceLocal, TerminationGraceful
@@ -424,6 +427,8 @@ func (s *nativeStream) abortOrResetTerminationLocked(err error) streamTerminatio
 			return makeStreamTerminationMeta(SourceRemote, DirectionBoth, TerminationAbort)
 		}
 		return makeStreamTerminationMeta(SourceLocal, DirectionBoth, TerminationAbort)
+	case s.sendStopErrLocked() != nil && errors.Is(err, s.sendStopErrLocked()):
+		return makeStreamTerminationMeta(SourceRemote, DirectionWrite, TerminationStopped)
 	case s.sendResetErrLocked() != nil && errors.Is(err, s.sendResetErrLocked()):
 		return makeStreamTerminationMeta(SourceLocal, DirectionWrite, TerminationReset)
 	case s.recvResetErrLocked() != nil && errors.Is(err, s.recvResetErrLocked()):
@@ -616,6 +621,9 @@ func (s *nativeStream) terminalErrLocked() error {
 	case state.TerminalErrorRecvAbort:
 		return s.recvAbortErrLocked()
 	case state.TerminalErrorSendReset:
+		if s.sendResetFromStopLocked() && s.sendStop != nil {
+			return s.sendStop
+		}
 		return s.sendResetErrLocked()
 	case state.TerminalErrorRecvReset:
 		return s.recvResetErrLocked()
@@ -1222,6 +1230,13 @@ func (s *nativeStream) recvAbortErrLocked() error {
 		return nil
 	}
 	return s.recvAbort
+}
+
+func (s *nativeStream) sendStopErrLocked() error {
+	if s == nil || s.sendStop == nil {
+		return nil
+	}
+	return s.sendStop
 }
 
 func (s *nativeStream) sendResetErrLocked() error {
