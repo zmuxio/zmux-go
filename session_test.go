@@ -11424,30 +11424,26 @@ func TestCompactTerminalStateClosesSessionWhenMarkerOnlyMemoryExceedsCap(t *test
 	}
 }
 
-func TestMarkerOnlyUsedStreamLimitOverrideClosesSessionWhenExceeded(t *testing.T) {
+func TestMarkerOnlyUsedStreamLimitOverrideClosesSessionWhenEntriesExceeded(t *testing.T) {
 	c, _, stop := newInvalidFrameConn(t, 0)
 	defer stop()
 
 	c.applyConfigRuntimePolicy(cloneConfig(&Config{
-		TombstoneLimit:            1,
 		MarkerOnlyUsedStreamLimit: 1,
 	}))
 
-	firstID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
-	for i := uint64(0); i < 3; i++ {
-		if err := c.handleAbortFrame(Frame{
-			Type:     FrameTypeABORT,
-			StreamID: firstID + i*4,
-			Payload:  mustEncodeVarint(uint64(CodeCancelled)),
-		}); err != nil {
-			t.Fatalf("handle hidden ABORT #%d: %v", i+1, err)
-		}
+	c.mu.Lock()
+	c.registry.usedStreamData = map[uint64]usedStreamMarker{
+		4: {action: lateDataAbortClosed, cause: lateDataCauseCloseRead},
+		8: {action: lateDataAbortState, cause: lateDataCauseAbort},
 	}
+	c.enforceTerminalBookkeepingMemoryCapLocked()
+	c.mu.Unlock()
 
 	select {
 	case <-c.lifecycle.closedCh:
 	case <-time.After(testSignalTimeout):
-		t.Fatal("timed out waiting for session close after marker-only used-stream limit was exceeded")
+		t.Fatal("timed out waiting for session close after marker-only entry limit was exceeded")
 	}
 
 	if !IsErrorCode(c.err(), CodeInternal) {
@@ -11455,11 +11451,12 @@ func TestMarkerOnlyUsedStreamLimitOverrideClosesSessionWhenExceeded(t *testing.T
 	}
 }
 
-func TestCompactMarkerOnlyRangesDropsEmptyMapBacking(t *testing.T) {
+func TestCompactMarkerOnlyRangesAccountMergedRangeAsSingleEntry(t *testing.T) {
 	c := newSessionMemoryTestConn()
 	marker := usedStreamMarker{action: lateDataAbortClosed, cause: lateDataCauseReset}
 
 	c.mu.Lock()
+	c.flow.sessionMemoryCap = c.compactTerminalStateUnitLocked()
 	c.registry.usedStreamData = make(map[uint64]usedStreamMarker)
 	for i := 0; i < 64; i++ {
 		c.registry.usedStreamData[4+uint64(i)*4] = marker
@@ -11468,6 +11465,8 @@ func TestCompactMarkerOnlyRangesDropsEmptyMapBacking(t *testing.T) {
 	mapReleased := c.registry.usedStreamData == nil
 	rangeMode := c.registry.usedStreamRangeMode
 	retained := c.markerOnlyRetainedLocked()
+	tracked := c.trackedRetainedStateMemoryLocked()
+	capErr := c.markerOnlyCapErrorLocked("test marker-only ranges")
 	got, ok := c.usedStreamMarkerForLocked(4 + 63*4)
 	c.mu.Unlock()
 
@@ -11477,8 +11476,14 @@ func TestCompactMarkerOnlyRangesDropsEmptyMapBacking(t *testing.T) {
 	if !rangeMode {
 		t.Fatal("usedStreamRangeMode = false, want true after compaction")
 	}
-	if retained != 64 {
-		t.Fatalf("markerOnlyRetainedLocked() = %d, want 64 streams in merged range", retained)
+	if retained != 1 {
+		t.Fatalf("markerOnlyRetainedLocked() = %d, want 1 merged range entry", retained)
+	}
+	if tracked != c.compactTerminalStateUnitLocked() {
+		t.Fatalf("tracked retained marker memory = %d, want %d", tracked, c.compactTerminalStateUnitLocked())
+	}
+	if capErr != nil {
+		t.Fatalf("markerOnlyCapErrorLocked() = %v, want nil for one merged range entry", capErr)
 	}
 	if !ok || !sameUsedStreamMarker(got, marker) {
 		t.Fatalf("used marker lookup = (%+v,%v), want %+v,true", got, ok, marker)
