@@ -31,10 +31,6 @@ func ParseTLVsView(src []byte) ([]TLV, error) {
 	return parseTLVs(src, false)
 }
 
-func parseTLVsView(src []byte) ([]TLV, error) {
-	return parseTLVs(src, false)
-}
-
 func walkTLVs(src []byte, visit tlvVisitor) error {
 	for len(src) > 0 {
 		typ, nType, err := ParseVarint(src)
