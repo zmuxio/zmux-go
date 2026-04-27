@@ -73,13 +73,26 @@ func ReleaseReadFrameBuffer(buf []byte, handle *FrameReadBufferHandle) {
 		return
 	}
 	bucket := &frameReadBufferBuckets[handle.bucket]
-	if cap(handle.buf) != bucket.size {
-		handle.buf = make([]byte, 0, bucket.size)
-	}
-	if cap(buf) == bucket.size {
-		handle.buf = buf[:0]
-	} else {
-		handle.buf = handle.buf[:0]
-	}
+	handle.buf = retainedFrameReadBuffer(buf, handle, bucket.size)
 	bucket.pool.Put(handle)
+}
+
+func retainedFrameReadBuffer(buf []byte, handle *FrameReadBufferHandle, bucketSize int) []byte {
+	if handle == nil || bucketSize <= 0 {
+		return nil
+	}
+	if cap(handle.buf) != bucketSize {
+		return make([]byte, 0, bucketSize)
+	}
+	if cap(buf) == bucketSize && sameBufferBackingStart(buf, handle.buf) {
+		return buf[:0]
+	}
+	return handle.buf[:0]
+}
+
+func sameBufferBackingStart(a, b []byte) bool {
+	if cap(a) == 0 || cap(b) == 0 {
+		return false
+	}
+	return &a[:1][0] == &b[:1][0]
 }

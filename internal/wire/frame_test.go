@@ -80,6 +80,35 @@ func TestReadFrameBufferedNonByteReaderDoesNotOverreadNextFrame(t *testing.T) {
 	}
 }
 
+func TestRetainedFrameReadBufferRejectsForeignSameCapBuffer(t *testing.T) {
+	t.Parallel()
+
+	owned := make([]byte, 0, minFrameReadBufferBucketSize)
+	foreign := make([]byte, 0, minFrameReadBufferBucketSize)
+	handle := &FrameReadBufferHandle{buf: owned}
+
+	got := retainedFrameReadBuffer(foreign, handle, minFrameReadBufferBucketSize)
+	if !sameBufferBackingStart(got, owned) {
+		t.Fatal("retainedFrameReadBuffer replaced handle backing with a foreign buffer")
+	}
+	if sameBufferBackingStart(got, foreign) {
+		t.Fatal("retainedFrameReadBuffer retained foreign backing")
+	}
+}
+
+func TestRetainedFrameReadBufferAcceptsOwnedSameCapBuffer(t *testing.T) {
+	t.Parallel()
+
+	owned := make([]byte, 0, minFrameReadBufferBucketSize)
+	handle := &FrameReadBufferHandle{buf: owned}
+	ownedView := owned[:minFrameReadBufferBucketSize/2]
+
+	got := retainedFrameReadBuffer(ownedView, handle, minFrameReadBufferBucketSize)
+	if !sameBufferBackingStart(got, owned) {
+		t.Fatal("retainedFrameReadBuffer rejected the owned backing")
+	}
+}
+
 func TestReadPrefaceNonByteReaderDoesNotOverreadFollowingFrame(t *testing.T) {
 	t.Parallel()
 

@@ -1858,6 +1858,35 @@ func TestWriteBatchDropsOversizedEncodingBuffer(t *testing.T) {
 	}
 }
 
+func TestRetainedWriteBatchEncodedBufferRejectsForeignSameCapBuffer(t *testing.T) {
+	t.Parallel()
+
+	owned := make([]byte, 0, 128)
+	foreign := make([]byte, 0, 128)
+	handle := &writeBatchEncodedBuffer{buf: owned}
+
+	got := retainedWriteBatchEncodedBuffer(foreign, handle, 128)
+	if !sameWriteBufferBackingStart(got, owned) {
+		t.Fatal("retainedWriteBatchEncodedBuffer replaced handle backing with a foreign buffer")
+	}
+	if sameWriteBufferBackingStart(got, foreign) {
+		t.Fatal("retainedWriteBatchEncodedBuffer retained foreign backing")
+	}
+}
+
+func TestRetainedWriteBatchEncodedBufferAcceptsOwnedSameCapBuffer(t *testing.T) {
+	t.Parallel()
+
+	owned := make([]byte, 0, 128)
+	handle := &writeBatchEncodedBuffer{buf: owned}
+	ownedView := owned[:64]
+
+	got := retainedWriteBatchEncodedBuffer(ownedView, handle, 128)
+	if !sameWriteBufferBackingStart(got, owned) {
+		t.Fatal("retainedWriteBatchEncodedBuffer rejected the owned backing")
+	}
+}
+
 func TestDequeueWriteRequestPrefersUrgentLane(t *testing.T) {
 	t.Parallel()
 
