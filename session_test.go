@@ -12238,6 +12238,171 @@ func TestMaybeCompactProvisionalQueueClearsStaleBackingPointers(t *testing.T) {
 	}
 }
 
+func TestDropPendingStreamControlCompactsSparseQueue(t *testing.T) {
+	c := newSessionMemoryTestConn()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	total := pendingStreamQueueCompactMinHead + 2
+	ids := make([]uint64, total)
+	streams := make([]*nativeStream, total)
+	for i := range ids {
+		ids[i] = 4 + uint64(i)*4
+		if !testSetPendingStreamMaxData(c, ids[i], uint64(i+1)) {
+			t.Fatalf("set pending MAX_DATA for stream %d failed", ids[i])
+		}
+		streams[i] = c.registry.streams[ids[i]]
+	}
+
+	state := c.pending.streamQueueState(pendingStreamQueueMaxData)
+	backing := state.items[:cap(state.items)]
+	for i := 0; i < pendingStreamQueueCompactMinHead; i++ {
+		if !c.dropPendingStreamControlEntryLocked(streamControlMaxData, ids[i]) {
+			t.Fatalf("drop pending MAX_DATA for stream %d failed", ids[i])
+		}
+	}
+
+	queue := state.items
+	first := streams[pendingStreamQueueCompactMinHead]
+	second := streams[pendingStreamQueueCompactMinHead+1]
+	if len(queue) != 2 {
+		t.Fatalf("len(pending MAX_DATA queue) = %d, want 2", len(queue))
+	}
+	if queue[0] != first || queue[1] != second {
+		t.Fatalf("pending MAX_DATA queue order = %p,%p want %p,%p", queue[0], queue[1], first, second)
+	}
+	if first.pendingQueueIndex(pendingStreamQueueMaxData) != 0 || second.pendingQueueIndex(pendingStreamQueueMaxData) != 1 {
+		t.Fatalf("pending MAX_DATA indexes = (%d,%d), want (0,1)", first.pendingQueueIndex(pendingStreamQueueMaxData), second.pendingQueueIndex(pendingStreamQueueMaxData))
+	}
+	if !testHasPendingStreamMaxData(c, first.id) || !testHasPendingStreamMaxData(c, second.id) {
+		t.Fatal("remaining pending MAX_DATA entries were not retained")
+	}
+	if cap(queue) > compactedQueueRetainLimit(len(queue)) {
+		t.Fatalf("pending MAX_DATA queue cap = %d, want <= %d", cap(queue), compactedQueueRetainLimit(len(queue)))
+	}
+	if len(queue) > 0 && len(backing) > 0 && &queue[0] == &backing[0] {
+		t.Fatal("pending MAX_DATA queue retained oversized backing after compaction")
+	}
+	for i := len(queue); i < len(backing); i++ {
+		if backing[i] != nil {
+			t.Fatalf("stale pending MAX_DATA backing entry at %d = %p, want nil", i, backing[i])
+		}
+	}
+}
+
+func TestDropPendingPriorityUpdateCompactsSparseQueue(t *testing.T) {
+	c := newSessionMemoryTestConn()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	total := pendingStreamQueueCompactMinHead + 2
+	ids := make([]uint64, total)
+	streams := make([]*nativeStream, total)
+	for i := range ids {
+		ids[i] = 4 + uint64(i)*4
+		if got := testSetPendingPriorityUpdate(c, ids[i], []byte{byte(i + 1)}); got == 0 {
+			t.Fatalf("set pending priority update for stream %d failed", ids[i])
+		}
+		streams[i] = c.registry.streams[ids[i]]
+	}
+
+	state := c.pending.streamQueueState(pendingStreamQueuePriority)
+	backing := state.items[:cap(state.items)]
+	for i := 0; i < pendingStreamQueueCompactMinHead; i++ {
+		if !c.dropPendingPriorityUpdateEntryLocked(ids[i]) {
+			t.Fatalf("drop pending priority update for stream %d failed", ids[i])
+		}
+	}
+
+	queue := state.items
+	first := streams[pendingStreamQueueCompactMinHead]
+	second := streams[pendingStreamQueueCompactMinHead+1]
+	if len(queue) != 2 {
+		t.Fatalf("len(pending priority queue) = %d, want 2", len(queue))
+	}
+	if queue[0] != first || queue[1] != second {
+		t.Fatalf("pending priority queue order = %p,%p want %p,%p", queue[0], queue[1], first, second)
+	}
+	if first.pendingQueueIndex(pendingStreamQueuePriority) != 0 || second.pendingQueueIndex(pendingStreamQueuePriority) != 1 {
+		t.Fatalf("pending priority indexes = (%d,%d), want (0,1)", first.pendingQueueIndex(pendingStreamQueuePriority), second.pendingQueueIndex(pendingStreamQueuePriority))
+	}
+	if !testHasPendingPriorityUpdate(c, first.id) || !testHasPendingPriorityUpdate(c, second.id) {
+		t.Fatal("remaining pending priority updates were not retained")
+	}
+	if cap(queue) > compactedQueueRetainLimit(len(queue)) {
+		t.Fatalf("pending priority queue cap = %d, want <= %d", cap(queue), compactedQueueRetainLimit(len(queue)))
+	}
+	if len(queue) > 0 && len(backing) > 0 && &queue[0] == &backing[0] {
+		t.Fatal("pending priority queue retained oversized backing after compaction")
+	}
+	for i := len(queue); i < len(backing); i++ {
+		if backing[i] != nil {
+			t.Fatalf("stale pending priority backing entry at %d = %p, want nil", i, backing[i])
+		}
+	}
+}
+
+func TestDropPendingTerminalControlCompactsSparseQueue(t *testing.T) {
+	c := newSessionMemoryTestConn()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	total := pendingStreamQueueCompactMinHead + 2
+	ids := make([]uint64, total)
+	streams := make([]*nativeStream, total)
+	for i := range ids {
+		ids[i] = 4 + uint64(i)*4
+		stream := ensureTestPendingStream(c, ids[i])
+		result := c.setPendingTerminalControlLocked(stream, func(stream *nativeStream) (bool, bool, bool) {
+			stream.pending.terminal.resetPayload = []byte{byte(i + 1)}
+			stream.pending.flags |= streamPendingTerminalReset
+			return true, false, false
+		})
+		if !result.accepted || !result.changed {
+			t.Fatalf("set pending terminal control for stream %d failed: %+v", ids[i], result)
+		}
+		streams[i] = stream
+	}
+
+	state := c.pending.streamQueueState(pendingStreamQueueTerminal)
+	backing := state.items[:cap(state.items)]
+	for i := 0; i < pendingStreamQueueCompactMinHead; i++ {
+		if !c.dropPendingTerminalControlEntryLocked(ids[i]) {
+			t.Fatalf("drop pending terminal control for stream %d failed", ids[i])
+		}
+	}
+
+	queue := state.items
+	first := streams[pendingStreamQueueCompactMinHead]
+	second := streams[pendingStreamQueueCompactMinHead+1]
+	if len(queue) != 2 {
+		t.Fatalf("len(pending terminal queue) = %d, want 2", len(queue))
+	}
+	if queue[0] != first || queue[1] != second {
+		t.Fatalf("pending terminal queue order = %p,%p want %p,%p", queue[0], queue[1], first, second)
+	}
+	if first.pendingQueueIndex(pendingStreamQueueTerminal) != 0 || second.pendingQueueIndex(pendingStreamQueueTerminal) != 1 {
+		t.Fatalf("pending terminal indexes = (%d,%d), want (0,1)", first.pendingQueueIndex(pendingStreamQueueTerminal), second.pendingQueueIndex(pendingStreamQueueTerminal))
+	}
+	if !first.hasPendingTerminalControlLocked() || !second.hasPendingTerminalControlLocked() {
+		t.Fatal("remaining pending terminal controls were not retained")
+	}
+	if cap(queue) > compactedQueueRetainLimit(len(queue)) {
+		t.Fatalf("pending terminal queue cap = %d, want <= %d", cap(queue), compactedQueueRetainLimit(len(queue)))
+	}
+	if len(queue) > 0 && len(backing) > 0 && &queue[0] == &backing[0] {
+		t.Fatal("pending terminal queue retained oversized backing after compaction")
+	}
+	for i := len(queue); i < len(backing); i++ {
+		if backing[i] != nil {
+			t.Fatalf("stale pending terminal backing entry at %d = %p, want nil", i, backing[i])
+		}
+	}
+}
+
 func TestLiveStreamCountCompatibilityRebuildsFromSeededMap(t *testing.T) {
 	c, _, stop := newInvalidFrameConn(t, 0)
 	defer stop()

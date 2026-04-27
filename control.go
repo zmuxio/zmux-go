@@ -324,6 +324,8 @@ const (
 	pendingStreamQueueCount
 )
 
+const pendingStreamQueueCompactMinHead = 64
+
 func pendingStreamQueueKindForControl(kind streamControlKind) pendingStreamQueueKind {
 	switch kind {
 	case streamControlBlocked:
@@ -395,6 +397,26 @@ func (c *Conn) pendingStreamQueueLocked(kind pendingStreamQueueKind) indexedStre
 	}
 	spec := pendingStreamQueueSpecs[kind]
 	return newIndexedStreamQueue(c.pending.streamQueueState(kind), spec.getIndex, spec.setIndex)
+}
+
+func pendingStreamQueueShouldCompact(head, length, count int) bool {
+	holes := length - head - count
+	return head >= pendingStreamQueueCompactMinHead || holes >= count
+}
+
+func pendingStreamQueueEntryValid(kind pendingStreamQueueKind) sparseQueueValidFn[*nativeStream] {
+	return func(stream *nativeStream, idx int) bool {
+		return stream != nil &&
+			stream.pendingQueueIndex(kind) == int32(idx) &&
+			stream.inPendingQueueLocked(kind)
+	}
+}
+
+func (c *Conn) compactPendingStreamQueueLocked(kind pendingStreamQueueKind) {
+	if c == nil || !kind.valid() {
+		return
+	}
+	c.pendingStreamQueueLocked(kind).compact(pendingStreamQueueShouldCompact, pendingStreamQueueEntryValid(kind))
 }
 
 func (c *Conn) ensurePendingStreamQueueLocked(kind pendingStreamQueueKind) {
@@ -504,6 +526,7 @@ func (c *Conn) dropPendingStreamControlEntryLocked(kind streamControlKind, strea
 	if !value.present {
 		if removed {
 			c.recomputePendingControlBytesLocked()
+			c.compactPendingStreamQueueLocked(queueKind)
 		}
 		return c.pending.controlBytes < prevBytes
 	}
@@ -511,6 +534,9 @@ func (c *Conn) dropPendingStreamControlEntryLocked(kind streamControlKind, strea
 		mode:   pendingControlReplaceForced,
 		notify: pendingControlNotifySkip,
 	})
+	if removed {
+		c.compactPendingStreamQueueLocked(queueKind)
+	}
 	return true
 }
 
@@ -716,8 +742,11 @@ func (c *Conn) dropPendingPriorityUpdateEntryLocked(streamID uint64) bool {
 		stream.clearPendingPriorityUpdateLocked()
 		stream.setPendingQueueIndex(pendingStreamQueuePriority, invalidStreamQueueIndex)
 	}
-	if removed := c.pendingPriorityQueueLocked().remove(stream, currentIndex, streamQueueEntryNonNil); removed && !released {
-		c.recomputePendingPriorityBytesLocked()
+	if removed := c.pendingPriorityQueueLocked().remove(stream, currentIndex, streamQueueEntryNonNil); removed {
+		if !released {
+			c.recomputePendingPriorityBytesLocked()
+		}
+		c.compactPendingStreamQueueLocked(pendingStreamQueuePriority)
 	}
 	return released || c.pending.priorityBytes < prevBytes
 }
@@ -780,6 +809,7 @@ func (c *Conn) dropPendingTerminalControlEntryLocked(streamID uint64) bool {
 		notify: pendingControlNotifySkip,
 	})
 	stream.setPendingQueueIndex(pendingStreamQueueTerminal, invalidStreamQueueIndex)
+	c.compactPendingStreamQueueLocked(pendingStreamQueueTerminal)
 	return true
 }
 
