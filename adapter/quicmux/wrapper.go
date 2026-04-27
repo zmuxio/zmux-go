@@ -38,6 +38,7 @@ var metadataPayloadPool = sync.Pool{
 }
 
 var emptyStreamPrelude = []byte{0}
+var errWritevPayloadTooLarge = errors.New("quicmux: writev payload length exceeds int")
 
 func init() {
 	defaultAcceptedPreludeMaxConcurrentValue.Store(defaultAcceptedPreludeMaxConcurrent)
@@ -1143,6 +1144,9 @@ func (s *quicStream) WriteFinal(p []byte) (int, error) {
 }
 
 func (s *quicStream) WritevFinal(parts ...[]byte) (int, error) {
+	if _, ok := quicWritevTotalLen(parts); !ok {
+		return 0, errWritevPayloadTooLarge
+	}
 	var total int
 	for _, part := range parts {
 		n, err := s.Write(part)
@@ -1272,6 +1276,9 @@ func (s *quicSendStream) WriteFinal(p []byte) (int, error) {
 }
 
 func (s *quicSendStream) WritevFinal(parts ...[]byte) (int, error) {
+	if _, ok := quicWritevTotalLen(parts); !ok {
+		return 0, errWritevPayloadTooLarge
+	}
 	var total int
 	for _, part := range parts {
 		n, err := s.Write(part)
@@ -1505,6 +1512,24 @@ func buildStreamPrelude(openPrefix []byte) ([]byte, error) {
 		return openPrefix, nil
 	}
 	return emptyStreamPrelude, nil
+}
+
+func quicWritevTotalLen(parts [][]byte) (int, bool) {
+	return quicWritevTotalLenWithin(parts, int(^uint(0)>>1))
+}
+
+func quicWritevTotalLenWithin(parts [][]byte, limit int) (int, bool) {
+	if limit < 0 {
+		return 0, false
+	}
+	total := 0
+	for _, part := range parts {
+		if len(part) > limit-total {
+			return 0, false
+		}
+		total += len(part)
+	}
+	return total, true
 }
 
 func cloneBytes(src []byte) []byte {

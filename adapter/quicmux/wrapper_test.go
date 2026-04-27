@@ -1341,6 +1341,23 @@ func TestWrapSessionCloseWriteReturnsErrWriteClosedLocally(t *testing.T) {
 	_ = stream.Close()
 }
 
+func TestQuicWritevTotalLenWithinRejectsOverflow(t *testing.T) {
+	parts := [][]byte{
+		[]byte("abc"),
+		[]byte("de"),
+	}
+
+	if got, ok := quicWritevTotalLenWithin(parts, 5); !ok || got != 5 {
+		t.Fatalf("quicWritevTotalLenWithin(limit=5) = (%d, %v), want (5, true)", got, ok)
+	}
+	if got, ok := quicWritevTotalLenWithin(parts, 4); ok || got != 0 {
+		t.Fatalf("quicWritevTotalLenWithin(limit=4) = (%d, %v), want (0, false)", got, ok)
+	}
+	if got, ok := quicWritevTotalLenWithin(parts, -1); ok || got != 0 {
+		t.Fatalf("quicWritevTotalLenWithin(limit=-1) = (%d, %v), want (0, false)", got, ok)
+	}
+}
+
 func TestWrapSessionCancelWriteAfterCloseWriteReturnsErrWriteClosed(t *testing.T) {
 	client, server := newWrappedPair(t)
 
