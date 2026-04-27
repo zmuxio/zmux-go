@@ -2955,6 +2955,47 @@ func TestTxFramePayloadSettersRefreshPayloadLength(t *testing.T) {
 	}
 }
 
+func TestTxFramePartsPayloadTrimsRetainedSlice(t *testing.T) {
+	t.Parallel()
+
+	parts := [][]byte{
+		[]byte("unused-head"),
+		nil,
+		[]byte("aa"),
+		[]byte("bbb"),
+		[]byte("unused-tail"),
+	}
+
+	frame := makeTxFrame(FrameTypeDATA, 0, 4)
+	frame.setPartsPayload(parts, 2, 1, 3)
+	if got := string(frame.clonedPayload()); got != "abb" {
+		t.Fatalf("parts payload = %q, want abb", got)
+	}
+	if got, want := len(frame.payloadParts), 2; got != want {
+		t.Fatalf("payloadParts len = %d, want %d", got, want)
+	}
+	if got, want := cap(frame.payloadParts), len(frame.payloadParts); got != want {
+		t.Fatalf("payloadParts cap = %d, want %d", got, want)
+	}
+	if frame.payloadPartIdx != 0 {
+		t.Fatalf("payloadPartIdx = %d, want 0 after trim", frame.payloadPartIdx)
+	}
+	if frame.payloadPartOff != 1 {
+		t.Fatalf("payloadPartOff = %d, want original offset 1", frame.payloadPartOff)
+	}
+
+	frame.setPrefixedPartsPayload([]byte("p"), parts, 2, 1, 3)
+	if got := string(frame.clonedPayload()); got != "pabb" {
+		t.Fatalf("prefixed parts payload = %q, want pabb", got)
+	}
+	if got, want := len(frame.payloadParts), 2; got != want {
+		t.Fatalf("prefixed payloadParts len = %d, want %d", got, want)
+	}
+	if got, want := cap(frame.payloadParts), len(frame.payloadParts); got != want {
+		t.Fatalf("prefixed payloadParts cap = %d, want %d", got, want)
+	}
+}
+
 func TestTxFramePayloadLengthSaturatesInvalidValues(t *testing.T) {
 	t.Parallel()
 

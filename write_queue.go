@@ -354,6 +354,7 @@ func (f *txFrame) setPartsPayload(parts [][]byte, idx, off, n int) {
 	if f == nil {
 		return
 	}
+	parts, idx, off = trimTxPayloadParts(parts, idx, off, n)
 	f.resetPayloadView()
 	f.payloadKind = txPayloadParts
 	f.payloadParts = parts
@@ -367,6 +368,7 @@ func (f *txFrame) setPrefixedPartsPayload(prefix []byte, parts [][]byte, idx, of
 	if f == nil {
 		return
 	}
+	parts, idx, off = trimTxPayloadParts(parts, idx, off, n)
 	f.resetPayloadView()
 	f.payloadKind = txPayloadPrefixParts
 	f.payloadPrefix = prefix
@@ -375,6 +377,56 @@ func (f *txFrame) setPrefixedPartsPayload(prefix []byte, parts [][]byte, idx, of
 	f.payloadPartOff = off
 	f.payloadPartLen = n
 	f.payloadLen = addTxPayloadLengths(len(prefix), n)
+}
+
+func trimTxPayloadParts(parts [][]byte, idx, off, n int) ([][]byte, int, int) {
+	if n <= 0 || len(parts) == 0 {
+		return nil, 0, 0
+	}
+	if idx < 0 {
+		idx = 0
+		off = 0
+	}
+	if off < 0 {
+		off = 0
+	}
+	for idx < len(parts) && off >= len(parts[idx]) {
+		idx++
+		off = 0
+	}
+	if idx >= len(parts) {
+		return nil, 0, 0
+	}
+
+	start := idx
+	startOff := off
+	remaining := n
+	for idx < len(parts) && remaining > 0 {
+		part := parts[idx]
+		if off >= len(part) {
+			idx++
+			off = 0
+			continue
+		}
+		take := len(part) - off
+		if take > remaining {
+			take = remaining
+		}
+		remaining -= take
+		off += take
+		if off >= len(part) {
+			idx++
+			off = 0
+		}
+	}
+	end := idx
+	if remaining == 0 && off > 0 && idx < len(parts) {
+		end = idx + 1
+	}
+	if end < start {
+		end = start
+	}
+	return parts[start:end:end], 0, startOff
 }
 
 // txFrameQueueCost is the coarse queued-byte accounting used by admission,
