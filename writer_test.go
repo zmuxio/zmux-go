@@ -2188,6 +2188,21 @@ func TestHandleWriteBatchClearsScatterGatherRefs(t *testing.T) {
 	}
 }
 
+func TestClearRetainedBatchRefsDropsOversizedScatterGatherScratch(t *testing.T) {
+	t.Parallel()
+
+	var scratch writeBatchScratch
+	buffers := scratch.scatterGatherBuffers(maxRetainedScatterGatherSegments + 1)
+	buffers = append(buffers, []byte("retained"))
+	scratch.sgBuffers = buffers
+
+	scratch.clearRetainedBatchRefs()
+
+	if scratch.sgBuffers != nil {
+		t.Fatalf("oversized sgBuffers retained cap %d, want dropped", cap(scratch.sgBuffers))
+	}
+}
+
 func TestHandleWriteBatchTransportErrorDoesNotEnqueueCloseFrameFromWriterLoop(t *testing.T) {
 	t.Parallel()
 

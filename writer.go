@@ -186,6 +186,9 @@ func (s *writeBatchScratch) clearRetainedBatchRefs() {
 	}
 	if cap(s.sgBuffers) > 0 {
 		clearNetBuffers(s.sgBuffers[:cap(s.sgBuffers)])
+		if cap(s.sgBuffers) > maxRetainedScatterGatherSegments {
+			s.sgBuffers = nil
+		}
 	}
 	s.clearQueuedStreamRefs()
 }
