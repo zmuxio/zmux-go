@@ -926,6 +926,13 @@ func (b *quicStreamBase) writePayload(writer io.Writer, p []byte) (int, error) {
 		if quicAdapterTerminalError(translated) {
 			b.markLocalWriteClosed(translated)
 		}
+		return n, translated
+	}
+	if n == 0 {
+		return 0, io.ErrNoProgress
+	}
+	if n < len(p) {
+		return n, io.ErrShortWrite
 	}
 	return n, translated
 }

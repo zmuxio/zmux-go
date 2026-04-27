@@ -1129,6 +1129,35 @@ func TestWritePayloadReturnsShortWriteOnInvalidProgress(t *testing.T) {
 	}
 }
 
+func TestWritePayloadRejectsImplicitNoProgressAndShortWrite(t *testing.T) {
+	tests := []struct {
+		name  string
+		n     int
+		wantN int
+		want  error
+	}{
+		{name: "no-progress", n: 0, wantN: 0, want: io.ErrNoProgress},
+		{name: "implicit-short-write", n: 2, wantN: 2, want: io.ErrShortWrite},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := &quicStreamBase{
+				sendPrelude: false,
+				preludeSent: true,
+			}
+
+			n, err := base.writePayload(invalidProgressWriter{n: tt.n}, []byte("abc"))
+			if n != tt.wantN {
+				t.Fatalf("writePayload n = %d, want %d", n, tt.wantN)
+			}
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("writePayload err = %v, want %v", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestWritePayloadAndCloseWriteSerializeUnderlyingClose(t *testing.T) {
 	writer := newConcurrentDetectWriteCloser()
 	base := &quicStreamBase{
