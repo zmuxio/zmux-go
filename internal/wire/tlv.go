@@ -71,8 +71,24 @@ func validateTLVs(src []byte) error {
 	return walkTLVs(src, nil)
 }
 
+const maxTLVParseCapacityHint = 64
+
+func tlvParseCapacityHint(srcLen int) int {
+	if srcLen <= 0 {
+		return 0
+	}
+	hint := srcLen / 2 // The smallest valid TLV is one-byte type + one-byte length.
+	if hint > maxTLVParseCapacityHint {
+		return maxTLVParseCapacityHint
+	}
+	return hint
+}
+
 func parseTLVs(src []byte, cloneValues bool) ([]TLV, error) {
 	var out []TLV
+	if hint := tlvParseCapacityHint(len(src)); hint > 0 {
+		out = make([]TLV, 0, hint)
+	}
 	err := walkTLVs(src, func(typ uint64, value []byte) error {
 		if cloneValues {
 			value = append([]byte(nil), value...)

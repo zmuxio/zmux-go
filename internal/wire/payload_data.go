@@ -51,7 +51,7 @@ func ParseDataPayloadView(payload []byte, flags byte) (DataPayload, error) {
 	}, nil
 }
 
-func parseDataPayload(payload []byte, flags byte, copyOpenInfo bool) (DataPayload, error) {
+func parseDataPayload(payload []byte, flags byte, cloneMetadata bool) (DataPayload, error) {
 	if flags&FrameFlagOpenMetadata == 0 {
 		return DataPayload{AppData: payload}, nil
 	}
@@ -67,11 +67,11 @@ func parseDataPayload(payload []byte, flags byte, copyOpenInfo bool) (DataPayloa
 
 	metadataRaw := remaining[:metadataLen]
 	appData := remaining[metadataLen:]
-	tlvs, err := parseTLVsView(metadataRaw)
+	tlvs, err := parseTLVs(metadataRaw, cloneMetadata)
 	if err != nil {
 		return DataPayload{}, err
 	}
-	parsed, ok, err := parseStreamMetadataTLVs(tlvs, copyOpenInfo)
+	parsed, ok, err := parseStreamMetadataTLVs(tlvs, cloneMetadata)
 	if err != nil {
 		return DataPayload{}, err
 	}

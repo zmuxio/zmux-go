@@ -114,6 +114,60 @@ func TestParseDataPayloadRetainsOpenInfoAfterSourceMutation(t *testing.T) {
 	}
 }
 
+func TestParseDataPayloadRetainsMetadataTLVsAfterSourceMutation(t *testing.T) {
+	t.Parallel()
+
+	priority := uint64(7)
+	raw, err := BuildOpenMetadataPrefix(CapabilityOpenMetadata|CapabilityPriorityHints, &priority, nil, []byte("ssh"), 1024)
+	if err != nil {
+		t.Fatalf("BuildOpenMetadataPrefix err = %v", err)
+	}
+	payload, err := ParseDataPayload(raw, FrameFlagOpenMetadata)
+	if err != nil {
+		t.Fatalf("ParseDataPayload err = %v", err)
+	}
+	if len(payload.MetadataTLVs) == 0 {
+		t.Fatal("MetadataTLVs empty, want parsed metadata")
+	}
+	values := make([][]byte, len(payload.MetadataTLVs))
+	for i := range payload.MetadataTLVs {
+		values[i] = append([]byte(nil), payload.MetadataTLVs[i].Value...)
+	}
+
+	for i := range raw {
+		raw[i] ^= 0xff
+	}
+
+	for i := range payload.MetadataTLVs {
+		if !bytes.Equal(payload.MetadataTLVs[i].Value, values[i]) {
+			t.Fatalf("MetadataTLVs[%d].Value after source mutation = %x, want %x", i, payload.MetadataTLVs[i].Value, values[i])
+		}
+	}
+}
+
+func TestParseDataPayloadOpenInfoDoesNotAliasMetadataTLVs(t *testing.T) {
+	t.Parallel()
+
+	raw, err := BuildOpenMetadataPrefix(CapabilityOpenMetadata, nil, nil, []byte("ssh"), 1024)
+	if err != nil {
+		t.Fatalf("BuildOpenMetadataPrefix err = %v", err)
+	}
+	payload, err := ParseDataPayload(raw, FrameFlagOpenMetadata)
+	if err != nil {
+		t.Fatalf("ParseDataPayload err = %v", err)
+	}
+
+	for i := range payload.MetadataTLVs {
+		if StreamMetadataType(payload.MetadataTLVs[i].Type) == MetadataOpenInfo {
+			payload.MetadataTLVs[i].Value[0] = 'x'
+		}
+	}
+
+	if !bytes.Equal(payload.OpenInfo, []byte("ssh")) {
+		t.Fatalf("OpenInfo after MetadataTLVs mutation = %q, want %q", payload.OpenInfo, "ssh")
+	}
+}
+
 func TestParseDataPayloadViewAliasesOpenInfoSource(t *testing.T) {
 	t.Parallel()
 
