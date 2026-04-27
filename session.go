@@ -1799,6 +1799,9 @@ func (c *Conn) planAbortLiveStreamLocked(stream *nativeStream, code ErrorCode, r
 	appErr := applicationErr(uint64(code), reason)
 	c.noteAbortReasonLocked(appErr.Code)
 	stream.setAbortedWithSource(appErr, terminalAbortLocal)
+	if err := c.recordLocalAbortTerminalChurnLocked(stream, time.Now(), "queue ABORT"); err != nil {
+		return txFrame{}, err
+	}
 	c.finalizeTerminalStreamLocked(stream, transientStreamReleaseOptions{
 		send:    true,
 		receive: streamReceiveReleaseAndClearReadBuf,

@@ -2055,11 +2055,36 @@ func (c *Conn) recordVisibleTerminalChurnLocked(stream *nativeStream, now time.T
 	)
 }
 
+func (c *Conn) recordLocalAbortTerminalChurnLocked(stream *nativeStream, now time.Time, op string) error {
+	if c == nil || !shouldRecordLocalAbortTerminalChurnLocked(stream) {
+		return nil
+	}
+	stream.markChurnCounted()
+	return c.recordChurnLocked(
+		now,
+		&c.abuse.visibleChurnWindowStart,
+		&c.abuse.visibleChurnCount,
+		c.visibleChurnWindowLocked(),
+		c.visibleChurnThresholdLocked(),
+		op,
+		"rapid open-then-reset/abort churn exceeded local threshold",
+	)
+}
+
 func shouldRecordVisibleTerminalChurnLocked(stream *nativeStream) bool {
 	if stream == nil {
 		return false
 	}
 	return !stream.isLocalOpenedLocked() && stream.applicationVisible && !stream.acceptedFlag() && !stream.churnCountedFlag() &&
+		state.FullyTerminal(stream.localSend, stream.localReceive, stream.effectiveSendHalfStateLocked(), stream.effectiveRecvHalfStateLocked())
+}
+
+func shouldRecordLocalAbortTerminalChurnLocked(stream *nativeStream) bool {
+	if stream == nil {
+		return false
+	}
+	localAbort := stream.sendAbortSource == terminalAbortLocal || stream.recvAbortSource == terminalAbortLocal
+	return localAbort && !stream.isLocalOpenedLocked() && !stream.acceptedFlag() && !stream.churnCountedFlag() &&
 		state.FullyTerminal(stream.localSend, stream.localReceive, stream.effectiveSendHalfStateLocked(), stream.effectiveRecvHalfStateLocked())
 }
 

@@ -7784,6 +7784,39 @@ func TestRapidVisibleAbortChurnTriggersProtocolClose(t *testing.T) {
 	}
 }
 
+func TestRapidLocalFlowControlAbortChurnTriggersProtocolClose(t *testing.T) {
+	c, _, stop := newInvalidPolicyConn(t)
+	defer stop()
+
+	c.queues.acceptBacklogLimit = 1024
+	c.queues.acceptBacklogBytesLimit = 1 << 20
+	c.config.local.Settings.InitialMaxData = uint64(visibleChurnThreshold + 1)
+	c.config.local.Settings.InitialMaxStreamDataBidiPeerOpened = 0
+	c.flow.recvSessionAdvertised = c.config.local.Settings.InitialMaxData
+
+	start := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
+	for i := 0; i < visibleChurnThreshold; i++ {
+		streamID := start + uint64(i*4)
+		if err := c.handleDataFrame(Frame{
+			Type:     FrameTypeDATA,
+			StreamID: streamID,
+			Payload:  []byte("x"),
+		}); err != nil {
+			t.Fatalf("early local flow-control abort churn %d err = %v, want nil", i+1, err)
+		}
+	}
+
+	lastID := start + uint64(visibleChurnThreshold*4)
+	err := c.handleDataFrame(Frame{
+		Type:     FrameTypeDATA,
+		StreamID: lastID,
+		Payload:  []byte("x"),
+	})
+	if !IsErrorCode(err, CodeProtocol) {
+		t.Fatalf("final local flow-control abort churn err = %v, want %s", err, CodeProtocol)
+	}
+}
+
 func TestRapidVisibleUniResetChurnTriggersProtocolClose(t *testing.T) {
 	c, _, stop := newInvalidPolicyConn(t)
 	defer stop()
