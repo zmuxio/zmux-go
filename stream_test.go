@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	rt "github.com/zmuxio/zmux-go/internal/runtime"
 	"github.com/zmuxio/zmux-go/internal/state"
 )
 
@@ -2953,6 +2954,124 @@ func TestFailUnopenedLocalStreamClearsPendingRuntimeState(t *testing.T) {
 	}
 	if pendingPriorityBytes != 0 {
 		t.Fatalf("pendingPriorityBytes = %d, want 0 after failUnopenedLocalStreamLocked", pendingPriorityBytes)
+	}
+}
+
+func TestFailUnopenedLocalStreamDropsWriteBatchState(t *testing.T) {
+	t.Parallel()
+
+	c := newSessionMemoryTestConn()
+	c.config.peer.Settings.SchedulerHints = SchedulerGroupFair
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stream := c.newLocalStreamLocked(
+		state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), streamArityBidi, OpenOptions{}, nil,
+	)
+	stream.readNotify = make(chan struct{}, 1)
+	stream.writeNotify = make(chan struct{}, 1)
+	c.registry.streams[stream.id] = stream
+	c.setStreamGroupLocked(stream, 7, true)
+	testSeedWriteBatchStateForStream(c, stream, 7)
+
+	c.failUnopenedLocalStreamLocked(stream, &ApplicationError{Code: uint64(CodeCancelled)})
+
+	if c.registry.streams[stream.id] != nil {
+		t.Fatal("live stream retained after failUnopenedLocalStreamLocked")
+	}
+	if stream.groupTracked {
+		t.Fatal("stream group tracking retained after failUnopenedLocalStreamLocked")
+	}
+	testRequireWriteBatchStateDropped(t, c, stream.id, 7)
+}
+
+func TestPreparedLocalAbortDropsWriteBatchState(t *testing.T) {
+	t.Parallel()
+
+	c := newSessionMemoryTestConn()
+	c.config.peer.Settings.SchedulerHints = SchedulerGroupFair
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stream := testVisibleBidiStream(c, state.FirstLocalStreamID(c.config.negotiated.LocalRole, true))
+	c.setStreamGroupLocked(stream, 7, true)
+	testSeedWriteBatchStateForStream(c, stream, 7)
+
+	frameType, _ := stream.applyPreparedTerminalSignalLocked(
+		terminalSignalAbort,
+		uint64(CodeCancelled),
+		&ApplicationError{Code: uint64(CodeCancelled)},
+		terminalSignalOptions{},
+	)
+	if frameType != FrameTypeABORT {
+		t.Fatalf("frameType = %v, want ABORT", frameType)
+	}
+	if stream.groupTracked {
+		t.Fatal("stream group tracking retained after prepared local abort")
+	}
+	testRequireWriteBatchStateDropped(t, c, stream.id, 7)
+}
+
+func testSeedWriteBatchStateForStream(c *Conn, stream *nativeStream, explicitGroup uint64) {
+	if c == nil || stream == nil {
+		return
+	}
+	streamKey := rt.GroupKey{Kind: 0, Value: stream.id}
+	groupKey := rt.GroupKey{Kind: 1, Value: explicitGroup}
+	c.writer.scheduler.State.StreamFinishTag = map[uint64]uint64{stream.id: 3}
+	c.writer.scheduler.State.StreamLastService = map[uint64]uint64{stream.id: 7}
+	c.writer.scheduler.State.StreamLag = map[uint64]int64{stream.id: 11}
+	c.writer.scheduler.State.StreamLastSeenBatch = map[uint64]uint64{stream.id: 13}
+	c.writer.scheduler.State.SmallBurstDisarmed = map[uint64]struct{}{stream.id: {}}
+	c.writer.scheduler.State.GroupVirtualTime = map[rt.GroupKey]uint64{streamKey: 17, groupKey: 19}
+	c.writer.scheduler.State.GroupFinishTag = map[rt.GroupKey]uint64{streamKey: 23, groupKey: 29}
+	c.writer.scheduler.State.GroupLastService = map[rt.GroupKey]uint64{streamKey: 31, groupKey: 37}
+	c.writer.scheduler.State.GroupLag = map[rt.GroupKey]int64{streamKey: 41, groupKey: 43}
+	c.writer.scheduler.State.PreferredStreamHead = map[rt.GroupKey]uint64{streamKey: stream.id, groupKey: stream.id}
+}
+
+func testRequireWriteBatchStateDropped(t *testing.T, c *Conn, streamID uint64, explicitGroup uint64) {
+	t.Helper()
+
+	if got := c.writer.scheduler.ActiveGroupRefs[explicitGroup]; got != 0 {
+		t.Fatalf("active explicit group refs for %d = %d, want 0", explicitGroup, got)
+	}
+	if _, ok := c.writer.scheduler.State.StreamFinishTag[streamID]; ok {
+		t.Fatalf("stream finish tag for %d retained", streamID)
+	}
+	if _, ok := c.writer.scheduler.State.StreamLastService[streamID]; ok {
+		t.Fatalf("stream last service for %d retained", streamID)
+	}
+	if _, ok := c.writer.scheduler.State.StreamLag[streamID]; ok {
+		t.Fatalf("stream lag for %d retained", streamID)
+	}
+	if _, ok := c.writer.scheduler.State.StreamLastSeenBatch[streamID]; ok {
+		t.Fatalf("stream last-seen batch for %d retained", streamID)
+	}
+	if _, ok := c.writer.scheduler.State.SmallBurstDisarmed[streamID]; ok {
+		t.Fatalf("small-burst disarmed state for %d retained", streamID)
+	}
+
+	streamKey := rt.GroupKey{Kind: 0, Value: streamID}
+	groupKey := rt.GroupKey{Kind: 1, Value: explicitGroup}
+	for _, key := range []rt.GroupKey{streamKey, groupKey} {
+		if _, ok := c.writer.scheduler.State.GroupVirtualTime[key]; ok {
+			t.Fatalf("group virtual time for key %#v retained", key)
+		}
+		if _, ok := c.writer.scheduler.State.GroupFinishTag[key]; ok {
+			t.Fatalf("group finish tag for key %#v retained", key)
+		}
+		if _, ok := c.writer.scheduler.State.GroupLastService[key]; ok {
+			t.Fatalf("group last-service state for key %#v retained", key)
+		}
+		if _, ok := c.writer.scheduler.State.GroupLag[key]; ok {
+			t.Fatalf("group lag for key %#v retained", key)
+		}
+		if _, ok := c.writer.scheduler.State.PreferredStreamHead[key]; ok {
+			t.Fatalf("preferred stream head for key %#v retained", key)
+		}
 	}
 }
 

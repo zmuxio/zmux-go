@@ -1520,8 +1520,9 @@ func (c *Conn) failUnopenedLocalStreamLocked(stream *nativeStream, appErr *Appli
 	}
 	stream.setAbortedWithSource(appErr, terminalAbortLocal)
 	c.finalizeTerminalStreamLocked(stream, transientStreamReleaseOptions{
-		send:    true,
-		receive: streamReceiveReleaseAndClearReadBuf,
+		scheduler: schedulerReleaseDrop,
+		send:      true,
+		receive:   streamReceiveReleaseAndClearReadBuf,
 	}, streamNotifyBoth, false)
 	c.dropLiveStreamLocked(stream.id)
 	c.removeUnseenLocalLocked(stream)
@@ -1709,8 +1710,9 @@ func (s *nativeStream) applyPreparedTerminalSignalLocked(kind terminalSignalKind
 		s.setAbortedWithSource(appErr, terminalAbortLocal)
 		s.conn.noteAbortReasonLocked(code)
 		s.conn.finalizeTerminalStreamLocked(s, transientStreamReleaseOptions{
-			send:    true,
-			receive: streamReceiveReleaseAndClearReadBuf,
+			scheduler: schedulerReleaseDrop,
+			send:      true,
+			receive:   streamReceiveReleaseAndClearReadBuf,
 		}, streamNotifyBoth, false)
 		return FrameTypeABORT, terminalWriteWakeSkip
 	default:
