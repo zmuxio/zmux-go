@@ -777,6 +777,36 @@ func TestEnsureOpenPreludeKeepsBufferUntilFullySent(t *testing.T) {
 	}
 }
 
+func TestEnsureOpenPreludeReturnsShortWriteOnInvalidProgress(t *testing.T) {
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{name: "negative", n: -1},
+		{name: "too-large", n: 1 << 20},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := &quicStreamBase{}
+			initLocalStreamBase(base, nil, nil, invalidProgressWriter{n: tt.n}, zmux.OpenOptions{
+				OpenInfo: []byte("ssh"),
+			})
+
+			err := base.ensureOpenPrelude()
+			if !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("ensureOpenPrelude err = %v, want %v", err, io.ErrShortWrite)
+			}
+			if base.preludeOffset != 0 {
+				t.Fatalf("preludeOffset = %d, want 0 after invalid progress", base.preludeOffset)
+			}
+			if base.preludeSent {
+				t.Fatal("preludeSent = true after invalid progress, want false")
+			}
+		})
+	}
+}
+
 func TestEnsureOpenPreludeWithContextCancelsBlockedWrite(t *testing.T) {
 	writer := newDeadlineAwareWriter()
 	base := &quicStreamBase{}
@@ -809,6 +839,33 @@ func TestEnsureOpenPreludeWithContextCancelsBlockedWrite(t *testing.T) {
 	}
 	if !deadlines[len(deadlines)-1].IsZero() {
 		t.Fatalf("last deadline = %v, want cleared zero deadline", deadlines[len(deadlines)-1])
+	}
+}
+
+func TestWritePayloadReturnsShortWriteOnInvalidProgress(t *testing.T) {
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{name: "negative", n: -1},
+		{name: "too-large", n: 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := &quicStreamBase{
+				sendPrelude: false,
+				preludeSent: true,
+			}
+
+			n, err := base.writePayload(invalidProgressWriter{n: tt.n}, []byte("abc"))
+			if n != 0 {
+				t.Fatalf("writePayload n = %d, want 0 after invalid progress", n)
+			}
+			if !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("writePayload err = %v, want %v", err, io.ErrShortWrite)
+			}
+		})
 	}
 }
 
@@ -1229,6 +1286,14 @@ func (w *partialPreludeWriter) Write(p []byte) (int, error) {
 		return n, w.failErr
 	}
 	return w.Buffer.Write(p)
+}
+
+type invalidProgressWriter struct {
+	n int
+}
+
+func (w invalidProgressWriter) Write(_ []byte) (int, error) {
+	return w.n, nil
 }
 
 type concurrentDetectWriteCloser struct {

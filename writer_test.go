@@ -1532,6 +1532,20 @@ func (c *zeroProgressWriteCloser) Write(_ []byte) (int, error) {
 
 func (c *zeroProgressWriteCloser) Close() error { return nil }
 
+type invalidProgressWriteCloser struct {
+	n int
+}
+
+func (c invalidProgressWriteCloser) Read(_ []byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (c invalidProgressWriteCloser) Write(_ []byte) (int, error) {
+	return c.n, nil
+}
+
+func (c invalidProgressWriteCloser) Close() error { return nil }
+
 func decodeFramesForTest(t *testing.T, data []byte) []Frame {
 	t.Helper()
 
@@ -2816,6 +2830,30 @@ func TestWriteAllReturnsNoProgressOnZeroWrite(t *testing.T) {
 	err := rt.WriteAll(&zeroProgressWriteCloser{}, []byte("abc"))
 	if !errors.Is(err, io.ErrNoProgress) {
 		t.Fatalf("writeAll err = %v, want %v", err, io.ErrNoProgress)
+	}
+}
+
+func TestWriteAllReturnsShortWriteOnInvalidProgress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{name: "negative", n: -1},
+		{name: "too-large", n: 4},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := rt.WriteAll(invalidProgressWriteCloser{n: tt.n}, []byte("abc"))
+			if !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("writeAll err = %v, want %v", err, io.ErrShortWrite)
+			}
+		})
 	}
 }
 

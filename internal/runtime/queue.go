@@ -293,6 +293,9 @@ func EffectiveDeadline(current, override time.Time) time.Time {
 func WriteAll(w io.Writer, p []byte) error {
 	for len(p) > 0 {
 		n, err := w.Write(p)
+		if n < 0 || n > len(p) {
+			return io.ErrShortWrite
+		}
 		if err != nil {
 			return err
 		}

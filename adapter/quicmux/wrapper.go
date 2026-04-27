@@ -651,7 +651,11 @@ func (b *quicStreamBase) ensureOpenPreludeLocked() error {
 		return nil
 	}
 	for b.preludeOffset < len(prelude) {
-		n, err := b.preludeWriter.Write(prelude[b.preludeOffset:])
+		remaining := prelude[b.preludeOffset:]
+		n, err := b.preludeWriter.Write(remaining)
+		if n < 0 || n > len(remaining) {
+			return io.ErrShortWrite
+		}
 		if n > 0 {
 			b.preludeOffset += n
 		}
@@ -700,6 +704,9 @@ func (b *quicStreamBase) writePayload(writer io.Writer, p []byte) (int, error) {
 		return 0, zmux.ErrWriteClosed
 	}
 	n, err := writer.Write(p)
+	if n < 0 || n > len(p) {
+		return 0, io.ErrShortWrite
+	}
 	if err != nil && b.localWriteClosed.Load() {
 		if localErr := b.loadLocalWriteErr(); localErr != nil {
 			return n, localErr
