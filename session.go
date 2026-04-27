@@ -1515,13 +1515,23 @@ const establishmentFailureWriteWait = 250 * time.Millisecond
 const establishmentSuccessWriteWait = time.Second
 
 var errEstablishmentPrefaceWriteTimeout = errors.New("local preface write stalled during establishment")
+var errEstablishmentPrefaceReadTimeout = errors.New("peer preface read stalled during establishment")
 
 type writeDeadlineSetter interface {
 	SetWriteDeadline(time.Time) error
 }
 
+type readDeadlineSetter interface {
+	SetReadDeadline(time.Time) error
+}
+
 type establishmentWriteDeadline struct {
 	setter writeDeadlineSetter
+	armed  bool
+}
+
+type establishmentReadDeadline struct {
+	setter readDeadlineSetter
 	armed  bool
 }
 
@@ -1539,11 +1549,32 @@ func beginEstablishmentWriteDeadline(conn io.ReadWriteCloser, timeout time.Durat
 	return establishmentWriteDeadline{setter: setter, armed: true}
 }
 
+func beginEstablishmentReadDeadline(conn io.ReadWriteCloser, timeout time.Duration) establishmentReadDeadline {
+	if timeout <= 0 || conn == nil {
+		return establishmentReadDeadline{}
+	}
+	setter, ok := conn.(readDeadlineSetter)
+	if !ok {
+		return establishmentReadDeadline{}
+	}
+	if err := setter.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return establishmentReadDeadline{}
+	}
+	return establishmentReadDeadline{setter: setter, armed: true}
+}
+
 func (d establishmentWriteDeadline) clear() error {
 	if !d.armed || d.setter == nil {
 		return nil
 	}
 	return d.setter.SetWriteDeadline(time.Time{})
+}
+
+func (d establishmentReadDeadline) clear() error {
+	if !d.armed || d.setter == nil {
+		return nil
+	}
+	return d.setter.SetReadDeadline(time.Time{})
 }
 
 func (d establishmentWriteDeadline) expedite() {
@@ -1559,6 +1590,16 @@ func normalizeEstablishmentWriteErr(err error, deadline establishmentWriteDeadli
 	}
 	if deadline.armed && errors.Is(err, os.ErrDeadlineExceeded) {
 		return errEstablishmentPrefaceWriteTimeout
+	}
+	return err
+}
+
+func normalizeEstablishmentReadErr(err error, deadline establishmentReadDeadline) error {
+	if err == nil {
+		return nil
+	}
+	if deadline.armed && errors.Is(err, os.ErrDeadlineExceeded) {
+		return errEstablishmentPrefaceReadTimeout
 	}
 	return err
 }
@@ -2291,12 +2332,20 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 	reader := bufio.NewReaderSize(conn, connReadBufferSize)
 	writeErrCh := make(chan error, 1)
 	writeDeadline := beginEstablishmentWriteDeadline(conn, establishmentSuccessWriteWait)
+	readDeadline := beginEstablishmentReadDeadline(conn, establishmentSuccessWriteWait)
 	go func() { writeErrCh <- rt.WriteAll(conn, payload) }()
 
 	peer, readErr := ReadPreface(reader)
 	if readErr != nil {
+		if readErr = normalizeEstablishmentReadErr(readErr, readDeadline); errors.Is(readErr, errEstablishmentPrefaceReadTimeout) {
+			readErr = wireError(CodeInternal, "read preface", readErr)
+		}
 		finishEstablishmentFailure(conn, writeErrCh, writeDeadline, local, nil, readErr)
 		return nil, readErr
+	}
+	if err := readDeadline.clear(); err != nil {
+		finishEstablishmentFailure(conn, writeErrCh, writeDeadline, local, &peer, err)
+		return nil, err
 	}
 
 	negotiated, err := NegotiatePrefaces(local, peer)

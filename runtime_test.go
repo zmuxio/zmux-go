@@ -1825,8 +1825,9 @@ func (c *scriptedDuplexConn) bytes() []byte {
 
 type recordingDeadlineDuplexConn struct {
 	*scriptedDuplexConn
-	mu        sync.Mutex
-	deadlines []time.Time
+	mu             sync.Mutex
+	readDeadlines  []time.Time
+	writeDeadlines []time.Time
 }
 
 func newRecordingDeadlineDuplexConn(inbound []byte) *recordingDeadlineDuplexConn {
@@ -1838,14 +1839,84 @@ func newRecordingDeadlineDuplexConn(inbound []byte) *recordingDeadlineDuplexConn
 func (c *recordingDeadlineDuplexConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.deadlines = append(c.deadlines, t)
+	c.writeDeadlines = append(c.writeDeadlines, t)
+	return nil
+}
+
+func (c *recordingDeadlineDuplexConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readDeadlines = append(c.readDeadlines, t)
 	return nil
 }
 
 func (c *recordingDeadlineDuplexConn) snapshotWriteDeadlines() []time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]time.Time(nil), c.deadlines...)
+	return append([]time.Time(nil), c.writeDeadlines...)
+}
+
+func (c *recordingDeadlineDuplexConn) snapshotReadDeadlines() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.readDeadlines...)
+}
+
+type readDeadlineTimeoutConn struct {
+	mu             sync.Mutex
+	deadline       time.Time
+	deadlineNotify chan struct{}
+	closed         bool
+	written        bytes.Buffer
+}
+
+func newReadDeadlineTimeoutConn() *readDeadlineTimeoutConn {
+	return &readDeadlineTimeoutConn{deadlineNotify: make(chan struct{})}
+}
+
+func (c *readDeadlineTimeoutConn) Read(_ []byte) (int, error) {
+	for {
+		c.mu.Lock()
+		closed := c.closed
+		deadline := c.deadline
+		notifyCh := c.deadlineNotify
+		c.mu.Unlock()
+		if closed {
+			return 0, io.ErrClosedPipe
+		}
+		if !deadline.IsZero() {
+			return 0, os.ErrDeadlineExceeded
+		}
+		<-notifyCh
+	}
+}
+
+func (c *readDeadlineTimeoutConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, io.ErrClosedPipe
+	}
+	return c.written.Write(p)
+}
+
+func (c *readDeadlineTimeoutConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadline = t
+	close(c.deadlineNotify)
+	c.deadlineNotify = make(chan struct{})
+	return nil
+}
+
+func (c *readDeadlineTimeoutConn) Close() error {
+	c.mu.Lock()
+	if !c.closed {
+		c.closed = true
+		close(c.deadlineNotify)
+	}
+	c.mu.Unlock()
+	return nil
 }
 
 type deadlineBlockingConn struct {
@@ -2166,7 +2237,7 @@ func TestClientEstablishmentRoleConflictEmitsFatalClose(t *testing.T) {
 	}
 }
 
-func TestClientEstablishmentClearsTemporaryWriteDeadlineOnSuccess(t *testing.T) {
+func TestClientEstablishmentClearsTemporaryDeadlinesOnSuccess(t *testing.T) {
 	t.Parallel()
 
 	conn := newRecordingDeadlineDuplexConn(testPrefaceBytesForRole(t, RoleResponder))
@@ -2187,6 +2258,34 @@ func TestClientEstablishmentClearsTemporaryWriteDeadlineOnSuccess(t *testing.T) 
 	}
 	if !got[len(got)-1].IsZero() {
 		t.Fatalf("final write deadline = %v, want cleared zero deadline", got[len(got)-1])
+	}
+
+	readDeadlines := conn.snapshotReadDeadlines()
+	if len(readDeadlines) < 2 {
+		t.Fatalf("read deadline calls = %d, want at least arm+clear", len(readDeadlines))
+	}
+	if readDeadlines[0].IsZero() {
+		t.Fatal("initial establishment read deadline was not armed")
+	}
+	if !readDeadlines[len(readDeadlines)-1].IsZero() {
+		t.Fatalf("final read deadline = %v, want cleared zero deadline", readDeadlines[len(readDeadlines)-1])
+	}
+}
+
+func TestClientEstablishmentReadDeadlineBoundsMissingPeerPreface(t *testing.T) {
+	t.Parallel()
+
+	conn := newReadDeadlineTimeoutConn()
+	client, err := Client(conn, nil)
+	if client != nil {
+		_ = client.Close()
+		t.Fatal("expected client establish to fail after missing peer preface")
+	}
+	if !errors.Is(err, errEstablishmentPrefaceReadTimeout) {
+		t.Fatalf("Client err = %v, want establishment preface read timeout", err)
+	}
+	if !IsErrorCode(err, CodeInternal) {
+		t.Fatalf("Client err = %v, want %s", err, CodeInternal)
 	}
 }
 
