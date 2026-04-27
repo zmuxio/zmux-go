@@ -147,7 +147,8 @@ func (c *Conn) markUsedStreamLocked(streamID uint64, marker usedStreamMarker) {
 		return
 	}
 	if c.registry.usedStreamRangeMode {
-		c.registry.usedStreamRanges = upsertUsedStreamRange(c.registry.usedStreamRanges, streamID, marker)
+		c.registry.usedStreamRanges = shrinkCompactedQueueBacking(upsertUsedStreamRange(c.registry.usedStreamRanges, streamID, marker))
+		c.dropUsedStreamMapEntryLocked(streamID)
 		return
 	}
 	if c.registry.usedStreamData == nil {
@@ -155,6 +156,16 @@ func (c *Conn) markUsedStreamLocked(streamID uint64, marker usedStreamMarker) {
 	}
 	c.registry.usedStreamData[streamID] = marker
 	c.compactMarkerOnlyRangesLocked()
+}
+
+func (c *Conn) dropUsedStreamMapEntryLocked(streamID uint64) {
+	if c == nil || c.registry.usedStreamData == nil {
+		return
+	}
+	delete(c.registry.usedStreamData, streamID)
+	if len(c.registry.usedStreamData) == 0 {
+		c.registry.usedStreamData = nil
+	}
 }
 
 func sameUsedStreamMarker(a, b usedStreamMarker) bool {
@@ -305,9 +316,9 @@ func (c *Conn) compactMarkerOnlyRangesLocked() {
 	for _, streamID := range ids {
 		marker := c.registry.usedStreamData[streamID]
 		ranges = upsertUsedStreamRange(ranges, streamID, marker)
-		delete(c.registry.usedStreamData, streamID)
+		c.dropUsedStreamMapEntryLocked(streamID)
 	}
-	c.registry.usedStreamRanges = ranges
+	c.registry.usedStreamRanges = shrinkCompactedQueueBacking(ranges)
 	c.registry.usedStreamRangeMode = true
 }
 

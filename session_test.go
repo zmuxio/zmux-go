@@ -11422,6 +11422,72 @@ func TestMarkerOnlyUsedStreamLimitOverrideClosesSessionWhenExceeded(t *testing.T
 	}
 }
 
+func TestCompactMarkerOnlyRangesDropsEmptyMapBacking(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	marker := usedStreamMarker{action: lateDataAbortClosed, cause: lateDataCauseReset}
+
+	c.mu.Lock()
+	c.registry.usedStreamData = make(map[uint64]usedStreamMarker)
+	for i := 0; i < 64; i++ {
+		c.registry.usedStreamData[4+uint64(i)*4] = marker
+	}
+	c.compactMarkerOnlyRangesLocked()
+	mapReleased := c.registry.usedStreamData == nil
+	rangeMode := c.registry.usedStreamRangeMode
+	retained := c.markerOnlyRetainedLocked()
+	got, ok := c.usedStreamMarkerForLocked(4 + 63*4)
+	c.mu.Unlock()
+
+	if !mapReleased {
+		t.Fatal("usedStreamData map retained empty backing after marker-only range compaction")
+	}
+	if !rangeMode {
+		t.Fatal("usedStreamRangeMode = false, want true after compaction")
+	}
+	if retained != 64 {
+		t.Fatalf("markerOnlyRetainedLocked() = %d, want 64 streams in merged range", retained)
+	}
+	if !ok || !sameUsedStreamMarker(got, marker) {
+		t.Fatalf("used marker lookup = (%+v,%v), want %+v,true", got, ok, marker)
+	}
+}
+
+func TestRangeModeMarkUsedStreamDropsStaleMapEntry(t *testing.T) {
+	c := newSessionMemoryTestConn()
+	streamID := uint64(4)
+	marker := usedStreamMarker{action: lateDataAbortState, cause: lateDataCauseAbort}
+
+	c.mu.Lock()
+	c.registry.usedStreamRangeMode = true
+	c.registry.usedStreamRanges = []usedStreamRange{{
+		start:  streamID,
+		end:    streamID,
+		marker: usedStreamMarker{action: lateDataAbortClosed, cause: lateDataCauseCloseRead},
+	}}
+	c.registry.usedStreamData = map[uint64]usedStreamMarker{
+		streamID: {action: lateDataAbortClosed, cause: lateDataCauseCloseRead},
+	}
+	c.markUsedStreamLocked(streamID, marker)
+	_, staleMapEntry := c.registry.usedStreamData[streamID]
+	mapReleased := c.registry.usedStreamData == nil
+	retained := c.markerOnlyRetainedLocked()
+	got, ok := c.usedStreamMarkerForLocked(streamID)
+	c.mu.Unlock()
+
+	if staleMapEntry {
+		t.Fatal("range-mode mark retained stale usedStreamData entry")
+	}
+	if !mapReleased {
+		t.Fatal("range-mode mark retained empty usedStreamData map")
+	}
+	if retained != 1 {
+		t.Fatalf("markerOnlyRetainedLocked() = %d, want 1 range without duplicate map entry", retained)
+	}
+	if !ok || !sameUsedStreamMarker(got, marker) {
+		t.Fatalf("used marker lookup = (%+v,%v), want %+v,true", got, ok, marker)
+	}
+}
+
 func TestTrackedSessionMemoryIncludesRetainedOpenInfoBytes(t *testing.T) {
 	c := newSessionMemoryTestConn()
 	c.mu.Lock()

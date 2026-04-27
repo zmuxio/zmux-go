@@ -3455,7 +3455,15 @@ func (c *Conn) markerOnlyRetainedLocked() int {
 	if c == nil {
 		return 0
 	}
-	return c.markerOnlyMapCountLocked() + len(c.registry.usedStreamRanges)
+	return saturatingAddInt(c.markerOnlyMapCountLocked(), c.markerOnlyRangeStreamCountLocked())
+}
+
+func saturatingAddInt(a, b int) int {
+	maxInt := int(^uint(0) >> 1)
+	if a >= maxInt || b >= maxInt || a > maxInt-b {
+		return maxInt
+	}
+	return a + b
 }
 
 func (c *Conn) markerOnlyMapCountLocked() int {
@@ -3468,6 +3476,29 @@ func (c *Conn) markerOnlyMapCountLocked() int {
 			continue
 		}
 		count++
+	}
+	return count
+}
+
+func usedStreamRangeStreamCount(r usedStreamRange) int {
+	if r.end < r.start {
+		return 0
+	}
+	count := (r.end-r.start)/4 + 1
+	maxInt := uint64(int(^uint(0) >> 1))
+	if count > maxInt {
+		return int(maxInt)
+	}
+	return int(count)
+}
+
+func (c *Conn) markerOnlyRangeStreamCountLocked() int {
+	if c == nil || len(c.registry.usedStreamRanges) == 0 {
+		return 0
+	}
+	count := 0
+	for _, r := range c.registry.usedStreamRanges {
+		count = saturatingAddInt(count, usedStreamRangeStreamCount(r))
 	}
 	return count
 }
