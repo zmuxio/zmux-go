@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/quic-go/quic-go v0.59.0
-	github.com/zmuxio/zmux-go v1.0.8
+	github.com/zmuxio/zmux-go v1.0.9
 )
 
 require (
