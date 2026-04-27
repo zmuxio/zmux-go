@@ -1,8 +1,6 @@
 package zmux
 
 import (
-	"io"
-	"net"
 	"sync"
 	"time"
 
@@ -16,7 +14,6 @@ type writeBatchScratch struct {
 	items            []rt.BatchItem
 	ordered          []writeRequest
 	rejected         []rejectedWriteRequest
-	sgBuffers        net.Buffers
 	encoded          []byte
 	encodedHandle    *writeBatchEncodedBuffer
 	explicitGroups   map[uint64]struct{}
@@ -45,7 +42,6 @@ type dequeuedWriteWork struct {
 }
 
 const maxControlBatchesPerWake = 4
-const maxRetainedScatterGatherSegments = 2048
 
 var maxRetainedWriteBatchBytes = maxWriteBatchFrames * int(DefaultSettings().MaxFramePayload)
 
@@ -75,10 +71,6 @@ func clearWriteRequests(reqs []writeRequest) {
 
 func clearRejectedWriteRequests(reqs []rejectedWriteRequest) {
 	clear(reqs)
-}
-
-func clearNetBuffers(bufs net.Buffers) {
-	clear(bufs)
 }
 
 func (s *writeBatchScratch) itemSlice(n int) []rt.BatchItem {
@@ -127,25 +119,6 @@ func (s *writeBatchScratch) rejectedSlice(capHint int) []rejectedWriteRequest {
 	return s.rejected
 }
 
-func (s *writeBatchScratch) scatterGatherBuffers(capHint int) net.Buffers {
-	if capHint < 0 {
-		capHint = 0
-	}
-	if cap(s.sgBuffers) > maxRetainedScatterGatherSegments && capHint <= maxRetainedScatterGatherSegments {
-		clearNetBuffers(s.sgBuffers[:cap(s.sgBuffers)])
-		s.sgBuffers = nil
-	}
-	if cap(s.sgBuffers) > 0 {
-		clearNetBuffers(s.sgBuffers[:cap(s.sgBuffers)])
-	}
-	if cap(s.sgBuffers) < capHint {
-		s.sgBuffers = make(net.Buffers, 0, capHint)
-	} else {
-		s.sgBuffers = s.sgBuffers[:0]
-	}
-	return s.sgBuffers
-}
-
 func (s *writeBatchScratch) encodedBuffer(n int) []byte {
 	s.releaseEncodedBuffer(s.encoded)
 	s.encoded, s.encodedHandle = acquireWriteBatchEncodedBuffer(n)
@@ -164,7 +137,6 @@ func (s *writeBatchScratch) reset() {
 	s.items = nil
 	s.ordered = nil
 	s.rejected = nil
-	s.sgBuffers = nil
 	s.explicitGroups = nil
 	s.explicitGroupIDs = nil
 	s.queuedByStream = nil
@@ -183,12 +155,6 @@ func (s *writeBatchScratch) clearRetainedBatchRefs() {
 	}
 	if len(s.rejected) > 0 {
 		clearRejectedWriteRequests(s.rejected[:len(s.rejected)])
-	}
-	if cap(s.sgBuffers) > 0 {
-		clearNetBuffers(s.sgBuffers[:cap(s.sgBuffers)])
-		if cap(s.sgBuffers) > maxRetainedScatterGatherSegments {
-			s.sgBuffers = nil
-		}
 	}
 	s.clearQueuedStreamRefs()
 }
@@ -625,40 +591,31 @@ func (c *Conn) writeBatch(batch []writeRequest) error {
 		return nil
 	}
 
-	totalEncoded, payloadBytes, frameCount, err := prepareWriteBatchSize(batch)
+	totalEncoded, _, frameCount, err := prepareWriteBatchSize(batch)
 	if err != nil {
 		return err
 	}
 
 	start := time.Now()
 	written, err := 0, error(nil)
-	scatterGather := false
-	if c.useScatterGatherWrite(payloadBytes, frameCount) {
-		if segmentCount, ok := writeBatchScatterGatherSegmentCount(batch, maxScatterGatherSegments); ok && scatterGatherSegmentDensityOK(payloadBytes, segmentCount) {
-			scatterGather = true
-			written, err = c.writeBatchScatterGather(batch, frameCount, segmentCount)
-		}
-	}
-	if !scatterGather {
-		buf := c.writer.scratch.encodedBuffer(totalEncoded)
-		defer func() {
-			c.writer.scratch.releaseEncodedBuffer(buf)
-		}()
-		for _, req := range batch {
-			for _, frame := range req.frames {
-				buf, err = appendFrameBinaryTrusted(buf, frame)
-				if err != nil {
-					break
-				}
-			}
+	buf := c.writer.scratch.encodedBuffer(totalEncoded)
+	defer func() {
+		c.writer.scratch.releaseEncodedBuffer(buf)
+	}()
+	for _, req := range batch {
+		for _, frame := range req.frames {
+			buf, err = appendFrameBinaryTrusted(buf, frame)
 			if err != nil {
 				break
 			}
 		}
-		if err == nil {
-			written = len(buf)
-			err = rt.WriteAll(c.io.conn, buf)
+		if err != nil {
+			break
 		}
+	}
+	if err == nil {
+		written = len(buf)
+		err = rt.WriteAll(c.io.conn, buf)
 	}
 	if err != nil {
 		return err
@@ -706,9 +663,6 @@ func prepareWriteBatchSize(batch []writeRequest) (totalEncoded int, payloadBytes
 
 const maxWriteBatchFrames = 32
 const maxEncodedFrameOverhead = 17
-const minScatterGatherPayloadBytes = 16 << 10
-const maxScatterGatherSegments = 64
-const minScatterGatherPayloadBytesPerSegment = 1024
 
 func (c *Conn) collectWriteBatch(first writeRequest, lane writeLane) []writeRequest {
 	if lane == writeLaneOrdinary || lane == writeLaneAdvisory {
@@ -772,141 +726,6 @@ func appendFrameBinaryTrusted(dst []byte, frame txFrame) ([]byte, error) {
 		return nil, err
 	}
 	return frame.appendPayload(dst), nil
-}
-
-func (c *Conn) useScatterGatherWrite(payloadBytes, frameCount int) bool {
-	return c != nil && c.io.conn != nil && c.io.scatterGatherOK && payloadBytes >= minScatterGatherPayloadBytes && frameCount > 0
-}
-
-func scatterGatherSegmentDensityOK(payloadBytes, segmentCount int) bool {
-	return segmentCount > 0 && payloadBytes/segmentCount >= minScatterGatherPayloadBytesPerSegment
-}
-
-func writeBatchScatterGatherSegmentCount(batch []writeRequest, maxSegments int) (int, bool) {
-	if maxSegments < 0 {
-		return 0, false
-	}
-	segmentCount := 0
-	addSegment := func() bool {
-		if segmentCount >= maxSegments {
-			return false
-		}
-		segmentCount++
-		return true
-	}
-
-	for _, req := range batch {
-		for _, frame := range req.frames {
-			if !addSegment() {
-				return 0, false
-			}
-			if frame.hasPayloadPrefix() && len(frame.payloadPrefix) > 0 {
-				if !addSegment() {
-					return 0, false
-				}
-			}
-			if frame.hasPayloadParts() {
-				idx := frame.payloadPartIdx
-				off := frame.payloadPartOff
-				remaining := frame.payloadPartLen
-				for remaining > 0 && idx < len(frame.payloadParts) {
-					part := frame.payloadParts[idx]
-					if off >= len(part) {
-						idx++
-						off = 0
-						continue
-					}
-					take := len(part) - off
-					if take > remaining {
-						take = remaining
-					}
-					if !addSegment() {
-						return 0, false
-					}
-					remaining -= take
-					idx++
-					off = 0
-				}
-				continue
-			}
-			if len(frame.Payload) > 0 {
-				if !addSegment() {
-					return 0, false
-				}
-			}
-		}
-	}
-	return segmentCount, true
-}
-
-func (c *Conn) writeBatchScatterGather(batch []writeRequest, frameCount, segmentCount int) (int, error) {
-	if c == nil || c.io.conn == nil {
-		return 0, ErrSessionClosed
-	}
-
-	headerArena := c.writer.scratch.encodedBuffer(frameCount * maxEncodedFrameOverhead)
-	defer func() {
-		c.writer.scratch.releaseEncodedBuffer(headerArena)
-	}()
-	headerArena = headerArena[:0]
-	buffers := c.writer.scratch.scatterGatherBuffers(segmentCount)
-	for _, req := range batch {
-		for _, frame := range req.frames {
-			start := len(headerArena)
-			var err error
-			headerArena, err = wire.AppendFrameHeaderTrustedCachedStreamID(
-				headerArena,
-				frame.Code(),
-				frame.StreamID,
-				frame.streamIDPacked,
-				frame.streamIDLen,
-				uint64(frame.payloadLength()),
-			)
-			if err != nil {
-				return 0, err
-			}
-			buffers = append(buffers, headerArena[start:])
-			if frame.hasPayloadPrefix() && len(frame.payloadPrefix) > 0 {
-				buffers = append(buffers, frame.payloadPrefix)
-			}
-			if frame.hasPayloadParts() {
-				idx := frame.payloadPartIdx
-				off := frame.payloadPartOff
-				remaining := frame.payloadPartLen
-				for remaining > 0 && idx < len(frame.payloadParts) {
-					part := frame.payloadParts[idx]
-					if off >= len(part) {
-						idx++
-						off = 0
-						continue
-					}
-					take := len(part) - off
-					if take > remaining {
-						take = remaining
-					}
-					buffers = append(buffers, part[off:off+take])
-					remaining -= take
-					idx++
-					off = 0
-				}
-				continue
-			}
-			if len(frame.Payload) > 0 {
-				buffers = append(buffers, frame.Payload)
-			}
-		}
-	}
-	written, err := buffers.WriteTo(c.io.conn)
-	return int(written), err
-}
-
-func transportSupportsScatterGather(conn io.ReadWriteCloser) bool {
-	switch conn.(type) {
-	case *net.TCPConn, *net.UnixConn:
-		return true
-	default:
-		return false
-	}
 }
 
 func sameStreamBurstKeepsOrder(batch []writeRequest, lane writeLane) bool {

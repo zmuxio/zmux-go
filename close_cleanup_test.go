@@ -2,7 +2,6 @@ package zmux
 
 import (
 	"errors"
-	"net"
 	"testing"
 )
 
@@ -88,18 +87,5 @@ func TestCloseSessionClearsProtocolBacklogAndDrainsBufferedDataQueues(t *testing
 		default:
 			t.Fatalf("%s drained request did not complete", name)
 		}
-	}
-}
-
-func TestWriteBatchScratchScatterGatherBuffersDropsOversizedRetention(t *testing.T) {
-	t.Parallel()
-
-	scratch := writeBatchScratch{
-		sgBuffers: make(net.Buffers, 0, maxRetainedScatterGatherSegments+512),
-	}
-
-	got := scratch.scatterGatherBuffers(1)
-	if cap(got) > maxRetainedScatterGatherSegments {
-		t.Fatalf("scatter-gather scratch cap = %d, want <= %d", cap(got), maxRetainedScatterGatherSegments)
 	}
 }

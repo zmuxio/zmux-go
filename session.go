@@ -2417,9 +2417,8 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 	}
 	c := &Conn{
 		io: connIOState{
-			conn:            conn,
-			reader:          reader,
-			scatterGatherOK: transportSupportsScatterGather(conn),
+			conn:   conn,
+			reader: reader,
 		},
 		config: connConfigState{
 			local:       local,
@@ -2675,9 +2674,8 @@ type connRuntimeSignalState struct {
 }
 
 type connIOState struct {
-	conn            io.ReadWriteCloser
-	reader          *bufio.Reader
-	scatterGatherOK bool
+	conn   io.ReadWriteCloser
+	reader *bufio.Reader
 }
 
 type connObserverState struct {

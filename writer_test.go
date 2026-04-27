@@ -2151,74 +2151,16 @@ func TestHandleWriteBatchClearsScratchOrderedRefs(t *testing.T) {
 	}
 }
 
-func TestHandleWriteBatchClearsScatterGatherRefs(t *testing.T) {
-	t.Parallel()
-
-	writer := &captureWriteCloser{}
-	c := newWriteLoopControlTestConn(writer)
-	c.io.scatterGatherOK = true
-
-	req := writeRequest{
-		done: make(chan error, 1),
-		frames: testTxFramesFrom([]Frame{{
-			Type:    FrameTypePING,
-			Payload: bytes.Repeat([]byte("x"), minScatterGatherPayloadBytes+1),
-		}}),
-	}
-
-	batch := c.writer.scratch.batchSlice(1, 1)
-	batch[0] = req
-	if !c.handleWriteBatch(batch) {
-		t.Fatal("handleWriteBatch() = false, want true")
-	}
-
-	select {
-	case err := <-req.done:
-		if err != nil {
-			t.Fatalf("done err = %v, want nil", err)
-		}
-	case <-time.After(testSignalTimeout):
-		t.Fatal("handleWriteBatch did not signal done")
-	}
-
-	for i, segment := range c.writer.scratch.sgBuffers[:cap(c.writer.scratch.sgBuffers)] {
-		if segment != nil {
-			t.Fatalf("sgBuffers[%d] retained payload refs after write completion", i)
-		}
-	}
-}
-
-func TestClearRetainedBatchRefsDropsOversizedScatterGatherScratch(t *testing.T) {
-	t.Parallel()
-
-	var scratch writeBatchScratch
-	buffers := scratch.scatterGatherBuffers(maxRetainedScatterGatherSegments + 1)
-	buffers = append(buffers, []byte("retained"))
-	scratch.sgBuffers = buffers
-
-	scratch.clearRetainedBatchRefs()
-
-	if scratch.sgBuffers != nil {
-		t.Fatalf("oversized sgBuffers retained cap %d, want dropped", cap(scratch.sgBuffers))
-	}
-}
-
-func TestHandleWriteBatchFallsBackForTinyScatterGatherSegments(t *testing.T) {
+func TestHandleWriteBatchMergesMultipartPayloadIntoSingleWrite(t *testing.T) {
 	t.Parallel()
 
 	writer := &countingWriteCloser{}
 	c := newWriteLoopControlTestConn(&captureWriteCloser{})
 	c.io.conn = writer
-	c.io.scatterGatherOK = true
 
-	partCount := maxScatterGatherSegments / 2
-	part := bytes.Repeat([]byte("x"), minScatterGatherPayloadBytes/partCount)
-	parts := make([][]byte, partCount)
-	for i := range parts {
-		parts[i] = part
-	}
+	parts := [][]byte{[]byte("hello"), []byte(" "), []byte("world")}
 	frame := makeTxFrame(FrameTypeDATA, 0, 0)
-	frame.setPartsPayload(parts, 0, 0, len(parts)*len(part))
+	frame.setPartsPayload(parts, 0, 0, len("hello world"))
 	req := writeRequest{
 		done:   make(chan error, 1),
 		frames: []txFrame{frame},
@@ -2240,10 +2182,7 @@ func TestHandleWriteBatchFallsBackForTinyScatterGatherSegments(t *testing.T) {
 	}
 
 	if got := writer.writeCount(); got != 1 {
-		t.Fatalf("underlying write count = %d, want 1 fallback write", got)
-	}
-	if cap(c.writer.scratch.sgBuffers) != 0 {
-		t.Fatalf("scatter-gather scratch cap = %d, want 0 after fallback", cap(c.writer.scratch.sgBuffers))
+		t.Fatalf("underlying write count = %d, want 1 merged write", got)
 	}
 }
 
