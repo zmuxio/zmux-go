@@ -35,6 +35,7 @@ session := quicmux.WrapSessionWithOptions(qconn, quicmux.SessionOptions{
 
 - `0`: use `quicmux.DefaultAcceptedPreludeMaxConcurrent()`
 - `> 0`: per-session upper bound for concurrently parsing accepted adapter preludes
+- values above the adapter safety cap are clamped
 - accepted prelude parsing is on-demand; idle sessions keep no prelude worker goroutines alive
 
 If you want one process-wide default for many wrapped sessions, set it during process init:

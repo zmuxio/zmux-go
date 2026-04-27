@@ -629,6 +629,13 @@ func TestNormalizeAcceptedPreludeMaxConcurrent(t *testing.T) {
 	if got := normalizeAcceptedPreludeMaxConcurrent(2); got != 2 {
 		t.Fatalf("normalizeAcceptedPreludeMaxConcurrent(2) = %d, want 2", got)
 	}
+	SetDefaultAcceptedPreludeMaxConcurrent(maxAcceptedPreludeMaxConcurrent + 1)
+	if got := DefaultAcceptedPreludeMaxConcurrent(); got != maxAcceptedPreludeMaxConcurrent {
+		t.Fatalf("DefaultAcceptedPreludeMaxConcurrent() after oversized default = %d, want %d", got, maxAcceptedPreludeMaxConcurrent)
+	}
+	if got := normalizeAcceptedPreludeMaxConcurrent(maxAcceptedPreludeMaxConcurrent + 1); got != maxAcceptedPreludeMaxConcurrent {
+		t.Fatalf("normalizeAcceptedPreludeMaxConcurrent(oversized) = %d, want %d", got, maxAcceptedPreludeMaxConcurrent)
+	}
 }
 
 func TestWrapSessionCancelWriteMakesLocalWriteFailImmediately(t *testing.T) {

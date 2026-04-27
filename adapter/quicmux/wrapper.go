@@ -20,6 +20,7 @@ const metadataPayloadPoolInitCap = 128
 const metadataPayloadPoolMaxRetainedCap = 2 << 10
 const acceptedPreludeResultQueueCap = 32
 const defaultAcceptedPreludeMaxConcurrent = 8
+const maxAcceptedPreludeMaxConcurrent = 1024
 
 const quicmuxOpenCaps = wire.CapabilityOpenMetadata | wire.CapabilityPriorityHints | wire.CapabilityStreamGroups
 
@@ -47,6 +48,9 @@ func init() {
 // session does not override SessionOptions.AcceptedPreludeMaxConcurrent.
 func DefaultAcceptedPreludeMaxConcurrent() int {
 	if current := int(defaultAcceptedPreludeMaxConcurrentValue.Load()); current > 0 {
+		if current > maxAcceptedPreludeMaxConcurrent {
+			return maxAcceptedPreludeMaxConcurrent
+		}
 		return current
 	}
 	return 1
@@ -58,6 +62,8 @@ func DefaultAcceptedPreludeMaxConcurrent() int {
 func SetDefaultAcceptedPreludeMaxConcurrent(max int) {
 	if max <= 0 {
 		max = defaultAcceptedPreludeMaxConcurrent
+	} else if max > maxAcceptedPreludeMaxConcurrent {
+		max = maxAcceptedPreludeMaxConcurrent
 	}
 	defaultAcceptedPreludeMaxConcurrentValue.Store(int64(max))
 }
@@ -122,6 +128,9 @@ func normalizeAcceptedPreludeReadTimeout(timeout time.Duration) time.Duration {
 
 func normalizeAcceptedPreludeMaxConcurrent(max int) int {
 	if max > 0 {
+		if max > maxAcceptedPreludeMaxConcurrent {
+			return maxAcceptedPreludeMaxConcurrent
+		}
 		return max
 	}
 	return DefaultAcceptedPreludeMaxConcurrent()
