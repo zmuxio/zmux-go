@@ -911,35 +911,40 @@ func (c *Conn) releaseStreamRuntimeStateLocked(stream *nativeStream, mask stream
 	if c == nil || stream == nil || mask == 0 {
 		return false
 	}
-	if mask&streamRuntimeBlocked != 0 {
-		stream.clearBlockedState()
-		stream.clearPendingControlValueLocked(streamControlBlocked)
-	}
-	if mask&streamRuntimePriority != 0 {
-		stream.clearPendingPriorityUpdateLocked()
-	}
-	if mask&streamRuntimeRecvFlow != 0 {
-		stream.clearPendingControlValueLocked(streamControlMaxData)
-	}
 	if !stream.idSet {
+		if mask&streamRuntimeBlocked != 0 {
+			stream.clearBlockedState()
+			stream.clearPendingControlValueLocked(streamControlBlocked)
+		}
+		if mask&streamRuntimePriority != 0 {
+			stream.clearPendingPriorityUpdateLocked()
+		}
+		if mask&streamRuntimeRecvFlow != 0 {
+			stream.clearPendingControlValueLocked(streamControlMaxData)
+		}
 		return false
 	}
+
 	prevTracked := c.trackedSessionMemoryLocked()
 	released := false
 	if mask&streamRuntimeBlocked != 0 {
 		if c.dropPendingStreamControlEntryLocked(streamControlBlocked, stream.id) {
 			released = true
 		}
+		stream.clearBlockedState()
+		stream.clearPendingControlValueLocked(streamControlBlocked)
 	}
 	if mask&streamRuntimePriority != 0 {
 		if c.dropPendingPriorityUpdateEntryLocked(stream.id) {
 			released = true
 		}
+		stream.clearPendingPriorityUpdateLocked()
 	}
 	if mask&streamRuntimeRecvFlow != 0 {
 		if c.dropPendingStreamControlEntryLocked(streamControlMaxData, stream.id) {
 			released = true
 		}
+		stream.clearPendingControlValueLocked(streamControlMaxData)
 	}
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(released))
 	return released
