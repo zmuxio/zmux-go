@@ -760,6 +760,7 @@ var referenceProfileClaimGate = []string{
 	"CloseRead emits STOP_SENDING(CANCELLED) unless the binding intentionally exposes a caller-supplied-code variant",
 	"Close acts as a full local close helper",
 	"Close on a unidirectional stream silently ignores the locally absent direction instead of failing solely because that half does not exist",
+	"each exposed API surface keeps one documented primary spelling per operation family, with any extra convenience spellings documented as wrappers over the same semantic action rather than as distinct lifecycle operations",
 	"before session-ready, sender behavior emits only the local preface and a fatal establishment CLOSE, and emits none of new-stream DATA, stream-scoped control, ordinary session-scoped control, or EXT",
 	"sender and receiver memory rules enforce the documented hidden-state, provisional-open, and late-tail bounds",
 	"liveness keeps at most one outstanding protocol PING and does not treat weak local signals as strong progress",

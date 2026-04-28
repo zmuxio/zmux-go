@@ -191,6 +191,11 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestSendStreamCloseIgnoresAbsentReadHalf",
 		"TestRecvStreamCloseIgnoresAbsentWriteHalf",
 	},
+	"each exposed API surface keeps one documented primary spelling per operation family, with any extra convenience spellings documented as wrappers over the same semantic action rather than as distinct lifecycle operations": {
+		"TestStableSessionInterfacesExposeDocumentedSurface",
+		"TestNativeInterfacesExposeNativeQueries",
+		"TestPublicAPISymbolsRemainAvailable",
+	},
 	"before session-ready, sender behavior emits only the local preface and a fatal establishment CLOSE, and emits none of new-stream DATA, stream-scoped control, ordinary session-scoped control, or EXT": {
 		"TestClientEstablishmentOnlyWritesPrefaceBeforePeerPreface",
 		"TestClientEstablishmentInvalidPeerPrefaceEmitsFatalClose",
@@ -544,13 +549,13 @@ func TestReferenceProfileClaimGate(t *testing.T) {
 	t.Parallel()
 
 	gate := ReferenceProfileClaimGate()
-	if len(gate) != 6 {
-		t.Fatalf("len(ReferenceProfileClaimGate()) = %d, want 6", len(gate))
+	if len(gate) != 7 {
+		t.Fatalf("len(ReferenceProfileClaimGate()) = %d, want 7", len(gate))
 	}
 	if gate[0] != "CloseRead emits STOP_SENDING(CANCELLED) unless the binding intentionally exposes a caller-supplied-code variant" {
 		t.Fatalf("ReferenceProfileClaimGate() = %#v", gate)
 	}
-	if gate[5] != "liveness keeps at most one outstanding protocol PING and does not treat weak local signals as strong progress" {
+	if gate[6] != "liveness keeps at most one outstanding protocol PING and does not treat weak local signals as strong progress" {
 		t.Fatalf("ReferenceProfileClaimGate() = %#v", gate)
 	}
 
