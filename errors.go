@@ -251,7 +251,14 @@ func wireError(code ErrorCode, op string, err error) error {
 
 // ErrorCodeOf returns the wire or application error code when one is present.
 func ErrorCodeOf(err error) (ErrorCode, bool) {
-	return wire.ErrorCodeOf(err)
+	if code, ok := wire.ErrorCodeOf(err); ok {
+		return code, true
+	}
+	appErr, ok := findError[*ApplicationError](err)
+	if !ok {
+		return 0, false
+	}
+	return ErrorCode(appErr.Code), true
 }
 
 // IsErrorCode reports whether err carries the given wire or application code.

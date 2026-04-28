@@ -48,3 +48,18 @@ func TestFindErrorFindsWrappedApplicationError(t *testing.T) {
 		t.Fatalf("findError = %#v, want %#v", got, want)
 	}
 }
+
+func TestErrorCodeOfFindsApplicationError(t *testing.T) {
+	err := fmt.Errorf("outer: %w", &ApplicationError{Code: uint64(CodeCancelled), Reason: "stop"})
+
+	code, ok := ErrorCodeOf(err)
+	if !ok {
+		t.Fatal("ErrorCodeOf did not find wrapped ApplicationError")
+	}
+	if code != CodeCancelled {
+		t.Fatalf("ErrorCodeOf = %v, want %v", code, CodeCancelled)
+	}
+	if !IsErrorCode(err, CodeCancelled) {
+		t.Fatal("IsErrorCode did not match wrapped ApplicationError")
+	}
+}
