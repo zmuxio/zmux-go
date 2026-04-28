@@ -277,7 +277,7 @@ const (
 	SettingMaxExtensionPayloadBytes              SettingID = 11
 	SettingSchedulerHints                        SettingID = 12
 	SettingPingPaddingKey                        SettingID = 13
-	SettingPrefacePadding                        SettingID = 14
+	SettingPrefacePadding                        SettingID = 63
 )
 
 type Settings struct {
