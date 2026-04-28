@@ -1158,6 +1158,62 @@ func TestWritePayloadRejectsImplicitNoProgressAndShortWrite(t *testing.T) {
 	}
 }
 
+func TestWritevFinalCoalescesSmallParts(t *testing.T) {
+	base := &quicStreamBase{
+		sendPrelude: false,
+		preludeSent: true,
+	}
+	writer := &recordingWriteCloser{}
+
+	n, err := base.writevFinal(writer, [][]byte{
+		[]byte("ab"),
+		nil,
+		[]byte("cd"),
+		[]byte("ef"),
+	})
+	if err != nil {
+		t.Fatalf("writevFinal err = %v, want nil", err)
+	}
+	if n != 6 {
+		t.Fatalf("writevFinal n = %d, want 6", n)
+	}
+	if writer.writes != 1 {
+		t.Fatalf("underlying Write calls = %d, want 1", writer.writes)
+	}
+	if got := writer.String(); got != "abcdef" {
+		t.Fatalf("underlying payload = %q, want %q", got, "abcdef")
+	}
+	if !writer.closed {
+		t.Fatal("underlying Close was not called")
+	}
+}
+
+func TestWritevFinalKeepsOversizedPartsSegmented(t *testing.T) {
+	base := &quicStreamBase{
+		sendPrelude: false,
+		preludeSent: true,
+	}
+	writer := &recordingWriteCloser{}
+
+	large := bytes.Repeat([]byte{'x'}, quicWritevCoalesceMaxBytes)
+	n, err := base.writevFinal(writer, [][]byte{
+		large,
+		[]byte("y"),
+	})
+	if err != nil {
+		t.Fatalf("writevFinal err = %v, want nil", err)
+	}
+	if n != quicWritevCoalesceMaxBytes+1 {
+		t.Fatalf("writevFinal n = %d, want %d", n, quicWritevCoalesceMaxBytes+1)
+	}
+	if writer.writes != 2 {
+		t.Fatalf("underlying Write calls = %d, want 2", writer.writes)
+	}
+	if !writer.closed {
+		t.Fatal("underlying Close was not called")
+	}
+}
+
 func TestWritePayloadAndCloseWriteSerializeUnderlyingClose(t *testing.T) {
 	writer := newConcurrentDetectWriteCloser()
 	base := &quicStreamBase{
@@ -1633,6 +1689,22 @@ type invalidProgressWriter struct {
 
 func (w invalidProgressWriter) Write(_ []byte) (int, error) {
 	return w.n, nil
+}
+
+type recordingWriteCloser struct {
+	bytes.Buffer
+	writes int
+	closed bool
+}
+
+func (w *recordingWriteCloser) Write(p []byte) (int, error) {
+	w.writes++
+	return w.Buffer.Write(p)
+}
+
+func (w *recordingWriteCloser) Close() error {
+	w.closed = true
+	return nil
 }
 
 type invalidProgressReader struct {

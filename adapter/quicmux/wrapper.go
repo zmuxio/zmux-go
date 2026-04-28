@@ -18,6 +18,7 @@ import (
 const quicmuxStreamPreludeMaxPayload = 16 << 10
 const metadataPayloadPoolInitCap = 128
 const metadataPayloadPoolMaxRetainedCap = 2 << 10
+const quicWritevCoalesceMaxBytes = 64 << 10
 const acceptedPreludeResultQueueCap = 32
 const defaultAcceptedPreludeMaxConcurrent = 8
 const maxAcceptedPreludeMaxConcurrent = 1024
@@ -618,6 +619,11 @@ type writeDeadlineSetter interface {
 	SetWriteDeadline(time.Time) error
 }
 
+type quicWriteCloser interface {
+	io.Writer
+	Close() error
+}
+
 type singleByteReader struct {
 	reader io.Reader
 	buf    [1]byte
@@ -937,6 +943,41 @@ func (b *quicStreamBase) writePayload(writer io.Writer, p []byte) (int, error) {
 	return n, translated
 }
 
+func (b *quicStreamBase) writevFinal(writer quicWriteCloser, parts [][]byte) (int, error) {
+	total, ok := quicWritevTotalLen(parts)
+	if !ok {
+		return 0, errWritevPayloadTooLarge
+	}
+	if total == 0 {
+		return 0, b.closeWrite(writer)
+	}
+	if len(parts) == 1 {
+		n, err := b.writePayload(writer, parts[0])
+		if err != nil {
+			return n, err
+		}
+		return n, b.closeWrite(writer)
+	}
+	if total <= quicWritevCoalesceMaxBytes {
+		p := coalesceQuicWritevParts(parts, total)
+		n, err := b.writePayload(writer, p)
+		if err != nil {
+			return n, err
+		}
+		return n, b.closeWrite(writer)
+	}
+
+	var written int
+	for _, part := range parts {
+		n, err := b.writePayload(writer, part)
+		written += n
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, b.closeWrite(writer)
+}
+
 func (b *quicStreamBase) closeWrite(closer interface{ Close() error }) error {
 	if closer == nil {
 		return zmux.ErrSessionClosed
@@ -1151,18 +1192,10 @@ func (s *quicStream) WriteFinal(p []byte) (int, error) {
 }
 
 func (s *quicStream) WritevFinal(parts ...[]byte) (int, error) {
-	if _, ok := quicWritevTotalLen(parts); !ok {
-		return 0, errWritevPayloadTooLarge
+	if s == nil || s.stream == nil {
+		return 0, zmux.ErrSessionClosed
 	}
-	var total int
-	for _, part := range parts {
-		n, err := s.Write(part)
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, s.CloseWrite()
+	return s.writevFinal(s.stream, parts)
 }
 
 func (s *quicStream) SetDeadline(t time.Time) error {
@@ -1283,18 +1316,10 @@ func (s *quicSendStream) WriteFinal(p []byte) (int, error) {
 }
 
 func (s *quicSendStream) WritevFinal(parts ...[]byte) (int, error) {
-	if _, ok := quicWritevTotalLen(parts); !ok {
-		return 0, errWritevPayloadTooLarge
+	if s == nil || s.stream == nil {
+		return 0, zmux.ErrSessionClosed
 	}
-	var total int
-	for _, part := range parts {
-		n, err := s.Write(part)
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, s.CloseWrite()
+	return s.writevFinal(s.stream, parts)
 }
 
 func (s *quicSendStream) CloseWrite() error {
@@ -1537,6 +1562,17 @@ func quicWritevTotalLenWithin(parts [][]byte, limit int) (int, bool) {
 		total += len(part)
 	}
 	return total, true
+}
+
+func coalesceQuicWritevParts(parts [][]byte, total int) []byte {
+	if total <= 0 {
+		return nil
+	}
+	out := make([]byte, 0, total)
+	for _, part := range parts {
+		out = append(out, part...)
+	}
+	return out
 }
 
 func cloneBytes(src []byte) []byte {
