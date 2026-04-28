@@ -728,14 +728,14 @@ var claimAcceptanceChecklist = map[Claim][]string{
 		"ignore duplicate singleton advisory updates as one dropped update",
 	},
 	ClaimAPISemanticsProfileV1: {
-		"document and implement the repository-default stream lifecycle surface from API_SEMANTICS.md",
-		"cover Close, CloseRead, CloseWrite, and Reset behavior",
-		"preserve structured error surfacing, open/cancel behavior, and accept visibility rules",
+		"document and implement the repository-default semantic operation families from API_SEMANTICS.md, including full local close helper, graceful send-half completion, read-side stop, send-side reset, whole-stream abort, structured error surfacing, open/cancel behavior, and accept visibility rules",
+		"document whether the binding exposes a stream-style convenience profile, a full-control protocol surface, or both",
+		"exact API spellings are not required",
 	},
 	ClaimStreamAdapterProfileV1: {
-		"satisfy the stream-adapter subset from API_SEMANTICS.md",
-		"cover bidirectional and unidirectional open and accept mapping",
-		"document adapter method mapping and declared limits/non-goals",
+		"satisfy the stream-adapter subset from API_SEMANTICS.md, including bidirectional/unidirectional open and accept mapping",
+		"provide one consistent convenience mapping or fuller documented control layer or both",
+		"document limits/non-goals",
 	},
 }
 
@@ -757,13 +757,13 @@ var profileAcceptanceChecklist = map[ImplementationProfile][]string{
 }
 
 var referenceProfileClaimGate = []string{
-	"CloseRead emits STOP_SENDING(CANCELLED) unless the binding intentionally exposes a caller-supplied-code variant",
-	"Close acts as a full local close helper",
-	"Close on a unidirectional stream silently ignores the locally absent direction instead of failing solely because that half does not exist",
+	"repository-default stream-style CloseRead() emits STOP_SENDING(CANCELLED) when that convenience profile is exposed, while fuller control surfaces MAY additionally expose caller-selected codes and diagnostics for STOP_SENDING, RESET, and ABORT",
+	"repository-default Close() acts as a full local close helper",
+	"repository-default Close() on a unidirectional stream silently ignores the locally absent direction rather than failing solely because that half does not exist",
 	"each exposed API surface keeps one documented primary spelling per operation family, with any extra convenience spellings documented as wrappers over the same semantic action rather than as distinct lifecycle operations",
-	"before session-ready, sender behavior emits only the local preface and a fatal establishment CLOSE, and emits none of new-stream DATA, stream-scoped control, ordinary session-scoped control, or EXT",
-	"sender and receiver memory rules enforce the documented hidden-state, provisional-open, and late-tail bounds",
-	"liveness keeps at most one outstanding protocol PING and does not treat weak local signals as strong progress",
+	"before session-ready, repository-default sender behavior emits only the local preface and a fatal establishment CLOSE, and emits none of new-stream DATA, stream-scoped control, ordinary session-scoped control, or EXT",
+	"repository-default sender and receiver memory rules enforce the documented hidden-state, provisional-open, and late-tail bounds",
+	"repository-default liveness rules keep at most one outstanding protocol PING and does not treat weak local signals as strong progress",
 }
 
 var claimRequiredSuites = map[Claim][]ConformanceSuite{

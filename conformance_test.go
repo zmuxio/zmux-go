@@ -61,29 +61,34 @@ var conformanceChecklistEvidence = map[string][]string{
 	"ignore duplicate singleton advisory updates as one dropped update": {
 		"TestPriorityUpdateDuplicateSingletonIgnored",
 	},
-	"document and implement the repository-default stream lifecycle surface from API_SEMANTICS.md": {
-		"TestCloseReadStopsPeerWritesButPreservesReverseRead",
-		"TestCloseWithErrorPropagatesWholeStreamAbort",
-	},
-	"cover Close, CloseRead, CloseWrite, and Reset behavior": {
+	"document and implement the repository-default semantic operation families from API_SEMANTICS.md, including full local close helper, graceful send-half completion, read-side stop, send-side reset, whole-stream abort, structured error surfacing, open/cancel behavior, and accept visibility rules": {
 		"TestCloseReadStopsPeerWritesButPreservesReverseRead",
 		"TestBidiStreamWriteReadAndCloseWrite",
 		"TestCloseWithErrorPropagatesWholeStreamAbort",
-	},
-	"preserve structured error surfacing, open/cancel behavior, and accept visibility rules": {
 		"TestStructuredErrorAfterLocalCloseWrite",
 		"TestVisibleAcceptBacklogRefusesNewestStream",
 		"TestProvisionalOpenHardCapFailsNewest",
 	},
-	"satisfy the stream-adapter subset from API_SEMANTICS.md": {
+	"document whether the binding exposes a stream-style convenience profile, a full-control protocol surface, or both": {
+		"TestStableSessionInterfacesExposeDocumentedSurface",
+		"TestNativeInterfacesExposeNativeQueries",
+		"TestPublicAPISymbolsRemainAvailable",
+	},
+	"exact API spellings are not required": {
+		"TestStableSessionInterfacesExposeDocumentedSurface",
+		"TestNativeInterfacesExposeNativeQueries",
+		"TestPublicAPISymbolsRemainAvailable",
+	},
+	"satisfy the stream-adapter subset from API_SEMANTICS.md, including bidirectional/unidirectional open and accept mapping": {
 		"TestBidiStreamWriteReadAndCloseWrite",
 		"TestUniStreamWriteReadAndCloseWrite",
 	},
-	"cover bidirectional and unidirectional open and accept mapping": {
+	"provide one consistent convenience mapping or fuller documented control layer or both": {
 		"TestBidiStreamWriteReadAndCloseWrite",
 		"TestUniStreamWriteReadAndCloseWrite",
+		"TestStableSessionInterfacesExposeDocumentedSurface",
 	},
-	"document adapter method mapping and declared limits/non-goals": {
+	"document limits/non-goals": {
 		"TestSendStreamCloseIgnoresAbsentReadHalf",
 		"TestRecvStreamCloseIgnoresAbsentWriteHalf",
 	},
@@ -180,14 +185,14 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestWriteAllRetriesPartialWrites",
 		"TestWriteAllReturnsNoProgressOnZeroWrite",
 	},
-	"CloseRead emits STOP_SENDING(CANCELLED) unless the binding intentionally exposes a caller-supplied-code variant": {
+	"repository-default stream-style CloseRead() emits STOP_SENDING(CANCELLED) when that convenience profile is exposed, while fuller control surfaces MAY additionally expose caller-selected codes and diagnostics for STOP_SENDING, RESET, and ABORT": {
 		"TestCloseReadStopsPeerWritesButPreservesReverseRead",
 		"TestCloseReadWithZeroWindowQueuesOpeningDataBeforeStopSending",
 	},
-	"Close acts as a full local close helper": {
+	"repository-default Close() acts as a full local close helper": {
 		"TestCloseWithErrorPropagatesWholeStreamAbort",
 	},
-	"Close on a unidirectional stream silently ignores the locally absent direction instead of failing solely because that half does not exist": {
+	"repository-default Close() on a unidirectional stream silently ignores the locally absent direction rather than failing solely because that half does not exist": {
 		"TestSendStreamCloseIgnoresAbsentReadHalf",
 		"TestRecvStreamCloseIgnoresAbsentWriteHalf",
 	},
@@ -196,12 +201,12 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestNativeInterfacesExposeNativeQueries",
 		"TestPublicAPISymbolsRemainAvailable",
 	},
-	"before session-ready, sender behavior emits only the local preface and a fatal establishment CLOSE, and emits none of new-stream DATA, stream-scoped control, ordinary session-scoped control, or EXT": {
+	"before session-ready, repository-default sender behavior emits only the local preface and a fatal establishment CLOSE, and emits none of new-stream DATA, stream-scoped control, ordinary session-scoped control, or EXT": {
 		"TestClientEstablishmentOnlyWritesPrefaceBeforePeerPreface",
 		"TestClientEstablishmentInvalidPeerPrefaceEmitsFatalClose",
 		"TestClientEstablishmentRoleConflictEmitsFatalClose",
 	},
-	"sender and receiver memory rules enforce the documented hidden-state, provisional-open, and late-tail bounds": {
+	"repository-default sender and receiver memory rules enforce the documented hidden-state, provisional-open, and late-tail bounds": {
 		"TestInvalidFixturesSupportedScenarios",
 		"TestStateFixturesSupportedScenarios",
 		"TestRapidHiddenAbortChurnTriggersProtocolClose",
@@ -209,7 +214,7 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestLateDataAggregateCapAfterMultipleTerminalDirections",
 		"TestQueueStreamBlockedDropsWhenControlBudgetExceeded",
 	},
-	"liveness keeps at most one outstanding protocol PING and does not treat weak local signals as strong progress": {
+	"repository-default liveness rules keep at most one outstanding protocol PING and does not treat weak local signals as strong progress": {
 		"TestPingWaitsForOutstandingSlot",
 		"TestKeepaliveSendsIdlePing",
 		"TestKeepaliveTimeoutSignalsIdleTimeoutError",
@@ -503,8 +508,16 @@ func TestClaimAcceptanceChecklist(t *testing.T) {
 	if len(referenceAPI) != 3 {
 		t.Fatalf("len(ClaimAPISemanticsProfileV1.AcceptanceChecklist()) = %d, want 3", len(referenceAPI))
 	}
-	if referenceAPI[0] != "document and implement the repository-default stream lifecycle surface from API_SEMANTICS.md" {
+	if referenceAPI[0] != "document and implement the repository-default semantic operation families from API_SEMANTICS.md, including full local close helper, graceful send-half completion, read-side stop, send-side reset, whole-stream abort, structured error surfacing, open/cancel behavior, and accept visibility rules" {
 		t.Fatalf("ClaimAPISemanticsProfileV1.AcceptanceChecklist() = %#v", referenceAPI)
+	}
+	if referenceAPI[2] != "exact API spellings are not required" {
+		t.Fatalf("ClaimAPISemanticsProfileV1.AcceptanceChecklist() = %#v", referenceAPI)
+	}
+
+	adapter := ClaimStreamAdapterProfileV1.AcceptanceChecklist()
+	if len(adapter) != 3 || adapter[1] != "provide one consistent convenience mapping or fuller documented control layer or both" {
+		t.Fatalf("ClaimStreamAdapterProfileV1.AcceptanceChecklist() = %#v", adapter)
 	}
 
 	wire[0] = "changed"
@@ -552,16 +565,16 @@ func TestReferenceProfileClaimGate(t *testing.T) {
 	if len(gate) != 7 {
 		t.Fatalf("len(ReferenceProfileClaimGate()) = %d, want 7", len(gate))
 	}
-	if gate[0] != "CloseRead emits STOP_SENDING(CANCELLED) unless the binding intentionally exposes a caller-supplied-code variant" {
+	if gate[0] != "repository-default stream-style CloseRead() emits STOP_SENDING(CANCELLED) when that convenience profile is exposed, while fuller control surfaces MAY additionally expose caller-selected codes and diagnostics for STOP_SENDING, RESET, and ABORT" {
 		t.Fatalf("ReferenceProfileClaimGate() = %#v", gate)
 	}
-	if gate[6] != "liveness keeps at most one outstanding protocol PING and does not treat weak local signals as strong progress" {
+	if gate[6] != "repository-default liveness rules keep at most one outstanding protocol PING and does not treat weak local signals as strong progress" {
 		t.Fatalf("ReferenceProfileClaimGate() = %#v", gate)
 	}
 
 	gate[0] = "changed"
 	again := ReferenceProfileClaimGate()
-	if again[0] != "CloseRead emits STOP_SENDING(CANCELLED) unless the binding intentionally exposes a caller-supplied-code variant" {
+	if again[0] != "repository-default stream-style CloseRead() emits STOP_SENDING(CANCELLED) when that convenience profile is exposed, while fuller control surfaces MAY additionally expose caller-selected codes and diagnostics for STOP_SENDING, RESET, and ABORT" {
 		t.Fatalf("ReferenceProfileClaimGate() did not return a defensive copy: %#v", again)
 	}
 }

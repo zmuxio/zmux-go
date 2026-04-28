@@ -65,9 +65,9 @@ func LoadNDJSON[T any](tb testing.TB, path string) []T {
 	if err != nil {
 		tb.Fatalf("open %s: %v", path, err)
 	}
-	tb.Cleanup(func() {
+	defer func() {
 		_ = file.Close()
-	})
+	}()
 
 	var fixtures []T
 	decoder := json.NewDecoder(file)
