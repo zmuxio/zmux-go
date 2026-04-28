@@ -1449,6 +1449,88 @@ func (c *captureWriteCloser) wroteChan() <-chan struct{} {
 	return c.wrote
 }
 
+type blockingCaptureWriteCloser struct {
+	mu           sync.Mutex
+	data         []byte
+	writes       int
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	wrote        chan struct{}
+}
+
+func newBlockingCaptureWriteCloser() *blockingCaptureWriteCloser {
+	return &blockingCaptureWriteCloser{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+		wrote:        make(chan struct{}, 1),
+	}
+}
+
+func (c *blockingCaptureWriteCloser) Read(_ []byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (c *blockingCaptureWriteCloser) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.writes++
+	first := c.writes == 1
+	c.mu.Unlock()
+
+	if first {
+		close(c.firstStarted)
+		<-c.releaseFirst
+	}
+
+	c.mu.Lock()
+	c.data = append(c.data, p...)
+	c.mu.Unlock()
+	select {
+	case c.wrote <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
+func (c *blockingCaptureWriteCloser) Close() error {
+	select {
+	case <-c.releaseFirst:
+	default:
+		close(c.releaseFirst)
+	}
+	return nil
+}
+
+func (c *blockingCaptureWriteCloser) bytes() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.data...)
+}
+
+func waitForBlockingCapturedFrames(t *testing.T, conn *blockingCaptureWriteCloser, want int) []Frame {
+	t.Helper()
+
+	deadline := time.Now().Add(testSignalTimeout)
+	for {
+		frames := decodeFramesForTest(t, conn.bytes())
+		if len(frames) >= want {
+			return frames
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("captured frames = %d, want at least %d", len(frames), want)
+		}
+		wait := time.Millisecond
+		if remaining < wait {
+			wait = remaining
+		}
+		select {
+		case <-conn.wrote:
+		case <-time.After(wait):
+			runtime.Gosched()
+		}
+	}
+}
+
 type countingWriteCloser struct {
 	mu     sync.Mutex
 	writes int
@@ -4877,6 +4959,107 @@ func TestWriteDeadlineExpiresWhileBlockedSendingToWriterQueue(t *testing.T) {
 
 	if err := releaseBlockedFirstWrite(t, writer, firstErrCh); err != nil {
 		t.Fatalf("first Write err = %v, want nil after writer release", err)
+	}
+}
+
+func TestStreamWriteClonesPayloadBeforeBufferedWriterAdmission(t *testing.T) {
+	writer := newBlockingCaptureWriteCloser()
+	c := &Conn{
+		io:        connIOState{conn: writer},
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+		writer: connWriterRuntimeState{
+			writeCh:       make(chan writeRequest, 1),
+			urgentWriteCh: make(chan writeRequest, 1),
+		},
+		config:   connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}},
+		flow:     connFlowState{sendSessionMax: 1024},
+		registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
+	}
+	first := testVisibleBidiStream(c, 4, testWithSendMax(1024))
+	second := testVisibleBidiStream(c, 8, testWithSendMax(1024))
+
+	go c.writeLoop()
+	defer func() {
+		_ = writer.Close()
+		select {
+		case <-c.lifecycle.closedCh:
+		default:
+			close(c.lifecycle.closedCh)
+		}
+	}()
+
+	firstErrCh := make(chan error, 1)
+	go func() {
+		_, err := first.Write([]byte("hello"))
+		firstErrCh <- err
+	}()
+
+	select {
+	case <-writer.firstStarted:
+	case <-time.After(2 * testSignalTimeout):
+		t.Fatal("first write did not block writer")
+	}
+
+	payload := []byte("world")
+	secondErrCh := make(chan error, 1)
+	go func() {
+		_, err := second.Write(payload)
+		secondErrCh <- err
+	}()
+
+	deadline := time.Now().Add(testSignalTimeout)
+	for len(c.writer.writeCh) == 0 {
+		select {
+		case err := <-secondErrCh:
+			t.Fatalf("second Write completed before buffered admission with %v", err)
+		default:
+		}
+		if remaining := time.Until(deadline); remaining <= 0 {
+			t.Fatal("second Write did not enter buffered writer queue")
+		} else if remaining < time.Millisecond {
+			time.Sleep(remaining)
+		} else {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	if err := second.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	select {
+	case err := <-secondErrCh:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("second Write err = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * testSignalTimeout):
+		t.Fatal("second Write did not return after deadline")
+	}
+
+	copy(payload, "xxxxx")
+	_ = writer.Close()
+
+	select {
+	case err := <-firstErrCh:
+		if err != nil {
+			t.Fatalf("first Write err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("first write did not unblock")
+	}
+
+	frames := waitForBlockingCapturedFrames(t, writer, 2)
+	var got []byte
+	for _, frame := range frames {
+		if frame.Type == FrameTypeDATA && frame.StreamID == second.id {
+			got = frame.Payload
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("captured frames missing second DATA: %+v", frames)
+	}
+	if string(got) != "world" {
+		t.Fatalf("second payload = %q, want original payload %q", got, "world")
 	}
 }
 

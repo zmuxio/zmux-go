@@ -31,8 +31,8 @@ type writeRequest struct {
 	// terminal FIN DATA for CloseWrite, RESET for Reset, or ABORT for
 	// CloseWithError).
 	terminalPolicy terminalWritePolicy
-	// cloneFramesBeforeSend delays defensive frame cloning for non-owned
-	// requests until they are ready to enter the single writer path.
+	// cloneFramesBeforeSend delays defensive frame cloning until requests are
+	// ready to enter the single writer path.
 	cloneFramesBeforeSend bool
 	// queueReserved tracks ordinary data-queue reservation held for this
 	// request while it waits to enter or leave the writer path.
@@ -608,9 +608,13 @@ type queuedWriteOptions struct {
 	terminalPolicy   terminalWritePolicy
 	deadlineOverride time.Time
 	ownership        frameOwnership
-	queuedBytes      uint64
-	deadlinePolicy   writeDeadlinePolicy
-	openerVisibility openerVisibilityMark
+	// cloneFramesBeforeSend protects caller-owned payloads after a queued write
+	// returns early on deadline or close while the single writer still owns the
+	// buffered request.
+	cloneFramesBeforeSend bool
+	queuedBytes           uint64
+	deadlinePolicy        writeDeadlinePolicy
+	openerVisibility      openerVisibilityMark
 }
 
 type queuedWriteCommit struct {

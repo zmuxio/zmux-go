@@ -618,7 +618,7 @@ func (s *nativeStream) queueFramesUntilDeadlineAndOptionsOwned(frames []txFrame,
 		req.queuedBytes = req.requestBufferedBytes
 	}
 	lane := writeLaneOrdinary.promote(writeUrgencyProfileFrom(req.requestAllUrgent))
-	req.cloneFramesBeforeSend = !opts.ownership.ownsFrames()
+	req.cloneFramesBeforeSend = opts.cloneFramesBeforeSend || !opts.ownership.ownsFrames()
 
 	// deadlineOverride only bounds local admission into the writer path. Once the
 	// request is queued to the single writer, completion waits follow the normal
@@ -892,11 +892,12 @@ const (
 
 func (s *nativeStream) queueBurstFramesWithAdmission(state writeBurstState, mode writeChunkMode, deadlinePolicy writeDeadlinePolicy) error {
 	opts := queuedWriteOptions{
-		terminalPolicy:   terminalWriteReject,
-		ownership:        frameOwned,
-		queuedBytes:      state.queuedBytes,
-		deadlinePolicy:   deadlinePolicy,
-		openerVisibility: state.commit.openerVisibility,
+		terminalPolicy:        terminalWriteReject,
+		ownership:             frameOwned,
+		cloneFramesBeforeSend: true,
+		queuedBytes:           state.queuedBytes,
+		deadlinePolicy:        deadlinePolicy,
+		openerVisibility:      state.commit.openerVisibility,
 	}
 	if mode.isFinal() && state.commit.finalize {
 		opts.terminalPolicy = terminalWriteAllow
