@@ -484,10 +484,12 @@ handshake without changing negotiated settings; the default random padding
 value length is 16..256 bytes, and `PrefacePaddingMinBytes` /
 `PrefacePaddingMaxBytes` can tune that range.
 
-Set `PingPadding = true` to append random opaque bytes to local PING frames and
-recognized PONG replies. This also advertises a per-session padding key in the
-local preface; when disabled, the key is omitted. This does not change
-`Ping(ctx, echo)` API behavior; the default padding range is 16..64 bytes.
+Set `PingPadding = true` to add an 8-byte padding tag plus random opaque bytes
+to local PING frames, and to append random opaque bytes to recognized PONG
+replies. This also advertises a per-session padding key in the local preface;
+when disabled, the key is omitted. This does not change `Ping(ctx, echo)` API
+behavior; the default extra PING/PONG length range is 16..64 bytes. For PING,
+that range includes the fixed 8-byte tag.
 
 ```go
 cfg := &zmux.Config{

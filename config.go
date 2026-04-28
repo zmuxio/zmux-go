@@ -188,19 +188,21 @@ type Config struct {
 	// derives an adaptive default from the keepalive interval and observed RTT
 	// within bounded caps so very high latency links remain usable.
 	KeepaliveTimeout time.Duration
-	// PingPadding appends random opaque bytes to local PING frames and
-	// recognized PONG replies to vary liveness frame lengths. It also advertises
-	// a per-session PingPaddingKey in the local preface. It does not change
-	// Ping(ctx, echo) API behavior.
+	// PingPadding adds an 8-byte padding tag plus random opaque bytes to local
+	// PING frames, and appends random opaque bytes to recognized PONG replies
+	// to vary liveness frame lengths. It also advertises a per-session
+	// PingPaddingKey in the local preface. It does not change Ping(ctx, echo)
+	// API behavior.
 	PingPadding bool
-	// PingPaddingMinBytes bounds the lower end of the random PING/PONG padding
-	// length when PingPadding is enabled. Zero uses the repository default.
+	// PingPaddingMinBytes bounds the lower end of the extra PING payload bytes
+	// and PONG suffix bytes when PingPadding is enabled. For PING, this total
+	// includes the fixed 8-byte tag. Zero uses the repository default.
 	PingPaddingMinBytes uint64
-	// PingPaddingMaxBytes bounds the upper end of the random PING/PONG padding
-	// length when PingPadding is enabled. Zero uses the repository default;
-	// values above the negotiated control payload limit are clamped. If the
-	// effective minimum exceeds the effective maximum, the runtime uses the
-	// maximum.
+	// PingPaddingMaxBytes bounds the upper end of the extra PING payload bytes
+	// and PONG suffix bytes when PingPadding is enabled. For PING, this total
+	// includes the fixed 8-byte tag. Zero uses the repository default; values
+	// above the negotiated control payload limit are clamped. If the effective
+	// minimum exceeds the effective maximum, the runtime uses the maximum.
 	PingPaddingMaxBytes uint64
 
 	// SessionMemoryCap overrides the repository-default tracked-session-memory
