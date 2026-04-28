@@ -17,7 +17,10 @@ func AppendFrameHeaderTrusted(dst []byte, code byte, streamID uint64, payloadLen
 	if err != nil {
 		return nil, WrapError(CodeProtocol, "marshal frame", err)
 	}
-	length := uint64(1+streamLen) + payloadLen
+	length, err := frameLengthForPayload(streamLen, payloadLen)
+	if err != nil {
+		return nil, err
+	}
 	dst, err = AppendVarint(dst, length)
 	if err != nil {
 		return nil, WrapError(CodeProtocol, "marshal frame", err)
@@ -34,8 +37,10 @@ func AppendFrameHeaderTrustedCachedStreamID(dst []byte, code byte, streamID uint
 	if streamIDLen == 0 {
 		return AppendFrameHeaderTrusted(dst, code, streamID, payloadLen)
 	}
-	length := uint64(1+streamIDLen) + payloadLen
-	var err error
+	length, err := frameLengthForPayload(int(streamIDLen), payloadLen)
+	if err != nil {
+		return nil, err
+	}
 	dst, err = AppendVarint(dst, length)
 	if err != nil {
 		return nil, WrapError(CodeProtocol, "marshal frame", err)
@@ -46,6 +51,17 @@ func AppendFrameHeaderTrustedCachedStreamID(dst []byte, code byte, streamID uint
 		return nil, WrapError(CodeProtocol, "marshal frame", err)
 	}
 	return dst, nil
+}
+
+func frameLengthForPayload(streamIDLen int, payloadLen uint64) (uint64, error) {
+	if streamIDLen <= 0 || streamIDLen > maxInboundFrameHeaderOverhead-1 {
+		return 0, FrameSizeError("marshal frame", ErrPayloadTooLarge)
+	}
+	headerLen := uint64(1 + streamIDLen)
+	if payloadLen > MaxVarint62-headerLen {
+		return 0, FrameSizeError("marshal frame", ErrPayloadTooLarge)
+	}
+	return headerLen + payloadLen, nil
 }
 
 func (f Frame) AppendBinary(dst []byte) ([]byte, error) {

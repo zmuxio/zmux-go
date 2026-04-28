@@ -73,6 +73,17 @@ func TestReadFrameBufferedRejectsOversizedPayloadBeforeReadingBody(t *testing.T)
 	}
 }
 
+func TestAppendFrameHeaderTrustedRejectsPayloadLengthOverflow(t *testing.T) {
+	t.Parallel()
+
+	if _, err := AppendFrameHeaderTrusted(nil, byte(FrameTypeDATA), 0, ^uint64(0)); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("AppendFrameHeaderTrusted err = %v, want %v", err, ErrPayloadTooLarge)
+	}
+	if _, err := AppendFrameHeaderTrustedCachedStreamID(nil, byte(FrameTypeDATA), 0, 0, 1, ^uint64(0)); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("AppendFrameHeaderTrustedCachedStreamID err = %v, want %v", err, ErrPayloadTooLarge)
+	}
+}
+
 func TestReadFrameBufferedRejectsShortStreamIDBeforeReadingPastFrame(t *testing.T) {
 	t.Parallel()
 
