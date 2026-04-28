@@ -4952,13 +4952,84 @@ func TestWriteDeadlineExpiresWhileBlockedSendingToWriterQueue(t *testing.T) {
 		t.Fatalf("SetWriteDeadline: %v", err)
 	}
 
-	_, err := second.Write([]byte("world"))
+	n, err := second.Write([]byte("world"))
+	if n != 0 {
+		t.Fatalf("second Write n = %d, want 0 before writer admission", n)
+	}
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("second Write err = %v, want deadline exceeded", err)
 	}
 
 	if err := releaseBlockedFirstWrite(t, writer, firstErrCh); err != nil {
 		t.Fatalf("first Write err = %v, want nil after writer release", err)
+	}
+}
+
+func newBufferedBlockingCaptureConnWithStreams(t *testing.T) (*Conn, *nativeStream, *nativeStream, *blockingCaptureWriteCloser) {
+	t.Helper()
+
+	writer := newBlockingCaptureWriteCloser()
+	c := &Conn{
+		io:        connIOState{conn: writer},
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+		writer: connWriterRuntimeState{
+			writeCh:       make(chan writeRequest, 1),
+			urgentWriteCh: make(chan writeRequest, 1),
+		},
+		config:   connConfigState{peer: Preface{Settings: Settings{MaxFramePayload: 16}}},
+		flow:     connFlowState{sendSessionMax: 1024},
+		registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
+	}
+	first := testVisibleBidiStream(c, 4, testWithSendMax(1024))
+	second := testVisibleBidiStream(c, 8, testWithSendMax(1024))
+
+	go c.writeLoop()
+	t.Cleanup(func() {
+		_ = writer.Close()
+		select {
+		case <-c.lifecycle.closedCh:
+		default:
+			close(c.lifecycle.closedCh)
+		}
+	})
+
+	return c, first, second, writer
+}
+
+func startBlockingCaptureFirstWrite(t *testing.T, first *nativeStream, writer *blockingCaptureWriteCloser) <-chan error {
+	t.Helper()
+
+	firstErrCh := make(chan error, 1)
+	go func() {
+		_, err := first.Write([]byte("hello"))
+		firstErrCh <- err
+	}()
+
+	select {
+	case <-writer.firstStarted:
+	case <-time.After(2 * testSignalTimeout):
+		t.Fatal("first write did not block writer")
+	}
+	return firstErrCh
+}
+
+func waitForBufferedOrdinaryWriterQueue(t *testing.T, c *Conn, done <-chan struct{}, op string) {
+	t.Helper()
+
+	deadline := time.Now().Add(testSignalTimeout)
+	for len(c.writer.writeCh) == 0 {
+		select {
+		case <-done:
+			t.Fatalf("%s completed before buffered writer admission", op)
+		default:
+		}
+		if remaining := time.Until(deadline); remaining <= 0 {
+			t.Fatalf("%s did not enter buffered writer queue", op)
+		} else if remaining < time.Millisecond {
+			time.Sleep(remaining)
+		} else {
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 
@@ -5063,6 +5134,154 @@ func TestStreamWriteClonesPayloadBeforeBufferedWriterAdmission(t *testing.T) {
 	}
 }
 
+func TestWriteFinalDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
+	c, first, second, writer := newBufferedBlockingCaptureConnWithStreams(t)
+
+	firstErrCh := startBlockingCaptureFirstWrite(t, first, writer)
+
+	payload := []byte("world")
+	resultCh := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	done := make(chan struct{})
+	go func() {
+		n, err := second.WriteFinal(payload)
+		resultCh <- struct {
+			n   int
+			err error
+		}{n: n, err: err}
+		close(done)
+	}()
+
+	waitForBufferedOrdinaryWriterQueue(t, c, done, "WriteFinal")
+
+	if err := second.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	select {
+	case result := <-resultCh:
+		if result.n != len("world") {
+			t.Fatalf("WriteFinal n = %d, want %d after buffered admission", result.n, len("world"))
+		}
+		if !errors.Is(result.err, os.ErrDeadlineExceeded) {
+			t.Fatalf("WriteFinal err = %v, want deadline exceeded", result.err)
+		}
+	case <-time.After(2 * testSignalTimeout):
+		t.Fatal("WriteFinal did not return after deadline")
+	}
+
+	c.mu.Lock()
+	sendFin := second.sendFinReached()
+	sendTerminal := state.SendTerminal(second.effectiveSendHalfStateLocked())
+	c.mu.Unlock()
+
+	if !sendFin {
+		t.Fatal("sendFinReached() = false after admitted final write timed out locally")
+	}
+	if !sendTerminal {
+		t.Fatal("send half is not terminal after admitted final write timed out locally")
+	}
+
+	copy(payload, "xxxxx")
+	_ = writer.Close()
+
+	select {
+	case err := <-firstErrCh:
+		if err != nil {
+			t.Fatalf("first Write err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("first write did not unblock")
+	}
+
+	frames := waitForBlockingCapturedFrames(t, writer, 2)
+	var got *Frame
+	for i := range frames {
+		if frames[i].Type == FrameTypeDATA && frames[i].StreamID == second.id {
+			got = &frames[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("captured frames missing second DATA: %+v", frames)
+	}
+	if got.Flags&FrameFlagFIN == 0 {
+		t.Fatalf("second DATA flags = %#x, want FIN", got.Flags)
+	}
+	if string(got.Payload) != "world" {
+		t.Fatalf("second payload = %q, want original payload %q", got.Payload, "world")
+	}
+}
+
+func TestCloseWriteDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
+	c, first, second, writer := newBufferedBlockingCaptureConnWithStreams(t)
+
+	firstErrCh := startBlockingCaptureFirstWrite(t, first, writer)
+
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		errCh <- second.CloseWrite()
+		close(done)
+	}()
+
+	waitForBufferedOrdinaryWriterQueue(t, c, done, "CloseWrite")
+
+	if err := second.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("CloseWrite err = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * testSignalTimeout):
+		t.Fatal("CloseWrite did not return after deadline")
+	}
+
+	c.mu.Lock()
+	sendFin := second.sendFinReached()
+	sendTerminal := state.SendTerminal(second.effectiveSendHalfStateLocked())
+	c.mu.Unlock()
+
+	if !sendFin {
+		t.Fatal("sendFinReached() = false after admitted CloseWrite timed out locally")
+	}
+	if !sendTerminal {
+		t.Fatal("send half is not terminal after admitted CloseWrite timed out locally")
+	}
+
+	_ = writer.Close()
+
+	select {
+	case err := <-firstErrCh:
+		if err != nil {
+			t.Fatalf("first Write err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("first write did not unblock")
+	}
+
+	frames := waitForBlockingCapturedFrames(t, writer, 2)
+	var got *Frame
+	for i := range frames {
+		if frames[i].Type == FrameTypeDATA && frames[i].StreamID == second.id {
+			got = &frames[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("captured frames missing second DATA: %+v", frames)
+	}
+	if got.Flags&FrameFlagFIN == 0 {
+		t.Fatalf("second DATA flags = %#x, want FIN", got.Flags)
+	}
+	if len(got.Payload) != 0 {
+		t.Fatalf("second FIN payload len = %d, want 0", len(got.Payload))
+	}
+}
+
 func TestEnqueueWriteRequestDeadlineRollbackClearsRetainedRefs(t *testing.T) {
 	c, first, second, writer := newBlockedWriterConnWithStreams(t)
 
@@ -5164,7 +5383,10 @@ func TestWriteDeadlineRollbackReleasesPreparedSendCreditWhileBlockedOnWriterQueu
 		t.Fatalf("SetWriteDeadline: %v", err)
 	}
 
-	_, err := second.Write([]byte("world"))
+	n, err := second.Write([]byte("world"))
+	if n != 0 {
+		t.Fatalf("second Write n = %d, want 0 before writer admission", n)
+	}
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("second Write err = %v, want deadline exceeded", err)
 	}
@@ -5195,7 +5417,10 @@ func TestWriteFinalDeadlineRollbackClearsPreparedFinWhileBlockedOnWriterQueue(t 
 		t.Fatalf("SetWriteDeadline: %v", err)
 	}
 
-	_, err := second.WriteFinal([]byte("world"))
+	n, err := second.WriteFinal([]byte("world"))
+	if n != 0 {
+		t.Fatalf("second WriteFinal n = %d, want 0 before writer admission", n)
+	}
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("second WriteFinal err = %v, want deadline exceeded", err)
 	}
@@ -5231,7 +5456,10 @@ func TestWriteDeadlineRestoresPendingPriorityUpdateWhileBlockedOnWriterQueue(t *
 		t.Fatalf("SetWriteDeadline: %v", err)
 	}
 
-	_, err := second.Write([]byte("world"))
+	n, err := second.Write([]byte("world"))
+	if n != 0 {
+		t.Fatalf("second Write n = %d, want 0 before writer admission", n)
+	}
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("second Write err = %v, want deadline exceeded", err)
 	}

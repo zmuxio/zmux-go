@@ -2745,9 +2745,9 @@ func TestWaitQueuedWriteCompletionClearsRetainedRefsOnInitialClose(t *testing.T)
 		preparedPriorityPayload: []byte("priority"),
 	}
 
-	err := stream.waitQueuedWriteCompletion(&req)
-	if !errors.Is(err, ErrSessionClosed) {
-		t.Fatalf("waitQueuedWriteCompletion() err = %v, want %v", err, ErrSessionClosed)
+	result := stream.waitQueuedWriteCompletion(&req)
+	if !errors.Is(result.err, ErrSessionClosed) {
+		t.Fatalf("waitQueuedWriteCompletion() err = %v, want %v", result.err, ErrSessionClosed)
 	}
 	if req.frames != nil || req.done != nil || req.preparedNotify != nil || req.reservedStream != nil || req.preparedPriorityPayload != nil {
 		t.Fatal("waitQueuedWriteCompletion did not clear retained request refs on early close")

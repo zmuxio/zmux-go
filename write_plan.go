@@ -587,13 +587,13 @@ func (s *nativeStream) commitQueuedWrite(commit queuedWriteCommit) {
 	}
 }
 
-func (s *nativeStream) queueFramesUntilDeadlineAndOptionsOwned(frames []txFrame, opts queuedWriteOptions) error {
+func (s *nativeStream) queueFramesUntilDeadlineAndOptionsOwnedResult(frames []txFrame, opts queuedWriteOptions) queuedWriteResult {
 	if s == nil || s.conn == nil || len(frames) == 0 {
-		return nil
+		return queuedWriteResult{completed: true}
 	}
 	if !opts.ownership.ownsFrames() {
 		if err := validateOutboundTxFramesWithLimits(frames, s.conn.localLimitsView(), s.conn.peerLimitsView()); err != nil {
-			return err
+			return queuedWriteResult{err: err}
 		}
 	}
 
@@ -605,7 +605,7 @@ func (s *nativeStream) queueFramesUntilDeadlineAndOptionsOwned(frames []txFrame,
 	}
 	if opts.ownership.ownsFrames() {
 		if err := s.prepareOwnedWriteRequest(&req); err != nil {
-			return err
+			return queuedWriteResult{err: err}
 		}
 	} else {
 		classifyWriteRequest(&req)
@@ -629,9 +629,15 @@ func (s *nativeStream) queueFramesUntilDeadlineAndOptionsOwned(frames []txFrame,
 		deadlineOverride: opts.deadlineOverride,
 		deadlinePolicy:   opts.deadlinePolicy,
 	}); err != nil {
-		return err
+		return queuedWriteResult{err: err}
 	}
-	return s.waitQueuedWriteCompletion(&req)
+	result := s.waitQueuedWriteCompletion(&req)
+	result.admitted = true
+	return result
+}
+
+func (s *nativeStream) queueFramesUntilDeadlineAndOptionsOwned(frames []txFrame, opts queuedWriteOptions) error {
+	return s.queueFramesUntilDeadlineAndOptionsOwnedResult(frames, opts).err
 }
 
 const (
@@ -890,7 +896,7 @@ const (
 	writeBurstFlushReady
 )
 
-func (s *nativeStream) queueBurstFramesWithAdmission(state writeBurstState, mode writeChunkMode, deadlinePolicy writeDeadlinePolicy) error {
+func (s *nativeStream) queueBurstFramesWithAdmission(state writeBurstState, mode writeChunkMode, deadlinePolicy writeDeadlinePolicy) queuedWriteResult {
 	opts := queuedWriteOptions{
 		terminalPolicy:        terminalWriteReject,
 		ownership:             frameOwned,
@@ -903,26 +909,33 @@ func (s *nativeStream) queueBurstFramesWithAdmission(state writeBurstState, mode
 		opts.terminalPolicy = terminalWriteAllow
 	}
 	if mode.isFinal() {
-		err := s.queueFramesUntilDeadlineAndOptionsOwned(state.frames, opts)
-		if err != nil {
-			if state.commit.finalize {
+		result := s.queueFramesUntilDeadlineAndOptionsOwnedResult(state.frames, opts)
+		if result.err != nil {
+			if state.commit.finalize && !result.pendingCompletion() {
 				s.conn.mu.Lock()
 				s.clearSendFin()
 				s.conn.mu.Unlock()
 			}
-			return err
+			return result
 		}
-		return nil
+		return result
 	}
-	return s.queueFramesUntilDeadlineAndOptionsOwned(state.frames, opts)
+	return s.queueFramesUntilDeadlineAndOptionsOwnedResult(state.frames, opts)
 }
 
-func (s *nativeStream) finishBurstQueueErr(state writeBurstState, err error) writeBurstResult {
+func (s *nativeStream) finishBurstQueueErr(state writeBurstState, result queuedWriteResult) writeBurstResult {
 	if state.commit.progress > 0 {
-		s.commitBurstProgress(state)
-		return writeBurstResult{progress: state.commit.progress, err: err}
+		if result.pendingCompletion() {
+			s.commitBurstSuccess(state)
+			return writeBurstResult{
+				progress:   state.commit.progress,
+				finalState: state.commit.burstFinalState(),
+				err:        result.err,
+			}
+		}
+		return writeBurstResult{err: result.err}
 	}
-	return writeBurstResult{err: err}
+	return writeBurstResult{err: result.err}
 }
 
 func (s *nativeStream) flushWriteBurst(state writeBurstState, chunkMode writeChunkMode, mode writeBurstFlushMode, burstErr error) writeBurstResult {
@@ -930,9 +943,9 @@ func (s *nativeStream) flushWriteBurst(state writeBurstState, chunkMode writeChu
 		if !state.hasFrames() {
 			return writeBurstResult{err: burstErr}
 		}
-		queueErr := s.queueBurstFramesWithAdmission(state, chunkMode, writeDeadlinePolicyAfterErr(burstErr))
-		if queueErr != nil {
-			return s.finishBurstQueueErr(state, queueErr)
+		queueResult := s.queueBurstFramesWithAdmission(state, chunkMode, writeDeadlinePolicyAfterErr(burstErr))
+		if queueResult.err != nil {
+			return s.finishBurstQueueErr(state, queueResult)
 		}
 		if mode == writeBurstFlushAccumulatedErr {
 			s.commitBurstPeerVisible(state)
@@ -946,8 +959,9 @@ func (s *nativeStream) flushWriteBurst(state writeBurstState, chunkMode writeChu
 	if !state.hasFrames() {
 		return writeBurstResult{stop: true}
 	}
-	if err := s.queueBurstFramesWithAdmission(state, chunkMode, writeDeadlineUseStream); err != nil {
-		return s.finishBurstQueueErr(state, err)
+	queueResult := s.queueBurstFramesWithAdmission(state, chunkMode, writeDeadlineUseStream)
+	if queueResult.err != nil {
+		return s.finishBurstQueueErr(state, queueResult)
 	}
 	switch mode {
 	case writeBurstFlushPrepared:

@@ -1216,11 +1216,11 @@ func (e terminalQueueExecution) wrapErr(err error) error {
 	return err
 }
 
-func (e terminalQueueExecution) handleLockedPostQueue(s *nativeStream, err error) {
+func (e terminalQueueExecution) handleLockedPostQueue(s *nativeStream, result queuedWriteResult) {
 	if s == nil || s.conn == nil {
 		return
 	}
-	if err != nil {
+	if result.err != nil && !result.pendingCompletion() {
 		switch e.hooks.rollback {
 		case terminalFrameRollbackCloseWrite:
 			s.clearSendFin()
@@ -1246,17 +1246,19 @@ func (e terminalQueueExecution) queue(s *nativeStream) error {
 	if s == nil || s.conn == nil || len(e.frames) == 0 {
 		return nil
 	}
-	err := s.queueFramesUntilDeadlineAndOptionsOwned(e.frames, e.opts)
-	if err != nil || e.hooks.notifyWrite {
+	result := s.queueFramesUntilDeadlineAndOptionsOwnedResult(e.frames, e.opts)
+	if result.err != nil || e.hooks.notifyWrite {
 		s.conn.mu.Lock()
-		e.handleLockedPostQueue(s, err)
+		e.handleLockedPostQueue(s, result)
 		s.conn.mu.Unlock()
 	}
-	if err != nil {
-		if !e.errorCommit.empty() {
+	if result.err != nil {
+		if result.pendingCompletion() {
+			s.commitQueuedWrite(e.commit)
+		} else if !e.errorCommit.empty() {
 			s.commitQueuedWrite(e.errorCommit)
 		}
-		return e.wrapErr(err)
+		return e.wrapErr(result.err)
 	}
 	s.commitQueuedWrite(e.commit)
 	return nil
