@@ -1282,10 +1282,16 @@ func (p closeReadPlan) queue(s *nativeStream) error {
 			return err
 		}
 	}
-	if err := s.queueFramesUntilDeadlineAndOptionsOwned([]txFrame{p.stopFrame}, queuedWriteOptions{
+	result := s.queueFramesUntilDeadlineAndOptionsOwnedResult([]txFrame{p.stopFrame}, queuedWriteOptions{
 		ownership: frameOwned,
-	}); err != nil {
-		return err
+	})
+	if result.err != nil {
+		if result.pendingCompletion() {
+			s.conn.mu.Lock()
+			s.clearLocalReadSignalPending()
+			s.conn.mu.Unlock()
+		}
+		return result.err
 	}
 	s.conn.mu.Lock()
 	s.clearLocalReadSignalPending()

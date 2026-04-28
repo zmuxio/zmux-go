@@ -5013,11 +5013,11 @@ func startBlockingCaptureFirstWrite(t *testing.T, first *nativeStream, writer *b
 	return firstErrCh
 }
 
-func waitForBufferedOrdinaryWriterQueue(t *testing.T, c *Conn, done <-chan struct{}, op string) {
+func waitForBufferedWriterQueue(t *testing.T, lane chan writeRequest, done <-chan struct{}, op string) {
 	t.Helper()
 
 	deadline := time.Now().Add(testSignalTimeout)
-	for len(c.writer.writeCh) == 0 {
+	for len(lane) == 0 {
 		select {
 		case <-done:
 			t.Fatalf("%s completed before buffered writer admission", op)
@@ -5154,7 +5154,7 @@ func TestWriteFinalDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
 		close(done)
 	}()
 
-	waitForBufferedOrdinaryWriterQueue(t, c, done, "WriteFinal")
+	waitForBufferedWriterQueue(t, c.writer.writeCh, done, "WriteFinal")
 
 	if err := second.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
 		t.Fatalf("SetWriteDeadline: %v", err)
@@ -5226,7 +5226,7 @@ func TestCloseWriteDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
 		close(done)
 	}()
 
-	waitForBufferedOrdinaryWriterQueue(t, c, done, "CloseWrite")
+	waitForBufferedWriterQueue(t, c.writer.writeCh, done, "CloseWrite")
 
 	if err := second.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
 		t.Fatalf("SetWriteDeadline: %v", err)
@@ -5279,6 +5279,68 @@ func TestCloseWriteDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
 	}
 	if len(got.Payload) != 0 {
 		t.Fatalf("second FIN payload len = %d, want 0", len(got.Payload))
+	}
+}
+
+func TestCloseReadDeadlineAfterBufferedAdmissionClearsPendingSignal(t *testing.T) {
+	c, first, second, writer := newBufferedBlockingCaptureConnWithStreams(t)
+
+	firstErrCh := startBlockingCaptureFirstWrite(t, first, writer)
+
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		errCh <- second.CloseRead()
+		close(done)
+	}()
+
+	waitForBufferedWriterQueue(t, c.writer.urgentWriteCh, done, "CloseRead")
+
+	if err := second.SetWriteDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("CloseRead err = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * testSignalTimeout):
+		t.Fatal("CloseRead did not return after deadline")
+	}
+
+	c.mu.Lock()
+	readStopped := second.readStopSentLocked()
+	pendingSignal := second.localReadSignalPendingFlag()
+	c.mu.Unlock()
+
+	if !readStopped {
+		t.Fatal("readStopSentLocked() = false after admitted CloseRead timed out locally")
+	}
+	if pendingSignal {
+		t.Fatal("local read signal still pending after admitted CloseRead timed out locally")
+	}
+
+	_ = writer.Close()
+
+	select {
+	case err := <-firstErrCh:
+		if err != nil {
+			t.Fatalf("first Write err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("first write did not unblock")
+	}
+
+	frames := waitForBlockingCapturedFrames(t, writer, 2)
+	found := false
+	for _, frame := range frames {
+		if frame.Type == FrameTypeStopSending && frame.StreamID == second.id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("captured frames missing second STOP_SENDING: %+v", frames)
 	}
 }
 
