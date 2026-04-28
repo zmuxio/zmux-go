@@ -615,18 +615,24 @@ func TestGoAwayMustBeNonIncreasing(t *testing.T) {
 	t.Parallel()
 	c, _, stop := newHandlerTestConn(t)
 	defer stop()
-	c.sessionControl.peerGoAwayBidi = 80
-	c.sessionControl.peerGoAwayUni = 99
+
+	localRole := c.config.negotiated.LocalRole
+	bidi := state.FirstLocalStreamID(localRole, true) + 76
+	uni := state.FirstLocalStreamID(localRole, false) + 96
+	uniWiden := uni + 4
+
+	c.sessionControl.peerGoAwayBidi = bidi
+	c.sessionControl.peerGoAwayUni = uni
 
 	if err := c.handleGoAwayFrame(Frame{
 		Type:    FrameTypeGOAWAY,
-		Payload: mustGoAwayPayload(t, 80, 99, uint64(CodeNoError), ""),
+		Payload: mustGoAwayPayload(t, bidi, uni, uint64(CodeNoError), ""),
 	}); err != nil {
 		t.Fatalf("first non-increasing GOAWAY: %v", err)
 	}
 	err := c.handleGoAwayFrame(Frame{
 		Type:    FrameTypeGOAWAY,
-		Payload: mustGoAwayPayload(t, 80, 103, uint64(CodeNoError), ""),
+		Payload: mustGoAwayPayload(t, bidi, uniWiden, uint64(CodeNoError), ""),
 	})
 	if !IsErrorCode(err, CodeProtocol) {
 		t.Fatalf("widening GOAWAY err = %v, want %s", err, CodeProtocol)

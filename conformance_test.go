@@ -214,7 +214,7 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestLateDataAggregateCapAfterMultipleTerminalDirections",
 		"TestQueueStreamBlockedDropsWhenControlBudgetExceeded",
 	},
-	"repository-default liveness rules keep at most one outstanding protocol PING and does not treat weak local signals as strong progress": {
+	"repository-default liveness rules keep at most one outstanding protocol PING and do not treat weak local signals as strong progress": {
 		"TestPingWaitsForOutstandingSlot",
 		"TestKeepaliveSendsIdlePing",
 		"TestKeepaliveTimeoutSignalsIdleTimeoutError",
@@ -568,7 +568,7 @@ func TestReferenceProfileClaimGate(t *testing.T) {
 	if gate[0] != "repository-default stream-style CloseRead() emits STOP_SENDING(CANCELLED) when that convenience profile is exposed, while fuller control surfaces MAY additionally expose caller-selected codes and diagnostics for STOP_SENDING, RESET, and ABORT" {
 		t.Fatalf("ReferenceProfileClaimGate() = %#v", gate)
 	}
-	if gate[6] != "repository-default liveness rules keep at most one outstanding protocol PING and does not treat weak local signals as strong progress" {
+	if gate[6] != "repository-default liveness rules keep at most one outstanding protocol PING and do not treat weak local signals as strong progress" {
 		t.Fatalf("ReferenceProfileClaimGate() = %#v", gate)
 	}
 

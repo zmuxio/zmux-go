@@ -1500,11 +1500,11 @@ func runInvalidSessionGoAwayIncrease(t *testing.T) error {
 
 	c, _, stop := newInvalidFrameConn(t, 0)
 	defer stop()
-	c.sessionControl.peerGoAwayBidi = 80
-	c.sessionControl.peerGoAwayUni = 99
+	c.sessionControl.peerGoAwayBidi = state.FirstLocalStreamID(c.config.negotiated.LocalRole, true) + 80
+	c.sessionControl.peerGoAwayUni = state.FirstLocalStreamID(c.config.negotiated.LocalRole, false) + 96
 	return c.handleGoAwayFrame(Frame{
 		Type:    FrameTypeGOAWAY,
-		Payload: mustGoAwayPayload(t, 80, 103, uint64(CodeNoError), ""),
+		Payload: mustGoAwayPayload(t, c.sessionControl.peerGoAwayBidi, c.sessionControl.peerGoAwayUni+4, uint64(CodeNoError), ""),
 	})
 }
 

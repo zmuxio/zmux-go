@@ -1282,15 +1282,15 @@
   "initial_state": null,
   "steps": [
     {
-      "event": "peer_GOAWAY_last_accepted_bidi_100_uni_99",
+      "event": "peer_GOAWAY_last_accepted_bidi_101_uni_99",
       "expect_result": "accepted"
     },
     {
-      "event": "peer_GOAWAY_last_accepted_bidi_80_uni_99",
+      "event": "peer_GOAWAY_last_accepted_bidi_81_uni_99",
       "expect_result": "accepted"
     },
     {
-      "event": "peer_GOAWAY_last_accepted_bidi_80_uni_103",
+      "event": "peer_GOAWAY_last_accepted_bidi_81_uni_103",
       "expect_result": "protocol_violation"
     }
   ]

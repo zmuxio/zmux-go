@@ -763,7 +763,7 @@ var referenceProfileClaimGate = []string{
 	"each exposed API surface keeps one documented primary spelling per operation family, with any extra convenience spellings documented as wrappers over the same semantic action rather than as distinct lifecycle operations",
 	"before session-ready, repository-default sender behavior emits only the local preface and a fatal establishment CLOSE, and emits none of new-stream DATA, stream-scoped control, ordinary session-scoped control, or EXT",
 	"repository-default sender and receiver memory rules enforce the documented hidden-state, provisional-open, and late-tail bounds",
-	"repository-default liveness rules keep at most one outstanding protocol PING and does not treat weak local signals as strong progress",
+	"repository-default liveness rules keep at most one outstanding protocol PING and do not treat weak local signals as strong progress",
 }
 
 var claimRequiredSuites = map[Claim][]ConformanceSuite{

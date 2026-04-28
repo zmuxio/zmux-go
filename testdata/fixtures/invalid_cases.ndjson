@@ -592,9 +592,9 @@
     "error": "PROTOCOL"
   },
   "input_shape": {
-    "prior_last_accepted_bidi_stream_id": 80,
+    "prior_last_accepted_bidi_stream_id": 81,
     "prior_last_accepted_uni_stream_id": 99,
-    "incoming_last_accepted_bidi_stream_id": 80,
+    "incoming_last_accepted_bidi_stream_id": 81,
     "incoming_last_accepted_uni_stream_id": 103
   }
 }

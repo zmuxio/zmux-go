@@ -354,7 +354,13 @@ func (c *Conn) validatePeerGoAwayPayloadLocked(payload goAwayPayload) error {
 	if err := validateGoAwayWatermarkForDirection(payload.LastAcceptedBidi, true); err != nil {
 		return err
 	}
+	if err := validateGoAwayWatermarkCreator(c.config.negotiated.LocalRole, payload.LastAcceptedBidi); err != nil {
+		return err
+	}
 	if err := validateGoAwayWatermarkForDirection(payload.LastAcceptedUni, false); err != nil {
+		return err
+	}
+	if err := validateGoAwayWatermarkCreator(c.config.negotiated.LocalRole, payload.LastAcceptedUni); err != nil {
 		return err
 	}
 	if payload.LastAcceptedBidi > c.sessionControl.peerGoAwayBidi || payload.LastAcceptedUni > c.sessionControl.peerGoAwayUni {

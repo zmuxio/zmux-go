@@ -513,6 +513,29 @@ func TestPeerGoAwayTransitionsSessionToDraining(t *testing.T) {
 	}
 }
 
+func TestPeerGoAwayRejectsWrongCreatorWatermark(t *testing.T) {
+	t.Parallel()
+	c, _, stop := newHandlerTestConn(t)
+	defer stop()
+
+	err := c.handleGoAwayFrame(Frame{
+		Type: FrameTypeGOAWAY,
+		Payload: mustGoAwayPayload(
+			t,
+			state.FirstPeerStreamID(c.config.negotiated.LocalRole, true),
+			0,
+			uint64(CodeNoError),
+			"",
+		),
+	})
+	if err == nil {
+		t.Fatal("handleGoAwayFrame err = nil, want protocol error")
+	}
+	if !IsErrorCode(err, CodeProtocol) {
+		t.Fatalf("handleGoAwayFrame err = %v, want PROTOCOL", err)
+	}
+}
+
 func TestPeerGoAwayNotifiesControlPlane(t *testing.T) {
 	t.Parallel()
 	c, _, stop := newHandlerTestConnWithOptions(t, false)
@@ -6901,29 +6924,43 @@ func TestPeerGoAwayWideningIsProtocolError(t *testing.T) {
 	c, _, stop := newHandlerTestConn(t)
 	defer stop()
 
-	c.sessionControl.peerGoAwayBidi = 100
-	c.sessionControl.peerGoAwayUni = 99
+	localRole := c.config.negotiated.LocalRole
+	bidiHigh := state.FirstLocalStreamID(localRole, true) + 96
+	bidiLow := bidiHigh - 20
+	uniHigh := state.FirstLocalStreamID(localRole, false) + 96
+	uniWiden := uniHigh + 4
+
+	c.sessionControl.peerGoAwayBidi = bidiHigh
+	c.sessionControl.peerGoAwayUni = uniHigh
 
 	if err := c.handleGoAwayFrame(Frame{
 		Type:    FrameTypeGOAWAY,
-		Payload: mustGoAwayPayload(t, 80, 99, uint64(CodeNoError), ""),
+		Payload: mustGoAwayPayload(t, bidiLow, uniHigh, uint64(CodeNoError), ""),
 	}); err != nil {
 		t.Fatalf("first non-increasing GOAWAY: %v", err)
 	}
-	if c.sessionControl.peerGoAwayBidi != 80 || c.sessionControl.peerGoAwayUni != 99 {
-		t.Fatalf("stored watermarks = (%d, %d), want (80, 99)", c.sessionControl.peerGoAwayBidi, c.sessionControl.peerGoAwayUni)
+	if c.sessionControl.peerGoAwayBidi != bidiLow || c.sessionControl.peerGoAwayUni != uniHigh {
+		t.Fatalf("stored watermarks = (%d, %d), want (%d, %d)", c.sessionControl.peerGoAwayBidi, c.sessionControl.peerGoAwayUni, bidiLow, uniHigh)
 	}
 
 	err := c.handleGoAwayFrame(Frame{
 		Type:    FrameTypeGOAWAY,
-		Payload: mustGoAwayPayload(t, 80, 103, uint64(CodeNoError), ""),
+		Payload: mustGoAwayPayload(t, bidiLow, uniWiden, uint64(CodeNoError), ""),
 	})
 	if !IsErrorCode(err, CodeProtocol) {
 		t.Fatalf("widening GOAWAY err = %v, want %s", err, CodeProtocol)
 	}
 }
 
-func TestPeerGoAwayBidiRejectsLocalOrWrongDirectionStreamID(t *testing.T) {
+func maxLocalGoAwayWatermark(localRole Role, arity streamArity) uint64 {
+	firstLocalID := state.FirstLocalStreamID(localRole, arity.isBidi())
+	if firstLocalID == 0 || firstLocalID > MaxVarint62 {
+		return 0
+	}
+	return firstLocalID + ((MaxVarint62-firstLocalID)/4)*4
+}
+
+func TestPeerGoAwayBidiAcceptsLocalAndRejectsWrongDirectionStreamID(t *testing.T) {
 	c, _, stop := newHandlerTestConn(t)
 	defer stop()
 
@@ -6954,7 +6991,7 @@ func TestPeerGoAwayBidiRejectsLocalOrWrongDirectionStreamID(t *testing.T) {
 	}
 }
 
-func TestPeerGoAwayUniRejectsLocalOrWrongDirectionStreamID(t *testing.T) {
+func TestPeerGoAwayUniAcceptsLocalAndRejectsWrongDirectionStreamID(t *testing.T) {
 	c, _, stop := newHandlerTestConn(t)
 	defer stop()
 
@@ -8264,8 +8301,8 @@ func TestRepeatedNoOpGoAwayTriggersProtocolClose(t *testing.T) {
 	c, _, stop := newInvalidPolicyConn(t)
 	defer stop()
 
-	bidi := maxPeerGoAwayWatermark(c.config.negotiated.LocalRole, streamArityBidi)
-	uni := maxPeerGoAwayWatermark(c.config.negotiated.LocalRole, streamArityUni)
+	bidi := maxLocalGoAwayWatermark(c.config.negotiated.LocalRole, streamArityBidi)
+	uni := maxLocalGoAwayWatermark(c.config.negotiated.LocalRole, streamArityUni)
 	frame := Frame{
 		Type:    FrameTypeGOAWAY,
 		Payload: mustGoAwayPayload(t, bidi, uni, uint64(CodeNoError), ""),
@@ -8294,8 +8331,8 @@ func TestGoAwayChangeClearsMixedNoOpControlBudget(t *testing.T) {
 		}
 	}
 
-	bidi := maxPeerGoAwayWatermark(c.config.negotiated.LocalRole, streamArityBidi)
-	uni := maxPeerGoAwayWatermark(c.config.negotiated.LocalRole, streamArityUni)
+	bidi := maxLocalGoAwayWatermark(c.config.negotiated.LocalRole, streamArityBidi)
+	uni := maxLocalGoAwayWatermark(c.config.negotiated.LocalRole, streamArityUni)
 	frame := Frame{
 		Type:    FrameTypeGOAWAY,
 		Payload: mustGoAwayPayload(t, bidi, uni, uint64(CodeNoError), ""),
@@ -21353,8 +21390,8 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		}
 		return nil
 	case "peer_GOAWAY_then_repeat_same_GOAWAY_threshold_plus_one":
-		bidi := maxPeerGoAwayWatermark(e.conn.config.negotiated.LocalRole, streamArityBidi)
-		uni := maxPeerGoAwayWatermark(e.conn.config.negotiated.LocalRole, streamArityUni)
+		bidi := maxLocalGoAwayWatermark(e.conn.config.negotiated.LocalRole, streamArityBidi)
+		uni := maxLocalGoAwayWatermark(e.conn.config.negotiated.LocalRole, streamArityUni)
 		payload, err := buildGoAwayPayload(bidi, uni, uint64(CodeNoError), "")
 		if err != nil {
 			return err
@@ -21379,8 +21416,8 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 				return err
 			}
 		}
-		bidi := maxPeerGoAwayWatermark(e.conn.config.negotiated.LocalRole, streamArityBidi)
-		uni := maxPeerGoAwayWatermark(e.conn.config.negotiated.LocalRole, streamArityUni)
+		bidi := maxLocalGoAwayWatermark(e.conn.config.negotiated.LocalRole, streamArityBidi)
+		uni := maxLocalGoAwayWatermark(e.conn.config.negotiated.LocalRole, streamArityUni)
 		payload, err := buildGoAwayPayload(bidi, uni, uint64(CodeNoError), "")
 		if err != nil {
 			return err
