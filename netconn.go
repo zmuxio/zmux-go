@@ -330,7 +330,7 @@ func (c *JoinedConn) Close() error {
 			errs = append(errs, err)
 		}
 	}
-	if writeHalf != nil && !(readClosedFully && sameJoinedHalf(readHalf, writeHalf)) {
+	if writeHalf != nil && (!readClosedFully || !sameJoinedHalf(readHalf, writeHalf)) {
 		if err := closeJoinedWriteHalf(writeHalf); err != nil {
 			errs = append(errs, err)
 		}
