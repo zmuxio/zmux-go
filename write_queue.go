@@ -4,6 +4,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	rt "github.com/zmuxio/zmux-go/internal/runtime"
@@ -12,8 +13,10 @@ import (
 )
 
 type writeRequest struct {
-	frames []txFrame
-	done   chan error
+	frames         []txFrame
+	done           chan error
+	cancel         *queuedWriteCancel
+	cancelReusable bool
 	// donePooled marks completion channels acquired from the internal pool so
 	// the hot path can reuse them after normal completion without changing the
 	// external request API that tests and control paths observe.
@@ -73,6 +76,52 @@ type writeRequest struct {
 	preparedPriorityPayload  []byte
 	preparedPriorityBytes    uint64
 	preparedPriorityQueued   bool
+}
+
+type queuedWriteCancelState uint32
+
+const (
+	queuedWriteCancelable queuedWriteCancelState = iota
+	queuedWriteWriting
+	queuedWriteCanceled
+)
+
+// queuedWriteCancel is shared by the caller's request and the queued copy in
+// the writer lane. Its CAS boundary decides whether a deadline may still roll
+// back reservations or the writer owns the request and must complete it.
+type queuedWriteCancel struct {
+	state atomic.Uint32
+}
+
+var queuedWriteCancelPool = sync.Pool{
+	New: func() any {
+		return &queuedWriteCancel{}
+	},
+}
+
+func acquireQueuedWriteCancel() *queuedWriteCancel {
+	cancel := queuedWriteCancelPool.Get().(*queuedWriteCancel)
+	cancel.state.Store(uint32(queuedWriteCancelable))
+	return cancel
+}
+
+func releaseQueuedWriteCancel(cancel *queuedWriteCancel) {
+	if cancel == nil {
+		return
+	}
+	cancel.state.Store(uint32(queuedWriteCancelable))
+	queuedWriteCancelPool.Put(cancel)
+}
+
+func (c *queuedWriteCancel) tryCancel() bool {
+	return c != nil && c.state.CompareAndSwap(uint32(queuedWriteCancelable), uint32(queuedWriteCanceled))
+}
+
+func (c *queuedWriteCancel) tryMarkWriting() bool {
+	if c == nil {
+		return true
+	}
+	return c.state.CompareAndSwap(uint32(queuedWriteCancelable), uint32(queuedWriteWriting))
 }
 
 type txFrame struct {
@@ -138,6 +187,13 @@ func (req *writeRequest) markDoneReusable() {
 	req.doneReusable = true
 }
 
+func (req *writeRequest) markCancelReusable() {
+	if req == nil || req.cancel == nil {
+		return
+	}
+	req.cancelReusable = true
+}
+
 func (req *writeRequest) tryTakeDoneErr() (error, bool) {
 	if req == nil || req.done == nil {
 		return nil, false
@@ -145,6 +201,7 @@ func (req *writeRequest) tryTakeDoneErr() (error, bool) {
 	select {
 	case err := <-req.done:
 		req.markDoneReusable()
+		req.markCancelReusable()
 		return err, true
 	default:
 		return nil, false
@@ -163,6 +220,19 @@ func (req *writeRequest) releaseDoneChan() {
 	if pooled {
 		drainDoneChan(done)
 		writeRequestDoneChanPool.Put(done)
+	}
+}
+
+func (req *writeRequest) releaseCancel() {
+	if req == nil || req.cancel == nil {
+		return
+	}
+	cancel := req.cancel
+	reusable := req.cancelReusable
+	req.cancel = nil
+	req.cancelReusable = false
+	if reusable {
+		releaseQueuedWriteCancel(cancel)
 	}
 }
 
@@ -787,6 +857,7 @@ func (req *writeRequest) clearRetainedRefs() {
 		return
 	}
 	req.frames = nil
+	req.releaseCancel()
 	req.releaseDoneChan()
 	req.preparedNotify = nil
 	req.queueReserved = false
@@ -813,6 +884,33 @@ func prepareWriteRequestForSend(req *writeRequest) {
 	}
 	req.ensureDoneChan()
 	req.frames, req.cloneFramesBeforeSend = cloneTxFramesIfNeeded(req.frames, req.cloneFramesBeforeSend)
+}
+
+func prepareCancelableWriteRequestForSend(req *writeRequest) {
+	prepareWriteRequestForSend(req)
+	if req != nil && req.cancel == nil {
+		req.cancel = acquireQueuedWriteCancel()
+		req.cancelReusable = false
+	}
+}
+
+func clearCanceledQueuedWriteRequest(req *writeRequest) {
+	if req == nil {
+		return
+	}
+	// The caller won cancellation and will not wait for a completion signal. The
+	// writer owns this copied reference now, so it may recycle the unused channel
+	// but must not send on it.
+	req.markDoneReusable()
+	req.markCancelReusable()
+	req.clearRetainedRefs()
+}
+
+func markWriteRequestWriting(req *writeRequest) bool {
+	if req == nil || req.cancel == nil {
+		return true
+	}
+	return req.cancel.tryMarkWriting()
 }
 
 func clearPreparedQueueRequests(reqs []writeRequest) {
@@ -1514,6 +1612,7 @@ func (s *nativeStream) releasePreparedWriteRequestForFailure(req *writeRequest) 
 	}
 	s.conn.releasePreparedWriteRequest(req)
 	req.markDoneReusable()
+	req.markCancelReusable()
 	req.clearRetainedRefs()
 }
 
@@ -1585,6 +1684,17 @@ func (s *nativeStream) queuedWriteWaitErrResult(req *writeRequest, waitErr error
 	return queuedWriteResult{err: waitErr}
 }
 
+func (s *nativeStream) cancelQueuedWriteOnDeadline(req *writeRequest) bool {
+	if s == nil || s.conn == nil || req == nil || req.cancel == nil {
+		return false
+	}
+	if !req.cancel.tryCancel() {
+		return false
+	}
+	s.conn.releasePreparedWriteRequest(req)
+	return true
+}
+
 func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) queuedWriteResult {
 	if s == nil || s.conn == nil {
 		return queuedWriteResult{completed: true, err: ErrSessionClosed}
@@ -1600,12 +1710,18 @@ func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) queuedWriteR
 	}
 	var timer *time.Timer
 	defer stopTimer(timer)
+	deadlineCanceled := false
 	for {
 		var timeout <-chan time.Time
-		if !completion.deadline.IsZero() {
+		if !deadlineCanceled && !completion.deadline.IsZero() {
 			delay := time.Until(completion.deadline)
 			if delay <= 0 {
-				return s.queuedWriteWaitErrResult(req, os.ErrDeadlineExceeded)
+				if s.cancelQueuedWriteOnDeadline(req) {
+					return queuedWriteResult{completed: true, err: os.ErrDeadlineExceeded}
+				}
+				deadlineCanceled = true
+				completion.deadline = time.Time{}
+				continue
 			}
 			timer = resetTimer(timer, delay)
 			timeout = timer.C
@@ -1616,15 +1732,24 @@ func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) queuedWriteR
 			return s.queuedWriteWaitErrResult(req, queueVisibleSessionErr(s.conn, s.conn.err()))
 		case err := <-req.done:
 			req.markDoneReusable()
+			req.markCancelReusable()
 			return queuedWriteResult{completed: true, err: s.conn.queueRequestDoneErr(err)}
 		case <-completion.notifyCh:
 			completion.notifyCh, completion.deadline, completion.closeErr = s.refreshQueuedWriteCompletion()
+			if deadlineCanceled {
+				completion.deadline = time.Time{}
+			}
 			if completion.closeErr != nil {
 				return s.queuedWriteWaitErrResult(req, queueVisibleSessionErr(s.conn, completion.closeErr))
 			}
 			continue
 		case <-timeout:
-			return s.queuedWriteWaitErrResult(req, os.ErrDeadlineExceeded)
+			if s.cancelQueuedWriteOnDeadline(req) {
+				return queuedWriteResult{completed: true, err: os.ErrDeadlineExceeded}
+			}
+			deadlineCanceled = true
+			completion.deadline = time.Time{}
+			continue
 		}
 	}
 }
@@ -1672,7 +1797,7 @@ func (s *nativeStream) sendQueuedWriteRequestUntilDeadline(req *writeRequest, la
 	if s == nil || s.conn == nil || req == nil {
 		return ErrSessionClosed
 	}
-	prepareWriteRequestForSend(req)
+	prepareCancelableWriteRequestForSend(req)
 	var timer *time.Timer
 	defer stopTimer(timer)
 	for {
@@ -2272,6 +2397,10 @@ func drainDetachedWriteLane(ch chan writeRequest, err error) bool {
 				return drained
 			}
 			drained = true
+			if !markWriteRequestWriting(&req) {
+				clearCanceledQueuedWriteRequest(&req)
+				continue
+			}
 			completeWriteRequest(&req, err)
 			req.clearRetainedRefs()
 		default:

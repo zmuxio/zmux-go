@@ -561,6 +561,10 @@ func (c *Conn) suppressWriteBatch(batch []writeRequest) []writeRequest {
 	inflightQueued := c.writer.scratch.streamValueAccumulator(len(batch))
 	for i := range batch {
 		req := &batch[i]
+		if !markWriteRequestWriting(req) {
+			clearCanceledQueuedWriteRequest(req)
+			continue
+		}
 		if err := c.suppressWriteRequestForStreamLocked(req, req.reservedStream); err != nil {
 			rejected = append(rejected, rejectedWriteRequest{req: *req, err: err})
 			continue

@@ -4911,8 +4911,8 @@ func releaseBlockedFirstWrite(t *testing.T, writer *stallingWriteCloser, firstEr
 func assertRetainedWriteRequestCleared(t *testing.T, req *writeRequest) {
 	t.Helper()
 
-	if req.frames != nil || req.done != nil || req.reservedStream != nil {
-		t.Fatalf("retained refs not cleared: frames=%v done=%v reservedStream=%v", req.frames, req.done, req.reservedStream)
+	if req.frames != nil || req.done != nil || req.cancel != nil || req.cancelReusable || req.reservedStream != nil {
+		t.Fatalf("retained refs not cleared: frames=%v done=%v cancel=%v cancelReusable=%v reservedStream=%v", req.frames, req.done, req.cancel, req.cancelReusable, req.reservedStream)
 	}
 	if req.queueReserved || req.queuedBytes != 0 || req.urgentReserved || req.advisoryReserved || req.cloneFramesBeforeSend {
 		t.Fatalf("queue state retained = (%v,%d,%v,%v,%v), want cleared",
@@ -5033,7 +5033,7 @@ func waitForBufferedWriterQueue(t *testing.T, lane chan writeRequest, done <-cha
 	}
 }
 
-func TestStreamWriteClonesPayloadBeforeBufferedWriterAdmission(t *testing.T) {
+func TestStreamWriteDeadlineAfterBufferedAdmissionCancelsQueuedRequest(t *testing.T) {
 	writer := newBlockingCaptureWriteCloser()
 	c := &Conn{
 		io:        connIOState{conn: writer},
@@ -5118,23 +5118,15 @@ func TestStreamWriteClonesPayloadBeforeBufferedWriterAdmission(t *testing.T) {
 		t.Fatal("first write did not unblock")
 	}
 
-	frames := waitForBlockingCapturedFrames(t, writer, 2)
-	var got []byte
+	frames := waitForBlockingCapturedFrames(t, writer, 1)
 	for _, frame := range frames {
 		if frame.Type == FrameTypeDATA && frame.StreamID == second.id {
-			got = frame.Payload
-			break
+			t.Fatalf("captured canceled second DATA frame: %+v", frames)
 		}
-	}
-	if got == nil {
-		t.Fatalf("captured frames missing second DATA: %+v", frames)
-	}
-	if string(got) != "world" {
-		t.Fatalf("second payload = %q, want original payload %q", got, "world")
 	}
 }
 
-func TestWriteFinalDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
+func TestWriteFinalDeadlineAfterBufferedAdmissionCancelsQueuedRequest(t *testing.T) {
 	c, first, second, writer := newBufferedBlockingCaptureConnWithStreams(t)
 
 	firstErrCh := startBlockingCaptureFirstWrite(t, first, writer)
@@ -5161,8 +5153,8 @@ func TestWriteFinalDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
 	}
 	select {
 	case result := <-resultCh:
-		if result.n != len("world") {
-			t.Fatalf("WriteFinal n = %d, want %d after buffered admission", result.n, len("world"))
+		if result.n != 0 {
+			t.Fatalf("WriteFinal n = %d, want 0 after queued request cancellation", result.n)
 		}
 		if !errors.Is(result.err, os.ErrDeadlineExceeded) {
 			t.Fatalf("WriteFinal err = %v, want deadline exceeded", result.err)
@@ -5176,11 +5168,11 @@ func TestWriteFinalDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
 	sendTerminal := state.SendTerminal(second.effectiveSendHalfStateLocked())
 	c.mu.Unlock()
 
-	if !sendFin {
-		t.Fatal("sendFinReached() = false after admitted final write timed out locally")
+	if sendFin {
+		t.Fatal("sendFinReached() = true after queued final write was canceled")
 	}
-	if !sendTerminal {
-		t.Fatal("send half is not terminal after admitted final write timed out locally")
+	if sendTerminal {
+		t.Fatal("send half is terminal after queued final write was canceled")
 	}
 
 	copy(payload, "xxxxx")
@@ -5195,26 +5187,15 @@ func TestWriteFinalDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
 		t.Fatal("first write did not unblock")
 	}
 
-	frames := waitForBlockingCapturedFrames(t, writer, 2)
-	var got *Frame
+	frames := waitForBlockingCapturedFrames(t, writer, 1)
 	for i := range frames {
 		if frames[i].Type == FrameTypeDATA && frames[i].StreamID == second.id {
-			got = &frames[i]
-			break
+			t.Fatalf("captured canceled second DATA frame: %+v", frames)
 		}
-	}
-	if got == nil {
-		t.Fatalf("captured frames missing second DATA: %+v", frames)
-	}
-	if got.Flags&FrameFlagFIN == 0 {
-		t.Fatalf("second DATA flags = %#x, want FIN", got.Flags)
-	}
-	if string(got.Payload) != "world" {
-		t.Fatalf("second payload = %q, want original payload %q", got.Payload, "world")
 	}
 }
 
-func TestCloseWriteDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
+func TestCloseWriteDeadlineAfterBufferedAdmissionCancelsQueuedRequest(t *testing.T) {
 	c, first, second, writer := newBufferedBlockingCaptureConnWithStreams(t)
 
 	firstErrCh := startBlockingCaptureFirstWrite(t, first, writer)
@@ -5245,11 +5226,11 @@ func TestCloseWriteDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
 	sendTerminal := state.SendTerminal(second.effectiveSendHalfStateLocked())
 	c.mu.Unlock()
 
-	if !sendFin {
-		t.Fatal("sendFinReached() = false after admitted CloseWrite timed out locally")
+	if sendFin {
+		t.Fatal("sendFinReached() = true after queued CloseWrite was canceled")
 	}
-	if !sendTerminal {
-		t.Fatal("send half is not terminal after admitted CloseWrite timed out locally")
+	if sendTerminal {
+		t.Fatal("send half is terminal after queued CloseWrite was canceled")
 	}
 
 	_ = writer.Close()
@@ -5263,26 +5244,15 @@ func TestCloseWriteDeadlineAfterBufferedAdmissionKeepsFinState(t *testing.T) {
 		t.Fatal("first write did not unblock")
 	}
 
-	frames := waitForBlockingCapturedFrames(t, writer, 2)
-	var got *Frame
+	frames := waitForBlockingCapturedFrames(t, writer, 1)
 	for i := range frames {
 		if frames[i].Type == FrameTypeDATA && frames[i].StreamID == second.id {
-			got = &frames[i]
-			break
+			t.Fatalf("captured canceled second FIN frame: %+v", frames)
 		}
-	}
-	if got == nil {
-		t.Fatalf("captured frames missing second DATA: %+v", frames)
-	}
-	if got.Flags&FrameFlagFIN == 0 {
-		t.Fatalf("second DATA flags = %#x, want FIN", got.Flags)
-	}
-	if len(got.Payload) != 0 {
-		t.Fatalf("second FIN payload len = %d, want 0", len(got.Payload))
 	}
 }
 
-func TestCloseReadDeadlineAfterBufferedAdmissionClearsPendingSignal(t *testing.T) {
+func TestCloseReadDeadlineAfterBufferedAdmissionCancelsQueuedSignal(t *testing.T) {
 	c, first, second, writer := newBufferedBlockingCaptureConnWithStreams(t)
 
 	firstErrCh := startBlockingCaptureFirstWrite(t, first, writer)
@@ -5314,10 +5284,10 @@ func TestCloseReadDeadlineAfterBufferedAdmissionClearsPendingSignal(t *testing.T
 	c.mu.Unlock()
 
 	if !readStopped {
-		t.Fatal("readStopSentLocked() = false after admitted CloseRead timed out locally")
+		t.Fatal("readStopSentLocked() = false after queued CloseRead timed out locally")
 	}
-	if pendingSignal {
-		t.Fatal("local read signal still pending after admitted CloseRead timed out locally")
+	if !pendingSignal {
+		t.Fatal("local read signal not pending after queued STOP_SENDING was canceled")
 	}
 
 	_ = writer.Close()
@@ -5331,16 +5301,11 @@ func TestCloseReadDeadlineAfterBufferedAdmissionClearsPendingSignal(t *testing.T
 		t.Fatal("first write did not unblock")
 	}
 
-	frames := waitForBlockingCapturedFrames(t, writer, 2)
-	found := false
+	frames := waitForBlockingCapturedFrames(t, writer, 1)
 	for _, frame := range frames {
 		if frame.Type == FrameTypeStopSending && frame.StreamID == second.id {
-			found = true
-			break
+			t.Fatalf("captured canceled second STOP_SENDING: %+v", frames)
 		}
-	}
-	if !found {
-		t.Fatalf("captured frames missing second STOP_SENDING: %+v", frames)
 	}
 }
 

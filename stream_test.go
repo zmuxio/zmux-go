@@ -4347,7 +4347,7 @@ func TestSetWriteDeadlineWakesBlockedWrite(t *testing.T) {
 	}
 }
 
-func TestStreamWriteDeadlineExpiresWhileWriterIsBlocked(t *testing.T) {
+func TestStreamWriteDeadlineDoesNotExpireAfterWriterStartsUnderlyingWrite(t *testing.T) {
 	t.Parallel()
 
 	writer := newStallingWriteCloser()
@@ -4380,15 +4380,22 @@ func TestStreamWriteDeadlineExpiresWhileWriterIsBlocked(t *testing.T) {
 
 	select {
 	case err := <-errCh:
-		if !errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("Write err = %v, want deadline exceeded", err)
+		t.Fatalf("Write completed while underlying writer was still blocked: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	_ = writer.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Write err = %v, want nil after underlying writer completes", err)
 		}
-	case <-time.After(2 * testSignalTimeout):
-		t.Fatal("blocked queued write did not hit deadline")
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Write did not complete after underlying writer was released")
 	}
 }
 
-func TestSetWriteDeadlineWakesBlockedQueuedWrite(t *testing.T) {
+func TestSetWriteDeadlineDoesNotWakeWriteAfterWriterStartsUnderlyingWrite(t *testing.T) {
 	t.Parallel()
 
 	writer := newStallingWriteCloser()
@@ -4421,11 +4428,18 @@ func TestSetWriteDeadlineWakesBlockedQueuedWrite(t *testing.T) {
 
 	select {
 	case err := <-errCh:
-		if !errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("Write err = %v, want deadline exceeded", err)
+		t.Fatalf("Write completed while underlying writer was still blocked: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	_ = writer.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Write err = %v, want nil after underlying writer completes", err)
 		}
-	case <-time.After(2 * testSignalTimeout):
-		t.Fatal("blocked queued write did not wake on deadline update")
+	case <-time.After(testSignalTimeout):
+		t.Fatal("Write did not complete after underlying writer was released")
 	}
 }
 
