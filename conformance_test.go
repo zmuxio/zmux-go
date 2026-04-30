@@ -411,6 +411,39 @@ func TestImplementationProfileReleaseCertificationGate(t *testing.T) {
 	}
 }
 
+func TestCoreModuleTargetConformance(t *testing.T) {
+	claims := CoreModuleTargetClaims()
+	if len(claims) != 4 ||
+		claims[0] != ClaimWireV1 ||
+		claims[1] != ClaimAPISemanticsProfileV1 ||
+		claims[2] != ClaimOpenMetadata ||
+		claims[3] != ClaimPriorityUpdate {
+		t.Fatalf("CoreModuleTargetClaims() = %#v", claims)
+	}
+
+	profiles := CoreModuleTargetImplementationProfiles()
+	if len(profiles) != 1 || profiles[0] != ProfileV1 {
+		t.Fatalf("CoreModuleTargetImplementationProfiles() = %#v", profiles)
+	}
+
+	suites := CoreModuleTargetSuites()
+	if len(suites) != 11 ||
+		suites[0] != SuiteCoreWireInteroperability ||
+		suites[9] != SuiteV1ProfileCompatibility ||
+		suites[10] != SuiteAPISemanticsProfile {
+		t.Fatalf("CoreModuleTargetSuites() = %#v", suites)
+	}
+
+	claims[0] = "changed"
+	profiles[0] = "changed"
+	suites[0] = "changed"
+	if CoreModuleTargetClaims()[0] != ClaimWireV1 ||
+		CoreModuleTargetImplementationProfiles()[0] != ProfileV1 ||
+		CoreModuleTargetSuites()[0] != SuiteCoreWireInteroperability {
+		t.Fatal("core module target conformance helpers did not return defensive copies")
+	}
+}
+
 func TestKnownClaimsReturnsCopy(t *testing.T) {
 	t.Parallel()
 

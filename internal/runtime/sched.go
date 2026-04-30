@@ -72,6 +72,10 @@ func (s *BatchScheduler) UntrackExplicitGroup(groupID uint64) {
 	delete(s.State.GroupLastService, GroupKey{Kind: 1, Value: groupID})
 	delete(s.State.GroupLag, GroupKey{Kind: 1, Value: groupID})
 	delete(s.State.PreferredStreamHead, GroupKey{Kind: 1, Value: groupID})
+	if s.State.HasPreferredGroupHead && s.State.PreferredGroupHead == (GroupKey{Kind: 1, Value: groupID}) {
+		s.State.PreferredGroupHead = GroupKey{}
+		s.State.HasPreferredGroupHead = false
+	}
 	s.maybeClearIdleHeadState()
 }
 
@@ -86,11 +90,16 @@ func (s *BatchScheduler) DropStream(streamID uint64, explicitGroup bool, groupID
 	delete(s.State.StreamLastSeenBatch, streamID)
 	delete(s.State.SmallBurstDisarmed, streamID)
 	if !explicitGroup || groupID == 0 {
-		delete(s.State.GroupVirtualTime, GroupKey{Kind: 0, Value: streamID})
-		delete(s.State.GroupFinishTag, GroupKey{Kind: 0, Value: streamID})
-		delete(s.State.GroupLastService, GroupKey{Kind: 0, Value: streamID})
-		delete(s.State.GroupLag, GroupKey{Kind: 0, Value: streamID})
-		delete(s.State.PreferredStreamHead, GroupKey{Kind: 0, Value: streamID})
+		groupKey := GroupKey{Kind: 0, Value: streamID}
+		delete(s.State.GroupVirtualTime, groupKey)
+		delete(s.State.GroupFinishTag, groupKey)
+		delete(s.State.GroupLastService, groupKey)
+		delete(s.State.GroupLag, groupKey)
+		delete(s.State.PreferredStreamHead, groupKey)
+		if s.State.HasPreferredGroupHead && s.State.PreferredGroupHead == groupKey {
+			s.State.PreferredGroupHead = GroupKey{}
+			s.State.HasPreferredGroupHead = false
+		}
 	}
 	s.maybeClearIdleHeadState()
 }

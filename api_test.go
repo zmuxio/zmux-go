@@ -116,6 +116,13 @@ func TestPublicProtocolAliasesRemainPinned(t *testing.T) {
 			t.Fatalf("%s = %d, want %d", tc.name, got, want)
 		}
 	}
+
+	if got := SchedulerHintFromCode(uint64(wire.SchedulerGroupFair)); got != SchedulerGroupFair {
+		t.Fatalf("SchedulerHintFromCode(group_fair) = %d, want %d", got, SchedulerGroupFair)
+	}
+	if got := SchedulerHintFromCode(99); got != SchedulerUnspecifiedOrBalanced {
+		t.Fatalf("SchedulerHintFromCode(unknown) = %d, want %d", got, SchedulerUnspecifiedOrBalanced)
+	}
 }
 
 func TestSessionConstructorsRejectNilConn(t *testing.T) {

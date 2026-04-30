@@ -131,7 +131,7 @@ func ParseSettingsTLV(src []byte) (Settings, error) {
 		case SettingMaxExtensionPayloadBytes:
 			settings.MaxExtensionPayloadBytes = value
 		case SettingSchedulerHints:
-			settings.SchedulerHints = SchedulerHint(value)
+			settings.SchedulerHints = SchedulerHintFromCode(value)
 		case SettingPingPaddingKey:
 			settings.PingPaddingKey = value
 		default:

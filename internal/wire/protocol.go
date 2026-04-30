@@ -45,6 +45,21 @@ const (
 	SchedulerGroupFair             SchedulerHint = 4
 )
 
+func SchedulerHintFromCode(code uint64) SchedulerHint {
+	switch SchedulerHint(code) {
+	case SchedulerLatency:
+		return SchedulerLatency
+	case SchedulerBalancedFair:
+		return SchedulerBalancedFair
+	case SchedulerBulkThroughput:
+		return SchedulerBulkThroughput
+	case SchedulerGroupFair:
+		return SchedulerGroupFair
+	default:
+		return SchedulerUnspecifiedOrBalanced
+	}
+}
+
 type Capabilities uint64
 
 const (

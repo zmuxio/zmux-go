@@ -7072,6 +7072,14 @@ func TestLocalGoAwayRejectsInvalidBidiOrUniWatermark(t *testing.T) {
 			if c.sessionControl.localGoAwayBidi != startBidi || c.sessionControl.localGoAwayUni != startUni {
 				t.Fatalf("role %s watermark changed after invalid uni direction GOAWAY: (%d, %d), want (%d, %d)", localRole, c.sessionControl.localGoAwayBidi, c.sessionControl.localGoAwayUni, startBidi, startUni)
 			}
+
+			err = c.GoAway(wire.MaxVarint62+1, 0)
+			if !IsErrorCode(err, CodeProtocol) {
+				t.Fatalf("role %s out-of-range bidi GOAWAY err = %v, want %s", localRole, err, CodeProtocol)
+			}
+			if c.sessionControl.localGoAwayBidi != startBidi || c.sessionControl.localGoAwayUni != startUni {
+				t.Fatalf("role %s watermark changed after out-of-range GOAWAY: (%d, %d), want (%d, %d)", localRole, c.sessionControl.localGoAwayBidi, c.sessionControl.localGoAwayUni, startBidi, startUni)
+			}
 		}()
 	}
 }

@@ -76,6 +76,9 @@ func ValidateStreamIDForRole(localRole wire.Role, streamID uint64) error {
 	if streamID == 0 {
 		return fmt.Errorf("stream_id = 0 is session-scoped")
 	}
+	if streamID > wire.MaxVarint62 {
+		return fmt.Errorf("stream_id %d exceeds varint62 range", streamID)
+	}
 	opener := StreamOpener(streamID)
 	if opener != wire.RoleInitiator && opener != wire.RoleResponder {
 		return fmt.Errorf("invalid stream_id %d", streamID)

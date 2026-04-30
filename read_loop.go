@@ -90,6 +90,10 @@ func (c *Conn) handleFrameBuffered(frame Frame, backing []byte, handle *wire.Fra
 			c.mu.Unlock()
 			return false, nil
 		}
+		if len(frame.Payload) < pingNonceBytes {
+			c.mu.Unlock()
+			return false, frameSizeError("handle PING", fmt.Errorf("PING payload too short: %d bytes", len(frame.Payload)))
+		}
 		err := c.recordInboundPingFloodLocked(now)
 		c.mu.Unlock()
 		if err != nil {

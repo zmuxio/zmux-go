@@ -7,9 +7,11 @@ func TestBatchSchedulerTrackAndUntrackExplicitGroup(t *testing.T) {
 
 	s := BatchScheduler{
 		State: BatchState{
-			GroupVirtualTime: map[GroupKey]uint64{{Kind: 1, Value: 7}: 11},
-			GroupFinishTag:   map[GroupKey]uint64{{Kind: 1, Value: 7}: 13},
-			GroupLastService: map[GroupKey]uint64{{Kind: 1, Value: 7}: 3},
+			GroupVirtualTime:      map[GroupKey]uint64{{Kind: 1, Value: 7}: 11},
+			GroupFinishTag:        map[GroupKey]uint64{{Kind: 1, Value: 7}: 13},
+			GroupLastService:      map[GroupKey]uint64{{Kind: 1, Value: 7}: 3},
+			PreferredGroupHead:    GroupKey{Kind: 1, Value: 7},
+			HasPreferredGroupHead: true,
 		},
 		ActiveGroupRefs: map[uint64]uint64{7: 2},
 	}
@@ -40,6 +42,9 @@ func TestBatchSchedulerTrackAndUntrackExplicitGroup(t *testing.T) {
 	if _, ok := s.State.GroupLastService[GroupKey{Kind: 1, Value: 7}]; ok {
 		t.Fatal("old explicit group last-service still retained")
 	}
+	if s.State.HasPreferredGroupHead {
+		t.Fatalf("old explicit group still retained as preferred head: %#v", s.State.PreferredGroupHead)
+	}
 }
 
 func TestBatchSchedulerDropStreamClearsIdleState(t *testing.T) {
@@ -61,6 +66,11 @@ func TestBatchSchedulerDropStreamClearsIdleState(t *testing.T) {
 				4: 1,
 			},
 			SmallBurstDisarmed: map[uint64]struct{}{4: {}},
+			PreferredGroupHead: GroupKey{
+				Kind:  0,
+				Value: 4,
+			},
+			HasPreferredGroupHead: true,
 			PreferredStreamHead: map[GroupKey]uint64{
 				{Kind: 0, Value: 4}: 4,
 			},
@@ -89,6 +99,9 @@ func TestBatchSchedulerDropStreamClearsIdleState(t *testing.T) {
 	}
 	if s.State.RootVirtualTime != 0 || s.State.ServiceSeq != 0 {
 		t.Fatalf("scheduler clocks = (%d,%d), want (0,0)", s.State.RootVirtualTime, s.State.ServiceSeq)
+	}
+	if s.State.HasPreferredGroupHead {
+		t.Fatalf("preferred group head retained after idle drop: %#v", s.State.PreferredGroupHead)
 	}
 	if s.State.StreamFinishTag != nil ||
 		s.State.StreamLastService != nil ||

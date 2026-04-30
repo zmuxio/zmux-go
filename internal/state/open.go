@@ -28,7 +28,7 @@ func MaxStreamIDForClass(nextID uint64) uint64 {
 }
 
 func ProjectedLocalOpenID(nextID uint64, queueLen int) uint64 {
-	if queueLen <= 0 || nextID > wire.MaxVarint62 {
+	if queueLen <= 0 || nextID == 0 || nextID > wire.MaxVarint62 {
 		return nextID
 	}
 	remaining := (wire.MaxVarint62 - nextID) / 4

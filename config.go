@@ -37,6 +37,10 @@ const (
 	SchedulerGroupFair             = wire.SchedulerGroupFair
 )
 
+func SchedulerHintFromCode(code uint64) SchedulerHint {
+	return wire.SchedulerHintFromCode(code)
+}
+
 type Capabilities = wire.Capabilities
 
 const (
@@ -823,12 +827,49 @@ var profileRequiredSuites = map[ImplementationProfile][]ConformanceSuite{
 	},
 }
 
+var coreModuleTargetClaims = []Claim{
+	ClaimWireV1,
+	ClaimAPISemanticsProfileV1,
+	ClaimOpenMetadata,
+	ClaimPriorityUpdate,
+}
+
+var coreModuleTargetProfiles = []ImplementationProfile{
+	ProfileV1,
+}
+
+var coreModuleTargetSuites = mergeRequiredSuites(coreModuleTargetClaims, coreModuleTargetProfiles)
+
 func copyStrings(in []string) []string {
 	return append([]string(nil), in...)
 }
 
 func copySuites(in []ConformanceSuite) []ConformanceSuite {
 	return append([]ConformanceSuite(nil), in...)
+}
+
+func mergeRequiredSuites(claims []Claim, profiles []ImplementationProfile) []ConformanceSuite {
+	seen := make(map[ConformanceSuite]struct{}, len(knownConformanceSuites))
+	for _, claim := range claims {
+		for _, suite := range claimRequiredSuites[claim] {
+			seen[suite] = struct{}{}
+		}
+	}
+	for _, profile := range profiles {
+		for _, suite := range profileRequiredSuites[profile] {
+			seen[suite] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]ConformanceSuite, 0, len(seen))
+	for _, suite := range knownConformanceSuites {
+		if _, ok := seen[suite]; ok {
+			out = append(out, suite)
+		}
+	}
+	return out
 }
 
 // KnownClaims returns the repository-defined claim names recognized by this
@@ -958,6 +999,27 @@ func (p ImplementationProfile) RequiredConformanceSuites() []ConformanceSuite {
 // suite selection gate for the implementation profile.
 func (p ImplementationProfile) ReleaseCertificationGate() []ConformanceSuite {
 	return p.RequiredConformanceSuites()
+}
+
+// CoreModuleTargetClaims returns the repository-defined conformance claims
+// targeted by the core zmux module. The returned slice is a copy and may be
+// modified by the caller.
+func CoreModuleTargetClaims() []Claim {
+	return append([]Claim(nil), coreModuleTargetClaims...)
+}
+
+// CoreModuleTargetImplementationProfiles returns the repository-defined
+// implementation profiles targeted by the core zmux module. The returned slice
+// is a copy and may be modified by the caller.
+func CoreModuleTargetImplementationProfiles() []ImplementationProfile {
+	return append([]ImplementationProfile(nil), coreModuleTargetProfiles...)
+}
+
+// CoreModuleTargetSuites returns the ordered union of conformance suites needed
+// to substantiate the core zmux module's target claims and profiles. The
+// returned slice is a copy and may be modified by the caller.
+func CoreModuleTargetSuites() []ConformanceSuite {
+	return copySuites(coreModuleTargetSuites)
 }
 
 type Frame = wire.Frame
@@ -1113,6 +1175,9 @@ func buildGoAwayPayload(lastAcceptedBidi, lastAcceptedUni, code uint64, reason s
 func validateGoAwayWatermarkForDirection(streamID uint64, bidi bool) error {
 	if streamID == 0 {
 		return nil
+	}
+	if streamID > wire.MaxVarint62 {
+		return fmt.Errorf("stream %d exceeds varint62 range for GOAWAY watermark", streamID)
 	}
 	if state.StreamIsBidi(streamID) != bidi {
 		return fmt.Errorf("stream %d has wrong direction for GOAWAY watermark", streamID)

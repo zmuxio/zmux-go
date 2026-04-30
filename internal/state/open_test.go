@@ -63,6 +63,12 @@ func TestOpenAdmissionHelpers(t *testing.T) {
 	if got := ProjectedLocalOpenID(last-4, 1); got != last {
 		t.Fatalf("projected local open id at last valid slot = %d, want %d", got, last)
 	}
+	if got := ProjectedLocalOpenID(0, 1); got != 0 {
+		t.Fatalf("projected local open id from unresolved role = %d, want 0", got)
+	}
+	if err := ValidateStreamIDForRole(wire.RoleInitiator, wire.MaxVarint62+1); err == nil {
+		t.Fatal("expected stream id above varint62 range to be rejected")
+	}
 	if got := ProvisionalAvailableCount(9, 21); got != 4 {
 		t.Fatalf("available provisional count = %d, want 4", got)
 	}

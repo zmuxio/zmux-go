@@ -33,6 +33,33 @@ func TestParseSettingsTLVRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseSettingsTLVNormalizesUnknownSchedulerHint(t *testing.T) {
+	t.Parallel()
+
+	value, err := EncodeVarint(99)
+	if err != nil {
+		t.Fatalf("EncodeVarint err = %v", err)
+	}
+	raw, err := AppendTLV(nil, uint64(SettingSchedulerHints), value)
+	if err != nil {
+		t.Fatalf("AppendTLV err = %v", err)
+	}
+
+	parsed, err := ParseSettingsTLV(raw)
+	if err != nil {
+		t.Fatalf("ParseSettingsTLV err = %v", err)
+	}
+	if parsed.SchedulerHints != SchedulerUnspecifiedOrBalanced {
+		t.Fatalf("SchedulerHints = %d, want %d", parsed.SchedulerHints, SchedulerUnspecifiedOrBalanced)
+	}
+	if got := SchedulerHintFromCode(4); got != SchedulerGroupFair {
+		t.Fatalf("SchedulerHintFromCode(4) = %d, want %d", got, SchedulerGroupFair)
+	}
+	if got := SchedulerHintFromCode(99); got != SchedulerUnspecifiedOrBalanced {
+		t.Fatalf("SchedulerHintFromCode(99) = %d, want %d", got, SchedulerUnspecifiedOrBalanced)
+	}
+}
+
 func TestParseSettingsTLVRejectsDuplicateKnownSetting(t *testing.T) {
 	t.Parallel()
 
