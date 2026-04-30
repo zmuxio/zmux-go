@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -94,6 +95,35 @@ func JoinConn(read ReadHalf, write WriteHalf) *JoinedConn {
 		readHalf:    read,
 		writeHalf:   write,
 	}
+}
+
+func sameJoinedHalf(first, second any) bool {
+	if first == nil || second == nil {
+		return false
+	}
+	firstValue := reflect.ValueOf(first)
+	secondValue := reflect.ValueOf(second)
+	if !firstValue.IsValid() ||
+		!secondValue.IsValid() ||
+		firstValue.Type() != secondValue.Type() ||
+		!firstValue.Type().Comparable() {
+		return false
+	}
+	return firstValue.Interface() == secondValue.Interface()
+}
+
+func closeJoinedReadHalf(readHalf ReadHalf) (bool, error) {
+	if closer, ok := readHalf.(io.Closer); ok {
+		return true, closer.Close()
+	}
+	return false, readHalf.CloseRead()
+}
+
+func closeJoinedWriteHalf(writeHalf WriteHalf) error {
+	if closer, ok := writeHalf.(io.Closer); ok {
+		return closer.Close()
+	}
+	return writeHalf.CloseWrite()
 }
 
 // ReadHalf returns the currently attached read half. It returns nil while the
@@ -292,13 +322,16 @@ func (c *JoinedConn) Close() error {
 	c.mu.Unlock()
 
 	var errs []error
+	readClosedFully := false
 	if readHalf != nil {
-		if err := readHalf.CloseRead(); err != nil {
+		var err error
+		readClosedFully, err = closeJoinedReadHalf(readHalf)
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if writeHalf != nil {
-		if err := writeHalf.CloseWrite(); err != nil {
+	if writeHalf != nil && !(readClosedFully && sameJoinedHalf(readHalf, writeHalf)) {
+		if err := closeJoinedWriteHalf(writeHalf); err != nil {
 			errs = append(errs, err)
 		}
 	}

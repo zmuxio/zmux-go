@@ -53,6 +53,83 @@ func (h *closeErrWriteHalf) SetWriteDeadline(time.Time) error { return nil }
 func (h *closeErrWriteHalf) LocalAddr() net.Addr              { return nil }
 func (h *closeErrWriteHalf) RemoteAddr() net.Addr             { return nil }
 
+type fullCloseHalf struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (h *fullCloseHalf) Read(_ []byte) (int, error) { return 0, io.EOF }
+
+func (h *fullCloseHalf) Write(p []byte) (int, error) { return len(p), nil }
+
+func (h *fullCloseHalf) CloseRead() error {
+	h.record("closeRead")
+	return nil
+}
+
+func (h *fullCloseHalf) CloseWrite() error {
+	h.record("closeWrite")
+	return nil
+}
+
+func (h *fullCloseHalf) Close() error {
+	h.record("close")
+	return nil
+}
+
+func (h *fullCloseHalf) SetReadDeadline(time.Time) error  { return nil }
+func (h *fullCloseHalf) SetWriteDeadline(time.Time) error { return nil }
+func (h *fullCloseHalf) LocalAddr() net.Addr              { return nil }
+func (h *fullCloseHalf) RemoteAddr() net.Addr             { return nil }
+
+func (h *fullCloseHalf) record(event string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.events = append(h.events, event)
+}
+
+func (h *fullCloseHalf) snapshotEvents() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.events...)
+}
+
+type halfCloseOnlyHalf struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (h *halfCloseOnlyHalf) Read(_ []byte) (int, error) { return 0, io.EOF }
+
+func (h *halfCloseOnlyHalf) Write(p []byte) (int, error) { return len(p), nil }
+
+func (h *halfCloseOnlyHalf) CloseRead() error {
+	h.record("closeRead")
+	return nil
+}
+
+func (h *halfCloseOnlyHalf) CloseWrite() error {
+	h.record("closeWrite")
+	return nil
+}
+
+func (h *halfCloseOnlyHalf) SetReadDeadline(time.Time) error  { return nil }
+func (h *halfCloseOnlyHalf) SetWriteDeadline(time.Time) error { return nil }
+func (h *halfCloseOnlyHalf) LocalAddr() net.Addr              { return nil }
+func (h *halfCloseOnlyHalf) RemoteAddr() net.Addr             { return nil }
+
+func (h *halfCloseOnlyHalf) record(event string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.events = append(h.events, event)
+}
+
+func (h *halfCloseOnlyHalf) snapshotEvents() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.events...)
+}
+
 type invalidProgressReadHalf struct {
 	n int
 }
@@ -736,6 +813,63 @@ func TestJoinedConnCloseJoinsHalfCloseErrors(t *testing.T) {
 	}
 	if !errors.Is(err, writeErr) {
 		t.Fatalf("Close err = %v, want joined write error %v", err, writeErr)
+	}
+}
+
+func TestJoinedConnCloseUsesFullCloseForCloseableHalves(t *testing.T) {
+	t.Parallel()
+
+	shared := &fullCloseHalf{}
+	if err := JoinConn(shared, shared).Close(); err != nil {
+		t.Fatalf("shared Close err = %v, want nil", err)
+	}
+	if got := shared.snapshotEvents(); len(got) != 1 || got[0] != "close" {
+		t.Fatalf("shared close events = %v, want [close]", got)
+	}
+
+	read := &fullCloseHalf{}
+	write := &fullCloseHalf{}
+	if err := JoinConn(read, write).Close(); err != nil {
+		t.Fatalf("separate Close err = %v, want nil", err)
+	}
+	if got := read.snapshotEvents(); len(got) != 1 || got[0] != "close" {
+		t.Fatalf("read close events = %v, want [close]", got)
+	}
+	if got := write.snapshotEvents(); len(got) != 1 || got[0] != "close" {
+		t.Fatalf("write close events = %v, want [close]", got)
+	}
+}
+
+func TestJoinedConnCloseFallsBackToBothHalfClosesWhenSharedHalfHasNoFullClose(t *testing.T) {
+	t.Parallel()
+
+	shared := &halfCloseOnlyHalf{}
+	if err := JoinConn(shared, shared).Close(); err != nil {
+		t.Fatalf("Close err = %v, want nil", err)
+	}
+	if got := shared.snapshotEvents(); len(got) != 2 || got[0] != "closeRead" || got[1] != "closeWrite" {
+		t.Fatalf("shared half close events = %v, want [closeRead closeWrite]", got)
+	}
+}
+
+func TestJoinedConnDirectionalCloseUsesHalfCloseForCloseableHalves(t *testing.T) {
+	t.Parallel()
+
+	read := &fullCloseHalf{}
+	write := &fullCloseHalf{}
+	conn := JoinConn(read, write)
+
+	if err := conn.CloseRead(); err != nil {
+		t.Fatalf("CloseRead err = %v, want nil", err)
+	}
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite err = %v, want nil", err)
+	}
+	if got := read.snapshotEvents(); len(got) != 1 || got[0] != "closeRead" {
+		t.Fatalf("read events = %v, want [closeRead]", got)
+	}
+	if got := write.snapshotEvents(); len(got) != 1 || got[0] != "closeWrite" {
+		t.Fatalf("write events = %v, want [closeWrite]", got)
 	}
 }
 
