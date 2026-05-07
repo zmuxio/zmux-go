@@ -21,6 +21,7 @@ server, err := zmux.Server(rwc, cfg)
 
 Use `New` when the transport does not already fix the initiator/responder role.
 Use `Client` or `Server` when the role is already known.
+Any `net.Conn` can be passed directly because it satisfies `io.ReadWriteCloser`.
 
 Use the stable constructors when you want the transport-agnostic surface:
 
@@ -509,12 +510,28 @@ session, err := zmux.New(rwc, cfg)
 
 ## JoinConn
 
-If your transport exposes separate read and write halves, combine them first:
+If your transport exposes separate read and write halves, combine them first.
+Use `JoinConn` when the halves already satisfy zmux's directional `ReadHalf`
+and `WriteHalf` contracts:
 
 ```go
 joined := zmux.JoinConn(readHalf, writeHalf)
 session, err := zmux.New(joined, nil)
 ```
+
+Use the split I/O helpers when the transport only exposes ordinary
+`io.Reader` and `io.Writer` halves:
+
+```go
+conn, err := zmux.ClientIO(reader, writer, cfg)
+session, err := zmux.ClientIOSession(reader, writer, cfg)
+joined := zmux.JoinIO(reader, writer)
+```
+
+`JoinIO` forwards deadlines and addresses when the underlying halves expose
+compatible methods, such as those on `net.Conn`. Plain `io.Reader` and
+`io.Writer` values that do not expose deadline methods report unsupported
+deadlines.
 
 ## QUIC Adapter
 

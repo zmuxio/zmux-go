@@ -262,6 +262,13 @@ func (s *nativeSendStream) Close() error {
 	return s.stream.Close()
 }
 
+func (s *nativeSendStream) joinedCloseIdentity() any {
+	if s == nil || s.stream == nil {
+		return nil
+	}
+	return s.stream
+}
+
 func (s *nativeSendStream) SetDeadline(t time.Time) error {
 	if s == nil || s.stream == nil {
 		return ErrSessionClosed
@@ -369,6 +376,13 @@ func (s *nativeRecvStream) Close() error {
 		return ErrSessionClosed
 	}
 	return s.stream.Close()
+}
+
+func (s *nativeRecvStream) joinedCloseIdentity() any {
+	if s == nil || s.stream == nil {
+		return nil
+	}
+	return s.stream
 }
 
 func (s *nativeRecvStream) SetDeadline(t time.Time) error {
@@ -1590,6 +1604,13 @@ func (s *nativeStream) Close() error {
 	return errors.Join(errs...)
 }
 
+func (s *nativeStream) joinedCloseIdentity() any {
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
 func (s *nativeStream) CloseWithError(code uint64, reason string) error {
 	return s.executeTerminalSignal(terminalSignalAbort, code, reason, terminalSignalOptions{
 		openerPolicy: terminalOpenerAllow,
@@ -1831,14 +1852,17 @@ func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint6
 }
 
 var (
-	_ net.Conn  = (*nativeStream)(nil)
-	_ net.Conn  = (*JoinedConn)(nil)
-	_ io.Reader = (*nativeStream)(nil)
-	_ io.Writer = (*nativeStream)(nil)
-	_ io.Reader = (*nativeRecvStream)(nil)
-	_ io.Writer = (*nativeSendStream)(nil)
-	_ ReadHalf  = (*nativeStream)(nil)
-	_ WriteHalf = (*nativeStream)(nil)
-	_ ReadHalf  = (*nativeRecvStream)(nil)
-	_ WriteHalf = (*nativeSendStream)(nil)
+	_ net.Conn            = (*nativeStream)(nil)
+	_ net.Conn            = (*JoinedConn)(nil)
+	_ io.Reader           = (*nativeStream)(nil)
+	_ io.Writer           = (*nativeStream)(nil)
+	_ io.Reader           = (*nativeRecvStream)(nil)
+	_ io.Writer           = (*nativeSendStream)(nil)
+	_ ReadHalf            = (*nativeStream)(nil)
+	_ WriteHalf           = (*nativeStream)(nil)
+	_ ReadHalf            = (*nativeRecvStream)(nil)
+	_ WriteHalf           = (*nativeSendStream)(nil)
+	_ joinedCloseIdentity = (*nativeStream)(nil)
+	_ joinedCloseIdentity = (*nativeRecvStream)(nil)
+	_ joinedCloseIdentity = (*nativeSendStream)(nil)
 )

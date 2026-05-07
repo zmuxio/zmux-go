@@ -94,6 +94,40 @@ func (h *fullCloseHalf) snapshotEvents() []string {
 	return append([]string(nil), h.events...)
 }
 
+type identityCloseReadHalf struct {
+	base     *fullCloseHalf
+	identity any
+}
+
+func (h *identityCloseReadHalf) Read(p []byte) (int, error) { return h.base.Read(p) }
+func (h *identityCloseReadHalf) CloseRead() error           { return h.base.CloseRead() }
+func (h *identityCloseReadHalf) Close() error               { return h.base.Close() }
+func (h *identityCloseReadHalf) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (h *identityCloseReadHalf) LocalAddr() net.Addr  { return nil }
+func (h *identityCloseReadHalf) RemoteAddr() net.Addr { return nil }
+func (h *identityCloseReadHalf) joinedCloseIdentity() any {
+	return h.identity
+}
+
+type identityCloseWriteHalf struct {
+	base     *fullCloseHalf
+	identity any
+}
+
+func (h *identityCloseWriteHalf) Write(p []byte) (int, error) { return h.base.Write(p) }
+func (h *identityCloseWriteHalf) CloseWrite() error           { return h.base.CloseWrite() }
+func (h *identityCloseWriteHalf) Close() error                { return h.base.Close() }
+func (h *identityCloseWriteHalf) SetWriteDeadline(time.Time) error {
+	return nil
+}
+func (h *identityCloseWriteHalf) LocalAddr() net.Addr  { return nil }
+func (h *identityCloseWriteHalf) RemoteAddr() net.Addr { return nil }
+func (h *identityCloseWriteHalf) joinedCloseIdentity() any {
+	return h.identity
+}
+
 type halfCloseOnlyHalf struct {
 	mu     sync.Mutex
 	events []string
@@ -837,6 +871,23 @@ func TestJoinedConnCloseUsesFullCloseForCloseableHalves(t *testing.T) {
 	}
 	if got := write.snapshotEvents(); len(got) != 1 || got[0] != "close" {
 		t.Fatalf("write close events = %v, want [close]", got)
+	}
+}
+
+func TestJoinedConnCloseUsesSharedCloseIdentityForDifferentHalfTypes(t *testing.T) {
+	t.Parallel()
+
+	shared := &fullCloseHalf{}
+	conn := JoinConn(
+		&identityCloseReadHalf{base: shared, identity: shared},
+		&identityCloseWriteHalf{base: shared, identity: shared},
+	)
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close err = %v, want nil", err)
+	}
+	if got := shared.snapshotEvents(); len(got) != 1 || got[0] != "close" {
+		t.Fatalf("shared identity close events = %v, want [close]", got)
 	}
 }
 

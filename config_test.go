@@ -73,3 +73,16 @@ func TestResetDefaultConfigRestoresBuiltInTemplate(t *testing.T) {
 		t.Fatalf("DefaultConfig().KeepaliveInterval = %v, want %v", got, want)
 	}
 }
+
+func TestMaxPrefacePaddingPayloadBytesUsesFullRemainingBudget(t *testing.T) {
+	t.Parallel()
+
+	got, err := maxPrefacePaddingPayloadBytes(DefaultSettings(), MaxPrefaceSettingsBytes)
+	if err != nil {
+		t.Fatalf("maxPrefacePaddingPayloadBytes err = %v", err)
+	}
+	const want = MaxPrefaceSettingsBytes - 3
+	if got != want {
+		t.Fatalf("maxPrefacePaddingPayloadBytes = %d, want %d", got, want)
+	}
+}

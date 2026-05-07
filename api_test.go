@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -175,6 +177,60 @@ func TestSessionConstructorsRejectNilConn(t *testing.T) {
 	})
 }
 
+func TestIOConstructorsRejectNilHalves(t *testing.T) {
+	t.Parallel()
+
+	conn := &countingCloseConn{}
+
+	t.Run("native", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name string
+			call func() (*Conn, error)
+		}{
+			{name: "NewIO nil reader", call: func() (*Conn, error) { return NewIO(nil, conn, nil) }},
+			{name: "NewIO nil writer", call: func() (*Conn, error) { return NewIO(conn, nil, nil) }},
+			{name: "ClientIO nil reader", call: func() (*Conn, error) { return ClientIO(nil, conn, nil) }},
+			{name: "ServerIO nil writer", call: func() (*Conn, error) { return ServerIO(conn, nil, nil) }},
+		}
+
+		for _, tc := range cases {
+			session, err := tc.call()
+			if session != nil {
+				t.Fatalf("%s returned non-nil conn for nil split transport", tc.name)
+			}
+			if !errors.Is(err, ErrNilConn) {
+				t.Fatalf("%s err = %v, want %v", tc.name, err, ErrNilConn)
+			}
+		}
+	})
+
+	t.Run("session", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name string
+			call func() (Session, error)
+		}{
+			{name: "NewIOSession nil reader", call: func() (Session, error) { return NewIOSession(nil, conn, nil) }},
+			{name: "NewIOSession nil writer", call: func() (Session, error) { return NewIOSession(conn, nil, nil) }},
+			{name: "ClientIOSession nil reader", call: func() (Session, error) { return ClientIOSession(nil, conn, nil) }},
+			{name: "ServerIOSession nil writer", call: func() (Session, error) { return ServerIOSession(conn, nil, nil) }},
+		}
+
+		for _, tc := range cases {
+			session, err := tc.call()
+			if session != nil {
+				t.Fatalf("%s returned non-nil session for nil split transport", tc.name)
+			}
+			if !errors.Is(err, ErrNilConn) {
+				t.Fatalf("%s err = %v, want %v", tc.name, err, ErrNilConn)
+			}
+		}
+	})
+}
+
 type countingCloseConn struct {
 	closeCount atomic.Int32
 }
@@ -220,6 +276,113 @@ func TestSessionConstructorsDoNotDoubleCloseTransportOnEstablishFailure(t *testi
 				t.Fatalf("%s close count = %d, want 1", tc.name, got)
 			}
 		})
+	}
+}
+
+func TestIOSessionConstructorsUseSplitReaderWriter(t *testing.T) {
+	t.Parallel()
+
+	left, right := net.Pipe()
+	type result struct {
+		session Session
+		err     error
+	}
+	clientCh := make(chan result, 1)
+	serverCh := make(chan result, 1)
+
+	go func() {
+		session, err := ClientIOSession(left, left, nil)
+		clientCh <- result{session: session, err: err}
+	}()
+	go func() {
+		session, err := ServerIOSession(right, right, nil)
+		serverCh <- result{session: session, err: err}
+	}()
+
+	client := <-clientCh
+	server := <-serverCh
+
+	if client.err != nil {
+		t.Fatalf("ClientIOSession establish: %v", client.err)
+	}
+	if server.err != nil {
+		t.Fatalf("ServerIOSession establish: %v", server.err)
+	}
+	defer func() { _ = client.session.Close() }()
+	defer func() { _ = server.session.Close() }()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	stream, n, err := client.session.OpenAndSend(ctx, []byte("ping"))
+	if err != nil {
+		t.Fatalf("OpenAndSend: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+	if n != len("ping") {
+		t.Fatalf("OpenAndSend n = %d, want %d", n, len("ping"))
+	}
+
+	accepted, err := server.session.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("AcceptStream: %v", err)
+	}
+	defer func() { _ = accepted.Close() }()
+
+	buf := make([]byte, len("ping"))
+	if _, err := io.ReadFull(accepted, buf); err != nil {
+		t.Fatalf("ReadFull accepted stream: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("accepted payload = %q, want %q", buf, "ping")
+	}
+}
+
+func TestJoinIOCloseDeduplicatesSharedCloser(t *testing.T) {
+	t.Parallel()
+
+	conn := &countingCloseConn{}
+	joined := JoinIO(conn, conn)
+
+	if err := joined.Close(); err != nil {
+		t.Fatalf("JoinIO(shared).Close err = %v", err)
+	}
+	if got := conn.closeCount.Load(); got != 1 {
+		t.Fatalf("shared split transport close count = %d, want 1", got)
+	}
+}
+
+func TestJoinIODirectionalCloseDeduplicatesSharedFullCloser(t *testing.T) {
+	t.Parallel()
+
+	conn := &countingCloseConn{}
+	joined := JoinIO(conn, conn)
+
+	if err := joined.CloseRead(); err != nil {
+		t.Fatalf("JoinIO(shared).CloseRead err = %v", err)
+	}
+	if got := conn.closeCount.Load(); got != 1 {
+		t.Fatalf("shared split transport close count after CloseRead = %d, want 1", got)
+	}
+	if err := joined.CloseWrite(); err != nil {
+		t.Fatalf("JoinIO(shared).CloseWrite err = %v", err)
+	}
+	if got := conn.closeCount.Load(); got != 1 {
+		t.Fatalf("shared split transport close count after CloseWrite = %d, want 1", got)
+	}
+}
+
+func TestJoinIOPlainHalvesReportUnsupportedDeadlines(t *testing.T) {
+	t.Parallel()
+
+	joined := JoinIO(&countingCloseConn{}, &countingCloseConn{})
+	deadline := time.Now().Add(time.Second)
+
+	if err := joined.SetReadDeadline(deadline); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("SetReadDeadline err = %v, want %v", err, errors.ErrUnsupported)
+	}
+	if err := joined.SetWriteDeadline(deadline); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("SetWriteDeadline err = %v, want %v", err, errors.ErrUnsupported)
 	}
 }
 

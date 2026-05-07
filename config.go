@@ -554,18 +554,22 @@ func maxPrefacePaddingPayloadBytes(settings Settings, configuredMax uint64) (uin
 	if err != nil {
 		return 0, err
 	}
-	for maxPayload > 0 {
-		lenLen, err := wire.VarintLen(maxPayload)
+	var low uint64
+	high := maxPayload
+	for low < high {
+		candidate := low + (high-low+1)/2
+		lenLen, err := wire.VarintLen(candidate)
 		if err != nil {
 			return 0, err
 		}
 		overhead := uint64(typeLen + lenLen)
-		if overhead <= remaining && maxPayload <= remaining-overhead {
-			return maxPayload, nil
+		if overhead <= remaining && candidate <= remaining-overhead {
+			low = candidate
+		} else {
+			high = candidate - 1
 		}
-		maxPayload--
 	}
-	return 0, nil
+	return low, nil
 }
 
 func randomUint64n(r io.Reader, n uint64) (uint64, error) {

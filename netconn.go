@@ -85,6 +85,10 @@ type PausedWriteHalf struct {
 	resumed bool
 }
 
+type joinedCloseIdentity interface {
+	joinedCloseIdentity() any
+}
+
 // JoinConn adapts one read half plus one write half into a net.Conn-compatible
 // wrapper. Either half may be nil.
 func JoinConn(read ReadHalf, write WriteHalf) *JoinedConn {
@@ -98,6 +102,24 @@ func JoinConn(read ReadHalf, write WriteHalf) *JoinedConn {
 }
 
 func sameJoinedHalf(first, second any) bool {
+	if sameComparableValue(joinedCloseIdentityOf(first), joinedCloseIdentityOf(second)) {
+		return true
+	}
+	return sameComparableValue(first, second)
+}
+
+func joinedCloseIdentityOf(v any) any {
+	if v == nil {
+		return nil
+	}
+	identity, ok := v.(joinedCloseIdentity)
+	if !ok {
+		return nil
+	}
+	return identity.joinedCloseIdentity()
+}
+
+func sameComparableValue(first, second any) bool {
 	if first == nil || second == nil {
 		return false
 	}
@@ -359,8 +381,10 @@ func (c *JoinedConn) SetReadDeadline(t time.Time) error {
 		c.mu.Unlock()
 		return ErrSessionClosed
 	}
+	prevDeadline := c.readDeadline
 	c.readDeadline = t
 	c.readDeadlineGen++
+	deadlineGen := c.readDeadlineGen
 	readHalf := c.readHalf
 	if readHalf != nil {
 		c.activeReadDeadlineOps++
@@ -375,6 +399,10 @@ func (c *JoinedConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
 	if c.activeReadDeadlineOps > 0 {
 		c.activeReadDeadlineOps--
+	}
+	if err != nil && c.readDeadlineGen == deadlineGen {
+		c.readDeadline = prevDeadline
+		c.readDeadlineGen++
 	}
 	c.broadcastReadLocked()
 	c.mu.Unlock()
@@ -392,8 +420,10 @@ func (c *JoinedConn) SetWriteDeadline(t time.Time) error {
 		c.mu.Unlock()
 		return ErrSessionClosed
 	}
+	prevDeadline := c.writeDeadline
 	c.writeDeadline = t
 	c.writeDeadlineGen++
+	deadlineGen := c.writeDeadlineGen
 	writeHalf := c.writeHalf
 	if writeHalf != nil {
 		c.activeWriteDeadlineOps++
@@ -408,6 +438,10 @@ func (c *JoinedConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
 	if c.activeWriteDeadlineOps > 0 {
 		c.activeWriteDeadlineOps--
+	}
+	if err != nil && c.writeDeadlineGen == deadlineGen {
+		c.writeDeadline = prevDeadline
+		c.writeDeadlineGen++
 	}
 	c.broadcastWriteLocked()
 	c.mu.Unlock()
