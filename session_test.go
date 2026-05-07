@@ -18651,6 +18651,51 @@ func TestLateDataOnGracefulTerminalTombstoneCountsAggregateCap(t *testing.T) {
 	}
 }
 
+func TestLateDataOnGracefulTerminalTombstoneCountsPerStreamCap(t *testing.T) {
+	c, frames, stop := newInvalidFrameConn(t, 0)
+	defer stop()
+
+	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
+	stream := seedStateFixtureStream(t, c, streamID, "bidi", "peer_owned", stateHalfExpect{
+		SendHalf: "send_fin",
+		RecvHalf: "recv_fin",
+	})
+
+	c.mu.Lock()
+	c.ingress.aggregateLateDataCap = 0
+	c.ingress.lateDataPerStreamCap = 1
+	c.maybeCompactTerminalLocked(stream)
+	c.mu.Unlock()
+
+	if err := c.handleDataFrame(Frame{
+		Type:     FrameTypeDATA,
+		StreamID: streamID,
+		Payload:  []byte("a"),
+	}); err != nil {
+		t.Fatalf("first late DATA on graceful tombstone err = %v", err)
+	}
+	assertInvalidQueuedAbortCode(t, frames, streamID, CodeStreamClosed)
+
+	err := c.handleDataFrame(Frame{
+		Type:     FrameTypeDATA,
+		StreamID: streamID,
+		Payload:  []byte("b"),
+	})
+	if !IsErrorCode(err, CodeProtocol) {
+		t.Fatalf("second late DATA on graceful tombstone err = %v, want %s", err, CodeProtocol)
+	}
+	c.mu.Lock()
+	tombstone := c.registry.tombstones[streamID]
+	aggregateLateData := c.ingress.aggregateLateData
+	c.mu.Unlock()
+	if tombstone.LateDataReceived != 2 {
+		t.Fatalf("tombstone LateDataReceived = %d, want 2", tombstone.LateDataReceived)
+	}
+	if aggregateLateData != 2 {
+		t.Fatalf("aggregateLateData = %d, want 2", aggregateLateData)
+	}
+}
+
 func TestLateDataOnSendOnlyTombstoneIgnored(t *testing.T) {
 	c, frames, stop := newInvalidFrameConn(t, 0)
 	defer stop()

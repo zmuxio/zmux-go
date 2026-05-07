@@ -47,6 +47,13 @@ type ioWriteHalf struct {
 	state *ioConnState
 }
 
+type ioCloseSide uint8
+
+const (
+	ioCloseReadSide ioCloseSide = iota
+	ioCloseWriteSide
+)
+
 // JoinIO adapts ordinary Go I/O halves into a net.Conn-compatible JoinedConn.
 //
 // Either half may be nil, matching JoinConn. The returned connection forwards
@@ -248,40 +255,46 @@ func (s *ioConnState) writerForWrite() (io.Writer, error) {
 }
 
 func (s *ioConnState) closeRead() error {
-	if s == nil {
-		return nil
-	}
-	s.closeMu.Lock()
-	if s.readClosed.Load() {
-		s.closeMu.Unlock()
-		return nil
-	}
-	reader := s.reader
-	writer := s.writer
-	s.readClosed.Store(true)
-	if readerCloseIsFull(reader) && sameJoinedHalf(reader, writer) {
-		s.writeClosed.Store(true)
-	}
-	s.closeMu.Unlock()
-	return closeReadDirectional(reader)
+	return s.closeDirectional(ioCloseReadSide)
 }
 
 func (s *ioConnState) closeWrite() error {
+	return s.closeDirectional(ioCloseWriteSide)
+}
+
+func (s *ioConnState) closeDirectional(side ioCloseSide) error {
 	if s == nil {
 		return nil
 	}
 	s.closeMu.Lock()
-	if s.writeClosed.Load() {
-		s.closeMu.Unlock()
-		return nil
-	}
-	writer := s.writer
 	reader := s.reader
-	s.writeClosed.Store(true)
-	if writerCloseIsFull(writer) && sameJoinedHalf(reader, writer) {
-		s.readClosed.Store(true)
+	writer := s.writer
+	shouldClose := false
+	switch side {
+	case ioCloseReadSide:
+		if !s.readClosed.Load() {
+			shouldClose = true
+			s.readClosed.Store(true)
+			if readerCloseIsFull(reader) && sameJoinedHalf(reader, writer) {
+				s.writeClosed.Store(true)
+			}
+		}
+	case ioCloseWriteSide:
+		if !s.writeClosed.Load() {
+			shouldClose = true
+			s.writeClosed.Store(true)
+			if writerCloseIsFull(writer) && sameJoinedHalf(reader, writer) {
+				s.readClosed.Store(true)
+			}
+		}
 	}
 	s.closeMu.Unlock()
+	if !shouldClose {
+		return nil
+	}
+	if side == ioCloseReadSide {
+		return closeReadDirectional(reader)
+	}
 	return closeWriteDirectional(writer)
 }
 

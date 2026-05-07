@@ -572,6 +572,18 @@ func (c *Conn) discardPeerDataLocked(stream *nativeStream, appLen uint64, cause 
 	return nil
 }
 
+func (c *Conn) discardTerminalPeerDataLocked(streamID uint64, appLen uint64, cause lateDataCause) error {
+	if c.sessionReceiveLimitExceededLocked(appLen) {
+		return wireError(CodeFlowControl, "handle DATA", fmt.Errorf("session receive window exceeded"))
+	}
+	c.accountDiscardedSessionReceiveLocked(appLen)
+	tombstoneCapExceeded := c.releaseTerminalLateDiscardLocked(streamID, appLen, cause)
+	if c.lateDataCapExceededLocked(nil) || tombstoneCapExceeded {
+		return wireError(CodeProtocol, "handle DATA", fmt.Errorf("late-data cap exceeded"))
+	}
+	return nil
+}
+
 func (c *Conn) bufferPeerDataLocked(stream *nativeStream, appData []byte) {
 	if c == nil || stream == nil {
 		return
@@ -835,14 +847,14 @@ func (c *Conn) handleTerminalDataPayload(frame Frame, appData []byte, dispositio
 	}
 	switch disposition.action {
 	case lateDataAbortClosed:
-		if err := c.discardPeerDataLocked(nil, uint64(len(appData)), disposition.cause); err != nil {
+		if err := c.discardTerminalPeerDataLocked(frame.StreamID, uint64(len(appData)), disposition.cause); err != nil {
 			c.mu.Unlock()
 			return err
 		}
 		c.mu.Unlock()
 		return c.abortWithCodeAsync(frame.StreamID, CodeStreamClosed)
 	case lateDataAbortState:
-		if err := c.discardPeerDataLocked(nil, uint64(len(appData)), disposition.cause); err != nil {
+		if err := c.discardTerminalPeerDataLocked(frame.StreamID, uint64(len(appData)), disposition.cause); err != nil {
 			c.mu.Unlock()
 			return err
 		}
@@ -851,7 +863,7 @@ func (c *Conn) handleTerminalDataPayload(frame Frame, appData []byte, dispositio
 	default:
 		defer c.mu.Unlock()
 		appLen := uint64(len(appData))
-		return c.discardPeerDataLocked(nil, appLen, disposition.cause)
+		return c.discardTerminalPeerDataLocked(frame.StreamID, appLen, disposition.cause)
 	}
 }
 
@@ -1280,6 +1292,26 @@ func (c *Conn) releaseLateDiscardLocked(stream *nativeStream, n uint64, cause la
 		stream.lateDataReceived = rt.SaturatingAdd(stream.lateDataReceived, n)
 		stream.recvPending = 0
 	}
+}
+
+func (c *Conn) releaseTerminalLateDiscardLocked(streamID uint64, n uint64, cause lateDataCause) bool {
+	if c == nil {
+		return false
+	}
+	c.releaseLateDiscardLocked(nil, n, cause)
+	if n == 0 || c.registry.tombstones == nil {
+		return false
+	}
+	tombstone, ok := c.registry.tombstones[streamID]
+	if !ok {
+		return false
+	}
+	if tombstone.Hidden {
+		c.noteHiddenUnreadDiscardLocked(n)
+	}
+	tombstone.LateDataReceived = rt.SaturatingAdd(tombstone.LateDataReceived, n)
+	c.registry.tombstones[streamID] = tombstone
+	return tombstone.LateDataCapEnabled && tombstone.LateDataReceived > tombstone.LateDataCap
 }
 
 func (c *Conn) recordLateDiscardCauseLocked(cause lateDataCause, n uint64) {

@@ -42,11 +42,14 @@ const (
 
 type streamTombstone struct {
 	state.StreamTombstone
-	Hidden        bool
-	CreatedAt     time.Time
-	OrderIndex    int
-	HiddenIndex   int
-	LateDataCause lateDataCause
+	Hidden             bool
+	LateDataCapEnabled bool
+	CreatedAt          time.Time
+	OrderIndex         int
+	HiddenIndex        int
+	LateDataReceived   uint64
+	LateDataCap        uint64
+	LateDataCause      lateDataCause
 }
 
 func (t *streamTombstone) queueIndex(hidden bool) int {
@@ -370,6 +373,7 @@ func (c *Conn) maybeCompactTerminalLocked(stream *nativeStream) {
 	}
 	tombstone := tombstoneStateForStream(stream)
 	lateDataCause := stream.lateDataCauseLocked()
+	lateDataCap := c.effectiveLateDataPerStreamCapLocked(stream)
 	now := time.Now()
 	hidden := !stream.applicationVisible
 	c.markUsedStreamLocked(stream.id, usedStreamMarkerFromTombstone(tombstone, lateDataCause))
@@ -377,12 +381,15 @@ func (c *Conn) maybeCompactTerminalLocked(stream *nativeStream) {
 		c.noteHiddenStreamReapedLocked()
 	}
 	c.registry.tombstones[stream.id] = streamTombstone{
-		StreamTombstone: tombstone,
-		Hidden:          hidden,
-		CreatedAt:       now,
-		OrderIndex:      -1,
-		HiddenIndex:     -1,
-		LateDataCause:   lateDataCause,
+		StreamTombstone:    tombstone,
+		Hidden:             hidden,
+		LateDataCapEnabled: lateDataCap.enabled,
+		CreatedAt:          now,
+		OrderIndex:         -1,
+		HiddenIndex:        -1,
+		LateDataReceived:   stream.lateDataReceived,
+		LateDataCap:        lateDataCap.value,
+		LateDataCause:      lateDataCause,
 	}
 	c.appendTombstoneLocked(stream.id)
 	if hidden {
