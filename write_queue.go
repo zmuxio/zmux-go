@@ -2180,41 +2180,51 @@ func (c *Conn) releaseWriteQueueReservation(req *writeRequest) {
 }
 
 func (c *Conn) releaseAdvisoryQueueReservation(req *writeRequest) {
-	if c == nil || req == nil || !req.advisoryReserved || req.queuedBytes == 0 {
-		return
-	}
-
-	c.mu.Lock()
-	prevTracked := c.trackedSessionMemoryLocked()
-	c.releaseAdvisoryQueueReservationLocked(req)
-	plan := rt.PlanLaneReleaseWake(prevTracked, c.trackedSessionMemoryLocked(), c.sessionMemoryHighThresholdLocked(), false)
-	if plan.Broadcast {
-		c.broadcastWriteWakeLocked()
-	}
-	c.mu.Unlock()
-
-	if plan.Control {
-		notify(c.pending.controlNotify)
-	}
+	c.releaseControlQueueReservation(req, writeLaneAdvisory)
 }
 
 func (c *Conn) releaseUrgentQueueReservation(req *writeRequest) {
-	if c == nil || req == nil || !req.urgentReserved || req.queuedBytes == 0 {
+	c.releaseControlQueueReservation(req, writeLaneUrgent)
+}
+
+func controlQueueReservationHeld(req *writeRequest, lane writeLane) bool {
+	if req == nil {
+		return false
+	}
+	if lane.isUrgent() {
+		return req.urgentReserved
+	}
+	if lane.isAdvisory() {
+		return req.advisoryReserved
+	}
+	return false
+}
+
+func (c *Conn) releaseControlQueueReservation(req *writeRequest, lane writeLane) {
+	if c == nil || req == nil || !controlQueueReservationHeld(req, lane) || req.queuedBytes == 0 {
 		return
 	}
 
 	c.mu.Lock()
 	prevTracked := c.trackedSessionMemoryLocked()
-	c.releaseUrgentQueueReservationLocked(req)
-	plan := rt.PlanLaneReleaseWake(prevTracked, c.trackedSessionMemoryLocked(), c.sessionMemoryHighThresholdLocked(), true)
+	c.releaseControlQueueReservationLocked(req, lane)
+	plan := rt.PlanLaneReleaseWake(prevTracked, c.trackedSessionMemoryLocked(), c.sessionMemoryHighThresholdLocked(), lane.isUrgent())
 	if plan.Broadcast {
 		c.broadcastWriteWakeLocked()
 	}
-	c.broadcastUrgentWakeLocked()
+	if lane.isUrgent() {
+		c.broadcastUrgentWakeLocked()
+		if plan.Control {
+			notify(c.pending.controlNotify)
+		}
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+
 	if plan.Control {
 		notify(c.pending.controlNotify)
 	}
-	c.mu.Unlock()
 }
 
 func (c *Conn) releaseWriteQueueReservationLocked(req *writeRequest) {
@@ -2243,26 +2253,36 @@ func (c *Conn) releaseWriteQueueReservationLocked(req *writeRequest) {
 }
 
 func (c *Conn) releaseUrgentQueueReservationLocked(req *writeRequest) {
-	if c == nil || req == nil || !req.urgentReserved || req.queuedBytes == 0 {
-		return
-	}
-
-	c.flow.urgentQueuedBytes = csub(c.flow.urgentQueuedBytes, req.queuedBytes)
-	req.urgentReserved = false
-	if !req.queueReserved && !req.advisoryReserved {
-		req.queuedBytes = 0
-		req.reservedStream = nil
-	}
+	c.releaseControlQueueReservationLocked(req, writeLaneUrgent)
 }
 
 func (c *Conn) releaseAdvisoryQueueReservationLocked(req *writeRequest) {
-	if c == nil || req == nil || !req.advisoryReserved || req.queuedBytes == 0 {
+	c.releaseControlQueueReservationLocked(req, writeLaneAdvisory)
+}
+
+func (c *Conn) releaseControlQueueReservationLocked(req *writeRequest, lane writeLane) {
+	if c == nil || req == nil || req.queuedBytes == 0 {
 		return
 	}
 
-	c.flow.advisoryQueuedBytes = csub(c.flow.advisoryQueuedBytes, req.queuedBytes)
-	req.advisoryReserved = false
-	if !req.queueReserved && !req.urgentReserved {
+	switch {
+	case lane.isUrgent():
+		if !req.urgentReserved {
+			return
+		}
+		c.flow.urgentQueuedBytes = csub(c.flow.urgentQueuedBytes, req.queuedBytes)
+		req.urgentReserved = false
+	case lane.isAdvisory():
+		if !req.advisoryReserved {
+			return
+		}
+		c.flow.advisoryQueuedBytes = csub(c.flow.advisoryQueuedBytes, req.queuedBytes)
+		req.advisoryReserved = false
+	default:
+		return
+	}
+
+	if !req.queueReserved && !req.urgentReserved && !req.advisoryReserved {
 		req.queuedBytes = 0
 		req.reservedStream = nil
 	}
