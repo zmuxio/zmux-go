@@ -249,48 +249,53 @@ type uniAcceptResult struct {
 	err    error
 }
 
+type quicAcceptLoopResult[T any] interface {
+	acceptResult() (T, error)
+}
+
+func (r bidiAcceptResult) acceptResult() (zmux.Stream, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.stream, nil
+}
+
+func (r uniAcceptResult) acceptResult() (zmux.RecvStream, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.stream, nil
+}
+
+func acceptStreamFromLoop[T any, R quicAcceptLoopResult[T]](ctx context.Context, conn SessionConn, ch <-chan R) (T, error) {
+	var zero T
+	ctx = defaultContext(ctx)
+	connCtx := conn.Context()
+	select {
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	case <-connCtx.Done():
+		if err := translateWaitError(context.Cause(connCtx)); err != nil {
+			return zero, err
+		}
+		return zero, zmux.ErrSessionClosed
+	case result := <-ch:
+		return result.acceptResult()
+	}
+}
+
 func (s *quicSession) AcceptStream(ctx context.Context) (zmux.Stream, error) {
 	if s == nil || s.conn == nil {
 		return nil, zmux.ErrSessionClosed
 	}
-	ctx = defaultContext(ctx)
-	ch := s.ensureBidiAcceptLoop()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.conn.Context().Done():
-		if err := translateWaitError(context.Cause(s.conn.Context())); err != nil {
-			return nil, err
-		}
-		return nil, zmux.ErrSessionClosed
-	case result := <-ch:
-		if result.err != nil {
-			return nil, result.err
-		}
-		return result.stream, nil
-	}
+	return acceptStreamFromLoop[zmux.Stream, bidiAcceptResult](ctx, s.conn, s.ensureBidiAcceptLoop())
 }
 
 func (s *quicSession) AcceptUniStream(ctx context.Context) (zmux.RecvStream, error) {
 	if s == nil || s.conn == nil {
 		return nil, zmux.ErrSessionClosed
 	}
-	ctx = defaultContext(ctx)
-	ch := s.ensureUniAcceptLoop()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.conn.Context().Done():
-		if err := translateWaitError(context.Cause(s.conn.Context())); err != nil {
-			return nil, err
-		}
-		return nil, zmux.ErrSessionClosed
-	case result := <-ch:
-		if result.err != nil {
-			return nil, result.err
-		}
-		return result.stream, nil
-	}
+	return acceptStreamFromLoop[zmux.RecvStream, uniAcceptResult](ctx, s.conn, s.ensureUniAcceptLoop())
 }
 
 func (s *quicSession) OpenStream(ctx context.Context) (zmux.Stream, error) {
@@ -534,32 +539,48 @@ func discardAcceptedUniStream(stream acceptedUniDiscarder) {
 	stream.CancelRead(quic.StreamErrorCode(zmux.CodeCancelled))
 }
 
+type acceptedPreparedStream interface {
+	activate(*quicActiveStreamCounters, quicActiveStreamKind)
+	CloseWithError(uint64, string) error
+}
+
+func prepareAcceptedStream[Raw any, Wrapped acceptedPreparedStream](
+	s *quicSession,
+	stream Raw,
+	wrap func(SessionConn, Raw, time.Duration) (Wrapped, error),
+	kind quicActiveStreamKind,
+	publish func(*quicSession, Wrapped) bool,
+) {
+	wrapped, err := wrap(s.conn, stream, s.acceptedPreludeReadTimeout)
+	if err != nil {
+		return
+	}
+	wrapped.activate(&s.active, kind)
+	if !publish(s, wrapped) {
+		_ = wrapped.CloseWithError(uint64(zmux.CodeCancelled), "")
+	}
+}
+
+func publishAcceptedBidiStream(s *quicSession, stream *quicStream) bool {
+	return s.publishBidiAcceptResult(bidiAcceptResult{stream: stream})
+}
+
+func publishAcceptedUniStream(s *quicSession, stream *quicRecvStream) bool {
+	return s.publishUniAcceptResult(uniAcceptResult{stream: stream})
+}
+
 func (s *quicSession) prepareAcceptedBidiStream(stream *quic.Stream) {
 	if s == nil || stream == nil {
 		return
 	}
-	wrapped, err := newAcceptedBidiStream(s.conn, stream, s.acceptedPreludeReadTimeout)
-	if err != nil {
-		return
-	}
-	wrapped.activate(&s.active, quicActiveStreamPeerBidi)
-	if !s.publishBidiAcceptResult(bidiAcceptResult{stream: wrapped}) {
-		_ = wrapped.CloseWithError(uint64(zmux.CodeCancelled), "")
-	}
+	prepareAcceptedStream(s, stream, newAcceptedBidiStream, quicActiveStreamPeerBidi, publishAcceptedBidiStream)
 }
 
 func (s *quicSession) prepareAcceptedUniStream(stream *quic.ReceiveStream) {
 	if s == nil || stream == nil {
 		return
 	}
-	wrapped, err := newAcceptedRecvStream(s.conn, stream, s.acceptedPreludeReadTimeout)
-	if err != nil {
-		return
-	}
-	wrapped.activate(&s.active, quicActiveStreamPeerUni)
-	if !s.publishUniAcceptResult(uniAcceptResult{stream: wrapped}) {
-		_ = wrapped.CloseWithError(uint64(zmux.CodeCancelled), "")
-	}
+	prepareAcceptedStream(s, stream, newAcceptedRecvStream, quicActiveStreamPeerUni, publishAcceptedUniStream)
 }
 
 func (s *quicSession) publishBidiAcceptResult(result bidiAcceptResult) bool {
