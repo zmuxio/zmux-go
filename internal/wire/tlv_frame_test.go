@@ -53,13 +53,21 @@ func TestParseDIAGReasonTruncatedVarintReturnsErrTruncatedTLV(t *testing.T) {
 	}
 }
 
-func TestFrameTotalLenRejectsIntOverflow(t *testing.T) {
+func TestFrameTotalLenChecksIntBoundary(t *testing.T) {
 	t.Parallel()
 
 	maxInt := int(^uint(0) >> 1)
-	if uint64(maxInt) >= MaxVarint62 {
-		t.Skip("frame length overflow is unreachable on this architecture")
+	if uint64(maxInt) > MaxVarint62 {
+		got, err := frameTotalLen(MaxVarint62, 1)
+		if err != nil {
+			t.Fatalf("frameTotalLen err = %v, want nil", err)
+		}
+		if want := int(MaxVarint62) + 1; got != want {
+			t.Fatalf("frameTotalLen = %d, want %d", got, want)
+		}
+		return
 	}
+
 	if _, err := frameTotalLen(uint64(maxInt), 1); !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("frameTotalLen err = %v, want %v", err, ErrPayloadTooLarge)
 	}

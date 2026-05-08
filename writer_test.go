@@ -3160,14 +3160,11 @@ func TestClassifyWriteRequestSingleFrameDataFIN(t *testing.T) {
 	}
 }
 
-func TestClassifyWriteRequestSaturatesHugeSingleFrameCost(t *testing.T) {
+func TestClassifyWriteRequestHandlesHugeSingleFrameCost(t *testing.T) {
 	t.Parallel()
 
 	maxPayloadLen := int(^uint(0) >> 1)
 	frameBytes := uint64(maxPayloadLen) + 1
-	if frameBytes <= uint64(maxRequestCost) {
-		t.Skip("requires an int width large enough to synthesize a frame cost above MaxInt64")
-	}
 
 	req := &writeRequest{frames: []txFrame{{
 		Type:       FrameTypeDATA,
@@ -3179,6 +3176,12 @@ func TestClassifyWriteRequestSaturatesHugeSingleFrameCost(t *testing.T) {
 
 	if got := req.requestBufferedBytes; got != frameBytes {
 		t.Fatalf("requestBufferedBytes = %d, want %d", got, frameBytes)
+	}
+	if frameBytes <= uint64(maxRequestCost) {
+		if got := req.requestCost; got != int64(frameBytes) {
+			t.Fatalf("requestCost = %d, want %d", got, int64(frameBytes))
+		}
+		return
 	}
 	if got := req.requestCost; got != maxRequestCost {
 		t.Fatalf("requestCost = %d, want %d", got, maxRequestCost)
@@ -4639,14 +4642,11 @@ func TestPrepareOwnedWriteRequestSingleFrameDataFIN(t *testing.T) {
 	}
 }
 
-func TestPrepareOwnedWriteRequestSaturatesHugeDataCost(t *testing.T) {
+func TestPrepareOwnedWriteRequestHandlesHugeDataCost(t *testing.T) {
 	t.Parallel()
 
 	maxPayloadLen := int(^uint(0) >> 1)
 	frameBytes := uint64(maxPayloadLen) + 1
-	if frameBytes <= uint64(maxRequestCost) {
-		t.Skip("requires an int width large enough to synthesize a frame cost above MaxInt64")
-	}
 
 	stream := &nativeStream{id: 4}
 	req := &writeRequest{frames: []txFrame{{
@@ -4662,7 +4662,11 @@ func TestPrepareOwnedWriteRequestSaturatesHugeDataCost(t *testing.T) {
 	if got := req.requestBufferedBytes; got != frameBytes {
 		t.Fatalf("requestBufferedBytes = %d, want %d", got, frameBytes)
 	}
-	if got := req.requestCost; got != maxRequestCost {
+	if frameBytes <= uint64(maxRequestCost) {
+		if got := req.requestCost; got != int64(frameBytes) {
+			t.Fatalf("requestCost = %d, want %d", got, int64(frameBytes))
+		}
+	} else if got := req.requestCost; got != maxRequestCost {
 		t.Fatalf("requestCost = %d, want %d", got, maxRequestCost)
 	}
 	if got := req.preparedSendBytes; got != uint64(maxPayloadLen) {

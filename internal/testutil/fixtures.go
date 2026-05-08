@@ -27,7 +27,7 @@ func LocateFixtureDir(tb testing.TB) string {
 	if fixtureDir != "" {
 		return fixtureDir
 	}
-	tb.Skip("wire fixtures not found in testdata/fixtures")
+	tb.Fatal("wire fixtures not found in testdata/fixtures")
 	return ""
 }
 
