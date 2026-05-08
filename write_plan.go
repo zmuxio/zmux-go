@@ -306,9 +306,23 @@ func (r preparedWriteStepBuild) hasStep() bool {
 	return r.ready
 }
 
-func (s *nativeStream) buildPreparedWriteStepLocked(
-	parts [][]byte,
-	idx, off, totalRemaining int,
+type preparedWritePayloadSource struct {
+	parts [][]byte
+	bytes []byte
+	idx   int
+	off   int
+}
+
+func (src preparedWritePayloadSource) frameLocked(s *nativeStream, chunk int, traits dataFrameTraits) txFrame {
+	if src.parts != nil {
+		return s.dataFrameFromPartsLocked(src.parts, src.idx, src.off, chunk, traits)
+	}
+	return s.dataFrameLocked(src.bytes[src.off:src.off+chunk], traits)
+}
+
+func (s *nativeStream) buildPreparedWritePayloadStepLocked(
+	src preparedWritePayloadSource,
+	totalRemaining int,
 	mode writeChunkMode,
 	window writePrepareWindow,
 ) preparedWriteStepBuild {
@@ -342,7 +356,7 @@ func (s *nativeStream) buildPreparedWriteStepLocked(
 	if window.openerVisibility.marksPeerVisible() {
 		traits |= dataFrameTraitOpenMetadata
 	}
-	frame := s.dataFrameFromPartsLocked(parts, idx, off, int(chunk), traits)
+	frame := src.frameLocked(s, int(chunk), traits)
 	finReservation := writeFinDefer
 	if finalized {
 		finReservation = writeFinReserve
@@ -351,6 +365,20 @@ func (s *nativeStream) buildPreparedWriteStepLocked(
 		step:  s.finishPreparedWriteStepLocked(frame, int(chunk), chunk, window.openerVisibility, finReservation),
 		ready: true,
 	}
+}
+
+func (s *nativeStream) buildPreparedWritePartsStepLocked(
+	parts [][]byte,
+	idx, off, totalRemaining int,
+	mode writeChunkMode,
+	window writePrepareWindow,
+) preparedWriteStepBuild {
+	return s.buildPreparedWritePayloadStepLocked(
+		preparedWritePayloadSource{parts: parts, idx: idx, off: off},
+		totalRemaining,
+		mode,
+		window,
+	)
 }
 
 func (s *nativeStream) buildPreparedWriteBytesStepLocked(
@@ -359,45 +387,30 @@ func (s *nativeStream) buildPreparedWriteBytesStepLocked(
 	mode writeChunkMode,
 	window writePrepareWindow,
 ) preparedWriteStepBuild {
-	if s == nil || s.conn == nil {
-		return preparedWriteStepBuild{}
+	return s.buildPreparedWritePayloadStepLocked(
+		preparedWritePayloadSource{bytes: p, off: off},
+		totalRemaining,
+		mode,
+		window,
+	)
+}
+
+func (s *nativeStream) acquireWriteStepWindowLocked(totalRemaining int, mode writeChunkMode) (writePrepareWindow, writePrepareOutcome, error) {
+	attempt, err := s.acquireWritePrepareWindowLocked(writePrepareWindowStep, mode.admissionPolicy())
+	if err != nil {
+		return writePrepareWindow{}, writePrepareReady, err
 	}
-	if window.openerVisibility.marksPeerVisible() && mode.isFinal() && totalRemaining == 0 {
-		frame := s.dataFrameLocked(nil, dataFrameTraitFIN|dataFrameTraitOpenMetadata)
-		return preparedWriteStepBuild{
-			step:  s.finishPreparedWriteStepLocked(frame, 0, 0, window.openerVisibility, writeFinDefer),
-			ready: true,
-		}
-	}
-	if window.openerVisibility.marksPeerVisible() && writePrepareBlocked(window) {
-		frame := s.dataFrameLocked(nil, dataFrameTraitOpenMetadata)
-		return preparedWriteStepBuild{
-			step:  s.finishPreparedWriteStepLocked(frame, 0, 0, window.openerVisibility, writeFinDefer),
-			ready: true,
-		}
+	if attempt.outcome == writePrepareRetry {
+		return writePrepareWindow{}, writePrepareRetry, nil
 	}
 
-	chunk := boundedWriteChunk(uint64(totalRemaining), window.availableSession, window.availableStream, window.frameCap)
-	if chunk == 0 {
-		return preparedWriteStepBuild{}
+	window := attempt.window
+	remainingLen := uint64(totalRemaining)
+	if mode.isFinal() && s.stopSeenWriteFinalNeedsImmediateCompletionLocked(remainingLen, window.frameCap, window.availableSession, window.availableStream) {
+		s.conn.mu.Unlock()
+		return writePrepareWindow{}, writePrepareReady, s.resetStopSeenWriteFinal()
 	}
-	finalized := mode.isFinal() && int(chunk) == totalRemaining
-	traits := dataFrameTraitNone
-	if finalized {
-		traits |= dataFrameTraitFIN
-	}
-	if window.openerVisibility.marksPeerVisible() {
-		traits |= dataFrameTraitOpenMetadata
-	}
-	frame := s.dataFrameLocked(p[off:off+int(chunk)], traits)
-	finReservation := writeFinDefer
-	if finalized {
-		finReservation = writeFinReserve
-	}
-	return preparedWriteStepBuild{
-		step:  s.finishPreparedWriteStepLocked(frame, int(chunk), chunk, window.openerVisibility, finReservation),
-		ready: true,
-	}
+	return window, writePrepareReady, nil
 }
 
 func (s *nativeStream) prepareWritePartsLocked(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) (writeStep, error) {
@@ -406,22 +419,15 @@ func (s *nativeStream) prepareWritePartsLocked(parts [][]byte, idx, off, totalRe
 	}
 
 	for {
-		attempt, err := s.acquireWritePrepareWindowLocked(writePrepareWindowStep, mode.admissionPolicy())
+		window, outcome, err := s.acquireWriteStepWindowLocked(totalRemaining, mode)
 		if err != nil {
 			return writeStep{}, err
 		}
-		if attempt.outcome == writePrepareRetry {
+		if outcome == writePrepareRetry {
 			continue
 		}
-		window := attempt.window
 
-		remainingLen := uint64(totalRemaining)
-		if mode.isFinal() && s.stopSeenWriteFinalNeedsImmediateCompletionLocked(remainingLen, window.frameCap, window.availableSession, window.availableStream) {
-			s.conn.mu.Unlock()
-			return writeStep{}, s.resetStopSeenWriteFinal()
-		}
-
-		step := s.buildPreparedWriteStepLocked(parts, idx, off, totalRemaining, mode, window)
+		step := s.buildPreparedWritePartsStepLocked(parts, idx, off, totalRemaining, mode, window)
 		if step.hasStep() {
 			return step.step, nil
 		}
@@ -438,19 +444,12 @@ func (s *nativeStream) prepareWriteBytesLocked(p []byte, off, totalRemaining int
 	}
 
 	for {
-		attempt, err := s.acquireWritePrepareWindowLocked(writePrepareWindowStep, mode.admissionPolicy())
+		window, outcome, err := s.acquireWriteStepWindowLocked(totalRemaining, mode)
 		if err != nil {
 			return writeStep{}, err
 		}
-		if attempt.outcome == writePrepareRetry {
+		if outcome == writePrepareRetry {
 			continue
-		}
-		window := attempt.window
-
-		remainingLen := uint64(totalRemaining)
-		if mode.isFinal() && s.stopSeenWriteFinalNeedsImmediateCompletionLocked(remainingLen, window.frameCap, window.availableSession, window.availableStream) {
-			s.conn.mu.Unlock()
-			return writeStep{}, s.resetStopSeenWriteFinal()
 		}
 
 		step := s.buildPreparedWriteBytesStepLocked(p, off, totalRemaining, mode, window)
@@ -850,19 +849,49 @@ type writeBurstBatchPreparation struct {
 	handled     bool
 }
 
-func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) writeBurstBatchPreparation {
+type writeBurstPayloadCursor struct {
+	parts   [][]byte
+	bytes   []byte
+	baseIdx int
+	baseOff int
+	idx     int
+	off     int
+}
+
+func newWritePartsBurstPayloadCursor(parts [][]byte, idx, off int) writeBurstPayloadCursor {
+	return writeBurstPayloadCursor{parts: parts, baseIdx: idx, baseOff: off, idx: idx, off: off}
+}
+
+func newWriteBytesBurstPayloadCursor(p []byte) writeBurstPayloadCursor {
+	return writeBurstPayloadCursor{bytes: p}
+}
+
+func (cursor *writeBurstPayloadCursor) seek(progress int) {
+	if cursor.parts != nil {
+		cursor.idx, cursor.off = advanceParts(cursor.parts, cursor.baseIdx, cursor.baseOff, progress)
+	}
+}
+
+func (cursor *writeBurstPayloadCursor) frameLocked(s *nativeStream, progress, chunk int, traits dataFrameTraits) txFrame {
+	if cursor.parts != nil {
+		return s.dataFrameFromPartsLocked(cursor.parts, cursor.idx, cursor.off, chunk, traits)
+	}
+	return s.dataFrameLocked(cursor.bytes[progress:progress+chunk], traits)
+}
+
+func (cursor *writeBurstPayloadCursor) advance(n int) {
+	if cursor.parts != nil {
+		cursor.idx, cursor.off = advanceParts(cursor.parts, cursor.idx, cursor.off, n)
+	}
+}
+
+func (s *nativeStream) prepareWritePayloadBurstBatch(cursor writeBurstPayloadCursor, totalRemaining int, mode writeChunkMode) writeBurstBatchPreparation {
 	prepared := writeBurstBatchPreparation{
 		start:      writeBatchStart{burstLimit: defaultWriteBurstFrames},
 		finalState: writeBurstNotFinalized,
 	}
 	if s == nil || s.conn == nil || totalRemaining <= 0 {
 		return prepared
-	}
-
-	if mode.isFinal() {
-		if totalRemaining == 0 {
-			return prepared
-		}
 	}
 
 	startReady := false
@@ -891,7 +920,7 @@ func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, tot
 		requestQueuedBytes := prepared.start.priority.frameBytes
 		queueCapHit := false
 
-		frameIdx, frameOff := advanceParts(parts, idx, off, prepared.progress)
+		cursor.seek(prepared.progress)
 		availableSession := window.availableSession
 		availableStream := window.availableStream
 		frameCap := window.frameCap
@@ -913,7 +942,8 @@ func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, tot
 			if frameFinalized {
 				traits |= dataFrameTraitFIN
 			}
-			frame := s.dataFrameFromPartsLocked(parts, frameIdx, frameOff, int(chunk), traits)
+			chunkLen := int(chunk)
+			frame := cursor.frameLocked(s, prepared.progress, chunkLen, traits)
 			frameBytes := txFrameBufferedBytes(frame)
 			if !prepared.start.allowsNextQueuedFrame(requestQueuedBytes, frameBytes) {
 				queueCapHit = true
@@ -922,8 +952,8 @@ func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, tot
 			prepared.frames = append(prepared.frames, frame)
 			prepared.queuedBytes = saturatingAdd(prepared.queuedBytes, frameBytes)
 			requestQueuedBytes = saturatingAdd(requestQueuedBytes, frameBytes)
-			prepared.progress += int(chunk)
-			frameIdx, frameOff = advanceParts(parts, frameIdx, frameOff, int(chunk))
+			prepared.progress += chunkLen
+			cursor.advance(chunkLen)
 			s.reserveWriteChunkLocked(chunk)
 			if frameFinalized {
 				s.setSendFin()
@@ -953,103 +983,12 @@ func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, tot
 	}
 }
 
+func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) writeBurstBatchPreparation {
+	return s.prepareWritePayloadBurstBatch(newWritePartsBurstPayloadCursor(parts, idx, off), totalRemaining, mode)
+}
+
 func (s *nativeStream) prepareWriteBytesBurstBatch(p []byte, totalRemaining int, mode writeChunkMode) writeBurstBatchPreparation {
-	prepared := writeBurstBatchPreparation{
-		start:      writeBatchStart{burstLimit: defaultWriteBurstFrames},
-		finalState: writeBurstNotFinalized,
-	}
-	if s == nil || s.conn == nil || totalRemaining <= 0 {
-		return prepared
-	}
-
-	if mode.isFinal() && totalRemaining == 0 {
-		return prepared
-	}
-
-	startReady := false
-	for {
-		attempt, err := s.acquireWritePrepareWindowLocked(writePrepareWindowBurst, mode.admissionPolicy())
-		if attempt.outcome == writePrepareBurstFallback {
-			return prepared
-		}
-		if err != nil {
-			prepared.err = err
-			prepared.handled = true
-			return prepared
-		}
-		window := attempt.window
-		if !startReady {
-			prepared.start = s.beginWriteBatchStartLocked()
-			startReady = true
-		}
-		if mode.isFinal() && s.stopSeenLocked() && !s.stopSeenWriteFinalBurstEligibleLocked(totalRemaining) {
-			s.conn.mu.Unlock()
-			return prepared
-		}
-		if prepared.frames == nil {
-			prepared.frames = writeFrameBuffer(prepared.start, 0)
-		}
-		requestQueuedBytes := prepared.start.priority.frameBytes
-		queueCapHit := false
-
-		availableSession := window.availableSession
-		availableStream := window.availableStream
-		frameCap := window.frameCap
-		remainingLen := uint64(totalRemaining - prepared.progress)
-		if mode.isFinal() && s.stopSeenWriteFinalNeedsImmediateCompletionLocked(remainingLen, frameCap, availableSession, availableStream) {
-			s.conn.mu.Unlock()
-			prepared.err = s.resetStopSeenWriteFinal()
-			prepared.handled = true
-			return prepared
-		}
-
-		for len(prepared.frames) < prepared.start.burstLimit && prepared.progress < totalRemaining && availableSession > 0 && availableStream > 0 && frameCap > 0 {
-			chunk := boundedWriteChunk(uint64(totalRemaining-prepared.progress), availableSession, availableStream, frameCap)
-			if chunk == 0 {
-				break
-			}
-			frameFinalized := mode.isFinal() && prepared.progress+int(chunk) == totalRemaining
-			traits := dataFrameTraitNone
-			if frameFinalized {
-				traits |= dataFrameTraitFIN
-			}
-			frameStart := prepared.progress
-			frame := s.dataFrameLocked(p[frameStart:frameStart+int(chunk)], traits)
-			frameBytes := txFrameBufferedBytes(frame)
-			if !prepared.start.allowsNextQueuedFrame(requestQueuedBytes, frameBytes) {
-				queueCapHit = true
-				break
-			}
-			prepared.frames = append(prepared.frames, frame)
-			prepared.queuedBytes = saturatingAdd(prepared.queuedBytes, frameBytes)
-			requestQueuedBytes = saturatingAdd(requestQueuedBytes, frameBytes)
-			prepared.progress += int(chunk)
-			s.reserveWriteChunkLocked(chunk)
-			if frameFinalized {
-				s.setSendFin()
-				prepared.finalState = writeBurstFinalized
-			}
-			availableSession -= chunk
-			availableStream -= chunk
-		}
-
-		if queueCapHit || len(prepared.frames) >= prepared.start.burstLimit || prepared.progress >= totalRemaining {
-			s.conn.mu.Unlock()
-			prepared.handled = true
-			return prepared
-		}
-		if prepared.progress > 0 {
-			s.conn.mu.Unlock()
-			prepared.handled = true
-			return prepared
-		}
-
-		if err := s.waitForWriteCreditLocked(availableSession, availableStream); err != nil {
-			prepared.err = err
-			prepared.handled = true
-			return prepared
-		}
-	}
+	return s.prepareWritePayloadBurstBatch(newWriteBytesBurstPayloadCursor(p), totalRemaining, mode)
 }
 
 func (s *nativeStream) resetStopSeenWriteFinal() error {

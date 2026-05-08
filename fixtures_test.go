@@ -1383,18 +1383,7 @@ func runInvalidBlockedWrongSideUni(t *testing.T) error {
 	}); err != nil {
 		return err
 	}
-	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.registry.streams[streamID]; ok {
-		return fmt.Errorf("stream %d remained live after local STREAM_STATE abort", streamID)
-	}
-	if !c.hasTerminalMarkerLocked(streamID) {
-		return fmt.Errorf("stream %d missing terminal marker after local STREAM_STATE abort", streamID)
-	}
-	return &ApplicationError{Code: uint64(CodeStreamState)}
+	return expectInvalidStreamStateAbort(c, frames, streamID)
 }
 
 func runInvalidMaxDataWrongSideUni(t *testing.T) error {
@@ -1411,18 +1400,7 @@ func runInvalidMaxDataWrongSideUni(t *testing.T) error {
 	}); err != nil {
 		return err
 	}
-	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.registry.streams[streamID]; ok {
-		return fmt.Errorf("stream %d remained live after local STREAM_STATE abort", streamID)
-	}
-	if !c.hasTerminalMarkerLocked(streamID) {
-		return fmt.Errorf("stream %d missing terminal marker after local STREAM_STATE abort", streamID)
-	}
-	return &ApplicationError{Code: uint64(CodeStreamState)}
+	return expectInvalidStreamStateAbort(c, frames, streamID)
 }
 
 func runInvalidStopSendingWrongSideUni(t *testing.T) error {
@@ -1439,18 +1417,7 @@ func runInvalidStopSendingWrongSideUni(t *testing.T) error {
 	}); err != nil {
 		return err
 	}
-	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.registry.streams[streamID]; ok {
-		return fmt.Errorf("stream %d remained live after local STREAM_STATE abort", streamID)
-	}
-	if !c.hasTerminalMarkerLocked(streamID) {
-		return fmt.Errorf("stream %d missing terminal marker after local STREAM_STATE abort", streamID)
-	}
-	return &ApplicationError{Code: uint64(CodeStreamState)}
+	return expectInvalidStreamStateAbort(c, frames, streamID)
 }
 
 func runInvalidResetWrongSideUni(t *testing.T) error {
@@ -1467,18 +1434,7 @@ func runInvalidResetWrongSideUni(t *testing.T) error {
 	}); err != nil {
 		return err
 	}
-	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
-		return err
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.registry.streams[streamID]; ok {
-		return fmt.Errorf("stream %d remained live after local STREAM_STATE abort", streamID)
-	}
-	if !c.hasTerminalMarkerLocked(streamID) {
-		return fmt.Errorf("stream %d missing terminal marker after local STREAM_STATE abort", streamID)
-	}
-	return &ApplicationError{Code: uint64(CodeStreamState)}
+	return expectInvalidStreamStateAbort(c, frames, streamID)
 }
 
 func runInvalidPeerStreamIDGap(t *testing.T) error {
@@ -1529,6 +1485,21 @@ func expectInvalidQueuedCloseWithError(frames <-chan Frame, streamID uint64, cod
 		return fmt.Errorf("ABORT payload = %x, want %x", frame.Payload, want)
 	}
 	return &ApplicationError{Code: uint64(code)}
+}
+
+func expectInvalidStreamStateAbort(c *Conn, frames <-chan Frame, streamID uint64) error {
+	if err := expectInvalidQueuedCloseWithError(frames, streamID, CodeStreamState); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.registry.streams[streamID]; ok {
+		return fmt.Errorf("stream %d remained live after local STREAM_STATE abort", streamID)
+	}
+	if !c.hasTerminalMarkerLocked(streamID) {
+		return fmt.Errorf("stream %d missing terminal marker after local STREAM_STATE abort", streamID)
+	}
+	return &ApplicationError{Code: uint64(CodeStreamState)}
 }
 
 func runInvalidLocalProvisionalOpenCancelMustNotBurnID(t *testing.T) error {
@@ -1787,6 +1758,19 @@ func expectedInvalidFixtureCode(t *testing.T, fixture invalidFixture) ErrorCode 
 	}
 }
 
+func expectQueuedStreamStateAbort(t *testing.T, c *Conn, frames <-chan Frame, streamID uint64) {
+	t.Helper()
+
+	frame := awaitQueuedFrame(t, frames)
+	if frame.Type != FrameTypeABORT || frame.StreamID != streamID {
+		t.Fatalf("queued frame = %+v, want ABORT on stream %d", frame, streamID)
+	}
+	if string(frame.Payload) != string(mustEncodeVarint(uint64(CodeStreamState))) {
+		t.Fatalf("ABORT payload = %x, want %x", frame.Payload, mustEncodeVarint(uint64(CodeStreamState)))
+	}
+	assertLocallyAbortedStream(t, c, streamID, "STREAM_STATE")
+}
+
 func TestPeerMaxDataOnLocalRecvOnlyUniAbortsStreamState(t *testing.T) {
 	t.Parallel()
 	c, frames, stop := newHandlerTestConn(t)
@@ -1803,15 +1787,7 @@ func TestPeerMaxDataOnLocalRecvOnlyUniAbortsStreamState(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("handle MAX_DATA: %v", err)
 	}
-
-	frame := awaitQueuedFrame(t, frames)
-	if frame.Type != FrameTypeABORT || frame.StreamID != stream.id {
-		t.Fatalf("queued frame = %+v, want ABORT on stream %d", frame, stream.id)
-	}
-	if string(frame.Payload) != string(mustEncodeVarint(uint64(CodeStreamState))) {
-		t.Fatalf("ABORT payload = %x, want %x", frame.Payload, mustEncodeVarint(uint64(CodeStreamState)))
-	}
-	assertLocallyAbortedStream(t, c, stream.id, "STREAM_STATE")
+	expectQueuedStreamStateAbort(t, c, frames, stream.id)
 }
 
 func TestPeerBlockedOnLocalSendOnlyUniAbortsStreamState(t *testing.T) {
@@ -1830,15 +1806,7 @@ func TestPeerBlockedOnLocalSendOnlyUniAbortsStreamState(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("handle BLOCKED: %v", err)
 	}
-
-	frame := awaitQueuedFrame(t, frames)
-	if frame.Type != FrameTypeABORT || frame.StreamID != stream.id {
-		t.Fatalf("queued frame = %+v, want ABORT on stream %d", frame, stream.id)
-	}
-	if string(frame.Payload) != string(mustEncodeVarint(uint64(CodeStreamState))) {
-		t.Fatalf("ABORT payload = %x, want %x", frame.Payload, mustEncodeVarint(uint64(CodeStreamState)))
-	}
-	assertLocallyAbortedStream(t, c, stream.id, "STREAM_STATE")
+	expectQueuedStreamStateAbort(t, c, frames, stream.id)
 }
 
 func TestPeerDataOnLocalSendOnlyUniAbortsStreamState(t *testing.T) {
@@ -1857,15 +1825,7 @@ func TestPeerDataOnLocalSendOnlyUniAbortsStreamState(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("handle DATA: %v", err)
 	}
-
-	frame := awaitQueuedFrame(t, frames)
-	if frame.Type != FrameTypeABORT || frame.StreamID != stream.id {
-		t.Fatalf("queued frame = %+v, want ABORT on stream %d", frame, stream.id)
-	}
-	if string(frame.Payload) != string(mustEncodeVarint(uint64(CodeStreamState))) {
-		t.Fatalf("ABORT payload = %x, want %x", frame.Payload, mustEncodeVarint(uint64(CodeStreamState)))
-	}
-	assertLocallyAbortedStream(t, c, stream.id, "STREAM_STATE")
+	expectQueuedStreamStateAbort(t, c, frames, stream.id)
 }
 
 func TestUnseenStreamMaxDataIsProtocolError(t *testing.T) {
