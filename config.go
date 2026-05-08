@@ -44,12 +44,10 @@ func SchedulerHintFromCode(code uint64) SchedulerHint {
 type Capabilities = wire.Capabilities
 
 const (
-	CapabilityPriorityHints         = wire.CapabilityPriorityHints
-	CapabilityStreamGroups          = wire.CapabilityStreamGroups
-	CapabilityMultilinkBasicRetired = wire.CapabilityMultilinkBasicRetired
-	CapabilityMultilinkBasic        = wire.CapabilityMultilinkBasic
-	CapabilityPriorityUpdate        = wire.CapabilityPriorityUpdate
-	CapabilityOpenMetadata          = wire.CapabilityOpenMetadata
+	CapabilityPriorityHints  = wire.CapabilityPriorityHints
+	CapabilityStreamGroups   = wire.CapabilityStreamGroups
+	CapabilityPriorityUpdate = wire.CapabilityPriorityUpdate
+	CapabilityOpenMetadata   = wire.CapabilityOpenMetadata
 )
 
 type SettingID = wire.SettingID
@@ -62,8 +60,6 @@ const (
 	SettingMaxIncomingStreamsBidi                = wire.SettingMaxIncomingStreamsBidi
 	SettingMaxIncomingStreamsUni                 = wire.SettingMaxIncomingStreamsUni
 	SettingMaxFramePayload                       = wire.SettingMaxFramePayload
-	SettingIdleTimeoutMillis                     = wire.SettingIdleTimeoutMillis
-	SettingKeepaliveHintMillis                   = wire.SettingKeepaliveHintMillis
 	SettingMaxControlPayloadBytes                = wire.SettingMaxControlPayloadBytes
 	SettingMaxExtensionPayloadBytes              = wire.SettingMaxExtensionPayloadBytes
 	SettingSchedulerHints                        = wire.SettingSchedulerHints
@@ -118,12 +114,7 @@ const (
 type EXTSubtype = wire.EXTSubtype
 
 const (
-	EXTPriorityUpdate     = wire.EXTPriorityUpdate
-	ExtMLReadyRetired     = wire.ExtMLReadyRetired
-	ExtMLAttachRetired    = wire.ExtMLAttachRetired
-	ExtMLAttachAckRetired = wire.ExtMLAttachAckRetired
-	ExtMLDrainReqRetired  = wire.ExtMLDrainReqRetired
-	ExtMLDrainAckRetired  = wire.ExtMLDrainAckRetired
+	EXTPriorityUpdate = wire.EXTPriorityUpdate
 )
 
 type ErrorCode = wire.ErrorCode

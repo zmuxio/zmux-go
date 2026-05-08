@@ -63,12 +63,10 @@ func SchedulerHintFromCode(code uint64) SchedulerHint {
 type Capabilities uint64
 
 const (
-	CapabilityPriorityHints         Capabilities = 1 << 0
-	CapabilityStreamGroups          Capabilities = 1 << 1
-	CapabilityMultilinkBasicRetired Capabilities = 1 << 2
-	CapabilityMultilinkBasic                     = CapabilityMultilinkBasicRetired
-	CapabilityPriorityUpdate        Capabilities = 1 << 3
-	CapabilityOpenMetadata          Capabilities = 1 << 4
+	CapabilityPriorityHints  Capabilities = 1 << 0
+	CapabilityStreamGroups   Capabilities = 1 << 1
+	CapabilityPriorityUpdate Capabilities = 1 << 3
+	CapabilityOpenMetadata   Capabilities = 1 << 4
 )
 
 func (c Capabilities) Has(bit Capabilities) bool { return c&bit != 0 }
@@ -112,28 +110,13 @@ func (c Capabilities) HasPeerVisibleGroupSemantics() bool {
 type EXTSubtype uint64
 
 const (
-	EXTPriorityUpdate     EXTSubtype = 1
-	ExtMLReadyRetired     EXTSubtype = 2
-	ExtMLAttachRetired    EXTSubtype = 3
-	ExtMLAttachAckRetired EXTSubtype = 4
-	ExtMLDrainReqRetired  EXTSubtype = 5
-	ExtMLDrainAckRetired  EXTSubtype = 6
+	EXTPriorityUpdate EXTSubtype = 1
 )
 
 func (s EXTSubtype) String() string {
 	switch s {
 	case EXTPriorityUpdate:
 		return "PRIORITY_UPDATE"
-	case ExtMLReadyRetired:
-		return "ML_READY"
-	case ExtMLAttachRetired:
-		return "ML_ATTACH"
-	case ExtMLAttachAckRetired:
-		return "ML_ATTACH_ACK"
-	case ExtMLDrainReqRetired:
-		return "ML_DRAIN_REQ"
-	case ExtMLDrainAckRetired:
-		return "ML_DRAIN_ACK"
 	default:
 		return fmt.Sprintf("ext_subtype(%d)", uint64(s))
 	}
@@ -286,8 +269,6 @@ const (
 	SettingMaxIncomingStreamsBidi                SettingID = 5
 	SettingMaxIncomingStreamsUni                 SettingID = 6
 	SettingMaxFramePayload                       SettingID = 7
-	SettingIdleTimeoutMillis                     SettingID = 8
-	SettingKeepaliveHintMillis                   SettingID = 9
 	SettingMaxControlPayloadBytes                SettingID = 10
 	SettingMaxExtensionPayloadBytes              SettingID = 11
 	SettingSchedulerHints                        SettingID = 12
@@ -303,8 +284,6 @@ type Settings struct {
 	MaxIncomingStreamsBidi                uint64
 	MaxIncomingStreamsUni                 uint64
 	MaxFramePayload                       uint64
-	IdleTimeoutMillis                     uint64
-	KeepaliveHintMillis                   uint64
 	MaxControlPayloadBytes                uint64
 	MaxExtensionPayloadBytes              uint64
 	SchedulerHints                        SchedulerHint
@@ -320,8 +299,6 @@ func DefaultSettings() Settings {
 		MaxIncomingStreamsBidi:                256,
 		MaxIncomingStreamsUni:                 256,
 		MaxFramePayload:                       16384,
-		IdleTimeoutMillis:                     0,
-		KeepaliveHintMillis:                   0,
 		MaxControlPayloadBytes:                4096,
 		MaxExtensionPayloadBytes:              4096,
 		SchedulerHints:                        SchedulerUnspecifiedOrBalanced,

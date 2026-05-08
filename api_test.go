@@ -67,16 +67,6 @@ func TestPublicProtocolAliasesRemainPinned(t *testing.T) {
 			want: func() uint64 { return uint64(wire.SettingMaxIncomingStreamsUni) },
 		},
 		{
-			name: "SettingIdleTimeoutMillis",
-			got:  func() uint64 { return uint64(SettingIdleTimeoutMillis) },
-			want: func() uint64 { return uint64(wire.SettingIdleTimeoutMillis) },
-		},
-		{
-			name: "SettingKeepaliveHintMillis",
-			got:  func() uint64 { return uint64(SettingKeepaliveHintMillis) },
-			want: func() uint64 { return uint64(wire.SettingKeepaliveHintMillis) },
-		},
-		{
 			name: "SettingSchedulerHints",
 			got:  func() uint64 { return uint64(SettingSchedulerHints) },
 			want: func() uint64 { return uint64(wire.SettingSchedulerHints) },

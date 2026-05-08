@@ -149,8 +149,6 @@ func TestKnownSettingSeenBitRecognizesConfiguredRange(t *testing.T) {
 		SettingMaxIncomingStreamsBidi,
 		SettingMaxIncomingStreamsUni,
 		SettingMaxFramePayload,
-		SettingIdleTimeoutMillis,
-		SettingKeepaliveHintMillis,
 		SettingMaxControlPayloadBytes,
 		SettingMaxExtensionPayloadBytes,
 		SettingSchedulerHints,

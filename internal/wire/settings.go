@@ -16,8 +16,6 @@ func MarshalSettingsTLV(s Settings) ([]byte, error) {
 		{SettingMaxIncomingStreamsBidi, s.MaxIncomingStreamsBidi, defaults.MaxIncomingStreamsBidi},
 		{SettingMaxIncomingStreamsUni, s.MaxIncomingStreamsUni, defaults.MaxIncomingStreamsUni},
 		{SettingMaxFramePayload, s.MaxFramePayload, defaults.MaxFramePayload},
-		{SettingIdleTimeoutMillis, s.IdleTimeoutMillis, defaults.IdleTimeoutMillis},
-		{SettingKeepaliveHintMillis, s.KeepaliveHintMillis, defaults.KeepaliveHintMillis},
 		{SettingMaxControlPayloadBytes, s.MaxControlPayloadBytes, defaults.MaxControlPayloadBytes},
 		{SettingMaxExtensionPayloadBytes, s.MaxExtensionPayloadBytes, defaults.MaxExtensionPayloadBytes},
 		{SettingSchedulerHints, uint64(s.SchedulerHints), uint64(defaults.SchedulerHints)},
@@ -122,10 +120,6 @@ func ParseSettingsTLV(src []byte) (Settings, error) {
 			settings.MaxIncomingStreamsUni = value
 		case SettingMaxFramePayload:
 			settings.MaxFramePayload = value
-		case SettingIdleTimeoutMillis:
-			settings.IdleTimeoutMillis = value
-		case SettingKeepaliveHintMillis:
-			settings.KeepaliveHintMillis = value
 		case SettingMaxControlPayloadBytes:
 			settings.MaxControlPayloadBytes = value
 		case SettingMaxExtensionPayloadBytes:
@@ -156,20 +150,16 @@ func knownSettingSeenBit(typ uint64) (uint16, bool) {
 		return 1 << 5, true
 	case SettingMaxFramePayload:
 		return 1 << 6, true
-	case SettingIdleTimeoutMillis:
-		return 1 << 7, true
-	case SettingKeepaliveHintMillis:
-		return 1 << 8, true
 	case SettingMaxControlPayloadBytes:
-		return 1 << 9, true
+		return 1 << 7, true
 	case SettingMaxExtensionPayloadBytes:
-		return 1 << 10, true
+		return 1 << 8, true
 	case SettingSchedulerHints:
-		return 1 << 11, true
+		return 1 << 9, true
 	case SettingPingPaddingKey:
-		return 1 << 12, true
+		return 1 << 10, true
 	case SettingPrefacePadding:
-		return 1 << 13, true
+		return 1 << 11, true
 	default:
 		return 0, false
 	}

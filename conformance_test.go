@@ -727,41 +727,7 @@ func TestCapabilitiesMetadataCarriageHelpers(t *testing.T) {
 	}
 }
 
-func TestRegistryReservedRetiredValuesRemainStable(t *testing.T) {
-	t.Parallel()
-
-	got := []Capabilities{CapabilityMultilinkBasic}[0]
-	wantAlias := []Capabilities{CapabilityMultilinkBasicRetired}[0]
-	if got != wantAlias {
-		t.Fatalf("CapabilityMultilinkBasic = %d, want alias of %d", got, wantAlias)
-	}
-	if got != Capabilities(1<<2) {
-		t.Fatalf("CapabilityMultilinkBasic = %d, want %d", got, 1<<2)
-	}
-
-	tests := []struct {
-		name string
-		got  EXTSubtype
-		want EXTSubtype
-	}{
-		{name: "ml_ready", got: ExtMLReadyRetired, want: 2},
-		{name: "ml_attach", got: ExtMLAttachRetired, want: 3},
-		{name: "ml_attach_ack", got: ExtMLAttachAckRetired, want: 4},
-		{name: "ml_drain_req", got: ExtMLDrainReqRetired, want: 5},
-		{name: "ml_drain_ack", got: ExtMLDrainAckRetired, want: 6},
-	}
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if tc.got != tc.want {
-				t.Fatalf("%s subtype = %d, want %d", tc.name, tc.got, tc.want)
-			}
-		})
-	}
-}
-
-func TestRegistryReservedRetiredSubtypeNamesRemainStable(t *testing.T) {
+func TestRegistrySubtypeNamesRemainStable(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -769,11 +735,6 @@ func TestRegistryReservedRetiredSubtypeNamesRemainStable(t *testing.T) {
 		want string
 	}{
 		{got: EXTPriorityUpdate, want: "PRIORITY_UPDATE"},
-		{got: ExtMLReadyRetired, want: "ML_READY"},
-		{got: ExtMLAttachRetired, want: "ML_ATTACH"},
-		{got: ExtMLAttachAckRetired, want: "ML_ATTACH_ACK"},
-		{got: ExtMLDrainReqRetired, want: "ML_DRAIN_REQ"},
-		{got: ExtMLDrainAckRetired, want: "ML_DRAIN_ACK"},
 		{got: EXTSubtype(99), want: "ext_subtype(99)"},
 	}
 	for _, tc := range tests {
