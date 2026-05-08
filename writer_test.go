@@ -7655,11 +7655,7 @@ func TestPriorityPolicyRespectsOpeningMetadataPrefix(t *testing.T) {
 	serverCfg := DefaultConfig()
 	serverCfg.Settings.MaxFramePayload = 16384
 
-	clientCfg := DefaultConfig()
-	clientCfg.Capabilities |= CapabilityOpenMetadata | CapabilityPriorityHints
-	serverCfg.Capabilities |= CapabilityOpenMetadata | CapabilityPriorityHints
-
-	client, _ := newConnPairWithConfig(t, clientCfg, serverCfg)
+	client, _ := newConnPairWithConfig(t, nil, serverCfg)
 	ctx, cancel := testContext(t)
 	defer cancel()
 

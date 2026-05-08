@@ -294,6 +294,10 @@ info := stream.OpenInfo()
 meta := stream.Metadata()
 ```
 
+No extra capability setup is needed when both sides use `nil` config or `DefaultConfig()`.
+The session preface advertises supported metadata features and uses the intersection negotiated
+with the peer.
+
 Update local metadata before the stream becomes peer-visible:
 
 ```go

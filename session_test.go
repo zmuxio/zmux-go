@@ -14024,12 +14024,7 @@ func TestRefusedPeerDataOpenerSkipsPayloadParse(t *testing.T) {
 }
 
 func TestOpenMetadataCarriesPriorityAndGroup(t *testing.T) {
-	clientCfg := DefaultConfig()
-	serverCfg := DefaultConfig()
-	clientCfg.Capabilities |= CapabilityOpenMetadata | CapabilityPriorityHints | CapabilityStreamGroups
-	serverCfg.Capabilities |= CapabilityOpenMetadata | CapabilityPriorityHints | CapabilityStreamGroups
-
-	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
+	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
 	defer cancel()
 
@@ -14078,12 +14073,7 @@ func TestOpenMetadataCarriesPriorityAndGroup(t *testing.T) {
 }
 
 func TestUpdateMetadataBeforeOpenUsesOpeningMetadata(t *testing.T) {
-	clientCfg := DefaultConfig()
-	serverCfg := DefaultConfig()
-	clientCfg.Capabilities |= CapabilityOpenMetadata | CapabilityPriorityHints | CapabilityStreamGroups
-	serverCfg.Capabilities |= CapabilityOpenMetadata | CapabilityPriorityHints | CapabilityStreamGroups
-
-	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
+	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
 	defer cancel()
 
@@ -14218,12 +14208,7 @@ func TestUpdateMetadataBeforeOpenTightensOversizedOpenMetadataPrefixBacking(t *t
 }
 
 func TestPriorityUpdateRoundTrip(t *testing.T) {
-	clientCfg := DefaultConfig()
-	serverCfg := DefaultConfig()
-	clientCfg.Capabilities |= CapabilityPriorityUpdate | CapabilityPriorityHints | CapabilityStreamGroups
-	serverCfg.Capabilities |= CapabilityPriorityUpdate | CapabilityPriorityHints | CapabilityStreamGroups
-
-	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
+	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
 	defer cancel()
 
@@ -14332,12 +14317,7 @@ func TestPriorityUpdateIgnoredWhenUnnegotiated(t *testing.T) {
 }
 
 func TestPriorityUpdateDuplicateSingletonIgnored(t *testing.T) {
-	clientCfg := DefaultConfig()
-	serverCfg := DefaultConfig()
-	clientCfg.Capabilities |= CapabilityPriorityUpdate | CapabilityPriorityHints
-	serverCfg.Capabilities |= CapabilityPriorityUpdate | CapabilityPriorityHints
-
-	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
+	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
 	defer cancel()
 

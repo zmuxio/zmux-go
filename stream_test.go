@@ -5407,11 +5407,7 @@ func TestOpenAndSend(t *testing.T) {
 func TestOpenUniAndSendWithOptionsPreservesOpenInfo(t *testing.T) {
 	t.Parallel()
 
-	clientCfg := DefaultConfig()
-	serverCfg := DefaultConfig()
-	clientCfg.Capabilities |= CapabilityOpenMetadata
-	serverCfg.Capabilities |= CapabilityOpenMetadata
-	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
+	client, server := newConnPair(t)
 	ctx, cancel := testContext(t)
 	defer cancel()
 
