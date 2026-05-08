@@ -58,7 +58,7 @@ func TestResetDefaultConfigRestoresBuiltInTemplate(t *testing.T) {
 	t.Cleanup(ResetDefaultConfig)
 
 	ConfigureDefaultConfig(func(cfg *Config) {
-		cfg.Capabilities = 0
+		cfg.DisableCapabilities = true
 		cfg.PingPadding = false
 		cfg.PrefacePadding = false
 	})
@@ -70,6 +70,9 @@ func TestResetDefaultConfigRestoresBuiltInTemplate(t *testing.T) {
 	}
 	if got := DefaultConfig().Capabilities; got != 0 {
 		t.Fatalf("DefaultConfig().Capabilities = %v after ConfigureDefaultConfig disabled it, want 0", got)
+	}
+	if !DefaultConfig().DisableCapabilities {
+		t.Fatal("DefaultConfig().DisableCapabilities = false after ConfigureDefaultConfig disabled capabilities")
 	}
 
 	ResetDefaultConfig()
@@ -85,6 +88,40 @@ func TestResetDefaultConfigRestoresBuiltInTemplate(t *testing.T) {
 	}
 	if got, want := cfg.KeepaliveInterval, defaultIdleKeepaliveInterval; got != want {
 		t.Fatalf("DefaultConfig().KeepaliveInterval = %v, want %v", got, want)
+	}
+}
+
+func TestZeroCapabilitiesUseDefaultCapabilitySet(t *testing.T) {
+	t.Parallel()
+
+	cfg := cloneConfig(&Config{Role: RoleResponder})
+	if got := cfg.Capabilities; got != defaultCapabilities {
+		t.Fatalf("cloneConfig zero Capabilities = %v, want default %v", got, defaultCapabilities)
+	}
+
+	local, err := cfg.LocalPreface()
+	if err != nil {
+		t.Fatalf("LocalPreface err = %v", err)
+	}
+	if got := local.Capabilities; got != defaultCapabilities {
+		t.Fatalf("local preface capabilities = %v, want default %v", got, defaultCapabilities)
+	}
+}
+
+func TestDisableCapabilitiesOverridesDefaultCapabilitySet(t *testing.T) {
+	t.Parallel()
+
+	cfg := cloneConfig(&Config{DisableCapabilities: true})
+	if got := cfg.Capabilities; got != 0 {
+		t.Fatalf("cloneConfig disabled Capabilities = %v, want 0", got)
+	}
+
+	local, err := cfg.LocalPreface()
+	if err != nil {
+		t.Fatalf("LocalPreface err = %v", err)
+	}
+	if got := local.Capabilities; got != 0 {
+		t.Fatalf("local preface capabilities = %v, want 0", got)
 	}
 }
 

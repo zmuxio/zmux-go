@@ -63,10 +63,10 @@ func SchedulerHintFromCode(code uint64) SchedulerHint {
 type Capabilities uint64
 
 const (
-	CapabilityPriorityHints  Capabilities = 1 << 0
-	CapabilityStreamGroups   Capabilities = 1 << 1
+	CapabilityOpenMetadata   Capabilities = 1 << 0
+	CapabilityPriorityHints  Capabilities = 1 << 1
+	CapabilityStreamGroups   Capabilities = 1 << 2
 	CapabilityPriorityUpdate Capabilities = 1 << 3
-	CapabilityOpenMetadata   Capabilities = 1 << 4
 )
 
 func (c Capabilities) Has(bit Capabilities) bool { return c&bit != 0 }
@@ -269,11 +269,11 @@ const (
 	SettingMaxIncomingStreamsBidi                SettingID = 5
 	SettingMaxIncomingStreamsUni                 SettingID = 6
 	SettingMaxFramePayload                       SettingID = 7
-	SettingMaxControlPayloadBytes                SettingID = 10
-	SettingMaxExtensionPayloadBytes              SettingID = 11
-	SettingSchedulerHints                        SettingID = 12
-	SettingPingPaddingKey                        SettingID = 13
-	SettingPrefacePadding                        SettingID = 63
+	SettingMaxControlPayloadBytes                SettingID = 8
+	SettingMaxExtensionPayloadBytes              SettingID = 9
+	SettingSchedulerHints                        SettingID = 10
+	SettingPingPaddingKey                        SettingID = 11
+	SettingPrefacePadding                        SettingID = 12
 )
 
 type Settings struct {

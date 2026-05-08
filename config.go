@@ -44,10 +44,10 @@ func SchedulerHintFromCode(code uint64) SchedulerHint {
 type Capabilities = wire.Capabilities
 
 const (
+	CapabilityOpenMetadata   = wire.CapabilityOpenMetadata
 	CapabilityPriorityHints  = wire.CapabilityPriorityHints
 	CapabilityStreamGroups   = wire.CapabilityStreamGroups
 	CapabilityPriorityUpdate = wire.CapabilityPriorityUpdate
-	CapabilityOpenMetadata   = wire.CapabilityOpenMetadata
 )
 
 type SettingID = wire.SettingID
@@ -143,16 +143,20 @@ type Negotiated = wire.Negotiated
 
 // Config controls session establishment and runtime behavior.
 //
-// Prefer starting from DefaultConfig(). The zero value is not the default:
-// Role zero is RoleInitiator, and defaults also enable padding and keepalive.
+// Prefer starting from DefaultConfig(). Constructors also fill zero
+// capability, protocol, setting, and nonce-source fields with defaults.
 type Config struct {
 	Role            Role
 	TieBreakerNonce uint64
 	MinProto        uint64
 	MaxProto        uint64
-	Capabilities    Capabilities
-	Settings        Settings
-	NonceSource     io.Reader
+	// Capabilities advertises optional protocol features.
+	// Zero uses the default capability set.
+	Capabilities Capabilities
+	// DisableCapabilities advertises no optional protocol features.
+	DisableCapabilities bool
+	Settings            Settings
+	NonceSource         io.Reader
 	// PrefacePadding adds one ignored settings TLV to the local preface.
 	PrefacePadding bool
 	// PrefacePaddingMinBytes is the lower padding length bound. Zero uses the default.
@@ -292,7 +296,7 @@ const (
 	defaultPrefacePaddingMaxBytes   = 256
 	defaultPingPaddingMinBytes      = 16
 	defaultPingPaddingMaxBytes      = 64
-	defaultCapabilities             = CapabilityOpenMetadata | CapabilityPriorityUpdate | CapabilityPriorityHints | CapabilityStreamGroups
+	defaultCapabilities             = CapabilityOpenMetadata | CapabilityPriorityHints | CapabilityStreamGroups | CapabilityPriorityUpdate
 )
 
 var (
@@ -370,6 +374,11 @@ func normalizeConfigDefaults(out Config) Config {
 	}
 	if out.MaxProto == 0 {
 		out.MaxProto = ProtoVersion
+	}
+	if out.DisableCapabilities {
+		out.Capabilities = 0
+	} else if out.Capabilities == 0 {
+		out.Capabilities = defaultCapabilities
 	}
 	if out.Settings == (Settings{}) {
 		out.Settings = DefaultSettings()

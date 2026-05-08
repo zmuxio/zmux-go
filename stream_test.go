@@ -5158,7 +5158,7 @@ func assertCurrentCreditWriteFrames(t *testing.T, frames <-chan Frame, streamID 
 func TestOpenInfoRequiresOpenMetadataCapability(t *testing.T) {
 	t.Parallel()
 
-	noCaps := &Config{Capabilities: 0}
+	noCaps := &Config{DisableCapabilities: true}
 	client, server := newConnPairWithConfig(t, noCaps, noCaps)
 	_ = server
 
@@ -5166,6 +5166,33 @@ func TestOpenInfoRequiresOpenMetadataCapability(t *testing.T) {
 	if !errors.Is(err, ErrOpenInfoUnavailable) {
 		t.Fatalf("OpenStreamWithOptions err = %v, want %v", err, ErrOpenInfoUnavailable)
 	}
+}
+
+func TestOpenMetadataCapabilityDoesNotForcePlainOpensToCarryMetadata(t *testing.T) {
+	t.Parallel()
+
+	c, frames, stop := newInvalidFrameConn(t, defaultCapabilities)
+	defer stop()
+
+	stream, err := c.OpenStream(context.Background())
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	if _, err := stream.Write([]byte("x")); err != nil {
+		t.Fatalf("Write err = %v", err)
+	}
+
+	frame := awaitQueuedFrame(t, frames)
+	if frame.Type != FrameTypeDATA {
+		t.Fatalf("queued frame type = %v, want DATA", frame.Type)
+	}
+	if frame.Flags&FrameFlagOpenMetadata != 0 {
+		t.Fatalf("queued frame flags = %v, want no OPEN_METADATA", frame.Flags)
+	}
+	if !bytes.Equal(frame.Payload, []byte("x")) {
+		t.Fatalf("queued payload = %x, want %x", frame.Payload, []byte("x"))
+	}
+	assertNoQueuedFrame(t, frames)
 }
 
 func TestOpenInfoOverflowsOpenMetadataPrefix(t *testing.T) {
@@ -5898,7 +5925,7 @@ func TestStructuredSessionErrorAfterPeerCloseOpen(t *testing.T) {
 func TestStructuredOpenErrorForOpenInfoUnavailable(t *testing.T) {
 	t.Parallel()
 
-	noCaps := &Config{Capabilities: 0}
+	noCaps := &Config{DisableCapabilities: true}
 	client, _ := newConnPairWithConfig(t, noCaps, noCaps)
 
 	_, err := client.OpenStreamWithOptions(context.Background(), OpenOptions{OpenInfo: []byte("need-metadata")})

@@ -460,8 +460,8 @@ session, err := zmux.New(rwc, cfg)
 ```
 
 Start from `DefaultConfig()` for normal sessions. Constructors called with a nil config also use the
-process-wide default template. A literal `&zmux.Config{}` keeps zero-value fields, including `Role`,
-so use it only when you need explicit zero-value behavior.
+process-wide default template. A literal `&zmux.Config{}` keeps the zero-value role
+(`RoleInitiator`), so set `Role` explicitly when endpoint ordering is not fixed.
 
 Use `ConfigureDefaultConfig` during process initialization to adjust the default template:
 
@@ -477,31 +477,16 @@ The template does not retain per-session random values such as `TieBreakerNonce`
 Concurrent template updates are race-safe, but the last completed update wins.
 `ResetDefaultConfig()` restores the built-in template.
 
-`DefaultConfig()` enables:
-
-- advertisement of the stable metadata capabilities implemented by this module: open metadata,
-  priority update, priority hints, and stream groups
-- keepalive PINGs for directional-idle liveness checks and slower RTT sampling
-- preface padding, which varies the establishment preface length without changing negotiated settings
-- keepalive PING/PONG padding, which adds random opaque bytes without changing `Ping(ctx, echo)` behavior
-
-Capabilities are still negotiated by intersection with the peer's preface, so a feature is used only
-when both sides advertise it. Set `Capabilities = 0`, `KeepaliveInterval = 0`,
-`PrefacePadding = false`, or `PingPadding = false` to disable those features. The default preface
-padding value range is 16..256 bytes. The default extra PING/PONG length range is 16..64 bytes; for
-PING, that range includes the fixed 8-byte padding tag.
+`DefaultConfig()` enables the standard metadata features, keepalive PINGs, and padding defaults.
+Open-time metadata is still sent only when an `OpenOptions` value asks for it. Set
+`DisableCapabilities = true`, `KeepaliveInterval = 0`, `PrefacePadding = false`, or
+`PingPadding = false` when a deployment needs those features disabled.
 
 When you need a self-contained config literal, set the non-zero defaults you depend on explicitly:
 
 ```go
 cfg := &zmux.Config{
 	Role: zmux.RoleAuto,
-	Capabilities: zmux.CapabilityOpenMetadata |
-		zmux.CapabilityPriorityUpdate |
-		zmux.CapabilityPriorityHints |
-		zmux.CapabilityStreamGroups,
-	PrefacePadding: true,
-	PingPadding:    true,
 	KeepaliveInterval:        30 * time.Second,
 	KeepaliveMaxPingInterval: 2 * time.Minute,
 	GracefulCloseDrainTimeout: 100 * time.Millisecond,
