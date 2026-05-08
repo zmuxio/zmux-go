@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"strings"
 
+	"github.com/zmuxio/zmux-go/internal/errutil"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -498,74 +498,16 @@ func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Sou
 	return SourceTransport
 }
 
-const maxErrorUnwrapDepth = 64
-
 func findError[T any](err error) (T, bool) {
-	return findErrorDepth[T](err, 0)
-}
-
-func findErrorDepth[T any](err error, depth int) (T, bool) {
-	var zero T
-	if err == nil || depth > maxErrorUnwrapDepth {
-		return zero, false
-	}
-	if target, ok := any(err).(T); ok {
-		return target, true
-	}
-	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range wrapped.Unwrap() {
-			if target, ok := findErrorDepth[T](child, depth+1); ok {
-				return target, true
-			}
-		}
-		return zero, false
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return findErrorDepth[T](wrapped.Unwrap(), depth+1)
-	}
-	return zero, false
+	return errutil.Find[T](err)
 }
 
 func isError(err, target error) bool {
-	if target == nil {
-		return err == nil
-	}
-	return isErrorDepth(err, target, 0)
+	return errutil.Is(err, target)
 }
 
-func isErrorDepth(err, target error, depth int) bool {
-	if err == nil || depth > maxErrorUnwrapDepth {
-		return false
-	}
-	if sameError(err, target) {
-		return true
-	}
-	if matcher, ok := err.(interface{ Is(error) bool }); ok && matcher.Is(target) {
-		return true
-	}
-	if wrapped, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range wrapped.Unwrap() {
-			if isErrorDepth(child, target, depth+1) {
-				return true
-			}
-		}
-		return false
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return isErrorDepth(wrapped.Unwrap(), target, depth+1)
-	}
-	return false
-}
-
-func sameError(err, target error) (same bool) {
-	if err == nil || target == nil {
-		return err == nil && target == nil
-	}
-	errValue := reflect.ValueOf(err)
-	targetValue := reflect.ValueOf(target)
-	return errValue.Type() == targetValue.Type() &&
-		errValue.Comparable() &&
-		errValue.Equal(targetValue)
+func sameError(err, target error) bool {
+	return errutil.Same(err, target)
 }
 
 func sessionErrorSource(c *Conn, err error) Source {

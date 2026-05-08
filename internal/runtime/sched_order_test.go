@@ -75,6 +75,20 @@ func TestOrderUrgentBatchOrdersSameRankStreamScopedByAscendingStreamID(t *testin
 	}
 }
 
+func assertOrderRetainsSingleRealStreamFinishTag(t *testing.T, order []int, reqs []RequestMeta, state *BatchState, streamID uint64) {
+	t.Helper()
+
+	if len(order) != len(reqs) {
+		t.Fatalf("order len = %d, want %d", len(order), len(reqs))
+	}
+	if len(state.StreamFinishTag) != 1 {
+		t.Fatalf("retained stream finish tags = %#v, want one real-stream entry", state.StreamFinishTag)
+	}
+	if _, ok := state.StreamFinishTag[streamID]; !ok {
+		t.Fatalf("real stream finish tag missing: %#v", state.StreamFinishTag)
+	}
+}
+
 func TestOrderBatchIndicesDoesNotRetainSessionScopedSyntheticState(t *testing.T) {
 	t.Parallel()
 
@@ -467,15 +481,7 @@ func TestOrderBatchIndicesRecordsRetainedWFQStateForRealStreamsOnly(t *testing.T
 	order := orderBatchIndices(BatchConfig{GroupFair: true, MaxFramePayload: 16384}, state, reqs, map[uint64]StreamMeta{
 		4: {},
 	})
-	if len(order) != len(reqs) {
-		t.Fatalf("order len = %d, want %d", len(order), len(reqs))
-	}
-	if len(state.StreamFinishTag) != 1 {
-		t.Fatalf("retained stream finish tags = %#v, want one real-stream entry", state.StreamFinishTag)
-	}
-	if _, ok := state.StreamFinishTag[4]; !ok {
-		t.Fatalf("real stream finish tag missing: %#v", state.StreamFinishTag)
-	}
+	assertOrderRetainsSingleRealStreamFinishTag(t, order, reqs, state, 4)
 	for key := range state.GroupVirtualTime {
 		if key.Kind == 2 {
 			t.Fatalf("retained transient group state for kind=2: %#v", state.GroupVirtualTime)
@@ -527,15 +533,7 @@ func TestOrderBatchIndicesMixedBatchRetainsOnlyRealStreamState(t *testing.T) {
 	order := orderBatchIndices(BatchConfig{MaxFramePayload: 16384}, state, reqs, map[uint64]StreamMeta{
 		4: {},
 	})
-	if len(order) != len(reqs) {
-		t.Fatalf("order len = %d, want %d", len(order), len(reqs))
-	}
-	if len(state.StreamFinishTag) != 1 {
-		t.Fatalf("retained stream finish tags = %#v, want one real-stream entry", state.StreamFinishTag)
-	}
-	if _, ok := state.StreamFinishTag[4]; !ok {
-		t.Fatalf("real stream finish tag missing: %#v", state.StreamFinishTag)
-	}
+	assertOrderRetainsSingleRealStreamFinishTag(t, order, reqs, state, 4)
 	for streamID := range state.StreamFinishTag {
 		if isSyntheticStreamKey(streamID) {
 			t.Fatalf("retained synthetic stream finish tag for stream %d: %#v", streamID, state.StreamFinishTag)

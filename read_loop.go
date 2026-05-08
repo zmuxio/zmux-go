@@ -884,6 +884,50 @@ func (c *Conn) finishPeerVisibleTerminalControlLocked(stream *nativeStream, op s
 	return nil
 }
 
+type peerTerminalControlDirection uint8
+
+const (
+	peerTerminalControlSend peerTerminalControlDirection = iota
+	peerTerminalControlReceive
+)
+
+func (direction peerTerminalControlDirection) allowed(stream *nativeStream) bool {
+	if stream == nil {
+		return false
+	}
+	switch direction {
+	case peerTerminalControlSend:
+		return stream.localSend
+	case peerTerminalControlReceive:
+		return stream.localReceive
+	default:
+		return false
+	}
+}
+
+func (c *Conn) preparePeerTerminalControlLocked(op string, streamID uint64, direction peerTerminalControlDirection) (*nativeStream, bool, error) {
+	stream, err := c.lookupExistingPeerStreamLocked(op, streamID)
+	if err != nil {
+		c.mu.Unlock()
+		return nil, true, err
+	}
+	if stream == nil {
+		c.mu.Unlock()
+		return nil, true, nil
+	}
+	if direction.allowed(stream) {
+		return stream, false, nil
+	}
+	frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
+	if err != nil {
+		c.mu.Unlock()
+		return nil, true, err
+	}
+	c.mu.Unlock()
+	c.queueReadLoopFrameAsync(frame)
+	return nil, true, nil
+}
+
 func (c *Conn) handleStopSendingFrame(frame Frame) error {
 	if !c.lockPeerNonCloseFrameHandling() {
 		return nil
@@ -904,24 +948,9 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 	if !c.lockPeerNonCloseFrameHandling() {
 		return nil
 	}
-	stream, err := c.lookupExistingPeerStreamLocked("STOP_SENDING", frame.StreamID)
-	if err != nil {
-		c.mu.Unlock()
+	stream, handled, err := c.preparePeerTerminalControlLocked("STOP_SENDING", frame.StreamID, peerTerminalControlSend)
+	if handled || err != nil {
 		return err
-	}
-	if stream == nil {
-		c.mu.Unlock()
-		return nil
-	}
-	if !stream.localSend {
-		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
-		if err != nil {
-			c.mu.Unlock()
-			return err
-		}
-		c.mu.Unlock()
-		c.queueReadLoopFrameAsync(frame)
-		return nil
 	}
 	now := time.Now()
 	c.markPeerVisibleLocked(stream)
@@ -1032,24 +1061,9 @@ func (c *Conn) handleResetFrame(frame Frame) error {
 	if !c.lockPeerNonCloseFrameHandling() {
 		return nil
 	}
-	stream, err := c.lookupExistingPeerStreamLocked("RESET", frame.StreamID)
-	if err != nil {
-		c.mu.Unlock()
+	stream, handled, err := c.preparePeerTerminalControlLocked("RESET", frame.StreamID, peerTerminalControlReceive)
+	if handled || err != nil {
 		return err
-	}
-	if stream == nil {
-		c.mu.Unlock()
-		return nil
-	}
-	if !stream.localReceive {
-		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
-		if err != nil {
-			c.mu.Unlock()
-			return err
-		}
-		c.mu.Unlock()
-		c.queueReadLoopFrameAsync(frame)
-		return nil
 	}
 	now := time.Now()
 	c.markPeerVisibleLocked(stream)
@@ -1458,45 +1472,90 @@ func (c *Conn) handleMaxDataFrame(frame Frame) error {
 	return c.handleStreamMaxDataFrame(frame.StreamID, value)
 }
 
-func (c *Conn) handleStreamMaxDataFrame(streamID uint64, value uint64) error {
-	if !c.lockPeerNonCloseFrameHandling() {
+type peerStreamControlKind uint8
+
+const (
+	peerStreamControlMaxData peerStreamControlKind = iota
+	peerStreamControlBlocked
+)
+
+func (kind peerStreamControlKind) action(stream *nativeStream) state.PeerStreamControlAction {
+	if stream == nil {
+		return state.PeerStreamControlAbortState
+	}
+	switch kind {
+	case peerStreamControlMaxData:
+		return state.PeerMaxDataAction(
+			stream.localSend,
+			stream.localReceive,
+			stream.effectiveSendHalfStateLocked(),
+			stream.effectiveRecvHalfStateLocked(),
+		)
+	case peerStreamControlBlocked:
+		return state.PeerBlockedAction(
+			stream.localSend,
+			stream.localReceive,
+			stream.effectiveSendHalfStateLocked(),
+			stream.effectiveRecvHalfStateLocked(),
+		)
+	default:
+		return state.PeerStreamControlAbortState
+	}
+}
+
+func (kind peerStreamControlKind) recordNoOp(c *Conn, now time.Time) error {
+	switch kind {
+	case peerStreamControlMaxData:
+		return c.recordNoOpMaxDataLocked(now)
+	case peerStreamControlBlocked:
+		return c.recordNoOpBlockedLocked(now)
+	default:
 		return nil
 	}
-	stream, err := c.lookupExistingPeerStreamLocked("MAX_DATA", streamID)
+}
+
+func (c *Conn) preparePeerStreamControlLocked(kind peerStreamControlKind, op string, streamID uint64) (*nativeStream, time.Time, bool, error) {
+	stream, err := c.lookupExistingPeerStreamLocked(op, streamID)
 	if err != nil {
 		c.mu.Unlock()
-		return err
+		return nil, time.Time{}, true, err
 	}
 	if stream == nil {
 		c.mu.Unlock()
-		return nil
+		return nil, time.Time{}, true, nil
 	}
 	now := time.Now()
-	switch state.PeerMaxDataAction(
-		stream.localSend,
-		stream.localReceive,
-		stream.effectiveSendHalfStateLocked(),
-		stream.effectiveRecvHalfStateLocked(),
-	) {
+	switch kind.action(stream) {
 	case state.PeerStreamControlIgnore:
-		if err := c.recordNoOpMaxDataLocked(now); err != nil {
+		if err := kind.recordNoOp(c, now); err != nil {
 			c.mu.Unlock()
-			return err
+			return nil, now, true, err
 		}
 		c.mu.Unlock()
-		return nil
+		return nil, now, true, nil
 	case state.PeerStreamControlAbortState:
 		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
 		if err != nil {
 			c.mu.Unlock()
-			return err
+			return nil, now, true, err
 		}
 		c.mu.Unlock()
 		c.queueReadLoopFrameAsync(frame)
-		return nil
+		return nil, now, true, nil
 	default:
 	}
 	c.markPeerVisibleLocked(stream)
+	return stream, now, false, nil
+}
+
+func (c *Conn) handleStreamMaxDataFrame(streamID uint64, value uint64) error {
+	if !c.lockPeerNonCloseFrameHandling() {
+		return nil
+	}
+	stream, now, handled, err := c.preparePeerStreamControlLocked(peerStreamControlMaxData, "MAX_DATA", streamID)
+	if handled || err != nil {
+		return err
+	}
 	update := peerMaxDataUnchanged
 	if value > stream.sendMax {
 		update = peerMaxDataExpanded
@@ -1537,41 +1596,10 @@ func (c *Conn) handleStreamBlockedFrame(streamID uint64) error {
 	if !c.lockPeerNonCloseFrameHandling() {
 		return nil
 	}
-	stream, err := c.lookupExistingPeerStreamLocked("BLOCKED", streamID)
-	if err != nil {
-		c.mu.Unlock()
+	stream, now, handled, err := c.preparePeerStreamControlLocked(peerStreamControlBlocked, "BLOCKED", streamID)
+	if handled || err != nil {
 		return err
 	}
-	if stream == nil {
-		c.mu.Unlock()
-		return nil
-	}
-	now := time.Now()
-	switch state.PeerBlockedAction(
-		stream.localSend,
-		stream.localReceive,
-		stream.effectiveSendHalfStateLocked(),
-		stream.effectiveRecvHalfStateLocked(),
-	) {
-	case state.PeerStreamControlIgnore:
-		if err := c.recordNoOpBlockedLocked(now); err != nil {
-			c.mu.Unlock()
-			return err
-		}
-		c.mu.Unlock()
-		return nil
-	case state.PeerStreamControlAbortState:
-		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
-		if err != nil {
-			c.mu.Unlock()
-			return err
-		}
-		c.mu.Unlock()
-		c.queueReadLoopFrameAsync(frame)
-		return nil
-	default:
-	}
-	c.markPeerVisibleLocked(stream)
 	if err := c.finishPeerBlockedFrameLocked(stream, now); err != nil {
 		c.mu.Unlock()
 		return err
@@ -2296,27 +2324,34 @@ func saturatingInc32(v uint32) uint32 {
 	return v + 1
 }
 
-func (c *Conn) inboundControlByteBudgetLocked() uint64 {
-	if c == nil {
-		maxPayload := DefaultSettings().MaxControlPayloadBytes
-		budget := saturatingMul(maxPayload, 64)
-		if budget < minInboundControlByteBudget {
-			return minInboundControlByteBudget
-		}
-		return budget
-	}
-	if c.abuse.controlByteBudget > 0 {
-		return c.abuse.controlByteBudget
-	}
-	maxPayload := c.config.local.Settings.MaxControlPayloadBytes
-	if maxPayload == 0 {
-		maxPayload = DefaultSettings().MaxControlPayloadBytes
-	}
+func inboundByteBudget(maxPayload uint64, minBudget uint64) uint64 {
 	budget := saturatingMul(maxPayload, 64)
-	if budget < minInboundControlByteBudget {
-		return minInboundControlByteBudget
+	if budget < minBudget {
+		return minBudget
 	}
 	return budget
+}
+
+func inboundConfiguredByteBudget(override uint64, configured uint64, defaultMax uint64, minBudget uint64) uint64 {
+	if override > 0 {
+		return override
+	}
+	if configured == 0 {
+		configured = defaultMax
+	}
+	return inboundByteBudget(configured, minBudget)
+}
+
+func (c *Conn) inboundControlByteBudgetLocked() uint64 {
+	if c == nil {
+		return inboundByteBudget(DefaultSettings().MaxControlPayloadBytes, minInboundControlByteBudget)
+	}
+	return inboundConfiguredByteBudget(
+		c.abuse.controlByteBudget,
+		c.config.local.Settings.MaxControlPayloadBytes,
+		DefaultSettings().MaxControlPayloadBytes,
+		minInboundControlByteBudget,
+	)
 }
 
 func (c *Conn) inboundMixedFrameBudgetLocked() uint32 {
@@ -2333,16 +2368,9 @@ func (c *Conn) inboundMixedFrameBudgetLocked() uint32 {
 
 func (c *Conn) inboundMixedByteBudgetLocked() uint64 {
 	if c == nil {
-		controlMaxPayload := DefaultSettings().MaxControlPayloadBytes
-		control := saturatingMul(controlMaxPayload, 64)
-		if control < minInboundControlByteBudget {
-			control = minInboundControlByteBudget
-		}
-		extMaxPayload := DefaultSettings().MaxExtensionPayloadBytes
-		ext := saturatingMul(extMaxPayload, 64)
-		if ext < minInboundExtByteBudget {
-			ext = minInboundExtByteBudget
-		}
+		settings := DefaultSettings()
+		control := inboundByteBudget(settings.MaxControlPayloadBytes, minInboundControlByteBudget)
+		ext := inboundByteBudget(settings.MaxExtensionPayloadBytes, minInboundExtByteBudget)
 		if control >= ext {
 			return control
 		}
@@ -2361,25 +2389,14 @@ func (c *Conn) inboundMixedByteBudgetLocked() uint64 {
 
 func (c *Conn) inboundExtByteBudgetLocked() uint64 {
 	if c == nil {
-		maxPayload := DefaultSettings().MaxExtensionPayloadBytes
-		budget := saturatingMul(maxPayload, 64)
-		if budget < minInboundExtByteBudget {
-			return minInboundExtByteBudget
-		}
-		return budget
+		return inboundByteBudget(DefaultSettings().MaxExtensionPayloadBytes, minInboundExtByteBudget)
 	}
-	if c.abuse.extByteBudget > 0 {
-		return c.abuse.extByteBudget
-	}
-	maxPayload := c.config.local.Settings.MaxExtensionPayloadBytes
-	if maxPayload == 0 {
-		maxPayload = DefaultSettings().MaxExtensionPayloadBytes
-	}
-	budget := saturatingMul(maxPayload, 64)
-	if budget < minInboundExtByteBudget {
-		return minInboundExtByteBudget
-	}
-	return budget
+	return inboundConfiguredByteBudget(
+		c.abuse.extByteBudget,
+		c.config.local.Settings.MaxExtensionPayloadBytes,
+		DefaultSettings().MaxExtensionPayloadBytes,
+		minInboundExtByteBudget,
+	)
 }
 
 func (c *Conn) shouldRecordGroupRebucketChurnLocked(stream *nativeStream, oldGroup uint64, oldExplicit bool) bool {

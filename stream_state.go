@@ -2008,52 +2008,23 @@ func (s *nativeStream) recomputePendingTerminalControlBytesLocked() {
 		return
 	}
 	var frameBuf [3]txFrame
-	frames := frameBuf[:0]
-	if s.pending.terminal.openerSet {
-		frames = append(frames, s.pending.terminal.opener)
-	}
-	if s.pending.flags&streamPendingTerminalAbort != 0 {
-		frames = append(frames, flatTxFrame(Frame{
-			Type:     FrameTypeABORT,
-			StreamID: s.id,
-			Payload:  s.pending.terminal.abortPayload,
-		}))
-		s.pending.terminal.bufferedBytes = txFramesBufferedBytes(frames)
-		return
-	}
-	if s.pending.flags&streamPendingTerminalStop != 0 {
-		frames = append(frames, flatTxFrame(Frame{
-			Type:     FrameTypeStopSending,
-			StreamID: s.id,
-			Payload:  s.pending.terminal.stopPayload,
-		}))
-	}
-	if s.pending.flags&streamPendingTerminalReset != 0 {
-		frames = append(frames, flatTxFrame(Frame{
-			Type:     FrameTypeRESET,
-			StreamID: s.id,
-			Payload:  s.pending.terminal.resetPayload,
-		}))
-	}
+	frames := s.appendPendingTerminalControlFramesLocked(frameBuf[:0])
 	s.pending.terminal.bufferedBytes = txFramesBufferedBytes(frames)
 }
 
-func (s *nativeStream) pendingTerminalFramesLocked() []txFrame {
-	if s == nil || !s.hasPendingTerminalControlLocked() {
-		return nil
+func (s *nativeStream) appendPendingTerminalControlFramesLocked(frames []txFrame) []txFrame {
+	if s == nil {
+		return frames
 	}
-	var frameBuf [3]txFrame
-	frames := frameBuf[:0]
 	if s.pending.terminal.openerSet {
 		frames = append(frames, s.pending.terminal.opener)
 	}
 	if s.pending.flags&streamPendingTerminalAbort != 0 {
-		frames = append(frames, flatTxFrame(Frame{
+		return append(frames, flatTxFrame(Frame{
 			Type:     FrameTypeABORT,
 			StreamID: s.id,
 			Payload:  s.pending.terminal.abortPayload,
 		}))
-		return frames
 	}
 	if s.pending.flags&streamPendingTerminalStop != 0 {
 		frames = append(frames, flatTxFrame(Frame{
@@ -2070,6 +2041,14 @@ func (s *nativeStream) pendingTerminalFramesLocked() []txFrame {
 		}))
 	}
 	return frames
+}
+
+func (s *nativeStream) pendingTerminalFramesLocked() []txFrame {
+	if s == nil || !s.hasPendingTerminalControlLocked() {
+		return nil
+	}
+	var frameBuf [3]txFrame
+	return s.appendPendingTerminalControlFramesLocked(frameBuf[:0])
 }
 
 func (s *nativeStream) pendingTerminalFlushStateLocked() (flush bool, keep bool) {

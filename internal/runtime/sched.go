@@ -111,18 +111,7 @@ func (s *BatchScheduler) maybeClearIdleHeadState() {
 	if s == nil {
 		return
 	}
-	if len(s.State.StreamFinishTag) != 0 ||
-		len(s.State.StreamLastService) != 0 ||
-		len(s.State.StreamLag) != 0 ||
-		len(s.State.StreamClass) != 0 ||
-		len(s.State.StreamLastSeenBatch) != 0 ||
-		len(s.State.SmallBurstDisarmed) != 0 ||
-		len(s.State.GroupVirtualTime) != 0 ||
-		len(s.State.GroupFinishTag) != 0 ||
-		len(s.State.GroupLastService) != 0 ||
-		len(s.State.GroupLag) != 0 ||
-		len(s.State.PreferredStreamHead) != 0 ||
-		s.State.HasPreferredGroupHead {
+	if hasIdleBatchStateStorage(&s.State) {
 		return
 	}
 	scrubIdleRetainedBatchState(&s.State)

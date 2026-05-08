@@ -381,6 +381,24 @@ func hasRetainedRealBatchState(state *BatchState) bool {
 		state.HasPreferredGroupHead
 }
 
+func hasIdleBatchStateStorage(state *BatchState) bool {
+	if state == nil {
+		return false
+	}
+	return len(state.StreamFinishTag) != 0 ||
+		len(state.StreamLastService) != 0 ||
+		len(state.StreamLag) != 0 ||
+		len(state.StreamClass) != 0 ||
+		len(state.StreamLastSeenBatch) != 0 ||
+		len(state.SmallBurstDisarmed) != 0 ||
+		len(state.GroupVirtualTime) != 0 ||
+		len(state.GroupFinishTag) != 0 ||
+		len(state.GroupLastService) != 0 ||
+		len(state.GroupLag) != 0 ||
+		len(state.PreferredStreamHead) != 0 ||
+		state.HasPreferredGroupHead
+}
+
 func scrubIdleRetainedBatchState(state *BatchState) {
 	if state == nil {
 		return
@@ -639,34 +657,30 @@ func bypassSelectionsMap(state *BatchState, capHint int) map[uint64]int {
 	return state.scratch.bypassSelections
 }
 
+func batchScratchSlice[T any](slot *[]T, n int, capHint int) []T {
+	if batchScratchOversized(cap(*slot), capHint) {
+		*slot = nil
+	}
+	if cap(*slot) < capHint {
+		*slot = make([]T, n, capHint)
+	} else {
+		*slot = (*slot)[:n]
+	}
+	return *slot
+}
+
 func interactiveActiveStreamSlice(state *BatchState, capHint int) []uint64 {
 	if state == nil {
 		return make([]uint64, 0, capHint)
 	}
-	if batchScratchOversized(cap(state.scratch.interactiveActiveStreams), capHint) {
-		state.scratch.interactiveActiveStreams = nil
-	}
-	if cap(state.scratch.interactiveActiveStreams) < capHint {
-		state.scratch.interactiveActiveStreams = make([]uint64, 0, capHint)
-	} else {
-		state.scratch.interactiveActiveStreams = state.scratch.interactiveActiveStreams[:0]
-	}
-	return state.scratch.interactiveActiveStreams
+	return batchScratchSlice(&state.scratch.interactiveActiveStreams, 0, capHint)
 }
 
 func bulkActiveStreamSlice(state *BatchState, capHint int) []uint64 {
 	if state == nil {
 		return make([]uint64, 0, capHint)
 	}
-	if batchScratchOversized(cap(state.scratch.bulkActiveStreams), capHint) {
-		state.scratch.bulkActiveStreams = nil
-	}
-	if cap(state.scratch.bulkActiveStreams) < capHint {
-		state.scratch.bulkActiveStreams = make([]uint64, 0, capHint)
-	} else {
-		state.scratch.bulkActiveStreams = state.scratch.bulkActiveStreams[:0]
-	}
-	return state.scratch.bulkActiveStreams
+	return batchScratchSlice(&state.scratch.bulkActiveStreams, 0, capHint)
 }
 
 func transientStreamFinishMap(state *BatchState, capHint int) map[uint64]uint64 {
@@ -745,60 +759,28 @@ func orderedSlice(state *BatchState, n int, capHint int) []int {
 	if state == nil {
 		return make([]int, n, capHint)
 	}
-	if batchScratchOversized(cap(state.scratch.ordered), capHint) {
-		state.scratch.ordered = nil
-	}
-	if cap(state.scratch.ordered) < capHint {
-		state.scratch.ordered = make([]int, n, capHint)
-	} else {
-		state.scratch.ordered = state.scratch.ordered[:n]
-	}
-	return state.scratch.ordered
+	return batchScratchSlice(&state.scratch.ordered, n, capHint)
 }
 
 func interactiveCandidateSlice(state *BatchState, capHint int) []wfqGroupCandidate {
 	if state == nil {
 		return make([]wfqGroupCandidate, 0, capHint)
 	}
-	if batchScratchOversized(cap(state.scratch.interactiveCandidates), capHint) {
-		state.scratch.interactiveCandidates = nil
-	}
-	if cap(state.scratch.interactiveCandidates) < capHint {
-		state.scratch.interactiveCandidates = make([]wfqGroupCandidate, 0, capHint)
-	} else {
-		state.scratch.interactiveCandidates = state.scratch.interactiveCandidates[:0]
-	}
-	return state.scratch.interactiveCandidates
+	return batchScratchSlice(&state.scratch.interactiveCandidates, 0, capHint)
 }
 
 func bulkCandidateSlice(state *BatchState, capHint int) []wfqGroupCandidate {
 	if state == nil {
 		return make([]wfqGroupCandidate, 0, capHint)
 	}
-	if batchScratchOversized(cap(state.scratch.bulkCandidates), capHint) {
-		state.scratch.bulkCandidates = nil
-	}
-	if cap(state.scratch.bulkCandidates) < capHint {
-		state.scratch.bulkCandidates = make([]wfqGroupCandidate, 0, capHint)
-	} else {
-		state.scratch.bulkCandidates = state.scratch.bulkCandidates[:0]
-	}
-	return state.scratch.bulkCandidates
+	return batchScratchSlice(&state.scratch.bulkCandidates, 0, capHint)
 }
 
 func groupOrderSlice(state *BatchState, n int, capHint int) []GroupKey {
 	if state == nil {
 		return make([]GroupKey, n, capHint)
 	}
-	if batchScratchOversized(cap(state.scratch.groupOrder), capHint) {
-		state.scratch.groupOrder = nil
-	}
-	if cap(state.scratch.groupOrder) < capHint {
-		state.scratch.groupOrder = make([]GroupKey, n, capHint)
-	} else {
-		state.scratch.groupOrder = state.scratch.groupOrder[:n]
-	}
-	return state.scratch.groupOrder
+	return batchScratchSlice(&state.scratch.groupOrder, n, capHint)
 }
 
 func selectedSlice(state *BatchState, n int) []bool {

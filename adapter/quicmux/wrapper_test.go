@@ -24,6 +24,138 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
+type acceptStreamResult struct {
+	stream zmux.Stream
+	err    error
+}
+
+type acceptUniStreamResult struct {
+	stream zmux.RecvStream
+	err    error
+}
+
+func acceptStreamAsync(ctx context.Context, server zmux.Session, capHint int) <-chan acceptStreamResult {
+	ch := make(chan acceptStreamResult, capHint)
+	go func() {
+		stream, err := server.AcceptStream(ctx)
+		ch <- acceptStreamResult{stream: stream, err: err}
+	}()
+	return ch
+}
+
+func requireAcceptedStream(t *testing.T, ch <-chan acceptStreamResult) zmux.Stream {
+	t.Helper()
+
+	accepted := <-ch
+	if accepted.err != nil {
+		t.Fatalf("AcceptStream err = %v", accepted.err)
+	}
+	if accepted.stream == nil {
+		t.Fatal("AcceptStream stream = nil, want stream")
+	}
+	return accepted.stream
+}
+
+func acceptUniStreamAsync(ctx context.Context, server zmux.Session, capHint int) <-chan acceptUniStreamResult {
+	ch := make(chan acceptUniStreamResult, capHint)
+	go func() {
+		stream, err := server.AcceptUniStream(ctx)
+		ch <- acceptUniStreamResult{stream: stream, err: err}
+	}()
+	return ch
+}
+
+func requireAcceptedUniStream(t *testing.T, ch <-chan acceptUniStreamResult) zmux.RecvStream {
+	t.Helper()
+
+	accepted := <-ch
+	if accepted.err != nil {
+		t.Fatalf("AcceptUniStream err = %v", accepted.err)
+	}
+	if accepted.stream == nil {
+		t.Fatal("AcceptUniStream stream = nil, want stream")
+	}
+	return accepted.stream
+}
+
+func openVisibleStream(t *testing.T, ctx context.Context, client zmux.Session, payload []byte) zmux.Stream {
+	t.Helper()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream err = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = stream.Close()
+	})
+	if _, err := stream.Write(payload); err != nil {
+		t.Fatalf("Write err = %v", err)
+	}
+	return stream
+}
+
+func openAndAcceptVisibleStream(t *testing.T, ctx context.Context, client, server zmux.Session, payload []byte) (zmux.Stream, zmux.Stream) {
+	t.Helper()
+
+	acceptCh := acceptStreamAsync(ctx, server, 1)
+	stream := openVisibleStream(t, ctx, client, payload)
+	return stream, requireAcceptedStream(t, acceptCh)
+}
+
+func newStalledPreludeScenario(t *testing.T) (zmux.Session, zmux.Session, context.Context) {
+	t.Helper()
+
+	client, server := newWrappedPairWithOptions(t, SessionOptions{}, SessionOptions{
+		AcceptedPreludeReadTimeout: 100 * time.Millisecond,
+	})
+	clientConn, _ := client.(*quicSession)
+	serverConn, _ := server.(*quicSession)
+	if clientConn == nil || serverConn == nil {
+		t.Fatal("wrapped sessions = nil adapter sessions, want quicSession")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	stalled, err := clientConn.conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("raw OpenStreamSync stalled err = %v", err)
+	}
+	t.Cleanup(func() {
+		stalled.CancelRead(0)
+		stalled.CancelWrite(0)
+		_ = stalled.Close()
+	})
+	return client, server, ctx
+}
+
+func openReadyStreamWithPayload(t *testing.T, ctx context.Context, client zmux.Session, label string, payload []byte) zmux.Stream {
+	t.Helper()
+
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream %s err = %v", label, err)
+	}
+	t.Cleanup(func() {
+		_ = stream.Close()
+	})
+	if _, err := stream.Write(payload); err != nil {
+		t.Fatalf("%s Write err = %v", label, err)
+	}
+	return stream
+}
+
+func assertMetadataPriorityGroup(t *testing.T, meta zmux.StreamMetadata, priority, group uint64) {
+	t.Helper()
+
+	if meta.Priority != priority {
+		t.Fatalf("accepted Priority = %d, want %d", meta.Priority, priority)
+	}
+	if meta.Group == nil || *meta.Group != group {
+		t.Fatalf("accepted Group = %v, want %d", meta.Group, group)
+	}
+}
+
 func TestQUICSessionContract(t *testing.T) {
 	adaptertest.RunSessionContract(t, newWrappedPair)
 }
@@ -268,15 +400,7 @@ func TestWrapSessionCloseReadUsesCancelledCode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
+	acceptCh := acceptStreamAsync(ctx, server, 1)
 
 	clientStream, err := client.OpenStream(ctx)
 	if err != nil {
@@ -285,12 +409,8 @@ func TestWrapSessionCloseReadUsesCancelledCode(t *testing.T) {
 	if _, err := clientStream.Write([]byte("p")); err != nil {
 		t.Fatalf("initial Write err = %v", err)
 	}
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptStream err = %v", accepted.err)
-	}
-
-	if err := accepted.stream.CloseRead(); err != nil {
+	accepted := requireAcceptedStream(t, acceptCh)
+	if err := accepted.CloseRead(); err != nil {
 		t.Fatalf("CloseRead err = %v", err)
 	}
 
@@ -320,15 +440,7 @@ func TestWrapSessionFreshCloseReadSubmitsPreludeBeforeStopSending(t *testing.T) 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
+	acceptCh := acceptStreamAsync(ctx, server, 1)
 
 	clientStream, err := client.OpenStream(ctx)
 	if err != nil {
@@ -338,18 +450,15 @@ func TestWrapSessionFreshCloseReadSubmitsPreludeBeforeStopSending(t *testing.T) 
 		t.Fatalf("CloseRead err = %v", err)
 	}
 
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptStream err = %v", accepted.err)
-	}
-	if got := accepted.stream.OpenInfo(); len(got) != 0 {
+	accepted := requireAcceptedStream(t, acceptCh)
+	if got := accepted.OpenInfo(); len(got) != 0 {
 		t.Fatalf("accepted OpenInfo len = %d, want 0", len(got))
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
-	_ = accepted.stream.SetWriteDeadline(deadline)
+	_ = accepted.SetWriteDeadline(deadline)
 	for time.Now().Before(deadline) {
-		_, err := accepted.stream.Write([]byte("x"))
+		_, err := accepted.Write([]byte("x"))
 		if err == nil {
 			time.Sleep(10 * time.Millisecond)
 			continue
@@ -372,15 +481,7 @@ func TestWrapSessionUniCloseMatchesAvailableDirection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	type acceptResult struct {
-		stream zmux.RecvStream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptUniStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
+	acceptCh := acceptUniStreamAsync(ctx, server, 1)
 
 	send, err := client.OpenUniStream(ctx)
 	if err != nil {
@@ -390,10 +491,7 @@ func TestWrapSessionUniCloseMatchesAvailableDirection(t *testing.T) {
 	if _, err := send.Write(payload[:1]); err != nil {
 		t.Fatalf("initial Write err = %v", err)
 	}
-	recv := <-acceptCh
-	if recv.err != nil {
-		t.Fatalf("AcceptUniStream err = %v", recv.err)
-	}
+	recv := requireAcceptedUniStream(t, acceptCh)
 	if _, err := send.Write(payload[1:]); err != nil {
 		t.Fatalf("Write err = %v", err)
 	}
@@ -401,7 +499,7 @@ func TestWrapSessionUniCloseMatchesAvailableDirection(t *testing.T) {
 		t.Fatalf("send Close err = %v", err)
 	}
 
-	got, err := io.ReadAll(recv.stream)
+	got, err := io.ReadAll(recv)
 	if err != nil {
 		t.Fatalf("ReadAll err = %v", err)
 	}
@@ -409,7 +507,7 @@ func TestWrapSessionUniCloseMatchesAvailableDirection(t *testing.T) {
 		t.Fatalf("ReadAll = %q, want %q", got, payload)
 	}
 
-	if err := recv.stream.Close(); err != nil {
+	if err := recv.Close(); err != nil {
 		t.Fatalf("recv Close err = %v", err)
 	}
 }
@@ -423,15 +521,7 @@ func TestWrapSessionOpenMetadataVisibleOnAccept(t *testing.T) {
 	priority := uint64(7)
 	group := uint64(11)
 
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
+	acceptCh := acceptStreamAsync(ctx, server, 1)
 
 	stream, err := client.OpenStreamWithOptions(ctx, zmux.OpenOptions{
 		InitialPriority: &priority,
@@ -442,26 +532,17 @@ func TestWrapSessionOpenMetadataVisibleOnAccept(t *testing.T) {
 		t.Fatalf("OpenStreamWithOptions err = %v", err)
 	}
 
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptStream err = %v", accepted.err)
-	}
-
-	meta := accepted.stream.Metadata()
-	if meta.Priority != priority {
-		t.Fatalf("accepted Priority = %d, want %d", meta.Priority, priority)
-	}
-	if meta.Group == nil || *meta.Group != group {
-		t.Fatalf("accepted Group = %v, want %d", meta.Group, group)
-	}
+	accepted := requireAcceptedStream(t, acceptCh)
+	meta := accepted.Metadata()
+	assertMetadataPriorityGroup(t, meta, priority, group)
 	if got := string(meta.OpenInfo); got != "ssh" {
 		t.Fatalf("accepted OpenInfo = %q, want %q", got, "ssh")
 	}
-	if got := string(accepted.stream.OpenInfo()); got != "ssh" {
+	if got := string(accepted.OpenInfo()); got != "ssh" {
 		t.Fatalf("accepted OpenInfo() = %q, want %q", got, "ssh")
 	}
 
-	_ = accepted.stream.Close()
+	_ = accepted.Close()
 	_ = stream.Close()
 }
 
@@ -474,15 +555,7 @@ func TestWrapSessionUpdateMetadataBeforeVisibilityUsesPrelude(t *testing.T) {
 	priority := uint64(5)
 	group := uint64(9)
 
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
+	acceptCh := acceptStreamAsync(ctx, server, 1)
 
 	stream, err := client.OpenStream(ctx)
 	if err != nil {
@@ -495,23 +568,14 @@ func TestWrapSessionUpdateMetadataBeforeVisibilityUsesPrelude(t *testing.T) {
 		t.Fatalf("UpdateMetadata err = %v", err)
 	}
 
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptStream err = %v", accepted.err)
-	}
-
-	meta := accepted.stream.Metadata()
-	if meta.Priority != priority {
-		t.Fatalf("accepted Priority = %d, want %d", meta.Priority, priority)
-	}
-	if meta.Group == nil || *meta.Group != group {
-		t.Fatalf("accepted Group = %v, want %d", meta.Group, group)
-	}
+	accepted := requireAcceptedStream(t, acceptCh)
+	meta := accepted.Metadata()
+	assertMetadataPriorityGroup(t, meta, priority, group)
 	if meta.OpenInfo != nil {
 		t.Fatalf("accepted OpenInfo = %v, want nil", meta.OpenInfo)
 	}
 
-	_ = accepted.stream.Close()
+	_ = accepted.Close()
 	_ = stream.Close()
 }
 
@@ -521,31 +585,10 @@ func TestWrapSessionUpdateMetadataAfterVisibilityUnavailable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
-
-	stream, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream err = %v", err)
-	}
-	if _, err := stream.Write([]byte("x")); err != nil {
-		t.Fatalf("Write err = %v", err)
-	}
-
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptStream err = %v", accepted.err)
-	}
+	stream, accepted := openAndAcceptVisibleStream(t, ctx, client, server, []byte("x"))
 
 	priority := uint64(13)
-	err = stream.UpdateMetadata(zmux.MetadataUpdate{Priority: &priority})
+	err := stream.UpdateMetadata(zmux.MetadataUpdate{Priority: &priority})
 	if !errors.Is(err, zmux.ErrPriorityUpdateUnavailable) {
 		t.Fatalf("UpdateMetadata err = %v, want %v", err, zmux.ErrPriorityUpdateUnavailable)
 	}
@@ -553,43 +596,13 @@ func TestWrapSessionUpdateMetadataAfterVisibilityUnavailable(t *testing.T) {
 		t.Fatalf("UpdateMetadata err = %v, want %v", err, zmux.ErrAdapterUnsupported)
 	}
 
-	_ = accepted.stream.Close()
+	_ = accepted.Close()
 	_ = stream.Close()
 }
 
 func TestWrapSessionAcceptStreamReturnsReadyStreamAheadOfStalledPrelude(t *testing.T) {
-	client, server := newWrappedPairWithOptions(t, SessionOptions{}, SessionOptions{
-		AcceptedPreludeReadTimeout: 100 * time.Millisecond,
-	})
-	clientConn, _ := client.(*quicSession)
-	serverConn, _ := server.(*quicSession)
-	if clientConn == nil || serverConn == nil {
-		t.Fatal("wrapped sessions = nil adapter sessions, want quicSession")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	stalled, err := clientConn.conn.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatalf("raw OpenStreamSync stalled err = %v", err)
-	}
-	t.Cleanup(func() {
-		stalled.CancelRead(0)
-		stalled.CancelWrite(0)
-		_ = stalled.Close()
-	})
-
-	ready, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream ready err = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = ready.Close()
-	})
-	if _, err := ready.Write([]byte("x")); err != nil {
-		t.Fatalf("ready Write err = %v", err)
-	}
+	client, server, ctx := newStalledPreludeScenario(t)
+	ready := openReadyStreamWithPayload(t, ctx, client, "ready", []byte("x"))
 
 	accepted, err := server.AcceptStream(ctx)
 	if err != nil {
@@ -610,16 +623,7 @@ func TestWrapSessionAcceptStreamReturnsReadyStreamAheadOfStalledPrelude(t *testi
 
 	time.Sleep(250 * time.Millisecond)
 
-	next, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream next err = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = next.Close()
-	})
-	if _, err := next.Write([]byte("y")); err != nil {
-		t.Fatalf("next Write err = %v", err)
-	}
+	next := openReadyStreamWithPayload(t, ctx, client, "next", []byte("y"))
 
 	acceptedNext, err := server.AcceptStream(ctx)
 	if err != nil {
@@ -632,64 +636,21 @@ func TestWrapSessionAcceptStreamReturnsReadyStreamAheadOfStalledPrelude(t *testi
 }
 
 func TestWrapSessionConcurrentAcceptStreamAllowsReadyStreamsToBypassStalledPrelude(t *testing.T) {
-	client, server := newWrappedPairWithOptions(t, SessionOptions{}, SessionOptions{
-		AcceptedPreludeReadTimeout: 100 * time.Millisecond,
-	})
-	clientConn, _ := client.(*quicSession)
-	serverConn, _ := server.(*quicSession)
-	if clientConn == nil || serverConn == nil {
-		t.Fatal("wrapped sessions = nil adapter sessions, want quicSession")
-	}
+	client, server, ctx := newStalledPreludeScenario(t)
+	ready := openReadyStreamWithPayload(t, ctx, client, "ready", []byte("x"))
+	secondReady := openReadyStreamWithPayload(t, ctx, client, "second ready", []byte("y"))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	stalled, err := clientConn.conn.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatalf("raw OpenStreamSync stalled err = %v", err)
-	}
-	t.Cleanup(func() {
-		stalled.CancelRead(0)
-		stalled.CancelWrite(0)
-		_ = stalled.Close()
-	})
-
-	ready, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream ready err = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = ready.Close()
-	})
-	if _, err := ready.Write([]byte("x")); err != nil {
-		t.Fatalf("ready Write err = %v", err)
-	}
-	secondReady, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream second ready err = %v", err)
-	}
-	t.Cleanup(func() {
-		_ = secondReady.Close()
-	})
-	if _, err := secondReady.Write([]byte("y")); err != nil {
-		t.Fatalf("second ready Write err = %v", err)
-	}
-
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 2)
+	acceptCh := make(chan acceptStreamResult, 2)
 	for range 2 {
 		go func() {
 			stream, err := server.AcceptStream(ctx)
-			acceptCh <- acceptResult{stream: stream, err: err}
+			acceptCh <- acceptStreamResult{stream: stream, err: err}
 		}()
 	}
 
 	first := <-acceptCh
 	second := <-acceptCh
-	results := []acceptResult{first, second}
+	results := []acceptStreamResult{first, second}
 	wantIDs := map[uint64]struct{}{
 		ready.StreamID():       {},
 		secondReady.StreamID(): {},
@@ -1353,36 +1314,15 @@ func TestWrapSessionCloseReadReturnsErrReadClosedLocally(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
-
-	stream, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream err = %v", err)
-	}
-	if _, err := stream.Write([]byte("x")); err != nil {
-		t.Fatalf("Write err = %v", err)
-	}
-
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptStream err = %v", accepted.err)
-	}
-	if err := accepted.stream.CloseRead(); err != nil {
+	stream, accepted := openAndAcceptVisibleStream(t, ctx, client, server, []byte("x"))
+	if err := accepted.CloseRead(); err != nil {
 		t.Fatalf("CloseRead err = %v", err)
 	}
-	if _, err := accepted.stream.Read(make([]byte, 1)); !errors.Is(err, zmux.ErrReadClosed) {
+	if _, err := accepted.Read(make([]byte, 1)); !errors.Is(err, zmux.ErrReadClosed) {
 		t.Fatalf("Read err = %v, want %v", err, zmux.ErrReadClosed)
 	}
 
-	_ = accepted.stream.Close()
+	_ = accepted.Close()
 	_ = stream.Close()
 }
 
@@ -1392,28 +1332,7 @@ func TestWrapSessionCloseWriteReturnsErrWriteClosedLocally(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
-
-	stream, err := client.OpenStream(ctx)
-	if err != nil {
-		t.Fatalf("OpenStream err = %v", err)
-	}
-	if _, err := stream.Write([]byte("x")); err != nil {
-		t.Fatalf("Write err = %v", err)
-	}
-
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptStream err = %v", accepted.err)
-	}
+	stream, accepted := openAndAcceptVisibleStream(t, ctx, client, server, []byte("x"))
 	if err := stream.CloseWrite(); err != nil {
 		t.Fatalf("CloseWrite err = %v", err)
 	}
@@ -1424,7 +1343,7 @@ func TestWrapSessionCloseWriteReturnsErrWriteClosedLocally(t *testing.T) {
 		t.Fatalf("Write err = %v, want %v", err, zmux.ErrWriteClosed)
 	}
 
-	_ = accepted.stream.Close()
+	_ = accepted.Close()
 	_ = stream.Close()
 }
 
@@ -1451,15 +1370,7 @@ func TestWrapSessionCancelWriteAfterCloseWriteReturnsErrWriteClosed(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	type acceptResult struct {
-		stream zmux.Stream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
+	acceptCh := acceptStreamAsync(ctx, server, 1)
 
 	stream, err := client.OpenStream(ctx)
 	if err != nil {
@@ -1472,16 +1383,13 @@ func TestWrapSessionCancelWriteAfterCloseWriteReturnsErrWriteClosed(t *testing.T
 		t.Fatalf("CancelWrite err = %v, want %v", err, zmux.ErrWriteClosed)
 	}
 
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptStream err = %v", accepted.err)
-	}
+	accepted := requireAcceptedStream(t, acceptCh)
 	buf := make([]byte, 1)
-	if n, err := accepted.stream.Read(buf); n != 0 || err != io.EOF {
+	if n, err := accepted.Read(buf); n != 0 || err != io.EOF {
 		t.Fatalf("Read after remote CloseWrite = (%d, %v), want (0, EOF)", n, err)
 	}
 
-	_ = accepted.stream.Close()
+	_ = accepted.Close()
 	_ = stream.Close()
 }
 
@@ -1494,15 +1402,7 @@ func TestWrapSessionUniOpenMetadataVisibleOnAccept(t *testing.T) {
 	priority := uint64(3)
 	group := uint64(21)
 
-	type acceptResult struct {
-		stream zmux.RecvStream
-		err    error
-	}
-	acceptCh := make(chan acceptResult, 1)
-	go func() {
-		stream, err := server.AcceptUniStream(ctx)
-		acceptCh <- acceptResult{stream: stream, err: err}
-	}()
+	acceptCh := acceptUniStreamAsync(ctx, server, 1)
 
 	stream, err := client.OpenUniStreamWithOptions(ctx, zmux.OpenOptions{
 		InitialPriority: &priority,
@@ -1513,23 +1413,14 @@ func TestWrapSessionUniOpenMetadataVisibleOnAccept(t *testing.T) {
 		t.Fatalf("OpenUniStreamWithOptions err = %v", err)
 	}
 
-	accepted := <-acceptCh
-	if accepted.err != nil {
-		t.Fatalf("AcceptUniStream err = %v", accepted.err)
-	}
-
-	meta := accepted.stream.Metadata()
-	if meta.Priority != priority {
-		t.Fatalf("accepted Priority = %d, want %d", meta.Priority, priority)
-	}
-	if meta.Group == nil || *meta.Group != group {
-		t.Fatalf("accepted Group = %v, want %d", meta.Group, group)
-	}
+	accepted := requireAcceptedUniStream(t, acceptCh)
+	meta := accepted.Metadata()
+	assertMetadataPriorityGroup(t, meta, priority, group)
 	if got := string(meta.OpenInfo); got != "rpc" {
 		t.Fatalf("accepted OpenInfo = %q, want %q", got, "rpc")
 	}
 
-	_ = accepted.stream.Close()
+	_ = accepted.Close()
 	_ = stream.Close()
 }
 

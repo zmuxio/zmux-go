@@ -84,24 +84,11 @@ func TestBatchSchedulerDropStreamClearsIdleState(t *testing.T) {
 
 	s.DropStream(4, false, 0)
 
-	if len(s.State.StreamFinishTag) != 0 ||
-		len(s.State.StreamLastService) != 0 ||
-		len(s.State.StreamLag) != 0 ||
-		len(s.State.StreamClass) != 0 ||
-		len(s.State.StreamLastSeenBatch) != 0 ||
-		len(s.State.SmallBurstDisarmed) != 0 ||
-		len(s.State.GroupVirtualTime) != 0 ||
-		len(s.State.GroupFinishTag) != 0 ||
-		len(s.State.GroupLastService) != 0 ||
-		len(s.State.GroupLag) != 0 ||
-		len(s.State.PreferredStreamHead) != 0 {
+	if hasIdleBatchStateStorage(&s.State) {
 		t.Fatalf("retained per-stream state not cleared: %#v", s.State)
 	}
 	if s.State.RootVirtualTime != 0 || s.State.ServiceSeq != 0 {
 		t.Fatalf("scheduler clocks = (%d,%d), want (0,0)", s.State.RootVirtualTime, s.State.ServiceSeq)
-	}
-	if s.State.HasPreferredGroupHead {
-		t.Fatalf("preferred group head retained after idle drop: %#v", s.State.PreferredGroupHead)
 	}
 	if s.State.StreamFinishTag != nil ||
 		s.State.StreamLastService != nil ||
@@ -138,11 +125,7 @@ func TestBatchSchedulerClearResetsSchedulerOwnership(t *testing.T) {
 	if len(s.ActiveGroupRefs) != 0 {
 		t.Fatalf("activeGroupRefs count = %d, want 0", len(s.ActiveGroupRefs))
 	}
-	if len(s.State.StreamFinishTag) != 0 ||
-		len(s.State.StreamLastService) != 0 ||
-		len(s.State.GroupVirtualTime) != 0 ||
-		len(s.State.GroupFinishTag) != 0 ||
-		len(s.State.GroupLastService) != 0 ||
+	if hasIdleBatchStateStorage(&s.State) ||
 		s.State.RootVirtualTime != 0 ||
 		s.State.ServiceSeq != 0 {
 		t.Fatalf("scheduler state not cleared: %#v", s.State)
