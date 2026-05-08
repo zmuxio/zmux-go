@@ -1727,6 +1727,33 @@ func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) queuedWriteR
 			timeout = timer.C
 		}
 
+		if timeout != nil {
+			select {
+			case <-s.conn.lifecycle.closedCh:
+				return s.queuedWriteWaitErrResult(req, queueVisibleSessionErr(s.conn, s.conn.err()))
+			case err := <-req.done:
+				req.markDoneReusable()
+				req.markCancelReusable()
+				return queuedWriteResult{completed: true, err: s.conn.queueRequestDoneErr(err)}
+			case <-completion.notifyCh:
+				completion.notifyCh, completion.deadline, completion.closeErr = s.refreshQueuedWriteCompletion()
+				if deadlineCanceled {
+					completion.deadline = time.Time{}
+				}
+				if completion.closeErr != nil {
+					return s.queuedWriteWaitErrResult(req, queueVisibleSessionErr(s.conn, completion.closeErr))
+				}
+				continue
+			case <-timeout:
+				if s.cancelQueuedWriteOnDeadline(req) {
+					return queuedWriteResult{completed: true, err: os.ErrDeadlineExceeded}
+				}
+				deadlineCanceled = true
+				completion.deadline = time.Time{}
+				continue
+			}
+		}
+
 		select {
 		case <-s.conn.lifecycle.closedCh:
 			return s.queuedWriteWaitErrResult(req, queueVisibleSessionErr(s.conn, s.conn.err()))
@@ -1742,13 +1769,6 @@ func (s *nativeStream) waitQueuedWriteCompletion(req *writeRequest) queuedWriteR
 			if completion.closeErr != nil {
 				return s.queuedWriteWaitErrResult(req, queueVisibleSessionErr(s.conn, completion.closeErr))
 			}
-			continue
-		case <-timeout:
-			if s.cancelQueuedWriteOnDeadline(req) {
-				return queuedWriteResult{completed: true, err: os.ErrDeadlineExceeded}
-			}
-			deadlineCanceled = true
-			completion.deadline = time.Time{}
 			continue
 		}
 	}
@@ -1811,6 +1831,26 @@ func (s *nativeStream) sendQueuedWriteRequestUntilDeadline(req *writeRequest, la
 			timeout = timer.C
 		}
 
+		if timeout != nil {
+			select {
+			case <-s.conn.lifecycle.closedCh:
+				return s.rollbackPreparedWriteRequest(req, queueVisibleSessionErr(s.conn, s.conn.err()))
+			case lane <- *req:
+				return nil
+			case <-notifyCh:
+				s.conn.mu.Lock()
+				refresh := s.conn.refreshQueuedWriteRequestLocked(s, req, opts)
+				s.conn.mu.Unlock()
+				if refresh.err != nil {
+					return s.rollbackPreparedWriteRequest(req, refresh.err)
+				}
+				deadline = refresh.deadline
+				continue
+			case <-timeout:
+				return s.rollbackPreparedWriteRequest(req, os.ErrDeadlineExceeded)
+			}
+		}
+
 		select {
 		case <-s.conn.lifecycle.closedCh:
 			return s.rollbackPreparedWriteRequest(req, queueVisibleSessionErr(s.conn, s.conn.err()))
@@ -1825,8 +1865,6 @@ func (s *nativeStream) sendQueuedWriteRequestUntilDeadline(req *writeRequest, la
 			}
 			deadline = refresh.deadline
 			continue
-		case <-timeout:
-			return s.rollbackPreparedWriteRequest(req, os.ErrDeadlineExceeded)
 		}
 	}
 }

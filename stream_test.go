@@ -2372,6 +2372,102 @@ func TestWaitWriteDoesNotConsumeControlNotify(t *testing.T) {
 	}
 }
 
+func TestWaitWriteHandlesNilWakeAndNoDeadline(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+	}
+	stream := testBuildDetachedStream(c, 0, testWithWriteNotify())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- stream.waitWrite(time.Time{})
+	}()
+
+	c.mu.Lock()
+	notify(stream.writeNotify)
+	c.mu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitWrite err = %v, want nil", err)
+		}
+	case <-time.After(testSignalTimeout):
+		t.Fatal("waitWrite timed out waiting for write notification")
+	}
+}
+
+func TestStreamWritePermitSerializesSameStreamWriters(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+	}
+	stream := testBuildDetachedStream(c, 0, testWithWriteNotify())
+
+	first, err := stream.acquireWritePermit()
+	if err != nil {
+		t.Fatalf("first acquireWritePermit err = %v", err)
+	}
+
+	acquired := make(chan streamWritePermit, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		permit, err := stream.acquireWritePermit()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		acquired <- permit
+	}()
+
+	select {
+	case permit := <-acquired:
+		permit.release()
+		t.Fatal("second acquireWritePermit completed while first permit was still active")
+	case err := <-errCh:
+		t.Fatalf("second acquireWritePermit err = %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	first.release()
+
+	select {
+	case permit := <-acquired:
+		permit.release()
+	case err := <-errCh:
+		t.Fatalf("second acquireWritePermit err = %v", err)
+	case <-time.After(testSignalTimeout):
+		t.Fatal("second acquireWritePermit did not resume after first permit release")
+	}
+}
+
+func TestStreamWritePermitHonorsWriteDeadlineWhileWaiting(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+	}
+	stream := testBuildDetachedStream(c, 0, testWithWriteNotify())
+
+	first, err := stream.acquireWritePermit()
+	if err != nil {
+		t.Fatalf("first acquireWritePermit err = %v", err)
+	}
+	defer first.release()
+
+	if err := stream.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline err = %v", err)
+	}
+
+	_, err = stream.acquireWritePermit()
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("second acquireWritePermit err = %v, want %v", err, os.ErrDeadlineExceeded)
+	}
+}
+
 func TestWaitReadDoesNotConsumeControlNotify(t *testing.T) {
 	t.Parallel()
 

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	rt "github.com/zmuxio/zmux-go/internal/runtime"
 	"github.com/zmuxio/zmux-go/internal/state"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -625,6 +626,12 @@ func (s *nativeStream) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
+	permit, err := s.acquireWritePermit()
+	if err != nil {
+		return 0, err
+	}
+	defer permit.release()
+
 	written := 0
 	for written < len(p) {
 		progress, stop, err := s.writeBurst(p[written:])
@@ -662,6 +669,12 @@ func (s *nativeStream) writevFinal(parts [][]byte) (int, error) {
 	if total == 0 {
 		return 0, s.CloseWrite()
 	}
+
+	permit, err := s.acquireWritePermit()
+	if err != nil {
+		return 0, err
+	}
+	defer permit.release()
 
 	written := 0
 	partIdx := 0
@@ -703,6 +716,55 @@ type streamWaitState struct {
 	writeDeadline time.Time
 	readWaiters   uint32
 	writeWaiters  uint32
+}
+
+type streamWritePermit struct {
+	stream *nativeStream
+	active bool
+}
+
+func (p *streamWritePermit) release() {
+	if p == nil || !p.active {
+		return
+	}
+	stream := p.stream
+	p.stream = nil
+	p.active = false
+	if stream == nil || stream.conn == nil {
+		return
+	}
+
+	stream.conn.mu.Lock()
+	if stream.writeInProgress {
+		stream.writeInProgress = false
+		notify(stream.writeNotify)
+	}
+	stream.conn.mu.Unlock()
+}
+
+func (s *nativeStream) acquireWritePermit() (streamWritePermit, error) {
+	return s.acquireWritePermitUntil(time.Time{})
+}
+
+func (s *nativeStream) acquireWritePermitUntil(deadlineOverride time.Time) (streamWritePermit, error) {
+	if s == nil || s.conn == nil {
+		return streamWritePermit{}, ErrSessionClosed
+	}
+	for {
+		s.conn.mu.Lock()
+		if !s.writeInProgress {
+			s.writeInProgress = true
+			s.conn.mu.Unlock()
+			return streamWritePermit{stream: s, active: true}, nil
+		}
+		notifyCh, deadline := s.writeWaitSnapshotLocked()
+		deadline = rt.EffectiveDeadline(deadline, deadlineOverride)
+		s.conn.mu.Unlock()
+
+		if err := s.waitWithDeadline(notifyCh, deadline, OperationWrite); err != nil {
+			return streamWritePermit{}, err
+		}
+	}
 }
 
 func (s *nativeStream) ensureReadNotifyLocked() chan struct{} {
@@ -960,6 +1022,9 @@ func (s *nativeStream) waitWithDeadline(notifyCh <-chan struct{}, deadline time.
 }
 
 func (s *nativeStream) waitWithDeadlineAndWake(notifyCh <-chan struct{}, wakeCh <-chan struct{}, deadline time.Time, op Operation) error {
+	if s == nil || s.conn == nil {
+		return ErrSessionClosed
+	}
 	var (
 		timer   *time.Timer
 		timeout <-chan time.Time
@@ -976,15 +1041,44 @@ func (s *nativeStream) waitWithDeadlineAndWake(notifyCh <-chan struct{}, wakeCh 
 	}
 	defer stopTimer(timer)
 
+	closedCh := s.conn.lifecycle.closedCh
+	if wakeCh != nil && timeout != nil {
+		select {
+		case <-closedCh:
+			return s.sessionWaitErr(op)
+		case <-notifyCh:
+			return s.waitReadyErr(op)
+		case <-wakeCh:
+			return s.waitReadyErr(op)
+		case <-timeout:
+			return os.ErrDeadlineExceeded
+		}
+	}
+	if wakeCh != nil {
+		select {
+		case <-closedCh:
+			return s.sessionWaitErr(op)
+		case <-notifyCh:
+			return s.waitReadyErr(op)
+		case <-wakeCh:
+			return s.waitReadyErr(op)
+		}
+	}
+	if timeout != nil {
+		select {
+		case <-closedCh:
+			return s.sessionWaitErr(op)
+		case <-notifyCh:
+			return s.waitReadyErr(op)
+		case <-timeout:
+			return os.ErrDeadlineExceeded
+		}
+	}
 	select {
-	case <-s.conn.lifecycle.closedCh:
+	case <-closedCh:
 		return s.sessionWaitErr(op)
 	case <-notifyCh:
 		return s.waitReadyErr(op)
-	case <-wakeCh:
-		return s.waitReadyErr(op)
-	case <-timeout:
-		return os.ErrDeadlineExceeded
 	}
 }
 
@@ -1446,6 +1540,12 @@ func (s *nativeStream) closeWriteUntil(deadlineOverride time.Time) error {
 		return ErrSessionClosed
 	}
 
+	permit, err := s.acquireWritePermitUntil(deadlineOverride)
+	if err != nil {
+		return err
+	}
+	defer permit.release()
+
 	for {
 		s.conn.mu.Lock()
 		if s.conn.lifecycle.closeErr != nil {
@@ -1479,46 +1579,6 @@ func (s *nativeStream) closeWriteUntil(deadlineOverride time.Time) error {
 		}
 		s.conn.mu.Unlock()
 		return plan.queueCloseWrite(s, deadlineOverride)
-	}
-}
-
-func (s *nativeStream) prepareAsyncCloseWritePlan() (terminalFramePlan, error) {
-	if s == nil || s.conn == nil {
-		return terminalFramePlan{}, ErrSessionClosed
-	}
-	for {
-		s.conn.mu.Lock()
-		if s.conn.lifecycle.closeErr != nil {
-			err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
-			s.conn.mu.Unlock()
-			return terminalFramePlan{}, sessionOperationErrLocked(s.conn, OperationClose, err)
-		}
-		if s.allowsCloseWriteNoOpAfterStopResetLocked() {
-			s.conn.mu.Unlock()
-			return terminalFramePlan{}, nil
-		}
-		if err := s.localSendActionErrLocked(state.LocalCloseWriteAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {
-			s.conn.mu.Unlock()
-			return terminalFramePlan{}, s.closeOperationErr(err)
-		}
-		plan, err := s.prepareTerminalFramePlanLocked(terminalDataPrepareSpec{
-			intent: terminalDataCloseWrite,
-			wrap:   s.closeOperationErr,
-		})
-		if err != nil {
-			s.conn.mu.Unlock()
-			return terminalFramePlan{}, err
-		}
-		if plan.shouldRetry() {
-			wait := plan.wait
-			s.conn.mu.Unlock()
-			if err := wait.wait(s, s.closeOperationErr); err != nil {
-				return terminalFramePlan{}, err
-			}
-			continue
-		}
-		s.conn.mu.Unlock()
-		return plan, nil
 	}
 }
 

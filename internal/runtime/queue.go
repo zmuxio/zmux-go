@@ -55,6 +55,10 @@ func SendByDeadline[T any](deadline time.Time, closed <-chan struct{}, lane chan
 		return false
 	}
 	if deadline.IsZero() {
+		if closed == nil {
+			lane <- value
+			return true
+		}
 		select {
 		case <-closed:
 			return false
@@ -68,6 +72,14 @@ func SendByDeadline[T any](deadline time.Time, closed <-chan struct{}, lane chan
 	}
 	timer := time.NewTimer(delay)
 	defer stopTimer(timer)
+	if closed == nil {
+		select {
+		case lane <- value:
+			return true
+		case <-timer.C:
+			return false
+		}
+	}
 	select {
 	case <-closed:
 		return false
@@ -83,6 +95,14 @@ func WaitByDeadline[T any](deadline time.Time, closed <-chan struct{}, done <-ch
 		return
 	}
 	if deadline.IsZero() {
+		if closed == nil {
+			<-done
+			return
+		}
+		if done == nil {
+			<-closed
+			return
+		}
 		select {
 		case <-closed:
 		case <-done:
@@ -95,6 +115,24 @@ func WaitByDeadline[T any](deadline time.Time, closed <-chan struct{}, done <-ch
 	}
 	timer := time.NewTimer(remaining)
 	defer stopTimer(timer)
+	if closed == nil && done == nil {
+		<-timer.C
+		return
+	}
+	if closed == nil {
+		select {
+		case <-done:
+		case <-timer.C:
+		}
+		return
+	}
+	if done == nil {
+		select {
+		case <-closed:
+		case <-timer.C:
+		}
+		return
+	}
 	select {
 	case <-closed:
 	case <-done:

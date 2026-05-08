@@ -250,11 +250,10 @@ const (
 )
 
 type protocolTask struct {
-	kind      protocolTaskKind
-	frame     txFrame
-	closePlan terminalFramePlan
-	stream    *nativeStream
-	deadline  time.Time
+	kind     protocolTaskKind
+	frame    txFrame
+	stream   *nativeStream
+	deadline time.Time
 }
 
 func (t protocolTask) dropOnOverflow() bool {
@@ -280,7 +279,7 @@ func (c *Conn) executeReadLoopProtocolTask(task protocolTask) error {
 		if task.stream == nil {
 			return nil
 		}
-		err := task.closePlan.queueCloseWrite(task.stream, task.deadline)
+		err := task.stream.closeWriteUntil(task.deadline)
 		if err == nil || errors.Is(err, ErrWriteClosed) {
 			return nil
 		}
@@ -984,18 +983,10 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		if conn := stream.conn; conn != nil {
 			deadline = time.Now().Add(conn.stopSendingDrainWindow())
 		}
-		closePlan, err := stream.prepareAsyncCloseWritePlan()
-		if err != nil {
-			return err
-		}
-		if len(closePlan.frames) == 0 {
-			return nil
-		}
 		if err := c.enqueueReadLoopProtocolTask(protocolTask{
-			kind:      protocolTaskCloseWrite,
-			closePlan: closePlan,
-			stream:    stream,
-			deadline:  deadline,
+			kind:     protocolTaskCloseWrite,
+			stream:   stream,
+			deadline: deadline,
 		}); err != nil {
 			c.handleReadLoopProtocolActionErr(err)
 		}

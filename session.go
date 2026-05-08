@@ -4224,20 +4224,34 @@ func (r keepaliveWaitResult) shouldContinue() bool {
 
 func (c *Conn) waitKeepaliveWake(timer *time.Timer, delay time.Duration) keepaliveWaitResult {
 	stopTimer(timer)
+	closedCh := c.lifecycle.closedCh
+	livenessCh := c.signals.livenessCh
 	if delay <= 0 {
-		select {
-		case <-c.lifecycle.closedCh:
+		if livenessCh == nil {
+			<-closedCh
 			return keepaliveWaitClosed
-		case <-c.signals.livenessCh:
+		}
+		select {
+		case <-closedCh:
+			return keepaliveWaitClosed
+		case <-livenessCh:
 			return keepaliveWaitContinue
 		}
 	}
 
 	timer.Reset(delay)
+	if livenessCh == nil {
+		select {
+		case <-closedCh:
+			return keepaliveWaitClosed
+		case <-timer.C:
+			return keepaliveWaitContinue
+		}
+	}
 	select {
-	case <-c.lifecycle.closedCh:
+	case <-closedCh:
 		return keepaliveWaitClosed
-	case <-c.signals.livenessCh:
+	case <-livenessCh:
 		return keepaliveWaitContinue
 	case <-timer.C:
 		return keepaliveWaitContinue

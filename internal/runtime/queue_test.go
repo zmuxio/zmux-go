@@ -55,11 +55,33 @@ func TestSendAndWaitByDeadline(t *testing.T) {
 		}
 	})
 
+	t.Run("send with nil closed succeeds", func(t *testing.T) {
+		lane := make(chan int, 1)
+		if !SendByDeadline(time.Time{}, nil, lane, 7) {
+			t.Fatal("SendByDeadline(nil closed) = false, want true")
+		}
+		if got := <-lane; got != 7 {
+			t.Fatalf("lane value = %d, want 7", got)
+		}
+	})
+
 	t.Run("wait returns on done", func(t *testing.T) {
 		closed := make(chan struct{})
 		done := make(chan error, 1)
 		done <- nil
 		WaitByDeadline(time.Now().Add(100*time.Millisecond), closed, done)
+	})
+
+	t.Run("wait with nil closed returns on done", func(t *testing.T) {
+		done := make(chan error, 1)
+		done <- nil
+		WaitByDeadline(time.Time{}, nil, done)
+	})
+
+	t.Run("wait with nil done returns on closed", func(t *testing.T) {
+		closed := make(chan struct{})
+		close(closed)
+		WaitByDeadline[struct{}](time.Time{}, closed, nil)
 	})
 
 	t.Run("wait with nil signals returns", func(t *testing.T) {

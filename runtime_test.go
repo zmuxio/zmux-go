@@ -4322,6 +4322,24 @@ func TestWaitKeepaliveWakeReturnsOnSignalAndClose(t *testing.T) {
 	waitKeepaliveWake(t, ch, closed)
 }
 
+func TestWaitKeepaliveWakeHandlesNilLivenessChannel(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{lifecycle: connLifecycleState{closedCh: make(chan struct{})}}
+	timer := time.NewTimer(time.Hour)
+	if got := c.waitKeepaliveWake(timer, time.Millisecond); got != keepaliveWaitContinue {
+		t.Fatalf("waitKeepaliveWake(timer) = %v, want %v", got, keepaliveWaitContinue)
+	}
+
+	closed := make(chan struct{})
+	close(closed)
+	c.lifecycle.closedCh = closed
+	timer = time.NewTimer(time.Hour)
+	if got := c.waitKeepaliveWake(timer, 0); got != keepaliveWaitClosed {
+		t.Fatalf("waitKeepaliveWake(closed) = %v, want %v", got, keepaliveWaitClosed)
+	}
+}
+
 func TestHandleFramePingCopiesPayloadBeforeQueueingPong(t *testing.T) {
 	t.Parallel()
 

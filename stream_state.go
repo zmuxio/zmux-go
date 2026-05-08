@@ -867,6 +867,12 @@ func (s *nativeStream) UpdateMetadata(update MetadataUpdate) error {
 		return wrapMetadataUpdateStructuredError(ErrEmptyMetadataUpdate)
 	}
 
+	permit, err := s.acquireWritePermit()
+	if err != nil {
+		return err
+	}
+	defer permit.release()
+
 	s.conn.mu.Lock()
 	if s.conn.lifecycle.closeErr != nil {
 		err := sessionOperationErrLocked(s.conn, OperationWrite, visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr))
@@ -1548,6 +1554,8 @@ type nativeStream struct {
 	pending        streamPendingState
 
 	idSet bool
+
+	writeInProgress bool
 
 	bidi         bool
 	localOpen    streamLocalOpenState
