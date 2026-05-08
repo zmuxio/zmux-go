@@ -17,35 +17,24 @@ type writeRequest struct {
 	done           chan error
 	cancel         *queuedWriteCancel
 	cancelReusable bool
-	// donePooled marks completion channels acquired from the internal pool so
-	// the hot path can reuse them after normal completion without changing the
-	// external request API that tests and control paths observe.
+	// donePooled allows recycling pooled completion channels.
 	donePooled   bool
 	doneReusable bool
-	// preparedNotify is an optional one-shot synchronization hook used by tests
-	// that need to observe the "prepared for writer admission" boundary without
-	// racing on caller-owned request fields.
+	// preparedNotify lets tests observe writer-admission readiness.
 	preparedNotify chan struct{}
-	// origin identifies whether the request came from the stream state machine
-	// or from protocol/control paths that only reuse the writer machinery.
+	// origin distinguishes stream-generated writes from control-plane writes.
 	origin writeRequestOrigin
-	// terminalPolicy permits sending an already-terminal request that was
-	// intentionally created by a local state transition (for example, the
-	// terminal FIN DATA for CloseWrite, RESET for Reset, or ABORT for
-	// CloseWithError).
+	// terminalPolicy permits terminal frames from local state transitions.
 	terminalPolicy terminalWritePolicy
-	// cloneFramesBeforeSend delays defensive frame cloning until requests are
-	// ready to enter the single writer path.
+	// cloneFramesBeforeSend defers payload cloning until writer admission.
 	cloneFramesBeforeSend bool
-	// queueReserved tracks ordinary data-queue reservation held for this
-	// request while it waits to enter or leave the writer path.
+	// queueReserved tracks ordinary queue reservation.
 	queueReserved    bool
 	queuedBytes      uint64
 	reservedStream   *nativeStream
 	urgentReserved   bool
 	advisoryReserved bool
-	// requestMetaReady guards cached stream/terminal classification derived
-	// from frames so hot suppress/admission paths do not rescan the batch.
+	// requestMetaReady guards cached frame classification.
 	requestMetaReady        bool
 	requestStreamID         uint64
 	requestStreamIDKnown    bool
@@ -59,19 +48,12 @@ type writeRequest struct {
 	terminalResetOnly       bool
 	terminalAbortOnly       bool
 	terminalHasFIN          bool
-	// preparedSendBytes / preparedSendFin track local send-side state that was
-	// reserved while building this request but is still withdrawable until the
-	// request enters the single writer path.
+	// preparedSend* tracks withdrawable send-side reservations.
 	preparedSendBytes uint64
 	preparedSendFin   bool
-	// preparedOpenerVisibility marks requests that carry the local opener frame
-	// for a local-opened stream and therefore hold the temporary advisory
-	// ordering barrier until writer admission or rollback.
+	// preparedOpenerVisibility holds opener ordering until admission or rollback.
 	preparedOpenerVisibility openerVisibilityMark
-	// preparedPriority* tracks a same-stream piggybacked PRIORITY_UPDATE that
-	// was lifted out of the pending advisory bucket while this request is still
-	// withdrawable. The request may later restore that update if local admission
-	// fails before writer admission.
+	// preparedPriority* tracks a withdrawable piggybacked PRIORITY_UPDATE.
 	preparedPriorityStreamID uint64
 	preparedPriorityPayload  []byte
 	preparedPriorityBytes    uint64
@@ -86,9 +68,7 @@ const (
 	queuedWriteCanceled
 )
 
-// queuedWriteCancel is shared by the caller's request and the queued copy in
-// the writer lane. Its CAS boundary decides whether a deadline may still roll
-// back reservations or the writer owns the request and must complete it.
+// queuedWriteCancel arbitrates deadline rollback against writer ownership.
 type queuedWriteCancel struct {
 	state atomic.Uint32
 }
@@ -240,8 +220,7 @@ func completeWriteRequest(req *writeRequest, err error) {
 	if req == nil || req.done == nil {
 		return
 	}
-	// Completion runs on the single writer path; stale or duplicate completion
-	// signals must not be able to park it indefinitely.
+	// Stale completions must not park the writer.
 	select {
 	case req.done <- err:
 	default:
@@ -499,10 +478,7 @@ func trimTxPayloadParts(parts [][]byte, idx, off, n int) ([][]byte, int, int) {
 	return parts[start:end:end], 0, startOff
 }
 
-// txFrameQueueCost is the coarse queued-byte accounting used by admission,
-// HWM/LWM thresholds, and queue reservation. It intentionally tracks only the
-// type byte plus payload bytes so queue pressure remains stable across later
-// encoding strategy changes.
+// txFrameQueueCost is the coarse queued-byte cost used for admission.
 func txFrameQueueCost(frame txFrame) uint64 {
 	return saturatingAdd(1, uint64(frame.payloadLength()))
 }
@@ -678,9 +654,7 @@ type queuedWriteOptions struct {
 	terminalPolicy   terminalWritePolicy
 	deadlineOverride time.Time
 	ownership        frameOwnership
-	// cloneFramesBeforeSend protects caller-owned payloads after a queued write
-	// returns early on deadline or close while the single writer still owns the
-	// buffered request.
+	// cloneFramesBeforeSend lets queued writes outlive caller-owned payloads.
 	cloneFramesBeforeSend bool
 	queuedBytes           uint64
 	deadlinePolicy        writeDeadlinePolicy
@@ -898,9 +872,7 @@ func clearCanceledQueuedWriteRequest(req *writeRequest) {
 	if req == nil {
 		return
 	}
-	// The caller won cancellation and will not wait for a completion signal. The
-	// writer owns this copied reference now, so it may recycle the unused channel
-	// but must not send on it.
+	// The writer owns the copied request but must not complete it.
 	req.markDoneReusable()
 	req.markCancelReusable()
 	req.clearRetainedRefs()

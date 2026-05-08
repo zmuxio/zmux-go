@@ -58,16 +58,23 @@ func TestResetDefaultConfigRestoresBuiltInTemplate(t *testing.T) {
 	t.Cleanup(ResetDefaultConfig)
 
 	ConfigureDefaultConfig(func(cfg *Config) {
-		cfg.PingPadding = true
+		cfg.PingPadding = false
+		cfg.PrefacePadding = false
 	})
-	if !DefaultConfig().PingPadding {
-		t.Fatal("DefaultConfig().PingPadding = false after ConfigureDefaultConfig")
+	if DefaultConfig().PingPadding {
+		t.Fatal("DefaultConfig().PingPadding = true after ConfigureDefaultConfig disabled it")
+	}
+	if DefaultConfig().PrefacePadding {
+		t.Fatal("DefaultConfig().PrefacePadding = true after ConfigureDefaultConfig disabled it")
 	}
 
 	ResetDefaultConfig()
 	cfg := DefaultConfig()
-	if cfg.PingPadding {
-		t.Fatal("DefaultConfig().PingPadding = true after ResetDefaultConfig")
+	if !cfg.PingPadding {
+		t.Fatal("DefaultConfig().PingPadding = false after ResetDefaultConfig")
+	}
+	if !cfg.PrefacePadding {
+		t.Fatal("DefaultConfig().PrefacePadding = false after ResetDefaultConfig")
 	}
 	if got, want := cfg.KeepaliveInterval, defaultIdleKeepaliveInterval; got != want {
 		t.Fatalf("DefaultConfig().KeepaliveInterval = %v, want %v", got, want)

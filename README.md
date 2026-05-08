@@ -1,17 +1,17 @@
 # zmux-go
 
-`zmux-go` implements the `zmux v1` single-link stream multiplexing protocol in Go.
+`zmux-go` is the Go implementation of the `zmux v1` single-link stream multiplexing protocol.
 
-It provides:
+It exposes:
 
-- a native API on `*zmux.Conn`
+- native zmux APIs on `*zmux.Conn`
 - stable transport-agnostic interfaces: `Session`, `Stream`, `SendStream`, `RecvStream`
 - native-only interfaces: `NativeSession`, `NativeStream`, `NativeSendStream`, `NativeRecvStream`
-- a QUIC adapter in `github.com/zmuxio/zmux-go/adapter/quicmux`
+- a QUIC adapter: `github.com/zmuxio/zmux-go/adapter/quicmux`
 
 ## Constructors
 
-Use the native constructors when you want the full zmux API:
+Native constructors return `*zmux.Conn` and expose the full zmux API:
 
 ```go
 conn, err := zmux.New(rwc, cfg)
@@ -19,11 +19,11 @@ client, err := zmux.Client(rwc, cfg)
 server, err := zmux.Server(rwc, cfg)
 ```
 
-Use `New` when the transport does not already fix the initiator/responder role.
-Use `Client` or `Server` when the role is already known.
-Any `net.Conn` can be passed directly because it satisfies `io.ReadWriteCloser`.
+Use `New` when the transport does not already fix the initiator/responder role. Use `Client` or `Server`
+when the role is already known. Any `net.Conn` can be passed directly because it satisfies
+`io.ReadWriteCloser`.
 
-Use the stable constructors when you want the transport-agnostic surface:
+Stable constructors return `Session` for code that should work with native zmux and adapters:
 
 ```go
 session, err := zmux.NewSession(rwc, cfg)
@@ -31,7 +31,7 @@ session, err := zmux.ClientSession(rwc, cfg)
 session, err := zmux.ServerSession(rwc, cfg)
 ```
 
-You can also expose an existing native connection through the stable session interface:
+You can also view an existing native connection through the stable session interface:
 
 ```go
 native, err := zmux.New(rwc, cfg)
@@ -39,6 +39,9 @@ session := zmux.AsSession(native)
 ```
 
 ## Stable Interfaces
+
+These are the interfaces application code should depend on when it needs to handle native zmux sessions
+and adapters through the same code path.
 
 `Session` is the stable session surface:
 
@@ -143,7 +146,7 @@ type RecvStream interface {
 
 Native constructors return `*zmux.Conn`, which satisfies `NativeSession`.
 
-`NativeSession` repeats open/accept methods with native stream return types and adds native session controls:
+`NativeSession` repeats the open/accept methods with native stream return types and adds native session controls:
 
 ```go
 type NativeSession interface {
@@ -180,8 +183,8 @@ type NativeSession interface {
 }
 ```
 
-`NativeStream`, `NativeSendStream`, and `NativeRecvStream` extend the stable stream interfaces with local/native
-queries:
+`NativeStream`, `NativeSendStream`, and `NativeRecvStream` extend the stable stream interfaces with
+native-only queries:
 
 ```go
 type NativeStream interface {
@@ -207,9 +210,9 @@ type NativeRecvStream interface {
 }
 ```
 
-These interfaces are specific to native zmux. Adapters only need to implement the stable surfaces.
+These interfaces are specific to native zmux. Adapters implement the stable surfaces.
 
-## Basic Use
+## Basic Usage
 
 Open and use a bidirectional stream:
 
@@ -303,7 +306,7 @@ err := stream.UpdateMetadata(zmux.MetadataUpdate{
 If metadata can no longer be represented on the wire, the call returns an error such as
 `zmux.ErrPriorityUpdateUnavailable` or `zmux.ErrAdapterUnsupported`.
 
-## Stream Close And Cancel
+## Stream Close and Cancel
 
 Stable stream methods mean:
 
@@ -313,7 +316,7 @@ Stable stream methods mean:
 - `CloseRead`: stop the local read side with the default cancel code
 - `CancelRead(code)`: stop the local read side with an explicit code
 - `CloseWithError(code, reason)`: abort the whole stream
-- `Close`: local helper that closes both existing halves
+- `Close`: local helper that closes both stream halves
 
 Payload buffers passed to `Write`, `WriteFinal`, `WritevFinal`, `OpenAndSend`,
 `OpenAndSendWithOptions`, `OpenUniAndSend`, and `OpenUniAndSendWithOptions` are not
@@ -340,8 +343,8 @@ if err := stream.CloseWithError(uint64(zmux.CodeInternal), "backend failed"); er
 }
 ```
 
-Native zmux treats whole-stream abort as a first-class operation on bidirectional and unidirectional streams, so
-`CloseWithError` exists on `Stream`, `SendStream`, and `RecvStream`.
+Native zmux treats whole-stream abort as a first-class operation, so `CloseWithError` exists on
+`Stream`, `SendStream`, and `RecvStream`.
 
 ## Deadlines
 
@@ -437,16 +440,14 @@ Common surface errors include:
 
 ## Configuration
 
-Pass `*zmux.Config` to control capabilities, settings, keepalive, close timeouts, queue budgets, memory budgets, and
-event hooks:
+Pass `*zmux.Config` to tune capabilities, settings, keepalive, close timeouts, queue budgets,
+memory budgets, and event hooks:
 
 ```go
 cfg := zmux.DefaultConfig()
 cfg.GracefulCloseDrainTimeout = 100 * time.Millisecond
-cfg.PrefacePadding = true
 cfg.PrefacePaddingMinBytes = 16
 cfg.PrefacePaddingMaxBytes = 256
-cfg.PingPadding = true
 cfg.EventHandler = func(ev zmux.Event) {
 	// observe stream/session lifecycle
 }
@@ -454,43 +455,35 @@ cfg.EventHandler = func(ev zmux.Event) {
 session, err := zmux.New(rwc, cfg)
 ```
 
-Start from `DefaultConfig()` unless you intentionally want to override fields
-that have non-default zero values such as `Role`.
+Start from `DefaultConfig()` for normal sessions. Constructors called with a nil config also use the
+process-wide default template. A literal `&zmux.Config{}` keeps zero-value fields, including `Role`,
+so use it only when you need explicit zero-value behavior.
 
-Use `ConfigureDefaultConfig` during process initialization to adjust the
-process-wide template used by `DefaultConfig()` and by constructors called with
-nil config:
+Use `ConfigureDefaultConfig` during process initialization to adjust the default template:
 
 ```go
 zmux.ConfigureDefaultConfig(func(cfg *zmux.Config) {
-	cfg.PrefacePadding = true
-	cfg.PingPadding = true
+	cfg.KeepaliveInterval = 30 * time.Second
+	cfg.PingPaddingMaxBytes = 96
 })
 ```
 
-The global template does not retain per-session random values such as
-`TieBreakerNonce` or `Settings.PingPaddingKey`; each session still generates
-fresh values when needed. Concurrent default-template updates are race-safe, but
-the last completed update wins, so configure it during process initialization.
+The template does not retain per-session random values such as `TieBreakerNonce` or
+`Settings.PingPaddingKey`; each session still generates fresh values when needed.
+Concurrent template updates are race-safe, but the last completed update wins.
 `ResetDefaultConfig()` restores the built-in template.
 
-`DefaultConfig()` already enables a low-frequency directional-idle keepalive
-probe plus a slower cap on how long the session may go without sending any
-PING for RTT sampling. Set `KeepaliveInterval = 0` to disable the automatic
-keepalive logic entirely, or lower it when you want faster liveness detection.
+`DefaultConfig()` enables:
 
-Set `PrefacePadding = true` to append one random ignored settings TLV to the
-local establishment preface. This varies the TLS record length of the zmux
-handshake without changing negotiated settings; the default random padding
-value length is 16..256 bytes, and `PrefacePaddingMinBytes` /
-`PrefacePaddingMaxBytes` can tune that range.
+- keepalive PINGs for directional-idle liveness checks and slower RTT sampling
+- preface padding, which varies the establishment preface length without changing negotiated settings
+- keepalive PING/PONG padding, which adds random opaque bytes without changing `Ping(ctx, echo)` behavior
 
-Set `PingPadding = true` to add an 8-byte padding tag plus random opaque bytes
-to local PING frames, and to append random opaque bytes to recognized PONG
-replies. This also advertises a per-session padding key in the local preface;
-when disabled, the key is omitted. This does not change `Ping(ctx, echo)` API
-behavior; the default extra PING/PONG length range is 16..64 bytes. For PING,
-that range includes the fixed 8-byte tag.
+Set `KeepaliveInterval = 0`, `PrefacePadding = false`, or `PingPadding = false` to disable those
+features. The default preface padding value range is 16..256 bytes. The default extra PING/PONG
+length range is 16..64 bytes; for PING, that range includes the fixed 8-byte padding tag.
+
+When you need a self-contained config literal, set the non-zero defaults you depend on explicitly:
 
 ```go
 cfg := &zmux.Config{
@@ -510,17 +503,17 @@ session, err := zmux.New(rwc, cfg)
 
 ## JoinConn
 
-If your transport exposes separate read and write halves, combine them first.
-Use `JoinConn` when the halves already satisfy zmux's directional `ReadHalf`
-and `WriteHalf` contracts:
+If a transport exposes separate read and write halves, combine them before constructing the session.
+Use `JoinConn` when those halves already satisfy zmux's directional `ReadHalf` and `WriteHalf`
+contracts:
 
 ```go
 joined := zmux.JoinConn(readHalf, writeHalf)
 session, err := zmux.New(joined, nil)
 ```
 
-Use the split I/O helpers when the transport only exposes ordinary
-`io.Reader` and `io.Writer` halves:
+Use the split I/O helpers when the transport only exposes ordinary `io.Reader` and `io.Writer`
+halves:
 
 ```go
 conn, err := zmux.ClientIO(reader, writer, cfg)
@@ -528,10 +521,9 @@ session, err := zmux.ClientIOSession(reader, writer, cfg)
 joined := zmux.JoinIO(reader, writer)
 ```
 
-`JoinIO` forwards deadlines and addresses when the underlying halves expose
-compatible methods, such as those on `net.Conn`. Plain `io.Reader` and
-`io.Writer` values that do not expose deadline methods report unsupported
-deadlines.
+`JoinIO` forwards deadlines and addresses when the underlying halves expose compatible methods,
+such as those on `net.Conn`. Plain `io.Reader` and `io.Writer` values that do not expose deadline
+methods report unsupported deadlines.
 
 ## QUIC Adapter
 
@@ -547,5 +539,5 @@ var qconn *quic.Conn
 session := quicmux.WrapSession(qconn)
 ```
 
-It implements the stable `zmux.Session` surface and maps the supported subset of metadata and termination semantics onto
-`quic-go`. See `adapter/quicmux/README.md` for adapter details.
+It implements the stable `zmux.Session` surface and maps the supported subset of metadata and
+termination semantics onto `quic-go`. See `adapter/quicmux/README.md` for adapter details.

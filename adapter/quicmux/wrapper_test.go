@@ -1340,7 +1340,9 @@ func TestPreferLocalWriteErrorReturnsLocalApplicationError(t *testing.T) {
 	base.localWriteClosed.Store(true)
 	base.storeLocalWriteErr(appErr)
 
-	if got := base.preferLocalWriteError(io.ErrUnexpectedEOF); got != appErr {
+	got := base.preferLocalWriteError(io.ErrUnexpectedEOF)
+	var gotAppErr *zmux.ApplicationError
+	if !errors.As(got, &gotAppErr) || gotAppErr.Code != appErr.Code || gotAppErr.Reason != appErr.Reason {
 		t.Fatalf("preferLocalWriteError = %v, want %v", got, appErr)
 	}
 }

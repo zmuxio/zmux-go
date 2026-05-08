@@ -12,12 +12,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// Ingress ownership lives here:
-// - frame dispatch and read loop
-// - session-level GOAWAY/CLOSE/EXT handling
-// - stream MAX_DATA/BLOCKED plus receive accounting/replenish
-// - stream STOP_SENDING/RESET/ABORT handling
-// - inbound abuse/flood guard budgets
+// This file owns inbound frame dispatch and read-loop protocol handling.
 
 var (
 	readLoopHooksMu             sync.RWMutex
@@ -129,8 +124,7 @@ func (c *Conn) readLoop() {
 	closeSessionFn := readLoopCloseSessionWithOptionsForReadErr
 	readLoopHooksMu.RUnlock()
 	for {
-		// Reuse one bounded frame buffer per active connection to avoid
-		// per-frame pool churn without pinning oversized backings indefinitely.
+		// Reuse one bounded frame buffer per active connection.
 		frame, buf, handle, err := readFrameBufferedFn(c.io.reader, limits, scratch)
 		if handle == nil && scratchHandle != nil && readLoopBufferUsesScratch(buf, scratch) {
 			handle = scratchHandle
@@ -715,8 +709,7 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 		c.mu.Unlock()
 		return false, nil
 	}
-	// The payload parse runs without c.mu held, so the stream may have been
-	// finalized or removed before we can safely mutate receive state.
+	// Payload parsing runs without c.mu, so recheck stream liveness.
 	stream = c.registry.streams[frame.StreamID]
 	if stream == nil {
 		if terminal := c.terminalDataDispositionForLocked(frame.StreamID); terminal.found() {
@@ -1866,9 +1859,7 @@ func saturatingMul(v uint64, n uint64) uint64 {
 	return rt.SaturatingMul(v, n)
 }
 
-// windowStamp stores an internal rolling-window anchor in a compact form.
-// These anchors are only compared against other process-local timestamps, so
-// they do not need the full time.Time representation.
+// windowStamp stores a compact rolling-window timestamp.
 type windowStamp int64
 
 func windowStampAt(now time.Time) windowStamp {

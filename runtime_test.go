@@ -1703,18 +1703,6 @@ func TestClientEstablishmentOnlyWritesPrefaceBeforePeerPreface(t *testing.T) {
 		_ = right.Close()
 	})
 
-	cfg := cloneConfig(nil)
-	cfg.Role = RoleInitiator
-	cfg.TieBreakerNonce = 0
-	local, err := cfg.LocalPreface()
-	if err != nil {
-		t.Fatalf("build local preface: %v", err)
-	}
-	want, err := local.MarshalBinary()
-	if err != nil {
-		t.Fatalf("marshal local preface: %v", err)
-	}
-
 	type result struct {
 		conn *Conn
 		err  error
@@ -1725,12 +1713,18 @@ func TestClientEstablishmentOnlyWritesPrefaceBeforePeerPreface(t *testing.T) {
 		clientCh <- result{conn: conn, err: err}
 	}()
 
-	got := make([]byte, len(want))
-	if _, err := io.ReadFull(right, got); err != nil {
+	got, err := ReadPreface(right)
+	if err != nil {
 		t.Fatalf("read client preface: %v", err)
 	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("client preface = %x, want %x", got, want)
+	if got.Role != RoleInitiator {
+		t.Fatalf("client preface role = %s, want %s", got.Role, RoleInitiator)
+	}
+	if got.PrefaceVersion != PrefaceVersion || got.MinProto != ProtoVersion || got.MaxProto != ProtoVersion {
+		t.Fatalf("client preface protocol fields = %+v, want current protocol", got)
+	}
+	if got.Settings.PingPaddingKey == 0 {
+		t.Fatal("client preface PingPaddingKey = 0, want default ping padding advertised")
 	}
 
 	if err := right.SetReadDeadline(time.Now().Add(testSignalTimeout / 5)); err != nil {
@@ -1753,6 +1747,18 @@ func TestClientEstablishmentOnlyWritesPrefaceBeforePeerPreface(t *testing.T) {
 	if client.err == nil {
 		t.Fatal("expected client establish error after peer close")
 	}
+}
+
+func testWrittenPrefacePrefix(t *testing.T, raw []byte) (Preface, int) {
+	t.Helper()
+	preface, n, err := wire.ParsePrefacePrefix(raw)
+	if err != nil {
+		t.Fatalf("parse written preface prefix: %v", err)
+	}
+	if n <= 0 {
+		t.Fatalf("written preface prefix len = %d, want positive", n)
+	}
+	return preface, n
 }
 
 func testPrefaceBytesForRole(t *testing.T, role Role) []byte {
@@ -2184,7 +2190,6 @@ func TestBuildEstablishmentCloseFrameEncodesFatalClose(t *testing.T) {
 func TestClientEstablishmentInvalidPeerPrefaceEmitsFatalClose(t *testing.T) {
 	t.Parallel()
 
-	wantPreface := testPrefaceBytesForRole(t, RoleInitiator)
 	invalidPeer := append([]byte(nil), testPrefaceBytesForRole(t, RoleResponder)...)
 	invalidPeer[5] = 7
 	conn := newRecordingDeadlineDuplexConn(invalidPeer)
@@ -2198,13 +2203,14 @@ func TestClientEstablishmentInvalidPeerPrefaceEmitsFatalClose(t *testing.T) {
 	}
 
 	written := conn.bytes()
-	if len(written) < len(wantPreface) {
-		t.Fatalf("establishment writes len = %d, want at least client preface len %d", len(written), len(wantPreface))
+	gotPreface, prefaceLen := testWrittenPrefacePrefix(t, written)
+	if gotPreface.Role != RoleInitiator {
+		t.Fatalf("client preface role = %s, want %s", gotPreface.Role, RoleInitiator)
 	}
-	if !bytes.Equal(written[:len(wantPreface)], wantPreface) {
-		t.Fatalf("client preface = %x, want %x", written[:len(wantPreface)], wantPreface)
+	if gotPreface.Settings.PingPaddingKey == 0 {
+		t.Fatal("client preface PingPaddingKey = 0, want default ping padding advertised")
 	}
-	frames := establishmentFramesAfterPreface(t, written, len(wantPreface))
+	frames := establishmentFramesAfterPreface(t, written, prefaceLen)
 	if len(frames) != 1 {
 		t.Fatalf("establishment frame count = %d, want 1 fatal CLOSE", len(frames))
 	}
@@ -2227,7 +2233,6 @@ func TestClientEstablishmentInvalidPeerPrefaceEmitsFatalClose(t *testing.T) {
 func TestClientEstablishmentRoleConflictEmitsFatalClose(t *testing.T) {
 	t.Parallel()
 
-	wantPreface := testPrefaceBytesForRole(t, RoleInitiator)
 	conflictingPeer := testPrefaceBytesForRole(t, RoleInitiator)
 	conn := newRecordingDeadlineDuplexConn(conflictingPeer)
 	client, err := Client(conn, nil)
@@ -2240,10 +2245,14 @@ func TestClientEstablishmentRoleConflictEmitsFatalClose(t *testing.T) {
 	}
 
 	written := conn.bytes()
-	if !bytes.Equal(written[:len(wantPreface)], wantPreface) {
-		t.Fatalf("client preface = %x, want %x", written[:len(wantPreface)], wantPreface)
+	gotPreface, prefaceLen := testWrittenPrefacePrefix(t, written)
+	if gotPreface.Role != RoleInitiator {
+		t.Fatalf("client preface role = %s, want %s", gotPreface.Role, RoleInitiator)
 	}
-	frames := establishmentFramesAfterPreface(t, written, len(wantPreface))
+	if gotPreface.Settings.PingPaddingKey == 0 {
+		t.Fatal("client preface PingPaddingKey = 0, want default ping padding advertised")
+	}
+	frames := establishmentFramesAfterPreface(t, written, prefaceLen)
 	if len(frames) != 1 {
 		t.Fatalf("establishment frame count = %d, want 1 fatal CLOSE", len(frames))
 	}

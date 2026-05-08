@@ -84,7 +84,7 @@ func ParseSettingsTLV(src []byte) (Settings, error) {
 			}
 			seenKnown |= bit
 			if SettingID(typ) == SettingPrefacePadding {
-				// Padding carries arbitrary bytes and intentionally has no semantic value.
+				// Padding is arbitrary and ignored.
 				continue
 			}
 		} else {

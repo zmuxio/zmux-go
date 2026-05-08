@@ -193,8 +193,7 @@ type writePrepareAttempt struct {
 	outcome writePrepareOutcome
 }
 
-// acquireWritePrepareWindowLocked returns with conn.mu still held on success.
-// Any retry/fallback/error path returns with the mutex already released.
+// acquireWritePrepareWindowLocked keeps conn.mu held only on success.
 func (s *nativeStream) acquireWritePrepareWindowLocked(mode writePrepareWindowMode, policy writeAdmissionPolicy) (writePrepareAttempt, error) {
 	if s == nil || s.conn == nil {
 		return writePrepareAttempt{}, ErrSessionClosed
@@ -699,10 +698,7 @@ func (s *nativeStream) queueFramesUntilDeadlineAndOptionsOwnedResult(frames []tx
 	lane := writeLaneOrdinary.promote(writeUrgencyProfileFrom(req.requestAllUrgent))
 	req.cloneFramesBeforeSend = opts.cloneFramesBeforeSend || !opts.ownership.ownsFrames()
 
-	// deadlineOverride only bounds local admission into the writer path. Once the
-	// request is queued to the single writer, completion waits follow the normal
-	// stream write deadline surface so internal convergence helpers do not race a
-	// request that is already in flight with a second fallback terminal action.
+	// deadlineOverride only bounds admission into the writer path.
 	if err := s.enqueueWriteRequestUntilDeadline(&req, streamWriteDispatchOptions{
 		lane:             lane,
 		deadlineOverride: opts.deadlineOverride,
@@ -943,7 +939,7 @@ func (s *nativeStream) prepareWritePartsBurstBatch(parts [][]byte, idx, off, tot
 			return prepared
 		}
 		if prepared.progress > 0 {
-			// Flush partial progress promptly instead of stalling it behind a later credit wait.
+			// Flush partial progress before waiting for more credit.
 			s.conn.mu.Unlock()
 			prepared.handled = true
 			return prepared
@@ -1202,8 +1198,7 @@ func (s *nativeStream) executeWriteBurst(parts [][]byte, idx, off, totalRemainin
 		if step.appN > 0 {
 			batchIdx, batchOff = advanceParts(parts, batchIdx, batchOff, step.appN)
 		}
-		// Flush the opener frame before attempting later chunks so flow-control
-		// BLOCKED signaling cannot overtake the first peer-visible DATA frame.
+		// Keep the opener ahead of later flow-control signals.
 		if step.openerVisibility.marksPeerVisible() {
 			break
 		}

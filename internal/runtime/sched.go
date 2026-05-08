@@ -2,12 +2,7 @@ package runtime
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// BatchScheduler owns retained batch-ordering state plus the explicit-group
-// tracking needed by the current repository-default sender model.
-//
-// This keeps writer/runtime scheduling ownership inside internal/runtime while
-// allowing root-package tests and adapters to inspect the retained state during
-// the ongoing structural refactor.
+// BatchScheduler owns retained batch-ordering and explicit-group state.
 type BatchScheduler struct {
 	State           BatchState
 	ActiveGroupRefs map[uint64]uint64

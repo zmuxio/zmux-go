@@ -339,8 +339,7 @@ type fixtureIndexEntry struct {
 	Count int    `json:"count"`
 }
 
-// These fixture metadata checks are tiny and intentionally run serially.
-// Parallelizing them only adds cache/debugging flakiness without saving time.
+// Keep fixture metadata checks serial.
 func TestCaseSetCodecIDsMatchWireFixtures(t *testing.T) {
 	sets := loadCaseSets(t)
 

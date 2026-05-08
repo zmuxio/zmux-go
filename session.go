@@ -1529,10 +1529,7 @@ func emitEstablishmentClose(conn io.Writer, local Preface, peer *Preface, err er
 	return rt.WriteAll(conn, frame)
 }
 
-// establishmentCloseDrainDelay gives fatal pre-ready CLOSE a short transport
-// drain window on transports without a half-close primitive. Without this,
-// immediate full close can race the peer's first post-preface read and drop the
-// only fatal frame establishing state is allowed to emit.
+// establishmentCloseDrainDelay gives fatal pre-ready CLOSE a short drain window.
 func establishmentCloseDrainDelay(err error) time.Duration {
 	if err == nil {
 		return 0
@@ -1542,11 +1539,7 @@ func establishmentCloseDrainDelay(err error) time.Duration {
 
 const establishmentFailureWriteWait = 250 * time.Millisecond
 
-// establishmentSuccessWriteWait bounds how long a successful handshake waits
-// for the already-started local preface write to finish after the peer preface
-// has been parsed. The preface is intentionally tiny; without a bound, a peer
-// that writes its own preface but never drains ours can stall Client/Server/New
-// indefinitely.
+// establishmentSuccessWriteWait bounds the local preface write after peer parse.
 const establishmentSuccessWriteWait = time.Second
 
 var errEstablishmentPrefaceWriteTimeout = errors.New("local preface write stalled during establishment")
@@ -2355,9 +2348,7 @@ func Server(conn io.ReadWriteCloser, cfg *Config) (*Conn, error) {
 	return establish(conn, c)
 }
 
-// connReadBufferSize bounds per-connection buffered-reader residency.
-// The frame path already allocates exact-sized frame buffers, so the reader
-// only needs enough space to amortize byte-wise varint/preface parsing.
+// connReadBufferSize amortizes byte-wise varint and preface parsing.
 const connReadBufferSize = 512
 
 func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
@@ -3137,10 +3128,7 @@ func (c *Conn) peerLimitsView() Limits {
 	return normalizeLimits(c.config.peer.Settings.Limits())
 }
 
-// bootstrapRuntimeQueuesLocked marks runtime-owned incremental queues as ready
-// on freshly established sessions. Fixture-style tests that seed slices/maps
-// directly can still rely on the zero-value lazy-sync path because they bypass
-// establish() and therefore do not call this helper.
+// bootstrapRuntimeQueuesLocked marks runtime-owned queues as ready.
 func (c *Conn) bootstrapRuntimeQueuesLocked() {
 	if c == nil {
 		return
@@ -5298,7 +5286,7 @@ func (c *Conn) failProvisionalWithSourceLocked(stream *nativeStream, err error, 
 	if err != nil {
 		if existing, ok := findError[*ApplicationError](err); ok {
 			appErr = existing
-			if _, bare := err.(*ApplicationError); !bare {
+			if !sameError(err, existing) {
 				surfaceErr = err
 			}
 		} else {

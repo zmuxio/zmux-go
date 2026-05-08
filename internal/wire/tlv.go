@@ -73,7 +73,7 @@ func tlvParseCapacityHint(srcLen int) int {
 	if srcLen <= 0 {
 		return 0
 	}
-	hint := srcLen / 2 // The smallest valid TLV is one-byte type + one-byte length.
+	hint := srcLen / 2 // Smallest TLV is type + length.
 	if hint > maxTLVParseCapacityHint {
 		return maxTLVParseCapacityHint
 	}

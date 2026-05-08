@@ -31,16 +31,10 @@ type WriteHalf interface {
 	RemoteAddr() net.Addr
 }
 
-// JoinedConn adapts an independent read half plus write half into a net.Conn.
+// JoinedConn adapts independent read and write halves into a net.Conn.
 //
-// Either half may be nil. A nil read half makes Read return ErrStreamNotReadable.
-// A nil write half makes Write return ErrStreamNotWritable.
-//
-// Directional pause operations hand ownership of the currently attached half to
-// the caller. While paused, upper-layer operations in that direction block until
-// the handle resumes or the joined-level deadline/close wakes them. Close only
-// closes halves that are still attached at the time Close runs; detached halves
-// remain caller-owned.
+// Either half may be nil. PauseRead and PauseWrite detach ownership until the
+// returned handle resumes the half.
 type JoinedConn struct {
 	mu sync.Mutex
 

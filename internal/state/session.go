@@ -2,6 +2,7 @@ package state
 
 import (
 	"io"
+	"reflect"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -112,12 +113,14 @@ func isErrorDepth(err, target error, depth int) bool {
 }
 
 func sameError(err, target error) (same bool) {
-	defer func() {
-		if recover() != nil {
-			same = false
-		}
-	}()
-	return err == target
+	if err == nil || target == nil {
+		return err == nil && target == nil
+	}
+	errValue := reflect.ValueOf(err)
+	targetValue := reflect.ValueOf(target)
+	return errValue.Type() == targetValue.Type() &&
+		errValue.Comparable() &&
+		errValue.Equal(targetValue)
 }
 
 func CanOpenLocally(state SessionState) bool {

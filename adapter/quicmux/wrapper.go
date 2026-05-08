@@ -45,9 +45,7 @@ func init() {
 	defaultAcceptedPreludeMaxConcurrentValue.Store(defaultAcceptedPreludeMaxConcurrent)
 }
 
-// DefaultAcceptedPreludeMaxConcurrent returns the package default upper bound
-// for concurrently parsing accepted QUIC stream adapter preludes when a
-// session does not override SessionOptions.AcceptedPreludeMaxConcurrent.
+// DefaultAcceptedPreludeMaxConcurrent returns the package default parse limit.
 func DefaultAcceptedPreludeMaxConcurrent() int {
 	if current := int(defaultAcceptedPreludeMaxConcurrentValue.Load()); current > 0 {
 		if current > maxAcceptedPreludeMaxConcurrent {
@@ -58,9 +56,8 @@ func DefaultAcceptedPreludeMaxConcurrent() int {
 	return 1
 }
 
-// SetDefaultAcceptedPreludeMaxConcurrent updates the package default upper
-// bound for concurrently parsing accepted QUIC stream adapter preludes. Values
-// less than or equal to zero restore the built-in default.
+// SetDefaultAcceptedPreludeMaxConcurrent updates the default parse limit.
+// Non-positive values restore the built-in default.
 func SetDefaultAcceptedPreludeMaxConcurrent(max int) {
 	if max <= 0 {
 		max = defaultAcceptedPreludeMaxConcurrent
@@ -70,8 +67,7 @@ func SetDefaultAcceptedPreludeMaxConcurrent(max int) {
 	defaultAcceptedPreludeMaxConcurrentValue.Store(int64(max))
 }
 
-// SessionOptions configures adapter-local behavior that does not exist on the
-// stable zmux Session surface itself.
+// SessionOptions configures adapter-local behavior.
 type SessionOptions struct {
 	// AcceptedPreludeReadTimeout bounds how long the adapter will wait for each
 	// accepted QUIC stream prelude before dropping that stream. Zero uses the
@@ -84,9 +80,6 @@ type SessionOptions struct {
 }
 
 // SessionConn is the quic-go connection shape required by the adapter.
-//
-// *quic.Conn satisfies this interface directly, so callers can pass accepted
-// or dialed QUIC connections to WrapSession without any extra shim.
 type SessionConn interface {
 	AcceptStream(ctx context.Context) (*quic.Stream, error)
 	AcceptUniStream(ctx context.Context) (*quic.ReceiveStream, error)
@@ -98,14 +91,12 @@ type SessionConn interface {
 	RemoteAddr() net.Addr
 }
 
-// WrapSession exposes a quic-go session / connection through the
-// repository-default zmux Session interface.
+// WrapSession exposes a quic-go connection as a zmux Session.
 func WrapSession(conn SessionConn) zmux.Session {
 	return WrapSessionWithOptions(conn, SessionOptions{})
 }
 
-// WrapSessionWithOptions exposes a quic-go session / connection through the
-// repository-default zmux Session interface with adapter-local options.
+// WrapSessionWithOptions exposes a quic-go connection as a zmux Session.
 func WrapSessionWithOptions(conn SessionConn, opts SessionOptions) zmux.Session {
 	if conn == nil {
 		return &quicSession{}
@@ -838,8 +829,7 @@ func (b *quicStreamBase) UpdateMetadata(update zmux.MetadataUpdate) error {
 	}
 	b.metaMu.Unlock()
 
-	// In the adapter, a pre-data UpdateMetadata acts as the peer-visible open
-	// advisory point. Once emitted, later updates are intentionally unsupported.
+	// Pre-data metadata is the adapter's peer-visible open advisory point.
 	if err := b.preferLocalWriteError(b.ensureOpenPrelude()); err != nil {
 		if quicAdapterTerminalError(err) {
 			b.markLocalWriteClosed(err)

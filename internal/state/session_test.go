@@ -64,7 +64,7 @@ func TestSessionErrorHelpersHandleCyclicUnwrap(t *testing.T) {
 	if got := CloseSessionState(SessionStateReady, cyclic, closedSentinel); got != SessionStateFailed {
 		t.Fatalf("CloseSessionState(cyclic) = %v, want %v", got, SessionStateFailed)
 	}
-	if got := VisibleSessionError(SessionStateReady, cyclic, closedSentinel); got != cyclic {
+	if got := VisibleSessionError(SessionStateReady, cyclic, closedSentinel); !sameError(got, cyclic) {
 		t.Fatalf("VisibleSessionError(cyclic) = %v, want original cyclic error", got)
 	}
 	if !IgnorePeerClose(cyclic, false, closedSentinel) {

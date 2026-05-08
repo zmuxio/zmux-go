@@ -152,10 +152,8 @@ type Negotiated = wire.Negotiated
 
 // Config controls session establishment and runtime behavior.
 //
-// Prefer starting from DefaultConfig(). The zero value is not the repository
-// default configuration because Role zero is RoleInitiator and the repository
-// defaults also enable low-frequency idle keepalive probing plus a slower RTT
-// sampling cap.
+// Prefer starting from DefaultConfig(). The zero value is not the default:
+// Role zero is RoleInitiator, and defaults also enable padding and keepalive.
 type Config struct {
 	Role            Role
 	TieBreakerNonce uint64
@@ -164,173 +162,127 @@ type Config struct {
 	Capabilities    Capabilities
 	Settings        Settings
 	NonceSource     io.Reader
-	// PrefacePadding appends one random ignored setting TLV to the local
-	// establishment preface to vary its encoded length. It does not change
-	// negotiated settings and is intended for transports that already provide
-	// confidentiality, such as TLS, but still expose record-size patterns.
+	// PrefacePadding adds one ignored settings TLV to the local preface.
 	PrefacePadding bool
-	// PrefacePaddingMinBytes bounds the lower end of the random padding value
-	// length when PrefacePadding is enabled. Zero uses the repository default.
+	// PrefacePaddingMinBytes is the lower padding length bound. Zero uses the default.
 	PrefacePaddingMinBytes uint64
-	// PrefacePaddingMaxBytes bounds the upper end of the random padding value
-	// length when PrefacePadding is enabled. Zero uses the repository default;
-	// values above MaxPrefaceSettingsBytes are clamped to the remaining settings
-	// TLV budget. If the effective minimum exceeds the effective maximum, the
-	// runtime uses the maximum.
+	// PrefacePaddingMaxBytes is the upper padding length bound. Zero uses the default.
 	PrefacePaddingMaxBytes uint64
-	// KeepaliveInterval bounds how long inbound or outbound transport activity
-	// may stay idle before the runtime probes with PING. Zero disables automatic
-	// keepalive entirely, including KeepaliveMaxPingInterval.
+	// KeepaliveInterval bounds idle time before an automatic PING.
+	// Zero disables automatic keepalive.
 	KeepaliveInterval time.Duration
-	// KeepaliveMaxPingInterval bounds how long the runtime may go without
-	// sending any local PING while keepalive is enabled. It is useful for
-	// occasional RTT sampling even on continuously busy sessions. Zero disables
-	// this extra cap and relies only on directional idle probing.
+	// KeepaliveMaxPingInterval bounds time between local PINGs while keepalive is enabled.
+	// Zero disables this extra cap.
 	KeepaliveMaxPingInterval time.Duration
-	// KeepaliveTimeout bounds how long an outstanding keepalive ping may remain
-	// unanswered before the session is aborted. When left at zero, the runtime
-	// derives an adaptive default from the keepalive interval and observed RTT
-	// within bounded caps so very high latency links remain usable.
+	// KeepaliveTimeout bounds how long a keepalive PING may remain unanswered.
+	// Zero uses an adaptive default.
 	KeepaliveTimeout time.Duration
-	// PingPadding adds an 8-byte padding tag plus random opaque bytes to local
-	// PING frames, and appends random opaque bytes to recognized PONG replies
-	// to vary liveness frame lengths. It also advertises a per-session
-	// PingPaddingKey in the local preface. It does not change Ping(ctx, echo)
-	// API behavior.
+	// PingPadding pads local PINGs and recognized PONG replies.
+	// It also advertises a per-session PingPaddingKey.
 	PingPadding bool
-	// PingPaddingMinBytes bounds the lower end of the extra PING payload bytes
-	// and PONG suffix bytes when PingPadding is enabled. For PING, this total
-	// includes the fixed 8-byte tag. Zero uses the repository default.
+	// PingPaddingMinBytes is the lower PING/PONG padding bound.
+	// For PING, it includes the fixed 8-byte tag. Zero uses the default.
 	PingPaddingMinBytes uint64
-	// PingPaddingMaxBytes bounds the upper end of the extra PING payload bytes
-	// and PONG suffix bytes when PingPadding is enabled. For PING, this total
-	// includes the fixed 8-byte tag. Zero uses the repository default; values
-	// above the negotiated control payload limit are clamped. If the effective
-	// minimum exceeds the effective maximum, the runtime uses the maximum.
+	// PingPaddingMaxBytes is the upper PING/PONG padding bound.
+	// For PING, it includes the fixed 8-byte tag. Zero uses the default.
 	PingPaddingMaxBytes uint64
 
-	// SessionMemoryCap overrides the repository-default tracked-session-memory
-	// hard cap. Zero uses the repository default.
+	// SessionMemoryCap overrides the tracked-session-memory cap. Zero uses the default.
 	SessionMemoryCap uint64
-	// PerStreamQueuedDataHWM overrides the repository-default per-stream
-	// ordinary queued-data high watermark. Zero uses the repository default.
+	// PerStreamQueuedDataHWM overrides the per-stream queued-data high watermark.
+	// Zero uses the default.
 	PerStreamQueuedDataHWM uint64
-	// SessionQueuedDataHWM overrides the repository-default session-wide
-	// ordinary queued-data high watermark. Zero uses the repository default.
+	// SessionQueuedDataHWM overrides the session-wide queued-data high watermark.
+	// Zero uses the default.
 	SessionQueuedDataHWM uint64
-	// UrgentQueuedBytesCap overrides the repository-default urgent/control lane
-	// hard cap. Zero uses the repository default.
+	// UrgentQueuedBytesCap overrides the urgent/control lane cap. Zero uses the default.
 	UrgentQueuedBytesCap uint64
-	// PendingControlBytesBudget overrides the repository-default coalesced
-	// pending control-plane byte budget. Zero uses the repository default.
+	// PendingControlBytesBudget overrides the coalesced control byte budget.
+	// Zero uses the default.
 	PendingControlBytesBudget uint64
-	// PendingPriorityBytesBudget overrides the repository-default coalesced
-	// pending advisory byte budget. Zero uses the repository default.
+	// PendingPriorityBytesBudget overrides the coalesced advisory byte budget.
+	// Zero uses the default.
 	PendingPriorityBytesBudget uint64
-	// RetainedOpenInfoBytesBudget overrides the repository-default retained
-	// open_info byte budget. Zero uses the repository default.
+	// RetainedOpenInfoBytesBudget overrides the retained open_info byte budget.
+	// Zero uses the default.
 	RetainedOpenInfoBytesBudget uint64
-	// RetainedPeerReasonBytesBudget overrides the repository-default retained
-	// peer reason-text byte budget. Zero uses the repository default.
+	// RetainedPeerReasonBytesBudget overrides the retained peer reason-text byte budget.
+	// Zero uses the default.
 	RetainedPeerReasonBytesBudget uint64
-	// AggregateLateDataCap overrides the repository-default aggregate late-data
-	// accounting cap. Zero uses the repository default.
+	// AggregateLateDataCap overrides aggregate late-data accounting. Zero uses the default.
 	AggregateLateDataCap uint64
-	// AcceptBacklogLimit overrides the repository-default visible accept backlog
-	// count cap. Zero uses the repository default.
+	// AcceptBacklogLimit overrides the visible accept backlog count. Zero uses the default.
 	AcceptBacklogLimit int
-	// AcceptBacklogBytesLimit overrides the repository-default visible accept
-	// backlog byte cap. Zero uses the repository default.
+	// AcceptBacklogBytesLimit overrides visible accept backlog bytes. Zero uses the default.
 	AcceptBacklogBytesLimit uint64
-	// TombstoneLimit overrides the repository-default retained tombstone count
-	// limit. Zero uses the repository default.
+	// TombstoneLimit overrides the retained tombstone count. Zero uses the default.
 	TombstoneLimit int
-	// MarkerOnlyUsedStreamLimit overrides the repository-default maximum count
-	// of retained marker-only used-stream entries after tombstones have been
-	// compacted or reaped. Zero uses the repository-default derived cap.
+	// MarkerOnlyUsedStreamLimit overrides retained marker-only used-stream entries.
+	// Zero uses the derived default.
 	MarkerOnlyUsedStreamLimit int
-	// AbuseWindow overrides the repository-default local anti-abuse accounting
-	// window. Zero uses the repository default.
+	// AbuseWindow overrides the local anti-abuse accounting window. Zero uses the default.
 	AbuseWindow time.Duration
-	// HiddenAbortChurnWindow overrides the repository-default hidden abort churn
-	// detection window. Zero uses the repository default.
+	// HiddenAbortChurnWindow overrides hidden abort churn detection. Zero uses the default.
 	HiddenAbortChurnWindow time.Duration
-	// HiddenAbortChurnThreshold overrides the repository-default hidden
-	// open-then-abort churn threshold. Zero uses the repository default.
+	// HiddenAbortChurnThreshold overrides hidden open-then-abort churn. Zero uses the default.
 	HiddenAbortChurnThreshold uint32
-	// VisibleTerminalChurnWindow overrides the repository-default visible churn
-	// detection window. Zero uses the repository default.
+	// VisibleTerminalChurnWindow overrides visible terminal churn detection.
+	// Zero uses the default.
 	VisibleTerminalChurnWindow time.Duration
-	// VisibleTerminalChurnThreshold overrides the repository-default visible
-	// open-then-reset/abort churn threshold. Zero uses the repository default.
+	// VisibleTerminalChurnThreshold overrides visible open-then-reset/abort churn.
+	// Zero uses the default.
 	VisibleTerminalChurnThreshold uint32
-	// InboundControlFrameBudget overrides the repository-default inbound
-	// control-frame rolling window budget. Zero uses the repository default.
+	// InboundControlFrameBudget overrides the inbound control-frame window.
+	// Zero uses the default.
 	InboundControlFrameBudget uint32
-	// InboundControlBytesBudget overrides the repository-default inbound
-	// control-byte rolling window budget. Zero uses the repository default.
+	// InboundControlBytesBudget overrides the inbound control-byte window.
+	// Zero uses the default.
 	InboundControlBytesBudget uint64
-	// InboundExtFrameBudget overrides the repository-default inbound EXT-frame
-	// rolling window budget. Zero uses the repository default.
+	// InboundExtFrameBudget overrides the inbound EXT-frame window. Zero uses the default.
 	InboundExtFrameBudget uint32
-	// InboundExtBytesBudget overrides the repository-default inbound EXT-byte
-	// rolling window budget. Zero uses the repository default.
+	// InboundExtBytesBudget overrides the inbound EXT-byte window. Zero uses the default.
 	InboundExtBytesBudget uint64
-	// InboundMixedFrameBudget overrides the repository-default mixed
-	// control/EXT frame rolling window budget. Zero uses the repository default.
+	// InboundMixedFrameBudget overrides the mixed control/EXT frame window.
+	// Zero uses the default.
 	InboundMixedFrameBudget uint32
-	// InboundMixedBytesBudget overrides the repository-default mixed
-	// control/EXT byte rolling window budget. Zero uses the repository default.
+	// InboundMixedBytesBudget overrides the mixed control/EXT byte window.
+	// Zero uses the default.
 	InboundMixedBytesBudget uint64
-	// NoOpControlFloodThreshold overrides the repository-default mixed no-op
-	// control threshold. Zero uses the repository default.
+	// NoOpControlFloodThreshold overrides the mixed no-op control threshold.
+	// Zero uses the default.
 	NoOpControlFloodThreshold uint32
-	// NoOpMaxDataFloodThreshold overrides the repository-default no-op MAX_DATA
-	// threshold. Zero uses the repository default.
+	// NoOpMaxDataFloodThreshold overrides the no-op MAX_DATA threshold.
+	// Zero uses the default.
 	NoOpMaxDataFloodThreshold uint32
-	// NoOpBlockedFloodThreshold overrides the repository-default no-op BLOCKED
-	// threshold. Zero uses the repository default.
+	// NoOpBlockedFloodThreshold overrides the no-op BLOCKED threshold. Zero uses the default.
 	NoOpBlockedFloodThreshold uint32
-	// NoOpZeroDataFloodThreshold overrides the repository-default zero-length
-	// DATA threshold. Zero uses the repository default.
+	// NoOpZeroDataFloodThreshold overrides the zero-length DATA threshold.
+	// Zero uses the default.
 	NoOpZeroDataFloodThreshold uint32
-	// NoOpPriorityUpdateFloodThreshold overrides the repository-default no-op
-	// PRIORITY_UPDATE threshold. Zero uses the repository default.
+	// NoOpPriorityUpdateFloodThreshold overrides the no-op PRIORITY_UPDATE threshold.
+	// Zero uses the default.
 	NoOpPriorityUpdateFloodThreshold uint32
-	// GroupRebucketChurnThreshold overrides the repository-default repeated
-	// effective stream_group rebucketing threshold within the local
-	// anti-abuse window when the negotiated scheduler baseline is group_fair.
-	// Zero uses the repository default.
+	// GroupRebucketChurnThreshold overrides repeated stream_group rebucketing.
+	// Zero uses the default.
 	GroupRebucketChurnThreshold uint32
-	// InboundPingFloodThreshold overrides the repository-default inbound PING
-	// flood threshold. Zero uses the repository default.
+	// InboundPingFloodThreshold overrides the inbound PING flood threshold.
+	// Zero uses the default.
 	InboundPingFloodThreshold uint32
-	// StopSendingGracefulDrainWindow overrides the repository-default bounded
-	// graceful-drain admission window used after peer STOP_SENDING before
-	// falling back to RESET(CANCELLED). Zero uses the repository default. When
-	// left unset, the runtime may widen the effective window from observed RTT
-	// within bounded caps so high latency links do not spuriously reset streams.
+	// StopSendingGracefulDrainWindow bounds graceful drain after peer STOP_SENDING.
+	// Zero uses the default.
 	StopSendingGracefulDrainWindow time.Duration
-	// StopSendingGracefulTailCap overrides the repository-default maximum
-	// unavoidable tail, in bytes, that may still converge via DATA|FIN after
-	// peer STOP_SENDING. Zero uses the repository default.
+	// StopSendingGracefulTailCap bounds DATA|FIN tail after peer STOP_SENDING.
+	// Zero uses the default.
 	StopSendingGracefulTailCap uint64
-	// GracefulCloseDrainTimeout overrides the repository-default bounded
-	// graceful-close drain wait before Close reports timeout to the caller.
-	// This bounds how long Close will keep waiting for already-visible local
-	// streams and provisionals to converge after GOAWAY, so it should usually be
-	// tuned from application shutdown behavior rather than raw RTT alone. Zero
-	// uses the repository default; when left unset, the runtime may widen the
-	// effective wait from observed RTT within bounded caps while keeping the
-	// default tuned for ordinary moderate-latency links.
+	// GracefulCloseDrainTimeout bounds Close waiting for graceful drain.
+	// Zero uses the default.
 	GracefulCloseDrainTimeout time.Duration
 
 	// EventHandler receives lightweight connection/stream lifecycle notifications.
 	EventHandler EventHandler
 }
 
-// OpenOptions carries optional repository-default open-time inputs for a new
-// stream.
+// OpenOptions carries optional open-time inputs for a new stream.
 //
 // InitialPriority and InitialGroup may remain local sender-policy hints when
 // the corresponding peer-visible carriage is unavailable. OpenInfo is
@@ -364,6 +316,8 @@ func builtinDefaultConfig() Config {
 		Capabilities:             0,
 		Settings:                 DefaultSettings(),
 		NonceSource:              rand.Reader,
+		PrefacePadding:           true,
+		PingPadding:              true,
 		KeepaliveInterval:        defaultIdleKeepaliveInterval,
 		KeepaliveMaxPingInterval: defaultKeepaliveMaxPingInterval,
 	}
@@ -382,8 +336,7 @@ func DefaultConfig() *Config {
 // template used by DefaultConfig and by constructors called with nil Config.
 //
 // Call it during process initialization before creating sessions. Existing
-// sessions are not affected. Concurrent calls are race-safe, but the last
-// completed update wins rather than merging independent edits.
+// sessions are not affected. Concurrent calls are race-safe; last write wins.
 //
 // Per-session random fields are not retained in the template: TieBreakerNonce
 // and Settings.PingPaddingKey are cleared after fn returns so each session can

@@ -12312,9 +12312,7 @@ func TestRetainPeerReasonBudgetFullBranchWakesWriteWaitersWhenBytesAreReleased(t
 func refreshProvisionalCreated(t *testing.T, streams ...NativeStream) {
 	t.Helper()
 
-	// Add a small forward skew so broader package load does not accidentally
-	// consume the real repository-default provisional max-age before the action
-	// under test gets CPU time.
+	// Skew forward so the action under test does not hit real provisional expiry.
 	now := time.Now().Add(testSignalTimeout)
 	for _, native := range streams {
 		stream := requireNativeStreamImpl(t, native)

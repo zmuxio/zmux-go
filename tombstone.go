@@ -34,8 +34,7 @@ type terminalDataDisposition struct {
 const maxTombstones = 4096
 
 const (
-	// Repository-default v1 hidden control-opened retention is currently realized
-	// as hidden terminal tombstones from ABORT-first peer streams.
+	// Hidden control-opened streams retain ABORT-first tombstones.
 	hiddenControlRetainedHardCap = state.DefaultAdmissionHardCap
 	hiddenControlRetainedMaxAge  = time.Second
 )

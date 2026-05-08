@@ -15,8 +15,7 @@ const defaultTimeout = 5 * time.Second
 
 type SessionPairFactory func(t *testing.T) (zmux.Session, zmux.Session)
 
-// RunSessionContract executes the repository-default adapter contract against
-// fresh connected session pairs supplied by pairFactory.
+// RunSessionContract executes the adapter contract against fresh session pairs.
 func RunSessionContract(t *testing.T, pairFactory SessionPairFactory) {
 	t.Helper()
 

@@ -2,7 +2,8 @@
 
 `quicmux` wraps `quic-go` connections behind the stable `zmux.Session` API.
 
-It is an adapter. It does not implement zmux-native `NativeSession` or native stream interfaces.
+It is an adapter. It implements the stable surfaces, not native zmux interfaces such as
+`NativeSession`.
 
 ## Usage
 
@@ -46,8 +47,8 @@ quicmux.SetDefaultAcceptedPreludeMaxConcurrent(2)
 
 ## Stable API Coverage
 
-The wrapper returns the stable `zmux.Session` surface, so callers use the same methods as other adapters or native
-`AsSession(...)` values:
+The wrapper returns the stable `zmux.Session` surface, so callers use the same methods as other
+adapters or native `AsSession(...)` values:
 
 - `AcceptStream` / `AcceptUniStream`
 - `OpenStream` / `OpenUniStream`
@@ -68,9 +69,8 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
 
 - `AcceptStream` / `OpenStream` map to QUIC bidirectional streams
 - `AcceptUniStream` / `OpenUniStream` map to QUIC unidirectional streams
-- accepted-stream prelude parsing runs in the background, so later ready streams can be accepted before stalled or
-  invalid
-  adapter preludes time out
+- accepted-stream prelude parsing runs in the background, so later ready streams can be accepted
+  before stalled or invalid adapter preludes time out
 - `CloseRead` maps to QUIC `CancelRead(CANCELLED)`
 - `CancelRead(code)` maps to QUIC `CancelRead(code)`
 - ordinary zero-length `Write` is a local no-op: it does not submit the
@@ -81,8 +81,8 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
   accept the adapter stream before observing read-side cancellation
 - `CloseWrite` maps to QUIC send-side `Close`
 - `CancelWrite(code)` maps to QUIC `CancelWrite(code)`
-- `CloseWithError(code, reason)` is best-effort: bidirectional streams cancel both local directions; unidirectional
-  streams cancel only the locally meaningful direction QUIC exposes
+- `CloseWithError(code, reason)` is best-effort: bidirectional streams cancel both local directions;
+  unidirectional streams cancel only the locally meaningful direction QUIC exposes
 - fresh write-side reset / abort visibility is intentionally not a portable
   adapter guarantee because QUIC `RESET_STREAM` can discard earlier
   unacknowledged stream data, including a just-written prelude
@@ -100,26 +100,26 @@ Wrapped streams expose the stable `zmux.Stream`, `zmux.SendStream`, and `zmux.Re
 - fresh locally opened streams submit the prelude before read-side terminal
   control, including `CloseRead` / `CancelRead` before any application payload
 
-Once the prelude is emitted, further metadata updates are not representable on the QUIC wire. The adapter returns
-`errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.
+Once the prelude is emitted, further metadata updates are not representable on the QUIC wire. The
+adapter returns `errors.Join(zmux.ErrAdapterUnsupported, zmux.ErrPriorityUpdateUnavailable)`.
 
 ## Errors
 
 - QUIC stream and connection application errors are normalized to `*zmux.ApplicationError`
 - QUIC stream-limit errors are normalized to `zmux.ErrOpenLimited`
-- QUIC idle, stateless-reset, version-negotiation, and local no-error close conditions are normalized to
-  `zmux.ErrSessionClosed`
+- QUIC idle, stateless-reset, version-negotiation, and local no-error close conditions are
+  normalized to `zmux.ErrSessionClosed`
 - connection-level QUIC closes preserve code and reason text
 - stream-level QUIC cancellations preserve only the numeric application code
 
-## Unsupported Or Reduced Behavior
+## Unsupported or Reduced Behavior
 
 - native zmux session helpers such as `Ping`, `GoAway`, `PeerGoAwayError`, `PeerCloseError`, `LocalPreface`,
   `PeerPreface`, and `Negotiated`
 - native stream queries such as `OpenedLocally`, `Bidirectional`, `ReadClosed`, and `WriteClosed`
 - post-open native advisory frames such as `PRIORITY_UPDATE`
-- detailed runtime counters in `Stats()`: the adapter only reports coarse session state because `quic-go` does not
-  expose matching mux internals
+- detailed runtime counters in `Stats()`: the adapter only reports coarse session state because
+  `quic-go` does not expose matching mux internals
 
 ## Non-goals
 
