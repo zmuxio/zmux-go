@@ -65,17 +65,19 @@ type JoinedConn struct {
 
 // PausedReadHalf owns a detached read half until Resume reattaches it.
 type PausedReadHalf struct {
-	mu      sync.Mutex
-	conn    *JoinedConn
-	current ReadHalf
-	resumed bool
+	handle joinedPausedHalf
 }
 
 // PausedWriteHalf owns a detached write half until Resume reattaches it.
 type PausedWriteHalf struct {
+	handle joinedPausedHalf
+}
+
+type joinedPausedHalf struct {
 	mu      sync.Mutex
 	conn    *JoinedConn
-	current WriteHalf
+	current any
+	side    joinedHalfSide
 	resumed bool
 }
 
@@ -224,42 +226,218 @@ func (c *JoinedConn) endWriteWaitLocked() {
 	}
 }
 
-func (c *JoinedConn) Read(p []byte) (int, error) {
-	if c == nil {
-		return 0, ErrSessionClosed
-	}
-	readHalf, err := c.enterRead()
-	if err != nil {
-		return 0, err
-	}
-	defer c.leaveRead()
+type joinedHalfSide uint8
 
-	if readHalf == nil {
-		return 0, ErrStreamNotReadable
+const (
+	joinedReadSide joinedHalfSide = iota
+	joinedWriteSide
+)
+
+func (side joinedHalfSide) beginWaitLocked(c *JoinedConn) (<-chan struct{}, <-chan struct{}, time.Time) {
+	if side == joinedReadSide {
+		return c.beginReadWaitLocked()
 	}
-	n, err := readHalf.Read(p)
-	if n < 0 || n > len(p) {
-		return 0, io.ErrShortBuffer
+	return c.beginWriteWaitLocked()
+}
+
+func (side joinedHalfSide) endWaitLocked(c *JoinedConn) {
+	if side == joinedReadSide {
+		c.endReadWaitLocked()
+		return
 	}
-	return n, err
+	c.endWriteWaitLocked()
+}
+
+func (side joinedHalfSide) broadcastLocked(c *JoinedConn) {
+	if side == joinedReadSide {
+		c.broadcastReadLocked()
+		return
+	}
+	c.broadcastWriteLocked()
+}
+
+func (side joinedHalfSide) halfLocked(c *JoinedConn) any {
+	if side == joinedReadSide {
+		return c.readHalf
+	}
+	return c.writeHalf
+}
+
+func (side joinedHalfSide) setHalfLocked(c *JoinedConn, half any) {
+	if side == joinedReadSide {
+		if half == nil {
+			c.readHalf = nil
+			return
+		}
+		c.readHalf = half.(ReadHalf)
+		return
+	}
+	if half == nil {
+		c.writeHalf = nil
+		return
+	}
+	c.writeHalf = half.(WriteHalf)
+}
+
+func (side joinedHalfSide) pausedLocked(c *JoinedConn) bool {
+	if side == joinedReadSide {
+		return c.readPaused
+	}
+	return c.writePaused
+}
+
+func (side joinedHalfSide) setPausedLocked(c *JoinedConn, paused bool) {
+	if side == joinedReadSide {
+		c.readPaused = paused
+		return
+	}
+	c.writePaused = paused
+}
+
+func (side joinedHalfSide) activeOpsLocked(c *JoinedConn) int {
+	if side == joinedReadSide {
+		return c.activeReadOps
+	}
+	return c.activeWriteOps
+}
+
+func (side joinedHalfSide) addActiveOpLocked(c *JoinedConn) {
+	if side == joinedReadSide {
+		c.activeReadOps++
+		return
+	}
+	c.activeWriteOps++
+}
+
+func (side joinedHalfSide) doneActiveOpLocked(c *JoinedConn) {
+	if side == joinedReadSide {
+		if c.activeReadOps > 0 {
+			c.activeReadOps--
+		}
+		return
+	}
+	if c.activeWriteOps > 0 {
+		c.activeWriteOps--
+	}
+}
+
+func (side joinedHalfSide) activeDeadlineOpsLocked(c *JoinedConn) int {
+	if side == joinedReadSide {
+		return c.activeReadDeadlineOps
+	}
+	return c.activeWriteDeadlineOps
+}
+
+func (side joinedHalfSide) addActiveDeadlineOpLocked(c *JoinedConn) {
+	if side == joinedReadSide {
+		c.activeReadDeadlineOps++
+		return
+	}
+	c.activeWriteDeadlineOps++
+}
+
+func (side joinedHalfSide) doneActiveDeadlineOpLocked(c *JoinedConn) {
+	if side == joinedReadSide {
+		if c.activeReadDeadlineOps > 0 {
+			c.activeReadDeadlineOps--
+		}
+		return
+	}
+	if c.activeWriteDeadlineOps > 0 {
+		c.activeWriteDeadlineOps--
+	}
+}
+
+func (side joinedHalfSide) deadlineLocked(c *JoinedConn) time.Time {
+	if side == joinedReadSide {
+		return c.readDeadline
+	}
+	return c.writeDeadline
+}
+
+func (side joinedHalfSide) deadlineGenLocked(c *JoinedConn) uint64 {
+	if side == joinedReadSide {
+		return c.readDeadlineGen
+	}
+	return c.writeDeadlineGen
+}
+
+func (side joinedHalfSide) setDeadlineLocked(c *JoinedConn, t time.Time) {
+	if side == joinedReadSide {
+		c.readDeadline = t
+		return
+	}
+	c.writeDeadline = t
+}
+
+func (side joinedHalfSide) bumpDeadlineGenLocked(c *JoinedConn) uint64 {
+	if side == joinedReadSide {
+		c.readDeadlineGen++
+		return c.readDeadlineGen
+	}
+	c.writeDeadlineGen++
+	return c.writeDeadlineGen
+}
+
+func (side joinedHalfSide) applyDeadline(half any, t time.Time) error {
+	if side == joinedReadSide {
+		return half.(ReadHalf).SetReadDeadline(t)
+	}
+	return half.(WriteHalf).SetWriteDeadline(t)
+}
+
+func (side joinedHalfSide) missingHalfErr() error {
+	if side == joinedReadSide {
+		return ErrStreamNotReadable
+	}
+	return ErrStreamNotWritable
+}
+
+func (side joinedHalfSide) invalidProgressErr() error {
+	if side == joinedReadSide {
+		return io.ErrShortBuffer
+	}
+	return io.ErrShortWrite
+}
+
+func (side joinedHalfSide) transfer(half any, p []byte) (int, error) {
+	if side == joinedReadSide {
+		return half.(ReadHalf).Read(p)
+	}
+	return half.(WriteHalf).Write(p)
+}
+
+func (side joinedHalfSide) close(half any) error {
+	if side == joinedReadSide {
+		return half.(ReadHalf).CloseRead()
+	}
+	return half.(WriteHalf).CloseWrite()
+}
+
+func (c *JoinedConn) Read(p []byte) (int, error) {
+	return c.transferHalf(joinedReadSide, p)
 }
 
 func (c *JoinedConn) Write(p []byte) (int, error) {
+	return c.transferHalf(joinedWriteSide, p)
+}
+
+func (c *JoinedConn) transferHalf(side joinedHalfSide, p []byte) (int, error) {
 	if c == nil {
 		return 0, ErrSessionClosed
 	}
-	writeHalf, err := c.enterWrite()
+	half, err := c.enterHalf(side)
 	if err != nil {
 		return 0, err
 	}
-	defer c.leaveWrite()
+	defer c.leaveHalf(side)
 
-	if writeHalf == nil {
-		return 0, ErrStreamNotWritable
+	if half == nil {
+		return 0, side.missingHalfErr()
 	}
-	n, err := writeHalf.Write(p)
+	n, err := side.transfer(half, p)
 	if n < 0 || n > len(p) {
-		return 0, io.ErrShortWrite
+		return 0, side.invalidProgressErr()
 	}
 	return n, err
 }
@@ -267,45 +445,33 @@ func (c *JoinedConn) Write(p []byte) (int, error) {
 // CloseRead closes the currently attached read half. If no read half is
 // attached, CloseRead is a no-op.
 func (c *JoinedConn) CloseRead() error {
-	if c == nil {
-		return ErrSessionClosed
-	}
-
-	readHalf, err := c.enterRead()
-	if err != nil {
-		if errors.Is(err, ErrSessionClosed) {
-			return nil
-		}
-		return err
-	}
-	defer c.leaveRead()
-
-	if readHalf == nil {
-		return nil
-	}
-	return readHalf.CloseRead()
+	return c.closeHalf(joinedReadSide)
 }
 
 // CloseWrite closes the currently attached write half. If no write half is
 // attached, CloseWrite is a no-op.
 func (c *JoinedConn) CloseWrite() error {
+	return c.closeHalf(joinedWriteSide)
+}
+
+func (c *JoinedConn) closeHalf(side joinedHalfSide) error {
 	if c == nil {
 		return ErrSessionClosed
 	}
 
-	writeHalf, err := c.enterWrite()
+	half, err := c.enterHalf(side)
 	if err != nil {
 		if errors.Is(err, ErrSessionClosed) {
 			return nil
 		}
 		return err
 	}
-	defer c.leaveWrite()
+	defer c.leaveHalf(side)
 
-	if writeHalf == nil {
+	if half == nil {
 		return nil
 	}
-	return writeHalf.CloseWrite()
+	return side.close(half)
 }
 
 // Close closes the currently attached halves and wakes all blocked operations.
@@ -365,45 +531,14 @@ func (c *JoinedConn) SetDeadline(t time.Time) error {
 }
 
 func (c *JoinedConn) SetReadDeadline(t time.Time) error {
-	if c == nil {
-		return ErrSessionClosed
-	}
-
-	c.mu.Lock()
-	c.initLocked()
-	if c.closed {
-		c.mu.Unlock()
-		return ErrSessionClosed
-	}
-	prevDeadline := c.readDeadline
-	c.readDeadline = t
-	c.readDeadlineGen++
-	deadlineGen := c.readDeadlineGen
-	readHalf := c.readHalf
-	if readHalf != nil {
-		c.activeReadDeadlineOps++
-	}
-	c.broadcastReadLocked()
-	c.mu.Unlock()
-
-	if readHalf == nil {
-		return nil
-	}
-	err := readHalf.SetReadDeadline(t)
-	c.mu.Lock()
-	if c.activeReadDeadlineOps > 0 {
-		c.activeReadDeadlineOps--
-	}
-	if err != nil && c.readDeadlineGen == deadlineGen {
-		c.readDeadline = prevDeadline
-		c.readDeadlineGen++
-	}
-	c.broadcastReadLocked()
-	c.mu.Unlock()
-	return err
+	return c.setHalfDeadline(joinedReadSide, t)
 }
 
 func (c *JoinedConn) SetWriteDeadline(t time.Time) error {
+	return c.setHalfDeadline(joinedWriteSide, t)
+}
+
+func (c *JoinedConn) setHalfDeadline(side joinedHalfSide, t time.Time) error {
 	if c == nil {
 		return ErrSessionClosed
 	}
@@ -414,30 +549,27 @@ func (c *JoinedConn) SetWriteDeadline(t time.Time) error {
 		c.mu.Unlock()
 		return ErrSessionClosed
 	}
-	prevDeadline := c.writeDeadline
-	c.writeDeadline = t
-	c.writeDeadlineGen++
-	deadlineGen := c.writeDeadlineGen
-	writeHalf := c.writeHalf
-	if writeHalf != nil {
-		c.activeWriteDeadlineOps++
+	prevDeadline := side.deadlineLocked(c)
+	side.setDeadlineLocked(c, t)
+	deadlineGen := side.bumpDeadlineGenLocked(c)
+	half := side.halfLocked(c)
+	if half != nil {
+		side.addActiveDeadlineOpLocked(c)
 	}
-	c.broadcastWriteLocked()
+	side.broadcastLocked(c)
 	c.mu.Unlock()
 
-	if writeHalf == nil {
+	if half == nil {
 		return nil
 	}
-	err := writeHalf.SetWriteDeadline(t)
+	err := side.applyDeadline(half, t)
 	c.mu.Lock()
-	if c.activeWriteDeadlineOps > 0 {
-		c.activeWriteDeadlineOps--
+	side.doneActiveDeadlineOpLocked(c)
+	if err != nil && side.deadlineGenLocked(c) == deadlineGen {
+		side.setDeadlineLocked(c, prevDeadline)
+		side.bumpDeadlineGenLocked(c)
 	}
-	if err != nil && c.writeDeadlineGen == deadlineGen {
-		c.writeDeadline = prevDeadline
-		c.writeDeadlineGen++
-	}
-	c.broadcastWriteLocked()
+	side.broadcastLocked(c)
 	c.mu.Unlock()
 	return err
 }
@@ -498,7 +630,9 @@ func (c *JoinedConn) PauseRead(ctx context.Context) (*PausedReadHalf, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PausedReadHalf{conn: c, current: current}, nil
+	return &PausedReadHalf{
+		handle: joinedPausedHalf{conn: c, current: current, side: joinedReadSide},
+	}, nil
 }
 
 // PauseWrite waits for the write side to become quiescent, detaches the
@@ -513,7 +647,9 @@ func (c *JoinedConn) PauseWrite(ctx context.Context) (*PausedWriteHalf, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PausedWriteHalf{conn: c, current: current}, nil
+	return &PausedWriteHalf{
+		handle: joinedPausedHalf{conn: c, current: current, side: joinedWriteSide},
+	}, nil
 }
 
 // Current returns the read half currently owned by the pause handle.
@@ -521,9 +657,11 @@ func (p *PausedReadHalf) Current() ReadHalf {
 	if p == nil {
 		return nil
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.current
+	current := p.handle.currentHalf()
+	if current == nil {
+		return nil
+	}
+	return current.(ReadHalf)
 }
 
 // Set stages next as the read half to attach on Resume and returns the
@@ -532,57 +670,19 @@ func (p *PausedReadHalf) Set(next ReadHalf) ReadHalf {
 	if p == nil {
 		return nil
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	prev := p.current
-	p.current = next
-	return prev
+	prev := p.handle.setHalf(next)
+	if prev == nil {
+		return nil
+	}
+	return prev.(ReadHalf)
 }
 
 // Resume reattaches the staged read half and re-enables upper-layer reads.
 func (p *PausedReadHalf) Resume() error {
-	if p == nil || p.conn == nil {
+	if p == nil {
 		return ErrSessionClosed
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.resumed {
-		return nil
-	}
-
-	current := p.current
-	for {
-		p.conn.mu.Lock()
-		if p.conn.closed {
-			p.conn.mu.Unlock()
-			p.resumed = true
-			return ErrSessionClosed
-		}
-		deadline := p.conn.readDeadline
-		gen := p.conn.readDeadlineGen
-		p.conn.mu.Unlock()
-		if current != nil {
-			if err := current.SetReadDeadline(deadline); err != nil {
-				return err
-			}
-		}
-		p.conn.mu.Lock()
-		if p.conn.closed {
-			p.conn.mu.Unlock()
-			p.resumed = true
-			return ErrSessionClosed
-		}
-		if current != nil && p.conn.readDeadlineGen != gen {
-			p.conn.mu.Unlock()
-			continue
-		}
-		p.conn.readHalf = current
-		p.conn.readPaused = false
-		p.conn.broadcastReadLocked()
-		p.conn.mu.Unlock()
-		p.resumed = true
-		return nil
-	}
+	return resumePausedHalf(&p.handle)
 }
 
 // Current returns the write half currently owned by the pause handle.
@@ -590,9 +690,11 @@ func (p *PausedWriteHalf) Current() WriteHalf {
 	if p == nil {
 		return nil
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.current
+	current := p.handle.currentHalf()
+	if current == nil {
+		return nil
+	}
+	return current.(WriteHalf)
 }
 
 // Set stages next as the write half to attach on Resume and returns the
@@ -601,6 +703,34 @@ func (p *PausedWriteHalf) Set(next WriteHalf) WriteHalf {
 	if p == nil {
 		return nil
 	}
+	prev := p.handle.setHalf(next)
+	if prev == nil {
+		return nil
+	}
+	return prev.(WriteHalf)
+}
+
+// Resume reattaches the staged write half and re-enables upper-layer writes.
+func (p *PausedWriteHalf) Resume() error {
+	if p == nil {
+		return ErrSessionClosed
+	}
+	return resumePausedHalf(&p.handle)
+}
+
+func (p *joinedPausedHalf) currentHalf() any {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.current
+}
+
+func (p *joinedPausedHalf) setHalf(next any) any {
+	if p == nil {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	prev := p.current
@@ -608,8 +738,7 @@ func (p *PausedWriteHalf) Set(next WriteHalf) WriteHalf {
 	return prev
 }
 
-// Resume reattaches the staged write half and re-enables upper-layer writes.
-func (p *PausedWriteHalf) Resume() error {
+func resumePausedHalf(p *joinedPausedHalf) error {
 	if p == nil || p.conn == nil {
 		return ErrSessionClosed
 	}
@@ -620,6 +749,7 @@ func (p *PausedWriteHalf) Resume() error {
 	}
 
 	current := p.current
+	side := p.side
 	for {
 		p.conn.mu.Lock()
 		if p.conn.closed {
@@ -627,11 +757,11 @@ func (p *PausedWriteHalf) Resume() error {
 			p.resumed = true
 			return ErrSessionClosed
 		}
-		deadline := p.conn.writeDeadline
-		gen := p.conn.writeDeadlineGen
+		deadline := side.deadlineLocked(p.conn)
+		gen := side.deadlineGenLocked(p.conn)
 		p.conn.mu.Unlock()
 		if current != nil {
-			if err := current.SetWriteDeadline(deadline); err != nil {
+			if err := side.applyDeadline(current, deadline); err != nil {
 				return err
 			}
 		}
@@ -641,20 +771,20 @@ func (p *PausedWriteHalf) Resume() error {
 			p.resumed = true
 			return ErrSessionClosed
 		}
-		if current != nil && p.conn.writeDeadlineGen != gen {
+		if current != nil && side.deadlineGenLocked(p.conn) != gen {
 			p.conn.mu.Unlock()
 			continue
 		}
-		p.conn.writeHalf = current
-		p.conn.writePaused = false
-		p.conn.broadcastWriteLocked()
+		side.setHalfLocked(p.conn, current)
+		side.setPausedLocked(p.conn, false)
+		side.broadcastLocked(p.conn)
 		p.conn.mu.Unlock()
 		p.resumed = true
 		return nil
 	}
 }
 
-func (c *JoinedConn) enterRead() (ReadHalf, error) {
+func (c *JoinedConn) enterHalf(side joinedHalfSide) (any, error) {
 	for {
 		c.mu.Lock()
 		c.initLocked()
@@ -662,67 +792,29 @@ func (c *JoinedConn) enterRead() (ReadHalf, error) {
 		case c.closed:
 			c.mu.Unlock()
 			return nil, ErrSessionClosed
-		case c.readPaused:
-			notifyCh, closedCh, deadline := c.beginReadWaitLocked()
+		case side.pausedLocked(c):
+			notifyCh, closedCh, deadline := side.beginWaitLocked(c)
 			c.mu.Unlock()
 			err := waitJoinedStateLocal(notifyCh, closedCh, deadline)
 			c.mu.Lock()
-			c.endReadWaitLocked()
+			side.endWaitLocked(c)
 			c.mu.Unlock()
 			if err != nil {
 				return nil, err
 			}
 		default:
-			readHalf := c.readHalf
-			c.activeReadOps++
+			half := side.halfLocked(c)
+			side.addActiveOpLocked(c)
 			c.mu.Unlock()
-			return readHalf, nil
+			return half, nil
 		}
 	}
 }
 
-func (c *JoinedConn) leaveRead() {
+func (c *JoinedConn) leaveHalf(side joinedHalfSide) {
 	c.mu.Lock()
-	if c.activeReadOps > 0 {
-		c.activeReadOps--
-	}
-	c.broadcastReadLocked()
-	c.mu.Unlock()
-}
-
-func (c *JoinedConn) enterWrite() (WriteHalf, error) {
-	for {
-		c.mu.Lock()
-		c.initLocked()
-		switch {
-		case c.closed:
-			c.mu.Unlock()
-			return nil, ErrSessionClosed
-		case c.writePaused:
-			notifyCh, closedCh, deadline := c.beginWriteWaitLocked()
-			c.mu.Unlock()
-			err := waitJoinedStateLocal(notifyCh, closedCh, deadline)
-			c.mu.Lock()
-			c.endWriteWaitLocked()
-			c.mu.Unlock()
-			if err != nil {
-				return nil, err
-			}
-		default:
-			writeHalf := c.writeHalf
-			c.activeWriteOps++
-			c.mu.Unlock()
-			return writeHalf, nil
-		}
-	}
-}
-
-func (c *JoinedConn) leaveWrite() {
-	c.mu.Lock()
-	if c.activeWriteOps > 0 {
-		c.activeWriteOps--
-	}
-	c.broadcastWriteLocked()
+	side.doneActiveOpLocked(c)
+	side.broadcastLocked(c)
 	c.mu.Unlock()
 }
 
@@ -789,57 +881,22 @@ func waitJoinedStateLocal(notifyCh <-chan struct{}, closedCh <-chan struct{}, de
 }
 
 func (c *JoinedConn) pauseReadHalf(ctx context.Context) (ReadHalf, error) {
-	ctx = contextOrBackground(ctx)
-	ownedPause := false
-
-	for {
-		c.mu.Lock()
-		c.initLocked()
-		switch {
-		case c.closed:
-			c.mu.Unlock()
-			return nil, ErrSessionClosed
-		case !ownedPause && c.readPaused:
-			notifyCh, closedCh, _ := c.beginReadWaitLocked()
-			c.mu.Unlock()
-			err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{})
-			c.mu.Lock()
-			c.endReadWaitLocked()
-			c.mu.Unlock()
-			if err != nil {
-				return nil, err
-			}
-		case !ownedPause:
-			c.readPaused = true
-			ownedPause = true
-			c.broadcastReadLocked()
-			c.mu.Unlock()
-		case c.activeReadOps == 0 && c.activeReadDeadlineOps == 0:
-			current := c.readHalf
-			c.readHalf = nil
-			c.broadcastReadLocked()
-			c.mu.Unlock()
-			return current, nil
-		default:
-			notifyCh, closedCh, _ := c.beginReadWaitLocked()
-			c.mu.Unlock()
-			err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{})
-			c.mu.Lock()
-			c.endReadWaitLocked()
-			if err != nil {
-				if ownedPause && !c.closed {
-					c.readPaused = false
-					c.broadcastReadLocked()
-				}
-				c.mu.Unlock()
-				return nil, err
-			}
-			c.mu.Unlock()
-		}
+	half, err := c.pauseHalf(ctx, joinedReadSide)
+	if half == nil || err != nil {
+		return nil, err
 	}
+	return half.(ReadHalf), nil
 }
 
 func (c *JoinedConn) pauseWriteHalf(ctx context.Context) (WriteHalf, error) {
+	half, err := c.pauseHalf(ctx, joinedWriteSide)
+	if half == nil || err != nil {
+		return nil, err
+	}
+	return half.(WriteHalf), nil
+}
+
+func (c *JoinedConn) pauseHalf(ctx context.Context, side joinedHalfSide) (any, error) {
 	ctx = contextOrBackground(ctx)
 	ownedPause := false
 
@@ -850,37 +907,37 @@ func (c *JoinedConn) pauseWriteHalf(ctx context.Context) (WriteHalf, error) {
 		case c.closed:
 			c.mu.Unlock()
 			return nil, ErrSessionClosed
-		case !ownedPause && c.writePaused:
-			notifyCh, closedCh, _ := c.beginWriteWaitLocked()
+		case !ownedPause && side.pausedLocked(c):
+			notifyCh, closedCh, _ := side.beginWaitLocked(c)
 			c.mu.Unlock()
 			err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{})
 			c.mu.Lock()
-			c.endWriteWaitLocked()
+			side.endWaitLocked(c)
 			c.mu.Unlock()
 			if err != nil {
 				return nil, err
 			}
 		case !ownedPause:
-			c.writePaused = true
+			side.setPausedLocked(c, true)
 			ownedPause = true
-			c.broadcastWriteLocked()
+			side.broadcastLocked(c)
 			c.mu.Unlock()
-		case c.activeWriteOps == 0 && c.activeWriteDeadlineOps == 0:
-			current := c.writeHalf
-			c.writeHalf = nil
-			c.broadcastWriteLocked()
+		case side.activeOpsLocked(c) == 0 && side.activeDeadlineOpsLocked(c) == 0:
+			current := side.halfLocked(c)
+			side.setHalfLocked(c, nil)
+			side.broadcastLocked(c)
 			c.mu.Unlock()
 			return current, nil
 		default:
-			notifyCh, closedCh, _ := c.beginWriteWaitLocked()
+			notifyCh, closedCh, _ := side.beginWaitLocked(c)
 			c.mu.Unlock()
 			err := waitJoinedState(ctx, notifyCh, closedCh, time.Time{})
 			c.mu.Lock()
-			c.endWriteWaitLocked()
+			side.endWaitLocked(c)
 			if err != nil {
 				if ownedPause && !c.closed {
-					c.writePaused = false
-					c.broadcastWriteLocked()
+					side.setPausedLocked(c, false)
+					side.broadcastLocked(c)
 				}
 				c.mu.Unlock()
 				return nil, err

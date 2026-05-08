@@ -179,73 +179,60 @@ func CollectReadyBatchInto[T any](batch []T, lane <-chan T, max int, order func(
 func CollectAlternatingReadyBatchInto[T any](batch []T, primary <-chan T, secondary <-chan T, preferSecondary bool, max int, order func([]T) []T) []T {
 	for len(batch) < max {
 		if preferSecondary {
-			select {
-			case req, ok := <-secondary:
-				if !ok {
-					secondary = nil
-					break
-				}
-				batch = append(batch, req)
+			if next, state := collectReadyFrom(&secondary, batch); state == collectReady {
+				batch = next
 				preferSecondary = false
 				continue
-			default:
 			}
-			select {
-			case req, ok := <-primary:
-				if !ok {
-					primary = nil
-					break
-				}
-				batch = append(batch, req)
+			if next, state := collectReadyFrom(&primary, batch); state == collectReady {
+				batch = next
 				preferSecondary = true
 				continue
-			default:
-				if primary == nil && secondary == nil {
-					if order != nil {
-						return order(batch)
-					}
-					return batch
-				}
-				if order != nil {
-					return order(batch)
-				}
-				return batch
+			} else if state == collectClosed {
+				continue
 			}
+			return orderReadyBatch(batch, order)
 		}
 
-		select {
-		case req, ok := <-primary:
-			if !ok {
-				primary = nil
-				break
-			}
-			batch = append(batch, req)
+		if next, state := collectReadyFrom(&primary, batch); state == collectReady {
+			batch = next
 			preferSecondary = true
 			continue
-		default:
 		}
-		select {
-		case req, ok := <-secondary:
-			if !ok {
-				secondary = nil
-				break
-			}
-			batch = append(batch, req)
+		if next, state := collectReadyFrom(&secondary, batch); state == collectReady {
+			batch = next
 			preferSecondary = false
 			continue
-		default:
-			if primary == nil && secondary == nil {
-				if order != nil {
-					return order(batch)
-				}
-				return batch
-			}
-			if order != nil {
-				return order(batch)
-			}
-			return batch
+		} else if state == collectClosed {
+			continue
 		}
+		return orderReadyBatch(batch, order)
 	}
+	return orderReadyBatch(batch, order)
+}
+
+type collectReadyState uint8
+
+const (
+	collectNotReady collectReadyState = iota
+	collectReady
+	collectClosed
+)
+
+func collectReadyFrom[T any](lane *<-chan T, batch []T) ([]T, collectReadyState) {
+	select {
+	case req, ok := <-*lane:
+		if !ok {
+			*lane = nil
+			return batch, collectClosed
+		}
+		return append(batch, req), collectReady
+	default:
+		return batch, collectNotReady
+	}
+}
+
+func orderReadyBatch[T any](batch []T, order func([]T) []T) []T {
 	if order != nil {
 		return order(batch)
 	}
