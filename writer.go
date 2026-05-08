@@ -492,29 +492,48 @@ func (c *Conn) tryDequeueWriteWork() (dequeuedWriteWork, bool) {
 		return dequeuedWriteWork{kind: dequeuedWriteWorkControl}, true
 	default:
 	}
-	advisory := c.writer.advisoryWriteCh
-	select {
-	case req := <-advisory:
-		return dequeuedWriteWork{req: req, lane: writeLaneAdvisory, kind: dequeuedWriteWorkRequest}, true
-	default:
-		return dequeuedWriteWork{}, false
+	if advisory := c.writer.advisoryWriteCh; advisory != nil {
+		select {
+		case req := <-advisory:
+			return dequeuedWriteWork{req: req, lane: writeLaneAdvisory, kind: dequeuedWriteWorkRequest}, true
+		default:
+		}
 	}
+	return dequeuedWriteWork{}, false
 }
 
 func (c *Conn) waitDequeueWriteWork() dequeuedWriteWork {
-	advisory := c.writer.advisoryWriteCh
+	closedCh := c.lifecycle.closedCh
+	terminalNotify := c.pending.terminalNotify
+	controlNotify := c.pending.controlNotify
+	urgentWriteCh := c.writer.urgentWriteCh
+	writeCh := c.writer.writeCh
+	if advisory := c.writer.advisoryWriteCh; advisory != nil {
+		select {
+		case <-closedCh:
+			return dequeuedWriteWork{kind: dequeuedWriteWorkClosed}
+		case <-terminalNotify:
+			return dequeuedWriteWork{kind: dequeuedWriteWorkControl}
+		case <-controlNotify:
+			return dequeuedWriteWork{kind: dequeuedWriteWorkControl}
+		case req := <-urgentWriteCh:
+			return dequeuedWriteWork{req: req, lane: writeLaneUrgent, kind: dequeuedWriteWorkRequest}
+		case req := <-advisory:
+			return dequeuedWriteWork{req: req, lane: writeLaneAdvisory, kind: dequeuedWriteWorkRequest}
+		case req := <-writeCh:
+			return dequeuedWriteWork{req: req, lane: writeLaneOrdinary, kind: dequeuedWriteWorkRequest}
+		}
+	}
 	select {
-	case <-c.lifecycle.closedCh:
+	case <-closedCh:
 		return dequeuedWriteWork{kind: dequeuedWriteWorkClosed}
-	case <-c.pending.terminalNotify:
+	case <-terminalNotify:
 		return dequeuedWriteWork{kind: dequeuedWriteWorkControl}
-	case <-c.pending.controlNotify:
+	case <-controlNotify:
 		return dequeuedWriteWork{kind: dequeuedWriteWorkControl}
-	case req := <-c.writer.urgentWriteCh:
+	case req := <-urgentWriteCh:
 		return dequeuedWriteWork{req: req, lane: writeLaneUrgent, kind: dequeuedWriteWorkRequest}
-	case req := <-advisory:
-		return dequeuedWriteWork{req: req, lane: writeLaneAdvisory, kind: dequeuedWriteWorkRequest}
-	case req := <-c.writer.writeCh:
+	case req := <-writeCh:
 		return dequeuedWriteWork{req: req, lane: writeLaneOrdinary, kind: dequeuedWriteWorkRequest}
 	}
 }

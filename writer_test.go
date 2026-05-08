@@ -2073,6 +2073,33 @@ func TestDequeueWriteRequestPrefersAdvisoryOverNormal(t *testing.T) {
 	}
 }
 
+func TestWaitDequeueWriteWorkHandlesNilAdvisoryLane(t *testing.T) {
+	t.Parallel()
+
+	c := &Conn{
+		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
+		pending:   connPendingControlState{terminalNotify: make(chan struct{}, 1), controlNotify: make(chan struct{}, 1)},
+		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 1)},
+	}
+
+	want := writeRequest{
+		done:   make(chan error, 1),
+		frames: testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("ordinary")}}),
+	}
+	c.writer.writeCh <- want
+
+	work := c.waitDequeueWriteWork()
+	if work.kind != dequeuedWriteWorkRequest {
+		t.Fatalf("waitDequeueWriteWork kind = %v, want request", work.kind)
+	}
+	if work.lane != writeLaneOrdinary {
+		t.Fatalf("lane = %v, want %v", work.lane, writeLaneOrdinary)
+	}
+	if string(work.req.frames[0].Payload) != "ordinary" {
+		t.Fatalf("payload = %q, want %q", work.req.frames[0].Payload, "ordinary")
+	}
+}
+
 func TestDequeueWriteWorkPrefersUrgentBeforeControlNotify(t *testing.T) {
 	t.Parallel()
 
