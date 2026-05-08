@@ -366,6 +366,10 @@ func prepareBatchScratchForBuild(state *BatchState, capHint int) {
 }
 
 func hasRetainedRealBatchState(state *BatchState) bool {
+	return hasRetainedBatchStateWithoutLag(state)
+}
+
+func hasRetainedBatchStateWithoutLag(state *BatchState) bool {
 	if state == nil {
 		return false
 	}
@@ -385,18 +389,9 @@ func hasIdleBatchStateStorage(state *BatchState) bool {
 	if state == nil {
 		return false
 	}
-	return len(state.StreamFinishTag) != 0 ||
-		len(state.StreamLastService) != 0 ||
+	return hasRetainedBatchStateWithoutLag(state) ||
 		len(state.StreamLag) != 0 ||
-		len(state.StreamClass) != 0 ||
-		len(state.StreamLastSeenBatch) != 0 ||
-		len(state.SmallBurstDisarmed) != 0 ||
-		len(state.GroupVirtualTime) != 0 ||
-		len(state.GroupFinishTag) != 0 ||
-		len(state.GroupLastService) != 0 ||
-		len(state.GroupLag) != 0 ||
-		len(state.PreferredStreamHead) != 0 ||
-		state.HasPreferredGroupHead
+		len(state.GroupLag) != 0
 }
 
 func scrubIdleRetainedBatchState(state *BatchState) {
