@@ -301,6 +301,7 @@ const (
 	defaultPrefacePaddingMaxBytes   = 256
 	defaultPingPaddingMinBytes      = 16
 	defaultPingPaddingMaxBytes      = 64
+	defaultCapabilities             = CapabilityOpenMetadata | CapabilityPriorityUpdate | CapabilityPriorityHints | CapabilityStreamGroups
 )
 
 var (
@@ -313,7 +314,7 @@ func builtinDefaultConfig() Config {
 		Role:                     RoleAuto,
 		MinProto:                 ProtoVersion,
 		MaxProto:                 ProtoVersion,
-		Capabilities:             0,
+		Capabilities:             defaultCapabilities,
 		Settings:                 DefaultSettings(),
 		NonceSource:              rand.Reader,
 		PrefacePadding:           true,

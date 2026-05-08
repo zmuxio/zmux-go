@@ -5158,7 +5158,8 @@ func assertCurrentCreditWriteFrames(t *testing.T, frames <-chan Frame, streamID 
 func TestOpenInfoRequiresOpenMetadataCapability(t *testing.T) {
 	t.Parallel()
 
-	client, server := newConnPairWithConfig(t, nil, nil)
+	noCaps := &Config{Capabilities: 0}
+	client, server := newConnPairWithConfig(t, noCaps, noCaps)
 	_ = server
 
 	_, err := client.OpenStreamWithOptions(context.Background(), OpenOptions{OpenInfo: []byte("need-metadata")})
@@ -5901,7 +5902,8 @@ func TestStructuredSessionErrorAfterPeerCloseOpen(t *testing.T) {
 func TestStructuredOpenErrorForOpenInfoUnavailable(t *testing.T) {
 	t.Parallel()
 
-	client, _ := newConnPairWithConfig(t, nil, nil)
+	noCaps := &Config{Capabilities: 0}
+	client, _ := newConnPairWithConfig(t, noCaps, noCaps)
 
 	_, err := client.OpenStreamWithOptions(context.Background(), OpenOptions{OpenInfo: []byte("need-metadata")})
 	if !errors.Is(err, ErrOpenInfoUnavailable) {

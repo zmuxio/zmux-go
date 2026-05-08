@@ -1616,9 +1616,11 @@ func TestEstablishedConnDefersOptionalChannelsUntilNeeded(t *testing.T) {
 	t.Parallel()
 
 	clientCfg := DefaultConfig()
+	clientCfg.Capabilities &^= CapabilityPriorityUpdate
 	clientCfg.KeepaliveInterval = 0
 	clientCfg.KeepaliveMaxPingInterval = 0
 	serverCfg := DefaultConfig()
+	serverCfg.Capabilities &^= CapabilityPriorityUpdate
 	serverCfg.KeepaliveInterval = 0
 	serverCfg.KeepaliveMaxPingInterval = 0
 	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)

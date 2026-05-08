@@ -58,6 +58,7 @@ func TestResetDefaultConfigRestoresBuiltInTemplate(t *testing.T) {
 	t.Cleanup(ResetDefaultConfig)
 
 	ConfigureDefaultConfig(func(cfg *Config) {
+		cfg.Capabilities = 0
 		cfg.PingPadding = false
 		cfg.PrefacePadding = false
 	})
@@ -67,9 +68,15 @@ func TestResetDefaultConfigRestoresBuiltInTemplate(t *testing.T) {
 	if DefaultConfig().PrefacePadding {
 		t.Fatal("DefaultConfig().PrefacePadding = true after ConfigureDefaultConfig disabled it")
 	}
+	if got := DefaultConfig().Capabilities; got != 0 {
+		t.Fatalf("DefaultConfig().Capabilities = %v after ConfigureDefaultConfig disabled it, want 0", got)
+	}
 
 	ResetDefaultConfig()
 	cfg := DefaultConfig()
+	if got := cfg.Capabilities; got != defaultCapabilities {
+		t.Fatalf("DefaultConfig().Capabilities = %v, want %v", got, defaultCapabilities)
+	}
 	if !cfg.PingPadding {
 		t.Fatal("DefaultConfig().PingPadding = false after ResetDefaultConfig")
 	}
@@ -78,6 +85,41 @@ func TestResetDefaultConfigRestoresBuiltInTemplate(t *testing.T) {
 	}
 	if got, want := cfg.KeepaliveInterval, defaultIdleKeepaliveInterval; got != want {
 		t.Fatalf("DefaultConfig().KeepaliveInterval = %v, want %v", got, want)
+	}
+}
+
+func TestDefaultConfigAdvertisesImplementedCapabilities(t *testing.T) {
+	ResetDefaultConfig()
+	t.Cleanup(ResetDefaultConfig)
+
+	cfg := DefaultConfig()
+	if got := cfg.Capabilities; got != defaultCapabilities {
+		t.Fatalf("DefaultConfig().Capabilities = %v, want %v", got, defaultCapabilities)
+	}
+	if !cfg.Capabilities.CanCarryOpenInfo() {
+		t.Fatal("DefaultConfig().Capabilities cannot carry OpenInfo")
+	}
+	if !cfg.Capabilities.CanCarryPriorityOnOpen() || !cfg.Capabilities.CanCarryGroupOnOpen() {
+		t.Fatal("DefaultConfig().Capabilities cannot carry open-time priority/group metadata")
+	}
+	if !cfg.Capabilities.CanCarryPriorityInUpdate() || !cfg.Capabilities.CanCarryGroupInUpdate() {
+		t.Fatal("DefaultConfig().Capabilities cannot carry priority/group updates")
+	}
+
+	local, err := cfg.LocalPreface()
+	if err != nil {
+		t.Fatalf("LocalPreface err = %v", err)
+	}
+	peer, err := cloneConfig(nil).LocalPreface()
+	if err != nil {
+		t.Fatalf("cloneConfig(nil).LocalPreface err = %v", err)
+	}
+	negotiated, err := NegotiatePrefaces(local, peer)
+	if err != nil {
+		t.Fatalf("NegotiatePrefaces err = %v", err)
+	}
+	if got := negotiated.Capabilities; got != defaultCapabilities {
+		t.Fatalf("negotiated capabilities = %v, want %v", got, defaultCapabilities)
 	}
 }
 

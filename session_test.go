@@ -14260,10 +14260,8 @@ func TestPriorityUpdateRoundTrip(t *testing.T) {
 }
 
 func TestPriorityUpdateUnavailableAfterOpen(t *testing.T) {
-	clientCfg := DefaultConfig()
-	serverCfg := DefaultConfig()
-	clientCfg.Capabilities |= CapabilityPriorityHints
-	serverCfg.Capabilities |= CapabilityPriorityHints
+	clientCfg := &Config{Capabilities: CapabilityPriorityHints}
+	serverCfg := &Config{Capabilities: CapabilityPriorityHints}
 
 	client, _ := newConnPairWithConfig(t, clientCfg, serverCfg)
 	ctx, cancel := testContext(t)
@@ -14283,10 +14281,8 @@ func TestPriorityUpdateUnavailableAfterOpen(t *testing.T) {
 }
 
 func TestPriorityUpdateIgnoredWhenUnnegotiated(t *testing.T) {
-	clientCfg := DefaultConfig()
-	serverCfg := DefaultConfig()
-	clientCfg.Capabilities |= CapabilityPriorityHints | CapabilityStreamGroups
-	serverCfg.Capabilities |= CapabilityPriorityHints | CapabilityStreamGroups
+	clientCfg := &Config{Capabilities: CapabilityPriorityHints | CapabilityStreamGroups}
+	serverCfg := &Config{Capabilities: CapabilityPriorityHints | CapabilityStreamGroups}
 
 	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
 	ctx, cancel := testContext(t)
