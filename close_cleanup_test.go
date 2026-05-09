@@ -14,8 +14,7 @@ func (testReadWriteCloser) Close() error                { return nil }
 func TestCloseSessionClearsProtocolBacklogAndDrainsBufferedDataQueues(t *testing.T) {
 	t.Parallel()
 
-	ordinary := make(chan writeRequest, 1)
-	advisory := make(chan writeRequest, 1)
+	ordinary := make(chan writeRequest, 2)
 	urgent := make(chan writeRequest, 1)
 
 	ordinaryDone := make(chan error, 1)
@@ -26,7 +25,7 @@ func TestCloseSessionClearsProtocolBacklogAndDrainsBufferedDataQueues(t *testing
 		done:   ordinaryDone,
 		frames: testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: 4, Payload: []byte("ordinary")}}),
 	}
-	advisory <- writeRequest{
+	ordinary <- writeRequest{
 		done:   advisoryDone,
 		frames: testTxFramesFrom([]Frame{{Type: FrameTypeEXT, StreamID: 4, Payload: []byte{0x01}}}),
 	}
@@ -43,9 +42,8 @@ func TestCloseSessionClearsProtocolBacklogAndDrainsBufferedDataQueues(t *testing
 		},
 		io: connIOState{conn: testReadWriteCloser{}},
 		writer: connWriterRuntimeState{
-			writeCh:         ordinary,
-			advisoryWriteCh: advisory,
-			urgentWriteCh:   urgent,
+			writeCh:       ordinary,
+			urgentWriteCh: urgent,
 		},
 		pending: connPendingControlState{
 			controlNotify:  make(chan struct{}, 1),
@@ -66,9 +64,6 @@ func TestCloseSessionClearsProtocolBacklogAndDrainsBufferedDataQueues(t *testing
 	}
 	if got := len(ordinary); got != 0 {
 		t.Fatalf("ordinary write lane still buffered %d request(s)", got)
-	}
-	if got := len(advisory); got != 0 {
-		t.Fatalf("advisory write lane still buffered %d request(s)", got)
 	}
 	if got := len(urgent); got != 0 {
 		t.Fatalf("urgent write lane still buffered %d request(s)", got)

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"os"
 	"sync"
 	"testing"
@@ -728,6 +729,66 @@ func TestWrapSessionAcceptLoopBoundsConcurrentPreludePreparation(t *testing.T) {
 	}
 	if got := countedServerConn.bidiAcceptCount(); got > limit+1 {
 		t.Fatalf("accepted bidi stream count = %d, want at most %d while prepare slots are saturated", got, limit+1)
+	}
+}
+
+func TestWrapSessionCloseWaitsForAcceptedPreludePreparation(t *testing.T) {
+	limit := 2
+	clientConn, serverConn := newQUICConnPair(t)
+	serverSession := WrapSessionWithOptions(serverConn, SessionOptions{
+		AcceptedPreludeReadTimeout:   -1,
+		AcceptedPreludeMaxConcurrent: limit,
+	})
+	serverAdapter, _ := serverSession.(*quicSession)
+	if serverAdapter == nil {
+		t.Fatal("wrapped server session = nil adapter session, want quicSession")
+	}
+	_ = serverAdapter.ensureBidiAcceptLoop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	for i := 0; i < limit; i++ {
+		stream, err := clientConn.OpenStreamSync(ctx)
+		if err != nil {
+			t.Fatalf("OpenStreamSync %d err = %v", i, err)
+		}
+		t.Cleanup(func() {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			_ = stream.Close()
+		})
+		if _, err := stream.Write([]byte{0x40}); err != nil {
+			t.Fatalf("stream %d partial prelude write err = %v", i, err)
+		}
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(serverAdapter.prepareSem) == limit {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := len(serverAdapter.prepareSem); got != limit {
+		t.Fatalf("accepted prelude prepare slots in use = %d, want %d", got, limit)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- serverAdapter.Close()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close err = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not return after closing stalled accepted prelude preparations")
+	}
+	if got := len(serverAdapter.prepareSem); got != 0 {
+		t.Fatalf("accepted prelude prepare slots after Close = %d, want 0", got)
 	}
 }
 
@@ -1462,9 +1523,15 @@ func newQUICConnPair(t *testing.T) (*quic.Conn, *quic.Conn) {
 	t.Cleanup(cancel)
 
 	serverTLS, clientTLS := testTLSConfigs(t)
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, nil)
+	clientPacketConn, serverPacketConn := newMemoryPacketConnPair("client", "server")
+	t.Cleanup(func() {
+		_ = clientPacketConn.Close()
+		_ = serverPacketConn.Close()
+	})
+
+	listener, err := quic.Listen(serverPacketConn, serverTLS, nil)
 	if err != nil {
-		t.Fatalf("ListenAddr err = %v", err)
+		t.Fatalf("Listen err = %v", err)
 	}
 	t.Cleanup(func() {
 		_ = listener.Close()
@@ -1480,9 +1547,9 @@ func newQUICConnPair(t *testing.T) (*quic.Conn, *quic.Conn) {
 		acceptCh <- acceptResult{conn: conn, err: err}
 	}()
 
-	clientConn, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, nil)
+	clientConn, err := quic.Dial(ctx, clientPacketConn, listener.Addr(), clientTLS, nil)
 	if err != nil {
-		t.Fatalf("DialAddr err = %v", err)
+		t.Fatalf("Dial err = %v", err)
 	}
 	t.Cleanup(func() {
 		_ = clientConn.CloseWithError(0, "")
@@ -1497,6 +1564,221 @@ func newQUICConnPair(t *testing.T) (*quic.Conn, *quic.Conn) {
 	})
 
 	return clientConn, serverResult.conn
+}
+
+type memoryPacketAddr string
+
+func (a memoryPacketAddr) Network() string { return "memory" }
+func (a memoryPacketAddr) String() string  { return string(a) }
+
+type memoryPacket struct {
+	data []byte
+	addr net.Addr
+}
+
+type memoryPacketTimeout struct{}
+
+func (memoryPacketTimeout) Error() string   { return "i/o timeout" }
+func (memoryPacketTimeout) Timeout() bool   { return true }
+func (memoryPacketTimeout) Temporary() bool { return true }
+
+type memoryPacketConn struct {
+	mu              sync.Mutex
+	addr            memoryPacketAddr
+	peer            *memoryPacketConn
+	recv            chan memoryPacket
+	closed          chan struct{}
+	closedOnce      sync.Once
+	readDeadline    time.Time
+	writeDeadline   time.Time
+	deadlineChanged chan struct{}
+}
+
+func newMemoryPacketConnPair(clientName, serverName string) (*memoryPacketConn, *memoryPacketConn) {
+	client := newMemoryPacketConn(clientName)
+	server := newMemoryPacketConn(serverName)
+	client.peer = server
+	server.peer = client
+	return client, server
+}
+
+func newMemoryPacketConn(name string) *memoryPacketConn {
+	return &memoryPacketConn{
+		addr:            memoryPacketAddr(name),
+		recv:            make(chan memoryPacket, 4096),
+		closed:          make(chan struct{}),
+		deadlineChanged: make(chan struct{}),
+	}
+}
+
+func (c *memoryPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		deadline, changed, err := c.readState()
+		if err != nil {
+			return 0, nil, err
+		}
+		timer, timerCh, expired := memoryDeadlineTimer(deadline)
+		if expired {
+			return 0, nil, memoryPacketTimeout{}
+		}
+		select {
+		case pkt := <-c.recv:
+			memoryStopTimer(timer)
+			n := copy(p, pkt.data)
+			return n, pkt.addr, nil
+		case <-c.closed:
+			memoryStopTimer(timer)
+			return 0, nil, net.ErrClosed
+		case <-changed:
+			memoryStopTimer(timer)
+		case <-timerCh:
+			return 0, nil, memoryPacketTimeout{}
+		}
+	}
+}
+
+func (c *memoryPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if c == nil {
+		return 0, net.ErrClosed
+	}
+	peer := c.peer
+	if peer == nil {
+		return 0, net.ErrClosed
+	}
+	deadline, err := c.writeState()
+	if err != nil {
+		return 0, err
+	}
+	timer, timerCh, expired := memoryDeadlineTimer(deadline)
+	if expired {
+		return 0, memoryPacketTimeout{}
+	}
+	data := append([]byte(nil), p...)
+	select {
+	case peer.recv <- memoryPacket{data: data, addr: c.addr}:
+		memoryStopTimer(timer)
+		return len(p), nil
+	case <-peer.closed:
+		memoryStopTimer(timer)
+		return 0, net.ErrClosed
+	case <-c.closed:
+		memoryStopTimer(timer)
+		return 0, net.ErrClosed
+	case <-timerCh:
+		return 0, memoryPacketTimeout{}
+	}
+}
+
+func (c *memoryPacketConn) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.closedOnce.Do(func() {
+		close(c.closed)
+		c.mu.Lock()
+		c.signalDeadlineChangedLocked()
+		c.mu.Unlock()
+	})
+	return nil
+}
+
+func (c *memoryPacketConn) LocalAddr() net.Addr {
+	if c == nil {
+		return nil
+	}
+	return c.addr
+}
+
+func (c *memoryPacketConn) SetDeadline(t time.Time) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	c.mu.Lock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	c.signalDeadlineChangedLocked()
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *memoryPacketConn) SetReadDeadline(t time.Time) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	c.mu.Lock()
+	c.readDeadline = t
+	c.signalDeadlineChangedLocked()
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *memoryPacketConn) SetWriteDeadline(t time.Time) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	c.mu.Lock()
+	c.writeDeadline = t
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *memoryPacketConn) readState() (time.Time, <-chan struct{}, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if memoryPacketClosed(c.closed) {
+		return time.Time{}, nil, net.ErrClosed
+	}
+	return c.readDeadline, c.deadlineChanged, nil
+}
+
+func (c *memoryPacketConn) writeState() (time.Time, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if memoryPacketClosed(c.closed) {
+		return time.Time{}, net.ErrClosed
+	}
+	return c.writeDeadline, nil
+}
+
+func (c *memoryPacketConn) signalDeadlineChangedLocked() {
+	if c == nil {
+		return
+	}
+	close(c.deadlineChanged)
+	c.deadlineChanged = make(chan struct{})
+}
+
+func memoryPacketClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func memoryDeadlineTimer(deadline time.Time) (*time.Timer, <-chan time.Time, bool) {
+	if deadline.IsZero() {
+		return nil, nil, false
+	}
+	delay := time.Until(deadline)
+	if delay <= 0 {
+		return nil, nil, true
+	}
+	timer := time.NewTimer(delay)
+	return timer, timer.C, false
+}
+
+func memoryStopTimer(timer *time.Timer) {
+	if timer == nil {
+		return
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
 }
 
 type countingSessionConn struct {

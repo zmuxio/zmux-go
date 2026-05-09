@@ -1858,9 +1858,6 @@ func (c *Conn) writeLaneChan(lane writeLane) chan writeRequest {
 	if lane.isUrgent() {
 		return c.writer.urgentWriteCh
 	}
-	if lane.isAdvisory() && c.writer.advisoryWriteCh != nil {
-		return c.writer.advisoryWriteCh
-	}
 	return c.writer.writeCh
 }
 

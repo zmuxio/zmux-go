@@ -7,50 +7,6 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-func TestDequeuePreferUrgentAdvisoryOrder(t *testing.T) {
-	t.Parallel()
-
-	t.Run("advisory before normal", func(t *testing.T) {
-		closed := make(chan struct{})
-		urgent := make(chan int, 1)
-		advisory := make(chan int, 1)
-		normal := make(chan int, 1)
-
-		advisory <- 2
-		normal <- 3
-		if got, lane, ok := DequeuePreferUrgentAdvisory(closed, urgent, advisory, normal); !ok || got != 2 || lane != advisory {
-			t.Fatalf("advisory-first dequeue = (%d,%v,%v), want (2, advisory, true)", got, lane, ok)
-		}
-	})
-
-	t.Run("urgent before advisory", func(t *testing.T) {
-		closed := make(chan struct{})
-		urgent := make(chan int, 1)
-		advisory := make(chan int, 1)
-		normal := make(chan int, 1)
-
-		urgent <- 1
-		advisory <- 2
-		normal <- 3
-		if got, lane, ok := DequeuePreferUrgentAdvisory(closed, urgent, advisory, normal); !ok || got != 1 || lane != urgent {
-			t.Fatalf("urgent-first dequeue = (%d,%v,%v), want (1, urgent, true)", got, lane, ok)
-		}
-	})
-
-	t.Run("closed advisory lane falls back to normal", func(t *testing.T) {
-		closed := make(chan struct{})
-		urgent := make(chan int)
-		advisory := make(chan int)
-		normal := make(chan int, 1)
-		close(advisory)
-		normal <- 7
-
-		if got, lane, ok := DequeuePreferUrgentAdvisory(closed, urgent, advisory, normal); !ok || lane != normal || got != 7 {
-			t.Fatalf("closed advisory dequeue = (%d,%v,%v), want (7, normal, true)", got, lane, ok)
-		}
-	})
-}
-
 func TestCollectReadyBatchIntoStopsOnClosedLane(t *testing.T) {
 	t.Parallel()
 
@@ -60,20 +16,6 @@ func TestCollectReadyBatchIntoStopsOnClosedLane(t *testing.T) {
 	got := CollectReadyBatchInto([]int{1}, lane, 4, nil)
 	if len(got) != 1 || got[0] != 1 {
 		t.Fatalf("CollectReadyBatchInto closed lane = %v, want [1]", got)
-	}
-}
-
-func TestCollectAlternatingReadyBatchIntoStopsOnClosedLane(t *testing.T) {
-	t.Parallel()
-
-	primary := make(chan int)
-	secondary := make(chan int, 1)
-	close(primary)
-	secondary <- 2
-
-	got := CollectAlternatingReadyBatchInto([]int{1}, primary, secondary, false, 4, nil)
-	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
-		t.Fatalf("CollectAlternatingReadyBatchInto closed lane = %v, want [1 2]", got)
 	}
 }
 

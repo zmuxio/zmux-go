@@ -959,7 +959,6 @@ func (c *Conn) Stats() SessionStats {
 
 	queues := QueueStats{
 		Urgent:   queueDepth(c.writer.urgentWriteCh),
-		Advisory: queueDepth(c.writer.advisoryWriteCh),
 		Ordinary: queueDepth(c.writer.writeCh),
 	}
 	queues.Total = queues.Urgent + queues.Advisory + queues.Ordinary
@@ -1388,7 +1387,7 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		if c.io.conn != nil {
 			_ = c.io.conn.Close()
 		}
-		drainDetachedWriteLanes(queueVisibleSessionErr(c, c.err()), c.writer.urgentWriteCh, c.writer.advisoryWriteCh, c.writer.writeCh)
+		drainDetachedWriteLanes(queueVisibleSessionErr(c, c.err()), c.writer.urgentWriteCh, c.writer.writeCh)
 
 		// Clear tombstones after the transport is closed so the ingress
 		// goroutine cannot race against a nil tombstone map.
@@ -1922,7 +1921,6 @@ const rttAdaptiveSlack = 50 * time.Millisecond
 const defaultKeepaliveTimeoutMin = 5 * time.Second
 const defaultKeepaliveTimeoutMax = 60 * time.Second
 const writerLaneBuffer = 128
-const advisoryLaneBuffer = 32
 
 func acceptedPeerGoAwayWatermark(localRole Role, arity streamArity, nextPeerID uint64) uint64 {
 	firstPeerID := state.FirstPeerStreamID(localRole, arity.isBidi())
@@ -2403,10 +2401,6 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 	}
 
 	now := time.Now()
-	var advisoryWriteCh chan writeRequest
-	if negotiated.Capabilities.SupportsPriorityUpdateCarriage() {
-		advisoryWriteCh = make(chan writeRequest, advisoryLaneBuffer)
-	}
 	var livenessCh chan struct{}
 	if cfg.KeepaliveInterval > 0 {
 		livenessCh = make(chan struct{}, 1)
@@ -2452,10 +2446,9 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 			gracefulCloseTimeout:   cfg.GracefulCloseDrainTimeout,
 		},
 		writer: connWriterRuntimeState{
-			scheduler:       rt.NewBatchScheduler(),
-			writeCh:         make(chan writeRequest, writerLaneBuffer),
-			advisoryWriteCh: advisoryWriteCh,
-			urgentWriteCh:   make(chan writeRequest, 1),
+			scheduler:     rt.NewBatchScheduler(),
+			writeCh:       make(chan writeRequest, writerLaneBuffer),
+			urgentWriteCh: make(chan writeRequest, 1),
 		},
 		lifecycle: connLifecycleState{
 			sessionState: connStateReady,
@@ -2551,12 +2544,11 @@ type connRetentionState struct {
 }
 
 type connWriterRuntimeState struct {
-	scheduler       rt.BatchScheduler
-	scratch         writeBatchScratch
-	writeCh         chan writeRequest
-	advisoryWriteCh chan writeRequest
-	urgentWriteCh   chan writeRequest
-	yieldOrdinary   bool
+	scheduler     rt.BatchScheduler
+	scratch       writeBatchScratch
+	writeCh       chan writeRequest
+	urgentWriteCh chan writeRequest
+	yieldOrdinary bool
 }
 
 type connProtocolRuntimeState struct {

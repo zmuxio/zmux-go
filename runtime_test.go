@@ -1629,9 +1629,6 @@ func TestEstablishedConnDefersOptionalChannelsUntilNeeded(t *testing.T) {
 		if conn.signals.acceptCh != nil {
 			t.Fatal("conn.signals.acceptCh != nil before AcceptStream waits, want lazy allocation")
 		}
-		if conn.writer.advisoryWriteCh != nil {
-			t.Fatal("conn.writer.advisoryWriteCh != nil without negotiated priority_update, want nil")
-		}
 		if conn.signals.livenessCh != nil {
 			t.Fatal("conn.signals.livenessCh != nil with keepalive disabled and without graceful-close waiters, want lazy allocation")
 		}
@@ -1650,7 +1647,7 @@ func TestEstablishedConnAllocatesLivenessChannelWithDefaultKeepalive(t *testing.
 	}
 }
 
-func TestEstablishedConnAllocatesAdvisoryChannelWhenPriorityUpdateNegotiated(t *testing.T) {
+func TestEstablishedConnKeepsPriorityUpdateOnControlPath(t *testing.T) {
 	t.Parallel()
 
 	clientCfg := &Config{Capabilities: CapabilityPriorityUpdate | CapabilityPriorityHints}
@@ -1658,8 +1655,8 @@ func TestEstablishedConnAllocatesAdvisoryChannelWhenPriorityUpdateNegotiated(t *
 	client, server := newConnPairWithConfig(t, clientCfg, serverCfg)
 
 	for _, conn := range []*Conn{client, server} {
-		if conn.writer.advisoryWriteCh == nil {
-			t.Fatal("conn.writer.advisoryWriteCh = nil with negotiated priority_update, want channel")
+		if got := conn.writeLaneChan(writeLaneAdvisory); got != conn.writer.writeCh {
+			t.Fatal("writeLaneChan(advisory) did not use ordinary writer queue")
 		}
 	}
 }

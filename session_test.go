@@ -2494,10 +2494,6 @@ func TestEventStreamOpenedByAbortWithError(t *testing.T) {
 			if req.done != nil {
 				req.done <- nil
 			}
-		case req := <-client.writer.advisoryWriteCh:
-			if req.done != nil {
-				req.done <- nil
-			}
 		case <-time.After(testSignalTimeout):
 		}
 	}()
@@ -6376,7 +6372,7 @@ func newSessionMemoryTestConn() *Conn {
 
 		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
-		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), advisoryWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 1)}, config: connConfigState{local: Preface{Settings: settings},
+		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 1)}, config: connConfigState{local: Preface{Settings: settings},
 			peer: Preface{Settings: settings}}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 }
@@ -6386,15 +6382,14 @@ func TestStatsSnapshotIncludesQueueDepths(t *testing.T) {
 
 	c := &Conn{
 		lifecycle: connLifecycleState{closedCh: make(chan struct{}), sessionState: connStateReady},
-		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 4), advisoryWriteCh: make(chan writeRequest, 4), urgentWriteCh: make(chan writeRequest, 4)},
+		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 4), urgentWriteCh: make(chan writeRequest, 4)},
 	}
 	c.writer.writeCh <- writeRequest{}
-	c.writer.advisoryWriteCh <- writeRequest{}
 	c.writer.urgentWriteCh <- writeRequest{}
 
 	stats := c.Stats()
-	if stats.Queues.Ordinary != 1 || stats.Queues.Advisory != 1 || stats.Queues.Urgent != 1 || stats.Queues.Total != 3 {
-		t.Fatalf("queue stats = %+v, want ordinary=1 advisory=1 urgent=1 total=3", stats.Queues)
+	if stats.Queues.Ordinary != 1 || stats.Queues.Advisory != 0 || stats.Queues.Urgent != 1 || stats.Queues.Total != 2 {
+		t.Fatalf("queue stats = %+v, want ordinary=1 advisory=0 urgent=1 total=2", stats.Queues)
 	}
 }
 
@@ -7514,7 +7509,7 @@ func TestControlFlushLoopTransfersPendingPriorityBytesToAdvisoryQueue(t *testing
 
 	var queued writeRequest
 	select {
-	case queued = <-c.writer.advisoryWriteCh:
+	case queued = <-c.writer.writeCh:
 	case <-time.After(testSignalTimeout):
 		t.Fatal("controlFlushLoop did not enqueue advisory request")
 	}
@@ -10003,7 +9998,7 @@ func newConfigPolicyTestConn(cfg *Config) *Conn {
 
 		pending: connPendingControlState{controlNotify: make(chan struct{}, 1)},
 		signals: connRuntimeSignalState{acceptCh: make(chan struct{}, 1)},
-		writer:  connWriterRuntimeState{writeCh: make(chan writeRequest, 1), advisoryWriteCh: make(chan writeRequest, 1), urgentWriteCh: make(chan writeRequest, 1)},
+		writer:  connWriterRuntimeState{writeCh: make(chan writeRequest, 1), urgentWriteCh: make(chan writeRequest, 1)},
 
 		observer:  connObserverState{eventHandler: cloned.EventHandler},
 		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})},
@@ -10474,9 +10469,8 @@ func newDelayedStopSendingPolicyConn(t *testing.T, delay time.Duration) (*Conn, 
 		pending: connPendingControlState{controlNotify: make(chan struct{}, 1)},
 		signals: connRuntimeSignalState{acceptCh: make(chan struct{}, 1)},
 		writer: connWriterRuntimeState{
-			writeCh:         make(chan writeRequest),
-			urgentWriteCh:   make(chan writeRequest),
-			advisoryWriteCh: make(chan writeRequest),
+			writeCh:       make(chan writeRequest),
+			urgentWriteCh: make(chan writeRequest),
 		},
 
 		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})},
@@ -11063,9 +11057,8 @@ func newHandlerTestConnWithOptions(t *testing.T, autoFlushTerminalControl bool) 
 		pending: connPendingControlState{controlNotify: make(chan struct{}, 1), terminalNotify: make(chan struct{}, 1)},
 		signals: connRuntimeSignalState{acceptCh: make(chan struct{}, 1)},
 		writer: connWriterRuntimeState{
-			writeCh:         make(chan writeRequest),
-			urgentWriteCh:   make(chan writeRequest),
-			advisoryWriteCh: make(chan writeRequest),
+			writeCh:       make(chan writeRequest),
+			urgentWriteCh: make(chan writeRequest),
 		},
 
 		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})},
@@ -11190,7 +11183,7 @@ func (c *Conn) flushPendingControlBatches() (fatal bool, err error) {
 		case req.urgentReserved:
 			c.writer.urgentWriteCh <- req
 		case req.advisoryReserved:
-			c.writer.advisoryWriteCh <- req
+			c.writer.writeCh <- req
 		default:
 			c.writer.writeCh <- req
 		}
@@ -17315,9 +17308,8 @@ func newStopSendingDrainTimeoutConn(t *testing.T) (*Conn, <-chan Frame, func()) 
 		pending: connPendingControlState{controlNotify: make(chan struct{}, 1), terminalNotify: make(chan struct{}, 1)},
 		signals: connRuntimeSignalState{acceptCh: make(chan struct{}, 1)},
 		writer: connWriterRuntimeState{
-			writeCh:         make(chan writeRequest),
-			urgentWriteCh:   make(chan writeRequest),
-			advisoryWriteCh: make(chan writeRequest),
+			writeCh:       make(chan writeRequest),
+			urgentWriteCh: make(chan writeRequest),
 		},
 
 		lifecycle: connLifecycleState{sessionState: connStateReady, closedCh: make(chan struct{})},
@@ -21855,7 +21847,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		}()
 		var queued writeRequest
 		select {
-		case queued = <-c.writer.advisoryWriteCh:
+		case queued = <-c.writer.writeCh:
 		case <-time.After(testSignalTimeout):
 			return fmt.Errorf("enqueuePreparedQueueRequest did not enqueue advisory request")
 		}
@@ -21943,7 +21935,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		notify(c.pending.controlNotify)
 		var queued writeRequest
 		select {
-		case queued = <-c.writer.advisoryWriteCh:
+		case queued = <-c.writer.writeCh:
 		case <-time.After(testSignalTimeout):
 			close(c.lifecycle.closedCh)
 			return fmt.Errorf("controlFlushLoop did not enqueue advisory request")

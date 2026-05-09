@@ -492,13 +492,6 @@ func (c *Conn) tryDequeueWriteWork() (dequeuedWriteWork, bool) {
 		return dequeuedWriteWork{kind: dequeuedWriteWorkControl}, true
 	default:
 	}
-	if advisory := c.writer.advisoryWriteCh; advisory != nil {
-		select {
-		case req := <-advisory:
-			return dequeuedWriteWork{req: req, lane: writeLaneAdvisory, kind: dequeuedWriteWorkRequest}, true
-		default:
-		}
-	}
 	return dequeuedWriteWork{}, false
 }
 
@@ -508,22 +501,6 @@ func (c *Conn) waitDequeueWriteWork() dequeuedWriteWork {
 	controlNotify := c.pending.controlNotify
 	urgentWriteCh := c.writer.urgentWriteCh
 	writeCh := c.writer.writeCh
-	if advisory := c.writer.advisoryWriteCh; advisory != nil {
-		select {
-		case <-closedCh:
-			return dequeuedWriteWork{kind: dequeuedWriteWorkClosed}
-		case <-terminalNotify:
-			return dequeuedWriteWork{kind: dequeuedWriteWorkControl}
-		case <-controlNotify:
-			return dequeuedWriteWork{kind: dequeuedWriteWorkControl}
-		case req := <-urgentWriteCh:
-			return dequeuedWriteWork{req: req, lane: writeLaneUrgent, kind: dequeuedWriteWorkRequest}
-		case req := <-advisory:
-			return dequeuedWriteWork{req: req, lane: writeLaneAdvisory, kind: dequeuedWriteWorkRequest}
-		case req := <-writeCh:
-			return dequeuedWriteWork{req: req, lane: writeLaneOrdinary, kind: dequeuedWriteWorkRequest}
-		}
-	}
 	select {
 	case <-closedCh:
 		return dequeuedWriteWork{kind: dequeuedWriteWorkClosed}
@@ -701,16 +678,9 @@ func (c *Conn) collectWriteBatch(first writeRequest, lane writeLane) []writeRequ
 func (c *Conn) collectOrdinaryWriteBatch(first writeRequest, firstLane writeLane) []writeRequest {
 	batch := c.writer.scratch.batchSlice(1, maxWriteBatchFrames)
 	batch[0] = first
-	return rt.CollectAlternatingReadyBatchInto(
-		batch,
-		c.writeLaneChan(writeLaneOrdinary),
-		c.advisoryReadChan(),
-		firstLane == writeLaneOrdinary,
-		maxWriteBatchFrames,
-		func(batch []writeRequest) []writeRequest {
-			return c.orderWriteBatch(batch, writeLaneOrdinary)
-		},
-	)
+	return rt.CollectReadyBatchInto(batch, c.writeLaneChan(firstLane), maxWriteBatchFrames, func(batch []writeRequest) []writeRequest {
+		return c.orderWriteBatch(batch, writeLaneOrdinary)
+	})
 }
 
 func (c *Conn) orderWriteBatch(batch []writeRequest, lane writeLane) []writeRequest {
@@ -804,13 +774,6 @@ func (c *Conn) batchOrder(batch []writeRequest, lane writeLane) []int {
 	default:
 		return rt.OrderBatchIndices(rt.BatchConfig{}, nil, nil)
 	}
-}
-
-func (c *Conn) advisoryReadChan() <-chan writeRequest {
-	if c.writer.advisoryWriteCh != nil {
-		return c.writer.advisoryWriteCh
-	}
-	return c.writer.writeCh
 }
 
 func (c *Conn) schedulerTracksExplicitGroupsLocked() bool {

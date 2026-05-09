@@ -135,6 +135,9 @@ type quicSession struct {
 	acceptedPreludeReadTimeout time.Duration
 	prepareSem                 chan struct{}
 	active                     quicActiveStreamCounters
+	internalMu                 sync.Mutex
+	internalActive             int
+	internalDone               chan struct{}
 	bidiOnce                   sync.Once
 	uniOnce                    sync.Once
 	bidiCh                     chan bidiAcceptResult
@@ -369,10 +372,14 @@ func (s *quicSession) Close() error {
 	if s == nil || s.conn == nil {
 		return nil
 	}
+	var closeErr error
 	if s.conn.Context().Err() != nil {
-		return translateWaitError(context.Cause(s.conn.Context()))
+		closeErr = translateWaitError(context.Cause(s.conn.Context()))
+	} else {
+		closeErr = translateError(s.conn.CloseWithError(0, ""))
 	}
-	return translateError(s.conn.CloseWithError(0, ""))
+	waitErr := s.waitClosedAndInternal(context.Background())
+	return errors.Join(closeErr, waitErr)
 }
 
 func (s *quicSession) CloseWithError(err error) {
@@ -387,15 +394,24 @@ func (s *quicSession) Wait(ctx context.Context) error {
 	if s == nil || s.conn == nil {
 		return nil
 	}
+	return s.waitClosedAndInternal(ctx)
+}
+
+func (s *quicSession) waitClosedAndInternal(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	var err error
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.conn.Context().Done():
-		return translateWaitError(context.Cause(s.conn.Context()))
+		err = translateWaitError(context.Cause(s.conn.Context()))
 	}
+	if waitErr := s.waitInternal(ctx); waitErr != nil {
+		return waitErr
+	}
+	return err
 }
 
 func (s *quicSession) Closed() bool {
@@ -430,7 +446,9 @@ func (s *quicSession) ensureBidiAcceptLoop() <-chan bidiAcceptResult {
 	}
 	s.bidiOnce.Do(func() {
 		s.bidiCh = make(chan bidiAcceptResult, acceptedPreludeResultQueueCap)
-		go s.acceptBidiLoop()
+		s.startInternal(func() {
+			s.acceptBidiLoop()
+		})
 	})
 	return s.bidiCh
 }
@@ -441,7 +459,9 @@ func (s *quicSession) ensureUniAcceptLoop() <-chan uniAcceptResult {
 	}
 	s.uniOnce.Do(func() {
 		s.uniCh = make(chan uniAcceptResult, acceptedPreludeResultQueueCap)
-		go s.acceptUniLoop()
+		s.startInternal(func() {
+			s.acceptUniLoop()
+		})
 	})
 	return s.uniCh
 }
@@ -457,10 +477,13 @@ func (s *quicSession) acceptBidiLoop() {
 			discardAcceptedBidiStream(stream)
 			return
 		}
-		go func() {
+		if !s.startInternal(func() {
 			defer s.releasePrepareSlot()
 			s.prepareAcceptedBidiStream(stream)
-		}()
+		}) {
+			s.releasePrepareSlot()
+			discardAcceptedBidiStream(stream)
+		}
 	}
 }
 
@@ -475,10 +498,64 @@ func (s *quicSession) acceptUniLoop() {
 			discardAcceptedUniStream(stream)
 			return
 		}
-		go func() {
+		if !s.startInternal(func() {
 			defer s.releasePrepareSlot()
 			s.prepareAcceptedUniStream(stream)
-		}()
+		}) {
+			s.releasePrepareSlot()
+			discardAcceptedUniStream(stream)
+		}
+	}
+}
+
+func (s *quicSession) startInternal(fn func()) bool {
+	if s == nil || s.conn == nil || fn == nil {
+		return false
+	}
+	s.internalMu.Lock()
+	if s.conn.Context().Err() != nil {
+		s.internalMu.Unlock()
+		return false
+	}
+	if s.internalActive == 0 {
+		s.internalDone = make(chan struct{})
+	}
+	s.internalActive++
+	s.internalMu.Unlock()
+	go func() {
+		defer s.finishInternal()
+		fn()
+	}()
+	return true
+}
+
+func (s *quicSession) finishInternal() {
+	if s == nil {
+		return
+	}
+	s.internalMu.Lock()
+	if s.internalActive > 0 {
+		s.internalActive--
+	}
+	if s.internalActive == 0 && s.internalDone != nil {
+		close(s.internalDone)
+		s.internalDone = nil
+	}
+	s.internalMu.Unlock()
+}
+
+func (s *quicSession) waitInternal(ctx context.Context) error {
+	s.internalMu.Lock()
+	done := s.internalDone
+	s.internalMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
 	}
 }
 

@@ -95,16 +95,14 @@ func BenchmarkCollectWriteBatchLaneBuffering(b *testing.B) {
 	for _, tc := range []struct {
 		name        string
 		ordinaryCap int
-		advisoryCap int
 	}{
-		{name: "unbuffered", ordinaryCap: 0, advisoryCap: 0},
-		{name: "buffered", ordinaryCap: 64, advisoryCap: 16},
+		{name: "unbuffered", ordinaryCap: 0},
+		{name: "buffered", ordinaryCap: 64},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			c := &Conn{
 				writer: connWriterRuntimeState{
-					writeCh:         make(chan writeRequest, tc.ordinaryCap),
-					advisoryWriteCh: make(chan writeRequest, tc.advisoryCap),
+					writeCh: make(chan writeRequest, tc.ordinaryCap),
 				},
 				registry: connRegistryState{streams: map[uint64]*nativeStream{
 					4: {id: 4, idSet: true},
@@ -1056,7 +1054,7 @@ func TestCollectWriteBatchOrdersPriorityUpdateAheadOfSameStreamData(t *testing.T
 	}
 }
 
-func TestCollectWriteBatchMergesAdvisoryAndDataLanes(t *testing.T) {
+func TestCollectWriteBatchOrdersAdvisoryAndDataOnSharedLane(t *testing.T) {
 	caps := CapabilityPriorityUpdate | CapabilityPriorityHints
 	payload, err := buildPriorityUpdatePayload(
 		caps,
@@ -1068,7 +1066,7 @@ func TestCollectWriteBatchMergesAdvisoryAndDataLanes(t *testing.T) {
 	}
 
 	c := &Conn{
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8), advisoryWriteCh: make(chan writeRequest, 8)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)},
 
 		config: connConfigState{peer: Preface{
 			Settings: Settings{
@@ -1094,7 +1092,7 @@ func TestCollectWriteBatchMergesAdvisoryAndDataLanes(t *testing.T) {
 	}
 
 	c.writer.writeCh <- second
-	c.writer.advisoryWriteCh <- third
+	c.writer.writeCh <- third
 
 	batch := c.collectWriteBatch(first, writeLaneOrdinary)
 	if len(batch) != 3 {
@@ -1119,7 +1117,7 @@ func TestCollectWriteBatchMergesAdvisoryAndDataLanes(t *testing.T) {
 	}
 }
 
-func TestCollectWriteBatchDoesNotStarveOrdinaryLaneWhenAdvisoryFlooded(t *testing.T) {
+func TestCollectWriteBatchKeepsQueuedOrdinaryWithSharedAdvisoryBatch(t *testing.T) {
 	caps := CapabilityPriorityUpdate | CapabilityPriorityHints
 	payload, err := buildPriorityUpdatePayload(
 		caps,
@@ -1132,8 +1130,7 @@ func TestCollectWriteBatchDoesNotStarveOrdinaryLaneWhenAdvisoryFlooded(t *testin
 
 	c := &Conn{
 		writer: connWriterRuntimeState{
-			writeCh:         make(chan writeRequest, 1),
-			advisoryWriteCh: make(chan writeRequest, maxWriteBatchFrames+8),
+			writeCh: make(chan writeRequest, maxWriteBatchFrames+9),
 		},
 
 		config: connConfigState{peer: Preface{
@@ -1157,7 +1154,7 @@ func TestCollectWriteBatchDoesNotStarveOrdinaryLaneWhenAdvisoryFlooded(t *testin
 		done:   make(chan error, 1),
 	}
 	for i := 0; i < maxWriteBatchFrames+8; i++ {
-		c.writer.advisoryWriteCh <- writeRequest{
+		c.writer.writeCh <- writeRequest{
 			frames: testTxFramesFrom([]Frame{{Type: FrameTypeEXT, StreamID: 4, Payload: payload}}),
 			done:   make(chan error, 1),
 		}
@@ -1202,7 +1199,7 @@ func TestCollectWriteBatchGivesOneCrossStreamAdvisoryHeadOpportunity(t *testing.
 	}
 
 	c := &Conn{
-		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8), advisoryWriteCh: make(chan writeRequest, 8)},
+		writer: connWriterRuntimeState{writeCh: make(chan writeRequest, 8)},
 
 		config: connConfigState{peer: Preface{
 			Settings: Settings{
@@ -1230,7 +1227,7 @@ func TestCollectWriteBatchGivesOneCrossStreamAdvisoryHeadOpportunity(t *testing.
 	}
 
 	c.writer.writeCh <- second
-	c.writer.advisoryWriteCh <- third
+	c.writer.writeCh <- third
 
 	batch := c.collectWriteBatch(first, writeLaneOrdinary)
 	if len(batch) != 3 {
@@ -1650,7 +1647,7 @@ func newWriteLoopControlTestConn(conn *captureWriteCloser) *Conn {
 		io: connIOState{conn: conn},
 
 		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
-		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest), advisoryWriteCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)},
+		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest), urgentWriteCh: make(chan writeRequest)},
 		signals:   connRuntimeSignalState{livenessCh: make(chan struct{}, 1)},
 		lifecycle: connLifecycleState{closedCh: make(chan struct{}), sessionState: connStateReady},
 
@@ -2024,7 +2021,7 @@ func TestDequeueWriteRequestPrefersUrgentLane(t *testing.T) {
 
 	c := &Conn{
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
-		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 4), advisoryWriteCh: make(chan writeRequest, 4), writeCh: make(chan writeRequest, 4)},
+		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 4), writeCh: make(chan writeRequest, 4)},
 	}
 
 	urgentReq := writeRequest{done: make(chan error, 1), frames: testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("urgent")}})}
@@ -2032,7 +2029,7 @@ func TestDequeueWriteRequestPrefersUrgentLane(t *testing.T) {
 	normalReq := writeRequest{done: make(chan error, 1), frames: testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("normal")}})}
 
 	c.writer.urgentWriteCh <- urgentReq
-	c.writer.advisoryWriteCh <- advisoryReq
+	c.writer.writeCh <- advisoryReq
 	c.writer.writeCh <- normalReq
 
 	work := c.dequeueWriteWork()
@@ -2047,33 +2044,33 @@ func TestDequeueWriteRequestPrefersUrgentLane(t *testing.T) {
 	}
 }
 
-func TestDequeueWriteRequestPrefersAdvisoryOverNormal(t *testing.T) {
+func TestDequeueWriteRequestCarriesAdvisoryOnOrdinaryLane(t *testing.T) {
 	t.Parallel()
 
 	c := &Conn{
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
-		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), advisoryWriteCh: make(chan writeRequest, 4), writeCh: make(chan writeRequest, 4)},
+		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 4)},
 	}
 
 	advisoryReq := writeRequest{done: make(chan error, 1), frames: testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("advisory")}})}
 	normalReq := writeRequest{done: make(chan error, 1), frames: testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("normal")}})}
 
-	c.writer.advisoryWriteCh <- advisoryReq
+	c.writer.writeCh <- advisoryReq
 	c.writer.writeCh <- normalReq
 
 	work := c.dequeueWriteWork()
 	if work.kind != dequeuedWriteWorkRequest {
 		t.Fatalf("dequeueWriteWork kind = %v, want request", work.kind)
 	}
-	if work.lane != writeLaneAdvisory {
-		t.Fatalf("lane = %v, want %v", work.lane, writeLaneAdvisory)
+	if work.lane != writeLaneOrdinary {
+		t.Fatalf("lane = %v, want %v", work.lane, writeLaneOrdinary)
 	}
 	if work.req.frames[0].Payload[0] != advisoryReq.frames[0].Payload[0] {
 		t.Fatalf("got = %q, want advisory", work.req.frames[0].Payload)
 	}
 }
 
-func TestWaitDequeueWriteWorkHandlesNilAdvisoryLane(t *testing.T) {
+func TestWaitDequeueWriteWorkUsesOrdinaryLane(t *testing.T) {
 	t.Parallel()
 
 	c := &Conn{
@@ -2106,7 +2103,7 @@ func TestDequeueWriteWorkPrefersUrgentBeforeControlNotify(t *testing.T) {
 	c := &Conn{
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
-		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), advisoryWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 1)},
+		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 1)},
 	}
 
 	want := writeRequest{
@@ -2131,17 +2128,17 @@ func TestDequeueWriteWorkPrefersUrgentBeforeControlNotify(t *testing.T) {
 	}
 }
 
-func TestDequeueWriteWorkPrefersControlBeforeAdvisoryWhenReady(t *testing.T) {
+func TestDequeueWriteWorkPrefersControlBeforeOrdinaryWhenReady(t *testing.T) {
 	t.Parallel()
 
 	c := &Conn{
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
 		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
-		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), advisoryWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 1)},
+		writer:    connWriterRuntimeState{urgentWriteCh: make(chan writeRequest, 1), writeCh: make(chan writeRequest, 1)},
 	}
 
 	c.pending.controlNotify <- struct{}{}
-	c.writer.advisoryWriteCh <- writeRequest{
+	c.writer.writeCh <- writeRequest{
 		done:   make(chan error, 1),
 		frames: testTxFramesFrom([]Frame{{Type: FrameTypePING, Payload: []byte("advisory")}}),
 	}
@@ -2649,7 +2646,7 @@ func TestDispatchPreparedQueueRequestsDispatchesAllAdvisoryRequestsBeforeWaiting
 	}
 
 	c := newWriteLoopControlTestConn(&captureWriteCloser{})
-	c.writer.advisoryWriteCh = make(chan writeRequest, 2)
+	c.writer.writeCh = make(chan writeRequest, 2)
 	c.config.negotiated.Capabilities = caps
 
 	c.mu.Lock()
@@ -2684,12 +2681,12 @@ func TestDispatchPreparedQueueRequestsDispatchesAllAdvisoryRequestsBeforeWaiting
 
 	var first, second writeRequest
 	select {
-	case first = <-c.writer.advisoryWriteCh:
+	case first = <-c.writer.writeCh:
 	case <-time.After(testSignalTimeout):
 		t.Fatal("first advisory request was not dispatched")
 	}
 	select {
-	case second = <-c.writer.advisoryWriteCh:
+	case second = <-c.writer.writeCh:
 	case <-time.After(testSignalTimeout):
 		t.Fatal("second advisory request was not dispatched before first completion")
 	}
@@ -2731,7 +2728,7 @@ func TestDispatchPreparedQueueRequestsWaitsForDispatchedAdvisoryRequestWhenLater
 	t.Parallel()
 
 	c := newWriteLoopControlTestConn(&captureWriteCloser{})
-	c.writer.advisoryWriteCh = make(chan writeRequest, 1)
+	c.writer.writeCh = make(chan writeRequest, 1)
 	c.flow.sessionMemoryCap = 8
 
 	reqs := []writeRequest{
@@ -2757,7 +2754,7 @@ func TestDispatchPreparedQueueRequestsWaitsForDispatchedAdvisoryRequestWhenLater
 
 	var first writeRequest
 	select {
-	case first = <-c.writer.advisoryWriteCh:
+	case first = <-c.writer.writeCh:
 	case <-time.After(testSignalTimeout):
 		t.Fatal("first advisory request was not dispatched")
 	}
@@ -2811,7 +2808,7 @@ func TestFlushPendingControlBatchesMarksTakeErrorFatal(t *testing.T) {
 	}
 
 	select {
-	case req := <-c.writer.advisoryWriteCh:
+	case req := <-c.writer.writeCh:
 		t.Fatalf("unexpected advisory request dispatched after advisory drop: %+v", req)
 	default:
 	}
@@ -3548,7 +3545,7 @@ func TestEnqueuePreparedQueueRequestSkipsPrepareWhenAlreadyClosed(t *testing.T) 
 
 	c := &Conn{
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
-		writer:    connWriterRuntimeState{advisoryWriteCh: make(chan writeRequest, 1)},
+		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 1)},
 	}
 	close(c.lifecycle.closedCh)
 
@@ -3585,7 +3582,7 @@ func TestEnqueuePreparedQueueRequestSkipsPrepareWhenAlreadyClosed(t *testing.T) 
 		t.Fatal("request payload was cloned even though session was already closed")
 	}
 	select {
-	case queued := <-c.writer.advisoryWriteCh:
+	case queued := <-c.writer.writeCh:
 		t.Fatalf("unexpected queued request after closed-session rejection: %+v", queued)
 	default:
 	}
@@ -3797,7 +3794,7 @@ func TestQueueAdvisoryFramesSplitsBatchesAtFrameCountLimit(t *testing.T) {
 
 	c := &Conn{
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
-		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 1), advisoryWriteCh: make(chan writeRequest, 2), urgentWriteCh: make(chan writeRequest, 1)}, config: connConfigState{peer: Preface{
+		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 2), urgentWriteCh: make(chan writeRequest, 1)}, config: connConfigState{peer: Preface{
 			Settings: Settings{
 				MaxExtensionPayloadBytes: 4096,
 			},
@@ -3816,7 +3813,7 @@ func TestQueueAdvisoryFramesSplitsBatchesAtFrameCountLimit(t *testing.T) {
 	reqCh := make(chan writeRequest, 2)
 	go func() {
 		for i := 0; i < 2; i++ {
-			req := <-c.writer.advisoryWriteCh
+			req := <-c.writer.writeCh
 			reqCh <- req
 			req.done <- nil
 		}
@@ -3849,7 +3846,7 @@ func TestQueueAdvisoryFramesDispatchesSecondChunkBeforeFirstCompletion(t *testin
 
 	c := &Conn{
 		lifecycle: connLifecycleState{closedCh: make(chan struct{})},
-		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 1), advisoryWriteCh: make(chan writeRequest, 2), urgentWriteCh: make(chan writeRequest, 1)}, config: connConfigState{peer: Preface{
+		writer:    connWriterRuntimeState{writeCh: make(chan writeRequest, 2), urgentWriteCh: make(chan writeRequest, 1)}, config: connConfigState{peer: Preface{
 			Settings: Settings{
 				MaxExtensionPayloadBytes: 4096,
 			},
@@ -3872,12 +3869,12 @@ func TestQueueAdvisoryFramesDispatchesSecondChunkBeforeFirstCompletion(t *testin
 
 	var first, second writeRequest
 	select {
-	case first = <-c.writer.advisoryWriteCh:
+	case first = <-c.writer.writeCh:
 	case <-time.After(testSignalTimeout):
 		t.Fatal("first advisory chunk was not dispatched")
 	}
 	select {
-	case second = <-c.writer.advisoryWriteCh:
+	case second = <-c.writer.writeCh:
 	case <-time.After(testSignalTimeout):
 		t.Fatal("second advisory chunk was not dispatched before first completion")
 	}
