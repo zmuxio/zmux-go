@@ -674,6 +674,21 @@ func TestWrapSessionConcurrentAcceptStreamAllowsReadyStreamsToBypassStalledPrelu
 	}
 }
 
+func waitForAcceptedPreludeSlots(t *testing.T, session *quicSession, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(session.prepareSem) == want {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := len(session.prepareSem); got != want {
+		t.Fatalf("accepted prelude prepare slots in use = %d, want %d", got, want)
+	}
+}
+
 func TestWrapSessionAcceptLoopBoundsConcurrentPreludePreparation(t *testing.T) {
 	limit := 3
 	clientConn, serverConn := newQUICConnPair(t)
@@ -711,17 +726,7 @@ func TestWrapSessionAcceptLoopBoundsConcurrentPreludePreparation(t *testing.T) {
 		})
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(serverAdapter.prepareSem) == limit {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if got := len(serverAdapter.prepareSem); got != limit {
-		t.Fatalf("accepted prelude prepare slots in use = %d, want %d", got, limit)
-	}
+	waitForAcceptedPreludeSlots(t, serverAdapter, limit)
 
 	time.Sleep(150 * time.Millisecond)
 	if got := len(serverAdapter.prepareSem); got != limit {
@@ -763,16 +768,7 @@ func TestWrapSessionCloseWaitsForAcceptedPreludePreparation(t *testing.T) {
 		}
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if len(serverAdapter.prepareSem) == limit {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := len(serverAdapter.prepareSem); got != limit {
-		t.Fatalf("accepted prelude prepare slots in use = %d, want %d", got, limit)
-	}
+	waitForAcceptedPreludeSlots(t, serverAdapter, limit)
 
 	done := make(chan error, 1)
 	go func() {
@@ -1644,6 +1640,9 @@ func (c *memoryPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	peer := c.peer
 	if peer == nil {
 		return 0, net.ErrClosed
+	}
+	if addr != nil && addr.String() != peer.addr.String() {
+		return 0, fmt.Errorf("unknown memory packet addr %s", addr.String())
 	}
 	deadline, err := c.writeState()
 	if err != nil {

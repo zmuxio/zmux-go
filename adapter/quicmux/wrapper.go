@@ -467,43 +467,36 @@ func (s *quicSession) ensureUniAcceptLoop() <-chan uniAcceptResult {
 }
 
 func (s *quicSession) acceptBidiLoop() {
-	for {
-		stream, err := s.conn.AcceptStream(context.Background())
-		if err != nil {
-			s.publishBidiAcceptResult(bidiAcceptResult{err: translateError(err)})
-			return
-		}
-		if !s.acquirePrepareSlot() {
-			discardAcceptedBidiStream(stream)
-			return
-		}
-		if !s.startInternal(func() {
-			defer s.releasePrepareSlot()
-			s.prepareAcceptedBidiStream(stream)
-		}) {
-			s.releasePrepareSlot()
-			discardAcceptedBidiStream(stream)
-		}
-	}
+	runAcceptedStreamLoop(s, s.conn.AcceptStream, publishBidiAcceptError, discardAcceptedRawBidiStream, (*quicSession).prepareAcceptedBidiStream)
 }
 
 func (s *quicSession) acceptUniLoop() {
+	runAcceptedStreamLoop(s, s.conn.AcceptUniStream, publishUniAcceptError, discardAcceptedRawUniStream, (*quicSession).prepareAcceptedUniStream)
+}
+
+func runAcceptedStreamLoop[Raw any](
+	s *quicSession,
+	accept func(context.Context) (Raw, error),
+	publishErr func(*quicSession, error),
+	discard func(Raw),
+	prepare func(*quicSession, Raw),
+) {
 	for {
-		stream, err := s.conn.AcceptUniStream(context.Background())
+		stream, err := accept(context.Background())
 		if err != nil {
-			s.publishUniAcceptResult(uniAcceptResult{err: translateError(err)})
+			publishErr(s, translateError(err))
 			return
 		}
 		if !s.acquirePrepareSlot() {
-			discardAcceptedUniStream(stream)
+			discard(stream)
 			return
 		}
 		if !s.startInternal(func() {
 			defer s.releasePrepareSlot()
-			s.prepareAcceptedUniStream(stream)
+			prepare(s, stream)
 		}) {
 			s.releasePrepareSlot()
-			discardAcceptedUniStream(stream)
+			discard(stream)
 		}
 	}
 }
@@ -608,6 +601,14 @@ func discardAcceptedUniStream(stream acceptedUniDiscarder) {
 	stream.CancelRead(quic.StreamErrorCode(zmux.CodeCancelled))
 }
 
+func discardAcceptedRawBidiStream(stream *quic.Stream) {
+	discardAcceptedBidiStream(stream)
+}
+
+func discardAcceptedRawUniStream(stream *quic.ReceiveStream) {
+	discardAcceptedUniStream(stream)
+}
+
 type acceptedPreparedStream interface {
 	activate(*quicActiveStreamCounters, quicActiveStreamKind)
 	CloseWithError(uint64, string) error
@@ -636,6 +637,14 @@ func publishAcceptedBidiStream(s *quicSession, stream *quicStream) bool {
 
 func publishAcceptedUniStream(s *quicSession, stream *quicRecvStream) bool {
 	return s.publishUniAcceptResult(uniAcceptResult{stream: stream})
+}
+
+func publishBidiAcceptError(s *quicSession, err error) {
+	_ = s.publishBidiAcceptResult(bidiAcceptResult{err: err})
+}
+
+func publishUniAcceptError(s *quicSession, err error) {
+	_ = s.publishUniAcceptResult(uniAcceptResult{err: err})
 }
 
 func (s *quicSession) prepareAcceptedBidiStream(stream *quic.Stream) {
