@@ -2,10 +2,13 @@ package zmux
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -16,13 +19,18 @@ import (
 	"github.com/zmuxio/zmux-go/internal/testutil"
 )
 
+// The wire fixture types list every field the vendored bundle uses, and
+// TestWireFixtureFieldsAreAllAsserted rejects any other key, so a new upstream
+// expectation fails loudly until the harness asserts it.
 type wireFixture struct {
 	ID             string             `json:"id"`
+	Source         string             `json:"source"`
 	Category       string             `json:"category"`
 	Hex            string             `json:"hex"`
 	Expect         wireFixtureExpect  `json:"expect"`
 	ExpectError    string             `json:"expect_error"`
 	ReceiverLimits *wireFixtureLimits `json:"receiver_limits"`
+	Notes          string             `json:"notes"`
 }
 
 type wireFixtureLimits struct {
@@ -39,21 +47,40 @@ type wireFixtureExpect struct {
 	MaxProto        *uint64                  `json:"max_proto"`
 	Capabilities    *uint64                  `json:"capabilities"`
 	SettingsLen     *uint64                  `json:"settings_len"`
+	Settings        map[string]uint64        `json:"settings"`
 	FrameLength     *uint64                  `json:"frame_length"`
 	FrameType       string                   `json:"frame_type"`
 	Flags           []string                 `json:"flags"`
 	StreamID        *uint64                  `json:"stream_id"`
-	PayloadHex      string                   `json:"payload_hex"`
+	PayloadHex      *string                  `json:"payload_hex"`
 	Decoded         wireFixtureDecodedExpect `json:"decoded"`
 }
 
 type wireFixtureDecodedExpect struct {
-	MaxOffset             *uint64                 `json:"max_offset"`
-	BlockedAt             *uint64                 `json:"blocked_at"`
-	ErrorCode             *uint64                 `json:"error_code"`
-	ExtType               string                  `json:"ext_type"`
-	ApplicationPayloadHex string                  `json:"application_payload_hex"`
-	StreamMetadataTLVs    []wireMetadataTLVExpect `json:"stream_metadata_tlvs"`
+	MaxOffset                *uint64                   `json:"max_offset"`
+	BlockedAt                *uint64                   `json:"blocked_at"`
+	ErrorCode                *uint64                   `json:"error_code"`
+	DebugText                *string                   `json:"debug_text"`
+	DiagBlockDropped         *bool                     `json:"diag_block_dropped"`
+	GoAway                   *wireGoAwayExpect         `json:"goaway"`
+	ExtType                  string                    `json:"ext_type"`
+	ExtTypeValue             *uint64                   `json:"ext_type_value"`
+	ApplicationPayloadHex    *string                   `json:"application_payload_hex"`
+	StreamMetadataTLVs       []wireMetadataTLVExpect   `json:"stream_metadata_tlvs"`
+	OpenMetadataBlockDropped *bool                     `json:"open_metadata_block_dropped"`
+	PingPaddingTag           *wirePingPaddingTagExpect `json:"ping_padding_tag"`
+}
+
+type wireGoAwayExpect struct {
+	LastAcceptedBidiStreamID *uint64 `json:"last_accepted_bidi_stream_id"`
+	LastAcceptedUniStreamID  *uint64 `json:"last_accepted_uni_stream_id"`
+	ErrorCode                *uint64 `json:"error_code"`
+}
+
+type wirePingPaddingTagExpect struct {
+	PingPaddingKey uint64 `json:"ping_padding_key"`
+	TokenHex       string `json:"token_hex"`
+	TagHex         string `json:"tag_hex"`
 }
 
 type wireMetadataTLVExpect struct {
@@ -101,7 +128,52 @@ func TestWireInvalidFixtures(t *testing.T) {
 			if got := code.String(); got != fixture.ExpectError {
 				t.Fatalf("error code = %s, want %s", got, fixture.ExpectError)
 			}
+			if fixture.Category != "frame_invalid" {
+				return
+			}
+			// The session reads frames from a stream, not a buffer; both
+			// readers must classify a complete invalid frame the same way.
+			for name, read := range map[string]func() error{
+				"ReadFrame": func() error {
+					_, err := ReadFrame(bytes.NewReader(raw), fixtureLimits(fixture.ReceiverLimits))
+					return err
+				},
+				"session reader": func() error {
+					_, _, _, err := readSessionFrameBuffered(bytes.NewReader(raw), fixtureLimits(fixture.ReceiverLimits), nil)
+					return err
+				},
+			} {
+				err := read()
+				code, ok := ErrorCodeOf(err)
+				if !ok || code.String() != fixture.ExpectError {
+					t.Fatalf("%s err = %v, want %s", name, err, fixture.ExpectError)
+				}
+			}
 		})
+	}
+}
+
+func TestWireFixtureFieldsAreAllAsserted(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"wire_valid.ndjson", "wire_invalid.ndjson"} {
+		file, err := os.Open(filepath.Join(testutil.LocateFixtureDir(t), name))
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		decoder := json.NewDecoder(file)
+		decoder.DisallowUnknownFields()
+		for {
+			var fixture wireFixture
+			err := decoder.Decode(&fixture)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				_ = file.Close()
+				t.Fatalf("%s: fixture %q has a field the harness does not assert: %v", name, fixture.ID, err)
+			}
+		}
+		_ = file.Close()
 	}
 }
 
@@ -153,12 +225,121 @@ func assertPrefaceFixture(t *testing.T, raw []byte, expect wireFixtureExpect) {
 		t.Fatalf("capabilities = %d, want %d", preface.Capabilities, *expect.Capabilities)
 	}
 	if expect.SettingsLen != nil {
-		settings, err := marshalSettingsTLV(preface.Settings)
-		if err != nil {
-			t.Fatalf("marshal parsed settings: %v", err)
-		}
-		if got := uint64(len(settings)); got != *expect.SettingsLen {
+		// settings_len is the raw field: it counts preface_padding, which the
+		// parsed preface drops, so re-encoded settings can be shorter.
+		if got := rawPrefaceSettingsLen(t, raw); got != *expect.SettingsLen {
 			t.Fatalf("settings_len = %d, want %d", got, *expect.SettingsLen)
+		}
+	}
+	if expect.Settings != nil {
+		assertPrefaceFixtureSettings(t, preface.Settings, expect.Settings)
+	}
+
+	read, err := ReadPreface(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("read preface: %v", err)
+	}
+	if read != preface {
+		t.Fatalf("ReadPreface = %+v, ParsePreface = %+v", read, preface)
+	}
+	// Padding does not survive decode and re-encode, so round-trip the
+	// decoded preface rather than the bytes.
+	encoded, err := preface.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal parsed preface: %v", err)
+	}
+	reparsed, err := ParsePreface(encoded)
+	if err != nil {
+		t.Fatalf("parse re-encoded preface: %v", err)
+	}
+	if reparsed != preface {
+		t.Fatalf("re-encoded preface = %+v, want %+v", reparsed, preface)
+	}
+}
+
+// rawPrefaceSettingsLen reads settings_len from the preface bytes:
+// magic, preface_ver and role, then the tie_breaker_nonce, min_proto,
+// max_proto, capabilities and settings_len varints.
+func rawPrefaceSettingsLen(t *testing.T, raw []byte) uint64 {
+	t.Helper()
+
+	offset := len(Magic) + 2
+	var value uint64
+	for i := 0; i < 5; i++ {
+		if offset > len(raw) {
+			t.Fatalf("preface % x ends before settings_len", raw)
+		}
+		v, n, err := ParseVarint(raw[offset:])
+		if err != nil {
+			t.Fatalf("parse preface header varint %d: %v", i, err)
+		}
+		offset += n
+		value = v
+	}
+	return value
+}
+
+var fixtureSettingNames = []string{
+	"initial_max_stream_data_bidi_locally_opened",
+	"initial_max_stream_data_bidi_peer_opened",
+	"initial_max_stream_data_uni",
+	"initial_max_data",
+	"max_incoming_streams_bidi",
+	"max_incoming_streams_uni",
+	"max_frame_payload",
+	"max_control_payload_bytes",
+	"max_extension_payload_bytes",
+	"scheduler_hints",
+	"ping_padding_key",
+}
+
+func fixtureSettingValue(settings Settings, name string) (uint64, bool) {
+	switch name {
+	case "initial_max_stream_data_bidi_locally_opened":
+		return settings.InitialMaxStreamDataBidiLocallyOpened, true
+	case "initial_max_stream_data_bidi_peer_opened":
+		return settings.InitialMaxStreamDataBidiPeerOpened, true
+	case "initial_max_stream_data_uni":
+		return settings.InitialMaxStreamDataUni, true
+	case "initial_max_data":
+		return settings.InitialMaxData, true
+	case "max_incoming_streams_bidi":
+		return settings.MaxIncomingStreamsBidi, true
+	case "max_incoming_streams_uni":
+		return settings.MaxIncomingStreamsUni, true
+	case "max_frame_payload":
+		return settings.MaxFramePayload, true
+	case "max_control_payload_bytes":
+		return settings.MaxControlPayloadBytes, true
+	case "max_extension_payload_bytes":
+		return settings.MaxExtensionPayloadBytes, true
+	case "scheduler_hints":
+		return uint64(settings.SchedulerHints), true
+	case "ping_padding_key":
+		return settings.PingPaddingKey, true
+	default:
+		return 0, false
+	}
+}
+
+// assertPrefaceFixtureSettings checks the settings a fixture lists and that
+// every other setting keeps its default.
+func assertPrefaceFixtureSettings(t *testing.T, got Settings, expect map[string]uint64) {
+	t.Helper()
+
+	for name := range expect {
+		if _, ok := fixtureSettingValue(got, name); !ok {
+			t.Fatalf("fixture expects unknown setting %q", name)
+		}
+	}
+	defaults := DefaultSettings()
+	for _, name := range fixtureSettingNames {
+		want, listed := expect[name]
+		if !listed {
+			want, _ = fixtureSettingValue(defaults, name)
+		}
+		if value, _ := fixtureSettingValue(got, name); value != want {
+			t.Fatalf("setting %s = %d, want %d", name, value, want)
 		}
 	}
 }
@@ -193,10 +374,18 @@ func assertFrameFixture(t *testing.T, raw []byte, expect wireFixtureExpect) {
 			t.Fatalf("flags = %v, want %v", gotFlags, expect.Flags)
 		}
 	}
-	if expect.PayloadHex != "" {
-		if got := fmt.Sprintf("%x", frame.Payload); got != strings.ToLower(expect.PayloadHex) {
-			t.Fatalf("payload_hex = %s, want %s", got, strings.ToLower(expect.PayloadHex))
+	if expect.PayloadHex != nil {
+		if got := fmt.Sprintf("%x", frame.Payload); got != strings.ToLower(*expect.PayloadHex) {
+			t.Fatalf("payload_hex = %s, want %s", got, strings.ToLower(*expect.PayloadHex))
 		}
+	}
+
+	read, err := ReadFrame(bytes.NewReader(raw), DefaultSettings().Limits())
+	if err != nil {
+		t.Fatalf("read frame: %v", err)
+	}
+	if read.Type != frame.Type || read.Flags != frame.Flags || read.StreamID != frame.StreamID || !bytes.Equal(read.Payload, frame.Payload) {
+		t.Fatalf("ReadFrame = %+v, ParseFrame = %+v", read, frame)
 	}
 
 	assertDecodedFrameFixture(t, frame, expect.Decoded)
@@ -217,31 +406,38 @@ func assertDecodedFrameFixture(t *testing.T, frame Frame, expect wireFixtureDeco
 			t.Fatalf("blocked_at = %d, want %d", value, *expect.BlockedAt)
 		}
 	}
-	if expect.ErrorCode != nil {
-		code, _, err := parseErrorPayload(frame.Payload)
+	if expect.ErrorCode != nil || expect.DebugText != nil || expect.DiagBlockDropped != nil {
+		assertErrorPayloadFixture(t, frame, expect)
+	}
+	if expect.GoAway != nil {
+		goAway, err := parseGOAWAYPayload(frame.Payload)
 		if err != nil {
-			t.Fatalf("parse error payload: %v", err)
+			t.Fatalf("parse GOAWAY payload: %v", err)
 		}
-		if code != *expect.ErrorCode {
-			t.Fatalf("error_code = %d, want %d", code, *expect.ErrorCode)
+		for _, field := range []struct {
+			name string
+			got  uint64
+			want *uint64
+		}{
+			{"last_accepted_bidi_stream_id", goAway.LastAcceptedBidi, expect.GoAway.LastAcceptedBidiStreamID},
+			{"last_accepted_uni_stream_id", goAway.LastAcceptedUni, expect.GoAway.LastAcceptedUniStreamID},
+			{"error_code", goAway.Code, expect.GoAway.ErrorCode},
+		} {
+			if field.want == nil {
+				t.Fatalf("goaway expectation is missing %s", field.name)
+			}
+			if field.got != *field.want {
+				t.Fatalf("goaway %s = %d, want %d", field.name, field.got, *field.want)
+			}
 		}
 	}
-	if len(expect.StreamMetadataTLVs) == 0 && expect.ApplicationPayloadHex == "" && expect.ExtType == "" {
-		return
+	if expect.PingPaddingTag != nil {
+		assertPingPaddingTagFixture(t, frame, *expect.PingPaddingTag)
 	}
 
 	switch frame.Type {
 	case FrameTypeDATA:
-		payload, err := parseDataPayload(frame.Payload, frame.Flags)
-		if err != nil {
-			t.Fatalf("parse DATA payload: %v", err)
-		}
-		assertMetadataTLVs(t, payload.MetadataTLVs, expect.StreamMetadataTLVs)
-		if expect.ApplicationPayloadHex != "" {
-			if got := fmt.Sprintf("%x", payload.AppData); got != strings.ToLower(expect.ApplicationPayloadHex) {
-				t.Fatalf("application_payload_hex = %s, want %s", got, strings.ToLower(expect.ApplicationPayloadHex))
-			}
-		}
+		assertDataPayloadFixture(t, frame, expect)
 	case FrameTypeEXT:
 		extType, n, err := ParseVarint(frame.Payload)
 		if err != nil {
@@ -250,20 +446,132 @@ func assertDecodedFrameFixture(t *testing.T, frame Frame, expect wireFixtureDeco
 		if expect.ExtType != "" && extSubtypeName(extType) != expect.ExtType {
 			t.Fatalf("ext_type = %q, want %q", extSubtypeName(extType), expect.ExtType)
 		}
-		tlvs, err := ParseTLVs(frame.Payload[n:])
-		if err != nil {
-			t.Fatalf("parse EXT TLVs: %v", err)
+		if expect.ExtTypeValue != nil && extType != *expect.ExtTypeValue {
+			t.Fatalf("ext_type value = %d, want %d", extType, *expect.ExtTypeValue)
 		}
-		assertMetadataTLVs(t, tlvs, expect.StreamMetadataTLVs)
+		// Only PRIORITY_UPDATE has a TLV body; other subtypes are opaque.
+		if EXTSubtype(extType) == EXTPriorityUpdate {
+			tlvs, err := ParseTLVs(frame.Payload[n:])
+			if err != nil {
+				t.Fatalf("parse EXT TLVs: %v", err)
+			}
+			assertMetadataTLVs(t, tlvs, expect.StreamMetadataTLVs)
+		} else if expect.StreamMetadataTLVs != nil {
+			t.Fatalf("stream_metadata_tlvs expected on EXT subtype %d", extType)
+		}
 	default:
-		t.Fatalf("decoded expectation unsupported for frame type %s", frame.Type)
+		if expect.ExtType != "" || expect.ExtTypeValue != nil || expect.StreamMetadataTLVs != nil ||
+			expect.ApplicationPayloadHex != nil || expect.OpenMetadataBlockDropped != nil {
+			t.Fatalf("decoded DATA/EXT expectation unsupported for frame type %s", frame.Type)
+		}
+	}
+}
+
+// assertErrorPayloadFixture checks error_code, debug_text and
+// diag_block_dropped of a frame whose payload ends in a DIAG block: the
+// error-carrying frames, or GOAWAY after its watermarks.
+func assertErrorPayloadFixture(t *testing.T, frame Frame, expect wireFixtureDecodedExpect) {
+	t.Helper()
+
+	var (
+		code      uint64
+		reason    string
+		mandatory int
+		err       error
+	)
+	if frame.Type == FrameTypeGOAWAY {
+		var goAway goAwayPayload
+		goAway, err = parseGOAWAYPayload(frame.Payload)
+		code, reason, mandatory = goAway.Code, goAway.Reason, 3
+	} else {
+		code, reason, err = parseErrorPayload(frame.Payload)
+		mandatory = 1
+	}
+	if err != nil {
+		t.Fatalf("parse %s payload: %v", frame.Type, err)
+	}
+	if expect.ErrorCode != nil && code != *expect.ErrorCode {
+		t.Fatalf("error_code = %d, want %d", code, *expect.ErrorCode)
+	}
+	if expect.DebugText != nil && reason != *expect.DebugText {
+		t.Fatalf("debug_text = %q, want %q", reason, *expect.DebugText)
+	}
+	if expect.DiagBlockDropped != nil && *expect.DiagBlockDropped {
+		diag := frame.Payload
+		for i := 0; i < mandatory; i++ {
+			_, n, err := ParseVarint(diag)
+			if err != nil {
+				t.Fatalf("parse %s mandatory field %d: %v", frame.Type, i, err)
+			}
+			diag = diag[n:]
+		}
+		if len(diag) == 0 {
+			t.Fatal("diag_block_dropped expected, but the payload carries no DIAG block")
+		}
+		if reason != "" {
+			t.Fatalf("debug_text = %q from a dropped DIAG block, want none", reason)
+		}
+	}
+}
+
+func assertDataPayloadFixture(t *testing.T, frame Frame, expect wireFixtureDecodedExpect) {
+	t.Helper()
+
+	payload, err := parseDataPayload(frame.Payload, frame.Flags)
+	if err != nil {
+		t.Fatalf("parse DATA payload: %v", err)
+	}
+	assertMetadataTLVs(t, payload.MetadataTLVs, expect.StreamMetadataTLVs)
+	if expect.ApplicationPayloadHex != nil {
+		if got := fmt.Sprintf("%x", payload.AppData); got != strings.ToLower(*expect.ApplicationPayloadHex) {
+			t.Fatalf("application_payload_hex = %s, want %s", got, strings.ToLower(*expect.ApplicationPayloadHex))
+		}
+	}
+	if expect.OpenMetadataBlockDropped == nil {
+		return
+	}
+	metadataLen, _, err := ParseVarint(frame.Payload)
+	if err != nil || frame.Flags&FrameFlagOpenMetadata == 0 {
+		t.Fatalf("open_metadata_block_dropped expected on DATA without an OPEN_METADATA block (err %v)", err)
+	}
+	dropped := len(payload.MetadataTLVs) == 0 && !payload.Metadata.HasPriority && !payload.Metadata.HasGroup &&
+		payload.Metadata.OpenInfo == nil && payload.OpenInfo == nil
+	if metadataLen == 0 {
+		t.Fatal("open_metadata_block_dropped expected on an empty metadata block")
+	}
+	if dropped != *expect.OpenMetadataBlockDropped {
+		t.Fatalf("open metadata block dropped = %v, want %v (parsed %+v)", dropped, *expect.OpenMetadataBlockDropped, payload)
+	}
+}
+
+// assertPingPaddingTagFixture checks the ping_padding_tag known-answer vector
+// (SPEC 6.4) against the tag the session uses to recognize padded PINGs.
+func assertPingPaddingTagFixture(t *testing.T, frame Frame, expect wirePingPaddingTagExpect) {
+	t.Helper()
+
+	token := mustHex(t, expect.TokenHex)
+	tag := mustHex(t, expect.TagHex)
+	if len(token) != pingNonceBytes || len(tag) != pingPaddingTagBytes {
+		t.Fatalf("ping_padding_tag token/tag lengths = %d/%d, want %d/%d", len(token), len(tag), pingNonceBytes, pingPaddingTagBytes)
+	}
+	if !bytes.HasPrefix(frame.Payload, append(append([]byte(nil), token...), tag...)) {
+		t.Fatalf("PING payload %x does not start with token %x and tag %x", frame.Payload, token, tag)
+	}
+	if got := pingPaddingTag(expect.PingPaddingKey, binary.BigEndian.Uint64(token)); got != binary.BigEndian.Uint64(tag) {
+		t.Fatalf("ping_padding_tag(%#x, %x) = %016x, want %x", expect.PingPaddingKey, token, got, tag)
+	}
+	if !hasPingPaddingTag(frame.Payload, expect.PingPaddingKey) {
+		t.Fatal("padded PING is not recognized under its ping_padding_key")
+	}
+	if hasPingPaddingTag(frame.Payload, expect.PingPaddingKey+1) {
+		t.Fatal("padded PING is recognized under a different ping_padding_key")
 	}
 }
 
 func assertMetadataTLVs(t *testing.T, actual []TLV, expect []wireMetadataTLVExpect) {
 	t.Helper()
 
-	if len(expect) == 0 {
+	if expect == nil {
 		return
 	}
 	if len(actual) != len(expect) {
@@ -774,6 +1082,18 @@ var supportedInvalidFixtureIDs = map[string]bool{
 	"preface_frame_payload_limit_too_small":                          true,
 	"preface_control_payload_limit_too_small":                        true,
 	"preface_extension_payload_limit_too_small":                      true,
+	"preface_invalid_magic":                                          true,
+	"preface_unsupported_preface_ver":                                true,
+	"preface_no_protocol_version_overlap":                            true,
+	"preface_explicit_same_role_conflict":                            true,
+	"preface_settings_len_exceeds_limit":                             true,
+	"preface_duplicate_padding":                                      true,
+	"preface_duplicate_unknown_setting_id":                           true,
+	"preface_setting_empty_value":                                    true,
+	"preface_setting_truncated_value":                                true,
+	"preface_setting_noncanonical_value":                             true,
+	"preface_setting_trailing_byte":                                  true,
+	"preface_settings_tlv_overrun":                                   true,
 	"frame_length_too_small":                                         true,
 	"frame_ext_payload_underflow":                                    true,
 	"frame_length_smaller_than_stream_id_prefix":                     true,
@@ -787,6 +1107,7 @@ var supportedInvalidFixtureIDs = map[string]bool{
 	"frame_priority_update_duplicate_singleton":                      true,
 	"frame_priority_update_truncated_tlv_header":                     true,
 	"frame_priority_update_tlv_value_overrun":                        true,
+	"frame_priority_update_noncanonical_value":                       true,
 	"frame_priority_update_without_capability":                       true,
 	"frame_priority_update_on_unused_stream":                         true,
 	"frame_priority_update_on_terminal_stream":                       true,
@@ -802,6 +1123,7 @@ var supportedInvalidFixtureIDs = map[string]bool{
 	"frame_data_exceeds_session_max_data":                            true,
 	"frame_peer_stream_id_gap":                                       true,
 	"frame_blocked_wrong_side_uni":                                   true,
+	"frame_data_wrong_side_uni":                                      true,
 	"frame_max_data_wrong_side_uni":                                  true,
 	"frame_stop_sending_wrong_side_uni":                              true,
 	"frame_reset_wrong_side_uni":                                     true,
@@ -826,6 +1148,7 @@ var supportedFrameInvalidFixtureIDs = map[string]bool{
 	"frame_priority_update_duplicate_singleton":       true,
 	"frame_priority_update_truncated_tlv_header":      true,
 	"frame_priority_update_tlv_value_overrun":         true,
+	"frame_priority_update_noncanonical_value":        true,
 	"frame_priority_update_without_capability":        true,
 	"frame_priority_update_on_unused_stream":          true,
 	"frame_priority_update_on_terminal_stream":        true,
@@ -841,6 +1164,7 @@ var supportedFrameInvalidFixtureIDs = map[string]bool{
 	"frame_data_exceeds_session_max_data":             true,
 	"frame_peer_stream_id_gap":                        true,
 	"frame_blocked_wrong_side_uni":                    true,
+	"frame_data_wrong_side_uni":                       true,
 	"frame_max_data_wrong_side_uni":                   true,
 	"frame_stop_sending_wrong_side_uni":               true,
 	"frame_reset_wrong_side_uni":                      true,
@@ -872,95 +1196,74 @@ func runInvalidFixture(t *testing.T, fixture invalidFixture) {
 	t.Helper()
 
 	var err error
-	switch fixture.ID {
-	case "preface_duplicate_setting_id":
-		err = runInvalidPrefaceDuplicateSettingID()
-	case "preface_invalid_role_value":
-		err = runInvalidPrefaceRoleValue()
-	case "preface_auto_equal_nonce_conflict":
-		err = runInvalidPrefaceAutoEqualNonce()
-	case "preface_auto_zero_nonce":
-		err = runInvalidPrefaceAutoZeroNonce()
-	case "preface_frame_payload_limit_too_small":
-		err = runInvalidPrefaceMinLimit(SettingMaxFramePayload, 16383)
-	case "preface_control_payload_limit_too_small":
-		err = runInvalidPrefaceMinLimit(SettingMaxControlPayloadBytes, 4095)
-	case "preface_extension_payload_limit_too_small":
-		err = runInvalidPrefaceMinLimit(SettingMaxExtensionPayloadBytes, 4095)
-	case "frame_length_too_small":
-		err = runInvalidFrameLengthTooSmall()
-	case "frame_ext_payload_underflow":
-		err = runInvalidFrameExtPayloadUnderflow(t)
-	case "frame_length_smaller_than_stream_id_prefix":
-		err = runInvalidFrameLengthSmallerThanStreamIDPrefix()
-	case "frame_ping_with_forbidden_fin_flag":
-		err = runInvalidFramePingWithForbiddenFinFlag(t)
-	case "frame_pong_too_short":
-		err = runInvalidFramePongTooShort(t)
-	case "frame_ping_payload_exceeds_local_echoable_limit":
-		err = runInvalidFramePingPayloadExceedsLocalEchoableLimit(t)
-	case "frame_abort_on_stream_zero":
-		err = runInvalidFrameAbortOnStreamZero(t)
-	case "frame_max_data_trailing_garbage":
-		err = runInvalidFrameMaxDataTrailingGarbage(t)
-	case "frame_blocked_trailing_garbage":
-		err = runInvalidFrameBlockedTrailingGarbage(t)
-	case "frame_unknown_core_type":
-		err = runInvalidFrameUnknownCoreType(t)
-	case "frame_priority_update_duplicate_singleton":
-		err = runInvalidPriorityUpdateDuplicateSingleton(t)
-	case "frame_priority_update_truncated_tlv_header":
-		err = runInvalidPriorityUpdateTruncatedTLVHeader(t)
-	case "frame_priority_update_tlv_value_overrun":
-		err = runInvalidPriorityUpdateTLVValueOverrun(t)
-	case "frame_priority_update_without_capability":
-		err = runInvalidPriorityUpdateWithoutCapability(t)
-	case "frame_priority_update_on_unused_stream":
-		err = runInvalidPriorityUpdateOnUnusedStream(t)
-	case "frame_priority_update_on_terminal_stream":
-		err = runInvalidPriorityUpdateOnTerminalStream(t)
-	case "frame_unknown_ext_subtype":
-		err = runInvalidUnknownExtSubtype(t)
-	case "frame_data_open_metadata_without_capability":
-		err = runInvalidDataOpenMetadataWithoutCapability(t)
-	case "frame_data_open_metadata_on_open_stream":
-		err = runInvalidDataOpenMetadataOnOpenStream(t)
-	case "frame_data_open_metadata_duplicate_singleton":
-		err = runInvalidDataOpenMetadataDuplicateSingleton(t)
-	case "frame_first_max_data_on_unused_stream":
-		err = runInvalidFirstMaxDataOnUnusedStream(t)
-	case "frame_first_blocked_on_unused_stream":
-		err = runInvalidFirstBlockedOnUnusedStream(t)
-	case "frame_first_stop_sending_on_unused_stream":
-		err = runInvalidFirstStopSendingOnUnusedStream(t)
-	case "frame_first_reset_on_unused_stream":
-		err = runInvalidFirstResetOnUnusedStream(t)
-	case "frame_data_exceeds_stream_max_data":
-		err = runInvalidDataExceedsStreamMaxData(t)
-	case "frame_data_exceeds_session_max_data":
-		err = runInvalidDataExceedsSessionMaxData(t)
-	case "frame_peer_stream_id_gap":
-		err = runInvalidPeerStreamIDGap(t)
-	case "frame_blocked_wrong_side_uni":
-		err = runInvalidBlockedWrongSideUni(t)
-	case "frame_max_data_wrong_side_uni":
-		err = runInvalidMaxDataWrongSideUni(t)
-	case "frame_stop_sending_wrong_side_uni":
-		err = runInvalidStopSendingWrongSideUni(t)
-	case "frame_reset_wrong_side_uni":
-		err = runInvalidResetWrongSideUni(t)
-	case "hidden_control_opened_stream_exceeds_hard_cap_without_shedding":
-		err = runInvalidHiddenControlOpenedHardCap(t)
-	case "local_provisional_open_cancel_must_not_burn_stream_id":
-		err = runInvalidLocalProvisionalOpenCancelMustNotBurnID(t)
-	case "late_data_after_close_read_exceeds_session_aggregate_cap":
-		err = runInvalidLateDataAfterCloseReadAggregateCap(t)
-	case "rapid_open_abort_churn_without_local_limit":
-		err = runInvalidRapidOpenAbortChurn(t)
-	case "session_goaway_last_accepted_increase":
-		err = runInvalidSessionGoAwayIncrease(t)
-	default:
-		t.Fatalf("unsupported invalid fixture %q", fixture.ID)
+	if raw, ok := invalidFixtureFrameBytes(t, fixture); ok {
+		err = runInvalidFrameBytes(raw)
+	} else if fixture.Category == "preface" && fixture.Hex != "" {
+		err = runInvalidPrefaceHex(t, fixture)
+	} else {
+		switch fixture.ID {
+		case "preface_duplicate_setting_id":
+			err = runInvalidPrefaceDuplicateSettingID(t, fixture)
+		case "preface_auto_equal_nonce_conflict",
+			"preface_explicit_same_role_conflict",
+			"preface_no_protocol_version_overlap":
+			err = runInvalidPrefaceNegotiation(t, fixture)
+		case "preface_frame_payload_limit_too_small",
+			"preface_control_payload_limit_too_small",
+			"preface_extension_payload_limit_too_small":
+			err = runInvalidPrefaceMinLimit(t, fixture)
+		case "frame_ping_payload_exceeds_local_echoable_limit":
+			err = runInvalidFramePingPayloadExceedsLocalEchoableLimit(t)
+		case "frame_priority_update_duplicate_singleton":
+			err = runInvalidPriorityUpdateDuplicateSingleton(t)
+		case "frame_priority_update_without_capability":
+			err = runInvalidPriorityUpdateWithoutCapability(t)
+		case "frame_priority_update_on_unused_stream":
+			err = runInvalidPriorityUpdateOnUnusedStream(t)
+		case "frame_priority_update_on_terminal_stream":
+			err = runInvalidPriorityUpdateOnTerminalStream(t)
+		case "frame_unknown_ext_subtype":
+			err = runInvalidUnknownExtSubtype(t)
+		case "frame_data_open_metadata_without_capability":
+			err = runInvalidDataOpenMetadataWithoutCapability(t)
+		case "frame_data_open_metadata_on_open_stream":
+			err = runInvalidDataOpenMetadataOnOpenStream(t)
+		case "frame_data_open_metadata_duplicate_singleton":
+			err = runInvalidDataOpenMetadataDuplicateSingleton(t)
+		case "frame_first_max_data_on_unused_stream",
+			"frame_first_blocked_on_unused_stream",
+			"frame_first_stop_sending_on_unused_stream",
+			"frame_first_reset_on_unused_stream":
+			err = runInvalidFirstFrameOnUnusedStream(t, fixture)
+		case "frame_data_exceeds_stream_max_data":
+			err = runInvalidDataExceedsStreamMaxData(t)
+		case "frame_data_exceeds_session_max_data":
+			err = runInvalidDataExceedsSessionMaxData(t)
+		case "frame_peer_stream_id_gap":
+			err = runInvalidPeerStreamIDGap(t)
+		case "frame_blocked_wrong_side_uni":
+			err = runInvalidBlockedWrongSideUni(t)
+		case "frame_data_wrong_side_uni":
+			err = runInvalidDataWrongSideUni(t)
+		case "frame_max_data_wrong_side_uni":
+			err = runInvalidMaxDataWrongSideUni(t)
+		case "frame_stop_sending_wrong_side_uni":
+			err = runInvalidStopSendingWrongSideUni(t)
+		case "frame_reset_wrong_side_uni":
+			err = runInvalidResetWrongSideUni(t)
+		case "hidden_control_opened_stream_exceeds_hard_cap_without_shedding":
+			err = runInvalidHiddenControlOpenedHardCap(t)
+		case "local_provisional_open_cancel_must_not_burn_stream_id":
+			err = runInvalidLocalProvisionalOpenCancelMustNotBurnID(t)
+		case "late_data_after_close_read_exceeds_session_aggregate_cap":
+			err = runInvalidLateDataAfterCloseReadAggregateCap(t)
+		case "rapid_open_abort_churn_without_local_limit":
+			err = runInvalidRapidOpenAbortChurn(t)
+		case "session_goaway_last_accepted_increase":
+			err = runInvalidSessionGoAwayIncrease(t)
+		default:
+			t.Fatalf("unsupported invalid fixture %q", fixture.ID)
+		}
 	}
 
 	if fixture.ExpectedResult.Action != "" {
@@ -970,85 +1273,219 @@ func runInvalidFixture(t *testing.T, fixture invalidFixture) {
 		return
 	}
 
-	want := expectedInvalidFixtureCode(t, fixture)
+	want := fixtureErrorCode(t, fixture.ExpectedResult.Error)
 	if !IsErrorCode(err, want) {
 		t.Fatalf("fixture %q err = %v, want %s", fixture.ID, err, want)
 	}
+	assertInvalidFixtureScope(t, fixture, err)
 }
 
-func runInvalidPrefaceDuplicateSettingID() error {
+// assertInvalidFixtureScope checks that the runner's error has the fixture's
+// scope. Stream-scoped runners return an ApplicationError only after they saw
+// the stream-local ABORT; session and establishment failures are wire errors
+// that end the session.
+func assertInvalidFixtureScope(t *testing.T, fixture invalidFixture, err error) {
+	t.Helper()
+
+	var appErr *ApplicationError
+	streamLocal := errors.As(err, &appErr)
+	switch fixture.ExpectedResult.Scope {
+	case "stream":
+		if !streamLocal {
+			t.Fatalf("fixture %q err = %v, want a stream-local %s", fixture.ID, err, fixture.ExpectedResult.Error)
+		}
+	case "session", "session_establishment":
+		var wireErr *WireError
+		if streamLocal || !errors.As(err, &wireErr) {
+			t.Fatalf("fixture %q err = %v, want a %s %s error", fixture.ID, err, fixture.ExpectedResult.Scope, fixture.ExpectedResult.Error)
+		}
+	default:
+		t.Fatalf("fixture %q has unsupported error scope %q", fixture.ID, fixture.ExpectedResult.Scope)
+	}
+}
+
+// invalidFixtureFrameBytes returns the complete raw frame of an invalid
+// fixture that a receiver rejects from the frame bytes alone: the fixture's
+// hex when it has one, else the frame its input_shape describes.
+func invalidFixtureFrameBytes(t *testing.T, fixture invalidFixture) ([]byte, bool) {
+	t.Helper()
+
+	if fixture.Category == "frame" && fixture.Hex != "" {
+		return mustHex(t, fixture.Hex), true
+	}
+	switch fixture.ID {
+	case "frame_length_too_small":
+		// frame_length = 1; the receiver rejects it from the length alone.
+		return []byte{0x01}, true
+	case "frame_ext_payload_underflow":
+		return rawInvalidFrameBytes(t, byte(FrameTypeEXT), 0, nil), true
+	case "frame_length_smaller_than_stream_id_prefix":
+		// frame_length = 2 while stream_id 16384 needs a 4-byte encoding.
+		return append([]byte{0x02, byte(FrameTypeDATA)}, mustEncodeVarint(16384)...), true
+	case "frame_pong_too_short":
+		return rawInvalidFrameBytes(t, byte(FrameTypePONG), 0, []byte{1, 2, 3, 4, 5, 6, 7}), true
+	case "frame_abort_on_stream_zero":
+		return rawInvalidFrameBytes(t, byte(FrameTypeABORT), 0, mustEncodeVarint(uint64(CodeCancelled))), true
+	case "frame_max_data_trailing_garbage":
+		return rawInvalidFrameBytes(t, byte(FrameTypeMAXDATA), 0, append(mustEncodeVarint(1024), 0x01)), true
+	case "frame_blocked_trailing_garbage":
+		return rawInvalidFrameBytes(t, byte(FrameTypeBLOCKED), 0, append(mustEncodeVarint(1024), 0x01)), true
+	case "frame_priority_update_truncated_tlv_header":
+		payload := mustAppendInvalidVarint(t, nil, uint64(EXTPriorityUpdate))
+		payload = mustAppendInvalidVarint(t, payload, uint64(MetadataStreamPriority))
+		return rawInvalidFrameBytes(t, byte(FrameTypeEXT), 4, payload), true
+	case "frame_priority_update_tlv_value_overrun":
+		payload := mustAppendInvalidVarint(t, nil, uint64(EXTPriorityUpdate))
+		payload = mustAppendInvalidVarint(t, payload, uint64(MetadataStreamPriority))
+		payload = mustAppendInvalidVarint(t, payload, 2)
+		payload = append(payload, 0x01)
+		return rawInvalidFrameBytes(t, byte(FrameTypeEXT), 4, payload), true
+	default:
+		return nil, false
+	}
+}
+
+// runInvalidFrameBytes rejects raw through both frame readers, which must
+// report the same error.
+func runInvalidFrameBytes(raw []byte) error {
+	limits := DefaultSettings().Limits()
+	_, _, err := ParseFrame(raw, limits)
+	_, readErr := ReadFrame(bytes.NewReader(raw), limits)
+	parseCode, parseOK := ErrorCodeOf(err)
+	readCode, readOK := ErrorCodeOf(readErr)
+	if !parseOK || !readOK || parseCode != readCode {
+		return fmt.Errorf("ParseFrame err = %v, ReadFrame err = %v, want the same wire error", err, readErr)
+	}
+	return err
+}
+
+// runInvalidPrefaceHex parses a fixture's raw peer preface with both preface
+// readers, which must agree, and negotiates a preface they accept against a
+// compatible local preface.
+func runInvalidPrefaceHex(t *testing.T, fixture invalidFixture) error {
+	t.Helper()
+
+	raw := mustHex(t, fixture.Hex)
+	peer, err := ParsePreface(raw)
+	read, readErr := ReadPreface(bytes.NewReader(raw))
+	parseCode, parseOK := ErrorCodeOf(err)
+	readCode, readOK := ErrorCodeOf(readErr)
+	if (err == nil) != (readErr == nil) || parseOK != readOK || parseCode != readCode {
+		return fmt.Errorf("ParsePreface err = %v, ReadPreface err = %v, want the same result", err, readErr)
+	}
+	if err != nil {
+		return err
+	}
+	if read != peer {
+		return fmt.Errorf("ReadPreface = %+v, ParsePreface = %+v", read, peer)
+	}
+	localRole := RoleResponder
+	if peer.Role == RoleResponder {
+		localRole = RoleInitiator
+	}
+	_, err = NegotiatePrefaces(fixturePreface(localRole, 0), peer)
+	return err
+}
+
+type invalidPrefaceShape struct {
+	SettingIDs           []uint64 `json:"setting_ids"`
+	LocalRole            string   `json:"local_role"`
+	PeerRole             string   `json:"peer_role"`
+	LocalTieBreakerNonce uint64   `json:"local_tie_breaker_nonce"`
+	PeerTieBreakerNonce  uint64   `json:"peer_tie_breaker_nonce"`
+	LocalMinProto        *uint64  `json:"local_min_proto"`
+	LocalMaxProto        *uint64  `json:"local_max_proto"`
+	PeerMinProto         *uint64  `json:"peer_min_proto"`
+	PeerMaxProto         *uint64  `json:"peer_max_proto"`
+	Setting              string   `json:"setting"`
+	Value                *uint64  `json:"value"`
+}
+
+func decodeInvalidPrefaceShape(t *testing.T, fixture invalidFixture) invalidPrefaceShape {
+	t.Helper()
+
+	var shape invalidPrefaceShape
+	if err := json.Unmarshal(fixture.InputShape, &shape); err != nil {
+		t.Fatalf("decode input_shape for %s: %v", fixture.ID, err)
+	}
+	return shape
+}
+
+func fixtureRole(t *testing.T, name string) Role {
+	t.Helper()
+
+	for _, role := range []Role{RoleInitiator, RoleResponder, RoleAuto} {
+		if role.String() == name {
+			return role
+		}
+	}
+	t.Fatalf("unsupported fixture role %q", name)
+	return 0
+}
+
+func runInvalidPrefaceDuplicateSettingID(t *testing.T, fixture invalidFixture) error {
+	t.Helper()
+
+	shape := decodeInvalidPrefaceShape(t, fixture)
+	if len(shape.SettingIDs) < 2 {
+		t.Fatalf("fixture %s lists %d setting ids, want a duplicate", fixture.ID, len(shape.SettingIDs))
+	}
 	var settings []byte
-	settings, _ = AppendTLV(settings, uint64(SettingMaxIncomingStreamsBidi), mustEncodeVarint(100))
-	settings, _ = AppendTLV(settings, uint64(SettingMaxIncomingStreamsBidi), mustEncodeVarint(101))
+	for i, id := range shape.SettingIDs {
+		settings = mustAppendInvalidTLV(t, settings, id, mustEncodeVarint(uint64(100+i)))
+	}
 	_, err := ParsePreface(buildFixturePrefaceBytes(byte(RoleInitiator), 0, settings))
 	return err
 }
 
-func runInvalidPrefaceRoleValue() error {
-	_, err := ParsePreface(buildFixturePrefaceBytes(7, 0, nil))
-	return err
-}
+func runInvalidPrefaceNegotiation(t *testing.T, fixture invalidFixture) error {
+	t.Helper()
 
-func runInvalidPrefaceAutoEqualNonce() error {
-	local := fixturePreface(RoleAuto, 17)
-	peer := fixturePreface(RoleAuto, 17)
-	_, err := NegotiatePrefaces(local, peer)
-	return err
-}
-
-func runInvalidPrefaceAutoZeroNonce() error {
+	shape := decodeInvalidPrefaceShape(t, fixture)
 	local := fixturePreface(RoleInitiator, 0)
-	peer := fixturePreface(RoleAuto, 0)
+	peer := fixturePreface(RoleResponder, 0)
+	if shape.LocalRole != "" {
+		local = fixturePreface(fixtureRole(t, shape.LocalRole), shape.LocalTieBreakerNonce)
+	}
+	if shape.PeerRole != "" {
+		peer = fixturePreface(fixtureRole(t, shape.PeerRole), shape.PeerTieBreakerNonce)
+	}
+	for _, field := range []struct {
+		dst *uint64
+		src *uint64
+	}{
+		{&local.MinProto, shape.LocalMinProto},
+		{&local.MaxProto, shape.LocalMaxProto},
+		{&peer.MinProto, shape.PeerMinProto},
+		{&peer.MaxProto, shape.PeerMaxProto},
+	} {
+		if field.src != nil {
+			*field.dst = *field.src
+		}
+	}
 	_, err := NegotiatePrefaces(local, peer)
 	return err
 }
 
-func runInvalidPrefaceMinLimit(id SettingID, value uint64) error {
+func runInvalidPrefaceMinLimit(t *testing.T, fixture invalidFixture) error {
+	t.Helper()
+
+	shape := decodeInvalidPrefaceShape(t, fixture)
+	if shape.Value == nil {
+		t.Fatalf("fixture %s has no setting value", fixture.ID)
+	}
 	peer := fixturePreface(RoleResponder, 0)
-	switch id {
-	case SettingMaxFramePayload:
-		peer.Settings.MaxFramePayload = value
-	case SettingMaxControlPayloadBytes:
-		peer.Settings.MaxControlPayloadBytes = value
-	case SettingMaxExtensionPayloadBytes:
-		peer.Settings.MaxExtensionPayloadBytes = value
+	switch shape.Setting {
+	case "max_frame_payload":
+		peer.Settings.MaxFramePayload = *shape.Value
+	case "max_control_payload_bytes":
+		peer.Settings.MaxControlPayloadBytes = *shape.Value
+	case "max_extension_payload_bytes":
+		peer.Settings.MaxExtensionPayloadBytes = *shape.Value
 	default:
-		return fmt.Errorf("unsupported setting id %d", id)
+		t.Fatalf("fixture %s sets unsupported setting %q", fixture.ID, shape.Setting)
 	}
 	_, err := NegotiatePrefaces(fixturePreface(RoleInitiator, 0), peer)
-	return err
-}
-
-func runInvalidFrameLengthTooSmall() error {
-	_, _, err := ParseFrame([]byte{0x01}, DefaultSettings().Limits())
-	return err
-}
-
-func runInvalidFrameExtPayloadUnderflow(t *testing.T) error {
-	t.Helper()
-	raw := rawInvalidFrameBytes(t, byte(FrameTypeEXT), 0, nil)
-	_, _, err := ParseFrame(raw, DefaultSettings().Limits())
-	return err
-}
-
-func runInvalidFrameLengthSmallerThanStreamIDPrefix() error {
-	streamID := mustEncodeVarint(16384)
-	raw := []byte{0x02, byte(FrameTypeDATA)}
-	raw = append(raw, streamID...)
-	_, _, err := ParseFrame(raw, DefaultSettings().Limits())
-	return err
-}
-
-func runInvalidFramePingWithForbiddenFinFlag(t *testing.T) error {
-	t.Helper()
-	_, _, err := ParseFrame(mustHex(t, "0a44000102030405060708"), DefaultSettings().Limits())
-	return err
-}
-
-func runInvalidFramePongTooShort(t *testing.T) error {
-	t.Helper()
-	raw := rawInvalidFrameBytes(t, byte(FrameTypePONG), 0, []byte{1, 2, 3, 4, 5, 6, 7})
-	_, _, err := ParseFrame(raw, DefaultSettings().Limits())
 	return err
 }
 
@@ -1067,33 +1504,6 @@ func runInvalidFramePingPayloadExceedsLocalEchoableLimit(t *testing.T) error {
 		return fmt.Errorf("ping payload send err = %v, want %s", err, CodeFrameSize)
 	}
 	return nil
-}
-
-func runInvalidFrameAbortOnStreamZero(t *testing.T) error {
-	t.Helper()
-	raw := rawInvalidFrameBytes(t, byte(FrameTypeABORT), 0, mustEncodeVarint(uint64(CodeCancelled)))
-	_, _, err := ParseFrame(raw, DefaultSettings().Limits())
-	return err
-}
-
-func runInvalidFrameMaxDataTrailingGarbage(t *testing.T) error {
-	t.Helper()
-	raw := rawInvalidFrameBytes(t, byte(FrameTypeMAXDATA), 0, append(mustEncodeVarint(1024), 0x01))
-	_, _, err := ParseFrame(raw, DefaultSettings().Limits())
-	return err
-}
-
-func runInvalidFrameBlockedTrailingGarbage(t *testing.T) error {
-	t.Helper()
-	raw := rawInvalidFrameBytes(t, byte(FrameTypeBLOCKED), 0, append(mustEncodeVarint(1024), 0x01))
-	_, _, err := ParseFrame(raw, DefaultSettings().Limits())
-	return err
-}
-
-func runInvalidFrameUnknownCoreType(t *testing.T) error {
-	t.Helper()
-	_, _, err := ParseFrame(mustHex(t, "020c00"), DefaultSettings().Limits())
-	return err
 }
 
 func runInvalidPriorityUpdateDuplicateSingleton(t *testing.T) error {
@@ -1117,24 +1527,6 @@ func runInvalidPriorityUpdateDuplicateSingleton(t *testing.T) error {
 		return fmt.Errorf("metadata after duplicate PRIORITY_UPDATE = %+v, want unchanged", meta)
 	}
 	return nil
-}
-
-func runInvalidPriorityUpdateTruncatedTLVHeader(t *testing.T) error {
-	t.Helper()
-	raw := rawInvalidFrameBytes(t, byte(FrameTypeEXT), 4, append(mustEncodeVarint(uint64(EXTPriorityUpdate)), mustEncodeVarint(uint64(MetadataStreamPriority))...))
-	_, _, err := ParseFrame(raw, DefaultSettings().Limits())
-	return err
-}
-
-func runInvalidPriorityUpdateTLVValueOverrun(t *testing.T) error {
-	t.Helper()
-	payload := mustAppendInvalidVarint(t, nil, uint64(EXTPriorityUpdate))
-	payload = mustAppendInvalidVarint(t, payload, uint64(MetadataStreamPriority))
-	payload = mustAppendInvalidVarint(t, payload, 2)
-	payload = append(payload, 0x01)
-	raw := rawInvalidFrameBytes(t, byte(FrameTypeEXT), 4, payload)
-	_, _, err := ParseFrame(raw, DefaultSettings().Limits())
-	return err
 }
 
 func runInvalidPriorityUpdateWithoutCapability(t *testing.T) error {
@@ -1301,52 +1693,64 @@ func runInvalidDataExceedsStreamMaxData(t *testing.T) error {
 	return &ApplicationError{Code: uint64(CodeFlowControl)}
 }
 
-func runInvalidFirstMaxDataOnUnusedStream(t *testing.T) error {
-	t.Helper()
-
-	c, _, stop := newInvalidFrameConn(t, 0)
-	defer stop()
-	return c.handleMaxDataFrame(Frame{
-		Type:     FrameTypeMAXDATA,
-		StreamID: state.FirstPeerStreamID(c.config.negotiated.LocalRole, true),
-		Payload:  mustEncodeVarint(64),
-	})
+type invalidStreamShape struct {
+	StreamID           uint64 `json:"stream_id"`
+	IncomingFrame      string `json:"incoming_frame"`
+	InitialStreamState string `json:"initial_stream_state"`
 }
 
-func runInvalidFirstBlockedOnUnusedStream(t *testing.T) error {
+// invalidFirstFrame builds the peer's first non-opening frame on an unused
+// stream from an input_shape's incoming_frame.
+func invalidFirstFrame(t *testing.T, incoming string, streamID uint64) Frame {
 	t.Helper()
 
-	c, _, stop := newInvalidFrameConn(t, 0)
-	defer stop()
-	return c.handleBlockedFrame(Frame{
-		Type:     FrameTypeBLOCKED,
-		StreamID: state.FirstPeerStreamID(c.config.negotiated.LocalRole, true),
-		Payload:  mustEncodeVarint(64),
-	})
+	switch incoming {
+	case "MAX_DATA":
+		return Frame{Type: FrameTypeMAXDATA, StreamID: streamID, Payload: mustEncodeVarint(64)}
+	case "BLOCKED":
+		return Frame{Type: FrameTypeBLOCKED, StreamID: streamID, Payload: mustEncodeVarint(64)}
+	case "STOP_SENDING":
+		return Frame{Type: FrameTypeStopSending, StreamID: streamID, Payload: mustEncodeVarint(uint64(CodeCancelled))}
+	case "RESET":
+		return Frame{Type: FrameTypeRESET, StreamID: streamID, Payload: mustEncodeVarint(uint64(CodeCancelled))}
+	default:
+		t.Fatalf("unsupported first frame %q", incoming)
+		return Frame{}
+	}
 }
 
-func runInvalidFirstStopSendingOnUnusedStream(t *testing.T) error {
+// runInvalidFirstFrameOnUnusedStream sends MAX_DATA, BLOCKED, STOP_SENDING or
+// RESET as the first frame on the peer's next unused stream ID. The result
+// must be a session PROTOCOL error that leaves no stream state behind: the
+// local side must not answer the unseen ID with a first-frame ABORT (SPEC 9.1).
+func runInvalidFirstFrameOnUnusedStream(t *testing.T, fixture invalidFixture) error {
 	t.Helper()
 
+	var shape invalidStreamShape
+	if err := json.Unmarshal(fixture.InputShape, &shape); err != nil {
+		t.Fatalf("decode input_shape for %s: %v", fixture.ID, err)
+	}
+	if shape.InitialStreamState != "idle" {
+		t.Fatalf("fixture %s initial_stream_state = %q, want idle", fixture.ID, shape.InitialStreamState)
+	}
 	c, _, stop := newInvalidFrameConn(t, 0)
 	defer stop()
-	return c.handleStopSendingFrame(Frame{
-		Type:     FrameTypeStopSending,
-		StreamID: state.FirstPeerStreamID(c.config.negotiated.LocalRole, true),
-		Payload:  mustEncodeVarint(uint64(CodeCancelled)),
-	})
-}
+	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
+	if streamID != shape.StreamID {
+		t.Fatalf("fixture %s stream_id = %d, harness peer's next bidi stream = %d", fixture.ID, shape.StreamID, streamID)
+	}
 
-func runInvalidFirstResetOnUnusedStream(t *testing.T) error {
-	t.Helper()
+	err := c.handleFrame(invalidFirstFrame(t, shape.IncomingFrame, streamID))
 
-	c, _, stop := newInvalidFrameConn(t, 0)
-	defer stop()
-	return c.handleResetFrame(Frame{
-		Type:     FrameTypeRESET,
-		StreamID: state.FirstPeerStreamID(c.config.negotiated.LocalRole, true),
-		Payload:  mustEncodeVarint(uint64(CodeCancelled)),
-	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.registry.streams[streamID]; ok {
+		return fmt.Errorf("first %s on unused stream %d created a live stream (err %v)", shape.IncomingFrame, streamID, err)
+	}
+	if c.hasTerminalMarkerLocked(streamID) {
+		return fmt.Errorf("first %s on unused stream %d left a terminal marker (err %v)", shape.IncomingFrame, streamID, err)
+	}
+	return err
 }
 
 func runInvalidDataExceedsSessionMaxData(t *testing.T) error {
@@ -1380,6 +1784,23 @@ func runInvalidBlockedWrongSideUni(t *testing.T) error {
 		Type:     FrameTypeBLOCKED,
 		StreamID: streamID,
 		Payload:  mustEncodeVarint(64),
+	}); err != nil {
+		return err
+	}
+	return expectInvalidStreamStateAbort(c, frames, streamID)
+}
+
+func runInvalidDataWrongSideUni(t *testing.T) error {
+	t.Helper()
+
+	c, frames, stop := newInvalidFrameConn(t, 0)
+	defer stop()
+	stream := seedStateFixtureStream(t, c, state.FirstLocalStreamID(c.config.negotiated.LocalRole, false), "uni_local_send_only", "local_owned", stateHalfExpect{SendHalf: "send_open"})
+	streamID := stream.id
+	if err := c.handleDataFrame(Frame{
+		Type:     FrameTypeDATA,
+		StreamID: streamID,
+		Payload:  []byte("x"),
 	}); err != nil {
 		return err
 	}
@@ -1734,27 +2155,6 @@ func fixtureErrorCode(t *testing.T, name string) ErrorCode {
 	default:
 		t.Fatalf("unsupported fixture error code %q", name)
 		return 0
-	}
-}
-
-func expectedInvalidFixtureCode(t *testing.T, fixture invalidFixture) ErrorCode {
-	t.Helper()
-
-	switch fixture.ID {
-	case "frame_length_too_small",
-		"frame_ext_payload_underflow",
-		"frame_length_smaller_than_stream_id_prefix",
-		"frame_pong_too_short",
-		"frame_priority_update_truncated_tlv_header",
-		"frame_priority_update_tlv_value_overrun":
-		return CodeFrameSize
-	case "frame_first_max_data_on_unused_stream",
-		"frame_first_blocked_on_unused_stream",
-		"frame_first_stop_sending_on_unused_stream",
-		"frame_first_reset_on_unused_stream":
-		return CodeProtocol
-	default:
-		return fixtureErrorCode(t, fixture.ExpectedResult.Error)
 	}
 }
 

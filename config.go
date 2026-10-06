@@ -163,6 +163,12 @@ type Config struct {
 	PrefacePaddingMinBytes uint64
 	// PrefacePaddingMaxBytes is the upper padding length bound. Zero uses the default.
 	PrefacePaddingMaxBytes uint64
+	// EstablishmentTimeout bounds session establishment: the local preface
+	// write and the peer preface read. It is enforced through the transport's
+	// read/write deadlines (net.Conn); for an un-handshaken tls.Conn the TLS
+	// handshake runs inside those reads and writes and shares the bound.
+	// Zero uses the default (10s). A negative value disables the bound.
+	EstablishmentTimeout time.Duration
 	// KeepaliveInterval bounds idle time before an automatic PING.
 	// Zero disables automatic keepalive.
 	KeepaliveInterval time.Duration
@@ -170,6 +176,8 @@ type Config struct {
 	// Zero disables this extra cap.
 	KeepaliveMaxPingInterval time.Duration
 	// KeepaliveTimeout bounds how long a keepalive PING may remain unanswered.
+	// It runs from when the PING is originated, so a transport that stops
+	// draining, and never even writes the PING, also trips it.
 	// Zero uses an adaptive default.
 	KeepaliveTimeout time.Duration
 	// PingPadding pads local PINGs and recognized PONG replies.
@@ -204,7 +212,11 @@ type Config struct {
 	// RetainedPeerReasonBytesBudget overrides the retained peer reason-text byte budget.
 	// Zero uses the default.
 	RetainedPeerReasonBytesBudget uint64
-	// AggregateLateDataCap overrides aggregate late-data accounting. Zero uses the default.
+	// AggregateLateDataCap overrides the aggregate late-data allowance reported
+	// by Stats (PressureStats.AggregateLateDataAtCap). The aggregate counts late
+	// bytes still retained by stopped or aborted streams and their tombstones.
+	// Exceeding it never fails the session; further late tail is discarded and
+	// its session credit released. Zero uses the default.
 	AggregateLateDataCap uint64
 	// AcceptBacklogLimit overrides the visible accept backlog count. Zero uses the default.
 	AcceptBacklogLimit int
@@ -212,7 +224,9 @@ type Config struct {
 	AcceptBacklogBytesLimit uint64
 	// TombstoneLimit overrides the retained tombstone count. Zero uses the default.
 	TombstoneLimit int
-	// MarkerOnlyUsedStreamLimit overrides retained marker-only used-stream entries.
+	// MarkerOnlyUsedStreamLimit overrides retained marker-only used-stream
+	// entries, up to the default derived from the session memory cap. Past the
+	// limit the oldest markers are coarsened; the session never fails for it.
 	// Zero uses the derived default.
 	MarkerOnlyUsedStreamLimit int
 	// AbuseWindow overrides the local anti-abuse accounting window. Zero uses the default.
@@ -269,8 +283,9 @@ type Config struct {
 	// StopSendingGracefulTailCap bounds DATA|FIN tail after peer STOP_SENDING.
 	// Zero uses the default.
 	StopSendingGracefulTailCap uint64
-	// GracefulCloseDrainTimeout bounds Close waiting for graceful drain.
-	// Zero uses the default.
+	// GracefulCloseDrainTimeout bounds Close waiting for graceful drain. It
+	// also bounds each wait for a GOAWAY write, so Close cannot hang on a
+	// transport that stopped draining. Zero uses the default.
 	GracefulCloseDrainTimeout time.Duration
 
 	// EventHandler receives lightweight connection/stream lifecycle notifications.
@@ -290,6 +305,7 @@ type OpenOptions struct {
 }
 
 const (
+	defaultEstablishmentTimeout     = 10 * time.Second
 	defaultIdleKeepaliveInterval    = time.Minute
 	defaultKeepaliveMaxPingInterval = 5 * time.Minute
 	defaultPrefacePaddingMinBytes   = 16
@@ -405,6 +421,18 @@ func cloneConfig(cfg *Config) Config {
 		return *DefaultConfig()
 	}
 	return normalizeConfigDefaults(*cfg)
+}
+
+// establishmentTimeout resolves EstablishmentTimeout. Zero means unbounded.
+func (c Config) establishmentTimeout() time.Duration {
+	switch {
+	case c.EstablishmentTimeout < 0:
+		return 0
+	case c.EstablishmentTimeout == 0:
+		return defaultEstablishmentTimeout
+	default:
+		return c.EstablishmentTimeout
+	}
 }
 
 func (c Config) LocalPreface() (Preface, error) {
@@ -564,6 +592,22 @@ func randomVarint62(r io.Reader) (uint64, error) {
 	}
 }
 
+// sessionLivenessSeed draws one per-session PRNG seed for keepalive jitter or
+// for PING tokens and padding. It reads the configured nonce source and falls
+// back to crypto/rand; preface nonces are never used, since explicit roles
+// force them to zero and auto-role peers send them in clear. Only if both
+// sources fail does it return 0, which selects the runtime's randomized
+// fallback counter.
+func sessionLivenessSeed(r io.Reader) uint64 {
+	if seed, err := randomUint62(r); err == nil && seed != 0 {
+		return seed
+	}
+	if seed, err := randomUint62(rand.Reader); err == nil {
+		return seed
+	}
+	return 0
+}
+
 func randomUint62(r io.Reader) (uint64, error) {
 	var buf [8]byte
 	if _, err := io.ReadFull(randomReader(r), buf[:]); err != nil {
@@ -589,10 +633,6 @@ func ReadPreface(r io.Reader) (Preface, error) {
 
 func NegotiatePrefaces(local, peer Preface) (Negotiated, error) {
 	return wire.NegotiatePrefaces(local, peer)
-}
-
-func marshalSettingsTLV(s Settings) ([]byte, error) {
-	return wire.MarshalSettingsTLV(s)
 }
 
 // Claim identifies one repository-defined standardized claim string from the
@@ -1029,6 +1069,12 @@ func ReadFrame(r io.Reader, limits Limits) (Frame, error) {
 
 func readFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *wire.FrameReadBufferHandle, error) {
 	return wire.ReadFrameBuffered(r, limits, dst)
+}
+
+// readSessionFrameBuffered leaves EXT subtype payload rules to the EXT
+// handlers, which check the negotiated capability first.
+func readSessionFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *wire.FrameReadBufferHandle, error) {
+	return wire.ReadSessionFrameBuffered(r, limits, dst)
 }
 
 func releaseReadFrameBuffer(buf []byte, handle *wire.FrameReadBufferHandle) {

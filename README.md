@@ -442,6 +442,10 @@ Common surface errors include:
 
 `ApplicationError` carries peer-visible application close codes and reason text.
 
+A stream read returns `io.EOF` only after the peer's FIN and all of its data. When the session
+ends first, even through a `NO_ERROR` close, a read on a stream that did not get the peer's FIN (or
+whose unread data was discarded) fails with the session error, such as `zmux.ErrSessionClosed`.
+
 ## Configuration
 
 Pass `*zmux.Config` to tune capabilities, settings, keepalive, close timeouts, queue budgets,
@@ -481,6 +485,17 @@ Concurrent template updates are race-safe, but the last completed update wins.
 Open-time metadata is still sent only when an `OpenOptions` value asks for it. Set
 `DisableCapabilities = true`, `KeepaliveInterval = 0`, `PrefacePadding = false`, or
 `PingPadding = false` when a deployment needs those features disabled.
+
+`EstablishmentTimeout` bounds the preface exchange (local preface write and peer preface read) on
+transports that support deadlines, such as `net.Conn`. Zero uses the 10s default and a negative
+value disables the bound. When the transport is a `*tls.Conn` that has not completed its
+handshake, the TLS handshake runs inside the preface I/O and shares this bound; call
+`HandshakeContext` first to bound it separately.
+
+`KeepaliveTimeout` runs from when a keepalive PING is originated, so a peer whose transport stops
+draining (the PING cannot even be written) also fails the session with `IDLE_TIMEOUT`. `Ping(ctx)`
+returns `ctx.Err()` at its deadline on such a transport, and `GracefulCloseDrainTimeout` also bounds
+each GOAWAY write of a graceful `Close`.
 
 When you need a self-contained config literal, set the non-zero defaults you depend on explicitly:
 

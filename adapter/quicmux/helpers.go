@@ -244,6 +244,18 @@ func translateError(err error) error {
 	return err
 }
 
+// checkQUICErrorCode rejects a caller-supplied error code that QUIC cannot
+// carry. QUIC, like zmux (SPEC §3.2), encodes codes as varint62. quic-go takes
+// any uint64 and only panics later, inside its own connection goroutine, when
+// it packs the RESET_STREAM, STOP_SENDING or CONNECTION_CLOSE frame; nothing
+// can recover that panic, so the code is checked before any state changes.
+func checkQUICErrorCode(code uint64) error {
+	if code > zmux.MaxVarint62 {
+		return errors.Join(zmux.ErrAdapterUnsupported, fmt.Errorf("quicmux: QUIC application error code %d exceeds varint62", code))
+	}
+	return nil
+}
+
 func mappedApplicationError(err error, defaultCode uint64) (uint64, string) {
 	if err == nil {
 		return defaultCode, ""

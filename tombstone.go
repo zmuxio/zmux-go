@@ -26,6 +26,20 @@ type usedStreamRange struct {
 	marker usedStreamMarker
 }
 
+// usedStreamClasses is the number of stream ID classes (stream_id & 3). Used
+// markers are kept per class so ranges of one class never interleave with
+// another's.
+const usedStreamClasses = 4
+
+// coarsenedUsedStreamMarker is the disposition of every used ID at or below
+// its class floor once old markers were coarsened: late DATA is discarded and
+// only released to the session window, late control is ignored.
+var coarsenedUsedStreamMarker = usedStreamMarker{action: lateDataIgnore, cause: lateDataCauseNone}
+
+func usedStreamClass(streamID uint64) int {
+	return int(streamID & (usedStreamClasses - 1))
+}
+
 type terminalDataDisposition struct {
 	action lateDataAction
 	cause  lateDataCause
@@ -149,8 +163,9 @@ func (c *Conn) markUsedStreamLocked(streamID uint64, marker usedStreamMarker) {
 		return
 	}
 	if c.registry.usedStreamRangeMode {
-		c.registry.usedStreamRanges = shrinkCompactedQueueBacking(upsertUsedStreamRange(c.registry.usedStreamRanges, streamID, marker))
+		c.upsertUsedStreamRangeLocked(streamID, marker)
 		c.dropUsedStreamMapEntryLocked(streamID)
+		c.boundMarkerOnlyRetentionLocked()
 		return
 	}
 	if c.registry.usedStreamData == nil {
@@ -158,6 +173,18 @@ func (c *Conn) markUsedStreamLocked(streamID uint64, marker usedStreamMarker) {
 	}
 	c.registry.usedStreamData[streamID] = marker
 	c.compactMarkerOnlyRangesLocked()
+	c.boundMarkerOnlyRetentionLocked()
+}
+
+// upsertUsedStreamRangeLocked records marker for streamID in the ranges of
+// its class. An ID at or below the class floor is already covered by the
+// coarsened prefix.
+func (c *Conn) upsertUsedStreamRangeLocked(streamID uint64, marker usedStreamMarker) {
+	class := usedStreamClass(streamID)
+	if streamID <= c.registry.usedStreamFloors[class] {
+		return
+	}
+	c.registry.usedStreamRanges[class] = shrinkCompactedQueueBacking(upsertUsedStreamRange(c.registry.usedStreamRanges[class], streamID, marker))
 }
 
 func (c *Conn) dropUsedStreamMapEntryLocked(streamID uint64) {
@@ -250,6 +277,8 @@ func setContainedUsedStreamMarker(ranges []usedStreamRange, idx int, streamID ui
 	return mergeUsedStreamRangeAround(out, insertIdx)
 }
 
+// upsertUsedStreamRange records marker for streamID in ranges, which hold one
+// stream ID class sorted by start.
 func upsertUsedStreamRange(ranges []usedStreamRange, streamID uint64, marker usedStreamMarker) []usedStreamRange {
 	if len(ranges) == 0 {
 		return append(ranges, usedStreamRange{start: streamID, end: streamID, marker: marker})
@@ -279,10 +308,8 @@ func (c *Conn) usedStreamMarkerForLocked(streamID uint64) (usedStreamMarker, boo
 			return marker, true
 		}
 	}
-	ranges := c.registry.usedStreamRanges
-	if len(ranges) == 0 {
-		return usedStreamMarker{}, false
-	}
+	class := usedStreamClass(streamID)
+	ranges := c.registry.usedStreamRanges[class]
 	idx := sort.Search(len(ranges), func(i int) bool {
 		return ranges[i].start > streamID
 	})
@@ -291,6 +318,9 @@ func (c *Conn) usedStreamMarkerForLocked(streamID uint64) (usedStreamMarker, boo
 		if usedStreamRangeContains(r, streamID) {
 			return r.marker, true
 		}
+	}
+	if streamID != 0 && streamID <= c.registry.usedStreamFloors[class] {
+		return coarsenedUsedStreamMarker, true
 	}
 	return usedStreamMarker{}, false
 }
@@ -314,14 +344,65 @@ func (c *Conn) compactMarkerOnlyRangesLocked() {
 		return
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	ranges := append([]usedStreamRange(nil), c.registry.usedStreamRanges...)
 	for _, streamID := range ids {
 		marker := c.registry.usedStreamData[streamID]
-		ranges = upsertUsedStreamRange(ranges, streamID, marker)
+		c.upsertUsedStreamRangeLocked(streamID, marker)
 		c.dropUsedStreamMapEntryLocked(streamID)
 	}
-	c.registry.usedStreamRanges = shrinkCompactedQueueBacking(ranges)
 	c.registry.usedStreamRangeMode = true
+}
+
+// boundMarkerOnlyRetentionLocked keeps retained marker-only state within its
+// budget. Exceeding the budget never fails or stalls the session: the oldest
+// ranges of the most fragmented classes are folded into their class floor
+// instead (see coarsenUsedStreamRangesLocked). Folding down to half the budget
+// keeps a long run of distinct dispositions from coarsening on every reap.
+func (c *Conn) boundMarkerOnlyRetentionLocked() {
+	if c == nil {
+		return
+	}
+	budget := c.markerOnlyHardCapLocked()
+	if c.markerOnlyRetainedLocked() <= budget {
+		return
+	}
+	c.compactMarkerOnlyRangesLocked()
+	c.coarsenUsedStreamRangesLocked(budget / 2)
+}
+
+// coarsenUsedStreamRangesLocked folds the oldest ranges of the most
+// fragmented classes into their class floor until at most target marker-only
+// entries remain. Every ID of a class up to a used ID is itself used (IDs are
+// opened in order), so a floor never covers an unused ID and no-reuse still
+// holds. IDs below the floor read as coarsenedUsedStreamMarker; live streams
+// and retained tombstones are looked up first and keep their own state. That
+// gives up only the recommended ABORT(STREAM_CLOSED) for DATA after FIN on
+// long-forgotten streams (SPEC §9.6); late DATA is still discarded with
+// session credit release and late control is still ignored (SPEC §9.4, §9.5).
+func (c *Conn) coarsenUsedStreamRangesLocked(target int) {
+	if target < 0 {
+		target = 0
+	}
+	retained := c.markerOnlyRetainedLocked()
+	for retained > target {
+		class, most := -1, 0
+		for k := range c.registry.usedStreamRanges {
+			if n := len(c.registry.usedStreamRanges[k]); n > most {
+				class, most = k, n
+			}
+		}
+		if class < 0 {
+			return
+		}
+		fold := min(most, retained-target)
+		ranges := c.registry.usedStreamRanges[class]
+		if floor := ranges[fold-1].end; floor > c.registry.usedStreamFloors[class] {
+			c.registry.usedStreamFloors[class] = floor
+		}
+		kept := copy(ranges, ranges[fold:])
+		clear(ranges[kept:])
+		c.registry.usedStreamRanges[class] = shrinkCompactedQueueBacking(ranges[:kept])
+		retained -= fold
+	}
 }
 
 func tombstoneStateForStream(stream *nativeStream) state.StreamTombstone {
@@ -349,10 +430,7 @@ func (c *Conn) enforceTerminalBookkeepingMemoryCapLocked() {
 		return
 	}
 	c.compactMarkerOnlyRangesLocked()
-	if err := c.markerOnlyCapErrorLocked("compact terminal state"); err != nil {
-		c.closeSessionAsyncLocked(err)
-		return
-	}
+	c.boundMarkerOnlyRetentionLocked()
 	if err := c.sessionMemoryCapErrorLocked("compact terminal state"); err != nil {
 		c.closeSessionAsyncLocked(err)
 	}
@@ -372,6 +450,8 @@ func (c *Conn) maybeCompactTerminalLocked(stream *nativeStream) {
 	}
 	tombstone := tombstoneStateForStream(stream)
 	lateDataCause := stream.lateDataCauseLocked()
+	// The allowance captured at the local stop or ABORT and the late bytes
+	// already counted (still part of the aggregate) move into the tombstone.
 	lateDataCap := c.effectiveLateDataPerStreamCapLocked(stream)
 	now := time.Now()
 	hidden := !stream.applicationVisible
@@ -577,6 +657,7 @@ func (c *Conn) removeTombstoneOrderSlotLocked(i int) bool {
 		c.registry.tombstoneCount = 0
 	}
 	c.markUsedStreamLocked(entry.streamID, usedStreamMarkerFromTombstone(entry.tombstone.StreamTombstone, entry.tombstone.LateDataCause))
+	c.releaseRetainedLateDataLocked(entry.tombstone.LateDataReceived)
 	entry.tombstone.OrderIndex = -1
 	c.removeHiddenTombstoneLocked(entry.streamID, entry.tombstone)
 	delete(c.registry.tombstones, entry.streamID)
@@ -800,12 +881,16 @@ func (c *Conn) appendIndexedTombstoneLocked(
 	if !ok || (hidden && !tombstone.Hidden) {
 		return
 	}
-	if idx := indexLookup(streamID, tombstone.queueIndex(hidden)); idx.found() {
-		if tombstone.queueIndex(hidden) != idx.index {
-			tombstone.setQueueIndex(hidden, idx.index)
-			c.registry.tombstones[streamID] = tombstone
+	// A freshly created tombstone (index -1) is not queued yet, so it skips the
+	// linear lookup.
+	if tombstone.queueIndex(hidden) >= 0 {
+		if idx := indexLookup(streamID, tombstone.queueIndex(hidden)); idx.found() {
+			if tombstone.queueIndex(hidden) != idx.index {
+				tombstone.setQueueIndex(hidden, idx.index)
+				c.registry.tombstones[streamID] = tombstone
+			}
+			return
 		}
-		return
 	}
 	tombstone.setQueueIndex(hidden, len(*order))
 	c.registry.tombstones[streamID] = tombstone
@@ -828,7 +913,11 @@ func (c *Conn) compactIndexedTombstoneQueueLocked(
 		*init = true
 		return
 	}
-	if *head == 0 && len(*order) <= 2*(*count) {
+	// Compact only once the dead slots (reaped head entries and interior
+	// holes) reach the live count. At the tombstone limit every close reaps
+	// the head, so rewriting the whole queue each time would cost O(limit)
+	// per close; this keeps it amortized O(1).
+	if len(*order)-*count < *count {
 		return
 	}
 	writeIdx := 0

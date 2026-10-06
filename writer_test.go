@@ -2,6 +2,7 @@ package zmux
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -5774,8 +5775,8 @@ func TestTerminalWakeFailsWriteBlockedOnWriterQueue(t *testing.T) {
 
 	second.conn.mu.Lock()
 	second.setSendStopSeen(&ApplicationError{Code: uint64(CodeCancelled)})
+	second.broadcastWriteNotifyLocked()
 	second.conn.mu.Unlock()
-	notify(second.writeNotify)
 
 	select {
 	case err := <-errCh:
@@ -6075,7 +6076,7 @@ func TestWriteFinalAfterSendStopSeenWithInsufficientCreditQueuesReset(t *testing
 		SendHalf: "send_stop_seen",
 		RecvHalf: "recv_open",
 	})
-	testMarkLocalOpenCommitted(stream)
+	testMarkLocalOpenVisible(stream)
 	stream.sendMax = 0
 
 	_, err := stream.WriteFinal([]byte("x"))
@@ -6784,6 +6785,11 @@ func TestReleaseBatchReservationsWakesDistinctStreamsCrossingLowWatermark(t *tes
 		},
 	}
 
+	stream.conn.mu.Lock()
+	streamWake := stream.ensureWriteNotifyLocked()
+	otherWake := other.ensureWriteNotifyLocked()
+	stream.conn.mu.Unlock()
+
 	stream.conn.releaseBatchReservations(batch)
 
 	stream.conn.mu.Lock()
@@ -6798,12 +6804,12 @@ func TestReleaseBatchReservationsWakesDistinctStreamsCrossingLowWatermark(t *tes
 	stream.conn.mu.Unlock()
 
 	select {
-	case <-stream.writeNotify:
+	case <-streamWake:
 	default:
 		t.Fatal("stream writeNotify not signaled")
 	}
 	select {
-	case <-other.writeNotify:
+	case <-otherWake:
 	default:
 		t.Fatal("other writeNotify not signaled")
 	}
@@ -7244,55 +7250,7 @@ func TestCloseStreamOnSessionReleasesQueuedBytesAndWakesBlockedWriters(t *testin
 	}
 }
 
-func TestCloseStreamOnSessionReleasesSessionSendCreditAndWakesBlockedWriters(t *testing.T) {
-	stream := newQueueBackpressureTestStream()
-	holder := testVisibleBidiStream(stream.conn, 8, testWithSendMax(1))
-	holder.sendSent = 1
-
-	stream.conn.mu.Lock()
-	stream.conn.flow.sendSessionMax = 1
-	stream.conn.flow.sendSessionUsed = 1
-	stream.conn.mu.Unlock()
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := stream.Write([]byte("x"))
-		done <- err
-	}()
-	awaitStreamWriteWaiter(t, stream, testSignalTimeout, "blocked write did not enter session-credit wait state")
-
-	go func() {
-		queued := <-stream.conn.writer.writeCh
-		queued.done <- nil
-	}()
-
-	stream.conn.mu.Lock()
-	stream.conn.closeStreamOnSessionWithOptionsLocked(holder, refusedStreamAppErr(), sessionCloseOptions{
-		abortSource: terminalAbortLocal,
-		finalize:    true,
-	})
-	gotSessionUsed := stream.conn.flow.sendSessionUsed
-	gotHolderSent := holder.sendSent
-	stream.conn.mu.Unlock()
-
-	if gotSessionUsed != 0 {
-		t.Fatalf("conn sendSessionUsed = %d, want 0 after session-close send-credit release", gotSessionUsed)
-	}
-	if gotHolderSent != 0 {
-		t.Fatalf("holder sendSent = %d, want 0 after session-close send-credit release", gotHolderSent)
-	}
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Write err = %v, want nil", err)
-		}
-	case <-time.After(2 * testSignalTimeout):
-		t.Fatal("blocked write did not wake after session-close send-credit release")
-	}
-}
-
-func TestCloseStreamOnSessionClearsPendingSessionBlockedAfterSendCreditRelease(t *testing.T) {
+func TestCloseStreamOnSessionKeepsCommittedSessionSendCredit(t *testing.T) {
 	stream := newQueueBackpressureTestStream()
 	holder := testVisibleBidiStream(stream.conn, 8, testWithSendMax(1))
 	holder.sendSent = 1
@@ -7321,16 +7279,36 @@ func TestCloseStreamOnSessionClearsPendingSessionBlockedAfterSendCreditRelease(t
 		queued.done <- nil
 	}()
 
+	// The holder's byte was already committed to the writer, so aborting the
+	// holder must not hand it back as fresh session credit (SPEC §8).
 	stream.conn.mu.Lock()
 	stream.conn.closeStreamOnSessionWithOptionsLocked(holder, refusedStreamAppErr(), sessionCloseOptions{
 		abortSource: terminalAbortLocal,
 		finalize:    true,
 	})
-	staleBlocked := stream.conn.pending.hasSessionBlocked
+	gotSessionUsed := stream.conn.flow.sendSessionUsed
+	gotHolderSent := holder.sendSent
+	stillBlocked := stream.conn.pending.hasSessionBlocked
 	stream.conn.mu.Unlock()
 
-	if staleBlocked {
-		t.Fatal("pending session BLOCKED remained queued after session send credit was released")
+	if gotSessionUsed != 1 {
+		t.Fatalf("conn sendSessionUsed = %d, want 1 after aborting a stream with committed bytes", gotSessionUsed)
+	}
+	if gotHolderSent != 0 {
+		t.Fatalf("holder sendSent = %d, want 0 after terminal per-stream release", gotHolderSent)
+	}
+	if !stillBlocked {
+		t.Fatal("pending session BLOCKED was dropped although session send credit is still exhausted")
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("blocked write completed with err = %v before the peer granted more session credit", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := stream.conn.handleSessionMaxDataFrame(2, 1); err != nil {
+		t.Fatalf("handleSessionMaxDataFrame err = %v", err)
 	}
 
 	select {
@@ -7339,7 +7317,14 @@ func TestCloseStreamOnSessionClearsPendingSessionBlockedAfterSendCreditRelease(t
 			t.Fatalf("Write err = %v, want nil", err)
 		}
 	case <-time.After(2 * testSignalTimeout):
-		t.Fatal("blocked write did not wake after session-close send-credit release")
+		t.Fatal("blocked write did not wake after peer session MAX_DATA")
+	}
+
+	stream.conn.mu.Lock()
+	staleBlocked := stream.conn.pending.hasSessionBlocked
+	stream.conn.mu.Unlock()
+	if staleBlocked {
+		t.Fatal("pending session BLOCKED remained queued after peer session MAX_DATA")
 	}
 }
 
@@ -7714,5 +7699,123 @@ func TestFragmentCapKeepsStaticLimitWhenRateEstimateIsHigher(t *testing.T) {
 
 	if got := stream.txFragmentCapLocked(0); got != 4096 {
 		t.Fatalf("fragment cap with fast send-rate estimate = %d, want 4096", got)
+	}
+}
+
+func TestConcurrentTerminalStreamsDoNotRaceBatchScheduler(t *testing.T) {
+	t.Parallel()
+
+	client, server := newConnPair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	go func() {
+		for {
+			stream, err := server.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go func(stream NativeStream) {
+				_, _ = io.Copy(io.Discard, stream)
+				_ = stream.CloseWrite()
+			}(stream)
+		}
+	}()
+
+	const rounds = 100
+	const streamsPerRound = 16
+	payload := bytes.Repeat([]byte{'x'}, 20)
+	for round := 0; round < rounds; round++ {
+		// Openers are written one at a time so this test only exercises the
+		// concurrent terminal paths, not cross-stream opener ordering.
+		streams := make([]NativeStream, streamsPerRound)
+		for i := range streams {
+			stream, err := client.OpenStream(ctx)
+			if err != nil {
+				t.Fatalf("round %d: OpenStream err = %v", round, err)
+			}
+			if _, err := stream.Write(payload); err != nil {
+				t.Fatalf("round %d: opener Write err = %v", round, err)
+			}
+			streams[i] = stream
+		}
+
+		var wg sync.WaitGroup
+		errCh := make(chan error, streamsPerRound)
+		for i, stream := range streams {
+			wg.Add(1)
+			go func(i int, stream NativeStream) {
+				defer wg.Done()
+				if _, err := stream.Write(payload); err != nil {
+					errCh <- err
+					return
+				}
+				if i%2 == 0 {
+					if err := stream.CloseWrite(); err != nil {
+						errCh <- err
+						return
+					}
+					_, _ = io.ReadAll(stream)
+					return
+				}
+				_ = stream.CancelWrite(7)
+				_ = stream.CloseRead()
+			}(i, stream)
+		}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			t.Fatalf("round %d: stream workload err = %v", round, err)
+		}
+		if err := client.err(); err != nil {
+			t.Fatalf("round %d: client session failed: %v", round, err)
+		}
+		if err := server.err(); err != nil {
+			t.Fatalf("round %d: server session failed: %v", round, err)
+		}
+	}
+}
+
+func TestSessionCloseDuringBatchOrderingDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	const rounds = 30
+	const streamsPerRound = 16
+	for round := 0; round < rounds; round++ {
+		client, server := newConnPair(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+		go func() {
+			for {
+				stream, err := server.AcceptStream(ctx)
+				if err != nil {
+					return
+				}
+				_ = stream.CloseRead()
+			}
+		}()
+
+		var wg sync.WaitGroup
+		for i := 0; i < streamsPerRound; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				stream, err := client.OpenStream(ctx)
+				if err != nil {
+					return
+				}
+				_, _ = stream.Write([]byte("x"))
+				_ = stream.CloseWrite()
+			}()
+		}
+		wg.Wait()
+		// Close both ends together so the peer CLOSE handling (which clears the
+		// retained scheduler state) overlaps the local writer's batch ordering.
+		var closeWG sync.WaitGroup
+		closeWG.Add(2)
+		go func() { defer closeWG.Done(); _ = client.Close() }()
+		go func() { defer closeWG.Done(); _ = server.Close() }()
+		closeWG.Wait()
+		cancel()
 	}
 }

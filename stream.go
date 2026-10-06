@@ -609,6 +609,7 @@ func (s *nativeStream) Read(p []byte) (int, error) {
 			s.conn.mu.Unlock()
 			return 0, surfaceErr
 		}
+		s.conn.replenishExhaustedReceiveLocked(s)
 		notifyCh, deadline := s.readWaitSnapshotLocked()
 		s.conn.mu.Unlock()
 
@@ -737,7 +738,7 @@ func (p *streamWritePermit) release() {
 	stream.conn.mu.Lock()
 	if stream.writeInProgress {
 		stream.writeInProgress = false
-		notify(stream.writeNotify)
+		stream.broadcastWriteNotifyLocked()
 	}
 	stream.conn.mu.Unlock()
 }
@@ -779,6 +780,34 @@ func (s *nativeStream) ensureWriteNotifyLocked() chan struct{} {
 		return nil
 	}
 	return ensureNotifyChan(&s.writeNotify)
+}
+
+// broadcastWriteNotifyLocked wakes every goroutine waiting on the stream's
+// write side. Several can wait at once (a Write for credit, another Write for
+// the write permit, a CloseRead for its STOP_SENDING, two operations for the
+// same opener turn), and a single token could reach a waiter it does not
+// concern and leave the one it was meant for blocked. A waiter takes the
+// channel with ensureWriteNotifyLocked under the same lock as the check it
+// waits on, so closing it wakes all of them and the next waiter makes a new
+// one.
+func (s *nativeStream) broadcastWriteNotifyLocked() {
+	if s == nil || s.writeNotify == nil {
+		return
+	}
+	close(s.writeNotify)
+	s.writeNotify = nil
+}
+
+// broadcastReadNotifyLocked is broadcastWriteNotifyLocked for the read side,
+// where concurrent Reads, or a Read and a SetReadDeadline from another
+// goroutine, can wait at once. A waiter takes the channel with
+// ensureReadNotifyLocked under the same lock as the check it waits on.
+func (s *nativeStream) broadcastReadNotifyLocked() {
+	if s == nil || s.readNotify == nil {
+		return
+	}
+	close(s.readNotify)
+	s.readNotify = nil
 }
 
 func (s *nativeStream) readNotifyChan() <-chan struct{} {
@@ -844,10 +873,10 @@ func notifyStreamLocked(stream *nativeStream, mask streamNotifyMask) {
 		return
 	}
 	if mask.includesRead() {
-		notify(stream.readNotify)
+		stream.broadcastReadNotifyLocked()
 	}
 	if mask.includesWrite() {
-		notify(stream.writeNotify)
+		stream.broadcastWriteNotifyLocked()
 	}
 }
 
@@ -981,10 +1010,10 @@ func (s *nativeStream) setWaitDeadline(t time.Time, op Operation) error {
 	switch op {
 	case OperationRead:
 		ws.readDeadline = t
-		notify(s.ensureReadNotifyLocked())
+		s.broadcastReadNotifyLocked()
 	case OperationWrite:
 		ws.writeDeadline = t
-		notify(s.ensureWriteNotifyLocked())
+		s.broadcastWriteNotifyLocked()
 	default:
 	}
 	s.conn.mu.Unlock()
@@ -1346,7 +1375,7 @@ func (e terminalQueueExecution) handleLockedPostQueue(s *nativeStream, result qu
 		}
 	}
 	if e.hooks.notifyWrite {
-		notify(s.writeNotify)
+		s.broadcastWriteNotifyLocked()
 	}
 }
 
@@ -1420,7 +1449,7 @@ func (s *nativeStream) commitLocalCloseReadLocked() {
 	}
 	s.setRecvStopSent()
 	s.conn.releaseStreamReceiveStateLocked(s, streamReceiveReleaseAndClearReadBuf)
-	notify(s.readNotify)
+	s.broadcastReadNotifyLocked()
 	s.conn.maybeFinalizePeerActiveLocked(s)
 	s.markLocalReadSignalPending()
 }
@@ -1473,6 +1502,37 @@ func (s *nativeStream) prepareCloseReadPlanLocked(stopPayload []byte) (plan clos
 	return plan, nil
 }
 
+// holdsReadStopBehindQueuedOpenerLocked reports whether this local stream's
+// opening DATA is queued but not yet written. A STOP_SENDING queued now would
+// overtake that opener on the urgent lane and become the stream's first frame.
+func (s *nativeStream) holdsReadStopBehindQueuedOpenerLocked() bool {
+	return s != nil && s.idSet && s.visibilityPhaseLocked() == state.LocalOpenPhaseQueued
+}
+
+// queuePendingStopSendingLocked parks STOP_SENDING in the pending terminal
+// queue, which holds it until the stream's opener has been written.
+func (s *nativeStream) queuePendingStopSendingLocked(payload []byte) error {
+	if s == nil || s.conn == nil {
+		return ErrSessionClosed
+	}
+	result := s.conn.setPendingTerminalControlLocked(s, func(stream *nativeStream) (changed bool, coalesced bool, superseded bool) {
+		if stream.pending.flags&streamPendingTerminalAbort != 0 {
+			return false, true, false
+		}
+		if stream.pending.flags&streamPendingTerminalStop != 0 && bytes.Equal(stream.pending.terminal.stopPayload, payload) {
+			return false, true, false
+		}
+		stream.pending.terminal.stopPayload = clonePayloadBytes(payload)
+		stream.pending.flags |= streamPendingTerminalStop
+		return true, false, false
+	})
+	if !result.accepted {
+		return terminalPendingQueueError("queue STOP_SENDING")
+	}
+	s.clearLocalReadSignalPending()
+	return nil
+}
+
 func (s *nativeStream) closeReadWithCode(code uint64) error {
 	if s == nil || s.conn == nil {
 		return ErrSessionClosed
@@ -1492,14 +1552,26 @@ func (s *nativeStream) closeReadWithCode(code uint64) error {
 		var err error
 		if commitState == localCloseReadPending && !s.localReadSignalPendingFlag() {
 			if err := s.localRecvActionErrLocked(state.LocalCloseReadAction(s.localReceive, s.effectiveRecvHalfStateLocked())); err != nil {
+				err = s.closeOperationErr(err)
 				s.conn.mu.Unlock()
-				return s.closeOperationErr(err)
+				return err
 			}
 		}
 		commitState, err = s.ensureLocalCloseReadCommittedLocked(commitState)
 		if err != nil {
+			err = s.closeOperationErr(err)
 			s.conn.mu.Unlock()
-			return s.closeOperationErr(err)
+			return err
+		}
+		if s.holdsReadStopBehindQueuedOpenerLocked() {
+			err := s.queuePendingStopSendingLocked(stopPayload)
+			s.conn.mu.Unlock()
+			if err != nil {
+				s.conn.closeSessionWithOptions(err, closeOriginInternal, closeFrameDefault)
+				return s.closeOperationErr(err)
+			}
+			notify(s.conn.pending.terminalNotify)
+			return nil
 		}
 
 		plan, err := s.prepareCloseReadPlanLocked(stopPayload)
@@ -1558,8 +1630,9 @@ func (s *nativeStream) closeWriteUntil(deadlineOverride time.Time) error {
 			return nil
 		}
 		if err := s.localSendActionErrLocked(state.LocalCloseWriteAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {
+			err = s.closeOperationErr(err)
 			s.conn.mu.Unlock()
-			return s.closeOperationErr(err)
+			return err
 		}
 		plan, err := s.prepareTerminalFramePlanLocked(terminalDataPrepareSpec{
 			intent: terminalDataCloseWrite,
@@ -1656,8 +1729,7 @@ func (s *nativeStream) Close() error {
 	if needsCloseRead {
 		if err := s.CloseRead(); err != nil &&
 			!errors.Is(err, ErrStreamNotReadable) &&
-			!errors.Is(err, ErrReadClosed) &&
-			!errors.Is(err, ErrWriteClosed) {
+			!errors.Is(err, ErrReadClosed) {
 			errs = append(errs, err)
 		}
 	}
@@ -1879,8 +1951,9 @@ func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint6
 	switch kind {
 	case terminalSignalReset:
 		if err := s.localSendActionErrLocked(state.LocalResetAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {
+			err = s.closeOperationErr(err)
 			s.conn.mu.Unlock()
-			return s.closeOperationErr(err)
+			return err
 		}
 	case terminalSignalAbort:
 		if state.LocalAbortActionForStream(s.effectiveSendHalfStateLocked(), s.effectiveRecvHalfStateLocked()) == state.LocalAbortActionNoOp {
@@ -1891,10 +1964,14 @@ func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint6
 	appErr := applicationErr(code, reason)
 	plan, err := s.prepareTerminalSignalPlanLocked(kind, code, reason, appErr, opts)
 	if err != nil {
+		err = s.closeOperationErr(err)
 		s.conn.mu.Unlock()
-		return s.closeOperationErr(err)
+		return err
 	}
 	dispatch, queued, err := s.enqueuePendingTerminalSignalLocked(plan)
+	if err == nil && plan.shouldNotifyWrite() {
+		s.broadcastWriteNotifyLocked()
+	}
 	s.conn.mu.Unlock()
 	if err != nil {
 		s.conn.closeSessionWithOptions(err, closeOriginInternal, closeFrameDefault)
@@ -1903,9 +1980,6 @@ func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint6
 	if queued {
 		notify(s.conn.pending.terminalNotify)
 		notify(s.conn.pending.controlNotify)
-	}
-	if plan.shouldNotifyWrite() {
-		notify(s.writeNotify)
 	}
 	emitStreamDispatch(s.conn, dispatch)
 	return nil

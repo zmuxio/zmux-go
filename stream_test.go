@@ -3179,8 +3179,10 @@ func TestCancelWriteOnConcreteLocalIDBeforeCommitQueuesOpeningAbort(t *testing.T
 	if !stream.isPeerVisibleLocked() {
 		t.Fatal("peerVisible = false, want true after queued opening ABORT")
 	}
-	if c.flow.sendSessionUsed != 0 {
-		t.Fatalf("sendSessionUsed = %d, want 0", c.flow.sendSessionUsed)
+	// Session send credit is returned only by the prepared request that holds
+	// the reserved bytes, never by the stream's terminal release.
+	if c.flow.sendSessionUsed != 9 {
+		t.Fatalf("sendSessionUsed = %d, want 9", c.flow.sendSessionUsed)
 	}
 	if c.flow.recvSessionUsed != 0 {
 		t.Fatalf("recvSessionUsed = %d, want 0", c.flow.recvSessionUsed)
@@ -3796,6 +3798,8 @@ func TestSessionMaxDataIncreaseBroadcastsConnWriteWake(t *testing.T) {
 	c.mu.Lock()
 	c.flow.sendSessionMax = 0
 	wake := c.currentWriteWakeLocked()
+	streamAWake := streamA.ensureWriteNotifyLocked()
+	streamBWake := streamB.ensureWriteNotifyLocked()
 	c.mu.Unlock()
 
 	if err := c.handleMaxDataFrame(Frame{Type: FrameTypeMAXDATA, Payload: mustEncodeVarint(32)}); err != nil {
@@ -3809,12 +3813,12 @@ func TestSessionMaxDataIncreaseBroadcastsConnWriteWake(t *testing.T) {
 	}
 
 	select {
-	case <-streamA.writeNotify:
+	case <-streamAWake:
 		t.Fatal("session MAX_DATA increase should not need per-stream writeNotify for streamA")
 	default:
 	}
 	select {
-	case <-streamB.writeNotify:
+	case <-streamBWake:
 		t.Fatal("session MAX_DATA increase should not need per-stream writeNotify for streamB")
 	default:
 	}
@@ -3837,7 +3841,7 @@ func TestPrepareWriteWakesOnSessionMaxDataIncrease(t *testing.T) {
 	go func() {
 		var parts [1][]byte
 		parts[0] = []byte("x")
-		step, err := stream.prepareWritePartsLocked(parts[:], 0, 0, 1, writeChunkStreaming)
+		step, err := testPrepareWritePartsLocked(stream, parts[:], 0, 0, 1, writeChunkStreaming)
 		resultCh <- struct {
 			step writeStep
 			err  error
@@ -3877,7 +3881,7 @@ func TestPrepareWriteFinalWakesOnSessionMaxDataIncrease(t *testing.T) {
 	go func() {
 		var parts [1][]byte
 		parts[0] = []byte("x")
-		step, err := stream.prepareWritePartsLocked(parts[:], 0, 0, 1, writeChunkFinal)
+		step, err := testPrepareWritePartsLocked(stream, parts[:], 0, 0, 1, writeChunkFinal)
 		resultCh <- struct {
 			step writeStep
 			err  error
@@ -3916,7 +3920,7 @@ func TestPrepareWriteFragmentsToCurrentSessionCredit(t *testing.T) {
 
 	var parts [1][]byte
 	parts[0] = []byte("hello")
-	step, err := stream.prepareWritePartsLocked(parts[:], 0, 0, len(parts[0]), writeChunkStreaming)
+	step, err := testPrepareWritePartsLocked(stream, parts[:], 0, 0, len(parts[0]), writeChunkStreaming)
 	if err != nil {
 		t.Fatalf("prepareWriteLocked err = %v, want nil", err)
 	}
@@ -3946,7 +3950,7 @@ func TestPrepareWriteFinalFragmentsToCurrentStreamCredit(t *testing.T) {
 
 	var finalParts [1][]byte
 	finalParts[0] = []byte("hello")
-	step, err := stream.prepareWritePartsLocked(finalParts[:], 0, 0, len(finalParts[0]), writeChunkFinal)
+	step, err := testPrepareWritePartsLocked(stream, finalParts[:], 0, 0, len(finalParts[0]), writeChunkFinal)
 	if err != nil {
 		t.Fatalf("prepareWriteFinalLocked err = %v, want nil", err)
 	}
@@ -3976,7 +3980,7 @@ func TestPrepareWriteReusesSinglePartPayloadBacking(t *testing.T) {
 	payload := []byte("hello")
 	var parts [1][]byte
 	parts[0] = payload
-	step, err := stream.prepareWritePartsLocked(parts[:], 0, 0, len(payload), writeChunkStreaming)
+	step, err := testPrepareWritePartsLocked(stream, parts[:], 0, 0, len(payload), writeChunkStreaming)
 	if err != nil {
 		t.Fatalf("prepareWriteLocked err = %v, want nil", err)
 	}
@@ -4003,7 +4007,7 @@ func TestPrepareWriteKeepsMultipartPayloadViewAcrossPartBoundary(t *testing.T) {
 	first := []byte("he")
 	second := []byte("llo")
 	parts := [][]byte{first, second}
-	step, err := stream.prepareWritePartsLocked(parts, 0, 0, len(first)+len(second), writeChunkStreaming)
+	step, err := testPrepareWritePartsLocked(stream, parts, 0, 0, len(first)+len(second), writeChunkStreaming)
 	if err != nil {
 		t.Fatalf("prepareWriteLocked err = %v, want nil", err)
 	}
@@ -4358,6 +4362,10 @@ func TestStreamWriteDeadlineExpiresOnFlowControlWait(t *testing.T) {
 	t.Parallel()
 	serverCfg := DefaultConfig()
 	serverCfg.Settings.InitialMaxStreamDataBidiPeerOpened = 0
+	// The BLOCKED on the zero window gets a standing-credit grant of
+	// 2*PerStreamQueuedDataHWM bytes; once those sit unread in the server the
+	// HWM forbids further growth, so the rest of the write keeps waiting.
+	serverCfg.PerStreamQueuedDataHWM = 1
 
 	client, server := newConnPairWithConfig(t, nil, serverCfg)
 	ctx, cancel := testContext(t)
@@ -5481,10 +5489,14 @@ func TestOpenAndSendHonorsContextCancellationBeforeOpen(t *testing.T) {
 func TestOpenAndSendHonorsContextDeadlineDuringFirstWrite(t *testing.T) {
 	t.Parallel()
 
-	serverCfg := DefaultConfig()
-	serverCfg.Settings.InitialMaxData = 0
-	serverCfg.Settings.InitialMaxStreamDataBidiPeerOpened = 0
-	client, _ := newConnPairWithConfig(t, nil, serverCfg)
+	// A real receiver grants standing credit to a zero window once the sender
+	// reports BLOCKED, so a raw peer stands in for one that never grants.
+	clientCfg := DefaultConfig()
+	clientCfg.Role = RoleInitiator
+	peerSettings := DefaultSettings()
+	peerSettings.InitialMaxData = 0
+	peerSettings.InitialMaxStreamDataBidiPeerOpened = 0
+	client, _ := newRawPeerConn(t, clientCfg, peerSettings)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -5501,10 +5513,13 @@ func TestOpenAndSendHonorsContextDeadlineDuringFirstWrite(t *testing.T) {
 func TestOpenUniAndSendHonorsContextDeadlineDuringFinalWrite(t *testing.T) {
 	t.Parallel()
 
-	serverCfg := DefaultConfig()
-	serverCfg.Settings.InitialMaxData = 0
-	serverCfg.Settings.InitialMaxStreamDataUni = 0
-	client, _ := newConnPairWithConfig(t, nil, serverCfg)
+	// A raw peer stands in for a receiver that never grants credit.
+	clientCfg := DefaultConfig()
+	clientCfg.Role = RoleInitiator
+	peerSettings := DefaultSettings()
+	peerSettings.InitialMaxData = 0
+	peerSettings.InitialMaxStreamDataUni = 0
+	client, _ := newRawPeerConn(t, clientCfg, peerSettings)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -7099,5 +7114,458 @@ func TestHandleCloseFrameDuplicateStandardDIAGDropsReasonKeepsPrimarySemantics(t
 	}
 	if peerCloseErr.Reason != "" {
 		t.Fatalf("peer close reason = %q, want empty string after duplicate singleton DIAG", peerCloseErr.Reason)
+	}
+}
+
+func openReadStopTestPair(t *testing.T) (*Conn, *nativeStream, *Conn, *nativeStream) {
+	t.Helper()
+	client, server := newConnPair(t)
+	ctx, cancel := testContext(t)
+	t.Cleanup(cancel)
+
+	accepted := acceptStreamAsync(ctx, server)
+	stream, err := client.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	if _, err := stream.Write([]byte("hi")); err != nil {
+		t.Fatalf("opener Write: %v", err)
+	}
+	result := <-accepted
+	if result.err != nil {
+		t.Fatalf("AcceptStream: %v", result.err)
+	}
+	if _, err := io.ReadFull(result.stream, make([]byte, 2)); err != nil {
+		t.Fatalf("server Read: %v", err)
+	}
+	return client, requireNativeStreamImpl(t, stream), server, result.stream
+}
+
+func awaitPeerStopSending(t *testing.T, stream *nativeStream) {
+	t.Helper()
+	awaitStreamWriteState(t, stream, testSignalTimeout, func(s *nativeStream) bool {
+		return s.sendStop != nil
+	}, "peer did not receive STOP_SENDING for the locally stopped read half")
+	if _, err := stream.Write([]byte("x")); !isWriteStoppedErr(err) {
+		t.Fatalf("Write after peer STOP_SENDING err = %v, want stop error", err)
+	}
+}
+
+func TestLocalReadStopSendsStopSendingWhenSendHalfConcluded(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		stop func(t *testing.T, client *nativeStream, server *nativeStream) error
+	}{
+		{
+			name: "close_write_then_close_read",
+			stop: func(t *testing.T, _ *nativeStream, server *nativeStream) error {
+				if err := server.CloseWrite(); err != nil {
+					t.Fatalf("CloseWrite: %v", err)
+				}
+				return server.CloseRead()
+			},
+		},
+		{
+			name: "full_close",
+			stop: func(_ *testing.T, _ *nativeStream, server *nativeStream) error {
+				return server.Close()
+			},
+		},
+		{
+			name: "cancel_write_then_close_read",
+			stop: func(t *testing.T, _ *nativeStream, server *nativeStream) error {
+				if err := server.CancelWrite(uint64(CodeCancelled)); err != nil {
+					t.Fatalf("CancelWrite: %v", err)
+				}
+				return server.CloseRead()
+			},
+		},
+		{
+			name: "peer_stop_sending_then_close_read",
+			stop: func(t *testing.T, client *nativeStream, server *nativeStream) error {
+				if err := client.CloseRead(); err != nil {
+					t.Fatalf("client CloseRead: %v", err)
+				}
+				awaitStreamWriteState(t, server, testSignalTimeout, func(s *nativeStream) bool {
+					return s.sendStop != nil
+				}, "server did not observe the client's STOP_SENDING")
+				return server.CloseRead()
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			client, cs, server, ss := openReadStopTestPair(t)
+			if err := tc.stop(t, cs, ss); err != nil {
+				t.Fatalf("local read stop err = %v, want nil", err)
+			}
+			awaitPeerStopSending(t, cs)
+
+			awaitConnState(t, server, testSignalTimeout, func(c *Conn) bool {
+				c.mu.Lock()
+				defer c.mu.Unlock()
+				return c.registry.activePeerBidi == 0
+			}, "server stream kept its incoming-stream slot after both directions concluded")
+			if err := server.err(); err != nil {
+				t.Fatalf("server session failed: %v", err)
+			}
+			if err := client.err(); err != nil {
+				t.Fatalf("client session failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestCloseThenPeerWritesWithinWindowDoesNotTripLateDataCap(t *testing.T) {
+	t.Parallel()
+
+	client, cs, server, ss := openReadStopTestPair(t)
+	if err := ss.Close(); err != nil {
+		t.Fatalf("server Close: %v", err)
+	}
+
+	chunk := make([]byte, 4096)
+	for i := 0; i < 16; i++ {
+		if _, err := cs.Write(chunk); err != nil {
+			if !isWriteStoppedErr(err) {
+				t.Fatalf("client Write %d err = %v, want nil or stop error", i, err)
+			}
+			break
+		}
+	}
+	awaitPeerStopSending(t, cs)
+
+	if err := server.err(); err != nil {
+		t.Fatalf("server session failed: %v", err)
+	}
+	if err := client.err(); err != nil {
+		t.Fatalf("client session failed: %v", err)
+	}
+}
+
+// TestCloseReadErrorRacingSessionCloseIsDataRaceFree repeats CloseRead on a
+// read half that already ended (each call fails with ErrReadClosed) while the
+// session closes. Surfacing that error reads stream termination state that
+// session close mutates under conn.mu, so it must happen before the lock is
+// released. Meaningful under -race.
+func TestCloseReadErrorRacingSessionCloseIsDataRaceFree(t *testing.T) {
+	t.Parallel()
+
+	for round := 0; round < 8; round++ {
+		client, cs, server, ss := openReadStopTestPair(t)
+		if _, err := cs.Write([]byte("unread")); err != nil {
+			t.Fatalf("round %d: client Write: %v", round, err)
+		}
+		if err := cs.CloseWrite(); err != nil {
+			t.Fatalf("round %d: client CloseWrite: %v", round, err)
+		}
+		awaitStreamReadState(t, ss, testSignalTimeout, func(s *nativeStream) bool {
+			return s.effectiveRecvHalfStateLocked() == state.RecvHalfFin
+		}, "server stream did not observe the client's FIN")
+
+		spinning := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			for i := 0; ; i++ {
+				if err := ss.CloseRead(); !errors.Is(err, ErrReadClosed) {
+					done <- err
+					return
+				}
+				if i == 0 {
+					close(spinning)
+				}
+			}
+		}()
+		<-spinning
+		_ = server.Close()
+		if err := <-done; err == nil {
+			t.Fatalf("round %d: CloseRead after session close err = nil, want session error", round)
+		}
+		_ = client.Close()
+	}
+}
+
+// gatedCaptureConn holds client transport writes while gated and records
+// every byte the client writes so the frame order can be checked afterwards.
+type gatedCaptureConn struct {
+	net.Conn
+	mu      sync.Mutex
+	gate    chan struct{}
+	entered chan struct{}
+	data    []byte
+}
+
+func (c *gatedCaptureConn) block() {
+	c.mu.Lock()
+	c.gate = make(chan struct{})
+	c.mu.Unlock()
+}
+
+func (c *gatedCaptureConn) open() {
+	c.mu.Lock()
+	if c.gate != nil {
+		close(c.gate)
+		c.gate = nil
+	}
+	c.mu.Unlock()
+}
+
+func (c *gatedCaptureConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	gate := c.gate
+	c.mu.Unlock()
+	if gate != nil {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
+		<-gate
+	}
+	n, err := c.Conn.Write(p)
+	c.mu.Lock()
+	c.data = append(c.data, p[:n]...)
+	c.mu.Unlock()
+	return n, err
+}
+
+func (c *gatedCaptureConn) framesAfterPreface(t *testing.T) []Frame {
+	t.Helper()
+	c.mu.Lock()
+	raw := append([]byte(nil), c.data...)
+	c.mu.Unlock()
+	reader := bytes.NewReader(raw)
+	if _, err := ReadPreface(reader); err != nil {
+		t.Fatalf("parse captured client preface: %v", err)
+	}
+	var frames []Frame
+	for reader.Len() > 0 {
+		frame, err := ReadFrame(reader, DefaultSettings().Limits())
+		if err != nil {
+			t.Fatalf("parse captured client frame: %v", err)
+		}
+		frames = append(frames, frame)
+	}
+	return frames
+}
+
+func pollStreamState(t *testing.T, stream *nativeStream, match func(*nativeStream) bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(testSignalTimeout)
+	for {
+		stream.conn.mu.Lock()
+		ok := match(stream)
+		stream.conn.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func newGatedCaptureConnPair(t *testing.T) (*Conn, *Conn, *gatedCaptureConn) {
+	t.Helper()
+	left, right := net.Pipe()
+	gated := &gatedCaptureConn{Conn: left, entered: make(chan struct{}, 1)}
+	type result struct {
+		conn *Conn
+		err  error
+	}
+	clientCh := make(chan result, 1)
+	serverCh := make(chan result, 1)
+	go func() { c, err := Client(gated, nil); clientCh <- result{c, err} }()
+	go func() { c, err := Server(right, nil); serverCh <- result{c, err} }()
+	client := <-clientCh
+	server := <-serverCh
+	if client.err != nil || server.err != nil {
+		t.Fatalf("establish: client=%v server=%v", client.err, server.err)
+	}
+	t.Cleanup(func() {
+		gated.open()
+		_ = client.conn.Close()
+		_ = server.conn.Close()
+	})
+	return client.conn, server.conn, gated
+}
+
+func TestLocalTerminalSignalNeverOvertakesQueuedOpener(t *testing.T) {
+	t.Parallel()
+
+	resetCommitted := func(s *nativeStream) bool { return s.sendReset != nil }
+	stopCommitted := func(s *nativeStream) bool { return s.readStopSentLocked() }
+	abortCommitted := func(s *nativeStream) bool { return s.sendAbortErrLocked() != nil }
+	tests := []struct {
+		name string
+		// withdraw lets the opener's Write time out while it is still queued:
+		// before the terminal signal, or after it when withdrawAfterSignal.
+		withdraw            bool
+		withdrawAfterSignal bool
+		signal              func(stream *nativeStream) error
+		committed           func(stream *nativeStream) bool
+		wantFirst           FrameType
+		wantType            FrameType
+	}{
+		{
+			name:      "cancel_write_while_opener_queued",
+			signal:    func(stream *nativeStream) error { return stream.CancelWrite(uint64(CodeCancelled)) },
+			committed: resetCommitted,
+			wantFirst: FrameTypeDATA,
+			wantType:  FrameTypeRESET,
+		},
+		{
+			name:      "close_read_while_opener_queued",
+			signal:    func(stream *nativeStream) error { return stream.CloseRead() },
+			committed: stopCommitted,
+			wantFirst: FrameTypeDATA,
+			wantType:  FrameTypeStopSending,
+		},
+		{
+			name:                "cancel_write_then_opener_withdrawn",
+			withdraw:            true,
+			withdrawAfterSignal: true,
+			signal:              func(stream *nativeStream) error { return stream.CancelWrite(uint64(CodeCancelled)) },
+			committed:           resetCommitted,
+			wantFirst:           FrameTypeDATA,
+			wantType:            FrameTypeRESET,
+		},
+		{
+			// A withdrawn opener is consumed with ABORT(CANCELLED) at once, so
+			// no later signal is needed to put its stream ID on the wire.
+			name:      "opener_withdrawn_before_signal",
+			withdraw:  true,
+			committed: abortCommitted,
+			wantFirst: FrameTypeABORT,
+			wantType:  FrameTypeABORT,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			client, server, gated := newGatedCaptureConnPair(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			go func() {
+				for {
+					stream, err := server.AcceptStream(ctx)
+					if err != nil {
+						return
+					}
+					go func() { _, _ = io.Copy(io.Discard, stream) }()
+				}
+			}()
+
+			// Park the writer inside the transport with the first stream's opener.
+			gated.block()
+			first, err := client.OpenStream(ctx)
+			if err != nil {
+				t.Fatalf("OpenStream first: %v", err)
+			}
+			go func() { _, _ = first.Write([]byte("x")) }()
+			select {
+			case <-gated.entered:
+			case <-time.After(testSignalTimeout):
+				t.Fatal("writer did not block on the gated transport")
+			}
+
+			// Queue the second stream's opener behind it.
+			second, err := client.OpenStream(ctx)
+			if err != nil {
+				t.Fatalf("OpenStream second: %v", err)
+			}
+			stream := requireNativeStreamImpl(t, second)
+			writeDone := make(chan error, 1)
+			if tc.withdraw {
+				deadline := 50 * time.Millisecond
+				if tc.withdrawAfterSignal {
+					deadline = 300 * time.Millisecond
+				}
+				if err := stream.SetWriteDeadline(time.Now().Add(deadline)); err != nil {
+					t.Fatalf("SetWriteDeadline: %v", err)
+				}
+			}
+			go func() {
+				_, err := second.Write([]byte("y"))
+				writeDone <- err
+			}()
+			pollStreamState(t, stream, func(s *nativeStream) bool {
+				return s.idSet && s.visibilityPhaseLocked() == state.LocalOpenPhaseQueued
+			}, "second stream opener was not queued")
+			awaitWithdrawn := func() {
+				select {
+				case err := <-writeDone:
+					if !errors.Is(err, os.ErrDeadlineExceeded) {
+						t.Fatalf("withdrawn opener Write err = %v, want deadline", err)
+					}
+				case <-time.After(testSignalTimeout):
+					t.Fatal("queued opener write did not time out")
+				}
+			}
+			if tc.withdraw && !tc.withdrawAfterSignal {
+				awaitWithdrawn()
+			}
+
+			signalDone := make(chan error, 1)
+			if tc.signal != nil {
+				go func() { signalDone <- tc.signal(stream) }()
+			} else {
+				signalDone <- nil
+			}
+			pollStreamState(t, stream, tc.committed, "terminal signal was not committed locally")
+			if tc.withdrawAfterSignal {
+				awaitWithdrawn()
+			}
+
+			gated.open()
+			select {
+			case err := <-signalDone:
+				if err != nil {
+					t.Fatalf("terminal signal err = %v, want nil", err)
+				}
+			case <-time.After(testSignalTimeout):
+				t.Fatal("terminal signal did not complete after the writer was released")
+			}
+			pollStreamState(t, stream, func(s *nativeStream) bool {
+				return !s.hasPendingTerminalControlLocked()
+			}, "terminal signal was not flushed")
+			pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+			defer pingCancel()
+			// A PONG proves the server processed everything before it without
+			// failing the session.
+			if _, err := client.Ping(pingCtx, nil); err != nil {
+				t.Fatalf("Ping after terminal signal err = %v (server err = %v)", err, server.err())
+			}
+			if err := server.err(); err != nil {
+				t.Fatalf("server session failed: %v", err)
+			}
+
+			streamID := second.StreamID()
+			var seen []FrameType
+			for _, frame := range gated.framesAfterPreface(t) {
+				if frame.StreamID == streamID {
+					seen = append(seen, frame.Type)
+				}
+			}
+			if len(seen) == 0 || seen[0] != tc.wantFirst {
+				t.Fatalf("stream %d frames = %v, want opening %v first", streamID, seen, tc.wantFirst)
+			}
+			found := false
+			for _, typ := range seen {
+				if typ == tc.wantType {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("stream %d frames = %v, want %v after the opener", streamID, seen, tc.wantType)
+			}
+		})
 	}
 }

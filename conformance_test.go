@@ -19,6 +19,12 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestWireInvalidFixtures",
 		"TestInvalidFixturesSupportedScenarios",
 		"TestDuplicatePeerCloseIgnoredBeforeParseAndBudgetAccounting",
+		"TestNonCanonicalFrameLengthClosesSessionWithProtocol",
+		"TestEXTPayloadShorterThanExtTypeClosesSessionWithProtocol",
+		"TestNegotiatedPriorityUpdateValidationOrder",
+		"TestWireInvalidFixturesCloseLiveSession",
+		"TestInvalidFixtureFramesCloseLiveSession",
+		"TestInvalidPrefaceFixturesFailLiveEstablishment",
 	},
 	"pass extension-tolerance behavior": {
 		"TestPriorityUpdateIgnoresUnknownTLV",
@@ -28,6 +34,7 @@ var conformanceChecklistEvidence = map[string][]string{
 	"satisfy zmux-wire-v1": {
 		"TestWireValidFixtures",
 		"TestWireInvalidFixtures",
+		"TestWireFixtureFieldsAreAllAsserted",
 	},
 	"negotiate open_metadata": {
 		"TestOpenMetadataCarriesPriorityAndGroup",
@@ -39,6 +46,8 @@ var conformanceChecklistEvidence = map[string][]string{
 	"reject unnegotiated or misplaced OPEN_METADATA": {
 		"TestOpenInfoRequiresOpenMetadataCapability",
 		"TestInvalidFixturesSupportedScenarios",
+		"TestOpenMetadataOnUsedStreamIsSessionProtocolInEveryState",
+		"TestInvalidFixtureFramesCloseLiveSession",
 	},
 	"ignore unknown metadata TLVs": {
 		"TestOpenMetadataIgnoresUnknownMetadataTLV",
@@ -60,6 +69,7 @@ var conformanceChecklistEvidence = map[string][]string{
 	},
 	"ignore duplicate singleton advisory updates as one dropped update": {
 		"TestPriorityUpdateDuplicateSingletonIgnored",
+		"TestNegotiatedPriorityUpdateValidationOrder",
 	},
 	"document and implement the repository-default semantic operation families from API_SEMANTICS.md, including full local close helper, graceful send-half completion, read-side stop, send-side reset, whole-stream abort, structured error surfacing, open/cancel behavior, and accept visibility rules": {
 		"TestCloseReadStopsPeerWritesButPreservesReverseRead",
@@ -129,6 +139,9 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestKeepaliveSendsIdlePing",
 		"TestOutboundTransportWriteResetsKeepaliveDeadline",
 		"TestResetKeepaliveDueDesynchronizesDistinctSessions",
+		"TestPeerCloseNoErrorFailsReceiveHalvesWithoutPeerFIN",
+		"TestLocalGracefulSessionCloseFailsReceiveHalvesWithoutPeerFIN",
+		"TestGracefulCloseIsBoundedWhileTransportWriteIsStalled",
 	},
 	"satisfy zmux-v1": {
 		"TestWireValidFixtures",
@@ -144,6 +157,7 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestOpenMetadataCarriesPriorityAndGroup",
 		"TestPriorityUpdateRoundTrip",
 		"TestPriorityUpdateIgnoredWhenUnnegotiated",
+		"TestUnnegotiatedPriorityUpdateIsIgnoredWithoutParsing",
 	},
 	"satisfy the repository-defined reference-profile claim gate": {
 		"TestClientEstablishmentOnlyWritesPrefaceBeforePeerPreface",
@@ -205,19 +219,26 @@ var conformanceChecklistEvidence = map[string][]string{
 		"TestClientEstablishmentOnlyWritesPrefaceBeforePeerPreface",
 		"TestClientEstablishmentInvalidPeerPrefaceEmitsFatalClose",
 		"TestClientEstablishmentRoleConflictEmitsFatalClose",
+		"TestEstablishmentFailureWithBufferedPeerPrefaceSendsPrefaceAndClose",
+		"TestEstablishmentFailureBeforePrefaceWriterRunsStillSendsPrefaceAndClose",
+		"TestInvalidPrefaceFixturesFailLiveEstablishment",
 	},
 	"repository-default sender and receiver memory rules enforce the documented hidden-state, provisional-open, and late-tail bounds": {
 		"TestInvalidFixturesSupportedScenarios",
 		"TestStateFixturesSupportedScenarios",
 		"TestRapidHiddenAbortChurnTriggersProtocolClose",
 		"TestProvisionalOpenHardCapFailsNewest",
-		"TestLateDataAggregateCapAfterMultipleTerminalDirections",
+		"TestLateDataAggregateCapOverflowDiscardsWithoutFailingSession",
+		"TestSequentialLateTailsDoNotExhaustSessionAggregate",
+		"TestLateTailUpToStreamCreditAfterLocalStopKeepsSession",
 		"TestQueueStreamBlockedDropsWhenControlBudgetExceeded",
 	},
 	"repository-default liveness rules keep at most one outstanding protocol PING and do not treat weak local signals as strong progress": {
 		"TestPingWaitsForOutstandingSlot",
 		"TestKeepaliveSendsIdlePing",
 		"TestKeepaliveTimeoutSignalsIdleTimeoutError",
+		"TestKeepaliveTimeoutFiresWhileTransportWriteIsStalled",
+		"TestPingHonorsContextWhileTransportWriteIsStalled",
 		"TestOutboundTransportWriteResetsKeepaliveDeadline",
 		"TestResetKeepaliveDueDesynchronizesDistinctSessions",
 	},

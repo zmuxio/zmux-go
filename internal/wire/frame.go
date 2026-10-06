@@ -100,14 +100,14 @@ func ParseFrame(src []byte, limits Limits) (Frame, int, error) {
 	if err != nil {
 		return Frame{}, 0, err
 	}
-	frame, err := parseBufferedFrame(src, frameLen, n, total, code, frameType, flags, limits)
+	frame, err := parseBufferedFrame(src, frameLen, n, total, code, frameType, flags, limits, false)
 	if err != nil {
 		return Frame{}, 0, err
 	}
 	return frame, total, nil
 }
 
-func parseBufferedFrame(src []byte, frameLen uint64, n int, total int, code byte, frameType FrameType, flags byte, limits Limits) (Frame, error) {
+func parseBufferedFrame(src []byte, frameLen uint64, n int, total int, code byte, frameType FrameType, flags byte, limits Limits, extEnvelopeOnly bool) (Frame, error) {
 	streamID, streamLen, err := ParseVarint(src[n+1:])
 	if err != nil {
 		if errors.Is(err, ErrTruncatedVarint) {
@@ -137,13 +137,25 @@ func parseBufferedFrame(src []byte, frameLen uint64, n int, total int, code byte
 		StreamID: streamID,
 		Payload:  payload,
 	}
-	if err := ValidateFrame(frame, limits, true); err != nil {
+	if err := validateFrame(frame, limits, true, extEnvelopeOnly); err != nil {
 		return Frame{}, err
 	}
 	return frame, nil
 }
 
 func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *FrameReadBufferHandle, error) {
+	return readFrameBuffered(r, limits, dst, false)
+}
+
+// ReadSessionFrameBuffered is ReadFrameBuffered for a session read loop. For
+// EXT it checks only the generic envelope (a parseable ext_type within the
+// extension payload limit) and leaves subtype payload rules to the session,
+// which must first check whether the subtype was negotiated (SPEC §7.6).
+func ReadSessionFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *FrameReadBufferHandle, error) {
+	return readFrameBuffered(r, limits, dst, true)
+}
+
+func readFrameBuffered(r io.Reader, limits Limits, dst []byte, extEnvelopeOnly bool) (Frame, []byte, *FrameReadBufferHandle, error) {
 	limits = NormalizeLimits(limits)
 
 	br, ok := r.(io.ByteReader)
@@ -153,6 +165,14 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 
 	frameLen, n, err := ReadVarint(br)
 	if err != nil {
+		switch {
+		case errors.Is(err, ErrTruncatedVarint):
+			// The transport ended inside the varint, as for stream_id below.
+			return Frame{}, dst, nil, io.ErrUnexpectedEOF
+		case errors.Is(err, ErrNonCanonicalVarint), errors.Is(err, ErrValueTooLarge):
+			return Frame{}, dst, nil, WrapError(CodeProtocol, "read frame_length", err)
+		}
+		// io.EOF at a frame boundary and transport errors stay unwrapped.
 		return Frame{}, dst, nil, err
 	}
 	if frameLen < 2 {
@@ -230,7 +250,7 @@ func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *
 		return Frame{}, dst, handle, err
 	}
 
-	frame, err := parseBufferedFrame(dst, frameLen, n, total, code, frameType, flags, limits)
+	frame, err := parseBufferedFrame(dst, frameLen, n, total, code, frameType, flags, limits, extEnvelopeOnly)
 	if err != nil {
 		return Frame{}, dst, handle, err
 	}
@@ -311,6 +331,10 @@ func NormalizeLimits(limits Limits) Limits {
 }
 
 func ValidateFrame(f Frame, limits Limits, inbound bool) error {
+	return validateFrame(f, limits, inbound, false)
+}
+
+func validateFrame(f Frame, limits Limits, inbound bool, extEnvelopeOnly bool) error {
 	if !f.Type.Valid() {
 		return WrapError(CodeProtocol, "validate frame", ErrInvalidFrameType)
 	}
@@ -352,6 +376,10 @@ func ValidateFrame(f Frame, limits Limits, inbound bool) error {
 		return ValidateGOAWAYPayload(f.Payload)
 	case FrameTypeEXT:
 		if err := validateInboundPayloadLimit(inbound, f.Payload, limits.MaxExtensionPayloadBytes, "validate EXT payload"); err != nil {
+			return err
+		}
+		if extEnvelopeOnly {
+			_, _, err := ParseEXTType(f.Payload)
 			return err
 		}
 		return ValidateEXTPayload(f.StreamID, f.Payload)
@@ -429,12 +457,24 @@ func ValidateGOAWAYPayload(payload []byte) error {
 	return nil
 }
 
-func ValidateEXTPayload(streamID uint64, payload []byte) error {
+// ParseEXTType decodes the ext_type prefix of an EXT payload and returns it
+// with the ext_payload offset. A payload too short for its ext_type, or a
+// non-canonical ext_type, is a session PROTOCOL error (SPEC §6.11), not the
+// FRAME_SIZE used for other truncated payload fields.
+func ParseEXTType(payload []byte) (EXTSubtype, int, error) {
 	extType, n, err := ParseVarint(payload)
 	if err != nil {
-		return FrameSizeError("validate EXT payload", err)
+		return 0, 0, WrapError(CodeProtocol, "validate EXT payload", err)
 	}
-	switch EXTSubtype(extType) {
+	return EXTSubtype(extType), n, nil
+}
+
+func ValidateEXTPayload(streamID uint64, payload []byte) error {
+	extType, n, err := ParseEXTType(payload)
+	if err != nil {
+		return err
+	}
+	switch extType {
 	case EXTPriorityUpdate:
 		if streamID == 0 {
 			return WrapError(CodeProtocol, "validate EXT payload", fmt.Errorf("PRIORITY_UPDATE requires non-zero stream_id"))

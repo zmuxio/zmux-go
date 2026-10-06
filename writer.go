@@ -464,8 +464,48 @@ func (c *Conn) handleWriteBatch(batch []writeRequest) bool {
 		c.closeSessionWithOptions(err, closeOriginWriteLoop, closeFrameDefault)
 		return false
 	}
+	c.markWrittenOpenersPeerVisible(batch)
 	c.completeWriteBatch(batch, nil)
 	return true
+}
+
+// markWrittenOpenersPeerVisible records that the opening DATA carried by a
+// written batch has reached the transport, and wakes the pending terminal
+// flush for RESET/STOP_SENDING frames that were held behind those openers.
+func (c *Conn) markWrittenOpenersPeerVisible(batch []writeRequest) {
+	if c == nil {
+		return
+	}
+	hasOpener := false
+	for i := range batch {
+		if batch[i].preparedOpenerVisibility.marksPeerVisible() {
+			hasOpener = true
+			break
+		}
+	}
+	if !hasOpener {
+		return
+	}
+	wakeTerminal := false
+	c.mu.Lock()
+	for i := range batch {
+		req := &batch[i]
+		if !req.preparedOpenerVisibility.marksPeerVisible() {
+			continue
+		}
+		stream := c.preparedRequestStreamLocked(req)
+		if stream == nil || !stream.awaitingPeerVisibilityLocked() {
+			continue
+		}
+		c.markPeerVisibleLocked(stream)
+		if stream.hasPendingTerminalControlLocked() {
+			wakeTerminal = true
+		}
+	}
+	c.mu.Unlock()
+	if wakeTerminal {
+		notify(c.pending.terminalNotify)
+	}
 }
 
 func (c *Conn) tryDequeueWriteWork() (dequeuedWriteWork, bool) {
@@ -573,6 +613,7 @@ func (c *Conn) suppressWriteBatch(batch []writeRequest) []writeRequest {
 	inflightQueued.Range(func(stream *nativeStream, queued uint64) {
 		stream.inflightQueued = saturatingAdd(stream.inflightQueued, queued)
 	})
+	c.releaseLocalOpenerTurnsForBatchLocked(filtered)
 	c.mu.Unlock()
 
 	c.releaseRejectedPreparedRequests(rejected)
@@ -683,6 +724,10 @@ func (c *Conn) collectOrdinaryWriteBatch(first writeRequest, firstLane writeLane
 	})
 }
 
+// orderWriteBatch may reorder requests across streams. It never reorders the
+// opening frames of one local stream class: a local stream commits its ID only
+// after the previous same-class opener was taken into an earlier batch (see
+// releaseLocalOpenerTurnsForBatchLocked), so a batch holds at most one of them.
 func (c *Conn) orderWriteBatch(batch []writeRequest, lane writeLane) []writeRequest {
 	if len(batch) < 2 {
 		return batch
@@ -762,8 +807,12 @@ func (c *Conn) batchOrder(batch []writeRequest, lane writeLane) []int {
 			c.urgentBatchItems(batch),
 		)
 	case writeLaneOrdinary, writeLaneAdvisory:
-		items := c.dataBatchItems(batch)
-		return c.writer.scheduler.Order(
+		// The retained scheduler state is also mutated by stream-terminal and
+		// session-close paths (DropStream, UntrackExplicitGroup, Clear) under
+		// c.mu, so building the items and ordering them must share that lock.
+		c.mu.Lock()
+		items := c.dataBatchItemsLocked(batch)
+		order := c.writer.scheduler.Order(
 			rt.BatchConfig{
 				GroupFair:       c.config.peer.Settings.SchedulerHints == SchedulerGroupFair,
 				SchedulerHint:   c.config.peer.Settings.SchedulerHints,
@@ -771,6 +820,8 @@ func (c *Conn) batchOrder(batch []writeRequest, lane writeLane) []int {
 			},
 			items,
 		)
+		c.mu.Unlock()
+		return order
 	default:
 		return rt.OrderBatchIndices(rt.BatchConfig{}, nil, nil)
 	}
@@ -917,11 +968,10 @@ func (c *Conn) urgentBatchItems(batch []writeRequest) []rt.BatchItem {
 	return items
 }
 
-func (c *Conn) dataBatchItems(batch []writeRequest) []rt.BatchItem {
+func (c *Conn) dataBatchItemsLocked(batch []writeRequest) []rt.BatchItem {
 	items, explicitGroups := c.writer.scratch.dataScratch(len(batch))
 	groupFair := c.config.peer.Settings.SchedulerHints == SchedulerGroupFair
 
-	c.mu.Lock()
 	for i := range batch {
 		req := &batch[i]
 		classifyWriteRequest(req)
@@ -945,7 +995,6 @@ func (c *Conn) dataBatchItems(batch []writeRequest) []rt.BatchItem {
 
 		items[i] = item
 	}
-	c.mu.Unlock()
 
 	return items
 }

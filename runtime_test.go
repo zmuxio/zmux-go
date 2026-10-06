@@ -373,7 +373,11 @@ func TestPeerAbortMakesReadReturnApplicationError(t *testing.T) {
 	}
 }
 
-func TestPeerAbortReleasesWithdrawnSendBudget(t *testing.T) {
+// Bytes already committed to the writer stay counted against the peer's
+// session MAX_DATA after the stream terminates (SPEC §8, IMPLEMENTATION §2.1.1).
+// Only prepared requests the writer discards hand their bytes back, see
+// TestWriteLoopSuppressRejectedDataRollsBackPreparedSendCredit.
+func TestPeerAbortKeepsCommittedSessionSendCredit(t *testing.T) {
 	t.Parallel()
 	c, frames, stop := newHandlerTestConn(t)
 	defer stop()
@@ -404,22 +408,22 @@ func TestPeerAbortReleasesWithdrawnSendBudget(t *testing.T) {
 	if sendAbort == nil || sendAbort.Code != uint64(CodeRefusedStream) {
 		t.Fatalf("sendAbort = %v, want code %d", sendAbort, uint64(CodeRefusedStream))
 	}
-	if sendSessionUsed != 0 {
-		t.Fatalf("sendSessionUsed = %d, want 0", sendSessionUsed)
+	if sendSessionUsed != 9 {
+		t.Fatalf("sendSessionUsed = %d, want 9 (committed bytes are never refunded)", sendSessionUsed)
 	}
 	if sendSent != 0 {
 		t.Fatalf("stream sendSent = %d, want 0", sendSent)
 	}
 }
 
-func TestResetReleasesWithdrawnSendBudget(t *testing.T) {
+func TestResetKeepsCommittedSessionSendCredit(t *testing.T) {
 	t.Parallel()
 	c, frames, stop := newHandlerTestConn(t)
 	defer stop()
 
 	c.mu.Lock()
 	stream := c.newLocalStreamWithIDLocked(state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), streamArityBidi, OpenOptions{}, nil)
-	testMarkLocalOpenCommitted(stream)
+	testMarkLocalOpenVisible(stream)
 	stream.sendSent = 11
 	c.flow.sendSessionUsed = 11
 	c.registry.streams[stream.id] = stream
@@ -450,8 +454,8 @@ func TestResetReleasesWithdrawnSendBudget(t *testing.T) {
 	sendReset := stream.sendReset
 	c.mu.Unlock()
 
-	if sendSessionUsed != 0 {
-		t.Fatalf("sendSessionUsed = %d, want 0", sendSessionUsed)
+	if sendSessionUsed != 11 {
+		t.Fatalf("sendSessionUsed = %d, want 11 (committed bytes are never refunded)", sendSessionUsed)
 	}
 	if sendSent != 0 {
 		t.Fatalf("stream sendSent = %d, want 0", sendSent)
@@ -461,7 +465,7 @@ func TestResetReleasesWithdrawnSendBudget(t *testing.T) {
 	}
 }
 
-func TestProvisionalResetReleasesWithdrawnSendBudget(t *testing.T) {
+func TestProvisionalResetKeepsSessionSendCreditForPreparedRequests(t *testing.T) {
 	t.Parallel()
 	c, frames, stop := newHandlerTestConn(t)
 	defer stop()
@@ -483,8 +487,10 @@ func TestProvisionalResetReleasesWithdrawnSendBudget(t *testing.T) {
 	sendAbort := stream.sendAbort
 	c.mu.Unlock()
 
-	if sendSessionUsed != 0 {
-		t.Fatalf("sendSessionUsed = %d, want 0", sendSessionUsed)
+	// Session credit for reserved bytes is returned only by the prepared
+	// request that carries them, when the writer discards that request.
+	if sendSessionUsed != 8 {
+		t.Fatalf("sendSessionUsed = %d, want 8", sendSessionUsed)
 	}
 	if sendSent != 0 {
 		t.Fatalf("stream sendSent = %d, want 0", sendSent)
@@ -494,7 +500,7 @@ func TestProvisionalResetReleasesWithdrawnSendBudget(t *testing.T) {
 	}
 }
 
-func TestCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
+func TestCloseWithErrorReleasesReceiveBudgetsAndKeepsCommittedSendCredit(t *testing.T) {
 	t.Parallel()
 	c, frames, stop := newHandlerTestConn(t)
 	defer stop()
@@ -537,8 +543,8 @@ func TestCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
 	sendAbort := stream.sendAbort
 	c.mu.Unlock()
 
-	if sendSessionUsed != 0 {
-		t.Fatalf("sendSessionUsed = %d, want 0", sendSessionUsed)
+	if sendSessionUsed != 13 {
+		t.Fatalf("sendSessionUsed = %d, want 13 (committed bytes are never refunded)", sendSessionUsed)
 	}
 	if recvSessionUsed != 0 {
 		t.Fatalf("recvSessionUsed = %d, want 0", recvSessionUsed)
@@ -557,7 +563,7 @@ func TestCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
 	}
 }
 
-func TestProvisionalCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
+func TestProvisionalCloseWithErrorKeepsSessionSendCreditForPreparedRequests(t *testing.T) {
 	t.Parallel()
 	c, frames, stop := newHandlerTestConn(t)
 	defer stop()
@@ -579,8 +585,10 @@ func TestProvisionalCloseWithErrorReleasesWithdrawnBudgets(t *testing.T) {
 	sendAbort := stream.sendAbort
 	c.mu.Unlock()
 
-	if sendSessionUsed != 0 {
-		t.Fatalf("sendSessionUsed = %d, want 0", sendSessionUsed)
+	// Session credit for reserved bytes is returned only by the prepared
+	// request that carries them, when the writer discards that request.
+	if sendSessionUsed != 10 {
+		t.Fatalf("sendSessionUsed = %d, want 10", sendSessionUsed)
 	}
 	if sendSent != 0 {
 		t.Fatalf("stream sendSent = %d, want 0", sendSent)
@@ -669,7 +677,7 @@ func TestPeerGoAwayReclaimsNeverPeerVisibleLocalStream(t *testing.T) {
 	}
 }
 
-func TestPeerGoAwayReclaimReleasesSendBudget(t *testing.T) {
+func TestPeerGoAwayReclaimKeepsSessionSendCredit(t *testing.T) {
 	t.Parallel()
 	c, _, stop := newHandlerTestConn(t)
 	defer stop()
@@ -692,8 +700,8 @@ func TestPeerGoAwayReclaimReleasesSendBudget(t *testing.T) {
 	if sendAbort == nil || sendAbort.Code != uint64(CodeRefusedStream) {
 		t.Fatalf("reclaimed send abort code = %v, want %d", sendAbort, uint64(CodeRefusedStream))
 	}
-	if used != 0 {
-		t.Fatalf("sendSessionUsed = %d, want 0", used)
+	if used != 9 {
+		t.Fatalf("sendSessionUsed = %d, want 9 (only discarded prepared requests refund credit)", used)
 	}
 	if stream.sendSent != 0 {
 		t.Fatalf("stream sendSent = %d, want 0", stream.sendSent)
@@ -753,6 +761,168 @@ func TestSuppressWriteRequestRejectsTerminalLocalSend(t *testing.T) {
 				t.Fatalf("sendHalf = %v, want %v", got, tc.state)
 			}
 		})
+	}
+}
+
+func TestSuppressWriteRequestKeepsReadStopAfterSendHalfConcludes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		seed     func(*nativeStream)
+		wantKeep bool
+	}{
+		{
+			name:     "send_fin",
+			seed:     func(stream *nativeStream) { stream.setSendFin() },
+			wantKeep: true,
+		},
+		{
+			name: "send_stop_seen",
+			seed: func(stream *nativeStream) {
+				stream.setSendStopSeen(&ApplicationError{Code: uint64(CodeCancelled)})
+			},
+			wantKeep: true,
+		},
+		{
+			name: "send_reset",
+			seed: func(stream *nativeStream) {
+				stream.setSendResetWithSource(&ApplicationError{Code: uint64(CodeCancelled)}, terminalResetDirect)
+			},
+			wantKeep: true,
+		},
+		{
+			name: "aborted",
+			seed: func(stream *nativeStream) {
+				stream.setAbortedWithSource(&ApplicationError{Code: uint64(CodeCancelled)}, terminalAbortLocal)
+			},
+			wantKeep: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, _, stop := newHandlerTestConn(t)
+			defer stop()
+
+			c.mu.Lock()
+			stream := c.newLocalStreamWithIDLocked(state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), streamArityBidi, OpenOptions{}, nil)
+			testMarkLocalOpenVisible(stream)
+			c.registry.streams[stream.id] = stream
+			tc.seed(stream)
+			c.mu.Unlock()
+
+			stopReq := writeRequest{
+				frames: testTxFramesFrom([]Frame{{Type: FrameTypeStopSending, StreamID: stream.id, Payload: mustEncodeVarint(uint64(CodeCancelled))}}),
+				done:   make(chan error, 1),
+				origin: writeRequestOriginStream,
+			}
+			err := c.suppressWriteRequest(stopReq)
+			if tc.wantKeep && err != nil {
+				t.Fatalf("STOP_SENDING suppress err = %v, want nil", err)
+			}
+			if !tc.wantKeep && err == nil {
+				t.Fatal("STOP_SENDING after whole-stream ABORT was not suppressed")
+			}
+
+			// DATA on the same concluded send half is still suppressed.
+			dataReq := writeRequest{
+				frames: testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: stream.id, Payload: []byte("x")}}),
+				done:   make(chan error, 1),
+				origin: writeRequestOriginStream,
+			}
+			if err := c.suppressWriteRequest(dataReq); err == nil {
+				t.Fatal("DATA after the send half concluded was not suppressed")
+			}
+		})
+	}
+}
+
+func TestSuppressWriteRequestKeepsQueuedOpenerAfterLocalReset(t *testing.T) {
+	t.Parallel()
+	c, _, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	stream := c.newLocalStreamWithIDLocked(state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), streamArityBidi, OpenOptions{}, nil)
+	stream.markSendCommittedAndMaybeBarrierLocked(openerVisibilityPeerVisible)
+	stream.setSendResetWithSource(&ApplicationError{Code: uint64(CodeCancelled)}, terminalResetDirect)
+	c.registry.streams[stream.id] = stream
+	c.mu.Unlock()
+
+	opener := writeRequest{
+		frames:                   testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: stream.id, Payload: []byte("x")}}),
+		done:                     make(chan error, 1),
+		origin:                   writeRequestOriginStream,
+		reservedStream:           stream,
+		preparedOpenerVisibility: openerVisibilityPeerVisible,
+	}
+	if err := c.suppressWriteRequest(opener); err != nil {
+		t.Fatalf("queued opener suppress err = %v, want nil so RESET cannot become the first frame", err)
+	}
+
+	later := writeRequest{
+		frames:         testTxFramesFrom([]Frame{{Type: FrameTypeDATA, StreamID: stream.id, Payload: []byte("y")}}),
+		done:           make(chan error, 1),
+		origin:         writeRequestOriginStream,
+		reservedStream: stream,
+	}
+	if err := c.suppressWriteRequest(later); err == nil {
+		t.Fatal("non-opening DATA after local RESET was not suppressed")
+	}
+
+	c.mu.Lock()
+	stream.setPeerVisibleLocked()
+	c.mu.Unlock()
+	if err := c.suppressWriteRequest(opener); err == nil {
+		t.Fatal("opener request on an already peer-visible reset stream was not suppressed")
+	}
+}
+
+func TestPendingResetHeldUntilQueuedOpenerIsWritten(t *testing.T) {
+	t.Parallel()
+	c, _, stop := newHandlerTestConn(t)
+	defer stop()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	stream := c.newLocalStreamWithIDLocked(state.FirstLocalStreamID(c.config.negotiated.LocalRole, true), streamArityBidi, OpenOptions{}, nil)
+	stream.markSendCommittedAndMaybeBarrierLocked(openerVisibilityPeerVisible)
+	stream.pending.flags |= streamPendingTerminalReset
+	stream.pending.terminal.resetPayload = mustEncodeVarint(uint64(CodeCancelled))
+
+	if flush, keep := stream.pendingTerminalFlushStateLocked(); flush || !keep {
+		t.Fatalf("queued-opener flush state = (%v,%v), want hold (false,true)", flush, keep)
+	}
+	if stream.needsPendingTerminalOpenerLocked() {
+		t.Fatal("held RESET must not carry its own opener while the opener is queued")
+	}
+
+	// Withdrawn opener: the RESET flushes, carrying a zero-length opener.
+	stream.clearOpeningBarrierLocked()
+	if flush, keep := stream.pendingTerminalFlushStateLocked(); !flush || keep {
+		t.Fatalf("withdrawn-opener flush state = (%v,%v), want flush (true,false)", flush, keep)
+	}
+	if !stream.needsPendingTerminalOpenerLocked() {
+		t.Fatal("RESET after a withdrawn opener must carry its own opener")
+	}
+
+	// Written opener: the RESET flushes on its own.
+	stream.setPeerVisibleLocked()
+	if flush, keep := stream.pendingTerminalFlushStateLocked(); !flush || keep {
+		t.Fatalf("peer-visible flush state = (%v,%v), want flush (true,false)", flush, keep)
+	}
+	if stream.needsPendingTerminalOpenerLocked() {
+		t.Fatal("RESET on a peer-visible stream must not carry an opener")
+	}
+
+	// ABORT is opening-eligible and is never held.
+	stream.localOpen.phase = state.LocalOpenPhaseQueued
+	stream.pending.flags |= streamPendingTerminalAbort
+	if flush, keep := stream.pendingTerminalFlushStateLocked(); !flush || keep {
+		t.Fatalf("ABORT flush state = (%v,%v), want flush (true,false)", flush, keep)
 	}
 }
 
@@ -2323,14 +2493,19 @@ func TestClientEstablishmentReadDeadlineBoundsMissingPeerPreface(t *testing.T) {
 func TestClientEstablishmentWriteDeadlineBoundsBlockedPrefaceWriter(t *testing.T) {
 	t.Parallel()
 
+	const timeout = 200 * time.Millisecond
 	conn := newDeadlineBlockingConn(testPrefaceBytesForRole(t, RoleResponder))
-	client, err := Client(conn, nil)
+	start := time.Now()
+	client, err := Client(conn, &Config{EstablishmentTimeout: timeout})
 	if client != nil {
 		_ = client.Close()
 		t.Fatal("expected client establish to fail after blocked local preface write")
 	}
 	if !errors.Is(err, errEstablishmentPrefaceWriteTimeout) {
 		t.Fatalf("Client err = %v, want establishment preface write timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed < timeout || elapsed >= timeout+testSignalTimeout {
+		t.Fatalf("Client failed after %v, want the configured %v establishment deadline", elapsed, timeout)
 	}
 
 	select {
@@ -2341,7 +2516,7 @@ func TestClientEstablishmentWriteDeadlineBoundsBlockedPrefaceWriter(t *testing.T
 
 	select {
 	case <-conn.writeDone:
-	case <-time.After(establishmentSuccessWriteWait + testSignalTimeout):
+	case <-time.After(testSignalTimeout):
 		t.Fatal("blocked local preface write did not exit after establishment deadline")
 	}
 }
@@ -3500,7 +3675,7 @@ func TestBeginGeneratedPingAllowedWhileDraining(t *testing.T) {
 	c.lifecycle.sessionState = connStateDraining
 	c.mu.Unlock()
 
-	_, _, err := c.beginGeneratedPing([]byte("ok"), "build PING")
+	_, _, err := c.beginGeneratedPing(context.Background(), []byte("ok"), "build PING")
 	if err != nil {
 		t.Fatalf("beginGeneratedPing while draining: %v", err)
 	}
@@ -3537,7 +3712,7 @@ func TestBeginGeneratedPingRejectedWhenClosing(t *testing.T) {
 	c.lifecycle.closeErr = &ApplicationError{Code: uint64(CodeInternal), Reason: "closing"}
 	c.mu.Unlock()
 
-	_, _, err := c.beginGeneratedPing(nil, "build PING")
+	_, _, err := c.beginGeneratedPing(context.Background(), nil, "build PING")
 	if !IsErrorCode(err, CodeInternal) {
 		t.Fatalf("beginGeneratedPing err = %v, want %s", err, CodeInternal)
 	}
@@ -3883,7 +4058,7 @@ func TestPaddedPongDoesNotCompleteUnpaddedUserPing(t *testing.T) {
 	c.liveness.pingPaddingMax = 16
 	c.mu.Unlock()
 
-	done, _, err := c.beginGeneratedPing([]byte("ok"), "build PING")
+	done, _, err := c.beginGeneratedPing(context.Background(), []byte("ok"), "build PING")
 	if err != nil {
 		t.Fatalf("beginGeneratedPing: %v", err)
 	}
@@ -3912,7 +4087,7 @@ func TestConfiguredPingPaddingPreservesUserPingEcho(t *testing.T) {
 	c.liveness.pingPaddingMax = 16
 	c.mu.Unlock()
 
-	done, _, err := c.beginGeneratedPing([]byte("ok"), "build PING")
+	done, _, err := c.beginGeneratedPing(context.Background(), []byte("ok"), "build PING")
 	if err != nil {
 		t.Fatalf("beginGeneratedPing: %v", err)
 	}
@@ -4682,5 +4857,186 @@ func TestReadVarintRoundTrip(t *testing.T) {
 		if n != len(encoded) {
 			t.Fatalf("read roundtrip %d consumed %d bytes, want %d", value, n, len(encoded))
 		}
+	}
+}
+
+func sessionSendUsedSnapshot(c *Conn) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flow.sendSessionUsed
+}
+
+func sessionRecvReceivedSnapshot(c *Conn) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flow.recvSessionReceived
+}
+
+func TestGracefulStreamsDoNotRefundCommittedSessionSendCredit(t *testing.T) {
+	t.Parallel()
+
+	serverSettings := DefaultSettings()
+	serverSettings.InitialMaxData = 64 * 1024
+	client, server := newConnPairWithConfig(t, nil, &Config{
+		Settings:             serverSettings,
+		SessionQueuedDataHWM: 16 * 1024,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const graceful = 8
+	payload := bytes.Repeat([]byte{0xab}, 32*1024)
+	for i := 0; i < graceful; i++ {
+		readDone := make(chan error, 1)
+		go func() {
+			stream, err := server.AcceptUniStream(ctx)
+			if err != nil {
+				readDone <- err
+				return
+			}
+			got, err := io.ReadAll(stream)
+			if err == nil && len(got) != len(payload) {
+				err = io.ErrShortBuffer
+			}
+			readDone <- err
+		}()
+		stream, err := client.OpenUniStream(ctx)
+		if err != nil {
+			t.Fatalf("OpenUniStream %d: %v", i, err)
+		}
+		if _, err := stream.WriteFinal(payload); err != nil {
+			t.Fatalf("WriteFinal %d: %v", i, err)
+		}
+		if err := <-readDone; err != nil {
+			t.Fatalf("server read %d: %v", i, err)
+		}
+	}
+
+	// Every byte of the finished streams was counted by the peer, so the
+	// sender must keep counting it as well (SPEC §8).
+	want := uint64(graceful * len(payload))
+	if got := sessionSendUsedSnapshot(client); got != want {
+		t.Fatalf("client sendSessionUsed = %d, want %d after %d graceful streams", got, want, graceful)
+	}
+	if got := sessionRecvReceivedSnapshot(server); got != want {
+		t.Fatalf("server recvSessionReceived = %d, want %d", got, want)
+	}
+
+	// The server application stops reading. The client must block on session
+	// credit instead of overrunning the server's session window.
+	sawBlockedWrite := false
+	for i := 0; i < 4 && !sawBlockedWrite; i++ {
+		stream, err := client.OpenUniStream(ctx)
+		if err != nil {
+			t.Fatalf("phase-two OpenUniStream %d: %v", i, err)
+		}
+		if err := stream.SetWriteDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			t.Fatalf("SetWriteDeadline: %v", err)
+		}
+		_, err = stream.Write(bytes.Repeat([]byte{0xcd}, 64*1024))
+		switch {
+		case err == nil:
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			sawBlockedWrite = true
+		default:
+			t.Fatalf("phase-two Write %d err = %v, want nil or deadline", i, err)
+		}
+	}
+	if !sawBlockedWrite {
+		t.Fatal("client never blocked on exhausted session credit")
+	}
+	if err := server.err(); err != nil {
+		t.Fatalf("server session failed: %v", err)
+	}
+	if err := client.err(); err != nil {
+		t.Fatalf("client session failed: %v", err)
+	}
+	if used, received := sessionSendUsedSnapshot(client), sessionRecvReceivedSnapshot(server); used < received {
+		t.Fatalf("client sendSessionUsed = %d below server recvSessionReceived = %d", used, received)
+	}
+}
+
+func TestTerminalStreamKeepsTransmittedSessionSendCredit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		terminate func(t *testing.T, client NativeStream, server NativeStream)
+	}{
+		{
+			name: "local_reset",
+			terminate: func(t *testing.T, client NativeStream, _ NativeStream) {
+				if err := client.CancelWrite(uint64(CodeCancelled)); err != nil {
+					t.Fatalf("CancelWrite err = %v", err)
+				}
+			},
+		},
+		{
+			name: "local_abort",
+			terminate: func(t *testing.T, client NativeStream, _ NativeStream) {
+				if err := client.CloseWithError(uint64(CodeInternal), "bye"); err != nil {
+					t.Fatalf("CloseWithError err = %v", err)
+				}
+			},
+		},
+		{
+			name: "peer_abort",
+			terminate: func(t *testing.T, client NativeStream, server NativeStream) {
+				if err := server.CloseWithError(uint64(CodeInternal), "bye"); err != nil {
+					t.Fatalf("peer CloseWithError err = %v", err)
+				}
+				awaitStreamWriteState(t, requireNativeStreamImpl(t, client), testSignalTimeout, func(s *nativeStream) bool {
+					return s.sendAbort != nil
+				}, "client stream did not observe peer ABORT")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			client, server := newConnPair(t)
+			ctx, cancel := testContext(t)
+			defer cancel()
+
+			const total = 20000
+			accepted := make(chan NativeStream, 1)
+			readDone := make(chan error, 1)
+			go func() {
+				stream, err := server.AcceptStream(ctx)
+				if err != nil {
+					readDone <- err
+					return
+				}
+				accepted <- stream
+				_, err = io.ReadFull(stream, make([]byte, total))
+				readDone <- err
+			}()
+
+			stream, err := client.OpenStream(ctx)
+			if err != nil {
+				t.Fatalf("OpenStream: %v", err)
+			}
+			if _, err := stream.Write(bytes.Repeat([]byte{1}, total)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if err := <-readDone; err != nil {
+				t.Fatalf("server read: %v", err)
+			}
+			serverStream := <-accepted
+
+			if got := sessionSendUsedSnapshot(client); got != total {
+				t.Fatalf("client sendSessionUsed before terminal = %d, want %d", got, total)
+			}
+			tc.terminate(t, stream, serverStream)
+
+			if got := sessionSendUsedSnapshot(client); got != total {
+				t.Fatalf("client sendSessionUsed after terminal = %d, want %d (transmitted bytes must not be refunded)", got, total)
+			}
+			if got := sessionRecvReceivedSnapshot(server); got != total {
+				t.Fatalf("server recvSessionReceived = %d, want %d", got, total)
+			}
+		})
 	}
 }

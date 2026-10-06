@@ -84,19 +84,31 @@ func (s *nativeStream) prepareRetriableLocalOpenerLocked() (localOpenerPrepareRe
 	}
 	result := localOpenerPrepareResult{}
 	if s.needsLocalOpenerLocked() {
+		// Validate the opener before a stream ID is committed; a local
+		// validation error must never burn an ID (SPEC §3.1).
+		if _, err := s.openerPrefixLenLocked(openerVisibilityPeerVisible); err != nil {
+			if !s.idSet {
+				// The stream can never open; do not let it hold up later
+				// same-class streams.
+				s.conn.failProvisionalLocked(s, err)
+			}
+			return localOpenerPrepareResult{}, err
+		}
 		openState, err := s.conn.prepareLocalOpeningLocked(s)
 		if err != nil {
 			return localOpenerPrepareResult{}, err
 		}
 		if openState.awaitingTurn() {
-			wait, blocked, waitErr := s.provisionalOpenTurnWaitLocked()
+			// The stream still has no ID, so it always retries. The turn
+			// check is repeated with a later now and may no longer block
+			// (an expired head was reaped in between); the zero wait then
+			// retries at once.
+			wait, _, waitErr := s.provisionalOpenTurnWaitLocked()
 			if waitErr != nil {
 				return localOpenerPrepareResult{}, waitErr
 			}
-			if blocked {
-				result.status = localOpenerRetry
-				result.wait = wait
-			}
+			result.status = localOpenerRetry
+			result.wait = wait
 			return result, nil
 		}
 		if openState.opened() {
@@ -297,13 +309,43 @@ func (s writeBurstFinalState) finalized() bool {
 	return s == writeBurstFinalized
 }
 
-type preparedWriteStepBuild struct {
-	step  writeStep
-	ready bool
+// preparedWriteStepPlan is the frame one write step would add, worked out from
+// the prepare window before anything is reserved for it.
+type preparedWriteStepPlan struct {
+	chunk  uint64
+	traits dataFrameTraits
+	fin    writeFinReservation
+	ready  bool
 }
 
-func (r preparedWriteStepBuild) hasStep() bool {
-	return r.ready
+func planPreparedWriteStep(totalRemaining int, mode writeChunkMode, window writePrepareWindow) preparedWriteStepPlan {
+	opener := window.openerVisibility.marksPeerVisible()
+	if opener && mode.isFinal() && totalRemaining == 0 {
+		return preparedWriteStepPlan{traits: dataFrameTraitFIN | dataFrameTraitOpenMetadata, ready: true}
+	}
+	if opener && writePrepareBlocked(window) {
+		return preparedWriteStepPlan{traits: dataFrameTraitOpenMetadata, ready: true}
+	}
+
+	chunk := boundedWriteChunk(uint64(totalRemaining), window.availableSession, window.availableStream, window.frameCap)
+	if chunk == 0 {
+		return preparedWriteStepPlan{}
+	}
+	plan := preparedWriteStepPlan{chunk: chunk, ready: true}
+	if mode.isFinal() && int(chunk) == totalRemaining {
+		plan.traits |= dataFrameTraitFIN
+		plan.fin = writeFinReserve
+	}
+	if opener {
+		plan.traits |= dataFrameTraitOpenMetadata
+	}
+	return plan
+}
+
+// queueCost is the txFrameQueueCost of the frame the plan builds. The window
+// carries the opener prefix length exactly when the frame carries the opener.
+func (p preparedWriteStepPlan) queueCost(window writePrepareWindow) uint64 {
+	return saturatingAdd(1, saturatingAdd(window.prefixLen, p.chunk))
 }
 
 type preparedWritePayloadSource struct {
@@ -320,79 +362,30 @@ func (src preparedWritePayloadSource) frameLocked(s *nativeStream, chunk int, tr
 	return s.dataFrameLocked(src.bytes[src.off:src.off+chunk], traits)
 }
 
-func (s *nativeStream) buildPreparedWritePayloadStepLocked(
-	src preparedWritePayloadSource,
-	totalRemaining int,
-	mode writeChunkMode,
-	window writePrepareWindow,
-) preparedWriteStepBuild {
-	if s == nil || s.conn == nil {
-		return preparedWriteStepBuild{}
+func (s *nativeStream) buildPreparedWriteStepLocked(src preparedWritePayloadSource, plan preparedWriteStepPlan, window writePrepareWindow) writeStep {
+	var frame txFrame
+	if plan.chunk == 0 {
+		frame = s.dataFrameLocked(nil, plan.traits)
+	} else {
+		frame = src.frameLocked(s, int(plan.chunk), plan.traits)
 	}
-	if window.openerVisibility.marksPeerVisible() && mode.isFinal() && totalRemaining == 0 {
-		frame := s.dataFrameLocked(nil, dataFrameTraitFIN|dataFrameTraitOpenMetadata)
-		return preparedWriteStepBuild{
-			step:  s.finishPreparedWriteStepLocked(frame, 0, 0, window.openerVisibility, writeFinDefer),
-			ready: true,
-		}
-	}
-	if window.openerVisibility.marksPeerVisible() && writePrepareBlocked(window) {
-		frame := s.dataFrameLocked(nil, dataFrameTraitOpenMetadata)
-		return preparedWriteStepBuild{
-			step:  s.finishPreparedWriteStepLocked(frame, 0, 0, window.openerVisibility, writeFinDefer),
-			ready: true,
-		}
-	}
-
-	chunk := boundedWriteChunk(uint64(totalRemaining), window.availableSession, window.availableStream, window.frameCap)
-	if chunk == 0 {
-		return preparedWriteStepBuild{}
-	}
-	finalized := mode.isFinal() && int(chunk) == totalRemaining
-	traits := dataFrameTraitNone
-	if finalized {
-		traits |= dataFrameTraitFIN
-	}
-	if window.openerVisibility.marksPeerVisible() {
-		traits |= dataFrameTraitOpenMetadata
-	}
-	frame := src.frameLocked(s, int(chunk), traits)
-	finReservation := writeFinDefer
-	if finalized {
-		finReservation = writeFinReserve
-	}
-	return preparedWriteStepBuild{
-		step:  s.finishPreparedWriteStepLocked(frame, int(chunk), chunk, window.openerVisibility, finReservation),
-		ready: true,
-	}
+	return s.finishPreparedWriteStepLocked(frame, int(plan.chunk), plan.chunk, window.openerVisibility, plan.fin)
 }
 
-func (s *nativeStream) buildPreparedWritePartsStepLocked(
-	parts [][]byte,
-	idx, off, totalRemaining int,
-	mode writeChunkMode,
-	window writePrepareWindow,
-) preparedWriteStepBuild {
-	return s.buildPreparedWritePayloadStepLocked(
-		preparedWritePayloadSource{parts: parts, idx: idx, off: off},
-		totalRemaining,
-		mode,
-		window,
-	)
+// writeStepBudget is the room left in the batch a write step would join.
+// Preparing a step reserves its send credit and FIN, and a reserved step has
+// to reach the queue, so the step is checked against the budget first.
+type writeStepBudget struct {
+	start  writeBatchStart
+	queued uint64
+	// held reports that the batch already holds frames. Those have to be
+	// queued before the step waits for credit: the peer grants more only once
+	// it has received them.
+	held bool
 }
 
-func (s *nativeStream) buildPreparedWriteBytesStepLocked(
-	p []byte,
-	off, totalRemaining int,
-	mode writeChunkMode,
-	window writePrepareWindow,
-) preparedWriteStepBuild {
-	return s.buildPreparedWritePayloadStepLocked(
-		preparedWritePayloadSource{bytes: p, off: off},
-		totalRemaining,
-		mode,
-		window,
-	)
+func (b writeStepBudget) admits(frameBytes uint64) bool {
+	return b.start.allowsNextQueuedFrame(b.queued, frameBytes)
 }
 
 func (s *nativeStream) acquireWriteStepWindowLocked(totalRemaining int, mode writeChunkMode) (writePrepareWindow, writePrepareOutcome, error) {
@@ -413,54 +406,45 @@ func (s *nativeStream) acquireWriteStepWindowLocked(totalRemaining int, mode wri
 	return window, writePrepareReady, nil
 }
 
-func (s *nativeStream) prepareWritePartsLocked(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode) (writeStep, error) {
+// prepareWriteStepLocked prepares the next frame of a step-path batch. It
+// returns ready=false, with nothing reserved, when that frame belongs in the
+// next batch.
+func (s *nativeStream) prepareWriteStepLocked(src preparedWritePayloadSource, totalRemaining int, mode writeChunkMode, budget writeStepBudget) (writeStep, bool, error) {
 	if s == nil || s.conn == nil {
-		return writeStep{}, ErrSessionClosed
+		return writeStep{}, false, ErrSessionClosed
 	}
 
 	for {
 		window, outcome, err := s.acquireWriteStepWindowLocked(totalRemaining, mode)
 		if err != nil {
-			return writeStep{}, err
+			return writeStep{}, false, err
 		}
 		if outcome == writePrepareRetry {
 			continue
 		}
 
-		step := s.buildPreparedWritePartsStepLocked(parts, idx, off, totalRemaining, mode, window)
-		if step.hasStep() {
-			return step.step, nil
+		plan := planPreparedWriteStep(totalRemaining, mode, window)
+		if plan.ready && budget.admits(plan.queueCost(window)) {
+			return s.buildPreparedWriteStepLocked(src, plan, window), true, nil
+		}
+		if plan.ready || budget.held {
+			// The frame goes in the next batch; nothing is reserved for it.
+			s.conn.mu.Unlock()
+			return writeStep{}, false, nil
 		}
 
 		if err := s.waitForWriteCreditLocked(window.availableSession, window.availableStream); err != nil {
-			return writeStep{}, err
+			return writeStep{}, false, err
 		}
 	}
 }
 
-func (s *nativeStream) prepareWriteBytesLocked(p []byte, off, totalRemaining int, mode writeChunkMode) (writeStep, error) {
-	if s == nil || s.conn == nil {
-		return writeStep{}, ErrSessionClosed
-	}
+func (s *nativeStream) prepareWritePartsLocked(parts [][]byte, idx, off, totalRemaining int, mode writeChunkMode, budget writeStepBudget) (writeStep, bool, error) {
+	return s.prepareWriteStepLocked(preparedWritePayloadSource{parts: parts, idx: idx, off: off}, totalRemaining, mode, budget)
+}
 
-	for {
-		window, outcome, err := s.acquireWriteStepWindowLocked(totalRemaining, mode)
-		if err != nil {
-			return writeStep{}, err
-		}
-		if outcome == writePrepareRetry {
-			continue
-		}
-
-		step := s.buildPreparedWriteBytesStepLocked(p, off, totalRemaining, mode, window)
-		if step.hasStep() {
-			return step.step, nil
-		}
-
-		if err := s.waitForWriteCreditLocked(window.availableSession, window.availableStream); err != nil {
-			return writeStep{}, err
-		}
-	}
+func (s *nativeStream) prepareWriteBytesLocked(p []byte, off, totalRemaining int, mode writeChunkMode, budget writeStepBudget) (writeStep, bool, error) {
+	return s.prepareWriteStepLocked(preparedWritePayloadSource{bytes: p, off: off}, totalRemaining, mode, budget)
 }
 
 func (s *nativeStream) reserveWriteChunkLocked(chunk uint64) {
@@ -590,6 +574,7 @@ func (s *nativeStream) prepareOwnedDataWriteRequest(req *writeRequest, maxPayloa
 	req.terminalDataPriority = terminalDataPriority
 	req.terminalResetOnly = false
 	req.terminalAbortOnly = false
+	req.terminalStopOnly = false
 	req.terminalHasFIN = hasFIN
 	req.preparedSendBytes = preparedSendBytes
 	req.preparedSendFin = hasFIN
@@ -748,6 +733,15 @@ func (s *nativeStream) beginWriteBatchStartLocked() writeBatchStart {
 	return start
 }
 
+func (s *nativeStream) beginWriteBatchStart() writeBatchStart {
+	if s == nil || s.conn == nil {
+		return writeBatchStart{burstLimit: defaultWriteBurstFrames}
+	}
+	s.conn.mu.Lock()
+	defer s.conn.mu.Unlock()
+	return s.beginWriteBatchStartLocked()
+}
+
 func (s *nativeStream) writeBurstLimitLocked() int {
 	return rt.WriteBurstLimit(s.priority, s.conn.config.peer.Settings.SchedulerHints)
 }
@@ -772,7 +766,29 @@ func (start writeBatchStart) allowsNextQueuedFrame(currentQueued uint64, nextFra
 
 func (s *nativeStream) txFragmentCapLocked(prefixLen uint64) uint64 {
 	baseCap := rt.FragmentCap(s.conn.config.peer.Settings.MaxFramePayload, prefixLen, s.priority, s.conn.config.peer.Settings.SchedulerHints)
-	return rt.RateLimitedFragmentCap(baseCap, s.conn.metrics.sendRateEstimate, s.priority, s.conn.config.peer.Settings.SchedulerHints)
+	fragmentCap := rt.RateLimitedFragmentCap(baseCap, s.conn.metrics.sendRateEstimate, s.priority, s.conn.config.peer.Settings.SchedulerHints)
+	return s.queueAdmissibleFragmentCapLocked(fragmentCap, prefixLen)
+}
+
+// queueAdmissibleFragmentCapLocked keeps one DATA frame within the local
+// queued-data limits, so an empty queue can always admit it. The peer's
+// max_frame_payload may be far larger than those limits (SPEC §5.3), and a
+// configured HWM may be smaller than one peer frame.
+func (s *nativeStream) queueAdmissibleFragmentCapLocked(fragmentCap, prefixLen uint64) uint64 {
+	queueCap := s.writeRequestQueueCapLocked()
+	if fragmentCap == 0 || queueCap == 0 {
+		return fragmentCap
+	}
+	// txFrameQueueCost charges the whole payload, opener prefix included,
+	// plus one.
+	limit := csub(queueCap, saturatingAdd(prefixLen, 1))
+	if limit == 0 {
+		limit = 1
+	}
+	if fragmentCap > limit {
+		return limit
+	}
+	return fragmentCap
 }
 
 func scaledFragmentCap(max uint64, num uint64, den uint64) uint64 {
@@ -821,6 +837,10 @@ func (state *writeBurstState) hasFrames() bool {
 		return false
 	}
 	return len(state.frames) > 0
+}
+
+func (state *writeBurstState) stepBudget(start writeBatchStart) writeStepBudget {
+	return writeStepBudget{start: start, queued: state.queuedBytes, held: state.hasFrames()}
 }
 
 func (s *nativeStream) commitBurstPeerVisible(state writeBurstState) {
@@ -898,6 +918,11 @@ func (s *nativeStream) prepareWritePayloadBurstBatch(cursor writeBurstPayloadCur
 	for {
 		attempt, err := s.acquireWritePrepareWindowLocked(writePrepareWindowBurst, mode.admissionPolicy())
 		if attempt.outcome == writePrepareBurstFallback {
+			// The step path emits the opener frame by frame, but its request
+			// is still bound by the same burst limit and queue cap.
+			if !startReady {
+				prepared.start = s.beginWriteBatchStart()
+			}
 			return prepared
 		}
 		if err != nil {
@@ -1124,13 +1149,11 @@ func (s *nativeStream) executeWriteBurst(parts [][]byte, idx, off, totalRemainin
 
 	batchIdx, batchOff := idx, off
 	for state.dataFrames < prepared.start.burstLimit && state.commit.progress < totalRemaining {
-		step, err := s.prepareWritePartsLocked(parts, batchIdx, batchOff, totalRemaining-state.commit.progress, mode)
+		step, ready, err := s.prepareWritePartsLocked(parts, batchIdx, batchOff, totalRemaining-state.commit.progress, mode, state.stepBudget(prepared.start))
 		if err != nil {
 			return s.flushWriteBurst(state, mode, writeBurstFlushAccumulatedErr, err)
 		}
-
-		frameBytes := txFrameBufferedBytes(step.frame)
-		if !prepared.start.allowsNextQueuedFrame(state.queuedBytes, frameBytes) {
+		if !ready {
 			break
 		}
 		state.appendStep(step)
@@ -1166,13 +1189,11 @@ func (s *nativeStream) executeWriteBytesBurst(p []byte, totalRemaining int, mode
 
 	batchOff := 0
 	for state.dataFrames < prepared.start.burstLimit && state.commit.progress < totalRemaining {
-		step, err := s.prepareWriteBytesLocked(p, batchOff, totalRemaining-state.commit.progress, mode)
+		step, ready, err := s.prepareWriteBytesLocked(p, batchOff, totalRemaining-state.commit.progress, mode, state.stepBudget(prepared.start))
 		if err != nil {
 			return s.flushWriteBurst(state, mode, writeBurstFlushAccumulatedErr, err)
 		}
-
-		frameBytes := txFrameBufferedBytes(step.frame)
-		if !prepared.start.allowsNextQueuedFrame(state.queuedBytes, frameBytes) {
+		if !ready {
 			break
 		}
 		state.appendStep(step)

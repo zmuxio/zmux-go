@@ -38,6 +38,7 @@ func TestPeerDataTransitionUsesExplicitHalfState(t *testing.T) {
 		wantOutcome PeerDataOutcome
 		wantAdvance bool
 		wantTrack   bool
+		wantWindow  bool
 	}{
 		{
 			name:        "open_accepts",
@@ -82,14 +83,41 @@ func TestPeerDataTransitionUsesExplicitHalfState(t *testing.T) {
 			wantOutcome: PeerDataIgnore,
 			wantAdvance: true,
 			wantTrack:   true,
+			wantWindow:  true,
 		},
 		{
-			name:        "full_terminal_overrides_recv_fin_abort_closed",
+			name:        "recv_stop_sent_enforces_stream_window",
+			localSend:   true,
+			localRecv:   true,
+			sendHalf:    SendHalfOpen,
+			recvHalf:    RecvHalfStopSent,
+			wantOutcome: PeerDataIgnore,
+			wantTrack:   true,
+			wantWindow:  true,
+		},
+		{
+			name:        "fully_terminal_recv_fin_still_aborts_closed",
 			localSend:   true,
 			localRecv:   true,
 			sendHalf:    SendHalfReset,
 			recvHalf:    RecvHalfFin,
-			wantOutcome: PeerDataIgnore,
+			wantOutcome: PeerDataAbortClosed,
+		},
+		{
+			name:        "send_fin_recv_fin_aborts_closed",
+			localSend:   true,
+			localRecv:   true,
+			sendHalf:    SendHalfFin,
+			recvHalf:    RecvHalfFin,
+			wantOutcome: PeerDataAbortClosed,
+		},
+		{
+			name:        "peer_uni_recv_fin_aborts_closed",
+			localSend:   false,
+			localRecv:   true,
+			sendHalf:    SendHalfAbsent,
+			recvHalf:    RecvHalfFin,
+			wantOutcome: PeerDataAbortClosed,
 		},
 		{
 			name:        "recv_aborted_keeps_per_stream_late_tracking",
@@ -115,6 +143,9 @@ func TestPeerDataTransitionUsesExplicitHalfState(t *testing.T) {
 			}
 			if got.TrackLatePerStream != tc.wantTrack {
 				t.Fatalf("trackLatePerStream = %v, want %v", got.TrackLatePerStream, tc.wantTrack)
+			}
+			if got.EnforceStreamWindow != tc.wantWindow {
+				t.Fatalf("enforceStreamWindow = %v, want %v", got.EnforceStreamWindow, tc.wantWindow)
 			}
 		})
 	}

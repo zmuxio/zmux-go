@@ -128,6 +128,11 @@ func QueueWouldBlock(sessionMemoryBlocked bool, sessionQueued, streamQueued, req
 	if sessionMemoryBlocked || reqBytes == 0 {
 		return sessionMemoryBlocked
 	}
+	if sessionQueued == 0 && streamQueued == 0 {
+		// An empty queue admits one request even above the watermarks;
+		// waiting could never make room for it.
+		return false
+	}
 	if SaturatingAdd(sessionQueued, reqBytes) > sessionHWM {
 		return true
 	}
@@ -139,6 +144,15 @@ func QueueWouldBlock(sessionMemoryBlocked bool, sessionQueued, streamQueued, req
 
 func CrossedLowWatermark(prev, next, lowWatermark uint64) bool {
 	return prev > lowWatermark && next <= lowWatermark
+}
+
+// QueueReleaseWakes reports whether releasing queued bytes from prev to next
+// can admit a request blocked by QueueWouldBlock. Falling to the low watermark
+// does, and so does draining the queue: a request larger than the gap between
+// the watermarks can be blocked while the queue is already below the low
+// watermark, and an empty queue admits even a request above the high one.
+func QueueReleaseWakes(prev, next, lowWatermark uint64) bool {
+	return CrossedLowWatermark(prev, next, lowWatermark) || (prev > 0 && next == 0)
 }
 
 func GainedCredit(prev, next uint64) bool {
@@ -218,9 +232,9 @@ func PlanQueueReleaseWake(
 	urgentReleased bool,
 ) ReleaseWakePlan {
 	memoryWake := MemoryWakeNeeded(prevTracked, nextTracked, memoryThreshold)
-	sessionWake := CrossedLowWatermark(prevSessionQueued, nextSessionQueued, sessionLWM)
+	sessionWake := QueueReleaseWakes(prevSessionQueued, nextSessionQueued, sessionLWM)
 	broadcast := sessionWake || memoryWake
-	streamWake := !sessionWake && CrossedLowWatermark(prevStreamQueued, nextStreamQueued, streamLWM)
+	streamWake := !sessionWake && QueueReleaseWakes(prevStreamQueued, nextStreamQueued, streamLWM)
 	return ReleaseWakePlan{
 		Broadcast:  broadcast,
 		StreamWake: streamWake,
@@ -238,10 +252,10 @@ func PlanPreparedReleaseWake(
 	urgentReleased bool,
 ) ReleaseWakePlan {
 	memoryWake := MemoryWakeNeeded(prevTracked, nextTracked, memoryThreshold)
-	sessionWake := CrossedLowWatermark(prevSessionQueued, nextSessionQueued, sessionLWM) ||
+	sessionWake := QueueReleaseWakes(prevSessionQueued, nextSessionQueued, sessionLWM) ||
 		GainedCredit(prevSessionCredit, nextSessionCredit)
 	broadcast := sessionWake || memoryWake
-	streamWake := !sessionWake && (CrossedLowWatermark(prevStreamQueued, nextStreamQueued, streamLWM) ||
+	streamWake := !sessionWake && (QueueReleaseWakes(prevStreamQueued, nextStreamQueued, streamLWM) ||
 		GainedCredit(prevStreamCredit, nextStreamCredit))
 	return ReleaseWakePlan{
 		Broadcast:  broadcast,

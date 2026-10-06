@@ -205,6 +205,13 @@ func (a streamArity) advanceNextLocalID(reg *connRegistryState) {
 	reg.nextLocalUni += 4
 }
 
+func (a streamArity) openerTurnState(reg *connRegistryState) (turn *uint64, releasedAt *time.Time) {
+	if a.isBidi() {
+		return &reg.openerTurnBidi, &reg.openerTurnReleasedBidi
+	}
+	return &reg.openerTurnUni, &reg.openerTurnReleasedUni
+}
+
 func (a streamArity) provisionalQueueState(queues *connQueueState) *streamSparseQueueState {
 	if queues == nil {
 		return nil
@@ -354,6 +361,7 @@ func (c *Conn) acceptStream(ctx context.Context, arity streamArity) (*nativeStre
 			}
 			return stream, nil
 		}
+		c.replenishExhaustedReceiveLocked(nil)
 		acceptCh := c.ensureAcceptNotifyLocked(arity)
 		closedCh := c.lifecycle.closedCh
 		c.mu.Unlock()
@@ -1395,8 +1403,10 @@ func (c *Conn) closeSessionWithOptions(err error, origin closeOrigin, closePolic
 		c.registry.tombstones = nil
 		c.clearTombstoneQueueLocked()
 		c.clearHiddenTombstonesLocked()
+		c.ingress.aggregateLateData = 0
 		c.registry.usedStreamData = nil
-		c.registry.usedStreamRanges = nil
+		c.registry.usedStreamRanges = [usedStreamClasses][]usedStreamRange{}
+		c.registry.usedStreamFloors = [usedStreamClasses]uint64{}
 		c.registry.usedStreamRangeMode = false
 		c.mu.Unlock()
 		if c != nil && c.observer.eventHandler != nil {
@@ -1536,9 +1546,14 @@ func establishmentCloseDrainDelay(err error) time.Duration {
 	return 10 * time.Millisecond
 }
 
+// establishmentFailureWriteWait bounds the local preface write that is still
+// pending when establishment fails, and the fatal CLOSE written after it.
 const establishmentFailureWriteWait = 250 * time.Millisecond
 
-// establishmentSuccessWriteWait bounds the local preface write after peer parse.
+// establishmentSuccessWriteWait is the least time the local preface write gets
+// after the peer preface was parsed, even when that happened close to the
+// establishment deadline. Transports with write deadlines are still cut off at
+// the establishment deadline itself.
 const establishmentSuccessWriteWait = time.Second
 
 var errEstablishmentPrefaceWriteTimeout = errors.New("local preface write stalled during establishment")
@@ -1553,8 +1568,9 @@ type readDeadlineSetter interface {
 }
 
 type establishmentWriteDeadline struct {
-	setter writeDeadlineSetter
-	armed  bool
+	setter   writeDeadlineSetter
+	deadline time.Time
+	armed    bool
 }
 
 type establishmentReadDeadline struct {
@@ -1570,10 +1586,11 @@ func beginEstablishmentWriteDeadline(conn io.ReadWriteCloser, timeout time.Durat
 	if !ok {
 		return establishmentWriteDeadline{}
 	}
-	if err := setter.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+	deadline := time.Now().Add(timeout)
+	if err := setter.SetWriteDeadline(deadline); err != nil {
 		return establishmentWriteDeadline{}
 	}
-	return establishmentWriteDeadline{setter: setter, armed: true}
+	return establishmentWriteDeadline{setter: setter, deadline: deadline, armed: true}
 }
 
 func beginEstablishmentReadDeadline(conn io.ReadWriteCloser, timeout time.Duration) establishmentReadDeadline {
@@ -1604,11 +1621,20 @@ func (d establishmentReadDeadline) clear() error {
 	return d.setter.SetReadDeadline(time.Time{})
 }
 
+// expedite shortens the pending local preface write to the failure-path
+// bound. It must not expire the deadline outright: when the peer preface was
+// already buffered, establishment can fail before the writer goroutine has
+// called Write, and an expired deadline would then fail that Write before any
+// byte is sent, leaving the peer with neither a preface nor a CLOSE.
 func (d establishmentWriteDeadline) expedite() {
 	if !d.armed || d.setter == nil {
 		return
 	}
-	_ = d.setter.SetWriteDeadline(time.Now())
+	deadline := time.Now().Add(establishmentFailureWriteWait)
+	if !d.deadline.IsZero() && d.deadline.Before(deadline) {
+		deadline = d.deadline
+	}
+	_ = d.setter.SetWriteDeadline(deadline)
 }
 
 func normalizeEstablishmentWriteErr(err error, deadline establishmentWriteDeadline) error {
@@ -1629,6 +1655,21 @@ func normalizeEstablishmentReadErr(err error, deadline establishmentReadDeadline
 		return errEstablishmentPrefaceReadTimeout
 	}
 	return err
+}
+
+// establishmentWriteWaitAfterRead bounds the wait for the local preface write
+// once the peer preface was parsed: the rest of the establishment budget, but
+// at least establishmentSuccessWriteWait. A zero deadline (establishment
+// timeout disabled) waits without bound.
+func establishmentWriteWaitAfterRead(deadline time.Time) time.Duration {
+	if deadline.IsZero() {
+		return 0
+	}
+	wait := time.Until(deadline)
+	if wait < establishmentSuccessWriteWait {
+		wait = establishmentSuccessWriteWait
+	}
+	return wait
 }
 
 func waitEstablishmentWrite(writeErrCh <-chan error, timeout time.Duration) error {
@@ -1758,27 +1799,23 @@ func closeSessionStreamErr(finalState connState, err error) *ApplicationError {
 	return closeMappedApplicationError(err)
 }
 
+// releaseSendLocked drops the per-stream send accounting of a terminal stream.
+//
+// It never refunds session send credit. DATA bytes already committed to the
+// writer stay counted in sendSessionUsed for the life of the session, because
+// the peer has counted them against its session MAX_DATA (SPEC §8; committed
+// credit must not be rolled back, IMPLEMENTATION §2.1.1). Bytes that are still
+// withdrawable belong to a prepared write request, and are returned by
+// rollbackPreparedSendLocked when that request is discarded instead of written.
 func (c *Conn) releaseSendLocked(stream *nativeStream) {
 	if stream == nil || stream.sendSent == 0 {
 		return
 	}
-	prevSessionCredit := csub(c.flow.sendSessionMax, c.flow.sendSessionUsed)
 	prevStreamCredit := csub(stream.sendMax, stream.sendSent)
-	c.flow.sendSessionUsed = csub(c.flow.sendSessionUsed, stream.sendSent)
 	stream.sendSent = 0
-	sessionWake := prevSessionCredit == 0 && csub(c.flow.sendSessionMax, c.flow.sendSessionUsed) > 0
-	streamWake := prevStreamCredit == 0 && csub(stream.sendMax, stream.sendSent) > 0
-	if sessionWake {
-		c.clearSessionBlockedStateLocked()
-		c.dropPendingSessionControlLocked(sessionControlBlocked)
-	}
-	if streamWake {
+	if prevStreamCredit == 0 && csub(stream.sendMax, stream.sendSent) > 0 {
 		stream.clearBlockedState()
-	}
-	if sessionWake {
-		c.broadcastWriteWakeLocked()
-	} else if streamWake {
-		notify(stream.writeNotify)
+		stream.broadcastWriteNotifyLocked()
 	}
 }
 
@@ -1813,6 +1850,9 @@ func (c *Conn) planAbortLiveStreamLocked(stream *nativeStream, code ErrorCode, r
 type sessionCloseOptions struct {
 	abortSource terminalAbortSource
 	finalize    bool
+	// sessionEnded is set when the whole session is terminating, as opposed
+	// to refusing or reclaiming one stream while the session lives on.
+	sessionEnded bool
 }
 
 func (s *nativeStream) applySessionCloseStateLocked(appErr *ApplicationError, source terminalAbortSource) {
@@ -1847,14 +1887,14 @@ func (c *Conn) closeStreamOnSessionWithOptionsLocked(stream *nativeStream, appEr
 	if appErr != nil {
 		c.noteAbortReasonLocked(appErr.Code)
 	}
-	stream.applySessionCloseStateLocked(appErr, opts.abortSource)
-	releaseOpts := transientStreamReleaseOptions{}
-	if opts.finalize {
-		releaseOpts.queuedWake = queuedDataWakeOnRelease
+	if opts.sessionEnded {
+		stream.markRecvEndedBySessionLocked(appErr)
 	}
-	releaseOpts.send = true
-	releaseOpts.receive = streamReceiveReleaseAndClearReadBuf
-	c.finalizeTerminalStreamLocked(stream, releaseOpts, streamNotifyBoth, opts.finalize)
+	stream.applySessionCloseStateLocked(appErr, opts.abortSource)
+	c.finalizeTerminalStreamLocked(stream, transientStreamReleaseOptions{
+		send:    true,
+		receive: streamReceiveReleaseAndClearReadBuf,
+	}, streamNotifyBoth, opts.finalize)
 }
 
 func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationError) {
@@ -1868,8 +1908,9 @@ func (c *Conn) releaseAllStreamsForSessionCloseLocked(sessionErr *ApplicationErr
 	}
 	c.forEachKnownStreamLocked(func(stream *nativeStream) {
 		c.closeStreamOnSessionWithOptionsLocked(stream, sessionErr, sessionCloseOptions{
-			abortSource: source,
-			finalize:    false,
+			abortSource:  source,
+			finalize:     false,
+			sessionEnded: true,
 		})
 		stream.clearQueueMembershipState()
 	})
@@ -1971,21 +2012,26 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	c.mu.Lock()
 	closeFrameOutstanding := c.closeFrameOutstandingLocked()
 	c.mu.Unlock()
+	goAwayTimeout := c.gracefulCloseDrainTimeout()
 
 	if initialPolicy.sendsInitial() && !closeFrameOutstanding {
-		if err := c.GoAway(initialBidi, initialUni); err != nil {
-			return err
-		}
-		timer := time.NewTimer(c.goAwayDrainInterval())
-		if c.lifecycle.closedCh != nil {
-			select {
-			case <-c.lifecycle.closedCh:
-			case <-timer.C:
+		if err := c.gracefulCloseGoAway(initialBidi, initialUni, goAwayTimeout); err != nil {
+			if !errors.Is(err, ErrGracefulCloseTimeout) {
+				return err
 			}
+			drainErr = err
 		} else {
-			<-timer.C
+			timer := time.NewTimer(c.goAwayDrainInterval())
+			if c.lifecycle.closedCh != nil {
+				select {
+				case <-c.lifecycle.closedCh:
+				case <-timer.C:
+				}
+			} else {
+				<-timer.C
+			}
+			timer.Stop()
 		}
-		timer.Stop()
 	}
 
 	c.mu.Lock()
@@ -1995,9 +2041,12 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	closeFrameOutstanding = closeFrameOutstanding || c.closeFrameOutstandingLocked()
 	c.mu.Unlock()
 
-	if !closeFrameOutstanding && (finalBidi != currentBidi || finalUni != currentUni) {
-		if err := c.GoAway(finalBidi, finalUni); err != nil {
-			return err
+	if drainErr == nil && !closeFrameOutstanding && (finalBidi != currentBidi || finalUni != currentUni) {
+		if err := c.gracefulCloseGoAway(finalBidi, finalUni, goAwayTimeout); err != nil {
+			if !errors.Is(err, ErrGracefulCloseTimeout) {
+				return err
+			}
+			drainErr = err
 		}
 	}
 	c.mu.Lock()
@@ -2008,11 +2057,15 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	}
 	c.reclaimGracefulCloseLocalStreamsLocked()
 	c.mu.Unlock()
-	if err := c.waitForGracefulCloseDrain(c.gracefulCloseDrainTimeout()); err != nil {
-		if !errors.Is(err, ErrGracefulCloseTimeout) {
-			return err
+	// A GOAWAY the writer could not put on the transport within the drain
+	// budget leaves nothing to drain for: go straight to the bounded CLOSE.
+	if drainErr == nil {
+		if err := c.waitForGracefulCloseDrain(c.gracefulCloseDrainTimeout()); err != nil {
+			if !errors.Is(err, ErrGracefulCloseTimeout) {
+				return err
+			}
+			drainErr = err
 		}
-		drainErr = err
 	}
 
 	c.mu.Lock()
@@ -2051,6 +2104,13 @@ func (c *Conn) closeWithGoAwayAndClose(initialPolicy goAwayInitialPolicy, initia
 	c.finishCloseFrameEnqueueLocked(sendResult.sent())
 	c.mu.Unlock()
 	if sendResult.err != nil {
+		// A peer that has read the CLOSE may close the transport before the
+		// writer reports the write done. In the closing state that ends the
+		// session in order (the same benign error Wait reports), so it is no
+		// Close failure.
+		if completeCloseErr(c, sendResult.err) == nil {
+			return drainErr
+		}
 		return closeOperationErr(c, sendResult.err)
 	}
 	if !sendResult.completed {
@@ -2277,6 +2337,28 @@ func (c *Conn) flushPendingLocalGoAway() error {
 	}
 }
 
+// gracefulCloseGoAway sends a graceful-close GOAWAY but waits at most timeout
+// for the writer to put it on the transport. Close must never block forever
+// on a transport that stopped draining (API_SEMANTICS §8.1): GoAway itself
+// waits for the write, so it runs aside and, when it is still blocked at the
+// deadline, ErrGracefulCloseTimeout moves Close on to its bounded CLOSE
+// attempt. The GOAWAY stays queued; the transport close that ends the session
+// also releases the GoAway call still waiting for it.
+func (c *Conn) gracefulCloseGoAway(lastAcceptedBidi, lastAcceptedUni uint64, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- c.GoAway(lastAcceptedBidi, lastAcceptedUni)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return ErrGracefulCloseTimeout
+	}
+}
+
 func (c *Conn) waitForGracefulCloseDrain(timeout time.Duration) error {
 	if c == nil {
 		return ErrSessionClosed
@@ -2366,8 +2448,13 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 
 	reader := bufio.NewReaderSize(conn, connReadBufferSize)
 	writeErrCh := make(chan error, 1)
-	writeDeadline := beginEstablishmentWriteDeadline(conn, establishmentSuccessWriteWait)
-	readDeadline := beginEstablishmentReadDeadline(conn, establishmentSuccessWriteWait)
+	timeout := cfg.establishmentTimeout()
+	var establishmentDeadline time.Time
+	if timeout > 0 {
+		establishmentDeadline = time.Now().Add(timeout)
+	}
+	writeDeadline := beginEstablishmentWriteDeadline(conn, timeout)
+	readDeadline := beginEstablishmentReadDeadline(conn, timeout)
 	go func() { writeErrCh <- rt.WriteAll(conn, payload) }()
 
 	peer, readErr := ReadPreface(reader)
@@ -2388,7 +2475,7 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 		finishEstablishmentFailure(conn, writeErrCh, writeDeadline, local, &peer, err)
 		return nil, err
 	}
-	if writeErr := normalizeEstablishmentWriteErr(waitEstablishmentWrite(writeErrCh, establishmentSuccessWriteWait), writeDeadline); writeErr != nil {
+	if writeErr := normalizeEstablishmentWriteErr(waitEstablishmentWrite(writeErrCh, establishmentWriteWaitAfterRead(establishmentDeadline)), writeDeadline); writeErr != nil {
 		_ = conn.Close()
 		if errors.Is(writeErr, errEstablishmentPrefaceWriteTimeout) {
 			return nil, wireError(CodeInternal, "write preface", writeErr)
@@ -2399,6 +2486,11 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+
+	// Independent per-session seeds keep sessions in different processes from
+	// sharing keepalive jitter and PING tokens/padding.
+	jitterSeed := sessionLivenessSeed(cfg.NonceSource)
+	pingSeed := sessionLivenessSeed(cfg.NonceSource)
 
 	now := time.Now()
 	var livenessCh chan struct{}
@@ -2465,8 +2557,8 @@ func establish(conn io.ReadWriteCloser, cfg Config) (*Conn, error) {
 			pingPadding:              cfg.PingPadding,
 			pingPaddingMin:           cfg.PingPaddingMinBytes,
 			pingPaddingMax:           cfg.PingPaddingMaxBytes,
-			keepaliveJitterState:     rt.InitKeepaliveJitterState(local.TieBreakerNonce ^ peer.TieBreakerNonce),
-			pingNonceState:           rt.InitSessionNonceState((local.TieBreakerNonce << 1) ^ peer.TieBreakerNonce),
+			keepaliveJitterState:     rt.InitKeepaliveJitterState(jitterSeed),
+			pingNonceState:           rt.InitSessionNonceState(pingSeed),
 			lastInboundFrameAt:       now,
 			lastControlProgressAt:    now,
 			lastTransportWriteAt:     now,
@@ -2642,6 +2734,9 @@ type connSessionControlState struct {
 	pendingGoAwayPayload []byte
 	hasPendingGoAway     bool
 	goAwaySendActive     bool
+
+	// localStreamIDsExhausted is set once a local stream ID class ran out.
+	localStreamIDsExhausted bool
 }
 
 type connShutdownRuntimeState struct {
@@ -2708,6 +2803,10 @@ type connFlowState struct {
 	perStreamDataHWM      uint64
 	sessionDataHWM        uint64
 	urgentQueueCap        uint64
+
+	// recvSessionBlockedAdvertised is the session limit seen by the previous
+	// peer session BLOCKED (0 until the first one).
+	recvSessionBlockedAdvertised uint64
 }
 
 type sparseQueueState[T any] struct {
@@ -2798,7 +2897,12 @@ type connRegistryState struct {
 	hiddenTombstoneHead  int
 	hiddenTombstoneCount int
 	usedStreamData       map[uint64]usedStreamMarker
-	usedStreamRanges     []usedStreamRange
+	// usedStreamRanges holds the compacted used-stream markers of each stream
+	// ID class (stream_id & 3), each sorted by start.
+	usedStreamRanges [usedStreamClasses][]usedStreamRange
+	// usedStreamFloors are the coarsened prefixes of each class: every used ID
+	// at or below the floor reads as coarsenedUsedStreamMarker (0 = none).
+	usedStreamFloors     [usedStreamClasses]uint64
 	usedStreamRangeMode  bool
 	tombstoneLimit       int
 	hiddenTombstonesInit bool
@@ -2807,6 +2911,23 @@ type connRegistryState struct {
 	nextLocalUni  uint64
 	nextPeerBidi  uint64
 	nextPeerUni   uint64
+
+	// highestRefusedPeerBidi/highestRefusedPeerUni are the highest peer IDs of
+	// each class already answered with ABORT(REFUSED_STREAM) for opening above
+	// the local GOAWAY watermark (0 = none). Such IDs are not consumed, so
+	// these keep a refused ID from being refused again for every DATA frame.
+	highestRefusedPeerBidi uint64
+	highestRefusedPeerUni  uint64
+
+	// openerTurnBidi/openerTurnUni hold the last committed local stream ID of
+	// each class until the writer takes that stream's first frame into a
+	// batch (0 when none is outstanding). A later stream of the same class
+	// commits only after that, so opening frames reach the wire in stream-ID
+	// order (SPEC §3.1).
+	openerTurnBidi         uint64
+	openerTurnUni          uint64
+	openerTurnReleasedBidi time.Time
+	openerTurnReleasedUni  time.Time
 
 	activeLocalBidi uint64
 	activeLocalUni  uint64
@@ -3516,41 +3637,34 @@ func (c *Conn) markerOnlyRangeCountLocked() int {
 	if c == nil {
 		return 0
 	}
-	return len(c.registry.usedStreamRanges)
+	count := 0
+	for _, ranges := range c.registry.usedStreamRanges {
+		count += len(ranges)
+	}
+	return count
 }
 
+// markerOnlyHardCapLocked is the retained marker-only budget. Markers count
+// toward tracked session memory, so they may take at most a quarter of the
+// session memory hard cap; otherwise markers alone could push the session to
+// the write-blocking high threshold. Past the budget markers are coarsened
+// (boundMarkerOnlyRetentionLocked), never failed.
 func (c *Conn) markerOnlyHardCapLocked() int {
 	if c == nil {
 		return 1
 	}
-	if c.retention.markerOnlyLimit > 0 {
-		return c.retention.markerOnlyLimit
+	capCount := uint64(1)
+	if unit := c.compactTerminalStateUnitLocked(); unit > 0 {
+		capCount = max(c.sessionMemoryHardCapLocked()/4/unit, 1)
 	}
-	unit := c.compactTerminalStateUnitLocked()
-	if unit == 0 {
-		return 1
-	}
-	capCount := c.sessionMemoryHardCapLocked() / unit
-	if capCount == 0 {
-		return 1
+	if limit := c.retention.markerOnlyLimit; limit > 0 && uint64(limit) < capCount {
+		return limit
 	}
 	maxInt := int(^uint(0) >> 1)
 	if capCount > uint64(maxInt) {
 		return maxInt
 	}
 	return int(capCount)
-}
-
-func (c *Conn) markerOnlyCapErrorLocked(op string) error {
-	if c == nil {
-		return nil
-	}
-	count := c.markerOnlyRetainedLocked()
-	capCount := c.markerOnlyHardCapLocked()
-	if count <= capCount {
-		return nil
-	}
-	return wireError(CodeInternal, op, fmt.Errorf("marker-only used-stream cap exceeded: count=%d cap=%d", count, capCount))
 }
 
 func retainedBucketStats(count int, unit uint64) RetainedBucketStats {
@@ -3600,7 +3714,7 @@ func (c *Conn) Ping(ctx context.Context, echo []byte) (time.Duration, error) {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		done, sentAt, err := c.beginGeneratedPing(echo, "build PING")
+		done, sentAt, err := c.beginGeneratedPing(ctx, echo, "build PING")
 		if err == nil {
 			select {
 			case <-ctx.Done():
@@ -3614,7 +3728,13 @@ func (c *Conn) Ping(ctx context.Context, echo []byte) (time.Duration, error) {
 			case <-done:
 				c.mu.Lock()
 				rtt := c.liveness.lastPingRTT
+				closeErr := c.lifecycle.closeErr
 				c.mu.Unlock()
+				// Session close also releases the outstanding ping before
+				// closedCh closes; that is not a PONG.
+				if closeErr != nil {
+					return 0, closeErr
+				}
 				if rtt == 0 {
 					return time.Since(sentAt), nil
 				}
@@ -3930,10 +4050,14 @@ func (c *Conn) beginPingPayloadLocked(payload []byte, ownership retainedBytesOwn
 	return done, sentAt, c.liveness.pingPayload, nil
 }
 
-func (c *Conn) beginGeneratedPing(echo []byte, op string) (<-chan struct{}, time.Time, error) {
+// beginGeneratedPing originates a user PING. ctx bounds only the hand-off to
+// the writer: the PING is not tied to its transport write, so a stalled
+// writer cannot hold Ping past its context (the PONG wait already honours it).
+func (c *Conn) beginGeneratedPing(ctx context.Context, echo []byte, op string) (<-chan struct{}, time.Time, error) {
 	if c == nil {
 		return nil, time.Time{}, ErrSessionClosed
 	}
+	ctx = contextOrBackground(ctx)
 	c.mu.Lock()
 	if c.lifecycle.closeErr != nil {
 		err := visibleSessionErrLocked(c, c.lifecycle.closeErr)
@@ -3965,8 +4089,13 @@ func (c *Conn) beginGeneratedPing(echo []byte, op string) (<-chan struct{}, time
 	notify(c.signals.livenessCh)
 	c.mu.Unlock()
 
-	if err := c.queueImmutableFrame(flatTxFrame(Frame{Type: FrameTypePING, Payload: retainedPayload})); err != nil {
+	if err := c.queuePingFrame(retainedPayload, ctx.Done()); err != nil {
+		// Withdrawn or rejected before the writer took it: the PING never
+		// reached the wire, so no late PONG needs to be tolerated.
 		c.failPing(retainedPayload)
+		if errors.Is(err, errPreparedQueueAborted) {
+			return nil, time.Time{}, ctx.Err()
+		}
 		return nil, time.Time{}, err
 	}
 
@@ -4005,10 +4134,26 @@ func (c *Conn) beginKeepalivePing(op string) (<-chan struct{}, time.Time, error)
 		return nil, time.Time{}, err
 	}
 	c.liveness.pingAcceptsPaddedPong = acceptsPaddedPong
+	timeout := c.effectiveKeepaliveTimeoutLocked()
 	notify(c.signals.livenessCh)
 	c.mu.Unlock()
 
-	if err := c.queueImmutableFrame(flatTxFrame(Frame{Type: FrameTypePING, Payload: retainedPayload})); err != nil {
+	// keepaliveLoop is the only place the keepalive timeout is evaluated, so
+	// it must never wait on a stalled transport write. The PING is handed to
+	// the writer without waiting for the write; one that cannot even reach
+	// the writer within the timeout has been outstanding for the whole timeout
+	// (IMPLEMENTATION §4).
+	var expired <-chan struct{}
+	if timeout > 0 {
+		expiry, cancel := context.WithDeadline(context.Background(), sentAt.Add(timeout))
+		defer cancel()
+		expired = expiry.Done()
+	}
+	if err := c.queuePingFrame(retainedPayload, expired); err != nil {
+		if errors.Is(err, errPreparedQueueAborted) {
+			c.CloseWithError(ErrKeepaliveTimeout)
+			return done, sentAt, nil
+		}
 		c.failPing(retainedPayload)
 		return nil, time.Time{}, err
 	}
@@ -4431,26 +4576,38 @@ func (w provisionalCommitWait) blocked() bool {
 	return w.blockedFlag
 }
 
+// provisionalOpenTurnWait is a commit-turn wait begun (under conn.mu) by
+// provisionalOpenTurnWaitLocked; wait must be called to end it. The zero
+// value is no wait: the caller retries at once.
 type provisionalOpenTurnWait struct {
 	notifyCh       <-chan struct{}
 	deadline       time.Time
 	retryOnTimeout bool
+	begun          bool
 }
 
 func (w provisionalOpenTurnWait) wait(stream *nativeStream, wrap func(error) error) error {
 	if stream == nil {
 		return ErrSessionClosed
 	}
-	if err := stream.waitWithDeadline(w.notifyCh, w.deadline, OperationWrite); err != nil {
-		if w.retryOnTimeout && errors.Is(err, os.ErrDeadlineExceeded) {
-			return nil
-		}
-		if wrap != nil {
-			return wrap(err)
-		}
+	if !w.begun {
+		return nil
+	}
+	err := stream.waitWithDeadline(w.notifyCh, w.deadline, OperationWrite)
+	if err != nil && w.retryOnTimeout && errors.Is(err, os.ErrDeadlineExceeded) {
+		err = nil
+	}
+	if stream.conn == nil {
 		return err
 	}
-	return nil
+	stream.conn.mu.Lock()
+	stream.endProvisionalCommitWaitLocked(time.Now())
+	if err != nil && wrap != nil {
+		// The wrappers read the stream's terminal state.
+		err = wrap(err)
+	}
+	stream.conn.mu.Unlock()
+	return err
 }
 
 type localOpenCommitState uint8
@@ -4980,7 +5137,8 @@ func (c *Conn) newProvisionalLocalStreamOwnedLocked(arity streamArity, opts Open
 
 func (c *Conn) checkLocalOpenAllowedLocked(id uint64, arity streamArity) error {
 	if id > MaxVarint62 {
-		return wireError(CodeProtocol, "open stream", fmt.Errorf("stream id overflow"))
+		c.noteLocalStreamIDsExhaustedLocked()
+		return errLocalStreamIDsExhausted
 	}
 	if err := state.ValidateLocalOpenID(c.config.negotiated.LocalRole, id, arity.isBidi()); err != nil {
 		return wireError(CodeProtocol, "open stream", err)
@@ -4992,6 +5150,42 @@ func (c *Conn) checkLocalOpenAllowedLocked(id uint64, arity streamArity) error {
 		return refusedStreamAppErr()
 	}
 	return nil
+}
+
+// noteLocalStreamIDsExhaustedLocked starts graceful session replacement the
+// first time a local stream ID class runs out (SPEC §3.1, §9.1). IDs are never
+// wrapped or reused, so opens of that class keep failing locally; one GOAWAY
+// that keeps the current watermarks moves the session to draining without
+// refusing any peer stream. It is queued here and written by a separate
+// goroutine, because callers hold c.mu on the open and commit paths.
+func (c *Conn) noteLocalStreamIDsExhaustedLocked() {
+	if c == nil || c.sessionControl.localStreamIDsExhausted {
+		return
+	}
+	c.sessionControl.localStreamIDsExhausted = true
+	if c.lifecycle.closeErr != nil || !c.allowLocalNonCloseControlLocked() ||
+		c.sessionControl.hasSentGoAway || c.sessionControl.hasPendingGoAway || c.sessionControl.goAwaySendActive {
+		return
+	}
+	localRole := c.config.negotiated.LocalRole
+	bidi := effectiveGoAwaySendWatermark(localRole, streamArityBidi, c.sessionControl.localGoAwayBidi)
+	uni := effectiveGoAwaySendWatermark(localRole, streamArityUni, c.sessionControl.localGoAwayUni)
+	payload, err := buildGoAwayPayload(bidi, uni, uint64(CodeNoError), "")
+	if err != nil {
+		return
+	}
+	c.sessionControl.pendingGoAwayBidi = bidi
+	c.sessionControl.pendingGoAwayUni = uni
+	if !c.setPendingGoAwayPayloadLocked(payload) {
+		return
+	}
+	c.sessionControl.localGoAwayBidi = bidi
+	c.sessionControl.localGoAwayUni = uni
+	c.advanceSessionOnLocalGoAwayLocked(true)
+	c.sessionControl.goAwaySendActive = true
+	go func() {
+		_ = c.flushPendingLocalGoAway()
+	}()
 }
 
 func (c *Conn) checkLocalOpenPossibleLocked(arity streamArity) error {
@@ -5152,7 +5346,7 @@ func (c *Conn) removeProvisionalLocked(stream *nativeStream) bool {
 
 func (c *Conn) notifyProvisionalWaitersLocked(arity streamArity) {
 	if head := c.provisionalHeadLocked(arity); head.found() {
-		notify(head.stream.writeNotify)
+		head.stream.broadcastWriteNotifyLocked()
 	}
 }
 
@@ -5169,17 +5363,112 @@ func (c *Conn) provisionalCommitWaitLocked(stream *nativeStream, now time.Time) 
 		return provisionalCommitWait{}, err
 	}
 	head := c.provisionalHeadLocked(arity)
-	if !head.found() || head.stream == stream {
-		return provisionalCommitWait{}, nil
+	if head.found() && head.stream != stream {
+		ageBase := c.provisionalAgeBaseLocked(head.stream, now)
+		if ageBase.IsZero() {
+			return provisionalCommitWait{blockedFlag: true}, nil
+		}
+		return provisionalCommitWait{
+			deadline:    ageBase.Add(c.provisionalOpenMaxAgeLocked()),
+			blockedFlag: true,
+		}, nil
 	}
-	headCreated := head.stream.provisionalCreatedAt()
-	if headCreated.IsZero() {
+	if c.localOpenerTurnLocked(arity) != 0 {
+		// The previous same-class opener has not reached the writer yet.
+		// Releasing the turn notifies the provisional head.
 		return provisionalCommitWait{blockedFlag: true}, nil
 	}
-	return provisionalCommitWait{
-		deadline:    headCreated.Add(c.provisionalOpenMaxAgeLocked()),
-		blockedFlag: true,
-	}, nil
+	return provisionalCommitWait{}, nil
+}
+
+// localOpenerTurnLocked returns the committed local stream ID of this class
+// whose first frame the writer has not taken yet, or 0.
+func (c *Conn) localOpenerTurnLocked(arity streamArity) uint64 {
+	if c == nil {
+		return 0
+	}
+	turn, _ := arity.openerTurnState(&c.registry)
+	if *turn == 0 {
+		return 0
+	}
+	// An ID above the peer's GOAWAY watermark is refused rather than opened,
+	// and every later ID is refused as well, so it cannot leave a gap.
+	if state.LocalOpenRefusedByGoAway(*turn, arity.isBidi(), c.sessionControl.peerGoAwayBidi, c.sessionControl.peerGoAwayUni) {
+		return 0
+	}
+	return *turn
+}
+
+func (c *Conn) holdsLocalOpenerTurnLocked(stream *nativeStream) bool {
+	return stream != nil && stream.idSet && c.localOpenerTurnLocked(stream.streamArity()) == stream.id
+}
+
+func (c *Conn) takeLocalOpenerTurnLocked(stream *nativeStream) {
+	if c == nil || stream == nil || !stream.idSet {
+		return
+	}
+	turn, _ := stream.streamArity().openerTurnState(&c.registry)
+	*turn = stream.id
+}
+
+func (c *Conn) releaseLocalOpenerTurnLocked(arity streamArity, now time.Time) {
+	turn, releasedAt := arity.openerTurnState(&c.registry)
+	if *turn == 0 {
+		return
+	}
+	*turn = 0
+	*releasedAt = now
+	c.notifyProvisionalWaitersLocked(arity)
+}
+
+// releaseLocalOpenerTurnsForBatchLocked runs once the writer has committed to
+// emitting batch. A turn holder whose first frame is in the batch reaches the
+// wire before anything a later batch carries, so the next stream of its class
+// may commit now.
+func (c *Conn) releaseLocalOpenerTurnsForBatchLocked(batch []writeRequest) {
+	if c == nil || (c.registry.openerTurnBidi == 0 && c.registry.openerTurnUni == 0) {
+		return
+	}
+	var now time.Time
+	for i := range batch {
+		for _, frame := range batch[i].frames {
+			var arity streamArity
+			switch frame.StreamID {
+			case 0:
+				continue
+			case c.registry.openerTurnBidi:
+				arity = streamArityBidi
+			case c.registry.openerTurnUni:
+				arity = streamArityUni
+			default:
+				continue
+			}
+			if now.IsZero() {
+				now = time.Now()
+			}
+			c.releaseLocalOpenerTurnLocked(arity, now)
+		}
+	}
+}
+
+// provisionalAgeBaseLocked returns the time a provisional stream started to
+// age. Waiting behind an earlier same-class opener that has not reached the
+// writer yet does not count against it, and neither does any time the stream
+// spends waiting for its own commit turn, whether the opener ahead of it then
+// opens or is abandoned: only idle provisional time counts.
+func (c *Conn) provisionalAgeBaseLocked(stream *nativeStream, now time.Time) time.Time {
+	origin, waiting := stream.provisionalAgeOriginLocked()
+	if origin.IsZero() {
+		return origin
+	}
+	arity := stream.streamArity()
+	if waiting || c.localOpenerTurnLocked(arity) != 0 {
+		return now
+	}
+	if _, releasedAt := arity.openerTurnState(&c.registry); releasedAt.After(origin) {
+		return *releasedAt
+	}
+	return origin
 }
 
 func (s *nativeStream) provisionalOpenTurnWaitLocked() (provisionalOpenTurnWait, bool, error) {
@@ -5202,10 +5491,12 @@ func (s *nativeStream) provisionalOpenTurnWaitLocked() (provisionalOpenTurnWait,
 		deadline = writeDeadline
 		retryOnTimeout = false
 	}
+	s.beginProvisionalCommitWaitLocked(time.Now())
 	return provisionalOpenTurnWait{
 		notifyCh:       notifyCh,
 		deadline:       deadline,
 		retryOnTimeout: retryOnTimeout,
+		begun:          true,
 	}, true, nil
 }
 
@@ -5244,6 +5535,7 @@ func (c *Conn) commitLocalOpenLocked(stream *nativeStream) (localOpenCommitState
 	c.noteOpenCommitLocked(createdAt, time.Now())
 	stream.clearProvisionalState()
 	stream.streamArity().advanceNextLocalID(&c.registry)
+	c.takeLocalOpenerTurnLocked(stream)
 	if removed {
 		c.notifyProvisionalWaitersLocked(stream.streamArity())
 	}
@@ -5315,11 +5607,11 @@ func (c *Conn) provisionalExpiredLocked(stream *nativeStream, now time.Time) boo
 	if stream == nil || stream.idSet {
 		return false
 	}
-	created := stream.provisionalCreatedAt()
-	if created.IsZero() {
+	ageBase := c.provisionalAgeBaseLocked(stream, now)
+	if ageBase.IsZero() {
 		return false
 	}
-	return now.Sub(created) > c.provisionalOpenMaxAgeLocked()
+	return now.Sub(ageBase) > c.provisionalOpenMaxAgeLocked()
 }
 
 func (c *Conn) provisionalOpenMaxAgeLocked() time.Duration {

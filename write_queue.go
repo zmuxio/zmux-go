@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"errors"
 	"os"
 	"runtime"
 	"sync"
@@ -47,6 +48,7 @@ type writeRequest struct {
 	terminalDataPriority    bool
 	terminalResetOnly       bool
 	terminalAbortOnly       bool
+	terminalStopOnly        bool
 	terminalHasFIN          bool
 	// preparedSend* tracks withdrawable send-side reservations.
 	preparedSendBytes uint64
@@ -754,7 +756,14 @@ func (p writeDeadlinePolicy) usesStreamDeadline() bool {
 type preparedQueueDispatchOptions struct {
 	lane      writeLane
 	ownership frameOwnership
+	// abort withdraws the request with errPreparedQueueAborted if it fires
+	// before the writer lane has taken the request. A nil channel never fires.
+	abort <-chan struct{}
 }
+
+// errPreparedQueueAborted reports that a dispatch was withdrawn by its abort
+// signal before the writer lane took the request; nothing reached the writer.
+var errPreparedQueueAborted = errors.New("zmux: queued frame withdrawn before writer admission")
 
 type frameLaneRequestOptions struct {
 	lane           writeLane
@@ -785,6 +794,7 @@ func clearWriteRequestClassification(req *writeRequest) {
 	req.terminalDataPriority = false
 	req.terminalResetOnly = false
 	req.terminalAbortOnly = false
+	req.terminalStopOnly = false
 	req.terminalHasFIN = false
 }
 
@@ -898,6 +908,7 @@ func initTerminalClassification(req *writeRequest) {
 	req.terminalDataPriority = true
 	req.terminalResetOnly = true
 	req.terminalAbortOnly = true
+	req.terminalStopOnly = true
 	req.terminalHasFIN = false
 }
 
@@ -908,6 +919,7 @@ func clearTerminalClassification(req *writeRequest) {
 	req.terminalDataPriority = false
 	req.terminalResetOnly = false
 	req.terminalAbortOnly = false
+	req.terminalStopOnly = false
 }
 
 func clearTerminalClassificationAndFIN(req *writeRequest) {
@@ -975,18 +987,26 @@ func classifyTerminalFrame(req *writeRequest, frame txFrame, fin terminalFINScan
 		}
 		req.terminalResetOnly = false
 		req.terminalAbortOnly = false
+		req.terminalStopOnly = false
 	case FrameTypeEXT:
 		if fin.seen() || !frameIsPriorityUpdate(frame) {
 			req.terminalDataPriority = false
 		}
 		req.terminalResetOnly = false
 		req.terminalAbortOnly = false
+		req.terminalStopOnly = false
 	case FrameTypeRESET:
 		req.terminalDataPriority = false
 		req.terminalAbortOnly = false
+		req.terminalStopOnly = false
 	case FrameTypeABORT:
 		req.terminalDataPriority = false
 		req.terminalResetOnly = false
+		req.terminalStopOnly = false
+	case FrameTypeStopSending:
+		req.terminalDataPriority = false
+		req.terminalResetOnly = false
+		req.terminalAbortOnly = false
 	default:
 		clearTerminalClassification(req)
 	}
@@ -1127,6 +1147,16 @@ func (req *writeRequest) allowsTerminalSendHalf(sendHalf state.SendHalfState, st
 	}
 }
 
+// carriesOnlyReadStopForStream reports whether every frame of the request is a
+// STOP_SENDING for streamID. Read-side stops belong to the receive half, so the
+// state of the local send half never suppresses them (SPEC §9.3).
+func (req *writeRequest) carriesOnlyReadStopForStream(streamID uint64) bool {
+	if req == nil || !req.targetsStreamID(streamID) {
+		return false
+	}
+	return req.terminalStopOnly
+}
+
 func (req *writeRequest) allowsQueuedGracefulFinDrainForStream(streamID uint64) bool {
 	if req == nil || !req.queueReserved || !req.targetsStreamID(streamID) {
 		return false
@@ -1160,14 +1190,21 @@ func (c *Conn) preparedRequestStreamLocked(req *writeRequest) *nativeStream {
 }
 
 func (c *Conn) rollbackPreparedSendLocked(stream *nativeStream, req *writeRequest) {
-	if c == nil || stream == nil || req == nil {
+	if c == nil || req == nil {
 		return
 	}
 
 	if req.preparedSendBytes > 0 {
-		stream.sendSent = csub(stream.sendSent, req.preparedSendBytes)
+		// These bytes never reached the writer, so their session credit is
+		// still withdrawable even if the stream has already been released.
+		if stream != nil {
+			stream.sendSent = csub(stream.sendSent, req.preparedSendBytes)
+		}
 		c.flow.sendSessionUsed = csub(c.flow.sendSessionUsed, req.preparedSendBytes)
 		req.preparedSendBytes = 0
+	}
+	if stream == nil {
+		return
 	}
 	if req.preparedSendFin {
 		if stream.sendFinReachedLocked() {
@@ -1178,6 +1215,11 @@ func (c *Conn) rollbackPreparedSendLocked(stream *nativeStream, req *writeReques
 	if req.preparedOpenerVisibility.marksPeerVisible() {
 		stream.clearOpeningBarrierLocked()
 		req.preparedOpenerVisibility = openerVisibilityUnchanged
+		if stream.hasPendingTerminalControlLocked() {
+			// A RESET/STOP_SENDING held behind this opener now has to carry
+			// its own opener; let the writer flush it.
+			notify(c.pending.terminalNotify)
+		}
 	}
 }
 
@@ -1194,12 +1236,13 @@ func (c *Conn) capturePreparedReleaseSnapshotLocked(stream *nativeStream) prepar
 	return snapshot
 }
 
-func (c *Conn) releasePreparedWriteRequestLocked(req *writeRequest) (*nativeStream, rt.ReleaseWakePlan) {
+func (c *Conn) releasePreparedWriteRequestLocked(req *writeRequest) (*nativeStream, rt.ReleaseWakePlan, withdrawnOpenerConsume) {
 	if c == nil || req == nil {
-		return nil, rt.ReleaseWakePlan{}
+		return nil, rt.ReleaseWakePlan{}, withdrawnOpenerConsume{}
 	}
 	stream := c.preparedRequestStreamLocked(req)
 	prev := c.capturePreparedReleaseSnapshotLocked(stream)
+	withdrawnOpener := req.preparedOpenerVisibility.marksPeerVisible()
 
 	c.rollbackPreparedSendLocked(stream, req)
 	if prev.sessionCredit == 0 && csub(c.flow.sendSessionMax, c.flow.sendSessionUsed) > 0 {
@@ -1234,7 +1277,69 @@ func (c *Conn) releasePreparedWriteRequestLocked(req *writeRequest) (*nativeStre
 		next.streamCredit,
 		urgentReleased,
 	)
-	return stream, plan
+	var consume withdrawnOpenerConsume
+	if withdrawnOpener {
+		consume = c.consumeWithdrawnOpenerLocked(stream)
+	}
+	return stream, plan, consume
+}
+
+// withdrawnOpenerConsume is what consuming a withdrawn opener's stream ID
+// leaves for the caller to do once conn.mu is released.
+type withdrawnOpenerConsume struct {
+	dispatch streamEventDispatch
+	queued   bool
+	err      error
+}
+
+func (r withdrawnOpenerConsume) empty() bool {
+	return !r.queued && r.err == nil && !r.dispatch.shouldEmit()
+}
+
+func (r withdrawnOpenerConsume) finish(c *Conn, origin closeOrigin) {
+	if c == nil {
+		return
+	}
+	if r.err != nil {
+		c.closeSessionWithOptions(r.err, origin, closeFrameDefault)
+		return
+	}
+	if r.queued {
+		notify(c.pending.terminalNotify)
+		notify(c.pending.controlNotify)
+	}
+	emitStreamDispatch(c, r.dispatch)
+}
+
+// consumeWithdrawnOpenerLocked handles a local stream whose committed opener
+// was withdrawn before the writer took it, for example because its first
+// Write timed out. Its ID still has to reach the wire before any later
+// same-class opener (SPEC §3.1), so the stream is aborted with CANCELLED;
+// ABORT is opening-eligible.
+func (c *Conn) consumeWithdrawnOpenerLocked(stream *nativeStream) withdrawnOpenerConsume {
+	if c == nil || stream == nil || c.lifecycle.closeErr != nil || !c.holdsLocalOpenerTurnLocked(stream) {
+		return withdrawnOpenerConsume{}
+	}
+	if !stream.shouldEmitOpenerFrameLocked() {
+		return withdrawnOpenerConsume{}
+	}
+	if stream.hasPendingTerminalControlLocked() {
+		// A pending ABORT, or a RESET/STOP_SENDING that now carries its own
+		// zero-length opener, consumes the ID when the writer flushes it.
+		return withdrawnOpenerConsume{queued: true}
+	}
+	if state.LocalAbortActionForStream(stream.effectiveSendHalfStateLocked(), stream.effectiveRecvHalfStateLocked()) == state.LocalAbortActionNoOp {
+		return withdrawnOpenerConsume{}
+	}
+	code := uint64(CodeCancelled)
+	plan, err := stream.prepareTerminalSignalPlanLocked(terminalSignalAbort, code, "", applicationErr(code, ""), terminalSignalOptions{
+		openerPolicy: terminalOpenerAllow,
+	})
+	if err != nil {
+		return withdrawnOpenerConsume{err: err}
+	}
+	dispatch, queued, err := stream.enqueuePendingTerminalSignalLocked(plan)
+	return withdrawnOpenerConsume{dispatch: dispatch, queued: queued, err: err}
 }
 
 func (c *Conn) releasePreparedWriteRequest(req *writeRequest) {
@@ -1244,20 +1349,21 @@ func (c *Conn) releasePreparedWriteRequest(req *writeRequest) {
 
 	urgentReleased := req.urgentReserved && req.queuedBytes > 0
 	c.mu.Lock()
-	stream, plan := c.releasePreparedWriteRequestLocked(req)
+	stream, plan, consume := c.releasePreparedWriteRequestLocked(req)
 	if plan.Broadcast {
 		c.broadcastWriteWakeLocked()
 	}
 	if urgentReleased {
 		c.broadcastUrgentWakeLocked()
 	}
+	if plan.StreamWake && stream != nil {
+		stream.broadcastWriteNotifyLocked()
+	}
 	c.mu.Unlock()
+	consume.finish(c, closeOriginInternal)
 
 	if plan.Control {
 		notify(c.pending.controlNotify)
-	}
-	if plan.StreamWake && stream != nil {
-		notify(stream.writeNotify)
 	}
 }
 
@@ -1267,7 +1373,7 @@ func (c *Conn) releaseRejectedPreparedRequests(rejected []rejectedWriteRequest) 
 	}
 
 	var (
-		streamWakes   []*nativeStream
+		consumes      []withdrawnOpenerConsume
 		needBroadcast bool
 		needControl   bool
 		needUrgent    bool
@@ -1275,11 +1381,14 @@ func (c *Conn) releaseRejectedPreparedRequests(rejected []rejectedWriteRequest) 
 	c.mu.Lock()
 	for i := range rejected {
 		needUrgent = needUrgent || (rejected[i].req.urgentReserved && rejected[i].req.queuedBytes > 0)
-		stream, plan := c.releasePreparedWriteRequestLocked(&rejected[i].req)
+		stream, plan, consume := c.releasePreparedWriteRequestLocked(&rejected[i].req)
 		needBroadcast = needBroadcast || plan.Broadcast
 		needControl = needControl || plan.Control
 		if plan.StreamWake && stream != nil {
-			streamWakes = append(streamWakes, stream)
+			stream.broadcastWriteNotifyLocked()
+		}
+		if !consume.empty() {
+			consumes = append(consumes, consume)
 		}
 	}
 	if needBroadcast {
@@ -1289,12 +1398,13 @@ func (c *Conn) releaseRejectedPreparedRequests(rejected []rejectedWriteRequest) 
 		c.broadcastUrgentWakeLocked()
 	}
 	c.mu.Unlock()
+	// Only the writer rejects prepared requests.
+	for _, consume := range consumes {
+		consume.finish(c, closeOriginWriteLoop)
+	}
 
 	if needControl {
 		notify(c.pending.controlNotify)
-	}
-	for _, stream := range streamWakes {
-		notify(stream.writeNotify)
 	}
 }
 
@@ -1374,6 +1484,9 @@ func (c *Conn) dispatchPreparedQueueRequest(req *writeRequest, opts preparedQueu
 			select {
 			case <-c.lifecycle.closedCh:
 				return queueVisibleSessionErr(c, c.err())
+			case <-opts.abort:
+				c.releaseUrgentQueueReservation(req)
+				return errPreparedQueueAborted
 			case <-wakeCh:
 			}
 		}
@@ -1414,6 +1527,10 @@ func (c *Conn) dispatchPreparedQueueRequest(req *writeRequest, opts preparedQueu
 		c.releaseUrgentQueueReservation(req)
 		c.releaseAdvisoryQueueReservation(req)
 		return queueVisibleSessionErr(c, c.err())
+	case <-opts.abort:
+		c.releaseUrgentQueueReservation(req)
+		c.releaseAdvisoryQueueReservation(req)
+		return errPreparedQueueAborted
 	case c.writeLaneChan(opts.lane) <- *req:
 	}
 	return nil
@@ -1812,6 +1929,7 @@ func (s *nativeStream) sendQueuedWriteRequestUntilDeadline(req *writeRequest, la
 			case <-notifyCh:
 				s.conn.mu.Lock()
 				refresh := s.conn.refreshQueuedWriteRequestLocked(s, req, opts)
+				notifyCh = s.ensureWriteNotifyLocked()
 				s.conn.mu.Unlock()
 				if refresh.err != nil {
 					return s.rollbackPreparedWriteRequest(req, refresh.err)
@@ -1831,6 +1949,7 @@ func (s *nativeStream) sendQueuedWriteRequestUntilDeadline(req *writeRequest, la
 		case <-notifyCh:
 			s.conn.mu.Lock()
 			refresh := s.conn.refreshQueuedWriteRequestLocked(s, req, opts)
+			notifyCh = s.ensureWriteNotifyLocked()
 			s.conn.mu.Unlock()
 			if refresh.err != nil {
 				return s.rollbackPreparedWriteRequest(req, refresh.err)
@@ -1883,6 +2002,38 @@ func (c *Conn) queueImmutableFrame(frame txFrame) error {
 		opts.lane = writeLaneUrgent
 	}
 	return c.queueTxFrame(frame, opts, frameImmutable)
+}
+
+// queuePingFrame hands an originated PING to the writer and returns once the
+// writer lane has taken it, without waiting for the transport write. The PING
+// is outstanding from origination and only a PONG proves the path healthy
+// (IMPLEMENTATION §4), so a stalled transport must hold neither a Ping caller
+// past its context nor the keepalive loop past its timeout. If abort fires
+// before the lane takes the PING, it is withdrawn unsent and
+// errPreparedQueueAborted is returned. A write failure after hand-off closes
+// the session, which every PING waiter also observes.
+func (c *Conn) queuePingFrame(payload []byte, abort <-chan struct{}) error {
+	frame := flatTxFrame(Frame{Type: FrameTypePING, Payload: payload})
+	opts := frameLaneRequestOptions{
+		lane: writeLaneOrdinary,
+	}
+	if rt.IsUrgentType(frame.Type) {
+		opts.lane = writeLaneUrgent
+	}
+	req, err := c.buildTxLaneRequest([]txFrame{frame}, opts)
+	if err != nil {
+		return err
+	}
+	if err := c.dispatchPreparedQueueRequest(&req, preparedQueueDispatchOptions{
+		lane:      opts.lane,
+		ownership: frameImmutable,
+		abort:     abort,
+	}); err != nil {
+		return err
+	}
+	// The writer owns and completes its copy; nothing waits on it here.
+	req.clearRetainedRefs()
+	return nil
 }
 
 func txFrameChunkSpans(frames []txFrame, maxFrames int, maxBytes uint64) []rt.ChunkSpan {
@@ -2181,7 +2332,7 @@ func (c *Conn) releaseWriteQueueReservation(req *writeRequest) {
 		}
 	}
 	if plan.StreamWake && stream != nil {
-		notify(stream.writeNotify)
+		stream.broadcastWriteNotifyLocked()
 	}
 	c.mu.Unlock()
 }
@@ -2239,15 +2390,19 @@ func (c *Conn) releaseWriteQueueReservationLocked(req *writeRequest) {
 		return
 	}
 
-	c.flow.queuedDataBytes = csub(c.flow.queuedDataBytes, req.queuedBytes)
-
 	stream := req.reservedStream
+	released := req.queuedBytes
 	if stream != nil {
-		stream.queuedDataBytes = csub(stream.queuedDataBytes, req.queuedBytes)
+		// A terminal stream's queued bytes may already have left the session
+		// total (releaseQueuedDataStreamStateLocked); they must not leave it
+		// twice, or the bytes other streams have queued stop being counted.
+		released = min(released, stream.queuedDataBytes)
+		stream.queuedDataBytes -= released
 		if stream.queuedDataBytes == 0 {
 			c.untrackQueuedDataStreamLocked(stream)
 		}
 	}
+	c.flow.queuedDataBytes = csub(c.flow.queuedDataBytes, released)
 
 	req.queueReserved = false
 	req.reservedStream = nil
@@ -2336,14 +2491,13 @@ func (c *Conn) releaseBatchReservations(batch []writeRequest) {
 	}
 
 	plan := rt.PlanLaneReleaseWake(prevTracked, c.trackedSessionMemoryLocked(), c.sessionMemoryHighThresholdLocked(), urgentReleased)
-	sessionWake := rt.CrossedLowWatermark(prevSession, c.flow.queuedDataBytes, c.sessionDataLWMLocked())
+	sessionWake := rt.QueueReleaseWakes(prevSession, c.flow.queuedDataBytes, c.sessionDataLWMLocked())
 	plan.Broadcast = plan.Broadcast || sessionWake
-	var streamWakes []*nativeStream
 	if !sessionWake {
 		lowWatermark := c.perStreamDataLWMLocked()
 		streamPrev.Range(func(stream *nativeStream, prev uint64) {
-			if rt.CrossedLowWatermark(prev, stream.queuedDataBytes, lowWatermark) {
-				streamWakes = append(streamWakes, stream)
+			if rt.QueueReleaseWakes(prev, stream.queuedDataBytes, lowWatermark) {
+				stream.broadcastWriteNotifyLocked()
 			}
 		})
 	}
@@ -2357,11 +2511,6 @@ func (c *Conn) releaseBatchReservations(batch []writeRequest) {
 
 	if plan.Control {
 		notify(c.pending.controlNotify)
-	}
-	for _, stream := range streamWakes {
-		if stream != nil {
-			notify(stream.writeNotify)
-		}
 	}
 }
 
@@ -2481,15 +2630,12 @@ func (c *Conn) untrackQueuedDataStreamLocked(stream *nativeStream) {
 	}
 }
 
-type queuedDataWakePolicy uint8
-
-const queuedDataWakeOnRelease queuedDataWakePolicy = 1
-
-func (p queuedDataWakePolicy) shouldWake() bool {
-	return p == queuedDataWakeOnRelease
-}
-
-func (c *Conn) releaseQueuedDataStreamStateLocked(stream *nativeStream, wake queuedDataWakePolicy) {
+// releaseQueuedDataStreamStateLocked drops a terminal stream's queued-data
+// accounting before its requests have drained from the writer queue. The room
+// it frees can admit writers blocked on queue admission, so it wakes them as
+// any other queue release does. When the writer later releases those
+// requests, releaseWriteQueueReservationLocked finds nothing left to release.
+func (c *Conn) releaseQueuedDataStreamStateLocked(stream *nativeStream) {
 	if c == nil || stream == nil {
 		return
 	}
@@ -2501,18 +2647,30 @@ func (c *Conn) releaseQueuedDataStreamStateLocked(stream *nativeStream, wake que
 		c.flow.queuedDataBytes = csub(c.flow.queuedDataBytes, releasedQueued)
 	}
 	c.clearQueuedDataStreamStateLocked(stream)
-
-	if !wake.shouldWake() || releasedQueued == 0 {
+	if releasedQueued == 0 {
 		return
 	}
 
-	memoryWake := c.sessionMemoryWakeNeededLocked(prevTracked)
-	sessionWake := rt.CrossedLowWatermark(prevSessionQueued, c.flow.queuedDataBytes, c.sessionDataLWMLocked())
-	if sessionWake || memoryWake {
+	plan := rt.PlanQueueReleaseWake(
+		prevTracked,
+		c.trackedSessionMemoryLocked(),
+		c.sessionMemoryHighThresholdLocked(),
+		prevSessionQueued,
+		c.flow.queuedDataBytes,
+		c.sessionDataLWMLocked(),
+		releasedQueued,
+		0,
+		c.perStreamDataLWMLocked(),
+		false,
+	)
+	if plan.Broadcast {
 		c.broadcastWriteWakeLocked()
+		if plan.MemoryWake {
+			notify(c.pending.controlNotify)
+		}
 	}
-	if memoryWake {
-		notify(c.pending.controlNotify)
+	if plan.StreamWake {
+		stream.broadcastWriteNotifyLocked()
 	}
 }
 

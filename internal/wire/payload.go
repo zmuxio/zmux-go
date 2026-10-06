@@ -215,8 +215,11 @@ func ParseDIAGReason(payload []byte) (string, error) {
 	var (
 		seenStandard uint8
 		debugText    []byte
+		dropped      bool
 	)
 
+	// A duplicate standard DIAG-TLV drops the reason, but the walk goes on so
+	// a later structural error still rejects the payload (SPEC §7.1, §7.2).
 	for len(payload) > 0 {
 		typ, nType, err := ParseVarint(payload)
 		if err != nil {
@@ -245,29 +248,29 @@ func ParseDIAGReason(payload []byte) (string, error) {
 		switch DIAGType(typ) {
 		case DIAGDebugText:
 			if seenStandard&diagSeenDebugText != 0 {
-				return "", nil
+				dropped = true
 			}
 			seenStandard |= diagSeenDebugText
 			debugText = value
 		case DIAGRetryAfterMillis:
 			if seenStandard&diagSeenRetryAfterMillis != 0 {
-				return "", nil
+				dropped = true
 			}
 			seenStandard |= diagSeenRetryAfterMillis
 		case DIAGOffendingStreamID:
 			if seenStandard&diagSeenOffendingStreamID != 0 {
-				return "", nil
+				dropped = true
 			}
 			seenStandard |= diagSeenOffendingStreamID
 		case DIAGOffendingFrameType:
 			if seenStandard&diagSeenOffendingFrameType != 0 {
-				return "", nil
+				dropped = true
 			}
 			seenStandard |= diagSeenOffendingFrameType
 		}
 	}
 
-	if len(debugText) == 0 {
+	if dropped || len(debugText) == 0 {
 		return "", nil
 	}
 	if !utf8.Valid(debugText) {

@@ -29,6 +29,21 @@ var (
 	ErrKeepaliveTimeout          = errors.New("zmux: keepalive timeout")
 )
 
+// errLocalStreamIDsExhausted reports that a local stream ID class is used up
+// (SPEC §3.1). It is a local open limit, not a peer violation, so it matches
+// ErrOpenLimited.
+var errLocalStreamIDsExhausted error = localStreamIDsExhaustedError{}
+
+type localStreamIDsExhaustedError struct{}
+
+func (localStreamIDsExhaustedError) Error() string {
+	return "zmux: local stream ID space exhausted"
+}
+
+func (localStreamIDsExhaustedError) Unwrap() error {
+	return ErrOpenLimited
+}
+
 // ApplicationError carries an application code and optional reason text.
 type ApplicationError struct {
 	Code   uint64
@@ -601,6 +616,9 @@ func (s *nativeStream) closeSurfaceErr(err error) error {
 	return wrapStructuredError(err, meta)
 }
 
+// closeOperationErr surfaces err for a stream close operation. Its termination
+// metadata reads stream state guarded by conn.mu, so a caller holding the lock
+// must surface the error before releasing it.
 func (s *nativeStream) closeOperationErr(err error) error {
 	if err == nil {
 		return nil

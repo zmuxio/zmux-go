@@ -6574,10 +6574,12 @@ func TestStatsReasonCountersBoundDistinctCodes(t *testing.T) {
 func TestStatsTrackBlockedWriteAndOpenLatency(t *testing.T) {
 	t.Parallel()
 
-	serverCfg := DefaultConfig()
-	serverCfg.Settings.InitialMaxStreamDataBidiPeerOpened = 0
-
-	client, _ := newConnPairWithConfig(t, nil, serverCfg)
+	// A raw peer stands in for a receiver that never grants credit.
+	clientCfg := DefaultConfig()
+	clientCfg.Role = RoleInitiator
+	peerSettings := DefaultSettings()
+	peerSettings.InitialMaxStreamDataBidiPeerOpened = 0
+	client, _ := newRawPeerConn(t, clientCfg, peerSettings)
 	ctx, cancel := testContext(t)
 	defer cancel()
 
@@ -7346,12 +7348,23 @@ func TestClearWriteQueueReservationsClearsPreparedPriorityBytes(t *testing.T) {
 func TestMarkerOnlyHardCapDefaultsToTrackedMemoryDerivedLimit(t *testing.T) {
 	c := newSessionMemoryTestConn()
 	c.mu.Lock()
-	c.flow.sessionMemoryCap = 3 * c.compactTerminalStateUnitLocked()
+	// Markers may use at most a quarter of the session memory hard cap.
+	c.flow.sessionMemoryCap = 12 * c.compactTerminalStateUnitLocked()
 	got := c.markerOnlyHardCapLocked()
+	c.retention.markerOnlyLimit = 2
+	lowerOverride := c.markerOnlyHardCapLocked()
+	c.retention.markerOnlyLimit = 100
+	higherOverride := c.markerOnlyHardCapLocked()
 	c.mu.Unlock()
 
 	if got != 3 {
 		t.Fatalf("markerOnlyHardCapLocked() = %d, want 3", got)
+	}
+	if lowerOverride != 2 {
+		t.Fatalf("markerOnlyHardCapLocked() with lower override = %d, want 2", lowerOverride)
+	}
+	if higherOverride != 3 {
+		t.Fatalf("markerOnlyHardCapLocked() with override above the memory bound = %d, want 3", higherOverride)
 	}
 }
 
@@ -7610,6 +7623,7 @@ func TestReleaseWriteQueueReservationMemoryWakeDoesNotSuppressStreamWake(t *test
 	c.flow.queuedDataBytes = 10
 	stream.queuedDataBytes = 5
 	wake := c.currentWriteWakeLocked()
+	streamWake := stream.ensureWriteNotifyLocked()
 	c.mu.Unlock()
 
 	c.releaseWriteQueueReservation(&req)
@@ -7620,7 +7634,7 @@ func TestReleaseWriteQueueReservationMemoryWakeDoesNotSuppressStreamWake(t *test
 		t.Fatal("expected memory release to broadcast global write wake")
 	}
 	select {
-	case <-stream.writeNotify:
+	case <-streamWake:
 	default:
 		t.Fatal("expected memory release not to suppress per-stream wake")
 	}
@@ -9307,8 +9321,10 @@ func TestCloseSessionReleasesStreamBuffersAndBudgets(t *testing.T) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if got := c.flow.sendSessionUsed; got != 0 {
-		t.Fatalf("sendSessionUsed = %d, want 0", got)
+	// Committed DATA stays counted in the session send total; only per-stream
+	// accounting and receive-side budgets are released.
+	if got, want := c.flow.sendSessionUsed, uint64(3+5+7); got != want {
+		t.Fatalf("sendSessionUsed = %d, want %d", got, want)
 	}
 	if got := c.flow.recvSessionUsed; got != 0 {
 		t.Fatalf("recvSessionUsed = %d, want 0", got)
@@ -9574,6 +9590,10 @@ func TestBlockedWriteUnblockedByPeerClose(t *testing.T) {
 	serverCfg.Settings.InitialMaxData = 1
 	serverCfg.Settings.InitialMaxStreamDataBidiPeerOpened = 1
 	serverCfg.Settings.InitialMaxStreamDataBidiLocallyOpened = 1
+	// With the first byte unread, high watermarks of 1 forbid standing-credit
+	// growth, so the client's BLOCKED gets no grant and the write keeps waiting.
+	serverCfg.PerStreamQueuedDataHWM = 1
+	serverCfg.SessionQueuedDataHWM = 1
 
 	client, server := newConnPairWithConfig(t, nil, serverCfg)
 	ctx, cancel := testContext(t)
@@ -11089,6 +11109,7 @@ func newHandlerTestConnWithOptions(t *testing.T, autoFlushTerminalControl bool) 
 			case <-stop:
 				return
 			case req := <-c.writer.writeCh:
+				testWriterTakeRequest(c, req)
 				for _, frame := range req.frames {
 					frames <- testPublicFrame(frame)
 				}
@@ -11096,6 +11117,7 @@ func newHandlerTestConnWithOptions(t *testing.T, autoFlushTerminalControl bool) 
 					req.done <- nil
 				}
 			case req := <-c.writer.urgentWriteCh:
+				testWriterTakeRequest(c, req)
 				for _, frame := range req.frames {
 					frames <- testPublicFrame(frame)
 				}
@@ -11156,6 +11178,14 @@ func newHandlerTestConnWithOptions(t *testing.T, autoFlushTerminalControl bool) 
 			t.Fatal("handler test control flush loop did not exit")
 		}
 	}
+}
+
+// testWriterTakeRequest mirrors the real writer committing req to a batch,
+// which hands a held local opener turn on to the next same-class stream.
+func testWriterTakeRequest(c *Conn, req writeRequest) {
+	c.mu.Lock()
+	c.releaseLocalOpenerTurnsForBatchLocked([]writeRequest{req})
+	c.mu.Unlock()
 }
 
 func newHandlerTestConn(t *testing.T) (*Conn, chan Frame, func()) {
@@ -11639,7 +11669,7 @@ func TestCompactTerminalStateClosesSessionWhenMarkerOnlyMemoryExceedsCap(t *test
 	}
 }
 
-func TestMarkerOnlyUsedStreamLimitOverrideClosesSessionWhenEntriesExceeded(t *testing.T) {
+func TestMarkerOnlyUsedStreamLimitOverrideCoarsensInsteadOfClosingSession(t *testing.T) {
 	c, _, stop := newInvalidFrameConn(t, 0)
 	defer stop()
 
@@ -11653,16 +11683,28 @@ func TestMarkerOnlyUsedStreamLimitOverrideClosesSessionWhenEntriesExceeded(t *te
 		8: {action: lateDataAbortState, cause: lateDataCauseAbort},
 	}
 	c.enforceTerminalBookkeepingMemoryCapLocked()
+	retained := c.markerOnlyRetainedLocked()
+	first, firstOK := c.usedStreamMarkerForLocked(4)
+	second, secondOK := c.usedStreamMarkerForLocked(8)
+	_, unusedOK := c.usedStreamMarkerForLocked(12)
 	c.mu.Unlock()
 
 	select {
 	case <-c.lifecycle.closedCh:
-	case <-time.After(testSignalTimeout):
-		t.Fatal("timed out waiting for session close after marker-only entry limit was exceeded")
+		t.Fatalf("session closed after marker-only entry limit was exceeded: %v", c.err())
+	default:
 	}
-
-	if !IsErrorCode(c.err(), CodeInternal) {
-		t.Fatalf("stored session err = %v, want %s", c.err(), CodeInternal)
+	if retained > 1 {
+		t.Fatalf("markerOnlyRetainedLocked() = %d, want <= 1", retained)
+	}
+	if !firstOK || !sameUsedStreamMarker(first, coarsenedUsedStreamMarker) {
+		t.Fatalf("marker for coarsened stream 4 = (%+v,%v), want %+v,true", first, firstOK, coarsenedUsedStreamMarker)
+	}
+	if !secondOK || !sameUsedStreamMarker(second, coarsenedUsedStreamMarker) {
+		t.Fatalf("marker for coarsened stream 8 = (%+v,%v), want %+v,true", second, secondOK, coarsenedUsedStreamMarker)
+	}
+	if unusedOK {
+		t.Fatal("stream 12 above the coarsened floor reads as used")
 	}
 }
 
@@ -11681,7 +11723,7 @@ func TestCompactMarkerOnlyRangesAccountMergedRangeAsSingleEntry(t *testing.T) {
 	rangeMode := c.registry.usedStreamRangeMode
 	retained := c.markerOnlyRetainedLocked()
 	tracked := c.trackedRetainedStateMemoryLocked()
-	capErr := c.markerOnlyCapErrorLocked("test marker-only ranges")
+	budget := c.markerOnlyHardCapLocked()
 	got, ok := c.usedStreamMarkerForLocked(4 + 63*4)
 	c.mu.Unlock()
 
@@ -11697,8 +11739,8 @@ func TestCompactMarkerOnlyRangesAccountMergedRangeAsSingleEntry(t *testing.T) {
 	if tracked != c.compactTerminalStateUnitLocked() {
 		t.Fatalf("tracked retained marker memory = %d, want %d", tracked, c.compactTerminalStateUnitLocked())
 	}
-	if capErr != nil {
-		t.Fatalf("markerOnlyCapErrorLocked() = %v, want nil for one merged range entry", capErr)
+	if retained > budget {
+		t.Fatalf("markerOnlyRetainedLocked() = %d, want within budget %d for one merged range entry", retained, budget)
 	}
 	if !ok || !sameUsedStreamMarker(got, marker) {
 		t.Fatalf("used marker lookup = (%+v,%v), want %+v,true", got, ok, marker)
@@ -11712,7 +11754,7 @@ func TestRangeModeMarkUsedStreamDropsStaleMapEntry(t *testing.T) {
 
 	c.mu.Lock()
 	c.registry.usedStreamRangeMode = true
-	c.registry.usedStreamRanges = []usedStreamRange{{
+	c.registry.usedStreamRanges[usedStreamClass(streamID)] = []usedStreamRange{{
 		start:  streamID,
 		end:    streamID,
 		marker: usedStreamMarker{action: lateDataAbortClosed, cause: lateDataCauseCloseRead},
@@ -13583,9 +13625,7 @@ func TestLastValidLocalStreamIDCommitsWithoutReuseThenNextOpenFails(t *testing.T
 	}
 
 	_, err = c.OpenStream(ctx)
-	if !IsErrorCode(err, CodeProtocol) {
-		t.Fatalf("open after last valid local stream id err = %v, want %s", err, CodeProtocol)
-	}
+	assertLocalStreamIDsExhaustedErr(t, err)
 
 	c.mu.Lock()
 	if len(c.queues.provisionalBidi.items) != 0 || c.queues.provisionalBidi.count != 0 {
@@ -13595,12 +13635,72 @@ func TestLastValidLocalStreamIDCommitsWithoutReuseThenNextOpenFails(t *testing.T
 		t.Fatalf("committed last-slot stream %d missing after exhausted-open rejection", last)
 	}
 	c.mu.Unlock()
+
+	// Exhaustion starts graceful replacement with one GOAWAY that keeps the
+	// current (permissive) watermarks.
+	assertExhaustionGoAway(t, c, awaitQueuedFrame(t, frames))
+	_, err = c.OpenStream(ctx)
+	assertLocalStreamIDsExhaustedErr(t, err)
+	assertNoQueuedFrame(t, frames)
+
+	// The other stream ID class is unaffected.
+	uni, err := c.OpenUniStream(ctx)
+	if err != nil {
+		t.Fatalf("open uni stream after bidi exhaustion: %v", err)
+	}
+	if _, err := uni.Write([]byte("u")); err != nil {
+		t.Fatalf("write uni stream after bidi exhaustion: %v", err)
+	}
+	if frame := awaitQueuedFrame(t, frames); frame.Type != FrameTypeDATA || frame.StreamID != uni.StreamID() {
+		t.Fatalf("queued frame after bidi exhaustion = %+v, want uni DATA opener", frame)
+	}
+}
+
+func assertLocalStreamIDsExhaustedErr(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrOpenLimited) || !errors.Is(err, errLocalStreamIDsExhausted) {
+		t.Fatalf("open after local stream ID exhaustion err = %v, want %v", err, errLocalStreamIDsExhausted)
+	}
+	if _, ok := ErrorCodeOf(err); ok {
+		t.Fatalf("open after local stream ID exhaustion err = %v, want a local error without a wire code", err)
+	}
+	var structured *Error
+	if !errors.As(err, &structured) || structured.Source != SourceLocal || structured.Operation != OperationOpen {
+		t.Fatalf("open after local stream ID exhaustion err = %#v, want local open error", err)
+	}
+}
+
+func assertExhaustionGoAway(t *testing.T, c *Conn, frame Frame) {
+	t.Helper()
+	if frame.Type != FrameTypeGOAWAY {
+		t.Fatalf("queued frame after local stream ID exhaustion = %+v, want GOAWAY", frame)
+	}
+	goAway, err := parseGOAWAYPayload(frame.Payload)
+	if err != nil {
+		t.Fatalf("parse GOAWAY: %v", err)
+	}
+	localRole := c.config.negotiated.LocalRole
+	if want := maxPeerGoAwayWatermark(localRole, streamArityBidi); goAway.LastAcceptedBidi != want {
+		t.Fatalf("GOAWAY bidi watermark = %d, want non-tightening %d", goAway.LastAcceptedBidi, want)
+	}
+	if want := maxPeerGoAwayWatermark(localRole, streamArityUni); goAway.LastAcceptedUni != want {
+		t.Fatalf("GOAWAY uni watermark = %d, want non-tightening %d", goAway.LastAcceptedUni, want)
+	}
+	if goAway.Code != uint64(CodeNoError) {
+		t.Fatalf("GOAWAY code = %d, want NO_ERROR", goAway.Code)
+	}
+	c.mu.Lock()
+	sessionState := c.lifecycle.sessionState
+	c.mu.Unlock()
+	if sessionState != connStateDraining {
+		t.Fatalf("session state after local stream ID exhaustion = %d, want draining", sessionState)
+	}
 }
 
 func TestProjectedLocalOpenExhaustionFailsBeforeCreatingGap(t *testing.T) {
 	t.Parallel()
 
-	c, _, stop := newHandlerTestConn(t)
+	c, frames, stop := newHandlerTestConn(t)
 	defer stop()
 
 	ctx, cancel := testContext(t)
@@ -13624,9 +13724,8 @@ func TestProjectedLocalOpenExhaustionFailsBeforeCreatingGap(t *testing.T) {
 	}
 
 	_, err = c.OpenStream(ctx)
-	if !IsErrorCode(err, CodeProtocol) {
-		t.Fatalf("third provisional beyond projected stream id range err = %v, want %s", err, CodeProtocol)
-	}
+	assertLocalStreamIDsExhaustedErr(t, err)
+	assertExhaustionGoAway(t, c, awaitQueuedFrame(t, frames))
 
 	c.mu.Lock()
 	if got := c.provisionalCountLocked(streamArityBidi); got != 2 {
@@ -13873,6 +13972,7 @@ func TestPeerDataOpenerRefusedByIncomingLimitDoesNotAccumulateLateData(t *testin
 	c.config.local.Settings.MaxIncomingStreamsBidi = 0
 	c.ingress.aggregateLateData = 3
 	c.ingress.hiddenUnreadBytesDiscarded = 5
+	beforeReceived := c.flow.recvSessionReceived
 	beforeAdvertised := c.flow.recvSessionAdvertised
 	c.mu.Unlock()
 
@@ -13895,8 +13995,13 @@ func TestPeerDataOpenerRefusedByIncomingLimitDoesNotAccumulateLateData(t *testin
 	if c.ingress.hiddenUnreadBytesDiscarded != 5 {
 		t.Fatalf("hiddenUnreadBytesDiscarded = %d, want 5", c.ingress.hiddenUnreadBytesDiscarded)
 	}
-	if c.flow.recvSessionAdvertised != beforeAdvertised {
-		t.Fatalf("recvSessionAdvertised = %d, want %d", c.flow.recvSessionAdvertised, beforeAdvertised)
+	// The refused opener's byte is counted and released again (SPEC §8), but
+	// it is not late data.
+	if c.flow.recvSessionReceived != beforeReceived+1 {
+		t.Fatalf("recvSessionReceived = %d, want %d", c.flow.recvSessionReceived, beforeReceived+1)
+	}
+	if c.flow.recvSessionAdvertised != beforeAdvertised+1 {
+		t.Fatalf("recvSessionAdvertised = %d, want %d", c.flow.recvSessionAdvertised, beforeAdvertised+1)
 	}
 	if len(c.registry.streams) != 0 {
 		t.Fatalf("live streams after refused DATA opener = %d, want 0", len(c.registry.streams))
@@ -13953,7 +14058,7 @@ func TestPeerAbortOpenerRefusedByIncomingLimitSkipsNoOpControlSideEffects(t *tes
 	}
 }
 
-func TestRefusedPeerDataOpenerSkipsPayloadParse(t *testing.T) {
+func TestRefusedPeerDataOpenerSkipsMetadataParse(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -13990,15 +14095,18 @@ func TestRefusedPeerDataOpenerSkipsPayloadParse(t *testing.T) {
 
 			c.mu.Lock()
 			tc.configure(c)
+			beforeReceived := c.flow.recvSessionReceived
 			c.mu.Unlock()
 
+			// metadata_len 2 covers a truncated TLV, which a refusal never
+			// interprets; the 3 trailing application bytes are still counted.
 			if err := c.handleDataFrame(Frame{
 				Type:     FrameTypeDATA,
 				Flags:    FrameFlagOpenMetadata,
 				StreamID: streamID,
-				Payload:  []byte{0xff},
+				Payload:  []byte{0x02, 0x01, 0x05, 'a', 'p', 'p'},
 			}); err != nil {
-				t.Fatalf("handle malformed refused DATA opener: %v", err)
+				t.Fatalf("handle refused DATA opener with malformed metadata TLV: %v", err)
 			}
 
 			assertInvalidQueuedAbortCode(t, frames, streamID, CodeRefusedStream)
@@ -14007,10 +14115,62 @@ func TestRefusedPeerDataOpenerSkipsPayloadParse(t *testing.T) {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			if len(c.registry.streams) != 0 {
-				t.Fatalf("live streams after refused malformed DATA opener = %d, want 0", len(c.registry.streams))
+				t.Fatalf("live streams after refused DATA opener = %d, want 0", len(c.registry.streams))
 			}
 			if got := c.hasTerminalMarkerLocked(streamID); got != tc.wantTerminalMarker {
 				t.Fatalf("terminal marker present = %t, want %t", got, tc.wantTerminalMarker)
+			}
+			if got := c.flow.recvSessionReceived - beforeReceived; got != 3 {
+				t.Fatalf("refused opener counted %d session bytes, want 3 application bytes", got)
+			}
+		})
+	}
+}
+
+func TestRefusedPeerDataOpenerWithMalformedMetadataLengthFailsFrameSize(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		configure func(*Conn)
+	}{
+		{
+			name: "incoming_limit",
+			configure: func(c *Conn) {
+				c.config.local.Settings.MaxIncomingStreamsBidi = 0
+			},
+		},
+		{
+			name: "local_goaway",
+			configure: func(c *Conn) {
+				c.sessionControl.localGoAwayBidi = 0
+				c.sessionControl.localGoAwayUni = 0
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			c, _, stop := newInvalidFrameConn(t, CapabilityOpenMetadata)
+			defer stop()
+
+			c.mu.Lock()
+			tc.configure(c)
+			c.mu.Unlock()
+
+			// The refused opener's application length is still needed for
+			// session accounting, so a malformed metadata_len is FRAME_SIZE.
+			err := c.handleDataFrame(Frame{
+				Type:     FrameTypeDATA,
+				Flags:    FrameFlagOpenMetadata,
+				StreamID: state.FirstPeerStreamID(c.config.negotiated.LocalRole, true),
+				Payload:  []byte{0xff},
+			})
+			if !IsErrorCode(err, CodeFrameSize) {
+				t.Fatalf("handle refused DATA opener with truncated metadata_len err = %v, want %s", err, CodeFrameSize)
 			}
 		})
 	}
@@ -17738,7 +17898,7 @@ func TestLateDataAfterSendAbortWhenSessionBudgetExceededReturnsFlowControl(t *te
 	}
 }
 
-func TestLateDataAfterFullyTerminalLiveStreamIsIgnored(t *testing.T) {
+func TestLateDataAfterFullyTerminalLiveStreamAbortsStreamClosed(t *testing.T) {
 	c, frames, stop := newInvalidFrameConn(t, 0)
 	defer stop()
 
@@ -17752,12 +17912,11 @@ func TestLateDataAfterFullyTerminalLiveStreamIsIgnored(t *testing.T) {
 
 	c.mu.Lock()
 	beforeSessionAdvertised := c.flow.recvSessionAdvertised
-	beforeRecvAdvertised := stream.recvAdvertised
-	beforeRecvBuffer := stream.recvBuffer
-	beforeReadBufLen := len(stream.readBuf)
-	beforeLateData := stream.lateDataReceived
+	beforeLateData := c.ingress.aggregateLateData
 	c.mu.Unlock()
 
+	// DATA after an observed peer FIN is a stream-state violation even though
+	// the stream is already fully terminal but not yet compacted (SPEC §9.2).
 	if err := c.handleDataFrame(Frame{
 		Type:     FrameTypeDATA,
 		StreamID: stream.id,
@@ -17766,30 +17925,21 @@ func TestLateDataAfterFullyTerminalLiveStreamIsIgnored(t *testing.T) {
 		t.Fatalf("late DATA after fully terminal live stream err = %v", err)
 	}
 
-	assertNoQueuedFrame(t, frames)
+	assertInvalidQueuedAbortCode(t, frames, stream.id, CodeStreamClosed)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.flow.recvSessionReceived != 4 {
+		t.Fatalf("recvSessionReceived = %d, want 4", c.flow.recvSessionReceived)
+	}
 	if c.flow.recvSessionAdvertised != beforeSessionAdvertised+4 {
 		t.Fatalf("recvSessionAdvertised = %d, want %d", c.flow.recvSessionAdvertised, beforeSessionAdvertised+4)
 	}
-	if stream.recvAdvertised != beforeRecvAdvertised {
-		t.Fatalf("recvAdvertised = %d, want %d", stream.recvAdvertised, beforeRecvAdvertised)
+	if stream.lateDataReceived != 0 || c.ingress.aggregateLateData != beforeLateData {
+		t.Fatalf("late data = (stream %d, aggregate %d), want (0, %d): DATA after FIN is not late tail", stream.lateDataReceived, c.ingress.aggregateLateData, beforeLateData)
 	}
-	if stream.recvBuffer != beforeRecvBuffer {
-		t.Fatalf("recvBuffer = %d, want %d", stream.recvBuffer, beforeRecvBuffer)
-	}
-	if len(stream.readBuf) != beforeReadBufLen {
-		t.Fatalf("readBuf len = %d, want %d", len(stream.readBuf), beforeReadBufLen)
-	}
-	if stream.lateDataReceived != beforeLateData {
-		t.Fatalf("lateDataReceived = %d, want %d", stream.lateDataReceived, beforeLateData)
-	}
-	if stream.sendHalfState() != state.SendHalfReset {
-		t.Fatalf("sendHalf = %v, want send_reset", stream.sendHalfState())
-	}
-	if stream.recvHalfState() != state.RecvHalfFin {
-		t.Fatalf("recvHalf = %v, want recv_fin", stream.recvHalfState())
+	if stream.recvAbort == nil || stream.recvAbort.Code != uint64(CodeStreamClosed) {
+		t.Fatalf("recvAbort = %v, want CODE_STREAM_CLOSED", stream.recvAbort)
 	}
 }
 
@@ -17999,7 +18149,7 @@ func TestLateDataAfterRecvAbortedWhenSessionWindowExceededReturnsFlowControl(t *
 	}
 }
 
-func TestLateDataAggregateCapAfterMultipleTerminalDirections(t *testing.T) {
+func TestLateDataAggregateCapOverflowDiscardsWithoutFailingSession(t *testing.T) {
 	c, _, stop := newInvalidFrameConn(t, 0)
 	defer stop()
 
@@ -18019,57 +18169,46 @@ func TestLateDataAggregateCapAfterMultipleTerminalDirections(t *testing.T) {
 
 	c.flow.recvSessionAdvertised = 100
 	c.flow.recvSessionReceived = 0
-	stream1.recvBuffer = 0
-	stream2.recvBuffer = 0
-	stream3.recvBuffer = 0
-	stream1.readBuf = nil
-	stream2.readBuf = nil
-	stream3.readBuf = nil
-	stream1.recvAdvertised = 0
-	stream2.recvAdvertised = 0
-	stream3.recvAdvertised = 0
+	for _, stream := range []*nativeStream{stream1, stream2, stream3} {
+		stream.recvBuffer = 0
+		stream.readBuf = nil
+		stream.recvReceived = 0
+		stream.recvAdvertised = 0
+	}
+	// The read-stopped direction still has one byte of advertised credit.
+	stream3.recvAdvertised = 1
 
-	if err := c.handleDataFrame(Frame{
-		Type:     FrameTypeDATA,
-		StreamID: stream1.id,
-		Payload:  []byte("x"),
-	}); err != nil {
-		t.Fatalf("late DATA on stream1 err = %v", err)
-	}
-	if err := c.handleDataFrame(Frame{
-		Type:     FrameTypeDATA,
-		StreamID: stream2.id,
-		Payload:  []byte("x"),
-	}); err != nil {
-		t.Fatalf("late DATA on stream2 err = %v", err)
-	}
-	err := c.handleDataFrame(Frame{
-		Type:     FrameTypeDATA,
-		StreamID: stream3.id,
-		Payload:  []byte("x"),
-	})
-	if !IsErrorCode(err, CodeProtocol) {
-		t.Fatalf("late DATA on stream3 err = %v, want %s", err, CodeProtocol)
+	for _, stream := range []*nativeStream{stream1, stream2, stream3} {
+		if err := c.handleDataFrame(Frame{
+			Type:     FrameTypeDATA,
+			StreamID: stream.id,
+			Payload:  []byte("x"),
+		}); err != nil {
+			t.Fatalf("late DATA on stream %d err = %v, want nil: aggregate overflow only discards", stream.id, err)
+		}
 	}
 
+	stats := c.Stats()
+	if !stats.Pressure.AggregateLateDataAtCap || stats.Pressure.AggregateLateData != 3 {
+		t.Fatalf("aggregate late data = (%d, atCap %v), want (3, true)", stats.Pressure.AggregateLateData, stats.Pressure.AggregateLateDataAtCap)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.ingress.aggregateLateData <= c.ingress.aggregateLateDataCap {
-		t.Fatalf("aggregateLateData = %d, want > %d", c.ingress.aggregateLateData, c.ingress.aggregateLateDataCap)
+	if c.lifecycle.closeErr != nil {
+		t.Fatalf("session failed after aggregate late-data overflow: %v", c.lifecycle.closeErr)
 	}
 	if c.flow.recvSessionAdvertised != 103 {
 		t.Fatalf("recvSessionAdvertised = %d, want %d", c.flow.recvSessionAdvertised, 103)
 	}
-	if stream1.recvAdvertised != 0 || stream2.recvAdvertised != 0 || stream3.recvAdvertised != 0 {
+	if stream1.recvAdvertised != 0 || stream2.recvAdvertised != 0 || stream3.recvAdvertised != 1 {
 		t.Fatalf("per-stream advertised changed: %d %d %d", stream1.recvAdvertised, stream2.recvAdvertised, stream3.recvAdvertised)
 	}
 }
 
-func TestLateDataPerStreamCapAfterCloseRead(t *testing.T) {
-	c, _, stop := newInvalidFrameConn(t, 0)
+func TestLateDataAfterCloseReadBeyondAdvertisedCreditAbortsFlowControl(t *testing.T) {
+	c, frames, stop := newInvalidFrameConn(t, 0)
 	defer stop()
 
-	c.ingress.aggregateLateDataCap = 0
 	c.ingress.lateDataPerStreamCap = 1
 	stream := seedStateFixtureStream(t, c, state.FirstPeerStreamID(c.config.negotiated.LocalRole, true), "bidi", "peer_owned", stateHalfExpect{
 		SendHalf: "send_open",
@@ -18077,38 +18216,52 @@ func TestLateDataPerStreamCapAfterCloseRead(t *testing.T) {
 	})
 	stream.recvBuffer = 0
 	stream.readBuf = nil
+	stream.recvReceived = 10
+	stream.recvAdvertised = 12
 
 	if err := stream.CloseRead(); err != nil {
 		t.Fatalf("local CloseRead: %v", err)
 	}
-
-	if err := c.handleDataFrame(Frame{
-		Type:     FrameTypeDATA,
-		StreamID: stream.id,
-		Payload:  []byte("a"),
-	}); err != nil {
-		t.Fatalf("first late DATA after CloseRead err = %v", err)
-	}
-
-	err := c.handleDataFrame(Frame{
-		Type:     FrameTypeDATA,
-		StreamID: stream.id,
-		Payload:  []byte("b"),
-	})
-	if !IsErrorCode(err, CodeProtocol) {
-		t.Fatalf("second late DATA after CloseRead err = %v, want %s", err, CodeProtocol)
+	if queued := awaitQueuedFrame(t, frames); queued.Type != FrameTypeStopSending {
+		t.Fatalf("queued frame type = %v, want %v", queued.Type, FrameTypeStopSending)
 	}
 
 	c.mu.Lock()
+	sessionAdvertisedBefore := c.flow.recvSessionAdvertised
+	sessionReceivedBefore := c.flow.recvSessionReceived
+	allowance := c.effectiveLateDataPerStreamCapLocked(stream)
+	c.mu.Unlock()
+	if !allowance.enabled || allowance.value != 2 {
+		t.Fatalf("late-data allowance = %+v, want outstanding credit 2 above the floor of 1", allowance)
+	}
+
+	// The two bytes still in flight under the advertised credit are late tail,
+	// discarded without any session error.
+	if err := c.handleDataFrame(Frame{Type: FrameTypeDATA, StreamID: stream.id, Payload: []byte("ab")}); err != nil {
+		t.Fatalf("in-credit late DATA after CloseRead err = %v, want nil", err)
+	}
+	assertNoQueuedFrame(t, frames)
+
+	// One byte beyond the frozen advertised limit is a stream FLOW_CONTROL
+	// violation on the live read-stopped direction, not a session error.
+	if err := c.handleDataFrame(Frame{Type: FrameTypeDATA, StreamID: stream.id, Payload: []byte("c")}); err != nil {
+		t.Fatalf("over-credit late DATA after CloseRead err = %v, want nil and stream ABORT", err)
+	}
+	assertInvalidQueuedAbortCode(t, frames, stream.id, CodeFlowControl)
+
+	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.lifecycle.closeErr != nil {
+		t.Fatalf("session failed: %v", c.lifecycle.closeErr)
+	}
 	if stream.lateDataReceived != 2 {
-		t.Fatalf("lateDataReceived = %d, want %d", stream.lateDataReceived, 2)
+		t.Fatalf("lateDataReceived = %d, want 2", stream.lateDataReceived)
 	}
-	if c.ingress.lateDataPerStreamCap != 1 {
-		t.Fatalf("lateDataPerStreamCap = %d, want %d", c.ingress.lateDataPerStreamCap, 1)
+	if c.flow.recvSessionReceived != sessionReceivedBefore+3 || c.flow.recvSessionAdvertised != sessionAdvertisedBefore+3 {
+		t.Fatalf("session (received, advertised) = (%d, %d), want (%d, %d)", c.flow.recvSessionReceived, c.flow.recvSessionAdvertised, sessionReceivedBefore+3, sessionAdvertisedBefore+3)
 	}
-	if c.ingress.aggregateLateData != 2 {
-		t.Fatalf("aggregateLateData = %d, want %d", c.ingress.aggregateLateData, 2)
+	if stream.recvAdvertised != 12 {
+		t.Fatalf("recvAdvertised = %d, want 12 (no stream credit after STOP_SENDING)", stream.recvAdvertised)
 	}
 }
 
@@ -18180,6 +18333,12 @@ func TestDefaultLateDataPerStreamCapAfterCloseReadUsesInitialWindowFraction(t *t
 
 	if err := stream.CloseRead(); err != nil {
 		t.Fatalf("local CloseRead: %v", err)
+	}
+	// After the peer RESET the direction no longer enforces stream credit, so
+	// only the late-data allowance bounds what a non-compliant peer may send:
+	// max(floor 1 KiB, outstanding credit 24) = 1 KiB.
+	if err := c.handleResetFrame(Frame{Type: FrameTypeRESET, StreamID: stream.id, Payload: mustEncodeVarint(uint64(CodeCancelled))}); err != nil {
+		t.Fatalf("peer RESET after CloseRead: %v", err)
 	}
 
 	if err := c.handleDataFrame(Frame{
@@ -18349,7 +18508,7 @@ func TestLateDataAfterRecvStopSentWhenSessionBudgetExceededReturnsFlowControl(t 
 	}
 }
 
-func TestLateDataAfterPeerFinNoBudgetSideEffects(t *testing.T) {
+func TestLateDataAfterPeerFinRestoresSessionBudget(t *testing.T) {
 	c, _, stop := newInvalidFrameConn(t, 0)
 	defer stop()
 
@@ -18384,17 +18543,22 @@ func TestLateDataAfterPeerFinNoBudgetSideEffects(t *testing.T) {
 	if stream.recvAbort == nil || stream.recvAbort.Code != uint64(CodeStreamClosed) {
 		t.Fatalf("recvAbort = %v, want CODE_STREAM_CLOSED", stream.recvAbort)
 	}
-	if c.flow.recvSessionAdvertised != beforeSessionAdvertised {
-		t.Fatalf("recvSessionAdvertised = %d, want %d", c.flow.recvSessionAdvertised, beforeSessionAdvertised)
+	// The sender counted the rejected byte against its session window, so it
+	// is counted here too and released again (SPEC §8).
+	if c.flow.recvSessionReceived != beforeSessionReceived+1 {
+		t.Fatalf("recvSessionReceived = %d, want %d", c.flow.recvSessionReceived, beforeSessionReceived+1)
 	}
-	if c.flow.recvSessionReceived != beforeSessionReceived {
-		t.Fatalf("recvSessionReceived = %d, want %d", c.flow.recvSessionReceived, beforeSessionReceived)
+	if c.flow.recvSessionAdvertised != beforeSessionAdvertised+1 {
+		t.Fatalf("recvSessionAdvertised = %d, want %d", c.flow.recvSessionAdvertised, beforeSessionAdvertised+1)
 	}
 	if stream.recvAdvertised != beforeRecvAdvertised {
 		t.Fatalf("recvAdvertised = %d, want %d", stream.recvAdvertised, beforeRecvAdvertised)
 	}
 	if stream.recvBuffer != 0 {
 		t.Fatalf("recvBuffer = %d, want 0", stream.recvBuffer)
+	}
+	if stream.lateDataReceived != 0 || c.ingress.aggregateLateData != 0 {
+		t.Fatalf("late data = (stream %d, aggregate %d), want 0/0", stream.lateDataReceived, c.ingress.aggregateLateData)
 	}
 }
 
@@ -18450,8 +18614,10 @@ func TestStatsTrackLateDataDiagnosticsByCause(t *testing.T) {
 	if got := stats.Diagnostics.LateDataAfterAbort; got != 1 {
 		t.Fatalf("late data after ABORT = %d, want 1", got)
 	}
-	if got := stats.Pressure.AggregateLateData; got != 4 {
-		t.Fatalf("aggregate late data = %d, want 4", got)
+	// The marker-only discard has no stream or tombstone that retains it, so it
+	// only shows up in the per-cause diagnostics, not the aggregate.
+	if got := stats.Pressure.AggregateLateData; got != 3 {
+		t.Fatalf("aggregate late data = %d, want 3", got)
 	}
 }
 
@@ -18577,7 +18743,7 @@ func TestLateDataOnGracefulTerminalTombstoneCountsAgainstSessionLimit(t *testing
 	}
 }
 
-func TestLateDataOnGracefulTerminalTombstoneCountsAggregateCap(t *testing.T) {
+func TestDataAfterFinOnGracefulTombstoneSkipsLateDataCaps(t *testing.T) {
 	c, frames, stop := newInvalidFrameConn(t, 0)
 	defer stop()
 
@@ -18590,47 +18756,53 @@ func TestLateDataOnGracefulTerminalTombstoneCountsAggregateCap(t *testing.T) {
 	c.mu.Lock()
 	c.maybeCompactTerminalLocked(stream)
 	c.ingress.aggregateLateDataCap = 1
+	c.ingress.lateDataPerStreamCap = 1
+	sessionReceivedBefore := c.flow.recvSessionReceived
+	sessionAdvertisedBefore := c.flow.recvSessionAdvertised
 	c.mu.Unlock()
 
-	if err := c.handleDataFrame(Frame{
-		Type:     FrameTypeDATA,
-		StreamID: streamID,
-		Payload:  []byte("a"),
-	}); err != nil {
-		t.Fatalf("first late DATA on graceful tombstone err = %v", err)
+	// DATA after FIN is rejected with ABORT(STREAM_CLOSED) every time; it is a
+	// stream-state violation, not late tail, so the late-data caps never trip.
+	for _, payload := range []string{"a", "bc", "def"} {
+		if err := c.handleDataFrame(Frame{
+			Type:     FrameTypeDATA,
+			StreamID: streamID,
+			Payload:  []byte(payload),
+		}); err != nil {
+			t.Fatalf("DATA %q on graceful tombstone err = %v, want nil", payload, err)
+		}
+		assertInvalidQueuedAbortCode(t, frames, streamID, CodeStreamClosed)
 	}
-	assertInvalidQueuedAbortCode(t, frames, streamID, CodeStreamClosed)
 
-	err := c.handleDataFrame(Frame{
-		Type:     FrameTypeDATA,
-		StreamID: streamID,
-		Payload:  []byte("b"),
-	})
-	if !IsErrorCode(err, CodeProtocol) {
-		t.Fatalf("second late DATA on graceful tombstone err = %v, want %s", err, CodeProtocol)
-	}
 	c.mu.Lock()
-	aggregateLateData := c.ingress.aggregateLateData
-	c.mu.Unlock()
-	if aggregateLateData <= 1 {
-		t.Fatalf("aggregateLateData = %d, want > 1", aggregateLateData)
+	defer c.mu.Unlock()
+	tombstone := c.registry.tombstones[streamID]
+	if tombstone.LateDataReceived != 0 || c.ingress.aggregateLateData != 0 {
+		t.Fatalf("late data = (tombstone %d, aggregate %d), want 0/0", tombstone.LateDataReceived, c.ingress.aggregateLateData)
+	}
+	if c.flow.recvSessionReceived != sessionReceivedBefore+6 || c.flow.recvSessionAdvertised != sessionAdvertisedBefore+6 {
+		t.Fatalf("session (received, advertised) = (%d, %d), want (%d, %d)", c.flow.recvSessionReceived, c.flow.recvSessionAdvertised, sessionReceivedBefore+6, sessionAdvertisedBefore+6)
 	}
 }
 
-func TestLateDataOnGracefulTerminalTombstoneCountsPerStreamCap(t *testing.T) {
+func TestLateDataOnResetTombstoneCountsPerStreamCap(t *testing.T) {
 	c, frames, stop := newInvalidFrameConn(t, 0)
 	defer stop()
 
 	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
 	stream := seedStateFixtureStream(t, c, streamID, "bidi", "peer_owned", stateHalfExpect{
 		SendHalf: "send_fin",
-		RecvHalf: "recv_fin",
+		RecvHalf: "recv_reset",
 	})
 
 	c.mu.Lock()
 	c.ingress.aggregateLateDataCap = 0
 	c.ingress.lateDataPerStreamCap = 1
 	c.maybeCompactTerminalLocked(stream)
+	if _, ok := c.registry.tombstones[streamID]; !ok {
+		c.mu.Unlock()
+		t.Fatalf("stream %d missing tombstone after reset compaction", streamID)
+	}
 	c.mu.Unlock()
 
 	if err := c.handleDataFrame(Frame{
@@ -18638,9 +18810,9 @@ func TestLateDataOnGracefulTerminalTombstoneCountsPerStreamCap(t *testing.T) {
 		StreamID: streamID,
 		Payload:  []byte("a"),
 	}); err != nil {
-		t.Fatalf("first late DATA on graceful tombstone err = %v", err)
+		t.Fatalf("first late DATA on reset tombstone err = %v", err)
 	}
-	assertInvalidQueuedAbortCode(t, frames, streamID, CodeStreamClosed)
+	assertNoQueuedFrame(t, frames)
 
 	err := c.handleDataFrame(Frame{
 		Type:     FrameTypeDATA,
@@ -18648,7 +18820,7 @@ func TestLateDataOnGracefulTerminalTombstoneCountsPerStreamCap(t *testing.T) {
 		Payload:  []byte("b"),
 	})
 	if !IsErrorCode(err, CodeProtocol) {
-		t.Fatalf("second late DATA on graceful tombstone err = %v, want %s", err, CodeProtocol)
+		t.Fatalf("second late DATA on reset tombstone err = %v, want %s", err, CodeProtocol)
 	}
 	c.mu.Lock()
 	tombstone := c.registry.tombstones[streamID]
@@ -19611,6 +19783,50 @@ func TestClearSendFinRollsBackToExplicitBaseState(t *testing.T) {
 	}
 }
 
+// A CloseWrite whose queue attempt fails because a concurrent RESET or ABORT
+// already ended the send half must not rewind that terminal state. The
+// rollback used to restore stop_seen, so the CloseWrite task answering a peer
+// STOP_SENDING surfaced the stream's own abort as a session error.
+func TestCloseWriteRollbackKeepsConcurrentTerminalSendState(t *testing.T) {
+	c, _, stop := newInvalidFrameConn(t, 0)
+	defer stop()
+
+	appErr := &ApplicationError{Code: uint64(CodeCancelled)}
+	rollback := terminalQueueExecution{hooks: terminalQueueHooks{rollback: terminalFrameRollbackCloseWrite}}
+	firstID := state.FirstLocalStreamID(c.config.negotiated.LocalRole, true)
+	tests := []struct {
+		name          string
+		end           func(*nativeStream)
+		want          state.SendHalfState
+		wantStopReset bool
+	}{
+		{name: "no_concurrent_terminal", end: func(*nativeStream) {}, want: state.SendHalfStopSeen},
+		{name: "local_abort", end: func(s *nativeStream) {
+			s.setAbortedWithSource(appErr, terminalAbortLocal)
+		}, want: state.SendHalfAborted},
+		{name: "reset_after_stop_sending", end: func(s *nativeStream) {
+			s.setSendResetWithSource(appErr, terminalResetFromStopSending)
+		}, want: state.SendHalfReset, wantStopReset: true},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testBuildStream(c, firstID+uint64(4*i), testWithVisibleLocalBidi())
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			s.setSendStopSeen(appErr)
+			s.setSendFin()
+			tc.end(s)
+			rollback.handleLockedPostQueue(s, queuedWriteResult{err: appErr})
+			if got := s.sendHalfState(); got != tc.want {
+				t.Fatalf("sendHalfState() = %v, want %v", got, tc.want)
+			}
+			if got := s.sendResetFromStopLocked(); got != tc.wantStopReset {
+				t.Fatalf("sendResetFromStopLocked() = %v, want %v", got, tc.wantStopReset)
+			}
+		})
+	}
+}
+
 func TestLateNonOpeningControlOnHiddenTombstoneIgnored(t *testing.T) {
 	c, frames, stop := newInvalidFrameConn(t, 0)
 	defer stop()
@@ -20102,6 +20318,8 @@ var supportedStateFixtureIDs = map[string]bool{
 	"first_blocked_on_unused_stream_is_invalid":                                                     true,
 	"uni_wrong_direction_data_rejected":                                                             true,
 	"uni_wrong_direction_blocked_rejected":                                                          true,
+	"peer_data_on_unopened_local_uni_is_protocol_violation":                                         true,
+	"peer_blocked_on_unopened_local_uni_is_protocol_violation":                                      true,
 	"uni_wrong_side_max_data_rejected":                                                              true,
 	"uni_wrong_side_stop_sending_rejected":                                                          true,
 	"terminal_control_ignored":                                                                      true,
@@ -20852,6 +21070,10 @@ func seedStateFixtureStream(t *testing.T, c *Conn, streamID uint64, streamKind, 
 
 	switch initial.SendHalf {
 	case "", "send_open":
+	case "absent":
+		if stream.localSend {
+			t.Fatalf("initial send_half %q on stream %d that has a local send half", initial.SendHalf, streamID)
+		}
 	case "send_fin":
 		stream.sendHalf = state.SendHalfFin
 	case "send_stop_seen":
@@ -20869,6 +21091,10 @@ func seedStateFixtureStream(t *testing.T, c *Conn, streamID uint64, streamKind, 
 
 	switch initial.RecvHalf {
 	case "", "recv_open":
+	case "absent":
+		if stream.localReceive {
+			t.Fatalf("initial recv_half %q on stream %d that has a local receive half", initial.RecvHalf, streamID)
+		}
 	case "recv_fin":
 		stream.recvHalf = state.RecvHalfFin
 	case "recv_reset":
@@ -22364,9 +22590,9 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 			c.mu.Unlock()
 			return fmt.Errorf("terminal marker missing for locally aborted stream %d", streamID)
 		}
-		if c.flow.recvSessionReceived != 0 || c.flow.recvSessionUsed != 0 {
+		if c.flow.recvSessionReceived != 1 || c.flow.recvSessionUsed != 0 || c.flow.recvSessionAdvertised != 2 {
 			c.mu.Unlock()
-			return fmt.Errorf("session recv accounting = (%d,%d), want 0/0", c.flow.recvSessionReceived, c.flow.recvSessionUsed)
+			return fmt.Errorf("session recv accounting = (received %d, used %d, advertised %d), want 1/0/2", c.flow.recvSessionReceived, c.flow.recvSessionUsed, c.flow.recvSessionAdvertised)
 		}
 		c.mu.Unlock()
 		select {
@@ -22385,6 +22611,8 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		c.mu.Lock()
 		c.flow.sendSessionMax = 0
 		wake := c.currentWriteWakeLocked()
+		streamAWake := streamA.ensureWriteNotifyLocked()
+		streamBWake := streamB.ensureWriteNotifyLocked()
 		c.mu.Unlock()
 		if err := c.handleMaxDataFrame(Frame{Type: FrameTypeMAXDATA, Payload: mustEncodeVarint(32)}); err != nil {
 			return fmt.Errorf("handle session MAX_DATA err = %v, want nil", err)
@@ -22395,12 +22623,12 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 			return fmt.Errorf("expected session MAX_DATA increase to close the connection-level write wake channel")
 		}
 		select {
-		case <-streamA.writeNotify:
+		case <-streamAWake:
 			return fmt.Errorf("session MAX_DATA increase should not need per-stream writeNotify for streamA")
 		default:
 		}
 		select {
-		case <-streamB.writeNotify:
+		case <-streamBWake:
 			return fmt.Errorf("session MAX_DATA increase should not need per-stream writeNotify for streamB")
 		default:
 		}
@@ -22420,7 +22648,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		go func() {
 			var parts [1][]byte
 			parts[0] = []byte("x")
-			step, err := stream.prepareWritePartsLocked(parts[:], 0, 0, 1, writeChunkStreaming)
+			step, err := testPrepareWritePartsLocked(stream, parts[:], 0, 0, 1, writeChunkStreaming)
 			resultCh <- struct {
 				step writeStep
 				err  error
@@ -22459,7 +22687,7 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		go func() {
 			var parts [1][]byte
 			parts[0] = []byte("x")
-			step, err := stream.prepareWritePartsLocked(parts[:], 0, 0, 1, writeChunkFinal)
+			step, err := testPrepareWritePartsLocked(stream, parts[:], 0, 0, 1, writeChunkFinal)
 			resultCh <- struct {
 				step writeStep
 				err  error
@@ -23109,6 +23337,10 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 				reservedStream: other,
 			},
 		}
+		stream.conn.mu.Lock()
+		streamWake := stream.ensureWriteNotifyLocked()
+		otherWake := other.ensureWriteNotifyLocked()
+		stream.conn.mu.Unlock()
 		stream.conn.releaseBatchReservations(batch)
 		stream.conn.mu.Lock()
 		if stream.inflightQueued != 0 {
@@ -23121,12 +23353,12 @@ func (e *stateFixtureEnv) applyStep(event string) error {
 		}
 		stream.conn.mu.Unlock()
 		select {
-		case <-stream.writeNotify:
+		case <-streamWake:
 		default:
 			return fmt.Errorf("stream writeNotify not signaled")
 		}
 		select {
-		case <-other.writeNotify:
+		case <-otherWake:
 		default:
 			return fmt.Errorf("other writeNotify not signaled")
 		}
@@ -25520,9 +25752,21 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 			t.Fatalf("event %q recvAdvertised = %d, want %d", step.Event, stream.recvAdvertised, wantStreamAdvertised)
 		}
 		assertQueuedMaxDataFrame(t, env, 0, env.conn.flow.recvSessionAdvertised)
-	case "stream_state_violation", "protocol_violation":
+	case "protocol_violation":
 		if !IsErrorCode(err, CodeProtocol) {
 			t.Fatalf("event %q err = %v, want %s", step.Event, err, CodeProtocol)
+		}
+		if appErr := (*ApplicationError)(nil); errors.As(err, &appErr) {
+			t.Fatalf("event %q err = %v, want a session PROTOCOL error, not a stream-local one", step.Event, err)
+		}
+		assertNoQueuedFrame(t, env.frames)
+	case "abort_stream_state":
+		if err != nil {
+			t.Fatalf("event %q err = %v, want nil with ABORT(STREAM_STATE) queued", step.Event, err)
+		}
+		expectQueuedStreamStateAbort(t, env.conn, env.frames, env.streamID)
+		if sessionErr := env.conn.err(); sessionErr != nil {
+			t.Fatalf("event %q session err = %v, want the session to stay open", step.Event, sessionErr)
 		}
 	case "internal_close":
 		if !IsErrorCode(err, CodeInternal) {
@@ -25668,7 +25912,7 @@ func assertStateFixtureStep(t *testing.T, env *stateFixtureEnv, step stateFixtur
 		if stream.recvAdvertised != wantStreamAdvertised {
 			t.Fatalf("event %q recvAdvertised = %d, want %d", step.Event, stream.recvAdvertised, wantStreamAdvertised)
 		}
-	case "per_direction_and_aggregate_late_tail_caps_apply", "additional_late_tail_is_discarded_or_local_policy_escalates":
+	case "per_direction_and_aggregate_late_tail_caps_apply", "additional_late_tail_is_discarded_with_session_budget_release":
 		if err != nil {
 			t.Fatalf("event %q err = %v, want nil", step.Event, err)
 		}
@@ -26532,7 +26776,7 @@ func TestStreamBlockedForcesPendingCreditFlushBelowPacingThreshold(t *testing.T)
 		pending:   connPendingControlState{controlNotify: make(chan struct{}, 1)},
 		lifecycle: connLifecycleState{sessionState: connStateReady}, config: connConfigState{local: Preface{Settings: settings},
 			peer:       Preface{Settings: settings},
-			negotiated: Negotiated{PeerSettings: settings, LocalRole: RoleInitiator}}, flow: connFlowState{perStreamDataHWM: 32}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
+			negotiated: Negotiated{PeerSettings: settings, LocalRole: RoleInitiator}}, flow: connFlowState{perStreamDataHWM: 32, recvSessionAdvertised: settings.InitialMaxData}, registry: connRegistryState{streams: make(map[uint64]*nativeStream)},
 	}
 	stream := &nativeStream{
 		conn:           c,
@@ -26654,7 +26898,7 @@ func TestHandleStreamMaxDataFrameIgnoresClosingUnknownStream(t *testing.T) {
 	c.mu.Unlock()
 
 	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
-	if err := c.handleStreamMaxDataFrame(streamID, 64); err != nil {
+	if err := c.handleStreamMaxDataFrame(streamID, 64, 1); err != nil {
 		t.Fatalf("handleStreamMaxDataFrame while closing: %v", err)
 	}
 }
@@ -26671,7 +26915,7 @@ func TestHandleStreamBlockedFrameIgnoresClosingUnknownStream(t *testing.T) {
 	c.mu.Unlock()
 
 	streamID := state.FirstPeerStreamID(c.config.negotiated.LocalRole, true)
-	if err := c.handleStreamBlockedFrame(streamID); err != nil {
+	if err := c.handleStreamBlockedFrame(streamID, 1); err != nil {
 		t.Fatalf("handleStreamBlockedFrame while closing: %v", err)
 	}
 }
@@ -26935,9 +27179,11 @@ func TestOpenMetadataFlowControlStillRejectsTrailingAppByteOverStreamWindow(t *t
 		c.mu.Unlock()
 		t.Fatalf("terminal marker missing for locally aborted stream %d", streamID)
 	}
-	if c.flow.recvSessionReceived != 0 || c.flow.recvSessionUsed != 0 {
+	// The rejected byte still counts in the session window and is released
+	// again as session credit; only the stream is aborted (SPEC §8).
+	if c.flow.recvSessionReceived != 1 || c.flow.recvSessionUsed != 0 || c.flow.recvSessionAdvertised != 2 {
 		c.mu.Unlock()
-		t.Fatalf("session recv accounting = (%d,%d), want 0/0", c.flow.recvSessionReceived, c.flow.recvSessionUsed)
+		t.Fatalf("session recv accounting = (received %d, used %d, advertised %d), want 1/0/2", c.flow.recvSessionReceived, c.flow.recvSessionUsed, c.flow.recvSessionAdvertised)
 	}
 	c.mu.Unlock()
 	assertNoQueuedFrame(t, frames)

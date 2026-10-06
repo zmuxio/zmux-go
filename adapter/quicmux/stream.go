@@ -88,6 +88,36 @@ func initLocalStreamBase(base *quicStreamBase, conn SessionConn, reader io.Reade
 	}
 }
 
+// attachLocalStream binds a locally opened base to its QUIC stream once the
+// stream exists; see freezeOpenPrelude.
+func (b *quicStreamBase) attachLocalStream(reader io.Reader, writer io.Writer) {
+	if b == nil {
+		return
+	}
+	b.reader = reader
+	b.preludeWriter = writer
+}
+
+// freezeOpenPrelude validates and freezes the open prelude of a local open
+// that carries peer-visible metadata, before any QUIC stream is opened. A
+// rejected open (for example open_info over the adapter's prelude cap) then
+// fails locally: it allocates no QUIC stream ID, never waits for peer stream
+// credit, and puts no RESET_STREAM / STOP_SENDING on the wire. Opens without
+// metadata stay unfrozen so pre-data metadata updates still work.
+func (b *quicStreamBase) freezeOpenPrelude() error {
+	if b == nil {
+		return zmux.ErrSessionClosed
+	}
+	b.metaMu.Lock()
+	needs := b.sendPrelude && !b.preludeSent && b.hasPeerVisibleOpenMetadataLocked()
+	b.metaMu.Unlock()
+	if !needs {
+		return nil
+	}
+	_, err := b.prepareOpenPrelude()
+	return err
+}
+
 func initAcceptedStreamBase(base *quicStreamBase, conn SessionConn, reader io.Reader, meta acceptedStreamMetadata) {
 	if base == nil {
 		return
@@ -654,6 +684,9 @@ func (s *quicStream) CancelRead(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	if err := checkQUICErrorCode(code); err != nil {
+		return err
+	}
 	if s.localReadClosed.Load() {
 		return zmux.ErrReadClosed
 	}
@@ -682,6 +715,9 @@ func (s *quicStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	if err := checkQUICErrorCode(code); err != nil {
+		return err
+	}
 	appErr := &zmux.ApplicationError{Code: code}
 	if !s.markLocalWriteClosed(appErr) {
 		if err := s.loadLocalWriteErr(); err != nil {
@@ -696,6 +732,9 @@ func (s *quicStream) CancelWrite(code uint64) error {
 func (s *quicStream) CloseWithError(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
+	}
+	if err := checkQUICErrorCode(code); err != nil {
+		return err
 	}
 	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
 	s.markLocalReadClosed(appErr)
@@ -760,6 +799,9 @@ func (s *quicSendStream) CancelWrite(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	if err := checkQUICErrorCode(code); err != nil {
+		return err
+	}
 	appErr := &zmux.ApplicationError{Code: code}
 	if !s.markLocalWriteClosed(appErr) {
 		if err := s.loadLocalWriteErr(); err != nil {
@@ -774,6 +816,9 @@ func (s *quicSendStream) CancelWrite(code uint64) error {
 func (s *quicSendStream) CloseWithError(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
+	}
+	if err := checkQUICErrorCode(code); err != nil {
+		return err
 	}
 	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
 	if s.markLocalWriteClosed(appErr) {
@@ -856,6 +901,9 @@ func (s *quicRecvStream) CancelRead(code uint64) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
 	}
+	if err := checkQUICErrorCode(code); err != nil {
+		return err
+	}
 	if s.localReadClosed.Load() {
 		return zmux.ErrReadClosed
 	}
@@ -867,6 +915,9 @@ func (s *quicRecvStream) CancelRead(code uint64) error {
 func (s *quicRecvStream) CloseWithError(code uint64, reason string) error {
 	if s == nil || s.stream == nil {
 		return zmux.ErrSessionClosed
+	}
+	if err := checkQUICErrorCode(code); err != nil {
+		return err
 	}
 	appErr := &zmux.ApplicationError{Code: code, Reason: reason}
 	s.markLocalReadClosed(appErr)

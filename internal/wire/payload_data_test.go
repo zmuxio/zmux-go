@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -195,4 +196,44 @@ func mustEncodeVarintForPayloadDataTest(t *testing.T, v uint64) []byte {
 		t.Fatalf("EncodeVarint(%d): %v", v, err)
 	}
 	return out
+}
+
+func TestParseDataPayloadAppDataDecodesOnlyMetadataLength(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		payload []byte
+		flags   byte
+		want    []byte
+		wantErr error
+	}{
+		{name: "no_open_metadata", payload: []byte("app"), want: []byte("app")},
+		// A truncated TLV inside the metadata block is skipped uninterpreted.
+		{name: "malformed_tlvs_skipped", payload: []byte{0x02, 0x01, 0x05, 'a', 'p', 'p'}, flags: FrameFlagOpenMetadata, want: []byte("app")},
+		{name: "empty_metadata", payload: []byte{0x00, 'x'}, flags: FrameFlagOpenMetadata, want: []byte("x")},
+		{name: "missing_metadata_len", payload: nil, flags: FrameFlagOpenMetadata, wantErr: ErrTruncatedVarint},
+		{name: "truncated_metadata_len", payload: []byte{0x40}, flags: FrameFlagOpenMetadata, wantErr: ErrTruncatedVarint},
+		{name: "non_canonical_metadata_len", payload: []byte{0x40, 0x01, 0x00}, flags: FrameFlagOpenMetadata, wantErr: ErrNonCanonicalVarint},
+		{name: "metadata_len_overrun", payload: []byte{0x05, 0x00}, flags: FrameFlagOpenMetadata, wantErr: ErrTLVValueOverrun},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ParseDataPayloadAppData(tc.payload, tc.flags)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("ParseDataPayloadAppData err = %v, want %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseDataPayloadAppData err = %v", err)
+			}
+			if !bytes.Equal(got, tc.want) {
+				t.Fatalf("app data = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

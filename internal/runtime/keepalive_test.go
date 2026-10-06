@@ -29,6 +29,25 @@ func TestInitKeepaliveJitterStateAllocatesDistinctDefaultSeeds(t *testing.T) {
 	}
 }
 
+func TestInitKeepaliveJitterStateFallbackStartsAtRandomOffset(t *testing.T) {
+	t.Parallel()
+
+	// A counter starting at zero would hand the n-th fallback session of every
+	// process the same small multiple of the gamma, and so the same keepalive
+	// jitter and PING token sequence.
+	got := InitKeepaliveJitterState(0)
+	inverse := uint64(1)
+	for i := 0; i < 6; i++ {
+		inverse *= 2 - keepaliveJitterGamma*inverse
+	}
+	if keepaliveJitterGamma*inverse != 1 {
+		t.Fatalf("gamma inverse %#x is wrong", inverse)
+	}
+	if k := got * inverse; k < 1<<20 {
+		t.Fatalf("InitKeepaliveJitterState(0) = %#x = %d*gamma, want a randomized fallback seed", got, k)
+	}
+}
+
 func TestNextKeepaliveJitterWithinWindow(t *testing.T) {
 	t.Parallel()
 

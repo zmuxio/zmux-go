@@ -16,7 +16,7 @@ import (
 
 var (
 	readLoopHooksMu             sync.RWMutex
-	readLoopReadFrameBuffered   = readFrameBuffered
+	readLoopReadFrameBuffered   = readSessionFrameBuffered
 	readLoopHandleFrameBuffered = func(c *Conn, frame Frame, backing []byte, handle *wire.FrameReadBufferHandle) (bool, error) {
 		return c.handleFrameBuffered(frame, backing, handle)
 	}
@@ -56,6 +56,9 @@ func (c *Conn) handleFrameBuffered(frame Frame, backing []byte, handle *wire.Fra
 			return false, err
 		}
 	case FrameTypeDATA:
+	case FrameTypeMAXDATA, FrameTypeBLOCKED:
+		// Charged by their handlers, and only when they do not advance
+		// flow-control state; see recordNonAdvancingFlowControlLocked.
 	default:
 		c.mu.Lock()
 		err := c.recordInboundControlBudgetLocked(now, uint64(len(frame.Payload)), "handle frame")
@@ -471,7 +474,7 @@ func (c *Conn) handleExtFrame(frame Frame) error {
 	}
 	c.mu.Unlock()
 
-	extType, n, err := ParseVarint(frame.Payload)
+	extType, n, err := wire.ParseEXTType(frame.Payload)
 	if err != nil {
 		c.mu.Lock()
 		ignore := state.IgnorePeerNonCloseFrame(c.lifecycle.sessionState, c.lifecycle.closeErr != nil)
@@ -479,7 +482,7 @@ func (c *Conn) handleExtFrame(frame Frame) error {
 		if ignore {
 			return nil
 		}
-		return frameSizeError("handle EXT", err)
+		return err
 	}
 	c.mu.Lock()
 	if state.IgnorePeerNonCloseFrame(c.lifecycle.sessionState, c.lifecycle.closeErr != nil) {
@@ -487,7 +490,7 @@ func (c *Conn) handleExtFrame(frame Frame) error {
 		return nil
 	}
 	c.mu.Unlock()
-	switch EXTSubtype(extType) {
+	switch extType {
 	case EXTPriorityUpdate:
 		return c.handlePriorityUpdateFrame(frame.StreamID, frame.Payload[n:])
 	default:
@@ -570,11 +573,69 @@ func (c *Conn) discardTerminalPeerDataLocked(streamID uint64, appLen uint64, cau
 		return wireError(CodeFlowControl, "handle DATA", fmt.Errorf("session receive window exceeded"))
 	}
 	c.accountDiscardedSessionReceiveLocked(appLen)
-	tombstoneCapExceeded := c.releaseTerminalLateDiscardLocked(streamID, appLen, cause)
-	if c.lateDataCapExceededLocked(nil) || tombstoneCapExceeded {
+	if c.releaseTerminalLateDiscardLocked(streamID, appLen, cause) {
 		return wireError(CodeProtocol, "handle DATA", fmt.Errorf("late-data cap exceeded"))
 	}
 	return nil
+}
+
+// discardRejectedPeerDataLocked drops the payload of a DATA frame that is
+// answered with a stream-local ABORT (DATA after peer FIN, wrong-direction
+// DATA, stream FLOW_CONTROL overrun). The sender has already counted those
+// bytes against its session window, so they are checked against and counted
+// in the session window and released again (SPEC §8). They are a peer
+// violation, not late tail, so the late-data caps are not charged.
+func (c *Conn) discardRejectedPeerDataLocked(appLen uint64) error {
+	if c.sessionReceiveLimitExceededLocked(appLen) {
+		return wireError(CodeFlowControl, "handle DATA", fmt.Errorf("session receive window exceeded"))
+	}
+	c.accountDiscardedSessionReceiveLocked(appLen)
+	c.releaseDiscardedSessionReceiveLocked(appLen)
+	return nil
+}
+
+// discardRefusedOpenerDataLocked drops the payload of an opening DATA frame
+// whose stream was refused (local GOAWAY watermark or incoming stream limit).
+// The sender has already counted its application bytes against its session
+// window, so they are checked against and counted in the session window and
+// released again (SPEC §8). Only the metadata_len prefix is decoded: a refusal
+// never interprets OPEN_METADATA TLVs (SPEC §3.2), but a malformed prefix is
+// still FRAME_SIZE. The bytes are not late data.
+func (c *Conn) discardRefusedOpenerDataLocked(frame Frame) error {
+	// The refusal may have dropped c.mu to queue its ABORT.
+	if state.IgnorePeerNonCloseFrame(c.lifecycle.sessionState, c.lifecycle.closeErr != nil) {
+		return nil
+	}
+	if frame.Flags&FrameFlagOpenMetadata != 0 && !c.config.negotiated.Capabilities.Has(CapabilityOpenMetadata) {
+		return wireError(CodeProtocol, "handle DATA", fmt.Errorf("OPEN_METADATA without negotiated capability"))
+	}
+	appData, err := wire.ParseDataPayloadAppData(frame.Payload, frame.Flags)
+	if err != nil {
+		return frameSizeError("handle DATA", err)
+	}
+	return c.discardRejectedPeerDataLocked(uint64(len(appData)))
+}
+
+// abortRejectedPeerDataLocked discards a rejected DATA payload and aborts the
+// live stream with code.
+func (c *Conn) abortRejectedPeerDataLocked(stream *nativeStream, appLen uint64, code ErrorCode) (txFrame, error) {
+	if err := c.discardRejectedPeerDataLocked(appLen); err != nil {
+		return txFrame{}, err
+	}
+	return c.planAbortLiveStreamLocked(stream, code, "")
+}
+
+// existingStreamDataAppLen validates a DATA frame on an already-open stream
+// that will not be buffered and returns its application-data length.
+func existingStreamDataAppLen(frame Frame) (uint64, error) {
+	if frame.Flags&FrameFlagOpenMetadata != 0 {
+		return 0, wireError(CodeProtocol, "handle DATA", fmt.Errorf("OPEN_METADATA on already-open stream %d", frame.StreamID))
+	}
+	appBytes, err := dataFrameAppData(frame)
+	if err != nil {
+		return 0, frameSizeError("handle DATA", err)
+	}
+	return uint64(len(appBytes)), nil
 }
 
 func (c *Conn) bufferPeerDataLocked(stream *nativeStream, appData []byte) {
@@ -639,8 +700,9 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 			return false, err
 		}
 		if stream == nil {
+			err := c.discardRefusedOpenerDataLocked(frame)
 			c.mu.Unlock()
-			return false, nil
+			return false, err
 		}
 	}
 	arrival := peerDataArrivalContinue
@@ -649,39 +711,50 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 	}
 	dataPlan := stream.peerDataPlanLocked(arrival)
 	switch dataPlan.Outcome {
-	case state.PeerDataAbortState:
-		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
+	case state.PeerDataAbortState, state.PeerDataAbortClosed:
+		code := CodeStreamState
+		if dataPlan.Outcome == state.PeerDataAbortClosed {
+			code = CodeStreamClosed
+		}
+		appLen, err := existingStreamDataAppLen(frame)
+		if err != nil {
+			c.mu.Unlock()
+			return false, err
+		}
+		abortFrame, err := c.abortRejectedPeerDataLocked(stream, appLen, code)
 		if err != nil {
 			c.mu.Unlock()
 			return false, err
 		}
 		c.mu.Unlock()
-		c.queueReadLoopFrameAsync(frame)
-		return false, nil
-	case state.PeerDataAbortClosed:
-		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamClosed, "")
-		if err != nil {
-			c.mu.Unlock()
-			return false, err
-		}
-		c.mu.Unlock()
-		c.queueReadLoopFrameAsync(frame)
+		c.queueReadLoopFrameAsync(abortFrame)
 		return false, nil
 	case state.PeerDataIgnore:
-		if frame.Flags&FrameFlagOpenMetadata != 0 {
-			c.mu.Unlock()
-			return false, wireError(CodeProtocol, "handle DATA", fmt.Errorf("OPEN_METADATA on already-open stream %d", frame.StreamID))
-		}
-		appBytes, err := dataFrameAppData(frame)
+		appLen, err := existingStreamDataAppLen(frame)
 		if err != nil {
 			c.mu.Unlock()
-			return false, frameSizeError("handle DATA", err)
+			return false, err
 		}
-		appLen := uint64(len(appBytes))
+		// The stop froze the advertised stream limit, so a compliant peer's
+		// in-flight tail always fits; bytes beyond it are a stream
+		// FLOW_CONTROL violation, not late data (SPEC §8).
+		if dataPlan.EnforceStreamWindow && receiveWindowExceeded(stream.recvReceived, stream.recvAdvertised, appLen) {
+			abortFrame, err := c.abortRejectedPeerDataLocked(stream, appLen, CodeFlowControl)
+			if err != nil {
+				c.mu.Unlock()
+				return false, err
+			}
+			c.mu.Unlock()
+			c.queueReadLoopFrameAsync(abortFrame)
+			return false, nil
+		}
 		discardPlan := ignoredPeerDataLateDiscard(stream, lateDataTrackingFrom(dataPlan.TrackLatePerStream))
 		if err := c.discardPeerDataLocked(discardPlan.stream, appLen, discardPlan.cause); err != nil {
 			c.mu.Unlock()
 			return false, err
+		}
+		if dataPlan.EnforceStreamWindow {
+			stream.recvReceived = saturatingAdd(stream.recvReceived, appLen)
 		}
 		if dataPlan.AdvanceRecvFin {
 			stream.setRecvFin()
@@ -743,7 +816,7 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 		return false, wireError(CodeFlowControl, "handle DATA", fmt.Errorf("session receive window exceeded"))
 	}
 	if receiveWindowExceeded(stream.recvReceived, stream.recvAdvertised, appLen) {
-		frame, err := c.planAbortLiveStreamLocked(stream, CodeFlowControl, "")
+		frame, err := c.abortRejectedPeerDataLocked(stream, appLen, CodeFlowControl)
 		if err != nil {
 			c.mu.Unlock()
 			return false, err
@@ -803,7 +876,7 @@ func (c *Conn) handleDataFrameBuffered(frame Frame, backing []byte, handle *wire
 	if frame.Flags&FrameFlagFIN != 0 {
 		stream.setRecvFin()
 	}
-	notify(stream.readNotify)
+	stream.broadcastReadNotifyLocked()
 	c.maybeFinalizePeerActiveLocked(stream)
 	c.mu.Unlock()
 	for _, refusedID := range refusedVisibleStreamIDs {
@@ -839,14 +912,14 @@ func (c *Conn) handleTerminalDataPayload(frame Frame, appData []byte, dispositio
 	}
 	switch disposition.action {
 	case lateDataAbortClosed:
-		if err := c.discardTerminalPeerDataLocked(frame.StreamID, uint64(len(appData)), disposition.cause); err != nil {
+		if err := c.discardRejectedPeerDataLocked(uint64(len(appData))); err != nil {
 			c.mu.Unlock()
 			return err
 		}
 		c.mu.Unlock()
 		return c.abortWithCodeAsync(frame.StreamID, CodeStreamClosed)
 	case lateDataAbortState:
-		if err := c.discardTerminalPeerDataLocked(frame.StreamID, uint64(len(appData)), disposition.cause); err != nil {
+		if err := c.discardRejectedPeerDataLocked(uint64(len(appData))); err != nil {
 			c.mu.Unlock()
 			return err
 		}
@@ -998,7 +1071,7 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 			}).Attempt
 		}
 	}
-	notify(stream.writeNotify)
+	stream.broadcastWriteNotifyLocked()
 	if gracefulFinish {
 		c.mu.Unlock()
 		deadline := time.Now().Add(rt.StopSendingDrainWindow(0))
@@ -1025,6 +1098,9 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 		return err
 	}
 	dispatch, queued, err := stream.enqueuePendingTerminalSignalLocked(resetPlan)
+	if err == nil && resetPlan.shouldNotifyWrite() {
+		stream.broadcastWriteNotifyLocked()
+	}
 	c.mu.Unlock()
 	if err != nil {
 		c.closeSessionWithOptions(err, closeOriginReadLoop, closeFrameDefault)
@@ -1033,9 +1109,6 @@ func (c *Conn) handleStopSendingFrame(frame Frame) error {
 	if queued {
 		notify(c.pending.terminalNotify)
 		notify(c.pending.controlNotify)
-	}
-	if resetPlan.shouldNotifyWrite() {
-		notify(stream.writeNotify)
 	}
 	emitStreamDispatch(c, dispatch)
 	return nil
@@ -1270,7 +1343,9 @@ func (c *Conn) releaseReceiveLocked(stream *nativeStream, n uint64) {
 	c.notifySessionMemoryReleasedLocked(prevTracked, sessionMemoryReleaseFrom(sessionN > 0))
 }
 
-func (c *Conn) releaseLateDiscardLocked(stream *nativeStream, n uint64, cause lateDataCause) {
+// releaseDiscardedSessionReceiveLocked re-advertises session credit for bytes
+// that were counted in the session window but never buffered.
+func (c *Conn) releaseDiscardedSessionReceiveLocked(n uint64) {
 	if n == 0 {
 		return
 	}
@@ -1281,7 +1356,17 @@ func (c *Conn) releaseLateDiscardLocked(stream *nativeStream, n uint64, cause la
 		c.flow.recvSessionPending = saturatingAdd(c.flow.recvSessionPending, n)
 		c.flow.recvReplenishRetry = true
 	}
-	c.ingress.aggregateLateData = rt.SaturatingAdd(c.ingress.aggregateLateData, n)
+}
+
+// releaseLateDiscardLocked releases the session credit of a discarded late
+// tail and charges it to its owning stream, when there is one. The aggregate
+// counter only tracks late bytes that a live stream or a tombstone still
+// accounts for; see releaseRetainedLateDataLocked.
+func (c *Conn) releaseLateDiscardLocked(stream *nativeStream, n uint64, cause lateDataCause) {
+	if n == 0 {
+		return
+	}
+	c.releaseDiscardedSessionReceiveLocked(n)
 	c.recordLateDiscardCauseLocked(cause, n)
 	if stream != nil {
 		if !stream.applicationVisible {
@@ -1289,6 +1374,7 @@ func (c *Conn) releaseLateDiscardLocked(stream *nativeStream, n uint64, cause la
 		}
 		stream.lateDataReceived = rt.SaturatingAdd(stream.lateDataReceived, n)
 		stream.recvPending = 0
+		c.ingress.aggregateLateData = rt.SaturatingAdd(c.ingress.aggregateLateData, n)
 	}
 }
 
@@ -1309,7 +1395,19 @@ func (c *Conn) releaseTerminalLateDiscardLocked(streamID uint64, n uint64, cause
 	}
 	tombstone.LateDataReceived = rt.SaturatingAdd(tombstone.LateDataReceived, n)
 	c.registry.tombstones[streamID] = tombstone
+	c.ingress.aggregateLateData = rt.SaturatingAdd(c.ingress.aggregateLateData, n)
 	return tombstone.LateDataCapEnabled && tombstone.LateDataReceived > tombstone.LateDataCap
+}
+
+// releaseRetainedLateDataLocked drops late bytes from the aggregate once the
+// live stream or tombstone that accounted for them is forgotten. A live
+// stream's count moves into its tombstone on compaction and is released only
+// when that tombstone is reaped, so nothing is subtracted twice.
+func (c *Conn) releaseRetainedLateDataLocked(n uint64) {
+	if c == nil || n == 0 {
+		return
+	}
+	c.ingress.aggregateLateData = csub(c.ingress.aggregateLateData, n)
 }
 
 func (c *Conn) recordLateDiscardCauseLocked(cause lateDataCause, n uint64) {
@@ -1324,17 +1422,17 @@ func (c *Conn) recordLateDiscardCauseLocked(cause lateDataCause, n uint64) {
 	}
 }
 
+// lateDataCapExceededLocked reports a breach of a stream's late-data
+// allowance. The allowance is never below the stream credit outstanding when
+// the local stop or ABORT committed, so only a peer that ignored its credit can
+// exceed it. The aggregate is deliberately not checked: discarded late bytes
+// hold no memory, so exceeding the aggregate allowance only means more
+// discarding and never fails the session (API_SEMANTICS §3).
 func (c *Conn) lateDataCapExceededLocked(stream *nativeStream) bool {
-	if c.ingress.aggregateLateDataCap > 0 && c.ingress.aggregateLateData > c.ingress.aggregateLateDataCap {
-		return true
-	}
 	if stream == nil {
 		return false
 	}
-	if limit := c.effectiveLateDataPerStreamCapLocked(stream); limit.exceeded(stream.lateDataReceived) {
-		return true
-	}
-	return false
+	return c.effectiveLateDataPerStreamCapLocked(stream).exceeded(stream.lateDataReceived)
 }
 
 type lateDataPerStreamCap struct {
@@ -1346,19 +1444,23 @@ func (c lateDataPerStreamCap) exceeded(received uint64) bool {
 	return c.enabled && received > c.value
 }
 
+// effectiveLateDataPerStreamCapLocked returns the per-direction late-data
+// allowance: max(repository floor, stream credit outstanding when the local
+// read-stop or ABORT committed). Compaction copies it into the tombstone.
 func (c *Conn) effectiveLateDataPerStreamCapLocked(stream *nativeStream) lateDataPerStreamCap {
 	if c == nil || stream == nil || !stream.localReceive || !stream.idSet {
 		return lateDataPerStreamCap{}
 	}
-	if c.ingress.lateDataPerStreamCap > 0 {
-		return lateDataPerStreamCap{value: c.ingress.lateDataPerStreamCap, enabled: true}
+	floor := c.ingress.lateDataPerStreamCap
+	if floor == 0 {
+		maxFramePayload := c.config.local.Settings.MaxFramePayload
+		if maxFramePayload == 0 {
+			maxFramePayload = DefaultSettings().MaxFramePayload
+		}
+		initialWindow := state.InitialReceiveWindow(c.config.negotiated.LocalRole, c.config.local.Settings, stream.id)
+		floor = lateDataPerStreamCapFor(initialWindow, maxFramePayload)
 	}
-	maxFramePayload := c.config.local.Settings.MaxFramePayload
-	if maxFramePayload == 0 {
-		maxFramePayload = DefaultSettings().MaxFramePayload
-	}
-	initialWindow := state.InitialReceiveWindow(c.config.negotiated.LocalRole, c.config.local.Settings, stream.id)
-	return lateDataPerStreamCap{value: lateDataPerStreamCapFor(initialWindow, maxFramePayload), enabled: true}
+	return lateDataPerStreamCap{value: maxUint64(floor, stream.lateDataCredit), enabled: true}
 }
 
 func lateDataPerStreamCapFor(initialStreamWindow, maxFramePayload uint64) uint64 {
@@ -1391,32 +1493,71 @@ func (p windowReplenishPolicy) forcesReplenish() bool {
 	return p == windowReplenishForce
 }
 
-func (c *Conn) finishPeerMaxDataFrameLocked(update peerMaxDataUpdate, now time.Time) error {
+// recordNonAdvancingFlowControlLocked charges a MAX_DATA or BLOCKED that did
+// not advance flow-control state to the inbound control and mixed rate
+// budgets. A MAX_DATA that raises a limit, or a BLOCKED that releases or
+// grants credit, is mandatory progress: the repository-default replenish
+// cadence alone exceeds any fixed frame budget during bulk transfer, so those
+// frames are never treated as control flood (SPEC §11, §13).
+func (c *Conn) recordNonAdvancingFlowControlLocked(now time.Time, payloadLen uint64, op string) error {
+	if err := c.recordInboundControlBudgetLocked(now, payloadLen, op); err != nil {
+		return err
+	}
+	return c.recordInboundMixedBudgetLocked(now, payloadLen, op)
+}
+
+func (c *Conn) finishPeerMaxDataFrameLocked(update peerMaxDataUpdate, now time.Time, payloadLen uint64) error {
 	if update.changed() {
 		c.clearNoOpMaxDataLocked()
 		return nil
 	}
+	if err := c.recordNonAdvancingFlowControlLocked(now, payloadLen, "handle MAX_DATA"); err != nil {
+		return err
+	}
 	return c.recordNoOpMaxDataLocked(now)
 }
 
-func (c *Conn) finishPeerBlockedFrameLocked(stream *nativeStream, now time.Time) error {
-	hasPending := c.flow.recvSessionPending != 0
+// creditGrantedSinceBlocked reports whether a receive limit rose since the
+// previous peer BLOCKED for that scope (or above the initial window, for the
+// first one). A BLOCKED sent before the peer saw that grant crossed it on the
+// wire; it is stale, not a no-op.
+func creditGrantedSinceBlocked(advertised, lastBlockedAdvertised, initial uint64) bool {
+	return advertised > maxUint64(lastBlockedAdvertised, initial)
+}
+
+func (c *Conn) finishPeerBlockedFrameLocked(stream *nativeStream, now time.Time, payloadLen uint64) error {
+	progress := c.flow.recvSessionPending != 0
+	sessionAdvertised := c.flow.recvSessionAdvertised
+	var streamAdvertised uint64
 	if stream != nil {
-		hasPending = hasPending || stream.recvPending != 0
-	}
-	if hasPending {
-		c.clearNoOpBlockedLocked()
-	} else if err := c.recordNoOpBlockedLocked(now); err != nil {
-		return err
+		streamAdvertised = stream.recvAdvertised
+		progress = progress || stream.recvPending != 0 ||
+			creditGrantedSinceBlocked(streamAdvertised, stream.peerBlockedAdvertised, state.InitialReceiveWindow(c.config.negotiated.LocalRole, c.config.local.Settings, stream.id))
+	} else {
+		progress = progress || creditGrantedSinceBlocked(sessionAdvertised, c.flow.recvSessionBlockedAdvertised, c.config.local.Settings.InitialMaxData)
 	}
 	c.maybeReplenishSessionLockedWithPolicy(windowReplenishForce)
 	if stream != nil {
 		c.maybeReplenishStreamLockedWithPolicy(stream, windowReplenishForce)
+		progress = progress || stream.recvAdvertised > streamAdvertised
+		stream.peerBlockedAdvertised = stream.recvAdvertised
+	} else {
+		c.flow.recvSessionBlockedAdvertised = c.flow.recvSessionAdvertised
 	}
-	return nil
+	// A BLOCKED that leads to a grant is progress, not a no-op (IMPLEMENTATION
+	// §3.2 zero-window grants).
+	progress = progress || c.flow.recvSessionAdvertised > sessionAdvertised
+	if progress {
+		c.clearNoOpBlockedLocked()
+		return nil
+	}
+	if err := c.recordNonAdvancingFlowControlLocked(now, payloadLen, "handle BLOCKED"); err != nil {
+		return err
+	}
+	return c.recordNoOpBlockedLocked(now)
 }
 
-func (c *Conn) handleSessionMaxDataFrame(value uint64) error {
+func (c *Conn) handleSessionMaxDataFrame(value uint64, payloadLen uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -1436,17 +1577,17 @@ func (c *Conn) handleSessionMaxDataFrame(value uint64) error {
 			notify(c.pending.controlNotify)
 		}
 	}
-	return c.finishPeerMaxDataFrameLocked(update, now)
+	return c.finishPeerMaxDataFrameLocked(update, now, payloadLen)
 }
 
-func (c *Conn) handleSessionBlockedFrame() error {
+func (c *Conn) handleSessionBlockedFrame(payloadLen uint64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if state.IgnorePeerNonCloseFrame(c.lifecycle.sessionState, c.lifecycle.closeErr != nil) {
 		return nil
 	}
-	return c.finishPeerBlockedFrameLocked(nil, time.Now())
+	return c.finishPeerBlockedFrameLocked(nil, time.Now(), payloadLen)
 }
 
 func (c *Conn) handleMaxDataFrame(frame Frame) error {
@@ -1466,10 +1607,11 @@ func (c *Conn) handleMaxDataFrame(frame Frame) error {
 		return frameSizeError("handle MAX_DATA", err)
 	}
 
+	payloadLen := uint64(len(frame.Payload))
 	if frame.StreamID == 0 {
-		return c.handleSessionMaxDataFrame(value)
+		return c.handleSessionMaxDataFrame(value, payloadLen)
 	}
-	return c.handleStreamMaxDataFrame(frame.StreamID, value)
+	return c.handleStreamMaxDataFrame(frame.StreamID, value, payloadLen)
 }
 
 type peerStreamControlKind uint8
@@ -1514,19 +1656,24 @@ func (kind peerStreamControlKind) recordNoOp(c *Conn, now time.Time) error {
 	}
 }
 
-func (c *Conn) preparePeerStreamControlLocked(kind peerStreamControlKind, op string, streamID uint64) (*nativeStream, time.Time, bool, error) {
+func (c *Conn) preparePeerStreamControlLocked(kind peerStreamControlKind, op string, streamID uint64, payloadLen uint64) (*nativeStream, time.Time, bool, error) {
 	stream, err := c.lookupExistingPeerStreamLocked(op, streamID)
 	if err != nil {
 		c.mu.Unlock()
 		return nil, time.Time{}, true, err
 	}
-	if stream == nil {
-		c.mu.Unlock()
-		return nil, time.Time{}, true, nil
-	}
 	now := time.Now()
+	if stream == nil {
+		err := c.recordNonAdvancingFlowControlLocked(now, payloadLen, "handle "+op)
+		c.mu.Unlock()
+		return nil, now, true, err
+	}
 	switch kind.action(stream) {
 	case state.PeerStreamControlIgnore:
+		if err := c.recordNonAdvancingFlowControlLocked(now, payloadLen, "handle "+op); err != nil {
+			c.mu.Unlock()
+			return nil, now, true, err
+		}
 		if err := kind.recordNoOp(c, now); err != nil {
 			c.mu.Unlock()
 			return nil, now, true, err
@@ -1534,6 +1681,10 @@ func (c *Conn) preparePeerStreamControlLocked(kind peerStreamControlKind, op str
 		c.mu.Unlock()
 		return nil, now, true, nil
 	case state.PeerStreamControlAbortState:
+		if err := c.recordNonAdvancingFlowControlLocked(now, payloadLen, "handle "+op); err != nil {
+			c.mu.Unlock()
+			return nil, now, true, err
+		}
 		frame, err := c.planAbortLiveStreamLocked(stream, CodeStreamState, "")
 		if err != nil {
 			c.mu.Unlock()
@@ -1548,11 +1699,11 @@ func (c *Conn) preparePeerStreamControlLocked(kind peerStreamControlKind, op str
 	return stream, now, false, nil
 }
 
-func (c *Conn) handleStreamMaxDataFrame(streamID uint64, value uint64) error {
+func (c *Conn) handleStreamMaxDataFrame(streamID uint64, value uint64, payloadLen uint64) error {
 	if !c.lockPeerNonCloseFrameHandling() {
 		return nil
 	}
-	stream, now, handled, err := c.preparePeerStreamControlLocked(peerStreamControlMaxData, "MAX_DATA", streamID)
+	stream, now, handled, err := c.preparePeerStreamControlLocked(peerStreamControlMaxData, "MAX_DATA", streamID, payloadLen)
 	if handled || err != nil {
 		return err
 	}
@@ -1561,9 +1712,9 @@ func (c *Conn) handleStreamMaxDataFrame(streamID uint64, value uint64) error {
 		update = peerMaxDataExpanded
 		stream.sendMax = value
 		c.releaseStreamRuntimeStateLocked(stream, streamRuntimeBlocked)
-		notify(stream.writeNotify)
+		stream.broadcastWriteNotifyLocked()
 	}
-	if err := c.finishPeerMaxDataFrameLocked(update, now); err != nil {
+	if err := c.finishPeerMaxDataFrameLocked(update, now, payloadLen); err != nil {
 		c.mu.Unlock()
 		return err
 	}
@@ -1586,21 +1737,22 @@ func (c *Conn) handleBlockedFrame(frame Frame) error {
 		}
 		return frameSizeError("handle BLOCKED", err)
 	}
+	payloadLen := uint64(len(frame.Payload))
 	if frame.StreamID == 0 {
-		return c.handleSessionBlockedFrame()
+		return c.handleSessionBlockedFrame(payloadLen)
 	}
-	return c.handleStreamBlockedFrame(frame.StreamID)
+	return c.handleStreamBlockedFrame(frame.StreamID, payloadLen)
 }
 
-func (c *Conn) handleStreamBlockedFrame(streamID uint64) error {
+func (c *Conn) handleStreamBlockedFrame(streamID uint64, payloadLen uint64) error {
 	if !c.lockPeerNonCloseFrameHandling() {
 		return nil
 	}
-	stream, now, handled, err := c.preparePeerStreamControlLocked(peerStreamControlBlocked, "BLOCKED", streamID)
+	stream, now, handled, err := c.preparePeerStreamControlLocked(peerStreamControlBlocked, "BLOCKED", streamID, payloadLen)
 	if handled || err != nil {
 		return err
 	}
-	if err := c.finishPeerBlockedFrameLocked(stream, now); err != nil {
+	if err := c.finishPeerBlockedFrameLocked(stream, now, payloadLen); err != nil {
 		c.mu.Unlock()
 		return err
 	}
@@ -1646,8 +1798,16 @@ func (c *Conn) maybeReplenishSessionLocked() {
 	c.maybeReplenishSessionLockedWithPolicy(windowReplenishIfNeeded)
 }
 
+// forcesExhaustedWindowGrant reports whether a forced replenish must grant
+// standing credit although nothing is pending: the scope still accepts peer
+// data but its advertised credit is used up. Without it a zero initial window
+// would never be opened (IMPLEMENTATION §3.2).
+func (p windowReplenishPolicy) forcesExhaustedWindowGrant(advertised, received uint64) bool {
+	return p.forcesReplenish() && rt.WindowRemaining(advertised, received) == 0
+}
+
 func (c *Conn) maybeReplenishSessionLockedWithPolicy(policy windowReplenishPolicy) {
-	if c.flow.recvSessionPending == 0 {
+	if c.flow.recvSessionPending == 0 && !policy.forcesExhaustedWindowGrant(c.flow.recvSessionAdvertised, c.flow.recvSessionReceived) {
 		return
 	}
 	target := c.sessionWindowTargetLocked()
@@ -1664,6 +1824,24 @@ func (c *Conn) maybeReplenishSessionLockedWithPolicy(policy windowReplenishPolic
 	c.replenishSessionLocked(target)
 }
 
+// replenishExhaustedReceiveLocked runs when an application read (stream
+// non-nil) or accept (stream nil) is about to wait. Any scope whose advertised
+// credit is used up gets a forced replenish, which grants standing credit even
+// with nothing pending, so a zero initial window does not stall a peer that
+// never sends BLOCKED (IMPLEMENTATION §3.2). Pending MAX_DATA for a local
+// stream whose opener is not on the wire yet stays held until it is.
+func (c *Conn) replenishExhaustedReceiveLocked(stream *nativeStream) {
+	if c == nil || c.lifecycle.closeErr != nil {
+		return
+	}
+	if rt.WindowRemaining(c.flow.recvSessionAdvertised, c.flow.recvSessionReceived) == 0 {
+		c.maybeReplenishSessionLockedWithPolicy(windowReplenishForce)
+	}
+	if stream != nil && rt.WindowRemaining(stream.recvAdvertised, stream.recvReceived) == 0 {
+		c.maybeReplenishStreamLockedWithPolicy(stream, windowReplenishForce)
+	}
+}
+
 func (c *Conn) replenishSessionLocked(target uint64) {
 	floor := rt.SaturatingAdd(c.flow.recvSessionAdvertised, c.flow.recvSessionPending)
 	desired := floor
@@ -1674,6 +1852,10 @@ func (c *Conn) replenishSessionLocked(target uint64) {
 		}
 	}
 	desired = clampVarint62(desired)
+	if desired <= c.flow.recvSessionAdvertised {
+		c.flow.recvSessionPending = 0
+		return
+	}
 	if !c.ensurePendingSessionMaxDataLocked(desired) {
 		c.flow.recvReplenishRetry = true
 		return
@@ -1687,7 +1869,10 @@ func (c *Conn) maybeReplenishStreamLocked(stream *nativeStream) {
 }
 
 func (c *Conn) maybeReplenishStreamLockedWithPolicy(stream *nativeStream, policy windowReplenishPolicy) {
-	if stream == nil || stream.recvPending == 0 {
+	if stream == nil {
+		return
+	}
+	if stream.recvPending == 0 && !policy.forcesExhaustedWindowGrant(stream.recvAdvertised, stream.recvReceived) {
 		return
 	}
 	if !stream.idSet || !stream.localReceive || stream.readStopSentLocked() || state.RecvTerminal(stream.effectiveRecvHalfStateLocked()) {
@@ -1719,6 +1904,10 @@ func (c *Conn) replenishStreamLocked(stream *nativeStream, target uint64) {
 		}
 	}
 	desired = clampVarint62(desired)
+	if desired <= stream.recvAdvertised {
+		stream.recvPending = 0
+		return
+	}
 	if !c.ensurePendingStreamMaxDataLocked(stream, desired) {
 		c.flow.recvReplenishRetry = true
 		return

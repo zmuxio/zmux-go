@@ -1,7 +1,5 @@
 package wire
 
-import "errors"
-
 type DataPayload struct {
 	MetadataTLVs []TLV
 	Metadata     ParsedStreamMetadata
@@ -51,6 +49,25 @@ func ParseDataPayloadView(payload []byte, flags byte) (DataPayload, error) {
 	}, nil
 }
 
+// ParseDataPayloadAppData returns the application data of a DATA payload,
+// decoding only the OPEN_METADATA metadata_len prefix. The metadata TLVs are
+// skipped uninterpreted, so a receiver that refuses an opening DATA can still
+// account its application bytes without parsing the metadata.
+func ParseDataPayloadAppData(payload []byte, flags byte) ([]byte, error) {
+	if flags&FrameFlagOpenMetadata == 0 {
+		return payload, nil
+	}
+	metadataLen, n, err := ParseVarint(payload)
+	if err != nil {
+		return nil, err
+	}
+	remaining := payload[n:]
+	if uint64(len(remaining)) < metadataLen {
+		return nil, ErrTLVValueOverrun
+	}
+	return remaining[metadataLen:], nil
+}
+
 func parseDataPayload(payload []byte, flags byte, cloneMetadata bool) (DataPayload, error) {
 	if flags&FrameFlagOpenMetadata == 0 {
 		return DataPayload{AppData: payload}, nil
@@ -97,8 +114,6 @@ func ParseStreamMetadataTLVsView(tlvs []TLV) (ParsedStreamMetadata, bool, error)
 func ParseStreamMetadataBytesView(src []byte) (ParsedStreamMetadata, bool, error) {
 	return parseStreamMetadataBytes(src, false)
 }
-
-var errDuplicateMetadataSingleton = errors.New("duplicate metadata singleton")
 
 func parseStreamMetadataTLVs(tlvs []TLV, copyOpenInfo bool) (ParsedStreamMetadata, bool, error) {
 	const (
@@ -160,8 +175,14 @@ func parseStreamMetadataBytes(src []byte, copyOpenInfo bool) (ParsedStreamMetada
 	)
 
 	seenSingleton := uint8(0)
+	dropped := false
 	out := ParsedStreamMetadata{}
 	err := walkTLVs(src, func(typ uint64, value []byte) error {
+		// A duplicate singleton drops the block, but the walk goes on so a
+		// later structural error still rejects it (SPEC §7.2).
+		if dropped {
+			return nil
+		}
 		var seenBit uint8
 		switch StreamMetadataType(typ) {
 		case MetadataStreamPriority:
@@ -173,7 +194,8 @@ func parseStreamMetadataBytes(src []byte, copyOpenInfo bool) (ParsedStreamMetada
 		}
 		if seenBit != 0 {
 			if seenSingleton&seenBit != 0 {
-				return errDuplicateMetadataSingleton
+				dropped = true
+				return nil
 			}
 			seenSingleton |= seenBit
 		}
@@ -202,11 +224,11 @@ func parseStreamMetadataBytes(src []byte, copyOpenInfo bool) (ParsedStreamMetada
 		}
 		return nil
 	})
-	if errors.Is(err, errDuplicateMetadataSingleton) {
-		return ParsedStreamMetadata{}, false, nil
-	}
 	if err != nil {
 		return ParsedStreamMetadata{}, false, err
+	}
+	if dropped {
+		return ParsedStreamMetadata{}, false, nil
 	}
 	return out, true, nil
 }
@@ -224,11 +246,18 @@ func ParseMetadataVarint(value []byte) (uint64, error) {
 
 func ParsePriorityUpdatePayload(payload []byte) (ParsedStreamMetadata, bool, error) {
 	out := ParsedStreamMetadata{}
+	dropped := false
 	err := walkTLVs(payload, func(typ uint64, value []byte) error {
+		// A duplicate singleton drops the update, but the walk goes on so a
+		// later structural error still rejects the frame (SPEC §7.2).
+		if dropped {
+			return nil
+		}
 		switch StreamMetadataType(typ) {
 		case MetadataStreamPriority:
 			if out.HasPriority {
-				return errDuplicateMetadataSingleton
+				dropped = true
+				return nil
 			}
 			parsed, err := ParseMetadataVarint(value)
 			if err != nil {
@@ -238,7 +267,8 @@ func ParsePriorityUpdatePayload(payload []byte) (ParsedStreamMetadata, bool, err
 			out.Priority = parsed
 		case MetadataStreamGroup:
 			if out.HasGroup {
-				return errDuplicateMetadataSingleton
+				dropped = true
+				return nil
 			}
 			parsed, err := ParseMetadataVarint(value)
 			if err != nil {
@@ -250,11 +280,11 @@ func ParsePriorityUpdatePayload(payload []byte) (ParsedStreamMetadata, bool, err
 		}
 		return nil
 	})
-	if errors.Is(err, errDuplicateMetadataSingleton) {
-		return ParsedStreamMetadata{}, false, nil
-	}
 	if err != nil {
 		return ParsedStreamMetadata{}, false, err
+	}
+	if dropped {
+		return ParsedStreamMetadata{}, false, nil
 	}
 	return out, true, nil
 }

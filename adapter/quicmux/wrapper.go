@@ -241,12 +241,17 @@ func (s *quicSession) OpenStreamWithOptions(ctx context.Context, opts zmux.OpenO
 		return nil, zmux.ErrSessionClosed
 	}
 	ctx = defaultContext(ctx)
+	wrapped := &quicStream{}
+	initLocalStreamBase(&wrapped.quicStreamBase, s.conn, nil, nil, opts)
+	if err := wrapped.freezeOpenPrelude(); err != nil {
+		return nil, err
+	}
 	stream, err := s.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, translateError(err)
 	}
-	wrapped := &quicStream{stream: stream}
-	initLocalStreamBase(&wrapped.quicStreamBase, s.conn, stream, stream, opts)
+	wrapped.stream = stream
+	wrapped.attachLocalStream(stream, stream)
 	if err := wrapped.maybeSendOpenPreludeOnOpen(ctx, stream); err != nil {
 		stream.CancelRead(quic.StreamErrorCode(zmux.CodeInternal))
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
@@ -262,12 +267,17 @@ func (s *quicSession) OpenUniStreamWithOptions(ctx context.Context, opts zmux.Op
 		return nil, zmux.ErrSessionClosed
 	}
 	ctx = defaultContext(ctx)
+	wrapped := &quicSendStream{}
+	initLocalStreamBase(&wrapped.quicStreamBase, s.conn, nil, nil, opts)
+	if err := wrapped.freezeOpenPrelude(); err != nil {
+		return nil, err
+	}
 	stream, err := s.conn.OpenUniStreamSync(ctx)
 	if err != nil {
 		return nil, translateError(err)
 	}
-	wrapped := &quicSendStream{stream: stream}
-	initLocalStreamBase(&wrapped.quicStreamBase, s.conn, nil, stream, opts)
+	wrapped.stream = stream
+	wrapped.attachLocalStream(nil, stream)
 	if err := wrapped.maybeSendOpenPreludeOnOpen(ctx, stream); err != nil {
 		stream.CancelWrite(quic.StreamErrorCode(zmux.CodeInternal))
 		_ = stream.Close()
@@ -322,6 +332,12 @@ func (s *quicSession) CloseWithError(err error) {
 		return
 	}
 	code, reason := mappedApplicationError(err, uint64(zmux.CodeCancelled))
+	if checkQUICErrorCode(code) != nil {
+		// The code has no wire form; close as an internal error, as the native
+		// session does when it cannot encode a CLOSE, instead of letting quic-go
+		// panic while packing CONNECTION_CLOSE.
+		code = uint64(zmux.CodeInternal)
+	}
 	_ = s.conn.CloseWithError(quic.ApplicationErrorCode(code), reason)
 }
 

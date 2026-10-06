@@ -1060,9 +1060,18 @@ func (c *Conn) visitPendingTerminalControlTxFramesLocked(stop *bool, collector *
 			}
 			continue
 		}
+		withOpener := target.needsPendingTerminalOpenerLocked()
+		if withOpener {
+			// The committed opener was withdrawn before it reached the writer,
+			// so the held RESET/STOP_SENDING carries a zero-length opener.
+			frames = append([]txFrame{target.dataFrameLocked(nil, dataFrameTraitOpenMetadata)}, frames...)
+		}
 		if !collector.appendFrames(frames) {
 			*stop = true
 			break
+		}
+		if withOpener {
+			c.markPeerVisibleLocked(target)
 		}
 		if c.dropPendingTerminalControlEntryLocked(id) {
 			released = true
@@ -1533,9 +1542,22 @@ func (c *Conn) applyPriorityUpdateLocked(streamID uint64, meta streamMetadata, n
 	return c.finishPriorityUpdateLocked(stream, meta, oldGroup, oldExplicit, now)
 }
 
+// handlePriorityUpdateFrame applies the PRIORITY_UPDATE rules in order: an
+// unnegotiated update is ignored without parsing (SPEC §7.6), stream 0 is a
+// session PROTOCOL error, a structurally malformed TLV sequence is
+// FRAME_SIZE, and a duplicate singleton drops the update.
 func (c *Conn) handlePriorityUpdateFrame(streamID uint64, payload []byte) error {
 	if !c.config.negotiated.Capabilities.Has(CapabilityPriorityUpdate) {
 		return nil
+	}
+	if streamID == 0 {
+		c.mu.Lock()
+		ignore := state.IgnorePeerNonCloseFrame(c.lifecycle.sessionState, c.lifecycle.closeErr != nil)
+		c.mu.Unlock()
+		if ignore {
+			return nil
+		}
+		return wireError(CodeProtocol, "handle PRIORITY_UPDATE", fmt.Errorf("PRIORITY_UPDATE requires non-zero stream_id"))
 	}
 
 	meta, ok, err := parsePriorityUpdatePayload(payload)

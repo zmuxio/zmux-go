@@ -1,19 +1,35 @@
 package runtime
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"sync/atomic"
 	"time"
 )
 
 const keepaliveJitterGamma uint64 = 0x9e3779b97f4a7c15
 
+// keepaliveJitterSeedCounter is the last-resort seed source for sessions
+// whose random seed draw failed. It starts at a random offset so that the
+// n-th fallback session of every process does not get the same sequence.
 var keepaliveJitterSeedCounter atomic.Uint64
+
+func init() {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err == nil {
+		keepaliveJitterSeedCounter.Store(binary.LittleEndian.Uint64(buf[:]))
+	}
+}
 
 func InitKeepaliveJitterState(seed uint64) uint64 {
 	if seed != 0 {
 		return seed
 	}
-	return keepaliveJitterSeedCounter.Add(keepaliveJitterGamma)
+	for {
+		if next := keepaliveJitterSeedCounter.Add(keepaliveJitterGamma); next != 0 {
+			return next
+		}
+	}
 }
 
 func InitSessionNonceState(seed uint64) uint64 {

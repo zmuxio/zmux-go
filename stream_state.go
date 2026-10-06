@@ -90,6 +90,9 @@ func (s *nativeStream) readErrLocked() error {
 		if s.readStopSentLocked() {
 			return ErrReadClosed
 		}
+		if s.recvEndedBySessionFlag() {
+			return s.recvEndedBySessionErrLocked()
+		}
 		if s.effectiveRecvHalfStateLocked() == state.RecvHalfFin {
 			return io.EOF
 		}
@@ -105,6 +108,9 @@ func (s *nativeStream) readClosedTerminationLocked() (Source, TerminationKind) {
 	}
 	if s.readStopSentLocked() && state.ReadErrorChoice(s.localReceive, s.localReadStop, s.effectiveRecvHalfStateLocked()) == state.TerminalErrorRecvClosed {
 		return SourceLocal, TerminationStopped
+	}
+	if s.recvEndedBySessionFlag() && s.conn != nil {
+		return sessionErrorSourceLocked(s.conn, s.conn.lifecycle.closeErr), TerminationSessionTermination
 	}
 	switch s.effectiveRecvHalfStateLocked() {
 	case state.RecvHalfFin:
@@ -271,17 +277,14 @@ func (s *nativeStream) peerDataPlanLocked(arrival peerDataArrival) state.PeerDat
 	if s == nil {
 		return state.PeerDataPlan{Outcome: state.PeerDataIgnore}
 	}
-	recvHalf := s.effectiveRecvHalfStateLocked()
-	// Local read-stop keeps late peer DATA on the discard path even after a
-	// trailing FIN converges the explicit recv half to recv_fin.
-	if s.readStopSentLocked() && recvHalf == state.RecvHalfFin {
-		recvHalf = state.RecvHalfStopSent
-	}
+	// A local read-stop does not hide an observed peer FIN: once the receive
+	// half reached recv_fin, later DATA is answered with ABORT(STREAM_CLOSED)
+	// exactly like the tombstone does (SPEC §9.2; STATE_MACHINE §5.1, §8.1).
 	return state.PeerDataTransition(
 		s.localSend,
 		s.localReceive,
 		s.effectiveSendHalfStateLocked(),
-		recvHalf,
+		s.effectiveRecvHalfStateLocked(),
 		arrival.hasFIN(),
 	)
 }
@@ -391,6 +394,12 @@ func (s *nativeStream) suppressWriteRequestErrLocked(req *writeRequest) error {
 	if sendHalf != state.SendHalfStopSeen && !state.SendTerminal(sendHalf) {
 		return nil
 	}
+	if s.allowsReadStopAfterSendTerminalLocked(req, sendHalf) {
+		return nil
+	}
+	if s.keepsQueuedOpenerAfterResetLocked(req, sendHalf) {
+		return nil
+	}
 	if req != nil && req.terminalPolicy.allowsTerminal() && s.allowsTerminalWriteRequestLocked(req) {
 		return nil
 	}
@@ -401,6 +410,31 @@ func (s *nativeStream) suppressWriteRequestErrLocked(req *writeRequest) error {
 		return err
 	}
 	return s.terminalErrLocked()
+}
+
+// allowsReadStopAfterSendTerminalLocked keeps a local STOP_SENDING flowing
+// after the local send half has concluded. The stop belongs to the receive
+// half, so FIN, RESET or a peer STOP_SENDING on the send half must not drop it
+// (SPEC §6.3, §9.3). Only a whole-stream ABORT makes it redundant.
+func (s *nativeStream) allowsReadStopAfterSendTerminalLocked(req *writeRequest, sendHalf state.SendHalfState) bool {
+	if s == nil || req == nil || sendHalf == state.SendHalfAborted {
+		return false
+	}
+	if s.effectiveRecvHalfStateLocked() == state.RecvHalfAborted {
+		return false
+	}
+	return req.carriesOnlyReadStopForStream(s.id)
+}
+
+// keepsQueuedOpenerAfterResetLocked lets the request that carries a local
+// stream's opening DATA reach the wire after a local RESET was committed
+// behind it. Dropping it would make the held RESET the stream's first frame,
+// which the peer must treat as a session PROTOCOL error (SPEC §6.7, §9.1).
+func (s *nativeStream) keepsQueuedOpenerAfterResetLocked(req *writeRequest, sendHalf state.SendHalfState) bool {
+	if s == nil || req == nil || sendHalf != state.SendHalfReset {
+		return false
+	}
+	return req.preparedOpenerVisibility.marksPeerVisible() && s.awaitingPeerVisibilityLocked()
 }
 
 func (s *nativeStream) ignoreLateNonOpeningControlLocked() bool {
@@ -656,10 +690,9 @@ type schedulerReleasePolicy uint8
 const schedulerReleaseDrop schedulerReleasePolicy = 1
 
 type transientStreamReleaseOptions struct {
-	queuedWake queuedDataWakePolicy
-	scheduler  schedulerReleasePolicy
-	send       bool
-	receive    streamReceiveReleaseMode
+	scheduler schedulerReleasePolicy
+	send      bool
+	receive   streamReceiveReleaseMode
 }
 
 func (c *Conn) releaseTerminalStreamStateLocked(stream *nativeStream, opts transientStreamReleaseOptions) {
@@ -675,7 +708,7 @@ func (c *Conn) releaseTerminalStreamStateLocked(stream *nativeStream, opts trans
 	if opts.scheduler == schedulerReleaseDrop {
 		c.dropWriteBatchStateLocked(stream)
 	}
-	c.releaseQueuedDataStreamStateLocked(stream, opts.queuedWake)
+	c.releaseQueuedDataStreamStateLocked(stream)
 	c.releaseStreamRetainedStateLocked(stream)
 }
 
@@ -963,7 +996,7 @@ func (c *Conn) lookupExistingPeerStreamLocked(frameName string, streamID uint64)
 	if stream := c.registry.streams[streamID]; stream != nil {
 		return stream, nil
 	}
-	if c.hasTerminalMarkerLocked(streamID) {
+	if c.hasTerminalMarkerLocked(streamID) || c.peerStreamRefusedByLocalGoAwayLocked(streamID) {
 		return nil, nil
 	}
 	return nil, wireError(
@@ -971,6 +1004,36 @@ func (c *Conn) lookupExistingPeerStreamLocked(frameName string, streamID uint64)
 		"handle "+frameName,
 		fmt.Errorf("%s on unknown stream %d", frameName, streamID),
 	)
+}
+
+// peerStreamRefusedByLocalGoAwayLocked reports a peer-owned ID above the local
+// GOAWAY watermark of its class. Watermarks never increase, so the ID can never
+// be opened and is known absent: the peer may still legally send RESET,
+// STOP_SENDING, MAX_DATA or BLOCKED on a stream it opened before it saw our
+// GOAWAY, and those frames are ignored rather than treated as a frame on an
+// unseen stream. The ID itself is not consumed (SPEC §3.1). Callers check live
+// streams and terminal markers first.
+func (c *Conn) peerStreamRefusedByLocalGoAwayLocked(streamID uint64) bool {
+	if c == nil || streamID == 0 || state.StreamIsLocal(c.config.negotiated.LocalRole, streamID) {
+		return false
+	}
+	return state.PeerOpenRefusedByGoAway(streamID, c.sessionControl.localGoAwayBidi, c.sessionControl.localGoAwayUni)
+}
+
+// notePeerOpenRefusedByLocalGoAwayLocked records a GOAWAY refusal of streamID
+// and reports whether it is the first one for that ID. Peers open IDs in
+// order, so one highest-refused ID per class is enough to answer each refused
+// stream with at most one ABORT(REFUSED_STREAM).
+func (c *Conn) notePeerOpenRefusedByLocalGoAwayLocked(streamID uint64) bool {
+	highest := &c.registry.highestRefusedPeerUni
+	if state.StreamIsBidi(streamID) {
+		highest = &c.registry.highestRefusedPeerBidi
+	}
+	if streamID <= *highest {
+		return false
+	}
+	*highest = streamID
+	return true
 }
 
 func (c *Conn) newPeerStreamLocked(id uint64) *nativeStream {
@@ -1015,8 +1078,8 @@ func (c *Conn) refusePeerStreamLocked(streamID uint64, stream *nativeStream, vis
 	c.noteAbortReasonLocked(uint64(CodeRefusedStream))
 	if stream != nil {
 		stream.setAbortedWithSource(refusedStreamAppErr(), terminalAbortLocal)
-		notify(stream.readNotify)
-		notify(stream.writeNotify)
+		stream.broadcastReadNotifyLocked()
+		stream.broadcastWriteNotifyLocked()
 		c.maybeCompactTerminalLocked(stream)
 	}
 	c.mu.Unlock()
@@ -1033,6 +1096,9 @@ func (c *Conn) openPeerStreamLocked(streamID uint64, visibility peerStreamVisibi
 		return nil, wireError(CodeProtocol, "open peer stream", fmt.Errorf("peer used local-owned stream id %d", streamID))
 	}
 	if state.PeerOpenRefusedByGoAway(streamID, c.sessionControl.localGoAwayBidi, c.sessionControl.localGoAwayUni) {
+		if !c.notePeerOpenRefusedByLocalGoAwayLocked(streamID) {
+			return nil, nil
+		}
 		if err := c.refusePeerStreamLocked(streamID, nil, visibility); err != nil {
 			return nil, err
 		}
@@ -1361,8 +1427,13 @@ func (s *nativeStream) setSendFin() {
 	}
 }
 
+// clearSendFin rolls back a prepared FIN that could not be queued. It only
+// undoes a FIN that is still the send-half state: when a concurrent RESET or
+// ABORT already replaced it, that terminal state wins and must not be
+// rewound to open/stop_seen (a CloseWrite racing CloseWithError would
+// otherwise surface the stream abort as a session error).
 func (s *nativeStream) clearSendFin() {
-	if s == nil {
+	if s == nil || !s.sendFinReachedLocked() {
 		return
 	}
 	s.sendResetSource = terminalResetDirect
@@ -1408,10 +1479,31 @@ func (s *nativeStream) setSendAbortWithSource(err *ApplicationError, source term
 	}
 }
 
+// captureLateDataCreditLocked records the stream credit the peer may still
+// legitimately have in flight when a local read-stop or local ABORT commits.
+// The late-data allowance for the direction never drops below it, so a peer
+// that stays within its advertised credit cannot trip the per-stream late-data
+// cap (SPEC §9.3, §9.5; API_SEMANTICS §3). Stream credit is not replenished
+// after the stop, so the advertised limit stays fixed from here on.
+func (s *nativeStream) captureLateDataCreditLocked() {
+	if s == nil || !s.localReceive {
+		return
+	}
+	switch s.effectiveRecvHalfStateLocked() {
+	case state.RecvHalfOpen, state.RecvHalfStopSent:
+	default:
+		return
+	}
+	if outstanding := csub(s.recvAdvertised, s.recvReceived); outstanding > s.lateDataCredit {
+		s.lateDataCredit = outstanding
+	}
+}
+
 func (s *nativeStream) setRecvStopSent() {
 	if s == nil {
 		return
 	}
+	s.captureLateDataCreditLocked()
 	s.localReadStop = true
 	s.storeRecvHalf(state.RecvHalfStopSent)
 	if s.conn != nil {
@@ -1443,6 +1535,9 @@ func (s *nativeStream) setRecvReset(err *ApplicationError) {
 func (s *nativeStream) setRecvAbortWithSource(err *ApplicationError, source terminalAbortSource) {
 	if s == nil {
 		return
+	}
+	if source == terminalAbortLocal {
+		s.captureLateDataCreditLocked()
 	}
 	s.recvAbort = err
 	s.recvAbortSurface = nil
@@ -1542,6 +1637,12 @@ type nativeStream struct {
 	recvBuffer       uint64
 	recvPending      uint64
 	lateDataReceived uint64
+	// lateDataCredit is the stream credit still outstanding when a local
+	// read-stop or local ABORT committed; see captureLateDataCreditLocked.
+	lateDataCredit uint64
+	// peerBlockedAdvertised is the stream limit seen by the previous peer
+	// BLOCKED for this stream (0 until the first one).
+	peerBlockedAdvertised uint64
 
 	provisionalIndex int32
 	acceptIndex      int32
@@ -1579,6 +1680,13 @@ type nativeStream struct {
 
 type streamProvisionalState struct {
 	created time.Time
+	// Commit-turn waits in progress, the start of the current waiting
+	// stretch, and the total of completed stretches. Waiting behind an earlier
+	// same-class opener is not idle provisional time, so it does not age the
+	// stream, even when that opener is later abandoned.
+	commitWaiters   int
+	commitWaitStart time.Time
+	commitWaited    time.Duration
 }
 
 type streamLocalOpenState struct {
@@ -1637,6 +1745,10 @@ const (
 	streamFlagAcceptedEventSent
 	streamFlagActiveCounted
 	streamFlagLocalReadSignalPending
+	// streamFlagRecvEndedBySession marks a receive half that session
+	// termination ended without a peer FIN, or whose unread bytes it
+	// discarded; see markRecvEndedBySessionLocked.
+	streamFlagRecvEndedBySession
 )
 
 func (s *nativeStream) clearQueueMembershipState() {
@@ -1684,6 +1796,45 @@ func (s *nativeStream) setProvisionalCreated(t time.Time) {
 		s.provisional = &streamProvisionalState{}
 	}
 	s.provisional.created = t
+}
+
+// provisionalAgeOriginLocked returns the creation time shifted past completed
+// commit-turn waits, and whether a commit-turn wait is in progress.
+func (s *nativeStream) provisionalAgeOriginLocked() (origin time.Time, waiting bool) {
+	if s == nil || s.provisional == nil {
+		return time.Time{}, false
+	}
+	p := s.provisional
+	if p.created.IsZero() {
+		return time.Time{}, p.commitWaiters > 0
+	}
+	return p.created.Add(p.commitWaited), p.commitWaiters > 0
+}
+
+func (s *nativeStream) beginProvisionalCommitWaitLocked(now time.Time) {
+	if s == nil || s.provisional == nil {
+		return
+	}
+	p := s.provisional
+	if p.commitWaiters == 0 {
+		p.commitWaitStart = now
+	}
+	p.commitWaiters++
+}
+
+func (s *nativeStream) endProvisionalCommitWaitLocked(now time.Time) {
+	if s == nil || s.provisional == nil || s.provisional.commitWaiters == 0 {
+		return
+	}
+	p := s.provisional
+	p.commitWaiters--
+	if p.commitWaiters > 0 {
+		return
+	}
+	if waited := now.Sub(p.commitWaitStart); waited > 0 {
+		p.commitWaited += waited
+	}
+	p.commitWaitStart = time.Time{}
 }
 
 func (s *nativeStream) clearProvisionalState() {
@@ -1765,6 +1916,46 @@ func (s *nativeStream) markLocalReadSignalPending() {
 
 func (s *nativeStream) clearLocalReadSignalPending() {
 	s.clearStreamFlag(streamFlagLocalReadSignalPending)
+}
+
+func (s *nativeStream) recvEndedBySessionFlag() bool {
+	return s.streamFlag(streamFlagRecvEndedBySession)
+}
+
+// markRecvEndedBySessionLocked records, before the session-close transition
+// runs, that the session rather than a peer FIN ends this receive half. Reads
+// then fail with the session error instead of reporting EOF: SPEC §6.10 fails
+// every remaining open stream on CLOSE, whatever its code, and §9.2 allows EOF
+// only after a peer FIN once all buffered data has been delivered. So a half
+// that is still open is marked on a graceful close (an abortive close aborts
+// it with the session's error instead), and a FIN'd half is marked when unread
+// bytes are about to be discarded. A drained FIN keeps its EOF, and a local
+// read-stop keeps its own error.
+func (s *nativeStream) markRecvEndedBySessionLocked(appErr *ApplicationError) {
+	if s == nil || !s.localReceive {
+		return
+	}
+	switch s.effectiveRecvHalfStateLocked() {
+	case state.RecvHalfOpen:
+		if appErr == nil {
+			s.markStreamFlag(streamFlagRecvEndedBySession)
+		}
+	case state.RecvHalfFin:
+		if len(s.readBuf) > 0 || s.recvBuffer > 0 {
+			s.markStreamFlag(streamFlagRecvEndedBySession)
+		}
+	default:
+	}
+}
+
+// recvEndedBySessionErrLocked is the read error of a half marked by
+// markRecvEndedBySessionLocked. It matches what a Read blocked at close time
+// gets from waitReadyErr / sessionWaitErr.
+func (s *nativeStream) recvEndedBySessionErrLocked() error {
+	if s == nil || s.conn == nil {
+		return ErrSessionClosed
+	}
+	return sessionOperationErrLocked(s.conn, OperationRead, visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr))
 }
 
 func setProvisionalIndex(stream *nativeStream, idx int32) {
@@ -2055,7 +2246,35 @@ func (s *nativeStream) pendingTerminalFlushStateLocked() (flush bool, keep bool)
 	if s == nil || !s.hasPendingTerminalControlLocked() {
 		return false, false
 	}
+	if s.holdsPendingTerminalBehindOpenerLocked() {
+		return false, true
+	}
 	return true, false
+}
+
+// holdsPendingTerminalBehindOpenerLocked reports whether a pending RESET or
+// STOP_SENDING must wait because the stream's opening DATA is still queued
+// in the writer. Neither frame may open a stream, and both would overtake the
+// opener on the urgent path (SPEC §9.1, IMPLEMENTATION §2.3). ABORT is
+// opening-eligible and is never held.
+func (s *nativeStream) holdsPendingTerminalBehindOpenerLocked() bool {
+	if s == nil || !s.idSet || s.pending.flags&streamPendingTerminalAbort != 0 {
+		return false
+	}
+	return s.visibilityPhaseLocked() == state.LocalOpenPhaseQueued
+}
+
+// needsPendingTerminalOpenerLocked reports whether a pending RESET or
+// STOP_SENDING has to carry its own zero-length opener because the stream's
+// committed opener was withdrawn before it reached the writer.
+func (s *nativeStream) needsPendingTerminalOpenerLocked() bool {
+	if s == nil || !s.idSet || s.pending.flags&streamPendingTerminalAbort != 0 {
+		return false
+	}
+	if s.pending.flags&(streamPendingTerminalStop|streamPendingTerminalReset) == 0 {
+		return false
+	}
+	return s.visibilityPhaseLocked() == state.LocalOpenPhaseNeedsEmit
 }
 
 func (s *nativeStream) clearPendingTerminalControlLocked() {

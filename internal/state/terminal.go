@@ -58,6 +58,9 @@ type PeerDataPlan struct {
 	Outcome            PeerDataOutcome
 	AdvanceRecvFin     bool
 	TrackLatePerStream bool
+	// EnforceStreamWindow keeps the advertised stream limit in force for
+	// discarded late DATA on a live read-stopped direction (SPEC §8, §9.3).
+	EnforceStreamWindow bool
 }
 
 type SessionClosePlan struct {
@@ -244,14 +247,14 @@ func PeerDataTransition(localSend, localReceive bool, sendHalf SendHalfState, re
 		}
 	case RecvHalfStopSent:
 		return PeerDataPlan{
-			Outcome:            PeerDataIgnore,
-			AdvanceRecvFin:     fin,
-			TrackLatePerStream: true,
+			Outcome:             PeerDataIgnore,
+			AdvanceRecvFin:      fin,
+			TrackLatePerStream:  true,
+			EnforceStreamWindow: true,
 		}
 	case RecvHalfFin:
-		if FullyTerminal(localSend, localReceive, sendHalf, recvHalf) {
-			return PeerDataPlan{Outcome: PeerDataIgnore}
-		}
+		// DATA after an observed peer FIN is a stream-state violation even when
+		// the stream is otherwise fully terminal (SPEC §9.2, §9.6).
 		return PeerDataPlan{Outcome: PeerDataAbortClosed}
 	default:
 		if FullyTerminal(localSend, localReceive, sendHalf, recvHalf) {

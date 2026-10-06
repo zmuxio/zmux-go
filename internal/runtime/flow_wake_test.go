@@ -60,3 +60,42 @@ func TestPlanLaneReleaseWakeBroadcastsOnMemoryRelief(t *testing.T) {
 		t.Fatal("Control = false, want true when memory wake occurs")
 	}
 }
+
+func TestQueueReleaseWakes(t *testing.T) {
+	tests := []struct {
+		name            string
+		prev, next, lwm uint64
+		want            bool
+	}{
+		{name: "crosses_low_watermark", prev: 6, next: 4, lwm: 4, want: true},
+		{name: "stays_above_low_watermark", prev: 8, next: 6, lwm: 4, want: false},
+		{name: "drains_below_low_watermark", prev: 3, next: 0, lwm: 4, want: true},
+		{name: "shrinks_below_low_watermark", prev: 3, next: 1, lwm: 4, want: false},
+		{name: "already_empty", prev: 0, next: 0, lwm: 4, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := QueueReleaseWakes(tc.prev, tc.next, tc.lwm); got != tc.want {
+				t.Fatalf("QueueReleaseWakes(%d, %d, %d) = %v, want %v", tc.prev, tc.next, tc.lwm, got, tc.want)
+			}
+		})
+	}
+}
+
+// A request larger than the gap between the watermarks can be blocked by a
+// queue that is already below the low watermark; draining that queue must
+// wake it even when session memory did not fall (no memory wake).
+func TestQueueReleaseWakePlansWakeOnDrainBelowLowWatermark(t *testing.T) {
+	plan := PlanQueueReleaseWake(90, 90, 80, 3, 0, 4, 2, 2, 4, false)
+	if !plan.Broadcast {
+		t.Fatal("PlanQueueReleaseWake Broadcast = false, want true when the session queue drains")
+	}
+	plan = PlanQueueReleaseWake(90, 90, 80, 9, 6, 4, 3, 0, 4, false)
+	if plan.Broadcast || !plan.StreamWake {
+		t.Fatalf("PlanQueueReleaseWake = %+v, want a stream wake when only the stream queue drains", plan)
+	}
+	plan = PlanPreparedReleaseWake(90, 90, 80, 3, 0, 4, 2, 2, 4, 1, 1, 1, 1, false)
+	if !plan.Broadcast {
+		t.Fatal("PlanPreparedReleaseWake Broadcast = false, want true when the session queue drains")
+	}
+}
