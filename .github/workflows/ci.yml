@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'releases/*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.module.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - name: root
+            path: .
+          - name: adapter-quicmux
+            path: adapter/quicmux
+    defaults:
+      run:
+        working-directory: ${{ matrix.module.path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module.path }}/go.mod
+          cache-dependency-path: |
+            ${{ matrix.module.path }}/go.mod
+            adapter/quicmux/go.sum
+            go.work
+            go.work.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needs to be run on:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          working-directory: ${{ matrix.module.path }}
