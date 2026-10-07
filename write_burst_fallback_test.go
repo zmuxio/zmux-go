@@ -165,9 +165,9 @@ func TestWriteFinalStepFallbackStopsBeforeReservingWhatTheQueueCannotTake(t *tes
 	case <-done:
 	case <-time.After(testSignalTimeout):
 		c.mu.Lock()
-		sent, max, fin := impl.sendSent, impl.sendMax, impl.sendFinReachedLocked()
+		sent, sendMax, fin := impl.sendSent, impl.sendMax, impl.sendFinReachedLocked()
 		c.mu.Unlock()
-		t.Fatalf("WriteFinal did not finish (stream sendSent=%d sendMax=%d finReserved=%v)", sent, max, fin)
+		t.Fatalf("WriteFinal did not finish (stream sendSent=%d sendMax=%d finReserved=%v)", sent, sendMax, fin)
 	}
 	if r := <-results; r.n != size || r.err != nil {
 		t.Fatalf("WriteFinal = (%d, %v), want (%d, nil)", r.n, r.err, size)

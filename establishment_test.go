@@ -53,11 +53,13 @@ func (c *lateWriterConn) Write(p []byte) (int, error) {
 			return 0, io.ErrClosedPipe
 		}
 		if c.deadlineSets >= 2 {
-			defer c.mu.Unlock()
 			if !c.deadline.IsZero() && !time.Now().Before(c.deadline) {
+				c.mu.Unlock()
 				return 0, os.ErrDeadlineExceeded
 			}
-			return c.written.Write(p)
+			n, err := c.written.Write(p)
+			c.mu.Unlock()
+			return n, err
 		}
 		changed := c.changed
 		c.mu.Unlock()

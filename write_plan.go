@@ -331,7 +331,7 @@ func planPreparedWriteStep(totalRemaining int, mode writeChunkMode, window write
 	if chunk == 0 {
 		return preparedWriteStepPlan{}
 	}
-	plan := preparedWriteStepPlan{chunk: chunk, ready: true}
+	plan := preparedWriteStepPlan{chunk: chunk, fin: writeFinDefer, ready: true}
 	if mode.isFinal() && int(chunk) == totalRemaining {
 		plan.traits |= dataFrameTraitFIN
 		plan.fin = writeFinReserve

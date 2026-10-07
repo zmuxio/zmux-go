@@ -62,9 +62,29 @@ func TestPublicProtocolAliasesRemainPinned(t *testing.T) {
 			want: func() uint64 { return uint64(wire.SettingInitialMaxData) },
 		},
 		{
+			name: "SettingMaxIncomingStreamsBidi",
+			got:  func() uint64 { return uint64(SettingMaxIncomingStreamsBidi) },
+			want: func() uint64 { return uint64(wire.SettingMaxIncomingStreamsBidi) },
+		},
+		{
 			name: "SettingMaxIncomingStreamsUni",
 			got:  func() uint64 { return uint64(SettingMaxIncomingStreamsUni) },
 			want: func() uint64 { return uint64(wire.SettingMaxIncomingStreamsUni) },
+		},
+		{
+			name: "SettingMaxFramePayload",
+			got:  func() uint64 { return uint64(SettingMaxFramePayload) },
+			want: func() uint64 { return uint64(wire.SettingMaxFramePayload) },
+		},
+		{
+			name: "SettingMaxControlPayloadBytes",
+			got:  func() uint64 { return uint64(SettingMaxControlPayloadBytes) },
+			want: func() uint64 { return uint64(wire.SettingMaxControlPayloadBytes) },
+		},
+		{
+			name: "SettingMaxExtensionPayloadBytes",
+			got:  func() uint64 { return uint64(SettingMaxExtensionPayloadBytes) },
+			want: func() uint64 { return uint64(wire.SettingMaxExtensionPayloadBytes) },
 		},
 		{
 			name: "SettingSchedulerHints",

@@ -477,18 +477,20 @@ func assertErrorPayloadFixture(t *testing.T, frame Frame, expect wireFixtureDeco
 		code      uint64
 		reason    string
 		mandatory int
-		err       error
 	)
 	if frame.Type == FrameTypeGOAWAY {
-		var goAway goAwayPayload
-		goAway, err = parseGOAWAYPayload(frame.Payload)
+		goAway, err := parseGOAWAYPayload(frame.Payload)
+		if err != nil {
+			t.Fatalf("parse %s payload: %v", frame.Type, err)
+		}
 		code, reason, mandatory = goAway.Code, goAway.Reason, 3
 	} else {
+		var err error
 		code, reason, err = parseErrorPayload(frame.Payload)
+		if err != nil {
+			t.Fatalf("parse %s payload: %v", frame.Type, err)
+		}
 		mandatory = 1
-	}
-	if err != nil {
-		t.Fatalf("parse %s payload: %v", frame.Type, err)
 	}
 	if expect.ErrorCode != nil && code != *expect.ErrorCode {
 		t.Fatalf("error_code = %d, want %d", code, *expect.ErrorCode)
