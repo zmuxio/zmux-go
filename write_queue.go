@@ -14,15 +14,27 @@ import (
 )
 
 type writeRequest struct {
-	frames         []txFrame
-	done           chan error
-	cancel         *queuedWriteCancel
-	cancelReusable bool
+	done   chan error
+	cancel *queuedWriteCancel
+	// preparedNotify lets tests observe writer-admission readiness.
+	preparedNotify          chan struct{}
+	reservedStream          *nativeStream
+	frames                  []txFrame
+	preparedPriorityPayload []byte
+	queuedBytes             uint64
+	requestStreamID         uint64
+	requestUrgencyRank      int
+	requestCost             int64
+	requestBufferedBytes    uint64
+	// preparedSend* tracks withdrawable send-side reservations.
+	preparedSendBytes uint64
+	// preparedPriority* tracks a withdrawable piggybacked PRIORITY_UPDATE.
+	preparedPriorityStreamID uint64
+	preparedPriorityBytes    uint64
+	cancelReusable           bool
 	// donePooled allows recycling pooled completion channels.
 	donePooled   bool
 	doneReusable bool
-	// preparedNotify lets tests observe writer-admission readiness.
-	preparedNotify chan struct{}
 	// origin distinguishes stream-generated writes from control-plane writes.
 	origin writeRequestOrigin
 	// terminalPolicy permits terminal frames from local state transitions.
@@ -31,18 +43,12 @@ type writeRequest struct {
 	cloneFramesBeforeSend bool
 	// queueReserved tracks ordinary queue reservation.
 	queueReserved    bool
-	queuedBytes      uint64
-	reservedStream   *nativeStream
 	urgentReserved   bool
 	advisoryReserved bool
 	// requestMetaReady guards cached frame classification.
 	requestMetaReady        bool
-	requestStreamID         uint64
 	requestStreamIDKnown    bool
 	requestStreamScoped     bool
-	requestUrgencyRank      int
-	requestCost             int64
-	requestBufferedBytes    uint64
 	requestIsPriorityUpdate bool
 	requestAllUrgent        bool
 	terminalDataPriority    bool
@@ -50,15 +56,9 @@ type writeRequest struct {
 	terminalAbortOnly       bool
 	terminalStopOnly        bool
 	terminalHasFIN          bool
-	// preparedSend* tracks withdrawable send-side reservations.
-	preparedSendBytes uint64
-	preparedSendFin   bool
+	preparedSendFin         bool
 	// preparedOpenerVisibility holds opener ordering until admission or rollback.
 	preparedOpenerVisibility openerVisibilityMark
-	// preparedPriority* tracks a withdrawable piggybacked PRIORITY_UPDATE.
-	preparedPriorityStreamID uint64
-	preparedPriorityPayload  []byte
-	preparedPriorityBytes    uint64
 	preparedPriorityQueued   bool
 }
 
@@ -107,21 +107,19 @@ func (c *queuedWriteCancel) tryMarkWriting() bool {
 }
 
 type txFrame struct {
-	Type     FrameType
-	Flags    byte
-	StreamID uint64
-	Payload  []byte
-
-	streamIDPacked uint64
-	streamIDLen    uint8
-
-	payloadKind    txPayloadKind
+	Payload        []byte
 	payloadPrefix  []byte
 	payloadParts   [][]byte
+	StreamID       uint64
+	streamIDPacked uint64
 	payloadPartIdx int
 	payloadPartOff int
 	payloadPartLen int
 	payloadLen     int
+	Type           FrameType
+	Flags          byte
+	streamIDLen    uint8
+	payloadKind    txPayloadKind
 }
 
 const postCloseQueueDrainWindow = 5 * time.Millisecond
@@ -653,12 +651,12 @@ func (o frameOwnership) ownsFrames() bool {
 }
 
 type queuedWriteOptions struct {
-	terminalPolicy   terminalWritePolicy
 	deadlineOverride time.Time
+	queuedBytes      uint64
+	terminalPolicy   terminalWritePolicy
 	ownership        frameOwnership
 	// cloneFramesBeforeSend lets queued writes outlive caller-owned payloads.
 	cloneFramesBeforeSend bool
-	queuedBytes           uint64
 	deadlinePolicy        writeDeadlinePolicy
 	openerVisibility      openerVisibilityMark
 }
@@ -773,8 +771,8 @@ type frameLaneRequestOptions struct {
 }
 
 type streamWriteDispatchOptions struct {
-	lane             writeLane
 	deadlineOverride time.Time
+	lane             writeLane
 	deadlinePolicy   writeDeadlinePolicy
 }
 

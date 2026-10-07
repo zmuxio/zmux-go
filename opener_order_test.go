@@ -13,10 +13,10 @@ import (
 
 type concurrentOpenCase struct {
 	name     string
-	uni      bool
 	streams  int
 	rounds   int
 	payload  int
+	uni      bool
 	priority bool
 }
 

@@ -58,14 +58,14 @@ const (
 
 // Event is delivered to EventHandler.
 type Event struct {
-	Type               EventType
-	SessionState       SessionState
-	StreamID           uint64
+	Time               time.Time
 	Stream             Stream
+	Err                error
+	Type               EventType
+	StreamID           uint64
+	SessionState       SessionState
 	Local              bool
 	Bidi               bool
-	Time               time.Time
-	Err                error
 	ApplicationVisible bool
 }
 
@@ -682,11 +682,11 @@ type HiddenStats struct {
 type AcceptBacklogStats struct {
 	Count      int
 	CountLimit int
-	AtCountCap bool
 	Bytes      uint64
 	BytesLimit uint64
-	AtBytesCap bool
 	Refused    uint64
+	AtCountCap bool
+	AtBytesCap bool
 }
 
 // ProvisionalStats reports provisional-open counts and limits.
@@ -2714,27 +2714,23 @@ type connLivenessState struct {
 }
 
 type connSessionControlState struct {
-	peerGoAwayBidi  uint64
-	peerGoAwayUni   uint64
-	localGoAwayBidi uint64
-	localGoAwayUni  uint64
-	peerGoAwayErr   *ApplicationError
-	peerCloseErr    *ApplicationError
-	peerCloseView   atomic.Pointer[ApplicationError]
-
+	peerGoAwayErr         *ApplicationError
+	peerCloseErr          *ApplicationError
+	peerCloseView         atomic.Pointer[ApplicationError]
+	pendingGoAwayPayload  []byte
+	peerGoAwayBidi        uint64
+	peerGoAwayUni         uint64
+	localGoAwayBidi       uint64
+	localGoAwayUni        uint64
 	peerGoAwayReasonBytes uint64
 	peerCloseReasonBytes  uint64
-
-	sentGoAwayBidi uint64
-	sentGoAwayUni  uint64
-	hasSentGoAway  bool
-
-	pendingGoAwayBidi    uint64
-	pendingGoAwayUni     uint64
-	pendingGoAwayPayload []byte
-	hasPendingGoAway     bool
-	goAwaySendActive     bool
-
+	sentGoAwayBidi        uint64
+	sentGoAwayUni         uint64
+	pendingGoAwayBidi     uint64
+	pendingGoAwayUni      uint64
+	hasSentGoAway         bool
+	hasPendingGoAway      bool
+	goAwaySendActive      bool
 	// localStreamIDsExhausted is set once a local stream ID class ran out.
 	localStreamIDsExhausted bool
 }
@@ -2836,105 +2832,99 @@ type connQueueState struct {
 }
 
 type connAbuseState struct {
-	abuseWindow             time.Duration
-	hiddenAbortChurnWindow  time.Duration
-	hiddenAbortChurnLimit   uint32
-	visibleChurnWindow      time.Duration
-	visibleChurnLimit       uint32
-	controlFrameBudget      uint32
-	controlByteBudget       uint64
-	extFrameBudget          uint32
-	extByteBudget           uint64
-	mixedFrameBudget        uint32
-	mixedByteBudget         uint64
-	noOpControlFloodLimit   uint32
-	noOpMaxDataFloodLimit   uint32
-	noOpBlockedFloodLimit   uint32
-	noOpZeroDataFloodLimit  uint32
-	noOpPriorityFloodLimit  uint32
-	groupRebucketFloodLimit uint32
-	pingFloodLimit          uint32
-
+	abuseWindow              time.Duration
+	hiddenAbortChurnWindow   time.Duration
+	visibleChurnWindow       time.Duration
+	controlByteBudget        uint64
+	extByteBudget            uint64
+	mixedByteBudget          uint64
 	hiddenAbortWindowStart   windowStamp
-	hiddenAbortCount         uint32
 	visibleChurnWindowStart  windowStamp
-	visibleChurnCount        uint32
 	controlBudgetWindowStart windowStamp
-	controlBudgetFrames      uint32
 	controlBudgetBytes       uint64
 	extBudgetWindowStart     windowStamp
-	extBudgetFrames          uint32
 	extBudgetBytes           uint64
 	mixedBudgetWindowStart   windowStamp
-	mixedBudgetFrames        uint32
 	mixedBudgetBytes         uint64
 	noopControlWindowStart   windowStamp
-	noopControlCount         uint32
 	noopMaxDataWindowStart   windowStamp
-	noopMaxDataCount         uint32
 	noopBlockedWindowStart   windowStamp
-	noopBlockedCount         uint32
 	noopDataWindowStart      windowStamp
-	noopDataCount            uint32
 	noopPriorityWindowStart  windowStamp
-	noopPriorityCount        uint32
 	groupRebucketWindowStart windowStamp
-	groupRebucketCount       uint32
 	pingFloodWindowStart     windowStamp
+	hiddenAbortChurnLimit    uint32
+	visibleChurnLimit        uint32
+	controlFrameBudget       uint32
+	extFrameBudget           uint32
+	mixedFrameBudget         uint32
+	noOpControlFloodLimit    uint32
+	noOpMaxDataFloodLimit    uint32
+	noOpBlockedFloodLimit    uint32
+	noOpZeroDataFloodLimit   uint32
+	noOpPriorityFloodLimit   uint32
+	groupRebucketFloodLimit  uint32
+	pingFloodLimit           uint32
+	hiddenAbortCount         uint32
+	visibleChurnCount        uint32
+	controlBudgetFrames      uint32
+	extBudgetFrames          uint32
+	mixedBudgetFrames        uint32
+	noopControlCount         uint32
+	noopMaxDataCount         uint32
+	noopBlockedCount         uint32
+	noopDataCount            uint32
+	noopPriorityCount        uint32
+	groupRebucketCount       uint32
 	pingFloodCount           uint32
 }
 
 type connRegistryState struct {
-	streams              map[uint64]*nativeStream
-	liveStreamCount      int
-	liveStreamsInit      bool
-	tombstones           map[uint64]streamTombstone
-	tombstoneOrder       []uint64
-	tombstoneHead        int
-	tombstoneCount       int
-	tombstonesInit       bool
-	hiddenTombstoneOrder []uint64
-	hiddenTombstoneHead  int
-	hiddenTombstoneCount int
-	usedStreamData       map[uint64]usedStreamMarker
+	openerTurnReleasedBidi time.Time
+	openerTurnReleasedUni  time.Time
+	streams                map[uint64]*nativeStream
+	tombstones             map[uint64]streamTombstone
+	usedStreamData         map[uint64]usedStreamMarker
 	// usedStreamRanges holds the compacted used-stream markers of each stream
 	// ID class (stream_id & 3), each sorted by start.
-	usedStreamRanges [usedStreamClasses][]usedStreamRange
+	usedStreamRanges     [usedStreamClasses][]usedStreamRange
+	tombstoneOrder       []uint64
+	hiddenTombstoneOrder []uint64
 	// usedStreamFloors are the coarsened prefixes of each class: every used ID
 	// at or below the floor reads as coarsenedUsedStreamMarker (0 = none).
 	usedStreamFloors     [usedStreamClasses]uint64
-	usedStreamRangeMode  bool
+	liveStreamCount      int
+	tombstoneHead        int
+	tombstoneCount       int
+	hiddenTombstoneHead  int
+	hiddenTombstoneCount int
 	tombstoneLimit       int
-	hiddenTombstonesInit bool
-
-	nextLocalBidi uint64
-	nextLocalUni  uint64
-	nextPeerBidi  uint64
-	nextPeerUni   uint64
-
+	nextLocalBidi        uint64
+	nextLocalUni         uint64
+	nextPeerBidi         uint64
+	nextPeerUni          uint64
 	// highestRefusedPeerBidi/highestRefusedPeerUni are the highest peer IDs of
 	// each class already answered with ABORT(REFUSED_STREAM) for opening above
 	// the local GOAWAY watermark (0 = none). Such IDs are not consumed, so
 	// these keep a refused ID from being refused again for every DATA frame.
 	highestRefusedPeerBidi uint64
 	highestRefusedPeerUni  uint64
-
 	// openerTurnBidi/openerTurnUni hold the last committed local stream ID of
 	// each class until the writer takes that stream's first frame into a
 	// batch (0 when none is outstanding). A later stream of the same class
 	// commits only after that, so opening frames reach the wire in stream-ID
 	// order (SPEC §3.1).
-	openerTurnBidi         uint64
-	openerTurnUni          uint64
-	openerTurnReleasedBidi time.Time
-	openerTurnReleasedUni  time.Time
-
-	activeLocalBidi uint64
-	activeLocalUni  uint64
-	activePeerBidi  uint64
-	activePeerUni   uint64
-
-	nextVisibilitySeq uint64
+	openerTurnBidi       uint64
+	openerTurnUni        uint64
+	activeLocalBidi      uint64
+	activeLocalUni       uint64
+	activePeerBidi       uint64
+	activePeerUni        uint64
+	nextVisibilitySeq    uint64
+	liveStreamsInit      bool
+	tombstonesInit       bool
+	usedStreamRangeMode  bool
+	hiddenTombstonesInit bool
 }
 
 // Conn is the native zmux session implementation.

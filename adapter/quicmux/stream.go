@@ -15,32 +15,29 @@ import (
 )
 
 type quicStreamBase struct {
-	conn          SessionConn
-	reader        io.Reader
-	preludeWriter io.Writer
-	sendPrelude   bool
-
-	writeMu sync.Mutex
-	metaMu  sync.Mutex
-	termMu  sync.Mutex
-
-	prelude       []byte
-	preludeSent   bool
-	preludeFrozen bool
-	preludeOffset int
-	priority      uint64
-	prioritySet   bool
-	group         uint64
-	groupEncoded  bool
-	openInfo      []byte
-
-	localReadClosed  atomic.Bool
-	localWriteClosed atomic.Bool
+	conn             SessionConn
+	reader           io.Reader
+	preludeWriter    io.Writer
 	localReadErr     error
 	localWriteErr    error
 	active           *quicActiveStreamCounters
-	activeKind       quicActiveStreamKind
+	prelude          []byte
+	openInfo         []byte
+	preludeOffset    int
+	priority         uint64
+	group            uint64
+	writeMu          sync.Mutex
+	metaMu           sync.Mutex
+	termMu           sync.Mutex
+	localReadClosed  atomic.Bool
+	localWriteClosed atomic.Bool
 	activeTracked    atomic.Bool
+	sendPrelude      bool
+	preludeSent      bool
+	preludeFrozen    bool
+	prioritySet      bool
+	groupEncoded     bool
+	activeKind       quicActiveStreamKind
 }
 
 type writeDeadlineSetter interface {

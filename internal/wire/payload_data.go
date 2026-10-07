@@ -8,11 +8,11 @@ type DataPayload struct {
 }
 
 type ParsedStreamMetadata struct {
-	HasPriority bool
-	Priority    uint64
-	HasGroup    bool
-	Group       uint64
 	OpenInfo    []byte
+	Priority    uint64
+	Group       uint64
+	HasPriority bool
+	HasGroup    bool
 }
 
 func ParseDataPayload(payload []byte, flags byte) (DataPayload, error) {

@@ -464,8 +464,8 @@ session, err := zmux.New(rwc, cfg)
 ```
 
 Start from `DefaultConfig()` for normal sessions. Constructors called with a nil config also use the
-process-wide default template. A literal `&zmux.Config{}` keeps the zero-value role
-(`RoleInitiator`), so set `Role` explicitly when endpoint ordering is not fixed.
+process-wide default template. A literal `&zmux.Config{}` keeps the zero-value role (`RoleInitiator`), so set `Role`
+explicitly when endpoint ordering is not fixed.
 
 Use `ConfigureDefaultConfig` during process initialization to adjust the default template:
 

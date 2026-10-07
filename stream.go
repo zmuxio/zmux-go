@@ -1313,8 +1313,8 @@ const (
 )
 
 type terminalSignalPlan struct {
-	frameType        FrameType
 	payload          []byte
+	frameType        FrameType
 	openerVisibility openerVisibilityMark
 	disposition      terminalSignalDisposition
 	writeWake        terminalWriteWakePolicy

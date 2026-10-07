@@ -220,14 +220,14 @@ func (k TerminationKind) String() string {
 
 // Error is the structured error wrapper returned by public APIs.
 type Error struct {
+	Err             error
+	ReasonText      string
+	WireCode        uint64
 	Scope           Scope
 	Operation       Operation
 	Source          Source
-	WireCode        uint64
-	ReasonText      string
 	Direction       Direction
 	TerminationKind TerminationKind
-	Err             error
 }
 
 func (e *Error) Error() string {

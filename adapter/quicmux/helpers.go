@@ -33,11 +33,11 @@ var emptyStreamPrelude = []byte{0}
 var errWritevPayloadTooLarge = errors.New("quicmux: writev payload length exceeds int")
 
 type acceptedStreamMetadata struct {
-	priority     uint64
-	prioritySet  bool
-	group        uint64
-	groupEncoded bool
 	openInfo     []byte
+	priority     uint64
+	group        uint64
+	prioritySet  bool
+	groupEncoded bool
 }
 
 func readAcceptedStreamMetadata(reader io.Reader) (acceptedStreamMetadata, error) {

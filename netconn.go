@@ -36,31 +36,25 @@ type WriteHalf interface {
 // Either half may be nil. PauseRead and PauseWrite detach ownership until the
 // returned handle resumes the half.
 type JoinedConn struct {
-	mu sync.Mutex
-
-	readNotify  chan struct{}
-	writeNotify chan struct{}
-	closedCh    chan struct{}
-
-	readHalf  ReadHalf
-	writeHalf WriteHalf
-
-	readPaused  bool
-	writePaused bool
-
+	readDeadline           time.Time
+	writeDeadline          time.Time
+	readHalf               ReadHalf
+	writeHalf              WriteHalf
+	readNotify             chan struct{}
+	writeNotify            chan struct{}
+	closedCh               chan struct{}
 	activeReadOps          int
 	activeWriteOps         int
 	activeReadDeadlineOps  int
 	activeWriteDeadlineOps int
 	readWaiters            int
 	writeWaiters           int
-
-	readDeadline     time.Time
-	writeDeadline    time.Time
-	readDeadlineGen  uint64
-	writeDeadlineGen uint64
-
-	closed bool
+	readDeadlineGen        uint64
+	writeDeadlineGen       uint64
+	mu                     sync.Mutex
+	readPaused             bool
+	writePaused            bool
+	closed                 bool
 }
 
 // PausedReadHalf owns a detached read half until Resume reattaches it.
