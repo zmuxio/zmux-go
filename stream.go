@@ -1,2002 +1,404 @@
 package zmux
 
 import (
-	"bytes"
-	"errors"
-	"fmt"
+	"context"
 	"io"
 	"net"
 	"os"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	rt "github.com/zmuxio/zmux-go/internal/runtime"
-	"github.com/zmuxio/zmux-go/internal/state"
-	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-type streamAddrProvider interface {
-	LocalAddr() net.Addr
-	RemoteAddr() net.Addr
+// handle is the application's side of one core stream. rmu and wmu
+// serialise reads and writes (lock level L0); close, cancel and deadline
+// changes never take them, so they can interrupt a blocked call.
+type handle struct {
+	c    *Conn
+	st   *core.Stream
+	rsig core.Signal // lazy: its channel is made by the first wait
+	wsig core.Signal
+	rmu  sync.Mutex
+	wmu  sync.Mutex
+	dl   atomic.Pointer[deadlines] // nil until a deadline is set
+
+	// Guarded by the session lock.
+	sendDone, recvDone, released bool
 }
 
-type streamAddr struct {
-	endpoint    string
-	streamID    uint64
-	streamIDSet bool
+func (c *Conn) newHandle(st *core.Stream) *handle {
+	h := &handle{c: c, st: st}
+	st.SetSignals(&h.rsig, &h.wsig)
+	h.sendDone = !st.Bidi() && !st.Local()
+	h.recvDone = !st.Bidi() && st.Local()
+	return h
 }
 
-func (a streamAddr) Network() string {
-	return "zmux"
+// cleanupHandle runs on the runtime's cleanup goroutine when a handle is
+// collected without being closed: reset(0) and stop(0) (API.md 5.1).
+func cleanupHandle(h *handle) {
+	h.stopDeadlines()
+	h.c.orphan(h.st)
 }
 
-func (a streamAddr) String() string {
-	if a.streamIDSet {
-		return fmt.Sprintf("%s/stream/%d", a.endpoint, a.streamID)
+// deadlines are a handle's read and write deadlines, allocated when the
+// first one is set.
+type deadlines struct{ r, w deadline }
+
+func (h *handle) deadlines() *deadlines {
+	if d := h.dl.Load(); d != nil {
+		return d
 	}
-	return fmt.Sprintf("%s/stream/pending", a.endpoint)
+	h.dl.CompareAndSwap(nil, &deadlines{})
+	return h.dl.Load()
 }
 
-func (s *nativeStream) LocalAddr() net.Addr {
-	return s.streamAddr(streamAddrEndpointLocal)
+// rwait and wwait return the channels a blocked read or write selects on:
+// nil while no deadline was ever set (setting one wakes the call, which
+// then selects on the new channel).
+func (h *handle) rwait() chan struct{} {
+	if d := h.dl.Load(); d != nil {
+		return d.r.wait()
+	}
+	return nil
 }
 
-func (s *nativeStream) RemoteAddr() net.Addr {
-	return s.streamAddr(streamAddrEndpointRemote)
+func (h *handle) wwait() chan struct{} {
+	if d := h.dl.Load(); d != nil {
+		return d.w.wait()
+	}
+	return nil
 }
 
-func (s *nativeStream) OpenedLocally() bool {
-	if s == nil {
-		return false
+// setDeadline moves a deadline and wakes a call blocked without one.
+func (h *handle) setDeadline(read, write bool, t time.Time) {
+	d := h.deadlines()
+	if read {
+		d.r.set(t)
 	}
-	if s.conn == nil {
-		return s.isLocalOpenedLocked()
+	if write {
+		d.w.set(t)
 	}
-	s.conn.mu.Lock()
-	defer s.conn.mu.Unlock()
-	return s.isLocalOpenedLocked()
+	h.c.lock()
+	if read {
+		h.rsig.FireLocked()
+	}
+	if write {
+		h.wsig.FireLocked()
+	}
+	h.c.unlock()
 }
 
-func (s *nativeStream) Bidirectional() bool {
-	return s != nil && s.bidi
-}
-
-func (s *nativeStream) ReadClosed() bool {
-	if s == nil {
-		return true
-	}
-	if s.conn != nil {
-		s.conn.mu.Lock()
-		defer s.conn.mu.Unlock()
-	}
-	if !s.localReceive {
-		return true
-	}
-	if s.readStopSentLocked() {
-		return true
-	}
-	return state.RecvTerminal(s.effectiveRecvHalfStateLocked())
-}
-
-func (s *nativeStream) WriteClosed() bool {
-	if s == nil {
-		return true
-	}
-	if s.conn != nil {
-		s.conn.mu.Lock()
-		defer s.conn.mu.Unlock()
-	}
-	if !s.localSend {
-		return true
-	}
-	return s.effectiveSendHalfStateLocked() != state.SendHalfOpen
-}
-
-type streamAddrEndpoint uint8
-
-const (
-	streamAddrEndpointRemote streamAddrEndpoint = iota
-	streamAddrEndpointLocal
-)
-
-func (e streamAddrEndpoint) endpointName() string {
-	if e == streamAddrEndpointLocal {
-		return "local"
-	}
-	return "remote"
-}
-
-func (e streamAddrEndpoint) providerAddr(provider streamAddrProvider) net.Addr {
-	if provider == nil {
-		return nil
-	}
-	if e == streamAddrEndpointLocal {
-		return provider.LocalAddr()
-	}
-	return provider.RemoteAddr()
-}
-
-func (s *nativeStream) streamAddr(endpoint streamAddrEndpoint) net.Addr {
-	var (
-		provider streamAddrProvider
-		streamID uint64
-		idSet    bool
-	)
-	if s != nil && s.conn != nil {
-		s.conn.mu.Lock()
-		streamID = s.id
-		idSet = s.idSet
-		if conn := s.conn.io.conn; conn != nil {
-			provider, _ = conn.(streamAddrProvider)
-		}
-		s.conn.mu.Unlock()
-		if provider != nil {
-			if addr := endpoint.providerAddr(provider); addr != nil {
-				return addr
-			}
-		}
-	}
-
-	if s == nil {
-		return streamAddr{endpoint: endpoint.endpointName()}
-	}
-	return streamAddr{
-		endpoint:    endpoint.endpointName(),
-		streamID:    streamID,
-		streamIDSet: idSet,
+func (h *handle) stopDeadlines() {
+	if d := h.dl.Load(); d != nil {
+		d.r.stop()
+		d.w.stop()
 	}
 }
 
-type nativeSendStream struct {
-	stream *nativeStream
-}
-
-func (s *nativeSendStream) StreamID() uint64 {
-	if s == nil || s.stream == nil {
-		return 0
-	}
-	return s.stream.StreamID()
-}
-
-func (s *nativeSendStream) OpenedLocally() bool {
-	if s == nil || s.stream == nil {
-		return false
-	}
-	return s.stream.OpenedLocally()
-}
-
-func (s *nativeSendStream) Bidirectional() bool {
-	if s == nil || s.stream == nil {
-		return false
-	}
-	return s.stream.Bidirectional()
-}
-
-func (s *nativeSendStream) WriteClosed() bool {
-	if s == nil || s.stream == nil {
-		return true
-	}
-	return s.stream.WriteClosed()
-}
-
-func (s *nativeSendStream) OpenInfo() []byte {
-	if s == nil || s.stream == nil {
-		return nil
-	}
-	return s.stream.OpenInfo()
-}
-
-func (s *nativeSendStream) LocalAddr() net.Addr {
-	if s == nil || s.stream == nil {
-		return streamAddr{endpoint: "local"}
-	}
-	return s.stream.LocalAddr()
-}
-
-func (s *nativeSendStream) RemoteAddr() net.Addr {
-	if s == nil || s.stream == nil {
-		return streamAddr{endpoint: "remote"}
-	}
-	return s.stream.RemoteAddr()
-}
-
-func (s *nativeSendStream) Metadata() StreamMetadata {
-	if s == nil || s.stream == nil {
-		return StreamMetadata{}
-	}
-	return s.stream.Metadata()
-}
-
-func (s *nativeSendStream) UpdateMetadata(update MetadataUpdate) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.UpdateMetadata(update)
-}
-
-func (s *nativeSendStream) Write(p []byte) (int, error) {
-	if s == nil || s.stream == nil {
-		return 0, ErrSessionClosed
-	}
-	return s.stream.Write(p)
-}
-
-func (s *nativeSendStream) WriteFinal(p []byte) (int, error) {
-	if s == nil || s.stream == nil {
-		return 0, ErrSessionClosed
-	}
-	return s.stream.WriteFinal(p)
-}
-
-func (s *nativeSendStream) WritevFinal(parts ...[]byte) (int, error) {
-	if s == nil || s.stream == nil {
-		return 0, ErrSessionClosed
-	}
-	return s.stream.WritevFinal(parts...)
-}
-
-func (s *nativeSendStream) CloseWrite() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWrite()
-}
-
-func (s *nativeSendStream) CancelWrite(code uint64) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CancelWrite(code)
-}
-
-func (s *nativeSendStream) CloseWithError(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWithError(code, reason)
-}
-
-func (s *nativeSendStream) Close() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.Close()
-}
-
-func (s *nativeSendStream) joinedCloseIdentity() any {
-	if s == nil || s.stream == nil {
-		return nil
-	}
-	return s.stream
-}
-
-func (s *nativeSendStream) SetDeadline(t time.Time) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.SetDeadline(t)
-}
-
-func (s *nativeSendStream) SetWriteDeadline(t time.Time) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.SetWriteDeadline(t)
-}
-
-type nativeRecvStream struct {
-	stream *nativeStream
-}
-
-func (s *nativeRecvStream) StreamID() uint64 {
-	if s == nil || s.stream == nil {
-		return 0
-	}
-	return s.stream.StreamID()
-}
-
-func (s *nativeRecvStream) OpenedLocally() bool {
-	if s == nil || s.stream == nil {
-		return false
-	}
-	return s.stream.OpenedLocally()
-}
-
-func (s *nativeRecvStream) Bidirectional() bool {
-	if s == nil || s.stream == nil {
-		return false
-	}
-	return s.stream.Bidirectional()
-}
-
-func (s *nativeRecvStream) ReadClosed() bool {
-	if s == nil || s.stream == nil {
-		return true
-	}
-	return s.stream.ReadClosed()
-}
-
-func (s *nativeRecvStream) OpenInfo() []byte {
-	if s == nil || s.stream == nil {
-		return nil
-	}
-	return s.stream.OpenInfo()
-}
-
-func (s *nativeRecvStream) LocalAddr() net.Addr {
-	if s == nil || s.stream == nil {
-		return streamAddr{endpoint: "local"}
-	}
-	return s.stream.LocalAddr()
-}
-
-func (s *nativeRecvStream) RemoteAddr() net.Addr {
-	if s == nil || s.stream == nil {
-		return streamAddr{endpoint: "remote"}
-	}
-	return s.stream.RemoteAddr()
-}
-
-func (s *nativeRecvStream) Metadata() StreamMetadata {
-	if s == nil || s.stream == nil {
-		return StreamMetadata{}
-	}
-	return s.stream.Metadata()
-}
-
-func (s *nativeRecvStream) Read(p []byte) (int, error) {
-	if s == nil || s.stream == nil {
-		return 0, ErrSessionClosed
-	}
-	return s.stream.Read(p)
-}
-
-func (s *nativeRecvStream) CloseRead() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseRead()
-}
-
-func (s *nativeRecvStream) CancelRead(code uint64) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CancelRead(code)
-}
-
-func (s *nativeRecvStream) CloseWithError(code uint64, reason string) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.CloseWithError(code, reason)
-}
-
-func (s *nativeRecvStream) Close() error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.Close()
-}
-
-func (s *nativeRecvStream) joinedCloseIdentity() any {
-	if s == nil || s.stream == nil {
-		return nil
-	}
-	return s.stream
-}
-
-func (s *nativeRecvStream) SetDeadline(t time.Time) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.SetDeadline(t)
-}
-
-func (s *nativeRecvStream) SetReadDeadline(t time.Time) error {
-	if s == nil || s.stream == nil {
-		return ErrSessionClosed
-	}
-	return s.stream.SetReadDeadline(t)
-}
-
-const (
-	readBufShrinkMinCap  = 256 << 10
-	readBufShrinkMaxTail = 64 << 10
-)
-
-func shouldTightenReadBufAfterConsume(buf []byte) bool {
-	if len(buf) == 0 {
-		return true
-	}
-	if cap(buf) < readBufShrinkMinCap {
-		return false
-	}
-	if len(buf) > readBufShrinkMaxTail {
-		return false
-	}
-	return len(buf) <= cap(buf)/4
-}
-
-func readChunkRetainedBytes(data, backing []byte) uint64 {
-	switch {
-	case len(backing) > 0:
-		return uint64(cap(backing))
-	case len(data) > 0:
-		return uint64(cap(data))
-	default:
-		return 0
+// maybeRelease releases the core stream once the application is done with
+// both directions (under the lock).
+func (h *handle) maybeReleaseLocked() {
+	if h.sendDone && h.recvDone && !h.released {
+		h.released = true
+		h.c.s.Release(h.st)
+		h.stopDeadlines()
 	}
 }
 
-func readChunkOverheadBytes(retained uint64, dataLen int) uint64 {
-	if retained <= uint64(dataLen) {
-		return 0
-	}
-	return retained - uint64(dataLen)
-}
+// ---- reading ----
 
-func (c *Conn) replaceReadChunkOverheadLocked(chunk *streamReadChunk, overhead uint64) {
-	if c == nil || chunk == nil || chunk.overheadBytes == overhead {
-		if chunk != nil {
-			chunk.overheadBytes = overhead
-		}
-		return
-	}
-	c.ingress.readBufferOverhead = csub(c.ingress.readBufferOverhead, chunk.overheadBytes)
-	c.ingress.readBufferOverhead = saturatingAdd(c.ingress.readBufferOverhead, overhead)
-	chunk.overheadBytes = overhead
-}
-
-func (c *Conn) releaseReadChunkLocked(chunk *streamReadChunk) {
-	if chunk == nil {
-		return
-	}
-	if c != nil {
-		c.replaceReadChunkOverheadLocked(chunk, 0)
-	}
-	releaseReadFrameBuffer(chunk.backing, chunk.handle)
-	releaseStreamReadChunk(chunk)
-}
-
-func (s *nativeStream) syncReadBufLocked() {
-	if s == nil {
-		return
-	}
-	if s.readHead == nil {
-		if len(s.readBuf) == 0 {
-			s.readBuf = nil
-		}
-		return
-	}
-	s.readBuf = s.readHead.data
-}
-
-func (s *nativeStream) ensureReadQueueHeadLocked(c *Conn) {
-	if s == nil || s.readHead != nil || len(s.readBuf) == 0 {
-		return
-	}
-	chunk := acquireStreamReadChunk()
-	chunk.data = s.readBuf
-	chunk.retainedBytes = readChunkRetainedBytes(s.readBuf, nil)
-	chunk.overheadBytes = readChunkOverheadBytes(chunk.retainedBytes, len(chunk.data))
-	if c != nil {
-		c.ingress.readBufferOverhead = saturatingAdd(c.ingress.readBufferOverhead, chunk.overheadBytes)
-	}
-	s.readHead = chunk
-	s.readTail = chunk
-	s.syncReadBufLocked()
-}
-
-func (s *nativeStream) appendReadChunkLocked(c *Conn, data, backing []byte, handle *wire.FrameReadBufferHandle) {
-	if s == nil || len(data) == 0 {
-		releaseReadFrameBuffer(backing, handle)
-		return
-	}
-	s.ensureReadQueueHeadLocked(c)
-
-	chunk := acquireStreamReadChunk()
-	chunk.data = data
-	chunk.backing = backing
-	chunk.handle = handle
-	chunk.retainedBytes = readChunkRetainedBytes(data, backing)
-	chunk.overheadBytes = readChunkOverheadBytes(chunk.retainedBytes, len(data))
-	if c != nil {
-		c.ingress.readBufferOverhead = saturatingAdd(c.ingress.readBufferOverhead, chunk.overheadBytes)
-	}
-
-	if s.readTail == nil {
-		s.readHead = chunk
-		s.readTail = chunk
-		s.syncReadBufLocked()
-		return
-	}
-	s.readTail.next = chunk
-	s.readTail = chunk
-}
-
-func (c *Conn) clearReadChunksLocked(stream *nativeStream) {
-	if stream == nil {
-		return
-	}
-	for chunk := stream.readHead; chunk != nil; {
-		next := chunk.next
-		c.releaseReadChunkLocked(chunk)
-		chunk = next
-	}
-	stream.readHead = nil
-	stream.readTail = nil
-	stream.readBuf = nil
-}
-
-func (s *nativeStream) bufferedReadLenLocked() int {
-	if s == nil {
-		return 0
-	}
-	if s.readHead == nil {
-		return len(s.readBuf)
-	}
-	total := 0
-	for chunk := s.readHead; chunk != nil; chunk = chunk.next {
-		total += len(chunk.data)
-	}
-	return total
-}
-
-func (s *nativeStream) consumeReadChunkLocked(c *Conn, n int) {
-	if s == nil || n <= 0 {
-		return
-	}
-	s.ensureReadQueueHeadLocked(c)
-	if s.readHead == nil {
-		return
-	}
-	chunk := s.readHead
-	if n >= len(chunk.data) {
-		s.readHead = chunk.next
-		if s.readHead == nil {
-			s.readTail = nil
-		}
-		s.readBuf = nil
-		c.releaseReadChunkLocked(chunk)
-		s.syncReadBufLocked()
-		return
-	}
-
-	if shouldTightenReadBufAfterConsume(chunk.data[n:]) {
-		tail := clonePayloadBytes(chunk.data[n:])
-		if chunk.handle != nil {
-			releaseReadFrameBuffer(chunk.backing, chunk.handle)
-		}
-		chunk.data = tail
-		chunk.backing = nil
-		chunk.handle = nil
-		chunk.retainedBytes = uint64(len(chunk.data))
-		c.replaceReadChunkOverheadLocked(chunk, 0)
-		s.syncReadBufLocked()
-		return
-	}
-
-	chunk.data = chunk.data[n:]
-	c.replaceReadChunkOverheadLocked(chunk, readChunkOverheadBytes(chunk.retainedBytes, len(chunk.data)))
-	s.syncReadBufLocked()
-}
-
-func (s *nativeStream) Read(p []byte) (int, error) {
-	if s == nil || s.conn == nil {
-		return 0, ErrSessionClosed
-	}
-	if len(p) == 0 {
-		return 0, nil
-	}
+func (h *handle) read(p []byte) (int, error) {
+	h.rmu.Lock()
+	defer h.rmu.Unlock()
+	c := h.c
 	for {
-		s.conn.mu.Lock()
-		s.ensureReadQueueHeadLocked(s.conn)
-		if len(s.readBuf) > 0 {
-			n := copy(p, s.readBuf)
-			s.consumeReadChunkLocked(s.conn, n)
-			s.conn.consumeReceiveLocked(s, uint64(n))
-			now := time.Now()
-			s.conn.noteStreamProgressLocked(now)
-			s.conn.noteAppProgressLocked(now)
-			s.conn.maybeFinalizePeerActiveLocked(s)
-			s.conn.mu.Unlock()
+		c.lock()
+		n, fin, err := c.s.Read(h.st, p)
+		if n == 0 && !fin && err == nil {
+			h.rsig.Drain()
+			c.s.WaitRead(h.st, &h.rsig)
+		}
+		if fin || err != nil {
+			h.recvDone = true
+			h.maybeReleaseLocked()
+		}
+		c.unlock()
+		if n > 0 || len(p) == 0 && err == nil {
+			if fin && n == 0 {
+				return 0, io.EOF
+			}
 			return n, nil
 		}
-		if err := s.readErrLocked(); err != nil {
-			s.conn.maybeFinalizePeerActiveLocked(s)
-			surfaceErr := s.readSurfaceErrLocked(err)
-			s.conn.mu.Unlock()
-			return 0, surfaceErr
+		if fin {
+			return 0, io.EOF
 		}
-		s.conn.replenishExhaustedReceiveLocked(s)
-		notifyCh, deadline := s.readWaitSnapshotLocked()
-		s.conn.mu.Unlock()
-
-		if err := s.waitWithDeadline(notifyCh, deadline, OperationRead); err != nil {
-			return 0, err
-		}
-	}
-}
-
-func (s *nativeStream) Write(p []byte) (int, error) {
-	if s == nil || s.conn == nil {
-		return 0, ErrSessionClosed
-	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	permit, err := s.acquireWritePermit()
-	if err != nil {
-		return 0, err
-	}
-	defer permit.release()
-
-	written := 0
-	for written < len(p) {
-		progress, stop, err := s.writeBurst(p[written:])
-		written += progress
 		if err != nil {
-			return written, err
+			return 0, apiErr(err)
 		}
-		if stop {
-			break
-		}
-	}
-	return written, nil
-}
-
-func (s *nativeStream) WriteFinal(p []byte) (int, error) {
-	return s.writevFinal([][]byte{p})
-}
-
-func (s *nativeStream) WritevFinal(parts ...[]byte) (int, error) {
-	return s.writevFinal(parts)
-}
-
-func (s *nativeStream) writevFinal(parts [][]byte) (int, error) {
-	if s == nil || s.conn == nil {
-		return 0, ErrSessionClosed
-	}
-
-	total, ok := totalPartLen(parts)
-	if !ok {
-		s.conn.mu.Lock()
-		err := s.writeSurfaceErrLocked(frameSizeError("send DATA payload", errPayloadTooLarge))
-		s.conn.mu.Unlock()
-		return 0, err
-	}
-	if total == 0 {
-		return 0, s.CloseWrite()
-	}
-
-	permit, err := s.acquireWritePermit()
-	if err != nil {
-		return 0, err
-	}
-	defer permit.release()
-
-	written := 0
-	partIdx := 0
-	partOff := 0
-	for written < total {
-		progress, finalState, stop, err := s.writeFinalBurst(parts, partIdx, partOff, total-written)
-		written += progress
-		partIdx, partOff = advanceParts(parts, partIdx, partOff, progress)
-		if err != nil {
-			return written, err
-		}
-		if finalState.finalized() {
-			return written, nil
-		}
-		if stop {
-			break
+		select {
+		case <-h.rsig.C:
+		case <-h.rwait():
+			return 0, os.ErrDeadlineExceeded
 		}
 	}
-	return written, nil
 }
 
-func (s *nativeStream) SetDeadline(t time.Time) error {
-	if err := s.SetReadDeadline(t); err != nil {
-		return err
-	}
-	return s.SetWriteDeadline(t)
+func (h *handle) cancelRead(code StreamErrorCode) {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	c.s.Stop(h.st, uint64(code))
+	h.recvDone = true
+	h.maybeReleaseLocked()
 }
 
-func (s *nativeStream) SetReadDeadline(t time.Time) error {
-	return s.setWaitDeadline(t, OperationRead)
-}
+// ---- writing ----
 
-func (s *nativeStream) SetWriteDeadline(t time.Time) error {
-	return s.setWaitDeadline(t, OperationWrite)
-}
-
-type streamWaitState struct {
-	readDeadline  time.Time
-	writeDeadline time.Time
-	readWaiters   uint32
-	writeWaiters  uint32
-}
-
-type streamWritePermit struct {
-	stream *nativeStream
-	active bool
-}
-
-func (p *streamWritePermit) release() {
-	if p == nil || !p.active {
-		return
-	}
-	stream := p.stream
-	p.stream = nil
-	p.active = false
-	if stream == nil || stream.conn == nil {
-		return
-	}
-
-	stream.conn.mu.Lock()
-	if stream.writeInProgress {
-		stream.writeInProgress = false
-		stream.broadcastWriteNotifyLocked()
-	}
-	stream.conn.mu.Unlock()
-}
-
-func (s *nativeStream) acquireWritePermit() (streamWritePermit, error) {
-	return s.acquireWritePermitUntil(time.Time{})
-}
-
-func (s *nativeStream) acquireWritePermitUntil(deadlineOverride time.Time) (streamWritePermit, error) {
-	if s == nil || s.conn == nil {
-		return streamWritePermit{}, ErrSessionClosed
-	}
+func (h *handle) write(p []byte, fin bool) (int, error) {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	c := h.c
+	total := 0
 	for {
-		s.conn.mu.Lock()
-		if !s.writeInProgress {
-			s.writeInProgress = true
-			s.conn.mu.Unlock()
-			return streamWritePermit{stream: s, active: true}, nil
+		c.lock()
+		c.s.SetNow(c.clk.now())
+		n, err := c.s.Write(h.st, p[total:], fin)
+		total += n
+		wait := err == nil && total < len(p)
+		if wait {
+			h.wsig.Drain()
+			c.s.WaitWrite(h.st, &h.wsig)
 		}
-		notifyCh, deadline := s.writeWaitSnapshotLocked()
-		deadline = rt.EffectiveDeadline(deadline, deadlineOverride)
-		s.conn.mu.Unlock()
-
-		if err := s.waitWithDeadline(notifyCh, deadline, OperationWrite); err != nil {
-			return streamWritePermit{}, err
+		if err == nil && fin && total == len(p) {
+			h.sendDone = true
+			h.maybeReleaseLocked()
 		}
-	}
-}
-
-func (s *nativeStream) ensureReadNotifyLocked() chan struct{} {
-	if s == nil {
-		return nil
-	}
-	return ensureNotifyChan(&s.readNotify)
-}
-
-func (s *nativeStream) ensureWriteNotifyLocked() chan struct{} {
-	if s == nil {
-		return nil
-	}
-	return ensureNotifyChan(&s.writeNotify)
-}
-
-// broadcastWriteNotifyLocked wakes every goroutine waiting on the stream's
-// write side. Several can wait at once (a Write for credit, another Write for
-// the write permit, a CloseRead for its STOP_SENDING, two operations for the
-// same opener turn), and a single token could reach a waiter it does not
-// concern and leave the one it was meant for blocked. A waiter takes the
-// channel with ensureWriteNotifyLocked under the same lock as the check it
-// waits on, so closing it wakes all of them and the next waiter makes a new
-// one.
-func (s *nativeStream) broadcastWriteNotifyLocked() {
-	if s == nil || s.writeNotify == nil {
-		return
-	}
-	close(s.writeNotify)
-	s.writeNotify = nil
-}
-
-// broadcastReadNotifyLocked is broadcastWriteNotifyLocked for the read side,
-// where concurrent Reads, or a Read and a SetReadDeadline from another
-// goroutine, can wait at once. A waiter takes the channel with
-// ensureReadNotifyLocked under the same lock as the check it waits on.
-func (s *nativeStream) broadcastReadNotifyLocked() {
-	if s == nil || s.readNotify == nil {
-		return
-	}
-	close(s.readNotify)
-	s.readNotify = nil
-}
-
-func (s *nativeStream) readNotifyChan() <-chan struct{} {
-	if s == nil || s.conn == nil {
-		return nil
-	}
-	s.conn.mu.Lock()
-	ch := s.ensureReadNotifyLocked()
-	s.conn.mu.Unlock()
-	return ch
-}
-
-func (s *nativeStream) writeNotifyChan() <-chan struct{} {
-	if s == nil || s.conn == nil {
-		return nil
-	}
-	s.conn.mu.Lock()
-	ch := s.ensureWriteNotifyLocked()
-	s.conn.mu.Unlock()
-	return ch
-}
-
-func (s *nativeStream) readWaitSnapshotLocked() (<-chan struct{}, time.Time) {
-	if s == nil {
-		return nil, time.Time{}
-	}
-	deadline := time.Time{}
-	if ws := s.waitStateLocked(); ws != nil {
-		deadline = ws.readDeadline
-	}
-	return s.ensureReadNotifyLocked(), deadline
-}
-
-func (s *nativeStream) writeWaitSnapshotLocked() (<-chan struct{}, time.Time) {
-	if s == nil {
-		return nil, time.Time{}
-	}
-	deadline := time.Time{}
-	if ws := s.waitStateLocked(); ws != nil {
-		deadline = ws.writeDeadline
-	}
-	return s.ensureWriteNotifyLocked(), deadline
-}
-
-type streamNotifyMask uint8
-
-const (
-	streamNotifyRead streamNotifyMask = 1 << iota
-	streamNotifyWrite
-	streamNotifyBoth = streamNotifyRead | streamNotifyWrite
-)
-
-func (m streamNotifyMask) includesRead() bool {
-	return m&streamNotifyRead != 0
-}
-
-func (m streamNotifyMask) includesWrite() bool {
-	return m&streamNotifyWrite != 0
-}
-
-func notifyStreamLocked(stream *nativeStream, mask streamNotifyMask) {
-	if stream == nil {
-		return
-	}
-	if mask.includesRead() {
-		stream.broadcastReadNotifyLocked()
-	}
-	if mask.includesWrite() {
-		stream.broadcastWriteNotifyLocked()
-	}
-}
-
-type streamReceiveReleaseMode uint8
-
-const (
-	streamReceiveRetain streamReceiveReleaseMode = iota
-	streamReceiveClearReadBufOnly
-	streamReceiveReleaseBudget
-	streamReceiveReleaseAndClearReadBuf
-)
-
-type streamReceiveReleaseTraits uint8
-
-const (
-	streamReceiveReleaseTraitNone   streamReceiveReleaseTraits = 0
-	streamReceiveReleaseTraitBudget streamReceiveReleaseTraits = 1 << iota
-	streamReceiveReleaseTraitClearReadBuf
-)
-
-func (t streamReceiveReleaseTraits) releaseMode() streamReceiveReleaseMode {
-	switch {
-	case t&streamReceiveReleaseTraitBudget != 0 && t&streamReceiveReleaseTraitClearReadBuf != 0:
-		return streamReceiveReleaseAndClearReadBuf
-	case t&streamReceiveReleaseTraitBudget != 0:
-		return streamReceiveReleaseBudget
-	case t&streamReceiveReleaseTraitClearReadBuf != 0:
-		return streamReceiveClearReadBufOnly
-	default:
-		return streamReceiveRetain
-	}
-}
-
-func (m streamReceiveReleaseMode) releasesBudget() bool {
-	return m == streamReceiveReleaseBudget || m == streamReceiveReleaseAndClearReadBuf
-}
-
-func (m streamReceiveReleaseMode) clearsReadBuf() bool {
-	return m == streamReceiveClearReadBufOnly || m == streamReceiveReleaseAndClearReadBuf
-}
-
-func (c *Conn) clearStreamReceiveBufferStateLocked(stream *nativeStream, mode streamReceiveReleaseMode) {
-	if c == nil || stream == nil {
-		return
-	}
-	stream.recvPending = 0
-	stream.recvBuffer = 0
-	if mode.clearsReadBuf() {
-		c.clearReadChunksLocked(stream)
-	} else {
-		stream.syncReadBufLocked()
-	}
-}
-
-func (c *Conn) releaseStreamReceiveStateLocked(stream *nativeStream, mode streamReceiveReleaseMode) {
-	if c == nil || stream == nil {
-		return
-	}
-	c.releaseReceiveLocked(stream, stream.recvBuffer)
-	c.clearStreamReceiveBufferStateLocked(stream, mode)
-}
-
-func (c *Conn) applyReceiveReleasePlanLocked(stream *nativeStream, mode streamReceiveReleaseMode) {
-	if c == nil || stream == nil {
-		return
-	}
-	if mode.releasesBudget() {
-		c.releaseStreamReceiveStateLocked(stream, mode)
-		return
-	}
-	if mode.clearsReadBuf() {
-		c.clearReadChunksLocked(stream)
-	} else {
-		stream.syncReadBufLocked()
-	}
-}
-
-func (s *nativeStream) ensureWaitStateLocked() *streamWaitState {
-	if s == nil {
-		return nil
-	}
-	if s.waitState == nil {
-		s.waitState = &streamWaitState{}
-	}
-	return s.waitState
-}
-
-func (s *nativeStream) waitStateLocked() *streamWaitState {
-	if s == nil {
-		return nil
-	}
-	return s.waitState
-}
-
-func (s *nativeStream) loadReadWaiters() uint32 {
-	if s == nil || s.conn == nil {
-		return 0
-	}
-	s.conn.mu.Lock()
-	ws := s.waitState
-	s.conn.mu.Unlock()
-	if ws == nil {
-		return 0
-	}
-	return atomic.LoadUint32(&ws.readWaiters)
-}
-
-func (s *nativeStream) loadWriteWaiters() uint32 {
-	if s == nil || s.conn == nil {
-		return 0
-	}
-	s.conn.mu.Lock()
-	ws := s.waitState
-	s.conn.mu.Unlock()
-	if ws == nil {
-		return 0
-	}
-	return atomic.LoadUint32(&ws.writeWaiters)
-}
-
-func (s *nativeStream) setWaitDeadline(t time.Time, op Operation) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	s.conn.mu.Lock()
-	if s.conn.lifecycle.closeErr != nil {
-		s.conn.mu.Unlock()
-		return ErrSessionClosed
-	}
-	ws := s.ensureWaitStateLocked()
-	switch op {
-	case OperationRead:
-		ws.readDeadline = t
-		s.broadcastReadNotifyLocked()
-	case OperationWrite:
-		ws.writeDeadline = t
-		s.broadcastWriteNotifyLocked()
-	default:
-	}
-	s.conn.mu.Unlock()
-	return nil
-}
-
-func (s *nativeStream) waitRead(deadline time.Time) error {
-	return s.waitWithDeadline(s.readNotifyChan(), deadline, OperationRead)
-}
-
-func (s *nativeStream) waitWrite(deadline time.Time) error {
-	return s.waitWriteWithWakeTracked(deadline, nil)
-}
-
-func (s *nativeStream) waitWriteWithWakeTracked(deadline time.Time, wakeCh <-chan struct{}) error {
-	start := time.Now()
-	err := s.waitWriteWithWake(deadline, wakeCh)
-	s.conn.noteBlockedWrite(time.Since(start))
-	return err
-}
-
-func (s *nativeStream) waitWithDeadlineAndWakeTracked(notifyCh <-chan struct{}, wakeCh <-chan struct{}, deadline time.Time, op Operation) error {
-	start := time.Now()
-	err := s.waitWithDeadlineAndWake(notifyCh, wakeCh, deadline, op)
-	s.conn.noteBlockedWrite(time.Since(start))
-	return err
-}
-
-func (s *nativeStream) waitWriteWithWake(deadline time.Time, wakeCh <-chan struct{}) error {
-	return s.waitWithDeadlineAndWake(s.writeNotifyChan(), wakeCh, deadline, OperationWrite)
-}
-
-func (s *nativeStream) waitWithDeadline(notifyCh <-chan struct{}, deadline time.Time, op Operation) error {
-	return s.waitWithDeadlineAndWake(notifyCh, nil, deadline, op)
-}
-
-func (s *nativeStream) waitWithDeadlineAndWake(notifyCh <-chan struct{}, wakeCh <-chan struct{}, deadline time.Time, op Operation) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	var (
-		timer   *time.Timer
-		timeout <-chan time.Time
-	)
-	endWait := s.beginWait(op)
-	defer endWait()
-	if !deadline.IsZero() {
-		delay := time.Until(deadline)
-		if delay <= 0 {
-			return os.ErrDeadlineExceeded
+		c.unlock()
+		if err != nil {
+			return total, apiErr(err)
 		}
-		timer = time.NewTimer(delay)
-		timeout = timer.C
-	}
-	defer stopTimer(timer)
-
-	closedCh := s.conn.lifecycle.closedCh
-	if wakeCh != nil && timeout != nil {
+		if !wait {
+			return total, nil
+		}
 		select {
-		case <-closedCh:
-			return s.sessionWaitErr(op)
-		case <-notifyCh:
-			return s.waitReadyErr(op)
-		case <-wakeCh:
-			return s.waitReadyErr(op)
-		case <-timeout:
-			return os.ErrDeadlineExceeded
-		}
-	}
-	if wakeCh != nil {
-		select {
-		case <-closedCh:
-			return s.sessionWaitErr(op)
-		case <-notifyCh:
-			return s.waitReadyErr(op)
-		case <-wakeCh:
-			return s.waitReadyErr(op)
-		}
-	}
-	if timeout != nil {
-		select {
-		case <-closedCh:
-			return s.sessionWaitErr(op)
-		case <-notifyCh:
-			return s.waitReadyErr(op)
-		case <-timeout:
-			return os.ErrDeadlineExceeded
-		}
-	}
-	select {
-	case <-closedCh:
-		return s.sessionWaitErr(op)
-	case <-notifyCh:
-		return s.waitReadyErr(op)
-	}
-}
-
-func (s *nativeStream) beginWait(op Operation) func() {
-	if s == nil {
-		return func() {}
-	}
-	var ws *streamWaitState
-	if s.conn != nil {
-		s.conn.mu.Lock()
-		ws = s.ensureWaitStateLocked()
-		s.conn.mu.Unlock()
-	}
-	switch op {
-	case OperationRead:
-		if ws == nil {
-			return func() {}
-		}
-		atomic.AddUint32(&ws.readWaiters, 1)
-		return func() {
-			atomic.AddUint32(&ws.readWaiters, ^uint32(0))
-		}
-	case OperationWrite:
-		if ws == nil {
-			return func() {}
-		}
-		atomic.AddUint32(&ws.writeWaiters, 1)
-		return func() {
-			atomic.AddUint32(&ws.writeWaiters, ^uint32(0))
-		}
-	default:
-		return func() {}
-	}
-}
-
-func (s *nativeStream) sessionCloseErr() error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	if err := s.conn.err(); err != nil {
-		s.conn.mu.Lock()
-		current := s.conn.lifecycle.sessionState
-		s.conn.mu.Unlock()
-		return state.VisibleSessionError(current, err, ErrSessionClosed)
-	}
-	return nil
-}
-
-func (s *nativeStream) sessionWaitErr(op Operation) error {
-	if err := s.sessionCloseErr(); err != nil {
-		return sessionOperationErr(s.conn, op, err)
-	}
-	return sessionOperationErr(s.conn, op, ErrSessionClosed)
-}
-
-func (s *nativeStream) waitReadyErr(op Operation) error {
-	if err := s.sessionCloseErr(); err != nil {
-		return sessionOperationErr(s.conn, op, err)
-	}
-	return nil
-}
-
-func stopTimer(timer *time.Timer) {
-	if timer == nil {
-		return
-	}
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
+		case <-h.wsig.C:
+		case <-h.wwait():
+			return total, os.ErrDeadlineExceeded
 		}
 	}
 }
 
-func resetTimer(timer *time.Timer, delay time.Duration) *time.Timer {
-	if timer == nil {
-		return time.NewTimer(delay)
-	}
-	stopTimer(timer)
-	timer.Reset(delay)
-	return timer
-}
-
-func (s *nativeStream) CloseRead() error {
-	return s.CancelRead(uint64(CodeCancelled))
-}
-
-type terminalLocalOpenerDisposition uint8
-
-const terminalLocalOpenerFinished terminalLocalOpenerDisposition = 1
-
-type terminalLocalOpenerResult struct {
-	visibility  openerVisibilityMark
-	disposition terminalLocalOpenerDisposition
-}
-
-func (r terminalLocalOpenerResult) finished() bool {
-	return r.disposition == terminalLocalOpenerFinished
-}
-
-func (s *nativeStream) prepareTerminalLocalOpenerLocked(appErr *ApplicationError, policy terminalOpenerPolicy) terminalLocalOpenerResult {
-	if s == nil || s.conn == nil || !s.needsLocalOpenerLocked() {
-		return terminalLocalOpenerResult{}
-	}
-	if !s.idSet {
-		s.conn.failProvisionalLocked(s, appErr)
-		return terminalLocalOpenerResult{disposition: terminalLocalOpenerFinished}
-	}
-	if policy == terminalOpenerRejectUnopened {
-		s.conn.failUnopenedLocalStreamLocked(s, appErr)
-		return terminalLocalOpenerResult{disposition: terminalLocalOpenerFinished}
-	}
-	result := terminalLocalOpenerResult{visibility: openerVisibilityPeerVisible}
-	s.markSendCommittedAndMaybeBarrierLocked(result.visibility)
-	return result
-}
-
-func (s *nativeStream) CancelRead(code uint64) error {
-	return s.closeReadWithCode(code)
-}
-
-type terminalSignalKind uint8
-
-const (
-	terminalSignalReset terminalSignalKind = iota
-	terminalSignalAbort
-)
-
-type terminalOpenerPolicy uint8
-
-const (
-	terminalOpenerAllow terminalOpenerPolicy = iota
-	terminalOpenerRejectUnopened
-)
-
-type terminalResetSource uint8
-
-const (
-	terminalResetDirect terminalResetSource = iota
-	terminalResetFromStopSending
-)
-
-type terminalSignalOptions struct {
-	openerPolicy terminalOpenerPolicy
-	resetSource  terminalResetSource
-}
-
-type terminalDataIntent uint8
-
-const (
-	terminalDataCloseRead terminalDataIntent = iota
-	terminalDataCloseWrite
-)
-
-func (i terminalDataIntent) requiresLocalSend() bool {
-	return i == terminalDataCloseRead
-}
-
-func (i terminalDataIntent) includesPriority() bool {
-	return i == terminalDataCloseWrite
-}
-
-func (i terminalDataIntent) sendsFIN() bool {
-	return i == terminalDataCloseWrite
-}
-
-type terminalDataPrepareSpec struct {
-	intent terminalDataIntent
-	wrap   func(error) error
-}
-
-type terminalFrameRollbackKind uint8
-
-const (
-	terminalFrameRollbackNone terminalFrameRollbackKind = iota
-	terminalFrameRollbackCloseWrite
-)
-
-type terminalFramePlanStatus uint8
-
-const terminalFramePlanRetry terminalFramePlanStatus = 1
-
-type terminalFramePlan struct {
-	frames           []txFrame
-	openerVisibility openerVisibilityMark
-	status           terminalFramePlanStatus
-	wait             provisionalOpenTurnWait
-}
-
-func (p terminalFramePlan) shouldRetry() bool {
-	return p.status == terminalFramePlanRetry
-}
-
-type terminalSignalDisposition uint8
-
-const terminalSignalFinished terminalSignalDisposition = 1
-
-type terminalWriteWakePolicy uint8
-
-const (
-	terminalWriteWakeSkip terminalWriteWakePolicy = iota
-	terminalWriteWakeNotify
-)
-
-type terminalSignalPlan struct {
-	payload          []byte
-	frameType        FrameType
-	openerVisibility openerVisibilityMark
-	disposition      terminalSignalDisposition
-	writeWake        terminalWriteWakePolicy
-}
-
-func (p terminalSignalPlan) finished() bool {
-	return p.disposition == terminalSignalFinished
-}
-
-func (p terminalSignalPlan) shouldNotifyWrite() bool {
-	return p.writeWake == terminalWriteWakeNotify
-}
-
-type terminalQueueHooks struct {
-	rollback              terminalFrameRollbackKind
-	clearPeerVisibleOnErr bool
-	notifyWrite           bool
-}
-
-type terminalQueueExecution struct {
-	frames      []txFrame
-	opts        queuedWriteOptions
-	commit      queuedWriteCommit
-	errorCommit queuedWriteCommit
-	hooks       terminalQueueHooks
-	errWrap     func(error) error
-}
-
-func (e terminalQueueExecution) wrapErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	if e.errWrap != nil {
-		return e.errWrap(err)
-	}
-	return err
-}
-
-func (e terminalQueueExecution) handleLockedPostQueue(s *nativeStream, result queuedWriteResult) {
-	if s == nil || s.conn == nil {
-		return
-	}
-	if result.err != nil && !result.pendingCompletion() {
-		switch e.hooks.rollback {
-		case terminalFrameRollbackCloseWrite:
-			s.clearSendFin()
-			if priority := preparedPriorityUpdateFromFrames(e.frames); priority.hasFrame() {
-				s.conn.queuePriorityUpdateAsync(priority.streamID, priority.payload, retainedBytesBorrowed)
-			}
-			if e.opts.openerVisibility.marksPeerVisible() {
-				s.clearOpeningBarrierLocked()
-			}
-		default:
-		}
-		if e.hooks.clearPeerVisibleOnErr && e.opts.openerVisibility.marksPeerVisible() {
-			s.conn.releaseStreamOpenMetadataPrefixLocked(s)
-			s.clearOpeningBarrierLocked()
-		}
-	}
-	if e.hooks.notifyWrite {
-		s.broadcastWriteNotifyLocked()
-	}
-}
-
-func (e terminalQueueExecution) queue(s *nativeStream) error {
-	if s == nil || s.conn == nil || len(e.frames) == 0 {
-		return nil
-	}
-	result := s.queueFramesUntilDeadlineAndOptionsOwnedResult(e.frames, e.opts)
-	if result.err != nil || e.hooks.notifyWrite {
-		s.conn.mu.Lock()
-		e.handleLockedPostQueue(s, result)
-		s.conn.mu.Unlock()
-	}
-	if result.err != nil {
-		if result.pendingCompletion() {
-			s.commitQueuedWrite(e.commit)
-		} else if !e.errorCommit.empty() {
-			s.commitQueuedWrite(e.errorCommit)
-		}
-		return e.wrapErr(result.err)
-	}
-	s.commitQueuedWrite(e.commit)
-	return nil
-}
-
-type closeReadPlan struct {
-	opener    terminalFramePlan
-	stopFrame txFrame
-}
-
-func (p closeReadPlan) shouldRetry() bool {
-	return p.opener.shouldRetry()
-}
-
-func (p closeReadPlan) queue(s *nativeStream) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	if len(p.opener.frames) > 0 {
-		if err := p.opener.queueCloseReadOpener(s); err != nil {
-			return err
-		}
-	}
-	result := s.queueFramesUntilDeadlineAndOptionsOwnedResult([]txFrame{p.stopFrame}, queuedWriteOptions{
-		ownership: frameOwned,
-	})
-	if result.err != nil {
-		if result.pendingCompletion() {
-			s.conn.mu.Lock()
-			s.clearLocalReadSignalPending()
-			s.conn.mu.Unlock()
-		}
-		return result.err
-	}
-	s.conn.mu.Lock()
-	s.clearLocalReadSignalPending()
-	s.conn.mu.Unlock()
-	return nil
-}
-
-type localCloseReadCommitState uint8
-
-const (
-	localCloseReadPending localCloseReadCommitState = iota
-	localCloseReadCommitted
-)
-
-func (s *nativeStream) commitLocalCloseReadLocked() {
-	if s == nil || s.conn == nil {
-		return
-	}
-	s.setRecvStopSent()
-	s.conn.releaseStreamReceiveStateLocked(s, streamReceiveReleaseAndClearReadBuf)
-	s.broadcastReadNotifyLocked()
-	s.conn.maybeFinalizePeerActiveLocked(s)
-	s.markLocalReadSignalPending()
-}
-
-func (s *nativeStream) ensureLocalCloseReadCommittedLocked(commitState localCloseReadCommitState) (localCloseReadCommitState, error) {
-	if s == nil {
-		return localCloseReadPending, ErrSessionClosed
-	}
-	if commitState == localCloseReadCommitted || s.localReadSignalPendingFlag() {
-		return localCloseReadCommitted, nil
-	}
-	if err := s.localRecvActionErrLocked(state.LocalCloseReadAction(s.localReceive, s.effectiveRecvHalfStateLocked())); err != nil {
-		return localCloseReadPending, err
-	}
-	s.commitLocalCloseReadLocked()
-	return localCloseReadCommitted, nil
-}
-
-func terminalPendingQueueError(op string) error {
-	return wireError(CodeInternal, op, fmt.Errorf("pending terminal control budget exceeded"))
-}
-
-func emitStreamDispatch(conn *Conn, dispatch streamEventDispatch) {
-	if conn == nil || !dispatch.shouldEmit() {
-		return
-	}
-	conn.emitEvent(dispatch.event)
-}
-
-func (s *nativeStream) prepareCloseReadPlanLocked(stopPayload []byte) (plan closeReadPlan, err error) {
-	if s == nil || s.conn == nil {
-		return closeReadPlan{}, ErrSessionClosed
-	}
-	plan.opener, err = s.prepareTerminalFramePlanLocked(terminalDataPrepareSpec{
-		intent: terminalDataCloseRead,
-		wrap:   s.closeOperationErr,
-	})
-	if err != nil {
-		return closeReadPlan{}, err
-	}
-	if plan.shouldRetry() {
-		return plan, nil
-	}
-
-	plan.stopFrame = flatTxFrame(Frame{
-		Type:     FrameTypeStopSending,
-		StreamID: s.id,
-		Payload:  stopPayload,
-	})
-	return plan, nil
-}
-
-// holdsReadStopBehindQueuedOpenerLocked reports whether this local stream's
-// opening DATA is queued but not yet written. A STOP_SENDING queued now would
-// overtake that opener on the urgent lane and become the stream's first frame.
-func (s *nativeStream) holdsReadStopBehindQueuedOpenerLocked() bool {
-	return s != nil && s.idSet && s.visibilityPhaseLocked() == state.LocalOpenPhaseQueued
-}
-
-// queuePendingStopSendingLocked parks STOP_SENDING in the pending terminal
-// queue, which holds it until the stream's opener has been written.
-func (s *nativeStream) queuePendingStopSendingLocked(payload []byte) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	result := s.conn.setPendingTerminalControlLocked(s, func(stream *nativeStream) (changed bool, coalesced bool, superseded bool) {
-		if stream.pending.flags&streamPendingTerminalAbort != 0 {
-			return false, true, false
-		}
-		if stream.pending.flags&streamPendingTerminalStop != 0 && bytes.Equal(stream.pending.terminal.stopPayload, payload) {
-			return false, true, false
-		}
-		stream.pending.terminal.stopPayload = clonePayloadBytes(payload)
-		stream.pending.flags |= streamPendingTerminalStop
-		return true, false, false
-	})
-	if !result.accepted {
-		return terminalPendingQueueError("queue STOP_SENDING")
-	}
-	s.clearLocalReadSignalPending()
-	return nil
-}
-
-func (s *nativeStream) closeReadWithCode(code uint64) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	stopPayload, err := buildCodePayload(code, "", 0)
-	if err != nil {
-		return s.closeOperationErr(err)
-	}
-	commitState := localCloseReadPending
+// writeBatch writes a nested session's batch into the stream without
+// copying its payload (API.md 4.6), waiting for send-buffer room like
+// write.
+func (h *handle) writeBatch(b *core.Batch) (int, error) {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	c := h.c
+	total := 0
 	for {
-		s.conn.mu.Lock()
-		if s.conn.lifecycle.closeErr != nil {
-			err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
-			s.conn.mu.Unlock()
-			return sessionOperationErrLocked(s.conn, OperationClose, err)
+		c.lock()
+		c.s.SetNow(c.clk.now())
+		n, err := c.s.WriteBatch(h.st, b, total)
+		total += n
+		wait := err == nil && total < b.Len()
+		if wait {
+			h.wsig.Drain()
+			c.s.WaitWrite(h.st, &h.wsig)
 		}
-		var err error
-		if commitState == localCloseReadPending && !s.localReadSignalPendingFlag() {
-			if err := s.localRecvActionErrLocked(state.LocalCloseReadAction(s.localReceive, s.effectiveRecvHalfStateLocked())); err != nil {
-				err = s.closeOperationErr(err)
-				s.conn.mu.Unlock()
-				return err
-			}
-		}
-		commitState, err = s.ensureLocalCloseReadCommittedLocked(commitState)
+		c.unlock()
 		if err != nil {
-			err = s.closeOperationErr(err)
-			s.conn.mu.Unlock()
-			return err
+			return total, apiErr(err)
 		}
-		if s.holdsReadStopBehindQueuedOpenerLocked() {
-			err := s.queuePendingStopSendingLocked(stopPayload)
-			s.conn.mu.Unlock()
-			if err != nil {
-				s.conn.closeSessionWithOptions(err, closeOriginInternal, closeFrameDefault)
-				return s.closeOperationErr(err)
-			}
-			notify(s.conn.pending.terminalNotify)
-			return nil
+		if !wait {
+			return total, nil
 		}
-
-		plan, err := s.prepareCloseReadPlanLocked(stopPayload)
-		if err != nil {
-			s.conn.mu.Unlock()
-			return err
+		select {
+		case <-h.wsig.C:
+		case <-h.wwait():
+			return total, os.ErrDeadlineExceeded
 		}
-		if plan.shouldRetry() {
-			wait := plan.opener.wait
-			s.conn.mu.Unlock()
-			if err := wait.wait(s, s.closeOperationErr); err != nil {
-				return err
-			}
-			continue
-		}
-		s.conn.mu.Unlock()
-		return plan.queue(s)
 	}
 }
 
-func (s *nativeStream) CloseWrite() error {
-	return s.closeWriteUntil(time.Time{})
+func (h *handle) close() error {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	err := c.s.Finish(h.st)
+	h.sendDone = true
+	h.maybeReleaseLocked()
+	return apiErr(err)
 }
 
-func (s *nativeStream) appendCloseWritePriorityFrameLocked(frames []txFrame, visibility openerVisibilityMark) []txFrame {
-	if s == nil || s.conn == nil || visibility.marksPeerVisible() {
-		return frames
-	}
-	priority := s.conn.takePendingPriorityUpdateFrameLocked(s.id)
-	if !priority.hasFrame() {
-		return frames
-	}
-	return priority.append(frames)
+func (h *handle) cancelWrite(code StreamErrorCode) {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	c.s.SetNow(c.clk.now())
+	c.s.Reset(h.st, uint64(code))
+	h.sendDone = true
+	h.maybeReleaseLocked()
 }
 
-func (s *nativeStream) closeWriteUntil(deadlineOverride time.Time) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-
-	permit, err := s.acquireWritePermitUntil(deadlineOverride)
-	if err != nil {
-		return err
-	}
-	defer permit.release()
-
-	for {
-		s.conn.mu.Lock()
-		if s.conn.lifecycle.closeErr != nil {
-			err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
-			s.conn.mu.Unlock()
-			return sessionOperationErrLocked(s.conn, OperationClose, err)
-		}
-		if s.allowsCloseWriteNoOpAfterStopResetLocked() {
-			s.conn.mu.Unlock()
-			return nil
-		}
-		if err := s.localSendActionErrLocked(state.LocalCloseWriteAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {
-			err = s.closeOperationErr(err)
-			s.conn.mu.Unlock()
-			return err
-		}
-		plan, err := s.prepareTerminalFramePlanLocked(terminalDataPrepareSpec{
-			intent: terminalDataCloseWrite,
-			wrap:   s.closeOperationErr,
-		})
-		if err != nil {
-			s.conn.mu.Unlock()
-			return err
-		}
-		if plan.shouldRetry() {
-			wait := plan.wait
-			s.conn.mu.Unlock()
-			if err := wait.wait(s, s.closeOperationErr); err != nil {
-				return err
-			}
-			continue
-		}
-		s.conn.mu.Unlock()
-		return plan.queueCloseWrite(s, deadlineOverride)
-	}
+func (h *handle) streamID() (StreamID, error) {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	id, err := c.s.PinID(h.st)
+	return StreamID(id), apiErr(err)
 }
 
-func (s *nativeStream) CancelWrite(code uint64) error {
-	return s.executeTerminalSignal(terminalSignalReset, code, "", terminalSignalOptions{
-		openerPolicy: terminalOpenerRejectUnopened,
-		resetSource:  terminalResetDirect,
-	})
-}
+// ---- public types ----
 
-func (s *nativeStream) resetAfterStopSending(code uint64) error {
-	return s.executeTerminalSignal(terminalSignalReset, code, "", terminalSignalOptions{
-		openerPolicy: terminalOpenerAllow,
-		resetSource:  terminalResetFromStopSending,
-	})
-}
+// ReceiveStream is the receiving part of a stream.
+type ReceiveStream struct{ h *handle }
 
-func (c *Conn) failUnopenedLocalStreamLocked(stream *nativeStream, appErr *ApplicationError) {
-	if c == nil || stream == nil || !stream.isLocalOpenedLocked() || !stream.idSet || stream.isSendCommittedLocked() {
-		return
-	}
-	stream.setAbortedWithSource(appErr, terminalAbortLocal)
-	c.finalizeTerminalStreamLocked(stream, transientStreamReleaseOptions{
-		scheduler: schedulerReleaseDrop,
-		send:      true,
-		receive:   streamReceiveReleaseAndClearReadBuf,
-	}, streamNotifyBoth, false)
-	c.dropLiveStreamLocked(stream.id)
-	c.removeUnseenLocalLocked(stream)
-	notify(c.signals.livenessCh)
-	c.broadcastStateWakeLocked()
-}
+// SendStream is the sending part of a stream.
+type SendStream struct{ h *handle }
 
-func (c *Conn) abortWithCode(streamID uint64, code ErrorCode) error {
-	payload, err := buildCodePayload(uint64(code), "", 0)
-	if err != nil {
-		return wireError(CodeInternal, "queue ABORT", err)
-	}
-	return c.queueImmutableFrame(flatTxFrame(Frame{Type: FrameTypeABORT, StreamID: streamID, Payload: payload}))
-}
+// Stream is a bidirectional stream. Close finishes the sending part only
+// (the quic-go convention); use CancelRead to stop reading.
+type Stream struct{ h *handle }
 
-func (s *nativeStream) Close() error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	var needsCloseWrite bool
-	var needsCloseRead bool
-	s.conn.mu.Lock()
-	if s.conn.lifecycle.closeErr != nil {
-		err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
-		s.conn.mu.Unlock()
-		return sessionOperationErrLocked(s.conn, OperationClose, err)
-	}
-	needsCloseWrite = s.localSend && !state.SendTerminal(s.effectiveSendHalfStateLocked())
-	needsCloseRead = s.localReceive && !state.RecvTerminal(s.effectiveRecvHalfStateLocked()) && !s.readStopSentLocked()
-	s.conn.mu.Unlock()
-	var errs []error
-	if needsCloseWrite {
-		if err := s.CloseWrite(); err != nil &&
-			!errors.Is(err, ErrStreamNotWritable) &&
-			!errors.Is(err, ErrWriteClosed) &&
-			!errors.Is(err, ErrReadClosed) {
-			errs = append(errs, err)
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				if cancelErr := s.CancelWrite(uint64(CodeCancelled)); cancelErr != nil &&
-					!errors.Is(cancelErr, ErrStreamNotWritable) &&
-					!errors.Is(cancelErr, ErrWriteClosed) &&
-					!errors.Is(cancelErr, ErrReadClosed) &&
-					!errors.Is(cancelErr, ErrSessionClosed) {
-					errs = append(errs, cancelErr)
-				}
-			}
-		}
-	}
-	if needsCloseRead {
-		if err := s.CloseRead(); err != nil &&
-			!errors.Is(err, ErrStreamNotReadable) &&
-			!errors.Is(err, ErrReadClosed) {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func (s *nativeStream) joinedCloseIdentity() any {
-	if s == nil {
-		return nil
-	}
+func newStream(h *handle) *Stream {
+	s := &Stream{h: h}
+	runtime.AddCleanup(s, cleanupHandle, h)
 	return s
 }
 
-func (s *nativeStream) CloseWithError(code uint64, reason string) error {
-	return s.executeTerminalSignal(terminalSignalAbort, code, reason, terminalSignalOptions{
-		openerPolicy: terminalOpenerAllow,
-	})
+func newSendStream(h *handle) *SendStream {
+	s := &SendStream{h: h}
+	runtime.AddCleanup(s, cleanupHandle, h)
+	return s
 }
 
-func (p terminalFramePlan) queue(s *nativeStream, opts queuedWriteOptions, commit queuedWriteCommit, rollback terminalFrameRollbackKind) error {
-	return terminalQueueExecution{
-		frames: p.frames,
-		opts:   opts,
-		commit: commit,
-		hooks: terminalQueueHooks{
-			rollback: rollback,
-		},
-		errWrap: s.closeOperationErr,
-	}.queue(s)
+func newReceiveStream(h *handle) *ReceiveStream {
+	s := &ReceiveStream{h: h}
+	runtime.AddCleanup(s, cleanupHandle, h)
+	return s
 }
 
-func (p terminalFramePlan) queueCloseReadOpener(s *nativeStream) error {
-	return p.queue(s, queuedWriteOptions{
-		ownership:        frameOwned,
-		openerVisibility: p.openerVisibility,
-	}, queuedWriteCommit{
-		openerVisibility: p.openerVisibility,
-	}, terminalFrameRollbackNone)
-}
+// StreamID returns the identifier; before the first frame it pins it and
+// the opening frame is sent at once (SPEC.md 7.2).
+func (s *Stream) StreamID() StreamID { defer runtime.KeepAlive(s); id, _ := s.h.streamID(); return id }
 
-func (p terminalFramePlan) queueCloseWrite(s *nativeStream, deadlineOverride time.Time) error {
-	return p.queue(s, queuedWriteOptions{
-		terminalPolicy:   terminalWriteAllow,
-		deadlineOverride: deadlineOverride,
-		ownership:        frameOwned,
-		openerVisibility: p.openerVisibility,
-	}, queuedWriteCommit{
-		openerVisibility: p.openerVisibility,
-		finalize:         true,
-	}, terminalFrameRollbackCloseWrite)
-}
+// Read reads stream data; io.EOF only after a FIN that was not reset.
+func (s *Stream) Read(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.read(p) }
 
-func (s *nativeStream) prepareTerminalFramePlanLocked(spec terminalDataPrepareSpec) (plan terminalFramePlan, err error) {
-	if s == nil || s.conn == nil {
-		return terminalFramePlan{}, ErrSessionClosed
-	}
-	if spec.intent.requiresLocalSend() && !s.localSend {
-		return terminalFramePlan{}, nil
-	}
+// Write writes p, waiting for send-buffer space.
+func (s *Stream) Write(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.write(p, false) }
 
-	openerResult, err := s.prepareRetriableLocalOpenerLocked()
-	if err != nil {
-		return plan, spec.wrap(err)
-	}
-	if openerResult.shouldRetry() {
-		plan.openerVisibility = openerResult.visibility
-		plan.status = terminalFramePlanRetry
-		plan.wait = openerResult.wait
-		return plan, nil
-	}
-	if spec.intent.requiresLocalSend() && !openerResult.visibility.marksPeerVisible() {
-		return terminalFramePlan{}, nil
-	}
+// Close finishes the sending part (FIN after the buffered data); it never
+// blocks and does not stop reading (CancelRead does).
+func (s *Stream) Close() error { defer runtime.KeepAlive(s); return s.h.close() }
 
-	var frameBuf [2]txFrame
-	frames := frameBuf[:0]
-	if spec.intent.includesPriority() {
-		frames = s.appendCloseWritePriorityFrameLocked(frames, openerResult.visibility)
-	}
-	traits := dataFrameTraitNone
-	if spec.intent.sendsFIN() {
-		traits |= dataFrameTraitFIN
-	}
-	if openerResult.visibility.marksPeerVisible() {
-		traits |= dataFrameTraitOpenMetadata
-	}
-	frames = append(frames, s.dataFrameLocked(nil, traits))
-	if err := s.validateOpenedFramesLocked(frames, openerResult.visibility); err != nil {
-		return terminalFramePlan{}, spec.wrap(err)
-	}
-	s.markSendCommittedAndMaybeBarrierLocked(openerResult.visibility)
-	if spec.intent.sendsFIN() {
-		s.setSendFin()
-	}
-	plan.frames = frames
-	plan.openerVisibility = openerResult.visibility
-	return plan, nil
-}
+// CancelWrite resets the sending part with code.
+func (s *Stream) CancelWrite(code StreamErrorCode) { defer runtime.KeepAlive(s); s.h.cancelWrite(code) }
 
-func (s *nativeStream) prepareTerminalSignalPlanLocked(kind terminalSignalKind, code uint64, reason string, appErr *ApplicationError, opts terminalSignalOptions) (plan terminalSignalPlan, err error) {
-	if s == nil || s.conn == nil {
-		return terminalSignalPlan{}, ErrSessionClosed
-	}
+// CancelRead stops reading with code (STOP_SENDING).
+func (s *Stream) CancelRead(code StreamErrorCode) { defer runtime.KeepAlive(s); s.h.cancelRead(code) }
 
-	payload, err := buildCodePayload(code, reason, s.conn.config.peer.Settings.MaxControlPayloadBytes)
-	if err != nil {
-		return terminalSignalPlan{}, err
-	}
-	plan.payload = payload
-	if s.needsLocalOpenerLocked() {
-		openerResult := s.prepareTerminalLocalOpenerLocked(appErr, opts.openerPolicy)
-		plan.openerVisibility = openerResult.visibility
-		if openerResult.finished() {
-			plan.disposition = terminalSignalFinished
-		}
-	}
-	if plan.finished() {
-		return plan, nil
-	}
-	plan.frameType, plan.writeWake = s.applyPreparedTerminalSignalLocked(kind, code, appErr, opts)
-	return plan, nil
-}
-
-func (s *nativeStream) applyPreparedTerminalSignalLocked(kind terminalSignalKind, code uint64, appErr *ApplicationError, opts terminalSignalOptions) (frameType FrameType, writeWake terminalWriteWakePolicy) {
-	if s == nil || s.conn == nil {
-		return 0, terminalWriteWakeSkip
-	}
-	switch kind {
-	case terminalSignalReset:
-		if opts.resetSource == terminalResetFromStopSending {
-			s.setSendResetWithSource(appErr, terminalResetFromStopSending)
-		} else {
-			s.setSendResetWithSource(appErr, terminalResetDirect)
-		}
-		s.conn.noteResetReasonLocked(code)
-		s.conn.releaseSendLocked(s)
-		return FrameTypeRESET, terminalWriteWakeNotify
-	case terminalSignalAbort:
-		s.setAbortedWithSource(appErr, terminalAbortLocal)
-		s.conn.noteAbortReasonLocked(code)
-		s.conn.finalizeTerminalStreamLocked(s, transientStreamReleaseOptions{
-			scheduler: schedulerReleaseDrop,
-			send:      true,
-			receive:   streamReceiveReleaseAndClearReadBuf,
-		}, streamNotifyBoth, false)
-		return FrameTypeABORT, terminalWriteWakeSkip
-	default:
-		return 0, terminalWriteWakeSkip
-	}
-}
-
-func (s *nativeStream) enqueuePendingTerminalSignalLocked(p terminalSignalPlan) (streamEventDispatch, bool, error) {
-	if s == nil || s.conn == nil || p.finished() {
-		return streamEventDispatch{}, false, nil
-	}
-	dispatch := streamEventDispatch{}
-	if p.openerVisibility.marksPeerVisible() {
-		s.conn.markPeerVisibleLocked(s)
-		dispatch = s.conn.takeStreamEventLocked(s, EventStreamOpened, nil)
-	}
-	s.conn.maybeFinalizePeerActiveLocked(s)
-	result := s.conn.setPendingTerminalControlLocked(s, func(stream *nativeStream) (changed bool, coalesced bool, superseded bool) {
-		switch p.frameType {
-		case FrameTypeRESET:
-			if stream.pending.flags&streamPendingTerminalAbort != 0 {
-				return false, true, false
-			}
-			if stream.pending.flags&streamPendingTerminalReset != 0 && bytes.Equal(stream.pending.terminal.resetPayload, p.payload) {
-				return false, true, false
-			}
-			stream.pending.terminal.resetPayload = clonePayloadBytes(p.payload)
-			stream.pending.flags |= streamPendingTerminalReset
-			return true, false, false
-		case FrameTypeABORT:
-			if stream.pending.flags&streamPendingTerminalAbort != 0 && bytes.Equal(stream.pending.terminal.abortPayload, p.payload) {
-				return false, true, false
-			}
-			superseded = stream.pending.flags&(streamPendingTerminalStop|streamPendingTerminalReset) != 0 || stream.pending.terminal.openerSet
-			stream.pending.terminal.opener = txFrame{}
-			stream.pending.terminal.openerSet = false
-			stream.pending.terminal.stopPayload = nil
-			stream.pending.terminal.resetPayload = nil
-			stream.pending.flags &^= streamPendingTerminalStop | streamPendingTerminalReset
-			stream.pending.terminal.abortPayload = clonePayloadBytes(p.payload)
-			stream.pending.flags |= streamPendingTerminalAbort
-			return true, false, superseded
-		default:
-			return false, false, false
-		}
-	})
-	if !result.accepted {
-		switch p.frameType {
-		case FrameTypeRESET:
-			return streamEventDispatch{}, false, terminalPendingQueueError("queue RESET")
-		case FrameTypeABORT:
-			return streamEventDispatch{}, false, terminalPendingQueueError("queue ABORT")
-		default:
-			return streamEventDispatch{}, false, terminalPendingQueueError("queue terminal control")
-		}
-	}
-	return dispatch, result.changed, nil
-}
-
-func (s *nativeStream) executeTerminalSignal(kind terminalSignalKind, code uint64, reason string, opts terminalSignalOptions) error {
-	if s == nil || s.conn == nil {
-		return ErrSessionClosed
-	}
-	s.conn.mu.Lock()
-	if s.conn.lifecycle.closeErr != nil {
-		err := visibleSessionErrLocked(s.conn, s.conn.lifecycle.closeErr)
-		s.conn.mu.Unlock()
-		return sessionOperationErrLocked(s.conn, OperationClose, err)
-	}
-	if kind == terminalSignalReset && s.needsLocalOpenerLocked() && s.idSet {
-		kind = terminalSignalAbort
-		opts.openerPolicy = terminalOpenerAllow
-		opts.resetSource = terminalResetDirect
-	}
-	switch kind {
-	case terminalSignalReset:
-		if err := s.localSendActionErrLocked(state.LocalResetAction(s.localSend, s.effectiveSendHalfStateLocked())); err != nil {
-			err = s.closeOperationErr(err)
-			s.conn.mu.Unlock()
-			return err
-		}
-	case terminalSignalAbort:
-		if state.LocalAbortActionForStream(s.effectiveSendHalfStateLocked(), s.effectiveRecvHalfStateLocked()) == state.LocalAbortActionNoOp {
-			s.conn.mu.Unlock()
-			return nil
-		}
-	}
-	appErr := applicationErr(code, reason)
-	plan, err := s.prepareTerminalSignalPlanLocked(kind, code, reason, appErr, opts)
-	if err != nil {
-		err = s.closeOperationErr(err)
-		s.conn.mu.Unlock()
-		return err
-	}
-	dispatch, queued, err := s.enqueuePendingTerminalSignalLocked(plan)
-	if err == nil && plan.shouldNotifyWrite() {
-		s.broadcastWriteNotifyLocked()
-	}
-	s.conn.mu.Unlock()
-	if err != nil {
-		s.conn.closeSessionWithOptions(err, closeOriginInternal, closeFrameDefault)
-		return s.closeOperationErr(err)
-	}
-	if queued {
-		notify(s.conn.pending.terminalNotify)
-		notify(s.conn.pending.controlNotify)
-	}
-	emitStreamDispatch(s.conn, dispatch)
+// SetReadDeadline sets the read deadline.
+func (s *Stream) SetReadDeadline(t time.Time) error {
+	defer runtime.KeepAlive(s)
+	s.h.setDeadline(true, false, t)
 	return nil
 }
 
-var (
-	_ net.Conn            = (*nativeStream)(nil)
-	_ net.Conn            = (*JoinedConn)(nil)
-	_ io.Reader           = (*nativeStream)(nil)
-	_ io.Writer           = (*nativeStream)(nil)
-	_ io.Reader           = (*nativeRecvStream)(nil)
-	_ io.Writer           = (*nativeSendStream)(nil)
-	_ ReadHalf            = (*nativeStream)(nil)
-	_ WriteHalf           = (*nativeStream)(nil)
-	_ ReadHalf            = (*nativeRecvStream)(nil)
-	_ WriteHalf           = (*nativeSendStream)(nil)
-	_ joinedCloseIdentity = (*nativeStream)(nil)
-	_ joinedCloseIdentity = (*nativeRecvStream)(nil)
-	_ joinedCloseIdentity = (*nativeSendStream)(nil)
-)
+// SetWriteDeadline sets the write deadline.
+func (s *Stream) SetWriteDeadline(t time.Time) error {
+	defer runtime.KeepAlive(s)
+	s.h.setDeadline(false, true, t)
+	return nil
+}
+
+// SetDeadline sets both deadlines.
+func (s *Stream) SetDeadline(t time.Time) error {
+	defer runtime.KeepAlive(s)
+	s.h.setDeadline(true, true, t)
+	return nil
+}
+
+// Context is the session's context: canceled when the session ends, not
+// when the stream does (unlike a quic-go stream's).
+func (s *Stream) Context() context.Context { defer runtime.KeepAlive(s); return s.h.c.ctx }
+
+// StreamID of a sending part.
+func (s *SendStream) StreamID() StreamID {
+	defer runtime.KeepAlive(s)
+	id, _ := s.h.streamID()
+	return id
+}
+
+// Write writes p.
+func (s *SendStream) Write(p []byte) (int, error) {
+	defer runtime.KeepAlive(s)
+	return s.h.write(p, false)
+}
+
+// Close finishes the stream (FIN after the buffered data); it never
+// blocks.
+func (s *SendStream) Close() error { defer runtime.KeepAlive(s); return s.h.close() }
+
+// CancelWrite resets the stream.
+func (s *SendStream) CancelWrite(code StreamErrorCode) {
+	defer runtime.KeepAlive(s)
+	s.h.cancelWrite(code)
+}
+
+// SetWriteDeadline sets the write deadline.
+func (s *SendStream) SetWriteDeadline(t time.Time) error {
+	defer runtime.KeepAlive(s)
+	s.h.setDeadline(false, true, t)
+	return nil
+}
+
+// StreamID of a receiving part.
+func (s *ReceiveStream) StreamID() StreamID {
+	defer runtime.KeepAlive(s)
+	id, _ := s.h.streamID()
+	return id
+}
+
+// Read reads stream data.
+func (s *ReceiveStream) Read(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.read(p) }
+
+// CancelRead stops reading.
+func (s *ReceiveStream) CancelRead(code StreamErrorCode) {
+	defer runtime.KeepAlive(s)
+	s.h.cancelRead(code)
+}
+
+// SetReadDeadline sets the read deadline.
+func (s *ReceiveStream) SetReadDeadline(t time.Time) error {
+	defer runtime.KeepAlive(s)
+	s.h.setDeadline(true, false, t)
+	return nil
+}
+
+// streamConn is the net.Conn view of a stream (StreamConn).
+type streamConn struct {
+	*Stream
+	local, remote net.Addr
+}
+
+// StreamConn returns a net.Conn view of s. Unlike Stream.Close, its Close
+// both finishes the stream and stops reading (CancelRead(0)), as net.Conn
+// users expect.
+func StreamConn(s *Stream, local, remote net.Addr) net.Conn {
+	return &streamConn{Stream: s, local: local, remote: remote}
+}
+
+func (c *streamConn) Close() error {
+	err := c.Stream.Close()
+	c.Stream.CancelRead(0)
+	return err
+}
+
+func (c *streamConn) LocalAddr() net.Addr  { return c.local }
+func (c *streamConn) RemoteAddr() net.Addr { return c.remote }

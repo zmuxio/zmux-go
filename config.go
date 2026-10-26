@@ -1,1225 +1,343 @@
 package zmux
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
-	"io"
-	"sync"
+	"math"
 	"time"
 
-	"github.com/zmuxio/zmux-go/internal/state"
+	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-const (
-	Magic                   = wire.Magic
-	PrefaceVersion          = wire.PrefaceVersion
-	ProtoVersion            = wire.ProtoVersion
-	MaxPrefaceSettingsBytes = wire.MaxPrefaceSettingsBytes
-	MaxVarint62             = wire.MaxVarint62
-)
-
-type Role = wire.Role
-
-const (
-	RoleInitiator = wire.RoleInitiator
-	RoleResponder = wire.RoleResponder
-	RoleAuto      = wire.RoleAuto
-)
-
-type SchedulerHint = wire.SchedulerHint
-
-const (
-	SchedulerUnspecifiedOrBalanced = wire.SchedulerUnspecifiedOrBalanced
-	SchedulerLatency               = wire.SchedulerLatency
-	SchedulerBalancedFair          = wire.SchedulerBalancedFair
-	SchedulerBulkThroughput        = wire.SchedulerBulkThroughput
-	SchedulerGroupFair             = wire.SchedulerGroupFair
-)
-
-func SchedulerHintFromCode(code uint64) SchedulerHint {
-	return wire.SchedulerHintFromCode(code)
-}
-
-type Capabilities = wire.Capabilities
-
-const (
-	CapabilityOpenMetadata   = wire.CapabilityOpenMetadata
-	CapabilityPriorityHints  = wire.CapabilityPriorityHints
-	CapabilityStreamGroups   = wire.CapabilityStreamGroups
-	CapabilityPriorityUpdate = wire.CapabilityPriorityUpdate
-)
-
-type SettingID = wire.SettingID
-
-const (
-	SettingInitialMaxStreamDataBidiLocallyOpened = wire.SettingInitialMaxStreamDataBidiLocallyOpened
-	SettingInitialMaxStreamDataBidiPeerOpened    = wire.SettingInitialMaxStreamDataBidiPeerOpened
-	SettingInitialMaxStreamDataUni               = wire.SettingInitialMaxStreamDataUni
-	SettingInitialMaxData                        = wire.SettingInitialMaxData
-	SettingMaxIncomingStreamsBidi                = wire.SettingMaxIncomingStreamsBidi
-	SettingMaxIncomingStreamsUni                 = wire.SettingMaxIncomingStreamsUni
-	SettingMaxFramePayload                       = wire.SettingMaxFramePayload
-	SettingMaxControlPayloadBytes                = wire.SettingMaxControlPayloadBytes
-	SettingMaxExtensionPayloadBytes              = wire.SettingMaxExtensionPayloadBytes
-	SettingSchedulerHints                        = wire.SettingSchedulerHints
-	SettingPingPaddingKey                        = wire.SettingPingPaddingKey
-	SettingPrefacePadding                        = wire.SettingPrefacePadding
-)
-
-type Settings = wire.Settings
-
-func DefaultSettings() Settings {
-	return wire.DefaultSettings()
-}
-
-type FrameType = wire.FrameType
-
-const (
-	FrameTypeDATA        = wire.FrameTypeDATA
-	FrameTypeMAXDATA     = wire.FrameTypeMAXDATA
-	FrameTypeStopSending = wire.FrameTypeStopSending
-	FrameTypePING        = wire.FrameTypePING
-	FrameTypePONG        = wire.FrameTypePONG
-	FrameTypeBLOCKED     = wire.FrameTypeBLOCKED
-	FrameTypeRESET       = wire.FrameTypeRESET
-	FrameTypeABORT       = wire.FrameTypeABORT
-	FrameTypeGOAWAY      = wire.FrameTypeGOAWAY
-	FrameTypeCLOSE       = wire.FrameTypeCLOSE
-	FrameTypeEXT         = wire.FrameTypeEXT
-)
-
-const (
-	FrameFlagOpenMetadata = wire.FrameFlagOpenMetadata
-	FrameFlagFIN          = wire.FrameFlagFIN
-)
-
-type StreamMetadataType = wire.StreamMetadataType
-
-const (
-	MetadataStreamPriority = wire.MetadataStreamPriority
-	MetadataStreamGroup    = wire.MetadataStreamGroup
-	MetadataOpenInfo       = wire.MetadataOpenInfo
-)
-
-type DIAGType = wire.DIAGType
-
-const (
-	DIAGDebugText          = wire.DIAGDebugText
-	DIAGRetryAfterMillis   = wire.DIAGRetryAfterMillis
-	DIAGOffendingStreamID  = wire.DIAGOffendingStreamID
-	DIAGOffendingFrameType = wire.DIAGOffendingFrameType
-)
-
-type EXTSubtype = wire.EXTSubtype
-
-const (
-	EXTPriorityUpdate = wire.EXTPriorityUpdate
-)
-
-type ErrorCode = wire.ErrorCode
-
-const (
-	CodeNoError            = wire.CodeNoError
-	CodeProtocol           = wire.CodeProtocol
-	CodeFlowControl        = wire.CodeFlowControl
-	CodeStreamLimit        = wire.CodeStreamLimit
-	CodeRefusedStream      = wire.CodeRefusedStream
-	CodeStreamState        = wire.CodeStreamState
-	CodeStreamClosed       = wire.CodeStreamClosed
-	CodeSessionClosing     = wire.CodeSessionClosing
-	CodeCancelled          = wire.CodeCancelled
-	CodeIdleTimeout        = wire.CodeIdleTimeout
-	CodeFrameSize          = wire.CodeFrameSize
-	CodeUnsupportedVersion = wire.CodeUnsupportedVersion
-	CodeRoleConflict       = wire.CodeRoleConflict
-	CodeInternal           = wire.CodeInternal
-)
-
-type Limits = wire.Limits
-
-type Preface = wire.Preface
-type Negotiated = wire.Negotiated
-
-// Config controls session establishment and runtime behavior.
-//
-// Prefer starting from DefaultConfig(). Constructors also fill zero
-// capability, protocol, setting, and nonce-source fields with defaults.
+// Config configures a session (API.md Section 6). The zero value of every
+// field selects its default; nil *Config means all defaults.
 type Config struct {
-	Role            Role
-	TieBreakerNonce uint64
-	MinProto        uint64
-	MaxProto        uint64
-	// Capabilities advertises optional protocol features.
-	// Zero uses the default capability set.
-	Capabilities Capabilities
-	// DisableCapabilities advertises no optional protocol features.
-	DisableCapabilities bool
-	Settings            Settings
-	NonceSource         io.Reader
-	// PrefacePadding adds one ignored settings TLV to the local preface.
-	PrefacePadding bool
-	// PrefacePaddingMinBytes is the lower padding length bound. Zero uses the default.
-	PrefacePaddingMinBytes uint64
-	// PrefacePaddingMaxBytes is the upper padding length bound. Zero uses the default.
-	PrefacePaddingMaxBytes uint64
-	// EstablishmentTimeout bounds session establishment: the local preface
-	// write and the peer preface read. It is enforced through the transport's
-	// read/write deadlines (net.Conn); for an un-handshaken tls.Conn the TLS
-	// handshake runs inside those reads and writes and shares the bound.
-	// Zero uses the default (10s). A negative value disables the bound.
-	EstablishmentTimeout time.Duration
-	// KeepaliveInterval bounds idle time before an automatic PING.
-	// Zero disables automatic keepalive.
-	KeepaliveInterval time.Duration
-	// KeepaliveMaxPingInterval bounds time between local PINGs while keepalive is enabled.
-	// Zero disables this extra cap.
-	KeepaliveMaxPingInterval time.Duration
-	// KeepaliveTimeout bounds how long a keepalive PING may remain unanswered.
-	// It runs from when the PING is originated, so a transport that stops
-	// draining, and never even writes the PING, also trips it.
-	// Zero uses an adaptive default.
-	KeepaliveTimeout time.Duration
-	// PingPadding pads local PINGs and recognized PONG replies.
-	// It also advertises a per-session PingPaddingKey.
-	PingPadding bool
-	// PingPaddingMinBytes is the lower PING/PONG padding bound.
-	// For PING, it includes the fixed 8-byte tag. Zero uses the default.
-	PingPaddingMinBytes uint64
-	// PingPaddingMaxBytes is the upper PING/PONG padding bound.
-	// For PING, it includes the fixed 8-byte tag. Zero uses the default.
-	PingPaddingMaxBytes uint64
+	// HandshakeTimeout bounds establishment and join confirmation (10 s).
+	HandshakeTimeout time.Duration
+	// MaxIdleTimeout is max_idle_timeout (30 s); negative disables it.
+	MaxIdleTimeout time.Duration
+	// KeepAlivePeriod sends a QX_PING when the session is idle this long
+	// (0: off). It must be below the effective idle timeout.
+	KeepAlivePeriod time.Duration
 
-	// SessionMemoryCap overrides the tracked-session-memory cap. Zero uses the default.
-	SessionMemoryCap uint64
-	// PerStreamQueuedDataHWM overrides the per-stream queued-data high watermark.
-	// Zero uses the default.
-	PerStreamQueuedDataHWM uint64
-	// SessionQueuedDataHWM overrides the session-wide queued-data high watermark.
-	// Zero uses the default.
-	SessionQueuedDataHWM uint64
-	// UrgentQueuedBytesCap overrides the urgent/control lane cap. Zero uses the default.
-	UrgentQueuedBytesCap uint64
-	// PendingControlBytesBudget overrides the coalesced control byte budget.
-	// Zero uses the default.
-	PendingControlBytesBudget uint64
-	// PendingPriorityBytesBudget overrides the coalesced advisory byte budget.
-	// Zero uses the default.
-	PendingPriorityBytesBudget uint64
-	// RetainedOpenInfoBytesBudget overrides the retained open_info byte budget.
-	// Zero uses the default.
-	RetainedOpenInfoBytesBudget uint64
-	// RetainedPeerReasonBytesBudget overrides the retained peer reason-text byte budget.
-	// Zero uses the default.
-	RetainedPeerReasonBytesBudget uint64
-	// AggregateLateDataCap overrides the aggregate late-data allowance reported
-	// by Stats (PressureStats.AggregateLateDataAtCap). The aggregate counts late
-	// bytes still retained by stopped or aborted streams and their tombstones.
-	// Exceeding it never fails the session; further late tail is discarded and
-	// its session credit released. Zero uses the default.
-	AggregateLateDataCap uint64
-	// AcceptBacklogLimit overrides the visible accept backlog count. Zero uses the default.
-	AcceptBacklogLimit int
-	// AcceptBacklogBytesLimit overrides visible accept backlog bytes. Zero uses the default.
-	AcceptBacklogBytesLimit uint64
-	// TombstoneLimit overrides the retained tombstone count. Zero uses the default.
-	TombstoneLimit int
-	// MarkerOnlyUsedStreamLimit overrides retained marker-only used-stream
-	// entries, up to the default derived from the session memory cap. Past the
-	// limit the oldest markers are coarsened; the session never fails for it.
-	// Zero uses the derived default.
-	MarkerOnlyUsedStreamLimit int
-	// AbuseWindow overrides the local anti-abuse accounting window. Zero uses the default.
-	AbuseWindow time.Duration
-	// HiddenAbortChurnWindow overrides hidden abort churn detection. Zero uses the default.
-	HiddenAbortChurnWindow time.Duration
-	// HiddenAbortChurnThreshold overrides hidden open-then-abort churn. Zero uses the default.
-	HiddenAbortChurnThreshold uint32
-	// VisibleTerminalChurnWindow overrides visible terminal churn detection.
-	// Zero uses the default.
-	VisibleTerminalChurnWindow time.Duration
-	// VisibleTerminalChurnThreshold overrides visible open-then-reset/abort churn.
-	// Zero uses the default.
-	VisibleTerminalChurnThreshold uint32
-	// InboundControlFrameBudget overrides the inbound control-frame window.
-	// Zero uses the default.
-	InboundControlFrameBudget uint32
-	// InboundControlBytesBudget overrides the inbound control-byte window.
-	// Zero uses the default.
-	InboundControlBytesBudget uint64
-	// InboundExtFrameBudget overrides the inbound EXT-frame window. Zero uses the default.
-	InboundExtFrameBudget uint32
-	// InboundExtBytesBudget overrides the inbound EXT-byte window. Zero uses the default.
-	InboundExtBytesBudget uint64
-	// InboundMixedFrameBudget overrides the mixed control/EXT frame window.
-	// Zero uses the default.
-	InboundMixedFrameBudget uint32
-	// InboundMixedBytesBudget overrides the mixed control/EXT byte window.
-	// Zero uses the default.
-	InboundMixedBytesBudget uint64
-	// NoOpControlFloodThreshold overrides the mixed no-op control threshold.
-	// Zero uses the default.
-	NoOpControlFloodThreshold uint32
-	// NoOpMaxDataFloodThreshold overrides the no-op MAX_DATA threshold.
-	// Zero uses the default.
-	NoOpMaxDataFloodThreshold uint32
-	// NoOpBlockedFloodThreshold overrides the no-op BLOCKED threshold. Zero uses the default.
-	NoOpBlockedFloodThreshold uint32
-	// NoOpZeroDataFloodThreshold overrides the zero-length DATA threshold.
-	// Zero uses the default.
-	NoOpZeroDataFloodThreshold uint32
-	// NoOpPriorityUpdateFloodThreshold overrides the no-op PRIORITY_UPDATE threshold.
-	// Zero uses the default.
-	NoOpPriorityUpdateFloodThreshold uint32
-	// GroupRebucketChurnThreshold overrides repeated stream_group rebucketing.
-	// Zero uses the default.
-	GroupRebucketChurnThreshold uint32
-	// InboundPingFloodThreshold overrides the inbound PING flood threshold.
-	// Zero uses the default.
-	InboundPingFloodThreshold uint32
-	// StopSendingGracefulDrainWindow bounds graceful drain after peer STOP_SENDING.
-	// Zero uses the default.
-	StopSendingGracefulDrainWindow time.Duration
-	// StopSendingGracefulTailCap bounds DATA|FIN tail after peer STOP_SENDING.
-	// Zero uses the default.
-	StopSendingGracefulTailCap uint64
-	// GracefulCloseDrainTimeout bounds Close waiting for graceful drain. It
-	// also bounds each wait for a GOAWAY write, so Close cannot hang on a
-	// transport that stopped draining. Zero uses the default.
-	GracefulCloseDrainTimeout time.Duration
+	// InitialStreamReceiveWindow (256 KiB, at least 4 KiB).
+	InitialStreamReceiveWindow uint64
+	// MaxStreamReceiveWindow caps auto-tuning (0: auto, a 64 MiB floor
+	// that grows within the memory budget).
+	MaxStreamReceiveWindow uint64
+	// LatencyBudget is the B of window auto-tuning (100 us).
+	LatencyBudget time.Duration
+	// InitialConnectionReceiveWindow (1 MiB, at least 16 KiB).
+	InitialConnectionReceiveWindow uint64
+	// MaxConnectionReceiveWindow (0: auto, a 96 MiB floor).
+	MaxConnectionReceiveWindow uint64
+	// MemoryBudget of a session without a listener (1 GiB); negative is
+	// unlimited.
+	MemoryBudget int64
 
-	// EventHandler receives lightweight connection/stream lifecycle notifications.
-	EventHandler EventHandler
+	// MaxIncomingStreams is initial_max_streams_bidi (256); negative is 0.
+	MaxIncomingStreams int64
+	// MaxIncomingUniStreams: 0 = staged credit (16, raised to 256 on the
+	// first AcceptUniStream); negative = explicit 0; positive = that value.
+	MaxIncomingUniStreams int64
+
+	// EnableDatagrams announces max_datagram_frame_size and datagram flows.
+	EnableDatagrams bool
+	// Datagram queue sizes (64 / 128 / 32 per stream / 1 MiB).
+	DatagramSendQueue    int
+	DatagramReceiveQueue int
+	DatagramStreamQueue  int
+	DatagramReceiveBytes int
+
+	// SendBuffer bounds written-but-unreleased bytes (4 MiB).
+	SendBuffer uint64
+	// MaxSendBuffer bounds its growth in multipath sessions (0: auto).
+	MaxSendBuffer uint64
+
+	// MaxPipes is the attachments this endpoint aims for (1: multipath
+	// off; 8 recommended when multipath is used).
+	MaxPipes int
+	// PipeHeadroom is H of the attachment cap (8).
+	PipeHeadroom int
+	// ReplayWindow is W (default max(64, 2*(MaxPipes+H))).
+	ReplayWindow int
+	// MaxLanes is the lanes accepted per inbound pipe (258; 1 disables).
+	MaxLanes int
+
+	// ResumeTimeout enables resume with this grace period.
+	ResumeTimeout time.Duration
+
+	// Scheduler is the session's scheduling policy (nil: Affinity).
+	Scheduler Scheduler
+	// SchedulerParams tune the scheduler and failure detection.
+	SchedulerParams SchedulerParams
+
+	// PipeAuth selects the join secret (required for multipath).
+	PipeAuth PipeAuth
+
+	// EarlyData enables early data (SPEC.md 6.1.2).
+	EarlyData EarlyData
+
+	// DatagramLimiter polices datagrams in each direction (API.md 5.6):
+	// a datagram passes when TryReady allows its whole payload, and is
+	// then charged; otherwise it is dropped and counted.
+	DatagramLimiter DatagramLimiter
+
+	// Tracer receives session events on a goroutine of its own.
+	Tracer *Tracer
+	// Redial re-establishes pipes after failures (resume).
+	Redial func(ctx context.Context, need Direction) (PipeIO, error)
+	// AllowConnectionWindowIncrease approves session window growth.
+	AllowConnectionWindowIncrease func(delta uint64) bool
 }
 
-// OpenOptions carries optional open-time inputs for a new stream.
-//
-// InitialPriority and InitialGroup may remain local sender-policy hints when
-// the corresponding peer-visible carriage is unavailable. OpenInfo is
-// peer-visible open-time metadata and is rejected if it cannot be carried on
-// the opening frame.
-type OpenOptions struct {
-	InitialPriority *uint64
-	InitialGroup    *uint64
-	OpenInfo        []byte
+// DatagramLimiter holds the limiters of the two datagram directions.
+type DatagramLimiter struct {
+	Send, Receive Limiter
 }
 
-const (
-	defaultEstablishmentTimeout     = 10 * time.Second
-	defaultIdleKeepaliveInterval    = time.Minute
-	defaultKeepaliveMaxPingInterval = 5 * time.Minute
-	defaultPrefacePaddingMinBytes   = 16
-	defaultPrefacePaddingMaxBytes   = 256
-	defaultPingPaddingMinBytes      = 16
-	defaultPingPaddingMaxBytes      = 64
-	defaultCapabilities             = CapabilityOpenMetadata | CapabilityPriorityHints | CapabilityStreamGroups | CapabilityPriorityUpdate
-)
+// SchedulerParams are the scheduler parameters of API.md Section 6.
+type SchedulerParams struct {
+	SuspectFloor  time.Duration // 250 ms, at least 50 ms
+	DeadTimeout   time.Duration // 0: default
+	Probation     *time.Duration
+	OverflowDelay time.Duration // 1 s
+	StandbyProbe  time.Duration // 1 s; negative: the probe interval
+	ProbeInterval time.Duration // 15 s; negative: off
+	NoRedundancy  bool          // redundancy "off"
+	SpreadChunk   int           // 16 KiB
+}
 
-var (
-	defaultConfigMu       sync.RWMutex
-	defaultConfigTemplate = builtinDefaultConfig()
-)
+// EarlyData enables early data.
+type EarlyData struct {
+	// ZmuxPeer declares the peer a zmux endpoint: data written before its
+	// parameters arrive goes out under the floor, behind the fence.
+	ZmuxPeer bool
+	// Replayable allows carrier early data (TLS 1.3, QUIC 0-RTT).
+	Replayable bool
+	// Remembered are the peer's parameters from an earlier session
+	// (Conn.RememberedParameters): a client sends its first streams in the
+	// carrier's early data under them.
+	Remembered []byte
+}
 
-func builtinDefaultConfig() Config {
-	return Config{
-		Role:                     RoleAuto,
-		MinProto:                 ProtoVersion,
-		MaxProto:                 ProtoVersion,
-		Capabilities:             defaultCapabilities,
-		Settings:                 DefaultSettings(),
-		NonceSource:              rand.Reader,
-		PrefacePadding:           true,
-		PingPadding:              true,
-		KeepaliveInterval:        defaultIdleKeepaliveInterval,
-		KeepaliveMaxPingInterval: defaultKeepaliveMaxPingInterval,
+// PipeAuth selects the secret sources of joins (MULTIPATH.md 10.1).
+type PipeAuth struct {
+	// TLS asserts that pipe 0's TLS 1.3 handshake terminates at the peer.
+	TLS bool
+	// PSK is a pre-shared key of at least 16 bytes.
+	PSK []byte
+	// AllowInsecure allows joins without a secret (tests, protected
+	// networks). It must not be combined with PSK.
+	AllowInsecure bool
+}
+
+// Clone returns a shallow copy (nil means defaults): slices such as
+// PipeAuth.PSK and EarlyData.Remembered and the function fields are shared.
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return &Config{}
 	}
+	cp := *c
+	return &cp
 }
 
-// DefaultConfig returns a copy of the process-wide default configuration
-// template.
-func DefaultConfig() *Config {
-	defaultConfigMu.RLock()
-	out := defaultConfigTemplate
-	defaultConfigMu.RUnlock()
-	return &out
+func dur(d, def time.Duration) core.Duration {
+	if d == 0 {
+		d = def
+	}
+	return core.Duration(d)
 }
 
-// ConfigureDefaultConfig mutates the process-wide default configuration
-// template used by DefaultConfig and by constructors called with nil Config.
-//
-// Call it during process initialization before creating sessions. Existing
-// sessions are not affected. Concurrent calls are race-safe; last write wins.
-//
-// Per-session random fields are not retained in the template: TieBreakerNonce
-// and Settings.PingPaddingKey are cleared after fn returns so each session can
-// generate fresh values.
-func ConfigureDefaultConfig(fn func(*Config)) {
-	if fn == nil {
-		return
+// coreConfig validates c and resolves it for the core.
+func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, error) {
+	if c == nil {
+		c = &Config{}
 	}
-	defaultConfigMu.RLock()
-	out := defaultConfigTemplate
-	defaultConfigMu.RUnlock()
-
-	fn(&out)
-
-	out = sanitizeDefaultConfigTemplate(out)
-	defaultConfigMu.Lock()
-	defaultConfigTemplate = out
-	defaultConfigMu.Unlock()
-}
-
-// ResetDefaultConfig restores the built-in process-wide default configuration
-// template.
-func ResetDefaultConfig() {
-	defaultConfigMu.Lock()
-	defaultConfigTemplate = builtinDefaultConfig()
-	defaultConfigMu.Unlock()
-}
-
-func sanitizeDefaultConfigTemplate(out Config) Config {
-	out = normalizeConfigDefaults(out)
-	out.TieBreakerNonce = 0
-	out.Settings.PingPaddingKey = 0
-	return out
-}
-
-func normalizeConfigDefaults(out Config) Config {
-	if out.MinProto == 0 {
-		out.MinProto = ProtoVersion
+	cc := core.DefaultConfig()
+	cc.Role, cc.TransportRole = role, transport
+	l := &cc.Local
+	if c.HandshakeTimeout != 0 {
+		cc.HandshakeTimeout = core.Duration(c.HandshakeTimeout)
 	}
-	if out.MaxProto == 0 {
-		out.MaxProto = ProtoVersion
-	}
-	if out.DisableCapabilities {
-		out.Capabilities = 0
-	} else if out.Capabilities == 0 {
-		out.Capabilities = defaultCapabilities
-	}
-	if out.Settings == (Settings{}) {
-		out.Settings = DefaultSettings()
-	} else {
-		defaults := DefaultSettings()
-		if out.Settings.MaxFramePayload == 0 {
-			out.Settings.MaxFramePayload = defaults.MaxFramePayload
-		}
-		if out.Settings.MaxControlPayloadBytes == 0 {
-			out.Settings.MaxControlPayloadBytes = defaults.MaxControlPayloadBytes
-		}
-		if out.Settings.MaxExtensionPayloadBytes == 0 {
-			out.Settings.MaxExtensionPayloadBytes = defaults.MaxExtensionPayloadBytes
-		}
-	}
-	if out.NonceSource == nil {
-		out.NonceSource = rand.Reader
-	}
-	return out
-}
-
-func cloneConfig(cfg *Config) Config {
-	if cfg == nil {
-		return *DefaultConfig()
-	}
-	return normalizeConfigDefaults(*cfg)
-}
-
-// establishmentTimeout resolves EstablishmentTimeout. Zero means unbounded.
-func (c Config) establishmentTimeout() time.Duration {
 	switch {
-	case c.EstablishmentTimeout < 0:
-		return 0
-	case c.EstablishmentTimeout == 0:
-		return defaultEstablishmentTimeout
-	default:
-		return c.EstablishmentTimeout
+	case c.MaxIdleTimeout < 0:
+		l.Has &^= wire.HasIdle
+	case c.MaxIdleTimeout > 0:
+		l.MaxIdleTimeout = uint64(c.MaxIdleTimeout / time.Millisecond)
 	}
-}
-
-func (c Config) LocalPreface() (Preface, error) {
-	if !c.Role.Valid() {
-		return Preface{}, wireError(CodeProtocol, "build preface", errInvalidRole)
+	cc.KeepAlive = core.Duration(c.KeepAlivePeriod)
+	if v := c.InitialStreamReceiveWindow; v != 0 {
+		if v < 4096 {
+			return cc, fmt.Errorf("%w: InitialStreamReceiveWindow below 4 KiB", ErrInvalidConfig)
+		}
+		l.MaxStreamDataBidiLoc, l.MaxStreamDataBidiRem, l.MaxStreamDataUni = v, v, v
 	}
-
-	nonce := c.TieBreakerNonce
-	switch c.Role {
-	case RoleInitiator, RoleResponder:
-		nonce = 0
-	case RoleAuto:
-		if nonce == 0 {
-			var err error
-			nonce, err = randomVarint62(c.NonceSource)
-			if err != nil {
-				return Preface{}, wireError(CodeInternal, "build preface", err)
-			}
+	if v := c.InitialConnectionReceiveWindow; v != 0 {
+		if v < 16384 {
+			return cc, fmt.Errorf("%w: InitialConnectionReceiveWindow below 16 KiB", ErrInvalidConfig)
+		}
+		l.InitialMaxData = v
+	}
+	cc.StreamWindowCap = c.MaxStreamReceiveWindow
+	cc.ConnWindowCap = c.MaxConnectionReceiveWindow
+	if c.LatencyBudget > 0 {
+		cc.LatencyBudget = core.Duration(c.LatencyBudget)
+	}
+	switch {
+	case c.MemoryBudget < 0:
+		cc.MemoryBudget = 0
+	case c.MemoryBudget > 0:
+		cc.MemoryBudget = uint64(c.MemoryBudget)
+	}
+	switch {
+	case c.MaxIncomingStreams < 0:
+		l.MaxStreamsBidi = 0
+	case c.MaxIncomingStreams > 0:
+		if c.MaxIncomingStreams < 4 {
+			return cc, fmt.Errorf("%w: MaxIncomingStreams must be 0 or at least 4", ErrInvalidConfig)
+		}
+		l.MaxStreamsBidi = uint64(c.MaxIncomingStreams)
+	}
+	switch {
+	case c.MaxIncomingUniStreams < 0:
+		cc.StagedUni, l.MaxStreamsUni = false, 0
+	case c.MaxIncomingUniStreams > 0:
+		cc.StagedUni, l.MaxStreamsUni = false, uint64(c.MaxIncomingUniStreams)
+	}
+	// The preamble limit: 4096, or the smallest initial window and a
+	// quarter of the session window when smaller, at least 1024.
+	pre := min(uint64(4096), l.MaxStreamDataBidiRem, l.MaxStreamDataUni, l.InitialMaxData/4)
+	l.Preamble = max(pre, 1024)
+	if c.EnableDatagrams {
+		cc.Datagrams = true
+		l.Has |= wire.HasDatagram | wire.HasFlows
+		l.MaxDatagramFrameSize = 65535
+	}
+	setInt := func(dst *int, v int) {
+		if v > 0 {
+			*dst = v
 		}
 	}
-
-	settings := c.Settings
-	if c.PingPadding {
-		if settings.PingPaddingKey == 0 {
-			var err error
-			settings.PingPaddingKey, err = randomVarint62(c.NonceSource)
-			if err != nil {
-				return Preface{}, wireError(CodeInternal, "build preface", err)
-			}
+	setInt(&cc.DgramSendQ, c.DatagramSendQueue)
+	setInt(&cc.DgramRecvQ, c.DatagramReceiveQueue)
+	setInt(&cc.DgramStreamQ, c.DatagramStreamQueue)
+	if c.DatagramReceiveBytes > 0 {
+		cc.DgramRecvSize = uint64(c.DatagramReceiveBytes)
+	}
+	if c.SendBuffer > 0 {
+		cc.SendBuffer = c.SendBuffer
+	}
+	cc.SendBufferMax = max(c.MaxSendBuffer, cc.SendBuffer)
+	if c.MaxSendBuffer == 0 {
+		cc.SendBufferMax = 0
+	}
+	if c.MaxLanes > 0 {
+		l.MaxLanes = uint64(c.MaxLanes)
+	}
+	if _, err := rand.Read(l.LaneKey[:]); err != nil {
+		return cc, err
+	}
+	if c.MaxPipes > 0 {
+		cc.MaxPipes = c.MaxPipes
+	}
+	if c.PipeHeadroom > 0 {
+		cc.Headroom = c.PipeHeadroom
+	}
+	cc.ReplayWindow = c.ReplayWindow
+	cc.Resume = core.Duration(c.ResumeTimeout)
+	p := &c.SchedulerParams
+	if p.SuspectFloor != 0 {
+		if p.SuspectFloor < 50*time.Millisecond {
+			return cc, fmt.Errorf("%w: SuspectFloor below 50 ms", ErrInvalidConfig)
 		}
-	} else {
-		settings.PingPaddingKey = 0
+		cc.SuspectFloor = core.Duration(p.SuspectFloor)
 	}
-
-	return Preface{
-		PrefaceVersion:  PrefaceVersion,
-		Role:            c.Role,
-		TieBreakerNonce: nonce,
-		MinProto:        c.MinProto,
-		MaxProto:        c.MaxProto,
-		Capabilities:    c.Capabilities,
-		Settings:        settings,
-	}, nil
-}
-
-func marshalLocalPrefacePayload(local Preface, cfg Config) ([]byte, error) {
-	if !cfg.PrefacePadding {
-		return local.MarshalBinary()
-	}
-	padding, err := randomPrefacePadding(cfg.NonceSource, local.Settings, cfg.PrefacePaddingMinBytes, cfg.PrefacePaddingMaxBytes)
-	if err != nil {
-		return nil, wireError(CodeInternal, "build preface padding", err)
-	}
-	return wire.MarshalPrefaceWithSettingsPadding(local, padding)
-}
-
-func randomPrefacePadding(r io.Reader, settings Settings, configuredMin, configuredMax uint64) ([]byte, error) {
-	maxPayload, err := maxPrefacePaddingPayloadBytes(settings, configuredMax)
-	if err != nil || maxPayload == 0 {
-		return nil, err
-	}
-	minPayload := configuredMin
-	if minPayload == 0 {
-		minPayload = defaultPrefacePaddingMinBytes
-	}
-	if minPayload > maxPayload {
-		minPayload = maxPayload
-	}
-	paddingLen := minPayload
-	if span := maxPayload - minPayload + 1; span > 1 {
-		n, err := randomUint64n(r, span)
-		if err != nil {
-			return nil, err
+	if p.DeadTimeout != 0 {
+		if p.DeadTimeout < time.Second {
+			return cc, fmt.Errorf("%w: DeadTimeout below 1 s", ErrInvalidConfig)
 		}
-		paddingLen += n
+		cc.DeadTimeout = core.Duration(p.DeadTimeout)
 	}
-	padding := make([]byte, int(paddingLen))
-	if _, err := io.ReadFull(randomReader(r), padding); err != nil {
-		return nil, err
+	if p.Probation != nil {
+		cc.Probation = core.Duration(*p.Probation)
 	}
-	return padding, nil
-}
-
-func maxPrefacePaddingPayloadBytes(settings Settings, configuredMax uint64) (uint64, error) {
-	settingsBuf, err := wire.MarshalSettingsTLV(settings)
-	if err != nil {
-		return 0, err
+	cc.OverflowDelay = dur(p.OverflowDelay, time.Second)
+	switch {
+	case p.StandbyProbe < 0:
+		cc.StandbyProbe = 0
+	case p.StandbyProbe > 0:
+		cc.StandbyProbe = core.Duration(p.StandbyProbe)
 	}
-	if len(settingsBuf) >= MaxPrefaceSettingsBytes {
-		return 0, nil
+	switch {
+	case p.ProbeInterval < 0:
+		cc.ProbeInterval = 0
+	case p.ProbeInterval > 0:
+		cc.ProbeInterval = core.Duration(p.ProbeInterval)
 	}
-	maxPayload := configuredMax
-	if maxPayload == 0 {
-		maxPayload = defaultPrefacePaddingMaxBytes
+	cc.Redundancy = !p.NoRedundancy
+	if p.SpreadChunk > 0 {
+		cc.SpreadChunk = p.SpreadChunk
 	}
-	remaining := uint64(MaxPrefaceSettingsBytes - len(settingsBuf))
-	if maxPayload > remaining {
-		maxPayload = remaining
+	if c.Scheduler != nil {
+		cc.Policy = c.Scheduler.policy()
 	}
-	typeLen, err := wire.VarintLen(uint64(SettingPrefacePadding))
-	if err != nil {
-		return 0, err
+	a := &c.PipeAuth
+	if a.AllowInsecure && len(a.PSK) > 0 {
+		return cc, fmt.Errorf("%w: AllowInsecure with a PSK", ErrInvalidConfig)
 	}
-	var low uint64
-	high := maxPayload
-	for low < high {
-		candidate := low + (high-low+1)/2
-		lenLen, err := wire.VarintLen(candidate)
-		if err != nil {
-			return 0, err
+	if len(a.PSK) > 0 && len(a.PSK) < 16 {
+		return cc, fmt.Errorf("%w: PSK shorter than 16 bytes", ErrInvalidConfig)
+	}
+	cc.PSK = a.PSK
+	if cc.MaxPipes > 1 || cc.Resume > 0 {
+		if !a.TLS && len(a.PSK) == 0 && !a.AllowInsecure {
+			return cc, fmt.Errorf("%w: multipath needs PipeAuth", ErrInvalidConfig)
 		}
-		overhead := uint64(typeLen + lenLen)
-		if overhead <= remaining && candidate <= remaining-overhead {
-			low = candidate
-		} else {
-			high = candidate - 1
+		l.Has |= wire.HasMultipath
+		if a.TLS {
+			l.SecretFlags |= wire.SecretExporter
+		}
+		if len(a.PSK) > 0 {
+			l.SecretFlags |= wire.SecretPSK
+		}
+		if a.AllowInsecure {
+			l.SecretFlags |= wire.SecretInsecure
+		}
+		if _, err := rand.Read(l.SessionNonce[:]); err != nil {
+			return cc, err
+		}
+		if cc.Resume > 0 {
+			l.Has |= wire.HasResume
+			l.ResumeGrace = uint64(max(1, cc.Resume/core.Millisecond))
 		}
 	}
-	return low, nil
-}
-
-func randomUint64n(r io.Reader, n uint64) (uint64, error) {
-	if n == 0 {
-		return 0, nil
-	}
-	if n > MaxVarint62+1 {
-		return 0, fmt.Errorf("random range %d exceeds 62-bit source range", n)
-	}
-	limit := ((MaxVarint62 + 1) / n) * n
-	for {
-		v, err := randomUint62(r)
-		if err != nil {
-			return 0, err
+	if role == core.RoleAuto {
+		l.Has |= wire.HasRole
+		l.Role = wire.RoleAuto
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return cc, err
 		}
-		if v < limit {
-			return v % n, nil
+		for _, x := range b {
+			l.RoleNonce = l.RoleNonce<<8 | uint64(x)
 		}
 	}
-}
-
-func randomReader(r io.Reader) io.Reader {
-	if r == nil {
-		return rand.Reader
+	// GREASE transport parameter (SPEC.md 5.2 rule 6).
+	var g [3]byte
+	if _, err := rand.Read(g[:]); err != nil {
+		return cc, err
 	}
-	return r
-}
-
-func randomVarint62(r io.Reader) (uint64, error) {
-	for {
-		v, err := randomUint62(r)
-		if err != nil {
-			return 0, err
-		}
-		if v != 0 {
-			return v, nil
-		}
-	}
-}
-
-// sessionLivenessSeed draws one per-session PRNG seed for keepalive jitter or
-// for PING tokens and padding. It reads the configured nonce source and falls
-// back to crypto/rand; preface nonces are never used, since explicit roles
-// force them to zero and auto-role peers send them in clear. Only if both
-// sources fail does it return 0, which selects the runtime's randomized
-// fallback counter.
-func sessionLivenessSeed(r io.Reader) uint64 {
-	if seed, err := randomUint62(r); err == nil && seed != 0 {
-		return seed
-	}
-	if seed, err := randomUint62(rand.Reader); err == nil {
-		return seed
-	}
-	return 0
-}
-
-func randomUint62(r io.Reader) (uint64, error) {
-	var buf [8]byte
-	if _, err := io.ReadFull(randomReader(r), buf[:]); err != nil {
-		return 0, err
-	}
-	return (uint64(buf[0]&0x3f) << 56) |
-		(uint64(buf[1]) << 48) |
-		(uint64(buf[2]) << 40) |
-		(uint64(buf[3]) << 32) |
-		(uint64(buf[4]) << 24) |
-		(uint64(buf[5]) << 16) |
-		(uint64(buf[6]) << 8) |
-		uint64(buf[7]), nil
-}
-
-func ParsePreface(data []byte) (Preface, error) {
-	return wire.ParsePreface(data)
-}
-
-func ReadPreface(r io.Reader) (Preface, error) {
-	return wire.ReadPreface(r)
-}
-
-func NegotiatePrefaces(local, peer Preface) (Negotiated, error) {
-	return wire.NegotiatePrefaces(local, peer)
-}
-
-// Claim identifies one repository-defined standardized claim string from the
-// zmux document set.
-type Claim string
-
-const (
-	ClaimWireV1                 Claim = "zmux-wire-v1"
-	ClaimAPISemanticsProfileV1  Claim = "zmux-api-semantics-profile-v1"
-	ClaimStreamAdapterProfileV1 Claim = "zmux-stream-adapter-profile-v1"
-	ClaimOpenMetadata           Claim = "zmux-open_metadata"
-	ClaimPriorityUpdate         Claim = "zmux-priority_update"
-)
-
-// ImplementationProfile identifies one repository-defined implementation
-// profile name from the zmux document set.
-type ImplementationProfile string
-
-const (
-	ProfileV1          ImplementationProfile = "zmux-v1"
-	ProfileReferenceV1 ImplementationProfile = "zmux-reference-profile-v1"
-)
-
-// ConformanceSuite identifies one repository-defined local conformance suite
-// selection bucket derived from CONFORMANCE.md.
-type ConformanceSuite string
-
-const (
-	SuiteCoreWireInteroperability     ConformanceSuite = "core-wire-interoperability"
-	SuiteInvalidInputHandling         ConformanceSuite = "invalid-input-handling"
-	SuiteExtensionTolerance           ConformanceSuite = "extension-tolerance"
-	SuiteCoreStreamLifecycle          ConformanceSuite = "core-stream-lifecycle"
-	SuiteCoreFlowControl              ConformanceSuite = "core-flow-control"
-	SuiteCoreSessionLifecycle         ConformanceSuite = "core-session-lifecycle"
-	SuiteOpenMetadata                 ConformanceSuite = "open_metadata"
-	SuitePriorityUpdate               ConformanceSuite = "priority_update"
-	SuitePriorityHintsAndStreamGroups ConformanceSuite = "priority-hints-and-stream-groups"
-	SuiteV1ProfileCompatibility       ConformanceSuite = "v1-profile-compatibility"
-	SuiteAPISemanticsProfile          ConformanceSuite = "api-semantics-profile"
-	SuiteStreamAdapterProfile         ConformanceSuite = "stream-adapter-profile"
-	SuiteReferenceProfileClaimGate    ConformanceSuite = "reference-profile-claim-gate"
-	SuiteReferenceQualityBehaviors    ConformanceSuite = "reference-quality-behaviors"
-)
-
-var knownClaims = []Claim{
-	ClaimWireV1,
-	ClaimAPISemanticsProfileV1,
-	ClaimStreamAdapterProfileV1,
-	ClaimOpenMetadata,
-	ClaimPriorityUpdate,
-}
-
-var knownProfiles = []ImplementationProfile{
-	ProfileV1,
-	ProfileReferenceV1,
-}
-
-var knownConformanceSuites = []ConformanceSuite{
-	SuiteCoreWireInteroperability,
-	SuiteInvalidInputHandling,
-	SuiteExtensionTolerance,
-	SuiteCoreStreamLifecycle,
-	SuiteCoreFlowControl,
-	SuiteCoreSessionLifecycle,
-	SuiteOpenMetadata,
-	SuitePriorityUpdate,
-	SuitePriorityHintsAndStreamGroups,
-	SuiteV1ProfileCompatibility,
-	SuiteAPISemanticsProfile,
-	SuiteStreamAdapterProfile,
-	SuiteReferenceProfileClaimGate,
-	SuiteReferenceQualityBehaviors,
-}
-
-var claimAcceptanceChecklist = map[Claim][]string{
-	ClaimWireV1: {
-		"pass core wire interoperability",
-		"pass invalid-input handling",
-		"pass extension-tolerance behavior",
-	},
-	ClaimOpenMetadata: {
-		"satisfy zmux-wire-v1",
-		"negotiate open_metadata",
-		"accept valid DATA|OPEN_METADATA on first opening DATA",
-		"reject unnegotiated or misplaced OPEN_METADATA",
-		"ignore unknown metadata TLVs",
-		"drop duplicate singleton metadata while preserving the enclosing DATA",
-	},
-	ClaimPriorityUpdate: {
-		"satisfy zmux-wire-v1",
-		"negotiate priority_update",
-		"process stream_priority and stream_group",
-		"ignore open_info inside PRIORITY_UPDATE",
-		"ignore unknown advisory TLVs",
-		"ignore duplicate singleton advisory updates as one dropped update",
-	},
-	ClaimAPISemanticsProfileV1: {
-		"document and implement the repository-default semantic operation families from API_SEMANTICS.md, including full local close helper, graceful send-half completion, read-side stop, send-side reset, whole-stream abort, structured error surfacing, open/cancel behavior, and accept visibility rules",
-		"document whether the binding exposes a stream-style convenience profile, a full-control protocol surface, or both",
-		"exact API spellings are not required",
-	},
-	ClaimStreamAdapterProfileV1: {
-		"satisfy the stream-adapter subset from API_SEMANTICS.md, including bidirectional/unidirectional open and accept mapping",
-		"provide one consistent convenience mapping or fuller documented control layer or both",
-		"document limits/non-goals",
-	},
-}
-
-var profileAcceptanceChecklist = map[ImplementationProfile][]string{
-	ProfileV1: {
-		"satisfy zmux-wire-v1",
-		"interoperate on explicit-role and role=auto establishment",
-		"pass core stream-lifecycle scenarios",
-		"pass core flow-control scenarios",
-		"pass core session-lifecycle scenarios",
-		"satisfy every currently active same-version optional surface in this repository",
-		"negotiate and handle open_metadata, priority_update, priority_hints, and stream_groups correctly",
-	},
-	ProfileReferenceV1: {
-		"satisfy zmux-v1",
-		"satisfy the repository-defined reference-profile claim gate",
-		"preserve the documented repository-default sender, memory, liveness, API, and scheduling behavior closely enough for release claims",
-	},
-}
-
-var referenceProfileClaimGate = []string{
-	"repository-default stream-style CloseRead() emits STOP_SENDING(CANCELLED) when that convenience profile is exposed, while fuller control surfaces MAY additionally expose caller-selected codes and diagnostics for STOP_SENDING, RESET, and ABORT",
-	"repository-default Close() acts as a full local close helper",
-	"repository-default Close() on a unidirectional stream silently ignores the locally absent direction rather than failing solely because that half does not exist",
-	"each exposed API surface keeps one documented primary spelling per operation family, with any extra convenience spellings documented as wrappers over the same semantic action rather than as distinct lifecycle operations",
-	"before session-ready, repository-default sender behavior emits only the local preface and a fatal establishment CLOSE, and emits none of new-stream DATA, stream-scoped control, ordinary session-scoped control, or EXT",
-	"repository-default sender and receiver memory rules enforce the documented hidden-state, provisional-open, and late-tail bounds",
-	"repository-default liveness rules keep at most one outstanding protocol PING and do not treat weak local signals as strong progress",
-}
-
-var claimRequiredSuites = map[Claim][]ConformanceSuite{
-	ClaimWireV1: {
-		SuiteCoreWireInteroperability,
-		SuiteInvalidInputHandling,
-		SuiteExtensionTolerance,
-	},
-	ClaimOpenMetadata: {
-		SuiteCoreWireInteroperability,
-		SuiteInvalidInputHandling,
-		SuiteExtensionTolerance,
-		SuiteOpenMetadata,
-	},
-	ClaimPriorityUpdate: {
-		SuiteCoreWireInteroperability,
-		SuiteInvalidInputHandling,
-		SuiteExtensionTolerance,
-		SuitePriorityUpdate,
-	},
-	ClaimAPISemanticsProfileV1: {
-		SuiteAPISemanticsProfile,
-	},
-	ClaimStreamAdapterProfileV1: {
-		SuiteStreamAdapterProfile,
-	},
-}
-
-var profileRequiredSuites = map[ImplementationProfile][]ConformanceSuite{
-	ProfileV1: {
-		SuiteCoreWireInteroperability,
-		SuiteInvalidInputHandling,
-		SuiteExtensionTolerance,
-		SuiteCoreStreamLifecycle,
-		SuiteCoreFlowControl,
-		SuiteCoreSessionLifecycle,
-		SuiteOpenMetadata,
-		SuitePriorityUpdate,
-		SuitePriorityHintsAndStreamGroups,
-		SuiteV1ProfileCompatibility,
-	},
-	ProfileReferenceV1: {
-		SuiteCoreWireInteroperability,
-		SuiteInvalidInputHandling,
-		SuiteExtensionTolerance,
-		SuiteCoreStreamLifecycle,
-		SuiteCoreFlowControl,
-		SuiteCoreSessionLifecycle,
-		SuiteOpenMetadata,
-		SuitePriorityUpdate,
-		SuitePriorityHintsAndStreamGroups,
-		SuiteV1ProfileCompatibility,
-		SuiteAPISemanticsProfile,
-		SuiteStreamAdapterProfile,
-		SuiteReferenceProfileClaimGate,
-		SuiteReferenceQualityBehaviors,
-	},
-}
-
-var coreModuleTargetClaims = []Claim{
-	ClaimWireV1,
-	ClaimAPISemanticsProfileV1,
-	ClaimOpenMetadata,
-	ClaimPriorityUpdate,
-}
-
-var coreModuleTargetProfiles = []ImplementationProfile{
-	ProfileV1,
-}
-
-var coreModuleTargetSuites = mergeRequiredSuites(coreModuleTargetClaims, coreModuleTargetProfiles)
-
-func copyStrings(in []string) []string {
-	return append([]string(nil), in...)
-}
-
-func copySuites(in []ConformanceSuite) []ConformanceSuite {
-	return append([]ConformanceSuite(nil), in...)
-}
-
-func mergeRequiredSuites(claims []Claim, profiles []ImplementationProfile) []ConformanceSuite {
-	seen := make(map[ConformanceSuite]struct{}, len(knownConformanceSuites))
-	for _, claim := range claims {
-		for _, suite := range claimRequiredSuites[claim] {
-			seen[suite] = struct{}{}
-		}
-	}
-	for _, profile := range profiles {
-		for _, suite := range profileRequiredSuites[profile] {
-			seen[suite] = struct{}{}
-		}
-	}
-	if len(seen) == 0 {
-		return nil
-	}
-	out := make([]ConformanceSuite, 0, len(seen))
-	for _, suite := range knownConformanceSuites {
-		if _, ok := seen[suite]; ok {
-			out = append(out, suite)
-		}
-	}
-	return out
-}
-
-// KnownClaims returns the repository-defined claim names recognized by this
-// package. The returned slice is a copy and may be modified by the caller.
-func KnownClaims() []Claim {
-	return append([]Claim(nil), knownClaims...)
-}
-
-// KnownImplementationProfiles returns the repository-defined implementation
-// profile names recognized by this package. The returned slice is a copy and
-// may be modified by the caller.
-func KnownImplementationProfiles() []ImplementationProfile {
-	return append([]ImplementationProfile(nil), knownProfiles...)
-}
-
-// KnownConformanceSuites returns the repository-defined local conformance
-// suite selection buckets recognized by this package.
-func KnownConformanceSuites() []ConformanceSuite {
-	return copySuites(knownConformanceSuites)
-}
-
-// Valid reports whether the claim matches one of the repository-defined claim
-// names in the current zmux document set.
-func (c Claim) Valid() bool {
-	switch c {
-	case ClaimWireV1, ClaimAPISemanticsProfileV1, ClaimStreamAdapterProfileV1, ClaimOpenMetadata, ClaimPriorityUpdate:
-		return true
-	default:
-		return false
-	}
-}
-
-// Valid reports whether the implementation profile matches one of the
-// repository-defined implementation-profile names in the current zmux document
-// set.
-func (p ImplementationProfile) Valid() bool {
-	switch p {
-	case ProfileV1, ProfileReferenceV1:
-		return true
-	default:
-		return false
-	}
-}
-
-// Valid reports whether the suite matches one of the repository-defined local
-// conformance suite selection buckets.
-func (s ConformanceSuite) Valid() bool {
-	switch s {
-	case SuiteCoreWireInteroperability,
-		SuiteInvalidInputHandling,
-		SuiteExtensionTolerance,
-		SuiteCoreStreamLifecycle,
-		SuiteCoreFlowControl,
-		SuiteCoreSessionLifecycle,
-		SuiteOpenMetadata,
-		SuitePriorityUpdate,
-		SuitePriorityHintsAndStreamGroups,
-		SuiteV1ProfileCompatibility,
-		SuiteAPISemanticsProfile,
-		SuiteStreamAdapterProfile,
-		SuiteReferenceProfileClaimGate,
-		SuiteReferenceQualityBehaviors:
-		return true
-	default:
-		return false
-	}
-}
-
-// Claims returns the repository-defined claim bundle associated with the given
-// implementation profile. The returned slice is a copy and may be modified by
-// the caller.
-func (p ImplementationProfile) Claims() []Claim {
-	switch p {
-	case ProfileV1:
-		return []Claim{
-			ClaimWireV1,
-			ClaimOpenMetadata,
-			ClaimPriorityUpdate,
-		}
-	case ProfileReferenceV1:
-		return []Claim{
-			ClaimWireV1,
-			ClaimAPISemanticsProfileV1,
-			ClaimStreamAdapterProfileV1,
-			ClaimOpenMetadata,
-			ClaimPriorityUpdate,
-		}
-	default:
-		return nil
-	}
-}
-
-// AcceptanceChecklist returns the repository-defined minimum acceptance
-// checklist for the claim. The returned slice is a copy and may be modified by
-// the caller.
-func (c Claim) AcceptanceChecklist() []string {
-	return copyStrings(claimAcceptanceChecklist[c])
-}
-
-// AcceptanceChecklist returns the repository-defined minimum acceptance
-// checklist for the implementation profile. The returned slice is a copy and
-// may be modified by the caller.
-func (p ImplementationProfile) AcceptanceChecklist() []string {
-	return copyStrings(profileAcceptanceChecklist[p])
-}
-
-// ReferenceProfileClaimGate returns the repository-defined reference-profile
-// gate conditions from the current zmux document set. The returned slice is a
-// copy and may be modified by the caller.
-func ReferenceProfileClaimGate() []string {
-	return copyStrings(referenceProfileClaimGate)
-}
-
-// RequiredConformanceSuites returns the repository-defined local suite
-// selection buckets needed to substantiate the claim.
-func (c Claim) RequiredConformanceSuites() []ConformanceSuite {
-	return copySuites(claimRequiredSuites[c])
-}
-
-// RequiredConformanceSuites returns the repository-defined local suite
-// selection buckets needed to substantiate the implementation profile.
-func (p ImplementationProfile) RequiredConformanceSuites() []ConformanceSuite {
-	return copySuites(profileRequiredSuites[p])
-}
-
-// ReleaseCertificationGate returns the repository-defined pass/fail local
-// suite selection gate for the implementation profile.
-func (p ImplementationProfile) ReleaseCertificationGate() []ConformanceSuite {
-	return p.RequiredConformanceSuites()
-}
-
-// CoreModuleTargetClaims returns the repository-defined conformance claims
-// targeted by the core zmux module. The returned slice is a copy and may be
-// modified by the caller.
-func CoreModuleTargetClaims() []Claim {
-	return append([]Claim(nil), coreModuleTargetClaims...)
-}
-
-// CoreModuleTargetImplementationProfiles returns the repository-defined
-// implementation profiles targeted by the core zmux module. The returned slice
-// is a copy and may be modified by the caller.
-func CoreModuleTargetImplementationProfiles() []ImplementationProfile {
-	return append([]ImplementationProfile(nil), coreModuleTargetProfiles...)
-}
-
-// CoreModuleTargetSuites returns the ordered union of conformance suites needed
-// to substantiate the core zmux module's target claims and profiles. The
-// returned slice is a copy and may be modified by the caller.
-func CoreModuleTargetSuites() []ConformanceSuite {
-	return copySuites(coreModuleTargetSuites)
-}
-
-type Frame = wire.Frame
-type dataPayload = wire.DataPayload
-type streamMetadata = wire.ParsedStreamMetadata
-type goAwayPayload = wire.GoAwayPayload
-type TLV = wire.TLV
-
-var (
-	maxRetainedReadFrameBytes = retainedReadFrameBufferLimit(DefaultSettings().MaxFramePayload)
-	defaultNormalizedLimits   = normalizeLimits(Limits{})
-)
-
-func ParseFrame(src []byte, limits Limits) (Frame, int, error) {
-	return wire.ParseFrame(src, limits)
-}
-
-func AppendTLV(dst []byte, typ uint64, value []byte) ([]byte, error) {
-	return wire.AppendTLV(dst, typ, value)
-}
-
-func ParseTLVs(src []byte) ([]TLV, error) {
-	return wire.ParseTLVs(src)
-}
-
-func VarintLen(v uint64) (int, error) {
-	return wire.VarintLen(v)
-}
-
-func AppendVarint(dst []byte, v uint64) ([]byte, error) {
-	return wire.AppendVarint(dst, v)
-}
-
-func EncodeVarint(v uint64) ([]byte, error) {
-	return wire.EncodeVarint(v)
-}
-
-func ParseVarint(src []byte) (uint64, int, error) {
-	return wire.ParseVarint(src)
-}
-
-func ReadVarint(r io.ByteReader) (uint64, int, error) {
-	return wire.ReadVarint(r)
-}
-
-func ReadFrame(r io.Reader, limits Limits) (Frame, error) {
-	return wire.ReadFrame(r, limits)
-}
-
-func readFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *wire.FrameReadBufferHandle, error) {
-	return wire.ReadFrameBuffered(r, limits, dst)
-}
-
-// readSessionFrameBuffered leaves EXT subtype payload rules to the EXT
-// handlers, which check the negotiated capability first.
-func readSessionFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *wire.FrameReadBufferHandle, error) {
-	return wire.ReadSessionFrameBuffered(r, limits, dst)
-}
-
-func releaseReadFrameBuffer(buf []byte, handle *wire.FrameReadBufferHandle) {
-	wire.ReleaseReadFrameBuffer(buf, handle)
-}
-
-func retainedReadFrameBufferLimit(maxFramePayload uint64) int {
-	if maxFramePayload == 0 {
-		maxFramePayload = DefaultSettings().MaxFramePayload
-	}
-	maxInt := int(^uint(0) >> 1)
-	if maxFramePayload > uint64(maxInt-maxEncodedFrameOverhead) {
-		return maxInt
-	}
-	return int(maxFramePayload) + maxEncodedFrameOverhead
-}
-
-func retainReadFrameBufferCapped(buf []byte, maxRetained int) []byte {
-	if maxRetained <= 0 || cap(buf) > maxRetained {
-		return nil
-	}
-	return buf[:0]
-}
-
-func retainReadFrameBuffer(buf []byte) []byte {
-	return retainReadFrameBufferCapped(buf, maxRetainedReadFrameBytes)
-}
-
-func retainReadFrameBufferForPayloadLimit(buf []byte, maxFramePayload uint64) []byte {
-	return retainReadFrameBufferCapped(buf, retainedReadFrameBufferLimit(maxFramePayload))
-}
-
-func normalizeLimits(limits Limits) Limits {
-	return wire.NormalizeLimits(limits)
-}
-
-func validateFrame(f Frame, limits Limits, inbound bool) error {
-	return wire.ValidateFrame(f, limits, inbound)
-}
-
-func frameSizeError(op string, err error) error {
-	return wire.FrameSizeError(op, err)
-}
-
-func parseExtFrame(payload []byte) (EXTSubtype, []byte, bool) {
-	subtype, n, err := ParseVarint(payload)
-	if err != nil {
-		return 0, nil, false
-	}
-	return EXTSubtype(subtype), payload[n:], true
-}
-
-func parseDataPayload(payload []byte, flags byte) (dataPayload, error) {
-	return wire.ParseDataPayload(payload, flags)
-}
-
-func parseDataPayloadView(payload []byte, flags byte) (dataPayload, error) {
-	return wire.ParseDataPayloadView(payload, flags)
-}
-
-func parseMetadataVarint(value []byte) (uint64, error) {
-	return wire.ParseMetadataVarint(value)
-}
-
-func parseErrorPayload(payload []byte) (uint64, string, error) {
-	return wire.ParseErrorPayload(payload)
-}
-
-func parseGOAWAYPayload(payload []byte) (goAwayPayload, error) {
-	return wire.ParseGOAWAYPayload(payload)
-}
-
-func buildOpenMetadataPrefix(caps Capabilities, opts OpenOptions, maxFramePayload uint64) ([]byte, error) {
-	return buildOpenMetadataPrefixFromCurrent(caps, opts.InitialPriority, opts.InitialGroup, opts.OpenInfo, maxFramePayload)
-}
-
-func buildOpenMetadataPrefixFromCurrent(
-	caps Capabilities,
-	priority *uint64,
-	group *uint64,
-	openInfo []byte,
-	maxFramePayload uint64,
-) ([]byte, error) {
-	return wire.BuildOpenMetadataPrefix(caps, priority, group, openInfo, maxFramePayload)
-}
-
-func appendOpenMetadataPrefix(
-	dst []byte,
-	caps Capabilities,
-	priority *uint64,
-	group *uint64,
-	openInfo []byte,
-	maxFramePayload uint64,
-) ([]byte, error) {
-	return wire.AppendOpenMetadataPrefix(dst, caps, priority, group, openInfo, maxFramePayload)
-}
-
-func buildGoAwayPayload(lastAcceptedBidi, lastAcceptedUni, code uint64, reason string) ([]byte, error) {
-	return wire.BuildGoAwayPayload(lastAcceptedBidi, lastAcceptedUni, code, reason)
-}
-
-func validateGoAwayWatermarkForDirection(streamID uint64, bidi bool) error {
-	if streamID == 0 {
-		return nil
-	}
-	if streamID > wire.MaxVarint62 {
-		return fmt.Errorf("stream %d exceeds varint62 range for GOAWAY watermark", streamID)
-	}
-	if state.StreamIsBidi(streamID) != bidi {
-		return fmt.Errorf("stream %d has wrong direction for GOAWAY watermark", streamID)
-	}
-	return nil
-}
-
-func validateGoAwayWatermarkCreator(owner Role, streamID uint64) error {
-	if streamID == 0 {
-		return nil
-	}
-	if !state.StreamIsLocal(owner, streamID) {
-		return fmt.Errorf("stream %d is not creatable by role %s", streamID, owner)
-	}
-	return nil
-}
-
-func buildCodePayload(code uint64, reason string, maxPayload uint64) ([]byte, error) {
-	payload, err := EncodeVarint(code)
-	if err != nil {
-		return nil, err
-	}
-	return appendDebugTextTLVCapped(payload, reason, maxPayload), nil
-}
-
-func clampVarint62(v uint64) uint64 {
-	if v > MaxVarint62 {
-		return MaxVarint62
-	}
-	return v
-}
-
-func encodeClampedVarint62(v uint64) []byte {
-	b, _ := EncodeVarint(clampVarint62(v))
-	return b
-}
-
-func clampedVarintLen62(v uint64) uint64 {
-	n, _ := VarintLen(clampVarint62(v))
-	return uint64(n)
+	n := uint64(g[0])<<8 | uint64(g[1])
+	l.HasGrease, l.GreaseID = true, 31*n+27
+	l.GreaseValue = make([]byte, int(g[2])%17)
+	_, _ = rand.Read(l.GreaseValue)
+	cc.DgramRecvLimited = c.DatagramLimiter.Receive != nil
+	cc.EarlyZmuxPeer = c.EarlyData.ZmuxPeer
+	cc.EarlyReplayable = c.EarlyData.Replayable
+	cc.EarlyRemembered = decodeRemembered(c.EarlyData.Remembered)
+	_ = math.MaxInt64
+	return cc, nil
 }

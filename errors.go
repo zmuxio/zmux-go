@@ -3,631 +3,268 @@ package zmux
 import (
 	"errors"
 	"fmt"
-	"io"
-	"strings"
+	"net"
+	"os"
 
-	"github.com/zmuxio/zmux-go/internal/errutil"
+	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-var (
-	ErrNilConn                   = errors.New("zmux: nil conn")
-	ErrSessionClosed             = errors.New("zmux: session closed")
-	ErrReadClosed                = errors.New("zmux: read side closed")
-	ErrWriteClosed               = errors.New("zmux: write side closed")
-	ErrStreamNotReadable         = errors.New("zmux: stream is not readable")
-	ErrStreamNotWritable         = errors.New("zmux: stream is not writable")
-	ErrOpenInfoUnavailable       = wire.ErrOpenInfoUnavailable
-	ErrOpenMetadataTooLarge      = wire.ErrOpenMetadataTooLarge
-	ErrOpenLimited               = errors.New("zmux: too many provisional local opens")
-	ErrOpenExpired               = errors.New("zmux: provisional local open expired before first-frame commit")
-	ErrAdapterUnsupported        = errors.New("zmux: feature not supported by adapter")
-	ErrPriorityUpdateUnavailable = errors.New("zmux: metadata update requires negotiated priority_update and matching semantic capability")
-	ErrPriorityUpdateTooLarge    = errors.New("zmux: priority update exceeds peer max_extension_payload_bytes")
-	ErrGracefulCloseTimeout      = errors.New("zmux: graceful close drain timed out")
-	ErrEmptyMetadataUpdate       = errors.New("zmux: metadata update has no fields")
-	ErrKeepaliveTimeout          = errors.New("zmux: keepalive timeout")
+// ApplicationErrorCode is an application error code (62 bits).
+type ApplicationErrorCode uint64
+
+// StreamErrorCode is an application error code of a stream.
+type StreamErrorCode uint64
+
+// TransportErrorCode is a transport error code (SPEC.md Section 10.2).
+type TransportErrorCode uint64
+
+// Application error-code conventions (EXTENSIONS.md Section 7).
+const (
+	CodeNoError       StreamErrorCode = 0
+	CodeCancelled     StreamErrorCode = 0x5a4d0001
+	CodeRejected      StreamErrorCode = 0x5a4d0002
+	CodeCarrierFailed StreamErrorCode = 0x5a4d0003
 )
 
-// errLocalStreamIDsExhausted reports that a local stream ID class is used up
-// (SPEC §3.1). It is a local open limit, not a peer violation, so it matches
-// ErrOpenLimited.
-var errLocalStreamIDsExhausted error = localStreamIDsExhaustedError{}
+// Transport error codes.
+const (
+	NoError                 TransportErrorCode = 0x00
+	InternalError           TransportErrorCode = 0x01
+	ConnectionRefused       TransportErrorCode = 0x02
+	FlowControlError        TransportErrorCode = 0x03
+	StreamLimitError        TransportErrorCode = 0x04
+	StreamStateError        TransportErrorCode = 0x05
+	FinalSizeError          TransportErrorCode = 0x06
+	FrameEncodingError      TransportErrorCode = 0x07
+	TransportParameterError TransportErrorCode = 0x08
+	ProtocolViolation       TransportErrorCode = 0x0a
+	NoViablePath            TransportErrorCode = 0x10
+	ExcessiveLoad           TransportErrorCode = 0x25ff75ef
+	RoleConflict            TransportErrorCode = 0x277db2c3
+	ResumeTimeoutCode       TransportErrorCode = 0x0eb87167
+	ResumeFailed            TransportErrorCode = 0x0f05f74e
+	IdleTimeoutCode         TransportErrorCode = 0x2736d55c
+)
 
-type localStreamIDsExhaustedError struct{}
+func (c TransportErrorCode) String() string { return wire.TransportErrorName(uint64(c)) }
 
-func (localStreamIDsExhaustedError) Error() string {
-	return "zmux: local stream ID space exhausted"
-}
-
-func (localStreamIDsExhaustedError) Unwrap() error {
-	return ErrOpenLimited
-}
-
-// ApplicationError carries an application code and optional reason text.
+// ApplicationError is a session closed by an application (CONNECTION_CLOSE
+// 0x1d).
 type ApplicationError struct {
-	Code   uint64
-	Reason string
+	Remote       bool
+	ErrorCode    ApplicationErrorCode
+	ErrorMessage string
 }
 
-func applicationErr(code uint64, reason string) *ApplicationError {
-	return &ApplicationError{Code: code, Reason: reason}
-}
-
-func refusedStreamAppErr() *ApplicationError {
-	return applicationErr(uint64(CodeRefusedStream), "")
-}
-
-func cancelledAppErr(reason string) *ApplicationError {
-	return applicationErr(uint64(CodeCancelled), reason)
-}
-
-func cloneApplicationError(err *ApplicationError) *ApplicationError {
-	if err == nil {
-		return nil
-	}
-	return applicationErr(err.Code, err.Reason)
-}
-
+// Error describes the close.
 func (e *ApplicationError) Error() string {
-	if e == nil {
-		return "<nil>"
-	}
-	if e.Reason != "" {
-		return fmt.Sprintf("zmux application error %d: %s", e.Code, e.Reason)
-	}
-	return fmt.Sprintf("zmux application error %d", e.Code)
+	return fmt.Sprintf("zmux: application error %#x (%s): %s", uint64(e.ErrorCode), remoteStr(e.Remote), e.ErrorMessage)
 }
 
-func (e *ApplicationError) Is(err error) bool {
-	if e == nil {
-		return false
-	}
-	other, ok := findError[*ApplicationError](err)
-	return ok && other.Code == e.Code
+// Is makes every session termination match net.ErrClosed.
+func (e *ApplicationError) Is(t error) bool { return t == net.ErrClosed }
+
+// TransportError is a session closed for a protocol error (0x1c).
+type TransportError struct {
+	Remote       bool
+	ErrorCode    TransportErrorCode
+	FrameType    uint64
+	ErrorMessage string
+	// Details are the key=value pairs of the diagnostic line (SPEC.md 4.3).
+	Details string
 }
 
-func (e *ApplicationError) ApplicationCode() uint64 {
-	if e == nil {
-		return 0
+// Error describes the close.
+func (e *TransportError) Error() string {
+	s := fmt.Sprintf("zmux: transport error %v (%s)", e.ErrorCode, remoteStr(e.Remote))
+	if e.ErrorMessage != "" {
+		s += ": " + e.ErrorMessage
 	}
-	return e.Code
+	return s
 }
 
-// Scope identifies whether an error belongs to the session or a stream.
-type Scope uint8
+// Is makes every session termination match net.ErrClosed.
+func (e *TransportError) Is(t error) bool { return t == net.ErrClosed }
 
-const (
-	ScopeUnknown Scope = iota
-	ScopeSession
-	ScopeStream
-)
+// IdleTimeoutError reports the idle timeout; Remote when the peer's timer
+// expired.
+type IdleTimeoutError struct{ Remote bool }
 
-func (s Scope) String() string {
-	switch s {
-	case ScopeSession:
-		return "session"
-	case ScopeStream:
-		return "stream"
-	default:
-		return "unknown"
+func (e *IdleTimeoutError) Error() string   { return "zmux: idle timeout (" + remoteStr(e.Remote) + ")" }
+func (e *IdleTimeoutError) Is(t error) bool { return t == net.ErrClosed || t == os.ErrDeadlineExceeded }
+func (e *IdleTimeoutError) Timeout() bool   { return true }
+
+// HandshakeTimeoutError reports that the peer's parameters did not arrive.
+type HandshakeTimeoutError struct{}
+
+func (e *HandshakeTimeoutError) Error() string { return "zmux: handshake timeout" }
+func (e *HandshakeTimeoutError) Is(t error) bool {
+	return t == net.ErrClosed || t == os.ErrDeadlineExceeded
+}
+func (e *HandshakeTimeoutError) Timeout() bool { return true }
+
+// EarlyDataRejectedError reports that the peer could not take early data
+// and processed none of it; retry on a new session without early data.
+type EarlyDataRejectedError struct{}
+
+func (e *EarlyDataRejectedError) Error() string   { return "zmux: early data rejected" }
+func (e *EarlyDataRejectedError) Is(t error) bool { return t == net.ErrClosed }
+
+// ResumeTimeoutError reports that the resume grace period expired.
+type ResumeTimeoutError struct{ LastPipeErr error }
+
+func (e *ResumeTimeoutError) Error() string   { return "zmux: resume timeout" }
+func (e *ResumeTimeoutError) Unwrap() error   { return e.LastPipeErr }
+func (e *ResumeTimeoutError) Is(t error) bool { return t == net.ErrClosed }
+
+// PipesLostError reports that the carrier failed or every pipe of a
+// direction was lost.
+type PipesLostError struct{ LastPipeErr error }
+
+func (e *PipesLostError) Error() string {
+	if e.LastPipeErr != nil {
+		return "zmux: pipes lost: " + e.LastPipeErr.Error()
 	}
+	return "zmux: pipes lost"
+}
+func (e *PipesLostError) Unwrap() error   { return e.LastPipeErr }
+func (e *PipesLostError) Is(t error) bool { return t == net.ErrClosed }
+
+// StreamError is a stream ended by the peer: a reset on reads, a
+// STOP_SENDING on writes.
+type StreamError struct {
+	StreamID  StreamID
+	ErrorCode StreamErrorCode
+	Remote    bool
+	// ReliableSize is the RESET_STREAM_AT Reliable Size of a reset.
+	ReliableSize uint64
 }
 
-// Operation identifies the API operation that failed.
-type Operation uint8
-
-const (
-	OperationUnknown Operation = iota
-	OperationOpen
-	OperationAccept
-	OperationRead
-	OperationWrite
-	OperationClose
-)
-
-func (o Operation) String() string {
-	switch o {
-	case OperationOpen:
-		return "open"
-	case OperationAccept:
-		return "accept"
-	case OperationRead:
-		return "read"
-	case OperationWrite:
-		return "write"
-	case OperationClose:
-		return "close"
-	default:
-		return "unknown"
-	}
+// Error describes the reset or STOP_SENDING.
+func (e *StreamError) Error() string {
+	return fmt.Sprintf("zmux: stream %d canceled with error code %#x (%s)", e.StreamID, uint64(e.ErrorCode), remoteStr(e.Remote))
 }
 
-// Source identifies where the error came from.
-type Source uint8
-
-const (
-	SourceUnknown Source = iota
-	SourceLocal
-	SourceRemote
-	SourceTransport
-)
-
-func (s Source) String() string {
-	switch s {
-	case SourceLocal:
-		return "local"
-	case SourceRemote:
-		return "remote"
-	case SourceTransport:
-		return "transport"
-	default:
-		return "unknown"
-	}
+// Is matches ErrRejected for a peer's ZMUX_REJECTED: the peer did not
+// process the stream, which can be retried (IsRetryable).
+func (e *StreamError) Is(t error) bool {
+	return t == ErrRejected && e.Remote && e.ErrorCode == CodeRejected
 }
 
-// Direction identifies which stream direction the error applies to.
-type Direction uint8
+// DatagramTooLargeError reports the largest payload the peer accepts.
+type DatagramTooLargeError struct{ MaxDatagramPayloadSize int64 }
 
-const (
-	DirectionUnknown Direction = iota
-	DirectionRead
-	DirectionWrite
-	DirectionBoth
-)
-
-func (d Direction) String() string {
-	switch d {
-	case DirectionRead:
-		return "read"
-	case DirectionWrite:
-		return "write"
-	case DirectionBoth:
-		return "both"
-	default:
-		return "unknown"
-	}
+// Error describes the limit.
+func (e *DatagramTooLargeError) Error() string {
+	return fmt.Sprintf("zmux: datagram too large (max %d)", e.MaxDatagramPayloadSize)
 }
 
-// TerminationKind identifies how the operation terminated.
-type TerminationKind uint8
+// StreamLimitReachedError reports that no stream credit is available now
+// (OpenStream); OpenStreamSync waits for credit instead.
+type StreamLimitReachedError struct{}
 
-const (
-	TerminationUnknown TerminationKind = iota
-	TerminationGraceful
-	TerminationStopped
-	TerminationReset
-	TerminationAbort
-	TerminationSessionTermination
-)
+// Error describes the condition.
+func (e *StreamLimitReachedError) Error() string { return "zmux: too many open streams" }
 
-func (k TerminationKind) String() string {
-	switch k {
-	case TerminationGraceful:
-		return "graceful"
-	case TerminationStopped:
-		return "stopped"
-	case TerminationReset:
-		return "reset"
-	case TerminationAbort:
-		return "abort"
-	case TerminationSessionTermination:
-		return "session_termination"
-	default:
-		return "unknown"
-	}
-}
-
-// Error is the structured error wrapper returned by public APIs.
-type Error struct {
-	Err             error
-	ReasonText      string
-	WireCode        uint64
-	Scope           Scope
-	Operation       Operation
-	Source          Source
-	Direction       Direction
-	TerminationKind TerminationKind
-}
-
-func (e *Error) Error() string {
-	if e == nil {
-		return "<nil>"
-	}
-	if e.Err != nil {
-		return e.Err.Error()
-	}
-	if e.Scope != ScopeUnknown || e.Operation != OperationUnknown {
-		return fmt.Sprintf("zmux %s %s error", e.Scope, e.Operation)
-	}
-	return "zmux error"
-}
-
-func (e *Error) Unwrap() error {
-	if e == nil {
-		return nil
-	}
-	return e.Err
-}
-
-// AsStructuredError returns the structured error wrapper when present.
-func AsStructuredError(err error) (*Error, bool) {
-	out, ok := findError[*Error](err)
-	if !ok {
-		return nil, false
-	}
-	return out, true
-}
-
-type WireError = wire.Error
-
-func wireError(code ErrorCode, op string, err error) error {
-	return wire.WrapError(code, op, err)
-}
-
-// ErrorCodeOf returns the wire or application error code when one is present.
-func ErrorCodeOf(err error) (ErrorCode, bool) {
-	if code, ok := wire.ErrorCodeOf(err); ok {
-		return code, true
-	}
-	appErr, ok := findError[*ApplicationError](err)
-	if !ok {
-		return 0, false
-	}
-	return ErrorCode(appErr.Code), true
-}
-
-// IsErrorCode reports whether err carries the given wire or application code.
-func IsErrorCode(err error, code ErrorCode) bool {
-	if wire.IsErrorCode(err, code) {
-		return true
-	}
-	appErr, ok := findError[*ApplicationError](err)
-	return ok && appErr.Code == uint64(code)
-}
+// Temporary reports that credit may arrive later.
+func (e *StreamLimitReachedError) Temporary() bool { return true }
 
 var (
-	errInvalidRole        = wire.ErrInvalidRole
-	errNonCanonicalVarint = wire.ErrNonCanonicalVarint
-	errTruncatedVarint    = wire.ErrTruncatedVarint
-	errInvalidFrameType   = wire.ErrInvalidFrameType
-	errPayloadTooLarge    = wire.ErrPayloadTooLarge
+	// ErrStreamClosed is returned for operations on a direction the
+	// application closed itself.
+	ErrStreamClosed = errors.New("zmux: stream closed")
+	// ErrWouldBlock is returned by non-blocking calls that would wait.
+	ErrWouldBlock = errors.New("zmux: operation would block")
+	// ErrNotNegotiated is returned for features the session does not use.
+	ErrNotNegotiated = errors.New("zmux: feature not negotiated")
+	// ErrNotEstablished is returned for calls that need the peer's
+	// parameters before they arrived.
+	ErrNotEstablished = errors.New("zmux: session not established")
+	// ErrRejected reports a stream the peer did not process (ZMUX_REJECTED
+	// or at or above a GOAWAY watermark); it is retryable.
+	ErrRejected = errors.New("zmux: stream rejected")
+	// ErrGoingAway reports an open after the peer's GOAWAY; it is retryable.
+	ErrGoingAway = errors.New("zmux: going away")
+	// ErrTooLate is returned for settings that must precede the first frame.
+	ErrTooLate = errors.New("zmux: too late: the stream's first frame was sent")
+	// ErrListenerClosed is returned by a closed Listener.
+	ErrListenerClosed = errors.New("zmux: listener closed")
+	// ErrInvalidConfig wraps configuration errors.
+	ErrInvalidConfig = errors.New("zmux: invalid configuration")
 )
 
-type errorMeta struct {
-	scope           Scope
-	operation       Operation
-	source          Source
-	direction       Direction
-	terminationKind TerminationKind
+// IsRetryable reports whether err says that the peer did not process the
+// stream, so it can be retried on this or another session.
+func IsRetryable(err error) bool {
+	var e *EarlyDataRejectedError
+	return errors.Is(err, ErrRejected) || errors.Is(err, ErrGoingAway) || errors.As(err, &e)
 }
 
-func reframeStructuredError(err error, meta errorMeta) error {
+func remoteStr(r bool) string {
+	if r {
+		return "remote"
+	}
+	return "local"
+}
+
+// sessionErr converts the core's terminal error.
+func sessionErr(e *core.SessionError) error {
+	if e == nil {
+		return nil
+	}
+	switch e.Kind {
+	case core.CloseApplication:
+		return &ApplicationError{Remote: e.Remote, ErrorCode: ApplicationErrorCode(e.Code), ErrorMessage: e.Reason}
+	case core.CloseTransport:
+		return &TransportError{Remote: e.Remote, ErrorCode: TransportErrorCode(e.Code), FrameType: e.FrameType,
+			ErrorMessage: e.Reason, Details: e.Details}
+	case core.CloseIdle:
+		return &IdleTimeoutError{Remote: e.Remote}
+	case core.CloseHandshakeTimeout:
+		return &HandshakeTimeoutError{}
+	case core.CloseEarlyRejected:
+		return &EarlyDataRejectedError{}
+	case core.CloseResumeTimeout:
+		return &ResumeTimeoutError{LastPipeErr: e.Cause}
+	case core.ClosePipesLost:
+		return &PipesLostError{LastPipeErr: e.Cause}
+	}
+	return &TransportError{ErrorCode: InternalError, ErrorMessage: e.Error()}
+}
+
+// apiErr converts an error returned by the core to the public form.
+func apiErr(err error) error {
 	if err == nil {
 		return nil
 	}
-
-	existing, ok := findError[*Error](err)
-	if !ok {
-		return wrapStructuredError(err, meta)
-	}
-
-	cloned := *existing
-	if meta.scope != ScopeUnknown {
-		cloned.Scope = meta.scope
-	}
-	if meta.operation != OperationUnknown {
-		cloned.Operation = meta.operation
-	}
-	if meta.source != SourceUnknown {
-		cloned.Source = meta.source
-	}
-	if meta.direction != DirectionUnknown {
-		cloned.Direction = meta.direction
-	}
-	if meta.terminationKind != TerminationUnknown {
-		cloned.TerminationKind = meta.terminationKind
-	}
-	code, reason := errorDetails(err)
-	if cloned.WireCode == 0 && code != 0 {
-		cloned.WireCode = code
-	}
-	if cloned.ReasonText == "" {
-		cloned.ReasonText = reason
-	}
-	return &cloned
-}
-
-func wrapStructuredError(err error, meta errorMeta) error {
-	if err == nil {
-		return nil
-	}
-
-	code, reason := errorDetails(err)
-
-	if existing, ok := findError[*Error](err); ok {
-		cloned := *existing
-		if cloned.Scope == ScopeUnknown {
-			cloned.Scope = meta.scope
-		}
-		if cloned.Operation == OperationUnknown {
-			cloned.Operation = meta.operation
-		}
-		if cloned.Source == SourceUnknown {
-			cloned.Source = meta.source
-		}
-		if cloned.Direction == DirectionUnknown {
-			cloned.Direction = meta.direction
-		}
-		if cloned.TerminationKind == TerminationUnknown {
-			cloned.TerminationKind = meta.terminationKind
-		}
-		if cloned.WireCode == 0 && code != 0 {
-			cloned.WireCode = code
-		}
-		if cloned.ReasonText == "" {
-			cloned.ReasonText = reason
-		}
-		return &cloned
-	}
-
-	return &Error{
-		Scope:           meta.scope,
-		Operation:       meta.operation,
-		Source:          meta.source,
-		WireCode:        code,
-		ReasonText:      reason,
-		Direction:       meta.direction,
-		TerminationKind: meta.terminationKind,
-		Err:             err,
-	}
-}
-
-func errorDetails(err error) (uint64, string) {
-	if appErr, ok := findError[*ApplicationError](err); ok {
-		return appErr.Code, appErr.Reason
-	}
-	if code, ok := ErrorCodeOf(err); ok {
-		return uint64(code), err.Error()
-	}
-	return 0, ""
-}
-
-func sessionOperationErr(c *Conn, op Operation, err error) error {
-	if err == nil {
-		return nil
-	}
-	return reframeStructuredError(err, errorMeta{
-		scope:           ScopeSession,
-		operation:       op,
-		source:          sessionErrorSource(c, err),
-		direction:       DirectionBoth,
-		terminationKind: TerminationSessionTermination,
-	})
-}
-
-func sessionOperationErrLocked(c *Conn, op Operation, err error) error {
-	if err == nil {
-		return nil
-	}
-	return reframeStructuredError(err, errorMeta{
-		scope:           ScopeSession,
-		operation:       op,
-		source:          sessionErrorSourceLocked(c, err),
-		direction:       DirectionBoth,
-		terminationKind: TerminationSessionTermination,
-	})
-}
-
-func readLoopSessionErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	wireErr, ok := findError[*wire.Error](err)
-	if !ok || !strings.HasPrefix(wireErr.Op, "validate ") {
-		return err
-	}
-	return reframeStructuredError(err, errorMeta{
-		scope:           ScopeSession,
-		source:          SourceRemote,
-		direction:       DirectionRead,
-		terminationKind: TerminationSessionTermination,
-	})
-}
-
-func openOperationErrLocked(c *Conn, err error) error {
-	if err == nil {
-		return nil
-	}
-	meta := errorMeta{
-		scope:     ScopeSession,
-		operation: OperationOpen,
-		source:    SourceLocal,
-		direction: DirectionBoth,
-	}
-	appErr, ok := findError[*ApplicationError](err)
+	var se *core.SessionError
+	var st *core.StreamError
+	var tl *core.DatagramTooLargeError
 	switch {
-	case ok && appErr.Code == uint64(CodeRefusedStream):
-		meta.source = SourceRemote
-	case ok:
-		meta.source = SourceLocal
-	default:
-		if _, ok := findError[*wire.Error](err); ok {
-			meta.source = sessionErrorSourceLocked(c, err)
+	case errors.As(err, &se):
+		return sessionErr(se)
+	case errors.As(err, &st):
+		switch st.Kind {
+		case core.StreamReset, core.StreamStopped:
+			return &StreamError{StreamID: StreamID(st.StreamID), ErrorCode: StreamErrorCode(st.Code), Remote: st.Remote,
+				ReliableSize: st.Reliable}
+		case core.StreamRejected:
+			return fmt.Errorf("stream %d: %w", st.StreamID, ErrRejected)
+		case core.StreamGoingAway:
+			return ErrGoingAway
 		}
+		return ErrStreamClosed
+	case errors.As(err, &tl):
+		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(tl.Max)}
+	case errors.Is(err, core.ErrNotNegotiated):
+		return ErrNotNegotiated
+	case errors.Is(err, core.ErrNotEstablished):
+		return ErrNotEstablished
+	case errors.Is(err, core.ErrStreamLimit):
+		return &StreamLimitReachedError{}
+	case errors.Is(err, core.ErrTooLate):
+		return ErrTooLate
 	}
-	return reframeStructuredError(err, meta)
-}
-
-func sessionWireErrorSource(err error) (Source, bool) {
-	wireErr, ok := findError[*wire.Error](err)
-	if !ok {
-		return SourceUnknown, false
-	}
-	switch {
-	case strings.HasPrefix(wireErr.Op, "send "),
-		strings.HasPrefix(wireErr.Op, "marshal "),
-		strings.HasPrefix(wireErr.Op, "build "),
-		strings.HasPrefix(wireErr.Op, "validate "):
-		return SourceLocal, true
-	case strings.HasPrefix(wireErr.Op, "parse "),
-		strings.HasPrefix(wireErr.Op, "read "),
-		strings.HasPrefix(wireErr.Op, "handle "),
-		strings.HasPrefix(wireErr.Op, "resolve "),
-		strings.HasPrefix(wireErr.Op, "negotiate "):
-		return SourceRemote, true
-	default:
-		return SourceUnknown, false
-	}
-}
-
-func sessionErrorSourceWithPeerClose(err error, peerClose *ApplicationError) Source {
-	switch {
-	case err == nil:
-		return SourceUnknown
-	case isError(err, io.EOF), isError(err, io.ErrClosedPipe):
-		return SourceTransport
-	}
-	if structured, ok := findError[*Error](err); ok && structured.Source != SourceUnknown {
-		return structured.Source
-	}
-	if source, ok := sessionWireErrorSource(err); ok {
-		return source
-	}
-
-	if appErr, ok := findError[*ApplicationError](err); ok {
-		if peerClose != nil && peerClose.Code == appErr.Code && peerClose.Reason == appErr.Reason {
-			return SourceRemote
-		}
-		return SourceLocal
-	}
-	if _, ok := ErrorCodeOf(err); ok {
-		return SourceRemote
-	}
-	if isError(err, ErrSessionClosed) {
-		if peerClose != nil {
-			return SourceRemote
-		}
-		return SourceLocal
-	}
-	return SourceTransport
-}
-
-func findError[T any](err error) (T, bool) {
-	return errutil.Find[T](err)
-}
-
-func isError(err, target error) bool {
-	return errutil.Is(err, target)
-}
-
-func sameError(err, target error) bool {
-	return errutil.Same(err, target)
-}
-
-func sessionErrorSource(c *Conn, err error) Source {
-	var peerClose *ApplicationError
-	if c != nil {
-		peerClose = c.sessionControl.peerCloseView.Load()
-	}
-	return sessionErrorSourceWithPeerClose(err, peerClose)
-}
-
-func sessionErrorSourceLocked(c *Conn, err error) Source {
-	var peerClose *ApplicationError
-	if c != nil {
-		peerClose = c.sessionControl.peerCloseView.Load()
-	}
-	return sessionErrorSourceWithPeerClose(err, peerClose)
-}
-
-func (s *nativeStream) readSurfaceErrLocked(err error) error {
-	if err == nil {
-		return nil
-	}
-	if isError(err, io.EOF) {
-		return err
-	}
-	meta := errorMeta{
-		scope:     ScopeStream,
-		operation: OperationRead,
-		direction: DirectionRead,
-	}
-	if termination := s.readTerminationMetaLocked(); termination.ready() {
-		meta.source = termination.source
-		meta.direction = termination.direction
-		meta.terminationKind = termination.kind
-	} else {
-		meta.source = SourceLocal
-	}
-	return wrapStructuredError(err, meta)
-}
-
-func (s *nativeStream) writeSurfaceErrLocked(err error) error {
-	if err == nil {
-		return nil
-	}
-	meta := errorMeta{
-		scope:     ScopeStream,
-		operation: OperationWrite,
-		direction: DirectionWrite,
-	}
-	switch {
-	case isError(err, ErrStreamNotWritable):
-		meta.source = SourceLocal
-	case s != nil:
-		if termination := s.writeTerminationMetaLocked(err); termination.ready() {
-			meta.source = termination.source
-			meta.direction = termination.direction
-			meta.terminationKind = termination.kind
-			break
-		}
-		meta.source = SourceLocal
-	default:
-		meta.source = SourceLocal
-	}
-	return wrapStructuredError(err, meta)
-}
-
-func (s *nativeStream) closeSurfaceErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	meta := errorMeta{
-		scope:     ScopeStream,
-		operation: OperationClose,
-		source:    SourceLocal,
-	}
-	switch {
-	case isError(err, ErrStreamNotReadable):
-		meta.direction = DirectionRead
-	case isError(err, ErrStreamNotWritable):
-		meta.direction = DirectionWrite
-	default:
-		meta.direction = DirectionBoth
-	}
-	if s != nil {
-		if termination := s.closeTerminationMetaLocked(err); termination.ready() {
-			meta.source = termination.source
-			meta.direction = termination.direction
-			meta.terminationKind = termination.kind
-		}
-	}
-	return wrapStructuredError(err, meta)
-}
-
-// closeOperationErr surfaces err for a stream close operation. Its termination
-// metadata reads stream state guarded by conn.mu, so a caller holding the lock
-// must surface the error before releasing it.
-func (s *nativeStream) closeOperationErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	if structured, ok := findError[*Error](err); ok && structured.Scope == ScopeSession {
-		return sessionOperationErr(s.conn, OperationClose, err)
-	}
-	return reframeStructuredError(s.closeSurfaceErr(err), errorMeta{
-		scope:     ScopeStream,
-		operation: OperationClose,
-	})
+	return err
 }

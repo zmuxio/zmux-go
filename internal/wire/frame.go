@@ -1,516 +1,392 @@
 package wire
 
-import (
-	"errors"
-	"fmt"
-	"io"
+// Frame type codepoints (REGISTRY.md Section 3).
+const (
+	TypePadding           uint64 = 0x00
+	TypeResetStream       uint64 = 0x04
+	TypeStopSending       uint64 = 0x05
+	TypeStream            uint64 = 0x08 // 0x08-0x0f
+	TypeMaxData           uint64 = 0x10
+	TypeMaxStreamData     uint64 = 0x11
+	TypeMaxStreamsBidi    uint64 = 0x12
+	TypeMaxStreamsUni     uint64 = 0x13
+	TypeDataBlocked       uint64 = 0x14
+	TypeStreamDataBlocked uint64 = 0x15
+	TypeStreamsBlockedBi  uint64 = 0x16
+	TypeStreamsBlockedUni uint64 = 0x17
+	TypeCloseTransport    uint64 = 0x1c
+	TypeCloseApp          uint64 = 0x1d
+	TypeResetStreamAt     uint64 = 0x24
+	TypeDatagram          uint64 = 0x30
+	TypeDatagramLen       uint64 = 0x31
+	TypeTransportParams   uint64 = 0x3f5153300d0a0d0a
+	TypePingRequest       uint64 = 0x348c67529ef8c7bd
+	TypePingResponse      uint64 = 0x348c67529ef8c7be
+	TypeGoAway            uint64 = 0x1911f43e
+	TypePriorityUpdate    uint64 = 0x073d08cf
+	TypePipeJoin          uint64 = 0x1a24de36
+	TypePipeAck           uint64 = 0x0b2b3eeb
+	TypePipeLane          uint64 = 0x3a05a1c9
+	TypePipePing          uint64 = 0x269b43e6
+	TypePipeAbandon       uint64 = 0x23b35b74
+	TypePipeStatus        uint64 = 0x227b2811
 )
 
-const maxInboundFrameHeaderOverhead = 9
+// STREAM frame type bits.
+const (
+	StreamBitFin = 0x01
+	StreamBitLen = 0x02
+	StreamBitOff = 0x04
+)
 
-func (f Frame) MarshalBinary() ([]byte, error) {
-	return f.AppendBinary(nil)
+// Kind classifies a decoded frame.
+type Kind uint8
+
+const (
+	KindPadding Kind = iota
+	KindStream
+	KindResetStream
+	KindResetStreamAt
+	KindStopSending
+	KindMaxData
+	KindMaxStreamData
+	KindMaxStreams
+	KindDataBlocked
+	KindStreamDataBlocked
+	KindStreamsBlocked
+	KindClose
+	KindDatagram
+	KindTransportParams
+	KindPing
+	KindGoAway
+	KindPriorityUpdate
+	KindPipeJoin
+	KindPipeAck
+	KindPipeLane
+	KindPipePing
+	KindPipeAbandon
+	KindPipeStatus
+)
+
+var kindNames = [...]string{"PADDING", "STREAM", "RESET_STREAM", "RESET_STREAM_AT", "STOP_SENDING",
+	"MAX_DATA", "MAX_STREAM_DATA", "MAX_STREAMS", "DATA_BLOCKED", "STREAM_DATA_BLOCKED",
+	"STREAMS_BLOCKED", "CONNECTION_CLOSE", "DATAGRAM", "QX_TRANSPORT_PARAMETERS", "QX_PING",
+	"GOAWAY", "PRIORITY_UPDATE", "PIPE_JOIN", "PIPE_ACK", "PIPE_LANE", "PIPE_PING",
+	"PIPE_ABANDON", "PIPE_STATUS"}
+
+func (k Kind) String() string { return kindNames[k] }
+
+// AckEliciting reports whether a frame of this kind elicits a PIPE_ACK.
+func (k Kind) AckEliciting() bool {
+	return k != KindPadding && k != KindPipeAck && k != KindClose
 }
 
-func AppendFrameHeaderTrusted(dst []byte, code byte, streamID uint64, payloadLen uint64) ([]byte, error) {
-	streamLen, err := VarintLen(streamID)
-	if err != nil {
-		return nil, WrapError(CodeProtocol, "marshal frame", err)
-	}
-	length, err := frameLengthForPayload(streamLen, payloadLen)
-	if err != nil {
-		return nil, err
-	}
-	dst, err = AppendVarint(dst, length)
-	if err != nil {
-		return nil, WrapError(CodeProtocol, "marshal frame", err)
-	}
-	dst = append(dst, code)
-	dst, err = AppendVarint(dst, streamID)
-	if err != nil {
-		return nil, WrapError(CodeProtocol, "marshal frame", err)
-	}
-	return dst, nil
+// Join is a decoded PIPE_JOIN frame (MULTIPATH.md Section 5.1).
+type Join struct {
+	Locator      []byte
+	PipeID       uint64
+	Dir          uint8 // 0 up, 1 down, 2 bidi
+	CarrierBound bool
+	Standby      bool
+	FateGroup    uint64
+	Priority     uint64
+	Token        []byte // 16 bytes
+	// MACLen is the number of bytes from Type through Priority (the MAC input).
+	MACLen int
 }
 
-func AppendFrameHeaderTrustedCachedStreamID(dst []byte, code byte, streamID uint64, packedStreamID uint64, streamIDLen uint8, payloadLen uint64) ([]byte, error) {
-	if streamIDLen == 0 {
-		return AppendFrameHeaderTrusted(dst, code, streamID, payloadLen)
-	}
-	length, err := frameLengthForPayload(int(streamIDLen), payloadLen)
-	if err != nil {
-		return nil, err
-	}
-	dst, err = AppendVarint(dst, length)
-	if err != nil {
-		return nil, WrapError(CodeProtocol, "marshal frame", err)
-	}
-	dst = append(dst, code)
-	dst, err = AppendPackedVarint(dst, packedStreamID, streamIDLen)
-	if err != nil {
-		return nil, WrapError(CodeProtocol, "marshal frame", err)
-	}
-	return dst, nil
+// Frame is one decoded frame. Byte fields alias the decoded buffer.
+type Frame struct {
+	Kind      Kind
+	Type      uint64 // wire frame type
+	TypeLen   int    // bytes of the type field
+	StreamID  uint64
+	Offset    uint64
+	Data      []byte // STREAM, DATAGRAM data; CONNECTION_CLOSE reason; QX_TP block
+	Fin       bool
+	HasOff    bool
+	HasLen    bool
+	Code      uint64
+	FinalSize uint64
+	Reliable  uint64
+	Value     uint64 // MAX_*, *_BLOCKED limit, QX_PING seq, PRIORITY_UPDATE seq
+	Bidi      bool
+	App       bool
+	ErrFrame  uint64 // CONNECTION_CLOSE frame type
+	Response  bool
+	MaxBidi   uint64
+	MaxUni    uint64
+	Urgency   uint8
+	Incr      bool
+	PipeID    uint64
+	Lane      uint64
+	LaneKey   []byte
+	Seq       uint64
+	Status    uint64
+	Priority  uint64
+	Join      Join
+	Count     int    // PADDING run length, PIPE_ACK entry count
+	Entries   []byte // PIPE_ACK entries, validated
 }
 
-func frameLengthForPayload(streamIDLen int, payloadLen uint64) (uint64, error) {
-	if streamIDLen <= 0 || streamIDLen > maxInboundFrameHeaderOverhead-1 {
-		return 0, FrameSizeError("marshal frame", ErrPayloadTooLarge)
+// AckEntry is one PIPE_ACK entry.
+type AckEntry struct{ PipeID, Lane, Position, Delay uint64 }
+
+// AckIter iterates validated PIPE_ACK entries without allocating.
+type AckIter struct{ b []byte }
+
+// Iter returns an iterator over the frame's PIPE_ACK entries.
+func (f *Frame) Iter() AckIter { return AckIter{f.Entries} }
+
+// Next returns the next entry.
+func (it *AckIter) Next() (AckEntry, bool) {
+	var e AckEntry
+	if len(it.b) == 0 {
+		return e, false
 	}
-	headerLen := uint64(1 + streamIDLen)
-	if payloadLen > MaxVarint62-headerLen {
-		return 0, FrameSizeError("marshal frame", ErrPayloadTooLarge)
-	}
-	return headerLen + payloadLen, nil
+	var n int
+	e.PipeID, n = ReadVarint(it.b)
+	it.b = it.b[n:]
+	e.Lane, n = ReadVarint(it.b)
+	it.b = it.b[n:]
+	e.Position, n = ReadVarint(it.b)
+	it.b = it.b[n:]
+	e.Delay, n = ReadVarint(it.b)
+	it.b = it.b[n:]
+	return e, true
 }
 
-func (f Frame) AppendBinary(dst []byte) ([]byte, error) {
-	if err := ValidateFrame(f, NormalizeLimits(Limits{}), false); err != nil {
-		return nil, err
-	}
-	dst, err := AppendFrameHeaderTrusted(dst, f.Code(), f.StreamID, uint64(len(f.Payload)))
-	if err != nil {
-		return nil, err
-	}
-	dst = append(dst, f.Payload...)
-	return dst, nil
+type reader struct {
+	b   []byte
+	i   int
+	bad bool
 }
 
-func ParseFrame(src []byte, limits Limits) (Frame, int, error) {
-	limits = NormalizeLimits(limits)
-
-	frameLen, n, err := ParseVarint(src)
-	if err != nil {
-		return Frame{}, 0, WrapError(CodeProtocol, "parse frame_length", err)
-	}
-	if frameLen < 2 {
-		return Frame{}, 0, FrameSizeError("parse frame_length", ErrShortFrame)
-	}
-	if len(src) < n+1 {
-		return Frame{}, 0, io.ErrUnexpectedEOF
-	}
-	code := src[n]
-	frameType := FrameType(code & 0x1f)
-	flags := code & 0xe0
-	if !frameType.Valid() {
-		return Frame{}, 0, WrapError(CodeProtocol, "parse frame code", ErrInvalidFrameType)
-	}
-
-	total, err := frameTotalLen(frameLen, n)
-	if err != nil {
-		return Frame{}, 0, err
-	}
-	frame, err := parseBufferedFrame(src, frameLen, n, total, code, frameType, flags, limits, false)
-	if err != nil {
-		return Frame{}, 0, err
-	}
-	return frame, total, nil
-}
-
-func parseBufferedFrame(src []byte, frameLen uint64, n int, total int, code byte, frameType FrameType, flags byte, limits Limits, extEnvelopeOnly bool) (Frame, error) {
-	streamID, streamLen, err := ParseVarint(src[n+1:])
-	if err != nil {
-		if errors.Is(err, ErrTruncatedVarint) {
-			return Frame{}, io.ErrUnexpectedEOF
-		}
-		return Frame{}, WrapError(CodeProtocol, "parse stream_id", err)
-	}
-	if frameLen < uint64(1+streamLen) {
-		return Frame{}, FrameSizeError("parse frame", ErrShortFrame)
-	}
-
-	payloadLen := frameLen - uint64(1+streamLen)
-	if payloadLen > InboundPayloadLimit(frameType, limits) {
-		return Frame{}, FrameSizeError("parse frame", ErrPayloadTooLarge)
-	}
-
-	if len(src) < total {
-		return Frame{}, io.ErrUnexpectedEOF
-	}
-
-	body := src[n:total]
-	payload := body[1+streamLen:]
-	frame := Frame{
-		Length:   frameLen,
-		Type:     FrameType(code & 0x1f),
-		Flags:    flags,
-		StreamID: streamID,
-		Payload:  payload,
-	}
-	if err := validateFrame(frame, limits, true, extEnvelopeOnly); err != nil {
-		return Frame{}, err
-	}
-	return frame, nil
-}
-
-func ReadFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *FrameReadBufferHandle, error) {
-	return readFrameBuffered(r, limits, dst, false)
-}
-
-// ReadSessionFrameBuffered is ReadFrameBuffered for a session read loop. For
-// EXT it checks only the generic envelope (a parseable ext_type within the
-// extension payload limit) and leaves subtype payload rules to the session,
-// which must first check whether the subtype was negotiated (SPEC §7.6).
-func ReadSessionFrameBuffered(r io.Reader, limits Limits, dst []byte) (Frame, []byte, *FrameReadBufferHandle, error) {
-	return readFrameBuffered(r, limits, dst, true)
-}
-
-func readFrameBuffered(r io.Reader, limits Limits, dst []byte, extEnvelopeOnly bool) (Frame, []byte, *FrameReadBufferHandle, error) {
-	limits = NormalizeLimits(limits)
-
-	br, ok := r.(io.ByteReader)
-	if !ok {
-		br = &exactByteReader{reader: r}
-	}
-
-	frameLen, n, err := ReadVarint(br)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrTruncatedVarint):
-			// The transport ended inside the varint, as for stream_id below.
-			return Frame{}, dst, nil, io.ErrUnexpectedEOF
-		case errors.Is(err, ErrNonCanonicalVarint), errors.Is(err, ErrValueTooLarge):
-			return Frame{}, dst, nil, WrapError(CodeProtocol, "read frame_length", err)
-		}
-		// io.EOF at a frame boundary and transport errors stay unwrapped.
-		return Frame{}, dst, nil, err
-	}
-	if frameLen < 2 {
-		return Frame{}, dst, nil, FrameSizeError("read frame_length", ErrShortFrame)
-	}
-	if frameLen > maxInboundFrameLen(limits) {
-		return Frame{}, dst, nil, FrameSizeError("read frame_length", ErrPayloadTooLarge)
-	}
-
-	var prefix [maxInboundFrameHeaderOverhead]byte
-	code, err := br.ReadByte()
-	if err != nil {
-		if err == io.EOF {
-			return Frame{}, dst, nil, io.ErrUnexpectedEOF
-		}
-		return Frame{}, dst, nil, err
-	}
-	prefix[0] = code
-	frameType := FrameType(code & 0x1f)
-	flags := code & 0xe0
-	if !frameType.Valid() {
-		return Frame{}, dst, nil, WrapError(CodeProtocol, "parse frame code", ErrInvalidFrameType)
-	}
-
-	firstStreamByte, err := br.ReadByte()
-	if err != nil {
-		if err == io.EOF {
-			return Frame{}, dst, nil, io.ErrUnexpectedEOF
-		}
-		return Frame{}, dst, nil, err
-	}
-	prefix[1] = firstStreamByte
-	streamLen := 1 << (firstStreamByte >> 6)
-	if frameLen < uint64(1+streamLen) {
-		return Frame{}, dst, nil, FrameSizeError("read frame", ErrShortFrame)
-	}
-	for i := 1; i < streamLen; i++ {
-		b, err := br.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				return Frame{}, dst, nil, io.ErrUnexpectedEOF
-			}
-			return Frame{}, dst, nil, err
-		}
-		prefix[1+i] = b
-	}
-	_, parsedStreamLen, err := ParseVarint(prefix[1 : 1+streamLen])
-	if err != nil {
-		if errors.Is(err, ErrTruncatedVarint) {
-			return Frame{}, dst, nil, io.ErrUnexpectedEOF
-		}
-		return Frame{}, dst, nil, WrapError(CodeProtocol, "parse stream_id", err)
-	}
-	payloadLen := frameLen - uint64(1+parsedStreamLen)
-	if payloadLen > InboundPayloadLimit(frameType, limits) {
-		return Frame{}, dst, nil, FrameSizeError("read frame", ErrPayloadTooLarge)
-	}
-
-	total, err := frameTotalLen(frameLen, n)
-	if err != nil {
-		return Frame{}, dst, nil, err
-	}
-	var handle *FrameReadBufferHandle
-	if cap(dst) < total {
-		dst, handle = acquireFrameReadBuffer(total)
-	} else {
-		dst = dst[:total]
-	}
-	header, err := AppendVarint(dst[:0], frameLen)
-	if err != nil {
-		return Frame{}, dst, handle, WrapError(CodeProtocol, "read frame", err)
-	}
-	copy(dst[len(header):len(header)+1+parsedStreamLen], prefix[:1+parsedStreamLen])
-	if _, err := io.ReadFull(r, dst[len(header)+1+parsedStreamLen:]); err != nil {
-		return Frame{}, dst, handle, err
-	}
-
-	frame, err := parseBufferedFrame(dst, frameLen, n, total, code, frameType, flags, limits, extEnvelopeOnly)
-	if err != nil {
-		return Frame{}, dst, handle, err
-	}
-	return frame, dst, handle, nil
-}
-
-type exactByteReader struct {
-	reader io.Reader
-	buf    [1]byte
-}
-
-func (r *exactByteReader) ReadByte() (byte, error) {
-	if r == nil || r.reader == nil {
-		return 0, io.ErrUnexpectedEOF
-	}
-	if _, err := io.ReadFull(r.reader, r.buf[:]); err != nil {
-		return 0, err
-	}
-	return r.buf[0], nil
-}
-
-func maxInboundFrameLen(limits Limits) uint64 {
-	maxPayload := limits.MaxFramePayload
-	if limits.MaxControlPayloadBytes > maxPayload {
-		maxPayload = limits.MaxControlPayloadBytes
-	}
-	if limits.MaxExtensionPayloadBytes > maxPayload {
-		maxPayload = limits.MaxExtensionPayloadBytes
-	}
-	if maxPayload > MaxVarint62-maxInboundFrameHeaderOverhead {
-		return MaxVarint62
-	}
-	return maxPayload + maxInboundFrameHeaderOverhead
-}
-
-func frameTotalLen(frameLen uint64, n int) (int, error) {
-	maxInt := int(^uint(0) >> 1)
-	if n < 0 || n > maxInt {
-		return 0, FrameSizeError("parse frame_length", ErrPayloadTooLarge)
-	}
-	if frameLen > uint64(maxInt-n) {
-		return 0, FrameSizeError("parse frame_length", ErrPayloadTooLarge)
-	}
-	return n + int(frameLen), nil
-}
-
-func ReadFrame(r io.Reader, limits Limits) (Frame, error) {
-	frame, _, _, err := ReadFrameBuffered(r, limits, nil)
-	return frame, err
-}
-
-func InboundPayloadLimit(frameType FrameType, limits Limits) uint64 {
-	switch frameType {
-	case FrameTypeDATA:
-		return limits.MaxFramePayload
-	case FrameTypeMAXDATA, FrameTypeBLOCKED, FrameTypePING, FrameTypePONG,
-		FrameTypeStopSending, FrameTypeRESET, FrameTypeABORT, FrameTypeGOAWAY, FrameTypeCLOSE:
-		return limits.MaxControlPayloadBytes
-	case FrameTypeEXT:
-		return limits.MaxExtensionPayloadBytes
-	default:
+func (r *reader) varint() uint64 {
+	if r.bad {
 		return 0
 	}
+	v, n := ReadVarint(r.b[r.i:])
+	if n == 0 {
+		r.bad = true
+		return 0
+	}
+	r.i += n
+	return v
 }
 
-func NormalizeLimits(limits Limits) Limits {
-	def := DefaultSettings().Limits()
-	if limits.MaxFramePayload == 0 {
-		limits.MaxFramePayload = def.MaxFramePayload
+func (r *reader) byte() byte {
+	if r.bad || r.i >= len(r.b) {
+		r.bad = true
+		return 0
 	}
-	if limits.MaxControlPayloadBytes == 0 {
-		limits.MaxControlPayloadBytes = def.MaxControlPayloadBytes
-	}
-	if limits.MaxExtensionPayloadBytes == 0 {
-		limits.MaxExtensionPayloadBytes = def.MaxExtensionPayloadBytes
-	}
-	return limits
+	c := r.b[r.i]
+	r.i++
+	return c
 }
 
-func ValidateFrame(f Frame, limits Limits, inbound bool) error {
-	return validateFrame(f, limits, inbound, false)
-}
-
-func validateFrame(f Frame, limits Limits, inbound bool, extEnvelopeOnly bool) error {
-	if !f.Type.Valid() {
-		return WrapError(CodeProtocol, "validate frame", ErrInvalidFrameType)
-	}
-	if err := validateFrameFlags(f.Type, f.Flags); err != nil {
-		return err
-	}
-	if err := validateFrameScope(f); err != nil {
-		return err
-	}
-
-	switch f.Type {
-	case FrameTypeDATA:
-		if err := validateInboundPayloadLimit(inbound, f.Payload, limits.MaxFramePayload, "validate DATA payload"); err != nil {
-			return err
-		}
-		return validateDataPayload(f.Payload, f.Flags)
-	case FrameTypeMAXDATA, FrameTypeBLOCKED:
-		if err := validateInboundPayloadLimit(inbound, f.Payload, limits.MaxControlPayloadBytes, "validate control payload"); err != nil {
-			return err
-		}
-		return validateExactOneVarintPayload(f.Type, f.Payload)
-	case FrameTypePING, FrameTypePONG:
-		if err := validateInboundPayloadLimit(inbound, f.Payload, limits.MaxControlPayloadBytes, "validate control payload"); err != nil {
-			return err
-		}
-		if len(f.Payload) < 8 {
-			return FrameSizeError("validate ping/pong payload", ErrShortFrame)
-		}
+func (r *reader) bytes(n uint64) []byte {
+	if r.bad || n > uint64(len(r.b)-r.i) {
+		r.bad = true
 		return nil
-	case FrameTypeStopSending, FrameTypeRESET, FrameTypeABORT, FrameTypeCLOSE:
-		if err := validateInboundPayloadLimit(inbound, f.Payload, limits.MaxControlPayloadBytes, "validate control payload"); err != nil {
-			return err
+	}
+	s := r.b[r.i : r.i+int(n)]
+	r.i += int(n)
+	return s
+}
+
+const max60 = 1 << 60
+
+// DecodeFrame decodes the frame at the start of b, which holds the rest of
+// the record. It returns the frame length. A non-minimal frame type is
+// reported as PROTOCOL_VIOLATION only after the frame decoded completely
+// (SPEC.md Section 10.3 precedence).
+func DecodeFrame(b []byte, f *Frame) (int, *Error) {
+	*f = Frame{}
+	t, tn := ReadVarint(b)
+	if tn == 0 {
+		return 0, ErrFrame("truncated frame type")
+	}
+	f.Type, f.TypeLen = t, tn
+	r := reader{b: b, i: tn}
+	switch {
+	case t == TypePadding:
+		f.Kind = KindPadding
+		n := 1
+		for n < len(b) && b[n] == 0 {
+			n++
 		}
-		return validateErrorAndDIAGPayload(f.Type, f.Payload)
-	case FrameTypeGOAWAY:
-		if err := validateInboundPayloadLimit(inbound, f.Payload, limits.MaxControlPayloadBytes, "validate control payload"); err != nil {
-			return err
+		f.Count = n
+		r.i = n
+	case t >= 0x08 && t <= 0x0f:
+		f.Kind = KindStream
+		f.StreamID = r.varint()
+		if t&StreamBitOff != 0 {
+			f.HasOff = true
+			f.Offset = r.varint()
 		}
-		return ValidateGOAWAYPayload(f.Payload)
-	case FrameTypeEXT:
-		if err := validateInboundPayloadLimit(inbound, f.Payload, limits.MaxExtensionPayloadBytes, "validate EXT payload"); err != nil {
-			return err
+		f.Fin = t&StreamBitFin != 0
+		if t&StreamBitLen != 0 {
+			f.HasLen = true
+			f.Data = r.bytes(r.varint())
+		} else if !r.bad {
+			f.Data = b[r.i:]
+			r.i = len(b)
 		}
-		if extEnvelopeOnly {
-			_, _, err := ParseEXTType(f.Payload)
-			return err
+		if !r.bad && f.Offset+uint64(len(f.Data)) > MaxVarint {
+			return 0, ErrFrame("stream offset plus length above 2^62-1")
 		}
-		return ValidateEXTPayload(f.StreamID, f.Payload)
+	case t == TypeResetStream:
+		f.Kind = KindResetStream
+		f.StreamID, f.Code, f.FinalSize = r.varint(), r.varint(), r.varint()
+	case t == TypeResetStreamAt:
+		f.Kind = KindResetStreamAt
+		f.StreamID, f.Code, f.FinalSize, f.Reliable = r.varint(), r.varint(), r.varint(), r.varint()
+		if !r.bad && f.Reliable > f.FinalSize {
+			return 0, ErrFrame("reliable size above final size")
+		}
+	case t == TypeStopSending:
+		f.Kind = KindStopSending
+		f.StreamID, f.Code = r.varint(), r.varint()
+	case t == TypeMaxData:
+		f.Kind = KindMaxData
+		f.Value = r.varint()
+	case t == TypeMaxStreamData:
+		f.Kind = KindMaxStreamData
+		f.StreamID, f.Value = r.varint(), r.varint()
+	case t == TypeMaxStreamsBidi || t == TypeMaxStreamsUni:
+		f.Kind = KindMaxStreams
+		f.Bidi = t == TypeMaxStreamsBidi
+		f.Value = r.varint()
+		if !r.bad && f.Value > max60 {
+			return 0, ErrFrame("MAX_STREAMS above 2^60")
+		}
+	case t == TypeDataBlocked:
+		f.Kind = KindDataBlocked
+		f.Value = r.varint()
+	case t == TypeStreamDataBlocked:
+		f.Kind = KindStreamDataBlocked
+		f.StreamID, f.Value = r.varint(), r.varint()
+	case t == TypeStreamsBlockedBi || t == TypeStreamsBlockedUni:
+		f.Kind = KindStreamsBlocked
+		f.Bidi = t == TypeStreamsBlockedBi
+		f.Value = r.varint()
+		if !r.bad && f.Value > max60 {
+			return 0, ErrFrame("STREAMS_BLOCKED above 2^60")
+		}
+	case t == TypeCloseTransport || t == TypeCloseApp:
+		f.Kind = KindClose
+		f.App = t == TypeCloseApp
+		f.Code = r.varint()
+		if !f.App {
+			f.ErrFrame = r.varint()
+		}
+		f.Data = r.bytes(r.varint())
+	case t == TypeDatagram || t == TypeDatagramLen:
+		f.Kind = KindDatagram
+		if t == TypeDatagramLen {
+			f.HasLen = true
+			f.Data = r.bytes(r.varint())
+		} else {
+			f.Data = b[r.i:]
+			r.i = len(b)
+		}
+	case t == TypeTransportParams:
+		f.Kind = KindTransportParams
+		f.Data = r.bytes(r.varint())
+	case t == TypePingRequest || t == TypePingResponse:
+		f.Kind = KindPing
+		f.Response = t == TypePingResponse
+		f.Value = r.varint()
+	case t == TypeGoAway:
+		f.Kind = KindGoAway
+		f.MaxBidi, f.MaxUni, f.Code = r.varint(), r.varint(), r.varint()
+		if !r.bad && (f.MaxBidi > max60 || f.MaxUni > max60) {
+			return 0, ErrFrame("GOAWAY watermark above 2^60")
+		}
+	case t == TypePriorityUpdate:
+		f.Kind = KindPriorityUpdate
+		f.StreamID, f.Seq = r.varint(), r.varint()
+		p := r.byte()
+		if !r.bad {
+			if p&0x0f != 0 {
+				return 0, ErrFrame("PRIORITY_UPDATE reserved bits")
+			}
+			f.Urgency, f.Incr = p>>5, p&0x10 != 0
+		}
+	case t == TypePipeJoin:
+		f.Kind = KindPipeJoin
+		if err := decodeJoin(&r, &f.Join); err != nil {
+			return 0, err
+		}
+	case t == TypePipeAck:
+		f.Kind = KindPipeAck
+		cnt := r.varint()
+		if !r.bad && cnt == 0 {
+			return 0, ErrFrame("PIPE_ACK without entries")
+		}
+		start := r.i
+		var pp, pl uint64
+		for i := uint64(0); i < cnt && !r.bad; i++ {
+			p, l := r.varint(), r.varint()
+			r.varint()
+			r.varint()
+			if !r.bad && i > 0 && (p < pp || p == pp && l <= pl) {
+				return 0, ErrFrame("PIPE_ACK entries not increasing")
+			}
+			pp, pl = p, l
+		}
+		if !r.bad {
+			f.Count = int(cnt)
+			f.Entries = b[start:r.i]
+		}
+	case t == TypePipeLane:
+		f.Kind = KindPipeLane
+		f.LaneKey = r.bytes(16)
+		f.PipeID, f.Lane = r.varint(), r.varint()
+	case t == TypePipePing:
+		f.Kind = KindPipePing
+	case t == TypePipeAbandon:
+		f.Kind = KindPipeAbandon
+		f.PipeID, f.Code = r.varint(), r.varint()
+	case t == TypePipeStatus:
+		f.Kind = KindPipeStatus
+		f.PipeID, f.Seq, f.Status, f.Priority = r.varint(), r.varint(), r.varint(), r.varint()
+		if !r.bad && f.Status > 1 {
+			return 0, ErrFrame("PIPE_STATUS status")
+		}
 	default:
-		return WrapError(CodeProtocol, "validate frame", ErrInvalidFrameType)
+		return 0, &Error{Code: FrameEncodingError, FrameType: t, Reason: "unknown or prohibited frame type"}
 	}
+	if r.bad {
+		return 0, &Error{Code: FrameEncodingError, FrameType: t, Reason: "truncated " + f.Kind.String()}
+	}
+	if tn != VarintLen(t) {
+		return r.i, &Error{Code: ProtocolViolation, FrameType: t, Reason: "frame type not minimally encoded"}
+	}
+	return r.i, nil
 }
 
-func validateInboundPayloadLimit(inbound bool, payload []byte, limit uint64, op string) error {
-	if inbound && uint64(len(payload)) > limit {
-		return FrameSizeError(op, ErrPayloadTooLarge)
+func decodeJoin(r *reader, j *Join) *Error {
+	ll := r.byte()
+	if !r.bad && (ll == 0 || ll > 16) {
+		return ErrFrame("PIPE_JOIN locator length")
 	}
-	return nil
-}
-
-func FrameSizeError(op string, err error) error {
-	return WrapError(CodeFrameSize, op, err)
-}
-
-func validateDataPayload(payload []byte, flags byte) error {
-	if flags&FrameFlagOpenMetadata == 0 {
-		return nil
-	}
-	metadataLen, n, err := ParseVarint(payload)
-	if err != nil {
-		return FrameSizeError("validate OPEN_METADATA length", err)
-	}
-	remaining := payload[n:]
-	if uint64(len(remaining)) < metadataLen {
-		return FrameSizeError("validate OPEN_METADATA payload", ErrTLVValueOverrun)
-	}
-	if err := validateTLVs(remaining[:metadataLen]); err != nil {
-		return FrameSizeError("validate OPEN_METADATA payload", err)
-	}
-	return nil
-}
-
-func validateExactOneVarintPayload(frameType FrameType, payload []byte) error {
-	value, n, err := ParseVarint(payload)
-	if err != nil {
-		return FrameSizeError(fmt.Sprintf("validate %s payload", frameType), err)
-	}
-	if value > MaxVarint62 {
-		return WrapError(CodeProtocol, fmt.Sprintf("validate %s payload", frameType), ErrValueTooLarge)
-	}
-	if n != len(payload) {
-		return WrapError(CodeProtocol, fmt.Sprintf("validate %s payload", frameType), fmt.Errorf("unexpected trailing bytes"))
-	}
-	return nil
-}
-
-func validateErrorAndDIAGPayload(frameType FrameType, payload []byte) error {
-	_, n, err := ParseVarint(payload)
-	if err != nil {
-		return FrameSizeError(fmt.Sprintf("validate %s payload", frameType), err)
-	}
-	if err := validateTLVs(payload[n:]); err != nil {
-		return FrameSizeError(fmt.Sprintf("validate %s payload", frameType), err)
-	}
-	return nil
-}
-
-func ValidateGOAWAYPayload(payload []byte) error {
-	offset := 0
-	for i := 0; i < 3; i++ {
-		_, n, err := ParseVarint(payload[offset:])
-		if err != nil {
-			return FrameSizeError("validate GOAWAY payload", err)
+	j.Locator = r.bytes(uint64(ll))
+	j.PipeID = r.varint()
+	fl := r.byte()
+	if !r.bad {
+		if fl&0xf0 != 0 || fl&0x03 == 3 {
+			return ErrFrame("PIPE_JOIN flags")
 		}
-		offset += n
+		j.Dir, j.CarrierBound, j.Standby = fl&3, fl&0x04 != 0, fl&0x08 != 0
 	}
-	if err := validateTLVs(payload[offset:]); err != nil {
-		return FrameSizeError("validate GOAWAY payload", err)
-	}
-	return nil
-}
-
-// ParseEXTType decodes the ext_type prefix of an EXT payload and returns it
-// with the ext_payload offset. A payload too short for its ext_type, or a
-// non-canonical ext_type, is a session PROTOCOL error (SPEC §6.11), not the
-// FRAME_SIZE used for other truncated payload fields.
-func ParseEXTType(payload []byte) (EXTSubtype, int, error) {
-	extType, n, err := ParseVarint(payload)
-	if err != nil {
-		return 0, 0, WrapError(CodeProtocol, "validate EXT payload", err)
-	}
-	return EXTSubtype(extType), n, nil
-}
-
-func ValidateEXTPayload(streamID uint64, payload []byte) error {
-	extType, n, err := ParseEXTType(payload)
-	if err != nil {
-		return err
-	}
-	switch extType {
-	case EXTPriorityUpdate:
-		if streamID == 0 {
-			return WrapError(CodeProtocol, "validate EXT payload", fmt.Errorf("PRIORITY_UPDATE requires non-zero stream_id"))
-		}
-		if _, _, err := ParsePriorityUpdatePayload(payload[n:]); err != nil {
-			return FrameSizeError("validate EXT payload", err)
-		}
-	}
-	return nil
-}
-
-func validateFrameFlags(frameType FrameType, flags byte) error {
-	if frameType != FrameTypeDATA {
-		if flags != 0 {
-			return WrapError(CodeProtocol, "validate frame flags", ErrInvalidFlags)
-		}
-		return nil
-	}
-	switch flags {
-	case 0, FrameFlagOpenMetadata, FrameFlagFIN, FrameFlagOpenMetadata | FrameFlagFIN:
-		return nil
-	default:
-		return WrapError(CodeProtocol, "validate frame flags", ErrInvalidFlags)
-	}
-}
-
-func validateFrameScope(f Frame) error {
-	switch f.Type {
-	case FrameTypeDATA, FrameTypeStopSending, FrameTypeRESET, FrameTypeABORT:
-		if f.StreamID == 0 {
-			return WrapError(CodeProtocol, "validate frame scope", fmt.Errorf("%s requires non-zero stream_id", f.Type))
-		}
-	case FrameTypePING, FrameTypePONG, FrameTypeGOAWAY, FrameTypeCLOSE:
-		if f.StreamID != 0 {
-			return WrapError(CodeProtocol, "validate frame scope", fmt.Errorf("%s requires stream_id = 0", f.Type))
-		}
+	j.FateGroup = r.varint()
+	j.Priority = r.varint()
+	j.MACLen = r.i
+	j.Token = r.bytes(16)
+	if !r.bad && r.i > 64 {
+		return ErrFrame("PIPE_JOIN longer than 64 bytes")
 	}
 	return nil
 }

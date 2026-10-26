@@ -20,8 +20,6 @@ profile.cov
 /.gocache*/
 /.golangci-lint-cache*/
 /.root-test-json.log
-/.claude/
-/CLAUDE.md
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
