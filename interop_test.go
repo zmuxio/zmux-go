@@ -55,11 +55,11 @@ func startPeerEnv(t *testing.T, env string, args ...string) *peerProc {
 	}()
 	t.Cleanup(func() {
 		done := make(chan struct{})
-		go func() { cmd.Wait(); close(done) }()
+		go func() { _ = cmd.Wait(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 			<-done
 		}
 	})
@@ -107,7 +107,7 @@ func TestInteropServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	p := startPeer(t, "client", ln.Addr().String())
 	nc, err := ln.Accept()
 	if err != nil {
@@ -136,7 +136,7 @@ func command(t *testing.T, ctx context.Context, c *Conn, cmd string, body []byte
 			t.Fatal(err)
 		}
 	}
-	go func() { st.Write(body); st.Close() }()
+	go func() { _, _ = st.Write(body); _ = st.Close() }()
 	b, err := io.ReadAll(st)
 	if err != nil {
 		t.Fatalf("%s: %v", cmd, err)
@@ -156,8 +156,8 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 				errs <- err
 				return
 			}
-			st.SetPreamble([]byte("echo"))
-			go func() { st.Write(msg); st.Close() }()
+			_ = st.SetPreamble([]byte("echo"))
+			go func() { _, _ = st.Write(msg); _ = st.Close() }()
 			got, err := io.ReadAll(st)
 			if err == nil && !bytes.Equal(got, msg) {
 				err = errors.New("echo mismatch")
@@ -173,9 +173,9 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	// Priority and open info.
 	{
 		st, _ := c.OpenStreamSync(ctx)
-		st.SetPreamble([]byte("info"))
-		st.SetPeerPriority(5, true)
-		st.Close()
+		_ = st.SetPreamble([]byte("info"))
+		_ = st.SetPeerPriority(5, true)
+		_ = st.Close()
 		b, _ := io.ReadAll(st)
 		if string(b) != "info=info;prio=5,true" {
 			t.Fatalf("info: %q", b)
@@ -184,8 +184,8 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	// Our reset reaches the peer.
 	{
 		st, _ := c.OpenStreamSync(ctx)
-		st.SetPreamble([]byte("reset"))
-		st.Write([]byte("x"))
+		_ = st.SetPreamble([]byte("reset"))
+		_, _ = st.Write([]byte("x"))
 		st.SetReliableBoundary() // "x" opens the stream: delivered, then the reset
 		st.CancelWrite(77)
 		b, _ := io.ReadAll(st)
@@ -200,8 +200,8 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	// The peer's reset.
 	{
 		st, _ := c.OpenStreamSync(ctx)
-		st.SetPreamble([]byte("sendreset:33"))
-		st.Close()
+		_ = st.SetPreamble([]byte("sendreset:33"))
+		_ = st.Close()
 		_, err := io.ReadAll(st)
 		var se *StreamError
 		if !errors.As(err, &se) || se.ErrorCode != 33 || !se.Remote {
@@ -216,8 +216,8 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 				return
 			}
 			b, _ := io.ReadAll(st)
-			st.Write(append([]byte(string(st.Preamble())+":"), b...))
-			st.Close()
+			_, _ = st.Write(append([]byte(string(st.Preamble())+":"), b...))
+			_ = st.Close()
 		}()
 		if r := command(t, ctx, c, "open-bidi:hello", nil); r != "opened=back:hello" {
 			t.Fatalf("open-bidi: %q", r)
@@ -248,8 +248,8 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		us.Write([]byte("u-echo"))
-		us.Close()
+		_, _ = us.Write([]byte("u-echo"))
+		_ = us.Close()
 		rs, err := c.AcceptUniStream(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -268,8 +268,8 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 			t.Fatalf("datagram: %q %v", d, err)
 		}
 		st, _ := c.OpenStreamSync(ctx)
-		st.SetPreamble([]byte("dgram:1"))
-		st.Write(nil)
+		_ = st.SetPreamble([]byte("dgram:1"))
+		_, _ = st.Write(nil)
 		if err := st.SendDatagram(4, []byte("sdg")); err != nil {
 			t.Fatal(err)
 		}
@@ -277,7 +277,7 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 		if err != nil || ctxv != 5 || string(d2) != "sdg" {
 			t.Fatalf("stream datagram: %d %q %v", ctxv, d2, err)
 		}
-		st.Close()
+		_ = st.Close()
 		if b, _ := io.ReadAll(st); string(b) != "dgram-done" {
 			t.Fatalf("dgram: %q", b)
 		}
@@ -372,9 +372,9 @@ func TestInteropMultipathServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tl.Close()
+	defer func() { _ = tl.Close() }()
 	l := NewListener(&ListenerConfig{Config: interopMPConfig()})
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	go func() {
@@ -383,7 +383,7 @@ func TestInteropMultipathServer(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go l.HandlePipe(ctx, NetPipe(nc), JoinHint{})
+			go func() { _ = l.HandlePipe(ctx, NetPipe(nc), JoinHint{}) }()
 		}
 	}()
 	p := startPeer(t, "mp-client", tl.Addr().String())

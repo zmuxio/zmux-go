@@ -43,7 +43,7 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 		}
 		limit := s.cfg.Local.MaxRecordSize
 		if size == 0 || size > limit {
-			s.failLocal(wire.Errorf(wire.FrameEncodingError, "record size", "value", size, "limit", limit,
+			s.failLocal(wire.NewError(wire.FrameEncodingError, "record size", "value", size, "limit", limit,
 				"pipe", pipe, "pos", il.pos))
 			return len(data)
 		}
@@ -96,7 +96,7 @@ func (s *Session) checkFirstRecord(b []byte) *wire.Error {
 		return nil
 	}
 	if size < 9 || size > s.cfg.Local.MaxRecordSize {
-		return wire.Errorf(wire.ProtocolViolation, "not a zmux or QMux peer", "value", size)
+		return wire.NewError(wire.ProtocolViolation, "not a zmux or QMux peer", "value", size)
 	}
 	for i := 0; i < 8 && n+i < len(b); i++ {
 		if b[n+i] != tpTypeBytes[i] {
@@ -133,7 +133,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 	idx := 0
 	for len(rec) > 0 {
 		n, e := wire.DecodeFrame(rec, &f)
-		if e == nil && f.Kind == wire.KindTransportParams && !(first && idx == 0) {
+		if e == nil && f.Kind == wire.KindTransportParams && (!first || idx != 0) {
 			var tp wire.Params
 			if pe := wire.DecodeParams(f.Data, &tp); pe != nil {
 				e = pe
@@ -211,20 +211,26 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 			facts.traffic = facts.traffic || f.Kind != wire.KindPing
 		case wire.KindPipePing:
 			facts.pipePing = true
+		case wire.KindPadding, wire.KindMaxData, wire.KindMaxStreamData, wire.KindMaxStreams,
+			wire.KindDataBlocked, wire.KindStreamDataBlocked, wire.KindStreamsBlocked, wire.KindClose,
+			wire.KindTransportParams, wire.KindGoAway, wire.KindPriorityUpdate, wire.KindPipeJoin,
+			wire.KindPipeAck, wire.KindPipeLane, wire.KindPipeAbandon, wire.KindPipeStatus:
+			// Neither activity nor a PIPE_PING.
 		}
 		if s.state >= StateClosing {
 			// Waiting for lanes before CONNECTION_CLOSE: only
 			// acknowledgements and the peer's close still matter.
 			if f.Kind == wire.KindPipeAck {
 				_ = s.ack.onPipeAck(&f, s.now)
-			} else if f.Kind == wire.KindClose {
+			}
+			if f.Kind == wire.KindClose {
 				s.closeFr.waitLanes = false
 			}
 			rec = rec[n:]
 			idx++
 			continue
 		}
-		if pe := s.dispatch(p, il, &f, buf); pe != nil {
+		if pe := s.dispatch(p, &f, buf); pe != nil {
 			s.failLocal(pe)
 			return
 		}
@@ -241,7 +247,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 	s.stats.BytesReceived += posBytes
 	s.stats.RecordsReceived++
 	if s.ack != nil {
-		s.ack.onRecord(p, il, posBytes, facts, s.now)
+		s.ack.onRecord(il, posBytes, facts, s.now)
 	}
 	if a := p.mp; a != nil {
 		if facts.traffic {
@@ -265,9 +271,11 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 }
 
 // dispatch applies one decoded frame.
-func (s *Session) dispatch(p *Pipe, il *inLane, f *wire.Frame, buf *Buf) *wire.Error {
+func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
 	switch f.Kind {
 	case wire.KindPadding:
+	case wire.KindTransportParams:
+		// Only the first frame of the first record, consumed before dispatch.
 	case wire.KindStream:
 		eff, e := s.onStream(f, buf)
 		if e != nil {
@@ -293,7 +301,7 @@ func (s *Session) dispatch(p *Pipe, il *inLane, f *wire.Frame, buf *Buf) *wire.E
 			return nil
 		}
 		if !st.hasS {
-			return wire.Errorf(wire.StreamStateError, "STOP_SENDING for a receive-only stream", "stream", st.id)
+			return wire.NewError(wire.StreamStateError, "STOP_SENDING for a receive-only stream", "stream", st.id)
 		}
 		if st.snd.stopped && !s.feat.Multipath && st.snd.state != sendDataRecvd && st.snd.state != sendResetRecvd {
 			s.charge()
@@ -319,7 +327,7 @@ func (s *Session) dispatch(p *Pipe, il *inLane, f *wire.Frame, buf *Buf) *wire.E
 			return nil
 		}
 		if !st.hasS {
-			return wire.Errorf(wire.StreamStateError, "MAX_STREAM_DATA for a receive-only stream", "stream", st.id)
+			return wire.NewError(wire.StreamStateError, "MAX_STREAM_DATA for a receive-only stream", "stream", st.id)
 		}
 		if !s.onSendCredit(st, f.Value) && !s.feat.Multipath && st.snd.state < sendDataRecvd {
 			s.charge()
@@ -335,7 +343,7 @@ func (s *Session) dispatch(p *Pipe, il *inLane, f *wire.Frame, buf *Buf) *wire.E
 		}
 	case wire.KindDataBlocked:
 		if f.Value > s.conn.adv {
-			return wire.Errorf(wire.ProtocolViolation, "DATA_BLOCKED above the advertised limit", "value", f.Value)
+			return wire.NewError(wire.ProtocolViolation, "DATA_BLOCKED above the advertised limit", "value", f.Value)
 		}
 		if f.Value <= s.conn.blockSeen && s.conn.blockSeen > 0 {
 			if !s.feat.Multipath {
@@ -359,10 +367,10 @@ func (s *Session) dispatch(p *Pipe, il *inLane, f *wire.Frame, buf *Buf) *wire.E
 			return nil
 		}
 		if !st.hasR {
-			return wire.Errorf(wire.StreamStateError, "STREAM_DATA_BLOCKED for a send-only stream", "stream", st.id)
+			return wire.NewError(wire.StreamStateError, "STREAM_DATA_BLOCKED for a send-only stream", "stream", st.id)
 		}
 		if f.Value > st.rcv.adv {
-			return wire.Errorf(wire.ProtocolViolation, "STREAM_DATA_BLOCKED above the advertised limit",
+			return wire.NewError(wire.ProtocolViolation, "STREAM_DATA_BLOCKED above the advertised limit",
 				"stream", st.id, "value", f.Value)
 		}
 		if f.Value <= st.rcv.blockSeen && st.rcv.blockSeen > 0 && !s.feat.Multipath &&
@@ -377,7 +385,7 @@ func (s *Session) dispatch(p *Pipe, il *inLane, f *wire.Frame, buf *Buf) *wire.E
 	case wire.KindStreamsBlocked:
 		t := typeIndex(f.Bidi)
 		if f.Value > s.rem[t].limit {
-			return wire.Errorf(wire.ProtocolViolation, "STREAMS_BLOCKED above the advertised limit", "value", f.Value)
+			return wire.NewError(wire.ProtocolViolation, "STREAMS_BLOCKED above the advertised limit", "value", f.Value)
 		}
 		if f.Value <= s.rem[t].blockedSeen && s.rem[t].blockedSeen > 0 && !s.feat.Multipath {
 			s.charge()
@@ -388,7 +396,7 @@ func (s *Session) dispatch(p *Pipe, il *inLane, f *wire.Frame, buf *Buf) *wire.E
 	case wire.KindDatagram:
 		return s.onDatagram(f)
 	case wire.KindPing:
-		return s.onPing(f, p)
+		return s.onPing(f)
 	case wire.KindGoAway:
 		s.onGoAway(f)
 	case wire.KindPriorityUpdate:
@@ -463,7 +471,7 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful bool, partial bool, now 
 	failed := (!graceful || partial) && !early
 	if s.feat.Multipath {
 		if failed || allEnded {
-			s.mpInboundEnded(p, il, !failed)
+			s.mpInboundEnded(p, !failed)
 		}
 		return
 	}

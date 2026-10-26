@@ -111,7 +111,7 @@ func FloorParams() wire.Params {
 // earlyAllowed: the role must not depend on the peer (SPEC.md 6.1.2 rule 1).
 func (s *Session) earlyAllowed() bool {
 	l := &s.cfg.Local
-	return s.cfg.Role != RoleAuto && !(l.Has&wire.HasRole != 0 && l.Role == wire.RoleAuto)
+	return s.cfg.Role != RoleAuto && (l.Has&wire.HasRole == 0 || l.Role != wire.RoleAuto)
 }
 
 // startEarly installs the assumed set before establishment.

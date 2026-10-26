@@ -22,12 +22,12 @@ type CapacityFloor struct {
 // pipeQuality is a pipe's band state.
 type pipeQuality struct {
 	band     *QualityBand // nil: the session's default
-	has      bool         // a first report exists
 	rtt      Duration
 	rate     float64
 	lastAt   Time
-	pending  bool
 	pendTime Time
+	has      bool // a first report exists
+	pending  bool
 }
 
 type sessQuality struct {

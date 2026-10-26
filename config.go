@@ -125,10 +125,10 @@ type EarlyData struct {
 
 // PipeAuth selects the secret sources of joins (MULTIPATH.md 10.1).
 type PipeAuth struct {
-	// TLS asserts that pipe 0's TLS 1.3 handshake terminates at the peer.
-	TLS bool
 	// PSK is a pre-shared key of at least 16 bytes.
 	PSK []byte
+	// TLS asserts that pipe 0's TLS 1.3 handshake terminates at the peer.
+	TLS bool
 	// AllowInsecure allows joins without a secret (tests, protected
 	// networks). It must not be combined with PSK.
 	AllowInsecure bool
@@ -154,7 +154,7 @@ func dur(d, def time.Duration) core.Duration {
 // coreConfig validates c and resolves it for the core.
 func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, error) {
 	if c == nil {
-		c = &Config{}
+		return (&Config{}).coreConfig(role, transport)
 	}
 	cc := core.DefaultConfig()
 	cc.Role, cc.TransportRole = role, transport
@@ -331,7 +331,7 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 		return cc, err
 	}
 	n := uint64(g[0])<<8 | uint64(g[1])
-	l.HasGrease, l.GreaseID = true, 31*n+27
+	l.GreaseID = 31*n + 27
 	l.GreaseValue = make([]byte, int(g[2])%17)
 	_, _ = rand.Read(l.GreaseValue)
 	cc.DgramRecvLimited = c.DatagramLimiter.Receive != nil

@@ -27,7 +27,7 @@ func loadCorpus(t testing.TB, name string) []corpusEntry {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var out []corpusEntry
 	sc := bufio.NewScanner(f)
 	sc.Buffer(nil, 1<<20)

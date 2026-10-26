@@ -2,6 +2,7 @@ package zmux
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ func TestMaintainPipesRedials(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- e.client.MaintainPipes(ctx, PipePool{Count: 2, MinBackoff: 10 * time.Millisecond,
-			Dial: func(ctx context.Context) (PipeIO, error) {
+			Dial: func(context.Context) (PipeIO, error) {
 				nc, err := net.Dial("tcp", e.ln.Addr().String())
 				if err != nil {
 					return PipeIO{}, err
@@ -46,12 +47,14 @@ func TestMaintainPipesRedials(t *testing.T) {
 	for _, p := range e.client.Pipes() {
 		if p.ID != 0 {
 			pp, _ := e.client.Pipe(p.ID)
-			pp.Abort(nil)
+			_ = pp.Abort(nil)
 			break
 		}
 	}
 	time.Sleep(50 * time.Millisecond)
 	wait(2)
 	cancel()
-	<-done
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("MaintainPipes returned %v, want context.Canceled", err)
+	}
 }

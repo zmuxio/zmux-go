@@ -104,12 +104,12 @@ func (s *Session) writePingRequest(w *recWriter) {
 }
 
 // onPing processes QX_PING.
-func (s *Session) onPing(f *wire.Frame, pp *Pipe) *wire.Error {
+func (s *Session) onPing(f *wire.Frame) *wire.Error {
 	p := &s.ping
 	if !f.Response {
 		if f.Value+1 <= p.reqSeen {
 			if !s.feat.Multipath {
-				return wire.Errorf(wire.ProtocolViolation, "QX_PING request not increasing", "value", f.Value)
+				return wire.NewError(wire.ProtocolViolation, "QX_PING request not increasing", "value", f.Value)
 			}
 			return nil // outdated: ignored, never chargeable
 		}
@@ -122,7 +122,7 @@ func (s *Session) onPing(f *wire.Frame, pp *Pipe) *wire.Error {
 		return nil
 	}
 	if f.Value+1 > p.maxSent {
-		return wire.Errorf(wire.ProtocolViolation, "QX_PING response above the largest request", "value", f.Value)
+		return wire.NewError(wire.ProtocolViolation, "QX_PING response above the largest request", "value", f.Value)
 	}
 	if f.Value+1 <= p.respSeen {
 		if !s.feat.Multipath {
@@ -185,7 +185,7 @@ func (s *Session) charge() {
 	}
 	b.tokens--
 	if b.tokens < 0 {
-		s.failLocal(wire.Errorf(wire.ExcessiveLoad, "no-effect budget exhausted"))
+		s.failLocal(wire.NewError(wire.ExcessiveLoad, "no-effect budget exhausted"))
 	}
 }
 

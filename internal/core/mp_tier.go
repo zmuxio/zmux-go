@@ -86,7 +86,7 @@ func (s *Session) classUsable(c class, p *Pipe) bool {
 // usableClass returns the class of this moment; ok is false when no pipe
 // is usable.
 func (s *Session) usableClass() (class, bool) {
-	any := func(c class) bool {
+	hasClass := func(c class) bool {
 		for _, p := range s.pipes {
 			if s.classUsable(c, p) {
 				return true
@@ -94,10 +94,10 @@ func (s *Session) usableClass() (class, bool) {
 		}
 		return false
 	}
-	settled := any(class{false, false}) || any(class{true, false})
+	settled := hasClass(class{false, false}) || hasClass(class{true, false})
 	c := class{probOK: !settled}
-	c.standby = !any(class{false, c.probOK})
-	return c, any(c)
+	c.standby = !hasClass(class{false, c.probOK})
+	return c, hasClass(c)
 }
 
 // rateOf is R_p of an outbound pipe.
@@ -162,16 +162,16 @@ func (s *Session) buildGate() *gate {
 	sa := s.cfg.Policy == PolicySessionAffinity
 	for lo := 0; lo < len(g.pipes); {
 		pr, _ := g.pipes[lo].mp.effPrio()
-		hi := lo
-		var active *Pipe
-		var aOWD Duration
+		active := g.pipes[lo]
+		aOWD := s.owd(active)
+		hi := lo + 1
 		for hi < len(g.pipes) {
 			q, _ := g.pipes[hi].mp.effPrio()
 			if q != pr {
 				break
 			}
 			o := s.owd(g.pipes[hi])
-			if active == nil || o < aOWD {
+			if o < aOWD {
 				active, aOWD = g.pipes[hi], o
 			}
 			hi++
@@ -444,8 +444,8 @@ func (st *Stream) waitStart() Time {
 // stay. ClearSend* return a field to the peer's request.
 type PipeSettings struct {
 	SendPriority      *uint64
-	ClearSendPriority bool
 	SendStandby       *bool
+	ClearSendPriority bool
 	ClearSendStandby  bool
 	RecvPriority      *uint64
 	RecvStandby       *bool
@@ -562,7 +562,7 @@ func (s *Session) onPipeStatus(f *wire.Frame) *wire.Error {
 	q := s.pipe(f.PipeID)
 	if q == nil {
 		if s.ownParity(f.PipeID) && f.PipeID >= m.nextID {
-			return wire.Errorf(wire.ProtocolViolation, "PIPE_STATUS for an untaken pipe ID", "pipe", f.PipeID)
+			return wire.NewError(wire.ProtocolViolation, "PIPE_STATUS for an untaken pipe ID", "pipe", f.PipeID)
 		}
 		return nil
 	}
@@ -633,5 +633,5 @@ func (s *Session) writeStatus(w *recWriter, q *Pipe) bool {
 func statusReady(q *Pipe) bool {
 	qa := q.mp
 	return qa != nil && len(qa.statusQ) > 0 && !qa.retired && q.in != nil && qa.in == inOpen &&
-		qa.out != outJoining && !(qa.joinerLocal && qa.out == outNone && qa.in == inJoining)
+		qa.out != outJoining && (!qa.joinerLocal || qa.out != outNone || qa.in != inJoining)
 }

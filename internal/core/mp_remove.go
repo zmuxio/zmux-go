@@ -119,7 +119,6 @@ func (s *Session) startDrain(p *Pipe) {
 	s.unsettle(p)
 	if p.out != nil && a.liveOut() {
 		a.out = outDraining
-		s.sched.unbindPipe(s, p)
 	}
 	if !a.abandonSent && !a.abandonQueued {
 		a.abandonQueued = true
@@ -297,7 +296,7 @@ func (s *Session) checkLastPipe(cause error) {
 }
 
 // mpInboundEnded handles the end of an inbound pipe (MULTIPATH.md 7.3).
-func (s *Session) mpInboundEnded(p *Pipe, il *inLane, graceful bool) {
+func (s *Session) mpInboundEnded(p *Pipe, graceful bool) {
 	a := p.mp
 	if a == nil || a.retired {
 		return

@@ -174,8 +174,6 @@ var (
 	// ErrStreamClosed is returned for operations on a direction the
 	// application closed itself.
 	ErrStreamClosed = errors.New("zmux: stream closed")
-	// ErrWouldBlock is returned by non-blocking calls that would wait.
-	ErrWouldBlock = errors.New("zmux: operation would block")
 	// ErrNotNegotiated is returned for features the session does not use.
 	ErrNotNegotiated = errors.New("zmux: feature not negotiated")
 	// ErrNotEstablished is returned for calls that need the peer's
@@ -188,8 +186,6 @@ var (
 	ErrGoingAway = errors.New("zmux: going away")
 	// ErrTooLate is returned for settings that must precede the first frame.
 	ErrTooLate = errors.New("zmux: too late: the stream's first frame was sent")
-	// ErrListenerClosed is returned by a closed Listener.
-	ErrListenerClosed = errors.New("zmux: listener closed")
 	// ErrInvalidConfig wraps configuration errors.
 	ErrInvalidConfig = errors.New("zmux: invalid configuration")
 )
@@ -253,6 +249,7 @@ func apiErr(err error) error {
 			return fmt.Errorf("stream %d: %w", st.StreamID, ErrRejected)
 		case core.StreamGoingAway:
 			return ErrGoingAway
+		case core.StreamClosedLocally:
 		}
 		return ErrStreamClosed
 	case errors.As(err, &tl):

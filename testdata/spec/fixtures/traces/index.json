@@ -2848,6 +2848,18 @@
       "steps": 19
     },
     {
+      "id": "multipath.redundancy.partial_copy_no_fin",
+      "file": "fixtures/traces/multipath/redundancy/partial_copy_no_fin.ndjson",
+      "title": "A copy that covers only part of a stream direction carries no FIN: after an idle period only the first chunk of a write that ends the direction is copied, and only the frame that reaches the final size carries FIN",
+      "refs": [
+        "SCHEDULER.md#4.1",
+        "SPEC.md#7.5"
+      ],
+      "findings": [],
+      "profile": "zmux-mp",
+      "steps": 18
+    },
+    {
       "id": "multipath.revalidate.pipes_await_acknowledgement",
       "file": "fixtures/traces/multipath/revalidate/pipes_await_acknowledgement.ndjson",
       "title": "After a revalidation request every live outbound pipe gets a PIPE_PING at once and takes no new stream data until it is acknowledged, while another pipe is",

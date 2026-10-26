@@ -16,7 +16,7 @@ func (s *Session) lookupStream(id uint64, opens bool) (*Stream, *wire.Error) {
 	t := typeIndex(isBidiID(id))
 	if isLocalID(id, s.role) {
 		if idx >= s.loc[t].next {
-			return nil, wire.Errorf(wire.StreamStateError, "frame for an unopened local stream", "stream", id)
+			return nil, wire.NewError(wire.StreamStateError, "frame for an unopened local stream", "stream", id)
 		}
 		return nil, nil
 	}
@@ -25,10 +25,10 @@ func (s *Session) lookupStream(id uint64, opens bool) (*Stream, *wire.Error) {
 		return nil, nil
 	}
 	if !opens {
-		return nil, wire.Errorf(wire.StreamStateError, "frame in the wrong direction", "stream", id)
+		return nil, wire.NewError(wire.StreamStateError, "frame in the wrong direction", "stream", id)
 	}
 	if idx >= rc.limit {
-		return nil, wire.Errorf(wire.StreamLimitError, "stream opened beyond the limit",
+		return nil, wire.NewError(wire.StreamLimitError, "stream opened beyond the limit",
 			"stream", id, "limit", rc.limit)
 	}
 	var last *Stream
@@ -145,24 +145,24 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		return true, nil // discarded stream: ignored, never chargeable
 	}
 	if !st.hasR {
-		return false, wire.Errorf(wire.StreamStateError, "STREAM on a send-only stream", "stream", st.id)
+		return false, wire.NewError(wire.StreamStateError, "STREAM on a send-only stream", "stream", st.id)
 	}
 	r := &st.rcv
 	off := f.Offset
 	end := off + uint64(len(f.Data))
 	if r.finKnown && (end > r.final || f.Fin && end != r.final) {
-		return false, wire.Errorf(wire.FinalSizeError, "data beyond the final size", "stream", st.id,
+		return false, wire.NewError(wire.FinalSizeError, "data beyond the final size", "stream", st.id,
 			"offset", off, "length", len(f.Data), "limit", r.final)
 	}
 	if f.Fin && end < r.highest {
-		return false, wire.Errorf(wire.FinalSizeError, "final size below received data", "stream", st.id)
+		return false, wire.NewError(wire.FinalSizeError, "final size below received data", "stream", st.id)
 	}
 	if end > r.adv {
-		return false, wire.Errorf(wire.FlowControlError, "stream data beyond the limit", "stream", st.id,
+		return false, wire.NewError(wire.FlowControlError, "stream data beyond the limit", "stream", st.id,
 			"offset", off, "length", len(f.Data), "limit", r.adv)
 	}
-	if !s.feat.Multipath && off != r.highest && !(r.reset && off >= r.highest) {
-		return false, wire.Errorf(wire.ProtocolViolation, "out-of-order stream data", "stream", st.id,
+	if !s.feat.Multipath && off != r.highest && (!r.reset || off < r.highest) {
+		return false, wire.NewError(wire.ProtocolViolation, "out-of-order stream data", "stream", st.id,
 			"offset", off, "length", len(f.Data))
 	}
 	top := r.highest
@@ -172,7 +172,7 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 	if end > top {
 		s.conn.recv += end - top
 		if s.conn.recv > s.conn.adv {
-			return false, wire.Errorf(wire.FlowControlError, "session data beyond the limit", "stream", st.id,
+			return false, wire.NewError(wire.FlowControlError, "session data beyond the limit", "stream", st.id,
 				"limit", s.conn.adv)
 		}
 	}
@@ -217,9 +217,6 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		if !r.stopped {
 			s.offer(st)
 		}
-		if f.Fin && end == uint64(pre.Size) {
-			// nothing else
-		}
 	}
 	if len(data) > 0 {
 		lo := max64(off, r.readOff)
@@ -250,7 +247,7 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		}
 	}
 	if f.Fin && !r.preDone && s.feat.Preamble && !st.local && end == 0 && !r.stopped {
-		return false, wire.Errorf(wire.ProtocolViolation, "opener's sending part has final size 0", "stream", st.id)
+		return false, wire.NewError(wire.ProtocolViolation, "opener's sending part has final size 0", "stream", st.id)
 	}
 	s.recvProgress(st)
 	if !effect && (len(f.Data) > 0 || !f.Fin) && !s.feat.Multipath {
@@ -282,7 +279,7 @@ func (s *Session) checkPreambleReset(st *Stream) *wire.Error {
 		return nil
 	}
 	if r.preDone && r.resetRel < r.preSize {
-		return wire.Errorf(wire.ProtocolViolation, "reset below the preamble", "stream", st.id)
+		return wire.NewError(wire.ProtocolViolation, "reset below the preamble", "stream", st.id)
 	}
 	return nil
 }
@@ -313,7 +310,7 @@ func (s *Session) onReset(f *wire.Frame, at bool) (bool, *wire.Error) {
 		return st == nil && err == nil, err
 	}
 	if !st.hasR {
-		return false, wire.Errorf(wire.StreamStateError, "reset of a send-only stream", "stream", st.id)
+		return false, wire.NewError(wire.StreamStateError, "reset of a send-only stream", "stream", st.id)
 	}
 	r := &st.rcv
 	rel := uint64(0)
@@ -321,13 +318,13 @@ func (s *Session) onReset(f *wire.Frame, at bool) (bool, *wire.Error) {
 		rel = f.Reliable
 	}
 	if r.finKnown && f.FinalSize != r.final || f.FinalSize < r.highest {
-		return false, wire.Errorf(wire.FinalSizeError, "final size changed", "stream", st.id)
+		return false, wire.NewError(wire.FinalSizeError, "final size changed", "stream", st.id)
 	}
 	if f.FinalSize > r.adv {
-		return false, wire.Errorf(wire.FlowControlError, "final size beyond the limit", "stream", st.id)
+		return false, wire.NewError(wire.FlowControlError, "final size beyond the limit", "stream", st.id)
 	}
 	if r.reset && f.Code != r.resetCode {
-		return false, wire.Errorf(wire.StreamStateError, "reset changes the error code", "stream", st.id)
+		return false, wire.NewError(wire.StreamStateError, "reset changes the error code", "stream", st.id)
 	}
 	top := r.highest
 	if r.finKnown {
@@ -336,12 +333,12 @@ func (s *Session) onReset(f *wire.Frame, at bool) (bool, *wire.Error) {
 	if f.FinalSize > top {
 		s.conn.recv += f.FinalSize - top
 		if s.conn.recv > s.conn.adv {
-			return false, wire.Errorf(wire.FlowControlError, "session data beyond the limit", "stream", st.id)
+			return false, wire.NewError(wire.FlowControlError, "session data beyond the limit", "stream", st.id)
 		}
 	}
 	if !st.local && s.feat.Preamble && !r.stopSent && !r.stopped {
 		if !at || f.FinalSize == 0 {
-			return false, wire.Errorf(wire.ProtocolViolation, "opener reset without the preamble", "stream", st.id)
+			return false, wire.NewError(wire.ProtocolViolation, "opener reset without the preamble", "stream", st.id)
 		}
 	}
 	effect := !r.reset || rel < r.resetRel

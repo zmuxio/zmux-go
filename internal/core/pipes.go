@@ -37,9 +37,8 @@ type Pipe struct {
 func (p *Pipe) ID() uint64 { return p.id }
 
 type inDir struct {
-	lanes  []*inLane
-	ended  bool
-	failed bool
+	lanes []*inLane
+	ended bool
 }
 
 type inLane struct {
@@ -56,7 +55,6 @@ type inLane struct {
 	posAt      Time   // when pos last advanced
 	expectLane bool   // the first record must start with PIPE_LANE
 	skipJoin   bool   // the first record starts with an already processed PIPE_JOIN
-	early      bool   // ended before its second record (no event)
 }
 
 type outDir struct {
@@ -80,7 +78,6 @@ type outLane struct {
 	writing     bool // a write call is in progress (since stallAt)
 	notWritable bool // the carrier reports it accepts no bytes (since stallAt)
 	stallAt     Time
-	early       bool       // the first record carried early data
 	log         []retained // multipath retention
 	segs        []sendSeg  // unacknowledged bytes in send order
 	activity    []uint64   // end positions of records with activity frames

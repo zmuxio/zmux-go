@@ -15,12 +15,12 @@ import (
 
 // laneOut is the lane state of an outbound pipe.
 type laneOut struct {
-	offered   bool   // the carrier offers lanes
 	next      uint64 // next lane number
-	requested bool   // a lane open is pending at the driver
 	pending   *outLane
-	refused   bool
 	copyLane  *outLane // the copy lane (SCHEDULER.md 9.2 rule 3), nil when none
+	offered   bool     // the carrier offers lanes
+	requested bool     // a lane open is pending at the driver
+	refused   bool
 }
 
 // laneLimit is the number of lanes the peer accepts on our pipes.
@@ -311,7 +311,7 @@ func (s *Session) AcceptLane(conn any, pipe, lane uint64, info CarrierInfo) bool
 		return false
 	}
 	if lane == 0 || lane >= s.cfg.Local.MaxLanes || p.in.lane(lane) != nil {
-		s.failLocal(wire.Errorf(wire.ProtocolViolation, "invalid lane", "pipe", pipe, "value", lane))
+		s.failLocal(wire.NewError(wire.ProtocolViolation, "invalid lane", "pipe", pipe, "value", lane))
 		return false
 	}
 	p.in.lanes = append(p.in.lanes, &inLane{lane: lane, info: info, expectLane: true})

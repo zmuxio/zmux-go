@@ -160,6 +160,7 @@ func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, bind
 				return 0, err
 			}
 			continue
+		case core.JoinClose, core.JoinRefused:
 		}
 		c.unlock()
 		closePipeIO(p)

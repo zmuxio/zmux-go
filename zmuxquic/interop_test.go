@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go"
 )
 
 // Interoperability over QUIC with another implementation's scripted peer
@@ -50,11 +50,11 @@ func startPeer(t *testing.T, args ...string) *peerProc {
 	}()
 	t.Cleanup(func() {
 		done := make(chan struct{})
-		go func() { cmd.Wait(); close(done) }()
+		go func() { _ = cmd.Wait(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
 			<-done
 		}
 	})
@@ -91,7 +91,7 @@ func command(t *testing.T, ctx context.Context, c *zmux.Conn, cmd string, body [
 	if err := st.SetPreamble([]byte(cmd)); err != nil {
 		t.Fatal(err)
 	}
-	go func() { st.Write(body); st.Close() }()
+	go func() { _, _ = st.Write(body); _ = st.Close() }()
 	b, err := io.ReadAll(st)
 	if err != nil {
 		t.Fatalf("%s: %v", cmd, err)
@@ -113,9 +113,9 @@ func bulkAndClose(t *testing.T, ctx context.Context, c *zmux.Conn, p *peerProc) 
 				errs <- err
 				return
 			}
-			st.SetPreamble([]byte("echo"))
-			st.SetDeadline(time.Now().Add(20 * time.Second))
-			go func() { st.Write(msg); st.Close() }()
+			_ = st.SetPreamble([]byte("echo"))
+			_ = st.SetDeadline(time.Now().Add(20 * time.Second))
+			go func() { _, _ = st.Write(msg); _ = st.Close() }()
 			got, err := io.ReadAll(st)
 			if err == nil && !bytes.Equal(got, msg) {
 				err = errors.New("echo mismatch")
@@ -183,12 +183,12 @@ func TestInteropQUICServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	l := zmux.NewListener(&zmux.ListenerConfig{Config: interopConfig(nil)})
-	defer l.Close()
-	go Serve(ctx, ln, l)
+	defer func() { _ = l.Close() }()
+	go func() { _ = Serve(ctx, ln, l) }()
 	p := startPeer(t, "quic-client", ln.Addr().String())
 	c, err := l.Accept(ctx)
 	if err != nil {
@@ -207,8 +207,8 @@ func TestInteropQUICServer(t *testing.T) {
 	}
 	replayable := st.Replayable()
 	b, _ := io.ReadAll(st)
-	st.Write([]byte("ok"))
-	st.Close()
+	_, _ = st.Write([]byte("ok"))
+	_ = st.Close()
 	if r := p.expect(t, "EARLY "); !strings.HasPrefix(r, "sent=true ") || !strings.HasSuffix(r, " reply=ok") {
 		t.Fatalf("peer early: %q", r)
 	}

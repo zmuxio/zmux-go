@@ -131,7 +131,7 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 			}
 			switch a.out {
 			case outActive, outJoining:
-				if at(stall.Add(s.tSuspect(a))) && apply && !(a.out == outJoining && !s.confirmedOnce(p)) {
+				if at(stall.Add(s.tSuspect(a))) && apply && (a.out != outJoining || s.confirmedOnce(p)) {
 					s.makeSuspect(p)
 				}
 			case outSuspect:
@@ -148,6 +148,8 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 					a.drainSuspect = true
 					s.reinjectPipe(p)
 				}
+			case outNone, outFailed, outClosed:
+				// liveOut excludes these.
 			}
 		}
 		if a.out == outDraining && at(a.drainStart.Add(s.tFail(a))) && apply {

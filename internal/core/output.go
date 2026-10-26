@@ -54,7 +54,7 @@ func (s *Session) WantsWrite(pipe, lane uint64) bool {
 	if s.mp != nil {
 		return s.mpWantsWrite(p, ol)
 	}
-	if lane == 0 && s.controlPending(p) {
+	if lane == 0 && s.controlPending() {
 		return true
 	}
 	return s.dataPendingOn(p, ol) && !s.limHeld(p)
@@ -80,7 +80,7 @@ func (s *Session) dataPendingOn(p *Pipe, ol *outLane) bool {
 	return false
 }
 
-func (s *Session) controlPending(p *Pipe) bool {
+func (s *Session) controlPending() bool {
 	if s.pend.maxData || s.pend.maxStreams[0] || s.pend.maxStreams[1] || s.pend.dataBlocked ||
 		s.pend.streamsBlocked[0] || s.pend.streamsBlocked[1] || s.pend.goaway || s.ctlHead != nil {
 		return true
@@ -118,11 +118,11 @@ func (s *Session) canSendNow(st *Stream) bool {
 // chunkPlan is what a stream could send now, before record room.
 type chunkPlan struct {
 	off, n     uint64
-	fin, open  bool
-	resend     bool
 	avail      uint64
 	credit     uint64
 	connCredit uint64
+	fin, open  bool
+	resend     bool
 	preBlocked bool
 }
 
@@ -277,11 +277,12 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, max int, now Time) b
 	return true
 }
 
-// afterBatch accounts positions and statistics of a produced batch.
+// afterBatch accounts positions and statistics of a produced batch; p and
+// its outbound direction are live (PollTransmit checked them).
 func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
 	var pos int
 	for _, r := range w.b.recs {
-		pos += recordPositionBytes(ol.info.Framing, r.size)
+		pos += recordPositionBytes(r.size)
 	}
 	start := ol.pos
 	ol.pos += uint64(pos)
@@ -289,13 +290,11 @@ func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
 		st.snd.laneEnd = ol.pos
 	}
 	s.stats.BytesSent += uint64(pos)
-	if s.ack != nil && p != nil && p.out != nil {
+	if s.ack != nil {
 		defer s.paceSent(p, uint64(pos))
 	}
 	s.stats.RecordsSent += uint64(w.recs)
-	if p != nil && p.out != nil {
-		p.out.records += uint64(w.recs)
-	}
+	p.out.records += uint64(w.recs)
 	if s.ack != nil {
 		s.ack.onSent(p, ol, start, w, s.now)
 	}
@@ -316,7 +315,7 @@ func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
 
 // WriteDone reports that a batch was written (or failed); it releases the
 // batch's references. n is the bytes the carrier took.
-func (s *Session) WriteDone(b *Batch, n int, err error, now Time) {
+func (s *Session) WriteDone(b *Batch, err error, now Time) {
 	s.SetNow(now)
 	b.release()
 	if p := s.pipe(b.Pipe); p != nil && p.out != nil {
@@ -576,7 +575,10 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 // writeData writes stream data in priority order; with lanes, only the
 // directions bound to ol.
 func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
-	lanes := p != nil && p.out.lo.offered
+	var lp *Pipe // the pipe whose lanes streams bind to; nil without lanes
+	if p != nil && p.out.lo.offered {
+		lp = p
+	}
 	var d *decision
 	if p != nil && p.mp != nil {
 		d = &s.mp.dec // prepared by mpWrite
@@ -588,22 +590,22 @@ func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 			if d != nil && (!s.canSendNow(st) || !s.onPipe(d, st)) {
 				continue
 			}
-			if lanes {
+			if lp != nil {
 				if !s.canSendNow(st) {
 					continue
 				}
-				if l, _, _ := s.laneFor(p, st); l != ol {
-					s.bindLane(p, st)
+				if l, _, _ := s.laneFor(lp, st); l != ol {
+					s.bindLane(lp, st)
 					continue
 				}
-				s.bindLane(p, st)
+				s.bindLane(lp, st)
 			}
 			r := s.sendChunk(w, st, d)
 			if r == chunkFull {
 				return
 			}
 			if r == chunkSent {
-				if lanes {
+				if lp != nil {
 					w.touched = append(w.touched, st)
 				}
 				progressed = true

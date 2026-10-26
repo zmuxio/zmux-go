@@ -13,9 +13,6 @@ import (
 
 // PipeOptions are the options of an attachment (API.md 4.2).
 type PipeOptions struct {
-	// Direction from the local endpoint: Bidirectional, SendOnly (an
-	// uplink) or ReceiveOnly (a downlink).
-	Direction Direction
 	// SendPriority is the tier of the local outbound direction (lower is
 	// preferred). Set, it wins over the peer's request.
 	SendPriority *uint64
@@ -25,8 +22,6 @@ type PipeOptions struct {
 	// SendStandby makes the local outbound direction carry data only on
 	// failover. Set, it wins over the peer's request.
 	SendStandby *bool
-	// ReceiveStandby asks the same of the peer's outbound direction.
-	ReceiveStandby bool
 	// Weight is the share for SpreadRoundRobin and the factor of
 	// SpreadRateWeighted (default 1; 0 excludes the pipe unless every
 	// candidate has 0).
@@ -41,23 +36,29 @@ type PipeOptions struct {
 	// pipe; 0 uses the session's.
 	SuspectFloor time.Duration
 	DeadTimeout  time.Duration
+	// Label names the pipe in statistics.
+	Label string
+	// Direction from the local endpoint: Bidirectional, SendOnly (an
+	// uplink) or ReceiveOnly (a downlink).
+	Direction Direction
+	// ReceiveStandby asks the peer to make its outbound direction standby
+	// (as SendStandby does locally).
+	ReceiveStandby bool
 	// CarrierBound ties the join token to the new carrier's TLS 1.3
 	// handshake (MULTIPATH.md 10.5); the carrier must be a TLS connection
 	// that terminates at the peer.
 	CarrierBound bool
-	// Label names the pipe in statistics.
-	Label string
 }
 
 func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 	var j core.JoinOptions
+	j.Dir = 2 // Bidirectional, and any value out of range
 	switch dir {
 	case SendOnly:
 		j.Dir = 0
 	case ReceiveOnly:
 		j.Dir = 1
-	default:
-		j.Dir = 2
+	case Bidirectional:
 	}
 	if o.SuspectFloor != 0 && o.SuspectFloor < 50*time.Millisecond {
 		return j, fmt.Errorf("%w: SuspectFloor below 50 ms", ErrInvalidConfig)
@@ -137,11 +138,12 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 	if c.closing {
 		return nil, c.errLocked()
 	}
-	pd := c.newPipeDrv(c.s.NextPipeID(), p)
-	if err := nestPipe(c, outerOf(p)); err != nil {
+	outer := outerOf(p) // the session p runs over; not owned here
+	if err := nestPipe(c, outer); err != nil {
 		return nil, err
 	}
-	pd.outer = outerOf(p)
+	pd := c.newPipeDrv(c.s.NextPipeID(), p)
+	pd.outer = outer
 	low := !oob && pd.tcp.setLowWater(multiLowWater)
 	info := carrierInfo(p, pd.tcp, low)
 	j.In, j.Out, j.OutSig = info, info, pd.wsig
@@ -379,25 +381,20 @@ func (c *Conn) SetScheduler(s Scheduler) {
 type PipeStats struct {
 	ID           uint64
 	Label        string
-	Direction    Direction
 	State        string // joining, active, suspect, draining, failed, closed
 	InState      string // opening, open, ended
-	Revalidating bool
 	AttachedFor  time.Duration
 	SuspectCount uint64
 	FailureCount uint64
 
 	SendPriority       uint64
 	SendPrioritySource string // local, peer, default
-	Standby            bool
 	StandbySource      string
 	ReceivePriority    uint64
-	ReceiveStandby     bool
 	StatusSequence     uint64
 	PeerRequest        *PeerRequest
 	Weight             uint64
 	ProbationUntil     time.Time // zero outside probation
-	Eligible           bool
 
 	SmoothedRTT  time.Duration // estimate
 	MinRTT       time.Duration // estimate
@@ -408,8 +405,6 @@ type PipeStats struct {
 
 	QueuedBytes   uint64
 	QueueDelay    time.Duration // estimate
-	Writable      bool
-	Saturated     bool
 	BytesInFlight uint64
 
 	BytesSent          uint64
@@ -424,6 +419,14 @@ type PipeStats struct {
 	SinceLastAck     time.Duration
 	SinceLastReceive time.Duration
 	Lanes            int
+
+	Direction      Direction
+	Revalidating   bool
+	Standby        bool // with StandbySource
+	ReceiveStandby bool
+	Eligible       bool
+	Writable       bool
+	Saturated      bool
 }
 
 // PeerRequest is the peer's latest PIPE_STATUS request for the local

@@ -105,27 +105,22 @@ type schedIter struct {
 func (sc *scheduler) iter() schedIter { return schedIter{sc: sc, level: -1} }
 
 func (it *schedIter) next() *Stream {
-	for {
-		if it.cur != nil {
-			n := it.cur.sch.next
-			if n != it.first && n != nil && n.sch.in && n.sch.level == uint8(it.level) {
-				it.cur = n
-				return n
-			}
-			it.cur = nil
+	if it.cur != nil {
+		n := it.cur.sch.next
+		if n != it.first && n != nil && n.sch.in && n.sch.level == uint8(it.level) {
+			it.cur = n
+			return n
 		}
-		it.level++
-		for it.level < 8 && it.sc.mask&(1<<it.level) == 0 {
-			it.level++
-		}
-		if it.level >= 8 {
-			return nil
-		}
-		it.first = it.sc.head[it.level]
-		it.cur = it.first
-		return it.cur
+		it.cur = nil
 	}
+	it.level++
+	for it.level < 8 && it.sc.mask&(1<<it.level) == 0 {
+		it.level++
+	}
+	if it.level >= 8 {
+		return nil
+	}
+	it.first = it.sc.head[it.level]
+	it.cur = it.first
+	return it.cur
 }
-
-// unbindPipe drops affinity bindings to a pipe (filled by the policies).
-func (sc *scheduler) unbindPipe(s *Session, p *Pipe) {}

@@ -44,7 +44,7 @@ func Classify(b []byte, maxRecord uint64) (Class, int) {
 		}
 		return true
 	}
-	c := ClassReject
+	var c Class
 	switch {
 	case size >= 9 && match(tpTypeBytes[:]):
 		c = ClassSession
@@ -111,14 +111,14 @@ type PendingCarriers struct {
 
 // Admit takes a slot for a new carrier from source; false: close it.
 func (p *PendingCarriers) Admit(source string) bool {
-	max := p.MaxPerSource
-	if max <= 0 {
-		max = 8
+	maxPer := p.MaxPerSource
+	if maxPer <= 0 {
+		maxPer = 8
 	}
 	if p.bySource == nil {
 		p.bySource = map[string]int{}
 	}
-	if p.bySource[source] >= max {
+	if p.bySource[source] >= maxPer {
 		return false
 	}
 	p.bySource[source]++

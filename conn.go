@@ -44,19 +44,13 @@ type Conn struct {
 
 	timer   *time.Timer
 	timerAt core.Time
-	fired   bool // the timeout ran: rearm no earlier than G
 
-	pipes   map[uint64]*pipeDrv
-	wg      sync.WaitGroup
-	closing bool // CLOSED: no new goroutines
-	done    chan struct{}
-	ctx     context.Context
-	cancel  context.CancelCauseFunc
-	err     error // terminal error once done
-
-	poisoned bool
-
-	estSig *core.Signal
+	pipes  map[uint64]*pipeDrv
+	wg     sync.WaitGroup
+	done   chan struct{}
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	err    error // terminal error once done
 
 	orphMu    sync.Mutex
 	orphans   []*core.Stream
@@ -74,6 +68,10 @@ type Conn struct {
 	redial      redialer
 	needRedial  bool // a direction may have been lost (under the lock)
 	dialed      dialer
+
+	fired    bool // the timeout ran: rearm no earlier than G
+	closing  bool // CLOSED: no new goroutines
+	poisoned bool
 }
 
 var sigPool = sync.Pool{New: func() any { s := make([]*core.Signal, 0, 16); return &s }}
@@ -254,7 +252,7 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 		return c, nil
 	}
 	if err := c.waitEstablished(ctx); err != nil {
-		c.CloseWithError(0, "")
+		c.closeWith(0, "")
 		return nil, err
 	}
 	return c, nil
@@ -377,11 +375,16 @@ func (c *Conn) closedErr() error {
 // CloseWithError closes the session immediately with an application error;
 // it never blocks. Unsent data is discarded.
 func (c *Conn) CloseWithError(code ApplicationErrorCode, msg string) error {
+	c.closeWith(code, msg)
+	return nil
+}
+
+// closeWith starts the immediate close; it cannot fail.
+func (c *Conn) closeWith(code ApplicationErrorCode, msg string) {
 	c.lock()
 	defer c.unlock()
 	c.s.SetNow(c.clk.now())
 	c.s.Close(uint64(code), []byte(msg))
-	return nil
 }
 
 // Close closes the session with code 0; like CloseWithError it never
@@ -400,7 +403,7 @@ func (c *Conn) Shutdown(ctx context.Context, code ApplicationErrorCode, msg stri
 	case <-c.done:
 		return nil
 	case <-ctx.Done():
-		c.CloseWithError(code, msg)
+		c.closeWith(code, msg)
 		return ctx.Err()
 	}
 }
@@ -682,7 +685,7 @@ func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 // credit it returns StreamLimitReachedError. Nothing is sent before the
 // first write (or StreamID).
 func (c *Conn) OpenStream() (*Stream, error) {
-	h, err := c.open(nil, true)
+	h, err := c.open(context.Background(), true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -692,7 +695,7 @@ func (c *Conn) OpenStream() (*Stream, error) {
 // OpenStreamSync opens a bidirectional stream, waiting for credit in FIFO
 // order.
 func (c *Conn) OpenStreamSync(ctx context.Context) (*Stream, error) {
-	h, err := c.open(ctx, true)
+	h, err := c.open(ctx, true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -701,7 +704,7 @@ func (c *Conn) OpenStreamSync(ctx context.Context) (*Stream, error) {
 
 // OpenUniStream opens a unidirectional stream without waiting.
 func (c *Conn) OpenUniStream() (*SendStream, error) {
-	h, err := c.open(nil, false)
+	h, err := c.open(context.Background(), false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -710,14 +713,15 @@ func (c *Conn) OpenUniStream() (*SendStream, error) {
 
 // OpenUniStreamSync opens a unidirectional stream, waiting for credit.
 func (c *Conn) OpenUniStreamSync(ctx context.Context) (*SendStream, error) {
-	h, err := c.open(ctx, false)
+	h, err := c.open(ctx, false, true)
 	if err != nil {
 		return nil, err
 	}
 	return newSendStream(h), nil
 }
 
-func (c *Conn) open(ctx context.Context, bidi bool) (*handle, error) {
+// open opens a stream; with wait it waits for credit until ctx ends.
+func (c *Conn) open(ctx context.Context, bidi, wait bool) (*handle, error) {
 	var sig *core.Signal
 	defer func() {
 		if sig != nil {
@@ -730,7 +734,7 @@ func (c *Conn) open(ctx context.Context, bidi bool) (*handle, error) {
 		c.lock()
 		c.s.SetNow(c.clk.now())
 		st, err := c.s.OpenStream(bidi)
-		if errors.Is(err, core.ErrStreamLimit) && ctx != nil {
+		if errors.Is(err, core.ErrStreamLimit) && wait && ctx != nil {
 			if sig == nil {
 				sig = core.NewSignal()
 			} else {

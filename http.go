@@ -57,10 +57,12 @@ func HTTPPipe(ctx context.Context, client *http.Client, url string, h http.Heade
 		w := &httpReqWriter{pw: pw, cancel: cancel}
 		go func() {
 			if resp, err := client.Do(req); err == nil {
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
+				// Drain so the connection can be reused; the uplink's
+				// outcome is reported through the pipe, not the response.
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
 			}
-			pw.CloseWithError(net.ErrClosed)
+			_ = pw.CloseWithError(net.ErrClosed) // never fails
 		}()
 		return PipeIO{W: w}, nil
 	}
@@ -82,7 +84,7 @@ func HTTPPipe(ctx context.Context, client *http.Client, url string, h http.Heade
 		x := <-ch
 		r.resp, r.err = x.resp, x.err
 		if r.err == nil && x.resp.StatusCode/100 != 2 {
-			x.resp.Body.Close()
+			_ = x.resp.Body.Close() // unused body; the status is the error
 			r.err = errors.New("zmux: HTTP carrier status " + x.resp.Status)
 		}
 		close(r.ch)
@@ -109,7 +111,7 @@ func HTTPSplitPipe(ctx context.Context, client *http.Client, url string, h http.
 	}
 	down, err := HTTPPipe(ctx, client, url, hh, ReceiveOnly)
 	if err != nil {
-		up.W.Close()
+		_ = up.W.Close() // abandon the uplink; err is the one to report
 		return PipeIO{}, err
 	}
 	return PipeIO{R: down.R, W: up.W}, nil
@@ -124,12 +126,12 @@ type httpReqWriter struct {
 
 func (w *httpReqWriter) Write(p []byte) (int, error) { return w.pw.Write(p) }
 func (w *httpReqWriter) Close() error {
-	w.once.Do(func() { w.pw.Close() })
+	w.once.Do(func() { _ = w.pw.Close() }) // never fails
 	return nil
 }
 func (w *httpReqWriter) Abort(err error) {
 	w.once.Do(func() {
-		w.pw.CloseWithError(err)
+		_ = w.pw.CloseWithError(err) // never fails
 		w.cancel()
 	})
 }
@@ -157,7 +159,7 @@ func (r *httpRespReader) Close() error {
 		go func() {
 			<-r.ch
 			if r.resp != nil {
-				r.resp.Body.Close()
+				_ = r.resp.Body.Close() // reader closed; nothing to report to
 			}
 		}()
 	})

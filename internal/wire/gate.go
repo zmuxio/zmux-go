@@ -3,8 +3,8 @@ package wire
 // Gates says which frames the receiver accepts in a session (SPEC.md 4.2,
 // 5.5): features in use, and unilateral announcements the receiver made.
 type Gates struct {
-	ResetStreamAt bool   // the receiver advertised reset_stream_at
 	MaxDatagram   uint64 // the receiver's max_datagram_frame_size; 0 = none
+	ResetStreamAt bool   // the receiver advertised reset_stream_at
 	GoAway        bool
 	Priority      bool
 	Multipath     bool
@@ -12,16 +12,15 @@ type Gates struct {
 	Lanes         bool // lanes available toward the receiver
 }
 
-// AllGates accepts every frame (with unbounded datagrams).
-var AllGates = Gates{ResetStreamAt: true, MaxDatagram: MaxVarint, GoAway: true, Priority: true,
-	Multipath: true, PipeAck: true, Lanes: true}
-
 // CheckGate returns the error for a decoded frame whose feature is not in use
-// (SPEC.md 4.1 rule 3, RFC 9221 Section 3 for DATAGRAM). recordLeft is the
-// number of bytes the frame occupied, for the DATAGRAM size check.
+// (SPEC.md 4.1 rule 3, RFC 9221 Section 3 for DATAGRAM).
 func CheckGate(f *Frame, g *Gates) *Error {
 	ok := true
 	switch f.Kind {
+	case KindPadding, KindStream, KindResetStream, KindStopSending, KindMaxData,
+		KindMaxStreamData, KindMaxStreams, KindDataBlocked, KindStreamDataBlocked,
+		KindStreamsBlocked, KindClose, KindTransportParams, KindPing:
+		// Core frames: always in use.
 	case KindResetStreamAt:
 		ok = g.ResetStreamAt
 	case KindDatagram:

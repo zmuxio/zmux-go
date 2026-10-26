@@ -84,7 +84,7 @@ func (s *Session) retainBatch(w *recWriter, ol *outLane, start uint64) {
 	ends := m.endsBuf[:0]
 	pos := start
 	for _, r := range w.b.recs {
-		pos += uint64(recordPositionBytes(ol.info.Framing, r.size))
+		pos += uint64(recordPositionBytes(r.size))
 		ends = append(ends, pos)
 	}
 	m.endsBuf = ends
@@ -171,6 +171,9 @@ func (s *Session) acked(d *frameDesc) {
 			p.mp.ackedAbandonAt = s.now
 			s.maybeRetire(p)
 		}
+	case dStop, dMaxData, dMaxStreamData, dMaxStreams, dDataBlocked, dStreamDataBlocked,
+		dStreamsBlocked, dGoAway, dStatus:
+		// Delivered; nothing waits on the acknowledgement.
 	}
 }
 
@@ -306,9 +309,9 @@ func (s *Session) retransmitBudget() uint64 {
 		sum += r * float64(a.rtt.smoothed+pd) / 1e9
 	}
 	b := uint64(4 * sum)
-	max := s.cfg.SendBufferMax
-	if max == 0 {
-		max = 64 << 20
+	bufMax := s.cfg.SendBufferMax
+	if bufMax == 0 {
+		bufMax = 64 << 20
 	}
-	return min64(max64(b, 1<<20), max64(max, 1<<20))
+	return min64(max64(b, 1<<20), max64(bufMax, 1<<20))
 }

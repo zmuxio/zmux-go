@@ -14,12 +14,12 @@ const (
 	EvDatagramDropped
 	EvOOBJoin
 	EvJoinSecurityUnavailable
-	// EvTierSaturation: a tier (priority in Code) entered or left saturation.
+	// EvTierSaturation reports that a tier (priority in Code) entered or left saturation.
 	EvTierSaturation
-	// EvPipePriority: the effective priority (Code), standby flag
+	// EvPipePriority reports that the effective priority (Code), standby flag
 	// (Saturated) or weight (Count) of an outbound direction changed.
 	EvPipePriority
-	// EvPipeQuality: a pipe's smoothed RTT (RTT) or rate (Rate) left its band.
+	// EvPipeQuality reports that a pipe's smoothed RTT (RTT) or rate (Rate) left its band.
 	EvPipeQuality
 	// EvCapacityBelow / EvCapacityRestored: the outbound capacity (Rate)
 	// crossed the floor.
@@ -79,25 +79,23 @@ func (s *Session) PollEvent() (Event, bool) {
 type ActionKind uint8
 
 const (
-	// ActShutdown: gracefully end the write side of an outbound lane.
+	// ActShutdown gracefully ends the write side of an outbound lane.
 	ActShutdown ActionKind = iota + 1
-	// ActAbort: abort both halves (failure).
+	// ActAbort aborts both halves (failure).
 	ActAbort
-	// ActClose: close a carrier direction gracefully (after linger).
+	// ActClose closes a carrier direction gracefully (after linger).
 	ActClose
-	// ActOpenLane: open a new outbound lane on the pipe's connection.
+	// ActOpenLane opens a new outbound lane on the pipe's connection.
 	ActOpenLane
-	// ActResetLane: reset an unconfirmed outbound lane (refused).
+	// ActResetLane resets an unconfirmed outbound lane (refused).
 	ActResetLane
-	// ActRejectCarrier: close a carrier that was never attached.
-	ActRejectCarrier
 )
 
 // Action is one carrier command.
 type Action struct {
-	Kind ActionKind
 	Pipe uint64
 	Lane uint64
+	Kind ActionKind
 	Dir  Dir
 }
 

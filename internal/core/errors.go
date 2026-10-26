@@ -22,13 +22,13 @@ const (
 
 // SessionError is the terminal error of a session.
 type SessionError struct {
-	Kind      CloseKind
 	Code      uint64
 	FrameType uint64
 	Reason    string
 	Details   string
-	Remote    bool
 	Cause     error // last pipe error for PipesLost/ResumeTimeout
+	Kind      CloseKind
+	Remote    bool
 }
 
 func (e *SessionError) Error() string {
@@ -77,11 +77,11 @@ const (
 
 // StreamError is a stream-level outcome.
 type StreamError struct {
-	Kind     StreamErrKind
 	StreamID uint64
 	Code     uint64
-	Remote   bool
 	Reliable uint64
+	Kind     StreamErrKind
+	Remote   bool
 }
 
 func (e *StreamError) Error() string {
@@ -94,6 +94,7 @@ func (e *StreamError) Error() string {
 		return fmt.Sprintf("zmux: stream %d rejected", e.StreamID)
 	case StreamGoingAway:
 		return "zmux: going away"
+	case StreamClosedLocally:
 	}
 	return fmt.Sprintf("zmux: stream %d closed locally", e.StreamID)
 }
@@ -101,12 +102,10 @@ func (e *StreamError) Error() string {
 // API errors that do not end anything.
 var (
 	ErrStreamLimit    = errors.New("zmux: stream limit reached")
-	ErrWouldBlock     = errors.New("zmux: operation would block")
 	ErrNotNegotiated  = errors.New("zmux: feature not negotiated")
 	ErrNotEstablished = errors.New("zmux: session not established")
 	ErrTooLate        = errors.New("zmux: setting must precede the first frame")
 	ErrInvalid        = errors.New("zmux: invalid argument")
-	ErrDatagramQueue  = errors.New("zmux: datagram queue full")
 )
 
 // DatagramTooLargeError reports the largest payload the peer accepts.

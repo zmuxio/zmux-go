@@ -36,11 +36,11 @@ type Pick interface {
 // PickRequest is a stream direction waiting for a decision.
 type PickRequest struct {
 	Stream       StreamID
-	Urgency      uint8
 	Len          uint64 // bytes ready to place
+	EligibleTier uint64 // the most-preferred usable tier
 	LastPipe     uint64
 	HasLastPipe  bool
-	EligibleTier uint64 // the most-preferred usable tier
+	Urgency      uint8
 }
 
 // PickPipe is a pipe as a custom policy sees it (values only).
@@ -52,22 +52,22 @@ type PickPipe struct {
 	Rate      uint64 // bytes/s
 	Unsent    uint64
 	InFlight  uint64
-	Writable  bool
 	Priority  uint64
+	Weight    uint64
+	Writable  bool
 	Standby   bool
 	Saturated bool
 	Probation bool
 	Eligible  bool // under tier gating: the built-in policies choose among these
-	Weight    uint64
 }
 
 // PickAnswer is the answer for one direction: Pipe is an index into the
 // pipes, Bytes the bytes it covers (0: until invalidated); Wait holds the
 // direction until the session's next input.
 type PickAnswer struct {
-	Wait  bool
 	Pipe  int
 	Bytes uint64
+	Wait  bool
 }
 
 // Custom returns a scheduler that asks p.
@@ -92,7 +92,6 @@ type hooks struct {
 	mu      sync.Mutex
 	q       []traceItem
 	dropped uint64
-	closed  bool
 	wantWin bool
 	wantPk  bool
 	running bool

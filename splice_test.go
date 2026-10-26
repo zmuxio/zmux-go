@@ -44,8 +44,8 @@ func TestSpliceForwardsBothWays(t *testing.T) {
 		if err != nil {
 			return
 		}
-		io.Copy(s, s)
-		s.Close()
+		_, _ = io.Copy(s, s)
+		_ = s.Close()
 	}()
 	s, err := client.OpenStreamSync(ctx)
 	if err != nil {
@@ -53,7 +53,7 @@ func TestSpliceForwardsBothWays(t *testing.T) {
 	}
 	msg := make([]byte, 2<<20)
 	rand.Read(msg)
-	go func() { s.Write(msg); s.Close() }()
+	go func() { _, _ = s.Write(msg); _ = s.Close() }()
 	got, err := io.ReadAll(s)
 	if err != nil || !bytes.Equal(got, msg) {
 		t.Fatalf("splice echo: %d bytes, %v", len(got), err)
@@ -78,13 +78,13 @@ func TestSpliceResetTravels(t *testing.T) {
 		if err != nil {
 			return
 		}
-		Splice(ctx, in, out, nil)
+		_, _ = Splice(ctx, in, out, nil)
 	}()
 	s, err := client.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Write([]byte("hello"))
+	_, _ = s.Write([]byte("hello"))
 	ss, err := server.AcceptStream(ctx)
 	if err != nil {
 		t.Fatal(err)

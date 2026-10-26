@@ -162,7 +162,7 @@ func (s *Session) mpWrite(w *recWriter, p *Pipe, ol *outLane) {
 	}
 	if ol.lane == 0 {
 		s.refreshTiers()
-		s.mpPipeFrames(w, p, ol)
+		s.mpPipeFrames(w, p)
 		prim, _ := s.primary()
 		if prim == p || prim == nil {
 			s.writeControl(w, p)
@@ -184,7 +184,7 @@ func (s *Session) mpWrite(w *recWriter, p *Pipe, ol *outLane) {
 
 // mpPipeFrames writes PIPE_JOIN, PIPE_ACK, PIPE_PING, PIPE_ABANDON and
 // PIPE_STATUS for the pipe.
-func (s *Session) mpPipeFrames(w *recWriter, p *Pipe, ol *outLane) {
+func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 	a := p.mp
 	m := s.mp
 	if a.held && !s.joinAllowedFor(p) {
@@ -305,7 +305,7 @@ func (s *Session) mpWantsWrite(p *Pipe, ol *outLane) bool {
 		if len(s.mp.pendAbandon) > 0 {
 			return true
 		}
-		if (p == prim || prim == nil) && s.controlPending(p) {
+		if (p == prim || prim == nil) && s.controlPending() {
 			return true
 		}
 	}

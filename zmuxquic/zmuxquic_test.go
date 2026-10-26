@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go"
 )
 
 func tlsConfigs(t *testing.T) (*tls.Config, *tls.Config) {
@@ -60,11 +60,11 @@ func newEnv(t *testing.T, scfg *zmux.Config) *env {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &env{ln: ln, lst: zmux.NewListener(&zmux.ListenerConfig{Config: scfg}), cli: cli, cancel: cancel}
-	go Serve(ctx, ln, e.lst)
+	go func() { _ = Serve(ctx, ln, e.lst) }()
 	t.Cleanup(func() {
 		cancel()
-		ln.Close()
-		e.lst.Close()
+		_ = ln.Close()
+		_ = e.lst.Close()
 	})
 	return e
 }
@@ -76,8 +76,8 @@ func echo(t *testing.T, c, s *zmux.Conn, n int) {
 	go func() {
 		st, err := s.AcceptStream(ctx)
 		if err == nil {
-			io.Copy(st, st)
-			st.Close()
+			_, _ = io.Copy(st, st)
+			_ = st.Close()
 		}
 	}()
 	st, err := c.OpenStreamSync(ctx)
@@ -86,7 +86,7 @@ func echo(t *testing.T, c, s *zmux.Conn, n int) {
 	}
 	msg := make([]byte, n)
 	rand.Read(msg)
-	go func() { st.Write(msg); st.Close() }()
+	go func() { _, _ = st.Write(msg); _ = st.Close() }()
 	got, err := io.ReadAll(st)
 	if err != nil || !bytes.Equal(got, msg) {
 		t.Fatalf("echo: %d of %d bytes, %v", len(got), n, err)
@@ -106,10 +106,10 @@ func TestQUICPipeAndLanes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		c.Close()
-		s.Close()
-		c.Wait()
-		s.Wait()
+		_ = c.Close()
+		_ = s.Close()
+		_ = c.Wait()
+		_ = s.Wait()
 	}()
 	echo(t, c, s, 1<<20)
 	// Several bulk streams at once ask for lanes of pipe 0.
@@ -146,10 +146,10 @@ func TestQUICZeroRTT(t *testing.T) {
 	}
 	echo(t, c, s, 1000)
 	remembered := c.RememberedParameters()
-	c.Close()
-	s.Close()
-	c.Wait()
-	s.Wait()
+	_ = c.Close()
+	_ = s.Close()
+	_ = c.Wait()
+	_ = s.Wait()
 	// The second sends its first stream in 0-RTT.
 	cfg := &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true, Remembered: remembered}}
 	c2, err := Dial(ctx, e.ln.Addr().String(), e.cli, nil, cfg)
@@ -163,7 +163,7 @@ func TestQUICZeroRTT(t *testing.T) {
 	if _, err := st.Write([]byte("early")); err != nil {
 		t.Fatal(err)
 	}
-	st.Close()
+	_ = st.Close()
 	s2, err := e.lst.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -176,10 +176,10 @@ func TestQUICZeroRTT(t *testing.T) {
 	if err != nil || string(b) != "early" {
 		t.Fatalf("early stream %q %v", b, err)
 	}
-	c2.Close()
-	s2.Close()
-	c2.Wait()
-	s2.Wait()
+	_ = c2.Close()
+	_ = s2.Close()
+	_ = c2.Wait()
+	_ = s2.Wait()
 }
 
 func TestQUICPool(t *testing.T) {
@@ -202,10 +202,10 @@ func TestQUICPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		c.Close()
-		s.Close()
-		c.Wait()
-		s.Wait()
+		_ = c.Close()
+		_ = s.Close()
+		_ = c.Wait()
+		_ = s.Wait()
 	}()
 	var fates []uint64
 	for range 2 {
@@ -242,10 +242,10 @@ func TestQUICCopyLane(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		c.Close()
-		s.Close()
-		c.Wait()
-		s.Wait()
+		_ = c.Close()
+		_ = s.Close()
+		_ = c.Wait()
+		_ = s.Wait()
 	}()
 	go func() {
 		for {
@@ -253,7 +253,7 @@ func TestQUICCopyLane(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func() { io.Copy(st, st); st.Close() }()
+			go func() { _, _ = io.Copy(st, st); _ = st.Close() }()
 		}
 	}()
 	for i := range 200 {
@@ -264,8 +264,8 @@ func TestQUICCopyLane(t *testing.T) {
 		}
 		st.SetPriority(0, false)
 		msg := bytes.Repeat([]byte{byte(i)}, 4096)
-		st.Write(msg)
-		st.Close()
+		_, _ = st.Write(msg)
+		_ = st.Close()
 		got, err := io.ReadAll(st)
 		if err != nil || !bytes.Equal(got, msg) {
 			t.Fatalf("urgent echo %d: %v", i, err)

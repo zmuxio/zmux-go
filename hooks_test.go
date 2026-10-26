@@ -25,7 +25,7 @@ func TestTracerSeesEstablishedAndClosed(t *testing.T) {
 	a, b := tcpPair(t)
 	c, s := pair(t, a, b, &Config{Tracer: tr}, nil)
 	_ = s
-	c.CloseWithError(3, "bye")
+	_ = c.CloseWithError(3, "bye")
 	select {
 	case err := <-closed:
 		var ae *ApplicationError
@@ -45,7 +45,7 @@ func TestTracerSeesEstablishedAndClosed(t *testing.T) {
 // pickSecond sends every chunk on the last pipe of the view.
 type pickLast struct{ calls atomic.Int32 }
 
-func (p *pickLast) Pick(reqs []PickRequest, pipes []PickPipe, out []PickAnswer) {
+func (p *pickLast) Pick(_ []PickRequest, pipes []PickPipe, out []PickAnswer) {
 	p.calls.Add(1)
 	for i := range out {
 		out[i] = PickAnswer{Pipe: len(pipes) - 1}
@@ -64,7 +64,7 @@ func TestCustomPolicy(t *testing.T) {
 	go func() {
 		s, err := e.server.AcceptStream(ctx)
 		if err == nil {
-			io.Copy(io.Discard, s)
+			_, _ = io.Copy(io.Discard, s)
 		}
 	}()
 	s, err := e.client.OpenStreamSync(ctx)
@@ -74,7 +74,7 @@ func TestCustomPolicy(t *testing.T) {
 	if _, err := s.Write(make([]byte, 256<<10)); err != nil {
 		t.Fatal(err)
 	}
-	s.Close()
+	_ = s.Close()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		st, err := p2.Stats()
@@ -97,7 +97,7 @@ func TestRedialAfterSuspension(t *testing.T) {
 	ccfg := mpConfig()
 	ccfg.ResumeTimeout = 5 * time.Second
 	var dials atomic.Int32
-	ccfg.Redial = func(ctx context.Context, need Direction) (PipeIO, error) {
+	ccfg.Redial = func(context.Context, Direction) (PipeIO, error) {
 		dials.Add(1)
 		nc, err := net.Dial("tcp", ln.Addr().String())
 		if err != nil {
@@ -127,15 +127,15 @@ func TestRedialAfterSuspension(t *testing.T) {
 	go func() {
 		s, err := e.server.AcceptStream(ctx)
 		if err == nil {
-			io.Copy(s, s)
-			s.Close()
+			_, _ = io.Copy(s, s)
+			_ = s.Close()
 		}
 	}()
 	s, err := e.client.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { s.Write([]byte("after")); s.Close() }()
+	go func() { _, _ = s.Write([]byte("after")); _ = s.Close() }()
 	b, err := io.ReadAll(s)
 	if err != nil || string(b) != "after" {
 		t.Fatalf("echo after resume %q %v", b, err)

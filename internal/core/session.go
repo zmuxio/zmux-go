@@ -63,7 +63,6 @@ type Session struct {
 	acceptW           [2][]*Signal
 	openW             [2][]*Signal
 	provisional       []*Stream // locally opened, not yet given an ID
-	pinned            [2]streamFIFO
 	sched             scheduler
 	ctlHead           *Stream
 	ctlTail           *Stream
@@ -88,7 +87,6 @@ type Session struct {
 	estW              []*Signal
 	bcast             *Signal // session-level broadcast for waits that watch state
 	stats             Stats
-	rnd               [8]byte
 	greaseFirst       bool
 	closedEmitted     bool
 	openLocalBidiRecv uint64
@@ -135,8 +133,7 @@ type remoteCount struct {
 	limit       uint64 // advertised MAX_STREAMS
 	initial     uint64 // concurrency (initial limit of SPEC 8.5 rule 3)
 	discarded   uint64
-	raisedAt    uint64 // discarded count at the last raise
-	staged      bool   // uni credit not yet raised (SPEC 8.5 rule 4)
+	staged      bool // uni credit not yet raised (SPEC 8.5 rule 4)
 	blockedSeen uint64
 }
 
@@ -147,15 +144,14 @@ type pendingCtl struct {
 	dataBlocked    bool
 	goaway         bool
 	forceMaxData   bool
-	anyForced      bool
 }
 
 type closeFrame struct {
-	pending   bool
-	app       bool
 	code      uint64
 	frameType uint64
 	reason    []byte
+	pending   bool
+	app       bool
 	sentAll   bool
 	waitLanes bool // wait until lanes are covered (SPEC.md 6.5 step 1)
 }

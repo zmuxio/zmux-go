@@ -43,8 +43,9 @@ sessions.
 go test -race ./...
 ```
 
-Run it in each module directory. The sub-modules use a `replace` directive
-for the root module until a release is tagged.
+Run it in each module directory. The root `go.work` makes the sub-modules
+build against the local root module; see RELEASING.md for the release
+order.
 
 ## License
 

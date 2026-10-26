@@ -38,8 +38,8 @@ func pair(t testing.TB, a, b net.Conn, ccfg, scfg *Config) (*Conn, *Conn) {
 		t.Fatal(r.err)
 	}
 	t.Cleanup(func() {
-		c.Close()
-		r.c.Close()
+		_ = c.Close()
+		_ = r.c.Close()
 		waitDone(t, c)
 		waitDone(t, r.c)
 	})
@@ -48,7 +48,7 @@ func pair(t testing.TB, a, b net.Conn, ccfg, scfg *Config) (*Conn, *Conn) {
 
 func waitDone(t testing.TB, c *Conn) {
 	done := make(chan struct{})
-	go func() { c.Wait(); close(done) }()
+	go func() { _ = c.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -62,7 +62,7 @@ func tcpPair(t testing.TB) (net.Conn, net.Conn) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	ch := make(chan net.Conn, 1)
 	go func() {
 		c, _ := ln.Accept()
@@ -75,7 +75,7 @@ func tcpPair(t testing.TB) (net.Conn, net.Conn) {
 	return a, <-ch
 }
 
-func carriers(t testing.TB) map[string]func(testing.TB) (net.Conn, net.Conn) {
+func carriers() map[string]func(testing.TB) (net.Conn, net.Conn) {
 	return map[string]func(testing.TB) (net.Conn, net.Conn){
 		"pipe": func(testing.TB) (net.Conn, net.Conn) { return net.Pipe() },
 		"tcp":  tcpPair,
@@ -83,7 +83,7 @@ func carriers(t testing.TB) map[string]func(testing.TB) (net.Conn, net.Conn) {
 }
 
 func TestEcho(t *testing.T) {
-	for name, mk := range carriers(t) {
+	for name, mk := range carriers() {
 		t.Run(name, func(t *testing.T) {
 			leakcheck.Check(t)
 			a, b := mk(t)
@@ -93,8 +93,8 @@ func TestEcho(t *testing.T) {
 				if err != nil {
 					return
 				}
-				io.Copy(st, st)
-				st.Close()
+				_, _ = io.Copy(st, st)
+				_ = st.Close()
 			}()
 			st, err := c.OpenStreamSync(context.Background())
 			if err != nil {
@@ -103,8 +103,8 @@ func TestEcho(t *testing.T) {
 			msg := make([]byte, 300000)
 			rand.Read(msg)
 			go func() {
-				st.Write(msg)
-				st.Close()
+				_, _ = st.Write(msg)
+				_ = st.Close()
 			}()
 			got, err := io.ReadAll(st)
 			if err != nil {
@@ -128,8 +128,8 @@ func TestManyStreams(t *testing.T) {
 				return
 			}
 			go func() {
-				io.Copy(st, st)
-				st.Close()
+				_, _ = io.Copy(st, st)
+				_ = st.Close()
 			}()
 		}
 	}()
@@ -142,7 +142,7 @@ func TestManyStreams(t *testing.T) {
 				return
 			}
 			msg := bytes.Repeat([]byte{byte(i)}, 20000)
-			go func() { st.Write(msg); st.Close() }()
+			go func() { _, _ = st.Write(msg); _ = st.Close() }()
 			got, err := io.ReadAll(st)
 			if err == nil && !bytes.Equal(got, msg) {
 				err = errors.New("mismatch")
@@ -162,7 +162,7 @@ func TestCloseWakesReaders(t *testing.T) {
 	a, b := net.Pipe()
 	c, s := pair(t, a, b, nil, nil)
 	st, _ := c.OpenStreamSync(context.Background())
-	st.Write([]byte("x"))
+	_, _ = st.Write([]byte("x"))
 	ss, err := s.AcceptStream(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -170,12 +170,12 @@ func TestCloseWakesReaders(t *testing.T) {
 	errc := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 10)
-		ss.Read(buf)
+		_, _ = ss.Read(buf)
 		_, err := ss.Read(buf)
 		errc <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
-	c.CloseWithError(7, "bye")
+	_ = c.CloseWithError(7, "bye")
 	select {
 	case err := <-errc:
 		var ae *ApplicationError
@@ -196,12 +196,12 @@ func TestDeadlines(t *testing.T) {
 	a, b := net.Pipe()
 	c, s := pair(t, a, b, &Config{SendBuffer: 64 << 10}, &Config{InitialStreamReceiveWindow: 4096, MaxStreamReceiveWindow: 4096})
 	st, _ := c.OpenStreamSync(context.Background())
-	st.Write([]byte("x"))
+	_, _ = st.Write([]byte("x"))
 	ss, err := s.AcceptStream(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	ss.Read(make([]byte, 1))
+	_, _ = ss.Read(make([]byte, 1))
 	// A deadline set while a read is blocked without one interrupts it.
 	errc := make(chan error, 1)
 	go func() {
@@ -209,7 +209,7 @@ func TestDeadlines(t *testing.T) {
 		errc <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
-	ss.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	_ = ss.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 	select {
 	case err := <-errc:
 		if !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -219,8 +219,8 @@ func TestDeadlines(t *testing.T) {
 		t.Fatal("blocked read not interrupted by a new deadline")
 	}
 	// Cleared, the stream reads again.
-	ss.SetReadDeadline(time.Time{})
-	st.Write([]byte("y"))
+	_ = ss.SetReadDeadline(time.Time{})
+	_, _ = st.Write([]byte("y"))
 	if _, err := io.ReadFull(ss, make([]byte, 1)); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestDeadlines(t *testing.T) {
 		errc <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
-	st.SetWriteDeadline(time.Now())
+	_ = st.SetWriteDeadline(time.Now())
 	select {
 	case err := <-errc:
 		if !errors.Is(err, os.ErrDeadlineExceeded) {

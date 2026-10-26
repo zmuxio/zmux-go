@@ -156,7 +156,8 @@ func spliceReadErr(r, w *Stream, err error) {
 		// r was reset: the bytes below its Reliable Size were forwarded;
 		// they stay reliable on w.
 		if se.ReliableSize > 0 && se.ErrorCode != CodeCarrierFailed {
-			w.h.do(func(s *core.Session) error { s.SetReliableBoundary(w.h.st); return nil })
+			// A closed session has no boundary left to keep.
+			_ = w.h.do(func(s *core.Session) error { s.SetReliableBoundary(w.h.st); return nil })
 		}
 		w.h.cancelWrite(se.ErrorCode)
 		return

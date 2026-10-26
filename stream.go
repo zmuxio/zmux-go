@@ -388,7 +388,7 @@ type streamConn struct {
 }
 
 // StreamConn returns a net.Conn view of s. Unlike Stream.Close, its Close
-// both finishes the stream and stops reading (CancelRead(0)), as net.Conn
+// both finishes the stream and stops reading (CancelRead(CodeNoError)), as net.Conn
 // users expect.
 func StreamConn(s *Stream, local, remote net.Addr) net.Conn {
 	return &streamConn{Stream: s, local: local, remote: remote}
@@ -396,7 +396,7 @@ func StreamConn(s *Stream, local, remote net.Addr) net.Conn {
 
 func (c *streamConn) Close() error {
 	err := c.Stream.Close()
-	c.Stream.CancelRead(0)
+	c.CancelRead(CodeNoError)
 	return err
 }
 

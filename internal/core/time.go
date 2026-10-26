@@ -16,8 +16,8 @@ const Never Time = math.MaxInt64
 
 const (
 	Microsecond Duration = 1000
-	Millisecond Duration = 1000 * Microsecond
-	Second      Duration = 1000 * Millisecond
+	Millisecond          = 1000 * Microsecond
+	Second               = 1000 * Millisecond
 )
 
 // Add adds d with saturation: an overflow is Never.
@@ -53,14 +53,6 @@ func MulD(d Duration, k int64) Duration {
 	return d * k
 }
 
-// SatAdd adds durations with saturation.
-func SatAdd(a, b Duration) Duration {
-	if a > math.MaxInt64-b {
-		return math.MaxInt64
-	}
-	return a + b
-}
-
 func minT(a, b Time) Time {
 	if a < b {
 		return a
@@ -94,15 +86,6 @@ func max64(a, b uint64) uint64 {
 		return a
 	}
 	return b
-}
-
-// satAddU adds unsigned values, saturating at 2^62-1.
-func satAddU(a, b uint64) uint64 {
-	const m = 1<<62 - 1
-	if a > m-b {
-		return m
-	}
-	return a + b
 }
 
 func maxT(a, b Time) Time {

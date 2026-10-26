@@ -53,7 +53,7 @@ func (rb *recvBuf) insert(off uint64, d []byte, buf *Buf) uint64 {
 	var added uint64
 	cur := off
 	for i := 0; i <= len(rb.ps) && cur < end; i++ {
-		var gapEnd uint64 = end
+		gapEnd := end
 		if i < len(rb.ps) {
 			p := rb.ps[i]
 			pe := p.off + uint64(len(p.b))

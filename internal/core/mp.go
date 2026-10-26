@@ -56,11 +56,9 @@ type multiPath struct {
 	pingCount       int
 	redundantAt     Time // when the redundant snapshot copy is due
 	ackChanged      bool // snapshot changed since the last copy
-	lastFull        Time
 	busyUntil       Time // traffic frames within the busy window
 	joinReplays     uint64
 	joinAuthFails   uint64
-	retiredSummary  uint64
 	retained        uint64 // unacknowledged stream bytes (SCHEDULER.md 13.1)
 
 	// Scheduler (SCHEDULER.md).
@@ -130,7 +128,6 @@ type attach struct {
 	lastElicit  Time // when an ack-eliciting byte was last sent
 	suspectAt   Time
 	failCause   error
-	reinjected  bool
 	unsentAhead uint64
 	noSampleAt  Time // samples of bytes sent at or before this are discarded (E2)
 	noSample    bool
@@ -286,7 +283,7 @@ func (m *multiPath) raise(id uint64) {
 	}
 }
 
-// mpPipeState returns the state names of a pipe for traces and stats.
+// PipeState returns the state names of a pipe for traces and stats.
 func (s *Session) PipeState(id uint64) (out, in string, ok bool) {
 	p := s.pipe(id)
 	if p == nil {

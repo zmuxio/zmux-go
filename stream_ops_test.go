@@ -35,7 +35,7 @@ func TestChunkRelayWithoutCopy(t *testing.T) {
 				if err != io.EOF {
 					t.Errorf("relay read: %v", err)
 				}
-				out.Close()
+				_ = out.Close()
 				return
 			}
 			if err := out.WriteChunk(ctx, ch); err != nil {
@@ -54,8 +54,8 @@ func TestChunkRelayWithoutCopy(t *testing.T) {
 	msg := make([]byte, 3<<20)
 	rand.Read(msg)
 	go func() {
-		src.Write(msg)
-		src.Close()
+		_, _ = src.Write(msg)
+		_ = src.Close()
 	}()
 	dst, err := s2.AcceptStream(ctx)
 	if err != nil {
@@ -106,7 +106,7 @@ func TestPreambleAndCapacity(t *testing.T) {
 	if err != nil || n == 0 || n > 16<<10 {
 		t.Fatalf("capacity %d %v", n, err)
 	}
-	go io.Copy(io.Discard, ss)
+	go func() { _, _ = io.Copy(io.Discard, ss) }()
 	big := make([]byte, 1<<20)
 	if _, err := st.Write(big); err != nil {
 		t.Fatal(err)
@@ -115,5 +115,5 @@ func TestPreambleAndCapacity(t *testing.T) {
 	if n, err := st.WaitSendCapacity(ctx, 8<<10); err != nil || n == 0 {
 		t.Fatalf("capacity after reads %d %v", n, err)
 	}
-	st.Close()
+	_ = st.Close()
 }

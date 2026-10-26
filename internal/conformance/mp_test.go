@@ -28,6 +28,7 @@ func (r *runner) listenerUp(st map[string]any) error {
 		switch res {
 		case core.PairReject:
 			c.rejected = true
+		case core.PairWait:
 		case core.PairDone:
 			o := partner.(*rcarrier)
 			c.attached, o.attached = true, true
@@ -85,6 +86,7 @@ func (r *runner) tryJoin(c *rcarrier, j *wire.Join, mac []byte, inband bool) {
 		c.rejected = true
 		c.buf = nil
 		return
+	case core.JoinAccepted:
 	}
 	c.held = false
 	c.attached, c.pipe, c.lane = true, j.PipeID, 0
@@ -187,6 +189,7 @@ func (r *runner) listenerSend(c *rcarrier, st map[string]any) error {
 		return nil
 	case core.ClassMore:
 		return nil
+	case core.ClassJoin, core.ClassLane:
 	}
 	if n == 0 {
 		return nil

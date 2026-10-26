@@ -64,15 +64,15 @@ var policyByName = map[string]core.Policy{"affinity": core.PolicyAffinity, "sess
 func TestTraces(t *testing.T) {
 	profiles := loadProfiles(t)
 	var files []string
-	filepath.WalkDir(filepath.Join(specDir, "traces"), func(p string, d os.DirEntry, err error) error {
+	_ = filepath.WalkDir(filepath.Join(specDir, "traces"), func(p string, _ os.DirEntry, _ error) error {
 		if strings.HasSuffix(p, ".ndjson") {
 			files = append(files, p)
 		}
 		return nil
 	})
 	sort.Strings(files)
-	if len(files) != 366 {
-		t.Errorf("found %d traces, want 366", len(files))
+	if len(files) != 367 {
+		t.Errorf("found %d traces, want 367", len(files))
 	}
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
@@ -128,9 +128,9 @@ type rlane struct {
 
 type rpipe struct {
 	id       uint64
-	in, out  bool
-	framing  core.Framing
 	lanes    map[uint64]*rlane
+	framing  core.Framing
+	in, out  bool
 	writable bool
 }
 
@@ -145,20 +145,20 @@ type rcarrier struct {
 	name       string
 	via        string
 	dir        string
-	framing    core.Framing
 	binding    []byte
-	held       bool
 	pendJoin   *wire.Join
 	pendMac    []byte
-	pendInband bool
 	conn       string
 	buf        []byte
-	attached   bool
 	pipe       uint64
 	lane       uint64
-	rejected   bool
 	source     string // listener slot held until the first record
 	deadline   core.Time
+	framing    core.Framing
+	held       bool
+	pendInband bool
+	attached   bool
+	rejected   bool
 }
 
 type runner struct {
@@ -203,7 +203,6 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	cfg.Local = paramsFromMap(tp)
 	cfg.Test.Enabled = true
 	if g, ok := th["grease_tp"].(map[string]any); ok {
-		cfg.Local.HasGrease = true
 		cfg.Local.GreaseID = num(g["id"])
 		cfg.Local.GreaseValue = hexb(g["value"])
 	}
@@ -358,8 +357,6 @@ func (r *runner) step(st map[string]any) error {
 	return fmt.Errorf("unknown op %s", op)
 }
 
-var errUnsupported = errors.New("unsupported step")
-
 func (r *runner) pipeUp(st map[string]any) error {
 	via, _ := st["via"].(string)
 	conn, _ := st["conn"].(string)
@@ -411,7 +408,7 @@ func (r *runner) pipeDown(st map[string]any) error {
 		r.s.PipeEnded(id, lane, how == "eof", partial, r.now)
 	}
 	if dir == "out" || dir == "bidi" {
-		r.s.WriteDone(&core.Batch{Pipe: id, Lane: lane}, 0, errors.New("carrier failed"), r.now)
+		r.s.WriteDone(&core.Batch{Pipe: id, Lane: lane}, errors.New("carrier failed"), r.now)
 	}
 	r.drainEvents()
 	return nil
@@ -567,7 +564,7 @@ func (r *runner) drainEvents() {
 func (r *runner) flush() {
 	for i := 0; i < 64; i++ {
 		var lanes []uint64
-		any := false
+		matched := false
 		ids := make([]uint64, 0, len(r.pipes))
 		for id := range r.pipes {
 			ids = append(ids, id)
@@ -581,7 +578,7 @@ func (r *runner) flush() {
 			lanes = r.s.OutLanes(id, lanes[:0])
 			for _, ln := range lanes {
 				for r.s.PollTransmit(id, ln, &r.b, core.DefaultBatch, r.now) {
-					any = true
+					matched = true
 					l := p.lane(ln)
 					if l.closed != "" {
 						r.t.Errorf("pipe %d lane %d: a batch after the lane was closed (%s)", id, ln, l.closed)
@@ -591,13 +588,13 @@ func (r *runner) flush() {
 					if shut && l.closed == "" {
 						l.closed = "graceful"
 					}
-					r.s.WriteDone(&r.b, r.b.Len(), nil, r.now)
+					r.s.WriteDone(&r.b, nil, r.now)
 					r.drainEvents()
 				}
 			}
 		}
 		r.drainEvents()
-		if !any {
+		if !matched {
 			return
 		}
 	}
@@ -1111,6 +1108,9 @@ func eventObj(e core.Event) (string, map[string]any) {
 		return "join_auth_failed", map[string]any{"reason": e.Reason}
 	case core.EvOOBJoin:
 		return "oob_join", map[string]any{"pipe": e.Pipe, "frame": hex.EncodeToString(e.Frame)}
+	case core.EvJoinSecurityUnavailable, core.EvTierSaturation, core.EvPipePriority, core.EvPipeQuality,
+		core.EvCapacityBelow, core.EvCapacityRestored:
+		// Not in the trace vocabulary.
 	}
 	return "other", nil
 }

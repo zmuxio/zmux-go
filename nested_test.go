@@ -52,8 +52,8 @@ func TestNestedSession(t *testing.T) {
 	}
 	ns := r.c
 	defer func() {
-		nc.Close()
-		ns.Close()
+		_ = nc.Close()
+		_ = ns.Close()
 		waitDone(t, nc)
 		waitDone(t, ns)
 	}()
@@ -64,14 +64,14 @@ func TestNestedSession(t *testing.T) {
 		if err != nil {
 			return
 		}
-		io.Copy(s, s)
-		s.Close()
+		_, _ = io.Copy(s, s)
+		_ = s.Close()
 	}()
 	s, err := nc.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { s.Write(msg); s.Close() }()
+	go func() { _, _ = s.Write(msg); _ = s.Close() }()
 	got, err := io.ReadAll(s)
 	if err != nil || !bytes.Equal(got, msg) {
 		t.Fatalf("nested echo: %d bytes, %v", len(got), err)
@@ -113,7 +113,7 @@ func TestNestedLaneCredit(t *testing.T) {
 	if len(lanes) != 2 {
 		t.Fatalf("%d nested lanes, want 2 (half of 4)", len(lanes))
 	}
-	(&laneStream{s: lanes[0], outer: c}).Close()
+	_ = (&laneStream{s: lanes[0], outer: c}).Close()
 	// Use the remaining credit, then wait as an application opener.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

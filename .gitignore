@@ -24,8 +24,7 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# Go workspace file
-go.work
+# Go workspace checksums (go.work itself is committed)
 go.work.sum
 
 # env file

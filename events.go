@@ -44,15 +44,17 @@ func (k PipeEventKind) String() string {
 // PipeEvent is one event of NextPipeEvent.
 type PipeEvent struct {
 	Kind PipeEventKind
-	// Pipe and Direction of the pipe events.
-	Pipe      uint64
+	// Direction of the pipe events (with Pipe).
 	Direction Direction
-	// Priority, Standby and Weight of PipePriorityChanged; Priority and
-	// Saturated of TierSaturation.
-	Priority  uint64
+	// Standby of PipePriorityChanged; Saturated of TierSaturation.
 	Standby   bool
-	Weight    uint64
 	Saturated bool
+	// Pipe of the pipe events.
+	Pipe uint64
+	// Priority and Weight of PipePriorityChanged; Priority of
+	// TierSaturation.
+	Priority uint64
+	Weight   uint64
 	// Reason of JoinAuthFailed ("mac", "mac_carrier_bound").
 	Reason string
 	// GoAway of GoAwayReceived.
@@ -141,6 +143,9 @@ func (c *Conn) drainEventsLocked() {
 		case core.EvPipePriority:
 			q.push(PipeEvent{Kind: PipePriorityChanged, Pipe: e.Pipe, Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count})
+		case core.EvClosed, core.EvDatagramDropped:
+			// The end surfaces through Wait and the drops through the
+			// statistics; neither is a pipe event.
 		}
 	}
 	if c.hk != nil {

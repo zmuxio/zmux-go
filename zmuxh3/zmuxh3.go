@@ -18,7 +18,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go"
 )
 
 const carrierFailed = webtransport.StreamErrorCode(zmux.CodeCarrierFailed)
@@ -113,7 +113,9 @@ func acceptLanes(sess *webtransport.Session) {
 		if err != nil {
 			return
 		}
-		go zmux.HandleLane(sess.Context(), zmux.PipeIO{R: &laneReader{s: s, sess: sess}})
+		// HandleLane closes a refused or failed lane itself; there is no
+		// caller to report its error to.
+		go func() { _ = zmux.HandleLane(sess.Context(), zmux.PipeIO{R: &laneReader{s: s, sess: sess}}) }()
 	}
 }
 

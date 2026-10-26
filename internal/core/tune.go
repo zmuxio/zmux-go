@@ -6,10 +6,9 @@ package core
 // allocated with the scope's first data.
 
 const (
-	tuneK         = 4
-	rateFloor     = Millisecond
-	tunePendMax   = 17
-	streamCapAuto = 64 << 20 // floor of the default stream window cap
+	tuneK       = 4
+	rateFloor   = Millisecond
+	tunePendMax = 17
 )
 
 // tuner is the auto-tuning state of one scope.

@@ -28,12 +28,8 @@ const (
 	IdleTimeout             uint64 = 0x2736d55c
 )
 
-// Application error code conventions (EXTENSIONS.md Section 7).
-const (
-	CodeCancelled     uint64 = 0x5a4d0001
-	CodeRejected      uint64 = 0x5a4d0002
-	CodeCarrierFailed uint64 = 0x5a4d0003
-)
+// CodeRejected is ZMUX_REJECTED (EXTENSIONS.md Section 7).
+const CodeRejected uint64 = 0x5a4d0002
 
 var transportErrorNames = map[uint64]string{
 	NoError: "NO_ERROR", InternalError: "INTERNAL_ERROR", ConnectionRefused: "CONNECTION_REFUSED",
@@ -98,8 +94,8 @@ func (e *Error) Phrase() string {
 	return s
 }
 
-// Errorf builds an Error. kv are key/value pairs for the diagnostic line.
-func Errorf(code uint64, reason string, kv ...any) *Error {
+// NewError builds an Error. kv are key/value pairs for the diagnostic line.
+func NewError(code uint64, reason string, kv ...any) *Error {
 	e := &Error{Code: code, Reason: reason}
 	if len(kv) > 0 {
 		var b strings.Builder

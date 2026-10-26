@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go"
 )
 
 // carrierFailed is ZMUX_CARRIER_FAILED as a QUIC stream error code.
@@ -165,13 +165,11 @@ func streamPipe(qc *quic.Conn, s *quic.Stream) zmux.PipeIO {
 
 // qStream is the sending half, with the carrier capabilities.
 type qStream struct {
-	mu     sync.Mutex
-	qc     *quic.Conn
-	s      *quic.Stream
-	wOnce  sync.Once
-	rOnce  sync.Once
-	reset  bool
-	closed bool
+	mu    sync.Mutex
+	qc    *quic.Conn
+	s     *quic.Stream
+	wOnce sync.Once
+	rOnce sync.Once
 }
 
 func (q *qStream) cur() (*quic.Conn, *quic.Stream) {

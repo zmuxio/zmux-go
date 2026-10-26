@@ -4,15 +4,15 @@ import "github.com/zmuxio/zmux-go/internal/wire"
 
 // goawayState is EXTENSIONS.md 3.
 type goawayState struct {
-	sent          bool
 	sentWater     [2]uint64
 	code          uint64
 	phase         int // 1: phase 1 sent, fence pending; 2: final
-	closeWhenDone bool
-	received      bool
 	recvWater     [2]uint64
 	recvCode      uint64
 	maxOffered    [2]uint64 // highest offered peer index + 1
+	sent          bool
+	received      bool
+	closeWhenDone bool
 }
 
 // Shutdown starts a graceful close (API.md 5.7): two-phase GOAWAY when it
@@ -53,9 +53,8 @@ func (s *Session) fenceDone() {
 	if g.phase != 1 {
 		return
 	}
-	if s.feat.Multipath {
-		// Wait for SRTT as well; approximated by sending at once.
-	}
+	// With multipath the wait would include SRTT as well; it is
+	// approximated by sending at once.
 	g.phase = 2
 	w := [2]uint64{g.maxOffered[0], g.maxOffered[1]}
 	lower := false
@@ -160,7 +159,7 @@ func (s *Session) allLocalStreams() []*Stream {
 func (s *Session) onPriorityUpdate(f *wire.Frame) *wire.Error {
 	id := f.StreamID
 	if !isBidiID(id) && !isLocalID(id, s.role) {
-		return wire.Errorf(wire.StreamStateError, "PRIORITY_UPDATE for the sender's unidirectional stream", "stream", id)
+		return wire.NewError(wire.StreamStateError, "PRIORITY_UPDATE for the sender's unidirectional stream", "stream", id)
 	}
 	st, e := s.lookupStream(id, isBidiID(id))
 	if e != nil {

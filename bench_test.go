@@ -20,8 +20,8 @@ func BenchmarkBulkTCP(b *testing.B) {
 		if err != nil {
 			return
 		}
-		io.Copy(io.Discard, st)
-		st.Close()
+		_, _ = io.Copy(io.Discard, st)
+		_ = st.Close()
 	}()
 	st, _ := c.OpenStreamSync(context.Background())
 	buf := make([]byte, 64<<10)
@@ -32,8 +32,8 @@ func BenchmarkBulkTCP(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	st.Close()
-	io.ReadAll(st)
+	_ = st.Close()
+	_, _ = io.ReadAll(st)
 }
 
 func BenchmarkRRTCP(b *testing.B) {
@@ -49,14 +49,14 @@ func BenchmarkRRTCP(b *testing.B) {
 			if _, err := io.ReadFull(st, buf); err != nil {
 				return
 			}
-			st.Write(buf)
+			_, _ = st.Write(buf)
 		}
 	}()
 	st, _ := c.OpenStreamSync(context.Background())
 	buf := make([]byte, 64)
 	b.ResetTimer()
 	for range b.N {
-		st.Write(buf)
+		_, _ = st.Write(buf)
 		if _, err := io.ReadFull(st, buf); err != nil {
 			b.Fatal(err)
 		}
@@ -82,8 +82,8 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 					return
 				}
 				if hdr[0] == 'b' {
-					io.Copy(io.Discard, st)
-					st.Close()
+					_, _ = io.Copy(io.Discard, st)
+					_ = st.Close()
 					return
 				}
 				buf := make([]byte, 64)
@@ -91,13 +91,13 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 					if _, err := io.ReadFull(st, buf); err != nil {
 						return
 					}
-					st.Write(buf)
+					_, _ = st.Write(buf)
 				}
 			}()
 		}
 	}()
 	bulk, _ := c.OpenStreamSync(ctx)
-	bulk.Write([]byte{'b'})
+	_, _ = bulk.Write([]byte{'b'})
 	var bulkBytes atomic.Int64
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -107,7 +107,7 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 		for {
 			select {
 			case <-stop:
-				bulk.Close()
+				_ = bulk.Close()
 				return
 			default:
 			}
@@ -119,7 +119,7 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 		}
 	}()
 	rr, _ := c.OpenStreamSync(ctx)
-	rr.Write([]byte{'r'})
+	_, _ = rr.Write([]byte{'r'})
 	rr.SetPriority(0, false) // latency-sensitive: ahead of the bulk stream
 	bulk.SetPriority(3, false)
 	buf := make([]byte, 64)
@@ -129,7 +129,7 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 	b0 := bulkBytes.Load()
 	for range b.N {
 		t := time.Now()
-		rr.Write(buf)
+		_, _ = rr.Write(buf)
 		if _, err := io.ReadFull(rr, buf); err != nil {
 			b.Fatal(err)
 		}
@@ -158,9 +158,9 @@ func BenchmarkMultipathSpread(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			defer ln.Close()
+			defer func() { _ = ln.Close() }()
 			l := NewListener(&ListenerConfig{Config: cfg})
-			defer l.Close()
+			defer func() { _ = l.Close() }()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			go func() {
@@ -169,7 +169,7 @@ func BenchmarkMultipathSpread(b *testing.B) {
 					if err != nil {
 						return
 					}
-					go l.HandlePipe(ctx, NetPipe(nc), JoinHint{})
+					go func() { _ = l.HandlePipe(ctx, NetPipe(nc), JoinHint{}) }()
 				}
 			}()
 			nc, _ := net.Dial("tcp", ln.Addr().String())
@@ -177,12 +177,12 @@ func BenchmarkMultipathSpread(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			srv, err := l.Accept(ctx)
 			if err != nil {
 				b.Fatal(err)
 			}
-			defer srv.Close()
+			defer func() { _ = srv.Close() }()
 			nc2, _ := net.Dial("tcp", ln.Addr().String())
 			if _, err := c.AddPipe(ctx, NetPipe(nc2), PipeOptions{}); err != nil {
 				b.Fatal(err)
@@ -195,8 +195,8 @@ func BenchmarkMultipathSpread(b *testing.B) {
 				if err != nil {
 					return
 				}
-				io.Copy(io.Discard, st)
-				st.Close()
+				_, _ = io.Copy(io.Discard, st)
+				_ = st.Close()
 			}()
 			st, _ := c.OpenStreamSync(ctx)
 			buf := make([]byte, 64<<10)
@@ -207,8 +207,8 @@ func BenchmarkMultipathSpread(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
-			st.Close()
-			io.ReadAll(st)
+			_ = st.Close()
+			_, _ = io.ReadAll(st)
 			<-got
 			b.StopTimer()
 			var total float64
@@ -227,21 +227,21 @@ func BenchmarkMultipathSpread(b *testing.B) {
 // request-response on a bare loopback TCP connection.
 func BenchmarkRRRawTCP(b *testing.B) {
 	a, s := tcpPair(b)
-	defer a.Close()
-	defer s.Close()
+	defer func() { _ = a.Close() }()
+	defer func() { _ = s.Close() }()
 	go func() {
 		buf := make([]byte, 64)
 		for {
 			if _, err := io.ReadFull(s, buf); err != nil {
 				return
 			}
-			s.Write(buf)
+			_, _ = s.Write(buf)
 		}
 	}()
 	buf := make([]byte, 64)
 	b.ResetTimer()
 	for range b.N {
-		a.Write(buf)
+		_, _ = a.Write(buf)
 		if _, err := io.ReadFull(a, buf); err != nil {
 			b.Fatal(err)
 		}

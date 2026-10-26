@@ -51,11 +51,6 @@ func AppendVarintN(b []byte, v uint64, n int) []byte {
 	}
 }
 
-// PutVarintN writes v into b[:n] using exactly n bytes.
-func PutVarintN(b []byte, v uint64, n int) {
-	AppendVarintN(b[:0], v, n)
-}
-
 // ReadVarint decodes a varint from b. n is 0 when b is too short.
 func ReadVarint(b []byte) (v uint64, n int) {
 	if len(b) == 0 {

@@ -34,7 +34,8 @@ func qpcInit() {
 	if r, _, _ := f.Call(uintptr(unsafe.Pointer(&freq))); r == 0 || freq == 0 {
 		return
 	}
-	c.Call(uintptr(unsafe.Pointer(&now)))
+	// QueryPerformanceCounter cannot fail on Windows XP and later.
+	_, _, _ = c.Call(uintptr(unsafe.Pointer(&now)))
 	qpcFreq, qpcStart, qpcBase, qpcProc = freq, now, time.Now(), c
 }
 
@@ -44,7 +45,7 @@ func monoSince(base time.Time) int64 {
 		return int64(time.Since(base))
 	}
 	var now int64
-	qpcProc.Call(uintptr(unsafe.Pointer(&now)))
+	_, _, _ = qpcProc.Call(uintptr(unsafe.Pointer(&now))) // cannot fail
 	ticks := now - qpcStart
 	ns := ticks/qpcFreq*1e9 + ticks%qpcFreq*1e9/qpcFreq
 	return int64(qpcBase.Sub(base)) + ns

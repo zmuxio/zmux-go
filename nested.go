@@ -107,7 +107,7 @@ func (w *stPipeW) CarrierConn() any { return w.outer }
 // only where lanes pay off (the outer session has lanes or more than one
 // pipe) and only with stream credit that leaves the application at least
 // half of the outer peer's streams (API.md 4.6).
-func (w *stPipeW) OpenLane(ctx context.Context) (io.WriteCloser, error) {
+func (w *stPipeW) OpenLane(context.Context) (io.WriteCloser, error) {
 	o := w.outer
 	s, ok := o.openNestedLane()
 	if !ok {

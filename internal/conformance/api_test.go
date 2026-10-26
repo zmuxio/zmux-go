@@ -89,7 +89,7 @@ func (r *runner) api(st map[string]any) error {
 				res["priority"] = map[string]any{"urgency": uint64(pp.Urgency), "incremental": pp.Incremental}
 			}
 			res["pipe_carrier"] = pp.PipeCarrier
-			tl := []any{}
+			tl := make([]any, 0, len(pp.App))
 			for _, t := range pp.App {
 				tl = append(tl, map[string]any{"type": t.Type, "value": hex.EncodeToString(t.Value)})
 			}

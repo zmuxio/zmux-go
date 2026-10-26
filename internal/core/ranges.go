@@ -55,9 +55,9 @@ func (r *rangeSet) add(lo, hi uint64) uint64 {
 }
 
 // covered returns how many bytes of [lo, hi) are in the set.
-func (r rangeSet) covered(lo, hi uint64) uint64 {
+func (r *rangeSet) covered(lo, hi uint64) uint64 {
 	var n uint64
-	for _, x := range r {
+	for _, x := range *r {
 		if x.hi <= lo {
 			continue
 		}
@@ -70,19 +70,19 @@ func (r rangeSet) covered(lo, hi uint64) uint64 {
 }
 
 // contains reports whether [lo, hi) is fully in the set.
-func (r rangeSet) contains(lo, hi uint64) bool { return r.covered(lo, hi) == hi-lo }
+func (r *rangeSet) contains(lo, hi uint64) bool { return r.covered(lo, hi) == hi-lo }
 
 // prefix returns the end of the range starting at 0 (0 when none).
-func (r rangeSet) prefix() uint64 {
-	if len(r) > 0 && r[0].lo == 0 {
-		return r[0].hi
+func (r *rangeSet) prefix() uint64 {
+	if s := *r; len(s) > 0 && s[0].lo == 0 {
+		return s[0].hi
 	}
 	return 0
 }
 
 // gaps calls f with each maximal subrange of [lo, hi) not in r, in order.
-func (r rangeSet) gaps(lo, hi uint64, f func(a, b uint64)) {
-	for _, x := range r {
+func (r *rangeSet) gaps(lo, hi uint64, f func(a, b uint64)) {
+	for _, x := range *r {
 		if x.hi <= lo {
 			continue
 		}

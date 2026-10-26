@@ -13,8 +13,8 @@ import (
 func clientOpening(f *testing.F, cfg *Config, stream bool) []byte {
 	f.Helper()
 	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
+	defer func() { _ = a.Close() }()
+	defer func() { _ = b.Close() }()
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -24,13 +24,13 @@ func clientOpening(f *testing.F, cfg *Config, stream bool) []byte {
 		}
 		if stream {
 			if st, err := c.OpenStream(); err == nil {
-				st.Write([]byte("hello"))
-				st.Close()
+				_, _ = st.Write([]byte("hello"))
+				_ = st.Close()
 			}
 		}
-		c.Wait()
+		_ = c.Wait()
 	}()
-	b.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_ = b.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	var out []byte
 	buf := make([]byte, 4096)
 	for {
@@ -46,16 +46,16 @@ func clientOpening(f *testing.F, cfg *Config, stream bool) []byte {
 // other: the session must end (no panic, no hang) once the input ends.
 func feed(t *testing.T, data []byte, serve func(ctx context.Context, p PipeIO) (*Conn, error)) {
 	a, b := net.Pipe()
-	go io.Copy(io.Discard, b)
+	go func() { _, _ = io.Copy(io.Discard, b) }()
 	go func() {
-		b.Write(data)
-		b.Close()
+		_, _ = b.Write(data)
+		_ = b.Close()
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c, err := serve(ctx, NetPipe(a))
 	if err != nil {
-		a.Close()
+		_ = a.Close()
 		return
 	}
 	go func() {
@@ -64,7 +64,7 @@ func feed(t *testing.T, data []byte, serve func(ctx context.Context, p PipeIO) (
 			if err != nil {
 				return
 			}
-			go func() { io.Copy(st, st); st.Close() }()
+			go func() { _, _ = io.Copy(st, st); _ = st.Close() }()
 		}
 	}()
 	go func() {
@@ -75,11 +75,11 @@ func feed(t *testing.T, data []byte, serve func(ctx context.Context, p PipeIO) (
 		}
 	}()
 	done := make(chan struct{})
-	go func() { c.Wait(); close(done) }()
+	go func() { _ = c.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		c.Close()
+		_ = c.Close()
 		select {
 		case <-done:
 		case <-time.After(3 * time.Second):
@@ -103,20 +103,20 @@ func FuzzListenerInput(f *testing.F) {
 	cfg := &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes....")},
 		MaxIdleTimeout: 2 * time.Second}
 	f.Add(clientOpening(f, cfg, false))
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Fuzz(func(_ *testing.T, data []byte) {
 		l := NewListener(&ListenerConfig{Config: cfg, FirstRecordTimeout: 500 * time.Millisecond})
-		defer l.Close()
+		defer func() { _ = l.Close() }()
 		a, b := net.Pipe()
-		go io.Copy(io.Discard, b)
+		go func() { _, _ = io.Copy(io.Discard, b) }()
 		go func() {
-			b.Write(data)
-			b.Close()
+			_, _ = b.Write(data)
+			_ = b.Close()
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		go func() {
 			if c, err := l.Accept(ctx); err == nil {
-				c.Close()
+				_ = c.Close()
 			}
 		}()
 		_ = l.HandlePipe(ctx, NetPipe(a), JoinHint{Source: "fuzz"})

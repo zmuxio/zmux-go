@@ -12,9 +12,9 @@ import (
 type Framing uint8
 
 const (
-	// ByteStream: records are concatenated with their Size fields.
+	// ByteStream concatenates records with their Size fields.
 	ByteStream Framing = iota
-	// Records: one message per record, without Size (WebSocket); the
+	// Records carries one message per record, without Size (WebSocket); the
 	// halves implement MessageReader and MessageWriter.
 	Records
 )

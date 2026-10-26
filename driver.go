@@ -16,23 +16,23 @@ import (
 // goroutine owns its half (the write token) and its batch; halves are
 // closed through hc (lane 0) or their laneOut exactly once each.
 type pipeDrv struct {
-	c       *Conn
-	id      uint64
-	hc      *halfCloser
-	framing Framing
-	wsig    *core.Signal // wakes the lane-0 writer
-	opener  laneOpener   // nil: the carrier offers no lanes
-	tcp     tcpInfo      // the TCP socket under the carrier, if any
-	outer   *Conn        // the outer session of a stream-backed carrier
-	dead    bool         // replaced (early-data restart): its goroutines report nothing (under the lock)
-
-	smu      sync.Mutex // leaf: shutdown request of lane 0
-	shutdown bool
-	gs       pipeGoroutines // the attachment's goroutines (HandlePipe waits on them)
+	c      *Conn
+	id     uint64
+	hc     *halfCloser
+	wsig   *core.Signal   // wakes the lane-0 writer
+	opener laneOpener     // nil: the carrier offers no lanes
+	tcp    tcpInfo        // the TCP socket under the carrier, if any
+	outer  *Conn          // the outer session of a stream-backed carrier
+	gs     pipeGoroutines // the attachment's goroutines (HandlePipe waits on them)
 
 	// Guarded by the session lock.
 	lanes   map[uint64]*laneOut // outbound lanes above 0
 	inLanes []io.ReadCloser     // inbound lanes above 0
+	dead    bool                // replaced (early-data restart): its goroutines report nothing
+
+	smu      sync.Mutex // leaf: shutdown request of lane 0
+	shutdown bool
+	framing  Framing
 }
 
 // laneOut is the writer side of one outbound lane above 0.
@@ -316,7 +316,6 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 			core.PutBatch(b)
 		}
 	}()
-	var wn int
 	var werr error
 	for {
 		if lo == nil && pd.takeShutdown() {
@@ -336,7 +335,7 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 		}
 		now := c.clk.now()
 		if reported {
-			c.s.WriteDone(b, wn, werr, now)
+			c.s.WriteDone(b, werr, now)
 			reported = false
 		}
 		if lane == 0 {
@@ -352,7 +351,7 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 		closing := c.closing
 		c.unlock()
 		if produced {
-			wn, werr = writeBatch(w, pd.framing, b)
+			_, werr = writeBatch(w, pd.framing, b)
 			reported = true
 			if b.Shutdown {
 				if lo == nil {

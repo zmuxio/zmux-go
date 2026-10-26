@@ -76,12 +76,12 @@ type limProbeState struct {
 	since      Time
 	length     Duration
 	startSent  uint64
-	drained    bool
 	drainedAt  Time
 	oldBase    Duration
 	afterDrain Duration
-	hasAfter   bool
 	rq         float64
+	drained    bool
+	hasAfter   bool
 	hasRq      bool
 }
 
@@ -136,7 +136,7 @@ func (l *limiter) downDone(rate float64, srtt Duration, p *limParams) bool {
 // walk runs the cycle on to t: the phase reached, its start and the gain
 // integral from phaseSince to t in seconds.
 func (l *limiter) walk(t Time, unit Duration, downDone bool) (int, Time, float64) {
-	u := int64(max(unit, 1))
+	u := max(unit, 1)
 	plen := func(k int) int64 {
 		switch {
 		case k == downPhase && downDone:
@@ -146,7 +146,7 @@ func (l *limiter) walk(t Time, unit Duration, downDone bool) (int, Time, float64
 		}
 		return u
 	}
-	left := int64(t.Sub(l.phaseSince))
+	left := t.Sub(l.phaseSince)
 	if left < 0 {
 		left = 0
 	}
@@ -182,7 +182,7 @@ func (l *limiter) walk(t Time, unit Duration, downDone bool) (int, Time, float64
 		}
 	}
 	gain += gainCycle[k] * float64(left)
-	return k, l.phaseSince.Add(Duration(start)), gain / 1e9
+	return k, l.phaseSince.Add(start), gain / 1e9
 }
 
 func (l *limiter) gain(now Time, rate float64, srtt Duration, p *limParams) float64 {
@@ -194,6 +194,8 @@ func (l *limiter) gain(now Time, rate float64, srtt Duration, p *limParams) floa
 	case limCruise:
 		k, _, _ := l.walk(now, l.unit(srtt), l.downDone(rate, srtt, p))
 		return gainCycle[k]
+	case limProbe:
+		// The probe paces at the measured rate.
 	}
 	return 1
 }
@@ -319,6 +321,8 @@ func (l *limiter) onAck(now Time, ev *limAck, e *rateEst, srtt Duration, p *limP
 	inFlight := ev.sent - min64(ev.sent, ev.acked)
 	inFlight -= min64(inFlight, ev.held)
 	switch l.mode {
+	case limStartup, limCruise:
+		// Phase changes come from refresh below.
 	case limDrain:
 		bdp := uint64(rate * float64(base) / 1e9)
 		if l.standing(srtt) <= p.budget || inFlight <= max64(bdp, p.slack(rate)) {
@@ -416,7 +420,7 @@ func (l *limiter) endProbe(now Time, e *rateEst, p *limParams) {
 
 // leftOut is the held bytes left out of the bytes in flight: all of them
 // during start-up, their smallest count over the last RTT_base afterwards.
-func (l *limiter) leftOut(now Time, held uint64) uint64 {
+func (l *limiter) leftOut(held uint64) uint64 {
 	if l.mode == limStartup {
 		return held
 	}

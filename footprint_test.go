@@ -94,7 +94,7 @@ func fpMPPairs(t *testing.T, l *Listener, n int) [][2]*Conn {
 	standby := true
 	for i := range out {
 		a, b := net.Pipe()
-		go l.HandlePipe(ctx, NetPipe(b), JoinHint{})
+		go func() { _ = l.HandlePipe(ctx, NetPipe(b), JoinHint{}) }()
 		c, err := Dial(ctx, a, fpMPConfig())
 		if err != nil {
 			t.Fatal(err)
@@ -104,7 +104,7 @@ func fpMPPairs(t *testing.T, l *Listener, n int) [][2]*Conn {
 			t.Fatal(err)
 		}
 		a2, b2 := net.Pipe()
-		go l.HandlePipe(ctx, NetPipe(b2), JoinHint{})
+		go func() { _ = l.HandlePipe(ctx, NetPipe(b2), JoinHint{}) }()
 		if _, err := c.AddPipe(ctx, NetPipe(a2), PipeOptions{SendStandby: &standby, ReceiveStandby: true}); err != nil {
 			t.Fatal(err)
 		}
@@ -115,12 +115,12 @@ func fpMPPairs(t *testing.T, l *Listener, n int) [][2]*Conn {
 
 func closePairs(v [][2]*Conn) {
 	for _, p := range v {
-		p[0].Close()
-		p[1].Close()
+		_ = p[0].Close()
+		_ = p[1].Close()
 	}
 	for _, p := range v {
-		p[0].Wait()
-		p[1].Wait()
+		_ = p[0].Wait()
+		_ = p[1].Wait()
 	}
 }
 
@@ -146,9 +146,9 @@ func TestFootprint(t *testing.T) {
 	warmup := fpPairs(t, fpN)
 	for _, p := range warmup {
 		st, _ := p[0].OpenStreamSync(context.Background())
-		st.Write([]byte{1})
+		_, _ = st.Write([]byte{1})
 		ss, _ := p[1].AcceptStream(context.Background())
-		io.ReadFull(ss, make([]byte, 1))
+		_, _ = io.ReadFull(ss, make([]byte, 1))
 	}
 	closePairs(warmup)
 	warmGoroutines(20 * fpN)
@@ -157,8 +157,8 @@ func TestFootprint(t *testing.T) {
 	before := heapNow()
 	if f := os.Getenv("ZMUX_FOOTPRINT_PROFILE"); f != "" && os.Getenv("ZMUX_FOOTPRINT_PRECISE") != "" {
 		if w, err := os.Create(f + ".before"); err == nil {
-			pprof.WriteHeapProfile(w)
-			w.Close()
+			_ = pprof.WriteHeapProfile(w)
+			_ = w.Close()
 		}
 	}
 	v := fpPairs(t, fpN)
@@ -166,8 +166,8 @@ func TestFootprint(t *testing.T) {
 	after := heapNow()
 	if f := os.Getenv("ZMUX_FOOTPRINT_PROFILE"); f != "" {
 		if w, err := os.Create(f); err == nil {
-			pprof.WriteHeapProfile(w)
-			w.Close()
+			_ = pprof.WriteHeapProfile(w)
+			_ = w.Close()
 		}
 	}
 	check("idle session pair, in-memory pipe", float64(after-before)/fpN, 17408)
@@ -182,7 +182,7 @@ func TestFootprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tl.Close()
+	defer func() { _ = tl.Close() }()
 	closePairs(fpPairsOver(t, fpN, tl))
 	time.Sleep(idle)
 	before = heapNow()
@@ -217,7 +217,7 @@ func TestFootprint(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		st.Write([]byte{1})
+		_, _ = st.Write([]byte{1})
 		streams = append(streams, [2]*Stream{st, nil})
 	}
 	for i := range streams {
@@ -225,31 +225,30 @@ func TestFootprint(t *testing.T) {
 		if !ok {
 			t.Fatal("accept failed")
 		}
-		io.ReadFull(st, make([]byte, 1))
+		_, _ = io.ReadFull(st, make([]byte, 1))
 		streams[i][1] = st
 	}
 	time.Sleep(idle)
 	after = heapNow()
 	if f := os.Getenv("ZMUX_FOOTPRINT_PROFILE"); f != "" {
 		if w, err := os.Create(f + ".streams"); err == nil {
-			pprof.WriteHeapProfile(w)
-			w.Close()
+			_ = pprof.WriteHeapProfile(w)
+			_ = w.Close()
 		}
 	}
 	check("idle stream (both ends)", float64(after-before)/nst, 1536)
 	runtime.KeepAlive(streams)
-	streams = nil
-	sc.Close()
-	ss.Close()
-	sc.Wait()
-	ss.Wait()
+	_ = sc.Close()
+	_ = ss.Close()
+	_ = sc.Wait()
+	_ = ss.Wait()
 
 	// Multipath: two pipe pairs, the second standby, after the join.
 	warm := NewListener(&ListenerConfig{Config: fpMPConfig()})
 	closePairs(fpMPPairs(t, warm, fpN))
-	warm.Close()
+	_ = warm.Close()
 	l := NewListener(&ListenerConfig{Config: fpMPConfig()})
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	time.Sleep(idle)
 	g0 = runtime.NumGoroutine()
 	before = heapNow()

@@ -40,7 +40,7 @@ func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
 			if err != nil {
 				return
 			}
-			go e.lst.HandlePipe(ctx, NetPipe(c), JoinHint{})
+			go func() { _ = e.lst.HandlePipe(ctx, NetPipe(c), JoinHint{}) }()
 		}
 	}()
 	dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
@@ -58,12 +58,12 @@ func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		e.client.Close()
-		e.server.Close()
+		_ = e.client.Close()
+		_ = e.server.Close()
 		waitDone(t, e.client)
 		waitDone(t, e.server)
-		ln.Close()
-		e.lst.Close()
+		_ = ln.Close()
+		_ = e.lst.Close()
 		cancel()
 	})
 	return e
@@ -127,7 +127,7 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 	if _, err := s.Write(payload[half:]); err != nil {
 		t.Fatal(err)
 	}
-	s.Close()
+	_ = s.Close()
 	got := <-done
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("received %d bytes, want %d intact", len(got), len(payload))

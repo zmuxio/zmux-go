@@ -5,41 +5,29 @@ package core
 // estimates of SCHEDULER.md 2.
 type PipeInfo struct {
 	ID           uint64
-	HasOut       bool
-	HasIn        bool
 	OutState     string
 	InState      string
-	Revalidating bool
 	AttachedFor  Duration
 	SuspectCount uint64
 	FailureCount uint64
 
 	SendPriority    uint64
 	PrioritySource  string // local, peer, default
-	Standby         bool
 	StandbySource   string
 	ReceivePriority uint64
-	ReceiveStandby  bool
 	StatusSeq       uint64
-	PeerRequest     bool // a peer request exists
-	PeerStandby     bool
 	PeerPriority    uint64
 	Weight          uint64
-	InProbation     bool
 	ProbationUntil  Time
-	Eligible        bool
 
 	SmoothedRTT  Duration
 	MinRTT       Duration
 	RTTVar       Duration
 	OWD          Duration
-	HasRTT       bool
 	DeliveryRate float64 // bytes/s
 	RTTSource    string  // ack, kernel, ping
 
 	QueuedBytes   uint64
-	Writable      bool
-	Saturated     bool
 	BytesInFlight uint64
 
 	BytesSent          uint64
@@ -54,6 +42,19 @@ type PipeInfo struct {
 	SinceLastAck     Duration
 	SinceLastReceive Duration
 	Lanes            int
+
+	HasOut         bool
+	HasIn          bool
+	Revalidating   bool
+	Standby        bool
+	ReceiveStandby bool
+	PeerRequest    bool // a peer request exists
+	PeerStandby    bool
+	InProbation    bool
+	Eligible       bool
+	HasRTT         bool
+	Writable       bool
+	Saturated      bool
 }
 
 // PipeIDs returns the IDs of the session's attachments.

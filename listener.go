@@ -252,6 +252,7 @@ func (l *Listener) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) erro
 		return l.join(ctx, withPrefix(p, first), j, mac, nil, true)
 	case core.ClassLane:
 		return handleLane(ctx, withPrefix(p, first), first)
+	case core.ClassMore, core.ClassReject:
 	}
 	closePipeIO(p)
 	return errRejected
@@ -363,7 +364,7 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO) error {
 	}
 	l.mu.Unlock()
 	if full {
-		c.CloseWithError(0, "refused")
+		c.closeWith(0, "refused")
 		return errRejected
 	}
 	return c.waitPipe(ctx, 0)
@@ -449,12 +450,12 @@ func (l *Listener) sessionSuspended(c *Conn) []*Conn {
 	defer l.mu.Unlock()
 	l.dropSuspended(c)
 	l.suspended = append(l.suspended, c)
-	max := l.cfg.MaxSuspended
-	if max <= 0 {
-		max = 1024
+	limit := l.cfg.MaxSuspended
+	if limit <= 0 {
+		limit = 1024
 	}
 	var over []*Conn
-	for len(l.suspended) > max {
+	for len(l.suspended) > limit {
 		over = append(over, l.suspended[0])
 		l.suspended = l.suspended[1:]
 	}
@@ -524,6 +525,7 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint JoinHint, src 
 		}
 		<-me.end
 		return nil
+	case core.PairDone:
 	}
 	other := partner.(*pairWait)
 	up, down := p, other.p

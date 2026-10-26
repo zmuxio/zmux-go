@@ -39,7 +39,7 @@ func TestQMuxInteropServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	p := startPeerEnv(t, "ZMUX_QMUX_PEER", "client", ln.Addr().String())
 	nc, err := ln.Accept()
 	if err != nil {
@@ -85,7 +85,7 @@ func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	// Our reset reaches the peer with the bytes delivered before it.
 	{
 		st, _ := c.OpenStreamSync(ctx)
-		st.Write([]byte("count\nabc"))
+		_, _ = st.Write([]byte("count\nabc"))
 		st.SetReliableBoundary()
 		st.CancelWrite(0x3fffffff)
 		// With reset_stream_at the bytes before the reset are counted too.
@@ -100,8 +100,8 @@ func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	// Our STOP_SENDING stops the peer's flood.
 	{
 		st, _ := c.OpenStreamSync(ctx)
-		st.Write([]byte("flood\n"))
-		st.Close()
+		_, _ = st.Write([]byte("flood\n"))
+		_ = st.Close()
 		buf := make([]byte, 4096)
 		if _, err := io.ReadAtLeast(st, buf, 2048); err != nil {
 			t.Fatal(err)
@@ -114,8 +114,8 @@ func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	// The peer's reset.
 	{
 		st, _ := c.OpenStreamSync(ctx)
-		st.Write([]byte("reset:33\n"))
-		st.Close()
+		_, _ = st.Write([]byte("reset:33\n"))
+		_ = st.Close()
 		_, err := io.ReadAll(st)
 		var se *StreamError
 		if !errors.As(err, &se) || se.ErrorCode != 33 {
@@ -129,8 +129,8 @@ func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 			return
 		}
 		b, _ := io.ReadAll(st)
-		st.Write(append([]byte("re:"), b...))
-		st.Close()
+		_, _ = st.Write(append([]byte("re:"), b...))
+		_ = st.Close()
 	}()
 	if r := qmuxCommand(t, ctx, c, "open-bidi:hi", nil); r != "opened=re:hi" {
 		t.Fatalf("open-bidi: %q", r)
@@ -143,8 +143,8 @@ func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	}
 	// Unidirectional echo and datagrams.
 	us, _ := c.OpenUniStreamSync(ctx)
-	us.Write([]byte("ue"))
-	us.Close()
+	_, _ = us.Write([]byte("ue"))
+	_ = us.Close()
 	if r := uniReport(t, ctx, c); r != "ue" {
 		t.Fatalf("uni echo: %q", r)
 	}

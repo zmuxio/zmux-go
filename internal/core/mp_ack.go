@@ -9,7 +9,7 @@ func (s *Session) mpAckEntry(e wire.AckEntry, now Time) *wire.Error {
 	p := s.pipe(e.PipeID)
 	if p == nil {
 		if s.ownParity(e.PipeID) && e.PipeID >= m.nextID {
-			return wire.Errorf(wire.ProtocolViolation, "PIPE_ACK for an untaken pipe ID", "pipe", e.PipeID)
+			return wire.NewError(wire.ProtocolViolation, "PIPE_ACK for an untaken pipe ID", "pipe", e.PipeID)
 		}
 		if !s.ownParity(e.PipeID) && e.Position > 0 && !m.idRetired(e.PipeID) {
 			return s.ackBeyondSent(e)
@@ -45,11 +45,11 @@ func (s *Session) mpAckEntry(e wire.AckEntry, now Time) *wire.Error {
 // ackBeyondSent: the peer claims data never sent (MULTIPATH.md 6.2,
 // RESUME.md 7).
 func (s *Session) ackBeyondSent(e wire.AckEntry) *wire.Error {
-	code := uint64(wire.ProtocolViolation)
+	code := wire.ProtocolViolation
 	if s.feat.Resume {
 		code = wire.ResumeFailed
 	}
-	return wire.Errorf(code, "PIPE_ACK position beyond the bytes sent", "pipe", e.PipeID, "pos", e.Position)
+	return wire.NewError(code, "PIPE_ACK position beyond the bytes sent", "pipe", e.PipeID, "pos", e.Position)
 }
 
 // mpAdvanced updates the pipe after its acknowledged position advanced.
@@ -75,6 +75,8 @@ func (s *Session) mpAdvanced(p *Pipe, ol *outLane, ps *pipeSend, now Time) {
 			s.emitPipeState(p)
 			s.checkTakeover()
 		}
+	case outNone, outActive, outDraining, outFailed, outClosed:
+		// An acknowledgement changes no other state.
 	}
 	s.revalAcked(p)
 	s.penaltyAcked(p)
@@ -119,7 +121,7 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 		if q == nil {
 			if s.ownParity(f.PipeID) {
 				if f.PipeID >= m.nextID {
-					return wire.Errorf(wire.ProtocolViolation, "PIPE_ABANDON for an untaken pipe ID", "pipe", f.PipeID)
+					return wire.NewError(wire.ProtocolViolation, "PIPE_ABANDON for an untaken pipe ID", "pipe", f.PipeID)
 				}
 				return nil
 			}
@@ -134,6 +136,12 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 		s.peerAbandon(q, f.Code)
 	case wire.KindPipeStatus:
 		return s.onPipeStatus(f)
+	case wire.KindPadding, wire.KindStream, wire.KindResetStream, wire.KindResetStreamAt,
+		wire.KindStopSending, wire.KindMaxData, wire.KindMaxStreamData, wire.KindMaxStreams,
+		wire.KindDataBlocked, wire.KindStreamDataBlocked, wire.KindStreamsBlocked, wire.KindClose,
+		wire.KindDatagram, wire.KindTransportParams, wire.KindPing, wire.KindGoAway,
+		wire.KindPriorityUpdate, wire.KindPipeJoin, wire.KindPipeAck, wire.KindPipeLane:
+		// Not a pipe frame; dispatch routes only the three above here.
 	}
 	return nil
 }

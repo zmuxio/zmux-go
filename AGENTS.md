@@ -1,10 +1,10 @@
 # AGENTS.md
 
 - Three modules: the root `github.com/zmuxio/zmux-go`, `zmuxquic/` and
-  `zmuxh3/`. The sub-modules require the root through a `replace` directive;
-  run every check below in each module.
+  `zmuxh3/`. The root `go.work` resolves the root module locally for the
+  sub-modules (no `replace` directives); run every check below in each module.
 - Before you finish, `gofmt -l .` must print nothing and `go vet ./...` and
-  `go test -race ./...` must pass in every module.
+  `go test -race ./...` and `golangci-lint run` must pass in every module.
 - The root module depends on the standard library only (plus
   `golang.org/x` where already required); QUIC and HTTP/3 dependencies live
   in the sub-modules.

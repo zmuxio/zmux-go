@@ -11,25 +11,25 @@ const (
 
 // probState is the probation of one outbound pipe.
 type probState struct {
-	on        bool
 	start     Time
 	k         int
 	ping      Time
+	upSince   Time
+	on        bool
 	pinged    bool
 	upCounted bool // the current ACTIVE period counts for the uptime cap
-	upSince   Time
 }
 
 // history is the probation history of a path: a pipe of fate group 0, or a
 // non-zero fate group of a joiner in one direction.
 type history struct {
 	k       int
-	ended   bool
 	endAt   Time
 	endBase Duration
+	uMax    Duration
+	ended   bool
 	pending bool // trouble in or soon after a probation: the next one raises k
 	trouble bool // the path has been suspect or failed
-	uMax    Duration
 	hasUMax bool
 }
 

@@ -14,9 +14,7 @@ type ackState struct {
 	delay     Duration // own zmux_max_ack_delay
 	peerDelay Duration // peer's zmux_max_ack_delay
 	immediate bool     // a PIPE_PING asked for an immediate PIPE_ACK
-	full      bool     // the next snapshot must be complete
 	woken     bool     // the delay expired and the writers were woken
-	lastFull  Time
 }
 
 // pipeSend is the sender's view of an outbound pipe as a whole, counted
@@ -122,7 +120,7 @@ func (a *ackState) srttMax() Duration {
 }
 
 // onRecord accounts a processed inbound record (MULTIPATH.md 6.3).
-func (a *ackState) onRecord(p *Pipe, il *inLane, n uint64, f recordFacts, now Time) {
+func (a *ackState) onRecord(il *inLane, n uint64, f recordFacts, now Time) {
 	if f.elicit {
 		if il.elicit == 0 {
 			il.elicitAt = now
@@ -147,7 +145,7 @@ func (a *ackState) due(now Time) bool {
 			continue
 		}
 		var sum uint64
-		var first Time = Never
+		first := Never
 		for _, il := range p.in.lanes {
 			if il.elicit > 0 {
 				sum += il.elicit
@@ -345,21 +343,24 @@ func (a *ackState) onPipeAck(f *wire.Frame, now Time) *wire.Error {
 			continue
 		}
 		if e.PipeID != 0 {
-			return wire.Errorf(wire.ProtocolViolation, "PIPE_ACK for a pipe other than 0", "pipe", e.PipeID)
+			return wire.NewError(wire.ProtocolViolation, "PIPE_ACK for a pipe other than 0", "pipe", e.PipeID)
 		}
 		if e.Position == 0 {
 			continue
 		}
 		p := s.pipe(0)
-		ol := p.out.lane(e.Lane)
+		var ol *outLane
+		if p != nil && p.out != nil {
+			ol = p.out.lane(e.Lane)
+		}
 		if ol == nil {
-			return wire.Errorf(wire.ProtocolViolation, "PIPE_ACK for an unopened lane", "pipe", 0, "value", e.Lane)
+			return wire.NewError(wire.ProtocolViolation, "PIPE_ACK for an unopened lane", "pipe", 0, "value", e.Lane)
 		}
 		if ol.refused {
 			continue
 		}
 		if e.Position > ol.pos {
-			return wire.Errorf(wire.ProtocolViolation, "PIPE_ACK position beyond the bytes sent",
+			return wire.NewError(wire.ProtocolViolation, "PIPE_ACK position beyond the bytes sent",
 				"pipe", 0, "pos", e.Position)
 		}
 		if e.Position <= ol.acked {
@@ -407,7 +408,7 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 			// A late entry (ACK Delay above the peer's maximum, typically
 			// the redundant copy) gives no RTT sample, unless the pipe has
 			// had none for 1 s (SCHEDULER.md 2.1).
-			late := ad > a.peerDelay && !(ps.rttAt != 0 && now.Sub(ps.rttAt) >= Second)
+			late := ad > a.peerDelay && (ps.rttAt == 0 || now.Sub(ps.rttAt) < Second)
 			if !late && (p.mp == nil || p.mp.sampleOK(last.sent)) {
 				ev.rtt = r.update(rtt, minD(ad, a.peerDelay), a.peerDelay, now)
 				ev.rttSentAt = last.sent

@@ -19,7 +19,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go"
 )
 
 func tlsConfigs(t *testing.T) (*tls.Config, *tls.Config) {
@@ -44,8 +44,8 @@ func echo(t *testing.T, c, s *zmux.Conn) {
 	go func() {
 		st, err := s.AcceptStream(ctx)
 		if err == nil {
-			io.Copy(st, st)
-			st.Close()
+			_, _ = io.Copy(st, st)
+			_ = st.Close()
 		}
 	}()
 	st, err := c.OpenStreamSync(ctx)
@@ -54,7 +54,7 @@ func echo(t *testing.T, c, s *zmux.Conn) {
 	}
 	msg := make([]byte, 512<<10)
 	rand.Read(msg)
-	go func() { st.Write(msg); st.Close() }()
+	go func() { _, _ = st.Write(msg); _ = st.Close() }()
 	got, err := io.ReadAll(st)
 	if err != nil || !bytes.Equal(got, msg) {
 		t.Fatalf("echo %d bytes %v", len(got), err)
@@ -71,16 +71,16 @@ func pskCfg() *zmux.Config {
 func TestHTTP3RequestStream(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
 	lst := zmux.NewListener(&zmux.ListenerConfig{Config: pskCfg()})
-	defer lst.Close()
+	defer func() { _ = lst.Close() }()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := Server("", srvTLS, nil, lst)
-	go srv.Serve(pc)
-	defer srv.Close()
+	go func() { _ = srv.Serve(pc) }()
+	defer func() { _ = srv.Close() }()
 	client, tr := Client(cliTLS, nil)
-	defer tr.Close()
+	defer func() { _ = tr.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	url := "https://" + pc.LocalAddr().String() + "/"
@@ -97,16 +97,16 @@ func TestHTTP3RequestStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	echo(t, c, s)
-	c.Close()
-	s.Close()
-	c.Wait()
-	s.Wait()
+	_ = c.Close()
+	_ = s.Close()
+	_ = c.Wait()
+	_ = s.Wait()
 }
 
 func TestWebTransport(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
 	lst := zmux.NewListener(&zmux.ListenerConfig{Config: cfg()})
-	defer lst.Close()
+	defer func() { _ = lst.Close() }()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -116,8 +116,8 @@ func TestWebTransport(t *testing.T) {
 	webtransport.ConfigureHTTP3Server(h3)
 	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
 	h3.Handler = Handler(ws, lst)
-	go ws.Serve(pc)
-	defer ws.Close()
+	go func() { _ = ws.Serve(pc) }()
+	defer func() { _ = ws.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
@@ -125,7 +125,7 @@ func TestWebTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sess.CloseWithError(0, "")
+	defer func() { _ = sess.CloseWithError(0, "") }()
 	s, err := lst.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -159,8 +159,8 @@ func TestWebTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	echo(t, c, s)
-	c.Close()
-	s.Close()
-	c.Wait()
-	s.Wait()
+	_ = c.Close()
+	_ = s.Close()
+	_ = c.Wait()
+	_ = s.Wait()
 }

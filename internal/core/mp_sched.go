@@ -18,14 +18,14 @@ const (
 type decision struct {
 	p            *Pipe
 	g            *gate
+	fastest      *Pipe // the eligible pipe of p's tier with the smallest ETA for a chunk
+	lv           *levelStats
+	tier         int
+	multiTier    bool
 	open         bool
 	usable       bool
 	takes        bool
 	joiningTakes bool
-	tier         int
-	multiTier    bool
-	fastest      *Pipe // the eligible pipe of p's tier with the smallest ETA for a chunk
-	lv           *levelStats
 }
 
 // newDecision prepares the decision for pipe p now.
@@ -94,21 +94,19 @@ func (s *Session) onPipe(d *decision, st *Stream) bool {
 		return d.usable && s.chosen(p, s.affinityTarget(d, st))
 	case PolicyCustom:
 		return s.customOK(d, st)
-	}
-	if !d.takes {
-		return false
-	}
-	switch s.policyOf(st) {
 	case PolicySpreadETA:
+		if !d.takes {
+			return false
+		}
 		if s.spreadETAOK(d, st) {
 			return true
 		}
 		s.chosen(p, d.fastest)
 		return false
 	case PolicySpreadRoundRobin, PolicySpreadRateWeighted:
-		return s.chosen(p, s.rrPick(d.g, d.tier, st))
+		return d.takes && s.chosen(p, s.rrPick(d.g, d.tier, st))
 	case PolicySessionAffinity:
-		return s.chosen(p, d.g.tiers[d.tier].active)
+		return d.takes && s.chosen(p, d.g.tiers[d.tier].active)
 	}
 	return false
 }
@@ -137,6 +135,8 @@ func (s *Session) chunkSent(d *decision, w *recWriter, st *Stream, off, n uint64
 		}
 	case PolicyCustom:
 		s.customUsed(st, n)
+	case PolicySessionAffinity, PolicySpreadETA:
+		// No per-chunk state.
 	}
 	if d.g != nil {
 		s.copyChunk(d, w, st, off, n, fin)
@@ -491,10 +491,10 @@ type rrVal struct {
 // binding is the pipe an affinity stream direction is bound to.
 type binding struct {
 	pipe        uint64
-	set         bool
-	provisional bool
 	epoch       uint64
 	moveTo      uint64
+	set         bool
+	provisional bool
 	moving      bool
 }
 
@@ -641,9 +641,9 @@ func (s *Session) bindOnSend(d *decision, st *Stream) {
 
 // affinityState is the re-evaluation state of affinity bindings.
 type affinityState struct {
-	provisional bool
 	seen        []uint64
 	epoch       uint64
+	provisional bool
 	stale       bool
 }
 
@@ -801,25 +801,25 @@ func (s *Session) customUsed(st *Stream, n uint64) {
 
 // pickAnswer is the custom answer a stream direction holds.
 type pickAnswer struct {
-	set     bool
-	wait    bool
 	pipe    uint64
 	left    uint64 // 0: until invalidated
 	gen     uint64
 	epoch   uint64
-	asked   bool
 	askedAt Time
+	set     bool
+	wait    bool
+	asked   bool
 }
 
 // PickFrame is a stream direction waiting for a custom decision.
 type PickFrame struct {
 	Stream       uint64
-	Urgency      uint8
 	Len          uint64 // bytes ready to place
+	EligibleTier uint64
 	LastPipe     uint64
 	HasLastPipe  bool
-	EligibleTier uint64
 	HasTier      bool
+	Urgency      uint8
 }
 
 // PickPipe is the value-only view of a pipe for a custom policy.
@@ -831,21 +831,21 @@ type PickPipe struct {
 	Rate      uint64
 	Unsent    uint64
 	InFlight  uint64
-	Writable  bool
 	Priority  uint64
+	Weight    uint64
+	Writable  bool
 	Standby   bool
 	Saturated bool
 	Probation bool
 	Eligible  bool
-	Weight    uint64
 }
 
 // PickAnswer is a policy's answer for one direction: a pipe index of the
 // view and the bytes it covers (0: until invalidated), or Wait.
 type PickAnswer struct {
-	Wait  bool
 	Index int
 	Bytes uint64
+	Wait  bool
 }
 
 // PickRequest is one call of the custom policy.

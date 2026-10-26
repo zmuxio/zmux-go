@@ -18,7 +18,7 @@ func (s *Session) limInFlight(p *Pipe) (uint64, uint64) {
 	raw := ps.elicitEnd - min64(ps.elicitEnd, ps.cum)
 	held := s.heldBytes(p)
 	if ps.lim != nil {
-		return raw - min64(raw, ps.lim.leftOut(s.now, held)), held
+		return raw - min64(raw, ps.lim.leftOut(held)), held
 	}
 	return raw, held
 }
@@ -96,7 +96,7 @@ func (s *Session) paceAck(p *Pipe, ev *limAck) {
 	ev.sent = max64(ps.elicitEnd, ps.cum)
 	held := s.heldBytes(p)
 	l.heldMin.update(s.now, float64(held), l.baseOr(s.srttOf(p)))
-	ev.held = l.leftOut(s.now, held)
+	ev.held = l.leftOut(held)
 	pp := s.limParams()
 	wasHeld := l.held
 	l.onAck(s.now, ev, &ps.re, s.srttOf(p), &pp)

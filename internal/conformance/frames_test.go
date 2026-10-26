@@ -198,8 +198,6 @@ func (c *encodeCtx) intField(v any) (uint64, bool) {
 	return num(v), false
 }
 
-func get(m map[string]any, k string) any { return m[k] }
-
 func getU(m map[string]any, k string) uint64 {
 	if v, ok := m[k]; ok && v != nil {
 		return num(v)
@@ -380,14 +378,6 @@ func (c *encodeCtx) encodeBody(r any) []byte {
 
 // ---- decoded frames as JSON-like objects ----
 
-var paramNames = func() map[uint64]string {
-	m := map[uint64]string{}
-	for k, v := range paramIDs {
-		m[v] = k
-	}
-	return m
-}()
-
 // frameObj converts a decoded frame to the field map of TRACES.md 6.
 func frameObj(f *wire.Frame) map[string]any {
 	o := map[string]any{"type": f.Kind.String()}
@@ -450,6 +440,8 @@ func frameObj(f *wire.Frame) map[string]any {
 	case wire.KindPipeStatus:
 		o["pipe"], o["seq"], o["priority"] = f.PipeID, f.Seq, f.Priority
 		o["status"] = []string{"available", "standby"}[f.Status]
+	case wire.KindPipePing:
+		// The type alone.
 	}
 	return o
 }

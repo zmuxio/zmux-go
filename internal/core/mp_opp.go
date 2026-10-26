@@ -46,19 +46,19 @@ func (s *Session) opportunistic(d *decision, w *recWriter) {
 		return
 	}
 	for _, st := range m.blocked {
-		if !s.oppSend(d, w, f, st) {
+		if !s.oppSend(w, f, st) {
 			return
 		}
 	}
 	if connBlocked {
-		s.oppSend(d, w, f, nil)
+		s.oppSend(w, f, nil)
 	}
 }
 
 // oppSend re-sends one chunk of blocking data on f; st nil means the
 // session's blocking data (the unacknowledged stream data sent first). It
 // returns false when the batch is full.
-func (s *Session) oppSend(d *decision, w *recWriter, f *Pipe, st *Stream) bool {
+func (s *Session) oppSend(w *recWriter, f *Pipe, st *Stream) bool {
 	p, e := s.blockingFrame(f, st)
 	if e == nil {
 		return true

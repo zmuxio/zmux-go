@@ -78,6 +78,8 @@ const HasAnyZmux = HasRole | HasGoAway | HasPreamble | HasPriority | HasFlows | 
 // Params is a set of transport parameters.
 type Params struct {
 	Has                  uint32
+	SecretFlags          uint8
+	SessionNonce         [16]byte
 	MaxIdleTimeout       uint64 // ms
 	InitialMaxData       uint64
 	MaxStreamDataBidiLoc uint64
@@ -90,8 +92,6 @@ type Params struct {
 	Role                 uint64
 	RoleNonce            uint64
 	Preamble             uint64
-	SecretFlags          uint8
-	SessionNonce         [16]byte
 	Locator              []byte
 	AckThreshold         uint64
 	MaxAckDelay          uint64 // ms
@@ -100,10 +100,10 @@ type Params struct {
 	ResumeGrace          uint64 // ms
 	AppProtocols         [][]byte
 
-	// GREASE parameters to send (encoding only).
+	// GREASE parameter to send (encoding only); GreaseID 0: none (a
+	// GREASE ID is never 0).
 	GreaseID    uint64
 	GreaseValue []byte
-	HasGrease   bool
 }
 
 // IsZmux reports whether the parameters identify a zmux endpoint.
@@ -389,7 +389,7 @@ func AppendParams(b []byte, p *Params) []byte {
 		}
 		b = appendParam(b, ParamAppProtocols, v)
 	}
-	if p.HasGrease {
+	if p.GreaseID != 0 {
 		b = appendParam(b, p.GreaseID, p.GreaseValue)
 	}
 	return b

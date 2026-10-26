@@ -17,7 +17,7 @@ func TestHTTPCarriers(t *testing.T) {
 	lst := NewListener(&ListenerConfig{Config: mpConfig()})
 	srv := httptest.NewServer(lst)
 	defer srv.Close()
-	defer lst.Close()
+	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, mode := range []string{"duplex", "split"} {
@@ -41,16 +41,16 @@ func TestHTTPCarriers(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() {
-				c.Close()
-				s.Close()
+				_ = c.Close()
+				_ = s.Close()
 				waitDone(t, c)
 				waitDone(t, s)
 			}()
 			go func() {
 				st, err := s.AcceptStream(ctx)
 				if err == nil {
-					io.Copy(st, st)
-					st.Close()
+					_, _ = io.Copy(st, st)
+					_ = st.Close()
 				}
 			}()
 			st, err := c.OpenStreamSync(ctx)
@@ -59,7 +59,7 @@ func TestHTTPCarriers(t *testing.T) {
 			}
 			msg := make([]byte, 256<<10)
 			rand.Read(msg)
-			go func() { st.Write(msg); st.Close() }()
+			go func() { _, _ = st.Write(msg); _ = st.Close() }()
 			got, err := io.ReadAll(st)
 			if err != nil || !bytes.Equal(got, msg) {
 				t.Fatalf("echo over HTTP %s: %d bytes, %v", mode, len(got), err)

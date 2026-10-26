@@ -28,7 +28,7 @@ type AddPipeResult uint8
 
 const (
 	AddPipeOK AddPipeResult = iota
-	// AddPipePending: the cap or the refusal backoff holds the join; the
+	// AddPipePending means the cap or the refusal backoff holds the join; the
 	// carrier waits and joins once allowed (MULTIPATH.md 5.7 step 1).
 	AddPipePending
 )
@@ -99,7 +99,7 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	id := m.nextID
 	m.nextID += 2
 	p := &Pipe{id: id}
-	a := &attach{joinerLocal: true, dir: o.Dir, fate: o.FateGroup, attachedAt: s.now, liveAt: s.now,
+	a := &attach{out: outNone, in: inNone, joinerLocal: true, dir: o.Dir, fate: o.FateGroup, attachedAt: s.now, liveAt: s.now,
 		lastAdvance: s.now, lastRecord: s.now, oob: o.OOB, weight: 1, probOpt: -1}
 	if o.Probation != nil {
 		a.probOpt = *o.Probation
@@ -159,13 +159,13 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 type JoinResult uint8
 
 const (
-	// JoinAccepted: the pipe is attached.
+	// JoinAccepted means the pipe is attached.
 	JoinAccepted JoinResult = iota
-	// JoinHold: the session is not established yet; offer the join again.
+	// JoinHold means the session is not established yet; offer the join again.
 	JoinHold
-	// JoinClose: close the carrier without writing anything.
+	// JoinClose asks the caller to close the carrier without writing anything.
 	JoinClose
-	// JoinRefused: close the carrier; a PIPE_ABANDON was queued.
+	// JoinRefused asks the caller to close the carrier; a PIPE_ABANDON was queued.
 	JoinRefused
 )
 
@@ -213,7 +213,7 @@ func (s *Session) AcceptJoin(j *wire.Join, macInput, binding []byte, c Carrier) 
 			return JoinClose
 		}
 	} else {
-		s.failLocal(wire.Errorf(wire.ProtocolViolation, "join with the wrong parity", "pipe", id))
+		s.failLocal(wire.NewError(wire.ProtocolViolation, "join with the wrong parity", "pipe", id))
 		return JoinClose
 	}
 	// Directions the acceptor needs: up = it reads, down = it writes.
@@ -226,14 +226,14 @@ func (s *Session) AcceptJoin(j *wire.Join, macInput, binding []byte, c Carrier) 
 		s.refuseJoin(id, wire.PipeResourceLimit)
 		return JoinRefused
 	}
-	if s.peerAttachments() >= m.cap && !(s.state == StateSuspended && s.makeRoom(false, needIn, needOut)) {
+	if s.peerAttachments() >= m.cap && (s.state != StateSuspended || !s.makeRoom(false, needIn, needOut)) {
 		s.refuseJoin(id, wire.PipeResourceLimit)
 		return JoinRefused
 	}
 	m.bits[id] = true
 	m.raise(id)
 	p := &Pipe{id: id}
-	a := &attach{dir: j.Dir, fate: j.FateGroup, attachedAt: s.now, liveAt: s.now, lastAdvance: s.now,
+	a := &attach{out: outNone, in: inNone, dir: j.Dir, fate: j.FateGroup, attachedAt: s.now, liveAt: s.now, lastAdvance: s.now,
 		lastRecord: s.now, weight: 1, peerPrio: j.Priority, peerStandby: j.Standby, probOpt: -1}
 	a.rtt = s.initialRTT(id)
 	p.mp = a
@@ -334,7 +334,7 @@ func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 	}
 	if oldest == nil {
 		out, in := s.liveCounts()
-		if !(provideOut && out == 0 || provideIn && in == 0) {
+		if (!provideOut || out != 0) && (!provideIn || in != 0) {
 			return false
 		}
 		for _, p := range s.pipes {

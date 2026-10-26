@@ -4,7 +4,6 @@ package wire
 const (
 	TLVOpenInfo    uint64 = 0x01
 	TLVPriority    uint64 = 0x02
-	TLVDeadline    uint64 = 0x03
 	TLVPipeCarrier uint64 = 0x05
 	TLVAppFirst    uint64 = 0x1000
 	TLVAppLast     uint64 = 0x3fff

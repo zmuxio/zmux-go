@@ -164,15 +164,15 @@ type pendPiece struct {
 }
 
 type pendStream struct {
-	on   bool
 	id   uint64
 	off  uint64
 	data []byte
 	pin  pin
-	fin  bool
-	dg   bool        // a DATAGRAM instead of STREAM
 	more []pendPiece // further contiguous segments of the same STREAM frame
 	n    int         // total data bytes (data and more)
+	on   bool
+	fin  bool
+	dg   bool // a DATAGRAM instead of STREAM
 }
 
 func (w *recWriter) init(b *Batch, framing Framing, recMax, budget int) {
@@ -421,7 +421,7 @@ func (w *recWriter) end() {
 }
 
 // recordPositionBytes returns the bytes a record counts in positions.
-func recordPositionBytes(framing Framing, size int) int {
+func recordPositionBytes(size int) int {
 	return wire.VarintLen(uint64(size)) + size
 }
 
