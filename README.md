@@ -6,6 +6,11 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/zmuxio/zmux-go)](go.mod)
 [![License](https://img.shields.io/github/license/zmuxio/zmux-go)](LICENSE)
 
+[![zmuxquic docs](https://img.shields.io/badge/pkg.go.dev-zmuxquic-007d9c)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxquic)
+[![zmuxquic release](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=zmuxquic/*&label=zmuxquic)](https://github.com/zmuxio/zmux-go/tags)
+[![zmuxh3 docs](https://img.shields.io/badge/pkg.go.dev-zmuxh3-007d9c)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxh3)
+[![zmuxh3 release](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=zmuxh3/*&label=zmuxh3)](https://github.com/zmuxio/zmux-go/tags)
+
 Go implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
 
