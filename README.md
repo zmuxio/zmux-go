@@ -1,5 +1,11 @@
 # zmux-go
 
+[![CI](https://github.com/zmuxio/zmux-go/actions/workflows/ci.yml/badge.svg)](https://github.com/zmuxio/zmux-go/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/zmuxio/zmux-go.svg)](https://pkg.go.dev/github.com/zmuxio/zmux-go)
+[![Release](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=v*&label=release)](https://github.com/zmuxio/zmux-go/tags)
+[![Go version](https://img.shields.io/github/go-mod/go-version/zmuxio/zmux-go)](go.mod)
+[![License](https://img.shields.io/github/license/zmuxio/zmux-go)](LICENSE)
+
 Go implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
 
