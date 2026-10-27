@@ -1,6 +1,6 @@
 package core
 
-// Probation, its history and revalidation (SCHEDULER.md 11, 11.1).
+// Probation, its history and revalidation.
 
 const (
 	probationFloor = Second
@@ -255,7 +255,7 @@ func (s *Session) probationTimers(now Time, apply bool) Time {
 	return next
 }
 
-// ---- revalidation (SCHEDULER.md 11.1) ----
+// ---- revalidation ----
 
 // RevalidatePipes asks for revalidation of one pipe (all == false) or of
 // every live outbound pipe: each sends a PIPE_PING at once and awaits
@@ -312,7 +312,7 @@ func (s *Session) endRevalidation(p *Pipe) {
 	s.wakeAllWriters()
 }
 
-// ---- backup probes (MULTIPATH.md 7.1, SCHEDULER.md 10 T4) ----
+// ---- backup probes (MULTIPATH.md 7.1) ----
 
 // backup reports a pipe probed every standby_probe while the session is
 // busy: standby, or of a less-preferred tier than the most-preferred usable.

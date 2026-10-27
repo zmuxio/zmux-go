@@ -26,9 +26,6 @@ type DuplicateResult struct {
 	RejoinStarted   bool
 }
 
-// ErrNoDecision reports two sessions the duplicate rule cannot decide.
-var ErrNoDecision = errors.New("zmux: the duplicate-session rule has no input that decides")
-
 // ResolveDuplicate applies the rule of EXTENSIONS.md 11 to two established
 // sessions that connect the same two endpoints and were dialed by
 // different endpoints: it returns the survivor and starts draining the

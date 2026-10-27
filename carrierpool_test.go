@@ -10,10 +10,9 @@ func TestCarrierPool(t *testing.T) {
 	n := 0
 	closed := map[int]bool{}
 	p := &CarrierPool[int]{
-		Dial:                          func(context.Context) (int, error) { n++; return n, nil },
-		Close:                         func(c int) { closed[c] = true },
-		MaxPipesPerConnection:         2,
-		MaxPipesPerConnectionLifetime: 3,
+		Dial:       func(context.Context) (int, error) { n++; return n, nil },
+		Close:      func(c int) { closed[c] = true },
+		PoolLimits: PoolLimits{MaxPipesPerConnection: 2, MaxPipesPerConnectionLifetime: 3},
 	}
 	ctx := context.Background()
 	get := func() *Lease[int] {
@@ -56,7 +55,7 @@ func TestCarrierPool(t *testing.T) {
 		t.Fatal("Get after Shutdown")
 	}
 	// Age: an old connection takes no new pipe.
-	p2 := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Millisecond}
+	p2 := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, PoolLimits: PoolLimits{MaxConnectionAge: time.Millisecond}}
 	x, _ := p2.Get(ctx)
 	time.Sleep(2 * time.Millisecond)
 	if y, _ := p2.Get(ctx); y.Conn == x.Conn {

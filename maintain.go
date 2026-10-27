@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// PipePool keeps pipes of one path up (API.md Appendix A).
+// PipePool keeps pipes of one path up.
 type PipePool struct {
 	// Dial opens a carrier of the path.
 	Dial func(ctx context.Context) (PipeIO, error)

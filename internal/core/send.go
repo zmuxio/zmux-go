@@ -4,7 +4,7 @@ import "github.com/zmuxio/zmux-go/internal/wire"
 
 // ---- writing (sending part) ----
 
-// SendCapacity returns the bytes the part could transmit now (API.md 5.1):
+// SendCapacity returns the bytes the part could transmit now:
 // the smaller remaining credit minus what it already holds unsent.
 func (s *Session) SendCapacity(st *Stream) uint64 {
 	sp := &st.snd
@@ -163,10 +163,9 @@ func (s *Session) heldLeave(st *Stream, before heldClass) {
 	}
 }
 
-// sendRoom applies the session send buffer by water-filling
-// (IMPLEMENTATION.md 6.4): small directions come off first, every other
-// direction may hold max(64 KiB, (send_buffer - small bytes) / n); each
-// direction may always hold 64 KiB.
+// sendRoom applies the session send buffer by water-filling: small directions
+// come off first, every other direction may hold max(64 KiB, (send_buffer -
+// small bytes) / n); each direction may always hold 64 KiB.
 func (s *Session) sendRoom(st *Stream) uint64 {
 	cl := classOf(st)
 	c := &s.conn
@@ -196,7 +195,7 @@ func (s *Session) SetSendBuffer(st *Stream, n uint64) {
 
 // WaitWrite registers sig for write progress of st.
 // A write that begins waiting within 1 ms of the stream's previous write
-// completing continues the same wait (SCHEDULER.md 10, age).
+// completing continues the same wait (age).
 func (s *Session) WaitWrite(st *Stream, sig *Signal) {
 	st.wsig = sig
 	sp := &st.snd
@@ -225,7 +224,7 @@ func (s *Session) Finish(st *Stream) error {
 }
 
 // SetReliableBoundary marks the data written so far as delivered even if the
-// stream is reset later (API.md 5.1).
+// stream is reset later.
 func (s *Session) SetReliableBoundary(st *Stream) {
 	st.snd.boundary = st.snd.appWritten
 	st.snd.hasBound = true
@@ -362,7 +361,7 @@ func (s *Session) sendTerminal(st *Stream, state sendState) {
 	s.maybeDiscard(st)
 }
 
-// ---- send capacity (API.md 5.1) ----
+// ---- send capacity ----
 
 // WaitSendCapacity registers sig to be woken once the part's capacity is
 // at least min, or above 0 while it holds nothing unsent, or the part can
@@ -425,7 +424,7 @@ func (s *Session) wakeCapacity() {
 	}
 }
 
-// WriteChunk queues data that references buf without copying (API.md 5.1);
+// WriteChunk queues data that references buf without copying;
 // the queue takes its own reference. It returns how much it took (the send
 // buffer bounds it, as for Write).
 func (s *Session) WriteChunk(st *Stream, data []byte, buf *Buf, fin bool) (int, error) {
@@ -471,7 +470,7 @@ func (s *Session) WriteErrOf(st *Stream) error { return s.writeErr(st) }
 func (s *Session) SendRoom(st *Stream) uint64 { return s.sendRoom(st) }
 
 // WriteBatch writes the bytes of b from skip on as stream data of st, as
-// far as the send buffer admits (API.md 4.6: the carrier of a nested
+// far as the send buffer admits (the carrier of a nested
 // session): the payload segments b pins are referenced, not copied (their
 // blocks and buffers are reference-counted across sessions), the record
 // headers are copied. The caller owns b until it reports the write to b's

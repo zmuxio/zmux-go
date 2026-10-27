@@ -1,7 +1,7 @@
 package core
 
 // Stream scheduling: strict priority by urgency, deficit round robin with a
-// 16 KiB quantum within a level (IMPLEMENTATION.md 5).
+// 16 KiB quantum within a level.
 
 const quantum = 16384
 

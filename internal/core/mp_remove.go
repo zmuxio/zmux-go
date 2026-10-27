@@ -43,6 +43,7 @@ func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
 	}
 	s.maybeRetire(p)
 	s.checkLastPipe(cause)
+	s.checkLingerDone()
 	s.wakeAllWriters()
 }
 

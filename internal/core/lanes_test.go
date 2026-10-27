@@ -2,7 +2,7 @@ package core
 
 import "testing"
 
-// Data lanes take the paced room in turns (SCHEDULER.md 9.2 rule 4); lane 0
+// Data lanes take the paced room in turns; lane 0
 // and the copy lane are never held back.
 func TestDataLaneTurns(t *testing.T) {
 	s := &Session{}

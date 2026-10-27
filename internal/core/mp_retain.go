@@ -1,10 +1,10 @@
 package core
 
-// Retention of unacknowledged information (MULTIPATH.md 7.4, SCHEDULER.md
-// 13.1): every ack-eliciting frame with a reinjection rule is logged per
-// outbound lane with the position that ends its record; a PIPE_ACK pops
-// the entries it covers (acked), a suspect or failed pipe turns the rest
-// into "send this scope again" (lost).
+// Retention of unacknowledged information (MULTIPATH.md 7.4): every
+// ack-eliciting frame with a reinjection rule is logged per outbound lane with
+// the position that ends its record; a PIPE_ACK pops the entries it covers
+// (acked), a suspect or failed pipe turns the rest into "send this scope again"
+// (lost).
 
 type descKind uint8
 
@@ -293,7 +293,10 @@ func (s *Session) dropResend(m *mpSend, lo, hi uint64) {
 	m.resend = out
 }
 
-// retransmitBudget is SCHEDULER.md 13.1.
+// retransmitBudget bounds the retained unacknowledged stream data: four
+// times the summed delivery rate times (smoothed RTT + the peer's ack
+// delay) of the live outbound pipes, at least 1 MiB and at most the send
+// buffer.
 func (s *Session) retransmitBudget() uint64 {
 	var sum float64
 	pd := 25 * Millisecond

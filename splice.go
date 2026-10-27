@@ -11,7 +11,7 @@ import (
 )
 
 // Limiter lets an external limiter, budget or meter act on bytes that zmux
-// forwards itself (Splice, datagrams; API.md A.1). zmux calls it outside
+// forwards itself (Splice, datagrams). zmux calls it outside
 // every session lock.
 type Limiter interface {
 	// Ready waits until at least min bytes (or the limiter's burst, if
@@ -49,10 +49,10 @@ type SpliceResult struct {
 var errSpliceSelf = errors.New("zmux: cannot splice a stream into itself")
 
 // Splice forwards two bidirectional streams into each other until both
-// directions have ended (API.md A.2): what arrives on a is sent on b and
+// directions have ended: what arrives on a is sent on b and
 // what arrives on b is sent on a, a chunk at a time, without copying and
 // only within the receiving side's credit, so backpressure crosses the
-// relay hop by hop. Ends travel as the table of A.2 says: FIN finishes the
+// relay hop by hop. Ends travel across: FIN finishes the
 // other side, a reset resets it with its code after the bytes below its
 // Reliable Size, a stop stops the upstream, a lost session fails the other
 // side with ZMUX_CARRIER_FAILED, and cancelling ctx ends both with code 0.
@@ -155,7 +155,7 @@ func spliceReadErr(r, w *Stream, err error) {
 	if errors.As(err, &se) && se.Remote {
 		// r was reset: the bytes below its Reliable Size were forwarded;
 		// they stay reliable on w.
-		if se.ReliableSize > 0 && se.ErrorCode != CodeCarrierFailed {
+		if se.ReliableSize > 0 && se.ErrorCode != StreamCarrierFailed {
 			// A closed session has no boundary left to keep.
 			_ = w.h.do(func(s *core.Session) error { s.SetReliableBoundary(w.h.st); return nil })
 		}
@@ -181,7 +181,7 @@ func spliceWriteErr(r, w *Stream, err error) {
 func spliceAbort(r, w *Stream, err error) {
 	code := StreamErrorCode(0)
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		code = CodeCarrierFailed
+		code = StreamCarrierFailed
 	}
 	r.h.cancelRead(code)
 	w.h.cancelWrite(code)

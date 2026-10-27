@@ -6,8 +6,8 @@ import (
 
 // ackState is the acknowledgement machinery of a session with
 // acknowledgement (MULTIPATH.md 3.5, 6): PIPE_ACK generation for inbound
-// pipes and processing for outbound ones, with the RTT estimator of
-// SCHEDULER.md 2.1. Single-pipe sessions keep nothing else (no retention).
+// pipes and processing for outbound ones, with the per-pipe RTT
+// estimator. Single-pipe sessions keep nothing else (no retention).
 type ackState struct {
 	s         *Session
 	threshold uint64   // own zmux_ack_threshold
@@ -68,7 +68,7 @@ func (r *rttEst) update(sample, ackDelay, maxAckDelay Duration, now Time) Durati
 		return sample
 	}
 	// The minimum of the last 300 s; a minimum older than that gives way
-	// to the current sample (SCHEDULER.md 2.1).
+	// to the current sample.
 	if sample <= r.min || now.Sub(r.minAt) > 300*Second {
 		r.min, r.minAt = sample, now
 	}
@@ -407,7 +407,7 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 			}
 			// A late entry (ACK Delay above the peer's maximum, typically
 			// the redundant copy) gives no RTT sample, unless the pipe has
-			// had none for 1 s (SCHEDULER.md 2.1).
+			// had none for 1 s.
 			late := ad > a.peerDelay && (ps.rttAt == 0 || now.Sub(ps.rttAt) < Second)
 			if !late && (p.mp == nil || p.mp.sampleOK(last.sent)) {
 				ev.rtt = r.update(rtt, minD(ad, a.peerDelay), a.peerDelay, now)
@@ -415,7 +415,7 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 				ps.rttAt = now
 				s.tuneAckSample(r.min)
 			}
-			// Delivery rate sample (SCHEDULER.md 2.3).
+			// Delivery rate sample.
 			iv := maxD(last.sent.Sub(last.firstSentAt), now.Sub(last.deliveredAt))
 			if iv > 0 && (p.mp == nil || p.mp.sampleOK(last.sent)) {
 				ev.rate = ps.re.sample(float64(ps.delivered-last.delivered)*1e9/float64(iv), last.bubble, last.epoch, now)

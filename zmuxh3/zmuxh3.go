@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"sync"
-	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -21,22 +20,22 @@ import (
 	"github.com/zmuxio/zmux-go"
 )
 
-const carrierFailed = webtransport.StreamErrorCode(zmux.CodeCarrierFailed)
+const carrierFailed = webtransport.StreamErrorCode(zmux.StreamCarrierFailed)
 
 // ---- HTTP/3 request streams ----
 
-// Client returns an http.Client whose requests run over HTTP/3, for
+// HTTPClient returns an http.Client whose requests run over HTTP/3, for
 // zmux.HTTPPipe and zmux.HTTPSplitPipe, and its transport, which the
-// caller closes when done.
-func Client(tlsConf *tls.Config, qconf *quic.Config) (*http.Client, *http3.Transport) {
+// caller closes when done. qconf may be nil.
+func HTTPClient(tlsConf *tls.Config, qconf *quic.Config) (*http.Client, *http3.Transport) {
 	t := &http3.Transport{TLSClientConfig: tlsConf, QUICConfig: qconf}
 	return &http.Client{Transport: t}, t
 }
 
-// Server returns an HTTP/3 server that hands its requests to l (an
-// http.Handler) as carriers; the caller starts it (ListenAndServe or
-// Serve) and closes it.
-func Server(addr string, tlsConf *tls.Config, qconf *quic.Config, l *zmux.Listener) *http3.Server {
+// NewHTTP3Server returns an HTTP/3 server that hands its requests to l
+// (zmux.Listener is an http.Handler) as carriers; the caller starts it
+// (ListenAndServe or Serve) and closes it. qconf may be nil.
+func NewHTTP3Server(addr string, tlsConf *tls.Config, qconf *quic.Config, l *zmux.Listener) *http3.Server {
 	return &http3.Server{Addr: addr, TLSConfig: http3.ConfigureTLSConfig(tlsConf), QUICConfig: qconf, Handler: l}
 }
 
@@ -54,13 +53,16 @@ func Handler(s *webtransport.Server, l *zmux.Listener) http.Handler {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		ServeSession(sess.Context(), sess, l)
+		_ = Serve(sess.Context(), sess, l)
 	})
 }
 
-// ServeSession hands the streams of a WebTransport session to l until the
-// session ends.
-func ServeSession(ctx context.Context, sess *webtransport.Session, l *zmux.Listener) {
+// Serve hands the streams of an accepted WebTransport session to l, as
+// zmuxquic.Serve does for a QUIC listener: each bidirectional stream is a
+// carrier (a bootstrap or a join), each unidirectional stream a lane. It
+// returns, with the error that ended the accept loop, when the session
+// ends or ctx ends; the zmux sessions continue on their pipes.
+func Serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener) error {
 	src := hostOf(sess.RemoteAddr())
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -75,19 +77,25 @@ func ServeSession(ctx context.Context, sess *webtransport.Session, l *zmux.Liste
 			go func() { _ = l.HandlePipe(ctx, p, zmux.JoinHint{Source: src}) }()
 		}
 	}()
+	var err error
 	for {
-		s, err := sess.AcceptStream(ctx)
+		var s *webtransport.Stream
+		s, err = sess.AcceptStream(ctx)
 		if err != nil {
 			break
 		}
-		go func() { _ = l.HandlePipe(ctx, StreamPipe(sess, s), zmux.JoinHint{Source: src}) }()
+		go func() { _ = l.HandlePipe(ctx, WebTransportPipe(sess, s), zmux.JoinHint{Source: src}) }()
 	}
 	wg.Wait()
+	return err
 }
 
-// DialSession opens a WebTransport session and starts a zmux session on
-// its first bidirectional stream (lanes wired).
-func DialSession(ctx context.Context, t *webtransport.Transport, url string, h http.Header, cfg *zmux.Config) (*zmux.Conn, *webtransport.Session, error) {
+// Dial opens a WebTransport session to url with t and the headers h and
+// starts a zmux client session on its first bidirectional stream, as
+// zmuxquic.Dial does on a QUIC connection; the lanes the server opens are
+// accepted. The caller closes the returned WebTransport session after the
+// zmux session ended.
+func Dial(ctx context.Context, t *webtransport.Transport, url string, h http.Header, cfg *zmux.Config) (*zmux.Conn, *webtransport.Session, error) {
 	_, sess, err := t.Dial(ctx, url, h)
 	if err != nil {
 		return nil, nil, err
@@ -119,54 +127,32 @@ func acceptLanes(sess *webtransport.Session) {
 	}
 }
 
-// Pool opens pipes on a pool of WebTransport sessions to one URL (a
-// carrier pool, API.md Appendix A): at most MaxPipesPerConnection pipes per
-// session at once, sessions retired by lifetime limits or failure; the
-// pipes of one session share a fate group.
+// Pool opens pipes on a pool of WebTransport sessions to one URL: at most
+// PoolLimits.MaxPipesPerConnection pipes per session at once, sessions
+// retired by lifetime limits or failure; the pipes of one session share a
+// fate group. It is safe for concurrent use.
 type Pool struct {
-	// MaxPipesPerConnection bounds the pipes on a session at once (8).
-	MaxPipesPerConnection int
-	// MaxPipesPerConnectionLifetime bounds the pipes a session carries over
-	// its life (0: unlimited).
-	MaxPipesPerConnectionLifetime int
-	// MaxConnectionAge stops giving pipes to a session this old (0:
-	// unlimited).
-	MaxConnectionAge time.Duration
-
-	once sync.Once
 	pool zmux.CarrierPool[*webtransport.Session]
-	dial func(ctx context.Context) (*webtransport.Session, error)
-}
-
-func (p *Pool) init() {
-	p.once.Do(func() {
-		p.pool = zmux.CarrierPool[*webtransport.Session]{Dial: p.dial, Close: closePooled,
-			MaxPipesPerConnection:         p.MaxPipesPerConnection,
-			MaxPipesPerConnectionLifetime: p.MaxPipesPerConnectionLifetime,
-			MaxConnectionAge:              p.MaxConnectionAge}
-	})
 }
 
 // Shutdown retires every session: idle ones close now, the others once
 // their pipes end; OpenPipe fails afterwards.
-func (p *Pool) Shutdown() {
-	p.init()
-	p.pool.Shutdown()
-}
+func (p *Pool) Shutdown() { p.pool.Shutdown() }
 
-// NewPool returns a pool that dials url with t and the headers h; its
-// limits are read at the first OpenPipe.
-func NewPool(t *webtransport.Transport, url string, h http.Header) *Pool {
+// NewPool returns a pool that dials url with t and the headers h, within
+// lim.
+func NewPool(t *webtransport.Transport, url string, h http.Header, lim zmux.PoolLimits) *Pool {
 	p := &Pool{}
-	p.dial = func(ctx context.Context) (*webtransport.Session, error) {
-		_, sess, err := t.Dial(ctx, url, h)
-		if err != nil {
-			return nil, err
-		}
-		go acceptLanes(sess)
-		context.AfterFunc(sess.Context(), func() { p.pool.RetireConn(sess) })
-		return sess, nil
-	}
+	p.pool = zmux.CarrierPool[*webtransport.Session]{PoolLimits: lim, Close: closePooled,
+		Dial: func(ctx context.Context) (*webtransport.Session, error) {
+			_, sess, err := t.Dial(ctx, url, h)
+			if err != nil {
+				return nil, err
+			}
+			go acceptLanes(sess)
+			context.AfterFunc(sess.Context(), func() { p.pool.RetireConn(sess) })
+			return sess, nil
+		}}
 	return p
 }
 
@@ -175,10 +161,9 @@ func closePooled(sess *webtransport.Session) { _ = sess.CloseWithError(0, "") }
 // OpenPipe opens a pipe on a pooled session; its PipeIO carries the
 // session's fate group.
 func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
-	if p.dial == nil {
+	if p.pool.Dial == nil {
 		return zmux.PipeIO{}, errors.New("zmuxh3: a Pool is made by NewPool")
 	}
-	p.init()
 	l, err := p.pool.Get(ctx)
 	if err != nil {
 		return zmux.PipeIO{}, err
@@ -189,7 +174,7 @@ func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 		return zmux.PipeIO{}, err
 	}
 	context.AfterFunc(s.Context(), l.Release)
-	pio := StreamPipe(l.Conn, s)
+	pio := WebTransportPipe(l.Conn, s)
 	pio.FateGroup = l.FateGroup
 	return pio, nil
 }
@@ -201,11 +186,12 @@ func OpenPipe(ctx context.Context, sess *webtransport.Session) (zmux.PipeIO, err
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
-	return StreamPipe(sess, s), nil
+	return WebTransportPipe(sess, s), nil
 }
 
-// StreamPipe adapts a bidirectional WebTransport stream to a pipe input.
-func StreamPipe(sess *webtransport.Session, s *webtransport.Stream) zmux.PipeIO {
+// WebTransportPipe adapts a bidirectional stream of a WebTransport session
+// to a pipe input (with lanes on the session's unidirectional streams).
+func WebTransportPipe(sess *webtransport.Session, s *webtransport.Stream) zmux.PipeIO {
 	ws := &wtStream{sess: sess, s: s}
 	return zmux.PipeIO{R: (*wtReader)(ws), W: ws}
 }

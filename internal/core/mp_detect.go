@@ -4,7 +4,7 @@ import "github.com/zmuxio/zmux-go/internal/wire"
 
 // Failure detection and the path layer's timers (MULTIPATH.md 7.1, 7.3,
 // 8.2, 8.4). Every deadline is computed by mpTimers, which both
-// mpNextTimeout and mpHandleTimeout use (IMPLEMENTATION.md 13.4 T2).
+// mpNextTimeout and mpHandleTimeout use.
 
 // pto is PTO_p (RFC 9002 6.2.1 with the peer's max_ack_delay).
 func (s *Session) pto(a *attach) Duration {

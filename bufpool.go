@@ -7,11 +7,11 @@ import (
 )
 
 // readBufSize holds one maximal record plus the start of the next one
-// (IMPLEMENTATION.md 3: at least max_record_size + 4).
+// (at least max_record_size + 4).
 const readBufSize = 128 << 10
 
 // idleBufSize is the small buffer a reader blocks on while its pipe is
-// quiet, so that an idle pipe holds no pooled buffer (IMPLEMENTATION.md 2.8).
+// quiet, so that an idle pipe holds no pooled buffer.
 const idleBufSize = 256
 
 // readPool holds free read buffers for reuse by every session; the garbage

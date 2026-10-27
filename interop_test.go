@@ -91,7 +91,7 @@ func TestInteropClient(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	c, err := Dial(ctx, nc, interopConfig())
+	c, err := Client(ctx, nc, interopConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	for range 4 {
 		go func() {
 			msg := make([]byte, 4<<20)
-			rand.Read(msg)
+			_, _ = rand.Read(msg)
 			st, err := c.OpenStreamSync(ctx)
 			if err != nil {
 				errs <- err
@@ -307,7 +307,7 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 	// Every pipe usable first (a join may still be in probation).
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		ps := c.Pipes()
+		ps := c.PipeStats()
 		ok := len(ps) >= 2
 		for _, p := range ps {
 			ok = ok && p.Eligible
@@ -319,15 +319,15 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 	}
 	c.SetScheduler(SpreadRoundRobin())
 	before := map[uint64]uint64{}
-	for _, p := range c.Pipes() {
+	for _, p := range c.PipeStats() {
 		before[p.ID] = p.BytesSent
 	}
 	msg := make([]byte, 16<<20)
-	rand.Read(msg)
+	_, _ = rand.Read(msg)
 	if r := command(t, ctx, c, "echo", msg); r != string(msg) {
 		t.Fatal("multipath echo mismatch")
 	}
-	ps := c.Pipes()
+	ps := c.PipeStats()
 	if len(ps) < 2 {
 		t.Fatalf("pipes: %d", len(ps))
 	}
@@ -348,7 +348,7 @@ func TestInteropMultipathClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := Dial(ctx, nc, interopMPConfig())
+	c, err := Client(ctx, nc, interopMPConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +393,7 @@ func TestInteropMultipathServer(t *testing.T) {
 	}
 	p.expect(t, "ESTABLISHED")
 	deadline := time.Now().Add(10 * time.Second)
-	for len(c.Pipes()) < 2 && time.Now().Before(deadline) {
+	for len(c.PipeStats()) < 2 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	spreadCheck(t, ctx, c)

@@ -4,7 +4,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// JoinOptions are the options of a local join (API.md 4.2).
+// JoinOptions are the options of a local join.
 type JoinOptions struct {
 	Dir          uint8 // MULTIPATH 5.1: 0 up, 1 down, 2 bidi (joiner's view)
 	FateGroup    uint64
@@ -165,7 +165,8 @@ const (
 	JoinHold
 	// JoinClose asks the caller to close the carrier without writing anything.
 	JoinClose
-	// JoinRefused asks the caller to close the carrier; a PIPE_ABANDON was queued.
+	// JoinRefused asks the caller to close the carrier; a PIPE_ABANDON was
+	// queued.
 	JoinRefused
 )
 

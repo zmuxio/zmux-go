@@ -17,7 +17,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// ListenerConfig configures a Listener (API.md 4.4). The zero value of
+// ListenerConfig configures a Listener. The zero value of
 // every field selects its default.
 type ListenerConfig struct {
 	// Config is the configuration of the sessions it accepts.
@@ -64,14 +64,32 @@ type JoinHint struct {
 	Source string
 }
 
-// Listener accepts sessions and the pipes that join them (MULTIPATH.md
-// 5.4, 5.5). Its lock is a leaf: it never takes a session lock while held.
+// Listener is the server side of zmux: it accepts sessions and the pipes
+// that join them (MULTIPATH.md 5.4, 5.5), so it is the way to serve
+// clients that use multipath, resume or split carriers. Serve feeds it the
+// connections of a net.Listener (TCP, or TLS with tls.NewListener);
+// HandlePipe feeds it any other carrier, and ServeHTTP HTTP carriers.
+// Accept returns the sessions it started:
+//
+//	l := zmux.NewListener(&zmux.ListenerConfig{Config: cfg})
+//	go l.Serve(ctx, ln)
+//	for {
+//		conn, err := l.Accept(ctx)
+//		if err != nil {
+//			return err
+//		}
+//		go handle(conn)
+//	}
+//
+// Close stops accepting; Shutdown also closes the accepted sessions
+// gracefully. Its lock is a leaf: it never takes a session lock while held.
 type Listener struct {
 	cfg ListenerConfig
 
 	mu        sync.Mutex
-	sessions  map[string]*Conn // by locator
-	suspended []*Conn          // in suspension order
+	live      map[*Conn]struct{} // every session it started, until it ends
+	sessions  map[string]*Conn   // by locator
+	suspended []*Conn            // in suspension order
 	pending   core.PendingCarriers
 	pairing   core.SplitPairing
 	pairs     map[[16]byte]*pairWait
@@ -88,9 +106,10 @@ type pairWait struct {
 	end  chan struct{}
 }
 
-// NewListener returns a listener; feed it carriers with HandlePipe.
+// NewListener returns a listener; feed it carriers with Serve, HandlePipe
+// or ServeHTTP. cfg may be nil.
 func NewListener(cfg *ListenerConfig) *Listener {
-	l := &Listener{sessions: map[string]*Conn{}, pairs: map[[16]byte]*pairWait{}, done: make(chan struct{})}
+	l := &Listener{live: map[*Conn]struct{}{}, sessions: map[string]*Conn{}, pairs: map[[16]byte]*pairWait{}, done: make(chan struct{})}
 	if cfg != nil {
 		l.cfg = *cfg
 	}
@@ -119,7 +138,7 @@ func (l *Listener) MemoryUsed() uint64 { return l.budget.Used() }
 
 // watchBudget is the serial context of the memory budget: it calls the
 // pressure hook and, under pressure, closes suspended sessions holding the
-// most memory first (IMPLEMENTATION.md 6.6).
+// most memory first.
 func (l *Listener) watchBudget() {
 	for {
 		select {
@@ -177,8 +196,9 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 	}
 }
 
-// Close stops accepting and stops the memory-pressure watcher; it does not
-// block, and sessions already accepted continue (close them to end them).
+// Close stops accepting: Accept and Serve return net.ErrClosed, new
+// carriers are refused and the memory-pressure watcher stops. It does not
+// block, and sessions already started continue; Shutdown ends them too.
 func (l *Listener) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -187,6 +207,74 @@ func (l *Listener) Close() error {
 		close(l.done)
 	}
 	return nil
+}
+
+// Shutdown closes the listener and then shuts down every session it
+// started, accepted or not, with Conn.Shutdown(ctx, code, msg) in
+// parallel: each sends GOAWAY, lets its open streams finish and closes.
+// It returns when every session has ended, or with ctx's error once ctx
+// ends (the remaining sessions are then closed at once).
+func (l *Listener) Shutdown(ctx context.Context, code ApplicationErrorCode, msg string) error {
+	_ = l.Close()
+	l.mu.Lock()
+	cs := make([]*Conn, 0, len(l.live))
+	for c := range l.live {
+		cs = append(cs, c)
+	}
+	l.mu.Unlock()
+	errs := make(chan error, len(cs))
+	for _, c := range cs {
+		go func() { errs <- c.Shutdown(ctx, code, msg) }()
+	}
+	var err error
+	for range cs {
+		if e := <-errs; e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
+// Serve accepts connections from ln and hands each one to HandlePipe, in a
+// goroutine of its own, as a carrier that starts or joins a session; the
+// sessions it starts are returned by Accept. For TLS, pass a listener made
+// by tls.NewListener. Serve closes ln when it returns: when ln.Accept
+// fails, when ctx ends (ctx's error), or when the listener is closed
+// (net.ErrClosed). Cancelling ctx also aborts the carriers Serve handed
+// over, ending their pipes; Shutdown or Close leave them to the sessions.
+func (l *Listener) Serve(ctx context.Context, ln net.Listener) error {
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-l.done:
+		case <-stop:
+		}
+		_ = ln.Close()
+	}()
+	for {
+		nc, err := ln.Accept()
+		if err != nil {
+			switch {
+			case ctx.Err() != nil:
+				return ctx.Err()
+			case l.isClosed():
+				return net.ErrClosed
+			}
+			return err
+		}
+		go func() { _ = l.HandlePipe(ctx, NetPipe(nc), JoinHint{}) }()
+	}
+}
+
+func (l *Listener) isClosed() bool {
+	select {
+	case <-l.done:
+		return true
+	default:
+		return false
+	}
 }
 
 var errRejected = errors.New("zmux: carrier rejected")
@@ -240,7 +328,7 @@ func (l *Listener) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) erro
 		return l.startSession(ctx, withPrefix(p, first))
 	case core.ClassJoin:
 		body := first
-		if p.Framing == ByteStream {
+		if p.Framing == FramingByteStream {
 			_, n := wire.ReadVarint(first)
 			body = first[n:]
 		}
@@ -289,7 +377,7 @@ func (l *Listener) readFirst(p PipeIO) ([]byte, core.Class, error) {
 
 // readFirstRecord reads a carrier's first record.
 func readFirstRecord(p PipeIO) ([]byte, core.Class, error) {
-	if p.Framing == Records {
+	if p.Framing == FramingRecords {
 		mr, ok := p.R.(MessageReader)
 		if !ok {
 			return nil, core.ClassReject, errors.New("zmux: Records framing needs a MessageReader")
@@ -343,7 +431,7 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO) error {
 		return err
 	}
 	if l.budget.Pressure() {
-		// Refused after its own parameters (IMPLEMENTATION.md 6.6 item 3).
+		// Refused after its own parameters.
 		c.lock()
 		c.s.Refuse()
 		c.unlock()
@@ -355,8 +443,15 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO) error {
 	if !full {
 		select {
 		case l.accept <- c:
-			if len(cc.Local.Locator) > 0 {
-				l.sessions[string(cc.Local.Locator)] = c
+			// sessionClosed runs after done is closed: a session that
+			// already ended is not recorded.
+			select {
+			case <-c.done:
+			default:
+				l.live[c] = struct{}{}
+				if len(cc.Local.Locator) > 0 {
+					l.sessions[string(cc.Local.Locator)] = c
+				}
 			}
 		default:
 			full = true
@@ -435,6 +530,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte,
 func (l *Listener) sessionClosed(c *Conn) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.live, c)
 	for k, v := range l.sessions {
 		if v == c {
 			delete(l.sessions, k)
@@ -584,7 +680,7 @@ func withPrefix(p PipeIO, first []byte) PipeIO {
 	if len(first) == 0 {
 		return p
 	}
-	if p.Framing == Records {
+	if p.Framing == FramingRecords {
 		p.R = &prefixMessages{first: first, r: p.R}
 		return p
 	}

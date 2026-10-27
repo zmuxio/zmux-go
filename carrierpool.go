@@ -9,9 +9,23 @@ import (
 	"time"
 )
 
+// PoolLimits bound how a carrier pool uses each underlying connection. The
+// zero value selects the defaults.
+type PoolLimits struct {
+	// MaxPipesPerConnection bounds the pipes on a connection at once
+	// (0: 8).
+	MaxPipesPerConnection int
+	// MaxPipesPerConnectionLifetime bounds the pipes a connection carries
+	// over its life (0: unlimited).
+	MaxPipesPerConnectionLifetime int
+	// MaxConnectionAge stops giving pipes to a connection this old (0:
+	// unlimited).
+	MaxConnectionAge time.Duration
+}
+
 // CarrierPool shares underlying connections between pipes, for adapters
 // that carry several pipes over one connection (HTTP/2 and HTTP/3 request
-// streams, QUIC streams; API.md Appendix A). A new pipe goes to the open
+// streams, QUIC streams). A new pipe goes to the open
 // connection with the most room within the limits, else to a new one; a
 // connection that reached its lifetime limits takes no new pipe and is
 // closed once its last pipe ends. The pipes of one connection get one
@@ -23,15 +37,9 @@ type CarrierPool[C comparable] struct {
 	Dial func(ctx context.Context) (C, error)
 	// Close closes a connection the pool retired once no pipe uses it.
 	Close func(C)
-	// MaxPipesPerConnection bounds the pipes on a connection at once
-	// (default 8).
-	MaxPipesPerConnection int
-	// MaxPipesPerConnectionLifetime bounds the pipes a connection carries
-	// over its life (0: unlimited).
-	MaxPipesPerConnectionLifetime int
-	// MaxConnectionAge stops giving pipes to a connection this old (0:
-	// unlimited).
-	MaxConnectionAge time.Duration
+	// PoolLimits bound the use of each connection; set them before the
+	// first Get.
+	PoolLimits
 
 	mu     sync.Mutex
 	conns  []*pooledConn[C]

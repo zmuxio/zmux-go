@@ -13,7 +13,7 @@ func StreamHeaderLen(id, off uint64, n int, withLen bool) int {
 }
 
 // AppendStreamHeader appends a STREAM frame header; the data follows it.
-// The OFF bit is set only for a non-zero offset (IMPLEMENTATION.md 4).
+// The OFF bit is set only for a non-zero offset.
 func AppendStreamHeader(b []byte, id, off uint64, n int, fin, withLen bool) []byte {
 	t := TypeStream
 	if off > 0 {

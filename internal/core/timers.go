@@ -2,8 +2,7 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// timers are the session's deadlines; every one is computed by nextTimeout
-// (IMPLEMENTATION.md 13.4 T2).
+// timers are the session's deadlines; every one is computed by nextTimeout.
 type timers struct {
 	handshake    Time
 	linger       Time

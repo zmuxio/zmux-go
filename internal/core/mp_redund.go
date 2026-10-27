@@ -2,7 +2,7 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// Redundant urgent data (SCHEDULER.md 4.1): a chunk of a redundant stream
+// Redundant urgent data: a chunk of a redundant stream
 // direction is taken by either pipe of the pair of its eligible tier and
 // copied to the other; the first spread_chunk of new data after an idle
 // period of a pipe is copied likewise. Copies wait outside the carrier for

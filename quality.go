@@ -6,21 +6,24 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-// QualityBand asks for PipeQualityChanged events (API.md 4.5): emitted for
-// an outbound pipe when its smoothed RTT leaves +-RTT around the last
+// QualityBand asks for EventPipeQualityChanged events: emitted for an
+// outbound pipe when its smoothed RTT leaves +-RTT around the last
 // reported value, or its delivery rate leaves [last/RateRatio,
-// last*RateRatio]; at most one per pipe per MinInterval (default 1 s;
-// negative: no minimum), the latest values winning. A zero RTT or
-// RateRatio turns that half off.
+// last*RateRatio]; at most one per pipe per MinInterval, the latest values
+// winning. A zero RTT or RateRatio turns that half off, so the zero
+// QualityBand reports nothing; a zero MinInterval means 1 s, a negative
+// one no minimum.
 type QualityBand struct {
 	RTT         time.Duration
 	RateRatio   float64
 	MinInterval time.Duration
 }
 
-// CapacityFloor asks for CapacityBelow once the summed delivery rate of the
-// usable, non-standby outbound pipes falls below Rate (bytes/s), and
-// CapacityRestored once it is back at Rate*RateRatio (default 1.25).
+// CapacityFloor asks for EventCapacityBelow once the summed delivery rate
+// of the usable, non-standby outbound pipes falls below Rate (bytes/s), and
+// EventCapacityRestored once it is back at Rate*RateRatio. A zero Rate
+// turns it off, so the zero CapacityFloor reports nothing; a zero
+// RateRatio means 1.25.
 type CapacityFloor struct {
 	Rate      float64
 	RateRatio float64

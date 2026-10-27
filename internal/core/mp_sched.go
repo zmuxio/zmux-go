@@ -2,8 +2,8 @@ package core
 
 import "math"
 
-// Multipath scheduling policies (SCHEDULER.md 3 to 8): which stream data a
-// pipe takes at its write opportunity (late binding, MULTIPATH.md 11.1).
+// Multipath scheduling policies: which stream data a pipe takes when it
+// can write (late binding), within the sender rules of MULTIPATH.md 11.
 
 const (
 	ecfBeta         = 0.25
@@ -74,7 +74,7 @@ func (s *Session) onPipe(d *decision, st *Stream) bool {
 	sp := &st.snd
 	if d.g == nil {
 		// No pipe is usable: a JOINING pipe carries stream data
-		// (MULTIPATH.md 11.1 rule S1).
+		// (MULTIPATH.md 11 rule S1).
 		return d.joiningTakes
 	}
 	if m := sp.mps; m != nil && (len(m.resend) > 0 || m.finResend) {
@@ -145,10 +145,9 @@ func (s *Session) chunkSent(d *decision, w *recWriter, st *Stream, off, n uint64
 
 // ---- estimates ----
 
-// placementRate is the rate the spreading policies place data with
-// (SCHEDULER.md 2.3): R_p, or for a usable pipe without a bottleneck
-// sample the fastest measured pipe of its tier and standby flag, for four
-// of its round trips.
+// placementRate is the rate the spreading policies place data with: R_p, or for
+// a usable pipe without a bottleneck sample the fastest measured pipe of its
+// tier and standby flag, for four of its round trips.
 func (s *Session) placementRate(p *Pipe) float64 {
 	e := &p.out.snd.re
 	own := e.value()
@@ -175,7 +174,7 @@ func (s *Session) placementRate(p *Pipe) float64 {
 	return fastest
 }
 
-// eta is ETA_p(L) in seconds (SCHEDULER.md 4).
+// eta is ETA_p(L) in seconds.
 func (s *Session) eta(p *Pipe, l uint64) float64 {
 	r := max(s.placementRate(p), 1)
 	return (s.queued(p)+float64(l))/r + float64(s.owd(p))/1e9
@@ -212,7 +211,7 @@ func (s *Session) earliestTwo(g *gate, ti int, l uint64, except *Pipe) (*Pipe, *
 	return a, b
 }
 
-// ---- spread-eta (SCHEDULER.md 5) ----
+// ---- spread-eta ----
 
 // levelStats are the ready amounts of the stream directions by urgency
 // level, for ECF's backlog and BLEST's share.
@@ -350,7 +349,9 @@ func (s *Session) spreadETAOK(d *decision, st *Stream) bool {
 	return need/float64(n) <= float64(sroom)
 }
 
-// reorderBudget is SCHEDULER.md 13.2.
+// reorderBudget bounds the stream data spread ahead of the slowest usable
+// pipe: twice the summed delivery rate times the one-way-delay spread of
+// the usable pipes, plus one chunk, within the connection credit left.
 func (s *Session) reorderBudget() uint64 {
 	room := s.conn.sendMax - min64(s.conn.sendMax, s.conn.sent)
 	var sum float64
@@ -380,7 +381,7 @@ func (s *Session) reorderBudget() uint64 {
 	return min64(room, uint64(b))
 }
 
-// ---- weighted round-robin (SCHEDULER.md 6) ----
+// ---- weighted round-robin ----
 
 // rrWeights calls f with each candidate of tier ti and its weight.
 func (s *Session) rrWeights(g *gate, ti int, byRate bool, f func(p *Pipe, w float64)) {
@@ -486,7 +487,7 @@ type rrVal struct {
 	v    float64
 }
 
-// ---- affinity (SCHEDULER.md 7) ----
+// ---- affinity ----
 
 // binding is the pipe an affinity stream direction is bound to.
 type binding struct {
@@ -737,7 +738,7 @@ func containsU64(x []uint64, v uint64) bool {
 	return false
 }
 
-// ---- custom policies (API.md 5.2) ----
+// ---- custom policies ----
 
 // customOK applies a custom answer. Without one, the decision is requested
 // from the driver, which asks the policy outside every lock; the direction
@@ -953,7 +954,7 @@ func (s *Session) pickChanged() {
 	}
 }
 
-// ---- policy changes (SCHEDULER.md 12) ----
+// ---- policy changes ----
 
 // SetPolicy changes the session's policy; the previous policy's state is
 // discarded and the new one starts from its initial state.

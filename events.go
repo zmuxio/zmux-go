@@ -7,26 +7,59 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-// PipeEventKind is the kind of a pipe or session event (API.md 4.2, 4.5).
-type PipeEventKind uint8
+// EventKind is the kind of a session event. The comment of each kind
+// names the Event fields it sets; the other fields are zero.
+type EventKind uint8
 
 const (
-	PipeAdded PipeEventKind = iota + 1
-	PipeJoined
-	PipeSuspect
-	PipeRecovered
-	PipeFailed
-	PipeClosed
-	PipePriorityChanged
-	TierSaturation
-	JoinAuthFailed
-	SessionSuspended
-	SessionResumed
-	GoAwayReceived
-	JoinSecurityUnavailable
-	PipeQualityChanged
-	CapacityBelow
-	CapacityRestored
+	// EventPipeAdded reports that a local outbound pipe direction appeared
+	// (Pipe, Direction).
+	EventPipeAdded EventKind = iota + 1
+	// EventPipeJoined reports that an outbound pipe direction became active
+	// (Pipe, Direction).
+	EventPipeJoined
+	// EventPipeSuspect reports that an outbound pipe direction stopped making
+	// progress (Pipe, Direction).
+	EventPipeSuspect
+	// EventPipeRecovered reports that a suspect outbound direction is active
+	// again (Pipe, Direction).
+	EventPipeRecovered
+	// EventPipeFailed reports that an outbound pipe direction failed (Pipe,
+	// Direction).
+	EventPipeFailed
+	// EventPipeClosed reports that a pipe direction ended; DirBidirectional
+	// when the whole attachment was retired (Pipe, Direction).
+	EventPipeClosed
+	// EventPipePriorityChanged reports that the effective tier, standby state
+	// or weight of an outbound pipe changed (Pipe, Priority, Standby, Weight).
+	EventPipePriorityChanged
+	// EventTierSaturation reports that the usable pipes of a tier became
+	// saturated or stopped being so (Priority, Saturated).
+	EventTierSaturation
+	// EventJoinAuthFailed reports that a join failed authentication (Reason:
+	// "mac" or "mac_carrier_bound").
+	EventJoinAuthFailed
+	// EventSessionSuspended reports that every pipe of a direction was lost and
+	// the session waits for a resume (no fields).
+	EventSessionSuspended
+	// EventSessionResumed reports that a suspended session has a pipe again (no
+	// fields).
+	EventSessionResumed
+	// EventGoAwayReceived reports that the peer sent GOAWAY (GoAway).
+	EventGoAwayReceived
+	// EventJoinSecurityUnavailable reports that both endpoints offered
+	// multipath but no join secret is available, so no pipe can join (no
+	// fields).
+	EventJoinSecurityUnavailable
+	// EventPipeQualityChanged reports that an outbound pipe left its
+	// QualityBand (Pipe, SmoothedRTT, DeliveryRate).
+	EventPipeQualityChanged
+	// EventCapacityBelow reports that the outbound capacity fell below the
+	// CapacityFloor (DeliveryRate: the capacity).
+	EventCapacityBelow
+	// EventCapacityRestored reports that the outbound capacity is back above
+	// the CapacityFloor (DeliveryRate: the capacity).
+	EventCapacityRestored
 )
 
 var pipeEventNames = [...]string{"", "PipeAdded", "PipeJoined", "PipeSuspect", "PipeRecovered", "PipeFailed",
@@ -34,43 +67,46 @@ var pipeEventNames = [...]string{"", "PipeAdded", "PipeJoined", "PipeSuspect", "
 	"SessionResumed", "GoAwayReceived", "JoinSecurityUnavailable", "PipeQualityChanged", "CapacityBelow",
 	"CapacityRestored"}
 
-func (k PipeEventKind) String() string {
+func (k EventKind) String() string {
 	if int(k) < len(pipeEventNames) {
 		return pipeEventNames[k]
 	}
 	return "PipeEventKind(?)"
 }
 
-// PipeEvent is one event of NextPipeEvent.
-type PipeEvent struct {
-	Kind PipeEventKind
-	// Direction of the pipe events (with Pipe).
+// Event is a session event, as NextEvent and Tracer.Event report it. Kind
+// says which of the other fields are set (see EventKind).
+type Event struct {
+	Kind EventKind
+	// Direction of a pipe event, from the local endpoint.
 	Direction Direction
-	// Standby of PipePriorityChanged; Saturated of TierSaturation.
+	// Standby (EventPipePriorityChanged) and Saturated
+	// (EventTierSaturation).
 	Standby   bool
 	Saturated bool
-	// Pipe of the pipe events.
+	// Pipe is the pipe ID of a pipe event.
 	Pipe uint64
-	// Priority and Weight of PipePriorityChanged; Priority of
-	// TierSaturation.
+	// Priority is the tier (EventPipePriorityChanged,
+	// EventTierSaturation); Weight the pipe's weight
+	// (EventPipePriorityChanged).
 	Priority uint64
 	Weight   uint64
-	// Reason of JoinAuthFailed ("mac", "mac_carrier_bound").
+	// Reason of EventJoinAuthFailed.
 	Reason string
-	// GoAway of GoAwayReceived.
+	// GoAway of EventGoAwayReceived.
 	GoAway *GoAway
-	// SmoothedRTT and DeliveryRate of PipeQualityChanged; DeliveryRate is
-	// the capacity of CapacityBelow and CapacityRestored (bytes/s).
+	// SmoothedRTT and DeliveryRate (bytes/s) of EventPipeQualityChanged;
+	// DeliveryRate is also the capacity of EventCapacityBelow and
+	// EventCapacityRestored.
 	SmoothedRTT  time.Duration
 	DeliveryRate float64
 }
 
-// eventQueue holds session events for NextPipeEvent; it is guarded by the
-// session lock. It is bounded: when the application does not read events,
-// the oldest are dropped (the latest state of a pipe can always be read
-// with Pipes()).
+// eventQueue holds session events for NextEvent; it is guarded by the
+// session lock. It is bounded (eventQueueMax): when the application does
+// not read events, the oldest are dropped and counted.
 type eventQueue struct {
-	q       []PipeEvent
+	q       []Event
 	waiters []*core.Signal
 	seenOut map[uint64]string
 	dropped uint64
@@ -78,7 +114,7 @@ type eventQueue struct {
 
 const eventQueueMax = 1024
 
-func (e *eventQueue) push(ev PipeEvent) {
+func (e *eventQueue) push(ev Event) {
 	if len(e.q) >= eventQueueMax {
 		copy(e.q, e.q[1:])
 		e.q = e.q[:len(e.q)-1]
@@ -110,38 +146,38 @@ func (c *Conn) drainEventsLocked() {
 		case core.EvPipeState:
 			c.pipeStateEvent(e)
 		case core.EvJoinAuthFailed:
-			q.push(PipeEvent{Kind: JoinAuthFailed, Reason: e.Reason})
+			q.push(Event{Kind: EventJoinAuthFailed, Reason: e.Reason})
 		case core.EvEstablished:
 			c.hk.trace(traceItem{est: true})
 		case core.EvSuspended:
 			c.needRedial = true
-			q.push(PipeEvent{Kind: SessionSuspended})
+			q.push(Event{Kind: EventSessionSuspended})
 			if c.lst != nil {
 				if over := c.lst.sessionSuspended(c); len(over) > 0 {
 					go closeSuspended(over)
 				}
 			}
 		case core.EvResumed:
-			q.push(PipeEvent{Kind: SessionResumed})
+			q.push(Event{Kind: EventSessionResumed})
 			if c.lst != nil {
 				c.lst.sessionResumed(c)
 			}
 		case core.EvGoAwayReceived:
-			q.push(PipeEvent{Kind: GoAwayReceived, GoAway: &GoAway{MaxBidi: e.MaxBidi, MaxUni: e.MaxUni,
+			q.push(Event{Kind: EventGoAwayReceived, GoAway: &GoAway{MaxBidi: e.MaxBidi, MaxUni: e.MaxUni,
 				ErrorCode: ApplicationErrorCode(e.Code)}})
 		case core.EvJoinSecurityUnavailable:
-			q.push(PipeEvent{Kind: JoinSecurityUnavailable})
+			q.push(Event{Kind: EventJoinSecurityUnavailable})
 		case core.EvTierSaturation:
-			q.push(PipeEvent{Kind: TierSaturation, Priority: e.Code, Saturated: e.Saturated})
+			q.push(Event{Kind: EventTierSaturation, Priority: e.Code, Saturated: e.Saturated})
 		case core.EvPipeQuality:
-			q.push(PipeEvent{Kind: PipeQualityChanged, Pipe: e.Pipe, SmoothedRTT: time.Duration(e.RTT),
+			q.push(Event{Kind: EventPipeQualityChanged, Pipe: e.Pipe, SmoothedRTT: time.Duration(e.RTT),
 				DeliveryRate: e.Rate})
 		case core.EvCapacityBelow:
-			q.push(PipeEvent{Kind: CapacityBelow, DeliveryRate: e.Rate})
+			q.push(Event{Kind: EventCapacityBelow, DeliveryRate: e.Rate})
 		case core.EvCapacityRestored:
-			q.push(PipeEvent{Kind: CapacityRestored, DeliveryRate: e.Rate})
+			q.push(Event{Kind: EventCapacityRestored, DeliveryRate: e.Rate})
 		case core.EvPipePriority:
-			q.push(PipeEvent{Kind: PipePriorityChanged, Pipe: e.Pipe, Priority: e.Code, Standby: e.Saturated,
+			q.push(Event{Kind: EventPipePriorityChanged, Pipe: e.Pipe, Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count})
 		case core.EvClosed, core.EvDatagramDropped:
 			// The end surfaces through Wait and the drops through the
@@ -178,7 +214,7 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 				// carrier commands of this one have run.
 				c.retiredIDs = append(c.retiredIDs, e.Pipe)
 			}
-			q.push(PipeEvent{Kind: PipeClosed, Pipe: e.Pipe, Direction: Bidirectional})
+			q.push(Event{Kind: EventPipeClosed, Pipe: e.Pipe, Direction: DirBidirectional})
 		}
 		return
 	}
@@ -188,31 +224,39 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 	prev, seen := q.seenOut[e.Pipe]
 	q.seenOut[e.Pipe] = e.State
 	if !seen {
-		q.push(PipeEvent{Kind: PipeAdded, Pipe: e.Pipe, Direction: SendOnly})
+		q.push(Event{Kind: EventPipeAdded, Pipe: e.Pipe, Direction: DirSendOnly})
 	}
-	var k PipeEventKind
+	var k EventKind
 	switch e.State {
 	case "ACTIVE":
-		k = PipeJoined
+		k = EventPipeJoined
 		if prev == "SUSPECT" {
-			k = PipeRecovered
+			k = EventPipeRecovered
 		}
 	case "SUSPECT":
-		k = PipeSuspect
+		k = EventPipeSuspect
 	case "FAILED":
-		k = PipeFailed
+		k = EventPipeFailed
 	case "CLOSED":
-		k = PipeClosed
+		k = EventPipeClosed
 	}
 	if k != 0 && prev != e.State {
-		q.push(PipeEvent{Kind: k, Pipe: e.Pipe, Direction: SendOnly})
+		q.push(Event{Kind: k, Pipe: e.Pipe, Direction: DirSendOnly})
 	}
 }
 
-// NextPipeEvent returns the next pipe or session event (API.md 4.2). It
-// returns the session's error once the session has ended and no event is
-// left.
-func (c *Conn) NextPipeEvent(ctx context.Context) (PipeEvent, error) {
+// NextEvent returns the next session event, waiting until one arrives,
+// ctx ends or the session ends. Once the session has ended and no event is
+// left it returns the session's error.
+//
+// Events wait in a queue of the session bounded at 1024 events. Reading it
+// is optional: when nobody calls NextEvent the oldest events are dropped
+// (ConnectionStats.EventsDropped counts them), so a reader that falls
+// behind sees the latest events and can read the current state with
+// PipeStats. The queue is independent of Config.Tracer: a Tracer receives
+// every event as well, on its own bounded queue, whether or not NextEvent
+// is called. Concurrent callers each receive different events.
+func (c *Conn) NextEvent(ctx context.Context) (Event, error) {
 	sig := core.NewSignal()
 	for {
 		c.lock()
@@ -220,7 +264,7 @@ func (c *Conn) NextPipeEvent(ctx context.Context) (PipeEvent, error) {
 		if len(q.q) > 0 {
 			ev := q.q[0]
 			copy(q.q, q.q[1:])
-			q.q[len(q.q)-1] = PipeEvent{}
+			q.q[len(q.q)-1] = Event{}
 			q.q = q.q[:len(q.q)-1]
 			c.unlock()
 			return ev, nil
@@ -232,7 +276,7 @@ func (c *Conn) NextPipeEvent(ctx context.Context) (PipeEvent, error) {
 		}
 		c.unlock()
 		if closing {
-			return PipeEvent{}, c.closedErr()
+			return Event{}, c.closedErr()
 		}
 		select {
 		case <-sig.C:
@@ -245,7 +289,7 @@ func (c *Conn) NextPipeEvent(ctx context.Context) (PipeEvent, error) {
 				}
 			}
 			c.unlock()
-			return PipeEvent{}, ctx.Err()
+			return Event{}, ctx.Err()
 		case <-c.done:
 		}
 	}

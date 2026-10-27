@@ -49,7 +49,7 @@ func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.client, err = Dial(dctx, nc, ccfg)
+	e.client, err = Client(dctx, nc, ccfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 	e.client.SetScheduler(SpreadRoundRobin())
 
 	payload := make([]byte, 4<<20)
-	rand.Read(payload)
+	_, _ = rand.Read(payload)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	done := make(chan []byte, 1)
@@ -133,13 +133,13 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 		t.Fatalf("received %d bytes, want %d intact", len(got), len(payload))
 	}
 	var used int
-	for _, ps := range e.client.Pipes() {
+	for _, ps := range e.client.PipeStats() {
 		if ps.BytesSent > 1<<16 {
 			used++
 		}
 	}
 	if used < 1 {
-		t.Fatalf("no pipe carried data: %+v", e.client.Pipes())
+		t.Fatalf("no pipe carried data: %+v", e.client.PipeStats())
 	}
 }
 
@@ -150,9 +150,9 @@ func TestMultipathEventsAndStats(t *testing.T) {
 	p := e.addPipe(t, PipeOptions{Weight: &w, Label: "second"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	seen := map[PipeEventKind]bool{}
-	for !seen[PipeJoined] {
-		ev, err := e.client.NextPipeEvent(ctx)
+	seen := map[EventKind]bool{}
+	for !seen[EventPipeJoined] {
+		ev, err := e.client.NextEvent(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,11 +169,11 @@ func TestMultipathEventsAndStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	for {
-		ev, err := e.client.NextPipeEvent(ctx)
+		ev, err := e.client.NextEvent(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ev.Kind == PipePriorityChanged {
+		if ev.Kind == EventPipePriorityChanged {
 			if ev.Pipe != p.ID() || ev.Priority != 5 {
 				t.Fatalf("event %+v", ev)
 			}
@@ -184,11 +184,11 @@ func TestMultipathEventsAndStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	for {
-		ev, err := e.client.NextPipeEvent(ctx)
+		ev, err := e.client.NextEvent(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ev.Kind == PipeClosed && ev.Pipe == p.ID() {
+		if ev.Kind == EventPipeClosed && ev.Pipe == p.ID() {
 			break
 		}
 	}

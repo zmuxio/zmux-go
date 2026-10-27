@@ -10,7 +10,7 @@ type dgramState struct {
 	recvW    []*Signal
 	sendW    []*Signal
 	// Received datagrams that wait for the receive limiter, which the
-	// driver runs outside the lock (API.md 5.6).
+	// driver runs outside the lock.
 	limited []PendingDatagram
 }
 

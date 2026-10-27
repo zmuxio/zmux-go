@@ -3,6 +3,7 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -32,7 +33,7 @@ type StreamID int64
 
 // Conn is a zmux session. Its methods are safe for concurrent use.
 //
-// Concurrency model (GO-DESIGN.md): one mutex guards the sans-IO core; no
+// Concurrency model: one mutex guards the sans-IO core; no
 // I/O, blocking or application code runs under it. Each pipe direction has
 // a reader and a writer goroutine; wake-ups are queued under the lock and
 // delivered after it is released.
@@ -61,7 +62,7 @@ type Conn struct {
 	oobHeaders  map[uint64]string // Zmux-Pipe-Join values of reservations
 	labels      map[uint64]string // pipe labels
 	lst         *Listener         // the listener that accepted the session
-	nestedLanes int               // lanes that nested pipes hold on this session (API.md 4.6)
+	nestedLanes int               // lanes that nested pipes hold on this session
 	retiredIDs  []uint64          // pipes retired in this critical section
 	retiredDone []uint64          // pipes retired in the previous one
 	hk          *hooks            // application hooks (nil: none)
@@ -87,6 +88,8 @@ func (c *Conn) unlock() {
 	r := recover()
 	if r != nil {
 		c.poison(r)
+	} else if c.s.SettlePending() {
+		c.settle()
 	}
 	wp := sigPool.Get().(*[]*core.Signal)
 	ws := c.s.TakeWakes((*wp)[:0])
@@ -137,9 +140,20 @@ func (c *Conn) unlock() {
 	}
 	if r != nil {
 		// The session is closed; the panic is not propagated to the caller,
-		// which gets the session error (IMPLEMENTATION.md 2.5.6).
+		// which gets the session error.
 		_ = r
 	}
+}
+
+// settle runs the core's pending completion, converting a panic like the
+// other critical sections do.
+func (c *Conn) settle() {
+	defer func() {
+		if r := recover(); r != nil {
+			c.poison(r)
+		}
+	}()
+	c.s.Settle()
 }
 
 // poison closes the session after a panic under the lock without running
@@ -150,14 +164,14 @@ func (c *Conn) poison(r any) {
 	}
 	c.poisoned = true
 	defer func() { _ = recover() }()
-	c.s.Close(uint64(InternalError), []byte(fmt.Sprint("internal error: ", r)))
+	c.s.Close(uint64(TransportInternalError), []byte(fmt.Sprint("internal error: ", r)))
 }
 
 func (c *Conn) rearmLocked() {
 	t := c.s.NextTimeout()
 	if c.fired {
 		// A deadline the timeout just handled did not move: never fire
-		// again at once (a busy loop), but G later (SCHEDULER.md 9.1).
+		// again at once (a busy loop), but G later.
 		c.fired = false
 		if now := c.clk.now(); t <= now {
 			t = now.Add(core.Millisecond)
@@ -198,9 +212,11 @@ func (c *Conn) onTimer() {
 
 }
 
-// Start establishes a session over any carrier with an explicit role
-// (API.md Section 3). It returns once the peer's transport parameters were
-// processed, or at once when early data toward a zmux peer is enabled.
+// Start establishes a session over any carrier with an explicit role. It
+// returns once the peer's transport parameters were processed, or at once
+// when the session may send early data (EarlyData.ZmuxPeer, or
+// EarlyData.Replayable with Remembered parameters); ConnectionState's
+// Established is false until the parameters arrive.
 func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error) {
 	if p.R == nil || p.W == nil {
 		return nil, fmt.Errorf("%w: the bootstrap carrier needs both halves", ErrInvalidConfig)
@@ -297,13 +313,56 @@ func sessionExporter(p PipeIO, initiator bool) ([]byte, error) {
 	return nil, fmt.Errorf("%w: PipeAuth.TLS on a carrier without TLS", ErrInvalidConfig)
 }
 
-// Dial establishes a client session over c (the qmux-go form).
-func Dial(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
+// Dial connects to addr on the named network (as net.Dialer.DialContext)
+// and starts a client session on the connection, which the session owns
+// from then on. It returns as Start does; ctx bounds the dial and the
+// handshake.
+func Dial(ctx context.Context, network, addr string, cfg *Config) (*Conn, error) {
+	var d net.Dialer
+	nc, err := d.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return clientOwning(ctx, nc, cfg)
+}
+
+// DialTLS connects to addr on the named network, runs the TLS handshake
+// with tlsConf (as tls.Dialer.DialContext) and starts a client session on
+// the TLS connection, which the session owns from then on. ctx bounds the
+// dial and both handshakes.
+func DialTLS(ctx context.Context, network, addr string, tlsConf *tls.Config, cfg *Config) (*Conn, error) {
+	d := tls.Dialer{Config: tlsConf}
+	nc, err := d.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return clientOwning(ctx, nc, cfg)
+}
+
+// clientOwning starts a client session on a connection it dialled, closing
+// it when the session cannot start.
+func clientOwning(ctx context.Context, nc net.Conn, cfg *Config) (*Conn, error) {
+	c, err := Client(ctx, nc, cfg)
+	if err != nil {
+		_ = nc.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// Client starts a client session on a connection the caller established
+// (TCP, TLS, Unix or any net.Conn), like tls.Client; it returns as Start
+// does. The session owns c from then on, unless Client fails with
+// ErrInvalidConfig.
+func Client(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
 	return Start(ctx, NetPipe(c), RoleClient, cfg)
 }
 
-// Server establishes a server session over c. It does not accept pipe
-// joins; use a Listener for multipath.
+// Server starts a single-pipe server session on an accepted connection,
+// like tls.Server. For multipath, resume or pipe joins use a Listener
+// (Listener.Serve accepts sessions and joins on a net.Listener): Server
+// rejects Config.MaxPipes above 1 with ErrInvalidConfig. The session owns
+// c from then on, unless Server fails with ErrInvalidConfig.
 func Server(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
 	if cfg != nil && cfg.MaxPipes > 1 {
 		return nil, fmt.Errorf("%w: Server cannot accept joins; use a Listener", ErrInvalidConfig)
@@ -387,17 +446,25 @@ func (c *Conn) closeWith(code ApplicationErrorCode, msg string) {
 	c.s.Close(uint64(code), []byte(msg))
 }
 
-// Close closes the session with code 0; like CloseWithError it never
-// blocks (use Wait for the end, or Shutdown for a graceful close).
+// Close closes the session at once with application error code 0,
+// discarding data not yet sent; it never blocks. Unlike net.Conn.Close it
+// does not flush: to let the peer read what was written, call
+// Shutdown(ctx, 0, "") instead. Wait waits for the end.
 func (c *Conn) Close() error { return c.CloseWithError(0, "") }
 
-// Shutdown closes gracefully: GOAWAY when it is in use, wait for open
-// streams, then CONNECTION_CLOSE (API.md 5.7). When ctx ends first it falls
-// back to CloseWithError and returns ctx's error.
+// Shutdown closes gracefully: it sends GOAWAY when the session negotiated
+// it, so that the peer opens no new stream, waits until the open streams
+// have ended, then closes with code and msg. When ctx ends first
+// it falls back to CloseWithError(code, msg) and returns ctx's error. The
+// usual call is
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//	defer cancel()
+//	err := conn.Shutdown(ctx, 0, "")
 func (c *Conn) Shutdown(ctx context.Context, code ApplicationErrorCode, msg string) error {
 	c.lock()
 	c.s.SetNow(c.clk.now())
-	c.s.Shutdown(uint64(code))
+	c.s.Shutdown(uint64(code), []byte(msg))
 	c.unlock()
 	select {
 	case <-c.done:
@@ -456,7 +523,7 @@ func (c *Conn) Ping(ctx context.Context) (time.Duration, error) {
 	}
 }
 
-// ConnectionState reports the negotiation results (API.md 5.4).
+// ConnectionState reports the negotiation results.
 type ConnectionState struct {
 	Role               Role
 	Established        bool
@@ -505,7 +572,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 	return st
 }
 
-// ConnectionStats are transport counters (API.md 7.2).
+// ConnectionStats are transport counters.
 type ConnectionStats struct {
 	BytesSent, BytesReceived     uint64
 	RecordsSent, RecordsReceived uint64
@@ -519,6 +586,9 @@ type ConnectionStats struct {
 	BytesWritten, BytesRead      uint64 // application bytes
 	BytesRedundant               uint64 // stream bytes sent again as redundant copies
 	NoEffectBudget               int64
+	// EventsDropped counts the events NextEvent's queue dropped because
+	// nobody read them in time.
+	EventsDropped uint64
 }
 
 // ConnectionStats returns a snapshot of the counters.
@@ -532,7 +602,7 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		DatagramsReceived: s.DatagramsReceived, DatagramsDroppedSend: s.DatagramsDroppedSend,
 		DatagramsDroppedRecv: s.DatagramsDroppedRecv, DatagramsDroppedLimit: s.DatagramsDroppedLimit,
 		BytesWritten: s.AppBytesWritten, BytesRead: s.AppBytesRead, BytesRedundant: s.BytesRedundant,
-		NoEffectBudget: c.s.BudgetTokens()}
+		NoEffectBudget: c.s.BudgetTokens(), EventsDropped: c.events.dropped}
 }
 
 // LocalAddr returns the local address of pipe 0 when its carrier has one.
@@ -587,6 +657,12 @@ func (c *Conn) sendDatagram(st *core.Stream, cx uint64, p []byte) error {
 // SendDatagramWait queues a session datagram, waiting for room in the send
 // queue instead of dropping its oldest entry.
 func (c *Conn) SendDatagramWait(ctx context.Context, p []byte) error {
+	return c.sendDatagramWait(ctx, nil, 0, p)
+}
+
+// sendDatagramWait waits for room in the send queue, then queues a session
+// (st nil) or stream datagram.
+func (c *Conn) sendDatagramWait(ctx context.Context, st *core.Stream, cx uint64, p []byte) error {
 	sig := core.NewSignal()
 	defer func() {
 		c.lock()
@@ -603,7 +679,7 @@ func (c *Conn) SendDatagramWait(ctx context.Context, p []byte) error {
 		}
 		c.unlock()
 		if !full {
-			return c.SendDatagram(p)
+			return c.sendDatagram(st, cx, p)
 		}
 		select {
 		case <-sig.C:
@@ -616,7 +692,7 @@ func (c *Conn) SendDatagramWait(ctx context.Context, p []byte) error {
 }
 
 // passDatagrams runs received datagrams through the receive limiter,
-// outside the lock (API.md 5.6).
+// outside the lock.
 func (c *Conn) passDatagrams() {
 	lim := c.cfg.DatagramLimiter.Receive
 	if lim == nil {

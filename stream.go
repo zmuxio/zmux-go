@@ -38,7 +38,7 @@ func (c *Conn) newHandle(st *core.Stream) *handle {
 }
 
 // cleanupHandle runs on the runtime's cleanup goroutine when a handle is
-// collected without being closed: reset(0) and stop(0) (API.md 5.1).
+// collected without being closed: reset(0) and stop(0).
 func cleanupHandle(h *handle) {
 	h.stopDeadlines()
 	h.c.orphan(h.st)
@@ -193,7 +193,7 @@ func (h *handle) write(p []byte, fin bool) (int, error) {
 }
 
 // writeBatch writes a nested session's batch into the stream without
-// copying its payload (API.md 4.6), waiting for send-buffer room like
+// copying its payload, waiting for send-buffer room like
 // write.
 func (h *handle) writeBatch(b *core.Batch) (int, error) {
 	h.wmu.Lock()
@@ -264,6 +264,19 @@ type SendStream struct{ h *handle }
 // Stream is a bidirectional stream. Close finishes the sending part only
 // (the quic-go convention); use CancelRead to stop reading.
 type Stream struct{ h *handle }
+
+// Urgency is the scheduling urgency of a stream's sending part (as in RFC
+// 9218): lower is more urgent.
+type Urgency uint8
+
+const (
+	// UrgencyHighest is the most urgent level.
+	UrgencyHighest Urgency = 0
+	// UrgencyDefault is the level of a new stream.
+	UrgencyDefault Urgency = 3
+	// UrgencyLowest is the least urgent level.
+	UrgencyLowest Urgency = 7
+)
 
 func newStream(h *handle) *Stream {
 	s := &Stream{h: h}
@@ -387,16 +400,16 @@ type streamConn struct {
 	local, remote net.Addr
 }
 
-// StreamConn returns a net.Conn view of s. Unlike Stream.Close, its Close
-// both finishes the stream and stops reading (CancelRead(CodeNoError)), as net.Conn
-// users expect.
+// StreamConn returns a net.Conn view of s. Unlike Stream.Close, its Close both
+// finishes the stream and stops reading (CancelRead(StreamNoError)), as
+// net.Conn users expect.
 func StreamConn(s *Stream, local, remote net.Addr) net.Conn {
 	return &streamConn{Stream: s, local: local, remote: remote}
 }
 
 func (c *streamConn) Close() error {
 	err := c.Stream.Close()
-	c.CancelRead(CodeNoError)
+	c.CancelRead(StreamNoError)
 	return err
 }
 

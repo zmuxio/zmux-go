@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// HTTP carriers (API.md 4.1): a request body carries the up direction, a
+// HTTP carriers: a request body carries the up direction, a
 // response body the down direction. HTTP/2 and HTTP/3 requests (and
 // HTTP/1.1 with full duplex) carry both; a split bootstrap pairs an uplink
 // POST and a downlink GET by the Zmux-Pipe-Pair header (SPEC.md 6.1.1), and
@@ -23,10 +23,10 @@ const (
 	HeaderPair = "Zmux-Pipe-Pair"
 )
 
-// HTTPPipe opens a carrier over an HTTP request: dir Bidirectional sends
+// HTTPPipe opens a carrier over an HTTP request: dir DirBidirectional sends
 // the request body up and reads the response body (HTTP/2, HTTP/3, or an
-// HTTP/1.1 server with full duplex); SendOnly is a POST whose body is the
-// uplink; ReceiveOnly is a GET whose response body is the downlink. h may
+// HTTP/1.1 server with full duplex); DirSendOnly is a POST whose body is the
+// uplink; DirReceiveOnly is a GET whose response body is the downlink. h may
 // carry the Zmux-Pipe-Join value of a Reservation. The request lives until
 // the pipe ends.
 func HTTPPipe(ctx context.Context, client *http.Client, url string, h http.Header, dir Direction) (PipeIO, error) {
@@ -37,7 +37,7 @@ func HTTPPipe(ctx context.Context, client *http.Client, url string, h http.Heade
 	method := http.MethodPost
 	var body io.ReadCloser = http.NoBody
 	var pw *io.PipeWriter
-	if dir == ReceiveOnly {
+	if dir == DirReceiveOnly {
 		method = http.MethodGet
 	} else {
 		var pr *io.PipeReader
@@ -52,7 +52,7 @@ func HTTPPipe(ctx context.Context, client *http.Client, url string, h http.Heade
 	for k, v := range h {
 		req.Header[k] = v
 	}
-	if dir == SendOnly {
+	if dir == DirSendOnly {
 		// The response is not read; the request ends with the pipe.
 		w := &httpReqWriter{pw: pw, cancel: cancel}
 		go func() {
@@ -105,11 +105,11 @@ func HTTPSplitPipe(ctx context.Context, client *http.Client, url string, h http.
 		hh = http.Header{}
 	}
 	hh.Set(HeaderPair, base64.RawURLEncoding.EncodeToString(tok[:]))
-	up, err := HTTPPipe(ctx, client, url, hh, SendOnly)
+	up, err := HTTPPipe(ctx, client, url, hh, DirSendOnly)
 	if err != nil {
 		return PipeIO{}, err
 	}
-	down, err := HTTPPipe(ctx, client, url, hh, ReceiveOnly)
+	down, err := HTTPPipe(ctx, client, url, hh, DirReceiveOnly)
 	if err != nil {
 		_ = up.W.Close() // abandon the uplink; err is the one to report
 		return PipeIO{}, err

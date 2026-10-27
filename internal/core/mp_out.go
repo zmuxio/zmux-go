@@ -30,7 +30,7 @@ func (a *attach) minRTT() Duration {
 	return a.rtt.smoothed
 }
 
-// owd is OWD_p (SCHEDULER.md 2.2).
+// owd is OWD_p.
 func (s *Session) owd(p *Pipe) Duration {
 	a := p.mp
 	if !a.rtt.has {

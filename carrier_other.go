@@ -9,4 +9,4 @@ import (
 
 func setNotsentLowat(uintptr, int) error { return errors.ErrUnsupported }
 
-func tcpMinRTT(uintptr) (time.Duration, bool) { return 0, false }
+func tcpMinRTT(_ uintptr) (time.Duration, bool) { return 0, false }

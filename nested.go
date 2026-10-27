@@ -11,7 +11,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-// Streams as pipes (API.md 4.6, EXTENSIONS.md 10): a bidirectional stream
+// Streams as pipes (EXTENSIONS.md 10): a bidirectional stream
 // of an outer session carries a pipe pair of a nested session.
 
 // OpenPipeStream opens a stream of c to carry a pipe pair of another
@@ -69,7 +69,7 @@ func (r *stPipeR) Read(p []byte) (int, error) { return r.s.Read(p) }
 // Close of the receiving half before its end stops it with
 // ZMUX_CARRIER_FAILED.
 func (r *stPipeR) Close() error {
-	r.once.Do(func() { r.s.CancelRead(CodeCarrierFailed) })
+	r.once.Do(func() { r.s.CancelRead(StreamCarrierFailed) })
 	return nil
 }
 
@@ -96,8 +96,8 @@ func (w *stPipeW) Close() error {
 // with the preamble as Reliable Size on the opener's part) and stops the
 // receiving part.
 func (w *stPipeW) Abort(error) {
-	w.wonce.Do(func() { w.s.CancelWrite(CodeCarrierFailed) })
-	w.once.Do(func() { w.s.CancelRead(CodeCarrierFailed) })
+	w.wonce.Do(func() { w.s.CancelWrite(StreamCarrierFailed) })
+	w.once.Do(func() { w.s.CancelRead(StreamCarrierFailed) })
 }
 
 // CarrierConn reports the outer session as the carrier connection.
@@ -106,7 +106,7 @@ func (w *stPipeW) CarrierConn() any { return w.outer }
 // OpenLane opens a further carrier stream of the outer session as a lane,
 // only where lanes pay off (the outer session has lanes or more than one
 // pipe) and only with stream credit that leaves the application at least
-// half of the outer peer's streams (API.md 4.6).
+// half of the outer peer's streams.
 func (w *stPipeW) OpenLane(context.Context) (io.WriteCloser, error) {
 	o := w.outer
 	s, ok := o.openNestedLane()
@@ -147,7 +147,7 @@ func (l *laneStream) Close() error {
 
 func (l *laneStream) Abort(error) {
 	l.once.Do(func() {
-		l.s.CancelWrite(CodeCarrierFailed)
+		l.s.CancelWrite(StreamCarrierFailed)
 		l.outer.releaseNestedLane()
 	})
 }
@@ -170,7 +170,7 @@ func (c *Conn) lanesPayOff() bool {
 }
 
 // openNestedLane opens an outer stream as a lane of a nested pipe in one
-// step under the outer session's lock (API.md 4.6): only with stream
+// step under the outer session's lock: only with stream
 // credit that no application opener waits for, never waiting itself, and
 // while the lanes of all nested pipes on c stay at most half of the outer
 // peer's initial_max_streams_bidi.
@@ -213,21 +213,28 @@ var nesting = struct {
 // errNestingLoop refuses a pipe whose carrier runs over its own session.
 var errNestingLoop = errors.New("zmux: the carrier runs over the session it would join")
 
-// outerOf returns the outer session of a stream-backed carrier.
-func outerOf(p PipeIO) *Conn {
+// outerRef names the outer session a stream-backed carrier runs over. It
+// is a reference for the nesting graph only: its holder neither owns nor
+// closes that session.
+type outerRef struct{ c *Conn }
+
+// outerOf returns the outer session of a stream-backed carrier (zero for
+// other carriers).
+func outerOf(p PipeIO) outerRef {
 	for _, x := range []any{p.W, p.R} {
 		if cc, ok := x.(carrierConner); ok {
 			if o, ok := cc.CarrierConn().(*Conn); ok {
-				return o
+				return outerRef{o}
 			}
 		}
 	}
-	return nil
+	return outerRef{}
 }
 
-// nestPipe records that n runs over o, unless o runs over n already; the
-// check and the record are one atomic step.
-func nestPipe(n, o *Conn) error {
+// nestPipe records that n runs over ref, unless ref runs over n already;
+// the check and the record are one atomic step.
+func nestPipe(n *Conn, ref outerRef) error {
+	o := ref.c
 	if o == nil {
 		return nil
 	}
@@ -246,7 +253,8 @@ func nestPipe(n, o *Conn) error {
 }
 
 // unnestPipe drops one edge n -> o (the pipe ended).
-func unnestPipe(n, o *Conn) {
+func unnestPipe(n *Conn, ref outerRef) {
+	o := ref.c
 	if o == nil {
 		return
 	}

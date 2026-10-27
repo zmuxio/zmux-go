@@ -1,7 +1,7 @@
 package core
 
 // Pacing: which pipes the carrier queue limiter paces, and its inputs
-// from the sends and acknowledgements of a pipe (SCHEDULER.md 9.1).
+// from the sends and acknowledgements of a pipe.
 
 // paced reports whether the limiter paces p: with acknowledgements (a
 // multipath session, or the single pipe with pipe acknowledgement), when
@@ -139,7 +139,7 @@ func (s *Session) paceDeadline() Time {
 	t := Never
 	for _, p := range s.pipes {
 		if p.out != nil && p.out.snd.lim != nil && p.out.snd.lim.held {
-			// G: no pacing timer earlier than the granularity (SCHEDULER.md 9.1).
+			// G: no pacing timer earlier than the granularity.
 			t = minT(t, max(p.out.snd.lim.release, s.now.Add(limGranularity)))
 		}
 	}

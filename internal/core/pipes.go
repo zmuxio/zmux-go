@@ -19,8 +19,8 @@ type CarrierInfo struct {
 	// Lanes: the carrier offers lanes (MULTIPATH.md 2.5).
 	Lanes bool
 	// QueueBound: the carrier bounds its own queue, with a low-water mark
-	// or an unsent count (API.md 4.1); otherwise the carrier queue limiter
-	// paces it (SCHEDULER.md 9.1).
+	// or an unsent count; otherwise the carrier queue limiter
+	// paces it.
 	QueueBound bool
 }
 
@@ -85,7 +85,7 @@ type outLane struct {
 	confirmed   bool
 	refused     bool
 	boundSt     []*Stream // stream directions bound to the lane
-	served      bool      // took a data batch this round (SCHEDULER.md 9.2 rule 4)
+	served      bool      // took a data batch this round
 	waiting     bool      // was refused data for its turn
 	sig         *Signal   // wakes the lane's writer (lanes above 0; lane 0 uses the pipe's)
 	openedAt    Time

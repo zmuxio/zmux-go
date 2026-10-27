@@ -52,7 +52,7 @@ func TestSpliceForwardsBothWays(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg := make([]byte, 2<<20)
-	rand.Read(msg)
+	_, _ = rand.Read(msg)
 	go func() { _, _ = s.Write(msg); _ = s.Close() }()
 	got, err := io.ReadAll(s)
 	if err != nil || !bytes.Equal(got, msg) {

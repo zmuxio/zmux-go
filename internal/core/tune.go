@@ -1,6 +1,6 @@
 package core
 
-// Receive-window auto-tuning (IMPLEMENTATION.md 6.2, SPEC.md 8.3 rule 6):
+// Receive-window auto-tuning (SPEC.md 8.3 rule 6):
 // each window is the arrival rate times max(K x RTT_min, B) and never
 // shrinks. One tuner per scope (a stream's receiving part, the session),
 // allocated with the scope's first data.
@@ -62,7 +62,7 @@ func (s *Session) SetCarrierMinRTT(d Duration) { s.tn.carrierMin = d }
 func (s *Session) tunePingSample(d Duration) { s.tn.loopMin.update(d, s.now) }
 func (s *Session) tuneAckSample(d Duration)  { s.tn.loopMin.update(d, s.now) }
 
-// pipeMinRTT is pipe_min_rtt of an attachment (IMPLEMENTATION.md 6.2).
+// pipeMinRTT is pipe_min_rtt of an attachment.
 func (s *Session) pipeMinRTT(p *Pipe) (Duration, bool) {
 	if p == nil || p.mp == nil {
 		return 0, false
@@ -255,7 +255,7 @@ func (s *Session) tuneData(st *Stream, end uint64) {
 }
 
 // tuneConsume lifts the pause once the buffer fell below half its cap.
-func (s *Session) tuneConsume(*Stream) {
+func (s *Session) tuneConsume() {
 	if s.tn.paused && s.conn.buffered < s.bufferCap()/2 {
 		s.tn.paused = false
 	}

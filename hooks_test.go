@@ -116,11 +116,11 @@ func TestRedialAfterSuspension(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for {
-		ev, err := e.client.NextPipeEvent(ctx)
+		ev, err := e.client.NextEvent(ctx)
 		if err != nil {
 			t.Fatalf("no resumption: %v (dials %d)", err, dials.Load())
 		}
-		if ev.Kind == SessionResumed {
+		if ev.Kind == EventSessionResumed {
 			break
 		}
 	}

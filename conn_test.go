@@ -29,7 +29,7 @@ func pair(t testing.TB, a, b net.Conn, ccfg, scfg *Config) (*Conn, *Conn) {
 		s, err := Server(ctx, b, scfg)
 		ch <- res{s, err}
 	}()
-	c, err := Dial(ctx, a, ccfg)
+	c, err := Client(ctx, a, ccfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestEcho(t *testing.T) {
 				t.Fatal(err)
 			}
 			msg := make([]byte, 300000)
-			rand.Read(msg)
+			_, _ = rand.Read(msg)
 			go func() {
 				_, _ = st.Write(msg)
 				_ = st.Close()

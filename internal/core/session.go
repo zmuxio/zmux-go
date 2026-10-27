@@ -104,7 +104,7 @@ type Session struct {
 	copyMaxData       bool
 }
 
-// Stats are exact counters of the session (API.md 7.2 subset).
+// Stats are exact counters of the session.
 type Stats struct {
 	BytesSent, BytesReceived     uint64
 	RecordsSent, RecordsReceived uint64
@@ -267,9 +267,11 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 				return &wire.Error{Code: wire.RoleConflict, Reason: "equal role nonces"}
 			}
 		case lr == wire.RoleAuto:
-			s.role = RoleInitiator
-			if pr == wire.RoleInitiator {
+			switch pr {
+			case wire.RoleInitiator:
 				s.role = RoleResponder
+			case wire.RoleResponder:
+				s.role = RoleInitiator
 			}
 		case pr == wire.RoleAuto || lr != pr:
 			s.role = Role(lr)

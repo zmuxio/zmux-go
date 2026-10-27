@@ -3,6 +3,7 @@ package zmux
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -16,7 +17,7 @@ type TLV struct {
 	Value []byte
 }
 
-// Chunk is stream data passed on without a copy (API.md 5.1). A chunk read
+// Chunk is stream data passed on without a copy. A chunk read
 // with ReadChunk references the session's receive buffer until it is
 // released: by WriteChunk, which takes ownership in every outcome, or by
 // Release.
@@ -44,12 +45,15 @@ func (h *handle) do(f func(s *core.Session) error) error {
 	return apiErr(f(c.s))
 }
 
-func (h *handle) setPriority(u uint8, inc bool) {
-	_ = h.do(func(s *core.Session) error { s.SetPriority(h.st, u, inc); return nil })
+func (h *handle) setPriority(u Urgency, inc bool) {
+	_ = h.do(func(s *core.Session) error { s.SetPriority(h.st, uint8(u), inc); return nil })
 }
 
-func (h *handle) setPeerPriority(u uint8, inc bool) error {
-	return h.do(func(s *core.Session) error { return s.SetPeerPriority(h.st, u, inc) })
+func (h *handle) setPeerPriority(u Urgency, inc bool) error {
+	if u > UrgencyLowest {
+		return fmt.Errorf("%w: urgency %d above %d", ErrInvalidConfig, u, UrgencyLowest)
+	}
+	return h.do(func(s *core.Session) error { return s.SetPeerPriority(h.st, uint8(u), inc) })
 }
 
 func (h *handle) preamble() ([]byte, []TLV, bool) {
@@ -278,16 +282,20 @@ func (h *handle) readFrom(r io.Reader) (int64, error) {
 
 // ---- Stream ----
 
-// SetPriority sets the local scheduling priority (urgency 0 to 7, lower is
-// more urgent; incremental directions share their level in turns).
-func (s *Stream) SetPriority(urgency uint8, incremental bool) {
+// SetPriority sets the local scheduling priority of the stream's sending
+// part: urgency (UrgencyHighest to UrgencyLowest; values above are taken
+// as UrgencyLowest), and whether it is incremental (incremental
+// directions of one urgency share it in turns, the others go one after
+// the other). New streams have UrgencyDefault, incremental.
+func (s *Stream) SetPriority(urgency Urgency, incremental bool) {
 	defer runtime.KeepAlive(s)
 	s.h.setPriority(urgency, incremental)
 }
 
 // SetPeerPriority asks the peer to schedule its sending part of the stream
-// so: in the preamble before the first frame, PRIORITY_UPDATE after.
-func (s *Stream) SetPeerPriority(urgency uint8, incremental bool) error {
+// so: in the preamble before the first frame, PRIORITY_UPDATE after. An
+// urgency above UrgencyLowest is ErrInvalidConfig.
+func (s *Stream) SetPeerPriority(urgency Urgency, incremental bool) error {
 	defer runtime.KeepAlive(s)
 	return s.h.setPeerPriority(urgency, incremental)
 }
@@ -315,8 +323,8 @@ func (s *Stream) PreambleTLVs() []TLV {
 	return t
 }
 
-// SetPipeCarrier marks the stream as a carrier of another session's pipe
-// (API.md 4.6) before the first frame.
+// SetPipeCarrier marks the stream as a carrier of another session's pipe before
+// the first frame.
 func (s *Stream) SetPipeCarrier() error {
 	defer runtime.KeepAlive(s)
 	return s.h.do(func(c *core.Session) error { return c.SetPipeCarrier(s.h.st) })
@@ -432,6 +440,13 @@ func (s *Stream) SendDatagram(contextID uint64, p []byte) error {
 	return s.h.sendDatagram(contextID, p)
 }
 
+// SendDatagramWait sends a stream datagram like SendDatagram, waiting for
+// room in the send queue instead of dropping its oldest entry.
+func (s *Stream) SendDatagramWait(ctx context.Context, contextID uint64, p []byte) error {
+	defer runtime.KeepAlive(s)
+	return s.h.c.sendDatagramWait(ctx, s.h.st, contextID, p)
+}
+
 // ReceiveDatagram returns the next stream datagram and its context
 // identifier.
 func (s *Stream) ReceiveDatagram(ctx context.Context) (uint64, []byte, error) {
@@ -441,8 +456,8 @@ func (s *Stream) ReceiveDatagram(ctx context.Context) (uint64, []byte, error) {
 
 // ---- SendStream ----
 
-// SetPriority sets the local scheduling priority.
-func (s *SendStream) SetPriority(urgency uint8, incremental bool) {
+// SetPriority sets the local scheduling priority, as Stream.SetPriority.
+func (s *SendStream) SetPriority(urgency Urgency, incremental bool) {
 	defer runtime.KeepAlive(s)
 	s.h.setPriority(urgency, incremental)
 }
@@ -519,8 +534,9 @@ func (s *SendStream) ReadFrom(r io.Reader) (int64, error) {
 
 // ---- ReceiveStream ----
 
-// SetPeerPriority asks the peer to schedule the stream so.
-func (s *ReceiveStream) SetPeerPriority(urgency uint8, incremental bool) error {
+// SetPeerPriority asks the peer to schedule the stream so, as
+// Stream.SetPeerPriority.
+func (s *ReceiveStream) SetPeerPriority(urgency Urgency, incremental bool) error {
 	defer runtime.KeepAlive(s)
 	return s.h.setPeerPriority(urgency, incremental)
 }

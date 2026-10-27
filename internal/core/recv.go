@@ -400,7 +400,7 @@ func (s *Session) Read(st *Stream, p []byte) (int, bool, error) {
 		s.stats.AppBytesRead += uint64(n)
 		s.bufSub(uint64(n))
 		s.streamCreditChanged(st)
-		s.tuneConsume(st)
+		s.tuneConsume()
 	}
 	if r.reset && r.readOff >= r.resetRel && r.buf.contiguous(r.readOff) == r.readOff {
 		if n > 0 {
@@ -535,6 +535,11 @@ func (s *Session) maybeDiscard(st *Stream) {
 	if st.dg != nil {
 		s.dropStreamDgrams(st)
 	}
+	// A graceful shutdown closes once its last stream is gone: checked by
+	// Settle, after the operation that discarded the stream.
+	if s.ga.closeWhenDone {
+		s.ga.recheck = true
+	}
 }
 
 func (s *Session) unlinkCtl(st *Stream) {
@@ -614,9 +619,8 @@ func (f *streamFIFO) pop() *Stream {
 func (f *streamFIFO) len() int { return len(f.q) - f.head }
 
 // SetReceiveWindow sets a receiving part's window: initial raises the
-// advertised limit at once, max caps auto-tuning and the unread bytes
-// (IMPLEMENTATION.md 6.4). Values below 16 KiB are raised to 16 KiB; 0
-// leaves a value as it is.
+// advertised limit at once, max caps auto-tuning and the unread bytes. Values
+// below 16 KiB are raised to 16 KiB; 0 leaves a value as it is.
 func (s *Session) SetReceiveWindow(st *Stream, initial, max uint64) {
 	r := &st.rcv
 	if max > 0 {
@@ -635,9 +639,9 @@ func (s *Session) SetReceiveWindow(st *Stream, initial, max uint64) {
 	}
 }
 
-// ReadChunk consumes up to max contiguous bytes without copying (API.md
-// 5.1). buf, when not nil, holds a reference the caller releases (Unref)
-// once it no longer needs data.
+// ReadChunk consumes up to max contiguous bytes without copying. buf, when not
+// nil, holds a reference the caller releases (Unref) once it no longer needs
+// data.
 func (s *Session) ReadChunk(st *Stream, max int) (data []byte, buf *Buf, fin bool, err error) {
 	if !st.hasR {
 		return nil, nil, false, ErrInvalid
@@ -658,7 +662,7 @@ func (s *Session) ReadChunk(st *Stream, max int) (data []byte, buf *Buf, fin boo
 		s.stats.AppBytesRead += n
 		s.bufSub(n)
 		s.streamCreditChanged(st)
-		s.tuneConsume(st)
+		s.tuneConsume()
 		return data, buf, false, nil
 	}
 	if r.reset && r.readOff >= r.resetRel {

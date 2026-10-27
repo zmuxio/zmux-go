@@ -25,7 +25,7 @@ func TestHTTPCarriers(t *testing.T) {
 			var p PipeIO
 			var err error
 			if mode == "duplex" {
-				p, err = HTTPPipe(ctx, srv.Client(), srv.URL, nil, Bidirectional)
+				p, err = HTTPPipe(ctx, srv.Client(), srv.URL, nil, DirBidirectional)
 			} else {
 				p, err = HTTPSplitPipe(ctx, srv.Client(), srv.URL, nil)
 			}
@@ -58,7 +58,7 @@ func TestHTTPCarriers(t *testing.T) {
 				t.Fatal(err)
 			}
 			msg := make([]byte, 256<<10)
-			rand.Read(msg)
+			_, _ = rand.Read(msg)
 			go func() { _, _ = st.Write(msg); _ = st.Close() }()
 			got, err := io.ReadAll(st)
 			if err != nil || !bytes.Equal(got, msg) {
@@ -66,12 +66,12 @@ func TestHTTPCarriers(t *testing.T) {
 			}
 			// A downlink joined out of band.
 			if mode == "duplex" {
-				r, err := c.ReservePipe(ReceiveOnly, PipeOptions{})
+				r, err := c.ReservePipe(DirReceiveOnly, PipeOptions{})
 				if err != nil {
 					t.Fatal(err)
 				}
 				h := map[string][]string{HeaderJoin: {r.Header()}}
-				dp, err := HTTPPipe(ctx, srv.Client(), srv.URL, h, ReceiveOnly)
+				dp, err := HTTPPipe(ctx, srv.Client(), srv.URL, h, DirReceiveOnly)
 				if err != nil {
 					t.Fatal(err)
 				}

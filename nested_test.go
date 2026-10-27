@@ -58,7 +58,7 @@ func TestNestedSession(t *testing.T) {
 		waitDone(t, ns)
 	}()
 	msg := make([]byte, 8<<20) // the outer stream references the nested blocks
-	rand.Read(msg)
+	_, _ = rand.Read(msg)
 	go func() {
 		s, err := ns.AcceptStream(ctx)
 		if err != nil {
@@ -80,21 +80,21 @@ func TestNestedSession(t *testing.T) {
 
 func TestNestingLoopRefused(t *testing.T) {
 	a, b := new(Conn), new(Conn)
-	if err := nestPipe(a, b); err != nil {
+	if err := nestPipe(a, outerRef{b}); err != nil {
 		t.Fatal(err)
 	}
-	if err := nestPipe(b, a); !errors.Is(err, errNestingLoop) {
+	if err := nestPipe(b, outerRef{a}); !errors.Is(err, errNestingLoop) {
 		t.Fatalf("loop accepted: %v", err)
 	}
 	forgetNesting(a)
-	if err := nestPipe(b, a); err != nil {
+	if err := nestPipe(b, outerRef{a}); err != nil {
 		t.Fatal(err)
 	}
 	forgetNesting(b)
 }
 
 // Nested lanes take at most half of the outer peer's bidirectional
-// streams and never credit an application opener waits for (API.md 4.6).
+// streams and never credit an application opener waits for.
 func TestNestedLaneCredit(t *testing.T) {
 	leakcheck.Check(t)
 	scfg := mpConfig()

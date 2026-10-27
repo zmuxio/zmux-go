@@ -6,7 +6,7 @@ import (
 )
 
 // blockSize is the size of a pooled send block; STREAM frames carry at most
-// one block's worth (IMPLEMENTATION.md 9.1: 16 KiB frames).
+// one block's worth (16 KiB frames).
 const blockSize = 16384
 
 // block is a pooled send buffer. refs counts the send queue's hold plus

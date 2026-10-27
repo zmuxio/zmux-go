@@ -1,6 +1,6 @@
 package core
 
-// Signal is a single-waiter wake-up slot (IMPLEMENTATION.md 2.5.3, 2.5.4).
+// Signal is a single-waiter wake-up slot.
 // The core queues it when the waiter's condition may have become true; the
 // driver delivers it after releasing the lock. Its channel has capacity one
 // so a signal sent before the waiter selects is never lost.

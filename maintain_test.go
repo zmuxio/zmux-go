@@ -27,7 +27,7 @@ func TestMaintainPipesRedials(t *testing.T) {
 	}()
 	count := func() int {
 		n := 0
-		for _, p := range e.client.Pipes() {
+		for _, p := range e.client.PipeStats() {
 			if p.ID != 0 && p.State == "active" {
 				n++
 			}
@@ -44,7 +44,7 @@ func TestMaintainPipesRedials(t *testing.T) {
 		}
 	}
 	wait(2)
-	for _, p := range e.client.Pipes() {
+	for _, p := range e.client.PipeStats() {
 		if p.ID != 0 {
 			pp, _ := e.client.Pipe(p.ID)
 			_ = pp.Abort(nil)

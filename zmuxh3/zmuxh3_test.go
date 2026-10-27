@@ -53,7 +53,7 @@ func echo(t *testing.T, c, s *zmux.Conn) {
 		t.Fatal(err)
 	}
 	msg := make([]byte, 512<<10)
-	rand.Read(msg)
+	_, _ = rand.Read(msg)
 	go func() { _, _ = st.Write(msg); _ = st.Close() }()
 	got, err := io.ReadAll(st)
 	if err != nil || !bytes.Equal(got, msg) {
@@ -76,15 +76,15 @@ func TestHTTP3RequestStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := Server("", srvTLS, nil, lst)
+	srv := NewHTTP3Server("", srvTLS, nil, lst)
 	go func() { _ = srv.Serve(pc) }()
 	defer func() { _ = srv.Close() }()
-	client, tr := Client(cliTLS, nil)
+	client, tr := HTTPClient(cliTLS, nil)
 	defer func() { _ = tr.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	url := "https://" + pc.LocalAddr().String() + "/"
-	p, err := zmux.HTTPPipe(ctx, client, url, nil, zmux.Bidirectional)
+	p, err := zmux.HTTPPipe(ctx, client, url, nil, zmux.DirBidirectional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestWebTransport(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
-	c, sess, err := DialSession(ctx, tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, cfg())
+	c, sess, err := Dial(ctx, tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, cfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +132,7 @@ func TestWebTransport(t *testing.T) {
 	}
 	echo(t, c, s)
 	// Pooled pipes: two per WebTransport session, then a new session.
-	pool := NewPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil)
-	pool.MaxPipesPerConnection = 2
+	pool := NewPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, zmux.PoolLimits{MaxPipesPerConnection: 2})
 	defer pool.Shutdown()
 	var fates []uint64
 	for range 3 {

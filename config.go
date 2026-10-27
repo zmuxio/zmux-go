@@ -11,7 +11,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// Config configures a session (API.md Section 6). The zero value of every
+// Config configures a session. The zero value of every
 // field selects its default; nil *Config means all defaults.
 type Config struct {
 	// HandshakeTimeout bounds establishment and join confirmation (10 s).
@@ -80,7 +80,7 @@ type Config struct {
 	// EarlyData enables early data (SPEC.md 6.1.2).
 	EarlyData EarlyData
 
-	// DatagramLimiter polices datagrams in each direction (API.md 5.6):
+	// DatagramLimiter polices datagrams in each direction:
 	// a datagram passes when TryReady allows its whole payload, and is
 	// then charged; otherwise it is dropped and counted.
 	DatagramLimiter DatagramLimiter
@@ -98,7 +98,8 @@ type DatagramLimiter struct {
 	Send, Receive Limiter
 }
 
-// SchedulerParams are the scheduler parameters of API.md Section 6.
+// SchedulerParams tune multipath scheduling and failure detection; the
+// zero value of every field selects its default.
 type SchedulerParams struct {
 	SuspectFloor  time.Duration // 250 ms, at least 50 ms
 	DeadTimeout   time.Duration // 0: default
@@ -110,16 +111,45 @@ type SchedulerParams struct {
 	SpreadChunk   int           // 16 KiB
 }
 
-// EarlyData enables early data.
+// EarlyData lets a client send stream data before the server's transport
+// parameters arrive (SPEC.md 6.1.2). With either form, Start, Client and
+// Dial return at once and ConnectionState().Established stays false until
+// the parameters arrive.
+//
+// ZmuxPeer: the client knows the server is a zmux endpoint and writes its
+// first streams on the bootstrap carrier right away, within the floor
+// values every zmux endpoint grants. Nothing is replayable.
+//
+// Replayable with Remembered: the client sends its first streams in the
+// carrier's own early data (QUIC 0-RTT through zmuxquic.Dial), under the
+// parameters remembered from an earlier session with the same server
+// (Conn.RememberedParameters). When the carrier refuses its early data,
+// the session sends those streams again after the handshake, without
+// telling the application. Carrier early data can be replayed by an
+// attacker, so the server sets Replayable as well: its streams that
+// arrived in early data then report Stream.Replayable, and a server that
+// must not act on a replayed request calls Stream.Reject on it; the client
+// gets a *StreamError for which IsRetryable is true, and opens the stream
+// again on the same session.
+//
+// When the server cannot take the early data at all (it is not a zmux
+// endpoint, or it grants no bidirectional stream), it processes none of it
+// and the session ends with *EarlyDataRejectedError: every call on the
+// session and its streams that is waiting or comes later (Read, Write,
+// AcceptStream, Wait, ...) returns it. errors.Is(err, ErrEarlyDataRejected)
+// and IsRetryable report it; retry on a new session without EarlyData,
+// since the cause persists. Remembered parameters above what the server
+// grants now end the session with a *TransportError
+// (TransportParameterError) instead: forget them.
 type EarlyData struct {
-	// ZmuxPeer declares the peer a zmux endpoint: data written before its
-	// parameters arrive goes out under the floor, behind the fence.
+	// ZmuxPeer declares the peer a zmux endpoint (client only).
 	ZmuxPeer bool
-	// Replayable allows carrier early data (TLS 1.3, QUIC 0-RTT).
+	// Replayable allows carrier early data (TLS 1.3, QUIC 0-RTT): on a
+	// client together with Remembered, on a server to accept and mark it.
 	Replayable bool
-	// Remembered are the peer's parameters from an earlier session
-	// (Conn.RememberedParameters): a client sends its first streams in the
-	// carrier's early data under them.
+	// Remembered are the peer's parameters from an earlier session, as
+	// Conn.RememberedParameters returned them (client only). Store them per
+	// server and only with the application's consent.
 	Remembered []byte
 }
 

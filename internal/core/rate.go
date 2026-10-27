@@ -1,6 +1,6 @@
 package core
 
-// Delivery-rate estimation (SCHEDULER.md 2.3): BBR's delivery-rate samples,
+// Delivery-rate estimation: BBR's delivery-rate samples,
 // a windowed maximum over the last 10 round trips within 10 s, and the
 // application-limited rules (the bottleneck observation and the bubble).
 

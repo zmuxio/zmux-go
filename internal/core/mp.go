@@ -4,10 +4,10 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// The path layer of a multipath session (MULTIPATH.md, SCHEDULER.md,
+// The path layer of a multipath session (MULTIPATH.md,
 // RESUME.md). It exists only once multipath is in use (s.mp != nil); every
 // pipe of such a session carries an attach record (p.mp). Single-pipe
-// sessions never allocate any of it (IMPLEMENTATION.md 2.6).
+// sessions never allocate any of it.
 
 // Outbound pipe states (STATE_MACHINE.md 3.1).
 type outState uint8
@@ -59,9 +59,9 @@ type multiPath struct {
 	busyUntil       Time // traffic frames within the busy window
 	joinReplays     uint64
 	joinAuthFails   uint64
-	retained        uint64 // unacknowledged stream bytes (SCHEDULER.md 13.1)
+	retained        uint64 // unacknowledged stream bytes
 
-	// Scheduler (SCHEDULER.md).
+	// Scheduler.
 	gateBuf      gate
 	dec          decision
 	tierSince    []tierMark
@@ -145,7 +145,7 @@ type attach struct {
 	weight      uint64
 	takeover    bool
 
-	// Scheduler (SCHEDULER.md).
+	// Scheduler.
 	probOpt      Duration // per-pipe Probation; <0: the session default
 	suspectFloor Duration // per-pipe SuspectFloor; 0: the session default
 	deadTimeout  Duration // per-pipe DeadTimeout; 0: the session default
@@ -161,7 +161,7 @@ type attach struct {
 	idleArm      uint64     // bytes of the idle copy left
 	placedSet    bool
 	placedFrom   uint64
-	// Counters (API.md 4.5).
+	// Counters.
 	suspects, failures, reinjectedBytes, oppBytes, pingsSent uint64
 
 	penalized  bool // MULTIPATH.md 7.5.1: no new data until penaltyEnd is acknowledged
@@ -304,6 +304,5 @@ func (s *Session) PipeState(id uint64) (out, in string, ok bool) {
 }
 
 // sampleOK reports whether bytes sent at sent may give estimator samples:
-// not when sent before or at the moment the pipe last became suspect
-// (SCHEDULER.md 2.1).
+// not when sent before or at the moment the pipe last became suspect.
 func (a *attach) sampleOK(sent Time) bool { return !a.noSample || sent > a.noSampleAt }

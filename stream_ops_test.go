@@ -52,7 +52,7 @@ func TestChunkRelayWithoutCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg := make([]byte, 3<<20)
-	rand.Read(msg)
+	_, _ = rand.Read(msg)
 	go func() {
 		_, _ = src.Write(msg)
 		_ = src.Close()

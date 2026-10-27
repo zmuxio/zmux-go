@@ -7,7 +7,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// CloseKind is the kind of a session termination (API.md 5.3).
+// CloseKind is the kind of a session termination.
 type CloseKind uint8
 
 const (

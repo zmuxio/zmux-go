@@ -11,38 +11,47 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// PipeOptions are the options of an attachment (API.md 4.2).
+// PipeOptions are the options of an attachment. The zero value is a
+// bidirectional pipe that follows the peer's priority requests and the
+// session's defaults.
+//
+// The Send fields are pointers because nil has its own meaning: the local
+// outbound direction then follows the peer's request (PIPE_STATUS); a set
+// value wins over it. The Receive fields are plain values because they
+// are always sent: the PIPE_JOIN carries a request for the peer's outbound
+// direction, so the zero values ask for tier 0, not standby.
 type PipeOptions struct {
 	// SendPriority is the tier of the local outbound direction (lower is
-	// preferred). Set, it wins over the peer's request.
+	// preferred). nil: the peer's request, else tier 0.
 	SendPriority *uint64
-	// ReceivePriority is the tier requested for the peer's outbound
-	// direction; it travels in the PIPE_JOIN.
-	ReceivePriority uint64
 	// SendStandby makes the local outbound direction carry data only on
-	// failover. Set, it wins over the peer's request.
+	// failover. nil: the peer's request, else active.
 	SendStandby *bool
 	// Weight is the share for SpreadRoundRobin and the factor of
-	// SpreadRateWeighted (default 1; 0 excludes the pipe unless every
-	// candidate has 0).
+	// SpreadRateWeighted. nil: 1; 0 excludes the pipe unless every
+	// candidate has 0.
 	Weight *uint64
-	// Probation is the base of the pipe's probation (nil: the session's;
-	// 0 disables it).
+	// Probation is the base of the pipe's probation. nil: the session's;
+	// 0 disables it.
 	Probation *time.Duration
+	// Label names the pipe in statistics.
+	Label string
+	// ReceivePriority is the tier requested for the peer's outbound
+	// direction (zero: tier 0).
+	ReceivePriority uint64
 	// FateGroup groups pipes that share a path; a pipe that replaces a
-	// failed one on the same path reuses its fate group.
+	// failed one on the same path reuses its fate group. 0: the carrier's
+	// PipeIO.FateGroup, else none (an independent path).
 	FateGroup uint64
 	// SuspectFloor (at least 50 ms) and DeadTimeout (at least 1 s) of the
 	// pipe; 0 uses the session's.
 	SuspectFloor time.Duration
 	DeadTimeout  time.Duration
-	// Label names the pipe in statistics.
-	Label string
-	// Direction from the local endpoint: Bidirectional, SendOnly (an
-	// uplink) or ReceiveOnly (a downlink).
+	// Direction from the local endpoint: DirBidirectional (the zero
+	// value), DirSendOnly (an uplink) or DirReceiveOnly (a downlink).
 	Direction Direction
 	// ReceiveStandby asks the peer to make its outbound direction standby
-	// (as SendStandby does locally).
+	// (zero: active).
 	ReceiveStandby bool
 	// CarrierBound ties the join token to the new carrier's TLS 1.3
 	// handshake (MULTIPATH.md 10.5); the carrier must be a TLS connection
@@ -52,13 +61,13 @@ type PipeOptions struct {
 
 func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 	var j core.JoinOptions
-	j.Dir = 2 // Bidirectional, and any value out of range
+	j.Dir = 2 // DirBidirectional, and any value out of range
 	switch dir {
-	case SendOnly:
+	case DirSendOnly:
 		j.Dir = 0
-	case ReceiveOnly:
+	case DirReceiveOnly:
 		j.Dir = 1
-	case Bidirectional:
+	case DirBidirectional:
 	}
 	if o.SuspectFloor != 0 && o.SuspectFloor < 50*time.Millisecond {
 		return j, fmt.Errorf("%w: SuspectFloor below 50 ms", ErrInvalidConfig)
@@ -87,9 +96,6 @@ type Pipe struct {
 	id uint64
 }
 
-// ErrPipeGone reports an attachment the session no longer knows.
-var ErrPipeGone = errors.New("zmux: pipe gone")
-
 // ID returns the pipe ID.
 func (p *Pipe) ID() uint64 { return p.id }
 
@@ -111,7 +117,7 @@ func (c *Conn) AddPipe(ctx context.Context, p PipeIO, o PipeOptions) (*Pipe, err
 
 func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 	dir := o.Direction
-	if (dir != ReceiveOnly && p.W == nil) || (dir != SendOnly && p.R == nil && !oob) {
+	if (dir != DirReceiveOnly && p.W == nil) || (dir != DirSendOnly && p.R == nil && !oob) {
 		return nil, fmt.Errorf("%w: the carrier lacks a half the direction needs", ErrInvalidConfig)
 	}
 	if o.FateGroup == 0 {
@@ -138,7 +144,7 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 	if c.closing {
 		return nil, c.errLocked()
 	}
-	outer := outerOf(p) // the session p runs over; not owned here
+	outer := outerOf(p)
 	if err := nestPipe(c, outer); err != nil {
 		return nil, err
 	}
@@ -155,7 +161,7 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 	pd.id = id
 	c.labels[id] = o.Label
 	if !oob {
-		c.startPipeLocked(pd, dir != SendOnly, dir != ReceiveOnly)
+		c.startPipeLocked(pd, dir != DirSendOnly, dir != DirReceiveOnly)
 	} else {
 		c.pipes[id] = pd
 	}
@@ -243,7 +249,7 @@ func (r *Reservation) Attach(ctx context.Context, p PipeIO) (*Pipe, error) {
 	if o, ok := p.W.(laneOpener); ok {
 		pd.opener = o
 	}
-	c.startPipeLocked(pd, r.dir != SendOnly, r.dir != ReceiveOnly)
+	c.startPipeLocked(pd, r.dir != DirSendOnly, r.dir != DirReceiveOnly)
 	c.s.WakePipe(r.p.id)
 	c.unlock()
 	if err := r.p.waitJoined(ctx); err != nil {
@@ -313,7 +319,7 @@ func (p *Pipe) SetProbation(d time.Duration) error {
 }
 
 // Revalidate sends a PIPE_PING at once; the pipe takes no new stream data
-// until it is acknowledged, while another pipe is usable (API.md 4.2).
+// until it is acknowledged, while another pipe is usable.
 func (p *Pipe) Revalidate() error {
 	c := p.c
 	c.lock()
@@ -331,7 +337,7 @@ func (c *Conn) RevalidatePipes() error {
 
 // Close removes the pipe gracefully: PIPE_ABANDON(NO_ERROR) and drain
 // (MULTIPATH.md 8.2). It does not block; the pipe's end is reported by
-// NextPipeEvent.
+// NextEvent.
 func (p *Pipe) Close() error {
 	c := p.c
 	c.lock()
@@ -357,7 +363,7 @@ func pipeErr(err error) error {
 }
 
 // SetScheduler changes the session's scheduling policy; it applies from
-// the next chunk (SCHEDULER.md 12).
+// the next chunk.
 func (c *Conn) SetScheduler(s Scheduler) {
 	c.lock()
 	defer c.unlock()
@@ -375,7 +381,7 @@ func (c *Conn) SetScheduler(s Scheduler) {
 	c.s.SetPolicy(s.policy())
 }
 
-// ---- statistics (API.md 4.5) ----
+// ---- statistics ----
 
 // PipeStats is a snapshot of one attachment, taken under the session lock.
 type PipeStats struct {
@@ -448,9 +454,22 @@ func (p *Pipe) Stats() (PipeStats, error) {
 	return c.pipeStats(pi), nil
 }
 
-// Pipes returns the snapshot of every attachment, in one critical section.
-// A session without multipath reports pipe 0.
-func (c *Conn) Pipes() []PipeStats {
+// Pipes returns the handles of the session's current attachments. A
+// session without multipath has pipe 0.
+func (c *Conn) Pipes() []*Pipe {
+	c.lock()
+	defer c.unlock()
+	ids := c.s.PipeIDs(nil)
+	out := make([]*Pipe, len(ids))
+	for i, id := range ids {
+		out[i] = &Pipe{c: c, id: id}
+	}
+	return out
+}
+
+// PipeStats returns a snapshot of every attachment, taken in one critical
+// section. A session without multipath reports pipe 0.
+func (c *Conn) PipeStats() []PipeStats {
 	c.lock()
 	defer c.unlock()
 	ids := c.s.PipeIDs(nil)
@@ -499,11 +518,11 @@ func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
 		Lanes: pi.Lanes}
 	switch {
 	case pi.HasOut && pi.HasIn:
-		st.Direction = Bidirectional
+		st.Direction = DirBidirectional
 	case pi.HasOut:
-		st.Direction = SendOnly
+		st.Direction = DirSendOnly
 	default:
-		st.Direction = ReceiveOnly
+		st.Direction = DirReceiveOnly
 	}
 	if pi.PeerRequest {
 		st.PeerRequest = &PeerRequest{Priority: pi.PeerPriority, Standby: pi.PeerStandby}

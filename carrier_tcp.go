@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Low-water marks of TCP carriers (SCHEDULER.md 9, IMPLEMENTATION.md 9.1):
+// Low-water marks of TCP carriers:
 // 128 KiB on a single pipe, 32 KiB per pipe of a multipath session.
 const (
 	singleLowWater = 128 << 10
@@ -15,8 +15,7 @@ const (
 )
 
 // tcpInfo is the TCP socket under a carrier, when there is one: its
-// low-water mark and its minimum RTT are optional carrier capabilities
-// (API.md 4.1).
+// low-water mark and its minimum RTT are optional carrier capabilities.
 type tcpInfo struct {
 	rc syscall.RawConn
 }

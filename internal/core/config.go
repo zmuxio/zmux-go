@@ -11,7 +11,7 @@ const (
 	RoleAuto
 )
 
-// Policy names a built-in scheduling policy (SCHEDULER.md Section 3).
+// Policy names a built-in scheduling policy.
 type Policy uint8
 
 const (
@@ -63,7 +63,7 @@ type Config struct {
 	DgramStreamQ  int
 	DgramRecvSize uint64
 	// DgramRecvLimited: received datagrams wait for the driver's receive
-	// limiter before they are queued (API.md 5.6).
+	// limiter before they are queued.
 	DgramRecvLimited bool
 
 	MaxPipes     int
@@ -105,7 +105,7 @@ type TestHooks struct {
 	PipeCap      int
 }
 
-// DefaultConfig returns the defaults of API.md Section 6 with the local
+// DefaultConfig returns the default configuration with the local
 // parameters a zmux endpoint sends (SPEC.md 5.3, 5.5).
 func DefaultConfig() Config {
 	c := Config{

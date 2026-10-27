@@ -85,7 +85,7 @@ func echo(t *testing.T, c, s *zmux.Conn, n int) {
 		t.Fatal(err)
 	}
 	msg := make([]byte, n)
-	rand.Read(msg)
+	_, _ = rand.Read(msg)
 	go func() { _, _ = st.Write(msg); _ = st.Close() }()
 	got, err := io.ReadAll(st)
 	if err != nil || !bytes.Equal(got, msg) {
@@ -123,11 +123,11 @@ func TestQUICPipeAndLanes(t *testing.T) {
 	}
 	wg.Wait()
 	var lanes int
-	for _, p := range c.Pipes() {
+	for _, p := range c.PipeStats() {
 		lanes += p.Lanes
 	}
 	if lanes < 2 {
-		t.Fatalf("no lanes were opened: %+v", c.Pipes())
+		t.Fatalf("no lanes were opened: %+v", c.PipeStats())
 	}
 }
 
@@ -135,8 +135,14 @@ func TestQUICZeroRTT(t *testing.T) {
 	e := newEnv(t, &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true}})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// A first session gets a session ticket and the parameters.
-	c, err := Dial(ctx, e.ln.Addr().String(), e.cli, nil, nil)
+	// A first session gets a session ticket and the parameters; it runs on
+	// a connection the test dials itself (Client).
+	qc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, QUICConfig(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = qc.CloseWithError(0, "") }()
+	c, err := Client(ctx, qc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,8 +192,7 @@ func TestQUICPool(t *testing.T) {
 	e := newEnv(t, mpConfig())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p := NewPool(e.ln.Addr().String(), e.cli, nil)
-	p.MaxPipesPerConnection = 2
+	p := NewPool(e.ln.Addr().String(), e.cli, nil, zmux.PoolLimits{MaxPipesPerConnection: 2})
 	defer p.Shutdown()
 	first, err := p.OpenPipe(ctx)
 	if err != nil {
@@ -222,13 +227,13 @@ func TestQUICPool(t *testing.T) {
 		t.Fatalf("fate groups %d %v", first.FateGroup, fates)
 	}
 	echo(t, c, s, 1<<20)
-	if n := len(c.Pipes()); n != 3 {
+	if n := len(c.PipeStats()); n != 3 {
 		t.Fatalf("%d pipes", n)
 	}
 }
 
 // TestQUICCopyLane: on a session's only pipe with lanes, urgent data is
-// copied to the copy lane (SCHEDULER.md 4.1, 9.2 rule 3).
+// copied to the copy lane.
 func TestQUICCopyLane(t *testing.T) {
 	e := newEnv(t, mpConfig())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -274,5 +279,5 @@ func TestQUICCopyLane(t *testing.T) {
 			return
 		}
 	}
-	t.Fatalf("no copy on the copy lane: %+v", c.Pipes())
+	t.Fatalf("no copy on the copy lane: %+v", c.PipeStats())
 }

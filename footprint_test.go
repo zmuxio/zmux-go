@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Idle footprint (IMPLEMENTATION.md 9.2): the live heap of idle sessions,
+// Idle footprint: the live heap of idle sessions,
 // streams and multipath sessions, both ends in this process over
 // in-memory pipes, after a warm-up, without idle timeout or keep-alive,
 // once the idle pipes gave their buffers back. Bounds: 17 408 B per
@@ -78,7 +78,7 @@ func fpPairsOver(t *testing.T, n int, ln net.Listener) [][2]*Conn {
 			}
 			ch <- s
 		}()
-		c, err := Dial(ctx, a, fpConfig())
+		c, err := Client(ctx, a, fpConfig())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,7 +95,7 @@ func fpMPPairs(t *testing.T, l *Listener, n int) [][2]*Conn {
 	for i := range out {
 		a, b := net.Pipe()
 		go func() { _ = l.HandlePipe(ctx, NetPipe(b), JoinHint{}) }()
-		c, err := Dial(ctx, a, fpMPConfig())
+		c, err := Client(ctx, a, fpMPConfig())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -265,7 +265,7 @@ func TestFootprint(t *testing.T) {
 	closePairs(mv)
 }
 
-// TestQuietSessionsFireNoTimer checks IMPLEMENTATION.md 9.2: settled quiet
+// TestQuietSessionsFireNoTimer checks that settled quiet
 // sessions (no idle timeout, no keep-alive) arm no timer, and settling
 // takes a few timer callbacks, not a busy loop.
 func TestQuietSessionsFireNoTimer(t *testing.T) {

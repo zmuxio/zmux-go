@@ -121,7 +121,7 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 	rr, _ := c.OpenStreamSync(ctx)
 	_, _ = rr.Write([]byte{'r'})
 	rr.SetPriority(0, false) // latency-sensitive: ahead of the bulk stream
-	bulk.SetPriority(3, false)
+	bulk.SetPriority(UrgencyDefault, false)
 	buf := make([]byte, 64)
 	lat := make([]time.Duration, 0, b.N)
 	b.ResetTimer()
@@ -173,7 +173,7 @@ func BenchmarkMultipathSpread(b *testing.B) {
 				}
 			}()
 			nc, _ := net.Dial("tcp", ln.Addr().String())
-			c, err := Dial(ctx, nc, cfg)
+			c, err := Client(ctx, nc, cfg)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -212,7 +212,7 @@ func BenchmarkMultipathSpread(b *testing.B) {
 			<-got
 			b.StopTimer()
 			var total float64
-			ps := c.Pipes()
+			ps := c.PipeStats()
 			for _, p := range ps {
 				total += float64(p.BytesSent)
 			}

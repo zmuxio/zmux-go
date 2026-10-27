@@ -2,7 +2,7 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// The carrier queue limiter (SCHEDULER.md 9.1): a pipe whose carrier has
+// The carrier queue limiter: a pipe whose carrier has
 // neither a low-water mark nor an unsent count is paced from what the peer
 // acknowledges, in the manner of BBR, in a multipath session and on the
 // single pipe with pipe acknowledgement. Every event costs constant

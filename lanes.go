@@ -39,7 +39,7 @@ func unregisterLaneKey(c *Conn) {
 }
 
 // HandleLane routes a stream that the peer opened on a lane-capable
-// carrier connection, on an endpoint without a listener (API.md 4.1): its
+// carrier connection, on an endpoint without a listener: its
 // first record names the session by Lane Key. A stream that names no pipe
 // is closed. It blocks until the lane ends.
 func HandleLane(ctx context.Context, p PipeIO) error {
@@ -57,7 +57,7 @@ func HandleLane(ctx context.Context, p PipeIO) error {
 // handleLane attaches an inbound lane whose first record is first.
 func handleLane(ctx context.Context, p PipeIO, first []byte) error {
 	body := first
-	if p.Framing == ByteStream {
+	if p.Framing == FramingByteStream {
 		_, n := wire.ReadVarint(first)
 		body = first[n:]
 	}

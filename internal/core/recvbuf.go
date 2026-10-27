@@ -24,7 +24,7 @@ func (b *Buf) Unref() {
 }
 
 // refThreshold: pieces of at least this size reference the read buffer;
-// smaller ones are copied (IMPLEMENTATION.md 3).
+// smaller ones are copied.
 const refThreshold = 4096
 
 type rpiece struct {

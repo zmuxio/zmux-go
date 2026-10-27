@@ -11,7 +11,7 @@ import (
 
 // Go's monotonic clock on Windows advances with the timer interrupt
 // (0.5-15.6 ms), which reads loopback round trips as 0; the core takes its
-// timestamps from QueryPerformanceCounter there (IMPLEMENTATION.md 6.2).
+// timestamps from QueryPerformanceCounter there.
 var (
 	qpcOnce  sync.Once
 	qpcFreq  int64

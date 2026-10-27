@@ -4,26 +4,28 @@ import "github.com/zmuxio/zmux-go/internal/wire"
 
 // goawayState is EXTENSIONS.md 3.
 type goawayState struct {
+	reason        []byte // of the final CONNECTION_CLOSE
 	sentWater     [2]uint64
 	code          uint64
 	phase         int // 1: phase 1 sent, fence pending; 2: final
 	recvWater     [2]uint64
 	recvCode      uint64
 	maxOffered    [2]uint64 // highest offered peer index + 1
+	recheck       bool      // a stream was discarded during a shutdown
 	sent          bool
 	received      bool
 	closeWhenDone bool
 }
 
-// Shutdown starts a graceful close (API.md 5.7): two-phase GOAWAY when it
-// is in use, then CONNECTION_CLOSE with code once no stream remains.
-func (s *Session) Shutdown(code uint64) {
+// Shutdown starts a graceful close: two-phase GOAWAY when it is in use,
+// then CONNECTION_CLOSE with code and reason once no stream remains.
+func (s *Session) Shutdown(code uint64, reason []byte) {
 	if s.isClosing() {
 		return
 	}
 	g := &s.ga
 	g.closeWhenDone = true
-	g.code = code
+	g.code, g.reason = code, reason
 	if !s.feat.GoAway || !s.peerSeen {
 		s.checkShutdownDone()
 		return
@@ -77,12 +79,25 @@ func (s *Session) fenceDone() {
 	s.checkShutdownDone()
 }
 
+// SettlePending reports work for Settle.
+func (s *Session) SettlePending() bool { return s.ga.recheck }
+
+// Settle completes what an operation left pending; the driver calls it at
+// the end of a critical section when SettlePending. It closes a
+// shutting-down session whose last stream the operation discarded.
+func (s *Session) Settle() {
+	if s.ga.recheck {
+		s.ga.recheck = false
+		s.checkShutdownDone()
+	}
+}
+
 // checkShutdownDone closes once no stream remains after Shutdown.
 func (s *Session) checkShutdownDone() {
 	if !s.ga.closeWhenDone || s.isClosing() || len(s.streams) > 0 || s.ga.phase == 1 {
 		return
 	}
-	s.Close(s.ga.code, nil)
+	s.Close(s.ga.code, s.ga.reason)
 }
 
 // onGoAway processes a received GOAWAY (EXTENSIONS.md 3.5).

@@ -12,11 +12,11 @@ import (
 type Framing uint8
 
 const (
-	// ByteStream concatenates records with their Size fields.
-	ByteStream Framing = iota
-	// Records carries one message per record, without Size (WebSocket); the
-	// halves implement MessageReader and MessageWriter.
-	Records
+	// FramingByteStream concatenates records with their Size fields.
+	FramingByteStream Framing = iota
+	// FramingRecords carries one message per record, without Size (as on
+	// WebSocket); the halves implement MessageReader and MessageWriter.
+	FramingRecords
 )
 
 // MessageReader is the receiving half of a message-framed carrier.
@@ -32,8 +32,8 @@ type MessageWriter interface {
 }
 
 // PipeIO is a pipe input: at most one receiving half and at most one
-// sending half, at least one of them, each closed by zmux exactly once
-// (API.md 4.1). Optional capabilities are discovered on the halves:
+// sending half, at least one of them, each closed by zmux exactly once.
+// Optional capabilities are discovered on the halves:
 //
 //   - interface{ Abort(error) } on W: used instead of Close when a pipe fails;
 //   - interface{ CloseWrite() error } on W: graceful end of the write side;

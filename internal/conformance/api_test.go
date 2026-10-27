@@ -221,7 +221,7 @@ func (r *runner) api(st map[string]any) error {
 	case "ping":
 		_, err = s.Ping(nil)
 	case "shutdown":
-		s.Shutdown(getU(args, "code"))
+		s.Shutdown(getU(args, "code"), nil)
 	case "close":
 		var reason []byte
 		if rs, ok := args["reason"].(string); ok {

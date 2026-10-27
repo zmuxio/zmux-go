@@ -18,7 +18,16 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-const specDir = "../../testdata/spec/fixtures"
+// specDir holds the specification's fixtures (testdata/spec/SOURCE names
+// their commit); localDir, when present, traces of local behaviour that
+// the specification leaves to implementations.
+const (
+	specDir  = "../../testdata/spec/fixtures"
+	localDir = "../../testdata/local/traces"
+
+	specTraces  = 321
+	localTraces = 49
+)
 
 type profile struct {
 	TP     map[string]any `json:"tp"`
@@ -61,18 +70,31 @@ var policyByName = map[string]core.Policy{"affinity": core.PolicyAffinity, "sess
 	"spread-eta": core.PolicySpreadETA, "spread-round-robin": core.PolicySpreadRoundRobin,
 	"spread-rate-weighted": core.PolicySpreadRateWeighted}
 
-func TestTraces(t *testing.T) {
-	profiles := loadProfiles(t)
+// traceFiles lists the traces under dir, sorted.
+func traceFiles(dir string) []string {
 	var files []string
-	_ = filepath.WalkDir(filepath.Join(specDir, "traces"), func(p string, _ os.DirEntry, _ error) error {
+	_ = filepath.WalkDir(dir, func(p string, _ os.DirEntry, _ error) error {
 		if strings.HasSuffix(p, ".ndjson") {
 			files = append(files, p)
 		}
 		return nil
 	})
 	sort.Strings(files)
-	if len(files) != 367 {
-		t.Errorf("found %d traces, want 367", len(files))
+	return files
+}
+
+func TestTraces(t *testing.T) {
+	profiles := loadProfiles(t)
+	files := traceFiles(filepath.Join(specDir, "traces"))
+	if len(files) != specTraces {
+		t.Errorf("found %d specification traces, want %d", len(files), specTraces)
+	}
+	if _, err := os.Stat(localDir); err == nil {
+		local := traceFiles(localDir)
+		if len(local) != localTraces {
+			t.Errorf("found %d local traces, want %d", len(local), localTraces)
+		}
+		files = append(files, local...)
 	}
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
@@ -198,6 +220,20 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	p := profiles[h.Profile]
 	tp := merge(p.TP, h.Overrides.TP)
 	cf := merge(p.Config, h.Overrides.Config)
+	// The test-mode sender (TRACES.md 3.4): the ETA choice, no probation,
+	// no redundant copies, standby pipes probed at 15 s.
+	switch cf["sender"] {
+	case nil:
+	case "test-mode":
+		for k, v := range map[string]any{"scheduler": "spread-eta", "probation": json.Number("0"),
+			"redundancy": "off", "standby_probe": json.Number("0")} {
+			if _, ok := cf[k]; !ok {
+				cf[k] = v
+			}
+		}
+	default:
+		t.Fatalf("unknown sender %v", cf["sender"])
+	}
 	th := merge(p.Test, h.Overrides.Test)
 	cfg := core.DefaultConfig()
 	cfg.Local = paramsFromMap(tp)

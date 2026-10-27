@@ -4,10 +4,10 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// maxStreamFrame is the largest STREAM frame payload (IMPLEMENTATION.md 9.1).
+// maxStreamFrame is the largest STREAM frame payload.
 const maxStreamFrame = 16384
 
-// DefaultBatch is the write batch (IMPLEMENTATION.md 4).
+// DefaultBatch is the write batch.
 const DefaultBatch = 256 << 10
 
 // recMax returns the largest Size for records on an outbound lane.
@@ -23,7 +23,7 @@ func (s *Session) recMax(ol *outLane) int {
 }
 
 // WantsWrite reports whether PollTransmit(pipe, lane) would produce bytes
-// now (IMPLEMENTATION.md 13.1 W8).
+// now.
 func (s *Session) WantsWrite(pipe, lane uint64) bool {
 	p := s.pipe(pipe)
 	if p == nil || p.out == nil || p.out.failed {
@@ -257,7 +257,7 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, max int, now Time) b
 	if b.n == 0 {
 		if s.ack != nil && !ol.notWritable {
 			// A write opportunity that ends with nothing to send: an
-			// application-limited moment (SCHEDULER.md 2.3).
+			// application-limited moment.
 			p.out.snd.re.appLimited(p.out.snd.so)
 		}
 		return false
@@ -385,9 +385,18 @@ func (s *Session) closeSentOn() {
 	s.checkLingerDone()
 }
 
-// checkLingerDone enters CLOSED once every inbound pipe ended.
+// checkLingerDone enters CLOSED once every inbound pipe ended. While
+// CONNECTION_CLOSE is pending it rechecks whether the pipes that can still
+// carry it all have it: a pipe that failed before taking it is no longer
+// waited for.
 func (s *Session) checkLingerDone() {
-	if s.state != StateClosing || s.closeFr.pending {
+	if s.state != StateClosing {
+		return
+	}
+	if s.closeFr.pending {
+		if !s.closeFr.waitLanes {
+			s.closeSentOn() // calls back once it is no longer pending
+		}
 		return
 	}
 	for _, p := range s.pipes {
@@ -399,7 +408,7 @@ func (s *Session) checkLingerDone() {
 }
 
 // writeControl writes the coalesced control state (SPEC.md 9.2) ahead of
-// data, in the order of IMPLEMENTATION.md 4.
+// data.
 func (s *Session) writeControl(w *recWriter, p *Pipe) {
 	if s.ack != nil && s.mp == nil {
 		s.ack.write(w, p, s.now)
@@ -666,7 +675,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	}
 	off, n, fin := p.off, p.n, p.fin
 	if d != nil && !p.resend && n > uint64(s.cfg.SpreadChunk) {
-		// One scheduling decision per chunk (SCHEDULER.md 5).
+		// One scheduling decision per chunk.
 		n, fin = uint64(s.cfg.SpreadChunk), false
 		if off == 0 && sp.preLen > n {
 			n = sp.preLen

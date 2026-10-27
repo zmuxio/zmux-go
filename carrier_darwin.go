@@ -12,5 +12,5 @@ func setNotsentLowat(fd uintptr, n int) error {
 }
 
 // tcpMinRTT: Darwin's TCP_CONNECTION_INFO reports only a smoothed RTT in
-// milliseconds, which is not a minimum (IMPLEMENTATION.md 6.2).
-func tcpMinRTT(uintptr) (time.Duration, bool) { return 0, false }
+// milliseconds, which is not a minimum.
+func tcpMinRTT(_ uintptr) (time.Duration, bool) { return 0, false }

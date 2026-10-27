@@ -7,7 +7,7 @@ import (
 )
 
 // Batch is the output of one PollTransmit: records for one outbound lane, as
-// header bytes in an arena and referenced payloads (IMPLEMENTATION.md 4).
+// header bytes in an arena and referenced payloads.
 // The driver writes Bufs and then reports the write with WriteDone, which
 // releases the referenced blocks. A Batch is reused across polls.
 type Batch struct {
@@ -237,8 +237,7 @@ func (w *recWriter) begin() {
 }
 
 // fits reports whether a frame of n bytes fits, opening a record if needed.
-// A frame that does not fit, header included, waits (IMPLEMENTATION.md
-// 13.6 P2).
+// A frame that does not fit, header included, waits.
 func (w *recWriter) fits(n int) bool {
 	if w.closed {
 		return false

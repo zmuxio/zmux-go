@@ -20,7 +20,7 @@ func sessions(ctx context.Context, ccfg, scfg *zmux.Config) (client, server *zmu
 		server, err = zmux.Server(ctx, b, scfg)
 		ch <- err
 	}()
-	client, err = zmux.Dial(ctx, a, ccfg)
+	client, err = zmux.Client(ctx, a, ccfg)
 	if serr := <-ch; err == nil {
 		err = serr
 	}
@@ -110,17 +110,17 @@ func ExampleStreamError() {
 		fmt.Println(err)
 		return
 	}
-	st.CancelWrite(zmux.CodeCancelled)
+	st.CancelWrite(zmux.StreamCancelled)
 
 	_, err = io.ReadAll(peer)
 	var se *zmux.StreamError
 	if errors.As(err, &se) {
 		switch se.ErrorCode {
-		case zmux.CodeNoError:
+		case zmux.StreamNoError:
 			fmt.Println("no error")
-		case zmux.CodeCancelled:
+		case zmux.StreamCancelled:
 			fmt.Println("cancelled by the peer")
-		case zmux.CodeRejected, zmux.CodeCarrierFailed:
+		case zmux.StreamRejected, zmux.StreamCarrierFailed:
 			fmt.Println("rejected or carrier failed")
 		default:
 			fmt.Printf("application code %#x\n", uint64(se.ErrorCode))
@@ -137,22 +137,22 @@ func ExampleTransportError() {
 			return "not a transport error"
 		}
 		switch te.ErrorCode {
-		case zmux.NoError:
+		case zmux.TransportNoError:
 			return "closed without error"
-		case zmux.ProtocolViolation, zmux.FrameEncodingError, zmux.FlowControlError,
-			zmux.StreamLimitError, zmux.StreamStateError, zmux.FinalSizeError,
-			zmux.TransportParameterError, zmux.RoleConflict:
+		case zmux.TransportProtocolViolation, zmux.TransportFrameEncodingError, zmux.TransportFlowControlError,
+			zmux.TransportStreamLimitError, zmux.TransportStreamStateError, zmux.TransportFinalSizeError,
+			zmux.TransportParameterError, zmux.TransportRoleConflict:
 			return "peer misbehaved: " + te.ErrorCode.String()
-		case zmux.InternalError, zmux.ExcessiveLoad, zmux.ConnectionRefused:
+		case zmux.TransportInternalError, zmux.TransportExcessiveLoad, zmux.TransportConnectionRefused:
 			return "peer refused or failed: " + te.ErrorCode.String()
-		case zmux.NoViablePath, zmux.ResumeTimeoutCode, zmux.ResumeFailed, zmux.IdleTimeoutCode:
+		case zmux.TransportNoViablePath, zmux.TransportResumeTimeout, zmux.TransportResumeFailed, zmux.TransportIdleTimeout:
 			return "carriers lost: " + te.ErrorCode.String()
 		default:
 			return "other: " + te.ErrorCode.String()
 		}
 	}
-	fmt.Println(describe(&zmux.TransportError{Remote: true, ErrorCode: zmux.ProtocolViolation}))
-	fmt.Println(describe(&zmux.TransportError{Remote: true, ErrorCode: zmux.IdleTimeoutCode}))
+	fmt.Println(describe(&zmux.TransportError{Remote: true, ErrorCode: zmux.TransportProtocolViolation}))
+	fmt.Println(describe(&zmux.TransportError{Remote: true, ErrorCode: zmux.TransportIdleTimeout}))
 	// Output:
 	// peer misbehaved: PROTOCOL_VIOLATION
 	// carriers lost: ZMUX_IDLE_TIMEOUT
@@ -173,6 +173,6 @@ func ExampleScheduler() {
 
 	// Share chunks by weight times measured rate from now on.
 	client.SetScheduler(zmux.SpreadRateWeighted())
-	fmt.Println(len(client.Pipes()))
+	fmt.Println(len(client.PipeStats()))
 	// Output: 1
 }

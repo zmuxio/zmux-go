@@ -1,6 +1,6 @@
 package core
 
-// Quality events (API.md 4.5): a pipe's smoothed RTT or delivery rate
+// Quality events: a pipe's smoothed RTT or delivery rate
 // leaving a band around the last reported values, and the session's
 // outbound capacity crossing a floor. Off until set, evaluated in O(1)
 // where the estimates change, at most one event per pipe per MinInterval

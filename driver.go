@@ -22,7 +22,7 @@ type pipeDrv struct {
 	wsig   *core.Signal   // wakes the lane-0 writer
 	opener laneOpener     // nil: the carrier offers no lanes
 	tcp    tcpInfo        // the TCP socket under the carrier, if any
-	outer  *Conn          // the outer session of a stream-backed carrier
+	outer  outerRef       // the outer session of a stream-backed carrier
 	gs     pipeGoroutines // the attachment's goroutines (HandlePipe waits on them)
 
 	// Guarded by the session lock.
@@ -177,7 +177,7 @@ func (c *Conn) addBootstrap(p PipeIO) {
 // readLoop feeds what a carrier half delivers into the core. It never
 // waits for anything but the carrier, so reads never wait behind writes
 // (SPEC.md 9.1). A quiet pipe blocks on a small buffer and holds no pooled
-// read buffer (IMPLEMENTATION.md 2.8).
+// read buffer.
 func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 	defer c.wg.Done()
 	defer func() {
@@ -185,7 +185,7 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 			c.fail(p)
 		}
 	}()
-	if pd.framing == Records {
+	if pd.framing == FramingRecords {
 		c.readMessages(pd, lane, r)
 		return
 	}
@@ -401,10 +401,10 @@ type batchWriter interface {
 // writeBatch hands a batch to the carrier in one call (gather write on a
 // net.Conn).
 func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
-	if bw, ok := w.(batchWriter); ok && framing == ByteStream {
+	if bw, ok := w.(batchWriter); ok && framing == FramingByteStream {
 		return bw.WriteBatch(b)
 	}
-	if framing == Records {
+	if framing == FramingRecords {
 		mw, ok := w.(MessageWriter)
 		if !ok {
 			return 0, errors.New("zmux: Records framing needs a MessageWriter")

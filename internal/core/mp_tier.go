@@ -6,7 +6,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// Tiers, usability and the tier gate (SCHEDULER.md 10, MULTIPATH.md 9).
+// Tiers, usability and the tier gate (MULTIPATH.md 9).
 // The gate is worked out at each scheduling decision from the values in
 // force at that moment; it lives in session scratch storage and allocates
 // nothing in steady state.
@@ -65,7 +65,7 @@ func (g *gate) admits(s *Session, p *Pipe) bool {
 // inProbation reports whether a pipe's probation is running.
 func (a *attach) inProbation() bool { return a.prob.on }
 
-// pipeUsable is SCHEDULER.md 10 "usable" for one outbound pipe; probOK
+// pipeUsable reports whether an outbound pipe is usable for data; probOK
 // lets pipes in probation or awaiting revalidation count.
 func (s *Session) pipeUsable(p *Pipe, probOK bool) bool {
 	a := p.mp
@@ -109,8 +109,7 @@ func (s *Session) rateOf(p *Pipe) float64 { return p.out.snd.re.value() }
 // merely refuses bytes saturates nothing.
 func (s *Session) committed(p *Pipe) float64 { return float64(p.mp.unsentAhead) }
 
-// notsentLowat is the carrier low-water mark of multipath sessions
-// (SCHEDULER.md 9).
+// notsentLowat is the carrier low-water mark of multipath sessions.
 const notsentLowat = 32 << 10
 
 // queued is Q_p of the arrival estimate: what is committed, and at least
@@ -188,7 +187,7 @@ func (s *Session) buildGate() *gate {
 		g.tiers = append(g.tiers, t)
 		lo = hi
 	}
-	// The cascade (SCHEDULER.md 10): only multi-tier gates need the
+	// The cascade: only multi-tier gates need the
 	// offered data and its age.
 	g.last, g.fed, g.allSat = 0, 0, false
 	if len(g.tiers) == 1 {
@@ -376,7 +375,7 @@ func (s *Session) tierDeadline() Time {
 
 // waitingData is X of the most-preferred tier and the age of its oldest
 // byte: stream data ready within stream and session credit and not yet
-// committed to a pipe, plus pending reinjection (SCHEDULER.md 10).
+// committed to a pipe, plus pending reinjection.
 func (s *Session) waitingData() (uint64, Time, bool) {
 	var fresh, lost uint64
 	var oldest Time
@@ -438,7 +437,7 @@ func (st *Stream) waitStart() Time {
 	return w
 }
 
-// ---- settings (API.md 4.2) ----
+// ---- settings ----
 
 // PipeSettings changes the tier settings of an attachment; nil fields
 // stay. ClearSend* return a field to the peer's request.

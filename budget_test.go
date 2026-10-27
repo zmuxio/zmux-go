@@ -41,7 +41,7 @@ func TestListenerMemoryBudget(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		return Dial(ctx, nc, nil)
+		return Client(ctx, nc, nil)
 	}
 	c, err := dial()
 	if err != nil {

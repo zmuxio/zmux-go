@@ -2,9 +2,9 @@ package zmux
 
 import "github.com/zmuxio/zmux-go/internal/core"
 
-// Scheduler is a scheduling policy of a multipath session (SCHEDULER.md
-// Section 3). The built-in policies are returned by Affinity,
-// SessionAffinity, SpreadETA, SpreadRoundRobin and SpreadRateWeighted.
+// Scheduler is a scheduling policy of a multipath session. The built-in
+// policies are returned by Affinity, SessionAffinity, SpreadETA,
+// SpreadRoundRobin and SpreadRateWeighted.
 type Scheduler interface {
 	policy() core.Policy
 }
@@ -32,7 +32,7 @@ func SpreadRateWeighted() Scheduler { return builtin(core.PolicySpreadRateWeight
 type Direction uint8
 
 const (
-	Bidirectional Direction = iota
-	SendOnly
-	ReceiveOnly
+	DirBidirectional Direction = iota
+	DirSendOnly
+	DirReceiveOnly
 )

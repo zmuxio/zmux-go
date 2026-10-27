@@ -1,8 +1,8 @@
 package core
 
-// PipeInfo is the snapshot of one attachment that Pipes() and Stats()
-// report (API.md 4.5): exact counts and settings, and the sender's
-// estimates of SCHEDULER.md 2.
+// PipeInfo is the snapshot of one attachment that PipeStats and Stats
+// report: exact counts and settings, and the sender's RTT, one-way delay
+// and delivery-rate estimates.
 type PipeInfo struct {
 	ID           uint64
 	OutState     string

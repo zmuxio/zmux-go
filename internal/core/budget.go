@@ -2,13 +2,12 @@ package core
 
 import "sync/atomic"
 
-// Budget is a memory budget shared by the sessions of a listener (API.md
-// 4.4, IMPLEMENTATION.md 6.6): the sum over them of buffered receive data,
-// retained data and the growth of each session window above its initial
-// size. Sessions charge it from their own critical sections with atomics
-// only (lock level L3); pressure starts when the sum reaches the limit and
-// ends when it falls below three quarters of it, and each transition is
-// signalled on Changed for the listener's serial context.
+// Budget is a memory budget shared by the sessions of a listener: the sum over
+// them of buffered receive data, retained data and the growth of each session
+// window above its initial size. Sessions charge it from their own critical
+// sections with atomics only (lock level L3); pressure starts when the sum
+// reaches the limit and ends when it falls below three quarters of it, and each
+// transition is signalled on Changed for the listener's serial context.
 type Budget struct {
 	limit   uint64 // 0: unlimited
 	used    atomic.Int64
@@ -79,7 +78,7 @@ func (s *Session) ChargeBudget() {
 // Charged is the session's current charge on its budget.
 func (s *Session) Charged() uint64 { return s.charged }
 
-// underPressure reports listener memory pressure (IMPLEMENTATION.md 6.6):
+// underPressure reports listener memory pressure:
 // the session behaves as at its buffer cap and refuses new peer streams.
 func (s *Session) underPressure() bool {
 	return s.cfg.Budget != nil && s.cfg.Budget.over.Load()

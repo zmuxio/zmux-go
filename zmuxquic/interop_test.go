@@ -107,7 +107,7 @@ func bulkAndClose(t *testing.T, ctx context.Context, c *zmux.Conn, p *peerProc) 
 	for range 6 {
 		wg.Go(func() {
 			msg := make([]byte, 8<<20)
-			rand.Read(msg)
+			_, _ = rand.Read(msg)
 			st, err := c.OpenStreamSync(ctx)
 			if err != nil {
 				errs <- err
@@ -128,14 +128,14 @@ func bulkAndClose(t *testing.T, ctx context.Context, c *zmux.Conn, p *peerProc) 
 	wg.Wait()
 	close(errs)
 	for err := range errs {
-		t.Fatalf("%v; pipes %+v; session %v", err, c.Pipes(), context.Cause(c.Context()))
+		t.Fatalf("%v; pipes %+v; session %v", err, c.PipeStats(), context.Cause(c.Context()))
 	}
 	var lanes int
-	for _, ps := range c.Pipes() {
+	for _, ps := range c.PipeStats() {
 		lanes += ps.Lanes
 	}
 	if lanes < 1 {
-		t.Errorf("no lanes: %+v", c.Pipes())
+		t.Errorf("no lanes: %+v", c.PipeStats())
 	}
 	if r := command(t, ctx, c, "close:7:done", nil); r != "closing" {
 		t.Fatalf("close: %q", r)

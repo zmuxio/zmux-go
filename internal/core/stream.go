@@ -161,7 +161,7 @@ type sendPart struct {
 	mps        *mpSend // multipath retention state (nil outside multipath)
 	appWritten uint64  // application bytes written (excludes the preamble)
 
-	// Ages for tier saturation (SCHEDULER.md 10).
+	// Ages for tier saturation.
 	waitAt    Time // the oldest unsent byte's write
 	wwaitAt   Time // the writer's wait for buffer space began
 	writeDone Time
@@ -248,7 +248,7 @@ func isBidiID(id uint64) bool { return id&2 == 0 }
 
 // ---- opening ----
 
-// OpenStream opens a local stream (API.md 5.1). Once established it reserves
+// OpenStream opens a local stream. Once established it reserves
 // stream-count credit and fails with ErrStreamLimit without it; before
 // establishment the stream is provisional.
 func (s *Session) OpenStream(bidi bool) (*Stream, error) {
@@ -310,7 +310,7 @@ func (s *Session) wakeOpeners() {
 	for t := range 2 {
 		if s.loc[t].reserved < s.loc[t].limit && len(s.openW[t]) > 0 {
 			// FIFO: wake the first waiter; it re-checks and the next one is
-			// woken when it gets its credit (API.md 5.1).
+			// woken when it gets its credit.
 			s.wake(s.openW[t][0])
 		}
 	}
@@ -471,7 +471,7 @@ func (s *Session) SetPriority(st *Stream, urgency uint8, incr bool) {
 
 // SetPeerPriority requests a priority for the peer's sending part:
 // the PRIORITY TLV before a local stream's first frame, PRIORITY_UPDATE
-// otherwise (API.md 5.1).
+// otherwise.
 func (s *Session) SetPeerPriority(st *Stream, urgency uint8, incr bool) error {
 	if urgency > 7 {
 		return ErrInvalid

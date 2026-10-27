@@ -8,7 +8,7 @@ type connFlow struct {
 	blocked  uint64 // limit+1 at which DATA_BLOCKED was sent
 	sendHeld uint64 // written, not yet released bytes (send_buffer)
 	creditAt Time   // when credit last arrived while data waited for it
-	// Send-buffer water-filling (IMPLEMENTATION.md 6.4).
+	// Send-buffer water-filling.
 	smallHeld uint64 // bytes held by small directions
 	bigCount  int    // directions that are not small
 
@@ -45,7 +45,7 @@ func (s *Session) bufferCap() uint64 {
 
 // bufAdd accounts n bytes stored in a stream buffer and releases session
 // credit for them below the cap. It is the only function that raises the
-// buffered count (IMPLEMENTATION.md 13.2 C1).
+// buffered count.
 func (s *Session) bufAdd(n uint64) {
 	if n == 0 {
 		return
@@ -97,7 +97,7 @@ func (s *Session) releaseUnbuffered(n uint64) {
 	s.connCreditChanged()
 }
 
-// updateThreshold is min(W/4, max(W/16, 256 KiB)) (IMPLEMENTATION.md 6.2).
+// updateThreshold is min(W/4, max(W/16, 256 KiB)).
 func updateThreshold(w uint64) uint64 {
 	return min64(w/4, max64(w/16, 256<<10))
 }

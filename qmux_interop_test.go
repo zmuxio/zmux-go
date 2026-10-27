@@ -24,7 +24,7 @@ func TestQMuxInteropClient(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	c, err := Dial(ctx, nc, &Config{EnableDatagrams: true})
+	c, err := Client(ctx, nc, &Config{EnableDatagrams: true})
 	if err != nil {
 		t.Fatal(err)
 	}

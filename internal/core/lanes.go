@@ -7,7 +7,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// Lanes (MULTIPATH.md 2.5, 5.8; SCHEDULER.md 9.2). A pipe whose carrier is
+// Lanes (MULTIPATH.md 2.5, 5.8). A pipe whose carrier is
 // a stream of a multi-stream connection may carry its records over several
 // streams of that connection. The outbound side opens lanes on demand and
 // binds stream directions to them; the inbound side attaches the lanes the
@@ -17,7 +17,7 @@ import (
 type laneOut struct {
 	next      uint64 // next lane number
 	pending   *outLane
-	copyLane  *outLane // the copy lane (SCHEDULER.md 9.2 rule 3), nil when none
+	copyLane  *outLane // the copy lane, nil when none
 	offered   bool     // the carrier offers lanes
 	requested bool     // a lane open is pending at the driver
 	refused   bool
@@ -97,8 +97,8 @@ func (s *Session) bindLane(p *Pipe, st *Stream) *outLane {
 	return l
 }
 
-// onLane0 reports a stream direction that lane 0 carries (SCHEDULER.md 9.2
-// rule 1): the redundant ones in multipath, urgency 0 to 2 without.
+// onLane0 reports a stream direction that lane 0 carries: the redundant ones in
+// multipath, urgency 0 to 2 without.
 func (s *Session) onLane0(st *Stream) bool {
 	if s.feat.Multipath {
 		return s.redundant(st)
@@ -222,8 +222,7 @@ func (s *Session) lanesAcked(p *Pipe, ol *outLane) {
 	if ol.acked > 0 {
 		s.laneConfirmed(p, ol)
 	}
-	// A direction stays bound until its data on the lane is acknowledged
-	// (SCHEDULER.md 9.2 rule 2).
+	// A direction stays bound until its data on the lane is acknowledged.
 	for i := 0; i < len(ol.boundSt); {
 		if st := ol.boundSt[i]; st.snd.laneEnd <= ol.acked {
 			s.unbindLane(st)
@@ -319,7 +318,7 @@ func (s *Session) AcceptLane(conn any, pipe, lane uint64, info CarrierInfo) bool
 }
 
 // dataTurn reports whether data lane ol may take new stream data from the
-// pipe's paced room now (SCHEDULER.md 9.2 rule 4): lane 0 and the copy
+// pipe's paced room now: lane 0 and the copy
 // lane always; a data lane once per round while another data lane that
 // asked has not had its turn, so a lane bound later is not starved by the
 // lanes whose writers come first.
@@ -353,7 +352,7 @@ func (s *Session) tookTurn(p *Pipe, ol *outLane) {
 	}
 }
 
-// copyLaneOf returns p's copy lane (SCHEDULER.md 9.2 rule 3): the
+// copyLaneOf returns p's copy lane: the
 // lowest-numbered confirmed lane above 0 with no bound stream direction,
 // kept while it serves; when there is none a lane is requested and nil
 // returned.

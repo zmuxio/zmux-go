@@ -8,22 +8,22 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-// Tracer receives session events (IMPLEMENTATION.md 2.5.7). Its functions
+// Tracer receives session events. Its functions
 // run serially and in order on a goroutine of the session, never under a
 // lock; the session never waits for them: a bounded queue holds events,
 // and on overflow the events other than Closed are dropped and counted.
 type Tracer struct {
 	// Established: the peer's transport parameters were processed.
 	Established func()
-	// Event: a pipe or session event (as NextPipeEvent reports them).
-	Event func(PipeEvent)
+	// Event: a pipe or session event (as NextEvent reports them).
+	Event func(Event)
 	// Dropped: events lost to overflow since the previous call.
 	Dropped func(count uint64)
 	// Closed: the session ended; nothing follows.
 	Closed func(err error)
 }
 
-// Pick is a custom scheduling policy (API.md 5.2). It runs outside every
+// Pick is a custom scheduling policy. It runs outside every
 // lock and must not block. One call carries every stream direction that
 // waits for a decision; it writes one answer per request into out (preset
 // to Wait). An answer names a pipe of pipes by index and how many bytes it
@@ -40,7 +40,7 @@ type PickRequest struct {
 	EligibleTier uint64 // the most-preferred usable tier
 	LastPipe     uint64
 	HasLastPipe  bool
-	Urgency      uint8
+	Urgency      Urgency
 }
 
 // PickPipe is a pipe as a custom policy sees it (values only).
@@ -99,7 +99,7 @@ type hooks struct {
 }
 
 type traceItem struct {
-	ev     PipeEvent
+	ev     Event
 	est    bool
 	closed bool
 	err    error
@@ -235,7 +235,7 @@ func (h *hooks) runPick() {
 	}
 	reqs := make([]PickRequest, len(req.Frames))
 	for i, f := range req.Frames {
-		reqs[i] = PickRequest{Stream: StreamID(f.Stream), Urgency: f.Urgency, Len: f.Len, LastPipe: f.LastPipe,
+		reqs[i] = PickRequest{Stream: StreamID(f.Stream), Urgency: Urgency(f.Urgency), Len: f.Len, LastPipe: f.LastPipe,
 			HasLastPipe: f.HasLastPipe, EligibleTier: f.EligibleTier}
 	}
 	pipes := make([]PickPipe, len(req.Pipes))
@@ -271,7 +271,7 @@ func safeCall(f func()) (ok bool) {
 	return true
 }
 
-// ---- redial (RESUME.md 4.3, API.md 5.5) ----
+// ---- redial (RESUME.md 4.3) ----
 
 // redialer re-establishes pipes with the Redial hook while the session
 // lacks a direction: at most one call in flight per direction, cancelled
@@ -294,11 +294,11 @@ func (c *Conn) maybeRedial() {
 	case out && in:
 		return
 	case !out && !in:
-		need = Bidirectional
+		need = DirBidirectional
 	case !out:
-		need = SendOnly
+		need = DirSendOnly
 	default:
-		need = ReceiveOnly
+		need = DirReceiveOnly
 	}
 	r := &c.redial
 	r.mu.Lock()

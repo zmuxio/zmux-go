@@ -7,8 +7,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// Carrier early data (TLS 1.3 early data, QUIC 0-RTT; SPEC.md 6.1.2,
-// API.md 4.1). A client that remembers its peer's parameters from an
+// Carrier early data (TLS 1.3 early data, QUIC 0-RTT; SPEC.md 6.1.2). A client that remembers its peer's parameters from an
 // earlier session sends its first streams in the carrier's early data; the
 // carrier reports whether the server accepted them, and on rejection the
 // session restarts the bootstrap pipe on the byte stream the adapter's
@@ -98,7 +97,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier) {
 	rw, err := ec.RestartEarly(c.ctx)
 	if err != nil {
 		c.lock()
-		c.s.Close(uint64(InternalError), []byte("early data restart failed"))
+		c.s.Close(uint64(TransportInternalError), []byte("early data restart failed"))
 		c.unlock()
 		return
 	}
@@ -115,7 +114,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier) {
 		// The verdict contradicts what the early carrier delivered (the
 		// peer's parameters arrived on it): fail rather than mix carriers.
 		_ = rw.Close()
-		c.s.Close(uint64(InternalError), []byte("early data rejected after the peer's parameters"))
+		c.s.Close(uint64(TransportInternalError), []byte("early data rejected after the peer's parameters"))
 		return
 	}
 	old := c.pipes[0]

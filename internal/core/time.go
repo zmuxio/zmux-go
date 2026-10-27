@@ -1,4 +1,4 @@
-// Package core is the sans-IO zmux session (IMPLEMENTATION.md Section 2.1).
+// Package core is the sans-IO zmux session.
 // Every method must be called with the session's lock held by the caller;
 // nothing here blocks, performs I/O or calls application code.
 package core
@@ -11,7 +11,7 @@ type Time int64
 // Duration is a span in nanoseconds.
 type Duration = int64
 
-// Never is a deadline that never fires (IMPLEMENTATION.md 13.4 T1).
+// Never is a deadline that never fires.
 const Never Time = math.MaxInt64
 
 const (
