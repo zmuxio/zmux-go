@@ -35,7 +35,8 @@ type ListenerConfig struct {
 	// session beyond it is refused.
 	Backlog int
 	// InstanceID is encoded at the start of every session locator, for
-	// load-balancer stickiness.
+	// load-balancer stickiness; random bytes fill the rest of the 16-byte
+	// locator. At most MaxInstanceIDLen bytes.
 	InstanceID []byte
 	// MemoryBudget bounds the sum over the listener's sessions of buffered
 	// receive data, retained data and session window growth (1 GiB;
@@ -106,9 +107,17 @@ type pairWait struct {
 	end  chan struct{}
 }
 
+// MaxInstanceIDLen bounds ListenerConfig.InstanceID so that at least 8
+// random bytes remain in the 16-byte session locator.
+const MaxInstanceIDLen = 8
+
 // NewListener returns a listener; feed it carriers with Serve, HandlePipe
-// or ServeHTTP. cfg may be nil.
+// or ServeHTTP. cfg may be nil. It panics if cfg.InstanceID is longer than
+// MaxInstanceIDLen.
 func NewListener(cfg *ListenerConfig) *Listener {
+	if cfg != nil && len(cfg.InstanceID) > MaxInstanceIDLen {
+		panic("zmux: ListenerConfig.InstanceID longer than MaxInstanceIDLen")
+	}
 	l := &Listener{live: map[*Conn]struct{}{}, sessions: map[string]*Conn{}, pairs: map[[16]byte]*pairWait{}, done: make(chan struct{})}
 	if cfg != nil {
 		l.cfg = *cfg
@@ -417,11 +426,9 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO) error {
 		closePipeIO(p)
 		return err
 	}
-	loc := make([]byte, len(l.cfg.InstanceID), len(l.cfg.InstanceID)+16)
-	copy(loc, l.cfg.InstanceID)
-	var r [16]byte
-	_, _ = rand.Read(r[:])
-	loc = append(loc, r[:]...)
+	loc := make([]byte, 16)
+	n := copy(loc, l.cfg.InstanceID)
+	_, _ = rand.Read(loc[n:])
 	if cc.Local.Has&wire.HasMultipath != 0 {
 		cc.Local.Locator = loc
 	}

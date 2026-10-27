@@ -33,7 +33,7 @@ func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &mpEnv{ln: ln, lst: NewListener(&ListenerConfig{Config: scfg}), cancel: cancel}
+	e := &mpEnv{ln: ln, lst: NewListener(&ListenerConfig{Config: scfg, InstanceID: []byte("instance")}), cancel: cancel}
 	go func() {
 		for {
 			c, err := ln.Accept()
