@@ -106,5 +106,8 @@ func openStream(ctx context.Context, qc **quic.Conn) (*quic.Stream, error) {
 		*qc = next
 		stream, err = next.OpenStreamSync(ctx)
 	}
-	return stream, err
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
 }

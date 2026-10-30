@@ -103,12 +103,12 @@ func Client(ctx context.Context, qc *quic.Conn, cfg *zmux.Config) (*zmux.Conn, e
 // or join), with lanes wired: the lanes the peer opens on qc are accepted
 // while qc is open (one goroutine per connection).
 func OpenPipe(ctx context.Context, qc *quic.Conn) (zmux.PipeIO, error) {
-	s, err := openStream(ctx, &qc)
+	pio, _, err := openPipe(ctx, &qc)
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
 	clientLanes(qc)
-	return streamPipe(qc, s), nil
+	return pio, nil
 }
 
 // Serve accepts connections from ln and hands their streams to l, as
@@ -182,6 +182,16 @@ func hostOf(a net.Addr) string {
 func streamPipe(qc *quic.Conn, s *quic.Stream) zmux.PipeIO {
 	sp := &qStream{qc: qc, s: s}
 	return zmux.PipeIO{R: (*qReader)(sp), W: sp}
+}
+
+// openPipe opens the first bidirectional stream of *qc (see openStream) as a
+// pipe input; the returned context ends with the stream.
+func openPipe(ctx context.Context, qc **quic.Conn) (zmux.PipeIO, context.Context, error) {
+	s, err := openStream(ctx, qc)
+	if err != nil {
+		return zmux.PipeIO{}, nil, err
+	}
+	return streamPipe(*qc, s), s.Context(), nil
 }
 
 // qStream is the sending half, with the carrier capabilities.
@@ -410,13 +420,12 @@ func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 		return zmux.PipeIO{}, err
 	}
 	qc := l.Conn
-	s, err := openStream(ctx, &qc)
+	pio, done, err := openPipe(ctx, &qc)
 	if err != nil {
 		l.Release()
 		return zmux.PipeIO{}, err
 	}
-	context.AfterFunc(s.Context(), l.Release)
-	pio := streamPipe(qc, s)
+	context.AfterFunc(done, l.Release)
 	pio.FateGroup = l.FateGroup
 	return pio, nil
 }
