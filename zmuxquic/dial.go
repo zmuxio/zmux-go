@@ -89,27 +89,22 @@ func handshakeReady(ctx context.Context, qc *quic.Conn) error {
 	}
 }
 
-// openStream opens the first bidirectional stream of qc after the handshake
-// barrier. After a 0-RTT rejection the stream lives on qc's next connection
-// handle, which is returned with it; on failure both results are nil and qc
-// stays with the caller, who owns its close (the next handle shares qc's
-// connection, so closing qc covers it).
-func openStream(ctx context.Context, qc *quic.Conn) (*quic.Conn, *quic.Stream, error) {
-	if err := handshakeReady(ctx, qc); err != nil {
-		return nil, nil, err
+// openStream opens the first bidirectional stream of *qc after the handshake
+// barrier. After a 0-RTT rejection the stream lives on the connection's next
+// handle, which replaces *qc; both handles share one connection, so the
+// caller's close of either covers it.
+func openStream(ctx context.Context, qc **quic.Conn) (*quic.Stream, error) {
+	if err := handshakeReady(ctx, *qc); err != nil {
+		return nil, err
 	}
-	conn := qc
-	stream, err := conn.OpenStreamSync(ctx)
+	stream, err := (*qc).OpenStreamSync(ctx)
 	if errors.Is(err, quic.Err0RTTRejected) {
-		next, nextErr := qc.NextConnection(ctx)
+		next, nextErr := (*qc).NextConnection(ctx)
 		if nextErr != nil {
-			return nil, nil, nextErr
+			return nil, nextErr
 		}
-		conn = next
-		stream, err = conn.OpenStreamSync(ctx)
+		*qc = next
+		stream, err = next.OpenStreamSync(ctx)
 	}
-	if err != nil {
-		return nil, nil, err
-	}
-	return conn, stream, nil
+	return stream, err
 }
