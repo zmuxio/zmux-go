@@ -29,7 +29,9 @@ func (b *Budget) Used() uint64 { return uint64(max(b.used.Load(), 0)) }
 // Pressure reports whether the sum is above the budget.
 func (b *Budget) Pressure() bool { return b.over.Load() }
 
-func (b *Budget) add(d int64) {
+// Add charges d bytes (negative: releases them); carrier adapters charge
+// the bytes they hold for the listener's sessions this way.
+func (b *Budget) Add(d int64) {
 	u := b.used.Add(d)
 	if b.limit == 0 {
 		return
@@ -70,7 +72,7 @@ func (s *Session) ChargeBudget() {
 		return
 	}
 	if u := s.memUsage(); u != s.charged {
-		b.add(int64(u) - int64(s.charged))
+		b.Add(int64(u) - int64(s.charged))
 		s.charged = u
 	}
 }

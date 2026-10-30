@@ -161,6 +161,7 @@ func (s *Session) startProbation(p *Pipe) {
 		}
 		s.wakePipe(p)
 	}
+	s.capacityChanged()
 }
 
 // probationSuspect: the pipe became suspect.
@@ -194,6 +195,7 @@ func (s *Session) probationFailed(p *Pipe) {
 // for the probes probation needs; it returns the next deadline.
 func (s *Session) probationTimers(now Time, apply bool) Time {
 	next := Never
+	changed := false
 	for _, p := range s.pipes {
 		a := p.mp
 		if a == nil || p.out == nil || a.retired {
@@ -203,10 +205,15 @@ func (s *Session) probationTimers(now Time, apply bool) Time {
 			if now >= end {
 				if apply {
 					a.prob.on = false
+					changed = true
 					h := s.hist(p)
 					h.ended, h.endAt, h.endBase = true, end, s.backoffBase(p)
 					s.checkTakeover()
 					s.wakeAllWriters()
+				} else {
+					// A deadline query must retain overdue work until the
+					// timer applies it, including a zero-RTT first probation.
+					next = minT(next, end)
 				}
 			} else {
 				next = minT(next, end)
@@ -252,6 +259,9 @@ func (s *Session) probationTimers(now Time, apply bool) Time {
 			}
 		}
 	}
+	if changed {
+		s.capacityChanged()
+	}
 	return next
 }
 
@@ -282,6 +292,7 @@ func (s *Session) RevalidatePipes(id uint64, all bool, now Time) error {
 			a.pingSince = s.now
 		}
 	}
+	s.capacityChanged()
 	s.checkTakeover()
 	s.wakeAllWriters()
 	return nil
@@ -308,6 +319,7 @@ func (s *Session) endRevalidation(p *Pipe) {
 		return
 	}
 	a.reval, a.revalPing = false, false
+	s.capacityChanged()
 	s.checkTakeover()
 	s.wakeAllWriters()
 }

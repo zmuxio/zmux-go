@@ -464,6 +464,7 @@ func (s *Session) SetPipe(id uint64, o PipeSettings) error {
 	a := p.mp
 	bp, bs := a.effPrio()
 	bw := a.weight
+	wasProbation := a.prob.on
 	if o.SendPriority != nil {
 		v := *o.SendPriority
 		a.sendPrio = &v
@@ -493,6 +494,9 @@ func (s *Session) SetPipe(id uint64, o PipeSettings) error {
 		if s.probationBase(p) < 0 && a.prob.on {
 			a.prob.on = false
 		}
+	}
+	if wasProbation != a.prob.on {
+		s.capacityChanged()
 	}
 	if req {
 		s.requestStatus(p)

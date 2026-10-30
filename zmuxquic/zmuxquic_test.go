@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,8 +54,16 @@ type env struct {
 }
 
 func newEnv(t *testing.T, scfg *zmux.Config) *env {
+	return newEnvAt(t, "127.0.0.1:0", scfg)
+}
+
+func newEnvAt(t *testing.T, address string, scfg *zmux.Config) *env {
+	return newEnvQUIC(t, address, scfg, &quic.Config{Allow0RTT: true})
+}
+func newEnvQUIC(t *testing.T, address string, scfg *zmux.Config, qconf *quic.Config) *env {
+	t.Helper()
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddrEarly("127.0.0.1:0", srv, QUICConfig(&quic.Config{Allow0RTT: true}))
+	ln, err := quic.ListenAddrEarly(address, srv, QUICConfig(qconf))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +140,26 @@ func TestQUICPipeAndLanes(t *testing.T) {
 	}
 }
 
-func TestQUICZeroRTT(t *testing.T) {
-	e := newEnv(t, &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true}})
+func TestQUICReplayableResumedDial(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		allow, ticket bool
+	}{{"accepted", true, true}, {"rejected", false, true}, {"no_ticket", true, false}} {
+		t.Run(tc.name, func(t *testing.T) { exerciseReplayableResumedDial(t, tc.allow, tc.ticket) })
+	}
+}
+func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket bool) {
+	t.Helper()
+	var allow atomic.Bool
+	allow.Store(true)
+	base := &quic.Config{Allow0RTT: true}
+	base.GetConfigForClient = func(*quic.ClientInfo) (*quic.Config, error) {
+		c := base.Clone()
+		c.GetConfigForClient = nil
+		c.Allow0RTT = allow.Load()
+		return c, nil
+	}
+	e := newEnvQUIC(t, "127.0.0.1:0", &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true}}, base)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// A first session gets a session ticket and the parameters; it runs on
@@ -156,9 +183,25 @@ func TestQUICZeroRTT(t *testing.T) {
 	_ = s.Close()
 	_ = c.Wait()
 	_ = s.Wait()
-	// The second sends its first stream in 0-RTT.
+	for {
+		if _, ok := e.cli.ClientSessionCache.Get("localhost"); ok {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("session ticket not received")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	allow.Store(allowSecond)
+	secondTLS := e.cli.Clone()
+	if !useTicket {
+		secondTLS.ClientSessionCache = tls.NewLRUClientSessionCache(4)
+	}
+	// The second uses replayable parameters and a resumed native connection.
+	// Native streams currently wait for handshake completion (upstream race).
 	cfg := &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true, Remembered: remembered}}
-	c2, err := Dial(ctx, e.ln.Addr().String(), e.cli, nil, cfg)
+	c2, err := Dial(ctx, e.ln.Addr().String(), secondTLS, nil, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

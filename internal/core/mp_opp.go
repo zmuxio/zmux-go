@@ -165,6 +165,7 @@ func (s *Session) penalize(p *Pipe) {
 	clear(e.samples)
 	e.samples = e.samples[:0]
 	e.r, e.measured = r/2, false
+	s.capacityChanged()
 	s.checkTakeover()
 }
 
@@ -172,6 +173,7 @@ func (s *Session) penalize(p *Pipe) {
 func (s *Session) penaltyAcked(p *Pipe) {
 	if a := p.mp; a.penalized && p.out.snd.cum >= a.penaltyEnd {
 		a.penalized = false
+		s.capacityChanged()
 		s.checkTakeover()
 		s.wakeAllWriters()
 	}

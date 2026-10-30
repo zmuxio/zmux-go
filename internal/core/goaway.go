@@ -25,6 +25,12 @@ func (s *Session) Shutdown(code uint64, reason []byte) {
 	}
 	g := &s.ga
 	g.closeWhenDone = true
+	for i := range s.openW {
+		for _, w := range s.openW[i] {
+			s.wake(w)
+		}
+		s.openW[i] = s.openW[i][:0]
+	}
 	g.code, g.reason = code, reason
 	if !s.feat.GoAway || !s.peerSeen {
 		s.checkShutdownDone()
@@ -94,7 +100,7 @@ func (s *Session) Settle() {
 
 // checkShutdownDone closes once no stream remains after Shutdown.
 func (s *Session) checkShutdownDone() {
-	if !s.ga.closeWhenDone || s.isClosing() || len(s.streams) > 0 || s.ga.phase == 1 {
+	if !s.ga.closeWhenDone || s.isClosing() || len(s.streams) > 0 || len(s.provisional) > 0 || s.ga.phase == 1 {
 		return
 	}
 	s.Close(s.ga.code, s.ga.reason)

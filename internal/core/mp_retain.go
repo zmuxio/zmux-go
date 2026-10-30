@@ -312,9 +312,5 @@ func (s *Session) retransmitBudget() uint64 {
 		sum += r * float64(a.rtt.smoothed+pd) / 1e9
 	}
 	b := uint64(4 * sum)
-	bufMax := s.cfg.SendBufferMax
-	if bufMax == 0 {
-		bufMax = 64 << 20
-	}
-	return min64(max64(b, 1<<20), max64(bufMax, 1<<20))
+	return min64(max64(b, 1<<20), max64(s.sendBufferLimit(), 1<<20))
 }

@@ -57,7 +57,12 @@ const (
 	DirBidi = DirIn | DirOut
 )
 
-func (s *Session) emit(e Event) { s.events = append(s.events, e) }
+func (s *Session) emit(e Event) {
+	if e.Kind == EvPipeState || e.Kind == EvPipePriority {
+		s.capacityChanged()
+	}
+	s.events = append(s.events, e)
+}
 
 // PollEvent returns the next queued event.
 func (s *Session) PollEvent() (Event, bool) {

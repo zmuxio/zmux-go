@@ -51,9 +51,11 @@ type Config struct {
 	DatagramStreamQueue  int
 	DatagramReceiveBytes int
 
-	// SendBuffer bounds written-but-unreleased bytes (4 MiB).
+	// SendBuffer starts the written-but-unreleased byte budget (4 MiB).
+	// Multipath sessions grow it to the retransmit budget, within MaxSendBuffer.
 	SendBuffer uint64
-	// MaxSendBuffer bounds its growth in multipath sessions (0: auto).
+	// MaxSendBuffer fixes its growth maximum (at least SendBuffer). Zero is
+	// automatic: a 64 MiB floor, above it within the memory budget.
 	MaxSendBuffer uint64
 
 	// MaxPipes is the attachments this endpoint aims for (1: multipath

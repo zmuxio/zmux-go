@@ -3,8 +3,10 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 
+	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -37,11 +39,27 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 	if opts != nil {
 		o = *opts
 	}
-	if s1 == s2 || s1.dialed == s2.dialed || s1.dialed == dialUnknown || s2.dialed == dialUnknown {
+	if s1 == nil || s2 == nil || s1 == s2 {
 		return DuplicateResult{}, ErrNoDecision
 	}
-	v1, v2 := dialerValue(s1, &o), dialerValue(s2, &o)
-	if v1 == nil || v2 == nil {
+	a, b := duplicateSnapshot(s1), duplicateSnapshot(s2)
+	if !a.established || !b.established || a.dialer == b.dialer || a.dialer == dialUnknown || b.dialer == dialUnknown {
+		return DuplicateResult{}, ErrNoDecision
+	}
+	var v1, v2 []byte
+	switch {
+	case len(o.LocalID) > 0 && len(o.PeerID) > 0:
+		v1, v2 = o.LocalID, o.PeerID
+		if a.dialer != dialLocal {
+			v1, v2 = v2, v1
+		}
+	case a.multipath && b.multipath:
+		v1, v2 = a.sessionNonce[:], b.sessionNonce[:]
+	case a.autoRole && b.autoRole:
+		v1, v2 = make([]byte, 8), make([]byte, 8)
+		binary.BigEndian.PutUint64(v1, a.roleNonce)
+		binary.BigEndian.PutUint64(v2, b.roleNonce)
+	default:
 		return DuplicateResult{}, ErrNoDecision
 	}
 	cmp := bytes.Compare(v1, v2)
@@ -49,12 +67,18 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 		return DuplicateResult{}, errors.New("zmux: duplicate sessions to this endpoint itself")
 	}
 	win, lose := s1, s2
+	loserDialer := b.dialer
 	if cmp > 0 {
 		win, lose = s2, s1
+		loserDialer = a.dialer
 	}
-	go func() { _ = lose.Shutdown(context.Background(), 0, "") }()
+	// Commit the existing drain state before returning; no separate waiter is needed.
+	lose.lock()
+	lose.s.SetNow(lose.clk.now())
+	lose.s.Shutdown(0, nil)
+	lose.unlock()
 	res := DuplicateResult{Survivor: win, Loser: lose}
-	if o.Rejoin && o.Dial != nil && lose.dialed == dialLocal && win.ConnectionState().Multipath {
+	if o.Rejoin && o.Dial != nil && loserDialer == dialLocal && win.ConnectionState().Multipath && win.JoinReady() {
 		res.RejoinStarted = true
 		go func() {
 			ctx, cancel := context.WithTimeout(win.ctx, win.handshakeTimeout())
@@ -69,42 +93,32 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 	return res, nil
 }
 
-// dialerValue is the value of a session's dialer the rule compares:
-// its identity, else its Session Nonce (both multipath), else its role
-// nonce (both auto).
-func dialerValue(c *Conn, o *DuplicateOptions) []byte {
-	local := c.dialed == dialLocal
-	if len(o.LocalID) > 0 && len(o.PeerID) > 0 {
-		if local {
-			return o.LocalID
-		}
-		return o.PeerID
-	}
+// duplicateInput is a value snapshot, not another authority for session state.
+// Capture the dialer under the same lock as its designation and transport parameters.
+type duplicateInput struct {
+	dialer                           dialer
+	established, multipath, autoRole bool
+	sessionNonce                     [16]byte
+	roleNonce                        uint64
+}
+
+func duplicateSnapshot(c *Conn) duplicateInput {
 	c.lock()
 	defer c.unlock()
-	lp := c.s.LocalParams()
-	pp, ok := c.s.PeerParams()
-	if !ok {
-		return nil
+	local := c.s.LocalParams()
+	peer, ok := c.s.PeerParams()
+	result := duplicateInput{dialer: c.dialed, established: ok && !c.closing && c.s.State() < core.StateClosing}
+	if !result.established {
+		return result
 	}
-	if c.s.Features().Multipath {
-		if local {
-			return append([]byte(nil), lp.SessionNonce[:]...)
-		}
-		return append([]byte(nil), pp.SessionNonce[:]...)
+	result.multipath = c.s.Features().Multipath
+	result.autoRole = local.Has&wire.HasRole != 0 && peer.Has&wire.HasRole != 0 && local.Role == wire.RoleAuto && peer.Role == wire.RoleAuto
+	params := local
+	if result.dialer != dialLocal {
+		params = peer
 	}
-	if lp.Has&wire.HasRole != 0 && pp.Has&wire.HasRole != 0 && lp.Role == wire.RoleAuto && pp.Role == wire.RoleAuto {
-		n := lp.RoleNonce
-		if !local {
-			n = pp.RoleNonce
-		}
-		b := make([]byte, 8)
-		for i := range b {
-			b[7-i] = byte(n >> (8 * i))
-		}
-		return b
-	}
-	return nil
+	result.sessionNonce, result.roleNonce = params.SessionNonce, params.RoleNonce
+	return result
 }
 
 // dialer of a session: who established its bootstrap carrier.

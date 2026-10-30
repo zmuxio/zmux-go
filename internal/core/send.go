@@ -8,7 +8,7 @@ import "github.com/zmuxio/zmux-go/internal/wire"
 // the smaller remaining credit minus what it already holds unsent.
 func (s *Session) SendCapacity(st *Stream) uint64 {
 	sp := &st.snd
-	if !st.hasS || sp.finWr || sp.reset || sp.stopped || s.err != nil {
+	if !st.hasS || st.cancelled || sp.errState != nil || sp.finWr || sp.reset || sp.stopped || s.err != nil {
 		return 0
 	}
 	unsent := st.unsent()
@@ -163,6 +163,39 @@ func (s *Session) heldLeave(st *Stream, before heldClass) {
 	}
 }
 
+// sendBufferLimit is the absolute maximum: a fixed value, or the 64 MiB
+// floor and what the original memory account can grant. sendHeld is already
+// charged, so adding it back avoids charging unsent/retained data twice.
+func (s *Session) sendBufferLimit() uint64 {
+	if n := s.cfg.SendBufferMax; n > 0 {
+		return max64(n, s.cfg.SendBuffer)
+	}
+	left := ^uint64(0)
+	used := s.memUsage()
+	if b := s.cfg.Budget; b != nil {
+		if b.limit > 0 {
+			left = b.limit - min64(b.limit, b.Used())
+			growth := used - min64(used, s.charged)
+			left -= min64(left, growth)
+		}
+	} else if b := s.cfg.MemoryBudget; b > 0 {
+		left = b - min64(b, used)
+	}
+	cap := ^uint64(0)
+	if left < cap-s.conn.sendHeld {
+		cap = s.conn.sendHeld + left
+	}
+	return max64(max64(64<<20, cap), s.cfg.SendBuffer)
+}
+
+// sessionSendBuffer is the one buffer divided by writers and affinity load.
+func (s *Session) sessionSendBuffer() uint64 {
+	if s.mp == nil {
+		return s.cfg.SendBuffer
+	}
+	return max64(s.cfg.SendBuffer, s.retransmitBudget())
+}
+
 // sendRoom applies the session send buffer by water-filling: small directions
 // come off first, every other direction may hold max(64 KiB, (send_buffer -
 // small bytes) / n); each direction may always hold 64 KiB.
@@ -170,21 +203,29 @@ func (s *Session) sendRoom(st *Stream) uint64 {
 	cl := classOf(st)
 	c := &s.conn
 	n := c.bigCount
-	pool := s.cfg.SendBuffer - min64(s.cfg.SendBuffer, c.smallHeld)
+	total := s.sessionSendBuffer()
+	pool := total - min64(total, c.smallHeld)
 	if !cl.big {
 		n++ // it competes once it holds more
 		if cl.small {
-			pool += min64(cl.held, s.cfg.SendBuffer-pool)
+			pool += min64(cl.held, total-pool)
 		}
 	}
 	share := max64(smallHeld, pool/uint64(max(n, 1)))
 	if st.snd.bufLimit > 0 {
-		share = min64(share, max64(st.snd.bufLimit, smallHeld))
+		share = min64(share, st.snd.bufLimit)
 	}
 	if cl.held >= share {
 		return 0
 	}
-	return share - cl.held
+	room := share - cl.held
+	totalRoom := total - min64(total, c.sendHeld)
+	floor := uint64(smallHeld)
+	if st.snd.bufLimit > 0 {
+		floor = min64(floor, st.snd.bufLimit)
+	}
+	floorRoom := floor - min64(floor, cl.held)
+	return min64(room, max64(totalRoom, floorRoom))
 }
 
 // SetSendBuffer bounds the part's written-but-unreleased bytes.
@@ -296,6 +337,14 @@ func (s *Session) cancelUnopened(st *Stream) {
 		return
 	}
 	st.cancelled = true
+	// An unannounced identifier cannot receive a reverse half from the peer.
+	if st.hasR {
+		st.rcv.state = recvDataRead
+	}
+	s.wakeStream(st)
+	s.checkCapacity(st)
+	s.unlinkCtl(st)
+	st.ctl = 0
 	s.dropProvisional(st)
 	h := s.heldEnter(st)
 	st.snd.wwait = false
@@ -394,7 +443,7 @@ func (s *Session) CancelCapacityWait(st *Stream) {
 
 func (s *Session) capReady(st *Stream, min uint64) bool {
 	sp := &st.snd
-	if !st.hasS || sp.finWr || sp.reset || sp.stopped || s.err != nil || st.discarded {
+	if !st.hasS || st.cancelled || sp.errState != nil || sp.finWr || sp.reset || sp.stopped || s.err != nil || st.discarded {
 		return true
 	}
 	c := s.SendCapacity(st)

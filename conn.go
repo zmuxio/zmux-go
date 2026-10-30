@@ -260,6 +260,25 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 	}
 	registerLaneKey(c)
 	c.lock()
+	// Publish the locator before bootstrap I/O can expose it to the peer.
+	// AcceptJoin already holds joins until negotiation completes.
+	if lst != nil {
+		lst.mu.Lock()
+		closed := lst.closed
+		if !closed {
+			lst.live[c] = struct{}{}
+			if len(cc.Local.Locator) > 0 {
+				lst.sessions[string(cc.Local.Locator)] = c
+			}
+		}
+		lst.mu.Unlock()
+		if closed {
+			c.unlock()
+			closePipeIO(p)
+			c.closeWith(0, "listener closed")
+			return nil, errRejected
+		}
+	}
 	c.addBootstrap(p)
 	early := cc.EarlyZmuxPeer || cc.EarlyRemembered != nil && cc.EarlyReplayable
 	c.unlock()

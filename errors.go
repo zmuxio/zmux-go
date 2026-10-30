@@ -239,7 +239,7 @@ var (
 	// ErrRejected reports a stream the peer did not process (ZMUX_REJECTED
 	// or at or above a GOAWAY watermark); it is retryable.
 	ErrRejected = errors.New("zmux: stream rejected")
-	// ErrGoingAway reports an open after the peer's GOAWAY; it is retryable.
+	// ErrGoingAway reports an open after local shutdown or the peer's GOAWAY; it is retryable.
 	ErrGoingAway = errors.New("zmux: going away")
 	// ErrTooLate is returned for settings that must precede the first frame.
 	ErrTooLate = errors.New("zmux: too late: the stream's first frame was sent")

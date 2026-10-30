@@ -14,8 +14,11 @@
 // single-pipe session on one accepted connection. Start takes any carrier
 // (PipeIO, for example a WebSocket connection with FramingRecords) and an
 // explicit Role, and Listener.HandlePipe or Listener.ServeHTTP accept any
-// carrier. The sub-modules zmuxquic and zmuxh3 carry sessions over QUIC,
-// HTTP/3 and WebTransport.
+// carrier. HTTPExchangePipe and HTTPExchangeHandler build a carrier out of
+// short HTTP requests for paths that buffer or cut long ones; they
+// authenticate but do not encrypt, so a proxy or CDN that terminates TLS
+// can read such a carrier. The sub-modules zmuxquic and zmuxh3 carry
+// sessions over QUIC, HTTP/3 and WebTransport.
 //
 // The Conn and Stream methods follow quic-go: OpenStream[Sync],
 // AcceptStream, Read, Write, Close (FIN), CancelRead, CancelWrite,

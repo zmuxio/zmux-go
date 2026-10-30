@@ -615,6 +615,9 @@ func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 			}
 			if r == chunkSent {
 				if lp != nil {
+					// Keep the physical lane while building this batch. afterBatch
+					// replaces the pending position with its final accounted end.
+					st.snd.laneEnd = ^uint64(0)
 					w.touched = append(w.touched, st)
 				}
 				progressed = true

@@ -117,10 +117,10 @@ func (s *Session) startDrain(p *Pipe) {
 	}
 	a.draining = true
 	a.drainStart = s.now
-	s.unsettle(p)
 	if p.out != nil && a.liveOut() {
 		a.out = outDraining
 	}
+	s.unsettle(p)
 	if !a.abandonSent && !a.abandonQueued {
 		a.abandonQueued = true
 		a.abandonCode = wire.NoError

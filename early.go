@@ -16,8 +16,10 @@ import (
 // EarlyClientCarrier is the optional capability of a client carrier that
 // sends early data. The halves of the bootstrap PipeIO implement it.
 type EarlyClientCarrier interface {
-	// EarlyAccepted blocks until the handshake decided: true when the
-	// server accepted the early data.
+	// EarlyAccepted waits for the carrier handshake's verdict for this pipe's
+	// initial bytes. Return true if they remain usable, including bytes sent
+	// only after the handshake. Return false only when those bytes were
+	// invalidated and RestartEarly must supply their replacement stream.
 	EarlyAccepted(ctx context.Context) (bool, error)
 	// RestartEarly returns the pipe's byte stream as it stands after the
 	// handshake (on QUIC the bootstrap stream opened again).

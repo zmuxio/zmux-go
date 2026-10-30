@@ -523,11 +523,25 @@ func (s *Session) hasLiveOutbound() bool {
 }
 
 // wakeAll queues every waiter of the session (close, GOAWAY).
-func (s *Session) wakeAll() {
-	for _, st := range s.streams {
-		s.wake(st.rsig)
-		s.wake(st.wsig)
+func (s *Session) wakeStream(st *Stream) {
+	s.wake(st.rsig)
+	s.wake(st.wsig)
+	if st.dg != nil {
+		s.wake(st.dg.sig)
 	}
+}
+
+func (s *Session) wakeStreams() {
+	for _, st := range s.streams {
+		s.wakeStream(st)
+	}
+	for _, st := range s.provisional {
+		s.wakeStream(st)
+	}
+}
+
+func (s *Session) wakeAll() {
+	s.wakeStreams()
 	for i := range 2 {
 		for _, w := range s.acceptW[i] {
 			s.wake(w)

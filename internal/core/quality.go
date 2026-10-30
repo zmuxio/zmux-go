@@ -58,6 +58,10 @@ func (s *Session) SetQualityBand(pipe int64, b QualityBand) error {
 // SetCapacityFloor sets the capacity floor; it reports at once when the
 // capacity is below it.
 func (s *Session) SetCapacityFloor(f CapacityFloor) {
+	if f.Rate == 0 {
+		s.q.floor, s.q.below, s.q.floorSet = nil, false, false
+		return
+	}
 	if f.RateRatio <= 0 {
 		f.RateRatio = 1.25
 	}
@@ -150,12 +154,13 @@ func (s *Session) checkCapacityFloor() {
 		return
 	}
 	var sum float64
+	c, _ := s.usableClass()
 	for _, p := range s.pipes {
-		if p.out == nil || !p.out.snd.re.measured {
+		if p.out == nil || !p.out.snd.re.hasSample {
 			continue
 		}
 		if p.mp != nil {
-			if _, sb := p.mp.effPrio(); sb || !s.pipeUsable(p, true) {
+			if _, sb := p.mp.effPrio(); sb || !s.pipeUsable(p, c.probOK) {
 				continue
 			}
 		}
@@ -168,5 +173,12 @@ func (s *Session) checkCapacityFloor() {
 	case s.q.below && sum >= f.Rate*f.RateRatio:
 		s.q.below = false
 		s.emit(Event{Kind: EvCapacityRestored, Rate: sum})
+	}
+}
+
+// capacityChanged rechecks the original aggregation after a usable-set change.
+func (s *Session) capacityChanged() {
+	if s.q.floorSet {
+		s.checkCapacityFloor()
 	}
 }

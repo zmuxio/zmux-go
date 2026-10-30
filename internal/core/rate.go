@@ -35,6 +35,7 @@ type rateEst struct {
 	blockEpoch uint64
 	blockedNow bool
 	measured   bool // a bottleneck sample was taken
+	hasSample  bool // an accepted sample exists, including application-limited samples
 }
 
 type rateSmp struct {
@@ -87,6 +88,7 @@ func (e *rateEst) sample(r float64, bubble bool, epoch uint64, now Time) float64
 	if !bottleneck && r <= e.value() {
 		return 0
 	}
+	e.hasSample = true
 	if bottleneck {
 		e.measured = true
 	}

@@ -58,3 +58,45 @@ func TestMaintainPipesRedials(t *testing.T) {
 		t.Fatalf("MaintainPipes returned %v, want context.Canceled", err)
 	}
 }
+
+func TestMaintainPipesDoesNotDialWhenTargetIsFull(t *testing.T) {
+	leakcheck.Check(t)
+	cfg := mpConfig()
+	cfg.MaxPipes = 2
+	e := newMPEnv(t, cfg, cfg)
+	occupied := e.addPipe(t, PipeOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := make(chan struct{}, 8)
+	done := make(chan error, 1)
+	go func() {
+		done <- e.client.MaintainPipes(ctx, PipePool{Dial: func(context.Context) (PipeIO, error) {
+			calls <- struct{}{}
+			return PipeIO{}, errors.New("test route unavailable")
+		}})
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("maintenance stopped with %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("maintenance did not stop")
+		}
+	}()
+	select {
+	case <-calls:
+		t.Fatal("dialed while existing bootstrap and pipe filled target")
+	case <-time.After(550 * time.Millisecond):
+	}
+	if err := occupied.Abort(nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(3 * time.Second):
+		t.Fatal("did not attempt recovery when target slot became free")
+	}
+}

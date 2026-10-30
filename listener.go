@@ -450,16 +450,8 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO) error {
 	if !full {
 		select {
 		case l.accept <- c:
-			// sessionClosed runs after done is closed: a session that
-			// already ended is not recorded.
-			select {
-			case <-c.done:
-			default:
-				l.live[c] = struct{}{}
-				if len(cc.Local.Locator) > 0 {
-					l.sessions[string(cc.Local.Locator)] = c
-				}
-			}
+			// startCore registered the locator before bootstrap I/O.
+			// sessionClosed owns its removal, including handshake failures.
 		default:
 			full = true
 		}

@@ -197,10 +197,12 @@ func (p *Pipe) waitJoined(ctx context.Context) error {
 	}
 }
 
-// JoinReady reports whether a pipe added now would join at once rather than
-// wait for the attachment cap or the refusal backoff: dial a carrier only
-// then, so that none is held idle.
+// JoinReady reports whether the maintenance target and join admission permit
+// dialing another pipe now. Explicit AddPipe still follows the physical cap.
 func (c *Conn) JoinReady() bool {
+	if c == nil {
+		return false
+	}
 	c.lock()
 	defer c.unlock()
 	return c.s.JoinReady()

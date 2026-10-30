@@ -453,7 +453,7 @@ func (s *Session) stopRecv(st *Stream, code uint64) {
 	} else {
 		r.readOff = r.highest
 	}
-	if r.state == recvRecv || r.state == recvSizeKnown {
+	if !st.cancelled && (r.state == recvRecv || r.state == recvSizeKnown) {
 		s.queueCtl(st, ctlStop)
 	}
 	s.recvProgress(st)
@@ -568,10 +568,7 @@ func (s *Session) unlinkCtl(st *Stream) {
 
 // failAllStreams gives every stream the session error (close).
 func (s *Session) failAllStreams() {
-	for _, st := range s.streams {
-		s.wake(st.rsig)
-		s.wake(st.wsig)
-	}
+	s.wakeStreams()
 	s.wakeCapacity()
 }
 

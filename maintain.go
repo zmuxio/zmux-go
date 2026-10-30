@@ -3,6 +3,7 @@ package zmux
 import (
 	"context"
 	"math/rand/v2"
+	"net"
 	"time"
 )
 
@@ -36,6 +37,15 @@ type Rotation struct {
 // pool.Rotate, until ctx ends or the session closes. It dials outside
 // every lock and returns ctx's error or the session's.
 func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	c.lock()
+	multipath := c.s.Features().Multipath
+	c.unlock()
+	if !multipath {
+		return ErrNotNegotiated
+	}
 	if pool.Count <= 0 {
 		pool.Count = 1
 	}
@@ -81,6 +91,13 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 			limitT: time.Duration(jitter(float64(pool.Rotate.MaxAge)))}
 	}
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return c.closedErr()
+		default:
+		}
 		// Drop members whose pipe is gone or failed.
 		live := members[:0]
 		for _, m := range members {
@@ -100,7 +117,7 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 		c.unlock()
 		lacking := !out || !in
 		// Redial the missing ones.
-		if len(members) < pool.Count {
+		if len(members) < pool.Count && c.JoinReady() {
 			p, err := join()
 			if err != nil {
 				select {
@@ -119,7 +136,7 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 		}
 		// Rotate: only usable pipes, never while a direction is lacking.
 		for _, m := range members {
-			if lacking || m.repl != nil || pool.Rotate.MaxBytes == 0 && pool.Rotate.MaxAge == 0 {
+			if lacking || !c.JoinReady() || m.repl != nil || pool.Rotate.MaxBytes == 0 && pool.Rotate.MaxAge == 0 {
 				continue
 			}
 			st, err := m.p.Stats()

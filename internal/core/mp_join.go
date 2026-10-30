@@ -319,7 +319,7 @@ func (s *Session) AttachedPipes(dst []uint64) []uint64 {
 // attachment provides a missing direction (provideIn: the local endpoint
 // reads on it, provideOut: it writes), the live attachment with the oldest
 // last progress is displaced, failed locally without PIPE_ABANDON.
-func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
+func (s *Session) roomCandidate(local, provideIn, provideOut bool) *Pipe {
 	var oldest *Pipe
 	for _, p := range s.pipes {
 		a := p.mp
@@ -336,7 +336,7 @@ func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 	if oldest == nil {
 		out, in := s.liveCounts()
 		if (!provideOut || out != 0) && (!provideIn || in != 0) {
-			return false
+			return nil
 		}
 		for _, p := range s.pipes {
 			a := p.mp
@@ -348,10 +348,20 @@ func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 			}
 		}
 		if oldest == nil {
-			return false
+			return nil
 		}
-		oa := oldest.mp
-		oa.abandonSent = true // displaced without PIPE_ABANDON
+	}
+	return oldest
+}
+
+func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
+	oldest := s.roomCandidate(local, provideIn, provideOut)
+	if oldest == nil {
+		return false
+	}
+	a := oldest.mp
+	if a.liveOut() || a.in == inOpen || a.in == inJoining {
+		a.abandonSent = true // displaced without PIPE_ABANDON
 		s.failPipe(oldest, wire.PipeFailed, nil)
 	}
 	s.retireLocally(oldest)
@@ -375,9 +385,25 @@ func (s *Session) retireLocally(p *Pipe) {
 	s.retire(p)
 }
 
-// JoinReady reports whether a local join would start at once (no cap, no
-// refusal backoff holds it).
-func (s *Session) JoinReady() bool { return s.mp != nil && s.joinAllowed() }
+// JoinReady reports whether maintenance has target room and a local join
+// may start now. Failed attachments retain physical headroom until retirement.
+func (s *Session) JoinReady() bool {
+	if s.isClosing() || s.mp == nil || s.now < s.mp.backoffUntil {
+		return false
+	}
+	if s.ownAttachments() >= s.mp.ownCap && (s.state != StateSuspended || s.roomCandidate(true, true, true) == nil) {
+		return false
+	}
+	n := 0
+	for _, p := range s.pipes {
+		a := p.mp
+		if a == nil || !a.joinerLocal || a.retired || a.out == outFailed || a.out == outNone && a.in == inEnded {
+			continue
+		}
+		n++
+	}
+	return n < max(1, s.cfg.MaxPipes)
+}
 
 // WakePipe wakes the writers of an attachment (a carrier was attached).
 func (s *Session) WakePipe(id uint64) {

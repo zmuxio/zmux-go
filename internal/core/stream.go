@@ -274,7 +274,7 @@ func (s *Session) openErr() error {
 	if s.err != nil {
 		return s.err
 	}
-	if s.ga.received {
+	if s.ga.received || s.ga.closeWhenDone {
 		return &StreamError{Kind: StreamGoingAway}
 	}
 	return nil
@@ -500,6 +500,9 @@ func (s *Session) dropProvisional(st *Stream) {
 			copy(s.provisional[i:], s.provisional[i+1:])
 			s.provisional[len(s.provisional)-1] = nil
 			s.provisional = s.provisional[:len(s.provisional)-1]
+			if s.ga.closeWhenDone {
+				s.ga.recheck = true
+			}
 			return
 		}
 	}

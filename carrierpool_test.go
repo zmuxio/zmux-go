@@ -2,6 +2,8 @@ package zmux
 
 import (
 	"context"
+	"errors"
+	"github.com/zmuxio/zmux-go/internal/wire"
 	"testing"
 	"time"
 )
@@ -60,5 +62,109 @@ func TestCarrierPool(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 	if y, _ := p2.Get(ctx); y.Conn == x.Conn {
 		t.Fatal("aged connection reused")
+	}
+}
+
+func TestCarrierPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
+	n := 0
+	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, PoolLimits: PoolLimits{MaxPipesPerConnectionLifetime: 1}}
+	defer p.Shutdown()
+	for i := 0; i < 32; i++ {
+		lease, err := p.Get(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		group := lease.FateGroup
+		lease.Release()
+		decoded, used := wire.ReadVarint(wire.AppendVarint(nil, group))
+		if group == 0 || group > wire.MaxVarint || used == 0 || decoded != group {
+			t.Fatalf("pool group %#x is not preserved by its wire encoding (%#x)", group, decoded)
+		}
+	}
+}
+
+func TestCarrierPoolShutdownAndCancelledContextDoNotDial(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		calls := 0
+		p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { calls++; return calls, nil }}
+		ctx := context.Background()
+		want := errPoolClosed
+		if shutdown {
+			p.Shutdown()
+		} else {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithCancel(ctx)
+			cancel()
+			want = context.Canceled
+		}
+		lease, err := p.Get(ctx)
+		if lease != nil {
+			lease.Release()
+		}
+		p.Shutdown()
+		if !errors.Is(err, want) || calls != 0 {
+			t.Fatalf("shutdown=%v: err=%v dials=%d", shutdown, err, calls)
+		}
+	}
+}
+
+func TestCarrierPoolCancelledLateDialReturnsItsConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	closed := 0
+	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { cancel(); return 1, nil }, Close: func(int) { closed++ }}
+	lease, err := p.Get(ctx)
+	if lease != nil {
+		lease.Release()
+	}
+	p.Shutdown()
+	if !errors.Is(err, context.Canceled) || closed != 1 {
+		t.Fatalf("late cancelled dial: err=%v closes=%d", err, closed)
+	}
+}
+
+func TestCarrierPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *testing.T) {
+	n, closed := 0, 0
+	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, PoolLimits: PoolLimits{MaxConnectionAge: time.Minute}}
+	p.Close = func(int) {
+		closed++
+		if !p.mu.TryLock() {
+			t.Error("Close callback ran under pool mutex")
+		} else {
+			p.mu.Unlock()
+		}
+	}
+	defer p.Shutdown()
+	first, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+	p.mu.Lock()
+	p.conns[0].born = time.Now().Add(-time.Hour)
+	p.mu.Unlock()
+	second, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if closed != 1 || len(p.conns) != 1 {
+		t.Fatalf("retired idle state retained: closes=%d entries=%d", closed, len(p.conns))
+	}
+}
+
+func TestCarrierPoolStaleLeaseRetirementCannotCloseTwice(t *testing.T) {
+	closed := 0
+	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { return 1, nil }, Close: func(int) { closed++ }, PoolLimits: PoolLimits{MaxPipesPerConnectionLifetime: 1}}
+	lease, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+	lease.Retire()
+	lease.Retire()
+	p.Shutdown()
+	if closed != 1 {
+		t.Fatalf("connection closed %d times", closed)
 	}
 }

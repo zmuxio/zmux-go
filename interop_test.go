@@ -46,21 +46,44 @@ func startPeerEnv(t *testing.T, env string, args ...string) *peerProc {
 		t.Fatal(err)
 	}
 	p := &peerProc{cmd: cmd, lines: make(chan string, 16)}
+	done := make(chan error, 1)
 	go func() {
 		sc := bufio.NewScanner(out)
+		var outputErr error
 		for sc.Scan() {
-			p.lines <- sc.Text()
+			select {
+			case p.lines <- sc.Text():
+			default:
+				outputErr = errors.New("peer output queue exceeded its bound")
+				_ = cmd.Process.Kill()
+			}
+			if outputErr != nil {
+				break
+			}
+		}
+		if outputErr == nil {
+			outputErr = sc.Err()
 		}
 		close(p.lines)
+		waitErr := cmd.Wait()
+		if outputErr != nil {
+			done <- outputErr
+		} else {
+			done <- waitErr
+		}
 	}()
 	t.Cleanup(func() {
-		done := make(chan struct{})
-		go func() { _ = cmd.Wait(); close(done) }()
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil && env == "ZMUX_INTEROP_PEER" && !t.Failed() {
+				t.Errorf("peer failed: %v", err)
+			}
 		case <-time.After(5 * time.Second):
 			_ = cmd.Process.Kill()
-			<-done
+			err := <-done
+			if env == "ZMUX_INTEROP_PEER" && !t.Failed() {
+				t.Errorf("peer did not terminate before cleanup: %v", err)
+			}
 		}
 	})
 	return p
@@ -283,10 +306,17 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 		}
 	}
 	// The peer closes with a code and reason.
-	if r := command(t, ctx, c, "close:42:bye", nil); r != "closing" {
-		t.Fatalf("close: %q", r)
+	closeStream, err := c.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	err := c.Wait()
+	if err := closeStream.SetPreamble([]byte("close:42:bye")); err != nil {
+		t.Fatal(err)
+	}
+	if err := closeStream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = c.Wait()
 	var ae *ApplicationError
 	if !errors.As(err, &ae) || ae.ErrorCode != 42 || ae.ErrorMessage != "bye" || !ae.Remote {
 		t.Fatalf("close: %v", err)
@@ -317,6 +347,15 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	ready := c.PipeStats()
+	if len(ready) < 2 {
+		t.Fatalf("pipes not ready: %+v", ready)
+	}
+	for _, p := range ready {
+		if !p.Eligible {
+			t.Fatalf("pipe not eligible before spreading: %+v", ready)
+		}
+	}
 	c.SetScheduler(SpreadRoundRobin())
 	before := map[uint64]uint64{}
 	for _, p := range c.PipeStats() {
@@ -333,7 +372,7 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 	}
 	for _, p := range ps {
 		if p.BytesSent-before[p.ID] < 1<<20 {
-			t.Fatalf("pipe %d carried %d bytes", p.ID, p.BytesSent-before[p.ID])
+			t.Fatalf("pipe %d carried %d bytes; stats: %+v", p.ID, p.BytesSent-before[p.ID], ps)
 		}
 	}
 	c.SetScheduler(nil)

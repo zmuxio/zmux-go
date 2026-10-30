@@ -503,7 +503,7 @@ type binding struct {
 func (s *Session) expectedBytes(st *Stream) uint64 {
 	e := st.unsent()
 	if st.snd.wwait {
-		lim := s.cfg.SendBuffer
+		lim := s.sessionSendBuffer()
 		if st.snd.bufLimit > 0 {
 			lim = st.snd.bufLimit
 		}

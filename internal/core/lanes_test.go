@@ -37,3 +37,49 @@ func TestDataLaneTurns(t *testing.T) {
 		t.Fatal("turns did not advance")
 	}
 }
+
+// A record batch must retain the direction's lane until its final position is accounted.
+func TestBatchKeepsDirectionOnItsPhysicalLane(t *testing.T) {
+	s := New(DefaultConfig(), 0)
+	info := CarrierInfo{Lanes: true}
+	p := s.AttachBootstrap(info, info, nil)
+	s.peerSeen = true
+	s.state = StateActive
+	s.peer.MaxLanes = 3
+	s.peer.MaxStreamDataBidiRem = 1 << 20
+	s.loc[0].limit = 10
+	s.conn.sendMax = 1 << 20
+	s.feat = Features{PipeAck: true, LanesOut: true, LanesIn: true}
+	p.out.lo.offered = true
+	for i := uint64(1); i <= 2; i++ {
+		p.out.lanes = append(p.out.lanes, &outLane{lane: i, info: info, confirmed: true})
+	}
+	st, err := s.OpenStream(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.urgency = 3
+	if _, err := s.Write(st, make([]byte, 48<<10), false); err != nil {
+		t.Fatal(err)
+	}
+	var b Batch
+	var w recWriter
+	w.init(&b, info.Framing, 65536, 65536)
+	defer b.Discard()
+	s.writeData(&w, p, p.out.lanes[1])
+	w.end()
+	if len(w.touched) == 0 {
+		t.Fatal("batch did not send stream data")
+	}
+	if st.snd.lane != 1 {
+		t.Fatalf("batch rebound its direction to lane %d, want 1", st.snd.lane)
+	}
+	s.afterBatch(&w, p, p.out.lanes[1])
+	if st.snd.laneEnd <= p.out.lanes[1].acked {
+		t.Fatal("batch already covered by old acknowledgement")
+	}
+	if got, _, _ := s.laneFor(p, st); got != p.out.lanes[1] {
+		t.Fatal("direction moved before its batch was acknowledged")
+	}
+	s.Release(st)
+}

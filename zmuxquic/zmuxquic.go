@@ -2,7 +2,8 @@
 // one bidirectional stream, its further lanes are unidirectional streams
 // of the same connection (MULTIPATH.md 2.5), the TLS exporter of the
 // connection authenticates joins, and a client may send its first streams
-// in 0-RTT (SPEC.md 6.1.2).
+// as replayable early data (SPEC.md 6.1.2). Native stream creation currently
+// waits for the QUIC handshake because of the pinned quic-go0-RTT race.
 package zmuxquic
 
 import (
@@ -46,22 +47,17 @@ func QUICConfig(base *quic.Config) *quic.Config {
 
 // Dial opens a QUIC connection to addr and starts a zmux client session on
 // its first bidirectional stream, as zmux.DialTLS does over TCP. With
-// cfg.EarlyData.Replayable and Remembered parameters, the first streams go
-// in 0-RTT. The session owns the connection: it is closed when the session
+// cfg.EarlyData.Replayable and Remembered parameters, replayable startup is
+// enabled; native streams wait for handshake completion until the quic-go
+// early-stream race is fixed. The session owns the connection: it is closed when the session
 // ends. qconf may be nil; QUICConfig sizes it for lanes.
 func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Config, cfg *zmux.Config) (*zmux.Conn, error) {
 	early := cfg != nil && cfg.EarlyData.Replayable && len(cfg.EarlyData.Remembered) > 0
-	var qc *quic.Conn
-	var err error
-	if early {
-		qc, err = quic.DialAddrEarly(ctx, addr, tlsConf, QUICConfig(qconf))
-	} else {
-		qc, err = quic.DialAddr(ctx, addr, tlsConf, QUICConfig(qconf))
-	}
+	qc, err := dialAddr(ctx, addr, tlsConf, QUICConfig(qconf), early)
 	if err != nil {
 		return nil, err
 	}
-	s, err := qc.OpenStreamSync(ctx)
+	qc, s, err := openStream(ctx, qc)
 	if err != nil {
 		_ = qc.CloseWithError(0, "")
 		return nil, err
@@ -106,7 +102,7 @@ func Client(ctx context.Context, qc *quic.Conn, cfg *zmux.Config) (*zmux.Conn, e
 // or join), with lanes wired: the lanes the peer opens on qc are accepted
 // while qc is open (one goroutine per connection).
 func OpenPipe(ctx context.Context, qc *quic.Conn) (zmux.PipeIO, error) {
-	s, err := qc.OpenStreamSync(ctx)
+	qc, s, err := openStream(ctx, qc)
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
@@ -242,6 +238,9 @@ func (q *qStream) ConnectionState() tls.ConnectionState {
 // waits for stream credit (MULTIPATH.md 5.8).
 func (q *qStream) OpenLane(ctx context.Context) (io.WriteCloser, error) {
 	qc, _ := q.cur()
+	if err := handshakeReady(ctx, qc); err != nil {
+		return nil, err
+	}
 	s, err := qc.OpenUniStreamSync(ctx)
 	if err != nil {
 		return nil, err
@@ -249,8 +248,9 @@ func (q *qStream) OpenLane(ctx context.Context) (io.WriteCloser, error) {
 	return &laneWriter{s: s}, nil
 }
 
-// EarlyAccepted waits for the handshake and reports whether the server
-// accepted 0-RTT.
+// EarlyAccepted waits for the handshake's carrier verdict. The temporary
+// handshake barrier creates every outgoing stream after that decision, so
+// this stream's bytes are delivered as 1-RTT even if native 0-RTT was rejected.
 func (q *qStream) EarlyAccepted(ctx context.Context) (bool, error) {
 	qc, _ := q.cur()
 	select {
@@ -260,7 +260,7 @@ func (q *qStream) EarlyAccepted(ctx context.Context) (bool, error) {
 	case <-qc.Context().Done():
 		return false, context.Cause(qc.Context())
 	}
-	return qc.ConnectionState().Used0RTT, nil
+	return true, nil
 }
 
 // RestartEarly opens the bootstrap stream again on the connection that
@@ -385,7 +385,7 @@ func NewPool(addr string, tlsConf *tls.Config, qconf *quic.Config, lim zmux.Pool
 	p := &Pool{}
 	p.pool = zmux.CarrierPool[*quic.Conn]{PoolLimits: lim, Close: closePooled,
 		Dial: func(ctx context.Context) (*quic.Conn, error) {
-			qc, err := quic.DialAddr(ctx, addr, tlsConf, QUICConfig(qconf))
+			qc, err := dialAddr(ctx, addr, tlsConf, QUICConfig(qconf), false)
 			if err != nil {
 				return nil, err
 			}
@@ -408,7 +408,7 @@ func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
-	s, err := l.Conn.OpenStreamSync(ctx)
+	_, s, err := openStream(ctx, l.Conn)
 	if err != nil {
 		l.Release()
 		return zmux.PipeIO{}, err

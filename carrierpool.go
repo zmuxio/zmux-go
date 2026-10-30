@@ -7,6 +7,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 // PoolLimits bound how a carrier pool uses each underlying connection. The
@@ -81,8 +83,22 @@ var errPoolClosed = errors.New("zmux: carrier pool closed")
 // Get returns a lease on a connection with room, dialling one when none
 // has; the dial runs outside the pool's lock.
 func (p *CarrierPool[C]) Get(ctx context.Context) (*Lease[C], error) {
-	if l := p.take(); l != nil {
-		return l, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	l, err := p.take()
+	if l != nil || err != nil {
+		return l, err
+	}
+	// An expired-connection Close callback may have stopped this pool or context.
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		return nil, errPoolClosed
 	}
 	c, err := p.Dial(ctx)
 	if err != nil {
@@ -90,14 +106,18 @@ func (p *CarrierPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	}
 	var b [8]byte
 	_, _ = rand.Read(b[:])
-	pc := &pooledConn[C]{c: c, fate: binary.BigEndian.Uint64(b[:]) | 1, born: time.Now(), active: 1, total: 1}
+	pc := &pooledConn[C]{c: c, fate: binary.BigEndian.Uint64(b[:])&wire.MaxVarint | 1, born: time.Now(), active: 1, total: 1}
+	cancelled := ctx.Err()
 	p.mu.Lock()
-	if p.closed {
+	if p.closed || cancelled != nil {
+		if p.closed {
+			cancelled = errPoolClosed
+		}
 		p.mu.Unlock()
 		if p.Close != nil {
 			p.Close(c)
 		}
-		return nil, errPoolClosed
+		return nil, cancelled
 	}
 	p.conns = append(p.conns, pc)
 	p.retireLocked(pc)
@@ -113,12 +133,22 @@ func (p *CarrierPool[C]) maxActive() int {
 }
 
 // take leases the open connection with the most room, if any.
-func (p *CarrierPool[C]) take() *Lease[C] {
+func (p *CarrierPool[C]) take() (*Lease[C], error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errPoolClosed
+	}
 	var best *pooledConn[C]
+	var idle []C
+	live := p.conns[:0]
 	for _, pc := range p.conns {
 		p.retireLocked(pc)
+		if pc.retired && pc.active == 0 {
+			idle = append(idle, pc.c)
+			continue
+		}
+		live = append(live, pc)
 		if pc.retired || pc.active >= p.maxActive() {
 			continue
 		}
@@ -126,13 +156,22 @@ func (p *CarrierPool[C]) take() *Lease[C] {
 			best = pc
 		}
 	}
-	if best == nil {
-		return nil
+	clear(p.conns[len(live):])
+	p.conns = live
+	var lease *Lease[C]
+	if best != nil {
+		best.active++
+		best.total++
+		p.retireLocked(best)
+		lease = &Lease[C]{Conn: best.c, FateGroup: best.fate, p: p, pc: best}
 	}
-	best.active++
-	best.total++
-	p.retireLocked(best)
-	return &Lease[C]{Conn: best.c, FateGroup: best.fate, p: p, pc: best}
+	p.mu.Unlock()
+	if p.Close != nil {
+		for _, c := range idle {
+			p.Close(c)
+		}
+	}
+	return lease, nil
 }
 
 func (p *CarrierPool[C]) room(pc *pooledConn[C]) int {
@@ -159,7 +198,7 @@ func (p *CarrierPool[C]) release(pc *pooledConn[C]) {
 	p.retireLocked(pc)
 	done := (pc.retired || p.closed) && pc.active == 0
 	if done {
-		p.drop(pc)
+		done = p.drop(pc)
 	}
 	p.mu.Unlock()
 	if done && p.Close != nil {
@@ -188,7 +227,7 @@ func (p *CarrierPool[C]) retire(pc *pooledConn[C]) {
 	pc.retired = true
 	done := pc.active == 0
 	if done {
-		p.drop(pc)
+		done = p.drop(pc)
 	}
 	p.mu.Unlock()
 	if done && p.Close != nil {
@@ -196,13 +235,16 @@ func (p *CarrierPool[C]) retire(pc *pooledConn[C]) {
 	}
 }
 
-func (p *CarrierPool[C]) drop(pc *pooledConn[C]) {
+func (p *CarrierPool[C]) drop(pc *pooledConn[C]) bool {
 	for i, x := range p.conns {
 		if x == pc {
-			p.conns = append(p.conns[:i], p.conns[i+1:]...)
-			return
+			copy(p.conns[i:], p.conns[i+1:])
+			p.conns[len(p.conns)-1] = nil
+			p.conns = p.conns[:len(p.conns)-1]
+			return true
 		}
 	}
+	return false
 }
 
 // Shutdown retires every connection: idle ones close now, the others when

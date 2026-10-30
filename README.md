@@ -193,6 +193,50 @@ func wsPipe(c wsConn) zmux.PipeIO {
 A WebSocket library that offers a byte-stream `net.Conn` view works with
 `zmux.Client` and `zmux.NetPipe` directly.
 
+## HTTP exchanges
+
+Where a long-lived HTTP request does not survive the path (CDNs and
+reverse proxies that buffer whole bodies, HTTP/1.0 hops, request duration
+limits, caches), an exchange carrier builds one zmux carrier out of a
+sequence of short POST requests. The server mounts a handler in front of
+its `Listener`:
+
+```go
+h := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk})
+defer h.Close()
+http.Handle("/x/", h)
+```
+
+and the client opens the carrier with the same PSK:
+
+```go
+p, err := zmux.HTTPExchangePipe(ctx, client, "https://example.com/x/{instance}/{nonce}",
+	&zmux.HTTPExchangeConfig{PSK: psk})
+if err != nil {
+	return err
+}
+conn, err := zmux.Start(ctx, p, zmux.RoleClient, cfg) // or conn.AddPipe(ctx, p, opts)
+```
+
+`{instance}` is the same in every request of a carrier (for load-balancer
+stickiness) and `{nonce}` differs in every request (cache busting; without
+it a query parameter is added). `DownURL` sends DOWN requests to another
+template (scheme, host, port and path may all differ, through other
+intermediaries); UP and CLOSE requests use the first. A carrier's state
+lives in one server process: with several backends, route every request of
+a carrier to the same one, for example by hashing `{instance}`. Both ends
+should use the same piece sizes: a body over the receiver's limit fails the
+carrier instead of being retried. Requests are numbered, idempotent and
+authenticated, so lost, repeated, reordered and cached exchanges are
+recovered; `HTTPExchangeConfig` documents the timers, sizes and limits and
+their defaults. Keep the server's `HoldTime` below every intermediary's
+response timeout, and the client transport's `MaxIdleConnsPerHost` at least
+`DownRequests+UpRequests`.
+
+The exchange MACs authenticate both ends (with a PSK) and bind each
+response to its request, but they do not encrypt. When TLS is terminated by
+a proxy or CDN, that intermediary can read the carrier.
+
 ## QUIC
 
 ```go
@@ -223,3 +267,36 @@ order.
 ## License
 
 Apache-2.0
+
+### QUIC dial socket families
+
+The `zmuxquic.Dial` and `NewPool` default dialer bind UDP using the resolved
+destination's address family (`udp4` or `udp6`). This avoids a macOS dual-stack
+wildcard ephemeral-port collision with a local IPv4 listener. Hostname-based
+TLS verification and session-cache settings are preserved without modifying
+the caller's TLS configuration. The adapter owns these sockets and releases
+them after native connection shutdown, including 0-RTT rejection/continuation.
+Existing QUIC connections passed to `Client` remain caller-owned.
+
+Native QUIC 0-RTT stream creation is temporarily gated on handshake completion:
+quic-go0.64.1 can race a stream's initial flow-control setup against peer
+transport-parameter updates. This applies to default dialers and borrowed
+connections passed to `OpenPipe`/`Client`; incoming early-data handling remains.
+The workaround sacrifices native 0-RTT payload latency while preserving zmux
+replayable/resumed startup, TLS validation, cancellation and socket ownership.
+Remove the barrier after a dependency fix passes the preserved native
+rejection reproducer under the race detector. No dependency fork is embedded.
+
+To check whether an upstream update removes that limitation, explicitly run
+`go test -race -tags=quicgo_upstream_repro ./zmuxquic -run TestQuicGoUpstreamEarlyStreamRejection -count=20`.
+This dependency reproducer deliberately bypasses the adapter's handshake
+barrier and currently detects the upstream race; it is not a supported
+production path. The default rejection test exercises the guarded adapter.
+
+The guarded outgoing stream's carrier verdict is accepted once its handshake
+completes: its bytes were sent as 1-RTT and were not invalidated by a native
+0-RTT rejection. This avoids replaying the newly created bootstrap twice.
+When removing the temporary barrier, validate the verdict for this pipe's
+initial bytes alongside stream opening. A connection-global `Used0RTT=false`
+does not mean a pipe created as 1-RTT was rejected. Test accepted/rejected
+resumption and remembered zmux parameters without a reusable TLS ticket.
