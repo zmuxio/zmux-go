@@ -65,7 +65,7 @@ func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Con
 	}
 	clientLanes(cur)
 	sp := &qStream{qc: cur, s: s}
-	c, err := zmux.Start(ctx, zmux.PipeIO{R: (*qReader)(sp), W: sp}, zmux.RoleClient, cfg)
+	c, err := zmux.Start(ctx, sp.pipe(), zmux.RoleClient, cfg)
 	if err != nil {
 		closeDialled(qc, sp)
 		return nil, err
@@ -180,9 +180,11 @@ func hostOf(a net.Addr) string {
 
 // streamPipe adapts a bidirectional QUIC stream to a pipe input.
 func streamPipe(qc *quic.Conn, s *quic.Stream) zmux.PipeIO {
-	sp := &qStream{qc: qc, s: s}
-	return zmux.PipeIO{R: (*qReader)(sp), W: sp}
+	return (&qStream{qc: qc, s: s}).pipe()
 }
+
+// pipe is the pipe input over q.
+func (q *qStream) pipe() zmux.PipeIO { return zmux.PipeIO{R: (*qReader)(q), W: q} }
 
 // openPipe opens the first bidirectional stream of *qc (see openStream) as a
 // pipe input; the returned context ends with the stream.
@@ -191,7 +193,8 @@ func openPipe(ctx context.Context, qc **quic.Conn) (zmux.PipeIO, context.Context
 	if err != nil {
 		return zmux.PipeIO{}, nil, err
 	}
-	return streamPipe(*qc, s), s.Context(), nil
+	sp := &qStream{qc: *qc, s: s}
+	return sp.pipe(), s.Context(), nil
 }
 
 // qStream is the sending half, with the carrier capabilities.
