@@ -78,7 +78,7 @@ func (h *handle) sendCapacity() uint64 {
 	return c.s.SendCapacity(h.st)
 }
 
-func (h *handle) waitSendCapacity(ctx context.Context, min uint64) (uint64, error) {
+func (h *handle) waitSendCapacity(ctx context.Context, n uint64) (uint64, error) {
 	c := h.c
 	sig := core.NewSignal()
 	defer func() {
@@ -88,7 +88,7 @@ func (h *handle) waitSendCapacity(ctx context.Context, min uint64) (uint64, erro
 	}()
 	for {
 		c.lock()
-		ready := c.s.WaitSendCapacity(h.st, min, sig)
+		ready := c.s.WaitSendCapacity(h.st, n, sig)
 		cp := c.s.SendCapacity(h.st)
 		err := c.s.WriteErrOf(h.st)
 		c.unlock()
@@ -108,16 +108,16 @@ func (h *handle) waitSendCapacity(ctx context.Context, min uint64) (uint64, erro
 	}
 }
 
-func (h *handle) readChunk(ctx context.Context, max int) (Chunk, error) {
+func (h *handle) readChunk(ctx context.Context, limit int) (Chunk, error) {
 	h.rmu.Lock()
 	defer h.rmu.Unlock()
 	c := h.c
-	if max <= 0 {
-		max = 1 << 20
+	if limit <= 0 {
+		limit = 1 << 20
 	}
 	for {
 		c.lock()
-		data, buf, fin, err := c.s.ReadChunk(h.st, max)
+		data, buf, fin, err := c.s.ReadChunk(h.st, limit)
 		if len(data) == 0 && !fin && err == nil {
 			h.rsig.Drain()
 			c.s.WaitRead(h.st, &h.rsig)
@@ -336,11 +336,11 @@ func (s *Stream) PipeCarrier() bool { defer runtime.KeepAlive(s); _, _, p := s.h
 // SendCapacity returns the bytes the sending part could transmit now.
 func (s *Stream) SendCapacity() uint64 { defer runtime.KeepAlive(s); return s.h.sendCapacity() }
 
-// WaitSendCapacity waits until SendCapacity is at least min (or above 0
+// WaitSendCapacity waits until SendCapacity is at least n (or above 0
 // while nothing is unsent) and returns it.
-func (s *Stream) WaitSendCapacity(ctx context.Context, min uint64) (uint64, error) {
+func (s *Stream) WaitSendCapacity(ctx context.Context, n uint64) (uint64, error) {
 	defer runtime.KeepAlive(s)
-	return s.h.waitSendCapacity(ctx, min)
+	return s.h.waitSendCapacity(ctx, n)
 }
 
 // Replayable reports whether the stream's opening frame arrived as carrier
@@ -356,9 +356,9 @@ func (s *Stream) Replayable() bool {
 
 // SetReceiveWindow sets the stream's initial and maximum receive window
 // (0 leaves a value; at least 16 KiB).
-func (s *Stream) SetReceiveWindow(initial, max uint64) {
+func (s *Stream) SetReceiveWindow(initial, limit uint64) {
 	defer runtime.KeepAlive(s)
-	_ = s.h.do(func(c *core.Session) error { c.SetReceiveWindow(s.h.st, initial, max); return nil })
+	_ = s.h.do(func(c *core.Session) error { c.SetReceiveWindow(s.h.st, initial, limit); return nil })
 }
 
 // SetSendBuffer bounds the stream's written-but-unreleased bytes.
@@ -406,12 +406,12 @@ func (s *Stream) TryWriteAll(p []byte) (bool, error) {
 	return s.h.tryWriteAll(p)
 }
 
-// ReadChunk returns up to max bytes without copying; release the chunk, or
+// ReadChunk returns up to n bytes without copying; release the chunk, or
 // hand it to WriteChunk, exactly once. A Chunk is a value: do not keep
 // copies of it past that.
-func (s *Stream) ReadChunk(ctx context.Context, max int) (Chunk, error) {
+func (s *Stream) ReadChunk(ctx context.Context, n int) (Chunk, error) {
 	defer runtime.KeepAlive(s)
-	return s.h.readChunk(ctx, max)
+	return s.h.readChunk(ctx, n)
 }
 
 // WriteChunk writes a chunk without copying and takes ownership of it.
@@ -478,9 +478,9 @@ func (s *SendStream) AddPreambleTLV(t uint64, v []byte) error {
 func (s *SendStream) SendCapacity() uint64 { defer runtime.KeepAlive(s); return s.h.sendCapacity() }
 
 // WaitSendCapacity waits for send capacity (see Stream.WaitSendCapacity).
-func (s *SendStream) WaitSendCapacity(ctx context.Context, min uint64) (uint64, error) {
+func (s *SendStream) WaitSendCapacity(ctx context.Context, n uint64) (uint64, error) {
 	defer runtime.KeepAlive(s)
-	return s.h.waitSendCapacity(ctx, min)
+	return s.h.waitSendCapacity(ctx, n)
 }
 
 // SetSendBuffer bounds the stream's written-but-unreleased bytes.
@@ -556,9 +556,9 @@ func (s *ReceiveStream) PreambleTLVs() []TLV {
 }
 
 // SetReceiveWindow sets the stream's initial and maximum receive window.
-func (s *ReceiveStream) SetReceiveWindow(initial, max uint64) {
+func (s *ReceiveStream) SetReceiveWindow(initial, limit uint64) {
 	defer runtime.KeepAlive(s)
-	_ = s.h.do(func(c *core.Session) error { c.SetReceiveWindow(s.h.st, initial, max); return nil })
+	_ = s.h.do(func(c *core.Session) error { c.SetReceiveWindow(s.h.st, initial, limit); return nil })
 }
 
 // Reject declines the stream before reading it.
@@ -573,10 +573,10 @@ func (s *ReceiveStream) Replayable() bool {
 	return s.h.st.Replayable()
 }
 
-// ReadChunk returns up to max bytes without copying.
-func (s *ReceiveStream) ReadChunk(ctx context.Context, max int) (Chunk, error) {
+// ReadChunk returns up to n bytes without copying.
+func (s *ReceiveStream) ReadChunk(ctx context.Context, n int) (Chunk, error) {
 	defer runtime.KeepAlive(s)
-	return s.h.readChunk(ctx, max)
+	return s.h.readChunk(ctx, n)
 }
 
 // WriteTo implements io.WriterTo.

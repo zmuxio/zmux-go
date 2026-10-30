@@ -48,11 +48,11 @@ type faultProxy struct {
 	replayDown bool
 
 	mu       sync.Mutex
+	replayed bool
 	rng      *mrand.Rand
 	cache    [][]byte // complete 200 responses, newest last
 	downResp []byte   // replayDown: the response to replay
 	downSeq  uint64
-	replayed bool
 	counts   [faultCount]int
 	conns    map[net.Conn]struct{}
 	done     chan struct{}

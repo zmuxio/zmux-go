@@ -3,9 +3,10 @@ package zmux
 import (
 	"context"
 	"errors"
-	"github.com/zmuxio/zmux-go/internal/wire"
 	"testing"
 	"time"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 func TestCarrierPool(t *testing.T) {

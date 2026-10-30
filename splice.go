@@ -14,11 +14,11 @@ import (
 // forwards itself (Splice, datagrams). zmux calls it outside
 // every session lock.
 type Limiter interface {
-	// Ready waits until at least min bytes (or the limiter's burst, if
-	// less) are allowed and returns the allowance, at most max.
-	Ready(ctx context.Context, min, max int) (int, error)
+	// Ready waits until at least minBytes bytes (or the limiter's burst, if
+	// less) are allowed and returns the allowance, at most maxBytes.
+	Ready(ctx context.Context, minBytes, maxBytes int) (int, error)
 	// TryReady returns the allowance now, 0 when it would have to wait.
-	TryReady(max int) int
+	TryReady(maxBytes int) int
 	// Charge accounts n bytes actually forwarded.
 	Charge(n int)
 }

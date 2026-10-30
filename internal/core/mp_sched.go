@@ -976,10 +976,10 @@ func (s *Session) SetPolicy(p Policy) {
 	s.wakeAllWriters()
 }
 
-// SetStreamPolicy sets a stream direction's own policy; clear returns it
-// to the session's.
-func (s *Session) SetStreamPolicy(st *Stream, p Policy, clear bool) {
-	if clear {
+// SetStreamPolicy sets a stream direction's own policy; inherit returns
+// it to the session's.
+func (s *Session) SetStreamPolicy(st *Stream, p Policy, inherit bool) {
+	if inherit {
 		st.pol = 0
 	} else {
 		st.pol = uint8(p) + 1

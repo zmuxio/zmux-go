@@ -197,9 +197,9 @@ func (s *Session) planChunk(st *Stream) chunkPlan {
 	return p
 }
 
-// PollTransmit fills b with records for the outbound lane, at most max
+// PollTransmit fills b with records for the outbound lane, at most limit
 // bytes. It returns false when nothing is due.
-func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, max int, now Time) bool {
+func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time) bool {
 	s.SetNow(now)
 	b.reset()
 	b.Pipe, b.Lane = pipe, lane
@@ -213,7 +213,7 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, max int, now Time) b
 	}
 	b.Contiguous = ol.info.TLS
 	var w recWriter
-	w.init(b, ol.info.Framing, s.recMax(ol), max)
+	w.init(b, ol.info.Framing, s.recMax(ol), limit)
 	if s.ack != nil && s.peerSeen {
 		w.dataRoom = s.paceRoom(p)
 		if w.dataRoom > 0 && !s.dataTurn(p, ol) {

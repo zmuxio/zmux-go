@@ -81,14 +81,18 @@ func (l *Lease[C]) Retire() { l.p.retire(l.pc) }
 var errPoolClosed = errors.New("zmux: carrier pool closed")
 
 // Get returns a lease on a connection with room, dialling one when none
-// has; the dial runs outside the pool's lock.
+// has; the dial runs outside the pool's lock. The lease is non-nil exactly
+// when the error is nil.
 func (p *CarrierPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	l, err := p.take()
-	if l != nil || err != nil {
-		return l, err
+	if err != nil {
+		return nil, err
+	}
+	if l != nil {
+		return l, nil
 	}
 	// An expired-connection Close callback may have stopped this pool or context.
 	if err = ctx.Err(); err != nil {

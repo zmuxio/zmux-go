@@ -57,13 +57,13 @@ func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Con
 	if err != nil {
 		return nil, err
 	}
-	qc, s, err := openStream(ctx, qc)
+	cur, s, err := openStream(ctx, qc)
 	if err != nil {
 		_ = qc.CloseWithError(0, "")
 		return nil, err
 	}
-	clientLanes(qc)
-	sp := &qStream{qc: qc, s: s}
+	clientLanes(cur)
+	sp := &qStream{qc: cur, s: s}
 	c, err := zmux.Start(ctx, zmux.PipeIO{R: (*qReader)(sp), W: sp}, zmux.RoleClient, cfg)
 	if err != nil {
 		closeDialled(qc, sp)
@@ -102,12 +102,12 @@ func Client(ctx context.Context, qc *quic.Conn, cfg *zmux.Config) (*zmux.Conn, e
 // or join), with lanes wired: the lanes the peer opens on qc are accepted
 // while qc is open (one goroutine per connection).
 func OpenPipe(ctx context.Context, qc *quic.Conn) (zmux.PipeIO, error) {
-	qc, s, err := openStream(ctx, qc)
+	cur, s, err := openStream(ctx, qc)
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
-	clientLanes(qc)
-	return streamPipe(qc, s), nil
+	clientLanes(cur)
+	return streamPipe(cur, s), nil
 }
 
 // Serve accepts connections from ln and hands their streams to l, as
@@ -408,13 +408,13 @@ func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
-	_, s, err := openStream(ctx, l.Conn)
+	qc, s, err := openStream(ctx, l.Conn)
 	if err != nil {
 		l.Release()
 		return zmux.PipeIO{}, err
 	}
 	context.AfterFunc(s.Context(), l.Release)
-	pio := streamPipe(l.Conn, s)
+	pio := streamPipe(qc, s)
 	pio.FateGroup = l.FateGroup
 	return pio, nil
 }

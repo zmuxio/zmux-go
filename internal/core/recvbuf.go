@@ -219,11 +219,11 @@ func (rb *recvBuf) clear() uint64 {
 // Refs returns the current reference count.
 func (b *Buf) Refs() int32 { return b.refs.Load() }
 
-// take consumes up to max contiguous bytes at off without copying: the
+// take consumes up to limit contiguous bytes at off without copying: the
 // slice of the first piece and, when it references a read buffer, a new
 // reference of that buffer for the caller.
-func (rb *recvBuf) take(off uint64, max int) ([]byte, *Buf) {
-	if len(rb.ps) == 0 || max <= 0 {
+func (rb *recvBuf) take(off uint64, limit int) ([]byte, *Buf) {
+	if len(rb.ps) == 0 || limit <= 0 {
 		return nil, nil
 	}
 	p := &rb.ps[0]
@@ -232,8 +232,8 @@ func (rb *recvBuf) take(off uint64, max int) ([]byte, *Buf) {
 	}
 	skip := off - p.off
 	d := p.b[skip:]
-	if len(d) > max {
-		d = d[:max]
+	if len(d) > limit {
+		d = d[:limit]
 	}
 	buf := p.buf
 	if buf != nil {

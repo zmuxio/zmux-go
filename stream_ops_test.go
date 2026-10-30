@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func TestChunkRelayWithoutCopy(t *testing.T) {
 		for {
 			ch, err := in.ReadChunk(ctx, 1<<20)
 			if err != nil {
-				if err != io.EOF {
+				if !errors.Is(err, io.EOF) {
 					t.Errorf("relay read: %v", err)
 				}
 				_ = out.Close()

@@ -181,11 +181,11 @@ func (s *Session) sendBufferLimit() uint64 {
 	} else if b := s.cfg.MemoryBudget; b > 0 {
 		left = b - min64(b, used)
 	}
-	cap := ^uint64(0)
-	if left < cap-s.conn.sendHeld {
-		cap = s.conn.sendHeld + left
+	limit := ^uint64(0)
+	if left < limit-s.conn.sendHeld {
+		limit = s.conn.sendHeld + left
 	}
-	return max64(max64(64<<20, cap), s.cfg.SendBuffer)
+	return max64(max64(64<<20, limit), s.cfg.SendBuffer)
 }
 
 // sessionSendBuffer is the one buffer divided by writers and affinity load.
@@ -413,18 +413,18 @@ func (s *Session) sendTerminal(st *Stream, state sendState) {
 // ---- send capacity ----
 
 // WaitSendCapacity registers sig to be woken once the part's capacity is
-// at least min, or above 0 while it holds nothing unsent, or the part can
+// at least n, or above 0 while it holds nothing unsent, or the part can
 // no longer send. It reports whether the condition holds now (sig is then
 // not registered).
-func (s *Session) WaitSendCapacity(st *Stream, min uint64, sig *Signal) bool {
-	if s.capReady(st, min) {
+func (s *Session) WaitSendCapacity(st *Stream, n uint64, sig *Signal) bool {
+	if s.capReady(st, n) {
 		return true
 	}
 	x := st.x()
 	if x.capSig == nil {
 		s.capWaiters = append(s.capWaiters, st)
 	}
-	x.capSig, x.capMin = sig, max64(min, 1)
+	x.capSig, x.capMin = sig, max64(n, 1)
 	return false
 }
 
@@ -441,13 +441,13 @@ func (s *Session) CancelCapacityWait(st *Stream) {
 	}
 }
 
-func (s *Session) capReady(st *Stream, min uint64) bool {
+func (s *Session) capReady(st *Stream, n uint64) bool {
 	sp := &st.snd
 	if !st.hasS || st.cancelled || sp.errState != nil || sp.finWr || sp.reset || sp.stopped || s.err != nil || st.discarded {
 		return true
 	}
 	c := s.SendCapacity(st)
-	return c >= max64(min, 1) || c > 0 && st.unsent() == 0
+	return c >= max64(n, 1) || c > 0 && st.unsent() == 0
 }
 
 // checkCapacity wakes st's capacity waiter when its condition holds.

@@ -329,8 +329,8 @@ type exServer struct {
 type exAssign struct {
 	buf      *exBuf
 	data     []byte
-	fin      bool
 	refs     int
+	fin      bool
 	released bool
 }
 

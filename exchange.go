@@ -47,6 +47,11 @@ type HTTPExchangeConfig struct {
 	// for paths that do not pass binary bodies unchanged.
 	Base64 bool
 
+	// NoCacheBust leaves a URL without {nonce} unchanged (client).
+	NoCacheBust bool
+	// testSkipResponseMAC disables the client's response MAC check (tests
+	// only: shows that the check is what rejects replayed responses).
+	testSkipResponseMAC bool
 	// Header is added to every request (client).
 	Header http.Header
 	// DownURL is the target template of DOWN requests (client; empty: the
@@ -64,8 +69,6 @@ type HTTPExchangeConfig struct {
 	// request when the URL has no {nonce} placeholder ("n"), so that no
 	// cache keyed on the target matches (client).
 	NonceParam string
-	// NoCacheBust leaves a URL without {nonce} unchanged (client).
-	NoCacheBust bool
 	// DownRequests is the number of DOWN requests the client keeps
 	// outstanding (2); it is lowered while the server answers BUSY.
 	DownRequests int
@@ -107,21 +110,15 @@ type HTTPExchangeConfig struct {
 	// GoneMemory is how long the server remembers an ended carrier to
 	// answer its late requests with GONE (60 s).
 	GoneMemory time.Duration
-
-	// testSkipResponseMAC disables the client's response MAC check (tests
-	// only: shows that the check is what rejects replayed responses).
-	testSkipResponseMAC bool
 }
 
 // exParams is a resolved HTTPExchangeConfig.
 type exParams struct {
 	psk                    []byte
-	b64                    bool
 	header                 http.Header
 	instance               string
 	downURL                string
 	nonceParam             string
-	cacheBust              bool
 	downs, ups             int
 	upPiece, downPiece     int
 	reqTimeout             time.Duration
@@ -131,6 +128,8 @@ type exParams struct {
 	window                 int
 	upStore                int
 	idle, goneFor          time.Duration
+	b64                    bool
+	cacheBust              bool
 	skipRespMAC            bool
 }
 
@@ -268,6 +267,7 @@ type exReq struct {
 	cid    [exCIDLen]byte
 	kind   byte
 	flags  byte
+	valid  bool // Kind, Flags, Data and reason follow Section 3
 	seq    uint64
 	ack    uint64
 	seqRaw []byte
@@ -275,7 +275,6 @@ type exReq struct {
 	hdr    []byte // Carrier ID through Nonce
 	mac    []byte
 	data   []byte
-	valid  bool // Kind, Flags, Data and reason follow Section 3
 }
 
 // parseExReq parses a binary request body; ok reports a complete header,

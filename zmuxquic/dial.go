@@ -69,7 +69,7 @@ func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *qui
 	return qc, nil
 }
 
-// handshakeReady is a temporary quic-go0.64.1 boundary: opening native streams
+// handshakeReady is a temporary quic-go v0.64.1 boundary: opening native streams
 // during 0-RTT can race peer transport-parameter updates. Remove this barrier
 // only after the preserved upstream rejection reproducer passes under -race.
 func handshakeReady(ctx context.Context, qc *quic.Conn) error {
@@ -88,18 +88,28 @@ func handshakeReady(ctx context.Context, qc *quic.Conn) error {
 		return context.Cause(ctx)
 	}
 }
+
+// openStream opens the first bidirectional stream of qc after the handshake
+// barrier. After a 0-RTT rejection the stream lives on qc's next connection
+// handle, which is returned with it; on failure both results are nil and qc
+// stays with the caller, who owns its close (the next handle shares qc's
+// connection, so closing qc covers it).
 func openStream(ctx context.Context, qc *quic.Conn) (*quic.Conn, *quic.Stream, error) {
 	if err := handshakeReady(ctx, qc); err != nil {
-		return qc, nil, err
+		return nil, nil, err
 	}
-	stream, err := qc.OpenStreamSync(ctx)
+	conn := qc
+	stream, err := conn.OpenStreamSync(ctx)
 	if errors.Is(err, quic.Err0RTTRejected) {
 		next, nextErr := qc.NextConnection(ctx)
 		if nextErr != nil {
-			return qc, nil, nextErr
+			return nil, nil, nextErr
 		}
-		qc = next
-		stream, err = qc.OpenStreamSync(ctx)
+		conn = next
+		stream, err = conn.OpenStreamSync(ctx)
 	}
-	return qc, stream, err
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, stream, nil
 }

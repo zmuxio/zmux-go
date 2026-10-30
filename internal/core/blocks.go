@@ -131,17 +131,17 @@ func (q *sendQ) prepend(p []byte) {
 	q.end += uint64(len(p))
 }
 
-// peek returns up to max bytes at offset off (base <= off < end) as one
+// peek returns up to limit bytes at offset off (base <= off < end) as one
 // contiguous slice and its block (to pin).
-func (q *sendQ) peek(off uint64, max int) ([]byte, pin) {
+func (q *sendQ) peek(off uint64, limit int) ([]byte, pin) {
 	pos := q.base
 	for i := range q.segs {
 		sg := &q.segs[i]
 		l := uint64(len(sg.b))
 		if off < pos+l {
 			b := sg.b[off-pos:]
-			if len(b) > max {
-				b = b[:max]
+			if len(b) > limit {
+				b = b[:limit]
 			}
 			return b, pin{sg.blk, sg.rb}
 		}

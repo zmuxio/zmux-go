@@ -616,12 +616,12 @@ func (f *streamFIFO) pop() *Stream {
 func (f *streamFIFO) len() int { return len(f.q) - f.head }
 
 // SetReceiveWindow sets a receiving part's window: initial raises the
-// advertised limit at once, max caps auto-tuning and the unread bytes. Values
+// advertised limit at once, limit caps auto-tuning and the unread bytes. Values
 // below 16 KiB are raised to 16 KiB; 0 leaves a value as it is.
-func (s *Session) SetReceiveWindow(st *Stream, initial, max uint64) {
+func (s *Session) SetReceiveWindow(st *Stream, initial, limit uint64) {
 	r := &st.rcv
-	if max > 0 {
-		r.maxWin = max64(max, 16<<10)
+	if limit > 0 {
+		r.maxWin = max64(limit, 16<<10)
 	}
 	if initial > 0 {
 		w := max64(initial, 16<<10)
@@ -639,7 +639,7 @@ func (s *Session) SetReceiveWindow(st *Stream, initial, max uint64) {
 // ReadChunk consumes up to max contiguous bytes without copying. buf, when not
 // nil, holds a reference the caller releases (Unref) once it no longer needs
 // data.
-func (s *Session) ReadChunk(st *Stream, max int) (data []byte, buf *Buf, fin bool, err error) {
+func (s *Session) ReadChunk(st *Stream, limit int) (data []byte, buf *Buf, fin bool, err error) {
 	if !st.hasR {
 		return nil, nil, false, ErrInvalid
 	}
@@ -650,10 +650,10 @@ func (s *Session) ReadChunk(st *Stream, max int) (data []byte, buf *Buf, fin boo
 	if r.state == recvDataRead {
 		return nil, nil, true, nil
 	}
-	if r.reset && r.readOff+uint64(max) > r.resetRel {
-		max = int(r.resetRel - min64(r.resetRel, r.readOff))
+	if r.reset && r.readOff+uint64(limit) > r.resetRel {
+		limit = int(r.resetRel - min64(r.resetRel, r.readOff))
 	}
-	data, buf = r.buf.take(r.readOff, max)
+	data, buf = r.buf.take(r.readOff, limit)
 	if n := uint64(len(data)); n > 0 {
 		r.readOff += n
 		s.stats.AppBytesRead += n

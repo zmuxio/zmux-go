@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -458,7 +459,7 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, _ = p.W.Write(make([]byte, 64<<10))
-		if err := read(p); err != errExchangeGone {
+		if err := read(p); !errors.Is(err, errExchangeGone) {
 			t.Fatalf("oversized UP: %v, want GONE", err)
 		}
 	})
@@ -475,7 +476,7 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := read(p); err != errExchangeProtocol {
+		if err := read(p); !errors.Is(err, errExchangeProtocol) {
 			t.Fatalf("oversized DOWN: %v, want a protocol failure", err)
 		}
 	})
