@@ -9,6 +9,7 @@
 [![zmuxquic](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fproxy.golang.org%2Fgithub.com%2Fzmuxio%2Fzmux-go%2Fzmuxquic%2F%40latest&query=%24.Version&label=zmuxquic&color=blue)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxquic)
 [![zmuxh3](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fproxy.golang.org%2Fgithub.com%2Fzmuxio%2Fzmux-go%2Fzmuxh3%2F%40latest&query=%24.Version&label=zmuxh3&color=blue)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxh3)
 [![zmuxws](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fproxy.golang.org%2Fgithub.com%2Fzmuxio%2Fzmux-go%2Fzmuxws%2F%40latest&query=%24.Version&label=zmuxws&color=blue)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxws)
+[![seal](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fproxy.golang.org%2Fgithub.com%2Fzmuxio%2Fzmux-go%2Fseal%2F%40latest&query=%24.Version&label=seal&color=blue)](https://pkg.go.dev/github.com/zmuxio/zmux-go/seal)
 
 Go implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
@@ -30,6 +31,7 @@ and datagram flows.
 | `github.com/zmuxio/zmux-go/zmuxquic` | QUIC carriers (quic-go) |
 | `github.com/zmuxio/zmux-go/zmuxh3` | HTTP/3 and WebTransport carriers |
 | `github.com/zmuxio/zmux-go/zmuxws` | WebSocket carriers |
+| `github.com/zmuxio/zmux-go/seal` | end-to-end protected carriers through TLS-terminating intermediaries (experimental) |
 
 ## Client
 
@@ -226,6 +228,29 @@ reports whether a carrier has such TLS). Over ws, or behind a proxy
 that terminates TLS, there is none and both fail, unless a carrier
 transform with its own handshake supplies the exporter. Only the exporter
 binding or a client that pins the server proves the TLS end to end.
+
+## Protected carriers (experimental)
+
+The `seal` module protects each carrier end to end where an intermediary
+terminates its TLS: a Noise handshake (IKpsk1 with pinned server keys, or
+NXpsk0 from a PSK alone) in one round trip that carries the client's first
+streams, then one AES-256-GCM frame per record. The wire format and the
+API are experimental and may change.
+
+```go
+srv, err := seal.NewServer(&seal.ServerConfig{Keys: keys, Authorize: authorize})
+l := zmux.NewListener(&zmux.ListenerConfig{
+	Admission: srv.Admission(seal.SealedOnly),
+	WrapPipe:  srv.WrapPipe,
+})
+
+conn, err := seal.Dial(ctx, "tcp", "example.com:4433",
+	&seal.ClientConfig{Peers: []seal.PublicKey{serverPub}, Key: clientKey, PSK: psk}, cfg)
+```
+
+`seal.WrapCandidate` wraps any non-split candidate (WebSocket, streaming,
+exchange); the carrier exports keying material, so `PipeAuth.Exporter` and
+carrier-bound joins bind to its handshake.
 
 ## HTTP exchanges
 

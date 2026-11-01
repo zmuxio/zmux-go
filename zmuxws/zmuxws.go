@@ -48,10 +48,11 @@ import (
 )
 
 // options are the connection settings of both ends: messages up to one
-// byte above the largest record, so that a peer cannot make a carrier
-// buffer much more than a record, and a message above the session's limit
-// reaches it as the oversized record it is.
-var options = wsconn.Options{ReadLimit: zmux.MaxRecordSize + 1}
+// byte above the largest record plus 64 bytes for the per-message
+// overhead of a carrier transform (such as an AEAD tag), so that a peer
+// cannot make a carrier buffer much more than a record, and a message
+// above the session's limit reaches it as the oversized record it is.
+var options = wsconn.Options{ReadLimit: zmux.MaxRecordSize + 1 + 64}
 
 // accepted returns the subprotocols a server accepts, by preference: each
 // identifier followed by its alias, so that the first identifier offered
@@ -424,7 +425,8 @@ func (d *tlsDialer) DialContext(ctx context.Context, network, addr string) (net.
 
 // Pipe returns a WebSocket connection, client or server, as a pipe input
 // with message framing. A connection established by other means should
-// have a read limit of at least zmux.MaxRecordSize+1 (wsconn's default
+// have a read limit of at least zmux.MaxRecordSize+1, 64 bytes more under a
+// transform (wsconn's default
 // is above it). Its ConnectionState is that of c's own connection when
 // that is a TLS connection, else not HandshakeComplete.
 func Pipe(c *wsconn.Conn) zmux.PipeIO { return pipe(c, tlsState(c.NetConn())) }

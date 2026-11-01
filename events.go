@@ -351,7 +351,10 @@ func (c *Conn) drainEventsLocked() {
 			c.hk.trace(traceItem{ev: ev})
 		}
 	}
-	if len(q.fresh) > 0 || len(c.pipeWaiters) > 0 {
+	// Only new events wake NextEvent; firePipeWaiters wakes AddPipe and
+	// the pool, whose long-lived waiter would otherwise keep NextEvent
+	// spinning.
+	if len(q.fresh) > 0 {
 		for _, w := range q.waiters {
 			w.Fire()
 		}

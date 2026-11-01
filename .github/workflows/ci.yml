@@ -31,6 +31,8 @@ jobs:
             path: zmuxh3
           - name: zmuxws
             path: zmuxws
+          - name: seal
+            path: seal
           - name: examples
             path: examples/xorpipe
     defaults:
@@ -67,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", zmuxquic, zmuxh3, zmuxws, examples/xorpipe]
+        module: [".", zmuxquic, zmuxh3, zmuxws, seal, examples/xorpipe]
     steps:
       - uses: actions/checkout@v7
 

@@ -5,5 +5,6 @@ use (
 	./zmuxh3
 	./zmuxquic
 	./zmuxws
+	./seal
 	./examples/xorpipe
 )

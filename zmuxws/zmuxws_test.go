@@ -373,8 +373,9 @@ func TestCarrier(t *testing.T) {
 			t.Fatalf("read %d bytes, %v", len(got), err)
 		}
 	}
-	// Above the largest record by more than a byte: the carrier fails.
-	if err := w.WriteMessage(make([]byte, zmux.MaxRecordSize+2)); err != nil {
+	// Above the largest record by more than the room for a transform's
+	// overhead: the carrier fails.
+	if err := w.WriteMessage(make([]byte, zmux.MaxRecordSize+66)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.ReadMessage(); err == nil {

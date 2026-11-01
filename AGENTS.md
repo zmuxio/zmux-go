@@ -1,7 +1,7 @@
 # AGENTS.md
 
-- Four modules: the root `github.com/zmuxio/zmux-go`, `zmuxquic/`, `zmuxh3/`
-  and `zmuxws/`. The root `go.work` resolves the root module locally for the
+- Five modules: the root `github.com/zmuxio/zmux-go`, `zmuxquic/`, `zmuxh3/`,
+  `zmuxws/` and `seal/`. The root `go.work` resolves the root module locally for the
   sub-modules (no `replace` directives); run every check below in each module.
 - Before you finish, `gofmt -l .` must print nothing and `go vet ./...` and
   `go test -race ./...` and `golangci-lint run` must pass in every module.

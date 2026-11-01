@@ -1,0 +1,8 @@
+github.com/djylb/netx v0.0.0-20261101155122-97a785ec6da4 h1:WvCD4rcuN2hOuS9keOcwG9Az54DfDU7ilAAcrSOGEBY=
+github.com/djylb/netx v0.0.0-20261101155122-97a785ec6da4/go.mod h1:8qOo/AF1/Xs8lttgM9zAeDNSPK+vtoMDppEbH6sQabY=
+github.com/djylb/timeshim v0.0.0-20261031100623-0e5ae6a85c7f h1:ApndOPGF7m6Byx+F399FGmNCOgLH6DDZgNyr8MXYokw=
+github.com/djylb/timeshim v0.0.0-20261031100623-0e5ae6a85c7f/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
+github.com/zmuxio/zmux-go v1.3.3 h1:juTNttgAVHkXT7gbzy/cOVW3Ra13WzFfYwYi3GhS7jk=
+github.com/zmuxio/zmux-go v1.3.3/go.mod h1:SmDFcqquRfd5P/NfiOTSq96muehK4y/mgZ7aGoHHtOw=
+github.com/zmuxio/zmux-go/zmuxws v1.3.3 h1:VCuXuXMhNeELH7PkUeHk2ea1Ykw4OBzCL9wyMUfahWE=
+github.com/zmuxio/zmux-go/zmuxws v1.3.3/go.mod h1:GHzrMw+TIzMbsxCDVe83bif4oQNBNGlgdQUDP/awFbQ=
