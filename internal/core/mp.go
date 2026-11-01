@@ -9,43 +9,50 @@ import (
 // pipe of such a session carries an attach record (p.mp). Single-pipe
 // sessions never allocate any of it.
 
-// Outbound pipe states (STATE_MACHINE.md 3.1).
-type outState uint8
+// OutState is the state of an outbound pipe direction (STATE_MACHINE.md
+// 3.1).
+type OutState uint8
 
 const (
-	outNone outState = iota
-	outJoining
-	outActive
-	outSuspect
-	outDraining
-	outFailed
-	outClosed
+	OutNone OutState = iota
+	OutJoining
+	OutActive
+	OutSuspect
+	OutDraining
+	OutFailed
+	OutClosed
+	OutRetired // reported only: the attachment was retired
 )
 
-var outStateNames = [...]string{"NONE", "JOINING", "ACTIVE", "SUSPECT", "DRAINING", "FAILED", "CLOSED"}
+var outStateNames = [...]string{"NONE", "JOINING", "ACTIVE", "SUSPECT", "DRAINING", "FAILED", "CLOSED", "RETIRED"}
 
-// Inbound pipe states (STATE_MACHINE.md 3.2).
-type inState uint8
+func (o OutState) String() string { return outStateNames[o] }
+
+// InState is the state of an inbound pipe direction (STATE_MACHINE.md
+// 3.2).
+type InState uint8
 
 const (
-	inNone inState = iota
-	inJoining
-	inOpen
-	inEnded
+	InNone InState = iota
+	InJoining
+	InOpen
+	InEnded
+	InRetired // reported only: the attachment was retired
 )
 
-var inStateNames = [...]string{"NONE", "JOINING", "OPEN", "ENDED"}
+var inStateNames = [...]string{"NONE", "JOINING", "OPEN", "ENDED", "RETIRED"}
+
+func (i InState) String() string { return inStateNames[i] }
 
 type multiPath struct {
 	keyOwn, keyPeer []byte
 	locator         []byte // our locator (what the peer puts in PIPE_JOIN)
 	peerLocator     []byte
-	nextID          uint64 // next own pipe ID
-	cap             int    // unretired attachments of the peer we keep
-	ownCap          int    // unretired attachments we joined ourselves
-	replayW         uint64 // W
-	h               uint64 // highest verified peer pipe ID
-	hSet            bool
+	nextID          uint64          // next own pipe ID
+	cap             int             // unretired attachments of the peer we keep
+	ownCap          int             // unretired attachments we joined ourselves
+	replayW         uint64          // W
+	h               uint64          // highest verified peer pipe ID
 	bits            map[uint64]bool // replay bits of peer IDs without state
 	pendAbandon     map[uint64]bool // PIPE_ABANDON owed for IDs without state
 	pendCode        map[uint64]uint64
@@ -54,12 +61,12 @@ type multiPath struct {
 	pingTimes       [8]Time // send times of the last 8 PIPE_PINGs
 	pingIdx         int
 	pingCount       int
-	redundantAt     Time // when the redundant snapshot copy is due
-	ackChanged      bool // snapshot changed since the last copy
-	busyUntil       Time // traffic frames within the busy window
-	joinReplays     uint64
-	joinAuthFails   uint64
+	redundantAt     Time   // when the redundant snapshot copy is due
+	busyUntil       Time   // traffic frames within the busy window
+	stateGen        uint64 // counts pipe state changes (mpHandleTimeout)
 	retained        uint64 // unacknowledged stream bytes
+	hSet            bool   // h is set
+	ackChanged      bool   // snapshot changed since the last copy
 
 	// Scheduler.
 	gateBuf      gate
@@ -70,13 +77,11 @@ type multiPath struct {
 	copies       []*copyRec
 	aff          affinityState
 	pickGen      uint64
-	pickWanted   bool
 	pickQ        []*Stream // directions waiting for a custom decision
 	inputEpoch   uint64
-	pickMisses   uint64
-	pickApplied  uint64
-	pickTimer    bool // a direction waits for an answer until pickDeadline
 	pickDeadline Time
+	pickWanted   bool
+	pickTimer    bool // a direction waits for an answer until pickDeadline
 
 	suspendCause error // the pipe loss that suspended the session
 
@@ -86,91 +91,101 @@ type multiPath struct {
 
 // attach is the per-attachment state of a multipath session.
 type attach struct {
-	joinerLocal bool
-	dir         uint8 // MULTIPATH 5.1 direction from the joiner: 0 up, 1 down, 2 bidi
 	fate        uint64
-	out         outState
-	in          inState
 	attachedAt  Time
 	join        *wire.Join // local join waiting to be written (in band)
+	pingSince   Time
+	joinerLocal bool
+	dir         uint8 // MULTIPATH 5.1 direction from the joiner: 0 up, 1 down, 2 bidi
+	out         OutState
+	in          InState
 	oob         bool
 	held        bool
 	resLimited  bool // abandoned by the peer with ZMUX_PIPE_RESOURCE_LIMIT // a local join waits for room or the backoff
 	firstRecord bool // our first record on the outbound direction is still due
 	discardTP   bool // the joiner discards a leading QX_TRANSPORT_PARAMETERS record
 	needPing    bool // a PIPE_PING is owed on this pipe
-	pingSince   Time
 	ackPair     bool // a PIPE_ACK answering a PIPE_PING is owed on this pair
 
 	// Removal (MULTIPATH.md 8).
-	abandonSent     bool // own PIPE_ABANDON handed to a carrier
-	abandonQueued   bool
 	abandonCode     uint64
-	abandonAcked    bool
-	abandonRecv     bool
 	abandonRecvAt   Time
 	abandonCodeRecv uint64
-	unilateral      bool
 	lingerUntil     Time
 	ackedAbandonAt  Time
+	drainStart      Time
+	abandonSent     bool // own PIPE_ABANDON handed to a carrier
+	abandonQueued   bool
+	abandonAcked    bool
+	abandonRecv     bool
+	unilateral      bool
 	draining        bool
 	drainSuspect    bool
-	drainStart      Time
 	retired         bool
 
 	// Sender view (estimates, detection).
 	rtt         rttEst
 	lastAdvance Time
 	liveAt      Time
-	unacked     bool // unacknowledged ack-eliciting bytes exist
-	lingering   bool
 	oldestAt    Time // send time of the oldest unacknowledged ack-eliciting byte
 	lastElicit  Time // when an ack-eliciting byte was last sent
 	suspectAt   Time
 	failCause   error
+	// unsentAhead is the snapshot of MULTIPATH.md 7.1: Q_p when the oldest
+	// unacknowledged ack-eliciting byte was handed over (the bytes ahead
+	// of it), fixed so that a pipe that stops moving is still detected.
 	unsentAhead uint64
-	noSampleAt  Time // samples of bytes sent at or before this are discarded (E2)
+	queueD      Duration // queue_p of the snapshot
+	noSampleAt  Time     // samples of bytes sent at or before this are discarded (E2)
+	unacked     bool     // unacknowledged ack-eliciting bytes exist
+	lingering   bool
 	noSample    bool
 
 	// Tiers (MULTIPATH.md 9).
 	sendPrio    *uint64
 	sendStandby *bool
 	peerPrio    uint64
-	peerStandby bool
 	peerSeq     uint64
 	recvPrio    uint64
-	recvStandby bool
 	statusSeq   uint64
 	statusQ     []statusReq // PIPE_STATUS owed
 	weight      uint64
+	peerStandby bool
+	recvStandby bool
 	takeover    bool
 
 	// Scheduler.
 	probOpt      Duration // per-pipe Probation; <0: the session default
 	suspectFloor Duration // per-pipe SuspectFloor; 0: the session default
 	deadTimeout  Duration // per-pipe DeadTimeout; 0: the session default
+	probeIv      Duration // per-pipe ProbeInterval; 0: the session default, <0: off
+	probeJit     float64  // per-pipe ProbeJitter; 0: the session default, <0: 0
+	probeH       Duration // H_p of the current probe wait, taken when it started
+	probeCut     float64  // the current probe wait is k_eff x (1 - probeCut): in [0, j], or [0, 1] for the first wait of a bootstrap pipe
 	prob         probState
 	hist         history // fate group 0
-	wasSuspect   bool
-	reval        bool // awaiting revalidation
-	revalPing    bool // its PIPE_PING is still to be written
 	revalEnd     uint64
 	rrCur        float64
 	copyQ        []*copyRec
 	selfCopyQ    []*copyRec // copies for p's own copy lane (a single-pipe tier)
 	idleArm      uint64     // bytes of the idle copy left
-	placedSet    bool
 	placedFrom   uint64
+	wasSuspect   bool
+	reval        bool // awaiting revalidation
+	revalPing    bool // its PIPE_PING is still to be written
+	placedSet    bool
 	// Counters.
 	suspects, failures, reinjectedBytes, oppBytes, pingsSent uint64
+	redundantBytes, dupBytes, pingsAnswered                  uint64
+	pingEnds                                                 []uint64 // outbound positions after unanswered PIPE_PINGs
 
-	penalized  bool // MULTIPATH.md 7.5.1: no new data until penaltyEnd is acknowledged
 	penaltyEnd uint64
 	// Reinjection hold (RESUME.md 6): a new pipe reinjects one chunk until
 	// the first PIPE_ACK after it became live, or one smoothed RTT.
 	holdUntil Time
-	held1     bool
 	holdSent  uint64
+	penalized bool // MULTIPATH.md 7.5.1: no new data until penaltyEnd is acknowledged
+	held1     bool
 
 	// Inbound silence.
 	lastRecord Time
@@ -219,9 +234,10 @@ func (s *Session) startMultipath() {
 	m.busyUntil = s.now.Add(15 * Second)
 	s.mp = m
 	for _, pp := range s.pipes {
-		a := &attach{joinerLocal: s.role == RoleInitiator, dir: 2, out: outActive, in: inOpen,
+		a := &attach{joinerLocal: s.role == RoleInitiator, dir: 2, out: OutActive, in: InOpen,
 			attachedAt: s.now, liveAt: s.now, lastAdvance: s.now, lastRecord: s.now, weight: 1, probOpt: -1}
 		a.rtt = s.initialRTT(pp.id)
+		s.drawProbe(a, pp, true)
 		pp.mp = a
 	}
 }
@@ -283,24 +299,20 @@ func (m *multiPath) raise(id uint64) {
 	}
 }
 
-// PipeState returns the state names of a pipe for traces and stats.
-func (s *Session) PipeState(id uint64) (out, in string, ok bool) {
+// PipeState returns the states of a pipe's two directions.
+func (s *Session) PipeState(id uint64) (out OutState, in InState, ok bool) {
 	p := s.pipe(id)
 	if p == nil {
-		return "", "", false
+		return OutNone, InNone, false
 	}
 	if s.mp == nil || p.mp == nil {
-		return "ACTIVE", "OPEN", true
+		return OutActive, InOpen, true
 	}
 	a := p.mp
 	if a.retired {
-		return "RETIRED", "RETIRED", true
+		return OutRetired, InRetired, true
 	}
-	o := outStateNames[a.out]
-	if a.out == outDraining && a.drainSuspect {
-		o = "DRAINING"
-	}
-	return o, inStateNames[a.in], true
+	return a.out, a.in, true
 }
 
 // sampleOK reports whether bytes sent at sent may give estimator samples:

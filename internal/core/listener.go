@@ -1,6 +1,12 @@
 package core
 
-import "github.com/zmuxio/zmux-go/internal/wire"
+import (
+	"container/list"
+	"net/netip"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
+)
 
 // Carrier classification of a listener (MULTIPATH.md 5.5, SPEC.md 6.2).
 
@@ -28,7 +34,7 @@ func Classify(b []byte, maxRecord uint64) (Class, int) {
 	if len(b) == 0 {
 		return ClassMore, 0
 	}
-	size, n := wire.ReadVarint(b)
+	size, n := varint.ConsumeVarint(b)
 	if n == 0 {
 		return ClassMore, 0
 	}
@@ -99,35 +105,87 @@ func (s *Session) SkipJoinFrame(pipe uint64) {
 	}
 }
 
-// PendingCarriers bounds the carriers of one listener that have not yet
-// delivered a complete first record (MULTIPATH.md 5.6): at most
-// MaxPerSource per source address; each is closed when its first record
-// does not arrive within Timeout. Callers serialise access.
-type PendingCarriers struct {
-	MaxPerSource int      // 0: the default 8
-	Timeout      Duration // 0: the default 2 s
-	bySource     map[string]int
+// Recommended limits of MULTIPATH.md 5.6.
+const (
+	DefaultMaxPending          = 64
+	DefaultMaxPendingPerSource = 8
+	DefaultFirstRecordTimeout  = 2 * Second
+	DefaultHandshakeTimeout    = 10 * Second
+)
+
+// Session defaults; the public package exports them.
+const (
+	DefaultKeepAlive   = 15 * Second // keep-alive period
+	DefaultIdleTimeout = 30 * Second // max_idle_timeout
+	DefaultProbeJitter = 0.25        // probe jitter j (MULTIPATH.md 7.1)
+)
+
+// SourceKey is the source a client address counts against (MULTIPATH.md
+// 5.6): an IPv6 address is aggregated to its /64 prefix, so that a client
+// cannot rotate addresses within its prefix; an IPv4 address (also
+// IPv4-mapped) stands for itself; anything else is kept as given.
+func SourceKey(addr string) string {
+	a, err := netip.ParseAddr(addr)
+	if err != nil {
+		return addr
+	}
+	a = a.Unmap().WithZone("")
+	if a.Is4() {
+		return a.String()
+	}
+	p, _ := a.Prefix(64)
+	return p.String()
 }
 
-// Admit takes a slot for a new carrier from source; false: close it.
-func (p *PendingCarriers) Admit(source string) bool {
-	maxPer := p.MaxPerSource
-	if maxPer <= 0 {
-		maxPer = 8
+// PendingCarriers bounds the carriers of one listener that have not yet
+// passed join verification (MULTIPATH.md 5.6): at most MaxPerSource per
+// source, refused beyond it, and at most MaxTotal in all, a new carrier
+// evicting the oldest when they are full; each is closed when its first
+// record does not arrive within Timeout. A carrier holds its source slot
+// (Enter) from its arrival, and a slot of the total (Take) only once it
+// is read for its first record. Callers serialise access.
+type PendingCarriers struct {
+	MaxTotal     int      // 0: DefaultMaxPending
+	MaxPerSource int      // 0: DefaultMaxPendingPerSource
+	Timeout      Duration // 0: DefaultFirstRecordTimeout
+	bySource     map[string]int
+	stalled      map[string]int
+	order        list.List // of *PendingCarrier, oldest first
+}
+
+// PendingCarrier is the slot of the total of one carrier.
+type PendingCarrier struct {
+	source string
+	owns   bool // Admit took its source slot as well
+	evict  func()
+	elem   *list.Element // nil once released or evicted
+}
+
+func (p *PendingCarriers) maxPer() int {
+	if p.MaxPerSource <= 0 {
+		return DefaultMaxPendingPerSource
 	}
+	return p.MaxPerSource
+}
+
+// Enter takes a source slot for a carrier that arrived from source; false:
+// the source holds its share, close the carrier. Leave gives it back.
+func (p *PendingCarriers) Enter(source string) bool {
 	if p.bySource == nil {
 		p.bySource = map[string]int{}
 	}
-	if p.bySource[source] >= maxPer {
+	if p.bySource[source] >= p.maxPer() {
 		return false
 	}
 	p.bySource[source]++
 	return true
 }
 
-// Release returns the slot of a carrier whose first record arrived or that
-// was closed.
-func (p *PendingCarriers) Release(source string) {
+// Held is the number of source slots source holds.
+func (p *PendingCarriers) Held(source string) int { return p.bySource[source] }
+
+// Leave gives back a source slot Enter took.
+func (p *PendingCarriers) Leave(source string) {
 	if n := p.bySource[source]; n > 1 {
 		p.bySource[source] = n - 1
 	} else {
@@ -135,11 +193,81 @@ func (p *PendingCarriers) Release(source string) {
 	}
 }
 
+// Take takes a slot of the total for a carrier that holds its source
+// slot. evict closes the carrier when a newer one takes its slot; Take
+// returns it as evicted instead of calling it, for the caller to call
+// outside its lock.
+func (p *PendingCarriers) Take(source string, evict func()) (c *PendingCarrier, evicted func()) {
+	maxTotal := p.MaxTotal
+	if maxTotal <= 0 {
+		maxTotal = DefaultMaxPending
+	}
+	if f := p.order.Front(); f != nil && p.order.Len() >= maxTotal {
+		old := f.Value.(*PendingCarrier)
+		p.Release(old)
+		evicted = old.evict
+	}
+	c = &PendingCarrier{source: source, evict: evict}
+	c.elem = p.order.PushBack(c)
+	return c, evicted
+}
+
+// Admit is Enter and Take in one: ok false, close the carrier. Release
+// then gives back both slots.
+func (p *PendingCarriers) Admit(source string, evict func()) (c *PendingCarrier, evicted func(), ok bool) {
+	if !p.Enter(source) {
+		return nil, nil, false
+	}
+	c, evicted = p.Take(source, evict)
+	c.owns = true
+	return c, evicted, true
+}
+
+// Release returns the slot of the total of a carrier that was classified
+// as a new session or a lane, passed join verification, or was closed,
+// and its source slot when Admit took it. Releasing a slot again, or one
+// that was evicted, does nothing.
+func (p *PendingCarriers) Release(c *PendingCarrier) {
+	if c == nil || c.elem == nil {
+		return
+	}
+	p.order.Remove(c.elem)
+	c.elem = nil
+	if c.owns {
+		p.Leave(c.source)
+	}
+}
+
+// Stall counts a carrier from source that an admission stalls; it keeps
+// its source slot and takes no slot of the total, so it is neither
+// evicted nor timed out. A source holds at most MaxPerSource - 1 stalled
+// carriers, so that it keeps a slot for a new attempt: false, close the
+// carrier at once. Unstall ends the count.
+func (p *PendingCarriers) Stall(source string) bool {
+	if p.stalled == nil {
+		p.stalled = map[string]int{}
+	}
+	if p.stalled[source] >= p.maxPer()-1 {
+		return false
+	}
+	p.stalled[source]++
+	return true
+}
+
+// Unstall ends the count of a carrier Stall counted.
+func (p *PendingCarriers) Unstall(source string) {
+	if n := p.stalled[source]; n > 1 {
+		p.stalled[source] = n - 1
+	} else {
+		delete(p.stalled, source)
+	}
+}
+
 // Deadline is when a carrier accepted at t must have its first record.
 func (p *PendingCarriers) Deadline(t Time) Time {
 	d := p.Timeout
 	if d <= 0 {
-		d = 2 * Second
+		d = DefaultFirstRecordTimeout
 	}
 	return t.Add(d)
 }

@@ -3,6 +3,7 @@ package core
 import (
 	"crypto/rand"
 	"encoding/binary"
+	mrand "math/rand/v2"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -32,6 +33,9 @@ type Features struct {
 	LanesIn bool
 	// JoinSecurityUnavailable: both offered multipath, no secret source.
 	JoinSecurityUnavailable bool
+	// CarrierDatagrams: DATAGRAM frames may go on the datagram channels of
+	// pipe carriers (EXTENSIONS.md 6.8).
+	CarrierDatagrams bool
 }
 
 // Acked reports whether the session is a session with acknowledgement.
@@ -69,6 +73,7 @@ type Session struct {
 	conn              connFlow
 	pend              pendingCtl
 	ping              pingState
+	rng               *mrand.Rand // rand
 	ga                goawayState
 	dg                *dgramState
 	budget            budget
@@ -102,6 +107,8 @@ type Session struct {
 	capWaiters        []*Stream
 	q                 sessQuality
 	copyMaxData       bool
+	shp               *shapeSess // nil until a Shaper is set
+	suspendedAt       Time       // when the current suspension began
 }
 
 // Stats are exact counters of the session.
@@ -119,6 +126,32 @@ type Stats struct {
 	BytesRedundant               uint64
 	BytesOpportunistic           uint64
 	DatagramsDroppedLimit        uint64
+	// Datagrams sent and received on carrier datagram channels, also
+	// counted in DatagramsSent and DatagramsReceived.
+	DatagramsSentChannel     uint64
+	DatagramsReceivedChannel uint64
+	// Payload bytes of the datagrams counted in DatagramsSent and of
+	// those the application received (API.md 7.1).
+	DatagramBytesSent     uint64
+	DatagramBytesReceived uint64
+	// StreamCreditWaits counts opens that waited for stream-count credit.
+	StreamCreditWaits uint64
+	// BytesReinjected counts stream bytes sent again after a pipe failed
+	// or became suspect, or opportunistically (BytesOpportunistic).
+	BytesReinjected uint64
+	Penalties       uint64 // pipes penalized (MULTIPATH.md 7.5.1)
+	Reinjections    uint64 // reinjection episodes
+	// BytesDuplicateReceived counts stream bytes received again (multipath).
+	BytesDuplicateReceived uint64
+	PipesAdded             uint64 // attachments, the bootstrap pair included
+	PipeFailures           uint64
+	JoinAuthFailures       uint64
+	JoinReplays            uint64
+	JoinRefusals           uint64 // own joins refused with ZMUX_PIPE_RESOURCE_LIMIT
+	Suspensions            uint64
+	SuspendedTime          Duration // the current suspension excluded (SessionStats adds it)
+	SchedulerAnswers       uint64   // custom scheduler answers that named a pipe and were applied; Wait is not counted
+	SchedulerFallbacks     uint64   // answers replaced by the affinity choice
 }
 
 type localCount struct {
@@ -196,6 +229,19 @@ func New(cfg Config, now Time) *Session {
 	return s
 }
 
+// rand returns the session's random source of non-secret draws, seeded
+// from Test.Seed or at random on first use.
+func (s *Session) rand() *mrand.Rand {
+	if s.rng == nil {
+		seed := s.cfg.Test.Seed
+		if seed == 0 {
+			seed = randUint64()
+		}
+		s.rng = mrand.New(mrand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+	}
+	return s.rng
+}
+
 // randUint64 returns a random value (nonces, GREASE).
 func randUint64() uint64 {
 	var b [8]byte
@@ -235,8 +281,23 @@ func (s *Session) LocalParams() *wire.Params { return &s.cfg.Local }
 // Config returns the configuration.
 func (s *Session) Config() *Config { return &s.cfg }
 
-// SessionStats returns a copy of the counters.
-func (s *Session) SessionStats() Stats { return s.stats }
+// SessionStats returns a copy of the counters, SuspendedTime including the
+// current suspension.
+func (s *Session) SessionStats() Stats {
+	st := s.stats
+	if s.state == StateSuspended {
+		st.SuspendedTime += s.now.Sub(s.suspendedAt)
+	}
+	return st
+}
+
+// endSuspension adds the suspension that ends now to SuspendedTime; it is
+// called before the state leaves SUSPENDED.
+func (s *Session) endSuspension() {
+	if s.state == StateSuspended {
+		s.stats.SuspendedTime += s.now.Sub(s.suspendedAt)
+	}
+}
 
 // Established reports whether the peer's parameters were processed.
 func (s *Session) Established() bool { return s.peerSeen }
@@ -291,6 +352,7 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	f.Preamble = both(wire.HasPreamble)
 	f.Priority = both(wire.HasPriority)
 	f.Flows = both(wire.HasFlows) && l.Has&wire.HasDatagram != 0
+	f.CarrierDatagrams = both(wire.HasCarrierDatagrams) && l.Has&wire.HasDatagram != 0
 	if both(wire.HasMultipath) {
 		if sel := l.SecretFlags & p.SecretFlags; sel&(wire.SecretExporter|wire.SecretPSK) != 0 || sel&wire.SecretInsecure != 0 {
 			f.Multipath = true
@@ -408,6 +470,7 @@ func (s *Session) closeWith(e *SessionError, fr *closeFrame) {
 		return
 	}
 	s.err = e
+	s.endSuspension()
 	s.state = StateClosing
 	s.failAllStreams()
 	s.wakeAll()
@@ -456,6 +519,7 @@ func (s *Session) closeSilently(e *SessionError, graceful bool) {
 		return
 	}
 	s.err = e
+	s.endSuspension()
 	s.state = StateClosing
 	s.failAllStreams()
 	s.wakeAll()
@@ -486,6 +550,7 @@ func (s *Session) finishClose() {
 	if s.err != nil && s.state != StateClosing {
 		s.failAllStreams()
 	}
+	s.endSuspension()
 	s.state = StateClosed
 	for _, p := range s.pipes {
 		s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})

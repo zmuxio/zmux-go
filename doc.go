@@ -13,8 +13,11 @@
 // sessions, so it is the server for multipath and resume. Server starts a
 // single-pipe session on one accepted connection. Start takes any carrier
 // (PipeIO, for example a WebSocket connection with FramingRecords) and an
-// explicit Role, and Listener.HandlePipe or Listener.ServeHTTP accept any
-// carrier. HTTPExchangePipe and HTTPExchangeHandler build a carrier out of
+// explicit Role, and Listener.HandlePipe or NewHTTPHandler accept any
+// carrier. An Admission on the Listener (ListenerConfig.Admission,
+// PrefixAuth) decides on every carrier before anything is sent on it,
+// whatever entry point took it, and a Credential is what a
+// client presents for it (Config.Credential, PresentPipe). HTTPExchangePipe and HTTPExchangeHandler build a carrier out of
 // short HTTP requests for paths that buffer or cut long ones; they
 // authenticate but do not encrypt, so a proxy or CDN that terminates TLS
 // can read such a carrier. The sub-modules zmuxquic and zmuxh3 carry
@@ -69,20 +72,52 @@
 //
 // # Names
 //
-// Constants carry the name of their type as a prefix: Role (RoleClient),
-// Dir (DirSendOnly), Framing (FramingRecords), Urgency (UrgencyDefault),
-// Event (EventPipeJoined), Transport for transport error codes
-// (TransportProtocolViolation) and Stream for stream error codes
-// (StreamCancelled).
+// Constants carry the name of their type, or a short form of it, as a
+// prefix: Role (RoleClient), Direction (DirSendOnly), Framing
+// (FramingRecords), Urgency (UrgencyDefault), EventKind (EventPipeJoined),
+// OutboundState (OutboundActive), Endpoint (EndpointLocal), Transport for
+// transport error codes (TransportProtocolViolation) and Stream for stream
+// error codes (StreamCancelled).
+//
+// Rates are float64 bytes per second throughout (PickPipe.Rate,
+// PipeStats.DeliveryRate, Event.DeliveryRate, CapacityFloor.Rate); memory
+// budgets and usage are int64 bytes.
 //
 // # Configuration
 //
-// The zero value of every Config field selects its default. For sizes,
-// counts and durations that can be turned off or unlimited, a negative
-// value means off or unlimited (MaxIdleTimeout, MemoryBudget,
-// MaxIncomingStreams, ListenerConfig.MemoryBudget); pointer fields
-// distinguish "unset" where zero is itself meaningful. Multipath needs
+// Settings: the zero value of a field selects its default, stated in the
+// field's documentation; for timeouts and limits it is a safe bound unless
+// the field says otherwise. A negative timeout means no timeout, as for
+// http.Server.IdleTimeout. Other negative values are an error unless the
+// field gives them a meaning.
+//
+// The fields that give negative values a meaning follow the standard
+// library: KeepAlivePeriod turns keep-alive off (net.Dialer.KeepAlive),
+// SchedulerParams.ProbeInterval and StandbyProbe and
+// PipeOptions.ProbeInterval turn probes off (net.KeepAliveConfig), and
+// HTTPExchangeConfig.Coalesce sends at once
+// (httputil.ReverseProxy.FlushInterval). A memory budget is lifted with
+// NoMemoryLimit. Other settings that turn something off are Disable and
+// No fields, as in net/http (NoIncomingStreams, NoProbeJitter,
+// PoolDecision.DisableIdleProbe, QualityBand.NoMinInterval,
+// shaping.Limits.NoPadding, ...). Zero values that are not a safe bound:
+// shaping.Limits (zero is unbounded; the session's other limits still
+// apply), PipePool.Rotate (zero rotates nothing) and Config.ResumeTimeout
+// (zero is no resume). Errors are ErrInvalidConfig; NewListener panics.
+//
+// Multipath needs
 // MaxPipes above 1 and a PipeAuth (PSK or TLS); without a secret, joins
 // are possible only with PipeAuth.AllowInsecure, meant for tests and
 // protected networks.
+//
+// # Time
+//
+// Config.Clock (a timeshim.Clock; nil is the host's monotonic clock) is the
+// session's time source: its timers, deadlines, RTT and rate estimates, and
+// the Redial and MaintainPipes waits run on it, so a timeshim.Fake drives a
+// session deterministically. Carrier read and write deadlines of
+// net.Conn, Listener and endpoint timers (first record, pairing, carrier
+// upgrade, the exchange carrier) and the transports of the QUIC adapters
+// (zmuxquic, zmuxh3: quic-go's loss recovery, idle and handshake timers)
+// stay on the host clock.
 package zmux

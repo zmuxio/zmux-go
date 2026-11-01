@@ -359,7 +359,7 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 	c.SetScheduler(SpreadRoundRobin())
 	before := map[uint64]uint64{}
 	for _, p := range c.PipeStats() {
-		before[p.ID] = p.BytesSent
+		before[p.Pipe] = p.BytesSent
 	}
 	msg := make([]byte, 16<<20)
 	_, _ = rand.Read(msg)
@@ -371,8 +371,8 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 		t.Fatalf("pipes: %d", len(ps))
 	}
 	for _, p := range ps {
-		if p.BytesSent-before[p.ID] < 1<<20 {
-			t.Fatalf("pipe %d carried %d bytes; stats: %+v", p.ID, p.BytesSent-before[p.ID], ps)
+		if p.BytesSent-before[p.Pipe] < 1<<20 {
+			t.Fatalf("pipe %d carried %d bytes; stats: %+v", p.Pipe, p.BytesSent-before[p.Pipe], ps)
 		}
 	}
 	c.SetScheduler(nil)

@@ -1,4 +1,10 @@
+// Package wire encodes and decodes the zmux wire format: QMux records,
+// frames, transport parameters and stream preambles, with the QUIC
+// variable-length integers of package varint. It allocates nothing on the
+// decode path: decoded byte fields alias the input.
 package wire
+
+import "github.com/zmuxio/zmux-go/varint"
 
 // Frame type codepoints (REGISTRY.md Section 3).
 const (
@@ -98,26 +104,26 @@ type Join struct {
 // Frame is one decoded frame. Byte fields alias the decoded buffer.
 type Frame struct {
 	Kind      Kind
+	Fin       bool
+	HasOff    bool
+	HasLen    bool
+	Bidi      bool
+	App       bool
+	Response  bool
+	Urgency   uint8
+	Incr      bool
 	Type      uint64 // wire frame type
 	TypeLen   int    // bytes of the type field
 	StreamID  uint64
 	Offset    uint64
 	Data      []byte // STREAM, DATAGRAM data; CONNECTION_CLOSE reason; QX_TP block
-	Fin       bool
-	HasOff    bool
-	HasLen    bool
 	Code      uint64
 	FinalSize uint64
 	Reliable  uint64
 	Value     uint64 // MAX_*, *_BLOCKED limit, QX_PING seq, PRIORITY_UPDATE seq
-	Bidi      bool
-	App       bool
 	ErrFrame  uint64 // CONNECTION_CLOSE frame type
-	Response  bool
 	MaxBidi   uint64
 	MaxUni    uint64
-	Urgency   uint8
-	Incr      bool
 	PipeID    uint64
 	Lane      uint64
 	LaneKey   []byte
@@ -145,13 +151,13 @@ func (it *AckIter) Next() (AckEntry, bool) {
 		return e, false
 	}
 	var n int
-	e.PipeID, n = ReadVarint(it.b)
+	e.PipeID, n = varint.ConsumeVarint(it.b)
 	it.b = it.b[n:]
-	e.Lane, n = ReadVarint(it.b)
+	e.Lane, n = varint.ConsumeVarint(it.b)
 	it.b = it.b[n:]
-	e.Position, n = ReadVarint(it.b)
+	e.Position, n = varint.ConsumeVarint(it.b)
 	it.b = it.b[n:]
-	e.Delay, n = ReadVarint(it.b)
+	e.Delay, n = varint.ConsumeVarint(it.b)
 	it.b = it.b[n:]
 	return e, true
 }
@@ -166,7 +172,7 @@ func (r *reader) varint() uint64 {
 	if r.bad {
 		return 0
 	}
-	v, n := ReadVarint(r.b[r.i:])
+	v, n := varint.ConsumeVarint(r.b[r.i:])
 	if n == 0 {
 		r.bad = true
 		return 0
@@ -203,7 +209,7 @@ const max60 = 1 << 60
 // (SPEC.md Section 10.3 precedence).
 func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 	*f = Frame{}
-	t, tn := ReadVarint(b)
+	t, tn := varint.ConsumeVarint(b)
 	if tn == 0 {
 		return 0, ErrFrame("truncated frame type")
 	}
@@ -233,7 +239,7 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 			f.Data = b[r.i:]
 			r.i = len(b)
 		}
-		if !r.bad && f.Offset+uint64(len(f.Data)) > MaxVarint {
+		if !r.bad && f.Offset+uint64(len(f.Data)) > varint.MaxVarint {
 			return 0, ErrFrame("stream offset plus length above 2^62-1")
 		}
 	case t == TypeResetStream:
@@ -361,7 +367,7 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 	if r.bad {
 		return 0, &Error{Code: FrameEncodingError, FrameType: t, Reason: "truncated " + f.Kind.String()}
 	}
-	if tn != VarintLen(t) {
+	if tn != varint.SizeVarint(t) {
 		return r.i, &Error{Code: ProtocolViolation, FrameType: t, Reason: "frame type not minimally encoded"}
 	}
 	return r.i, nil

@@ -5,6 +5,7 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // listenerUp delivers a carrier through the local endpoint's listener.
@@ -45,11 +46,12 @@ func (r *runner) listenerUp(st map[string]any) error {
 	}
 	r.carriers[name] = c
 	if src, ok := st["source"].(string); ok {
-		if !r.pending.Admit(src) {
+		slot, _, ok := r.pending.Admit(src, nil)
+		if !ok {
 			c.rejected = true
 			return nil
 		}
-		c.source, c.deadline = src, r.pending.Deadline(r.now)
+		c.slot, c.deadline = slot, r.pending.Deadline(r.now)
 	}
 	if oob, ok := st["oob_join"].(string); ok {
 		j, mac, _, ok := core.ParseJoin(hexb(oob))
@@ -194,16 +196,16 @@ func (r *runner) listenerSend(c *rcarrier, st map[string]any) error {
 	if n == 0 {
 		return nil
 	}
-	if c.source != "" {
+	if c.slot != nil {
 		// The first record is complete: the slot is free again.
-		r.pending.Release(c.source)
-		c.source = ""
+		r.pending.Release(c.slot)
+		c.slot = nil
 	}
 	if cl == core.ClassLane {
 		c.via = "lane"
 		return r.carrierSend(c, map[string]any{"hex": ""})
 	}
-	_, sn := wire.ReadVarint(c.buf)
+	_, sn := varint.ConsumeVarint(c.buf)
 	j, mac, _, ok := core.ParseJoin(c.buf[sn:n])
 	if !ok {
 		c.rejected = true

@@ -1,6 +1,9 @@
 package core
 
-import "github.com/zmuxio/zmux-go/internal/wire"
+import (
+	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
+)
 
 // pingState is QX_PING (SPEC.md 4.5): at most one request outstanding, one
 // response owed.
@@ -73,7 +76,7 @@ func (s *Session) writePingResponse(w *recWriter) {
 	p := &s.ping
 	if p.owe {
 		seq := p.oweSeq
-		n := 8 + wire.VarintLen(seq)
+		n := 8 + varint.SizeVarint(seq)
 		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPing(b, true, seq) }) {
 			return
 		}
@@ -88,7 +91,7 @@ func (s *Session) writePingRequest(w *recWriter) {
 	p := &s.ping
 	if (p.want || p.requestFirst) && p.outstanding == 0 {
 		seq := p.next
-		n := 8 + wire.VarintLen(seq)
+		n := 8 + varint.SizeVarint(seq)
 		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPing(b, false, seq) }) {
 			return
 		}
@@ -100,6 +103,9 @@ func (s *Session) writePingRequest(w *recWriter) {
 		p.expires = s.now.Add(maxD(Second, MulD(s.srtt(), 3)))
 		p.want, p.requestFirst = false, false
 		w.activity = true
+		if s.shp != nil {
+			s.shp.mark(s.now)
+		}
 	}
 }
 
@@ -189,5 +195,5 @@ func (s *Session) charge() {
 	}
 }
 
-// BudgetTokens returns the current tokens (statistic).
-func (s *Session) BudgetTokens() int64 { return s.budget.tokens }
+// BudgetTokens returns the current tokens (statistic); 0 once exhausted.
+func (s *Session) BudgetTokens() uint64 { return uint64(max(s.budget.tokens, 0)) }

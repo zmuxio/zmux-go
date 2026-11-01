@@ -14,3 +14,6 @@ func setNotsentLowat(fd uintptr, n int) error {
 // tcpMinRTT: Darwin's TCP_CONNECTION_INFO reports only a smoothed RTT in
 // milliseconds, which is not a minimum.
 func tcpMinRTT(_ uintptr) (time.Duration, bool) { return 0, false }
+
+// tcpUnsent: the platform reports no count of unsent bytes alone.
+func tcpUnsent(_ uintptr) (uint64, bool) { return 0, false }

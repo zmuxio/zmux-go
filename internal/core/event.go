@@ -29,21 +29,24 @@ const (
 
 // Event is one core event.
 type Event struct {
-	Kind     EventKind
 	Pipe     uint64
+	Kind     EventKind
 	Dir      Dir
-	State    string
+	OutState OutState // EvPipeState of DirOut
+	InState  InState  // EvPipeState of DirIn
+	Carrier  uint8    // EvPipeState: the pipe's carrier kind
 	Err      *SessionError
 	MaxBidi  uint64
 	MaxUni   uint64
 	Code     uint64
 	Count    uint64
 	Frame    []byte
-	Reason   string
+	Reason   JoinAuthReason // EvJoinAuthFailed
 	Features Features
 	Role     Role
 
 	Saturated bool
+	Failed    bool // retirement (EvPipeState of OutRetired): the attachment failed
 	RTT       Duration
 	Rate      float64
 }
@@ -112,4 +115,23 @@ func (s *Session) TakeActions(dst []Action) []Action {
 	clear(s.actions)
 	s.actions = s.actions[:0]
 	return dst
+}
+
+// JoinAuthReason says which join token failed verification (MULTIPATH.md
+// 5.4 step 5).
+type JoinAuthReason uint8
+
+const (
+	JoinAuthMAC             JoinAuthReason = iota + 1 // a token without carrier binding
+	JoinAuthMACCarrierBound                           // a carrier-bound token
+)
+
+func (r JoinAuthReason) String() string {
+	switch r {
+	case JoinAuthMAC:
+		return "mac"
+	case JoinAuthMACCarrierBound:
+		return "mac_carrier_bound"
+	}
+	return "JoinAuthReason(?)"
 }

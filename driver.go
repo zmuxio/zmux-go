@@ -25,14 +25,20 @@ type pipeDrv struct {
 	outer  outerRef       // the outer session of a stream-backed carrier
 	gs     pipeGoroutines // the attachment's goroutines (HandlePipe waits on them)
 
-	// Guarded by the session lock.
+	// Guarded by the session lock (and dead, below).
 	lanes   map[uint64]*laneOut // outbound lanes above 0
 	inLanes []io.ReadCloser     // inbound lanes above 0
-	dead    bool                // replaced (early-data restart): its goroutines report nothing
+
+	// The carrier's datagram channel (nil: none) and its sender.
+	ch     DatagramChannel
+	chSig  *core.Signal
+	chEnd  chan struct{}
+	chOnce sync.Once
 
 	smu      sync.Mutex // leaf: shutdown request of lane 0
 	shutdown bool
 	framing  Framing
+	dead     bool // guarded by the session lock: replaced (early-data restart), its goroutines report nothing
 }
 
 // laneOut is the writer side of one outbound lane above 0.
@@ -116,8 +122,12 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 	if !lanes {
 		_, lanes = p.R.(laneOpener)
 	}
-	return core.CarrierInfo{Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
+	info := core.CarrierInfo{Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
 		Lanes: lanes, QueueBound: lowWater}
+	if ch := channelOf(p); ch != nil {
+		info.Channel = ch
+	}
+	return info
 }
 
 // newPipeDrv prepares the driver of an attachment (under the lock).
@@ -129,6 +139,7 @@ func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
 		pd.opener = o
 	}
 	pd.tcp = tcpOf(p.W)
+	pd.ch = channelOf(p)
 	return pd
 }
 
@@ -141,6 +152,7 @@ func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool) {
 			break
 		}
 	}
+	c.startChannel(pd) // its receiver before the first record
 	if read && pd.hc.io.R != nil {
 		c.wg.Add(1)
 		pd.gs.add()
@@ -168,6 +180,7 @@ func (c *Conn) addBootstrap(p PipeIO) {
 	info := carrierInfo(p, pd.tcp, low)
 	c.orphanSig.Store(pd.wsig)
 	c.s.AttachBootstrap(info, info, pd.wsig)
+	c.s.SetPipeKind(0, uint8(p.Carrier)) // before its first record
 	if d, ok := pd.tcp.minRTT(); ok {
 		c.s.SetCarrierMinRTT(core.Duration(d))
 	}
@@ -222,7 +235,11 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 		}
 		if err != nil {
 			graceful := errors.Is(err, io.EOF)
-			c.s.PipeEnded(pd.id, lane, graceful, used > consumed, now)
+			var cause error
+			if !graceful {
+				cause = err
+			}
+			c.s.PipeEnded(pd.id, lane, graceful, used > consumed, cause, now)
 		}
 		if reads++; reads&63 == 0 && pd.id == 0 && lane == 0 {
 			// The carrier's own minimum RTT feeds auto-tuning.
@@ -285,7 +302,11 @@ func (c *Conn) readMessages(pd *pipeDrv, lane uint64, r io.Reader) {
 		if err == nil {
 			c.s.ReceiveMessage(pd.id, lane, &core.Buf{B: msg}, msg, now)
 		} else {
-			c.s.PipeEnded(pd.id, lane, errors.Is(err, io.EOF), false, now)
+			var cause error
+			if !errors.Is(err, io.EOF) {
+				cause = err
+			}
+			c.s.PipeEnded(pd.id, lane, cause == nil, false, cause, now)
 		}
 		c.unlock()
 		c.passDatagrams()
@@ -316,8 +337,21 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 			core.PutBatch(b)
 		}
 	}()
+	// The carrier's unsent count: the half's own, else the TCP socket's.
+	var unsentOf func() (uint64, bool)
+	if u, ok := w.(unsentReporter); ok {
+		unsentOf = u.Unsent
+	} else if lo == nil && pd.tcp.rc != nil {
+		unsentOf = pd.tcp.unsent
+	}
 	var werr error
 	for {
+		// Read outside the session lock.
+		var unsent uint64
+		var unsentOK bool
+		if unsentOf != nil {
+			unsent, unsentOK = unsentOf()
+		}
 		if lo == nil && pd.takeShutdown() {
 			pd.hc.shutdownWrite()
 		}
@@ -334,6 +368,9 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 			return
 		}
 		now := c.clk.now()
+		if unsentOK {
+			c.s.SetCarrierUnsent(pd.id, lane, unsent)
+		}
 		if reported {
 			c.s.WriteDone(b, werr, now)
 			reported = false
@@ -399,7 +436,7 @@ type batchWriter interface {
 }
 
 // writeBatch hands a batch to the carrier in one call (gather write on a
-// net.Conn).
+// net.Conn or a BuffersWriter).
 func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 	if bw, ok := w.(batchWriter); ok && framing == FramingByteStream {
 		return bw.WriteBatch(b)
@@ -422,10 +459,17 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 	if len(bufs) == 1 {
 		return w.Write(bufs[0])
 	}
+	if _, ok := w.(*tls.Conn); ok {
+		// A gather write would cost a TLS record per buffer.
+		return WriteFlat(w, bufs)
+	}
 	if nc, ok := w.(net.Conn); ok {
 		nb := net.Buffers(bufs)
 		n, err := nb.WriteTo(nc)
 		return int(n), err
+	}
+	if bw, ok := w.(BuffersWriter); ok {
+		return bw.WriteBuffers(bufs)
 	}
 	n := 0
 	for _, p := range bufs {
@@ -477,20 +521,34 @@ func (c *Conn) openLane(pd *pipeDrv) {
 
 // ---- carrier commands ----
 
-// doAction performs a carrier command outside the lock.
-func (c *Conn) doAction(a core.Action) {
-	c.mu.Lock()
-	pd := c.pipes[a.Pipe]
-	var lo *laneOut
-	var start bool
-	if pd != nil {
-		lo = pd.lanes[a.Lane]
+// pendingAct is a carrier command with its attachment, resolved under the
+// lock in the critical section that queued it: a retired attachment leaves
+// c.pipes in a later critical section, which may run before the command is
+// performed, and a command looked up then would be lost (an aborted half
+// that is never closed blocks its goroutine for good).
+type pendingAct struct {
+	a     core.Action
+	pd    *pipeDrv
+	lo    *laneOut
+	start bool
+}
+
+// resolveActionLocked binds a to its attachment (under the lock).
+func (c *Conn) resolveActionLocked(a core.Action) pendingAct {
+	pa := pendingAct{a: a, pd: c.pipes[a.Pipe]}
+	if pd := pa.pd; pd != nil {
+		pa.lo = pd.lanes[a.Lane]
 		if a.Kind == core.ActOpenLane && pd.opener != nil && !c.closing {
 			c.wg.Add(1)
-			start = true
+			pa.start = true
 		}
 	}
-	c.mu.Unlock()
+	return pa
+}
+
+// doAction performs a carrier command outside the lock.
+func (c *Conn) doAction(pa pendingAct) {
+	a, pd, lo, start := pa.a, pa.pd, pa.lo, pa.start
 	if pd == nil {
 		return
 	}
@@ -527,6 +585,7 @@ func (c *Conn) doAction(a core.Action) {
 
 // closeAll closes every half and lane of the attachment.
 func (pd *pipeDrv) closeAll(abort bool) {
+	pd.endChannel()
 	pd.hc.closeAll(abort, net.ErrClosed)
 	pd.c.mu.Lock()
 	lanes := make([]*laneOut, 0, len(pd.lanes))

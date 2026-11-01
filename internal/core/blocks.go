@@ -46,7 +46,8 @@ func (b *block) unref() {
 // sendQ holds the retained bytes of a sending part, [base, end), as slices
 // of pooled blocks or owned small buffers.
 type sendQ struct {
-	segs []seg
+	segs []seg // a window of arr
+	arr  []seg // the segment array, reused as the window moves on
 	tail *block
 	base uint64
 	end  uint64
@@ -85,12 +86,34 @@ func (p pin) unref() {
 	}
 }
 
+// add appends a segment. The window reaching the end of the array moves
+// back to its start when at most half of it is in use, else to an array
+// twice its size, so a queue that keeps being written and released does
+// not allocate.
+func (q *sendQ) add(sg seg) {
+	if n := len(q.segs); n == cap(q.segs) {
+		if n > 0 && n <= len(q.arr)/2 {
+			copy(q.arr, q.segs)
+			clear(q.arr[n:])
+		} else {
+			arr := make([]seg, max(2*n, 4))
+			copy(arr, q.segs)
+			q.arr = arr
+		}
+		q.segs = q.arr[:n]
+	}
+	q.segs = append(q.segs, sg)
+}
+
+// keptSegs is the largest segment array an emptied queue keeps.
+const keptSegs = 64
+
 // writeRef appends a received buffer's bytes without copying; the queue
 // takes one reference of rb.
 func (q *sendQ) writeRef(p []byte, rb *Buf) {
 	q.end += uint64(len(p))
 	rb.Ref()
-	q.segs = append(q.segs, seg{b: p, rb: rb})
+	q.add(seg{b: p, rb: rb})
 	q.tail = nil
 }
 
@@ -98,7 +121,7 @@ func (q *sendQ) writeRef(p []byte, rb *Buf) {
 func (q *sendQ) writePin(p []byte, pn pin) {
 	q.end += uint64(len(p))
 	pn.ref()
-	q.segs = append(q.segs, seg{b: p, blk: pn.blk, rb: pn.rb})
+	q.add(seg{b: p, blk: pn.blk, rb: pn.rb})
 	q.tail = nil
 }
 
@@ -118,14 +141,46 @@ func (q *sendQ) write(p []byte) {
 		c := copy(blk.b[:], p)
 		blk.n = c
 		q.tail = blk
-		q.segs = append(q.segs, seg{b: blk.b[:c:blockSize], blk: blk})
+		q.add(seg{b: blk.b[:c:blockSize], blk: blk})
 		p = p[c:]
 	}
 }
 
+// lendTail returns the block to fill in place next, with a reference for
+// the borrower: the tail block while it has a useful amount of room, else a
+// fresh one.
+func (q *sendQ) lendTail() *block {
+	if n := len(q.segs); n > 0 && q.tail != nil && q.segs[n-1].blk == q.tail && q.tail.n <= blockSize-minLend {
+		q.tail.ref()
+		return q.tail
+	}
+	return getBlock()
+}
+
+// minLend is the least tail room worth lending; below it a fresh block
+// gives the reader a full block to fill.
+const minLend = blockSize / 8
+
+// commitTail appends n bytes the borrower wrote at blk.b[blk.n:] and takes
+// over its reference. The block is still the tail unless the bytes before
+// it were all released meanwhile; then it starts a new segment.
+func (q *sendQ) commitTail(blk *block, n int) {
+	q.end += uint64(n)
+	at := blk.n
+	blk.n += n
+	if k := len(q.segs); k > 0 && q.tail == blk && q.segs[k-1].blk == blk {
+		last := &q.segs[k-1]
+		last.b = last.b[:len(last.b)+n]
+		blk.unref()
+		return
+	}
+	q.tail = blk
+	q.add(seg{b: blk.b[at : at+n : blockSize], blk: blk})
+}
+
 // prepend inserts owned bytes before base (the preamble at ID allocation).
 func (q *sendQ) prepend(p []byte) {
-	q.segs = append(q.segs, seg{})
+	q.add(seg{})
 	copy(q.segs[1:], q.segs)
 	q.segs[0] = seg{b: p}
 	q.end += uint64(len(p))
@@ -150,10 +205,12 @@ func (q *sendQ) peek(off uint64, limit int) ([]byte, pin) {
 	return nil, pin{}
 }
 
-// release drops bytes below off.
+// release drops bytes below off. A queue released to empty keeps a small
+// segment array for the next writes.
 func (q *sendQ) release(off uint64) {
-	for q.base < off && len(q.segs) > 0 {
-		sg := &q.segs[0]
+	k := 0
+	for q.base < off && k < len(q.segs) {
+		sg := &q.segs[k]
 		l := uint64(len(sg.b))
 		if q.base+l <= off {
 			if sg.blk != nil {
@@ -166,18 +223,25 @@ func (q *sendQ) release(off uint64) {
 				sg.rb.Unref()
 			}
 			q.base += l
-			q.segs[0] = seg{}
-			q.segs = q.segs[1:]
+			*sg = seg{}
+			k++
 			continue
 		}
 		cut := off - q.base
 		sg.b = sg.b[cut:]
 		q.base = off
 	}
-	if len(q.segs) == 0 {
+	if k == len(q.segs) {
 		q.segs = nil
+		if len(q.arr) <= keptSegs {
+			q.segs = q.arr[:0]
+		} else {
+			q.arr = nil
+		}
 		q.base = off
+		return
 	}
+	q.segs = q.segs[k:]
 }
 
 // drop releases everything.
@@ -190,7 +254,7 @@ func (q *sendQ) drop() {
 			sg.rb.Unref()
 		}
 	}
-	q.segs = nil
+	q.segs, q.arr = nil, nil
 	q.tail = nil
 	q.base = q.end
 }

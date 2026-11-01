@@ -236,7 +236,7 @@ func (s *Session) probationTimers(now Time, apply bool) Time {
 			}
 		}
 		if a.fate == 0 && apply {
-			busy := a.prob.on || a.out == outSuspect
+			busy := a.prob.on || a.out == OutSuspect
 			a.hist.decay(!busy, now)
 		}
 	}
@@ -246,9 +246,9 @@ func (s *Session) probationTimers(now Time, apply bool) Time {
 			used := false
 			for _, p := range s.pipes {
 				a := p.mp
-				if a != nil && a.fate == key.group && a.joinerLocal == key.local && a.out != outFailed {
+				if a != nil && a.fate == key.group && a.joinerLocal == key.local && a.out != OutFailed {
 					used = true
-					if a.prob.on || a.out == outSuspect {
+					if a.prob.on || a.out == OutSuspect {
 						busy = true
 					}
 				}
@@ -283,7 +283,7 @@ func (s *Session) RevalidatePipes(id uint64, all bool, now Time) error {
 		if a == nil || p.out == nil || (!all && p.id != id) || a.reval {
 			continue
 		}
-		if a.out != outActive && a.out != outJoining {
+		if a.out != OutActive && a.out != OutJoining {
 			continue
 		}
 		a.reval, a.revalPing = true, true
@@ -303,6 +303,20 @@ func (s *Session) revalPingWritten(p *Pipe) {
 	a := p.mp
 	a.revalPing = false
 	a.revalEnd = p.out.snd.so
+}
+
+// pingsAcked counts the PIPE_PINGs on p that the acknowledged position
+// now covers as answered.
+func (s *Session) pingsAcked(p *Pipe) {
+	a := p.mp
+	n := 0
+	for n < len(a.pingEnds) && a.pingEnds[n] <= p.out.snd.cum {
+		n++
+	}
+	if n > 0 {
+		a.pingsAnswered += uint64(n)
+		a.pingEnds = append(a.pingEnds[:0], a.pingEnds[n:]...)
+	}
 }
 
 // revalAcked ends a revalidation whose PIPE_PING is acknowledged.
@@ -356,7 +370,7 @@ func (s *Session) markBusy() {
 	}
 	for _, p := range s.pipes {
 		a := p.mp
-		if a == nil || p.out == nil || a.needPing || a.unacked || (a.out != outActive && a.out != outSuspect) || !s.backup(p) {
+		if a == nil || p.out == nil || a.needPing || a.unacked || (a.out != OutActive && a.out != OutSuspect) || !s.backup(p) {
 			continue
 		}
 		ref := maxT(a.lastElicit, a.liveAt)

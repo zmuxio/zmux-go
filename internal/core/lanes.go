@@ -5,6 +5,7 @@ import (
 	"slices"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // Lanes (MULTIPATH.md 2.5, 5.8). A pipe whose carrier is
@@ -185,7 +186,7 @@ func (s *Session) LaneOpenFailed(pipe uint64) {
 // writeLaneFirst writes the PIPE_LANE record of a new lane.
 func (s *Session) writeLaneFirst(w *recWriter, p *Pipe, ol *outLane) {
 	key := s.peer.LaneKey[:]
-	n := wire.VarintLen(wire.TypePipeLane) + 16 + wire.VarintLen(p.id) + wire.VarintLen(ol.lane)
+	n := varint.SizeVarint(wire.TypePipeLane) + 16 + varint.SizeVarint(p.id) + varint.SizeVarint(ol.lane)
 	if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPipeLane(b, key, p.id, ol.lane) }) {
 		return
 	}

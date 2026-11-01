@@ -195,6 +195,19 @@ func (e *DatagramTooLargeError) Error() string {
 	return fmt.Sprintf("zmux: datagram too large (max %d)", e.MaxDatagramPayloadSize)
 }
 
+// PreambleTooLargeError reports a stream preamble (OPEN_INFO, application
+// TLVs and the rest) above the largest the peer accepts, Max bytes encoded:
+// the peer's limit once known or assumed for early data, else the 1024-byte
+// floor every endpoint accepts. The setter that would exceed it returns it
+// and leaves the preamble as it was; a stream whose limit shrank before it
+// was announced fails with it locally, and nothing of it is sent.
+type PreambleTooLargeError struct{ Max int }
+
+// Error describes the limit.
+func (e *PreambleTooLargeError) Error() string {
+	return fmt.Sprintf("zmux: preamble too large (max %d)", e.Max)
+}
+
 // StreamLimitReachedError reports that no stream credit is available now
 // (OpenStream); OpenStreamSync waits for credit instead.
 type StreamLimitReachedError struct{}
@@ -313,6 +326,8 @@ func apiErr(err error) error {
 			return fmt.Errorf("stream %d: %w", st.StreamID, ErrRejected)
 		case core.StreamGoingAway:
 			return ErrGoingAway
+		case core.StreamPreambleTooLarge:
+			return &PreambleTooLargeError{Max: int(st.Code)}
 		case core.StreamClosedLocally:
 		}
 		return ErrStreamClosed

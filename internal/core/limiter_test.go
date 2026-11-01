@@ -62,7 +62,7 @@ func (p *pathSim) step() {
 		}
 		sentAt := p.flight[i].at
 		r := now.Sub(sentAt)
-		adj := p.rtt.update(r, 0, 25*Millisecond, now)
+		adj := p.rtt.update(r, 0, 25*Millisecond, now, false)
 		j := 0
 		for j+1 < len(p.flight) && p.flight[j+1].end <= ack {
 			j++

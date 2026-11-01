@@ -166,7 +166,7 @@ func (s *Session) writeCopies(d *decision, w *recWriter, q *[]*copyRec) {
 	}
 	cq := *q
 	defer func() { *q = cq }()
-	for len(cq) > 0 && w.dataRoom != 0 {
+	for len(cq) > 0 && !w.dataHeld() {
 		c := cq[0]
 		if s.copyLeft(c) == 0 {
 			c.dead = true
@@ -191,7 +191,7 @@ func (s *Session) writeCopies(d *decision, w *recWriter, q *[]*copyRec) {
 			start = end
 		}
 		n := end - start
-		room := w.room() - wire.StreamHeaderLen(st.id, start, int(n), true)
+		room := w.dataFit(w.room() - wire.StreamHeaderLen(st.id, start, int(n), true))
 		if room <= 0 {
 			return
 		}
@@ -218,7 +218,9 @@ func (s *Session) writeCopies(d *decision, w *recWriter, q *[]*copyRec) {
 		}
 		w.logFrame(frameDesc{kind: dStream, id: st.id, off: start, n: n, fin: fin})
 		w.spendData(n)
+		st.countFrame(start, n)
 		s.stats.BytesRedundant += n
+		p.mp.redundantBytes += n
 		if start+n >= end {
 			c.queued = false
 			cq = cq[1:]

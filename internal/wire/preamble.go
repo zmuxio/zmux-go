@@ -1,5 +1,7 @@
 package wire
 
+import "github.com/zmuxio/zmux-go/varint"
+
 // Preamble TLV types (EXTENSIONS.md 4.3).
 const (
 	TLVOpenInfo    uint64 = 0x01
@@ -42,7 +44,7 @@ type Preamble struct {
 func ParsePreamble(data []byte, limit uint64, dst *Preamble) *Error {
 	app := dst.App[:0]
 	*dst = Preamble{}
-	l, n := ReadVarint(data)
+	l, n := varint.ConsumeVarint(data)
 	if n == 0 {
 		return ErrProto("preamble Length incomplete")
 	}
@@ -92,8 +94,8 @@ func ParsePreamble(data []byte, limit uint64, dst *Preamble) *Error {
 }
 
 func appendTLV(b []byte, t uint64, v []byte) []byte {
-	b = AppendVarint(b, t)
-	b = AppendVarint(b, uint64(len(v)))
+	b = varint.AppendVarint(b, t)
+	b = varint.AppendVarint(b, uint64(len(v)))
 	return append(b, v...)
 }
 
@@ -113,7 +115,7 @@ type PreambleSpec struct {
 // BodyLen is the length of the TLVs.
 func (s *PreambleSpec) BodyLen() int {
 	n := 0
-	tl := func(t uint64, l int) { n += VarintLen(t) + VarintLen(uint64(l)) + l }
+	tl := func(t uint64, l int) { n += varint.SizeVarint(t) + varint.SizeVarint(uint64(l)) + l }
 	if s.HasOpenInfo {
 		tl(TLVOpenInfo, len(s.OpenInfo))
 	}
@@ -135,12 +137,12 @@ func (s *PreambleSpec) BodyLen() int {
 // Size is the encoded preamble size.
 func (s *PreambleSpec) Size() int {
 	l := s.BodyLen()
-	return VarintLen(uint64(l)) + l
+	return varint.SizeVarint(uint64(l)) + l
 }
 
 // AppendPreamble encodes the preamble.
 func AppendPreamble(b []byte, s *PreambleSpec) []byte {
-	b = AppendVarint(b, uint64(s.BodyLen()))
+	b = varint.AppendVarint(b, uint64(s.BodyLen()))
 	if s.HasOpenInfo {
 		b = appendTLV(b, TLVOpenInfo, s.OpenInfo)
 	}

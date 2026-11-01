@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // ---- parameters by name ----
@@ -71,7 +72,7 @@ func encodeParamValue(name string, v any) []byte {
 	case "zmux_role":
 		m := v.(map[string]any)
 		role := map[string]uint64{"initiator": 0, "responder": 1, "auto": 2}[m["role"].(string)]
-		b := wire.AppendVarint(nil, role)
+		b := varint.AppendVarint(nil, role)
 		if n, ok := m["nonce"]; ok {
 			x := num(n)
 			for i := 7; i >= 0; i-- {
@@ -88,10 +89,10 @@ func encodeParamValue(name string, v any) []byte {
 		return append(b, loc...)
 	case "zmux_max_lanes":
 		m := v.(map[string]any)
-		b := wire.AppendVarint(nil, num(m["max_lanes"]))
+		b := varint.AppendVarint(nil, num(m["max_lanes"]))
 		return append(b, hexb(m["lane_key"])...)
 	}
-	return wire.AppendVarint(nil, num(v))
+	return varint.AppendVarint(nil, num(v))
 }
 
 // paramsFromMap builds wire.Params from a profile's tp map without
@@ -253,12 +254,12 @@ func (c *encodeCtx) encodeFrame(b []byte, f map[string]any) []byte {
 			t |= 1
 		}
 		b = append(b, t)
-		b = wire.AppendVarint(b, getU(f, "id"))
+		b = varint.AppendVarint(b, getU(f, "id"))
 		if hasOff {
-			b = wire.AppendVarint(b, off)
+			b = varint.AppendVarint(b, off)
 		}
 		if hasLen {
-			b = wire.AppendVarint(b, uint64(len(data)))
+			b = varint.AppendVarint(b, uint64(len(data)))
 		}
 		return append(b, data...)
 	case "RESET_STREAM":
@@ -311,8 +312,8 @@ func (c *encodeCtx) encodeFrame(b []byte, f map[string]any) []byte {
 			} else {
 				v = encodeParamValue(name, p["value"])
 			}
-			block = wire.AppendVarint(block, id)
-			block = wire.AppendVarint(block, uint64(len(v)))
+			block = varint.AppendVarint(block, id)
+			block = varint.AppendVarint(block, uint64(len(v)))
 			block = append(block, v...)
 		}
 		return wire.AppendTransportParams(b, block)
@@ -334,14 +335,14 @@ func (c *encodeCtx) encodeFrame(b []byte, f map[string]any) []byte {
 		for _, ev := range ents {
 			e := ev.(map[string]any)
 			pos, ph := c.intField(e["position"])
-			b = wire.AppendVarint(b, getU(e, "pipe"))
-			b = wire.AppendVarint(b, getU(e, "lane"))
+			b = varint.AppendVarint(b, getU(e, "pipe"))
+			b = varint.AppendVarint(b, getU(e, "lane"))
 			if ph {
-				b = wire.AppendVarintN(b, pos, 4)
+				b = varint.AppendVarintN(b, pos, 4)
 			} else {
-				b = wire.AppendVarint(b, pos)
+				b = varint.AppendVarint(b, pos)
 			}
-			b = wire.AppendVarint(b, getU(e, "delay"))
+			b = varint.AppendVarint(b, getU(e, "delay"))
 		}
 		return b
 	case "PIPE_LANE":
@@ -362,7 +363,7 @@ func (c *encodeCtx) encodeRecords(recs []any) []byte {
 	var out []byte
 	for _, r := range recs {
 		body := c.encodeBody(r)
-		out = wire.AppendVarint(out, uint64(len(body)))
+		out = varint.AppendVarint(out, uint64(len(body)))
 		out = append(out, body...)
 	}
 	return out
@@ -565,8 +566,8 @@ func matchParams(pat, got map[string]any) bool {
 	var ps []pv
 	b := block
 	for len(b) > 0 {
-		id, n := wire.ReadVarint(b)
-		l, m := wire.ReadVarint(b[n:])
+		id, n := varint.ConsumeVarint(b)
+		l, m := varint.ConsumeVarint(b[n:])
 		ps = append(ps, pv{id, b[n+m : n+m+int(l)]})
 		b = b[n+m+int(l):]
 	}

@@ -19,12 +19,19 @@ import (
 // template points to; the request target and headers are otherwise
 // ignored. The bytes it holds for its carriers count against the
 // listener's memory budget.
+//
+// Once the listener is closed (Listener.Close or Shutdown) or the handler
+// is, a request for a new carrier is answered with GONE, so the client
+// fails it at once. Carriers already serving sessions continue: they end
+// with their sessions, as other carriers do, or all at once with Close.
 type HTTPExchangeHandler struct {
 	l      *Listener
 	p      exParams
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup // HandlePipe goroutines
+
+	nonces *replayCache
 
 	mu       sync.Mutex
 	closed   bool
@@ -39,12 +46,19 @@ type exGone struct {
 }
 
 // NewHTTPExchangeHandler returns a handler that serves exchange carriers
-// into l. cfg may be nil.
-func NewHTTPExchangeHandler(l *Listener, cfg *HTTPExchangeConfig) *HTTPExchangeHandler {
-	h := &HTTPExchangeHandler{l: l, p: cfg.resolve(),
+// into l. An invalid cfg (nil, without a PSK and AllowInsecure, or with an
+// invalid Admission) is an ErrInvalidConfig error.
+func NewHTTPExchangeHandler(l *Listener, cfg *HTTPExchangeConfig) (*HTTPExchangeHandler, error) {
+	p, err := cfg.resolve()
+	if err != nil {
+		return nil, err
+	}
+	h := &HTTPExchangeHandler{l: l, p: p,
 		carriers: map[[exCIDLen]byte]*exServer{}, gone: map[[exCIDLen]byte]*exKey{}}
+	skew := int64(p.skew / time.Second)
+	h.nonces = newReplayCache(2*skew+1, max(skew, 1), p.nonceCache)
 	h.ctx, h.cancel = context.WithCancel(context.Background())
-	return h
+	return h, nil
 }
 
 // Close fails every carrier, refuses new requests and returns once the
@@ -65,168 +79,213 @@ func (h *HTTPExchangeHandler) Close() error {
 	return nil
 }
 
-// ServeHTTP answers one exchange request.
+// ServeHTTP answers one exchange request. A request that is not an
+// authenticated, fresh exchange request is served by the fallback
+// (HTTPExchangeConfig.Next) with its body replayed, and changes nothing.
 func (h *HTTPExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if ClassifyHTTP(r) != HTTPClassExchange {
+		h.p.http.Fallback(w, r)
 		return
 	}
-	limit := exReqHdrMax + h.p.upPiece
+	if earlyRequest(r) {
+		w.WriteHeader(http.StatusTooEarly)
+		h.l.CountSetupFailure() // it needs the handshake: no pipe input
+		return
+	}
+	limit := exReqHdrMax + h.p.upLimit
 	if h.p.b64 {
 		limit = b64Len(limit)
 	}
-	switch {
-	case r.ContentLength < 0:
-		http.Error(w, "length required", http.StatusLengthRequired)
-		return
-	case r.ContentLength > int64(limit):
-		h.tooLarge(w, r)
+	if r.ContentLength > int64(limit) {
+		h.p.http.Fallback(w, r)
 		return
 	}
-	buf, body, err := readExBody(r.Body, int(r.ContentLength), h.p.b64)
+	cl := int(r.ContentLength)
+	raw := getExBuf(cl)
+	defer raw.unref()
+	n, err := io.ReadFull(r.Body, raw.b[:cl])
 	if err != nil {
-		http.Error(w, "bad body", http.StatusBadRequest)
+		// The body ended before its Content-Length (its client aborted
+		// it): the fallback gets what arrived and then the same error,
+		// as it would have read it, not a body that seems complete.
+		r.Body = &replayBody{Reader: io.MultiReader(bytesReader(raw.b[:n]), errReader{err}), c: r.Body}
+		h.p.http.Fallback(w, r)
 		return
+	}
+	buf, body := raw, raw.b[:cl]
+	if h.p.b64 {
+		dec := getExBuf(base64.StdEncoding.DecodedLen(cl))
+		m, err := base64.StdEncoding.Strict().Decode(dec.b, raw.b[:cl])
+		if err != nil {
+			dec.unref()
+			h.fallback(w, r, raw.b[:cl])
+			return
+		}
+		buf, body = dec, dec.b[:m]
+		defer dec.unref()
 	}
 	// The request's fields alias buf until the response is written.
-	defer buf.unref()
 	q, ok := parseExReq(body)
 	if !ok {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		h.fallback(w, r, raw.b[:cl])
 		return
 	}
-	if !q.valid {
-		h.invalid(w, &q)
-		return
-	}
-	c, key, flags := h.lookup(r, &q)
+	c, key, gone := h.authenticate(&q)
 	switch {
 	case key == nil:
-		http.Error(w, "forbidden", http.StatusForbidden)
-	case c == nil:
-		h.respond(w, key, &q, flags, nil)
-	default:
+		h.fallback(w, r, raw.b[:cl])
+	case !q.valid:
+		// Authenticated, but its fields are malformed.
+		if c != nil {
+			c.fail(errExchangeProtocol)
+		}
+		h.respond(w, key, &q, exFlagGone, nil)
+	case c != nil:
 		buf.ref() // serve's own reference: an UP piece keeps it
+		c.serve(w, r, &q, buf)
+	case gone:
+		h.respond(w, key, &q, exFlagGone, nil)
+	default:
+		c, flags := h.create(w, r, &q, key, raw.b[:cl])
+		if flags == exAnswered {
+			return
+		}
+		if c == nil {
+			h.respond(w, key, &q, flags, nil)
+			return
+		}
+		buf.ref()
 		c.serve(w, r, &q, buf)
 	}
 }
 
-// tooLarge answers an UP request over the local body limit with GONE
-// (Section 8): a configuration mismatch the client does not retry. Only
-// the request's header is read; the request is not authenticated, so it
-// changes nothing.
-func (h *HTTPExchangeHandler) tooLarge(w http.ResponseWriter, r *http.Request) {
-	n := exReqHdrMax
-	if h.p.b64 {
-		n = b64Len(n)
+// exAnswered is create's flags for a request the admission answered.
+const exAnswered = 0xff
+
+// fallback serves a request that is not authenticated with the fallback,
+// the bytes read from its body put back in front of the rest.
+func (h *HTTPExchangeHandler) fallback(w http.ResponseWriter, r *http.Request, read []byte) {
+	if len(read) > 0 {
+		r.Body = &replayBody{Reader: io.MultiReader(bytesReader(read), r.Body), c: r.Body}
 	}
-	buf, b, err := readExBody(r.Body, n, h.p.b64)
-	if err != nil {
-		http.Error(w, "too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	defer buf.unref()
-	q, ok := parseExReq(b)
-	if !ok || !q.valid || q.kind != exKindUp {
-		http.Error(w, "too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	h.mu.Lock()
-	key, gone := h.goneLocked(q.cid)
-	if c := h.carriers[q.cid]; c != nil {
-		key, gone = c.key, true
-	}
-	h.mu.Unlock()
-	if !gone {
-		key = newExKey(h.p.psk, q.cid[:])
-	}
-	h.respond(w, key, &q, exFlagGone, nil)
+	h.p.http.Fallback(w, r)
 }
 
-// invalid answers an authenticated request whose fields violate Section 3
-// with GONE and fails its carrier, if any; it creates none.
-func (h *HTTPExchangeHandler) invalid(w http.ResponseWriter, q *exReq) {
-	h.mu.Lock()
-	c := h.carriers[q.cid]
-	key, gone := h.goneLocked(q.cid)
-	h.mu.Unlock()
-	switch {
-	case c != nil:
-		key = c.key
-	case !gone:
-		key = newExKey(h.p.psk, q.cid[:])
-	}
-	if m := key.requestMAC(q.hdr, q.data); !hmac.Equal(m[:], q.mac) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	if c != nil {
-		c.fail(errExchangeProtocol)
-	}
-	h.respond(w, key, q, exFlagGone, nil)
-}
-
-// lookup finds or creates the carrier of a request whose MAC verifies. key
-// is nil when the MAC does not verify. Without a carrier, flags is the
-// answer: GONE for a remembered carrier, BUSY for one that cannot be
-// created, processed for a CLOSE of an unknown carrier.
-func (h *HTTPExchangeHandler) lookup(r *http.Request, q *exReq) (c *exServer, key *exKey, flags byte) {
+// authenticate verifies q's MAC with the key of its carrier (live c,
+// remembered as gone, or new), then its freshness: its Time within
+// MaxClockSkew of the clock and its (Carrier ID, Nonce) not seen before.
+// key is nil when q is not authenticated.
+func (h *HTTPExchangeHandler) authenticate(q *exReq) (c *exServer, key *exKey, gone bool) {
 	h.mu.Lock()
 	c = h.carriers[q.cid]
 	g, gone := h.goneLocked(q.cid)
-	closed := h.closed
 	h.mu.Unlock()
-	verify := func(k *exKey) bool {
-		m := k.requestMAC(q.hdr, q.data)
-		return hmac.Equal(m[:], q.mac)
-	}
 	switch {
 	case c != nil:
-		if !verify(c.key) {
-			return nil, nil, 0
-		}
-		return c, c.key, 0
+		key, gone = c.key, false
 	case gone:
-		if !verify(g) {
-			return nil, nil, 0
-		}
-		return nil, g, exFlagGone
+		key = g
+	default:
+		key = newExKey(h.p.psk, q.cid[:])
 	}
-	key = newExKey(h.p.psk, q.cid[:])
-	if !verify(key) {
-		return nil, nil, 0
+	if m := key.requestMAC(q.hdr, q.data); !hmac.Equal(m[:], q.mac) {
+		return nil, nil, false
 	}
+	now := time.Now().Unix()
+	skew := int64(h.p.skew / time.Second)
+	d := int64(int32(q.ts - uint32(now))) // the difference, modulo 2^32
+	if d < -skew || d > skew {
+		return nil, nil, false
+	}
+	var k replayKey
+	copy(k[:], q.cid[:])
+	copy(k[exCIDLen:], q.nonce)
+	if !h.nonces.add(k, now+d, now-skew) {
+		return nil, nil, false
+	}
+	return c, key, gone
+}
+
+// create creates the carrier of an authenticated request for an unknown
+// Carrier ID. Without a carrier, flags is the answer: GONE when the
+// handler or its listener is closed, BUSY under memory pressure or when the
+// listener refuses the carrier (its source holds its share of pending
+// carriers, ListenerConfig.MaxPendingPerSource), processed
+// for a CLOSE (which creates none and remembers the carrier as gone).
+//
+// The request that creates a carrier takes a slot of its source and
+// passes the listener's admission, decided on its head; one that is not
+// accepted has been answered (the fallback, or the request aborted) and
+// create returns exAnswered.
+func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *exReq, key *exKey, read []byte) (*exServer, byte) {
 	if q.kind == exKindClose {
 		h.mu.Lock()
 		h.forgetLocked(q.cid, key)
 		h.mu.Unlock()
-		return nil, key, 0
+		return nil, 0
 	}
-	if closed || h.l.budget.Pressure() {
-		return nil, key, exFlagBusy
+	h.mu.Lock()
+	closed := h.closed
+	h.mu.Unlock()
+	switch {
+	case closed || h.l.isClosed():
+		return nil, exFlagGone
+	case h.l.budget.Pressure():
+		return nil, exFlagBusy
+	}
+	a, err := h.l.Arrive(requestSource(h.p.http.Trusted, r))
+	if err != nil {
+		return nil, exFlagBusy // the source holds its share
+	}
+	if !a.decideRequest(w, r, false, func() { h.fallback(w, r, read) }) {
+		return nil, exAnswered
 	}
 	nc := newExServer(h, q.cid, key)
 	h.mu.Lock()
 	if old := h.carriers[q.cid]; old != nil {
 		h.mu.Unlock()
-		return old, old.key, 0 // created concurrently
+		nc.idle.Stop()
+		a.Release()
+		return old, 0 // created concurrently
 	}
-	if h.closed {
+	if _, gone := h.goneLocked(q.cid); gone || h.closed {
 		h.mu.Unlock()
-		return nil, key, exFlagBusy
+		nc.idle.Stop()
+		a.Release()
+		return nil, exFlagGone
 	}
 	h.carriers[q.cid] = nc
 	h.wg.Add(1)
 	h.mu.Unlock()
-	hint := JoinHint{}
-	if a, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		hint.Source = a
+	// The listener takes or refuses the carrier now, before it waits for
+	// anything: one it refuses is answered BUSY and leaves no state, live
+	// or gone.
+	a.takeSlot()
+	run, err := h.l.take(PipeIO{R: &exServerReader{nc}, W: &exServerWriter{nc},
+		Carrier: CarrierExchange}, JoinHint{Source: a.src}, a.key)
+	if err != nil {
+		h.mu.Lock()
+		if h.carriers[q.cid] == nc {
+			delete(h.carriers, q.cid)
+		}
+		if _, gone := h.gone[q.cid]; gone {
+			if n := len(h.goneQ); n > 0 && h.goneQ[n-1].cid == q.cid {
+				// Remembered by the refused pipe's close just now.
+				delete(h.gone, q.cid)
+				h.goneQ[n-1] = exGone{}
+				h.goneQ = h.goneQ[:n-1]
+			}
+		}
+		h.mu.Unlock()
+		nc.idle.Stop()
+		h.wg.Done()
+		return nil, exFlagBusy
 	}
 	go func() {
 		defer h.wg.Done()
-		_ = h.l.HandlePipe(h.ctx, PipeIO{R: &exServerReader{nc}, W: &exServerWriter{nc}}, hint)
+		_ = run(h.ctx)
 	}()
-	return nc, key, 0
+	return nc, 0
 }
 
 // goneLocked looks a remembered carrier up, forgetting the expired ones.
@@ -293,22 +352,22 @@ type exServer struct {
 	rc, wc   sync.Cond     // uplink reader, downlink writer
 	assigned chan struct{} // closed and replaced when a piece is assigned
 	dead     chan struct{} // closed when the carrier ends
-	ended    bool
-	err      error // failure seen by zmux (nil: completed)
+	err      error         // failure seen by zmux (nil: completed)
 	last     time.Time
 	idle     *time.Timer
 	coal     *time.Timer
 	mem      int64 // charged to the listener's budget
+	ended    bool
 
 	// uplink
+	upFinOK bool
+	rclosed bool
 	upNext  uint64              // lowest number not received
 	upMax   uint64              // highest number received plus one
 	upOOO   map[uint64]*exPiece // received above upNext
 	upQ     []*exPiece          // contiguous, not yet read by zmux
-	upLen   int                 // bytes in upOOO and upQ
+	upLen   int                 // bytes in upOOO and upQ, and exPieceCost per piece in upOOO
 	upFin   uint64
-	upFinOK bool
-	rclosed bool
 
 	// downlink
 	ack     uint64               // highest Down Ack received
@@ -318,9 +377,9 @@ type exServer struct {
 	cur     *exBuf               // bytes of piece fill
 	curLen  int
 	curAt   time.Time
-	nheld   int // held DOWN requests
-	wclosed bool
+	nheld   int    // held DOWN requests
 	finLow  uint64 // lowest FIN piece, when finOK
+	wclosed bool
 	finOK   bool
 }
 
@@ -355,7 +414,7 @@ func (c *exServer) onIdle() {
 	}
 	if c.nheld == 0 {
 		if rest := c.h.p.idle - time.Since(c.last); rest <= 0 {
-			// Both FINs on their way: released as complete (Section 7.4).
+			// Both FINs on their way: released as complete.
 			err := errExchangeIdle
 			if c.upFinOK && c.upNext > c.upFin && c.finOK {
 				err = nil
@@ -452,7 +511,7 @@ func (c *exServer) releaseLocked(a *exAssign) {
 	}
 }
 
-// completeLocked ends a completed carrier (Section 7.4).
+// completeLocked ends a completed carrier.
 func (c *exServer) completeLocked() bool {
 	if c.upFinOK && c.upNext > c.upFin && c.finOK && c.ack > c.finLow {
 		return c.endLocked(nil)
@@ -524,7 +583,11 @@ func (c *exServer) serve(w http.ResponseWriter, r *http.Request, q *exReq, buf *
 	h.respond(w, c.key, q, flags, nil)
 }
 
-// upLocked stores an UP piece (Section 7.2); it owns buf and returns the
+// exPieceCost is what an UP piece held out of order counts against the
+// uplink store besides its bytes.
+const exPieceCost = 64
+
+// upLocked stores an UP piece; it owns buf and returns the
 // response flags.
 func (c *exServer) upLocked(q *exReq, buf *exBuf) byte {
 	n, fin := q.seq, q.flags&exFlagFin != 0
@@ -540,25 +603,33 @@ func (c *exServer) upLocked(q *exReq, buf *exBuf) byte {
 		return 0
 	}
 	p := &exPiece{fin: fin}
-	if len(q.data) > 0 && !c.rclosed {
-		room := c.h.p.upStore
-		if n != c.upNext {
-			// Out of order: leave room for the piece zmux waits for.
-			room -= c.h.p.upPiece
-			if c.h.l.budget.Pressure() {
-				room = 0
-			}
+	keep := len(q.data) > 0 && !c.rclosed
+	need := 0
+	if keep {
+		need = len(q.data)
+	}
+	room := c.h.p.upStore
+	if n != c.upNext {
+		// Out of order: leave room for the piece zmux waits for, and count
+		// a fixed cost per held piece, empty ones too, so that their
+		// number is bounded.
+		room -= c.h.p.upLimit
+		if c.h.l.budget.Pressure() {
+			room = 0
 		}
-		if c.upLen+len(q.data) > room {
-			buf.unref()
-			return exFlagBusy
-		}
+		need += exPieceCost
+	}
+	if need > 0 && c.upLen+need > room {
+		buf.unref()
+		return exFlagBusy
+	}
+	if keep {
 		p.buf, p.data = buf, q.data
-		c.upLen += len(q.data)
 		c.charge(int64(len(buf.b)))
 	} else {
 		buf.unref()
 	}
+	c.upLen += need
 	if fin {
 		c.upFin, c.upFinOK = n, true
 	}
@@ -575,6 +646,7 @@ func (c *exServer) upLocked(q *exReq, buf *exBuf) byte {
 			break
 		}
 		delete(c.upOOO, c.upNext)
+		c.upLen -= exPieceCost
 		c.upQ = append(c.upQ, x)
 		c.upNext++
 	}
@@ -582,7 +654,7 @@ func (c *exServer) upLocked(q *exReq, buf *exBuf) byte {
 	return 0
 }
 
-// down answers a DOWN request (Section 7.3); it is called locked and
+// down answers a DOWN request; it is called locked and
 // unlocks.
 func (c *exServer) down(w http.ResponseWriter, r *http.Request, q *exReq) {
 	h := c.h

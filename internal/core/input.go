@@ -2,6 +2,7 @@ package core
 
 import (
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 var tpTypeBytes = [8]byte{0xff, 0x51, 0x53, 0x30, 0x0d, 0x0a, 0x0d, 0x0a}
@@ -37,7 +38,7 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 				return len(data)
 			}
 		}
-		size, n := wire.ReadVarint(rest)
+		size, n := varint.ConsumeVarint(rest)
 		if n == 0 {
 			break
 		}
@@ -79,7 +80,7 @@ func (s *Session) ReceiveMessage(pipe, lane uint64, buf *Buf, msg []byte, now Ti
 			return
 		}
 	}
-	posBytes := uint64(wire.VarintLen(uint64(len(msg))) + len(msg))
+	posBytes := uint64(varint.SizeVarint(uint64(len(msg))) + len(msg))
 	s.processRecord(p, il, buf, msg, posBytes)
 }
 
@@ -89,7 +90,7 @@ func (s *Session) checkFirstRecord(b []byte) *wire.Error {
 	if len(b) == 0 {
 		return nil
 	}
-	size, n := wire.ReadVarint(b)
+	size, n := varint.ConsumeVarint(b)
 	if n == 0 {
 		// Size incomplete: its first byte alone cannot reject except an
 		// impossible length class; wait.
@@ -109,6 +110,7 @@ func (s *Session) checkFirstRecord(b []byte) *wire.Error {
 // recordFacts is what one processed record carried.
 type recordFacts struct {
 	elicit   bool
+	other    bool // an ack-eliciting frame other than PIPE_PING
 	activity bool
 	onlyPad  bool
 	pipePing bool
@@ -128,6 +130,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 		}
 	}
 	first := il.expectTP
+	size := len(rec)
 	facts := recordFacts{onlyPad: true}
 	var f wire.Frame
 	idx := 0
@@ -149,7 +152,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 		if il.skipJoin && idx == 0 && f.Kind == wire.KindPipeJoin {
 			il.skipJoin = false
 			facts.onlyPad = false
-			facts.elicit = true
+			facts.elicit, facts.other = true, true
 			rec = rec[n:]
 			idx++
 			continue
@@ -160,7 +163,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 				return
 			}
 			facts.onlyPad = false
-			facts.elicit = true
+			facts.elicit, facts.other = true, true
 			rec = rec[n:]
 			idx++
 			continue
@@ -185,7 +188,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 				return
 			}
 			facts.onlyPad = false
-			facts.elicit = true
+			facts.elicit, facts.other = true, true
 			rec = rec[n:]
 			idx++
 			continue
@@ -203,6 +206,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 		}
 		if f.Kind.AckEliciting() {
 			facts.elicit = true
+			facts.other = facts.other || f.Kind != wire.KindPipePing
 		}
 		switch f.Kind {
 		case wire.KindStream, wire.KindResetStream, wire.KindResetStreamAt, wire.KindStopSending,
@@ -238,16 +242,19 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 		idx++
 	}
 	il.expectLane = false
-	if facts.onlyPad && s.peerSeen {
-		s.charge()
-	}
 	il.pos += posBytes
 	il.recs++
 	il.posAt = s.now
 	s.stats.BytesReceived += posBytes
 	s.stats.RecordsReceived++
+	if s.shp != nil {
+		s.shapeRecordIn(p, il.lane, size, facts.onlyPad)
+	}
 	if s.ack != nil {
 		s.ack.onRecord(il, posBytes, facts, s.now)
+	}
+	if facts.traffic {
+		p.lastTraffic = s.now
 	}
 	if a := p.mp; a != nil {
 		if facts.traffic {
@@ -257,10 +264,10 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 			a.maxGap = g
 		}
 		a.lastRecord = s.now
-		if a.in == inJoining {
-			a.in = inOpen
-			if a.out == outJoining {
-				a.out = outActive
+		if a.in == InJoining {
+			a.in = InOpen
+			if a.out == OutJoining {
+				a.out = OutActive
 			}
 			s.joinConfirmed(p)
 		}
@@ -394,7 +401,7 @@ func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
 	case wire.KindClose:
 		s.onClose(f)
 	case wire.KindDatagram:
-		return s.onDatagram(f)
+		return s.onDatagram(f, false)
 	case wire.KindPing:
 		return s.onPing(f)
 	case wire.KindGoAway:
@@ -440,9 +447,10 @@ func splitDetails(r string) (string, string) {
 	return r, ""
 }
 
-// PipeEnded reports the end of an inbound lane: graceful (eof) or failed.
-// The driver calls it after feeding every complete record it read.
-func (s *Session) PipeEnded(pipe, lane uint64, graceful bool, partial bool, now Time) {
+// PipeEnded reports the end of an inbound lane: graceful (eof) or failed
+// with cause (the read error, if any). The driver calls it after feeding
+// every complete record it read.
+func (s *Session) PipeEnded(pipe, lane uint64, graceful bool, partial bool, cause error, now Time) {
 	s.SetNow(now)
 	p := s.pipe(pipe)
 	if p == nil || p.in == nil {
@@ -471,12 +479,12 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful bool, partial bool, now 
 	failed := (!graceful || partial) && !early
 	if s.feat.Multipath {
 		if failed || allEnded {
-			s.mpInboundEnded(p, !failed)
+			s.mpInboundEnded(p, !failed, cause)
 		}
 		return
 	}
 	if failed {
-		s.closeWith(&SessionError{Kind: ClosePipesLost}, nil)
+		s.closeWith(&SessionError{Kind: ClosePipesLost, Cause: cause}, nil)
 		return
 	}
 	if !allEnded {
@@ -492,6 +500,9 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful bool, partial bool, now 
 
 // PipeWriteFailed reports a failed write on an outbound lane.
 func (s *Session) pipeWriteFailed(pipe, lane uint64, err error) {
+	if p := s.pipe(pipe); s.shp != nil && lane == 0 && p != nil {
+		s.shapePipeDown(p)
+	}
 	if s.state >= StateClosing {
 		if s.state == StateClosing {
 			if p := s.pipe(pipe); p != nil && p.out != nil {

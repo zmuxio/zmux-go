@@ -103,7 +103,7 @@ func FloorParams() wire.Params {
 		InitialMaxData:       16384,
 		MaxStreamsBidi:       4,
 		MaxStreamDataBidiRem: 4096,
-		Preamble:             1024,
+		Preamble:             floorPreamble,
 		MaxRecordSize:        wire.DefaultMaxRecordSize,
 	}
 }

@@ -2,6 +2,7 @@ package core
 
 import (
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // ackState is the acknowledgement machinery of a session with
@@ -15,6 +16,12 @@ type ackState struct {
 	peerDelay Duration // peer's zmux_max_ack_delay
 	immediate bool     // a PIPE_PING asked for an immediate PIPE_ACK
 	woken     bool     // the delay expired and the writers were woken
+	// Since the last PIPE_ACK that discharged the acknowledgement: an
+	// ack-eliciting frame other than PIPE_PING arrived (other), and a
+	// PIPE_PING arrived on a pipe pair without a usable outbound direction
+	// (pairless). Either sends the answer to a PIPE_PING on the primary
+	// pipe too (MULTIPATH.md 6.5).
+	other, pairless bool
 }
 
 // pipeSend is the sender's view of an outbound pipe as a whole, counted
@@ -43,8 +50,9 @@ type sample struct {
 	delivered   uint64
 	deliveredAt Time
 	firstSentAt Time
-	epoch       uint64 // rateEst.blockEpoch at send
-	bubble      bool   // sent while an application-limited bubble was in flight
+	epoch       uint64    // rateEst.blockEpoch at send
+	bubble      bool      // sent while an application-limited bubble was in flight
+	ahead       aheadSnap // when it was handed over
 }
 
 // rttEst is RFC 9002 Section 5 with a 300 s minimum filter.
@@ -57,8 +65,11 @@ type rttEst struct {
 	latest   Duration
 }
 
-// update takes one sample and returns the adjusted value.
-func (r *rttEst) update(sample, ackDelay, maxAckDelay Duration, now Time) Duration {
+// update takes one sample and returns the adjusted value. A quiet sample
+// (taken while the session is quiet, its answer returning on the probed
+// pipe pair) does not enter the minimum once there is one (SCHEDULER.md
+// 2.1).
+func (r *rttEst) update(sample, ackDelay, maxAckDelay Duration, now Time, quiet bool) Duration {
 	r.latest = sample
 	if !r.has {
 		r.has = true
@@ -69,7 +80,7 @@ func (r *rttEst) update(sample, ackDelay, maxAckDelay Duration, now Time) Durati
 	}
 	// The minimum of the last 300 s; a minimum older than that gives way
 	// to the current sample.
-	if sample <= r.min || now.Sub(r.minAt) > 300*Second {
+	if !quiet && (sample <= r.min || now.Sub(r.minAt) > 300*Second) {
 		r.min, r.minAt = sample, now
 	}
 	adj := sample
@@ -103,17 +114,12 @@ func newAckState(s *Session) *ackState {
 // srttMax is the largest smoothed RTT over outbound lanes with a sample.
 func (a *ackState) srttMax() Duration {
 	var m Duration
-	if a.s.mp != nil {
-		for _, p := range a.s.pipes {
-			if p.mp != nil && p.out != nil && p.mp.liveOut() && p.mp.rtt.smoothed > m {
-				m = p.mp.rtt.smoothed
-			}
-		}
-		return m
-	}
 	for _, p := range a.s.pipes {
-		if p.out != nil && p.out.snd.rtt.has && p.out.snd.rtt.smoothed > m {
-			m = p.out.snd.rtt.smoothed
+		if p.out == nil || !p.liveOut() {
+			continue
+		}
+		if d, ok := p.srtt(); ok && d > m {
+			m = d
 		}
 	}
 	return m
@@ -130,6 +136,7 @@ func (a *ackState) onRecord(il *inLane, n uint64, f recordFacts, now Time) {
 	if f.pipePing {
 		a.immediate = true
 	}
+	a.other = a.other || f.other
 	if a.due(now) {
 		a.s.wakeAllWriters()
 	}
@@ -197,13 +204,16 @@ func (a *ackState) write(w *recWriter, _ *Pipe, now Time) {
 
 // writeSnapshot writes the positions of every inbound pipe and lane that
 // is not retired and has a position above 0 (MULTIPATH.md 6.2), split
-// over several frames when it does not fit one.
-func (a *ackState) writeSnapshot(w *recWriter, _ bool) {
+// over several frames when it does not fit one. With discharge the
+// snapshot ends the pending acknowledgement; without, it is a copy (the
+// answer on a probed pipe pair that the primary pipe sends as well). It
+// reports whether the whole snapshot was written.
+func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 	now := a.s.now
 	var ents [16]wire.AckEntry
 	es := ents[:0]
 	for _, p := range a.s.pipes {
-		if p.in == nil || p.mp != nil && p.mp.retired {
+		if p.in == nil || p.retired() {
 			continue
 		}
 		for _, il := range p.in.lanes {
@@ -218,15 +228,17 @@ func (a *ackState) writeSnapshot(w *recWriter, _ bool) {
 		}
 	}
 	if len(es) == 0 {
-		a.immediate = false
-		return
+		if discharge {
+			a.immediate, a.other, a.pairless = false, false, false
+		}
+		return true
 	}
 	sortEntries(es)
 	for len(es) > 0 {
 		k := len(es)
 		n := 0
 		for {
-			n = wire.VarintLen(wire.TypePipeAck) + wire.VarintLen(uint64(k))
+			n = varint.SizeVarint(wire.TypePipeAck) + varint.SizeVarint(uint64(k))
 			for _, e := range es[:k] {
 				n += wire.AckEntryLen(e)
 			}
@@ -243,11 +255,14 @@ func (a *ackState) writeSnapshot(w *recWriter, _ bool) {
 			}
 			return b
 		}) {
-			return
+			return false
 		}
 		es = es[k:]
 	}
-	a.immediate, a.woken = false, false
+	if !discharge {
+		return true
+	}
+	a.immediate, a.woken, a.other, a.pairless = false, false, false, false
 	for _, p := range a.s.pipes {
 		if p.in == nil {
 			continue
@@ -257,6 +272,7 @@ func (a *ackState) writeSnapshot(w *recWriter, _ bool) {
 			il.reported = il.pos
 		}
 	}
+	return true
 }
 
 func sortEntries(es []wire.AckEntry) {
@@ -271,7 +287,7 @@ func sortEntries(es []wire.AckEntry) {
 // onSent records a produced batch for RTT samples and idle accounting.
 // The PIPE_LANE record of an unconfirmed lane is outside the send order
 // (MULTIPATH.md 2.5).
-func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now Time) {
+func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now Time, ahead aheadSnap) {
 	if w.activity {
 		ol.activity = append(ol.activity, ol.pos)
 	}
@@ -299,7 +315,7 @@ func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now 
 		ps.elicitEnd = max64(ps.elicitEnd, end)
 		bubble, epoch := ps.re.sendFlags(ps.cum)
 		ps.samples = append(ps.samples, sample{end: end, sent: now, delivered: ps.delivered,
-			deliveredAt: ps.deliveredAt, firstSentAt: ps.firstSentAt, epoch: epoch, bubble: bubble})
+			deliveredAt: ps.deliveredAt, firstSentAt: ps.firstSentAt, epoch: epoch, bubble: bubble, ahead: ahead})
 	}
 }
 
@@ -401,23 +417,20 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 		if last != nil {
 			rtt := now.Sub(last.sent)
 			ad := MulD(int64(e.Delay), Microsecond)
-			r := &ps.rtt
-			if p.mp != nil {
-				r = &p.mp.rtt
-			}
+			r := p.rtt()
 			// A late entry (ACK Delay above the peer's maximum, typically
 			// the redundant copy) gives no RTT sample, unless the pipe has
 			// had none for 1 s.
 			late := ad > a.peerDelay && (ps.rttAt == 0 || now.Sub(ps.rttAt) < Second)
-			if !late && (p.mp == nil || p.mp.sampleOK(last.sent)) {
-				ev.rtt = r.update(rtt, minD(ad, a.peerDelay), a.peerDelay, now)
+			if !late && p.sampleOK(last.sent) {
+				ev.rtt = r.update(rtt, minD(ad, a.peerDelay), a.peerDelay, now, s.mp != nil && s.quiet())
 				ev.rttSentAt = last.sent
 				ps.rttAt = now
 				s.tuneAckSample(r.min)
 			}
 			// Delivery rate sample.
 			iv := maxD(last.sent.Sub(last.firstSentAt), now.Sub(last.deliveredAt))
-			if iv > 0 && (p.mp == nil || p.mp.sampleOK(last.sent)) {
+			if iv > 0 && p.sampleOK(last.sent) {
 				ev.rate = ps.re.sample(float64(ps.delivered-last.delivered)*1e9/float64(iv), last.bubble, last.epoch, now)
 			}
 			ps.firstSentAt = last.sent
@@ -440,7 +453,7 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 // hasEntries reports whether a snapshot would have an entry.
 func (a *ackState) hasEntries() bool {
 	for _, p := range a.s.pipes {
-		if p.in == nil || p.mp != nil && p.mp.retired {
+		if p.in == nil || p.retired() {
 			continue
 		}
 		for _, il := range p.in.lanes {

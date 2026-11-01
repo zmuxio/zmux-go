@@ -6,6 +6,7 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // The lane keys of the process's sessions (MULTIPATH.md 5.8): inbound
@@ -51,19 +52,21 @@ func HandleLane(ctx context.Context, p PipeIO) error {
 		}
 		return err
 	}
-	return handleLane(ctx, withPrefix(p, first), first)
+	return handleLane(ctx, nil, withPrefix(p, first), first)
 }
 
-// handleLane attaches an inbound lane whose first record is first.
-func handleLane(ctx context.Context, p PipeIO, first []byte) error {
+// handleLane attaches an inbound lane whose first record is first; l
+// counts the outcome (nil without a listener).
+func handleLane(ctx context.Context, l *Listener, p PipeIO, first []byte) error {
 	body := first
 	if p.Framing == FramingByteStream {
-		_, n := wire.ReadVarint(first)
+		_, n := varint.ConsumeVarint(first)
 		body = first[n:]
 	}
 	var f wire.Frame
 	if _, err := wire.DecodeFrame(body, &f); err != nil || f.Kind != wire.KindPipeLane {
 		closePipeIO(p)
+		l.rejectedBy(errRejected)
 		return errRejected
 	}
 	var k [16]byte
@@ -73,6 +76,7 @@ func handleLane(ctx context.Context, p PipeIO, first []byte) error {
 	laneKeys.mu.Unlock()
 	if c == nil {
 		closePipeIO(p)
+		l.rejectedBy(errRejected)
 		return errRejected
 	}
 	var conn any
@@ -83,7 +87,11 @@ func handleLane(ctx context.Context, p PipeIO, first []byte) error {
 	}
 	done, err := c.acceptLane(p, conn, f.PipeID, f.Lane)
 	if err != nil {
+		l.rejectedBy(err)
 		return err
+	}
+	if l != nil {
+		l.st.joins.Add(1)
 	}
 	select {
 	case <-done:
@@ -104,6 +112,7 @@ func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{
 		closePipeIO(p)
 		return nil, errRejected
 	}
+	markTaken(p)
 	if p.W != nil && any(p.W) != any(p.R) {
 		// The reverse half of a bidirectional stream used as a lane is
 		// unused: it ends at once.
@@ -137,13 +146,14 @@ func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, bind
 		outer := outerOf(p)
 		loop := nestPipe(c, outer) != nil
 		res := c.s.AcceptJoin(j, mac, binding, core.Carrier{HasIn: p.R != nil, HasOut: p.W != nil, In: info,
-			Out: info, OutSig: pd.wsig, Refuse: loop})
+			Out: info, OutSig: pd.wsig, Refuse: loop, Kind: uint8(p.Carrier)})
 		if res != core.JoinAccepted && !loop {
 			unnestPipe(c, outer)
 		}
 		pd.outer = outer
 		switch res {
 		case core.JoinAccepted:
+			markTaken(p)
 			if inband {
 				c.s.SkipJoinFrame(j.PipeID)
 			}
@@ -160,7 +170,11 @@ func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, bind
 				return 0, err
 			}
 			continue
-		case core.JoinClose, core.JoinRefused:
+		case core.JoinRefused:
+			c.unlock()
+			closePipeIO(p)
+			return 0, errRefused
+		case core.JoinClose:
 		}
 		c.unlock()
 		closePipeIO(p)

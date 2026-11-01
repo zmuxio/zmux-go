@@ -33,7 +33,7 @@ func (s *Session) newDecision(d *decision, p *Pipe) {
 	*d = decision{p: p, lv: d.lv}
 	d.open = s.open(p)
 	d.g = s.buildGate()
-	d.joiningTakes = p.mp.out == outJoining
+	d.joiningTakes = p.mp.out == OutJoining
 	if d.g == nil {
 		return
 	}
@@ -772,7 +772,7 @@ func (s *Session) customOK(d *decision, st *Stream) bool {
 	if s.now.Sub(a.askedAt) < pickWait {
 		return false
 	}
-	mp.pickMisses++
+	s.stats.SchedulerFallbacks++
 	return d.usable && s.affinityTarget(d, st) == d.p
 }
 
@@ -782,7 +782,7 @@ const pickWait = Millisecond
 // pipeTakesAny reports whether a pipe may carry new data at all (a custom
 // policy may override the tiers, never rule S1).
 func (s *Session) pipeTakesAny(p *Pipe) bool {
-	return p.mp.out == outActive && p.out != nil && !p.out.failed
+	return p.mp.out == OutActive && p.out != nil && !p.out.failed
 }
 
 func (s *Session) customUsed(st *Stream, n uint64) {
@@ -826,19 +826,21 @@ type PickFrame struct {
 // PickPipe is the value-only view of a pipe for a custom policy.
 type PickPipe struct {
 	Pipe      uint64
-	State     string
 	SRTT      Duration
 	RTTVar    Duration
-	Rate      uint64
+	Rate      float64 // bytes per second
 	Unsent    uint64
 	InFlight  uint64
 	Priority  uint64
 	Weight    uint64
+	State     OutState
 	Writable  bool
 	Standby   bool
 	Saturated bool
 	Probation bool
 	Eligible  bool
+	Shaping   bool    // a Shaper is active on the pipe
+	ShapingW  float64 // the Shaper's weight; 0: none
 }
 
 // PickAnswer is a policy's answer for one direction: a pipe index of the
@@ -875,10 +877,13 @@ func (s *Session) TakePick(req *PickRequest) bool {
 			continue
 		}
 		pr, sb := p.mp.effPrio()
-		pp := PickPipe{Pipe: p.id, State: outStateNames[p.mp.out], SRTT: p.mp.rtt.smoothed, RTTVar: p.mp.rtt.rttvar,
-			Rate: uint64(s.rateOf(p)), Unsent: p.mp.unsentAhead, Writable: s.open(p), Priority: pr, Standby: sb,
+		pp := PickPipe{Pipe: p.id, State: p.mp.out, SRTT: p.mp.rtt.smoothed, RTTVar: p.mp.rtt.rttvar,
+			Rate: s.rateOf(p), Unsent: s.queuedOn(p), Writable: s.open(p), Priority: pr, Standby: sb,
 			Probation: p.mp.prob.on, Weight: p.mp.weight}
 		pp.InFlight = p.out.snd.so - min64(p.out.snd.so, p.out.snd.cum)
+		if s.shp != nil && p.sh != nil && p.sh.sh != nil {
+			pp.Shaping, pp.ShapingW = true, p.sh.weight
+		}
 		if g != nil {
 			pp.Eligible = g.admits(s, p)
 			if ti := g.tierOf(p); ti >= 0 && ti <= g.last {
@@ -920,19 +925,19 @@ func (s *Session) AnswerPick(req *PickRequest, answers []PickAnswer, failed bool
 		}
 		m := st.snd.mps
 		if failed || req.Gen != mp.pickGen || i >= len(answers) {
-			mp.pickMisses++
+			s.stats.SchedulerFallbacks++
 			m.pick = pickAnswer{asked: true, gen: mp.pickGen} // asked long ago: a miss
 			continue
 		}
 		a := answers[i]
 		switch {
-		case a.Wait:
+		case a.Wait: // not counted: only answers that name a pipe are (API.md 7.2)
 			m.pick = pickAnswer{set: true, wait: true, gen: req.Gen, epoch: mp.inputEpoch, asked: true}
 		case a.Index < 0 || a.Index >= len(req.Pipes):
-			mp.pickMisses++
+			s.stats.SchedulerFallbacks++
 			m.pick = pickAnswer{asked: true, gen: mp.pickGen}
 		default:
-			mp.pickApplied++
+			s.stats.SchedulerAnswers++
 			m.pick = pickAnswer{set: true, pipe: req.Pipes[a.Index].Pipe, left: a.Bytes, gen: req.Gen, asked: true}
 		}
 	}

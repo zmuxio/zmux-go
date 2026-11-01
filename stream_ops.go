@@ -20,7 +20,17 @@ type TLV struct {
 // Chunk is stream data passed on without a copy. A chunk read
 // with ReadChunk references the session's receive buffer until it is
 // released: by WriteChunk, which takes ownership in every outcome, or by
+// Release. Its Data must not be changed, and must not be used after
 // Release.
+//
+// Copies on the way out: ReadFrom reads into the pooled send blocks and
+// WriteChunk queues the chunk's memory, so neither copies in user space;
+// what the carrier does when the session sends those blocks is its own:
+// a TCP connection takes them with writev, no copy; *tls.Conn flattens
+// once while encrypting; a QUIC stream flattens once; an HTTP request body
+// is copied once by the Transport and an HTTP response body once by its
+// bufio writer; WebSocket flattens once per record; a stream of an outer
+// session (nested sessions) takes them without a copy.
 type Chunk struct {
 	Data []byte
 	buf  *core.Buf
@@ -259,26 +269,66 @@ func (h *handle) writeTo(w io.Writer) (int64, error) {
 	}
 }
 
-// readFrom copies r into the stream.
+// readFrom copies r into the stream, reading straight into the stream's
+// pooled send blocks: no intermediate buffer and no copy.
 func (h *handle) readFrom(r io.Reader) (int64, error) {
-	buf := make([]byte, 64<<10)
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	c := h.c
+	lent := false
+	defer func() {
+		if lent { // r panicked: end the loan
+			c.lock()
+			_ = c.s.CommitWrite(h.st, 0)
+			c.unlock()
+		}
+	}()
 	var n int64
 	for {
-		m, err := r.Read(buf)
-		if m > 0 {
-			if _, werr := h.write(buf[:m], false); werr != nil {
-				return n, werr
-			}
-			n += int64(m)
+		c.lock()
+		c.s.SetNow(c.clk.now())
+		buf, err := c.s.WriteSpace(h.st, 1<<30)
+		if err == nil && len(buf) == 0 {
+			h.wsig.Drain()
+			c.s.WaitWrite(h.st, &h.wsig)
 		}
-		if errors.Is(err, io.EOF) {
+		c.unlock()
+		if err != nil {
+			return n, apiErr(err)
+		}
+		if len(buf) == 0 {
+			select {
+			case <-h.wsig.C:
+			case <-h.wwait():
+				return n, os.ErrDeadlineExceeded
+			}
+			continue
+		}
+		lent = true
+		m, rerr := r.Read(buf)
+		if m < 0 || m > len(buf) {
+			m, rerr = 0, errInvalidRead
+		}
+		lent = false
+		c.lock()
+		c.s.SetNow(c.clk.now())
+		werr := c.s.CommitWrite(h.st, m)
+		c.unlock()
+		if werr != nil {
+			return n, apiErr(werr)
+		}
+		n += int64(m)
+		if errors.Is(rerr, io.EOF) {
 			return n, nil
 		}
-		if err != nil {
-			return n, err
+		if rerr != nil {
+			return n, rerr
 		}
 	}
 }
+
+// errInvalidRead is a reader's count outside its buffer.
+var errInvalidRead = errors.New("zmux: reader returned an invalid count")
 
 // ---- Stream ----
 
@@ -300,14 +350,16 @@ func (s *Stream) SetPeerPriority(urgency Urgency, incremental bool) error {
 	return s.h.setPeerPriority(urgency, incremental)
 }
 
-// SetPreamble sets OPEN_INFO before the first frame.
+// SetPreamble sets OPEN_INFO before the first frame. A preamble that
+// would exceed the peer's limit is *PreambleTooLargeError.
 func (s *Stream) SetPreamble(b []byte) error {
 	defer runtime.KeepAlive(s)
 	return s.h.do(func(c *core.Session) error { return c.SetOpenInfo(s.h.st, b) })
 }
 
 // AddPreambleTLV adds an application TLV (type 0x1000 to 0x3fff) before
-// the first frame.
+// the first frame. A preamble that would exceed the peer's limit is
+// *PreambleTooLargeError.
 func (s *Stream) AddPreambleTLV(t uint64, v []byte) error {
 	defer runtime.KeepAlive(s)
 	return s.h.do(func(c *core.Session) error { return c.AddPreambleTLV(s.h.st, t, v) })
@@ -388,6 +440,14 @@ func (s *Stream) SetRedundant(on bool) {
 	_ = s.h.do(func(c *core.Session) error { c.SetRedundant(s.h.st, &on); return nil })
 }
 
+// ClearRedundant undoes SetRedundant: the stream's redundancy follows the
+// session's again (SchedulerParams.NoRedundancy; by default urgency 0 to
+// 2 are redundant).
+func (s *Stream) ClearRedundant() {
+	defer runtime.KeepAlive(s)
+	_ = s.h.do(func(c *core.Session) error { c.SetRedundant(s.h.st, nil); return nil })
+}
+
 // SetReliableBoundary marks the data written so far as delivered even if
 // the stream is reset later (RESET_STREAM_AT).
 func (s *Stream) SetReliableBoundary() {
@@ -420,13 +480,20 @@ func (s *Stream) WriteChunk(ctx context.Context, c Chunk) error {
 	return s.h.writeChunk(ctx, c)
 }
 
-// WriteTo implements io.WriterTo.
+// WriteTo implements io.WriterTo: it passes w the session's receive
+// buffers in place, with no intermediate buffer.
 func (s *Stream) WriteTo(w io.Writer) (int64, error) {
 	defer runtime.KeepAlive(s)
 	return s.h.writeTo(w)
 }
 
-// ReadFrom implements io.ReaderFrom; it does not finish the stream.
+// ReadFrom implements io.ReaderFrom; it does not finish the stream. It
+// reads r straight into the stream's pooled send blocks (at most one block,
+// 16 KiB, and what the send buffer admits, per Read), with no intermediate
+// buffer, no copy and no allocation once warm; see Chunk for the carrier's
+// copies. Writes to the stream wait while it runs, and Close or CancelWrite
+// meanwhile ends it with their error, discarding the bytes of the Read in
+// progress.
 func (s *Stream) ReadFrom(r io.Reader) (int64, error) {
 	defer runtime.KeepAlive(s)
 	return s.h.readFrom(r)
@@ -462,7 +529,8 @@ func (s *SendStream) SetPriority(urgency Urgency, incremental bool) {
 	s.h.setPriority(urgency, incremental)
 }
 
-// SetPreamble sets OPEN_INFO before the first frame.
+// SetPreamble sets OPEN_INFO before the first frame. A preamble that
+// would exceed the peer's limit is *PreambleTooLargeError.
 func (s *SendStream) SetPreamble(b []byte) error {
 	defer runtime.KeepAlive(s)
 	return s.h.do(func(c *core.Session) error { return c.SetOpenInfo(s.h.st, b) })
@@ -508,6 +576,12 @@ func (s *SendStream) SetRedundant(on bool) {
 	_ = s.h.do(func(c *core.Session) error { c.SetRedundant(s.h.st, &on); return nil })
 }
 
+// ClearRedundant undoes SetRedundant: redundancy follows the session's.
+func (s *SendStream) ClearRedundant() {
+	defer runtime.KeepAlive(s)
+	_ = s.h.do(func(c *core.Session) error { c.SetRedundant(s.h.st, nil); return nil })
+}
+
 // SetReliableBoundary marks the data written so far as delivered.
 func (s *SendStream) SetReliableBoundary() {
 	defer runtime.KeepAlive(s)
@@ -526,7 +600,7 @@ func (s *SendStream) WriteChunk(ctx context.Context, c Chunk) error {
 	return s.h.writeChunk(ctx, c)
 }
 
-// ReadFrom implements io.ReaderFrom.
+// ReadFrom implements io.ReaderFrom like Stream.ReadFrom.
 func (s *SendStream) ReadFrom(r io.Reader) (int64, error) {
 	defer runtime.KeepAlive(s)
 	return s.h.readFrom(r)
@@ -579,7 +653,7 @@ func (s *ReceiveStream) ReadChunk(ctx context.Context, n int) (Chunk, error) {
 	return s.h.readChunk(ctx, n)
 }
 
-// WriteTo implements io.WriterTo.
+// WriteTo implements io.WriterTo like Stream.WriteTo.
 func (s *ReceiveStream) WriteTo(w io.Writer) (int64, error) {
 	defer runtime.KeepAlive(s)
 	return s.h.writeTo(w)

@@ -24,3 +24,12 @@ func tcpMinRTT(fd uintptr) (time.Duration, bool) {
 	us := *(*uint32)(unsafe.Pointer(&buf[148]))
 	return time.Duration(us) * time.Microsecond, us > 0
 }
+
+const siocOutqNSD = 0x894B // SIOCOUTQNSD: bytes in the send queue not yet sent
+
+// tcpUnsent reads the bytes the socket holds unsent (SIOCOUTQNSD).
+func tcpUnsent(fd uintptr) (uint64, bool) {
+	var n int32
+	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, fd, siocOutqNSD, uintptr(unsafe.Pointer(&n)))
+	return uint64(max(n, 0)), e == 0
+}

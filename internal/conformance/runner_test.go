@@ -16,6 +16,7 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // specDir holds the specification's fixtures (testdata/spec/SOURCE names
@@ -25,8 +26,8 @@ const (
 	specDir  = "../../testdata/spec/fixtures"
 	localDir = "../../testdata/local/traces"
 
-	specTraces  = 321
-	localTraces = 49
+	specTraces  = 369
+	localTraces = 53
 )
 
 type profile struct {
@@ -174,7 +175,7 @@ type rcarrier struct {
 	buf        []byte
 	pipe       uint64
 	lane       uint64
-	source     string // listener slot held until the first record
+	slot       *core.PendingCarrier // listener slot held until the first record
 	deadline   core.Time
 	framing    core.Framing
 	held       bool
@@ -311,6 +312,18 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 			if v != nil {
 				cfg.StandbyProbe = ms(v)
 			}
+		case "probe_interval":
+			if v != nil {
+				cfg.ProbeInterval = ms(v)
+			}
+		case "probe_jitter":
+			if v != nil {
+				j, err := v.(json.Number).Float64()
+				if err != nil {
+					t.Fatalf("probe_jitter %v: %v", v, err)
+				}
+				cfg.ProbeJitter = j
+			}
 		case "redundancy":
 			cfg.Redundancy = v.(string) == "urgent"
 		case "scheduler":
@@ -430,7 +443,7 @@ func (r *runner) pipeDown(st map[string]any) error {
 		if c == nil || !c.attached {
 			return nil
 		}
-		r.s.PipeEnded(c.pipe, c.lane, st["how"].(string) == "eof", len(c.buf) > 0, r.now)
+		r.s.PipeEnded(c.pipe, c.lane, st["how"].(string) == "eof", len(c.buf) > 0, nil, r.now)
 		r.drainEvents()
 		return nil
 	}
@@ -441,7 +454,7 @@ func (r *runner) pipeDown(st map[string]any) error {
 	if dir == "in" || dir == "bidi" {
 		l := r.pipes[id].lane(lane)
 		partial := len(l.in) > 0
-		r.s.PipeEnded(id, lane, how == "eof", partial, r.now)
+		r.s.PipeEnded(id, lane, how == "eof", partial, nil, r.now)
 	}
 	if dir == "out" || dir == "bidi" {
 		r.s.WriteDone(&core.Batch{Pipe: id, Lane: lane}, errors.New("carrier failed"), r.now)
@@ -543,9 +556,9 @@ func (r *runner) advance(d core.Duration) error {
 	r.s.HandleTimeout(r.now)
 	r.drainEvents()
 	for _, c := range r.carriers {
-		if c.source != "" && !c.rejected && r.now >= c.deadline {
-			r.pending.Release(c.source)
-			c.source = ""
+		if c.slot != nil && !c.rejected && r.now >= c.deadline {
+			r.pending.Release(c.slot)
+			c.slot = nil
 			c.rejected = true
 		}
 	}
@@ -643,13 +656,13 @@ func (r *runner) capture(p *rpipe, lane uint64) {
 	if p.framing == core.FramingRecords {
 		recs = r.b.Messages()
 		for _, m := range recs {
-			l.written += uint64(wire.VarintLen(uint64(len(m))) + len(m))
+			l.written += uint64(varint.SizeVarint(uint64(len(m))) + len(m))
 		}
 	} else {
 		data := r.b.Flat()
 		l.written += uint64(len(data))
 		for len(data) > 0 {
-			size, n := wire.ReadVarint(data)
+			size, n := varint.ConsumeVarint(data)
 			if n == 0 || uint64(len(data)-n) < size {
 				r.t.Fatalf("local endpoint wrote a partial record")
 			}
@@ -1088,11 +1101,11 @@ func (r *runner) expectState(st map[string]any) error {
 	if pv, ok := st["pipe"]; ok {
 		out, in, ok := r.s.PipeState(num(pv))
 		if !ok {
-			out, in = "RETIRED", "RETIRED"
+			out, in = core.OutRetired, core.InRetired
 		}
-		got := out
+		got := out.String()
 		if st["dir"] == "in" {
-			got = in
+			got = in.String()
 		}
 		want := st["state"]
 		if m, ok := want.(map[string]any); ok {
@@ -1139,9 +1152,13 @@ func eventObj(e core.Event) (string, map[string]any) {
 	case core.EvResumed:
 		return "resumed", map[string]any{}
 	case core.EvPipeState:
-		return "pipe_state", map[string]any{"pipe": e.Pipe, "state": e.State}
+		state := e.OutState.String()
+		if e.Dir == core.DirIn {
+			state = e.InState.String()
+		}
+		return "pipe_state", map[string]any{"pipe": e.Pipe, "state": state}
 	case core.EvJoinAuthFailed:
-		return "join_auth_failed", map[string]any{"reason": e.Reason}
+		return "join_auth_failed", map[string]any{"reason": e.Reason.String()}
 	case core.EvOOBJoin:
 		return "oob_join", map[string]any{"pipe": e.Pipe, "frame": hex.EncodeToString(e.Frame)}
 	case core.EvJoinSecurityUnavailable, core.EvTierSaturation, core.EvPipePriority, core.EvPipeQuality,
@@ -1239,7 +1256,7 @@ func (r *runner) carrierSend(c *rcarrier, st map[string]any) error {
 		return nil
 	}
 	if !c.attached {
-		size, n := wire.ReadVarint(c.buf)
+		size, n := varint.ConsumeVarint(c.buf)
 		if n == 0 || uint64(len(c.buf)-n) < size {
 			return nil
 		}

@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 
+	"github.com/djylb/timeshim"
+
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -43,14 +45,14 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 		return DuplicateResult{}, ErrNoDecision
 	}
 	a, b := duplicateSnapshot(s1), duplicateSnapshot(s2)
-	if !a.established || !b.established || a.dialer == b.dialer || a.dialer == dialUnknown || b.dialer == dialUnknown {
+	if !a.established || !b.established || a.dialer == b.dialer || a.dialer == 0 || b.dialer == 0 {
 		return DuplicateResult{}, ErrNoDecision
 	}
 	var v1, v2 []byte
 	switch {
 	case len(o.LocalID) > 0 && len(o.PeerID) > 0:
 		v1, v2 = o.LocalID, o.PeerID
-		if a.dialer != dialLocal {
+		if a.dialer != EndpointLocal {
 			v1, v2 = v2, v1
 		}
 	case a.multipath && b.multipath:
@@ -78,10 +80,11 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 	lose.s.Shutdown(0, nil)
 	lose.unlock()
 	res := DuplicateResult{Survivor: win, Loser: lose}
-	if o.Rejoin && o.Dial != nil && loserDialer == dialLocal && win.ConnectionState().Multipath && win.JoinReady() {
+	if o.Rejoin && o.Dial != nil && loserDialer == EndpointLocal && win.ConnectionState().Multipath && win.JoinReady() {
 		res.RejoinStarted = true
 		go func() {
-			ctx, cancel := context.WithTimeout(win.ctx, win.handshakeTimeout())
+			clk := win.clk.source()
+			ctx, cancel := timeshim.WithDeadline(win.ctx, clk, clk.Now().Add(win.cfg.handshakeTimeout()))
 			defer cancel()
 			if p, err := o.Dial(ctx); err == nil {
 				if _, err := win.AddPipe(ctx, p, PipeOptions{}); err != nil {
@@ -96,7 +99,7 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 // duplicateInput is a value snapshot, not another authority for session state.
 // Capture the dialer under the same lock as its designation and transport parameters.
 type duplicateInput struct {
-	dialer                           dialer
+	dialer                           Endpoint // 0: unknown
 	established, multipath, autoRole bool
 	sessionNonce                     [16]byte
 	roleNonce                        uint64
@@ -114,30 +117,41 @@ func duplicateSnapshot(c *Conn) duplicateInput {
 	result.multipath = c.s.Features().Multipath
 	result.autoRole = local.Has&wire.HasRole != 0 && peer.Has&wire.HasRole != 0 && local.Role == wire.RoleAuto && peer.Role == wire.RoleAuto
 	params := local
-	if result.dialer != dialLocal {
+	if result.dialer != EndpointLocal {
 		params = peer
 	}
 	result.sessionNonce, result.roleNonce = params.SessionNonce, params.RoleNonce
 	return result
 }
 
-// dialer of a session: who established its bootstrap carrier.
-type dialer uint8
+// Endpoint names one end of a session, seen from this end.
+type Endpoint uint8
 
 const (
-	dialUnknown dialer = iota
-	dialLocal
-	dialPeer
+	EndpointLocal Endpoint = iota + 1
+	EndpointPeer
 )
 
+func (e Endpoint) String() string {
+	switch e {
+	case EndpointLocal:
+		return "local"
+	case EndpointPeer:
+		return "peer"
+	}
+	return "Endpoint(?)"
+}
+
 // DesignateDialer records which endpoint dialed a session whose bootstrap
-// carrier is symmetric (role auto), for ResolveDuplicate.
-func (c *Conn) DesignateDialer(local bool) {
+// carrier is symmetric (role auto), for ResolveDuplicate. A value other
+// than EndpointLocal or EndpointPeer forgets the designation.
+func (c *Conn) DesignateDialer(e Endpoint) {
 	c.lock()
 	defer c.unlock()
-	if local {
-		c.dialed = dialLocal
-	} else {
-		c.dialed = dialPeer
+	switch e {
+	case EndpointLocal, EndpointPeer:
+		c.dialed = e
+	default:
+		c.dialed = 0
 	}
 }

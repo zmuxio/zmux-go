@@ -11,17 +11,21 @@ func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
 	if a == nil || a.retired {
 		return
 	}
-	wasDraining := a.out == outDraining || a.draining
-	if p.out != nil && a.out != outFailed && a.out != outClosed {
-		a.out = outFailed
+	wasDraining := a.out == OutDraining || a.draining
+	if p.out != nil && a.out != OutFailed && a.out != OutClosed {
+		a.out = OutFailed
 		a.failures++
+		s.stats.PipeFailures++
 		p.out.failed = true
+		if s.shp != nil {
+			s.shapePipeDown(p)
+		}
 		s.probationFailed(p)
 		s.unsettle(p)
 		s.reinjectPipe(p)
 	}
-	if p.in != nil && a.in != inEnded {
-		a.in = inEnded
+	if p.in != nil && a.in != InEnded {
+		a.in = InEnded
 		p.in.ended = true
 	}
 	if a.failCause == nil {
@@ -59,7 +63,7 @@ func (s *Session) fateGroupHit(p *Pipe) {
 		if qa.draining || qa.abandonRecv && qa.abandonCodeRecv == wire.NoError {
 			continue
 		}
-		if qa.out == outActive {
+		if qa.out == OutActive {
 			if qa.unacked {
 				s.makeSuspect(q)
 			} else {
@@ -73,10 +77,10 @@ func (s *Session) fateGroupHit(p *Pipe) {
 // makeSuspect moves an outbound pipe to SUSPECT (MULTIPATH.md 7.2).
 func (s *Session) makeSuspect(p *Pipe) {
 	a := p.mp
-	if a.out != outActive && a.out != outJoining {
+	if a.out != OutActive && a.out != OutJoining {
 		return
 	}
-	a.out = outSuspect
+	a.out = OutSuspect
 	a.suspects++
 	a.suspectAt = s.now
 	a.noSampleAt, a.noSample = s.now, true
@@ -118,7 +122,7 @@ func (s *Session) startDrain(p *Pipe) {
 	a.draining = true
 	a.drainStart = s.now
 	if p.out != nil && a.liveOut() {
-		a.out = outDraining
+		a.out = OutDraining
 	}
 	s.unsettle(p)
 	if !a.abandonSent && !a.abandonQueued {
@@ -142,6 +146,7 @@ func (s *Session) peerAbandon(p *Pipe, code uint64) {
 	a.abandonCodeRecv = code
 	if a.joinerLocal && code == wire.PipeResourceLimit {
 		a.resLimited = true
+		s.stats.JoinRefusals++
 		// Refusal backoff (MULTIPATH.md 5.7 step 1).
 		m := s.mp
 		m.backoffExp++
@@ -180,10 +185,10 @@ func unackedStream(p *Pipe) bool {
 // checkDrain completes a drain (MULTIPATH.md 8.2 step 3).
 func (s *Session) checkDrain(p *Pipe) {
 	a := p.mp
-	if a.out != outDraining || !a.abandonSent || !a.abandonRecv || unackedStream(p) {
+	if a.out != OutDraining || !a.abandonSent || !a.abandonRecv || unackedStream(p) {
 		return
 	}
-	a.out = outClosed
+	a.out = OutClosed
 	s.reinjectPipe(p)
 	for _, l := range p.out.lanes {
 		if !l.shut {
@@ -191,7 +196,7 @@ func (s *Session) checkDrain(p *Pipe) {
 			s.act(Action{Kind: ActShutdown, Pipe: p.id, Lane: l.lane, Dir: DirOut})
 		}
 	}
-	if p.in != nil && a.in == inOpen {
+	if p.in != nil && a.in == InOpen {
 		a.lingerUntil = s.now.Add(s.lingerTimeout())
 		a.lingering = true
 	}
@@ -219,10 +224,10 @@ func (s *Session) maybeRetire(p *Pipe) {
 	if !a.abandonRecv && !a.unilateral {
 		return
 	}
-	if p.out != nil && a.out != outFailed && a.out != outClosed {
+	if p.out != nil && a.out != OutFailed && a.out != OutClosed {
 		return
 	}
-	if p.in != nil && a.in != inEnded {
+	if p.in != nil && a.in != InEnded {
 		return
 	}
 	s.retire(p)
@@ -232,7 +237,9 @@ func (s *Session) maybeRetire(p *Pipe) {
 func (s *Session) retire(p *Pipe) {
 	a := p.mp
 	a.retired = true
-	if !a.joinerLocal && p.id != 0 {
+	// A peer-parity ID stays used, pipe 0 of an initiator peer included
+	// (MULTIPATH.md 4.3): its later PIPE_ACK entries are ignored.
+	if !s.ownParity(p.id) {
 		s.mp.bits[p.id] = true
 	}
 	s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
@@ -248,7 +255,9 @@ func (s *Session) retire(p *Pipe) {
 	if len(s.retiredPipes) > 64 {
 		s.retiredPipes = s.retiredPipes[1:]
 	}
-	s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirBidi, State: "RETIRED"})
+	s.mp.stateGen++
+	s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirBidi, OutState: OutRetired, InState: InRetired,
+		Carrier: p.carrier, Failed: a.failures > 0})
 	s.checkLastPipe(nil)
 	if a.joinerLocal && !a.resLimited {
 		// Another attachment retired: the refusal backoff ends
@@ -268,7 +277,7 @@ func (s *Session) liveCounts() (out, in int) {
 		if p.out != nil && a.liveOut() {
 			out++
 		}
-		if p.in != nil && (a.in == inJoining || a.in == inOpen) {
+		if p.in != nil && (a.in == InJoining || a.in == InOpen) {
 			in++
 		}
 	}
@@ -297,7 +306,7 @@ func (s *Session) checkLastPipe(cause error) {
 }
 
 // mpInboundEnded handles the end of an inbound pipe (MULTIPATH.md 7.3).
-func (s *Session) mpInboundEnded(p *Pipe, graceful bool) {
+func (s *Session) mpInboundEnded(p *Pipe, graceful bool, cause error) {
 	a := p.mp
 	if a == nil || a.retired {
 		return
@@ -305,7 +314,7 @@ func (s *Session) mpInboundEnded(p *Pipe, graceful bool) {
 	expected := graceful && (a.abandonRecv || a.abandonSent && a.abandonCode == wire.NoError || a.draining ||
 		s.state >= StateClosing)
 	if expected {
-		a.in = inEnded
+		a.in = InEnded
 		s.ack.immediate = true
 		s.emitPipeState(p)
 		s.maybeRetire(p)
@@ -314,7 +323,7 @@ func (s *Session) mpInboundEnded(p *Pipe, graceful bool) {
 		return
 	}
 	s.ack.immediate = true
-	s.failPipe(p, wire.PipeFailed, nil)
+	s.failPipe(p, wire.PipeFailed, cause)
 }
 
 // mpOutboundFailed handles a failed write on an outbound pipe.

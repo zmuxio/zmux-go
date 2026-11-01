@@ -3,6 +3,8 @@ package zmux
 import (
 	"sync"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // deadline is the per-handle deadline of net.Conn semantics: a channel that
@@ -10,11 +12,12 @@ import (
 // pipeDeadline pattern of package net). Its lock is a leaf (L3).
 type deadline struct {
 	mu     sync.Mutex
-	timer  *time.Timer
+	timer  timeshim.Timer
 	cancel chan struct{}
 }
 
-func (d *deadline) set(t time.Time) {
+// set moves the deadline to t on clk.
+func (d *deadline) set(t time.Time, clk timeshim.Clock) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.timer != nil && !d.timer.Stop() {
@@ -31,9 +34,9 @@ func (d *deadline) set(t time.Time) {
 	if closed || d.cancel == nil {
 		d.cancel = make(chan struct{})
 	}
-	if dur := time.Until(t); dur > 0 {
+	if dur := timeshim.Until(clk, t); dur > 0 {
 		ch := d.cancel
-		d.timer = time.AfterFunc(dur, func() { close(ch) })
+		d.timer = clk.AfterFunc(dur, func() { close(ch) })
 		return
 	}
 	close(d.cancel)

@@ -1,9 +1,10 @@
 package zmux
 
 import (
-	"context"
 	"sync"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 )
@@ -45,27 +46,32 @@ type PickRequest struct {
 
 // PickPipe is a pipe as a custom policy sees it (values only).
 type PickPipe struct {
-	Pipe      uint64
-	State     string
+	Pipe      uint64 // pipe ID
 	SRTT      time.Duration
 	RTTVar    time.Duration
-	Rate      uint64 // bytes/s
-	Unsent    uint64
+	Rate      float64 // delivery rate estimate, bytes per second
+	Unsent    uint64  // Q_p: handed to the carrier and not taken yet, plus its own unsent count where reported
 	InFlight  uint64
 	Priority  uint64
 	Weight    uint64
+	State     OutboundState
 	Writable  bool
 	Standby   bool
 	Saturated bool
 	Probation bool
 	Eligible  bool // under tier gating: the built-in policies choose among these
+	// ShapingActive: a Shaper is active on the pipe.
+	ShapingActive bool
+	// ShapingWeight is the weight the pipe's Shaper set; 0: none.
+	ShapingWeight float64
 }
 
-// PickAnswer is the answer for one direction: Pipe is an index into the
-// pipes, Bytes the bytes it covers (0: until invalidated); Wait holds the
-// direction until the session's next input.
+// PickAnswer is the answer for one direction: Index is the chosen pipe's
+// index into the pipes passed to Pick (not its pipe ID), Bytes the bytes it
+// covers (0: until invalidated); Wait holds the direction until the
+// session's next input.
 type PickAnswer struct {
-	Pipe  int
+	Index int
 	Bytes uint64
 	Wait  bool
 }
@@ -240,10 +246,11 @@ func (h *hooks) runPick() {
 	}
 	pipes := make([]PickPipe, len(req.Pipes))
 	for i, p := range req.Pipes {
-		pipes[i] = PickPipe{Pipe: p.Pipe, State: p.State, SRTT: time.Duration(p.SRTT),
+		pipes[i] = PickPipe{Pipe: p.Pipe, State: OutboundState(p.State), SRTT: time.Duration(p.SRTT),
 			RTTVar: time.Duration(p.RTTVar), Rate: p.Rate, Unsent: p.Unsent, InFlight: p.InFlight,
 			Writable: p.Writable, Priority: p.Priority, Standby: p.Standby, Saturated: p.Saturated,
-			Probation: p.Probation, Eligible: p.Eligible, Weight: p.Weight}
+			Probation: p.Probation, Eligible: p.Eligible, Weight: p.Weight,
+			ShapingActive: p.Shaping, ShapingWeight: p.ShapingW}
 	}
 	out := make([]PickAnswer, len(reqs))
 	for i := range out {
@@ -252,7 +259,7 @@ func (h *hooks) runPick() {
 	failed := !safeCall(func() { h.pick.Pick(reqs, pipes, out) })
 	ans := make([]core.PickAnswer, len(out))
 	for i, a := range out {
-		ans[i] = core.PickAnswer{Wait: a.Wait, Index: a.Pipe, Bytes: a.Bytes}
+		ans[i] = core.PickAnswer{Wait: a.Wait, Index: a.Index, Bytes: a.Bytes}
 	}
 	c.lock()
 	c.s.AnswerPick(&req, ans, failed)
@@ -275,10 +282,23 @@ func safeCall(f func()) (ok bool) {
 
 // redialer re-establishes pipes with the Redial hook while the session
 // lacks a direction: at most one call in flight per direction, cancelled
-// when the session ends; a carrier returned after the end is closed.
+// when the session ends; a carrier returned after the end is closed. Each
+// direction keeps its failure count, last attempt and backoff across the
+// losses of the direction, so that a wait counts from the previous
+// attempt.
 type redialer struct {
 	mu       sync.Mutex
 	inFlight [3]bool
+	state    [3]redialState
+}
+
+type redialState struct {
+	failures int
+	lastDial time.Time
+	backoff  time.Duration // built-in; 0: not started
+	wait     time.Duration // the built-in wait after lastDial, jittered
+	view     PoolView
+	dec      PoolDecision
 }
 
 // maybeRedial starts redials for the directions the session lacks.
@@ -321,13 +341,61 @@ func (c *Conn) closingNow() bool {
 }
 
 func (c *Conn) redialLoop(need Direction) {
+	r := &c.redial
+	clk := c.clk.source()
 	defer func() {
-		c.redial.mu.Lock()
-		c.redial.inFlight[need] = false
-		c.redial.mu.Unlock()
+		r.mu.Lock()
+		r.inFlight[need] = false
+		r.mu.Unlock()
 	}()
-	backoff := 250 * time.Millisecond
+	// Only this loop touches st while inFlight[need] holds.
+	r.mu.Lock()
+	st := &r.state[need]
+	r.mu.Unlock()
+	if st.backoff == 0 {
+		st.backoff = 250 * time.Millisecond
+	}
+	// delay is the wait after the previous attempt: the policy's
+	// DialAfter, else the built-in backoff (none before a first failure).
+	delay := func() time.Duration {
+		var d time.Duration
+		if st.failures > 0 {
+			d = st.wait
+		}
+		pol := c.cfg.RedialPolicy
+		if pol == nil {
+			return d
+		}
+		v := &st.view
+		v.Now, v.Failures, v.LastDial, v.Members = clk.Now(), st.failures, st.lastDial, v.Members[:0]
+		for _, ps := range c.PipeStats() {
+			v.Members = append(v.Members, PoolMember{ID: ps.Pipe, Age: ps.AttachedFor, Idle: ps.SinceLastTraffic,
+				Pipes: 1, BytesSent: ps.BytesSent, BytesReceived: ps.BytesReceived})
+		}
+		if err := decide(pol, v, &st.dec); err != nil {
+			st.dec = PoolDecision{} // as a policy that panics
+			reportRejected(c.cfg.DecisionRejected, err)
+		}
+		if st.dec.DialAfter > 0 {
+			d = min(st.dec.DialAfter, MaxRedialBackoff)
+		}
+		return d
+	}
 	for {
+		if !st.lastDial.IsZero() {
+			if w := timeshim.Until(clk, st.lastDial.Add(delay())); w > 0 {
+				t := timeshim.NewTimer(clk, w)
+				select {
+				case <-t.C:
+				case <-c.done:
+					t.Stop()
+					return
+				}
+			}
+		} else if c.cfg.RedialPolicy != nil {
+			delay() // the policy is asked before the first call
+		}
+		st.lastDial = clk.Now()
 		var p PipeIO
 		var err error
 		ok := safeCall(func() { p, err = c.cfg.Redial(c.ctx, need) })
@@ -338,10 +406,11 @@ func (c *Conn) redialLoop(need Direction) {
 			return
 		}
 		if ok && err == nil {
-			ctx, cancel := context.WithTimeout(c.ctx, c.handshakeTimeout())
-			_, err = c.AddPipe(ctx, p, PipeOptions{Direction: need})
+			ctx, cancel := timeshim.WithDeadline(c.ctx, clk, clk.Now().Add(c.cfg.handshakeTimeout()))
+			_, err = c.AddPipe(ctx, p, st.dec.probeOptions(PipeOptions{Direction: need}))
 			cancel()
 			if err == nil {
+				st.failures, st.backoff = 0, 250*time.Millisecond
 				return
 			}
 		}
@@ -351,18 +420,10 @@ func (c *Conn) redialLoop(need Direction) {
 		if out && in {
 			return
 		}
-		select {
-		case <-time.After(backoff):
-		case <-c.done:
-			return
+		if st.failures > 0 {
+			st.backoff = min(2*st.backoff, MaxRedialBackoff)
 		}
-		backoff = min(2*backoff, 30*time.Second)
+		st.failures++
+		st.wait = backoffWait(st.backoff)
 	}
-}
-
-func (c *Conn) handshakeTimeout() time.Duration {
-	if c.cfg.HandshakeTimeout > 0 {
-		return c.cfg.HandshakeTimeout
-	}
-	return 10 * time.Second
 }

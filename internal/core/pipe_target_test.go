@@ -8,7 +8,7 @@ func targetSession() *Session {
 	s := New(cfg, 0)
 	s.state = StateActive
 	s.mp = &multiPath{ownCap: 10}
-	s.pipes = append(s.pipes, &Pipe{mp: &attach{joinerLocal: true, out: outActive, in: inOpen}})
+	s.pipes = append(s.pipes, &Pipe{mp: &attach{joinerLocal: true, out: OutActive, in: InOpen}})
 	return s
 }
 
@@ -17,7 +17,7 @@ func TestJoinReadyUsesMaintenanceTarget(t *testing.T) {
 	if !s.JoinReady() {
 		t.Fatal("bootstrap leaves one target slot")
 	}
-	p := &Pipe{mp: &attach{joinerLocal: true, out: outActive, in: inOpen}}
+	p := &Pipe{mp: &attach{joinerLocal: true, out: OutActive, in: InOpen}}
 	s.pipes = append(s.pipes, p)
 	if !s.joinAllowed() {
 		t.Fatal("explicit join still has physical headroom")
@@ -25,11 +25,11 @@ func TestJoinReadyUsesMaintenanceTarget(t *testing.T) {
 	if s.JoinReady() {
 		t.Fatal("maintenance target is full")
 	}
-	p.mp.out = outDraining
+	p.mp.out = OutDraining
 	if s.JoinReady() {
 		t.Fatal("draining still counts toward target")
 	}
-	p.mp.out = outFailed
+	p.mp.out = OutFailed
 	if !s.JoinReady() {
 		t.Fatal("failed pipe must free the maintenance slot")
 	}
@@ -39,7 +39,7 @@ func TestJoinReadyUsesMaintenanceTarget(t *testing.T) {
 	}
 	s.mp.backoffUntil = 0
 	for len(s.pipes) < s.mp.ownCap {
-		s.pipes = append(s.pipes, &Pipe{mp: &attach{joinerLocal: true, out: outFailed}})
+		s.pipes = append(s.pipes, &Pipe{mp: &attach{joinerLocal: true, out: OutFailed}})
 	}
 	if s.JoinReady() {
 		t.Fatal("failed bookkeeping still consumes physical headroom")
@@ -48,16 +48,16 @@ func TestJoinReadyUsesMaintenanceTarget(t *testing.T) {
 
 func TestJoinReadyIgnoresPeerJoinsAndEndedReceiveOnly(t *testing.T) {
 	s := targetSession()
-	s.pipes = append(s.pipes, &Pipe{mp: &attach{out: outActive, in: inOpen}})
+	s.pipes = append(s.pipes, &Pipe{mp: &attach{out: OutActive, in: InOpen}})
 	if !s.JoinReady() {
 		t.Fatal("peer joins cannot consume our target")
 	}
-	p := &Pipe{mp: &attach{joinerLocal: true, out: outNone, in: inOpen}}
+	p := &Pipe{mp: &attach{joinerLocal: true, out: OutNone, in: InOpen}}
 	s.pipes = append(s.pipes, p)
 	if s.JoinReady() {
 		t.Fatal("live receive-only join counts")
 	}
-	p.mp.in = inEnded
+	p.mp.in = InEnded
 	if !s.JoinReady() {
 		t.Fatal("ended receive-only join must free target")
 	}
@@ -69,9 +69,9 @@ func TestJoinReadyIgnoresPeerJoinsAndEndedReceiveOnly(t *testing.T) {
 
 func TestJoinReadyAllowsSuspendedCapacityRecoveryWithoutMutating(t *testing.T) {
 	s := targetSession()
-	s.pipes[0].mp.out, s.pipes[0].mp.in = outFailed, inEnded
+	s.pipes[0].mp.out, s.pipes[0].mp.in = OutFailed, InEnded
 	for len(s.pipes) < s.mp.ownCap {
-		s.pipes = append(s.pipes, &Pipe{mp: &attach{joinerLocal: true, out: outFailed, in: inEnded}})
+		s.pipes = append(s.pipes, &Pipe{mp: &attach{joinerLocal: true, out: OutFailed, in: InEnded}})
 	}
 	if s.JoinReady() {
 		t.Fatal("active session still obeys physical headroom")

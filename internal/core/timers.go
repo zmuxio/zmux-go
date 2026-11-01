@@ -8,6 +8,9 @@ type timers struct {
 	linger       Time
 	lastActivity Time // last event that restarted the idle timer
 	lastKeepRef  Time
+	keepDrawn    Time    // the lastActivity the keep-alive wait was drawn for
+	keepCut      float64 // that wait is k x (1 - keepCut), keepCut in [0, j]
+	keepHas      bool
 	laneWait     Time // CONNECTION_CLOSE waits for lanes until then
 	grace        Time // resume grace
 }
@@ -34,8 +37,8 @@ func (s *Session) NextTimeout() Time {
 		if d := s.idleTimeout(); d > 0 {
 			t = minT(t, s.timers.lastActivity.Add(d))
 		}
-		if k := s.cfg.KeepAlive; k > 0 && s.ping.outstanding == 0 && s.timers.lastKeepRef != s.timers.lastActivity {
-			t = minT(t, s.timers.lastActivity.Add(k))
+		if at, ok := s.keepAliveAt(); ok && s.ping.outstanding == 0 && s.timers.lastKeepRef != s.timers.lastActivity {
+			t = minT(t, at)
 		}
 	}
 	if s.ping.outstanding != 0 {
@@ -47,6 +50,10 @@ func (s *Session) NextTimeout() Time {
 	if s.mp != nil {
 		t = minT(t, s.mpNextTimeout())
 	}
+	if s.shp != nil {
+		t = minT(t, s.shapeDeadline())
+	}
+	t = minT(t, s.heldDeadline())
 	if s.ack != nil {
 		t = minT(t, s.paceDeadline())
 		t = minT(t, s.qualityTimers(s.now, false))
@@ -97,7 +104,7 @@ func (s *Session) HandleTimeout(now Time) {
 			s.idleExpired()
 			return
 		}
-		if k := s.cfg.KeepAlive; k > 0 && s.ping.outstanding == 0 && now >= s.timers.lastActivity.Add(k) &&
+		if at, ok := s.keepAliveAt(); ok && s.ping.outstanding == 0 && now >= at &&
 			s.timers.lastKeepRef != s.timers.lastActivity {
 			s.timers.lastKeepRef = s.timers.lastActivity
 			s.ping.want = true
@@ -110,10 +117,39 @@ func (s *Session) HandleTimeout(now Time) {
 	if s.mp != nil {
 		s.mpHandleTimeout(now)
 	}
+	if s.shp != nil {
+		s.shapeTimeout(now)
+	}
+	s.expireHeld(now)
 	if s.ack != nil {
 		s.paceTimeout(now)
 		s.qualityTimers(now, true)
 	}
+}
+
+// keepAliveAt returns when the next keep-alive falls due (SPEC.md 6.4):
+// the period k is KeepAlive capped at half the effective idle timeout, and
+// each restart of the timer draws its wait from [k x (1 - j), k] with the
+// probe jitter j.
+func (s *Session) keepAliveAt() (Time, bool) {
+	k := s.cfg.KeepAlive
+	if k <= 0 {
+		return 0, false
+	}
+	if d := s.idleTimeout(); d > 0 {
+		k = min(k, d/2)
+	}
+	tm := &s.timers
+	if !tm.keepHas || tm.keepDrawn != tm.lastActivity {
+		tm.keepHas, tm.keepDrawn, tm.keepCut = true, tm.lastActivity, 0
+		if j := s.cfg.ProbeJitter; j > 0 {
+			tm.keepCut = j * s.rand().Float64()
+		}
+	}
+	if c := tm.keepCut; c > 0 {
+		k = Duration(float64(k) * (1 - c))
+	}
+	return tm.lastActivity.Add(k), true
 }
 
 // idleExpired closes on the idle timeout (SPEC.md 6.4).

@@ -41,7 +41,6 @@ const (
 
 // limiter is the carrier queue limiter of one outbound pipe.
 type limiter struct {
-	mode limMode
 	// Startup: the last growth step and the round trips since without
 	// 25 % more.
 	full float64
@@ -52,24 +51,29 @@ type limiter struct {
 	// Probe (base refresh).
 	pr limProbeState
 
+	tokens   float64
+	refilled Time
+	inFlight uint64
+	release  Time // Never: until an acknowledgement makes room
+	heldMin  winMin
+
 	nearAt, explainedAt Time
 	baseD               Duration
-	baseHas             bool
 	recent              winMin // u over max(srtt/2, the gap since the last sample)
 	lastSample          Time
-	hasLastSample       bool
 	bottleneck          winMax // bottleneck rate samples (r_q)
 	roundMax            float64
 	boundSet            Time
-	boundHas            bool
 
-	tokens    float64
-	hasTokens bool
-	refilled  Time
-	inFlight  uint64
-	held      bool
-	release   Time // Never: until an acknowledgement makes room
-	heldMin   winMin
+	// The one-byte fields, together for the layout: the mode, the flags
+	// of tokens and release above, then those of baseD, lastSample and
+	// boundSet.
+	mode          limMode
+	hasTokens     bool
+	held          bool
+	baseHas       bool
+	hasLastSample bool
+	boundHas      bool
 }
 
 type limProbeState struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -119,6 +120,6 @@ func FuzzListenerInput(f *testing.F) {
 				_ = c.Close()
 			}
 		}()
-		_ = l.HandlePipe(ctx, NetPipe(a), JoinHint{Source: "fuzz"})
+		_ = l.HandlePipe(ctx, NetPipe(a), JoinHint{Source: netip.MustParseAddrPort("192.0.2.1:1")})
 	})
 }

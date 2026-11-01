@@ -7,9 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -43,8 +47,10 @@ type Conn struct {
 	clk clock
 	cfg *Config
 
-	timer   *time.Timer
-	timerAt core.Time
+	timer     timeshim.Timer
+	timerAt   core.Time
+	timerArm  core.Time     // when the timer was armed to fire
+	timerLate time.Duration // smoothed lateness of the host timer
 
 	pipes  map[uint64]*pipeDrv
 	wg     sync.WaitGroup
@@ -58,7 +64,8 @@ type Conn struct {
 	orphanSig atomic.Pointer[core.Signal]
 
 	events      eventQueue
-	pipeWaiters []*core.Signal    // AddPipe waiting for a join (woken on pipe state changes)
+	pipeWaiters []*core.Signal // AddPipe waiting for a join (woken on pipe state changes)
+
 	oobHeaders  map[uint64]string // Zmux-Pipe-Join values of reservations
 	labels      map[uint64]string // pipe labels
 	lst         *Listener         // the listener that accepted the session
@@ -67,16 +74,27 @@ type Conn struct {
 	retiredDone []uint64          // pipes retired in the previous one
 	hk          *hooks            // application hooks (nil: none)
 	redial      redialer
-	needRedial  bool // a direction may have been lost (under the lock)
-	dialed      dialer
+	needRedial  bool        // a direction may have been lost (under the lock)
+	dialed      Endpoint    // who dialed the bootstrap carrier; 0: unknown
+	carrier     CarrierKind // the kind DialMode chose
 
 	fired    bool // the timeout ran: rearm no earlier than G
 	closing  bool // CLOSED: no new goroutines
 	poisoned bool
+	// A shaping deadline is met in place: the timer is armed lead before
+	// it, by the host timer's observed lateness, and the callback waits
+	// for the deadline itself.
+	timerPrecise bool
+
+	chIn    chIn // received channel datagrams for the session
+	chInMax int  // the hand-off's length: the datagram receive queue's
+
+	carrierTries []CandidateResult // DialMode's tries, in order
 }
 
 var sigPool = sync.Pool{New: func() any { s := make([]*core.Signal, 0, 16); return &s }}
 var actPool = sync.Pool{New: func() any { s := make([]core.Action, 0, 4); return &s }}
+var pendPool = sync.Pool{New: func() any { s := make([]pendingAct, 0, 4); return &s }}
 
 // lock takes the session lock; the caller defers c.unlock().
 func (c *Conn) lock() { c.mu.Lock() }
@@ -114,17 +132,30 @@ func (c *Conn) unlock() {
 	} else if c.timer != nil {
 		c.timer.Stop()
 	}
-	c.mu.Unlock()
-	core.FireAll(ws)
-	clear(ws)
-	*wp = ws[:0]
-	sigPool.Put(wp)
+	pp := pendPool.Get().(*[]pendingAct)
+	pend := (*pp)[:0]
 	for _, a := range acts {
-		c.doAction(a)
+		pend = append(pend, c.resolveActionLocked(a))
 	}
 	clear(acts)
 	*ap = acts[:0]
 	actPool.Put(ap)
+	c.mu.Unlock()
+	if closed && c.lst != nil {
+		// Unregistered before any waiter learns of the end, so that a
+		// failed establishment returns with its registration gone.
+		c.lst.sessionClosed(c)
+	}
+	core.FireAll(ws)
+	clear(ws)
+	*wp = ws[:0]
+	sigPool.Put(wp)
+	for _, pa := range pend {
+		c.doAction(pa)
+	}
+	clear(pend)
+	*pp = pend[:0]
+	pendPool.Put(pp)
 	hk.start()
 	if redial {
 		c.maybeRedial()
@@ -134,9 +165,6 @@ func (c *Conn) unlock() {
 		close(c.done)
 		unregisterLaneKey(c)
 		forgetNesting(c)
-		if c.lst != nil {
-			c.lst.sessionClosed(c)
-		}
 	}
 	if r != nil {
 		// The session is closed; the panic is not propagated to the caller,
@@ -187,9 +215,17 @@ func (c *Conn) rearmLocked() {
 		}
 		return
 	}
-	d := c.clk.until(t)
+	arm := t
+	// Only the host clock is met in place: a configured clock moves on
+	// its own terms.
+	c.timerPrecise = c.clk.ext == nil && t == c.s.ShapingDeadline()
+	if c.timerPrecise {
+		arm = t.Add(-core.Duration(min(c.timerLate+c.timerLate/4+50*time.Microsecond, maxTimerLead)))
+	}
+	c.timerArm = arm
+	d := c.clk.until(arm)
 	if c.timer == nil {
-		c.timer = time.AfterFunc(d, c.onTimer)
+		c.timer = c.clk.afterFunc(d, c.onTimer)
 	} else {
 		c.timer.Reset(d)
 	}
@@ -199,8 +235,30 @@ func (c *Conn) rearmLocked() {
 // none).
 var timerFires atomic.Int64
 
+// maxTimerLead bounds how long a timer callback waits in place for a
+// shaping deadline: it yields in a loop (busy) for up to this long per
+// deadline, the CPU cost of meeting shaping deadlines precisely
+// (SetShaper).
+const maxTimerLead = 2 * time.Millisecond
+
 func (c *Conn) onTimer() {
 	timerFires.Add(1)
+	c.mu.Lock()
+	now := c.clk.now()
+	if late := time.Duration(now - c.timerArm); late >= 0 && late < time.Second {
+		c.timerLate += (late - c.timerLate) / 8
+	}
+	at, precise := c.timerAt, c.timerPrecise
+	c.mu.Unlock()
+	if precise && at != core.Never && time.Duration(at-now) <= maxTimerLead {
+		// Wait in place for the deadline the timer fired ahead of. A
+		// callback that started before a rearm reads the new deadline,
+		// which may be further away: it does not wait (the rearmed timer
+		// fires for it).
+		for c.clk.now() < at {
+			runtime.Gosched()
+		}
+	}
 	c.lock()
 	defer c.unlock()
 	if c.closing {
@@ -254,9 +312,9 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 	c.lst = lst
 	switch {
 	case lst != nil || cc.TransportRole == core.RoleResponder:
-		c.dialed = dialPeer
+		c.dialed = EndpointPeer
 	case cc.TransportRole == core.RoleInitiator:
-		c.dialed = dialLocal
+		c.dialed = EndpointLocal
 	}
 	registerLaneKey(c)
 	c.lock()
@@ -371,10 +429,20 @@ func clientOwning(ctx context.Context, nc net.Conn, cfg *Config) (*Conn, error) 
 
 // Client starts a client session on a connection the caller established
 // (TCP, TLS, Unix or any net.Conn), like tls.Client; it returns as Start
-// does. The session owns c from then on, unless Client fails with
-// ErrInvalidConfig.
+// does. With cfg.Credential, the connection starts with its prefix
+// (PresentPipe; a *tls.Conn is handshaken first). The session owns c from
+// then on, unless Client fails with ErrInvalidConfig.
 func Client(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
-	return Start(ctx, NetPipe(c), RoleClient, cfg)
+	p := NetPipe(c)
+	if cfg != nil {
+		if err := PresentPipe(ctx, p, cfg.Credential); err != nil {
+			if !errors.Is(err, ErrInvalidConfig) {
+				_ = c.Close()
+			}
+			return nil, err
+		}
+	}
+	return Start(ctx, p, RoleClient, cfg)
 }
 
 // Server starts a single-pipe server session on an accepted connection,
@@ -390,10 +458,14 @@ func Server(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
 }
 
 func newConn(cfg *Config, cc core.Config) *Conn {
-	c := &Conn{cfg: cfg, clk: newClock(), pipes: make(map[uint64]*pipeDrv, 1), done: make(chan struct{}),
+	c := &Conn{cfg: cfg, clk: newClock(cfg.clock()), pipes: make(map[uint64]*pipeDrv, 1), done: make(chan struct{}),
 		timerAt: core.Never, oobHeaders: map[uint64]string{}, labels: map[uint64]string{}}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
 	c.s = core.New(cc, c.clk.now())
+	if cfg != nil && cfg.Shaper != nil {
+		c.s.SetShaper(coreFactory(cfg.Shaper))
+	}
+	c.chInMax = c.s.Config().DgramRecvQ
 	c.hk = newHooks(c)
 	return c
 }
@@ -553,14 +625,21 @@ type ConnectionState struct {
 	Resume             bool
 	JoinSecurityAbsent bool
 	PeerIsZmux         bool
+	// PeerGoAway holds the watermarks of the GOAWAY frames received (the
+	// minimum per stream type) and the latest error code; nil while none
+	// was received. EventGoAwayReceived reports each one.
 	PeerGoAway         *GoAway
 	MaxDatagramPayload int
 }
 
-// GoAway are the watermarks of a received GOAWAY.
+// GoAway are the watermarks of a received GOAWAY (EXTENSIONS.md Section 3):
+// streams the receiver initiated with an index at or above MaxBidi
+// (bidirectional) or MaxUni (unidirectional) were not and will not be
+// processed by the peer, and fail with a retryable error.
 type GoAway struct {
 	MaxBidi, MaxUni uint64
-	ErrorCode       ApplicationErrorCode
+	// ErrorCode is the GOAWAY's application error code.
+	ErrorCode ApplicationErrorCode
 }
 
 // ConnectionState returns the negotiation results.
@@ -591,37 +670,109 @@ func (c *Conn) ConnectionState() ConnectionState {
 	return st
 }
 
-// ConnectionStats are transport counters.
+// ConnectionStats is a snapshot of a session's statistics (API.md 7.2).
+// Each field holds a value it had during the call; relations between
+// counts (a subset, a sum) hold for their final values, not in every
+// snapshot. Counts only increase, from 0 when the session was made;
+// the fields marked gauge are current values. A duration or RTT that is
+// absent (before the first sample) is 0.
 type ConnectionStats struct {
+	// Carrier is the carrier kind a carrier mode chose (DialMode), the
+	// latest after a switch; 0 for a session not dialed in a mode.
+	Carrier CarrierKind
+	// CarrierCandidates are the tries of the mode's candidates in order,
+	// joins of preferred kinds included: the latest 64.
+	CarrierCandidates []CandidateResult
+
+	// BytesSent and BytesReceived count every byte of the records passed
+	// to and received from the carriers (framing, frames of every kind,
+	// copies and acknowledgements included), not what a carrier adds.
 	BytesSent, BytesReceived     uint64
 	RecordsSent, RecordsReceived uint64
-	StreamsOpenedLocal           uint64
-	StreamsOpenedRemote          uint64
-	DatagramsSent                uint64
-	DatagramsReceived            uint64
-	DatagramsDroppedSend         uint64
-	DatagramsDroppedRecv         uint64
-	DatagramsDroppedLimit        uint64
-	BytesWritten, BytesRead      uint64 // application bytes
-	BytesRedundant               uint64 // stream bytes sent again as redundant copies
-	NoEffectBudget               int64
-	// EventsDropped counts the events NextEvent's queue dropped because
-	// nobody read them in time.
-	EventsDropped uint64
+
+	// The application bytes (API.md 7.1): stream payload the application
+	// wrote and read, and datagram payload handed to a carrier and
+	// returned to the application.
+	BytesWritten, BytesRead                  uint64
+	DatagramBytesSent, DatagramBytesReceived uint64
+
+	// StreamsOpenedLocal counts a local stream when its first frame is
+	// emitted or it is pinned, StreamsOpenedRemote a peer stream when it is
+	// first seen.
+	StreamsOpenedLocal, StreamsOpenedRemote uint64
+	StreamsActive                           uint64 // gauge: streams the session holds
+	StreamCreditWaits                       uint64 // opens that waited for stream-count credit
+
+	// DatagramsSent counts session and stream datagrams handed to a
+	// carrier, DatagramsReceived those received and queued for the
+	// application; the Channel counts are those of them on a carrier
+	// datagram channel (DatagramChannel).
+	DatagramsSent, DatagramsReceived               uint64
+	DatagramsSentChannel, DatagramsReceivedChannel uint64
+	// DatagramsDroppedSend counts datagrams dropped from the send queue,
+	// DatagramsDroppedRecv received ones dropped (a full queue, an unknown
+	// or closed stream, the byte limit), DatagramsDroppedLimit those a
+	// datagram limiter dropped, either way.
+	DatagramsDroppedSend, DatagramsDroppedRecv, DatagramsDroppedLimit uint64
+
+	NoEffectBudget uint64 // gauge: tokens of the no-effect budget
+
+	// The RTT of pipe 0 outside multipath, of the primary pipe in a
+	// multipath session; MeanDeviation is 0 where the source measures no
+	// variation.
+	SmoothedRTT, MinRTT, LatestRTT, MeanDeviation time.Duration
+
+	// BytesReinjected counts stream bytes sent again after a pipe failed
+	// or became suspect, or opportunistically; BytesOpportunistic those
+	// of them sent opportunistically.
+	BytesReinjected, BytesOpportunistic uint64
+	Penalties                           uint64 // pipes penalized for slowing down
+	Reinjections                        uint64 // reinjection episodes
+	BytesRedundant                      uint64 // stream bytes sent as redundant copies
+	BytesDuplicateReceived              uint64 // stream bytes received again (multipath)
+
+	SendBuffered uint64 // gauge: written stream bytes not yet sent
+	RecvBuffered uint64 // gauge: received stream bytes not yet read
+	Retained     uint64 // gauge: sent stream bytes not yet acknowledged (multipath)
+
+	PipesActive      uint64 // gauge: ACTIVE outbound pipes
+	PipesAdded       uint64 // attachments, the bootstrap pair included
+	PipeFailures     uint64
+	JoinAuthFailures uint64 // joins whose token did not verify
+	JoinReplays      uint64 // joins closed as replays or too late
+	JoinRefusals     uint64 // own joins refused with ZMUX_PIPE_RESOURCE_LIMIT
+	Suspensions      uint64
+	SuspendedTime    time.Duration // the current suspension included
+
+	SchedulerAnswers   uint64 // custom scheduler answers that named a pipe and were applied; Wait is not counted
+	SchedulerFallbacks uint64 // answers replaced by the affinity choice
 }
 
-// ConnectionStats returns a snapshot of the counters.
+// ConnectionStats returns a snapshot of the session's statistics.
 func (c *Conn) ConnectionStats() ConnectionStats {
 	c.lock()
 	defer c.unlock()
-	s := c.s.SessionStats()
-	return ConnectionStats{BytesSent: s.BytesSent, BytesReceived: s.BytesReceived, RecordsSent: s.RecordsSent,
-		RecordsReceived: s.RecordsReceived, StreamsOpenedLocal: s.StreamsOpenedLocal,
-		StreamsOpenedRemote: s.StreamsOpenedRemote, DatagramsSent: s.DatagramsSent,
-		DatagramsReceived: s.DatagramsReceived, DatagramsDroppedSend: s.DatagramsDroppedSend,
-		DatagramsDroppedRecv: s.DatagramsDroppedRecv, DatagramsDroppedLimit: s.DatagramsDroppedLimit,
-		BytesWritten: s.AppBytesWritten, BytesRead: s.AppBytesRead, BytesRedundant: s.BytesRedundant,
-		NoEffectBudget: c.s.BudgetTokens(), EventsDropped: c.events.dropped}
+	c.s.SetNow(c.clk.now()) // SuspendedTime is current
+	s, g := c.s.SessionStats(), c.s.Gauges()
+	return ConnectionStats{Carrier: c.carrier, CarrierCandidates: slices.Clone(c.carrierTries),
+		BytesSent: s.BytesSent, BytesReceived: s.BytesReceived, RecordsSent: s.RecordsSent,
+		RecordsReceived: s.RecordsReceived, BytesWritten: s.AppBytesWritten, BytesRead: s.AppBytesRead,
+		DatagramBytesSent: s.DatagramBytesSent, DatagramBytesReceived: s.DatagramBytesReceived,
+		StreamsOpenedLocal: s.StreamsOpenedLocal, StreamsOpenedRemote: s.StreamsOpenedRemote,
+		StreamsActive: g.StreamsActive, StreamCreditWaits: s.StreamCreditWaits,
+		DatagramsSent: s.DatagramsSent, DatagramsReceived: s.DatagramsReceived,
+		DatagramsSentChannel: s.DatagramsSentChannel, DatagramsReceivedChannel: s.DatagramsReceivedChannel,
+		DatagramsDroppedSend: s.DatagramsDroppedSend, DatagramsDroppedRecv: s.DatagramsDroppedRecv,
+		DatagramsDroppedLimit: s.DatagramsDroppedLimit, NoEffectBudget: c.s.BudgetTokens(),
+		SmoothedRTT: time.Duration(g.SmoothedRTT), MinRTT: time.Duration(g.MinRTT),
+		LatestRTT: time.Duration(g.LatestRTT), MeanDeviation: time.Duration(g.MeanDeviation),
+		BytesReinjected: s.BytesReinjected, BytesOpportunistic: s.BytesOpportunistic, Penalties: s.Penalties,
+		Reinjections: s.Reinjections, BytesRedundant: s.BytesRedundant, BytesDuplicateReceived: s.BytesDuplicateReceived,
+		SendBuffered: g.SendBuffered, RecvBuffered: g.RecvBuffered, Retained: g.Retained,
+		PipesActive: g.PipesActive, PipesAdded: s.PipesAdded, PipeFailures: s.PipeFailures,
+		JoinAuthFailures: s.JoinAuthFailures, JoinReplays: s.JoinReplays, JoinRefusals: s.JoinRefusals,
+		Suspensions: s.Suspensions, SuspendedTime: time.Duration(s.SuspendedTime),
+		SchedulerAnswers: s.SchedulerAnswers, SchedulerFallbacks: s.SchedulerFallbacks}
 }
 
 // LocalAddr returns the local address of pipe 0 when its carrier has one.
@@ -832,6 +983,7 @@ func (c *Conn) open(ctx context.Context, bidi, wait bool) (*handle, error) {
 		if errors.Is(err, core.ErrStreamLimit) && wait && ctx != nil {
 			if sig == nil {
 				sig = core.NewSignal()
+				c.s.CountCreditWait()
 			} else {
 				c.s.CancelOpenWait(bidi, sig)
 			}

@@ -4,4 +4,5 @@ use (
 	.
 	./zmuxh3
 	./zmuxquic
+	./zmuxws
 )

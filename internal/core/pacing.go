@@ -55,11 +55,8 @@ func (s *Session) limiterOf(p *Pipe) *limiter {
 
 // srttOf is the smoothed RTT the limiter uses for p.
 func (s *Session) srttOf(p *Pipe) Duration {
-	if p.mp != nil {
-		return p.mp.rtt.smoothed
-	}
-	if p.out.snd.rtt.has {
-		return p.out.snd.rtt.smoothed
+	if d, ok := p.srtt(); ok {
+		return d
 	}
 	return 333 * Millisecond
 }
@@ -122,7 +119,10 @@ func (s *Session) paceSent(p *Pipe, bytes uint64) {
 // paceSample feeds the single pipe's first QX_PING round trip.
 func (s *Session) pacePing(rtt Duration) {
 	p := s.pipe(0)
-	if p == nil || p.out == nil || p.mp != nil || p.out.snd.rtt.has {
+	if p == nil || p.out == nil {
+		return
+	}
+	if _, ok := p.srtt(); ok {
 		return
 	}
 	if l := s.limiterOf(p); l != nil {

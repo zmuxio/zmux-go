@@ -44,15 +44,15 @@ type retained struct {
 
 // mpSend is the multipath side storage of a sending part.
 type mpSend struct {
-	acked      rangeSet // acknowledged byte ranges
-	resend     rangeSet // ranges to send again
-	finAcked   bool
-	finResend  bool
+	acked      rangeSet   // acknowledged byte ranges
+	resend     rangeSet   // ranges to send again
 	bind       binding    // affinity
 	rr         []rrVal    // own round-robin values
 	pick       pickAnswer // custom policy answer
+	oppSent    rangeSet   // bytes re-sent opportunistically (once each)
+	finAcked   bool
+	finResend  bool
 	pickQueued bool
-	oppSent    rangeSet // bytes re-sent opportunistically (once each)
 }
 
 func (sp *sendPart) mpState() *mpSend {
@@ -76,7 +76,7 @@ type recDesc struct {
 }
 
 // retainBatch moves the logged frames of a batch into the lane's log.
-func (s *Session) retainBatch(w *recWriter, ol *outLane, start uint64) {
+func (s *Session) retainBatch(w *recWriter, ol *outLane, start, ahead uint64) {
 	if len(w.descs) == 0 {
 		return
 	}
@@ -92,7 +92,7 @@ func (s *Session) retainBatch(w *recWriter, ol *outLane, start uint64) {
 	// fixed at sending so that a pipe that slows down cannot raise it.
 	var due Duration
 	if p := w.pipe; p != nil && p.mp != nil {
-		due = timeAt(p.mp.unsentAhead+(pos-start), s.rateOf(p)) + p.mp.minRTT() + s.ack.peerDelay
+		due = timeAt(ahead+(pos-start), s.rateOf(p)) + p.mp.minRTT() + s.ack.peerDelay
 	}
 	for _, rd := range w.descs {
 		e := pos
@@ -124,18 +124,22 @@ func (s *Session) reinjectPipe(p *Pipe) {
 	if p.out == nil {
 		return
 	}
+	episode := false
 	for _, ol := range p.out.lanes {
 		for i := range ol.log {
 			e := &ol.log[i]
 			if e.reinjected {
 				continue
 			}
-			e.reinjected = true
+			e.reinjected, episode = true, true
 			if e.d.kind == dStream {
 				p.mp.reinjectedBytes += e.d.n
 			}
 			s.lost(&e.d)
 		}
+	}
+	if episode {
+		s.stats.Reinjections++
 	}
 	s.wakeAllWriters()
 }
@@ -187,7 +191,7 @@ func (s *Session) streamAckProgress(st *Stream) {
 		h := s.heldEnter(st)
 		sp.q.release(min64(pre, sp.q.end))
 		s.heldLeave(st, h)
-		s.mp.retained -= min64(s.mp.retained, min64(sp.q.base, sp.sent)-min64(rel, sp.sent))
+		s.mp.release(min64(sp.q.base, sp.sent) - min64(rel, sp.sent))
 		s.wake(st.wsig)
 	}
 	end := sp.q.end
@@ -313,4 +317,40 @@ func (s *Session) retransmitBudget() uint64 {
 	}
 	b := uint64(4 * sum)
 	return min64(max64(b, 1<<20), max64(s.sendBufferLimit(), 1<<20))
+}
+
+// Retention accounting (multipath only): stream bytes sent and not yet
+// acknowledged, bounded by retransmitBudget. The methods are no-ops on a
+// session without multipath (nil m).
+
+// retain counts n newly sent stream bytes.
+func (m *multiPath) retain(n uint64) {
+	if m != nil {
+		m.retained += n
+	}
+}
+
+// release uncounts n acknowledged or dropped stream bytes.
+func (m *multiPath) release(n uint64) {
+	if m != nil {
+		m.retained -= min64(m.retained, n)
+	}
+}
+
+// retainedBytes is the retained stream data.
+func (m *multiPath) retainedBytes() uint64 {
+	if m == nil {
+		return 0
+	}
+	return m.retained
+}
+
+// capRetained caps n new stream bytes to what the retransmit budget still
+// takes.
+func (s *Session) capRetained(n uint64) uint64 {
+	if s.mp == nil {
+		return n
+	}
+	b := s.retransmitBudget()
+	return min64(n, b-min64(b, s.mp.retained))
 }

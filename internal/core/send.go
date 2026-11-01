@@ -112,6 +112,65 @@ func (s *Session) Write(st *Stream, p []byte, fin bool) (int, error) {
 	return n, nil
 }
 
+// WriteSpace lends the caller the free tail of the part's send block, at
+// most limit bytes and no more than the send buffer admits, to fill in
+// place; CommitWrite then takes the bytes written into it. An empty slice
+// with a nil error means wait (WaitWrite). Until CommitWrite the part takes
+// no other write and the caller may fill the slice without the session
+// lock: the bytes lie above the block's filled length, which nothing else
+// reads or writes.
+func (s *Session) WriteSpace(st *Stream, limit int) ([]byte, error) {
+	s.pickInput()
+	if err := s.writeErr(st); err != nil {
+		return nil, err
+	}
+	sp := &st.snd
+	if sp.res != nil {
+		panic("zmux: WriteSpace without CommitWrite")
+	}
+	room := s.sendRoom(st)
+	if room == 0 || limit <= 0 {
+		return nil, nil
+	}
+	blk := sp.q.lendTail()
+	n := min(blockSize-blk.n, limit)
+	if uint64(n) > room {
+		n = int(room)
+	}
+	sp.res = blk
+	return blk.b[blk.n : blk.n+n : blk.n+n], nil
+}
+
+// CommitWrite takes the first n bytes of the slice WriteSpace lent (n may be
+// 0) and ends the loan. The bytes are taken even when the send buffer
+// shrank meanwhile, so it may run over by less than one block. A part
+// reset or closed meanwhile discards them and returns its error.
+func (s *Session) CommitWrite(st *Stream, n int) error {
+	sp := &st.snd
+	blk := sp.res
+	if blk == nil {
+		panic("zmux: CommitWrite without WriteSpace")
+	}
+	sp.res = nil
+	s.pickInput()
+	if err := s.writeErr(st); err != nil || n == 0 {
+		blk.unref()
+		return err
+	}
+	h := s.heldEnter(st)
+	if st.unsent() == 0 {
+		sp.waitAt = s.now
+	}
+	sp.q.commitTail(blk, n)
+	s.stats.AppBytesWritten += uint64(n)
+	sp.appWritten += uint64(n)
+	sp.wwait = false
+	sp.writeDone = s.now
+	s.heldLeave(st, h)
+	s.becomeSend(st)
+	return nil
+}
+
 func (s *Session) becomeSend(st *Stream) {
 	if st.snd.state == sendReady && st.idSet {
 		st.snd.state = sendSend
@@ -288,7 +347,9 @@ func (s *Session) Reset(st *Stream, code uint64) {
 			return
 		}
 		// Data below a reliable boundary must be delivered: open now.
-		s.allocID(st)
+		if !s.allocID(st) {
+			return
+		}
 	}
 	s.startReset(st, code, false)
 }
@@ -398,8 +459,8 @@ func (s *Session) onSendCredit(st *Stream, v uint64) bool {
 func (s *Session) sendTerminal(st *Stream, state sendState) {
 	sp := &st.snd
 	sp.state = state
-	if s.mp != nil && sp.sent > sp.q.base {
-		s.mp.retained -= min64(s.mp.retained, sp.sent-sp.q.base)
+	if sp.sent > sp.q.base {
+		s.mp.release(sp.sent - sp.q.base)
 	}
 	h := s.heldEnter(st)
 	sp.wwait = false

@@ -14,7 +14,7 @@ import (
 
 func TestListenerMemoryBudget(t *testing.T) {
 	leakcheck.Check(t)
-	type note struct{ used, budget uint64 }
+	type note struct{ used, budget int64 }
 	notes := make(chan note, 16)
 	const budget = 128 << 10
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -23,7 +23,7 @@ func TestListenerMemoryBudget(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 	l := NewListener(&ListenerConfig{MemoryBudget: budget, Config: &Config{},
-		OnMemoryPressure: func(used, b uint64) { notes <- note{used, b} }})
+		OnMemoryPressure: func(used, b int64) { notes <- note{used, b} }})
 	defer func() { _ = l.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

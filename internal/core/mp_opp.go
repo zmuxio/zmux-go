@@ -27,7 +27,7 @@ func streamBlocked(st *Stream) bool {
 // is the eligible pipe with the earliest arrival.
 func (s *Session) opportunistic(d *decision, w *recWriter) {
 	m := s.mp
-	if d.g == nil || !d.takes || d.fastest != d.p || w.dataRoom == 0 {
+	if d.g == nil || !d.takes || d.fastest != d.p || w.dataHeld() {
 		return
 	}
 	f := d.p
@@ -88,7 +88,10 @@ func (s *Session) oppSend(w *recWriter, f *Pipe, st *Stream) bool {
 	if lo >= hi {
 		return true
 	}
-	room := w.room() - wire.StreamHeaderLen(st.id, lo, int(hi-lo), true)
+	if w.gateRoom() == 0 {
+		return false // the shaping gate holds it: no record is planned for it
+	}
+	room := w.dataFit(w.room() - wire.StreamHeaderLen(st.id, lo, int(hi-lo), true))
 	if room <= 0 {
 		return false
 	}
@@ -104,6 +107,8 @@ func (s *Session) oppSend(w *recWriter, f *Pipe, st *Stream) bool {
 	w.logFrame(frameDesc{kind: dStream, id: st.id, off: lo, n: n})
 	w.spendData(n)
 	ms.oppSent.add(lo, lo+n)
+	st.countFrame(lo, n)
+	s.stats.BytesReinjected += n
 	s.stats.BytesOpportunistic += n
 	f.mp.oppBytes += n
 	s.penalize(p)
@@ -159,6 +164,7 @@ func (s *Session) penalize(p *Pipe) {
 		return
 	}
 	a.penalized = true
+	s.stats.Penalties++
 	a.penaltyEnd = p.out.snd.so
 	e := &p.out.snd.re
 	r := e.value()

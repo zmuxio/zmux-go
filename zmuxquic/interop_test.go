@@ -132,7 +132,7 @@ func bulkAndClose(t *testing.T, ctx context.Context, c *zmux.Conn, p *peerProc) 
 	}
 	var lanes int
 	for _, ps := range c.PipeStats() {
-		lanes += ps.Lanes
+		lanes += ps.LanesOut
 	}
 	if lanes < 1 {
 		t.Errorf("no lanes: %+v", c.PipeStats())
@@ -188,7 +188,7 @@ func TestInteropQUICServer(t *testing.T) {
 	defer cancel()
 	l := zmux.NewListener(&zmux.ListenerConfig{Config: interopConfig(nil)})
 	defer func() { _ = l.Close() }()
-	go func() { _ = Serve(ctx, ln, l) }()
+	go func() { _ = Serve(ctx, ln, l, nil) }()
 	p := startPeer(t, "quic-client", ln.Addr().String())
 	c, err := l.Accept(ctx)
 	if err != nil {

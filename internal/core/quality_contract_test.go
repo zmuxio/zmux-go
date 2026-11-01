@@ -9,14 +9,14 @@ func capacitySession() *Session {
 	return s
 }
 func capacityExtra(s *Session) *Pipe {
-	p := &Pipe{id: uint64(len(s.pipes) * 2), mp: &attach{out: outActive, in: inOpen, probOpt: -1, weight: 1}, out: &outDir{lanes: []*outLane{{}}}}
+	p := &Pipe{id: uint64(len(s.pipes) * 2), mp: &attach{out: OutActive, in: InOpen, probOpt: -1, weight: 1}, out: &outDir{lanes: []*outLane{{}}}}
 	s.pipes = append(s.pipes, p)
 	return p
 }
 func capacityMP() *Session {
 	s := capacitySession()
 	s.mp = &multiPath{}
-	s.pipes[0].mp = &attach{out: outActive, in: inOpen, probOpt: -1, weight: 1}
+	s.pipes[0].mp = &attach{out: OutActive, in: InOpen, probOpt: -1, weight: 1}
 	return s
 }
 func measuredRate(p *Pipe, rate float64) {
@@ -142,10 +142,10 @@ func TestCapacityStateAndPriorityChangesReportWithoutAnotherAcknowledgement(t *t
 	p := s.pipes[0]
 	measuredRate(p, 2000000)
 	s.SetCapacityFloor(CapacityFloor{Rate: 1500000, RateRatio: 1.01})
-	p.mp.out = outFailed
+	p.mp.out = OutFailed
 	s.emitPipeState(p)
 	wantCapacity(t, s, EvCapacityBelow, 0)
-	p.mp.out = outActive
+	p.mp.out = OutActive
 	s.emitPipeState(p)
 	wantCapacity(t, s, EvCapacityRestored, 2000000)
 	standby := true
@@ -159,7 +159,7 @@ func TestCapacityStateAndPriorityChangesReportWithoutAnotherAcknowledgement(t *t
 	if s.q.floorSet || s.q.floor != nil {
 		t.Fatal("zero floor retained monitoring state")
 	}
-	p.mp.out = outFailed
+	p.mp.out = OutFailed
 	s.emitPipeState(p)
 	if e, ok := takeCapacity(s); ok {
 		t.Fatalf("disabled floor reported %+v", e)

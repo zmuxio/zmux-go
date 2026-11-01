@@ -2,6 +2,7 @@ package core
 
 import (
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // Sending part states (RFC 9000 Section 3.1).
@@ -82,6 +83,29 @@ type Stream struct {
 
 	pol    uint8 // scheduling policy + 1; 0: the session's
 	redund int8  // SetRedundant: 1 on, -1 off, 0 the session default
+
+	cnt streamCounters
+}
+
+// streamCounters are the counts of StreamStats that no other field keeps
+// (API.md 7.2); they are never reset, so a released stream keeps them.
+type streamCounters struct {
+	bytesSent       uint64 // payload bytes put into STREAM frames, every copy
+	appRead         uint64 // payload bytes returned to the application
+	dgSent          uint64
+	dgBytesSent     uint64
+	dgReceived      uint64
+	dgBytesReceived uint64
+	dgDropped       uint64 // dropped from the stream's full queue
+}
+
+// countFrame counts the payload bytes of a STREAM frame [off, off+n) of
+// st that is put into a record, the preamble excluded.
+func (st *Stream) countFrame(off, n uint64) {
+	if pre := st.snd.preLen; off < pre {
+		n -= min64(n, pre-off)
+	}
+	st.cnt.bytesSent += n
 }
 
 // streamExt is the rarely used state of a stream, allocated on first use.
@@ -160,6 +184,7 @@ type sendPart struct {
 	laneEnd    uint64  // lane position after the direction's last frame on it
 	mps        *mpSend // multipath retention state (nil outside multipath)
 	appWritten uint64  // application bytes written (excludes the preamble)
+	res        *block  // block lent by WriteSpace until CommitWrite, with a reference
 
 	// Ages for tier saturation.
 	waitAt    Time // the oldest unsent byte's write
@@ -327,7 +352,16 @@ func (s *Session) newStream(bidi, local bool) *Stream {
 }
 
 // allocID gives a local stream its identifier (SPEC.md 7.2 rule 1).
-func (s *Session) allocID(st *Stream) {
+// allocID allocates the identifier and queues the preamble. A preamble
+// above the peer's limit (which may have shrunk since it was set) fails
+// the stream locally instead: nothing is sent, and it returns false.
+func (s *Session) allocID(st *Stream) bool {
+	if s.feat.Preamble {
+		if lim := s.preambleMax(); uint64(st.preSize()) > lim {
+			s.failPreamble(st, lim)
+			return false
+		}
+	}
 	t := typeIndex(st.bidi)
 	idx := s.loc[t].next
 	s.loc[t].next++
@@ -338,6 +372,9 @@ func (s *Session) allocID(st *Stream) {
 		s.openLocalBidiRecv++
 	}
 	s.streams[st.id] = st
+	if s.shp != nil {
+		s.shapeStream(shaping.EventStreamOpen, st.id)
+	}
 	st.applyPeerParams()
 	if s.feat.Preamble {
 		var pre wire.PreambleSpec
@@ -345,12 +382,16 @@ func (s *Session) allocID(st *Stream) {
 			pre = *st.pre
 		}
 		if s.greaseFirst {
-			s.greaseFirst = false
 			if s.cfg.Test.Enabled {
 				pre.Grease = s.cfg.Test.GreaseTLV
 			} else {
 				g := randUint64()
 				pre.Grease = &wire.TLV{Type: 0x21 + 0x1f*(g%1000), Value: nil}
+			}
+			if uint64(pre.Size()) > s.preambleMax() {
+				pre.Grease = nil // a later stream carries it
+			} else {
+				s.greaseFirst = false
 			}
 		}
 		b := wire.AppendPreamble(make([]byte, 0, pre.Size()), &pre)
@@ -363,6 +404,52 @@ func (s *Session) allocID(st *Stream) {
 		}
 	}
 	st.pre = nil
+	return true
+}
+
+// floorPreamble is the preamble limit every zmux endpoint advertises at
+// least (FloorParams).
+const floorPreamble = 1024
+
+// preambleMax is the largest preamble the peer accepts: its parameter,
+// known or assumed for early data (remembered or the floor), else the
+// floor.
+func (s *Session) preambleMax() uint64 {
+	if (s.peerSeen || s.earlyActive()) && s.peer.Has&wire.HasPreamble != 0 {
+		return s.peer.Preamble
+	}
+	return floorPreamble
+}
+
+// preambleErr is the error of a preamble above lim.
+func preambleErr(lim uint64) *StreamError {
+	return &StreamError{Kind: StreamPreambleTooLarge, Code: lim}
+}
+
+// failPreamble fails a stream whose preamble the peer would not accept,
+// before it is announced.
+func (s *Session) failPreamble(st *Stream, lim uint64) {
+	e := preambleErr(lim)
+	if st.hasS && st.snd.errState == nil {
+		st.snd.errState = e
+	}
+	if st.hasR && st.rcv.errState == nil {
+		st.rcv.errState = e
+	}
+	s.cancelUnopened(st)
+}
+
+// editPreamble applies f to the local preamble and keeps the change only
+// when the result fits the peer's limit.
+func (s *Session) editPreamble(st *Stream, f func(ps *wire.PreambleSpec)) error {
+	ps := st.preSpec()
+	old := *ps
+	f(ps)
+	if lim := s.preambleMax(); uint64(ps.Size()) > lim {
+		*ps = old
+		return preambleErr(lim)
+	}
+	return nil
 }
 
 // applyPeerParams sets the initial send credit from the peer's parameters.
@@ -408,7 +495,9 @@ func (s *Session) PinID(st *Stream) (uint64, error) {
 	if !s.peerSeen {
 		return 0, ErrNotEstablished
 	}
-	s.allocID(st)
+	if !s.allocID(st) {
+		return 0, st.snd.errState
+	}
 	st.pinned = true
 	s.sched.ensure(st)
 	s.wakeAllWriters()
@@ -432,10 +521,10 @@ func (s *Session) SetOpenInfo(st *Stream, b []byte) error {
 	if err := s.beforeFirstFrame(st); err != nil {
 		return err
 	}
-	ps := st.preSpec()
-	ps.OpenInfo = append([]byte(nil), b...)
-	ps.HasOpenInfo = true
-	return nil
+	return s.editPreamble(st, func(ps *wire.PreambleSpec) {
+		ps.OpenInfo = append([]byte(nil), b...)
+		ps.HasOpenInfo = true
+	})
 }
 
 // AddPreambleTLV adds an application TLV before the first frame.
@@ -446,9 +535,9 @@ func (s *Session) AddPreambleTLV(st *Stream, t uint64, v []byte) error {
 	if err := s.beforeFirstFrame(st); err != nil {
 		return err
 	}
-	ps := st.preSpec()
-	ps.App = append(ps.App, wire.TLV{Type: t, Value: append([]byte(nil), v...)})
-	return nil
+	return s.editPreamble(st, func(ps *wire.PreambleSpec) {
+		ps.App = append(ps.App, wire.TLV{Type: t, Value: append([]byte(nil), v...)})
+	})
 }
 
 // SetPipeCarrier marks the stream as a carrier before the first frame.
@@ -456,8 +545,7 @@ func (s *Session) SetPipeCarrier(st *Stream) error {
 	if err := s.beforeFirstFrame(st); err != nil {
 		return err
 	}
-	st.preSpec().PipeCarrier = true
-	return nil
+	return s.editPreamble(st, func(ps *wire.PreambleSpec) { ps.PipeCarrier = true })
 }
 
 // SetPriority sets local scheduling priority.
@@ -477,9 +565,9 @@ func (s *Session) SetPeerPriority(st *Stream, urgency uint8, incr bool) error {
 		return ErrInvalid
 	}
 	if st.local && !st.idSet {
-		ps := st.preSpec()
-		ps.HasPriority, ps.Urgency, ps.Incr = true, urgency, incr
-		return nil
+		return s.editPreamble(st, func(ps *wire.PreambleSpec) {
+			ps.HasPriority, ps.Urgency, ps.Incr = true, urgency, incr
+		})
 	}
 	if !s.feat.Priority {
 		return ErrNotNegotiated

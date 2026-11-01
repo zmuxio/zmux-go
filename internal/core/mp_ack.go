@@ -59,33 +59,36 @@ func (s *Session) mpAdvanced(p *Pipe, ol *outLane, ps *pipeSend, now Time) {
 	a.lastAdvance = now
 	if len(ps.samples) == 0 {
 		a.unacked = false
+		s.setAhead(p, aheadSnap{})
 	} else {
 		a.unacked, a.oldestAt = true, ps.samples[0].sent
+		s.setAhead(p, ps.samples[0].ahead)
 	}
 	switch a.out {
-	case outJoining:
+	case OutJoining:
 		if ol.lane == 0 {
-			a.out = outActive
+			a.out = OutActive
 			s.joinConfirmed(p)
 		}
-	case outSuspect:
+	case OutSuspect:
 		if _, st := s.writeStall(p); !st {
-			a.out = outActive
+			a.out = OutActive
 			s.startProbation(p)
 			s.emitPipeState(p)
 			s.checkTakeover()
 		}
-	case outNone, outActive, outDraining, outFailed, outClosed:
+	case OutNone, OutActive, OutDraining, OutFailed, OutClosed, OutRetired:
 		// An acknowledgement changes no other state.
 	}
 	s.revalAcked(p)
+	s.pingsAcked(p)
 	s.penaltyAcked(p)
 	s.mpLaneAdvanced(p, ol)
 }
 
 // mpLaneAdvanced runs after any lane of the pipe was acknowledged further.
 func (s *Session) mpLaneAdvanced(p *Pipe, _ *outLane) {
-	if p.mp.out == outDraining {
+	if p.mp.out == OutDraining {
 		s.checkDrain(p)
 	}
 	s.wakeAllWriters()
@@ -95,6 +98,7 @@ func (s *Session) mpLaneAdvanced(p *Pipe, _ *outLane) {
 func (s *Session) joinConfirmed(p *Pipe) {
 	a := p.mp
 	a.liveAt = s.now
+	s.drawProbe(a, p, false)
 	s.mp.backoffExp = 0
 	s.startProbation(p)
 	if len(a.statusQ) > 1 {
@@ -111,9 +115,12 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 	m := s.mp
 	switch f.Kind {
 	case wire.KindPipePing:
+		s.charge() // every PIPE_PING (SPEC.md 9.4.1 NE-2)
 		s.ack.immediate = true
-		if p.mp != nil && p.out != nil && p.mp.out != outFailed {
+		if p.mp != nil && s.answersOnPair(p) {
 			p.mp.ackPair = true
+		} else {
+			s.ack.pairless = true
 		}
 		s.wakeAllWriters()
 	case wire.KindPipeAbandon:

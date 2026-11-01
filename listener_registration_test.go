@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
 // A peer can join as soon as it receives our parameters, even while its
@@ -49,5 +51,29 @@ func TestListenerRegistersBeforeBootstrapParameters(t *testing.T) {
 	defer listener.mu.Unlock()
 	if len(listener.sessions) != 0 || len(listener.live) != 0 {
 		t.Error("failed establishment retained its registration")
+	}
+}
+
+// A carrier waiting for its first record is abandoned when its context
+// ends or the listener closes, not only at the first-record timeout.
+func TestListenerFirstRecordAbandoned(t *testing.T) {
+	leakcheck.Check(t)
+	l := NewListener(&ListenerConfig{FirstRecordTimeout: time.Minute})
+	ctx, cancel := context.WithCancel(context.Background())
+	for _, stop := range []func(){cancel, func() { _ = l.Close() }} {
+		a, b := net.Pipe()
+		done := make(chan error, 1)
+		go func() { done <- l.HandlePipe(ctx, NetPipe(a), JoinHint{}) }()
+		stop()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("carrier without a first record accepted")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("carrier still waiting for its first record")
+		}
+		_ = b.Close()
+		ctx = context.Background()
 	}
 }

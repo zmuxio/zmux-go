@@ -6,21 +6,27 @@ import (
 
 // JoinOptions are the options of a local join.
 type JoinOptions struct {
-	Dir          uint8 // MULTIPATH 5.1: 0 up, 1 down, 2 bidi (joiner's view)
 	FateGroup    uint64
-	OOB          bool
-	CarrierBound bool
 	Binding      []byte // TLS exporter of the new carrier (carrier-bound)
 	SendPriority *uint64
 	SendStandby  *bool
 	RecvPriority uint64
-	RecvStandby  bool
 	Weight       uint64
 	Probation    *Duration // nil: the session default; 0 disables
 	SuspectFloor Duration  // 0: the session default
 	DeadTimeout  Duration  // 0: the session default
-	In, Out      CarrierInfo
-	OutSig       *Signal
+	// ProbeInterval (0: the session default; negative: off) and
+	// ProbeJitter (0: the session default; negative: 0) of MULTIPATH.md
+	// 7.1.
+	ProbeInterval Duration
+	ProbeJitter   float64
+	In, Out       CarrierInfo
+	OutSig        *Signal
+	Dir           uint8 // MULTIPATH 5.1: 0 up, 1 down, 2 bidi (joiner's view)
+	OOB           bool
+	CarrierBound  bool
+	RecvStandby   bool
+	Kind          uint8 // the carrier's kind (SetPipeKind)
 }
 
 // AddPipeResult says what happened to a local join.
@@ -98,8 +104,9 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	}
 	id := m.nextID
 	m.nextID += 2
-	p := &Pipe{id: id}
-	a := &attach{out: outNone, in: inNone, joinerLocal: true, dir: o.Dir, fate: o.FateGroup, attachedAt: s.now, liveAt: s.now,
+	p := &Pipe{id: id, carrier: o.Kind}
+	s.stats.PipesAdded++
+	a := &attach{out: OutNone, in: InNone, joinerLocal: true, dir: o.Dir, fate: o.FateGroup, attachedAt: s.now, liveAt: s.now,
 		lastAdvance: s.now, lastRecord: s.now, oob: o.OOB, weight: 1, probOpt: -1}
 	if o.Probation != nil {
 		a.probOpt = *o.Probation
@@ -109,18 +116,20 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	}
 	a.rtt = s.initialRTT(id)
 	a.suspectFloor, a.deadTimeout = o.SuspectFloor, o.DeadTimeout
+	a.probeIv, a.probeJit = o.ProbeInterval, o.ProbeJitter
+	s.drawProbe(a, nil, false)
 	a.sendPrio, a.sendStandby = o.SendPriority, o.SendStandby
 	a.recvPrio, a.recvStandby = o.RecvPriority, o.RecvStandby
 	p.mp = a
 	if o.Dir != 1 { // up or bidi: we write
 		p.out = &outDir{lanes: []*outLane{{info: o.Out, confirmed: true}}, sig: o.OutSig}
 		p.out.lo.offered = o.Out.Lanes
-		a.out = outJoining
+		a.out = OutJoining
 		a.firstRecord = true
 	}
 	if o.Dir != 0 { // down or bidi: we read
 		p.in = &inDir{lanes: []*inLane{{info: o.In}}}
-		a.in = inJoining
+		a.in = InJoining
 		a.discardTP = true
 	}
 	j := &wire.Join{Locator: m.peerLocator, PipeID: id, Dir: o.Dir, CarrierBound: o.CarrierBound,
@@ -172,9 +181,10 @@ const (
 
 // Carrier describes the carrier of a peer join to the acceptor.
 type Carrier struct {
-	HasIn, HasOut bool // the directions the carrier provides to the acceptor
 	In, Out       CarrierInfo
 	OutSig        *Signal // wakes the outbound writer
+	HasIn, HasOut bool    // the directions the carrier provides to the acceptor
+	Kind          uint8   // the carrier's kind (SetPipeKind)
 	// Refuse: the join would run over its own session (EXTENSIONS.md
 	// 10.2); it is refused with ZMUX_PIPE_RESOURCE_LIMIT once verified.
 	Refuse bool
@@ -199,10 +209,10 @@ func (s *Session) AcceptJoin(j *wire.Join, macInput, binding []byte, c Carrier) 
 		b = binding
 	}
 	if !wire.VerifyJoinToken(m.keyPeer, macInput, b, j.Token) {
-		m.joinAuthFails++
-		reason := "mac"
+		s.stats.JoinAuthFailures++
+		reason := JoinAuthMAC
 		if j.CarrierBound {
-			reason = "mac_carrier_bound"
+			reason = JoinAuthMACCarrierBound
 		}
 		s.emit(Event{Kind: EvJoinAuthFailed, Reason: reason})
 		return JoinClose
@@ -210,7 +220,7 @@ func (s *Session) AcceptJoin(j *wire.Join, macInput, binding []byte, c Carrier) 
 	id := j.PipeID
 	if !s.ownParity(id) {
 		if s.pipe(id) != nil || m.idRetired(id) {
-			m.joinReplays++
+			s.stats.JoinReplays++
 			return JoinClose
 		}
 	} else {
@@ -233,19 +243,21 @@ func (s *Session) AcceptJoin(j *wire.Join, macInput, binding []byte, c Carrier) 
 	}
 	m.bits[id] = true
 	m.raise(id)
-	p := &Pipe{id: id}
-	a := &attach{out: outNone, in: inNone, dir: j.Dir, fate: j.FateGroup, attachedAt: s.now, liveAt: s.now, lastAdvance: s.now,
+	p := &Pipe{id: id, carrier: c.Kind}
+	s.stats.PipesAdded++
+	a := &attach{out: OutNone, in: InNone, dir: j.Dir, fate: j.FateGroup, attachedAt: s.now, liveAt: s.now, lastAdvance: s.now,
 		lastRecord: s.now, weight: 1, peerPrio: j.Priority, peerStandby: j.Standby, probOpt: -1}
 	a.rtt = s.initialRTT(id)
+	s.drawProbe(a, nil, false)
 	p.mp = a
 	if needIn {
 		p.in = &inDir{lanes: []*inLane{{info: in}}}
-		a.in = inOpen
+		a.in = InOpen
 	}
 	if needOut {
 		p.out = &outDir{lanes: []*outLane{{info: out, confirmed: true}}, sig: outSig}
 		p.out.lo.offered = out.Lanes
-		a.out = outActive
+		a.out = OutActive
 		a.firstRecord = true
 		a.needPing = true
 		a.pingSince = s.now
@@ -295,13 +307,14 @@ func (m *multiPath) abandonCodes(id, code uint64) {
 }
 
 func (s *Session) emitPipeState(p *Pipe) {
+	s.mp.stateGen++
 	s.pickChanged()
 	o, i, _ := s.PipeState(p.id)
 	if p.out != nil {
-		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirOut, State: o})
+		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirOut, OutState: o, Carrier: p.carrier})
 	}
 	if p.in != nil {
-		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirIn, State: i})
+		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirIn, InState: i, Carrier: p.carrier})
 	}
 }
 
@@ -326,7 +339,7 @@ func (s *Session) roomCandidate(local, provideIn, provideOut bool) *Pipe {
 		if a == nil || a.retired || a.joinerLocal != local {
 			continue
 		}
-		if a.liveOut() || a.in == inOpen || a.in == inJoining {
+		if a.liveOut() || a.in == InOpen || a.in == InJoining {
 			continue
 		}
 		if oldest == nil || a.attachedAt < oldest.mp.attachedAt {
@@ -360,7 +373,7 @@ func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 		return false
 	}
 	a := oldest.mp
-	if a.liveOut() || a.in == inOpen || a.in == inJoining {
+	if a.liveOut() || a.in == InOpen || a.in == InJoining {
 		a.abandonSent = true // displaced without PIPE_ABANDON
 		s.failPipe(oldest, wire.PipeFailed, nil)
 	}
@@ -397,7 +410,7 @@ func (s *Session) JoinReady() bool {
 	n := 0
 	for _, p := range s.pipes {
 		a := p.mp
-		if a == nil || !a.joinerLocal || a.retired || a.out == outFailed || a.out == outNone && a.in == inEnded {
+		if a == nil || !a.joinerLocal || a.retired || a.out == OutFailed || a.out == OutNone && a.in == InEnded {
 			continue
 		}
 		n++
@@ -405,9 +418,21 @@ func (s *Session) JoinReady() bool {
 	return n < max(1, s.cfg.MaxPipes)
 }
 
-// WakePipe wakes the writers of an attachment (a carrier was attached).
-func (s *Session) WakePipe(id uint64) {
-	if p := s.pipe(id); p != nil && p.out != nil {
+// AttachCarrier gives a reserved attachment (AddPipe with OOB) its
+// carrier: the carrier's info replaces the placeholder's, so that its
+// records are framed and sized for it, and the writers are woken.
+func (s *Session) AttachCarrier(id uint64, info CarrierInfo, kind uint8) {
+	p := s.pipe(id)
+	if p == nil {
+		return
+	}
+	s.SetPipeKind(id, kind)
+	if p.in != nil {
+		p.in.lanes[0].info = info
+	}
+	if p.out != nil {
+		p.out.lanes[0].info = info
+		p.out.lo.offered = info.Lanes
 		s.wakePipe(p)
 	}
 }

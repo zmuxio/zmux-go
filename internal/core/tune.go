@@ -48,8 +48,8 @@ func (m *minFilter) update(d Duration, now Time) {
 type tuneState struct {
 	carrierMin Duration // the carrier's own minimum RTT, 0 when unknown
 	loopMin    minFilter
-	paused     bool   // growth paused from the buffer cap until below half
 	proposal   uint64 // session window growth awaiting the predicate
+	paused     bool   // growth paused from the buffer cap until below half
 	asking     bool
 }
 
@@ -218,18 +218,19 @@ func (s *Session) connAllowance() uint64 {
 		return ^uint64(0)
 	}
 	used := c.buffered + c.win - min64(c.win, s.initConnWin)
-	if s.mp != nil {
-		used += s.mp.retained
-	}
+	used += s.mp.retainedBytes()
 	if used >= b {
 		return c.win
 	}
 	return c.win + (b - used)
 }
 
-// tuneData feeds a stream's new highest offset to its and the session's tuner.
-func (s *Session) tuneData(st *Stream, end uint64) {
+// tuneData feeds a stream's highest received offset to its and the
+// session's tuner: with multipath a frame may end below it, and a lower
+// offset would make a rate sample of the wrapped difference.
+func (s *Session) tuneData(st *Stream) {
 	r := &st.rcv
+	end := r.highest
 	if r.tune == nil && end >= r.window/4 {
 		// A stream gets its tuner once it carried a quarter of its window:
 		// one that exchanges small messages never needs a larger window.

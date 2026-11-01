@@ -47,10 +47,10 @@ func heapNow() uint64 {
 	return m.HeapAlloc
 }
 
-func fpConfig() *Config { return &Config{MaxIdleTimeout: -1} }
+func fpConfig() *Config { return &Config{MaxIdleTimeout: -1, KeepAlivePeriod: -1} }
 
 func fpMPConfig() *Config {
-	return &Config{MaxIdleTimeout: -1, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes....")}}
+	return &Config{MaxIdleTimeout: -1, KeepAlivePeriod: -1, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes....")}}
 }
 
 func fpPairs(t *testing.T, n int) [][2]*Conn { return fpPairsOver(t, n, nil) }
@@ -195,7 +195,7 @@ func TestFootprint(t *testing.T) {
 	// Streams: opened by one end, accepted by the other, nothing buffered;
 	// many on one session pair, as the per-stream cost.
 	const nst = 10000
-	scfg := &Config{MaxIdleTimeout: -1, MaxIncomingStreams: 2 * nst}
+	scfg := &Config{MaxIdleTimeout: -1, KeepAlivePeriod: -1, MaxIncomingStreams: 2 * nst}
 	pc, pd := net.Pipe()
 	sc, ss := pair(t, pc, pd, scfg, scfg)
 	ctx := context.Background()

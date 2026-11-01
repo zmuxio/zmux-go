@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -10,17 +11,25 @@ import (
 // outbound pipe when its smoothed RTT leaves +-RTT around the last
 // reported value, or its delivery rate leaves [last/RateRatio,
 // last*RateRatio]; at most one per pipe per MinInterval, the latest values
-// winning. A zero RTT or RateRatio turns that half off, so the zero
-// QualityBand reports nothing; a zero MinInterval means 1 s, a negative
-// one no minimum.
+// winning. The zero QualityBand reports nothing. A negative or NaN field
+// is invalid (ErrInvalidConfig).
 type QualityBand struct {
-	RTT         time.Duration
-	RateRatio   float64
+	// RTT is the band around the reported smoothed RTT. Zero turns this
+	// half off.
+	RTT time.Duration
+	// RateRatio is the factor around the reported delivery rate. Zero
+	// turns this half off.
+	RateRatio float64
+	// MinInterval is the least time between two events of a pipe. Zero
+	// is 1 s; no minimum takes NoMinInterval.
 	MinInterval time.Duration
+	// NoMinInterval sets no minimum time between events.
+	NoMinInterval bool
 }
 
 // CapacityFloor asks for EventCapacityBelow once the summed delivery rate
-// of the usable, non-standby outbound pipes falls below Rate (bytes/s), and
+// of the usable, non-standby outbound pipes falls below Rate (bytes per
+// second, as every delivery rate of the API), and
 // EventCapacityRestored once it is back at Rate*RateRatio. A zero Rate
 // turns it off, so the zero CapacityFloor reports nothing; a zero
 // RateRatio means 1.25.
@@ -29,27 +38,41 @@ type CapacityFloor struct {
 	RateRatio float64
 }
 
-func (b QualityBand) core() core.QualityBand {
+// core resolves b for the core, whose MinInterval is 0 for the default
+// and negative for none.
+func (b QualityBand) core() (core.QualityBand, error) {
+	if b.RTT < 0 || !(b.RateRatio >= 0) || b.MinInterval < 0 {
+		return core.QualityBand{}, fmt.Errorf("%w: negative or NaN QualityBand field", ErrInvalidConfig)
+	}
 	mi := core.Duration(b.MinInterval)
-	if b.MinInterval < 0 {
+	if b.NoMinInterval {
 		mi = -1
 	}
-	return core.QualityBand{RTT: core.Duration(b.RTT), RateRatio: b.RateRatio, MinInterval: mi}
+	return core.QualityBand{RTT: core.Duration(b.RTT), RateRatio: b.RateRatio, MinInterval: mi}, nil
 }
 
 // SetQualityBand sets the default band of the session's pipes.
-func (c *Conn) SetQualityBand(b QualityBand) {
+func (c *Conn) SetQualityBand(b QualityBand) error {
+	cb, err := b.core()
+	if err != nil {
+		return err
+	}
 	c.lock()
 	defer c.unlock()
-	_ = c.s.SetQualityBand(-1, b.core())
+	_ = c.s.SetQualityBand(-1, cb)
+	return nil
 }
 
 // SetQualityBand sets the band of this pipe.
 func (p *Pipe) SetQualityBand(b QualityBand) error {
+	cb, err := b.core()
+	if err != nil {
+		return err
+	}
 	c := p.c
 	c.lock()
 	defer c.unlock()
-	return pipeErr(c.s.SetQualityBand(int64(p.id), b.core()))
+	return pipeErr(c.s.SetQualityBand(int64(p.id), cb))
 }
 
 // SetCapacityFloor sets the capacity floor of the outbound direction.

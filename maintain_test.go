@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ func TestMaintainPipesRedials(t *testing.T) {
 	count := func() int {
 		n := 0
 		for _, p := range e.client.PipeStats() {
-			if p.ID != 0 && p.State == "active" {
+			if p.Pipe != 0 && p.Outbound == OutboundActive {
 				n++
 			}
 		}
@@ -45,8 +46,8 @@ func TestMaintainPipesRedials(t *testing.T) {
 	}
 	wait(2)
 	for _, p := range e.client.PipeStats() {
-		if p.ID != 0 {
-			pp, _ := e.client.Pipe(p.ID)
+		if p.Pipe != 0 {
+			pp, _ := e.client.Pipe(p.Pipe)
 			_ = pp.Abort(nil)
 			break
 		}
@@ -99,4 +100,88 @@ func TestMaintainPipesDoesNotDialWhenTargetIsFull(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("did not attempt recovery when target slot became free")
 	}
+}
+
+// A rotation dial waits for the pool's backoff, counted from the start of
+// the previous dial, and its failures grow that backoff as a redial's do.
+func TestMaintainPipesRotationBacksOff(t *testing.T) {
+	t.Parallel()
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	dial := tcpDialer(e.ln.Addr().String())
+	var dials, maxFailures atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- e.client.MaintainPipes(ctx, PipePool{MinBackoff: 400 * time.Millisecond, MaxBackoff: 10 * time.Second,
+			Rotate: Rotation{MaxAge: time.Millisecond},
+			Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
+				if f := int64(v.Failures); f > maxFailures.Load() {
+					maxFailures.Store(f)
+				}
+				d.Recheck = MinRecheck // passes keep coming
+			}),
+			Dial: func(ctx context.Context) (PipeIO, error) {
+				if dials.Add(1) > 1 {
+					return PipeIO{}, errors.New("test dial refused")
+				}
+				return dial(ctx)
+			}})
+	}()
+	defer func() {
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("MaintainPipes ended with %v, want the cancellation", err)
+		}
+	}()
+	waitUntil(t, 5*time.Second, "first rotation dial", func() bool { return dials.Load() >= 2 })
+	time.Sleep(1500 * time.Millisecond)
+	// Waits of at least 0.8 x 800 ms and 0.8 x 1.6 s follow the first failure.
+	if n := dials.Load() - 2; n > 2 {
+		t.Fatalf("%d rotation dials in 1.5 s after a failure", n)
+	}
+	if maxFailures.Load() < 1 {
+		t.Fatal("rotation failures not counted")
+	}
+}
+
+// A Join member reports its pipes in the pool view.
+func TestMaintainPipesJoinMemberPipes(t *testing.T) {
+	t.Parallel()
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	dial := tcpDialer(e.ln.Addr().String())
+	var pipes atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- e.client.MaintainPipes(ctx, PipePool{
+			Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
+				for _, m := range v.Members {
+					pipes.Store(int64(m.Pipes))
+				}
+				d.Recheck = MinRecheck
+			}),
+			Join: func(ctx context.Context, c *Conn, o PipeOptions) ([]*Pipe, error) {
+				var ps []*Pipe
+				for range 2 {
+					io, err := dial(ctx)
+					if err != nil {
+						return ps, err
+					}
+					p, err := c.AddPipe(ctx, io, o)
+					if err != nil {
+						closePipeIO(io)
+						return ps, err
+					}
+					ps = append(ps, p)
+				}
+				return ps, nil
+			}})
+	}()
+	defer func() {
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Errorf("MaintainPipes ended with %v, want the cancellation", err)
+		}
+	}()
+	waitUntil(t, 5*time.Second, "member of two pipes", func() bool { return pipes.Load() == 2 })
 }

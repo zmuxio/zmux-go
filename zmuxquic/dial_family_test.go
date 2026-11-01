@@ -24,12 +24,13 @@ func TestPoolDialUsesDestinationUDPFamily(t *testing.T) {
 			e := newEnvAt(t, tc.address, mpConfig())
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			pool := NewPool(e.ln.Addr().String(), e.cli, nil, zmux.PoolLimits{})
+			pool := NewPool(e.ln.Addr().String(), e.cli, nil, nil, zmux.PoolLimits{})
 			defer pool.Shutdown()
-			qc, err := pool.pool.Dial(ctx)
+			pc, err := pool.pool.Dial(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
+			qc := pc.qc
 			defer func() { _ = qc.CloseWithError(0, "") }()
 			local := qc.LocalAddr().(*net.UDPAddr)
 			if (local.IP.To4() != nil) != tc.v4 {
@@ -62,12 +63,13 @@ func TestPoolDialPreservesHostnameWithoutChangingCallerTLS(t *testing.T) {
 	address := net.JoinHostPort("localhost", strconv.Itoa(e.ln.Addr().(*net.UDPAddr).Port))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	pool := NewPool(address, cfg, nil, zmux.PoolLimits{})
+	pool := NewPool(address, cfg, nil, nil, zmux.PoolLimits{})
 	defer pool.Shutdown()
-	qc, err := pool.pool.Dial(ctx)
+	pc, err := pool.pool.Dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	qc := pc.qc
 	defer func() { _ = qc.CloseWithError(0, "") }()
 	if cfg.ServerName != "" {
 		t.Fatalf("caller TLS config changed: %q", cfg.ServerName)

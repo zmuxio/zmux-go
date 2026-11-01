@@ -159,9 +159,9 @@ func (c *Conn) lanesPayOff() bool {
 	defer c.unlock()
 	n := 0
 	for _, id := range c.s.PipeIDs(nil) {
-		if pi, ok := c.s.PipeInfo(id); ok && pi.HasOut && (pi.OutState == "ACTIVE" || pi.OutState == "JOINING") {
+		if pi, ok := c.s.PipeInfo(id); ok && pi.HasOut && (pi.OutState == core.OutActive || pi.OutState == core.OutJoining) {
 			n++
-			if pi.Lanes > 1 {
+			if pi.LanesOut > 1 {
 				return true
 			}
 		}

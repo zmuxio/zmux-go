@@ -1,6 +1,10 @@
 package wire
 
-import "bytes"
+import (
+	"bytes"
+
+	"github.com/zmuxio/zmux-go/varint"
+)
 
 // Transport parameter identifiers (REGISTRY.md Section 4).
 const (
@@ -25,11 +29,16 @@ const (
 	ParamMaxAckDelay          uint64 = 0x17fa1ed6
 	ParamMaxLanes             uint64 = 0x27856ef0
 	ParamResume               uint64 = 0x0d5778ce
+	ParamCarrierDatagrams     uint64 = 0x3d274c5f
 	ParamAppProtocols         uint64 = 0x3d4f9c2a8b1e6075 // the qmux crate's hook
 )
 
 // DefaultMaxRecordSize is the limit when max_record_size is absent.
 const DefaultMaxRecordSize = 16382
+
+// MaxRecordSize is zmux's own max_record_size: the largest record it
+// accepts, and the largest it sends to a peer that accepts more.
+const MaxRecordSize = 65535
 
 // Secret flags of zmux_multipath (MULTIPATH.md 3.1).
 const (
@@ -69,11 +78,12 @@ const (
 	HasLanes
 	HasResume
 	HasAppProtocols
+	HasCarrierDatagrams
 )
 
 // HasAnyZmux are the zmux parameters whose presence identifies a zmux peer.
 const HasAnyZmux = HasRole | HasGoAway | HasPreamble | HasPriority | HasFlows | HasMultipath |
-	HasAckThreshold | HasPipeAck | HasAckDelay | HasLanes | HasResume
+	HasAckThreshold | HasPipeAck | HasAckDelay | HasLanes | HasResume | HasCarrierDatagrams
 
 // Params is a set of transport parameters.
 type Params struct {
@@ -121,6 +131,7 @@ var paramBits = map[uint64]uint32{
 	ParamPriority: HasPriority, ParamDatagramFlows: HasFlows, ParamMultipath: HasMultipath,
 	ParamAckThreshold: HasAckThreshold, ParamPipeAck: HasPipeAck, ParamMaxAckDelay: HasAckDelay,
 	ParamMaxLanes: HasLanes, ParamResume: HasResume, ParamAppProtocols: HasAppProtocols,
+	ParamCarrierDatagrams: HasCarrierDatagrams,
 }
 
 // DecodeParams decodes and validates a parameter block (SPEC.md 5.2-5.5,
@@ -164,7 +175,7 @@ func DecodeParams(b []byte, p *Params) *Error {
 }
 
 func varintValue(v []byte) (uint64, *Error) {
-	x, n := ReadVarint(v)
+	x, n := varint.ConsumeVarint(v)
 	if n == 0 || n != len(v) {
 		return 0, ErrParam("malformed varint parameter")
 	}
@@ -174,7 +185,7 @@ func varintValue(v []byte) (uint64, *Error) {
 func (p *Params) decodeOne(id uint64, v []byte) *Error {
 	var err *Error
 	switch id {
-	case ParamResetStreamAt, ParamGoAway, ParamPriority, ParamDatagramFlows, ParamPipeAck:
+	case ParamResetStreamAt, ParamGoAway, ParamPriority, ParamDatagramFlows, ParamPipeAck, ParamCarrierDatagrams:
 		if len(v) != 0 {
 			return ErrParam("non-empty flag parameter")
 		}
@@ -206,7 +217,7 @@ func (p *Params) decodeOne(id uint64, v []byte) *Error {
 			err = ErrParam("max_record_size below 16382")
 		}
 	case ParamRole:
-		x, n := ReadVarint(v)
+		x, n := varint.ConsumeVarint(v)
 		if n == 0 || x > 2 {
 			return ErrParam("zmux_role")
 		}
@@ -246,7 +257,7 @@ func (p *Params) decodeOne(id uint64, v []byte) *Error {
 			err = ErrParam("zmux_max_ack_delay out of range")
 		}
 	case ParamMaxLanes:
-		x, n := ReadVarint(v)
+		x, n := varint.ConsumeVarint(v)
 		if n == 0 || x == 0 || len(v)-n != 16 {
 			return ErrParam("zmux_max_lanes")
 		}
@@ -291,15 +302,15 @@ func (p *Params) validate() *Error {
 }
 
 func appendParam(b []byte, id uint64, v []byte) []byte {
-	b = AppendVarint(b, id)
-	b = AppendVarint(b, uint64(len(v)))
+	b = varint.AppendVarint(b, id)
+	b = varint.AppendVarint(b, uint64(len(v)))
 	return append(b, v...)
 }
 
 func appendVarintParam(b []byte, id, v uint64) []byte {
-	b = AppendVarint(b, id)
-	b = AppendVarint(b, uint64(VarintLen(v)))
-	return AppendVarint(b, v)
+	b = varint.AppendVarint(b, id)
+	b = varint.AppendVarint(b, uint64(varint.SizeVarint(v)))
+	return varint.AppendVarint(b, v)
 }
 
 // AppendParams encodes the parameters present in p.Has.
@@ -336,7 +347,7 @@ func AppendParams(b []byte, p *Params) []byte {
 		b = appendVarintParam(b, ParamMaxRecordSize, p.MaxRecordSize)
 	}
 	if h&HasRole != 0 {
-		v := AppendVarint(nil, p.Role)
+		v := varint.AppendVarint(nil, p.Role)
 		if p.Role == RoleAuto {
 			for i := 7; i >= 0; i-- {
 				v = append(v, byte(p.RoleNonce>>(8*i)))
@@ -356,6 +367,9 @@ func AppendParams(b []byte, p *Params) []byte {
 	if h&HasFlows != 0 {
 		b = appendParam(b, ParamDatagramFlows, nil)
 	}
+	if h&HasCarrierDatagrams != 0 {
+		b = appendParam(b, ParamCarrierDatagrams, nil)
+	}
 	if h&HasMultipath != 0 {
 		v := make([]byte, 0, 18+len(p.Locator))
 		v = append(v, p.SecretFlags)
@@ -374,7 +388,7 @@ func AppendParams(b []byte, p *Params) []byte {
 		b = appendVarintParam(b, ParamMaxAckDelay, p.MaxAckDelay)
 	}
 	if h&HasLanes != 0 {
-		v := AppendVarint(nil, p.MaxLanes)
+		v := varint.AppendVarint(nil, p.MaxLanes)
 		v = append(v, p.LaneKey[:]...)
 		b = appendParam(b, ParamMaxLanes, v)
 	}

@@ -4,6 +4,7 @@ import (
 	"slices"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // Tiers, usability and the tier gate (MULTIPATH.md 9).
@@ -30,11 +31,11 @@ type tierInfo struct {
 
 // gate is the tier gate at one decision.
 type gate struct {
-	cls    class
 	pipes  []*Pipe // usable pipes, tier by tier, in attachment order within a tier
 	tiers  []tierInfo
 	last   int // index of the least-preferred eligible tier
 	fed    int // index of the least-preferred tier offered excess data
+	cls    class
 	allSat bool
 }
 
@@ -69,7 +70,7 @@ func (a *attach) inProbation() bool { return a.prob.on }
 // lets pipes in probation or awaiting revalidation count.
 func (s *Session) pipeUsable(p *Pipe, probOK bool) bool {
 	a := p.mp
-	if a == nil || p.out == nil || p.out.failed || a.out != outActive || a.retired {
+	if a == nil || p.out == nil || p.out.failed || a.out != OutActive || a.retired {
 		return false
 	}
 	return !a.penalized && (probOK || !a.inProbation() && !a.reval)
@@ -104,10 +105,10 @@ func (s *Session) usableClass() (class, bool) {
 func (s *Session) rateOf(p *Pipe) float64 { return p.out.snd.re.value() }
 
 // committed is the Q_p of tier saturation: bytes committed to p and not
-// yet transmitted. The core hands bytes over at write opportunities only,
-// so what is committed is what the carrier reports unsent; a pipe that
-// merely refuses bytes saturates nothing.
-func (s *Session) committed(p *Pipe) float64 { return float64(p.mp.unsentAhead) }
+// yet transmitted (queuedOn). The core hands bytes over at write
+// opportunities only, so a pipe that merely refuses bytes saturates
+// nothing.
+func (s *Session) committed(p *Pipe) float64 { return float64(s.queuedOn(p)) }
 
 // notsentLowat is the carrier low-water mark of multipath sessions.
 const notsentLowat = 32 << 10
@@ -618,7 +619,7 @@ func (s *Session) writeStatus(w *recWriter, q *Pipe) bool {
 		if r.standby {
 			st = 1
 		}
-		n := 4 + wire.VarintLen(id) + wire.VarintLen(r.seq) + wire.VarintLen(st) + wire.VarintLen(r.prio)
+		n := 4 + varint.SizeVarint(id) + varint.SizeVarint(r.seq) + varint.SizeVarint(st) + varint.SizeVarint(r.prio)
 		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPipeStatus(b, id, r.seq, st, r.prio) }) {
 			return false
 		}
@@ -635,6 +636,6 @@ func (s *Session) writeStatus(w *recWriter, q *Pipe) bool {
 // is ACTIVE (a change made while JOINING waits for that).
 func statusReady(q *Pipe) bool {
 	qa := q.mp
-	return qa != nil && len(qa.statusQ) > 0 && !qa.retired && q.in != nil && qa.in == inOpen &&
-		qa.out != outJoining && (!qa.joinerLocal || qa.out != outNone || qa.in != inJoining)
+	return qa != nil && len(qa.statusQ) > 0 && !qa.retired && q.in != nil && qa.in == InOpen &&
+		qa.out != OutJoining && (!qa.joinerLocal || qa.out != OutNone || qa.in != InJoining)
 }

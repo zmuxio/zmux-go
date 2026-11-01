@@ -20,7 +20,7 @@ import (
 	"github.com/zmuxio/zmux-go"
 )
 
-func tlsConfigs(t *testing.T) (*tls.Config, *tls.Config) {
+func tlsConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -53,23 +53,23 @@ type env struct {
 	cancel context.CancelFunc
 }
 
-func newEnv(t *testing.T, scfg *zmux.Config) *env {
+func newEnv(t testing.TB, scfg *zmux.Config) *env {
 	return newEnvAt(t, "127.0.0.1:0", scfg)
 }
 
-func newEnvAt(t *testing.T, address string, scfg *zmux.Config) *env {
+func newEnvAt(t testing.TB, address string, scfg *zmux.Config) *env {
 	return newEnvQUIC(t, address, scfg, &quic.Config{Allow0RTT: true})
 }
-func newEnvQUIC(t *testing.T, address string, scfg *zmux.Config, qconf *quic.Config) *env {
+func newEnvQUIC(t testing.TB, address string, scfg *zmux.Config, qconf *quic.Config) *env {
 	t.Helper()
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddrEarly(address, srv, QUICConfig(qconf))
+	ln, err := quic.ListenAddrEarly(address, srv, testQUIC(qconf))
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &env{ln: ln, lst: zmux.NewListener(&zmux.ListenerConfig{Config: scfg}), cli: cli, cancel: cancel}
-	go func() { _ = Serve(ctx, ln, e.lst) }()
+	go func() { _ = Serve(ctx, ln, e.lst, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		_ = ln.Close()
@@ -121,6 +121,7 @@ func TestQUICPipeAndLanes(t *testing.T) {
 		_ = s.Wait()
 	}()
 	echo(t, c, s, 1<<20)
+	checkKind(t, zmux.CarrierQUIC, c, s)
 	// Several bulk streams at once ask for lanes of pipe 0.
 	var wg sync.WaitGroup
 	for range 4 {
@@ -133,7 +134,7 @@ func TestQUICPipeAndLanes(t *testing.T) {
 	wg.Wait()
 	var lanes int
 	for _, p := range c.PipeStats() {
-		lanes += p.Lanes
+		lanes += p.LanesOut
 	}
 	if lanes < 2 {
 		t.Fatalf("no lanes were opened: %+v", c.PipeStats())
@@ -235,7 +236,7 @@ func TestQUICPool(t *testing.T) {
 	e := newEnv(t, mpConfig())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p := NewPool(e.ln.Addr().String(), e.cli, nil, zmux.PoolLimits{MaxPipesPerConnection: 2})
+	p := NewPool(e.ln.Addr().String(), e.cli, nil, nil, zmux.PoolLimits{MaxPipesPerConnection: 2})
 	defer p.Shutdown()
 	first, err := p.OpenPipe(ctx)
 	if err != nil {
@@ -318,9 +319,83 @@ func TestQUICCopyLane(t *testing.T) {
 		if err != nil || !bytes.Equal(got, msg) {
 			t.Fatalf("urgent echo %d: %v", i, err)
 		}
-		if c.ConnectionStats().BytesRedundant > 0 {
+		if r := c.ConnectionStats().BytesRedundant; r > 0 {
+			// The session count is the sum of the pipes' (taken later:
+			// at least as large).
+			var pipes uint64
+			for _, ps := range c.PipeStats() {
+				pipes += ps.BytesRedundant
+			}
+			if pipes < r {
+				t.Fatalf("pipes count %d redundant bytes, the session %d", pipes, r)
+			}
 			return
 		}
 	}
 	t.Fatalf("no copy on the copy lane: %+v", c.PipeStats())
+}
+
+// testQUIC is QUICConfig(base) with a handshake timeout that tolerates a
+// loaded test host: the default 5 s fails handshakes under -race with
+// many packages running at once.
+func testQUIC(base *quic.Config) *quic.Config {
+	c := QUICConfig(base)
+	c.HandshakeIdleTimeout = 30 * time.Second
+	return c
+}
+
+// checkKind fails the test unless every pipe of each session reports
+// carrier kind k.
+func checkKind(t *testing.T, k zmux.CarrierKind, cs ...*zmux.Conn) {
+	t.Helper()
+	for _, c := range cs {
+		st := c.PipeStats()
+		if len(st) == 0 {
+			t.Fatal("no pipes")
+		}
+		for _, p := range st {
+			if p.Carrier != k {
+				t.Fatalf("pipe %d: carrier %v, want %v", p.Pipe, p.Carrier, k)
+			}
+		}
+	}
+}
+
+// TestQUICHandshakeFailureCounted checks that Serve reports a connection
+// whose handshake fails before any stream arrived as a setup failure of
+// the listener, and nothing else. The server fails the handshake itself,
+// on the client's last flight (no client certificate), so the connection
+// has been accepted by then: a handshake that fails before the listener
+// hands the connection over is invisible to Serve and counted nowhere.
+func TestQUICHandshakeFailureCounted(t *testing.T) {
+	srv, cli := tlsConfigs(t)
+	srv.ClientAuth = tls.RequireAnyClientCert
+	ln, err := quic.ListenAddrEarly("127.0.0.1:0", srv, testQUIC(&quic.Config{Allow0RTT: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig()})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	served := make(chan struct{})
+	go func() { _ = Serve(ctx, ln, lst, nil); close(served) }()
+	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-served }()
+	if qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, testQUIC(nil)); err == nil {
+		// The client finishes first; the server's verdict closes the
+		// connection.
+		select {
+		case <-qc.Context().Done():
+		case <-ctx.Done():
+			t.Fatal("the handshake succeeded")
+		}
+	}
+	for lst.Stats().SetupFailures != 1 {
+		if ctx.Err() != nil {
+			t.Fatalf("stats %+v", lst.Stats())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if st := lst.Stats(); st != (zmux.ListenerStats{SetupFailures: 1}) {
+		t.Fatalf("stats %+v", st)
+	}
 }

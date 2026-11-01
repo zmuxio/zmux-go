@@ -10,6 +10,8 @@
 [![zmuxquic release](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=zmuxquic/*&label=zmuxquic)](https://github.com/zmuxio/zmux-go/tags)
 [![zmuxh3 docs](https://img.shields.io/badge/pkg.go.dev-zmuxh3-007d9c)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxh3)
 [![zmuxh3 release](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=zmuxh3/*&label=zmuxh3)](https://github.com/zmuxio/zmux-go/tags)
+[![zmuxws docs](https://img.shields.io/badge/pkg.go.dev-zmuxws-007d9c)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxws)
+[![zmuxws release](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=zmuxws/*&label=zmuxws)](https://github.com/zmuxio/zmux-go/tags)
 
 Go implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
@@ -27,9 +29,10 @@ and datagram flows.
 
 | Module | Purpose |
 | --- | --- |
-| `github.com/zmuxio/zmux-go` | core protocol, TCP/TLS/WebSocket/HTTP carriers |
+| `github.com/zmuxio/zmux-go` | core protocol, TCP/TLS/HTTP carriers, any message carrier |
 | `github.com/zmuxio/zmux-go/zmuxquic` | QUIC carriers (quic-go) |
 | `github.com/zmuxio/zmux-go/zmuxh3` | HTTP/3 and WebTransport carriers |
+| `github.com/zmuxio/zmux-go/zmuxws` | WebSocket carriers |
 
 ## Client
 
@@ -91,8 +94,9 @@ for {
 }
 ```
 
-`l.Shutdown(ctx, 0, "")` stops accepting and ends every session
-gracefully. `zmux.Server` serves a single connection without multipath.
+`l.Shutdown(ctx, 0, "")` stops accepting new sessions, ends every session
+gracefully while still taking their joins and resumptions, and then
+closes the listener; `l.Close()` refuses every carrier at once. `zmux.Server` serves a single connection without multipath.
 
 ## Closing
 
@@ -153,45 +157,33 @@ for {
 
 ## WebSocket
 
-A WebSocket connection carries one zmux record per binary message
-(`FramingRecords`). The adapter below fits libraries whose connections read
-and write whole messages:
+`zmuxws` carries one zmux record per binary message (`FramingRecords`),
+so proxies that re-chunk the byte stream cannot break records. The
+subprotocol is the application protocol identifier: `qmux-02` by default,
+`qmux-02.<application>` or an application's own identifier, each also
+accepted as its draft-01 alias.
 
 ```go
-type wsConn interface {
-	ReadMessage() (messageType int, p []byte, err error)
-	WriteMessage(messageType int, data []byte) error
-	Close() error
-}
+// server: upgrades go to l; other requests, and those the admission
+// does not accept, to Next
+h, err := zmuxws.Handler(l, &zmux.HTTPOptions{Next: site})
+http.Handle("/zmux", h)
 
-const binaryMessage = 2
-
-type wsAdapter struct{ c wsConn }
-
-func (a *wsAdapter) ReadMessage() ([]byte, error) {
-	for {
-		t, p, err := a.c.ReadMessage()
-		if err != nil || t == binaryMessage {
-			return p, err
-		}
-	}
-}
-func (a *wsAdapter) WriteMessage(p []byte) error { return a.c.WriteMessage(binaryMessage, p) }
-func (a *wsAdapter) Read([]byte) (int, error)    { return 0, errors.New("message carrier") }
-func (a *wsAdapter) Write([]byte) (int, error)   { return 0, errors.New("message carrier") }
-func (a *wsAdapter) Close() error                { return a.c.Close() }
-
-func wsPipe(c wsConn) zmux.PipeIO {
-	a := &wsAdapter{c: c}
-	return zmux.PipeIO{R: a, W: a, Framing: zmux.FramingRecords}
-}
-
-// client: zmux.Start(ctx, wsPipe(ws), zmux.RoleClient, cfg)
-// server: l.HandlePipe(ctx, wsPipe(ws), zmux.JoinHint{})
+// client
+conn, err := zmuxws.Dial(ctx, "wss://example.com/zmux", nil, nil)
 ```
 
-A WebSocket library that offers a byte-stream `net.Conn` view works with
-`zmux.Client` and `zmux.NetPipe` directly.
+Nothing is answered before a request is accepted: a request that is not a
+WebSocket upgrade, or offers no accepted subprotocol, goes to `Next`, and
+the admission decides on the upgrade request's head. A client's
+credential travels in the upgrade request: `Dial` presents
+`Config.Credential` and `DialPipe` `DialOptions.Credential`, for a
+`PrefixAuth` in its `Zmux-Prefix-Auth` field, which
+`PrefixAuthVerifier.Decide` checks.
+`DialPipe` opens a further pipe, with the `Zmux-Pipe-Join` field of a
+`Reservation` for an out-of-band join, and `zmuxws.Pipe` adapts a
+WebSocket connection established otherwise. A close frame ends a pipe
+gracefully; an aborted pipe closes the connection without one.
 
 ## HTTP exchanges
 
@@ -202,7 +194,10 @@ sequence of short POST requests. The server mounts a handler in front of
 its `Listener`:
 
 ```go
-h := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk})
+h, err := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk})
+if err != nil {
+	return err
+}
 defer h.Close()
 http.Handle("/x/", h)
 ```
@@ -224,18 +219,199 @@ it a query parameter is added). `DownURL` sends DOWN requests to another
 template (scheme, host, port and path may all differ, through other
 intermediaries); UP and CLOSE requests use the first. A carrier's state
 lives in one server process: with several backends, route every request of
-a carrier to the same one, for example by hashing `{instance}`. Both ends
-should use the same piece sizes: a body over the receiver's limit fails the
-carrier instead of being retried. Requests are numbered, idempotent and
+a carrier to the same one, for example by hashing `{instance}`. The
+default piece size keeps every body at most 1,000,000 bytes after the body
+encoding, below the 1 MiB request body limit common on reverse proxies;
+each end accepts pieces up to 1 MiB, or its own piece size when larger. A
+DOWN body over the client's limit fails the carrier, and an UP body over
+the server's is not taken and fails the carrier at the client's deadline.
+Requests are numbered, idempotent and
 authenticated, so lost, repeated, reordered and cached exchanges are
-recovered; `HTTPExchangeConfig` documents the timers, sizes and limits and
+recovered. Every request carries its send time and a random nonce: the
+server takes a request only within `MaxClockSkew` of its own clock and only
+once per (carrier ID, nonce), so both ends need roughly synchronized
+clocks. Requests it does not take go to `Next` (`http.NotFound` without
+one), with their body; `HTTPExchangeConfig` documents the timers, sizes and limits and
 their defaults. Keep the server's `HoldTime` below every intermediary's
 response timeout, and the client transport's `MaxIdleConnsPerHost` at least
 `DownRequests+UpRequests`.
 
-The exchange MACs authenticate both ends (with a PSK) and bind each
-response to its request, but they do not encrypt. When TLS is terminated by
+The exchange MACs authenticate both ends with the PSK and bind each
+response to its request, but they do not encrypt. A PSK is required;
+`AllowInsecure` runs the carrier without one (tests and protected
+networks), and the carrier ID then is a bearer secret. When TLS is terminated by
 a proxy or CDN, that intermediary can read the carrier.
+
+## Behind a reverse proxy or CDN
+
+Which HTTP carriers pass depends on the path: a front that buffers request
+bodies passes downlinks but not streaming uplinks, one that buffers whole
+bodies passes only the exchange carrier, and some fronts pass WebSocket
+only. The server can serve every kind on one target, and the client can
+choose among them.
+
+**One endpoint.** `HTTPEndpoint` classifies each request by its head
+(`ClassifyHTTP`) and hands it to the adapter of its class; requests that
+are not carriers, and those an adapter's admission does not take, go to
+the host's handler with their body:
+
+```go
+stream, err := zmux.NewHTTPHandler(l, &zmux.HTTPOptions{Next: site, Trusted: trusted})
+ex, err := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk, Next: site, Trusted: trusted})
+ws, err := zmuxws.Handler(l, &zmux.HTTPOptions{Next: site, Trusted: trusted})
+http.Handle("/zmux", &zmux.HTTPEndpoint{Stream: stream, Exchange: ex, WebSocket: ws, Next: site})
+```
+
+**Choosing a carrier.** `DialMode` takes a mode: `ExplicitMode(c)` uses one
+kind and reports its failure as it is; `AutoMode(c...)` tries candidates in
+order of preference and keeps the first whose peer answers within a short
+timer, without early data and without racing them. With `Config.MaxPipes`
+above 1 it establishes the session on the most robust kind (the exchange
+carrier unless a kind is known to work) and moves the session to preferred
+kinds by joining them as further pipes, without a second session. A
+`CarrierCache` in `ModePolicy` remembers per server and local network which
+kinds worked; a kind that failed, or dropped soon after it was chosen, is
+skipped until its backoff expires. Each try and the choice are reported as
+`EventCarrierCandidate` and `EventCarrierChosen`, and in `ConnectionStats`.
+
+```go
+conn, err := zmux.DialMode(ctx, zmux.AutoMode(
+	zmuxws.Candidate("wss://example.com/zmux", nil),
+	zmux.StreamingCandidate(client, "https://example.com/zmux", nil),
+	zmux.SplitCandidate(client, "https://example.com/zmux", nil),
+	zmux.ExchangeCandidate(client, "https://example.com/zmux", &zmux.HTTPExchangeConfig{PSK: psk}),
+), cfg, &zmux.ModePolicy{Cache: cache, Key: "example.com|" + network})
+```
+
+`zmuxquic.Candidate` and `zmuxh3.WebTransportCandidate` add the kinds a
+client can use when it reaches the server directly, and
+`zmuxh3.HTTP3Candidate` a streaming request over HTTP/3. A carrier kind
+describes only this end's hop, not what lies beyond its first peer.
+
+**Client addresses.** Behind a proxy every carrier comes from the proxy's
+address. `TrustedProxies` names the proxies whose report of the client
+address is believed: its `Listener` wraps a `net.Listener` that receives
+the PROXY protocol from them, and `HTTPOptions.Trusted` (and
+`HTTPExchangeConfig.Trusted`) reads the forwarding header field they set.
+The reported address is then the source that admissions see and that the
+listener's per-source limits count; the same report from any other peer is
+ignored.
+
+```go
+trusted := &zmux.TrustedProxies{Prefixes: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
+	Header: "X-Forwarded-For"}
+```
+
+**TLS at the proxy.** The server then sees no TLS: prefix tokens are
+unbound, joins need `PipeAuth.PSK`, and the exchange carrier can be read by
+the proxy. Keep the hop from the proxy to the server local or encrypted.
+
+**Proxy configuration.** A location that passes every kind, in nginx
+syntax:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
+location /zmux {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;          # WebSocket
+    proxy_set_header Connection $connection_upgrade;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_request_buffering off;   # stream uplinks as they arrive
+    proxy_buffering off;           # downlinks also send X-Accel-Buffering: no
+    proxy_read_timeout 300s;       # above the session's keep-alive
+    proxy_send_timeout 300s;
+    client_max_body_size 1m;       # exchange bodies stay within 1,000,000 bytes
+}
+```
+
+- Full duplex: a bidirectional request carrier needs both bodies forwarded
+  at once, which an HTTP/1.1 hop does not guarantee. Pass it over HTTP/2
+  without TLS (`grpc_pass grpc://127.0.0.1:8080;` in a server whose
+  listener has `http2 on`), and let the server accept HTTP/2 by prior
+  knowledge:
+
+  ```go
+  srv := &http.Server{Addr: "127.0.0.1:8080", Handler: endpoint, Protocols: new(http.Protocols)}
+  srv.Protocols.SetHTTP1(true)
+  srv.Protocols.SetUnencryptedHTTP2(true)
+  ```
+
+- Early data: keep `ssl_early_data off`, or forward its marker with
+  `proxy_set_header Early-Data $ssl_early_data;`: the adapters answer a
+  carrier request that carries `Early-Data: 1` with `425 (Too Early)`, and
+  the proxy repeats it after its handshake. An HTTP/3 server with
+  `quic.Config.Allow0RTT` hands requests over before the handshake
+  completes; the adapters answer those carrier requests 425 as well.
+- Idle limits: proxies end requests that stay silent (60 s by default for
+  the read and send timeouts, 30 s to 125 s for a CDN's response): keep
+  `Config.KeepAlivePeriod` (15 s by default, at most half the idle timeout; negative turns it off)
+  and, with multipath, the probe interval below the shortest limit on the
+  path, and the
+  exchange server's `HoldTime` below the CDN's response timeout.
+
+## Admission
+
+An `Admission` is configured on the listener (`ListenerConfig.Admission`)
+and decides on every carrier of it before anything is sent on it,
+whatever entry point took it: `Listener.Serve` and `HandlePipe`,
+`NewHTTPHandler`, the exchange handler, `zmuxws.Handler`, `zmuxh3.Handler`
+and `zmuxquic.Serve`. Every entry runs the same steps: the carrier takes a
+slot of its source (`MaxPendingPerSource`) before its outer handshake
+(TLS, an HTTP upgrade, QUIC), the admission reads up to `Peek` bytes and
+calls `Decide` with them and the carrier's metadata (`CarrierInfo`: its
+`Source` and `Peer`, TLS state, HTTP request), then `WrapPipe` runs and the
+carrier is classified. `Decide` gets a context that ends with what remains
+of `PeekTimeout` and when the listener stops. It accepts the carrier
+(without the bytes it skips), hands it with every byte read to the
+fallback of its kind (`ListenerConfig.Fallback` for byte streams,
+`HTTPOptions.Next` for HTTP, the `fallback` of `zmuxquic.Serve`), stalls
+it, or closes it. A source holds at most `MaxPendingPerSource - 1` stalled
+carriers, and a stall lasts the same duration for every carrier from one
+source during the listener's lifetime (`Listener.StallDuration`).
+`ListenerStats.Admission` counts the outcomes. An adapter with its own
+accept loop takes a carrier with `Listener.Arrive` (`AdmitUpgrade` for an
+HTTP upgrade) and hands it on with `Arrival.HandlePipe`. `PrefixAuth` is one `Decide`: a carrier starts with a token of
+`PrefixTokenLen` bytes, optionally bound to its TLS handshake; a carrier
+decided on its request head (a WebSocket or WebTransport upgrade, an HTTP
+request carrier without a body such as a downlink `GET`) carries it in
+the `Zmux-Prefix-Auth` request field instead (`HeaderPrefixAuth`, 43
+characters of base64url). The same `Admission` serves both:
+
+```go
+auth := &zmux.PrefixAuth{Key: key, Slot: 30 * time.Second, Skew: 1, BindTLS: true}
+v, err := zmux.NewPrefixAuthVerifier(auth)
+l := zmux.NewListener(&zmux.ListenerConfig{Config: cfg,
+	Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}, Fallback: fallback})
+go l.Serve(ctx, tls.NewListener(ln, tlsConf))
+
+// client: Config.Credential is presented by the dialers
+conn, err := zmux.DialTLS(ctx, "tcp", addr, tlsConf, &zmux.Config{Credential: auth})
+```
+
+A `Credential` is the client side of an admission: `Prefix` gives the
+first bytes of a carrier, `Header` the request field of a carrier decided
+on its request head, each
+from the carrier's metadata (`CarrierInfo`, with its TLS state for a
+binding). `Client`, `Dial`, `DialTLS`, `zmuxquic.Dial` and `Client`,
+`zmuxws.Dial` and `zmuxh3.Dial` present `Config.Credential`; the pipe
+dialers for joins take theirs in `zmuxws.DialOptions.Credential`,
+`zmuxquic.NewPool`, `zmuxh3.NewPool` and `zmuxh3.DialSession`;
+`HTTPPipe` and `HTTPSplitPipe` take one (unbound: the request's connection
+is not known in advance), and `PresentPipe` presents one on any other
+byte-stream pipe.
+
+A split bootstrap (`HTTPSplitPipe`, `SplitCandidate`) holds its first half
+in a pairing slot until the other half arrives or the handshake timeout
+ends: 64 slots per listener and 8 per source (SPEC.md 6.1.1), counted by
+the source that `MaxPendingPerSource` counts (an IPv6 client by its /64).
+Without an `Admission`, a few sources can keep those slots full and delay
+other clients' split bootstraps; serve a split bootstrap that the open
+Internet reaches with an `Admission`, such as `PrefixAuth`.
 
 ## QUIC
 
@@ -243,9 +419,71 @@ a proxy or CDN, that intermediary can read the carrier.
 conn, err := zmuxquic.Dial(ctx, "example.com:4433", tlsConf, nil, nil)
 ```
 
-On the server, `zmuxquic.Serve(ctx, ln, l)` hands the streams of a QUIC
+On the server, `zmuxquic.Serve(ctx, ln, l, nil)` hands the streams of a QUIC
 listener to a `zmux.Listener`; `zmuxh3.Dial` and `zmuxh3.Serve` do the same
 for WebTransport sessions.
+
+### Datagram channels
+
+QUIC, HTTP/3 and WebTransport carriers have an unreliable datagram service
+of their own besides the stream that is the pipe. When both endpoints
+enable datagrams and support it, a datagram that fits is sent there
+instead of in a record, so a lost packet loses that datagram rather than
+delaying every later one behind the stream's retransmission. Nothing
+changes for the application: the same calls, sizes and queues; larger
+datagrams, pipes whose records are shaped, and peers without the channel
+use records. `ConnectionStats` counts the datagrams that went on channels
+(`DatagramsSentChannel`, `DatagramsReceivedChannel`).
+
+- QUIC: the connection's QUIC datagrams, each naming its pipe by stream
+  ID, so several pipes and sessions share a connection. `QUICConfig`
+  enables them; a connection that carries pipes leaves its datagrams to
+  zmux.
+- WebTransport: the session's datagrams, named the same way.
+- HTTP/3: the HTTP Datagrams of a bidirectional carrier's request stream.
+  `NewHTTP3Server` enables them (`HTTP3Handler` wraps the handler of any
+  other HTTP/3 server). Pipes opened with an `http.Client`, as
+  `HTTP3Candidate` does, keep datagrams in records.
+
+A carrier of another kind offers its own channel by implementing
+`zmux.DatagramChannel` on a half of its `PipeIO`; `zmux.ChannelDemux`
+routes the datagrams of a connection shared by several pipes.
+
+### Pool policies
+
+`PipePool.Policy` and `CarrierPool.Policy` take a `zmux.PoolPolicy`.
+`machine.PoolPolicy` (package `shaping/machine`) builds one from JSON:
+
+```json
+{
+  "count": {"const": 2},
+  "dial_after": [{"const": 1}, {"range": [5, 10]}],
+  "retire": [{"metric": "age", "above": {"range": [1800, 3600], "scope": "pipe"}}]
+}
+```
+
+Every field is optional; an absent field keeps the pool's own value, and
+an unknown field or metric fails construction. Values have the form and
+validation of definition values; times are in seconds.
+
+- `count` is rounded; below 1 it is 1.
+- `dial_after[k]` is the delay after the last dial when `k` dials in a
+  row failed; the last entry applies to any higher number.
+- `retire` lists a member when one rule's metric is strictly greater than
+  its threshold; members are listed in view order, each once. Metrics:
+  `age`, `idle` (seconds), `pipes`, `bytes_sent`, `bytes_received`,
+  `bytes` (their sum).
+- Scopes: `each` (or none) draws at every decision, `shared` once per
+  policy, `pipe` once per member ID while the member is in the view.
+  `pipe` is accepted only in `retire` thresholds.
+
+`Recheck` is set to the earliest time at which an `age` or `idle` rule
+would hold for a member not retired, or at which `dial_after` after the
+last dial elapses; 0 when there is neither. Byte and pipe rules do not set
+it. Pools decide again no later than `Recheck` (at least
+`zmux.MinRecheck`, 10 ms) in addition to their own triggers.
+
+`Options.NewSource` sets the random source; `Decide` does not block.
 
 ## More
 

@@ -101,3 +101,12 @@ func (r *rangeSet) gaps(lo, hi uint64, f func(a, b uint64)) {
 		f(lo, hi)
 	}
 }
+
+// total returns the number of bytes in the set.
+func (r *rangeSet) total() uint64 {
+	var n uint64
+	for _, x := range *r {
+		n += x.hi - x.lo
+	}
+	return n
+}

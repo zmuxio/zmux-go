@@ -44,9 +44,23 @@ type PipeOptions struct {
 	// PipeIO.FateGroup, else none (an independent path).
 	FateGroup uint64
 	// SuspectFloor (at least 50 ms) and DeadTimeout (at least 1 s) of the
-	// pipe; 0 uses the session's.
+	// pipe. Zero uses the session's.
 	SuspectFloor time.Duration
 	DeadTimeout  time.Duration
+	// ProbeInterval is the probe interval k of the pipe while it is idle
+	// (at least 1 s), measured to the carrier: with a shaping delay of up
+	// to H, probes wait k_eff = max(1 s, k - H). Zero uses the session's;
+	// a negative value turns the idle probes of the pipe off, as
+	// SchedulerParams.ProbeInterval does; otherwise at least 1 s. On an
+	// attachment without an outbound direction at the peer at most 15 s
+	// takes effect, and the probes stay.
+	ProbeInterval time.Duration
+	// ProbeJitter is the probe jitter j of the pipe, from 0 to below 1:
+	// each probe waits a uniform draw from [k_eff x (1 - j), k_eff]. Zero
+	// uses the session's; a jitter of 0 takes NoProbeJitter.
+	ProbeJitter float64
+	// NoProbeJitter makes the pipe's j 0, the fixed schedule.
+	NoProbeJitter bool
 	// Direction from the local endpoint: DirBidirectional (the zero
 	// value), DirSendOnly (an uplink) or DirReceiveOnly (a downlink).
 	Direction Direction
@@ -75,6 +89,15 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 	if o.DeadTimeout != 0 && o.DeadTimeout < time.Second {
 		return j, fmt.Errorf("%w: DeadTimeout below 1 s", ErrInvalidConfig)
 	}
+	if o.Probation != nil && *o.Probation < 0 {
+		return j, fmt.Errorf("%w: negative Probation", ErrInvalidConfig)
+	}
+	if err := checkProbeInterval(o.ProbeInterval, "ProbeInterval"); err != nil {
+		return j, err
+	}
+	if err := checkProbeJitter(o.ProbeJitter, "ProbeJitter"); err != nil {
+		return j, err
+	}
 	j.FateGroup, j.SendPriority, j.SendStandby = o.FateGroup, o.SendPriority, o.SendStandby
 	j.RecvPriority, j.RecvStandby = o.ReceivePriority, o.ReceiveStandby
 	j.Weight = 1
@@ -86,6 +109,12 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 		j.Probation = &d
 	}
 	j.SuspectFloor, j.DeadTimeout = core.Duration(o.SuspectFloor), core.Duration(o.DeadTimeout)
+	// The core's per-pipe probe settings: 0 the session's, a negative
+	// interval off, a negative jitter 0.
+	j.ProbeInterval, j.ProbeJitter = core.Duration(max(o.ProbeInterval, -1)), o.ProbeJitter
+	if o.NoProbeJitter {
+		j.ProbeJitter = -1
+	}
 	return j, nil
 }
 
@@ -116,6 +145,10 @@ func (c *Conn) AddPipe(ctx context.Context, p PipeIO, o PipeOptions) (*Pipe, err
 }
 
 func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
+	if r, ok := p.R.(*httpRespReader); ok && r.peer != nil {
+		// Its pairing token makes pipe pair 0 only (SPEC.md 6.1.1).
+		return nil, fmt.Errorf("%w: a split bootstrap carrier cannot join a session; join an uplink and a downlink (HTTPSplitJoin)", ErrInvalidConfig)
+	}
 	dir := o.Direction
 	if (dir != DirReceiveOnly && p.W == nil) || (dir != DirSendOnly && p.R == nil && !oob) {
 		return nil, fmt.Errorf("%w: the carrier lacks a half the direction needs", ErrInvalidConfig)
@@ -152,7 +185,7 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 	pd.outer = outer
 	low := !oob && pd.tcp.setLowWater(multiLowWater)
 	info := carrierInfo(p, pd.tcp, low)
-	j.In, j.Out, j.OutSig = info, info, pd.wsig
+	j.In, j.Out, j.OutSig, j.Kind = info, info, pd.wsig, uint8(p.Carrier)
 	id, _, err := c.s.AddPipe(j)
 	if err != nil {
 		unnestPipe(c, pd.outer)
@@ -173,18 +206,20 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 func (p *Pipe) waitJoined(ctx context.Context) error {
 	c := p.c
 	sig := core.NewSignal()
+	defer c.unwatchPipes(sig)
 	for {
 		c.lock()
 		out, in, ok := c.s.PipeState(p.id)
-		if ok && (out == "JOINING" || out == "NONE" && in == "JOINING") {
+		if ok && (out == core.OutJoining || out == core.OutNone && in == core.InJoining) {
 			sig.Drain()
-			c.pipeWaiters = append(c.pipeWaiters, sig)
+			c.watchPipes(sig)
 		}
 		c.unlock()
 		switch {
-		case !ok || out == "FAILED" || out == "CLOSED" || out == "RETIRED" || out == "NONE" && in != "JOINING" && in != "OPEN":
+		case !ok || out == core.OutFailed || out == core.OutClosed || out == core.OutRetired ||
+			out == core.OutNone && in != core.InJoining && in != core.InOpen:
 			return fmt.Errorf("zmux: pipe %d not joined: %w", p.id, ErrPipeGone)
-		case out == "ACTIVE" || out == "SUSPECT" || out == "NONE" && in == "OPEN":
+		case out == core.OutActive || out == core.OutSuspect || out == core.OutNone && in == core.InOpen:
 			return nil
 		}
 		select {
@@ -251,8 +286,9 @@ func (r *Reservation) Attach(ctx context.Context, p PipeIO) (*Pipe, error) {
 	if o, ok := p.W.(laneOpener); ok {
 		pd.opener = o
 	}
+	// The reservation's placeholder said nothing of the carrier.
+	c.s.AttachCarrier(r.p.id, carrierInfo(p, pd.tcp, false), uint8(p.Carrier))
 	c.startPipeLocked(pd, r.dir != DirSendOnly, r.dir != DirReceiveOnly)
-	c.s.WakePipe(r.p.id)
 	c.unlock()
 	if err := r.p.waitJoined(ctx); err != nil {
 		_ = r.p.Abort(err)
@@ -310,13 +346,20 @@ func (p *Pipe) SetReceiveStandby(b bool) error { return p.set(core.PipeSettings{
 // SetWeight sets the pipe's weight for the round-robin policies (local).
 func (p *Pipe) SetWeight(w uint64) error { return p.set(core.PipeSettings{Weight: &w}) }
 
-// SetProbation sets the base of the pipe's probation; 0 disables it, a
-// negative value returns to the session's default.
+// SetProbation sets the base of the pipe's probation; 0 disables it, and
+// a negative value is invalid (ErrInvalidConfig).
 func (p *Pipe) SetProbation(d time.Duration) error {
-	v := core.Duration(d)
 	if d < 0 {
-		v = -1
+		return fmt.Errorf("%w: negative Probation", ErrInvalidConfig)
 	}
+	v := core.Duration(d)
+	return p.set(core.PipeSettings{Probation: &v})
+}
+
+// ClearProbation returns the base of the pipe's probation to the
+// session's.
+func (p *Pipe) ClearProbation() error {
+	v := core.Duration(-1)
 	return p.set(core.PipeSettings{Probation: &v})
 }
 
@@ -326,7 +369,7 @@ func (p *Pipe) Revalidate() error {
 	c := p.c
 	c.lock()
 	defer c.unlock()
-	return apiErr(c.s.RevalidatePipes(p.id, false, c.clk.now()))
+	return pipeErr(c.s.RevalidatePipes(p.id, false, c.clk.now()))
 }
 
 // RevalidatePipes revalidates every live outbound pipe (after a network
@@ -385,56 +428,174 @@ func (c *Conn) SetScheduler(s Scheduler) {
 
 // ---- statistics ----
 
-// PipeStats is a snapshot of one attachment, taken under the session lock.
+// OutboundState is the state of a pipe's outbound direction (STATE_MACHINE.md
+// 3.1); OutboundNone when the pipe has none.
+type OutboundState uint8
+
+const (
+	OutboundNone     = OutboundState(core.OutNone)
+	OutboundJoining  = OutboundState(core.OutJoining)
+	OutboundActive   = OutboundState(core.OutActive)
+	OutboundSuspect  = OutboundState(core.OutSuspect)
+	OutboundDraining = OutboundState(core.OutDraining)
+	OutboundFailed   = OutboundState(core.OutFailed)
+	OutboundClosed   = OutboundState(core.OutClosed)
+)
+
+// String returns the state's name in lower case ("active").
+func (s OutboundState) String() string {
+	switch s {
+	case OutboundNone:
+		return "none"
+	case OutboundJoining:
+		return "joining"
+	case OutboundActive:
+		return "active"
+	case OutboundSuspect:
+		return "suspect"
+	case OutboundDraining:
+		return "draining"
+	case OutboundFailed:
+		return "failed"
+	case OutboundClosed:
+		return "closed"
+	}
+	return "OutboundState(?)"
+}
+
+// InboundState is the state of a pipe's inbound direction (STATE_MACHINE.md
+// 3.2); InboundNone when the pipe has none.
+type InboundState uint8
+
+const (
+	InboundNone    = InboundState(core.InNone)
+	InboundJoining = InboundState(core.InJoining)
+	InboundOpen    = InboundState(core.InOpen)
+	InboundEnded   = InboundState(core.InEnded)
+)
+
+// String returns the state's name in lower case ("open").
+func (s InboundState) String() string {
+	switch s {
+	case InboundNone:
+		return "none"
+	case InboundJoining:
+		return "joining"
+	case InboundOpen:
+		return "open"
+	case InboundEnded:
+		return "ended"
+	}
+	return "InboundState(?)"
+}
+
+// PipeStats is a snapshot of one attachment (API.md 7.2). Fields marked
+// estimate are the sender's estimators (SCHEDULER.md 2) and change as
+// samples arrive; a gauge is a current value; the other counts only
+// increase. Each field holds a value it had during the call; the state
+// fields (the direction states, flags, priorities and their sources,
+// probation, the lanes present, Pipe) are read at one point, while
+// relations between counts hold for their final values, not in every
+// snapshot. An absent field is its zero value: an estimate or duration
+// before the first sample, the fields that need acknowledgements when
+// ConnectionState shows pipe acknowledgement not in use, and every field
+// of a direction the attachment does not have, whose state is then
+// OutboundNone or InboundNone.
 type PipeStats struct {
-	ID           uint64
-	Label        string
-	State        string // joining, active, suspect, draining, failed, closed
-	InState      string // opening, open, ended
+	Pipe      uint64 // the pipe ID
+	FateGroup uint64
+	Label     string
+	Local     bool        // this endpoint joined the attachment
+	Carrier   CarrierKind // PipeIO.Carrier
+	// Outbound and Inbound are the states of the two directions;
+	// OutboundNone and InboundNone for one the attachment lacks.
+	Outbound     OutboundState
+	Inbound      InboundState
 	AttachedFor  time.Duration
-	SuspectCount uint64
-	FailureCount uint64
+	SuspectCount uint64 // times the outbound pipe became suspect
+	FailureCount uint64 // 0 or 1: whether the attachment failed
+	Failure      error  // why it failed, once it did
 
+	// The effective priority and standby flag (Standby, below) of the
+	// outbound direction (lower priority preferred) and where they come
+	// from: "local", "peer" or "default".
 	SendPriority       uint64
-	SendPrioritySource string // local, peer, default
+	SendPrioritySource string
 	StandbySource      string
-	ReceivePriority    uint64
-	StatusSequence     uint64
-	PeerRequest        *PeerRequest
-	Weight             uint64
-	ProbationUntil     time.Time // zero outside probation
+	// ReceivePriority and ReceiveStandby (below) are requested of the peer
+	// for its outbound direction; RequestSeq is the sequence number of the
+	// last PIPE_STATUS request sent.
+	ReceivePriority uint64
+	RequestSeq      uint64
+	PeerRequest     *PeerRequest // the peer's latest request; nil before one
+	Weight          uint64
+	// ProbationUntil is the end of the outbound pipe's probation, zero
+	// outside probation or for a base so large that it never ends.
+	ProbationUntil time.Time
+	Standby        bool
+	ReceiveStandby bool
+	InProbation    bool
+	Revalidating   bool // awaiting revalidation
+	Eligible       bool // eligible under tier gating now
+	Writable       bool // the outbound carrier takes bytes now
+	Saturated      bool // the outbound pipe's tier is saturated
 
+	RTTSource    string        // "ack", "kernel" or "ping"; "" before the first sample
 	SmoothedRTT  time.Duration // estimate
 	MinRTT       time.Duration // estimate
 	RTTVar       time.Duration // estimate
-	OWD          time.Duration // estimate
-	DeliveryRate float64       // bytes/s, estimate
-	RTTSource    string        // ack, kernel, ping
+	OneWayDelay  time.Duration // estimate; needs acknowledgements
+	DeliveryRate uint64        // R_p in bytes per second, estimate; needs acknowledgements
 
+	// QueuedBytes is a gauge of the bytes the outbound carrier holds
+	// unsent, the adapter's unsent count summed over the lanes; 0 where
+	// the adapter reports none. QueueDelay is the estimate QueuedBytes /
+	// DeliveryRate, 0 when either is.
 	QueuedBytes   uint64
-	QueueDelay    time.Duration // estimate
-	BytesInFlight uint64
+	QueueDelay    time.Duration
+	BytesInFlight uint64 // gauge: sent and not acknowledged
 
-	BytesSent          uint64
-	BytesReceived      uint64
-	BytesAcked         uint64
-	RecordsSent        uint64
-	RecordsReceived    uint64
-	BytesReinjected    uint64
-	BytesOpportunistic uint64
-	PingsSent          uint64
+	// BytesSent and BytesReceived are the outbound and inbound positions
+	// over all lanes; BytesAcked the acknowledged outbound position.
+	BytesSent       uint64
+	BytesReceived   uint64
+	BytesAcked      uint64
+	RecordsSent     uint64
+	RecordsReceived uint64
+	// BytesReinjected counts stream bytes sent again elsewhere because
+	// this pipe failed or became suspect.
+	BytesReinjected        uint64
+	BytesOpportunistic     uint64 // opportunistic copies sent on the outbound pipe
+	BytesRedundant         uint64 // redundant copies sent on the outbound pipe
+	BytesDuplicateReceived uint64 // duplicate stream bytes received on the inbound pipe
+	PingsSent              uint64
+	PingsAnswered          uint64 // PIPE_PINGs answered by an acknowledgement
 
 	SinceLastAck     time.Duration
 	SinceLastReceive time.Duration
-	Lanes            int
+	// SinceLastTraffic is the time since a record carrying a traffic frame
+	// (STREAM, RESET_STREAM, RESET_STREAM_AT, STOP_SENDING or DATAGRAM) was
+	// sent on the pipe or completely received on it, or since the pipe
+	// became live. Probes, acknowledgements, other control frames and
+	// padding do not count.
+	SinceLastTraffic time.Duration
 
-	Direction      Direction
-	Revalidating   bool
-	Standby        bool // with StandbySource
-	ReceiveStandby bool
-	Eligible       bool
-	Writable       bool
-	Saturated      bool
+	// LanesOut and LanesIn are gauges of the lanes of each direction, lane
+	// 0 included; LanesRefused counts own outbound lanes refused.
+	LanesOut, LanesIn int
+	LanesRefused      uint64
+	// Lanes are the positions of each lane of a pipe with lanes; nil
+	// without, lane 0 then being the pipe itself.
+	Lanes []LaneStats
+}
+
+// LaneStats are the positions of one lane; a direction the lane does not
+// have reports 0.
+type LaneStats struct {
+	Lane             uint64
+	PositionSent     uint64 // bytes written on the outbound lane, its first record included
+	PositionAcked    uint64 // the position the peer acknowledged on it
+	PositionReceived uint64 // the position of the inbound lane
 }
 
 // PeerRequest is the peer's latest PIPE_STATUS request for the local
@@ -444,16 +605,19 @@ type PeerRequest struct {
 	Standby  bool
 }
 
-// Stats returns the pipe's snapshot.
-func (p *Pipe) Stats() (PipeStats, error) {
+// Stats returns the pipe's snapshot; false once the attachment is retired
+// (or the session that ended released it): a read reports the absence
+// rather than an error.
+func (p *Pipe) Stats() (PipeStats, bool) {
 	c := p.c
 	c.lock()
 	defer c.unlock()
+	c.s.SetNow(c.clk.now()) // the durations since an event are current
 	pi, ok := c.s.PipeInfo(p.id)
 	if !ok {
-		return PipeStats{}, ErrPipeGone
+		return PipeStats{}, false
 	}
-	return c.pipeStats(pi), nil
+	return c.pipeStats(pi), true
 }
 
 // Pipes returns the handles of the session's current attachments. A
@@ -461,6 +625,7 @@ func (p *Pipe) Stats() (PipeStats, error) {
 func (c *Conn) Pipes() []*Pipe {
 	c.lock()
 	defer c.unlock()
+	c.s.SetNow(c.clk.now()) // the durations since an event are current
 	ids := c.s.PipeIDs(nil)
 	out := make([]*Pipe, len(ids))
 	for i, id := range ids {
@@ -469,11 +634,12 @@ func (c *Conn) Pipes() []*Pipe {
 	return out
 }
 
-// PipeStats returns a snapshot of every attachment, taken in one critical
-// section. A session without multipath reports pipe 0.
+// PipeStats returns a snapshot of every attachment. A session without
+// multipath reports pipe 0.
 func (c *Conn) PipeStats() []PipeStats {
 	c.lock()
 	defer c.unlock()
+	c.s.SetNow(c.clk.now()) // the durations since an event are current
 	ids := c.s.PipeIDs(nil)
 	out := make([]PipeStats, 0, len(ids))
 	for _, id := range ids {
@@ -495,36 +661,27 @@ func (c *Conn) Pipe(id uint64) (*Pipe, bool) {
 }
 
 func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
-	low := func(s string) string {
-		b := []byte(s)
-		for i, x := range b {
-			if x >= 'A' && x <= 'Z' {
-				b[i] = x + 'a' - 'A'
-			}
-		}
-		return string(b)
-	}
-	st := PipeStats{ID: pi.ID, Label: c.labels[pi.ID], State: low(pi.OutState), InState: low(pi.InState),
-		Revalidating: pi.Revalidating, AttachedFor: time.Duration(pi.AttachedFor),
-		SuspectCount: pi.SuspectCount, FailureCount: pi.FailureCount, SendPriority: pi.SendPriority,
-		SendPrioritySource: pi.PrioritySource, Standby: pi.Standby, StandbySource: pi.StandbySource,
-		ReceivePriority: pi.ReceivePriority, ReceiveStandby: pi.ReceiveStandby, StatusSequence: pi.StatusSeq,
-		Weight: pi.Weight, Eligible: pi.Eligible, SmoothedRTT: time.Duration(pi.SmoothedRTT),
-		MinRTT: time.Duration(pi.MinRTT), RTTVar: time.Duration(pi.RTTVar), OWD: time.Duration(pi.OWD),
-		DeliveryRate: pi.DeliveryRate, RTTSource: pi.RTTSource, QueuedBytes: pi.QueuedBytes,
-		Writable: pi.Writable, Saturated: pi.Saturated, BytesInFlight: pi.BytesInFlight,
+	st := PipeStats{Pipe: pi.ID, Local: pi.Local, FateGroup: pi.FateGroup, Label: c.labels[pi.ID],
+		Carrier: CarrierKind(pi.Carrier), Outbound: OutboundState(pi.OutState), Inbound: InboundState(pi.InState),
+		AttachedFor: time.Duration(pi.AttachedFor), SuspectCount: pi.SuspectCount, FailureCount: pi.FailureCount,
+		Failure: pi.Failure, SendPriority: pi.SendPriority, SendPrioritySource: pi.PrioritySource,
+		Standby: pi.Standby, StandbySource: pi.StandbySource, ReceivePriority: pi.ReceivePriority,
+		ReceiveStandby: pi.ReceiveStandby, RequestSeq: pi.StatusSeq, Weight: pi.Weight,
+		InProbation: pi.InProbation, Revalidating: pi.Revalidating, Eligible: pi.Eligible,
+		Writable: pi.Writable, Saturated: pi.Saturated, RTTSource: pi.RTTSource,
+		SmoothedRTT: time.Duration(pi.SmoothedRTT), MinRTT: time.Duration(pi.MinRTT),
+		RTTVar: time.Duration(pi.RTTVar), OneWayDelay: time.Duration(pi.OWD),
+		DeliveryRate: uint64(pi.DeliveryRate), QueuedBytes: pi.QueuedBytes, BytesInFlight: pi.BytesInFlight,
 		BytesSent: pi.BytesSent, BytesReceived: pi.BytesReceived, BytesAcked: pi.BytesAcked,
 		RecordsSent: pi.RecordsSent, RecordsReceived: pi.RecordsReceived, BytesReinjected: pi.BytesReinjected,
-		BytesOpportunistic: pi.BytesOpportunistic, PingsSent: pi.PingsSent,
+		BytesOpportunistic: pi.BytesOpportunistic, BytesRedundant: pi.BytesRedundant,
+		BytesDuplicateReceived: pi.BytesDuplicateRecv, PingsSent: pi.PingsSent, PingsAnswered: pi.PingsAnswered,
 		SinceLastAck: time.Duration(pi.SinceLastAck), SinceLastReceive: time.Duration(pi.SinceLastReceive),
-		Lanes: pi.Lanes}
-	switch {
-	case pi.HasOut && pi.HasIn:
-		st.Direction = DirBidirectional
-	case pi.HasOut:
-		st.Direction = DirSendOnly
-	default:
-		st.Direction = DirReceiveOnly
+		SinceLastTraffic: time.Duration(pi.SinceLastTraffic), LanesOut: pi.LanesOut, LanesIn: pi.LanesIn,
+		LanesRefused: uint64(pi.LanesRefused)}
+	for _, l := range pi.Lanes {
+		st.Lanes = append(st.Lanes, LaneStats{Lane: l.Lane, PositionSent: l.PositionSent,
+			PositionAcked: l.PositionAcked, PositionReceived: l.PositionReceived})
 	}
 	if pi.PeerRequest {
 		st.PeerRequest = &PeerRequest{Priority: pi.PeerPriority, Standby: pi.PeerStandby}
@@ -535,5 +692,37 @@ func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
 	if pi.DeliveryRate > 0 {
 		st.QueueDelay = time.Duration(float64(pi.QueuedBytes) / pi.DeliveryRate * 1e9)
 	}
+	if st.Outbound == OutboundNone || !pi.HasOut {
+		st.clearOutbound()
+	}
+	if st.Inbound == InboundNone || !pi.HasIn {
+		st.clearInbound()
+	}
 	return st
+}
+
+// clearOutbound zeroes the fields of the outbound direction, which an
+// attachment without one reports as absent (API.md 7.2): its state is
+// OutboundNone and every other field of the direction is 0.
+func (st *PipeStats) clearOutbound() {
+	st.Outbound = OutboundNone
+	st.SuspectCount = 0
+	st.SendPriority, st.SendPrioritySource, st.Standby, st.StandbySource = 0, "", false, ""
+	st.PeerRequest, st.Weight = nil, 0
+	st.ProbationUntil, st.InProbation, st.Revalidating = time.Time{}, false, false
+	st.Eligible, st.Writable, st.Saturated = false, false, false
+	st.RTTSource, st.SmoothedRTT, st.MinRTT, st.RTTVar, st.OneWayDelay, st.DeliveryRate = "", 0, 0, 0, 0, 0
+	st.QueuedBytes, st.QueueDelay, st.BytesInFlight = 0, 0, 0
+	st.BytesSent, st.BytesAcked, st.RecordsSent = 0, 0, 0
+	st.BytesReinjected, st.BytesOpportunistic, st.BytesRedundant = 0, 0, 0
+	st.PingsSent, st.PingsAnswered, st.SinceLastAck = 0, 0, 0
+	st.LanesOut, st.LanesRefused = 0, 0
+}
+
+// clearInbound zeroes the fields of the inbound direction (clearOutbound).
+func (st *PipeStats) clearInbound() {
+	st.Inbound = InboundNone
+	st.ReceivePriority, st.ReceiveStandby, st.RequestSeq = 0, false, 0
+	st.BytesReceived, st.RecordsReceived, st.BytesDuplicateReceived = 0, 0, 0
+	st.SinceLastReceive, st.LanesIn = 0, 0
 }

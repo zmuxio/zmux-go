@@ -1,5 +1,7 @@
 package wire
 
+import "github.com/zmuxio/zmux-go/varint"
+
 // Gates says which frames the receiver accepts in a session (SPEC.md 4.2,
 // 5.5): features in use, and unilateral announcements the receiver made.
 type Gates struct {
@@ -30,7 +32,7 @@ func CheckGate(f *Frame, g *Gates) *Error {
 		// The frame size counts the whole frame (RFC 9221 Section 3).
 		size := uint64(1 + len(f.Data))
 		if f.HasLen {
-			size += uint64(VarintLen(uint64(len(f.Data))))
+			size += uint64(varint.SizeVarint(uint64(len(f.Data))))
 		}
 		if size > g.MaxDatagram {
 			return &Error{Code: ProtocolViolation, FrameType: f.Type, Reason: "DATAGRAM larger than advertised"}

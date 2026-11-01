@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
+	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -118,8 +121,8 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 	// Both pipes carry data; then the added pipe fails in the middle and
 	// its unacknowledged data is reinjected.
 	time.Sleep(20 * time.Millisecond)
-	if st, err := p2.Stats(); err != nil || st.BytesSent < 1<<16 {
-		t.Fatalf("pipe 2 carried too little: %+v %v", st, err)
+	if st, ok := p2.Stats(); !ok || st.BytesSent < 1<<16 {
+		t.Fatalf("pipe 2 carried too little: %+v %v", st, ok)
 	}
 	if err := p2.Abort(nil); err != nil {
 		t.Fatal(err)
@@ -141,6 +144,18 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 	if used < 1 {
 		t.Fatalf("no pipe carried data: %+v", e.client.PipeStats())
 	}
+	// The abort is one failure of the two attachments; whatever it
+	// reinjected went again as copies of the stream.
+	cs := e.client.ConnectionStats()
+	if cs.PipesAdded != 2 || cs.PipeFailures != 1 || cs.Reinjections > 1 {
+		t.Fatalf("added %d, failures %d, reinjections %d", cs.PipesAdded, cs.PipeFailures, cs.Reinjections)
+	}
+	if st, ok := p2.Stats(); ok && (st.FailureCount != 1 || st.Failure == nil) {
+		t.Fatalf("the failed pipe: %+v", st)
+	}
+	if ss := s.Stats(); ss.BytesWritten != uint64(len(payload)) || ss.BytesSent < ss.BytesWritten {
+		t.Fatalf("stream stats %+v", ss)
+	}
 }
 
 func TestMultipathEventsAndStats(t *testing.T) {
@@ -158,12 +173,28 @@ func TestMultipathEventsAndStats(t *testing.T) {
 		}
 		seen[ev.Kind] = true
 	}
-	st, err := p.Stats()
-	if err != nil {
-		t.Fatal(err)
+	st, ok := p.Stats()
+	if !ok {
+		t.Fatal("pipe gone")
 	}
-	if st.Label != "second" || st.Weight != 3 || st.State != "active" {
+	if st.Label != "second" || st.Weight != 3 || st.Outbound != OutboundActive {
 		t.Fatalf("stats %+v", st)
+	}
+	if !st.Local || st.LanesOut != 1 || st.LanesIn != 1 || st.Lanes != nil {
+		t.Fatalf("own attachment without lanes: %+v", st)
+	}
+	// The joined pipe's first PIPE_PING is answered by an acknowledgement.
+	waitUntil(t, 5*time.Second, "an answered PIPE_PING", func() bool {
+		st, ok := p.Stats()
+		return ok && st.PingsSent > 0 && st.PingsAnswered > 0 && st.PingsAnswered <= st.PingsSent
+	})
+	if cs := e.client.ConnectionStats(); cs.PipesActive != 2 || cs.PipesAdded != 2 {
+		t.Fatalf("pipes active %d, added %d, want 2, 2", cs.PipesActive, cs.PipesAdded)
+	}
+	for _, ps := range e.server.PipeStats() {
+		if ps.Pipe != 0 && ps.Local {
+			t.Fatalf("the acceptor reports the peer's join as its own: %+v", ps)
+		}
 	}
 	if err := p.SetSendPriority(5); err != nil {
 		t.Fatal(err)
@@ -188,8 +219,212 @@ func TestMultipathEventsAndStats(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ev.Kind == EventPipeClosed && ev.Pipe == p.ID() {
+		if ev.Kind == EventPipeClosed && ev.Pipe == p.ID() ||
+			ev.Kind == EventPipesRetired && slices.Contains(ev.Last, p.ID()) {
 			break
 		}
+	}
+}
+
+// TestStreamPipeBound checks the companion of StreamStats.PipeID: an
+// unbound sending direction reports PipeBound false, and one that the
+// affinity scheduler bound to pipe 0, whose ID is also the zero value,
+// reports PipeBound true.
+func TestStreamPipeBound(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, err := e.client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Stats(); st.PipeBound || st.PipeID != 0 {
+		t.Fatalf("before any data: %+v", st)
+	}
+	if _, err := s.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	for st := s.Stats(); !st.PipeBound; st = s.Stats() {
+		if ctx.Err() != nil {
+			t.Fatalf("never bound: %+v", st)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if st := s.Stats(); st.PipeID != 0 {
+		t.Fatalf("bound to pipe %d, want the only pipe 0", st.PipeID)
+	}
+	s.CancelWrite(0)
+}
+
+// TestClearRedundant checks that ClearRedundant hands a stream's
+// redundancy back to the session: an urgent stream with redundancy
+// turned off sends no copies, and once cleared it follows the session's
+// default (on for urgency 0 to 2) and sends copies on the second pipe.
+func TestClearRedundant(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	e.addPipe(t, PipeOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	redundant := func() (n uint64) {
+		for _, ps := range e.client.PipeStats() {
+			n += ps.BytesRedundant
+		}
+		return n
+	}
+	s, err := e.client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetPriority(1, false)
+	s.SetRedundant(false)
+	rs := make(chan *Stream, 1)
+	go func() {
+		r, err := e.server.AcceptStream(ctx)
+		if err != nil {
+			rs <- nil
+			return
+		}
+		rs <- r
+	}()
+	chunk := make([]byte, 16<<10)
+	exchange := func(r *Stream) {
+		t.Helper()
+		if _, err := s.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(r, make([]byte, len(chunk))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.Write(chunk); err != nil {
+		t.Fatal(err)
+	}
+	r := <-rs
+	if r == nil {
+		t.Fatal("no stream accepted")
+	}
+	if _, err := io.ReadFull(r, make([]byte, len(chunk))); err != nil {
+		t.Fatal(err)
+	}
+	if n := redundant(); n != 0 {
+		t.Fatalf("%d redundant bytes with redundancy off", n)
+	}
+	s.ClearRedundant()
+	for redundant() == 0 {
+		if ctx.Err() != nil {
+			t.Fatal("no redundant copies after ClearRedundant")
+		}
+		exchange(r)
+	}
+	s.CancelWrite(0)
+	r.CancelRead(0)
+}
+
+// TestPipeStatsAbsentDirection checks the Go form of an absent direction:
+// a pipe joined send-only reports, at the joiner, InboundNone and every
+// inbound field 0, and at the peer OutboundNone and every outbound field
+// 0 (priority sources and weight included), while the present direction
+// keeps its values.
+func TestPipeStatsAbsentDirection(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	p := e.addPipe(t, PipeOptions{Direction: DirSendOnly})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var peer PipeStats
+	for {
+		var found bool
+		for _, ps := range e.server.PipeStats() {
+			if ps.Pipe == p.ID() && ps.Inbound == InboundOpen {
+				peer, found = ps, true
+			}
+		}
+		if found {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("the peer never saw pipe %d open: %+v", p.ID(), e.server.PipeStats())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	want := PipeStats{Pipe: peer.Pipe, Local: peer.Local, FateGroup: peer.FateGroup, Label: peer.Label,
+		Carrier: peer.Carrier, Inbound: peer.Inbound, AttachedFor: peer.AttachedFor,
+		FailureCount: peer.FailureCount, Failure: peer.Failure, ReceivePriority: peer.ReceivePriority,
+		ReceiveStandby: peer.ReceiveStandby, RequestSeq: peer.RequestSeq, BytesReceived: peer.BytesReceived,
+		RecordsReceived: peer.RecordsReceived, BytesDuplicateReceived: peer.BytesDuplicateReceived,
+		SinceLastReceive: peer.SinceLastReceive, SinceLastTraffic: peer.SinceLastTraffic, LanesIn: peer.LanesIn,
+		Lanes: peer.Lanes}
+	if !reflect.DeepEqual(peer, want) {
+		t.Fatalf("receive-only pipe at the peer: %+v", peer)
+	}
+	if peer.BytesReceived == 0 || peer.LanesIn == 0 {
+		t.Fatalf("the present inbound direction reads 0: %+v", peer)
+	}
+	own, ok := p.Stats()
+	if !ok {
+		t.Fatal("pipe gone")
+	}
+	if own.Inbound != InboundNone || own.BytesReceived != 0 || own.RecordsReceived != 0 || own.LanesIn != 0 ||
+		own.SinceLastReceive != 0 || own.ReceivePriority != 0 || own.RequestSeq != 0 {
+		t.Fatalf("send-only pipe at the joiner: %+v", own)
+	}
+	if own.Outbound == OutboundNone || own.BytesSent == 0 || own.Weight == 0 || own.SendPrioritySource == "" {
+		t.Fatalf("the present outbound direction reads 0: %+v", own)
+	}
+}
+
+// TestRetiredPipeHandle checks a handle after retirement: its reads
+// report absence, and its operations fail with ErrPipeGone.
+func TestRetiredPipeHandle(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	p := e.addPipe(t, PipeOptions{})
+	if _, ok := p.Stats(); !ok {
+		t.Fatal("a live pipe reads as gone")
+	}
+	if err := p.Abort(nil); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, "the pipe retired", func() bool { _, ok := p.Stats(); return !ok })
+	for name, err := range map[string]error{"SetWeight": p.SetWeight(2), "SetSendPriority": p.SetSendPriority(1),
+		"Revalidate": p.Revalidate(), "Close": p.Close(), "Abort": p.Abort(nil)} {
+		if !errors.Is(err, ErrPipeGone) {
+			t.Errorf("%s on a retired pipe: %v", name, err)
+		}
+	}
+}
+
+// TestPipesRetiredEvent checks retirement through the session: a pipe
+// that fails and retires while nobody reads events leaves no event of
+// its own, only an EventPipesRetired that names it and counts its unread
+// failure; no EventPipeClosed stands for the retirement.
+func TestPipesRetiredEvent(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	p := e.addPipe(t, PipeOptions{})
+	if err := p.Abort(nil); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, "the pipe retired", func() bool { _, ok := p.Stats(); return !ok })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var sum *Event
+	for {
+		ev, err := e.client.NextEvent(ctx)
+		if err != nil {
+			break
+		}
+		if ev.Pipe == p.ID() && pipeEvent(ev.Kind) {
+			t.Fatalf("event %v of the retired pipe", ev.Kind)
+		}
+		if ev.Kind == EventPipesRetired {
+			sum = &ev
+			break
+		}
+	}
+	if sum == nil || sum.Retired != 1 || sum.Failed != 1 || !slices.Equal(sum.Last, []uint64{p.ID()}) {
+		t.Fatalf("summary %+v", sum)
 	}
 }

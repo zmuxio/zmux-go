@@ -1,6 +1,9 @@
 package core
 
-import "github.com/zmuxio/zmux-go/internal/wire"
+import (
+	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/shaping"
+)
 
 // Failure detection and the path layer's timers (MULTIPATH.md 7.1, 7.3,
 // 8.2, 8.4). Every deadline is computed by mpTimers, which both
@@ -17,33 +20,181 @@ func (s *Session) pto(a *attach) Duration {
 	return d
 }
 
+// queueDelay is queue_p = min(1 s, unsent_ahead_p / R_p) (MULTIPATH.md
+// 7.1), taken with the snapshot (setAhead).
+func (s *Session) queueDelay(a *attach) Duration { return a.queueD }
+
+// aheadSnap is the snapshot of MULTIPATH.md 7.1 taken when bytes are
+// handed to a carrier: unsent_ahead (Q_p then) and queue_p at R_p then.
+type aheadSnap struct {
+	bytes uint64
+	delay Duration
+}
+
+// snapAhead takes the snapshot for a batch handed to p now. queue_p is
+// taken only for multipath sessions, which alone use it.
+func (s *Session) snapAhead(p *Pipe) aheadSnap {
+	n := s.queuedOn(p)
+	if n == 0 || p.mp == nil || p.out == nil {
+		return aheadSnap{bytes: n}
+	}
+	return aheadSnap{bytes: n, delay: minD(Second, timeAt(n, s.rateOf(p)))}
+}
+
+// setAhead makes snap that of p's oldest unacknowledged ack-eliciting
+// byte.
+func (s *Session) setAhead(p *Pipe, snap aheadSnap) {
+	p.mp.unsentAhead, p.mp.queueD = snap.bytes, snap.delay
+}
+
 func (s *Session) tSuspect(a *attach) Duration {
 	f := s.cfg.SuspectFloor
 	if a.suspectFloor > 0 {
 		f = a.suspectFloor
 	}
-	return maxD(f, 2*s.pto(a))
+	return maxD(f, 2*(s.pto(a)+s.queueDelay(a)))
 }
 
-func (s *Session) tFail(a *attach) Duration { return maxD(2*Second, 8*s.pto(a)) }
+func (s *Session) tFail(a *attach) Duration { return maxD(2*Second, 8*(s.pto(a)+s.queueDelay(a))) }
 
 func (s *Session) tDead(a *attach) Duration {
-	dt := s.cfg.DeadTimeout
+	f, dt := s.cfg.SuspectFloor, s.cfg.DeadTimeout
+	if a.suspectFloor > 0 {
+		f = a.suspectFloor
+	}
 	if a.deadTimeout > 0 {
 		dt = a.deadTimeout
 	}
+	return s.deadLimit(s.pto(a)+s.queueDelay(a), f, dt)
+}
+
+// deadLimit is T_dead (MULTIPATH.md 7.1) for PTO + queue d, suspect floor
+// f and dead_timeout dt (0: not set).
+func (s *Session) deadLimit(d, f, dt Duration) Duration {
 	if dt == 0 {
-		if s.feat.Resume {
-			dt = s.tFail(a)
-		} else {
+		dt = maxD(2*Second, 8*d) // T_fail
+		if !s.feat.Resume {
 			idle := s.idleTimeout()
 			if idle == 0 {
-				idle = 30 * Second
+				idle = DefaultIdleTimeout
 			}
-			dt = maxD(s.tFail(a), idle/2)
+			dt = maxD(dt, idle/2)
 		}
 	}
-	return maxD(s.tSuspect(a), dt)
+	return maxD(maxD(f, 2*d), dt)
+}
+
+// lastInDead is the T_dead that bounds the silence of the last live
+// inbound pipe (MULTIPATH.md 7.3): that of the last pipe, with the
+// largest PTO of the live outbound pipes, or the initial values when there
+// are none.
+func (s *Session) lastInDead() Duration {
+	var d Duration
+	for _, p := range s.pipes {
+		if p.mp != nil && !p.mp.retired && p.out != nil && p.mp.liveOut() {
+			d = maxD(d, s.pto(p.mp))
+		}
+	}
+	if d == 0 {
+		var a attach
+		a.rtt.smoothed, a.rtt.rttvar = 333*Millisecond, 166*Millisecond
+		d = s.pto(&a)
+	}
+	return s.deadLimit(d, s.cfg.SuspectFloor, s.cfg.DeadTimeout)
+}
+
+// probeInterval is the probe interval k of p's outbound direction: the
+// pipe's ProbeInterval, else the session's; on an attachment without an
+// outbound direction at the peer at most 15 s, and never off (MULTIPATH.md
+// 7.1). 0: no probes.
+func (s *Session) probeInterval(p *Pipe) Duration {
+	k := s.cfg.ProbeInterval
+	switch {
+	case p.mp.probeIv > 0:
+		k = p.mp.probeIv
+	case p.mp.probeIv < 0:
+		k = 0 // off for this pipe
+	}
+	if p.in == nil && (k == 0 || k > 15*Second) {
+		k = 15 * Second
+	}
+	return k
+}
+
+// probeHold is H_p, the longest time one record of p that carries no
+// urgent frame may wait between being planned and being handed to the
+// carrier, as the guardrails bound it now (MULTIPATH.md 7.1): the smaller
+// of MaxDelay and what remains of MaxPauseTotal, the one that is set if
+// only one is. 0 when p (nil: not yet attached) is not shaped with plans,
+// or when neither guardrail is set.
+func (s *Session) probeHold(p *Pipe) Duration {
+	if p == nil {
+		return 0
+	}
+	ps := p.sh
+	if s.shp == nil || ps == nil || ps.sh == nil || ps.caps&shaping.CapPlan == 0 {
+		return 0
+	}
+	if s.shp.lim.NoPause {
+		return 0
+	}
+	h := Duration(s.shp.lim.MaxDelay)
+	if m := s.shp.lim.MaxPauseTotal; m > 0 {
+		left := Duration(m - min(s.shp.stats.PauseTotal, m))
+		if h == 0 || left < h {
+			h = left
+		}
+	}
+	return max(h, 0)
+}
+
+// probeWait is the current wait of p's idle-pipe probe: k_eff = max(1 s,
+// k - H_p), never above k, with H_p and the draw both taken when the wait
+// started (drawProbe), so that the probe reaches the carrier at most k
+// after the previous ack-eliciting byte did. 0: no probes.
+func (s *Session) probeWait(p *Pipe) Duration {
+	k := s.probeInterval(p)
+	if k == 0 {
+		return 0
+	}
+	if h := p.mp.probeH; h > 0 {
+		k = min(k, max(Second, k-h))
+	}
+	if c := p.mp.probeCut; c > 0 {
+		k = Duration(float64(k) * (1 - c))
+	}
+	return k
+}
+
+// probeJitter is the probe jitter j of a.
+func (s *Session) probeJitter(a *attach) float64 {
+	switch {
+	case a.probeJit > 0:
+		return a.probeJit
+	case a.probeJit < 0:
+		return 0
+	}
+	return s.cfg.ProbeJitter
+}
+
+// drawProbe starts a probe wait of a: w = k_eff x (1 - j x u), u uniform
+// in [0, 1), so w lies in (k_eff x (1 - j), k_eff]. The first wait of a
+// bootstrap pipe (boot: no PIPE_PING was sent on it by either end) is
+// drawn from the whole interval instead when j > 0, so that pipes and
+// sessions set up together do not probe in step; a joined pipe carried
+// the joiner's PIPE_PING, so both of its ends draw as usual (MULTIPATH.md
+// 7.1). H_p is fixed for the wait here as well: p is a's pipe, nil while
+// it is being made (H_p 0).
+func (s *Session) drawProbe(a *attach, p *Pipe, boot bool) {
+	a.probeH = s.probeHold(p)
+	a.probeCut = 0
+	if j := s.probeJitter(a); j > 0 {
+		u := s.rand().Float64()
+		if !boot {
+			u *= j
+		}
+		a.probeCut = u
+	}
 }
 
 // tref is the start of an ack stall.
@@ -85,7 +236,7 @@ func (s *Session) writeStall(p *Pipe) (Time, bool) {
 
 func (s *Session) otherActive(p *Pipe) bool {
 	for _, q := range s.pipes {
-		if q != p && q.mp != nil && q.out != nil && q.mp.out == outActive {
+		if q != p && q.mp != nil && q.out != nil && q.mp.out == OutActive {
 			return true
 		}
 	}
@@ -109,6 +260,19 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 		next = minT(next, t)
 		return false
 	}
+	// due is at for a deadline whose processing changes a pipe's state:
+	// one already passed but not yet processed stays pending, so that a
+	// driver that asks for the next deadline between the moment it passed
+	// and the timer pass still arms a timer for it.
+	due := func(t Time) bool {
+		if !at(t) {
+			return false
+		}
+		if !apply {
+			next = minT(next, t)
+		}
+		return true
+	}
 	liveIn := s.hasLiveInbound()
 	for i := 0; i < len(s.pipes); i++ {
 		p := s.pipes[i]
@@ -117,8 +281,8 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 			continue
 		}
 		// Unconfirmed local joins fail at the handshake timeout.
-		if a.joinerLocal && (a.out == outJoining || a.out == outNone && a.in == inJoining) && p.id != 0 {
-			if at(a.attachedAt.Add(s.cfg.HandshakeTimeout)) && apply {
+		if a.joinerLocal && (a.out == OutJoining || a.out == OutNone && a.in == InJoining) && p.id != 0 {
+			if due(a.attachedAt.Add(s.cfg.HandshakeTimeout)) && apply {
 				s.failPipe(p, 0x296a5bf5, nil)
 				continue
 			}
@@ -130,38 +294,35 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 				stall = ws
 			}
 			switch a.out {
-			case outActive, outJoining:
-				if at(stall.Add(s.tSuspect(a))) && apply && (a.out != outJoining || s.confirmedOnce(p)) {
+			case OutActive, OutJoining:
+				if (a.out != OutJoining || s.confirmedOnce(p)) && due(stall.Add(s.tSuspect(a))) && apply {
 					s.makeSuspect(p)
 				}
-			case outSuspect:
+			case OutSuspect:
 				lim := s.tDead(a)
 				if s.otherActive(p) {
 					lim = s.tFail(a)
 				}
-				if at(stall.Add(lim)) && apply {
+				if due(stall.Add(lim)) && apply {
 					s.failPipe(p, 0x296a5bf5, nil)
 					continue
 				}
-			case outDraining:
-				if !a.drainSuspect && at(stall.Add(s.tSuspect(a))) && apply {
+			case OutDraining:
+				if !a.drainSuspect && due(stall.Add(s.tSuspect(a))) && apply {
 					a.drainSuspect = true
 					s.reinjectPipe(p)
 				}
-			case outNone, outFailed, outClosed:
+			case OutNone, OutFailed, OutClosed, OutRetired:
 				// liveOut excludes these.
 			}
 		}
-		if a.out == outDraining && at(a.drainStart.Add(s.tFail(a))) && apply {
+		if a.out == OutDraining && due(a.drainStart.Add(s.tFail(a))) && apply {
 			s.failPipe(p, 0x296a5bf5, nil)
 			continue
 		}
 		// Idle-pipe probe (MULTIPATH.md 7.1).
-		if p.out != nil && (a.out == outActive || a.out == outSuspect) && !a.unacked && !a.needPing {
-			iv := s.cfg.ProbeInterval
-			if p.in == nil {
-				iv = 15 * Second
-			}
+		if p.out != nil && (a.out == OutActive || a.out == OutSuspect) && !a.unacked && !a.needPing {
+			iv := s.probeWait(p)
 			if sp := s.cfg.StandbyProbe; sp > 0 && now < m.busyUntil && s.backup(p) && (iv == 0 || sp < iv) {
 				iv = sp
 			}
@@ -170,7 +331,7 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 				if a.liveAt > ref {
 					ref = a.liveAt
 				}
-				if at(ref.Add(iv)) && apply {
+				if due(ref.Add(iv)) && apply {
 					a.needPing = true
 					a.pingSince = now
 					s.wakeAllWriters()
@@ -179,32 +340,37 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 		}
 		// Unilateral retirement (MULTIPATH.md 8.4).
 		if a.abandonAcked && !a.abandonRecv && !a.unilateral {
-			if at(a.ackedAbandonAt.Add(maxD(2*Second, 3*s.maxPTO()))) && apply {
+			if due(a.ackedAbandonAt.Add(maxD(2*Second, 3*s.maxPTO()))) && apply {
 				a.unilateral = true
 				s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
-				if p.out != nil && a.out != outFailed {
-					a.out = outClosed
+				if p.out != nil && a.out != OutFailed {
+					a.out = OutClosed
 				}
 				if p.in != nil {
-					a.in = inEnded
+					a.in = InEnded
 				}
 				s.maybeRetire(p)
 				continue
 			}
 		}
 		// Linger after a completed PIPE_ABANDON exchange.
-		if a.lingering && a.in == inOpen && at(a.lingerUntil) && apply {
-			a.in = inEnded
+		if a.lingering && a.in == InOpen && due(a.lingerUntil) && apply {
+			a.in = InEnded
 			s.act(Action{Kind: ActClose, Pipe: p.id, Dir: DirIn})
 			s.maybeRetire(p)
 			continue
 		}
 		// Inbound silence of an attachment without a local outbound
 		// direction (MULTIPATH.md 7.3).
-		if p.out == nil && a.in == inOpen {
+		if p.out == nil && a.in == InOpen {
 			_, nIn := s.liveCounts()
 			lim := 15*Second + Duration(nIn)*Second/8 + maxD(2*Second, maxD(2*s.srttMaxOut(), a.maxGap-15*Second))
-			if at(a.lastRecord.Add(lim)) && apply {
+			if nIn <= 1 {
+				// Losing it leaves no live inbound pipe: the patience of
+				// a stalled last outbound pipe.
+				lim = maxD(lim, s.lastInDead())
+			}
+			if due(a.lastRecord.Add(lim)) && apply {
 				s.failPipe(p, 0x296a5bf5, nil)
 				continue
 			}
@@ -281,7 +447,20 @@ func (s *Session) srttMaxOut() Duration {
 
 func (s *Session) mpNextTimeout() Time { return s.mpTimers(s.now, false) }
 
-func (s *Session) mpHandleTimeout(now Time) { s.mpTimers(now, true) }
+// mpHandleTimeout acts on the due deadlines. A pipe state change in a pass
+// can make other deadlines due at once (a failure turns another pipe's
+// limit into T_dead, a suspicion whose T_dead equals T_suspect); those are
+// no longer pending for mpNextTimeout, so passes repeat until one changes
+// no pipe state.
+func (s *Session) mpHandleTimeout(now Time) {
+	for range 16 {
+		g := s.mp.stateGen
+		s.mpTimers(now, true)
+		if s.mp == nil || s.mp.stateGen == g {
+			return
+		}
+	}
+}
 
 // ---- suspension (RESUME.md 4) ----
 
@@ -292,6 +471,8 @@ func (s *Session) suspend(cause error) {
 	s.mp.suspendCause = cause
 	s.preSuspend = s.state
 	s.state = StateSuspended
+	s.suspendedAt = s.now
+	s.stats.Suspensions++
 	s.timers.grace = s.now.Add(s.graceDur())
 	s.emit(Event{Kind: EvSuspended})
 }
@@ -325,16 +506,17 @@ func (s *Session) checkResumed() {
 		if p.mp == nil || p.mp.retired {
 			continue
 		}
-		if p.out != nil && p.mp.out == outActive {
+		if p.out != nil && p.mp.out == OutActive {
 			act = true
 		}
-		if p.in != nil && p.mp.in == inOpen {
+		if p.in != nil && p.mp.in == InOpen {
 			open = true
 		}
 	}
 	if !act || !open {
 		return
 	}
+	s.endSuspension()
 	s.state = s.preSuspend
 	if s.ga.sent || s.ga.received {
 		s.state = StateDraining

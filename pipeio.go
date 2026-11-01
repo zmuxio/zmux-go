@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"sync"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 // Framing is a carrier's record framing (SPEC.md 3.1, 3.4).
@@ -19,6 +21,10 @@ const (
 	FramingRecords
 )
 
+// MaxRecordSize is the largest record zmux accepts (its max_record_size):
+// with FramingRecords, the largest message a carrier needs to deliver.
+const MaxRecordSize = wire.MaxRecordSize
+
 // MessageReader is the receiving half of a message-framed carrier.
 type MessageReader interface {
 	// ReadMessage returns the next whole message.
@@ -31,22 +37,69 @@ type MessageWriter interface {
 	WriteMessage(p []byte) error
 }
 
+// BuffersWriter is an optional capability of a byte-stream sending half
+// that takes a batch of buffers in one call, as net.Buffers does for a
+// net.Conn: one flush or one locked copy per batch instead of one per
+// buffer.
+type BuffersWriter interface {
+	// WriteBuffers writes bufs in order, as one Write of their
+	// concatenation would. It may consume bufs (advance or empty its
+	// elements) but retains neither bufs nor their contents once it
+	// returns.
+	WriteBuffers(bufs [][]byte) (int, error)
+}
+
+var flatPool = sync.Pool{New: func() any { return new([]byte) }}
+
+// WriteFlat writes bufs to w with one Write of their concatenation, copied
+// into a pooled buffer: one call per batch for a writer whose every call
+// costs a record or a locked hand-over (TLS, a QUIC stream). A
+// BuffersWriter may implement WriteBuffers with it.
+func WriteFlat(w io.Writer, bufs [][]byte) (int, error) {
+	if len(bufs) == 1 {
+		return w.Write(bufs[0])
+	}
+	bp := flatPool.Get().(*[]byte)
+	b := (*bp)[:0]
+	for _, p := range bufs {
+		b = append(b, p...)
+	}
+	n, err := w.Write(b) // w retains nothing of b once it returns
+	*bp = b[:0]
+	flatPool.Put(bp)
+	return n, err
+}
+
 // PipeIO is a pipe input: at most one receiving half and at most one
 // sending half, at least one of them, each closed by zmux exactly once.
 // Optional capabilities are discovered on the halves:
 //
 //   - interface{ Abort(error) } on W: used instead of Close when a pipe fails;
+//   - BuffersWriter on W: a batch of records in one call;
 //   - interface{ CloseWrite() error } on W: graceful end of the write side;
 //   - interface{ ConnectionState() tls.ConnectionState }: a TLS carrier
 //     (records built at 16382 bytes, exporter for PipeAuth.TLS);
 //   - interface{ CarrierConn() any } and interface{ OpenLane(ctx) (io.WriteCloser, error) }: lanes;
 //   - interface{ RestartEarly(ctx) (io.ReadWriteCloser, error) }: carrier early data.
+//   - DatagramChannel: the carrier's datagram channel (EXTENSIONS.md 6.8).
+//   - interface{ Unsent() (uint64, bool) } on W, and on a lane's writer:
+//     the bytes write calls took that the carrier has not yet transmitted,
+//     false when it cannot tell; queried by the driver outside the session
+//     lock before each write (PipeStats.QueuedBytes, the scheduler's Q_p).
+//     A TCP connection, or a TLS one over it, reports the socket's
+//     unsent bytes where the platform has a query (Linux SIOCOUTQNSD)
+//     without it.
 //
 // A half's Close must interrupt a blocked Read or Write.
 type PipeIO struct {
 	R       io.ReadCloser
 	W       io.WriteCloser
 	Framing Framing
+	// Carrier is the carrier's kind, which the adapters set on both ends
+	// and a Candidate's dial sets to its Kind; 0 for a carrier of no listed
+	// kind, such as raw TCP or TLS. The session reports it to its
+	// ShaperFactory, in pipe events and in PipeStats.
+	Carrier CarrierKind
 	// Label names the pipe in statistics.
 	Label string
 	// FateGroup is the carrier's own fate group (a carrier pool's pipes on
@@ -63,6 +116,9 @@ type tlsStater interface {
 }
 
 type closeWriter interface{ CloseWrite() error }
+
+// unsentReporter is the optional unsent count of a sending half.
+type unsentReporter interface{ Unsent() (uint64, bool) }
 
 type aborter interface{ Abort(error) }
 

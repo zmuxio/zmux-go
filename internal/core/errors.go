@@ -73,6 +73,7 @@ const (
 	StreamClosedLocally
 	StreamRejected
 	StreamGoingAway
+	StreamPreambleTooLarge // Code is the largest preamble the peer accepts
 )
 
 // StreamError is a stream-level outcome.
@@ -94,6 +95,8 @@ func (e *StreamError) Error() string {
 		return fmt.Sprintf("zmux: stream %d rejected", e.StreamID)
 	case StreamGoingAway:
 		return "zmux: going away"
+	case StreamPreambleTooLarge:
+		return fmt.Sprintf("zmux: preamble too large (max %d)", e.Code)
 	case StreamClosedLocally:
 	}
 	return fmt.Sprintf("zmux: stream %d closed locally", e.StreamID)

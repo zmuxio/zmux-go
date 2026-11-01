@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 type corpusEntry struct {
@@ -46,7 +48,7 @@ func (e *corpusEntry) gates() Gates {
 	for _, n := range e.Gates {
 		switch n {
 		case "max_datagram_frame_size":
-			g.MaxDatagram = MaxVarint
+			g.MaxDatagram = varint.MaxVarint
 		case "reset_stream_at":
 			g.ResetStreamAt = true
 		case "zmux_goaway":
@@ -118,7 +120,7 @@ func processEntry(e *corpusEntry) *Error {
 	case "record":
 		b, _ := hex.DecodeString(e.Hex)
 		for len(b) > 0 {
-			size, n := ReadVarint(b)
+			size, n := varint.ConsumeVarint(b)
 			if n == 0 {
 				return ErrFrame("truncated size")
 			}

@@ -57,6 +57,18 @@ func (t tcpInfo) minRTT() (time.Duration, bool) {
 	return d, ok && d > 0
 }
 
+// unsent is the carrier's unsent count, an optional capability: the bytes
+// the socket holds and has not sent (Linux SIOCOUTQNSD).
+func (t tcpInfo) unsent() (uint64, bool) {
+	if t.rc == nil {
+		return 0, false
+	}
+	var n uint64
+	ok := false
+	_ = t.rc.Control(func(fd uintptr) { n, ok = tcpUnsent(fd) })
+	return n, ok
+}
+
 func (t tcpInfo) hasMinRTT() bool {
 	_, ok := t.minRTT()
 	return ok

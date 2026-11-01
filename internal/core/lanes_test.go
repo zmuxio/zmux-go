@@ -1,6 +1,13 @@
 package core
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/shaping"
+	"github.com/zmuxio/zmux-go/varint"
+)
 
 // Data lanes take the paced room in turns; lane 0
 // and the copy lane are never held back.
@@ -82,4 +89,79 @@ func TestBatchKeepsDirectionOnItsPhysicalLane(t *testing.T) {
 		t.Fatal("direction moved before its batch was acknowledged")
 	}
 	s.Release(st)
+}
+
+// planShaper plans every record with a fixed delay and padding target and
+// records the lanes it planned.
+type planShaper struct {
+	delay time.Duration
+	padTo int
+	lanes []uint64
+}
+
+func (d *planShaper) Capabilities() shaping.Caps { return shaping.CapPlan }
+func (d *planShaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
+	d.lanes = append(d.lanes, v.Lane)
+	p.Delay, p.PadTo = d.delay, d.padTo
+}
+func (d *planShaper) OnEvent(*shaping.Event, *shaping.Reply) {}
+
+// A lane's PIPE_LANE record is a record of its pipe like any other
+// (MULTIPATH.md 5.8): the pipe's Shaper plans it, its delay holds it and,
+// while it waits, every other lane of the pipe, and its padding is
+// applied, PIPE_LANE and PADDING being all the record holds.
+func TestLaneFirstRecordShaped(t *testing.T) {
+	s := New(DefaultConfig(), 0)
+	info := CarrierInfo{Lanes: true}
+	p := s.AttachBootstrap(info, info, nil)
+	p.out.lanes[0].tpSent = true
+	s.peerSeen = true
+	s.state = StateActive
+	s.peer.MaxLanes = 3
+	s.peerMaxRecord = 65535
+	s.feat = Features{PipeAck: true, LanesOut: true, LanesIn: true}
+	p.out.lo.offered = true
+	ps := &planShaper{delay: 20 * time.Millisecond, padTo: 200}
+	s.SetShaper(func(uint64, uint8) shaping.Shaper { return ps })
+	lane, ok := s.LaneOpened(p.id, info, nil)
+	if !ok {
+		t.Fatal("lane not opened")
+	}
+	now := Time(Second)
+	s.SetNow(now)
+	b := GetBatch()
+	defer PutBatch(b)
+	if s.PollTransmit(p.id, lane, b, DefaultBatch, now) {
+		t.Fatal("the PIPE_LANE record went during its delay")
+	}
+	if len(ps.lanes) != 1 || ps.lanes[0] != lane {
+		t.Fatalf("planned lanes %v, want [%d]", ps.lanes, lane)
+	}
+	if s.WantsWrite(p.id, lane) || s.WantsWrite(p.id, 0) {
+		t.Fatal("a lane of the pipe wants to write while its record is delayed")
+	}
+	if d := s.ShapingDeadline(); d != now.Add(20*Millisecond) {
+		t.Fatalf("shaping deadline %v, want the delay's end", d)
+	}
+	now = now.Add(20 * Millisecond)
+	s.SetNow(now)
+	s.shapeTimeout(now)
+	if !s.WantsWrite(p.id, lane) {
+		t.Fatal("the lane does not want to write after the delay")
+	}
+	if !s.PollTransmit(p.id, lane, b, DefaultBatch, now) {
+		t.Fatal("no PIPE_LANE record after the delay")
+	}
+	recs := batchFrames(t, b)
+	if len(recs) != 1 || len(recs[0]) < 2 || recs[0][0] != wire.KindPipeLane {
+		t.Fatalf("records %v, want one PIPE_LANE record", recs)
+	}
+	for _, k := range recs[0][1:] {
+		if k != wire.KindPadding {
+			t.Fatalf("the PIPE_LANE record holds %v", recs[0])
+		}
+	}
+	if size, _ := varint.ConsumeVarint(b.Bufs()[0]); size != 200 {
+		t.Fatalf("PIPE_LANE record of %d bytes, want the planned 200", size)
+	}
 }

@@ -2,6 +2,7 @@ package core
 
 import (
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // lookupStream resolves the stream a frame references, opening peer streams
@@ -38,6 +39,9 @@ func (s *Session) lookupStream(id uint64, opens bool) (*Stream, *wire.Error) {
 		st.id, st.idSet, st.opened = nid, true, true
 		st.urgency, st.incr = 3, true
 		s.streams[nid] = st
+		if s.shp != nil {
+			s.shapeStream(shaping.EventStreamOpen, nid)
+		}
 		st.applyPeerParams()
 		s.stats.StreamsOpenedRemote++
 		if s.ga.sent && i >= s.ga.sentWater[t] || s.underPressure() {
@@ -45,6 +49,7 @@ func (s *Session) lookupStream(id uint64, opens bool) (*Stream, *wire.Error) {
 		} else if !s.feat.Preamble {
 			s.offer(st)
 		}
+		s.releaseHeld(st)
 		last = st
 	}
 	rc.opened = idx + 1
@@ -176,6 +181,9 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 				"limit", s.conn.adv)
 		}
 	}
+	if s.feat.Multipath {
+		s.countDuplicate(r, off, end)
+	}
 	effect := end > r.highest || f.Fin && !r.finKnown
 	r.highest = max64(r.highest, end)
 	if f.Fin && !r.finKnown {
@@ -185,7 +193,7 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		}
 	}
 	if s.tuneOn() {
-		s.tuneData(st, end)
+		s.tuneData(st)
 	}
 	// Preamble of a peer stream (EXTENSIONS.md 4.4).
 	data := f.Data
@@ -398,6 +406,7 @@ func (s *Session) Read(st *Stream, p []byte) (int, bool, error) {
 	if n > 0 {
 		r.readOff += uint64(n)
 		s.stats.AppBytesRead += uint64(n)
+		st.cnt.appRead += uint64(n)
 		s.bufSub(uint64(n))
 		s.streamCreditChanged(st)
 		s.tuneConsume()
@@ -504,6 +513,9 @@ func (s *Session) maybeDiscard(st *Stream) {
 	}
 	st.discarded = true
 	delete(s.streams, st.id)
+	if s.shp != nil {
+		s.shapeStream(shaping.EventStreamEnd, st.id)
+	}
 	s.sched.remove(st)
 	s.unlinkCtl(st)
 	s.unbindLane(st)
@@ -657,6 +669,7 @@ func (s *Session) ReadChunk(st *Stream, limit int) (data []byte, buf *Buf, fin b
 	if n := uint64(len(data)); n > 0 {
 		r.readOff += n
 		s.stats.AppBytesRead += n
+		st.cnt.appRead += n
 		s.bufSub(n)
 		s.streamCreditChanged(st)
 		s.tuneConsume()
@@ -696,4 +709,17 @@ func (s *Session) ReadReady(st *Stream) (uint64, bool) {
 	end := r.stopped || r.state == recvDataRead || r.finKnown && r.readOff == r.final && !r.reset ||
 		r.reset && r.readOff >= r.resetRel || s.err != nil
 	return 0, end
+}
+
+// countDuplicate counts the stream bytes of [off, end) that were received
+// already, for the session and the pipe of the record (multipath).
+func (s *Session) countDuplicate(r *recvPart, off, end uint64) {
+	dup := r.arrived.covered(off, end)
+	if dup == 0 {
+		return
+	}
+	s.stats.BytesDuplicateReceived += dup
+	if p := s.rxPipe; p != nil && p.mp != nil {
+		p.mp.dupBytes += dup
+	}
 }

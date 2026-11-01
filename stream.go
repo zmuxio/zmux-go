@@ -77,10 +77,10 @@ func (h *handle) wwait() chan struct{} {
 func (h *handle) setDeadline(read, write bool, t time.Time) {
 	d := h.deadlines()
 	if read {
-		d.r.set(t)
+		d.r.set(t, h.c.clk.source())
 	}
 	if write {
-		d.w.set(t)
+		d.w.set(t, h.c.clk.source())
 	}
 	h.c.lock()
 	if read {
@@ -415,3 +415,83 @@ func (c *streamConn) Close() error {
 
 func (c *streamConn) LocalAddr() net.Addr  { return c.local }
 func (c *streamConn) RemoteAddr() net.Addr { return c.remote }
+
+// StreamStats is a snapshot of a stream's statistics in payload bytes, the
+// preamble excluded (API.md 7.2); each field holds a value it had during
+// the call, and PipeID with PipeBound are read at one point. Both
+// parts of a bidirectional stream return the same snapshot; the fields of
+// a direction the stream lacks stay 0. Once the session released the
+// stream the snapshot keeps its final values for as long as the handle is
+// held.
+type StreamStats struct {
+	// BytesWritten counts the payload the sending part accepted from the
+	// application; BytesSent the payload put into STREAM frames, every
+	// copy (reinjection, redundancy, opportunistic) again.
+	BytesWritten, BytesSent uint64
+	// BytesAcknowledged counts distinct payload offsets acknowledged:
+	// passed to the carrier without multipath, covered by PIPE_ACK with
+	// it.
+	BytesAcknowledged uint64
+	// BytesReceived counts distinct payload bytes received, read or not;
+	// none before a peer stream's preamble, and after CancelRead every
+	// byte below the highest offset received. BytesRead counts those
+	// returned to the application.
+	BytesReceived, BytesRead uint64
+	// The stream's datagrams handed to a carrier, received and queued,
+	// and dropped from its full queue, with their payload bytes.
+	DatagramsSent, DatagramsReceived         uint64
+	DatagramsDroppedRecv                     uint64
+	DatagramBytesSent, DatagramBytesReceived uint64
+	// SendBuffered is a gauge of written bytes not yet released (unsent;
+	// unacknowledged in multipath), RecvBuffered of received bytes not yet
+	// read, RecvWindow of the current receive window.
+	SendBuffered, RecvBuffered, RecvWindow uint64
+	// PipeID is the pipe the sending direction is bound to under the
+	// affinity scheduler while PipeBound is true; pipe 0 is a pipe, so an
+	// unbound direction reports PipeBound false (and PipeID 0).
+	PipeID    uint64
+	PipeBound bool
+}
+
+func (h *handle) stats() StreamStats {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	in := c.s.StreamInfo(h.st)
+	return StreamStats{BytesWritten: in.BytesWritten, BytesSent: in.BytesSent,
+		BytesAcknowledged: in.BytesAcknowledged, BytesReceived: in.BytesReceived, BytesRead: in.BytesRead,
+		DatagramsSent: in.DatagramsSent, DatagramsReceived: in.DatagramsReceived,
+		DatagramsDroppedRecv: in.DatagramsDroppedRecv, DatagramBytesSent: in.DatagramBytesSent,
+		DatagramBytesReceived: in.DatagramBytesReceived, SendBuffered: in.SendBuffered,
+		RecvBuffered: in.RecvBuffered, RecvWindow: in.RecvWindow, PipeID: in.Pipe, PipeBound: in.PipeBound}
+}
+
+// Stats returns a snapshot of the stream's statistics; a nil s returns
+// the zero snapshot.
+func (s *Stream) Stats() StreamStats {
+	if s == nil || s.h == nil {
+		return StreamStats{}
+	}
+	defer runtime.KeepAlive(s)
+	return s.h.stats()
+}
+
+// Stats returns a snapshot of the stream's statistics; a nil s returns
+// the zero snapshot.
+func (s *SendStream) Stats() StreamStats {
+	if s == nil || s.h == nil {
+		return StreamStats{}
+	}
+	defer runtime.KeepAlive(s)
+	return s.h.stats()
+}
+
+// Stats returns a snapshot of the stream's statistics; a nil s returns
+// the zero snapshot.
+func (s *ReceiveStream) Stats() StreamStats {
+	if s == nil || s.h == nil {
+		return StreamStats{}
+	}
+	defer runtime.KeepAlive(s)
+	return s.h.stats()
+}

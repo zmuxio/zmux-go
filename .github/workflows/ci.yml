@@ -29,6 +29,8 @@ jobs:
             path: zmuxquic
           - name: zmuxh3
             path: zmuxh3
+          - name: zmuxws
+            path: zmuxws
     defaults:
       run:
         shell: bash
@@ -63,7 +65,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", zmuxquic, zmuxh3]
+        module: [".", zmuxquic, zmuxh3, zmuxws]
     steps:
       - uses: actions/checkout@v5
 

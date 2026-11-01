@@ -56,8 +56,8 @@ func autoDuplicatePair(t *testing.T) (*Conn, *Conn) {
 	if other.err != nil {
 		t.Fatal(other.err)
 	}
-	first.DesignateDialer(false)
-	other.conn.DesignateDialer(true)
+	first.DesignateDialer(EndpointPeer)
+	other.conn.DesignateDialer(EndpointLocal)
 	t.Cleanup(func() { _ = first.Close(); _ = other.conn.Close(); waitDone(t, first); waitDone(t, other.conn) })
 	return first, other.conn
 }

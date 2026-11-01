@@ -297,12 +297,12 @@ func ExampleConn_AddPipe() {
 			break
 		}
 	}
-	st, err := p.Stats()
-	if err != nil {
-		fmt.Println(err)
+	st, ok := p.Stats()
+	if !ok {
+		fmt.Println(zmux.ErrPipeGone)
 		return
 	}
-	fmt.Println(len(client.Pipes()), "pipes;", st.Label, st.State, "standby:", st.Standby)
+	fmt.Println(len(client.Pipes()), "pipes;", st.Label, st.Outbound, "standby:", st.Standby)
 	// Output: 2 pipes; backup active standby: true
 }
 
@@ -334,7 +334,7 @@ func ExampleEarlyData() {
 	_ = st.SetReadDeadline(time.Now().Add(5 * time.Second))
 	ga.releaseAfter(ctx, []byte("request")) // the server starts only now
 	go func() {
-		server, err := zmux.Server(ctx, b, &zmux.Config{MaxIncomingStreams: -1})
+		server, err := zmux.Server(ctx, b, &zmux.Config{NoIncomingStreams: true})
 		if err == nil {
 			_ = server.Wait()
 		}
@@ -416,7 +416,7 @@ func ExampleSplice() {
 	fmt.Println(r.AtoB.Bytes, r.BtoA.Bytes, r.AtoB.End, r.BtoA.End)
 	// Output:
 	// through the relay
-	// 17 17 <nil> <nil>
+	// 17 17 finished finished
 }
 
 // wsConn is the message interface that WebSocket libraries offer, in the

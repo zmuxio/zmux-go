@@ -1,10 +1,13 @@
 # Releasing
 
-This repository holds three Go modules:
+This repository holds four Go modules:
 
 - root module: `github.com/zmuxio/zmux-go`
 - QUIC carrier module: `github.com/zmuxio/zmux-go/zmuxquic`
 - HTTP/3 carrier module: `github.com/zmuxio/zmux-go/zmuxh3`
+- WebSocket carrier module: `github.com/zmuxio/zmux-go/zmuxws`, which
+  requires `github.com/djylb/netx`: a netx change it needs is released
+  (pushed, and tagged once netx has tags) before the zmuxws release
 
 The sub-modules track the current root release directly. They do not keep
 compatibility shims for older root versions.
@@ -12,7 +15,7 @@ compatibility shims for older root versions.
 ## Version Tags
 
 - root module tag: `vX.Y.Z`
-- sub-module tags: `zmuxquic/vX.Y.Z` and `zmuxh3/vX.Y.Z`
+- sub-module tags: `zmuxquic/vX.Y.Z`, `zmuxh3/vX.Y.Z` and `zmuxws/vX.Y.Z`
 
 ## Local Development
 
@@ -26,6 +29,7 @@ use (
 	.
 	./zmuxh3
 	./zmuxquic
+	./zmuxws
 )
 ```
 
@@ -46,6 +50,23 @@ Always release in this order:
 
 Do not tag a sub-module first.
 
+## Dependency Update
+
+Before every release, update every dependency of every module to its latest
+release, then review the changes and run the full tests:
+
+```bash
+go get -u -t ./...
+go mod tidy
+(cd zmuxquic && GOWORK=off go get -u -t ./... && GOWORK=off go mod tidy)
+(cd zmuxh3 && GOWORK=off go get -u -t ./... && GOWORK=off go mod tidy)
+(cd zmuxws && GOWORK=off go get -u -t ./... && GOWORK=off go mod tidy)
+go test -race ./... ./zmuxquic/... ./zmuxh3/... ./zmuxws/...
+```
+
+Commit the updates on their own before the release commit. Keep the `go`
+directive unchanged unless raising it is an intentional release decision.
+
 ## Root Release
 
 From the repository root:
@@ -64,7 +85,7 @@ sub-module release commit.
 
 ## Sub-module Release
 
-From `zmuxquic`, then from `zmuxh3`, with the workspace off so that the
+From `zmuxquic`, `zmuxh3` and `zmuxws`, with the workspace off so that the
 published root version is resolved:
 
 ```bash
@@ -77,12 +98,13 @@ go test ./...
 Then from the repository root:
 
 ```bash
-git add zmuxquic/go.mod zmuxquic/go.sum zmuxh3/go.mod zmuxh3/go.sum
-git commit -m "zmuxquic, zmuxh3: bump zmux-go to vX.Y.Z"
+git add zmuxquic/go.mod zmuxquic/go.sum zmuxh3/go.mod zmuxh3/go.sum zmuxws/go.mod zmuxws/go.sum
+git commit -m "zmuxquic, zmuxh3, zmuxws: bump zmux-go to vX.Y.Z"
 git tag -a zmuxquic/vX.Y.Z -m "zmuxquic/vX.Y.Z"
 git tag -a zmuxh3/vX.Y.Z -m "zmuxh3/vX.Y.Z"
+git tag -a zmuxws/vX.Y.Z -m "zmuxws/vX.Y.Z"
 git push origin main
-git push origin zmuxquic/vX.Y.Z zmuxh3/vX.Y.Z
+git push origin zmuxquic/vX.Y.Z zmuxh3/vX.Y.Z zmuxws/vX.Y.Z
 ```
 
 ## Proxy Lag
@@ -113,17 +135,18 @@ git commit -m "release: prepare vX.Y.Z"
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 
-# zmuxquic and zmuxh3 (each directory)
+# zmuxquic, zmuxh3 and zmuxws (each directory)
 export GOWORK=off
 go get github.com/zmuxio/zmux-go@vX.Y.Z
 go mod tidy
 go test ./...
 
 # root
-git add zmuxquic/go.mod zmuxquic/go.sum zmuxh3/go.mod zmuxh3/go.sum
-git commit -m "zmuxquic, zmuxh3: bump zmux-go to vX.Y.Z"
+git add zmuxquic/go.mod zmuxquic/go.sum zmuxh3/go.mod zmuxh3/go.sum zmuxws/go.mod zmuxws/go.sum
+git commit -m "zmuxquic, zmuxh3, zmuxws: bump zmux-go to vX.Y.Z"
 git tag -a zmuxquic/vX.Y.Z -m "zmuxquic/vX.Y.Z"
 git tag -a zmuxh3/vX.Y.Z -m "zmuxh3/vX.Y.Z"
+git tag -a zmuxws/vX.Y.Z -m "zmuxws/vX.Y.Z"
 git push origin main
-git push origin zmuxquic/vX.Y.Z zmuxh3/vX.Y.Z
+git push origin zmuxquic/vX.Y.Z zmuxh3/vX.Y.Z zmuxws/vX.Y.Z
 ```

@@ -48,7 +48,7 @@ type pickLast struct{ calls atomic.Int32 }
 func (p *pickLast) Pick(_ []PickRequest, pipes []PickPipe, out []PickAnswer) {
 	p.calls.Add(1)
 	for i := range out {
-		out[i] = PickAnswer{Pipe: len(pipes) - 1}
+		out[i] = PickAnswer{Index: len(pipes) - 1}
 	}
 }
 
@@ -77,9 +77,9 @@ func TestCustomPolicy(t *testing.T) {
 	_ = s.Close()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		st, err := p2.Stats()
-		if err != nil {
-			t.Fatal(err)
+		st, ok := p2.Stats()
+		if !ok {
+			t.Fatal("pipe gone")
 		}
 		if st.BytesSent > 200<<10 {
 			break
@@ -139,5 +139,54 @@ func TestRedialAfterSuspension(t *testing.T) {
 	b, err := io.ReadAll(s)
 	if err != nil || string(b) != "after" {
 		t.Fatalf("echo after resume %q %v", b, err)
+	}
+}
+
+// An invalid RedialPolicy decision is rejected as the zero decision and
+// reported to Config.DecisionRejected outside every lock; redialling goes
+// on and resumes the session.
+func TestRedialPolicyInvalidDecision(t *testing.T) {
+	leakcheck.Check(t)
+	var ln net.Listener
+	ccfg := mpConfig()
+	ccfg.ResumeTimeout = 5 * time.Second
+	ccfg.Redial = func(context.Context, Direction) (PipeIO, error) {
+		nc, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			return PipeIO{}, err
+		}
+		return NetPipe(nc), nil
+	}
+	ccfg.RedialPolicy = policyFunc(func(_ *PoolView, d *PoolDecision) {
+		d.DialAfter, d.ProbeInterval = time.Hour, 500*time.Millisecond
+	})
+	var e *mpEnv
+	var rejected atomic.Int32
+	ccfg.DecisionRejected = func(err error) {
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("reported %v, want ErrInvalidConfig", err)
+		}
+		_ = e.client.Pipes() // outside every lock of the session
+		rejected.Add(1)
+		panic("contained")
+	}
+	scfg := mpConfig()
+	scfg.ResumeTimeout = 5 * time.Second
+	e = newMPEnv(t, ccfg, scfg)
+	ln = e.ln
+	e.client.pipes[0].closeAll(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for {
+		ev, err := e.client.NextEvent(ctx)
+		if err != nil {
+			t.Fatalf("no resumption: %v (rejected %d)", err, rejected.Load())
+		}
+		if ev.Kind == EventSessionResumed {
+			break
+		}
+	}
+	if rejected.Load() == 0 {
+		t.Fatal("rejected decision not reported")
 	}
 }

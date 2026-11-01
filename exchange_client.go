@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
@@ -14,9 +15,10 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // HTTPExchangePipe opens an HTTP exchange carrier (see HTTPExchangeConfig)
@@ -25,13 +27,27 @@ import (
 // carrier is ready at once. rawURL may contain {instance} and {nonce}
 // placeholders, anywhere in its path or query. client may be nil
 // (http.DefaultClient); keep its transport's MaxIdleConnsPerHost at least
-// DownRequests+UpRequests so that connections are reused. The carrier
-// ends when zmux closes it or when ctx ends.
+// DownRequests+UpRequests so that connections are reused. ctx bounds the
+// setting up: ending it before the first verified response fails the
+// carrier, which otherwise lives until zmux closes it. An invalid cfg (nil, or
+// without a PSK and AllowInsecure) is an ErrInvalidConfig error.
+//
+// Every request follows redirects as HTTPPipe does; a pure scheme upgrade
+// (CheckHTTPRedirect) is remembered, and the carrier's later requests go
+// to the new origin at once.
 func HTTPExchangePipe(ctx context.Context, client *http.Client, rawURL string, cfg *HTTPExchangeConfig) (PipeIO, error) {
-	if client == nil {
-		client = http.DefaultClient
+	return httpExchangePipe(ctx, client, rawURL, nil, cfg)
+}
+
+func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTarget, cfg *HTTPExchangeConfig) (PipeIO, error) {
+	p, err := cfg.resolve()
+	if err != nil {
+		return PipeIO{}, err
 	}
-	c := &exClient{p: cfg.resolve(), hc: client, wake: make(chan struct{}, 1),
+	if t != nil {
+		rawURL = t.URL()
+	}
+	c := &exClient{p: p, hc: client, nc: noRedirectClient(client), ht: t, wake: make(chan struct{}, 1),
 		downs: map[uint64]*exReqState{}, held: map[uint64]*exPiece{}}
 	if _, err := rand.Read(c.cid[:]); err != nil {
 		return PipeIO{}, err
@@ -48,34 +64,66 @@ func HTTPExchangePipe(ctx context.Context, client *http.Client, rawURL string, c
 		downURL = rawURL
 	}
 	for i, u := range []string{rawURL, downURL} {
-		t := exTarget{tmpl: u, param: c.p.nonceParam, instance: inst,
-			bust: c.p.cacheBust && !strings.Contains(u, "{nonce}")}
+		tg := exTarget{tmpl: u, param: c.p.nonceParam, instance: inst,
+			bust: c.p.cacheBust && !strings.Contains(u, "{nonce}"), origin: new(atomic.Pointer[string])}
 		var probe [exNonceLen]byte
-		if _, err := url.Parse(t.build(probe[:])); err != nil {
+		if _, err := url.Parse(tg.build(probe[:])); err != nil {
 			return PipeIO{}, fmt.Errorf("%w: exchange URL: %v", ErrInvalidConfig, err)
 		}
 		if i == 0 {
-			c.target = t
+			c.target = tg
 		} else {
-			c.downTarget = t
+			c.downTarget = tg
 		}
 	}
 	c.rc.L, c.wc.L = &c.mu, &c.mu
 	c.upLimit, c.downLimit = c.p.ups, c.p.downs
-	c.ctx, c.cancel = context.WithCancel(ctx)
+	// ctx bounds the setting up of the carrier only: from the first
+	// verified response on, the carrier lives until it is closed.
+	c.ctx, c.cancel = context.WithCancel(context.WithoutCancel(ctx))
+	c.setup = context.AfterFunc(ctx, c.cancel)
 	go c.run()
-	return PipeIO{R: &exClientReader{c}, W: &exClientWriter{c}}, nil
+	return PipeIO{R: &exClientReader{c}, W: &exClientWriter{c}, Carrier: CarrierExchange}, nil
 }
 
 // exTarget builds request targets from the URL template.
 type exTarget struct {
 	tmpl, param, instance string
 	bust                  bool
+	// origin replaces the template's scheme and authority once a request
+	// was upgraded to https (nil: none).
+	origin *atomic.Pointer[string]
+}
+
+// tmplOrigin splits the template at the end of its scheme and authority.
+func tmplOrigin(tmpl string) (origin, rest string) {
+	i := strings.Index(tmpl, "://")
+	if i < 0 {
+		return "", tmpl
+	}
+	j := strings.IndexAny(tmpl[i+3:], "/?#")
+	if j < 0 {
+		return tmpl, ""
+	}
+	return tmpl[:i+3+j], tmpl[i+3+j:]
+}
+
+// upgraded records that a request to from was upgraded to to.
+func (t *exTarget) upgraded(to *url.URL) string {
+	o := to.Scheme + "://" + to.Host
+	t.origin.Store(&o)
+	_, rest := tmplOrigin(t.tmpl)
+	return o + rest
 }
 
 func (t *exTarget) build(nonce []byte) string {
 	n := hex.EncodeToString(nonce)
-	u := strings.NewReplacer("{instance}", t.instance, "{nonce}", n).Replace(t.tmpl)
+	tmpl := t.tmpl
+	if o := t.origin.Load(); o != nil {
+		_, rest := tmplOrigin(tmpl)
+		tmpl = *o + rest
+	}
+	u := strings.NewReplacer("{instance}", t.instance, "{nonce}", n).Replace(tmpl)
 	if t.bust {
 		sep := "?"
 		if strings.Contains(u, "?") {
@@ -91,8 +139,11 @@ func (t *exTarget) build(nonce []byte) string {
 // attempt in flight (at most DownRequests+UpRequests, plus a final CLOSE)
 // performs it and applies its result under mu.
 type exClient struct {
+	setup      func() bool // stops ctx from ending the carrier (context.AfterFunc)
 	p          exParams
-	hc         *http.Client
+	hc         *http.Client // the caller's client (nil: the default)
+	nc         *http.Client // hc returning redirects
+	ht         *HTTPTarget  // the candidate's target, if any
 	cid        [exCIDLen]byte
 	key        *exKey
 	target     exTarget // UP and CLOSE requests
@@ -109,6 +160,8 @@ type exClient struct {
 	gone    bool // the server answered GONE
 
 	// uplink
+	wclosed  bool   // zmux closed the write side
+	finSeal  bool   // the FIN piece is sealed
 	open     *exBuf // the piece being filled (nil: none)
 	openLen  int
 	openAt   time.Time // first byte of the open piece
@@ -116,21 +169,19 @@ type exClient struct {
 	ups      []*exUp   // sealed pieces not yet processed, by number
 	upFlight int
 	upLimit  int
-	wclosed  bool // zmux closed the write side
-	finSeal  bool // the FIN piece is sealed
 
 	// downlink
-	ack       uint64              // smallest downlink number not received
-	deliv     uint64              // next piece to give to the reader
-	held      map[uint64]*exPiece // received, not yet given to the reader
-	fin       uint64              // lowest FIN piece, when finKnown
-	finKnown  bool
+	ack       uint64                 // smallest downlink number not received
+	deliv     uint64                 // next piece to give to the reader
+	held      map[uint64]*exPiece    // received, not yet given to the reader
+	fin       uint64                 // lowest FIN piece, when finKnown
 	downs     map[uint64]*exReqState // outstanding DOWN numbers
 	dnFlight  int
 	downLimit int
-	rclosed   bool
 	rbuf      *exBuf // the piece the reader is consuming
 	rdata     []byte
+	finKnown  bool
+	rclosed   bool
 }
 
 // exReqState is one request number's retry state.
@@ -211,7 +262,7 @@ func (c *exClient) run() {
 	}
 }
 
-// completeLocked reports a completed carrier (Section 6.1 item 5).
+// completeLocked reports a completed carrier.
 func (c *exClient) completeLocked() bool {
 	return c.finSeal && len(c.ups) == 0 && c.finKnown && c.ack > c.fin
 }
@@ -407,6 +458,7 @@ type exResult struct {
 	ok    bool // a verified response
 	bad   bool // a verified response that fails the carrier
 	flags byte
+	err   error // the failure of bad, if not a protocol error
 	buf   *exBuf
 	data  []byte
 }
@@ -414,6 +466,9 @@ type exResult struct {
 func (c *exClient) attempt(a *exAttempt) {
 	defer a.cancel()
 	r := c.exchange(a)
+	if r.ok {
+		c.setup()
+	}
 	if a.kind == exKindClose {
 		if r.buf != nil {
 			r.buf.unref()
@@ -439,8 +494,8 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 		release()
 		return res
 	}
-	hdr := appendExReqHdr(make([]byte, 0, exReqHdrMax), &c.cid, a.kind, a.flags, a.seq, a.ack, &nonce)
-	seqRaw := hdr[exCIDLen+2 : exCIDLen+2+wire.VarintLen(a.seq)]
+	hdr := appendExReqHdr(make([]byte, 0, exReqHdrMax), &c.cid, a.kind, a.flags, a.seq, a.ack, uint32(time.Now().Unix()), &nonce)
+	seqRaw := hdr[exCIDLen+2 : exCIDLen+2+varint.SizeVarint(a.seq)]
 	mac := c.key.requestMAC(hdr, a.data)
 	hdr = append(hdr, mac[:]...)
 	var body io.ReadCloser
@@ -464,24 +519,49 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 	if a.kind == exKindDown {
 		tg = &c.downTarget
 	}
-	req, err := http.NewRequestWithContext(a.ctx, http.MethodPost, tg.build(nonce[:]), body)
+	// Every hop of a redirect sends the same body; it is given up once
+	// the transport closed every one.
+	var hops atomic.Int32
+	hops.Store(1)
+	unhop := func() {
+		if hops.Add(-1) == 0 {
+			_ = body.Close()
+		}
+	}
+	defer unhop()
+	src := body.(*exBody)
+	from := tg.build(nonce[:])
+	resp, final, err := doHTTP(a.ctx, c.hc, c.nc, from, func(u *url.URL) (*http.Request, error) {
+		hops.Add(1)
+		hb := &exBody{hdr: src.hdr, data: src.data, done: unhop}
+		req, err := http.NewRequestWithContext(a.ctx, http.MethodPost, u.String(), hb)
+		if err != nil {
+			_ = hb.Close()
+			return nil, err
+		}
+		req.ContentLength = int64(n)
+		addHeader(req.Header, c.p.header)
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("Cache-Control", "no-store")
+		req.Header.Set("Pragma", "no-cache")
+		return req, nil
+	})
 	if err != nil {
-		_ = body.Close()
+		var re *HTTPRedirectError
+		if errors.As(err, &re) {
+			// A redirect the carrier must not follow fails it.
+			res.ok, res.bad, res.err = true, true, err
+		}
 		return res
 	}
-	req.ContentLength = int64(n)
-	for k, v := range c.p.header {
-		req.Header[k] = v
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Cache-Control", "no-store")
-	req.Header.Set("Pragma", "no-cache")
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return res
+	if f, perr := url.Parse(from); perr == nil && final.String() != from && SchemeUpgradeOf(f, final) {
+		up := tg.upgraded(final)
+		if c.ht != nil && tg == &c.target {
+			c.ht.Redirected(up)
+		}
 	}
 	defer func() { _ = resp.Body.Close() }() // read in full or abandoned
-	limit := int64(exRespHdr + c.p.downPiece)
+	limit := int64(exRespHdr + c.p.downLimit)
 	if c.p.b64 {
 		limit = int64(b64Len(int(limit)))
 	}
@@ -549,6 +629,9 @@ func (c *exClient) applyLocked(a *exAttempt, r exResult, now time.Time) {
 	switch {
 	case !r.ok:
 		retry()
+		return
+	case r.bad && r.err != nil:
+		c.failLocked(r.err)
 		return
 	case r.bad:
 		c.failLocked(errExchangeProtocol)

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 func TestCarrierPool(t *testing.T) {
@@ -77,8 +77,8 @@ func TestCarrierPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
 		}
 		group := lease.FateGroup
 		lease.Release()
-		decoded, used := wire.ReadVarint(wire.AppendVarint(nil, group))
-		if group == 0 || group > wire.MaxVarint || used == 0 || decoded != group {
+		decoded, used := varint.ConsumeVarint(varint.AppendVarint(nil, group))
+		if group == 0 || group > varint.MaxVarint || used == 0 || decoded != group {
 			t.Fatalf("pool group %#x is not preserved by its wire encoding (%#x)", group, decoded)
 		}
 	}
@@ -168,4 +168,50 @@ func TestCarrierPoolStaleLeaseRetirementCannotCloseTwice(t *testing.T) {
 	if closed != 1 {
 		t.Fatalf("connection closed %d times", closed)
 	}
+}
+
+// A decision that fails Validate is rejected as a whole and reported to
+// DecisionRejected outside the pool's lock; the pool goes on.
+func TestCarrierPoolRejectsAndReportsInvalidDecision(t *testing.T) {
+	n := 0
+	var p *CarrierPool[int]
+	var reported []error
+	p = &CarrierPool[int]{
+		Dial: func(context.Context) (int, error) { n++; return n, nil },
+		PoolLimits: PoolLimits{
+			Policy: policyFunc(func(_ *PoolView, d *PoolDecision) {
+				d.Count, d.ProbeInterval = 3, 500*time.Millisecond
+			}),
+			DecisionRejected: func(err error) {
+				if !p.mu.TryLock() {
+					t.Error("reported under the pool's lock")
+				} else {
+					p.mu.Unlock()
+				}
+				reported = append(reported, err)
+			},
+		},
+	}
+	a, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Conn != b.Conn {
+		t.Fatalf("connections %d and %d: the rejected Count 3 applied", a.Conn, b.Conn)
+	}
+	if len(reported) < 2 {
+		t.Fatalf("%d rejections reported", len(reported))
+	}
+	for _, err := range reported {
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("reported %v", err)
+		}
+	}
+	a.Release()
+	b.Release()
+	p.Shutdown()
 }

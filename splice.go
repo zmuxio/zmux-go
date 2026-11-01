@@ -3,6 +3,7 @@ package zmux
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"runtime"
 	"sync"
@@ -25,7 +26,8 @@ type Limiter interface {
 
 // SpliceOptions configure Splice.
 type SpliceOptions struct {
-	// Chunk is the most one direction holds at once (64 KiB).
+	// Chunk is the most one direction holds at once (64 KiB; a splice
+	// moves data, so 0 has no other meaning).
 	Chunk int
 	// AtoB and BtoA limit the two directions (nil: none).
 	AtoB, BtoA Limiter
@@ -36,9 +38,74 @@ type SpliceDirection struct {
 	Bytes            uint64 // stream bytes forwarded
 	DatagramBytes    uint64 // datagram bytes forwarded
 	DatagramsDropped uint64
-	// End is how the direction ended: nil for a FIN, else the reset,
-	// stop, session error or cancellation that ended it.
-	End error
+	End              SpliceEnd // how the direction ended
+}
+
+// SpliceEndKind is the event that ended a direction of a splice (API.md
+// A.2): one row of the table of ends.
+type SpliceEndKind uint8
+
+const (
+	SpliceFinished       SpliceEndKind = iota // FIN read upstream and passed on
+	SpliceReset                               // the upstream stream was reset with Code
+	SpliceStopped                             // the downstream stream was stopped with Code
+	SpliceUpstreamLost                        // the upstream stream's session closed or was lost
+	SpliceDownstreamLost                      // the downstream stream's session closed or was lost
+	SpliceCancelled                           // ctx ended, or the direction's Limiter failed
+)
+
+// String returns the kind's name ("finished").
+func (k SpliceEndKind) String() string {
+	switch k {
+	case SpliceFinished:
+		return "finished"
+	case SpliceReset:
+		return "reset"
+	case SpliceStopped:
+		return "stopped"
+	case SpliceUpstreamLost:
+		return "upstream lost"
+	case SpliceDownstreamLost:
+		return "downstream lost"
+	case SpliceCancelled:
+		return "cancelled"
+	}
+	return "SpliceEndKind(?)"
+}
+
+// SpliceEnd is how a direction of a splice ended; Code is the
+// application error code of SpliceReset and SpliceStopped, which travels
+// unchanged to the other side, and 0 for the other kinds.
+type SpliceEnd struct {
+	Kind SpliceEndKind
+	Code StreamErrorCode
+}
+
+// String returns the end's kind, with its code for a reset or a stop
+// ("reset 0x77").
+func (e SpliceEnd) String() string {
+	if e.Kind == SpliceReset || e.Kind == SpliceStopped {
+		return fmt.Sprintf("%v %#x", e.Kind, uint64(e.Code))
+	}
+	return e.Kind.String()
+}
+
+// spliceEnd classifies the error that ended a direction: a remote reset
+// (read side) or stop (write side) with its code, a cancellation, or the
+// loss of the session on that side.
+func spliceEnd(err error, write bool) SpliceEnd {
+	var se *StreamError
+	switch {
+	case errors.As(err, &se) && se.Remote && !write:
+		return SpliceEnd{Kind: SpliceReset, Code: se.ErrorCode}
+	case errors.As(err, &se) && se.Remote:
+		return SpliceEnd{Kind: SpliceStopped, Code: se.ErrorCode}
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return SpliceEnd{Kind: SpliceCancelled}
+	case write:
+		return SpliceEnd{Kind: SpliceDownstreamLost}
+	}
+	return SpliceEnd{Kind: SpliceUpstreamLost}
 }
 
 // SpliceResult is the result of Splice.
@@ -68,7 +135,10 @@ func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResul
 	if opts != nil {
 		o = *opts
 	}
-	if o.Chunk <= 0 {
+	if o.Chunk < 0 {
+		return SpliceResult{}, fmt.Errorf("%w: negative SpliceOptions.Chunk", ErrInvalidConfig)
+	}
+	if o.Chunk == 0 {
 		o.Chunk = 64 << 10
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -98,10 +168,15 @@ func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResul
 func spliceDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter) SpliceDirection {
 	var d SpliceDirection
 	for {
-		n, end, err := r.h.waitReadable(ctx)
+		n, end, werr, err := r.h.waitReadable(ctx, w.h)
+		if werr != nil {
+			spliceWriteErr(r, w, werr)
+			d.End = spliceEnd(werr, true)
+			return d
+		}
 		if err != nil {
 			spliceAbort(r, w, err)
-			d.End = err
+			d.End = spliceEnd(err, false)
 			return d
 		}
 		var want int
@@ -110,7 +185,7 @@ func spliceDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter) Splice
 			capy, err := w.h.waitSendCapacity(ctx, uint64(want))
 			if err != nil {
 				spliceWriteErr(r, w, err)
-				d.End = err
+				d.End = spliceEnd(err, true)
 				return d
 			}
 			take := min(int(capy), chunk)
@@ -118,7 +193,7 @@ func spliceDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter) Splice
 				take, err = lim.Ready(ctx, min(want, take), take)
 				if err != nil {
 					spliceAbort(r, w, err)
-					d.End = err
+					d.End = SpliceEnd{Kind: SpliceCancelled}
 					return d
 				}
 			}
@@ -129,7 +204,7 @@ func spliceDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter) Splice
 			m := len(ch.Data)
 			if werr := w.h.writeChunk(ctx, ch); werr != nil {
 				spliceWriteErr(r, w, werr)
-				d.End = werr
+				d.End = spliceEnd(werr, true)
 				return d
 			}
 			if lim != nil {
@@ -143,7 +218,7 @@ func spliceDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter) Splice
 			return d
 		case err != nil:
 			spliceReadErr(r, w, err)
-			d.End = err
+			d.End = spliceEnd(err, false)
 			return d
 		}
 	}
@@ -188,8 +263,10 @@ func spliceAbort(r, w *Stream, err error) {
 }
 
 // waitReadable waits until the receiving part has bytes, or its end is
-// due at once (end true).
-func (h *handle) waitReadable(ctx context.Context) (uint64, bool, error) {
+// due at once (end true); the first error is w's, the second ctx's. The
+// wait also ends at once when w, the sending part the bytes go to, can no
+// longer send (stopped, or its session closed or lost).
+func (h *handle) waitReadable(ctx context.Context, w *handle) (uint64, bool, error, error) {
 	c := h.c
 	for {
 		c.lock()
@@ -200,12 +277,22 @@ func (h *handle) waitReadable(ctx context.Context) (uint64, bool, error) {
 		}
 		c.unlock()
 		if n > 0 || end {
-			return n, end, nil
+			return n, end, nil, nil
+		}
+		// w's signal is woken by a STOP_SENDING and by the end of its
+		// session; drained before the check, so neither is missed.
+		w.c.lock()
+		w.wsig.Drain()
+		e := w.c.s.WriteErrOf(w.st)
+		w.c.unlock()
+		if e != nil {
+			return 0, false, apiErr(e), nil
 		}
 		select {
 		case <-h.rsig.C:
+		case <-w.wsig.C:
 		case <-ctx.Done():
-			return 0, false, ctx.Err()
+			return 0, false, nil, ctx.Err()
 		}
 	}
 }

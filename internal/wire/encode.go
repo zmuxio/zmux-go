@@ -1,13 +1,15 @@
 package wire
 
+import "github.com/zmuxio/zmux-go/varint"
+
 // StreamHeaderLen is the length of a STREAM frame header.
 func StreamHeaderLen(id, off uint64, n int, withLen bool) int {
-	l := 1 + VarintLen(id)
+	l := 1 + varint.SizeVarint(id)
 	if off > 0 {
-		l += VarintLen(off)
+		l += varint.SizeVarint(off)
 	}
 	if withLen {
-		l += VarintLen(uint64(n))
+		l += varint.SizeVarint(uint64(n))
 	}
 	return l
 }
@@ -26,36 +28,36 @@ func AppendStreamHeader(b []byte, id, off uint64, n int, fin, withLen bool) []by
 		t |= StreamBitFin
 	}
 	b = append(b, byte(t))
-	b = AppendVarint(b, id)
+	b = varint.AppendVarint(b, id)
 	if off > 0 {
-		b = AppendVarint(b, off)
+		b = varint.AppendVarint(b, off)
 	}
 	if withLen {
-		b = AppendVarint(b, uint64(n))
+		b = varint.AppendVarint(b, uint64(n))
 	}
 	return b
 }
 
 func AppendResetStream(b []byte, id, code, final uint64) []byte {
 	b = append(b, byte(TypeResetStream))
-	return AppendVarint(AppendVarint(AppendVarint(b, id), code), final)
+	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, id), code), final)
 }
 
 func AppendResetStreamAt(b []byte, id, code, final, reliable uint64) []byte {
 	b = append(b, byte(TypeResetStreamAt))
-	return AppendVarint(AppendVarint(AppendVarint(AppendVarint(b, id), code), final), reliable)
+	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, id), code), final), reliable)
 }
 
 func AppendStopSending(b []byte, id, code uint64) []byte {
-	return AppendVarint(AppendVarint(append(b, byte(TypeStopSending)), id), code)
+	return varint.AppendVarint(varint.AppendVarint(append(b, byte(TypeStopSending)), id), code)
 }
 
 func AppendMaxData(b []byte, v uint64) []byte {
-	return AppendVarint(append(b, byte(TypeMaxData)), v)
+	return varint.AppendVarint(append(b, byte(TypeMaxData)), v)
 }
 
 func AppendMaxStreamData(b []byte, id, v uint64) []byte {
-	return AppendVarint(AppendVarint(append(b, byte(TypeMaxStreamData)), id), v)
+	return varint.AppendVarint(varint.AppendVarint(append(b, byte(TypeMaxStreamData)), id), v)
 }
 
 func AppendMaxStreams(b []byte, bidi bool, v uint64) []byte {
@@ -63,15 +65,15 @@ func AppendMaxStreams(b []byte, bidi bool, v uint64) []byte {
 	if bidi {
 		t = TypeMaxStreamsBidi
 	}
-	return AppendVarint(append(b, byte(t)), v)
+	return varint.AppendVarint(append(b, byte(t)), v)
 }
 
 func AppendDataBlocked(b []byte, v uint64) []byte {
-	return AppendVarint(append(b, byte(TypeDataBlocked)), v)
+	return varint.AppendVarint(append(b, byte(TypeDataBlocked)), v)
 }
 
 func AppendStreamDataBlocked(b []byte, id, v uint64) []byte {
-	return AppendVarint(AppendVarint(append(b, byte(TypeStreamDataBlocked)), id), v)
+	return varint.AppendVarint(varint.AppendVarint(append(b, byte(TypeStreamDataBlocked)), id), v)
 }
 
 func AppendStreamsBlocked(b []byte, bidi bool, v uint64) []byte {
@@ -79,25 +81,25 @@ func AppendStreamsBlocked(b []byte, bidi bool, v uint64) []byte {
 	if bidi {
 		t = TypeStreamsBlockedBi
 	}
-	return AppendVarint(append(b, byte(t)), v)
+	return varint.AppendVarint(append(b, byte(t)), v)
 }
 
 // AppendClose appends CONNECTION_CLOSE; frameType is used only for 0x1c.
 func AppendClose(b []byte, app bool, code, frameType uint64, reason []byte) []byte {
 	if app {
-		b = AppendVarint(append(b, byte(TypeCloseApp)), code)
+		b = varint.AppendVarint(append(b, byte(TypeCloseApp)), code)
 	} else {
-		b = AppendVarint(AppendVarint(append(b, byte(TypeCloseTransport)), code), frameType)
+		b = varint.AppendVarint(varint.AppendVarint(append(b, byte(TypeCloseTransport)), code), frameType)
 	}
-	b = AppendVarint(b, uint64(len(reason)))
+	b = varint.AppendVarint(b, uint64(len(reason)))
 	return append(b, reason...)
 }
 
 // CloseLen is the encoded length of a CONNECTION_CLOSE frame.
 func CloseLen(app bool, code, frameType uint64, reasonLen int) int {
-	l := 1 + VarintLen(code) + VarintLen(uint64(reasonLen)) + reasonLen
+	l := 1 + varint.SizeVarint(code) + varint.SizeVarint(uint64(reasonLen)) + reasonLen
 	if !app {
-		l += VarintLen(frameType)
+		l += varint.SizeVarint(frameType)
 	}
 	return l
 }
@@ -105,14 +107,14 @@ func CloseLen(app bool, code, frameType uint64, reasonLen int) int {
 // AppendDatagramHeader appends a DATAGRAM header for n bytes of data.
 func AppendDatagramHeader(b []byte, n int, withLen bool) []byte {
 	if withLen {
-		return AppendVarint(append(b, byte(TypeDatagramLen)), uint64(n))
+		return varint.AppendVarint(append(b, byte(TypeDatagramLen)), uint64(n))
 	}
 	return append(b, byte(TypeDatagram))
 }
 
 func AppendTransportParams(b []byte, block []byte) []byte {
-	b = AppendVarint(b, TypeTransportParams)
-	b = AppendVarint(b, uint64(len(block)))
+	b = varint.AppendVarint(b, TypeTransportParams)
+	b = varint.AppendVarint(b, uint64(len(block)))
 	return append(b, block...)
 }
 
@@ -121,12 +123,12 @@ func AppendPing(b []byte, response bool, seq uint64) []byte {
 	if response {
 		t = TypePingResponse
 	}
-	return AppendVarint(AppendVarint(b, t), seq)
+	return varint.AppendVarint(varint.AppendVarint(b, t), seq)
 }
 
 func AppendGoAway(b []byte, maxBidi, maxUni, code uint64) []byte {
-	b = AppendVarint(b, TypeGoAway)
-	return AppendVarint(AppendVarint(AppendVarint(b, maxBidi), maxUni), code)
+	b = varint.AppendVarint(b, TypeGoAway)
+	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, maxBidi), maxUni), code)
 }
 
 // PriorityByte encodes urgency and incremental (EXTENSIONS.md 5.2).
@@ -139,17 +141,17 @@ func PriorityByte(urgency uint8, incr bool) byte {
 }
 
 func AppendPriorityUpdate(b []byte, id, seq uint64, urgency uint8, incr bool) []byte {
-	b = AppendVarint(b, TypePriorityUpdate)
-	b = AppendVarint(AppendVarint(b, id), seq)
+	b = varint.AppendVarint(b, TypePriorityUpdate)
+	b = varint.AppendVarint(varint.AppendVarint(b, id), seq)
 	return append(b, PriorityByte(urgency, incr))
 }
 
 // AppendJoinMAC appends PIPE_JOIN from Type through Priority (the MAC input).
 func AppendJoinMAC(b []byte, j *Join) []byte {
-	b = AppendVarint(b, TypePipeJoin)
+	b = varint.AppendVarint(b, TypePipeJoin)
 	b = append(b, byte(len(j.Locator)))
 	b = append(b, j.Locator...)
-	b = AppendVarint(b, j.PipeID)
+	b = varint.AppendVarint(b, j.PipeID)
 	fl := j.Dir & 3
 	if j.CarrierBound {
 		fl |= 0x04
@@ -158,8 +160,8 @@ func AppendJoinMAC(b []byte, j *Join) []byte {
 		fl |= 0x08
 	}
 	b = append(b, fl)
-	b = AppendVarint(b, j.FateGroup)
-	return AppendVarint(b, j.Priority)
+	b = varint.AppendVarint(b, j.FateGroup)
+	return varint.AppendVarint(b, j.Priority)
 }
 
 // AppendJoin appends the whole PIPE_JOIN frame.
@@ -167,35 +169,41 @@ func AppendJoin(b []byte, j *Join) []byte {
 	return append(AppendJoinMAC(b, j), j.Token...)
 }
 
+// JoinLen is the encoded length of AppendJoin's frame.
+func JoinLen(j *Join) int {
+	return varint.SizeVarint(TypePipeJoin) + 1 + len(j.Locator) + varint.SizeVarint(j.PipeID) + 1 +
+		varint.SizeVarint(j.FateGroup) + varint.SizeVarint(j.Priority) + len(j.Token)
+}
+
 // AppendPipeAckHeader appends the type and entry count; entries follow.
 func AppendPipeAckHeader(b []byte, count int) []byte {
-	return AppendVarint(AppendVarint(b, TypePipeAck), uint64(count))
+	return varint.AppendVarint(varint.AppendVarint(b, TypePipeAck), uint64(count))
 }
 
 func AppendAckEntry(b []byte, e AckEntry) []byte {
-	return AppendVarint(AppendVarint(AppendVarint(AppendVarint(b, e.PipeID), e.Lane), e.Position), e.Delay)
+	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, e.PipeID), e.Lane), e.Position), e.Delay)
 }
 
 // AckEntryLen is the encoded length of an entry.
 func AckEntryLen(e AckEntry) int {
-	return VarintLen(e.PipeID) + VarintLen(e.Lane) + VarintLen(e.Position) + VarintLen(e.Delay)
+	return varint.SizeVarint(e.PipeID) + varint.SizeVarint(e.Lane) + varint.SizeVarint(e.Position) + varint.SizeVarint(e.Delay)
 }
 
 func AppendPipeLane(b []byte, key []byte, pipe, lane uint64) []byte {
-	b = AppendVarint(b, TypePipeLane)
+	b = varint.AppendVarint(b, TypePipeLane)
 	b = append(b, key...)
-	return AppendVarint(AppendVarint(b, pipe), lane)
+	return varint.AppendVarint(varint.AppendVarint(b, pipe), lane)
 }
 
-func AppendPipePing(b []byte) []byte { return AppendVarint(b, TypePipePing) }
+func AppendPipePing(b []byte) []byte { return varint.AppendVarint(b, TypePipePing) }
 
 func AppendPipeAbandon(b []byte, pipe, code uint64) []byte {
-	return AppendVarint(AppendVarint(AppendVarint(b, TypePipeAbandon), pipe), code)
+	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, TypePipeAbandon), pipe), code)
 }
 
 func AppendPipeStatus(b []byte, pipe, seq, status, prio uint64) []byte {
-	b = AppendVarint(b, TypePipeStatus)
-	return AppendVarint(AppendVarint(AppendVarint(AppendVarint(b, pipe), seq), status), prio)
+	b = varint.AppendVarint(b, TypePipeStatus)
+	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, pipe), seq), status), prio)
 }
 
 // AppendFrame re-encodes a decoded frame in its shortest form. It is used by
@@ -216,10 +224,10 @@ func AppendFrame(b []byte, f *Frame) []byte {
 			if f.Fin {
 				t |= StreamBitFin
 			}
-			b = AppendVarint(append(b, byte(t)), f.StreamID)
+			b = varint.AppendVarint(append(b, byte(t)), f.StreamID)
 			b = append(b, 0)
 			if f.HasLen {
-				b = AppendVarint(b, uint64(len(f.Data)))
+				b = varint.AppendVarint(b, uint64(len(f.Data)))
 			}
 			return append(b, f.Data...)
 		}

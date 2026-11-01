@@ -217,7 +217,7 @@ func BenchmarkMultipathSpread(b *testing.B) {
 				total += float64(p.BytesSent)
 			}
 			for _, p := range ps {
-				b.ReportMetric(float64(p.BytesSent)/total*100, fmt.Sprintf("pipe%d-%%", p.ID))
+				b.ReportMetric(float64(p.BytesSent)/total*100, fmt.Sprintf("pipe%d-%%", p.Pipe))
 			}
 		})
 	}

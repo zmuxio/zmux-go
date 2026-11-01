@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"github.com/zmuxio/zmux-go/internal/core"
-	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 func errResult(err error) map[string]any {
@@ -290,4 +290,4 @@ func (r *runner) api(st map[string]any) error {
 	return nil
 }
 
-var _ = wire.MaxVarint
+var _ = varint.MaxVarint

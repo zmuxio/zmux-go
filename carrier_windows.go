@@ -26,3 +26,6 @@ func tcpMinRTT(fd uintptr) (time.Duration, bool) {
 	us := *(*uint32)(unsafe.Pointer(&info[24]))
 	return time.Duration(us) * time.Microsecond, us > 0 && us != ^uint32(0)
 }
+
+// tcpUnsent: the platform reports no count of unsent bytes alone.
+func tcpUnsent(uintptr) (uint64, bool) { return 0, false }

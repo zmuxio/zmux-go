@@ -107,10 +107,7 @@ func outOfBand(b *QualityBand, q *pipeQuality, rtt Duration, rate float64) bool 
 }
 
 func (s *Session) pipeEstimates(p *Pipe) (Duration, float64, bool) {
-	r := &p.out.snd.rtt
-	if p.mp != nil {
-		r = &p.mp.rtt
-	}
+	r := p.rtt()
 	if !r.has {
 		return 0, 0, false
 	}
