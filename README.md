@@ -131,8 +131,8 @@ Both endpoints set `MaxPipes` above 1 and a join secret; the server uses a
 `Listener`. The client adds pipes over other paths and follows them with
 `NextEvent`. The secret is `PipeAuth.PSK`, or `PipeAuth.Exporter`: the exporter
 of the innermost end-to-end handshake of the first pipe (`zmux.Exporter`: a
-carrier transform's own, or TLS that this process terminates), read when the
-peer's parameters arrive.
+carrier transform's own, or TLS that this process terminates, its handshake
+done or still running), read when the peer's parameters arrive.
 
 ```go
 cfg := &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: psk}}
@@ -413,7 +413,8 @@ fallback of its kind (`ListenerConfig.Fallback` for byte streams,
 `HTTPOptions.Next` for HTTP, the `fallback` of `zmuxquic.Serve`), stalls
 it, or closes it; `VerdictMore` reads a longer prefix (up to `MaxPeek`)
 and decides again, and `Decision.Variant` labels the carrier, counted per
-label in `AdmissionStats.Variants`. A source holds at most `MaxPendingPerSource - 1` stalled
+label in `Listener.VariantStats` (one of a few host constants, never derived
+from the peer's bytes; past `MaxAdmissionVariants` labels share one bucket). A source holds at most `MaxPendingPerSource - 1` stalled
 carriers, and a stall lasts the same duration for every carrier from one
 source during the listener's lifetime (`Listener.StallDuration`).
 `ListenerStats.Admission` counts the outcomes. An adapter with its own
@@ -476,8 +477,11 @@ offer capabilities as interfaces (`CloseWriter`, `Aborter`,
 `ResponseHeaderer`, ...); a transform forwards a lower one only where its
 meaning survives. A transform whose first message carries the client's
 first flight uses `EarlyData.HoldFirstFlight` with `Conn.ReleaseFirstFlight`
-and reports the server's verdict as carrier early data; `ReplayFilter` is
-the single-use cache for its nonces. `PipeIO.Variant` labels the carriers
+and reports the server's verdict as carrier early data
+(`EarlyClientCarrier.SendsEarlyData`); `ReplayFilter` is the single-use
+cache for its nonces, checked only after the nonce and its timestamp were
+authenticated together. `ResponseHeaderer` metadata is unauthenticated
+and never decides authentication. `PipeIO.Variant` labels the carriers
 in events, statistics, shaping and `CarrierCache` (with
 `CarrierCache.Report` for outcomes the host learns later).
 [examples/xorpipe](examples/xorpipe) is a complete example.

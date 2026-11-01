@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -137,8 +138,8 @@ func TestFirstFlight(t *testing.T) {
 		t.Fatalf("the header is classified %v", cls)
 	}
 	echo(t, ctx, c, sc)
-	if v := s.lst.Stats().Admission.Variants[xorpipe.Variant]; v.Accepted != 1 {
-		t.Fatalf("variant stats %+v", s.lst.Stats().Admission.Variants)
+	if vs := s.lst.VariantStats(); !slices.Contains(vs, zmux.VariantStat{Name: xorpipe.Variant, Accepted: 1}) {
+		t.Fatalf("variant stats %+v", vs)
 	}
 }
 
@@ -179,8 +180,8 @@ func TestPlainNextToTransform(t *testing.T) {
 	}
 	defer func() { _ = c.Close(); _ = sc.Close(); _ = c.Wait(); _ = sc.Wait() }()
 	echo(t, ctx, c, sc)
-	if v := s.lst.Stats().Admission.Variants[""]; v.Accepted != 1 {
-		t.Fatalf("variant stats %+v", s.lst.Stats().Admission.Variants)
+	if vs := s.lst.VariantStats(); !slices.Contains(vs, zmux.VariantStat{Accepted: 1}) {
+		t.Fatalf("variant stats %+v", vs)
 	}
 }
 

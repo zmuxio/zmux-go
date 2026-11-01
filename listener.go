@@ -298,6 +298,17 @@ func (l *Listener) Stats() ListenerStats {
 		Rejected: c.rejected.Load(), Refused: c.refused.Load(), TimedOut: c.timedOut.Load(), Admission: c.adm.snapshot()}
 }
 
+// VariantStats returns the admission outcomes by Decision.Variant, a copy
+// sorted by Name, with the bucket of the variants past
+// MaxAdmissionVariants last; their sums are AdmissionStats.Accepted,
+// Fallback, Stalled + StallOverflow and Closed. A nil l returns nil.
+func (l *Listener) VariantStats() []VariantStat {
+	if l == nil {
+		return nil
+	}
+	return l.st.adm.variantStats()
+}
+
 // CountSetupFailure counts a connection that never became a pipe input
 // (ListenerStats.SetupFailures). Adapters that run their own accept
 // loops call it for a failed TLS handshake or its timeout, a failed HTTP
@@ -912,22 +923,16 @@ func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte,
 			return errRefused
 		}
 	}
+	var exp KeyingMaterialExporter
 	if j.CarrierBound {
 		// A carrier without an exporter is never carrier-bound
 		// (MULTIPATH.md 10.5): refuse rather than verify an empty binding.
-		e, ok := Exporter(p)
-		if !ok {
+		var ok bool
+		if exp, ok = Exporter(p); !ok {
 			closePipeIO(p)
 			l.st.rejected.Add(1)
 			return errRejected
 		}
-		b, err := e.ExportKeyingMaterial(wire.ExporterPipe, nil, 32)
-		if err != nil {
-			closePipeIO(p)
-			l.st.rejected.Add(1)
-			return errRejected
-		}
-		binding = b
 	}
 	// A join that arrived as carrier early data could be a replay: it is
 	// processed only once the carrier's handshake completed.
@@ -953,6 +958,17 @@ func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte,
 			l.CountSetupFailure()
 			return errRejected
 		}
+	}
+	if exp != nil {
+		// Read once the carrier's handshake completed (its exporter is
+		// read late, as the session's is).
+		b, err := exp.ExportKeyingMaterial(wire.ExporterPipe, nil, 32)
+		if err != nil {
+			closePipeIO(p)
+			l.st.rejected.Add(1)
+			return errRejected
+		}
+		binding = b
 	}
 	id, err := c.acceptJoin(ctx, p, j, mac, binding, inband, admitted)
 	release()

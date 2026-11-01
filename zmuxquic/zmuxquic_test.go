@@ -147,11 +147,21 @@ func TestQUICReplayableResumedDial(t *testing.T) {
 		name          string
 		allow, ticket bool
 	}{{"accepted", true, true}, {"rejected", false, true}, {"no_ticket", true, false}} {
-		t.Run(tc.name, func(t *testing.T) { exerciseReplayableResumedDial(t, tc.allow, tc.ticket) })
+		t.Run(tc.name, func(t *testing.T) { exerciseReplayableResumedDial(t, tc.allow, tc.ticket, false) })
+		// PipeAuth.Exporter reads the exporter once the handshake completed,
+		// of the connection that replaced a rejected 0-RTT one: a join then
+		// verifies on both ends.
+		t.Run(tc.name+"_exporter", func(t *testing.T) { exerciseReplayableResumedDial(t, tc.allow, tc.ticket, true) })
 	}
 }
-func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket bool) {
+func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporter bool) {
 	t.Helper()
+	withAuth := func(cfg *zmux.Config) *zmux.Config {
+		if exporter {
+			cfg.MaxPipes, cfg.PipeAuth = 4, zmux.PipeAuth{Exporter: true}
+		}
+		return cfg
+	}
 	var allow atomic.Bool
 	allow.Store(true)
 	base := &quic.Config{Allow0RTT: true}
@@ -161,7 +171,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket bool) {
 		c.Allow0RTT = allow.Load()
 		return c, nil
 	}
-	e := newEnvQUIC(t, "127.0.0.1:0", &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true}}, base)
+	e := newEnvQUIC(t, "127.0.0.1:0", withAuth(&zmux.Config{EarlyData: zmux.EarlyData{Replayable: true}}), base)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// A first session gets a session ticket and the parameters; it runs on
@@ -171,7 +181,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket bool) {
 		t.Fatal(err)
 	}
 	defer func() { _ = qc.CloseWithError(0, "") }()
-	c, err := Client(ctx, qc, nil)
+	c, err := Client(ctx, qc, withAuth(&zmux.Config{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +212,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket bool) {
 	}
 	// The second uses replayable parameters and a resumed native connection.
 	// Native streams currently wait for handshake completion (upstream race).
-	cfg := &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true, Remembered: remembered}}
+	cfg := withAuth(&zmux.Config{EarlyData: zmux.EarlyData{Replayable: true, Remembered: remembered}})
 	c2, err := Dial(ctx, e.ln.Addr().String(), secondTLS, nil, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -227,10 +237,55 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket bool) {
 	if err != nil || string(b) != "early" {
 		t.Fatalf("early stream %q %v", b, err)
 	}
+	if exporter {
+		jc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, QUICConfig(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = jc.CloseWithError(0, "") }()
+		pio, err := OpenPipe(ctx, jc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c2.AddPipe(ctx, pio, zmux.PipeOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		echo(t, c2, s2, 1<<10)
+		if n := len(s2.PipeStats()); n != 2 {
+			t.Fatalf("server has %d pipes", n)
+		}
+	}
 	_ = c2.Close()
 	_ = s2.Close()
 	_ = c2.Wait()
 	_ = s2.Wait()
+}
+
+// Floor early data through Dial without 0-RTT: the stream is not sent
+// early, so the session needs no Replayable and waits for no verdict.
+func TestQUICDialZmuxPeer(t *testing.T) {
+	for _, replayable := range []bool{false, true} {
+		e := newEnv(t, mpConfig())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cfg := mpConfig()
+		cfg.EarlyData = zmux.EarlyData{ZmuxPeer: true, Replayable: replayable}
+		c, err := Dial(ctx, e.ln.Addr().String(), e.cli, nil, cfg)
+		if err != nil {
+			cancel()
+			t.Fatalf("replayable %v: %v", replayable, err)
+		}
+		s, err := e.lst.Accept(ctx)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		echo(t, c, s, 1000)
+		_ = c.Close()
+		_ = s.Close()
+		_ = c.Wait()
+		_ = s.Wait()
+		cancel()
+	}
 }
 
 func TestQUICPool(t *testing.T) {

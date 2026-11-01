@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -506,8 +505,5 @@ func TestShutdownKeepsJoins(t *testing.T) {
 	}
 }
 
-// eqAdm compares admission totals, ignoring the per-variant counts.
-func eqAdm(a, b AdmissionStats) bool {
-	a.Variants, b.Variants = nil, nil
-	return reflect.DeepEqual(a, b)
-}
+// eqAdm compares admission totals.
+func eqAdm(a, b AdmissionStats) bool { return a == b }

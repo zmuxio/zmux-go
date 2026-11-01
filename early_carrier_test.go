@@ -26,7 +26,11 @@ type earlyLayer struct {
 	held     [][]byte
 	dropped  atomic.Int64
 	restarts atomic.Int32
+	late     bool // no early data this time: writes pass from the start
+	waits    atomic.Int32
 }
+
+func (l *earlyLayer) SendsEarlyData() bool { return !l.late }
 
 func (l *earlyLayer) Write(b []byte) (int, error) {
 	l.mu.Lock()
@@ -62,6 +66,7 @@ func (l *earlyLayer) decide(accept bool) {
 }
 
 func (l *earlyLayer) EarlyAccepted(ctx context.Context) (bool, error) {
+	l.waits.Add(1)
 	select {
 	case ok := <-l.verdict:
 		return ok, nil
@@ -169,6 +174,80 @@ func TestEarlyCarrierNeedsReplayable(t *testing.T) {
 	}
 }
 
+// Floor early data and the carrier's own early data in each combination:
+// the verdict is awaited, and Replayable required, only when the carrier
+// sends early data this time; a carrier with the capability that sends
+// nothing early (QUIC without 0-RTT) behaves as one without it.
+func TestEarlyCarrierFloorCombinations(t *testing.T) {
+	for _, x := range []struct {
+		name               string
+		carrier            int // 0 none, 1 capable but not early, 2 early
+		replayable, refuse bool
+		waits              int32
+	}{
+		{"plain", 0, false, false, 0},
+		{"plain replayable", 0, true, false, 0},
+		{"not early", 1, false, false, 0},
+		{"not early replayable", 1, true, false, 0},
+		{"early", 2, false, true, 0},
+		{"early replayable", 2, true, false, 1},
+	} {
+		t.Run(x.name, func(t *testing.T) {
+			leakcheck.Check(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			a, b := net.Pipe()
+			cp := NetPipe(a)
+			var layer *earlyLayer
+			if x.carrier > 0 {
+				layer = &earlyLayer{Conn: a, verdict: make(chan bool, 1), late: x.carrier == 1}
+				if layer.late {
+					layer.state = 1
+				}
+				cp = PipeIO{R: a, W: layer}
+			}
+			cfg := mpConfig()
+			cfg.EarlyData = EarlyData{ZmuxPeer: true, Replayable: x.replayable}
+			c, err := Start(ctx, cp, RoleClient, cfg)
+			if x.refuse {
+				_ = a.Close()
+				_ = b.Close()
+				if !errors.Is(err, ErrInvalidConfig) {
+					t.Fatalf("error %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			ch := make(chan *Conn, 1)
+			go func() {
+				s, err := Start(ctx, NetPipe(b), RoleServer, mpConfig())
+				if err != nil {
+					t.Error(err)
+				}
+				ch <- s
+			}()
+			if layer != nil && !layer.late {
+				go layer.decide(true)
+			}
+			s := <-ch
+			if s == nil {
+				_ = c.Close()
+				return
+			}
+			defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
+			echoOnce(t, ctx, c, s)
+			if x.waits > 0 {
+				waitUntil(t, 5*time.Second, "the verdict", func() bool { return layer.waits.Load() == x.waits })
+			}
+			if layer != nil && (layer.waits.Load() != x.waits || layer.restarts.Load() != 0) {
+				t.Fatalf("waits %d, restarts %d", layer.waits.Load(), layer.restarts.Load())
+			}
+		})
+	}
+}
+
 // earlyServer is a server carrier that received early data.
 type earlyServer struct {
 	net.Conn
@@ -225,4 +304,63 @@ func TestEarlyServerReplayable(t *testing.T) {
 	}
 	close(es.done)
 	waitUntil(t, 5*time.Second, "handshake done", func() bool { return !open().Replayable() })
+}
+
+// A STOP_SENDING and a window update sent in rejected carrier early data
+// go again after the restart, behind the re-issued opening STREAM frame.
+func TestEarlyCarrierRejectedStop(t *testing.T) {
+	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a, b := net.Pipe()
+	layer := &earlyLayer{Conn: a, verdict: make(chan bool, 1)}
+	c, err := Start(ctx, PipeIO{R: a, W: layer}, RoleClient, earlyFloorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := []byte("early request")
+	st, err := c.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	waitUntil(t, 5*time.Second, "the first flight", func() bool {
+		layer.mu.Lock()
+		defer layer.mu.Unlock()
+		return len(layer.held) > 0
+	})
+	st.SetReceiveWindow(1<<22, 1<<22)
+	st.CancelRead(5)
+	time.Sleep(20 * time.Millisecond) // let the frames join the held flight
+	layer.decide(false)
+	waitUntil(t, 5*time.Second, "the restart", func() bool { return layer.restarts.Load() == 1 })
+	ch := make(chan *Conn, 1)
+	go func() {
+		s, err := Start(ctx, NetPipe(b), RoleServer, mpConfig())
+		if err != nil {
+			t.Error(err)
+		}
+		ch <- s
+	}()
+	s := <-ch
+	if s == nil {
+		_ = c.Close()
+		return
+	}
+	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
+	ss, err := s.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := io.ReadAll(ss); err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("server read %q, %v", got, err)
+	}
+	waitUntil(t, 5*time.Second, "STOP_SENDING", func() bool {
+		_, err := ss.Write([]byte("x"))
+		return err != nil
+	})
+	echoOnce(t, ctx, c, s)
 }

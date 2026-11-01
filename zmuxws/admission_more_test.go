@@ -2,6 +2,7 @@ package zmuxws
 
 import (
 	"context"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,8 +37,8 @@ func TestAdmissionFirstMessage(t *testing.T) {
 	}
 	echo(t, ctx, c, s, 1<<10)
 	closeBoth(c, s)
-	if st := l.Stats().Admission; st.Variants["ws"].Accepted != 1 || seen.Load() < 9 {
-		t.Fatalf("stats %+v, first message %d bytes", st, seen.Load())
+	if vs := l.VariantStats(); !slices.Contains(vs, zmux.VariantStat{Name: "ws", Accepted: 1}) || seen.Load() < 9 {
+		t.Fatalf("variants %+v, first message %d bytes", vs, seen.Load())
 	}
 }
 
@@ -53,8 +54,8 @@ func TestAdmissionMoreOnHead(t *testing.T) {
 	if len(b) != 0 || d > 5*time.Second {
 		t.Fatalf("answered %q after %v", b, d)
 	}
-	if st := l.Stats().Admission; st.Closed != 1 || st.Variants["h"].Closed != 1 {
-		t.Fatalf("stats %+v", st)
+	if st, vs := l.Stats().Admission, l.VariantStats(); st.Closed != 1 || !slices.Contains(vs, zmux.VariantStat{Name: "h", Closed: 1}) {
+		t.Fatalf("stats %+v, variants %+v", st, vs)
 	}
 }
 

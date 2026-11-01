@@ -124,6 +124,10 @@ func (w *clientWriter) decided(ok bool) error {
 
 func (w *clientWriter) Close() error { return w.c.Close() }
 
+// SendsEarlyData reports the first flight, which the server may refuse
+// (zmux.EarlyClientCarrier).
+func (w *clientWriter) SendsEarlyData() bool { return true }
+
 // EarlyAccepted reports the server's verdict on the first flight
 // (zmux.EarlyClientCarrier).
 func (w *clientWriter) EarlyAccepted(ctx context.Context) (bool, error) {

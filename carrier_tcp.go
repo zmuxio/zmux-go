@@ -20,6 +20,40 @@ const (
 type tcpInfo struct {
 	rc      syscall.RawConn
 	retrans *counter32 // widens a 32-bit retransmission count (Windows)
+	q       *tcpQuery
+}
+
+// tcpQuery holds the RawConn.Control callbacks of one socket, bound once,
+// and their results, so that a query allocates nothing (a closure per call
+// would escape through Control); mu serialises the queries.
+type tcpQuery struct {
+	mu                   sync.Mutex
+	n                    uint64
+	d                    time.Duration
+	low                  int
+	ok                   bool
+	unsent, retrans, rtt func(uintptr)
+	lowWater             func(uintptr)
+}
+
+func newTCPQuery() *tcpQuery {
+	q := &tcpQuery{}
+	q.unsent = func(fd uintptr) { q.n, q.ok = tcpUnsent(fd) }
+	q.retrans = func(fd uintptr) { q.n, q.ok = tcpRetrans(fd) }
+	q.rtt = func(fd uintptr) { q.d, q.ok = tcpMinRTT(fd) }
+	q.lowWater = func(fd uintptr) { q.ok = setNotsentLowat(fd, q.low) == nil }
+	return q
+}
+
+// run runs f, one of q's callbacks, on rc and returns its results.
+func (q *tcpQuery) run(rc syscall.RawConn, f func(uintptr)) (uint64, time.Duration, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.n, q.d, q.ok = 0, 0, false
+	if rc.Control(f) != nil {
+		return 0, 0, false
+	}
+	return q.n, q.d, q.ok
 }
 
 // counter32 extends a wrapping 32-bit counter to 64 bits, read often
@@ -48,7 +82,7 @@ func tcpOf(x any) tcpInfo {
 	}
 	if c, ok := x.(*net.TCPConn); ok {
 		if rc, err := c.SyscallConn(); err == nil {
-			return tcpInfo{rc: rc, retrans: retransCounter()}
+			return tcpInfo{rc: rc, retrans: retransCounter(), q: newTCPQuery()}
 		}
 	}
 	return tcpInfo{}
@@ -60,9 +94,11 @@ func (t tcpInfo) setLowWater(n int) bool {
 	if t.rc == nil {
 		return false
 	}
-	ok := false
-	_ = t.rc.Control(func(fd uintptr) { ok = setNotsentLowat(fd, n) == nil })
-	return ok
+	q := t.q
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.low, q.ok = n, false
+	return t.rc.Control(q.lowWater) == nil && q.ok
 }
 
 // minRTT is the carrier's own minimum RTT (Linux tcpi_min_rtt, Windows
@@ -71,9 +107,7 @@ func (t tcpInfo) minRTT() (time.Duration, bool) {
 	if t.rc == nil {
 		return 0, false
 	}
-	var d time.Duration
-	ok := false
-	_ = t.rc.Control(func(fd uintptr) { d, ok = tcpMinRTT(fd) })
+	_, d, ok := t.q.run(t.rc, t.q.rtt)
 	return d, ok && d > 0
 }
 
@@ -83,9 +117,7 @@ func (t tcpInfo) unsent() (uint64, bool) {
 	if t.rc == nil {
 		return 0, false
 	}
-	var n uint64
-	ok := false
-	_ = t.rc.Control(func(fd uintptr) { n, ok = tcpUnsent(fd) })
+	n, _, ok := t.q.run(t.rc, t.q.unsent)
 	return n, ok
 }
 
@@ -99,9 +131,7 @@ func (t tcpInfo) retransmitted() (uint64, bool) {
 	if t.rc == nil {
 		return 0, false
 	}
-	var n uint64
-	ok := false
-	_ = t.rc.Control(func(fd uintptr) { n, ok = tcpRetrans(fd) })
+	n, _, ok := t.q.run(t.rc, t.q.retrans)
 	if ok && t.retrans != nil {
 		n = t.retrans.widen(uint32(n))
 	}

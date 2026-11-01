@@ -468,18 +468,24 @@ func (st *Stream) applyPeerParams() {
 			st.snd.maxData = s.peer.MaxStreamDataBidiLoc
 		}
 	}
-	if st.hasR && st.rcv.window == 0 {
-		// Receive windows come from the local parameters.
+	if r := &st.rcv; st.hasR && r.adv == 0 {
+		// Receive windows come from the local parameters, which are what
+		// the peer knows: a window SetReceiveWindow raised before is
+		// advertised by MAX_STREAM_DATA.
 		l := &s.cfg.Local
+		var w uint64
 		switch {
 		case !st.bidi:
-			st.rcv.window = l.MaxStreamDataUni
+			w = l.MaxStreamDataUni
 		case st.local:
-			st.rcv.window = l.MaxStreamDataBidiLoc
+			w = l.MaxStreamDataBidiLoc
 		default:
-			st.rcv.window = l.MaxStreamDataBidiRem
+			w = l.MaxStreamDataBidiRem
 		}
-		st.rcv.adv = st.rcv.window
+		r.adv = w
+		if r.window == 0 {
+			r.window = w
+		}
 	}
 }
 

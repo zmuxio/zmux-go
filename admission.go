@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -166,18 +167,33 @@ type Decision struct {
 	// Need is, with VerdictMore, the total prefix length Decide needs.
 	Need int
 	// Variant labels the carrier with any verdict, for
-	// AdmissionStats.Variants; on VerdictAccept it is the PipeIO.Variant
-	// handed to WrapPipe (which may change it). "" for none.
+	// Listener.VariantStats; on VerdictAccept it is the PipeIO.Variant
+	// handed to WrapPipe (which may change it). "" for none. Use one of a
+	// few constants of the host, never a value derived from the peer's
+	// bytes: at most MaxAdmissionVariants are counted apart.
 	Variant string
 }
 
-// VariantStats are the admission outcomes of one Decision.Variant.
-type VariantStats struct {
+// VariantStat are the admission outcomes of one Decision.Variant
+// (Listener.VariantStats).
+type VariantStat struct {
+	// Name is the Decision.Variant ("" for none; also "" for the
+	// Overflow bucket).
+	Name string
+	// Overflow marks the bucket of the variants past MaxAdmissionVariants.
+	Overflow bool
+
 	Accepted, Fallback uint64
 	// Stalled counts VerdictStall decisions, StallOverflow included.
 	Stalled uint64
 	Closed  uint64
 }
+
+// MaxAdmissionVariants bounds the distinct Decision.Variant values a
+// listener counts apart; the outcomes of further values are counted in one
+// VariantStat with Overflow set. Variants are meant to be a few constants
+// of the host, never derived from what the peer sent.
+const MaxAdmissionVariants = 64
 
 // AdmissionStats are the outcomes of a listener's admission (API.md 7.2),
 // each carrier that took its source slot and whose outcome is known
@@ -201,30 +217,34 @@ type AdmissionStats struct {
 	// HandshakeFailed counts carriers whose outer handshake failed or
 	// timed out, without a decision.
 	HandshakeFailed uint64
-	// Variants are the outcomes by Decision.Variant ("" for none), a
-	// copy: their sums are Accepted, Fallback, Stalled + StallOverflow
-	// and Closed.
-	Variants map[string]VariantStats
 }
 
 type admissionCounters struct {
 	accepted, fallback, stalled, closed, stallOverflow, peekTimedOut, handshakeFailed atomic.Uint64
 
 	mu       sync.Mutex
-	variants map[string]*VariantStats
+	variants map[string]*VariantStat
+	overflow *VariantStat // the variants past MaxAdmissionVariants
 }
 
 // variant counts a final verdict of variant v.
 func (c *admissionCounters) variant(v string, verdict Verdict) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.variants == nil {
-		c.variants = map[string]*VariantStats{}
-	}
 	vs := c.variants[v]
-	if vs == nil {
-		vs = &VariantStats{}
+	switch {
+	case vs != nil:
+	case len(c.variants) < MaxAdmissionVariants:
+		if c.variants == nil {
+			c.variants = map[string]*VariantStat{}
+		}
+		vs = &VariantStat{Name: v}
 		c.variants[v] = vs
+	default:
+		if c.overflow == nil {
+			c.overflow = &VariantStat{Overflow: true}
+		}
+		vs = c.overflow
 	}
 	switch verdict {
 	case VerdictAccept:
@@ -239,18 +259,28 @@ func (c *admissionCounters) variant(v string, verdict Verdict) {
 }
 
 func (c *admissionCounters) snapshot() AdmissionStats {
-	st := AdmissionStats{Accepted: c.accepted.Load(), Fallback: c.fallback.Load(), Stalled: c.stalled.Load(),
+	return AdmissionStats{Accepted: c.accepted.Load(), Fallback: c.fallback.Load(), Stalled: c.stalled.Load(),
 		Closed: c.closed.Load(), StallOverflow: c.stallOverflow.Load(), PeekTimedOut: c.peekTimedOut.Load(),
 		HandshakeFailed: c.handshakeFailed.Load()}
+}
+
+// variantStats copies the per-variant counts, sorted by Name, the Overflow
+// bucket last.
+func (c *admissionCounters) variantStats() []VariantStat {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.variants) > 0 {
-		st.Variants = make(map[string]VariantStats, len(c.variants))
-		for k, v := range c.variants {
-			st.Variants[k] = *v
-		}
+	if len(c.variants) == 0 {
+		return nil
 	}
-	return st
+	out := make([]VariantStat, 0, len(c.variants)+1)
+	for _, v := range c.variants {
+		out = append(out, *v)
+	}
+	slices.SortFunc(out, func(a, b VariantStat) int { return strings.Compare(a.Name, b.Name) })
+	if c.overflow != nil {
+		out = append(out, *c.overflow)
+	}
+	return out
 }
 
 // Validate checks a (nil is valid) and resolves its bounds, once; a must

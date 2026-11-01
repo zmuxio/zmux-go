@@ -3,6 +3,7 @@ package zmuxquic
 import (
 	"context"
 	"io"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -218,7 +219,7 @@ func TestServeAdmissionMore(t *testing.T) {
 	_ = s.Close()
 	_ = c.Wait()
 	_ = s.Wait()
-	if st := lst.Stats().Admission; st.Variants["q"].Accepted != 1 {
-		t.Fatalf("stats %+v", st)
+	if vs := lst.VariantStats(); !slices.Contains(vs, zmux.VariantStat{Name: "q", Accepted: 1}) {
+		t.Fatalf("variants %+v", vs)
 	}
 }

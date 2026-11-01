@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http/httptest"
@@ -97,16 +98,16 @@ func TestAdmissionMore(t *testing.T) {
 		t.Fatalf("WrapPipe saw variants %q", variants)
 	}
 	mu.Unlock()
-	st := lst.Stats().Admission
-	if st.Accepted != 2 || st.Variants["x"].Accepted != 1 || st.Variants[""].Accepted != 1 {
-		t.Fatalf("stats %+v", st)
+	st, vs := lst.Stats().Admission, lst.VariantStats()
+	if st.Accepted != 2 || len(vs) != 2 || vs[0] != (VariantStat{Accepted: 1}) || vs[1] != (VariantStat{Name: "x", Accepted: 1}) {
+		t.Fatalf("stats %+v, variants %+v", st, vs)
 	}
 }
 
 // admitOnce hands a carrier that delivers send (and then ends, when end
 // is set) to a listener with adm, and returns its admission stats and the
-// prefix lengths Decide saw.
-func admitOnce(t *testing.T, adm *Admission, p func() (PipeIO, func()), seen *[]int) AdmissionStats {
+// prefix lengths Decide saw, and its per-variant counts.
+func admitOnce(t *testing.T, adm *Admission, p func() (PipeIO, func()), seen *[]int) (AdmissionStats, []VariantStat) {
 	t.Helper()
 	decide := adm.Decide
 	var mu sync.Mutex
@@ -121,7 +122,17 @@ func admitOnce(t *testing.T, adm *Admission, p func() (PipeIO, func()), seen *[]
 	q, peer := p()
 	defer peer()
 	_ = lst.HandlePipe(context.Background(), q, JoinHint{})
-	return lst.Stats().Admission
+	return lst.Stats().Admission, lst.VariantStats()
+}
+
+// variantNamed is the per-variant count of name (zero if none).
+func variantNamed(vs []VariantStat, name string) VariantStat {
+	for _, v := range vs {
+		if !v.Overflow && v.Name == name {
+			return v
+		}
+	}
+	return VariantStat{}
 }
 
 // streamCarrier delivers send, then ends when end is set (else stays open).
@@ -180,12 +191,12 @@ func TestAdmissionMoreBounds(t *testing.T) {
 		var seen []int
 		adm := x.adm
 		start := time.Now()
-		st := admitOnce(t, adm, streamCarrier(x.send, x.end), &seen)
+		st, vs := admitOnce(t, adm, streamCarrier(x.send, x.end), &seen)
 		if st.Closed != x.closed || st.PeekTimedOut != x.timeout || !equalInts(seen, x.seen) {
 			t.Fatalf("%s: stats %+v, Decide saw %v", x.name, st, seen)
 		}
-		if x.closed > 0 && st.Variants["m"].Closed != x.closed {
-			t.Fatalf("%s: variants %+v", x.name, st.Variants)
+		if x.closed > 0 && variantNamed(vs, "m").Closed != x.closed {
+			t.Fatalf("%s: variants %+v", x.name, vs)
 		}
 		if x.timeout > 0 && time.Since(start) > 3*time.Second {
 			t.Fatalf("%s: rounds did not share the timeout", x.name)
@@ -265,20 +276,20 @@ func TestAdmissionFirstMessage(t *testing.T) {
 	} {
 		var seen []int
 		adm := x.adm
-		st := admitOnce(t, adm, func() (PipeIO, func()) {
+		st, vs := admitOnce(t, adm, func() (PipeIO, func()) {
 			m := newFirstMsgCarrier(msg)
 			return PipeIO{R: m, W: m, Framing: FramingRecords}, func() { _ = m.Close() }
 		}, &seen)
 		if st.Accepted != x.accepted || st.Closed != x.closed || !equalInts(seen, x.seen) {
 			t.Fatalf("%s: stats %+v, Decide saw %v", x.name, st, seen)
 		}
-		var sum VariantStats
-		for _, v := range st.Variants {
+		var sum VariantStat
+		for _, v := range vs {
 			sum.Accepted += v.Accepted
 			sum.Closed += v.Closed
 		}
 		if sum.Accepted != st.Accepted || sum.Closed != st.Closed {
-			t.Fatalf("%s: variants %+v do not add up", x.name, st.Variants)
+			t.Fatalf("%s: variants %+v do not add up", x.name, vs)
 		}
 	}
 }
@@ -316,8 +327,8 @@ func TestAdmissionMoreHTTP(t *testing.T) {
 	}
 	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
 	echoOnce(t, ctx, c, s)
-	if st := lst.Stats().Admission; st.Variants["x"].Accepted != 1 {
-		t.Fatalf("stats %+v", st)
+	if vs := lst.VariantStats(); variantNamed(vs, "x").Accepted != 1 {
+		t.Fatalf("variants %+v", vs)
 	}
 }
 
@@ -329,5 +340,36 @@ func TestAdmissionMaxPeekConfig(t *testing.T) {
 		if err := a.Validate(); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%+v: %v", a, err)
 		}
+	}
+}
+
+// Past MaxAdmissionVariants distinct variants, the outcomes of further
+// ones share the Overflow bucket, listed last; the names come sorted.
+func TestAdmissionVariantBound(t *testing.T) {
+	var c admissionCounters
+	for i := MaxAdmissionVariants + 2; i > 0; i-- {
+		c.variant(fmt.Sprintf("v%03d", i), VerdictAccept)
+	}
+	c.variant("v001", VerdictClose)
+	c.variant("v999", VerdictStall)
+	vs := c.variantStats()
+	if len(vs) != MaxAdmissionVariants+1 {
+		t.Fatalf("%d variants", len(vs))
+	}
+	for i := 1; i < MaxAdmissionVariants; i++ {
+		if vs[i-1].Name >= vs[i].Name || vs[i].Overflow {
+			t.Fatalf("variants %+v not sorted", vs)
+		}
+	}
+	// The first MaxAdmissionVariants seen were v066 down to v003.
+	if vs[0] != (VariantStat{Name: "v003", Accepted: 1}) {
+		t.Fatalf("first %+v", vs[0])
+	}
+	if o := vs[MaxAdmissionVariants]; o != (VariantStat{Overflow: true, Accepted: 2, Stalled: 1, Closed: 1}) {
+		t.Fatalf("overflow %+v", o)
+	}
+	var none *Listener
+	if none.VariantStats() != nil {
+		t.Fatal("a nil listener has variants")
 	}
 }

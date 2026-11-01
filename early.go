@@ -15,9 +15,18 @@ import (
 // bootstrap pipe on the pipe the carrier's restart hook returns.
 
 // EarlyClientCarrier is the optional capability of a client carrier that
-// sends early data, on the W half of the bootstrap PipeIO. With it, the
-// session's early sends stay provisional until EarlyAccepted returns.
+// may send early data, on the W half of the bootstrap PipeIO. When
+// SendsEarlyData reports true, the session's early sends stay provisional
+// until EarlyAccepted returns.
 type EarlyClientCarrier interface {
+	// SendsEarlyData reports whether this pipe's initial bytes go out as
+	// carrier early data, which the server may refuse or see replayed; it
+	// must not change for the pipe. A carrier that sends them only after
+	// its handshake (QUIC without 0-RTT) returns false: floor early data
+	// (EarlyData.ZmuxPeer) then neither waits for a verdict nor needs
+	// Replayable. Remembered parameters with Replayable wait for
+	// EarlyAccepted either way.
+	SendsEarlyData() bool
 	// EarlyAccepted waits for the carrier handshake's verdict for this pipe's
 	// initial bytes. Return true if they remain usable, including bytes sent
 	// only after the handshake. Return false only when those bytes were
@@ -91,14 +100,21 @@ func (c *Conn) watchEarly(p PipeIO) {
 }
 
 // earlyCarrier is the bootstrap carrier's verdict hook when the session's
-// early data waits for it: a client with early data on a carrier with
-// EarlyClientCarrier.
+// early data waits for it, on a carrier with EarlyClientCarrier: a client
+// with Remembered parameters and Replayable (carrier early data by
+// definition), or with floor early data on a carrier that sends early data
+// this time. The order is the core's (Remembered first).
 func earlyCarrier(p PipeIO, e *EarlyData) (EarlyClientCarrier, bool) {
 	ec, ok := p.W.(EarlyClientCarrier)
-	if !ok || !e.clientEarly() {
+	switch {
+	case !ok:
 		return nil, false
+	case e.Replayable && len(e.Remembered) > 0:
+		return ec, true
+	case e.ZmuxPeer && ec.SendsEarlyData():
+		return ec, true
 	}
-	return ec, true
+	return nil, false
 }
 
 // earlyVerdict applies the carrier's verdict; on rejection the restart

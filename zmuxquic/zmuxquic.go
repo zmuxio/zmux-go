@@ -77,7 +77,7 @@ func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Con
 		return nil, err
 	}
 	clientLanes(cur)
-	sp := &qStream{qc: cur, s: s}
+	sp := &qStream{qc: cur, s: s, early: early}
 	if err := zmux.PresentPipe(ctx, sp.pipe(), cred); err != nil {
 		closeDialled(qc, sp)
 		return nil, err
@@ -350,6 +350,7 @@ type qStream struct {
 	qc     *quic.Conn
 	s      *quic.Stream
 	closed bool // Dial's session ended: a replacement connection is closed
+	early  bool // Dial sent the stream in 0-RTT
 	wOnce  sync.Once
 	rOnce  sync.Once
 }
@@ -419,6 +420,9 @@ func (q *qStream) OpenLane(ctx context.Context) (io.WriteCloser, error) {
 	}
 	return &laneWriter{s: s}, nil
 }
+
+// SendsEarlyData reports a stream Dial opened in 0-RTT.
+func (q *qStream) SendsEarlyData() bool { return q.early }
 
 // EarlyAccepted waits for the handshake's carrier verdict. The temporary
 // handshake barrier creates every outgoing stream after that decision, so

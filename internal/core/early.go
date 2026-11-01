@@ -84,11 +84,25 @@ func (s *Session) RestartEarly(info CarrierInfo, now Time) bool {
 		if sp.state == sendDataSent {
 			sp.state = sendSend
 		}
+		// Not opened any more: its control frames, re-queued here, wait
+		// for the opening STREAM frame of the re-issue.
+		st.opened = false
 		if sp.reset {
 			sp.resetSent = false
 			s.queueCtl(st, ctlReset)
 		}
-		st.opened = false
+		if r := &st.rcv; st.hasR {
+			// Nothing of the early carrier reached the peer: a
+			// STOP_SENDING or window update in it goes again.
+			if r.stopped && r.stopSent {
+				r.stopSent = false
+				s.queueCtl(st, ctlStop)
+			}
+			if r.adv > s.cfg.Local.MaxStreamDataBidiLoc {
+				st.forceMSD = true
+				s.queueCtl(st, ctlMaxStreamData)
+			}
+		}
 		s.sched.ensure(st)
 	}
 	s.wakePipe(p)

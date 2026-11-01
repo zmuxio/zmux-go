@@ -143,6 +143,12 @@ func (s *Session) streamCreditChanged(st *Stream) {
 
 // queueCtl marks a pending control frame of st.
 func (s *Session) queueCtl(st *Stream, bit uint8) {
+	st.ctl |= bit
+	if st.local && !st.opened {
+		// No ID on the wire yet: the bits wait for the opening STREAM
+		// frame, which queues them (openedCtl).
+		return
+	}
 	if !st.inCtl {
 		st.inCtl = true
 		st.ctlNext = nil
@@ -153,6 +159,13 @@ func (s *Session) queueCtl(st *Stream, bit uint8) {
 		}
 		s.ctlTail = st
 	}
-	st.ctl |= bit
 	s.wakeAllWriters()
+}
+
+// openedCtl queues the control frames that waited for st's opening
+// STREAM frame.
+func (s *Session) openedCtl(st *Stream) {
+	if st.ctl != 0 {
+		s.queueCtl(st, 0)
+	}
 }

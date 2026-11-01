@@ -103,6 +103,90 @@ func TestExporterTransform(t *testing.T) {
 	}
 }
 
+// PipeAuth.Exporter on a TLS client whose handshake has not run yet (it
+// runs on the session's first write): the exporter is read once the
+// handshake completed, and a carrier-bound join over TLS verifies.
+func TestExporterTLSBeforeHandshake(t *testing.T) {
+	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	scfg, ccfg := selfSignedTLS(t)
+	lst := NewListener(&ListenerConfig{Config: exporterConfig()})
+	defer func() { _ = lst.Close() }()
+	pair := func() *tls.Conn {
+		a, b := tcpPair(t)
+		go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), JoinHint{}) }()
+		return tls.Client(b, ccfg)
+	}
+	c, err := Start(ctx, NetPipe(pair()), RoleClient, exporterConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := lst.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
+	echoOnce(t, ctx, c, s)
+	// A join binds to its carrier's exporter when it starts: that
+	// handshake must have run.
+	jc := pair()
+	if err := jc.HandshakeContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.AddPipe(ctx, NetPipe(jc), PipeOptions{CarrierBound: true}); err != nil {
+		t.Fatalf("carrier-bound join: %v", err)
+	}
+	echoOnce(t, ctx, c, s)
+}
+
+// earlyKM is a server carrier whose join arrived as early data: its
+// exporter fails until the handshake completed.
+type earlyKM struct {
+	*kmConn
+	done chan struct{}
+}
+
+func (e *earlyKM) UsedEarlyData() bool                { return true }
+func (e *earlyKM) HandshakeComplete() <-chan struct{} { return e.done }
+func (e *earlyKM) ExportKeyingMaterial(label string, ctx []byte, n int) ([]byte, error) {
+	select {
+	case <-e.done:
+		return e.kmConn.ExportKeyingMaterial(label, ctx, n)
+	default:
+		return nil, errors.New("handshake incomplete")
+	}
+}
+
+// A listener reads a carrier-bound join's exporter only once the
+// handshake of a carrier that delivered it as early data completed.
+func TestExporterEarlyJoin(t *testing.T) {
+	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lst := NewListener(&ListenerConfig{Config: exporterConfig()})
+	defer func() { _ = lst.Close() }()
+	ck, sk := kmPair("s0")
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, JoinHint{}) }()
+	c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, exporterConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := lst.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
+	cj, sj := kmPair("j1")
+	ej := &earlyKM{kmConn: sj, done: make(chan struct{})}
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: ej, W: ej}, JoinHint{}) }()
+	time.AfterFunc(100*time.Millisecond, func() { close(ej.done) })
+	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{CarrierBound: true}); err != nil {
+		t.Fatalf("carrier-bound join: %v", err)
+	}
+	waitUntil(t, 5*time.Second, "the join", func() bool { return len(s.PipeStats()) == 2 })
+}
+
 // A failed exporter read closes the session with INTERNAL_ERROR.
 func TestExporterReadFails(t *testing.T) {
 	leakcheck.Check(t)
@@ -155,8 +239,9 @@ type stateForward struct {
 func (s *stateForward) ConnectionState() tls.ConnectionState { return s.below.ConnectionState() }
 
 // Exporter finds a transform's own exporter before any TLS state, adapts
-// a forwarded terminated TLS state, and finds nothing on a carrier whose
-// TLS handshake has not completed.
+// a forwarded terminated TLS state, finds a *tls.Conn before its handshake
+// (read late: failing until it completed) and nothing on a forwarded state
+// whose handshake has not completed.
 func TestExporterSources(t *testing.T) {
 	leakcheck.Check(t)
 	scfg, ccfg := selfSignedTLS(t)
@@ -164,8 +249,15 @@ func TestExporterSources(t *testing.T) {
 	a, b := tcpPair(t)
 	sc, cc := tls.Server(a, scfg), tls.Client(b, ccfg)
 	defer func() { _ = sc.Close(); _ = cc.Close() }()
-	if _, ok := Exporter(NetPipe(cc)); ok {
-		t.Fatal("exporter before the TLS handshake")
+	early, ok := Exporter(NetPipe(cc))
+	if !ok {
+		t.Fatal("no exporter on a TLS connection before its handshake")
+	}
+	if _, err := early.ExportKeyingMaterial("l", nil, 32); err == nil {
+		t.Fatal("exporter read before the TLS handshake")
+	}
+	if fw := (&stateForward{Conn: cc, below: cc}); func() bool { _, ok := Exporter(PipeIO{R: fw, W: fw}); return ok }() {
+		t.Fatal("exporter on a forwarded state before the handshake")
 	}
 	done := make(chan error, 1)
 	go func() { done <- sc.Handshake() }()
@@ -184,6 +276,9 @@ func TestExporterSources(t *testing.T) {
 	}
 	if got, _ := e.ExportKeyingMaterial("l", nil, 32); !bytes.Equal(got, want) {
 		t.Fatal("forwarded exporter differs from the TLS one")
+	}
+	if got, err := early.ExportKeyingMaterial("l", nil, 32); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("exporter found before the handshake reads %x, %v", got, err)
 	}
 	own := &exportOnly{Conn: cc, km: &kmConn{secret: "own"}}
 	if _, ok := TerminatedTLS(PipeIO{R: own, W: own}); ok {

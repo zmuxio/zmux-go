@@ -635,6 +635,14 @@ func (s *Session) writeControl(w *recWriter, p *Pipe) {
 // writeStreamCtl writes the pending control frames of one stream; it
 // returns false when the batch is full.
 func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
+	if st.local && !st.opened {
+		// Not opened (again, after an early-data restart): its frames
+		// keep their bits and follow the opening STREAM frame.
+		ctl := st.ctl
+		s.unlinkCtl(st)
+		st.ctl = ctl
+		return true
+	}
 	id := st.id
 	if st.ctl&ctlMaxStreamData != 0 {
 		r := &st.rcv
@@ -903,6 +911,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		return chunkSent
 	}
 	st.opened = true
+	s.openedCtl(st)
 	if s.dg != nil && len(s.dg.send) > 0 {
 		s.wakeAllWriters() // its held datagrams may follow
 	}

@@ -59,6 +59,12 @@ type ReplayConfig struct {
 // most Max keys are held, and a full filter accepts nothing new. Keys are
 // hashed with a per-filter random seed; expiry costs O(1) per Check and no
 // key is ever scanned. It is safe for concurrent use.
+//
+// The filter trusts its inputs: authenticate k and t together (t inside
+// the MAC or AEAD that covers k) and call Check only on what verified. An
+// unauthenticated stamp lets a replay pick a fresh t, and unauthenticated
+// keys let anyone fill the filter (ReplayFull) and so refuse every honest
+// key until the window passes.
 type ReplayFilter struct {
 	window    int64 // ms
 	width     int64 // ms per bucket
@@ -104,6 +110,7 @@ func NewReplayFilter(c ReplayConfig) (*ReplayFilter, error) {
 
 // Check checks k stamped t (Unix milliseconds) and records a fresh k. k
 // may be of any length; the filter retains neither k nor its contents.
+// Both must have been authenticated together before the call.
 func (f *ReplayFilter) Check(k []byte, t int64) ReplayVerdict {
 	return f.checkAt(k, t, f.clk.Now().UnixMilli())
 }

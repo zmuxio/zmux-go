@@ -246,8 +246,9 @@ type SchedulerParams struct {
 // ZmuxPeer: the client knows the server is a zmux endpoint and writes its
 // first streams on the bootstrap carrier right away, within the floor
 // values every zmux endpoint grants. Nothing is replayable, unless the
-// carrier itself has early data (its W half is an EarlyClientCarrier, such
-// as a transform whose first message carries the first flight): the
+// carrier itself sends early data (its W half is an EarlyClientCarrier
+// whose SendsEarlyData is true, such as a transform whose first message
+// carries the first flight; not QUIC without 0-RTT): the
 // streams then travel in it, wait for its verdict and are sent again after
 // a rejection, as with Remembered below, and the client consents to replay
 // with Replayable (else Start fails with ErrInvalidConfig).

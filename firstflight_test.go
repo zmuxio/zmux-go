@@ -187,3 +187,28 @@ func TestHoldFirstFlightConfig(t *testing.T) {
 		t.Fatalf("server: %v", err)
 	}
 }
+
+// A session that closes while its first flight is held stops the release
+// timer: nothing fires after the session ended.
+func TestHoldFirstFlightClosed(t *testing.T) {
+	leakcheck.Check(t)
+	a, b := net.Pipe()
+	defer func() { _ = b.Close() }()
+	cfg := holdConfig()
+	cfg.HandshakeTimeout = time.Hour
+	c, err := Start(context.Background(), NetPipe(a), RoleClient, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+	waitDone(t, c)
+	c.lock()
+	held := c.firstTimer != nil
+	c.unlock()
+	if held {
+		t.Fatal("the first flight timer outlived the session")
+	}
+	if n := c.ConnectionStats().FirstFlightTimeouts; n != 0 {
+		t.Fatalf("FirstFlightTimeouts %d", n)
+	}
+}

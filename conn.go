@@ -142,8 +142,15 @@ func (c *Conn) unlock() {
 	}
 	if !c.closing {
 		c.rearmLocked()
-	} else if c.timer != nil {
-		c.timer.Stop()
+	} else {
+		if c.timer != nil {
+			c.timer.Stop()
+		}
+		if c.firstTimer != nil {
+			// A held first flight ends with the session.
+			c.firstTimer.Stop()
+			c.firstTimer = nil
+		}
 	}
 	pp := pendPool.Get().(*[]pendingAct)
 	pend := (*pp)[:0]

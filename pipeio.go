@@ -3,6 +3,7 @@ package zmux
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -55,6 +56,12 @@ type MessageBatchWriter interface {
 // response (an exchange carrier), as a copy; nil before any response. A
 // host or transform reads outer metadata from it, such as Date as a clock
 // hint; it changes nothing. A transparent transform may forward it.
+//
+// The header is not authenticated: on plain HTTP or WebSocket anyone on
+// the path, and over TLS any proxy that terminates it, can write or alter
+// it. Never base authentication or authorization on it; a host that takes
+// Date as a clock hint bounds what it accepts (a maximum offset from its
+// own clock, never earlier than a time it already trusts).
 type ResponseHeaderer interface {
 	ResponseHeader() http.Header
 }
@@ -296,11 +303,13 @@ type KeyingMaterialExporter interface {
 }
 
 // Exporter returns the exporter of p: the first half (W, then R) that
-// implements KeyingMaterialExporter, else the state of a TLS handshake
-// this process terminated (TerminatedTLS) as one; ok false: none. It is
-// the only source of the exporters of PipeAuth.Exporter and
-// PipeOptions.CarrierBound. Exporter only finds the exporter; reading it
-// may still fail while the handshake is incomplete.
+// implements KeyingMaterialExporter, else the TLS handshake this process
+// runs for a ConnectionStater half, read from its ConnectionState when
+// ExportKeyingMaterial is called: one that completed (TerminatedTLS), or
+// one that may still complete (a *tls.Conn, a carrier with early data such
+// as QUIC 0-RTT); ok false: none. It is the only source of the exporters
+// of PipeAuth.Exporter and PipeOptions.CarrierBound. Exporter only finds
+// the exporter; reading it fails while the handshake is incomplete.
 func Exporter(p PipeIO) (e KeyingMaterialExporter, ok bool) {
 	for _, x := range []any{p.W, p.R} {
 		if e, ok := exporterOf(x); ok {
@@ -315,10 +324,41 @@ func exporterOf(x any) (KeyingMaterialExporter, bool) {
 	if e, ok := x.(KeyingMaterialExporter); ok {
 		return e, true
 	}
-	if st, ok := terminatedTLS(x); ok {
-		return &st, true // *tls.ConnectionState exports from its handshake
+	s, ok := x.(ConnectionStater)
+	if !ok {
+		return nil, false
+	}
+	if handshaking(x) || s.ConnectionState().HandshakeComplete {
+		return stateExporter{s}, true
 	}
 	return nil, false
+}
+
+// handshaking reports a half whose TLS (or QUIC) handshake this process
+// runs and may not have completed yet: a *tls.Conn, or a carrier with early
+// data (QUIC 0-RTT). Without TLS, or with TLS ended at a proxy (a plain
+// WebSocket), a ConnectionStater never completes a handshake.
+func handshaking(x any) bool {
+	switch x.(type) {
+	case *tls.Conn, EarlyClientCarrier, EarlyServerCarrier:
+		return true
+	}
+	return false
+}
+
+// stateExporter exports from the handshake state of a ConnectionStater at
+// the time it is read, not when it was found: the handshake may complete
+// later, and a carrier may replace its connection (a QUIC 0-RTT rejection).
+type stateExporter struct{ s ConnectionStater }
+
+var errHandshakeIncomplete = errors.New("zmux: TLS handshake not complete")
+
+func (e stateExporter) ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error) {
+	st := e.s.ConnectionState()
+	if !st.HandshakeComplete {
+		return nil, errHandshakeIncomplete
+	}
+	return st.ExportKeyingMaterial(label, context, length)
 }
 
 // TerminatedTLS reports the state of the TLS (or QUIC) handshake that this
