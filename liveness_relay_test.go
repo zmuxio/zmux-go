@@ -149,3 +149,31 @@ func TestLivenessSingleKeepAlive(t *testing.T) {
 		t.Fatal("session alive after its carrier died")
 	}
 }
+
+// A DeadTimeout set while the session runs bounds the failure of a pipe
+// that turns suspect after the change: with the derived limit (half the
+// 30 s idle timeout) the black-holed session would stay up for 15 s.
+func TestRelaySetLivenessDeadTimeout(t *testing.T) {
+	t.Parallel()
+	c := relayConfig(0)
+	c.SchedulerParams.ProbeInterval = time.Second
+	e := newRelayEnv(t, c, relayConfig(0), zmuxtest.RelayOptions{}, true)
+	if err := e.client.SetLiveness(zmux.Liveness{ProbeInterval: time.Second, DeadTimeout: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	e.relay.Blackhole(true, true)
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- e.client.Wait() }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, zmux.ErrPipesLost) {
+			t.Fatalf("session ended with %v", err)
+		}
+		if el := time.Since(start); el > 6*time.Second {
+			t.Fatalf("ended after %v", el)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("session still open: the new DeadTimeout was not applied")
+	}
+}

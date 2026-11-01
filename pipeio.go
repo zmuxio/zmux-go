@@ -78,8 +78,11 @@ func WriteFlat(w io.Writer, bufs [][]byte) (int, error) {
 //   - interface{ Abort(error) } on W: used instead of Close when a pipe fails;
 //   - BuffersWriter on W: a batch of records in one call;
 //   - interface{ CloseWrite() error } on W: graceful end of the write side;
-//   - interface{ ConnectionState() tls.ConnectionState }: a TLS carrier
-//     (records built at 16382 bytes, exporter for PipeAuth.TLS);
+//   - interface{ ConnectionState() tls.ConnectionState }: the TLS that the
+//     carrier runs over and that this process terminates, for the exporters
+//     of PipeAuth.TLS and PipeOptions.CarrierBound and CarrierInfo.TLS; a
+//     state without HandshakeComplete is no TLS, so that these fail
+//     (records are built at 16382 bytes on a *tls.Conn);
 //   - interface{ CarrierConn() any } and interface{ OpenLane(ctx) (io.WriteCloser, error) }: lanes;
 //   - interface{ RestartEarly(ctx) (io.ReadWriteCloser, error) }: carrier early data.
 //   - DatagramChannel: the carrier's datagram channel (EXTENSIONS.md 6.8).
@@ -222,7 +225,9 @@ func (h *halfCloser) closeAll(abort bool, cause error) {
 func carrierIsTLS(p PipeIO) (tls.ConnectionState, bool) {
 	for _, x := range []any{p.W, p.R} {
 		if s, ok := x.(tlsStater); ok {
-			return s.ConnectionState(), true
+			if st := s.ConnectionState(); st.HandshakeComplete {
+				return st, true
+			}
 		}
 	}
 	return tls.ConnectionState{}, false

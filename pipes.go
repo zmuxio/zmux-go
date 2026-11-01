@@ -89,23 +89,17 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 		j.Dir = 1
 	case DirBidirectional:
 	}
-	if o.SuspectFloor != 0 && o.SuspectFloor < 50*time.Millisecond {
-		return j, fmt.Errorf("%w: SuspectFloor below 50 ms", ErrInvalidConfig)
-	}
-	if o.DeadTimeout != 0 && o.DeadTimeout < time.Second {
-		return j, fmt.Errorf("%w: DeadTimeout below 1 s", ErrInvalidConfig)
+	live := PipeLiveness{SuspectFloor: o.SuspectFloor, DeadTimeout: o.DeadTimeout, ProbeInterval: o.ProbeInterval,
+		ProbeJitter: o.ProbeJitter, NoProbeJitter: o.NoProbeJitter}
+	var err error
+	if j.Live, err = live.core(); err != nil {
+		return j, err
 	}
 	if o.Probation < 0 {
 		return j, fmt.Errorf("%w: negative Probation", ErrInvalidConfig)
 	}
 	if o.NoProbation && o.Probation != 0 {
 		return j, fmt.Errorf("%w: Probation with NoProbation", ErrInvalidConfig)
-	}
-	if err := checkProbeInterval(o.ProbeInterval, "ProbeInterval"); err != nil {
-		return j, err
-	}
-	if err := checkProbeJitter(o.ProbeJitter, "ProbeJitter"); err != nil {
-		return j, err
 	}
 	j.FateGroup, j.SendPriority, j.SendStandby = o.FateGroup, o.SendPriority, o.SendStandby
 	j.RecvPriority, j.RecvStandby = o.ReceivePriority, o.ReceiveStandby
@@ -116,13 +110,6 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 	if o.NoProbation || o.Probation != 0 {
 		d := core.Duration(o.Probation)
 		j.Probation = &d
-	}
-	j.SuspectFloor, j.DeadTimeout = core.Duration(o.SuspectFloor), core.Duration(o.DeadTimeout)
-	// The core's per-pipe probe settings: 0 the session's, a negative
-	// interval off, a negative jitter 0.
-	j.ProbeInterval, j.ProbeJitter = core.Duration(max(o.ProbeInterval, -1)), o.ProbeJitter
-	if o.NoProbeJitter {
-		j.ProbeJitter = -1
 	}
 	return j, nil
 }

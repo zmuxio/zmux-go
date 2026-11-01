@@ -57,7 +57,8 @@ type PipePool struct {
 	// failed, or from the start of the pool before its first; each wait is
 	// reduced by a random fraction of up to 0.2, drawn once per wait. 0
 	// selects the default: no backoff would redial a failing path in a
-	// busy loop.
+	// busy loop. A MinBackoff above MaxBackoff (the defaults filled in) is
+	// invalid.
 	MinBackoff, MaxBackoff time.Duration
 	// Policy, when set, is asked on every pass of the pool; its
 	// DialAfter replaces the backoff, bounded by MaxBackoff, and its
@@ -159,6 +160,9 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	}
 	if pool.MaxBackoff == 0 {
 		pool.MaxBackoff = DefaultMaxBackoff
+	}
+	if pool.MinBackoff > pool.MaxBackoff {
+		return fmt.Errorf("%w: PipePool MinBackoff %v above MaxBackoff %v", ErrInvalidConfig, pool.MinBackoff, pool.MaxBackoff)
 	}
 	var mp *modePool
 	switch {

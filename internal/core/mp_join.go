@@ -12,21 +12,15 @@ type JoinOptions struct {
 	SendStandby  *bool
 	RecvPriority uint64
 	Weight       uint64
-	Probation    *Duration // nil: the session default; 0 disables
-	SuspectFloor Duration  // 0: the session default
-	DeadTimeout  Duration  // 0: the session default
-	// ProbeInterval (0: the session default; negative: off) and
-	// ProbeJitter (0: the session default; negative: 0) of MULTIPATH.md
-	// 7.1.
-	ProbeInterval Duration
-	ProbeJitter   float64
-	In, Out       CarrierInfo
-	OutSig        *Signal
-	Dir           uint8 // MULTIPATH 5.1: 0 up, 1 down, 2 bidi (joiner's view)
-	OOB           bool
-	CarrierBound  bool
-	RecvStandby   bool
-	Kind          uint8 // the carrier's kind (SetPipeKind)
+	Probation    *Duration    // nil: the session default; 0 disables
+	Live         PipeLiveness // the pipe's own liveness settings
+	In, Out      CarrierInfo
+	OutSig       *Signal
+	Dir          uint8 // MULTIPATH 5.1: 0 up, 1 down, 2 bidi (joiner's view)
+	OOB          bool
+	CarrierBound bool
+	RecvStandby  bool
+	Kind         uint8 // the carrier's kind (SetPipeKind)
 }
 
 // AddPipeResult says what happened to a local join.
@@ -115,8 +109,7 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 		a.weight = o.Weight
 	}
 	a.rtt = s.initialRTT(id)
-	a.suspectFloor, a.deadTimeout = o.SuspectFloor, o.DeadTimeout
-	a.probeIv, a.probeJit = o.ProbeInterval, o.ProbeJitter
+	a.live = o.Live
 	s.drawProbe(a, nil, false)
 	a.sendPrio, a.sendStandby = o.SendPriority, o.SendStandby
 	a.recvPrio, a.recvStandby = o.RecvPriority, o.RecvStandby

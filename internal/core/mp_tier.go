@@ -451,6 +451,7 @@ type PipeSettings struct {
 	RecvStandby       *bool
 	Weight            *uint64
 	Probation         *Duration // <0: the session default; 0 disables
+	Liveness          *PipeLiveness
 }
 
 // SetPipe applies tier settings to an attachment (MULTIPATH.md 9).
@@ -495,6 +496,9 @@ func (s *Session) SetPipe(id uint64, o PipeSettings) error {
 		if s.probationBase(p) < 0 && a.prob.on {
 			a.prob.on = false
 		}
+	}
+	if o.Liveness != nil {
+		a.live = *o.Liveness
 	}
 	if wasProbation != a.prob.on {
 		s.capacityChanged()

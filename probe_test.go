@@ -82,7 +82,7 @@ func TestProbeOptionsValidation(t *testing.T) {
 	}
 	for _, o := range []PipeOptions{{ProbeInterval: time.Second, ProbeJitter: 0.99}} {
 		j, err := o.join(DirBidirectional)
-		if err != nil || j.ProbeInterval != core.Duration(o.ProbeInterval) || j.ProbeJitter != o.ProbeJitter {
+		if err != nil || j.Live.ProbeInterval != core.Duration(o.ProbeInterval) || j.Live.ProbeJitter != o.ProbeJitter {
 			t.Errorf("%+v: %+v %v", o, j, err)
 		}
 	}

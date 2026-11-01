@@ -48,22 +48,32 @@ func (s *Session) setAhead(p *Pipe, snap aheadSnap) {
 }
 
 func (s *Session) tSuspect(a *attach) Duration {
-	f := s.cfg.SuspectFloor
-	if a.suspectFloor > 0 {
-		f = a.suspectFloor
-	}
+	f, _ := s.deadParams(a)
 	return maxD(f, 2*(s.pto(a)+s.queueDelay(a)))
 }
 
 func (s *Session) tFail(a *attach) Duration { return maxD(2*Second, 8*(s.pto(a)+s.queueDelay(a))) }
 
-func (s *Session) tDead(a *attach) Duration {
-	f, dt := s.cfg.SuspectFloor, s.cfg.DeadTimeout
-	if a.suspectFloor > 0 {
-		f = a.suspectFloor
+// deadParams are the SuspectFloor and DeadTimeout (0: derived) of a: the
+// pipe's own, else the session's.
+func (s *Session) deadParams(a *attach) (f, dt Duration) {
+	f, dt = s.cfg.SuspectFloor, s.cfg.DeadTimeout
+	if a.live.SuspectFloor > 0 {
+		f = a.live.SuspectFloor
 	}
-	if a.deadTimeout > 0 {
-		dt = a.deadTimeout
+	if a.live.DeadTimeout > 0 {
+		dt = a.live.DeadTimeout
+	}
+	return f, dt
+}
+
+// tDead is T_dead of a suspect pipe, under the SuspectFloor and
+// DeadTimeout in force when it turned suspect: a later change of the
+// settings applies from its next suspicion.
+func (s *Session) tDead(a *attach) Duration {
+	f, dt := a.suspFloor, a.suspDead
+	if !a.suspHeld {
+		f, dt = s.deadParams(a)
 	}
 	return s.deadLimit(s.pto(a)+s.queueDelay(a), f, dt)
 }
@@ -110,9 +120,9 @@ func (s *Session) lastInDead() Duration {
 func (s *Session) probeInterval(p *Pipe) Duration {
 	k := s.cfg.ProbeInterval
 	switch {
-	case p.mp.probeIv > 0:
-		k = p.mp.probeIv
-	case p.mp.probeIv < 0:
+	case p.mp.live.ProbeInterval > 0:
+		k = p.mp.live.ProbeInterval
+	case p.mp.live.ProbeInterval < 0:
 		k = 0 // off for this pipe
 	}
 	if p.in == nil && (k == 0 || k > 15*Second) {
@@ -169,9 +179,9 @@ func (s *Session) probeWait(p *Pipe) Duration {
 // probeJitter is the probe jitter j of a.
 func (s *Session) probeJitter(a *attach) float64 {
 	switch {
-	case a.probeJit > 0:
-		return a.probeJit
-	case a.probeJit < 0:
+	case a.live.ProbeJitter > 0:
+		return a.live.ProbeJitter
+	case a.live.ProbeJitter < 0:
 		return 0
 	}
 	return s.cfg.ProbeJitter

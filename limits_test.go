@@ -54,7 +54,7 @@ func TestConfigLimitsValidation(t *testing.T) {
 	}
 	// A negative per-pipe ProbeInterval turns the pipe's idle probes off.
 	o := PipeOptions{ProbeInterval: -time.Second}
-	if j, err := o.join(DirBidirectional); err != nil || j.ProbeInterval >= 0 {
+	if j, err := o.join(DirBidirectional); err != nil || j.Live.ProbeInterval >= 0 {
 		t.Errorf("PipeOptions ProbeInterval negative: %+v %v", j, err)
 	}
 }

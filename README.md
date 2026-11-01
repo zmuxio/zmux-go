@@ -167,6 +167,14 @@ exist in `SchedulerParams` too. `PipeStats` reports per-pipe loss:
 `LossRate` from the carrier's own retransmissions; see the godoc for
 their exact definitions.
 
+Liveness can change while a session runs: `Conn.SetLiveness` replaces the
+keep-alive period and the failure-detection and probe settings as a whole
+(zero fields are the defaults, `Conn.Liveness` returns the values in
+effect), `Pipe.SetLiveness` and `ClearLiveness` set or drop a pipe's own.
+A pipe already suspect keeps the dead timeout it turned suspect under.
+`Conn.RaiseIncomingStreams` raises the incoming stream limits, for example
+after the peer has authenticated; the limits only grow.
+
 ## WebSocket
 
 `zmuxws` carries one zmux record per binary message (`FramingRecords`),
@@ -196,6 +204,13 @@ credential travels in the upgrade request: `Dial` presents
 `Reservation` for an out-of-band join, and `zmuxws.Pipe` adapts a
 WebSocket connection established otherwise. A close frame ends a pipe
 gracefully; an aborted pipe closes the connection without one.
+
+A carrier exposes the TLS this process terminates beneath it
+(`ConnectionState`: the client's wss connection, the server's request
+TLS, shared by the WebSocket streams of one HTTP/2 connection), so
+`PipeAuth.TLS` and `CarrierBound` work over wss. Over ws, or behind a proxy
+that terminates TLS, there is none and both fail. Only the exporter
+binding or a client that pins the server proves the TLS end to end.
 
 ## HTTP exchanges
 

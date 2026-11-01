@@ -284,7 +284,15 @@ type EarlyData struct {
 type PipeAuth struct {
 	// PSK is a pre-shared key of at least 16 bytes.
 	PSK []byte
-	// TLS asserts that pipe 0's TLS 1.3 handshake terminates at the peer.
+	// TLS asserts that pipe 0's TLS 1.3 handshake terminates at the peer:
+	// the join secret is derived from its exporter, read from the
+	// carrier's ConnectionState, as a TLS or a zmuxws WebSocket carrier
+	// has it. A carrier whose TLS this process does not terminate (none,
+	// or ended at a proxy) has no exporter, and the session fails to
+	// start. An intermediary that terminates TLS on both sides leaves the
+	// ends with different exporters, so that joins fail: the binding to
+	// the exporter, or a client that pins the server, is what proves the
+	// TLS end to end, not the presence of TLS.
 	TLS bool
 	// AllowInsecure allows joins without a secret (tests, protected
 	// networks). It must not be combined with PSK.
@@ -384,7 +392,7 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	if c.LatencyBudget < 0 || c.MemoryBudget < 0 && c.MemoryBudget != NoMemoryLimit || c.MaxIncomingStreams < 0 || c.MaxIncomingUniStreams < 0 ||
 		c.DatagramSendQueue < 0 || c.DatagramReceiveQueue < 0 || c.DatagramStreamQueue < 0 || c.DatagramReceiveBytes < 0 ||
 		c.MaxPipes < 0 || c.PipeHeadroom < 0 || c.ReplayWindow < 0 || c.MaxLanes < 0 || c.ResumeTimeout < 0 ||
-		p.SuspectFloor < 0 || p.DeadTimeout < 0 || p.Probation < 0 || p.OverflowDelay < 0 ||
+		p.Probation < 0 || p.OverflowDelay < 0 ||
 		p.SpreadChunk < 0 {
 		return cc, fmt.Errorf("%w: negative Config count, size or duration", ErrInvalidConfig)
 	}
@@ -398,14 +406,12 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	case c.MaxIdleTimeout > 0:
 		l.MaxIdleTimeout = uint64(c.MaxIdleTimeout / time.Millisecond)
 	}
-	switch {
-	case c.KeepAlivePeriod < 0:
-		cc.KeepAlive = 0
-	case c.KeepAlivePeriod > 0 && c.KeepAlivePeriod < time.Second:
-		return cc, fmt.Errorf("%w: KeepAlivePeriod %v neither 0 nor at least 1 s", ErrInvalidConfig, c.KeepAlivePeriod)
-	case c.KeepAlivePeriod > 0:
-		cc.KeepAlive = core.Duration(c.KeepAlivePeriod)
+	lv := c.liveness()
+	clv, err := lv.core()
+	if err != nil {
+		return cc, err
 	}
+	cc.SetLiveness(clv)
 	if v := c.InitialStreamReceiveWindow; v != 0 {
 		if v < 4096 {
 			return cc, fmt.Errorf("%w: InitialStreamReceiveWindow below 4 KiB", ErrInvalidConfig)
@@ -485,18 +491,6 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	}
 	cc.ReplayWindow = c.ReplayWindow
 	cc.Resume = core.Duration(c.ResumeTimeout)
-	if p.SuspectFloor != 0 {
-		if p.SuspectFloor < 50*time.Millisecond {
-			return cc, fmt.Errorf("%w: SuspectFloor below 50 ms", ErrInvalidConfig)
-		}
-		cc.SuspectFloor = core.Duration(p.SuspectFloor)
-	}
-	if p.DeadTimeout != 0 {
-		if p.DeadTimeout < time.Second {
-			return cc, fmt.Errorf("%w: DeadTimeout below 1 s", ErrInvalidConfig)
-		}
-		cc.DeadTimeout = core.Duration(p.DeadTimeout)
-	}
 	switch {
 	case p.NoProbation && p.Probation != 0:
 		return cc, fmt.Errorf("%w: Probation with NoProbation", ErrInvalidConfig)
@@ -506,33 +500,6 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 		cc.Probation = core.Duration(p.Probation)
 	}
 	cc.OverflowDelay = dur(p.OverflowDelay, time.Second)
-	if err := checkProbeInterval(p.StandbyProbe, "StandbyProbe"); err != nil {
-		return cc, err
-	}
-	switch {
-	case p.StandbyProbe < 0:
-		cc.StandbyProbe = 0
-	case p.StandbyProbe > 0:
-		cc.StandbyProbe = core.Duration(p.StandbyProbe)
-	}
-	if err := checkProbeInterval(p.ProbeInterval, "ProbeInterval"); err != nil {
-		return cc, err
-	}
-	switch {
-	case p.ProbeInterval < 0:
-		cc.ProbeInterval = 0
-	case p.ProbeInterval > 0:
-		cc.ProbeInterval = core.Duration(p.ProbeInterval)
-	}
-	if err := checkProbeJitter(p.ProbeJitter, "ProbeJitter"); err != nil {
-		return cc, err
-	}
-	switch {
-	case p.NoProbeJitter:
-		cc.ProbeJitter = 0
-	case p.ProbeJitter > 0:
-		cc.ProbeJitter = p.ProbeJitter
-	}
 	cc.Redundancy = !p.NoRedundancy
 	if p.SpreadChunk > 0 {
 		cc.SpreadChunk = p.SpreadChunk

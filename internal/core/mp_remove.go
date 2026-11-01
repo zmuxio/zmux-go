@@ -88,6 +88,8 @@ func (s *Session) makeSuspect(p *Pipe) {
 	a.out = OutSuspect
 	a.suspects++
 	a.suspectAt = s.now
+	a.suspHeld = true
+	a.suspFloor, a.suspDead = s.deadParams(a)
 	a.noSampleAt, a.noSample = s.now, true
 	s.probationSuspect(p)
 	s.unsettle(p)

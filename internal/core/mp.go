@@ -155,25 +155,25 @@ type attach struct {
 	takeover    bool
 
 	// Scheduler.
-	probOpt      Duration // per-pipe Probation; <0: the session default
-	suspectFloor Duration // per-pipe SuspectFloor; 0: the session default
-	deadTimeout  Duration // per-pipe DeadTimeout; 0: the session default
-	probeIv      Duration // per-pipe ProbeInterval; 0: the session default, <0: off
-	probeJit     float64  // per-pipe ProbeJitter; 0: the session default, <0: 0
-	probeH       Duration // H_p of the current probe wait, taken when it started
-	probeCut     float64  // the current probe wait is k_eff x (1 - probeCut): in [0, j], or [0, 1] for the first wait of a bootstrap pipe
-	prob         probState
-	hist         history // fate group 0
-	revalEnd     uint64
-	rrCur        float64
-	copyQ        []*copyRec
-	selfCopyQ    []*copyRec // copies for p's own copy lane (a single-pipe tier)
-	idleArm      uint64     // bytes of the idle copy left
-	placedFrom   uint64
-	wasSuspect   bool
-	reval        bool // awaiting revalidation
-	revalPing    bool // its PIPE_PING is still to be written
-	placedSet    bool
+	probOpt    Duration     // per-pipe Probation; <0: the session default
+	live       PipeLiveness // the pipe's own liveness settings
+	suspHeld   bool         // suspFloor and suspDead hold: set on turning suspect
+	suspFloor  Duration     // the SuspectFloor in force when the pipe turned suspect
+	suspDead   Duration     // the DeadTimeout in force then (0: derived)
+	probeH     Duration     // H_p of the current probe wait, taken when it started
+	probeCut   float64      // the current probe wait is k_eff x (1 - probeCut): in [0, j], or [0, 1] for the first wait of a bootstrap pipe
+	prob       probState
+	hist       history // fate group 0
+	revalEnd   uint64
+	rrCur      float64
+	copyQ      []*copyRec
+	selfCopyQ  []*copyRec // copies for p's own copy lane (a single-pipe tier)
+	idleArm    uint64     // bytes of the idle copy left
+	placedFrom uint64
+	wasSuspect bool
+	reval      bool // awaiting revalidation
+	revalPing  bool // its PIPE_PING is still to be written
+	placedSet  bool
 	// Counters.
 	suspects, failures, reinjectedBytes, oppBytes, pingsSent uint64
 	redundantBytes, dupBytes, pingsAnswered                  uint64

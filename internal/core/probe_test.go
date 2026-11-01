@@ -219,19 +219,19 @@ func TestProbePerPipeOptions(t *testing.T) {
 	cfg.ProbeJitter = 0.5
 	s, p := probeSession(cfg)
 	a := p.mp
-	a.probeIv, a.probeJit = 3*Second, -1
+	a.live.ProbeInterval, a.live.ProbeJitter = 3*Second, -1
 	s.drawProbe(a, p, false)
 	if w := s.probeWait(p); w != 3*Second {
 		t.Fatalf("explicit 0 jitter: wait %v, want 3 s", w)
 	}
-	a.probeJit = 0.25
+	a.live.ProbeJitter = 0.25
 	for range 200 {
 		s.drawProbe(a, p, false)
 		if w := s.probeWait(p); w < 2250*Millisecond || w > 3*Second {
 			t.Fatalf("per-pipe jitter: wait %v", w)
 		}
 	}
-	a.probeJit = 0
+	a.live.ProbeJitter = 0
 	seen := false
 	for range 200 {
 		s.drawProbe(a, p, false)
@@ -275,22 +275,22 @@ func TestProbeUnidirectionalCap(t *testing.T) {
 	cfg := DefaultConfig()
 	s, p := probeSession(cfg)
 	p.in = nil
-	p.mp.probeIv = 60 * Second
+	p.mp.live.ProbeInterval = 60 * Second
 	if k := s.probeInterval(p); k != 15*Second {
 		t.Fatalf("ProbeInterval 60 s on an uplink: %v", k)
 	}
-	p.mp.probeIv = 0
+	p.mp.live.ProbeInterval = 0
 	s.cfg.ProbeInterval = 0
 	if k := s.probeInterval(p); k != 15*Second {
 		t.Fatalf("probe_interval 0 on an uplink: %v", k)
 	}
-	p.mp.probeIv = 5 * Second
+	p.mp.live.ProbeInterval = 5 * Second
 	if k := s.probeInterval(p); k != 5*Second {
 		t.Fatalf("ProbeInterval 5 s on an uplink: %v", k)
 	}
 	q := s.pipes[0]
 	q.in = &inDir{}
-	q.mp.probeIv = 0
+	q.mp.live.ProbeInterval = 0
 	if k := s.probeInterval(q); k != 0 {
 		t.Fatalf("probe_interval 0 on a pipe pair: %v", k)
 	}

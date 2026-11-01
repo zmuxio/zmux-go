@@ -370,6 +370,9 @@ func sessionExporter(p PipeIO, initiator bool) ([]byte, error) {
 			return nil, false, nil
 		}
 		st := s.ConnectionState()
+		if !st.HandshakeComplete {
+			return nil, false, nil // TLS not terminated here: no exporter
+		}
 		b, err := st.ExportKeyingMaterial(wire.ExporterSession, nil, 32)
 		if err != nil {
 			return nil, true, fmt.Errorf("zmux: TLS exporter: %w", err)
