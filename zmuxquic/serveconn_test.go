@@ -80,7 +80,7 @@ func TestServeConnDialled(t *testing.T) {
 		t.Fatalf("server: %d pipes, want 2", n)
 	}
 	scancel()
-	if err := <-served; err != context.Canceled {
+	if err := <-served; !errors.Is(err, context.Canceled) {
 		t.Fatalf("ServeConn after its context ended: %v", err)
 	}
 	echo(t, c, s, 1<<16) // the session continues

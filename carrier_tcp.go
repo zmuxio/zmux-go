@@ -48,11 +48,7 @@ func tcpOf(x any) tcpInfo {
 	}
 	if c, ok := x.(*net.TCPConn); ok {
 		if rc, err := c.SyscallConn(); err == nil {
-			t := tcpInfo{rc: rc}
-			if tcpRetransBits == 32 {
-				t.retrans = &counter32{}
-			}
-			return t
+			return tcpInfo{rc: rc, retrans: retransCounter()}
 		}
 	}
 	return tcpInfo{}

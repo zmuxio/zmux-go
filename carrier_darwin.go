@@ -22,8 +22,8 @@ func tcpUnsent(_ uintptr) (uint64, bool) { return 0, false }
 
 const tcpConnectionInfo = 0x106 // TCP_CONNECTION_INFO
 
-// tcpRetransBits is the width of the count tcpRetrans reads.
-const tcpRetransBits = 64
+// retransCounter widens the count tcpRetrans reads: nil, it is 64 bits.
+func retransCounter() *counter32 { return nil }
 
 // tcpRetrans reads tcpi_txretransmitbytes (offset 72 of struct
 // tcp_connection_info).

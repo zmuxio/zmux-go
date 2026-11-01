@@ -65,19 +65,24 @@ func TestExportedDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if DefaultKeepAlivePeriod != 15*time.Second || time.Duration(cc.KeepAlive) != DefaultKeepAlivePeriod {
-		t.Errorf("keep-alive %v / %v", DefaultKeepAlivePeriod, cc.KeepAlive)
-	}
-	if DefaultMaxIdleTimeout != 30*time.Second || time.Duration(cc.Local.MaxIdleTimeout)*time.Millisecond != DefaultMaxIdleTimeout {
-		t.Errorf("idle %v / %v ms", DefaultMaxIdleTimeout, cc.Local.MaxIdleTimeout)
-	}
-	if DefaultProbeJitter != 0.25 || cc.ProbeJitter != DefaultProbeJitter {
-		t.Errorf("probe jitter %v / %v", DefaultProbeJitter, cc.ProbeJitter)
-	}
-	if DefaultMaxRecordSize != 16382 || shaping.StartupAllowance != DefaultMaxRecordSize || shaping.MinMaxLen != 64 {
-		t.Errorf("record %v, allowance %v, min max_len %v", DefaultMaxRecordSize, shaping.StartupAllowance, shaping.MinMaxLen)
-	}
-	if MaxRedialBackoff != 30*time.Second || DefaultMaxBackoff != 60*time.Second {
-		t.Errorf("backoff %v %v", MaxRedialBackoff, DefaultMaxBackoff)
+	for _, c := range []struct {
+		name      string
+		got, want any
+	}{
+		{"DefaultKeepAlivePeriod", DefaultKeepAlivePeriod, 15 * time.Second},
+		{"keep-alive in effect", time.Duration(cc.KeepAlive), DefaultKeepAlivePeriod},
+		{"DefaultMaxIdleTimeout", DefaultMaxIdleTimeout, 30 * time.Second},
+		{"idle timeout in effect", time.Duration(cc.Local.MaxIdleTimeout) * time.Millisecond, DefaultMaxIdleTimeout},
+		{"DefaultProbeJitter", DefaultProbeJitter, 0.25},
+		{"probe jitter in effect", cc.ProbeJitter, DefaultProbeJitter},
+		{"DefaultMaxRecordSize", DefaultMaxRecordSize, 16382},
+		{"shaping.StartupAllowance", shaping.StartupAllowance, DefaultMaxRecordSize},
+		{"shaping.MinMaxLen", shaping.MinMaxLen, 64},
+		{"MaxRedialBackoff", MaxRedialBackoff, 30 * time.Second},
+		{"DefaultMaxBackoff", DefaultMaxBackoff, 60 * time.Second},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s: %v (%T), want %v (%T)", c.name, c.got, c.got, c.want, c.want)
+		}
 	}
 }

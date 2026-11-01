@@ -22,6 +22,7 @@ func (x *injectShaper) OnEvent(e *shaping.Event, r *shaping.Reply) {
 		r.Inject = &shaping.Inject{Len: x.n}
 	case shaping.EventInjected:
 		x.injected = append(x.injected, e.Len)
+	default: // the other events need no reply
 	}
 }
 

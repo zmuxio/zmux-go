@@ -51,7 +51,7 @@ type PoolDecision struct {
 	// else happens. Zero is none; a negative value is invalid. Pools wait
 	// at least MinRecheck.
 	Recheck time.Duration
-	// ProbeInterval, DisableIdleProbe, ProbeJitter and NoProbeJitter are
+	// ProbeInterval, ProbeJitter, DisableIdleProbe and NoProbeJitter are
 	// set on the pipes a pool dials after this decision, over its
 	// PipeOptions: the zero values keep the pool's (else the session's)
 	// settings; DisableIdleProbe turns their idle probes off and
@@ -64,8 +64,8 @@ type PoolDecision struct {
 	// the whole decision and reports the error to its DecisionRejected
 	// callback.
 	ProbeInterval    time.Duration
-	DisableIdleProbe bool
 	ProbeJitter      float64
+	DisableIdleProbe bool
 	NoProbeJitter    bool
 }
 

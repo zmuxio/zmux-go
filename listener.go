@@ -631,31 +631,38 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint JoinHint) (PipeI
 	stop := context.AfterFunc(ctx, func() { closePipeIO(p) })
 	q, err := wrap(ctx, p, hint)
 	fired := !stop()
-	if err == nil && fired {
-		err = context.Cause(ctx)
-	}
-	if err == nil && q.R == nil && q.W == nil {
-		err = errors.New("no pipe halves")
-	}
-	if err == nil {
-		err = q.checkOverhead()
-	}
 	if err != nil {
-		markTaken(p) // what the layer read is no longer a request to hand on
-		if q.R != nil || q.W != nil {
-			closePipeIO(q)
-		}
-		if !fired {
-			closePipeIO(p)
-		}
-		l.CountSetupFailure()
-		return PipeIO{}, fmt.Errorf("zmux: WrapPipe: %w", err)
+		// Halves a failing layer returned anyway are closed too.
+		return l.wrapFailed(p, q, fired, err)
+	}
+	if fired {
+		return l.wrapFailed(p, q, fired, context.Cause(ctx))
+	}
+	if q.R == nil && q.W == nil {
+		return l.wrapFailed(p, q, fired, errors.New("no pipe halves"))
+	}
+	if err := q.checkOverhead(); err != nil {
+		return l.wrapFailed(p, q, fired, err)
 	}
 	if any(q.R) != any(p.R) || any(q.W) != any(p.W) {
 		markTaken(p)
 	}
 	q.Carrier, q.Label, q.FateGroup = p.Carrier, p.Label, p.FateGroup
 	return q, nil
+}
+
+// wrapFailed closes what wrapPipe holds after err: q's halves, and p
+// unless the bound fired (which closed it), and counts a setup failure.
+func (l *Listener) wrapFailed(p, q PipeIO, fired bool, err error) (PipeIO, error) {
+	markTaken(p) // what the layer read is no longer a request to hand on
+	if q.R != nil || q.W != nil {
+		closePipeIO(q)
+	}
+	if !fired {
+		closePipeIO(p)
+	}
+	l.CountSetupFailure()
+	return PipeIO{}, fmt.Errorf("zmux: WrapPipe: %w", err)
 }
 
 // handleAdmitted is HandlePipe for an admitted carrier.

@@ -69,7 +69,7 @@ func decodeValue(dec *json.Decoder) (any, error) {
 			}
 			return o, nil
 		case '[':
-			a := []any{}
+			var a []any // [] is still a []any, not the nil of null
 			for dec.More() {
 				v, err := decodeValue(dec)
 				if err != nil {

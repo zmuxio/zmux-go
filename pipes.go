@@ -37,9 +37,6 @@ type PipeOptions struct {
 	// Probation is the base of the pipe's probation. Zero is the
 	// session's; a negative value is invalid.
 	Probation time.Duration
-	// NoProbation turns the pipe's probation off; Probation must then be
-	// zero.
-	NoProbation bool
 	// Label names the pipe in statistics.
 	Label string
 	// ReceivePriority is the tier requested for the peer's outbound
@@ -67,6 +64,9 @@ type PipeOptions struct {
 	ProbeJitter float64
 	// NoProbeJitter makes the pipe's j 0, the fixed schedule.
 	NoProbeJitter bool
+	// NoProbation turns the pipe's probation off; Probation must then be
+	// zero.
+	NoProbation bool
 	// Direction from the local endpoint: DirBidirectional (the zero
 	// value), DirSendOnly (an uplink) or DirReceiveOnly (a downlink).
 	Direction Direction

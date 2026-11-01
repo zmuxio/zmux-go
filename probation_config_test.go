@@ -30,8 +30,11 @@ func TestProbationSettings(t *testing.T) {
 			}
 			continue
 		}
-		if err != nil || cc.Probation != x.want {
-			t.Fatalf("%+v: probation %v, %v", x.p, cc.Probation, err)
+		if err != nil {
+			t.Fatalf("%+v: %v", x.p, err)
+		}
+		if cc.Probation != x.want {
+			t.Fatalf("%+v: probation %v", x.p, cc.Probation)
 		}
 	}
 	for _, x := range []struct {
@@ -52,8 +55,11 @@ func TestProbationSettings(t *testing.T) {
 			}
 			continue
 		}
-		if err != nil || (j.Probation == nil) != (x.want == nil) || j.Probation != nil && *j.Probation != *x.want {
-			t.Fatalf("%+v: probation %v, %v", x.o, j.Probation, err)
+		if err != nil {
+			t.Fatalf("%+v: %v", x.o, err)
+		}
+		if (j.Probation == nil) != (x.want == nil) || j.Probation != nil && *j.Probation != *x.want {
+			t.Fatalf("%+v: probation %v", x.o, j.Probation)
 		}
 	}
 }

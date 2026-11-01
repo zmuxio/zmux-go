@@ -476,6 +476,9 @@ func (a *Arrival) Admit(ctx context.Context, p PipeIO, fallback func(context.Con
 		} else {
 			a.stallPipe(ctx, p, false)
 		}
+	default:
+		// VerdictStall, VerdictClose and a failed handshake: admitPipe
+		// has acted.
 	}
 	return PipeIO{}, false
 }
@@ -497,9 +500,9 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 	adm := l.cfg.Admission
 	ctx, cancel := l.stopContext(ctx)
 	defer cancel()
-	if hs := tlsPending(p); hs != nil {
+	if handshake := pendingHandshake(p); handshake != nil {
 		hctx, hcancel := timeshim.WithTimeout(ctx, l.clk, l.cfg.Config.handshakeTimeout())
-		err := hs.HandshakeContext(hctx)
+		err := handshake(hctx)
 		hcancel()
 		if err != nil {
 			closePipeIO(p)
@@ -532,17 +535,19 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 	case VerdictStall:
 		a.stallPipe(ctx, p, true)
 		return PipeIO{}, nil, VerdictStall
+	default: // VerdictClose
+		closePipeIO(p)
+		a.Release()
+		return PipeIO{}, nil, VerdictClose
 	}
-	closePipeIO(p)
-	a.Release()
-	return PipeIO{}, nil, VerdictClose
 }
 
-// tlsPending is p's TLS connection whose handshake has not completed.
-func tlsPending(p PipeIO) *tls.Conn {
+// pendingHandshake is the HandshakeContext of p's TLS connection whose
+// handshake has not completed, nil without one. The connection stays p's.
+func pendingHandshake(p PipeIO) func(context.Context) error {
 	for _, x := range []any{p.R, p.W} {
 		if tc, ok := x.(*tls.Conn); ok && !tc.ConnectionState().HandshakeComplete {
-			return tc
+			return tc.HandshakeContext
 		}
 	}
 	return nil
@@ -619,6 +624,8 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 		l.st.adm.accepted.Add(1)
 	case VerdictFallback:
 		l.st.adm.fallback.Add(1)
+	case VerdictStall:
+		// Counted by stallSlot.
 	case VerdictClose:
 		l.st.adm.closed.Add(1)
 	}

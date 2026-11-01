@@ -35,8 +35,8 @@ func tcpUnsent(fd uintptr) (uint64, bool) {
 	return uint64(max(n, 0)), e == 0
 }
 
-// tcpRetransBits is the width of the count tcpRetrans reads.
-const tcpRetransBits = 64
+// retransCounter widens the count tcpRetrans reads: nil, it is 64 bits.
+func retransCounter() *counter32 { return nil }
 
 // tcpRetrans reads tcpi_bytes_retrans (offset 208 of struct tcp_info,
 // Linux 4.19 and later).

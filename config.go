@@ -207,8 +207,6 @@ type SchedulerParams struct {
 	// Probation is the base of a pipe's probation. Zero is the default
 	// (from the RTT and the pipe's history); a negative value is invalid.
 	Probation time.Duration
-	// NoProbation turns probation off; Probation must then be zero.
-	NoProbation bool
 	// OverflowDelay is how long higher tiers stay saturated before a
 	// lower tier takes data. Zero is 1 s; a negative value is invalid.
 	OverflowDelay time.Duration
@@ -229,13 +227,15 @@ type SchedulerParams struct {
 	// the first one of pipe 0 from [0, k_eff]. Zero is 0.25; a jitter of 0
 	// takes NoProbeJitter.
 	ProbeJitter float64
+	// SpreadChunk is the unit the spreading policies split data into. Zero
+	// is 16 KiB; a negative value is invalid.
+	SpreadChunk int
+	// NoProbation turns probation off; Probation must then be zero.
+	NoProbation bool
 	// NoProbeJitter makes j 0, the fixed schedule.
 	NoProbeJitter bool
 	// NoRedundancy turns redundancy off.
 	NoRedundancy bool
-	// SpreadChunk is the unit the spreading policies split data into. Zero
-	// is 16 KiB; a negative value is invalid.
-	SpreadChunk int
 }
 
 // EarlyData lets a client send stream data before the server's transport

@@ -14,6 +14,7 @@ func tcpMinRTT(_ uintptr) (time.Duration, bool) { return 0, false }
 // tcpUnsent: the platform reports no count of unsent bytes alone.
 func tcpUnsent(uintptr) (uint64, bool) { return 0, false }
 
-const tcpRetransBits = 64
+// retransCounter widens the count tcpRetrans reads: nil, it is 64 bits.
+func retransCounter() *counter32 { return nil }
 
 func tcpRetrans(uintptr) (uint64, bool) { return 0, false }

@@ -31,8 +31,8 @@ func tcpMinRTT(fd uintptr) (time.Duration, bool) {
 // tcpUnsent: the platform reports no count of unsent bytes alone.
 func tcpUnsent(uintptr) (uint64, bool) { return 0, false }
 
-// tcpRetransBits is the width of the count tcpRetrans reads.
-const tcpRetransBits = 32
+// retransCounter widens the 32-bit count tcpRetrans reads.
+func retransCounter() *counter32 { return &counter32{} }
 
 // tcpRetrans reads BytesRetrans of TCP_INFO_v0 through WSAIoctl, a 32-bit
 // count that tcpInfo widens. TCP_INFO_v1 and v2 keep the same 32-bit
