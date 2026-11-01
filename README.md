@@ -133,6 +133,16 @@ Both endpoints set `MaxPipes` above 1 and a join secret; the server uses a
 of the innermost end-to-end handshake of the first pipe (`zmux.Exporter`: a
 carrier transform's own, or TLS that this process terminates, its handshake
 done or still running), read when the peer's parameters arrive.
+`PipeAuth.DeferredPSK` sends the PSK flag but takes the key later, for
+example once the application authenticated the peer over the session:
+`conn.SetJoinSecret(psk)` (once, at least 16 bytes) derives the join keys.
+Until then `AddPipe` fails with `ErrJoinSecretPending`, the peer's joins
+wait at most `HandshakeTimeout` (`ConnectionStats.JoinSecretPending`) and
+the session cannot resume. The peer may hold the same bytes as a static
+`PSK`. `ListenerConfig.SessionConfig` picks each new session's `Config`,
+for example `Exporter` where `zmux.TerminatedTLS` reports TLS ended here
+and `DeferredPSK` otherwise, or its `ShapingLimits`; `Conn.SetShapingLimits`
+replaces them while the session runs.
 
 ```go
 cfg := &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: psk}}

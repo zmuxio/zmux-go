@@ -128,16 +128,21 @@ func TestExporterTLSBeforeHandshake(t *testing.T) {
 	}
 	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
 	echoOnce(t, ctx, c, s)
-	// A join binds to its carrier's exporter when it starts: that
-	// handshake must have run.
+	// A carrier-bound join over a TLS client whose handshake has not
+	// run: AddPipe runs it before reading the exporter.
 	jc := pair()
-	if err := jc.HandshakeContext(ctx); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := c.AddPipe(ctx, NetPipe(jc), PipeOptions{CarrierBound: true}); err != nil {
 		t.Fatalf("carrier-bound join: %v", err)
 	}
 	echoOnce(t, ctx, c, s)
+	// A handshake that fails fails the join.
+	a, b := tcpPair(t)
+	go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), JoinHint{}) }()
+	bad := tls.Client(b, &tls.Config{ServerName: "elsewhere.invalid"})
+	if _, err := c.AddPipe(ctx, NetPipe(bad), PipeOptions{CarrierBound: true}); err == nil ||
+		!strings.Contains(err.Error(), "carrier handshake") {
+		t.Fatalf("join over a failing handshake: %v", err)
+	}
 }
 
 // earlyKM is a server carrier whose join arrived as early data: its

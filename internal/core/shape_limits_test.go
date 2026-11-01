@@ -176,3 +176,31 @@ func TestShapingInjectWaitsForBatchRoom(t *testing.T) {
 		t.Fatalf("clamped %d", c)
 	}
 }
+
+// SetShapeLimits applies to the records planned after it: a tightened
+// ratio bounds the room by the padding already spent (not undone), and a
+// loosened one restores it.
+func TestShapingSetLimitsRuntime(t *testing.T) {
+	s, _, _ := injectSession(t, shaping.Limits{MaxPaddingRatio: 0.5}, 0)
+	s.shapeSess()
+	s.shp.stats.PaddingBytes = 2 * shaping.StartupAllowance
+	s.stats.BytesSent = 10 * shaping.StartupAllowance
+	if _, r := s.padRoom(); r == 0 {
+		t.Fatal("no room under 0.5")
+	}
+	s.SetShapeLimits(shaping.Limits{MaxPaddingRatio: 0.1})
+	if _, r := s.padRoom(); r != 0 {
+		t.Fatalf("room %d past a tightened ratio", r)
+	}
+	if s.shp.stats.PaddingBytes != 2*shaping.StartupAllowance {
+		t.Fatal("spent padding reset")
+	}
+	s.SetShapeLimits(shaping.Limits{MaxPaddingRatio: 0.5})
+	if _, r := s.padRoom(); r == 0 {
+		t.Fatal("no room after loosening")
+	}
+	s.SetShapeLimits(shaping.Limits{MaxPaddingBytes: 2 * shaping.StartupAllowance})
+	if h, _ := s.padRoom(); h != 0 {
+		t.Fatalf("hard room %d past MaxPaddingBytes", h)
+	}
+}

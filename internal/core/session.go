@@ -90,7 +90,9 @@ type Session struct {
 	actions           []Action
 	closedW           []*Signal
 	estW              []*Signal
-	bcast             *Signal // session-level broadcast for waits that watch state
+	keyW              []*Signal // joins held until the deferred PSK derives the join keys
+	secretSet         bool      // SetJoinSecret supplied the deferred PSK
+	bcast             *Signal   // session-level broadcast for waits that watch state
 	stats             Stats
 	greaseFirst       bool
 	closedEmitted     bool
@@ -148,6 +150,7 @@ type Stats struct {
 	PipeFailures           uint64
 	JoinAuthFailures       uint64
 	JoinReplays            uint64
+	JoinSecretPending      uint64 // peer joins held for the deferred PSK
 	JoinRefusals           uint64 // own joins refused with ZMUX_PIPE_RESOURCE_LIMIT
 	Suspensions            uint64
 	SuspendedTime          Duration // the current suspension excluded (SessionStats adds it)

@@ -34,6 +34,17 @@ type MessageReader interface {
 	ReadMessage() ([]byte, error)
 }
 
+// MessageLimitReader is an optional capability of a MessageReader:
+// ReadMessageLimit returns the next message when it holds at most limit
+// bytes, and fails with ErrMessageTooLarge for a longer one after reading
+// no more than limit+1 of its bytes into memory (the carrier is then
+// unusable). The admission of a listener reads a first message with it
+// (Admission.Peek, MaxPeek); without it, the message is read whole, up
+// to the carrier's own limit, and then checked.
+type MessageLimitReader interface {
+	ReadMessageLimit(limit int) ([]byte, error)
+}
+
 // MessageWriter is the sending half of a message-framed carrier.
 type MessageWriter interface {
 	// WriteMessage writes one whole message.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -363,4 +364,62 @@ func TestEarlyCarrierRejectedStop(t *testing.T) {
 		return err != nil
 	})
 	echoOnce(t, ctx, c, s)
+}
+
+// failingRestart is an earlyLayer whose RestartEarly fails, the carrier
+// itself staying writable.
+type failingRestart struct{ *earlyLayer }
+
+func (l failingRestart) RestartEarly(context.Context) (PipeIO, error) {
+	l.restarts.Add(1)
+	l.mu.Lock()
+	l.state = 1
+	l.mu.Unlock()
+	return PipeIO{}, errors.New("no restart")
+}
+
+// A failed restart still writes the CONNECTION_CLOSE on the carrier: the
+// peer sees why the session ended.
+func TestEarlyCarrierRestartFailsClose(t *testing.T) {
+	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a, b := net.Pipe()
+	layer := failingRestart{&earlyLayer{Conn: a, verdict: make(chan bool, 1)}}
+	c, err := Start(ctx, PipeIO{R: a, W: layer}, RoleClient, earlyFloorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := c.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Write([]byte("early")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, "the first flight", func() bool {
+		layer.mu.Lock()
+		defer layer.mu.Unlock()
+		return len(layer.held) > 0
+	})
+	ch := make(chan error, 1)
+	go func() {
+		s, err := Start(ctx, NetPipe(b), RoleServer, mpConfig())
+		if err != nil {
+			ch <- err
+			return
+		}
+		ch <- s.Wait()
+	}()
+	layer.decide(false)
+	select {
+	case err := <-ch:
+		if err == nil || !strings.Contains(err.Error(), "(remote): early data restart failed") {
+			t.Fatalf("server ended with %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the server never saw the close")
+	}
+	waitDone(t, c)
+	_ = st
 }

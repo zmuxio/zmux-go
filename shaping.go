@@ -66,6 +66,30 @@ func (c *Conn) SetPipeShaper(pipe uint64, s shaping.Shaper) bool {
 	return c.s.SetPipeShaper(pipe, s)
 }
 
+// SetShapingLimits replaces the session's Config.ShapingLimits: records
+// planned from then on follow l, whether shaping is installed yet or not.
+// Limits may be tightened or loosened (they bound this endpoint's own
+// overhead and are never sent). Padding and pause already spent stay
+// counted: past a tightened bound nothing more is padded or paused, and
+// nothing already sent is undone. An invalid l fails with
+// ErrInvalidConfig and changes nothing.
+func (c *Conn) SetShapingLimits(l shaping.Limits) error {
+	if err := checkLimits(&l); err != nil {
+		return err
+	}
+	c.lock()
+	defer c.unlock()
+	c.s.SetShapeLimits(l)
+	return nil
+}
+
+// ShapingLimits returns the session's shaping limits.
+func (c *Conn) ShapingLimits() shaping.Limits {
+	c.lock()
+	defer c.unlock()
+	return c.s.ShapeLimits()
+}
+
 // ShapingStats returns the shaping counters.
 func (c *Conn) ShapingStats() shaping.Stats {
 	c.lock()

@@ -46,27 +46,32 @@ func (i InState) String() string { return inStateNames[i] }
 
 type multiPath struct {
 	keyOwn, keyPeer []byte
-	locator         []byte // our locator (what the peer puts in PIPE_JOIN)
-	peerLocator     []byte
-	nextID          uint64          // next own pipe ID
-	cap             int             // unretired attachments of the peer we keep
-	ownCap          int             // unretired attachments we joined ourselves
-	replayW         uint64          // W
-	h               uint64          // highest verified peer pipe ID
-	bits            map[uint64]bool // replay bits of peer IDs without state
-	pendAbandon     map[uint64]bool // PIPE_ABANDON owed for IDs without state
-	pendCode        map[uint64]uint64
-	backoffUntil    Time
-	backoffExp      int
-	pingTimes       [8]Time // send times of the last 8 PIPE_PINGs
-	pingIdx         int
-	pingCount       int
-	redundantAt     Time   // when the redundant snapshot copy is due
-	busyUntil       Time   // traffic frames within the busy window
-	stateGen        uint64 // counts pipe state changes (mpHandleTimeout)
-	retained        uint64 // unacknowledged stream bytes
-	hSet            bool   // h is set
-	ackChanged      bool   // snapshot changed since the last copy
+	// exporter is the exporter value read at establishment, kept only
+	// while keysPending: the join keys wait for the deferred PSK.
+	exporter     []byte
+	keysPending  bool
+	usePSK       bool   // the negotiation selected the PSK (P)
+	locator      []byte // our locator (what the peer puts in PIPE_JOIN)
+	peerLocator  []byte
+	nextID       uint64          // next own pipe ID
+	cap          int             // unretired attachments of the peer we keep
+	ownCap       int             // unretired attachments we joined ourselves
+	replayW      uint64          // W
+	h            uint64          // highest verified peer pipe ID
+	bits         map[uint64]bool // replay bits of peer IDs without state
+	pendAbandon  map[uint64]bool // PIPE_ABANDON owed for IDs without state
+	pendCode     map[uint64]uint64
+	backoffUntil Time
+	backoffExp   int
+	pingTimes    [8]Time // send times of the last 8 PIPE_PINGs
+	pingIdx      int
+	pingCount    int
+	redundantAt  Time   // when the redundant snapshot copy is due
+	busyUntil    Time   // traffic frames within the busy window
+	stateGen     uint64 // counts pipe state changes (mpHandleTimeout)
+	retained     uint64 // unacknowledged stream bytes
+	hSet         bool   // h is set
+	ackChanged   bool   // snapshot changed since the last copy
 
 	// Scheduler.
 	gateBuf      gate
@@ -197,31 +202,26 @@ type attach struct {
 // A failed read of the exporter is the session's INTERNAL_ERROR.
 func (s *Session) startMultipath() *wire.Error {
 	l, p := &s.cfg.Local, &s.peer
-	var exporter, psk []byte
 	sel := l.SecretFlags & p.SecretFlags
+	m := &multiPath{locator: l.Locator, peerLocator: p.Locator, bits: map[uint64]bool{},
+		pendAbandon: map[uint64]bool{}, usePSK: sel&wire.SecretPSK != 0}
 	if sel&wire.SecretExporter != 0 && s.cfg.Exporter != nil {
 		b, err := s.cfg.Exporter()
 		if err != nil {
 			return &wire.Error{Code: wire.InternalError, Reason: "exporter: " + err.Error()}
 		}
-		exporter = b
+		m.exporter = b
 	}
-	m := &multiPath{locator: l.Locator, peerLocator: p.Locator, bits: map[uint64]bool{},
-		pendAbandon: map[uint64]bool{}}
-	if sel&wire.SecretPSK != 0 {
-		psk = s.cfg.PSK
-	}
-	initN, respN := l.SessionNonce[:], p.SessionNonce[:]
-	if s.role == RoleResponder {
-		initN, respN = respN, initN
-	}
-	ki, kr := wire.JoinKeys(wire.SessionSecret(initN, respN, exporter, psk))
 	if s.role == RoleInitiator {
-		m.keyOwn, m.keyPeer = ki, kr
 		m.nextID = 2
 	} else {
-		m.keyOwn, m.keyPeer = kr, ki
 		m.nextID = 1
+	}
+	s.mp = m
+	if m.usePSK && s.cfg.DeferredPSK && !s.secretSet {
+		m.keysPending = true
+	} else {
+		s.deriveKeys()
 	}
 	maxPipes := max(1, s.cfg.MaxPipes)
 	m.cap = maxPipes + s.cfg.Headroom
@@ -238,7 +238,6 @@ func (s *Session) startMultipath() *wire.Error {
 		m.h, m.hSet = 0, true
 	}
 	m.busyUntil = s.now.Add(15 * Second)
-	s.mp = m
 	for _, pp := range s.pipes {
 		a := &attach{joinerLocal: s.role == RoleInitiator, dir: 2, out: OutActive, in: InOpen,
 			attachedAt: s.now, liveAt: s.now, lastAdvance: s.now, lastRecord: s.now, weight: 1, probOpt: -1}
@@ -247,6 +246,78 @@ func (s *Session) startMultipath() *wire.Error {
 		pp.mp = a
 	}
 	return nil
+}
+
+// deriveKeys derives the join keys (MULTIPATH.md 10.3, 10.4) from the
+// exporter read at establishment and the PSK, when the negotiation
+// selected them; it is the only derivation, at establishment or when the
+// deferred PSK arrives.
+func (s *Session) deriveKeys() {
+	m := s.mp
+	var psk []byte
+	if m.usePSK {
+		psk = s.cfg.PSK
+	}
+	initN, respN := s.cfg.Local.SessionNonce[:], s.peer.SessionNonce[:]
+	if s.role == RoleResponder {
+		initN, respN = respN, initN
+	}
+	ki, kr := wire.JoinKeys(wire.SessionSecret(initN, respN, m.exporter, psk))
+	if s.role == RoleInitiator {
+		m.keyOwn, m.keyPeer = ki, kr
+	} else {
+		m.keyOwn, m.keyPeer = kr, ki
+	}
+	m.exporter, m.keysPending = nil, false
+}
+
+// SetJoinSecret supplies the deferred PSK (Config.DeferredPSK): once
+// the negotiation selected it, the join keys are derived and the held
+// peer joins go on. Before establishment the PSK is kept for it.
+func (s *Session) SetJoinSecret(psk []byte) error {
+	if s.isClosing() {
+		return s.err
+	}
+	if s.secretSet {
+		return ErrJoinSecretSet
+	}
+	if s.peerSeen && (s.mp == nil || !s.mp.usePSK) {
+		return ErrNotNegotiated
+	}
+	s.cfg.PSK, s.secretSet = append([]byte(nil), psk...), true
+	if s.mp != nil && s.mp.keysPending {
+		s.deriveKeys()
+		s.emit(Event{Kind: EvJoinKeys})
+		for _, w := range s.keyW {
+			s.wake(w)
+		}
+		s.keyW = nil
+	}
+	return nil
+}
+
+// JoinSecretPending reports whether the join keys wait for the deferred
+// PSK.
+func (s *Session) JoinSecretPending() bool { return s.mp != nil && s.mp.keysPending }
+
+// WaitJoinKeys registers sig until the join keys exist or the session
+// closes; it reports true when that is already so.
+func (s *Session) WaitJoinKeys(sig *Signal) bool {
+	if !s.JoinSecretPending() || s.isClosing() {
+		return true
+	}
+	s.keyW = append(s.keyW, sig)
+	return false
+}
+
+// UnwaitJoinKeys removes sig registered by WaitJoinKeys.
+func (s *Session) UnwaitJoinKeys(sig *Signal) {
+	for i, w := range s.keyW {
+		if w == sig {
+			s.keyW = append(s.keyW[:i], s.keyW[i+1:]...)
+			return
+		}
+	}
 }
 
 // initialRTT is the RFC 9002 initial estimate, or the test hook's.

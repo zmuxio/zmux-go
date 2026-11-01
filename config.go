@@ -318,8 +318,18 @@ type PipeAuth struct {
 	// proves the handshake end to end, not the presence of TLS.
 	Exporter bool
 	// AllowInsecure allows joins without a secret (tests, protected
-	// networks). It must not be combined with PSK.
+	// networks). It must not be combined with PSK or DeferredPSK.
 	AllowInsecure bool
+	// DeferredPSK offers a PSK (the P flag) that the application supplies
+	// after establishment with Conn.SetJoinSecret, for example once it
+	// authenticated the peer over the session. Until then no join key
+	// exists: local joins fail with ErrJoinSecretPending and the peer's
+	// joins are held (ConnectionStats.JoinSecretPending) for at most
+	// HandshakeTimeout, then closed silently; a session that loses its
+	// pipes before the secret cannot resume. It combines with Exporter
+	// as a static PSK does, and the peer may have the same bytes as a
+	// static PSK. It must not be combined with PSK or AllowInsecure.
+	DeferredPSK bool
 }
 
 // Clone returns a shallow copy (nil means defaults): slices such as
@@ -538,19 +548,23 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	if a.AllowInsecure && len(a.PSK) > 0 {
 		return cc, fmt.Errorf("%w: AllowInsecure with a PSK", ErrInvalidConfig)
 	}
+	if a.DeferredPSK && (len(a.PSK) > 0 || a.AllowInsecure) {
+		return cc, fmt.Errorf("%w: DeferredPSK with a PSK or AllowInsecure", ErrInvalidConfig)
+	}
+	cc.DeferredPSK = a.DeferredPSK
 	if len(a.PSK) > 0 && len(a.PSK) < 16 {
 		return cc, fmt.Errorf("%w: PSK shorter than 16 bytes", ErrInvalidConfig)
 	}
 	cc.PSK = a.PSK
 	if cc.MaxPipes > 1 || cc.Resume > 0 {
-		if !a.Exporter && len(a.PSK) == 0 && !a.AllowInsecure {
+		if !a.Exporter && len(a.PSK) == 0 && !a.DeferredPSK && !a.AllowInsecure {
 			return cc, fmt.Errorf("%w: multipath needs PipeAuth", ErrInvalidConfig)
 		}
 		l.Has |= wire.HasMultipath
 		if a.Exporter {
 			l.SecretFlags |= wire.SecretExporter
 		}
-		if len(a.PSK) > 0 {
+		if len(a.PSK) > 0 || a.DeferredPSK {
 			l.SecretFlags |= wire.SecretPSK
 		}
 		if a.AllowInsecure {

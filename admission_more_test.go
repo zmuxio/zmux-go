@@ -373,3 +373,96 @@ func TestAdmissionVariantBound(t *testing.T) {
 		t.Fatal("a nil listener has variants")
 	}
 }
+
+// limitMsgCarrier is a firstMsgCarrier with ReadMessageLimit; ReadMessage
+// must not be used.
+type limitMsgCarrier struct {
+	*firstMsgCarrier
+	limits []int
+	whole  bool
+}
+
+func (m *limitMsgCarrier) ReadMessage() ([]byte, error) {
+	m.whole = true
+	return m.firstMsgCarrier.ReadMessage()
+}
+
+func (m *limitMsgCarrier) ReadMessageLimit(limit int) ([]byte, error) {
+	m.limits = append(m.limits, limit)
+	b, err := m.firstMsgCarrier.ReadMessage()
+	if len(b) > limit {
+		return nil, ErrMessageTooLarge
+	}
+	return b, err
+}
+
+// The first message is read with the admission's bound,
+// max(Peek, MaxPeek), where the carrier can bound the read: a longer one
+// is refused before Decide.
+func TestAdmissionFirstMessageLimit(t *testing.T) {
+	leakcheck.Check(t)
+	msg := bytes.Repeat([]byte{1}, 40)
+	for _, x := range []struct {
+		adm              *Admission
+		accepted, closed uint64
+	}{
+		{&Admission{Peek: 1, MaxPeek: 39, Decide: seq(Decision{Verdict: VerdictAccept})}, 0, 1},
+		{&Admission{Peek: 1, MaxPeek: 40, Decide: seq(Decision{Verdict: VerdictAccept})}, 1, 0},
+	} {
+		var seen []int
+		var m *limitMsgCarrier
+		st, _ := admitOnce(t, x.adm, func() (PipeIO, func()) {
+			m = &limitMsgCarrier{firstMsgCarrier: newFirstMsgCarrier(msg)}
+			return PipeIO{R: m, W: m, Framing: FramingRecords}, func() { _ = m.Close() }
+		}, &seen)
+		if st.Accepted != x.accepted || st.Closed != x.closed {
+			t.Fatalf("MaxPeek %d: stats %+v", x.adm.MaxPeek, st)
+		}
+		if len(m.limits) == 0 || m.limits[0] != x.adm.MaxPeek {
+			t.Fatalf("MaxPeek %d: limits %v, whole read %v", x.adm.MaxPeek, m.limits, m.whole)
+		}
+	}
+}
+
+// A partial Skip of a first message is counted once, as a close: a
+// concurrent snapshot never sees it accepted.
+func TestAdmissionPartialSkipCountedOnce(t *testing.T) {
+	leakcheck.Check(t)
+	adm := &Admission{Peek: 1, MaxPeek: 64, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+		return Decision{Verdict: VerdictAccept, Skip: 3, Variant: "w"}
+	}}
+	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
+	defer func() { _ = lst.Close() }()
+	stop := make(chan struct{})
+	bad := make(chan string, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				close(bad)
+				return
+			default:
+			}
+			if st := lst.Stats().Admission; st.Accepted != 0 {
+				bad <- "accepted"
+				return
+			}
+			if v := variantNamed(lst.VariantStats(), "w"); v.Accepted != 0 {
+				bad <- "variant accepted"
+				return
+			}
+		}
+	}()
+	for range 20 {
+		m := newFirstMsgCarrier(bytes.Repeat([]byte{1}, 40))
+		_ = lst.HandlePipe(context.Background(), PipeIO{R: m, W: m, Framing: FramingRecords}, JoinHint{})
+		_ = m.Close()
+	}
+	close(stop)
+	if s, ok := <-bad; ok {
+		t.Fatal(s)
+	}
+	if st := lst.Stats().Admission; st.Closed != 20 {
+		t.Fatalf("stats %+v", st)
+	}
+}

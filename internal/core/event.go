@@ -14,6 +14,8 @@ const (
 	EvDatagramDropped
 	EvOOBJoin
 	EvJoinSecurityUnavailable
+	// EvJoinKeys reports that the deferred PSK derived the join keys.
+	EvJoinKeys
 	// EvTierSaturation reports that a tier (priority in Code) entered or left saturation.
 	EvTierSaturation
 	// EvPipePriority reports that the effective priority (Code), standby flag

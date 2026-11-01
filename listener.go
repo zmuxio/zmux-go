@@ -124,6 +124,22 @@ type ListenerConfig struct {
 	// (MessageBatchWriter) counts as one write, which the layer may turn
 	// into one write of p.
 	WrapPipe func(ctx context.Context, p PipeIO, hint JoinHint) (PipeIO, error)
+	// SessionConfig, when set, is called once for every carrier that
+	// starts a new session (not for joins), outside every lock, with the
+	// carrier's info (Source, Peer, and TLS where this process terminated
+	// it, as TerminatedTLS reports) and its admission's Decision.Value.
+	// It returns the Config of that session, such as PipeAuth.Exporter
+	// where TLS ends here and PipeAuth.DeferredPSK where it ends at an
+	// intermediary, or per-session ShapingLimits; nil selects Config.
+	// Joins to the session verify with its own Config. The listener-level
+	// settings stay the listener's: ListenerConfig.MemoryBudget replaces
+	// the returned MemoryBudget as it replaces Config's, the carrier-level
+	// bounds (split pairing, the handshake of a join in early data,
+	// WrapPipe) use Config.HandshakeTimeout, and the returned Clock must
+	// be nil or Config's. A returned Config that violates that or is
+	// invalid for a server session (ErrInvalidConfig), an error and a
+	// panic close the carrier without a byte, counted as rejected.
+	SessionConfig func(ctx context.Context, info *CarrierInfo, admitted any) (*Config, error)
 }
 
 // Listener defaults that zmux itself does not recommend (MULTIPATH.md 5.6
@@ -712,7 +728,7 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint JoinHint, 
 	switch cls {
 	case core.ClassSession:
 		release()
-		return l.startSession(ctx, withPrefix(p, first), hint.Admitted)
+		return l.startSession(ctx, withPrefix(p, first), hint.Admitted, hint.Source)
 	case core.ClassJoin:
 		body := first
 		if p.Framing == FramingByteStream {
@@ -836,9 +852,15 @@ func readFirstRecord(p PipeIO) ([]byte, core.Class, error) {
 }
 
 // startSession starts a server session on a carrier whose first record is
-// QX_TRANSPORT_PARAMETERS; admitted is the carrier's admission value.
-func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any) error {
-	cfg := l.cfg.Config.Clone()
+// QX_TRANSPORT_PARAMETERS; admitted is the carrier's admission value,
+// src its JoinHint.Source.
+func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src netip.AddrPort) error {
+	cfg, err := l.sessionConfig(ctx, p, admitted, src)
+	if err != nil {
+		closePipeIO(p)
+		l.st.rejected.Add(1)
+		return err
+	}
 	cc, err := cfg.coreConfig(core.RoleResponder, core.RoleResponder)
 	if err != nil {
 		closePipeIO(p)
@@ -886,6 +908,45 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any) err
 	}
 	l.st.sessions.Add(1)
 	return c.waitPipe(ctx, 0)
+}
+
+// sessionConfig is a copy of the Config of a new session on p:
+// ListenerConfig.SessionConfig's, checked against the listener's, or
+// Config.
+func (l *Listener) sessionConfig(ctx context.Context, p PipeIO, admitted any, src netip.AddrPort) (*Config, error) {
+	f := l.cfg.SessionConfig
+	if f == nil {
+		return l.cfg.Config.Clone(), nil
+	}
+	info := &CarrierInfo{Source: src, Peer: peerOf(p)}
+	if !info.Source.IsValid() {
+		info.Source = info.Peer
+	}
+	if cs, ok := TerminatedTLS(p); ok {
+		info.TLS = &cs
+	}
+	var cfg *Config
+	var err error
+	if !safeCall(func() { cfg, err = f(ctx, info, admitted) }) {
+		err = errors.New("panicked")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("zmux: SessionConfig: %w", err)
+	}
+	if cfg == nil {
+		return l.cfg.Config.Clone(), nil
+	}
+	if c := cfg.clock(); c != nil && !sameClock(c, l.cfg.Config.clock()) {
+		return nil, fmt.Errorf("%w: SessionConfig returned a Clock other than the listener's", ErrInvalidConfig)
+	}
+	return cfg.Clone(), nil
+}
+
+// sameClock reports whether a and b are the same clock (a clock of a
+// type that is not comparable is not).
+func sameClock(a, b timeshim.Clock) (same bool) {
+	defer func() { _ = recover() }()
+	return a == b
 }
 
 // join attaches a carrier that joins a session; inband: its first record
@@ -1132,7 +1193,7 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint JoinHint, src 
 		up, down, admitted = other.p, p, other.admitted
 	}
 	both := PipeIO{R: up.R, W: down.W, Framing: up.Framing, Label: up.Label, Carrier: up.Carrier}
-	err = l.startSession(ctx, both, admitted)
+	err = l.startSession(ctx, both, admitted, hint.Source)
 	other.done <- err
 	close(other.end)
 	// The token stays used while its session lives (no second pairing).

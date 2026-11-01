@@ -117,6 +117,17 @@ func earlyCarrier(p PipeIO, e *EarlyData) (EarlyClientCarrier, bool) {
 	return nil, false
 }
 
+// failRestartLocked closes the session after a failed early-data restart
+// and starts the stopped bootstrap writer again, so that the
+// CONNECTION_CLOSE reaches the peer on the carrier it has.
+func (c *Conn) failRestartLocked(old *pipeDrv, reason string) {
+	c.s.EarlyDiscarded()
+	c.s.Close(uint64(TransportInternalError), []byte(reason))
+	if old != nil && !old.dead && c.pipes[0] == old && old.wstop {
+		c.startWriterLocked(old)
+	}
+}
+
 // earlyVerdict applies the carrier's verdict; on rejection the restart
 // hook is called first, and a hook that fails fails the session. boot is
 // the bootstrap pipe.
@@ -162,7 +173,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	}
 	if err != nil {
 		c.lock()
-		c.s.Close(uint64(TransportInternalError), []byte("early data restart failed"))
+		c.failRestartLocked(old, "early data restart failed")
 		c.unlock()
 		return
 	}
@@ -180,7 +191,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 		// The same carrier past its handshake: its reader goes on, its
 		// writer starts again on the restarted session.
 		if !sameR || !sameW || p.Framing != boot.Framing || !c.s.RestartEarly(carrierInfo(p, old.tcp, false), c.clk.now()) {
-			c.s.Close(uint64(TransportInternalError), []byte("early data restart failed"))
+			c.failRestartLocked(old, "early data restart failed")
 			return
 		}
 		c.startWriterLocked(old)
@@ -192,7 +203,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 		// The verdict contradicts what the early carrier delivered (the
 		// peer's parameters arrived on it): fail rather than mix carriers.
 		closePipeIO(p)
-		c.s.Close(uint64(TransportInternalError), []byte("early data rejected after the peer's parameters"))
+		c.failRestartLocked(old, "early data rejected after the peer's parameters")
 		return
 	}
 	old.dead = true // its goroutines no longer report to the core

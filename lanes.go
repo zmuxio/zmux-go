@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/djylb/timeshim"
+
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
@@ -172,6 +174,13 @@ func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, bind
 				return 0, err
 			}
 			continue
+		case core.JoinSecretWait:
+			c.unlock()
+			if err := c.waitJoinKeys(ctx); err != nil {
+				closePipeIO(p) // silently: no ZMUX_RESUME_FAILED
+				return 0, err
+			}
+			continue
 		case core.JoinRefused:
 			c.unlock()
 			closePipeIO(p)
@@ -181,6 +190,33 @@ func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, bind
 		c.unlock()
 		closePipeIO(p)
 		return 0, errRejected
+	}
+}
+
+// waitJoinKeys waits until the join keys exist (Conn.SetJoinSecret), for
+// at most the handshake timeout.
+func (c *Conn) waitJoinKeys(ctx context.Context) error {
+	sig := core.NewSignal()
+	t := timeshim.NewTimer(c.clk.source(), c.cfg.handshakeTimeout())
+	defer t.Stop()
+	for {
+		c.lock()
+		ready := c.s.WaitJoinKeys(sig)
+		c.unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-sig.C:
+			continue
+		case <-t.C:
+		case <-ctx.Done():
+		case <-c.done:
+		}
+		c.lock()
+		c.s.UnwaitJoinKeys(sig)
+		c.unlock()
+		return errRejected
 	}
 }
 

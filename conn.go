@@ -693,7 +693,10 @@ type ConnectionState struct {
 	PipeAck            bool
 	Resume             bool
 	JoinSecurityAbsent bool
-	PeerIsZmux         bool
+	// JoinSecretPending: the negotiation selected PipeAuth.DeferredPSK and
+	// Conn.SetJoinSecret has not supplied it yet; no join is possible.
+	JoinSecretPending bool
+	PeerIsZmux        bool
 	// PeerGoAway holds the watermarks of the GOAWAY frames received (the
 	// minimum per stream type) and the latest error code; nil while none
 	// was received. EventGoAwayReceived reports each one.
@@ -711,6 +714,32 @@ type GoAway struct {
 	ErrorCode ApplicationErrorCode
 }
 
+// SetJoinSecret supplies the PSK of PipeAuth.DeferredPSK, at least 16
+// bytes, once: the join keys are derived from it (with the exporter when
+// both are selected, MULTIPATH.md 10.3) and the held joins of the peer go
+// on. Called before establishment, the PSK is kept until the negotiation.
+// It fails with ErrInvalidConfig without DeferredPSK or with a shorter
+// PSK, ErrJoinSecretSet when already supplied, ErrNotNegotiated when the
+// negotiation did not select the PSK (the peer offered no P), and with the
+// session's error once it is closed.
+func (c *Conn) SetJoinSecret(psk []byte) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	if !c.cfg.PipeAuth.DeferredPSK {
+		return fmt.Errorf("%w: SetJoinSecret without PipeAuth.DeferredPSK", ErrInvalidConfig)
+	}
+	if len(psk) < 16 {
+		return fmt.Errorf("%w: join secret shorter than 16 bytes", ErrInvalidConfig)
+	}
+	c.lock()
+	defer c.unlock()
+	if c.closing {
+		return c.errLocked()
+	}
+	return apiErr(c.s.SetJoinSecret(psk))
+}
+
 // ConnectionState returns the negotiation results.
 func (c *Conn) ConnectionState() ConnectionState {
 	c.lock()
@@ -724,6 +753,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 	st.Established = c.s.Established()
 	f := c.s.Features()
 	st.Multipath, st.PipeAck, st.Resume, st.JoinSecurityAbsent = f.Multipath, f.PipeAck, f.Resume, f.JoinSecurityUnavailable
+	st.JoinSecretPending = c.s.JoinSecretPending()
 	l := c.s.LocalParams()
 	st.SupportsDatagrams.Local = l.Has&wire.HasDatagram != 0
 	st.SupportsResetAt.Local = l.Has&wire.HasResetAt != 0
@@ -811,9 +841,12 @@ type ConnectionStats struct {
 	PipeFailures     uint64
 	JoinAuthFailures uint64 // joins whose token did not verify
 	JoinReplays      uint64 // joins closed as replays or too late
-	JoinRefusals     uint64 // own joins refused with ZMUX_PIPE_RESOURCE_LIMIT, or answered with ZMUX_RESUME_FAILED
-	Suspensions      uint64
-	SuspendedTime    time.Duration // the current suspension included
+	// JoinSecretPending counts peer joins held for PipeAuth.DeferredPSK
+	// (not join auth failures).
+	JoinSecretPending uint64
+	JoinRefusals      uint64 // own joins refused with ZMUX_PIPE_RESOURCE_LIMIT, or answered with ZMUX_RESUME_FAILED
+	Suspensions       uint64
+	SuspendedTime     time.Duration // the current suspension included
 
 	SchedulerAnswers   uint64 // custom scheduler answers that named a pipe and were applied; Wait is not counted
 	SchedulerFallbacks uint64 // answers replaced by the affinity choice
@@ -844,7 +877,7 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		Reinjections: s.Reinjections, BytesRedundant: s.BytesRedundant, BytesDuplicateReceived: s.BytesDuplicateReceived,
 		SendBuffered: g.SendBuffered, RecvBuffered: g.RecvBuffered, Retained: g.Retained,
 		PipesActive: g.PipesActive, PipesAdded: s.PipesAdded, PipeFailures: s.PipeFailures,
-		JoinAuthFailures: s.JoinAuthFailures, JoinReplays: s.JoinReplays, JoinRefusals: s.JoinRefusals,
+		JoinAuthFailures: s.JoinAuthFailures, JoinReplays: s.JoinReplays, JoinSecretPending: s.JoinSecretPending, JoinRefusals: s.JoinRefusals,
 		Suspensions: s.Suspensions, SuspendedTime: time.Duration(s.SuspendedTime),
 		SchedulerAnswers: s.SchedulerAnswers, SchedulerFallbacks: s.SchedulerFallbacks,
 		FirstFlightTimeouts: c.firstTimeouts}

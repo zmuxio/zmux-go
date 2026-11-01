@@ -629,10 +629,11 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 	}
 	var more func(have []byte, need int) ([]byte, bool)
 	records := p.Framing == FramingRecords
+	tooLong := false
 	if adm.Peek > 0 && p.R != nil {
 		var fired bool
 		if records {
-			prefix, fired = a.peekMessage(p, deadline)
+			prefix, tooLong, fired = a.peekMessage(p, adm.r.maxPeek, deadline)
 		} else {
 			prefix, fired = a.peekPipe(p, prefix, adm.Peek, deadline)
 			more = func(have []byte, need int) ([]byte, bool) { return a.peekPipe(p, have, need, deadline) }
@@ -645,14 +646,10 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 		}
 	}
 	var dd decided
-	if records && len(prefix) > adm.r.maxPeek {
+	if tooLong {
 		dd = decided{a.count(Decision{Verdict: VerdictClose}), prefix}
 	} else {
-		dd = a.decide(ctx, info, prefix, deadline, more)
-		if records && dd.Verdict == VerdictAccept && dd.Skip != 0 && dd.Skip != len(dd.prefix) {
-			// A message is replayed whole or not at all: recount.
-			dd = a.recount(dd, Decision{Verdict: VerdictClose, Variant: dd.Variant})
-		}
+		dd = a.decide(ctx, info, prefix, deadline, more, records)
 	}
 	d := dd.Decision
 	prefix = dd.prefix
@@ -706,22 +703,32 @@ func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (pr
 }
 
 // peekMessage reads the first message of a message-framed p by deadline
-// (none when the carrier ends or its half is no MessageReader).
-func (a *Arrival) peekMessage(p PipeIO, deadline time.Time) (msg []byte, fired bool) {
+// (none when the carrier ends or its half is no MessageReader), at most
+// limit; tooLong: it held more (read no further than limit+1 bytes with a
+// MessageLimitReader).
+func (a *Arrival) peekMessage(p PipeIO, limit int, deadline time.Time) (msg []byte, tooLong, fired bool) {
 	mr, ok := p.R.(MessageReader)
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	var once atomic.Bool
 	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
 		once.Store(true)
 		interruptRead(p)
 	})
-	msg, _ = mr.ReadMessage()
-	if !t.Stop() && once.Load() {
-		return nil, true
+	var err error
+	if lr, ok := p.R.(MessageLimitReader); ok {
+		msg, err = lr.ReadMessageLimit(limit)
+	} else {
+		msg, err = mr.ReadMessage()
 	}
-	return bytes.Clone(msg), false
+	if !t.Stop() && once.Load() {
+		return nil, false, true
+	}
+	if errors.Is(err, ErrMessageTooLarge) || len(msg) > limit {
+		return nil, true, false
+	}
+	return bytes.Clone(msg), false, false
 }
 
 // interruptRead ends a blocked read of p: a passed read deadline where
@@ -742,10 +749,11 @@ type decided struct {
 // decide calls Decide with ctx ending at deadline, outside every lock,
 // again after each VerdictMore with the longer prefix that more reads (nil:
 // VerdictMore is VerdictClose), bounds the result and counts the outcome
-// (a stall's aggregate count is stallSlot's). A decision not returned in
+// (a stall's aggregate count is stallSlot's); whole: the prefix is a
+// message, replayed whole or not at all. A decision not returned in
 // time is VerdictClose.
 func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, deadline time.Time,
-	more func(have []byte, need int) ([]byte, bool)) decided {
+	more func(have []byte, need int) ([]byte, bool), whole bool) decided {
 	l := a.l
 	dctx, cancel := timeshim.WithDeadline(ctx, l.clk, deadline)
 	defer cancel()
@@ -762,7 +770,12 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 			return decided{Decision{Verdict: VerdictClose}, prefix}
 		}
 		if d.Verdict != VerdictMore {
-			return decided{a.count(d.bound(len(prefix))), prefix}
+			d = d.bound(len(prefix))
+			if whole && d.Verdict == VerdictAccept && d.Skip != 0 && d.Skip != len(prefix) {
+				// A message is replayed whole or not at all.
+				d = Decision{Verdict: VerdictClose, Variant: d.Variant}
+			}
+			return decided{a.count(d), prefix}
 		}
 		if more == nil || ended || d.Need <= len(prefix) || d.Need > l.cfg.Admission.r.maxPeek {
 			return decided{a.count(Decision{Verdict: VerdictClose, Variant: d.Variant}), prefix}
@@ -829,19 +842,6 @@ func (a *Arrival) count(d Decision) Decision {
 	}
 	l.st.adm.variant(d.Variant, d.Verdict)
 	return d
-}
-
-// recount replaces a counted acceptance with to.
-func (a *Arrival) recount(from decided, to Decision) decided {
-	l := a.l
-	l.st.adm.accepted.Add(^uint64(0))
-	l.st.adm.mu.Lock()
-	l.st.adm.variants[from.Variant].Accepted--
-	l.st.adm.mu.Unlock()
-	a.mu.Lock()
-	a.value, a.variant = nil, ""
-	a.mu.Unlock()
-	return decided{a.count(to), from.prefix}
 }
 
 // stallSlot counts a stalled carrier of the arrival; ok false: the source
@@ -1160,7 +1160,7 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 		}
 	}
 	info := &CarrierInfo{Source: a.src, Peer: a.peer, TLS: r.TLS, Request: r, Head: head}
-	dd := a.decide(ctx, info, prefix, deadline, more)
+	dd := a.decide(ctx, info, prefix, deadline, more, false)
 	d, prefix := dd.Decision, dd.prefix
 	switch d.Verdict {
 	case VerdictAccept:

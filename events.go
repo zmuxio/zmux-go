@@ -337,6 +337,10 @@ func (c *Conn) drainEventsLocked() {
 		case core.EvPipePriority:
 			q.push(Event{Kind: EventPipePriorityChanged, Pipe: e.Pipe, Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
+		case core.EvJoinKeys:
+			// Joins are possible: maintenance and redial go on.
+			c.needRedial = true
+			c.firePipeWaiters()
 		case core.EvClosed, core.EvDatagramDropped:
 			// The end surfaces through Wait and the drops through the
 			// statistics; neither is a pipe event.

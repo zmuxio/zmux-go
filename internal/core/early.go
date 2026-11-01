@@ -50,6 +50,21 @@ func (s *Session) releaseProvisional() {
 	}
 }
 
+// EarlyDiscarded records that the carrier discarded what pipe 0 wrote
+// (a rejected first flight) when no restart follows: the parameters lead
+// pipe 0's next record again, so that a CONNECTION_CLOSE written there is
+// one the peer can read. Nothing changes once the peer's parameters
+// arrived (the peer saw the flight).
+func (s *Session) EarlyDiscarded() {
+	p := s.pipe(0)
+	if p == nil || s.peerSeen || p.out == nil {
+		return
+	}
+	if l := p.out.lane(0); l != nil {
+		l.tpSent = false
+	}
+}
+
 // RestartEarly restarts the bootstrap pipe after the carrier rejected its
 // early data, on the byte stream the restart hook returned (SPEC.md 6.1.2,
 // Outcome): QX_TRANSPORT_PARAMETERS first, and the early streams' data,

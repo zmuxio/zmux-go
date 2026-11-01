@@ -21,7 +21,6 @@ var zeroPad [wire.MaxRecordSize]byte
 type shapeSess struct {
 	fac   Factory
 	gen   uint64 // bumped by SetShaper; a pipe's instance of an older one is replaced
-	lim   shaping.Limits
 	stats shaping.Stats
 	// marks: send times of the latest records that SPEC.md 9.4.3 rule 1
 	// counts toward a plain QMux peer (PADDING-only records, QX_PING
@@ -65,9 +64,17 @@ type pipeShape struct {
 	injFirst   bool // the injection waited for batch room: it leads the next batch
 }
 
+// SetShapeLimits replaces the session's shaping guardrails (local only,
+// never sent): records planned from now on follow l; what was already
+// padded or paused stays counted.
+func (s *Session) SetShapeLimits(l shaping.Limits) { s.cfg.ShapeLimits = l }
+
+// ShapeLimits returns the session's shaping guardrails.
+func (s *Session) ShapeLimits() shaping.Limits { return s.cfg.ShapeLimits }
+
 func (s *Session) shapeSess() *shapeSess {
 	if s.shp == nil {
-		s.shp = &shapeSess{lim: s.cfg.ShapeLimits}
+		s.shp = &shapeSess{}
 		for i := range s.shp.marks {
 			s.shp.marks[i] = math.MinInt64
 		}
@@ -271,15 +278,15 @@ func (s *Session) shapePause(d Duration) Time {
 	if d <= 0 {
 		return s.now
 	}
-	if sh.lim.NoPause {
+	if s.cfg.ShapeLimits.NoPause {
 		sh.stats.Clamped++
 		return s.now
 	}
-	if m := Duration(sh.lim.MaxDelay); m > 0 && d > m {
+	if m := Duration(s.cfg.ShapeLimits.MaxDelay); m > 0 && d > m {
 		d = m
 		sh.stats.Clamped++
 	}
-	if m := sh.lim.MaxPauseTotal; m > 0 && time.Duration(d) > m-min(sh.stats.PauseTotal, m) {
+	if m := s.cfg.ShapeLimits.MaxPauseTotal; m > 0 && time.Duration(d) > m-min(sh.stats.PauseTotal, m) {
 		d = Duration(m - min(sh.stats.PauseTotal, m))
 		sh.stats.Clamped++
 	}
@@ -442,14 +449,14 @@ func (ps *pipeShape) padFor(n int) int {
 func (s *Session) padRoom() (hard, ratio uint64) {
 	sh := s.shp
 	hard, ratio = math.MaxUint64, math.MaxUint64
-	if sh.lim.NoPadding {
+	if s.cfg.ShapeLimits.NoPadding {
 		return 0, 0
 	}
-	if m := sh.lim.MaxPaddingBytes; m > 0 {
+	if m := s.cfg.ShapeLimits.MaxPaddingBytes; m > 0 {
 		hard = m - min64(sh.stats.PaddingBytes, m)
 	}
-	if r := sh.lim.MaxPaddingRatio; r > 0 || sh.lim.NoPaddingRatio {
-		if sh.lim.NoPaddingRatio {
+	if r := s.cfg.ShapeLimits.MaxPaddingRatio; r > 0 || s.cfg.ShapeLimits.NoPaddingRatio {
+		if s.cfg.ShapeLimits.NoPaddingRatio {
 			r = 0
 		}
 		other := s.stats.BytesSent - min64(s.stats.BytesSent, sh.stats.PaddingBytes)
@@ -567,7 +574,7 @@ func (s *Session) shapeInject(w *recWriter) {
 		return
 	}
 	w.end()
-	if w.closed || !s.peerZmux && !sh.allowed(s.now) || sh.lim.NoInjection || sh.lim.NoPadding || sh.lim.MaxInjected > 0 && sh.stats.Injected >= sh.lim.MaxInjected {
+	if w.closed || !s.peerZmux && !sh.allowed(s.now) || s.cfg.ShapeLimits.NoInjection || s.cfg.ShapeLimits.NoPadding || s.cfg.ShapeLimits.MaxInjected > 0 && sh.stats.Injected >= s.cfg.ShapeLimits.MaxInjected {
 		sh.stats.InjectDropped++
 		return
 	}

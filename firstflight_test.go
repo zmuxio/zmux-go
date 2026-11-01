@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +110,9 @@ func TestHoldFirstFlight(t *testing.T) {
 	if n := c.ConnectionStats().FirstFlightTimeouts; n != 0 {
 		t.Fatalf("FirstFlightTimeouts %d", n)
 	}
+	// A collected handle resets its stream (doc.go, Ownership): st stays
+	// referenced until the server read what it wrote.
+	runtime.KeepAlive(st)
 }
 
 // On a message-framed carrier the first flight is one WriteMessages call.
@@ -145,6 +149,7 @@ func TestHoldFirstFlightMessages(t *testing.T) {
 	if f := bx.first.Load(); f == nil || !bytes.Contains(*f, []byte("hello")) || bx.single.Load() != 0 {
 		t.Fatalf("first batch of %d messages without the stream, %d single writes", bx.firstBatch.Load(), bx.single.Load())
 	}
+	runtime.KeepAlive(st)
 }
 
 // Without a release, the handshake timeout releases the first flight,

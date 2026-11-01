@@ -266,6 +266,14 @@ var (
 	ErrTooLate = errors.New("zmux: too late: the stream's first frame was sent")
 	// ErrInvalidConfig wraps configuration errors.
 	ErrInvalidConfig = errors.New("zmux: invalid configuration")
+	// ErrMessageTooLarge is returned by MessageLimitReader.ReadMessageLimit
+	// for a message above its limit.
+	ErrMessageTooLarge = errors.New("zmux: message too large")
+	// ErrJoinSecretPending is returned by joins of a session whose
+	// PipeAuth.DeferredPSK was not supplied yet (Conn.SetJoinSecret).
+	ErrJoinSecretPending = errors.New("zmux: join secret pending")
+	// ErrJoinSecretSet is returned by a second Conn.SetJoinSecret.
+	ErrJoinSecretSet = errors.New("zmux: join secret already set")
 	// ErrPipeGone is returned by Pipe methods once the session no longer
 	// knows the attachment.
 	ErrPipeGone = errors.New("zmux: pipe gone")
@@ -345,6 +353,10 @@ func apiErr(err error) error {
 		return ErrNotNegotiated
 	case errors.Is(err, core.ErrNotEstablished):
 		return ErrNotEstablished
+	case errors.Is(err, core.ErrJoinSecretPending):
+		return ErrJoinSecretPending
+	case errors.Is(err, core.ErrJoinSecretSet):
+		return ErrJoinSecretSet
 	case errors.Is(err, core.ErrStreamLimit):
 		return &StreamLimitReachedError{}
 	case errors.Is(err, core.ErrTooLate):

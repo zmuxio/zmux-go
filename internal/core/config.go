@@ -69,6 +69,9 @@ type Config struct {
 	ProbeJitter   float64 // 0 <= j < 1 (MULTIPATH.md 7.1); 0: a fixed schedule
 
 	PSK []byte
+	// DeferredPSK: the PSK (P flag) is supplied after establishment
+	// (SetJoinSecret); until then no join key exists.
+	DeferredPSK bool
 	// Exporter reads the exporter of pipe 0's innermost end-to-end
 	// handshake (E flag); called once, while the peer's parameters are
 	// processed; nil: none.

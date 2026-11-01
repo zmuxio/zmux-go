@@ -145,11 +145,11 @@ func (s *Session) probeHold(p *Pipe) Duration {
 	if s.shp == nil || ps == nil || ps.sh == nil || ps.caps&shaping.CapPlan == 0 {
 		return 0
 	}
-	if s.shp.lim.NoPause {
+	if s.cfg.ShapeLimits.NoPause {
 		return 0
 	}
-	h := Duration(s.shp.lim.MaxDelay)
-	if m := s.shp.lim.MaxPauseTotal; m > 0 {
+	h := Duration(s.cfg.ShapeLimits.MaxDelay)
+	if m := s.cfg.ShapeLimits.MaxPauseTotal; m > 0 {
 		left := Duration(m - min(s.shp.stats.PauseTotal, m))
 		if h == 0 || left < h {
 			h = left

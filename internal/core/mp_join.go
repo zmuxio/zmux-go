@@ -93,6 +93,9 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 		return 0, 0, s.err
 	}
 	m := s.mp
+	if m.keysPending {
+		return 0, 0, ErrJoinSecretPending
+	}
 	if s.state == StateSuspended && s.ownAttachments() >= m.ownCap {
 		s.makeRoom(true, o.Dir != 0, o.Dir != 1)
 	}
@@ -165,6 +168,10 @@ const (
 	JoinAccepted JoinResult = iota
 	// JoinHold means the session is not established yet; offer the join again.
 	JoinHold
+	// JoinSecretWait means the join keys wait for the deferred PSK
+	// (MULTIPATH.md 5.4 step 4): hold the carrier, without session state,
+	// until WaitJoinKeys or the handshake timeout, then offer it again.
+	JoinSecretWait
 	// JoinClose asks the caller to close the carrier without writing anything.
 	JoinClose
 	// JoinRefused asks the caller to close the carrier; a PIPE_ABANDON was
@@ -196,6 +203,10 @@ func (s *Session) AcceptJoin(j *wire.Join, macInput, binding []byte, c Carrier) 
 	m := s.mp
 	if m == nil {
 		return JoinClose
+	}
+	if m.keysPending {
+		s.stats.JoinSecretPending++
+		return JoinSecretWait
 	}
 	var b []byte
 	if j.CarrierBound {
@@ -394,7 +405,7 @@ func (s *Session) retireLocally(p *Pipe) {
 // JoinReady reports whether maintenance has target room and a local join
 // may start now. Failed attachments retain physical headroom until retirement.
 func (s *Session) JoinReady() bool {
-	if s.isClosing() || s.mp == nil || s.now < s.mp.backoffUntil {
+	if s.isClosing() || s.mp == nil || s.mp.keysPending || s.now < s.mp.backoffUntil {
 		return false
 	}
 	if s.ownAttachments() >= s.mp.ownCap && (s.state != StateSuspended || s.roomCandidate(true, true, true) == nil) {

@@ -308,7 +308,11 @@ func (c *Conn) maybeRedial() {
 	}
 	c.lock()
 	out, in := c.s.LiveDirections()
+	pending := c.s.JoinSecretPending() // EvJoinKeys asks again
 	c.unlock()
+	if pending {
+		return
+	}
 	var need Direction
 	switch {
 	case out && in:

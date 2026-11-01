@@ -3,6 +3,7 @@ package zmux
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -438,5 +439,46 @@ func TestShapingHugePadding(t *testing.T) {
 				t.Fatalf("record of %d bytes", n)
 			}
 		}
+	}
+}
+
+// SetShapingLimits before a shaper is installed bounds it once installed;
+// an invalid value changes nothing; concurrent calls are safe.
+func TestSetShapingLimits(t *testing.T) {
+	c, s, rc := shapedPair(t, nil)
+	if err := c.SetShapingLimits(shaping.Limits{MaxPaddingRatio: 2}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("ratio 2: %v", err)
+	}
+	if err := c.SetShapingLimits(shaping.Limits{MaxDelay: -1}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("negative delay: %v", err)
+	}
+	if c.ShapingLimits() != (shaping.Limits{}) {
+		t.Fatal("an invalid value changed the limits")
+	}
+	want := shaping.Limits{MaxPaddingBytes: 4096}
+	if err := c.SetShapingLimits(want); err != nil {
+		t.Fatal(err)
+	}
+	if c.ShapingLimits() != want {
+		t.Fatalf("limits %+v", c.ShapingLimits())
+	}
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				_ = c.SetShapingLimits(want)
+				_ = c.ShapingLimits()
+				_ = c.ShapingStats()
+			}
+		}()
+	}
+	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 1000 }))
+	rc.start()
+	transfer(t, c, s, 100<<10)
+	wg.Wait()
+	if st := c.ShapingStats(); st.PaddingBytes > 4096 || st.PaddingBytes == 0 {
+		t.Fatalf("padded %d bytes under MaxPaddingBytes 4096", st.PaddingBytes)
 	}
 }

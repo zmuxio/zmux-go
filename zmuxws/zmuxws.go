@@ -494,6 +494,14 @@ func (p *carrier) ReadMessage() ([]byte, error) {
 // WriteMessage sends m as one binary message.
 func (p *carrier) WriteMessage(m []byte) error { return p.c.WriteMessage(wsconn.Binary, m) }
 
+// WriteMessages sends msgs as binary messages in one write to the
+// connection beneath (zmux.MessageBatchWriter).
+func (p *carrier) WriteMessages(msgs [][]byte) error {
+	return p.c.WriteMessages(wsconn.Binary, msgs)
+}
+
+var _ zmux.MessageBatchWriter = (*carrier)(nil)
+
 func (p *carrier) Read([]byte) (int, error)  { return 0, errMessageCarrier }
 func (p *carrier) Write([]byte) (int, error) { return 0, errMessageCarrier }
 

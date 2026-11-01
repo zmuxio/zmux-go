@@ -147,8 +147,21 @@ func (p *Pipe) Admitted() any {
 // AddPipe joins a new carrier to the session in band (MULTIPATH.md 5.7) and
 // waits until the join is confirmed, the pipe fails, or ctx ends (the pipe
 // is then removed). A join that the attachment cap or the refusal backoff
-// holds waits for room.
+// holds waits for room. With CarrierBound, a carrier whose TLS handshake
+// (a *tls.Conn half, or a Handshaker) has not completed is first driven
+// through it with ctx; a failed handshake closes it and is returned.
 func (c *Conn) AddPipe(ctx context.Context, p PipeIO, o PipeOptions) (*Pipe, error) {
+	if o.CarrierBound {
+		// The binding is the carrier's exporter, read once its own
+		// handshake completed: a TLS half (or Handshaker) not yet past it
+		// is driven through it with ctx first.
+		if handshake := pendingHandshake(p); handshake != nil {
+			if err := handshake(ctx); err != nil {
+				closePipeIO(p)
+				return nil, fmt.Errorf("zmux: carrier handshake: %w", err)
+			}
+		}
+	}
 	pp, err := c.addPipe(p, o, false)
 	if err != nil {
 		return nil, err

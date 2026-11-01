@@ -109,6 +109,11 @@ var (
 	ErrNotEstablished = errors.New("zmux: session not established")
 	ErrTooLate        = errors.New("zmux: setting must precede the first frame")
 	ErrInvalid        = errors.New("zmux: invalid argument")
+	// ErrJoinSecretPending: the deferred PSK was not supplied yet, so that
+	// no join key exists (MULTIPATH.md 10.1).
+	ErrJoinSecretPending = errors.New("zmux: join secret pending")
+	// ErrJoinSecretSet: the deferred PSK was already supplied.
+	ErrJoinSecretSet = errors.New("zmux: join secret already set")
 )
 
 // DatagramTooLargeError reports the largest payload the peer accepts.
