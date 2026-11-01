@@ -249,10 +249,7 @@ func (s *Session) earlyAdopt() {
 // handshake completes (CarrierHandshakeDone).
 func (s *Session) CarrierEarlyIn() { s.carrierEarlyIn = true }
 
-// CarrierHandshakeDone ends the replayable period.
-func (s *Session) CarrierHandshakeDone() {
-	s.carrierEarlyIn = false
-	for _, st := range s.streams {
-		st.replayable = false
-	}
-}
+// CarrierHandshakeDone ends the replayable period: streams opened later
+// are not replayable, while a stream that arrived in early data stays so
+// (its request may have been repeated whatever followed).
+func (s *Session) CarrierHandshakeDone() { s.carrierEarlyIn = false }

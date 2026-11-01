@@ -377,6 +377,9 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 			return nil, errRejected
 		}
 	}
+	if _, ok := earlyIn(p, &c.cfg.EarlyData); ok {
+		c.s.CarrierEarlyIn()
+	}
 	c.addBootstrap(p)
 	if cc.HoldFirstFlight {
 		c.firstTimer = c.clk.source().AfterFunc(cfg.handshakeTimeout(), func() { c.releaseFirst(true) })

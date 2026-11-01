@@ -81,10 +81,7 @@ func (c *Conn) watchEarly(p PipeIO) {
 		c.wg.Add(1)
 		go c.earlyVerdict(ec, p)
 	}
-	if es, ok := p.W.(EarlyServerCarrier); ok && c.cfg.EarlyData.Replayable && es.UsedEarlyData() {
-		c.lock()
-		c.s.CarrierEarlyIn()
-		c.unlock()
+	if es, ok := earlyIn(p, &c.cfg.EarlyData); ok {
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
@@ -97,6 +94,14 @@ func (c *Conn) watchEarly(p PipeIO) {
 			}
 		}()
 	}
+}
+
+// earlyIn is the bootstrap carrier of a server whose streams arriving in
+// carrier early data are replayable. The session is marked (CarrierEarlyIn)
+// before the bootstrap reader starts, so no early stream is missed.
+func earlyIn(p PipeIO, e *EarlyData) (EarlyServerCarrier, bool) {
+	es, ok := p.W.(EarlyServerCarrier)
+	return es, ok && e.Replayable && es.UsedEarlyData()
 }
 
 // earlyCarrier is the bootstrap carrier's verdict hook when the session's

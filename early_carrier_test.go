@@ -377,8 +377,18 @@ func (l failingRestart) RestartEarly(context.Context) (PipeIO, error) {
 	return PipeIO{}, errors.New("no restart")
 }
 
+// deafWriter is a carrier whose writes never fail: the peer's session
+// ends only through what it reads, never by a write racing the close.
+type deafWriter struct{ net.Conn }
+
+func (w deafWriter) Write(b []byte) (int, error) {
+	_, _ = w.Conn.Write(b)
+	return len(b), nil
+}
+
 // A failed restart still writes the CONNECTION_CLOSE on the carrier: the
-// peer sees why the session ended.
+// peer sees why the session ended. The server's writes cannot fail, so it
+// ends on what it reads (the close comes before the carrier's end).
 func TestEarlyCarrierRestartFailsClose(t *testing.T) {
 	leakcheck.Check(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -403,7 +413,7 @@ func TestEarlyCarrierRestartFailsClose(t *testing.T) {
 	})
 	ch := make(chan error, 1)
 	go func() {
-		s, err := Start(ctx, NetPipe(b), RoleServer, mpConfig())
+		s, err := Start(ctx, PipeIO{R: b, W: deafWriter{b}}, RoleServer, mpConfig())
 		if err != nil {
 			ch <- err
 			return
