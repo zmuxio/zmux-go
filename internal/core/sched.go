@@ -36,7 +36,7 @@ func (st *Stream) sendable() bool {
 	if sp.finWr && !sp.finSent && !sp.reset {
 		return true
 	}
-	return st.pinned && !st.opened || (!st.idSet && (sp.finWr || sp.q.end > sp.q.base))
+	return (st.pinned || st.openWant) && !st.opened || (!st.idSet && (sp.finWr || sp.q.end > sp.q.base))
 }
 
 func (sc *scheduler) ensure(st *Stream) {

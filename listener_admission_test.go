@@ -152,7 +152,7 @@ func TestAdmissionSource(t *testing.T) {
 	if err := lst.HandlePipe(ctx, NetPipe(addrConn{c, other}), JoinHint{Source: netip.MustParseAddrPort("203.0.113.7:9")}); err == nil {
 		t.Fatal("a second carrier of a full source was taken")
 	}
-	if _, err := d.Read(make([]byte, 1)); err != io.EOF {
+	if _, err := d.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("refused carrier: %v", err)
 	}
 	// Without JoinHint.Source the peer is the source.
@@ -204,7 +204,7 @@ func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 	if err := lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), JoinHint{}); err == nil {
 		t.Fatal("a third carrier of the source was taken")
 	}
-	if _, err := b.Read(make([]byte, 1)); err != io.EOF {
+	if _, err := b.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("refused carrier: %v", err)
 	}
 	cancel()

@@ -596,7 +596,7 @@ func TestStallCountsPerSource(t *testing.T) {
 	// The third: the source has its share of stalled carriers.
 	c, s := net.Pipe()
 	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{s, src}), JoinHint{}); done <- struct{}{} }()
-	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("read %v, want the end", err)
 	}
 	<-done

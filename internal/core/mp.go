@@ -273,16 +273,17 @@ func (s *Session) deriveKeys() {
 
 // SetJoinSecret supplies the deferred PSK (Config.DeferredPSK): once
 // the negotiation selected it, the join keys are derived and the held
-// peer joins go on. Before establishment the PSK is kept for it.
+// peer joins go on. Before establishment the PSK is kept for it, and
+// dropped when the negotiation does not select it (processPeerParams).
 func (s *Session) SetJoinSecret(psk []byte) error {
 	if s.isClosing() {
 		return s.err
 	}
-	if s.secretSet {
-		return ErrJoinSecretSet
-	}
 	if s.peerSeen && (s.mp == nil || !s.mp.usePSK) {
 		return ErrNotNegotiated
+	}
+	if s.secretSet {
+		return ErrJoinSecretSet
 	}
 	s.cfg.PSK, s.secretSet = append([]byte(nil), psk...), true
 	if s.mp != nil && s.mp.keysPending {
@@ -294,6 +295,20 @@ func (s *Session) SetJoinSecret(psk []byte) error {
 		s.keyW = nil
 	}
 	return nil
+}
+
+// SessionBinding is the session's binding value (wire.SessionBinding),
+// nil before establishment or without multipath, whose parameter carries
+// the Session Nonces.
+func (s *Session) SessionBinding() []byte {
+	if s.mp == nil {
+		return nil
+	}
+	initN, respN := s.cfg.Local.SessionNonce[:], s.peer.SessionNonce[:]
+	if s.role == RoleResponder {
+		initN, respN = respN, initN
+	}
+	return wire.SessionBinding(initN, respN)
 }
 
 // JoinSecretPending reports whether the join keys wait for the deferred

@@ -201,7 +201,7 @@ func (e *exEnv) echoErr(n int, timeout time.Duration) error {
 	hsh := sha256.New()
 	got, err := io.Copy(hsh, st)
 	if err != nil || got != int64(n) || !bytes.Equal(hsh.Sum(nil), want[:]) {
-		return fmt.Errorf("echo: %d of %d bytes, hash match %v, %v", got, n, bytes.Equal(hsh.Sum(nil), want[:]), err)
+		return fmt.Errorf("echo: %d of %d bytes, hash match %v, %w", got, n, bytes.Equal(hsh.Sum(nil), want[:]), err)
 	}
 	return nil
 }

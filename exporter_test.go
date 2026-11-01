@@ -318,9 +318,9 @@ func TestExporterSplit(t *testing.T) {
 		{"one", PipeIO{R: up, W: up}, true, u},
 		{"uplink only", PipeIO{W: up, R: &net.TCPConn{}}, true, u},
 	} {
-		e, err := sessionExporter(tc.p, tc.initiator)
-		if err != nil {
-			t.Fatal(err)
+		e := bootExporters(tc.p, tc.initiator)
+		if e == nil {
+			t.Fatalf("%s: no exporter", tc.name)
 		}
 		if _, err := e.value(); err == nil {
 			t.Fatalf("%s: value before load", tc.name)
@@ -330,5 +330,83 @@ func TestExporterSplit(t *testing.T) {
 		if err != nil || !bytes.Equal(got, tc.want) {
 			t.Fatalf("%s: %x %v", tc.name, got, err)
 		}
+	}
+}
+
+// Conn.ExportKeyingMaterial: both ends of a TLS carrier and of a
+// transform's exporter obtain the same value; a carrier without an
+// exporter and a zmux label fail.
+func TestConnExportKeyingMaterial(t *testing.T) {
+	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	check := func(name string, c, s *Conn) {
+		t.Helper()
+		ce, err := c.ExportKeyingMaterial("EXPORTER-app", []byte("x"), 32)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		se, err := s.ExportKeyingMaterial("EXPORTER-app", []byte("x"), 32)
+		if err != nil || !bytes.Equal(ce, se) || len(ce) != 32 {
+			t.Fatalf("%s: %x / %x, %v", name, ce, se, err)
+		}
+		if _, err := c.ExportKeyingMaterial(wire.ExporterSession, nil, 32); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("%s: zmux label: %v", name, err)
+		}
+	}
+	// A transform's exporter.
+	ck, sk := kmPair("k")
+	ch := make(chan *Conn, 1)
+	go func() { s, _ := Start(ctx, PipeIO{R: sk, W: sk}, RoleServer, nil); ch <- s }()
+	c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := <-ch
+	check("transform", c, s)
+	_ = c.Close()
+	_ = s.Close()
+	waitDone(t, c)
+	waitDone(t, s)
+	// TLS.
+	scfg, ccfg := selfSignedTLS(t)
+	ta, tb := tcpPair(t)
+	tc, ts := tls.Client(ta, ccfg), tls.Server(tb, scfg)
+	go func() { s, _ := Server(ctx, ts, nil); ch <- s }()
+	c, err = Client(ctx, tc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = <-ch
+	check("tls", c, s)
+	_ = c.Close()
+	_ = s.Close()
+	waitDone(t, c)
+	waitDone(t, s)
+	// No exporter.
+	a, b := net.Pipe()
+	c, _ = pair(t, a, b, nil, nil)
+	if _, err := c.ExportKeyingMaterial("EXPORTER-app", nil, 32); !errors.Is(err, ErrNoExporter) {
+		t.Fatalf("plain carrier: %v", err)
+	}
+}
+
+// SessionBinding is the same at both ends, differs between sessions and
+// is nil without multipath.
+func TestSessionBinding(t *testing.T) {
+	leakcheck.Check(t)
+	var prev []byte
+	for range 2 {
+		e := newMPEnv(t, mpConfig(), mpConfig())
+		cb, sb := e.client.SessionBinding(), e.server.SessionBinding()
+		if len(cb) != 32 || !bytes.Equal(cb, sb) || bytes.Equal(cb, prev) {
+			t.Fatalf("bindings %x / %x, previous %x", cb, sb, prev)
+		}
+		prev = cb
+	}
+	a, b := net.Pipe()
+	c, _ := pair(t, a, b, nil, nil)
+	if c.SessionBinding() != nil {
+		t.Fatal("binding without multipath")
 	}
 }

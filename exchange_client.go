@@ -68,7 +68,7 @@ func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t
 			bust: c.p.cacheBust && !strings.Contains(u, "{nonce}"), origin: new(atomic.Pointer[string])}
 		var probe [exNonceLen]byte
 		if _, err := url.Parse(tg.build(probe[:])); err != nil {
-			return PipeIO{}, fmt.Errorf("%w: exchange URL: %v", ErrInvalidConfig, err)
+			return PipeIO{}, fmt.Errorf("%w: exchange URL: %w", ErrInvalidConfig, err)
 		}
 		if i == 0 {
 			c.target = tg

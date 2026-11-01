@@ -274,6 +274,9 @@ var (
 	ErrJoinSecretPending = errors.New("zmux: join secret pending")
 	// ErrJoinSecretSet is returned by a second Conn.SetJoinSecret.
 	ErrJoinSecretSet = errors.New("zmux: join secret already set")
+	// ErrNoExporter is returned by Conn.ExportKeyingMaterial when the
+	// bootstrap carrier has no keying material exporter.
+	ErrNoExporter = errors.New("zmux: the carrier has no keying material exporter")
 	// ErrPipeGone is returned by Pipe methods once the session no longer
 	// knows the attachment.
 	ErrPipeGone = errors.New("zmux: pipe gone")

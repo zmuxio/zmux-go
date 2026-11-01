@@ -197,7 +197,7 @@ func (s *Session) planChunk(st *Stream) chunkPlan {
 	if p.off+p.n == sp.q.end && sp.finWr && !sp.finSent && !sp.reset {
 		p.fin = true
 	}
-	p.open = p.n == 0 && !p.fin && !st.opened && st.pinned
+	p.open = p.n == 0 && !p.fin && !st.opened && (st.pinned || st.openWant)
 	return p
 }
 
@@ -635,9 +635,8 @@ func (s *Session) writeControl(w *recWriter, p *Pipe) {
 // writeStreamCtl writes the pending control frames of one stream; it
 // returns false when the batch is full.
 func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
-	if st.local && !st.opened {
-		// Not opened (again, after an early-data restart): its frames
-		// keep their bits and follow the opening STREAM frame.
+	if st.ctlWaits() {
+		// Its frames keep their bits and follow the opening STREAM frame.
 		ctl := st.ctl
 		s.unlinkCtl(st)
 		st.ctl = ctl
@@ -910,7 +909,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		}
 		return chunkSent
 	}
-	st.opened = true
+	st.opened, st.reopen = true, false
 	s.openedCtl(st)
 	if s.dg != nil && len(s.dg.send) > 0 {
 		s.wakeAllWriters() // its held datagrams may follow
@@ -940,8 +939,10 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	}
 	if s.feat.Multipath {
 		sp.mpState()
+		s.wake(st.wsig)
 	} else if s.holdSends() {
 		// Carrier early data: the bytes stay until the verdict.
+		s.wake(st.wsig)
 	} else {
 		h := s.heldEnter(st)
 		sp.q.release(sp.sent)

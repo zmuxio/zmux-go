@@ -136,6 +136,10 @@ func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{
 // inband: its first record starts with the PIPE_JOIN the listener read;
 // admitted is the carrier's admission value.
 func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, binding []byte, inband bool, admitted any) (uint64, error) {
+	// Waiting for establishment or the join keys is bounded even when the
+	// handshake is not (Config.joinWaitTimeout).
+	ctx, cancel := timeshim.WithTimeout(ctx, c.clk.source(), c.cfg.joinWaitTimeout())
+	defer cancel()
 	for {
 		c.lock()
 		if c.closing {
@@ -193,12 +197,10 @@ func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, bind
 	}
 }
 
-// waitJoinKeys waits until the join keys exist (Conn.SetJoinSecret), for
-// at most the handshake timeout.
+// waitJoinKeys waits until the join keys exist (Conn.SetJoinSecret) or
+// ctx ends.
 func (c *Conn) waitJoinKeys(ctx context.Context) error {
 	sig := core.NewSignal()
-	t := timeshim.NewTimer(c.clk.source(), c.cfg.handshakeTimeout())
-	defer t.Stop()
 	for {
 		c.lock()
 		ready := c.s.WaitJoinKeys(sig)
@@ -209,7 +211,6 @@ func (c *Conn) waitJoinKeys(ctx context.Context) error {
 		select {
 		case <-sig.C:
 			continue
-		case <-t.C:
 		case <-ctx.Done():
 		case <-c.done:
 		}

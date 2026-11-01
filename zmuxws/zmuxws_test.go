@@ -405,16 +405,16 @@ func TestCarrier(t *testing.T) {
 	if err := cli.W.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); err != io.EOF {
+	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); !errors.Is(err, io.EOF) {
 		t.Fatalf("after a close frame: %v", err)
 	}
-	if _, err := cli.R.(zmux.MessageReader).ReadMessage(); err != io.EOF {
+	if _, err := cli.R.(zmux.MessageReader).ReadMessage(); !errors.Is(err, io.EOF) {
 		t.Fatalf("after the echoed close frame: %v", err)
 	}
 
 	srv, cli = pipePair(t)
 	cli.W.(interface{ Abort(error) }).Abort(nil)
-	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); err == nil || err == io.EOF {
+	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); err == nil || errors.Is(err, io.EOF) {
 		t.Fatalf("after an abort: %v", err)
 	}
 
@@ -422,7 +422,7 @@ func TestCarrier(t *testing.T) {
 	if err := cli.W.(*carrier).c.WriteMessage(wsconn.Text, []byte("text")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); err == nil || err == io.EOF {
+	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); err == nil || errors.Is(err, io.EOF) {
 		t.Fatalf("after a text message: %v", err)
 	}
 }

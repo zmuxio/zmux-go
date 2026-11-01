@@ -1,6 +1,7 @@
 package zmuxtest
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -219,7 +220,7 @@ func (r *Relay) copy(rc *relayConn, dst, src net.Conn, up bool) {
 				<-rc.done
 				return
 			}
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 					_ = cw.CloseWrite()
 					// The other direction ends the connection.

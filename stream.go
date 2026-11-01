@@ -253,6 +253,35 @@ func (h *handle) streamID() (StreamID, error) {
 	return StreamID(id), apiErr(err)
 }
 
+// flush sends the opening frame and the buffered data, waiting until they
+// left or the write deadline passed.
+func (h *handle) flush() error {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	c := h.c
+	c.lock()
+	c.s.SetNow(c.clk.now())
+	target, err := c.s.Flush(h.st)
+	c.unlock()
+	if err != nil {
+		return apiErr(err)
+	}
+	for {
+		c.lock()
+		h.wsig.Drain()
+		done, err := c.s.FlushDone(h.st, target, &h.wsig)
+		c.unlock()
+		if done {
+			return apiErr(err)
+		}
+		select {
+		case <-h.wsig.C:
+		case <-h.wwait():
+			return os.ErrDeadlineExceeded
+		}
+	}
+}
+
 // ---- public types ----
 
 // ReceiveStream is the receiving part of a stream.
@@ -297,8 +326,26 @@ func newReceiveStream(h *handle) *ReceiveStream {
 }
 
 // StreamID returns the identifier; before the first frame it pins it and
-// the opening frame is sent at once (SPEC.md 7.2).
+// the opening frame is sent at once (SPEC.md 7.2). Before establishment it
+// is 0. To open a stream on the wire, Flush is the explicit call.
 func (s *Stream) StreamID() StreamID { defer runtime.KeepAlive(s); id, _ := s.h.streamID(); return id }
+
+// Flush sends what was written now: the opening frame at once when the
+// stream has none yet, with the preamble and the data written before it
+// in that one frame, and the rest of the buffered data, as flow control
+// allows. It waits until they were sent or the write deadline passed
+// (os.ErrDeadlineExceeded), and fails as Write does on a reset or closed
+// stream or session; after Close it flushes the FIN as well. Stream
+// credit is reserved by OpenStream, so the opening frame never waits for
+// it. Data written after Flush goes in later frames. Before
+// establishment the opening frame goes as soon as the stream may open (in
+// early data when that is in use); while the first flight is held
+// (EarlyData.HoldFirstFlight) Flush returns at once and the frames leave
+// with the flight. Flush counts as the first frame: preamble settings
+// fail with ErrTooLate after it. It is the explicit way to open a stream
+// on the wire whose peer speaks first; StreamID pins the same way but
+// does not wait.
+func (s *Stream) Flush() error { defer runtime.KeepAlive(s); return s.h.flush() }
 
 // Read reads stream data; io.EOF only after a FIN that was not reset.
 func (s *Stream) Read(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.read(p) }
@@ -347,6 +394,9 @@ func (s *SendStream) StreamID() StreamID {
 	id, _ := s.h.streamID()
 	return id
 }
+
+// Flush sends what was written now (Stream.Flush).
+func (s *SendStream) Flush() error { defer runtime.KeepAlive(s); return s.h.flush() }
 
 // Write writes p.
 func (s *SendStream) Write(p []byte) (int, error) {

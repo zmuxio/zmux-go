@@ -68,7 +68,9 @@ type Stream struct {
 	stackReject bool // rejected by the stack, never offered
 	discarded   bool
 	pinned      bool // identifier pinned, opening frame owed
+	openWant    bool // Flush before establishment: opening frame owed once allowed
 	opened      bool // first frame emitted (local) or opened (peer)
+	reopen      bool // opening frame re-issued after an early-data restart
 	cancelled   bool // cancelled before any frame: never on the wire
 	replayable  bool
 
@@ -510,10 +512,60 @@ func (s *Session) PinID(st *Stream) (uint64, error) {
 	return st.id, nil
 }
 
+// Flush makes st's opening frame owed and reports the send offset that
+// covers what is buffered now; FlushDone tells when it was sent. After
+// establishment it pins the identifier (PinID); before, the opening frame
+// goes as soon as the stream may open, in early data if that is in use.
+// Data written before goes in the opening frame.
+func (s *Session) Flush(st *Stream) (uint64, error) {
+	sp := &st.snd
+	switch {
+	case !st.hasS:
+		return 0, ErrInvalid
+	case sp.errState != nil:
+		return 0, sp.errState
+	case s.err != nil:
+		return 0, s.err
+	}
+	if !st.idSet {
+		if st.cancelled {
+			return 0, sp.errState
+		}
+		if s.peerSeen {
+			if _, err := s.PinID(st); err != nil {
+				return 0, err
+			}
+		} else {
+			st.openWant = true
+		}
+	}
+	s.becomeSend(st)
+	return sp.q.end, nil
+}
+
+// FlushDone reports whether st's opening frame and its data up to target
+// were sent (or are queued in the held first flight, which leaves with
+// it), or the stream or session failed (err).
+func (s *Session) FlushDone(st *Stream, target uint64, sig *Signal) (bool, error) {
+	sp := &st.snd
+	switch {
+	case sp.reset || sp.errState != nil:
+		return true, sp.errState
+	case s.err != nil:
+		return true, s.err
+	case s.firstHeld:
+		return true, nil
+	case st.opened && sp.sent >= min64(target, sp.q.end):
+		return true, nil
+	}
+	st.wsig = sig
+	return false, nil
+}
+
 // ---- local preamble settings ----
 
 func (s *Session) beforeFirstFrame(st *Stream) error {
-	if !st.local || st.idSet {
+	if !st.local || st.idSet || st.openWant {
 		return ErrTooLate
 	}
 	if s.peerSeen && !s.feat.Preamble {

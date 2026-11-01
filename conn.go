@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,6 +62,9 @@ type Conn struct {
 
 	// exp is the late exporter of PipeAuth.Exporter, nil without it.
 	exp *lateExporter
+	// boot holds the bootstrap carrier's exporters (ExportKeyingMaterial),
+	// nil when it has none; set before the session is shared.
+	boot *lateExporter
 	// firstTimer releases a held first flight at the handshake timeout;
 	// firstTimeouts counts that (session lock).
 	firstTimer    timeshim.Timer
@@ -333,17 +337,17 @@ func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 // the listener that owns it, if any, and admitted the admission value of
 // its bootstrap carrier.
 func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted any) (*Conn, error) {
+	boot := bootExporters(p, lst == nil && cc.TransportRole == core.RoleInitiator)
 	var exp *lateExporter
 	if cfg.PipeAuth.Exporter {
-		var err error
-		exp, err = sessionExporter(p, lst == nil && cc.TransportRole == core.RoleInitiator)
-		if err != nil {
-			return nil, err
+		if boot == nil {
+			return nil, fmt.Errorf("%w: PipeAuth.Exporter on a carrier without an exporter", ErrInvalidConfig)
 		}
+		exp = boot
 		cc.Exporter = exp.value
 	}
 	c := newConn(cfg, cc)
-	c.exp = exp
+	c.exp, c.boot = exp, boot
 	c.lst = lst
 	c.admitted = admitted
 	switch {
@@ -405,9 +409,9 @@ type lateExporter struct {
 	loaded   atomic.Bool
 }
 
-// sessionExporter finds the exporters of p's halves; ErrInvalidConfig
-// when neither has one.
-func sessionExporter(p PipeIO, initiator bool) (*lateExporter, error) {
+// bootExporters finds the exporters of p's halves (Exporter's rule per
+// half); nil when neither has one.
+func bootExporters(p PipeIO, initiator bool) *lateExporter {
 	up, down := any(p.W), any(p.R) // the initiator writes on the uplink
 	if !initiator {
 		up, down = p.R, p.W
@@ -418,35 +422,44 @@ func sessionExporter(p PipeIO, initiator bool) (*lateExporter, error) {
 		e.down, _ = exporterOf(down)
 	}
 	if e.up == nil && e.down == nil {
-		return nil, fmt.Errorf("%w: PipeAuth.Exporter on a carrier without an exporter", ErrInvalidConfig)
+		return nil
 	}
-	return e, nil
+	return e
+}
+
+// export reads the exporters: the one value of a carrier, or for a split
+// bootstrap whose halves are two connections the uplink's value followed
+// by the downlink's.
+func (e *lateExporter) export(label string, ctxData []byte, length int) ([]byte, error) {
+	u, err := readExporter(e.up, label, ctxData, length)
+	if err != nil {
+		return nil, err
+	}
+	d, err := readExporter(e.down, label, ctxData, length)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case u != nil && d != nil && !bytes.Equal(u, d):
+		return append(u, d...), nil
+	case u != nil:
+		return u, nil
+	}
+	return d, nil
+}
+
+func readExporter(x KeyingMaterialExporter, label string, ctxData []byte, length int) ([]byte, error) {
+	if x == nil {
+		return nil, nil
+	}
+	return x.ExportKeyingMaterial(label, ctxData, length)
 }
 
 // load reads the exporter once; it calls the carrier, so never under the
 // session lock.
 func (e *lateExporter) load() {
 	e.once.Do(func() {
-		read := func(x KeyingMaterialExporter) []byte {
-			if x == nil || e.err != nil {
-				return nil
-			}
-			b, err := x.ExportKeyingMaterial(wire.ExporterSession, nil, 32)
-			if err != nil {
-				e.err = err
-			}
-			return b
-		}
-		u, d := read(e.up), read(e.down)
-		switch {
-		case e.err != nil:
-		case u != nil && d != nil && !bytes.Equal(u, d):
-			e.b = append(u, d...) // two connections: a split bootstrap
-		case u != nil:
-			e.b = u
-		default:
-			e.b = d
-		}
+		e.b, e.err = e.export(wire.ExporterSession, nil, 32)
 		e.loaded.Store(true)
 	})
 }
@@ -717,11 +730,13 @@ type GoAway struct {
 // SetJoinSecret supplies the PSK of PipeAuth.DeferredPSK, at least 16
 // bytes, once: the join keys are derived from it (with the exporter when
 // both are selected, MULTIPATH.md 10.3) and the held joins of the peer go
-// on. Called before establishment, the PSK is kept until the negotiation.
-// It fails with ErrInvalidConfig without DeferredPSK or with a shorter
-// PSK, ErrJoinSecretSet when already supplied, ErrNotNegotiated when the
-// negotiation did not select the PSK (the peer offered no P), and with the
-// session's error once it is closed.
+// on. Called before establishment, the PSK is kept for the negotiation:
+// when that does not select the PSK (the peer offered no P), it is
+// dropped, and ConnectionState().JoinSecretPending stays false. It fails
+// with ErrInvalidConfig without DeferredPSK or with a shorter PSK,
+// ErrNotNegotiated after an establishment that did not select the PSK
+// (also when one was supplied before), ErrJoinSecretSet when already
+// supplied, and with the session's error once it is closed.
 func (c *Conn) SetJoinSecret(psk []byte) error {
 	if c == nil {
 		return net.ErrClosed
@@ -738,6 +753,42 @@ func (c *Conn) SetJoinSecret(psk []byte) error {
 		return c.errLocked()
 	}
 	return apiErr(c.s.SetJoinSecret(psk))
+}
+
+// ExportKeyingMaterial exports keying material (RFC 5705, RFC 8446
+// Section 7.5) from the innermost end-to-end handshake of the bootstrap
+// carrier, the source Exporter finds (the carrier's own exporter, a
+// transform's, or the TLS handshake this process runs). For a split
+// bootstrap whose halves are two connections the result is the uplink's
+// value followed by the downlink's, 2*length bytes, as for
+// PipeAuth.Exporter. It fails with ErrNoExporter when the carrier has
+// none, ErrInvalidConfig for a label of zmux's own ("EXPORTER-zmux-"),
+// which keys the joins, and with the carrier's error while its handshake
+// is incomplete. Both ends obtain the same value.
+func (c *Conn) ExportKeyingMaterial(label string, ctxData []byte, length int) ([]byte, error) {
+	if c == nil {
+		return nil, net.ErrClosed
+	}
+	if strings.HasPrefix(label, "EXPORTER-zmux-") {
+		return nil, fmt.Errorf("%w: exporter label %q is reserved", ErrInvalidConfig, label)
+	}
+	if c.boot == nil {
+		return nil, ErrNoExporter
+	}
+	return c.boot.export(label, ctxData, length)
+}
+
+// SessionBinding returns a 32-byte value that identifies this session,
+// the same at both ends: HKDF-Extract (SHA-256) of the two Session
+// Nonces under a fixed label (MULTIPATH.md Section 10.3). An application
+// includes it in an authentication transcript to bind that
+// authentication to this session. It is public, not a secret. It is nil
+// before establishment and when multipath is not in use, whose parameter
+// carries the nonces (ConnectionState().Multipath).
+func (c *Conn) SessionBinding() []byte {
+	c.lock()
+	defer c.unlock()
+	return c.s.SessionBinding()
 }
 
 // ConnectionState returns the negotiation results.

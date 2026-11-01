@@ -385,7 +385,7 @@ func (r *runner) step(st map[string]any) error {
 		return r.expectClose(st)
 	case "expect_open":
 		if r.s.State() >= core.StateClosing {
-			return fmt.Errorf("session is %v: %v", r.s.State(), r.s.Err())
+			return fmt.Errorf("session is %v: %w", r.s.State(), r.s.Err())
 		}
 		return nil
 	case "expect_state":
@@ -767,7 +767,7 @@ func (r *runner) expectFrames(st map[string]any) error {
 		l.frames, l.recIdx = nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("%v\nframes:\n%s", err, dumpFrames(frames))
+		return fmt.Errorf("%w\nframes:\n%s", err, dumpFrames(frames))
 	}
 	return nil
 }
@@ -1071,7 +1071,7 @@ func (r *runner) expectClose(st map[string]any) error {
 	pat := st["error"].(map[string]any)
 	got := errorObj(e)
 	if !matchObj(pat, got) {
-		return fmt.Errorf("close error %v (%v), want %v", got, e, pat)
+		return fmt.Errorf("close error %v (%w), want %v", got, e, pat)
 	}
 	if w, ok := st["wire"].(bool); ok {
 		code := pat["code"]

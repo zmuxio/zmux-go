@@ -144,9 +144,7 @@ func (s *Session) streamCreditChanged(st *Stream) {
 // queueCtl marks a pending control frame of st.
 func (s *Session) queueCtl(st *Stream, bit uint8) {
 	st.ctl |= bit
-	if st.local && !st.opened {
-		// No ID on the wire yet: the bits wait for the opening STREAM
-		// frame, which queues them (openedCtl).
+	if st.ctlWaits() {
 		return
 	}
 	if !st.inCtl {
@@ -160,6 +158,16 @@ func (s *Session) queueCtl(st *Stream, bit uint8) {
 		s.ctlTail = st
 	}
 	s.wakeAllWriters()
+}
+
+// ctlWaits reports whether the control frames of st wait for its opening
+// STREAM frame, which queues them (openedCtl): before the identifier is
+// allocated (a frame then would carry no valid ID), and after an
+// early-data restart until the re-issued opening frame, while one is
+// still coming. Once allocated, a control frame may itself be the
+// stream's first frame (SPEC.md 7.2 rules 1 and 2, 8.4).
+func (st *Stream) ctlWaits() bool {
+	return st.local && (!st.idSet || st.reopen && !st.opened && st.sendable())
 }
 
 // openedCtl queues the control frames that waited for st's opening

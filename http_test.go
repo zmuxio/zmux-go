@@ -148,7 +148,7 @@ func TestBodyPipe(t *testing.T) {
 	for {
 		n, err := p.read(buf)
 		got = append(got, buf[:n]...)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

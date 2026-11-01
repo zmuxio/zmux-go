@@ -28,6 +28,19 @@ func SessionSecret(initNonce, respNonce []byte, exporter, psk []byte) []byte {
 	return prk
 }
 
+// SessionBinding is the public binding value of a session (MULTIPATH.md
+// 10.3): HKDF-Extract with SHA-256 of the two Session Nonces under a
+// fixed label, 32 bytes, the same at both ends.
+func SessionBinding(initNonce, respNonce []byte) []byte {
+	ikm := make([]byte, 0, len(initNonce)+len(respNonce))
+	ikm = append(append(ikm, initNonce...), respNonce...)
+	prk, err := hkdf.Extract(sha256.New, ikm, []byte("zmux session binding"))
+	if err != nil {
+		panic(err)
+	}
+	return prk
+}
+
 // JoinKeys derives join_key_i and join_key_r (MULTIPATH.md 10.4).
 func JoinKeys(secret []byte) (ki, kr []byte) {
 	var err error

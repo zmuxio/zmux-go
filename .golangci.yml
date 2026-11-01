@@ -8,7 +8,9 @@ linters:
   default: none
   enable:
     - errcheck
+    - errorlint
     - govet
     - ineffassign
     - staticcheck
+    - unconvert
     - unused

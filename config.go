@@ -325,7 +325,8 @@ type PipeAuth struct {
 	// authenticated the peer over the session. Until then no join key
 	// exists: local joins fail with ErrJoinSecretPending and the peer's
 	// joins are held (ConnectionStats.JoinSecretPending) for at most
-	// HandshakeTimeout, then closed silently; a session that loses its
+	// HandshakeTimeout (its default when HandshakeTimeout is no
+	// timeout), then closed silently; a session that loses its
 	// pipes before the secret cannot resume. It combines with Exporter
 	// as a static PSK does, and the peer may have the same bytes as a
 	// static PSK. It must not be combined with PSK or AllowInsecure.
@@ -371,6 +372,17 @@ func (c *Config) handshakeTimeout() time.Duration {
 		return time.Duration(core.DefaultHandshakeTimeout)
 	}
 	return timeout(c.HandshakeTimeout, time.Duration(core.DefaultHandshakeTimeout))
+}
+
+// joinWaitTimeout bounds how long a carrier joining the session waits,
+// holding a pending slot of the listener, for establishment or for the
+// join keys: the HandshakeTimeout, or its default when that is no
+// timeout, since the pending slots are a safety bound.
+func (c *Config) joinWaitTimeout() time.Duration {
+	if d := c.handshakeTimeout(); d < noTimeout {
+		return d
+	}
+	return time.Duration(core.DefaultHandshakeTimeout)
 }
 
 func dur(d, def time.Duration) core.Duration {
