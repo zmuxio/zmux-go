@@ -88,13 +88,13 @@ func (o CandidateOutcome) String() string {
 
 // CandidateResult is the outcome of one try of a candidate.
 type CandidateResult struct {
-	Kind    CarrierKind
 	Variant string // the candidate's Variant
+	// Err is the failure (nil when usable).
+	Err     error
+	Kind    CarrierKind
 	Outcome CandidateOutcome
 	// Joined is set for a try as a further pipe of the established session.
 	Joined bool
-	// Err is the failure (nil when usable).
-	Err error
 }
 
 // Candidate is one carrier kind that DialMode may use. Dial opens a
@@ -291,11 +291,11 @@ type cacheEntry struct {
 type CacheOutcome uint8
 
 const (
-	// CacheUsable: the candidate worked, as a chosen one does.
+	// CacheUsable means that the candidate worked, as a chosen one does.
 	CacheUsable CacheOutcome = iota
-	// CacheFailed: an ordinary failure; the backoff doubles.
+	// CacheFailed means an ordinary failure; the backoff doubles.
 	CacheFailed
-	// CacheRejected: a definite verdict, such as a binding check that
+	// CacheRejected means a definite verdict, such as a binding check that
 	// proves the path unsuitable; the candidate is skipped for
 	// BackoffMax.
 	CacheRejected

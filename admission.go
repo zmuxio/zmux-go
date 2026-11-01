@@ -839,6 +839,8 @@ func (a *Arrival) count(d Decision) Decision {
 		// The aggregate is counted by stallSlot.
 	case VerdictClose:
 		l.st.adm.closed.Add(1)
+	case VerdictMore:
+		// Never final: decide turns it into a longer prefix or a close.
 	}
 	l.st.adm.variant(d.Variant, d.Verdict)
 	return d

@@ -212,7 +212,7 @@ func (c *Conn) poison(r any) {
 	}
 	c.poisoned = true
 	defer func() { _ = recover() }()
-	c.s.Close(uint64(TransportInternalError), []byte(fmt.Sprint("internal error: ", r)))
+	c.s.FailInternal(fmt.Sprint("internal error: ", r))
 }
 
 func (c *Conn) rearmLocked() {

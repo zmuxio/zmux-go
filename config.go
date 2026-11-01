@@ -275,6 +275,10 @@ type SchedulerParams struct {
 // grants now end the session with a *TransportError
 // (TransportParameterError) instead: forget them.
 type EarlyData struct {
+	// Remembered are the peer's parameters from an earlier session, as
+	// Conn.RememberedParameters returned them (client only). Store them per
+	// server and only with the application's consent.
+	Remembered []byte
 	// ZmuxPeer declares the peer a zmux endpoint (client only).
 	ZmuxPeer bool
 	// Replayable allows carrier early data, which the peer may see
@@ -282,10 +286,6 @@ type EarlyData struct {
 	// client with Remembered, or with ZmuxPeer on a carrier with early
 	// data; on a server to accept it and mark its streams.
 	Replayable bool
-	// Remembered are the peer's parameters from an earlier session, as
-	// Conn.RememberedParameters returned them (client only). Store them per
-	// server and only with the application's consent.
-	Remembered []byte
 	// HoldFirstFlight keeps the bootstrap pipe's first carrier write until
 	// Conn.ReleaseFirstFlight, or until Config.HandshakeTimeout has passed
 	// since Start (ConnectionStats.FirstFlightTimeouts); the handshake

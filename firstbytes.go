@@ -10,12 +10,12 @@ import (
 type FirstBytes uint8
 
 const (
-	// FirstBytesNeedMore: more bytes are needed to tell.
+	// FirstBytesNeedMore means that more bytes are needed to tell.
 	FirstBytesNeedMore FirstBytes = iota
-	// FirstBytesRecord: the bytes can begin a first record of this
-	// specification.
+	// FirstBytesRecord means that the bytes can begin a first record of
+	// this specification.
 	FirstBytesRecord
-	// FirstBytesOther: the bytes cannot begin a first record.
+	// FirstBytesOther means that the bytes cannot begin a first record.
 	FirstBytesOther
 )
 

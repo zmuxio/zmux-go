@@ -537,9 +537,9 @@ type PipeStats struct {
 	Pipe      uint64 // the pipe ID
 	FateGroup uint64
 	Label     string
+	Variant   string      // PipeIO.Variant
 	Local     bool        // this endpoint joined the attachment
 	Carrier   CarrierKind // PipeIO.Carrier
-	Variant   string      // PipeIO.Variant
 	// Outbound and Inbound are the states of the two directions;
 	// OutboundNone and InboundNone for one the attachment lacks.
 	Outbound     OutboundState

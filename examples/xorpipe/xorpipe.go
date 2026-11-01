@@ -99,6 +99,7 @@ func (w *clientWriter) Write(b []byte) (int, error) {
 		return len(b), nil
 	case stDropping:
 		return len(b), nil
+	case stPassing:
 	}
 	return w.c.Write(xor(b, w.key))
 }
@@ -151,8 +152,8 @@ func (w *clientWriter) RestartEarly(context.Context) (zmux.PipeIO, error) {
 
 type clientReader struct {
 	c    net.Conn
-	key  byte
 	w    *clientWriter
+	key  byte
 	once bool
 }
 

@@ -242,3 +242,21 @@ func TestDeadlines(t *testing.T) {
 	runtime.KeepAlive(st)
 	runtime.KeepAlive(ss)
 }
+
+// A panic under the session lock closes the session with a transport
+// INTERNAL_ERROR that the peer sees with its reason.
+func TestPanicClosesWithInternalError(t *testing.T) {
+	leakcheck.Check(t)
+	a, b := net.Pipe()
+	c, s := pair(t, a, b, nil, nil)
+	func() {
+		c.lock()
+		defer c.unlock()
+		panic("boom")
+	}()
+	var te *TransportError
+	if err := s.Wait(); !errors.As(err, &te) || !te.Remote || te.ErrorCode != TransportInternalError ||
+		te.ErrorMessage != "internal error: boom" {
+		t.Fatalf("peer ended with %v", err)
+	}
+}

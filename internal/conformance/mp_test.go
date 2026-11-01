@@ -79,7 +79,8 @@ func (r *runner) tryJoin(c *rcarrier, j *wire.Join, mac []byte, inband bool) {
 	res := r.s.AcceptJoin(j, mac, c.binding, core.Carrier{HasIn: hasIn, HasOut: hasOut, In: info, Out: info})
 	r.drainEvents()
 	switch res {
-	case core.JoinHold:
+	case core.JoinHold, core.JoinSecretWait:
+		// Offered again later; the vectors use no deferred PSK.
 		c.held = true
 		c.pendJoin, c.pendMac, c.pendInband = j, mac, inband
 		r.held = append(r.held, c)

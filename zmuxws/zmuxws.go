@@ -476,7 +476,25 @@ var errMessageCarrier = errors.New("zmuxws: a message carrier has no byte stream
 // the end of the pipe (io.EOF); a connection that ends without one, and a
 // text message, fail it.
 func (p *carrier) ReadMessage() ([]byte, error) {
-	typ, m, err := p.c.AppendMessage(nil)
+	return p.message(p.c.AppendMessage(nil))
+}
+
+// ReadMessageLimit returns the next binary message as ReadMessage does,
+// when it holds at most limit bytes (zmux.MessageLimitReader); a longer
+// one, also after decompression, is read no further and fails the
+// carrier (status 1009) with zmux.ErrMessageTooLarge.
+func (p *carrier) ReadMessageLimit(limit int) ([]byte, error) {
+	m, err := p.message(p.c.ReadMessageLimit(int64(max(limit, 0))))
+	if errors.Is(err, wsconn.ErrMessageTooLarge) {
+		return nil, zmux.ErrMessageTooLarge
+	}
+	return m, err
+}
+
+var _ zmux.MessageLimitReader = (*carrier)(nil)
+
+// message maps a read of the connection to the carrier's result.
+func (p *carrier) message(typ wsconn.MessageType, m []byte, err error) ([]byte, error) {
 	var ce *wsconn.CloseError
 	switch {
 	case err == nil && typ != wsconn.Binary:

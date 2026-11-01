@@ -13,14 +13,14 @@ import (
 type ReplayVerdict uint8
 
 const (
-	// ReplayFresh: the key is new and now recorded.
+	// ReplayFresh means that the key is new and now recorded.
 	ReplayFresh ReplayVerdict = iota
-	// ReplaySeen: the key was seen within its window.
+	// ReplaySeen means that the key was seen within its window.
 	ReplaySeen
-	// ReplayOutside: the stamp is outside the window of the filter's
-	// clock, or before its NotBefore.
+	// ReplayOutside means that the stamp is outside the window of the
+	// filter's clock, or before its NotBefore.
 	ReplayOutside
-	// ReplayFull: the filter holds Max keys and records nothing new.
+	// ReplayFull means that the filter holds Max keys and records nothing new.
 	ReplayFull
 )
 

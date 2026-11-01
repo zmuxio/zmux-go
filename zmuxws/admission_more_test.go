@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	zmux "github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go"
 )
 
 // A WebSocket carrier handed to HandlePipe is admitted on its first

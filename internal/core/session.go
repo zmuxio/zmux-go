@@ -504,6 +504,12 @@ func (s *Session) Close(code uint64, reason []byte) {
 		&closeFrame{app: true, code: code, reason: reason})
 }
 
+// FailInternal closes the session with a transport INTERNAL_ERROR carrying
+// reason: a local failure outside the protocol.
+func (s *Session) FailInternal(reason string) {
+	s.failLocal(&wire.Error{Code: wire.InternalError, Reason: reason})
+}
+
 // failLocal closes with a locally detected transport error.
 func (s *Session) failLocal(e *wire.Error) {
 	s.closeTransport(&SessionError{Kind: CloseTransport, Code: e.Code, FrameType: e.FrameType,

@@ -1162,7 +1162,7 @@ func eventObj(e core.Event) (string, map[string]any) {
 	case core.EvOOBJoin:
 		return "oob_join", map[string]any{"pipe": e.Pipe, "frame": hex.EncodeToString(e.Frame)}
 	case core.EvJoinSecurityUnavailable, core.EvTierSaturation, core.EvPipePriority, core.EvPipeQuality,
-		core.EvCapacityBelow, core.EvCapacityRestored:
+		core.EvCapacityBelow, core.EvCapacityRestored, core.EvJoinKeys:
 		// Not in the trace vocabulary.
 	}
 	return "other", nil

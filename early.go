@@ -122,7 +122,7 @@ func earlyCarrier(p PipeIO, e *EarlyData) (EarlyClientCarrier, bool) {
 // CONNECTION_CLOSE reaches the peer on the carrier it has.
 func (c *Conn) failRestartLocked(old *pipeDrv, reason string) {
 	c.s.EarlyDiscarded()
-	c.s.Close(uint64(TransportInternalError), []byte(reason))
+	c.s.FailInternal(reason)
 	if old != nil && !old.dead && c.pipes[0] == old && old.wstop {
 		c.startWriterLocked(old)
 	}

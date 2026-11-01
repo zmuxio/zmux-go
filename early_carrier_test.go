@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -414,7 +413,9 @@ func TestEarlyCarrierRestartFailsClose(t *testing.T) {
 	layer.decide(false)
 	select {
 	case err := <-ch:
-		if err == nil || !strings.Contains(err.Error(), "(remote): early data restart failed") {
+		var te *TransportError
+		if !errors.As(err, &te) || !te.Remote || te.ErrorCode != TransportInternalError ||
+			te.ErrorMessage != "early data restart failed" {
 			t.Fatalf("server ended with %v", err)
 		}
 	case <-ctx.Done():

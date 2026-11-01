@@ -381,6 +381,26 @@ func TestCarrier(t *testing.T) {
 		t.Fatal("oversized message read")
 	}
 
+	// A bounded read: a message of the limit is read, a longer one fails
+	// the carrier with zmux.ErrMessageTooLarge and close status 1009.
+	srv, cli = pipePair(t)
+	w, lr := cli.W.(zmux.MessageWriter), srv.R.(zmux.MessageLimitReader)
+	for _, n := range []int{64, 65} {
+		if err := w.WriteMessage(make([]byte, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := lr.ReadMessageLimit(64); err != nil || len(got) != 64 {
+		t.Fatalf("read %d bytes, %v", len(got), err)
+	}
+	if _, err := lr.ReadMessageLimit(64); !errors.Is(err, zmux.ErrMessageTooLarge) {
+		t.Fatalf("over the limit: %v", err)
+	}
+	var ce *wsconn.CloseError
+	if _, _, err := cli.W.(*carrier).c.ReadMessage(); !errors.As(err, &ce) || ce.Code != wsconn.StatusMessageTooBig {
+		t.Fatalf("peer saw %v", err)
+	}
+
 	srv, cli = pipePair(t)
 	if err := cli.W.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
 		t.Fatal(err)
