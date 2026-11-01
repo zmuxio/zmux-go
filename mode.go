@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -811,7 +810,7 @@ func outcomeOf(err error) CandidateOutcome {
 	var ht *HandshakeTimeoutError
 	var re *HTTPRedirectError
 	switch {
-	case errors.As(err, &se), errors.As(err, &re), errors.Is(err, syscall.ECONNREFUSED):
+	case errors.As(err, &se), errors.As(err, &re), connRefused(err):
 		return CandidateRefused
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, ErrHandshakeTimeout), errors.As(err, &ht):
 		return CandidateTimedOut

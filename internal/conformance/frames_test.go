@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math"
 	"strconv"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -618,5 +617,3 @@ func matchParams(pat, got map[string]any) bool {
 	}
 	return true
 }
-
-var _ = math.MaxInt64

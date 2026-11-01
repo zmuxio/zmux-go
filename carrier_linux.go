@@ -17,8 +17,7 @@ func setNotsentLowat(fd uintptr, n int) error {
 func tcpMinRTT(fd uintptr) (time.Duration, bool) {
 	var buf [232]byte
 	l := uint32(len(buf))
-	_, _, e := syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, syscall.IPPROTO_TCP, syscall.TCP_INFO,
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&l)), 0)
+	e := getsockopt(fd, syscall.IPPROTO_TCP, syscall.TCP_INFO, unsafe.Pointer(&buf[0]), &l)
 	if e != 0 || l < 152 {
 		return 0, false
 	}
@@ -43,8 +42,7 @@ func retransCounter() *counter32 { return nil }
 func tcpRetrans(fd uintptr) (uint64, bool) {
 	var buf [232]byte
 	l := uint32(len(buf))
-	_, _, e := syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, syscall.IPPROTO_TCP, syscall.TCP_INFO,
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&l)), 0)
+	e := getsockopt(fd, syscall.IPPROTO_TCP, syscall.TCP_INFO, unsafe.Pointer(&buf[0]), &l)
 	if e != 0 || l < 216 {
 		return 0, false
 	}
