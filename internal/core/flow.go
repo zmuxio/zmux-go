@@ -162,12 +162,10 @@ func (s *Session) queueCtl(st *Stream, bit uint8) {
 
 // ctlWaits reports whether the control frames of st wait for its opening
 // STREAM frame, which queues them (openedCtl): before the identifier is
-// allocated (a frame then would carry no valid ID), and after an
-// early-data restart until the re-issued opening frame, while one is
-// still coming. Once allocated, a control frame may itself be the
+// allocated (a frame then would carry no valid ID). Once allocated, a control frame may itself be the
 // stream's first frame (SPEC.md 7.2 rules 1 and 2, 8.4).
 func (st *Stream) ctlWaits() bool {
-	return st.local && (!st.idSet || st.reopen && !st.opened && st.sendable())
+	return st.local && !st.idSet
 }
 
 // openedCtl queues the control frames that waited for st's opening

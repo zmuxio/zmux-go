@@ -99,9 +99,8 @@ func (s *Session) RestartEarly(info CarrierInfo, now Time) bool {
 		if sp.state == sendDataSent {
 			sp.state = sendSend
 		}
-		// Not opened any more: its control frames, re-queued here, wait
-		// for the opening STREAM frame of the re-issue (ctlWaits).
-		st.reopen = st.opened || st.reopen
+		// Not opened any more: the re-issue carries the opening frame
+		// again; queued control frames do not wait for it (ctlWaits).
 		st.opened = false
 		if sp.reset {
 			sp.resetSent = false

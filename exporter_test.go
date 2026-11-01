@@ -353,6 +353,9 @@ func TestConnExportKeyingMaterial(t *testing.T) {
 		if _, err := c.ExportKeyingMaterial(wire.ExporterSession, nil, 32); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%s: zmux label: %v", name, err)
 		}
+		if _, err := c.ExportKeyingMaterial("EXPORTER-app", nil, -1); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("%s: negative length: %v", name, err)
+		}
 	}
 	// A transform's exporter.
 	ck, sk := kmPair("k")

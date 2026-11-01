@@ -402,6 +402,7 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	if s.cfg.DeferredPSK && s.secretSet && (s.mp == nil || !s.mp.usePSK) {
 		// A deferred PSK supplied early that the negotiation did not
 		// select is dropped: SetJoinSecret now reports ErrNotNegotiated.
+		clear(s.cfg.PSK)
 		s.cfg.PSK, s.secretSet = nil, false
 	}
 	if s.state == StateEstablishing {

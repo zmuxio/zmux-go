@@ -772,6 +772,9 @@ func (c *Conn) ExportKeyingMaterial(label string, ctxData []byte, length int) ([
 	if strings.HasPrefix(label, "EXPORTER-zmux-") {
 		return nil, fmt.Errorf("%w: exporter label %q is reserved", ErrInvalidConfig, label)
 	}
+	if length < 0 {
+		return nil, fmt.Errorf("%w: exporter length %d is negative", ErrInvalidConfig, length)
+	}
 	if c.boot == nil {
 		return nil, ErrNoExporter
 	}

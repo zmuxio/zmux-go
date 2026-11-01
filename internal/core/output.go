@@ -909,7 +909,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		}
 		return chunkSent
 	}
-	st.opened, st.reopen = true, false
+	st.opened = true
 	s.openedCtl(st)
 	if s.dg != nil && len(s.dg.send) > 0 {
 		s.wakeAllWriters() // its held datagrams may follow

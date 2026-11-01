@@ -70,7 +70,6 @@ type Stream struct {
 	pinned      bool // identifier pinned, opening frame owed
 	openWant    bool // Flush before establishment: opening frame owed once allowed
 	opened      bool // first frame emitted (local) or opened (peer)
-	reopen      bool // opening frame re-issued after an early-data restart
 	cancelled   bool // cancelled before any frame: never on the wire
 	replayable  bool
 

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"slices"
 	"testing"
@@ -77,9 +78,13 @@ func TestJoinSecretEarlyNotSelected(t *testing.T) {
 	if err := s.SetJoinSecret(psk); err != nil {
 		t.Fatal(err)
 	}
+	held := s.cfg.PSK
 	peer := FloorParams()
 	if err := s.processPeerParams(&peer); err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Equal(held, make([]byte, len(held))) {
+		t.Fatal("dropped PSK not cleared")
 	}
 	if s.secretSet || s.cfg.PSK != nil || s.JoinSecretPending() {
 		t.Fatalf("secret kept: set=%v pending=%v", s.secretSet, s.JoinSecretPending())
@@ -174,5 +179,54 @@ func TestFlushFrames(t *testing.T) {
 		}
 		s.WriteDone(b, nil, Time(Second))
 		PutBatch(b)
+	}
+}
+
+// After an early-data restart, a preamble larger than the stream credit
+// of the peer's new parameters is reported by STREAM_DATA_BLOCKED at
+// once rather than held for the opening STREAM frame it blocks (SPEC.md
+// 7.2); the peer's credit then lets the stream finish.
+func TestRestartPreambleBlocked(t *testing.T) {
+	s, p := channelSession(t, nil, false)
+	s.feat.Preamble = true
+	s.peer.MaxStreamDataBidiRem = 1 << 20
+	s.loc[0].limit = 10
+	s.conn.sendMax = 1 << 20
+	s.earlyHeld = true // carrier early data: the bytes stay for a re-issue
+	st, _ := s.OpenStream(true)
+	if err := s.SetOpenInfo(st, make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.Write(st, []byte("data"), true)
+	pollKinds(t, s, p, 2)
+	if !st.opened {
+		t.Fatal("not opened before the restart")
+	}
+	s.peerSeen = false
+	if !s.RestartEarly(CarrierInfo{}, Time(Second)) {
+		t.Fatal("RestartEarly refused")
+	}
+	if k := pollKinds(t, s, p, 2); slices.Contains(k, wire.KindStream) {
+		t.Fatalf("stream re-issued before the peer's parameters: %v", k)
+	}
+	peer := s.cfg.Local
+	peer.Preamble = 16
+	peer.MaxStreamDataBidiRem = 16
+	record := func(f []byte) {
+		s.Receive(p.id, 0, nil, append(varint.AppendVarint(nil, uint64(len(f))), f...), Time(Second))
+	}
+	record(wire.AppendTransportParams(nil, wire.AppendParams(nil, &peer)))
+	if !s.peerSeen || s.state != StateActive {
+		t.Fatalf("peer parameters not taken: state=%v %v", s.state, s.err)
+	}
+	s.loc[0].limit = 10
+	k := pollKinds(t, s, p, 3)
+	if !slices.Contains(k, wire.KindStreamDataBlocked) || slices.Contains(k, wire.KindStream) {
+		t.Fatalf("after the restart: %v (opened=%v ctl=%b)", k, st.opened, st.ctl)
+	}
+	record(wire.AppendMaxStreamData(nil, st.id, 1<<20))
+	fs := pollStream(t, s, p)
+	if len(fs) == 0 || !fs[len(fs)-1].Fin || !st.opened {
+		t.Fatalf("after the credit: %+v (opened=%v)", fs, st.opened)
 	}
 }
