@@ -77,7 +77,7 @@ func TestShapingGateMidBatch(t *testing.T) {
 			s.conn.sendMax = 1 << 20
 			const at = 3
 			sh := &gateAtShaper{at: at, maxLen: 500, gate: gate}
-			s.SetShaper(func(uint64, uint8) shaping.Shaper { return sh })
+			s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return sh })
 			st, err := s.OpenStream(true)
 			if err != nil {
 				t.Fatal(err)

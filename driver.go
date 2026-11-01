@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 )
@@ -24,6 +25,8 @@ type pipeDrv struct {
 	tcp    tcpInfo        // the TCP socket under the carrier, if any
 	outer  outerRef       // the outer session of a stream-backed carrier
 	gs     pipeGoroutines // the attachment's goroutines (HandlePipe waits on them)
+
+	admitted any // the admission value of the carrier that joined it (set once, under the session lock)
 
 	// Guarded by the session lock (and dead, below).
 	lanes   map[uint64]*laneOut // outbound lanes above 0
@@ -123,7 +126,7 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 		_, lanes = p.R.(laneOpener)
 	}
 	info := core.CarrierInfo{Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
-		Lanes: lanes, QueueBound: lowWater}
+		Lanes: lanes, QueueBound: lowWater, WriteOverhead: p.WriteOverhead}
 	if ch := channelOf(p); ch != nil {
 		info.Channel = ch
 	}
@@ -344,13 +347,29 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 	} else if lo == nil && pd.tcp.rc != nil {
 		unsentOf = pd.tcp.unsent
 	}
+	// The carrier's retransmissions (lane 0: lanes share their carrier).
+	var retransOf func() (uint64, bool)
+	if lo == nil {
+		if r, ok := w.(retransReporter); ok {
+			retransOf = r.Retransmitted
+		} else if pd.tcp.rc != nil {
+			retransOf = pd.tcp.retransmitted
+		}
+	}
+	var retransAt time.Time
 	var werr error
 	for {
 		// Read outside the session lock.
-		var unsent uint64
-		var unsentOK bool
+		var unsent, retrans uint64
+		var unsentOK, retransOK bool
 		if unsentOf != nil {
 			unsent, unsentOK = unsentOf()
+		}
+		if retransOf != nil {
+			if t := time.Now(); t.Sub(retransAt) >= time.Second {
+				retransAt = t
+				retrans, retransOK = retransOf()
+			}
 		}
 		if lo == nil && pd.takeShutdown() {
 			pd.hc.shutdownWrite()
@@ -370,6 +389,9 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 		now := c.clk.now()
 		if unsentOK {
 			c.s.SetCarrierUnsent(pd.id, lane, unsent)
+		}
+		if retransOK {
+			c.s.SetCarrierRetransmitted(pd.id, retrans)
 		}
 		if reported {
 			c.s.WriteDone(b, werr, now)

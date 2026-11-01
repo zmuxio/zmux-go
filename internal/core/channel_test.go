@@ -122,7 +122,7 @@ func TestChannelSendFallback(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s, p := channelSession(t, tc.ch, tc.negotiated)
 			if tc.shaped {
-				s.SetShaper(func(uint64, uint8) shaping.Shaper { return nopShaper{} })
+				s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return nopShaper{} })
 			}
 			if err := s.SendDatagram(nil, 0, []byte("x")); err != nil {
 				t.Fatal(err)

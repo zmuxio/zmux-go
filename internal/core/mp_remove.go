@@ -15,6 +15,11 @@ func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
 	if p.out != nil && a.out != OutFailed && a.out != OutClosed {
 		a.out = OutFailed
 		a.failures++
+		var sent uint64
+		for _, l := range p.out.lanes {
+			sent += l.pos
+		}
+		a.bytesLost = sent - min64(sent, p.out.snd.cum)
 		s.stats.PipeFailures++
 		p.out.failed = true
 		if s.shp != nil {
@@ -146,12 +151,7 @@ func (s *Session) peerAbandon(p *Pipe, code uint64) {
 	a.abandonCodeRecv = code
 	if a.joinerLocal && code == wire.PipeResourceLimit {
 		a.resLimited = true
-		s.stats.JoinRefusals++
-		// Refusal backoff (MULTIPATH.md 5.7 step 1).
-		m := s.mp
-		m.backoffExp++
-		d := Second << min(m.backoffExp-1, 6)
-		m.backoffUntil = s.now.Add(minD(d, 60*Second))
+		s.joinRefused()
 	}
 	if code == wire.NoError {
 		if !a.draining {
@@ -165,6 +165,38 @@ func (s *Session) peerAbandon(p *Pipe, code uint64) {
 		s.failPipe(p, code, nil)
 	}
 	s.maybeRetire(p)
+}
+
+// joinRefused counts a refused local join and extends the refusal
+// backoff (MULTIPATH.md 5.7 step 1).
+func (s *Session) joinRefused() {
+	s.stats.JoinRefusals++
+	m := s.mp
+	m.backoffExp++
+	d := Second << min(m.backoffExp-1, 6)
+	m.backoffUntil = s.now.Add(minD(d, 60*Second))
+}
+
+// joinAnsweredClose handles a CONNECTION_CLOSE that starts the inbound
+// side of an unconfirmed local join (MULTIPATH.md 5.4 step 3, 5.7): the
+// peer holds no session for the locator. ZMUX_RESUME_FAILED on a
+// suspended session ends the session at once, with no pipe to send a
+// close on; otherwise only the join fails, ZMUX_RESUME_FAILED backing
+// later joins off as a refusal does.
+func (s *Session) joinAnsweredClose(p *Pipe, f *wire.Frame) {
+	resumeFailed := !f.App && f.Code == wire.ResumeFailed
+	if resumeFailed && s.state == StateSuspended {
+		s.closeWith(&SessionError{Kind: CloseTransport, Code: wire.ResumeFailed, Reason: "peer has no session"}, nil)
+		return
+	}
+	if resumeFailed {
+		s.joinRefused()
+	}
+	kind := CloseTransport
+	if f.App {
+		kind = CloseApplication
+	}
+	s.failPipe(p, wire.PipeFailed, &SessionError{Kind: kind, Code: f.Code, Remote: true, Reason: string(f.Data)})
 }
 
 // unackedStream reports stream data on the pipe not yet acknowledged.

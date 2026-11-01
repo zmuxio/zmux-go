@@ -50,12 +50,20 @@ type PipeInfo struct {
 	QueuedBytes   uint64
 	BytesInFlight uint64
 
-	BytesSent          uint64
-	BytesReceived      uint64
-	BytesAcked         uint64
-	RecordsSent        uint64
-	RecordsReceived    uint64
-	BytesReinjected    uint64
+	BytesSent       uint64
+	BytesReceived   uint64
+	BytesAcked      uint64
+	RecordsSent     uint64
+	RecordsReceived uint64
+	BytesReinjected uint64
+	// BytesLost is the outbound bytes sent and not acknowledged when the
+	// pipe failed (MULTIPATH.md 7.2), RecordsLost its estimate in records;
+	// BytesRetransmitted and LossRate come from the carrier
+	// (SetCarrierRetransmitted).
+	BytesLost          uint64
+	RecordsLost        uint64
+	BytesRetransmitted uint64
+	LossRate           float64
 	BytesOpportunistic uint64
 	PingsSent          uint64
 	PingsAnswered      uint64
@@ -124,6 +132,7 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 		}
 		pi.BytesAcked = d.snd.cum
 		pi.RecordsSent = d.records
+		pi.BytesRetransmitted, pi.LossRate = d.retrans, d.lossRate
 		pi.BytesInFlight = d.snd.so - min64(d.snd.so, d.snd.cum)
 		pi.DeliveryRate = d.snd.re.value()
 		pi.QueuedBytes, _ = s.carrierUnsent(p)
@@ -188,6 +197,10 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 			}
 		}
 		pi.BytesReinjected, pi.BytesOpportunistic, pi.PingsSent = a.reinjectedBytes, a.oppBytes, a.pingsSent
+		pi.BytesLost = a.bytesLost
+		if pi.BytesSent > 0 {
+			pi.RecordsLost = (a.bytesLost*pi.RecordsSent + pi.BytesSent - 1) / pi.BytesSent
+		}
 		pi.ProbeInterval, pi.ProbeJitter = s.probeInterval(p), s.probeJitter(a)
 	}
 	if p.in != nil {

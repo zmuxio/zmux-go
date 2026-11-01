@@ -24,6 +24,9 @@ type CarrierInfo struct {
 	// or an unsent count; otherwise the carrier queue limiter
 	// paces it.
 	QueueBound bool
+	// WriteOverhead is the fixed number of bytes each carrier write adds
+	// below the pipe (PipeIO.WriteOverhead), handed to the shaper factory.
+	WriteOverhead int
 	// Channel is the carrier's datagram channel for the pipe (EXTENSIONS.md
 	// 6.8), nil when it has none.
 	Channel Channel
@@ -130,9 +133,18 @@ type outDir struct {
 	lanes   []*outLane
 	snd     pipeSend
 	records uint64 // records written
-	q       pipeQuality
-	sig     *Signal
-	failed  bool
+	// The carrier's own retransmissions (SetCarrierRetransmitted) and the
+	// smoothed loss rate sampled from them.
+	retrans      uint64
+	retransKnown bool
+	lossRate     float64
+	lossHas      bool
+	lossAt       Time
+	lossSent     uint64 // BytesSent at lossAt
+	lossRetrans  uint64 // retrans at lossAt
+	q            pipeQuality
+	sig          *Signal
+	failed       bool
 }
 
 type outLane struct {

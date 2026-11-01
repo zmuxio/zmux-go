@@ -128,6 +128,24 @@ type Pipe struct {
 // ID returns the pipe ID.
 func (p *Pipe) ID() uint64 { return p.id }
 
+// Admitted returns the Decision.Value of the admission that accepted the
+// pipe's carrier, the one that carried its PIPE_JOIN (or the session's
+// value for the bootstrap pipe, Conn.Admitted). It is nil without one, on
+// the dialing side, and once the session no longer knows the pipe. zmux
+// does not compare it with the session's: a host that requires a join to
+// come from the session's client compares them, in WrapPipe or here.
+func (p *Pipe) Admitted() any {
+	if p.id == 0 {
+		return p.c.admitted
+	}
+	p.c.lock()
+	defer p.c.unlock()
+	if pd := p.c.pipes[p.id]; pd != nil {
+		return pd.admitted
+	}
+	return nil
+}
+
 // AddPipe joins a new carrier to the session in band (MULTIPATH.md 5.7) and
 // waits until the join is confirmed, the pipe fails, or ctx ends (the pipe
 // is then removed). A join that the attachment cap or the refusal backoff
@@ -152,6 +170,9 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 	dir := o.Direction
 	if (dir != DirReceiveOnly && p.W == nil) || (dir != DirSendOnly && p.R == nil && !oob) {
 		return nil, fmt.Errorf("%w: the carrier lacks a half the direction needs", ErrInvalidConfig)
+	}
+	if err := p.checkOverhead(); err != nil {
+		return nil, err
 	}
 	if o.FateGroup == 0 {
 		o.FateGroup = p.FateGroup
@@ -564,7 +585,25 @@ type PipeStats struct {
 	RecordsReceived uint64
 	// BytesReinjected counts stream bytes sent again elsewhere because
 	// this pipe failed or became suspect.
-	BytesReinjected        uint64
+	BytesReinjected uint64
+	// BytesLost is the outbound bytes sent and not acknowledged when the
+	// pipe failed, over all lanes (BytesSent - BytesAcked at that moment);
+	// 0 before a failure and without acknowledgements. They are carrier
+	// bytes with frame overhead, sent again elsewhere by reinjection,
+	// unlike BytesReinjected, the stream payload sent again. RecordsLost is
+	// its estimate in records, BytesLost x RecordsSent / BytesSent rounded
+	// up.
+	BytesLost   uint64
+	RecordsLost uint64
+	// BytesRetransmitted is the bytes the carrier itself retransmitted, as
+	// its adapter reports them (PipeIO: Retransmitted), sampled at most once
+	// a second; 0 when it reports none. Pipes sharing one carrier
+	// connection (QUIC streams of one connection) report the connection's
+	// count, the same on each. LossRate is the smoothed carrier loss rate:
+	// an EWMA (gain 1/8) of the retransmitted bytes per byte sent between
+	// samples at least 1 s apart; 0 before the first sample.
+	BytesRetransmitted     uint64
+	LossRate               float64
 	BytesOpportunistic     uint64 // opportunistic copies sent on the outbound pipe
 	BytesRedundant         uint64 // redundant copies sent on the outbound pipe
 	BytesDuplicateReceived uint64 // duplicate stream bytes received on the inbound pipe
@@ -674,6 +713,8 @@ func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
 		DeliveryRate: uint64(pi.DeliveryRate), QueuedBytes: pi.QueuedBytes, BytesInFlight: pi.BytesInFlight,
 		BytesSent: pi.BytesSent, BytesReceived: pi.BytesReceived, BytesAcked: pi.BytesAcked,
 		RecordsSent: pi.RecordsSent, RecordsReceived: pi.RecordsReceived, BytesReinjected: pi.BytesReinjected,
+		RecordsLost: pi.RecordsLost, BytesLost: pi.BytesLost, BytesRetransmitted: pi.BytesRetransmitted,
+		LossRate:           pi.LossRate,
 		BytesOpportunistic: pi.BytesOpportunistic, BytesRedundant: pi.BytesRedundant,
 		BytesDuplicateReceived: pi.BytesDuplicateRecv, PingsSent: pi.PingsSent, PingsAnswered: pi.PingsAnswered,
 		SinceLastAck: time.Duration(pi.SinceLastAck), SinceLastReceive: time.Duration(pi.SinceLastReceive),
@@ -715,6 +756,7 @@ func (st *PipeStats) clearOutbound() {
 	st.QueuedBytes, st.QueueDelay, st.BytesInFlight = 0, 0, 0
 	st.BytesSent, st.BytesAcked, st.RecordsSent = 0, 0, 0
 	st.BytesReinjected, st.BytesOpportunistic, st.BytesRedundant = 0, 0, 0
+	st.RecordsLost, st.BytesLost, st.BytesRetransmitted, st.LossRate = 0, 0, 0, 0
 	st.PingsSent, st.PingsAnswered, st.SinceLastAck = 0, 0, 0
 	st.LanesOut, st.LanesRefused = 0, 0
 }

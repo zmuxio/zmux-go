@@ -25,6 +25,26 @@ type PipePool struct {
 	// all of them are, and they are replaced together. ctx bounds the
 	// joins.
 	Join func(ctx context.Context, c *Conn, o PipeOptions) ([]*Pipe, error)
+	// Mode, in place of Dial and Join, dials each member over a carrier
+	// kind of the mode's candidates (a split candidate joins as a split
+	// carrier), presenting the session's Config.Credential. Stable first,
+	// then upgrade: a member is dialed over the most robust kind available
+	// (a kind ModePolicy.Cache holds as usable, else the exchange carrier,
+	// else the last), skipping the kinds the cache holds as failed unless
+	// all are; a member of a kind that a preferred kind not backing off
+	// could replace is rotated to it, make before break, and the
+	// replacement takes over once it has stayed usable for
+	// ModePolicy.Settle. A kind whose join fails, whose replacement ends
+	// before it settled, or whose member fails within
+	// ModePolicy.DropWindow of being joined, is recorded as failed. Each
+	// try is reported as an EventCarrierCandidate, and a member joined
+	// over a kind other than the session's carrier as an
+	// EventCarrierChosen. ExplicitMode dials its one kind only, without
+	// the cache.
+	Mode Mode
+	// ModePolicy is the policy of Mode (nil: the defaults, with a cache
+	// private to the pool); its NoJoin does not apply.
+	ModePolicy *ModePolicy
 	// Count is the number of usable pipes to keep (0: 1, as a pool of no
 	// pipes has nothing to maintain).
 	Count int
@@ -112,6 +132,12 @@ func backoffWait(b time.Duration) time.Duration {
 // while the session is suspended, and dials outside every lock. It
 // returns ctx's error or the session's.
 func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
+	return c.maintainPipes(ctx, pool, nil)
+}
+
+// maintainPipes is MaintainPipes; seed, when set, is the pool's mode and
+// its first member (DialMode).
+func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed) error {
 	if c == nil {
 		return net.ErrClosed
 	}
@@ -133,8 +159,18 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 	if pool.MaxBackoff == 0 {
 		pool.MaxBackoff = DefaultMaxBackoff
 	}
-	if (pool.Dial == nil) == (pool.Join == nil) {
-		return fmt.Errorf("%w: PipePool needs exactly one of Dial and Join", ErrInvalidConfig)
+	var mp *modePool
+	switch {
+	case seed != nil:
+		mp = seed.mp
+	case len(pool.Mode.candidates) > 0:
+		var err error
+		if mp, err = newModePool(pool.Mode, pool.ModePolicy, c.cfg.Credential); err != nil {
+			return err
+		}
+	}
+	if n := btoi(pool.Dial != nil) + btoi(pool.Join != nil) + btoi(mp != nil); n != 1 {
+		return fmt.Errorf("%w: PipePool needs exactly one of Dial, Join and Mode", ErrInvalidConfig)
 	}
 	type member struct {
 		ps     []*Pipe
@@ -144,6 +180,10 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 		repl   []*Pipe // its replacement while rotating
 		idle   time.Duration
 		retire bool // the policy asked for its replacement
+		// With a mode: the kind of ps and of repl, when ps were joined
+		// and repl became usable (wall clock, for the cache).
+		kind, replKind   int
+		joined, replSeen time.Time
 	}
 	closeAll := func(ps []*Pipe) {
 		for _, p := range ps {
@@ -176,12 +216,15 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 	timer := timeshim.NewTimer(clk, time.Hour) // the next recheck or dial, per pass
 	timer.Stop()
 	defer timer.Stop()
-	join := func() ([]*Pipe, error) {
+	join := func(kind int) ([]*Pipe, error) {
 		dctx, cancel := timeshim.WithDeadline(ctx, clk, clk.Now().Add(c.cfg.handshakeTimeout()))
 		defer cancel()
 		o := pool.Options
 		if pool.Policy != nil {
 			o = dec.probeOptions(o)
+		}
+		if mp != nil {
+			return mp.join(dctx, c, kind, o)
 		}
 		if pool.Join != nil {
 			var ps []*Pipe
@@ -207,9 +250,9 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 	}
 	// dial joins a member now, counting the attempt for the backoff that
 	// every dial of the pool, redial or rotation, shares.
-	dial := func() ([]*Pipe, error) {
+	dial := func(kind int) ([]*Pipe, error) {
 		lastDial = clk.Now()
-		ps, err := join()
+		ps, err := join(kind)
 		if err != nil {
 			failures++
 			wait = backoffWait(backoff)
@@ -220,16 +263,33 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 		wait = backoffWait(backoff)
 		return ps, nil
 	}
-	newMember := func(ps []*Pipe) *member {
+	newMember := func(ps []*Pipe, kind int) *member {
 		return &member{ps: ps, born: clk.Now(), limitB: uint64(jitter(float64(pool.Rotate.MaxBytes))),
-			limitT: time.Duration(jitter(float64(pool.Rotate.MaxAge)))}
+			limitT: time.Duration(jitter(float64(pool.Rotate.MaxAge))), kind: kind, joined: time.Now()}
+	}
+	if seed != nil {
+		m := newMember(seed.pipes, seed.kind)
+		m.joined = seed.born
+		members = append(members, m)
+	}
+	// With a mode, a session that fails counts against the kinds of the
+	// members joined less than DropWindow ago.
+	sessionEnded := func() error {
+		err := c.closedErr()
+		var ae *ApplicationError
+		if mp != nil && !errors.As(c.Wait(), &ae) {
+			for _, m := range members {
+				mp.dropped(m.kind, m.joined)
+			}
+		}
+		return err
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c.done:
-			return c.closedErr()
+			return sessionEnded()
 		default:
 		}
 		// Watch before reading the state: a change after the read wakes
@@ -251,8 +311,15 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 					Idle: m.idle, Pipes: len(m.ps), BytesSent: st.BytesSent, BytesReceived: st.BytesReceived})
 			} else {
 				closeAll(m.ps) // the rest of a member goes with its failed pipe
+				if mp != nil && !c.isDone() {
+					mp.dropped(m.kind, m.joined)
+				}
 				if m.repl != nil {
-					live = append(live, newMember(m.repl))
+					r := newMember(m.repl, m.replKind)
+					if mp != nil {
+						mp.established(c, r.kind)
+					}
+					live = append(live, r)
 				}
 			}
 		}
@@ -308,8 +375,15 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 		var dialAt time.Time
 		if len(members) < count && c.JoinReady() {
 			if dialDue {
-				if ps, err := dial(); err == nil {
-					members = append(members, newMember(ps))
+				kind := -1
+				if mp != nil {
+					kind = mp.pick(time.Now())
+				}
+				if ps, err := dial(kind); err == nil {
+					members = append(members, newMember(ps, kind))
+					if mp != nil {
+						mp.established(c, kind)
+					}
 				}
 				continue
 			}
@@ -317,16 +391,22 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 		}
 		// Rotate: only usable pipes, never while a direction is lacking, one
 		// dial per pass under the same backoff as a redial.
+		// With a mode, a member is also rotated to a preferred kind.
 		dialed := false
 		for _, m := range members {
-			if lacking || !c.JoinReady() || m.repl != nil || !m.retire && pool.Rotate.MaxBytes == 0 && pool.Rotate.MaxAge == 0 {
+			upgrade := -1
+			if mp != nil && m.repl == nil {
+				upgrade = mp.better(m.kind, time.Now())
+			}
+			if lacking || !c.JoinReady() || m.repl != nil ||
+				!m.retire && upgrade < 0 && pool.Rotate.MaxBytes == 0 && pool.Rotate.MaxAge == 0 {
 				continue
 			}
 			st, _, usable := memberState(m.ps)
 			if !usable {
 				continue
 			}
-			due := m.retire || pool.Rotate.MaxBytes > 0 && max(st.BytesSent, st.BytesReceived) >= m.limitB ||
+			due := m.retire || upgrade >= 0 || pool.Rotate.MaxBytes > 0 && max(st.BytesSent, st.BytesReceived) >= m.limitB ||
 				pool.Rotate.MaxAge > 0 && timeshim.Since(clk, m.born) >= m.limitT
 			if !due {
 				continue
@@ -335,8 +415,12 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 				dialAt = from.Add(delay)
 				break
 			}
-			if r, err := dial(); err == nil {
-				m.repl = r
+			kind := upgrade
+			if mp != nil && kind < 0 {
+				kind = mp.pick(time.Now())
+			}
+			if r, err := dial(kind); err == nil {
+				m.repl, m.replKind, m.replSeen = r, kind, time.Time{}
 			}
 			dialed = true
 			break
@@ -344,14 +428,37 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 		if dialed {
 			continue // decide again before the next dial
 		}
-		// Close an old pipe once its replacement is usable.
+		// Close an old pipe once its replacement is usable (with a mode,
+		// once it has stayed usable for Settle); a replacement that ends
+		// first is dropped.
 		for _, m := range members {
 			if m.repl == nil {
 				continue
 			}
-			if _, _, usable := memberState(m.repl); usable {
-				closeAll(m.ps)
-				*m = *newMember(m.repl)
+			_, alive, usable := memberState(m.repl)
+			if !alive {
+				closeAll(m.repl)
+				if mp != nil {
+					mp.record(m.replKind, false)
+				}
+				m.repl = nil
+				continue
+			}
+			if !usable {
+				continue
+			}
+			if mp != nil {
+				if m.replSeen.IsZero() {
+					m.replSeen = time.Now()
+				}
+				if time.Since(m.replSeen) < mp.p.settle {
+					continue // the pass tick looks again
+				}
+			}
+			closeAll(m.ps)
+			*m = *newMember(m.repl, m.replKind)
+			if mp != nil {
+				mp.established(c, m.kind)
 			}
 		}
 		next := time.Duration(-1)
@@ -375,8 +482,25 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c.done:
-			return c.closedErr()
+			return sessionEnded()
 		}
 		timer.Stop()
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// isDone reports whether the session has ended.
+func (c *Conn) isDone() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
 	}
 }

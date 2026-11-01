@@ -28,7 +28,13 @@ func (o *Options) source() rand.Source {
 
 // Factory returns a zmux.ShaperFactory running d. d is validated and must
 // not be modified afterwards. Every pipe runs d as defined, whatever its
-// ShapedPipe says.
+// ShapedPipe says, except for its WriteOverhead: the max_len and pad_to
+// lengths of d are those of a carrier write below the pipe, so that on
+// the first record of each write (shaping.RecordView.WriteStart) the
+// pipe's WriteOverhead is taken off them; a max_len that falls below
+// shaping.MinMaxLen is raised to it (and counted as clamped). pad_multiple
+// (a block size, not a length) and inject lengths (whose write is not
+// known when planned) are not changed.
 func (d *Definition) Factory(o Options) (zmux.ShaperFactory, error) {
 	if err := d.Check(o.Limits); err != nil {
 		return nil, err
@@ -59,7 +65,11 @@ func (d *Definition) Factory(o Options) (zmux.ShaperFactory, error) {
 			f.kept[i], f.has[i] = sh.draw(v), true
 		}
 	}
-	return func(zmux.ShapedPipe) shaping.Shaper { return f.newShaper() }, nil
+	return func(p zmux.ShapedPipe) shaping.Shaper {
+		s := f.newShaper()
+		s.over = max(p.WriteOverhead, 0)
+		return s
+	}, nil
 }
 
 // NewFactory parses a JSON Definition and returns its Factory.
@@ -140,6 +150,7 @@ type shaper struct {
 	pkept []float64 // pipe-scoped values
 	phas  []bool
 	seq   uint64
+	over  int            // ShapedPipe.WriteOverhead
 	rep   *shaping.Reply // the reply being built
 	out   struct {       // what rep points to
 		inj    shaping.Inject
@@ -158,7 +169,7 @@ type trig struct {
 
 func (s *shaper) Capabilities() shaping.Caps { return s.f.caps }
 
-func (s *shaper) Plan(_ *shaping.RecordView, p *shaping.RecordPlan) {
+func (s *shaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
 	for i := range s.ms {
 		r := s.f.d.Machines[i].States[s.ms[i].cur].Record
 		if r == nil {
@@ -185,6 +196,12 @@ func (s *shaper) Plan(_ *shaping.RecordView, p *shaping.RecordPlan) {
 			p.Delay = max(p.Delay, s.dur(r.Delay))
 		}
 		p.Flush = p.Flush || r.Flush
+	}
+	if o := s.over; o > 0 && v.WriteStart {
+		if p.MaxLen > 0 {
+			p.MaxLen = max(p.MaxLen-o, 1) // below MinMaxLen: raised and counted by the session
+		}
+		p.PadTo = max(p.PadTo-o, 0)
 	}
 	s.rep = &p.Reply
 	s.fire(OnRecordOut, 0)

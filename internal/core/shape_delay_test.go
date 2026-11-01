@@ -60,7 +60,7 @@ func TestShapingDelayHoldsControlFrames(t *testing.T) {
 	s.loc[0].limit = 10
 	s.conn.sendMax = 1 << 20
 	ds := &delayShaper{delay: 20 * time.Millisecond}
-	s.SetShaper(func(uint64, uint8) shaping.Shaper { return ds })
+	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return ds })
 	st, err := s.OpenStream(true)
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +108,7 @@ func TestShapingDelayHoldsControlFrames(t *testing.T) {
 	// CONNECTION_CLOSE goes during a delay.
 	s2, p2 := channelSession(t, nil, false)
 	ds2 := &delayShaper{delay: time.Hour}
-	s2.SetShaper(func(uint64, uint8) shaping.Shaper { return ds2 })
+	s2.SetShaper(func(uint64, uint8, int) shaping.Shaper { return ds2 })
 	s2.pend.maxData, s2.pend.forceMaxData = true, true
 	b2 := GetBatch()
 	defer PutBatch(b2)
@@ -229,7 +229,7 @@ func (x *stateShaper) OnEvent(*shaping.Event, *shaping.Reply) {}
 func TestShapingPlansARecordOnce(t *testing.T) {
 	s, p := channelSession(t, nil, false)
 	x := &stateShaper{}
-	s.SetShaper(func(uint64, uint8) shaping.Shaper { return x })
+	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return x })
 	s.pend.maxData, s.pend.forceMaxData = true, true
 	now := Time(Second)
 	b := GetBatch()

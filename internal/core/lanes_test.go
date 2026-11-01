@@ -122,7 +122,7 @@ func TestLaneFirstRecordShaped(t *testing.T) {
 	s.feat = Features{PipeAck: true, LanesOut: true, LanesIn: true}
 	p.out.lo.offered = true
 	ps := &planShaper{delay: 20 * time.Millisecond, padTo: 200}
-	s.SetShaper(func(uint64, uint8) shaping.Shaper { return ps })
+	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return ps })
 	lane, ok := s.LaneOpened(p.id, info, nil)
 	if !ok {
 		t.Fatal("lane not opened")

@@ -1,8 +1,14 @@
-// Package testproxy is a reverse proxy for tests that behaves as common
-// deployments in front of a server do: a reverse proxy with its default
-// configuration, a CDN that buffers whole bodies, and a front that passes
-// WebSocket only. It forwards to the upstream over HTTP/1.1.
-package testproxy
+// Package zmuxtest is experimental test support, outside the zmux API
+// stability promise: it may change in any commit and is not for
+// production use. It uses the standard library only.
+//
+// Proxy is a reverse proxy that behaves as common deployments in front of
+// a server do: a reverse proxy with its default configuration, a CDN that
+// buffers whole bodies, and a front that passes WebSocket only; it
+// forwards to the upstream over HTTP/1.1. Relay is a TCP relay that loses
+// carriers on demand: idle and age cuts, black holes, refusals and
+// explicit cuts.
+package zmuxtest
 
 import (
 	"bufio"

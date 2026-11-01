@@ -59,6 +59,10 @@ type Conn struct {
 	cancel context.CancelCauseFunc
 	err    error // terminal error once done
 
+	// admitted is the admission value of the bootstrap carrier (set
+	// before the session is shared, never changed).
+	admitted any
+
 	orphMu    sync.Mutex
 	orphans   []*core.Stream
 	orphanSig atomic.Pointer[core.Signal]
@@ -279,6 +283,9 @@ func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 	if p.R == nil || p.W == nil {
 		return nil, fmt.Errorf("%w: the bootstrap carrier needs both halves", ErrInvalidConfig)
 	}
+	if err := p.checkOverhead(); err != nil {
+		return nil, err
+	}
 	cfg = cfg.Clone()
 	transport := core.RoleInitiator
 	crole := core.RoleInitiator
@@ -295,12 +302,13 @@ func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 	if err != nil {
 		return nil, err
 	}
-	return startCore(ctx, p, cfg, cc, nil)
+	return startCore(ctx, p, cfg, cc, nil, nil)
 }
 
 // startCore starts a session from a resolved core configuration; lst is
-// the listener that owns it, if any.
-func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener) (*Conn, error) {
+// the listener that owns it, if any, and admitted the admission value of
+// its bootstrap carrier.
+func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted any) (*Conn, error) {
 	if cfg.PipeAuth.TLS {
 		exp, err := sessionExporter(p, lst == nil && cc.TransportRole == core.RoleInitiator)
 		if err != nil {
@@ -310,6 +318,7 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 	}
 	c := newConn(cfg, cc)
 	c.lst = lst
+	c.admitted = admitted
 	switch {
 	case lst != nil || cc.TransportRole == core.RoleResponder:
 		c.dialed = EndpointPeer
@@ -740,7 +749,7 @@ type ConnectionStats struct {
 	PipeFailures     uint64
 	JoinAuthFailures uint64 // joins whose token did not verify
 	JoinReplays      uint64 // joins closed as replays or too late
-	JoinRefusals     uint64 // own joins refused with ZMUX_PIPE_RESOURCE_LIMIT
+	JoinRefusals     uint64 // own joins refused with ZMUX_PIPE_RESOURCE_LIMIT, or answered with ZMUX_RESUME_FAILED
 	Suspensions      uint64
 	SuspendedTime    time.Duration // the current suspension included
 
@@ -774,6 +783,12 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		Suspensions: s.Suspensions, SuspendedTime: time.Duration(s.SuspendedTime),
 		SchedulerAnswers: s.SchedulerAnswers, SchedulerFallbacks: s.SchedulerFallbacks}
 }
+
+// Admitted returns the Decision.Value of the admission that accepted the
+// session's bootstrap carrier (for a split bootstrap, its uplink half's),
+// nil without one and on the dialing side. It does not change for the
+// session's lifetime, resumes included; Pipe.Admitted is each pipe's.
+func (c *Conn) Admitted() any { return c.admitted }
 
 // LocalAddr returns the local address of pipe 0 when its carrier has one.
 func (c *Conn) LocalAddr() net.Addr {

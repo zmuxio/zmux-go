@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -247,5 +248,42 @@ func TestStatsStreamInfo(t *testing.T) {
 	lst.countFrame(8, 4)
 	if in := s.StreamInfo(lst); in.BytesSent != 7 {
 		t.Fatalf("BytesSent = %d, want 7", in.BytesSent)
+	}
+}
+
+func TestStatsBytesLost(t *testing.T) {
+	s, p := statsMP()
+	ol := p.out.lanes[0]
+	ol.pos, p.out.records, p.out.snd.cum = 1000, 10, 400
+	if pi, _ := s.PipeInfo(p.id); pi.BytesLost != 0 || pi.RecordsLost != 0 {
+		t.Fatalf("before the failure: %d bytes, %d records lost", pi.BytesLost, pi.RecordsLost)
+	}
+	s.failPipe(p, 0, nil)
+	pi, _ := s.PipeInfo(p.id)
+	if pi.BytesLost != 600 || pi.RecordsLost != 6 {
+		t.Fatalf("%d bytes, %d records lost, want 600, 6", pi.BytesLost, pi.RecordsLost)
+	}
+}
+
+func TestStatsLossRate(t *testing.T) {
+	s, p := statsMP()
+	ol := p.out.lanes[0]
+	s.SetCarrierRetransmitted(p.id, 0) // baseline
+	ol.pos += 1000
+	s.SetNow(s.now.Add(Second / 2))
+	s.SetCarrierRetransmitted(p.id, 100) // too early: no sample
+	if pi, _ := s.PipeInfo(p.id); pi.LossRate != 0 || pi.BytesRetransmitted != 100 {
+		t.Fatalf("before a sample: rate %v, %d retransmitted", pi.LossRate, pi.BytesRetransmitted)
+	}
+	s.SetNow(s.now.Add(Second / 2))
+	s.SetCarrierRetransmitted(p.id, 100)
+	if pi, _ := s.PipeInfo(p.id); pi.LossRate != 0.1 {
+		t.Fatalf("first sample: rate %v, want 0.1", pi.LossRate)
+	}
+	ol.pos += 1000
+	s.SetNow(s.now.Add(Second))
+	s.SetCarrierRetransmitted(p.id, 100) // no loss in this interval
+	if pi, _ := s.PipeInfo(p.id); math.Abs(pi.LossRate-(0.1-0.1/8)) > 1e-12 {
+		t.Fatalf("second sample: rate %v, want %v", pi.LossRate, 0.1-0.1/8)
 	}
 }

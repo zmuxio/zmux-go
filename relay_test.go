@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
-	"github.com/zmuxio/zmux-go/internal/testproxy"
 	"github.com/zmuxio/zmux-go/shaping/machine"
+	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 // Tests of carrier loss through relays that behave as intermediaries on
@@ -34,12 +34,12 @@ func relayConfig(resume time.Duration) *zmux.Config {
 // client whose bootstrap carrier goes direct or through the relay.
 type relayEnv struct {
 	ln     net.Listener
-	relay  *testproxy.Relay
+	relay  *zmuxtest.Relay
 	client *zmux.Conn
 	server *zmux.Conn
 }
 
-func newRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, ro testproxy.RelayOptions, viaRelay bool) *relayEnv {
+func newRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, ro zmuxtest.RelayOptions, viaRelay bool) *relayEnv {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -63,7 +63,7 @@ func newRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, ro testproxy.RelayOption
 			}()
 		}
 	}()
-	rl, err := testproxy.NewRelay(ln.Addr().String(), ro)
+	rl, err := zmuxtest.NewRelay(ln.Addr().String(), ro)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestRelayIdleLimit(t *testing.T) {
 	t.Parallel()
 	t.Run("probes keep the pipe", func(t *testing.T) {
 		t.Parallel()
-		e := newRelayEnv(t, relayConfig(0), relayConfig(0), testproxy.RelayOptions{IdleCut: 2500 * time.Millisecond}, false)
+		e := newRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{IdleCut: 2500 * time.Millisecond}, false)
 		d := &dialer{addr: e.relay.Addr()}
 		maintain(t, e.client, zmux.PipePool{Dial: d.dial,
 			Options: zmux.PipeOptions{ProbeInterval: time.Second, ProbeJitter: 0.3}})
@@ -196,7 +196,7 @@ func TestRelayIdleLimit(t *testing.T) {
 		// pool pipe is silent after its join until its own probe at 4 s.
 		ccfg, scfg := relayConfig(0), relayConfig(0)
 		ccfg.SchedulerParams.NoProbeJitter, scfg.SchedulerParams.NoProbeJitter = true, true
-		e := newRelayEnv(t, ccfg, scfg, testproxy.RelayOptions{IdleCut: 2500 * time.Millisecond}, false)
+		e := newRelayEnv(t, ccfg, scfg, zmuxtest.RelayOptions{IdleCut: 2500 * time.Millisecond}, false)
 		d := &dialer{addr: e.relay.Addr()}
 		maintain(t, e.client, zmux.PipePool{Dial: d.dial, Options: zmux.PipeOptions{ProbeInterval: 4 * time.Second}})
 		poll(t, 5*time.Second, "pool pipe", func() bool { return len(activePool(e.client)) == 1 })
@@ -223,7 +223,7 @@ func TestRelayIdleLimit(t *testing.T) {
 // the pool replaces it.
 func TestRelayBlackHole(t *testing.T) {
 	t.Parallel()
-	e := newRelayEnv(t, relayConfig(0), relayConfig(0), testproxy.RelayOptions{}, false)
+	e := newRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, false)
 	d := &dialer{addr: e.relay.Addr()}
 	maintain(t, e.client, zmux.PipePool{Dial: d.dial, Options: zmux.PipeOptions{ProbeInterval: time.Second}})
 	poll(t, 5*time.Second, "pool pipe", func() bool { return len(activePool(e.client)) == 1 })
@@ -330,7 +330,7 @@ func (ev *events) first(k zmux.EventKind) (time.Time, bool) {
 // the echoed bytes arrive whole, without loss or duplication.
 func TestRelayLastPipeCutResumes(t *testing.T) {
 	t.Parallel()
-	e := newRelayEnv(t, relayConfig(120*time.Second), relayConfig(120*time.Second), testproxy.RelayOptions{}, true)
+	e := newRelayEnv(t, relayConfig(120*time.Second), relayConfig(120*time.Second), zmuxtest.RelayOptions{}, true)
 	pol, err := machine.PoolPolicy([]byte(`{"dial_after":[{"const":0.3},{"const":0.6}],"dial_jitter":0.3}`), machine.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -408,7 +408,7 @@ func TestRelayLastPipeCutResumes(t *testing.T) {
 // with ZMUX_RESUME_TIMEOUT, and the pool stops with the session's error.
 func TestRelayRefusedUntilResumeTimeout(t *testing.T) {
 	t.Parallel()
-	e := newRelayEnv(t, relayConfig(2*time.Second), relayConfig(2*time.Second), testproxy.RelayOptions{}, true)
+	e := newRelayEnv(t, relayConfig(2*time.Second), relayConfig(2*time.Second), zmuxtest.RelayOptions{}, true)
 	d := &dialer{addr: e.relay.Addr()}
 	done := maintain(t, e.client, zmux.PipePool{Dial: d.dial, MinBackoff: 200 * time.Millisecond})
 	poll(t, 5*time.Second, "pool pipe", func() bool { return len(activePool(e.client)) == 1 })
@@ -440,11 +440,11 @@ func TestRelayRefusedUntilResumeTimeout(t *testing.T) {
 type httpRelayEnv struct {
 	// ctx bounds the HTTP requests of the carriers: the session's life.
 	ctx   context.Context
-	relay *testproxy.Relay
+	relay *zmuxtest.Relay
 	hc    *http.Client
 	// relay2 and hc2: a second path to the server, for pipes that one
 	// relay's faults must not reach.
-	relay2 *testproxy.Relay
+	relay2 *zmuxtest.Relay
 	hc2    *http.Client
 	url    string
 	client *zmux.Conn
@@ -459,7 +459,7 @@ func newHTTPRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, split bool) *httpRel
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(hh)
-	rl, err := testproxy.NewRelay(srv.Listener.Addr().String(), testproxy.RelayOptions{})
+	rl, err := zmuxtest.NewRelay(srv.Listener.Addr().String(), zmuxtest.RelayOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +467,7 @@ func newHTTPRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, split bool) *httpRel
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", rl.Addr())
 	}}
-	rl2, err := testproxy.NewRelay(srv.Listener.Addr().String(), testproxy.RelayOptions{})
+	rl2, err := zmuxtest.NewRelay(srv.Listener.Addr().String(), zmuxtest.RelayOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -625,7 +625,7 @@ func TestRelaySplitDownlinkSilenced(t *testing.T) {
 // while a stream keeps flowing without a stall.
 func TestRelayAgeLimitRotation(t *testing.T) {
 	t.Parallel()
-	e := newRelayEnv(t, relayConfig(0), relayConfig(0), testproxy.RelayOptions{MaxAge: 3 * time.Second}, false)
+	e := newRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{MaxAge: 3 * time.Second}, false)
 	pol, err := machine.PoolPolicy([]byte(`{"retire":[{"metric":"age","above":{"const":2},"jitter":0.2}]}`), machine.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -723,7 +723,7 @@ func TestRelayDeadTimeoutAtSuspicion(t *testing.T) {
 		c.SchedulerParams.DeadTimeout = time.Second
 		return c
 	}
-	e := newRelayEnv(t, cfg(), relayConfig(0), testproxy.RelayOptions{}, true)
+	e := newRelayEnv(t, cfg(), relayConfig(0), zmuxtest.RelayOptions{}, true)
 	e.relay.Blackhole(true, true)
 	start := time.Now()
 	done := make(chan error, 1)

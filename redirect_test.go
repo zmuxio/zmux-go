@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
-	"github.com/zmuxio/zmux-go/internal/testproxy"
+	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 func TestCheckHTTPRedirect(t *testing.T) {
@@ -55,12 +55,12 @@ func TestCheckHTTPRedirect(t *testing.T) {
 // trusts the front.
 type redirectEnv struct {
 	*modeEnv
-	front *testproxy.Proxy // https
+	front *zmuxtest.Proxy // https
 }
 
 func newRedirectEnv(t *testing.T) *redirectEnv {
 	e := &redirectEnv{modeEnv: newModeEnv(t)}
-	e.front = testproxy.New(e.srv.URL, testproxy.Profile{TLS: true})
+	e.front = zmuxtest.New(e.srv.URL, zmuxtest.Profile{TLS: true})
 	e.tr.TLSClientConfig = e.front.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
 	return e
 }
@@ -90,7 +90,7 @@ func TestHTTPRedirectUpgrade(t *testing.T) {
 	for _, st := range []int{301, 302, 303, 307, 308} {
 		for _, k := range []CarrierKind{CarrierStreaming, CarrierSplit, CarrierExchange} {
 			t.Run(http.StatusText(st)+"/"+k.String(), func(t *testing.T) {
-				rd := testproxy.New("http://unused.invalid", testproxy.RedirectToHTTPS(e.front.URL, st))
+				rd := zmuxtest.New("http://unused.invalid", zmuxtest.RedirectToHTTPS(e.front.URL, st))
 				defer rd.Close()
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
@@ -141,11 +141,11 @@ func TestHTTPRedirectRefused(t *testing.T) {
 	}))
 	defer elsewhere.Close()
 	otherHost := strings.Replace(elsewhere.URL, "127.0.0.1", "localhost", 1)
-	downgrade := testproxy.New("http://unused.invalid", testproxy.Profile{TLS: true, RedirectTo: e.srv.URL})
+	downgrade := zmuxtest.New("http://unused.invalid", zmuxtest.Profile{TLS: true, RedirectTo: e.srv.URL})
 	defer downgrade.Close()
-	moved := testproxy.New("http://unused.invalid", testproxy.Profile{RedirectTo: e.front.URL + "/moved", RedirectStatus: 301})
+	moved := zmuxtest.New("http://unused.invalid", zmuxtest.Profile{RedirectTo: e.front.URL + "/moved", RedirectStatus: 301})
 	defer moved.Close()
-	cross := testproxy.New("http://unused.invalid", testproxy.Profile{RedirectTo: otherHost})
+	cross := zmuxtest.New("http://unused.invalid", zmuxtest.Profile{RedirectTo: otherHost})
 	defer cross.Close()
 	for _, c := range []struct {
 		name, url string
@@ -172,7 +172,7 @@ func TestHTTPRedirectRefused(t *testing.T) {
 	if n := other.Load(); n != 0 {
 		t.Fatalf("the other host got %d requests", n)
 	}
-	moved307 := testproxy.New("http://unused.invalid", testproxy.Profile{RedirectTo: e.front.URL + "/moved", RedirectStatus: 307})
+	moved307 := zmuxtest.New("http://unused.invalid", zmuxtest.Profile{RedirectTo: e.front.URL + "/moved", RedirectStatus: 307})
 	defer moved307.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -241,7 +241,7 @@ func TestDialModeRedirectCache(t *testing.T) {
 	leakcheck.Check(t)
 	e := newRedirectEnv(t)
 	defer e.close()
-	rd := testproxy.New("http://unused.invalid", testproxy.RedirectToHTTPS(e.front.URL, 308))
+	rd := zmuxtest.New("http://unused.invalid", zmuxtest.RedirectToHTTPS(e.front.URL, 308))
 	defer rd.Close()
 	pol := fastPolicy(true)
 	pol.Cache, pol.Key = &CarrierCache{}, "redirect"

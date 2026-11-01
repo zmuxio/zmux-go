@@ -273,6 +273,11 @@ kinds by joining them as further pipes, without a second session. A
 kinds worked; a kind that failed, or dropped soon after it was chosen, is
 skipped until its backoff expires. Each try and the choice are reported as
 `EventCarrierCandidate` and `EventCarrierChosen`, and in `ConnectionStats`.
+`CarrierCache.Snapshot` and `Restore` carry what it knows across restarts
+as versioned JSON. The moves to preferred kinds are a `PipePool` with a
+`Mode`: each member is dialed over the most robust kind available and
+rotated to a preferred one, make before break, so `MaintainPipes` can keep
+a session's further pipes on the best kind a path passes.
 
 ```go
 conn, err := zmux.DialMode(ctx, zmux.AutoMode(

@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
-	"github.com/zmuxio/zmux-go/internal/testproxy"
 	"github.com/zmuxio/zmux-go/shaping"
+	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 // waitUntil polls cond every 10 ms until it holds or d passes.
@@ -183,7 +183,7 @@ func TestProbeAnsweredOnSamePairWithJitter(t *testing.T) {
 		c.KeepAlivePeriod = -1
 	})
 	e := newMPEnv(t, cc, sc)
-	rl, err := testproxy.NewRelay(e.ln.Addr().String(), testproxy.RelayOptions{})
+	rl, err := zmuxtest.NewRelay(e.ln.Addr().String(), zmuxtest.RelayOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

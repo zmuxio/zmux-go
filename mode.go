@@ -1,7 +1,9 @@
 package zmux
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -113,7 +115,7 @@ type Candidate struct {
 	// join joins a carrier of the kind to c, for a kind whose Dial does
 	// not open a carrier that can join (a split bootstrap); nil: AddPipe
 	// on a carrier from Dial. ctx bounds the attempt, life the carriers.
-	join func(ctx, life context.Context, c *Conn, cred Credential) ([]*Pipe, error)
+	join func(ctx, life context.Context, c *Conn, cred Credential, o PipeOptions) ([]*Pipe, error)
 }
 
 // StreamingCandidate is a bidirectional streaming request (HTTPPipe) to
@@ -138,8 +140,8 @@ func SplitCandidate(client *http.Client, url string, h http.Header) Candidate {
 		Dial: func(ctx context.Context, cred Credential) (PipeIO, error) {
 			return httpSplitPipe(ctx, client, url, t, h, cred)
 		},
-		join: func(ctx, _ context.Context, c *Conn, cred Credential) ([]*Pipe, error) {
-			return httpSplitJoin(ctx, c, client, url, t, h, cred, PipeOptions{})
+		join: func(ctx, _ context.Context, c *Conn, cred Credential, o PipeOptions) ([]*Pipe, error) {
+			return httpSplitJoin(ctx, c, client, url, t, h, cred, o)
 		}}
 }
 
@@ -154,7 +156,8 @@ func ExchangeCandidate(client *http.Client, url string, cfg *HTTPExchangeConfig)
 	}}
 }
 
-// Mode is how DialMode chooses the carrier: ExplicitMode or AutoMode.
+// Mode is how DialMode, or a PipePool, chooses the carrier: ExplicitMode
+// or AutoMode.
 type Mode struct {
 	auto       bool
 	candidates []Candidate
@@ -335,15 +338,168 @@ func (cc *CarrierCache) record(key string, cand Candidate, ok bool, now time.Tim
 	if cand.Target != nil {
 		cand.Target.Reset()
 	}
-	lo, hi := cc.BackoffMin, cc.BackoffMax
+	lo, hi := cc.backoffBounds()
+	e.backoff = min(max(2*e.backoff, lo), hi)
+	e.goodUntil, e.failUntil = time.Time{}, now.Add(e.backoff)
+}
+
+// backoffBounds returns BackoffMin and BackoffMax with their defaults,
+// the maximum no less than the minimum.
+func (cc *CarrierCache) backoffBounds() (lo, hi time.Duration) {
+	lo, hi = cc.BackoffMin, cc.BackoffMax
 	if lo <= 0 {
 		lo = time.Minute
 	}
 	if hi <= 0 {
 		hi = 6 * time.Hour
 	}
-	e.backoff = min(max(2*e.backoff, lo), max(hi, lo))
-	e.goodUntil, e.failUntil = time.Time{}, now.Add(e.backoff)
+	return lo, max(hi, lo)
+}
+
+// expired reports whether an entry no longer tells anything at now: it is
+// neither usable nor failed, and its backoff history is older than the
+// longest backoff.
+func (e *cacheEntry) expired(now time.Time, backoffMax time.Duration) bool {
+	return !now.Before(e.goodUntil) && !now.Before(e.failUntil) && !now.Before(e.failUntil.Add(backoffMax))
+}
+
+// newer reports whether e was recorded later than o: the later of its
+// two times is later.
+func (e *cacheEntry) newer(o *cacheEntry) bool {
+	return latest(e).After(latest(o))
+}
+
+func latest(e *cacheEntry) time.Time {
+	if e.failUntil.After(e.goodUntil) {
+		return e.failUntil
+	}
+	return e.goodUntil
+}
+
+// carrierCacheVersion is the version of the format of
+// CarrierCache.Snapshot.
+const carrierCacheVersion = 1
+
+// cacheSnapshot is the format of CarrierCache.Snapshot: JSON with the
+// times as RFC 3339 wall-clock times ("" or absent: none) and the backoff
+// in milliseconds.
+type cacheSnapshot struct {
+	Version *int                 `json:"version"`
+	Entries []cacheSnapshotEntry `json:"entries"`
+}
+
+type cacheSnapshotEntry struct {
+	Key       string `json:"key"`
+	Kind      string `json:"kind"`
+	GoodUntil string `json:"good_until,omitempty"`
+	FailUntil string `json:"fail_until,omitempty"`
+	BackoffMS int64  `json:"backoff_ms,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+func formatCacheTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Round(0).UTC().Format(time.RFC3339Nano)
+}
+
+func parseCacheTime(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339Nano, s)
+}
+
+// Snapshot returns what the cache knows, to be restored by Restore, such as
+// in the next run of the process: JSON of the form
+//
+//	{"version": 1, "entries": [{"key": "...", "kind": "streaming",
+//	  "good_until": "2026-11-01T12:00:00Z", "fail_until": "...",
+//	  "backoff_ms": 60000, "url": "..."}]}
+//
+// with the kinds by name (CarrierKind.String) and the times on the wall
+// clock. An entry is expired, and left out, when both its times and its
+// fail time plus BackoffMax have passed.
+func (cc *CarrierCache) Snapshot() ([]byte, error) {
+	now := time.Now()
+	_, hi := cc.backoffBounds()
+	v := carrierCacheVersion
+	snap := cacheSnapshot{Version: &v, Entries: []cacheSnapshotEntry{}}
+	cc.mu.Lock()
+	for k, e := range cc.m {
+		if e.expired(now, hi) {
+			continue
+		}
+		snap.Entries = append(snap.Entries, cacheSnapshotEntry{Key: k.key, Kind: k.kind.String(),
+			GoodUntil: formatCacheTime(e.goodUntil), FailUntil: formatCacheTime(e.failUntil),
+			BackoffMS: e.backoff.Milliseconds(), URL: e.url})
+	}
+	cc.mu.Unlock()
+	slices.SortFunc(snap.Entries, func(a, b cacheSnapshotEntry) int {
+		return cmp.Or(strings.Compare(a.Key, b.Key), strings.Compare(a.Kind, b.Kind))
+	})
+	return json.Marshal(snap)
+}
+
+// Restore merges a Snapshot into the cache. For a key and kind the cache
+// already holds, or that the snapshot holds more than once, the newer
+// entry (the later of its two times is later) is kept. A nonzero backoff
+// outside BackoffMin and BackoffMax is brought within them; expired entries are
+// dropped. Unknown fields, and entries of a kind this version does not
+// know, are ignored. A version other than 1, a field of the wrong type, a
+// negative backoff or malformed JSON is an error wrapping
+// ErrInvalidConfig that leaves the cache as it was.
+func (cc *CarrierCache) Restore(data []byte) error {
+	var snap cacheSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return fmt.Errorf("%w: carrier cache snapshot: %w", ErrInvalidConfig, err)
+	}
+	if snap.Version == nil || *snap.Version != carrierCacheVersion {
+		return fmt.Errorf("%w: carrier cache snapshot not of version %d", ErrInvalidConfig, carrierCacheVersion)
+	}
+	now := time.Now()
+	lo, hi := cc.backoffBounds()
+	m := map[cacheKey]*cacheEntry{}
+	for _, se := range snap.Entries {
+		if se.BackoffMS < 0 {
+			return fmt.Errorf("%w: carrier cache snapshot: negative backoff_ms", ErrInvalidConfig)
+		}
+		good, err := parseCacheTime(se.GoodUntil)
+		if err != nil {
+			return fmt.Errorf("%w: carrier cache snapshot: %w", ErrInvalidConfig, err)
+		}
+		fail, err := parseCacheTime(se.FailUntil)
+		if err != nil {
+			return fmt.Errorf("%w: carrier cache snapshot: %w", ErrInvalidConfig, err)
+		}
+		i := slices.Index(carrierKindNames[:], se.Kind)
+		if i <= 0 {
+			continue
+		}
+		e := &cacheEntry{goodUntil: good, failUntil: fail, url: se.URL}
+		if se.BackoffMS > 0 { // 0: no failure in a row
+			e.backoff = min(max(time.Duration(min(se.BackoffMS, int64(hi/time.Millisecond)))*time.Millisecond, lo), hi)
+		}
+		if e.expired(now, hi) {
+			continue
+		}
+		k := cacheKey{se.Key, CarrierKind(i)}
+		if o := m[k]; o == nil || e.newer(o) {
+			m[k] = e
+		}
+	}
+	cc.mu.Lock()
+	if cc.m == nil {
+		cc.m = map[cacheKey]*cacheEntry{}
+	}
+	for k, e := range m {
+		if o := cc.m[k]; o == nil || e.newer(o) {
+			cc.m[k] = e
+		}
+	}
+	cc.mu.Unlock()
+	return nil
 }
 
 // ModeError reports that DialMode found no usable candidate, with the
@@ -404,18 +560,8 @@ func (e *ModeError) Unwrap() []error {
 // choice as an EventCarrierChosen (again on every switch), and both in
 // ConnectionStats. When no candidate is usable, the error is a *ModeError.
 func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn, error) {
-	if len(m.candidates) == 0 {
-		return nil, fmt.Errorf("%w: DialMode without a candidate", ErrInvalidConfig)
-	}
-	var kinds [256]bool
-	for _, c := range m.candidates {
-		if c.Dial == nil || c.Kind == 0 {
-			return nil, fmt.Errorf("%w: candidate without a kind or Dial", ErrInvalidConfig)
-		}
-		if kinds[c.Kind] {
-			return nil, fmt.Errorf("%w: two candidates of kind %v", ErrInvalidConfig, c.Kind)
-		}
-		kinds[c.Kind] = true
+	if err := m.validate(); err != nil {
+		return nil, err
 	}
 	var cred Credential
 	if cfg != nil {
@@ -433,28 +579,19 @@ func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn,
 		c.reportCarrier(cand.Kind, []CandidateResult{res}, true)
 		return c, nil
 	}
-	p, err := pol.resolve()
+	mp, err := newModePool(m, pol, cred)
 	if err != nil {
 		return nil, err
 	}
+	p := &mp.p
 	cfg = cfg.Clone()
 	cfg.EarlyData = EarlyData{}
 	now := time.Now()
-	order := make([]int, 0, len(m.candidates))
-	for i, c := range m.candidates {
-		if _, until := p.cache.state(p.key, c.Kind, now); until.IsZero() {
-			order = append(order, i)
-		}
-	}
-	if len(order) == 0 {
-		for i := range m.candidates {
-			order = append(order, i)
-		}
-	}
+	order := mp.usable(now)
 	join := !p.noJoin && cfg.MaxPipes > 1
 	seq := order
 	if join {
-		base := baseCandidate(m.candidates, order, &p, now)
+		base := baseCandidate(m.candidates, order, p, now)
 		seq = append([]int{base}, slices.DeleteFunc(slices.Clone(order), func(i int) bool { return i == base })...)
 	}
 	var results []CandidateResult
@@ -464,19 +601,50 @@ func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn,
 		}
 		cand := m.candidates[i]
 		p.cache.prime(p.key, cand)
-		c, res := startCandidate(ctx, cand, cfg, cred, &p)
+		c, res := startCandidate(ctx, cand, cfg, cred, p)
 		results = append(results, res)
 		p.cache.record(p.key, cand, c != nil, time.Now())
 		if c == nil {
 			continue
 		}
 		c.reportCarrier(cand.Kind, results, true)
-		u := &upgrader{c: c, cands: m.candidates, p: p, cred: cred, active: i, chosen: time.Now(),
-			join: join && c.ConnectionState().Multipath}
-		go u.run()
+		chosen := time.Now()
+		if join && c.ConnectionState().Multipath {
+			pipe0, _ := c.Pipe(0)
+			seed := &modeSeed{mp: mp, pipes: []*Pipe{pipe0}, kind: i, born: chosen}
+			go func() { _ = c.maintainPipes(c.Context(), PipePool{Count: 1}, seed) }()
+			return c, nil
+		}
+		// One carrier: the session ends with it, and counts against its
+		// kind when it fails soon after it was chosen.
+		go func() {
+			var ae *ApplicationError
+			if err := c.Wait(); !errors.As(err, &ae) {
+				mp.dropped(i, chosen)
+			}
+		}()
 		return c, nil
 	}
 	return nil, &ModeError{Results: results}
+}
+
+// validate checks that m has candidates, each with a kind and a Dial, and
+// no kind twice.
+func (m Mode) validate() error {
+	if len(m.candidates) == 0 {
+		return fmt.Errorf("%w: a Mode without a candidate", ErrInvalidConfig)
+	}
+	var kinds [256]bool
+	for _, c := range m.candidates {
+		if c.Dial == nil || c.Kind == 0 {
+			return fmt.Errorf("%w: candidate without a kind or Dial", ErrInvalidConfig)
+		}
+		if kinds[c.Kind] {
+			return fmt.Errorf("%w: two candidates of kind %v", ErrInvalidConfig, c.Kind)
+		}
+		kinds[c.Kind] = true
+	}
+	return nil
 }
 
 // baseCandidate is the candidate a session is established on before the
@@ -582,17 +750,17 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Crede
 	return c, res
 }
 
-// joinCandidate joins a carrier of cand to c within the candidate's
-// timer.
-func joinCandidate(c *Conn, cand Candidate, cred Credential, p *modeParams) ([]*Pipe, CandidateResult) {
+// joinCandidate joins a carrier of cand to c with the options o within the
+// candidate's timer; ctx bounds the attempt, and the carriers then live
+// until the session ends.
+func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred Credential, p *modeParams, o PipeOptions) ([]*Pipe, CandidateResult) {
 	res := CandidateResult{Kind: cand.Kind, Joined: true}
-	ctx := c.Context()
 	life, cancel, stop := candidateLife(ctx, c.cfg.handshakeTimeout())
 	var pipes []*Pipe
 	var err error
 	if cand.join != nil {
 		jctx, jcancel := context.WithTimeout(ctx, p.timerMin)
-		pipes, err = cand.join(jctx, life, c, cred)
+		pipes, err = cand.join(jctx, life, c, cred, o)
 		jcancel()
 	} else {
 		t0 := time.Now()
@@ -600,7 +768,7 @@ func joinCandidate(c *Conn, cand Candidate, cred Credential, p *modeParams) ([]*
 		if pio, err = cand.dial(life, cred); err == nil {
 			jctx, jcancel := context.WithTimeout(ctx, p.timer(time.Since(t0)))
 			var pp *Pipe
-			if pp, err = c.AddPipe(jctx, pio, PipeOptions{}); err == nil {
+			if pp, err = c.AddPipe(jctx, pio, o); err == nil {
 				pipes = []*Pipe{pp}
 			} else {
 				closePipeIO(pio)
@@ -620,7 +788,7 @@ func joinCandidate(c *Conn, cand Candidate, cred Credential, p *modeParams) ([]*
 		res.Outcome, res.Err = outcomeOf(err), err
 		return nil, res
 	}
-	context.AfterFunc(ctx, cancel)
+	context.AfterFunc(c.Context(), cancel)
 	res.Outcome = CandidateUsable
 	return pipes, res
 }
@@ -639,218 +807,121 @@ func outcomeOf(err error) CandidateOutcome {
 	return CandidateFailed
 }
 
-// upgrader follows the carrier kind of a session dialed in auto mode: it
-// joins preferred kinds and retires the ones they replace (join), replaces
-// a failed kind, and records in the cache a kind that failed soon after it
-// was chosen. It ends with the session.
-type upgrader struct {
-	c      *Conn
-	cands  []Candidate
-	p      modeParams
-	cred   Credential
-	active int       // the candidate of the active pipes
-	pipes  []*Pipe   // the active pipes; nil: pipe 0 (the bootstrap)
-	chosen time.Time // when active was chosen
-	join   bool
-	// recorded: the active kind was recorded as dropped
-	recorded bool
+// modePool chooses the carrier kinds of a pipe pool dialed by a mode
+// (PipePool.Mode): stable first, then upgrade. A member is dialed over
+// the most robust kind available (baseCandidate), and a member of a kind
+// a preferred kind could replace is rotated to it, make before break; the
+// replacement takes over once it has stayed usable for Settle. A kind
+// whose join fails, whose replacement ends before it settled, or whose
+// member fails within DropWindow of being joined counts as failed.
+type modePool struct {
+	cands []Candidate
+	auto  bool
+	p     modeParams
+	cred  Credential
 }
 
-func (u *upgrader) run() {
-	ctx := u.c.Context()
-	for ctx.Err() == nil {
-		if u.join {
-			u.tryBetter(ctx)
-		}
-		var retry *time.Timer
-		var retryC <-chan time.Time
-		if u.join {
-			if next := u.nextRetry(); !next.IsZero() {
-				retry = time.NewTimer(time.Until(next))
-				retryC = retry.C
-			}
-		}
-		ended, failed := u.c.waitPipes(ctx, u.activeIDs(), retryC)
-		if retry != nil {
-			retry.Stop()
-		}
-		if ctx.Err() != nil {
-			break
-		}
-		if !ended {
-			continue
-		}
-		if failed {
-			u.dropped()
-		}
-		if !u.join {
-			<-ctx.Done() // the session's one carrier ended: the session ends
-			break
-		}
-		u.replace(ctx)
+func newModePool(m Mode, pol *ModePolicy, cred Credential) (*modePool, error) {
+	if err := m.validate(); err != nil {
+		return nil, err
 	}
-	// A session that failed soon after its kind was chosen counts against
-	// the kind.
-	var ae *ApplicationError
-	if err := u.c.Wait(); !errors.As(err, &ae) {
-		u.dropped()
+	p, err := pol.resolve()
+	if err != nil {
+		return nil, err
 	}
+	return &modePool{cands: m.candidates, auto: m.auto, p: p, cred: cred}, nil
 }
 
-// dropped records the active kind as failed when it was chosen less than
-// DropWindow ago, once per choice.
-func (u *upgrader) dropped() {
-	if !u.recorded && time.Since(u.chosen) < u.p.drop {
-		u.recorded = true
-		u.p.cache.record(u.p.key, u.cands[u.active], false, time.Now())
+// usable lists the candidates not backing off, in order (all of them when
+// every one is).
+func (mp *modePool) usable(now time.Time) []int {
+	order := make([]int, 0, len(mp.cands))
+	for i, c := range mp.cands {
+		if _, until := mp.p.cache.state(mp.p.key, c.Kind, now); until.IsZero() {
+			order = append(order, i)
+		}
 	}
+	if len(order) == 0 {
+		for i := range mp.cands {
+			order = append(order, i)
+		}
+	}
+	return order
 }
 
-func (u *upgrader) activeIDs() []uint64 {
-	if u.pipes == nil {
-		return []uint64{0}
+// pick is the kind to dial a new member over: the most robust one
+// available.
+func (mp *modePool) pick(now time.Time) int {
+	if !mp.auto {
+		return 0
 	}
-	ids := make([]uint64, len(u.pipes))
-	for i, p := range u.pipes {
-		ids[i] = p.ID()
-	}
-	return ids
+	return baseCandidate(mp.cands, mp.usable(now), &mp.p, now)
 }
 
-// nextRetry is when the next preferred kind's backoff expires (zero: none
-// is preferred).
-func (u *upgrader) nextRetry() time.Time {
-	var next time.Time
-	now := time.Now()
-	for i := range u.active {
-		_, until := u.p.cache.state(u.p.key, u.cands[i].Kind, now)
-		if until.IsZero() {
-			until = now.Add(u.p.timerMin) // not yet tried, or its success expired
-		}
-		if next.IsZero() || until.Before(next) {
-			next = until
+// better is the most preferred kind before cur that is not backing off
+// (-1: none), which a member of kind cur is rotated to.
+func (mp *modePool) better(cur int, now time.Time) int {
+	if !mp.auto {
+		return -1
+	}
+	for i := range cur {
+		if _, until := mp.p.cache.state(mp.p.key, mp.cands[i].Kind, now); until.IsZero() {
+			return i
 		}
 	}
-	return next
+	return -1
 }
 
-// tryBetter joins the preferred kinds, in order, that are not backing
-// off; the first that stays joined for Settle becomes active and the
-// pipes of the kind it replaces are retired.
-func (u *upgrader) tryBetter(ctx context.Context) {
-	for i := 0; i < u.active && ctx.Err() == nil; i++ {
-		cand := u.cands[i]
-		if _, until := u.p.cache.state(u.p.key, cand.Kind, time.Now()); !until.IsZero() {
-			continue
-		}
-		u.p.cache.prime(u.p.key, cand)
-		pipes, res := joinCandidate(u.c, cand, u.cred, &u.p)
-		u.c.reportCarrier(cand.Kind, []CandidateResult{res}, false)
-		if pipes == nil {
-			u.p.cache.record(u.p.key, cand, false, time.Now())
-			continue
-		}
-		ids := make([]uint64, len(pipes))
-		for j, p := range pipes {
-			ids[j] = p.ID()
-		}
-		t := time.NewTimer(u.p.settle)
-		ended, _ := u.c.waitPipes(ctx, ids, t.C)
-		t.Stop()
-		if ended || ctx.Err() != nil {
-			for _, p := range pipes {
-				_ = p.Abort(errors.New("zmux: joined pipe ended before it settled"))
-			}
-			u.p.cache.record(u.p.key, cand, false, time.Now())
-			continue
-		}
-		u.p.cache.record(u.p.key, cand, true, time.Now())
-		u.retire()
-		u.setActive(i, pipes)
-		return
+// join joins a member of kind i to c, reporting the try; a failed try is
+// recorded in the cache.
+func (mp *modePool) join(ctx context.Context, c *Conn, i int, o PipeOptions) ([]*Pipe, error) {
+	cand := mp.cands[i]
+	if mp.auto {
+		mp.p.cache.prime(mp.p.key, cand)
+	}
+	pipes, res := joinCandidate(ctx, c, cand, mp.cred, &mp.p, o)
+	c.reportCarrier(cand.Kind, []CandidateResult{res}, false)
+	if pipes == nil {
+		mp.record(i, false)
+		return nil, res.Err
+	}
+	return pipes, nil
+}
+
+func (mp *modePool) record(i int, ok bool) {
+	if mp.auto {
+		mp.p.cache.record(mp.p.key, mp.cands[i], ok, time.Now())
 	}
 }
 
-// replace joins the best kind available after the active pipes ended.
-func (u *upgrader) replace(ctx context.Context) {
-	backoff := u.p.timerMin
-	for ctx.Err() == nil {
-		now := time.Now()
-		for i, cand := range u.cands {
-			if _, until := u.p.cache.state(u.p.key, cand.Kind, now); !until.IsZero() && i != len(u.cands)-1 {
-				continue // the last is tried in any case
-			}
-			u.p.cache.prime(u.p.key, cand)
-			pipes, res := joinCandidate(u.c, cand, u.cred, &u.p)
-			u.c.reportCarrier(cand.Kind, []CandidateResult{res}, false)
-			u.p.cache.record(u.p.key, cand, pipes != nil, time.Now())
-			if pipes != nil {
-				u.setActive(i, pipes)
-				return
-			}
-		}
-		t := time.NewTimer(backoff)
-		select {
-		case <-t.C:
-		case <-ctx.Done():
-		}
-		t.Stop()
-		backoff = min(2*backoff, time.Minute)
+// established records kind i as usable and reports it as the session's
+// carrier when it is not already.
+func (mp *modePool) established(c *Conn, i int) {
+	mp.record(i, true)
+	k := mp.cands[i].Kind
+	c.lock()
+	cur := c.carrier
+	c.unlock()
+	if cur != k {
+		c.reportCarrier(k, nil, true)
 	}
 }
 
-// retire closes the active pipes gracefully.
-func (u *upgrader) retire() {
-	if u.pipes == nil {
-		if p, ok := u.c.Pipe(0); ok {
-			_ = p.Close()
-		}
-		return
-	}
-	for _, p := range u.pipes {
-		_ = p.Close()
+// dropped records kind i as failed when its member was joined (at born)
+// less than DropWindow ago.
+func (mp *modePool) dropped(i int, born time.Time) {
+	if time.Since(born) < mp.p.drop {
+		mp.record(i, false)
 	}
 }
 
-func (u *upgrader) setActive(i int, pipes []*Pipe) {
-	u.active, u.pipes, u.chosen, u.recorded = i, pipes, time.Now(), false
-	u.c.reportCarrier(u.cands[i].Kind, nil, true)
-}
-
-// waitPipes waits until one of the pipes ids has ended (failed: by
-// failure), until retry fires, or ctx ends.
-func (c *Conn) waitPipes(ctx context.Context, ids []uint64, retry <-chan time.Time) (ended, failed bool) {
-	sig := core.NewSignal()
-	defer c.unwatchPipes(sig)
-	for {
-		c.lock()
-		sig.Drain()
-		c.watchPipes(sig)
-		for _, id := range ids {
-			out, in, ok := c.s.PipeState(id)
-			switch {
-			case !ok || out == core.OutClosed || out == core.OutRetired || out == core.OutDraining:
-				ended = true
-			case out == core.OutFailed:
-				ended, failed = true, true
-			case out == core.OutNone && in != core.InJoining && in != core.InOpen:
-				ended = true
-			}
-		}
-		c.unlock()
-		if ended {
-			return ended, failed
-		}
-		select {
-		case <-sig.C:
-		case <-retry:
-			return false, false
-		case <-ctx.Done():
-			return false, false
-		case <-c.done:
-			return false, false
-		}
-	}
+// modeSeed hands MaintainPipes the pipes a session dialed by DialMode was
+// established on, as the pool's first member, with the pool's mode.
+type modeSeed struct {
+	mp    *modePool
+	pipes []*Pipe
+	kind  int
+	born  time.Time
 }
 
 // carrierTriesKept is the number of the latest tries that ConnectionStats

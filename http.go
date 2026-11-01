@@ -758,7 +758,21 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// does not read what is left of a full-duplex request body, so a
 	// client could otherwise send its next request on a connection that
 	// is about to close.
-	hw := &httpRespWriter{w: w, rc: rc, close: r.ProtoMajor == 1}
+	life := &httpLife{}
+	hw := &httpRespWriter{w: w, rc: rc, close: r.ProtoMajor == 1, life: life}
+	// After ServeHTTP returns, the response and its controller are not
+	// used again (net/http): a pipe's halves closed later leave them.
+	fellBack := false
+	defer func() {
+		life.end()
+		if fellBack {
+			return // the halves were closed before; the connection lives on
+		}
+		_ = rc.SetWriteDeadline(time.Now()) // a blocked write returns
+		hw.mu.Lock()
+		hw.closed = true
+		hw.mu.Unlock()
+	}()
 	p := PipeIO{Carrier: CarrierSplit}
 	var body *httpReqBody
 	switch class {
@@ -769,7 +783,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// An admitted uplink's response header goes out while its body
 		// is read.
 		_ = rc.EnableFullDuplex()
-		body = &httpReqBody{b: r.Body, rc: rc}
+		body = &httpReqBody{b: r.Body, rc: rc, life: life}
 		p.R = body
 	default:
 		p.Carrier = CarrierStreaming
@@ -777,7 +791,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.Carrier = CarrierHTTP3
 		}
 		_ = rc.EnableFullDuplex()
-		body = &httpReqBody{b: r.Body, rc: rc}
+		body = &httpReqBody{b: r.Body, rc: rc, life: life}
 		p.R = body
 		p.W = hw
 		if dc := httpChannelOf(w); dc != nil {
@@ -805,6 +819,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if len(read) > 0 {
 				r.Body = &replayBody{Reader: io.MultiReader(bytesReader(read), r.Body), c: r.Body}
 			}
+			fellBack = true
 			h.o.Fallback(w, r)
 			return
 		}
@@ -822,6 +837,7 @@ type httpRespWriter struct {
 	written bool // the response header went out
 	close   bool // Connection: close
 	stopped bool // the receiver was stopped (under chMu)
+	life    *httpLife
 
 	// The request stream's datagram channel: its provider (under mu), and
 	// the channel once the header went out. The receiver's state has a
@@ -896,11 +912,33 @@ func (h *httpRespWriter) WriteBuffers(bufs [][]byte) (int, error) {
 // Close ends the response (the handler returns once the pipe has ended);
 // a write blocked on a peer that does not read is interrupted.
 func (h *httpRespWriter) Close() error {
-	_ = h.rc.SetWriteDeadline(time.Now())
+	h.life.do(func() { _ = h.rc.SetWriteDeadline(time.Now()) })
 	h.mu.Lock()
 	h.closed = true
 	h.mu.Unlock()
 	return nil
+}
+
+// httpLife is the lifetime of a carrier's ServeHTTP call: the response
+// controller is used only while it runs.
+type httpLife struct {
+	mu   sync.Mutex
+	done bool
+}
+
+// do runs f unless ServeHTTP has returned; end waits for a running f.
+func (l *httpLife) do(f func()) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.done {
+		f()
+	}
+}
+
+func (l *httpLife) end() {
+	l.mu.Lock()
+	l.done = true
+	l.mu.Unlock()
 }
 
 // httpReqBody is the request body as the receiving half of a pipe; Close
@@ -910,8 +948,9 @@ func (h *httpRespWriter) Close() error {
 // carrier, it keeps what was read (at most firstReadBound bytes, what the
 // listener reads before it decides) for the fallback.
 type httpReqBody struct {
-	b  io.ReadCloser
-	rc *http.ResponseController
+	b    io.ReadCloser
+	rc   *http.ResponseController
+	life *httpLife
 
 	mu    sync.Mutex
 	read  []byte
@@ -952,7 +991,7 @@ func (r *httpReqBody) replay() ([]byte, bool) {
 }
 
 func (r *httpReqBody) Close() error {
-	_ = r.rc.SetReadDeadline(time.Now())
+	r.life.do(func() { _ = r.rc.SetReadDeadline(time.Now()) })
 	if _, ok := r.replay(); ok {
 		return nil
 	}

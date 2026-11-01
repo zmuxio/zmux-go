@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
-	"github.com/zmuxio/zmux-go/internal/testproxy"
+	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 // Rows of the liveness bound (MULTIPATH.md 7.1) measured through a relay
@@ -90,7 +90,7 @@ func busy(t *testing.T, e *relayEnv) {
 // here, plus the round trips of a loaded test host).
 func TestLivenessDataPipe(t *testing.T) {
 	t.Parallel()
-	e := newRelayEnv(t, relayConfig(0), relayConfig(0), testproxy.RelayOptions{}, true)
+	e := newRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, true)
 	busy(t, e)
 	time.Sleep(300 * time.Millisecond)
 	if d := suspectAfter(t, e, 0, 5*time.Second); d > 2*time.Second {
@@ -102,7 +102,7 @@ func TestLivenessDataPipe(t *testing.T) {
 // silent death is suspected within standby_probe + T_suspect.
 func TestLivenessStandbyBusy(t *testing.T) {
 	t.Parallel()
-	e := newRelayEnv(t, relayConfig(0), relayConfig(0), testproxy.RelayOptions{}, false)
+	e := newRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, false)
 	nc, err := net.Dial("tcp", e.relay.Addr())
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +127,7 @@ func TestLivenessStandbyBusy(t *testing.T) {
 func TestLivenessSingleKeepAlive(t *testing.T) {
 	t.Parallel()
 	cfg := func() *zmux.Config { return &zmux.Config{MaxIdleTimeout: 2 * time.Second} }
-	e := newRelayEnv(t, cfg(), cfg(), testproxy.RelayOptions{}, true)
+	e := newRelayEnv(t, cfg(), cfg(), zmuxtest.RelayOptions{}, true)
 	done := make(chan error, 1)
 	go func() { done <- e.client.Wait() }()
 	select {

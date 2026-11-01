@@ -177,6 +177,7 @@ type attach struct {
 	// Counters.
 	suspects, failures, reinjectedBytes, oppBytes, pingsSent uint64
 	redundantBytes, dupBytes, pingsAnswered                  uint64
+	bytesLost                                                uint64   // unacknowledged outbound bytes at the failure
 	pingEnds                                                 []uint64 // outbound positions after unanswered PIPE_PINGs
 
 	penaltyEnd uint64

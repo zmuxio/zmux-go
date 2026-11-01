@@ -129,6 +129,14 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 			return
 		}
 	}
+	if a := p.mp; a != nil && il.lane == 0 && a.joinerLocal && a.in == InJoining && p.id != 0 &&
+		(a.out == OutJoining || a.out == OutNone) {
+		var f wire.Frame
+		if _, e := wire.DecodeFrame(rec, &f); e == nil && f.Kind == wire.KindClose {
+			s.joinAnsweredClose(p, &f)
+			return
+		}
+	}
 	first := il.expectTP
 	size := len(rec)
 	facts := recordFacts{onlyPad: true}

@@ -160,15 +160,32 @@ func Serve(ctx context.Context, ln ConnListener, l *zmux.Listener, fallback func
 		if err != nil {
 			return err
 		}
-		go serveConn(ctx, qc, l, fallback)
+		go func() { _ = ServeConn(ctx, qc, l, fallback) }()
 	}
 }
 
-func serveConn(ctx context.Context, qc *quic.Conn, l *zmux.Listener, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) {
+// ServeConn serves one established QUIC connection that the caller
+// accepted or dialled, such as one made by hole punching, exactly as Serve
+// serves each connection it accepts (Serve calls it): the connection takes
+// a slot of its source, its remote address (zmux.Listener.Arrive), is
+// admitted by its first bidirectional stream when l has an Admission (one
+// that used 0-RTT is then closed), and its streams then go through l
+// (ListenerConfig.WrapPipe included) as bootstraps, joins and lanes, so
+// that sessions started on it are returned by Accept on l and its pipes
+// join sessions of l. A connection refused is closed.
+//
+// ServeConn returns when the connection ends (nil) or ctx ends
+// (ctx.Err()); after ctx ends no further stream of the connection is
+// handed to l, while the connection and its sessions continue, as with
+// Serve. On a closed listener it closes qc and returns net.ErrClosed.
+func ServeConn(ctx context.Context, qc *quic.Conn, l *zmux.Listener, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) error {
 	a, err := l.Arrive(netip.AddrPort{}, addrPort(qc.RemoteAddr()))
 	if err != nil {
 		_ = qc.CloseWithError(0, "")
-		return
+		if errors.Is(err, net.ErrClosed) {
+			return err
+		}
+		return nil // refused: the connection ended
 	}
 	// A connection without a stream gives its slot back when it ends.
 	go func() {
@@ -179,25 +196,30 @@ func serveConn(ctx context.Context, qc *quic.Conn, l *zmux.Listener, fallback fu
 		var used atomic.Bool
 		go watchHandshake(qc, a, &used)
 		go acceptLanes(ctx, qc, a, &used)
-		acceptPipes(ctx, qc, a, &used)
-		return
+		go acceptPipes(ctx, qc, a, &used)
+		return served(ctx, qc)
 	}
 	select {
 	case <-qc.HandshakeComplete():
 	case <-qc.Context().Done():
 		a.HandshakeFailed()
-		return
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	if qc.ConnectionState().Used0RTT {
 		a.HandshakeFailed()
 		_ = qc.CloseWithError(0, "")
-		return
+		return nil
 	}
 	// A connection without a stream ends with its idle timeout.
 	s, err := qc.AcceptStream(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		_ = qc.CloseWithError(0, "")
-		return
+		return nil
 	}
 	var fb func(context.Context, zmux.PipeIO)
 	if fallback != nil {
@@ -206,11 +228,25 @@ func serveConn(ctx context.Context, qc *quic.Conn, l *zmux.Listener, fallback fu
 	p, ok := a.Admit(ctx, streamPipe(qc, s), fb)
 	if !ok {
 		_ = qc.CloseWithError(0, "")
-		return
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
 	}
 	go acceptLanes(ctx, qc, a, nil)
 	go acceptPipes(ctx, qc, a, nil)
-	_ = a.HandlePipe(ctx, p, zmux.JoinHint{})
+	go func() { _ = a.HandlePipe(ctx, p, zmux.JoinHint{}) }()
+	return served(ctx, qc)
+}
+
+// served waits for the end of qc (nil) or of ctx (its error).
+func served(ctx context.Context, qc *quic.Conn) error {
+	select {
+	case <-qc.Context().Done():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // watchHandshake counts a connection whose handshake failed before any of
@@ -322,6 +358,14 @@ func (q *qStream) cur() (*quic.Conn, *quic.Stream) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.qc, q.s
+}
+
+// Retransmitted reports the bytes the connection declared lost, which
+// it sends again (zmux.PipeIO capability); the streams of a connection
+// share the count.
+func (q *qStream) Retransmitted() (uint64, bool) {
+	qc, _ := q.cur()
+	return qc.ConnectionStats().BytesLost, true
 }
 
 func (q *qStream) Write(p []byte) (int, error) {

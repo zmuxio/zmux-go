@@ -3,13 +3,14 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
-	"github.com/zmuxio/zmux-go/internal/testproxy"
+	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 var modePSK = bytes.Repeat([]byte{5}, 32)
@@ -122,19 +123,19 @@ func TestDialModeProfiles(t *testing.T) {
 	defer e.close()
 	for _, c := range []struct {
 		name    string
-		profile *testproxy.Profile
+		profile *zmuxtest.Profile
 		want    CarrierKind
 		tries   int
 	}{
 		{"direct", nil, CarrierStreaming, 1},
-		{"pass-through", &testproxy.Profile{}, CarrierStreaming, 1},
-		{"nginx defaults", new(testproxy.NginxDefaults()), CarrierExchange, 3},
-		{"buffering cdn", new(testproxy.BufferingCDN(3 * time.Second)), CarrierExchange, 3},
+		{"pass-through", &zmuxtest.Profile{}, CarrierStreaming, 1},
+		{"nginx defaults", new(zmuxtest.NginxDefaults()), CarrierExchange, 3},
+		{"buffering cdn", new(zmuxtest.BufferingCDN(3 * time.Second)), CarrierExchange, 3},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			url := e.srv.URL
 			if c.profile != nil {
-				px := testproxy.New(e.srv.URL, *c.profile)
+				px := zmuxtest.New(e.srv.URL, *c.profile)
 				defer px.Close()
 				url = px.URL
 			}
@@ -184,7 +185,7 @@ func TestDialModeExplicit(t *testing.T) {
 	leakcheck.Check(t)
 	e := newModeEnv(t)
 	defer e.close()
-	px := testproxy.New(e.srv.URL, testproxy.NginxDefaults())
+	px := zmuxtest.New(e.srv.URL, zmuxtest.NginxDefaults())
 	defer px.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -197,7 +198,7 @@ func TestDialModeExplicit(t *testing.T) {
 		t.Fatalf("explicit streaming through a buffering proxy: %v", err)
 	}
 	// A WebSocket-only front refuses the request.
-	ws := testproxy.New(e.srv.URL, testproxy.WebSocketFront())
+	ws := zmuxtest.New(e.srv.URL, zmuxtest.WebSocketFront())
 	defer ws.Close()
 	_, err = DialMode(ctx, ExplicitMode(ExchangeCandidate(e.hc, ws.URL, &HTTPExchangeConfig{PSK: modePSK})), cfg, nil)
 	if !errors.As(err, &me) || len(me.Results) != 1 || me.Results[0].Kind != CarrierExchange {
@@ -231,7 +232,7 @@ func TestDialModeCache(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	nginx := testproxy.New(e.srv.URL, testproxy.NginxDefaults())
+	nginx := zmuxtest.New(e.srv.URL, zmuxtest.NginxDefaults())
 	defer nginx.Close()
 	c, err := DialMode(ctx, AutoMode(e.candidates(nginx.URL)...), modeCfg(), pol)
 	if err != nil {
@@ -251,7 +252,7 @@ func TestDialModeCache(t *testing.T) {
 	closeConn(t, c)
 
 	// A path that lets streaming through, then drops it.
-	pass := testproxy.New(e.srv.URL, testproxy.Profile{})
+	pass := zmuxtest.New(e.srv.URL, zmuxtest.Profile{})
 	defer pass.Close()
 	pol.Key = "server|other-lan"
 	c, err = DialMode(ctx, AutoMode(e.candidates(pass.URL)...), modeCfg(), pol)
@@ -322,7 +323,7 @@ func TestDialModeJoin(t *testing.T) {
 	}
 	closeConn(t, c)
 
-	px := testproxy.New(e.srv.URL, testproxy.NginxDefaults())
+	px := zmuxtest.New(e.srv.URL, zmuxtest.NginxDefaults())
 	defer px.Close()
 	c, err = DialMode(ctx, AutoMode(e.candidates(px.URL)...), modeCfg(), fastPolicy(false))
 	if err != nil {
@@ -350,27 +351,10 @@ func TestDialModeJoin(t *testing.T) {
 	closeConn(t, c)
 }
 
-// TestModeBookkeepingBounded leaves no pipe waiter behind once waitPipes
-// returns, registers one per wait, and keeps the latest carrier tries.
+// TestModeBookkeepingBounded keeps the latest carrier tries.
 func TestModeBookkeepingBounded(t *testing.T) {
 	a, b := tcpPair(t)
 	c, _ := pair(t, a, b, nil, nil)
-	retry := make(chan time.Time)
-	close(retry)
-	for range 100 {
-		if ended, _ := c.waitPipes(t.Context(), []uint64{0}, retry); ended {
-			t.Fatal("pipe 0 ended")
-		}
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	c.waitPipes(ctx, []uint64{0}, nil)
-	c.lock()
-	n := len(c.pipeWaiters)
-	c.unlock()
-	if n != 0 {
-		t.Fatalf("%d pipe waiters left", n)
-	}
 	var tries []CandidateResult
 	for i := range 100 {
 		tries = append(tries, CandidateResult{Kind: CarrierKind(i)})
@@ -380,4 +364,304 @@ func TestModeBookkeepingBounded(t *testing.T) {
 	if len(got) != carrierTriesKept || got[0].Kind != CarrierKind(100-carrierTriesKept) || got[len(got)-1].Kind != 99 {
 		t.Fatalf("%d tries kept, from %v", len(got), got[0].Kind)
 	}
+}
+
+// exchangeBase dials a session on the exchange carrier directly, for a
+// Mode pool to add members to.
+func exchangeBase(t *testing.T, ctx context.Context, e *modeEnv) (*Conn, *Conn) {
+	t.Helper()
+	c, err := DialMode(ctx, ExplicitMode(ExchangeCandidate(e.hc, e.srv.URL, &HTTPExchangeConfig{PSK: modePSK})), modeCfg(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, <-e.sessions
+}
+
+// waitCached waits until the cache holds kind under key as usable (good)
+// or as failed.
+func waitCached(t *testing.T, cc *CarrierCache, key string, kind CarrierKind, good bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		g, until := cc.state(key, kind, time.Now())
+		if good && g || !good && !until.IsZero() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%v not cached as good=%v", kind, good)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestPipePoolModeUpgrade dials a Mode pool's member over the most robust
+// kind and rotates it to the preferred kind, make before break; a kind
+// the cache holds as usable is dialed at once.
+func TestPipePoolModeUpgrade(t *testing.T) {
+	leakcheck.Check(t)
+	e := newModeEnv(t)
+	defer e.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, s := exchangeBase(t, ctx, e)
+	defer func() { _ = s.Close() }()
+	pol := fastPolicy(false)
+	pol.Cache, pol.Key = &CarrierCache{}, "k"
+	pctx, pcancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- c.MaintainPipes(pctx, PipePool{Mode: AutoMode(e.candidates(e.srv.URL)...), ModePolicy: pol})
+	}()
+	waitCarrier(t, c, CarrierStreaming, 10*time.Second)
+	waitCached(t, pol.Cache, "k", CarrierStreaming, true)
+	tries := kinds(c.ConnectionStats().CarrierCandidates)
+	// The base, the pool's exchange member, its streaming replacement.
+	if len(tries) < 3 || tries[1] != "exchange:usable(join)" || tries[2] != "streaming:usable(join)" {
+		t.Fatalf("tries %v", tries)
+	}
+	// The exchange member is closed once its replacement settled: pipe 0
+	// and the streaming member are left.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(c.Pipes()) != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d pipes after the upgrade", len(c.Pipes()))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	echoOnce(t, ctx, c, s)
+	pcancel()
+	t.Logf("MaintainPipes: %v", <-done)
+	closeConn(t, c)
+
+	// The cache now holds streaming as usable: a new pool joins it first.
+	c, s = exchangeBase(t, ctx, e)
+	defer func() { _ = s.Close() }()
+	go func() {
+		done <- c.MaintainPipes(ctx, PipePool{Mode: AutoMode(e.candidates(e.srv.URL)...), ModePolicy: pol})
+	}()
+	waitCarrier(t, c, CarrierStreaming, 10*time.Second)
+	if tries := kinds(c.ConnectionStats().CarrierCandidates); len(tries) != 2 || tries[1] != "streaming:usable(join)" {
+		t.Fatalf("with a cached kind: %v", tries)
+	}
+	closeConn(t, c)
+	if err := <-done; err == nil {
+		t.Fatal("pool outlived its session")
+	}
+}
+
+// TestPipePoolModeFallback records a member that drops soon after it was
+// joined as failed, and replaces it over another kind; a path that
+// passes only the exchange carrier keeps the member there.
+func TestPipePoolModeFallback(t *testing.T) {
+	leakcheck.Check(t)
+	e := newModeEnv(t)
+	defer e.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	pass := zmuxtest.New(e.srv.URL, zmuxtest.Profile{})
+	defer pass.Close()
+	c, s := exchangeBase(t, ctx, e)
+	defer func() { _ = s.Close() }()
+	pol := fastPolicy(false)
+	pol.Cache, pol.Key = &CarrierCache{}, "k"
+	done := make(chan error, 1)
+	go func() {
+		done <- c.MaintainPipes(ctx, PipePool{Mode: AutoMode(e.candidates(pass.URL)...), ModePolicy: pol,
+			MinBackoff: 100 * time.Millisecond})
+	}()
+	waitCarrier(t, c, CarrierStreaming, 10*time.Second)
+	waitCached(t, pol.Cache, "k", CarrierStreaming, true)
+	pass.CloseClientConnections()
+	waitCached(t, pol.Cache, "k", CarrierStreaming, false)
+	waitCarrier(t, c, CarrierSplit, 10*time.Second)
+	echoOnce(t, ctx, c, s)
+	closeConn(t, c)
+	t.Logf("MaintainPipes: %v", <-done)
+
+	nginx := zmuxtest.New(e.srv.URL, zmuxtest.NginxDefaults())
+	defer nginx.Close()
+	c, s = exchangeBase(t, ctx, e)
+	defer func() { _ = s.Close() }()
+	pol.Cache = &CarrierCache{}
+	go func() {
+		done <- c.MaintainPipes(ctx, PipePool{Mode: AutoMode(e.candidates(nginx.URL)...), ModePolicy: pol,
+			MinBackoff: 100 * time.Millisecond})
+	}()
+	waitCached(t, pol.Cache, "k", CarrierStreaming, false)
+	waitCached(t, pol.Cache, "k", CarrierSplit, false)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(c.Pipes()) != 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(c.Pipes()) != 2 || c.ConnectionStats().Carrier != CarrierExchange {
+		t.Fatalf("%d pipes on %v: %v", len(c.Pipes()), c.ConnectionStats().Carrier, kinds(c.ConnectionStats().CarrierCandidates))
+	}
+	echoOnce(t, ctx, c, s)
+	closeConn(t, c)
+	t.Logf("MaintainPipes: %v", <-done)
+}
+
+// TestPipePoolModeConfig rejects a pool with more than one of Dial, Join
+// and Mode, and a Mode with an invalid candidate.
+func TestPipePoolModeConfig(t *testing.T) {
+	leakcheck.Check(t)
+	e := newModeEnv(t)
+	defer e.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, s := exchangeBase(t, ctx, e)
+	defer func() { _ = s.Close() }()
+	defer closeConn(t, c)
+	m := AutoMode(e.candidates(e.srv.URL)...)
+	dial := func(context.Context) (PipeIO, error) { return PipeIO{}, errors.New("no") }
+	for _, p := range []PipePool{
+		{Mode: m, Dial: dial},
+		{Mode: AutoMode(Candidate{Kind: CarrierStreaming})},
+		{Mode: m, ModePolicy: &ModePolicy{Settle: -1}},
+	} {
+		if err := c.MaintainPipes(ctx, p); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("%+v: %v", p, err)
+		}
+	}
+}
+
+// TestCarrierCacheSnapshot restores a snapshot in a new cache (a restart):
+// the entries round-trip, expired ones are dropped, unknown fields and
+// kinds are ignored, entries merge newer first, and a bad version, type
+// or backoff rejects the whole snapshot.
+func TestCarrierCacheSnapshot(t *testing.T) {
+	cc := &CarrierCache{}
+	now := time.Now()
+	st := StreamingCandidate(http.DefaultClient, "https://a.example/z", nil)
+	sp := SplitCandidate(http.DefaultClient, "https://a.example/z", nil)
+	cc.record("k", st, false, now)
+	cc.record("k", st, false, now) // backoff 2 min
+	st.Target.Redirected("https://b.example/z")
+	cc.record("k2", st, true, now)
+	cc.record("old", sp, false, now.Add(-7*time.Hour)) // expired: past the longest backoff
+	data, err := cc.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil || raw["version"] != 1.0 || len(raw["entries"].([]any)) != 2 {
+		t.Fatalf("snapshot %s", data)
+	}
+	re := &CarrierCache{}
+	if err := re.Restore(data); err != nil {
+		t.Fatal(err)
+	}
+	if _, until := re.state("k", CarrierStreaming, now); until.Sub(now.Add(2*time.Minute)).Abs() > time.Millisecond {
+		t.Fatalf("restored backoff until %v", until)
+	}
+	if good, _ := re.state("k2", CarrierStreaming, now); !good {
+		t.Fatal("usable entry not restored")
+	}
+	if _, ok := re.m[cacheKey{"old", CarrierSplit}]; ok {
+		t.Fatal("expired entry restored")
+	}
+	if e := re.m[cacheKey{"k", CarrierStreaming}]; e.backoff != 2*time.Minute {
+		t.Fatalf("backoff %v", e.backoff)
+	}
+	fresh := StreamingCandidate(http.DefaultClient, "https://a.example/z", nil)
+	re.prime("k2", fresh)
+	if fresh.Target.URL() != "https://b.example/z" {
+		t.Fatalf("restored URL %q", fresh.Target.URL())
+	}
+	// The restored backoff doubles on the next failure.
+	re.record("k", st, false, now)
+	if e := re.m[cacheKey{"k", CarrierStreaming}]; e.backoff != 4*time.Minute {
+		t.Fatalf("backoff after restore %v", e.backoff)
+	}
+
+	future := now.Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	later := now.Add(2 * time.Hour).UTC().Format(time.RFC3339Nano)
+	past := now.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	longAgo := now.Add(-7 * time.Hour).UTC().Format(time.RFC3339Nano)
+	lc := &CarrierCache{}
+	lenient := `{"version":1,"extra":true,"entries":[` +
+		`{"key":"k","kind":"split","good_until":"` + future + `","fail_until":"","new_field":3},` +
+		`{"key":"k","kind":"carrier-of-the-future","good_until":"` + future + `"},` +
+		`{"key":"k","kind":"exchange","fail_until":"` + past + `","backoff_ms":60000},` + // backoff history kept
+		`{"key":"k","kind":"quic","fail_until":"` + longAgo + `","backoff_ms":60000},` + // expired
+		`{"key":"d","kind":"quic","fail_until":"` + later + `","backoff_ms":1},` + // newer, backoff to 1 min
+		`{"key":"d","kind":"quic","fail_until":"` + future + `","backoff_ms":999999999999}]}`
+	if err := lc.Restore([]byte(lenient)); err != nil {
+		t.Fatal(err)
+	}
+	if len(lc.m) != 3 {
+		t.Fatalf("restored %d entries", len(lc.m))
+	}
+	if good, _ := lc.state("k", CarrierSplit, now); !good {
+		t.Fatal("split not restored")
+	}
+	if e := lc.m[cacheKey{"k", CarrierExchange}]; e == nil || e.backoff != time.Minute {
+		t.Fatal("backoff history not restored")
+	}
+	if e := lc.m[cacheKey{"d", CarrierQUIC}]; e == nil || e.backoff != time.Minute {
+		t.Fatalf("duplicate entry %+v", e)
+	}
+	// Merge: an older entry does not replace a newer one, a newer does.
+	older := `{"version":1,"entries":[{"key":"k","kind":"split","fail_until":"` + future + `","backoff_ms":60000},` +
+		`{"key":"d","kind":"quic","good_until":"` + later + `"},{"key":"n","kind":"websocket","good_until":"` + future + `"}]}`
+	if err := lc.Restore([]byte(older)); err != nil {
+		t.Fatal(err)
+	}
+	if good, _ := lc.state("k", CarrierSplit, now); !good {
+		t.Fatal("an older entry replaced a newer one")
+	}
+	if good, _ := lc.state("n", CarrierWebSocket, now); !good || len(lc.m) != 4 {
+		t.Fatal("new entry not merged")
+	}
+	newer := `{"version":1,"entries":[{"key":"k","kind":"split","fail_until":"` + later + `","backoff_ms":60000}]}`
+	if err := lc.Restore([]byte(newer)); err != nil {
+		t.Fatal(err)
+	}
+	if good, _ := lc.state("k", CarrierSplit, now); good {
+		t.Fatal("a newer entry did not replace an older one")
+	}
+	for _, bad := range []string{`{"version":2,"entries":[]}`, `{"entries":[]}`, `not json`,
+		`{"version":1,"entries":[{"key":"z","kind":"split","good_until":"` + future + `"},{"key":"k","kind":"split","backoff_ms":-1}]}`,
+		`{"version":1,"entries":[{"key":"z","kind":"split","backoff_ms":1.5}]}`,
+		`{"version":1,"entries":[{"key":"z","kind":"split","good_until":3}]}`,
+		`{"version":1,"entries":[{"key":"z","kind":"split","good_until":"tomorrow"}]}`,
+		`{"version":"1","entries":[]}`} {
+		err := lc.Restore([]byte(bad))
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("restored %s: %v", bad, err)
+		}
+	}
+	if len(lc.m) != 4 || lc.m[cacheKey{"z", CarrierSplit}] != nil {
+		t.Fatal("a rejected snapshot changed the cache")
+	}
+}
+
+// TestDialModeRestoredCache skips, after a restart, the kinds a restored
+// snapshot holds as failed.
+func TestDialModeRestoredCache(t *testing.T) {
+	leakcheck.Check(t)
+	e := newModeEnv(t)
+	defer e.close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	before := &CarrierCache{}
+	before.record("k", StreamingCandidate(e.hc, e.srv.URL, nil), false, time.Now())
+	data, err := before.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := &CarrierCache{}
+	if err := after.Restore(data); err != nil {
+		t.Fatal(err)
+	}
+	pol := fastPolicy(true)
+	pol.Cache, pol.Key = after, "k"
+	c, err := DialMode(ctx, AutoMode(e.candidates(e.srv.URL)...), modeCfg(), pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := c.ConnectionStats(); st.Carrier != CarrierSplit || len(st.CarrierCandidates) != 1 {
+		t.Fatalf("after the restore: %v", kinds(st.CarrierCandidates))
+	}
+	closeConn(t, c)
 }

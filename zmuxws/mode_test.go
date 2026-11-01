@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
-	"github.com/zmuxio/zmux-go/internal/testproxy"
+	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 // TestDialModeProfiles serves every HTTP carrier kind on one target
@@ -59,19 +59,19 @@ func TestDialModeProfiles(t *testing.T) {
 	hc := &http.Client{Transport: tr}
 	for _, c := range []struct {
 		name    string
-		profile *testproxy.Profile
+		profile *zmuxtest.Profile
 		want    zmux.CarrierKind
 		tries   int
 	}{
 		{"direct", nil, zmux.CarrierWebSocket, 1},
-		{"websocket front", new(testproxy.WebSocketFront()), zmux.CarrierWebSocket, 1},
-		{"nginx defaults", new(testproxy.NginxDefaults()), zmux.CarrierExchange, 3},
-		{"buffering cdn", new(testproxy.BufferingCDN(3 * time.Second)), zmux.CarrierExchange, 3},
+		{"websocket front", new(zmuxtest.WebSocketFront()), zmux.CarrierWebSocket, 1},
+		{"nginx defaults", new(zmuxtest.NginxDefaults()), zmux.CarrierExchange, 3},
+		{"buffering cdn", new(zmuxtest.BufferingCDN(3 * time.Second)), zmux.CarrierExchange, 3},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			u := srv.URL
 			if c.profile != nil {
-				px := testproxy.New(srv.URL, *c.profile)
+				px := zmuxtest.New(srv.URL, *c.profile)
 				defer px.Close()
 				u = px.URL
 			}
@@ -104,7 +104,7 @@ func TestDialModeProfiles(t *testing.T) {
 
 	// Explicit WebSocket through a proxy without WebSocket: refused, and no
 	// other kind is tried.
-	px := testproxy.New(srv.URL, testproxy.NginxDefaults())
+	px := zmuxtest.New(srv.URL, zmuxtest.NginxDefaults())
 	defer px.Close()
 	_, err = zmux.DialMode(context.Background(), zmux.ExplicitMode(Candidate("ws"+strings.TrimPrefix(px.URL, "http")+"/zmux", nil)), mpConfig(), nil)
 	var me *zmux.ModeError

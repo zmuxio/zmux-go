@@ -9,6 +9,9 @@ type ShapedPipe struct {
 	// Carrier is the pipe's carrier kind (PipeIO.Carrier); 0 for a carrier
 	// of no listed kind, such as raw TCP or TLS.
 	Carrier CarrierKind
+	// WriteOverhead is the pipe's PipeIO.WriteOverhead: the fixed number
+	// of bytes each carrier write adds below the pipe.
+	WriteOverhead int
 }
 
 // ShaperFactory returns the Shaper of an outbound pipe; nil: the pipe is
@@ -18,12 +21,12 @@ type ShapedPipe struct {
 type ShaperFactory func(ShapedPipe) shaping.Shaper
 
 // coreFactory adapts f to the core, which keeps a pipe's kind opaque.
-func coreFactory(f ShaperFactory) func(uint64, uint8) shaping.Shaper {
+func coreFactory(f ShaperFactory) func(uint64, uint8, int) shaping.Shaper {
 	if f == nil {
 		return nil
 	}
-	return func(id uint64, kind uint8) shaping.Shaper {
-		return f(ShapedPipe{ID: id, Carrier: CarrierKind(kind)})
+	return func(id uint64, kind uint8, overhead int) shaping.Shaper {
+		return f(ShapedPipe{ID: id, Carrier: CarrierKind(kind), WriteOverhead: overhead})
 	}
 }
 

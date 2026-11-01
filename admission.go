@@ -135,6 +135,13 @@ type Decision struct {
 	// Skip is the number of leading prefix bytes that are not carrier bytes
 	// (VerdictAccept only); the rest is replayed to the Listener.
 	Skip int
+	// Value is the host's value for an accepted carrier (VerdictAccept
+	// only; ignored otherwise): zmux hands it on without looking at it to
+	// WrapPipe (JoinHint.Admitted) and to the session (Conn.Admitted) or
+	// pipe (Pipe.Admitted) the carrier makes, and holds it until their
+	// state is released. Whether a join comes from the same client as its
+	// session is the host's to decide: zmux compares no values.
+	Value any
 }
 
 // AdmissionStats are the outcomes of a listener's admission (API.md 7.2),
@@ -299,12 +306,13 @@ type Arrival struct {
 	mu       sync.Mutex
 	held     bool // the source slot Arrive took is held and not yet handed on
 	accepted bool // the admission accepted the carrier
+	value    any  // Decision.Value of that acceptance
 }
 
 // Arrive takes a slot of source for a carrier that arrived from peer
-// (source zero: peer). A source without a free slot, or a closed listener,
-// refuses it (ListenerStats.Refused): the caller closes the carrier
-// without a handshake.
+// (source zero: peer). A source without a free slot, or a closed listener
+// (net.ErrClosed), refuses it (ListenerStats.Refused): the caller closes
+// the carrier without a handshake.
 func (l *Listener) Arrive(source, peer netip.AddrPort) (*Arrival, error) {
 	source, peer = unmapped(source), unmapped(peer)
 	if !source.IsValid() {
@@ -312,10 +320,14 @@ func (l *Listener) Arrive(source, peer netip.AddrPort) (*Arrival, error) {
 	}
 	key := sourceKey(source)
 	l.mu.Lock()
-	ok := !l.closed && l.pending.Enter(key)
+	closed := l.closed
+	ok := !closed && l.pending.Enter(key)
 	l.mu.Unlock()
 	if !ok {
 		l.st.refused.Add(1)
+		if closed {
+			return nil, net.ErrClosed
+		}
 		return nil, errRefused
 	}
 	return &Arrival{l: l, src: source, peer: peer, key: key, held: true}, nil
@@ -398,6 +410,12 @@ func (a *Arrival) accept() {
 // ignored: the arrival's source applies.
 func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) error {
 	l := a.l
+	if err := p.checkOverhead(); err != nil {
+		a.Release()
+		closePipeIO(p)
+		l.CountSetupFailure()
+		return err
+	}
 	if !a.isAccepted() {
 		q, prefix, v := a.admitPipe(ctx, p)
 		switch v {
@@ -422,6 +440,9 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) error
 		return errRefused
 	}
 	hint.Source = a.src
+	a.mu.Lock()
+	hint.Admitted = a.value
+	a.mu.Unlock()
 	run, err := l.take(p, hint, a.key)
 	if err != nil {
 		return err
@@ -568,6 +589,10 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 	select {
 	case d = <-res:
 	case <-dctx.Done():
+	}
+	// A decision that returns after ctx or the deadline ended is not
+	// used, however the select above chose.
+	if dctx.Err() != nil {
 		if errors.Is(dctx.Err(), context.DeadlineExceeded) {
 			l.st.adm.peekTimedOut.Add(1)
 		} else {
@@ -579,12 +604,15 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 	case d.Verdict > VerdictClose:
 		d = Decision{Verdict: VerdictClose}
 	case d.Verdict != VerdictAccept:
-		d.Skip = 0
+		d.Skip, d.Value = 0, nil
 	case d.Skip < 0 || d.Skip > len(prefix):
 		d = Decision{Verdict: VerdictClose}
 	}
 	switch d.Verdict {
 	case VerdictAccept:
+		a.mu.Lock()
+		a.value = d.Value
+		a.mu.Unlock()
 		l.st.adm.accepted.Add(1)
 	case VerdictFallback:
 		l.st.adm.fallback.Add(1)

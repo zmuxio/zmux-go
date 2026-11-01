@@ -1,4 +1,4 @@
-package testproxy
+package zmuxtest
 
 import (
 	"io"

@@ -388,6 +388,44 @@ func (s *Session) SetCarrierUnsent(pipe, lane, n uint64) {
 	}
 }
 
+// lossSampleGap is the shortest time between two samples of a pipe's
+// smoothed loss rate.
+const lossSampleGap = Second
+
+// SetCarrierRetransmitted records the bytes the carrier of a pipe has
+// retransmitted, as its adapter reports them (an optional capability),
+// and samples the pipe's smoothed loss rate: an EWMA with gain 1/8 of the
+// retransmitted bytes per byte sent between samples at least
+// lossSampleGap apart. A count that moves back (a carrier that undoes
+// losses) counts as no retransmission.
+func (s *Session) SetCarrierRetransmitted(pipe, n uint64) {
+	p := s.pipe(pipe)
+	if p == nil || p.out == nil {
+		return
+	}
+	d := p.out
+	var sent uint64
+	for _, l := range d.lanes {
+		sent += l.pos
+	}
+	first := !d.retransKnown
+	d.retrans, d.retransKnown = n, true
+	if first {
+		d.lossAt, d.lossSent, d.lossRetrans = s.now, sent, n
+		return
+	}
+	if s.now.Sub(d.lossAt) < lossSampleGap || sent <= d.lossSent {
+		return
+	}
+	x := float64(n-min64(n, d.lossRetrans)) / float64(sent-d.lossSent)
+	if d.lossHas {
+		d.lossRate += (x - d.lossRate) / 8
+	} else {
+		d.lossRate, d.lossHas = x, true
+	}
+	d.lossAt, d.lossSent, d.lossRetrans = s.now, sent, n
+}
+
 // WriteDone reports that a batch was written (or failed); it releases the
 // batch's references. n is the bytes the carrier took.
 func (s *Session) WriteDone(b *Batch, err error, now Time) {

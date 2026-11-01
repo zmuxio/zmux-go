@@ -32,8 +32,11 @@ const (
 // RecordView describes the next outgoing record.
 type RecordView struct {
 	Pipe, Lane uint64
-	Seq        uint64        // records of the pipe planned before this one
-	Limit      int           // largest frames length, bytes
+	Seq        uint64 // records of the pipe planned before this one
+	Limit      int    // largest frames length, bytes
+	// WriteStart: the record is the first of a carrier write call (every
+	// record of a message-framed carrier, one message per write).
+	WriteStart bool
 	Now        time.Duration // session clock
 }
 
@@ -110,7 +113,7 @@ type Timer struct {
 
 // MinMaxLen is the smallest RecordPlan.MaxLen honoured (64 bytes, a
 // STREAM frame header and some data); a smaller nonzero MaxLen is raised
-// to it.
+// to it (Stats.Clamped).
 const MinMaxLen = 64
 
 // StartupAllowance is the PADDING a session may add regardless of

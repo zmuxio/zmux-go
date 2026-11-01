@@ -3,6 +3,7 @@ package zmux
 import (
 	"crypto/tls"
 	"net"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -17,7 +18,26 @@ const (
 // tcpInfo is the TCP socket under a carrier, when there is one: its
 // low-water mark and its minimum RTT are optional carrier capabilities.
 type tcpInfo struct {
-	rc syscall.RawConn
+	rc      syscall.RawConn
+	retrans *counter32 // widens a 32-bit retransmission count (Windows)
+}
+
+// counter32 extends a wrapping 32-bit counter to 64 bits, read often
+// enough that it wraps at most once between reads.
+type counter32 struct {
+	mu   sync.Mutex
+	last uint32
+	high uint64 // wraps seen, << 32
+}
+
+func (c *counter32) widen(v uint32) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if v < c.last {
+		c.high += 1 << 32
+	}
+	c.last = v
+	return c.high | uint64(v)
 }
 
 // tcpOf finds the TCP socket under a carrier half (a TCP connection, or a
@@ -28,7 +48,11 @@ func tcpOf(x any) tcpInfo {
 	}
 	if c, ok := x.(*net.TCPConn); ok {
 		if rc, err := c.SyscallConn(); err == nil {
-			return tcpInfo{rc: rc}
+			t := tcpInfo{rc: rc}
+			if tcpRetransBits == 32 {
+				t.retrans = &counter32{}
+			}
+			return t
 		}
 	}
 	return tcpInfo{}
@@ -66,6 +90,25 @@ func (t tcpInfo) unsent() (uint64, bool) {
 	var n uint64
 	ok := false
 	_ = t.rc.Control(func(fd uintptr) { n, ok = tcpUnsent(fd) })
+	return n, ok
+}
+
+// retransmitted is the bytes the socket retransmitted, an optional
+// capability: Linux tcpi_bytes_retrans of TCP_INFO (64-bit, Linux 4.19
+// and later), Darwin tcpi_txretransmitbytes of TCP_CONNECTION_INFO
+// (64-bit), Windows BytesRetrans of SIO_TCP_INFO (32-bit in every version
+// of TCP_INFO, widened here: it is read at most once a second, far less
+// than 4 GiB of retransmissions apart).
+func (t tcpInfo) retransmitted() (uint64, bool) {
+	if t.rc == nil {
+		return 0, false
+	}
+	var n uint64
+	ok := false
+	_ = t.rc.Control(func(fd uintptr) { n, ok = tcpRetrans(fd) })
+	if ok && t.retrans != nil {
+		n = t.retrans.widen(uint32(n))
+	}
 	return n, ok
 }
 

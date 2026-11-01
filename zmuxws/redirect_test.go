@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
-	"github.com/zmuxio/zmux-go/internal/testproxy"
+	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 // TestRedirect follows a redirect of the upgrade from ws to wss on the
@@ -51,7 +51,7 @@ func TestRedirect(t *testing.T) {
 	ws := func(u string) string { return "ws" + strings.TrimPrefix(u, "http") }
 
 	for _, st := range []int{301, 302, 307, 308} {
-		rd := testproxy.New("http://unused.invalid", testproxy.RedirectToHTTPS(srv.URL, st))
+		rd := zmuxtest.New("http://unused.invalid", zmuxtest.RedirectToHTTPS(srv.URL, st))
 		cand := Candidate(ws(rd.URL)+"/zmux", o)
 		c, err := zmux.DialMode(ctx, zmux.ExplicitMode(cand), cfg, nil)
 		if err != nil {
@@ -82,10 +82,10 @@ func TestRedirect(t *testing.T) {
 		rd.Close()
 	}
 
-	cross := testproxy.New("http://unused.invalid", testproxy.Profile{
+	cross := zmuxtest.New("http://unused.invalid", zmuxtest.Profile{
 		RedirectTo: strings.Replace(elsewhere.URL, "127.0.0.1", "localhost", 1)})
 	defer cross.Close()
-	down := testproxy.New("http://unused.invalid", testproxy.Profile{TLS: true, RedirectTo: elsewhere.URL})
+	down := zmuxtest.New("http://unused.invalid", zmuxtest.Profile{TLS: true, RedirectTo: elsewhere.URL})
 	defer down.Close()
 	droots := x509.NewCertPool()
 	droots.AddCert(down.Certificate())

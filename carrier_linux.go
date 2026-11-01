@@ -33,3 +33,19 @@ func tcpUnsent(fd uintptr) (uint64, bool) {
 	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, fd, siocOutqNSD, uintptr(unsafe.Pointer(&n)))
 	return uint64(max(n, 0)), e == 0
 }
+
+// tcpRetransBits is the width of the count tcpRetrans reads.
+const tcpRetransBits = 64
+
+// tcpRetrans reads tcpi_bytes_retrans (offset 208 of struct tcp_info,
+// Linux 4.19 and later).
+func tcpRetrans(fd uintptr) (uint64, bool) {
+	var buf [232]byte
+	l := uint32(len(buf))
+	_, _, e := syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, syscall.IPPROTO_TCP, syscall.TCP_INFO,
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&l)), 0)
+	if e != 0 || l < 216 {
+		return 0, false
+	}
+	return *(*uint64)(unsafe.Pointer(&buf[208])), true
+}

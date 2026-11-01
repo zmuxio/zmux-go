@@ -363,3 +363,42 @@ func TestStreamTriggerCaps(t *testing.T) {
 		t.Fatalf("%+v", p)
 	}
 }
+
+// The pipe's write overhead comes off max_len and pad_to on the first
+// record of a carrier write only; a max_len it takes below the floor is
+// left for the session to raise.
+func TestWriteOverhead(t *testing.T) {
+	d := &Definition{Version: 1, Machines: []Machine{{States: []State{{Record: &Record{
+		MaxLen: cv(1000), PadTo: cv(800), PadMultiple: cv(16), Pad: cv(3)}}}}}}
+	f, err := d.Factory(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := f(zmux.ShapedPipe{WriteOverhead: 22})
+	var r shaping.Reply
+	s.OnEvent(&shaping.Event{Kind: shaping.EventStart}, &r)
+	var first, later shaping.RecordPlan
+	s.Plan(&shaping.RecordView{WriteStart: true}, &first)
+	s.Plan(&shaping.RecordView{}, &later)
+	if first.MaxLen != 978 || first.PadTo != 778 || first.PadMultiple != 16 || first.Pad != 3 {
+		t.Fatalf("first record of a write: %+v", first)
+	}
+	if later.MaxLen != 1000 || later.PadTo != 800 {
+		t.Fatalf("later record of a write: %+v", later)
+	}
+	var zero shaping.RecordPlan
+	f(zmux.ShapedPipe{}).Plan(&shaping.RecordView{WriteStart: true}, &zero)
+	if zero.MaxLen != 1000 || zero.PadTo != 800 {
+		t.Fatalf("without overhead: %+v", zero)
+	}
+	small := &Definition{Version: 1, Machines: []Machine{{States: []State{{Record: &Record{MaxLen: cv(20)}}}}}}
+	fs, err := small.Factory(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p shaping.RecordPlan
+	fs(zmux.ShapedPipe{WriteOverhead: 22}).Plan(&shaping.RecordView{WriteStart: true}, &p)
+	if p.MaxLen != 1 {
+		t.Fatalf("max_len under the overhead: %d, want 1 (raised by the session)", p.MaxLen)
+	}
+}

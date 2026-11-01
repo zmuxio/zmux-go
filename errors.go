@@ -84,8 +84,11 @@ func (e *TransportError) Error() string {
 	return s
 }
 
-// Is makes every session termination match net.ErrClosed.
-func (e *TransportError) Is(t error) bool { return t == net.ErrClosed }
+// Is makes every session termination match net.ErrClosed, and
+// ZMUX_RESUME_FAILED match ErrResumeFailed.
+func (e *TransportError) Is(t error) bool {
+	return t == net.ErrClosed || t == ErrResumeFailed && e.ErrorCode == TransportResumeFailed
+}
 
 // IdleTimeoutError reports the idle timeout; Remote when the peer's timer
 // expired. It matches ErrIdleTimeout, net.ErrClosed and
@@ -234,6 +237,11 @@ var (
 	// ErrResumeTimeout reports that a suspended session was not resumed in time
 	// (*ResumeTimeoutError).
 	ErrResumeTimeout = errors.New("zmux: resume timeout")
+	// ErrResumeFailed reports that a session closed with ZMUX_RESUME_FAILED
+	// (*TransportError): among others, a suspended session whose resume
+	// join the listener answered with it, as it holds no session for the
+	// locator (ListenerConfig.AnswerUnknownJoins).
+	ErrResumeFailed = errors.New("zmux: resume failed")
 	// ErrPipesLost reports that the session lost its pipes and could not resume
 	// (*PipesLostError).
 	ErrPipesLost = errors.New("zmux: pipes lost")

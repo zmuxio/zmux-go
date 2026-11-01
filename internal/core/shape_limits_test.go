@@ -46,7 +46,7 @@ func injectSession(t *testing.T, lim shaping.Limits, n int) (*Session, *Pipe, *i
 	s.peerZmux = true
 	s.cfg.ShapeLimits = lim
 	sh := &injectShaper{n: n}
-	s.SetShaper(func(uint64, uint8) shaping.Shaper { return sh })
+	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return sh })
 	return s, p, sh
 }
 

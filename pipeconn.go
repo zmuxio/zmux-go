@@ -22,7 +22,8 @@ import (
 // CloseWrite ends the sending half where it offers CloseWrite. Addresses
 // and deadlines are those of the halves that have them; a deadline with no
 // half to take it is os.ErrNoDeadline. The conn exposes none of p's other
-// capabilities.
+// capabilities. The PipeIO of a layer over the conn may set WriteOverhead
+// to the bytes that layer adds to each of its writes.
 func PipeConn(p PipeIO) net.Conn {
 	c := &pipeConn{p: p}
 	if p.Framing == FramingRecords {

@@ -3,6 +3,7 @@ package zmux
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -89,6 +90,13 @@ func WriteFlat(w io.Writer, bufs [][]byte) (int, error) {
 //     A TCP connection, or a TLS one over it, reports the socket's
 //     unsent bytes where the platform has a query (Linux SIOCOUTQNSD)
 //     without it.
+//   - interface{ Retransmitted() (uint64, bool) } on W: the bytes the
+//     carrier has retransmitted, false when it cannot tell; queried as
+//     Unsent is, at most once a second (PipeStats.BytesRetransmitted,
+//     LossRate). A TCP connection, or a TLS one over it, reports the
+//     socket's count without it (Linux tcpi_bytes_retrans, Darwin
+//     tcpi_txretransmitbytes, Windows SIO_TCP_INFO BytesRetrans, a
+//     32-bit count widened to 64 bits).
 //
 // A half's Close must interrupt a blocked Read or Write.
 type PipeIO struct {
@@ -105,6 +113,24 @@ type PipeIO struct {
 	// FateGroup is the carrier's own fate group (a carrier pool's pipes on
 	// one connection share one), used when PipeOptions.FateGroup is 0.
 	FateGroup uint64
+	// WriteOverhead is the fixed number of bytes that each write call on
+	// the carrier adds below it, a hint passed to shaping
+	// (ShapedPipe.WriteOverhead) and not checked by zmux; 0: none. A value
+	// outside [0, MaxWriteOverhead] is ErrInvalidConfig where the PipeIO
+	// is used (Start, AddPipe, the listener's HandlePipe and WrapPipe's
+	// result). WrapPipe's result keeps the WriteOverhead it sets.
+	WriteOverhead int
+}
+
+// MaxWriteOverhead is the largest PipeIO.WriteOverhead.
+const MaxWriteOverhead = 65535
+
+// checkOverhead reports a WriteOverhead outside [0, MaxWriteOverhead].
+func (p PipeIO) checkOverhead() error {
+	if p.WriteOverhead < 0 || p.WriteOverhead > MaxWriteOverhead {
+		return fmt.Errorf("%w: PipeIO.WriteOverhead %d outside [0, %d]", ErrInvalidConfig, p.WriteOverhead, MaxWriteOverhead)
+	}
+	return nil
 }
 
 // NetPipe returns the PipeIO of a bidirectional net.Conn (TCP, TLS, Unix,
@@ -119,6 +145,9 @@ type closeWriter interface{ CloseWrite() error }
 
 // unsentReporter is the optional unsent count of a sending half.
 type unsentReporter interface{ Unsent() (uint64, bool) }
+
+// retransReporter is the optional retransmission count of a sending half.
+type retransReporter interface{ Retransmitted() (uint64, bool) }
 
 type aborter interface{ Abort(error) }
 

@@ -109,7 +109,7 @@ func TestBatchFullRecordAlone(t *testing.T) {
 func TestBatchManyRecordsShaped(t *testing.T) {
 	s, p := multiSession(t, 65535, 64<<10)
 	sh := &lenShaper{maxLen: 300}
-	s.SetShaper(func(uint64, uint8) shaping.Shaper { return sh })
+	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return sh })
 	b := GetBatch()
 	defer PutBatch(b)
 	if !s.PollTransmit(p.id, 0, b, DefaultBatch, Time(Second)) {
@@ -134,7 +134,7 @@ func TestBatchDelayedRecordEndsBatch(t *testing.T) {
 	s, p := multiSession(t, 65535, 16<<10)
 	const at = 5
 	sh := &lenShaper{maxLen: 400, delayAt: at, delay: 10 * time.Millisecond}
-	s.SetShaper(func(uint64, uint8) shaping.Shaper { return sh })
+	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return sh })
 	now := Time(Second)
 	b := GetBatch()
 	defer PutBatch(b)

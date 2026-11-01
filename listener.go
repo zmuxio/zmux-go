@@ -59,6 +59,19 @@ type ListenerConfig struct {
 	// load-balancer stickiness; random bytes fill the rest of the 16-byte
 	// locator. At most MaxInstanceIDLen bytes.
 	InstanceID []byte
+	// AnswerUnknownJoins makes the listener answer an admitted carrier
+	// whose well-formed join names a locator that starts with InstanceID
+	// but no session here: it writes CONNECTION_CLOSE with
+	// ZMUX_RESUME_FAILED and ends the carrier (MULTIPATH.md 5.4), so that
+	// a suspended client fails at once instead of at its resume timeout.
+	// The carrier still counts as rejected; every other rejected carrier
+	// gets no byte. Leave it off where a load balancer can route a join
+	// to an instance with the same InstanceID that does not hold its
+	// session. It does not change what a carrier that Admission does not
+	// accept gets; what a carrier that is not admitted receives
+	// depends on the Admission configured (without one every carrier is
+	// admitted).
+	AnswerUnknownJoins bool
 	// MemoryBudget bounds the sum over the listener's sessions of buffered
 	// receive data, retained data and session window growth. Zero is
 	// 1 GiB; NoMemoryLimit is unlimited. It replaces the sessions' own
@@ -167,6 +180,10 @@ type JoinHint struct {
 	// host that resolves it itself (zero: the address the carrier arrived
 	// from). The adapters set it from TrustedProxies.
 	Source netip.AddrPort
+	// Admitted is Decision.Value of the admission that accepted the
+	// carrier (nil: none). The listener sets it for WrapPipe; a value
+	// passed to HandlePipe is replaced.
+	Admitted any
 }
 
 // Listener is the server side of zmux: it accepts sessions and the pipes
@@ -305,9 +322,10 @@ func (l *Listener) rejectedBy(err error) {
 }
 
 type pairWait struct {
-	p    PipeIO
-	done chan error // the session's result for the waiting half
-	end  chan struct{}
+	p        PipeIO
+	admitted any        // the half's admission value
+	done     chan error // the session's result for the waiting half
+	end      chan struct{}
 }
 
 // MaxInstanceIDLen bounds ListenerConfig.InstanceID so that at least 8
@@ -618,6 +636,9 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint JoinHint) (PipeI
 	if err == nil && q.R == nil && q.W == nil {
 		err = errors.New("no pipe halves")
 	}
+	if err == nil {
+		err = q.checkOverhead()
+	}
 	if err != nil {
 		markTaken(p) // what the layer read is no longer a request to hand on
 		if q.R != nil || q.W != nil {
@@ -651,7 +672,7 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint JoinHint, 
 			l.st.rejected.Add(1)
 			return errRejected
 		}
-		return l.join(ctx, p, j, mac, nil, false, release)
+		return l.join(ctx, p, j, mac, false, hint.Admitted, release)
 	}
 	first, cls, err := l.readFirst(ctx, p)
 	if err != nil {
@@ -666,7 +687,7 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint JoinHint, 
 	switch cls {
 	case core.ClassSession:
 		release()
-		return l.startSession(ctx, withPrefix(p, first))
+		return l.startSession(ctx, withPrefix(p, first), hint.Admitted)
 	case core.ClassJoin:
 		body := first
 		if p.Framing == FramingByteStream {
@@ -679,7 +700,7 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint JoinHint, 
 			l.st.rejected.Add(1)
 			return errRejected
 		}
-		return l.join(ctx, withPrefix(p, first), j, mac, nil, true, release)
+		return l.join(ctx, withPrefix(p, first), j, mac, true, hint.Admitted, release)
 	case core.ClassLane:
 		release()
 		return handleLane(ctx, l, withPrefix(p, first), first)
@@ -790,8 +811,8 @@ func readFirstRecord(p PipeIO) ([]byte, core.Class, error) {
 }
 
 // startSession starts a server session on a carrier whose first record is
-// QX_TRANSPORT_PARAMETERS.
-func (l *Listener) startSession(ctx context.Context, p PipeIO) error {
+// QX_TRANSPORT_PARAMETERS; admitted is the carrier's admission value.
+func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any) error {
 	cfg := l.cfg.Config.Clone()
 	cc, err := cfg.coreConfig(core.RoleResponder, core.RoleResponder)
 	if err != nil {
@@ -807,7 +828,7 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO) error {
 	}
 	cc.Budget = l.budget
 	markTaken(p)
-	c, err := startCore(ctx, p, cfg, cc, l)
+	c, err := startCore(ctx, p, cfg, cc, l, admitted)
 	if err != nil {
 		l.st.rejected.Add(1)
 		return err
@@ -844,8 +865,10 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO) error {
 
 // join attaches a carrier that joins a session; inband: its first record
 // starts with the PIPE_JOIN (already read into its prefix). release gives
-// up the carrier's pending slot once the join was verified or refused.
-func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte, binding []byte, inband bool, release func()) error {
+// up the carrier's pending slot once the join was verified or refused;
+// admitted is the carrier's admission value.
+func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte, inband bool, admitted any, release func()) error {
+	var binding []byte
 	l.mu.Lock()
 	c, closed := l.sessions[string(j.Locator)], l.closed
 	l.mu.Unlock()
@@ -855,7 +878,12 @@ func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte,
 		return errRefused
 	}
 	if c == nil {
-		closePipeIO(p)
+		if l.cfg.AnswerUnknownJoins && bytes.HasPrefix(j.Locator, l.cfg.InstanceID) {
+			release()
+			l.answerUnknownJoin(ctx, p)
+		} else {
+			closePipeIO(p)
+		}
 		l.st.rejected.Add(1)
 		return errRejected
 	}
@@ -912,7 +940,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte,
 			return errRejected
 		}
 	}
-	id, err := c.acceptJoin(ctx, p, j, mac, binding, inband)
+	id, err := c.acceptJoin(ctx, p, j, mac, binding, inband, admitted)
 	release()
 	if err != nil {
 		l.rejectedBy(err)
@@ -920,6 +948,40 @@ func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte,
 	}
 	l.st.joins.Add(1)
 	return c.waitPipe(ctx, id)
+}
+
+// unknownJoinAnswer is the record a listener answers an unknown join
+// with (MULTIPATH.md 5.4 step 3): CONNECTION_CLOSE, ZMUX_RESUME_FAILED,
+// frame type 0, no reason.
+var unknownJoinAnswer = [8]byte{0x07, 0x1c, 0x8f, 0x05, 0xf7, 0x4e, 0x00, 0x00}
+
+// answerUnknownJoin writes unknownJoinAnswer on p and ends it: the
+// sending half gracefully, then what the joiner sends is discarded until
+// it ends the carrier or the first-record timeout passes, so that the
+// answer is not lost to a reset over unread data.
+func (l *Listener) answerUnknownJoin(ctx context.Context, p PipeIO) {
+	markTaken(p)
+	var err error
+	if p.Framing == FramingRecords {
+		mw, ok := p.W.(MessageWriter)
+		if !ok {
+			closePipeIO(p)
+			return
+		}
+		err = mw.WriteMessage(unknownJoinAnswer[1:])
+	} else {
+		_, err = p.W.Write(unknownJoinAnswer[:])
+	}
+	if err == nil && p.R != nil {
+		if cw, ok := p.W.(closeWriter); ok && cw.CloseWrite() == nil {
+			t := l.clk.AfterFunc(l.cfg.FirstRecordTimeout, func() { interruptRead(p) })
+			stop := context.AfterFunc(ctx, func() { interruptRead(p) })
+			discard(p.R)
+			stop()
+			t.Stop()
+		}
+	}
+	closePipeIO(p)
 }
 
 // sessionClosed forgets a session that ended.
@@ -977,7 +1039,7 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint JoinHint, src 
 	var t [16]byte
 	copy(t[:], tok)
 	hto := l.cfg.Config.handshakeTimeout()
-	me := &pairWait{p: p, done: make(chan error, 1), end: make(chan struct{})}
+	me := &pairWait{p: p, admitted: hint.Admitted, done: make(chan error, 1), end: make(chan struct{})}
 	l.mu.Lock()
 	res, partner := l.pairing.Offer(t, hint.Uplink, src, me, core.Time(l.clk.Now().Add(hto).UnixNano()))
 	l.mu.Unlock()
@@ -1026,12 +1088,12 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint JoinHint, src 
 	case core.PairDone:
 	}
 	other := partner.(*pairWait)
-	up, down := p, other.p
+	up, down, admitted := p, other.p, hint.Admitted
 	if !hint.Uplink {
-		up, down = other.p, p
+		up, down, admitted = other.p, p, other.admitted
 	}
 	both := PipeIO{R: up.R, W: down.W, Framing: up.Framing, Label: up.Label, Carrier: up.Carrier}
-	err = l.startSession(ctx, both)
+	err = l.startSession(ctx, both, admitted)
 	other.done <- err
 	close(other.end)
 	// The token stays used while its session lives (no second pairing).

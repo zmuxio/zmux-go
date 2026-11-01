@@ -79,8 +79,9 @@ func (s *Session) shapeSess() *shapeSess {
 }
 
 // Factory returns the Shaper of an outbound pipe of carrier kind carrier
-// (SetPipeKind); nil: the pipe is not shaped.
-type Factory func(pipe uint64, carrier uint8) shaping.Shaper
+// (SetPipeKind) whose carrier adds overhead bytes to each write
+// (CarrierInfo.WriteOverhead); nil: the pipe is not shaped.
+type Factory func(pipe uint64, carrier uint8, overhead int) shaping.Shaper
 
 // SetShaper installs f on every outbound pipe; nil: no shaping.
 func (s *Session) SetShaper(f Factory) {
@@ -153,7 +154,7 @@ func (s *Session) shapeOf(p *Pipe) *pipeShape {
 						s.shp.stats.Faults++
 					}
 				}()
-				x = f(p.id, p.carrier)
+				x = f(p.id, p.carrier, writeOverhead(p))
 			}()
 		}
 		ps = s.shapeInstall(p, x)
@@ -162,6 +163,14 @@ func (s *Session) shapeOf(p *Pipe) *pipeShape {
 		return nil
 	}
 	return ps
+}
+
+// writeOverhead is the WriteOverhead of p's outbound carrier (lane 0).
+func writeOverhead(p *Pipe) int {
+	if p == nil || p.out == nil || len(p.out.lanes) == 0 {
+		return 0
+	}
+	return p.out.lanes[0].info.WriteOverhead
 }
 
 func (s *Session) shapeInstall(p *Pipe, x shaping.Shaper) *pipeShape {
@@ -374,7 +383,7 @@ func (ps *pipeShape) prep(w *recWriter) {
 		ps.plan = shaping.RecordPlan{}
 		if ps.caps&shaping.CapPlan != 0 {
 			ps.v = shaping.RecordView{Pipe: ps.p.id, Lane: w.b.Lane, Seq: ps.seq, Limit: w.recMax,
-				Now: time.Duration(s.now)}
+				WriteStart: w.recs == 0 || w.framing == FramingRecords, Now: time.Duration(s.now)}
 			x := ps.sh
 			if !ps.call(func() { x.Plan(&ps.v, &ps.plan) }) {
 				w.sh = nil
@@ -382,6 +391,10 @@ func (ps *pipeShape) prep(w *recWriter) {
 			}
 		}
 		ps.planned = true
+		if m := ps.plan.MaxLen; m > 0 && m < shaping.MinMaxLen {
+			ps.plan.MaxLen = shaping.MinMaxLen
+			s.shp.stats.Clamped++
+		}
 		if ps.plan.Reply != (shaping.Reply{}) {
 			ps.apply(&ps.plan.Reply)
 			if ps.sh == nil {

@@ -131,8 +131,9 @@ func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{
 }
 
 // acceptJoin attaches a carrier that joins the session (MULTIPATH.md 5.4);
-// inband: its first record starts with the PIPE_JOIN the listener read.
-func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, binding []byte, inband bool) (uint64, error) {
+// inband: its first record starts with the PIPE_JOIN the listener read;
+// admitted is the carrier's admission value.
+func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, binding []byte, inband bool, admitted any) (uint64, error) {
 	for {
 		c.lock()
 		if c.closing {
@@ -153,6 +154,7 @@ func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, bind
 		pd.outer = outer
 		switch res {
 		case core.JoinAccepted:
+			pd.admitted = admitted
 			markTaken(p)
 			if inband {
 				c.s.SkipJoinFrame(j.PipeID)
