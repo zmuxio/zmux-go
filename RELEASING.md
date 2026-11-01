@@ -5,9 +5,12 @@ This repository holds four Go modules:
 - root module: `github.com/zmuxio/zmux-go`
 - QUIC carrier module: `github.com/zmuxio/zmux-go/zmuxquic`
 - HTTP/3 carrier module: `github.com/zmuxio/zmux-go/zmuxh3`
-- WebSocket carrier module: `github.com/zmuxio/zmux-go/zmuxws`, which
-  requires `github.com/djylb/netx`: a netx change it needs is released
-  (pushed, and tagged once netx has tags) before the zmuxws release
+- WebSocket carrier module: `github.com/zmuxio/zmux-go/zmuxws`
+
+The root module and `zmuxws` require `github.com/djylb/netx` and
+`github.com/djylb/timeshim` at pseudo-versions of their `main` branch; those
+libraries are not tagged. A change this repository needs is pushed to their
+`main` first, then required with `go get <module>@main`.
 
 The sub-modules track the current root release directly. They do not keep
 compatibility shims for older root versions.
@@ -53,14 +56,16 @@ Do not tag a sub-module first.
 ## Dependency Update
 
 Before every release, update every dependency of every module to its latest
-release, then review the changes and run the full tests:
+release (`netx` and `timeshim` to their latest `main`), then review the
+changes and run the full tests:
 
 ```bash
 go get -u -t ./...
+go get github.com/djylb/netx@main github.com/djylb/timeshim@main
 go mod tidy
 (cd zmuxquic && GOWORK=off go get -u -t ./... && GOWORK=off go mod tidy)
 (cd zmuxh3 && GOWORK=off go get -u -t ./... && GOWORK=off go mod tidy)
-(cd zmuxws && GOWORK=off go get -u -t ./... && GOWORK=off go mod tidy)
+(cd zmuxws && GOWORK=off go get -u -t ./... && GOWORK=off go get github.com/djylb/netx@main github.com/djylb/timeshim@main && GOWORK=off go mod tidy)
 go test -race ./... ./zmuxquic/... ./zmuxh3/... ./zmuxws/...
 ```
 
