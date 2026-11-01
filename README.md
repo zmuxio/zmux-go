@@ -5,10 +5,9 @@
 [![Release](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=v*&label=release)](https://github.com/zmuxio/zmux-go/tags)
 [![Go version](https://img.shields.io/github/go-mod/go-version/zmuxio/zmux-go)](go.mod)
 [![License](https://img.shields.io/github/license/zmuxio/zmux-go)](LICENSE)
-
-[![zmuxquic](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=zmuxquic/*&label=&color=007d9c)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxquic)
-[![zmuxh3](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=zmuxh3/*&label=&color=007d9c)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxh3)
-[![zmuxws](https://img.shields.io/github/v/tag/zmuxio/zmux-go?filter=zmuxws/*&label=&color=007d9c)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxws)
+[![zmuxquic](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fproxy.golang.org%2Fgithub.com%2Fzmuxio%2Fzmux-go%2Fzmuxquic%2F%40latest&query=%24.Version&label=zmuxquic&color=blue)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxquic)
+[![zmuxh3](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fproxy.golang.org%2Fgithub.com%2Fzmuxio%2Fzmux-go%2Fzmuxh3%2F%40latest&query=%24.Version&label=zmuxh3&color=blue)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxh3)
+[![zmuxws](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fproxy.golang.org%2Fgithub.com%2Fzmuxio%2Fzmux-go%2Fzmuxws%2F%40latest&query=%24.Version&label=zmuxws&color=blue)](https://pkg.go.dev/github.com/zmuxio/zmux-go/zmuxws)
 
 Go implementation of zmux: multiplexed, flow-controlled streams and
 datagrams over one or many reliable byte pipes.
