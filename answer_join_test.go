@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -299,5 +302,44 @@ func TestJoinAnsweredUnknown(t *testing.T) {
 	_ = s.Close()
 	if b, err := io.ReadAll(s); err != nil || string(b) != "ping" {
 		t.Fatalf("echo %q, %v", b, err)
+	}
+}
+
+// TestAnswerUnknownJoinsReceiveOnly checks that a carrier without a
+// sending half (an HTTP split uplink request, a lane) gets no answer to
+// an unknown join and is closed, counted as rejected.
+func TestAnswerUnknownJoinsReceiveOnly(t *testing.T) {
+	leakcheck.Check(t)
+	id := []byte("inst")
+	lst := NewListener(&ListenerConfig{Config: mpConfig(), InstanceID: id, AnswerUnknownJoins: true})
+	defer func() { _ = lst.Close() }()
+
+	// A receive-only carrier with an in-band join.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r := io.NopCloser(bytes.NewReader(joinRecord(locatorFor(id))))
+	if err := lst.HandlePipe(ctx, PipeIO{R: r}, JoinHint{}); err == nil {
+		t.Fatal("lane join accepted")
+	}
+
+	// An HTTP split uplink with an out-of-band join.
+	srv := httptest.NewServer(mustHTTPHandler(t, lst))
+	defer srv.Close()
+	f := wire.AppendJoin(nil, &wire.Join{Locator: locatorFor(id), PipeID: 1, Dir: 1, Token: make([]byte, 16)})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, io.MultiReader(bytes.NewReader([]byte("x"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(HeaderJoin, base64.RawURLEncoding.EncodeToString(f))
+	if resp, err := srv.Client().Do(req); err == nil {
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if len(b) != 0 {
+			t.Fatalf("uplink: response body %x", b)
+		}
+	}
+	srv.Client().Transport.(*http.Transport).CloseIdleConnections()
+	if st := lst.Stats(); st.Rejected != 2 {
+		t.Fatalf("stats %+v", st)
 	}
 }

@@ -324,11 +324,7 @@ func (cc *CarrierCache) record(key string, cand Candidate, ok bool, now time.Tim
 		cc.m[k] = e
 	}
 	if ok {
-		ttl := cc.SuccessTTL
-		if ttl <= 0 {
-			ttl = 6 * time.Hour
-		}
-		*e = cacheEntry{goodUntil: now.Add(ttl)}
+		*e = cacheEntry{goodUntil: now.Add(cc.successTTL())}
 		if cand.Target != nil && cand.Target.URL() != cand.Target.Base() {
 			e.url = cand.Target.URL()
 		}
@@ -345,6 +341,14 @@ func (cc *CarrierCache) record(key string, cand Candidate, ok bool, now time.Tim
 
 // backoffBounds returns BackoffMin and BackoffMax with their defaults,
 // the maximum no less than the minimum.
+// successTTL is SuccessTTL or its default.
+func (cc *CarrierCache) successTTL() time.Duration {
+	if cc.SuccessTTL <= 0 {
+		return 6 * time.Hour
+	}
+	return cc.SuccessTTL
+}
+
 func (cc *CarrierCache) backoffBounds() (lo, hi time.Duration) {
 	lo, hi = cc.BackoffMin, cc.BackoffMax
 	if lo <= 0 {
@@ -445,7 +449,9 @@ func (cc *CarrierCache) Snapshot() ([]byte, error) {
 // Restore merges a Snapshot into the cache. For a key and kind the cache
 // already holds, or that the snapshot holds more than once, the newer
 // entry (the later of its two times is later) is kept. A nonzero backoff
-// outside BackoffMin and BackoffMax is brought within them; expired entries are
+// outside BackoffMin and BackoffMax is brought within them, a good time
+// further ahead than SuccessTTL or a fail time further ahead than
+// BackoffMax is brought back to that bound, and expired entries are
 // dropped. Unknown fields, and entries of a kind this version does not
 // know, are ignored. A version other than 1, a field of the wrong type, a
 // negative backoff or malformed JSON is an error wrapping
@@ -476,6 +482,12 @@ func (cc *CarrierCache) Restore(data []byte) error {
 		i := slices.Index(carrierKindNames[:], se.Kind)
 		if i <= 0 {
 			continue
+		}
+		if goodMax := now.Add(cc.successTTL()); good.After(goodMax) {
+			good = goodMax
+		}
+		if failMax := now.Add(hi); fail.After(failMax) {
+			fail = failMax
 		}
 		e := &cacheEntry{goodUntil: good, failUntil: fail, url: se.URL}
 		if se.BackoffMS > 0 { // 0: no failure in a row

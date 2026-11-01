@@ -279,7 +279,7 @@ func (s *Session) shapePause(d Duration) Time {
 		d = m
 		sh.stats.Clamped++
 	}
-	if m := sh.lim.MaxPauseTotal; m > 0 && sh.stats.PauseTotal+time.Duration(d) > m {
+	if m := sh.lim.MaxPauseTotal; m > 0 && time.Duration(d) > m-min(sh.stats.PauseTotal, m) {
 		d = Duration(m - min(sh.stats.PauseTotal, m))
 		sh.stats.Clamped++
 	}
@@ -395,6 +395,14 @@ func (ps *pipeShape) prep(w *recWriter) {
 			ps.plan.MaxLen = shaping.MinMaxLen
 			s.shp.stats.Clamped++
 		}
+		// No padding target goes beyond a record, so that padFor cannot
+		// overflow.
+		for _, f := range [...]*int{&ps.plan.PadTo, &ps.plan.PadMultiple, &ps.plan.Pad} {
+			if *f > w.recMax {
+				*f = w.recMax
+				s.shp.stats.Clamped++
+			}
+		}
 		if ps.plan.Reply != (shaping.Reply{}) {
 			ps.apply(&ps.plan.Reply)
 			if ps.sh == nil {
@@ -477,6 +485,9 @@ func (s *Session) shapeWakeCovered() {
 // allowPad bounds n bytes of PADDING by the guardrails.
 func (s *Session) allowPad(n int) int {
 	sh := s.shp
+	if n <= 0 {
+		return 0
+	}
 	hard, ratio := s.padRoom()
 	u := min(uint64(n), hard, ratio)
 	if u < uint64(n) {

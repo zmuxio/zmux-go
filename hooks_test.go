@@ -112,7 +112,7 @@ func TestRedialAfterSuspension(t *testing.T) {
 	// Break pipe 0 under the session: both directions are lost, the
 	// session suspends and the hook rejoins.
 	pd := e.client.pipes[0]
-	pd.closeAll(true)
+	pd.closeAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for {
@@ -174,7 +174,7 @@ func TestRedialPolicyInvalidDecision(t *testing.T) {
 	scfg.ResumeTimeout = 5 * time.Second
 	e = newMPEnv(t, ccfg, scfg)
 	ln = e.ln
-	e.client.pipes[0].closeAll(true)
+	e.client.pipes[0].closeAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for {

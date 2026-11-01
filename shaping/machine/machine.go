@@ -190,7 +190,7 @@ func (s *shaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
 			p.PadMultiple = max(p.PadMultiple, s.length(r.PadMultiple))
 		}
 		if r.Pad != nil {
-			p.Pad += s.length(r.Pad)
+			p.Pad = min(p.Pad+s.length(r.Pad), math.MaxInt32) // lengths are at most 2^31-1
 		}
 		if r.Delay != nil {
 			p.Delay = max(p.Delay, s.dur(r.Delay))
@@ -297,7 +297,7 @@ func (s *shaper) act(m int, a *Action) {
 	case OpRate:
 		// Draws are rounded and bounded as stated values are: a rate by
 		// 2^53, a burst by 2^31-1, the same on every platform.
-		s.out.gate = shaping.Gate{Rate: int64(min(math.Round(s.sample(a.Rate)), maxCount))}
+		s.out.gate = shaping.Gate{Rate: int64(bounded(math.Round(s.sample(a.Rate)), maxCount))}
 		if a.Burst != nil {
 			s.out.gate.Burst = int64(s.length(a.Burst))
 		}
@@ -361,13 +361,22 @@ func (s *shaper) cond(m int, c *Cond) bool {
 }
 
 func (s *shaper) length(v *Value) int {
-	return int(min(math.Round(s.sample(v)), math.MaxInt32))
+	return int(bounded(math.Round(s.sample(v)), math.MaxInt32))
+}
+
+// bounded is x within [-m, m], NaN as 0, so that a conversion to an
+// integer is the same on every platform.
+func bounded(x, m float64) float64 {
+	if math.IsNaN(x) {
+		return 0
+	}
+	return math.Max(math.Min(x, m), -m)
 }
 
 func (s *shaper) dur(v *Value) time.Duration { return seconds(s.sample(v)) }
 
 func seconds(x float64) time.Duration {
-	return time.Duration(math.Round(min(x*1e9, math.MaxInt64/2)))
+	return time.Duration(math.Round(bounded(x*1e9, math.MaxInt64/2)))
 }
 
 // kept returns the kept value of v for its scope.

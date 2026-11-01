@@ -198,7 +198,7 @@ func (c *Conn) waitPipe(ctx context.Context, id uint64) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		pd.closeAll(true)
+		pd.closeAll()
 		<-done
 		return ctx.Err()
 	}

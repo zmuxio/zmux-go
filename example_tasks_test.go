@@ -281,8 +281,7 @@ func ExampleConn_AddPipe() {
 	}
 	defer closeBoth(client, server)
 
-	standby := true
-	p, err := client.AddPipe(ctx, zmux.NetPipe(a1), zmux.PipeOptions{Label: "backup", SendStandby: &standby})
+	p, err := client.AddPipe(ctx, zmux.NetPipe(a1), zmux.PipeOptions{Label: "backup", SendStandby: new(true)})
 	if err != nil {
 		fmt.Println(err)
 		return

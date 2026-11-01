@@ -407,7 +407,10 @@ func (a *Arrival) accept() {
 // ListenerConfig.Fallback. Once the arrival is accepted, further
 // carriers of it (a QUIC connection's further streams) are handed on
 // without an admission, each taking a slot of the source. hint.Source is
-// ignored: the arrival's source applies.
+// ignored: the arrival's source applies. Hand on the first carrier alone
+// and further ones only once it has been accepted (Admitted): first
+// carriers handed on concurrently are each admitted on their own, with a
+// decision each.
 func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) error {
 	l := a.l
 	if err := p.checkOverhead(); err != nil {
@@ -647,8 +650,9 @@ func (a *Arrival) stallSlot(counted bool) (d time.Duration, release func(), ok b
 }
 
 // stallPipe stalls p: it discards what arrives until the peer ends it or
-// the stall duration passes on the listener's clock, then closes it
-// gracefully; the arrival is released at the end.
+// the stall duration passes on the listener's clock or the listener
+// stops taking carriers, then closes it gracefully; the arrival is
+// released at the end.
 // counted: the decision was VerdictStall, not a fallback without target.
 func (a *Arrival) stallPipe(ctx context.Context, p PipeIO, counted bool) {
 	defer a.Release()
@@ -661,6 +665,8 @@ func (a *Arrival) stallPipe(ctx context.Context, p PipeIO, counted bool) {
 		return
 	}
 	defer release()
+	ctx, cancel := a.l.stopContext(ctx) // Listener.Close ends a stall
+	defer cancel()
 	t := a.l.clk.AfterFunc(d, func() { interruptRead(p) })
 	stop := context.AfterFunc(ctx, func() { interruptRead(p) })
 	discard(p.R)

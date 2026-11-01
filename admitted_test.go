@@ -133,3 +133,44 @@ func TestAdmittedValueSplit(t *testing.T) {
 	waitDone(t, srv)
 	hs.Client().CloseIdleConnections()
 }
+
+// TestAdmittedValueExchange checks that a session on an HTTP exchange
+// carrier takes the accepting decision's value.
+func TestAdmittedValueExchange(t *testing.T) {
+	leakcheck.Check(t)
+	lst := NewListener(&ListenerConfig{Config: mpConfig(),
+		Admission: &Admission{PeekTimeout: 5 * time.Second, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+			return Decision{Verdict: VerdictAccept, Value: "ex"}
+		}}})
+	defer func() { _ = lst.Close() }()
+	xc := &HTTPExchangeConfig{AllowInsecure: true}
+	eh, err := NewHTTPExchangeHandler(lst, xc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = eh.Close() }()
+	hs := httptest.NewServer(eh)
+	defer hs.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	p, err := HTTPExchangePipe(ctx, hs.Client(), hs.URL, xc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli, err := Start(ctx, p, RoleClient, mpConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := lst.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.Admitted(); got != "ex" {
+		t.Fatalf("session value %v", got)
+	}
+	_ = cli.Close()
+	_ = srv.Close()
+	waitDone(t, cli)
+	waitDone(t, srv)
+	hs.Client().CloseIdleConnections()
+}

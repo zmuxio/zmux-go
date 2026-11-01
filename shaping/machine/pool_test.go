@@ -348,7 +348,7 @@ func TestPoolPolicyPipePool(t *testing.T) {
 	}
 	cfg := func() *zmux.Config {
 		return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)},
-			SchedulerParams: zmux.SchedulerParams{Probation: new(time.Duration)}}
+			SchedulerParams: zmux.SchedulerParams{NoProbation: true}}
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

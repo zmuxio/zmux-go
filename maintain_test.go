@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -184,4 +185,56 @@ func TestMaintainPipesJoinMemberPipes(t *testing.T) {
 		}
 	}()
 	waitUntil(t, 5*time.Second, "member of two pipes", func() bool { return pipes.Load() == 2 })
+}
+
+// A replacement still being rotated in when ctx ends is closed; the
+// member it was to replace stays.
+func TestMaintainPipesStopClosesReplacement(t *testing.T) {
+	t.Parallel()
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	dial := tcpDialer(e.ln.Addr().String())
+	var mu sync.Mutex
+	var joined []*Pipe
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- e.client.MaintainPipes(ctx, PipePool{Rotate: Rotation{MaxAge: time.Millisecond},
+			Join: func(ctx context.Context, c *Conn, o PipeOptions) ([]*Pipe, error) {
+				mu.Lock()
+				n := len(joined)
+				mu.Unlock()
+				if n > 0 {
+					o.Probation = time.Hour // never usable while the test runs
+				}
+				pio, err := dial(ctx)
+				if err != nil {
+					return nil, err
+				}
+				p, err := c.AddPipe(ctx, pio, o)
+				if err != nil {
+					closePipeIO(pio)
+					return nil, err
+				}
+				mu.Lock()
+				joined = append(joined, p)
+				mu.Unlock()
+				return []*Pipe{p}, nil
+			}})
+	}()
+	waitUntil(t, 5*time.Second, "a replacement", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(joined) >= 2
+	})
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("MaintainPipes ended with %v", err)
+	}
+	mu.Lock()
+	first, repl := joined[0], joined[1]
+	mu.Unlock()
+	waitUntil(t, 5*time.Second, "the replacement closed", func() bool { _, ok := repl.Stats(); return !ok })
+	if _, ok := first.Stats(); !ok {
+		t.Fatal("the member's pipe went with the pool")
+	}
 }

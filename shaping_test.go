@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"slices"
@@ -412,5 +413,28 @@ func TestShapingTimerPrecision(t *testing.T) {
 	slices.Sort(gaps)
 	if med := gaps[len(gaps)/2]; med < every || med > every+every/20 {
 		t.Fatalf("median gap %v for injections every %v (gaps %v)", med, every, gaps)
+	}
+}
+
+// TestShapingHugePadding: padding targets beyond a record are bounded by
+// it instead of overflowing.
+func TestShapingHugePadding(t *testing.T) {
+	for _, f := range []func(*shaping.RecordPlan){
+		func(p *shaping.RecordPlan) { p.PadTo, p.PadMultiple = math.MaxInt, 3 },
+		func(p *shaping.RecordPlan) { p.PadMultiple = math.MaxInt },
+		func(p *shaping.RecordPlan) { p.Pad = math.MaxInt },
+		func(p *shaping.RecordPlan) { p.PadTo, p.Pad = 300, math.MaxInt },
+		func(p *shaping.RecordPlan) { p.PadTo, p.PadMultiple = 300, math.MaxInt },
+	} {
+		c, s, rc := shapedPair(t, &Config{ShapingLimits: shaping.Limits{MaxPaddingBytes: 1 << 20}})
+		c.SetShaper(planShaper(f))
+		rc.start()
+		transfer(t, c, s, 100)
+		sizes, _ := rc.records()
+		for _, n := range sizes {
+			if n > 1<<16 { // the largest max_record_size
+				t.Fatalf("record of %d bytes", n)
+			}
+		}
 	}
 }

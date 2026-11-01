@@ -27,7 +27,7 @@ import (
 func relayConfig(resume time.Duration) *zmux.Config {
 	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)},
 		ResumeTimeout:   resume,
-		SchedulerParams: zmux.SchedulerParams{Probation: new(time.Duration)}}
+		SchedulerParams: zmux.SchedulerParams{NoProbation: true}}
 }
 
 // relayEnv is a TCP listener of a server, a relay in front of it and a

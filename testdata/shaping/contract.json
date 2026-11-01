@@ -27,6 +27,7 @@
     {"name": "counter_negative", "json": {"version": 1, "machines": [{"states": [{"enter": [{"op": "set", "slot": 0, "value": {"const": -1}}]}]}]}, "error": "negative"},
     {"name": "empty_value", "json": {"version": 1, "machines": [{"states": [{"record": {"pad": {}}}]}]}, "error": "exactly one"},
     {"name": "unreachable", "json": {"version": 1, "machines": [{"states": [{}, {}]}]}, "error": "unreachable"},
+    {"name": "start_restarts", "json": {"version": 1, "machines": [{"states": [{"enter": [{"op": "restart"}]}]}]}, "error": "restart"},
     {"name": "zero_delay_cycle", "json": {"version": 1, "machines": [{"states": [
       {"enter": [{"op": "inject", "after": {"const": 0}, "len": {"const": 1}}], "next": [{"on": "injected", "to": 0}]}]}]},
       "error": "zero delay"},

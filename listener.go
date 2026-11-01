@@ -65,12 +65,13 @@ type ListenerConfig struct {
 	// ZMUX_RESUME_FAILED and ends the carrier (MULTIPATH.md 5.4), so that
 	// a suspended client fails at once instead of at its resume timeout.
 	// The carrier still counts as rejected; every other rejected carrier
-	// gets no byte. Leave it off where a load balancer can route a join
-	// to an instance with the same InstanceID that does not hold its
-	// session. It does not change what a carrier that Admission does not
-	// accept gets; what a carrier that is not admitted receives
-	// depends on the Admission configured (without one every carrier is
-	// admitted).
+	// gets no byte, and neither does a carrier without a sending half (a
+	// QUIC or WebTransport lane, an HTTP split uplink request). Leave it
+	// off where a load balancer can route a join to an instance with the
+	// same InstanceID that does not hold its session. It does not change
+	// what a carrier that Admission does not accept gets; what a carrier
+	// that is not admitted receives depends on the Admission configured
+	// (without one every carrier is admitted).
 	AnswerUnknownJoins bool
 	// MemoryBudget bounds the sum over the listener's sessions of buffered
 	// receive data, retained data and session window growth. Zero is
@@ -959,8 +960,17 @@ var unknownJoinAnswer = [8]byte{0x07, 0x1c, 0x8f, 0x05, 0xf7, 0x4e, 0x00, 0x00}
 // sending half gracefully, then what the joiner sends is discarded until
 // it ends the carrier or the first-record timeout passes, so that the
 // answer is not lost to a reset over unread data.
+//
+// A carrier without a sending half (a QUIC or WebTransport lane, an HTTP
+// split uplink request) gets no answer: the record goes on the carrier
+// that carried the join, and the uplink request's response is not a zmux
+// carrier.
 func (l *Listener) answerUnknownJoin(ctx context.Context, p PipeIO) {
 	markTaken(p)
+	if p.W == nil {
+		closePipeIO(p)
+		return
+	}
 	var err error
 	if p.Framing == FramingRecords {
 		mw, ok := p.W.(MessageWriter)

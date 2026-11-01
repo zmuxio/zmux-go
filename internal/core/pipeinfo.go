@@ -2,6 +2,8 @@ package core
 
 import (
 	"cmp"
+	"math"
+	"math/bits"
 	"slices"
 )
 
@@ -199,7 +201,7 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 		pi.BytesReinjected, pi.BytesOpportunistic, pi.PingsSent = a.reinjectedBytes, a.oppBytes, a.pingsSent
 		pi.BytesLost = a.bytesLost
 		if pi.BytesSent > 0 {
-			pi.RecordsLost = (a.bytesLost*pi.RecordsSent + pi.BytesSent - 1) / pi.BytesSent
+			pi.RecordsLost = mulDivCeil(a.bytesLost, pi.RecordsSent, pi.BytesSent)
 		}
 		pi.ProbeInterval, pi.ProbeJitter = s.probeInterval(p), s.probeJitter(a)
 	}
@@ -355,4 +357,17 @@ func (s *Session) StreamInfo(st *Stream) StreamInfo {
 		}
 	}
 	return in
+}
+
+// mulDivCeil is ceil(a x b / d) for d > 0 without overflowing the product;
+// math.MaxUint64 when the quotient does not fit.
+func mulDivCeil(a, b, d uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	lo, c := bits.Add64(lo, d-1, 0)
+	hi += c
+	if hi >= d {
+		return math.MaxUint64
+	}
+	q, _ := bits.Div64(hi, lo, d)
+	return q
 }

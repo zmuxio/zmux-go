@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"encoding/binary"
 	"errors"
 	"syscall"
 	"time"
@@ -23,7 +24,7 @@ func tcpMinRTT(fd uintptr) (time.Duration, bool) {
 	if err != nil || n < 28 {
 		return 0, false
 	}
-	us := *(*uint32)(unsafe.Pointer(&info[24]))
+	us := binary.NativeEndian.Uint32(info[24:])
 	return time.Duration(us) * time.Microsecond, us > 0 && us != ^uint32(0)
 }
 
@@ -45,5 +46,5 @@ func tcpRetrans(fd uintptr) (uint64, bool) {
 	if err != nil || n < 72 {
 		return 0, false
 	}
-	return uint64(*(*uint32)(unsafe.Pointer(&info[68]))), true
+	return uint64(binary.NativeEndian.Uint32(info[68:])), true
 }

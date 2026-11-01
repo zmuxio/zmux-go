@@ -705,3 +705,32 @@ func TestServeConnSource(t *testing.T) {
 	<-done
 	<-done
 }
+
+// TestCloseEndsFallbackStall: a carrier stalled for a fallback without
+// target, under a caller context that never ends, ends when the listener
+// closes.
+func TestCloseEndsFallbackStall(t *testing.T) {
+	leakcheck.Check(t)
+	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: 4, PeekTimeout: 5 * time.Second,
+		StallMin: time.Minute, StallMax: time.Minute,
+		Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictFallback} }}})
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	done := make(chan struct{})
+	go func() { _ = lst.HandlePipe(context.Background(), NetPipe(b), JoinHint{}); close(done) }()
+	if _, err := a.Write([]byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	for end := time.Now().Add(5 * time.Second); lst.Stats().Admission.Fallback != 1; time.Sleep(time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("stats %+v", lst.Stats())
+		}
+	}
+	go func() { _, _ = io.Copy(io.Discard, a) }()
+	_ = lst.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stall outlived Listener.Close")
+	}
+}

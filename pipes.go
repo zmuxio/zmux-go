@@ -16,9 +16,12 @@ import (
 // session's defaults.
 //
 // The Send fields are pointers because nil has its own meaning: the local
-// outbound direction then follows the peer's request (PIPE_STATUS); a set
-// value wins over it. The Receive fields are plain values because they
-// are always sent: the PIPE_JOIN carries a request for the peer's outbound
+// outbound direction then follows the peer's request (PIPE_STATUS), which
+// can change at any time; a set value, the zero value included, wins over
+// it. Weight is a pointer because 0 is a weight of its own (excluded).
+// Set a pointer field with new, as in SendStandby: new(true) or
+// Weight: new(uint64(0)). The Receive fields are plain values because
+// they are always sent: the PIPE_JOIN carries a request for the peer's outbound
 // direction, so the zero values ask for tier 0, not standby.
 type PipeOptions struct {
 	// SendPriority is the tier of the local outbound direction (lower is
@@ -31,9 +34,12 @@ type PipeOptions struct {
 	// SpreadRateWeighted. nil: 1; 0 excludes the pipe unless every
 	// candidate has 0.
 	Weight *uint64
-	// Probation is the base of the pipe's probation. nil: the session's;
-	// 0 disables it.
-	Probation *time.Duration
+	// Probation is the base of the pipe's probation. Zero is the
+	// session's; a negative value is invalid.
+	Probation time.Duration
+	// NoProbation turns the pipe's probation off; Probation must then be
+	// zero.
+	NoProbation bool
 	// Label names the pipe in statistics.
 	Label string
 	// ReceivePriority is the tier requested for the peer's outbound
@@ -89,8 +95,11 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 	if o.DeadTimeout != 0 && o.DeadTimeout < time.Second {
 		return j, fmt.Errorf("%w: DeadTimeout below 1 s", ErrInvalidConfig)
 	}
-	if o.Probation != nil && *o.Probation < 0 {
+	if o.Probation < 0 {
 		return j, fmt.Errorf("%w: negative Probation", ErrInvalidConfig)
+	}
+	if o.NoProbation && o.Probation != 0 {
+		return j, fmt.Errorf("%w: Probation with NoProbation", ErrInvalidConfig)
 	}
 	if err := checkProbeInterval(o.ProbeInterval, "ProbeInterval"); err != nil {
 		return j, err
@@ -104,8 +113,8 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 	if o.Weight != nil {
 		j.Weight = *o.Weight
 	}
-	if o.Probation != nil {
-		d := core.Duration(*o.Probation)
+	if o.NoProbation || o.Probation != 0 {
+		d := core.Duration(o.Probation)
 		j.Probation = &d
 	}
 	j.SuspectFloor, j.DeadTimeout = core.Duration(o.SuspectFloor), core.Duration(o.DeadTimeout)

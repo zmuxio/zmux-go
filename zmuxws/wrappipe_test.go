@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/zmuxio/zmux-go"
 )
@@ -28,7 +27,7 @@ func TestWrapPipeTLS(t *testing.T) {
 
 	cfg := func() *zmux.Config {
 		return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{TLS: true},
-			SchedulerParams: zmux.SchedulerParams{Probation: new(time.Duration)}}
+			SchedulerParams: zmux.SchedulerParams{NoProbation: true}}
 	}
 	l := zmux.NewListener(&zmux.ListenerConfig{Config: cfg(),
 		WrapPipe: func(ctx context.Context, p zmux.PipeIO, _ zmux.JoinHint) (zmux.PipeIO, error) {

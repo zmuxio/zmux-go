@@ -223,34 +223,41 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 			n, err = r.Read(buf.B[used:])
 			used += n
 		}
-		consumed := 0
-		c.lock()
-		if pd.dead {
-			c.unlock()
+		consumed, dead := 0, false
+		// A deferred unlock turns a panic of the core into a closed
+		// session (Conn.unlock) instead of leaving the lock held.
+		func() {
+			c.lock()
+			defer c.unlock()
+			if pd.dead {
+				dead = true
+				return
+			}
+			now := c.clk.now()
+			if used > 0 {
+				consumed = c.s.Receive(pd.id, lane, buf, buf.B[:used], now)
+			}
+			if err != nil {
+				graceful := errors.Is(err, io.EOF)
+				var cause error
+				if !graceful {
+					cause = err
+				}
+				c.s.PipeEnded(pd.id, lane, graceful, used > consumed, cause, now)
+			}
+			if reads++; reads&63 == 0 && pd.id == 0 && lane == 0 {
+				// The carrier's own minimum RTT feeds auto-tuning.
+				if d, ok := pd.tcp.minRTT(); ok {
+					c.s.SetCarrierMinRTT(core.Duration(d))
+				}
+			}
+		}()
+		if dead {
 			if buf != nil {
 				buf.Unref()
 			}
 			return
 		}
-		now := c.clk.now()
-		if used > 0 {
-			consumed = c.s.Receive(pd.id, lane, buf, buf.B[:used], now)
-		}
-		if err != nil {
-			graceful := errors.Is(err, io.EOF)
-			var cause error
-			if !graceful {
-				cause = err
-			}
-			c.s.PipeEnded(pd.id, lane, graceful, used > consumed, cause, now)
-		}
-		if reads++; reads&63 == 0 && pd.id == 0 && lane == 0 {
-			// The carrier's own minimum RTT feeds auto-tuning.
-			if d, ok := pd.tcp.minRTT(); ok {
-				c.s.SetCarrierMinRTT(core.Duration(d))
-			}
-		}
-		c.unlock()
 		c.passDatagrams()
 		if err != nil {
 			if buf != nil {
@@ -300,18 +307,20 @@ func (c *Conn) readMessages(pd *pipeDrv, lane uint64, r io.Reader) {
 		} else {
 			err = errors.New("zmux: Records framing needs a MessageReader")
 		}
-		c.lock()
-		now := c.clk.now()
-		if err == nil {
-			c.s.ReceiveMessage(pd.id, lane, &core.Buf{B: msg}, msg, now)
-		} else {
-			var cause error
-			if !errors.Is(err, io.EOF) {
-				cause = err
+		func() {
+			c.lock()
+			defer c.unlock()
+			now := c.clk.now()
+			if err == nil {
+				c.s.ReceiveMessage(pd.id, lane, &core.Buf{B: msg}, msg, now)
+			} else {
+				var cause error
+				if !errors.Is(err, io.EOF) {
+					cause = err
+				}
+				c.s.PipeEnded(pd.id, lane, cause == nil, false, cause, now)
 			}
-			c.s.PipeEnded(pd.id, lane, cause == nil, false, cause, now)
-		}
-		c.unlock()
+		}()
 		c.passDatagrams()
 		if err != nil {
 			pd.hc.closeRead()
@@ -377,38 +386,43 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 		if lo != nil && lo.takeShut() {
 			lo.close(false)
 		}
-		c.lock()
-		if pd.dead {
+		produced, closing, dead := false, false, false
+		func() {
+			c.lock()
+			defer c.unlock()
+			if pd.dead {
+				if reported {
+					b.Discard()
+					reported = false
+				}
+				dead = true
+				return
+			}
+			now := c.clk.now()
+			if unsentOK {
+				c.s.SetCarrierUnsent(pd.id, lane, unsent)
+			}
+			if retransOK {
+				c.s.SetCarrierRetransmitted(pd.id, retrans)
+			}
 			if reported {
-				b.Discard()
+				c.s.WriteDone(b, werr, now)
 				reported = false
 			}
-			c.unlock()
+			if lane == 0 {
+				c.releaseOrphansLocked()
+			}
+			if werr == nil {
+				if b == nil {
+					b = core.GetBatch()
+				}
+				produced = c.s.PollTransmit(pd.id, lane, b, core.DefaultBatch, now)
+			}
+			closing = c.closing
+		}()
+		if dead {
 			return
 		}
-		now := c.clk.now()
-		if unsentOK {
-			c.s.SetCarrierUnsent(pd.id, lane, unsent)
-		}
-		if retransOK {
-			c.s.SetCarrierRetransmitted(pd.id, retrans)
-		}
-		if reported {
-			c.s.WriteDone(b, werr, now)
-			reported = false
-		}
-		if lane == 0 {
-			c.releaseOrphansLocked()
-		}
-		produced := false
-		if werr == nil {
-			if b == nil {
-				b = core.GetBatch()
-			}
-			produced = c.s.PollTransmit(pd.id, lane, b, core.DefaultBatch, now)
-		}
-		closing := c.closing
-		c.unlock()
 		if produced {
 			_, werr = writeBatch(w, pd.framing, b)
 			reported = true
@@ -582,7 +596,7 @@ func (c *Conn) doAction(pa pendingAct) {
 			lo.requestShut()
 		}
 	case core.ActAbort:
-		pd.closeAll(true)
+		pd.closeAll()
 	case core.ActClose:
 		if a.Dir&core.DirIn != 0 {
 			pd.hc.closeRead()
@@ -605,10 +619,10 @@ func (c *Conn) doAction(pa pendingAct) {
 	}
 }
 
-// closeAll closes every half and lane of the attachment.
-func (pd *pipeDrv) closeAll(abort bool) {
+// closeAll aborts every half and lane of the attachment.
+func (pd *pipeDrv) closeAll() {
 	pd.endChannel()
-	pd.hc.closeAll(abort, net.ErrClosed)
+	pd.hc.closeAll(true, net.ErrClosed)
 	pd.c.mu.Lock()
 	lanes := make([]*laneOut, 0, len(pd.lanes))
 	for _, l := range pd.lanes {
@@ -618,7 +632,7 @@ func (pd *pipeDrv) closeAll(abort bool) {
 	pd.inLanes = nil
 	pd.c.mu.Unlock()
 	for _, l := range lanes {
-		l.close(abort)
+		l.close(true)
 	}
 	for _, r := range in {
 		_ = r.Close()

@@ -103,7 +103,9 @@ func TestShapingWriteOverheadWrapPipe(t *testing.T) {
 				_ = c.Close()
 				t.Fatal("session over a WrapPipe result outside the range")
 			}
-			t.Logf("HandlePipe: %v", <-herr)
+			if herr := <-herr; herr == nil {
+				t.Fatal("HandlePipe accepted a WrapPipe result outside the range")
+			}
 			if n := l.Stats().SetupFailures; n != 1 {
 				t.Fatalf("%d setup failures, want 1", n)
 			}
@@ -139,6 +141,8 @@ func TestShapingWriteOverheadWrapPipe(t *testing.T) {
 		waitDone(t, s)
 		cancel()
 		_ = l.Close()
-		t.Logf("HandlePipe: %v", <-herr)
+		if herr := <-herr; herr != nil {
+			t.Fatalf("HandlePipe: %v", herr)
+		}
 	}
 }

@@ -204,9 +204,11 @@ type SchedulerParams struct {
 	// DeadTimeout is the time after which a suspect pipe fails. Zero is
 	// derived from the RTT; otherwise at least 1 s.
 	DeadTimeout time.Duration
-	// Probation is the base of a pipe's probation. Nil is the default; 0
-	// disables it; a negative value is invalid.
-	Probation *time.Duration
+	// Probation is the base of a pipe's probation. Zero is the default
+	// (from the RTT and the pipe's history); a negative value is invalid.
+	Probation time.Duration
+	// NoProbation turns probation off; Probation must then be zero.
+	NoProbation bool
 	// OverflowDelay is how long higher tiers stay saturated before a
 	// lower tier takes data. Zero is 1 s; a negative value is invalid.
 	OverflowDelay time.Duration
@@ -382,7 +384,7 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	if c.LatencyBudget < 0 || c.MemoryBudget < 0 && c.MemoryBudget != NoMemoryLimit || c.MaxIncomingStreams < 0 || c.MaxIncomingUniStreams < 0 ||
 		c.DatagramSendQueue < 0 || c.DatagramReceiveQueue < 0 || c.DatagramStreamQueue < 0 || c.DatagramReceiveBytes < 0 ||
 		c.MaxPipes < 0 || c.PipeHeadroom < 0 || c.ReplayWindow < 0 || c.MaxLanes < 0 || c.ResumeTimeout < 0 ||
-		p.SuspectFloor < 0 || p.DeadTimeout < 0 || p.Probation != nil && *p.Probation < 0 || p.OverflowDelay < 0 ||
+		p.SuspectFloor < 0 || p.DeadTimeout < 0 || p.Probation < 0 || p.OverflowDelay < 0 ||
 		p.SpreadChunk < 0 {
 		return cc, fmt.Errorf("%w: negative Config count, size or duration", ErrInvalidConfig)
 	}
@@ -495,8 +497,13 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 		}
 		cc.DeadTimeout = core.Duration(p.DeadTimeout)
 	}
-	if p.Probation != nil {
-		cc.Probation = core.Duration(*p.Probation)
+	switch {
+	case p.NoProbation && p.Probation != 0:
+		return cc, fmt.Errorf("%w: Probation with NoProbation", ErrInvalidConfig)
+	case p.NoProbation:
+		cc.Probation = 0
+	case p.Probation != 0:
+		cc.Probation = core.Duration(p.Probation)
 	}
 	cc.OverflowDelay = dur(p.OverflowDelay, time.Second)
 	if err := checkProbeInterval(p.StandbyProbe, "StandbyProbe"); err != nil {

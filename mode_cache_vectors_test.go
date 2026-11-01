@@ -81,12 +81,22 @@ func TestCarrierCacheVectors(t *testing.T) {
 			}
 		})
 	}
+	// The canonical form, through the snapshot's own encoding (the cache
+	// bounds the times it restores).
 	for _, x := range v.Exact {
-		cc := &CarrierCache{}
-		if err := cc.Restore([]byte(x)); err != nil {
+		var snap cacheSnapshot
+		if err := json.Unmarshal([]byte(x), &snap); err != nil {
 			t.Fatalf("%s: %v", x, err)
 		}
-		if data, _ := cc.Snapshot(); string(data) != x {
+		for i, e := range snap.Entries {
+			g, err1 := parseCacheTime(e.GoodUntil)
+			f, err2 := parseCacheTime(e.FailUntil)
+			if err1 != nil || err2 != nil {
+				t.Fatalf("%s: %v %v", x, err1, err2)
+			}
+			snap.Entries[i].GoodUntil, snap.Entries[i].FailUntil = formatCacheTime(g), formatCacheTime(f)
+		}
+		if data, _ := json.Marshal(snap); string(data) != x {
 			t.Fatalf("round trip\n got %s\nwant %s", data, x)
 		}
 	}

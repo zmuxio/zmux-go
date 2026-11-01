@@ -430,7 +430,9 @@ func TestPipePoolModeUpgrade(t *testing.T) {
 	}
 	echoOnce(t, ctx, c, s)
 	pcancel()
-	t.Logf("MaintainPipes: %v", <-done)
+	if err := <-done; errors.Is(err, ErrInvalidConfig) || errors.Is(err, ErrNotNegotiated) {
+		t.Fatalf("MaintainPipes: %v", err)
+	}
 	closeConn(t, c)
 
 	// The cache now holds streaming as usable: a new pool joins it first.
@@ -476,7 +478,9 @@ func TestPipePoolModeFallback(t *testing.T) {
 	waitCarrier(t, c, CarrierSplit, 10*time.Second)
 	echoOnce(t, ctx, c, s)
 	closeConn(t, c)
-	t.Logf("MaintainPipes: %v", <-done)
+	if err := <-done; errors.Is(err, ErrInvalidConfig) || errors.Is(err, ErrNotNegotiated) {
+		t.Fatalf("MaintainPipes: %v", err)
+	}
 
 	nginx := zmuxtest.New(e.srv.URL, zmuxtest.NginxDefaults())
 	defer nginx.Close()
@@ -498,7 +502,9 @@ func TestPipePoolModeFallback(t *testing.T) {
 	}
 	echoOnce(t, ctx, c, s)
 	closeConn(t, c)
-	t.Logf("MaintainPipes: %v", <-done)
+	if err := <-done; errors.Is(err, ErrInvalidConfig) || errors.Is(err, ErrNotNegotiated) {
+		t.Fatalf("MaintainPipes: %v", err)
+	}
 }
 
 // TestPipePoolModeConfig rejects a pool with more than one of Dial, Join

@@ -95,33 +95,31 @@ type exTarget struct {
 	origin *atomic.Pointer[string]
 }
 
-// tmplOrigin splits the template at the end of its scheme and authority.
-func tmplOrigin(tmpl string) (origin, rest string) {
+// tmplRest is the template after its scheme and authority.
+func tmplRest(tmpl string) string {
 	i := strings.Index(tmpl, "://")
 	if i < 0 {
-		return "", tmpl
+		return tmpl
 	}
 	j := strings.IndexAny(tmpl[i+3:], "/?#")
 	if j < 0 {
-		return tmpl, ""
+		return ""
 	}
-	return tmpl[:i+3+j], tmpl[i+3+j:]
+	return tmpl[i+3+j:]
 }
 
 // upgraded records that a request to from was upgraded to to.
 func (t *exTarget) upgraded(to *url.URL) string {
 	o := to.Scheme + "://" + to.Host
 	t.origin.Store(&o)
-	_, rest := tmplOrigin(t.tmpl)
-	return o + rest
+	return o + tmplRest(t.tmpl)
 }
 
 func (t *exTarget) build(nonce []byte) string {
 	n := hex.EncodeToString(nonce)
 	tmpl := t.tmpl
 	if o := t.origin.Load(); o != nil {
-		_, rest := tmplOrigin(tmpl)
-		tmpl = *o + rest
+		tmpl = *o + tmplRest(tmpl)
 	}
 	u := strings.NewReplacer("{instance}", t.instance, "{nonce}", n).Replace(tmpl)
 	if t.bust {

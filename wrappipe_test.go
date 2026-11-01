@@ -17,7 +17,7 @@ import (
 // exporter: a session starts only when both ends see the same TLS.
 func tlsWrapConfig() *Config {
 	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{TLS: true},
-		SchedulerParams: SchedulerParams{Probation: new(time.Duration)}}
+		SchedulerParams: SchedulerParams{NoProbation: true}}
 }
 
 // serverTLSWrap is a WrapPipe that runs a TLS server over every carrier.

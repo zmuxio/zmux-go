@@ -261,8 +261,11 @@ func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *
 	// anything: one it refuses is answered BUSY and leaves no state, live
 	// or gone.
 	a.takeSlot()
+	a.mu.Lock()
+	hint := JoinHint{Source: a.src, Admitted: a.value}
+	a.mu.Unlock()
 	run, err := h.l.take(PipeIO{R: &exServerReader{nc}, W: &exServerWriter{nc},
-		Carrier: CarrierExchange}, JoinHint{Source: a.src}, a.key)
+		Carrier: CarrierExchange}, hint, a.key)
 	if err != nil {
 		h.mu.Lock()
 		if h.carriers[q.cid] == nc {

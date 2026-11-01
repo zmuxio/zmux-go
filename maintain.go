@@ -130,7 +130,8 @@ func backoffWait(b time.Duration) time.Duration {
 // before the first. The pool decides again at once on pipe failures, the
 // loss of a direction and the suspension of the session, keeps dialling
 // while the session is suspended, and dials outside every lock. It
-// returns ctx's error or the session's.
+// returns ctx's error or the session's; when ctx ends, a replacement still
+// being rotated in is closed and the pool's other pipes stay.
 func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 	return c.maintainPipes(ctx, pool, nil)
 }
@@ -284,10 +285,21 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		}
 		return err
 	}
+	// A replacement still being rotated in is the pool's own: it goes when
+	// the pool stops; the members' pipes stay.
+	stopped := func() error {
+		for _, m := range members {
+			if m.repl != nil {
+				closeAll(m.repl)
+				m.repl = nil
+			}
+		}
+		return ctx.Err()
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return stopped()
 		case <-c.done:
 			return sessionEnded()
 		default:
@@ -480,7 +492,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		case <-tick.C:
 		case <-wake:
 		case <-ctx.Done():
-			return ctx.Err()
+			return stopped()
 		case <-c.done:
 			return sessionEnded()
 		}

@@ -45,7 +45,7 @@ func TestAdmissionEveryEntry(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		sl := net.Listener(ln)
+		sl := ln
 		if tlsOn {
 			sl = tls.NewListener(ln, srvTLS)
 		}

@@ -124,6 +124,6 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier) {
 	c.s.SetWriterSignal(0, pd.wsig)
 	c.orphanSig.Store(pd.wsig)
 	c.startPipeLocked(pd, true, true)
-	old.wsig.Fire()       // its writer sees it is dead and ends
-	go old.closeAll(true) // its reader ends with its carrier
+	old.wsig.Fire()   // its writer sees it is dead and ends
+	go old.closeAll() // its reader ends with its carrier
 }

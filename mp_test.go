@@ -26,7 +26,7 @@ type mpEnv struct {
 
 func mpConfig() *Config {
 	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)},
-		SchedulerParams: SchedulerParams{Probation: new(time.Duration)}}
+		SchedulerParams: SchedulerParams{NoProbation: true}}
 }
 
 func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {

@@ -81,7 +81,8 @@ func (st *State) values(f func(*Value)) {
 	}
 }
 
-// structure checks reachability and that no injection with a zero lower
+// structure checks reachability, that the start state does not restart
+// on entry (which would enter it again without end), and that no injection with a zero lower
 // bound on its delay lies on a cycle of unconditional enter, injected or
 // counter transitions.
 func (m *Machine) structure() error {
@@ -104,6 +105,11 @@ func (m *Machine) structure() error {
 				all[i] = append(all[i], m.Start)
 				fast[i] = append(fast[i], m.Start)
 			}
+		}
+	}
+	for _, a := range m.States[m.Start].Enter {
+		if a.Op == OpRestart {
+			return fmt.Errorf("state %d: restart on entering the start state", m.Start)
 		}
 	}
 	seen := reach(all, m.Start)

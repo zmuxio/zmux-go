@@ -242,7 +242,7 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 	}
 	a.firstRecord = false
 	if a.needPing && a.out != OutFailed && m.pingAllowed(s.now) && s.oldestPingWaiter(p) {
-		if w.frame(varint.SizeVarint(wire.TypePipePing), true, func(b []byte) []byte { return wire.AppendPipePing(b) }) {
+		if w.frame(varint.SizeVarint(wire.TypePipePing), true, wire.AppendPipePing) {
 			a.needPing = false
 			a.pingsSent++
 			w.pingWritten = true

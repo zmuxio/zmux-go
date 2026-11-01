@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"encoding/binary"
 	"syscall"
 	"time"
 	"unsafe"
@@ -34,5 +35,5 @@ func tcpRetrans(fd uintptr) (uint64, bool) {
 	if e != 0 || l < 80 {
 		return 0, false
 	}
-	return *(*uint64)(unsafe.Pointer(&buf[72])), true
+	return binary.NativeEndian.Uint64(buf[72:]), true
 }

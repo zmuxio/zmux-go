@@ -158,14 +158,16 @@ func (c *Conn) channelLoop(pd *pipeDrv) {
 	}()
 	var out []core.ChannelOut
 	for {
-		c.lock()
-		if pd.dead {
-			c.unlock()
-			return
-		}
-		var live bool
-		out, live = c.s.PollChannel(pd.id, out[:0])
-		c.unlock()
+		// Deferred unlocks turn a panic of the core into a closed session
+		// (Conn.unlock) instead of leaving the lock held.
+		live := false
+		func() {
+			c.lock()
+			defer c.unlock()
+			if !pd.dead {
+				out, live = c.s.PollChannel(pd.id, out[:0])
+			}
+		}()
 		if !live {
 			return
 		}
@@ -174,9 +176,11 @@ func (c *Conn) channelLoop(pd *pipeDrv) {
 			out[i].Frame = nil
 		}
 		if len(out) > 0 {
-			c.lock()
-			c.s.ChannelDone(out)
-			c.unlock()
+			func() {
+				c.lock()
+				defer c.unlock()
+				c.s.ChannelDone(out)
+			}()
 			clear(out)
 		}
 		if len(out) > 0 {

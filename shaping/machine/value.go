@@ -80,10 +80,17 @@ func (s *drawer) dist(v *Value) float64 {
 	case DistPareto:
 		return p[0] / math.Pow(u(), 1/p[1])
 	case DistGamma:
-		return s.gamma(p[0]) * p[1]
+		x, _ := s.gammaLog(p[0])
+		return x * p[1]
 	case DistBeta:
-		x, y := s.gamma(p[0]), s.gamma(p[1])
-		return x / (x + y)
+		x, lx := s.gammaLog(p[0])
+		y, ly := s.gammaLog(p[1])
+		if t := x + y; t > 0 && !math.IsInf(t, 0) {
+			return x / t
+		}
+		// Both variates underflowed (small shapes): their ratio from the
+		// logarithms.
+		return 1 / (1 + math.Exp(ly-lx))
 	case DistGeometric:
 		if p[0] == 1 {
 			return 1
@@ -197,9 +204,24 @@ func (s *drawer) pick(w []float64) int {
 
 // gamma samples Gamma(a, 1) (Marsaglia and Tsang).
 func (s *drawer) gamma(a float64) float64 {
+	x, _ := s.gammaLog(a)
+	return x
+}
+
+// gammaLog samples Gamma(a, 1) and returns it with its logarithm, which
+// stays finite for a shape below 1 where the variate underflows to 0.
+func (s *drawer) gammaLog(a float64) (x, lx float64) {
 	if a < 1 {
-		return s.gamma(a+1) * math.Pow(1-s.r.Float64(), 1/a)
+		g := s.gamma(a + 1)
+		u := 1 - s.r.Float64()
+		return g * math.Pow(u, 1/a), math.Log(g) + math.Log(u)/a
 	}
+	x = s.gamma1(a)
+	return x, math.Log(x)
+}
+
+// gamma1 samples Gamma(a, 1) for a shape of at least 1.
+func (s *drawer) gamma1(a float64) float64 {
 	d := a - 1.0/3
 	c := 1 / math.Sqrt(9*d)
 	for {
