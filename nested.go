@@ -222,7 +222,7 @@ type outerRef struct{ c *Conn }
 // other carriers).
 func outerOf(p PipeIO) outerRef {
 	for _, x := range []any{p.W, p.R} {
-		if cc, ok := x.(carrierConner); ok {
+		if cc, ok := x.(CarrierConner); ok {
 			if o, ok := cc.CarrierConn().(*Conn); ok {
 				return outerRef{o}
 			}

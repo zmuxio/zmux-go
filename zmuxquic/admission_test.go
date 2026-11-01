@@ -168,3 +168,57 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 		t.Fatalf("Decide called %d times", n)
 	}
 }
+
+// A QUIC first stream that begins with a host header is read with
+// VerdictMore and accepted past it; the session runs on the rest.
+func TestServeAdmissionMore(t *testing.T) {
+	srv, cli := tlsConfigs(t)
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := append([]byte{0x01, 20}, make([]byte, 18)...)
+	adm := &zmux.Admission{Peek: 2, MaxPeek: 64, PeekTimeout: 5 * time.Second,
+		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
+			if c, _ := zmux.ClassifyFirstBytes(prefix, zmux.FramingByteStream); c != zmux.FirstBytesOther || prefix[0] != 0x01 {
+				return zmux.Decision{Verdict: zmux.VerdictClose}
+			}
+			if len(prefix) < int(prefix[1]) {
+				return zmux.Decision{Verdict: zmux.VerdictMore, Need: int(prefix[1])}
+			}
+			return zmux.Decision{Verdict: zmux.VerdictAccept, Skip: int(prefix[1]), Variant: "q"}
+		}}
+	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = Serve(ctx, ln, lst, nil); close(done) }()
+	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := OpenPipe(ctx, qc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.W.Write(header); err != nil {
+		t.Fatal(err)
+	}
+	c, err := zmux.Start(ctx, p, zmux.RoleClient, mpConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := lst.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echo(t, c, s, 1<<12)
+	_ = c.Close()
+	_ = s.Close()
+	_ = c.Wait()
+	_ = s.Wait()
+	if st := lst.Stats().Admission; st.Variants["q"].Accepted != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+}

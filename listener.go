@@ -114,12 +114,15 @@ type ListenerConfig struct {
 	// WrapPipe has returned), and Config.HandshakeTimeout bounds it: ctx
 	// ends at that bound or when the carrier is evicted, and p is closed
 	// then. FirstRecordTimeout runs from its return. The listener sets p's
-	// Carrier, Label and FateGroup on the result, whose halves and Framing
-	// are WrapPipe's. An error, or the bound, closes p and counts a setup
+	// Carrier, Label and FateGroup on the result, whose halves, Framing,
+	// WriteOverhead and Variant are WrapPipe's (p.Variant, the admission's
+	// Decision.Variant, stays where the result has none). An error, or the bound, closes p and counts a setup
 	// failure (ListenerStats.SetupFailures).
 	//
 	// A layer must map every write on the PipeIO it returns to exactly
-	// one write on p, never merging writes.
+	// one write on p, never merging writes; a WriteMessages call
+	// (MessageBatchWriter) counts as one write, which the layer may turn
+	// into one write of p.
 	WrapPipe func(ctx context.Context, p PipeIO, hint JoinHint) (PipeIO, error)
 }
 
@@ -648,6 +651,9 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint JoinHint) (PipeI
 		markTaken(p)
 	}
 	q.Carrier, q.Label, q.FateGroup = p.Carrier, p.Label, p.FateGroup
+	if q.Variant == "" {
+		q.Variant = p.Variant
+	}
 	return q, nil
 }
 
@@ -909,13 +915,13 @@ func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte,
 	if j.CarrierBound {
 		// A carrier without an exporter is never carrier-bound
 		// (MULTIPATH.md 10.5): refuse rather than verify an empty binding.
-		st, ok := TerminatedTLS(p)
+		e, ok := Exporter(p)
 		if !ok {
 			closePipeIO(p)
 			l.st.rejected.Add(1)
 			return errRejected
 		}
-		b, err := st.ExportKeyingMaterial(wire.ExporterPipe, nil, 32)
+		b, err := e.ExportKeyingMaterial(wire.ExporterPipe, nil, 32)
 		if err != nil {
 			closePipeIO(p)
 			l.st.rejected.Add(1)
@@ -990,7 +996,7 @@ func (l *Listener) answerUnknownJoin(ctx context.Context, p PipeIO) {
 		_, err = p.W.Write(unknownJoinAnswer[:])
 	}
 	if err == nil && p.R != nil {
-		if cw, ok := p.W.(closeWriter); ok && cw.CloseWrite() == nil {
+		if cw, ok := p.W.(CloseWriter); ok && cw.CloseWrite() == nil {
 			t := l.clk.AfterFunc(l.cfg.FirstRecordTimeout, func() { interruptRead(p) })
 			stop := context.AfterFunc(ctx, func() { interruptRead(p) })
 			discard(p.R)
@@ -1190,7 +1196,7 @@ func carrierConnOf(x any) any {
 		return carrierConnOf(r.r)
 	case readOnly:
 		return carrierConnOf(r.r)
-	case carrierConner:
+	case CarrierConner:
 		return r.CarrierConn()
 	}
 	return nil

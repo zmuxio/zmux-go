@@ -31,6 +31,8 @@ jobs:
             path: zmuxh3
           - name: zmuxws
             path: zmuxws
+          - name: examples
+            path: examples/xorpipe
     defaults:
       run:
         shell: bash
@@ -65,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", zmuxquic, zmuxh3, zmuxws]
+        module: [".", zmuxquic, zmuxh3, zmuxws, examples/xorpipe]
     steps:
       - uses: actions/checkout@v7
 

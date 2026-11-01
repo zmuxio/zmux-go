@@ -31,7 +31,7 @@ type HTTPExchangeHandler struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup // HandlePipe goroutines
 
-	nonces *replayCache
+	nonces *ReplayFilter
 
 	mu       sync.Mutex
 	closed   bool
@@ -55,8 +55,11 @@ func NewHTTPExchangeHandler(l *Listener, cfg *HTTPExchangeConfig) (*HTTPExchange
 	}
 	h := &HTTPExchangeHandler{l: l, p: p,
 		carriers: map[[exCIDLen]byte]*exServer{}, gone: map[[exCIDLen]byte]*exKey{}}
-	skew := int64(p.skew / time.Second)
-	h.nonces = newReplayCache(2*skew+1, max(skew, 1), p.nonceCache)
+	// Stamps are whole seconds, checked against MaxClockSkew first: the
+	// window takes the second of rounding.
+	if h.nonces, err = NewReplayFilter(ReplayConfig{Window: p.skew.Truncate(time.Second) + time.Second, Max: p.nonceCache}); err != nil {
+		return nil, err
+	}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
 	return h, nil
 }
@@ -197,10 +200,10 @@ func (h *HTTPExchangeHandler) authenticate(q *exReq) (c *exServer, key *exKey, g
 	if d < -skew || d > skew {
 		return nil, nil, false
 	}
-	var k replayKey
+	var k [exCIDLen + exNonceLen]byte
 	copy(k[:], q.cid[:])
 	copy(k[exCIDLen:], q.nonce)
-	if !h.nonces.add(k, now+d, now-skew) {
+	if h.nonces.checkAt(k[:], (now+d)*1000, now*1000) != ReplayFresh {
 		return nil, nil, false
 	}
 	return c, key, gone

@@ -194,15 +194,20 @@ type attach struct {
 }
 
 // startMultipath allocates the path layer at establishment.
-func (s *Session) startMultipath() {
+// A failed read of the exporter is the session's INTERNAL_ERROR.
+func (s *Session) startMultipath() *wire.Error {
 	l, p := &s.cfg.Local, &s.peer
-	m := &multiPath{locator: l.Locator, peerLocator: p.Locator, bits: map[uint64]bool{},
-		pendAbandon: map[uint64]bool{}}
 	var exporter, psk []byte
 	sel := l.SecretFlags & p.SecretFlags
-	if sel&wire.SecretExporter != 0 {
-		exporter = s.cfg.Exporter
+	if sel&wire.SecretExporter != 0 && s.cfg.Exporter != nil {
+		b, err := s.cfg.Exporter()
+		if err != nil {
+			return &wire.Error{Code: wire.InternalError, Reason: "exporter: " + err.Error()}
+		}
+		exporter = b
 	}
+	m := &multiPath{locator: l.Locator, peerLocator: p.Locator, bits: map[uint64]bool{},
+		pendAbandon: map[uint64]bool{}}
 	if sel&wire.SecretPSK != 0 {
 		psk = s.cfg.PSK
 	}
@@ -241,6 +246,7 @@ func (s *Session) startMultipath() {
 		s.drawProbe(a, pp, true)
 		pp.mp = a
 	}
+	return nil
 }
 
 // initialRTT is the RFC 9002 initial estimate, or the test hook's.

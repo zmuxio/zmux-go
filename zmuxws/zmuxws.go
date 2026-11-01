@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -126,7 +127,11 @@ type handler struct {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	hs, err := wshttp.Check(w, r, &h.so)
+	// The 101 carries Date, as an origin server's responses do (RFC 9110
+	// 6.6.1); the response header is the client's (ResponseHeader).
+	so := h.so
+	so.Header = append(slices.Clip(h.so.Header), httphead.Field{Name: "Date", Value: time.Now().UTC().Format(http.TimeFormat)})
+	hs, err := wshttp.Check(w, r, &so)
 	if err != nil || hs.Subprotocol == "" {
 		h.o.Fallback(w, r)
 		return
@@ -344,7 +349,7 @@ func dialOnce(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Cred
 // which then owns the connection; on every error the connection is closed
 // (wsconn.Client closes nc itself when the handshake fails).
 func handshake(ctx context.Context, nc net.Conn, rawURL string, co *wsconn.ClientOptions, credErr error) (p zmux.PipeIO, err error) {
-	c, _, err := wsconn.Client(ctx, nc, rawURL, co)
+	c, resp, err := wsconn.Client(ctx, nc, rawURL, co)
 	if err != nil {
 		_ = nc.Close()
 		return zmux.PipeIO{}, handshakeErr(err, credErr)
@@ -357,7 +362,15 @@ func handshake(ctx context.Context, nc net.Conn, rawURL string, co *wsconn.Clien
 	if credErr != nil {
 		return zmux.PipeIO{}, credErr
 	}
-	return pipe(c, tlsState(nc)), nil
+	p = pipe(c, tlsState(nc))
+	if resp != nil {
+		h := http.Header{}
+		for _, f := range resp.Header {
+			h.Add(f.Name, f.Value)
+		}
+		p.R.(*carrier).hdr = h
+	}
+	return p, nil
 }
 
 // handshakeErr is the error of a failed handshake: credErr, the credential
@@ -439,7 +452,13 @@ func tlsState(nc net.Conn) *tls.ConnectionState {
 type carrier struct {
 	c   *wsconn.Conn
 	tls *tls.ConnectionState // nil: no TLS terminated here
+	hdr http.Header          // the client's 101 response header (nil: none)
 }
+
+// ResponseHeader returns a copy of the header of the 101 response that
+// opened a client carrier (zmux.ResponseHeaderer); nil on a server or a
+// carrier made by Pipe.
+func (p *carrier) ResponseHeader() http.Header { return p.hdr.Clone() }
 
 // ConnectionState returns the state of the TLS beneath the connection,
 // shared by the streams of one HTTP/2 connection; without TLS terminated

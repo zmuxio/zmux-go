@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -261,28 +262,28 @@ func TestAdmissionStats(t *testing.T) {
 			fb = func(_ context.Context, c net.Conn) { _ = c.Close() }
 		}
 		st := run(decideWith(x.v, &n), fb, nil, false)
-		if st.Admission != x.want || st.Rejected != 0 {
+		if !eqAdm(st.Admission, x.want) || st.Rejected != 0 {
 			t.Fatalf("%s: %+v", x.name, st)
 		}
 	}
 	// A panic, and a Skip outside the prefix, are VerdictClose.
 	panicking := &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision { panic("decide") }}
-	if st := run(panicking, nil, nil, false); st.Admission != (AdmissionStats{Closed: 1}) {
+	if st := run(panicking, nil, nil, false); !eqAdm(st.Admission, AdmissionStats{Closed: 1}) {
 		t.Fatalf("panic: %+v", st)
 	}
 	skip := &Admission{Peek: 2, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
 		return Decision{Verdict: VerdictAccept, Skip: 3}
 	}}
-	if st := run(skip, nil, []byte{1, 2}, false); st.Admission != (AdmissionStats{Closed: 1}) {
+	if st := run(skip, nil, []byte{1, 2}, false); !eqAdm(st.Admission, AdmissionStats{Closed: 1}) {
 		t.Fatalf("skip: %+v", st)
 	}
 	// Accepted: the carrier goes on to the listener, counted there once.
 	if st := run(&Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{} }}, nil,
-		[]byte("GET / HTTP/1.1\r\n\r\n"), false); st.Admission != (AdmissionStats{Accepted: 1}) || st.Rejected != 1 {
+		[]byte("GET / HTTP/1.1\r\n\r\n"), false); !eqAdm(st.Admission, AdmissionStats{Accepted: 1}) || st.Rejected != 1 {
 		t.Fatalf("accept: %+v", st)
 	}
 	// A failed TLS handshake is HandshakeFailed, not a setup failure.
-	if st := run(decideWith(VerdictAccept, &n), nil, nil, true); st.Admission != (AdmissionStats{HandshakeFailed: 1}) || st.SetupFailures != 0 {
+	if st := run(decideWith(VerdictAccept, &n), nil, nil, true); !eqAdm(st.Admission, AdmissionStats{HandshakeFailed: 1}) || st.SetupFailures != 0 {
 		t.Fatalf("handshake: %+v", st)
 	}
 }
@@ -348,7 +349,7 @@ func TestAdmissionFakeClock(t *testing.T) {
 		}
 		e.clk.Advance(time.Nanosecond)
 		e.ended(t)
-		if st := e.lst.Stats().Admission; st != (AdmissionStats{PeekTimedOut: 1}) {
+		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1}) {
 			t.Fatalf("stats %+v", st)
 		}
 	})
@@ -364,7 +365,7 @@ func TestAdmissionFakeClock(t *testing.T) {
 		e.advance(t, 1, 10*time.Second)
 		e.ended(t)
 		dl := <-dls
-		if st := e.lst.Stats().Admission; st != (AdmissionStats{PeekTimedOut: 1}) || !dl.Equal(start.Add(10*time.Second)) {
+		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1}) || !dl.Equal(start.Add(10*time.Second)) {
 			t.Fatalf("stats %+v, deadline %v after the start", st, dl.Sub(start))
 		}
 	})
@@ -417,7 +418,7 @@ func TestAdmissionDecideCancel(t *testing.T) {
 	if err := <-done; err == nil {
 		t.Fatal("HandlePipe succeeded")
 	}
-	if st := lst.Stats().Admission; st != (AdmissionStats{Closed: 1}) {
+	if st := lst.Stats().Admission; !eqAdm(st, AdmissionStats{Closed: 1}) {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -503,4 +504,10 @@ func TestShutdownKeepsJoins(t *testing.T) {
 	if err := lst.HandlePipe(ctx, NetPipe(a), JoinHint{}); err == nil {
 		t.Fatal("a closed listener took a carrier")
 	}
+}
+
+// eqAdm compares admission totals, ignoring the per-variant counts.
+func eqAdm(a, b AdmissionStats) bool {
+	a.Variants, b.Variants = nil, nil
+	return reflect.DeepEqual(a, b)
 }

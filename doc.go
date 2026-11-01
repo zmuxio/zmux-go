@@ -23,6 +23,16 @@
 // can read such a carrier. The sub-modules zmuxquic and zmuxh3 carry
 // sessions over QUIC, HTTP/3 and WebTransport.
 //
+// A carrier transform (a byte transform, compression, a handshake of its
+// own) wraps carriers with the public API: a Candidate's Dial on the
+// client, ListenerConfig.WrapPipe on the server, behind an Admission that
+// tells its first bytes from a zmux first record (ClassifyFirstBytes,
+// VerdictMore, Decision.Variant). Its halves offer the optional
+// capabilities that PipeIO lists (KeyingMaterialExporter for its own
+// exporter, EarlyClientCarrier for a first flight that the server may
+// refuse, with EarlyData.HoldFirstFlight and Conn.ReleaseFirstFlight);
+// ReplayFilter is a single-use cache for its nonces.
+//
 // The Conn and Stream methods follow quic-go: OpenStream[Sync],
 // AcceptStream, Read, Write, Close (FIN), CancelRead, CancelWrite,
 // deadlines, SendDatagram and ReceiveDatagram. StreamConn gives a stream

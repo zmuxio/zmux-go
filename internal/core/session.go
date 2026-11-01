@@ -102,6 +102,7 @@ type Session struct {
 	initConnWin       uint64 // the initial session window
 	charged           uint64 // the charge on cfg.Budget
 	earlyHeld         bool   // provisional sends wait for the carrier's verdict
+	firstHeld         bool   // pipe 0 writes nothing until ReleaseFirstFlight
 	earlyAccepted     bool
 	carrierEarlyIn    bool // the bootstrap carrier delivers early data not yet confirmed by its handshake
 	capWaiters        []*Stream
@@ -225,6 +226,10 @@ func New(cfg Config, now Time) *Session {
 		s.early.carrier = true
 	case cfg.EarlyZmuxPeer && s.earlyAllowed():
 		s.startEarly(FloorParams(), true)
+		s.early.carrier = cfg.EarlyCarrier
+	}
+	if s.firstHeld = cfg.HoldFirstFlight; s.firstHeld {
+		s.timers.handshake = Never // it runs from the release
 	}
 	return s
 }
@@ -387,7 +392,9 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 		s.ack = newAckState(s)
 	}
 	if f.Multipath {
-		s.startMultipath()
+		if err := s.startMultipath(); err != nil {
+			return err
+		}
 	}
 	if s.state == StateEstablishing {
 		s.state = StateActive

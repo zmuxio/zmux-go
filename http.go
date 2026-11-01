@@ -190,6 +190,27 @@ type httpCall struct {
 	err  error
 }
 
+// header is a copy of the response header, nil before the response.
+func (c *httpCall) header() http.Header {
+	select {
+	case <-c.done:
+	default:
+		return nil
+	}
+	if c.resp == nil {
+		return nil
+	}
+	return c.resp.Header.Clone()
+}
+
+// ResponseHeader returns a copy of the header of the carrier's response
+// (ResponseHeaderer); nil before it.
+func (r *httpRespReader) ResponseHeader() http.Header { return r.call.header() }
+
+// ResponseHeader returns a copy of the header of the uplink request's
+// response (ResponseHeaderer); nil before it.
+func (w *httpReqWriter) ResponseHeader() http.Header { return w.call.header() }
+
 // end is the error the carrier's halves report once the request ended.
 func (c *httpCall) end() error {
 	if c.err != nil {

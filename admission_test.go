@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -631,7 +632,7 @@ func TestAdmitBeforeHandshake(t *testing.T) {
 			}
 		}
 		// Each 425 is a setup failure and nothing else.
-		if st := lst.Stats(); st != (ListenerStats{SetupFailures: 2}) {
+		if st := lst.Stats(); !reflect.DeepEqual(st, ListenerStats{SetupFailures: 2}) {
 			t.Fatalf("stats after two 425 answers: %+v", st)
 		}
 		_ = lst.Close()

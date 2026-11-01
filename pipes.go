@@ -73,9 +73,11 @@ type PipeOptions struct {
 	// ReceiveStandby asks the peer to make its outbound direction standby
 	// (zero: active).
 	ReceiveStandby bool
-	// CarrierBound ties the join token to the new carrier's TLS 1.3
-	// handshake (MULTIPATH.md 10.5); the carrier must be a TLS connection
-	// that terminates at the peer.
+	// CarrierBound ties the join token to the new carrier's innermost
+	// end-to-end handshake (MULTIPATH.md 10.5): its exporter (Exporter),
+	// read when AddPipe is called, so the carrier's handshake must have
+	// completed by then; the listener reads its own side when the join
+	// arrives.
 	CarrierBound bool
 }
 
@@ -179,13 +181,13 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 	}
 	j.OOB = oob
 	if o.CarrierBound {
-		st, ok := TerminatedTLS(p)
+		e, ok := Exporter(p)
 		if !ok {
-			return nil, fmt.Errorf("%w: CarrierBound on a carrier without TLS", ErrInvalidConfig)
+			return nil, fmt.Errorf("%w: CarrierBound on a carrier without an exporter", ErrInvalidConfig)
 		}
-		b, err := st.ExportKeyingMaterial(wire.ExporterPipe, nil, 32)
+		b, err := e.ExportKeyingMaterial(wire.ExporterPipe, nil, 32)
 		if err != nil {
-			return nil, fmt.Errorf("zmux: TLS exporter: %w", err)
+			return nil, fmt.Errorf("zmux: carrier exporter: %w", err)
 		}
 		j.CarrierBound, j.Binding = true, b
 	}
@@ -300,7 +302,7 @@ func (r *Reservation) Attach(ctx context.Context, p PipeIO) (*Pipe, error) {
 	pd.hc = newHalfCloser(p)
 	pd.framing = p.Framing
 	pd.tcp = tcpOf(p.W)
-	if o, ok := p.W.(laneOpener); ok {
+	if o, ok := p.W.(LaneOpener); ok {
 		pd.opener = o
 	}
 	// The reservation's placeholder said nothing of the carrier.
@@ -524,6 +526,7 @@ type PipeStats struct {
 	Label     string
 	Local     bool        // this endpoint joined the attachment
 	Carrier   CarrierKind // PipeIO.Carrier
+	Variant   string      // PipeIO.Variant
 	// Outbound and Inbound are the states of the two directions;
 	// OutboundNone and InboundNone for one the attachment lacks.
 	Outbound     OutboundState
@@ -697,7 +700,7 @@ func (c *Conn) Pipe(id uint64) (*Pipe, bool) {
 
 func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
 	st := PipeStats{Pipe: pi.ID, Local: pi.Local, FateGroup: pi.FateGroup, Label: c.labels[pi.ID],
-		Carrier: CarrierKind(pi.Carrier), Outbound: OutboundState(pi.OutState), Inbound: InboundState(pi.InState),
+		Carrier: CarrierKind(pi.Carrier), Variant: c.variantLocked(pi.ID), Outbound: OutboundState(pi.OutState), Inbound: InboundState(pi.InState),
 		AttachedFor: time.Duration(pi.AttachedFor), SuspectCount: pi.SuspectCount, FailureCount: pi.FailureCount,
 		Failure: pi.Failure, SendPriority: pi.SendPriority, SendPrioritySource: pi.PrioritySource,
 		Standby: pi.Standby, StandbySource: pi.StandbySource, ReceivePriority: pi.ReceivePriority,

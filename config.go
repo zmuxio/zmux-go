@@ -245,7 +245,12 @@ type SchedulerParams struct {
 //
 // ZmuxPeer: the client knows the server is a zmux endpoint and writes its
 // first streams on the bootstrap carrier right away, within the floor
-// values every zmux endpoint grants. Nothing is replayable.
+// values every zmux endpoint grants. Nothing is replayable, unless the
+// carrier itself has early data (its W half is an EarlyClientCarrier, such
+// as a transform whose first message carries the first flight): the
+// streams then travel in it, wait for its verdict and are sent again after
+// a rejection, as with Remembered below, and the client consents to replay
+// with Replayable (else Start fails with ErrInvalidConfig).
 //
 // Replayable with Remembered: the client sends its first streams in the
 // carrier's own early data (QUIC 0-RTT through zmuxquic.Dial), under the
@@ -271,13 +276,29 @@ type SchedulerParams struct {
 type EarlyData struct {
 	// ZmuxPeer declares the peer a zmux endpoint (client only).
 	ZmuxPeer bool
-	// Replayable allows carrier early data (TLS 1.3, QUIC 0-RTT): on a
-	// client together with Remembered, on a server to accept and mark it.
+	// Replayable allows carrier early data, which the peer may see
+	// replayed (TLS 1.3, QUIC 0-RTT, a transform's first flight): on a
+	// client with Remembered, or with ZmuxPeer on a carrier with early
+	// data; on a server to accept it and mark its streams.
 	Replayable bool
 	// Remembered are the peer's parameters from an earlier session, as
 	// Conn.RememberedParameters returned them (client only). Store them per
 	// server and only with the application's consent.
 	Remembered []byte
+	// HoldFirstFlight keeps the bootstrap pipe's first carrier write until
+	// Conn.ReleaseFirstFlight, or until Config.HandshakeTimeout has passed
+	// since Start (ConnectionStats.FirstFlightTimeouts); the handshake
+	// timeout runs from the release. Streams opened and written before the
+	// release leave in the same write as the transport parameters, as a
+	// carrier whose first message carries the first flight wants. Client
+	// with early data only (ZmuxPeer, or Remembered with Replayable);
+	// otherwise ErrInvalidConfig.
+	HoldFirstFlight bool
+}
+
+// clientEarly reports whether a client with e sends early data.
+func (e *EarlyData) clientEarly() bool {
+	return e.ZmuxPeer || e.Replayable && len(e.Remembered) > 0
 }
 
 // PipeAuth selects the secret sources of joins (MULTIPATH.md 10.1).
@@ -285,14 +306,15 @@ type PipeAuth struct {
 	// PSK is a pre-shared key of at least 16 bytes.
 	PSK []byte
 	// Exporter derives the join secret from the exporter of the innermost
-	// end-to-end handshake on pipe 0; today its source is TLS 1.3 that this
-	// process terminates (TerminatedTLS: a TLS, QUIC or zmuxws WebSocket
-	// carrier). A carrier without such a handshake (no TLS, or TLS ended
-	// at a proxy) has no exporter, and the session fails to start. An
-	// intermediary that terminates TLS on both sides leaves the ends with
-	// different exporters, so that joins fail: the binding to the
-	// exporter, or a client that pins the server, is what proves the
-	// handshake end to end, not the presence of TLS.
+	// end-to-end handshake on pipe 0 (Exporter: a half implementing
+	// KeyingMaterialExporter, or TLS/QUIC this process terminates), read
+	// when the peer's parameters arrive; a failed read closes the session
+	// with INTERNAL_ERROR. A carrier without an exporter (no TLS, or TLS
+	// ended at a proxy, and no transform of its own) makes Start fail with
+	// ErrInvalidConfig. An intermediary that terminates TLS on both sides
+	// leaves the ends with different exporters, so that joins fail: the
+	// binding to the exporter, or a client that pins the server, is what
+	// proves the handshake end to end, not the presence of TLS.
 	Exporter bool
 	// AllowInsecure allows joins without a secret (tests, protected
 	// networks). It must not be combined with PSK.
@@ -565,5 +587,11 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	cc.EarlyZmuxPeer = c.EarlyData.ZmuxPeer
 	cc.EarlyReplayable = c.EarlyData.Replayable
 	cc.EarlyRemembered = decodeRemembered(c.EarlyData.Remembered)
+	if e := &c.EarlyData; e.HoldFirstFlight {
+		if role != core.RoleInitiator || !e.clientEarly() {
+			return cc, fmt.Errorf("%w: EarlyData.HoldFirstFlight without client early data", ErrInvalidConfig)
+		}
+		cc.HoldFirstFlight = true
+	}
 	return cc, nil
 }

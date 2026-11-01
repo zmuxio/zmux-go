@@ -38,6 +38,11 @@ const (
 	TypePipeStatus        uint64 = 0x227b2811
 )
 
+// FirstFrameTypes are the frame types that may begin a carrier's first
+// record (SPEC.md 6.2, MULTIPATH.md 5.5): their encodings begin with ff, 9a
+// and ba, never 03 (REGISTRY.md 2.4 item 6).
+var FirstFrameTypes = [...]uint64{TypeTransportParams, TypePipeJoin, TypePipeLane}
+
 // STREAM frame type bits.
 const (
 	StreamBitFin = 0x01

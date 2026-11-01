@@ -21,7 +21,7 @@ type pipeDrv struct {
 	id     uint64
 	hc     *halfCloser
 	wsig   *core.Signal   // wakes the lane-0 writer
-	opener laneOpener     // nil: the carrier offers no lanes
+	opener LaneOpener     // nil: the carrier offers no lanes
 	tcp    tcpInfo        // the TCP socket under the carrier, if any
 	outer  outerRef       // the outer session of a stream-backed carrier
 	gs     pipeGoroutines // the attachment's goroutines (HandlePipe waits on them)
@@ -42,6 +42,11 @@ type pipeDrv struct {
 	shutdown bool
 	framing  Framing
 	dead     bool // guarded by the session lock: replaced (early-data restart), its goroutines report nothing
+	// wstop (session lock): the lane-0 writer stops before writing again
+	// (an early-data restart on the same halves); wdone is closed when it
+	// has returned.
+	wstop bool
+	wdone chan struct{}
 }
 
 // laneOut is the writer side of one outbound lane above 0.
@@ -56,7 +61,7 @@ type laneOut struct {
 
 func (l *laneOut) close(abort bool) {
 	l.once.Do(func() {
-		if a, ok := l.w.(aborter); ok && abort {
+		if a, ok := l.w.(Aborter); ok && abort {
 			a.Abort(net.ErrClosed)
 		}
 		_ = l.w.Close()
@@ -121,9 +126,9 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 	// Records aligned to TLS records only on a TLS byte stream (SPEC.md
 	// 3.3); a QUIC stream reports a TLS state for its exporter only.
 	_, isTLS := p.W.(*tls.Conn)
-	_, lanes := p.W.(laneOpener)
+	_, lanes := p.W.(LaneOpener)
 	if !lanes {
-		_, lanes = p.R.(laneOpener)
+		_, lanes = p.R.(LaneOpener)
 	}
 	info := core.CarrierInfo{Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
 		Lanes: lanes, QueueBound: lowWater, WriteOverhead: p.WriteOverhead}
@@ -136,9 +141,9 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 // newPipeDrv prepares the driver of an attachment (under the lock).
 func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
 	pd := &pipeDrv{c: c, id: id, hc: newHalfCloser(p), framing: p.Framing, wsig: core.NewSignal()}
-	if o, ok := p.W.(laneOpener); ok {
+	if o, ok := p.W.(LaneOpener); ok {
 		pd.opener = o
-	} else if o, ok := p.R.(laneOpener); ok {
+	} else if o, ok := p.R.(LaneOpener); ok {
 		pd.opener = o
 	}
 	pd.tcp = tcpOf(p.W)
@@ -150,7 +155,7 @@ func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
 func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool) {
 	c.pipes[pd.id] = pd
 	for _, x := range []any{pd.hc.io.W, pd.hc.io.R} {
-		if cc, ok := x.(carrierConner); ok {
+		if cc, ok := x.(CarrierConner); ok {
 			c.s.SetCarrierConn(pd.id, cc.CarrierConn())
 			break
 		}
@@ -164,14 +169,25 @@ func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool) {
 			c.readLoop(pd, 0, pd.hc.io.R)
 		}()
 	}
-	if write && pd.hc.io.W != nil {
-		c.wg.Add(1)
-		pd.gs.add()
-		go func() {
-			defer pd.gs.done()
-			c.writeLoop(pd, 0, pd.wsig, nil)
-		}()
+	if write {
+		c.startWriterLocked(pd)
 	}
+}
+
+// startWriterLocked starts the lane-0 writer of pd.
+func (c *Conn) startWriterLocked(pd *pipeDrv) {
+	if pd.hc.io.W == nil {
+		return
+	}
+	done := make(chan struct{})
+	pd.wstop, pd.wdone = false, done
+	c.wg.Add(1)
+	pd.gs.add()
+	go func() {
+		defer pd.gs.done()
+		defer close(done)
+		c.writeLoop(pd, 0, pd.wsig, nil)
+	}()
 }
 
 // addBootstrap attaches pipe 0 and starts its goroutines (under the lock).
@@ -190,6 +206,16 @@ func (c *Conn) addBootstrap(p PipeIO) {
 	c.startPipeLocked(pd, true, true)
 }
 
+// bootstrapExporter is the late exporter that the reader of lane 0 of the
+// bootstrap pipe loads before delivering the carrier's first bytes, nil
+// for any other reader.
+func (c *Conn) bootstrapExporter(pd *pipeDrv, lane uint64) *lateExporter {
+	if pd.id != 0 || lane != 0 {
+		return nil
+	}
+	return c.exp
+}
+
 // readLoop feeds what a carrier half delivers into the core. It never
 // waits for anything but the carrier, so reads never wait behind writes
 // (SPEC.md 9.1). A quiet pipe blocks on a small buffer and holds no pooled
@@ -205,6 +231,7 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 		c.readMessages(pd, lane, r)
 		return
 	}
+	exp := c.bootstrapExporter(pd, lane)
 	var small [idleBufSize]byte
 	var buf *core.Buf
 	used := 0
@@ -222,6 +249,10 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 		} else {
 			n, err = r.Read(buf.B[used:])
 			used += n
+		}
+		if exp != nil && n > 0 {
+			exp.load()
+			exp = nil
 		}
 		consumed, dead := 0, false
 		// A deferred unlock turns a panic of the core into a closed
@@ -299,6 +330,7 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 // readMessages reads a message-framed carrier.
 func (c *Conn) readMessages(pd *pipeDrv, lane uint64, r io.Reader) {
 	mr, ok := r.(MessageReader)
+	exp := c.bootstrapExporter(pd, lane)
 	for {
 		var msg []byte
 		var err error
@@ -306,6 +338,10 @@ func (c *Conn) readMessages(pd *pipeDrv, lane uint64, r io.Reader) {
 			msg, err = mr.ReadMessage()
 		} else {
 			err = errors.New("zmux: Records framing needs a MessageReader")
+		}
+		if exp != nil && err == nil {
+			exp.load()
+			exp = nil
 		}
 		func() {
 			c.lock()
@@ -351,7 +387,7 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 	}()
 	// The carrier's unsent count: the half's own, else the TCP socket's.
 	var unsentOf func() (uint64, bool)
-	if u, ok := w.(unsentReporter); ok {
+	if u, ok := w.(UnsentReporter); ok {
 		unsentOf = u.Unsent
 	} else if lo == nil && pd.tcp.rc != nil {
 		unsentOf = pd.tcp.unsent
@@ -359,7 +395,7 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 	// The carrier's retransmissions (lane 0: lanes share their carrier).
 	var retransOf func() (uint64, bool)
 	if lo == nil {
-		if r, ok := w.(retransReporter); ok {
+		if r, ok := w.(RetransReporter); ok {
 			retransOf = r.Retransmitted
 		} else if pd.tcp.rc != nil {
 			retransOf = pd.tcp.retransmitted
@@ -390,7 +426,7 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 		func() {
 			c.lock()
 			defer c.unlock()
-			if pd.dead {
+			if pd.dead || lo == nil && pd.wstop {
 				if reported {
 					b.Discard()
 					reported = false
@@ -478,12 +514,22 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 		return bw.WriteBatch(b)
 	}
 	if framing == FramingRecords {
+		msgs := b.Messages()
+		n := 0
+		if bw, ok := w.(MessageBatchWriter); ok {
+			for _, m := range msgs {
+				n += len(m)
+			}
+			if err := bw.WriteMessages(msgs); err != nil {
+				return 0, err
+			}
+			return n, nil
+		}
 		mw, ok := w.(MessageWriter)
 		if !ok {
 			return 0, errors.New("zmux: Records framing needs a MessageWriter")
 		}
-		n := 0
-		for _, m := range b.Messages() {
+		for _, m := range msgs {
 			if err := mw.WriteMessage(m); err != nil {
 				return n, err
 			}
@@ -507,15 +553,8 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 	if bw, ok := w.(BuffersWriter); ok {
 		return bw.WriteBuffers(bufs)
 	}
-	n := 0
-	for _, p := range bufs {
-		m, err := w.Write(p)
-		n += m
-		if err != nil {
-			return n, err
-		}
-	}
-	return n, nil
+	// Any other writer (a transform) gets one write per batch.
+	return WriteFlat(w, bufs)
 }
 
 // ---- lanes (MULTIPATH.md 2.5, 5.8) ----

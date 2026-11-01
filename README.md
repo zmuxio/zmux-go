@@ -130,8 +130,9 @@ case errors.Is(err, net.ErrClosed):
 Both endpoints set `MaxPipes` above 1 and a join secret; the server uses a
 `Listener`. The client adds pipes over other paths and follows them with
 `NextEvent`. The secret is `PipeAuth.PSK`, or `PipeAuth.Exporter`: the exporter
-of the innermost end-to-end handshake of the first pipe (today TLS that this
-process terminates).
+of the innermost end-to-end handshake of the first pipe (`zmux.Exporter`: a
+carrier transform's own, or TLS that this process terminates), read when the
+peer's parameters arrive.
 
 ```go
 cfg := &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: psk}}
@@ -212,7 +213,8 @@ A carrier exposes the TLS this process terminates beneath it
 TLS, shared by the WebSocket streams of one HTTP/2 connection), so
 `PipeAuth.Exporter` and `CarrierBound` work over wss (`zmux.TerminatedTLS`
 reports whether a carrier has such TLS). Over ws, or behind a proxy
-that terminates TLS, there is none and both fail. Only the exporter
+that terminates TLS, there is none and both fail, unless a carrier
+transform with its own handshake supplies the exporter. Only the exporter
 binding or a client that pins the server proves the TLS end to end.
 
 ## HTTP exchanges
@@ -400,7 +402,8 @@ whatever entry point took it: `Listener.Serve` and `HandlePipe`,
 `NewHTTPHandler`, the exchange handler, `zmuxws.Handler`, `zmuxh3.Handler`
 and `zmuxquic.Serve`. Every entry runs the same steps: the carrier takes a
 slot of its source (`MaxPendingPerSource`) before its outer handshake
-(TLS, an HTTP upgrade, QUIC), the admission reads up to `Peek` bytes and
+(TLS, an HTTP upgrade, QUIC), the admission reads up to `Peek` bytes (on a
+message-framed carrier its first message) and
 calls `Decide` with them and the carrier's metadata (`CarrierInfo`: its
 `Source` and `Peer`, TLS state, HTTP request), then `WrapPipe` runs and the
 carrier is classified. `Decide` gets a context that ends with what remains
@@ -408,7 +411,9 @@ of `PeekTimeout` and when the listener stops. It accepts the carrier
 (without the bytes it skips), hands it with every byte read to the
 fallback of its kind (`ListenerConfig.Fallback` for byte streams,
 `HTTPOptions.Next` for HTTP, the `fallback` of `zmuxquic.Serve`), stalls
-it, or closes it. A source holds at most `MaxPendingPerSource - 1` stalled
+it, or closes it; `VerdictMore` reads a longer prefix (up to `MaxPeek`)
+and decides again, and `Decision.Variant` labels the carrier, counted per
+label in `AdmissionStats.Variants`. A source holds at most `MaxPendingPerSource - 1` stalled
 carriers, and a stall lasts the same duration for every carrier from one
 source during the listener's lifetime (`Listener.StallDuration`).
 `ListenerStats.Admission` counts the outcomes. An adapter with its own
@@ -456,6 +461,26 @@ join for a session this instance does not hold with `ZMUX_RESUME_FAILED`,
 so a suspended client fails at once instead of at its resume timeout.
 Leave it off where a load balancer can route a join to another instance
 with the same `InstanceID`.
+
+## Carrier transforms
+
+A transform (compression, a byte transform, a handshake of its own) wraps
+a carrier on both ends with the public API alone: the client in a
+`Candidate`'s `Dial` (or before `Start`, `AddPipe`), the server in
+`ListenerConfig.WrapPipe`, after an `Admission` that tells its first bytes
+from a zmux first record (`ClassifyFirstBytes`, `VerdictMore`,
+`Decision.Variant`). A batch of records is one write on the wrapped half
+(one `WriteMessages` on a message-framed `MessageBatchWriter`). The halves
+offer capabilities as interfaces (`CloseWriter`, `Aborter`,
+`ConnectionStater`, `KeyingMaterialExporter`, `EarlyClientCarrier`,
+`ResponseHeaderer`, ...); a transform forwards a lower one only where its
+meaning survives. A transform whose first message carries the client's
+first flight uses `EarlyData.HoldFirstFlight` with `Conn.ReleaseFirstFlight`
+and reports the server's verdict as carrier early data; `ReplayFilter` is
+the single-use cache for its nonces. `PipeIO.Variant` labels the carriers
+in events, statistics, shaping and `CarrierCache` (with
+`CarrierCache.Report` for outcomes the host learns later).
+[examples/xorpipe](examples/xorpipe) is a complete example.
 
 ## QUIC
 

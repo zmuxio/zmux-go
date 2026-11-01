@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	crand "crypto/rand"
@@ -31,16 +32,27 @@ import (
 // to Peek bytes of the carrier (a stream's first bytes after its TLS
 // handshake, an HTTP request's body), never more, and calls Decide with
 // what it read and the carrier's metadata; the Decision says what happens
-// to the carrier.
+// to the carrier. On a message-framed carrier (FramingRecords, such as
+// WebSocket) the prefix is the carrier's first message, whole. Decide may
+// ask for more of a byte stream (VerdictMore, up to MaxPeek bytes), as a
+// host that tells several kinds of carrier apart by their first bytes
+// does (ClassifyFirstBytes).
 //
 // The fields are read by NewListener; an Admission must not be changed or
 // copied afterwards.
 type Admission struct {
 	// Peek is the number of bytes read before Decide (0: none). Decide
-	// receives fewer when the carrier ends first.
+	// receives fewer when the carrier ends first. On a message-framed
+	// carrier any Peek above 0 reads the first message, of at most
+	// max(Peek, MaxPeek) bytes; a longer one is VerdictClose.
 	Peek int
-	// PeekTimeout bounds the reading of the Peek bytes and the decision,
-	// from the end of the carrier's outer handshake (TLS). Zero selects a
+	// MaxPeek bounds Decision.Need, the prefix that VerdictMore may ask
+	// for, and a first message (0: Peek, so that VerdictMore is
+	// VerdictClose). It is not below Peek, or ErrInvalidConfig.
+	MaxPeek int
+	// PeekTimeout bounds the reading of the prefix, every VerdictMore
+	// round included, and the decisions, from the end of the carrier's
+	// outer handshake (TLS). Zero selects a
 	// value drawn once per Admission, from a secure random source, between
 	// 5 s and 30 s; a negative value is no timeout.
 	PeekTimeout time.Duration
@@ -48,8 +60,9 @@ type Admission struct {
 	// valid only during the call. ctx ends at what remains of PeekTimeout
 	// and when the listener stops taking carriers (Close, or the end of
 	// Shutdown); a decision not returned by then is VerdictClose, and so
-	// is a panic. It is called at most once per carrier, concurrently for
-	// different carriers, outside every lock.
+	// is a panic. It is called once per carrier and once more after each
+	// VerdictMore, concurrently for different carriers, outside every
+	// lock.
 	Decide func(ctx context.Context, info *CarrierInfo, prefix []byte) Decision
 	// StallMin and StallMax bound the duration of a VerdictStall. The
 	// duration is a function of the carrier's source alone for the
@@ -66,6 +79,7 @@ type Admission struct {
 
 // admParams are the resolved bounds of an Admission.
 type admParams struct {
+	maxPeek            int // max(Peek, MaxPeek)
 	peekTimeout        time.Duration
 	stallMin, stallMax time.Duration
 }
@@ -123,6 +137,13 @@ const (
 	VerdictStall
 	// VerdictClose closes the carrier at once.
 	VerdictClose
+	// VerdictMore asks for a longer prefix of a byte stream: the listener
+	// reads until it has Decision.Need bytes, the carrier ends or
+	// PeekTimeout passes, and calls Decide again with the longer prefix.
+	// Need must exceed the prefix and not exceed MaxPeek, and VerdictMore
+	// after a carrier ended short of Need, on a message-framed carrier or
+	// on one decided on its request head is VerdictClose.
+	VerdictMore
 )
 
 // verdictFailed is the outcome of a carrier whose outer handshake failed:
@@ -142,6 +163,20 @@ type Decision struct {
 	// state is released. Whether a join comes from the same client as its
 	// session is the host's to decide: zmux compares no values.
 	Value any
+	// Need is, with VerdictMore, the total prefix length Decide needs.
+	Need int
+	// Variant labels the carrier with any verdict, for
+	// AdmissionStats.Variants; on VerdictAccept it is the PipeIO.Variant
+	// handed to WrapPipe (which may change it). "" for none.
+	Variant string
+}
+
+// VariantStats are the admission outcomes of one Decision.Variant.
+type VariantStats struct {
+	Accepted, Fallback uint64
+	// Stalled counts VerdictStall decisions, StallOverflow included.
+	Stalled uint64
+	Closed  uint64
 }
 
 // AdmissionStats are the outcomes of a listener's admission (API.md 7.2),
@@ -166,16 +201,56 @@ type AdmissionStats struct {
 	// HandshakeFailed counts carriers whose outer handshake failed or
 	// timed out, without a decision.
 	HandshakeFailed uint64
+	// Variants are the outcomes by Decision.Variant ("" for none), a
+	// copy: their sums are Accepted, Fallback, Stalled + StallOverflow
+	// and Closed.
+	Variants map[string]VariantStats
 }
 
 type admissionCounters struct {
 	accepted, fallback, stalled, closed, stallOverflow, peekTimedOut, handshakeFailed atomic.Uint64
+
+	mu       sync.Mutex
+	variants map[string]*VariantStats
+}
+
+// variant counts a final verdict of variant v.
+func (c *admissionCounters) variant(v string, verdict Verdict) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.variants == nil {
+		c.variants = map[string]*VariantStats{}
+	}
+	vs := c.variants[v]
+	if vs == nil {
+		vs = &VariantStats{}
+		c.variants[v] = vs
+	}
+	switch verdict {
+	case VerdictAccept:
+		vs.Accepted++
+	case VerdictFallback:
+		vs.Fallback++
+	case VerdictStall:
+		vs.Stalled++
+	default:
+		vs.Closed++
+	}
 }
 
 func (c *admissionCounters) snapshot() AdmissionStats {
-	return AdmissionStats{Accepted: c.accepted.Load(), Fallback: c.fallback.Load(), Stalled: c.stalled.Load(),
+	st := AdmissionStats{Accepted: c.accepted.Load(), Fallback: c.fallback.Load(), Stalled: c.stalled.Load(),
 		Closed: c.closed.Load(), StallOverflow: c.stallOverflow.Load(), PeekTimedOut: c.peekTimedOut.Load(),
 		HandshakeFailed: c.handshakeFailed.Load()}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.variants) > 0 {
+		st.Variants = make(map[string]VariantStats, len(c.variants))
+		for k, v := range c.variants {
+			st.Variants[k] = *v
+		}
+	}
+	return st
 }
 
 // Validate checks a (nil is valid) and resolves its bounds, once; a must
@@ -188,15 +263,17 @@ func (a *Admission) Validate() error {
 		switch {
 		case a.Decide == nil:
 			a.err = fmt.Errorf("%w: Admission.Decide is nil", ErrInvalidConfig)
-		case a.Peek < 0 || a.StallMin < 0 || a.StallMax < 0:
+		case a.Peek < 0 || a.MaxPeek < 0 || a.StallMin < 0 || a.StallMax < 0:
 			a.err = fmt.Errorf("%w: negative Admission field", ErrInvalidConfig)
+		case a.MaxPeek != 0 && a.MaxPeek < a.Peek:
+			a.err = fmt.Errorf("%w: Admission.MaxPeek below Peek", ErrInvalidConfig)
 		case a.StallMin > a.StallMax:
 			a.err = fmt.Errorf("%w: Admission.StallMin above StallMax", ErrInvalidConfig)
 		}
 		if a.err != nil {
 			return
 		}
-		r := admParams{peekTimeout: a.PeekTimeout, stallMin: a.StallMin, stallMax: a.StallMax}
+		r := admParams{maxPeek: max(a.Peek, a.MaxPeek), peekTimeout: a.PeekTimeout, stallMin: a.StallMin, stallMax: a.StallMax}
 		if r.peekTimeout == 0 {
 			r.peekTimeout = drawDuration(5*time.Second, 30*time.Second)
 		}
@@ -304,9 +381,10 @@ type Arrival struct {
 	key  string
 
 	mu       sync.Mutex
-	held     bool // the source slot Arrive took is held and not yet handed on
-	accepted bool // the admission accepted the carrier
-	value    any  // Decision.Value of that acceptance
+	held     bool   // the source slot Arrive took is held and not yet handed on
+	accepted bool   // the admission accepted the carrier
+	value    any    // Decision.Value of that acceptance
+	variant  string // Decision.Variant of that acceptance
 }
 
 // Arrive takes a slot of source for a carrier that arrived from peer
@@ -445,6 +523,9 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) error
 	hint.Source = a.src
 	a.mu.Lock()
 	hint.Admitted = a.value
+	if p.Variant == "" {
+		p.Variant = a.variant // the admission labels the carrier
+	}
 	a.mu.Unlock()
 	run, err := l.take(p, hint, a.key)
 	if err != nil {
@@ -516,9 +597,16 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 	if cs, ok := TerminatedTLS(p); ok {
 		info.TLS = &cs
 	}
-	if adm.Peek > 0 && p.R != nil && p.Framing == FramingByteStream {
+	var more func(have []byte, need int) ([]byte, bool)
+	records := p.Framing == FramingRecords
+	if adm.Peek > 0 && p.R != nil {
 		var fired bool
-		prefix, fired = a.peekPipe(p, adm.Peek, deadline)
+		if records {
+			prefix, fired = a.peekMessage(p, deadline)
+		} else {
+			prefix, fired = a.peekPipe(p, prefix, adm.Peek, deadline)
+			more = func(have []byte, need int) ([]byte, bool) { return a.peekPipe(p, have, need, deadline) }
+		}
 		if fired {
 			closePipeIO(p)
 			l.st.adm.peekTimedOut.Add(1)
@@ -526,7 +614,18 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 			return PipeIO{}, nil, VerdictClose
 		}
 	}
-	d := a.decide(ctx, info, prefix, deadline)
+	var dd decided
+	if records && len(prefix) > adm.r.maxPeek {
+		dd = decided{a.count(Decision{Verdict: VerdictClose}), prefix}
+	} else {
+		dd = a.decide(ctx, info, prefix, deadline, more)
+		if records && dd.Verdict == VerdictAccept && dd.Skip != 0 && dd.Skip != len(dd.prefix) {
+			// A message is replayed whole or not at all: recount.
+			dd = a.recount(dd, Decision{Verdict: VerdictClose, Variant: dd.Variant})
+		}
+	}
+	d := dd.Decision
+	prefix = dd.prefix
 	switch d.Verdict {
 	case VerdictAccept:
 		return withPrefix(p, prefix[d.Skip:]), nil, VerdictAccept
@@ -542,30 +641,57 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 	}
 }
 
-// pendingHandshake is the HandshakeContext of p's TLS connection whose
-// handshake has not completed, nil without one. The connection stays p's.
+// pendingHandshake is the HandshakeContext of p's half whose own
+// handshake has not run (a Handshaker; a *tls.Conn only while its
+// handshake is incomplete), nil without one. The half stays p's.
 func pendingHandshake(p PipeIO) func(context.Context) error {
 	for _, x := range []any{p.R, p.W} {
-		if tc, ok := x.(*tls.Conn); ok && !tc.ConnectionState().HandshakeComplete {
-			return tc.HandshakeContext
+		if tc, ok := x.(*tls.Conn); ok {
+			if !tc.ConnectionState().HandshakeComplete {
+				return tc.HandshakeContext
+			}
+			continue
+		}
+		if h, ok := x.(Handshaker); ok {
+			return h.HandshakeContext
 		}
 	}
 	return nil
 }
 
-// peekPipe reads up to n bytes of p by deadline; fired: the deadline
-// passed first (the carrier may be closed).
-func (a *Arrival) peekPipe(p PipeIO, n int, deadline time.Time) (prefix []byte, fired bool) {
+// peekPipe reads p by deadline until have holds n bytes, and returns
+// them (fewer when the carrier ends); fired: the deadline passed first
+// (the carrier may be closed).
+func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (prefix []byte, fired bool) {
 	var once atomic.Bool
 	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
 		once.Store(true)
 		interruptRead(p)
 	})
-	prefix = peek(p.R, n)
+	prefix = peek(p.R, have, n)
 	if !t.Stop() && once.Load() {
 		return nil, true
 	}
 	return prefix, false
+}
+
+// peekMessage reads the first message of a message-framed p by deadline
+// (none when the carrier ends or its half is no MessageReader).
+func (a *Arrival) peekMessage(p PipeIO, deadline time.Time) (msg []byte, fired bool) {
+	mr, ok := p.R.(MessageReader)
+	if !ok {
+		return nil, false
+	}
+	var once atomic.Bool
+	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
+		once.Store(true)
+		interruptRead(p)
+	})
+	msg, _ = mr.ReadMessage()
+	if !t.Stop() && once.Load() {
+		return nil, true
+	}
+	return bytes.Clone(msg), false
 }
 
 // interruptRead ends a blocked read of p: a passed read deadline where
@@ -577,13 +703,52 @@ func interruptRead(p PipeIO) {
 	closePipeIO(p)
 }
 
+// decided is a final Decision with the prefix it was taken on.
+type decided struct {
+	Decision
+	prefix []byte
+}
+
 // decide calls Decide with ctx ending at deadline, outside every lock,
-// bounds the result and counts the outcome (a stall is counted by
-// stallSlot). A decision not returned in time is VerdictClose.
-func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, deadline time.Time) Decision {
+// again after each VerdictMore with the longer prefix that more reads (nil:
+// VerdictMore is VerdictClose), bounds the result and counts the outcome
+// (a stall's aggregate count is stallSlot's). A decision not returned in
+// time is VerdictClose.
+func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, deadline time.Time,
+	more func(have []byte, need int) ([]byte, bool)) decided {
 	l := a.l
 	dctx, cancel := timeshim.WithDeadline(ctx, l.clk, deadline)
 	defer cancel()
+	ended := false // the carrier ended short of a Need
+	for {
+		d, ok := a.callDecide(dctx, info, prefix)
+		if !ok {
+			if errors.Is(dctx.Err(), context.DeadlineExceeded) {
+				l.st.adm.peekTimedOut.Add(1)
+			} else {
+				l.st.adm.closed.Add(1)
+				l.st.adm.variant("", VerdictClose)
+			}
+			return decided{Decision{Verdict: VerdictClose}, prefix}
+		}
+		if d.Verdict != VerdictMore {
+			return decided{a.count(d.bound(len(prefix))), prefix}
+		}
+		if more == nil || ended || d.Need <= len(prefix) || d.Need > l.cfg.Admission.r.maxPeek {
+			return decided{a.count(Decision{Verdict: VerdictClose, Variant: d.Variant}), prefix}
+		}
+		next, fired := more(prefix, d.Need)
+		if fired {
+			l.st.adm.peekTimedOut.Add(1)
+			return decided{Decision{Verdict: VerdictClose}, prefix}
+		}
+		prefix, ended = next, len(next) < d.Need
+	}
+}
+
+// callDecide runs Decide once; ok false: dctx ended first (a decision
+// returned after that is not used, however the select chose).
+func (a *Arrival) callDecide(dctx context.Context, info *CarrierInfo, prefix []byte) (Decision, bool) {
 	res := make(chan Decision, 1)
 	go func() {
 		d := Decision{Verdict: VerdictClose}
@@ -591,45 +756,62 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 			_ = recover() // a panicking decision is VerdictClose
 			res <- d
 		}()
-		d = l.cfg.Admission.Decide(dctx, info, prefix)
+		d = a.l.cfg.Admission.Decide(dctx, info, prefix)
 	}()
 	var d Decision
 	select {
 	case d = <-res:
 	case <-dctx.Done():
 	}
-	// A decision that returns after ctx or the deadline ended is not
-	// used, however the select above chose.
-	if dctx.Err() != nil {
-		if errors.Is(dctx.Err(), context.DeadlineExceeded) {
-			l.st.adm.peekTimedOut.Add(1)
-		} else {
-			l.st.adm.closed.Add(1)
-		}
-		return Decision{Verdict: VerdictClose}
-	}
+	return d, dctx.Err() == nil
+}
+
+// bound is d with the fields its verdict does not use cleared; an unknown
+// verdict, or a Skip outside a prefix of n bytes, is VerdictClose.
+func (d Decision) bound(n int) Decision {
 	switch {
-	case d.Verdict > VerdictClose:
-		d = Decision{Verdict: VerdictClose}
+	case d.Verdict >= VerdictMore:
+		return Decision{Verdict: VerdictClose, Variant: d.Variant}
 	case d.Verdict != VerdictAccept:
-		d.Skip, d.Value = 0, nil
-	case d.Skip < 0 || d.Skip > len(prefix):
-		d = Decision{Verdict: VerdictClose}
+		return Decision{Verdict: d.Verdict, Variant: d.Variant}
+	case d.Skip < 0 || d.Skip > n:
+		return Decision{Verdict: VerdictClose, Variant: d.Variant}
 	}
+	d.Need = 0
+	return d
+}
+
+// count counts a final decision and keeps the value of an acceptance.
+func (a *Arrival) count(d Decision) Decision {
+	l := a.l
 	switch d.Verdict {
 	case VerdictAccept:
 		a.mu.Lock()
-		a.value = d.Value
+		a.value, a.variant = d.Value, d.Variant
 		a.mu.Unlock()
 		l.st.adm.accepted.Add(1)
 	case VerdictFallback:
 		l.st.adm.fallback.Add(1)
 	case VerdictStall:
-		// Counted by stallSlot.
+		// The aggregate is counted by stallSlot.
 	case VerdictClose:
 		l.st.adm.closed.Add(1)
 	}
+	l.st.adm.variant(d.Variant, d.Verdict)
 	return d
+}
+
+// recount replaces a counted acceptance with to.
+func (a *Arrival) recount(from decided, to Decision) decided {
+	l := a.l
+	l.st.adm.accepted.Add(^uint64(0))
+	l.st.adm.mu.Lock()
+	l.st.adm.variants[from.Variant].Accepted--
+	l.st.adm.mu.Unlock()
+	a.mu.Lock()
+	a.value, a.variant = nil, ""
+	a.mu.Unlock()
+	return decided{a.count(to), from.prefix}
 }
 
 // stallSlot counts a stalled carrier of the arrival; ok false: the source
@@ -679,21 +861,26 @@ func (a *Arrival) stallPipe(ctx context.Context, p PipeIO, counted bool) {
 	discard(p.R)
 	stop()
 	t.Stop()
-	if cw, ok := p.W.(closeWriter); ok {
+	if cw, ok := p.W.(CloseWriter); ok {
 		_ = cw.CloseWrite()
 	}
 	closePipeIO(p)
 }
 
-// peek reads up to n bytes from r into a buffer of n bytes; it stops early
-// at the end of r or an error (an interrupted read).
-func peek(r io.Reader, n int) []byte {
-	if n == 0 {
-		return nil
+// peek reads from r until have holds n bytes (a new buffer when have has
+// no room); it stops early at the end of r or an error (an interrupted
+// read).
+func peek(r io.Reader, have []byte, n int) []byte {
+	if n <= len(have) {
+		return have
 	}
-	b := make([]byte, n)
-	got, _ := io.ReadFull(r, b)
-	return b[:got]
+	b := have
+	if cap(b) < n {
+		b = make([]byte, len(have), n)
+		copy(b, have)
+	}
+	got, _ := io.ReadFull(r, b[len(have):n])
+	return b[:len(have)+got]
 }
 
 // stallBuf is the discard buffer of stalled carriers.
@@ -926,8 +1113,25 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 		}
 		prefix, head = b[:n], n == 0 && err == io.EOF
 	}
+	var more func(have []byte, need int) ([]byte, bool)
+	if !head && adm.Peek > 0 {
+		more = func(have []byte, need int) ([]byte, bool) {
+			rc := http.NewResponseController(w)
+			var fired atomic.Bool
+			t := l.clk.AfterFunc(deadline.Sub(l.clk.Now()), func() {
+				fired.Store(true)
+				_ = rc.SetReadDeadline(time.Now())
+			})
+			b := peek(r.Body, have, need)
+			if !t.Stop() && fired.Load() {
+				return nil, true
+			}
+			return b, false
+		}
+	}
 	info := &CarrierInfo{Source: a.src, Peer: a.peer, TLS: r.TLS, Request: r, Head: head}
-	d := a.decide(ctx, info, prefix, deadline)
+	dd := a.decide(ctx, info, prefix, deadline, more)
+	d, prefix := dd.Decision, dd.prefix
 	switch d.Verdict {
 	case VerdictAccept:
 		if rest := prefix[d.Skip:]; len(rest) > 0 {

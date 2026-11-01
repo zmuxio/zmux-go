@@ -59,6 +59,13 @@ type Conn struct {
 	cancel context.CancelCauseFunc
 	err    error // terminal error once done
 
+	// exp is the late exporter of PipeAuth.Exporter, nil without it.
+	exp *lateExporter
+	// firstTimer releases a held first flight at the handshake timeout;
+	// firstTimeouts counts that (session lock).
+	firstTimer    timeshim.Timer
+	firstTimeouts uint64
+
 	// admitted is the admission value of the bootstrap carrier (set
 	// before the session is shared, never changed).
 	admitted any
@@ -81,6 +88,8 @@ type Conn struct {
 	needRedial  bool        // a direction may have been lost (under the lock)
 	dialed      Endpoint    // who dialed the bootstrap carrier; 0: unknown
 	carrier     CarrierKind // the kind DialMode chose
+	// carrierVariant is the chosen candidate's Variant.
+	carrierVariant string
 
 	fired    bool // the timeout ran: rearm no earlier than G
 	closing  bool // CLOSED: no new goroutines
@@ -302,6 +311,14 @@ func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 	if err != nil {
 		return nil, err
 	}
+	if _, ok := earlyCarrier(p, &cfg.EarlyData); ok && role == RoleClient {
+		if !cfg.EarlyData.Replayable {
+			// The carrier's early data can be replayed: the client
+			// consents with Replayable.
+			return nil, fmt.Errorf("%w: EarlyData.ZmuxPeer on a carrier with early data needs Replayable", ErrInvalidConfig)
+		}
+		cc.EarlyCarrier = true
+	}
 	return startCore(ctx, p, cfg, cc, nil, nil)
 }
 
@@ -309,14 +326,17 @@ func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 // the listener that owns it, if any, and admitted the admission value of
 // its bootstrap carrier.
 func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted any) (*Conn, error) {
+	var exp *lateExporter
 	if cfg.PipeAuth.Exporter {
-		exp, err := sessionExporter(p, lst == nil && cc.TransportRole == core.RoleInitiator)
+		var err error
+		exp, err = sessionExporter(p, lst == nil && cc.TransportRole == core.RoleInitiator)
 		if err != nil {
 			return nil, err
 		}
-		cc.Exporter = exp
+		cc.Exporter = exp.value
 	}
 	c := newConn(cfg, cc)
+	c.exp = exp
 	c.lst = lst
 	c.admitted = admitted
 	switch {
@@ -347,6 +367,9 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 		}
 	}
 	c.addBootstrap(p)
+	if cc.HoldFirstFlight {
+		c.firstTimer = c.clk.source().AfterFunc(cfg.handshakeTimeout(), func() { c.releaseFirst(true) })
+	}
 	early := cc.EarlyZmuxPeer || cc.EarlyRemembered != nil && cc.EarlyReplayable
 	c.unlock()
 	c.watchEarly(p)
@@ -360,42 +383,73 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 	return c, nil
 }
 
-// sessionExporter is the exporter value of PipeAuth.Exporter (MULTIPATH.md
-// 10.2): from pipe 0's carrier, or for a split bootstrap whose halves are
-// two TLS connections the uplink's exporter followed by the downlink's.
-func sessionExporter(p PipeIO, initiator bool) ([]byte, error) {
-	export := func(x any) ([]byte, bool, error) {
-		st, ok := terminatedTLS(x)
-		if !ok {
-			return nil, false, nil // no handshake terminated here: no exporter
-		}
-		b, err := st.ExportKeyingMaterial(wire.ExporterSession, nil, 32)
-		if err != nil {
-			return nil, true, fmt.Errorf("zmux: TLS exporter: %w", err)
-		}
-		return b, true, nil
-	}
+// lateExporter is the exporter value of PipeAuth.Exporter (MULTIPATH.md
+// 10.2), read late: by the bootstrap pipe's reader, outside the session
+// lock, before it delivers the first bytes of the carrier, which carry the
+// peer's parameters, so that the carrier's own handshake has completed
+// (the core asks for the value while it processes them). For a split
+// bootstrap whose halves are two connections the value is the uplink's
+// exporter followed by the downlink's.
+type lateExporter struct {
+	up, down KeyingMaterialExporter // either may be nil
+	once     sync.Once
+	b        []byte
+	err      error
+	loaded   atomic.Bool
+}
+
+// sessionExporter finds the exporters of p's halves; ErrInvalidConfig
+// when neither has one.
+func sessionExporter(p PipeIO, initiator bool) (*lateExporter, error) {
 	up, down := any(p.W), any(p.R) // the initiator writes on the uplink
 	if !initiator {
 		up, down = p.R, p.W
 	}
-	u, uok, err := export(up)
-	if err != nil {
-		return nil, err
+	e := &lateExporter{}
+	e.up, _ = exporterOf(up)
+	if down != up { // the halves of one carrier: one exporter
+		e.down, _ = exporterOf(down)
 	}
-	d, dok, err := export(down)
-	if err != nil {
-		return nil, err
+	if e.up == nil && e.down == nil {
+		return nil, fmt.Errorf("%w: PipeAuth.Exporter on a carrier without an exporter", ErrInvalidConfig)
 	}
-	switch {
-	case uok && dok && !bytes.Equal(u, d):
-		return append(u, d...), nil // two connections: a split bootstrap
-	case uok:
-		return u, nil
-	case dok:
-		return d, nil
+	return e, nil
+}
+
+// load reads the exporter once; it calls the carrier, so never under the
+// session lock.
+func (e *lateExporter) load() {
+	e.once.Do(func() {
+		read := func(x KeyingMaterialExporter) []byte {
+			if x == nil || e.err != nil {
+				return nil
+			}
+			b, err := x.ExportKeyingMaterial(wire.ExporterSession, nil, 32)
+			if err != nil {
+				e.err = err
+			}
+			return b
+		}
+		u, d := read(e.up), read(e.down)
+		switch {
+		case e.err != nil:
+		case u != nil && d != nil && !bytes.Equal(u, d):
+			e.b = append(u, d...) // two connections: a split bootstrap
+		case u != nil:
+			e.b = u
+		default:
+			e.b = d
+		}
+		e.loaded.Store(true)
+	})
+}
+
+// value is the core's Exporter: the value load read.
+func (e *lateExporter) value() ([]byte, error) {
+	if !e.loaded.Load() {
+		return nil, errors.New("not read before the peer's parameters")
 	}
-	return nil, fmt.Errorf("%w: PipeAuth.Exporter on a carrier without TLS", ErrInvalidConfig)
+	return e.b, e.err
 }
 
 // Dial connects to addr on the named network (as net.Dialer.DialContext)
@@ -471,7 +525,7 @@ func newConn(cfg *Config, cc core.Config) *Conn {
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
 	c.s = core.New(cc, c.clk.now())
 	if cfg != nil && cfg.Shaper != nil {
-		c.s.SetShaper(coreFactory(cfg.Shaper))
+		c.s.SetShaper(c.coreFactory(cfg.Shaper))
 	}
 	c.chInMax = c.s.Config().DgramRecvQ
 	c.hk = newHooks(c)
@@ -687,7 +741,9 @@ func (c *Conn) ConnectionState() ConnectionState {
 type ConnectionStats struct {
 	// Carrier is the carrier kind a carrier mode chose (DialMode), the
 	// latest after a switch; 0 for a session not dialed in a mode.
-	Carrier CarrierKind
+	// CarrierVariant is that candidate's Variant.
+	Carrier        CarrierKind
+	CarrierVariant string
 	// CarrierCandidates are the tries of the mode's candidates in order,
 	// joins of preferred kinds included: the latest 64.
 	CarrierCandidates []CandidateResult
@@ -754,6 +810,9 @@ type ConnectionStats struct {
 
 	SchedulerAnswers   uint64 // custom scheduler answers that named a pipe and were applied; Wait is not counted
 	SchedulerFallbacks uint64 // answers replaced by the affinity choice
+	// FirstFlightTimeouts is 1 when EarlyData.HoldFirstFlight was released
+	// by Config.HandshakeTimeout rather than ReleaseFirstFlight.
+	FirstFlightTimeouts uint64
 }
 
 // ConnectionStats returns a snapshot of the session's statistics.
@@ -762,7 +821,7 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 	defer c.unlock()
 	c.s.SetNow(c.clk.now()) // SuspendedTime is current
 	s, g := c.s.SessionStats(), c.s.Gauges()
-	return ConnectionStats{Carrier: c.carrier, CarrierCandidates: slices.Clone(c.carrierTries),
+	return ConnectionStats{Carrier: c.carrier, CarrierVariant: c.carrierVariant, CarrierCandidates: slices.Clone(c.carrierTries),
 		BytesSent: s.BytesSent, BytesReceived: s.BytesReceived, RecordsSent: s.RecordsSent,
 		RecordsReceived: s.RecordsReceived, BytesWritten: s.AppBytesWritten, BytesRead: s.AppBytesRead,
 		DatagramBytesSent: s.DatagramBytesSent, DatagramBytesReceived: s.DatagramBytesReceived,
@@ -780,7 +839,30 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		PipesActive: g.PipesActive, PipesAdded: s.PipesAdded, PipeFailures: s.PipeFailures,
 		JoinAuthFailures: s.JoinAuthFailures, JoinReplays: s.JoinReplays, JoinRefusals: s.JoinRefusals,
 		Suspensions: s.Suspensions, SuspendedTime: time.Duration(s.SuspendedTime),
-		SchedulerAnswers: s.SchedulerAnswers, SchedulerFallbacks: s.SchedulerFallbacks}
+		SchedulerAnswers: s.SchedulerAnswers, SchedulerFallbacks: s.SchedulerFallbacks,
+		FirstFlightTimeouts: c.firstTimeouts}
+}
+
+// ReleaseFirstFlight ends EarlyData.HoldFirstFlight: everything queued so
+// far is built into records and written to the bootstrap carrier in one
+// write (one Write or WriteBuffers on a byte stream, one WriteMessages
+// where the half is a MessageBatchWriter), as far as one batch holds it.
+// Calls after the first, and on a session without HoldFirstFlight, do
+// nothing. It never blocks.
+func (c *Conn) ReleaseFirstFlight() { c.releaseFirst(false) }
+
+// releaseFirst releases the first flight; timeout: by the handshake
+// timeout.
+func (c *Conn) releaseFirst(timeout bool) {
+	c.lock()
+	defer c.unlock()
+	if c.firstTimer != nil {
+		c.firstTimer.Stop()
+		c.firstTimer = nil
+	}
+	if c.s.ReleaseFirstFlight(c.clk.now()) && timeout {
+		c.firstTimeouts++
+	}
 }
 
 // Admitted returns the Decision.Value of the admission that accepted the

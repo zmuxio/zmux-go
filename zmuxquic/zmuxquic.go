@@ -437,15 +437,15 @@ func (q *qStream) EarlyAccepted(ctx context.Context) (bool, error) {
 
 // RestartEarly opens the bootstrap stream again on the connection that
 // replaced a rejected 0-RTT one.
-func (q *qStream) RestartEarly(ctx context.Context) (io.ReadWriteCloser, error) {
+func (q *qStream) RestartEarly(ctx context.Context) (zmux.PipeIO, error) {
 	qc, _ := q.cur()
 	nc, err := qc.NextConnection(ctx)
 	if err != nil {
-		return nil, err
+		return zmux.PipeIO{}, err
 	}
 	s, err := nc.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, err
+		return zmux.PipeIO{}, err
 	}
 	q.mu.Lock()
 	closed := q.closed
@@ -455,10 +455,11 @@ func (q *qStream) RestartEarly(ctx context.Context) (io.ReadWriteCloser, error) 
 	q.mu.Unlock()
 	if closed {
 		_ = nc.CloseWithError(0, "")
-		return nil, net.ErrClosed
+		return zmux.PipeIO{}, net.ErrClosed
 	}
 	clientLanes(nc)
-	return &restarted{q: q}, nil
+	r := &restarted{q: q}
+	return zmux.PipeIO{R: r, W: r}, nil
 }
 
 // UsedEarlyData reports a server stream that arrived in 0-RTT.

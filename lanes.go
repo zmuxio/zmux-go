@@ -80,9 +80,9 @@ func handleLane(ctx context.Context, l *Listener, p PipeIO, first []byte) error 
 		return errRejected
 	}
 	var conn any
-	if cc, ok := p.R.(carrierConner); ok {
+	if cc, ok := p.R.(CarrierConner); ok {
 		conn = cc.CarrierConn()
-	} else if cc, ok := p.W.(carrierConner); ok {
+	} else if cc, ok := p.W.(CarrierConner); ok {
 		conn = cc.CarrierConn()
 	}
 	done, err := c.acceptLane(p, conn, f.PipeID, f.Lane)

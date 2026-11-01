@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -440,7 +441,7 @@ func TestUpgradeFailureCounted(t *testing.T) {
 	r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
 	r.Header.Set("Sec-WebSocket-Protocol", zmux.DefaultALPN)
 	h.ServeHTTP(httptest.NewRecorder(), r)
-	if st := lst.Stats(); st != (zmux.ListenerStats{SetupFailures: 1}) {
+	if st := lst.Stats(); !reflect.DeepEqual(st, zmux.ListenerStats{SetupFailures: 1}) {
 		t.Fatalf("stats %+v", st)
 	}
 }

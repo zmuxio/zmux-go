@@ -95,7 +95,7 @@ func (c *pipeConn) Close() error {
 
 // CloseWrite ends the sending half gracefully where it offers CloseWrite.
 func (c *pipeConn) CloseWrite() error {
-	if cw, ok := c.p.W.(closeWriter); ok {
+	if cw, ok := c.p.W.(CloseWriter); ok {
 		return cw.CloseWrite()
 	}
 	return errors.ErrUnsupported

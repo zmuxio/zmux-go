@@ -31,7 +31,7 @@ func (s *Session) WantsWrite(pipe, lane uint64) bool {
 		return false
 	}
 	ol := p.out.lane(lane)
-	if ol == nil || ol.shut || ol.closeSent || s.state == StateClosed {
+	if ol == nil || ol.shut || ol.closeSent || s.state == StateClosed || s.holdsFirst(pipe) {
 		return false
 	}
 	if pipe == 0 && lane == 0 && !ol.tpSent {
@@ -212,7 +212,7 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 		return false
 	}
 	ol := p.out.lane(lane)
-	if ol == nil || ol.shut {
+	if ol == nil || ol.shut || s.holdsFirst(pipe) {
 		return false
 	}
 	var w recWriter
@@ -443,6 +443,29 @@ func (s *Session) WriteDone(b *Batch, err error, now Time) {
 	if err != nil {
 		s.pipeWriteFailed(b.Pipe, b.Lane, err)
 	}
+}
+
+// holdsFirst reports whether pipe's output waits for ReleaseFirstFlight
+// (a CONNECTION_CLOSE does not wait).
+func (s *Session) holdsFirst(pipe uint64) bool {
+	return s.firstHeld && pipe == 0 && !s.closeFr.pending
+}
+
+// ReleaseFirstFlight lets pipe 0 write what is queued, and starts the
+// handshake timeout; it reports whether the first flight was held.
+func (s *Session) ReleaseFirstFlight(now Time) bool {
+	s.SetNow(now)
+	if !s.firstHeld {
+		return false
+	}
+	s.firstHeld = false
+	if s.state == StateEstablishing && !s.peerSeen {
+		s.timers.handshake = now.Add(s.cfg.HandshakeTimeout)
+	}
+	if p := s.pipe(0); p != nil {
+		s.wakePipe(p)
+	}
+	return true
 }
 
 // writeParams writes the first record of the bootstrap pipe (SPEC.md 5.1).

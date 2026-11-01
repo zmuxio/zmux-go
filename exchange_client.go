@@ -155,7 +155,8 @@ type exClient struct {
 	err     error     // the carrier failed
 	ended   bool      // run has stopped: no more requests
 	sentAny bool
-	gone    bool // the server answered GONE
+	gone    bool        // the server answered GONE
+	respHdr http.Header // the latest response's header
 
 	// uplink
 	wclosed  bool   // zmux closed the write side
@@ -552,6 +553,9 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 		}
 		return res
 	}
+	c.mu.Lock()
+	c.respHdr = resp.Header
+	c.mu.Unlock()
 	if f, perr := url.Parse(from); perr == nil && final.String() != from && SchemeUpgradeOf(f, final) {
 		up := tg.upgraded(final)
 		if c.ht != nil && tg == &c.target {
@@ -728,6 +732,20 @@ func (b *exBody) Close() error {
 
 // exClientReader is the downlink half.
 type exClientReader struct{ c *exClient }
+
+// header is a copy of the latest response's header, nil before one.
+func (c *exClient) header() http.Header {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.respHdr.Clone()
+}
+
+// ResponseHeader returns a copy of the latest response's header
+// (ResponseHeaderer); nil before one.
+func (r *exClientReader) ResponseHeader() http.Header { return r.c.header() }
+
+// ResponseHeader is the reader's (ResponseHeaderer).
+func (w *exClientWriter) ResponseHeader() http.Header { return w.c.header() }
 
 func (r *exClientReader) Read(p []byte) (int, error) {
 	c := r.c

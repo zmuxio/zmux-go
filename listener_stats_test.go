@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"net"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -87,7 +88,7 @@ func TestListenerStats(t *testing.T) {
 	}
 	got := lst.Stats()
 	want := ListenerStats{Sessions: 1, Joins: 1, SetupFailures: 1, Rejected: 1, Refused: 1, TimedOut: 1}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("stats %+v, want %+v", got, want)
 	}
 }
@@ -195,7 +196,7 @@ func TestListenerStatsIdentity(t *testing.T) {
 		_ = a1.Close()
 		got := al.Stats()
 		want := map[Verdict]AdmissionStats{VerdictClose: {Closed: 1}, VerdictFallback: {Fallback: 1}, VerdictStall: {Stalled: 1}}[v]
-		if got.Admission != want || sum(got) != 0 {
+		if !eqAdm(got.Admission, want) || sum(got) != 0 {
 			t.Fatalf("verdict %d: %+v", v, got)
 		}
 		_ = al.Close()
@@ -219,7 +220,7 @@ func TestListenerStatsIdentity(t *testing.T) {
 
 	got := lst.Stats()
 	want := ListenerStats{Sessions: 2, Joins: 1, Rejected: 1, Refused: 1, TimedOut: 2, SetupFailures: 1}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("stats %+v, want %+v", got, want)
 	}
 }
@@ -247,7 +248,7 @@ func TestEarlyJoinWaitCancelled(t *testing.T) {
 	go func() { done <- e.lst.HandlePipe(hctx, PipeIO{R: srv, W: earlyHalf{srv}}, JoinHint{}) }()
 	// The join waits for the handshake: nothing is counted yet.
 	time.Sleep(50 * time.Millisecond)
-	if got := e.lst.Stats(); got != before {
+	if got := e.lst.Stats(); !reflect.DeepEqual(got, before) {
 		t.Fatalf("counted while waiting: %+v", got)
 	}
 	hcancel()
@@ -256,7 +257,7 @@ func TestEarlyJoinWaitCancelled(t *testing.T) {
 	}
 	want := before
 	want.SetupFailures++
-	if got := e.lst.Stats(); got != want {
+	if got := e.lst.Stats(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("stats %+v, want %+v", got, want)
 	}
 }

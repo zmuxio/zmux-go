@@ -68,8 +68,11 @@ type Config struct {
 	ProbeInterval Duration
 	ProbeJitter   float64 // 0 <= j < 1 (MULTIPATH.md 7.1); 0: a fixed schedule
 
-	PSK      []byte
-	Exporter []byte // exporter of pipe 0's innermost end-to-end handshake (E flag)
+	PSK []byte
+	// Exporter reads the exporter of pipe 0's innermost end-to-end
+	// handshake (E flag); called once, while the peer's parameters are
+	// processed; nil: none.
+	Exporter func() ([]byte, error)
 
 	// EarlyRemembered are the peer parameters remembered from an earlier
 	// session: a client sends early streams in carrier early data under
@@ -108,6 +111,12 @@ type Config struct {
 
 	EarlyZmuxPeer   bool
 	EarlyReplayable bool
+	// EarlyCarrier: the bootstrap carrier reports a verdict on its early
+	// data (the zmux floor's early sends then wait for it, as remembered
+	// parameters' do).
+	EarlyCarrier bool
+	// HoldFirstFlight: pipe 0 writes nothing until ReleaseFirstFlight.
+	HoldFirstFlight bool
 }
 
 // TestHooks are the trace runner's deterministic values.

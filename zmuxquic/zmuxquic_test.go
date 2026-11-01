@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"io"
 	"math/big"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -395,7 +396,7 @@ func TestQUICHandshakeFailureCounted(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if st := lst.Stats(); st != (zmux.ListenerStats{SetupFailures: 1}) {
+	if st := lst.Stats(); !reflect.DeepEqual(st, zmux.ListenerStats{SetupFailures: 1}) {
 		t.Fatalf("stats %+v", st)
 	}
 }

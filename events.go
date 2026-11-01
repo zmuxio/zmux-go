@@ -115,6 +115,10 @@ type Event struct {
 	// Outcome that of EventCarrierCandidate.
 	Carrier CarrierKind
 	Outcome CandidateOutcome
+	// Variant is the PipeIO.Variant of a pipe event's carrier while the
+	// pipe has one, and the candidate's of EventCarrierCandidate and
+	// EventCarrierChosen.
+	Variant string
 	// Pipe is the pipe ID of a pipe event.
 	Pipe uint64
 	// Priority is the tier (EventPipePriorityChanged,
@@ -379,7 +383,7 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 		case core.InEnded:
 			if q.dirs[e.Pipe]&dirInEnded == 0 {
 				q.push(Event{Kind: EventPipeClosed, Pipe: e.Pipe, Direction: DirReceiveOnly,
-					Carrier: CarrierKind(e.Carrier)})
+					Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
 			}
 		case core.InNone:
 			// No inbound direction: nothing to report.
@@ -392,7 +396,7 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 	prev, seen := q.seenOut[e.Pipe]
 	q.seenOut[e.Pipe] = e.OutState
 	if !seen {
-		q.push(Event{Kind: EventPipeAdded, Pipe: e.Pipe, Direction: DirSendOnly, Carrier: CarrierKind(e.Carrier)})
+		q.push(Event{Kind: EventPipeAdded, Pipe: e.Pipe, Direction: DirSendOnly, Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
 	}
 	var k EventKind
 	switch e.OutState {
@@ -412,7 +416,7 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 		// reported once it settles, retirement by EventPipesRetired.
 	}
 	if k != 0 && prev != e.OutState {
-		q.push(Event{Kind: k, Pipe: e.Pipe, Direction: DirSendOnly, Carrier: CarrierKind(e.Carrier)})
+		q.push(Event{Kind: k, Pipe: e.Pipe, Direction: DirSendOnly, Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
 	}
 }
 

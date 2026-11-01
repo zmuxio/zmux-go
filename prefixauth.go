@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -201,10 +200,11 @@ func (a *PrefixAuth) token(binding []byte, now time.Time) ([]byte, error) {
 	return b, nil
 }
 
-// PrefixAuthBinding returns the binding of a TLS carrier: 32 bytes of the
-// exporter with PrefixAuthExporterLabel and an empty context.
-func PrefixAuthBinding(cs *tls.ConnectionState) ([]byte, error) {
-	return cs.ExportKeyingMaterial(PrefixAuthExporterLabel, []byte{}, 32)
+// PrefixAuthBinding returns the binding of a carrier: 32 bytes of its
+// exporter (a *tls.ConnectionState such as CarrierInfo.TLS, or Exporter's
+// result) with PrefixAuthExporterLabel and an empty context.
+func PrefixAuthBinding(e KeyingMaterialExporter) ([]byte, error) {
+	return e.ExportKeyingMaterial(PrefixAuthExporterLabel, []byte{}, 32)
 }
 
 // PrefixAuthVerifier verifies tokens and rejects each Nonce after its
@@ -215,7 +215,7 @@ type PrefixAuthVerifier struct {
 	slot   int64
 	skew   int64
 	pool   sync.Pool
-	cache  *replayCache
+	cache  *ReplayFilter
 	now    func() time.Time
 }
 
@@ -230,8 +230,14 @@ func NewPrefixAuthVerifier(a *PrefixAuth) (*PrefixAuthVerifier, error) {
 	if size == 0 {
 		size = 1 << 16
 	}
-	v := &PrefixAuthVerifier{bind: a.BindTLS, header: a.headerName(), slot: slot, skew: int64(a.Skew), now: time.Now,
-		cache: newReplayCache(2*int64(a.Skew)+1, 1, size)}
+	v := &PrefixAuthVerifier{bind: a.BindTLS, header: a.headerName(), slot: slot, skew: int64(a.Skew), now: time.Now}
+	// A token of slot s verifies while the clock is within skew slots of
+	// s: within (skew+1) slots of the slot's start.
+	v.cache, err = NewReplayFilter(ReplayConfig{Window: time.Duration(int64(a.Skew)+1) * time.Duration(slot) * time.Second,
+		Max: size})
+	if err != nil {
+		return nil, err
+	}
 	v.pool.New = func() any { return hmac.New(sha256.New, k) }
 	return v, nil
 }
@@ -260,9 +266,7 @@ func (v *PrefixAuthVerifier) Verify(token, binding []byte) bool {
 	if !found {
 		return false
 	}
-	var k replayKey
-	copy(k[:], nonce)
-	return v.cache.add(k, at, cur-v.skew)
+	return v.cache.checkAt(nonce, at*v.slot*1000, v.now().UnixMilli()) == ReplayFresh
 }
 
 // Decide is an Admission.Decide that accepts a carrier whose prefix is a

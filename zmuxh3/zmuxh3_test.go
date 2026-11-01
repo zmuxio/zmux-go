@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -226,7 +227,7 @@ func TestUpgradeFailureCounted(t *testing.T) {
 	r, _ := http.NewRequest(http.MethodGet, "https://localhost/", nil)
 	r.RemoteAddr = "192.0.2.1:443"
 	h.ServeHTTP(&discardWriter{h: http.Header{}}, r)
-	if st := lst.Stats(); st != (zmux.ListenerStats{SetupFailures: 1}) {
+	if st := lst.Stats(); !reflect.DeepEqual(st, zmux.ListenerStats{SetupFailures: 1}) {
 		t.Fatalf("stats %+v", st)
 	}
 }

@@ -12,6 +12,9 @@ type ShapedPipe struct {
 	// WriteOverhead is the pipe's PipeIO.WriteOverhead: the fixed number
 	// of bytes each carrier write adds below the pipe.
 	WriteOverhead int
+	// Variant is the pipe's PipeIO.Variant, so that a factory can choose a
+	// policy per transform.
+	Variant string
 }
 
 // ShaperFactory returns the Shaper of an outbound pipe; nil: the pipe is
@@ -20,14 +23,24 @@ type ShapedPipe struct {
 // sessions.
 type ShaperFactory func(ShapedPipe) shaping.Shaper
 
-// coreFactory adapts f to the core, which keeps a pipe's kind opaque.
-func coreFactory(f ShaperFactory) func(uint64, uint8, int) shaping.Shaper {
+// coreFactory adapts f to the core, which keeps a pipe's kind opaque; the
+// core calls it under the session lock.
+func (c *Conn) coreFactory(f ShaperFactory) func(uint64, uint8, int) shaping.Shaper {
 	if f == nil {
 		return nil
 	}
 	return func(id uint64, kind uint8, overhead int) shaping.Shaper {
-		return f(ShapedPipe{ID: id, Carrier: CarrierKind(kind), WriteOverhead: overhead})
+		return f(ShapedPipe{ID: id, Carrier: CarrierKind(kind), WriteOverhead: overhead, Variant: c.variantLocked(id)})
 	}
+}
+
+// variantLocked is the PipeIO.Variant of pipe id's carrier ("" for none
+// or a reservation without its carrier).
+func (c *Conn) variantLocked(id uint64) string {
+	if pd := c.pipes[id]; pd != nil {
+		return pd.hc.io.Variant
+	}
+	return ""
 }
 
 // SetShaper installs f on every outbound pipe of the session, replacing
@@ -42,7 +55,7 @@ func coreFactory(f ShaperFactory) func(uint64, uint8, int) shaping.Shaper {
 func (c *Conn) SetShaper(f ShaperFactory) {
 	c.lock()
 	defer c.unlock()
-	c.s.SetShaper(coreFactory(f))
+	c.s.SetShaper(c.coreFactory(f))
 }
 
 // SetPipeShaper installs s on one outbound pipe until the next SetShaper;

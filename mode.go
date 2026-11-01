@@ -89,6 +89,7 @@ func (o CandidateOutcome) String() string {
 // CandidateResult is the outcome of one try of a candidate.
 type CandidateResult struct {
 	Kind    CarrierKind
+	Variant string // the candidate's Variant
 	Outcome CandidateOutcome
 	// Joined is set for a try as a further pipe of the established session.
 	Joined bool
@@ -110,6 +111,12 @@ type Candidate struct {
 	// server in ModePolicy.Cache, and starts it at the base URL again
 	// after a failure.
 	Target *HTTPTarget
+	// Variant labels a transform the candidate's carriers run (PipeIO.Variant,
+	// which DialMode sets on what Dial returns when it is not ""). A kind
+	// with different variants makes different candidates, each with its
+	// own CarrierCache entry; DialMode orders them as for different kinds,
+	// so that the host states its preference by their order.
+	Variant string
 
 	// join joins a carrier of the kind to c, for a kind whose Dial does
 	// not open a carrier that can join (a split bootstrap); nil: AddPipe
@@ -266,15 +273,39 @@ type CarrierCache struct {
 }
 
 type cacheKey struct {
-	key  string
-	kind CarrierKind
+	key     string
+	kind    CarrierKind
+	variant string
 }
+
+func candKey(key string, c Candidate) cacheKey { return cacheKey{key, c.Kind, c.Variant} }
 
 type cacheEntry struct {
 	goodUntil time.Time
 	failUntil time.Time
 	backoff   time.Duration
 	url       string // where redirects led the usable kind ("": its base)
+}
+
+// CacheOutcome is what a host learnt of a candidate (CarrierCache.Report).
+type CacheOutcome uint8
+
+const (
+	// CacheUsable: the candidate worked, as a chosen one does.
+	CacheUsable CacheOutcome = iota
+	// CacheFailed: an ordinary failure; the backoff doubles.
+	CacheFailed
+	// CacheRejected: a definite verdict, such as a binding check that
+	// proves the path unsuitable; the candidate is skipped for
+	// BackoffMax.
+	CacheRejected
+)
+
+// Report records an outcome the host learnt after DialMode for the
+// candidate of kind and variant under key (the ModePolicy.Key in use),
+// in the entry DialMode's own outcomes use. Safe for concurrent use.
+func (cc *CarrierCache) Report(key string, kind CarrierKind, variant string, o CacheOutcome) {
+	cc.update(cacheKey{key, kind, variant}, nil, o, time.Now())
 }
 
 // prime starts cand's target at the URL the cache remembers for it.
@@ -284,7 +315,7 @@ func (cc *CarrierCache) prime(key string, cand Candidate) {
 	}
 	cc.mu.Lock()
 	var u string
-	if e := cc.m[cacheKey{key, cand.Kind}]; e != nil {
+	if e := cc.m[candKey(key, cand)]; e != nil {
 		u = e.url
 	}
 	cc.mu.Unlock()
@@ -294,10 +325,10 @@ func (cc *CarrierCache) prime(key string, cand Candidate) {
 }
 
 // state reports what the cache knows of kind under key at now.
-func (cc *CarrierCache) state(key string, kind CarrierKind, now time.Time) (good bool, failUntil time.Time) {
+func (cc *CarrierCache) state(key string, cand Candidate, now time.Time) (good bool, failUntil time.Time) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-	e := cc.m[cacheKey{key, kind}]
+	e := cc.m[candKey(key, cand)]
 	if e == nil {
 		return false, time.Time{}
 	}
@@ -310,31 +341,46 @@ func (cc *CarrierCache) state(key string, kind CarrierKind, now time.Time) (good
 // record records the outcome of cand under key; for a kind with a target,
 // a usable one's URL, and a failed one starts at its base URL again.
 func (cc *CarrierCache) record(key string, cand Candidate, ok bool, now time.Time) {
-	kind := cand.Kind
+	o := CacheFailed
+	if ok {
+		o = CacheUsable
+	}
+	cc.update(candKey(key, cand), cand.Target, o, now)
+}
+
+// update applies o to the entry of k; target, when known, is the
+// candidate's.
+func (cc *CarrierCache) update(k cacheKey, target *HTTPTarget, o CacheOutcome, now time.Time) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	if cc.m == nil {
 		cc.m = map[cacheKey]*cacheEntry{}
 	}
-	k := cacheKey{key, kind}
 	e := cc.m[k]
 	if e == nil {
 		e = &cacheEntry{}
 		cc.m[k] = e
 	}
-	if ok {
+	if o == CacheUsable {
+		url := e.url
 		*e = cacheEntry{goodUntil: now.Add(cc.successTTL())}
-		if cand.Target != nil && cand.Target.URL() != cand.Target.Base() {
-			e.url = cand.Target.URL()
+		switch {
+		case target != nil && target.URL() != target.Base():
+			e.url = target.URL()
+		case target == nil:
+			e.url = url // a report keeps what redirects found
 		}
 		return
 	}
 	e.url = ""
-	if cand.Target != nil {
-		cand.Target.Reset()
+	if target != nil {
+		target.Reset()
 	}
 	lo, hi := cc.backoffBounds()
 	e.backoff = min(max(2*e.backoff, lo), hi)
+	if o == CacheRejected {
+		e.backoff = hi
+	}
 	e.goodUntil, e.failUntil = time.Time{}, now.Add(e.backoff)
 }
 
@@ -398,6 +444,7 @@ type cacheSnapshotEntry struct {
 	FailUntil string `json:"fail_until,omitempty"`
 	BackoffMS int64  `json:"backoff_ms,omitempty"`
 	URL       string `json:"url,omitempty"`
+	Variant   string `json:"variant,omitempty"`
 }
 
 func formatCacheTime(t time.Time) string {
@@ -436,11 +483,11 @@ func (cc *CarrierCache) Snapshot() ([]byte, error) {
 		}
 		snap.Entries = append(snap.Entries, cacheSnapshotEntry{Key: k.key, Kind: k.kind.String(),
 			GoodUntil: formatCacheTime(e.goodUntil), FailUntil: formatCacheTime(e.failUntil),
-			BackoffMS: e.backoff.Milliseconds(), URL: e.url})
+			BackoffMS: e.backoff.Milliseconds(), URL: e.url, Variant: k.variant})
 	}
 	cc.mu.Unlock()
 	slices.SortFunc(snap.Entries, func(a, b cacheSnapshotEntry) int {
-		return cmp.Or(strings.Compare(a.Key, b.Key), strings.Compare(a.Kind, b.Kind))
+		return cmp.Or(strings.Compare(a.Key, b.Key), strings.Compare(a.Kind, b.Kind), strings.Compare(a.Variant, b.Variant))
 	})
 	return json.Marshal(snap)
 }
@@ -495,7 +542,7 @@ func (cc *CarrierCache) Restore(data []byte) error {
 		if e.expired(now, hi) {
 			continue
 		}
-		k := cacheKey{se.Key, CarrierKind(i)}
+		k := cacheKey{se.Key, CarrierKind(i), se.Variant}
 		if o := m[k]; o == nil || e.newer(o) {
 			m[k] = e
 		}
@@ -587,7 +634,7 @@ func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn,
 			}
 			return nil, &ModeError{Results: []CandidateResult{res}}
 		}
-		c.reportCarrier(cand.Kind, []CandidateResult{res}, true)
+		c.reportCarrier(cand, []CandidateResult{res}, true)
 		return c, nil
 	}
 	mp, err := newModePool(m, pol, cred)
@@ -618,7 +665,7 @@ func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn,
 		if c == nil {
 			continue
 		}
-		c.reportCarrier(cand.Kind, results, true)
+		c.reportCarrier(cand, results, true)
 		chosen := time.Now()
 		if join && c.ConnectionState().Multipath {
 			pipe0, _ := c.Pipe(0)
@@ -640,20 +687,21 @@ func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn,
 }
 
 // validate checks that m has candidates, each with a kind and a Dial, and
-// no kind twice.
+// no kind and variant twice.
 func (m Mode) validate() error {
 	if len(m.candidates) == 0 {
 		return fmt.Errorf("%w: a Mode without a candidate", ErrInvalidConfig)
 	}
-	var kinds [256]bool
+	seen := map[cacheKey]bool{}
 	for _, c := range m.candidates {
 		if c.Dial == nil || c.Kind == 0 {
 			return fmt.Errorf("%w: candidate without a kind or Dial", ErrInvalidConfig)
 		}
-		if kinds[c.Kind] {
-			return fmt.Errorf("%w: two candidates of kind %v", ErrInvalidConfig, c.Kind)
+		k := candKey("", c)
+		if seen[k] {
+			return fmt.Errorf("%w: two candidates of kind %v and variant %q", ErrInvalidConfig, c.Kind, c.Variant)
 		}
-		kinds[c.Kind] = true
+		seen[k] = true
 	}
 	return nil
 }
@@ -663,7 +711,7 @@ func (m Mode) validate() error {
 // carrier, else the last.
 func baseCandidate(cands []Candidate, order []int, p *modeParams, now time.Time) int {
 	for _, i := range order {
-		if good, _ := p.cache.state(p.key, cands[i].Kind, now); good {
+		if good, _ := p.cache.state(p.key, cands[i], now); good {
 			return i
 		}
 	}
@@ -706,12 +754,15 @@ func (c Candidate) dial(ctx context.Context, cred Credential) (PipeIO, error) {
 	p, err := c.Dial(ctx, cred)
 	if err == nil {
 		p.Carrier = c.Kind
+		if c.Variant != "" {
+			p.Variant = c.Variant
+		}
 	}
 	return p, err
 }
 
 func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Credential, p *modeParams) (*Conn, CandidateResult) {
-	res := CandidateResult{Kind: cand.Kind}
+	res := CandidateResult{Kind: cand.Kind, Variant: cand.Variant}
 	life, cancel, stop := candidateLife(ctx, cfg.handshakeTimeout())
 	t0 := time.Now()
 	pio, err := cand.dial(life, cred)
@@ -765,7 +816,7 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Crede
 // candidate's timer; ctx bounds the attempt, and the carriers then live
 // until the session ends.
 func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred Credential, p *modeParams, o PipeOptions) ([]*Pipe, CandidateResult) {
-	res := CandidateResult{Kind: cand.Kind, Joined: true}
+	res := CandidateResult{Kind: cand.Kind, Variant: cand.Variant, Joined: true}
 	life, cancel, stop := candidateLife(ctx, c.cfg.handshakeTimeout())
 	var pipes []*Pipe
 	var err error
@@ -848,7 +899,7 @@ func newModePool(m Mode, pol *ModePolicy, cred Credential) (*modePool, error) {
 func (mp *modePool) usable(now time.Time) []int {
 	order := make([]int, 0, len(mp.cands))
 	for i, c := range mp.cands {
-		if _, until := mp.p.cache.state(mp.p.key, c.Kind, now); until.IsZero() {
+		if _, until := mp.p.cache.state(mp.p.key, c, now); until.IsZero() {
 			order = append(order, i)
 		}
 	}
@@ -876,7 +927,7 @@ func (mp *modePool) better(cur int, now time.Time) int {
 		return -1
 	}
 	for i := range cur {
-		if _, until := mp.p.cache.state(mp.p.key, mp.cands[i].Kind, now); until.IsZero() {
+		if _, until := mp.p.cache.state(mp.p.key, mp.cands[i], now); until.IsZero() {
 			return i
 		}
 	}
@@ -891,7 +942,7 @@ func (mp *modePool) join(ctx context.Context, c *Conn, i int, o PipeOptions) ([]
 		mp.p.cache.prime(mp.p.key, cand)
 	}
 	pipes, res := joinCandidate(ctx, c, cand, mp.cred, &mp.p, o)
-	c.reportCarrier(cand.Kind, []CandidateResult{res}, false)
+	c.reportCarrier(cand, []CandidateResult{res}, false)
 	if pipes == nil {
 		mp.record(i, false)
 		return nil, res.Err
@@ -909,12 +960,12 @@ func (mp *modePool) record(i int, ok bool) {
 // carrier when it is not already.
 func (mp *modePool) established(c *Conn, i int) {
 	mp.record(i, true)
-	k := mp.cands[i].Kind
+	cand := mp.cands[i]
 	c.lock()
-	cur := c.carrier
+	cur, curV := c.carrier, c.carrierVariant
 	c.unlock()
-	if cur != k {
-		c.reportCarrier(k, nil, true)
+	if cur != cand.Kind || curV != cand.Variant {
+		c.reportCarrier(cand, nil, true)
 	}
 }
 
@@ -958,7 +1009,7 @@ func (c *Conn) unwatchPipes(sig *core.Signal) {
 
 // reportCarrier records the results of tries and, with chosen, the choice
 // of kind, as events and in the statistics.
-func (c *Conn) reportCarrier(kind CarrierKind, results []CandidateResult, chosen bool) {
+func (c *Conn) reportCarrier(cand Candidate, results []CandidateResult, chosen bool) {
 	c.lock()
 	defer c.unlock()
 	q := &c.events
@@ -967,13 +1018,13 @@ func (c *Conn) reportCarrier(kind CarrierKind, results []CandidateResult, chosen
 			c.carrierTries = append(c.carrierTries[:0], c.carrierTries[1:]...)
 		}
 		c.carrierTries = append(c.carrierTries, r)
-		ev := Event{Kind: EventCarrierCandidate, Carrier: r.Kind, Outcome: r.Outcome}
+		ev := Event{Kind: EventCarrierCandidate, Carrier: r.Kind, Variant: r.Variant, Outcome: r.Outcome}
 		q.push(ev)
 		c.hk.trace(traceItem{ev: ev})
 	}
 	if chosen {
-		c.carrier = kind
-		ev := Event{Kind: EventCarrierChosen, Carrier: kind}
+		c.carrier, c.carrierVariant = cand.Kind, cand.Variant
+		ev := Event{Kind: EventCarrierChosen, Carrier: cand.Kind, Variant: cand.Variant}
 		q.push(ev)
 		c.hk.trace(traceItem{ev: ev})
 	}

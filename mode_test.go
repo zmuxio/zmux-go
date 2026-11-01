@@ -262,13 +262,13 @@ func TestDialModeCache(t *testing.T) {
 	if st := c.ConnectionStats(); st.Carrier != CarrierStreaming {
 		t.Fatalf("pass-through: %v", kinds(st.CarrierCandidates))
 	}
-	if good, _ := cache.state(pol.Key, CarrierStreaming, time.Now()); !good {
+	if good, _ := cache.state(pol.Key, Candidate{Kind: CarrierStreaming}, time.Now()); !good {
 		t.Fatal("streaming not cached as usable")
 	}
 	pass.CloseClientConnections()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		if _, until := cache.state(pol.Key, CarrierStreaming, time.Now()); !until.IsZero() {
+		if _, until := cache.state(pol.Key, Candidate{Kind: CarrierStreaming}, time.Now()); !until.IsZero() {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -359,7 +359,7 @@ func TestModeBookkeepingBounded(t *testing.T) {
 	for i := range 100 {
 		tries = append(tries, CandidateResult{Kind: CarrierKind(i)})
 	}
-	c.reportCarrier(0, tries, false)
+	c.reportCarrier(Candidate{}, tries, false)
 	got := c.ConnectionStats().CarrierCandidates
 	if len(got) != carrierTriesKept || got[0].Kind != CarrierKind(100-carrierTriesKept) || got[len(got)-1].Kind != 99 {
 		t.Fatalf("%d tries kept, from %v", len(got), got[0].Kind)
@@ -383,7 +383,7 @@ func waitCached(t *testing.T, cc *CarrierCache, key string, kind CarrierKind, go
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		g, until := cc.state(key, kind, time.Now())
+		g, until := cc.state(key, Candidate{Kind: kind}, time.Now())
 		if good && g || !good && !until.IsZero() {
 			return
 		}
@@ -557,16 +557,16 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 	if err := re.Restore(data); err != nil {
 		t.Fatal(err)
 	}
-	if _, until := re.state("k", CarrierStreaming, now); until.Sub(now.Add(2*time.Minute)).Abs() > time.Millisecond {
+	if _, until := re.state("k", Candidate{Kind: CarrierStreaming}, now); until.Sub(now.Add(2*time.Minute)).Abs() > time.Millisecond {
 		t.Fatalf("restored backoff until %v", until)
 	}
-	if good, _ := re.state("k2", CarrierStreaming, now); !good {
+	if good, _ := re.state("k2", Candidate{Kind: CarrierStreaming}, now); !good {
 		t.Fatal("usable entry not restored")
 	}
-	if _, ok := re.m[cacheKey{"old", CarrierSplit}]; ok {
+	if _, ok := re.m[cacheKey{"old", CarrierSplit, ""}]; ok {
 		t.Fatal("expired entry restored")
 	}
-	if e := re.m[cacheKey{"k", CarrierStreaming}]; e.backoff != 2*time.Minute {
+	if e := re.m[cacheKey{"k", CarrierStreaming, ""}]; e.backoff != 2*time.Minute {
 		t.Fatalf("backoff %v", e.backoff)
 	}
 	fresh := StreamingCandidate(http.DefaultClient, "https://a.example/z", nil)
@@ -576,7 +576,7 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 	}
 	// The restored backoff doubles on the next failure.
 	re.record("k", st, false, now)
-	if e := re.m[cacheKey{"k", CarrierStreaming}]; e.backoff != 4*time.Minute {
+	if e := re.m[cacheKey{"k", CarrierStreaming, ""}]; e.backoff != 4*time.Minute {
 		t.Fatalf("backoff after restore %v", e.backoff)
 	}
 
@@ -598,13 +598,13 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 	if len(lc.m) != 3 {
 		t.Fatalf("restored %d entries", len(lc.m))
 	}
-	if good, _ := lc.state("k", CarrierSplit, now); !good {
+	if good, _ := lc.state("k", Candidate{Kind: CarrierSplit}, now); !good {
 		t.Fatal("split not restored")
 	}
-	if e := lc.m[cacheKey{"k", CarrierExchange}]; e == nil || e.backoff != time.Minute {
+	if e := lc.m[cacheKey{"k", CarrierExchange, ""}]; e == nil || e.backoff != time.Minute {
 		t.Fatal("backoff history not restored")
 	}
-	if e := lc.m[cacheKey{"d", CarrierQUIC}]; e == nil || e.backoff != time.Minute {
+	if e := lc.m[cacheKey{"d", CarrierQUIC, ""}]; e == nil || e.backoff != time.Minute {
 		t.Fatalf("duplicate entry %+v", e)
 	}
 	// Merge: an older entry does not replace a newer one, a newer does.
@@ -613,17 +613,17 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 	if err := lc.Restore([]byte(older)); err != nil {
 		t.Fatal(err)
 	}
-	if good, _ := lc.state("k", CarrierSplit, now); !good {
+	if good, _ := lc.state("k", Candidate{Kind: CarrierSplit}, now); !good {
 		t.Fatal("an older entry replaced a newer one")
 	}
-	if good, _ := lc.state("n", CarrierWebSocket, now); !good || len(lc.m) != 4 {
+	if good, _ := lc.state("n", Candidate{Kind: CarrierWebSocket}, now); !good || len(lc.m) != 4 {
 		t.Fatal("new entry not merged")
 	}
 	newer := `{"version":1,"entries":[{"key":"k","kind":"split","fail_until":"` + later + `","backoff_ms":60000}]}`
 	if err := lc.Restore([]byte(newer)); err != nil {
 		t.Fatal(err)
 	}
-	if good, _ := lc.state("k", CarrierSplit, now); good {
+	if good, _ := lc.state("k", Candidate{Kind: CarrierSplit}, now); good {
 		t.Fatal("a newer entry did not replace an older one")
 	}
 	for _, bad := range []string{`{"version":2,"entries":[]}`, `{"entries":[]}`, `not json`,
@@ -637,7 +637,7 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 			t.Fatalf("restored %s: %v", bad, err)
 		}
 	}
-	if len(lc.m) != 4 || lc.m[cacheKey{"z", CarrierSplit}] != nil {
+	if len(lc.m) != 4 || lc.m[cacheKey{"z", CarrierSplit, ""}] != nil {
 		t.Fatal("a rejected snapshot changed the cache")
 	}
 }
