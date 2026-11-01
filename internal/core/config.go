@@ -69,7 +69,7 @@ type Config struct {
 	ProbeJitter   float64 // 0 <= j < 1 (MULTIPATH.md 7.1); 0: a fixed schedule
 
 	PSK      []byte
-	Exporter []byte // TLS exporter of pipe 0 (E flag asserted by the application)
+	Exporter []byte // exporter of pipe 0's innermost end-to-end handshake (E flag)
 
 	// EarlyRemembered are the peer parameters remembered from an earlier
 	// session: a client sends early streams in carrier early data under

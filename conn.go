@@ -309,7 +309,7 @@ func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 // the listener that owns it, if any, and admitted the admission value of
 // its bootstrap carrier.
 func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted any) (*Conn, error) {
-	if cfg.PipeAuth.TLS {
+	if cfg.PipeAuth.Exporter {
 		exp, err := sessionExporter(p, lst == nil && cc.TransportRole == core.RoleInitiator)
 		if err != nil {
 			return nil, err
@@ -360,18 +360,14 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 	return c, nil
 }
 
-// sessionExporter is the exporter value of PipeAuth.TLS (MULTIPATH.md
+// sessionExporter is the exporter value of PipeAuth.Exporter (MULTIPATH.md
 // 10.2): from pipe 0's carrier, or for a split bootstrap whose halves are
 // two TLS connections the uplink's exporter followed by the downlink's.
 func sessionExporter(p PipeIO, initiator bool) ([]byte, error) {
 	export := func(x any) ([]byte, bool, error) {
-		s, ok := x.(tlsStater)
+		st, ok := terminatedTLS(x)
 		if !ok {
-			return nil, false, nil
-		}
-		st := s.ConnectionState()
-		if !st.HandshakeComplete {
-			return nil, false, nil // TLS not terminated here: no exporter
+			return nil, false, nil // no handshake terminated here: no exporter
 		}
 		b, err := st.ExportKeyingMaterial(wire.ExporterSession, nil, 32)
 		if err != nil {
@@ -399,7 +395,7 @@ func sessionExporter(p PipeIO, initiator bool) ([]byte, error) {
 	case dok:
 		return d, nil
 	}
-	return nil, fmt.Errorf("%w: PipeAuth.TLS on a carrier without TLS", ErrInvalidConfig)
+	return nil, fmt.Errorf("%w: PipeAuth.Exporter on a carrier without TLS", ErrInvalidConfig)
 }
 
 // Dial connects to addr on the named network (as net.Dialer.DialContext)

@@ -909,7 +909,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, j *wire.Join, mac []byte,
 	if j.CarrierBound {
 		// A carrier without an exporter is never carrier-bound
 		// (MULTIPATH.md 10.5): refuse rather than verify an empty binding.
-		st, ok := carrierIsTLS(p)
+		st, ok := TerminatedTLS(p)
 		if !ok {
 			closePipeIO(p)
 			l.st.rejected.Add(1)

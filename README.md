@@ -129,7 +129,9 @@ case errors.Is(err, net.ErrClosed):
 
 Both endpoints set `MaxPipes` above 1 and a join secret; the server uses a
 `Listener`. The client adds pipes over other paths and follows them with
-`NextEvent`:
+`NextEvent`. The secret is `PipeAuth.PSK`, or `PipeAuth.Exporter`: the exporter
+of the innermost end-to-end handshake of the first pipe (today TLS that this
+process terminates).
 
 ```go
 cfg := &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: psk}}
@@ -208,7 +210,8 @@ gracefully; an aborted pipe closes the connection without one.
 A carrier exposes the TLS this process terminates beneath it
 (`ConnectionState`: the client's wss connection, the server's request
 TLS, shared by the WebSocket streams of one HTTP/2 connection), so
-`PipeAuth.TLS` and `CarrierBound` work over wss. Over ws, or behind a proxy
+`PipeAuth.Exporter` and `CarrierBound` work over wss (`zmux.TerminatedTLS`
+reports whether a carrier has such TLS). Over ws, or behind a proxy
 that terminates TLS, there is none and both fail. Only the exporter
 binding or a client that pins the server proves the TLS end to end.
 

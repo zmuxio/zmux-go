@@ -61,7 +61,7 @@ func echo(t *testing.T, c, s *zmux.Conn) {
 	}
 }
 
-func cfg() *zmux.Config { return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{TLS: true}} }
+func cfg() *zmux.Config { return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true}} }
 
 // pskCfg: HTTP request carriers expose no TLS exporter to the session.
 func pskCfg() *zmux.Config {

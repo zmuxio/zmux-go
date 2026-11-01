@@ -79,7 +79,7 @@ func PresentPipe(ctx context.Context, p PipeIO, c Credential) error {
 		}
 	}
 	info := &CarrierInfo{}
-	if cs, ok := carrierIsTLS(p); ok {
+	if cs, ok := TerminatedTLS(p); ok {
 		info.TLS = &cs
 	}
 	if ra, ok := p.W.(interface{ RemoteAddr() net.Addr }); ok && ra.RemoteAddr() != nil {

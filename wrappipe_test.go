@@ -16,7 +16,7 @@ import (
 // tlsWrapConfig is a session config whose join secret is pipe 0's TLS
 // exporter: a session starts only when both ends see the same TLS.
 func tlsWrapConfig() *Config {
-	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{TLS: true},
+	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true},
 		SchedulerParams: SchedulerParams{NoProbation: true}}
 }
 

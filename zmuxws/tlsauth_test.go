@@ -12,12 +12,12 @@ import (
 )
 
 func tlsAuthConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{TLS: true}}
+	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true}}
 }
 
-// Over wss both ends have the TLS exporter: a session with PipeAuth.TLS
+// Over wss both ends have the TLS exporter: a session with PipeAuth.Exporter
 // starts, and a carrier-bound pipe joins it.
-func TestPipeAuthTLS(t *testing.T) {
+func TestPipeAuthExporter(t *testing.T) {
 	ctx := testContext(t)
 	l := zmux.NewListener(&zmux.ListenerConfig{Config: tlsAuthConfig()})
 	h, err := Handler(l, nil)
@@ -55,9 +55,9 @@ func TestPipeAuthTLS(t *testing.T) {
 	closeBoth(c, s)
 }
 
-// Over plain ws there is no TLS terminated here: PipeAuth.TLS fails to
+// Over plain ws there is no TLS terminated here: PipeAuth.Exporter fails to
 // start rather than bind to nothing.
-func TestPipeAuthTLSPlain(t *testing.T) {
+func TestPipeAuthExporterPlain(t *testing.T) {
 	ctx := testContext(t)
 	l := zmux.NewListener(&zmux.ListenerConfig{Config: tlsAuthConfig()})
 	u := server(t, l, nil)
@@ -65,7 +65,7 @@ func TestPipeAuthTLSPlain(t *testing.T) {
 		if c != nil {
 			_ = c.Close()
 		}
-		t.Fatalf("PipeAuth.TLS over ws: %v", err)
+		t.Fatalf("PipeAuth.Exporter over ws: %v", err)
 	}
 	p, err := DialPipe(ctx, u, nil)
 	if err != nil {

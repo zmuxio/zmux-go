@@ -106,7 +106,7 @@
 // (zero is no resume). Errors are ErrInvalidConfig; NewListener panics.
 //
 // Multipath needs
-// MaxPipes above 1 and a PipeAuth (PSK or TLS); without a secret, joins
+// MaxPipes above 1 and a PipeAuth (PSK or Exporter); without a secret, joins
 // are possible only with PipeAuth.AllowInsecure, meant for tests and
 // protected networks.
 //

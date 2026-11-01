@@ -400,7 +400,7 @@ func (q *qStream) CarrierConn() any {
 }
 
 // ConnectionState exposes the connection's TLS state (the exporter of
-// PipeAuth.TLS and carrier-bound joins).
+// PipeAuth.Exporter and carrier-bound joins).
 func (q *qStream) ConnectionState() tls.ConnectionState {
 	qc, _ := q.cur()
 	return qc.ConnectionState().TLS

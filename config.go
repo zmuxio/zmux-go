@@ -284,16 +284,16 @@ type EarlyData struct {
 type PipeAuth struct {
 	// PSK is a pre-shared key of at least 16 bytes.
 	PSK []byte
-	// TLS asserts that pipe 0's TLS 1.3 handshake terminates at the peer:
-	// the join secret is derived from its exporter, read from the
-	// carrier's ConnectionState, as a TLS or a zmuxws WebSocket carrier
-	// has it. A carrier whose TLS this process does not terminate (none,
-	// or ended at a proxy) has no exporter, and the session fails to
-	// start. An intermediary that terminates TLS on both sides leaves the
-	// ends with different exporters, so that joins fail: the binding to
-	// the exporter, or a client that pins the server, is what proves the
-	// TLS end to end, not the presence of TLS.
-	TLS bool
+	// Exporter derives the join secret from the exporter of the innermost
+	// end-to-end handshake on pipe 0; today its source is TLS 1.3 that this
+	// process terminates (TerminatedTLS: a TLS, QUIC or zmuxws WebSocket
+	// carrier). A carrier without such a handshake (no TLS, or TLS ended
+	// at a proxy) has no exporter, and the session fails to start. An
+	// intermediary that terminates TLS on both sides leaves the ends with
+	// different exporters, so that joins fail: the binding to the
+	// exporter, or a client that pins the server, is what proves the
+	// handshake end to end, not the presence of TLS.
+	Exporter bool
 	// AllowInsecure allows joins without a secret (tests, protected
 	// networks). It must not be combined with PSK.
 	AllowInsecure bool
@@ -520,11 +520,11 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	}
 	cc.PSK = a.PSK
 	if cc.MaxPipes > 1 || cc.Resume > 0 {
-		if !a.TLS && len(a.PSK) == 0 && !a.AllowInsecure {
+		if !a.Exporter && len(a.PSK) == 0 && !a.AllowInsecure {
 			return cc, fmt.Errorf("%w: multipath needs PipeAuth", ErrInvalidConfig)
 		}
 		l.Has |= wire.HasMultipath
-		if a.TLS {
+		if a.Exporter {
 			l.SecretFlags |= wire.SecretExporter
 		}
 		if len(a.PSK) > 0 {

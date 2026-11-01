@@ -513,7 +513,7 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 	}
 	deadline := l.clk.Now().Add(adm.r.peekTimeout)
 	info := &CarrierInfo{Source: a.src, Peer: a.peer}
-	if cs, ok := carrierIsTLS(p); ok {
+	if cs, ok := TerminatedTLS(p); ok {
 		info.TLS = &cs
 	}
 	if adm.Peek > 0 && p.R != nil && p.Framing == FramingByteStream {

@@ -43,7 +43,7 @@ func tlsConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 }
 
 func mpConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{TLS: true}}
+	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true}}
 }
 
 type env struct {

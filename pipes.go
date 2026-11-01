@@ -179,7 +179,7 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
 	}
 	j.OOB = oob
 	if o.CarrierBound {
-		st, ok := carrierIsTLS(p)
+		st, ok := TerminatedTLS(p)
 		if !ok {
 			return nil, fmt.Errorf("%w: CarrierBound on a carrier without TLS", ErrInvalidConfig)
 		}

@@ -80,8 +80,9 @@ func WriteFlat(w io.Writer, bufs [][]byte) (int, error) {
 //   - interface{ CloseWrite() error } on W: graceful end of the write side;
 //   - interface{ ConnectionState() tls.ConnectionState }: the TLS that the
 //     carrier runs over and that this process terminates, for the exporters
-//     of PipeAuth.TLS and PipeOptions.CarrierBound and CarrierInfo.TLS; a
-//     state without HandshakeComplete is no TLS, so that these fail
+//     of PipeAuth.Exporter and PipeOptions.CarrierBound and CarrierInfo.TLS; a
+//     state without HandshakeComplete is no TLS, so that these fail (see
+//     TerminatedTLS)
 //     (records are built at 16382 bytes on a *tls.Conn);
 //   - interface{ CarrierConn() any } and interface{ OpenLane(ctx) (io.WriteCloser, error) }: lanes;
 //   - interface{ RestartEarly(ctx) (io.ReadWriteCloser, error) }: carrier early data.
@@ -222,12 +223,25 @@ func (h *halfCloser) closeAll(abort bool, cause error) {
 	})
 }
 
-func carrierIsTLS(p PipeIO) (tls.ConnectionState, bool) {
+// TerminatedTLS reports the TLS state of p's carrier when this process
+// completed its handshake (a TLS connection, a QUIC stream or a zmuxws
+// WebSocket over TLS terminated here): the source of the exporters of
+// PipeAuth.Exporter and PipeOptions.CarrierBound and of CarrierInfo.TLS.
+// It is false for a carrier without TLS, or whose TLS ends at a proxy.
+func TerminatedTLS(p PipeIO) (tls.ConnectionState, bool) {
 	for _, x := range []any{p.W, p.R} {
-		if s, ok := x.(tlsStater); ok {
-			if st := s.ConnectionState(); st.HandshakeComplete {
-				return st, true
-			}
+		if st, ok := terminatedTLS(x); ok {
+			return st, true
+		}
+	}
+	return tls.ConnectionState{}, false
+}
+
+// terminatedTLS is TerminatedTLS for one half of a pipe.
+func terminatedTLS(x any) (tls.ConnectionState, bool) {
+	if s, ok := x.(tlsStater); ok {
+		if st := s.ConnectionState(); st.HandshakeComplete {
+			return st, true
 		}
 	}
 	return tls.ConnectionState{}, false

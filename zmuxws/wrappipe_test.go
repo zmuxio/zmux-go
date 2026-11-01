@@ -26,7 +26,7 @@ func TestWrapPipeTLS(t *testing.T) {
 	ccfg := &tls.Config{RootCAs: roots, ServerName: "example.com", MinVersion: tls.VersionTLS13}
 
 	cfg := func() *zmux.Config {
-		return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{TLS: true},
+		return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true},
 			SchedulerParams: zmux.SchedulerParams{NoProbation: true}}
 	}
 	l := zmux.NewListener(&zmux.ListenerConfig{Config: cfg(),

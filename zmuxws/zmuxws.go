@@ -14,7 +14,7 @@
 //
 // A carrier has the state of the TLS beneath it that this process
 // terminates (ConnectionState): a client's wss connection, or the TLS
-// connection of a server's request (r.TLS), so that zmux.PipeAuth.TLS and
+// connection of a server's request (r.TLS), so that zmux.PipeAuth.Exporter and
 // zmux.PipeOptions.CarrierBound work over wss. The WebSocket streams of
 // one HTTP/2 connection (extended CONNECT) share its TLS and so its
 // exporters. Where TLS ends elsewhere (a ws URL, or a server behind a
