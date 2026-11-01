@@ -94,7 +94,9 @@ type HTTPExchangeConfig struct {
 	UpRequests int
 	// UpPieceSize is the largest UP piece the client sends, and the server's
 	// limit when above 1 MiB, the default limit of piece data a request may
-	// carry; a larger piece is answered with GONE, which fails the carrier.
+	// carry. A request whose Content-Length exceeds that limit plus the
+	// largest request header, after the body encoding, is not read: it goes
+	// to the fallback (Next) as a request that is not an exchange request.
 	// The default (DefaultExchangePieceSize) keeps every request body at
 	// most 1,000,000 bytes after the body encoding.
 	UpPieceSize int

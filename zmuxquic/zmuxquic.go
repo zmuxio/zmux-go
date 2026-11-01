@@ -4,7 +4,7 @@
 // datagrams of the connection (EXTENSIONS.md 6.8), the TLS exporter of the
 // connection authenticates joins, and a client may send its first streams
 // as replayable early data (SPEC.md 6.1.2). Native stream creation currently
-// waits for the QUIC handshake because of the pinned quic-go0-RTT race.
+// waits for the QUIC handshake because of the pinned quic-go 0-RTT race.
 package zmuxquic
 
 import (

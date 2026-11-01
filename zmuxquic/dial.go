@@ -71,7 +71,22 @@ func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *qui
 
 // handshakeReady is a temporary quic-go v0.64.1 boundary: opening native streams
 // during 0-RTT can race peer transport-parameter updates. Remove this barrier
-// only after the preserved upstream rejection reproducer passes under -race.
+// only after the preserved upstream rejection reproducer passes under -race:
+//
+//	go test -race -tags=quicgo_upstream_repro ./zmuxquic -run TestQuicGoUpstreamEarlyStreamRejection -count=20
+//
+// The reproducer bypasses this barrier and is not a supported path; the
+// default rejection test exercises the guarded adapter. The barrier gives up
+// native 0-RTT payload latency only: zmux replayable and resumed startup, TLS
+// validation, cancellation and socket ownership stay. It covers the default
+// dialers and borrowed connections passed to OpenPipe and Client; incoming
+// early data is unchanged. qStream.EarlyAccepted relies on it: every outgoing
+// stream is created as 1-RTT, so its bytes were not invalidated by a 0-RTT
+// rejection. When removing the barrier, decide the verdict per pipe for its
+// initial bytes together with stream opening (a connection-wide
+// Used0RTT=false does not mean that a pipe created as 1-RTT was rejected), and
+// test accepted and rejected resumption, and remembered zmux parameters
+// without a reusable TLS ticket.
 func handshakeReady(ctx context.Context, qc *quic.Conn) error {
 	if qc == nil {
 		return errors.New("zmuxquic: nil QUIC connection")

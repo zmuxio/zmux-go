@@ -98,6 +98,11 @@ for {
 gracefully while still taking their joins and resumptions, and then
 closes the listener; `l.Close()` refuses every carrier at once. `zmux.Server` serves a single connection without multipath.
 
+In `Config` and the other configuration structs, the zero value of a field
+selects its stated default, a negative timeout means no timeout, other
+negative values are invalid unless the field gives them a meaning, and the
+`Disable` and `No` fields switch features off.
+
 ## Closing
 
 `Conn.Close` ends the session at once and discards data not yet sent, unlike
@@ -139,8 +144,7 @@ nc, err := net.Dial("tcp", backupAddr)
 if err != nil {
 	return err
 }
-standby := true
-p, err := conn.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{Label: "backup", SendStandby: &standby})
+p, err := conn.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{Label: "backup", SendStandby: new(true)})
 if err != nil {
 	return err
 }
@@ -154,6 +158,17 @@ for {
 	}
 }
 ```
+
+The pointer fields of `PipeOptions` (`SendPriority`, `SendStandby`,
+`Weight`) are nil to follow the peer's request or the default; a set value,
+zero included, wins, so `Weight: new(uint64(0))` excludes the pipe from
+spreading. `Probation` is the base of a pipe's probation (zero: the
+session's `Config.SchedulerParams.Probation`, whose zero derives it from
+the RTT and the pipe's history); `NoProbation` turns it off, and both
+exist in `SchedulerParams` too. `PipeStats` reports per-pipe loss:
+`BytesLost` and `RecordsLost` when a pipe fails, `BytesRetransmitted` and
+`LossRate` from the carrier's own retransmissions; see the godoc for
+their exact definitions.
 
 ## WebSocket
 
@@ -261,6 +276,9 @@ ex, err := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk, Nex
 ws, err := zmuxws.Handler(l, &zmux.HTTPOptions{Next: site, Trusted: trusted})
 http.Handle("/zmux", &zmux.HTTPEndpoint{Stream: stream, Exchange: ex, WebSocket: ws, Next: site})
 ```
+
+Its `WebTransport` field takes a WebTransport handler such as
+`zmuxh3.Handler` for the WebTransport sessions served on the same target.
 
 **Choosing a carrier.** `DialMode` takes a mode: `ExplicitMode(c)` uses one
 kind and reports its failure as it is; `AutoMode(c...)` tries candidates in
@@ -412,11 +430,17 @@ byte-stream pipe.
 
 A split bootstrap (`HTTPSplitPipe`, `SplitCandidate`) holds its first half
 in a pairing slot until the other half arrives or the handshake timeout
-ends: 64 slots per listener and 8 per source (SPEC.md 6.1.1), counted by
+ends: 64 slots per listener and 8 per source ([SPEC.md 6.1.1](https://github.com/zmuxio/zmux-spec/blob/main/SPEC.md#611-pairing-a-split-bootstrap)), counted by
 the source that `MaxPendingPerSource` counts (an IPv6 client by its /64).
 Without an `Admission`, a few sources can keep those slots full and delay
 other clients' split bootstraps; serve a split bootstrap that the open
 Internet reaches with an `Admission`, such as `PrefixAuth`.
+
+`ListenerConfig.AnswerUnknownJoins` (off by default) answers an admitted
+join for a session this instance does not hold with `ZMUX_RESUME_FAILED`,
+so a suspended client fails at once instead of at its resume timeout.
+Leave it off where a load balancer can route a join to another instance
+with the same `InstanceID`.
 
 ## QUIC
 
@@ -425,10 +449,18 @@ conn, err := zmuxquic.Dial(ctx, "example.com:4433", tlsConf, nil, nil)
 ```
 
 On the server, `zmuxquic.Serve(ctx, ln, l, nil)` hands the streams of a QUIC
-listener to a `zmux.Listener`; `zmuxh3.Dial` and `zmuxh3.Serve` do the same
-for WebTransport sessions.
+listener to a `zmux.Listener`; `zmuxquic.ServeConn` serves one QUIC
+connection the caller already accepted or dialled, such as one made by hole
+punching. `zmuxh3.Dial` and `zmuxh3.Serve` do the same for WebTransport
+sessions.
 
-### Datagram channels
+The default dialer of `zmuxquic.Dial` and `NewPool` binds `udp4` or `udp6`
+by the destination's address family. Native QUIC 0-RTT streams are
+currently created only after the handshake completes; zmux's own
+replayable startup and resumption are not affected. A `quic.Conn` passed
+to `Client` or `OpenPipe` stays owned by the caller.
+
+## Datagram channels
 
 QUIC, HTTP/3 and WebTransport carriers have an unreliable datagram service
 of their own besides the stream that is the pipe. When both endpoints
@@ -438,7 +470,8 @@ delaying every later one behind the stream's retransmission. Nothing
 changes for the application: the same calls, sizes and queues; larger
 datagrams, pipes whose records are shaped, and peers without the channel
 use records. `ConnectionStats` counts the datagrams that went on channels
-(`DatagramsSentChannel`, `DatagramsReceivedChannel`).
+(`DatagramsSentChannel`, `DatagramsReceivedChannel`), and
+`zmuxquic.ChannelDropped` the QUIC datagrams that named no attached pipe.
 
 - QUIC: the connection's QUIC datagrams, each naming its pipe by stream
   ID, so several pipes and sessions share a connection. `QUICConfig`
@@ -454,7 +487,7 @@ A carrier of another kind offers its own channel by implementing
 `zmux.DatagramChannel` on a half of its `PipeIO`; `zmux.ChannelDemux`
 routes the datagrams of a connection shared by several pipes.
 
-### Pool policies
+## Pool policies
 
 `PipePool.Policy` and `CarrierPool.Policy` take a `zmux.PoolPolicy`.
 `machine.PoolPolicy` (package `shaping/machine`) builds one from JSON:
@@ -474,10 +507,16 @@ validation of definition values; times are in seconds.
 - `count` is rounded; below 1 it is 1.
 - `dial_after[k]` is the delay after the last dial when `k` dials in a
   row failed; the last entry applies to any higher number.
+- `dial_jitter`, 0 to below 1, shortens each `dial_after` wait by a random
+  fraction of up to it; it needs `dial_after`.
 - `retire` lists a member when one rule's metric is strictly greater than
   its threshold; members are listed in view order, each once. Metrics:
   `age`, `idle` (seconds), `pipes`, `bytes_sent`, `bytes_received`,
-  `bytes` (their sum).
+  `bytes` (their sum). A rule's `jitter`, 0 to below 1, lowers its
+  threshold by a random fraction of up to it, drawn once per member.
+- `probe_interval` is the probe interval of the pipes the pool dials; 0
+  turns their idle probes off. `probe_jitter`, 0 to below 1, is their probe
+  jitter and needs `probe_interval`.
 - Scopes: `each` (or none) draws at every decision, `shared` once per
   policy, `pipe` once per member ID while the member is in the view.
   `pipe` is accepted only in `retire` thresholds.
@@ -495,7 +534,10 @@ it. Pools decide again no later than `Recheck` (at least
 The package documentation and its examples cover datagrams, stream
 preambles and priorities, early data and its retry, splicing streams
 between sessions, lanes, nested sessions and the scheduler. The protocol
-is specified in the zmux specification repository.
+is specified in the [zmux specification repository](https://github.com/zmuxio/zmux-spec).
+
+`zmuxtest` is experimental test support (a misbehaving reverse proxy and a
+carrier-cutting relay), outside the API stability promise.
 
 ## Testing
 
@@ -510,36 +552,3 @@ order.
 ## License
 
 Apache-2.0
-
-### QUIC dial socket families
-
-The `zmuxquic.Dial` and `NewPool` default dialer bind UDP using the resolved
-destination's address family (`udp4` or `udp6`). This avoids a macOS dual-stack
-wildcard ephemeral-port collision with a local IPv4 listener. Hostname-based
-TLS verification and session-cache settings are preserved without modifying
-the caller's TLS configuration. The adapter owns these sockets and releases
-them after native connection shutdown, including 0-RTT rejection/continuation.
-Existing QUIC connections passed to `Client` remain caller-owned.
-
-Native QUIC 0-RTT stream creation is temporarily gated on handshake completion:
-quic-go0.64.1 can race a stream's initial flow-control setup against peer
-transport-parameter updates. This applies to default dialers and borrowed
-connections passed to `OpenPipe`/`Client`; incoming early-data handling remains.
-The workaround sacrifices native 0-RTT payload latency while preserving zmux
-replayable/resumed startup, TLS validation, cancellation and socket ownership.
-Remove the barrier after a dependency fix passes the preserved native
-rejection reproducer under the race detector. No dependency fork is embedded.
-
-To check whether an upstream update removes that limitation, explicitly run
-`go test -race -tags=quicgo_upstream_repro ./zmuxquic -run TestQuicGoUpstreamEarlyStreamRejection -count=20`.
-This dependency reproducer deliberately bypasses the adapter's handshake
-barrier and currently detects the upstream race; it is not a supported
-production path. The default rejection test exercises the guarded adapter.
-
-The guarded outgoing stream's carrier verdict is accepted once its handshake
-completes: its bytes were sent as 1-RTT and were not invalidated by a native
-0-RTT rejection. This avoids replaying the newly created bootstrap twice.
-When removing the temporary barrier, validate the verdict for this pipe's
-initial bytes alongside stream opening. A connection-global `Used0RTT=false`
-does not mean a pipe created as 1-RTT was rejected. Test accepted/rejected
-resumption and remembered zmux parameters without a reusable TLS ticket.
