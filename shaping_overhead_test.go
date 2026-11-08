@@ -141,7 +141,8 @@ func TestShapingWriteOverheadWrapPipe(t *testing.T) {
 		waitDone(t, s)
 		cancel()
 		_ = l.Close()
-		if herr := <-herr; herr != nil {
+		// The cancel above can reach HandlePipe before it returns.
+		if herr := <-herr; herr != nil && !errors.Is(herr, context.Canceled) {
 			t.Fatalf("HandlePipe: %v", herr)
 		}
 	}
