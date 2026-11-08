@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -395,7 +396,11 @@ func (w *wtStream) Close() error {
 	return err
 }
 
+// Abort fails both halves. A write parked on a WT_SESSION_GONE reset waits
+// for the session to end and ignores CancelWrite, so the write deadline is
+// what releases it.
 func (w *wtStream) Abort(error) {
+	_ = w.s.SetWriteDeadline(time.Unix(1, 0))
 	w.wOnce.Do(func() { w.s.CancelWrite(carrierFailed) })
 	w.rOnce.Do(func() { w.s.CancelRead(carrierFailed) })
 }
@@ -446,7 +451,10 @@ func (l *laneWriter) Close() error {
 	l.once.Do(func() { err = l.s.Close() })
 	return err
 }
-func (l *laneWriter) Abort(error) { l.once.Do(func() { l.s.CancelWrite(carrierFailed) }) }
+func (l *laneWriter) Abort(error) {
+	_ = l.s.SetWriteDeadline(time.Unix(1, 0)) // releases a write parked on WT_SESSION_GONE
+	l.once.Do(func() { l.s.CancelWrite(carrierFailed) })
+}
 
 type laneReader struct {
 	s    *webtransport.ReceiveStream
