@@ -60,13 +60,15 @@ func (c *connChannel) maxDatagram() int {
 	if last := c.probedAt.Load(); last != 0 && now-last < int64(sizeRefresh) {
 		return int(c.max.Load())
 	}
-	c.probedAt.Store(now)
 	st := c.qc.ConnectionState()
 	if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
 		c.max.Store(0)
 		return 0
 	}
 	c.learn(c.qc.SendDatagram(sizeProbe))
+	// The probe time is published after the maximum it produced, so a
+	// concurrent caller never reads a fresh time with a stale maximum.
+	c.probedAt.Store(now)
 	return int(c.max.Load())
 }
 

@@ -44,10 +44,11 @@ func (d *dgramSize) get(overhead int, probe func() error) int {
 	if last := d.probedAt.Load(); last != 0 && now-last < int64(sizeRefresh) {
 		return int(d.max.Load())
 	}
-	d.probedAt.Store(now)
 	if !d.learn(probe(), overhead) {
 		d.max.Store(0)
 	}
+	// After the result: a concurrent caller that sees a recent probe reads it.
+	d.probedAt.Store(now)
 	return int(d.max.Load())
 }
 
