@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -351,5 +352,18 @@ func TestChannelHandOff(t *testing.T) {
 			t.Fatalf("%d dropped, want at least %d", s.ConnectionStats().DatagramsDroppedRecv, s.chInMax)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// The channel of a read half stays visible behind the bytes classification
+// read back; the write half need not offer it.
+func TestChannelOfBehindPrefix(t *testing.T) {
+	a, _ := chanPair(t, 1200)
+	w := struct{ io.WriteCloser }{a}
+	for _, framing := range []Framing{FramingByteStream, FramingRecords} {
+		p := withPrefix(PipeIO{R: a, W: w, Framing: framing}, []byte{1})
+		if channelOf(p) == nil {
+			t.Fatalf("framing %v: channel lost", framing)
+		}
 	}
 }

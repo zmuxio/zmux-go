@@ -112,7 +112,7 @@ func channelOf(p PipeIO) DatagramChannel {
 	if ch, ok := p.W.(DatagramChannel); ok {
 		return ch
 	}
-	if ch, ok := p.R.(DatagramChannel); ok {
+	if ch, ok := unprefixed(p.R).(DatagramChannel); ok {
 		return ch
 	}
 	return nil
