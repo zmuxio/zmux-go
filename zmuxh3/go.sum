@@ -1,5 +1,3 @@
-github.com/djylb/netx v0.0.0-20261101155122-97a785ec6da4 h1:WvCD4rcuN2hOuS9keOcwG9Az54DfDU7ilAAcrSOGEBY=
-github.com/djylb/netx v0.0.0-20261101155122-97a785ec6da4/go.mod h1:8qOo/AF1/Xs8lttgM9zAeDNSPK+vtoMDppEbH6sQabY=
 github.com/djylb/netx v0.0.0-20261107123044-7640ba4c50af h1:7AftwubxQYl3SxbEVOEq0/LpPrZP20Hs+55YTsAM3d4=
 github.com/djylb/netx v0.0.0-20261107123044-7640ba4c50af/go.mod h1:8qOo/AF1/Xs8lttgM9zAeDNSPK+vtoMDppEbH6sQabY=
 github.com/djylb/timeshim v0.0.0-20261031100623-0e5ae6a85c7f h1:ApndOPGF7m6Byx+F399FGmNCOgLH6DDZgNyr8MXYokw=
@@ -16,8 +14,8 @@ github.com/quic-go/webtransport-go v0.13.0 h1:RJLrTUHlTj8jJaQlQJUy0z0Mf7u1fVM0I6
 github.com/quic-go/webtransport-go v0.13.0/go.mod h1:K83X9YHbAqgSLO6ikS6BXCMdWOvqh9JTHALulvb2JVk=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
-github.com/zmuxio/zmux-go v1.3.4 h1:rmwyH3EWp9Hl+oLuodTECSYU9lsh01LKcgHuGrolo1g=
-github.com/zmuxio/zmux-go v1.3.4/go.mod h1:SmDFcqquRfd5P/NfiOTSq96muehK4y/mgZ7aGoHHtOw=
+github.com/zmuxio/zmux-go v1.4.0 h1:3JxT5txIwLeooBiX3vra2781PfKlTCEtfrLP3uhZ7Ek=
+github.com/zmuxio/zmux-go v1.4.0/go.mod h1:enzA4U511yIYxAKyEmZDMKryYuzGqeVT0nF5uQRd650=
 go.uber.org/mock v0.5.2 h1:LbtPTcP8A5k9WPXj54PPPbjcI4Y6lhyOZXn+VS7wNko=
 go.uber.org/mock v0.5.2/go.mod h1:wLlUxC2vVTPTaE3UD51E0BGOAElKrILxhVSDYQLld5o=
 go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
