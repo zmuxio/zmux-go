@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
@@ -82,7 +83,7 @@ func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t
 	// verified response on, the carrier lives until it is closed.
 	c.ctx, c.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	c.setup = context.AfterFunc(ctx, c.cancel)
-	go c.run()
+	labels.Go(ctx, "exchange-client", func() { c.run() })
 	return PipeIO{R: &exClientReader{c}, W: &exClientWriter{c}, Carrier: CarrierExchange}, nil
 }
 
@@ -155,12 +156,14 @@ type exClient struct {
 	err     error     // the carrier failed
 	ended   bool      // run has stopped: no more requests
 	sentAny bool
-	gone    bool        // the server answered GONE
-	respHdr http.Header // the latest response's header
+	gone    bool // the server answered GONE
+	// The flags of the uplink and the downlink, kept with the others.
+	wclosed  bool // uplink: zmux closed the write side
+	finSeal  bool // uplink: the FIN piece is sealed
+	finKnown bool // downlink: fin is set
+	rclosed  bool // downlink: zmux closed the read side
 
 	// uplink
-	wclosed  bool   // zmux closed the write side
-	finSeal  bool   // the FIN piece is sealed
 	open     *exBuf // the piece being filled (nil: none)
 	openLen  int
 	openAt   time.Time // first byte of the open piece
@@ -179,8 +182,6 @@ type exClient struct {
 	downLimit int
 	rbuf      *exBuf // the piece the reader is consuming
 	rdata     []byte
-	finKnown  bool
-	rclosed   bool
 }
 
 // exReqState is one request number's retry state.
@@ -239,7 +240,7 @@ func (c *exClient) run() {
 		next, done := c.stepLocked(now, &launch)
 		c.mu.Unlock()
 		for _, a := range launch {
-			go c.attempt(a)
+			labels.Go(c.ctx, "exchange-attempt", func() { c.attempt(a) })
 		}
 		if done {
 			return
@@ -546,16 +547,12 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 		return req, nil
 	})
 	if err != nil {
-		var re *HTTPRedirectError
-		if errors.As(err, &re) {
+		if _, ok := errors.AsType[*HTTPRedirectError](err); ok {
 			// A redirect the carrier must not follow fails it.
 			res.ok, res.bad, res.err = true, true, err
 		}
 		return res
 	}
-	c.mu.Lock()
-	c.respHdr = resp.Header
-	c.mu.Unlock()
 	if f, perr := url.Parse(from); perr == nil && final.String() != from && SchemeUpgradeOf(f, final) {
 		up := tg.upgraded(final)
 		if c.ht != nil && tg == &c.target {
@@ -732,20 +729,6 @@ func (b *exBody) Close() error {
 
 // exClientReader is the downlink half.
 type exClientReader struct{ c *exClient }
-
-// header is a copy of the latest response's header, nil before one.
-func (c *exClient) header() http.Header {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.respHdr.Clone()
-}
-
-// ResponseHeader returns a copy of the latest response's header
-// (ResponseHeaderer); nil before one.
-func (r *exClientReader) ResponseHeader() http.Header { return r.c.header() }
-
-// ResponseHeader is the reader's (ResponseHeaderer).
-func (w *exClientWriter) ResponseHeader() http.Header { return w.c.header() }
 
 func (r *exClientReader) Read(p []byte) (int, error) {
 	c := r.c

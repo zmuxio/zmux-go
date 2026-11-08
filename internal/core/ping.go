@@ -5,7 +5,7 @@ import (
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// pingState is QX_PING (SPEC.md 4.5): at most one request outstanding, one
+// pingState is QX_PING: at most one request outstanding, one
 // response owed.
 type pingState struct {
 	next         uint64 // next request sequence number
@@ -165,7 +165,7 @@ func (s *Session) pingExpired() {
 	}
 }
 
-// ---- no-effect budget (SPEC.md 9.4) ----
+// ---- no-effect budget ----
 
 const (
 	budgetCap    = 4096

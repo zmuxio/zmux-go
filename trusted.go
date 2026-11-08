@@ -13,7 +13,7 @@ import (
 
 // TrustedProxies names the intermediaries in front of a server (reverse
 // proxies, load balancers, CDNs) whose report of a carrier's client
-// address is believed (MULTIPATH.md 5.6). The source of a carrier, which
+// address is believed. The source of a carrier, which
 // the admission sees as CarrierInfo.Source and the Listener counts in its
 // per-source limits, is then the client address the intermediary reports;
 // the same report from any other peer is ignored, so that a client cannot

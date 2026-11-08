@@ -43,20 +43,16 @@ func TestClassifyHTTP(t *testing.T) {
 		want HTTPClass
 	}{
 		{"websocket", req(http.MethodGet, map[string]string{"Upgrade": "WebSocket", "Connection": "Upgrade"}, nil, 0), HTTPClassWebSocket},
-		{"websocket with a join", req(http.MethodGet, map[string]string{"Upgrade": "websocket", HeaderJoin: "x"}, nil, 0), HTTPClassWebSocket},
 		{"extended connect websocket", h2ws, HTTPClassWebSocket},
 		{"webtransport", h3, HTTPClassWebTransport},
 		{"webtransport draft", h3draft, HTTPClassWebTransport},
 		{"other webtransport-*", h3other, HTTPClassNone},
 		{"downlink pair", req(http.MethodGet, map[string]string{HeaderPair: "x"}, nil, 0), HTTPClassDownlink},
-		{"downlink join", req(http.MethodGet, map[string]string{HeaderJoin: "x"}, nil, 0), HTTPClassDownlink},
 		{"plain get", req(http.MethodGet, nil, nil, 0), HTTPClassNone},
 		{"split uplink", req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, -1), HTTPClassUplink},
 		{"split uplink with a length", req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, 1), HTTPClassUplink},
 		{"exchange", req(http.MethodPost, nil, body, 1), HTTPClassExchange},
-		{"exchange with a join", req(http.MethodPost, map[string]string{HeaderJoin: "x"}, body, 1), HTTPClassExchange},
 		{"bidirectional", req(http.MethodPost, nil, body, -1), HTTPClassBidirectional},
-		{"join uplink", req(http.MethodPost, map[string]string{HeaderJoin: "x"}, body, -1), HTTPClassUplink},
 		{"put", req(http.MethodPut, nil, body, -1), HTTPClassNone},
 		{"plain connect", req(http.MethodConnect, nil, nil, -1), HTTPClassNone},
 	} {
@@ -79,7 +75,7 @@ type unifiedEnv struct {
 
 func newUnifiedEnv(t *testing.T, adm *Admission, trusted *TrustedProxies) *unifiedEnv {
 	t.Helper()
-	e := &unifiedEnv{lst: NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})}
+	e := &unifiedEnv{lst: mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})}
 	host := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -108,9 +104,10 @@ func newUnifiedEnv(t *testing.T, adm *Admission, trusted *TrustedProxies) *unifi
 }
 
 func (e *unifiedEnv) close() {
-	e.srv.Close()
+	// First what handlers may be waiting in: the server's Close waits for them.
 	_ = e.ex.Close()
 	_ = e.lst.Close()
+	e.srv.Close()
 }
 
 func (e *unifiedEnv) hostRequests() []string {
@@ -300,7 +297,7 @@ func TestHTTPTrustedSource(t *testing.T) {
 				}
 				return Decision{Verdict: VerdictFallback}
 			}}
-			lst := NewListener(&ListenerConfig{Admission: adm})
+			lst := mustNewListener(&ListenerConfig{Admission: adm})
 			defer func() { _ = lst.Close() }()
 			h, err := NewHTTPHandler(lst, &HTTPOptions{Trusted: c.trusted})
 			if err != nil {

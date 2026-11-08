@@ -3,6 +3,10 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -51,7 +55,7 @@ func TestMessageBatchWriter(t *testing.T) {
 	}
 	ch := make(chan res, 1)
 	go func() {
-		c, err := Start(ctx, PipeIO{R: by, W: by, Framing: FramingRecords}, RoleServer, mpConfig())
+		c, err := startServerNoListener(ctx, PipeIO{R: by, W: by, Framing: FramingRecords}, mpConfig())
 		ch <- res{c, err}
 	}()
 	c, err := Start(ctx, PipeIO{R: bx, W: bx, Framing: FramingRecords}, RoleClient, mpConfig())
@@ -71,3 +75,43 @@ func TestMessageBatchWriter(t *testing.T) {
 		}
 	}
 }
+
+// msgCarrier is one end of an in-memory message-framed carrier.
+type msgCarrier struct {
+	in, out chan []byte
+	once    *sync.Once
+	done    chan struct{}
+}
+
+func msgCarriers() (*msgCarrier, *msgCarrier) {
+	x, y, once, done := make(chan []byte, 8), make(chan []byte, 8), new(sync.Once), make(chan struct{})
+	return &msgCarrier{in: x, out: y, once: once, done: done}, &msgCarrier{in: y, out: x, once: once, done: done}
+}
+
+func (m *msgCarrier) ReadMessage() ([]byte, error) {
+	select {
+	case b := <-m.in:
+		return b, nil
+	case <-m.done:
+		select {
+		case b := <-m.in:
+			return b, nil
+		default:
+			return nil, io.EOF
+		}
+	}
+}
+
+func (m *msgCarrier) WriteMessage(p []byte) error {
+	select {
+	case <-m.done:
+		return net.ErrClosed
+	default:
+	}
+	m.out <- bytes.Clone(p)
+	return nil
+}
+
+func (m *msgCarrier) Read([]byte) (int, error)  { return 0, errors.New("message carrier") }
+func (m *msgCarrier) Write([]byte) (int, error) { return 0, errors.New("message carrier") }
+func (m *msgCarrier) Close() error              { m.once.Do(func() { close(m.done) }); return nil }

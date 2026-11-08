@@ -1,8 +1,8 @@
 package core
 
 // Liveness are the session's liveness settings: the keep-alive period
-// (SPEC.md 6.4; 0: off) and the failure detection and probes of the path
-// layer (MULTIPATH.md 7), with the values of Config.
+// (0: off) and the failure detection and probes of the path
+// layer, with the values of Config.
 type Liveness struct {
 	KeepAlive     Duration
 	SuspectFloor  Duration
@@ -50,7 +50,7 @@ func (s *Session) SetLiveness(l Liveness) {
 }
 
 // RaiseIncomingStreams raises the concurrency of the peer's streams of one
-// type to n (SPEC.md 8.5): MAX_STREAMS only grows, so an n at or below the
+// type to n: MAX_STREAMS only grows, so an n at or below the
 // current concurrency changes nothing. While unidirectional credit is
 // staged, n raises the target the first accept moves it to. After GOAWAY
 // the concurrency is recorded but no credit is sent. It reports whether
@@ -80,5 +80,5 @@ func (s *Session) RaiseIncomingStreams(bidi bool, n uint64) bool {
 	return true
 }
 
-// maxStreamCount is the largest MAX_STREAMS value (2^60, SPEC.md 8.5).
+// maxStreamCount is the largest MAX_STREAMS value (2^60).
 const maxStreamCount = 1 << 60

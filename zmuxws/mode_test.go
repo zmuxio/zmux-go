@@ -20,7 +20,7 @@ import (
 // the path passes is chosen.
 func TestDialModeProfiles(t *testing.T) {
 	psk := bytes.Repeat([]byte{3}, 32)
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig()})
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	stream, err := zmux.NewHTTPHandler(l, &zmux.HTTPOptions{Next: next})
 	if err != nil {
 		t.Fatal(err)

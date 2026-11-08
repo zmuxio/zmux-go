@@ -59,17 +59,17 @@ func TestAdmissionMore(t *testing.T) {
 	var calls sync.Map
 	var mu sync.Mutex
 	var variants []string
-	wrap := func(_ context.Context, p PipeIO, _ JoinHint) (PipeIO, error) {
+	wrap := func(_ context.Context, p PipeIO, _ PipeHint) (PipeIO, error) {
 		mu.Lock()
 		variants = append(variants, p.Variant)
 		mu.Unlock()
 		return PipeIO{R: p.R, W: p.W, Framing: p.Framing}, nil // the result keeps it
 	}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: classifyingAdmission(&calls), WrapPipe: wrap})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: classifyingAdmission(&calls), WrapPipe: WrapPipeFunc(wrap)})
 	defer func() { _ = lst.Close() }()
 	for i, header := range [][]byte{testHeader(), nil} {
 		a, b := net.Pipe()
-		go func() { _ = lst.HandlePipe(ctx, NetPipe(a), JoinHint{}) }()
+		go func() { _ = lst.HandlePipe(ctx, NetPipe(a), PipeHint{}) }()
 		if header != nil {
 			if _, err := b.Write(header); err != nil {
 				t.Fatal(err)
@@ -117,11 +117,11 @@ func admitOnce(t *testing.T, adm *Admission, p func() (PipeIO, func()), seen *[]
 		mu.Unlock()
 		return decide(ctx, info, prefix)
 	}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
 	defer func() { _ = lst.Close() }()
 	q, peer := p()
 	defer peer()
-	_ = lst.HandlePipe(context.Background(), q, JoinHint{})
+	_ = lst.HandlePipe(context.Background(), q, PipeHint{})
 	return lst.Stats().Admission, lst.VariantStats()
 }
 
@@ -300,7 +300,7 @@ func TestAdmissionMoreHTTP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var calls sync.Map
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: classifyingAdmission(&calls)})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: classifyingAdmission(&calls)})
 	defer func() { _ = lst.Close() }()
 	hh, err := NewHTTPHandler(lst, nil)
 	if err != nil {
@@ -431,7 +431,7 @@ func TestAdmissionPartialSkipCountedOnce(t *testing.T) {
 	adm := &Admission{Peek: 1, MaxPeek: 64, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
 		return Decision{Verdict: VerdictAccept, Skip: 3, Variant: "w"}
 	}}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
 	defer func() { _ = lst.Close() }()
 	stop := make(chan struct{})
 	bad := make(chan string, 1)
@@ -455,7 +455,7 @@ func TestAdmissionPartialSkipCountedOnce(t *testing.T) {
 	}()
 	for range 20 {
 		m := newFirstMsgCarrier(bytes.Repeat([]byte{1}, 40))
-		_ = lst.HandlePipe(context.Background(), PipeIO{R: m, W: m, Framing: FramingRecords}, JoinHint{})
+		_ = lst.HandlePipe(context.Background(), PipeIO{R: m, W: m, Framing: FramingRecords}, PipeHint{})
 		_ = m.Close()
 	}
 	close(stop)

@@ -2,11 +2,12 @@ package wire
 
 import (
 	"bytes"
+	"slices"
 
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// Transport parameter identifiers (REGISTRY.md Section 4).
+// Transport parameter identifiers.
 const (
 	ParamMaxIdleTimeout       uint64 = 0x01
 	ParamInitialMaxData       uint64 = 0x04
@@ -24,6 +25,7 @@ const (
 	ParamPriority             uint64 = 0x31e7139d
 	ParamDatagramFlows        uint64 = 0x0af391ed
 	ParamMultipath            uint64 = 0x30dc2978
+	ParamSessionCrypto        uint64 = 0x026f24b5
 	ParamAckThreshold         uint64 = 0x2762c7e5
 	ParamPipeAck              uint64 = 0x34b47621
 	ParamMaxAckDelay          uint64 = 0x17fa1ed6
@@ -40,11 +42,10 @@ const DefaultMaxRecordSize = 16382
 // accepts, and the largest it sends to a peer that accepts more.
 const MaxRecordSize = 65535
 
-// Secret flags of zmux_multipath (MULTIPATH.md 3.1).
+// Secret flags of zmux_multipath.
 const (
 	SecretExporter = 0x01
 	SecretPSK      = 0x04
-	SecretInsecure = 0x08
 )
 
 // Roles of zmux_role.
@@ -79,6 +80,7 @@ const (
 	HasResume
 	HasAppProtocols
 	HasCarrierDatagrams
+	HasSessionCrypto
 )
 
 // HasAnyZmux are the zmux parameters whose presence identifies a zmux peer.
@@ -87,8 +89,10 @@ const HasAnyZmux = HasRole | HasGoAway | HasPreamble | HasPriority | HasFlows | 
 
 // Params is a set of transport parameters.
 type Params struct {
-	Has                  uint32
-	SecretFlags          uint8
+	Has         uint32
+	SecretFlags uint8
+	// SessionCrypto is zmux_session_crypto: the Join Suites and Groups.
+	SessionCrypto        SessionCrypto
 	SessionNonce         [16]byte
 	MaxIdleTimeout       uint64 // ms
 	InitialMaxData       uint64
@@ -128,15 +132,14 @@ var paramBits = map[uint64]uint32{
 	ParamMaxStreamDataBidiRem: HasBidiRemote, ParamMaxStreamDataUni: HasUni, ParamMaxStreamsBidi: HasStreamsBidi,
 	ParamMaxStreamsUni: HasStreamsUni, ParamResetStreamAt: HasResetAt, ParamMaxDatagramFrameSize: HasDatagram,
 	ParamMaxRecordSize: HasRecordSize, ParamRole: HasRole, ParamGoAway: HasGoAway, ParamPreamble: HasPreamble,
-	ParamPriority: HasPriority, ParamDatagramFlows: HasFlows, ParamMultipath: HasMultipath,
+	ParamPriority: HasPriority, ParamDatagramFlows: HasFlows, ParamMultipath: HasMultipath, ParamSessionCrypto: HasSessionCrypto,
 	ParamAckThreshold: HasAckThreshold, ParamPipeAck: HasPipeAck, ParamMaxAckDelay: HasAckDelay,
 	ParamMaxLanes: HasLanes, ParamResume: HasResume, ParamAppProtocols: HasAppProtocols,
 	ParamCarrierDatagrams: HasCarrierDatagrams,
 }
 
-// DecodeParams decodes and validates a parameter block (SPEC.md 5.2-5.5,
-// MULTIPATH.md 3, RESUME.md 3, EXTENSIONS.md 2, 4.1). Unknown parameters are
-// ignored. It allocates only for the locator and application protocols.
+// DecodeParams decodes and validates a parameter block, those of
+// the extensions included. Unknown parameters are ignored. It allocates only for the locator and application protocols.
 func DecodeParams(b []byte, p *Params) *Error {
 	*p = Params{MaxRecordSize: DefaultMaxRecordSize}
 	// Duplicate detection: known parameters use the Has bits; unknown ones
@@ -159,10 +162,8 @@ func DecodeParams(b []byte, p *Params) *Error {
 			}
 			p.Has |= bit
 		} else {
-			for _, s := range seenUnknown {
-				if s == id {
-					return ErrParam("duplicate parameter")
-				}
+			if slices.Contains(seenUnknown, id) {
+				return ErrParam("duplicate parameter")
 			}
 			seenUnknown = append(seenUnknown, id)
 			continue
@@ -242,10 +243,15 @@ func (p *Params) decodeOne(id uint64, v []byte) *Error {
 		p.SecretFlags = v[0]
 		copy(p.SessionNonce[:], v[1:17])
 		ll := int(v[17])
-		if ll > 16 || len(v) != 18+ll {
+		if len(v) != 18+ll {
 			return ErrParam("zmux_multipath locator")
 		}
 		p.Locator = bytes.Clone(v[18:])
+	case ParamSessionCrypto:
+		var ok bool
+		if p.SessionCrypto, ok = DecodeSessionCrypto(v); !ok {
+			err = ErrParam("zmux_session_crypto")
+		}
 	case ParamAckThreshold:
 		p.AckThreshold, err = varintValue(v)
 		if err == nil && p.AckThreshold < 1024 {
@@ -286,6 +292,9 @@ func (p *Params) validate() *Error {
 	if p.Has&(HasAckThreshold|HasAckDelay|HasLanes) != 0 && !ackish {
 		return ErrParam("companion parameter without zmux_multipath or zmux_pipe_ack")
 	}
+	if (p.Has&HasSessionCrypto != 0) != (p.Has&HasMultipath != 0) {
+		return ErrParam("zmux_session_crypto and zmux_multipath go together")
+	}
 	if p.Has&HasResume != 0 && p.Has&HasMultipath == 0 {
 		return ErrParam("zmux_resume without zmux_multipath")
 	}
@@ -313,9 +322,13 @@ func appendVarintParam(b []byte, id, v uint64) []byte {
 	return varint.AppendVarint(b, v)
 }
 
-// AppendParams encodes the parameters present in p.Has.
-func AppendParams(b []byte, p *Params) []byte {
+// AppendParams encodes the parameters present in p.Has. A Locator beyond the 255
+// bytes its length field holds is an error.
+func AppendParams(b []byte, p *Params) ([]byte, *Error) {
 	h := p.Has
+	if h&HasMultipath != 0 && len(p.Locator) > 255 {
+		return nil, ErrParam("zmux_multipath locator over 255 bytes")
+	}
 	if h&HasIdle != 0 {
 		b = appendVarintParam(b, ParamMaxIdleTimeout, p.MaxIdleTimeout)
 	}
@@ -377,6 +390,7 @@ func AppendParams(b []byte, p *Params) []byte {
 		v = append(v, byte(len(p.Locator)))
 		v = append(v, p.Locator...)
 		b = appendParam(b, ParamMultipath, v)
+		b = appendParam(b, ParamSessionCrypto, p.SessionCrypto.Append(nil))
 	}
 	if h&HasAckThreshold != 0 {
 		b = appendVarintParam(b, ParamAckThreshold, p.AckThreshold)
@@ -406,5 +420,5 @@ func AppendParams(b []byte, p *Params) []byte {
 	if p.GreaseID != 0 {
 		b = appendParam(b, p.GreaseID, p.GreaseValue)
 	}
-	return b
+	return b, nil
 }

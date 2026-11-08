@@ -110,7 +110,7 @@ func BenchmarkBulkRecords(b *testing.B) {
 
 // BenchmarkBulkHTTP2: a full-duplex HTTP/2 request carrier.
 func BenchmarkBulkHTTP2(b *testing.B) {
-	lst := zmux.NewListener(nil)
+	lst := mustNewListener(nil)
 	hh, err := zmux.NewHTTPHandler(lst, nil)
 	if err != nil {
 		b.Fatal(err)
@@ -121,8 +121,7 @@ func BenchmarkBulkHTTP2(b *testing.B) {
 	defer srv.Close()
 	defer func() { _ = lst.Close() }()
 	// The request lives as long as its context: no timeout on it.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := b.Context()
 	p, err := zmux.HTTPPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirBidirectional, nil)
 	if err != nil {
 		b.Fatal(err)

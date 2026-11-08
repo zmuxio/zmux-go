@@ -24,7 +24,7 @@ var paramIDs = map[string]uint64{
 	"zmux_datagram_flows": wire.ParamDatagramFlows, "zmux_multipath": wire.ParamMultipath,
 	"zmux_ack_threshold": wire.ParamAckThreshold, "zmux_pipe_ack": wire.ParamPipeAck,
 	"zmux_max_ack_delay": wire.ParamMaxAckDelay, "zmux_max_lanes": wire.ParamMaxLanes,
-	"zmux_resume": wire.ParamResume,
+	"zmux_resume": wire.ParamResume, "zmux_session_crypto": wire.ParamSessionCrypto,
 }
 
 var emptyParams = map[string]bool{"reset_stream_at": true, "zmux_goaway": true, "zmux_priority": true,
@@ -86,6 +86,17 @@ func encodeParamValue(name string, v any) []byte {
 		loc := hexb(m["locator"])
 		b = append(b, byte(len(loc)))
 		return append(b, loc...)
+	case "zmux_session_crypto":
+		m := v.(map[string]any)
+		var b []byte
+		for _, k := range []string{"suites", "groups"} {
+			ids := m[k].([]any)
+			b = varint.AppendVarint(b, uint64(len(ids)))
+			for _, id := range ids {
+				b = varint.AppendVarint(b, num(id))
+			}
+		}
+		return b
 	case "zmux_max_lanes":
 		m := v.(map[string]any)
 		b := varint.AppendVarint(nil, num(m["max_lanes"]))
@@ -152,6 +163,15 @@ func paramsFromMap(tp map[string]any) wire.Params {
 			p.SecretFlags = byte(num(m["flags"]))
 			copy(p.SessionNonce[:], hexb(m["nonce"]))
 			p.Locator = hexb(m["locator"])
+		case "zmux_session_crypto":
+			p.Has |= wire.HasSessionCrypto
+			m := v.(map[string]any)
+			for _, id := range m["suites"].([]any) {
+				p.SessionCrypto.Suites = append(p.SessionCrypto.Suites, num(id))
+			}
+			for _, id := range m["groups"].([]any) {
+				p.SessionCrypto.Groups = append(p.SessionCrypto.Groups, num(id))
+			}
 		case "zmux_ack_threshold":
 			p.Has |= wire.HasAckThreshold
 			p.AckThreshold = num(v)
@@ -210,7 +230,7 @@ func getB(m map[string]any, k string) bool {
 	return v
 }
 
-// encodeFrame appends a JSON frame (TRACES.md 6).
+// encodeFrame appends a JSON frame.
 func (c *encodeCtx) encodeFrame(b []byte, f map[string]any) []byte {
 	switch f["type"].(string) {
 	case "PADDING":
@@ -322,12 +342,6 @@ func (c *encodeCtx) encodeFrame(b []byte, f map[string]any) []byte {
 		return wire.AppendGoAway(b, getU(f, "max_bidi"), getU(f, "max_uni"), getU(f, "code"))
 	case "PRIORITY_UPDATE":
 		return wire.AppendPriorityUpdate(b, getU(f, "id"), getU(f, "seq"), uint8(getU(f, "urgency")), getB(f, "incremental"))
-	case "PIPE_JOIN":
-		dir := map[string]uint8{"up": 0, "down": 1, "bidi": 2}[f["direction"].(string)]
-		j := wire.Join{Locator: hexb(f["locator"]), PipeID: getU(f, "pipe"), Dir: dir,
-			CarrierBound: getB(f, "carrier_bound"), Standby: getB(f, "standby"),
-			FateGroup: getU(f, "fate_group"), Priority: getU(f, "priority"), Token: hexb(f["token"])}
-		return wire.AppendJoin(b, &j)
 	case "PIPE_ACK":
 		ents := f["entries"].([]any)
 		b = wire.AppendPipeAckHeader(b, len(ents))
@@ -353,6 +367,15 @@ func (c *encodeCtx) encodeFrame(b []byte, f map[string]any) []byte {
 	case "PIPE_STATUS":
 		st := map[string]uint64{"available": 0, "standby": 1}[f["status"].(string)]
 		return wire.AppendPipeStatus(b, getU(f, "pipe"), getU(f, "seq"), st, getU(f, "priority"))
+	case "SESSION_EPOCH":
+		var share, loc []byte
+		if v, ok := f["share"].(string); ok {
+			share = hexb(v)
+		}
+		if v, ok := f["locator"].(string); ok {
+			loc = hexb(v)
+		}
+		return wire.AppendSessionEpoch(b, epochPhases[f["phase"].(string)], getU(f, "epoch"), share, loc)
 	}
 	panic("unknown frame type " + f["type"].(string))
 }
@@ -378,7 +401,7 @@ func (c *encodeCtx) encodeBody(r any) []byte {
 
 // ---- decoded frames as JSON-like objects ----
 
-// frameObj converts a decoded frame to the field map of TRACES.md 6.
+// frameObj converts a decoded frame to the field map the traces use.
 func frameObj(f *wire.Frame) map[string]any {
 	o := map[string]any{"type": f.Kind.String()}
 	switch f.Kind {
@@ -420,12 +443,6 @@ func frameObj(f *wire.Frame) map[string]any {
 		o["max_bidi"], o["max_uni"], o["code"] = f.MaxBidi, f.MaxUni, f.Code
 	case wire.KindPriorityUpdate:
 		o["id"], o["seq"], o["urgency"], o["incremental"] = f.StreamID, f.Seq, uint64(f.Urgency), f.Incr
-	case wire.KindPipeJoin:
-		j := &f.Join
-		o["locator"], o["pipe"] = hex.EncodeToString(j.Locator), j.PipeID
-		o["direction"] = []string{"up", "down", "bidi"}[j.Dir]
-		o["carrier_bound"], o["standby"], o["fate_group"], o["priority"] = j.CarrierBound, j.Standby, j.FateGroup, j.Priority
-		o["token"] = hex.EncodeToString(j.Token)
 	case wire.KindPipeAck:
 		var ents []any
 		it := f.Iter()
@@ -440,13 +457,23 @@ func frameObj(f *wire.Frame) map[string]any {
 	case wire.KindPipeStatus:
 		o["pipe"], o["seq"], o["priority"] = f.PipeID, f.Seq, f.Priority
 		o["status"] = []string{"available", "standby"}[f.Status]
+	case wire.KindSessionEpoch:
+		o["phase"], o["epoch"] = epochPhaseNames[f.Status], f.Seq
+		if f.Status <= wire.EpochAnswer {
+			o["share"], o["locator"] = hex.EncodeToString(f.Share), hex.EncodeToString(f.Locator)
+		}
 	case wire.KindPipePing:
 		// The type alone.
 	}
 	return o
 }
 
-// matchValue matches one pattern field (TRACES.md 5.6).
+var (
+	epochPhaseNames = []string{"offer", "answer"}
+	epochPhases     = map[string]uint8{"offer": 0, "answer": 1}
+)
+
+// matchValue matches one pattern field.
 func matchValue(pat, got any) bool {
 	if s, ok := pat.(string); ok && s == "*" {
 		return true

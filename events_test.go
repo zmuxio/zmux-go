@@ -119,7 +119,10 @@ func TestJoinAuthReasonNames(t *testing.T) {
 	for _, c := range []struct {
 		r    JoinAuthReason
 		want string
-	}{{JoinAuthReasonMAC, "mac"}, {JoinAuthReasonCarrierBound, "mac_carrier_bound"}} {
+	}{{JoinAuthReasonAuth, "auth"}, {JoinAuthReasonMissingField, "missing_field"}, {JoinAuthReasonBadField, "bad_field"},
+		{JoinAuthReasonTLVTruncated, "tlv_truncated"}, {JoinAuthReasonTLVNonMinimal, "tlv_non_minimal"},
+		{JoinAuthReasonTLVOrder, "tlv_order"},
+		{JoinAuthReasonTLVUnknownCritical, "tlv_unknown_critical"}, {JoinAuthReasonKex, "kex"}} {
 		if got := c.r.String(); got != c.want {
 			t.Errorf("%d: %q, want %q", c.r, got, c.want)
 		}

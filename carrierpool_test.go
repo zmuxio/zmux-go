@@ -13,9 +13,9 @@ func TestCarrierPool(t *testing.T) {
 	n := 0
 	closed := map[int]bool{}
 	p := &CarrierPool[int]{
-		Dial:       func(context.Context) (int, error) { n++; return n, nil },
-		Close:      func(c int) { closed[c] = true },
-		PoolLimits: PoolLimits{MaxPipesPerConnection: 2, MaxPipesPerConnectionLifetime: 3},
+		Dial:                  func(context.Context) (int, error) { n++; return n, nil },
+		Close:                 func(c int) { closed[c] = true },
+		MaxPipesPerConnection: 2, MaxPipesPerConnectionLifetime: 3,
 	}
 	ctx := context.Background()
 	get := func() *Lease[int] {
@@ -58,7 +58,7 @@ func TestCarrierPool(t *testing.T) {
 		t.Fatal("Get after Shutdown")
 	}
 	// Age: an old connection takes no new pipe.
-	p2 := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, PoolLimits: PoolLimits{MaxConnectionAge: time.Millisecond}}
+	p2 := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Millisecond}
 	x, _ := p2.Get(ctx)
 	time.Sleep(2 * time.Millisecond)
 	if y, _ := p2.Get(ctx); y.Conn == x.Conn {
@@ -68,9 +68,9 @@ func TestCarrierPool(t *testing.T) {
 
 func TestCarrierPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
 	n := 0
-	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, PoolLimits: PoolLimits{MaxPipesPerConnectionLifetime: 1}}
+	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxPipesPerConnectionLifetime: 1}
 	defer p.Shutdown()
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		lease, err := p.Get(context.Background())
 		if err != nil {
 			t.Fatal(err)
@@ -126,7 +126,7 @@ func TestCarrierPoolCancelledLateDialReturnsItsConnection(t *testing.T) {
 
 func TestCarrierPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *testing.T) {
 	n, closed := 0, 0
-	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, PoolLimits: PoolLimits{MaxConnectionAge: time.Minute}}
+	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Minute}
 	p.Close = func(int) {
 		closed++
 		if !p.mu.TryLock() {
@@ -156,7 +156,7 @@ func TestCarrierPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *tes
 
 func TestCarrierPoolStaleLeaseRetirementCannotCloseTwice(t *testing.T) {
 	closed := 0
-	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { return 1, nil }, Close: func(int) { closed++ }, PoolLimits: PoolLimits{MaxPipesPerConnectionLifetime: 1}}
+	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { return 1, nil }, Close: func(int) { closed++ }, MaxPipesPerConnectionLifetime: 1}
 	lease, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -178,18 +178,16 @@ func TestCarrierPoolRejectsAndReportsInvalidDecision(t *testing.T) {
 	var reported []error
 	p = &CarrierPool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
-		PoolLimits: PoolLimits{
-			Policy: policyFunc(func(_ *PoolView, d *PoolDecision) {
-				d.Count, d.ProbeInterval = 3, 500*time.Millisecond
-			}),
-			DecisionRejected: func(err error) {
-				if !p.mu.TryLock() {
-					t.Error("reported under the pool's lock")
-				} else {
-					p.mu.Unlock()
-				}
-				reported = append(reported, err)
-			},
+		Policy: policyFunc(func(_ *PoolView, d *PoolDecision) {
+			d.Count, d.ProbeInterval = 3, 500*time.Millisecond
+		}),
+		DecisionRejected: func(err error) {
+			if !p.mu.TryLock() {
+				t.Error("reported under the pool's lock")
+			} else {
+				p.mu.Unlock()
+			}
+			reported = append(reported, err)
 		},
 	}
 	a, err := p.Get(context.Background())

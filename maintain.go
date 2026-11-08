@@ -23,7 +23,7 @@ type PipePool struct {
 	// itself, such as an uplink and a downlink of a split carrier
 	// (HTTPSplitJoin), with the options given; the member is usable while
 	// all of them are, and they are replaced together. ctx bounds the
-	// joins.
+	// joins; o has NoWaitAttached set, as the pool's own joins do.
 	Join func(ctx context.Context, c *Conn, o PipeOptions) ([]*Pipe, error)
 	// Mode, in place of Dial and Join, dials each member over a carrier
 	// kind of the mode's candidates (a split candidate joins as a split
@@ -78,8 +78,8 @@ type PipePool struct {
 // Rotation replaces pipes before a lifetime limit: when a pipe has carried
 // MaxBytes in either direction or is MaxAge old (each reduced by a random
 // fraction of up to Jitter), a replacement is dialled and joined, and the
-// old pipe is closed gracefully once the replacement is usable (make
-// before break).
+// old pipe is closed gracefully once the replacement is usable and attached
+// by the peer (Pipe.WaitAttached): make before break.
 type Rotation struct {
 	MaxBytes uint64        // 0: no byte limit
 	MaxAge   time.Duration // 0: no age limit
@@ -89,8 +89,11 @@ type Rotation struct {
 // memberState sums the statistics of a member's pipes (SinceLastTraffic:
 // the least) and reports whether every pipe is alive (its outbound
 // direction neither failed nor closed, or its inbound one open for a
-// downlink) and usable (active outbound out of probation, or open
-// inbound).
+// downlink) and usable (active outbound out of probation, or open inbound,
+// and attached by the peer: PipeStats.PeerAttached, the state WaitAttached
+// waits for). A joiner reads a join as joined at its verified Reply, before
+// the acceptor has its attachment state, so closing the pipe it replaces
+// any earlier could remove the acceptor's last pipe.
 func memberState(ps []*Pipe) (sum PipeStats, alive, usable bool) {
 	alive, usable = len(ps) > 0, len(ps) > 0
 	for i, p := range ps {
@@ -103,6 +106,7 @@ func memberState(ps []*Pipe) (sum PipeStats, alive, usable bool) {
 		if i == 0 || st.SinceLastTraffic < sum.SinceLastTraffic {
 			sum.SinceLastTraffic = st.SinceLastTraffic
 		}
+		usable = usable && st.PeerAttached
 		if st.Outbound == OutboundNone {
 			alive = alive && st.Inbound == InboundOpen || alive && st.Inbound == InboundJoining
 			usable = usable && st.Inbound == InboundOpen
@@ -156,7 +160,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		pool.Count = 1
 	}
 	if pool.MinBackoff == 0 {
-		pool.MinBackoff = time.Second
+		pool.MinBackoff = DefaultMinBackoff
 	}
 	if pool.MaxBackoff == 0 {
 		pool.MaxBackoff = DefaultMaxBackoff
@@ -177,6 +181,8 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	if n := btoi(pool.Dial != nil) + btoi(pool.Join != nil) + btoi(mp != nil); n != 1 {
 		return fmt.Errorf("%w: PipePool needs exactly one of Dial, Join and Mode", ErrInvalidConfig)
 	}
+	c.pools.Add(1) // a running pool attends a suspension (EventResumeUnattended)
+	defer c.pools.Add(-1)
 	type member struct {
 		ps     []*Pipe
 		born   time.Time
@@ -222,9 +228,13 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	timer.Stop()
 	defer timer.Stop()
 	join := func(kind int) ([]*Pipe, error) {
-		dctx, cancel := timeshim.WithDeadline(ctx, clk, clk.Now().Add(c.cfg.handshakeTimeout()))
+		dctx, cancel := timeshim.WithDeadline(ctx, clk, clk.Now().Add(c.cfg.joinTimeout()))
 		defer cancel()
 		o := pool.Options
+		// A replacement closes its old pipe only once attached by the peer
+		// (memberState), and a redial must not wait for an acknowledgement
+		// that only the direction it restores could carry.
+		o.NoWaitAttached = true
 		if pool.Policy != nil {
 			o = dec.probeOptions(o)
 		}
@@ -234,7 +244,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		if pool.Join != nil {
 			var ps []*Pipe
 			var err error
-			if !safeCall(func() { ps, err = pool.Join(dctx, c, o) }) {
+			if !safeLog(c.cfg.Logger, "PipePool.Join", func() { ps, err = pool.Join(dctx, c, o) }) {
 				err = errors.New("zmux: PipePool.Join panicked")
 			}
 			if err == nil && len(ps) == 0 {
@@ -248,7 +258,6 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		}
 		pp, err := c.AddPipe(dctx, p, o)
 		if err != nil {
-			closePipeIO(p)
 			return nil, err
 		}
 		return []*Pipe{pp}, nil
@@ -344,9 +353,9 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		delay := wait
 		if pool.Policy != nil {
 			view.Now, view.Failures, view.LastDial = now, failures, lastDial
-			if err := decide(pool.Policy, &view, &dec); err != nil {
+			if err := decide(c.cfg.Logger, pool.Policy, &view, &dec); err != nil {
 				dec = PoolDecision{Retire: dec.Retire[:0]} // rejected, as a policy that panics
-				reportRejected(pool.DecisionRejected, err)
+				reportRejected(c.cfg.Logger, pool.DecisionRejected, err)
 			}
 			if dec.DialAfter > 0 {
 				delay = min(dec.DialAfter, pool.MaxBackoff)
@@ -387,6 +396,8 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		if from.IsZero() {
 			from = start
 		}
+		// The join refusal backoff holds joins on its own (JoinReady): a
+		// dial waits for the longer of the two.
 		dialDue := now.Sub(from) >= delay
 		var dialAt time.Time
 		if len(members) < count && c.JoinReady() {
@@ -461,7 +472,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 				continue
 			}
 			if !usable {
-				continue
+				continue // a state change or the peer's attachment wakes the pass
 			}
 			if mp != nil {
 				if m.replSeen.IsZero() {

@@ -2,14 +2,15 @@ package zmux
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 // pipeDrv owns the goroutines and carrier halves of one attachment.
@@ -20,11 +21,12 @@ type pipeDrv struct {
 	c      *Conn
 	id     uint64
 	hc     *halfCloser
-	wsig   *core.Signal   // wakes the lane-0 writer
-	opener LaneOpener     // nil: the carrier offers no lanes
-	tcp    tcpInfo        // the TCP socket under the carrier, if any
-	outer  outerRef       // the outer session of a stream-backed carrier
-	gs     pipeGoroutines // the attachment's goroutines (HandlePipe waits on them)
+	wsig   *core.Signal    // wakes the lane-0 writer
+	opener LaneOpener      // nil: the carrier offers no lanes
+	tcp    tcpInfo         // the TCP socket under the carrier, if any
+	outer  outerRef        // the outer session of a stream-backed carrier
+	gs     pipeGoroutines  // the attachment's goroutines (HandlePipe waits on them)
+	lctx   context.Context // the goroutine labels of the pipe (labels.go)
 
 	admitted any // the admission value of the carrier that joined it (set once, under the session lock)
 
@@ -40,6 +42,7 @@ type pipeDrv struct {
 
 	smu      sync.Mutex // leaf: shutdown request of lane 0
 	shutdown bool
+	shutReq  bool // lane 0's shutdown was requested (sticky)
 	framing  Framing
 	dead     bool // guarded by the session lock: replaced (early-data restart), its goroutines report nothing
 	// wstop (session lock): the lane-0 writer stops before writing again
@@ -109,8 +112,16 @@ var closedChan = func() chan struct{} { c := make(chan struct{}); close(c); retu
 func (pd *pipeDrv) requestShutdown() {
 	pd.smu.Lock()
 	pd.shutdown = true
+	pd.shutReq = true
 	pd.smu.Unlock()
 	pd.wsig.Fire()
+}
+
+// shutdownRequested reports whether lane 0's shutdown was ever requested.
+func (pd *pipeDrv) shutdownRequested() bool {
+	pd.smu.Lock()
+	defer pd.smu.Unlock()
+	return pd.shutReq
 }
 
 func (pd *pipeDrv) takeShutdown() bool {
@@ -123,15 +134,15 @@ func (pd *pipeDrv) takeShutdown() bool {
 
 // carrierInfo describes a carrier half to the core.
 func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
-	// Records aligned to TLS records only on a TLS byte stream (SPEC.md
-	// 3.3); a QUIC stream reports a TLS state for its exporter only.
-	_, isTLS := p.W.(*tls.Conn)
+	// Records aligned to TLS records only on a TLS byte stream;
+	// a QUIC stream reports a TLS state for its exporter only.
+	isTLS := tlsRecords(p.W)
 	_, lanes := p.W.(LaneOpener)
 	if !lanes {
 		_, lanes = p.R.(LaneOpener)
 	}
 	info := core.CarrierInfo{Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
-		Lanes: lanes, QueueBound: lowWater, WriteOverhead: p.WriteOverhead}
+		Lanes: lanes, QueueBound: lowWater, WriteOverhead: p.WriteOverhead, MaxRecord: carrierRecordLimit(p)}
 	if ch := channelOf(p); ch != nil {
 		info.Channel = ch
 	}
@@ -139,8 +150,12 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 }
 
 // newPipeDrv prepares the driver of an attachment (under the lock).
+//
+// Every PipeIO that becomes part of a session comes through here once, so this
+// is where the padding of the handshake run on it is metered.
 func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
-	pd := &pipeDrv{c: c, id: id, hc: newHalfCloser(p), framing: p.Framing, wsig: core.NewSignal()}
+	c.s.ShapeSpendHandshake(p.HandshakePadding)
+	pd := &pipeDrv{c: c, id: id, hc: newHalfCloser(p), framing: p.Framing, wsig: core.NewSignal(), lctx: c.pipeLabels(id)}
 	if o, ok := p.W.(LaneOpener); ok {
 		pd.opener = o
 	} else if o, ok := p.R.(LaneOpener); ok {
@@ -149,6 +164,12 @@ func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
 	pd.tcp = tcpOf(p.W)
 	pd.ch = channelOf(p)
 	return pd
+}
+
+// adopt makes q the carrier of a joined attachment; the TCP socket stays the one
+// below it, for the statistics.
+func (pd *pipeDrv) adopt(q PipeIO) {
+	pd.hc, pd.framing = newHalfCloser(q), q.Framing
 }
 
 // startPipeLocked starts the goroutines of an attachment.
@@ -164,10 +185,10 @@ func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool) {
 	if read && pd.hc.io.R != nil {
 		c.wg.Add(1)
 		pd.gs.add()
-		go func() {
+		labels.Go(pd.lctx, "read", func() {
 			defer pd.gs.done()
 			c.readLoop(pd, 0, pd.hc.io.R)
-		}()
+		})
 	}
 	if write {
 		c.startWriterLocked(pd)
@@ -183,11 +204,11 @@ func (c *Conn) startWriterLocked(pd *pipeDrv) {
 	pd.wstop, pd.wdone = false, done
 	c.wg.Add(1)
 	pd.gs.add()
-	go func() {
+	labels.Go(pd.lctx, "write", func() {
 		defer pd.gs.done()
 		defer close(done)
 		c.writeLoop(pd, 0, pd.wsig, nil)
-	}()
+	})
 }
 
 // addBootstrap attaches pipe 0 and starts its goroutines (under the lock).
@@ -197,7 +218,6 @@ func (c *Conn) addBootstrap(p PipeIO) {
 	_ = nestPipe(c, pd.outer) // a new session cannot form a loop
 	low := pd.tcp.setLowWater(singleLowWater)
 	info := carrierInfo(p, pd.tcp, low)
-	c.orphanSig.Store(pd.wsig)
 	c.s.AttachBootstrap(info, info, pd.wsig)
 	c.s.SetPipeKind(0, uint8(p.Carrier)) // before its first record
 	if d, ok := pd.tcp.minRTT(); ok {
@@ -217,8 +237,9 @@ func (c *Conn) bootstrapExporter(pd *pipeDrv, lane uint64) *lateExporter {
 }
 
 // readLoop feeds what a carrier half delivers into the core. It never
-// waits for anything but the carrier, so reads never wait behind writes
-// (SPEC.md 9.1). A quiet pipe blocks on a small buffer and holds no pooled
+// waits for anything but the carrier (its handshake, its early-data
+// verdict), so reads never wait behind writes.
+// A quiet pipe blocks on a small buffer and holds no pooled
 // read buffer.
 func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 	defer c.wg.Done()
@@ -232,6 +253,7 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 		return
 	}
 	exp := c.bootstrapExporter(pd, lane)
+	first := true
 	var small [idleBufSize]byte
 	var buf *core.Buf
 	used := 0
@@ -250,8 +272,15 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 			n, err = r.Read(buf.B[used:])
 			used += n
 		}
+		if first && n > 0 {
+			first = false
+			c.awaitVerdict(pd, lane)
+		}
 		if exp != nil && n > 0 {
-			exp.load()
+			if lerr := exp.load(c.done); lerr != nil {
+				// What was read waited for a handshake that failed.
+				n, err, used = 0, lerr, 0
+			}
 			exp = nil
 		}
 		consumed, dead := 0, false
@@ -331,6 +360,7 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 func (c *Conn) readMessages(pd *pipeDrv, lane uint64, r io.Reader) {
 	mr, ok := r.(MessageReader)
 	exp := c.bootstrapExporter(pd, lane)
+	first := true
 	for {
 		var msg []byte
 		var err error
@@ -339,8 +369,12 @@ func (c *Conn) readMessages(pd *pipeDrv, lane uint64, r io.Reader) {
 		} else {
 			err = errors.New("zmux: Records framing needs a MessageReader")
 		}
+		if first && err == nil {
+			first = false
+			c.awaitVerdict(pd, lane)
+		}
 		if exp != nil && err == nil {
-			exp.load()
+			err = exp.load(c.done)
 			exp = nil
 		}
 		func() {
@@ -445,9 +479,6 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 				c.s.WriteDone(b, werr, now)
 				reported = false
 			}
-			if lane == 0 {
-				c.releaseOrphansLocked()
-			}
 			if werr == nil {
 				if b == nil {
 					b = core.GetBatch()
@@ -541,7 +572,7 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 	if len(bufs) == 1 {
 		return w.Write(bufs[0])
 	}
-	if _, ok := w.(*tls.Conn); ok {
+	if tlsRecords(w) {
 		// A gather write would cost a TLS record per buffer.
 		return WriteFlat(w, bufs)
 	}
@@ -557,7 +588,7 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 	return WriteFlat(w, bufs)
 }
 
-// ---- lanes (MULTIPATH.md 2.5, 5.8) ----
+// ---- lanes ----
 
 // openLane opens a requested outbound lane outside the lock.
 func (c *Conn) openLane(pd *pipeDrv) {
@@ -588,10 +619,10 @@ func (c *Conn) openLane(pd *pipeDrv) {
 	pd.lanes[lane] = lo
 	c.wg.Add(1)
 	pd.gs.add()
-	go func() {
+	labels.Go(pd.lctx, "lane-write", func() {
 		defer pd.gs.done()
 		c.writeLoop(pd, lane, lo.sig, lo)
-	}()
+	})
 }
 
 // ---- carrier commands ----
@@ -645,7 +676,7 @@ func (c *Conn) doAction(pa pendingAct) {
 		}
 	case core.ActOpenLane:
 		if start {
-			go c.openLane(pd)
+			labels.Go(pd.lctx, "lane-open", func() { c.openLane(pd) })
 		} else if pd.opener == nil {
 			c.mu.Lock()
 			c.s.LaneOpenFailed(pd.id)
@@ -687,23 +718,38 @@ func (c *Conn) fail(p any) {
 
 // ---- orphaned handles (GC cleanup) ----
 
-// orphan queues a stream whose handle was collected without being closed;
-// it runs on the runtime's cleanup goroutine and takes only a leaf lock.
-func (c *Conn) orphan(st *core.Stream) {
-	c.orphMu.Lock()
-	c.orphans = append(c.orphans, st)
-	c.orphMu.Unlock()
-	if sig := c.orphanSig.Load(); sig != nil {
-		sig.Fire()
+// orphanQueue is a lock-free stack of the handles collected unclosed: the
+// runtime's cleanup goroutine pushes, the session takes them all under its
+// lock.
+type orphanQueue struct{ head atomic.Pointer[handle] }
+
+func (q *orphanQueue) push(h *handle) {
+	for {
+		old := q.head.Load()
+		h.orphanNext = old
+		if q.head.CompareAndSwap(old, h) {
+			return
+		}
 	}
 }
 
+// orphanSweep bounds how long a handle collected unclosed waits for its
+// release on a session without other activity: while the session has
+// unreleased handles its timer fires at least this often.
+const orphanSweep = 5 * time.Second
+
+// releaseOrphansLocked releases the handles collected unclosed (under the
+// lock); every critical section calls it.
 func (c *Conn) releaseOrphansLocked() {
-	c.orphMu.Lock()
-	os := c.orphans
-	c.orphans = nil
-	c.orphMu.Unlock()
-	for _, st := range os {
-		c.s.Release(st)
+	if c.orphans.head.Load() == nil {
+		return
+	}
+	for h := c.orphans.head.Swap(nil); h != nil; {
+		next := h.orphanNext
+		h.orphanNext = nil
+		if !h.released {
+			h.release()
+		}
+		h = next
 	}
 }

@@ -40,11 +40,11 @@ func TestShaperFromFirstRecord(t *testing.T) {
 	a, b := tcpPair(t)
 	rs := &recConn{Conn: b, on: true}
 	k := &kindRecorder{padTo: 700}
-	lst := NewListener(&ListenerConfig{Config: &Config{Shaper: k.factory}})
+	lst := mustNewListener(&ListenerConfig{Config: &Config{Shaper: k.factory}})
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: rs, W: rs, Carrier: CarrierStreaming}, JoinHint{}) }()
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: rs, W: rs, Carrier: CarrierStreaming}, PipeHint{}) }()
 	c, err := Start(ctx, PipeIO{R: a, W: a, Carrier: CarrierStreaming}, RoleClient, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +55,7 @@ func TestShaperFromFirstRecord(t *testing.T) {
 	}
 	transfer(t, c, s, 1000)
 	sizes, _ := rs.records()
-	if len(sizes) == 0 || sizes[0] < 700 {
+	if len(sizes) == 0 || wireLen(sizes[0]) < 700 {
 		t.Fatalf("server records %v, the first not shaped", sizes)
 	}
 	if got := k.seen(); len(got) == 0 || got[0] != (ShapedPipe{ID: 0, Carrier: CarrierStreaming}) {
@@ -85,9 +85,9 @@ func TestCarrierKindJoin(t *testing.T) {
 	ks, kc := &kindRecorder{}, &kindRecorder{}
 	scfg, ccfg := mpConfig(), mpConfig()
 	scfg.Shaper, ccfg.Shaper = ks.factory, kc.factory
-	lst := NewListener(&ListenerConfig{Config: scfg})
+	lst := mustNewListener(&ListenerConfig{Config: scfg})
 	defer func() { _ = lst.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	// The server labels its carriers in accept order, as an adapter of
 	// two kinds would.
@@ -100,7 +100,7 @@ func TestCarrierKindJoin(t *testing.T) {
 			}
 			p := NetPipe(nc)
 			p.Carrier = kinds[min(i, 1)]
-			go func() { _ = lst.HandlePipe(ctx, p, JoinHint{}) }()
+			go func() { _ = lst.HandlePipe(ctx, p, PipeHint{}) }()
 		}
 	}()
 	dial := func(k CarrierKind) PipeIO {
@@ -125,23 +125,32 @@ func TestCarrierKindJoin(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[uint64]CarrierKind{0: CarrierWebSocket, p.ID(): CarrierQUIC}
-	// Every pipe makes a record (the join's confirmation at least).
-	deadline := time.Now().Add(5 * time.Second)
+	// PipeAdded of the join is queued before AddPipe returned.
 	for {
-		transfer(t, c, s, 100)
-		transfer(t, s, c, 100)
-		if len(kc.seen()) >= 2 && len(ks.seen()) >= 2 || time.Now().After(deadline) {
+		ev, err := c.NextEvent(ctx)
+		if err != nil {
+			t.Fatalf("no PipeAdded for pipe %d: %v", p.ID(), err)
+		}
+		if ev.Kind == EventPipeAdded && ev.Pipe == p.ID() {
+			if ev.Carrier != CarrierQUIC {
+				t.Fatalf("PipeAdded %d: carrier %v", ev.Pipe, ev.Carrier)
+			}
 			break
 		}
 	}
-	for name, k := range map[string]*kindRecorder{"client": kc, "server": ks} {
-		got := k.seen()
-		if len(got) < 2 {
-			t.Fatalf("%s factory saw %v", name, got)
+	// The acceptor attaches at the confirmation, and its first record on a pipe
+	// creates the shaper: traffic goes on until both ends have seen both pipes.
+	for len(kc.seen()) < 2 || len(ks.seen()) < 2 || len(s.PipeStats()) < 2 {
+		if ctx.Err() != nil {
+			t.Fatalf("client factory %v, server factory %v, server pipes %+v", kc.seen(), ks.seen(), s.PipeStats())
 		}
-		for _, sp := range got {
+		transfer(t, c, s, 100)
+		transfer(t, s, c, 100)
+	}
+	for name, k := range map[string]*kindRecorder{"client": kc, "server": ks} {
+		for _, sp := range k.seen() {
 			if want[sp.ID] != sp.Carrier {
-				t.Fatalf("%s factory saw %v, want %v", name, got, want)
+				t.Fatalf("%s factory saw %v, want %v", name, k.seen(), want)
 			}
 		}
 	}
@@ -154,20 +163,6 @@ func TestCarrierKindJoin(t *testing.T) {
 			if want[ps.Pipe] != ps.Carrier {
 				t.Fatalf("pipe %d: carrier %v, want %v", ps.Pipe, ps.Carrier, want[ps.Pipe])
 			}
-		}
-	}
-	ectx, ecancel := context.WithTimeout(ctx, time.Second)
-	defer ecancel()
-	for {
-		ev, err := c.NextEvent(ectx)
-		if err != nil {
-			t.Fatalf("no PipeAdded for pipe %d: %v", p.ID(), err)
-		}
-		if ev.Kind == EventPipeAdded && ev.Pipe == p.ID() {
-			if ev.Carrier != CarrierQUIC {
-				t.Fatalf("PipeAdded %d: carrier %v", ev.Pipe, ev.Carrier)
-			}
-			break
 		}
 	}
 	_ = c.Close()

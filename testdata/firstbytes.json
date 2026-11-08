@@ -67,51 +67,37 @@
   {
    "hex": "099a",
    "framing": "stream",
-   "class": "record",
-   "need": 0,
-   "note": "1-byte Size 9, PIPE_JOIN"
+   "class": "other", "need": 0, "note": "1-byte Size 9, 9a, not a first frame type"
   },
   {
    "hex": "3f9a",
    "framing": "stream",
-   "class": "record",
-   "need": 0,
-   "note": "1-byte Size 63, PIPE_JOIN"
+   "class": "other", "need": 0, "note": "1-byte Size 63, 9a, not a first frame type"
   },
   {
    "hex": "40409a",
    "framing": "stream",
-   "class": "record",
-   "need": 0,
-   "note": "2-byte Size 64, PIPE_JOIN"
+   "class": "other", "need": 0, "note": "2-byte Size 64, 9a, not a first frame type"
   },
   {
    "hex": "7fff9a",
    "framing": "stream",
-   "class": "record",
-   "need": 0,
-   "note": "2-byte Size 16383, PIPE_JOIN"
+   "class": "other", "need": 0, "note": "2-byte Size 16383, 9a, not a first frame type"
   },
   {
    "hex": "800040009a",
    "framing": "stream",
-   "class": "record",
-   "need": 0,
-   "note": "4-byte Size 16384, PIPE_JOIN"
+   "class": "other", "need": 0, "note": "4-byte Size 16384, 9a, not a first frame type"
   },
   {
    "hex": "8000ffff9a",
    "framing": "stream",
-   "class": "record",
-   "need": 0,
-   "note": "4-byte Size 65535, PIPE_JOIN"
+   "class": "other", "need": 0, "note": "4-byte Size 65535, 9a, not a first frame type"
   },
   {
    "hex": "9a",
    "framing": "records",
-   "class": "record",
-   "need": 0,
-   "note": "message, PIPE_JOIN"
+   "class": "other", "need": 0, "note": "message, 9a, not a first frame type"
   },
   {
    "hex": "09ba",
@@ -287,13 +273,6 @@
    "class": "other",
    "need": 0,
    "note": "TLS record in a message"
-  },
-  {
-   "hex": "5a4d5558",
-   "framing": "stream",
-   "class": "other",
-   "need": 0,
-   "note": "ZMUX"
   },
   {
    "hex": "474554",

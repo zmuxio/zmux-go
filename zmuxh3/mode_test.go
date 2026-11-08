@@ -17,12 +17,13 @@ import (
 // target (zmux.HTTPEndpoint) and dials each in auto and explicit mode.
 func TestCandidates(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: pskCfg()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: pskCfg()})
 	defer func() { _ = lst.Close() }()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = pc.Close() }() // a server does not close what it was given
 	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
 		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
 	webtransport.ConfigureHTTP3Server(h3)

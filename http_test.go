@@ -25,7 +25,7 @@ func TestHTTPCarriers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: PrefixTokenLen, Decide: v.Decide,
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: PrefixTokenLen, Decide: v.Decide,
 		PeekTimeout: 2 * time.Second, StallMax: 100 * time.Millisecond}})
 	hh, err := NewHTTPHandler(lst, nil)
 	if err != nil {
@@ -80,18 +80,9 @@ func TestHTTPCarriers(t *testing.T) {
 			if err != nil || !bytes.Equal(got, msg) {
 				t.Fatalf("echo over HTTP %s: %d bytes, %v", mode, len(got), err)
 			}
-			// A downlink joined out of band.
+			// A downlink joined over two requests.
 			if mode == "duplex" {
-				r, err := c.ReservePipe(DirReceiveOnly, PipeOptions{})
-				if err != nil {
-					t.Fatal(err)
-				}
-				h := map[string][]string{HeaderJoin: {r.Header()}}
-				dp, err := HTTPPipe(ctx, srv.Client(), srv.URL, h, DirReceiveOnly, auth)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := r.Attach(ctx, dp); err != nil {
+				if _, err := HTTPSplitJoin(ctx, c, srv.Client(), srv.URL, nil, auth, PipeOptions{Direction: DirReceiveOnly}); err != nil {
 					t.Fatal(err)
 				}
 			}

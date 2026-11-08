@@ -102,7 +102,7 @@ func TestPrefixAuthHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: PrefixTokenLen, Decide: v.Decide}})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: PrefixTokenLen, Decide: v.Decide}})
 	defer func() { _ = lst.Close() }()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if a, ok := lst.AdmitUpgrade(w, r, nil); ok {
@@ -289,7 +289,7 @@ func TestAdmissionStream(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		lst = NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, Fallback: fb})
+		lst = mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, Fallback: fb})
 		done := make(chan struct{})
 		go func() { _ = lst.Serve(ctx, tls.NewListener(ln, srvTLS)); close(done) }()
 		l := lst
@@ -433,7 +433,7 @@ func TestAdmissionHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(),
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(),
 		Admission: &Admission{Peek: PrefixTokenLen, PeekTimeout: time.Second, Decide: v.Decide, StallMax: time.Second}})
 	defer func() { _ = lst.Close() }()
 	h, err := NewHTTPHandler(lst, &HTTPOptions{Next: siteHandler()})
@@ -484,7 +484,7 @@ func TestAdmissionHTTP(t *testing.T) {
 // is answered by Next as Next answers it directly, and creates nothing.
 func TestAdmissionExchange(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
 	h := newExHandler(t, lst, &HTTPExchangeConfig{PSK: []byte("k"), HoldTime: 50 * time.Millisecond,
 		MaxClockSkew: 30 * time.Second, Next: siteHandler()})
@@ -544,7 +544,7 @@ func TestAdmissionExchange(t *testing.T) {
 func TestStallDurationBySource(t *testing.T) {
 	stall := func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }
 	a := &Admission{Decide: stall, StallMin: time.Second, StallMax: 1000 * time.Second}
-	lst := NewListener(&ListenerConfig{Admission: a})
+	lst := mustNewListener(&ListenerConfig{Admission: a})
 	defer func() { _ = lst.Close() }()
 	ap := netip.MustParseAddrPort
 	for _, r := range []string{"192.0.2.1:1", "198.51.100.7:2", "[2001:db8::1]:3"} {
@@ -562,12 +562,14 @@ func TestStallDurationBySource(t *testing.T) {
 			t.Fatalf("%s %v, %s %v", p[0], x, p[1], y)
 		}
 	}
-	fixed := NewListener(&ListenerConfig{Admission: &Admission{Decide: stall, StallMin: 5 * time.Second, StallMax: 5 * time.Second}})
+	fixed := mustNewListener(&ListenerConfig{Admission: &Admission{Decide: stall, StallMin: 5 * time.Second, StallMax: 5 * time.Second}})
 	defer func() { _ = fixed.Close() }()
 	if d := fixed.StallDuration(ap("192.0.2.1:1")); d != 5*time.Second {
 		t.Fatalf("fixed interval: %v", d)
 	}
-	if d := NewListener(nil).StallDuration(ap("192.0.2.1:1")); d != 0 {
+	none := mustNewListener(nil)
+	defer func() { _ = none.Close() }()
+	if d := none.StallDuration(ap("192.0.2.1:1")); d != 0 {
 		t.Fatalf("without an admission: %v", d)
 	}
 }
@@ -580,7 +582,7 @@ func TestStallCountsPerSource(t *testing.T) {
 	leakcheck.Check(t)
 	a := &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} },
 		StallMin: time.Minute, StallMax: time.Minute}
-	lst := NewListener(&ListenerConfig{MaxPendingPerSource: 3, Admission: a})
+	lst := mustNewListener(&ListenerConfig{MaxPendingPerSource: 3, Admission: a})
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -590,12 +592,12 @@ func TestStallCountsPerSource(t *testing.T) {
 	for range 2 {
 		c, s := net.Pipe()
 		clients = append(clients, c)
-		go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{s, src}), JoinHint{}); done <- struct{}{} }()
+		go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{s, src}), PipeHint{}); done <- struct{}{} }()
 	}
 	waitUntil(t, 5*time.Second, "two stalled", func() bool { return lst.Stats().Admission.Stalled == 2 })
 	// The third: the source has its share of stalled carriers.
 	c, s := net.Pipe()
-	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{s, src}), JoinHint{}); done <- struct{}{} }()
+	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{s, src}), PipeHint{}); done <- struct{}{} }()
 	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("read %v, want the end", err)
 	}
@@ -622,7 +624,7 @@ func TestAdmitBeforeHandshake(t *testing.T) {
 		return Decision{Verdict: VerdictAccept}
 	}}
 	for _, a := range []*Admission{nil, adm} {
-		lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: a})
+		lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: a})
 		for _, upgrade := range []bool{false, true} {
 			r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
 			r.TLS = &tls.ConnectionState{HandshakeComplete: false}
@@ -640,7 +642,7 @@ func TestAdmitBeforeHandshake(t *testing.T) {
 	if decided {
 		t.Fatal("decided on an early request")
 	}
-	lst := NewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
 	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
 	r.TLS = &tls.ConnectionState{HandshakeComplete: true}
@@ -674,7 +676,7 @@ func TestServeConnSource(t *testing.T) {
 	a := &Admission{Peek: 2, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
 		return Decision{Verdict: VerdictAccept, Skip: 1}
 	}}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1, FirstRecordTimeout: 10 * time.Second, Admission: a})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1, FirstRecordTimeout: 10 * time.Second, Admission: a})
 	ctx, cancel := context.WithCancel(context.Background())
 	var clients []net.Conn
 	done := make(chan struct{}, 2)
@@ -682,7 +684,7 @@ func TestServeConnSource(t *testing.T) {
 		c, s := net.Pipe()
 		clients = append(clients, c)
 		go func() {
-			_ = lst.HandlePipe(ctx, NetPipe(addrConn{s, &net.TCPAddr{IP: net.ParseIP(host), Port: 1}}), JoinHint{})
+			_ = lst.HandlePipe(ctx, NetPipe(addrConn{s, &net.TCPAddr{IP: net.ParseIP(host), Port: 1}}), PipeHint{})
 			done <- struct{}{}
 		}()
 		if _, err := c.Write([]byte{0, 0x40}); err != nil {
@@ -712,13 +714,13 @@ func TestServeConnSource(t *testing.T) {
 // closes.
 func TestCloseEndsFallbackStall(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: 4, PeekTimeout: 5 * time.Second,
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: 4, PeekTimeout: 5 * time.Second,
 		StallMin: time.Minute, StallMax: time.Minute,
 		Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictFallback} }}})
 	a, b := net.Pipe()
 	defer func() { _ = a.Close() }()
 	done := make(chan struct{})
-	go func() { _ = lst.HandlePipe(context.Background(), NetPipe(b), JoinHint{}); close(done) }()
+	go func() { _ = lst.HandlePipe(context.Background(), NetPipe(b), PipeHint{}); close(done) }()
 	if _, err := a.Write([]byte("abcd")); err != nil {
 		t.Fatal(err)
 	}

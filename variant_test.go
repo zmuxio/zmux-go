@@ -57,13 +57,13 @@ func TestDialModeVariants(t *testing.T) {
 	leakcheck.Check(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	lst := NewListener(&ListenerConfig{Config: &Config{}})
+	lst := mustNewListener(&ListenerConfig{Config: &Config{}})
 	defer func() { _ = lst.Close() }()
 	failing := Candidate{Kind: CarrierStreaming, Variant: "a",
 		Dial: func(context.Context, Credential) (PipeIO, error) { return PipeIO{}, errors.New("no") }}
 	working := Candidate{Kind: CarrierStreaming, Variant: "b", Dial: func(context.Context, Credential) (PipeIO, error) {
 		a, b := net.Pipe()
-		go func() { _ = lst.HandlePipe(ctx, NetPipe(b), JoinHint{}) }()
+		go func() { _ = lst.HandlePipe(ctx, NetPipe(b), PipeHint{}) }()
 		return NetPipe(a), nil
 	}}
 	var shaped []ShapedPipe
@@ -91,7 +91,7 @@ func TestDialModeVariants(t *testing.T) {
 	if st := c.PipeStats(); len(st) != 1 || st[0].Variant != "b" {
 		t.Fatalf("pipe stats %+v", st)
 	}
-	if cs := c.ConnectionStats(); cs.CarrierVariant != "b" || len(cs.CarrierCandidates) != 2 || cs.CarrierCandidates[0].Variant != "a" {
+	if cs := c.ConnectionStats(); len(cs.CarrierCandidates) != 2 || cs.CarrierCandidates[0].Variant != "a" {
 		t.Fatalf("connection stats %+v", cs)
 	}
 	c.lock()

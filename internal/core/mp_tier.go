@@ -7,7 +7,7 @@ import (
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// Tiers, usability and the tier gate (MULTIPATH.md 9).
+// Tiers, usability and the tier gate.
 // The gate is worked out at each scheduling decision from the values in
 // force at that moment; it lives in session scratch storage and allocates
 // nothing in steady state.
@@ -241,17 +241,15 @@ func (s *Session) takes(g *gate, p *Pipe) bool {
 	if ti <= g.fed {
 		return true
 	}
-	for i := 0; i < ti; i++ {
+	for i := range ti {
 		if s.cfg.Policy == PolicySessionAffinity {
 			if s.open(g.tiers[i].active) {
 				return false
 			}
 			continue
 		}
-		for _, q := range g.tierPipes(i) {
-			if s.open(q) {
-				return false
-			}
+		if slices.ContainsFunc(g.tierPipes(i), s.open) {
+			return false
 		}
 	}
 	return true
@@ -394,13 +392,7 @@ func (s *Session) waitingData() (uint64, Time, bool) {
 			continue
 		}
 		fresh += r
-		w := st.waitStart()
-		if sp.creditAt > w {
-			w = sp.creditAt
-		}
-		if s.conn.creditAt > w {
-			w = s.conn.creditAt
-		}
+		w := max(sp.creditAt, st.waitStart(), s.conn.creditAt)
 		if !has || w < oldest {
 			oldest, has = w, true
 		}
@@ -454,7 +446,7 @@ type PipeSettings struct {
 	Liveness          *PipeLiveness
 }
 
-// SetPipe applies tier settings to an attachment (MULTIPATH.md 9).
+// SetPipe applies tier settings to an attachment.
 func (s *Session) SetPipe(id uint64, o PipeSettings) error {
 	if s.mp == nil {
 		return ErrNotNegotiated
@@ -541,6 +533,7 @@ func (s *Session) requestStatus(p *Pipe) {
 		return
 	}
 	a.statusSeq++
+	a.statusHeld = a.statusHeld || a.hs
 	if len(a.statusQ) >= statusOwedMax {
 		a.statusQ = a.statusQ[1:]
 	}
@@ -564,7 +557,7 @@ func (s *Session) statusLost(p *Pipe, seq uint64) {
 }
 
 // onPipeStatus applies the peer's request for the local outbound
-// direction (MULTIPATH.md 9).
+// direction.
 func (s *Session) onPipeStatus(f *wire.Frame) *wire.Error {
 	m := s.mp
 	q := s.pipe(f.PipeID)
@@ -589,7 +582,7 @@ func (s *Session) onPipeStatus(f *wire.Frame) *wire.Error {
 	return nil
 }
 
-// checkTakeover runs the standby takeover (MULTIPATH.md 9): while an
+// checkTakeover runs the standby takeover: while an
 // attachment's own standby outbound pipe carries the traffic because no
 // non-standby pipe is usable, its standby request for the peer's
 // direction is replaced by "available"; once a non-standby pipe is usable
@@ -630,16 +623,17 @@ func (s *Session) writeStatus(w *recWriter, q *Pipe) bool {
 		w.logFrame(frameDesc{kind: dStatus, id: id, val: r.seq})
 		qa.statusQ = qa.statusQ[1:]
 	}
-	if len(qa.statusQ) == 0 {
-		qa.statusQ = nil
-	}
+	qa.statusQ, qa.statusHeld = nil, false
 	return true
 }
 
-// statusReady reports whether q's PIPE_STATUS may go out: the attachment
-// is ACTIVE (a change made while JOINING waits for that).
-func statusReady(q *Pipe) bool {
+// statusReady reports whether q's PIPE_STATUS may go out on p: the attachment is
+// ACTIVE, and a change made while JOINING goes on the attachment itself, or for a
+// down attachment once its first record has arrived.
+func statusReady(q, p *Pipe) bool {
 	qa := q.mp
-	return qa != nil && len(qa.statusQ) > 0 && !qa.retired && q.in != nil && qa.in == InOpen &&
-		qa.out != OutJoining && (!qa.joinerLocal || qa.out != OutNone || qa.in != InJoining)
+	if qa == nil || len(qa.statusQ) == 0 || qa.retired || qa.hs || q.in == nil || qa.in != InOpen {
+		return false
+	}
+	return !qa.statusHeld || q == p
 }

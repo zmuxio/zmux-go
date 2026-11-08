@@ -4,11 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	mrand "math/rand/v2"
+	"slices"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// State is the session state (STATE_MACHINE.md 4.1).
+// State is the session state.
 type State uint8
 
 const (
@@ -24,17 +25,18 @@ var stateNames = [...]string{"ESTABLISHING", "ACTIVE", "DRAINING", "SUSPENDED", 
 
 func (s State) String() string { return stateNames[s] }
 
-// Features are the features in use (SPEC.md 5.5).
+// Features are the features in use.
 type Features struct {
 	Role, GoAway, Preamble, Priority, Flows, Multipath, PipeAck, Resume bool
 	// LanesOut: lanes available toward the peer (we may open them).
 	LanesOut bool
 	// LanesIn: lanes available toward us (the peer may open them).
 	LanesIn bool
-	// JoinSecurityUnavailable: both offered multipath, no secret source.
+	// JoinSecurityUnavailable: both offered multipath and the peer has no
+	// secret source (a local one is required by configuration).
 	JoinSecurityUnavailable bool
 	// CarrierDatagrams: DATAGRAM frames may go on the datagram channels of
-	// pipe carriers (EXTENSIONS.md 6.8).
+	// pipe carriers.
 	CarrierDatagrams bool
 }
 
@@ -50,11 +52,23 @@ type Session struct {
 
 	role      Role // resolved role (initiator/responder)
 	roleKnown bool
-	peer      wire.Params
-	peerSeen  bool
-	feat      Features
-	gates     wire.Gates
-	peerZmux  bool
+	// Flags of the session, kept together.
+	secretSet      bool // SetJoinSecret supplied the deferred PSK
+	declared       bool // pipe 0 is known end to end
+	greaseFirst    bool
+	closedEmitted  bool
+	preSuspend     State // the state before the suspension, restored at its end
+	earlyHeld      bool  // provisional sends wait for the carrier's verdict
+	firstHeld      bool  // pipe 0 writes nothing until ReleaseFirstFlight
+	earlyAccepted  bool
+	carrierEarlyIn bool // the bootstrap carrier delivers early data not yet confirmed by its handshake
+	copyMaxData    bool
+
+	peer     wire.Params
+	peerSeen bool
+	feat     Features
+	peerZmux bool
+	gates    wire.Gates
 
 	// Peer limits for sending.
 	peerMaxRecord uint64
@@ -88,28 +102,20 @@ type Session struct {
 	evHead            int
 	wakes             []*Signal
 	actions           []Action
-	closedW           []*Signal
 	estW              []*Signal
 	keyW              []*Signal // joins held until the deferred PSK derives the join keys
-	secretSet         bool      // SetJoinSecret supplied the deferred PSK
 	bcast             *Signal   // session-level broadcast for waits that watch state
 	stats             Stats
-	greaseFirst       bool
-	closedEmitted     bool
+	earnBytes         uint64 // own bytes sent: no padding, injections or copies
+	earnSkip          uint64 // bytes earned on a discarded first flight, not earned twice
 	openLocalBidiRecv uint64
 	retiredPipes      []uint64
-	preSuspend        State
 	tn                tuneState
 	rxPipe            *Pipe  // the pipe of the record being processed
 	initConnWin       uint64 // the initial session window
 	charged           uint64 // the charge on cfg.Budget
-	earlyHeld         bool   // provisional sends wait for the carrier's verdict
-	firstHeld         bool   // pipe 0 writes nothing until ReleaseFirstFlight
-	earlyAccepted     bool
-	carrierEarlyIn    bool // the bootstrap carrier delivers early data not yet confirmed by its handshake
 	capWaiters        []*Stream
 	q                 sessQuality
-	copyMaxData       bool
 	shp               *shapeSess // nil until a Shaper is set
 	suspendedAt       Time       // when the current suspension began
 }
@@ -134,7 +140,7 @@ type Stats struct {
 	DatagramsSentChannel     uint64
 	DatagramsReceivedChannel uint64
 	// Payload bytes of the datagrams counted in DatagramsSent and of
-	// those the application received (API.md 7.1).
+	// those the application received.
 	DatagramBytesSent     uint64
 	DatagramBytesReceived uint64
 	// StreamCreditWaits counts opens that waited for stream-count credit.
@@ -142,7 +148,7 @@ type Stats struct {
 	// BytesReinjected counts stream bytes sent again after a pipe failed
 	// or became suspect, or opportunistically (BytesOpportunistic).
 	BytesReinjected uint64
-	Penalties       uint64 // pipes penalized (MULTIPATH.md 7.5.1)
+	Penalties       uint64 // pipes penalized
 	Reinjections    uint64 // reinjection episodes
 	// BytesDuplicateReceived counts stream bytes received again (multipath).
 	BytesDuplicateReceived uint64
@@ -150,7 +156,8 @@ type Stats struct {
 	PipeFailures           uint64
 	JoinAuthFailures       uint64
 	JoinReplays            uint64
-	JoinSecretPending      uint64 // peer joins held for the deferred PSK
+	JoinPending            uint64 // peer joins held for the join keys
+	JoinBatchDropped       uint64 // first batch frames dropped
 	JoinRefusals           uint64 // own joins refused with ZMUX_PIPE_RESOURCE_LIMIT
 	Suspensions            uint64
 	SuspendedTime          Duration // the current suspension excluded (SessionStats adds it)
@@ -168,9 +175,9 @@ type localCount struct {
 type remoteCount struct {
 	opened      uint64 // highest opened index + 1
 	limit       uint64 // advertised MAX_STREAMS
-	initial     uint64 // concurrency (initial limit of SPEC 8.5 rule 3)
+	initial     uint64 // concurrency: the initial stream limit, which credit never lowers
 	discarded   uint64
-	staged      bool // uni credit not yet raised (SPEC 8.5 rule 4)
+	staged      bool // uni credit not yet raised past the initial limit
 	blockedSeen uint64
 }
 
@@ -190,12 +197,16 @@ type closeFrame struct {
 	pending   bool
 	app       bool
 	sentAll   bool
-	waitLanes bool // wait until lanes are covered (SPEC.md 6.5 step 1)
+	waitLanes bool // wait until lanes are covered
+	// lingering: timers.linger is the linger timeout of step 3, armed once
+	// every carrier took CONNECTION_CLOSE; before that it bounds step 1's
+	// wait for a carrier that does not take it.
+	lingering bool
 }
 
 // New creates a session. The bootstrap pipe is attached with AttachBootstrap.
 func New(cfg Config, now Time) *Session {
-	s := &Session{cfg: cfg, now: now, start: now, streams: make(map[uint64]*Stream)}
+	s := &Session{cfg: cfg, now: now, start: now, streams: make(map[uint64]*Stream), declared: cfg.Declared}
 	if s.cfg.Local.MaxRecordSize == 0 {
 		s.cfg.Local.MaxRecordSize = wire.DefaultMaxRecordSize
 	}
@@ -313,7 +324,7 @@ func (s *Session) Established() bool { return s.peerSeen }
 func (s *Session) isClosing() bool { return s.state >= StateClosing }
 
 // processPeerParams runs when the first frame of the inbound bootstrap pipe
-// decoded (SPEC.md 5.1, 6.1).
+// decoded.
 func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	s.peer = *p
 	s.peerSeen = true
@@ -321,7 +332,7 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	l := &s.cfg.Local
 	s.feat = Features{}
 	f := &s.feat
-	// Role negotiation (EXTENSIONS.md 2.3).
+	// Role negotiation.
 	if l.Has&wire.HasRole != 0 && p.Has&wire.HasRole != 0 {
 		f.Role = true
 		lr, pr := l.Role, p.Role
@@ -362,10 +373,19 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	f.Flows = both(wire.HasFlows) && l.Has&wire.HasDatagram != 0
 	f.CarrierDatagrams = both(wire.HasCarrierDatagrams) && l.Has&wire.HasDatagram != 0
 	if both(wire.HasMultipath) {
-		if sel := l.SecretFlags & p.SecretFlags; sel&(wire.SecretExporter|wire.SecretPSK) != 0 || sel&wire.SecretInsecure != 0 {
-			f.Multipath = true
-		} else {
+		const sources = wire.SecretExporter | wire.SecretPSK
+		lf, pf := l.SecretFlags&sources, p.SecretFlags&sources
+		switch {
+		case lf == 0 || pf == 0:
+			if s.cfg.SecureFirstPipe {
+				return wire.ErrParam("secret flags of a secure first pipe")
+			}
 			f.JoinSecurityUnavailable = true
+		case lf != pf:
+			// Never the intersection: a party on the path could clear a flag.
+			return wire.ErrParam("differing secret flags")
+		default:
+			f.Multipath = true
 		}
 	}
 	f.PipeAck = both(wire.HasPipeAck) && !f.Multipath
@@ -398,11 +418,11 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 		if err := s.startMultipath(); err != nil {
 			return err
 		}
-	}
-	if s.cfg.DeferredPSK && s.secretSet && (s.mp == nil || !s.mp.usePSK) {
-		// A deferred PSK supplied early that the negotiation did not
-		// select is dropped: SetJoinSecret now reports ErrNotNegotiated.
-		clear(s.cfg.PSK)
+	} else if s.cfg.PSK != nil {
+		// No secret will be derived: a deferred PSK this session holds is dropped.
+		if s.secretSet {
+			clear(s.cfg.PSK)
+		}
 		s.cfg.PSK, s.secretSet = nil, false
 	}
 	if s.state == StateEstablishing {
@@ -412,9 +432,6 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	s.timers.lastActivity = s.now
 	s.timers.lastKeepRef = -1
 	s.emit(Event{Kind: EvEstablished, Features: *f, Role: s.role})
-	if f.JoinSecurityUnavailable {
-		s.emit(Event{Kind: EvJoinSecurityUnavailable})
-	}
 	for _, w := range s.estW {
 		s.wake(w)
 	}
@@ -433,16 +450,7 @@ func (s *Session) WaitEstablished(sig *Signal) bool {
 	return false
 }
 
-// WaitClosed registers sig until the session is CLOSED.
-func (s *Session) WaitClosed(sig *Signal) bool {
-	if s.state == StateClosed {
-		return true
-	}
-	s.closedW = append(s.closedW, sig)
-	return false
-}
-
-// idleTimeout is the effective idle timeout (SPEC.md 6.4).
+// idleTimeout is the effective idle timeout.
 func (s *Session) idleTimeout() Duration {
 	a, b := s.cfg.Local.MaxIdleTimeout, s.peer.MaxIdleTimeout
 	switch {
@@ -457,7 +465,8 @@ func (s *Session) idleTimeout() Duration {
 	}
 }
 
-// srtt is the session SRTT of SPEC.md 1.3.
+// srtt is the session SRTT: the largest pipe SRTT, else the initial
+// estimate.
 func (s *Session) srtt() Duration {
 	if s.cfg.Test.RTT > 0 && s.ack == nil {
 		return s.cfg.Test.RTT
@@ -473,14 +482,14 @@ func (s *Session) srtt() Duration {
 	return 333 * Millisecond
 }
 
-// lingerTimeout is min(2 s, max(250 ms, 3 x SRTT)) (SPEC.md 6.5).
+// lingerTimeout is min(2 s, max(250 ms, 3 x SRTT)).
 func (s *Session) lingerTimeout() Duration {
 	return minD(2*Second, maxD(250*Millisecond, MulD(s.srtt(), 3)))
 }
 
 // closeWith enters CLOSING and queues CONNECTION_CLOSE fr on every live
 // outbound pipe; with fr nil, or without a live outbound pipe, it closes the
-// carriers at once (CLOSED). The first error wins (SPEC.md 6.5).
+// carriers at once (CLOSED). The first error wins.
 func (s *Session) closeWith(e *SessionError, fr *closeFrame) {
 	if s.state >= StateClosing {
 		return
@@ -504,7 +513,7 @@ func (s *Session) closeWith(e *SessionError, fr *closeFrame) {
 	s.wakeAllWriters()
 }
 
-// Close closes the session with an application error (SPEC.md 6.5).
+// Close closes the session with an application error.
 func (s *Session) Close(code uint64, reason []byte) {
 	s.closeWith(&SessionError{Kind: CloseApplication, Code: code, Reason: string(reason)},
 		&closeFrame{app: true, code: code, reason: reason})
@@ -524,14 +533,7 @@ func (s *Session) failLocal(e *wire.Error) {
 
 // closeTransport closes with a transport CONNECTION_CLOSE carrying e.
 func (s *Session) closeTransport(e *SessionError) {
-	rs := e.Reason
-	if e.Details != "" {
-		rs += "\n" + e.Details
-	}
-	if len(rs) > 1024 {
-		rs = rs[:1024]
-	}
-	s.closeWith(e, &closeFrame{code: e.Code, frameType: e.FrameType, reason: []byte(rs)})
+	s.closeWith(e, &closeFrame{code: e.Code, frameType: e.FrameType, reason: []byte(wire.Phrase(e.Reason, e.Details))})
 }
 
 // closeSilently closes without CONNECTION_CLOSE (handshake timeout, pipes
@@ -579,10 +581,6 @@ func (s *Session) finishClose() {
 	}
 	s.timers = timers{handshake: Never, linger: Never, grace: Never}
 	s.emitClosedEvent()
-	for _, w := range s.closedW {
-		s.wake(w)
-	}
-	s.closedW = nil
 	s.releaseAll()
 	s.wakeAll()
 }
@@ -601,12 +599,7 @@ func (s *Session) emitClosedEvent() {
 }
 
 func (s *Session) hasLiveOutbound() bool {
-	for _, p := range s.pipes {
-		if s.canCarryClose(p) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(s.pipes, s.canCarryClose)
 }
 
 // wakeAll queues every waiter of the session (close, GOAWAY).

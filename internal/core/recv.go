@@ -6,8 +6,8 @@ import (
 )
 
 // lookupStream resolves the stream a frame references, opening peer streams
-// implicitly (SPEC.md 7.2 rules 2-4). It returns nil without error for a
-// discarded stream (crossing frame, SPEC.md 7.6). opens is whether the
+// implicitly. It returns nil without error for a
+// discarded stream (crossing frame). opens is whether the
 // frame may open a peer stream of this direction.
 func (s *Session) lookupStream(id uint64, opens bool) (*Stream, *wire.Error) {
 	if st := s.streams[id]; st != nil {
@@ -73,7 +73,7 @@ func (s *Session) offer(st *Stream) {
 }
 
 // stackRejectStream rejects a peer stream with ZMUX_REJECTED on both parts
-// without offering it (EXTENSIONS.md 3.4, 7.2).
+// without offering it.
 func (s *Session) stackRejectStream(st *Stream) {
 	st.stackReject = true
 	st.releasedR, st.releasedS = true, true
@@ -120,8 +120,7 @@ func (s *Session) CancelAcceptWait(bidi bool, sig *Signal) {
 	}
 }
 
-// unstageUni raises staged unidirectional credit on the first accept
-// (SPEC.md 8.5 rule 4).
+// unstageUni raises staged unidirectional credit on the first accept.
 func (s *Session) unstageUni() {
 	rc := &s.rem[1]
 	if !rc.staged {
@@ -175,11 +174,11 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		top = max64(top, r.final)
 	}
 	if end > top {
-		s.conn.recv += end - top
-		if s.conn.recv > s.conn.adv {
+		if s.conn.recv+(end-top) > s.conn.adv {
 			return false, wire.NewError(wire.FlowControlError, "session data beyond the limit", "stream", st.id,
 				"limit", s.conn.adv)
 		}
+		s.conn.recv += end - top
 	}
 	if s.feat.Multipath {
 		s.countDuplicate(r, off, end)
@@ -195,7 +194,7 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 	if s.tuneOn() {
 		s.tuneData(st)
 	}
-	// Preamble of a peer stream (EXTENSIONS.md 4.4).
+	// Preamble of a peer stream.
 	data := f.Data
 	if !st.local && s.feat.Preamble && !r.preDone && off == 0 {
 		var pre wire.Preamble
@@ -212,7 +211,7 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 			return false, e
 		}
 		// Bytes buffered before the preamble that overlap it leave the
-		// buffer through the one accounting path (C1).
+		// buffer through the one accounting path.
 		if d := r.buf.discard(r.preSize); d > 0 {
 			s.bufSub(d)
 		}
@@ -279,8 +278,8 @@ func copyPreamble(p *wire.Preamble) *peerPreamble {
 	return pp
 }
 
-// checkPreambleReset enforces EXTENSIONS.md 4.4 rule 2 once both the
-// preamble size and a reset are known.
+// checkPreambleReset enforces that a reset never cuts into the stream
+// preamble, once both the preamble size and the reset are known.
 func (s *Session) checkPreambleReset(st *Stream) *wire.Error {
 	r := &st.rcv
 	if st.local || !s.feat.Preamble || r.stopSent || r.stopped || !r.reset {
@@ -364,7 +363,7 @@ func (s *Session) onReset(f *wire.Frame, at bool) (bool, *wire.Error) {
 	if e := s.checkPreambleReset(st); e != nil {
 		return false, e
 	}
-	// Release the gap the reset makes undeliverable (SPEC.md 8.3).
+	// Release the gap the reset makes undeliverable.
 	lo, hi := r.resetRel, min64(r.relLo, r.final)
 	if lo < hi {
 		gap := (hi - lo) - r.arrived.covered(lo, hi)
@@ -469,7 +468,7 @@ func (s *Session) stopRecv(st *Stream, code uint64) {
 }
 
 // Release drops every handle: an unfinished sending part is reset and an
-// unread receiving part stopped, both with code 0 (EXTENSIONS.md 7.4).
+// unread receiving part stopped, both with code 0.
 func (s *Session) Release(st *Stream) {
 	if st.hasS && !st.snd.finWr && !st.snd.reset {
 		s.Reset(st, 0)
@@ -482,7 +481,7 @@ func (s *Session) Release(st *Stream) {
 	s.maybeDiscard(st)
 }
 
-// Reject declines an accepted stream before reading (EXTENSIONS.md 7.2).
+// Reject declines an accepted stream before reading.
 func (s *Session) Reject(st *Stream) {
 	if st.hasS && !st.snd.reset {
 		st.snd.errState = &StreamError{Kind: StreamRejected, StreamID: st.id}
@@ -497,7 +496,7 @@ func (s *Session) Reject(st *Stream) {
 }
 
 // maybeDiscard discards the stream's state once both parts are terminal and
-// the application released it (SPEC.md 7.6, 8.5).
+// the application released it.
 func (s *Session) maybeDiscard(st *Stream) {
 	if st.discarded || !st.idSet {
 		return

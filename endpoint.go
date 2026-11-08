@@ -50,7 +50,7 @@ func ClassifyHTTP(r *http.Request) HTTPClass {
 		switch {
 		case r.ProtoMajor == 1 && headerHasToken(r.Header, "Upgrade", "websocket"):
 			return HTTPClassWebSocket
-		case r.Header.Get(HeaderPair) != "" || r.Header.Get(HeaderJoin) != "":
+		case r.Header.Get(HeaderPair) != "":
 			return HTTPClassDownlink
 		}
 	case http.MethodConnect:
@@ -73,8 +73,6 @@ func ClassifyHTTP(r *http.Request) HTTPClass {
 			return HTTPClassUplink
 		case r.ContentLength >= 0:
 			return HTTPClassExchange
-		case r.Header.Get(HeaderJoin) != "":
-			return HTTPClassUplink
 		}
 		return HTTPClassBidirectional
 	}
@@ -94,8 +92,8 @@ func headerHasToken(h http.Header, name, token string) bool {
 	return false
 }
 
-// HTTPEndpoint serves every HTTP carrier kind on one request target
-// (API.md 4.8): it classifies each request with
+// HTTPEndpoint serves every HTTP carrier kind on one request target:
+// it classifies each request with
 // ClassifyHTTP and hands it to the adapter of its class, which runs its
 // own admission and serves what it does not accept with its own fallback.
 // It adds no behaviour of its own: a request of a class without an adapter,

@@ -28,7 +28,7 @@ func TestServeAdmission(t *testing.T) {
 	}
 	adm := &zmux.Admission{Peek: zmux.PrefixTokenLen, PeekTimeout: time.Second, Decide: v.Decide,
 		StallMin: 10 * time.Millisecond, StallMax: 20 * time.Millisecond}
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
@@ -122,7 +122,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 			decided.Add(1)
 			return zmux.Decision{Verdict: zmux.VerdictAccept}
 		}}
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
@@ -189,7 +189,7 @@ func TestServeAdmissionMore(t *testing.T) {
 			}
 			return zmux.Decision{Verdict: zmux.VerdictAccept, Skip: int(prefix[1]), Variant: "q"}
 		}}
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
@@ -199,6 +199,7 @@ func TestServeAdmissionMore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = qc.CloseWithError(0, "") }()
 	p, err := OpenPipe(ctx, qc)
 	if err != nil {
 		t.Fatal(err)

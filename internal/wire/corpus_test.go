@@ -175,7 +175,7 @@ func TestCorpusInvalid(t *testing.T) {
 	}
 }
 
-// checkRoundTrip checks CONFORMANCE.md 4.1: re-encoding is no longer, decodes
+// checkRoundTrip checks the round-trip rule: re-encoding is no longer, decodes
 // to an equal frame and is stable.
 func checkRoundTrip(t testing.TB, id string, b []byte, exact bool) {
 	var f1, f2 Frame
@@ -213,7 +213,7 @@ func FuzzDecodeFrame(f *testing.F) {
 		if _, err := DecodeFrame(b, &fr); err == nil && fr.Kind == KindTransportParams {
 			var p, q Params
 			if DecodeParams(fr.Data, &p) == nil {
-				enc := AppendParams(nil, &p)
+				enc, _ := AppendParams(nil, &p)
 				if err := DecodeParams(enc, &q); err != nil {
 					t.Fatalf("re-encoded params fail: %v", err)
 				}

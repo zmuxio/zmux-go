@@ -133,7 +133,7 @@ func TestEarlyCarrierFloor(t *testing.T) {
 				waitUntil(t, 5*time.Second, "the restart", func() bool { return layer.restarts.Load() == 1 })
 			}
 			go func() {
-				s, err := Start(ctx, NetPipe(b), RoleServer, mpConfig())
+				s, err := startServerNoListener(ctx, NetPipe(b), mpConfig())
 				ch <- res{s, err}
 			}()
 			if accept {
@@ -222,7 +222,7 @@ func TestEarlyCarrierFloorCombinations(t *testing.T) {
 			}
 			ch := make(chan *Conn, 1)
 			go func() {
-				s, err := Start(ctx, NetPipe(b), RoleServer, mpConfig())
+				s, err := startServerNoListener(ctx, NetPipe(b), mpConfig())
 				if err != nil {
 					t.Error(err)
 				}
@@ -269,7 +269,7 @@ func TestEarlyServerReplayable(t *testing.T) {
 	scfg.EarlyData.Replayable = true
 	ch := make(chan *Conn, 1)
 	go func() {
-		s, err := Start(ctx, PipeIO{R: b, W: es}, RoleServer, scfg)
+		s, err := startServerNoListener(ctx, PipeIO{R: b, W: es}, scfg)
 		if err != nil {
 			t.Error(err)
 		}
@@ -339,7 +339,7 @@ func TestEarlyCarrierRejectedStop(t *testing.T) {
 	waitUntil(t, 5*time.Second, "the restart", func() bool { return layer.restarts.Load() == 1 })
 	ch := make(chan *Conn, 1)
 	go func() {
-		s, err := Start(ctx, NetPipe(b), RoleServer, mpConfig())
+		s, err := startServerNoListener(ctx, NetPipe(b), mpConfig())
 		if err != nil {
 			t.Error(err)
 		}
@@ -413,7 +413,7 @@ func TestEarlyCarrierRestartFailsClose(t *testing.T) {
 	})
 	ch := make(chan error, 1)
 	go func() {
-		s, err := Start(ctx, PipeIO{R: b, W: deafWriter{b}}, RoleServer, mpConfig())
+		s, err := startServerNoListener(ctx, PipeIO{R: b, W: deafWriter{b}}, mpConfig())
 		if err != nil {
 			ch <- err
 			return
@@ -433,4 +433,102 @@ func TestEarlyCarrierRestartFailsClose(t *testing.T) {
 	}
 	waitDone(t, c)
 	_ = st
+}
+
+// peerBytesSeen counts what a carrier's read half delivered.
+type peerBytesSeen struct {
+	net.Conn
+	n atomic.Int64
+}
+
+func (r *peerBytesSeen) Read(b []byte) (int, error) {
+	n, err := r.Conn.Read(b)
+	r.n.Add(int64(n))
+	return n, err
+}
+
+// The peer's first bytes may be read before the verdict is applied, a
+// server speaking as soon as its carrier decided: they wait for the
+// verdict, so a rejected flight restarts, or fails with a close the peer
+// can read, whichever came first.
+func TestEarlyCarrierPeerBytesBeforeVerdict(t *testing.T) {
+	t.Run("restart", func(t *testing.T) {
+		leakcheck.Check(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		a, b := net.Pipe()
+		r := &peerBytesSeen{Conn: a}
+		layer := &earlyLayer{Conn: r, verdict: make(chan bool, 1)}
+		c, err := Start(ctx, PipeIO{R: r, W: layer}, RoleClient, earlyFloorConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := c.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg := []byte("early request")
+		if _, err := st.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		_ = st.Close()
+		ch := make(chan *Conn, 1)
+		go func() {
+			s, err := startServerNoListener(ctx, NetPipe(b), mpConfig())
+			if err != nil {
+				t.Error(err)
+			}
+			ch <- s
+		}()
+		waitUntil(t, 5*time.Second, "the peer's bytes", func() bool { return r.n.Load() > 0 })
+		layer.decide(false)
+		s := <-ch
+		if s == nil {
+			_ = c.Close()
+			waitDone(t, c)
+			return
+		}
+		defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
+		ss, err := s.AcceptStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := io.ReadAll(ss); err != nil || !bytes.Equal(got, msg) {
+			t.Fatalf("server read %q, %v", got, err)
+		}
+		echoOnce(t, ctx, c, s)
+	})
+	t.Run("failed restart", func(t *testing.T) {
+		leakcheck.Check(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		a, b := net.Pipe()
+		layer := failingRestart{&earlyLayer{Conn: a, verdict: make(chan bool, 1)}}
+		r := &peerBytesSeen{Conn: a}
+		c, err := Start(ctx, PipeIO{R: r, W: layer}, RoleClient, earlyFloorConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch := make(chan error, 1)
+		go func() {
+			s, err := startServerNoListener(ctx, PipeIO{R: b, W: deafWriter{b}}, mpConfig())
+			if err != nil {
+				ch <- err
+				return
+			}
+			ch <- s.Wait()
+		}()
+		waitUntil(t, 5*time.Second, "the peer's bytes", func() bool { return r.n.Load() > 0 })
+		layer.decide(false)
+		select {
+		case err := <-ch:
+			var te *TransportError
+			if !errors.As(err, &te) || !te.Remote || te.ErrorMessage != "early data restart failed" {
+				t.Fatalf("server ended with %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("the server never saw the close")
+		}
+		waitDone(t, c)
+	})
 }

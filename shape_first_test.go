@@ -25,7 +25,7 @@ func (d *firstDelay) Plan(_ *shaping.RecordView, p *shaping.RecordPlan) {
 	}
 	d.n++
 }
-func (d *firstDelay) OnEvent(*shaping.Event, *shaping.Reply) {}
+func (d *firstDelay) OnEvent(*shaping.Event, *shaping.Effects) {}
 
 // A shaping delay on the first record of the bootstrap pipe, installed
 // from the session's creation, holds the transport parameters, which

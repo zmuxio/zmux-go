@@ -60,7 +60,7 @@ type Stream struct {
 	hasS  bool // has a sending part
 	hasR  bool // has a receiving part
 
-	// Life cycle (STATE_MACHINE.md 2.3).
+	// Life cycle.
 	offered     bool // peer stream offered through accept
 	accepted    bool
 	releasedS   bool // the application gave up the sending part
@@ -88,8 +88,8 @@ type Stream struct {
 	cnt streamCounters
 }
 
-// streamCounters are the counts of StreamStats that no other field keeps
-// (API.md 7.2); they are never reset, so a released stream keeps them.
+// streamCounters are the counts of StreamStats that no other field keeps;
+// they are never reset, so a released stream keeps them.
 type streamCounters struct {
 	bytesSent       uint64 // payload bytes put into STREAM frames, every copy
 	appRead         uint64 // payload bytes returned to the application
@@ -352,7 +352,7 @@ func (s *Session) newStream(bidi, local bool) *Stream {
 	return st
 }
 
-// allocID gives a local stream its identifier (SPEC.md 7.2 rule 1).
+// allocID gives a local stream its identifier.
 // allocID allocates the identifier and queues the preamble. A preamble
 // above the peer's limit (which may have shrunk since it was set) fails
 // the stream locally instead: nothing is sent, and it returns false.
@@ -490,8 +490,8 @@ func (st *Stream) applyPeerParams() {
 	}
 }
 
-// PinID returns the identifier, pinning it before the first frame (SPEC.md
-// 7.2 rule 1).
+// PinID returns the identifier, pinning it before the first frame
+// in the order identifiers are allocated.
 func (s *Session) PinID(st *Stream) (uint64, error) {
 	if st.idSet {
 		return st.id, nil

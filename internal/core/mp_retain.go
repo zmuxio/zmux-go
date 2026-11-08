@@ -1,6 +1,6 @@
 package core
 
-// Retention of unacknowledged information (MULTIPATH.md 7.4): every
+// Retention of unacknowledged information: every
 // ack-eliciting frame with a reinjection rule is logged per outbound lane with
 // the position that ends its record; a PIPE_ACK pops the entries it covers
 // (acked), a suspect or failed pipe turns the rest into "send this scope again"
@@ -38,8 +38,11 @@ type retained struct {
 	end        uint64 // lane position after the record carrying the frame
 	d          frameDesc
 	reinjected bool
-	sent       Time     // when the batch was handed to the carrier
-	due        Duration // E: the acknowledgement time expected at sending (7.5.1)
+	// penalized: re-sent once because a penalty of its pipe moved the
+	// binding of its stream direction away.
+	penalized bool
+	sent      Time     // when the batch was handed to the carrier
+	due       Duration // E: the acknowledgement time expected at sending, for penalization
 }
 
 // mpSend is the multipath side storage of a sending part.
@@ -119,7 +122,7 @@ func (s *Session) ackLog(ol *outLane, pos uint64) {
 }
 
 // reinjectPipe marks the unacknowledged information of a pipe for sending
-// again, at most once per entry (MULTIPATH.md 7.4).
+// again, at most once per entry.
 func (s *Session) reinjectPipe(p *Pipe) {
 	if p.out == nil {
 		return

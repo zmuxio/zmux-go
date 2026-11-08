@@ -3,15 +3,15 @@ package zmux_test
 import (
 	"context"
 	"errors"
-	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
-// Rows of the liveness bound (MULTIPATH.md 7.1) measured through a relay
+// Rows of the liveness bound measured through a relay
 // that turns into a black hole: the carrier stays connected and every
 // byte is dropped.
 
@@ -90,35 +90,39 @@ func busy(t *testing.T, e *relayEnv) {
 // here, plus the round trips of a loaded test host).
 func TestLivenessDataPipe(t *testing.T) {
 	t.Parallel()
-	e := newRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, true)
-	busy(t, e)
-	time.Sleep(300 * time.Millisecond)
-	if d := suspectAfter(t, e, 0, 5*time.Second); d > 2*time.Second {
-		t.Fatalf("data pipe suspect after %v", d)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		e := newMemRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, true)
+		busy(t, e)
+		time.Sleep(300 * time.Millisecond)
+		if d := suspectAfter(t, e, 0, 5*time.Second); d > 2*time.Second {
+			t.Fatalf("data pipe suspect after %v", d)
+		}
+	})
 }
 
 // A standby pipe of a busy session is probed every standby_probe: its
 // silent death is suspected within standby_probe + T_suspect.
 func TestLivenessStandbyBusy(t *testing.T) {
 	t.Parallel()
-	e := newRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, false)
-	nc, err := net.Dial("tcp", e.relay.Addr())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	sb := true
-	p, err := e.client.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{SendStandby: &sb})
-	if err != nil {
-		t.Fatal(err)
-	}
-	busy(t, e)
-	time.Sleep(1500 * time.Millisecond) // the join settles and a standby probe runs
-	if d := suspectAfter(t, e, p.ID(), 4*time.Second); d > 2500*time.Millisecond {
-		t.Fatalf("standby pipe suspect after %v (standby_probe 1 s + T_suspect)", d)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		e := newMemRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, false)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		nc, err := e.dialRelay(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sb := true
+		p, err := e.client.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{SendStandby: &sb})
+		if err != nil {
+			t.Fatal(err)
+		}
+		busy(t, e)
+		time.Sleep(1500 * time.Millisecond) // the join settles and a standby probe runs
+		if d := suspectAfter(t, e, p.ID(), 4*time.Second); d > 2500*time.Millisecond {
+			t.Fatalf("standby pipe suspect after %v (standby_probe 1 s + T_suspect)", d)
+		}
+	})
 }
 
 // A session without multipath: keep-alive (on by default, capped at half
@@ -126,28 +130,30 @@ func TestLivenessStandbyBusy(t *testing.T) {
 // and closes it within the idle timeout once its carrier dies silently.
 func TestLivenessSingleKeepAlive(t *testing.T) {
 	t.Parallel()
-	cfg := func() *zmux.Config { return &zmux.Config{MaxIdleTimeout: 2 * time.Second} }
-	e := newRelayEnv(t, cfg(), cfg(), zmuxtest.RelayOptions{}, true)
-	done := make(chan error, 1)
-	go func() { done <- e.client.Wait() }()
-	select {
-	case err := <-done:
-		t.Fatalf("idle session with keep-alive closed: %v", err)
-	case <-time.After(5 * time.Second):
-	}
-	e.relay.Blackhole(true, true)
-	start := time.Now()
-	select {
-	case err := <-done:
-		if !errors.Is(err, zmux.ErrIdleTimeout) {
-			t.Fatalf("closed with %v", err)
+	synctest.Test(t, func(t *testing.T) {
+		cfg := func() *zmux.Config { return &zmux.Config{MaxIdleTimeout: 2 * time.Second} }
+		e := newMemRelayEnv(t, cfg(), cfg(), zmuxtest.RelayOptions{}, true)
+		done := make(chan error, 1)
+		go func() { done <- e.client.Wait() }()
+		select {
+		case err := <-done:
+			t.Fatalf("idle session with keep-alive closed: %v", err)
+		case <-time.After(5 * time.Second):
 		}
-		if el := time.Since(start); el > 3*time.Second {
-			t.Fatalf("closed %v after the carrier died (idle timeout 2 s)", el)
+		e.relay.Blackhole(true, true)
+		start := time.Now()
+		select {
+		case err := <-done:
+			if !errors.Is(err, zmux.ErrIdleTimeout) {
+				t.Fatalf("closed with %v", err)
+			}
+			if el := time.Since(start); el > 3*time.Second {
+				t.Fatalf("closed %v after the carrier died (idle timeout 2 s)", el)
+			}
+		case <-time.After(6 * time.Second):
+			t.Fatal("session alive after its carrier died")
 		}
-	case <-time.After(6 * time.Second):
-		t.Fatal("session alive after its carrier died")
-	}
+	})
 }
 
 // A DeadTimeout set while the session runs bounds the failure of a pipe
@@ -155,25 +161,27 @@ func TestLivenessSingleKeepAlive(t *testing.T) {
 // 30 s idle timeout) the black-holed session would stay up for 15 s.
 func TestRelaySetLivenessDeadTimeout(t *testing.T) {
 	t.Parallel()
-	c := relayConfig(0)
-	c.SchedulerParams.ProbeInterval = time.Second
-	e := newRelayEnv(t, c, relayConfig(0), zmuxtest.RelayOptions{}, true)
-	if err := e.client.SetLiveness(zmux.Liveness{ProbeInterval: time.Second, DeadTimeout: time.Second}); err != nil {
-		t.Fatal(err)
-	}
-	e.relay.Blackhole(true, true)
-	start := time.Now()
-	done := make(chan error, 1)
-	go func() { done <- e.client.Wait() }()
-	select {
-	case err := <-done:
-		if !errors.Is(err, zmux.ErrPipesLost) {
-			t.Fatalf("session ended with %v", err)
+	synctest.Test(t, func(t *testing.T) {
+		c := relayConfig(0)
+		c.SchedulerParams.ProbeInterval = time.Second
+		e := newMemRelayEnv(t, c, relayConfig(0), zmuxtest.RelayOptions{}, true)
+		if err := e.client.SetLiveness(zmux.Liveness{ProbeInterval: time.Second, DeadTimeout: time.Second}); err != nil {
+			t.Fatal(err)
 		}
-		if el := time.Since(start); el > 6*time.Second {
-			t.Fatalf("ended after %v", el)
+		e.relay.Blackhole(true, true)
+		start := time.Now()
+		done := make(chan error, 1)
+		go func() { done <- e.client.Wait() }()
+		select {
+		case err := <-done:
+			if !errors.Is(err, zmux.ErrPipesLost) {
+				t.Fatalf("session ended with %v", err)
+			}
+			if el := time.Since(start); el > 6*time.Second {
+				t.Fatalf("ended after %v", el)
+			}
+		case <-time.After(12 * time.Second):
+			t.Fatal("session still open: the new DeadTimeout was not applied")
 		}
-	case <-time.After(12 * time.Second):
-		t.Fatal("session still open: the new DeadTimeout was not applied")
-	}
+	})
 }

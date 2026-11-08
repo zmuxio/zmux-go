@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 
+	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 // Carrier early data (TLS 1.3 early data, QUIC 0-RTT, a transform's first
-// flight; SPEC.md 6.1.2). A client with early data (EarlyData.ZmuxPeer, or
+// flight). A client with early data (EarlyData.ZmuxPeer, or
 // Remembered with Replayable) whose bootstrap carrier can tell whether the
 // server accepted its early data sends its first streams in it; the
 // carrier reports the verdict, and on rejection the session restarts the
@@ -31,6 +32,9 @@ type EarlyClientCarrier interface {
 	// initial bytes. Return true if they remain usable, including bytes sent
 	// only after the handshake. Return false only when those bytes were
 	// invalidated and RestartEarly must supply their replacement stream.
+	// What the pipe reads reaches the session only after the verdict has
+	// been applied, so the verdict must not depend on the session; a read
+	// half may itself deliver it, as long as it returns no bytes before.
 	EarlyAccepted(ctx context.Context) (bool, error)
 	// RestartEarly returns the pipe as it stands after the handshake: new
 	// halves, with their Framing, WriteOverhead and capabilities (on QUIC
@@ -46,6 +50,10 @@ type EarlyClientCarrier interface {
 // EarlyServerCarrier is the optional capability of a server carrier that
 // accepted early data, on the W half: with EarlyData.Replayable, streams
 // opened before HandshakeComplete is closed report Stream.Replayable.
+//
+// A carrier may add HandshakeFailed() <-chan struct{}, closed when the
+// handshake can no longer complete: a reader waiting for it then ends
+// at once rather than at Config.HandshakeTimeout.
 type EarlyServerCarrier interface {
 	UsedEarlyData() bool
 	HandshakeComplete() <-chan struct{}
@@ -61,7 +69,11 @@ func (c *Conn) RememberedParameters() []byte {
 	if !ok {
 		return nil
 	}
-	return wire.AppendParams(nil, p)
+	b, err := wire.AppendParams(nil, p)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 func decodeRemembered(b []byte) *wire.Params {
@@ -79,11 +91,11 @@ func decodeRemembered(b []byte) *wire.Params {
 func (c *Conn) watchEarly(p PipeIO) {
 	if ec, ok := earlyCarrier(p, &c.cfg.EarlyData); ok {
 		c.wg.Add(1)
-		go c.earlyVerdict(ec, p)
+		labels.Go(c.lctx, "early-verdict", func() { c.earlyVerdict(ec, p) })
 	}
 	if es, ok := earlyIn(p, &c.cfg.EarlyData); ok {
 		c.wg.Add(1)
-		go func() {
+		labels.Go(c.lctx, "early-watch", func() {
 			defer c.wg.Done()
 			select {
 			case <-es.HandshakeComplete():
@@ -92,7 +104,7 @@ func (c *Conn) watchEarly(p PipeIO) {
 				c.unlock()
 			case <-c.done:
 			}
-		}()
+		})
 	}
 }
 
@@ -133,11 +145,27 @@ func (c *Conn) failRestartLocked(old *pipeDrv, reason string) {
 	}
 }
 
+// awaitVerdict holds the bootstrap carrier's first bytes until the verdict
+// has been applied. A server speaks as soon as its carrier decided, so the
+// reader can have the peer's parameters while earlyVerdict has yet to take
+// the lock; delivered first, they would end the session's chance to restart
+// and hide that the peer never saw this side's parameters.
+func (c *Conn) awaitVerdict(pd *pipeDrv, lane uint64) {
+	if pd.id != 0 || lane != 0 || c.verdictDone == nil {
+		return
+	}
+	select {
+	case <-c.verdictDone:
+	case <-c.done:
+	}
+}
+
 // earlyVerdict applies the carrier's verdict; on rejection the restart
 // hook is called first, and a hook that fails fails the session. boot is
 // the bootstrap pipe.
 func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	defer c.wg.Done()
+	defer close(c.verdictDone)
 	ok, err := ec.EarlyAccepted(c.ctx)
 	if err != nil {
 		return // the carrier failed: the pipe's own end reports it
@@ -183,7 +211,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 		return
 	}
 	p.Carrier, p.Label, p.FateGroup, p.Variant = boot.Carrier, boot.Label, boot.FateGroup, boot.Variant
-	sameR, sameW := any(p.R) == any(boot.R), any(p.W) == any(boot.W)
+	sameR, sameW := sameHalf(p.R, boot.R), sameHalf(p.W, boot.W)
 	c.lock()
 	defer c.unlock()
 	if c.closing || old == nil || c.pipes[0] != old {
@@ -213,7 +241,6 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	}
 	old.dead = true // its goroutines no longer report to the core
 	c.s.SetWriterSignal(0, pd.wsig)
-	c.orphanSig.Store(pd.wsig)
 	c.startPipeLocked(pd, true, true)
 	old.wsig.Fire()   // its writer sees it is dead and ends
 	go old.closeAll() // its reader ends with its carrier

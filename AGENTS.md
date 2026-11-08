@@ -12,10 +12,14 @@
   and every parse, and reject ambiguous framing instead of guessing.
 - Methods on nil connection and stream pointers return an error instead of
   panicking.
-- User callbacks never run under a lock.
+- User callbacks never run under a lock. The exception is a record `Shaper`
+  (`Plan`, `OnEvent`, its factory): it decides each record as the record is
+  assembled, must not block or call the session, and a panic stops the shaping
+  of that pipe. A `HandshakeShaper` is no exception.
 - Tests must not leak goroutines, sockets or timers, and must not rely on OS
   socket buffer sizes.
-- `testdata/spec` mirrors the protocol conformance fixtures; do not edit it
-  by hand.
+- `testdata/spec`, `testdata/carrier-cache`, `testdata/shaping` and
+  `seal/proto/testdata/vectors` are copied from the specification; do not
+  edit them by hand.
 - Commit subjects are short, English and imperative.
 - Never commit host names, IP addresses or credentials.

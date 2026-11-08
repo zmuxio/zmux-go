@@ -2,6 +2,9 @@ package seal_test
 
 import (
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"fmt"
 	"net"
 	"net/netip"
 
@@ -9,40 +12,56 @@ import (
 	"github.com/zmuxio/zmux-go/seal"
 )
 
-// A server that accepts only protected carriers, and a client that pins
-// its key and sends its first stream in msg1.
-func Example() {
-	serverKey, _ := seal.GenerateKey()
-	clientKey, _ := seal.GenerateKey()
-	psk := []byte("a PSK of at least 16 random bytes")
+type oneToken struct{ handle, psk []byte }
 
-	srv, _ := seal.NewServer(&seal.ServerConfig{
-		Keys: []seal.PrivateKey{serverKey},
-		Authorize: func(_ context.Context, peer seal.PublicKey, _ netip.AddrPort) ([]byte, any, bool) {
-			return psk, "client 1", peer == clientKey.Public()
-		},
-	})
-	lst := zmux.NewListener(&zmux.ListenerConfig{
-		Config:    &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true}},
-		Admission: srv.Admission(seal.SealedOnly),
-		WrapPipe:  srv.WrapPipe,
-	})
+func (g oneToken) Resolve(context.Context, []byte, netip.AddrPort) ([]byte, error) {
+	return g.psk, nil
+}
+
+func (g oneToken) Credential(context.Context, seal.CredentialRequest) (*seal.Credential, error) {
+	return nil, nil
+}
+
+func (g oneToken) Commit(context.Context, seal.Admission) (any, error) {
+	return "client 1", nil
+}
+
+// A server that takes only Sealed carriers, and a client that pins its key.
+func Example() {
+	ctx := context.Background()
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
+	handle, psk, _ := seal.DeriveHandlePSK(secret, []byte("example"), nil)
+	node, _ := ecdh.X25519().GenerateKey(rand.Reader)
+
+	server := &seal.ServerConfig{Gate: oneToken{handle, psk}, Key: node}
+	lst, err := zmux.NewListener(&zmux.ListenerConfig{WrapPipe: server})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	defer func() { _ = lst.Close() }()
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	go func() { _ = lst.Serve(context.Background(), ln) }()
+	go func() { _ = lst.Serve(ctx, ln) }()
 
-	ctx := context.Background()
-	conn, err := seal.Dial(ctx, "tcp", ln.Addr().String(),
-		&seal.ClientConfig{Peers: []seal.PublicKey{serverKey.Public()}, Key: clientKey, PSK: psk},
-		&zmux.Config{EarlyData: zmux.EarlyData{ZmuxPeer: true, Replayable: true, HoldFirstFlight: true}})
+	nc, _ := net.Dial("tcp", ln.Addr().String())
+	p, err := seal.Establish(ctx, zmux.NetPipe(nc), &seal.ClientConfig{
+		Anchor: seal.PinAnchor(seal.NodeKeyID(node.PublicKey().Bytes())),
+		Handle: handle,
+		PSK:    psk,
+	})
 	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	conn, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{})
+	if err != nil {
+		fmt.Println(err)
 		return
 	}
 	defer func() { _ = conn.Close() }()
-	st, _ := conn.OpenStream()
-	_, _ = st.Write([]byte("HELLO"))
-	conn.ReleaseFirstFlight() // msg1 carries the parameters and HELLO
 
 	sc, _ := lst.Accept(ctx)
-	_ = sc.Admitted().(*seal.Peer).Value // "client 1"
+	fmt.Println(sc.Admitted().(*seal.Peer).Value)
+	// Output: client 1
 }

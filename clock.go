@@ -11,23 +11,26 @@ import (
 // clock maps the session's clock to core.Time: the host's monotonic clock
 // (QueryPerformanceCounter on Windows) when Config.Clock is nil, the
 // configured clock otherwise.
+//
+// A session's time starts at 0 and is never negative.
 type clock struct {
-	base time.Time
-	ext  timeshim.Clock // nil: the host clock
+	base   time.Time
+	origin int64          // monoNow at base (the host clock)
+	ext    timeshim.Clock // nil: the host clock
 }
 
 func newClock(ext timeshim.Clock) clock {
 	if ext == nil {
-		return clock{base: time.Now()}
+		return clock{base: time.Now(), origin: monoNow()}
 	}
 	return clock{base: ext.Now(), ext: ext}
 }
 
 func (c clock) now() core.Time {
 	if c.ext == nil {
-		return core.Time(monoSince(c.base))
+		return core.Time(monoNow() - c.origin)
 	}
-	return core.Time(c.ext.Now().Sub(c.base))
+	return core.Time(max(c.ext.Now().Sub(c.base), 0))
 }
 
 // until converts a core time to a duration from now.

@@ -17,7 +17,7 @@ import (
 func TestListenerRegistersBeforeBootstrapParameters(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	listener := NewListener(&ListenerConfig{Config: mpConfig()})
+	listener := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = listener.Close() }()
 	server, peer := net.Pipe()
 	defer func() { _ = peer.Close() }()
@@ -59,12 +59,12 @@ func TestListenerRegistersBeforeBootstrapParameters(t *testing.T) {
 // ends or the listener closes, not only at the first-record timeout.
 func TestListenerFirstRecordAbandoned(t *testing.T) {
 	leakcheck.Check(t)
-	l := NewListener(&ListenerConfig{FirstRecordTimeout: time.Minute})
+	l := mustNewListener(&ListenerConfig{FirstRecordTimeout: time.Minute})
 	ctx, cancel := context.WithCancel(context.Background())
 	for _, stop := range []func(){cancel, func() { _ = l.Close() }} {
 		a, b := net.Pipe()
 		done := make(chan error, 1)
-		go func() { done <- l.HandlePipe(ctx, NetPipe(a), JoinHint{}) }()
+		go func() { done <- l.HandlePipe(ctx, NetPipe(a), PipeHint{}) }()
 		stop()
 		select {
 		case err := <-done:

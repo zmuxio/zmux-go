@@ -20,6 +20,9 @@ func (s *Session) recMax(ol *outLane) int {
 	if ol.info.TLS && m > wire.DefaultMaxRecordSize {
 		m = wire.DefaultMaxRecordSize
 	}
+	if ol.info.MaxRecord > 0 && m > ol.info.MaxRecord {
+		m = ol.info.MaxRecord
+	}
 	return m
 }
 
@@ -27,7 +30,7 @@ func (s *Session) recMax(ol *outLane) int {
 // now.
 func (s *Session) WantsWrite(pipe, lane uint64) bool {
 	p := s.pipe(pipe)
-	if p == nil || p.out == nil || p.out.failed {
+	if p == nil || p.out == nil || p.out.failed || p.mp != nil && p.mp.hs {
 		return false
 	}
 	ol := p.out.lane(lane)
@@ -135,7 +138,7 @@ type chunkPlan struct {
 	preBlocked bool
 }
 
-// planResend plans a frame of reinjected stream data (MULTIPATH.md 7.4).
+// planResend plans a frame of reinjected stream data.
 func (s *Session) planResend(st *Stream) (chunkPlan, bool) {
 	sp := &st.snd
 	m := sp.mps
@@ -181,14 +184,11 @@ func (s *Session) planChunk(st *Stream) chunkPlan {
 	}
 	p.credit = sp.maxData - min64(sp.maxData, p.off)
 	p.connCredit = s.conn.sendMax - min64(s.conn.sendMax, s.conn.sent)
-	p.n = min64(p.avail, min64(p.credit, p.connCredit))
-	if p.n > maxStreamFrame {
-		p.n = maxStreamFrame
-	}
+	p.n = min(min64(p.avail, min64(p.credit, p.connCredit)), maxStreamFrame)
 	if p.off >= sp.sent {
 		p.n = s.capRetained(p.n)
 	}
-	// The first frame carries the whole preamble (EXTENSIONS.md 4.2).
+	// The first frame carries the whole preamble.
 	if p.off == 0 && sp.preLen > 0 && p.n < sp.preLen {
 		p.n = 0
 		p.preBlocked = true
@@ -212,7 +212,7 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 		return false
 	}
 	ol := p.out.lane(lane)
-	if ol == nil || ol.shut || s.holdsFirst(pipe) {
+	if ol == nil || ol.shut || s.holdsFirst(pipe) || p.mp != nil && p.mp.hs {
 		return false
 	}
 	var w recWriter
@@ -224,7 +224,7 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 		}
 	}
 	// Every record of the pipe goes through its Shaper, a lane's PIPE_LANE
-	// record included (MULTIPATH.md 5.8): it is planned, padded and
+	// record included: it is planned, padded and
 	// delayed like any other.
 	var ps *pipeShape
 	if s.shp != nil {
@@ -289,9 +289,6 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 		return false
 	}
 	s.afterBatch(&w, p, ol)
-	if s.shp != nil && s.shp.injWait {
-		s.shapeWakeCovered()
-	}
 	if s.ack != nil {
 		if (w.budget < 1024 || w.capped || w.dataHeld()) && s.dataPending(ol) {
 			p.out.snd.re.blocked() // the write runs, or the limiter holds, while more data waits
@@ -322,6 +319,18 @@ func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
 		st.snd.laneEnd = ol.pos
 	}
 	s.stats.BytesSent += uint64(pos)
+	// Earned are the bytes given to the carrier: a message carries no size field.
+	given := uint64(pos)
+	if w.framing == FramingRecords {
+		given = 0
+		for _, r := range w.b.recs {
+			given += uint64(r.size)
+		}
+	}
+	earned := given - min64(given, w.notEarned)
+	skip := min64(earned, s.earnSkip)
+	s.earnSkip -= skip
+	s.earnBytes += earned - skip
 	if s.ack != nil {
 		defer s.paceSent(p, uint64(pos))
 	}
@@ -342,13 +351,13 @@ func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
 	}
 	// Session without acknowledgement: a record passed to the carrier
 	// restarts the idle timer unless it carries only QX_PING requests and
-	// PADDING (SPEC.md 6.4).
+	// PADDING.
 	if !s.feat.Acked() && !w.onlyPing {
 		s.timers.lastActivity = s.now
 	}
 }
 
-// queuedOn is Q_p (SCHEDULER.md 4): the bytes handed to p's outbound
+// queuedOn is Q_p: the bytes handed to p's outbound
 // carrier that it has not taken yet (the batches being written), plus
 // what the carrier holds unsent where the adapter reports it, over all
 // lanes.
@@ -379,7 +388,7 @@ func (s *Session) carrierUnsent(p *Pipe) (uint64, bool) {
 }
 
 // SetCarrierUnsent records the bytes the carrier of a lane holds unsent,
-// as its adapter reports them (MULTIPATH.md 2.5, an optional capability).
+// as its adapter reports them (an optional capability).
 func (s *Session) SetCarrierUnsent(pipe, lane, n uint64) {
 	if p := s.pipe(pipe); p != nil && p.out != nil {
 		if ol := p.out.lane(lane); ol != nil {
@@ -435,6 +444,9 @@ func (s *Session) WriteDone(b *Batch, err error, now Time) {
 		if ol := p.out.lane(b.Lane); ol != nil {
 			ol.writing = false
 			ol.handed -= min64(ol.handed, b.pos)
+			// Nothing follows CONNECTION_CLOSE on a lane, and one batch of
+			// a lane is written at a time: this write carried it.
+			ol.closeDone = ol.closeSent && err == nil
 			if ol.notWritable {
 				ol.stallAt = now
 			}
@@ -442,6 +454,49 @@ func (s *Session) WriteDone(b *Batch, err error, now Time) {
 	}
 	if err != nil {
 		s.pipeWriteFailed(b.Pipe, b.Lane, err)
+	}
+	s.startLinger()
+}
+
+// startLinger arms the linger timeout once CONNECTION_CLOSE was handed to
+// every carrier that takes it: lingering starts from
+// the hand-off, not from the queueing, so a slow write never cuts it short.
+func (s *Session) startLinger() {
+	if s.state == StateClosing && s.closeFr.sentAll && !s.closeFr.lingering && s.CloseHandedOff() {
+		s.closeFr.lingering = true
+		s.timers.linger = s.now.Add(s.lingerTimeout())
+	}
+}
+
+// CloseHandedOff reports whether a close no longer waits for the carriers:
+// CONNECTION_CLOSE was written to every pipe that took it and is still
+// alive, and no pipe that can carry it still lacks it; also for a session
+// CLOSED or closed without CONNECTION_CLOSE. It is false before the close.
+func (s *Session) CloseHandedOff() bool {
+	switch {
+	case s.state < StateClosing:
+		return false
+	case s.state == StateClosed || !s.closeFr.pending && !s.closeFr.sentAll:
+		return true
+	case s.closeFr.pending:
+		return false
+	}
+	for _, p := range s.pipes {
+		if p.out == nil || p.out.failed {
+			continue
+		}
+		if l := p.out.lane(0); l != nil && l.closeSent && !l.closeDone {
+			return false
+		}
+	}
+	return true
+}
+
+// EndClose ends a close that the carriers did not take in time: the
+// session enters CLOSED and every carrier is closed.
+func (s *Session) EndClose() {
+	if s.state == StateClosing {
+		s.finishClose()
 	}
 }
 
@@ -468,9 +523,13 @@ func (s *Session) ReleaseFirstFlight(now Time) bool {
 	return true
 }
 
-// writeParams writes the first record of the bootstrap pipe (SPEC.md 5.1).
+// writeParams writes the first record of the bootstrap pipe.
 func (s *Session) writeParams(w *recWriter, ol *outLane) {
-	block := wire.AppendParams(nil, &s.cfg.Local)
+	block, e := wire.AppendParams(nil, &s.cfg.Local)
+	if e != nil {
+		s.failLocal(e)
+		return
+	}
 	n := varint.SizeVarint(wire.TypeTransportParams) + varint.SizeVarint(uint64(len(block))) + len(block)
 	if !w.frame(n, true, func(b []byte) []byte { return wire.AppendTransportParams(b, block) }) {
 		// Held by a shaping delay of the first record: the parameters
@@ -503,8 +562,9 @@ func (s *Session) writeClose(w *recWriter, ol *outLane) {
 	w.closed = true
 }
 
-// closeSentOn starts the linger timer once CONNECTION_CLOSE was handed to
-// every live outbound pipe (SPEC.md 6.5 step 3).
+// closeSentOn runs once CONNECTION_CLOSE was queued on every live outbound
+// pipe: it shuts their write sides down after it and bounds the wait for
+// the carriers to take it.
 func (s *Session) closeSentOn() {
 	for _, p := range s.pipes {
 		if !s.canCarryClose(p) {
@@ -527,8 +587,11 @@ func (s *Session) closeSentOn() {
 			}
 		}
 	}
+	// Step 1 waits at most the linger timeout for the carriers to take
+	// CONNECTION_CLOSE; lingering starts at the hand-off (startLinger).
 	s.timers.linger = s.now.Add(s.lingerTimeout())
 	s.emitClosedEvent()
+	s.startLinger()
 	s.checkLingerDone()
 }
 
@@ -554,7 +617,7 @@ func (s *Session) checkLingerDone() {
 	s.finishClose()
 }
 
-// writeControl writes the coalesced control state (SPEC.md 9.2) ahead of
+// writeControl writes the coalesced control state ahead of
 // data.
 func (s *Session) writeControl(w *recWriter, p *Pipe) {
 	if s.ack != nil && s.mp == nil {
@@ -680,7 +743,7 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 	if st.ctl&ctlReset != 0 {
 		sp := &st.snd
 		// Outside multipath the data below the Reliable Size precedes the
-		// reset on the pipe (SPEC.md 4.3).
+		// reset on the pipe.
 		if sp.sent >= sp.resetRel {
 			final := max64(sp.sent, sp.resetRel)
 			code, rel, at := sp.resetCode, sp.resetRel, sp.resetAt
@@ -705,7 +768,7 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 			sp.sent = final
 			w.activity, w.traffic = true, true
 			w.onlyPing = false
-			// Outside multipath a written reset is acknowledged (SPEC.md 7.4).
+			// Outside multipath a written reset is acknowledged.
 			if !s.feat.Multipath {
 				s.sendTerminal(st, sendResetRecvd)
 			}
@@ -815,7 +878,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 			}
 			if (s.peerSeen || s.earlyActive()) && s.feat.Preamble && s.loc[t].next < s.loc[t].limit {
 				// The preamble does not fit the session credit: allocate
-				// and report the block (SPEC.md 8.4).
+				// and report the block.
 				if s.allocID(st) {
 					s.blockedOn(st, false, true)
 				}
@@ -853,13 +916,26 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	if (p.n > 0 || p.fin) && w.dataHeld() {
 		return chunkFull // the limiter or the shaping gate holds the pipe's data back
 	}
-	room := w.dataFit(w.room() - wire.StreamHeaderLen(st.id, off, int(n), true)) // plans a record (shaping)
+	hdr := wire.StreamHeaderLen(st.id, off, int(n), true)
+	fits := w.room() - hdr // plans a record (shaping)
+	if off == 0 && uint64(max(fits, 0)) < sp.preLen && w.cut > 0 && w.recBytes+w.pendLen(false) == 0 &&
+		uint64(max(min(w.recMax, w.budget-w.sizeCost())-hdr, 0)) >= sp.preLen {
+		// The first frame carries the whole preamble (a record takes its first
+		// frame): the plan's largest record gives way, or the stream never opens.
+		fits = int(sp.preLen)
+		s.shp.stats.Clamped++
+	}
+	room := w.dataFit(fits)
 	if room <= 0 {
 		return chunkFull
 	}
 	if n > uint64(room) {
 		if off == 0 && sp.preLen > 0 && uint64(room) < sp.preLen {
-			return chunkFull
+			// The preamble goes whole: an open gate lets it through in debt.
+			if uint64(max(fits, 0)) < sp.preLen {
+				return chunkFull
+			}
+			room = int(sp.preLen)
 		}
 		n = uint64(room)
 		fin = false
@@ -895,6 +971,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	w.spendData(n)
 	st.countFrame(off, n)
 	if p.resend {
+		w.notEarned += uint64(wire.StreamHeaderLen(st.id, off, int(n), true)) + n
 		s.stats.BytesReinjected += n
 		if d != nil {
 			d.p.mp.holdSent += n
@@ -930,6 +1007,12 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		s.mp.retain(newEnd - sp.sent)
 		sp.sent = newEnd
 	}
+	if sp.sent >= sp.maxData && sp.sendEnd() > sp.sent {
+		// The chunk used the last of the peer's stream credit while data
+		// waits: the direction is blocked now, whichever pipe the
+		// scheduler offers it next (a binding that moves offers none).
+		s.blockedOn(st, true, s.conn.sent >= s.conn.sendMax)
+	}
 	if fin {
 		sp.finSent = true
 		sp.state = sendDataSent
@@ -964,8 +1047,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	return chunkSent
 }
 
-// blockedOn queues STREAM_DATA_BLOCKED / DATA_BLOCKED once per limit
-// (SPEC.md 8.4).
+// blockedOn queues STREAM_DATA_BLOCKED / DATA_BLOCKED once per limit.
 func (s *Session) blockedOn(st *Stream, stream, conn bool) {
 	if stream && st.snd.blocked != st.snd.maxData+1 {
 		st.snd.blocked = st.snd.maxData + 1
@@ -1002,5 +1084,5 @@ func (s *Session) canCarryClose(p *Pipe) bool {
 	if l := p.out.lane(0); l == nil || l.shut {
 		return false
 	}
-	return p.liveOut() && !p.retired()
+	return p.liveOut() && !p.retired() && (p.mp == nil || !p.mp.hs)
 }

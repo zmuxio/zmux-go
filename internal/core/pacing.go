@@ -70,10 +70,7 @@ func (s *Session) paceRoom(p *Pipe) int64 {
 	}
 	pp := s.limParams()
 	in, _ := s.limInFlight(p)
-	r := l.room(s.now, in, p.out.snd.re.value(), s.srttOf(p), &pp)
-	if r > 1<<40 {
-		r = 1 << 40
-	}
+	r := min(l.room(s.now, in, p.out.snd.re.value(), s.srttOf(p), &pp), 1<<40)
 	return int64(r)
 }
 

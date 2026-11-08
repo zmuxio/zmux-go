@@ -28,7 +28,7 @@ type fnPlan struct{ max int }
 
 func (f *fnPlan) Capabilities() shaping.Caps                        { return shaping.CapPlan }
 func (f *fnPlan) Plan(_ *shaping.RecordView, p *shaping.RecordPlan) { p.MaxLen = f.max }
-func (f *fnPlan) OnEvent(*shaping.Event, *shaping.Reply)            {}
+func (f *fnPlan) OnEvent(*shaping.Event, *shaping.Effects)          {}
 
 // Every record of a message-framed carrier starts a carrier write; under
 // byte framing only the first record of a batch does.

@@ -3,34 +3,36 @@ package zmux
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 // HTTP carriers: a request body carries the up direction, a
 // response body the down direction. HTTP/2 and HTTP/3 requests (and
 // HTTP/1.1 with full duplex) carry both; a split bootstrap pairs an uplink
-// POST and a downlink GET by the Zmux-Pipe-Pair header (SPEC.md 6.1.1), and
-// a pipe that cannot write first joins out of band with Zmux-Pipe-Join
-// (MULTIPATH.md 5.3).
-const (
-	HeaderJoin = "Zmux-Pipe-Join"
-	HeaderPair = "Zmux-Pipe-Pair"
-)
+// POST and a downlink GET by the Zmux-Pipe-Pair header, and
+// a pipe that cannot write first joins out of band with Zmux-Pipe-Join.
+
+// HeaderPair is the header that pairs the uplink POST and the downlink GET
+// of a split bootstrap.
+const HeaderPair = "Zmux-Pipe-Pair"
 
 // HTTPPipe opens a carrier over an HTTP request: dir DirBidirectional sends
 // the request body up and reads the response body (HTTP/2, HTTP/3, or an
 // HTTP/1.1 server with full duplex); DirSendOnly is a POST whose body is the
-// uplink; DirReceiveOnly is a GET whose response body is the downlink. h may
-// carry the Zmux-Pipe-Join value of a Reservation. ctx bounds the setting
+// uplink; DirReceiveOnly is a GET whose response body is the downlink. ctx bounds the setting
 // up: ending it before the request is under way (its body read by the
 // transport, or its response arrived) fails the carrier; after that the
 // request lives until the pipe ends, as for any dialled connection.
@@ -74,7 +76,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 	// the carrier lives until it is closed.
 	life, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	stop := context.AfterFunc(ctx, cancel)
-	call := &httpCall{done: make(chan struct{}), up: func() { stop() }}
+	call := &httpCall{done: make(chan struct{}), wrote: make(chan struct{}), up: func() { stop() }}
 	ctx = life
 	method := http.MethodPost
 	var s *upStream
@@ -95,6 +97,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 			body = up
 		}
 		actx, acancel := context.WithCancel(ctx)
+		actx = httptrace.WithClientTrace(actx, &httptrace.ClientTrace{WroteHeaders: call.headersWritten})
 		req, err := http.NewRequestWithContext(actx, method, u.String(), body)
 		if err != nil {
 			acancel()
@@ -136,7 +139,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 		cancel()
 		return PipeIO{}, err
 	}
-	go func() {
+	labels.Go(ctx, "http-pipe", func() {
 		resp, final, err := doHTTP(ctx, client, nc, rawURL, func(u *url.URL) (*http.Request, error) {
 			if first != nil {
 				r := first
@@ -168,7 +171,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 		}
 		s.p.closeRead(call.end())
 		cancel()
-	}()
+	})
 	p := PipeIO{Carrier: CarrierSplit}
 	if dir == DirBidirectional {
 		p.Carrier = CarrierStreaming
@@ -188,28 +191,25 @@ type httpCall struct {
 	done chan struct{}
 	resp *http.Response // a 2xx response
 	err  error
+
+	// The connection a transport declared secure (HTTPCarrierBody), and
+	// the end of the wait for it: the request's headers went out.
+	conn      atomic.Pointer[ConnectionStater]
+	wrote     chan struct{}
+	wroteOnce sync.Once
 }
 
-// header is a copy of the response header, nil before the response.
-func (c *httpCall) header() http.Header {
-	select {
-	case <-c.done:
-	default:
-		return nil
-	}
-	if c.resp == nil {
-		return nil
-	}
-	return c.resp.Header.Clone()
+func (c *httpCall) headersWritten() { c.wroteOnce.Do(func() { close(c.wrote) }) }
+
+// HTTPCarrierBody is implemented by the request body of an HTTP carrier. A
+// client transport whose connection protects the request end to end, such
+// as HTTP/3 over QUIC (zmuxh3.HTTPClient), calls SetSecureConnection with
+// that connection before it writes the request's headers: the carrier then
+// declares the Bound contract (CarrierSecure) with the connection's
+// exporter, which identifies the connection, not the request stream.
+type HTTPCarrierBody interface {
+	SetSecureConnection(ConnectionStater)
 }
-
-// ResponseHeader returns a copy of the header of the carrier's response
-// (ResponseHeaderer); nil before it.
-func (r *httpRespReader) ResponseHeader() http.Header { return r.call.header() }
-
-// ResponseHeader returns a copy of the header of the uplink request's
-// response (ResponseHeaderer); nil before it.
-func (w *httpReqWriter) ResponseHeader() http.Header { return w.call.header() }
 
 // end is the error the carrier's halves report once the request ended.
 func (c *httpCall) end() error {
@@ -297,6 +297,14 @@ type httpUpBody struct {
 	off  int    // of s.carry sent by this body (under s.mu)
 	dead atomic.Bool
 	once sync.Once
+}
+
+// SetSecureConnection implements HTTPCarrierBody; a body a redirect
+// replaced declares nothing.
+func (b *httpUpBody) SetSecureConnection(c ConnectionStater) {
+	if c != nil && !b.dead.Load() {
+		b.call.conn.Store(&c)
+	}
 }
 
 func (b *httpUpBody) Read(p []byte) (int, error) {
@@ -429,7 +437,7 @@ func addHeader(dst, src http.Header) {
 }
 
 // HTTPSplitPipe opens a split bootstrap over two requests, a POST uplink
-// and a GET downlink, paired by a random pairing token (SPEC.md 6.1.1),
+// and a GET downlink, paired by a random pairing token,
 // each presenting cred as HTTPPipe does. The carriers must be
 // confidential end to end (TLS to the server).
 func HTTPSplitPipe(ctx context.Context, client *http.Client, url string, h http.Header, cred Credential) (PipeIO, error) {
@@ -463,76 +471,28 @@ func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *HTTP
 	// after its first bytes were taken fails the downlink's reads.
 	uw, dr := up.W.(*httpReqWriter), down.R.(*httpRespReader)
 	dr.peer = uw.call
-	go func() {
+	labels.Go(ctx, "http-split", func() {
 		<-uw.call.done
 		if uw.call.err != nil {
 			dr.cancel()
 		}
-	}()
+	})
 	return PipeIO{R: down.R, W: up.W, Carrier: CarrierSplit}, nil
 }
 
-// HTTPSplitJoin joins a split carrier to c as a further pipe of the
-// session: a downlink GET joined out of band and an uplink POST joined in
-// band, opened at the same time (a split bootstrap's pairing makes pipe
-// pair 0 only). Both get o, with their Direction. ctx bounds the joins;
-// the requests then live until their pipes end. When either join fails
-// the other pipe is aborted.
-func HTTPSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, h http.Header, cred Credential, o PipeOptions) ([]*Pipe, error) {
+// HTTPSplitJoin joins a split carrier to c as one further pipe of the session: one Join
+// across a paired POST and GET, a bidi attachment by default. ctx
+// bounds the join; the requests then live until the pipe ends.
+func HTTPSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, h http.Header, cred Credential, o PipeOptions) (*Pipe, error) {
 	return httpSplitJoin(ctx, c, client, url, nil, h, cred, o)
 }
 
-func httpSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, t *HTTPTarget, h http.Header, cred Credential, o PipeOptions) ([]*Pipe, error) {
-	if t != nil {
-		url = t.URL()
-	}
-	od, ou := o, o
-	od.Direction, ou.Direction = DirReceiveOnly, DirSendOnly
-	r, err := c.ReservePipe(DirReceiveOnly, od)
+func httpSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, t *HTTPTarget, h http.Header, cred Credential, o PipeOptions) (*Pipe, error) {
+	p, err := httpSplitPipe(ctx, client, url, t, h, cred)
 	if err != nil {
 		return nil, err
 	}
-	hh := h.Clone()
-	if hh == nil {
-		hh = http.Header{}
-	}
-	hh.Set(HeaderJoin, r.Header())
-	type res struct {
-		p   *Pipe
-		err error
-	}
-	downc := make(chan res, 1)
-	go func() {
-		down, err := httpPipe(ctx, client, url, t, hh, DirReceiveOnly, cred)
-		if err != nil {
-			r.Cancel()
-			downc <- res{nil, err}
-			return
-		}
-		p, err := r.Attach(ctx, down)
-		downc <- res{p, err}
-	}()
-	var pu *Pipe
-	up, err := httpPipe(ctx, client, url, t, h, DirSendOnly, cred)
-	if err == nil {
-		if pu, err = c.AddPipe(ctx, up, ou); err != nil {
-			closePipeIO(up)
-		}
-	}
-	d := <-downc
-	if err == nil {
-		err = d.err
-	}
-	if err != nil {
-		if d.p != nil {
-			_ = d.p.Abort(err)
-		}
-		if pu != nil {
-			_ = pu.Abort(err)
-		}
-		return nil, err
-	}
-	return []*Pipe{d.p, pu}, nil
+	return c.AddPipe(ctx, p, o)
 }
 
 // httpReqWriter is the request body: an uplink.
@@ -561,6 +521,30 @@ func (w *httpReqWriter) WriteBuffers(bufs [][]byte) (int, error) {
 	w.p.wrMu.Lock()
 	defer w.p.wrMu.Unlock()
 	return w.p.write(bufs, total)
+}
+
+// CarrierSecure declares the Bound contract once the transport named a
+// secure connection (HTTPCarrierBody).
+func (w *httpReqWriter) CarrierSecure() bool { return w.call.conn.Load() != nil }
+
+// ConnectionState is that connection's TLS state; without one, none.
+func (w *httpReqWriter) ConnectionState() tls.ConnectionState {
+	if c := w.call.conn.Load(); c != nil {
+		return (*c).ConnectionState()
+	}
+	return tls.ConnectionState{}
+}
+
+// HandshakeContext waits until the request's headers went out (or the
+// request ended): a transport names the connection before then.
+func (w *httpReqWriter) HandshakeContext(ctx context.Context) error {
+	select {
+	case <-w.call.wrote:
+	case <-w.call.done:
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+	return nil
 }
 
 func (w *httpReqWriter) Close() error {
@@ -773,7 +757,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	hint := JoinHint{Join: r.Header.Get(HeaderJoin), Pair: r.Header.Get(HeaderPair)}
+	hint := PipeHint{Pair: r.Header.Get(HeaderPair)}
 	rc := http.NewResponseController(w)
 	// An HTTP/1.1 connection is not reused after a carrier: the server
 	// does not read what is left of a full-duplex request body, so a
@@ -813,10 +797,16 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = rc.EnableFullDuplex()
 		body = &httpReqBody{b: r.Body, rc: rc, life: life}
+		if r.ProtoMajor == 3 && r.TLS != nil && r.TLS.HandshakeComplete {
+			// This process ended the request's QUIC connection, which
+			// protects the stream end to end: the carrier declares the
+			// Bound contract, its Binding from the connection's exporter.
+			body.tls = r.TLS
+		}
 		p.R = body
 		p.W = hw
 		if dc := httpChannelOf(w); dc != nil {
-			// The request stream's datagrams (EXTENSIONS.md 6.8).
+			// The request stream's datagrams.
 			hw.chp = dc
 			p.W = &httpChanWriter{httpRespWriter: hw}
 		}
@@ -972,26 +962,38 @@ type httpReqBody struct {
 	b    io.ReadCloser
 	rc   *http.ResponseController
 	life *httpLife
+	tls  *tls.ConnectionState // the request's QUIC connection (HTTP/3)
 
 	mu    sync.Mutex
 	read  []byte
 	taken bool // the listener took the carrier, or read past the bound
+	ended bool // the body hit its end: net/http now reads the connection itself
 }
 
 func (r *httpReqBody) Read(p []byte) (int, error) {
 	n, err := r.b.Read(p)
-	if n > 0 {
-		r.mu.Lock()
-		if !r.taken {
-			if len(r.read)+n > firstReadBound {
-				r.taken, r.read = true, nil
-			} else {
-				r.read = append(r.read, p[:n]...)
-			}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ended = r.ended || errors.Is(err, io.EOF)
+	if n > 0 && !r.taken {
+		if len(r.read)+n > firstReadBound {
+			r.taken, r.read = true, nil
+		} else {
+			r.read = append(r.read, p[:n]...)
 		}
-		r.mu.Unlock()
 	}
 	return n, err
+}
+
+// CarrierSecure declares the Bound contract on an HTTP/3 request.
+func (r *httpReqBody) CarrierSecure() bool { return r.tls != nil }
+
+// ConnectionState is that connection's TLS state; otherwise none.
+func (r *httpReqBody) ConnectionState() tls.ConnectionState {
+	if r.tls == nil {
+		return tls.ConnectionState{}
+	}
+	return *r.tls
 }
 
 func (r *httpReqBody) carrierTaken() {
@@ -1012,7 +1014,14 @@ func (r *httpReqBody) replay() ([]byte, bool) {
 }
 
 func (r *httpReqBody) Close() error {
-	r.life.do(func() { _ = r.rc.SetReadDeadline(time.Now()) })
+	// A deadline during net/http's background read would cancel the connection's
+	// context, and with it the next request on the connection; no read of ours blocks.
+	r.mu.Lock()
+	ended := r.ended
+	r.mu.Unlock()
+	if !ended {
+		r.life.do(func() { _ = r.rc.SetReadDeadline(time.Now()) })
+	}
 	if _, ok := r.replay(); ok {
 		return nil
 	}
@@ -1023,7 +1032,7 @@ func (r *httpReqBody) Close() error {
 // found through Unwrap: the datagram channel of the request's stream, for
 // HTTP versions that have one, such as HTTP/3 with HTTP Datagrams (RFC
 // 9297; zmuxh3 provides it). The handler of NewHTTPHandler uses it for
-// bidirectional carriers (EXTENSIONS.md 6.8).
+// bidirectional carriers.
 type HTTPDatagramChannel interface {
 	// DatagramChannel returns the request stream's datagram channel. The
 	// handler calls it once, after the response header was written, while

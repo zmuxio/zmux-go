@@ -41,8 +41,7 @@ type SpliceDirection struct {
 	End              SpliceEnd // how the direction ended
 }
 
-// SpliceEndKind is the event that ended a direction of a splice (API.md
-// A.2): one row of the table of ends.
+// SpliceEndKind is the event that ended a direction of a splice.
 type SpliceEndKind uint8
 
 const (

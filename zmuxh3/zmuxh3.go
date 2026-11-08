@@ -2,10 +2,9 @@
 // WebTransport sessions (quic-go): an HTTP/3 request's body carries the up
 // direction and its response body the down direction; on WebTransport a
 // pipe pair is one bidirectional stream and its further lanes are
-// unidirectional streams of the session (MULTIPATH.md 2.5). Datagrams may
+// unidirectional streams of the session. Datagrams may
 // go as HTTP Datagrams of a bidirectional carrier's request stream (served
-// by NewHTTP3Server) or as datagrams of the WebTransport session
-// (EXTENSIONS.md 6.8).
+// by NewHTTP3Server) or as datagrams of the WebTransport session.
 package zmuxh3
 
 import (
@@ -15,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"sync"
@@ -23,6 +23,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 const carrierFailed = webtransport.StreamErrorCode(zmux.StreamCarrierFailed)
@@ -31,11 +32,78 @@ const carrierFailed = webtransport.StreamErrorCode(zmux.StreamCarrierFailed)
 
 // HTTPClient returns an http.Client whose requests run over HTTP/3, for
 // zmux.HTTPPipe and zmux.HTTPSplitPipe, and its transport, which the
-// caller closes when done. qconf may be nil.
+// caller closes when done. qconf may be nil. A carrier's request names its
+// QUIC connection to the carrier (zmux.HTTPCarrierBody), which then declares
+// the Bound contract with the connection's exporter. The transport dials each
+// connection on a socket of its own; do not replace its Dial.
 func HTTPClient(tlsConf *tls.Config, qconf *quic.Config) (*http.Client, *http3.Transport) {
-	t := &http3.Transport{TLSClientConfig: tlsConf, QUICConfig: qconf}
-	return &http.Client{Transport: t}, t
+	c := &h3Conns{byLocal: map[string]*quic.Conn{}}
+	t := &http3.Transport{TLSClientConfig: tlsConf, QUICConfig: qconf, Dial: c.dial}
+	return &http.Client{Transport: &h3RoundTripper{t: t, conns: c}}, t
 }
+
+// h3Conns are the client's QUIC connections by local address, each on its
+// own socket, so that the connection a request went out on is found from
+// what httptrace reports.
+type h3Conns struct {
+	mu      sync.Mutex
+	byLocal map[string]*quic.Conn
+}
+
+func (c *h3Conns) dial(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+	qc, err := quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
+	if err != nil {
+		return nil, err
+	}
+	key := qc.LocalAddr().String()
+	c.mu.Lock()
+	c.byLocal[key] = qc
+	c.mu.Unlock()
+	context.AfterFunc(qc.Context(), func() {
+		c.mu.Lock()
+		if c.byLocal[key] == qc {
+			delete(c.byLocal, key)
+		}
+		c.mu.Unlock()
+	})
+	return qc, nil
+}
+
+func (c *h3Conns) find(local net.Addr) *quic.Conn {
+	if local == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.byLocal[local.String()]
+}
+
+// h3RoundTripper names a carrier request's connection to its body before
+// the transport writes the request's headers.
+type h3RoundTripper struct {
+	t     *http3.Transport
+	conns *h3Conns
+}
+
+func (r *h3RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if b, ok := req.Body.(zmux.HTTPCarrierBody); ok {
+		trace := &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) {
+			if i.Conn == nil {
+				return
+			}
+			if qc := r.conns.find(i.Conn.LocalAddr()); qc != nil {
+				b.SetSecureConnection(quicState{qc})
+			}
+		}}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+	}
+	return r.t.RoundTrip(req)
+}
+
+// quicState is the TLS state of a QUIC connection, read when asked.
+type quicState struct{ qc *quic.Conn }
+
+func (s quicState) ConnectionState() tls.ConnectionState { return s.qc.ConnectionState().TLS }
 
 // NewHTTP3Server returns an HTTP/3 server that serves h, typically the
 // handler of zmux.NewHTTPHandler, which hands requests to a listener as
@@ -93,9 +161,9 @@ func Serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener) er
 func serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener, a *zmux.Arrival) error {
 	handle := func(p zmux.PipeIO) {
 		if a != nil {
-			_ = a.HandlePipe(ctx, p, zmux.JoinHint{})
+			_ = a.HandlePipe(ctx, p, zmux.PipeHint{})
 		} else {
-			_ = l.HandlePipe(ctx, p, zmux.JoinHint{Source: addrPort(sess.RemoteAddr())})
+			_ = l.HandlePipe(ctx, p, zmux.PipeHint{Source: addrPort(sess.RemoteAddr())})
 		}
 	}
 	if a != nil {
@@ -103,7 +171,7 @@ func serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener, a 
 	}
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() {
+	labels.Go(ctx, "wt-accept-lanes", func() {
 		defer wg.Done()
 		for {
 			s, err := sess.AcceptUniStream(ctx)
@@ -111,9 +179,9 @@ func serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener, a 
 				return
 			}
 			p := zmux.PipeIO{R: &laneReader{s: s, sess: sess}, Carrier: zmux.CarrierWebTransport}
-			go handle(p)
+			labels.Go(ctx, "wt-lane", func() { handle(p) })
 		}
-	}()
+	})
 	var err error
 	for {
 		var s *webtransport.Stream
@@ -121,7 +189,8 @@ func serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener, a 
 		if err != nil {
 			break
 		}
-		go handle(WebTransportPipe(sess, s))
+		p := WebTransportPipe(sess, s)
+		labels.Go(ctx, "wt-pipe", func() { handle(p) })
 	}
 	wg.Wait()
 	return err
@@ -152,7 +221,7 @@ func Dial(ctx context.Context, t *webtransport.Transport, url string, h http.Hea
 		_ = sess.CloseWithError(0, "")
 		return nil, nil, err
 	}
-	go acceptLanes(sess)
+	labels.Go(context.Background(), "wt-client-lanes", func() { acceptLanes(sess) })
 	return c, sess, nil
 }
 
@@ -233,9 +302,9 @@ func acceptLanes(sess *webtransport.Session) {
 		}
 		// HandleLane closes a refused or failed lane itself; there is no
 		// caller to report its error to.
-		go func() {
+		labels.Go(context.Background(), "wt-lane", func() {
 			_ = zmux.HandleLane(sess.Context(), zmux.PipeIO{R: &laneReader{s: s, sess: sess}, Carrier: zmux.CarrierWebTransport})
-		}()
+		})
 	}
 }
 
@@ -261,7 +330,7 @@ func NewPool(t *webtransport.Transport, url string, h http.Header, cred zmux.Cre
 			if err != nil {
 				return nil, err
 			}
-			go acceptLanes(sess)
+			labels.Go(context.Background(), "wt-client-lanes", func() { acceptLanes(sess) })
 			context.AfterFunc(sess.Context(), func() { p.pool.RetireConn(sess) })
 			return sess, nil
 		}}
@@ -339,6 +408,10 @@ func (w *wtStream) ConnectionState() tls.ConnectionState {
 	return w.sess.SessionState().ConnectionState.TLS
 }
 
+// CarrierSecure declares the Bound contract: a WebTransport stream is a QUIC stream of a
+// connection this process terminates.
+func (w *wtStream) CarrierSecure() bool { return true }
+
 // OpenLane opens a unidirectional stream of the session as a lane.
 func (w *wtStream) OpenLane(ctx context.Context) (io.WriteCloser, error) {
 	s, err := w.sess.OpenUniStreamSync(ctx)
@@ -414,3 +487,6 @@ func addrPort(a net.Addr) netip.AddrPort {
 	ap, _ := netip.ParseAddrPort(a.String())
 	return ap
 }
+
+// CloseIdleConnections passes to the transport (http.Client.CloseIdleConnections).
+func (r *h3RoundTripper) CloseIdleConnections() { r.t.CloseIdleConnections() }

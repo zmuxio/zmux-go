@@ -63,7 +63,12 @@ func Example_tcp() {
 		fmt.Println(err)
 		return
 	}
-	l := zmux.NewListener(nil)
+	l, err := zmux.NewListener(nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() { _ = l.Close() }()
 	go func() { _ = l.Serve(ctx, ln) }()
 	go func() {
 		for {
@@ -110,7 +115,12 @@ func ExampleDialTLS() {
 		fmt.Println(err)
 		return
 	}
-	l := zmux.NewListener(nil)
+	l, err := zmux.NewListener(nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() { _ = l.Close() }()
 	go func() { _ = l.Serve(ctx, tls.NewListener(ln, serverTLS)) }()
 	go func() {
 		for {
@@ -259,15 +269,19 @@ func ExampleConn_SendDatagram() {
 func ExampleConn_AddPipe() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cfg := &zmux.Config{MaxPipes: 2, PipeAuth: zmux.PipeAuth{PSK: []byte("an example pre-shared key, 32 B")}}
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: cfg})
+	cfg := &zmux.Config{MaxPipes: 2, PipeAuth: zmux.PipeAuth{PSK: []byte("an example pre-shared key, 32 B"), EndToEnd: true}}
+	l, err := zmux.NewListener(&zmux.ListenerConfig{Config: cfg})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	defer func() { _ = l.Close() }()
 
 	// Two carriers between the same endpoints (two paths in practice).
 	a0, b0 := net.Pipe()
 	a1, b1 := net.Pipe()
-	go func() { _ = l.HandlePipe(ctx, zmux.NetPipe(b0), zmux.JoinHint{}) }()
-	go func() { _ = l.HandlePipe(ctx, zmux.NetPipe(b1), zmux.JoinHint{}) }()
+	go func() { _ = l.HandlePipe(ctx, zmux.NetPipe(b0), zmux.PipeHint{}) }()
+	go func() { _ = l.HandlePipe(ctx, zmux.NetPipe(b1), zmux.PipeHint{}) }()
 
 	client, err := zmux.Client(ctx, a0, cfg)
 	if err != nil {

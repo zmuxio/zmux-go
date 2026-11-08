@@ -16,6 +16,7 @@ type PipeInfo struct {
 	OutState       OutState
 	InState        InState
 	Local          bool // this endpoint joined the attachment
+	PeerAttached   bool // the peer holds the attachment too
 	HasOut         bool
 	HasIn          bool
 	Revalidating   bool
@@ -59,7 +60,7 @@ type PipeInfo struct {
 	RecordsReceived uint64
 	BytesReinjected uint64
 	// BytesLost is the outbound bytes sent and not acknowledged when the
-	// pipe failed (MULTIPATH.md 7.2), RecordsLost its estimate in records;
+	// pipe failed, RecordsLost its estimate in records;
 	// BytesRetransmitted and LossRate come from the carrier
 	// (SetCarrierRetransmitted).
 	BytesLost          uint64
@@ -72,7 +73,7 @@ type PipeInfo struct {
 	BytesRedundant     uint64
 	BytesDuplicateRecv uint64
 	// ProbeInterval and ProbeJitter are the effective k and j of the
-	// outbound direction's idle probes (MULTIPATH.md 7.1).
+	// outbound direction's idle probes.
 	ProbeInterval Duration
 	ProbeJitter   float64
 
@@ -161,10 +162,11 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 	pi.Lanes = laneInfos(p)
 	a := p.mp
 	if a == nil {
-		pi.Local = s.role == RoleInitiator
+		pi.Local, pi.PeerAttached = s.role == RoleInitiator, true
 		return pi, true
 	}
 	pi.Local, pi.FateGroup, pi.Failure = a.joinerLocal, a.fate, a.failCause
+	pi.PeerAttached = a.peerAttached(id)
 	pi.BytesRedundant, pi.BytesDuplicateRecv, pi.PingsAnswered = a.redundantBytes, a.dupBytes, a.pingsAnswered
 	pi.AttachedFor = s.now.Sub(a.attachedAt)
 	pi.Revalidating = a.reval
@@ -245,7 +247,7 @@ func laneInfos(p *Pipe) []LaneInfo {
 }
 
 // SessionGauges are the current values of SessionStats that are not
-// counts (API.md 7.2), taken in one pass under the lock.
+// counts, taken in one pass under the lock.
 type SessionGauges struct {
 	StreamsActive uint64
 	SendBuffered  uint64 // written stream bytes not yet sent
@@ -307,7 +309,7 @@ func (st *Stream) unsentPayload() uint64 {
 func (s *Session) CountCreditWait() { s.stats.StreamCreditWaits++ }
 
 // StreamInfo is the snapshot of one stream that StreamStats reports, in
-// payload bytes (API.md 7.2). A released stream keeps its final values.
+// payload bytes. A released stream keeps its final values.
 type StreamInfo struct {
 	BytesWritten, BytesSent, BytesAcknowledged uint64
 	BytesReceived, BytesRead                   uint64
@@ -336,8 +338,8 @@ func (s *Session) StreamInfo(st *Stream) StreamInfo {
 				}
 			}
 		} else {
-			// Outside multipath what reached the carrier is delivered
-			// (SPEC.md 7.4); after a reset, up to the final size.
+			// Outside multipath what reached the carrier is delivered;
+			// after a reset, up to the final size.
 			in.BytesAcknowledged = sp.sent - min64(sp.sent, sp.preLen)
 		}
 		if term := sp.state == sendDataRecvd || sp.state == sendResetRecvd; !term {

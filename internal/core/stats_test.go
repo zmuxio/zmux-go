@@ -1,10 +1,12 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"testing"
 
+	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -12,6 +14,7 @@ import (
 func statsMP() (*Session, *Pipe) {
 	s := capacityMP()
 	s.mp.bits, s.mp.pendAbandon = map[uint64]bool{}, map[uint64]bool{}
+	s.mp.usableGroups = []uint64{join.GroupX25519, join.GroupX25519MLKEM768}
 	p := capacityExtra(s)
 	return s, p
 }
@@ -64,18 +67,32 @@ func TestStatsSuspendedTime(t *testing.T) {
 func TestStatsJoinAuthAndReplays(t *testing.T) {
 	s, p := statsMP()
 	s.role, s.roleKnown = RoleInitiator, true
+	s.peerSeen = true
+	su, _ := join.LookupSuite(join.SuiteAES)
 	key := make([]byte, 32)
-	s.mp.keyPeer = key
-	mac := []byte("mac input")
-	// A token that does not verify.
-	j := &wire.Join{PipeID: 3, Token: make([]byte, 16)}
-	if r := s.AcceptJoin(j, mac, nil, Carrier{HasIn: true, HasOut: true}); r != JoinClose {
-		t.Fatalf("bad token: %v", r)
+	setTestKeys(s, su.ID, key)
+	hello := func(psk []byte) join.Hello {
+		j, err := join.NewJoiner(join.JoinerConfig{Suite: su, Group: testJoinGroup, Mode: join.Trusted, Framing: join.Stream, Locator: []byte("L"), PSK: psk})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := j.WriteHello(nil, join.HelloPayload{Pipe: join.Pipe{ID: 3, Direction: 2}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, _, err := join.ParseHello(b, join.Stream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	// A Hello that does not open.
+	if _, r := s.OpenHello(hello(bytes.Repeat([]byte{1}, 32)), FramingBytes, nil); r != JoinClose {
+		t.Fatalf("bad key: %v", r)
 	}
 	// A verified join for an ID the session already has: a replay.
 	p.id = 3
-	j = &wire.Join{PipeID: 3, Token: wire.JoinToken(key, mac, nil)}
-	if r := s.AcceptJoin(j, mac, nil, Carrier{HasIn: true, HasOut: true}); r != JoinClose {
+	if _, r := s.OpenHello(hello(key), FramingBytes, nil); r != JoinClose {
 		t.Fatalf("replay: %v", r)
 	}
 	st := s.SessionStats()
@@ -286,4 +303,23 @@ func TestStatsLossRate(t *testing.T) {
 	if pi, _ := s.PipeInfo(p.id); math.Abs(pi.LossRate-(0.1-0.1/8)) > 1e-12 {
 		t.Fatalf("second sample: rate %v, want %v", pi.LossRate, 0.1-0.1/8)
 	}
+}
+
+var testJoinGroup, _ = join.LookupGroup(join.GroupX25519MLKEM768)
+
+// A local join's Group must be usable in the session.
+func TestAddPipeGroupNotUsable(t *testing.T) {
+	s, _ := statsMP()
+	s.mp.usableGroups = []uint64{join.GroupX25519MLKEM768}
+	setTestKeys(s, join.SuiteAES, make([]byte, 32))
+	s.mp.ep.join.peer = []byte("L")
+	if _, _, err := s.AddPipe(JoinOptions{Group: join.GroupX25519}); !errors.Is(err, ErrGroupNotUsable) {
+		t.Fatal(err)
+	}
+}
+
+// setTestKeys gives the session epoch 0 with one join key for both roles.
+func setTestKeys(s *Session, suite uint64, key []byte) {
+	e := &epoch{keys: map[uint64]*joinKeys{suite: {i: key, r: key}}, local: s.cfg.Local.Locator}
+	s.mp.ep = epochs{list: []*epoch{e}, join: e, last: -1}
 }

@@ -2,8 +2,8 @@ package wire
 
 import "github.com/zmuxio/zmux-go/varint"
 
-// Gates says which frames the receiver accepts in a session (SPEC.md 4.2,
-// 5.5): features in use, and unilateral announcements the receiver made.
+// Gates says which frames the receiver accepts in a session:
+// features in use, and unilateral announcements the receiver made.
 type Gates struct {
 	MaxDatagram   uint64 // the receiver's max_datagram_frame_size; 0 = none
 	ResetStreamAt bool   // the receiver advertised reset_stream_at
@@ -14,8 +14,9 @@ type Gates struct {
 	Lanes         bool // lanes available toward the receiver
 }
 
-// CheckGate returns the error for a decoded frame whose feature is not in use
-// (SPEC.md 4.1 rule 3, RFC 9221 Section 3 for DATAGRAM).
+// CheckGate returns the error for a decoded frame whose feature is not in use:
+// a frame of a feature the session did not negotiate is a connection error
+// (for DATAGRAM, as RFC 9221 Section 3).
 func CheckGate(f *Frame, g *Gates) *Error {
 	ok := true
 	switch f.Kind {
@@ -41,7 +42,7 @@ func CheckGate(f *Frame, g *Gates) *Error {
 		ok = g.GoAway
 	case KindPriorityUpdate:
 		ok = g.Priority
-	case KindPipeJoin, KindPipePing, KindPipeAbandon, KindPipeStatus:
+	case KindPipePing, KindPipeAbandon, KindPipeStatus, KindSessionEpoch:
 		ok = g.Multipath
 	case KindPipeAck:
 		ok = g.Multipath || g.PipeAck

@@ -13,8 +13,8 @@ import (
 )
 
 // A ListenerConfig.WrapPipe layer runs TLS over WebSocket carriers, one
-// message per write: the session's join secret and a carrier-bound join
-// use that TLS, and the carriers keep their kind.
+// message per write: the session's join secret uses that TLS, a further carrier joins,
+// and the carriers keep their kind.
 func TestWrapPipeTLS(t *testing.T) {
 	ctx := testContext(t)
 	certSrv := httptest.NewTLSServer(http.NotFoundHandler()) // a certificate to use
@@ -26,17 +26,17 @@ func TestWrapPipeTLS(t *testing.T) {
 	ccfg := &tls.Config{RootCAs: roots, ServerName: "example.com", MinVersion: tls.VersionTLS13}
 
 	cfg := func() *zmux.Config {
-		return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true},
+		return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true},
 			SchedulerParams: zmux.SchedulerParams{NoProbation: true}}
 	}
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: cfg(),
-		WrapPipe: func(ctx context.Context, p zmux.PipeIO, _ zmux.JoinHint) (zmux.PipeIO, error) {
+	l := mustNewListener(&zmux.ListenerConfig{Config: cfg(),
+		WrapPipe: zmux.WrapPipeFunc(func(ctx context.Context, p zmux.PipeIO, _ zmux.PipeHint) (zmux.PipeIO, error) {
 			tc := tls.Server(zmux.PipeConn(p), scfg)
 			if err := tc.HandshakeContext(ctx); err != nil {
 				return zmux.PipeIO{}, err
 			}
 			return zmux.NetPipe(tc), nil
-		}})
+		})})
 	h, err := Handler(l, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +74,7 @@ func TestWrapPipeTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Carrier = zmux.CarrierWebSocket
-	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{CarrierBound: true}); err != nil {
+	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{}); err != nil {
 		t.Fatalf("carrier-bound join: %v", err)
 	}
 	echo(t, ctx, c, s, 256<<10)

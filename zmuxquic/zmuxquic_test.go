@@ -44,7 +44,7 @@ func tlsConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 }
 
 func mpConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true}}
+	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true}}
 }
 
 type env struct {
@@ -69,14 +69,43 @@ func newEnvQUIC(t testing.TB, address string, scfg *zmux.Config, qconf *quic.Con
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &env{ln: ln, lst: zmux.NewListener(&zmux.ListenerConfig{Config: scfg}), cli: cli, cancel: cancel}
-	go func() { _ = Serve(ctx, ln, e.lst, nil) }()
+	e := &env{ln: ln, lst: mustNewListener(&zmux.ListenerConfig{Config: scfg}), cli: cli, cancel: cancel}
+	tl := &trackedListener{ConnListener: ln}
+	go func() { _ = Serve(ctx, tl, e.lst, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		_ = ln.Close()
 		_ = e.lst.Close()
+		tl.closeAll()
 	})
 	return e
+}
+
+// trackedListener remembers what it accepted: closing a QUIC listener
+// leaves established connections alone, and a client's close may never
+// arrive (a test's relay drops it).
+type trackedListener struct {
+	ConnListener
+	mu    sync.Mutex
+	conns []*quic.Conn
+}
+
+func (l *trackedListener) Accept(ctx context.Context) (*quic.Conn, error) {
+	qc, err := l.ConnListener.Accept(ctx)
+	if err == nil {
+		l.mu.Lock()
+		l.conns = append(l.conns, qc)
+		l.mu.Unlock()
+	}
+	return qc, err
+}
+
+func (l *trackedListener) closeAll() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, qc := range l.conns {
+		_ = qc.CloseWithError(0, "")
+	}
 }
 
 func echo(t *testing.T, c, s *zmux.Conn, n int) {
@@ -126,11 +155,9 @@ func TestQUICPipeAndLanes(t *testing.T) {
 	// Several bulk streams at once ask for lanes of pipe 0.
 	var wg sync.WaitGroup
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			echo(t, c, s, 2<<20)
-		}()
+		})
 	}
 	wg.Wait()
 	var lanes int
@@ -158,7 +185,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 	t.Helper()
 	withAuth := func(cfg *zmux.Config) *zmux.Config {
 		if exporter {
-			cfg.MaxPipes, cfg.PipeAuth = 4, zmux.PipeAuth{Exporter: true}
+			cfg.MaxPipes, cfg.PipeAuth = 4, zmux.PipeAuth{Exporter: true, EndToEnd: true}
 		}
 		return cfg
 	}
@@ -430,7 +457,7 @@ func TestQUICHandshakeFailureCounted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	served := make(chan struct{})

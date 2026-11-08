@@ -22,22 +22,22 @@ func TestAdmittedValue(t *testing.T) {
 	var n atomic.Int32
 	var mu sync.Mutex
 	var wrapped []any
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), InstanceID: []byte("inst"),
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), InstanceID: []byte("inst"),
 		Admission: &Admission{PeekTimeout: 5 * time.Second, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
 			return Decision{Verdict: VerdictAccept, Value: fmt.Sprintf("v%d", n.Add(1))}
 		}},
-		WrapPipe: func(_ context.Context, p PipeIO, h JoinHint) (PipeIO, error) {
+		WrapPipe: WrapPipeFunc(func(_ context.Context, p PipeIO, h PipeHint) (PipeIO, error) {
 			mu.Lock()
 			wrapped = append(wrapped, h.Admitted)
 			mu.Unlock()
 			return p, nil
-		}})
+		})})
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	carrier := func() net.Conn {
 		a, b := net.Pipe()
-		go func() { _ = lst.HandlePipe(ctx, NetPipe(b), JoinHint{Admitted: "caller"}) }()
+		go func() { _ = lst.HandlePipe(ctx, NetPipe(b), PipeHint{Admitted: "caller"}) }()
 		return a
 	}
 	cli, err := Client(ctx, carrier(), mpConfig())
@@ -59,6 +59,7 @@ func TestAdmittedValue(t *testing.T) {
 	if p, ok := srv.Pipe(0); !ok || p.Admitted() != "v1" {
 		t.Fatalf("bootstrap pipe value %v", p.Admitted())
 	}
+	waitUntil(t, 5*time.Second, "the joined pipe at the acceptor", func() bool { _, ok := srv.Pipe(cp.ID()); return ok })
 	sp, ok := srv.Pipe(cp.ID())
 	if !ok || sp.Admitted() != "v2" {
 		t.Fatalf("joined pipe value %v", sp.Admitted())
@@ -74,10 +75,10 @@ func TestAdmittedValue(t *testing.T) {
 	}
 
 	// Without an admission: no value, also where HandlePipe was given one.
-	plain := NewListener(&ListenerConfig{Config: mpConfig()})
+	plain := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = plain.Close() }()
 	a, b := net.Pipe()
-	go func() { _ = plain.HandlePipe(ctx, NetPipe(b), JoinHint{Admitted: "caller"}) }()
+	go func() { _ = plain.HandlePipe(ctx, NetPipe(b), PipeHint{Admitted: "caller"}) }()
 	c2, err := Client(ctx, a, mpConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +100,7 @@ func TestAdmittedValue(t *testing.T) {
 // the value of its uplink half.
 func TestAdmittedValueSplit(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig(),
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(),
 		Admission: &Admission{PeekTimeout: 5 * time.Second, Decide: func(_ context.Context, info *CarrierInfo, _ []byte) Decision {
 			return Decision{Verdict: VerdictAccept, Value: info.Request.Method}
 		}}})
@@ -138,7 +139,7 @@ func TestAdmittedValueSplit(t *testing.T) {
 // carrier takes the accepting decision's value.
 func TestAdmittedValueExchange(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig(),
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(),
 		Admission: &Admission{PeekTimeout: 5 * time.Second, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
 			return Decision{Verdict: VerdictAccept, Value: "ex"}
 		}}})

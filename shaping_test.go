@@ -2,13 +2,11 @@ package zmux
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
-	"os"
 	"slices"
 	"sync"
 	"testing"
@@ -65,7 +63,7 @@ func (c *recConn) records() (sizes, zeros []int) {
 type fnShaper struct {
 	caps  shaping.Caps
 	plan  func(*shaping.RecordView, *shaping.RecordPlan)
-	event func(*shaping.Event, *shaping.Reply)
+	event func(*shaping.Event, *shaping.Effects)
 }
 
 func (f *fnShaper) Capabilities() shaping.Caps { return f.caps }
@@ -74,7 +72,7 @@ func (f *fnShaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
 		f.plan(v, p)
 	}
 }
-func (f *fnShaper) OnEvent(e *shaping.Event, r *shaping.Reply) {
+func (f *fnShaper) OnEvent(e *shaping.Event, r *shaping.Effects) {
 	if f.event != nil {
 		f.event(e, r)
 	}
@@ -126,74 +124,76 @@ func planShaper(f func(*shaping.RecordPlan)) ShaperFactory {
 	}
 }
 
-// contract is the language-independent data of testdata/shaping.
-type contract struct {
-	Records []struct {
-		Name   string
-		Side   string // the shaped sender: "client" (default) or "server"
-		Limits struct {
-			MaxPaddingBytes uint64 `json:"max_padding_bytes"`
-		}
-		Plan struct {
-			MaxLen      int `json:"max_len"`
-			PadTo       int `json:"pad_to"`
-			PadMultiple int `json:"pad_multiple"`
-			Pad         int
-		}
-		Send   int
-		Repeat int
-		Expect struct {
-			MinLen          int `json:"min_len"`
-			MaxLen          int `json:"max_len"`
-			Mod, Rem        int
-			MinRecords      int    `json:"min_records"`
-			MaxPaddingBytes uint64 `json:"max_padding_bytes"`
-			Clamped         bool
-			Padding         bool
-			MinPad          int `json:"min_pad"` // trailing PADDING bytes of every record
-		}
-	}
+// recordCase shapes a transfer by one plan and bounds its records; lengths
+// are wire bytes.
+type recordCase struct {
+	name     string
+	limits   shaping.Limits
+	plan     shaping.UnitPlan
+	maxLen   int
+	send     int
+	repeat   int
+	minLen   int
+	wantMax  int
+	mod, rem int
+	records  int
+	padBound uint64
+	server   bool // the shaped sender is the server
+	clamped  bool
+	padding  bool
+	minPad   int // wire bytes added by trailing PADDING to every record
 }
 
-func TestShapingContractRecords(t *testing.T) {
-	b, err := os.ReadFile("testdata/shaping/contract.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var k contract
-	if err := json.Unmarshal(b, &k); err != nil {
-		t.Fatal(err)
-	}
-	for _, v := range k.Records {
-		t.Run(v.Name, func(t *testing.T) {
-			cfg := &Config{ShapingLimits: shaping.Limits{MaxPaddingBytes: v.Limits.MaxPaddingBytes}}
+// wireLen is the wire length of a record of n frame bytes on a byte stream.
+func wireLen(n int) int { return n + varint.SizeVarint(uint64(n)) }
+
+// paddedWire is the wire length that the trailing PADDING of a record of n
+// frame bytes, z of them zero, adds.
+func paddedWire(n, z int) int { return wireLen(n) - wireLen(n-z) }
+
+func TestShapingRecords(t *testing.T) {
+	for _, v := range []recordCase{
+		{name: "pad_to", plan: shaping.UnitPlan{PadTo: 300}, send: 10, minLen: 300, padding: true},
+		{name: "pad_multiple_and_pad", plan: shaping.UnitPlan{PadMultiple: 100, Pad: 3}, send: 1000, mod: 100, rem: 3},
+		{name: "max_len", maxLen: 100, send: 5000, wantMax: 100, records: 50},
+		{name: "clamp_to_limit", plan: shaping.UnitPlan{PadTo: 1 << 20}, send: 10, wantMax: wireLen(65535), clamped: true},
+		{name: "account_does_not_bound_padding", limits: shaping.Limits{Wire: shaping.Account{Initial: 1}}, plan: shaping.UnitPlan{Pad: 300},
+			send: 10, repeat: 2, minPad: 300, padding: true},
+		{name: "server_pad_each_record", server: true, plan: shaping.UnitPlan{Pad: 16}, maxLen: 300, send: 20000,
+			records: 60, minPad: 16},
+	} {
+		t.Run(v.name, func(t *testing.T) {
+			cfg := &Config{ShapingLimits: v.limits}
 			var c, s *Conn
 			var rc *recConn
-			if v.Side == "server" {
+			if v.server {
 				s, c, rc = shapedServerPair(t, cfg)
 			} else {
 				c, s, rc = shapedPair(t, cfg)
 			}
 			c.SetShaper(planShaper(func(p *shaping.RecordPlan) {
-				p.MaxLen, p.PadTo, p.PadMultiple, p.Pad = v.Plan.MaxLen, v.Plan.PadTo, v.Plan.PadMultiple, v.Plan.Pad
-			}))
+				p.UnitPlan, p.MaxLen = v.plan, v.maxLen
+			}), nil)
 			rc.start()
-			for range max(v.Repeat, 1) {
-				transfer(t, c, s, v.Send)
+			for range max(v.repeat, 1) {
+				transfer(t, c, s, v.send)
 			}
 			sizes, zeros := rc.records()
-			e := v.Expect
-			if len(sizes) == 0 || len(sizes) < e.MinRecords {
+			if len(sizes) == 0 || len(sizes) < v.records {
 				t.Fatalf("%d records", len(sizes))
 			}
 			for i, n := range sizes {
-				if n < e.MinLen || e.MaxLen > 0 && n > e.MaxLen || e.Mod > 0 && n%e.Mod != e.Rem || zeros[i] < e.MinPad {
-					t.Fatalf("record of %d bytes, %d trailing zero bytes", n, zeros[i])
+				w := wireLen(n)
+				if w < v.minLen || v.wantMax > 0 && w > v.wantMax || v.mod > 0 && w%v.mod != v.rem || paddedWire(n, zeros[i]) < v.minPad {
+					t.Fatalf("record of %d wire bytes, %d trailing zero bytes", w, zeros[i])
 				}
 			}
 			st := c.ShapingStats()
-			if e.MaxPaddingBytes > 0 && st.PaddingBytes > e.MaxPaddingBytes || e.Clamped && st.Clamped == 0 ||
-				e.Padding && st.PaddingBytes == 0 || st.PaddingBytes < uint64(len(sizes)*e.MinPad) {
+			if v.padBound > 0 && st.WireSpent > v.padBound || v.clamped && st.Clamped == 0 ||
+				v.padding && st.WireSpent == 0 {
+				t.Fatalf("stats %+v", st)
+			}
+			if v.minPad > 0 && st.WireSpent < uint64(len(sizes)*(v.minPad-1)) { // a larger Size field takes a byte
 				t.Fatalf("stats %+v", st)
 			}
 		})
@@ -205,20 +205,21 @@ func TestShapingInjectZmuxPeer(t *testing.T) {
 	c, _, rc := shapedPair(t, nil)
 	rc.start()
 	c.SetShaper(func(ShapedPipe) shaping.Shaper {
-		return &fnShaper{event: func(e *shaping.Event, r *shaping.Reply) {
+		return &fnShaper{event: func(e *shaping.Event, r *shaping.Effects) {
 			if e.Kind == shaping.EventStart || e.Kind == shaping.EventInjected {
-				r.Inject = &shaping.Inject{After: time.Millisecond, Len: 20}
+				r.Set = shaping.EffectInject
+				r.HasInject, r.InjectAt, r.InjectLen = true, e.Now+time.Millisecond, 20
 			}
 		}}
-	})
+	}, nil)
 	time.Sleep(500 * time.Millisecond)
-	c.SetShaper(nil)
+	c.SetShaper(nil, nil)
 	time.Sleep(50 * time.Millisecond)
 	st := c.ShapingStats()
 	sizes, zeros := rc.records()
 	pad := 0
 	for i := range sizes {
-		if sizes[i] == 20 && zeros[i] == 20 {
+		if wireLen(sizes[i]) == 20 && zeros[i] == sizes[i] {
 			pad++
 		}
 	}
@@ -230,12 +231,12 @@ func TestShapingInjectZmuxPeer(t *testing.T) {
 func TestShapingRate(t *testing.T) {
 	c, s, _ := shapedPair(t, nil)
 	c.SetShaper(func(ShapedPipe) shaping.Shaper {
-		return &fnShaper{event: func(e *shaping.Event, r *shaping.Reply) {
+		return &fnShaper{event: func(e *shaping.Event, r *shaping.Effects) {
 			if e.Kind == shaping.EventStart {
-				r.Gate = &shaping.Gate{Rate: 100000, Burst: 10000}
+				r.Set, r.Rate, r.Burst = shaping.EffectGate, 100000, 10000
 			}
 		}}
-	})
+	}, nil)
 	t0 := time.Now()
 	transfer(t, c, s, 50000)
 	if d := time.Since(t0); d < 300*time.Millisecond {
@@ -248,12 +249,12 @@ func TestShapingRateCutsFrames(t *testing.T) {
 	// by more than the frame overhead.
 	c, s, rc := shapedPair(t, nil)
 	c.SetShaper(func(ShapedPipe) shaping.Shaper {
-		return &fnShaper{event: func(e *shaping.Event, r *shaping.Reply) {
+		return &fnShaper{event: func(e *shaping.Event, r *shaping.Effects) {
 			if e.Kind == shaping.EventStart {
-				r.Gate = &shaping.Gate{Rate: 400000, Burst: 1000}
+				r.Set, r.Rate, r.Burst = shaping.EffectGate, 400000, 1000
 			}
 		}}
-	})
+	}, nil)
 	rc.start()
 	transfer(t, c, s, 20000)
 	sizes, _ := rc.records()
@@ -269,7 +270,7 @@ func TestShapingDelayResumes(t *testing.T) {
 	c, s, _ := shapedPair(t, nil)
 	c.SetShaper(planShaper(func(p *shaping.RecordPlan) {
 		p.MaxLen, p.Delay = 1000, 5*time.Millisecond
-	}))
+	}), nil)
 	t0 := time.Now()
 	transfer(t, c, s, 10000)
 	if d := time.Since(t0); d > 3*time.Second {
@@ -281,16 +282,17 @@ func TestShapingTimerAndReplace(t *testing.T) {
 	c, _, _ := shapedPair(t, nil)
 	got := make(chan shaping.EventKind, 8)
 	c.SetShaper(func(ShapedPipe) shaping.Shaper {
-		return &fnShaper{event: func(e *shaping.Event, r *shaping.Reply) {
-			if e.Kind == shaping.EventStart {
-				r.Timer[1] = &shaping.Timer{After: 10 * time.Millisecond}
-			}
-			if e.Kind == shaping.EventTimer && e.Timer != 1 {
-				t.Errorf("slot %d", e.Timer)
+		return &fnShaper{event: func(e *shaping.Event, r *shaping.Effects) {
+			switch e.Kind {
+			case shaping.EventStart:
+				r.Set, r.HasWake, r.Wake = shaping.EffectWake, true, e.Now+10*time.Millisecond
+			case shaping.EventTimer:
+				r.Set = shaping.EffectWake
+			default: // the other events need no answer
 			}
 			got <- e.Kind
 		}}
-	})
+	}, nil)
 	want := func(k shaping.EventKind) {
 		select {
 		case g := <-got:
@@ -314,11 +316,21 @@ func TestShapingTimerAndReplace(t *testing.T) {
 
 func TestShapingFault(t *testing.T) {
 	c, s, _ := shapedPair(t, nil)
-	c.SetShaper(planShaper(func(*shaping.RecordPlan) { panic("x") }))
+	c.SetShaper(planShaper(func(*shaping.RecordPlan) { panic("x") }), nil)
 	transfer(t, c, s, 1000)
 	if st := c.ShapingStats(); st.Faults != 1 {
 		t.Fatalf("stats %+v", st)
 	}
+}
+
+// reachableWire is the wire length a record gets for the target l: the
+// smallest reachable one, of at least min frame bytes.
+func reachableWire(l, minFrames int) int {
+	f := minFrames
+	for wireLen(f) < l {
+		f++
+	}
+	return wireLen(f)
 }
 
 // TestShapingExactSize checks that planned sizes are met exactly also when
@@ -340,7 +352,7 @@ func TestShapingExactSize(t *testing.T) {
 			c, s, rc := shapedPair(t, nil)
 			c.SetShaper(planShaper(func(rp *shaping.RecordPlan) {
 				rp.MaxLen, rp.PadTo, rp.PadMultiple, rp.Pad = p.maxLen, p.padTo, p.mult, p.pad
-			}))
+			}), nil)
 			rc.start()
 			for _, n := range []int{1, 60, 61, 62, 63, 195, 196, 197, 990, 995, 3000, 40000} {
 				transfer(t, c, s, n)
@@ -350,22 +362,34 @@ func TestShapingExactSize(t *testing.T) {
 				t.Fatal("no records")
 			}
 			for _, n := range sizes {
+				w := wireLen(n)
 				switch {
-				case p.padTo > 0 && n != p.padTo:
-					t.Fatalf("record of %d bytes, want %d (sizes %v)", n, p.padTo, sizes)
-				case p.mult > 0 && n%p.mult != p.pad:
-					t.Fatalf("record of %d bytes, want %d mod %d (sizes %v)", n, p.pad, p.mult, sizes)
+				case p.padTo > 0 && w != reachableWire(p.padTo, shaping.MinMaxLen):
+					t.Fatalf("record of %d wire bytes for %d (sizes %v)", w, p.padTo, sizes)
+				case p.mult > 0 && !multipleReaches(w, p.mult, p.pad):
+					t.Fatalf("record of %d wire bytes, want %d mod %d (sizes %v)", w, p.pad, p.mult, sizes)
 				}
 			}
 		})
 	}
 }
 
-// A plan that sets only Pad appends that many PADDING bytes to every
+// multipleReaches reports whether the wire length w is a multiple of mult plus
+// pad, taken to the next reachable length.
+func multipleReaches(w, mult, pad int) bool {
+	for t := w - pad; t >= w-pad-2 && t >= 0; t-- {
+		if t%mult == 0 && reachableWire(t+pad, 0) == w {
+			return true
+		}
+	}
+	return false
+}
+
+// A plan that sets only Pad adds that many wire bytes of PADDING to every
 // record, data records included.
 func TestShapingPadOnly(t *testing.T) {
 	c, s, rc := shapedPair(t, nil)
-	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 7 }))
+	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 7 }), nil)
 	rc.start()
 	for _, n := range []int{1, 63, 64, 100, 5000} {
 		transfer(t, c, s, n)
@@ -375,8 +399,8 @@ func TestShapingPadOnly(t *testing.T) {
 		t.Fatal("no records")
 	}
 	for i := range sizes {
-		if zeros[i] < 7 {
-			t.Fatalf("record %d of %d bytes ends with %d PADDING bytes, want 7", i, sizes[i], zeros[i])
+		if paddedWire(sizes[i], zeros[i]) < 7 {
+			t.Fatalf("record %d of %d bytes ends with %d PADDING bytes, want 7 wire bytes", i, sizes[i], zeros[i])
 		}
 	}
 }
@@ -385,22 +409,23 @@ func TestShapingPadOnly(t *testing.T) {
 // records injected every 10 ms are about 10 ms apart, not a timer tick
 // more.
 func TestShapingTimerPrecision(t *testing.T) {
-	c, _, _ := shapedPair(t, nil)
+	c, _, _ := shapedPair(t, &Config{ShapingPreciseTimer: true})
 	const every = 10 * time.Millisecond
 	var mu sync.Mutex
 	var at []time.Time
 	c.SetShaper(func(ShapedPipe) shaping.Shaper {
-		return &fnShaper{caps: shaping.CapPlan, event: func(e *shaping.Event, r *shaping.Reply) {
+		return &fnShaper{caps: shaping.CapPlan, event: func(e *shaping.Event, r *shaping.Effects) {
 			if e.Kind == shaping.EventInjected {
 				mu.Lock()
 				at = append(at, time.Now())
 				mu.Unlock()
 			}
 			if e.Kind == shaping.EventStart || e.Kind == shaping.EventInjected {
-				r.Inject = &shaping.Inject{Len: 50, After: every}
+				r.Set = shaping.EffectInject
+				r.HasInject, r.InjectAt, r.InjectLen = true, e.Now+every, 50
 			}
 		}}
-	})
+	}, nil)
 	time.Sleep(400 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
@@ -429,8 +454,8 @@ func TestShapingHugePadding(t *testing.T) {
 		func(p *shaping.RecordPlan) { p.PadTo, p.Pad = 300, math.MaxInt },
 		func(p *shaping.RecordPlan) { p.PadTo, p.PadMultiple = 300, math.MaxInt },
 	} {
-		c, s, rc := shapedPair(t, &Config{ShapingLimits: shaping.Limits{MaxPaddingBytes: 1 << 20}})
-		c.SetShaper(planShaper(f))
+		c, s, rc := shapedPair(t, &Config{ShapingLimits: shaping.Limits{Wire: shaping.Account{Initial: 1 << 20}}})
+		c.SetShaper(planShaper(f), nil)
 		rc.start()
 		transfer(t, c, s, 100)
 		sizes, _ := rc.records()
@@ -446,16 +471,13 @@ func TestShapingHugePadding(t *testing.T) {
 // an invalid value changes nothing; concurrent calls are safe.
 func TestSetShapingLimits(t *testing.T) {
 	c, s, rc := shapedPair(t, nil)
-	if err := c.SetShapingLimits(shaping.Limits{MaxPaddingRatio: 2}); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("ratio 2: %v", err)
-	}
-	if err := c.SetShapingLimits(shaping.Limits{MaxDelay: -1}); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("negative delay: %v", err)
+	if err := c.SetShapingLimits(shaping.Limits{Wire: shaping.Account{PerMB: shaping.MaxAccountRate + 1}}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("ppm above 10^6: %v", err)
 	}
 	if c.ShapingLimits() != (shaping.Limits{}) {
 		t.Fatal("an invalid value changed the limits")
 	}
-	want := shaping.Limits{MaxPaddingBytes: 4096}
+	want := shaping.Limits{Wire: shaping.Account{Initial: 4096}}
 	if err := c.SetShapingLimits(want); err != nil {
 		t.Fatal(err)
 	}
@@ -464,21 +486,19 @@ func TestSetShapingLimits(t *testing.T) {
 	}
 	var wg sync.WaitGroup
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 50 {
 				_ = c.SetShapingLimits(want)
 				_ = c.ShapingLimits()
 				_ = c.ShapingStats()
 			}
-		}()
+		})
 	}
-	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 1000 }))
+	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 1000 }), nil)
 	rc.start()
 	transfer(t, c, s, 100<<10)
 	wg.Wait()
-	if st := c.ShapingStats(); st.PaddingBytes > 4096 || st.PaddingBytes == 0 {
-		t.Fatalf("padded %d bytes under MaxPaddingBytes 4096", st.PaddingBytes)
+	if st := c.ShapingStats(); st.WireSpent == 0 {
+		t.Fatalf("stats %+v: padding is metered", st)
 	}
 }

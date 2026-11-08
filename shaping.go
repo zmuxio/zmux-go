@@ -44,17 +44,14 @@ func (c *Conn) variantLocked(id uint64) string {
 }
 
 // SetShaper installs f on every outbound pipe of the session, replacing
-// earlier instances; nil: no shaping.
-//
-// A deadline that a Shaper sets (a delay, a gate) is met precisely: the
-// session's timer is armed ahead of it by the host timer's observed
-// lateness, at most 2 ms, and its callback then yields in a loop until the
-// deadline. Each shaping deadline so costs up to that lead in CPU time on
-// one goroutine; a Shaper that sets deadlines at a high rate trades CPU
-// for timing precision.
-func (c *Conn) SetShaper(f ShaperFactory) {
+// earlier instances; nil: no shaping. budget gives the configuration's budget,
+// called once here outside the lock; nil replaces an earlier budget with none, so
+// that only ShapingLimits apply. The account's spending carries over.
+func (c *Conn) SetShaper(f ShaperFactory, budget func() shaping.Budget) {
+	b := askBudget(c.cfg.Logger, budget)
 	c.lock()
 	defer c.unlock()
+	c.s.SetShapeBudget(b)
 	c.s.SetShaper(c.coreFactory(f))
 }
 
@@ -66,13 +63,9 @@ func (c *Conn) SetPipeShaper(pipe uint64, s shaping.Shaper) bool {
 	return c.s.SetPipeShaper(pipe, s)
 }
 
-// SetShapingLimits replaces the session's Config.ShapingLimits: records
-// planned from then on follow l, whether shaping is installed yet or not.
-// Limits may be tightened or loosened (they bound this endpoint's own
-// overhead and are never sent). Padding and pause already spent stay
-// counted: past a tightened bound nothing more is padded or paused, and
-// nothing already sent is undone. An invalid l fails with
-// ErrInvalidConfig and changes nothing.
+// SetShapingLimits replaces the session's Config.ShapingLimits, tighter or
+// looser; they are never sent. The account's spending carries over. An invalid
+// l fails with ErrInvalidConfig and changes nothing.
 func (c *Conn) SetShapingLimits(l shaping.Limits) error {
 	if err := checkLimits(&l); err != nil {
 		return err
@@ -88,6 +81,13 @@ func (c *Conn) ShapingLimits() shaping.Limits {
 	c.lock()
 	defer c.unlock()
 	return c.s.ShapeLimits()
+}
+
+// ShapingMeters returns the session's shaping readings.
+func (c *Conn) ShapingMeters() shaping.Meters {
+	c.lock()
+	defer c.unlock()
+	return c.s.ShapeMeters()
 }
 
 // ShapingStats returns the shaping counters.

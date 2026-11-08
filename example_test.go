@@ -113,8 +113,7 @@ func ExampleStreamError() {
 	st.CancelWrite(zmux.StreamCancelled)
 
 	_, err = io.ReadAll(peer)
-	var se *zmux.StreamError
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*zmux.StreamError](err); ok {
 		switch se.ErrorCode {
 		case zmux.StreamNoError:
 			fmt.Println("no error")

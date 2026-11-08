@@ -1,6 +1,6 @@
 package core
 
-// connFlow is the session-level flow control (SPEC.md 8.2, 8.3).
+// connFlow is the session-level flow control.
 type connFlow struct {
 	// Sending.
 	sendMax  uint64 // peer's MAX_DATA
@@ -31,7 +31,7 @@ func (c *connFlow) initRecv(w uint64) {
 // sessionWindowCapFloor is the 96 MiB floor of the default cap.
 const sessionWindowCapFloor = 96 << 20
 
-// bufferCap is max(session window cap, S) (SPEC.md 8.3 rule 4).
+// bufferCap is max(session window cap, S).
 func (s *Session) bufferCap() uint64 {
 	c := uint64(sessionWindowCapFloor)
 	if s.cfg.ConnWindowCap > 0 {
@@ -102,8 +102,8 @@ func updateThreshold(w uint64) uint64 {
 	return min64(w/4, max64(w/16, 256<<10))
 }
 
-// creditDue decides whether a scope's released credit must be sent now
-// (SPEC.md 8.3 rules 2 and 3). received is what the peer has sent there.
+// creditDue decides whether a scope's released credit must be sent now.
+// received is what the peer has sent there.
 func creditDue(c, l, w, received uint64, blockedFrame bool) bool {
 	if c <= l {
 		return false
@@ -163,7 +163,7 @@ func (s *Session) queueCtl(st *Stream, bit uint8) {
 // ctlWaits reports whether the control frames of st wait for its opening
 // STREAM frame, which queues them (openedCtl): before the identifier is
 // allocated (a frame then would carry no valid ID). Once allocated, a control frame may itself be the
-// stream's first frame (SPEC.md 7.2 rules 1 and 2, 8.4).
+// stream's first frame.
 func (st *Stream) ctlWaits() bool {
 	return st.local && !st.idSet
 }

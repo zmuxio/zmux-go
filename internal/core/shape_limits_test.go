@@ -1,14 +1,13 @@
 package core
 
 import (
-	"math"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/shaping"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// injectShaper asks for one injection of n bytes when installed.
+// injectShaper asks for one injection of n frame bytes when installed.
 type injectShaper struct {
 	n        int
 	injected []int
@@ -16,12 +15,16 @@ type injectShaper struct {
 
 func (x *injectShaper) Capabilities() shaping.Caps                    { return 0 }
 func (x *injectShaper) Plan(*shaping.RecordView, *shaping.RecordPlan) {}
-func (x *injectShaper) OnEvent(e *shaping.Event, r *shaping.Reply) {
+func (x *injectShaper) OnEvent(e *shaping.Event, r *shaping.Effects) {
 	switch e.Kind {
 	case shaping.EventStart:
-		r.Inject = &shaping.Inject{Len: x.n}
+		r.Set = shaping.EffectInject
+		r.HasInject, r.InjectAt, r.InjectLen = true, e.Now, wireOf(x.n, true, 0)
 	case shaping.EventInjected:
 		x.injected = append(x.injected, e.Len)
+		r.Set = shaping.EffectInject
+	case shaping.EventInjectDropped:
+		r.Set = shaping.EffectInject
 	default: // the other events need no reply
 	}
 }
@@ -61,78 +64,6 @@ func poll(t *testing.T, s *Session, p *Pipe, limit int, now Time) []int {
 	sizes := recordSizes(b)
 	s.WriteDone(b, nil, now)
 	return sizes
-}
-
-// Under a padding ratio limit, the first injection of a session, of a
-// whole default-size record, goes out at its full length (the startup
-// allowance), and no clamp is counted.
-func TestShapingRatioStartupAllowance(t *testing.T) {
-	s, p, sh := injectSession(t, shaping.Limits{MaxPaddingRatio: 0.01}, shaping.StartupAllowance)
-	now := Time(Second)
-	s.shapeTimeout(now)
-	poll(t, s, p, DefaultBatch, now)
-	if len(sh.injected) != 1 || sh.injected[0] != shaping.StartupAllowance {
-		t.Fatalf("injected %v, want [%d]", sh.injected, shaping.StartupAllowance)
-	}
-	if st := s.ShapingStats(); st.Clamped != 0 || st.PaddingBytes != shaping.StartupAllowance {
-		t.Fatalf("stats %+v", st)
-	}
-}
-
-// NoPaddingRatio, a ratio of 0, still allows the startup allowance and
-// no more: unlike NoPadding, the first injection goes out whole, and one
-// past the allowance waits however much else is sent.
-func TestShapingNoPaddingRatio(t *testing.T) {
-	s, p, sh := injectSession(t, shaping.Limits{NoPaddingRatio: true, MaxPaddingRatio: 0.5}, shaping.StartupAllowance)
-	now := Time(Second)
-	s.shapeTimeout(now)
-	poll(t, s, p, DefaultBatch, now)
-	if len(sh.injected) != 1 || sh.injected[0] != shaping.StartupAllowance {
-		t.Fatalf("injected %v, want [%d]", sh.injected, shaping.StartupAllowance)
-	}
-	if hard, ratio := s.padRoom(); hard != math.MaxUint64 || ratio != 0 {
-		t.Fatalf("room %d, %d after the allowance", hard, ratio)
-	}
-	s.stats.BytesSent += 1 << 30
-	if _, ratio := s.padRoom(); ratio != 0 {
-		t.Fatalf("ratio room %d: the ratio grew past 0", ratio)
-	}
-}
-
-// An injection beyond the ratio allowance waits and later goes out whole,
-// without a clamp; one cut by MaxPaddingBytes is counted as clamped.
-func TestShapingInjectDeferredNotCut(t *testing.T) {
-	s, p, sh := injectSession(t, shaping.Limits{MaxPaddingRatio: 0.5}, 1000)
-	s.shp.stats.PaddingBytes = shaping.StartupAllowance // the allowance is spent
-	s.stats.BytesSent = shaping.StartupAllowance
-	now := Time(Second)
-	s.shapeTimeout(now)
-	poll(t, s, p, DefaultBatch, now)
-	if len(sh.injected) != 0 || !p.sh.injDue || s.shapeWants(p, 0) {
-		t.Fatalf("injected %v, due %v: not deferred", sh.injected, p.sh.injDue)
-	}
-	// Other bytes sent raise the ratio allowance above the injection.
-	s.stats.BytesSent += 2*shaping.StartupAllowance + 4000
-	if !s.shapeWants(p, 0) {
-		t.Fatal("covered injection not wanted")
-	}
-	poll(t, s, p, DefaultBatch, now)
-	if len(sh.injected) != 1 || sh.injected[0] != 1000 {
-		t.Fatalf("injected %v, want [1000]", sh.injected)
-	}
-	if st := s.ShapingStats(); st.Clamped != 0 {
-		t.Fatalf("stats %+v: clamped without a hard limit", st)
-	}
-
-	s, p, sh = injectSession(t, shaping.Limits{MaxPaddingBytes: 300}, 1000)
-	s.shapeTimeout(now)
-	poll(t, s, p, DefaultBatch, now)
-	if len(sh.injected) != 1 || sh.injected[0] != 300 {
-		t.Fatalf("injected %v, want [300]", sh.injected)
-	}
-	if st := s.ShapingStats(); st.Clamped != 1 {
-		t.Fatalf("stats %+v: hard cut not counted", st)
-	}
 }
 
 // NoInjection and NoPadding allow no injection at all.
@@ -177,30 +108,16 @@ func TestShapingInjectWaitsForBatchRoom(t *testing.T) {
 	}
 }
 
-// SetShapeLimits applies to the records planned after it: a tightened
-// ratio bounds the room by the padding already spent (not undone), and a
-// loosened one restores it.
+// SetShapeLimits carries the account over: what was spent stays spent.
 func TestShapingSetLimitsRuntime(t *testing.T) {
-	s, _, _ := injectSession(t, shaping.Limits{MaxPaddingRatio: 0.5}, 0)
-	s.shapeSess()
-	s.shp.stats.PaddingBytes = 2 * shaping.StartupAllowance
-	s.stats.BytesSent = 10 * shaping.StartupAllowance
-	if _, r := s.padRoom(); r == 0 {
-		t.Fatal("no room under 0.5")
+	s, _, _ := injectSession(t, shaping.Limits{Wire: shaping.Account{Initial: 1000}}, 0)
+	s.shp.acct.spend(500)
+	s.SetShapeLimits(shaping.Limits{Wire: shaping.Account{Initial: 100}})
+	if l := s.shp.acct.left(); l != 100 {
+		t.Fatalf("left %d", l)
 	}
-	s.SetShapeLimits(shaping.Limits{MaxPaddingRatio: 0.1})
-	if _, r := s.padRoom(); r != 0 {
-		t.Fatalf("room %d past a tightened ratio", r)
-	}
-	if s.shp.stats.PaddingBytes != 2*shaping.StartupAllowance {
-		t.Fatal("spent padding reset")
-	}
-	s.SetShapeLimits(shaping.Limits{MaxPaddingRatio: 0.5})
-	if _, r := s.padRoom(); r == 0 {
-		t.Fatal("no room after loosening")
-	}
-	s.SetShapeLimits(shaping.Limits{MaxPaddingBytes: 2 * shaping.StartupAllowance})
-	if h, _ := s.padRoom(); h != 0 {
-		t.Fatalf("hard room %d past MaxPaddingBytes", h)
+	s.SetShapeLimits(shaping.Limits{Wire: shaping.Account{Initial: 300}})
+	if l := s.shp.acct.left(); l != 300 || s.shp.acct.spent != 500 {
+		t.Fatalf("left %d spent %d", l, s.shp.acct.spent)
 	}
 }

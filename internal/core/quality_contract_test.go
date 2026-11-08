@@ -22,7 +22,7 @@ func capacityMP() *Session {
 func measuredRate(p *Pipe, rate float64) {
 	e := &p.out.snd.re
 	e.blockedNow = true
-	e.sample(rate, false, 0, 0)
+	e.sample(rate, false, false, 0, 0)
 	e.blockedNow = false
 }
 func takeCapacity(s *Session) (Event, bool) {
@@ -48,7 +48,7 @@ func TestCapacityCountsAcceptedApplicationLimitedSampleWithoutEndingPlacement(t 
 	p := s.pipes[0]
 	s.SetCapacityFloor(CapacityFloor{Rate: 1500000, RateRatio: 1.01})
 	wantCapacity(t, s, EvCapacityBelow, 0)
-	p.out.snd.re.sample(2000000, true, 0, 1)
+	p.out.snd.re.sample(2000000, true, false, 0, 1)
 	if p.out.snd.re.measured {
 		t.Fatal("application-limited sample ended placement")
 	}
@@ -57,7 +57,7 @@ func TestCapacityCountsAcceptedApplicationLimitedSampleWithoutEndingPlacement(t 
 }
 func TestCapacityRejectedSampleDoesNotCountTheInitialEstimate(t *testing.T) {
 	s := capacitySession()
-	s.pipes[0].out.snd.re.sample(500000, true, 0, 1)
+	s.pipes[0].out.snd.re.sample(500000, true, false, 0, 1)
 	s.SetCapacityFloor(CapacityFloor{Rate: 100000})
 	wantCapacity(t, s, EvCapacityBelow, 0)
 }

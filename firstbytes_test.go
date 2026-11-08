@@ -50,9 +50,9 @@ func TestClassifyFirstBytesVectors(t *testing.T) {
 }
 
 // The first frame types are the ones the session accepts as first
-// records, and their leads are ff, 9a and ba.
+// records, and their leads are ff and ba.
 func TestClassifyFirstBytesTable(t *testing.T) {
-	if firstLeads != [3]byte{0xff, 0x9a, 0xba} {
+	if firstLeads != [2]byte{0xff, 0xba} {
 		t.Fatalf("leads %x", firstLeads)
 	}
 	for _, ty := range wire.FirstFrameTypes {
@@ -72,13 +72,13 @@ func TestClassifyFirstBytesTable(t *testing.T) {
 // Every prefix that the session's first-record parser does not reject is
 // not judged Other, and every byte pair of 16 03 is.
 func TestClassifyFirstBytesAgreesWithCore(t *testing.T) {
-	for b0 := 0; b0 < 256; b0++ {
-		for b1 := 0; b1 < 256; b1++ {
+	for b0 := range 256 {
+		for b1 := range 256 {
 			for _, tail := range [][]byte{{0xff, 0x9a, 0xba}, {0x00, 0x40, 0xff}, {0x00, 0xff, 0xff}} {
 				b := append([]byte{byte(b0), byte(b1)}, tail...)
 				cc, _ := core.Classify(b, MaxRecordSize)
 				c, _ := ClassifyFirstBytes(b, FramingByteStream)
-				if cc != core.ClassReject && cc != core.ClassMore && c == FirstBytesOther {
+				if cc != core.ClassReject && cc != core.ClassMore && cc != core.ClassJoin && c == FirstBytesOther {
 					t.Fatalf("% x: core %v, classified Other", b, cc)
 				}
 			}

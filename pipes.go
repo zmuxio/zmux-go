@@ -2,13 +2,13 @@ package zmux
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go/internal/core"
-	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/internal/join"
 )
 
 // PipeOptions are the options of an attachment. The zero value is a
@@ -21,7 +21,7 @@ import (
 // it. Weight is a pointer because 0 is a weight of its own (excluded).
 // Set a pointer field with new, as in SendStandby: new(true) or
 // Weight: new(uint64(0)). The Receive fields are plain values because
-// they are always sent: the PIPE_JOIN carries a request for the peer's outbound
+// they are always sent: the Hello carries a request for the peer's outbound
 // direction, so the zero values ask for tier 0, not standby.
 type PipeOptions struct {
 	// SendPriority is the tier of the local outbound direction (lower is
@@ -73,12 +73,15 @@ type PipeOptions struct {
 	// ReceiveStandby asks the peer to make its outbound direction standby
 	// (zero: active).
 	ReceiveStandby bool
-	// CarrierBound ties the join token to the new carrier's innermost
-	// end-to-end handshake (MULTIPATH.md 10.5): its exporter (Exporter),
-	// read when AddPipe is called, so the carrier's handshake must have
-	// completed by then; the listener reads its own side when the join
-	// arrives.
-	CarrierBound bool
+	// NoWaitAttached makes AddPipe return at the verified Reply instead of
+	// once the peer has attached the pipe. The caller then keeps the
+	// session's other pipes until Pipe.WaitAttached returns.
+	NoWaitAttached bool
+	// Mode is the record mode of this carrier. nil: Config.RecordPolicy, else Sealed.
+	Mode *RecordMode
+	// Group is the key exchange of the Join's key share. Zero: Group 1 when it is usable, otherwise Group 2. A Group that is
+	// not usable in the session fails AddPipe with ErrInvalidConfig.
+	Group uint64
 }
 
 func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
@@ -103,7 +106,7 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 	if o.NoProbation && o.Probation != 0 {
 		return j, fmt.Errorf("%w: Probation with NoProbation", ErrInvalidConfig)
 	}
-	j.FateGroup, j.SendPriority, j.SendStandby = o.FateGroup, o.SendPriority, o.SendStandby
+	j.FateGroup, j.SendPriority, j.SendStandby, j.Group = o.FateGroup, o.SendPriority, o.SendStandby, o.Group
 	j.RecvPriority, j.RecvStandby = o.ReceivePriority, o.ReceiveStandby
 	j.Weight = 1
 	if o.Weight != nil {
@@ -127,7 +130,7 @@ type Pipe struct {
 func (p *Pipe) ID() uint64 { return p.id }
 
 // Admitted returns the Decision.Value of the admission that accepted the
-// pipe's carrier, the one that carried its PIPE_JOIN (or the session's
+// pipe's carrier, the one that carried its Hello (or the session's
 // value for the bootstrap pipe, Conn.Admitted). It is nil without one, on
 // the dialing side, and once the session no longer knows the pipe. zmux
 // does not compare it with the session's: a host that requires a join to
@@ -144,115 +147,124 @@ func (p *Pipe) Admitted() any {
 	return nil
 }
 
-// AddPipe joins a new carrier to the session in band (MULTIPATH.md 5.7) and
-// waits until the join is confirmed, the pipe fails, or ctx ends (the pipe
-// is then removed). A join that the attachment cap or the refusal backoff
-// holds waits for room. With CarrierBound, a carrier whose TLS handshake
-// (a *tls.Conn half, or a Handshaker) has not completed is first driven
-// through it with ctx; a failed handshake closes it and is returned.
+// AddPipe joins a new carrier to the session with the Join handshake and returns
+// once the peer has attached the pipe (Pipe.WaitAttached), or with
+// PipeOptions.NoWaitAttached once the Reply has been verified. ctx bounds the call,
+// and otherwise Config.JoinTimeout. The carrier belongs to zmux from the call on:
+// when AddPipe fails, ErrInvalidConfig included, it has been closed. A refusal returns ErrJoinRefused and starts the
+// backoff. A join that the attachment cap or the refusal backoff holds waits for room.
+// A pipe that the peer has not attached when ctx or the timeout ends is aborted, and
+// ctx's error returned; one that fails or goes first returns ErrPipeGone. A send-only
+// pipe is attached by an acknowledgement, which the peer sends on an inbound
+// direction: without another pipe that receives, the default wait lasts until the
+// deadline. In Bound, a carrier whose handshake (a *tls.Conn half, or a Handshaker)
+// has not completed is first driven through it with ctx; a failed handshake closes it.
 func (c *Conn) AddPipe(ctx context.Context, p PipeIO, o PipeOptions) (*Pipe, error) {
-	if o.CarrierBound {
-		// The binding is the carrier's exporter, read once its own
-		// handshake completed: a TLS half (or Handshaker) not yet past it
-		// is driven through it with ctx first.
-		if handshake := pendingHandshake(p); handshake != nil {
-			if err := handshake(ctx); err != nil {
-				closePipeIO(p)
-				return nil, fmt.Errorf("zmux: carrier handshake: %w", err)
-			}
-		}
+	pp, taken, err := c.addPipeCall(ctx, p, o)
+	if err != nil && !taken {
+		closePipeIO(p)
 	}
-	pp, err := c.addPipe(p, o, false)
-	if err != nil {
-		return nil, err
-	}
-	if err := pp.waitJoined(ctx); err != nil {
-		_ = pp.Abort(err)
-		return nil, err
-	}
-	return pp, nil
+	return pp, err
 }
 
-func (c *Conn) addPipe(p PipeIO, o PipeOptions, oob bool) (*Pipe, error) {
-	if r, ok := p.R.(*httpRespReader); ok && r.peer != nil {
-		// Its pairing token makes pipe pair 0 only (SPEC.md 6.1.1).
-		return nil, fmt.Errorf("%w: a split bootstrap carrier cannot join a session; join an uplink and a downlink (HTTPSplitJoin)", ErrInvalidConfig)
-	}
+// addPipeCall is AddPipe; taken reports that the session took p (and
+// closes it when it fails).
+func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pipe, taken bool, err error) {
 	dir := o.Direction
-	if (dir != DirReceiveOnly && p.W == nil) || (dir != DirSendOnly && p.R == nil && !oob) {
-		return nil, fmt.Errorf("%w: the carrier lacks a half the direction needs", ErrInvalidConfig)
+	if p.W == nil || p.R == nil {
+		return nil, false, fmt.Errorf("%w: a join needs both directions of the carrier; pair two with PairedPipe", ErrInvalidConfig)
 	}
 	if err := p.checkOverhead(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if o.FateGroup == 0 {
 		o.FateGroup = p.FateGroup
 	}
 	j, err := o.join(dir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	j.OOB = oob
-	if o.CarrierBound {
-		e, ok := Exporter(p)
-		if !ok {
-			return nil, fmt.Errorf("%w: CarrierBound on a carrier without an exporter", ErrInvalidConfig)
+	mode := Sealed
+	switch {
+	case o.Mode != nil:
+		mode = *o.Mode
+	case c.cfg.RecordPolicy != nil:
+		mode = c.cfg.RecordPolicy(joinCarrierInfo(p, false))
+	}
+	if mode > Trusted {
+		return nil, false, fmt.Errorf("%w: record mode %v for a join", ErrInvalidConfig, mode)
+	}
+	j.Mode = join.Mode(mode)
+	if mode == Bound {
+		if p.Carrier == CarrierSplit {
+			return nil, false, fmt.Errorf("%w: Bound on a split carrier", ErrInvalidConfig)
 		}
-		b, err := e.ExportKeyingMaterial(wire.ExporterPipe, nil, 32)
-		if err != nil {
-			return nil, fmt.Errorf("zmux: carrier exporter: %w", err)
+		// The handshake first: a carrier may name its connection only then.
+		if handshake := pendingHandshake(p); handshake != nil {
+			if err := handshake(ctx); err != nil {
+				return nil, false, fmt.Errorf("zmux: carrier handshake: %w", err)
+			}
 		}
-		j.CarrierBound, j.Binding = true, b
+		if !IsCarrierSecure(p) {
+			return nil, false, fmt.Errorf("%w: Bound on a carrier without a Secure declaration", ErrInvalidConfig)
+		}
+		if j.Binding, err = joinBinding(p); err != nil {
+			return nil, false, err
+		}
 	}
-	c.lock()
-	defer c.unlock()
-	if c.closing {
-		return nil, c.errLocked()
-	}
-	outer := outerOf(p)
-	if err := nestPipe(c, outer); err != nil {
-		return nil, err
-	}
-	pd := c.newPipeDrv(c.s.NextPipeID(), p)
-	pd.outer = outer
-	low := !oob && pd.tcp.setLowWater(multiLowWater)
-	info := carrierInfo(p, pd.tcp, low)
-	j.In, j.Out, j.OutSig, j.Kind = info, info, pd.wsig, uint8(p.Carrier)
-	id, _, err := c.s.AddPipe(j)
+	pp, pd, err := c.addPipe(p, o, j)
 	if err != nil {
-		unnestPipe(c, pd.outer)
-		return nil, apiErr(err)
+		return nil, false, err
 	}
-	pd.id = id
-	c.labels[id] = o.Label
-	if !oob {
-		c.startPipeLocked(pd, dir != DirSendOnly, dir != DirReceiveOnly)
-	} else {
-		c.pipes[id] = pd
+	jctx, cancel := timeshim.WithTimeout(ctx, c.clk.source(), c.cfg.joinTimeout())
+	defer cancel()
+	if err := c.joinCarrier(jctx, pd, p, dir); err != nil {
+		if !errors.Is(err, ErrJoinRefused) {
+			_ = pp.Abort(err)
+		}
+		return nil, true, err
 	}
-	return &Pipe{c: c, id: id}, nil
+	if o.NoWaitAttached {
+		return pp, true, nil
+	}
+	if err := pp.WaitAttached(jctx); err != nil {
+		_ = pp.Abort(err)
+		if jctx.Err() != nil && c.ctx.Err() == nil {
+			return nil, true, fmt.Errorf("zmux: pipe %d not attached by the peer: %w", pp.id, err)
+		}
+		return nil, true, err
+	}
+	return pp, true, nil
 }
 
-// waitJoined waits until the outbound direction (or, for a downlink, the
-// inbound one) is ACTIVE/OPEN, or the pipe failed.
-func (p *Pipe) waitJoined(ctx context.Context) error {
+// WaitAttached waits until the peer has attached the pipe, returning nil at once for a pipe it
+// already has: the bootstrap pipe, a pipe the peer joined, or one this
+// endpoint joined that has received a PIPE_ACK acknowledging a byte (one
+// with only an inbound direction: a record). AddPipe waits for it unless
+// PipeOptions.NoWaitAttached is set; until then the peer may have no state
+// of the pipe, and closing the session's other pipes would leave it none. It returns
+// ctx's error, ErrPipeGone once the pipe failed, closed or is gone before
+// it is attached, or the session's error once the session ends.
+func (p *Pipe) WaitAttached(ctx context.Context) error {
 	c := p.c
 	sig := core.NewSignal()
 	defer c.unwatchPipes(sig)
 	for {
 		c.lock()
-		out, in, ok := c.s.PipeState(p.id)
-		if ok && (out == core.OutJoining || out == core.OutNone && in == core.InJoining) {
-			sig.Drain()
-			c.watchPipes(sig)
-		}
+		sig.Drain()
+		c.watchPipes(sig)
+		pi, ok := c.s.PipeInfo(p.id)
 		c.unlock()
 		switch {
-		case !ok || out == core.OutFailed || out == core.OutClosed || out == core.OutRetired ||
-			out == core.OutNone && in != core.InJoining && in != core.InOpen:
-			return fmt.Errorf("zmux: pipe %d not joined: %w", p.id, ErrPipeGone)
-		case out == core.OutActive || out == core.OutSuspect || out == core.OutNone && in == core.InOpen:
+		case c.isDone():
+			return c.closedErr()
+		case !ok:
+			return ErrPipeGone
+		case pi.PeerAttached:
 			return nil
+		case pi.HasOut && (pi.OutState == core.OutFailed || pi.OutState == core.OutClosed || pi.OutState == core.OutDraining),
+			!pi.HasOut && pi.InState == core.InEnded:
+			return ErrPipeGone
 		}
 		select {
 		case <-sig.C:
@@ -262,6 +274,41 @@ func (p *Pipe) waitJoined(ctx context.Context) error {
 			return c.closedErr()
 		}
 	}
+}
+
+func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions) (*Pipe, *pipeDrv, error) {
+	c.lock()
+	defer c.unlock()
+	if c.closing {
+		return nil, nil, c.errLocked()
+	}
+	outer := outerOf(p)
+	if err := nestPipe(c, outer); err != nil {
+		return nil, nil, err
+	}
+	pd := c.newPipeDrv(c.s.NextPipeID(), p)
+	pd.outer = outer
+	low := pd.tcp.setLowWater(multiLowWater)
+	info := carrierInfo(p, pd.tcp, low)
+	if j.Mode == join.Sealed {
+		overhead := p.WriteOverhead + 16
+		if p.Framing != FramingRecords {
+			overhead += sealedLen
+		}
+		info = core.CarrierInfo{Framing: core.FramingRecords, MinRTT: info.MinRTT, QueueBound: low,
+			WriteOverhead: overhead, MaxRecord: SealedMaxRecord}
+		pd.opener, pd.ch = nil, nil
+	}
+	j.In, j.Out, j.OutSig, j.Kind = info, info, pd.wsig, uint8(p.Carrier)
+	id, _, err := c.s.AddPipe(j)
+	if err != nil {
+		unnestPipe(c, pd.outer)
+		return nil, nil, apiErr(err)
+	}
+	pd.id = id
+	c.pipes[id] = pd
+	c.labels[id] = o.Label
+	return &Pipe{c: c, id: id}, pd, nil
 }
 
 // JoinReady reports whether the maintenance target and join admission permit
@@ -274,70 +321,6 @@ func (c *Conn) JoinReady() bool {
 	defer c.unlock()
 	return c.s.JoinReady()
 }
-
-// Reservation is a pipe reserved for an out-of-band join (MULTIPATH.md
-// 5.3): send Header() with the carrier's request as the Zmux-Pipe-Join
-// header, then Attach the carrier.
-type Reservation struct {
-	p      *Pipe
-	header string
-	dir    Direction
-}
-
-// ReservePipe reserves a pipe for an out-of-band join.
-func (c *Conn) ReservePipe(dir Direction, o PipeOptions) (*Reservation, error) {
-	o.Direction = dir
-	pp, err := c.addPipe(PipeIO{W: nopWriteCloser{}, R: nil}, o, true)
-	if err != nil {
-		return nil, err
-	}
-	c.lock()
-	h := c.oobHeaders[pp.id]
-	delete(c.oobHeaders, pp.id)
-	c.unlock()
-	return &Reservation{p: pp, header: h, dir: dir}, nil
-}
-
-// Header returns the Zmux-Pipe-Join header value (base64url of the
-// PIPE_JOIN frame, without padding).
-func (r *Reservation) Header() string { return r.header }
-
-// Attach binds the carrier of the reserved pipe and waits until the join
-// is confirmed (see AddPipe).
-func (r *Reservation) Attach(ctx context.Context, p PipeIO) (*Pipe, error) {
-	c := r.p.c
-	c.lock()
-	pd := c.pipes[r.p.id]
-	if pd == nil || c.closing {
-		c.unlock()
-		return nil, ErrPipeGone
-	}
-	pd.hc = newHalfCloser(p)
-	pd.framing = p.Framing
-	pd.tcp = tcpOf(p.W)
-	if o, ok := p.W.(LaneOpener); ok {
-		pd.opener = o
-	}
-	// The reservation's placeholder said nothing of the carrier.
-	c.s.AttachCarrier(r.p.id, carrierInfo(p, pd.tcp, false), uint8(p.Carrier))
-	c.startPipeLocked(pd, r.dir != DirSendOnly, r.dir != DirReceiveOnly)
-	c.unlock()
-	if err := r.p.waitJoined(ctx); err != nil {
-		_ = r.p.Abort(err)
-		return nil, err
-	}
-	return r.p, nil
-}
-
-// Cancel abandons the reservation.
-func (r *Reservation) Cancel() { _ = r.p.Abort(errors.New("zmux: reservation cancelled")) }
-
-type nopWriteCloser struct{}
-
-func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
-func (nopWriteCloser) Close() error                { return nil }
-
-func encodeJoinHeader(frame []byte) string { return base64.RawURLEncoding.EncodeToString(frame) }
 
 // ---- settings ----
 
@@ -412,14 +395,35 @@ func (c *Conn) RevalidatePipes() error {
 	return apiErr(c.s.RevalidatePipes(0, true, c.clk.now()))
 }
 
-// Close removes the pipe gracefully: PIPE_ABANDON(NO_ERROR) and drain
-// (MULTIPATH.md 8.2). It does not block; the pipe's end is reported by
+// Close removes the pipe gracefully: PIPE_ABANDON(NO_ERROR) and drain.
+// It does not block; the pipe's end is reported by
 // NextEvent.
 func (p *Pipe) Close() error {
 	c := p.c
 	c.lock()
 	defer c.unlock()
+	c.warnLastPipeLocked(p.id)
 	return pipeErr(c.s.RemovePipe(p.id, true))
+}
+
+// warnLastPipeLocked logs a warning when the application removes pipe id,
+// the last one of a direction, while the session has open streams: the
+// session suspends (resume) or ends with PipesLost.
+func (c *Conn) warnLastPipeLocked(id uint64) {
+	if c.hk.logger() != nil && !c.closing && c.s.HasStreams() && c.s.RemovesLast(id) {
+		c.hk.warn("zmux: the application removed the last pipe of a direction while streams are open: the session suspends (resume) or ends with PipesLost")
+	}
+}
+
+// unattendedLocked reports whether a suspension has nothing in the
+// library that will dial: the session can rejoin (the peer gave a Session
+// Locator) but has no Config.Redial and no running MaintainPipes.
+func (c *Conn) unattendedLocked() bool {
+	if c.cfg.Redial != nil || c.pools.Load() > 0 {
+		return false
+	}
+	p, ok := c.s.PeerParams()
+	return ok && len(p.Locator) > 0
 }
 
 // Abort removes the pipe abruptly: failure, reinjection and
@@ -429,6 +433,7 @@ func (p *Pipe) Abort(cause error) error {
 	c.lock()
 	defer c.unlock()
 	c.s.SetPipeCause(p.id, cause)
+	c.warnLastPipeLocked(p.id)
 	return pipeErr(c.s.RemovePipe(p.id, false))
 }
 
@@ -460,8 +465,8 @@ func (c *Conn) SetScheduler(s Scheduler) {
 
 // ---- statistics ----
 
-// OutboundState is the state of a pipe's outbound direction (STATE_MACHINE.md
-// 3.1); OutboundNone when the pipe has none.
+// OutboundState is the state of a pipe's outbound direction in its life
+// cycle; OutboundNone when the pipe has none.
 type OutboundState uint8
 
 const (
@@ -495,8 +500,8 @@ func (s OutboundState) String() string {
 	return "OutboundState(?)"
 }
 
-// InboundState is the state of a pipe's inbound direction (STATE_MACHINE.md
-// 3.2); InboundNone when the pipe has none.
+// InboundState is the state of a pipe's inbound direction in its life
+// cycle; InboundNone when the pipe has none.
 type InboundState uint8
 
 const (
@@ -521,8 +526,8 @@ func (s InboundState) String() string {
 	return "InboundState(?)"
 }
 
-// PipeStats is a snapshot of one attachment (API.md 7.2). Fields marked
-// estimate are the sender's estimators (SCHEDULER.md 2) and change as
+// PipeStats is a snapshot of one attachment. Fields marked
+// estimate are the sender's estimators and change as
 // samples arrive; a gauge is a current value; the other counts only
 // increase. Each field holds a value it had during the call; the state
 // fields (the direction states, flags, priorities and their sources,
@@ -534,12 +539,16 @@ func (s InboundState) String() string {
 // of a direction the attachment does not have, whose state is then
 // OutboundNone or InboundNone.
 type PipeStats struct {
-	Pipe      uint64 // the pipe ID
-	FateGroup uint64
-	Label     string
-	Variant   string      // PipeIO.Variant
-	Local     bool        // this endpoint joined the attachment
-	Carrier   CarrierKind // PipeIO.Carrier
+	Pipe       uint64 // the pipe ID
+	FateGroup  uint64
+	Label      string
+	Variant    string     // PipeIO.Variant
+	RecordMode RecordMode // who protects its records
+	Local      bool       // this endpoint joined the attachment
+	// PeerAttached reports that the peer has attached the pipe
+	// (WaitAttached); once true it stays true.
+	PeerAttached bool
+	Carrier      CarrierKind // PipeIO.Carrier
 	// Outbound and Inbound are the states of the two directions;
 	// OutboundNone and InboundNone for one the attachment lacks.
 	Outbound     OutboundState
@@ -712,7 +721,7 @@ func (c *Conn) Pipe(id uint64) (*Pipe, bool) {
 }
 
 func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
-	st := PipeStats{Pipe: pi.ID, Local: pi.Local, FateGroup: pi.FateGroup, Label: c.labels[pi.ID],
+	st := PipeStats{Pipe: pi.ID, RecordMode: c.pipeModeLocked(pi.ID), Local: pi.Local, PeerAttached: pi.PeerAttached, FateGroup: pi.FateGroup, Label: c.labels[pi.ID],
 		Carrier: CarrierKind(pi.Carrier), Variant: c.variantLocked(pi.ID), Outbound: OutboundState(pi.OutState), Inbound: InboundState(pi.InState),
 		AttachedFor: time.Duration(pi.AttachedFor), SuspectCount: pi.SuspectCount, FailureCount: pi.FailureCount,
 		Failure: pi.Failure, SendPriority: pi.SendPriority, SendPrioritySource: pi.PrioritySource,
@@ -755,7 +764,7 @@ func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
 }
 
 // clearOutbound zeroes the fields of the outbound direction, which an
-// attachment without one reports as absent (API.md 7.2): its state is
+// attachment without one reports as absent: its state is
 // OutboundNone and every other field of the direction is 0.
 func (st *PipeStats) clearOutbound() {
 	st.Outbound = OutboundNone
@@ -779,4 +788,39 @@ func (st *PipeStats) clearInbound() {
 	st.ReceivePriority, st.ReceiveStandby, st.RequestSeq = 0, false, 0
 	st.BytesReceived, st.RecordsReceived, st.BytesDuplicateReceived = 0, 0, 0
 	st.SinceLastReceive, st.LanesIn = 0, 0
+}
+
+// pipeModeLocked is the record mode of an attachment.
+func (c *Conn) pipeModeLocked(id uint64) RecordMode {
+	if id == 0 && !c.cc.SecureFirstPipe {
+		return Unmanaged
+	}
+	return RecordMode(c.s.PipeMode(id))
+}
+
+// WeakestRecordMode is the session's protection: that of its weakest pipe, Unmanaged
+// included. A host can authorize by it.
+func (c *Conn) WeakestRecordMode() RecordMode {
+	c.lock()
+	defer c.unlock()
+	m, unmanaged := c.s.WeakestMode()
+	if unmanaged {
+		return Unmanaged
+	}
+	return RecordMode(m)
+}
+
+// DeclareEndToEnd states that the host has proven pipe 0 end to end, for example with a
+// pinned certificate or an attestation over an exporter of its own label. It is local
+// and sends nothing. Until then a session whose first pipe is not on the secure carrier
+// has no join keys: local joins fail with ErrJoinPending and the peer's are held. The
+// library stops a host from forgetting or joining too early, not from declaring falsely.
+// A session on a secure first pipe needs no call, and one is a no-op.
+func (c *Conn) DeclareEndToEnd() {
+	if c == nil {
+		return
+	}
+	c.lock()
+	defer c.unlock()
+	c.s.DeclareEndToEnd()
 }

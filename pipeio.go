@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// Framing is a carrier's record framing (SPEC.md 3.1, 3.4).
+// Framing is a carrier's record framing.
 type Framing uint8
 
 const (
@@ -30,7 +30,7 @@ const MaxRecordSize = wire.MaxRecordSize
 
 // MessageReader is the receiving half of a message-framed carrier.
 type MessageReader interface {
-	// ReadMessage returns the next whole message.
+	// ReadMessage returns the next whole message. The caller owns the returned slice.
 	ReadMessage() ([]byte, error)
 }
 
@@ -59,22 +59,6 @@ type MessageWriter interface {
 // it returns. An error means none or some were written; the pipe fails.
 type MessageBatchWriter interface {
 	WriteMessages(msgs [][]byte) error
-}
-
-// ResponseHeaderer is an optional capability of a client half of an HTTP
-// carrier: the header of the HTTP response that opened it (a WebSocket
-// 101, a streaming or split carrier's response), or of the most recent
-// response (an exchange carrier), as a copy; nil before any response. A
-// host or transform reads outer metadata from it, such as Date as a clock
-// hint; it changes nothing. A transparent transform may forward it.
-//
-// The header is not authenticated: on plain HTTP or WebSocket anyone on
-// the path, and over TLS any proxy that terminates it, can write or alter
-// it. Never base authentication or authorization on it; a host that takes
-// Date as a clock hint bounds what it accepts (a maximum offset from its
-// own clock, never earlier than a time it already trusts).
-type ResponseHeaderer interface {
-	ResponseHeader() http.Header
 }
 
 // BuffersWriter is an optional capability of a byte-stream sending half
@@ -123,12 +107,12 @@ func WriteFlat(w io.Writer, bufs [][]byte) (int, error) {
 //     carrier (TerminatedTLS, CarrierInfo.TLS); records are built at
 //     16382 bytes on a *tls.Conn;
 //   - KeyingMaterialExporter: the exporter of the innermost end-to-end
-//     handshake, for PipeAuth.Exporter and PipeOptions.CarrierBound
+//     handshake, for PipeAuth.Exporter and the Bound record mode
 //     (Exporter, which falls back to a terminated TLS state);
 //   - Handshaker: a handshake the listener runs before admission;
 //   - CarrierConner and LaneOpener: lanes;
 //   - EarlyClientCarrier and EarlyServerCarrier on W: carrier early data;
-//   - DatagramChannel: the carrier's datagram channel (EXTENSIONS.md 6.8);
+//   - DatagramChannel: the carrier's datagram channel;
 //   - UnsentReporter on W and on a lane's writer: bytes not yet
 //     transmitted (a TCP connection, or a TLS one over it, reports the
 //     socket's where the platform has a query, Linux SIOCOUTQNSD);
@@ -147,6 +131,11 @@ type PipeIO struct {
 	// kind, such as raw TCP or TLS. The session reports it to its
 	// ShaperFactory, in pipe events and in PipeStats.
 	Carrier CarrierKind
+	// Protocol is the application protocol the carrier negotiated other
+	// than by the ALPN of a TLS handshake this process runs, such as a
+	// WebSocket subprotocol (ConnectionState.ApplicationProtocol); empty
+	// otherwise.
+	Protocol string
 	// Label names the pipe in statistics.
 	Label string
 	// FateGroup is the carrier's own fate group (a carrier pool's pipes on
@@ -165,6 +154,10 @@ type PipeIO struct {
 	// zmux only reports it, in pipe events, PipeStats, ShapedPipe and
 	// CarrierCache keys; the host bounds the number of variants.
 	Variant string
+	// HandshakePadding is the padding bytes a handshake run on the carrier
+	// before this PipeIO added; the session the carrier becomes part of, by
+	// starting it or by joining it, meters it once. 0: none.
+	HandshakePadding uint64
 }
 
 // MaxWriteOverhead is the largest PipeIO.WriteOverhead.
@@ -231,7 +224,7 @@ type UnsentReporter interface{ Unsent() (n uint64, ok bool) }
 type RetransReporter interface{ Retransmitted() (n uint64, ok bool) }
 
 // LaneOpener is a half whose carrier opens further write lanes
-// (EXTENSIONS.md lanes): each a writer of whole records.
+// (lanes): each a writer of whole records.
 type LaneOpener interface {
 	OpenLane(ctx context.Context) (io.WriteCloser, error)
 }
@@ -248,11 +241,12 @@ type halfCloser struct {
 	same    bool
 	rOnce   sync.Once
 	wOnce   sync.Once
+	wDone   atomic.Bool // the write side's graceful end has returned
 	allOnce sync.Once
 }
 
 func newHalfCloser(p PipeIO) *halfCloser {
-	same := p.R != nil && p.W != nil && any(p.R) == any(p.W)
+	same := p.R != nil && p.W != nil && sameHalf(p.R, p.W)
 	return &halfCloser{io: p, same: same}
 }
 
@@ -273,6 +267,7 @@ func (h *halfCloser) shutdownWrite() {
 		return
 	}
 	h.wOnce.Do(func() {
+		defer h.wDone.Store(true)
 		if cw, ok := h.io.W.(CloseWriter); ok {
 			_ = cw.CloseWrite()
 			return
@@ -307,7 +302,7 @@ func (h *halfCloser) closeAll(abort bool, cause error) {
 // handshake and exports keying material from it (RFC 5705, RFC 8446
 // Section 7.5 semantics). It returns an error until that handshake has
 // completed. A transform that runs its own handshake implements it on its
-// halves so that PipeAuth.Exporter and PipeOptions.CarrierBound bind to
+// halves so that PipeAuth.Exporter and the Bound record mode bind to
 // the innermost handshake.
 type KeyingMaterialExporter interface {
 	ExportKeyingMaterial(label string, context []byte, length int) ([]byte, error)
@@ -319,7 +314,7 @@ type KeyingMaterialExporter interface {
 // ExportKeyingMaterial is called: one that completed (TerminatedTLS), or
 // one that may still complete (a *tls.Conn, a carrier with early data such
 // as QUIC 0-RTT); ok false: none. It is the only source of the exporters
-// of PipeAuth.Exporter and PipeOptions.CarrierBound. Exporter only finds
+// of PipeAuth.Exporter and the Bound record mode. Exporter only finds
 // the exporter; reading it fails while the handshake is incomplete.
 func Exporter(p PipeIO) (e KeyingMaterialExporter, ok bool) {
 	for _, x := range []any{p.W, p.R} {
@@ -330,8 +325,25 @@ func Exporter(p PipeIO) (e KeyingMaterialExporter, ok bool) {
 	return nil, false
 }
 
+// unprefixed is the half behind what classification read back.
+func unprefixed(x any) any {
+	for {
+		switch v := x.(type) {
+		case *prefixReader:
+			x = v.r
+		case *prefixMessages:
+			x = v.r
+		case readOnly:
+			x = v.r
+		default:
+			return x
+		}
+	}
+}
+
 // exporterOf is Exporter for one half of a pipe.
 func exporterOf(x any) (KeyingMaterialExporter, bool) {
+	x = unprefixed(x)
 	if e, ok := x.(KeyingMaterialExporter); ok {
 		return e, true
 	}
@@ -351,7 +363,7 @@ func exporterOf(x any) (KeyingMaterialExporter, bool) {
 // WebSocket), a ConnectionStater never completes a handshake.
 func handshaking(x any) bool {
 	switch x.(type) {
-	case *tls.Conn, EarlyClientCarrier, EarlyServerCarrier:
+	case *tls.Conn, *secureTLSConn, EarlyClientCarrier, EarlyServerCarrier:
 		return true
 	}
 	return false

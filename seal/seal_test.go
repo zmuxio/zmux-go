@@ -1,547 +1,581 @@
-package seal
+package seal_test
 
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"io"
+	"math/big"
 	"net"
-	"net/http/httptest"
 	"net/netip"
-	"strings"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/djylb/timeshim"
-
 	"github.com/zmuxio/zmux-go"
-	"github.com/zmuxio/zmux-go/zmuxws"
+	"github.com/zmuxio/zmux-go/seal"
+	"github.com/zmuxio/zmux-go/seal/proto"
 )
 
-var testPSK = []byte("0123456789abcdef0123456789abcdef")
-
-type fixture struct {
-	t         *testing.T
-	srv       *Server
-	lst       *zmux.Listener
-	addr      string
-	srvKey    PrivateKey
-	cliKey    PrivateKey
-	tags      *TagTable
-	authorize func(PublicKey) ([]byte, any, bool)
-}
-
-type fixOpt struct {
-	mode   Mode
-	tls    *tls.Config
-	ws     bool
-	zcfg   *zmux.Config
-	window time.Duration
-}
-
-func newFixture(t *testing.T, o fixOpt) *fixture {
+func newKey(t *testing.T) *ecdh.PrivateKey {
 	t.Helper()
-	f := &fixture{t: t}
-	f.srvKey, _ = GenerateKey()
-	f.cliKey, _ = GenerateKey()
-	f.tags = NewTagTable(nil)
-	if err := f.tags.Set("boot-1", testPSK, "boot-value"); err != nil {
-		t.Fatal(err)
-	}
-	cli := f.cliKey.Public()
-	f.authorize = func(p PublicKey) ([]byte, any, bool) { return testPSK, "client-1", p == cli }
-	old, _ := GenerateKey()
-	srv, err := NewServer(&ServerConfig{Keys: []PrivateKey{f.srvKey, old}, Bootstrap: f.tags, Window: o.window,
-		PeekTimeout: time.Second,
-		Authorize: func(_ context.Context, p PublicKey, _ netip.AddrPort) ([]byte, any, bool) {
-			return f.authorize(p)
-		}})
+	k, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.srv = srv
-	zcfg := o.zcfg
-	if zcfg == nil {
-		zcfg = &zmux.Config{EarlyData: zmux.EarlyData{Replayable: true}}
+	return k
+}
+
+type gate struct {
+	handle, psk []byte
+	cred        *proto.Credential
+
+	mu      sync.Mutex
+	asked   []seal.CredentialRequest
+	commits []seal.Admission
+}
+
+func (g *gate) Resolve(_ context.Context, h []byte, _ netip.AddrPort) ([]byte, error) {
+	if !bytes.Equal(h, g.handle) {
+		return nil, errors.New("unknown handle")
 	}
-	f.lst = zmux.NewListener(&zmux.ListenerConfig{Config: zcfg, Admission: srv.Admission(o.mode), WrapPipe: srv.WrapPipe})
-	if o.ws {
-		h, err := zmuxws.Handler(f.lst, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		hs := httptest.NewServer(h)
-		f.addr = "ws" + strings.TrimPrefix(hs.URL, "http")
-		t.Cleanup(func() { _ = f.lst.Close(); hs.Close() })
-		return f
+	return g.psk, nil
+}
+
+func (g *gate) Credential(_ context.Context, r seal.CredentialRequest) (*proto.Credential, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.asked = append(g.asked, r)
+	return g.cred, nil
+}
+
+func (g *gate) Commit(_ context.Context, a seal.Admission) (any, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.commits = append(g.commits, a)
+	return "client 1", nil
+}
+
+// secureConn declares the Bound contract over a net.Conn, with a fixed exporter.
+type secureConn struct {
+	net.Conn
+	exp []byte
+}
+
+func (c *secureConn) CarrierSecure() bool { return true }
+func (c *secureConn) ExportKeyingMaterial(string, []byte, int) ([]byte, error) {
+	return c.exp, nil
+}
+
+// laneConn has the capabilities that Sealed must hide.
+type laneConn struct{ secureConn }
+
+func (*laneConn) OpenLane(context.Context) (io.WriteCloser, error) { return nil, errors.New("no") }
+func (*laneConn) ChannelStreamID() (uint64, bool)                  { return 0, false }
+func (*laneConn) MaxChannelDatagram() int                          { return 0 }
+func (*laneConn) SendChannelDatagram([]byte) error                 { return nil }
+func (*laneConn) ReceiveChannelDatagrams(func([]byte)) (stop func()) {
+	return func() {}
+}
+
+type fixture struct {
+	psk, handle []byte
+	node        *ecdh.PrivateKey
+	client      seal.ClientConfig
+	server      seal.ServerConfig
+}
+
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	secret := make([]byte, 32)
+	_, _ = rand.Read(secret)
+	handle, psk, err := seal.DeriveHandlePSK(secret, []byte("test"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := newKey(t)
+	return &fixture{psk: psk, handle: handle, node: node,
+		client: seal.ClientConfig{Anchor: seal.PinAnchor(seal.NodeKeyID(node.PublicKey().Bytes())), Handle: handle, PSK: psk},
+		server: seal.ServerConfig{Gate: &gate{handle: handle, psk: psk}, Key: node}}
+}
+
+func anyMode(zmux.CarrierInfo, zmux.RecordMode, any) bool { return true }
+
+func listen(t *testing.T, ctx context.Context, lc *zmux.ListenerConfig) (*zmux.Listener, string) {
+	t.Helper()
+	l, err := zmux.NewListener(lc)
+	if err != nil {
+		t.Fatal(err)
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.tls != nil {
-		ln = tls.NewListener(ln, o.tls)
-	}
 	done := make(chan struct{})
-	go func() { _ = f.lst.Serve(context.Background(), ln); close(done) }()
-	t.Cleanup(func() { _ = f.lst.Close(); _ = ln.Close(); <-done })
-	f.addr = ln.Addr().String()
-	return f
+	go func() { defer close(done); _ = l.Serve(ctx, ln) }()
+	t.Cleanup(func() { _ = l.Close(); _ = ln.Close(); <-done })
+	return l, ln.Addr().String()
 }
 
-func (f *fixture) clientConfig() *ClientConfig {
-	return &ClientConfig{Peers: []PublicKey{f.srvKey.Public()}, Key: f.cliKey, PSK: testPSK, Skew: &ClockSkew{}}
-}
-
-func earlyConfig() *zmux.Config {
-	return &zmux.Config{EarlyData: zmux.EarlyData{ZmuxPeer: true, Replayable: true, HoldFirstFlight: true}}
-}
-
-// recConn records each write.
-type recConn struct {
-	net.Conn
-	mu     sync.Mutex
-	writes [][]byte
-	mangle func(i int, b []byte) []byte
-}
-
-func (c *recConn) Write(b []byte) (int, error) {
-	c.mu.Lock()
-	i := len(c.writes)
-	c.writes = append(c.writes, bytes.Clone(b))
-	m := c.mangle
-	c.mu.Unlock()
-	if m != nil {
-		if _, err := c.Conn.Write(m(i, bytes.Clone(b))); err != nil {
-			return 0, err
-		}
-		return len(b), nil
-	}
-	return c.Conn.Write(b)
-}
-
-func (c *recConn) first() []byte {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.writes) == 0 {
-		return nil
-	}
-	return c.writes[0]
-}
-
-func testCtx(t *testing.T) context.Context {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	t.Cleanup(cancel)
-	return ctx
-}
-
-// dial opens a carrier to f (TCP, or WebSocket) and wraps it.
-func (f *fixture) dial(ctx context.Context, cc *ClientConfig, ws bool, mangle func(int, []byte) []byte) (zmux.PipeIO, *recConn) {
-	f.t.Helper()
-	if ws {
-		p, err := zmuxws.DialPipe(ctx, f.addr, nil)
-		if err != nil {
-			f.t.Fatal(err)
-		}
-		q, err := Client(p, cc)
-		if err != nil {
-			f.t.Fatal(err)
-		}
-		return q, nil
-	}
-	nc, err := net.Dial("tcp", f.addr)
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	rc := &recConn{Conn: nc, mangle: mangle}
-	q, err := Client(zmux.NetPipe(rc), cc)
-	if err != nil {
-		f.t.Fatal(err)
-	}
-	return q, rc
-}
-
-// hello starts a session on p, writes hello on a stream before releasing
-// the first flight, and returns both ends and what the server read.
-func (f *fixture) hello(ctx context.Context, p zmux.PipeIO, hello []byte) (c, sc *zmux.Conn, got []byte, rep bool) {
-	t := f.t
+func dial(t *testing.T, addr string) net.Conn {
 	t.Helper()
-	c, err := zmux.Start(ctx, p, zmux.RoleClient, earlyConfig())
+	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return c
+}
+
+func echo(t *testing.T, ctx context.Context, c, s *zmux.Conn) {
+	t.Helper()
+	msg := bytes.Repeat([]byte("zmux"), 32<<10)
 	st, err := c.OpenStream()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Write(hello); err != nil {
-		t.Fatal(err)
-	}
-	_ = st.Close()
-	c.ReleaseFirstFlight()
-	sc, err = f.lst.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ss, err := sc.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rep = ss.Replayable()
-	got, err = io.ReadAll(ss)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close(); _ = sc.Close(); _ = c.Wait(); _ = sc.Wait() })
-	return c, sc, got, rep
-}
-
-func echo(t *testing.T, ctx context.Context, c, s *zmux.Conn, n int) {
-	t.Helper()
+	errc := make(chan error, 1)
 	go func() {
-		st, err := s.AcceptStream(ctx)
+		_, err := st.Write(msg)
 		if err == nil {
-			_, _ = io.Copy(st, st)
-			_ = st.Close()
+			err = st.Close()
 		}
+		errc <- err
 	}()
-	st, err := c.OpenStreamSync(ctx)
+	in, err := s.AcceptStream(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	msg := bytes.Repeat([]byte("0123456789"), n/10)
-	go func() { _, _ = st.Write(msg); _ = st.Close() }()
-	got, err := io.ReadAll(st)
+	got, err := io.ReadAll(in)
 	if err != nil || !bytes.Equal(got, msg) {
-		t.Fatalf("echo: %d bytes, %v", len(got), err)
+		t.Fatalf("read %d bytes: %v", len(got), err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
 	}
 }
 
-// The regular handshake over TCP: HELLO leaves in msg1, the server's
-// stream is replayable, the identity reaches Conn.Admitted.
-func TestRegularTCP(t *testing.T) {
-	ctx := testCtx(t)
-	f := newFixture(t, fixOpt{})
-	p, rc := f.dial(ctx, f.clientConfig(), false, nil)
-	hello := bytes.Repeat([]byte("HELLO"), 40)
-	c, sc, got, rep := f.hello(ctx, p, hello)
-	if !bytes.Equal(got, hello) || !rep {
-		t.Fatalf("server read %q, replayable %v", got, rep)
-	}
-	if n := len(rc.first()); n < ikMsg1Head+len(hello)+tagLen {
-		t.Fatalf("msg1 of %d bytes cannot hold the stream", n)
-	}
-	if cls, _ := zmux.ClassifyFirstBytes(rc.first(), zmux.FramingByteStream); cls != zmux.FirstBytesOther {
-		t.Fatalf("msg1 classified %v", cls)
-	}
-	peer, _ := sc.Admitted().(*Peer)
-	if peer == nil || peer.Value != "client-1" || peer.Static != f.cliKey.Public() || !peer.EarlyAccepted {
-		t.Fatalf("admitted %+v", sc.Admitted())
-	}
-	if acc, known := settled(ctx, p); !acc || !known {
-		t.Fatal("first flight not reported accepted")
-	}
-	echo(t, ctx, c, sc, 1<<20)
-	st := f.srv.Stats()
-	if st.Handshakes != 1 || st.EarlyAccepted != 1 || st.HandshakeNanos == 0 {
-		t.Fatalf("stats %+v", st)
-	}
-	a, err1 := p.W.(zmux.KeyingMaterialExporter).ExportKeyingMaterial("x", nil, 32)
-	b, err2 := sc.ExportKeyingMaterial("x", nil, 32)
-	if err1 != nil || err2 != nil || len(a) != 32 || len(b) != 32 {
-		t.Fatalf("exporter: %v %v", err1, err2)
+// Each mode establishes a session over TCP, and a further carrier joins it.
+func TestModesAndJoin(t *testing.T) {
+	for _, mode := range []zmux.RecordMode{zmux.Sealed, zmux.Bound, zmux.Trusted} {
+		t.Run(mode.String(), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			f := newFixture(t)
+			f.server.AllowRecordMode = anyMode
+			exp := bytes.Repeat([]byte{7}, 32)
+			wrap := func(ctx context.Context, p zmux.PipeIO, h zmux.PipeHint) (zmux.PipeIO, error) {
+				if mode == zmux.Bound {
+					p = zmux.NetPipe(&secureConn{Conn: p.W.(net.Conn), exp: exp})
+				}
+				return f.server.WrapPipe(ctx, p, h)
+			}
+			l, addr := listen(t, ctx, &zmux.ListenerConfig{
+				Config:   &zmux.Config{MaxPipes: 4, AllowRecordMode: anyMode},
+				WrapPipe: zmux.WrapPipeFunc(wrap),
+			})
+			carrier := func() zmux.PipeIO {
+				nc := dial(t, addr)
+				if mode == zmux.Bound {
+					return zmux.NetPipe(&secureConn{Conn: nc, exp: exp})
+				}
+				return zmux.NetPipe(nc)
+			}
+			cc := f.client
+			cc.Mode = mode
+			p, err := seal.Establish(ctx, carrier(), &cc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if peer, ok := seal.PeerOf(p); !ok || !bytes.Equal(peer.Static, f.node.PublicKey().Bytes()) || peer.Mode != mode {
+				t.Fatalf("PeerOf: %+v %v", peer, ok)
+			}
+			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4, RecordPolicy: func(zmux.CarrierInfo) zmux.RecordMode { return zmux.Trusted }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = c.Close() }()
+			s, err := l.Accept(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = s.Close() }()
+			if v, ok := s.Admitted().(*seal.Peer); !ok || v.Value != "client 1" || v.Mode != mode {
+				t.Fatalf("Admitted: %+v", s.Admitted())
+			}
+			echo(t, ctx, c, s)
+			if _, err := c.AddPipe(ctx, zmux.NetPipe(dial(t, addr)), zmux.PipeOptions{}); err != nil {
+				t.Fatalf("join: %v", err)
+			}
+			echo(t, ctx, c, s)
+			if n := len(c.PipeStats()); n != 2 {
+				t.Fatalf("%d pipes", n)
+			}
+		})
 	}
 }
 
-// The bootstrap handshake over WebSocket: the client learns the server
-// key, the identity is the table's.
-func TestBootstrapWebSocket(t *testing.T) {
-	ctx := testCtx(t)
-	f := newFixture(t, fixOpt{ws: true})
-	var learnt PublicKey
-	cc := &ClientConfig{PSK: testPSK, Skew: &ClockSkew{}, OnPeer: func(k PublicKey) { learnt = k }}
-	p, _ := f.dial(ctx, cc, true, nil)
-	if p.Variant != VariantBootstrap || p.Framing != zmux.FramingRecords {
-		t.Fatalf("pipe %+v", p)
-	}
-	c, sc, got, _ := f.hello(ctx, p, []byte("boot hello"))
-	settled(ctx, p)
-	if string(got) != "boot hello" || learnt != f.srvKey.Public() {
-		t.Fatalf("read %q, learnt %x", got, learnt)
-	}
-	peer, _ := sc.Admitted().(*Peer)
-	if peer == nil || !peer.Bootstrap || peer.ID != "boot-1" || peer.Value != "boot-value" {
-		t.Fatalf("admitted %+v", sc.Admitted())
-	}
-	echo(t, ctx, c, sc, 256<<10)
-	if st := f.srv.Stats(); st.Bootstraps != 1 {
-		t.Fatalf("stats %+v", st)
-	}
-	// The regular handshake on the same entrance, over WebSocket too.
-	p2, _ := f.dial(ctx, f.clientConfig(), true, nil)
-	c2, sc2, got2, _ := f.hello(ctx, p2, []byte("regular"))
-	if string(got2) != "regular" {
-		t.Fatalf("read %q", got2)
-	}
-	echo(t, ctx, c2, sc2, 64<<10)
-}
-
-// waitFail waits for the session on p to fail without the server
-// accepting it.
-func (f *fixture) waitFail(ctx context.Context, p zmux.PipeIO) {
-	t := f.t
+func establishPair(t *testing.T, ctx context.Context, cc *seal.ClientConfig, sc *seal.ServerConfig, cl, sv zmux.PipeIO) (zmux.PipeIO, zmux.PipeIO, error, error) {
 	t.Helper()
-	c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{})
-	if err != nil {
-		return
+	type res struct {
+		p   zmux.PipeIO
+		err error
 	}
-	done := make(chan struct{})
-	go func() { _, _ = c.OpenStreamSync(ctx); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("session did not fail")
-	}
-	_ = c.Close()
-	actx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	ch := make(chan res, 1)
+	go func() {
+		p, err := sc.WrapPipe(ctx, sv, zmux.PipeHint{})
+		if err != nil {
+			_ = sv.W.Close()
+		}
+		ch <- res{p, err}
+	}()
+	p, err := seal.Establish(ctx, cl, cc)
+	r := <-ch
+	return p, r.p, err, r.err
+}
+
+// Over net.Pipe, a Sealed carrier shows only what its own layer offers.
+func TestHiddenCapabilities(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if sc, err := f.lst.Accept(actx); err == nil {
-		_ = sc.Close()
-		t.Fatal("server accepted the session")
+	f := newFixture(t)
+	a, b := net.Pipe()
+	carrierExp := bytes.Repeat([]byte{9}, 32)
+	wrapped := &laneConn{secureConn{Conn: a, exp: carrierExp}}
+	cp, sp, cerr, serr := establishPair(t, ctx, &f.client, &f.server, zmux.NetPipe(wrapped), zmux.NetPipe(b))
+	if cerr != nil || serr != nil {
+		t.Fatal(cerr, serr)
+	}
+	defer func() { _ = cp.W.Close(); _ = sp.W.Close() }()
+	for _, x := range []any{cp.R, cp.W} {
+		if _, ok := x.(zmux.LaneOpener); ok {
+			t.Error("LaneOpener visible")
+		}
+		if _, ok := x.(zmux.DatagramChannel); ok {
+			t.Error("DatagramChannel visible")
+		}
+		if _, ok := x.(zmux.CarrierSecure); ok {
+			t.Error("CarrierSecure visible")
+		}
+		if _, ok := x.(zmux.ConnectionStater); ok {
+			t.Error("ConnectionStater visible")
+		}
+	}
+	e, ok := zmux.Exporter(cp)
+	if !ok {
+		t.Fatal("no exporter")
+	}
+	got, err := e.ExportKeyingMaterial(proto.BoundExporterLabel, nil, 32)
+	if err != nil || bytes.Equal(got, carrierExp) {
+		t.Fatalf("the carrier's exporter passed through: %x %v", got, err)
+	}
+	se, _ := zmux.Exporter(sp)
+	if other, err := se.ExportKeyingMaterial(proto.BoundExporterLabel, nil, 32); err != nil || !bytes.Equal(got, other) {
+		t.Fatalf("exporters differ: %v", err)
+	}
+	if m, ok := cp.W.(zmux.CarrierRecordMode); !ok || m.RecordMode() != zmux.Sealed {
+		t.Fatal("no Sealed mode")
+	}
+	if cp.Framing != zmux.FramingRecords {
+		t.Fatal("not a message carrier")
 	}
 }
 
-func TestFailures(t *testing.T) {
-	ctx := testCtx(t)
-	f := newFixture(t, fixOpt{})
-	other, _ := GenerateKey()
-
-	cc := f.clientConfig()
-	cc.PSK = []byte("another PSK of sixteen bytes+")
-	p, _ := f.dial(ctx, cc, false, nil)
-	f.waitFail(ctx, p)
-
-	cc = f.clientConfig()
-	cc.Peers = []PublicKey{other.Public()}
-	p, _ = f.dial(ctx, cc, false, nil)
-	f.waitFail(ctx, p)
-
-	cc = f.clientConfig()
-	cc.Key = other
-	p, _ = f.dial(ctx, cc, false, nil)
-	f.waitFail(ctx, p)
-
-	// Tampering with msg1's payload.
-	p, _ = f.dial(ctx, f.clientConfig(), false, func(i int, b []byte) []byte {
-		if i == 0 {
-			b[len(b)-1] ^= 1
-		}
-		return b
-	})
-	f.waitFail(ctx, p)
-
-	// A bootstrap client with a PSK the table lacks.
-	p, _ = f.dial(ctx, &ClientConfig{PSK: []byte("unknown bootstrap PSK"), Skew: &ClockSkew{}}, false, nil)
-	f.waitFail(ctx, p)
-
-	st := f.srv.Stats()
-	// The unknown bootstrap client looks like a regular msg1 that has not
-	// ended: it times out in the admission, counted there.
-	if st.FailAuth != 2 || st.FailNoKey != 1 || st.FailUnauthorized != 1 || st.Handshakes != 0 {
-		t.Fatalf("stats %+v", st)
+func TestWrongPSK(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	cc := f.client
+	cc.PSK = bytes.Repeat([]byte{1}, 32)
+	a, b := net.Pipe()
+	_, _, cerr, serr := establishPair(t, ctx, &cc, &f.server, zmux.NetPipe(a), zmux.NetPipe(b))
+	var rej *zmux.RejectError
+	if cerr == nil || !errors.As(serr, &rej) || rej.Reason != "auth" {
+		t.Fatalf("client %v server %v", cerr, serr)
 	}
+}
 
-	// Tampering with a transport frame (the second write) fails the
-	// established session.
-	p, _ = f.dial(ctx, f.clientConfig(), false, func(i int, b []byte) []byte {
-		if i == 1 {
-			b[len(b)-1] ^= 1
-		}
-		return b
+func TestPeerIsSelf(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	cc := f.client
+	cc.Key = f.node
+	a, b := net.Pipe()
+	_, _, cerr, _ := establishPair(t, ctx, &cc, &f.server, zmux.NetPipe(a), zmux.NetPipe(b))
+	if !errors.Is(cerr, proto.ErrPeerIsSelf) {
+		t.Fatalf("client %v", cerr)
+	}
+}
+
+func TestBoundNeedsSecureCarrier(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	cc := f.client
+	cc.Mode = zmux.Bound
+	a, b := net.Pipe()
+	defer func() { _ = b.Close() }()
+	if _, err := seal.Establish(ctx, zmux.NetPipe(a), &cc); !errors.Is(err, proto.ErrInvalidConfig) {
+		t.Fatal(err)
+	}
+}
+
+// A server takes only Sealed unless configured.
+func TestServerRefusesModeByDefault(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	cc := f.client
+	cc.Mode = zmux.Trusted
+	a, b := net.Pipe()
+	_, _, cerr, serr := establishPair(t, ctx, &cc, &f.server, zmux.NetPipe(a), zmux.NetPipe(b))
+	var rej *zmux.RejectError
+	if cerr == nil || !errors.As(serr, &rej) || rej.Reason != "record_mode" {
+		t.Fatalf("client %v server %v", cerr, serr)
+	}
+}
+
+// countConn counts the bytes written.
+
+// A refused Establish reaches the listener's hook.
+func TestOnReject(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	got := make(chan zmux.RejectInfo, 1)
+	_, addr := listen(t, ctx, &zmux.ListenerConfig{
+		WrapPipe: &f.server,
+		OnReject: func(i zmux.RejectInfo) zmux.RejectAction { got <- i; return zmux.RejectClose },
 	})
-	c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{})
+	cc := f.client
+	cc.Handle = []byte("nobody-nobody-16")
+	if _, err := seal.Establish(ctx, zmux.NetPipe(dial(t, addr)), &cc); err == nil {
+		t.Fatal("established")
+	}
+	select {
+	case i := <-got:
+		if i.Reason != "unknown_handle" {
+			t.Fatalf("%+v", i)
+		}
+	case <-ctx.Done():
+		t.Fatal("no OnReject")
+	}
+}
+
+// A lane's first record passes the transform; a plain session start does not.
+func TestWrapPipeLaneFirstRecord(t *testing.T) {
+	lane, need := zmux.FirstRecordIsLane([]byte{0x16, 0xba}, zmux.FramingByteStream)
+	if !lane || need != 0 {
+		t.Fatal(lane, need)
+	}
+	if lane, _ := zmux.FirstRecordIsLane([]byte{0x16, 0xff}, zmux.FramingByteStream); lane {
+		t.Fatal("parameters read as a lane")
+	}
+	if _, need := zmux.FirstRecordIsLane([]byte{0x40}, zmux.FramingByteStream); need != 2 {
+		t.Fatal(need)
+	}
+}
+
+// laneHalf is one end of a carrier connection with lanes over net.Pipe. Lanes the client
+// opens reach the listener as carriers of their own, as streams of a QUIC connection do.
+type laneHalf struct {
+	secureConn
+	id   any
+	open func(context.Context) (io.WriteCloser, error)
+}
+
+func (h *laneHalf) CarrierConn() any { return h.id }
+func (h *laneHalf) OpenLane(ctx context.Context) (io.WriteCloser, error) {
+	return h.open(ctx)
+}
+
+// A lane of a Bound session goes through the transform's WrapPipe like any carrier, and
+// its first record passes on to the session.
+func TestLaneThroughWrapPipe(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	f.server.AllowRecordMode = anyMode
+	l, err := zmux.NewListener(&zmux.ListenerConfig{
+		Config:   &zmux.Config{MaxPipes: 4, AllowRecordMode: anyMode},
+		WrapPipe: &f.server,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc, err := f.lst.Accept(ctx)
-	if err == nil {
-		go func() { _, _ = sc.AcceptStream(ctx) }()
-		st, err := c.OpenStreamSync(ctx)
-		if err == nil {
-			_, _ = st.Write([]byte("data"))
-		}
-		werr := make(chan error, 1)
-		go func() { werr <- sc.Wait() }()
-		select {
-		case err := <-werr:
-			_ = err
-		case <-time.After(5 * time.Second):
-			t.Fatal("tampered frame did not end the session")
-		}
+	defer func() { _ = l.Close() }()
+	exp := bytes.Repeat([]byte{7}, 32)
+	conn := new(int)
+	var conns sync.WaitGroup
+	defer conns.Wait()
+	defer cancel()
+	half := func(nc net.Conn) *laneHalf {
+		return &laneHalf{Conn: nc, exp: exp, id: conn, open: func(context.Context) (io.WriteCloser, error) {
+			return nil, errors.New("server opens no lane here")
+		}}
 	}
-	_ = c.Close()
-}
-
-// A replayed msg1 completes no session; the first flight of a stale stamp
-// is refused, sent again, and the session works.
-func TestReplayAndWindow(t *testing.T) {
-	ctx := testCtx(t)
-	f := newFixture(t, fixOpt{})
-	p, rc := f.dial(ctx, f.clientConfig(), false, nil)
-	f.hello(ctx, p, []byte("first"))
-	nc, err := net.Dial("tcp", f.addr)
+	serve := func(p zmux.PipeIO) {
+		p.Carrier = zmux.CarrierQUIC
+		conns.Go(func() { _ = l.HandlePipe(ctx, p, zmux.PipeHint{}) })
+	}
+	var lanes atomic.Int64
+	open := func(context.Context) (io.WriteCloser, error) {
+		a, b := net.Pipe()
+		lanes.Add(1)
+		serve(zmux.PipeIO{R: half(b)}) // a lane reaches the acceptor as a receiving half
+		return a, nil
+	}
+	a, b := net.Pipe()
+	sh := half(b)
+	serve(zmux.PipeIO{R: sh, W: sh})
+	h := &laneHalf{Conn: a, exp: exp, id: conn, open: open}
+	cc := f.client
+	cc.Mode = zmux.Bound
+	p, err := seal.Establish(ctx, zmux.PipeIO{R: h, W: h, Carrier: zmux.CarrierQUIC}, &cc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = nc.Write(rc.first())
-	_ = nc.SetReadDeadline(time.Now().Add(3 * time.Second))
-	n, _ := io.ReadFull(nc, make([]byte, ikMsg2Head))
-	_ = nc.Close()
-	if n != ikMsg2Head {
-		t.Fatalf("replay got %d bytes of msg2", n)
+	c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4})
+	if err != nil {
+		t.Fatal(err)
 	}
-	actx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-	if sc, err := f.lst.Accept(actx); err == nil {
-		_ = sc.Close()
-		t.Fatal("replay made a session")
+	defer func() { _ = c.Close() }()
+	s, err := l.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	cancel()
-	if st := f.srv.Stats(); st.Replays != 1 || st.EarlyRejected != 1 {
-		t.Fatalf("stats %+v", st)
+	defer func() { _ = s.Close() }()
+	got := func() (out, in int) {
+		for _, ps := range c.PipeStats() {
+			out = max(out, ps.LanesOut)
+		}
+		for _, ps := range s.PipeStats() {
+			in = max(in, ps.LanesIn)
+		}
+		return out, in
 	}
-
-	// A client clock 10 minutes ahead.
-	clk := timeshim.NewFake(time.Now().Add(10 * time.Minute))
-	cc := f.clientConfig()
-	cc.Clock = clk
-	p, _ = f.dial(ctx, cc, false, nil)
-	c, sc, got, rep := f.hello(ctx, p, []byte("late"))
-	if string(got) != "late" || rep {
-		t.Fatalf("read %q, replayable %v", got, rep)
+	for {
+		echo(t, ctx, c, s)
+		if out, in := got(); out > 1 && in > 1 {
+			break
+		}
+		if ctx.Err() != nil {
+			out, in := got()
+			t.Fatalf("lanes out %d, in %d, opened %d", out, in, lanes.Load())
+		}
 	}
-	if acc, known := settled(ctx, p); acc || !known {
-		t.Fatal("stale first flight reported accepted")
-	}
-	echo(t, ctx, c, sc, 64<<10)
-	if st := f.srv.Stats(); st.WindowMiss != 1 {
-		t.Fatalf("stats %+v", st)
-	}
-	if off, auth := cc.Skew.Offset(clk); !auth || off > -9*time.Minute {
-		t.Fatalf("offset %v %v", off, auth)
-	}
-	// The learnt offset puts the next stamp in the window.
-	p, _ = f.dial(ctx, cc, false, nil)
-	f.hello(ctx, p, []byte("again"))
-	if acc, _ := settled(ctx, p); !acc {
-		t.Fatal("calibrated first flight refused")
+	if m := s.WeakestRecordMode(); m != zmux.Bound {
+		t.Fatalf("mode %v", m)
 	}
 }
 
-func selfSigned(t *testing.T) (*tls.Config, *tls.Config) {
+// A pin passes on the key whatever credential message 2 carries; an Anchor
+// that needs a credential fails without one.
+func TestAnchorWithoutCredential(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	for _, tc := range []struct {
+		name   string
+		anchor seal.Anchor
+		cred   *proto.Credential
+		ok     bool
+	}{
+		{"pin, none", f.client.Anchor, nil, true},
+		{"credential anchor, none", credAnchor{}, nil, false},
+		{"pin, unknown type", f.client.Anchor, &proto.Credential{Type: 77}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cc, sc := f.client, f.server
+			cc.Anchor = tc.anchor
+			sc.Gate = &gate{handle: f.handle, psk: f.psk, cred: tc.cred}
+			a, b := net.Pipe()
+			cp, sp, cerr, _ := establishPair(t, ctx, &cc, &sc, zmux.NetPipe(a), zmux.NetPipe(b))
+			if tc.ok != (cerr == nil) {
+				t.Fatal(cerr)
+			}
+			if cerr == nil {
+				_ = cp.W.Close()
+				_ = sp.W.Close()
+			} else if !errors.Is(cerr, seal.ErrVerifyRejected) {
+				t.Fatal(cerr)
+			}
+		})
+	}
+}
+
+func TestRawCarrierHints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	f.server.AllowRecordMode = anyMode
+	cc := f.client
+	cc.Mode = zmux.Trusted
+	_, cert := testCert(t)
+	cl, sv := net.Pipe()
+	tc := tls.Client(cl, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // a test carrier
+	ts := tls.Server(sv, &tls.Config{Certificates: []tls.Certificate{cert}})
+	cp, sp, cerr, serr := establishPair(t, ctx, &cc, &f.server, zmux.SecureTLS(tc), zmux.SecureTLS(ts))
+	if cerr != nil || serr != nil {
+		t.Fatal(cerr, serr)
+	}
+	defer func() { _ = cp.W.Close(); _ = sp.W.Close() }()
+	if r, ok := cp.W.(zmux.TLSRecordCarrier); !ok || !r.TLSRecords() {
+		t.Fatal("the TLS hint is lost")
+	}
+	if nc, ok := cp.W.(interface{ NetConn() net.Conn }); !ok || nc.NetConn() != cl {
+		t.Fatal("NetConn is lost")
+	}
+	r := cp.R.(interface{ SetReadDeadline(time.Time) error })
+	if err := r.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cp.R.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if err := cp.W.(interface{ SetWriteDeadline(time.Time) error }).SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// SecureTLS carries Bound: the session needs no other declaration, and both ends mix the
+// same exporter.
+func TestSecureTLSBound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	f.server.AllowRecordMode = anyMode
+	cc := f.client
+	cc.Mode = zmux.Bound
+	_, cert := testCert(t)
+	cl, sv := net.Pipe()
+	cp, sp, cerr, serr := establishPair(t, ctx, &cc, &f.server,
+		zmux.SecureTLS(tls.Client(cl, &tls.Config{InsecureSkipVerify: true})), //nolint:gosec // a test carrier
+		zmux.SecureTLS(tls.Server(sv, &tls.Config{Certificates: []tls.Certificate{cert}})))
+	if cerr != nil || serr != nil {
+		t.Fatal(cerr, serr)
+	}
+	_ = cp.W.Close()
+	_ = sp.W.Close()
+}
+
+func testCert(t *testing.T) (ed25519.PrivateKey, tls.Certificate) {
 	t.Helper()
-	srv := httptest.NewTLSServer(nil)
-	cert := srv.TLS.Certificates[0]
-	srv.Close()
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, &tls.Config{InsecureSkipVerify: true}
-}
-
-// Auto takes plain carriers on TLS terminated here and sealed ones;
-// SealedOnly takes no plain carrier, and Auto none without TLS.
-func TestModes(t *testing.T) {
-	ctx := testCtx(t)
-	stls, ctls := selfSigned(t)
-	f := newFixture(t, fixOpt{mode: Auto, tls: stls})
-	c, err := zmux.DialTLS(ctx, "tcp", f.addr, ctls, nil)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc, err := f.lst.Accept(ctx)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if peer, _ := sc.Admitted().(*Peer); peer == nil || !peer.Plain {
-		t.Fatalf("admitted %+v", sc.Admitted())
-	}
-	echo(t, ctx, c, sc, 16<<10)
-	_ = c.Close()
-	_ = sc.Close()
-	tc, err := tls.Dial("tcp", f.addr, ctls)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p, err := Client(zmux.NetPipe(tc), f.clientConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.hello(ctx, p, []byte("sealed in TLS"))
-	if st := f.srv.Stats(); st.PlainAccepted != 1 || st.Handshakes != 1 {
-		t.Fatalf("stats %+v", st)
-	}
-
-	g := newFixture(t, fixOpt{mode: Auto})
-	nc, _ := net.Dial("tcp", g.addr)
-	g.waitFail(ctx, zmux.NetPipe(nc))
-	h := newFixture(t, fixOpt{mode: SealedOnly, tls: stls})
-	tc, err = tls.Dial("tcp", h.addr, ctls)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.waitFail(ctx, zmux.NetPipe(tc))
-	if g.srv.Stats().PlainNotTerminated != 1 || h.srv.Stats().PlainRejected != 1 {
-		t.Fatalf("stats %+v %+v", g.srv.Stats(), h.srv.Stats())
-	}
-}
-
-// PipeAuth.Exporter binds joins to the carrier's exporter; each joining
-// carrier runs its own handshake.
-func TestExporterJoin(t *testing.T) {
-	ctx := testCtx(t)
-	zcfg := &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true}}
-	f := newFixture(t, fixOpt{zcfg: zcfg, ws: true})
-	p, _ := f.dial(ctx, f.clientConfig(), true, nil)
-	c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sc, err := f.lst.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close(); _ = sc.Close() })
-	echo(t, ctx, c, sc, 16<<10)
-	for range 2 {
-		q, _ := f.dial(ctx, f.clientConfig(), true, nil)
-		if _, err := c.AddPipe(ctx, q, zmux.PipeOptions{CarrierBound: true}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	echo(t, ctx, c, sc, 1<<20)
-	if n := len(c.PipeStats()); n != 3 {
-		t.Fatalf("%d pipes", n)
-	}
-	if st := f.srv.Stats(); st.Handshakes != 3 {
-		t.Fatalf("stats %+v", st)
-	}
-}
-
-// Concurrent streams over both carrier kinds.
-func TestConcurrent(t *testing.T) {
-	for _, ws := range []bool{false, true} {
-		ctx := testCtx(t)
-		f := newFixture(t, fixOpt{ws: ws})
-		p, _ := f.dial(ctx, f.clientConfig(), ws, nil)
-		c, sc, _, _ := f.hello(ctx, p, []byte("x"))
-		var wg sync.WaitGroup
-		for range 8 {
-			wg.Go(func() { echo(t, ctx, c, sc, 256<<10) })
-		}
-		wg.Wait()
-	}
-}
-
-// settled waits for msg2 and reports EarlyDataAccepted.
-func settled(ctx context.Context, p zmux.PipeIO) (bool, bool) {
-	_, _ = p.W.(zmux.EarlyClientCarrier).EarlyAccepted(ctx)
-	return EarlyDataAccepted(p)
+	return priv, tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
 }

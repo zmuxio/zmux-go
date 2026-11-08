@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"runtime"
 	"slices"
 	"sync"
 	"testing"
@@ -145,7 +146,7 @@ func TestHoldFirstFlightWebSocket(t *testing.T) {
 	}
 	sch := make(chan *zmux.Conn, 1)
 	go func() {
-		s, err := zmux.Start(ctx, srv, zmux.RoleServer, mpConfig())
+		s, err := zmux.Start(ctx, srv, zmux.RoleServer, singlePipe(mpConfig()))
 		if err != nil {
 			t.Error(err)
 		}
@@ -155,6 +156,9 @@ func TestHoldFirstFlightWebSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The handle stays reachable until the peer has read: a collected
+	// unclosed Stream resets its stream, which then never opens.
+	defer runtime.KeepAlive(st)
 	if _, err := st.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +216,7 @@ func TestBatchInterop(t *testing.T) {
 	}
 	sch := make(chan *zmux.Conn, 1)
 	go func() {
-		s, err := zmux.Start(ctx, srv, zmux.RoleServer, mpConfig())
+		s, err := zmux.Start(ctx, srv, zmux.RoleServer, singlePipe(mpConfig()))
 		if err != nil {
 			t.Error(err)
 		}
@@ -230,4 +234,11 @@ func TestBatchInterop(t *testing.T) {
 	defer closeBoth(c, s)
 	echo(t, ctx, c, s, 1<<20)
 	echo(t, ctx, s, c, 1<<20)
+}
+
+// singlePipe is cfg for a server session without a Listener, which takes
+// no joins: no multipath and no resume.
+func singlePipe(cfg *zmux.Config) *zmux.Config {
+	cfg.MaxPipes, cfg.ResumeTimeout = 0, 0
+	return cfg
 }

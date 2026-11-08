@@ -205,8 +205,8 @@ func Admission() *zmux.Admission {
 // of the transform it checks the header against filter, answers the
 // verdict, drops a refused flight and returns the XOR pipe; other carriers
 // pass as they are.
-func WrapPipe(filter *zmux.ReplayFilter, key byte) func(context.Context, zmux.PipeIO, zmux.JoinHint) (zmux.PipeIO, error) {
-	return func(_ context.Context, p zmux.PipeIO, hint zmux.JoinHint) (zmux.PipeIO, error) {
+func WrapPipe(filter *zmux.ReplayFilter, key byte) zmux.WrapPipeFunc {
+	return func(_ context.Context, p zmux.PipeIO, hint zmux.PipeHint) (zmux.PipeIO, error) {
 		h, ok := hint.Admitted.([HeaderLen]byte)
 		if !ok {
 			return p, nil

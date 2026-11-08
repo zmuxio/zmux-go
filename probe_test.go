@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -92,21 +93,23 @@ func TestProbeOptionsValidation(t *testing.T) {
 // session's 15 s.
 func TestProbePerPipeInterval(t *testing.T) {
 	t.Parallel()
-	e := newMPEnv(t, mpConfig(), mpConfig())
-	p := e.addPipe(t, PipeOptions{ProbeInterval: time.Second})
-	base := pipeStat(t, p).PingsSent
-	time.Sleep(3500 * time.Millisecond)
-	if n := pipeStat(t, p).PingsSent - base; n < 2 || n > 5 {
-		t.Fatalf("%d probes in 3.5 s at a 1 s interval", n)
-	}
-	// Pipe 0 keeps the session's 15 s (its PIPE_PING frames in this busy
-	// session also come from answers and return-pipe liveness).
-	e.client.lock()
-	pi, _ := e.client.s.PipeInfo(0)
-	e.client.unlock()
-	if k := time.Duration(pi.ProbeInterval); k != 15*time.Second {
-		t.Fatalf("pipe 0 probe interval %v, want the 15 s default", k)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		e := newMemMPEnv(t, mpConfig(), mpConfig())
+		p := e.addPipe(t, PipeOptions{ProbeInterval: time.Second})
+		base := pipeStat(t, p).PingsSent
+		synctest.Sleep(3500 * time.Millisecond)
+		if n := pipeStat(t, p).PingsSent - base; n < 2 || n > 5 {
+			t.Fatalf("%d probes in 3.5 s at a 1 s interval", n)
+		}
+		// Pipe 0 keeps the session's 15 s (its PIPE_PING frames in this busy
+		// session also come from answers and return-pipe liveness).
+		e.client.lock()
+		pi, _ := e.client.s.PipeInfo(0)
+		e.client.unlock()
+		if k := time.Duration(pi.ProbeInterval); k != 15*time.Second {
+			t.Fatalf("pipe 0 probe interval %v, want the 15 s default", k)
+		}
+	})
 }
 
 // Probes and their answers never keep the session alive: a session that
@@ -123,52 +126,56 @@ func TestProbesDoNotKeepSessionAlive(t *testing.T) {
 	}
 	t.Run("idle", func(t *testing.T) {
 		t.Parallel()
-		e := newMPEnv(t, cfg(-1), cfg(-1)) // keep-alive off
-		start := time.Now()
-		var err error
-		done := make(chan struct{})
-		go func() { err = e.client.Wait(); close(done) }()
-		// Probes run before the idle timeout, on either endpoint.
-		time.Sleep(2500 * time.Millisecond)
-		var pings uint64
-		for _, c := range []*Conn{e.client, e.server} {
-			for _, st := range c.PipeStats() {
-				pings += st.PingsSent
+		synctest.Test(t, func(t *testing.T) {
+			e := newMemMPEnv(t, cfg(-1), cfg(-1)) // keep-alive off
+			start := time.Now()
+			var err error
+			done := make(chan struct{})
+			go func() { err = e.client.Wait(); close(done) }()
+			// Probes run before the idle timeout, on either endpoint.
+			synctest.Sleep(2500 * time.Millisecond)
+			var pings uint64
+			for _, c := range []*Conn{e.client, e.server} {
+				for _, st := range c.PipeStats() {
+					pings += st.PingsSent
+				}
 			}
-		}
-		if pings < 2 {
-			t.Fatalf("%d probes in 2.5 s at a 1 s interval", pings)
-		}
-		select {
-		case <-done:
-		case <-time.After(8 * time.Second):
-			t.Fatal("session alive past its idle timeout")
-		}
-		if !errors.Is(err, ErrIdleTimeout) {
-			t.Fatalf("session ended with %v", err)
-		}
-		if el := time.Since(start); el < 2500*time.Millisecond {
-			t.Fatalf("closed after %v", el)
-		}
+			if pings < 2 {
+				t.Fatalf("%d probes in 2.5 s at a 1 s interval", pings)
+			}
+			select {
+			case <-done:
+			case <-time.After(8 * time.Second):
+				t.Fatal("session alive past its idle timeout")
+			}
+			if !errors.Is(err, ErrIdleTimeout) {
+				t.Fatalf("session ended with %v", err)
+			}
+			if el := time.Since(start); el < 2500*time.Millisecond {
+				t.Fatalf("closed after %v", el)
+			}
+		})
 	})
 	t.Run("keep-alive", func(t *testing.T) {
 		t.Parallel()
-		e := newMPEnv(t, cfg(time.Second), cfg(-1))
-		p := e.addPipe(t, PipeOptions{})
-		pings := func() (n uint64) {
-			for _, st := range e.client.PipeStats() {
-				n += st.PingsSent
+		synctest.Test(t, func(t *testing.T) {
+			e := newMemMPEnv(t, cfg(time.Second), cfg(-1))
+			p := e.addPipe(t, PipeOptions{})
+			pings := func() (n uint64) {
+				for _, st := range e.client.PipeStats() {
+					n += st.PingsSent
+				}
+				return n
 			}
-			return n
-		}
-		base := pings()
-		time.Sleep(4500 * time.Millisecond)
-		if e.client.closingNow() {
-			t.Fatalf("session closed with keep-alive: %v", e.client.closedErr())
-		}
-		if n := pings() - base; n < 3 {
-			t.Fatalf("%d probes in 4.5 s with keep-alive (pipe %d)", n, p.ID())
-		}
+			base := pings()
+			synctest.Sleep(4500 * time.Millisecond)
+			if e.client.closingNow() {
+				t.Fatalf("session closed with keep-alive: %v", e.client.closedErr())
+			}
+			if n := pings() - base; n < 3 {
+				t.Fatalf("%d probes in 4.5 s with keep-alive (pipe %d)", n, p.ID())
+			}
+		})
 	})
 }
 
@@ -213,6 +220,10 @@ func TestProbeAnsweredOnSamePairWithJitter(t *testing.T) {
 	// settle advances the clock by inc and waits, in real time, until the
 	// exchanges that started settle; it returns the probes sent on p and
 	// whether the server sent a record on the pair meanwhile.
+	waitUntil(t, 5*time.Second, "the pair at the server", func() bool {
+		_, ok := e.server.Pipe(p.ID())
+		return ok
+	})
 	sent := func() uint64 {
 		for _, st := range e.server.PipeStats() {
 			if st.Pipe == p.ID() {
@@ -292,7 +303,7 @@ func (d delayCounter) Plan(_ *shaping.RecordView, p *shaping.RecordPlan) {
 	d.plans.Add(1)
 	p.Delay = d.delay
 }
-func (d delayCounter) OnEvent(*shaping.Event, *shaping.Reply) {}
+func (d delayCounter) OnEvent(*shaping.Event, *shaping.Effects) {}
 
 // Probe records go through the shaper; a shaping delay well above
 // T_suspect counts from the record's hand-over to the carrier, so it never
@@ -304,7 +315,7 @@ func TestProbeThroughShaperNotSuspect(t *testing.T) {
 	c.SchedulerParams.SuspectFloor = 50 * time.Millisecond
 	e := newMPEnv(t, c, mpConfig())
 	var plans atomic.Int64
-	e.client.SetShaper(func(ShapedPipe) shaping.Shaper { return delayCounter{400 * time.Millisecond, &plans} })
+	e.client.SetShaper(func(ShapedPipe) shaping.Shaper { return delayCounter{400 * time.Millisecond, &plans} }, nil)
 	p0, _ := e.client.Pipe(0)
 	base := pipeStat(t, p0).PingsSent
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)

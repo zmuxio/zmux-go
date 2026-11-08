@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -239,8 +240,8 @@ func (p *CarrierPool[C]) release(pc *pooledConn[C]) {
 	p.consultLocked()
 	p.retireLocked(pc)
 	var idle []C
-	for i := len(p.conns) - 1; i >= 0; i-- {
-		if x := p.conns[i]; (x.retired || p.closed) && x.active == 0 && p.drop(x) {
+	for _, x := range slices.Backward(p.conns) {
+		if (x.retired || p.closed) && x.active == 0 && p.drop(x) {
 			idle = append(idle, x.c)
 		}
 	}
@@ -338,8 +339,8 @@ func (p *CarrierPool[C]) recheckNow() {
 	}
 	p.consultLocked()
 	var idle []C
-	for i := len(p.conns) - 1; i >= 0; i-- {
-		x := p.conns[i]
+	for _, x := range slices.Backward(p.conns) {
+
 		p.retireLocked(x)
 		if x.retired && x.active == 0 && p.drop(x) {
 			idle = append(idle, x.c)
@@ -380,7 +381,7 @@ func (p *CarrierPool[C]) consultLocked() bool {
 		}
 		v.Members = append(v.Members, m)
 	}
-	if err := decide(p.Policy, v, &p.dec); err != nil {
+	if err := decide(nil, p.Policy, v, &p.dec); err != nil { // a CarrierPool has no Logger
 		p.dec = PoolDecision{Retire: p.dec.Retire[:0]} // rejected, as by MaintainPipes
 		if p.DecisionRejected != nil {
 			p.rejected = append(p.rejected, err)
@@ -412,6 +413,6 @@ func (p *CarrierPool[C]) unlockReport() {
 	f := p.DecisionRejected
 	p.mu.Unlock()
 	for _, err := range errs {
-		reportRejected(f, err)
+		reportRejected(nil, f, err)
 	}
 }

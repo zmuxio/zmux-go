@@ -101,11 +101,11 @@ func FuzzServerInput(f *testing.F) {
 }
 
 func FuzzListenerInput(f *testing.F) {
-	cfg := &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes....")},
+	cfg := &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes...."), EndToEnd: true},
 		MaxIdleTimeout: 2 * time.Second}
 	f.Add(clientOpening(f, cfg, false))
 	f.Fuzz(func(_ *testing.T, data []byte) {
-		l := NewListener(&ListenerConfig{Config: cfg, FirstRecordTimeout: 500 * time.Millisecond})
+		l := mustNewListener(&ListenerConfig{Config: cfg, FirstRecordTimeout: 500 * time.Millisecond})
 		defer func() { _ = l.Close() }()
 		a, b := net.Pipe()
 		go func() { _, _ = io.Copy(io.Discard, b) }()
@@ -120,6 +120,6 @@ func FuzzListenerInput(f *testing.F) {
 				_ = c.Close()
 			}
 		}()
-		_ = l.HandlePipe(ctx, NetPipe(a), JoinHint{Source: netip.MustParseAddrPort("192.0.2.1:1")})
+		_ = l.HandlePipe(ctx, NetPipe(a), PipeHint{Source: netip.MustParseAddrPort("192.0.2.1:1")})
 	})
 }

@@ -2,7 +2,7 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// earlyState is early data under an assumed parameter set (SPEC.md 6.1.2):
+// earlyState is early data under an assumed parameter set:
 // the zmux floor, or parameters remembered for carrier early data.
 type earlyState struct {
 	assumed   wire.Params
@@ -66,8 +66,8 @@ func (s *Session) EarlyDiscarded() {
 }
 
 // RestartEarly restarts the bootstrap pipe after the carrier rejected its
-// early data, on the byte stream the restart hook returned (SPEC.md 6.1.2,
-// Outcome): QX_TRANSPORT_PARAMETERS first, and the early streams' data,
+// early data, on the byte stream the restart hook returned:
+// QX_TRANSPORT_PARAMETERS first, and the early streams' data,
 // FIN bits and resets after the peer's parameters. Nothing of the early
 // carrier reached the peer. It reports false, changing nothing, when the
 // session cannot restart: the peer's parameters already arrived on the
@@ -82,6 +82,7 @@ func (s *Session) RestartEarly(info CarrierInfo, now Time) bool {
 	p.out = &outDir{lanes: []*outLane{{info: info, confirmed: true}}, sig: sig}
 	p.out.lo.offered = info.Lanes
 	p.in = &inDir{lanes: []*inLane{{info: info, expectTP: true}}}
+	s.earnSkip = s.earnBytes // nothing of it reached the peer; it goes again
 	s.conn.sent = 0
 	// The early sends are re-issued after the peer's parameters.
 	s.earlyHeld = true
@@ -137,7 +138,7 @@ func FloorParams() wire.Params {
 	}
 }
 
-// earlyAllowed: the role must not depend on the peer (SPEC.md 6.1.2 rule 1).
+// earlyAllowed: the role must not depend on the peer.
 func (s *Session) earlyAllowed() bool {
 	l := &s.cfg.Local
 	return s.cfg.Role != RoleAuto && (l.Has&wire.HasRole == 0 || l.Role != wire.RoleAuto)
@@ -179,7 +180,7 @@ func (s *Session) writeEarly(w *recWriter) {
 }
 
 // earlyOutcome decides the fate of early data when the peer's parameters
-// arrive (SPEC.md 6.1.2 Outcome).
+// arrive.
 func (s *Session) earlyOutcome() *wire.Error {
 	e := s.early
 	p := &s.peer

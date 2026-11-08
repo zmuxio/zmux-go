@@ -3,9 +3,10 @@ package wire
 import (
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
-// Transport error codes (SPEC.md Section 10.2).
+// Transport error codes.
 const (
 	NoError                 uint64 = 0x00
 	InternalError           uint64 = 0x01
@@ -28,7 +29,7 @@ const (
 	IdleTimeout             uint64 = 0x2736d55c
 )
 
-// CodeRejected is ZMUX_REJECTED (EXTENSIONS.md Section 7).
+// CodeRejected is ZMUX_REJECTED, an application-level stream refusal.
 const CodeRejected uint64 = 0x5a4d0002
 
 var transportErrorNames = map[uint64]string{
@@ -67,7 +68,7 @@ type Error struct {
 	Code      uint64
 	FrameType uint64
 	Reason    string
-	// Details are the key=value pairs of the diagnostic line (SPEC.md 4.3).
+	// Details are the key=value pairs of the diagnostic line.
 	Details string
 }
 
@@ -82,14 +83,23 @@ func (e *Error) Error() string {
 	return s
 }
 
-// Phrase renders the Reason Phrase with its diagnostic line, at most 1024 bytes.
-func (e *Error) Phrase() string {
-	s := e.Reason
-	if e.Details != "" {
-		s += "\n" + e.Details
+// maxPhrase bounds the Reason Phrase a transport close carries.
+const maxPhrase = 1024
+
+// Phrase renders the Reason Phrase of a transport close: reason, then the
+// diagnostic line details, cut to at most 1024 bytes at a UTF-8 character
+// boundary.
+func Phrase(reason, details string) string {
+	s := reason
+	if details != "" {
+		s += "\n" + details
 	}
-	if len(s) > 1024 {
-		s = s[:1024]
+	if len(s) > maxPhrase {
+		n := maxPhrase
+		for n > 0 && !utf8.RuneStart(s[n]) {
+			n--
+		}
+		s = s[:n]
 	}
 	return s
 }

@@ -23,10 +23,10 @@ func TestCarrierPoolPolicyCountAndRetire(t *testing.T) {
 	p := &CarrierPool[int]{
 		Dial:  func(context.Context) (int, error) { n++; return n, nil },
 		Close: func(c int) { mu.Lock(); closed = append(closed, c); mu.Unlock() },
-		PoolLimits: PoolLimits{Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
+		Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
 			d.Count = 2
 			d.Retire = append(d.Retire, retire...)
-		})},
+		}),
 	}
 	ctx := context.Background()
 	a, _ := p.Get(ctx)
@@ -51,9 +51,9 @@ func TestCarrierPoolPolicyDialAfter(t *testing.T) {
 	n := 0
 	p := &CarrierPool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
-		PoolLimits: PoolLimits{Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
+		Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
 			d.Count, d.DialAfter = 3, time.Hour
-		})},
+		}),
 	}
 	ctx := context.Background()
 	a, _ := p.Get(ctx)
@@ -152,7 +152,7 @@ func TestCarrierPoolRecheckRetiresBusyConnection(t *testing.T) {
 	p := &CarrierPool[int]{
 		Dial:  func(context.Context) (int, error) { n++; return n, nil },
 		Close: func(c int) { mu.Lock(); closed = append(closed, c); mu.Unlock() },
-		PoolLimits: PoolLimits{Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
+		Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
 			decisions++
 			d.Count = 1
 			for _, m := range v.Members {
@@ -163,7 +163,7 @@ func TestCarrierPoolRecheckRetiresBusyConnection(t *testing.T) {
 					d.Recheck = r
 				}
 			}
-		})},
+		}),
 	}
 	ctx := context.Background()
 	a, _ := p.Get(ctx)

@@ -7,22 +7,22 @@ import "testing"
 func TestSplitPairingWithdraw(t *testing.T) {
 	var sp SplitPairing
 	a, b, c := [16]byte{1}, [16]byte{2}, "x"
-	if r, _ := sp.Offer(a, true, "s1", "A-up", 0); r != PairWait {
+	if r, _ := sp.Offer(a, true, "s1", "A-up"); r != PairWait {
 		t.Fatal(r)
 	}
-	if r, _ := sp.Offer(b, true, "s2", "B-up", 0); r != PairWait {
+	if r, _ := sp.Offer(b, true, "s2", "B-up"); r != PairWait {
 		t.Fatal(r)
 	}
 	if !sp.Withdraw(a, "A-up") {
 		t.Fatal("own carrier not withdrawn")
 	}
-	if r, got := sp.Offer(b, false, "s2", "B-down", 0); r != PairDone || got != "B-up" {
+	if r, got := sp.Offer(b, false, "s2", "B-down"); r != PairDone || got != "B-up" {
 		t.Fatalf("the other pairing was disturbed: %v %v", r, got)
 	}
 	if sp.Withdraw(b, "B-up") {
 		t.Fatal("a paired carrier was withdrawn")
 	}
-	if r, _ := sp.Offer(b, true, "s3", c, 0); r != PairReject {
+	if r, _ := sp.Offer(b, true, "s3", c); r != PairReject {
 		t.Fatal("a used token paired again")
 	}
 	sp.Forget(b)
@@ -31,7 +31,7 @@ func TestSplitPairingWithdraw(t *testing.T) {
 	}
 }
 
-// MULTIPATH.md 5.6: IPv6 sources count per /64; a full listener evicts its
+// Pending-carrier limits: IPv6 sources count per /64; a full listener evicts its
 // oldest pending carrier, a full source refuses.
 func TestPendingCarriers(t *testing.T) {
 	for in, want := range map[string]string{

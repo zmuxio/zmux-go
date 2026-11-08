@@ -92,8 +92,7 @@ func (b *Batch) seg(sg bseg) []byte {
 	return b.arena[sg.a0:sg.a1]
 }
 
-// Messages returns one flat message per record (message framing, SPEC.md
-// 3.4). The messages share storage that the batch reuses: they are valid
+// Messages returns one flat message per record (message framing). The messages share storage that the batch reuses: they are valid
 // until the next call or PutBatch, and a carrier must not retain them.
 func (b *Batch) Messages() [][]byte {
 	if cap(b.mbuf) < b.n {
@@ -136,32 +135,38 @@ func (b *Batch) release() {
 
 // recWriter builds records into a batch.
 type recWriter struct {
-	b            *Batch
-	recMax       int // largest Size (frames bytes) of a record
-	budget       int // bytes left in the batch
-	sizeSeg      int
-	recBytes     int
-	recs         int
-	elicEnd      int // batch bytes up to the end of the last ack-eliciting record
-	framing      Framing
-	open         bool
-	delayed      bool // the next record waits for its shaping delay
-	elicit       bool // the open record has an ack-eliciting frame
-	anyElic      bool // the batch has an ack-eliciting byte
-	activity     bool // an activity frame was written
-	traffic      bool // a traffic frame (MULTIPATH.md 7.1): an activity frame but QX_PING
-	onlyPing     bool // records so far carry only QX_PING requests and PADDING
-	pend         pendStream
-	closed       bool // nothing else: CONNECTION_CLOSE written, or laneOnly
-	laneOnly     bool // the first record of a lane: PIPE_LANE only
-	retain       bool
-	newData      bool // new stream data was written (idle copy)
-	revalPing    bool // the PIPE_PING of a revalidation was written
-	pingWritten  bool // a PIPE_PING was written
+	b           *Batch
+	recMax      int // largest Size (frames bytes) of a record
+	budget      int // bytes left in the batch
+	sizeSeg     int
+	recBytes    int
+	recs        int
+	elicEnd     int // batch bytes up to the end of the last ack-eliciting record
+	framing     Framing
+	open        bool
+	delayed     bool   // the next record waits for its shaping delay
+	elicit      bool   // the open record has an ack-eliciting frame
+	anyElic     bool   // the batch has an ack-eliciting byte
+	activity    bool   // an activity frame was written
+	traffic     bool   // a traffic frame: an activity frame but QX_PING
+	onlyPing    bool   // records so far carry only QX_PING requests and PADDING
+	epochAnswer uint64 // the epoch of a SESSION_EPOCH answer written, 0: none
+	pend        pendStream
+	closed      bool // nothing else: CONNECTION_CLOSE written, or laneOnly
+	laneOnly    bool // the first record of a lane: PIPE_LANE only
+	retain      bool
+	newData     bool // new stream data was written (idle copy)
+	revalPing   bool // the PIPE_PING of a revalidation was written
+	pingWritten bool // a PIPE_PING was written
+	capped      bool // nextRecord stopped at recBound while data may wait
+	// Stream data opens no further record once the batch holds this many
+	// bytes (nextRecord); 0: one record.
+	recBound     int
 	touched      []*Stream
 	abandonsSent []*Pipe
 	descs        []recDesc
 	dataSpent    uint64 // stream data bytes charged to the room
+	notEarned    uint64 // padding, injections and copies in the batch (earnBytes)
 	dataRoom     int64  // stream data the limiter lets through; <0: no limit
 	pipe         *Pipe  // the pipe of the batch (multipath retention)
 	sh           *pipeShape
@@ -172,17 +177,12 @@ type recWriter struct {
 	gate     *pipeShape
 	gateGen  uint64 // gate generation the batch follows
 	gateBase uint64 // dataSpent when that gate took effect in the batch
-	// Stream data opens no further record once the batch holds this many
-	// bytes (nextRecord); 0: one record.
-	recBound int
-	gateShut bool // that gate holds stream data for the rest of the batch
-	gateOn   bool // gateGen and gateBase are set
-	capped   bool // nextRecord stopped at recBound while data may wait
+	gateShut bool   // that gate holds stream data for the rest of the batch
+	gateOn   bool   // gateGen and gateBase are set
 }
 
 // batchRecBound is the bytes after which stream data opens no further
-// record in a batch: the ceiling of the write-call bound
-// (IMPLEMENTATION.md Section 4), so that a batch of many small records
+// record in a batch: the ceiling of the write-call bound, so that a batch of many small records
 // does not hold a call longer than one full record does.
 const batchRecBound = 64 << 10
 

@@ -46,7 +46,7 @@ func TestShapingWriteOverhead(t *testing.T) {
 				viewed.Store(1)
 			}
 		}}
-	})
+	}, nil)
 	st, err := c.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -89,14 +89,14 @@ func TestShapingWriteOverheadWrapPipe(t *testing.T) {
 	}{{22, true}, {MaxWriteOverhead + 1, false}} {
 		var got atomic.Int64
 		got.Store(-1)
-		l := NewListener(&ListenerConfig{WrapPipe: func(_ context.Context, p PipeIO, _ JoinHint) (PipeIO, error) {
+		l := mustNewListener(&ListenerConfig{WrapPipe: WrapPipeFunc(func(_ context.Context, p PipeIO, _ PipeHint) (PipeIO, error) {
 			p.WriteOverhead = tc.over
 			return p, nil
-		}})
+		})})
 		a, b := net.Pipe()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		herr := make(chan error, 1)
-		go func() { herr <- l.HandlePipe(ctx, NetPipe(b), JoinHint{}) }()
+		go func() { herr <- l.HandlePipe(ctx, NetPipe(b), PipeHint{}) }()
 		c, err := Client(ctx, a, nil)
 		if !tc.ok {
 			if err == nil {
@@ -123,7 +123,7 @@ func TestShapingWriteOverheadWrapPipe(t *testing.T) {
 		s.SetShaper(func(sp ShapedPipe) shaping.Shaper {
 			got.Store(int64(sp.WriteOverhead))
 			return &fnShaper{}
-		})
+		}, nil)
 		st, err := s.OpenStreamSync(ctx)
 		if err != nil {
 			t.Fatal(err)

@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -207,9 +208,7 @@ func (x *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = resp.Body.Close() }()
 	buffer := x.p.BufferResponses && (!x.p.HonorAccel || !strings.EqualFold(resp.Header.Get("X-Accel-Buffering"), "no"))
 	hh := w.Header()
-	for k, v := range resp.Header {
-		hh[k] = v
-	}
+	maps.Copy(hh, resp.Header)
 	for _, h := range hopByHop {
 		hh.Del(h)
 	}

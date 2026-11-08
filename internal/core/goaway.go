@@ -2,7 +2,8 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// goawayState is EXTENSIONS.md 3.
+// goawayState is the graceful shutdown by GOAWAY: the fence, then the final
+// GOAWAY and the close.
 type goawayState struct {
 	reason        []byte // of the final CONNECTION_CLOSE
 	sentWater     [2]uint64
@@ -54,7 +55,7 @@ func (s *Session) Shutdown(code uint64, reason []byte) {
 // goawaySent runs when a GOAWAY frame left.
 func (s *Session) goawaySent() {}
 
-// fenceDone sends the final GOAWAY (EXTENSIONS.md 3.3 phase 2).
+// fenceDone sends the final GOAWAY, the second phase of the shutdown.
 func (s *Session) fenceDone() {
 	g := &s.ga
 	s.ping.fence = 0
@@ -106,7 +107,7 @@ func (s *Session) checkShutdownDone() {
 	s.Close(s.ga.code, s.ga.reason)
 }
 
-// onGoAway processes a received GOAWAY (EXTENSIONS.md 3.5).
+// onGoAway processes a received GOAWAY.
 func (s *Session) onGoAway(f *wire.Frame) {
 	g := &s.ga
 	lowered := false
@@ -176,7 +177,7 @@ func (s *Session) allLocalStreams() []*Stream {
 	return out
 }
 
-// onPriorityUpdate processes PRIORITY_UPDATE (EXTENSIONS.md 5.4).
+// onPriorityUpdate processes PRIORITY_UPDATE.
 func (s *Session) onPriorityUpdate(f *wire.Frame) *wire.Error {
 	id := f.StreamID
 	if !isBidiID(id) && !isLocalID(id, s.role) {

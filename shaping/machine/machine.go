@@ -1,400 +1,513 @@
 package machine
 
 import (
-	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
-// Options configure a Factory. The zero value is valid.
-type Options struct {
-	// NewSource returns the random source of one pipe; nil: a ChaCha8
-	// generator seeded from crypto/rand.
-	NewSource func() rand.Source
-	// Limits bound the Definition.
-	Limits SizeLimits
+func micros(x uint64) time.Duration { return time.Duration(x) * time.Microsecond }
+
+// compiledMachines are machines with their shared values drawn and pipe
+// values given slots. They are read only.
+type compiledMachines struct {
+	ms       []machineDef
+	npipe    int32
+	caps     shaping.Caps
+	ncounter int
+	ntimer   int
+	queue    int // the most triggers pending in one call
+	o        *Options
 }
 
-func (o *Options) source() rand.Source {
-	if o.NewSource == nil {
-		return nil
+func compileMachines(defs []machineDef, src rand.Source, shared *[]uint64, o *Options) *compiledMachines {
+	c := &compiledMachines{caps: shaping.CapPlan, o: o, ms: make([]machineDef, len(defs))}
+	fix := func(v *value) {
+		if !v.set {
+			return
+		}
+		*v = v.resolved(src, shared)
+		if v.sc == scopePipe && v.segs != nil {
+			v.slot = c.npipe
+			c.npipe++
+		}
 	}
-	return o.NewSource()
-}
-
-// Factory returns a zmux.ShaperFactory running d. d is validated and must
-// not be modified afterwards. Every pipe runs d as defined, whatever its
-// ShapedPipe says, except for its WriteOverhead: the max_len and pad_to
-// lengths of d are those of a carrier write below the pipe, so that on
-// the first record of each write (shaping.RecordView.WriteStart) the
-// pipe's WriteOverhead is taken off them; a max_len that falls below
-// shaping.MinMaxLen is raised to it (and counted as clamped). pad_multiple
-// (a block size, not a length) and inject lengths (whose write is not
-// known when planned) are not changed.
-func (d *Definition) Factory(o Options) (zmux.ShaperFactory, error) {
-	if err := d.Check(o.Limits); err != nil {
-		return nil, err
-	}
-	f := &factory{d: d, o: o, idx: map[*Value]int{}}
-	f.caps = shaping.CapPlan
-	for i := range d.Machines {
-		f.bound += 4 * (len(d.Machines[i].States) + 1)
-		for j := range d.Machines[i].States {
-			st := &d.Machines[i].States[j]
-			f.index(st)
-			for _, t := range st.Next {
-				switch t.On {
-				case OnRecordIn, OnPaddingIn:
-					f.caps |= shaping.CapRecordIn
-				case OnStreamOpen, OnStreamEnd:
-					f.caps |= shaping.CapStreams
+	for i := range defs {
+		d := defs[i]
+		d.states = slices.Clone(d.states)
+		c.queue++
+		for j := range d.states {
+			st := &d.states[j]
+			if st.rec != nil {
+				r := *st.rec
+				st.rec = &r
+				for _, v := range []*value{&r.target, &r.maxLen, &r.padTo, &r.padMul, &r.pad, &r.delay} {
+					fix(v)
+				}
+			}
+			st.enter = slices.Clone(st.enter)
+			c.queue++
+			for k := range st.enter {
+				a := &st.enter[k]
+				fix(&a.a)
+				fix(&a.b)
+				if a.op == opSet || a.op == opAdd || a.op == opSub {
+					c.queue++
+				}
+			}
+			st.next = slices.Clone(st.next)
+			for k := range st.next {
+				t := &st.next[k]
+				fix(&t.val)
+				fix(&t.prob)
+				switch t.on {
+				case onRecordIn, onPaddingIn:
+					c.caps |= shaping.CapRecordIn
+				case onStreamOpen, onStreamEnd:
+					c.caps |= shaping.CapStreams
+				case onRecordOut, onInjected, onInjectDropped, onEnter, onTimer, onZero:
+				}
+				if t.cond && t.what >= whatWireLeft {
+					c.caps |= shaping.CapBudget
 				}
 			}
 		}
+		c.ms[i] = d
+		c.ncounter += d.counters
+		c.ntimer += d.timers
 	}
-	// Factory-scoped values are drawn once, here.
-	sh := f.newShaper()
-	f.kept = make([]float64, len(f.idx))
-	f.has = make([]bool, len(f.idx))
-	for v, i := range f.idx {
-		if v.Scope == ScopeShared {
-			f.kept[i], f.has[i] = sh.draw(v), true
-		}
-	}
-	return func(p zmux.ShapedPipe) shaping.Shaper {
-		s := f.newShaper()
-		s.over = max(p.WriteOverhead, 0)
-		return s
-	}, nil
+	return c
 }
 
-// NewFactory parses a JSON Definition and returns its Factory.
-func NewFactory(b []byte, o Options) (zmux.ShaperFactory, error) {
-	if m := o.Limits.MaxBytes; m > 0 && len(b) > m {
-		return nil, fmt.Errorf("machine: %d bytes, limit %d", len(b), m)
+// Factory returns the zmux.ShaperFactory of the machines; nil without
+// machines. Every pipe runs them as defined, whatever its ShapedPipe says.
+func (c *Compiled) Factory() zmux.ShaperFactory {
+	if c.machines == nil {
+		return nil
 	}
-	d, err := Parse(b)
+	m := c.machines
+	return func(zmux.ShapedPipe) shaping.Shaper { return m.newShaper() }
+}
+
+// NewFactory parses a candidate's JSON and returns the Factory of its machines.
+func NewFactory(b []byte, o Options) (zmux.ShaperFactory, error) {
+	c, err := ParseCandidate(b, nil, SizeLimits{})
 	if err != nil {
 		return nil, err
 	}
-	return d.Factory(o)
-}
-
-type factory struct {
-	d     *Definition
-	o     Options
-	idx   map[*Value]int
-	kept  []float64 // factory-scoped values
-	has   []bool
-	bound int // triggers processed per event
-	caps  shaping.Caps
-}
-
-func (f *factory) value(v *Value) {
-	if v == nil {
-		return
-	}
-	if _, ok := f.idx[v]; !ok {
-		f.idx[v] = len(f.idx)
-	}
-	if d := v.Dist; d != nil {
-		for i := range d.Of {
-			f.value(&d.Of[i])
-		}
-	}
-}
-
-func (f *factory) index(st *State) {
-	if r := st.Record; r != nil {
-		for _, v := range []*Value{r.MaxLen, r.PadTo, r.PadMultiple, r.Pad, r.Delay} {
-			f.value(v)
-		}
-	}
-	for i := range st.Enter {
-		a := &st.Enter[i]
-		for _, v := range []*Value{a.After, a.Len, a.Rate, a.Burst, a.Value} {
-			f.value(v)
-		}
-	}
-	for i := range st.Next {
-		t := &st.Next[i]
-		f.value(t.Prob)
-		if t.If != nil {
-			f.value(&t.If.Value)
-		}
-	}
-}
-
-func (f *factory) newShaper() *shaper {
-	s := &shaper{f: f, ms: make([]mstate, len(f.d.Machines))}
-	s.drawer = drawer{r: newRand(f.o.source()), keeper: s}
-	s.pkept = make([]float64, len(f.idx))
-	s.phas = make([]bool, len(f.idx))
-	return s
+	return c.Compile(o).Factory(), nil
 }
 
 type mstate struct {
-	cur int
-	ctr [2]float64
+	cur    int32
+	weight uint32
+	gen    uint64
+	ctr    []uint64
+	tm     []int64 // deadlines; noTime: none
+	injAt  int64
+	injLen int64 // <0: none
+	rate   uint64
+	burst  uint64
+}
+
+const noTime = int64(math.MinInt64)
+
+type item struct {
+	m    int32
+	slot int32
+	gen  uint64
+	t    trigger
+}
+
+type due struct {
+	at      int64
+	m, slot int32
 }
 
 // shaper is the Shaper of one pipe.
 type shaper struct {
-	f *factory
-	drawer
-	ms    []mstate
-	pkept []float64 // pipe-scoped values
-	phas  []bool
-	seq   uint64
-	over  int            // ShapedPipe.WriteOverhead
-	rep   *shaping.Reply // the reply being built
-	out   struct {       // what rep points to
-		inj    shaping.Inject
-		gate   shaping.Gate
-		timer  [2]shaping.Timer
-		weight float64
+	c    *compiledMachines
+	src  rand.Source
+	ms   []mstate
+	q    []item
+	dues []due
+	pk   []uint64
+	pset []bool
+
+	now        int64 // microseconds on the session clock
+	m          shaping.Meters
+	n          uint64
+	seq        uint64
+	pauseUntil int64
+	stopped    bool
+	surfaced   int32 // the machine whose injection is out; <0: none
+
+	lastInjAt, lastInjLen int64 // lastInjLen <0: none
+	lastWake              int64
+	lastPause             int64
+	lastRate, lastBurst   uint64
+	lastWeight            uint32
+}
+
+func (c *compiledMachines) newShaper() *shaper {
+	s := &shaper{c: c, surfaced: -1, lastInjLen: -1, lastWake: noTime}
+	s.src = c.o.source()
+	s.ms = make([]mstate, len(c.ms))
+	ctr := make([]uint64, c.ncounter)
+	tm := make([]int64, c.ntimer)
+	for i := range tm {
+		tm[i] = noTime
 	}
-	n int    // Len of the triggering event
-	q []trig // pending triggers
+	for i := range c.ms {
+		m := &s.ms[i]
+		d := &c.ms[i]
+		m.cur = int32(d.start)
+		m.injLen = -1
+		m.ctr, ctr = ctr[:d.counters:d.counters], ctr[d.counters:]
+		m.tm, tm = tm[:d.timers:d.timers], tm[d.timers:]
+	}
+	s.q = make([]item, 0, c.queue)
+	s.dues = make([]due, 0, c.ntimer)
+	s.pk = make([]uint64, c.npipe)
+	s.pset = make([]bool, c.npipe)
+	return s
 }
 
-type trig struct {
-	m int
-	t Trigger
+func (s *shaper) Capabilities() shaping.Caps { return s.c.caps }
+
+func (s *shaper) val(v *value) uint64 {
+	if v.segs == nil {
+		return v.c
+	}
+	if v.sc == scopePipe {
+		if !s.pset[v.slot] {
+			s.pk[v.slot], s.pset[v.slot] = v.drawTable(s.src), true
+		}
+		return s.pk[v.slot]
+	}
+	return v.drawTable(s.src)
 }
 
-func (s *shaper) Capabilities() shaping.Caps { return s.f.caps }
-
+// Plan draws the record's fields in machine order and fires record_out.
 func (s *shaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
+	s.now = int64(v.Now / time.Microsecond)
+	s.m = v.Meters
 	for i := range s.ms {
-		r := s.f.d.Machines[i].States[s.ms[i].cur].Record
+		r := s.c.ms[i].states[s.ms[i].cur].rec
 		if r == nil {
 			continue
 		}
 		m := 0
-		if r.MaxLen != nil {
-			if m = s.length(r.MaxLen); p.MaxLen == 0 || m > 0 && m < p.MaxLen {
-				p.MaxLen = m
-			}
+		if r.target.set {
+			m = int(s.val(&r.target))
+			p.PadTo = max(p.PadTo, m)
+		} else if r.maxLen.set {
+			m = int(s.val(&r.maxLen))
 		}
-		if r.PadTo == r.MaxLen && r.PadTo != nil {
-			p.PadTo = max(p.PadTo, m) // one draw for both fields
-		} else if r.PadTo != nil {
-			p.PadTo = max(p.PadTo, s.length(r.PadTo))
+		if m > 0 && (p.MaxLen == 0 || m < p.MaxLen) {
+			p.MaxLen = m
 		}
-		if r.PadMultiple != nil {
-			p.PadMultiple = max(p.PadMultiple, s.length(r.PadMultiple))
+		if r.padTo.set {
+			p.PadTo = max(p.PadTo, int(s.val(&r.padTo)))
 		}
-		if r.Pad != nil {
-			p.Pad = min(p.Pad+s.length(r.Pad), math.MaxInt32) // lengths are at most 2^31-1
+		if r.padMul.set {
+			p.PadMultiple = max(p.PadMultiple, int(s.val(&r.padMul)))
 		}
-		if r.Delay != nil {
-			p.Delay = max(p.Delay, s.dur(r.Delay))
+		if r.pad.set {
+			p.Pad = min(p.Pad+int(s.val(&r.pad)), math.MaxInt32)
 		}
-		p.Flush = p.Flush || r.Flush
+		if r.delay.set {
+			p.Delay = max(p.Delay, micros(s.val(&r.delay)))
+		}
+		p.Flush = p.Flush || r.flush
 	}
-	if o := s.over; o > 0 && v.WriteStart {
-		if p.MaxLen > 0 {
-			p.MaxLen = max(p.MaxLen-o, 1) // below MinMaxLen: raised and counted by the session
-		}
-		p.PadTo = max(p.PadTo-o, 0)
-	}
-	s.rep = &p.Reply
-	s.fire(OnRecordOut, 0)
+	s.fire(onRecordOut, 0, 0, -1)
 	s.seq++
-	p.Stop, p.Reply.Stop = p.Reply.Stop, false // the stop follows the record
-	s.rep = nil
+	p.Stop = s.stopped
+	s.effects(&p.Effects)
 }
 
-func (s *shaper) OnEvent(e *shaping.Event, r *shaping.Reply) {
-	s.rep = r
-	defer func() { s.rep = nil }()
+// OnEvent runs an event entrance.
+func (s *shaper) OnEvent(e *shaping.Event, r *shaping.Effects) {
+	s.now = int64(e.Now / time.Microsecond)
+	s.m = e.Meters
 	switch e.Kind {
 	case shaping.EventStart:
 		for i := range s.ms {
-			s.enter(i, s.f.d.Machines[i].Start)
+			s.enter(int32(i), int32(s.c.ms[i].start))
 		}
 		s.drain()
 	case shaping.EventRecordIn:
 		if e.PaddingOnly {
-			s.fire(OnPaddingIn, e.Len)
+			s.fire(onPaddingIn, 0, uint64(max(e.Len, 0)), -1)
 		} else {
-			s.fire(OnRecordIn, e.Len)
+			s.fire(onRecordIn, 0, uint64(max(e.Len, 0)), -1)
 		}
 	case shaping.EventInjected:
-		s.fire(OnInjected, e.Len)
+		s.clearSurfaced()
+		s.fire(onInjected, 0, uint64(max(e.Len, 0)), -1)
+	case shaping.EventInjectDropped:
+		s.clearSurfaced()
+		if i := s.surfaced; i >= 0 {
+			s.fire(onInjectDropped, 0, 0, i)
+		}
 	case shaping.EventTimer:
-		s.fire([2]Trigger{OnTimer0, OnTimer1}[e.Timer&1], 0)
+		s.wake()
 	case shaping.EventStreamOpen:
-		s.fire(OnStreamOpen, 0)
+		s.fire(onStreamOpen, 0, 0, -1)
 	case shaping.EventStreamEnd:
-		s.fire(OnStreamEnd, 0)
-	case shaping.EventReplaced, shaping.EventStopped, shaping.EventPipeFailed:
-		// The instance ends; no machine reacts.
+		s.fire(onStreamEnd, 0, 0, -1)
+	default: // the instance ends; no machine reacts
+		return
+	}
+	s.effects(r)
+	if s.stopped {
+		r.Set |= shaping.EffectStop
 	}
 }
 
-// fire offers t to every machine.
-func (s *shaper) fire(t Trigger, n int) {
-	s.n = n
+func (s *shaper) clearSurfaced() {
+	if i := s.surfaced; i >= 0 {
+		s.ms[i].injLen = -1
+	}
+}
+
+func (s *shaper) wake() {
+	s.dues = s.dues[:0]
 	for i := range s.ms {
-		s.q = append(s.q, trig{i, t})
+		for j, at := range s.ms[i].tm {
+			if at != noTime && at <= s.now {
+				s.dues = append(s.dues, due{at, int32(i), int32(j)})
+			}
+		}
+	}
+	slices.SortFunc(s.dues, func(a, b due) int {
+		switch {
+		case a.at != b.at:
+			if a.at < b.at {
+				return -1
+			}
+			return 1
+		case a.m != b.m:
+			return int(a.m - b.m)
+		}
+		return int(a.slot - b.slot)
+	})
+	for _, d := range s.dues {
+		if s.ms[d.m].tm[d.slot] != d.at {
+			continue
+		}
+		s.ms[d.m].tm[d.slot] = noTime
+		s.fire(onTimer, d.slot, 0, d.m)
+	}
+}
+
+// fire offers a trigger to every machine, or to machine only.
+func (s *shaper) fire(t trigger, slot int32, n uint64, only int32) {
+	s.n = n
+	if only >= 0 {
+		s.q = append(s.q, item{only, slot, s.ms[only].gen, t})
+	} else {
+		for i := range s.ms {
+			s.q = append(s.q, item{int32(i), slot, s.ms[i].gen, t})
+		}
 	}
 	s.drain()
 }
 
-// drain processes pending triggers, at most f.bound per call: a cycle of
-// moves on enter or counter triggers ends there.
+// drain runs the queue first in, first out; a trigger of an earlier entry of
+// its machine's state is dropped.
 func (s *shaper) drain() {
-	for steps := 0; len(s.q) > 0 && steps < s.f.bound; steps++ {
-		g := s.q[0]
-		s.q = s.q[1:]
-		s.step(g.m, g.t)
+	for i := 0; i < len(s.q); i++ {
+		g := s.q[i]
+		if g.gen == s.ms[g.m].gen {
+			s.step(g.m, g.t, g.slot)
+		}
 	}
 	s.q = s.q[:0]
 }
 
-func (s *shaper) step(m int, t Trigger) {
-	st := &s.f.d.Machines[m].States[s.ms[m].cur]
-	for i := range st.Next {
-		tr := &st.Next[i]
-		if tr.On != t || tr.If != nil && !s.cond(m, tr.If) {
+func (s *shaper) step(m int32, t trigger, slot int32) {
+	st := &s.c.ms[m].states[s.ms[m].cur]
+	for i := range st.next {
+		tr := &st.next[i]
+		if tr.on != t || tr.slot != slot {
 			continue
 		}
-		if tr.Prob != nil && s.r.Float64() >= s.sample(tr.Prob) {
+		if tr.cond && !s.cond(m, tr) {
 			continue
 		}
-		s.enter(m, tr.To)
+		if tr.prob.set && !probTrue(s.val(&tr.prob), s.src) {
+			continue
+		}
+		s.enter(m, tr.to)
 		return
 	}
 }
 
-func (s *shaper) enter(m, to int) {
-	s.ms[m].cur = to
-	st := &s.f.d.Machines[m].States[to]
-	for i := range st.Enter {
-		s.act(m, &st.Enter[i])
+func (s *shaper) cond(m int32, tr *transition) bool {
+	var x uint64
+	switch tr.what {
+	case whatCounter:
+		x = s.ms[m].ctr[tr.cslot]
+	case whatLen:
+		x = s.n
+	case whatSeq:
+		x = s.seq
+	case whatWireLeft:
+		x = s.m.WireLeft
+	case whatStallLeft:
+		x = s.m.StallLeft
+	case whatWireSpent:
+		x = s.m.WireSpent
+	case whatSentBytes:
+		x = s.m.SentBytes
+	case whatWirePPM:
+		x = shaping.WirePPM(s.m.WireSpent, s.m.SentBytes)
 	}
-	s.q = append(s.q, trig{m, OnEnter})
-}
-
-func (s *shaper) act(m int, a *Action) {
-	r := s.rep
-	switch a.Op {
-	case OpInject:
-		s.out.inj = shaping.Inject{Cancel: true}
-		if !a.Cancel {
-			s.out.inj = shaping.Inject{After: s.dur(a.After), Len: s.length(a.Len)}
-		}
-		r.Inject = &s.out.inj
-	case OpPause:
-		s.out.gate = shaping.Gate{Pause: s.dur(a.After)}
-		r.Gate = &s.out.gate
-	case OpRate:
-		// Draws are rounded and bounded as stated values are: a rate by
-		// 2^53, a burst by 2^31-1, the same on every platform.
-		s.out.gate = shaping.Gate{Rate: int64(bounded(math.Round(s.sample(a.Rate)), maxCount))}
-		if a.Burst != nil {
-			s.out.gate.Burst = int64(s.length(a.Burst))
-		}
-		r.Gate = &s.out.gate
-	case OpTimer:
-		s.out.timer[a.Slot] = shaping.Timer{Cancel: true}
-		if !a.Cancel {
-			s.out.timer[a.Slot] = shaping.Timer{After: s.dur(a.After)}
-		}
-		r.Timer[a.Slot] = &s.out.timer[a.Slot]
-	case OpSet, OpAdd, OpSub:
-		c := &s.ms[m].ctr[a.Slot]
-		was, x := *c, s.sample(a.Value)
-		switch a.Op {
-		case OpSet:
-			*c = x
-		case OpAdd:
-			*c += x
-		case OpSub:
-			*c = math.Max(*c-x, 0)
-		}
-		if *c == 0 && (was != 0 || a.Op != OpSet) {
-			s.q = append(s.q, trig{m, [2]Trigger{OnZero0, OnZero1}[a.Slot]})
-		}
-	case OpWeight:
-		s.out.weight = s.sample(a.Value)
-		r.Weight = &s.out.weight
-	case OpStop:
-		r.Stop = true
-	case OpRestart:
-		s.enter(m, s.f.d.Machines[m].Start)
-	}
-}
-
-func (s *shaper) cond(m int, c *Cond) bool {
-	var x float64
-	switch c.What {
-	case QuantityCounter0:
-		x = s.ms[m].ctr[0]
-	case QuantityCounter1:
-		x = s.ms[m].ctr[1]
-	case QuantityLen:
-		x = float64(s.n)
-	case QuantitySeq:
-		x = float64(s.seq)
-	}
-	y := s.sample(&c.Value)
-	switch c.Cmp {
-	case CmpLT:
+	y := s.val(&tr.val)
+	switch tr.cmp {
+	case cmpLT:
 		return x < y
-	case CmpLE:
+	case cmpLE:
 		return x <= y
-	case CmpEQ:
+	case cmpEQ:
 		return x == y
-	case CmpNE:
+	case cmpNE:
 		return x != y
-	case CmpGE:
+	case cmpGE:
 		return x >= y
+	case cmpGT:
 	}
 	return x > y
 }
 
-func (s *shaper) length(v *Value) int {
-	return int(bounded(math.Round(s.sample(v)), math.MaxInt32))
-}
-
-// bounded is x within [-m, m], NaN as 0, so that a conversion to an
-// integer is the same on every platform.
-func bounded(x, m float64) float64 {
-	if math.IsNaN(x) {
-		return 0
+func (s *shaper) enter(m, to int32) {
+	ms := &s.ms[m]
+	ms.cur = to
+	ms.gen++
+	st := &s.c.ms[m].states[to]
+	for i := range st.enter {
+		a := &st.enter[i]
+		if a.op == opRestart {
+			s.enter(m, int32(s.c.ms[m].start))
+			return
+		}
+		s.act(m, a)
 	}
-	return math.Max(math.Min(x, m), -m)
+	s.q = append(s.q, item{m, 0, ms.gen, onEnter})
 }
 
-func (s *shaper) dur(v *Value) time.Duration { return seconds(s.sample(v)) }
-
-func seconds(x float64) time.Duration {
-	return time.Duration(math.Round(bounded(x*1e9, math.MaxInt64/2)))
-}
-
-// kept returns the kept value of v for its scope.
-func (s *shaper) kept(v *Value) (float64, bool) {
-	i := s.f.idx[v]
-	switch {
-	case v.Scope == ScopeShared && s.f.has != nil && s.f.has[i]:
-		return s.f.kept[i], true
-	case v.Scope == ScopePipe && s.phas[i]:
-		return s.pkept[i], true
+func (s *shaper) act(m int32, a *action) {
+	ms := &s.ms[m]
+	switch a.op {
+	case opInject:
+		if a.cancel {
+			ms.injLen = -1
+			return
+		}
+		after := s.val(&a.a)
+		ms.injAt = s.now + int64(after)
+		ms.injLen = int64(s.val(&a.b))
+	case opPause:
+		s.pauseUntil = max(s.pauseUntil, s.now+int64(s.val(&a.a)))
+	case opRate:
+		ms.rate = s.val(&a.a)
+		ms.burst = 0
+		if a.b.set {
+			ms.burst = s.val(&a.b)
+		}
+	case opTimer:
+		if a.cancel {
+			ms.tm[a.slot] = noTime
+			return
+		}
+		ms.tm[a.slot] = s.now + int64(s.val(&a.a))
+	case opSet, opAdd, opSub:
+		c := &ms.ctr[a.slot]
+		was, x := *c, s.val(&a.a)
+		switch a.op {
+		case opSet:
+			*c = x
+		case opAdd:
+			*c = was + x
+			if *c < was {
+				*c = math.MaxUint64
+			}
+		default:
+			*c = was - min(was, x)
+		}
+		if *c == 0 && (was != 0 || a.op != opSet) {
+			s.q = append(s.q, item{m, a.slot, ms.gen, onZero})
+		}
+	case opWeight:
+		if w := s.val(&a.a); w != 0 {
+			ms.weight = uint32(w)
+		}
+	case opStop:
+		s.stopped = true
+	case opRestart:
 	}
-	return 0, false
 }
 
-// keep keeps x as the value of v if its scope is pipe.
-func (s *shaper) keep(v *Value, x float64) {
-	if v.Scope == ScopePipe {
-		i := s.f.idx[v]
-		s.pkept[i], s.phas[i] = x, true
+// effects sets r to what differs from the last answer.
+func (s *shaper) effects(r *shaping.Effects) {
+	best := int32(-1)
+	for i := range s.ms {
+		if s.ms[i].injLen >= 0 && (best < 0 || s.ms[i].injAt < s.ms[best].injAt) {
+			best = int32(i)
+		}
+	}
+	s.surfaced = best
+	injAt, injLen := int64(0), int64(-1)
+	if best >= 0 {
+		injAt, injLen = s.ms[best].injAt, s.ms[best].injLen
+	}
+	if injLen != s.lastInjLen || injLen >= 0 && injAt != s.lastInjAt {
+		s.lastInjAt, s.lastInjLen = injAt, injLen
+		r.Set |= shaping.EffectInject
+		if injLen >= 0 {
+			r.HasInject, r.InjectAt, r.InjectLen = true, micros(uint64(injAt)), int(injLen)
+		}
+	}
+	wake := noTime
+	for i := range s.ms {
+		for _, at := range s.ms[i].tm {
+			if at != noTime && (wake == noTime || at < wake) {
+				wake = at
+			}
+		}
+	}
+	if wake != s.lastWake {
+		s.lastWake = wake
+		r.Set |= shaping.EffectWake
+		if wake != noTime {
+			r.HasWake, r.Wake = true, micros(uint64(wake))
+		}
+	}
+	var rate, burst uint64
+	var weight uint32
+	for i := range s.ms {
+		m := &s.ms[i]
+		if m.rate != 0 && (rate == 0 || m.rate < rate) {
+			rate, burst = m.rate, m.burst
+		}
+		if m.weight != 0 && (weight == 0 || m.weight < weight) {
+			weight = m.weight
+		}
+	}
+	if s.pauseUntil != s.lastPause || rate != s.lastRate || burst != s.lastBurst {
+		s.lastPause, s.lastRate, s.lastBurst = s.pauseUntil, rate, burst
+		r.Set |= shaping.EffectGate
+		r.PauseUntil, r.Rate, r.Burst = micros(uint64(s.pauseUntil)), rate, burst
+	}
+	if weight != s.lastWeight {
+		s.lastWeight = weight
+		r.Set |= shaping.EffectWeight
+		r.Weight = weight
 	}
 }

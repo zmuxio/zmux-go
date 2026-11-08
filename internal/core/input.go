@@ -18,6 +18,9 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 	if p == nil || p.in == nil {
 		return len(data)
 	}
+	if p.mp != nil && p.mp.hs {
+		return len(data) // nothing read before Proven reaches the session
+	}
 	il := p.in.lane(lane)
 	if il == nil || il.ended {
 		return len(data)
@@ -26,7 +29,7 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 		return len(data)
 	}
 	if s.state == StateClosing && !s.closeFr.waitLanes {
-		// Lingering: discard without processing (SPEC.md 6.5 step 3).
+		// Lingering: discard without processing.
 		return len(data)
 	}
 	consumed := 0
@@ -58,13 +61,16 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 	return consumed
 }
 
-// ReceiveMessage processes one message of a message-framed carrier
-// (SPEC.md 3.4): the message is one record's Frames field.
+// ReceiveMessage processes one message of a message-framed carrier:
+// the message is one record's Frames field.
 func (s *Session) ReceiveMessage(pipe, lane uint64, buf *Buf, msg []byte, now Time) {
 	s.SetNow(now)
 	p := s.pipe(pipe)
 	if p == nil || p.in == nil || s.state >= StateClosing {
 		return
+	}
+	if p.mp != nil && p.mp.hs {
+		return // nothing read before Proven reaches the session
 	}
 	il := p.in.lane(lane)
 	if il == nil || il.ended {
@@ -85,7 +91,7 @@ func (s *Session) ReceiveMessage(pipe, lane uint64, buf *Buf, msg []byte, now Ti
 }
 
 // checkFirstRecord validates the prefix of the first record of a bootstrap
-// pipe byte by byte (SPEC.md 6.2).
+// pipe byte by byte.
 func (s *Session) checkFirstRecord(b []byte) *wire.Error {
 	if len(b) == 0 {
 		return nil
@@ -114,29 +120,13 @@ type recordFacts struct {
 	activity bool
 	onlyPad  bool
 	pipePing bool
-	traffic  bool // a traffic frame (MULTIPATH.md 7.1): activity without QX_PING
+	traffic  bool // a traffic frame: activity without QX_PING
 }
 
 // processRecord applies every frame of one complete record, then counts it
-// into the lane's position (MULTIPATH.md 6.1).
+// into the lane's position.
 func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBytes uint64) {
 	s.rxPipe = p
-	if a := p.mp; a != nil && a.discardTP && il.lane == 0 {
-		a.discardTP = false
-		if len(rec) >= 8 && [8]byte(rec[:8]) == tpTypeBytes {
-			// A shared listener's parameters leading a join carrier:
-			// discarded, not counted (MULTIPATH.md 5.7 step 3).
-			return
-		}
-	}
-	if a := p.mp; a != nil && il.lane == 0 && a.joinerLocal && a.in == InJoining && p.id != 0 &&
-		(a.out == OutJoining || a.out == OutNone) {
-		var f wire.Frame
-		if _, e := wire.DecodeFrame(rec, &f); e == nil && f.Kind == wire.KindClose {
-			s.joinAnsweredClose(p, &f)
-			return
-		}
-	}
 	first := il.expectTP
 	size := len(rec)
 	facts := recordFacts{onlyPad: true}
@@ -156,14 +146,6 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 			e.FrameType = f.Type
 			s.failLocal(e)
 			return
-		}
-		if il.skipJoin && idx == 0 && f.Kind == wire.KindPipeJoin {
-			il.skipJoin = false
-			facts.onlyPad = false
-			facts.elicit, facts.other = true, true
-			rec = rec[n:]
-			idx++
-			continue
 		}
 		if il.expectLane && idx == 0 {
 			if f.Kind != wire.KindPipeLane {
@@ -225,8 +207,8 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 			facts.pipePing = true
 		case wire.KindPadding, wire.KindMaxData, wire.KindMaxStreamData, wire.KindMaxStreams,
 			wire.KindDataBlocked, wire.KindStreamDataBlocked, wire.KindStreamsBlocked, wire.KindClose,
-			wire.KindTransportParams, wire.KindGoAway, wire.KindPriorityUpdate, wire.KindPipeJoin,
-			wire.KindPipeAck, wire.KindPipeLane, wire.KindPipeAbandon, wire.KindPipeStatus:
+			wire.KindTransportParams, wire.KindGoAway, wire.KindPriorityUpdate,
+			wire.KindPipeAck, wire.KindPipeLane, wire.KindPipeAbandon, wire.KindPipeStatus, wire.KindSessionEpoch:
 			// Neither activity nor a PIPE_PING.
 		}
 		if s.state >= StateClosing {
@@ -252,6 +234,9 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 	il.expectLane = false
 	il.pos += posBytes
 	il.recs++
+	if p.out == nil {
+		s.sawPeer(p) // an inbound-only attachment
+	}
 	il.posAt = s.now
 	s.stats.BytesReceived += posBytes
 	s.stats.RecordsReceived++
@@ -272,12 +257,8 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 			a.maxGap = g
 		}
 		a.lastRecord = s.now
-		if a.in == InJoining {
-			a.in = InOpen
-			if a.out == OutJoining {
-				a.out = OutActive
-			}
-			s.joinConfirmed(p)
+		if p.out == nil {
+			a.statusHeld = false // a down attachment: its first record has arrived
 		}
 	}
 	if !s.feat.Acked() || facts.activity {
@@ -416,19 +397,19 @@ func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
 		s.onGoAway(f)
 	case wire.KindPriorityUpdate:
 		return s.onPriorityUpdate(f)
-	case wire.KindPipeJoin:
-		return wire.ErrProto("PIPE_JOIN on a pipe of the session")
 	case wire.KindPipeAck:
 		return s.ack.onPipeAck(f, s.now)
 	case wire.KindPipeLane:
 		return wire.ErrProto("PIPE_LANE out of place")
 	case wire.KindPipePing, wire.KindPipeAbandon, wire.KindPipeStatus:
 		return s.onPipeFrame(p, f)
+	case wire.KindSessionEpoch:
+		return s.onSessionEpoch(p, f)
 	}
 	return nil
 }
 
-// onClose processes a received CONNECTION_CLOSE (SPEC.md 6.5).
+// onClose processes a received CONNECTION_CLOSE.
 func (s *Session) onClose(f *wire.Frame) {
 	e := &SessionError{Remote: true, Code: f.Code, FrameType: f.ErrFrame}
 	reason := string(f.Data)
@@ -445,7 +426,7 @@ func (s *Session) onClose(f *wire.Frame) {
 	s.closeWith(e, &closeFrame{code: wire.NoError})
 }
 
-// splitDetails separates the diagnostic line (SPEC.md 4.3).
+// splitDetails separates the diagnostic line.
 func splitDetails(r string) (string, string) {
 	for i := len(r) - 1; i >= 0; i-- {
 		if r[i] == '\n' {
@@ -469,7 +450,7 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful bool, partial bool, caus
 		return
 	}
 	il.ended = true
-	// A lane that ends before its second record is no event (MULTIPATH.md 5.8).
+	// A lane that ends before its second record is no event.
 	early := il.lane > 0 && il.recs <= 1
 	allEnded := true
 	for _, l := range p.in.lanes {

@@ -6,7 +6,7 @@ package wire
 
 import "github.com/zmuxio/zmux-go/varint"
 
-// Frame type codepoints (REGISTRY.md Section 3).
+// Frame type codepoints.
 const (
 	TypePadding           uint64 = 0x00
 	TypeResetStream       uint64 = 0x04
@@ -30,18 +30,24 @@ const (
 	TypePingResponse      uint64 = 0x348c67529ef8c7be
 	TypeGoAway            uint64 = 0x1911f43e
 	TypePriorityUpdate    uint64 = 0x073d08cf
-	TypePipeJoin          uint64 = 0x1a24de36
 	TypePipeAck           uint64 = 0x0b2b3eeb
 	TypePipeLane          uint64 = 0x3a05a1c9
 	TypePipePing          uint64 = 0x269b43e6
 	TypePipeAbandon       uint64 = 0x23b35b74
 	TypePipeStatus        uint64 = 0x227b2811
+	TypeSessionEpoch      uint64 = 0x024e93eb
+)
+
+// SESSION_EPOCH phases.
+const (
+	EpochOffer  = 0
+	EpochAnswer = 1
 )
 
 // FirstFrameTypes are the frame types that may begin a carrier's first
-// record (SPEC.md 6.2, MULTIPATH.md 5.5): their encodings begin with ff, 9a
-// and ba, never 03 (REGISTRY.md 2.4 item 6).
-var FirstFrameTypes = [...]uint64{TypeTransportParams, TypePipeJoin, TypePipeLane}
+// record: their encodings begin with ff, 9a
+// and ba, never 03.
+var FirstFrameTypes = [...]uint64{TypeTransportParams, TypePipeLane}
 
 // STREAM frame type bits.
 const (
@@ -71,39 +77,25 @@ const (
 	KindPing
 	KindGoAway
 	KindPriorityUpdate
-	KindPipeJoin
 	KindPipeAck
 	KindPipeLane
 	KindPipePing
 	KindPipeAbandon
 	KindPipeStatus
+	KindSessionEpoch
 )
 
 var kindNames = [...]string{"PADDING", "STREAM", "RESET_STREAM", "RESET_STREAM_AT", "STOP_SENDING",
 	"MAX_DATA", "MAX_STREAM_DATA", "MAX_STREAMS", "DATA_BLOCKED", "STREAM_DATA_BLOCKED",
 	"STREAMS_BLOCKED", "CONNECTION_CLOSE", "DATAGRAM", "QX_TRANSPORT_PARAMETERS", "QX_PING",
-	"GOAWAY", "PRIORITY_UPDATE", "PIPE_JOIN", "PIPE_ACK", "PIPE_LANE", "PIPE_PING",
-	"PIPE_ABANDON", "PIPE_STATUS"}
+	"GOAWAY", "PRIORITY_UPDATE", "PIPE_ACK", "PIPE_LANE", "PIPE_PING",
+	"PIPE_ABANDON", "PIPE_STATUS", "SESSION_EPOCH"}
 
 func (k Kind) String() string { return kindNames[k] }
 
 // AckEliciting reports whether a frame of this kind elicits a PIPE_ACK.
 func (k Kind) AckEliciting() bool {
 	return k != KindPadding && k != KindPipeAck && k != KindClose
-}
-
-// Join is a decoded PIPE_JOIN frame (MULTIPATH.md Section 5.1).
-type Join struct {
-	Locator      []byte
-	PipeID       uint64
-	Dir          uint8 // 0 up, 1 down, 2 bidi
-	CarrierBound bool
-	Standby      bool
-	FateGroup    uint64
-	Priority     uint64
-	Token        []byte // 16 bytes
-	// MACLen is the number of bytes from Type through Priority (the MAC input).
-	MACLen int
 }
 
 // Frame is one decoded frame. Byte fields alias the decoded buffer.
@@ -135,7 +127,9 @@ type Frame struct {
 	Seq       uint64
 	Status    uint64
 	Priority  uint64
-	Join      Join
+	Share     []byte // SESSION_EPOCH offer or answer; Status is the phase, Seq the epoch
+	Locator   []byte // SESSION_EPOCH offer or answer, empty to keep the sender's
+	Body      []byte // SESSION_EPOCH: the bytes from Phase through Locator
 	Count     int    // PADDING run length, PIPE_ACK entry count
 	Entries   []byte // PIPE_ACK entries, validated
 }
@@ -211,7 +205,7 @@ const max60 = 1 << 60
 // DecodeFrame decodes the frame at the start of b, which holds the rest of
 // the record. It returns the frame length. A non-minimal frame type is
 // reported as PROTOCOL_VIOLATION only after the frame decoded completely
-// (SPEC.md Section 10.3 precedence).
+// (errors of a complete frame take precedence over feature gating).
 func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 	*f = Frame{}
 	t, tn := varint.ConsumeVarint(b)
@@ -325,11 +319,6 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 			}
 			f.Urgency, f.Incr = p>>5, p&0x10 != 0
 		}
-	case t == TypePipeJoin:
-		f.Kind = KindPipeJoin
-		if err := decodeJoin(&r, &f.Join); err != nil {
-			return 0, err
-		}
 	case t == TypePipeAck:
 		f.Kind = KindPipeAck
 		cnt := r.varint()
@@ -366,6 +355,19 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 		if !r.bad && f.Status > 1 {
 			return 0, ErrFrame("PIPE_STATUS status")
 		}
+	case t == TypeSessionEpoch:
+		f.Kind = KindSessionEpoch
+		start := r.i
+		f.Status = uint64(r.byte())
+		if !r.bad && f.Status > EpochAnswer {
+			return 0, &Error{Code: ProtocolViolation, FrameType: t, Reason: "SESSION_EPOCH phase"}
+		}
+		f.Seq = r.varint()
+		f.Share = r.bytes(r.varint())
+		f.Locator = r.bytes(uint64(r.byte()))
+		if !r.bad {
+			f.Body = b[start:r.i]
+		}
 	default:
 		return 0, &Error{Code: FrameEncodingError, FrameType: t, Reason: "unknown or prohibited frame type"}
 	}
@@ -376,28 +378,4 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 		return r.i, &Error{Code: ProtocolViolation, FrameType: t, Reason: "frame type not minimally encoded"}
 	}
 	return r.i, nil
-}
-
-func decodeJoin(r *reader, j *Join) *Error {
-	ll := r.byte()
-	if !r.bad && (ll == 0 || ll > 16) {
-		return ErrFrame("PIPE_JOIN locator length")
-	}
-	j.Locator = r.bytes(uint64(ll))
-	j.PipeID = r.varint()
-	fl := r.byte()
-	if !r.bad {
-		if fl&0xf0 != 0 || fl&0x03 == 3 {
-			return ErrFrame("PIPE_JOIN flags")
-		}
-		j.Dir, j.CarrierBound, j.Standby = fl&3, fl&0x04 != 0, fl&0x08 != 0
-	}
-	j.FateGroup = r.varint()
-	j.Priority = r.varint()
-	j.MACLen = r.i
-	j.Token = r.bytes(16)
-	if !r.bad && r.i > 64 {
-		return ErrFrame("PIPE_JOIN longer than 64 bytes")
-	}
-	return nil
 }

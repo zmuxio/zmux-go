@@ -9,6 +9,7 @@ import (
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -30,7 +31,7 @@ type DuplicateResult struct {
 	RejoinStarted   bool
 }
 
-// ResolveDuplicate applies the rule of EXTENSIONS.md 11 to two established
+// ResolveDuplicate applies the duplicate-session rule to two established
 // sessions that connect the same two endpoints and were dialed by
 // different endpoints: it returns the survivor and starts draining the
 // other session (GOAWAY, no new streams, close with NO_ERROR once its
@@ -82,16 +83,14 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 	res := DuplicateResult{Survivor: win, Loser: lose}
 	if o.Rejoin && o.Dial != nil && loserDialer == EndpointLocal && win.ConnectionState().Multipath && win.JoinReady() {
 		res.RejoinStarted = true
-		go func() {
+		labels.Go(win.lctx, "duplicate-rejoin", func() {
 			clk := win.clk.source()
-			ctx, cancel := timeshim.WithDeadline(win.ctx, clk, clk.Now().Add(win.cfg.handshakeTimeout()))
+			ctx, cancel := timeshim.WithDeadline(win.ctx, clk, clk.Now().Add(win.cfg.joinTimeout()))
 			defer cancel()
 			if p, err := o.Dial(ctx); err == nil {
-				if _, err := win.AddPipe(ctx, p, PipeOptions{}); err != nil {
-					closePipeIO(p)
-				}
+				_, _ = win.AddPipe(ctx, p, PipeOptions{})
 			}
-		}()
+		})
 	}
 	return res, nil
 }

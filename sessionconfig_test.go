@@ -1,9 +1,12 @@
 package zmux
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,8 +24,8 @@ func TestSessionConfigMixed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	scfg, ccfg := selfSignedTLS(t)
-	tlsLim, plainLim := shaping.Limits{MaxPaddingBytes: 1}, shaping.Limits{MaxPaddingBytes: 2}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), SessionConfig: func(_ context.Context, info *CarrierInfo, _ any) (*Config, error) {
+	tlsLim, plainLim := shaping.Limits{Wire: shaping.Account{Initial: 1}}, shaping.Limits{Wire: shaping.Account{Initial: 2}}
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), SessionConfig: func(_ context.Context, info *CarrierInfo, _ any) (*Config, error) {
 		if info.TLS != nil {
 			c := exporterConfig()
 			c.ShapingLimits = tlsLim
@@ -35,12 +38,12 @@ func TestSessionConfigMixed(t *testing.T) {
 	defer func() { _ = lst.Close() }()
 	tlsPair := func() *tls.Conn {
 		a, b := tcpPair(t)
-		go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), JoinHint{}) }()
+		go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), PipeHint{}) }()
 		return tls.Client(b, ccfg)
 	}
 	plainPair := func() PipeIO {
 		a, b := tcpPair(t)
-		go func() { _ = lst.HandlePipe(ctx, NetPipe(a), JoinHint{}) }()
+		go func() { _ = lst.HandlePipe(ctx, NetPipe(a), PipeHint{}) }()
 		return NetPipe(b)
 	}
 	ce, err := Start(ctx, NetPipe(tlsPair()), RoleClient, exporterConfig())
@@ -66,13 +69,13 @@ func TestSessionConfigMixed(t *testing.T) {
 	if se.ShapingLimits() != tlsLim || sd.ShapingLimits() != plainLim {
 		t.Fatalf("limits %+v, %+v", se.ShapingLimits(), sd.ShapingLimits())
 	}
-	if se.ConnectionState().JoinSecretPending || !sd.ConnectionState().JoinSecretPending {
+	if se.ConnectionState().JoinPending || !sd.ConnectionState().JoinPending {
 		t.Fatal("PipeAuth not per session")
 	}
 	if err := se.SetJoinSecret(joinSecret); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("SetJoinSecret on the exporter session: %v", err)
 	}
-	if _, err := ce.AddPipe(ctx, NetPipe(tlsPair()), PipeOptions{CarrierBound: true}); err != nil {
+	if _, err := ce.AddPipe(ctx, NetPipe(tlsPair()), PipeOptions{}); err != nil {
 		t.Fatalf("exporter join: %v", err)
 	}
 	mustSet(t, cd, joinSecret)
@@ -85,7 +88,8 @@ func TestSessionConfigMixed(t *testing.T) {
 }
 
 // nil selects Config; an error, a panic and a Config that breaks the
-// listener's constraints or is invalid reject the carrier.
+// listener's constraints or is invalid reject the carrier; an error and a
+// panic reach the listener's Logger.
 func TestSessionConfigOutcomes(t *testing.T) {
 	leakcheck.Check(t)
 	other := timeshim.Or(nil)
@@ -100,20 +104,21 @@ func TestSessionConfigOutcomes(t *testing.T) {
 		{"clock", func() (*Config, error) { c := mpConfig(); c.Clock = other; return c, nil }, false},
 		{"invalid", func() (*Config, error) {
 			c := mpConfig()
-			c.PipeAuth = PipeAuth{DeferredPSK: true, AllowInsecure: true}
+			c.PipeAuth = PipeAuth{DeferredPSK: true, PSK: joinSecret}
 			return c, nil
 		}, false},
 	} {
 		t.Run(x.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			lst := NewListener(&ListenerConfig{Config: mpConfig(), SessionConfig: func(context.Context, *CarrierInfo, any) (*Config, error) {
+			var log bytes.Buffer
+			lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Logger: slog.New(slog.NewTextHandler(&log, nil)), SessionConfig: func(context.Context, *CarrierInfo, any) (*Config, error) {
 				return x.f()
 			}})
 			defer func() { _ = lst.Close() }()
 			a, b := tcpPair(t)
 			done := make(chan error, 1)
-			go func() { done <- lst.HandlePipe(ctx, NetPipe(a), JoinHint{}) }()
+			go func() { done <- lst.HandlePipe(ctx, NetPipe(a), PipeHint{}) }()
 			c, err := Start(ctx, NetPipe(b), RoleClient, mpConfig())
 			if err == nil {
 				defer func() { _ = c.Close(); waitDone(t, c) }()
@@ -134,6 +139,10 @@ func TestSessionConfigOutcomes(t *testing.T) {
 			}
 			if st := lst.Stats(); st.Rejected != 1 || st.Sessions != 0 {
 				t.Fatalf("stats %+v", st)
+			}
+			logged := strings.Contains(log.String(), "ListenerConfig.SessionConfig")
+			if want := x.name == "error" || x.name == "panic"; logged != want {
+				t.Fatalf("logged %v: %q", logged, log.String())
 			}
 		})
 	}

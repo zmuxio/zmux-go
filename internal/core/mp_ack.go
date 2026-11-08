@@ -2,8 +2,7 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// mpAckEntry processes one PIPE_ACK entry of a multipath session
-// (MULTIPATH.md 6.2).
+// mpAckEntry processes one PIPE_ACK entry of a multipath session.
 func (s *Session) mpAckEntry(e wire.AckEntry, now Time) *wire.Error {
 	m := s.mp
 	p := s.pipe(e.PipeID)
@@ -37,13 +36,14 @@ func (s *Session) mpAckEntry(e wire.AckEntry, now Time) *wire.Error {
 		return nil
 	}
 	ol.acked = e.Position
+	s.sawPeer(p)
 	s.ackLog(ol, e.Position)
 	s.ack.advanced(p, ol, e, now)
 	return nil
 }
 
-// ackBeyondSent: the peer claims data never sent (MULTIPATH.md 6.2,
-// RESUME.md 7).
+// ackBeyondSent: the peer claims data never sent: a
+// protocol violation, reported as a failed resume when resume is in use.
 func (s *Session) ackBeyondSent(e wire.AckEntry) *wire.Error {
 	code := wire.ProtocolViolation
 	if s.feat.Resume {
@@ -65,20 +65,17 @@ func (s *Session) mpAdvanced(p *Pipe, ol *outLane, ps *pipeSend, now Time) {
 		s.setAhead(p, ps.samples[0].ahead)
 	}
 	switch a.out {
-	case OutJoining:
-		if ol.lane == 0 {
-			a.out = OutActive
-			s.joinConfirmed(p)
-		}
 	case OutSuspect:
 		if _, st := s.writeStall(p); !st {
 			a.out = OutActive
 			s.startProbation(p)
 			s.emitPipeState(p)
 			s.checkTakeover()
+			s.checkResumed()
 		}
-	case OutNone, OutActive, OutDraining, OutFailed, OutClosed, OutRetired:
-		// An acknowledgement changes no other state.
+	case OutNone, OutJoining, OutActive, OutDraining, OutFailed, OutClosed, OutRetired:
+		// An acknowledgement changes no other state: joinConfirmed, not an
+		// acknowledgement, makes a joining direction active.
 	}
 	s.revalAcked(p)
 	s.pingsAcked(p)
@@ -115,7 +112,7 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 	m := s.mp
 	switch f.Kind {
 	case wire.KindPipePing:
-		s.charge() // every PIPE_PING (SPEC.md 9.4.1 NE-2)
+		s.charge() // every PIPE_PING
 		s.ack.immediate = true
 		if p.mp != nil && s.answersOnPair(p) {
 			p.mp.ackPair = true
@@ -147,7 +144,7 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 		wire.KindStopSending, wire.KindMaxData, wire.KindMaxStreamData, wire.KindMaxStreams,
 		wire.KindDataBlocked, wire.KindStreamDataBlocked, wire.KindStreamsBlocked, wire.KindClose,
 		wire.KindDatagram, wire.KindTransportParams, wire.KindPing, wire.KindGoAway,
-		wire.KindPriorityUpdate, wire.KindPipeJoin, wire.KindPipeAck, wire.KindPipeLane:
+		wire.KindPriorityUpdate, wire.KindPipeAck, wire.KindPipeLane, wire.KindSessionEpoch:
 		// Not a pipe frame; dispatch routes only the three above here.
 	}
 	return nil

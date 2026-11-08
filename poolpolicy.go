@@ -2,6 +2,7 @@ package zmux
 
 import (
 	"fmt"
+	"log/slog"
 	"time"
 )
 
@@ -88,22 +89,23 @@ func (d *PoolDecision) Validate() error {
 // MinRecheck is the shortest wait a pool applies to PoolDecision.Recheck.
 const MinRecheck = 10 * time.Millisecond
 
-// decide asks pol, containing a panic (the zero decision then applies),
-// and returns the decision's Validate error, the decision left as it is.
-func decide(pol PoolPolicy, v *PoolView, d *PoolDecision) error {
+// decide asks pol, containing a panic (the zero decision then applies,
+// and the panic is logged to l), and returns the decision's Validate
+// error, the decision left as it is.
+func decide(l *slog.Logger, pol PoolPolicy, v *PoolView, d *PoolDecision) error {
 	*d = PoolDecision{Retire: d.Retire[:0]}
-	if !safeCall(func() { pol.Decide(v, d) }) {
+	if !safeLog(l, "PoolPolicy.Decide", func() { pol.Decide(v, d) }) {
 		*d = PoolDecision{}
 	}
 	return d.Validate()
 }
 
 // reportRejected hands the error of a rejected decision to a pool's
-// DecisionRejected callback f, if set, containing a panic. Callers hold no
-// lock.
-func reportRejected(f func(error), err error) {
+// DecisionRejected callback f, if set, containing a panic (logged to l).
+// Callers hold no lock.
+func reportRejected(l *slog.Logger, f func(error), err error) {
 	if f != nil {
-		safeCall(func() { f(err) })
+		safeLog(l, "DecisionRejected", func() { f(err) })
 	}
 }
 

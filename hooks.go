@@ -1,12 +1,15 @@
 package zmux
 
 import (
+	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 // Tracer receives session events. Its functions
@@ -63,7 +66,7 @@ type PickPipe struct {
 	// ShapingActive: a Shaper is active on the pipe.
 	ShapingActive bool
 	// ShapingWeight is the weight the pipe's Shaper set; 0: none.
-	ShapingWeight float64
+	ShapingWeight uint32
 }
 
 // PickAnswer is the answer for one direction: Index is the chosen pipe's
@@ -94,6 +97,8 @@ type hooks struct {
 	tr    *Tracer
 	pick  Pick
 	allow func(delta uint64) bool
+	log   *slog.Logger
+	warns []string // warnings for log, queued under the session lock
 
 	mu      sync.Mutex
 	q       []traceItem
@@ -113,14 +118,35 @@ type traceItem struct {
 
 func newHooks(c *Conn) *hooks {
 	cfg := c.cfg
-	h := &hooks{c: c, tr: cfg.Tracer, allow: cfg.AllowConnectionWindowIncrease, kick: make(chan struct{}, 1)}
+	h := &hooks{c: c, tr: cfg.Tracer, allow: cfg.AllowConnectionWindowIncrease, log: cfg.Logger, kick: make(chan struct{}, 1)}
 	if cp, ok := cfg.Scheduler.(customPolicy); ok {
 		h.pick = cp.p
 	}
-	if h.tr == nil && h.pick == nil && h.allow == nil {
+	if h.tr == nil && h.pick == nil && h.allow == nil && h.log == nil {
 		return nil
 	}
 	return h
+}
+
+// warn queues a warning for Config.Logger (under the session lock; the
+// leaf lock only); the hook goroutine logs it.
+func (h *hooks) warn(msg string) {
+	if h == nil || h.log == nil {
+		return
+	}
+	h.mu.Lock()
+	if len(h.warns) < hookQueueMax {
+		h.warns = append(h.warns, msg)
+	}
+	h.mu.Unlock()
+}
+
+// logger is h's Config.Logger; h may be nil.
+func (h *hooks) logger() *slog.Logger {
+	if h == nil {
+		return nil
+	}
+	return h.log
 }
 
 // trace queues a tracer item (under the session lock; the leaf lock only).
@@ -154,14 +180,14 @@ func (h *hooks) start() {
 		return
 	}
 	h.mu.Lock()
-	work := len(h.q) > 0 || h.wantWin || h.wantPk || h.dropped > 0
+	work := len(h.q) > 0 || h.wantWin || h.wantPk || h.dropped > 0 || len(h.warns) > 0
 	run := work && !h.running
 	if run {
 		h.running = true
 	}
 	h.mu.Unlock()
 	if run {
-		go h.run()
+		labels.Go(h.c.lctx, "hooks", func() { h.run() })
 	} else if work {
 		select {
 		case h.kick <- struct{}{}:
@@ -180,17 +206,22 @@ func (h *hooks) run() {
 		h.dropped = 0
 		win, pk := h.wantWin, h.wantPk
 		h.wantWin, h.wantPk = false, false
-		if len(q) == 0 && dropped == 0 && !win && !pk {
+		warns := h.warns
+		h.warns = nil
+		if len(q) == 0 && dropped == 0 && !win && !pk && len(warns) == 0 {
 			h.running = false
 			h.mu.Unlock()
 			return
 		}
 		h.mu.Unlock()
+		for _, w := range warns {
+			h.log.Warn(w)
+		}
 		for _, it := range q {
 			h.deliver(it)
 		}
 		if dropped > 0 && h.tr.Dropped != nil {
-			safeCall(func() { h.tr.Dropped(dropped) })
+			safeLog(h.log, "Tracer.Dropped", func() { h.tr.Dropped(dropped) })
 		}
 		if win {
 			h.window()
@@ -205,11 +236,11 @@ func (h *hooks) deliver(it traceItem) {
 	t := h.tr
 	switch {
 	case it.est && t.Established != nil:
-		safeCall(t.Established)
+		safeLog(h.log, "Tracer.Established", t.Established)
 	case it.closed && t.Closed != nil:
-		safeCall(func() { t.Closed(it.err) })
+		safeLog(h.log, "Tracer.Closed", func() { t.Closed(it.err) })
 	case !it.est && !it.closed && t.Event != nil:
-		safeCall(func() { t.Event(it.ev) })
+		safeLog(h.log, "Tracer.Event", func() { t.Event(it.ev) })
 	}
 }
 
@@ -223,7 +254,7 @@ func (h *hooks) window() {
 		return
 	}
 	allow := false
-	safeCall(func() { allow = h.allow(delta) })
+	safeLog(h.log, "Config.AllowConnectionWindowIncrease", func() { allow = h.allow(delta) })
 	c.lock()
 	c.s.ApplyWindowProposal(w, allow)
 	c.unlock()
@@ -256,7 +287,7 @@ func (h *hooks) runPick() {
 	for i := range out {
 		out[i].Wait = true
 	}
-	failed := !safeCall(func() { h.pick.Pick(reqs, pipes, out) })
+	failed := !safeLog(h.log, "Pick", func() { h.pick.Pick(reqs, pipes, out) })
 	ans := make([]core.PickAnswer, len(out))
 	for i, a := range out {
 		ans[i] = core.PickAnswer{Wait: a.Wait, Index: a.Index, Bytes: a.Bytes}
@@ -266,19 +297,22 @@ func (h *hooks) runPick() {
 	c.unlock()
 }
 
-// safeCall runs application code; a panic is contained (and reported as
-// false).
-func safeCall(f func()) (ok bool) {
+// safeLog runs the host callback f, containing a panic (ok false), which
+// it logs as the panic of what to l (nil: not logged), outside every lock.
+func safeLog(l *slog.Logger, what string, f func()) (ok bool) {
 	defer func() {
-		if recover() != nil {
+		if r := recover(); r != nil {
 			ok = false
+			if l != nil {
+				l.Warn("zmux: a host callback panicked; the panic was contained", "callback", what, "panic", fmt.Sprint(r))
+			}
 		}
 	}()
 	f()
 	return true
 }
 
-// ---- redial (RESUME.md 4.3) ----
+// ---- redial ----
 
 // redialer re-establishes pipes with the Redial hook while the session
 // lacks a direction: at most one call in flight per direction, cancelled
@@ -295,8 +329,8 @@ type redialer struct {
 type redialState struct {
 	failures int
 	lastDial time.Time
-	backoff  time.Duration // built-in; 0: not started
-	wait     time.Duration // the built-in wait after lastDial, jittered
+	backoff  time.Duration // the current backoff; 0: not started
+	wait     time.Duration // the wait after lastDial, jittered
 	view     PoolView
 	dec      PoolDecision
 }
@@ -308,7 +342,7 @@ func (c *Conn) maybeRedial() {
 	}
 	c.lock()
 	out, in := c.s.LiveDirections()
-	pending := c.s.JoinSecretPending() // EvJoinKeys asks again
+	pending := c.s.JoinPendingNow() // EvJoinKeys asks again
 	c.unlock()
 	if pending {
 		return
@@ -332,7 +366,7 @@ func (c *Conn) maybeRedial() {
 	}
 	r.inFlight[need] = true
 	r.mu.Unlock()
-	go c.redialLoop(need)
+	labels.Go(c.lctx, "redial", func() { c.redialLoop(need) })
 }
 
 func (c *Conn) closingNow() bool {
@@ -356,16 +390,15 @@ func (c *Conn) redialLoop(need Direction) {
 	r.mu.Lock()
 	st := &r.state[need]
 	r.mu.Unlock()
+	lo, hi := c.cfg.redialBackoff()
 	if st.backoff == 0 {
-		st.backoff = 250 * time.Millisecond
+		st.backoff = lo
+		st.wait = backoffWait(lo)
 	}
 	// delay is the wait after the previous attempt: the policy's
-	// DialAfter, else the built-in backoff (none before a first failure).
+	// DialAfter, else the backoff.
 	delay := func() time.Duration {
-		var d time.Duration
-		if st.failures > 0 {
-			d = st.wait
-		}
+		d := st.wait
 		pol := c.cfg.RedialPolicy
 		if pol == nil {
 			return d
@@ -376,18 +409,20 @@ func (c *Conn) redialLoop(need Direction) {
 			v.Members = append(v.Members, PoolMember{ID: ps.Pipe, Age: ps.AttachedFor, Idle: ps.SinceLastTraffic,
 				Pipes: 1, BytesSent: ps.BytesSent, BytesReceived: ps.BytesReceived})
 		}
-		if err := decide(pol, v, &st.dec); err != nil {
+		if err := decide(c.cfg.Logger, pol, v, &st.dec); err != nil {
 			st.dec = PoolDecision{} // as a policy that panics
-			reportRejected(c.cfg.DecisionRejected, err)
+			reportRejected(c.cfg.Logger, c.cfg.DecisionRejected, err)
 		}
 		if st.dec.DialAfter > 0 {
-			d = min(st.dec.DialAfter, MaxRedialBackoff)
+			d = min(st.dec.DialAfter, hi)
 		}
 		return d
 	}
 	for {
 		if !st.lastDial.IsZero() {
-			if w := timeshim.Until(clk, st.lastDial.Add(delay())); w > 0 {
+			// The join refusal backoff a refused join started is separate:
+			// the call waits for the longer of the two.
+			if w := max(timeshim.Until(clk, st.lastDial.Add(delay())), c.refusalWait()); w > 0 {
 				t := timeshim.NewTimer(clk, w)
 				select {
 				case <-t.C:
@@ -402,7 +437,7 @@ func (c *Conn) redialLoop(need Direction) {
 		st.lastDial = clk.Now()
 		var p PipeIO
 		var err error
-		ok := safeCall(func() { p, err = c.cfg.Redial(c.ctx, need) })
+		ok := safeLog(c.cfg.Logger, "Config.Redial", func() { p, err = c.cfg.Redial(c.ctx, need) })
 		if c.closingNow() {
 			if ok && err == nil {
 				closePipeIO(p)
@@ -410,11 +445,12 @@ func (c *Conn) redialLoop(need Direction) {
 			return
 		}
 		if ok && err == nil {
-			ctx, cancel := timeshim.WithDeadline(c.ctx, clk, clk.Now().Add(c.cfg.handshakeTimeout()))
-			_, err = c.AddPipe(ctx, p, st.dec.probeOptions(PipeOptions{Direction: need}))
+			ctx, cancel := timeshim.WithDeadline(c.ctx, clk, clk.Now().Add(c.cfg.joinTimeout()))
+			_, err = c.AddPipe(ctx, p, st.dec.probeOptions(PipeOptions{Direction: need, NoWaitAttached: true}))
 			cancel()
 			if err == nil {
-				st.failures, st.backoff = 0, 250*time.Millisecond
+				st.failures, st.backoff = 0, lo
+				st.wait = backoffWait(lo)
 				return
 			}
 		}
@@ -425,9 +461,17 @@ func (c *Conn) redialLoop(need Direction) {
 			return
 		}
 		if st.failures > 0 {
-			st.backoff = min(2*st.backoff, MaxRedialBackoff)
+			st.backoff = min(2*st.backoff, hi)
 		}
 		st.failures++
 		st.wait = backoffWait(st.backoff)
 	}
+}
+
+// refusalWait is what remains of the join refusal backoff, which a refused
+// join started.
+func (c *Conn) refusalWait() time.Duration {
+	c.lock()
+	defer c.unlock()
+	return time.Duration(c.s.JoinBackoffLeft(c.clk.now()))
 }

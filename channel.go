@@ -5,11 +5,12 @@ import (
 	"sync/atomic"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 // DatagramChannel is the datagram channel of a pipe's carrier, an optional
-// capability of a PipeIO half (EXTENSIONS.md 6.8): an unreliable datagram
+// capability of a PipeIO half: an unreliable datagram
 // service of the carrier besides the reliable stream that is the pipe, such
 // as QUIC DATAGRAM frames of the connection a QUIC stream belongs to, the
 // HTTP Datagrams of an HTTP/3 request stream, or the datagrams of a
@@ -45,7 +46,7 @@ type DatagramChannel interface {
 
 // ChannelDemux routes the channel datagrams of one carrier connection
 // shared by several pipes, such as a QUIC connection or a WebTransport
-// session, to those pipes by their Pipe Stream ID (EXTENSIONS.md 6.8). An
+// session, to those pipes by their Pipe Stream ID. An
 // adapter runs one receive loop per connection that passes every datagram
 // to Deliver, and its pipes' ReceiveChannelDatagrams register with
 // Register. The pipes may belong to several sessions. The zero value is
@@ -100,7 +101,7 @@ func (d *ChannelDemux) Deliver(b []byte) {
 func (d *ChannelDemux) Dropped() uint64 { return d.dropped.Load() }
 
 // AppendChannelDatagram appends the channel datagram of one DATAGRAM frame
-// with data, after the Pipe Stream ID id when withID (EXTENSIONS.md 6.8).
+// with data, after the Pipe Stream ID id when withID.
 func AppendChannelDatagram(b []byte, withID bool, id uint64, data []byte) []byte {
 	return wire.AppendChannelDatagram(b, withID, id, data)
 }
@@ -131,11 +132,11 @@ func (c *Conn) startChannel(pd *pipeDrv) {
 	stop := pd.ch.ReceiveChannelDatagrams(func(frame []byte) { c.receiveChannel(pd, frame) })
 	c.wg.Add(1)
 	pd.gs.add()
-	go func() {
+	labels.Go(pd.lctx, "channel", func() {
 		defer pd.gs.done()
 		defer stop()
 		c.channelLoop(pd)
-	}()
+	})
 }
 
 // endChannel ends the attachment's channel sender and receiver.
@@ -230,7 +231,7 @@ func (c *Conn) receiveChannel(pd *pipeDrv, frame []byte) {
 	in.draining = true
 	in.mu.Unlock()
 	if start {
-		go c.drainChannel()
+		labels.Go(c.lctx, "channel-drain", func() { c.drainChannel() })
 	}
 }
 

@@ -8,7 +8,7 @@ import (
 )
 
 // TestErrorCodeRegistry checks that the exported error codes are the
-// registry's (SPEC.md 10.2, EXTENSIONS.md 7).
+// registry's.
 func TestErrorCodeRegistry(t *testing.T) {
 	transport := map[TransportErrorCode]string{
 		TransportNoError: "NO_ERROR", TransportInternalError: "INTERNAL_ERROR", TransportConnectionRefused: "CONNECTION_REFUSED",

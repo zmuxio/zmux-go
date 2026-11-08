@@ -131,7 +131,7 @@ func AppendGoAway(b []byte, maxBidi, maxUni, code uint64) []byte {
 	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, maxBidi), maxUni), code)
 }
 
-// PriorityByte encodes urgency and incremental (EXTENSIONS.md 5.2).
+// PriorityByte encodes urgency and incremental.
 func PriorityByte(urgency uint8, incr bool) byte {
 	p := urgency << 5
 	if incr {
@@ -144,35 +144,6 @@ func AppendPriorityUpdate(b []byte, id, seq uint64, urgency uint8, incr bool) []
 	b = varint.AppendVarint(b, TypePriorityUpdate)
 	b = varint.AppendVarint(varint.AppendVarint(b, id), seq)
 	return append(b, PriorityByte(urgency, incr))
-}
-
-// AppendJoinMAC appends PIPE_JOIN from Type through Priority (the MAC input).
-func AppendJoinMAC(b []byte, j *Join) []byte {
-	b = varint.AppendVarint(b, TypePipeJoin)
-	b = append(b, byte(len(j.Locator)))
-	b = append(b, j.Locator...)
-	b = varint.AppendVarint(b, j.PipeID)
-	fl := j.Dir & 3
-	if j.CarrierBound {
-		fl |= 0x04
-	}
-	if j.Standby {
-		fl |= 0x08
-	}
-	b = append(b, fl)
-	b = varint.AppendVarint(b, j.FateGroup)
-	return varint.AppendVarint(b, j.Priority)
-}
-
-// AppendJoin appends the whole PIPE_JOIN frame.
-func AppendJoin(b []byte, j *Join) []byte {
-	return append(AppendJoinMAC(b, j), j.Token...)
-}
-
-// JoinLen is the encoded length of AppendJoin's frame.
-func JoinLen(j *Join) int {
-	return varint.SizeVarint(TypePipeJoin) + 1 + len(j.Locator) + varint.SizeVarint(j.PipeID) + 1 +
-		varint.SizeVarint(j.FateGroup) + varint.SizeVarint(j.Priority) + len(j.Token)
 }
 
 // AppendPipeAckHeader appends the type and entry count; entries follow.
@@ -204,6 +175,14 @@ func AppendPipeAbandon(b []byte, pipe, code uint64) []byte {
 func AppendPipeStatus(b []byte, pipe, seq, status, prio uint64) []byte {
 	b = varint.AppendVarint(b, TypePipeStatus)
 	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, pipe), seq), status), prio)
+}
+
+// AppendSessionEpoch appends a SESSION_EPOCH frame.
+func AppendSessionEpoch(b []byte, phase uint8, epoch uint64, share, locator []byte) []byte {
+	b = append(varint.AppendVarint(b, TypeSessionEpoch), phase)
+	b = varint.AppendVarint(b, epoch)
+	b = append(varint.AppendVarint(b, uint64(len(share))), share...)
+	return append(append(b, byte(len(locator))), locator...)
 }
 
 // AppendFrame re-encodes a decoded frame in its shortest form. It is used by
@@ -262,8 +241,6 @@ func AppendFrame(b []byte, f *Frame) []byte {
 		return AppendGoAway(b, f.MaxBidi, f.MaxUni, f.Code)
 	case KindPriorityUpdate:
 		return AppendPriorityUpdate(b, f.StreamID, f.Seq, f.Urgency, f.Incr)
-	case KindPipeJoin:
-		return AppendJoin(b, &f.Join)
 	case KindPipeAck:
 		b = AppendPipeAckHeader(b, f.Count)
 		it := f.Iter()
@@ -279,6 +256,8 @@ func AppendFrame(b []byte, f *Frame) []byte {
 		return AppendPipeAbandon(b, f.PipeID, f.Code)
 	case KindPipeStatus:
 		return AppendPipeStatus(b, f.PipeID, f.Seq, f.Status, f.Priority)
+	case KindSessionEpoch:
+		return AppendSessionEpoch(b, uint8(f.Status), f.Seq, f.Share, f.Locator)
 	}
 	return b
 }

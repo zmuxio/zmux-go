@@ -2,238 +2,313 @@ package machine
 
 import (
 	crand "crypto/rand"
-	"math"
+	"encoding/json"
+	"math/bits"
 	"math/rand/v2"
 )
 
-// keeper holds sampled values per scope.
-type keeper interface {
-	kept(v *Value) (float64, bool)
-	keep(v *Value, x float64)
-}
+// family is the range of a kind of value.
+type family struct{ lo, hi uint64 }
 
-// drawer samples Values from a random source; it holds the state of bags.
-type drawer struct {
-	r *rand.Rand
-	keeper
-	bags map[*Value][]float64
-}
-
-// newRand returns a generator on src, or on a ChaCha8 source seeded from
-// crypto/rand when src is nil.
-func newRand(src rand.Source) *rand.Rand {
-	if src == nil {
-		var seed [32]byte
-		_, _ = crand.Read(seed[:])
-		src = rand.NewChaCha8(seed)
-	}
-	return rand.New(src)
-}
-
-// sample returns v, kept per its scope.
-func (s *drawer) sample(v *Value) float64 {
-	if x, ok := s.kept(v); ok {
-		return x
-	}
-	x := s.draw(v)
-	s.keep(v, x)
-	return x
-}
-
-// draw samples v and applies its bounds.
-func (s *drawer) draw(v *Value) float64 {
-	var x float64
-	switch {
-	case v.Const != nil:
-		x = *v.Const
-	case v.Range != nil:
-		x = v.Range[0] + (v.Range[1]-v.Range[0])*s.r.Float64()
-	default:
-		x = s.dist(v)
-	}
-	if v.Min != nil {
-		x = math.Max(x, *v.Min)
-	}
-	if v.Max != nil {
-		x = math.Min(x, *v.Max)
-	}
-	return x
-}
-
-func (s *drawer) dist(v *Value) float64 {
-	d, r := v.Dist, s.r
-	p := d.Params
-	u := func() float64 { return 1 - r.Float64() } // (0, 1]
-	switch d.Kind {
-	case DistUniform:
-		return p[0] + (p[1]-p[0])*r.Float64()
-	case DistLogUniform:
-		return math.Exp(math.Log(p[0]) + (math.Log(p[1])-math.Log(p[0]))*r.Float64())
-	case DistExponential:
-		return r.ExpFloat64() / p[0]
-	case DistNormal:
-		return p[0] + p[1]*r.NormFloat64()
-	case DistLogNormal:
-		return math.Exp(p[0] + p[1]*r.NormFloat64())
-	case DistWeibull:
-		return p[0] * math.Pow(-math.Log(u()), 1/p[1])
-	case DistPareto:
-		return p[0] / math.Pow(u(), 1/p[1])
-	case DistGamma:
-		x, _ := s.gammaLog(p[0])
-		return x * p[1]
-	case DistBeta:
-		x, lx := s.gammaLog(p[0])
-		y, ly := s.gammaLog(p[1])
-		if t := x + y; t > 0 && !math.IsInf(t, 0) {
-			return x / t
-		}
-		// Both variates underflowed (small shapes): their ratio from the
-		// logarithms.
-		return 1 / (1 + math.Exp(ly-lx))
-	case DistGeometric:
-		if p[0] == 1 {
-			return 1
-		}
-		return math.Ceil(math.Log(u()) / math.Log(1-p[0]))
-	case DistBinomial:
-		return s.binomial(p[0], p[1])
-	case DistPoisson:
-		return s.poisson(p[0])
-	case DistEmpirical:
-		return d.Points[s.pick(d.Weights)]
-	case DistBag:
-		b := s.bags[v]
-		if len(b) == 0 {
-			if s.bags == nil {
-				s.bags = map[*Value][]float64{}
-			}
-			b = append(b[:0], d.Points...)
-		}
-		i := r.IntN(len(b))
-		x := b[i]
-		b[i] = b[len(b)-1]
-		s.bags[v] = b[:len(b)-1]
-		return x
-	}
-	return s.sample(&d.Of[s.pick(d.Weights)]) // mixture
-}
-
-// maxCount is the largest Binomial trial count and Poisson mean accepted:
-// 2^53, beyond which counts are not exact in a float64.
 const maxCount = 1 << 53
 
-// directTrials is the most trials a binomial sample takes one by one;
-// directMean the largest mean a Poisson sample takes by the product of
-// uniforms.
-const (
-	directTrials = 64
-	directMean   = 30
+var (
+	famLength    = family{0, 1<<31 - 1}
+	famTime      = family{0, 1_000_000_000_000_000}
+	famPPM       = family{0, 1_000_000}
+	famWeight    = family{0, 1<<32 - 1}
+	famCounter   = family{0, maxCount}
+	famRate      = family{0, 1 << 43}
+	famPoolCount = family{1, maxCount}
 )
 
-// binomial samples Binomial(n, p) for an integral n in [0, 2^53] (Knuth,
-// TAOCP 3.4.1 F): while n is large, the median order statistic of n
-// uniforms, a Beta variate, halves the trials; O(log n) steps, then at
-// most directTrials Bernoulli trials.
-func (s *drawer) binomial(n, p float64) float64 {
-	k := 0.0
-	for n > directTrials {
-		// Exact at the ends, where a rounded Beta variate could skip trials.
-		if p <= 0 {
-			return k
+type scope uint8
+
+const (
+	scopeEach scope = iota
+	scopePipe
+	scopeShared
+	scopeSession
+)
+
+// seg is one segment of a table.
+type seg struct{ w, lo, hi uint64 }
+
+// value is a parsed value: a constant, or a table with a scope. A value
+// resolved at compile time is a constant in the compiled copy.
+type value struct {
+	segs  []seg // nil: the constant c
+	cum   []uint64
+	total uint64
+	low   uint64 // the least segment bound
+	c     uint64
+	sc    scope
+	set   bool
+	slot  int32 // scopePipe: its place in the pipe's slots
+}
+
+// minBinary is the smallest number of segments searched by bisection.
+const minBinary = 8
+
+// table is a parsed list of segments. References share it; it is not changed.
+type table struct {
+	segs   []seg
+	cum    []uint64
+	total  uint64
+	lo, hi uint64 // over every segment, those of weight 0 included
+}
+
+// tables is the state of parsing one candidate: its table sources, those parsed so
+// far, its limits and what it has used of them.
+type tables struct {
+	raw    map[string]json.RawMessage
+	parsed map[string]*table
+	l      SizeLimits
+	bytes  int
+	slots  int64
+	budget bool // parsing a budget: its tables have scope session
+}
+
+// named returns the table called name, parsed at its first reference.
+func (t *tables) named(name, what string) (*table, error) {
+	if t == nil {
+		return nil, fail("table", "%q", name)
+	}
+	if tb, ok := t.parsed[name]; ok {
+		return tb, nil
+	}
+	b, ok := t.raw[name]
+	if !ok {
+		return nil, fail("table", "%q", name)
+	}
+	if err := t.useBytes(len(b)); err != nil {
+		return nil, err
+	}
+	x, err := decode(b)
+	if err != nil {
+		return nil, err
+	}
+	tb, err := t.segments(x, what)
+	if err != nil {
+		return nil, err
+	}
+	if t.parsed == nil {
+		t.parsed = map[string]*table{}
+	}
+	t.parsed[name] = tb
+	return tb, nil
+}
+
+// useBytes counts n JSON bytes against MaxBytes.
+func (t *tables) useBytes(n int) error {
+	t.bytes += n
+	if m := t.l.MaxBytes; m > 0 && t.bytes > m {
+		return fail("limit", "%d bytes, limit %d", t.bytes, m)
+	}
+	return nil
+}
+
+// useSlots counts a machine's counters and timers against MaxSlots.
+func (t *tables) useSlots(n int) error {
+	t.slots += int64(n)
+	if m := t.l.maxSlots(); m >= 0 && t.slots > m {
+		return fail("limit", "%d counters and timers, limit %d", t.slots, m)
+	}
+	return nil
+}
+
+// segments reads a list of segments. Its count is checked before anything is made
+// of it.
+func (t *tables) segments(x any, what string) (*table, error) {
+	a, ok := x.([]any)
+	if !ok || len(a) == 0 {
+		return nil, fail("type", "%s: segments", what)
+	}
+	if t != nil && t.l.MaxSegments > 0 && len(a) > t.l.MaxSegments {
+		return nil, fail("limit", "%s: %d segments", what, len(a))
+	}
+	tb := &table{segs: make([]seg, len(a)), lo: maxCount}
+	for i, s := range a {
+		q, ok := s.([]any)
+		if !ok || len(q) != 3 {
+			return nil, fail("type", "%s: segment", what)
 		}
-		if p >= 1 {
-			return k + n
+		var n [3]int64
+		var err error
+		for j := range n {
+			if n[j], err = integer(q[j], what); err != nil {
+				return nil, err
+			}
 		}
-		a := 1 + math.Floor(n/2)
-		b := n + 1 - a
-		x := s.gamma(a)
-		x /= x + s.gamma(b)
-		if x >= p {
-			n, p = a-1, p/x
+		if n[0] < 0 || n[0] > 1<<32-1 || n[1] < 0 || n[1] > n[2] || n[2] > maxCount {
+			return nil, fail("range", "%s: segment %v", what, n)
+		}
+		tb.segs[i] = seg{uint64(n[0]), uint64(n[1]), uint64(n[2])}
+		tb.total += uint64(n[0])
+		tb.lo, tb.hi = min(tb.lo, uint64(n[1])), max(tb.hi, uint64(n[2]))
+	}
+	if tb.total == 0 {
+		return nil, fail("range", "%s: total weight 0", what)
+	}
+	if len(tb.segs) >= minBinary {
+		tb.cum = make([]uint64, len(tb.segs))
+		var acc uint64
+		for i := range tb.segs {
+			acc += tb.segs[i].w
+			tb.cum[i] = acc
+		}
+	}
+	return tb, nil
+}
+
+func parseValue(x any, f family, t *tables, allowPipe bool, what string) (value, error) {
+	if _, ok := x.(json.Number); ok {
+		n, err := integer(x, what)
+		if err != nil {
+			return value{}, err
+		}
+		if n < 0 || uint64(n) < f.lo || uint64(n) > f.hi {
+			return value{}, fail("range", "%s: %d", what, n)
+		}
+		return value{c: uint64(n), set: true}, nil
+	}
+	o, err := members(x, what, "t", "scope")
+	if err != nil {
+		return value{}, err
+	}
+	raw, err := required(o, "t", what)
+	if err != nil {
+		return value{}, err
+	}
+	v := value{set: true}
+	switch s := o.get("scope").(type) {
+	case nil:
+	case string:
+		switch s {
+		case "each":
+			v.sc = scopeEach
+		case "pipe":
+			v.sc = scopePipe
+		case "shared":
+			v.sc = scopeShared
+		case "session":
+			v.sc = scopeSession
+		default:
+			return value{}, fail("type", "%s: scope %q", what, s)
+		}
+	default:
+		return value{}, fail("type", "%s: scope", what)
+	}
+	if v.sc == scopePipe && !allowPipe {
+		return value{}, fail("scope", "%s: scope pipe", what)
+	}
+	if v.sc == scopeSession && (t == nil || !t.budget) {
+		return value{}, fail("scope", "%s: scope session", what)
+	}
+	if v.sc != scopeSession && t != nil && t.budget {
+		return value{}, fail("scope", "%s: only scope session", what)
+	}
+	var tb *table
+	if name, ok := raw.(string); ok {
+		tb, err = t.named(name, what)
+	} else {
+		tb, err = t.segments(raw, what)
+	}
+	if err != nil {
+		return value{}, err
+	}
+	if tb.lo < f.lo || tb.hi > f.hi {
+		return value{}, fail("range", "%s: segments in [%d, %d]", what, tb.lo, tb.hi)
+	}
+	v.segs, v.cum, v.total, v.low = tb.segs, tb.cum, tb.total, tb.lo
+	return v, nil
+}
+
+// lower is the least value v can state, segments of weight 0 included.
+func (v *value) lower() uint64 {
+	if v.segs == nil {
+		return v.c
+	}
+	return v.low
+}
+
+func mulhi64(a, b uint64) uint64 {
+	hi, _ := bits.Mul64(a, b)
+	return hi
+}
+
+// drawTable draws from the table of v; a constant takes nothing.
+func (v *value) drawTable(src rand.Source) uint64 {
+	segs := v.segs
+	if segs == nil {
+		return v.c
+	}
+	i := 0
+	if len(segs) > 1 {
+		c := mulhi64(src.Uint64(), v.total)
+		if v.cum != nil {
+			lo, hi := 0, len(segs)-1
+			for lo < hi {
+				m := int(uint(lo+hi) >> 1)
+				if c < v.cum[m] {
+					hi = m
+				} else {
+					lo = m + 1
+				}
+			}
+			i = lo
 		} else {
-			k += a
-			n, p = b-1, (p-x)/(1-x)
+			var acc uint64
+			for i = 0; i < len(segs)-1; i++ {
+				acc += segs[i].w
+				if c < acc {
+					break
+				}
+			}
 		}
 	}
-	for i := 0.0; i < n; i++ {
-		if s.r.Float64() < p {
-			k++
-		}
+	s := &segs[i]
+	if s.lo == s.hi {
+		return s.lo
 	}
-	return k
+	return s.lo + mulhi64(src.Uint64(), s.hi-s.lo+1)
 }
 
-// poisson samples Poisson(mean) for a mean in (0, 2^53] (Knuth, TAOCP
-// 3.4.1 F): while the mean is large, a Gamma variate takes 7/8 of it at
-// once, or the rest is binomial; O(log mean) steps, then the product of
-// uniforms for a mean of at most directMean.
-func (s *drawer) poisson(mean float64) float64 {
-	k := 0.0
-	for mean > directMean {
-		m := math.Floor(mean * 7 / 8)
-		x := s.gamma(m)
-		if x >= mean {
-			return k + s.binomial(m-1, mean/x)
-		}
-		k += m
-		mean -= x
+// resolved is v with a shared table drawn into a constant.
+func (v *value) resolved(src rand.Source, order *[]uint64) value {
+	if v.sc != scopeShared || v.segs == nil {
+		return *v
 	}
-	l, t := math.Exp(-mean), s.r.Float64()
-	for t > l {
-		k++
-		t *= s.r.Float64()
-	}
-	return k
+	x := v.drawTable(src)
+	*order = append(*order, x)
+	return value{c: x, set: true}
 }
 
-func (s *drawer) pick(w []float64) int {
-	t := 0.0
-	for _, x := range w {
-		t += x
+// probTrue is the draw of a probability of p parts per million.
+func probTrue(p uint64, src rand.Source) bool {
+	if p == 0 {
+		return false
 	}
-	t *= s.r.Float64()
-	for i, x := range w {
-		if t < x {
-			return i
-		}
-		t -= x
+	if p >= 1_000_000 {
+		return true
 	}
-	return len(w) - 1
+	return mulhi64(src.Uint64(), 1_000_000) < p
 }
 
-// gamma samples Gamma(a, 1) (Marsaglia and Tsang).
-func (s *drawer) gamma(a float64) float64 {
-	x, _ := s.gammaLog(a)
-	return x
+// jitterScale is floor(2^64 / 10^6).
+const jitterScale = 18446744073709
+
+// jitterWith reduces x by up to j parts per million under the draw u.
+func jitterWith(x uint64, j uint32, u uint64) uint64 {
+	m := mulhi64(x, uint64(j)*jitterScale)
+	return x - mulhi64(u, m+1)
 }
 
-// gammaLog samples Gamma(a, 1) and returns it with its logarithm, which
-// stays finite for a shape below 1 where the variate underflows to 0.
-func (s *drawer) gammaLog(a float64) (x, lx float64) {
-	if a < 1 {
-		g := s.gamma(a + 1)
-		u := 1 - s.r.Float64()
-		return g * math.Pow(u, 1/a), math.Log(g) + math.Log(u)/a
-	}
-	x = s.gamma1(a)
-	return x, math.Log(x)
-}
+type cryptoSeeded struct{ *rand.ChaCha8 }
 
-// gamma1 samples Gamma(a, 1) for a shape of at least 1.
-func (s *drawer) gamma1(a float64) float64 {
-	d := a - 1.0/3
-	c := 1 / math.Sqrt(9*d)
-	for {
-		x := s.r.NormFloat64()
-		v := 1 + c*x
-		if v <= 0 {
-			continue
-		}
-		v = v * v * v
-		u := 1 - s.r.Float64()
-		if math.Log(u) < 0.5*x*x+d-d*v+d*math.Log(v) {
-			return d * v
-		}
-	}
+// newSource returns a ChaCha8 generator seeded from crypto/rand.
+func newSource() rand.Source {
+	var seed [32]byte
+	_, _ = crand.Read(seed[:])
+	return cryptoSeeded{rand.NewChaCha8(seed)}
 }

@@ -7,7 +7,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // countConn counts the writes on a carrier.
@@ -67,22 +70,24 @@ func TestSetLivenessValidation(t *testing.T) {
 // A keep-alive period turned on while the session runs takes effect at
 // once on an idle session.
 func TestSetLivenessKeepAliveRuns(t *testing.T) {
-	a, b := tcpPair(t)
-	cc := &countConn{Conn: a}
-	c, _ := pair(t, cc, b, &Config{KeepAlivePeriod: -1}, &Config{KeepAlivePeriod: -1})
-	time.Sleep(200 * time.Millisecond)
-	cc.n.Store(0)
-	time.Sleep(1200 * time.Millisecond)
-	if n := cc.n.Load(); n != 0 {
-		t.Fatalf("%d writes with keep-alive off", n)
-	}
-	if err := c.SetLiveness(Liveness{KeepAlivePeriod: time.Second, NoProbeJitter: true}); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(2500 * time.Millisecond)
-	if n := cc.n.Load(); n < 2 {
-		t.Fatalf("%d writes in 2.5 s with a 1 s keep-alive", n)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		cc := &countConn{Conn: a}
+		c, _ := pair(t, cc, b, &Config{KeepAlivePeriod: -1, Clock: timeshim.Real}, &Config{KeepAlivePeriod: -1, Clock: timeshim.Real})
+		synctest.Sleep(200 * time.Millisecond)
+		cc.n.Store(0)
+		synctest.Sleep(1200 * time.Millisecond)
+		if n := cc.n.Load(); n != 0 {
+			t.Fatalf("%d writes with keep-alive off", n)
+		}
+		if err := c.SetLiveness(Liveness{KeepAlivePeriod: time.Second, NoProbeJitter: true}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Sleep(2500 * time.Millisecond)
+		if n := cc.n.Load(); n < 2 {
+			t.Fatalf("%d writes in 2.5 s with a 1 s keep-alive", n)
+		}
+	})
 }
 
 // Pipe.SetLiveness validates as PipeOptions does and fails on a retired

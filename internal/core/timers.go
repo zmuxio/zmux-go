@@ -76,9 +76,16 @@ func (s *Session) HandleTimeout(now Time) {
 		}
 	}
 	if now >= s.timers.linger {
-		s.timers.linger = Never
-		s.finishClose()
-		return
+		if s.state == StateClosing && s.closeFr.sentAll && !s.closeFr.lingering {
+			// Step 1's wait ended without every carrier taking
+			// CONNECTION_CLOSE: linger from now, once.
+			s.closeFr.lingering = true
+			s.timers.linger = now.Add(s.lingerTimeout())
+		} else {
+			s.timers.linger = Never
+			s.finishClose()
+			return
+		}
 	}
 	if s.closeFr.waitLanes && now >= s.timers.laneWait {
 		s.closeFr.waitLanes = false
@@ -89,7 +96,7 @@ func (s *Session) HandleTimeout(now Time) {
 	}
 	s.laneTimeouts(now, true)
 	if s.state == StateSuspended && now >= s.timers.grace {
-		// Grace expiry (RESUME.md 8): CONNECTION_CLOSE on any live
+		// Grace expiry: CONNECTION_CLOSE on any live
 		// outbound pipe, otherwise a local close.
 		s.timers.grace = Never
 		s.closeWith(&SessionError{Kind: CloseResumeTimeout, Cause: s.lastPipeErr()},
@@ -127,7 +134,7 @@ func (s *Session) HandleTimeout(now Time) {
 	}
 }
 
-// keepAliveAt returns when the next keep-alive falls due (SPEC.md 6.4):
+// keepAliveAt returns when the next keep-alive falls due:
 // the period k is KeepAlive capped at half the effective idle timeout, and
 // each restart of the timer draws its wait from [k x (1 - j), k] with the
 // probe jitter j.
@@ -152,7 +159,7 @@ func (s *Session) keepAliveAt() (Time, bool) {
 	return tm.lastActivity.Add(k), true
 }
 
-// idleExpired closes on the idle timeout (SPEC.md 6.4).
+// idleExpired closes on the idle timeout.
 func (s *Session) idleExpired() {
 	e := &SessionError{Kind: CloseIdle}
 	if s.feat.Acked() {

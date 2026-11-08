@@ -35,7 +35,7 @@ func decideWith(v Verdict, n *atomic.Int32) *Admission {
 func TestAdmissionEveryEntry(t *testing.T) {
 	leakcheck.Check(t)
 	var decided atomic.Int32
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: decideWith(VerdictClose, &decided)})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: decideWith(VerdictClose, &decided)})
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -79,7 +79,7 @@ func TestAdmissionEveryEntry(t *testing.T) {
 	expect("tls")
 	// HandlePipe.
 	a, b := net.Pipe()
-	_ = lst.HandlePipe(ctx, NetPipe(a), JoinHint{})
+	_ = lst.HandlePipe(ctx, NetPipe(a), PipeHint{})
 	_ = b.Close()
 	expect("HandlePipe")
 	// HTTP carriers and the exchange carrier.
@@ -119,7 +119,7 @@ func TestAdmissionEveryEntry(t *testing.T) {
 	}
 }
 
-// TestAdmissionSource checks the one source of a carrier: JoinHint.Source
+// TestAdmissionSource checks the one source of a carrier: PipeHint.Source
 // given to HandlePipe, or the peer, is CarrierInfo.Source, and the
 // per-source limit counts it, whatever the peer.
 func TestAdmissionSource(t *testing.T) {
@@ -134,14 +134,14 @@ func TestAdmissionSource(t *testing.T) {
 		}
 		return Decision{Verdict: VerdictClose}
 	}}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, MaxPendingPerSource: 1})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, MaxPendingPerSource: 1})
 	defer func() { _ = lst.Close() }()
 	ctx := context.Background()
 	src := netip.MustParseAddrPort("203.0.113.7:0")
 	peer := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1000}
 	a, b := net.Pipe()
 	done := make(chan struct{})
-	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{a, peer}), JoinHint{Source: src}); close(done) }()
+	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{a, peer}), PipeHint{Source: src}); close(done) }()
 	info := <-infos
 	if info.Source != src || info.Peer != netip.MustParseAddrPort("192.0.2.1:1000") {
 		t.Fatalf("source %v, peer %v", info.Source, info.Peer)
@@ -149,16 +149,16 @@ func TestAdmissionSource(t *testing.T) {
 	// Another peer, the same source: refused at once, undecided.
 	c, d := net.Pipe()
 	other := &net.TCPAddr{IP: net.ParseIP("198.51.100.1"), Port: 1}
-	if err := lst.HandlePipe(ctx, NetPipe(addrConn{c, other}), JoinHint{Source: netip.MustParseAddrPort("203.0.113.7:9")}); err == nil {
+	if err := lst.HandlePipe(ctx, NetPipe(addrConn{c, other}), PipeHint{Source: netip.MustParseAddrPort("203.0.113.7:9")}); err == nil {
 		t.Fatal("a second carrier of a full source was taken")
 	}
 	if _, err := d.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("refused carrier: %v", err)
 	}
-	// Without JoinHint.Source the peer is the source.
+	// Without PipeHint.Source the peer is the source.
 	e, f := net.Pipe()
 	done2 := make(chan struct{})
-	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{e, other}), JoinHint{}); close(done2) }()
+	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{e, other}), PipeHint{}); close(done2) }()
 	if info := <-infos; info.Source != netip.MustParseAddrPort("198.51.100.1:1") || info.Peer != info.Source {
 		t.Fatalf("source %v, peer %v", info.Source, info.Peer)
 	}
@@ -179,7 +179,7 @@ func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 	leakcheck.Check(t)
 	srvTLS, _ := selfSignedTLS(t)
 	var decided atomic.Int32
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: decideWith(VerdictClose, &decided), MaxPendingPerSource: 2})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: decideWith(VerdictClose, &decided), MaxPendingPerSource: 2})
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -189,11 +189,9 @@ func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 	for range 2 { // silent clients: their handshakes never finish
 		a, b := net.Pipe()
 		clients = append(clients, b)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), JoinHint{})
-		}()
+		wg.Go(func() {
+			_ = lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), PipeHint{})
+		})
 	}
 	waitUntil(t, 5*time.Second, "two slots", func() bool {
 		lst.mu.Lock()
@@ -201,7 +199,7 @@ func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 		return lst.pending.Held(sourceKey(netip.MustParseAddrPort("192.0.2.1:1"))) == 2
 	})
 	a, b := net.Pipe()
-	if err := lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), JoinHint{}); err == nil {
+	if err := lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), PipeHint{}); err == nil {
 		t.Fatal("a third carrier of the source was taken")
 	}
 	if _, err := b.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
@@ -224,7 +222,7 @@ func TestAdmissionStats(t *testing.T) {
 	ctx := context.Background()
 	run := func(adm *Admission, fallback func(context.Context, net.Conn), send []byte, tlsServer bool) ListenerStats {
 		t.Helper()
-		lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, Fallback: fallback})
+		lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, Fallback: fallback})
 		defer func() { _ = lst.Close() }()
 		a, b := net.Pipe()
 		go func() {
@@ -239,7 +237,7 @@ func TestAdmissionStats(t *testing.T) {
 			p = NetPipe(tls.Server(a, srvTLS))
 			go func() { _ = b.Close() }()
 		}
-		_ = lst.HandlePipe(ctx, p, JoinHint{})
+		_ = lst.HandlePipe(ctx, p, PipeHint{})
 		_ = b.Close()
 		return lst.Stats()
 	}
@@ -300,11 +298,11 @@ func newFakeEnv(t *testing.T, adm *Admission, firstRecord time.Duration) *fakeEn
 	clk := timeshim.NewFake(time.Unix(1767225600, 0))
 	cfg := mpConfig()
 	cfg.Clock = clk
-	e := &fakeEnv{clk: clk, lst: NewListener(&ListenerConfig{Config: cfg, Admission: adm, FirstRecordTimeout: firstRecord}),
+	e := &fakeEnv{clk: clk, lst: mustNewListener(&ListenerConfig{Config: cfg, Admission: adm, FirstRecordTimeout: firstRecord}),
 		done: make(chan struct{})}
 	a, b := net.Pipe()
 	e.peer = b
-	go func() { _ = e.lst.HandlePipe(context.Background(), NetPipe(a), JoinHint{}); close(e.done) }()
+	go func() { _ = e.lst.HandlePipe(context.Background(), NetPipe(a), PipeHint{}); close(e.done) }()
 	t.Cleanup(func() { _ = b.Close(); _ = e.lst.Close() })
 	return e
 }
@@ -404,11 +402,11 @@ func TestAdmissionDecideCancel(t *testing.T) {
 		errc <- ctx.Err()
 		return Decision{}
 	}}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
 	a, b := net.Pipe()
 	defer func() { _ = b.Close() }()
 	done := make(chan error, 1)
-	go func() { done <- lst.HandlePipe(context.Background(), NetPipe(a), JoinHint{}) }()
+	go func() { done <- lst.HandlePipe(context.Background(), NetPipe(a), PipeHint{}) }()
 	<-started
 	_ = lst.Close()
 	if err := <-errc; !errors.Is(err, context.Canceled) {
@@ -433,7 +431,7 @@ func TestShutdownKeepsJoins(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	lst := NewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	served := make(chan error, 1)
 	go func() { served <- lst.Serve(ctx, ln) }()
 	dial := func() net.Conn {
@@ -481,9 +479,7 @@ func TestShutdownKeepsJoins(t *testing.T) {
 	if _, err := c.AddPipe(ctx, NetPipe(dial()), PipeOptions{}); err != nil {
 		t.Fatalf("join during Shutdown: %v", err)
 	}
-	if lst.Stats().Joins != 1 {
-		t.Fatalf("stats %+v", lst.Stats())
-	}
+	waitUntil(t, 5*time.Second, "the join counted", func() bool { return lst.Stats().Joins == 1 })
 	// The stream ends, the session with it, and Shutdown closes the listener.
 	_ = st.Close()
 	_, _ = io.ReadAll(ss)
@@ -500,7 +496,7 @@ func TestShutdownKeepsJoins(t *testing.T) {
 	waitDone(t, c)
 	a, b := net.Pipe()
 	defer func() { _ = b.Close() }()
-	if err := lst.HandlePipe(ctx, NetPipe(a), JoinHint{}); err == nil {
+	if err := lst.HandlePipe(ctx, NetPipe(a), PipeHint{}); err == nil {
 		t.Fatal("a closed listener took a carrier")
 	}
 }

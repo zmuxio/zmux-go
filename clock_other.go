@@ -4,4 +4,7 @@ package zmux
 
 import "time"
 
-func monoSince(base time.Time) int64 { return int64(time.Since(base)) }
+var monoBase = time.Now()
+
+// monoNow reads the host's monotonic clock, from an arbitrary origin.
+func monoNow() int64 { return int64(time.Since(monoBase)) }

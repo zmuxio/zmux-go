@@ -11,7 +11,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-// TLV is an application TLV of a stream's preamble (EXTENSIONS.md 4.3).
+// TLV is an application TLV of a stream's preamble.
 type TLV struct {
 	Type  uint64
 	Value []byte
@@ -505,6 +505,19 @@ func (s *Stream) ReadFrom(r io.Reader) (int64, error) {
 func (s *Stream) SendDatagram(contextID uint64, p []byte) error {
 	defer runtime.KeepAlive(s)
 	return s.h.sendDatagram(contextID, p)
+}
+
+// MaxDatagramPayload returns the largest stream datagram payload, with
+// context identifier contextID, the peer accepts now; 0 when it accepts
+// none on this stream. Before the stream has its identifier (it is
+// assigned when the stream is announced) the value assumes the longest
+// identifier encoding and may grow by a few bytes afterwards.
+func (s *Stream) MaxDatagramPayload(contextID uint64) int {
+	defer runtime.KeepAlive(s)
+	c := s.h.c
+	c.lock()
+	defer c.unlock()
+	return c.s.StreamMaxDatagramPayload(s.h.st, contextID)
 }
 
 // SendDatagramWait sends a stream datagram like SendDatagram, waiting for

@@ -23,6 +23,7 @@ import (
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 // Admission is a decision taken on a new carrier before any byte is sent on
@@ -91,10 +92,22 @@ type admParams struct {
 type CarrierInfo struct {
 	// Source is the carrier's client address: what a trusted intermediary
 	// reports (TrustedProxies; port 0 when it reports none), what the
-	// host gave as JoinHint.Source, and otherwise Peer. The listener's
+	// host gave as PipeHint.Source, and otherwise Peer. The listener's
 	// per-source limits and the stall duration count it aggregated: an
 	// IPv6 address to its /64 prefix, the port ignored.
 	Source netip.AddrPort
+	// HasExporter, Secure, Label and IsFirstPipe describe a carrier to RecordPolicy and
+	// AllowRecordMode: whether it has an exporter, declares the Bound contract
+	// (CarrierSecure), its label, and whether it is the session's first pipe.
+	Label               string
+	HasExporter, Secure bool
+	IsFirstPipe         bool
+	// Head marks a carrier decided on its HTTP request head, before any
+	// body byte is read: an HTTP upgrade such as WebSocket or
+	// WebTransport, an exchange carrier, or an HTTP request carrier
+	// without a body, such as a downlink GET. There is no prefix, and a
+	// credential travels in a request header field.
+	Head bool
 	// Peer is the address the carrier arrived from: the remote address of
 	// its connection, or an HTTP request's RemoteAddr. Zero when it is not
 	// an IP address and port, such as a Unix socket.
@@ -108,12 +121,6 @@ type CarrierInfo struct {
 	// Request is the request of an HTTP carrier. Its body must not be read
 	// by Decide; the bytes the listener read are the prefix.
 	Request *http.Request
-	// Head marks a carrier decided on its HTTP request head, before any
-	// body byte is read: an HTTP upgrade such as WebSocket or
-	// WebTransport, an exchange carrier, or an HTTP request carrier
-	// without a body, such as a downlink GET. There is no prefix, and a
-	// credential travels in a request header field.
-	Head bool
 }
 
 // Verdict is the outcome of an admission.
@@ -159,7 +166,7 @@ type Decision struct {
 	Skip int
 	// Value is the host's value for an accepted carrier (VerdictAccept
 	// only; ignored otherwise): zmux hands it on without looking at it to
-	// WrapPipe (JoinHint.Admitted) and to the session (Conn.Admitted) or
+	// WrapPipe (PipeHint.Admitted) and to the session (Conn.Admitted) or
 	// pipe (Pipe.Admitted) the carrier makes, and holds it until their
 	// state is released. Whether a join comes from the same client as its
 	// session is the host's to decide: zmux compares no values.
@@ -195,7 +202,7 @@ type VariantStat struct {
 // of the host, never derived from what the peer sent.
 const MaxAdmissionVariants = 64
 
-// AdmissionStats are the outcomes of a listener's admission (API.md 7.2),
+// AdmissionStats are the outcomes of a listener's admission,
 // each carrier that took its source slot and whose outcome is known
 // counted once, so that the sum of the fields is the number of such
 // carriers. All are zero without an Admission.
@@ -325,7 +332,7 @@ func drawDuration(lo, hi time.Duration) time.Duration {
 }
 
 // sourceKey is the one aggregation of a source for the listener's
-// per-source state (MULTIPATH.md 5.6): an IPv6 address to its /64, an
+// per-source state: an IPv6 address to its /64, an
 // IPv4 address itself, the port ignored; "" for an invalid address.
 func sourceKey(src netip.AddrPort) string {
 	if !src.IsValid() {
@@ -430,7 +437,14 @@ func (l *Listener) Arrive(source, peer netip.AddrPort) (*Arrival, error) {
 	l.mu.Lock()
 	closed := l.closed
 	ok := !closed && l.pending.Enter(key)
+	var watch func()
+	if ok {
+		watch = l.startWatchLocked()
+	}
 	l.mu.Unlock()
+	if watch != nil {
+		watch()
+	}
 	if !ok {
 		l.st.refused.Add(1)
 		if closed {
@@ -519,7 +533,7 @@ func (a *Arrival) accept() {
 // and further ones only once it has been accepted (Admitted): first
 // carriers handed on concurrently are each admitted on their own, with a
 // decision each.
-func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) error {
+func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error {
 	l := a.l
 	if err := p.checkOverhead(); err != nil {
 		a.Release()
@@ -534,7 +548,7 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) error
 			p = q
 			a.accept()
 		case VerdictFallback:
-			if nc, ok := p.R.(net.Conn); ok && any(p.W) == any(p.R) && l.cfg.Fallback != nil {
+			if nc, ok := p.R.(net.Conn); ok && sameHalf(p.W, p.R) && l.cfg.Fallback != nil {
 				a.Release()
 				l.cfg.Fallback(ctx, PrefixedConn(nc, prefix))
 				return errRejected
@@ -546,9 +560,12 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint JoinHint) error
 		}
 	}
 	if !a.takeSlot() {
-		closePipeIO(p)
 		l.st.refused.Add(1)
-		return errRefused
+		if l.isClosed() {
+			closePipeIO(p)
+			return errRefused
+		}
+		return l.refusePending(ctx, p, a.src, a.peer)
 	}
 	hint.Source = a.src
 	a.mu.Lock()
@@ -793,14 +810,12 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 // returned after that is not used, however the select chose).
 func (a *Arrival) callDecide(dctx context.Context, info *CarrierInfo, prefix []byte) (Decision, bool) {
 	res := make(chan Decision, 1)
-	go func() {
+	labels.Go(dctx, "admission", func() {
 		d := Decision{Verdict: VerdictClose}
-		defer func() {
-			_ = recover() // a panicking decision is VerdictClose
-			res <- d
-		}()
-		d = a.l.cfg.Admission.Decide(dctx, info, prefix)
-	}()
+		defer func() { res <- d }()
+		// A panicking decision is VerdictClose.
+		safeLog(a.l.cfg.Logger, "Admission.Decide", func() { d = a.l.cfg.Admission.Decide(dctx, info, prefix) })
+	})
 	var d Decision
 	select {
 	case d = <-res:

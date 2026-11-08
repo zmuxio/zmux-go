@@ -2,7 +2,7 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// Framing is a carrier's record framing (SPEC.md 3.1, 3.4).
+// Framing is a carrier's record framing.
 type Framing uint8
 
 const (
@@ -12,13 +12,15 @@ const (
 
 // CarrierInfo describes a carrier half to the core.
 type CarrierInfo struct {
-	Framing Framing
-	// TLS: build records of at most 16382 bytes of frames (SPEC.md 3.3).
+	// MaxRecord bounds the record size locally; 0: no bound.
+	MaxRecord int
+	Framing   Framing
+	// TLS: build records of at most 16382 bytes of frames.
 	TLS bool
 	// MinRTT reports whether the carrier provides a minimum RTT; without it
-	// the first record carries a QX_PING request (SPEC.md 8.3 rule 6).
+	// the first record carries a QX_PING request.
 	MinRTT bool
-	// Lanes: the carrier offers lanes (MULTIPATH.md 2.5).
+	// Lanes: the carrier offers lanes.
 	Lanes bool
 	// QueueBound: the carrier bounds its own queue, with a low-water mark
 	// or an unsent count; otherwise the carrier queue limiter
@@ -27,8 +29,8 @@ type CarrierInfo struct {
 	// WriteOverhead is the fixed number of bytes each carrier write adds
 	// below the pipe (PipeIO.WriteOverhead), handed to the shaper factory.
 	WriteOverhead int
-	// Channel is the carrier's datagram channel for the pipe (EXTENSIONS.md
-	// 6.8), nil when it has none.
+	// Channel is the carrier's datagram channel for the pipe,
+	// nil when it has none.
 	Channel Channel
 }
 
@@ -59,13 +61,13 @@ type Pipe struct {
 	carrier uint8
 	// chSig wakes the sender of the carrier's datagram channel.
 	chSig *Signal
-	// lastTraffic is when a record with a traffic frame (MULTIPATH.md
-	// 7.1) was last produced or completely received on the pipe.
+	// lastTraffic is when a record with a traffic frame
+	// was last produced or completely received on the pipe.
 	lastTraffic Time
 }
 
 // sinceTraffic is the time since a record with a traffic frame was sent
-// or completely received on p, or since p became live (API.md 4.5).
+// or completely received on p, or since p became live.
 func (s *Session) sinceTraffic(p *Pipe) Duration {
 	t := maxT(p.lastTraffic, s.start)
 	if p.mp != nil {
@@ -117,13 +119,12 @@ type inLane struct {
 	pos  uint64
 	info CarrierInfo
 	recs uint64
-	// Acknowledgement generation (MULTIPATH.md 6.3).
+	// Acknowledgement generation.
 	elicit     uint64 // ack-eliciting bytes since the last PIPE_ACK
 	elicitAt   Time   // when the first of them arrived
 	reported   uint64 // position last reported
 	posAt      Time   // when pos last advanced
 	expectLane bool   // the first record must start with PIPE_LANE
-	skipJoin   bool   // the first record starts with an already processed PIPE_JOIN
 	expectTP   bool   // the first record must start with QX_TRANSPORT_PARAMETERS
 	ended      bool
 }
@@ -133,17 +134,17 @@ type outDir struct {
 	lanes   []*outLane
 	snd     pipeSend
 	records uint64 // records written
+	q       pipeQuality
+	sig     *Signal
 	// The carrier's own retransmissions (SetCarrierRetransmitted) and the
 	// smoothed loss rate sampled from them.
 	retrans      uint64
-	retransKnown bool
 	lossRate     float64
-	lossHas      bool
 	lossAt       Time
 	lossSent     uint64 // BytesSent at lossAt
 	lossRetrans  uint64 // retrans at lossAt
-	q            pipeQuality
-	sig          *Signal
+	retransKnown bool
+	lossHas      bool
 	failed       bool
 }
 
@@ -157,13 +158,15 @@ type outLane struct {
 	stallAt     Time
 	tpSent      bool
 	closeSent   bool
+	closeDone   bool // the batch with CONNECTION_CLOSE was written (CloseHandedOff)
 	shut        bool
 	writing     bool       // a write call is in progress (since stallAt)
 	unsentKnown bool       // the adapter reports an unsent count for the lane
-	notWritable bool       // the carrier reports it accepts no bytes (since stallAt)
+	notWritable bool       // SetWritable reported the carrier accepts no bytes (since stallAt)
 	log         []retained // multipath retention
 	segs        []sendSeg  // unacknowledged bytes in send order
 	activity    []uint64   // end positions of records with activity frames
+	answers     []epochAck // records carrying a SESSION_EPOCH answer
 	boundSt     []*Stream  // stream directions bound to the lane
 	sig         *Signal    // wakes the lane's writer (lanes above 0; lane 0 uses the pipe's)
 	openedAt    Time
@@ -185,7 +188,7 @@ func (s *Session) AttachBootstrap(in, out CarrierInfo, writer *Signal) *Pipe {
 	s.pipes = append(s.pipes, p)
 	if l := &s.cfg.Local; l.Has&wire.HasDatagram != 0 && (out.Channel != nil || l.Has&wire.HasMultipath != 0) {
 		// A pipe carrier can have a datagram channel: the bootstrap's, or
-		// one a multipath session joins (EXTENSIONS.md 6.8).
+		// one a multipath session joins.
 		l.Has |= wire.HasCarrierDatagrams
 	}
 	s.wake(writer)
@@ -228,7 +231,11 @@ func (s *Session) SetWriterSignal(pipe uint64, sig *Signal) {
 }
 
 // SetWritable records whether a carrier half accepts bytes now; a carrier
-// that accepts none for T_suspect makes the pipe suspect (MULTIPATH.md 7.1).
+// that accepts none for T_suspect makes the pipe suspect. It is the input of a
+// carrier that reports writability before a write: the package's drivers
+// write with blocking calls and report a full carrier through the write in
+// progress (PollTransmit to WriteDone), which the scheduler treats the same
+// way, so only the conformance runner calls it.
 func (s *Session) SetWritable(pipe, lane uint64, writable bool, now Time) {
 	s.SetNow(now)
 	p := s.pipe(pipe)
@@ -258,3 +265,6 @@ func (s *Session) SetWritable(pipe, lane uint64, writable bool, now Time) {
 // stalled reports a lane that has bytes to hand over but whose carrier
 // takes none.
 func (ol *outLane) stalled() bool { return ol.writing || ol.notWritable }
+
+// epochAck is the end position of a record carrying the answer of epoch n.
+type epochAck struct{ pos, n uint64 }

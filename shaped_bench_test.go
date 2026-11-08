@@ -18,7 +18,7 @@ func writeCalls() (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, l := range bytes.Split(b, []byte("\n")) {
+	for l := range bytes.SplitSeq(b, []byte("\n")) {
 		if v, ok := bytes.CutPrefix(l, []byte("syscw: ")); ok {
 			n, err := strconv.ParseUint(string(v), 10, 64)
 			return n, err == nil
@@ -38,7 +38,7 @@ func BenchmarkBulkShaped(b *testing.B) {
 			seq = (seq*1103515245 + 12345) & 0x7fffffff
 			p.MaxLen = 100 + seq%601
 		}}
-	})
+	}, nil)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

@@ -21,7 +21,7 @@ func TestServeConnDialled(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), InstanceID: []byte("instance")})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), InstanceID: []byte("instance")})
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -104,7 +104,7 @@ func TestServeConnRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	_ = lst.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ var joinSecret = bytes.Repeat([]byte{9}, 32)
 
 func deferredConfig() *Config {
 	c := mpConfig()
-	c.PipeAuth = PipeAuth{DeferredPSK: true}
+	c.PipeAuth = PipeAuth{DeferredPSK: true, EndToEnd: true}
 	return c
 }
 
@@ -61,16 +62,16 @@ func TestJoinSecretBothDeferred(t *testing.T) {
 	e := newMPEnv(t, ccfg, scfg)
 	ln = e.ln
 	for _, c := range []*Conn{e.client, e.server} {
-		if st := c.ConnectionState(); !st.Multipath || !st.JoinSecretPending {
+		if st := c.ConnectionState(); !st.Multipath || !st.JoinPending {
 			t.Fatalf("state %+v", st)
 		}
 	}
-	if _, err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinSecretPending) {
+	if _, err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinPending) {
 		t.Fatalf("join before the secret: %v", err)
 	}
 	mustSet(t, e.client, joinSecret)
 	mustSet(t, e.server, joinSecret)
-	if e.client.ConnectionState().JoinSecretPending {
+	if e.client.ConnectionState().JoinPending {
 		t.Fatal("still pending")
 	}
 	if err := e.client.SetJoinSecret(joinSecret); !errors.Is(err, ErrJoinSecretSet) {
@@ -114,23 +115,23 @@ func TestJoinSecretServerLate(t *testing.T) {
 	mustSet(t, e.client, joinSecret)
 	done := make(chan error, 1)
 	go func() { _, err := e.tryPipe(5 * time.Second); done <- err }()
-	waitUntil(t, 5*time.Second, "held join", func() bool { return e.server.ConnectionStats().JoinSecretPending == 1 })
+	waitUntil(t, 5*time.Second, "held join", func() bool { return e.server.ConnectionStats().JoinPending == 1 })
 	mustSet(t, e.server, joinSecret)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if st := e.server.ConnectionStats(); st.JoinAuthFailures != 0 || st.JoinSecretPending != 1 {
+	if st := e.server.ConnectionStats(); st.JoinAuthFailures != 0 || st.JoinPending != 1 {
 		t.Fatalf("stats %+v", st)
 	}
 }
 
 // The server supplies it first: the client's joins fail with
-// ErrJoinSecretPending until it supplies its own.
+// ErrJoinPending until it supplies its own.
 func TestJoinSecretClientLate(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, deferredConfig(), deferredConfig())
 	mustSet(t, e.server, joinSecret)
-	if _, err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinSecretPending) {
+	if _, err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinPending) {
 		t.Fatalf("join before the client's secret: %v", err)
 	}
 	if e.client.JoinReady() {
@@ -160,7 +161,7 @@ func TestJoinSecretDeferredAndStatic(t *testing.T) {
 	scfg := mpConfig()
 	scfg.PipeAuth.PSK = joinSecret
 	e := newMPEnv(t, deferredConfig(), scfg)
-	if e.server.ConnectionState().JoinSecretPending {
+	if e.server.ConnectionState().JoinPending {
 		t.Fatal("static end pending")
 	}
 	mustSet(t, e.client, joinSecret)
@@ -169,39 +170,29 @@ func TestJoinSecretDeferredAndStatic(t *testing.T) {
 	}
 }
 
-// Without the peer's P the PSK is not selected: SetJoinSecret fails and
-// the exporter alone keys the joins.
-func TestJoinSecretNotSelected(t *testing.T) {
+// Secret Flags that differ close the session: a deferred PSK is never dropped for the
+// exporter alone.
+func TestJoinSecretFlagsDiffer(t *testing.T) {
 	leakcheck.Check(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	scfg := exporterConfig()
-	lst := NewListener(&ListenerConfig{Config: scfg})
+	lst := mustNewListener(&ListenerConfig{Config: scfg})
 	defer func() { _ = lst.Close() }()
 	ck, sk := kmPair("s0")
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, JoinHint{}) }()
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, PipeHint{}) }()
 	ccfg := exporterConfig()
 	ccfg.PipeAuth.DeferredPSK = true
 	c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, ccfg)
 	if err != nil {
-		t.Fatal(err)
+		if !strings.Contains(err.Error(), "TRANSPORT_PARAMETER_ERROR") {
+			t.Fatal(err)
+		}
+		return
 	}
-	s, err := lst.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
-	echoOnce(t, ctx, c, s)
-	if err := c.SetJoinSecret(joinSecret); !errors.Is(err, ErrNotNegotiated) {
-		t.Fatalf("SetJoinSecret without the peer's P: %v", err)
-	}
-	if c.ConnectionState().JoinSecretPending {
-		t.Fatal("pending without P")
-	}
-	cj, sj := kmPair("j")
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sj, W: sj}, JoinHint{}) }()
-	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{}); err != nil {
-		t.Fatal(err)
+	defer func() { _ = c.Close(); waitDone(t, c) }()
+	if err := c.Wait(); err == nil || !strings.Contains(err.Error(), "TRANSPORT_PARAMETER_ERROR") {
+		t.Fatalf("session end: %v", err)
 	}
 }
 
@@ -212,10 +203,10 @@ func TestJoinSecretWithExporter(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cfg := func() *Config { c := exporterConfig(); c.PipeAuth.DeferredPSK = true; return c }
-	lst := NewListener(&ListenerConfig{Config: cfg()})
+	lst := mustNewListener(&ListenerConfig{Config: cfg()})
 	defer func() { _ = lst.Close() }()
 	ck, sk := kmPair("s0")
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, JoinHint{}) }()
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, PipeHint{}) }()
 	c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, cfg())
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +217,7 @@ func TestJoinSecretWithExporter(t *testing.T) {
 	}
 	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
 	echoOnce(t, ctx, c, s)
-	if !c.ConnectionState().JoinSecretPending {
+	if !c.ConnectionState().JoinPending {
 		t.Fatal("not pending")
 	}
 	mustSet(t, c, joinSecret)
@@ -235,7 +226,7 @@ func TestJoinSecretWithExporter(t *testing.T) {
 		t.Fatalf("exporter read %d times", n)
 	}
 	cj, sj := kmPair("j")
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sj, W: sj}, JoinHint{}) }()
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sj, W: sj}, PipeHint{}) }()
 	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +254,7 @@ func TestJoinSecretHoldTimeout(t *testing.T) {
 	if n := read.Load(); n != 0 {
 		t.Fatalf("the held join was answered with %d bytes", n)
 	}
-	if st := e.server.ConnectionStats(); st.JoinSecretPending != 1 || st.JoinAuthFailures != 0 {
+	if st := e.server.ConnectionStats(); st.JoinPending != 1 || st.JoinAuthFailures != 0 {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -284,7 +275,6 @@ func TestJoinSecretConfig(t *testing.T) {
 	leakcheck.Check(t)
 	for _, a := range []PipeAuth{
 		{DeferredPSK: true, PSK: joinSecret},
-		{DeferredPSK: true, AllowInsecure: true},
 	} {
 		cfg := mpConfig()
 		cfg.PipeAuth = a

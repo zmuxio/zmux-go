@@ -1,34 +1,37 @@
 package conformance
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// specDir holds the specification's fixtures (testdata/spec/SOURCE names
-// their commit); localDir, when present, traces of local behaviour that
-// the specification leaves to implementations.
+// specDir holds the specification's public fixtures, copied unchanged
+// from the specification.
+// localDirs, when present, hold traces kept in the development repository
+// only: the specification's traces of the local sender policy and this
+// repository's own traces of local behaviour. A missing one is skipped.
 const (
-	specDir  = "../../testdata/spec/fixtures"
-	localDir = "../../testdata/local/traces"
-
-	specTraces  = 369
-	localTraces = 53
+	specDir    = "../../testdata/spec/fixtures"
+	specTraces = 372
 )
+
+var localDirs = []string{"../../testdata/local/spec-traces", "../../testdata/local/traces"}
 
 type profile struct {
 	TP     map[string]any `json:"tp"`
@@ -62,11 +65,6 @@ func loadProfiles(t *testing.T) map[string]profile {
 	return m
 }
 
-// enabled lists the trace id prefixes the implementation passes so far.
-var enabled = []string{"core.", "ext.", "compat.", "findings.", "multipath.", "resume."}
-
-var skipped = map[string]string{}
-
 var policyByName = map[string]core.Policy{"affinity": core.PolicyAffinity, "session-affinity": core.PolicySessionAffinity,
 	"spread-eta": core.PolicySpreadETA, "spread-round-robin": core.PolicySpreadRoundRobin,
 	"spread-rate-weighted": core.PolicySpreadRateWeighted}
@@ -90,10 +88,14 @@ func TestTraces(t *testing.T) {
 	if len(files) != specTraces {
 		t.Errorf("found %d specification traces, want %d", len(files), specTraces)
 	}
-	if _, err := os.Stat(localDir); err == nil {
-		local := traceFiles(localDir)
-		if len(local) != localTraces {
-			t.Errorf("found %d local traces, want %d", len(local), localTraces)
+	for _, dir := range localDirs {
+		if _, err := os.Stat(dir); err != nil {
+			t.Logf("%s absent: skipped", dir)
+			continue
+		}
+		local := traceFiles(dir)
+		if len(local) == 0 {
+			t.Errorf("%s holds no traces", dir)
 		}
 		files = append(files, local...)
 	}
@@ -108,15 +110,6 @@ func TestTraces(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Run(h.ID, func(t *testing.T) {
-			on := false
-			for _, p := range enabled {
-				if strings.HasPrefix(h.ID, p) {
-					on = true
-				}
-			}
-			if why, ok := skipped[h.ID]; ok || !on {
-				t.Skip("not enabled: " + why)
-			}
 			defer func() {
 				if p := recover(); p != nil {
 					t.Fatalf("panic: %v\n%s", p, debug.Stack())
@@ -155,6 +148,12 @@ type rpipe struct {
 	framing  core.Framing
 	in, out  bool
 	writable bool
+	// A local join: joining until the Reply; hello holds what JoinHello wrote and
+	// acc reads it as the peer (Hello last read).
+	joining bool
+	hello   []byte
+	acc     *join.Acceptor
+	replyIn []byte
 }
 
 func (p *rpipe) lane(l uint64) *rlane {
@@ -165,30 +164,35 @@ func (p *rpipe) lane(l uint64) *rlane {
 }
 
 type rcarrier struct {
-	name       string
-	via        string
-	dir        string
-	binding    []byte
-	pendJoin   *wire.Join
-	pendMac    []byte
-	conn       string
-	buf        []byte
-	pipe       uint64
-	lane       uint64
-	slot       *core.PendingCarrier // listener slot held until the first record
-	deadline   core.Time
-	framing    core.Framing
-	held       bool
-	pendInband bool
-	attached   bool
-	rejected   bool
+	name     string
+	via      string
+	dir      string
+	binding  []byte
+	conn     string
+	buf      []byte
+	pipe     uint64
+	lane     uint64
+	slot     *core.PendingCarrier // listener slot held until the first record
+	deadline core.Time
+	framing  core.Framing
+	attached bool
+	rejected bool
+	// The listener's handshake.
+	confirm    bool // write the confirmation once the Reply came
+	decision   join.Decision
+	heldHello  *join.Hello
+	pj         *core.PeerJoin
+	joiner     *join.Joiner // the scripted peer
+	reply      []byte
+	outcome    string // what the handshake came to: accept, refuse, reject, fatal, or "" while it runs
+	hsDeadline core.Time
+	msgs       [][]byte // units held until Confirmed
 }
 
 type runner struct {
 	pending      core.PendingCarriers
 	pairing      core.SplitPairing
 	carriers     map[string]*rcarrier
-	held         []*rcarrier
 	t            *testing.T
 	h            header
 	s            *core.Session
@@ -202,16 +206,14 @@ type runner struct {
 	b            core.Batch
 	enc          encodeCtx
 	stepNo       any
+	modes        map[string]bool // AllowRecordMode; nil accepts every mode
+	ep           runnerEpochs
 }
 
 func merge(dst, src map[string]any) map[string]any {
 	out := map[string]any{}
-	for k, v := range dst {
-		out[k] = v
-	}
-	for k, v := range src {
-		out[k] = v
-	}
+	maps.Copy(out, dst)
+	maps.Copy(out, src)
 	return out
 }
 
@@ -221,7 +223,7 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	p := profiles[h.Profile]
 	tp := merge(p.TP, h.Overrides.TP)
 	cf := merge(p.Config, h.Overrides.Config)
-	// The test-mode sender (TRACES.md 3.4): the ETA choice, no probation,
+	// The test-mode sender: the ETA choice, no probation,
 	// no redundant copies, standby pipes probed at 15 s.
 	switch cf["sender"] {
 	case nil:
@@ -239,6 +241,9 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	cfg := core.DefaultConfig()
 	cfg.Local = paramsFromMap(tp)
 	cfg.Test.Enabled = true
+	// A profile's sessions: pipe 0 is end to end by declaration.
+	cfg.Declared = true
+	cfg.JoinEarlyHello = 8 << 10
 	if g, ok := th["grease_tp"].(map[string]any); ok {
 		cfg.Local.GreaseID = num(g["id"])
 		cfg.Local.GreaseValue = hexb(g["value"])
@@ -264,6 +269,11 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	if v, ok := th["role_nonce"]; ok {
 		cfg.Local.RoleNonce = num(v)
 	}
+	// Traces script every exchange: no policy of this end starts one.
+	cfg.EpochPeriod, cfg.EpochJoins, cfg.NoEpochAfterFirstPipe, cfg.NoEpochAfterResume = -1, -1, true, true
+	if v, ok := th["epoch_locator_prefix"]; ok {
+		cfg.Test.EpochLocatorPrefix = hexb(v)
+	}
 	if v, ok := th["session_nonce"]; ok {
 		copy(cfg.Local.SessionNonce[:], hexb(v))
 	}
@@ -275,6 +285,7 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	} else {
 		cfg.Role, cfg.TransportRole = core.RoleInitiator, core.RoleInitiator
 	}
+	var modes map[string]bool
 	for k, v := range cf {
 		switch k {
 		case "keep_alive_period":
@@ -333,6 +344,13 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 			if ps, ok := m["psk"]; ok {
 				cfg.PSK = hexb(ps)
 			}
+		case "declared_end_to_end":
+			cfg.Declared = v.(bool)
+		case "record_modes":
+			modes = map[string]bool{}
+			for _, x := range v.([]any) {
+				modes[x.(string)] = true
+			}
 		case "early_data":
 			m := v.(map[string]any)
 			cfg.EarlyZmuxPeer, _ = m["zmux_peer"].(bool)
@@ -340,7 +358,7 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 		}
 	}
 	r := &runner{t: t, h: h, streams: map[string]*core.Stream{}, pipes: map[uint64]*rpipe{}, evSeen: map[string]int{},
-		carriers: map[string]*rcarrier{}}
+		carriers: map[string]*rcarrier{}, modes: modes}
 	r.s = core.New(cfg, 0)
 	r.enc.sent = func(pipe, lane uint64) uint64 {
 		if p := r.pipes[pipe]; p != nil {
@@ -374,9 +392,21 @@ func (r *runner) step(st map[string]any) error {
 		return r.api(st)
 	case "advance":
 		return r.advance(ms(st["ms"]))
+	case "peer_join":
+		return r.peerJoin(st)
+	case "peer_epoch":
+		return r.peerEpoch(st)
+	case "peer_join_finish":
+		return r.peerJoinFinish(st)
+	case "peer_confirm":
+		return r.peerConfirm(st)
 	}
 	r.flush()
 	switch op {
+	case "expect_join_hello":
+		return r.expectJoinHello(st)
+	case "peer_join_reply":
+		return r.peerJoinReply(st)
 	case "expect_frames":
 		return r.expectFrames(st)
 	case "expect_no_frames":
@@ -418,7 +448,7 @@ func (r *runner) pipeUp(st map[string]any) error {
 		return r.listenerUp(st)
 	}
 	if via != "" && via != "bootstrap" {
-		r.t.Skip("pipe_up via " + via)
+		return fmt.Errorf("pipe_up via %s", via)
 	}
 	id := num(st["pipe"])
 	p := &rpipe{id: id, lanes: map[uint64]*rlane{}, writable: true}
@@ -475,6 +505,9 @@ func (r *runner) peerSend(st map[string]any) error {
 	p := r.pipes[id]
 	if p == nil {
 		return fmt.Errorf("no pipe %d", id)
+	}
+	if p.joining {
+		return r.joinerRead(p, st)
 	}
 	if msgs, ok := st["messages"].([]any); ok || st["messages_hex"] != nil {
 		var list [][]byte
@@ -555,6 +588,7 @@ func (r *runner) advance(d core.Duration) error {
 	r.now = target
 	r.s.HandleTimeout(r.now)
 	r.drainEvents()
+	r.handshakeDeadlines()
 	for _, c := range r.carriers {
 		if c.slot != nil && !c.rejected && r.now >= c.deadline {
 			r.pending.Release(c.slot)
@@ -611,14 +645,15 @@ func (r *runner) drainEvents() {
 
 // flush polls every writable outbound lane until nothing comes out.
 func (r *runner) flush() {
-	for i := 0; i < 64; i++ {
+	r.writeHellos()
+	for range 64 {
 		var lanes []uint64
 		matched := false
 		ids := make([]uint64, 0, len(r.pipes))
 		for id := range r.pipes {
 			ids = append(ids, id)
 		}
-		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		slices.Sort(ids)
 		for _, id := range ids {
 			p := r.pipes[id]
 			if !p.out || !p.writable {
@@ -683,9 +718,7 @@ func (r *runner) capture(p *rpipe, lane uint64) {
 				j, _ := json.Marshal(o)
 				if d, ok := o["data"].(string); ok && len(d) > 40 {
 					o2 := map[string]any{}
-					for k, v := range o {
-						o2[k] = v
-					}
+					maps.Copy(o2, o)
 					o2["data"] = fmt.Sprintf("<%d bytes>", len(d)/2)
 					j, _ = json.Marshal(o2)
 				}
@@ -696,6 +729,9 @@ func (r *runner) capture(p *rpipe, lane uint64) {
 			}
 			if f.Kind == wire.KindClose {
 				r.closesSent = append(r.closesSent, o)
+			}
+			if f.Kind == wire.KindSessionEpoch {
+				r.localEpoch(&f, o)
 			}
 			l.frames = append(l.frames, o)
 			l.recIdx = append(l.recIdx, l.recs)
@@ -715,7 +751,7 @@ func (r *runner) lanesFor(st map[string]any) []*rlane {
 		for id := range r.pipes {
 			ids = append(ids, id)
 		}
-		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		slices.Sort(ids)
 		for _, id := range ids {
 			for _, l := range r.pipes[id].lanes {
 				out = append(out, l)
@@ -1159,10 +1195,9 @@ func eventObj(e core.Event) (string, map[string]any) {
 		return "pipe_state", map[string]any{"pipe": e.Pipe, "state": state}
 	case core.EvJoinAuthFailed:
 		return "join_auth_failed", map[string]any{"reason": e.Reason.String()}
-	case core.EvOOBJoin:
-		return "oob_join", map[string]any{"pipe": e.Pipe, "frame": hex.EncodeToString(e.Frame)}
-	case core.EvJoinSecurityUnavailable, core.EvTierSaturation, core.EvPipePriority, core.EvPipeQuality,
-		core.EvCapacityBelow, core.EvCapacityRestored, core.EvJoinKeys:
+	case core.EvTierSaturation, core.EvPipePriority, core.EvPipeQuality,
+		core.EvCapacityBelow, core.EvCapacityRestored, core.EvJoinKeys, core.EvPipeAttached,
+		core.EvEpochCommitted, core.EvEpochDeleted, core.EvLocatorAdded, core.EvLocatorRemoved:
 		// Not in the trace vocabulary.
 	}
 	return "other", nil
@@ -1236,10 +1271,8 @@ func (r *runner) expectPipeClosed(st map[string]any) error {
 	return nil
 }
 
-var _ = bufio.NewReader
-
 // carrierSend delivers bytes on an inbound lane carrier: the first record
-// is routed by its PIPE_LANE (MULTIPATH.md 5.8), the rest is the lane's.
+// is routed by its PIPE_LANE, the rest is the lane's.
 func (r *runner) carrierSend(c *rcarrier, st map[string]any) error {
 	if c == nil {
 		return fmt.Errorf("unknown carrier")

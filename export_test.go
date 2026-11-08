@@ -7,7 +7,7 @@ import "testing"
 func ShapedRecordSizes(t *testing.T, f ShaperFactory, n int) []int {
 	t.Helper()
 	c, s, rc := shapedPair(t, nil)
-	c.SetShaper(f)
+	c.SetShaper(f, nil)
 	rc.start()
 	transfer(t, c, s, n)
 	sizes, _ := rc.records()

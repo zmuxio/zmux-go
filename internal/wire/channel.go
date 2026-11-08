@@ -2,7 +2,7 @@ package wire
 
 import "github.com/zmuxio/zmux-go/varint"
 
-// Channel datagrams (EXTENSIONS.md 6.8): one DATAGRAM frame sent on a
+// Channel datagrams: one DATAGRAM frame sent on a
 // carrier's own datagram channel instead of in a record, after the Pipe
 // Stream ID on channels shared by the pipes of a connection (QUIC,
 // WebTransport) and alone where the channel belongs to the pipe (HTTP/3).

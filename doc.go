@@ -40,21 +40,23 @@
 //
 // Blocking: calls that wait take a context.Context (OpenStreamSync,
 // AcceptStream, Ping, Shutdown, AddPipe, NextEvent, ...) or honour the
-// stream's deadlines (Read, Write). Close, CloseWithError, CancelRead,
-// CancelWrite and Pipe.Close never block; Wait blocks until the session
-// and all its goroutines ended. Conn.Context and Stream.Context are the
+// stream's deadlines (Read, Write). Conn.Close and CloseWithError block
+// only until CONNECTION_CLOSE has been handed to the carriers (at most about
+// one second); CancelRead, CancelWrite and Pipe.Close never block; Wait
+// blocks until the session and all its goroutines ended. Conn.Context and Stream.Context are the
 // session's context.
 //
 // Closing: Conn.Close ends the session at once and discards data not yet
-// sent; Conn.Shutdown lets open streams finish first. Listener.Shutdown
+// sent, and a process may exit as soon as it returns; Conn.Shutdown lets open streams finish first. Listener.Shutdown
 // does the same for every session of a listener.
 //
 // Ownership: a Stream handle that is garbage-collected without being
 // closed resets and stops its stream, so keep it while it is in use. A
-// net.Conn given to Client or Server and a PipeIO given to Start, AddPipe
-// or HandlePipe belong to zmux from then on, which closes each half
-// exactly once, unless the call fails with ErrInvalidConfig before taking
-// it. A Chunk from ReadChunk is released exactly once, by Release or by
+// net.Conn given to Client, Server or a Dial function and a PipeIO given to
+// Start, AddPipe or HandlePipe belong to zmux from then on, whether the
+// call succeeds or fails (ErrInvalidConfig, a refused or failed join, a
+// panic in a host callback included): zmux closes each half exactly once,
+// and the caller never closes it. A Chunk from ReadChunk is released exactly once, by Release or by
 // WriteChunk.
 //
 // # Events
@@ -98,8 +100,10 @@
 // Settings: the zero value of a field selects its default, stated in the
 // field's documentation; for timeouts and limits it is a safe bound unless
 // the field says otherwise. A negative timeout means no timeout, as for
-// http.Server.IdleTimeout. Other negative values are an error unless the
-// field gives them a meaning.
+// http.Server.IdleTimeout, where the field allows it (JoinTimeout,
+// ResumeTimeout and JoinEarlyHello do not). Other negative values are an
+// error unless the field gives them a meaning. A value out of range is an
+// error, never corrected.
 //
 // The fields that give negative values a meaning follow the standard
 // library: KeepAlivePeriod turns keep-alive off (net.Dialer.KeepAlive),
@@ -113,13 +117,16 @@
 // shaping.Limits.NoPadding, ...). Zero values that are not a safe bound:
 // shaping.Limits (zero is unbounded; the session's other limits still
 // apply), PipePool.Rotate (zero rotates nothing) and Config.ResumeTimeout
-// (zero is no resume). Errors are ErrInvalidConfig; NewListener panics.
+// (zero is no resume). Errors are ErrInvalidConfig, from Start, Dial,
+// Client and Server before a byte is written, and from NewListener.
 //
-// Multipath needs
-// MaxPipes above 1 and a PipeAuth (PSK, DeferredPSK with
-// Conn.SetJoinSecret, or Exporter); without a secret, joins are possible
-// only with PipeAuth.AllowInsecure, meant for tests and protected
-// networks.
+// Multipath needs MaxPipes above 1 and a PipeAuth (PSK, DeferredPSK with
+// Conn.SetJoinSecret, or Exporter); a session whose first pipe is not on the secure
+// carrier has join keys only once its host declared that pipe end to end
+// (PipeAuth.EndToEnd or Conn.DeclareEndToEnd). Every added pipe uses the Join
+// handshake. A process restored from a snapshot MUST reseed its random source before
+// any Join: repeated random output can repeat a Reply's nonce, which replays an old
+// confirmation and reuses record keys.
 //
 // # Time
 //

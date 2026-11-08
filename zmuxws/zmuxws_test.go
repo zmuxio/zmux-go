@@ -23,7 +23,7 @@ import (
 )
 
 func mpConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)}}
+	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true}}
 }
 
 func testContext(t *testing.T) context.Context {
@@ -86,7 +86,7 @@ func closeBoth(c, s *zmux.Conn) {
 
 func TestSession(t *testing.T) {
 	ctx := testContext(t)
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig()})
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	u := server(t, l, nil)
 	c, err := Dial(ctx, u+"/zmux", nil, mpConfig())
 	if err != nil {
@@ -98,16 +98,12 @@ func TestSession(t *testing.T) {
 	}
 	echo(t, ctx, c, s, 1<<20)
 
-	// A second pipe, joined out of band with the Zmux-Pipe-Join field.
-	r, err := c.ReservePipe(zmux.DirBidirectional, zmux.PipeOptions{})
+	// A second pipe.
+	p, err := DialPipe(ctx, u+"/zmux", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := DialPipe(ctx, u+"/zmux", &DialOptions{Header: http.Header{zmux.HeaderJoin: {r.Header()}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Attach(ctx, p); err != nil {
+	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(c.Pipes()); n != 2 {
@@ -128,7 +124,7 @@ func TestTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(),
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
 		Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}})
 	h, err := Handler(l, &zmux.HTTPOptions{Next: next})
 	if err != nil {
@@ -167,6 +163,11 @@ func TestTLS(t *testing.T) {
 			t.Fatal(err)
 		}
 		echo(t, ctx, c, s, 256<<10)
+		for _, x := range []*zmux.Conn{c, s} {
+			if st := x.ConnectionState(); st.ApplicationProtocol != zmux.DefaultALPN || st.TLS == nil || st.TLS.NegotiatedProtocol == zmux.DefaultALPN {
+				t.Fatalf("subprotocol %q, TLS %v", st.ApplicationProtocol, st.TLS)
+			}
+		}
 		if n := len(c.PipeStats()); n != 2 {
 			t.Fatalf("%d pipes", n)
 		}
@@ -187,7 +188,7 @@ func TestSubprotocols(t *testing.T) {
 	ctx := testContext(t)
 	var decided atomic.Int32
 	o := &zmux.HTTPOptions{Next: next}
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{
 		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
 			decided.Add(1)
 			return zmux.Decision{}
@@ -204,7 +205,7 @@ func TestSubprotocols(t *testing.T) {
 		{[]string{"qmux-02"}, ""},
 		{[]string{"moq-transport-17"}, ""},
 	} {
-		d := &wsconn.Dialer{ClientOptions: wsconn.ClientOptions{Subprotocols: tc.offer}}
+		d := &wsconn.Dialer{Subprotocols: tc.offer}
 		wc, resp, err := d.Dial(ctx, u+"/x")
 		if tc.want == "" {
 			if err == nil || resp == nil || resp.Code != http.StatusTeapot {
@@ -246,7 +247,7 @@ func TestAdmissionAcceptAndFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	o := &zmux.HTTPOptions{Next: next}
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(),
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
 		Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}})
 	u := server(t, l, o)
 	name, value, err := auth.Header(&zmux.CarrierInfo{Head: true})
@@ -313,7 +314,7 @@ func TestAdmissionStallAndClose(t *testing.T) {
 		{zmux.VerdictClose, 0},
 	} {
 		o := &zmux.HTTPOptions{Next: next}
-		l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{
+		l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{
 			StallMin: 300 * time.Millisecond, StallMax: 400 * time.Millisecond,
 			Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
 				return zmux.Decision{Verdict: tc.verdict}
@@ -449,7 +450,7 @@ func checkKind(t *testing.T, k zmux.CarrierKind, cs ...*zmux.Conn) {
 // the checks but cannot be completed (here: a response writer that cannot
 // be taken over) is a setup failure of the listener and nothing else.
 func TestUpgradeFailureCounted(t *testing.T) {
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
 	h, err := Handler(lst, nil)
 	if err != nil {

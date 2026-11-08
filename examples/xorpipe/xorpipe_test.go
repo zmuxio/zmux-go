@@ -54,8 +54,11 @@ func newServer(t *testing.T) *server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: &zmux.Config{},
+	lst, err := zmux.NewListener(&zmux.ListenerConfig{Config: &zmux.Config{},
 		Admission: xorpipe.Admission(), WrapPipe: xorpipe.WrapPipe(filter, key)})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -213,7 +216,7 @@ func TestPublicAPIOnly(t *testing.T) {
 	if err != nil {
 		t.Skip("go list:", err)
 	}
-	for _, p := range strings.Fields(string(out)) {
+	for p := range strings.FieldsSeq(string(out)) {
 		if strings.Contains(p, "/internal") {
 			t.Fatalf("the example imports %s", p)
 		}

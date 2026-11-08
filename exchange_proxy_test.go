@@ -118,12 +118,10 @@ func (p *faultProxy) serve() {
 		if !p.track(c) {
 			continue
 		}
-		p.wg.Add(1)
-		go func() {
-			defer p.wg.Done()
+		p.wg.Go(func() {
 			defer p.untrack(c)
 			p.exchange(c)
-		}()
+		})
 	}
 }
 
@@ -172,11 +170,9 @@ func (p *faultProxy) exchange(c net.Conn) {
 		}
 	}
 	if f[faultDuplicate] {
-		p.wg.Add(1)
-		go func() {
-			defer p.wg.Done()
+		p.wg.Go(func() {
 			_, _ = p.forward(req.URL.RequestURI(), body)
-		}()
+		})
 	}
 	resp, err := p.forward(req.URL.RequestURI(), body)
 	if err != nil || f[faultDropResponse] {

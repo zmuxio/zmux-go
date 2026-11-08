@@ -11,7 +11,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-// Streams as pipes (EXTENSIONS.md 10): a bidirectional stream
+// Streams as pipes: a bidirectional stream
 // of an outer session carries a pipe pair of a nested session.
 
 // OpenPipeStream opens a stream of c to carry a pipe pair of another
@@ -50,7 +50,7 @@ func streamPipe(s *Stream, outer *Conn, opener bool) PipeIO {
 	return PipeIO{R: (*stPipeR)(sp), W: (*stPipeW)(sp)}
 }
 
-// stPipe adapts a stream to the pipe operations of EXTENSIONS.md 10.2.
+// stPipe adapts a stream to the pipe operations of a nested carrier.
 type stPipe struct {
 	s      *Stream
 	outer  *Conn
@@ -200,7 +200,7 @@ func (c *Conn) releaseNestedLane() {
 	}
 }
 
-// ---- loops (EXTENSIONS.md 10.2) ----
+// ---- loops ----
 
 // nesting records which sessions run over which: an edge n -> o for every
 // pipe of n carried by a stream of o. No pipe of a session may run over

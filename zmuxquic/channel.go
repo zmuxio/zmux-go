@@ -9,9 +9,10 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
-// The datagram channel of QUIC stream pipes (EXTENSIONS.md 6.8): QUIC
+// The datagram channel of QUIC stream pipes: QUIC
 // DATAGRAM frames of the connection, each starting with the Pipe Stream
 // ID, the QUIC stream ID of the pipe. One receive loop per connection
 // routes them to the pipes on it, which may belong to several sessions;
@@ -91,7 +92,7 @@ func (c *connChannel) register(id uint64, deliver func([]byte)) func() {
 		if !c.qc.ConnectionState().SupportsDatagrams.Local {
 			return
 		}
-		go func() {
+		labels.Go(context.Background(), "quic-channel", func() {
 			for {
 				b, err := c.qc.ReceiveDatagram(c.qc.Context())
 				if err != nil {
@@ -99,7 +100,7 @@ func (c *connChannel) register(id uint64, deliver func([]byte)) func() {
 				}
 				c.demux.Deliver(b)
 			}
-		}()
+		})
 	})
 	return c.demux.Register(id, deliver)
 }

@@ -14,7 +14,14 @@ import (
 type gateAtShaper struct {
 	at     uint64
 	maxLen int
-	gate   shaping.Gate
+	gate   gateSpec
+}
+
+// gateSpec is the gate a plan sets: a pause from the plan's time, a rate and
+// a burst.
+type gateSpec struct {
+	pause       time.Duration
+	rate, burst uint64
 }
 
 func (g *gateAtShaper) Capabilities() shaping.Caps { return shaping.CapPlan }
@@ -24,11 +31,14 @@ func (g *gateAtShaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
 		p.MaxLen = g.maxLen
 	}
 	if v.Seq == g.at {
-		gt := g.gate
-		p.Reply.Gate = &gt
+		p.Effects.Set = shaping.EffectGate
+		p.Effects.Rate, p.Effects.Burst = g.gate.rate, g.gate.burst
+		if g.gate.pause > 0 {
+			p.Effects.PauseUntil = v.Now + g.gate.pause
+		}
 	}
 }
-func (g *gateAtShaper) OnEvent(*shaping.Event, *shaping.Reply) {}
+func (g *gateAtShaper) OnEvent(*shaping.Event, *shaping.Effects) {}
 
 // recordData returns the STREAM data bytes of each record of a byte-stream
 // batch.
@@ -66,9 +76,9 @@ func recordData(t *testing.T, b *Batch) []int {
 // fill the records before the gate, one each; stream data follows in the
 // gating record.
 func TestShapingGateMidBatch(t *testing.T) {
-	for name, gate := range map[string]shaping.Gate{
-		"rate":  {Rate: 1_000_000, Burst: 100},
-		"pause": {Pause: 50 * time.Millisecond},
+	for name, gate := range map[string]gateSpec{
+		"rate":  {rate: 1_000_000, burst: 100},
+		"pause": {pause: 50 * time.Millisecond},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, p := channelSession(t, nil, false)
@@ -110,20 +120,20 @@ func TestShapingGateMidBatch(t *testing.T) {
 			}
 			ps := p.sh
 			switch {
-			case gate.Pause > 0:
+			case gate.pause > 0:
 				if after != 0 {
 					t.Fatalf("records %v: %d data bytes during the pause", recs, after)
 				}
 			default:
-				if after > int(gate.Burst) {
-					t.Fatalf("records %v: %d data bytes after the gate, burst %d", recs, after, gate.Burst)
+				if after > int(gate.burst) {
+					t.Fatalf("records %v: %d data bytes after the gate, burst %d", recs, after, gate.burst)
 				}
 				if after == 0 {
 					t.Fatalf("records %v: no data within the burst", recs)
 				}
-				if want := float64(gate.Burst - int64(after)); ps.tokens != want {
-					t.Fatalf("bucket %.0f after %d gated bytes, want %.0f (data before the gate not charged)",
-						ps.tokens, after, want)
+				if want := int64(int(gate.burst) - after); ps.bucket.tokens != want {
+					t.Fatalf("bucket %d after %d gated bytes, want %d (data before the gate not charged)",
+						ps.bucket.tokens, after, want)
 				}
 			}
 		})

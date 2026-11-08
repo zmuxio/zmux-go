@@ -17,7 +17,7 @@ import (
 )
 
 func dgCfg() *zmux.Config {
-	return &zmux.Config{EnableDatagrams: true, PipeAuth: zmux.PipeAuth{PSK: make([]byte, 32)}}
+	return &zmux.Config{EnableDatagrams: true, PipeAuth: zmux.PipeAuth{PSK: make([]byte, 32), EndToEnd: true}}
 }
 
 // warmUp sends datagrams from a to b until one goes on the channel (the
@@ -85,12 +85,13 @@ func roundTrip(t *testing.T, c, s *zmux.Conn, tag string) {
 
 func TestWebTransportChannel(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: dgCfg()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: dgCfg()})
 	defer func() { _ = lst.Close() }()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = pc.Close() }() // a server does not close what it was given
 	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
 		QUICConfig: testQUIC()}
 	webtransport.ConfigureHTTP3Server(h3)
@@ -261,12 +262,13 @@ func (r *rawH3) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 
 func TestHTTP3Channel(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: dgCfg()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: dgCfg()})
 	defer func() { _ = lst.Close() }()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = pc.Close() }() // a server does not close what it was given
 	hh, err := zmux.NewHTTPHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -307,12 +309,13 @@ func TestHTTP3Channel(t *testing.T) {
 // A client without the channel gets datagrams in records.
 func TestHTTP3ChannelFallback(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
-	lst := zmux.NewListener(&zmux.ListenerConfig{Config: dgCfg()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: dgCfg()})
 	defer func() { _ = lst.Close() }()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = pc.Close() }() // a server does not close what it was given
 	hh, err := zmux.NewHTTPHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)

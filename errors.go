@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -16,10 +17,10 @@ type ApplicationErrorCode uint64
 // StreamErrorCode is an application error code of a stream.
 type StreamErrorCode uint64
 
-// TransportErrorCode is a transport error code (SPEC.md Section 10.2).
+// TransportErrorCode is a transport error code.
 type TransportErrorCode uint64
 
-// Application error-code conventions (EXTENSIONS.md Section 7).
+// Application error-code conventions.
 const (
 	StreamNoError       StreamErrorCode = 0
 	StreamCancelled     StreamErrorCode = 0x5a4d0001
@@ -71,7 +72,7 @@ type TransportError struct {
 	ErrorCode    TransportErrorCode
 	FrameType    uint64
 	ErrorMessage string
-	// Details are the key=value pairs of the diagnostic line (SPEC.md 4.3).
+	// Details are the key=value pairs of the diagnostic line.
 	Details string
 }
 
@@ -238,9 +239,7 @@ var (
 	// (*ResumeTimeoutError).
 	ErrResumeTimeout = errors.New("zmux: resume timeout")
 	// ErrResumeFailed reports that a session closed with ZMUX_RESUME_FAILED
-	// (*TransportError): among others, a suspended session whose resume
-	// join the listener answered with it, as it holds no session for the
-	// locator (ListenerConfig.AnswerUnknownJoins).
+	// (*TransportError).
 	ErrResumeFailed = errors.New("zmux: resume failed")
 	// ErrPipesLost reports that the session lost its pipes and could not resume
 	// (*PipesLostError).
@@ -269,9 +268,13 @@ var (
 	// ErrMessageTooLarge is returned by MessageLimitReader.ReadMessageLimit
 	// for a message above its limit.
 	ErrMessageTooLarge = errors.New("zmux: message too large")
-	// ErrJoinSecretPending is returned by joins of a session whose
-	// PipeAuth.DeferredPSK was not supplied yet (Conn.SetJoinSecret).
-	ErrJoinSecretPending = errors.New("zmux: join secret pending")
+	// ErrJoinPending is returned by joins of a session without join keys yet: a
+	// deferred PSK not supplied (Conn.SetJoinSecret), or an Unmanaged first pipe not
+	// declared (Conn.DeclareEndToEnd). The error returned wraps it and says
+	// which of the two, or both, is missing.
+	ErrJoinPending = errors.New("zmux: join pending")
+	// ErrJoinRefused is returned by AddPipe when the peer's Reply refused the join.
+	ErrJoinRefused = errors.New("zmux: join refused")
 	// ErrJoinSecretSet is returned by a second Conn.SetJoinSecret.
 	ErrJoinSecretSet = errors.New("zmux: join secret already set")
 	// ErrNoExporter is returned by Conn.ExportKeyingMaterial when the
@@ -356,14 +359,20 @@ func apiErr(err error) error {
 		return ErrNotNegotiated
 	case errors.Is(err, core.ErrNotEstablished):
 		return ErrNotEstablished
-	case errors.Is(err, core.ErrJoinSecretPending):
-		return ErrJoinSecretPending
+	case errors.Is(err, core.ErrJoinPending):
+		var jp *core.JoinPendingError
+		if errors.As(err, &jp) && (jp.Declare || jp.Secret) {
+			return fmt.Errorf("%w%s", ErrJoinPending, strings.TrimPrefix(jp.Error(), "zmux: join pending"))
+		}
+		return ErrJoinPending
 	case errors.Is(err, core.ErrJoinSecretSet):
 		return ErrJoinSecretSet
 	case errors.Is(err, core.ErrStreamLimit):
 		return &StreamLimitReachedError{}
 	case errors.Is(err, core.ErrTooLate):
 		return ErrTooLate
+	case errors.Is(err, core.ErrGroupNotUsable):
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	return err
 }

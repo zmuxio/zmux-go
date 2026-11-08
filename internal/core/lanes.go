@@ -4,11 +4,12 @@ import (
 	"crypto/subtle"
 	"slices"
 
+	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// Lanes (MULTIPATH.md 2.5, 5.8). A pipe whose carrier is
+// Lanes. A pipe whose carrier is
 // a stream of a multi-stream connection may carry its records over several
 // streams of that connection. The outbound side opens lanes on demand and
 // binds stream directions to them; the inbound side attaches the lanes the
@@ -239,7 +240,7 @@ func (s *Session) lanesAcked(p *Pipe, ol *outLane) {
 }
 
 // lanesCovered reports whether every record written on lanes other than 0
-// is acknowledged (SPEC.md 6.5 step 1).
+// is acknowledged.
 func (s *Session) lanesCovered() bool {
 	for _, p := range s.pipes {
 		if p.out == nil {
@@ -264,7 +265,7 @@ func (s *Session) laneTimeouts(now Time, apply bool) Time {
 			continue
 		}
 		l := p.out.lo.pending
-		d := l.openedAt.Add(s.cfg.HandshakeTimeout)
+		d := l.openedAt.Add(s.cfg.JoinTimeout)
 		if apply && now >= d {
 			s.laneRefused(p, l)
 			continue
@@ -295,8 +296,8 @@ func (s *Session) SetCarrierConn(pipe uint64, conn any) {
 
 // AcceptLane attaches an inbound lane whose first record starts with a
 // PIPE_LANE naming (pipe, lane) and carrying this session's key. It returns
-// false when the stream must be aborted without any effect (MULTIPATH.md
-// 5.8 reader rule 1); protocol violations close the session.
+// false when the stream must be aborted without any effect (a lane that names no
+// usable pipe of this session); protocol violations close the session.
 func (s *Session) AcceptLane(conn any, pipe, lane uint64, info CarrierInfo) bool {
 	if s.state >= StateClosing || !s.peerSeen {
 		return false
@@ -304,6 +305,9 @@ func (s *Session) AcceptLane(conn any, pipe, lane uint64, info CarrierInfo) bool
 	p := s.pipe(pipe)
 	if p == nil || p.in == nil || p.in.ended || p.conn == nil || p.conn != conn {
 		return false
+	}
+	if p.mp != nil && p.mp.mode == join.Sealed {
+		return false // a lane would carry raw records past the protection
 	}
 	if !s.feat.LanesIn {
 		s.failLocal(&wire.Error{Code: wire.FrameEncodingError, FrameType: wire.TypePipeLane,

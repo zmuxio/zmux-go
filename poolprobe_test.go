@@ -18,7 +18,7 @@ func TestPoolDecisionValidate(t *testing.T) {
 			t.Errorf("%+v: %v", d, err)
 		}
 		var got PoolDecision
-		err := decide(policyFunc(func(_ *PoolView, x *PoolDecision) { *x = d }), &PoolView{}, &got)
+		err := decide(nil, policyFunc(func(_ *PoolView, x *PoolDecision) { *x = d }), &PoolView{}, &got)
 		if !errors.Is(err, ErrInvalidConfig) || got.ProbeInterval != d.ProbeInterval {
 			t.Errorf("decide %+v: %v, %+v", d, err, got)
 		}

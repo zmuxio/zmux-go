@@ -16,8 +16,8 @@ var (
 	qpcOnce  sync.Once
 	qpcFreq  int64
 	qpcStart int64
-	qpcBase  time.Time
 	qpcProc  *syscall.Proc
+	monoBase = time.Now()
 )
 
 func qpcInit() {
@@ -36,17 +36,20 @@ func qpcInit() {
 	}
 	// QueryPerformanceCounter cannot fail on Windows XP and later.
 	_, _, _ = c.Call(uintptr(unsafe.Pointer(&now)))
-	qpcFreq, qpcStart, qpcBase, qpcProc = freq, now, time.Now(), c
+	qpcFreq, qpcStart, qpcProc = freq, now, c
 }
 
-func monoSince(base time.Time) int64 {
+// monoNow reads the host's monotonic clock, from an arbitrary origin. A
+// session subtracts its own first reading: the timer-interrupt clock lags
+// the counter by up to a tick, so mixing the two could read before the
+// session began.
+func monoNow() int64 {
 	qpcOnce.Do(qpcInit)
 	if qpcProc == nil {
-		return int64(time.Since(base))
+		return int64(time.Since(monoBase))
 	}
 	var now int64
 	_, _, _ = qpcProc.Call(uintptr(unsafe.Pointer(&now))) // cannot fail
 	ticks := now - qpcStart
-	ns := ticks/qpcFreq*1e9 + ticks%qpcFreq*1e9/qpcFreq
-	return int64(qpcBase.Sub(base)) + ns
+	return ticks/qpcFreq*1e9 + ticks%qpcFreq*1e9/qpcFreq
 }

@@ -1,6 +1,7 @@
 package zmuxtest
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -31,10 +32,10 @@ type RelayOptions struct {
 // drops the bytes of chosen directions without ending the connection (a
 // black hole), refuses new connections, or cuts the current ones.
 type Relay struct {
-	o      RelayOptions
-	target string
-	ln     net.Listener
-	wg     sync.WaitGroup
+	o    RelayOptions
+	dial func(context.Context) (net.Conn, error)
+	ln   net.Listener
+	wg   sync.WaitGroup
 
 	mu      sync.Mutex
 	conns   map[*relayConn]struct{}
@@ -64,10 +65,21 @@ func NewRelay(target string, o RelayOptions) (*Relay, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Relay{o: o, target: target, ln: ln, conns: map[*relayConn]struct{}{}, quit: make(chan struct{})}
+	return NewRelayOn(ln, func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", target)
+	}, o), nil
+}
+
+// NewRelayOn relays each connection ln accepts to a connection from dial;
+// with an in-memory listener and dial (a netx.ChanListener) the relay
+// needs no network, as tests in a testing/synctest bubble require. The
+// relay owns ln and closes it.
+func NewRelayOn(ln net.Listener, dial func(context.Context) (net.Conn, error), o RelayOptions) *Relay {
+	r := &Relay{o: o, dial: dial, ln: ln, conns: map[*relayConn]struct{}{}, quit: make(chan struct{})}
 	r.wg.Add(1)
 	go r.accept()
-	return r, nil
+	return r
 }
 
 // Addr is the relay's listening address.
@@ -169,7 +181,9 @@ func (r *Relay) accept() {
 			_ = c.Close()
 			continue
 		}
-		u, err := net.DialTimeout("tcp", r.target, 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		u, err := r.dial(ctx)
+		cancel()
 		if err != nil {
 			_ = c.Close()
 			continue

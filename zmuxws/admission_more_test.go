@@ -16,7 +16,7 @@ import (
 func TestAdmissionFirstMessage(t *testing.T) {
 	ctx := testContext(t)
 	var seen atomic.Int32
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: 1, MaxPeek: 1 << 16,
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: 1, MaxPeek: 1 << 16,
 		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
 			if c, _ := zmux.ClassifyFirstBytes(prefix, zmux.FramingRecords); c != zmux.FirstBytesRecord || len(prefix) < 9 {
 				return zmux.Decision{Verdict: zmux.VerdictClose}
@@ -26,7 +26,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 		}}})
 	defer func() { _ = l.Close() }()
 	srv, cli := pipePair(t)
-	go func() { _ = l.HandlePipe(ctx, srv, zmux.JoinHint{}) }()
+	go func() { _ = l.HandlePipe(ctx, srv, zmux.PipeHint{}) }()
 	c, err := zmux.Start(ctx, cli, zmux.RoleClient, mpConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 // An upgrade is decided on its head: VerdictMore is VerdictClose.
 func TestAdmissionMoreOnHead(t *testing.T) {
 	o := &zmux.HTTPOptions{Next: next}
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: 4, MaxPeek: 64,
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: 4, MaxPeek: 64,
 		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
 			return zmux.Decision{Verdict: zmux.VerdictMore, Need: 8, Variant: "h"}
 		}}})
@@ -58,27 +58,3 @@ func TestAdmissionMoreOnHead(t *testing.T) {
 		t.Fatalf("stats %+v, variants %+v", st, vs)
 	}
 }
-
-// A dialed carrier exposes its 101 response header; one made by Pipe has
-// none.
-func TestResponseHeader(t *testing.T) {
-	ctx := testContext(t)
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig()})
-	defer func() { _ = l.Close() }()
-	u := server(t, l, &zmux.HTTPOptions{Next: next})
-	p, err := DialPipe(ctx, u, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closePipe(p)
-	h := p.W.(zmux.ResponseHeaderer).ResponseHeader()
-	if h == nil || h.Get("Date") == "" {
-		t.Fatalf("header %v", h)
-	}
-	srv, cli := pipePair(t)
-	if srv.W.(zmux.ResponseHeaderer).ResponseHeader() != nil || cli.W.(zmux.ResponseHeaderer).ResponseHeader() != nil {
-		t.Fatal("a header on a carrier made by Pipe")
-	}
-}
-
-func closePipe(p zmux.PipeIO) { _ = p.W.Close() }

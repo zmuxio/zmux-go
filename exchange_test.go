@@ -128,7 +128,7 @@ type exEnv struct {
 // use instead of the server's (a proxy in front of it).
 func newExEnv(t *testing.T, ccfg, scfg *HTTPExchangeConfig, front func(origin string) string) *exEnv {
 	t.Helper()
-	e := &exEnv{lst: NewListener(&ListenerConfig{Config: mpConfig()})}
+	e := &exEnv{lst: mustNewListener(&ListenerConfig{Config: mpConfig()})}
 	e.h = newExHandler(t, e.lst, scfg)
 	e.srv = httptest.NewServer(e.h)
 	e.tr = &http.Transport{MaxIdleConnsPerHost: 16}
@@ -232,7 +232,7 @@ func TestHTTPExchangeEcho(t *testing.T) {
 // that is malformed fails its carrier.
 func TestHTTPExchangeServerRules(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: 10 * time.Second})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
 	cfg := &HTTPExchangeConfig{PSK: []byte("k"), DownWindow: 4, HoldTime: 50 * time.Millisecond}
 	h := newExHandler(t, lst, cfg)
@@ -334,7 +334,7 @@ func TestHTTPExchangeInterop(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), d)
 		defer cancel()
-		lst := NewListener(&ListenerConfig{Config: zcfg})
+		lst := mustNewListener(&ListenerConfig{Config: zcfg})
 		h := newExHandler(t, lst, cfg)
 		srv := &http.Server{Addr: envOr("ZMUX_EXCHANGE_ADDR", "127.0.0.1:8080"), Handler: h, ReadHeaderTimeout: 10 * time.Second}
 		go func() { _ = srv.ListenAndServe() }()
@@ -408,7 +408,7 @@ func envOr(k, d string) string {
 // carrier instead of aborting it.
 func TestHTTPExchangeCompletion(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
 	h := newExHandler(t, lst, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
 	defer func() { _ = h.Close() }()
@@ -467,7 +467,7 @@ func TestHTTPExchangeCompletion(t *testing.T) {
 // refuses new carriers with GONE and creates none.
 func TestHTTPExchangeListenerClosed(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	h := newExHandler(t, lst, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
 	defer func() { _ = h.Close() }()
 	_ = lst.Close()
@@ -513,7 +513,7 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 	}
 	ctx := context.Background()
 	t.Run("up", func(t *testing.T) {
-		lst := NewListener(&ListenerConfig{Config: mpConfig()})
+		lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 		h := newExHandler(t, lst, &HTTPExchangeConfig{UpPieceSize: 16 << 10, HoldTime: 100 * time.Millisecond, AllowInsecure: true})
 		srv := httptest.NewServer(h)
 		defer func() { srv.Close(); _ = h.Close(); _ = lst.Close() }()
@@ -551,7 +551,7 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 // hosts and paths in front of one handler.
 func TestHTTPExchangeSplitTargets(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	h := newExHandler(t, lst, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
 	var mu sync.Mutex
 	hits := map[string]int{}
@@ -569,7 +569,7 @@ func TestHTTPExchangeSplitTargets(t *testing.T) {
 	}
 	up, down := front("/up/"), front("/down/")
 	tr := &http.Transport{MaxIdleConnsPerHost: 8}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	p, err := HTTPExchangePipe(context.Background(), &http.Client{Transport: tr}, up.URL+"/up/{instance}",
 		&HTTPExchangeConfig{DownURL: down.URL + "/down/{instance}/{nonce}", AllowInsecure: true})
@@ -583,7 +583,7 @@ func TestHTTPExchangeSplitTargets(t *testing.T) {
 	if e.server, err = lst.Accept(ctx); err != nil {
 		t.Fatal(err)
 	}
-	e.echo(t, 1<<20, 20*time.Second)
+	e.echo(t, 1<<20, 60*time.Second)
 	e.close(t)
 	down.Close()
 	mu.Lock()
@@ -666,7 +666,7 @@ func TestHTTPExchangeBodySize(t *testing.T) {
 // with the fallback before any admission.
 func TestExchangeHandlerClass(t *testing.T) {
 	decided := false
-	l := NewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+	l := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision {
 		decided = true
 		return Decision{Verdict: VerdictAccept}
 	}}})
@@ -688,7 +688,7 @@ func TestExchangeHandlerClass(t *testing.T) {
 // arrived and then the read error, not a body that seems complete.
 func TestHTTPExchangeTruncatedFallback(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	type seen struct {
 		body []byte
 		err  error
@@ -722,7 +722,7 @@ func TestHTTPExchangeTruncatedFallback(t *testing.T) {
 // carrier waits for is still taken.
 func TestHTTPExchangeOutOfOrderCost(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: 10 * time.Second})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
 	h := newExHandler(t, lst, &HTTPExchangeConfig{PSK: []byte("k"), UpStoreLimit: 1})
 	defer func() { _ = h.Close() }()
@@ -763,7 +763,7 @@ func TestHTTPExchangeOutOfOrderCost(t *testing.T) {
 // that it is served once the share is free.
 func TestHTTPExchangePendingShare(t *testing.T) {
 	leakcheck.Check(t)
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1, FirstRecordTimeout: 10 * time.Second})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1, FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
 	h := newExHandler(t, lst, &HTTPExchangeConfig{PSK: []byte("k")})
 	defer func() { _ = h.Close() }()

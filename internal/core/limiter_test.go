@@ -72,7 +72,7 @@ func (p *pathSim) step() {
 		rate := float64(ack-last.delivered) * 1e9 / float64(iv)
 		ev := limAck{rtt: adj, rttSentAt: sentAt, acked: ack, sent: p.sent}
 		p.est.blockEpoch++ // the sender always has data: every range is a bottleneck sample
-		ev.rate = p.est.sample(rate, false, 0, now)
+		ev.rate = p.est.sample(rate, false, false, 0, now)
 		p.lastAck = now
 		p.acked = ack
 		if ack >= p.roundEnd {
@@ -176,7 +176,7 @@ func TestLimiterPacingQuantum(t *testing.T) {
 	now := Time(Second)
 	var est rateEst
 	est.blockEpoch = 1
-	est.sample(1.25e9, false, 0, now) // 10 Gbit/s
+	est.sample(1.25e9, false, false, 0, now) // 10 Gbit/s
 	l := newLimiter(now)
 	l.mode, l.phaseSince = limCruise, now
 	l.baseD, l.baseHas = 10*Millisecond, true

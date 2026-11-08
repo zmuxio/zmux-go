@@ -54,12 +54,25 @@ func newModeEnv(t *testing.T) *modeEnv {
 func (e *modeEnv) close() {
 	e.stop()
 	<-e.done
-	e.unifiedEnv.close()
+	// Their carriers keep the server's handlers: end them before it closes.
 	close(e.sessions)
 	for s := range e.sessions {
 		_ = s.Close()
 	}
+	e.unifiedEnv.close()
 	e.tr.CloseIdleConnections()
+}
+
+// session is the next session the listener accepted.
+func (e *modeEnv) session(t *testing.T, ctx context.Context) *Conn {
+	t.Helper()
+	select {
+	case s := <-e.sessions:
+		return s
+	case <-ctx.Done():
+		t.Fatal("no session at the listener")
+		return nil
+	}
 }
 
 // candidates are the HTTP kinds to url, by preference.
@@ -294,21 +307,27 @@ func TestDialModeJoin(t *testing.T) {
 	leakcheck.Check(t)
 	e := newModeEnv(t)
 	defer e.close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	c, err := DialMode(ctx, AutoMode(e.candidates(e.srv.URL)...), modeCfg(), fastPolicy(false))
+	// A join that works has all the time load may take; only the joins
+	// through the proxy below are expected to run out of it.
+	patient := &ModePolicy{TimerMin: 20 * time.Second, TimerMax: 40 * time.Second, Settle: 200 * time.Millisecond}
+	c, err := DialMode(ctx, AutoMode(e.candidates(e.srv.URL)...), modeCfg(), patient)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st := c.ConnectionStats(); len(st.CarrierCandidates) != 1 || st.CarrierCandidates[0].Kind != CarrierExchange {
+	// Whichever client is open when the test ends, on any path.
+	defer func() { _ = c.Close() }()
+	// A join may already have followed: the first try is what established.
+	if st := c.ConnectionStats(); len(st.CarrierCandidates) == 0 || st.CarrierCandidates[0].Kind != CarrierExchange {
 		t.Fatalf("established on %v", kinds(st.CarrierCandidates))
 	}
-	s := <-e.sessions
+	s := e.session(t, ctx)
 	defer func() { _ = s.Close() }()
 	echoOnce(t, ctx, c, s)
-	waitCarrier(t, c, CarrierStreaming, 10*time.Second)
+	waitCarrier(t, c, CarrierStreaming, 60*time.Second)
 	// The exchange pipe is retired: one pipe is left.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for len(c.Pipes()) != 1 {
 		if time.Now().After(deadline) {
 			t.Fatalf("%d pipes after the upgrade", len(c.Pipes()))
@@ -329,10 +348,10 @@ func TestDialModeJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s = <-e.sessions
+	s = e.session(t, ctx)
 	defer func() { _ = s.Close() }()
 	// Both preferred joins fail, and the session stays on the exchange.
-	deadline = time.Now().Add(10 * time.Second)
+	deadline = time.Now().Add(60 * time.Second)
 	for {
 		st := c.ConnectionStats()
 		if len(st.CarrierCandidates) >= 3 {

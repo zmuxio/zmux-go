@@ -13,9 +13,10 @@ import (
 	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
-// Datagram channels (EXTENSIONS.md 6.8): the HTTP Datagrams (RFC 9297) of
+// Datagram channels: the HTTP Datagrams (RFC 9297) of
 // an HTTP/3 request stream that is a pipe, the frame alone; and the
 // datagrams of a WebTransport session, each starting with the Pipe Stream
 // ID of a stream of the session, routed by one receive loop per session.
@@ -114,7 +115,7 @@ func (c *h3Channel) SendChannelDatagram(b []byte) error {
 // ReceiveChannelDatagrams receives the stream's HTTP Datagrams.
 func (c *h3Channel) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 	ctx, cancel := context.WithCancel(c.str.Context())
-	go func() {
+	labels.Go(context.Background(), "h3-channel", func() {
 		for {
 			b, err := c.str.ReceiveDatagram(ctx)
 			if err != nil {
@@ -122,7 +123,7 @@ func (c *h3Channel) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 			}
 			deliver(b)
 		}
-	}()
+	})
 	return cancel
 }
 
@@ -215,7 +216,7 @@ func (c *wtChannel) send(b []byte) error {
 
 func (c *wtChannel) register(id uint64, deliver func([]byte)) func() {
 	c.recvOnce.Do(func() {
-		go func() {
+		labels.Go(context.Background(), "wt-channel", func() {
 			for {
 				b, err := c.sess.ReceiveDatagram(c.sess.Context())
 				if err != nil {
@@ -223,7 +224,7 @@ func (c *wtChannel) register(id uint64, deliver func([]byte)) func() {
 				}
 				c.demux.Deliver(b)
 			}
-		}()
+		})
 	})
 	return c.demux.Register(id, deliver)
 }

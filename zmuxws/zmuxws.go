@@ -1,5 +1,5 @@
 // Package zmuxws carries zmux pipes over WebSocket. Every binary message
-// is one record's Frames field (FramingRecords, SPEC.md 3.4), so that
+// is one record's Frames field (FramingRecords), so that
 // intermediaries that re-chunk the byte stream cannot break records; a
 // text message fails the pipe. The subprotocol (Sec-WebSocket-Protocol)
 // is the application protocol identifier, as ALPN is over TLS: DefaultALPN
@@ -8,16 +8,14 @@
 //
 // Handler serves upgrade requests to a zmux.Listener; Dial and DialPipe
 // open a WebSocket to a ws:// or wss:// URL; Pipe adapts a connection
-// established otherwise. An out-of-band join travels in the
-// Zmux-Pipe-Join request field (zmux.HeaderJoin), a client's credential
+// established otherwise. A client's credential travels
 // in its header form, such as zmux.PrefixAuth's Zmux-Prefix-Auth field.
 //
 // A carrier has the state of the TLS beneath it that this process
 // terminates (ConnectionState): a client's wss connection, or the TLS
-// connection of a server's request (r.TLS), so that zmux.PipeAuth.Exporter and
-// zmux.PipeOptions.CarrierBound work over wss. The WebSocket streams of
-// one HTTP/2 connection (extended CONNECT) share its TLS and so its
-// exporters. Where TLS ends elsewhere (a ws URL, or a server behind a
+// connection of a server's request (r.TLS), so that zmux.PipeAuth.Exporter works over wss. A carrier on a TLS connection of its
+// own declares the Bound contract (zmux.CarrierSecure); the WebSocket streams of one
+// HTTP/2 connection (extended CONNECT) share its TLS and its exporters, and do not. Where TLS ends elsewhere (a ws URL, or a server behind a
 // TLS-terminating proxy) the state is not HandshakeComplete, and both fail
 // rather than bind to TLS that is not the peer's. Only the exporter
 // binding, or a client that pins the server, proves the TLS end to end.
@@ -56,7 +54,7 @@ var options = wsconn.Options{ReadLimit: zmux.MaxRecordSize + 1 + 64}
 
 // accepted returns the subprotocols a server accepts, by preference: each
 // identifier followed by its alias, so that the first identifier offered
-// in either form is chosen (SPEC.md 6.2).
+// in either form is chosen.
 func accepted(protocols []string) []string {
 	if len(protocols) == 0 {
 		protocols = []string{zmux.DefaultALPN}
@@ -129,7 +127,7 @@ type handler struct {
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The 101 carries Date, as an origin server's responses do (RFC 9110
-	// 6.6.1); the response header is the client's (ResponseHeader).
+	// 6.6.1).
 	so := h.so
 	so.Header = append(slices.Clip(h.so.Header), httphead.Field{Name: "Date", Value: time.Now().UTC().Format(http.TimeFormat)})
 	hs, err := wshttp.Check(w, r, &so)
@@ -143,15 +141,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	c, err := wshttp.Accept(w, r, hs)
 	if err != nil {
-		var he *wsconn.HandshakeError
-		if errors.As(err, &he) {
+		if _, ok := errors.AsType[*wsconn.HandshakeError](err); ok {
 			// Nothing was answered.
 			h.o.Fallback(w, r)
 		}
 		a.HandshakeFailed() // the upgrade failed: no pipe input
 		return
 	}
-	_ = a.HandlePipe(r.Context(), pipe(c, r.TLS), zmux.JoinHint{Join: r.Header.Get(zmux.HeaderJoin)})
+	_ = a.HandlePipe(r.Context(), pipe(c, r.TLS, r.ProtoMajor == 1), zmux.PipeHint{})
 	// Over an HTTP/2 stream, the handler outlives the connection.
 	select {
 	case <-wshttp.Done(c):
@@ -168,7 +165,7 @@ type DialOptions struct {
 	// zmux.DefaultALPN), followed by their aliases.
 	Protocols []string
 	// Header holds fields added to the upgrade request, such as
-	// zmux.HeaderJoin with a Reservation's Header. A Host field sets the
+	// a credential's. A Host field sets the
 	// request's Host; the handshake's own fields are refused.
 	Header http.Header
 	// Credential is presented in the upgrade request (its Header form,
@@ -350,7 +347,7 @@ func dialOnce(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Cred
 // which then owns the connection; on every error the connection is closed
 // (wsconn.Client closes nc itself when the handshake fails).
 func handshake(ctx context.Context, nc net.Conn, rawURL string, co *wsconn.ClientOptions, credErr error) (p zmux.PipeIO, err error) {
-	c, resp, err := wsconn.Client(ctx, nc, rawURL, co)
+	c, _, err := wsconn.Client(ctx, nc, rawURL, co)
 	if err != nil {
 		_ = nc.Close()
 		return zmux.PipeIO{}, handshakeErr(err, credErr)
@@ -363,15 +360,7 @@ func handshake(ctx context.Context, nc net.Conn, rawURL string, co *wsconn.Clien
 	if credErr != nil {
 		return zmux.PipeIO{}, credErr
 	}
-	p = pipe(c, tlsState(nc))
-	if resp != nil {
-		h := http.Header{}
-		for _, f := range resp.Header {
-			h.Add(f.Name, f.Value)
-		}
-		p.R.(*carrier).hdr = h
-	}
-	return p, nil
+	return pipe(c, tlsState(nc), true), nil
 }
 
 // handshakeErr is the error of a failed handshake: credErr, the credential
@@ -429,14 +418,15 @@ func (d *tlsDialer) DialContext(ctx context.Context, network, addr string) (net.
 // transform (wsconn's default
 // is above it). Its ConnectionState is that of c's own connection when
 // that is a TLS connection, else not HandshakeComplete.
-func Pipe(c *wsconn.Conn) zmux.PipeIO { return pipe(c, tlsState(c.NetConn())) }
+func Pipe(c *wsconn.Conn) zmux.PipeIO { return pipe(c, tlsState(c.NetConn()), true) }
 
-func pipe(c *wsconn.Conn, st *tls.ConnectionState) zmux.PipeIO {
+// own says that the connection beneath c carries only c.
+func pipe(c *wsconn.Conn, st *tls.ConnectionState, own bool) zmux.PipeIO {
 	if st != nil && !st.HandshakeComplete {
 		st = nil
 	}
-	p := &carrier{c: c, tls: st}
-	return zmux.PipeIO{R: p, W: p, Framing: zmux.FramingRecords, Carrier: zmux.CarrierWebSocket}
+	p := &carrier{c: c, tls: st, own: own}
+	return zmux.PipeIO{R: p, W: p, Framing: zmux.FramingRecords, Carrier: zmux.CarrierWebSocket, Protocol: c.Subprotocol()}
 }
 
 // tlsState is the state of nc's TLS when nc is a TLS connection.
@@ -454,13 +444,13 @@ func tlsState(nc net.Conn) *tls.ConnectionState {
 type carrier struct {
 	c   *wsconn.Conn
 	tls *tls.ConnectionState // nil: no TLS terminated here
-	hdr http.Header          // the client's 101 response header (nil: none)
+	own bool                 // the TLS connection carries only this WebSocket
 }
 
-// ResponseHeader returns a copy of the header of the 101 response that
-// opened a client carrier (zmux.ResponseHeaderer); nil on a server or a
-// carrier made by Pipe.
-func (p *carrier) ResponseHeader() http.Header { return p.hdr.Clone() }
+// CarrierSecure reports the Bound contract: end to end on a TLS connection of its own.
+func (p *carrier) CarrierSecure() bool {
+	return p.tls != nil && p.own && p.tls.Version >= tls.VersionTLS12
+}
 
 // ConnectionState returns the state of the TLS beneath the connection,
 // shared by the streams of one HTTP/2 connection; without TLS terminated

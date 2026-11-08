@@ -2,7 +2,7 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// ---- failure and removal (MULTIPATH.md 7.2, 7.3, 8) ----
+// ---- failure and removal ----
 
 // failPipe fails an attachment: reinjection, carrier closed, PIPE_ABANDON
 // (unless one was sent), then the last-pipe rule.
@@ -10,6 +10,9 @@ func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
 	a := p.mp
 	if a == nil || a.retired {
 		return
+	}
+	if a.joinerLocal && a.joining() {
+		s.mp.joinFailures++ // feeds the join retry backoff
 	}
 	wasDraining := a.out == OutDraining || a.draining
 	if p.out != nil && a.out != OutFailed && a.out != OutClosed {
@@ -57,7 +60,7 @@ func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
 }
 
 // fateGroupHit marks the other attachments of the same joiner and fate
-// group suspect or probes them (MULTIPATH.md 7.1).
+// group suspect or probes them.
 func (s *Session) fateGroupHit(p *Pipe) {
 	a := p.mp
 	for _, q := range s.pipes {
@@ -79,10 +82,10 @@ func (s *Session) fateGroupHit(p *Pipe) {
 	}
 }
 
-// makeSuspect moves an outbound pipe to SUSPECT (MULTIPATH.md 7.2).
+// makeSuspect moves an outbound pipe to SUSPECT.
 func (s *Session) makeSuspect(p *Pipe) {
 	a := p.mp
-	if a.out != OutActive && a.out != OutJoining {
+	if a.out != OutActive {
 		return
 	}
 	a.out = OutSuspect
@@ -120,10 +123,15 @@ func (s *Session) RemovePipe(id uint64, graceful bool) error {
 	return nil
 }
 
-// startDrain begins a graceful removal (MULTIPATH.md 8.2).
+// startDrain begins a graceful removal.
 func (s *Session) startDrain(p *Pipe) {
 	a := p.mp
 	if a.draining {
+		return
+	}
+	if a.hs {
+		// A graceful removal needs the carrier.
+		s.failPipe(p, wire.PipeFailed, nil)
 		return
 	}
 	a.draining = true
@@ -142,7 +150,7 @@ func (s *Session) startDrain(p *Pipe) {
 	s.wakeAllWriters()
 }
 
-// peerAbandon handles a received PIPE_ABANDON (MULTIPATH.md 8.2, 8.3).
+// peerAbandon handles a received PIPE_ABANDON.
 func (s *Session) peerAbandon(p *Pipe, code uint64) {
 	a := p.mp
 	if a == nil || a.retired || a.abandonRecv {
@@ -170,35 +178,13 @@ func (s *Session) peerAbandon(p *Pipe, code uint64) {
 }
 
 // joinRefused counts a refused local join and extends the refusal
-// backoff (MULTIPATH.md 5.7 step 1).
+// backoff.
 func (s *Session) joinRefused() {
 	s.stats.JoinRefusals++
 	m := s.mp
 	m.backoffExp++
 	d := Second << min(m.backoffExp-1, 6)
 	m.backoffUntil = s.now.Add(minD(d, 60*Second))
-}
-
-// joinAnsweredClose handles a CONNECTION_CLOSE that starts the inbound
-// side of an unconfirmed local join (MULTIPATH.md 5.4 step 3, 5.7): the
-// peer holds no session for the locator. ZMUX_RESUME_FAILED on a
-// suspended session ends the session at once, with no pipe to send a
-// close on; otherwise only the join fails, ZMUX_RESUME_FAILED backing
-// later joins off as a refusal does.
-func (s *Session) joinAnsweredClose(p *Pipe, f *wire.Frame) {
-	resumeFailed := !f.App && f.Code == wire.ResumeFailed
-	if resumeFailed && s.state == StateSuspended {
-		s.closeWith(&SessionError{Kind: CloseTransport, Code: wire.ResumeFailed, Reason: "peer has no session"}, nil)
-		return
-	}
-	if resumeFailed {
-		s.joinRefused()
-	}
-	kind := CloseTransport
-	if f.App {
-		kind = CloseApplication
-	}
-	s.failPipe(p, wire.PipeFailed, &SessionError{Kind: kind, Code: f.Code, Remote: true, Reason: string(f.Data)})
 }
 
 // unackedStream reports stream data on the pipe not yet acknowledged.
@@ -216,7 +202,7 @@ func unackedStream(p *Pipe) bool {
 	return false
 }
 
-// checkDrain completes a drain (MULTIPATH.md 8.2 step 3).
+// checkDrain completes a drain.
 func (s *Session) checkDrain(p *Pipe) {
 	a := p.mp
 	if a.out != OutDraining || !a.abandonSent || !a.abandonRecv || unackedStream(p) {
@@ -246,7 +232,7 @@ func (s *Session) abandonHanded(p *Pipe) {
 }
 
 // maybeRetire retires an attachment at the first moment every condition
-// holds (MULTIPATH.md 8.4).
+// holds.
 func (s *Session) maybeRetire(p *Pipe) {
 	a := p.mp
 	if a == nil || a.retired {
@@ -271,8 +257,8 @@ func (s *Session) maybeRetire(p *Pipe) {
 func (s *Session) retire(p *Pipe) {
 	a := p.mp
 	a.retired = true
-	// A peer-parity ID stays used, pipe 0 of an initiator peer included
-	// (MULTIPATH.md 4.3): its later PIPE_ACK entries are ignored.
+	// A peer-parity ID stays used, pipe 0 of an initiator peer included:
+	// its later PIPE_ACK entries are ignored.
 	if !s.ownParity(p.id) {
 		s.mp.bits[p.id] = true
 	}
@@ -293,9 +279,9 @@ func (s *Session) retire(p *Pipe) {
 	s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirBidi, OutState: OutRetired, InState: InRetired,
 		Carrier: p.carrier, Failed: a.failures > 0})
 	s.checkLastPipe(nil)
-	if a.joinerLocal && !a.resLimited {
-		// Another attachment retired: the refusal backoff ends
-		// (MULTIPATH.md 5.7 step 1).
+	if a.joinerLocal && !a.resLimited && !a.hs {
+		// Another attachment that the acceptor had attached retired: the refusal
+		// backoff ends.
 		s.mp.backoffUntil = 0
 		s.wakeAllWriters()
 	}
@@ -318,7 +304,8 @@ func (s *Session) liveCounts() (out, in int) {
 	return
 }
 
-// checkLastPipe applies MULTIPATH.md 8.5.
+// checkLastPipe handles the loss of the last live pipe of a direction:
+// suspend with resume, else close.
 func (s *Session) checkLastPipe(cause error) {
 	if s.state >= StateClosing || s.state == StateSuspended {
 		return
@@ -339,7 +326,7 @@ func (s *Session) checkLastPipe(cause error) {
 	s.closeWith(e, nil)
 }
 
-// mpInboundEnded handles the end of an inbound pipe (MULTIPATH.md 7.3).
+// mpInboundEnded handles the end of an inbound pipe.
 func (s *Session) mpInboundEnded(p *Pipe, graceful bool, cause error) {
 	a := p.mp
 	if a == nil || a.retired {
@@ -365,4 +352,21 @@ func (s *Session) mpOutboundFailed(id uint64, err error) {
 	if p := s.pipe(id); p != nil && p.mp != nil {
 		s.failPipe(p, wire.PipeFailed, err)
 	}
+}
+
+// RemovesLast reports whether removing pipe id would leave a direction
+// without a live pipe, the last pipe of a direction.
+func (s *Session) RemovesLast(id uint64) bool {
+	p := s.pipe(id)
+	if s.mp == nil || p == nil || p.mp == nil || p.mp.retired {
+		return false
+	}
+	out, in := s.liveCounts()
+	if p.out != nil && p.mp.liveOut() {
+		out--
+	}
+	if p.in != nil && (p.mp.in == InJoining || p.mp.in == InOpen) {
+		in--
+	}
+	return out <= 0 || in <= 0
 }

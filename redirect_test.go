@@ -295,8 +295,7 @@ func TestHTTPRedirectPastReplayBound(t *testing.T) {
 	for err == nil {
 		_, err = p.W.Write(buf)
 	}
-	var re *HTTPRedirectError
-	if !errors.As(err, &re) {
+	if _, ok := errors.AsType[*HTTPRedirectError](err); !ok {
 		t.Fatalf("got %v", err)
 	}
 }

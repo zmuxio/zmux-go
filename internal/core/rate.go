@@ -81,10 +81,11 @@ func (e *rateEst) advance(cum, so uint64) bool {
 	return false
 }
 
-// sample feeds one delivery-rate sample.
+// sample feeds one delivery-rate sample; proven marks a queue-proven
+// range, a bottleneck sample whatever the bubble and the epoch say.
 // It returns the sample's value when it is a bottleneck sample, else 0.
-func (e *rateEst) sample(r float64, bubble bool, epoch uint64, now Time) float64 {
-	bottleneck := !bubble && (epoch != e.blockEpoch || e.blockedNow)
+func (e *rateEst) sample(r float64, bubble, proven bool, epoch uint64, now Time) float64 {
+	bottleneck := proven || !bubble && (epoch != e.blockEpoch || e.blockedNow)
 	if !bottleneck && r <= e.value() {
 		return 0
 	}

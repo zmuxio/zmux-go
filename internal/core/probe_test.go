@@ -4,7 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/internal/join"
+	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // probeSession is a multipath session with pipe 0 idle and live at time 0.
@@ -93,15 +94,14 @@ func TestProbeWaitShapingHold(t *testing.T) {
 		k, maxDelay, pauseTotal, want Duration
 	}{
 		{10 * Second, 3 * Second, 0, 7 * Second},
-		{10 * Second, 0, 0, 10 * Second},
-		{10 * Second, 3 * Second, 2 * Second, 8 * Second},
+		{10 * Second, -1, 0, 10 * Second},
+		{10 * Second, 0, 0, 9 * Second},
 		{2 * Second, 3 * Second, 0, Second},
 		{Second, 500 * Millisecond, 0, Second},
 	} {
 		cfg := DefaultConfig()
 		cfg.ProbeInterval, cfg.ProbeJitter = c.k, 0
 		cfg.ShapeLimits.MaxDelay = time.Duration(c.maxDelay)
-		cfg.ShapeLimits.MaxPauseTotal = time.Duration(c.pauseTotal)
 		s, p := probeSession(cfg)
 		p.out = &outDir{lanes: []*outLane{{}}}
 		if w := s.probeWait(p); w != c.k {
@@ -113,20 +113,17 @@ func TestProbeWaitShapingHold(t *testing.T) {
 		}
 		s.drawProbe(p.mp, p, false)
 		if w := s.probeWait(p); w != c.want {
-			t.Errorf("k %v, MaxDelay %v, MaxPauseTotal %v: wait %v, want %v", c.k, c.maxDelay, c.pauseTotal, w, c.want)
+			t.Errorf("k %v, MaxDelay %v: wait %v, want %v", c.k, c.maxDelay, w, c.want)
 		}
 	}
 }
 
-// H_p is computed when a probe wait starts: delays that use up
-// MaxPauseTotal during a wait leave it as it is, and the next wait takes
-// the smaller remainder; with MaxPauseTotal used up, H_p is 0 even with
-// MaxDelay set.
+// H_p is computed when a probe wait starts: a bound changed during a wait
+// leaves it as it is, and the next wait takes the new one.
 func TestProbeHoldAtWaitStart(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ProbeInterval, cfg.ProbeJitter = 10*Second, 0
 	cfg.ShapeLimits.MaxDelay = time.Duration(3 * Second)
-	cfg.ShapeLimits.MaxPauseTotal = time.Duration(4 * Second)
 	s, p := probeSession(cfg)
 	p.out = &outDir{lanes: []*outLane{{}}}
 	s.SetPipeShaper(0, &delayShaper{delay: time.Second})
@@ -134,18 +131,18 @@ func TestProbeHoldAtWaitStart(t *testing.T) {
 	if w := s.probeWait(p); w != 7*Second {
 		t.Fatalf("H_p = MaxDelay: wait %v, want 7 s", w)
 	}
-	s.shapePause(2 * Second) // 2 s of the total used during the wait
+	s.SetShapeLimits(shaping.Limits{MaxDelay: time.Duration(2 * Second)})
 	if w := s.probeWait(p); w != 7*Second {
 		t.Fatalf("H_p changed during the wait: %v", w)
 	}
 	s.drawProbe(p.mp, p, false)
 	if w := s.probeWait(p); w != 8*Second {
-		t.Fatalf("H_p = the 2 s left of MaxPauseTotal: wait %v, want 8 s", w)
+		t.Fatalf("H_p = the new bound: wait %v, want 8 s", w)
 	}
-	s.shapePause(5 * Second) // clamped to the 2 s left
+	s.SetShapeLimits(shaping.Limits{MaxDelay: -1})
 	s.drawProbe(p.mp, p, false)
 	if w := s.probeWait(p); w != 10*Second {
-		t.Fatalf("MaxPauseTotal used up: wait %v, want k", w)
+		t.Fatalf("no bound: wait %v, want k", w)
 	}
 }
 
@@ -319,7 +316,7 @@ func TestPassedSuspicionStaysPending(t *testing.T) {
 
 // A joined pipe carried the joiner's PIPE_PING: the acceptor's first wait
 // is drawn as every later one, from [k(1-j), k], never from the whole
-// interval that only a bootstrap pipe uses (MULTIPATH.md 7.1).
+// interval that only a bootstrap pipe uses.
 func TestProbeAcceptedJoinFirstWait(t *testing.T) {
 	for i := range 200 {
 		s, _ := statsMP()
@@ -327,13 +324,10 @@ func TestProbeAcceptedJoinFirstWait(t *testing.T) {
 		s.rng = nil
 		s.cfg.Test.Seed = uint64(i + 1)
 		s.role, s.roleKnown = RoleInitiator, true
-		key := make([]byte, 32)
-		s.mp.keyPeer = key
-		mac := []byte("mac input")
-		j := &wire.Join{PipeID: 7, Dir: 2, Token: wire.JoinToken(key, mac, nil)}
 		s.peerSeen, s.mp.cap = true, 16
-		if r := s.AcceptJoin(j, mac, nil, Carrier{HasIn: true, HasOut: true}); r != JoinAccepted {
-			t.Fatalf("join: %v", r)
+		s.mp.bits = map[uint64]bool{}
+		if !acceptJoinForTest(t, s, 7) {
+			t.Fatal("join")
 		}
 		var p *Pipe
 		for _, x := range s.pipes {
@@ -352,7 +346,7 @@ func TestProbeAcceptedJoinFirstWait(t *testing.T) {
 
 // The silence limit of an inbound pipe without a local outbound direction
 // is L_in, except for the last live inbound pipe, which gets max(L_in,
-// T_dead) (MULTIPATH.md 7.3).
+// T_dead).
 func TestInboundSilenceLastPipe(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.DeadTimeout = 60 * Second
@@ -373,4 +367,44 @@ func TestInboundSilenceLastPipe(t *testing.T) {
 	if next := s.mpNextTimeout(); next != want {
 		t.Fatalf("two inbound pipes: deadline %v, want L_in %v", next, want)
 	}
+}
+
+// acceptJoinForTest runs the acceptor's handshake of a bidi join of pipe id.
+func acceptJoinForTest(t *testing.T, s *Session, id uint64) bool {
+	t.Helper()
+	su, _ := join.LookupSuite(join.SuiteAES)
+	psk := make([]byte, 32)
+	setTestKeys(s, su.ID, psk)
+	j, err := join.NewJoiner(join.JoinerConfig{Suite: su, Group: testJoinGroup, Mode: join.Trusted, Framing: join.Stream, Locator: []byte("L"), PSK: psk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello, err := j.WriteHello(nil, join.HelloPayload{Pipe: join.Pipe{ID: id, Direction: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _, err := join.ParseHello(hello, join.Stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pj, res := s.OpenHello(h, FramingBytes, nil)
+	if res != JoinAccepted {
+		return false
+	}
+	c := Carrier{HasIn: true, HasOut: true}
+	reply, res := s.ClaimHello(pj, c, 0, 1<<20, &shaping.UnitPlan{})
+	if res != JoinAccepted {
+		return false
+	}
+	if _, _, err := j.ReadReply(reply); err != nil {
+		t.Fatal(err)
+	}
+	confirm, err := j.WriteConfirm(nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, done, err := pj.ReadConfirm(confirm); err != nil || !done {
+		t.Fatalf("confirm: %v %v", done, err)
+	}
+	return s.ConfirmJoin(pj, c) == JoinAccepted
 }

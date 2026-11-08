@@ -141,7 +141,7 @@ type nopShaper struct{}
 
 func (nopShaper) Capabilities() shaping.Caps                    { return shaping.CapPlan }
 func (nopShaper) Plan(*shaping.RecordView, *shaping.RecordPlan) {}
-func (nopShaper) OnEvent(*shaping.Event, *shaping.Reply)        {}
+func (nopShaper) OnEvent(*shaping.Event, *shaping.Effects)      {}
 
 func TestChannelReceive(t *testing.T) {
 	frame := func(data string) []byte { return wire.AppendChannelDatagram(nil, false, 0, append([]byte{0}, data...)) }
@@ -225,8 +225,7 @@ func recvStream(t *testing.T, s *Session, st *Stream) []string {
 }
 
 // Datagrams of a peer stream that arrive before its opening frame are held
-// for one smoothed RTT and delivered when it opens, in arrival order
-// (EXTENSIONS.md 6.4, 6.8).
+// for one smoothed RTT and delivered when it opens, in arrival order.
 func TestHeldStreamDatagrams(t *testing.T) {
 	const peerStream = 1 // the responder's first bidirectional stream
 	t.Run("delivered on open", func(t *testing.T) {

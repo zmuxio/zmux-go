@@ -5,17 +5,18 @@ import (
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/shaping/machine"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 func TestShapingMachineDefinition(t *testing.T) {
-	f, err := machine.NewFactory([]byte(`{"version":1,"machines":[{"states":[{"record":{"pad_to":{"const":200}}}]}]}`),
+	f, err := machine.NewFactory([]byte(`{"machines":[{"start":0,"states":[{"record":{"pad_to":200}}]}]}`),
 		machine.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, n := range zmux.ShapedRecordSizes(t, f, 10) {
-		if n < 200 {
-			t.Fatalf("record of %d bytes", n)
+		if n+varint.SizeVarint(uint64(n)) < 200 {
+			t.Fatalf("record of %d frame bytes", n)
 		}
 	}
 }

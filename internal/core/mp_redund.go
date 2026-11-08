@@ -219,6 +219,7 @@ func (s *Session) writeCopies(d *decision, w *recWriter, q *[]*copyRec) {
 		w.logFrame(frameDesc{kind: dStream, id: st.id, off: start, n: n, fin: fin})
 		w.spendData(n)
 		st.countFrame(start, n)
+		w.notEarned += uint64(wire.StreamHeaderLen(st.id, start, int(n), true)) + n
 		s.stats.BytesRedundant += n
 		p.mp.redundantBytes += n
 		if start+n >= end {
@@ -261,7 +262,7 @@ func (s *Session) unsettle(p *Pipe) {
 
 // startReinjectHold: a new outbound pipe reinjects at most one chunk until
 // the first PIPE_ACK received after it became live, for up to one smoothed
-// RTT (RESUME.md 6). New stream data does not wait.
+// RTT. New stream data does not wait.
 func (s *Session) startReinjectHold(p *Pipe) {
 	a := p.mp
 	a.held1, a.holdSent = true, 0

@@ -29,7 +29,7 @@ func pollKinds(t *testing.T, s *Session, p *Pipe, rounds int) []wire.Kind {
 
 // A stream that got its identifier but no opening STREAM frame (no
 // session credit) sends its reset at once: the frame carries the right ID
-// and opens the stream at the peer (SPEC.md 7.2 rule 2).
+// and opens the stream at the peer.
 func TestResetAfterAllocWithoutOpen(t *testing.T) {
 	s, p := channelSession(t, nil, false)
 	s.feat.Preamble = false
@@ -52,7 +52,7 @@ func TestResetAfterAllocWithoutOpen(t *testing.T) {
 }
 
 // A preamble that does not fit the stream credit is reported by
-// STREAM_DATA_BLOCKED at once (SPEC.md 8.4): the opening frame needs that
+// STREAM_DATA_BLOCKED at once: the opening frame needs that
 // credit, so the report cannot wait for it.
 func TestPreambleBlockedReportsAtOnce(t *testing.T) {
 	s, p := channelSession(t, nil, false)
@@ -86,8 +86,8 @@ func TestJoinSecretEarlyNotSelected(t *testing.T) {
 	if !bytes.Equal(held, make([]byte, len(held))) {
 		t.Fatal("dropped PSK not cleared")
 	}
-	if s.secretSet || s.cfg.PSK != nil || s.JoinSecretPending() {
-		t.Fatalf("secret kept: set=%v pending=%v", s.secretSet, s.JoinSecretPending())
+	if s.secretSet || s.cfg.PSK != nil || s.JoinPendingNow() {
+		t.Fatalf("secret kept: set=%v pending=%v", s.secretSet, s.JoinPendingNow())
 	}
 	if err := s.SetJoinSecret(psk); !errors.Is(err, ErrNotNegotiated) {
 		t.Fatalf("SetJoinSecret after establishment: %v", err)
@@ -184,8 +184,8 @@ func TestFlushFrames(t *testing.T) {
 
 // After an early-data restart, a preamble larger than the stream credit
 // of the peer's new parameters is reported by STREAM_DATA_BLOCKED at
-// once rather than held for the opening STREAM frame it blocks (SPEC.md
-// 7.2); the peer's credit then lets the stream finish.
+// once rather than held for the opening STREAM frame it blocks
+// (streams open in identifier order); the peer's credit then lets the stream finish.
 func TestRestartPreambleBlocked(t *testing.T) {
 	s, p := channelSession(t, nil, false)
 	s.feat.Preamble = true
@@ -215,7 +215,8 @@ func TestRestartPreambleBlocked(t *testing.T) {
 	record := func(f []byte) {
 		s.Receive(p.id, 0, nil, append(varint.AppendVarint(nil, uint64(len(f))), f...), Time(Second))
 	}
-	record(wire.AppendTransportParams(nil, wire.AppendParams(nil, &peer)))
+	enc, _ := wire.AppendParams(nil, &peer)
+	record(wire.AppendTransportParams(nil, enc))
 	if !s.peerSeen || s.state != StateActive {
 		t.Fatalf("peer parameters not taken: state=%v %v", s.state, s.err)
 	}

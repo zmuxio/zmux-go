@@ -179,7 +179,7 @@ func TestChannelDatagramsNegotiation(t *testing.T) {
 func TestChannelDatagramsShaped(t *testing.T) {
 	a, b := chanPair(t, 1200)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 1 }))
+	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 1 }), nil)
 	if got := exchangeDatagrams(t, c, s, 5, 100); got != 5 {
 		t.Fatalf("%d of 5", got)
 	}

@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -326,8 +329,10 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 
 var interopPSK = []byte("zmux interop pre-shared key 0123")
 
+func interopAnyMode(CarrierInfo, RecordMode, any) bool { return true }
+
 func interopMPConfig() *Config {
-	return &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{PSK: interopPSK}}
+	return &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{PSK: interopPSK, EndToEnd: true}, AllowRecordMode: interopAnyMode}
 }
 
 // spreadCheck sends bulk with round-robin spreading and checks that every
@@ -412,7 +417,7 @@ func TestInteropMultipathServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tl.Close() }()
-	l := NewListener(&ListenerConfig{Config: interopMPConfig()})
+	l := mustNewListener(&ListenerConfig{Config: interopMPConfig()})
 	defer func() { _ = l.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -422,7 +427,7 @@ func TestInteropMultipathServer(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func() { _ = l.HandlePipe(ctx, NetPipe(nc), JoinHint{}) }()
+			go func() { _ = l.HandlePipe(ctx, NetPipe(nc), PipeHint{}) }()
 		}
 	}()
 	p := startPeer(t, "mp-client", tl.Addr().String())
@@ -438,3 +443,133 @@ func TestInteropMultipathServer(t *testing.T) {
 	spreadCheck(t, ctx, c)
 	interopScript(t, ctx, c, p)
 }
+
+// TLS with the join secret from the exporter alone: the
+// join succeeds only with the same session secret at both ends. Each connection's first byte in TLS says what it is: B a
+// bootstrap carrier, J a join, U and D the halves of a split bootstrap on two
+// connections, whose exporter value is the uplink's followed by the downlink's.
+
+const (
+	interopAppLabel = "EXPORTER-interop-app"
+	interopPair     = "zmux split pair!"
+)
+
+func interopTLSConfig() *Config {
+	// Joins on a Secure carrier are Bound, so the interop covers that mode.
+	bound := func(c CarrierInfo) RecordMode {
+		if c.Secure {
+			return Bound
+		}
+		return Sealed
+	}
+	return &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, AllowRecordMode: interopAnyMode, RecordPolicy: bound}
+}
+
+func interopKeys(t *testing.T, c *Conn, p *peerProc, wantLen int) {
+	t.Helper()
+	got, err := c.ExportKeyingMaterial(interopAppLabel, nil, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != wantLen {
+		t.Fatalf("exporter value of %d bytes, want %d", len(got), wantLen)
+	}
+	if peer := p.expect(t, "KEYS "); peer != hex.EncodeToString(got) {
+		t.Fatalf("exporter values differ: peer %s, here %x", peer, got)
+	}
+}
+
+func interopTLSClient(t *testing.T, split bool) {
+	p := startPeer(t, "tls-server")
+	addr := p.expect(t, "LISTEN ")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	dial := func(kind byte) *tls.Conn {
+		tc, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tc.Write([]byte{kind}); err != nil {
+			t.Fatal(err)
+		}
+		return tc
+	}
+	var boot PipeIO
+	wantLen := 16
+	if split {
+		boot = PipeIO{W: dial('U'), R: dial('D')}
+		wantLen = 32
+	} else {
+		boot = NetPipe(dial('B'))
+	}
+	c, err := Start(ctx, boot, RoleClient, interopTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	interopKeys(t, c, p, wantLen)
+	p.expect(t, "ESTABLISHED")
+	if _, err := c.AddPipe(ctx, NetPipe(dial('J')), PipeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	spreadCheck(t, ctx, c)
+	interopScript(t, ctx, c, p)
+}
+
+func interopTLSServer(t *testing.T, mode string, wantLen int) {
+	if os.Getenv("ZMUX_INTEROP_PEER") == "" {
+		t.Skip("ZMUX_INTEROP_PEER not set")
+	}
+	srv, _ := selfSignedTLS(t)
+	srv.MinVersion = tls.VersionTLS13
+	tl, err := tls.Listen("tcp", "127.0.0.1:0", srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tl.Close() }()
+	l := mustNewListener(&ListenerConfig{Config: interopTLSConfig()})
+	defer func() { _ = l.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	go func() {
+		for {
+			nc, err := tl.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				kind := make([]byte, 1)
+				if _, err := io.ReadFull(nc, kind); err != nil {
+					_ = nc.Close()
+					return
+				}
+				pair := base64.RawURLEncoding.EncodeToString([]byte(interopPair))
+				switch kind[0] {
+				case 'U':
+					_ = l.HandlePipe(ctx, PipeIO{R: nc}, PipeHint{Pair: pair, Uplink: true})
+				case 'D':
+					_ = l.HandlePipe(ctx, PipeIO{W: nc}, PipeHint{Pair: pair})
+				default:
+					_ = l.HandlePipe(ctx, NetPipe(secureTLS{nc.(*tls.Conn)}), PipeHint{})
+				}
+			}()
+		}
+	}()
+	p := startPeer(t, mode, tl.Addr().String())
+	c, err := l.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interopKeys(t, c, p, wantLen)
+	p.expect(t, "ESTABLISHED")
+	deadline := time.Now().Add(10 * time.Second)
+	for len(c.PipeStats()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	spreadCheck(t, ctx, c)
+	interopScript(t, ctx, c, p)
+}
+
+func TestInteropTLSExporterJoinClient(t *testing.T)  { interopTLSClient(t, false) }
+func TestInteropTLSExporterSplitClient(t *testing.T) { interopTLSClient(t, true) }
+func TestInteropTLSExporterJoinServer(t *testing.T)  { interopTLSServer(t, "tls-client", 16) }
+func TestInteropTLSExporterSplitServer(t *testing.T) { interopTLSServer(t, "tls-split-client", 32) }

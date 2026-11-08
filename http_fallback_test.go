@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,7 +25,7 @@ type refusedEnv struct {
 
 func newRefusedEnv(t *testing.T, adm *Admission) *refusedEnv {
 	t.Helper()
-	e := &refusedEnv{lst: NewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: time.Second, Admission: adm})}
+	e := &refusedEnv{lst: mustNewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: time.Second, Admission: adm})}
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -94,7 +93,7 @@ func TestHTTPRefusedCarrierFallback(t *testing.T) {
 	defer e.close()
 
 	// A join naming a session of another listener.
-	other := NewListener(&ListenerConfig{Config: mpConfig()})
+	other := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = other.Close() }()
 	osrv := httptest.NewServer(mustHTTPHandler(t, other))
 	defer osrv.Close()
@@ -119,24 +118,10 @@ func TestHTTPRefusedCarrierFallback(t *testing.T) {
 		waitDone(t, s)
 		osrv.Client().Transport.(*http.Transport).CloseIdleConnections()
 	}()
-	up, err := c.ReservePipe(DirSendOnly, PipeOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	down, err := c.ReservePipe(DirReceiveOnly, PipeOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	upJoin, downJoin := up.Header(), down.Header()
-	up.Cancel()
-	down.Cancel()
 	garbage := make([]byte, 200<<10)
 	_, _ = rand.Read(garbage)
 	garbage[0] = 0xff // a record length beyond MaxRecordSize
 	small := []byte("hello, host")
-	badJoin := base64.RawURLEncoding.EncodeToString([]byte("not a join"))
-	join := func(v string) http.Header { return http.Header{HeaderJoin: {v}} }
 	for _, x := range []struct {
 		name   string
 		method string
@@ -145,18 +130,14 @@ func TestHTTPRefusedCarrierFallback(t *testing.T) {
 	}{
 		{"garbage first record", http.MethodPost, garbage, nil},
 		{"incomplete first record", http.MethodPost, []byte{0x40}, nil},
-		{"undecodable join uplink", http.MethodPost, small, join("!!")},
-		{"malformed join uplink", http.MethodPost, small, join(badJoin)},
-		{"unknown join uplink", http.MethodPost, garbage, join(upJoin)},
-		{"unknown join downlink", http.MethodGet, nil, join(downJoin)},
-		{"malformed join downlink", http.MethodGet, nil, join(badJoin)},
+		{"small first record", http.MethodPost, small, nil},
 	} {
 		if code := e.send(t, x.method, x.body, x.h); code != http.StatusTeapot {
 			t.Fatalf("%s: status %d, want the fallback's", x.name, code)
 		}
 		got := e.served()
 		if len(got) != 1 || !bytes.Equal(got[0], x.body) && (x.body != nil || len(got[0]) != 0) {
-			t.Fatalf("%s: the fallback got %d requests, want 1 with the %d-byte body", x.name, len(got), len(x.body))
+			t.Fatalf("%s: the fallback got %q, want 1 request with the %d-byte body", x.name, got, len(x.body))
 		}
 	}
 
@@ -217,7 +198,7 @@ func TestHTTPRejectedStreamFallbackFullDuplex(t *testing.T) {
 	leakcheck.Check(t)
 	adm := &Admission{Peek: 4, PeekTimeout: time.Second,
 		Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictFallback} }}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
 	defer func() { _ = lst.Close() }()
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTeapot)

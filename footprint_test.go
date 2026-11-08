@@ -50,7 +50,7 @@ func heapNow() uint64 {
 func fpConfig() *Config { return &Config{MaxIdleTimeout: -1, KeepAlivePeriod: -1} }
 
 func fpMPConfig() *Config {
-	return &Config{MaxIdleTimeout: -1, KeepAlivePeriod: -1, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes....")}}
+	return &Config{MaxIdleTimeout: -1, KeepAlivePeriod: -1, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes...."), EndToEnd: true}}
 }
 
 func fpPairs(t *testing.T, n int) [][2]*Conn { return fpPairsOver(t, n, nil) }
@@ -94,7 +94,7 @@ func fpMPPairs(t *testing.T, l *Listener, n int) [][2]*Conn {
 	standby := true
 	for i := range out {
 		a, b := net.Pipe()
-		go func() { _ = l.HandlePipe(ctx, NetPipe(b), JoinHint{}) }()
+		go func() { _ = l.HandlePipe(ctx, NetPipe(b), PipeHint{}) }()
 		c, err := Client(ctx, a, fpMPConfig())
 		if err != nil {
 			t.Fatal(err)
@@ -104,7 +104,7 @@ func fpMPPairs(t *testing.T, l *Listener, n int) [][2]*Conn {
 			t.Fatal(err)
 		}
 		a2, b2 := net.Pipe()
-		go func() { _ = l.HandlePipe(ctx, NetPipe(b2), JoinHint{}) }()
+		go func() { _ = l.HandlePipe(ctx, NetPipe(b2), PipeHint{}) }()
 		if _, err := c.AddPipe(ctx, NetPipe(a2), PipeOptions{SendStandby: &standby, ReceiveStandby: true}); err != nil {
 			t.Fatal(err)
 		}
@@ -244,10 +244,10 @@ func TestFootprint(t *testing.T) {
 	_ = ss.Wait()
 
 	// Multipath: two pipe pairs, the second standby, after the join.
-	warm := NewListener(&ListenerConfig{Config: fpMPConfig()})
+	warm := mustNewListener(&ListenerConfig{Config: fpMPConfig()})
 	closePairs(fpMPPairs(t, warm, fpN))
 	_ = warm.Close()
-	l := NewListener(&ListenerConfig{Config: fpMPConfig()})
+	l := mustNewListener(&ListenerConfig{Config: fpMPConfig()})
 	defer func() { _ = l.Close() }()
 	time.Sleep(idle)
 	g0 = runtime.NumGoroutine()

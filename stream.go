@@ -17,20 +17,25 @@ import (
 // serialise reads and writes (lock level L0); close, cancel and deadline
 // changes never take them, so they can interrupt a blocked call.
 type handle struct {
-	c    *Conn
-	st   *core.Stream
-	rsig core.Signal // lazy: its channel is made by the first wait
-	wsig core.Signal
-	rmu  sync.Mutex
-	wmu  sync.Mutex
-	dl   atomic.Pointer[deadlines] // nil until a deadline is set
+	c  *Conn
+	st *core.Stream
+	// orphanNext links the handle into Conn.orphans once it was collected
+	// unclosed; written before the push publishes it.
+	orphanNext *handle
+	rsig       core.Signal // lazy: its channel is made by the first wait
+	wsig       core.Signal
+	rmu        sync.Mutex
+	wmu        sync.Mutex
+	dl         atomic.Pointer[deadlines] // nil until a deadline is set
 
 	// Guarded by the session lock.
 	sendDone, recvDone, released bool
 }
 
+// newHandle makes the handle of st (under the lock).
 func (c *Conn) newHandle(st *core.Stream) *handle {
 	h := &handle{c: c, st: st}
+	c.handles++
 	st.SetSignals(&h.rsig, &h.wsig)
 	h.sendDone = !st.Bidi() && !st.Local()
 	h.recvDone = !st.Bidi() && st.Local()
@@ -38,11 +43,12 @@ func (c *Conn) newHandle(st *core.Stream) *handle {
 }
 
 // cleanupHandle runs on the runtime's cleanup goroutine when a handle is
-// collected without being closed: reset(0) and stop(0).
-func cleanupHandle(h *handle) {
-	h.stopDeadlines()
-	h.c.orphan(h.st)
-}
+// collected without being closed. That goroutine belongs to no session
+// (nor to a synctest bubble the session runs in), so it only queues the
+// handle with one atomic push: no channel, timer or lock of the session.
+// The session releases it (reset(0) and stop(0)) in its next critical
+// section, at the latest at its orphan sweep (Conn.orphanSweepLocked).
+func cleanupHandle(h *handle) { h.c.orphans.push(h) }
 
 // deadlines are a handle's read and write deadlines, allocated when the
 // first one is set.
@@ -92,6 +98,15 @@ func (h *handle) setDeadline(read, write bool, t time.Time) {
 	h.c.unlock()
 }
 
+// release releases the core stream of a handle not yet released (under
+// the lock).
+func (h *handle) release() {
+	h.released = true
+	h.c.handles--
+	h.c.s.Release(h.st)
+	h.stopDeadlines()
+}
+
 func (h *handle) stopDeadlines() {
 	if d := h.dl.Load(); d != nil {
 		d.r.stop()
@@ -103,9 +118,7 @@ func (h *handle) stopDeadlines() {
 // both directions (under the lock).
 func (h *handle) maybeReleaseLocked() {
 	if h.sendDone && h.recvDone && !h.released {
-		h.released = true
-		h.c.s.Release(h.st)
-		h.stopDeadlines()
+		h.release()
 	}
 }
 
@@ -326,7 +339,7 @@ func newReceiveStream(h *handle) *ReceiveStream {
 }
 
 // StreamID returns the identifier; before the first frame it pins it and
-// the opening frame is sent at once (SPEC.md 7.2). Before establishment it
+// the opening frame is sent at once. Before establishment it
 // is 0. To open a stream on the wire, Flush is the explicit call.
 func (s *Stream) StreamID() StreamID { defer runtime.KeepAlive(s); id, _ := s.h.streamID(); return id }
 
@@ -467,7 +480,7 @@ func (c *streamConn) LocalAddr() net.Addr  { return c.local }
 func (c *streamConn) RemoteAddr() net.Addr { return c.remote }
 
 // StreamStats is a snapshot of a stream's statistics in payload bytes, the
-// preamble excluded (API.md 7.2); each field holds a value it had during
+// preamble excluded; each field holds a value it had during
 // the call, and PipeID with PipeBound are read at one point. Both
 // parts of a bidirectional stream return the same snapshot; the fields of
 // a direction the stream lacks stay 0. Once the session released the

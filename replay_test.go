@@ -74,15 +74,13 @@ func TestReplayFilterClockConcurrent(t *testing.T) {
 	var mu sync.Mutex
 	fresh := 0
 	for range 16 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if f.Check([]byte("k"), now) == ReplayFresh {
 				mu.Lock()
 				fresh++
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if fresh != 1 || f.Len() != 1 {

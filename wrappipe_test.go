@@ -16,13 +16,13 @@ import (
 // tlsWrapConfig is a session config whose join secret is pipe 0's TLS
 // exporter: a session starts only when both ends see the same TLS.
 func tlsWrapConfig() *Config {
-	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true},
+	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true},
 		SchedulerParams: SchedulerParams{NoProbation: true}}
 }
 
 // serverTLSWrap is a WrapPipe that runs a TLS server over every carrier.
-func serverTLSWrap(cfg *tls.Config) func(context.Context, PipeIO, JoinHint) (PipeIO, error) {
-	return func(ctx context.Context, p PipeIO, _ JoinHint) (PipeIO, error) {
+func serverTLSWrap(cfg *tls.Config) func(context.Context, PipeIO, PipeHint) (PipeIO, error) {
+	return func(ctx context.Context, p PipeIO, _ PipeHint) (PipeIO, error) {
 		tc := tls.Server(PipeConn(p), cfg)
 		if err := tc.HandshakeContext(ctx); err != nil {
 			_ = tc.Close()
@@ -51,7 +51,7 @@ func clientTLSWrap(c Candidate, cfg *tls.Config) Candidate {
 }
 
 // checkWrapped checks a session over wrapped carriers: data flows, the
-// carrier kinds are unchanged, and a carrier-bound join over a further
+// carrier kinds are unchanged, and a join over a further
 // wrapped carrier succeeds.
 func checkWrapped(t *testing.T, ctx context.Context, c, s *Conn, kind CarrierKind, more func() PipeIO) {
 	t.Helper()
@@ -65,8 +65,8 @@ func checkWrapped(t *testing.T, ctx context.Context, c, s *Conn, kind CarrierKin
 			t.Fatalf("carrier kind %v, want %v", st.Carrier, kind)
 		}
 	}
-	if _, err := c.AddPipe(ctx, more(), PipeOptions{CarrierBound: true}); err != nil {
-		t.Fatalf("carrier-bound join: %v", err)
+	if _, err := c.AddPipe(ctx, more(), PipeOptions{}); err != nil {
+		t.Fatalf("join: %v", err)
 	}
 	echoOnce(t, ctx, c, s)
 }
@@ -79,7 +79,7 @@ func TestWrapPipeTLS(t *testing.T) {
 	defer cancel()
 
 	t.Run("tcp", func(t *testing.T) {
-		lst := NewListener(&ListenerConfig{Config: tlsWrapConfig(), WrapPipe: serverTLSWrap(scfg)})
+		lst := mustNewListener(&ListenerConfig{Config: tlsWrapConfig(), WrapPipe: WrapPipeFunc(serverTLSWrap(scfg))})
 		defer func() { _ = lst.Close() }()
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -111,7 +111,7 @@ func TestWrapPipeTLS(t *testing.T) {
 	})
 
 	t.Run("streaming", func(t *testing.T) {
-		lst := NewListener(&ListenerConfig{Config: tlsWrapConfig(), WrapPipe: serverTLSWrap(scfg)})
+		lst := mustNewListener(&ListenerConfig{Config: tlsWrapConfig(), WrapPipe: WrapPipeFunc(serverTLSWrap(scfg))})
 		defer func() { _ = lst.Close() }()
 		hh, err := NewHTTPHandler(lst, nil)
 		if err != nil {
@@ -150,7 +150,7 @@ func TestWrapPipeFailure(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			cfg := mpConfig()
 			cfg.HandshakeTimeout = 200 * time.Millisecond
-			wrap := func(_ context.Context, p PipeIO, _ JoinHint) (PipeIO, error) {
+			wrap := func(_ context.Context, p PipeIO, _ PipeHint) (PipeIO, error) {
 				if mode == "error" {
 					return PipeIO{}, errors.New("refused")
 				}
@@ -158,11 +158,11 @@ func TestWrapPipeFailure(t *testing.T) {
 				_, err := p.R.Read(b[:]) // ignores ctx: ends when p is closed
 				return PipeIO{}, err
 			}
-			lst := NewListener(&ListenerConfig{Config: cfg, WrapPipe: wrap})
+			lst := mustNewListener(&ListenerConfig{Config: cfg, WrapPipe: WrapPipeFunc(wrap)})
 			defer func() { _ = lst.Close() }()
 			a, b := net.Pipe()
 			done := make(chan error, 1)
-			go func() { done <- lst.HandlePipe(context.Background(), NetPipe(a), JoinHint{}) }()
+			go func() { done <- lst.HandlePipe(context.Background(), NetPipe(a), PipeHint{}) }()
 			select {
 			case err := <-done:
 				if err == nil {
@@ -188,14 +188,14 @@ func TestWrapPipeFailure(t *testing.T) {
 func TestWrapPipeSplit(t *testing.T) {
 	leakcheck.Check(t)
 	var mu sync.Mutex
-	var halves []JoinHint
-	wrap := func(_ context.Context, p PipeIO, hint JoinHint) (PipeIO, error) {
+	var halves []PipeHint
+	wrap := func(_ context.Context, p PipeIO, hint PipeHint) (PipeIO, error) {
 		mu.Lock()
 		halves = append(halves, hint)
 		mu.Unlock()
 		return p, nil
 	}
-	lst := NewListener(&ListenerConfig{Config: mpConfig(), WrapPipe: wrap})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), WrapPipe: WrapPipeFunc(wrap)})
 	defer func() { _ = lst.Close() }()
 	hh, err := NewHTTPHandler(lst, nil)
 	if err != nil {
@@ -221,8 +221,8 @@ func TestWrapPipeSplit(t *testing.T) {
 	echoOnce(t, ctx, c, s)
 	mu.Lock()
 	defer mu.Unlock()
-	if len(halves) != 2 || halves[0].Pair == "" || halves[0].Pair != halves[1].Pair || halves[0].Uplink == halves[1].Uplink {
-		t.Fatalf("halves %+v", halves)
+	if len(halves) != 1 || halves[0].Pair != "" {
+		t.Fatalf("WrapPipe runs once, on the pair: %+v", halves)
 	}
 	if st, _ := s.Pipes()[0].Stats(); st.Carrier != CarrierSplit {
 		t.Fatalf("carrier kind %v", st.Carrier)

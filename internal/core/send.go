@@ -354,8 +354,8 @@ func (s *Session) Reset(st *Stream, code uint64) {
 	s.startReset(st, code, false)
 }
 
-// startReset queues RESET_STREAM or RESET_STREAM_AT (SPEC.md 4.3,
-// EXTENSIONS.md 4.5). stopReply: the reset answers STOP_SENDING.
+// startReset queues RESET_STREAM or RESET_STREAM_AT.
+// stopReply: the reset answers STOP_SENDING.
 func (s *Session) startReset(st *Stream, code uint64, stopReply bool) {
 	sp := &st.snd
 	if sp.reset {
@@ -392,7 +392,7 @@ func (s *Session) startReset(st *Stream, code uint64, stopReply bool) {
 	s.wakeAllWriters()
 }
 
-// cancelUnopened forgets a stream that never emitted a frame (SPEC.md 7.2).
+// cancelUnopened forgets a stream that never emitted a frame.
 func (s *Session) cancelUnopened(st *Stream) {
 	if st.cancelled {
 		return
@@ -419,7 +419,7 @@ func (s *Session) cancelUnopened(st *Stream) {
 	s.wakeOpeners()
 }
 
-// onStopSending handles a received STOP_SENDING (SPEC.md 4.3).
+// onStopSending handles a received STOP_SENDING.
 func (s *Session) onStopSending(st *Stream, code uint64) {
 	sp := &st.snd
 	if sp.state == sendDataRecvd || sp.state == sendResetRecvd {

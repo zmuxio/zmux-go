@@ -25,7 +25,7 @@ func (l *lenShaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
 		p.Delay = l.delay
 	}
 }
-func (l *lenShaper) OnEvent(*shaping.Event, *shaping.Reply) {}
+func (l *lenShaper) OnEvent(*shaping.Event, *shaping.Effects) {}
 
 func multiSession(t *testing.T, recMax uint64, data int) (*Session, *Pipe) {
 	t.Helper()
@@ -119,8 +119,8 @@ func TestBatchManyRecordsShaped(t *testing.T) {
 		t.Fatalf("%d records in the batch, want >= 100", len(b.recs))
 	}
 	for i, r := range b.recs {
-		if r.size > 300 {
-			t.Fatalf("record %d of %d bytes beyond MaxLen 300", i, r.size)
+		if wireOf(r.size, true, 0) > 300 {
+			t.Fatalf("record %d of %d frame bytes beyond MaxLen 300", i, r.size)
 		}
 	}
 	if sh.plans < len(b.recs) || sh.plans > len(b.recs)+1 {

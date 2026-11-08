@@ -59,7 +59,7 @@ func TestChannelDatagramMalformed(t *testing.T) {
 
 func TestCarrierDatagramsParam(t *testing.T) {
 	p := Params{Has: HasCarrierDatagrams | HasDatagram, MaxDatagramFrameSize: 65535, MaxRecordSize: DefaultMaxRecordSize}
-	b := AppendParams(nil, &p)
+	b, _ := AppendParams(nil, &p)
 	var q Params
 	if err := DecodeParams(b, &q); err != nil {
 		t.Fatal(err)

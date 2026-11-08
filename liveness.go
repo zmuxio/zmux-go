@@ -203,7 +203,7 @@ func (p *Pipe) ClearLiveness() error { return p.SetLiveness(PipeLiveness{}) }
 // RaiseIncomingStreams raises the number of bidirectional and of
 // unidirectional streams the peer may have open (MaxIncomingStreams,
 // MaxIncomingUniStreams) to bidi and uni while the session runs, and
-// sends the credit as MAX_STREAMS. The credit only grows (SPEC.md 8.5): a
+// sends the credit as MAX_STREAMS. The credit only grows: a
 // value at or below the current one leaves that type as it is, so 0
 // raises nothing. While the unidirectional credit is still staged
 // (MaxIncomingUniStreams zero), uni raises the value the first

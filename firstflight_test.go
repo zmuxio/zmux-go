@@ -56,7 +56,7 @@ func startHeld(t *testing.T, ctx context.Context, p PipeIO, peer PipeIO, cfg *Co
 	}
 	ch := make(chan *Conn, 1)
 	go func() {
-		s, err := Start(ctx, peer, RoleServer, mpConfig())
+		s, err := startServerNoListener(ctx, peer, mpConfig())
 		if err != nil {
 			t.Error(err)
 		}
@@ -188,7 +188,7 @@ func TestHoldFirstFlightConfig(t *testing.T) {
 	}
 	a, b := net.Pipe()
 	defer func() { _ = a.Close(); _ = b.Close() }()
-	if _, err := Start(context.Background(), NetPipe(a), RoleServer, holdConfig()); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := startServerNoListener(context.Background(), NetPipe(a), holdConfig()); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("server: %v", err)
 	}
 }

@@ -130,3 +130,28 @@ func TestFakeClockResumeGrace(t *testing.T) {
 		t.Fatalf("session ended with %v", err)
 	}
 }
+
+// backwardClock reads earlier than the reading a session starts from.
+type backwardClock struct {
+	*timeshim.Fake
+	reads int
+}
+
+func (c *backwardClock) Now() time.Time {
+	c.reads++
+	return c.Fake.Now().Add(-time.Duration(c.reads) * time.Millisecond)
+}
+
+// TestClockNeverNegative: session time starts at 0 on the host clock, from
+// a session's first reading on, and on a configured clock that steps back.
+func TestClockNeverNegative(t *testing.T) {
+	for range 10000 {
+		if now := newClock(nil).now(); now < 0 {
+			t.Fatalf("host clock read %d right after its start", now)
+		}
+	}
+	c := newClock(&backwardClock{Fake: timeshim.NewFake(time.Unix(1_000_000, 0))})
+	if now := c.now(); now != 0 {
+		t.Fatalf("configured clock stepped back: read %d", now)
+	}
+}

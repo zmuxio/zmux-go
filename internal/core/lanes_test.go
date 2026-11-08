@@ -104,10 +104,10 @@ func (d *planShaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
 	d.lanes = append(d.lanes, v.Lane)
 	p.Delay, p.PadTo = d.delay, d.padTo
 }
-func (d *planShaper) OnEvent(*shaping.Event, *shaping.Reply) {}
+func (d *planShaper) OnEvent(*shaping.Event, *shaping.Effects) {}
 
-// A lane's PIPE_LANE record is a record of its pipe like any other
-// (MULTIPATH.md 5.8): the pipe's Shaper plans it, its delay holds it and,
+// A lane's PIPE_LANE record is a record of its pipe like any other:
+// the pipe's Shaper plans it, its delay holds it and,
 // while it waits, every other lane of the pipe, and its padding is
 // applied, PIPE_LANE and PADDING being all the record holds.
 func TestLaneFirstRecordShaped(t *testing.T) {
@@ -161,7 +161,7 @@ func TestLaneFirstRecordShaped(t *testing.T) {
 			t.Fatalf("the PIPE_LANE record holds %v", recs[0])
 		}
 	}
-	if size, _ := varint.ConsumeVarint(b.Bufs()[0]); size != 200 {
-		t.Fatalf("PIPE_LANE record of %d bytes, want the planned 200", size)
+	if size, n := varint.ConsumeVarint(b.Bufs()[0]); int(size)+n != 200 {
+		t.Fatalf("PIPE_LANE record of %d bytes on the wire, want the planned 200", int(size)+n)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"net"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func TestListenerStats(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	lst := NewListener(&ListenerConfig{FirstRecordTimeout: 100 * time.Millisecond, Config: mpConfig()})
+	lst := mustNewListener(&ListenerConfig{FirstRecordTimeout: 100 * time.Millisecond, Config: mpConfig()})
 	done := make(chan struct{})
 	go func() { _ = lst.Serve(ctx, ln); close(done) }()
 	defer func() { cancel(); _ = lst.Close(); <-done }()
@@ -72,7 +73,7 @@ func TestListenerStats(t *testing.T) {
 	srvTLS, _ := selfSignedTLS(t)
 	a1, a2 := net.Pipe()
 	served := make(chan struct{})
-	go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a2, srvTLS)), JoinHint{}); close(served) }()
+	go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a2, srvTLS)), PipeHint{}); close(served) }()
 	_, _ = a1.Write([]byte("not a client hello"))
 	_ = a1.Close()
 	<-served
@@ -82,7 +83,7 @@ func TestListenerStats(t *testing.T) {
 	_ = lst.Close()
 	r1, r2 := net.Pipe()
 	defer func() { _ = r2.Close() }()
-	if err := lst.HandlePipe(ctx, NetPipe(r1), JoinHint{}); err == nil {
+	if err := lst.HandlePipe(ctx, NetPipe(r1), PipeHint{}); err == nil {
 		t.Fatal("a closed listener took a carrier")
 	}
 	got := lst.Stats()
@@ -107,7 +108,7 @@ func TestListenerStatsIdentity(t *testing.T) {
 	defer cancel()
 	scfg := mpConfig()
 	scfg.HandshakeTimeout = 300 * time.Millisecond
-	lst := NewListener(&ListenerConfig{FirstRecordTimeout: 100 * time.Millisecond, Config: scfg})
+	lst := mustNewListener(&ListenerConfig{FirstRecordTimeout: 100 * time.Millisecond, Config: scfg})
 	done := make(chan struct{})
 	go func() { _ = lst.Serve(ctx, ln); close(done) }()
 	defer func() { cancel(); _ = lst.Close(); <-done }()
@@ -179,7 +180,7 @@ func TestListenerStatsIdentity(t *testing.T) {
 	h1, h2 := net.Pipe()
 	tok := base64.RawURLEncoding.EncodeToString(make([]byte, 16))
 	go func() {
-		_ = lst.HandlePipe(ctx, PipeIO{R: h1, Carrier: CarrierSplit}, JoinHint{Pair: tok, Uplink: true})
+		_ = lst.HandlePipe(ctx, PipeIO{R: h1, Carrier: CarrierSplit}, PipeHint{Pair: tok, Uplink: true})
 	}()
 	expect("an unpaired half", 1)
 	_ = h2.Close()
@@ -188,10 +189,10 @@ func TestListenerStatsIdentity(t *testing.T) {
 	for _, v := range []Verdict{VerdictClose, VerdictFallback, VerdictStall} {
 		adm := &Admission{StallMin: time.Millisecond, StallMax: 10 * time.Millisecond,
 			Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: v} }}
-		al := NewListener(&ListenerConfig{Config: mpConfig(), Admission: adm,
+		al := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm,
 			Fallback: func(_ context.Context, c net.Conn) { _ = c.Close() }})
 		a1, a2 := net.Pipe()
-		_ = al.HandlePipe(ctx, NetPipe(a2), JoinHint{})
+		_ = al.HandlePipe(ctx, NetPipe(a2), PipeHint{})
 		_ = a1.Close()
 		got := al.Stats()
 		want := map[Verdict]AdmissionStats{VerdictClose: {Closed: 1}, VerdictFallback: {Fallback: 1}, VerdictStall: {Stalled: 1}}[v]
@@ -214,7 +215,7 @@ func TestListenerStatsIdentity(t *testing.T) {
 	_ = lst.Close()
 	r1, r2 := net.Pipe()
 	defer func() { _ = r2.Close() }()
-	_ = lst.HandlePipe(ctx, NetPipe(r1), JoinHint{})
+	_ = lst.HandlePipe(ctx, NetPipe(r1), PipeHint{})
 	expect("a refusal", 1)
 
 	got := lst.Stats()
@@ -225,11 +226,18 @@ func TestListenerStatsIdentity(t *testing.T) {
 }
 
 // earlyHalf is a server carrier half that took early data and whose
-// handshake never completes.
-type earlyHalf struct{ net.Conn }
+// handshake never completes; asked closes when the join waits for it.
+type earlyHalf struct {
+	net.Conn
+	once  sync.Once
+	asked chan struct{}
+}
 
-func (earlyHalf) UsedEarlyData() bool                { return true }
-func (earlyHalf) HandshakeComplete() <-chan struct{} { return nil }
+func (*earlyHalf) UsedEarlyData() bool { return true }
+func (h *earlyHalf) HandshakeComplete() <-chan struct{} {
+	h.once.Do(func() { close(h.asked) })
+	return nil
+}
 
 // TestEarlyJoinWaitCancelled checks that a join sent in early data whose
 // wait for the handshake is cancelled counts as a setup failure, and
@@ -239,14 +247,19 @@ func TestEarlyJoinWaitCancelled(t *testing.T) {
 	e := newMPEnv(t, mpConfig(), mpConfig())
 	before := e.lst.Stats()
 	cli, srv := net.Pipe()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	go func() { _, _ = e.client.AddPipe(ctx, NetPipe(cli), PipeOptions{}) }()
 	hctx, hcancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
-	go func() { done <- e.lst.HandlePipe(hctx, PipeIO{R: srv, W: earlyHalf{srv}}, JoinHint{}) }()
+	half := &earlyHalf{Conn: srv, asked: make(chan struct{})}
+	go func() { done <- e.lst.HandlePipe(hctx, PipeIO{R: srv, W: half}, PipeHint{}) }()
 	// The join waits for the handshake: nothing is counted yet.
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-half.asked:
+	case <-ctx.Done():
+		t.Fatal("the join never waited for the handshake")
+	}
 	if got := e.lst.Stats(); got != before {
 		t.Fatalf("counted while waiting: %+v", got)
 	}

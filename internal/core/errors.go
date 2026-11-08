@@ -64,7 +64,7 @@ func (e *SessionError) Error() string {
 
 func (e *SessionError) Unwrap() error { return e.Cause }
 
-// StreamErrKind classifies stream-level outcomes (STATE_MACHINE.md 2.5).
+// StreamErrKind classifies stream-level outcomes.
 type StreamErrKind uint8
 
 const (
@@ -109,9 +109,10 @@ var (
 	ErrNotEstablished = errors.New("zmux: session not established")
 	ErrTooLate        = errors.New("zmux: setting must precede the first frame")
 	ErrInvalid        = errors.New("zmux: invalid argument")
-	// ErrJoinSecretPending reports that the deferred PSK was not supplied
-	// yet, so that no join key exists (MULTIPATH.md 10.1).
-	ErrJoinSecretPending = errors.New("zmux: join secret pending")
+	// ErrGroupNotUsable is a local join's Group outside the session's usable Groups.
+	ErrGroupNotUsable = errors.New("zmux: Group not usable in the session")
+	// ErrJoinPending reports a session without join keys yet.
+	ErrJoinPending = errors.New("zmux: join pending")
 	// ErrJoinSecretSet reports that the deferred PSK was already supplied.
 	ErrJoinSecretSet = errors.New("zmux: join secret already set")
 )

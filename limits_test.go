@@ -15,12 +15,9 @@ import (
 // below 1 ms are configuration errors, not corrected.
 func TestConfigLimitsValidation(t *testing.T) {
 	bad := []Config{
-		{ShapingLimits: shaping.Limits{MaxPaddingRatio: -0.1}},
-		{ShapingLimits: shaping.Limits{MaxPaddingRatio: 1.5}},
-		{ShapingLimits: shaping.Limits{MaxPaddingRatio: math.NaN()}},
-		{ShapingLimits: shaping.Limits{MaxPaddingRatio: math.Inf(1)}},
-		{ShapingLimits: shaping.Limits{MaxPauseTotal: -time.Second}},
-		{ShapingLimits: shaping.Limits{MaxDelay: -1}},
+		{ShapingLimits: shaping.Limits{Wire: shaping.Account{Initial: shaping.MaxAccountInitial + 1}}},
+		{ShapingLimits: shaping.Limits{Wire: shaping.Account{PerMB: shaping.MaxAccountRate + 1}}},
+		{ShapingLimits: shaping.Limits{Wire: shaping.Account{PerSec: math.MaxUint64}}},
 		{SchedulerParams: SchedulerParams{ProbeInterval: time.Nanosecond}},
 		{SchedulerParams: SchedulerParams{ProbeInterval: 999 * time.Millisecond}},
 		{SchedulerParams: SchedulerParams{StandbyProbe: 500 * time.Millisecond}},
@@ -40,7 +37,8 @@ func TestConfigLimitsValidation(t *testing.T) {
 		}
 	}
 	good := []Config{
-		{ShapingLimits: shaping.Limits{MaxPaddingRatio: 1, MaxPaddingBytes: 1 << 20, MaxDelay: time.Second}},
+		{ShapingLimits: shaping.Limits{Wire: shaping.Account{Initial: shaping.MaxAccountInitial, PerMB: shaping.MaxAccountRate, PerSec: shaping.MaxAccountRate}, MaxDelay: time.Second}},
+		{ShapingLimits: shaping.Limits{MaxDelay: -1}},
 		{SchedulerParams: SchedulerParams{ProbeInterval: time.Second}},
 		{KeepAlivePeriod: time.Second, MaxIdleTimeout: time.Millisecond},
 		{SchedulerParams: SchedulerParams{ProbeInterval: -1, StandbyProbe: -1, NoProbeJitter: true}},
@@ -76,10 +74,12 @@ func TestExportedDefaults(t *testing.T) {
 		{"DefaultProbeJitter", DefaultProbeJitter, 0.25},
 		{"probe jitter in effect", cc.ProbeJitter, DefaultProbeJitter},
 		{"DefaultMaxRecordSize", DefaultMaxRecordSize, 16382},
-		{"shaping.StartupAllowance", shaping.StartupAllowance, DefaultMaxRecordSize},
+		{"shaping.DefaultMaxDelay", shaping.DefaultMaxDelay, time.Second},
 		{"shaping.MinMaxLen", shaping.MinMaxLen, 64},
-		{"MaxRedialBackoff", MaxRedialBackoff, 30 * time.Second},
+		{"DefaultMinBackoff", DefaultMinBackoff, time.Second},
 		{"DefaultMaxBackoff", DefaultMaxBackoff, 60 * time.Second},
+		{"DefaultJoinTimeout", DefaultJoinTimeout, 10 * time.Second},
+		{"join timeout in effect", time.Duration(cc.JoinTimeout), DefaultJoinTimeout},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s: %v (%T), want %v (%T)", c.name, c.got, c.got, c.want, c.want)

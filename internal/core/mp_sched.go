@@ -1,9 +1,11 @@
 package core
 
+import "slices"
+
 import "math"
 
 // Multipath scheduling policies: which stream data a pipe takes when it
-// can write (late binding), within the sender rules of MULTIPATH.md 11.
+// can write (late binding), within the multipath sender rules.
 
 const (
 	ecfBeta         = 0.25
@@ -16,16 +18,15 @@ const (
 // pipe shares; the gate is rebuilt per chunk only where it can change
 // (several tiers).
 type decision struct {
-	p            *Pipe
-	g            *gate
-	fastest      *Pipe // the eligible pipe of p's tier with the smallest ETA for a chunk
-	lv           *levelStats
-	tier         int
-	multiTier    bool
-	open         bool
-	usable       bool
-	takes        bool
-	joiningTakes bool
+	p         *Pipe
+	g         *gate
+	fastest   *Pipe // the eligible pipe of p's tier with the smallest ETA for a chunk
+	lv        *levelStats
+	tier      int
+	multiTier bool
+	open      bool
+	usable    bool
+	takes     bool
 }
 
 // newDecision prepares the decision for pipe p now.
@@ -33,7 +34,6 @@ func (s *Session) newDecision(d *decision, p *Pipe) {
 	*d = decision{p: p, lv: d.lv}
 	d.open = s.open(p)
 	d.g = s.buildGate()
-	d.joiningTakes = p.mp.out == OutJoining
 	if d.g == nil {
 		return
 	}
@@ -73,13 +73,12 @@ func (s *Session) onPipe(d *decision, st *Stream) bool {
 	p := d.p
 	sp := &st.snd
 	if d.g == nil {
-		// No pipe is usable: a JOINING pipe carries stream data
-		// (MULTIPATH.md 11 rule S1).
-		return d.joiningTakes
+		// No pipe is usable: only a Hello's first batch, outside this path, goes.
+		return false
 	}
 	if m := sp.mps; m != nil && (len(m.resend) > 0 || m.finResend) {
 		// Reinjected information goes on the eligible pipe of the tier
-		// with the earliest arrival (rule S3), within the reinjection hold.
+		// with the earliest arrival, within the reinjection hold.
 		return d.takes && d.fastest == p && s.reinjectRoom(p)
 	}
 	if d.takes && s.redundant(st) {
@@ -315,7 +314,7 @@ func (s *Session) spreadETAOK(d *decision, st *Stream) bool {
 	u := st.urgency & 7
 	lv := s.levels(d)
 	var more uint64
-	for v := uint8(0); v < u; v++ {
+	for v := range u {
 		more += lv.total[v]
 	}
 	room := s.conn.sendMax - min64(s.conn.sendMax, s.conn.sent)
@@ -725,17 +724,13 @@ func (s *Session) refreshBindings(g *gate) {
 		}
 		if target != nil && target.id != b.pipe {
 			b.moving, b.moveTo = true, target.id
+			s.noteBlocked(st)
 		}
 	}
 }
 
 func containsU64(x []uint64, v uint64) bool {
-	for _, y := range x {
-		if y == v {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(x, v)
 }
 
 // ---- custom policies ----
@@ -780,7 +775,8 @@ func (s *Session) customOK(d *decision, st *Stream) bool {
 const pickWait = Millisecond
 
 // pipeTakesAny reports whether a pipe may carry new data at all (a custom
-// policy may override the tiers, never rule S1).
+// policy may override the tiers, never the rule that only an
+// active, unfailed outbound direction carries data).
 func (s *Session) pipeTakesAny(p *Pipe) bool {
 	return p.mp.out == OutActive && p.out != nil && !p.out.failed
 }
@@ -839,8 +835,8 @@ type PickPipe struct {
 	Saturated bool
 	Probation bool
 	Eligible  bool
-	Shaping   bool    // a Shaper is active on the pipe
-	ShapingW  float64 // the Shaper's weight; 0: none
+	Shaping   bool   // a Shaper is active on the pipe
+	ShapingW  uint32 // the Shaper's weight; 0: none
 }
 
 // PickAnswer is a policy's answer for one direction: a pipe index of the
@@ -873,7 +869,7 @@ func (s *Session) TakePick(req *PickRequest) bool {
 	req.Gen = mp.pickGen
 	g := s.buildGate()
 	for _, p := range s.pipes {
-		if p.mp == nil || p.out == nil || !p.mp.liveOut() {
+		if p.mp == nil || p.out == nil || p.mp.hs || !p.mp.liveOut() {
 			continue
 		}
 		pr, sb := p.mp.effPrio()
@@ -931,7 +927,7 @@ func (s *Session) AnswerPick(req *PickRequest, answers []PickAnswer, failed bool
 		}
 		a := answers[i]
 		switch {
-		case a.Wait: // not counted: only answers that name a pipe are (API.md 7.2)
+		case a.Wait: // not counted: only answers that name a pipe are
 			m.pick = pickAnswer{set: true, wait: true, gen: req.Gen, epoch: mp.inputEpoch, asked: true}
 		case a.Index < 0 || a.Index >= len(req.Pipes):
 			s.stats.SchedulerFallbacks++

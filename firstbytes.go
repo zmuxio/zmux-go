@@ -56,17 +56,17 @@ func firstLead(b byte) bool {
 // with framing f (for FramingRecords, the start of the first message), can
 // begin a first record of this specification: on a byte stream a Size of
 // at least 9 and at most MaxRecordSize, as a variable-length integer of 1,
-// 2 or 4 bytes, then a first frame type (SPEC.md 6.2; its encoding begins
-// with ff, 9a or ba, REGISTRY.md 2.4); in a message, the first frame type
+// 2 or 4 bytes, then a first frame type (its encoding begins with ff or
+// ba); in a message, the first frame type
 // at once. need is the total number of bytes needed (at most
 // MaxFirstBytes) when the result is FirstBytesNeedMore, else 0.
 //
 // It judges the syntax of a prefix only, not the limits of a receiver (the
-// full check of SPEC.md 6.2 is the session's). b beginning 16 03, as TLS
+// full check of a first record is the session's). b beginning 16 03, as TLS
 // does, is always FirstBytesOther. It is the one authority for hosts and
 // transforms that tell zmux records from other content, at admission
-// (Admission.Decide) or when drawing a prefix that must not look like one
-// (redrawn until both framings give FirstBytesOther).
+// (Admission.Decide) or when choosing a prefix (redrawn until both framings
+// give FirstBytesOther).
 func ClassifyFirstBytes(b []byte, f Framing) (c FirstBytes, need int) {
 	if len(b) == 0 {
 		return FirstBytesNeedMore, 1
@@ -100,4 +100,26 @@ func ClassifyFirstBytes(b []byte, f Framing) (c FirstBytes, need int) {
 		return FirstBytesRecord, 0
 	}
 	return FirstBytesOther, 0
+}
+
+// FirstRecordIsLane tells whether b, the first bytes of a carrier with framing f, begin
+// a lane's first record. A transform that handles only its own
+// handshakes passes such a carrier on: the session then checks its Lane Key, connection
+// and record mode. need is the total number of bytes needed when more are wanted, else 0.
+func FirstRecordIsLane(b []byte, f Framing) (lane bool, need int) {
+	lead := byte(0xba)
+	if f == FramingRecords {
+		return len(b) > 0 && b[0] == lead, 0
+	}
+	if len(b) == 0 {
+		return false, 1
+	}
+	size, n := varint.ConsumeVarint(b)
+	if n == 0 {
+		return false, 1 << (b[0] >> 6)
+	}
+	if len(b) <= n {
+		return false, n + 1
+	}
+	return size >= 9 && size <= MaxRecordSize && b[n] == lead, 0
 }

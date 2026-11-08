@@ -1,6 +1,7 @@
 package core
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ func (d *delayShaper) Plan(_ *shaping.RecordView, p *shaping.RecordPlan) {
 	d.plans++
 	p.Delay = d.delay
 }
-func (d *delayShaper) OnEvent(*shaping.Event, *shaping.Reply) {}
+func (d *delayShaper) OnEvent(*shaping.Event, *shaping.Effects) {}
 
 // batchFrames returns the frame kinds of each record of a byte-stream
 // batch.
@@ -90,12 +91,7 @@ func TestShapingDelayHoldsControlFrames(t *testing.T) {
 	recs := batchFrames(t, b)
 	first := recs[0]
 	has := func(k wire.Kind) bool {
-		for _, x := range first {
-			if x == k {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(first, k)
 	}
 	if !has(wire.KindMaxData) || !has(wire.KindStream) {
 		t.Fatalf("first record %v: control frames and data not together", first)
@@ -136,23 +132,24 @@ func TestShapingPadPlacement(t *testing.T) {
 	}
 	bare := wire.StreamHeaderLen(0, 0, len(data), false) + len(data)
 	with := wire.StreamHeaderLen(0, 0, len(data), true) + len(data)
+	wl := func(f int) int { return wireOf(f, true, 0) }
 	for name, tc := range map[string]struct {
-		plan  shaping.RecordPlan
+		plan  shaping.UnitPlan
 		size  int
 		kinds []wire.Kind
 		zeros int // trailing PADDING bytes
 	}{
-		"pad_to inside Length": {shaping.RecordPlan{PadTo: bare + 1}, bare + 1,
+		"pad_to inside Length": {shaping.UnitPlan{PadTo: wl(bare + 1)}, bare + 1,
 			[]wire.Kind{wire.KindPadding, wire.KindStream}, 0},
-		"pad_to at Length end": {shaping.RecordPlan{PadTo: with}, with, []wire.Kind{wire.KindStream}, 0},
-		"pad_to beyond":        {shaping.RecordPlan{PadTo: with + 10}, with + 10, []wire.Kind{wire.KindStream, wire.KindPadding}, 10},
-		"pad only":             {shaping.RecordPlan{Pad: 5}, with + 5, []wire.Kind{wire.KindStream, wire.KindPadding}, 5},
-		"pad and pad_to":       {shaping.RecordPlan{PadTo: bare + 1, Pad: 3}, with + 3, []wire.Kind{wire.KindStream, wire.KindPadding}, 3},
+		"pad_to at Length end": {shaping.UnitPlan{PadTo: wl(with)}, with, []wire.Kind{wire.KindStream}, 0},
+		"pad_to beyond":        {shaping.UnitPlan{PadTo: wl(with + 10)}, with + 10, []wire.Kind{wire.KindStream, wire.KindPadding}, 10},
+		"pad only":             {shaping.UnitPlan{Pad: 5}, with + 5, []wire.Kind{wire.KindStream, wire.KindPadding}, 5},
+		"pad and pad_to":       {shaping.UnitPlan{PadTo: wl(bare + 1), Pad: 3}, with + 3, []wire.Kind{wire.KindStream, wire.KindPadding}, 3},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := New(DefaultConfig(), 0)
 			s.shapeSess()
-			ps := &pipeShape{s: s, sh: nopShaper{}, planned: true, plan: tc.plan}
+			ps := &pipeShape{s: s, sh: nopShaper{}, planned: true, sizeField: true, plan: shaping.RecordPlan{UnitPlan: tc.plan}}
 			b := GetBatch()
 			defer PutBatch(b)
 			var w recWriter
@@ -199,8 +196,8 @@ func TestShapingPadPlacement(t *testing.T) {
 }
 
 // stateShaper moves its state on every plan, like a state machine on
-// record_out: state 0 pads to 768 after a delay and arms timer 0 on its
-// first plan, state 1 pads to 300. The timer only arrives as an event.
+// record_out: state 0 pads to 768 after a delay and sets a wake time on its
+// first plan, state 1 pads to 300. The wake only arrives as an event.
 type stateShaper struct {
 	state int
 	armed bool
@@ -214,14 +211,19 @@ func (x *stateShaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
 		p.PadTo, p.Delay = 768, 20*time.Millisecond
 		if !x.armed {
 			x.armed = true
-			p.Reply.Timer[0] = &shaping.Timer{After: 10 * time.Millisecond}
+			p.Effects.Set = shaping.EffectWake
+			p.Effects.HasWake, p.Effects.Wake = true, v.Now+10*time.Millisecond
 		}
 	} else {
 		p.PadTo = 300
 	}
 	x.state ^= 1
 }
-func (x *stateShaper) OnEvent(*shaping.Event, *shaping.Reply) {}
+func (x *stateShaper) OnEvent(e *shaping.Event, r *shaping.Effects) {
+	if e.Kind == shaping.EventTimer {
+		r.Set = shaping.EffectWake
+	}
+}
 
 // Plan is called once per record: an event between a plan and the
 // sending of its record does not plan the record again, which would move
@@ -255,5 +257,18 @@ func TestShapingPlansARecordOnce(t *testing.T) {
 	s.WriteDone(b, nil, end)
 	if len(x.seqs) == 0 || len(x.seqs) > 2 || x.seqs[0] != 0 || len(x.seqs) == 2 && x.seqs[1] != 1 {
 		t.Fatalf("Plan calls by Seq %v, want one for record 0 (then record 1)", x.seqs)
+	}
+}
+
+// TestShapeUndelayedPlanBeforeZero writes a record planned without a delay
+// at any clock reading: "no delay" is no point in time a clock can precede.
+func TestShapeUndelayedPlanBeforeZero(t *testing.T) {
+	s := New(DefaultConfig(), -1000)
+	s.AttachBootstrap(CarrierInfo{}, CarrierInfo{}, NewSignal())
+	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return &delayShaper{} })
+	b := GetBatch()
+	defer PutBatch(b)
+	if !s.PollTransmit(0, 0, b, DefaultBatch, -1000) {
+		t.Fatal("the first record waits for a delay nobody planned, with no timer to end it")
 	}
 }

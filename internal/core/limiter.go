@@ -150,10 +150,7 @@ func (l *limiter) walk(t Time, unit Duration, downDone bool) (int, Time, float64
 		}
 		return u
 	}
-	left := t.Sub(l.phaseSince)
-	if left < 0 {
-		left = 0
-	}
+	left := max(t.Sub(l.phaseSince), 0)
 	k := l.phase
 	var start int64
 	gain := 0.0

@@ -45,6 +45,15 @@ func (k *kmConn) ExportKeyingMaterial(label string, ctx []byte, n int) ([]byte, 
 	return h[:n], nil
 }
 
+// CarrierSecure declares that the carrier meets the Bound contract.
+func (k *kmConn) CarrierSecure() bool { return true }
+
+// secureTLS is a TLS carrier its host declares fit for Bound.
+type secureTLS struct{ *tls.Conn }
+
+// CarrierSecure declares that the carrier meets the Bound contract.
+func (secureTLS) CarrierSecure() bool { return true }
+
 // kmPair is a connected pair of exporting carriers sharing secret.
 func kmPair(secret string) (*kmConn, *kmConn) {
 	a, b := net.Pipe()
@@ -52,21 +61,22 @@ func kmPair(secret string) (*kmConn, *kmConn) {
 }
 
 func exporterConfig() *Config {
-	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true},
+	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true},
+		AllowRecordMode: func(CarrierInfo, RecordMode, any) bool { return true },
 		SchedulerParams: SchedulerParams{NoProbation: true}}
 }
 
 // A transform's own exporter keys the session: read once, by the bootstrap
 // reader after the carrier delivered the peer's first bytes, and a
-// carrier-bound join over a further such carrier succeeds, while one whose
+// Bound join over a further such carrier succeeds, while one whose
 // exporter differs does not.
 func TestExporterTransform(t *testing.T) {
 	leakcheck.Check(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	lst := NewListener(&ListenerConfig{Config: exporterConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: exporterConfig()})
 	defer func() { _ = lst.Close() }()
-	serve := func(k *kmConn) { go func() { _ = lst.HandlePipe(ctx, PipeIO{R: k, W: k}, JoinHint{}) }() }
+	serve := func(k *kmConn) { go func() { _ = lst.HandlePipe(ctx, PipeIO{R: k, W: k}, PipeHint{}) }() }
 	ck, sk := kmPair("s0")
 	serve(sk)
 	c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, exporterConfig())
@@ -89,8 +99,8 @@ func TestExporterTransform(t *testing.T) {
 	}
 	cj, sj := kmPair("j1")
 	serve(sj)
-	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{CarrierBound: true}); err != nil {
-		t.Fatalf("carrier-bound join: %v", err)
+	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{Mode: new(Bound)}); err != nil {
+		t.Fatalf("Bound join: %v", err)
 	}
 	echoOnce(t, ctx, c, s)
 	cb, sb := kmPair("j2")
@@ -98,24 +108,24 @@ func TestExporterTransform(t *testing.T) {
 	serve(sb)
 	jctx, jcancel := context.WithTimeout(ctx, time.Second)
 	defer jcancel()
-	if _, err := c.AddPipe(jctx, PipeIO{R: cb, W: cb}, PipeOptions{CarrierBound: true}); err == nil {
+	if _, err := c.AddPipe(jctx, PipeIO{R: cb, W: cb}, PipeOptions{Mode: new(Bound)}); err == nil {
 		t.Fatal("join with a different exporter succeeded")
 	}
 }
 
 // PipeAuth.Exporter on a TLS client whose handshake has not run yet (it
 // runs on the session's first write): the exporter is read once the
-// handshake completed, and a carrier-bound join over TLS verifies.
+// handshake completed, and a Bound join over TLS verifies.
 func TestExporterTLSBeforeHandshake(t *testing.T) {
 	leakcheck.Check(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	scfg, ccfg := selfSignedTLS(t)
-	lst := NewListener(&ListenerConfig{Config: exporterConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: exporterConfig()})
 	defer func() { _ = lst.Close() }()
 	pair := func() *tls.Conn {
 		a, b := tcpPair(t)
-		go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), JoinHint{}) }()
+		go func() { _ = lst.HandlePipe(ctx, NetPipe(secureTLS{tls.Server(a, scfg)}), PipeHint{}) }()
 		return tls.Client(b, ccfg)
 	}
 	c, err := Start(ctx, NetPipe(pair()), RoleClient, exporterConfig())
@@ -128,18 +138,18 @@ func TestExporterTLSBeforeHandshake(t *testing.T) {
 	}
 	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
 	echoOnce(t, ctx, c, s)
-	// A carrier-bound join over a TLS client whose handshake has not
+	// A Bound join over a TLS client whose handshake has not
 	// run: AddPipe runs it before reading the exporter.
 	jc := pair()
-	if _, err := c.AddPipe(ctx, NetPipe(jc), PipeOptions{CarrierBound: true}); err != nil {
-		t.Fatalf("carrier-bound join: %v", err)
+	if _, err := c.AddPipe(ctx, NetPipe(secureTLS{jc}), PipeOptions{Mode: new(Bound)}); err != nil {
+		t.Fatalf("Bound join: %v", err)
 	}
 	echoOnce(t, ctx, c, s)
 	// A handshake that fails fails the join.
 	a, b := tcpPair(t)
-	go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), JoinHint{}) }()
+	go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), PipeHint{}) }()
 	bad := tls.Client(b, &tls.Config{ServerName: "elsewhere.invalid"})
-	if _, err := c.AddPipe(ctx, NetPipe(bad), PipeOptions{CarrierBound: true}); err == nil ||
+	if _, err := c.AddPipe(ctx, NetPipe(secureTLS{bad}), PipeOptions{Mode: new(Bound)}); err == nil ||
 		!strings.Contains(err.Error(), "carrier handshake") {
 		t.Fatalf("join over a failing handshake: %v", err)
 	}
@@ -163,16 +173,16 @@ func (e *earlyKM) ExportKeyingMaterial(label string, ctx []byte, n int) ([]byte,
 	}
 }
 
-// A listener reads a carrier-bound join's exporter only once the
+// A listener reads a Bound join's exporter only once the
 // handshake of a carrier that delivered it as early data completed.
 func TestExporterEarlyJoin(t *testing.T) {
 	leakcheck.Check(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	lst := NewListener(&ListenerConfig{Config: exporterConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: exporterConfig()})
 	defer func() { _ = lst.Close() }()
 	ck, sk := kmPair("s0")
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, JoinHint{}) }()
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, PipeHint{}) }()
 	c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, exporterConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -184,10 +194,10 @@ func TestExporterEarlyJoin(t *testing.T) {
 	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
 	cj, sj := kmPair("j1")
 	ej := &earlyKM{kmConn: sj, done: make(chan struct{})}
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: ej, W: ej}, JoinHint{}) }()
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: ej, W: ej}, PipeHint{}) }()
 	time.AfterFunc(100*time.Millisecond, func() { close(ej.done) })
-	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{CarrierBound: true}); err != nil {
-		t.Fatalf("carrier-bound join: %v", err)
+	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{Mode: new(Bound)}); err != nil {
+		t.Fatalf("Bound join: %v", err)
 	}
 	waitUntil(t, 5*time.Second, "the join", func() bool { return len(s.PipeStats()) == 2 })
 }
@@ -197,11 +207,11 @@ func TestExporterReadFails(t *testing.T) {
 	leakcheck.Check(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	lst := NewListener(&ListenerConfig{Config: exporterConfig()})
+	lst := mustNewListener(&ListenerConfig{Config: exporterConfig()})
 	defer func() { _ = lst.Close() }()
 	ck, sk := kmPair("s0")
 	ck.fail = errors.New("handshake incomplete")
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, JoinHint{}) }()
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, PipeHint{}) }()
 	c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, exporterConfig())
 	if err == nil {
 		_ = c.Close()
@@ -325,7 +335,7 @@ func TestExporterSplit(t *testing.T) {
 		if _, err := e.value(); err == nil {
 			t.Fatalf("%s: value before load", tc.name)
 		}
-		e.load()
+		_ = e.load(nil)
 		got, err := e.value()
 		if err != nil || !bytes.Equal(got, tc.want) {
 			t.Fatalf("%s: %x %v", tc.name, got, err)

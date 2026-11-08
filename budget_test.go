@@ -22,7 +22,7 @@ func TestListenerMemoryBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	l := NewListener(&ListenerConfig{MemoryBudget: budget, Config: &Config{},
+	l := mustNewListener(&ListenerConfig{MemoryBudget: budget, Config: &Config{},
 		OnMemoryPressure: func(used, b int64) { notes <- note{used, b} }})
 	defer func() { _ = l.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -33,7 +33,7 @@ func TestListenerMemoryBudget(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go func() { _ = l.HandlePipe(ctx, NetPipe(nc), JoinHint{}) }()
+			go func() { _ = l.HandlePipe(ctx, NetPipe(nc), PipeHint{}) }()
 		}
 	}()
 	dial := func() (*Conn, error) {
@@ -77,8 +77,7 @@ func TestListenerMemoryBudget(t *testing.T) {
 	}
 	if c2, err := dial(); err == nil {
 		werr := c2.Wait()
-		var te *TransportError
-		if !errors.As(werr, &te) {
+		if _, ok := errors.AsType[*TransportError](werr); !ok {
 			t.Fatalf("new session under pressure: %v", werr)
 		}
 	}

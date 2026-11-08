@@ -2,7 +2,7 @@ package zmux
 
 import "testing"
 
-// The alias table of SPEC.md 6.2.
+// The specification's table of ALPN aliases.
 func TestALPNAlias(t *testing.T) {
 	for _, tc := range []struct{ id, alias string }{
 		{"qmux-02", "qmux-01"},

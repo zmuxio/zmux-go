@@ -12,13 +12,13 @@ import (
 func twoPipeSession() (*Conn, *Conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cfg := &Config{MaxPipes: 2, PipeAuth: PipeAuth{PSK: []byte("an example pre-shared key, 32 B")}}
-	l := NewListener(&ListenerConfig{Config: cfg})
+	cfg := &Config{MaxPipes: 2, PipeAuth: PipeAuth{PSK: []byte("an example pre-shared key, 32 B"), EndToEnd: true}}
+	l := mustNewListener(&ListenerConfig{Config: cfg})
 	defer func() { _ = l.Close() }()
 	a0, b0 := net.Pipe()
 	a1, b1 := net.Pipe()
-	go func() { _ = l.HandlePipe(ctx, NetPipe(b0), JoinHint{}) }()
-	go func() { _ = l.HandlePipe(ctx, NetPipe(b1), JoinHint{}) }()
+	go func() { _ = l.HandlePipe(ctx, NetPipe(b0), PipeHint{}) }()
+	go func() { _ = l.HandlePipe(ctx, NetPipe(b1), PipeHint{}) }()
 	client, err := Client(ctx, a0, cfg)
 	if err != nil {
 		return nil, nil, err
@@ -48,7 +48,7 @@ func twoPipeSession() (*Conn, *Conn, error) {
 // once, many times: a pipe that fails before it carried CONNECTION_CLOSE
 // must not leave the other end CLOSING for ever.
 func TestCloseWhileJoinedPipeFails(t *testing.T) {
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		c, s, err := twoPipeSession()
 		if err != nil {
 			t.Fatal(err)

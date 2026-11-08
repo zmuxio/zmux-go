@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
 )
@@ -21,10 +23,13 @@ const (
 	DefaultMaxIdleTimeout = time.Duration(core.DefaultIdleTimeout)
 	// DefaultProbeJitter is the default SchedulerParams.ProbeJitter.
 	DefaultProbeJitter = core.DefaultProbeJitter
-	// MaxRedialBackoff caps the wait between Config.Redial calls, the
-	// built-in backoff and RedialPolicy's DialAfter alike.
-	MaxRedialBackoff = 30 * time.Second
-	// DefaultMaxBackoff is the default PipePool.MaxBackoff of MaintainPipes.
+	// DefaultJoinTimeout is the default Config.JoinTimeout.
+	DefaultJoinTimeout = time.Duration(core.DefaultHandshakeTimeout)
+	// DefaultMinBackoff and DefaultMaxBackoff are the default bounds of
+	// the redial backoff, Config.RedialMinBackoff and RedialMaxBackoff for
+	// the Redial hook and PipePool.MinBackoff and MaxBackoff for each
+	// pool: the wait starts at the minimum and doubles up to the maximum.
+	DefaultMinBackoff = time.Second
 	DefaultMaxBackoff = 60 * time.Second
 )
 
@@ -35,13 +40,35 @@ const DefaultMaxRecordSize = wire.DefaultMaxRecordSize
 
 // Config configures a session; nil *Config means all defaults. Its fields
 // follow the Settings rules of the package documentation: the zero value
-// selects the stated default, a negative timeout is no timeout, other
-// negative values are invalid (ErrInvalidConfig) unless the field gives
-// them a meaning, and the Disable and No fields switch features off.
+// selects the stated default, a negative timeout is no timeout where the
+// field says so, other negative values are invalid (ErrInvalidConfig)
+// unless the field gives them a meaning, and the Disable and No fields
+// switch features off. A value out of range is an error, never corrected.
 type Config struct {
-	// HandshakeTimeout bounds establishment and join confirmation. Zero
-	// is 10 s; a negative value is no timeout.
+	// HandshakeTimeout bounds establishment: the peer's transport
+	// parameters must arrive within it. Zero is 10 s; a negative value is
+	// no timeout. It does not bound joins (JoinTimeout).
 	HandshakeTimeout time.Duration
+	// JoinTimeout is the deadline of every join: a pipe this endpoint adds
+	// (AddPipe without a context deadline, Redial, PipePool), a pipe or
+	// lane the peer adds until it is confirmed, a join held for the join
+	// keys and a carrier stalled after a rejected join. Zero is
+	// DefaultJoinTimeout (10 s); it cannot be no timeout, so a negative
+	// value is invalid, and so is one above the maximum join deadline of 60 s,
+	// on which epoch retention rests. It is independent of HandshakeTimeout.
+	JoinTimeout time.Duration
+	// EpochPeriod, EpochJoins, NoEpochAfterFirstPipe and NoEpochAfterResume
+	// are the policy of session epochs, the key exchanges that evolve the
+	// session secret. A multipath session advances its epoch after EpochPeriod
+	// in one epoch, after EpochJoins joins in it, once when its first Sealed or
+	// Bound pipe exists if its secret comes from a TLS exporter or a pre-shared
+	// key, and once after a suspension ends. Zero EpochPeriod and EpochJoins are
+	// the defaults, every hour and every 65536 joins; a negative one turns that
+	// trigger off, and the two booleans turn theirs off.
+	EpochPeriod           time.Duration
+	EpochJoins            int
+	NoEpochAfterFirstPipe bool
+	NoEpochAfterResume    bool
 	// MaxIdleTimeout is max_idle_timeout, the time without inbound
 	// activity after which the session closes. Zero is 30 s; a negative
 	// value announces no idle timeout; a positive one is at least 1 ms.
@@ -82,12 +109,12 @@ type Config struct {
 	// 4; granting none takes NoIncomingStreams; a negative value is
 	// invalid.
 	MaxIncomingStreams int64
-	// NoIncomingStreams grants the peer no bidirectional stream.
-	NoIncomingStreams bool
 	// MaxIncomingUniStreams is initial_max_streams_uni. Zero is a staged
 	// credit: 16, raised to 256 on the first AcceptUniStream; a negative
 	// value is invalid.
 	MaxIncomingUniStreams int64
+	// NoIncomingStreams grants the peer no bidirectional stream.
+	NoIncomingStreams bool
 	// NoIncomingUniStreams grants the peer no unidirectional stream.
 	NoIncomingUniStreams bool
 
@@ -106,8 +133,9 @@ type Config struct {
 	// 4 MiB. Multipath sessions grow it to the retransmit budget, within
 	// MaxSendBuffer.
 	SendBuffer uint64
-	// MaxSendBuffer fixes its growth maximum (at least SendBuffer). Zero is
-	// automatic: a 64 MiB floor, above it within the memory budget.
+	// MaxSendBuffer fixes its growth maximum; one below SendBuffer (or
+	// its default) is invalid. Zero is automatic: a 64 MiB floor, above it
+	// within the memory budget.
 	MaxSendBuffer uint64
 
 	// MaxPipes is the attachments this endpoint aims for. Zero or 1 is
@@ -115,34 +143,70 @@ type Config struct {
 	MaxPipes int
 	// PipeHeadroom is H of the attachment cap. Zero is 8.
 	PipeHeadroom int
-	// ReplayWindow is W. Zero is max(64, 2*(MaxPipes+H)); a smaller
-	// window is raised to MaxPipes+H.
+	// ReplayWindow is W, the join replay window. Zero is
+	// max(64, 2*(MaxPipes+H)); a window below MaxPipes+H is invalid.
 	ReplayWindow int
 	// MaxLanes is the lanes accepted per inbound pipe. Zero is 258; 1
 	// accepts the stream lane only.
 	MaxLanes int
 
-	// ResumeTimeout enables resume with this grace period. Zero is no
-	// resume.
+	// ResumeTimeout enables resume with this grace period, at least 1 ms
+	// (a fraction of a millisecond is rounded up). Zero is no resume; a
+	// negative value is invalid. Resume needs a secret source (PipeAuth),
+	// and a server session a Listener; a client should have a redial
+	// source (Redial or MaintainPipes).
 	ResumeTimeout time.Duration
 
 	// Scheduler is the session's scheduling policy (nil: Affinity).
 	Scheduler Scheduler
 	// SchedulerParams tune the scheduler and failure detection.
 	SchedulerParams SchedulerParams
-	// ShapingLimits bound what a Shaper adds (SetShaper); a negative
-	// duration or a MaxPaddingRatio outside [0, 1] is invalid.
+	// ShapingLimits are the application's bounds on shaping; an account field
+	// above its maximum is invalid.
 	ShapingLimits shaping.Limits
+	// ShapingBudget gives the shaping configuration's budget, called once per
+	// session outside every lock; nil: none. It cannot widen ShapingLimits.
+	ShapingBudget func() shaping.Budget
+	// HandshakeShaper is asked for the plan of each Join message this session
+	// writes; nil: none.
+	HandshakeShaper shaping.HandshakeShaper
+	// ShapingPreciseTimer meets shaping deadlines in place: the session's
+	// timer is armed ahead by the host timer's observed lateness, at most
+	// 2 ms, and its callback yields in a loop until the deadline, which costs
+	// CPU time up to that lead on one goroutine per deadline. Off: deadlines
+	// are met as the host timer allows.
+	ShapingPreciseTimer bool
 	// Shaper is installed when the session is created, as by SetShaper
 	// (nil: no shaping): every outbound pipe of the session, the
 	// bootstrap pipe of an accepted session and joined pipes included, is
 	// shaped from its first record. SetShaper replaces it.
 	Shaper ShaperFactory
 
-	// PipeAuth selects the join secret (required for multipath).
+	// PipeAuth configures the source of the session secret. Multipath
+	// (MaxPipes above 1) and resume need one: a PSK, a deferred PSK or the
+	// exporter; on a secure first pipe the secure carrier is the source and
+	// PipeAuth sets none of them. Without a source Start fails with
+	// ErrInvalidConfig before a byte is written. A source is never dropped
+	// because the peer did not offer it: flags that differ close the
+	// session.
 	PipeAuth PipeAuth
+	// RecordPolicy chooses the record mode of each carrier this endpoint joins; nil is
+	// always Sealed. PipeOptions.Mode wins over it.
+	RecordPolicy RecordPolicy
+	// AllowRecordMode is the acceptor's check of a Hello's mode; nil passes only Sealed.
+	AllowRecordMode AllowRecordMode
+	// AuthorizeJoin is an acceptor's further check of a join; nil passes all.
+	AuthorizeJoin func(c *Conn, pipe uint64) bool
+	// JoinEarlyHello is the size of a Hello's first batch: 0 takes 8 KiB; a
+	// negative value is invalid. Larger batches outgrow the first congestion
+	// window and delay both the Hello and the Reply.
+	JoinEarlyHello int
+	// NoJoinEarlyHello sends no first batch with a Hello; JoinEarlyHello
+	// must then be zero.
+	NoJoinEarlyHello bool
 
-	// EarlyData enables early data (SPEC.md 6.1.2).
+	// EarlyData enables early data: stream data before the peer's
+	// transport parameters arrive.
 	EarlyData EarlyData
 
 	// DatagramLimiter polices datagrams in each direction:
@@ -152,6 +216,13 @@ type Config struct {
 
 	// Tracer receives session events on a goroutine of its own.
 	Tracer *Tracer
+	// Logger receives what the application would otherwise not see: a
+	// warning when the last pipe of a direction is removed while streams
+	// are open, a warning with EventResumeUnattended, and the failures of
+	// host callbacks that zmux contains (a panic in a hook). It is called
+	// outside every lock and must not block; nil logs nothing. What the
+	// events and the Tracer report is not logged again.
+	Logger *slog.Logger
 	// Credential is presented on the carrier of a client session by the
 	// functions that open one with this Config: Client, Dial and DialTLS
 	// and the dialers of zmuxquic, zmuxws and zmuxh3 (nil: none). Pipes
@@ -160,17 +231,27 @@ type Config struct {
 	Credential Credential
 	// Redial re-establishes pipes after failures (resume): it is called
 	// as soon as the session lacks a direction or suspends, delayed only
-	// by the wait since its previous call for that direction. It keeps
-	// one pipe per direction; a session that keeps several pipes is
-	// maintained with Conn.MaintainPipes and a PipePool, which also
-	// replaces failed pipes, and leaves Redial nil.
+	// by the redial backoff since its previous call for that direction,
+	// and by the join refusal backoff a refused join started (the longer
+	// of the two). It keeps one pipe per direction; a session that keeps
+	// several pipes is maintained with Conn.MaintainPipes and a PipePool,
+	// which also replaces failed pipes, and leaves Redial nil.
 	Redial func(ctx context.Context, need Direction) (PipeIO, error)
+	// RedialMinBackoff and RedialMaxBackoff bound the backoff of Redial:
+	// after a failed call the wait, counted from the start of the previous
+	// call, starts at the minimum and doubles up to the maximum, each wait
+	// reduced by a random fraction of up to 0.2. Zero is DefaultMinBackoff
+	// (1 s) and DefaultMaxBackoff (60 s); a negative value, or a minimum
+	// above the maximum with the defaults filled in, is invalid. The pools
+	// of MaintainPipes follow the same rule with state of their own.
+	RedialMinBackoff, RedialMaxBackoff time.Duration
 	// RedialPolicy, when set, is asked before each Redial call; DialAfter
-	// is the wait from the previous call to the next (at most 30 s; 0: the
-	// built-in backoff), and ProbeInterval and ProbeJitter apply to the
-	// pipe a call yields. Count and Retire are not used. A decision that
-	// fails PoolDecision.Validate is rejected: the call goes ahead as with
-	// the zero decision and the error is reported to DecisionRejected.
+	// is the wait from the previous call to the next (at most
+	// RedialMaxBackoff; 0: the backoff), and ProbeInterval and ProbeJitter
+	// apply to the pipe a call yields. Count and Retire are not used. A
+	// decision that fails PoolDecision.Validate is rejected: the call goes
+	// ahead as with the zero decision and the error is reported to
+	// DecisionRejected.
 	RedialPolicy PoolPolicy
 	// DecisionRejected, when set, receives the PoolDecision.Validate error
 	// (ErrInvalidConfig) of each decision of RedialPolicy the session
@@ -222,8 +303,7 @@ type SchedulerParams struct {
 	// PIPE_PING of an answer, the standby probes and the probes of
 	// uplinks and downlinks; otherwise at least 1 s.
 	ProbeInterval time.Duration
-	// ProbeJitter is the probe jitter j, from 0 to below 1 (MULTIPATH.md
-	// 7.1): each probe waits a uniform draw from [k_eff x (1 - j), k_eff],
+	// ProbeJitter is the probe jitter j, from 0 to below 1: each probe waits a uniform draw from [k_eff x (1 - j), k_eff],
 	// the first one of pipe 0 from [0, k_eff]. Zero is 0.25; a jitter of 0
 	// takes NoProbeJitter.
 	ProbeJitter float64
@@ -239,7 +319,7 @@ type SchedulerParams struct {
 }
 
 // EarlyData lets a client send stream data before the server's transport
-// parameters arrive (SPEC.md 6.1.2). With either form, Start, Client and
+// parameters arrive. With either form, Start, Client and
 // Dial return at once and ConnectionState().Established stays false until
 // the parameters arrive.
 //
@@ -279,7 +359,8 @@ type EarlyData struct {
 	// Conn.RememberedParameters returned them (client only). Store them per
 	// server and only with the application's consent.
 	Remembered []byte
-	// ZmuxPeer declares the peer a zmux endpoint (client only).
+	// ZmuxPeer declares the peer a zmux endpoint (client only; with
+	// RoleAuto, where no side is the client, it is invalid).
 	ZmuxPeer bool
 	// Replayable allows carrier early data, which the peer may see
 	// replayed (TLS 1.3, QUIC 0-RTT, a transform's first flight): on a
@@ -302,7 +383,9 @@ func (e *EarlyData) clientEarly() bool {
 	return e.ZmuxPeer || e.Replayable && len(e.Remembered) > 0
 }
 
-// PipeAuth selects the secret sources of joins (MULTIPATH.md 10.1).
+// PipeAuth configures the secret sources of joins. EndToEnd is no source:
+// it says the bootstrap carrier ends at the peer, which the exporter and a
+// deferred PSK need to be trusted.
 type PipeAuth struct {
 	// PSK is a pre-shared key of at least 16 bytes.
 	PSK []byte
@@ -317,20 +400,23 @@ type PipeAuth struct {
 	// binding to the exporter, or a client that pins the server, is what
 	// proves the handshake end to end, not the presence of TLS.
 	Exporter bool
-	// AllowInsecure allows joins without a secret (tests, protected
-	// networks). It must not be combined with PSK or DeferredPSK.
-	AllowInsecure bool
 	// DeferredPSK offers a PSK (the P flag) that the application supplies
 	// after establishment with Conn.SetJoinSecret, for example once it
 	// authenticated the peer over the session. Until then no join key
-	// exists: local joins fail with ErrJoinSecretPending and the peer's
-	// joins are held (ConnectionStats.JoinSecretPending) for at most
-	// HandshakeTimeout (its default when HandshakeTimeout is no
-	// timeout), then closed silently; a session that loses its
+	// exists: local joins fail with ErrJoinPending and the peer's
+	// joins are held (ConnectionStats.JoinPending) for at most
+	// JoinTimeout, then closed silently; a session that loses its
 	// pipes before the secret cannot resume. It combines with Exporter
 	// as a static PSK does, and the peer may have the same bytes as a
-	// static PSK. It must not be combined with PSK or AllowInsecure.
+	// static PSK. It must not be combined with PSK.
 	DeferredPSK bool
+	// EndToEnd declares in advance what Conn.DeclareEndToEnd declares: the
+	// host knows pipe 0 ends at the peer before the session starts, such as
+	// on a pinned connection. Without it, and without the secure carrier,
+	// there are no join keys. It is no secret source of its own, and on a
+	// secure first pipe it is accepted and has no effect, so that one
+	// Config serves both.
+	EndToEnd bool
 }
 
 // Clone returns a shallow copy (nil means defaults): slices such as
@@ -374,15 +460,25 @@ func (c *Config) handshakeTimeout() time.Duration {
 	return timeout(c.HandshakeTimeout, time.Duration(core.DefaultHandshakeTimeout))
 }
 
-// joinWaitTimeout bounds how long a carrier joining the session waits,
-// holding a pending slot of the listener, for establishment or for the
-// join keys: the HandshakeTimeout, or its default when that is no
-// timeout, since the pending slots are a safety bound.
-func (c *Config) joinWaitTimeout() time.Duration {
-	if d := c.handshakeTimeout(); d < noTimeout {
-		return d
+// joinTimeout is the effective JoinTimeout; c may be nil (a negative
+// value does not pass coreConfig).
+func (c *Config) joinTimeout() time.Duration {
+	if c == nil || c.JoinTimeout <= 0 {
+		return DefaultJoinTimeout
 	}
-	return time.Duration(core.DefaultHandshakeTimeout)
+	return c.JoinTimeout
+}
+
+// redialBackoff returns the bounds of the Redial backoff.
+func (c *Config) redialBackoff() (lo, hi time.Duration) {
+	lo, hi = DefaultMinBackoff, DefaultMaxBackoff
+	if c != nil && c.RedialMinBackoff > 0 {
+		lo = c.RedialMinBackoff
+	}
+	if c != nil && c.RedialMaxBackoff > 0 {
+		hi = c.RedialMaxBackoff
+	}
+	return lo, hi
 }
 
 func dur(d, def time.Duration) core.Duration {
@@ -413,16 +509,24 @@ func checkProbeJitter(v float64, what string) error {
 	return nil
 }
 
-// checkLimits reports shaping limits outside their ranges: a negative
-// duration, or a MaxPaddingRatio that is not a number from 0 to 1.
+// checkLimits reports shaping limits outside their ranges.
 func checkLimits(l *shaping.Limits) error {
-	if !(l.MaxPaddingRatio >= 0 && l.MaxPaddingRatio <= 1) { // NaN included
-		return fmt.Errorf("%w: ShapingLimits.MaxPaddingRatio %v outside [0, 1]", ErrInvalidConfig, l.MaxPaddingRatio)
-	}
-	if l.MaxPauseTotal < 0 || l.MaxDelay < 0 {
-		return fmt.Errorf("%w: negative ShapingLimits duration", ErrInvalidConfig)
+	if a := l.Wire; a.Initial > shaping.MaxAccountInitial || a.PerMB > shaping.MaxAccountRate || a.PerSec > shaping.MaxAccountRate {
+		return fmt.Errorf("%w: ShapingLimits.Wire field above its maximum", ErrInvalidConfig)
 	}
 	return nil
+}
+
+// askBudget calls f; nil or a panic is no budget (the panic is logged to
+// l).
+func askBudget(l *slog.Logger, f func() shaping.Budget) (b shaping.Budget) {
+	if f == nil {
+		return b
+	}
+	if !safeLog(l, "Config.ShapingBudget", func() { b = f() }) {
+		b = shaping.Budget{}
+	}
+	return b
 }
 
 // coreConfig validates c and resolves it for the core.
@@ -437,11 +541,27 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	if c.LatencyBudget < 0 || c.MemoryBudget < 0 && c.MemoryBudget != NoMemoryLimit || c.MaxIncomingStreams < 0 || c.MaxIncomingUniStreams < 0 ||
 		c.DatagramSendQueue < 0 || c.DatagramReceiveQueue < 0 || c.DatagramStreamQueue < 0 || c.DatagramReceiveBytes < 0 ||
 		c.MaxPipes < 0 || c.PipeHeadroom < 0 || c.ReplayWindow < 0 || c.MaxLanes < 0 || c.ResumeTimeout < 0 ||
+		c.JoinTimeout < 0 || c.JoinEarlyHello < 0 || c.RedialMinBackoff < 0 || c.RedialMaxBackoff < 0 ||
 		p.Probation < 0 || p.OverflowDelay < 0 ||
 		p.SpreadChunk < 0 {
 		return cc, fmt.Errorf("%w: negative Config count, size or duration", ErrInvalidConfig)
 	}
+	if c.JoinTimeout > time.Duration(core.MaxJoinDeadline) {
+		return cc, fmt.Errorf("%w: JoinTimeout %v above the maximum join deadline %v", ErrInvalidConfig, c.JoinTimeout, time.Duration(core.MaxJoinDeadline))
+	}
+	if lo, hi := c.redialBackoff(); lo > hi {
+		return cc, fmt.Errorf("%w: RedialMinBackoff %v above RedialMaxBackoff %v", ErrInvalidConfig, lo, hi)
+	}
+	if c.NoJoinEarlyHello && c.JoinEarlyHello != 0 {
+		return cc, fmt.Errorf("%w: JoinEarlyHello with NoJoinEarlyHello", ErrInvalidConfig)
+	}
+	if c.EarlyData.ZmuxPeer && role == core.RoleAuto {
+		return cc, fmt.Errorf("%w: EarlyData.ZmuxPeer with RoleAuto", ErrInvalidConfig)
+	}
 	cc.HandshakeTimeout = core.Duration(c.handshakeTimeout())
+	cc.JoinTimeout = core.Duration(c.joinTimeout())
+	cc.EpochPeriod, cc.EpochJoins = core.Duration(c.EpochPeriod), int64(c.EpochJoins)
+	cc.NoEpochAfterFirstPipe, cc.NoEpochAfterResume = c.NoEpochAfterFirstPipe, c.NoEpochAfterResume
 	switch {
 	case c.MaxIdleTimeout < 0:
 		l.Has &^= wire.HasIdle
@@ -518,10 +638,10 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	if c.SendBuffer > 0 {
 		cc.SendBuffer = c.SendBuffer
 	}
-	cc.SendBufferMax = max(c.MaxSendBuffer, cc.SendBuffer)
-	if c.MaxSendBuffer == 0 {
-		cc.SendBufferMax = 0
+	if c.MaxSendBuffer != 0 && c.MaxSendBuffer < cc.SendBuffer {
+		return cc, fmt.Errorf("%w: MaxSendBuffer %d below SendBuffer %d", ErrInvalidConfig, c.MaxSendBuffer, cc.SendBuffer)
 	}
+	cc.SendBufferMax = c.MaxSendBuffer
 	if c.MaxLanes > 0 {
 		l.MaxLanes = uint64(c.MaxLanes)
 	}
@@ -533,6 +653,9 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	}
 	if c.PipeHeadroom > 0 {
 		cc.Headroom = c.PipeHeadroom
+	}
+	if c.ReplayWindow != 0 && c.ReplayWindow < max(1, cc.MaxPipes)+cc.Headroom {
+		return cc, fmt.Errorf("%w: ReplayWindow %d below MaxPipes+PipeHeadroom (%d)", ErrInvalidConfig, c.ReplayWindow, max(1, cc.MaxPipes)+cc.Headroom)
 	}
 	cc.ReplayWindow = c.ReplayWindow
 	cc.Resume = core.Duration(c.ResumeTimeout)
@@ -553,15 +676,21 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 		return cc, err
 	}
 	cc.ShapeLimits = c.ShapingLimits
+	cc.ShapeBudget = askBudget(c.Logger, c.ShapingBudget)
 	if c.Scheduler != nil {
 		cc.Policy = c.Scheduler.policy()
 	}
 	a := &c.PipeAuth
-	if a.AllowInsecure && len(a.PSK) > 0 {
-		return cc, fmt.Errorf("%w: AllowInsecure with a PSK", ErrInvalidConfig)
+	if a.DeferredPSK && len(a.PSK) > 0 {
+		return cc, fmt.Errorf("%w: DeferredPSK with a PSK", ErrInvalidConfig)
 	}
-	if a.DeferredPSK && (len(a.PSK) > 0 || a.AllowInsecure) {
-		return cc, fmt.Errorf("%w: DeferredPSK with a PSK or AllowInsecure", ErrInvalidConfig)
+	cc.Declared = a.EndToEnd
+	cc.JoinEarlyHello = 8 << 10
+	switch {
+	case c.NoJoinEarlyHello:
+		cc.JoinEarlyHello = 0
+	case c.JoinEarlyHello > 0:
+		cc.JoinEarlyHello = c.JoinEarlyHello
 	}
 	cc.DeferredPSK = a.DeferredPSK
 	if len(a.PSK) > 0 && len(a.PSK) < 16 {
@@ -569,25 +698,21 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	}
 	cc.PSK = a.PSK
 	if cc.MaxPipes > 1 || cc.Resume > 0 {
-		if !a.Exporter && len(a.PSK) == 0 && !a.DeferredPSK && !a.AllowInsecure {
-			return cc, fmt.Errorf("%w: multipath needs PipeAuth", ErrInvalidConfig)
-		}
-		l.Has |= wire.HasMultipath
+		l.Has |= wire.HasMultipath | wire.HasSessionCrypto
+		l.SessionCrypto = join.LocalCrypto()
 		if a.Exporter {
 			l.SecretFlags |= wire.SecretExporter
 		}
 		if len(a.PSK) > 0 || a.DeferredPSK {
 			l.SecretFlags |= wire.SecretPSK
 		}
-		if a.AllowInsecure {
-			l.SecretFlags |= wire.SecretInsecure
-		}
 		if _, err := rand.Read(l.SessionNonce[:]); err != nil {
 			return cc, err
 		}
 		if cc.Resume > 0 {
 			l.Has |= wire.HasResume
-			l.ResumeGrace = uint64(max(1, cc.Resume/core.Millisecond))
+			// A fraction of a millisecond is rounded up (the unit).
+			l.ResumeGrace = uint64((cc.Resume + core.Millisecond - 1) / core.Millisecond)
 		}
 	}
 	if role == core.RoleAuto {
@@ -601,7 +726,7 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 			l.RoleNonce = l.RoleNonce<<8 | uint64(x)
 		}
 	}
-	// GREASE transport parameter (SPEC.md 5.2 rule 6).
+	// The GREASE transport parameter.
 	var g [3]byte
 	if _, err := rand.Read(g[:]); err != nil {
 		return cc, err

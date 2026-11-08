@@ -128,7 +128,7 @@ func TestStreamCreditWaits(t *testing.T) {
 }
 
 // TestDirectionStateNames checks that the two direction state types name
-// the states of STATE_MACHINE.md 3.1 and 3.2 and nothing else: a retired
+// the specified direction states and nothing else: a retired
 // attachment has no snapshot, so neither type has a retired value.
 func TestDirectionStateNames(t *testing.T) {
 	out := []string{"none", "joining", "active", "suspect", "draining", "failed", "closed"}

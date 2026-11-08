@@ -338,7 +338,7 @@ func (s *Session) endRevalidation(p *Pipe) {
 	s.wakeAllWriters()
 }
 
-// ---- backup probes (MULTIPATH.md 7.1) ----
+// ---- backup probes ----
 
 // backup reports a pipe probed every standby_probe while the session is
 // busy: standby, or of a less-preferred tier than the most-preferred usable.

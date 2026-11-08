@@ -49,10 +49,14 @@ const (
 	EventSessionResumed
 	// EventGoAwayReceived reports that the peer sent GOAWAY (GoAway).
 	EventGoAwayReceived
-	// EventJoinSecurityUnavailable reports that both endpoints offered
-	// multipath but no join secret is available, so no pipe can join (no
-	// fields).
-	EventJoinSecurityUnavailable
+	// EventResumeUnattended follows EventSessionSuspended when nothing in
+	// the library will dial for the session: it can rejoin (the peer gave
+	// a Session Locator) but has neither a Config.Redial hook nor a running
+	// MaintainPipes pool, so it ends at its resume timeout unless the
+	// application adds a pipe (no fields). It is also logged as a warning
+	// (Config.Logger). An application that resumes with its own AddPipe
+	// calls reacts to EventSessionSuspended and can ignore it.
+	EventResumeUnattended
 	// EventPipeQualityChanged reports that an outbound pipe left its
 	// QualityBand (Pipe, SmoothedRTT, DeliveryRate).
 	EventPipeQualityChanged
@@ -73,12 +77,18 @@ const (
 	// after the previous one was read and accumulates until it is read, the
 	// unread events of each retired pipe leaving the queue for it.
 	EventPipesRetired
+	// EventEpochCommitted reports that the session committed an epoch (Epoch):
+	// its secret is known, and joins of it are accepted.
+	EventEpochCommitted
+	// EventEpochDeleted reports that an epoch (Epoch), its keys and its
+	// Locators were deleted.
+	EventEpochDeleted
 )
 
 var pipeEventNames = [...]string{"", "PipeAdded", "PipeJoined", "PipeSuspect", "PipeRecovered", "PipeFailed",
 	"PipeClosed", "PipePriorityChanged", "TierSaturation", "JoinAuthFailed", "SessionSuspended",
-	"SessionResumed", "GoAwayReceived", "JoinSecurityUnavailable", "PipeQualityChanged", "CapacityBelow",
-	"CapacityRestored", "CarrierCandidate", "CarrierChosen", "PipesRetired"}
+	"SessionResumed", "GoAwayReceived", "ResumeUnattended", "PipeQualityChanged", "CapacityBelow",
+	"CapacityRestored", "CarrierCandidate", "CarrierChosen", "PipesRetired", "EpochCommitted", "EpochDeleted"}
 
 func (k EventKind) String() string {
 	if int(k) < len(pipeEventNames) {
@@ -87,15 +97,24 @@ func (k EventKind) String() string {
 	return "PipeEventKind(?)"
 }
 
-// JoinAuthReason says which kind of join token failed verification.
+// JoinAuthReason says why a Hello failed verification.
 type JoinAuthReason uint8
 
+// Reasons of EventJoinAuthFailed: the Hello did not open (auth), its payload did
+// not parse (the error class of the failure), or its key share was refused after
+// the Pipe ID was used (kex).
 const (
-	JoinAuthReasonMAC          = JoinAuthReason(core.JoinAuthMAC)             // a token without carrier binding
-	JoinAuthReasonCarrierBound = JoinAuthReason(core.JoinAuthMACCarrierBound) // a carrier-bound token
+	JoinAuthReasonAuth               = JoinAuthReason(core.JoinAuthAEAD)
+	JoinAuthReasonMissingField       = JoinAuthReason(core.JoinAuthMissingField)
+	JoinAuthReasonBadField           = JoinAuthReason(core.JoinAuthBadField)
+	JoinAuthReasonTLVTruncated       = JoinAuthReason(core.JoinAuthTLVTruncated)
+	JoinAuthReasonTLVNonMinimal      = JoinAuthReason(core.JoinAuthTLVNonMinimal)
+	JoinAuthReasonTLVOrder           = JoinAuthReason(core.JoinAuthTLVOrder)
+	JoinAuthReasonTLVUnknownCritical = JoinAuthReason(core.JoinAuthTLVUnknownCritical)
+	JoinAuthReasonKex                = JoinAuthReason(core.JoinAuthKex)
 )
 
-// String returns "mac" or "mac_carrier_bound", the names of API.md.
+// String returns the name the API specification uses ("auth", "kex", ...).
 func (r JoinAuthReason) String() string { return core.JoinAuthReason(r).String() }
 
 // Event is a session event, as NextEvent and Tracer.Event report it. Kind
@@ -115,6 +134,8 @@ type Event struct {
 	// Outcome that of EventCarrierCandidate.
 	Carrier CarrierKind
 	Outcome CandidateOutcome
+	// Epoch of EventEpochCommitted and EventEpochDeleted.
+	Epoch uint64
 	// Variant is the PipeIO.Variant of a pipe event's carrier while the
 	// pipe has one, and the candidate's of EventCarrierCandidate and
 	// EventCarrierChosen.
@@ -154,8 +175,8 @@ func pipeEvent(k EventKind) bool {
 		EventPipePriorityChanged, EventPipeQualityChanged:
 		return true
 	case EventTierSaturation, EventJoinAuthFailed, EventSessionSuspended, EventSessionResumed,
-		EventGoAwayReceived, EventJoinSecurityUnavailable, EventCapacityBelow, EventCapacityRestored,
-		EventCarrierCandidate, EventCarrierChosen, EventPipesRetired:
+		EventGoAwayReceived, EventResumeUnattended, EventCapacityBelow, EventCapacityRestored,
+		EventCarrierCandidate, EventCarrierChosen, EventPipesRetired, EventEpochCommitted, EventEpochDeleted:
 		return false
 	}
 	return false
@@ -167,8 +188,8 @@ func terminal(k EventKind) bool { return k == EventPipeFailed || k == EventPipeC
 // eventQueue holds session events for NextEvent; it is guarded by the
 // session lock. It is bounded (eventQueueMax): when the application does
 // not read events, the oldest non-terminal ones are dropped and counted;
-// a retired pipe's unread events are folded into one EventPipesRetired
-// (IMPLEMENTATION.md 2.5.7), so the queue stays bounded however many pipes
+// a retired pipe's unread events are folded into one EventPipesRetired,
+// so the queue stays bounded however many pipes
 // a session goes through.
 type eventQueue struct {
 	q       []Event
@@ -298,8 +319,6 @@ func (c *Conn) drainEventsLocked() {
 			break
 		}
 		switch e.Kind {
-		case core.EvOOBJoin:
-			c.oobHeaders[e.Pipe] = encodeJoinHeader(e.Frame)
 		case core.EvPipeState:
 			c.pipeStateEvent(e)
 		case core.EvJoinAuthFailed:
@@ -310,6 +329,10 @@ func (c *Conn) drainEventsLocked() {
 			c.needRedial = true
 			c.firePipeWaiters()
 			q.push(Event{Kind: EventSessionSuspended})
+			if c.unattendedLocked() {
+				q.push(Event{Kind: EventResumeUnattended})
+				c.hk.warn("zmux: session suspended without a redial source (Config.Redial or MaintainPipes): it ends at its resume timeout unless the application adds a pipe")
+			}
 			if c.lst != nil {
 				if over := c.lst.sessionSuspended(c); len(over) > 0 {
 					go closeSuspended(over)
@@ -323,8 +346,6 @@ func (c *Conn) drainEventsLocked() {
 		case core.EvGoAwayReceived:
 			q.push(Event{Kind: EventGoAwayReceived, GoAway: &GoAway{MaxBidi: e.MaxBidi, MaxUni: e.MaxUni,
 				ErrorCode: ApplicationErrorCode(e.Code)}})
-		case core.EvJoinSecurityUnavailable:
-			q.push(Event{Kind: EventJoinSecurityUnavailable})
 		case core.EvTierSaturation:
 			q.push(Event{Kind: EventTierSaturation, Priority: e.Code, Saturated: e.Saturated})
 		case core.EvPipeQuality:
@@ -337,10 +358,25 @@ func (c *Conn) drainEventsLocked() {
 		case core.EvPipePriority:
 			q.push(Event{Kind: EventPipePriorityChanged, Pipe: e.Pipe, Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
+		case core.EvPipeAttached:
+			c.firePipeWaiters() // WaitAttached and the pool
 		case core.EvJoinKeys:
 			// Joins are possible: maintenance and redial go on.
 			c.needRedial = true
 			c.firePipeWaiters()
+		case core.EvEpochCommitted:
+			q.push(Event{Kind: EventEpochCommitted, Epoch: e.Code})
+			c.firePipeWaiters()
+		case core.EvEpochDeleted:
+			q.push(Event{Kind: EventEpochDeleted, Epoch: e.Code})
+		case core.EvLocatorAdded:
+			if c.lst != nil {
+				c.lst.addLocator(c, e.Frame)
+			}
+		case core.EvLocatorRemoved:
+			if c.lst != nil {
+				c.lst.removeLocator(c, e.Frame)
+			}
 		case core.EvClosed, core.EvDatagramDropped:
 			// The end surfaces through Wait and the drops through the
 			// statistics; neither is a pipe event.
@@ -478,7 +514,7 @@ func (c *Conn) NextEvent(ctx context.Context) (Event, error) {
 }
 
 // closeSuspended closes sessions beyond the listener's MaxSuspended, the
-// longest-suspended first, with ZMUX_RESUME_TIMEOUT (RESUME.md 9).
+// longest-suspended first, with ZMUX_RESUME_TIMEOUT.
 func closeSuspended(cs []*Conn) {
 	for _, c := range cs {
 		c.lock()

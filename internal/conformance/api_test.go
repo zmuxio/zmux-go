@@ -229,6 +229,8 @@ func (r *runner) api(st map[string]any) error {
 		s.Close(getU(args, "code"), reason)
 	case "add_pipe":
 		res, err = r.addPipe(args)
+	case "advance_epoch":
+		err = s.AdvanceEpoch()
 	case "set_pipe_status":
 		var o core.PipeSettings
 		u := func(k string) *uint64 {
@@ -275,7 +277,7 @@ func (r *runner) api(st map[string]any) error {
 	case "remove_pipe":
 		err = s.RemovePipe(getU(args, "pipe"), getB(args, "graceful"))
 	default:
-		r.t.Skip("api " + call)
+		return fmt.Errorf("api %q is not implemented by the runner", call)
 	}
 	if err != nil {
 		res = errResult(err)

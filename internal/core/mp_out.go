@@ -7,10 +7,10 @@ import (
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// ---- control order (MULTIPATH.md 6.5) ----
+// ---- control order ----
 
 // effPrio returns the effective send priority and standby flag of an
-// outbound direction (MULTIPATH.md 9): local setting, else the peer's
+// outbound direction: local setting, else the peer's
 // request, else the default.
 func (a *attach) effPrio() (uint64, bool) {
 	pr, sb := a.peerPrio, a.peerStandby
@@ -77,7 +77,7 @@ func (s *Session) controlRank(p *Pipe) (int, uint64, int, Duration) {
 // controlOrder returns the live outbound pipes in the control order.
 func (s *Session) controlOrder(dst []*Pipe) []*Pipe {
 	for _, p := range s.pipes {
-		if p.mp != nil && p.out != nil && !p.out.failed && p.mp.liveOut() && !p.mp.retired {
+		if p.mp != nil && p.out != nil && !p.out.failed && p.mp.liveOut() && !p.mp.hs && !p.mp.retired {
 			if p.mp.out == OutDraining && p.mp.abandonSent && p.mp.abandonRecv {
 				continue
 			}
@@ -118,7 +118,7 @@ func (s *Session) primary() (*Pipe, *Pipe) {
 	return a, b
 }
 
-// ---- PIPE_PING rate limit (MULTIPATH.md 6.4) ----
+// ---- PIPE_PING rate limit ----
 
 func (m *multiPath) pingAllowed(now Time) bool {
 	return m.pingCount < 8 || now >= m.pingTimes[m.pingIdx].Add(Second)
@@ -143,7 +143,7 @@ func (m *multiPath) pingNext() Time {
 // oldestPingWaiter reports whether p waits longest for a PIPE_PING.
 func (s *Session) oldestPingWaiter(p *Pipe) bool {
 	for _, q := range s.pipes {
-		if q.mp != nil && q != p && q.mp.needPing && q.out != nil && !q.out.failed &&
+		if q.mp != nil && q != p && q.mp.needPing && !q.mp.hs && q.out != nil && !q.out.failed &&
 			q.mp.pingSince < p.mp.pingSince {
 			return false
 		}
@@ -157,11 +157,11 @@ func (s *Session) oldestPingWaiter(p *Pipe) bool {
 func (s *Session) mpWrite(w *recWriter, p *Pipe, ol *outLane) {
 	w.retain = true
 	w.pipe = p
-	// A multipath write call holds max(4 KiB, R_p x 50 ms) (MULTIPATH.md
-	// Section 7.1).
+	// A multipath write call holds max(4 KiB, R_p x 50 ms), so that
+	// a pipe's queue stays within what its failure detection assumes.
 	w.recBound = int(min(max(s.rateOf(p)/20, 4<<10), batchRecBound))
 	a := p.mp
-	if a.held && !s.joinAllowedFor(p) {
+	if a.hs {
 		return
 	}
 	if ol.lane == 0 {
@@ -186,27 +186,12 @@ func (s *Session) mpWrite(w *recWriter, p *Pipe, ol *outLane) {
 	s.writeData(w, p, ol)
 }
 
-// mpPipeFrames writes PIPE_JOIN, PIPE_ACK, PIPE_PING, PIPE_ABANDON and
+// mpPipeFrames writes PIPE_ACK, PIPE_PING, PIPE_ABANDON and
 // PIPE_STATUS for the pipe.
 func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 	a := p.mp
 	m := s.mp
-	if a.held && !s.joinAllowedFor(p) {
-		return
-	}
 	first := a.firstRecord
-	if a.join != nil && s.joinAllowedFor(p) {
-		j := a.join
-		n := wire.JoinLen(j)
-		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendJoin(b, j) }) {
-			return
-		}
-		a.join = nil
-		if !a.oob {
-			a.needPing = true
-			a.pingSince = s.now
-		}
-	}
 	prim, second := s.primary()
 	isPrim := p == prim || prim == nil
 	if s.ack != nil {
@@ -214,8 +199,8 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 		switch {
 		case first || a.ackPair:
 			// The first record's snapshot, or the answer to a PIPE_PING on
-			// its own pipe pair (MULTIPATH.md 6.5). Held back whole when
-			// the record is delayed (MULTIPATH.md 5.2).
+			// its own pipe pair. Held back whole when
+			// the record is delayed.
 			if !s.ack.writeSnapshot(w, first || pairOnly || isPrim) {
 				return
 			}
@@ -264,7 +249,7 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 			continue
 		}
 		// A graceful removal of an own outbound pipe puts its PIPE_ABANDON
-		// on that pipe; otherwise another pipe carries it (MULTIPATH 8.1).
+		// on that pipe; otherwise another pipe carries it.
 		selfGraceful := qa.abandonCode == wire.NoError && q.out != nil && qa.liveOut() && !qa.drainSuspect
 		if selfGraceful && q != p || !selfGraceful && q == p && prim != nil && prim != p {
 			continue
@@ -291,9 +276,11 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 		delete(m.pendAbandon, id)
 		delete(m.pendCode, id)
 	}
-	// PIPE_STATUS requests (MULTIPATH.md 9): only for ACTIVE attachments.
+	s.epochProgress()
+	s.writeEpoch(w, p)
+	// PIPE_STATUS requests: only for ACTIVE attachments.
 	for _, q := range s.pipes {
-		if statusReady(q) && !s.writeStatus(w, q) {
+		if statusReady(q, p) && !s.writeStatus(w, q) {
 			return
 		}
 	}
@@ -305,14 +292,13 @@ func (s *Session) ackOwed() bool {
 	return s.ack.due(s.now) || s.ack.unreported() && s.creditPending()
 }
 
-// quiet reports a quiet session: no traffic frame within the busy window
-// (MULTIPATH.md 7.1).
+// quiet reports a quiet session: no traffic frame within the busy window.
 func (s *Session) quiet() bool { return s.now >= s.mp.busyUntil }
 
 // ackPairOnly reports whether the pending acknowledgement answers only
 // PIPE_PING frames of a quiet session, each on a pipe pair with a usable
 // outbound direction: the answers then go on those pairs alone, neither on
-// the primary pipe nor as a redundant copy (MULTIPATH.md 6.5).
+// the primary pipe nor as a redundant copy.
 func (s *Session) ackPairOnly() bool {
 	if s.ack.other || s.ack.pairless || !s.quiet() {
 		return false
@@ -327,7 +313,7 @@ func (s *Session) ackPairOnly() bool {
 
 // answersOnPair reports whether the answer to a PIPE_PING received on p
 // can go on p's outbound direction: it exists and is neither suspect nor
-// failed (MULTIPATH.md 6.5).
+// failed.
 func (s *Session) answersOnPair(p *Pipe) bool {
 	a := p.mp
 	return p.out != nil && !p.out.failed && a.liveOut() && a.out != OutSuspect
@@ -350,7 +336,7 @@ func (s *Session) idleFor(p *Pipe) bool {
 
 // answerPing adds a PIPE_PING to the answer that p carries when p has been
 // idle for R_p: one exchange then shows both directions of the pair to
-// work, and the PIPE_PING starts p's next probe wait (MULTIPATH.md 6.5).
+// work, and the PIPE_PING starts p's next probe wait.
 // Probes turned off do not change this.
 func (s *Session) answerPing(p *Pipe) {
 	if s.idleFor(p) {
@@ -360,8 +346,7 @@ func (s *Session) answerPing(p *Pipe) {
 
 // returnLiveness adds a PIPE_PING to a primary or redundant PIPE_ACK of a
 // busy session on a pipe idle for R_p, whose death would otherwise go
-// unnoticed; in a quiet session such pipes are probed like any other
-// (MULTIPATH.md 6.5).
+// unnoticed; in a quiet session such pipes are probed like any other.
 func (s *Session) returnLiveness(p *Pipe) {
 	if !s.quiet() && s.idleFor(p) {
 		p.mp.needPing, p.mp.pingSince = true, s.now
@@ -372,11 +357,11 @@ func (s *Session) returnLiveness(p *Pipe) {
 // when mpWrite would produce bytes now (W8).
 func (s *Session) mpWantsWrite(p *Pipe, ol *outLane) bool {
 	a := p.mp
-	if a.retired || a.out == OutFailed || a.out == OutClosed || a.held && !s.joinAllowedFor(p) {
+	if a.hs || a.retired || a.out == OutFailed || a.out == OutClosed {
 		return false
 	}
 	if ol.lane == 0 {
-		if a.join != nil && s.joinAllowedFor(p) || a.firstRecord && a.join == nil && s.ack != nil && s.ack.hasEntries() || a.ackPair {
+		if a.firstRecord && s.ack != nil && s.ack.hasEntries() || a.ackPair {
 			return true
 		}
 		if a.needPing && s.mp.pingAllowed(s.now) && s.oldestPingWaiter(p) {
@@ -391,7 +376,7 @@ func (s *Session) mpWantsWrite(p *Pipe, ol *outLane) bool {
 		}
 		for _, q := range s.pipes {
 			if q.mp != nil && !q.mp.retired && (q.mp.abandonQueued && s.abandonGoesOn(q, p, prim) ||
-				statusReady(q)) {
+				statusReady(q, p)) {
 				return true
 			}
 		}
@@ -469,8 +454,8 @@ func (s *Session) abandonGoesOn(q, p, prim *Pipe) bool {
 	return q != p || prim == p || prim == nil
 }
 
-// creditPending reports pending credit frames (a PIPE_ACK rides along,
-// MULTIPATH.md 6.3).
+// creditPending reports pending credit frames (a PIPE_ACK rides
+// along).
 func (s *Session) creditPending() bool {
 	if s.pend.maxData {
 		return true
@@ -484,8 +469,7 @@ func (s *Session) creditPending() bool {
 }
 
 // writeCreditCopies copies the latest limits that were sent while the
-// window was the bottleneck into the redundant snapshot's record
-// (MULTIPATH.md 6.5).
+// window was the bottleneck into the redundant snapshot's record.
 func (s *Session) writeCreditCopies(w *recWriter) {
 	if s.copyMaxData {
 		v := s.conn.adv

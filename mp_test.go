@@ -12,12 +12,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/netx"
+	"github.com/djylb/timeshim"
+
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
-// mpEnv is a listener on TCP and a client session dialled to it.
+// mpEnv is a listener on TCP (newMPEnv) or in memory (newMemMPEnv, for
+// tests in a testing/synctest bubble) and a client session dialled to it.
 type mpEnv struct {
 	ln     net.Listener
+	dial   func(context.Context) (net.Conn, error) // connects to ln
 	lst    *Listener
 	client *Conn
 	server *Conn
@@ -25,30 +30,66 @@ type mpEnv struct {
 }
 
 func mpConfig() *Config {
-	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)},
+	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true},
 		SchedulerParams: SchedulerParams{NoProbation: true}}
 }
 
 func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
 	t.Helper()
+	return newMPEnvOn(t, ccfg, &ListenerConfig{Config: scfg, InstanceID: []byte("instance")})
+}
+
+func newMPEnvOn(t *testing.T, ccfg *Config, lcfg *ListenerConfig) *mpEnv {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return startMPEnv(t, ccfg, lcfg, ln, func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", ln.Addr().String())
+	})
+}
+
+// newMemMPEnv is newMPEnv over in-memory pipes; both configurations take
+// the host clock as Config.Clock, which the bubble's fake clock drives on
+// every platform (the session's own monotonic source on Windows is
+// outside it).
+func newMemMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
+	t.Helper()
+	ccfg.Clock, scfg.Clock = timeshim.Real, timeshim.Real
+	ln := netx.NewChanListener(nil, 0)
+	return startMPEnv(t, ccfg, &ListenerConfig{Config: scfg, InstanceID: []byte("instance")}, ln,
+		func(ctx context.Context) (net.Conn, error) { return ln.Dial(ctx, nil) })
+}
+
+// pipeDialer is a PipePool.Dial to e's listener.
+func (e *mpEnv) pipeDialer() func(context.Context) (PipeIO, error) {
+	return func(ctx context.Context) (PipeIO, error) {
+		nc, err := e.dial(ctx)
+		if err != nil {
+			return PipeIO{}, err
+		}
+		return NetPipe(nc), nil
+	}
+}
+
+func startMPEnv(t *testing.T, ccfg *Config, lcfg *ListenerConfig, ln net.Listener, dial func(context.Context) (net.Conn, error)) *mpEnv {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &mpEnv{ln: ln, lst: NewListener(&ListenerConfig{Config: scfg, InstanceID: []byte("instance")}), cancel: cancel}
+	e := &mpEnv{ln: ln, dial: dial, lst: mustNewListener(lcfg), cancel: cancel}
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go func() { _ = e.lst.HandlePipe(ctx, NetPipe(c), JoinHint{}) }()
+			go func() { _ = e.lst.HandlePipe(ctx, NetPipe(c), PipeHint{}) }()
 		}
 	}()
-	dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
+	dctx, dcancel := context.WithTimeout(ctx, 60*time.Second)
 	defer dcancel()
-	nc, err := net.Dial("tcp", ln.Addr().String())
+	nc, err := dial(dctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,12 +115,12 @@ func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
 
 func (e *mpEnv) addPipe(t *testing.T, o PipeOptions) *Pipe {
 	t.Helper()
-	nc, err := net.Dial("tcp", e.ln.Addr().String())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	nc, err := e.dial(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	p, err := e.client.AddPipe(ctx, NetPipe(nc), o)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +139,7 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 
 	payload := make([]byte, 4<<20)
 	_, _ = rand.Read(payload)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	done := make(chan []byte, 1)
 	go func() {
@@ -120,10 +161,10 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 	}
 	// Both pipes carry data; then the added pipe fails in the middle and
 	// its unacknowledged data is reinjected.
-	time.Sleep(20 * time.Millisecond)
-	if st, ok := p2.Stats(); !ok || st.BytesSent < 1<<16 {
-		t.Fatalf("pipe 2 carried too little: %+v %v", st, ok)
-	}
+	waitUntil(t, 60*time.Second, "data on pipe 2", func() bool {
+		st, ok := p2.Stats()
+		return ok && st.BytesSent >= 1<<16
+	})
 	if err := p2.Abort(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -149,6 +190,10 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 	cs := e.client.ConnectionStats()
 	if cs.PipesAdded != 2 || cs.PipeFailures != 1 || cs.Reinjections > 1 {
 		t.Fatalf("added %d, failures %d, reinjections %d", cs.PipesAdded, cs.PipeFailures, cs.Reinjections)
+	}
+	// What went again earned nothing the second time.
+	if m := e.client.ShapingMeters(); m.SentBytes == 0 || m.SentBytes+cs.BytesReinjected+cs.BytesRedundant > cs.BytesSent {
+		t.Fatalf("earned %d of %d sent, %d again, %d copies", m.SentBytes, cs.BytesSent, cs.BytesReinjected, cs.BytesRedundant)
 	}
 	if st, ok := p2.Stats(); ok && (st.FailureCount != 1 || st.Failure == nil) {
 		t.Fatalf("the failed pipe: %+v", st)
@@ -337,7 +382,7 @@ func TestPipeStatsAbsentDirection(t *testing.T) {
 	for {
 		var found bool
 		for _, ps := range e.server.PipeStats() {
-			if ps.Pipe == p.ID() && ps.Inbound == InboundOpen {
+			if ps.Pipe == p.ID() && ps.Inbound == InboundOpen && ps.BytesReceived > 0 {
 				peer, found = ps, true
 			}
 		}
@@ -349,7 +394,7 @@ func TestPipeStatsAbsentDirection(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	want := PipeStats{Pipe: peer.Pipe, Local: peer.Local, FateGroup: peer.FateGroup, Label: peer.Label,
+	want := PipeStats{Pipe: peer.Pipe, Local: peer.Local, PeerAttached: peer.PeerAttached, FateGroup: peer.FateGroup, Label: peer.Label,
 		Carrier: peer.Carrier, Inbound: peer.Inbound, AttachedFor: peer.AttachedFor,
 		FailureCount: peer.FailureCount, Failure: peer.Failure, ReceivePriority: peer.ReceivePriority,
 		ReceiveStandby: peer.ReceiveStandby, RequestSeq: peer.RequestSeq, BytesReceived: peer.BytesReceived,

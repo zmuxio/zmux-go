@@ -2,7 +2,7 @@ package wire
 
 import "github.com/zmuxio/zmux-go/varint"
 
-// Preamble TLV types (EXTENSIONS.md 4.3).
+// Preamble TLV types.
 const (
 	TLVOpenInfo    uint64 = 0x01
 	TLVPriority    uint64 = 0x02
@@ -39,7 +39,7 @@ type Preamble struct {
 }
 
 // ParsePreamble parses a preamble from the data of the STREAM frame at
-// offset 0 alone (EXTENSIONS.md 4.4 rule 1). Every violation is a
+// offset 0 alone. Every violation is a
 // PROTOCOL_VIOLATION. App TLVs are appended to dst.App's storage.
 func ParsePreamble(data []byte, limit uint64, dst *Preamble) *Error {
 	app := dst.App[:0]
@@ -100,7 +100,7 @@ func appendTLV(b []byte, t uint64, v []byte) []byte {
 }
 
 // PreambleSpec describes a preamble to encode. TLVs are written in
-// increasing type order with the GREASE TLV last (TRACES.md 3.3).
+// increasing type order with the GREASE TLV last.
 type PreambleSpec struct {
 	OpenInfo    []byte
 	HasOpenInfo bool

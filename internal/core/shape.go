@@ -22,14 +22,13 @@ type shapeSess struct {
 	fac   Factory
 	gen   uint64 // bumped by SetShaper; a pipe's instance of an older one is replaced
 	stats shaping.Stats
-	// marks: send times of the latest records that SPEC.md 9.4.3 rule 1
-	// counts toward a plain QMux peer (PADDING-only records, QX_PING
+	// marks: send times of the latest records that the
+	// per-second limit on no-effect records counts toward a plain QMux peer (PADDING-only records, QX_PING
 	// requests, PIPE_PING frames).
 	marks [16]Time
 	mi    int
-	// injWait: an injection may be deferred until the padding ratio
-	// allowance covers it (shapeWakeCovered).
-	injWait bool
+	acct  wireAccount
+	eff   shaping.Limits // the local limits under the budget
 }
 
 // pipeShape is the shaping state of one outbound pipe.
@@ -42,35 +41,101 @@ type pipeShape struct {
 	plan shaping.RecordPlan // applies to the next record while planned
 	v    shaping.RecordView
 	ev   shaping.Event
-	r    shaping.Reply
+	r    shaping.Effects
 	hold Time // stream data waits until then (Gate)
 	// The planned record's earliest send time (RecordPlan.Delay): until
 	// then the pipe sends nothing but CONNECTION_CLOSE.
 	delayUntil Time
 	gateGen    uint64 // bumped by each Gate
-	rate       int64
-	burst      int64
-	tokens     float64
-	filled     Time
+	rateAsked  uint64 // as answered; the bucket holds the rate in force
+	bucket     tokenBucket
+	heldSince  Time // the rate gate holds data since then; Never: not held
 	injAt      Time
-	injLen     int
-	timers     [2]Time
-	weight     float64
-	caps       shaping.Caps
-	planned    bool // plan applies to the next record
-	delayWake  bool // the delayed record is due at delayUntil
-	wake       bool // a writer waits for hold or tokens
-	injDue     bool
-	injFirst   bool // the injection waited for batch room: it leads the next batch
+	injLen     int // frame bytes; 0: none
+	wakeAt     Time
+	pauseAsked Time // the latest PauseUntil taken
+	// How the current record's wire lengths convert to frame bytes (with
+	// sizeField below).
+	over int
+	// The plan's MaxLen and PadTo as asked, on the wire.
+	wireMaxLen, wirePadTo int
+	injPad                int // PADDING frames bytes an injection added to the record
+	injPaid               int // of those, what the account already metered
+	caps                  shaping.Caps
+	weight                uint32
+	sizeField             bool // see over
+	planned               bool // plan applies to the next record
+	delayWake             bool // the delayed record is due at delayUntil
+	wake                  bool // a writer waits for hold or tokens
+	injDue                bool
+	injFirst              bool // the injection waited for batch room: it leads the next batch
 }
 
-// SetShapeLimits replaces the session's shaping guardrails (local only,
-// never sent): records planned from now on follow l; what was already
-// padded or paused stays counted.
-func (s *Session) SetShapeLimits(l shaping.Limits) { s.cfg.ShapeLimits = l }
+// SetShapeLimits replaces the session's local limits; the account carries over.
+func (s *Session) SetShapeLimits(l shaping.Limits) {
+	sh := s.shapeSess()
+	s.cfg.ShapeLimits = l
+	s.shapeLimitsChanged(sh)
+}
 
-// ShapeLimits returns the session's shaping guardrails.
+// ShapeLimits returns the session's local limits.
 func (s *Session) ShapeLimits() shaping.Limits { return s.cfg.ShapeLimits }
+
+// ShapeLimitsInForce returns the local limits under the budget.
+func (s *Session) ShapeLimitsInForce() shaping.Limits {
+	if s.shp != nil {
+		return s.shp.eff
+	}
+	return s.cfg.ShapeLimits.With(s.cfg.ShapeBudget)
+}
+
+// SetShapeBudget replaces the configuration's budget; the account carries over.
+func (s *Session) SetShapeBudget(b shaping.Budget) {
+	sh := s.shapeSess()
+	s.cfg.ShapeBudget = b
+	s.shapeLimitsChanged(sh)
+}
+
+func (s *Session) shapeLimitsChanged(sh *shapeSess) {
+	sh.eff = s.cfg.ShapeLimits.With(s.cfg.ShapeBudget)
+	sh.acct.set(usOf(s.now), s.earnBytes, sh.eff.Wire)
+	for _, p := range s.pipes {
+		if ps := p.sh; ps != nil && ps.sh != nil && ps.rateAsked != 0 {
+			ps.setRate()
+		}
+	}
+}
+
+// usOf is t in microseconds of the session clock.
+func usOf(t Time) uint64 { return uint64(max(int64(t), 0)) / 1000 }
+
+// shapeSpend meters wire bytes of an accompanying action.
+func (s *Session) shapeSpend(n int) {
+	if n > 0 {
+		s.shapeSess().acct.spend(uint64(n))
+	}
+}
+
+// ShapeSpendHandshake meters the padding of a handshake run before the session.
+func (s *Session) ShapeSpendHandshake(n uint64) {
+	if n > 0 {
+		s.shapeSess().acct.spend(n)
+	}
+}
+
+// ShapeMeters returns the session's readings.
+func (s *Session) ShapeMeters() shaping.Meters {
+	s.shapeSess()
+	return s.shapeMeters()
+}
+
+// shapeMeters are the readings a CapBudget instance gets.
+func (s *Session) shapeMeters() shaping.Meters {
+	sh := s.shp
+	sh.acct.accrue(usOf(s.now), s.earnBytes)
+	return shaping.Meters{WireLeft: sh.acct.left(), StallLeft: math.MaxUint64, WireSpent: sh.acct.spent,
+		StallSpent: uint64(sh.stats.StallSpent / time.Microsecond), SentBytes: s.earnBytes}
+}
 
 func (s *Session) shapeSess() *shapeSess {
 	if s.shp == nil {
@@ -81,6 +146,10 @@ func (s *Session) shapeSess() *shapeSess {
 		if s.ping.outstanding != 0 {
 			s.shp.mark(s.ping.sentAt)
 		}
+		// The account runs from the session's start, whenever it is first needed.
+		s.shp.eff = s.cfg.ShapeLimits.With(s.cfg.ShapeBudget)
+		s.shp.acct.lastUS = usOf(s.start)
+		s.shp.acct.set(usOf(s.start), 0, s.shp.eff.Wire)
 	}
 	return s.shp
 }
@@ -144,7 +213,9 @@ func (s *Session) ShapingStats() shaping.Stats {
 	if s.shp == nil {
 		return shaping.Stats{}
 	}
-	return s.shp.stats
+	st := s.shp.stats
+	st.WireSpent = s.shp.acct.spent
+	return st
 }
 
 // shapeOf returns p's active shaping state, installing the factory's
@@ -182,9 +253,10 @@ func writeOverhead(p *Pipe) int {
 
 func (s *Session) shapeInstall(p *Pipe, x shaping.Shaper) *pipeShape {
 	if old := p.sh; old != nil && old.sh != nil {
-		old.event(shaping.EventReplaced, 0, 0, false, 0)
+		old.settleHeld(s.now)
+		old.event(shaping.EventReplaced, 0, 0, false)
 	}
-	ps := &pipeShape{s: s, p: p, sh: x, gen: s.shp.gen, injAt: Never, timers: [2]Time{Never, Never}}
+	ps := &pipeShape{s: s, p: p, sh: x, gen: s.shp.gen, injAt: Never, wakeAt: Never, heldSince: Never}
 	p.sh = ps
 	if x == nil {
 		return ps
@@ -192,7 +264,7 @@ func (s *Session) shapeInstall(p *Pipe, x shaping.Shaper) *pipeShape {
 	if !ps.call(func() { ps.caps = x.Capabilities() }) {
 		return ps
 	}
-	ps.event(shaping.EventStart, 0, 0, false, 0)
+	ps.event(shaping.EventStart, 0, 0, false)
 	return ps
 }
 
@@ -213,21 +285,25 @@ func (ps *pipeShape) stop(notify bool) {
 	if ps.sh == nil {
 		return
 	}
+	ps.settleHeld(ps.s.now)
 	if notify {
-		ps.event(shaping.EventStopped, 0, 0, false, 0)
+		ps.event(shaping.EventStopped, 0, 0, false)
 	}
-	*ps = pipeShape{s: ps.s, p: ps.p, gen: ps.gen, injAt: Never, timers: [2]Time{Never, Never}}
+	*ps = pipeShape{s: ps.s, p: ps.p, gen: ps.gen, injAt: Never, wakeAt: Never, heldSince: Never}
 }
 
 // event delivers a notification and applies the reply.
-func (ps *pipeShape) event(k shaping.EventKind, lane uint64, n int, padOnly bool, timer int) {
+func (ps *pipeShape) event(k shaping.EventKind, lane uint64, n int, padOnly bool) {
 	ps.eventOn(shaping.Event{Kind: k, Pipe: ps.p.id, Lane: lane, Now: time.Duration(ps.s.now), Len: n,
-		PaddingOnly: padOnly, Timer: timer})
+		PaddingOnly: padOnly})
 }
 
 func (ps *pipeShape) eventOn(e shaping.Event) {
 	ps.ev = e
-	ps.r = shaping.Reply{}
+	if ps.caps&shaping.CapBudget != 0 {
+		ps.ev.Meters = ps.s.shapeMeters()
+	}
+	ps.r = shaping.Effects{}
 	x, k := ps.sh, e.Kind
 	if !ps.call(func() { x.OnEvent(&ps.ev, &ps.r) }) || k == shaping.EventReplaced || k == shaping.EventStopped ||
 		k == shaping.EventPipeFailed {
@@ -236,62 +312,139 @@ func (ps *pipeShape) eventOn(e shaping.Event) {
 	ps.apply(&ps.r)
 }
 
-// apply executes a reply.
-func (ps *pipeShape) apply(r *shaping.Reply) {
+// apply executes the items an answer changes.
+func (ps *pipeShape) apply(r *shaping.Effects) {
+	if r.Set == 0 {
+		return
+	}
 	s := ps.s
-	if in := r.Inject; in != nil {
+	if r.Set&shaping.EffectInject != 0 {
 		ps.injLen, ps.injAt, ps.injDue, ps.injFirst = 0, Never, false, false
-		if !in.Cancel {
-			ps.injLen, ps.injAt = max(in.Len, 1), s.now.Add(max(Duration(in.After), 0))
+		if r.HasInject {
+			// It goes as one write of its own.
+			ps.injLen = max(framesOf(r.InjectLen, ps.framedSize(), writeOverhead(ps.p)), 1)
+			ps.injAt = Time(r.InjectAt)
 		}
 	}
-	if g := r.Gate; g != nil {
-		ps.hold = s.shapePause(Duration(g.Pause))
-		ps.rate, ps.burst, ps.filled = max(g.Rate, 0), g.Burst, s.now
-		if ps.burst <= 0 {
-			ps.burst = int64(min64(s.peerMaxRecord, wire.MaxRecordSize))
+	if r.Set&shaping.EffectWake != 0 {
+		ps.wakeAt = Never
+		if r.HasWake {
+			ps.wakeAt = Time(r.Wake)
 		}
-		ps.tokens = float64(ps.burst)
+	}
+	if r.Set&shaping.EffectGate != 0 {
+		// Only what extends the pauses asked for so far counts: an Effects answer
+		// repeats its PauseUntil, and a limit may have shortened that pause.
+		if d := Time(r.PauseUntil); d > max(ps.hold, s.now, ps.pauseAsked) {
+			from := max(ps.hold, s.now)
+			ps.hold = from.Add(s.shapePause(d.Sub(max(from, ps.pauseAsked))))
+			ps.pauseAsked = d
+		}
+		burst, clamped := shapeBurstFloor(r.Burst, int64(min64(s.peerMaxRecord, wire.MaxRecordSize)))
+		if rate := min(r.Rate, shaping.MaxAccountRate); rate != ps.rateAsked || burst != ps.bucket.burst {
+			if clamped && rate != 0 {
+				s.shp.stats.Clamped++
+			}
+			ps.settleHeld(s.now)
+			ps.rateAsked, ps.bucket.burst = rate, burst
+			ps.setRate()
+			ps.bucket.reset(usOf(s.now))
+		}
 		ps.wake = true
 		ps.gateGen++
 	}
-	for i, t := range r.Timer {
-		if t != nil {
-			ps.timers[i] = Never
-			if !t.Cancel {
-				ps.timers[i] = s.now.Add(max(Duration(t.After), 0))
-			}
-		}
+	if r.Set&shaping.EffectWeight != 0 && r.Weight != 0 {
+		ps.weight = r.Weight
 	}
-	if w := r.Weight; w != nil && *w > 0 && !math.IsInf(*w, 1) {
-		ps.weight = *w
-	}
-	if r.Stop {
+	if r.Set&shaping.EffectStop != 0 {
 		ps.stop(true)
 	}
 	s.wakePipe(ps.p)
 }
 
-// shapePause bounds a pause by the guardrails and returns its end.
-func (s *Session) shapePause(d Duration) Time {
+// setRate puts the rate asked in force, within the lower bound of one wait.
+func (ps *pipeShape) setRate() {
+	md := int64(-1)
+	if m := ps.s.shp.eff.MaxDelay; m >= 0 {
+		md = int64(m / time.Microsecond)
+	}
+	r, clamped := shapeRateFloor(ps.rateAsked, md)
+	if clamped {
+		ps.s.shp.stats.Clamped++
+	}
+	if r != ps.bucket.rate {
+		// What has passed earns at the old rate and is held under the old rate.
+		ps.bucket.fill(usOf(ps.s.now))
+		ps.settleHeld(ps.s.now)
+	}
+	ps.bucket.rate = r
+}
+
+// settleHeld adds the time the rate gate has held data to the stall; a later
+// hold counts from its own start.
+func (ps *pipeShape) settleHeld(now Time) {
+	if ps.heldSince != Never {
+		ps.s.shp.addStall(time.Duration(now.Sub(ps.heldSince)))
+		ps.heldSince = Never
+	}
+}
+
+// framedSize reports that p's records have a size field: on a byte stream.
+func (ps *pipeShape) framedSize() bool {
+	o := ps.p.out
+	return o != nil && len(o.lanes) > 0 && o.lanes[0].info.Framing != FramingRecords
+}
+
+// framesOf is the smallest frame byte count whose record reaches the wire
+// length t, with over bytes of the write: a length no record has is taken to
+// the next one.
+func framesOf(t int, sizeField bool, over int) int {
+	x := t - over
+	if x <= 0 {
+		return 0
+	}
+	if !sizeField {
+		return x
+	}
+	f := max(x-8, 0)
+	for f+varint.SizeVarint(uint64(f)) < x {
+		f++
+	}
+	return f
+}
+
+// wireOf is the wire length of a record of f frame bytes.
+func wireOf(f int, sizeField bool, over int) int {
+	if sizeField {
+		f += varint.SizeVarint(uint64(f))
+	}
+	return f + over
+}
+
+// shapePause bounds a pause by the limits and returns what is left of it.
+func (s *Session) shapePause(d Duration) Duration {
 	sh := s.shp
 	if d <= 0 {
-		return s.now
+		return 0
 	}
-	if s.cfg.ShapeLimits.NoPause {
+	if sh.eff.NoPause {
 		sh.stats.Clamped++
-		return s.now
+		return 0
 	}
-	if m := Duration(s.cfg.ShapeLimits.MaxDelay); m > 0 && d > m {
+	if m := Duration(sh.eff.MaxDelay); m > 0 && d > m {
 		d = m
 		sh.stats.Clamped++
 	}
-	if m := s.cfg.ShapeLimits.MaxPauseTotal; m > 0 && time.Duration(d) > m-min(sh.stats.PauseTotal, m) {
-		d = Duration(m - min(sh.stats.PauseTotal, m))
-		sh.stats.Clamped++
+	sh.addStall(time.Duration(d))
+	return d
+}
+
+func (sh *shapeSess) addStall(d time.Duration) {
+	if d > math.MaxInt64-sh.stats.StallSpent {
+		sh.stats.StallSpent = math.MaxInt64
+		return
 	}
-	sh.stats.PauseTotal += time.Duration(d)
-	return s.now.Add(d)
+	sh.stats.StallSpent += d
 }
 
 // held reports whether the gate holds stream data now.
@@ -299,18 +452,18 @@ func (ps *pipeShape) held(now Time) bool {
 	if now < ps.hold {
 		return true
 	}
-	if ps.rate == 0 {
+	if ps.bucket.rate == 0 {
+		ps.settleHeld(now)
 		return false
 	}
-	ps.tokens = min(float64(ps.burst), ps.tokens+float64(ps.rate)*float64(now.Sub(ps.filled))/1e9)
-	ps.filled = now
-	return ps.tokens < ps.quantum()
-}
-
-// quantum is the bucket level that releases a held pipe: the bytes of
-// one granularity G, at least one.
-func (ps *pipeShape) quantum() float64 {
-	return max(1, min(float64(ps.burst), float64(ps.rate)*float64(limGranularity)/1e9))
+	ps.bucket.fill(usOf(now))
+	h := ps.bucket.held()
+	if !h {
+		ps.settleHeld(now)
+	} else if ps.heldSince == Never {
+		ps.heldSince = now
+	}
+	return h
 }
 
 // gateRoom returns the stream data the shaping gate lets through for the
@@ -329,10 +482,10 @@ func (w *recWriter) gateRoom() int64 {
 		ps.wake = true
 		return 0
 	}
-	if ps.rate == 0 {
+	if ps.bucket.rate == 0 {
 		return -1
 	}
-	r := int64(ps.tokens) - int64(w.dataSpent-w.gateBase)
+	r := ps.bucket.tokens - int64(w.dataSpent-w.gateBase)
 	if r <= 0 {
 		ps.wake = true
 		return 0
@@ -348,8 +501,8 @@ func (w *recWriter) chargeGate() {
 		return
 	}
 	w.gateRoom() // follows a gate set by the batch's last plan
-	if ps.rate > 0 {
-		ps.tokens -= float64(w.dataSpent - w.gateBase)
+	if ps.bucket.rate > 0 {
+		ps.bucket.tokens -= int64(w.dataSpent - w.gateBase)
 	}
 	w.gateBase = w.dataSpent
 }
@@ -364,7 +517,7 @@ func (s *Session) shapeHeld(p *Pipe) bool {
 
 // delayed reports whether the planned record may not go yet.
 func (ps *pipeShape) delayed(now Time) bool {
-	return ps.sh != nil && ps.planned && now < ps.delayUntil
+	return ps.sh != nil && ps.planned && ps.delayWake && now < ps.delayUntil
 }
 
 // shapeDelayed reports whether p's planned record waits for its delay.
@@ -372,7 +525,7 @@ func (s *Session) shapeDelayed(p *Pipe) bool { return p.sh != nil && p.sh.delaye
 
 // shapeWants reports an injection due on lane 0 of p.
 func (s *Session) shapeWants(p *Pipe, lane uint64) bool {
-	return lane == 0 && p.sh != nil && p.sh.injDue && s.injCovered(p.sh.injLen)
+	return lane == 0 && p.sh != nil && p.sh.injDue
 }
 
 // prep plans the record that the writer opens next.
@@ -391,6 +544,9 @@ func (ps *pipeShape) prep(w *recWriter) {
 		if ps.caps&shaping.CapPlan != 0 {
 			ps.v = shaping.RecordView{Pipe: ps.p.id, Lane: w.b.Lane, Seq: ps.seq, Limit: w.recMax,
 				WriteStart: w.recs == 0 || w.framing == FramingRecords, Now: time.Duration(s.now)}
+			if ps.caps&shaping.CapBudget != 0 {
+				ps.v.Meters = s.shapeMeters()
+			}
 			x := ps.sh
 			if !ps.call(func() { x.Plan(&ps.v, &ps.plan) }) {
 				w.sh = nil
@@ -398,28 +554,25 @@ func (ps *pipeShape) prep(w *recWriter) {
 			}
 		}
 		ps.planned = true
-		if m := ps.plan.MaxLen; m > 0 && m < shaping.MinMaxLen {
-			ps.plan.MaxLen = shaping.MinMaxLen
-			s.shp.stats.Clamped++
-		}
-		// No padding target goes beyond a record, so that padFor cannot
-		// overflow.
-		for _, f := range [...]*int{&ps.plan.PadTo, &ps.plan.PadMultiple, &ps.plan.Pad} {
+		pl := &ps.plan
+		ps.wireMaxLen, ps.wirePadTo, ps.injPad, ps.injPaid = pl.MaxLen, pl.PadTo, 0, 0
+		ps.fit(w, true)
+		for _, f := range [...]*int{&pl.PadMultiple, &pl.Pad} {
 			if *f > w.recMax {
 				*f = w.recMax
 				s.shp.stats.Clamped++
 			}
 		}
-		if ps.plan.Reply != (shaping.Reply{}) {
-			ps.apply(&ps.plan.Reply)
+		if pl.Effects.Set != 0 {
+			ps.apply(&pl.Effects)
 			if ps.sh == nil {
 				w.sh = nil
 				return
 			}
 		}
 		ps.delayUntil, ps.delayWake = 0, false
-		if d := ps.plan.Delay; d > 0 {
-			ps.delayUntil, ps.delayWake = s.shapePause(Duration(d)), true
+		if d := pl.Delay; d > 0 {
+			ps.delayUntil, ps.delayWake = s.now.Add(s.shapePause(Duration(d))), true
 		}
 	}
 	if ps.delayed(ps.s.now) {
@@ -427,81 +580,64 @@ func (ps *pipeShape) prep(w *recWriter) {
 		w.delayed = true
 		return
 	}
+	// A record planned in the middle of a write may open at the start of a later
+	// one, or the reverse: its lengths follow where it opens.
+	if ps.over != ps.overHere(w) {
+		ps.fit(w, false)
+	}
 	w.cut = 0
 	if m := ps.plan.MaxLen; m > 0 && m < w.recMax {
 		w.cut = max(m, shaping.MinMaxLen)
 	}
 }
 
-// padFor returns the PADDING the plan adds to a record of n frames bytes.
-func (ps *pipeShape) padFor(n int) int {
-	pl := &ps.plan
-	t := max(n, pl.PadTo)
-	if b := pl.PadMultiple; b > 0 && t%b != 0 {
-		t += b - t%b
+// overHere is the write overhead a record opened now by w carries.
+func (ps *pipeShape) overHere(w *recWriter) int {
+	if w.recs == 0 || w.framing == FramingRecords {
+		return writeOverhead(ps.p)
 	}
-	return t - n + max(pl.Pad, 0)
+	return 0
 }
 
-// padRoom returns the PADDING bytes the guardrails still allow: by
-// MaxPaddingBytes (hard) and by MaxPaddingRatio or NoPaddingRatio, at least
-// shaping.StartupAllowance in all (ratio); math.MaxUint64: unbounded.
-func (s *Session) padRoom() (hard, ratio uint64) {
-	sh := s.shp
-	hard, ratio = math.MaxUint64, math.MaxUint64
-	if s.cfg.ShapeLimits.NoPadding {
-		return 0, 0
-	}
-	if m := s.cfg.ShapeLimits.MaxPaddingBytes; m > 0 {
-		hard = m - min64(sh.stats.PaddingBytes, m)
-	}
-	if r := s.cfg.ShapeLimits.MaxPaddingRatio; r > 0 || s.cfg.ShapeLimits.NoPaddingRatio {
-		if s.cfg.ShapeLimits.NoPaddingRatio {
-			r = 0
+// fit converts the plan's wire lengths for a record opened now by w; count says
+// that its clamps are counted, once for a record.
+func (ps *pipeShape) fit(w *recWriter, count bool) {
+	s, pl := ps.s, &ps.plan
+	clamped := func() {
+		if count {
+			s.shp.stats.Clamped++
 		}
-		other := s.stats.BytesSent - min64(s.stats.BytesSent, sh.stats.PaddingBytes)
-		m := max(uint64(r*float64(other)), shaping.StartupAllowance)
-		ratio = m - min64(sh.stats.PaddingBytes, m)
 	}
-	return hard, ratio
-}
-
-// injCovered reports whether an injection of n bytes may go now: the
-// ratio allowance covers it, or a hard limit, which cuts it, binds first.
-func (s *Session) injCovered(n int) bool {
-	hard, ratio := s.padRoom()
-	return ratio >= uint64(n) || hard <= ratio
-}
-
-// shapeWakeCovered wakes the pipes whose deferred injection the ratio
-// allowance now covers.
-func (s *Session) shapeWakeCovered() {
-	sh := s.shp
-	sh.injWait = false
-	for _, p := range s.pipes {
-		if ps := p.sh; ps != nil && ps.sh != nil && ps.injDue {
-			if s.injCovered(ps.injLen) {
-				s.wakePipe(p)
-			} else {
-				sh.injWait = true
+	ps.sizeField, ps.over = w.framing != FramingRecords, ps.overHere(w)
+	pl.MaxLen, pl.PadTo = ps.wireMaxLen, ps.wirePadTo
+	// The largest record, in frame bytes from here on.
+	if m := pl.MaxLen; m > 0 {
+		f := framesOf(m, ps.sizeField, ps.over)
+		if f < shaping.MinMaxLen {
+			f = shaping.MinMaxLen
+			clamped()
+			if pl.PadTo == m {
+				pl.PadTo = wireOf(f, ps.sizeField, ps.over)
 			}
 		}
+		pl.MaxLen = f
+	}
+	// No padding target goes beyond a record, so that padFor cannot
+	// overflow.
+	if m := wireOf(w.recMax, ps.sizeField, ps.over); pl.PadTo > m {
+		pl.PadTo = m
+		clamped()
 	}
 }
 
-// allowPad bounds n bytes of PADDING by the guardrails.
-func (s *Session) allowPad(n int) int {
-	sh := s.shp
-	if n <= 0 {
-		return 0
+// padFor returns the PADDING the plan adds to a record of n frames bytes.
+func (ps *pipeShape) padFor(n int) int {
+	l := wireOf(n, ps.sizeField, ps.over)
+	t := shaping.PadFor(l, &ps.plan.UnitPlan)
+	if t <= l {
+		return ps.injPad
 	}
-	hard, ratio := s.padRoom()
-	u := min(uint64(n), hard, ratio)
-	if u < uint64(n) {
-		sh.stats.Clamped++
-	}
-	sh.stats.PaddingBytes += u
-	return int(u)
+	return max(framesOf(t, ps.sizeField, ps.over), n) - n + ps.injPad
 }
 
 // endShaped applies the plan to the record being closed; the pending
@@ -513,6 +649,10 @@ func (s *Session) allowPad(n int) int {
 func (w *recWriter) endShaped() {
 	ps := w.sh
 	last := w.pendLen(false)
+	if w.cut > 0 && w.recBytes+w.pendLen(true) >= w.cut {
+		// Cut at the plan's largest record: the next record's head.
+		ps.s.shapeSpend(wireOf(w.cut, ps.sizeField, ps.over) - w.cut)
+	}
 	if pad := ps.padFor(w.recBytes + w.pendLen(true)); pad > 0 {
 		w.flushPend(true)
 		w.pad(w.clampPad(pad, 0))
@@ -535,15 +675,24 @@ func (w *recWriter) endShaped() {
 	}
 }
 
-// clampPad bounds n bytes of PADDING by the record and batch room left
-// besides rest bytes still to follow, then by the guardrails.
+// clampPad bounds n bytes of PADDING by the record and batch room left besides
+// rest bytes still to follow, and meters what is not yet.
 func (w *recWriter) clampPad(n, rest int) int {
+	ps := w.sh
+	sh := ps.s.shp
 	avail := min(w.recMax-w.recBytes-rest, w.budget-rest-varint.SizeVarint(uint64(w.recMax)))
 	if n > avail {
 		n = max(avail, 0)
-		w.sh.s.shp.stats.Clamped++
+		sh.stats.Clamped++
 	}
-	return w.sh.s.allowPad(n)
+	if sh.eff.NoPadding {
+		if n > 0 {
+			sh.stats.Clamped++
+		}
+		return 0
+	}
+	sh.acct.spend(uint64(max(n-ps.injPaid, 0)))
+	return n
 }
 
 // pad appends n bytes of PADDING to the open record.
@@ -555,40 +704,49 @@ func (w *recWriter) pad(n int) {
 	w.recBytes += n
 	w.budget -= n
 	w.b.n += n
+	w.notEarned += uint64(n)
 }
 
-// shapeInject sends a due injection on lane 0: as PADDING of the open
-// record, or as a record of PADDING only within the guardrails and, toward
-// a plain QMux peer, SPEC.md 9.4.3 rule 1.
+// shapeInject sends a due injection on lane 0: as PADDING of the open record, or
+// as a record of PADDING only within the per-second no-effect limit toward a plain QMux
+// peer. Either way it is spontaneous: what the limits or the account refuse is
+// dropped, never deferred.
 func (s *Session) shapeInject(w *recWriter) {
 	ps := w.sh
 	if ps == nil || !ps.injDue || w.b.Lane != 0 || ps.delayed(s.now) {
 		return
 	}
 	n := ps.injLen
-	ps.injDue, ps.injLen, ps.injFirst = false, 0, false
+	ps.injDue, ps.injFirst = false, false // the slot stays until the answer replaces it
 	sh := s.shp
+	off := sh.eff.NoInjection || sh.eff.NoPadding
 	if w.open && w.recBytes+w.pendLen(false) > 0 && ps.planned {
-		ps.plan.Pad += n
-		ps.event(shaping.EventInjected, 0, n, false, 0)
+		if off || !sh.acct.charge(usOf(s.now), s.earnBytes, uint64(n)) {
+			s.shapeDropped(ps)
+			return
+		}
+		ps.injPad += n // frames bytes, beside the plan's wire lengths
+		ps.injPaid += n
+		ps.event(shaping.EventInjected, 0, n, false)
 		return
 	}
 	w.end()
-	if w.closed || !s.peerZmux && !sh.allowed(s.now) || s.cfg.ShapeLimits.NoInjection || s.cfg.ShapeLimits.NoPadding || s.cfg.ShapeLimits.MaxInjected > 0 && sh.stats.Injected >= s.cfg.ShapeLimits.MaxInjected {
-		sh.stats.InjectDropped++
+	if !s.peerZmux && !sh.allowed(s.now) || off {
+		s.shapeDropped(ps)
+		return
+	}
+	// The record before it closed the batch (its plan flushes): it goes first
+	// in the next batch, and nothing is charged until it goes.
+	if w.closed {
+		ps.injDue, ps.injFirst = true, true
 		return
 	}
 	if n > w.recMax {
 		n = w.recMax // a record is the most an injection sends
 		sh.stats.Clamped++
 	}
-	// An injection that the ratio allowance or, in a batch that already
-	// holds records, the batch room does not cover waits, to go whole
-	// later; only a hard limit cuts it.
-	if !s.injCovered(n) {
-		ps.injDue, ps.injLen, sh.injWait = true, n, true
-		return
-	}
+	// In a batch that already holds records, what the batch has no room for
+	// waits, to go whole in the next; nothing is charged until it goes.
 	if m := w.budget - varint.SizeVarint(uint64(w.recMax)); n > m {
 		if w.b.n > 0 {
 			ps.injDue, ps.injLen, ps.injFirst = true, n, true
@@ -597,8 +755,8 @@ func (s *Session) shapeInject(w *recWriter) {
 		n = max(m, 0)
 		sh.stats.Clamped++
 	}
-	if n = s.allowPad(n); n == 0 {
-		sh.stats.InjectDropped++
+	if n == 0 || !sh.acct.charge(usOf(s.now), s.earnBytes, uint64(wireOf(n, w.framing != FramingRecords, ps.overHere(w)))) {
+		s.shapeDropped(ps)
 		return
 	}
 	w.sh = nil
@@ -606,12 +764,26 @@ func (s *Session) shapeInject(w *recWriter) {
 	w.pad(n)
 	w.end()
 	w.sh = ps
+	if w.framing != FramingRecords {
+		w.notEarned += uint64(recordPositionBytes(n) - n)
+	}
 	sh.mark(s.now)
 	sh.stats.Injected++
-	ps.event(shaping.EventInjected, 0, n, false, 0)
+	ps.event(shaping.EventInjected, 0, n, false)
 }
 
-// allowed reports whether a record of SPEC.md 9.4.3 rule 1 may go now.
+// shapeDropped reports an injection that will not go. What the answer leaves in
+// the slot, kept or new, is tried no sooner than a granularity later: a chain of
+// drops is not a loop, however short the answer's own delays.
+func (s *Session) shapeDropped(ps *pipeShape) {
+	s.shp.stats.InjectDropped++
+	ps.event(shaping.EventInjectDropped, 0, 0, false)
+	if ps.injLen > 0 {
+		ps.injAt = max(ps.injAt, s.now.Add(limGranularity))
+	}
+}
+
+// allowed reports whether a no-effect record may go now (at most len(marks) per second).
 func (sh *shapeSess) allowed(now Time) bool { return sh.marks[sh.mi] <= now.Add(-Second) }
 
 func (sh *shapeSess) mark(t Time) {
@@ -622,7 +794,7 @@ func (sh *shapeSess) mark(t Time) {
 // shapeRecordIn reports a received record.
 func (s *Session) shapeRecordIn(p *Pipe, lane uint64, n int, padOnly bool) {
 	if ps := p.sh; ps != nil && ps.sh != nil && ps.caps&shaping.CapRecordIn != 0 {
-		ps.event(shaping.EventRecordIn, lane, n, padOnly, 0)
+		ps.event(shaping.EventRecordIn, lane, n, padOnly)
 	}
 }
 
@@ -644,7 +816,7 @@ func (s *Session) shapeDeadline() Time {
 		if ps == nil || ps.sh == nil {
 			continue
 		}
-		t = minT(t, minT(ps.timers[0], ps.timers[1]))
+		t = minT(t, ps.wakeAt)
 		if ps.injLen > 0 && !ps.injDue {
 			t = minT(t, ps.injAt)
 		}
@@ -653,8 +825,12 @@ func (s *Session) shapeDeadline() Time {
 		}
 		if ps.wake && s.sched.mask != 0 {
 			r := ps.hold
-			if ps.rate > 0 && ps.tokens < ps.quantum() {
-				r = max(r, ps.filled.Add(Duration((ps.quantum()-ps.tokens)*1e9/float64(ps.rate))+1))
+			if b := &ps.bucket; b.rate > 0 && b.held() {
+				at := Never
+				if us, ok := b.release(); ok && us <= math.MaxInt64/1000 {
+					at = Time(us * 1000)
+				}
+				r = max(r, at)
 				r = max(r, s.now.Add(limGranularity))
 			}
 			t = minT(t, r)
@@ -667,17 +843,17 @@ func (s *Session) shapeDeadline() Time {
 func (s *Session) shapeTimeout(now Time) {
 	for _, p := range s.pipes {
 		ps := p.sh
-		for i := range 2 {
-			if ps == nil || ps.sh == nil {
-				break
-			}
-			if ps.timers[i] <= now {
-				ps.timers[i] = Never
-				ps.event(shaping.EventTimer, 0, 0, false, i)
-			}
-		}
 		if ps == nil || ps.sh == nil {
 			continue
+		}
+		if at := ps.wakeAt; at <= now {
+			ps.event(shaping.EventTimer, 0, 0, false)
+			if ps.sh == nil {
+				continue
+			}
+			if ps.wakeAt == at { // not replaced: not again at once
+				ps.wakeAt = now.Add(limGranularity)
+			}
 		}
 		if ps.injLen > 0 && !ps.injDue && ps.injAt <= now {
 			ps.injDue = true
@@ -697,7 +873,7 @@ func (s *Session) shapeTimeout(now Time) {
 // shapePipeDown ends shaping of a pipe whose outbound direction failed.
 func (s *Session) shapePipeDown(p *Pipe) {
 	if ps := p.sh; ps != nil && ps.sh != nil {
-		ps.event(shaping.EventPipeFailed, 0, 0, false, 0)
+		ps.event(shaping.EventPipeFailed, 0, 0, false)
 		ps.stop(false)
 	}
 }
@@ -709,4 +885,12 @@ func (s *Session) shapeStream(k shaping.EventKind, id uint64) {
 			ps.eventOn(shaping.Event{Kind: k, Pipe: p.id, Now: time.Duration(s.now), Stream: id})
 		}
 	}
+}
+
+// ShapeFaults counts the panics of the session's shapers (ShapingStats.Faults).
+func (s *Session) ShapeFaults() uint64 {
+	if s.shp == nil {
+		return 0
+	}
+	return s.shp.stats.Faults
 }

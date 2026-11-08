@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 // HTTPExchangeHandler serves HTTP exchange carriers (see
@@ -265,7 +267,7 @@ func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *
 	// or gone.
 	a.takeSlot()
 	a.mu.Lock()
-	hint := JoinHint{Source: a.src, Admitted: a.value}
+	hint := PipeHint{Source: a.src, Admitted: a.value}
 	a.mu.Unlock()
 	run, err := h.l.take(PipeIO{R: &exServerReader{nc}, W: &exServerWriter{nc},
 		Carrier: CarrierExchange}, hint, a.key)
@@ -287,10 +289,10 @@ func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *
 		h.wg.Done()
 		return nil, exFlagBusy
 	}
-	go func() {
+	labels.Go(context.Background(), "exchange-server", func() {
 		defer h.wg.Done()
 		_ = run(h.ctx)
-	}()
+	})
 	return nc, 0
 }
 
@@ -364,29 +366,30 @@ type exServer struct {
 	coal     *time.Timer
 	mem      int64 // charged to the listener's budget
 	ended    bool
+	// The flags of the uplink and the downlink, kept with ended.
+	upFinOK bool // uplink: upFin is set
+	rclosed bool // uplink: zmux closed the read side
+	wclosed bool // downlink: zmux closed the write side
+	finOK   bool // downlink: finLow is set
 
 	// uplink
-	upFinOK bool
-	rclosed bool
-	upNext  uint64              // lowest number not received
-	upMax   uint64              // highest number received plus one
-	upOOO   map[uint64]*exPiece // received above upNext
-	upQ     []*exPiece          // contiguous, not yet read by zmux
-	upLen   int                 // bytes in upOOO and upQ, and exPieceCost per piece in upOOO
-	upFin   uint64
+	upNext uint64              // lowest number not received
+	upMax  uint64              // highest number received plus one
+	upOOO  map[uint64]*exPiece // received above upNext
+	upQ    []*exPiece          // contiguous, not yet read by zmux
+	upLen  int                 // bytes in upOOO and upQ, and exPieceCost per piece in upOOO
+	upFin  uint64
 
 	// downlink
-	ack     uint64               // highest Down Ack received
-	pieces  map[uint64]*exAssign // assigned, not yet released
-	asgEnd  uint64               // highest assigned number plus one
-	fill    uint64               // lowest unassigned number: the piece bytes go to
-	cur     *exBuf               // bytes of piece fill
-	curLen  int
-	curAt   time.Time
-	nheld   int    // held DOWN requests
-	finLow  uint64 // lowest FIN piece, when finOK
-	wclosed bool
-	finOK   bool
+	ack    uint64               // highest Down Ack received
+	pieces map[uint64]*exAssign // assigned, not yet released
+	asgEnd uint64               // highest assigned number plus one
+	fill   uint64               // lowest unassigned number: the piece bytes go to
+	cur    *exBuf               // bytes of piece fill
+	curLen int
+	curAt  time.Time
+	nheld  int    // held DOWN requests
+	finLow uint64 // lowest FIN piece, when finOK
 }
 
 // exAssign is an assigned downlink piece; refs counts the responses being

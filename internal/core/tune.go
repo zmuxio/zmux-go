@@ -1,6 +1,6 @@
 package core
 
-// Receive-window auto-tuning (SPEC.md 8.3 rule 6):
+// Receive-window auto-tuning:
 // each window is the arrival rate times max(K x RTT_min, B) and never
 // shrinks. One tuner per scope (a stream's receiving part, the session),
 // allocated with the scope's first data.

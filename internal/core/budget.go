@@ -1,6 +1,10 @@
 package core
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
+)
 
 // Budget is a memory budget shared by the sessions of a listener: the sum over
 // them of buffered receive data, retained data and the growth of each session
@@ -86,8 +90,8 @@ func (s *Session) underPressure() bool {
 	return s.cfg.Budget != nil && s.cfg.Budget.over.Load()
 }
 
-// Refuse closes a session the listener does not take (CONNECTION_REFUSED
-// after its own parameters).
-func (s *Session) Refuse() {
-	s.closeTransport(&SessionError{Kind: CloseTransport, Code: 0x02, Reason: "memory budget"})
+// Refuse closes a session the listener does not take by its policy
+// (CONNECTION_REFUSED after its own parameters).
+func (s *Session) Refuse(reason string) {
+	s.closeTransport(&SessionError{Kind: CloseTransport, Code: wire.ConnectionRefused, Reason: reason})
 }

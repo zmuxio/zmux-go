@@ -5,7 +5,7 @@ import (
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// dgramState holds the datagram queues (EXTENSIONS.md 6.5).
+// dgramState holds the datagram queues.
 type dgramState struct {
 	send     []outDgram
 	recv     [][]byte
@@ -16,7 +16,7 @@ type dgramState struct {
 	// driver runs outside the lock.
 	limited []PendingDatagram
 	// Received datagrams of peer streams not opened yet, in arrival order
-	// and so in the order they expire (EXTENSIONS.md 6.4).
+	// and so in the order they expire.
 	held []heldDgram
 }
 
@@ -53,14 +53,14 @@ func (p *PendingDatagram) Len() int {
 
 // outDgram is a queued datagram: its encoded data (flow prefix + payload)
 // and, for a stream datagram, its stream, whose opening frame it must not
-// overtake (EXTENSIONS.md 6.4).
+// overtake.
 type outDgram struct {
 	data []byte
 	st   *Stream
 	n    int // payload bytes (data without the flow and context prefix)
 }
 
-// countSent counts a datagram handed to a carrier (API.md 7.1).
+// countSent counts a datagram handed to a carrier.
 func (s *Session) countSent(o *outDgram) {
 	s.stats.DatagramsSent++
 	s.stats.DatagramBytesSent += uint64(o.n)
@@ -118,7 +118,7 @@ func (d *dgramState) sendable(s *Session) bool {
 
 // dgPipe returns the pipe that DATAGRAM frames go to now: the pipe whose
 // lane 0 carries the control frames, the primary pipe of a multipath
-// session (MULTIPATH.md 11.1 rule S7) or the session's outbound pipe;
+// session or the session's outbound pipe;
 // nil when every pipe of a multipath session carries them.
 func (s *Session) dgPipe() *Pipe {
 	if s.mp != nil {
@@ -148,7 +148,7 @@ func (c chanUse) takes(n int) bool {
 }
 
 // channelOf returns how DATAGRAM frames for p may use its carrier's
-// datagram channel (EXTENSIONS.md 6.8): when both endpoints sent
+// datagram channel: when both endpoints sent
 // zmux_carrier_datagrams, the carrier has a channel, and p's records are
 // not shaped.
 func (s *Session) channelOf(p *Pipe) chanUse {
@@ -184,7 +184,7 @@ func (s *Session) wakeChannels() {
 
 // PollChannel appends to dst the channel datagrams due on the datagram
 // channel of pipe, each a new slice the driver sends outside the lock and
-// in order (EXTENSIONS.md 6.8); live is false once the pipe can send no
+// in order; live is false once the pipe can send no
 // more. ChannelDone counts them once the driver tried them.
 func (s *Session) PollChannel(pipe uint64, dst []ChannelOut) (_ []ChannelOut, live bool) {
 	p := s.pipe(pipe)
@@ -239,7 +239,7 @@ func (s *Session) ChannelDone(out []ChannelOut) {
 }
 
 // ReceiveChannelDatagram processes a channel datagram received for pipe,
-// its Pipe Stream ID removed (EXTENSIONS.md 6.8). It is not a record: it
+// its Pipe Stream ID removed. It is not a record: it
 // advances no PIPE_ACK position, is not charged to the no-effect budget
 // and restarts no idle timer.
 func (s *Session) ReceiveChannelDatagram(pipe uint64, frame []byte, now Time) {
@@ -278,7 +278,7 @@ func (s *Session) dgState() *dgramState {
 }
 
 // MaxDatagramPayload returns the largest session datagram payload the peer
-// accepts now, 0 when it accepts none (EXTENSIONS.md 6.6).
+// accepts now, 0 when it accepts none.
 func (s *Session) MaxDatagramPayload(flowLen int) int {
 	if !s.peerSeen || s.peerMaxDgram == 0 {
 		return 0
@@ -291,6 +291,21 @@ func (s *Session) MaxDatagramPayload(flowLen int) int {
 		return 0
 	}
 	return int(m - 1)
+}
+
+// StreamMaxDatagramPayload returns the largest datagram payload the peer
+// accepts now on st with context identifier context, 0 when it accepts none
+// there. Before st has its identifier the largest identifier encoding is
+// assumed, so the value only grows once it is assigned.
+func (s *Session) StreamMaxDatagramPayload(st *Stream, context uint64) int {
+	if !s.cfg.Datagrams || !s.peerSeen || !s.feat.Flows || !st.bidi {
+		return 0
+	}
+	idLen := 8
+	if st.idSet {
+		idLen = varint.SizeVarint(st.id + 1)
+	}
+	return s.MaxDatagramPayload(idLen + varint.SizeVarint(context))
 }
 
 // SendDatagram queues a datagram; a full queue drops its oldest entry
@@ -448,8 +463,8 @@ func (s *Session) onDatagram(f *wire.Frame, ch bool) *wire.Error {
 			}
 			st := s.streams[id]
 			if st == nil && !isLocalID(id, s.role) && id>>2 >= s.rem[0].opened {
-				// It overtook the stream's opening frame (EXTENSIONS.md
-				// 6.4, 6.8): held for at most one smoothed RTT, and
+				// It overtook the stream's opening frame:
+				// held for at most one smoothed RTT, and
 				// counted as received once delivered.
 				s.holdDatagram(id, streamDgram(ctx, data[cn:]), ch)
 				return nil

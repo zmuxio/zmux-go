@@ -13,9 +13,10 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
-// Carrier selection (API.md 4.8): DialMode dials a session over one carrier
+// Carrier selection: DialMode dials a session over one carrier
 // kind (ExplicitMode) or chooses among candidates (AutoMode), for paths
 // through reverse proxies and CDNs where which kinds pass depends on the
 // path. Every kind keeps its own dialer; a Candidate wraps one. A kind
@@ -137,7 +138,7 @@ func StreamingCandidate(client *http.Client, url string, h http.Header) Candidat
 
 // SplitCandidate is a split bootstrap (HTTPSplitPipe) to url with client
 // and the fields h. As a further pipe of a session it joins as an uplink
-// POST and a downlink GET joined out of band, two pipes. Its carriers must
+// POST and a downlink GET that one Join pairs into one pipe. Its carriers must
 // be confidential end to end or up to a trusted TLS-terminating
 // intermediary.
 func SplitCandidate(client *http.Client, url string, h http.Header) Candidate {
@@ -147,7 +148,11 @@ func SplitCandidate(client *http.Client, url string, h http.Header) Candidate {
 			return httpSplitPipe(ctx, client, url, t, h, cred)
 		},
 		join: func(ctx, _ context.Context, c *Conn, cred Credential, o PipeOptions) ([]*Pipe, error) {
-			return httpSplitJoin(ctx, c, client, url, t, h, cred, o)
+			p, err := httpSplitJoin(ctx, c, client, url, t, h, cred, o)
+			if err != nil {
+				return nil, err
+			}
+			return []*Pipe{p}, nil
 		}}
 }
 
@@ -670,17 +675,17 @@ func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn,
 		if join && c.ConnectionState().Multipath {
 			pipe0, _ := c.Pipe(0)
 			seed := &modeSeed{mp: mp, pipes: []*Pipe{pipe0}, kind: i, born: chosen}
-			go func() { _ = c.maintainPipes(c.Context(), PipePool{Count: 1}, seed) }()
+			labels.Go(c.lctx, "pool", func() { _ = c.maintainPipes(c.Context(), PipePool{Count: 1}, seed) })
 			return c, nil
 		}
 		// One carrier: the session ends with it, and counts against its
 		// kind when it fails soon after it was chosen.
-		go func() {
+		labels.Go(c.lctx, "mode-watch", func() {
 			var ae *ApplicationError
 			if err := c.Wait(); !errors.As(err, &ae) {
 				mp.dropped(i, chosen)
 			}
-		}()
+		})
 		return c, nil
 	}
 	return nil, &ModeError{Results: results}
@@ -817,7 +822,7 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Crede
 // until the session ends.
 func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred Credential, p *modeParams, o PipeOptions) ([]*Pipe, CandidateResult) {
 	res := CandidateResult{Kind: cand.Kind, Variant: cand.Variant, Joined: true}
-	life, cancel, stop := candidateLife(ctx, c.cfg.handshakeTimeout())
+	life, cancel, stop := candidateLife(ctx, c.cfg.joinTimeout())
 	var pipes []*Pipe
 	var err error
 	if cand.join != nil {
@@ -832,8 +837,6 @@ func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred Credential
 			var pp *Pipe
 			if pp, err = c.AddPipe(jctx, pio, o); err == nil {
 				pipes = []*Pipe{pp}
-			} else {
-				closePipeIO(pio)
 			}
 			jcancel()
 		}

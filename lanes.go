@@ -4,14 +4,13 @@ import (
 	"context"
 	"sync"
 
-	"github.com/djylb/timeshim"
-
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// The lane keys of the process's sessions (MULTIPATH.md 5.8): inbound
+// The lane keys of the process's sessions: inbound
 // lanes are routed by key over every session, whatever accepted them. The
 // registry's lock is a leaf.
 var laneKeys = struct {
@@ -115,7 +114,7 @@ func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{
 		return nil, errRejected
 	}
 	markTaken(p)
-	if p.W != nil && any(p.W) != any(p.R) {
+	if p.W != nil && !sameHalf(p.W, p.R) {
 		// The reverse half of a bidirectional stream used as a lane is
 		// unused: it ends at once.
 		_ = p.W.Close()
@@ -124,77 +123,12 @@ func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{
 	done := make(chan struct{})
 	c.wg.Add(1)
 	pd.gs.add()
-	go func() {
+	labels.Go(pd.lctx, "lane-read", func() {
 		defer close(done)
 		defer pd.gs.done()
 		c.readLoop(pd, lane, p.R)
-	}()
+	})
 	return done, nil
-}
-
-// acceptJoin attaches a carrier that joins the session (MULTIPATH.md 5.4);
-// inband: its first record starts with the PIPE_JOIN the listener read;
-// admitted is the carrier's admission value.
-func (c *Conn) acceptJoin(ctx context.Context, p PipeIO, j *wire.Join, mac, binding []byte, inband bool, admitted any) (uint64, error) {
-	// Waiting for establishment or the join keys is bounded even when the
-	// handshake is not (Config.joinWaitTimeout).
-	ctx, cancel := timeshim.WithTimeout(ctx, c.clk.source(), c.cfg.joinWaitTimeout())
-	defer cancel()
-	for {
-		c.lock()
-		if c.closing {
-			c.unlock()
-			closePipeIO(p)
-			return 0, errRejected
-		}
-		pd := c.newPipeDrv(j.PipeID, p)
-		low := pd.tcp.setLowWater(multiLowWater)
-		info := carrierInfo(p, pd.tcp, low)
-		outer := outerOf(p)
-		loop := nestPipe(c, outer) != nil
-		res := c.s.AcceptJoin(j, mac, binding, core.Carrier{HasIn: p.R != nil, HasOut: p.W != nil, In: info,
-			Out: info, OutSig: pd.wsig, Refuse: loop, Kind: uint8(p.Carrier)})
-		if res != core.JoinAccepted && !loop {
-			unnestPipe(c, outer)
-		}
-		pd.outer = outer
-		switch res {
-		case core.JoinAccepted:
-			pd.admitted = admitted
-			markTaken(p)
-			if inband {
-				c.s.SkipJoinFrame(j.PipeID)
-			}
-			if j.Dir == 1 && p.R != nil && any(p.R) != any(p.W) {
-				_ = p.R.Close() // a downlink: the acceptor reads nothing
-			}
-			c.startPipeLocked(pd, j.Dir != 1, j.Dir != 0)
-			c.unlock()
-			return j.PipeID, nil
-		case core.JoinHold:
-			c.unlock()
-			if err := c.waitEstablished(ctx); err != nil {
-				closePipeIO(p)
-				return 0, err
-			}
-			continue
-		case core.JoinSecretWait:
-			c.unlock()
-			if err := c.waitJoinKeys(ctx); err != nil {
-				closePipeIO(p) // silently: no ZMUX_RESUME_FAILED
-				return 0, err
-			}
-			continue
-		case core.JoinRefused:
-			c.unlock()
-			closePipeIO(p)
-			return 0, errRefused
-		case core.JoinClose:
-		}
-		c.unlock()
-		closePipeIO(p)
-		return 0, errRejected
-	}
 }
 
 // waitJoinKeys waits until the join keys exist (Conn.SetJoinSecret) or

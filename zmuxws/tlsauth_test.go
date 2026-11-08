@@ -12,14 +12,28 @@ import (
 )
 
 func tlsAuthConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true}}
+	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true},
+		AllowRecordMode: func(zmux.CarrierInfo, zmux.RecordMode, any) bool { return true }}
+}
+
+// A WebSocket stream sharing an HTTP/2 connection's TLS has no Bound contract.
+func TestCarrierSecure(t *testing.T) {
+	st := &tls.ConnectionState{Version: tls.VersionTLS13}
+	for _, c := range []struct {
+		p    carrier
+		want bool
+	}{{carrier{tls: st, own: true}, true}, {carrier{tls: st}, false}, {carrier{own: true}, false}} {
+		if got := c.p.CarrierSecure(); got != c.want {
+			t.Errorf("%+v: %v", c.p, got)
+		}
+	}
 }
 
 // Over wss both ends have the TLS exporter: a session with PipeAuth.Exporter
 // starts, and a carrier-bound pipe joins it.
 func TestPipeAuthExporter(t *testing.T) {
 	ctx := testContext(t)
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: tlsAuthConfig()})
+	l := mustNewListener(&zmux.ListenerConfig{Config: tlsAuthConfig()})
 	h, err := Handler(l, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +59,7 @@ func TestPipeAuthExporter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{CarrierBound: true}); err != nil {
+	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{Mode: new(zmux.Bound)}); err != nil {
 		t.Fatal(err)
 	}
 	echo(t, ctx, c, s, 64<<10)
@@ -59,7 +73,7 @@ func TestPipeAuthExporter(t *testing.T) {
 // start rather than bind to nothing.
 func TestPipeAuthExporterPlain(t *testing.T) {
 	ctx := testContext(t)
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: tlsAuthConfig()})
+	l := mustNewListener(&zmux.ListenerConfig{Config: tlsAuthConfig()})
 	u := server(t, l, nil)
 	if c, err := Dial(ctx, u, nil, tlsAuthConfig()); !errors.Is(err, zmux.ErrInvalidConfig) {
 		if c != nil {

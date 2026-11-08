@@ -153,23 +153,22 @@ func BenchmarkMultipathSpread(b *testing.B) {
 		s    Scheduler
 	}{{"round-robin", SpreadRoundRobin()}, {"eta", SpreadETA()}} {
 		b.Run(sched.name, func(b *testing.B) {
-			cfg := &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)}}
+			cfg := &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true}}
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer func() { _ = ln.Close() }()
-			l := NewListener(&ListenerConfig{Config: cfg})
+			l := mustNewListener(&ListenerConfig{Config: cfg})
 			defer func() { _ = l.Close() }()
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			ctx := b.Context()
 			go func() {
 				for {
 					nc, err := ln.Accept()
 					if err != nil {
 						return
 					}
-					go func() { _ = l.HandlePipe(ctx, NetPipe(nc), JoinHint{}) }()
+					go func() { _ = l.HandlePipe(ctx, NetPipe(nc), PipeHint{}) }()
 				}
 			}()
 			nc, _ := net.Dial("tcp", ln.Addr().String())

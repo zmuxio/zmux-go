@@ -1,5 +1,11 @@
 package core
 
+import (
+	"errors"
+
+	"github.com/zmuxio/zmux-go/internal/join"
+)
+
 // EventKind enumerates core events delivered to the driver.
 type EventKind uint8
 
@@ -12,8 +18,6 @@ const (
 	EvSuspended
 	EvResumed
 	EvDatagramDropped
-	EvOOBJoin
-	EvJoinSecurityUnavailable
 	// EvJoinKeys reports that the deferred PSK derived the join keys.
 	EvJoinKeys
 	// EvTierSaturation reports that a tier (priority in Code) entered or left saturation.
@@ -27,6 +31,17 @@ const (
 	// crossed the floor.
 	EvCapacityBelow
 	EvCapacityRestored
+	// EvPipeAttached reports that the peer attached a pipe the endpoint
+	// joined (the peer sent on it, so it holds the attachment too).
+	EvPipeAttached
+	// EvEpochCommitted / EvEpochDeleted: an epoch (Code) was committed or
+	// deleted.
+	EvEpochCommitted
+	EvEpochDeleted
+	// EvLocatorAdded / EvLocatorRemoved: a local Locator (Frame) joins may now
+	// name, or no longer.
+	EvLocatorAdded
+	EvLocatorRemoved
 )
 
 // Event is one core event.
@@ -119,21 +134,46 @@ func (s *Session) TakeActions(dst []Action) []Action {
 	return dst
 }
 
-// JoinAuthReason says which join token failed verification (MULTIPATH.md
-// 5.4 step 5).
+// JoinAuthReason says why a Hello failed verification.
 type JoinAuthReason uint8
 
+// Reasons of a failed join authentication: the Hello did not open (auth), its
+// payload did not parse (the class of the failure), or its key share was refused
+// after the Pipe ID's bit was set (kex).
 const (
-	JoinAuthMAC             JoinAuthReason = iota + 1 // a token without carrier binding
-	JoinAuthMACCarrierBound                           // a carrier-bound token
+	JoinAuthAEAD JoinAuthReason = iota + 1
+	JoinAuthMissingField
+	JoinAuthBadField
+	JoinAuthTLVTruncated
+	JoinAuthTLVNonMinimal
+	JoinAuthTLVOrder
+	JoinAuthTLVUnknownCritical
+	JoinAuthKex
 )
 
+var joinAuthNames = [...]string{"", "auth", "missing_field", "bad_field", "tlv_truncated", "tlv_non_minimal", "tlv_order", "tlv_unknown_critical", "kex"}
+
 func (r JoinAuthReason) String() string {
-	switch r {
-	case JoinAuthMAC:
-		return "mac"
-	case JoinAuthMACCarrierBound:
-		return "mac_carrier_bound"
+	if int(r) > 0 && int(r) < len(joinAuthNames) {
+		return joinAuthNames[r]
 	}
 	return "JoinAuthReason(?)"
+}
+
+// joinAuthReason classifies the failure of a Hello.
+func joinAuthReason(err error) JoinAuthReason {
+	for _, c := range []struct {
+		err error
+		r   JoinAuthReason
+	}{
+		{join.ErrMissingField, JoinAuthMissingField}, {join.ErrBadField, JoinAuthBadField},
+		{join.ErrTLVTruncated, JoinAuthTLVTruncated}, {join.ErrTLVNonMinimal, JoinAuthTLVNonMinimal},
+		{join.ErrTLVOrder, JoinAuthTLVOrder}, {join.ErrTLVUnknownCritical, JoinAuthTLVUnknownCritical},
+		{join.ErrKex, JoinAuthKex},
+	} {
+		if errors.Is(err, c.err) {
+			return c.r
+		}
+	}
+	return JoinAuthAEAD
 }

@@ -26,7 +26,7 @@ func TestRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := zmux.NewListener(&zmux.ListenerConfig{Config: mpConfig(),
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
 		Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}})
 	h, err := Handler(l, &zmux.HTTPOptions{Next: next})
 	if err != nil {
