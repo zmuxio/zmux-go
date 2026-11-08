@@ -1078,6 +1078,38 @@ func sameClock(a, b timeshim.Clock) (same bool) {
 	return a == b
 }
 
+// KnownJoin reports, for use in Admission.Decide, whether prefix begins a
+// Join Hello (the first byte of a join) whose Locator names a session of l
+// at this moment. A prefix that is not a Join, or is malformed (a suite this
+// process does not have, reserved mode bits, a zero Locator length), gives
+// false, 0.
+// When prefix ends before the Locator and the nonce that follows it (the
+// head of the Hello), need is the total prefix length required, to
+// return as Decision.Need with VerdictMore; Admission.MaxPeek must allow
+// it: at most 259 bytes plus the suite's nonce length (32 for the suites
+// defined), 291 in all. On a message-framed carrier the prefix is the whole
+// message and need > 0 means it is too short.
+//
+// The answer is advisory: the join still authenticates, and a session that
+// ended meanwhile gets OnReject as for any unknown Locator. l.mu is held
+// for the lookup only.
+func (l *Listener) KnownJoin(prefix []byte) (known bool, need int) {
+	if len(prefix) == 0 || prefix[0] != join.ProfileJoin {
+		return false, 0
+	}
+	h, n, err := join.ParseHelloHead(prefix, join.Stream)
+	if errors.Is(err, join.ErrIncomplete) {
+		return false, n
+	}
+	if err != nil {
+		return false, 0
+	}
+	l.mu.Lock()
+	_, ok := l.sessions[string(h.Locator)]
+	l.mu.Unlock()
+	return ok, 0
+}
+
 // join runs the acceptor's side of a Hello. The carrier keeps its
 // pending slot until it is Confirmed.
 func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, release func()) error {

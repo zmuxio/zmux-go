@@ -84,7 +84,7 @@ func TestHTTP3RequestStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewHTTP3Server("", srvTLS, nil, hh)
+	srv := NewHTTP3Server("", srvTLS, nil, hh, nil)
 	go func() { _ = srv.Serve(pc) }()
 	defer func() { _ = srv.Close() }()
 	client, tr := HTTPClient(cliTLS, nil)
@@ -312,7 +312,7 @@ func TestBoundOverHTTP3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewHTTP3Server("", srvTLS, nil, hh)
+	srv := NewHTTP3Server("", srvTLS, nil, hh, nil)
 	go func() { _ = srv.Serve(pc) }()
 	defer func() { _ = srv.Close() }()
 	client, tr := HTTPClient(cliTLS, nil)

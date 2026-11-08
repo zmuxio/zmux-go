@@ -273,7 +273,7 @@ func TestHTTP3Channel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewHTTP3Server("", srvTLS, testQUIC(), hh)
+	srv := NewHTTP3Server("", srvTLS, testQUIC(), hh, nil)
 	go func() { _ = srv.Serve(pc) }()
 	defer func() { _ = srv.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -320,7 +320,7 @@ func TestHTTP3ChannelFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewHTTP3Server("", srvTLS, testQUIC(), hh)
+	srv := NewHTTP3Server("", srvTLS, testQUIC(), hh, nil)
 	go func() { _ = srv.Serve(pc) }()
 	defer func() { _ = srv.Close() }()
 	client, tr := HTTPClient(cliTLS, &quic.Config{HandshakeIdleTimeout: 30 * time.Second})

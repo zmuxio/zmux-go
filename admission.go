@@ -58,6 +58,16 @@ type Admission struct {
 	// value drawn once per Admission, from a secure random source, between
 	// 5 s and 30 s; a negative value is no timeout.
 	PeekTimeout time.Duration
+	// FallbackOnPeekTimeout makes a byte-stream carrier whose prefix does
+	// not arrive within PeekTimeout, in the first read or in a
+	// VerdictMore round, take VerdictFallback with every byte read so far
+	// replayed (without a fallback target it is stalled, as for any
+	// fallback). It needs a receiving half that continues after its read
+	// deadline passed (a net.Conn, a TLS connection); a carrier that does
+	// not, a message-framed one and an HTTP request carrier are closed on
+	// the timeout as when it is false. A Decide that does not return in
+	// time is VerdictClose, and a failed outer handshake is not affected.
+	FallbackOnPeekTimeout bool
 	// Decide returns the decision for a carrier. prefix is what was read,
 	// valid only during the call. ctx ends at what remains of PeekTimeout
 	// and when the listener stops taking carriers (Close, or the end of
@@ -205,7 +215,9 @@ const MaxAdmissionVariants = 64
 // AdmissionStats are the outcomes of a listener's admission,
 // each carrier that took its source slot and whose outcome is known
 // counted once, so that the sum of the fields is the number of such
-// carriers. All are zero without an Admission.
+// carriers, except that a carrier Admission.FallbackOnPeekTimeout takes to
+// fallback is counted in both PeekTimedOut and Fallback. All are zero
+// without an Admission.
 type AdmissionStats struct {
 	Accepted uint64 // VerdictAccept
 	// Fallback counts VerdictFallback, also where the carrier has no
@@ -219,7 +231,9 @@ type AdmissionStats struct {
 	// MaxPendingPerSource - 1 stalled carriers.
 	StallOverflow uint64
 	// PeekTimedOut counts carriers whose prefix or decision did not
-	// arrive within PeekTimeout.
+	// arrive within PeekTimeout. A carrier that Admission.FallbackOnPeekTimeout
+	// takes to fallback is counted both here and in Fallback: the two
+	// overlap for it.
 	PeekTimedOut uint64
 	// HandshakeFailed counts carriers whose outer handshake failed or
 	// timed out, without a decision.
@@ -644,22 +658,26 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 	if cs, ok := TerminatedTLS(p); ok {
 		info.TLS = &cs
 	}
-	var more func(have []byte, need int) ([]byte, bool)
+	var more peekMore
 	records := p.Framing == FramingRecords
 	tooLong := false
 	if adm.Peek > 0 && p.R != nil {
-		var fired bool
+		var fired, resumable bool
 		if records {
 			prefix, tooLong, fired = a.peekMessage(p, adm.r.maxPeek, deadline)
 		} else {
-			prefix, fired = a.peekPipe(p, prefix, adm.Peek, deadline)
-			more = func(have []byte, need int) ([]byte, bool) { return a.peekPipe(p, have, need, deadline) }
+			prefix, fired, resumable = a.peekPipe(p, prefix, adm.Peek, deadline)
+			more = func(have []byte, need int) ([]byte, bool, bool) { return a.peekPipe(p, have, need, deadline) }
 		}
 		if fired {
-			closePipeIO(p)
 			l.st.adm.peekTimedOut.Add(1)
-			a.Release()
-			return PipeIO{}, nil, VerdictClose
+			if !resumable {
+				closePipeIO(p)
+				a.Release()
+				return PipeIO{}, nil, VerdictClose
+			}
+			a.count(Decision{Verdict: VerdictFallback})
+			return p, prefix, VerdictFallback
 		}
 	}
 	var dd decided
@@ -703,20 +721,40 @@ func pendingHandshake(p PipeIO) func(context.Context) error {
 	return nil
 }
 
+// peekMore reads on until the prefix holds need bytes (see decide): the
+// prefix, whether the deadline passed first, and, then, whether the carrier
+// goes on to fallback with that prefix (otherwise it is closed).
+type peekMore func(have []byte, need int) (prefix []byte, fired, resumable bool)
+
 // peekPipe reads p by deadline until have holds n bytes, and returns
-// them (fewer when the carrier ends); fired: the deadline passed first
-// (the carrier may be closed).
-func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (prefix []byte, fired bool) {
-	var once atomic.Bool
+// them (fewer when the carrier ends); fired: the deadline passed first.
+// Then resumable: Admission.FallbackOnPeekTimeout is set and p's read
+// deadline is cleared again, so that prefix, the bytes read, is the carrier's
+// to fall back with; otherwise the carrier is closed.
+func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (prefix []byte, fired, resumable bool) {
+	var deadlined bool
+	done := make(chan struct{})
 	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
-		once.Store(true)
-		interruptRead(p)
+		defer close(done)
+		fired = true
+		deadlined = interruptRead(p)
 	})
 	prefix = peek(p.R, have, n)
-	if !t.Stop() && once.Load() {
-		return nil, true
+	if t.Stop() {
+		return prefix, false, false
 	}
-	return prefix, false
+	<-done // the timer's function has run
+	if !fired {
+		return prefix, false, false
+	}
+	complete := len(prefix) >= n // the prefix arrived in time after all
+	if deadlined && (complete || a.l.cfg.Admission.FallbackOnPeekTimeout) {
+		if d, ok := p.R.(interface{ SetReadDeadline(time.Time) error }); ok && d.SetReadDeadline(time.Time{}) == nil {
+			return prefix, !complete, !complete
+		}
+	}
+	closePipeIO(p)
+	return nil, true, false
 }
 
 // peekMessage reads the first message of a message-framed p by deadline
@@ -749,12 +787,13 @@ func (a *Arrival) peekMessage(p PipeIO, limit int, deadline time.Time) (msg []by
 }
 
 // interruptRead ends a blocked read of p: a passed read deadline where
-// the receiving half takes one, a close otherwise.
-func interruptRead(p PipeIO) {
+// the receiving half takes one (deadlined), a close otherwise.
+func interruptRead(p PipeIO) (deadlined bool) {
 	if d, ok := p.R.(interface{ SetReadDeadline(time.Time) error }); ok && d.SetReadDeadline(time.Now()) == nil {
-		return
+		return true
 	}
 	closePipeIO(p)
+	return false
 }
 
 // decided is a final Decision with the prefix it was taken on.
@@ -770,7 +809,7 @@ type decided struct {
 // message, replayed whole or not at all. A decision not returned in
 // time is VerdictClose.
 func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, deadline time.Time,
-	more func(have []byte, need int) ([]byte, bool), whole bool) decided {
+	more peekMore, whole bool) decided {
 	l := a.l
 	dctx, cancel := timeshim.WithDeadline(ctx, l.clk, deadline)
 	defer cancel()
@@ -797,9 +836,12 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 		if more == nil || ended || d.Need <= len(prefix) || d.Need > l.cfg.Admission.r.maxPeek {
 			return decided{a.count(Decision{Verdict: VerdictClose, Variant: d.Variant}), prefix}
 		}
-		next, fired := more(prefix, d.Need)
+		next, fired, resumable := more(prefix, d.Need)
 		if fired {
 			l.st.adm.peekTimedOut.Add(1)
+			if resumable {
+				return decided{a.count(Decision{Verdict: VerdictFallback, Variant: d.Variant}), next}
+			}
 			return decided{Decision{Verdict: VerdictClose}, prefix}
 		}
 		prefix, ended = next, len(next) < d.Need
@@ -1025,6 +1067,11 @@ type HTTPOptions struct {
 	// the source itself rewrites r.RemoteAddr before the handler runs and
 	// leaves Trusted nil.
 	Trusted *TrustedProxies
+	// PairField is the request field that pairs the uplink POST and the
+	// downlink GET of a split bootstrap (empty: HeaderPair), another name
+	// only where an intermediary strips unknown fields. The client side
+	// uses the same name (HTTPSplitOptions.PairField).
+	PairField string
 }
 
 // Validate checks o (nil is valid); the HTTP adapters call it when they
@@ -1032,6 +1079,9 @@ type HTTPOptions struct {
 func (o *HTTPOptions) Validate() error {
 	if o == nil {
 		return nil
+	}
+	if err := checkPairField(o.PairField); err != nil {
+		return err
 	}
 	return o.Trusted.validate()
 }
@@ -1160,9 +1210,9 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 		}
 		prefix, head = b[:n], n == 0 && err == io.EOF
 	}
-	var more func(have []byte, need int) ([]byte, bool)
+	var more peekMore
 	if !head && adm.Peek > 0 {
-		more = func(have []byte, need int) ([]byte, bool) {
+		more = func(have []byte, need int) ([]byte, bool, bool) {
 			rc := http.NewResponseController(w)
 			var fired atomic.Bool
 			t := l.clk.AfterFunc(deadline.Sub(l.clk.Now()), func() {
@@ -1171,9 +1221,9 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 			})
 			b := peek(r.Body, have, need)
 			if !t.Stop() && fired.Load() {
-				return nil, true
+				return nil, true, false
 			}
-			return b, false
+			return b, false, false
 		}
 	}
 	info := &CarrierInfo{Source: a.src, Peer: a.peer, TLS: r.TLS, Request: r, Head: head}

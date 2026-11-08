@@ -66,6 +66,13 @@ func NewHTTPExchangeHandler(l *Listener, cfg *HTTPExchangeConfig) (*HTTPExchange
 	return h, nil
 }
 
+// HTTPOptions returns the options the handler serves with (see
+// HandlerOptions).
+func (h *HTTPExchangeHandler) HTTPOptions() *HTTPOptions {
+	o := h.p.http
+	return &o
+}
+
 // Close fails every carrier, refuses new requests and returns once the
 // carriers' pipes have ended.
 func (h *HTTPExchangeHandler) Close() error {
@@ -88,7 +95,7 @@ func (h *HTTPExchangeHandler) Close() error {
 // authenticated, fresh exchange request is served by the fallback
 // (HTTPExchangeConfig.Next) with its body replayed, and changes nothing.
 func (h *HTTPExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if ClassifyHTTP(r) != HTTPClassExchange {
+	if h.p.http.Classify(r) != HTTPClassExchange {
 		h.p.http.Fallback(w, r)
 		return
 	}

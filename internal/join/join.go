@@ -395,6 +395,40 @@ type Hello struct {
 // to the caller; ParseHelloExact refuses them. A suite outside the session's
 // negotiated set is for the caller to refuse before going further.
 func ParseHello(b []byte, f Framing) (h Hello, n int, err error) {
+	h, n, err = ParseHelloHead(b, f)
+	if err != nil {
+		return Hello{}, n, err
+	}
+	short := func(need int) (Hello, int, error) {
+		if f == Message {
+			return Hello{}, 0, ErrMalformed
+		}
+		return Hello{}, need, ErrIncomplete
+	}
+	if f == Message {
+		if len(b)-n > MaxMessage {
+			return Hello{}, 0, ErrTooLarge
+		}
+		h.Ciphertext = b[n:]
+		return h, len(b), nil
+	}
+	if len(b) < n+lenPrefix {
+		return short(n + lenPrefix)
+	}
+	cl := int(binary.BigEndian.Uint16(b[n:]))
+	n += lenPrefix
+	if len(b) < n+cl {
+		return short(n + cl)
+	}
+	h.Ciphertext = b[n : n+cl]
+	return h, n + cl, nil
+}
+
+// ParseHelloHead parses the clear head of a Join Hello at the start of b,
+// up to and including R, and returns the bytes it took; Ciphertext is
+// not set. With ErrIncomplete, n is the smallest total length that can make
+// progress (the length of the head once its Locator length is known).
+func ParseHelloHead(b []byte, f Framing) (h Hello, n int, err error) {
 	short := func(need int) (Hello, int, error) {
 		if f == Message {
 			return Hello{}, 0, ErrMalformed
@@ -447,23 +481,7 @@ func ParseHello(b []byte, f Framing) (h Hello, n int, err error) {
 	h.R = b[n : n+s.NonceLen]
 	n += s.NonceLen
 	h.clear = b[:n]
-	if f == Message {
-		if len(b)-n > MaxMessage {
-			return Hello{}, 0, ErrTooLarge
-		}
-		h.Ciphertext = b[n:]
-		return h, len(b), nil
-	}
-	if len(b) < n+lenPrefix {
-		return short(n + lenPrefix)
-	}
-	cl := int(binary.BigEndian.Uint16(b[n:]))
-	n += lenPrefix
-	if len(b) < n+cl {
-		return short(n + cl)
-	}
-	h.Ciphertext = b[n : n+cl]
-	return h, n + cl, nil
+	return h, n, nil
 }
 
 // ParseHelloExact is ParseHello for an acceptor's buffer: a joiner sends nothing

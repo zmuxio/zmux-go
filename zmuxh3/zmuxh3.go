@@ -110,12 +110,12 @@ func (s quicState) ConnectionState() tls.ConnectionState { return s.qc.Connectio
 // handler of zmux.NewHTTPHandler, which hands requests to a listener as
 // carriers; the caller starts it (ListenAndServe or Serve) and closes it.
 // It enables HTTP Datagrams, which bidirectional carriers use as their
-// datagram channel (HTTP3Handler). qconf may be nil. With qconf.Allow0RTT
-// a request may arrive in 0-RTT, before the handshake completes; the zmux
-// adapters answer such a carrier request 425 (Too Early).
-func NewHTTP3Server(addr string, tlsConf *tls.Config, qconf *quic.Config, h http.Handler) *http3.Server {
+// datagram channel (HTTP3Handler, whose o it takes). qconf may be nil. With
+// qconf.Allow0RTT a request may arrive in 0-RTT, before the handshake
+// completes; the zmux adapters answer such a carrier request 425 (Too Early).
+func NewHTTP3Server(addr string, tlsConf *tls.Config, qconf *quic.Config, h http.Handler, o *zmux.HTTPOptions) *http3.Server {
 	return &http3.Server{Addr: addr, TLSConfig: http3.ConfigureTLSConfig(tlsConf), QUICConfig: qconf,
-		Handler: HTTP3Handler(h), EnableDatagrams: true}
+		Handler: HTTP3Handler(h, o), EnableDatagrams: true}
 }
 
 // ---- WebTransport ----

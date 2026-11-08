@@ -467,3 +467,65 @@ func TestUpgradeFailureCounted(t *testing.T) {
 		t.Fatalf("stats %+v", st)
 	}
 }
+
+// NoSubprotocol accepts an upgrade request without a Sec-WebSocket-Protocol
+// field; a request that offers subprotocols, none accepted, still reaches
+// the next handler, and a server without NoSubprotocol refuses the bare
+// request.
+func TestNoSubprotocol(t *testing.T) {
+	ctx := testContext(t)
+	o := &zmux.HTTPOptions{Next: next}
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
+	u := server(t, l, o, "qmux-02.chat", NoSubprotocol)
+
+	c, err := Dial(ctx, u, &DialOptions{Protocols: []string{NoSubprotocol}}, mpConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := l.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echo(t, ctx, c, s, 4096)
+	closeBoth(c, s)
+
+	p, err := DialPipe(ctx, u, &DialOptions{Protocols: []string{NoSubprotocol}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Protocol != "" {
+		t.Fatalf("Protocol = %q", p.Protocol)
+	}
+	_ = p.W.Close()
+
+	c, err = Dial(ctx, u, &DialOptions{Protocols: []string{"qmux-02.chat"}}, mpConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err = l.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echo(t, ctx, c, s, 4096)
+	closeBoth(c, s)
+
+	// Offered but not accepted: the next handler.
+	_, resp, err := (&wsconn.Dialer{Subprotocols: []string{"qmux-02"}}).Dial(ctx, u+"/x")
+	if err == nil || resp == nil || resp.Code != http.StatusTeapot {
+		t.Fatalf("unmatched offer: %v %+v", err, resp)
+	}
+
+	// Mixed with others on the client.
+	_, err = DialPipe(ctx, u, &DialOptions{Protocols: []string{NoSubprotocol, "qmux-02.chat"}})
+	if !errors.Is(err, zmux.ErrInvalidConfig) {
+		t.Fatalf("mixed protocols: %v", err)
+	}
+
+	// A server that does not accept it.
+	l2 := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
+	u2 := server(t, l2, o, "qmux-02.chat")
+	_, resp, err = (&wsconn.Dialer{}).Dial(ctx, u2+"/x")
+	if err == nil || resp == nil || resp.Code != http.StatusTeapot {
+		t.Fatalf("bare request to a server without NoSubprotocol: %v %+v", err, resp)
+	}
+}

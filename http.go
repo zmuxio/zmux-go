@@ -22,11 +22,11 @@ import (
 // HTTP carriers: a request body carries the up direction, a
 // response body the down direction. HTTP/2 and HTTP/3 requests (and
 // HTTP/1.1 with full duplex) carry both; a split bootstrap pairs an uplink
-// POST and a downlink GET by the Zmux-Pipe-Pair header, and
-// a pipe that cannot write first joins out of band with Zmux-Pipe-Join.
+// POST and a downlink GET by a pairing header.
 
-// HeaderPair is the header that pairs the uplink POST and the downlink GET
-// of a split bootstrap.
+// HeaderPair is the default header that pairs the uplink POST and the
+// downlink GET of a split bootstrap (HTTPOptions.PairField and
+// HTTPSplitOptions.PairField name another).
 const HeaderPair = "Zmux-Pipe-Pair"
 
 // HTTPPipe opens a carrier over an HTTP request: dir DirBidirectional sends
@@ -441,10 +441,52 @@ func addHeader(dst, src http.Header) {
 // each presenting cred as HTTPPipe does. The carriers must be
 // confidential end to end (TLS to the server).
 func HTTPSplitPipe(ctx context.Context, client *http.Client, url string, h http.Header, cred Credential) (PipeIO, error) {
-	return httpSplitPipe(ctx, client, url, nil, h, cred)
+	return httpSplitPipe(ctx, client, url, nil, h, cred, HeaderPair)
 }
 
-func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *HTTPTarget, h http.Header, cred Credential) (PipeIO, error) {
+// HTTPSplitOptions configure the pairing of a split bootstrap on the
+// client side. The zero value, and nil, pair by HeaderPair.
+type HTTPSplitOptions struct {
+	// PairField is the request field that pairs the uplink POST and the
+	// downlink GET (empty: HeaderPair). The server's HTTPOptions.PairField
+	// must be the same.
+	PairField string
+}
+
+// Validate checks o (nil is valid).
+func (o *HTTPSplitOptions) Validate() error {
+	if o == nil {
+		return nil
+	}
+	return checkPairField(o.PairField)
+}
+
+// pairField returns the canonical pairing field of o.
+func (o *HTTPSplitOptions) pairField() string {
+	if o == nil {
+		return HeaderPair
+	}
+	return (&HTTPOptions{PairField: o.PairField}).pairField()
+}
+
+// Pipe is HTTPSplitPipe with o's pairing field.
+func (o *HTTPSplitOptions) Pipe(ctx context.Context, client *http.Client, url string, h http.Header, cred Credential) (PipeIO, error) {
+	if err := o.Validate(); err != nil {
+		return PipeIO{}, err
+	}
+	return httpSplitPipe(ctx, client, url, nil, h, cred, o.pairField())
+}
+
+// Join is HTTPSplitJoin with o's pairing field.
+func (o *HTTPSplitOptions) Join(ctx context.Context, c *Conn, client *http.Client, url string, h http.Header, cred Credential, po PipeOptions) (*Pipe, error) {
+	if err := o.Validate(); err != nil {
+		return nil, err
+	}
+	return httpSplitJoin(ctx, c, client, url, nil, h, cred, po, o.pairField())
+}
+
+// httpSplitPipe is HTTPSplitPipe; pair is the canonical pairing field.
+func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *HTTPTarget, h http.Header, cred Credential, pair string) (PipeIO, error) {
 	if t != nil {
 		// Both requests start where the last carrier ended up.
 		url = t.URL()
@@ -457,7 +499,7 @@ func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *HTTP
 	if hh == nil {
 		hh = http.Header{}
 	}
-	hh.Set(HeaderPair, base64.RawURLEncoding.EncodeToString(tok[:]))
+	hh.Set(pair, base64.RawURLEncoding.EncodeToString(tok[:]))
 	up, err := httpPipe(ctx, client, url, t, hh, DirSendOnly, cred)
 	if err != nil {
 		return PipeIO{}, err
@@ -484,11 +526,11 @@ func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *HTTP
 // across a paired POST and GET, a bidi attachment by default. ctx
 // bounds the join; the requests then live until the pipe ends.
 func HTTPSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, h http.Header, cred Credential, o PipeOptions) (*Pipe, error) {
-	return httpSplitJoin(ctx, c, client, url, nil, h, cred, o)
+	return httpSplitJoin(ctx, c, client, url, nil, h, cred, o, HeaderPair)
 }
 
-func httpSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, t *HTTPTarget, h http.Header, cred Credential, o PipeOptions) (*Pipe, error) {
-	p, err := httpSplitPipe(ctx, client, url, t, h, cred)
+func httpSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, t *HTTPTarget, h http.Header, cred Credential, o PipeOptions, pair string) (*Pipe, error) {
+	p, err := httpSplitPipe(ctx, client, url, t, h, cred, pair)
 	if err != nil {
 		return nil, err
 	}
@@ -735,9 +777,15 @@ func NewHTTPHandler(l *Listener, o *HTTPOptions) (http.Handler, error) {
 	}
 	var opts HTTPOptions
 	if o != nil {
-		opts = HTTPOptions{Next: o.Next, Trusted: o.Trusted}
+		opts = *o
 	}
 	return &httpHandler{l: l, o: opts}, nil
+}
+
+// HTTPOptions returns the options the handler serves with.
+func (h *httpHandler) HTTPOptions() *HTTPOptions {
+	o := h.o
+	return &o
 }
 
 type httpHandler struct {
@@ -746,7 +794,7 @@ type httpHandler struct {
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	class := ClassifyHTTP(r)
+	class := h.o.Classify(r)
 	switch class {
 	case HTTPClassDownlink, HTTPClassUplink, HTTPClassBidirectional:
 	default:
@@ -757,7 +805,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	hint := PipeHint{Pair: r.Header.Get(HeaderPair)}
+	hint := PipeHint{Pair: r.Header.Get(h.o.pairField())}
 	rc := http.NewResponseController(w)
 	// An HTTP/1.1 connection is not reused after a carrier: the server
 	// does not read what is left of a full-duplex request body, so a

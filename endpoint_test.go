@@ -3,6 +3,7 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -339,5 +340,131 @@ func TestHTTPTrustedSource(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestHTTPPairField pairs a split bootstrap by a configured field on both
+// ends, classifies requests by it, and refuses a name that is not a field
+// name.
+func TestHTTPPairField(t *testing.T) {
+	leakcheck.Check(t)
+	for _, bad := range []string{"bad name", "x:y", "é"} {
+		if err := (&HTTPOptions{PairField: bad}).Validate(); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("server PairField %q: %v", bad, err)
+		}
+		if err := (&HTTPSplitOptions{PairField: bad}).Validate(); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("client PairField %q: %v", bad, err)
+		}
+	}
+	o := &HTTPOptions{PairField: "x-link-id"}
+	for _, c := range []struct {
+		method, field string
+		want          HTTPClass
+	}{
+		{http.MethodGet, "X-Link-Id", HTTPClassDownlink},
+		{http.MethodGet, HeaderPair, HTTPClassNone},
+		{http.MethodPost, "X-Link-Id", HTTPClassUplink},
+		{http.MethodPost, HeaderPair, HTTPClassBidirectional},
+	} {
+		r := httptest.NewRequest(c.method, "http://example.test/zmux", nil)
+		r.ContentLength = -1
+		r.Header.Set(c.field, "x")
+		if got := o.Classify(r); got != c.want {
+			t.Errorf("%s %s: %v, want %v", c.method, c.field, got, c.want)
+		}
+	}
+
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
+	defer func() { _ = lst.Close() }()
+	stream, err := NewHTTPHandler(lst, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(&HTTPEndpoint{Stream: stream, Options: o})
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	p, err := (&HTTPSplitOptions{PairField: "X-Link-Id"}).Pipe(ctx, srv.Client(), srv.URL, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Start(ctx, p, RoleClient, mpConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := lst.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoOnce(t, ctx, c, s)
+	if st := s.PipeStats(); len(st) == 0 || st[0].Carrier != CarrierSplit {
+		t.Fatalf("carrier %+v, want split", st)
+	}
+	_ = c.Close()
+	_ = s.Close()
+	waitDone(t, c)
+	waitDone(t, s)
+}
+
+// TestPairFieldReserved refuses names that HTTP, WebSocket or the adapters
+// use.
+func TestPairFieldReserved(t *testing.T) {
+	for _, bad := range []string{"Content-Length", "content-type", "Transfer-Encoding", "HOST", "connection", "Upgrade",
+		"Keep-Alive", "TE", "Trailer", "Proxy-Authorization", "proxy-x", "Authorization", "Sec-WebSocket-Key",
+		"sec-websocket-protocol", HeaderPrefixAuth, "X-Forwarded-For"} {
+		if err := checkPairField(bad); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("%q: %v", bad, err)
+		}
+	}
+	for _, ok := range []string{"", "X-Link-Id", HeaderPair, "Tr", "Hosted"} {
+		if err := checkPairField(ok); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+}
+
+// TestEndpointPairFieldAgreement: the endpoint takes the pairing field from
+// its handlers, an exchange handler honours its own, and a mismatch is an
+// error.
+func TestEndpointPairFieldAgreement(t *testing.T) {
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
+	defer func() { _ = lst.Close() }()
+	custom := &HTTPOptions{PairField: "X-Link-Id"}
+	stream, err := NewHTTPHandler(lst, custom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mk := func(field string) *HTTPExchangeHandler {
+		ex, err := NewHTTPExchangeHandler(lst, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32), PairField: field})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ex.Close() })
+		return ex
+	}
+	if o, ok := HandlerOptions(mk("x-link-id")); !ok || o.pairField() != "X-Link-Id" {
+		t.Fatalf("exchange handler options %+v", o)
+	}
+	if err := (&HTTPEndpoint{Stream: stream, Exchange: mk("X-Link-Id")}).Validate(); err != nil {
+		t.Fatalf("agreeing handlers: %v", err)
+	}
+	for name, e := range map[string]*HTTPEndpoint{
+		"exchange differs": {Stream: stream, Exchange: mk("")},
+		"options differ":   {Stream: stream, Options: &HTTPOptions{}},
+	} {
+		if err := e.Validate(); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("%s: %v", name, err)
+		}
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://example.test/", nil))
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("%s: served %d", name, rec.Code)
+		}
+	}
+	// A POST with a length and the custom field is an uplink, not an exchange request.
+	r := httptest.NewRequest(http.MethodPost, "http://example.test/", strings.NewReader("x"))
+	r.Header.Set("X-Link-Id", "x")
+	if got := mk("X-Link-Id").HTTPOptions().Classify(r); got != HTTPClassUplink {
+		t.Fatalf("classified %v", got)
 	}
 }

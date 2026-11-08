@@ -38,7 +38,7 @@ func TestNestedSession(t *testing.T) {
 		c, err := Start(ctx, StreamPipe(st), RoleServer, nil)
 		srv <- res{c, err}
 	}()
-	p, err := oc.OpenPipeStream(ctx, TLV{Type: 0x1001, Value: []byte("route")})
+	p, err := oc.OpenPipeStream(ctx, &PipeStreamOptions{Info: []byte("info"), TLVs: []TLV{{Type: 0x1001, Value: []byte("route")}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,4 +138,109 @@ func TestNestedLaneCredit(t *testing.T) {
 	<-opened
 	runtime.KeepAlive(lanes)
 	runtime.KeepAlive(app)
+}
+
+// TestStreamPipeLocalOpen wraps a locally opened stream that carries
+// OPEN_INFO and PIPE_CARRIER; the peer sees the preamble and runs the
+// nested session over the stream.
+func TestStreamPipeLocalOpen(t *testing.T) {
+	leakcheck.Check(t)
+	a, b := tcpPair(t)
+	oc, os := pair(t, a, b, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	type res struct {
+		c    *Conn
+		info []byte
+		err  error
+	}
+	srv := make(chan res, 1)
+	go func() {
+		st, err := os.AcceptStream(ctx)
+		if err != nil {
+			srv <- res{err: err}
+			return
+		}
+		c, err := Start(ctx, StreamPipe(st), RoleServer, nil)
+		srv <- res{c: c, info: st.Preamble(), err: err}
+	}()
+	s, err := oc.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPreamble([]byte("route=/x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPipeCarrier(); err != nil {
+		t.Fatal(err)
+	}
+	nc, err := Start(ctx, StreamPipe(s), RoleClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := <-srv
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	defer func() {
+		_ = nc.Close()
+		_ = r.c.Close()
+		waitDone(t, nc)
+		waitDone(t, r.c)
+	}()
+	if string(r.info) != "route=/x" {
+		t.Fatalf("OPEN_INFO = %q", r.info)
+	}
+	go func() {
+		st, err := r.c.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(st, st)
+		_ = st.Close()
+	}()
+	ns, err := nc.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = ns.Write([]byte("ping")); _ = ns.Close() }()
+	if got, err := io.ReadAll(ns); err != nil || string(got) != "ping" {
+		t.Fatalf("nested echo: %q, %v", got, err)
+	}
+}
+
+// TestPreamblePriority reads the PRIORITY the opener sent in the preamble.
+func TestPreamblePriority(t *testing.T) {
+	leakcheck.Check(t)
+	a, b := tcpPair(t)
+	oc, os := pair(t, a, b, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := oc.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPeerPriority(UrgencyHighest, true); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s.Write([]byte("x"))
+	r, err := os.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u, inc, ok := r.PreamblePriority(); !ok || u != UrgencyHighest || !inc {
+		t.Fatalf("PreamblePriority = %v %v %v", u, inc, ok)
+	}
+	s2, err := oc.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = s2.Write([]byte("y"))
+	r2, err := os.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := r2.PreamblePriority(); ok {
+		t.Fatal("PRIORITY reported for a stream that sent none")
+	}
 }

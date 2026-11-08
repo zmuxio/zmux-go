@@ -14,49 +14,67 @@ import (
 // Streams as pipes: a bidirectional stream
 // of an outer session carries a pipe pair of a nested session.
 
+// PipeStreamOptions is the opening preamble of a carrier stream.
+type PipeStreamOptions struct {
+	// Info is the stream's OPEN_INFO (nil: none).
+	Info []byte
+	// TLVs are application TLVs (for example routing metadata for
+	// relays); PIPE_CARRIER is added.
+	TLVs []TLV
+}
+
 // OpenPipeStream opens a stream of c to carry a pipe pair of another
-// session; tlvs are application TLVs of its preamble (for example routing
-// metadata for relays), to which PIPE_CARRIER is added. Nothing is sent
-// before the nested session writes its first record.
-func (c *Conn) OpenPipeStream(ctx context.Context, tlvs ...TLV) (PipeIO, error) {
+// session, with the preamble o (nil: PIPE_CARRIER only). Nothing is sent
+// before the nested session writes its first record. When the peer does not
+// use the preamble, o must be empty.
+func (c *Conn) OpenPipeStream(ctx context.Context, o *PipeStreamOptions) (PipeIO, error) {
 	s, err := c.OpenStreamSync(ctx)
 	if err != nil {
 		return PipeIO{}, err
 	}
-	pre := c.ConnectionState().PeerIsZmux
-	if pre {
+	fail := func(err error) (PipeIO, error) {
+		s.CancelWrite(0)
+		s.CancelRead(0)
+		return PipeIO{}, err
+	}
+	if c.ConnectionState().PeerIsZmux {
 		if err := s.SetPipeCarrier(); err != nil && !errors.Is(err, ErrNotNegotiated) {
-			s.CancelWrite(0)
-			return PipeIO{}, err
+			return fail(err)
 		}
 	}
-	for _, t := range tlvs {
-		if err := s.AddPreambleTLV(t.Type, t.Value); err != nil {
-			s.CancelWrite(0)
-			s.CancelRead(0)
-			return PipeIO{}, fmt.Errorf("zmux: pipe stream TLV: %w", err)
+	if o != nil {
+		if o.Info != nil {
+			if err := s.SetPreamble(o.Info); err != nil {
+				return fail(fmt.Errorf("zmux: pipe stream OPEN_INFO: %w", err))
+			}
+		}
+		for _, t := range o.TLVs {
+			if err := s.AddPreambleTLV(t.Type, t.Value); err != nil {
+				return fail(fmt.Errorf("zmux: pipe stream TLV: %w", err))
+			}
 		}
 	}
-	return streamPipe(s, c, true), nil
+	return streamPipe(s, c), nil
 }
 
 // StreamPipe wraps a bidirectional stream that carries a pipe pair (one
 // the peer opened with PIPE_CARRIER, or any stream the application knows
-// to be a carrier).
-func StreamPipe(s *Stream) PipeIO { return streamPipe(s, s.h.c, false) }
+// to be a carrier). A stream opened locally may be wrapped too: set its
+// preamble first (SetPreamble for OPEN_INFO, SetPipeCarrier, AddPreambleTLV),
+// before the nested session writes.
+func StreamPipe(s *Stream) PipeIO { return streamPipe(s, s.h.c) }
 
-func streamPipe(s *Stream, outer *Conn, opener bool) PipeIO {
-	sp := &stPipe{s: s, outer: outer, opener: opener}
+func streamPipe(s *Stream, outer *Conn) PipeIO {
+	sp := &stPipe{s: s, outer: outer}
 	return PipeIO{R: (*stPipeR)(sp), W: (*stPipeW)(sp)}
 }
 
 // stPipe adapts a stream to the pipe operations of a nested carrier.
 type stPipe struct {
-	s      *Stream
-	outer  *Conn
-	opener bool
-	once   sync.Once // the read half is closed once
-	wonce  sync.Once // the write half is closed once
+	s     *Stream
+	outer *Conn
+	once  sync.Once // the read half is closed once
+	wonce sync.Once // the write half is closed once
 }
 
 type stPipeR stPipe

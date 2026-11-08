@@ -81,6 +81,18 @@ func (h *handle) preamble() ([]byte, []TLV, bool) {
 	return p.OpenInfo, tl, p.PipeCarrier
 }
 
+// preamblePriority returns the PRIORITY TLV of the opening preamble.
+func (h *handle) preamblePriority() (Urgency, bool, bool) {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	p, ok := h.st.PeerPreamble()
+	if !ok || !p.HasPriority {
+		return 0, false, false
+	}
+	return Urgency(p.Urgency), p.Incremental, true
+}
+
 func (h *handle) sendCapacity() uint64 {
 	c := h.c
 	c.lock()
@@ -368,6 +380,15 @@ func (s *Stream) AddPreambleTLV(t uint64, v []byte) error {
 // Preamble returns the OPEN_INFO the peer opened the stream with.
 func (s *Stream) Preamble() []byte { defer runtime.KeepAlive(s); b, _, _ := s.h.preamble(); return b }
 
+// PreamblePriority returns the urgency and incremental flag of the PRIORITY
+// TLV the peer opened the stream with; ok is false when its preamble
+// carried none. It reports the opening preamble only, not a later
+// PRIORITY_UPDATE.
+func (s *Stream) PreamblePriority() (urgency Urgency, incremental, ok bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.preamblePriority()
+}
+
 // PreambleTLVs returns the application TLVs of the peer's preamble.
 func (s *Stream) PreambleTLVs() []TLV {
 	defer runtime.KeepAlive(s)
@@ -633,6 +654,13 @@ func (s *ReceiveStream) Preamble() []byte {
 	defer runtime.KeepAlive(s)
 	b, _, _ := s.h.preamble()
 	return b
+}
+
+// PreamblePriority returns the peer's opening PRIORITY, as
+// Stream.PreamblePriority.
+func (s *ReceiveStream) PreamblePriority() (urgency Urgency, incremental, ok bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.preamblePriority()
 }
 
 // PreambleTLVs returns the application TLVs of the peer's preamble.

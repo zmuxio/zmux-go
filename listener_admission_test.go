@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -503,3 +504,145 @@ func TestShutdownKeepsJoins(t *testing.T) {
 
 // eqAdm compares admission totals.
 func eqAdm(a, b AdmissionStats) bool { return a == b }
+
+// TestAdmissionFallbackOnPeekTimeout: with FallbackOnPeekTimeout a carrier
+// whose prefix does not arrive in time, in the first read or in a
+// VerdictMore round, goes to the fallback with the bytes read replayed and
+// the carrier still usable; a decision that does not return in time is
+// still closed, and without the option the carrier is closed.
+func TestAdmissionFallbackOnPeekTimeout(t *testing.T) {
+	leakcheck.Check(t)
+	run := func(t *testing.T, adm *Admission, send []byte, timers int) (*fakeEnv, <-chan net.Conn) {
+		t.Helper()
+		clk := timeshim.NewFake(time.Unix(1767225600, 0))
+		cfg := mpConfig()
+		cfg.Clock = clk
+		got := make(chan net.Conn, 1)
+		e := &fakeEnv{clk: clk, done: make(chan struct{}),
+			lst: mustNewListener(&ListenerConfig{Config: cfg, Admission: adm,
+				Fallback: func(_ context.Context, c net.Conn) { got <- c }})}
+		a, b := net.Pipe()
+		e.peer = b
+		go func() { _ = e.lst.HandlePipe(context.Background(), NetPipe(a), PipeHint{}); close(e.done) }()
+		t.Cleanup(func() { _ = b.Close(); _ = e.lst.Close() })
+		if len(send) > 0 {
+			if _, err := b.Write(send); err != nil {
+				t.Fatal(err)
+			}
+		}
+		e.advance(t, timers, 10*time.Second)
+		return e, got
+	}
+	replayed := func(t *testing.T, e *fakeEnv, got <-chan net.Conn, want string) {
+		t.Helper()
+		var c net.Conn
+		select {
+		case c = <-got:
+		case <-time.After(5 * time.Second):
+			t.Fatal("no fallback")
+		}
+		buf := make([]byte, len(want))
+		if _, err := io.ReadFull(c, buf); err != nil || string(buf) != want {
+			t.Fatalf("replayed %q, %v; want %q", buf, err, want)
+		}
+		// The carrier goes on after the timeout.
+		go func() { _, _ = e.peer.Write([]byte("z")) }()
+		var one [1]byte
+		if _, err := io.ReadFull(c, one[:]); err != nil || one[0] != 'z' {
+			t.Fatalf("read after the fallback: %q, %v", one[:], err)
+		}
+		_ = c.Close()
+	}
+	decide := func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictAccept} }
+	t.Run("first read", func(t *testing.T) {
+		e, got := run(t, &Admission{Peek: 4, PeekTimeout: 10 * time.Second, FallbackOnPeekTimeout: true, Decide: decide}, []byte("ab"), 1)
+		replayed(t, e, got, "ab")
+		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1, Fallback: 1}) {
+			t.Fatalf("stats %+v", st)
+		}
+	})
+	t.Run("more", func(t *testing.T) {
+		more := seq(Decision{Verdict: VerdictMore, Need: 8})
+		e, got := run(t, &Admission{Peek: 1, MaxPeek: 8, PeekTimeout: 10 * time.Second, FallbackOnPeekTimeout: true, Decide: more}, []byte("abc"), 2)
+		replayed(t, e, got, "abc")
+		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1, Fallback: 1}) {
+			t.Fatalf("stats %+v", st)
+		}
+	})
+	t.Run("no bytes", func(t *testing.T) {
+		e, got := run(t, &Admission{Peek: 4, PeekTimeout: 10 * time.Second, FallbackOnPeekTimeout: true, Decide: decide}, nil, 1)
+		replayed(t, e, got, "")
+	})
+	t.Run("option off", func(t *testing.T) {
+		e, _ := run(t, &Admission{Peek: 4, PeekTimeout: 10 * time.Second, Decide: decide}, []byte("ab"), 1)
+		e.ended(t)
+		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1}) {
+			t.Fatalf("stats %+v", st)
+		}
+	})
+	t.Run("decision not returned", func(t *testing.T) {
+		block := func(ctx context.Context, _ *CarrierInfo, _ []byte) Decision { <-ctx.Done(); return Decision{} }
+		e, _ := run(t, &Admission{PeekTimeout: 10 * time.Second, FallbackOnPeekTimeout: true, Decide: block}, nil, 1)
+		e.ended(t)
+		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1}) {
+			t.Fatalf("stats %+v", st)
+		}
+	})
+}
+
+// TestKnownJoin: KnownJoin tells, from the head of a Hello, whether its
+// Locator names a session of the listener, and how long a prefix it needs.
+func TestKnownJoin(t *testing.T) {
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
+	defer func() { _ = lst.Close() }()
+	loc := []byte("known-locator")
+	lst.mu.Lock()
+	lst.sessions[string(loc)] = new(Conn)
+	lst.mu.Unlock()
+	t.Cleanup(func() {
+		lst.mu.Lock()
+		delete(lst.sessions, string(loc))
+		lst.mu.Unlock()
+	})
+	hello := func(suite, mode byte, locator []byte) []byte {
+		b := []byte{0x02, suite, mode, byte(len(locator))}
+		b = append(b, locator...)
+		return append(b, make([]byte, 32)...) // R
+	}
+	full := hello(1, 0, loc)
+	head := len(full)
+	for _, c := range []struct {
+		name   string
+		prefix []byte
+		known  bool
+		need   int
+	}{
+		{"empty", nil, false, 0},
+		{"not a join", []byte{0x40, 0x10, 0xff}, false, 0},
+		{"first byte only", full[:1], false, 2},
+		{"suite only", full[:2], false, 3},
+		{"mode only", full[:3], false, 4},
+		{"length known", full[:4], false, head},
+		{"locator cut", full[:10], false, head},
+		{"nonce cut", full[:head-1], false, head},
+		{"head", full[:head], true, 0},
+		{"head and payload", append(bytes.Clone(full), 0, 4, 1, 2, 3, 4), true, 0},
+		{"bound mode", hello(1, 1, loc), true, 0},
+		{"unknown suite", hello(9, 0, loc), false, 0},
+		{"reserved mode", hello(1, 3, loc), false, 0},
+		{"spare mode bits", hello(1, 0x04, loc), false, 0},
+		{"zero locator length", []byte{0x02, 1, 0, 0}, false, 0},
+		{"unknown locator", hello(1, 0, []byte("other-locator")), false, 0},
+	} {
+		known, need := lst.KnownJoin(c.prefix)
+		if known != c.known || need != c.need {
+			t.Errorf("%s: KnownJoin = %v, %d; want %v, %d", c.name, known, need, c.known, c.need)
+		}
+	}
+	lst.mu.Lock()
+	delete(lst.sessions, string(loc))
+	lst.mu.Unlock()
+	if known, _ := lst.KnownJoin(full); known {
+		t.Error("a session that ended is still known")
+	}
+}

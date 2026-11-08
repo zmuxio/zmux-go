@@ -70,6 +70,10 @@ type HTTPExchangeConfig struct {
 	// testSkipResponseMAC disables the client's response MAC check (tests
 	// only: shows that the check is what rejects replayed responses).
 	testSkipResponseMAC bool
+	// PairField is the HTTPOptions.PairField of the endpoint that serves
+	// the handler (server): the field that makes a request a split half and
+	// not an exchange request.
+	PairField string
 	// Header is added to every request (client).
 	Header http.Header
 	// DownURL is the target template of DOWN requests (client; empty: the
@@ -240,7 +244,7 @@ func (c *HTTPExchangeConfig) resolve() (exParams, error) {
 		idle: timeout(x.IdleTimeout, 60*time.Second), goneFor: dur(x.GoneMemory, 60*time.Second),
 		skipRespMAC: x.testSkipResponseMAC,
 		skew:        dur(x.MaxClockSkew, 60*time.Second), nonceCache: pos(x.NonceCacheSize, 1<<18),
-		http: HTTPOptions{Next: x.Next, Trusted: x.Trusted},
+		http: HTTPOptions{Next: x.Next, Trusted: x.Trusted, PairField: x.PairField},
 	}
 	if err := p.http.Validate(); err != nil {
 		return exParams{}, err

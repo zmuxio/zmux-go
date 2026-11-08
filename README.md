@@ -629,7 +629,7 @@ use records. `ConnectionStats` counts the datagrams that went on channels
 - WebTransport: the session's datagrams, named the same way.
 - HTTP/3: the HTTP Datagrams of a bidirectional carrier's request stream.
   `NewHTTP3Server` enables them (`HTTP3Handler` wraps the handler of any
-  other HTTP/3 server). Pipes opened with an `http.Client`, as
+  other HTTP/3 server); both take the `HTTPOptions` of the zmux handler. Pipes opened with an `http.Client`, as
   `HTTP3Candidate` does, keep datagrams in records.
 
 A carrier of another kind offers its own channel by implementing

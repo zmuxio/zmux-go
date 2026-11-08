@@ -142,13 +142,25 @@ func StreamingCandidate(client *http.Client, url string, h http.Header) Candidat
 // be confidential end to end or up to a trusted TLS-terminating
 // intermediary.
 func SplitCandidate(client *http.Client, url string, h http.Header) Candidate {
+	return splitCandidate(client, url, h, HeaderPair)
+}
+
+// Candidate is SplitCandidate with o's pairing field.
+func (o *HTTPSplitOptions) Candidate(client *http.Client, url string, h http.Header) (Candidate, error) {
+	if err := o.Validate(); err != nil {
+		return Candidate{}, err
+	}
+	return splitCandidate(client, url, h, o.pairField()), nil
+}
+
+func splitCandidate(client *http.Client, url string, h http.Header, pair string) Candidate {
 	t := NewHTTPTarget(url)
 	return Candidate{Kind: CarrierSplit, Target: t,
 		Dial: func(ctx context.Context, cred Credential) (PipeIO, error) {
-			return httpSplitPipe(ctx, client, url, t, h, cred)
+			return httpSplitPipe(ctx, client, url, t, h, cred, pair)
 		},
 		join: func(ctx, _ context.Context, c *Conn, cred Credential, o PipeOptions) ([]*Pipe, error) {
-			p, err := httpSplitJoin(ctx, c, client, url, t, h, cred, o)
+			p, err := httpSplitJoin(ctx, c, client, url, t, h, cred, o, pair)
 			if err != nil {
 				return nil, err
 			}

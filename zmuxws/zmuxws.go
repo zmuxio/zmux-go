@@ -52,28 +52,44 @@ import (
 // above the session's limit reaches it as the oversized record it is.
 var options = wsconn.Options{ReadLimit: zmux.MaxRecordSize + 1 + 64}
 
+// NoSubprotocol in the protocols of Handler accepts an upgrade request that
+// has no Sec-WebSocket-Protocol field, and as the only entry of
+// DialOptions.Protocols sends none. The pipe's Protocol is then "".
+const NoSubprotocol = ""
+
 // accepted returns the subprotocols a server accepts, by preference: each
 // identifier followed by its alias, so that the first identifier offered
-// in either form is chosen.
-func accepted(protocols []string) []string {
+// in either form is chosen; none reports NoSubprotocol among protocols.
+func accepted(protocols []string) (out []string, none bool) {
 	if len(protocols) == 0 {
 		protocols = []string{zmux.DefaultALPN}
 	}
-	out := make([]string, 0, 2*len(protocols))
+	out = make([]string, 0, 2*len(protocols))
 	for _, p := range protocols {
+		if p == NoSubprotocol {
+			none = true
+			continue
+		}
 		out = append(out, p)
 		if a, ok := zmux.ALPNAlias(p); ok {
 			out = append(out, a)
 		}
 	}
-	return out
+	return out, none
 }
 
 // offered returns the subprotocols a client offers: the identifiers, then
-// their aliases.
-func offered(protocols []string) []string {
+// their aliases; NoSubprotocol alone offers none, and mixed with others it
+// is zmux.ErrInvalidConfig.
+func offered(protocols []string) ([]string, error) {
 	if len(protocols) == 0 {
 		protocols = []string{zmux.DefaultALPN}
+	}
+	if slices.Contains(protocols, NoSubprotocol) {
+		if len(protocols) > 1 {
+			return nil, fmt.Errorf("%w: zmuxws.NoSubprotocol cannot be offered with other protocols", zmux.ErrInvalidConfig)
+		}
+		return nil, nil
 	}
 	out := append(make([]string, 0, 2*len(protocols)), protocols...)
 	for _, p := range protocols {
@@ -81,14 +97,17 @@ func offered(protocols []string) []string {
 			out = append(out, a)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // ---- server ----
 
 // Handler returns an http.Handler that upgrades WebSocket requests to
 // carriers of l. protocols are the subprotocols it accepts, by preference
-// (none: zmux.DefaultALPN), each also as its alias.
+// (none: zmux.DefaultALPN), each also as its alias. NoSubprotocol among
+// them also accepts a request with no Sec-WebSocket-Protocol field; a
+// request that offers subprotocols, none of them accepted, is not
+// accepted.
 //
 // Nothing is answered before a request is accepted: a request that is not
 // a valid WebSocket upgrade or offers no accepted subprotocol is served by
@@ -96,7 +115,7 @@ func offered(protocols []string) []string {
 // (zmux.Listener.AdmitUpgrade, decided on the request head, without a
 // prefix). An accepted request is answered with 101 and its connection is
 // handed to the listener for its lifetime (zmux.Arrival.HandlePipe), with
-// the request's Zmux-Pipe-Join field and source (o.Trusted). A request forwarded from
+// the request's source (o.Trusted). A request forwarded from
 // early data is answered 425 (Too Early). o may be nil; an invalid o is an
 // error.
 //
@@ -106,9 +125,10 @@ func Handler(l *zmux.Listener, o *zmux.HTTPOptions, protocols ...string) (http.H
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
-	h := &handler{l: l, so: wsconn.ServerOptions{
+	subs, none := accepted(protocols)
+	h := &handler{l: l, none: none, so: wsconn.ServerOptions{
 		Options:      options,
-		Subprotocols: accepted(protocols),
+		Subprotocols: subs,
 		// Origins are the admission's to decide; zmux clients are seldom
 		// browsers.
 		CheckOrigin: wsconn.AnyOrigin,
@@ -123,6 +143,8 @@ type handler struct {
 	l  *zmux.Listener
 	o  zmux.HTTPOptions
 	so wsconn.ServerOptions
+	// none accepts a request without a Sec-WebSocket-Protocol field.
+	none bool
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -131,7 +153,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	so := h.so
 	so.Header = append(slices.Clip(h.so.Header), httphead.Field{Name: "Date", Value: time.Now().UTC().Format(http.TimeFormat)})
 	hs, err := wshttp.Check(w, r, &so)
-	if err != nil || hs.Subprotocol == "" {
+	// Check reports no subprotocol both for a request that offers none and
+	// for one whose offers are all unaccepted.
+	if err != nil || hs.Subprotocol == "" && (!h.none || len(r.Header.Values("Sec-WebSocket-Protocol")) != 0) {
 		h.o.Fallback(w, r)
 		return
 	}
@@ -162,7 +186,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // zmux.DefaultALPN and dials with a net.Dialer.
 type DialOptions struct {
 	// Protocols are the subprotocols offered, by preference (none:
-	// zmux.DefaultALPN), followed by their aliases.
+	// zmux.DefaultALPN), followed by their aliases. []string{NoSubprotocol}
+	// offers none; NoSubprotocol with other entries is
+	// zmux.ErrInvalidConfig.
 	Protocols []string
 	// Header holds fields added to the upgrade request, such as
 	// a credential's. A Host field sets the
@@ -281,9 +307,13 @@ func dialOnce(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Cred
 	if !secure && u.Scheme != "ws" && u.Scheme != "http" || u.Hostname() == "" {
 		return zmux.PipeIO{}, fmt.Errorf("zmuxws: not a ws or wss URL: %q", rawURL)
 	}
+	subs, err := offered(o.Protocols)
+	if err != nil {
+		return zmux.PipeIO{}, err
+	}
 	co := wsconn.ClientOptions{
 		Options:          options,
-		Subprotocols:     offered(o.Protocols),
+		Subprotocols:     subs,
 		HandshakeTimeout: o.HandshakeTimeout,
 	}
 	for name, vs := range o.Header {
