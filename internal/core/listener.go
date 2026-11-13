@@ -89,23 +89,6 @@ const (
 	DefaultProbeJitter = 0.25        // probe jitter j
 )
 
-// SourceKey is the source a client address counts against:
-// an IPv6 address is aggregated to its /64 prefix, so that a client
-// cannot rotate addresses within its prefix; an IPv4 address (also
-// IPv4-mapped) stands for itself; anything else is kept as given.
-func SourceKey(addr string) string {
-	a, err := netip.ParseAddr(addr)
-	if err != nil {
-		return addr
-	}
-	a = a.Unmap().WithZone("")
-	if a.Is4() {
-		return a.String()
-	}
-	p, _ := a.Prefix(64)
-	return p.String()
-}
-
 // PendingCarriers bounds the carriers of one listener before they belong
 // to a session: at most MaxPerSource per source and MaxTotal in all, from
 // a carrier's arrival until it enters a session, is closed or is handed to
@@ -117,8 +100,8 @@ type PendingCarriers struct {
 	MaxTotal     int      // 0: DefaultMaxPending; negative: unlimited
 	MaxPerSource int      // 0: DefaultMaxPendingPerSource
 	Timeout      Duration // 0: DefaultFirstRecordTimeout
-	bySource     map[string]int
-	stalledBy    map[string]int
+	bySource     map[netip.Prefix]int
+	stalledBy    map[netip.Prefix]int
 	total        int
 	stalls       list.List // of *PendingSlot, the stalled ones, oldest first
 }
@@ -126,7 +109,7 @@ type PendingCarriers struct {
 // PendingSlot is the source slot and the slot of the total that one
 // carrier holds.
 type PendingSlot struct {
-	source string
+	source netip.Prefix
 	held   bool
 	stall  *list.Element // non-nil while stalled
 	evict  func()
@@ -164,9 +147,9 @@ func (p *PendingCarriers) maxTotal() int {
 // oldest stalled carrier, whose slots are free at once, and returns that
 // carrier's evict function for the caller to call outside its lock. Leave
 // gives the slots back.
-func (p *PendingCarriers) Enter(source string) (s *PendingSlot, evicted func(), r EnterResult) {
+func (p *PendingCarriers) Enter(source netip.Prefix) (s *PendingSlot, evicted func(), r EnterResult) {
 	if p.bySource == nil {
-		p.bySource = map[string]int{}
+		p.bySource = map[netip.Prefix]int{}
 	}
 	if p.bySource[source] >= p.maxPer() {
 		return nil, nil, EnterSourceFull
@@ -189,7 +172,7 @@ func (p *PendingCarriers) Enter(source string) (s *PendingSlot, evicted func(), 
 }
 
 // Held is the number of source slots source holds.
-func (p *PendingCarriers) Held(source string) int { return p.bySource[source] }
+func (p *PendingCarriers) Held(source netip.Prefix) int { return p.bySource[source] }
 
 // Total is the number of slots of the total taken.
 func (p *PendingCarriers) Total() int { return p.total }
@@ -220,7 +203,7 @@ func (p *PendingCarriers) Stall(s *PendingSlot, evict func()) bool {
 		return false
 	}
 	if p.stalledBy == nil {
-		p.stalledBy = map[string]int{}
+		p.stalledBy = map[netip.Prefix]int{}
 	}
 	if p.stalledBy[s.source] >= p.maxPer()-1 {
 		return false

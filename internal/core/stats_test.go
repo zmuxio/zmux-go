@@ -323,3 +323,48 @@ func setTestKeys(s *Session, suite uint64, key []byte) {
 	e := &epoch{keys: map[uint64]*joinKeys{suite: {i: key, r: key}}, local: s.cfg.Local.Locator}
 	s.mp.ep = epochs{list: []*epoch{e}, join: e, last: -1}
 }
+
+// TestStreamDatagramBytes (N18): a stream's datagram queue is bounded by
+// count and by payload bytes, the oldest dropped and counted one by one;
+// an unlimited byte bound leaves the count; a datagram above the byte
+// bound is kept alone; the session's byte bound is unaffected; the
+// defaults keep 32 datagrams of 9000 bytes.
+func TestStreamDatagramBytes(t *testing.T) {
+	fill := func(q int, size uint64, n, each int) (*Session, *Stream) {
+		s := capacitySession()
+		s.cfg.DgramStreamQ, s.cfg.DgramStreamSize = q, size
+		st := s.newStream(true, false)
+		st.id, st.idSet = 1, true
+		for i := range n {
+			p := make([]byte, each)
+			p[0] = byte(i)
+			s.queueDatagram(st, streamDgram(0, p))
+		}
+		return s, st
+	}
+	s, st := fill(32, 16<<10, 10, 4<<10)
+	if in := s.StreamInfo(st); len(st.dg.q) != 4 || in.DatagramsDroppedRecv != 6 || st.dg.size != 16<<10 {
+		t.Fatalf("16 KiB: %d kept, %d dropped, %d bytes", len(st.dg.q), in.DatagramsDroppedRecv, st.dg.size)
+	}
+	if s.dg.recvSize != 0 || s.stats.DatagramsDroppedRecv != 6 {
+		t.Fatalf("session: %d bytes, %d dropped", s.dg.recvSize, s.stats.DatagramsDroppedRecv)
+	}
+	for i := 6; i < 10; i++ {
+		if _, p, ok := s.RecvStreamDatagram(st); !ok || p[0] != byte(i) {
+			t.Fatalf("datagram %d: %v %v", i, p[:1], ok)
+		}
+	}
+	if st.dg.size != 0 {
+		t.Fatalf("an empty queue holds %d bytes", st.dg.size)
+	}
+	if s, st = fill(32, 0, 10, 4<<10); len(st.dg.q) != 10 || s.stats.DatagramsDroppedRecv != 0 {
+		t.Fatalf("unlimited: %d kept", len(st.dg.q))
+	}
+	if s, st = fill(32, 16<<10, 3, 20<<10); len(st.dg.q) != 1 || s.stats.DatagramsDroppedRecv != 2 {
+		t.Fatalf("above the bound: %d kept, %d dropped", len(st.dg.q), s.stats.DatagramsDroppedRecv)
+	}
+	d := DefaultConfig()
+	if s, st = fill(d.DgramStreamQ, d.DgramStreamSize, 32, 9000); len(st.dg.q) != 32 || s.stats.DatagramsDroppedRecv != 0 {
+		t.Fatalf("defaults: %d kept", len(st.dg.q))
+	}
+}

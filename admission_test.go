@@ -240,3 +240,65 @@ func TestCloseEndsFallbackStall(t *testing.T) {
 		t.Fatal("the stall outlived Listener.Close")
 	}
 }
+
+// TestSourcePrefixes checks the source aggregation of
+// ListenerConfig.SourcePrefixV4 and SourcePrefixV6: sources in one prefix
+// share the per-source slots and the stall duration, sources in different
+// prefixes do not, an IPv4-mapped address counts as IPv4, and a prefix
+// length beyond its range is the configuration error.
+func TestSourcePrefixes(t *testing.T) {
+	for _, lc := range []ListenerConfig{{SourcePrefixV4: 33}, {SourcePrefixV4: -1}, {SourcePrefixV6: 129}, {SourcePrefixV6: -1}} {
+		if _, err := NewListener(&lc); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("%+v: %v", lc, err)
+		}
+	}
+	stall := func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }
+	a := &Admission{Decide: stall, StallMin: time.Second, StallMax: 1 << 40}
+	lst := mustNewListener(&ListenerConfig{MaxPendingPerSource: 2, SourcePrefixV4: 24, SourcePrefixV6: 56, Admission: a})
+	defer func() { _ = lst.Close() }()
+	ap := netip.MustParseAddrPort
+	for _, g := range [][3]string{
+		// two sources of one prefix, a third of the same, one of another
+		{"192.0.2.1:1", "[::ffff:192.0.2.200]:2", "192.0.2.77:3"},
+		{"[2001:db8:0:1::1]:1", "[2001:db8:0:ff::2]:2", "[2001:db8:0:42::3]:3"},
+	} {
+		var held []*Arrival
+		for _, s := range g[:2] {
+			ar, err := lst.Arrive(ap(s), netip.AddrPort{})
+			if err != nil {
+				t.Fatalf("%s: %v", s, err)
+			}
+			held = append(held, ar)
+		}
+		if _, err := lst.Arrive(ap(g[2]), netip.AddrPort{}); err == nil {
+			t.Fatalf("%s: a third source of a full prefix was let in", g[2])
+		}
+		if x, y := lst.StallDuration(ap(g[0])), lst.StallDuration(ap(g[2])); x != y {
+			t.Fatalf("stall durations in one prefix: %v %v", x, y)
+		}
+		for _, ar := range held {
+			ar.Release()
+		}
+	}
+	for _, p := range [][2]string{{"192.0.2.1:1", "192.0.3.1:1"}, {"[2001:db8:0:1::1]:1", "[2001:db8:0:100::1]:1"}} {
+		var held []*Arrival
+		for range 2 {
+			ar, err := lst.Arrive(ap(p[0]), netip.AddrPort{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			held = append(held, ar)
+		}
+		ar, err := lst.Arrive(ap(p[1]), netip.AddrPort{})
+		if err != nil {
+			t.Fatalf("%s shares the full prefix of %s: %v", p[1], p[0], err)
+		}
+		held = append(held, ar)
+		if x, y := lst.StallDuration(ap(p[0])), lst.StallDuration(ap(p[1])); x == y {
+			t.Fatalf("one stall duration %v in different prefixes %s %s", x, p[0], p[1])
+		}
+		for _, ar := range held {
+			ar.Release()
+		}
+	}
+}

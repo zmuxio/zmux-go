@@ -1,6 +1,7 @@
 package seal_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,4 +162,80 @@ func TestFinishFramingRejected(t *testing.T) {
 	if serr == nil || errors.As(serr, &rej) {
 		t.Fatalf("carrier end: server %v", serr)
 	}
+}
+
+// TestBindingMismatch: a Bound Establish whose two ends see different
+// carrier exporters (a terminating intermediary) is refused as "auth" with
+// RecordMode Bound. By default it is stalled: no byte, the carrier open
+// after the refusal and ended within the stall bound (the handshake
+// timeout here). With OnReject returning RejectClose it is closed at once,
+// without a byte, and counted as rejected.
+func TestBindingMismatch(t *testing.T) {
+	const stallBound = 1500 * time.Millisecond
+	for _, closeAtOnce := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		f := newFixture(t)
+		f.server.AllowRecordMode = anyMode
+		got := make(chan zmux.RejectInfo, 1)
+		lc := &zmux.ListenerConfig{WrapPipe: &f.server, Config: &zmux.Config{HandshakeTimeout: stallBound}}
+		if closeAtOnce {
+			lc.OnReject = func(i zmux.RejectInfo) zmux.RejectAction { got <- i; return zmux.RejectClose }
+		}
+		l, err := zmux.NewListener(lc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, b := net.Pipe()
+		srv := &secureConn{Conn: b, exp: bytes.Repeat([]byte{1}, 32)}
+		served := make(chan struct{})
+		go func() { defer close(served); _ = l.HandlePipe(ctx, zmux.PipeIO{R: srv, W: srv}, zmux.PipeHint{}) }()
+		cli := &readCounter{secureConn: secureConn{Conn: a, exp: bytes.Repeat([]byte{2}, 32)}}
+		cc := f.client
+		cc.RecordMode = zmux.RecordBound
+		start := time.Now()
+		if _, err := seal.Establish(ctx, zmux.PipeIO{R: cli, W: cli}, &cc); err == nil {
+			t.Fatal("a mismatching Bound Establish was accepted")
+		}
+		took := time.Since(start)
+		if closeAtOnce {
+			select {
+			case i := <-got:
+				if i.Reason != "auth" || i.RecordMode != zmux.RecordBound {
+					t.Fatalf("reject info %+v", i)
+				}
+			case <-ctx.Done():
+				t.Fatal("no OnReject")
+			}
+		}
+		if n := cli.n.Load(); n != 0 {
+			t.Fatalf("close %v: the listener sent %d bytes", closeAtOnce, n)
+		}
+		switch {
+		case closeAtOnce && took > stallBound/2:
+			t.Fatalf("closed after %v, not at once", took)
+		case !closeAtOnce && (took < stallBound*2/3 || took > 3*stallBound):
+			t.Fatalf("stalled %v, bound %v", took, stallBound)
+		}
+		<-served
+		if closeAtOnce {
+			if st := l.Stats(); st.Rejected != 1 {
+				t.Fatalf("stats %+v", st)
+			}
+		}
+		_ = a.Close()
+		_ = l.Close()
+		cancel()
+	}
+}
+
+// readCounter counts the bytes the peer sent.
+type readCounter struct {
+	secureConn
+	n atomic.Int64
+}
+
+func (c *readCounter) Read(p []byte) (int, error) {
+	n, err := c.secureConn.Read(p)
+	c.n.Add(int64(n))
+	return n, err
 }

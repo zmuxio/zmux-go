@@ -213,6 +213,20 @@ type LaneOpener interface {
 // fate.
 type CarrierConner interface{ CarrierConn() any }
 
+// CloseCodeRecorder is a half whose carrier connection outlives its pipes
+// and ends with an application error code of its own, such as a QUIC
+// connection: when the session ends, zmux passes its close code and reason
+// to each pipe's halves before it ends them: those of its application
+// close (CONNECTION_CLOSE 0x1d, sent or received), or 0 and an empty
+// reason after any other end (a transport error, an idle timeout), so that
+// the adapter closes the connection, once no pipe uses it, with the code
+// of the last session it carried. It may be called more than once with
+// the same code; a pipe removed while its session runs passes nothing. A
+// transform may forward it.
+type CloseCodeRecorder interface {
+	RecordCloseCode(code ApplicationErrorCode, reason string)
+}
+
 // halfCloser closes the halves of a carrier exactly once each, also when R
 // and W are the same object.
 type halfCloser struct {
@@ -227,6 +241,17 @@ type halfCloser struct {
 func newHalfCloser(p PipeIO) *halfCloser {
 	same := p.R != nil && p.W != nil && sameHalf(p.R, p.W)
 	return &halfCloser{io: p, same: same}
+}
+
+// recordCloseCode passes the session's close code to the halves that take
+// it (CloseCodeRecorder).
+func (h *halfCloser) recordCloseCode(code ApplicationErrorCode, reason string) {
+	if r, ok := h.io.W.(CloseCodeRecorder); ok {
+		r.RecordCloseCode(code, reason)
+	}
+	if r, ok := h.io.R.(CloseCodeRecorder); ok && !h.same {
+		r.RecordCloseCode(code, reason)
+	}
 }
 
 // closeRead closes the receiving half (after its end, or at CLOSED).

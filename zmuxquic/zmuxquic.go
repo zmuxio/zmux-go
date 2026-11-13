@@ -58,8 +58,10 @@ func Config(base *quic.Config) *quic.Config {
 // its first bidirectional stream, as zmux.DialTLS does over TCP. With
 // cfg.EarlyData.Replayable and Remembered parameters, replayable startup is
 // enabled; native streams wait for handshake completion until the quic-go
-// early-stream race is fixed. The session owns the connection: it is closed when the session
-// ends. qconf may be nil; Config sizes it for lanes. With
+// early-stream race is fixed. The session owns the connection: it is closed once the session
+// has wholly ended (the peer read its CONNECTION_CLOSE and ended its side, or
+// the linger timeout expired), with the session's application error code
+// (0 after any other end). qconf may be nil; Config sizes it for lanes. With
 // cfg.Credential, the first stream starts with its prefix, bound to the
 // connection's handshake, and 0-RTT is not used.
 func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Config, cfg *zmux.Config) (*zmux.Conn, error) {
@@ -81,35 +83,55 @@ func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Con
 	clientLanes(cur)
 	sp := &qStream{qc: cur, s: s, early: early}
 	if err := zmux.PresentPipe(ctx, sp.pipe(), cred); err != nil {
-		closeDialled(qc, sp)
+		closeDialled(qc, sp, 0, "")
 		return nil, err
 	}
 	c, err := zmux.Start(ctx, sp.pipe(), zmux.RoleClient, cfg)
 	if err != nil {
-		closeDialled(qc, sp)
+		closeDialled(qc, sp, 0, "")
 		return nil, err
 	}
-	context.AfterFunc(c.Context(), func() { closeDialled(qc, sp) })
+	// The session's context ends when it has wholly ended: every pipe's
+	// inbound side ended or lingered out.
+	context.AfterFunc(c.Context(), func() {
+		code, reason := closeCode(context.Cause(c.Context()))
+		closeDialled(qc, sp, code, reason)
+	})
 	return c, nil
 }
 
 // closeDialled closes the connection Dial opened, and the one that
-// replaced it after a 0-RTT rejection.
-func closeDialled(qc *quic.Conn, sp *qStream) {
+// replaced it after a 0-RTT rejection, with code and reason.
+func closeDialled(qc *quic.Conn, sp *qStream, code quic.ApplicationErrorCode, reason string) {
 	sp.mu.Lock()
 	sp.closed = true
 	cur := sp.qc
 	sp.mu.Unlock()
-	_ = cur.CloseWithError(0, "")
+	_ = cur.CloseWithError(code, reason)
 	if cur != qc {
-		_ = qc.CloseWithError(0, "")
+		_ = qc.CloseWithError(0, "") // it carried no session
 	}
+}
+
+// closeCode is the QUIC application close of a session that ended with
+// err: its application error code and reason, 0 and none after any other
+// end.
+func closeCode(err error) (quic.ApplicationErrorCode, string) {
+	var ae *zmux.ApplicationError
+	if errors.As(err, &ae) {
+		return quic.ApplicationErrorCode(ae.ErrorCode), ae.ErrorMessage
+	}
+	return 0, ""
 }
 
 // Client starts a client session on the first bidirectional stream of an
 // established QUIC connection that the caller dialled, as zmux.Client does
 // on a net.Conn, with cfg.Credential's prefix; the caller keeps ownership
-// of qc and closes it after the session ended.
+// of qc and closes it once the session has wholly ended (Wait returned,
+// or Done is closed), not sooner: a QUIC close discards the stream data
+// the peer has not acknowledged, the zmux close included. Its code is the
+// session's: the ErrorCode of the *zmux.ApplicationError that Wait
+// returns, 0 after any other end.
 func Client(ctx context.Context, qc *quic.Conn, cfg *zmux.Config) (*zmux.Conn, error) {
 	p, err := ConnPipe(ctx, qc)
 	if err != nil {
@@ -126,9 +148,10 @@ func Client(ctx context.Context, qc *quic.Conn, cfg *zmux.Config) (*zmux.Conn, e
 
 // ConnPipe opens a bidirectional stream of qc as a pipe input (bootstrap
 // or join), with lanes wired: the lanes the peer opens on qc are accepted
-// while qc is open (one goroutine per connection).
+// while qc is open (one goroutine per connection). The caller keeps
+// ownership of qc, as with Client.
 func ConnPipe(ctx context.Context, qc *quic.Conn) (zmux.PipeIO, error) {
-	pio, _, err := openPipe(ctx, &qc)
+	pio, err := openPipe(ctx, &qc)
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
@@ -179,7 +202,10 @@ func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener, fallback func
 // ServeConn returns when the connection ends (nil) or ctx ends
 // (ctx.Err()); after ctx ends no further stream of the connection is
 // handed to l, while the connection and its sessions continue, as with
-// Serve. On a closed listener it closes qc and returns net.ErrClosed.
+// Serve. On a closed listener it closes qc and returns net.ErrClosed. A
+// connection that never carried a session (refused, stalled, fallback) is
+// closed with code 0; one that did stays open after its sessions end, for
+// the client to close with the last session's code, or its idle timeout.
 func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) error {
 	a, err := l.Arrive(netip.AddrPort{}, addrPort(qc.RemoteAddr()))
 	if err != nil {
@@ -336,14 +362,14 @@ func (q *qStream) pipe() zmux.PipeIO {
 }
 
 // openPipe opens the first bidirectional stream of *qc (see openStream) as a
-// pipe input; the returned context ends with the stream.
-func openPipe(ctx context.Context, qc **quic.Conn) (zmux.PipeIO, context.Context, error) {
+// pipe input.
+func openPipe(ctx context.Context, qc **quic.Conn) (zmux.PipeIO, error) {
 	s, err := openStream(ctx, qc)
 	if err != nil {
-		return zmux.PipeIO{}, nil, err
+		return zmux.PipeIO{}, err
 	}
 	sp := &qStream{qc: *qc, s: s}
-	return sp.pipe(), s.Context(), nil
+	return sp.pipe(), nil
 }
 
 // qStream is the sending half, with the carrier capabilities.
@@ -355,6 +381,47 @@ type qStream struct {
 	early  bool // Dial sent the stream in 0-RTT
 	wOnce  sync.Once
 	rOnce  sync.Once
+	// rec, when set, records the close code of the pipe's session for its
+	// connection (zmux.CloseCodeRecorder); ended, when set, is called once
+	// both halves have ended.
+	rec    *closeRecord
+	ended  func()
+	halves atomic.Int32
+}
+
+// halfEnded counts the end of one half; the second calls ended.
+func (q *qStream) halfEnded() {
+	if q.halves.Add(1) == 2 && q.ended != nil {
+		q.ended()
+	}
+}
+
+// RecordCloseCode records the code of the pipe's session for the pooled
+// connection's close (zmux.CloseCodeRecorder).
+func (q *qStream) RecordCloseCode(code zmux.ApplicationErrorCode, reason string) {
+	if q.rec != nil {
+		q.rec.set(quic.ApplicationErrorCode(code), reason)
+	}
+}
+
+// closeRecord is the close code of the last session a pooled connection
+// carried.
+type closeRecord struct {
+	mu     sync.Mutex
+	code   quic.ApplicationErrorCode
+	reason string
+}
+
+func (r *closeRecord) set(code quic.ApplicationErrorCode, reason string) {
+	r.mu.Lock()
+	r.code, r.reason = code, reason
+	r.mu.Unlock()
+}
+
+func (r *closeRecord) get() (quic.ApplicationErrorCode, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.code, r.reason
 }
 
 func (q *qStream) cur() (*quic.Conn, *quic.Stream) {
@@ -385,6 +452,7 @@ func (q *qStream) Close() error {
 	q.wOnce.Do(func() {
 		_, s := q.cur()
 		err = s.Close()
+		q.halfEnded()
 	})
 	return err
 }
@@ -392,8 +460,8 @@ func (q *qStream) Close() error {
 // Abort resets both halves (a pipe failure).
 func (q *qStream) Abort(error) {
 	_, s := q.cur()
-	q.wOnce.Do(func() { s.CancelWrite(carrierFailed) })
-	q.rOnce.Do(func() { s.CancelRead(carrierFailed) })
+	q.wOnce.Do(func() { s.CancelWrite(carrierFailed); q.halfEnded() })
+	q.rOnce.Do(func() { s.CancelRead(carrierFailed); q.halfEnded() })
 }
 
 // CarrierConn is the QUIC connection (lanes are its streams).
@@ -525,8 +593,14 @@ func (r *qReader) Close() error {
 	q.rOnce.Do(func() {
 		_, s := q.cur()
 		s.CancelRead(carrierFailed)
+		q.halfEnded()
 	})
 	return nil
+}
+
+// RecordCloseCode of the receiving half (zmux.CloseCodeRecorder).
+func (r *qReader) RecordCloseCode(code zmux.ApplicationErrorCode, reason string) {
+	(*qStream)(r).RecordCloseCode(code, reason)
 }
 
 // CarrierConn of the receiving half (for lanes routed by HandlePipe).
@@ -577,6 +651,7 @@ type pooled struct {
 	qc        *quic.Conn
 	mu        sync.Mutex // held while the first stream is opened
 	presented bool
+	rec       closeRecord // the close code of the last session it carried
 }
 
 // Shutdown retires every connection: idle ones close now, the others once
@@ -602,7 +677,13 @@ func NewPool(addr string, tlsConf *tls.Config, qconf *quic.Config, cred zmux.Car
 	return p
 }
 
-func closePooled(pc *pooled) { _ = pc.qc.CloseWithError(0, "") }
+// closePooled closes a retired connection once none of its pipes has not
+// ended (each pipe's inbound side ended or lingered out), with the code of
+// the last session it carried.
+func closePooled(pc *pooled) {
+	code, reason := pc.rec.get()
+	_ = pc.qc.CloseWithError(code, reason)
+}
 
 // OpenPipe opens a pipe (a bidirectional stream with its lanes) on a
 // pooled connection; its PipeIO carries the connection's fate group.
@@ -614,19 +695,24 @@ func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
-	pio, done, err := p.open(ctx, l.Conn)
+	pio, err := p.open(ctx, l.Conn)
 	if err != nil {
 		l.Release()
 		return zmux.PipeIO{}, err
 	}
-	context.AfterFunc(done, l.Release)
+	// The lease ends with the pipe: once both of its halves have ended,
+	// that is once the session ended it after its inbound side ended or
+	// lingered out, so that the connection is never closed under a zmux
+	// close the peer has not read; or with the connection.
+	q := pio.W.(*qStream)
+	q.rec, q.ended = &l.Conn.rec, pipeRelease(l.Conn.qc.Context(), l.Release)
 	pio.FateGroup = l.FateGroup
 	return pio, nil
 }
 
 // open opens a stream of pc. The first one (the lowest stream ID) starts
 // with the credential's prefix; streams are opened one at a time.
-func (p *Pool) open(ctx context.Context, pc *pooled) (zmux.PipeIO, context.Context, error) {
+func (p *Pool) open(ctx context.Context, pc *pooled) (zmux.PipeIO, error) {
 	qc := pc.qc
 	if p.cred == nil {
 		return openPipe(ctx, &qc)
@@ -636,16 +722,16 @@ func (p *Pool) open(ctx context.Context, pc *pooled) (zmux.PipeIO, context.Conte
 	if pc.presented {
 		return openPipe(ctx, &qc)
 	}
-	pio, done, err := openPipe(ctx, &qc)
+	pio, err := openPipe(ctx, &qc)
 	if err != nil {
-		return pio, done, err
+		return pio, err
 	}
 	if err := zmux.PresentPipe(ctx, pio, p.cred); err != nil {
 		pio.W.(*qStream).Abort(err)
-		return zmux.PipeIO{}, nil, err
+		return zmux.PipeIO{}, err
 	}
 	pc.presented = true
-	return pio, done, nil
+	return pio, nil
 }
 
 // SetReadDeadline bounds reads of the receiving half.
@@ -657,10 +743,23 @@ func (r *qReader) SetReadDeadline(t time.Time) error {
 // Candidate is a QUIC stream to addr for zmux.DialChoice, for a client that
 // reaches the server directly: each carrier is the first stream of a new
 // connection (dialed as NewPool does, without 0-RTT), which starts with
-// the session's credential and is closed once the pipe ends.
+// the session's credential and is closed once the pipe has ended, with
+// the session's code.
 func Candidate(addr string, tlsConf *tls.Config, qconf *quic.Config) zmux.Candidate {
 	return zmux.Candidate{Kind: zmux.CarrierQUIC, Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 		p := NewPool(addr, tlsConf, qconf, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 		return p.OpenPipe(ctx)
 	}}
+}
+
+// pipeRelease calls release when the connection's ctx ends or when the
+// returned function is called, which the pipe calls once both its halves
+// ended; it then also withdraws the registration on ctx, so that a
+// long-lived connection does not accumulate one per pipe.
+func pipeRelease(ctx context.Context, release func()) func() {
+	stop := context.AfterFunc(ctx, release)
+	return func() {
+		stop()
+		release()
+	}
 }

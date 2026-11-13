@@ -105,8 +105,9 @@ type CarrierInfo struct {
 	// Source is the carrier's client address: what a trusted intermediary
 	// reports (TrustedProxies; port 0 when it reports none), what the
 	// host gave as PipeHint.Source, and otherwise Peer. The listener's
-	// per-source limits and the stall duration count it aggregated: an
-	// IPv6 address to its /64 prefix, the port ignored.
+	// per-source limits and the stall duration count it aggregated to
+	// its source prefix (ListenerConfig.SourcePrefixV4, SourcePrefixV6),
+	// the port ignored.
 	Source netip.AddrPort
 	// Head marks a carrier decided on its HTTP request head, before any
 	// body byte is read: an HTTP upgrade such as WebSocket or
@@ -342,13 +343,22 @@ func drawDuration(lo, hi time.Duration) time.Duration {
 }
 
 // sourceKey is the one aggregation of a source for the listener's
-// per-source state: an IPv6 address to its /64, an
-// IPv4 address itself, the port ignored; "" for an invalid address.
-func sourceKey(src netip.AddrPort) string {
+// per-source state (the source slots, the count of stalled carriers, the
+// stall duration): the address, an IPv4-mapped one as IPv4, to its source
+// prefix (ListenerConfig.SourcePrefixV4, SourcePrefixV6), the port and the
+// zone ignored; the zero Prefix for an invalid address. Nothing else
+// aggregates a source.
+func (l *Listener) sourceKey(src netip.AddrPort) netip.Prefix {
 	if !src.IsValid() {
-		return ""
+		return netip.Prefix{}
 	}
-	return core.SourceKey(src.Addr().String())
+	a := src.Addr().Unmap().WithZone("")
+	bits := l.cfg.SourcePrefixV6
+	if a.Is4() {
+		bits = l.cfg.SourcePrefixV4
+	}
+	p, _ := a.Prefix(bits) // bits is in range (resolve)
+	return p
 }
 
 // addrPortOf is a's address and port, an IPv4-mapped address as IPv4;
@@ -397,17 +407,18 @@ func (l *Listener) StallDuration(source netip.AddrPort) time.Duration {
 	if l.cfg.Admission == nil {
 		return 0
 	}
-	return l.stallDuration(sourceKey(source))
+	return l.stallDuration(l.sourceKey(source))
 }
 
-func (l *Listener) stallDuration(key string) time.Duration {
+func (l *Listener) stallDuration(key netip.Prefix) time.Duration {
 	a := l.cfg.Admission
 	lo, hi := a.r.stallMin, a.r.stallMax
 	if hi <= lo {
 		return hi
 	}
 	m := hmac.New(sha256.New, l.stallKey[:])
-	m.Write([]byte(key))
+	b, _ := key.MarshalBinary() // the address and the prefix length
+	m.Write(b)
 	v := binary.BigEndian.Uint64(m.Sum(nil))
 	return lo + time.Duration(v%uint64(hi-lo+1))
 }
@@ -426,7 +437,7 @@ type Arrival struct {
 	l    *Listener
 	src  netip.AddrPort
 	peer netip.AddrPort
-	key  string
+	key  netip.Prefix
 
 	mu       sync.Mutex
 	slot     *core.PendingSlot // the slots Arrive took, until handed on
@@ -447,7 +458,7 @@ func (l *Listener) Arrive(source, peer netip.AddrPort) (*Arrival, error) {
 	if !source.IsValid() {
 		source = peer
 	}
-	key := sourceKey(source)
+	key := l.sourceKey(source)
 	slot, err := l.enter(key)
 	if err != nil {
 		return nil, err
@@ -464,7 +475,7 @@ func (l *Listener) Arrive(source, peer netip.AddrPort) (*Arrival, error) {
 // enter takes the slots of a carrier from the source of key, counting a
 // refusal; the error is net.ErrClosed, errRefused (the source's share) or
 // errRejected (every slot taken, none stalled).
-func (l *Listener) enter(key string) (*core.PendingSlot, error) {
+func (l *Listener) enter(key netip.Prefix) (*core.PendingSlot, error) {
 	l.mu.Lock()
 	closed := l.closed
 	var slot *core.PendingSlot

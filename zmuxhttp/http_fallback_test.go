@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -232,5 +233,62 @@ func TestHTTPRejectedStreamFallbackFullDuplex(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusTeapot {
 		t.Fatalf("status %d, want the fallback's", resp.StatusCode)
+	}
+}
+
+// A refusal over HTTP/2 reaches the carrier while the transport still
+// waits for the request body: the response body's Close waits for the
+// body's writer, which the transport's Close of the request body ends.
+// A redirect's response body is closed the same way.
+func TestHTTP2RefusalWhileUplinkIdle(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/moved", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/zmux")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = io.WriteString(w, "moved")
+	})
+	mux.HandleFunc("/zmux", func(w http.ResponseWriter, r *http.Request) {
+		// Refuse once the uplink's first bytes arrived, as a carrier
+		// handler refuses on its prefix.
+		_, _ = io.ReadFull(r.Body, make([]byte, len("preface")))
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = io.WriteString(w, "refused") // a body the client leaves unread
+	})
+	var p http.Protocols
+	p.SetHTTP1(true)
+	p.SetUnencryptedHTTP2(true)
+	srv := httptest.NewUnstartedServer(mux)
+	srv.Config.Protocols = &p
+	srv.Start()
+	defer srv.Close()
+	var cp http.Protocols
+	cp.SetUnencryptedHTTP2(true)
+	client := &http.Client{Transport: &http.Transport{Protocols: &cp}}
+	defer client.CloseIdleConnections()
+	for _, path := range []string{"/zmux", "/moved"} {
+		t.Run(path, func(t *testing.T) {
+			pipe, err := StreamCandidate(client, srv.URL+path, nil).Dial(t.Context(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = pipe.W.Close() }()
+			// The uplink sends, then waits: the transport's next read of
+			// the body waits too.
+			go func() { _, _ = pipe.W.Write([]byte("preface")) }()
+			got := make(chan error, 1)
+			go func() {
+				_, err := pipe.R.Read(make([]byte, 1))
+				got <- err
+			}()
+			select {
+			case err = <-got:
+			case <-time.After(5 * time.Second):
+				t.Fatal("refusal not reported while the uplink is idle")
+			}
+			var se *StatusError
+			if !errors.As(err, &se) || se.StatusCode != http.StatusTeapot || !errors.Is(err, zmux.ErrCarrierRefused) {
+				t.Fatalf("read error %v", err)
+			}
+		})
 	}
 }

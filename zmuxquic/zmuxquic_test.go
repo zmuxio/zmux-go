@@ -53,6 +53,7 @@ type env struct {
 	lst    *zmux.Listener
 	cli    *tls.Config
 	cancel context.CancelFunc
+	tl     *trackedListener
 }
 
 func newEnv(t testing.TB, scfg *zmux.Config) *env {
@@ -72,6 +73,7 @@ func newEnvQUIC(t testing.TB, address string, scfg *zmux.Config, qconf *quic.Con
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &env{ln: ln, lst: mustNewListener(&zmux.ListenerConfig{Config: scfg}), cli: cli, cancel: cancel}
 	tl := &trackedListener{ConnListener: ln}
+	e.tl = tl
 	go func() { _ = Serve(ctx, e.lst, tl, nil) }()
 	t.Cleanup(func() {
 		cancel()
@@ -99,6 +101,13 @@ func (l *trackedListener) Accept(ctx context.Context) (*quic.Conn, error) {
 		l.mu.Unlock()
 	}
 	return qc, err
+}
+
+// last is the connection accepted last.
+func (l *trackedListener) last() *quic.Conn {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.conns[len(l.conns)-1]
 }
 
 func (l *trackedListener) closeAll() {

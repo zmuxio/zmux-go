@@ -87,6 +87,9 @@ func (s *Session) stackRejectStream(st *Stream) {
 // AcceptStream pops an offered peer stream; ok is false when none waits.
 // The first call for unidirectional streams raises staged credit.
 func (s *Session) AcceptStream(bidi bool) (*Stream, bool) {
+	if s.state >= StateClosing {
+		return nil, false // the queue was discarded: accept fails
+	}
 	t := typeIndex(bidi)
 	if !bidi {
 		s.unstageUni()
@@ -409,6 +412,9 @@ func (s *Session) Read(st *Stream, p []byte) (int, bool, error) {
 		s.bufSub(uint64(n))
 		s.streamCreditChanged(st)
 		s.tuneConsume()
+		if r.drainWait {
+			s.drainRead(st)
+		}
 	}
 	if r.reset && r.readOff >= r.resetRel && r.buf.contiguous(r.readOff) == r.readOff {
 		if n > 0 {
@@ -455,6 +461,9 @@ func (s *Session) stopRecv(st *Stream, code uint64) {
 	r.stopped, r.stopCode = true, code
 	if d := r.buf.clear(); d > 0 {
 		s.bufSub(d)
+	}
+	if r.drainWait {
+		s.drainRead(st)
 	}
 	if r.finKnown {
 		r.readOff = r.final
@@ -672,6 +681,9 @@ func (s *Session) ReadChunk(st *Stream, limit int) (data []byte, buf *Buf, fin b
 		s.bufSub(n)
 		s.streamCreditChanged(st)
 		s.tuneConsume()
+		if r.drainWait {
+			s.drainRead(st)
+		}
 		return data, buf, false, nil
 	}
 	if r.reset && r.readOff >= r.resetRel {

@@ -140,7 +140,7 @@ func TestBodyPipe(t *testing.T) {
 	var got []byte
 	buf := make([]byte, 3)
 	for {
-		n, err := p.read(buf)
+		n, err := p.read(buf, nil)
 		got = append(got, buf[:n]...)
 		if errors.Is(err, io.EOF) {
 			break
@@ -165,7 +165,7 @@ func TestBodyPipe(t *testing.T) {
 	p = newBodyPipe()
 	w = &httpReqWriter{p: p, cancel: func() {}}
 	go func() { time.Sleep(10 * time.Millisecond); w.Abort(stop) }()
-	if _, err := p.read(buf); !errors.Is(err, stop) {
+	if _, err := p.read(buf, nil); !errors.Is(err, stop) {
 		t.Fatalf("read after the writer aborted: %v", err)
 	}
 }

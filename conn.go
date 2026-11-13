@@ -18,6 +18,7 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
+	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -120,6 +121,14 @@ type Conn struct {
 	closeSig *core.Signal
 	aborted  bool
 	poisoned bool
+	// closeCode and closeMsg are the first Close's, which an Abort during
+	// its flush sends instead of its own (the first call decides).
+	closeCode ApplicationErrorCode
+	closeMsg  string
+
+	// waited is Done's channel, made and closed by its goroutine.
+	waitOnce sync.Once
+	waited   chan struct{}
 	// A shaping deadline is met in place: the timer is armed lead before
 	// it, by the host timer's observed lateness, and the callback waits
 	// for the deadline itself.
@@ -760,36 +769,46 @@ func (c *Conn) closedErr() error {
 }
 
 // closeLimit bounds the whole of Close: the flush and the hand-off of
-// CONNECTION_CLOSE to the carriers.
-const closeLimit = time.Second
+// CONNECTION_CLOSE to the carriers. The flush ends at closeFlushLimit, so
+// that a carrier that takes data, when the data waits for credit, still
+// gets CONNECTION_CLOSE within the bound.
+const (
+	closeLimit      = time.Second
+	closeFlushLimit = closeLimit * 9 / 10
+)
 
-// Close closes the session gracefully, without error (code 0). The data
-// the streams have written and not yet sent is sent first, as far as flow
-// control and the carriers allow; then CONNECTION_CLOSE is handed to the
-// carrier of every usable outbound pipe, after which each pipe's write
-// side is shut down gracefully and its inbound side read until the peer
-// ends it or the linger timeout passes. Streams still open fail with the
-// session's error. Close returns once CONNECTION_CLOSE has been handed to
-// every such carrier (written to it; for a socket, taken into the
-// kernel's send buffer), at once when no pipe can carry it, and at the
-// latest one second after the call, flushing included: what has not been
-// handed over by then is discarded and the carriers that did not take
-// CONNECTION_CLOSE are closed. The half-close and the linger go on in the
-// background, so a process may exit as soon as Close returns; Wait waits
-// for them.
-//
-// Close and Abort are idempotent: the first call of either decides what is
-// sent, and a later call returns no later than the first, except that an
-// Abort while Close is still flushing discards what remains unsent and
-// ends the flush at once. Either returns at once on an ended session.
-// Close always returns nil.
+// Close is CloseWithError(0, ""): the graceful close without error. It
+// always returns nil, and makes Conn an io.Closer.
 func (c *Conn) Close() error {
-	c.closeGraceful(0, "")
-	return nil
+	return c.CloseWithError(0, "")
 }
 
-// closeGraceful is Close with an application error code and reason.
-func (c *Conn) closeGraceful(code ApplicationErrorCode, msg string) {
+// CloseWithError closes the session gracefully with an application error
+// code and reason, which the peer sees as ApplicationError (code 0 and an
+// empty reason is the close without error). The data the streams have
+// written and not yet sent is sent first, as far as flow control and the
+// carriers allow; then CONNECTION_CLOSE is handed to the carrier of every
+// usable outbound pipe, after which each pipe's write side is shut down
+// gracefully and its inbound side read until the peer ends it or the
+// linger timeout passes. Streams still open fail with the session's error;
+// they are not waited for (Shutdown waits for them). CloseWithError returns
+// once CONNECTION_CLOSE has been handed to every such carrier (written to
+// it; for a socket, taken into the kernel's send buffer), at once when no
+// pipe can carry it, and at the latest one second after the call, flushing
+// included: what has not been handed over by then is discarded and the
+// carriers that did not take CONNECTION_CLOSE are closed. The half-close
+// and the linger go on in the background, so a process may exit as soon as
+// it returns; Wait and Done wait for them, and so for the peer to have read
+// the close.
+//
+// CloseWithError (and Close) and Abort are idempotent: the first call of
+// either decides the code, the reason and what is sent, and a later call
+// returns no later than the first and sends nothing more, except that an
+// Abort while CloseWithError is still flushing discards what remains
+// unsent and ends the flush at once, still with the close's code and
+// reason. Either returns at once on an ended session. CloseWithError
+// always returns nil.
+func (c *Conn) CloseWithError(code ApplicationErrorCode, reason string) error {
 	c.lock()
 	// After an Abort, which returned at once, a Close returns at once too.
 	if c.ending != nil || c.closing || c.aborted {
@@ -801,9 +820,10 @@ func (c *Conn) closeGraceful(code ApplicationErrorCode, msg string) {
 			case <-c.done:
 			}
 		}
-		return
+		return nil
 	}
 	c.ending = make(chan struct{})
+	c.closeCode, c.closeMsg = code, reason
 	sig := core.NewSignal()
 	c.closeSig = sig
 	c.unlock()
@@ -813,12 +833,20 @@ func (c *Conn) closeGraceful(code ApplicationErrorCode, msg string) {
 		c.unlock()
 		close(c.ending)
 	}()
-	t := time.NewTimer(closeLimit) // real time: a bound on carrier IO
+	c.closeFlush(sig, code, reason)
+	return nil
+}
+
+// closeFlush is CloseWithError after its start: the flush, CONNECTION_CLOSE
+// and the hand-off, within closeLimit.
+func (c *Conn) closeFlush(sig *core.Signal, code ApplicationErrorCode, msg string) {
+	start := time.Now()
+	t := time.NewTimer(closeFlushLimit) // real time: a bound on carrier IO
 	defer t.Stop()
-	expired := false
-	// The flush: until nothing written can be sent now. The checks read
-	// under the bare mutex: an unlock would wake sig itself.
-	for !expired {
+	// The flush: until nothing written can be sent now, data that waits
+	// for credit included. The checks read under the bare mutex: an unlock
+	// would wake sig itself.
+	for flushed := false; !flushed; {
 		c.mu.Lock()
 		flushing := !c.aborted && c.s.Flushable()
 		c.mu.Unlock()
@@ -830,15 +858,23 @@ func (c *Conn) closeGraceful(code ApplicationErrorCode, msg string) {
 		case <-c.done:
 			return
 		case <-t.C:
-			expired = true
+			flushed = true // given up: the rest is discarded
 		}
 	}
 	c.lock()
 	c.s.SetNow(c.clk.now())
 	c.s.Close(uint64(code), []byte(msg)) // nothing when an Abort closed it first
 	c.unlock()
-	// The hand-off: until every carrier took CONNECTION_CLOSE.
-	for !expired {
+	// The hand-off: until every carrier took CONNECTION_CLOSE, within what
+	// remains of closeLimit.
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(closeLimit - time.Since(start))
+	for expired := false; !expired; {
 		c.mu.Lock()
 		done := c.handedOffLocked()
 		c.mu.Unlock()
@@ -879,13 +915,17 @@ func (c *Conn) handedOffLocked() bool {
 // CONNECTION_CLOSE with code and reason on each usable outbound pipe whose
 // carrier takes it, discards the data not yet sent, fails the open streams
 // with the session's error and returns without waiting for any carrier.
-// The carriers are then shut down gracefully in the background, as Close
-// does after its hand-off. Code 0 is allowed and differs from Close only
-// in what is drained. An Abort after Close or Abort sends nothing more,
-// except that one while Close is still flushing ends the flush.
+// The carriers are then shut down gracefully in the background, as
+// CloseWithError does after its hand-off. Code 0 is allowed and differs
+// from Close only in what is drained. An Abort after CloseWithError or
+// Abort sends nothing more, except that one while CloseWithError is still
+// flushing ends the flush, sending the close's code and reason.
 func (c *Conn) Abort(code ApplicationErrorCode, reason string) {
 	c.lock()
 	defer c.unlock()
+	if c.ending != nil {
+		code, reason = c.closeCode, c.closeMsg // the first call decides
+	}
 	c.aborted = true
 	c.s.SetNow(c.clk.now())
 	c.s.Close(uint64(code), []byte(reason))
@@ -910,17 +950,45 @@ func (c *Conn) Shutdown(ctx context.Context, code ApplicationErrorCode, msg stri
 	case <-c.done:
 		return nil
 	case <-ctx.Done():
-		c.closeGraceful(code, msg)
+		_ = c.CloseWithError(code, msg)
 		return ctx.Err()
 	}
 }
 
-// Wait blocks until the session is closed and every goroutine of it has
-// ended, then returns the session's error.
+// Wait blocks until the session has wholly ended, then returns the
+// session's error: until it is closed, every pipe's inbound side has ended
+// (the peer read CONNECTION_CLOSE and ended its side of the carrier) or
+// the linger timeout has expired, and every goroutine of the session has
+// ended. After CloseWithError, a Wait that returns before the linger
+// timeout confirms that the peer read the close. Done is its selectable
+// form.
 func (c *Conn) Wait() error {
 	<-c.done
 	c.wg.Wait()
 	return c.closedErr()
+}
+
+// Done returns a channel that is closed when Wait would return; Wait then
+// returns the session's error at once. A select on it bounds the wait with
+// a timer or a context, "the close delivered or given up after d":
+//
+//	_ = conn.CloseWithError(code, "replaced")
+//	select {
+//	case <-conn.Done():
+//	case <-ctx.Done(): // the linger goes on and ends the carriers
+//	}
+//
+// A wait given up this way changes nothing in the session.
+func (c *Conn) Done() <-chan struct{} {
+	c.waitOnce.Do(func() {
+		c.waited = make(chan struct{})
+		labels.Go(c.lctx, "done", func() {
+			<-c.done
+			c.wg.Wait()
+			close(c.waited)
+		})
+	})
+	return c.waited
 }
 
 // Ping sends a QX_PING request (or joins the outstanding one) and returns

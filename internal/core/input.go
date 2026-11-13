@@ -423,6 +423,9 @@ func (s *Session) onClose(f *wire.Frame) {
 		e.Kind = CloseTransport
 		e.Reason, e.Details = splitDetails(reason)
 	}
+	if s.state < StateClosing {
+		s.drain.on = true // only a processed CONNECTION_CLOSE drains reads
+	}
 	s.closeWith(e, &closeFrame{code: wire.NoError})
 }
 

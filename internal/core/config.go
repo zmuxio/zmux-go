@@ -56,6 +56,9 @@ type Config struct {
 	DgramRecvQ    int
 	DgramStreamQ  int
 	DgramRecvSize uint64
+	// DgramStreamSize bounds the payload bytes of a stream's datagram
+	// queue; 0 = unlimited.
+	DgramStreamSize uint64
 
 	MaxPipes     int
 	Headroom     int
@@ -178,6 +181,7 @@ func DefaultConfig() Config {
 		DgramRecvQ:       128,
 		DgramStreamQ:     32,
 		DgramRecvSize:    1 << 20,
+		DgramStreamSize:  512 << 10,
 		MaxPipes:         1,
 		Headroom:         8,
 		SpreadChunk:      16384,

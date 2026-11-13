@@ -163,7 +163,7 @@ func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 	waitUntil(t, 5*time.Second, "two slots", func() bool {
 		lst.mu.Lock()
 		defer lst.mu.Unlock()
-		return lst.pending.Held(sourceKey(netip.MustParseAddrPort("192.0.2.1:1"))) == 2
+		return lst.pending.Held(lst.sourceKey(netip.MustParseAddrPort("192.0.2.1:1"))) == 2
 	})
 	a, b := net.Pipe()
 	if err := lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), PipeHint{}); err == nil {

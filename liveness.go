@@ -193,11 +193,11 @@ func (l *PipeLiveness) core() (core.PipeLiveness, error) {
 // raises nothing. While the unidirectional credit is still staged
 // (MaxIncomingUniStreams zero), uni raises the value the first
 // AcceptUniStream moves it to. After GOAWAY no credit is sent. A negative
-// value or one above 2^60 is an ErrInvalidConfig error that changes
-// nothing.
+// value or one above MaxStreamCredit is an ErrInvalidConfig error that
+// changes nothing.
 func (c *Conn) RaiseIncomingStreams(bidi, uni int64) error {
-	if bidi < 0 || uni < 0 || bidi > 1<<60 || uni > 1<<60 {
-		return fmt.Errorf("%w: RaiseIncomingStreams %d, %d outside [0, 2^60]", ErrInvalidConfig, bidi, uni)
+	if bidi < 0 || uni < 0 || bidi > MaxStreamCredit || uni > MaxStreamCredit {
+		return fmt.Errorf("%w: RaiseIncomingStreams %d, %d outside [0, MaxStreamCredit]", ErrInvalidConfig, bidi, uni)
 	}
 	c.lock()
 	defer c.unlock()

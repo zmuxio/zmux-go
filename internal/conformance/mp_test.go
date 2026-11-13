@@ -2,10 +2,13 @@ package conformance
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"net/netip"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
@@ -124,7 +127,7 @@ func (r *runner) listenerUp(st map[string]any) error {
 	}
 	r.carriers[name] = c
 	if src, ok := st["source"].(string); ok {
-		slot, _, res := r.pending.Enter(src)
+		slot, _, res := r.pending.Enter(traceSource(src))
 		if res != core.EnterOK {
 			c.rejected = true
 			return nil
@@ -833,4 +836,13 @@ func (r *runner) peerEpoch(st map[string]any) error {
 func bodyOf(f []byte) []byte {
 	_, n := varint.ConsumeVarint(f)
 	return f[n:]
+}
+
+// traceSource is a trace's source name as a distinct source prefix.
+func traceSource(name string) netip.Prefix {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	var a [4]byte
+	binary.BigEndian.PutUint32(a[:], h.Sum32())
+	return netip.PrefixFrom(netip.AddrFrom4(a), 32)
 }

@@ -98,6 +98,7 @@ type Session struct {
 	timers            timers
 	err               *SessionError
 	closeFr           closeFrame
+	drain             readDrainState
 	events            []Event
 	evHead            int
 	wakes             []*Signal
@@ -188,6 +189,15 @@ type pendingCtl struct {
 	dataBlocked    bool
 	goaway         bool
 	forceMaxData   bool
+}
+
+// readDrain: the peer's CONNECTION_CLOSE was processed, and CLOSED, which
+// releases the receive buffers, waits within the linger timeout until the
+// application has read what its opened and accepted streams received;
+// drainLeft counts those streams (recvPart.drainWait).
+type readDrainState struct {
+	on   bool
+	left int
 }
 
 type closeFrame struct {
@@ -499,7 +509,19 @@ func (s *Session) closeWith(e *SessionError, fr *closeFrame) {
 	s.state = StateClosing
 	s.failAllStreams()
 	s.wakeAll()
+	s.discardAcceptQueues()
+	if s.drain.on {
+		s.startReadDrain()
+	}
 	if fr == nil || !s.hasLiveOutbound() {
+		if s.drain.on {
+			// No CONNECTION_CLOSE to send: linger from the peer's close.
+			s.timers.linger = s.now.Add(s.lingerTimeout())
+			s.closeFr.sentAll, s.closeFr.lingering = true, true
+			s.emitClosedEvent()
+			s.checkLingerDone()
+			return
+		}
 		s.finishClose()
 		return
 	}

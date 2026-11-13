@@ -85,3 +85,14 @@ func TestExportedDefaults(t *testing.T) {
 		}
 	}
 }
+
+// TestDatagramStreamBytesSetting: zero is 512 KiB, a negative value
+// unlimited, a positive value itself.
+func TestDatagramStreamBytesSetting(t *testing.T) {
+	for v, want := range map[int]uint64{0: 512 << 10, -1: 0, 4096: 4096} {
+		cc, err := (&Config{DatagramStreamBytes: v}).coreConfig(core.RoleInitiator, core.RoleInitiator)
+		if err != nil || cc.DgramStreamSize != want {
+			t.Fatalf("%d: %d, %v", v, cc.DgramStreamSize, err)
+		}
+	}
+}

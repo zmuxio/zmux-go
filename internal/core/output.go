@@ -614,7 +614,51 @@ func (s *Session) checkLingerDone() {
 			return
 		}
 	}
+	if s.drain.on && s.drain.left > 0 {
+		return // the reads or the linger timeout end the wait
+	}
 	s.finishClose()
+}
+
+// startReadDrain marks the streams the application opened or accepted
+// that hold received data it has not read; nothing arrives after the
+// peer's close, so the count only falls (drainRead, stopRecv).
+func (s *Session) startReadDrain() {
+	for _, st := range s.streams {
+		if !st.hasR || !st.local && !st.accepted {
+			continue
+		}
+		if r := &st.rcv; !r.stopped && r.buf.contiguous(r.readOff) > r.readOff {
+			r.drainWait = true
+			s.drain.left++
+		}
+	}
+}
+
+// drainRead ends the wait for st once its buffered data has been read or
+// dropped; the last one lets CLOSED proceed.
+func (s *Session) drainRead(st *Stream) {
+	r := &st.rcv
+	if r.stopped || r.buf.contiguous(r.readOff) <= r.readOff {
+		r.drainWait = false
+		s.drain.left--
+		s.checkLingerDone()
+	}
+}
+
+// discardAcceptQueues drops the peer streams not yet accepted when the
+// session closes (SPEC.md Section 6.5): their data is released and accept
+// fails.
+func (s *Session) discardAcceptQueues() {
+	for t := range s.acceptQ {
+		for st := s.acceptQ[t].pop(); st != nil; st = s.acceptQ[t].pop() {
+			if st.hasR {
+				if d := st.rcv.buf.clear(); d > 0 {
+					s.bufSub(d)
+				}
+			}
+		}
+	}
 }
 
 // writeControl writes the coalesced control state ahead of

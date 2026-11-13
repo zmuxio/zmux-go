@@ -12,12 +12,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -208,8 +210,11 @@ func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a 
 // starts a zmux client session on its first bidirectional stream, as
 // zmuxquic.Dial does on a QUIC connection; the lanes the server opens are
 // accepted. The CONNECT request carries cfg.Credential (DialSession). The
-// caller closes the returned WebTransport session after the zmux session
-// ended.
+// caller, which may start further zmux sessions on the returned
+// WebTransport session (SessionPipe), closes it once the last of them has
+// wholly ended (Wait returned, or Done is closed), not sooner: closing it
+// resets its streams, the zmux close included. Its code is the last
+// session's (SessionCloseCode).
 func Dial(ctx context.Context, t *webtransport.Transport, url string, h http.Header, cfg *zmux.Config) (*zmux.Conn, *webtransport.Session, error) {
 	var cred zmux.CarrierCredential
 	if cfg != nil {
@@ -234,7 +239,8 @@ func Dial(ctx context.Context, t *webtransport.Transport, url string, h http.Hea
 }
 
 // DialSession opens a WebTransport session to url with t and the headers
-// h on a new QUIC connection, which is closed with the session. With
+// h on a new QUIC connection, which is closed with the session, with its
+// session close code. With
 // cred, the CONNECT request carries its Header form, bound to the
 // connection's handshake: the connection is dialed with t.DialAddr (nil:
 // quic.DialAddr), the request is sent after the handshake completed, and
@@ -297,8 +303,64 @@ func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, 
 	if err != nil {
 		return fail(err)
 	}
-	context.AfterFunc(sess.Context(), func() { _ = qc.CloseWithError(0, "") })
+	// The connection carries this session only: it closes with the
+	// session's code once the session ended, after a linger in which the
+	// session's close capsule reaches the peer (a QUIC close discards
+	// stream data the peer has not acknowledged), unless the peer closes
+	// it first.
+	context.AfterFunc(sess.Context(), func() {
+		var code quic.ApplicationErrorCode
+		var reason string
+		var se *webtransport.SessionError
+		if errors.As(closeError(sess), &se) {
+			code, reason = quic.ApplicationErrorCode(se.ErrorCode), se.Message
+		}
+		t := time.NewTimer(lingerTimeout(qc.ConnectionStats().SmoothedRTT))
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-qc.Context().Done():
+		}
+		_ = qc.CloseWithError(code, reason)
+	})
 	return sess, nil
+}
+
+// lingerTimeout is the zmux linger timeout for a smoothed RTT:
+// min(2 s, max(250 ms, 3 x SRTT)).
+func lingerTimeout(srtt time.Duration) time.Duration {
+	return min(2*time.Second, max(250*time.Millisecond, 3*srtt))
+}
+
+// closeError is the error that ended sess (a *webtransport.SessionError
+// for a session close), read once its context is done: its context carries
+// no cause, its stream maps do.
+//
+// webtransport-go v0.13 offers no accessor for it: Context has no cause and
+// the error is private. Its stream maps return it from Accept once the
+// session is closed; an Accept with a context already ended never waits,
+// and a stream it could still return (a session not closed yet) is reset
+// at once instead of being left open.
+func closeError(sess *webtransport.Session) error {
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	s, err := sess.AcceptUniStream(done)
+	if s != nil {
+		s.CancelRead(carrierFailed)
+	}
+	return err
+}
+
+// SessionCloseCode is the WebTransport session close code and message for
+// a zmux session that ended with err: its application error code and
+// reason, 0 and none after any other end or for a code beyond the 32 bits
+// of a WebTransport session code.
+func SessionCloseCode(err error) (webtransport.SessionErrorCode, string) {
+	var ae *zmux.ApplicationError
+	if errors.As(err, &ae) && ae.ErrorCode <= math.MaxUint32 {
+		return webtransport.SessionErrorCode(ae.ErrorCode), ae.ErrorMessage
+	}
+	return 0, ""
 }
 
 // acceptLanes routes the lanes the server opens on a client session.
@@ -321,7 +383,37 @@ func acceptLanes(sess *webtransport.Session) {
 // retired by lifetime limits or failure; the pipes of one session share a
 // fate group. It is safe for concurrent use.
 type Pool struct {
-	pool carrier.Pool[*webtransport.Session]
+	pool carrier.Pool[*wtPooled]
+}
+
+// wtPooled is a pooled WebTransport session.
+type wtPooled struct {
+	sess *webtransport.Session
+	rec  closeRecord // the close code of the last zmux session it carried
+}
+
+// closeRecord is the close code of the last zmux session a pooled
+// WebTransport session carried.
+type closeRecord struct {
+	mu     sync.Mutex
+	code   zmux.ApplicationErrorCode
+	reason string
+	set    bool
+}
+
+func (r *closeRecord) record(code zmux.ApplicationErrorCode, reason string) {
+	r.mu.Lock()
+	r.code, r.reason, r.set = code, reason, true
+	r.mu.Unlock()
+}
+
+func (r *closeRecord) get() (webtransport.SessionErrorCode, string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.set {
+		return 0, ""
+	}
+	return SessionCloseCode(&zmux.ApplicationError{ErrorCode: r.code, ErrorMessage: r.reason})
 }
 
 // Shutdown retires every session: idle ones close now, the others once
@@ -332,20 +424,27 @@ func (p *Pool) Shutdown() { p.pool.Shutdown() }
 // (DialSession), within lim.
 func NewPool(t *webtransport.Transport, url string, h http.Header, cred zmux.CarrierCredential, lim carrier.PoolLimits) *Pool {
 	p := &Pool{}
-	p.pool = carrier.Pool[*webtransport.Session]{PoolLimits: lim, Close: closePooled,
-		Dial: func(ctx context.Context) (*webtransport.Session, error) {
+	p.pool = carrier.Pool[*wtPooled]{PoolLimits: lim, Close: closePooled,
+		Dial: func(ctx context.Context) (*wtPooled, error) {
 			sess, err := DialSession(ctx, t, url, h, cred)
 			if err != nil {
 				return nil, err
 			}
 			labels.Go(context.Background(), "wt-client-lanes", func() { acceptLanes(sess) })
-			context.AfterFunc(sess.Context(), func() { p.pool.RetireConn(sess) })
-			return sess, nil
+			wp := &wtPooled{sess: sess}
+			context.AfterFunc(sess.Context(), func() { p.pool.RetireConn(wp) })
+			return wp, nil
 		}}
 	return p
 }
 
-func closePooled(sess *webtransport.Session) { _ = sess.CloseWithError(0, "") }
+// closePooled closes a retired session once none of its pipes has not
+// ended (each pipe's inbound side ended or lingered out), with the code of
+// the last zmux session it carried.
+func closePooled(wp *wtPooled) {
+	code, reason := wp.rec.get()
+	_ = wp.sess.CloseWithError(code, reason)
+}
 
 // OpenPipe opens a pipe on a pooled session; its PipeIO carries the
 // session's fate group.
@@ -357,13 +456,15 @@ func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
-	s, err := l.Conn.OpenStreamSync(ctx)
+	s, err := l.Conn.sess.OpenStreamSync(ctx)
 	if err != nil {
 		l.Release()
 		return zmux.PipeIO{}, err
 	}
-	context.AfterFunc(s.Context(), l.Release)
-	pio := StreamPipe(l.Conn, s)
+	// The lease ends once both halves of the pipe have ended, after its
+	// inbound side ended or lingered out, or with the session.
+	ws := &wtStream{sess: l.Conn.sess, s: s, rec: &l.Conn.rec, ended: pipeRelease(l.Conn.sess.Context(), l.Release)}
+	pio := ws.pipe()
 	pio.FateGroup = l.FateGroup
 	return pio, nil
 }
@@ -381,8 +482,12 @@ func SessionPipe(ctx context.Context, sess *webtransport.Session) (zmux.PipeIO, 
 // StreamPipe adapts a bidirectional stream of a WebTransport session
 // to a pipe input (with lanes on the session's unidirectional streams).
 func StreamPipe(sess *webtransport.Session, s *webtransport.Stream) zmux.PipeIO {
-	ws := &wtStream{sess: sess, s: s}
-	return zmux.PipeIO{R: (*wtReader)(ws), W: ws, Carrier: zmux.CarrierWebTransport}
+	return (&wtStream{sess: sess, s: s}).pipe()
+}
+
+// pipe is the pipe input over w.
+func (w *wtStream) pipe() zmux.PipeIO {
+	return zmux.PipeIO{R: (*wtReader)(w), W: w, Carrier: zmux.CarrierWebTransport}
 }
 
 type wtStream struct {
@@ -390,6 +495,27 @@ type wtStream struct {
 	s     *webtransport.Stream
 	wOnce sync.Once
 	rOnce sync.Once
+	// rec, when set, records the close code of the pipe's session for its
+	// pooled WebTransport session (zmux.CloseCodeRecorder); ended, when
+	// set, is called once both halves have ended.
+	rec    *closeRecord
+	ended  func()
+	halves atomic.Int32
+}
+
+// halfEnded counts the end of one half; the second calls ended.
+func (w *wtStream) halfEnded() {
+	if w.halves.Add(1) == 2 && w.ended != nil {
+		w.ended()
+	}
+}
+
+// RecordCloseCode records the code of the pipe's session
+// (zmux.CloseCodeRecorder).
+func (w *wtStream) RecordCloseCode(code zmux.ApplicationErrorCode, reason string) {
+	if w.rec != nil {
+		w.rec.record(code, reason)
+	}
 }
 
 func (w *wtStream) Write(p []byte) (int, error) { return w.s.Write(p) }
@@ -399,7 +525,7 @@ func (w *wtStream) WriteBuffers(bufs [][]byte) (int, error) { return carrier.Wri
 
 func (w *wtStream) Close() error {
 	var err error
-	w.wOnce.Do(func() { err = w.s.Close() })
+	w.wOnce.Do(func() { err = w.s.Close(); w.halfEnded() })
 	return err
 }
 
@@ -408,8 +534,8 @@ func (w *wtStream) Close() error {
 // what releases it.
 func (w *wtStream) Abort(error) {
 	_ = w.s.SetWriteDeadline(time.Unix(1, 0))
-	w.wOnce.Do(func() { w.s.CancelWrite(carrierFailed) })
-	w.rOnce.Do(func() { w.s.CancelRead(carrierFailed) })
+	w.wOnce.Do(func() { w.s.CancelWrite(carrierFailed); w.halfEnded() })
+	w.rOnce.Do(func() { w.s.CancelRead(carrierFailed); w.halfEnded() })
 }
 
 // CarrierConn is the WebTransport session (lanes are its streams).
@@ -438,8 +564,13 @@ type wtReader wtStream
 func (r *wtReader) Read(p []byte) (int, error) { return r.s.Read(p) }
 
 func (r *wtReader) Close() error {
-	r.rOnce.Do(func() { r.s.CancelRead(carrierFailed) })
+	r.rOnce.Do(func() { r.s.CancelRead(carrierFailed); (*wtStream)(r).halfEnded() })
 	return nil
+}
+
+// RecordCloseCode of the receiving half (zmux.CloseCodeRecorder).
+func (r *wtReader) RecordCloseCode(code zmux.ApplicationErrorCode, reason string) {
+	(*wtStream)(r).RecordCloseCode(code, reason)
 }
 
 func (r *wtReader) CarrierConn() any { return r.sess }
@@ -479,7 +610,8 @@ func (l *laneReader) CarrierConn() any { return l.sess }
 // Candidate is a WebTransport stream to url for zmux.DialChoice,
 // for a client that reaches the server directly: each carrier is the first
 // stream of a new WebTransport session (DialSession with the headers h and
-// the session's credential), which is closed once the pipe ends.
+// the session's credential), which is closed once the pipe has ended, with
+// the zmux session's code.
 func Candidate(t *webtransport.Transport, url string, h http.Header) zmux.Candidate {
 	return zmux.Candidate{Kind: zmux.CarrierWebTransport, Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 		p := NewPool(t, url, h, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
@@ -505,3 +637,15 @@ func addrPort(a net.Addr) netip.AddrPort {
 
 // CloseIdleConnections passes to the transport (http.Client.CloseIdleConnections).
 func (r *h3RoundTripper) CloseIdleConnections() { r.t.CloseIdleConnections() }
+
+// pipeRelease calls release when the connection's ctx ends or when the
+// returned function is called, which the pipe calls once both its halves
+// ended; it then also withdraws the registration on ctx, so that a
+// long-lived connection does not accumulate one per pipe.
+func pipeRelease(ctx context.Context, release func()) func() {
+	stop := context.AfterFunc(ctx, release)
+	return func() {
+		stop()
+		release()
+	}
+}

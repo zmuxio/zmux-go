@@ -34,6 +34,14 @@ const (
 	DefaultMaxBackoff = 60 * time.Second
 )
 
+// MaxStreamCredit is the largest stream count credit the encoding allows,
+// 2^60 (RFC 9000 Section 4.6): the value that grants the peer as many
+// streams as the protocol can count, in effect no limit. It is the upper
+// end of the range of Config.MaxIncomingStreams and MaxIncomingUniStreams
+// and of Conn.RaiseIncomingStreams; those settings have no unlimited
+// setting of their own, and their negative value stays "none".
+const MaxStreamCredit int64 = 1 << 60
+
 // DefaultMaxRecordSize is the max_record_size in effect while it is
 // absent (16382 bytes): records are built at most this large before the
 // peer's parameters arrive, and always on a TLS carrier.
@@ -104,11 +112,11 @@ type Config struct {
 
 	// MaxIncomingStreams is initial_max_streams_bidi, the bidirectional
 	// streams the peer may open at first. Zero is 256; a negative value
-	// grants none; otherwise at least 4.
+	// grants none; otherwise at least 4 and at most MaxStreamCredit.
 	MaxIncomingStreams int64
 	// MaxIncomingUniStreams is initial_max_streams_uni. Zero is a staged
 	// credit: 16, raised to 256 on the first AcceptUniStream; a negative
-	// value grants none.
+	// value grants none; otherwise at most MaxStreamCredit.
 	MaxIncomingUniStreams int64
 
 	// EnableDatagrams announces max_datagram_frame_size and datagram flows.
@@ -116,11 +124,23 @@ type Config struct {
 	// DatagramSendQueue, DatagramReceiveQueue, DatagramStreamQueue (per
 	// stream) and DatagramReceiveBytes size the datagram queues. Zero is
 	// 64, 128, 32 and 1 MiB (an empty queue would drop every datagram); a
-	// negative value is invalid.
+	// negative value is invalid. DatagramReceiveBytes bounds the session
+	// queue and the datagrams held for streams not opened yet, not the
+	// stream queues.
 	DatagramSendQueue    int
 	DatagramReceiveQueue int
 	DatagramStreamQueue  int
 	DatagramReceiveBytes int
+	// DatagramStreamBytes bounds the payload bytes of each stream's
+	// datagram queue, per direction of receipt, beside DatagramStreamQueue:
+	// a datagram that would exceed either drops the oldest of that queue
+	// until both hold, each counted as dropped; a single datagram larger
+	// than it is kept alone. Zero is 512 KiB; a negative value is
+	// unlimited, leaving the count as the only bound. DatagramReceiveBytes
+	// does not include the stream queues, so with the defaults a session's
+	// received datagrams are bounded by about MaxIncomingStreams x
+	// DatagramStreamBytes (256 x 512 KiB) beside it.
+	DatagramStreamBytes int
 
 	// SendBuffer starts the written-but-unreleased byte budget, in bytes.
 	// Zero is 4 MiB; a negative value is invalid. Multipath sessions grow
@@ -562,14 +582,16 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	case c.MaxIncomingStreams < 0:
 		l.MaxStreamsBidi = 0
 	case c.MaxIncomingStreams > 0:
-		if c.MaxIncomingStreams < 4 {
-			return cc, fmt.Errorf("%w: MaxIncomingStreams must be 0 or at least 4", ErrInvalidConfig)
+		if c.MaxIncomingStreams < 4 || c.MaxIncomingStreams > MaxStreamCredit {
+			return cc, fmt.Errorf("%w: MaxIncomingStreams must be 0, negative or in [4, MaxStreamCredit]", ErrInvalidConfig)
 		}
 		l.MaxStreamsBidi = uint64(c.MaxIncomingStreams)
 	}
 	switch {
 	case c.MaxIncomingUniStreams < 0:
 		cc.StagedUni, l.MaxStreamsUni = false, 0
+	case c.MaxIncomingUniStreams > MaxStreamCredit:
+		return cc, fmt.Errorf("%w: MaxIncomingUniStreams above MaxStreamCredit", ErrInvalidConfig)
 	case c.MaxIncomingUniStreams > 0:
 		cc.StagedUni, l.MaxStreamsUni = false, uint64(c.MaxIncomingUniStreams)
 	}
@@ -592,6 +614,12 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	setInt(&cc.DgramStreamQ, c.DatagramStreamQueue)
 	if c.DatagramReceiveBytes > 0 {
 		cc.DgramRecvSize = uint64(c.DatagramReceiveBytes)
+	}
+	switch {
+	case c.DatagramStreamBytes < 0:
+		cc.DgramStreamSize = 0 // unlimited
+	case c.DatagramStreamBytes > 0:
+		cc.DgramStreamSize = uint64(c.DatagramStreamBytes)
 	}
 	if c.SendBuffer > 0 {
 		cc.SendBuffer = uint64(c.SendBuffer)

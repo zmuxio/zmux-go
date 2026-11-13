@@ -100,7 +100,7 @@ func closeExitChild(addr string) {
 	if _, err := c.Ping(ctx); err != nil {
 		os.Exit(4)
 	}
-	c.closeGraceful(7, "bye") // Close with an application code
+	_ = c.CloseWithError(7, "bye")
 	_ = c.Close()
 	os.Exit(0)
 }

@@ -64,10 +64,24 @@ type ListenerConfig struct {
 	// stalled ones included: a new carrier beyond it is refused, and a
 	// source holds at most MaxPendingPerSource - 1 stalled carriers, a
 	// carrier to be stalled beyond that being closed. A source is a client
-	// address, its /64 prefix for IPv6; deployments behind a carrier-grade
-	// NAT raise it. Each half of a split bootstrap holds a slot until the
-	// pair is complete, so split bootstraps need at least 2.
+	// address aggregated to its source prefix (SourcePrefixV4,
+	// SourcePrefixV6); deployments behind a carrier-grade NAT raise it.
+	// Each half of a split bootstrap holds a slot until the pair is
+	// complete, so split bootstraps need at least 2.
 	MaxPendingPerSource int
+	// SourcePrefixV4 and SourcePrefixV6 aggregate a source to its prefix:
+	// an IPv4 source (an IPv4-mapped IPv6 one included) counts by its first
+	// SourcePrefixV4 bits (1 to 32; zero: 32, the address on its own), an
+	// IPv6 source by its first SourcePrefixV6 bits (1 to 128; zero: 64),
+	// ports ignored. This one aggregation is used by everything the
+	// listener keeps per source: the MaxPendingPerSource slots, the count of
+	// a source's stalled carriers and the stall duration
+	// (Listener.StallDuration). A shorter prefix groups more clients into
+	// one share, which tightens the bound against one network and lets its
+	// clients crowd each other out; the defaults suit public listeners. A
+	// negative value or one beyond the address length makes NewListener
+	// fail with ErrInvalidConfig; there is no off setting.
+	SourcePrefixV4, SourcePrefixV6 int
 	// MaxPendingPerSession bounds the Unconfirmed carriers of one session:
 	// joins that passed authentication and wait for the joiner's
 	// confirmation. Zero is 4; a new authenticated Hello beyond it evicts
@@ -182,6 +196,10 @@ const (
 	// defaultMaxPendingPerSession is the default ListenerConfig.MaxPendingPerSession.
 	defaultMaxPendingPerSession = 4
 	defaultMemoryBudget         = 1 << 30
+	// The default source prefixes: an IPv4 address on its own, an IPv6
+	// address to its /64.
+	defaultSourcePrefixV4 = 32
+	defaultSourcePrefixV6 = 64
 )
 
 // PipeWrapper is a ListenerConfig.WrapPipe.
@@ -229,6 +247,15 @@ func (c *ListenerConfig) resolve() (ListenerConfig, error) {
 	}
 	if r.MaxPendingPerSession == 0 {
 		r.MaxPendingPerSession = defaultMaxPendingPerSession
+	}
+	if r.SourcePrefixV4 < 0 || r.SourcePrefixV4 > 32 || r.SourcePrefixV6 < 0 || r.SourcePrefixV6 > 128 {
+		return r, fmt.Errorf("%w: ListenerConfig.SourcePrefixV4 beyond 0..32 or SourcePrefixV6 beyond 0..128", ErrInvalidConfig)
+	}
+	if r.SourcePrefixV4 == 0 {
+		r.SourcePrefixV4 = defaultSourcePrefixV4
+	}
+	if r.SourcePrefixV6 == 0 {
+		r.SourcePrefixV6 = defaultSourcePrefixV6
 	}
 	r.FirstRecordTimeout = setting.Timeout(r.FirstRecordTimeout, time.Duration(core.DefaultFirstRecordTimeout))
 	if err := r.Admission.Validate(); err != nil {

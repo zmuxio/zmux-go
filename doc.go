@@ -114,7 +114,9 @@
 // http.Server.IdleTimeout): Liveness.KeepAlivePeriod, StandbyProbe and
 // ProbeInterval turn keep-alive and probes off, a negative ProbeJitter is
 // a jitter of 0, a negative MaxIncomingStreams grants no stream, a negative
-// MemoryBudget is unlimited, a negative SchedulerParams.Probation turns
+// MemoryBudget is unlimited, a negative DatagramStreamBytes leaves a
+// stream's datagram queue without a byte bound, a negative
+// SchedulerParams.Probation turns
 // probation off and a negative zmuxhttp.ExchangeConfig.Coalesce sends at once.
 // A negative value of a field without such a setting (JoinTimeout,
 // ResumeTimeout, the windows, MaxPipes) is an error. A feature that is on

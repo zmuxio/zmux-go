@@ -96,7 +96,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 		var body io.ReadCloser = http.NoBody
 		var up *httpUpBody
 		if s != nil {
-			up = &httpUpBody{s: s, call: call}
+			up = &httpUpBody{s: s, call: call, closed: make(chan struct{})}
 			body = up
 		}
 		actx, acancel := context.WithCancel(ctx)
@@ -305,6 +305,12 @@ type httpUpBody struct {
 	off  int    // of s.carry sent by this body (under s.mu)
 	dead atomic.Bool
 	once sync.Once
+	// closed closes when the transport closes the body: a Read waiting
+	// on the pipe returns at once. An HTTP/2 transport's response body
+	// Close waits for the request body's writer, so a refused or
+	// redirected request's Close would otherwise wait for the carrier's
+	// next write.
+	closed chan struct{}
 }
 
 // SetSecureConnection implements CarrierBody; a body a redirect
@@ -344,7 +350,7 @@ func (b *httpUpBody) Read(p []byte) (int, error) {
 				continue
 			}
 		}
-		n, err := s.p.read(p)
+		n, err := s.p.read(p, b.closed)
 		if !s.direct.Load() || b.dead.Load() {
 			s.mu.Lock()
 			if b.dead.Load() {
@@ -397,6 +403,7 @@ func (b *httpUpBody) fromCarry(p []byte) (n int, err error, ok bool) {
 
 func (b *httpUpBody) Close() error {
 	b.once.Do(func() {
+		close(b.closed)
 		end := func() {
 			<-b.call.done
 			if b.s.isLive(b) {
@@ -634,11 +641,14 @@ func newBodyPipe() *bodyPipe {
 	return &bodyPipe{wrCh: make(chan struct{}), rdCh: make(chan int), done: make(chan struct{})}
 }
 
-// read takes one turn of the current write.
-func (p *bodyPipe) read(b []byte) (int, error) {
+// read takes one turn of the current write, or none once closed closes
+// (io.ErrClosedPipe); closed may be nil.
+func (p *bodyPipe) read(b []byte, closed <-chan struct{}) (int, error) {
 	select {
 	case <-p.done:
 		return 0, p.readCloseError()
+	case <-closed:
+		return 0, io.ErrClosedPipe
 	default:
 	}
 	select {
@@ -657,6 +667,8 @@ func (p *bodyPipe) read(b []byte) (int, error) {
 		return n, nil
 	case <-p.done:
 		return 0, p.readCloseError()
+	case <-closed:
+		return 0, io.ErrClosedPipe
 	}
 }
 

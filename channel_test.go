@@ -83,13 +83,33 @@ func exchangeDatagrams(t *testing.T, c, s *Conn, n, size int) int {
 	return got
 }
 
+// sentStats waits until c has counted sent datagrams in all and returns
+// its statistics. The driver counts a channel datagram once the carrier
+// took it, outside the session's lock and so possibly after the peer
+// already received it; a datagram the peer received is counted on its
+// sender eventually, not before the peer sees it.
+func sentStats(t *testing.T, c *Conn, sent uint64) ConnectionStats {
+	t.Helper()
+	for {
+		cs := c.ConnectionStats()
+		if cs.DatagramsSent >= sent {
+			return cs
+		}
+		select {
+		case <-t.Context().Done():
+			t.Fatalf("sent datagrams not counted: %+v", cs)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
 func TestChannelDatagrams(t *testing.T) {
 	a, b := chanPair(t, 1200)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
 	if got := exchangeDatagrams(t, c, s, 50, 100); got != 50 {
 		t.Fatalf("%d of 50 datagrams", got)
 	}
-	cs, ss := c.ConnectionStats(), s.ConnectionStats()
+	cs, ss := sentStats(t, c, 50), s.ConnectionStats()
 	if cs.DatagramsSentChannel != 50 || cs.DatagramsSent != 50 || ss.DatagramsReceivedChannel != 50 || ss.DatagramsReceived != 50 {
 		t.Fatalf("client %+v\nserver %+v", cs, ss)
 	}
@@ -97,14 +117,14 @@ func TestChannelDatagrams(t *testing.T) {
 		t.Fatalf("%d channel datagrams sent", a.sent.Load())
 	}
 	// Both directions.
-	if got := exchangeDatagrams(t, s, c, 10, 1000); got != 10 || s.ConnectionStats().DatagramsSentChannel != 10 {
+	if got := exchangeDatagrams(t, s, c, 10, 1000); got != 10 || sentStats(t, s, 10).DatagramsSentChannel != 10 {
 		t.Fatalf("server to client: %d", got)
 	}
 	// Above the channel's maximum: in records.
 	if got := exchangeDatagrams(t, c, s, 5, 1500); got != 5 {
 		t.Fatalf("%d of 5 large datagrams", got)
 	}
-	if cs := c.ConnectionStats(); cs.DatagramsSentChannel != 50 || cs.DatagramsSent != 55 {
+	if cs := sentStats(t, c, 55); cs.DatagramsSentChannel != 50 || cs.DatagramsSent != 55 {
 		t.Fatalf("large datagrams: %+v", cs)
 	}
 	// Stream datagrams use the channel too.
@@ -128,7 +148,7 @@ func TestChannelDatagrams(t *testing.T) {
 	if err != nil || cx != 7 || string(p) != "flow" {
 		t.Fatalf("stream datagram %d %q %v", cx, p, err)
 	}
-	if cs := c.ConnectionStats(); cs.DatagramsSentChannel != 51 {
+	if cs := sentStats(t, c, 56); cs.DatagramsSentChannel != 51 || cs.DatagramsSent != 56 {
 		t.Fatalf("stream datagram not on the channel: %+v", cs)
 	}
 }

@@ -530,7 +530,8 @@ func (e *atkEnv) tlsRelay(a *tap) string {
 }
 
 // Bound: a third party that splices the carrier makes the origin refuse the Hello,
-// because the two TLS connections have different exporters.
+// because the two TLS connections have different exporters; a refused join is
+// closed at once by default, not stalled.
 func TestJoinBoundRelayRefused(t *testing.T) {
 	t.Parallel()
 	e := newAtkEnv(t, atkOpts{})
@@ -545,8 +546,12 @@ func TestJoinBoundRelayRefused(t *testing.T) {
 	}
 	a := &tap{}
 	addr := e.tlsRelay(a)
+	start := time.Now()
 	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dialTLS(addr)), PipeOptions{RecordMode: new(RecordBound)}); err == nil {
 		t.Fatal("Bound passed a third party")
+	}
+	if took := time.Since(start); took > DefaultJoinTimeout/2 {
+		t.Fatalf("the refused join ended after %v, not at once", took)
 	}
 	e.until("the origin's refusal", func() bool { return e.s.ConnectionStats().JoinAuthFailures == 1 })
 	if _, _, err := join.ParseHelloExact(a.bytes(), join.Stream); err != nil {
@@ -1796,7 +1801,7 @@ func TestPendingLimitRejects(t *testing.T) {
 			deadline := time.Now().Add(10 * time.Second)
 			for {
 				lst.mu.Lock()
-				n := lst.pending.Held(sourceKey(src))
+				n := lst.pending.Held(lst.sourceKey(src))
 				lst.mu.Unlock()
 				if n == 2 {
 					break

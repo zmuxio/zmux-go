@@ -201,7 +201,7 @@ func TestRaiseIncomingStreams(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("ninth stream: %v", err)
 	}
-	for _, bad := range [][2]int64{{-1, 0}, {0, -1}, {1<<60 + 1, 0}} {
+	for _, bad := range [][2]int64{{-1, 0}, {0, -1}, {MaxStreamCredit + 1, 0}, {0, MaxStreamCredit + 1}} {
 		if err := s.RaiseIncomingStreams(bad[0], bad[1]); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%v: %v", bad, err)
 		}
@@ -214,6 +214,36 @@ func TestRaiseIncomingStreams(t *testing.T) {
 	}
 	if _, err := c.OpenStreamSync(ctx); err != nil {
 		t.Fatalf("after the raise: %v", err)
+	}
+	if err := s.RaiseIncomingStreams(MaxStreamCredit, MaxStreamCredit); err != nil {
+		t.Fatalf("a raise to MaxStreamCredit: %v", err)
+	}
+}
+
+// TestMaxStreamCredit (N19): MaxStreamCredit is 2^60, the stream count
+// options set to it advertise it, and one above it is the configuration
+// error.
+func TestMaxStreamCredit(t *testing.T) {
+	if MaxStreamCredit != 1<<60 {
+		t.Fatalf("MaxStreamCredit %d", MaxStreamCredit)
+	}
+	for _, cfg := range []*Config{{MaxIncomingStreams: MaxStreamCredit + 1}, {MaxIncomingUniStreams: MaxStreamCredit + 1}} {
+		a, b := net.Pipe()
+		_, err := Client(context.Background(), a, cfg)
+		_ = a.Close()
+		_ = b.Close()
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("%+v: %v", cfg, err)
+		}
+	}
+	a, b := tcpPair(t)
+	c, _ := pair(t, a, b, nil, &Config{MaxIncomingStreams: MaxStreamCredit, MaxIncomingUniStreams: MaxStreamCredit})
+	c.lock()
+	p, ok := c.s.PeerParams()
+	bidi, uni := p.MaxStreamsBidi, p.MaxStreamsUni
+	c.unlock()
+	if !ok || bidi != 1<<60 || uni != 1<<60 {
+		t.Fatalf("advertised %d, %d (%v)", bidi, uni, ok)
 	}
 }
 

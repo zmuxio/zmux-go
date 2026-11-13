@@ -93,6 +93,13 @@ func TestRaiseIncomingStreams(t *testing.T) {
 	if s.rem[1].limit != 512 {
 		t.Fatalf("unstaged uni limit %d", s.rem[1].limit)
 	}
+	// N19: a raise to the largest credit sends MAX_STREAMS 2^60.
+	s.pend.maxStreams = [2]bool{}
+	for t2 := range 2 {
+		if !s.RaiseIncomingStreams(t2 == 0, maxStreamCount) || s.rem[t2].limit != 1<<60 || !s.pend.maxStreams[t2] {
+			t.Fatalf("raise to 2^60: %+v, pending %v", s.rem[t2], s.pend.maxStreams[t2])
+		}
+	}
 }
 
 // T_dead_p = max(suspect_floor, 2 x (PTO + queue), dead_timeout), where an

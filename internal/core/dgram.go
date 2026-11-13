@@ -9,7 +9,7 @@ import (
 type dgramState struct {
 	send     []outDgram
 	recv     [][]byte
-	recvSize uint64 // bytes held in every receive queue
+	recvSize uint64 // bytes of the session queue and the held datagrams
 	recvW    []*Signal
 	sendW    []*Signal
 	// Received datagrams that wait for the receive limiter, which the
@@ -266,8 +266,24 @@ func (s *Session) ReceiveChannelDatagram(pipe uint64, frame []byte, now Time) {
 }
 
 type streamDgrams struct {
-	q   [][]byte // context-prefixed payloads
-	sig *Signal
+	q    [][]byte // context-prefixed payloads
+	size uint64   // their payload bytes (DgramStreamSize)
+	sig  *Signal
+}
+
+// dgPayloadLen is the payload length of a context-prefixed stream datagram.
+func dgPayloadLen(e []byte) uint64 {
+	_, n := varint.ConsumeVarint(e)
+	return uint64(len(e) - n)
+}
+
+// pop removes the oldest datagram of the queue.
+func (q *streamDgrams) pop() []byte {
+	e := q.q[0]
+	q.q[0] = nil
+	q.q = q.q[1:]
+	q.size -= dgPayloadLen(e)
+	return e
 }
 
 func (s *Session) dgState() *dgramState {
@@ -583,16 +599,18 @@ func (s *Session) queueDatagram(st *Stream, e []byte) {
 		if st.dg == nil {
 			st.dg = &streamDgrams{}
 		}
-		if len(st.dg.q) >= s.cfg.DgramStreamQ {
-			d.recvSize -= uint64(len(st.dg.q[0]))
-			st.dg.q = st.dg.q[1:]
+		// The count, then the bytes: the oldest go, each counted; a
+		// datagram above the byte bound is kept alone.
+		n := dgPayloadLen(e)
+		for len(st.dg.q) > 0 && (len(st.dg.q) >= s.cfg.DgramStreamQ ||
+			s.cfg.DgramStreamSize > 0 && st.dg.size+n > s.cfg.DgramStreamSize) {
+			st.dg.pop()
 			s.dropRecv(1)
 			st.cnt.dgDropped++
 		}
 		st.cnt.dgReceived++
 		st.dg.q = append(st.dg.q, e)
-		d.recvSize += uint64(len(e))
-		s.trimRecvBytes()
+		st.dg.size += n
 		s.wake(st.dg.sig)
 		s.wake(st.rsig)
 		return
@@ -622,7 +640,8 @@ func (s *Session) dropRecv(n uint64) {
 
 // trimRecvBytes keeps received datagrams within the byte limit by dropping
 // the oldest held for streams not opened yet, then the oldest of the
-// session queue.
+// session queue. The stream queues have bounds of their own and do not
+// count against it.
 func (s *Session) trimRecvBytes() {
 	d := s.dg
 	for d.recvSize > s.cfg.DgramRecvSize && len(d.held) > 0 {
@@ -665,12 +684,7 @@ func (s *Session) RecvStreamDatagram(st *Stream) (uint64, []byte, bool) {
 	if st.dg == nil || len(st.dg.q) == 0 {
 		return 0, nil, false
 	}
-	e := st.dg.q[0]
-	st.dg.q[0] = nil
-	st.dg.q = st.dg.q[1:]
-	if s.dg != nil {
-		s.dg.recvSize -= uint64(len(e))
-	}
+	e := st.dg.pop()
 	ctx, n := varint.ConsumeVarint(e)
 	p := e[n:]
 	s.stats.DatagramBytesReceived += uint64(len(p))
@@ -687,10 +701,5 @@ func (s *Session) WaitStreamDatagram(st *Stream, sig *Signal) {
 }
 
 func (s *Session) dropStreamDgrams(st *Stream) {
-	if s.dg != nil {
-		for _, e := range st.dg.q {
-			s.dg.recvSize -= uint64(len(e))
-		}
-	}
 	st.dg = nil
 }

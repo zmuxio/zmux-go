@@ -638,6 +638,14 @@ type pendingAct struct {
 	pd    *pipeDrv
 	lo    *laneOut
 	start bool
+	// coded: the session has ended, with an application close of code and
+	// reason or (0, "") otherwise, before this command ended the pipe
+	// (CloseCodeRecorder). The
+	// shutdown of a closing session's pipe comes before its inbound side
+	// ends, so the code is recorded before either half has ended.
+	coded  bool
+	code   ApplicationErrorCode
+	reason string
 }
 
 // resolveActionLocked binds a to its attachment (under the lock).
@@ -648,6 +656,14 @@ func (c *Conn) resolveActionLocked(a core.Action) pendingAct {
 		if a.Kind == core.ActOpenLane && pd.opener != nil && !c.closing {
 			c.wg.Add(1)
 			pa.start = true
+		}
+		if a.Kind == core.ActShutdown || a.Kind == core.ActAbort || a.Kind == core.ActClose {
+			if e := c.s.Err(); e != nil {
+				pa.coded = true // 0 and no reason after any end but an application close
+				if e.Kind == core.CloseApplication {
+					pa.code, pa.reason = ApplicationErrorCode(e.Code), e.Reason
+				}
+			}
 		}
 	}
 	return pa
@@ -661,14 +677,23 @@ func (c *Conn) doAction(pa pendingAct) {
 	}
 	switch a.Kind {
 	case core.ActShutdown:
+		if pa.coded {
+			pd.hc.recordCloseCode(pa.code, pa.reason)
+		}
 		if a.Lane == 0 {
 			pd.requestShutdown()
 		} else if lo != nil {
 			lo.requestShut()
 		}
 	case core.ActAbort:
+		if pa.coded {
+			pd.hc.recordCloseCode(pa.code, pa.reason)
+		}
 		pd.closeAll()
 	case core.ActClose:
+		if pa.coded {
+			pd.hc.recordCloseCode(pa.code, pa.reason)
+		}
 		if a.Dir&core.DirIn != 0 {
 			pd.hc.closeRead()
 		}

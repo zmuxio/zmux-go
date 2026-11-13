@@ -121,14 +121,34 @@ warnings an application would otherwise not see.
 
 ## Closing
 
-`Conn.Close` closes the session gracefully: it first sends what the streams
-have written, as far as flow control and the carriers allow, then hands
-CONNECTION_CLOSE to every usable carrier (written to it; for a socket, taken
-into the kernel's send buffer). It returns at the latest 1 s after the call,
-flushing included, so a process may exit as soon as it returns; what was not
-handed over by then is discarded. `Conn.Abort(code, reason)` ends the
-session at once with an application error and discards unsent data. `Wait`
-waits for the session's whole end. To let the peer read everything first:
+`Conn.CloseWithError(code, reason)` closes the session gracefully with an
+application error code and reason, which the peer sees as
+`*zmux.ApplicationError`; `Conn.Close` is `CloseWithError(0, "")`. It first
+sends what the streams have written, as far as flow control and the
+carriers allow, then hands CONNECTION_CLOSE to every usable carrier (written
+to it; for a socket, taken into the kernel's send buffer). It returns at the
+latest 1 s after the call, flushing included, so a process may exit as soon
+as it returns; what was not handed over by then is discarded. Open streams
+are not waited for; they fail with the session's error.
+`Conn.Abort(code, reason)` ends the session at once with an application
+error and discards unsent data. The first close or abort decides the code
+and reason; an abort while a close is still flushing ends the flush at once.
+
+`Wait` waits for the session's whole end: until the peer has read
+CONNECTION_CLOSE and ended its side of every carrier, or the linger timeout
+has expired. `Done` is its selectable form, so "delivered or given up after
+d" is a `select`:
+
+```go
+_ = conn.CloseWithError(0x2a, "replaced")
+select {
+case <-conn.Done(): // the peer read the close (or the linger ended)
+case <-time.After(5 * time.Second):
+}
+```
+
+To let the peer read everything first, including what the open streams
+still write:
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -279,7 +299,10 @@ is set with `PipeOptions.Liveness`, or later with
 `zmux.Clear[zmux.PipeLiveness]()`.
 A pipe already suspect keeps the dead timeout it turned suspect under.
 `Conn.RaiseIncomingStreams` raises the incoming stream limits, for example
-after the peer has authenticated; the limits only grow.
+after the peer has authenticated; the limits only grow. `zmux.MaxStreamCredit`
+(2^60) is the largest stream credit, the value of `MaxIncomingStreams`,
+`MaxIncomingUniStreams` and `RaiseIncomingStreams` that grants as many
+streams as the protocol counts.
 
 ## WebSocket
 
@@ -571,7 +594,11 @@ and decides again, and `Decision.Variant` labels the carrier, counted per
 label in `Listener.VariantStats` (one of a few host constants, never derived
 from the peer's bytes; past `MaxAdmissionVariants` labels share one bucket). A source holds at most `MaxPendingPerSource - 1` stalled
 carriers, and a stall lasts the same duration for every carrier from one
-source during the listener's lifetime (`Listener.StallDuration`).
+source during the listener's lifetime (`Listener.StallDuration`). A source
+is a client address aggregated to its prefix, `SourcePrefixV4` bits for IPv4
+(default 32, the address on its own) and `SourcePrefixV6` bits for IPv6
+(default 64), ports ignored; the slots, the stalled-carrier count and the
+stall duration all use it.
 `ListenerStats.Admission` counts the outcomes. An adapter with its own
 accept loop takes a carrier with `Listener.Arrive` (`AdmitUpgrade` for an
 HTTP upgrade) and hands it on with `Arrival.HandlePipe`. `admit.PrefixAuth` is one `Decide`: a carrier starts with a token of
@@ -613,7 +640,7 @@ byte-stream pipe.
 A split bootstrap (`zmuxhttp.SplitPipe`, `zmuxhttp.SplitCandidate`) holds its first half
 in a pairing slot until the other half arrives or the handshake timeout
 ends: 64 slots per listener and 8 per source ([pairing a split bootstrap](https://github.com/zmuxio/zmux-spec/blob/main/SPEC.md#611-pairing-a-split-bootstrap)), counted by
-the source that `MaxPendingPerSource` counts (an IPv6 client by its /64).
+the source that `MaxPendingPerSource` counts (a client by its source prefix).
 Without an `Admission`, a few sources can keep those slots full and delay
 other clients' split bootstraps; serve a split bootstrap that the open
 Internet reaches with an `Admission`, such as `admit.PrefixAuth`.
@@ -659,6 +686,28 @@ replayable startup and resumption are not affected. A `quic.Conn` passed
 to `zmuxquic.Client` or `zmuxquic.ConnPipe` stays owned by the caller.
 `zmuxh3.SessionPipe` and `zmuxh3.StreamPipe` do the same for a WebTransport
 session or stream.
+
+A QUIC close discards stream data the peer has not acknowledged, so a QUIC
+connection is closed only after the zmux close on its streams was read or
+given up. The connections `zmuxquic.Dial`, `NewPool` and `Candidate` open
+(and the WebTransport sessions of `zmuxh3.NewPool` and `Candidate`) close
+once none of their pipes has not ended, each pipe's inbound side having
+ended or lingered out, with the application error code of the last zmux
+session they carried (0 after a transport error, an idle timeout or no
+session). A caller that owns the connection or session closes it after
+`Wait` returns (or `Done` is closed), with the code of the
+`*zmux.ApplicationError` that `Wait` returned; `zmuxh3.SessionCloseCode`
+gives it for a WebTransport session.
+
+## Datagram queues
+
+Received datagrams wait in bounded queues, the oldest dropped and counted
+when one is full: the session queue (`DatagramReceiveQueue`, 128) and the
+datagrams held for streams not opened yet share `DatagramReceiveBytes`
+(1 MiB); each stream's queue has its own count (`DatagramStreamQueue`, 32)
+and payload bytes (`DatagramStreamBytes`, 512 KiB; negative: no byte
+bound), a single larger datagram being kept alone. An application that
+forwards packets at a high rate raises both.
 
 ## Datagram channels
 
