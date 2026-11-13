@@ -909,6 +909,9 @@ func Accept(h Hello, f Framing, psk, binding []byte, usable func(group uint64) b
 	if h.Mode == Bound && len(binding) == 0 {
 		return nil, HelloPayload{}, ErrAuth
 	}
+	if h.Mode == Bound && len(binding) != BindingLen {
+		return nil, HelloPayload{}, fmt.Errorf("%w: binding", ErrInvalidConfig)
+	}
 	a := &Acceptor{c: schedule{suite: h.Suite, mode: h.Mode, f: f, psk: psk}, helloCT: bytes.Clone(h.Ciphertext)}
 	a.c.begin(h.clear, binding)
 	plain, err := a.c.open1(a.c.sec.K0, h.Ciphertext)

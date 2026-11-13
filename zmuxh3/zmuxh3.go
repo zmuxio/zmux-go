@@ -4,7 +4,7 @@
 // pipe pair is one bidirectional stream and its further lanes are
 // unidirectional streams of the session. Datagrams may
 // go as HTTP Datagrams of a bidirectional carrier's request stream (served
-// by NewHTTP3Server) or as datagrams of the WebTransport session.
+// by NewServer) or as datagrams of the WebTransport session.
 package zmuxh3
 
 import (
@@ -24,7 +24,9 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 	"github.com/zmuxio/zmux-go/internal/labels"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 const carrierFailed = webtransport.StreamErrorCode(zmux.StreamCarrierFailed)
@@ -32,9 +34,9 @@ const carrierFailed = webtransport.StreamErrorCode(zmux.StreamCarrierFailed)
 // ---- HTTP/3 request streams ----
 
 // HTTPClient returns an http.Client whose requests run over HTTP/3, for
-// zmux.HTTPPipe and zmux.HTTPSplitPipe, and its transport, which the
+// zmuxhttp.StreamPipe and zmuxhttp.SplitPipe, and its transport, which the
 // caller closes when done. qconf may be nil. A carrier's request names its
-// QUIC connection to the carrier (zmux.HTTPCarrierBody), which then declares
+// QUIC connection to the carrier (zmuxhttp.CarrierBody), which then declares
 // the Bound contract with the connection's exporter. The transport dials each
 // connection on a socket of its own; do not replace its Dial.
 func HTTPClient(tlsConf *tls.Config, qconf *quic.Config) (*http.Client, *http3.Transport) {
@@ -87,7 +89,7 @@ type h3RoundTripper struct {
 }
 
 func (r *h3RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if b, ok := req.Body.(zmux.HTTPCarrierBody); ok {
+	if b, ok := req.Body.(zmuxhttp.CarrierBody); ok {
 		trace := &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) {
 			if i.Conn == nil {
 				return
@@ -106,21 +108,22 @@ type quicState struct{ qc *quic.Conn }
 
 func (s quicState) ConnectionState() tls.ConnectionState { return s.qc.ConnectionState().TLS }
 
-// NewHTTP3Server returns an HTTP/3 server that serves h, typically the
-// handler of zmux.NewHTTPHandler, which hands requests to a listener as
+// NewServer returns an HTTP/3 server that serves h, typically the
+// handler of zmuxhttp.NewHandler, which hands requests to a listener as
 // carriers; the caller starts it (ListenAndServe or Serve) and closes it.
 // It enables HTTP Datagrams, which bidirectional carriers use as their
 // datagram channel (HTTP3Handler, whose o it takes). qconf may be nil. With
 // qconf.Allow0RTT a request may arrive in 0-RTT, before the handshake
 // completes; the zmux adapters answer such a carrier request 425 (Too Early).
-func NewHTTP3Server(addr string, tlsConf *tls.Config, qconf *quic.Config, h http.Handler, o *zmux.HTTPOptions) *http3.Server {
+func NewServer(addr string, tlsConf *tls.Config, qconf *quic.Config, h http.Handler, o *zmuxhttp.Options) *http3.Server {
 	return &http3.Server{Addr: addr, TLSConfig: http3.ConfigureTLSConfig(tlsConf), QUICConfig: qconf,
 		Handler: HTTP3Handler(h, o), EnableDatagrams: true}
 }
 
 // ---- WebTransport ----
 
-// Handler returns an http.Handler for an HTTP/3 server configured with
+// NewHandler returns an http.Handler that serves WebTransport carriers of l
+// through s, a WebTransport server whose HTTP/3 server is configured with
 // webtransport.ConfigureHTTP3Server: each request passes l's admission on
 // its head (zmux.Listener.AdmitUpgrade; the body is not read), is
 // upgraded to a WebTransport session, and the session's bidirectional
@@ -128,12 +131,16 @@ func NewHTTP3Server(addr string, tlsConf *tls.Config, qconf *quic.Config, h http
 // until the session ends, with the request's source (o.Trusted). A request
 // forwarded from early data, or received in 0-RTT, is answered 425; one that cannot be upgraded
 // is served by o.Next. o may be nil; an invalid o is an error.
-func Handler(s *webtransport.Server, l *zmux.Listener, o *zmux.HTTPOptions) (http.Handler, error) {
+func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (http.Handler, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
+	if o == nil {
+		o = &zmuxhttp.Options{}
+	}
+	fallback := http.HandlerFunc(o.Fallback)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a, ok := l.AdmitUpgrade(w, r, o)
+		a, ok := l.AdmitUpgrade(w, r, o.Trusted, fallback)
 		if !ok {
 			return
 		}
@@ -143,7 +150,7 @@ func Handler(s *webtransport.Server, l *zmux.Listener, o *zmux.HTTPOptions) (htt
 			o.Fallback(w, r)
 			return
 		}
-		_ = serve(sess.Context(), sess, l, a)
+		_ = serve(sess.Context(), l, sess, a)
 	}), nil
 }
 
@@ -153,13 +160,13 @@ func Handler(s *webtransport.Server, l *zmux.Listener, o *zmux.HTTPOptions) (htt
 // each passing l's admission on its own (zmux.Listener.HandlePipe). It
 // returns, with the error that ended the accept loop, when the session
 // ends or ctx ends; the zmux sessions continue on their pipes.
-func Serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener) error {
-	return serve(ctx, sess, l, nil)
+func Serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session) error {
+	return serve(ctx, l, sess, nil)
 }
 
 // serve is Serve, or with a the streams of a session admitted as one
 // arrival.
-func serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener, a *zmux.Arrival) error {
+func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a *zmux.Arrival) error {
 	handle := func(p zmux.PipeIO) {
 		if a != nil {
 			_ = a.HandlePipe(ctx, p, zmux.PipeHint{})
@@ -190,7 +197,7 @@ func serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener, a 
 		if err != nil {
 			break
 		}
-		p := WebTransportPipe(sess, s)
+		p := StreamPipe(sess, s)
 		labels.Go(ctx, "wt-pipe", func() { handle(p) })
 	}
 	wg.Wait()
@@ -204,15 +211,15 @@ func serve(ctx context.Context, sess *webtransport.Session, l *zmux.Listener, a 
 // caller closes the returned WebTransport session after the zmux session
 // ended.
 func Dial(ctx context.Context, t *webtransport.Transport, url string, h http.Header, cfg *zmux.Config) (*zmux.Conn, *webtransport.Session, error) {
-	var cred zmux.Credential
+	var cred zmux.CarrierCredential
 	if cfg != nil {
-		cred = cfg.Credential
+		cred = cfg.CarrierCredential
 	}
 	sess, err := DialSession(ctx, t, url, h, cred)
 	if err != nil {
 		return nil, nil, err
 	}
-	p, err := OpenPipe(ctx, sess)
+	p, err := SessionPipe(ctx, sess)
 	if err != nil {
 		_ = sess.CloseWithError(0, "")
 		return nil, nil, err
@@ -233,7 +240,7 @@ func Dial(ctx context.Context, t *webtransport.Transport, url string, h http.Hea
 // quic.DialAddr), the request is sent after the handshake completed, and
 // t.QUICConfig and t.TLSClientConfig are completed as t.Dial does. Without
 // cred it is t.Dial.
-func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, h http.Header, cred zmux.Credential) (*webtransport.Session, error) {
+func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, h http.Header, cred zmux.CarrierCredential) (*webtransport.Session, error) {
 	if cred == nil {
 		_, sess, err := t.Dial(ctx, rawURL, h)
 		return sess, err
@@ -314,7 +321,7 @@ func acceptLanes(sess *webtransport.Session) {
 // retired by lifetime limits or failure; the pipes of one session share a
 // fate group. It is safe for concurrent use.
 type Pool struct {
-	pool zmux.CarrierPool[*webtransport.Session]
+	pool carrier.Pool[*webtransport.Session]
 }
 
 // Shutdown retires every session: idle ones close now, the others once
@@ -323,9 +330,9 @@ func (p *Pool) Shutdown() { p.pool.Shutdown() }
 
 // NewPool returns a pool that dials url with t, the headers h and cred
 // (DialSession), within lim.
-func NewPool(t *webtransport.Transport, url string, h http.Header, cred zmux.Credential, lim zmux.PoolLimits) *Pool {
+func NewPool(t *webtransport.Transport, url string, h http.Header, cred zmux.CarrierCredential, lim carrier.PoolLimits) *Pool {
 	p := &Pool{}
-	p.pool = zmux.CarrierPool[*webtransport.Session]{PoolLimits: lim, Close: closePooled,
+	p.pool = carrier.Pool[*webtransport.Session]{PoolLimits: lim, Close: closePooled,
 		Dial: func(ctx context.Context) (*webtransport.Session, error) {
 			sess, err := DialSession(ctx, t, url, h, cred)
 			if err != nil {
@@ -356,24 +363,24 @@ func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 		return zmux.PipeIO{}, err
 	}
 	context.AfterFunc(s.Context(), l.Release)
-	pio := WebTransportPipe(l.Conn, s)
+	pio := StreamPipe(l.Conn, s)
 	pio.FateGroup = l.FateGroup
 	return pio, nil
 }
 
-// OpenPipe opens a bidirectional stream of a WebTransport session as a
+// SessionPipe opens a bidirectional stream of a WebTransport session as a
 // pipe input (a bootstrap or a join).
-func OpenPipe(ctx context.Context, sess *webtransport.Session) (zmux.PipeIO, error) {
+func SessionPipe(ctx context.Context, sess *webtransport.Session) (zmux.PipeIO, error) {
 	s, err := sess.OpenStreamSync(ctx)
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
-	return WebTransportPipe(sess, s), nil
+	return StreamPipe(sess, s), nil
 }
 
-// WebTransportPipe adapts a bidirectional stream of a WebTransport session
+// StreamPipe adapts a bidirectional stream of a WebTransport session
 // to a pipe input (with lanes on the session's unidirectional streams).
-func WebTransportPipe(sess *webtransport.Session, s *webtransport.Stream) zmux.PipeIO {
+func StreamPipe(sess *webtransport.Session, s *webtransport.Stream) zmux.PipeIO {
 	ws := &wtStream{sess: sess, s: s}
 	return zmux.PipeIO{R: (*wtReader)(ws), W: ws, Carrier: zmux.CarrierWebTransport}
 }
@@ -388,7 +395,7 @@ type wtStream struct {
 func (w *wtStream) Write(p []byte) (int, error) { return w.s.Write(p) }
 
 // WriteBuffers writes a batch with one stream write (one locked copy).
-func (w *wtStream) WriteBuffers(bufs [][]byte) (int, error) { return zmux.WriteFlat(w.s, bufs) }
+func (w *wtStream) WriteBuffers(bufs [][]byte) (int, error) { return carrier.WriteFlat(w.s, bufs) }
 
 func (w *wtStream) Close() error {
 	var err error
@@ -445,7 +452,7 @@ type laneWriter struct {
 func (l *laneWriter) Write(p []byte) (int, error) { return l.s.Write(p) }
 
 // WriteBuffers writes a batch with one stream write (one locked copy).
-func (l *laneWriter) WriteBuffers(bufs [][]byte) (int, error) { return zmux.WriteFlat(l.s, bufs) }
+func (l *laneWriter) WriteBuffers(bufs [][]byte) (int, error) { return carrier.WriteFlat(l.s, bufs) }
 func (l *laneWriter) Close() error {
 	var err error
 	l.once.Do(func() { err = l.s.Close() })
@@ -469,23 +476,23 @@ func (l *laneReader) Close() error {
 }
 func (l *laneReader) CarrierConn() any { return l.sess }
 
-// WebTransportCandidate is a WebTransport stream to url for zmux.DialMode,
+// Candidate is a WebTransport stream to url for zmux.DialChoice,
 // for a client that reaches the server directly: each carrier is the first
 // stream of a new WebTransport session (DialSession with the headers h and
 // the session's credential), which is closed once the pipe ends.
-func WebTransportCandidate(t *webtransport.Transport, url string, h http.Header) zmux.Candidate {
-	return zmux.Candidate{Kind: zmux.CarrierWebTransport, Dial: func(ctx context.Context, cred zmux.Credential) (zmux.PipeIO, error) {
-		p := NewPool(t, url, h, cred, zmux.PoolLimits{MaxPipesPerConnectionLifetime: 1})
+func Candidate(t *webtransport.Transport, url string, h http.Header) zmux.Candidate {
+	return zmux.Candidate{Kind: zmux.CarrierWebTransport, Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
+		p := NewPool(t, url, h, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 		return p.OpenPipe(ctx)
 	}}
 }
 
 // HTTP3Candidate is a bidirectional streaming request over HTTP/3 to url
-// for zmux.DialMode (zmux.StreamingCandidate with an HTTP/3 client, such
+// for zmux.DialChoice (zmuxhttp.StreamCandidate with an HTTP/3 client, such
 // as HTTPClient's). Its kind describes this end's hop only: the first
 // peer may be an HTTP/3 intermediary in front of the server.
 func HTTP3Candidate(client *http.Client, url string, h http.Header) zmux.Candidate {
-	c := zmux.StreamingCandidate(client, url, h)
+	c := zmuxhttp.StreamCandidate(client, url, h)
 	c.Kind = zmux.CarrierHTTP3
 	return c
 }

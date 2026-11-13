@@ -13,25 +13,32 @@
 // sessions, so it is the server for multipath and resume. Server starts a
 // single-pipe session on one accepted connection. Start takes any carrier
 // (PipeIO, for example a WebSocket connection with FramingRecords) and an
-// explicit Role, and Listener.HandlePipe or NewHTTPHandler accept any
+// explicit Role, and Listener.HandlePipe or zmuxhttp.NewHandler accept any
 // carrier. An Admission on the Listener (ListenerConfig.Admission,
-// PrefixAuth) decides on every carrier before anything is sent on it,
+// admit.PrefixAuth) decides on every carrier before anything is sent on it,
 // whatever entry point took it, and a Credential is what a
-// client presents for it (Config.Credential, PresentPipe). HTTPExchangePipe and HTTPExchangeHandler build a carrier out of
-// short HTTP requests for paths that buffer or cut long ones; they
-// authenticate but do not encrypt, so a proxy or CDN that terminates TLS
-// can read such a carrier. The sub-modules zmuxquic and zmuxh3 carry
-// sessions over QUIC, HTTP/3 and WebTransport.
+// client presents for it (Config.Credential, PresentPipe).
+//
+// Packages beside this one: zmuxhttp carries sessions over HTTP requests
+// (stream, split and exchange carriers; the exchange carrier, of short
+// requests for paths that buffer or cut long ones, authenticates but does
+// not encrypt, so a proxy or CDN that terminates TLS can read it); admit
+// holds what a server judges a carrier by before any handshake
+// (admit.ClassifyFirstBytes, admit.PrefixAuth, admit.ReplayFilter);
+// carrier holds the building blocks of carrier adapters (a connection
+// pool, a channel datagram demultiplexer). The sub-modules zmuxquic and
+// zmuxh3 carry sessions over QUIC, HTTP/3 and WebTransport, and zmuxws
+// over WebSocket.
 //
 // A carrier transform (a byte transform, compression, a handshake of its
 // own) wraps carriers with the public API: a Candidate's Dial on the
 // client, ListenerConfig.WrapPipe on the server, behind an Admission that
-// tells its first bytes from a zmux first record (ClassifyFirstBytes,
+// tells its first bytes from a zmux first record (admit.ClassifyFirstBytes,
 // VerdictMore, Decision.Variant). Its halves offer the optional
 // capabilities that PipeIO lists (KeyingMaterialExporter for its own
 // exporter, EarlyClientCarrier for a first flight that the server may
 // refuse, with EarlyData.HoldFirstFlight and Conn.ReleaseFirstFlight);
-// ReplayFilter is a single-use cache for its nonces.
+// admit.ReplayFilter is a single-use cache for its nonces.
 //
 // The Conn and Stream methods follow quic-go: OpenStream[Sync],
 // AcceptStream, Read, Write, Close (FIN), CancelRead, CancelWrite,
@@ -40,14 +47,16 @@
 //
 // Blocking: calls that wait take a context.Context (OpenStreamSync,
 // AcceptStream, Ping, Shutdown, AddPipe, NextEvent, ...) or honour the
-// stream's deadlines (Read, Write). Conn.Close and CloseWithError block
-// only until CONNECTION_CLOSE has been handed to the carriers (at most about
-// one second); CancelRead, CancelWrite and Pipe.Close never block; Wait
+// stream's deadlines (Read, Write). Conn.Close blocks only until the
+// written data is flushed and CONNECTION_CLOSE has been handed to the
+// carriers (at most one second); Conn.Abort, CancelRead, CancelWrite and Pipe.Close never block; Wait
 // blocks until the session and all its goroutines ended. Conn.Context and Stream.Context are the
 // session's context.
 //
-// Closing: Conn.Close ends the session at once and discards data not yet
-// sent, and a process may exit as soon as it returns; Conn.Shutdown lets open streams finish first. Listener.Shutdown
+// Closing: Conn.Close flushes what the streams have written and ends the
+// session, and a process may exit as soon as it returns; Conn.Abort ends
+// it at once with an error code, discarding data not yet sent;
+// Conn.Shutdown lets open streams finish first. Listener.Shutdown
 // does the same for every session of a listener.
 //
 // Ownership: a Stream handle that is garbage-collected without being
@@ -85,7 +94,7 @@
 // # Names
 //
 // Constants carry the name of their type, or a short form of it, as a
-// prefix: Role (RoleClient), Direction (DirSendOnly), Framing
+// prefix: Role (RoleClient), Direction (DirectionSendOnly), Framing
 // (FramingRecords), Urgency (UrgencyDefault), EventKind (EventPipeJoined),
 // OutboundState (OutboundActive), Endpoint (EndpointLocal), Transport for
 // transport error codes (TransportProtocolViolation) and Stream for stream
@@ -97,28 +106,27 @@
 //
 // # Configuration
 //
-// Settings: the zero value of a field selects its default, stated in the
-// field's documentation; for timeouts and limits it is a safe bound unless
-// the field says otherwise. A negative timeout means no timeout, as for
-// http.Server.IdleTimeout, where the field allows it (JoinTimeout,
-// ResumeTimeout and JoinEarlyHello do not). Other negative values are an
-// error unless the field gives them a meaning. A value out of range is an
-// error, never corrected.
-//
-// The fields that give negative values a meaning follow the standard
-// library: KeepAlivePeriod turns keep-alive off (net.Dialer.KeepAlive),
-// SchedulerParams.ProbeInterval and StandbyProbe and
-// PipeOptions.ProbeInterval turn probes off (net.KeepAliveConfig), and
-// HTTPExchangeConfig.Coalesce sends at once
-// (httputil.ReverseProxy.FlushInterval). A memory budget is lifted with
-// NoMemoryLimit. Other settings that turn something off are Disable and
-// No fields, as in net/http (NoIncomingStreams, NoProbeJitter,
-// PoolDecision.DisableIdleProbe, QualityBand.NoMinInterval,
-// shaping.Limits.NoPadding, ...). Zero values that are not a safe bound:
-// shaping.Limits (zero is unbounded; the session's other limits still
-// apply), PipePool.Rotate (zero rotates nothing) and Config.ResumeTimeout
-// (zero is no resume). Errors are ErrInvalidConfig, from Start, Dial,
-// Client and Server before a byte is written, and from NewListener.
+// Settings: each setting is written one way. The zero value of a field
+// selects its default, stated in the field's documentation; for timeouts
+// and limits it is a safe bound unless the field says otherwise. A negative
+// value is the field's off, none, no timeout or unlimited setting where the
+// field has one, following the standard library (net.Dialer.KeepAlive,
+// http.Server.IdleTimeout): Liveness.KeepAlivePeriod, StandbyProbe and
+// ProbeInterval turn keep-alive and probes off, a negative ProbeJitter is
+// a jitter of 0, a negative MaxIncomingStreams grants no stream, a negative
+// MemoryBudget is unlimited, a negative SchedulerParams.Probation turns
+// probation off and a negative zmuxhttp.ExchangeConfig.Coalesce sends at once.
+// A negative value of a field without such a setting (JoinTimeout,
+// ResumeTimeout, the windows, MaxPipes) is an error. A feature that is on
+// by default is turned off with a Switch field set to SwitchOff
+// (EpochAfterFirstPipe, SchedulerParams.Redundancy, ...); one that is off
+// by default is a bool named for it (EnableDatagrams, ReturnOnReply).
+// Zero values that are not a safe bound: shaping.Limits (zero is
+// unbounded; the session's other limits still apply), PipePool.Rotate
+// (zero rotates nothing) and Config.ResumeTimeout (zero is no resume). A
+// value out of range is an error, never corrected. Errors are
+// ErrInvalidConfig, from Start, Dial, Client and Server before a byte is
+// written, and from NewListener.
 //
 // Multipath needs MaxPipes above 1 and a PipeAuth (PSK, DeferredPSK with
 // Conn.SetJoinSecret, or Exporter); a session whose first pipe is not on the secure

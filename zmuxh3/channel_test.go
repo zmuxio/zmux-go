@@ -14,6 +14,7 @@ import (
 	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 func dgCfg() *zmux.Config {
@@ -96,7 +97,7 @@ func TestWebTransportChannel(t *testing.T) {
 		QUICConfig: testQUIC()}
 	webtransport.ConfigureHTTP3Server(h3)
 	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
-	wh, err := Handler(ws, lst, nil)
+	wh, err := NewHandler(lst, nil, ws)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +119,7 @@ func TestWebTransportChannel(t *testing.T) {
 	}
 	// A second zmux session on another stream of the same WebTransport
 	// session: the session's datagrams are routed by Pipe Stream ID.
-	p2, err := OpenPipe(ctx, sess)
+	p2, err := SessionPipe(ctx, sess)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +133,7 @@ func TestWebTransportChannel(t *testing.T) {
 	}
 	roundTrip(t, c, s, "first")
 	roundTrip(t, c2, s2, "second")
-	if WebTransportChannelDropped(sess) != 0 {
+	if ChannelDropped(sess) != 0 {
 		t.Fatal("datagrams dropped")
 	}
 	for _, x := range []*zmux.Conn{c, c2, s, s2} {
@@ -269,11 +270,11 @@ func TestHTTP3Channel(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = pc.Close() }() // a server does not close what it was given
-	hh, err := zmux.NewHTTPHandler(lst, nil)
+	hh, err := zmuxhttp.NewHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewHTTP3Server("", srvTLS, testQUIC(), hh, nil)
+	srv := NewServer("", srvTLS, testQUIC(), hh, nil)
 	go func() { _ = srv.Serve(pc) }()
 	defer func() { _ = srv.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -316,18 +317,18 @@ func TestHTTP3ChannelFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = pc.Close() }() // a server does not close what it was given
-	hh, err := zmux.NewHTTPHandler(lst, nil)
+	hh, err := zmuxhttp.NewHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewHTTP3Server("", srvTLS, testQUIC(), hh, nil)
+	srv := NewServer("", srvTLS, testQUIC(), hh, nil)
 	go func() { _ = srv.Serve(pc) }()
 	defer func() { _ = srv.Close() }()
 	client, tr := HTTPClient(cliTLS, &quic.Config{HandshakeIdleTimeout: 30 * time.Second})
 	defer func() { _ = tr.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := zmux.HTTPPipe(ctx, client, "https://"+pc.LocalAddr().String()+"/", nil, zmux.DirBidirectional, nil)
+	p, err := zmuxhttp.StreamPipe(ctx, client, "https://"+pc.LocalAddr().String()+"/", nil, zmux.DirectionBidirectional, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -27,8 +27,8 @@ and datagram flows.
 
 | Module | Purpose |
 | --- | --- |
-| `github.com/zmuxio/zmux-go` | core protocol, TCP/TLS/HTTP carriers, any message carrier |
-| `github.com/zmuxio/zmux-go/zmuxquic` | QUIC carriers (quic-go) |
+| `github.com/zmuxio/zmux-go` | core protocol, TCP/TLS carriers, any message carrier; packages `zmuxhttp` (HTTP carriers), `admit` (admission helpers such as `PrefixAuth`) and `carrier` (utilities for carrier adapters) |
+| `github.com/zmuxio/zmux-go/zmuxquic` | QUIC carriers |
 | `github.com/zmuxio/zmux-go/zmuxh3` | HTTP/3 and WebTransport carriers |
 | `github.com/zmuxio/zmux-go/zmuxws` | WebSocket carriers |
 | `github.com/zmuxio/zmux-go/seal` | secure carrier: end-to-end handshake and record protection (experimental) |
@@ -109,24 +109,26 @@ listener you made: one that took a carrier runs a goroutine until then.
 rejects `MaxPipes` above 1 and `ResumeTimeout` with `ErrInvalidConfig`.
 
 In `Config` and the other configuration structs, the zero value of a field
-selects its stated default, a negative timeout means no timeout where the
-field says so, other negative values are invalid unless the field gives
-them a meaning, and the `Disable` and `No` fields switch features off. A
-value out of range is `ErrInvalidConfig`, never corrected. `JoinTimeout`
-(10 s) bounds every join and cannot be switched off; `HandshakeTimeout`
-bounds establishment only. `Config.Logger` (a `*slog.Logger`) receives the
+selects its stated default, and a negative value turns the setting off, or
+makes a limit unlimited, where the field has such a setting; other negative
+values are invalid. A feature that is on by default has a `Switch` field
+(`SwitchOff` turns it off). A value out of range is `ErrInvalidConfig`,
+never corrected. `JoinTimeout` (10 s) bounds every join and cannot be
+switched off; `HandshakeTimeout` bounds establishment only.
+`ListenerConfig.MaxPending` (1024 by default) bounds the carriers a
+listener holds before they belong to a session. `Config.Logger` (a `*slog.Logger`) receives the
 warnings an application would otherwise not see.
 
 ## Closing
 
-`Conn.Close` ends the session at once and discards data not yet sent, unlike
-`net.Conn.Close`. It returns once CONNECTION_CLOSE has been handed to every
-usable carrier (written to it; for a socket, taken into the kernel's send
-buffer), and after at most 1 s when a carrier does not take it, so a process
-may exit as soon as it returns. On a synchronous carrier such as `net.Pipe`
-a write completes only when the peer reads, so a peer that no longer reads
-makes `Close` wait the full second. `Wait` waits for the session's whole end.
-To let the peer read everything first:
+`Conn.Close` closes the session gracefully: it first sends what the streams
+have written, as far as flow control and the carriers allow, then hands
+CONNECTION_CLOSE to every usable carrier (written to it; for a socket, taken
+into the kernel's send buffer). It returns at the latest 1 s after the call,
+flushing included, so a process may exit as soon as it returns; what was not
+handed over by then is discarded. `Conn.Abort(code, reason)` ends the
+session at once with an application error and discards unsent data. `Wait`
+waits for the session's whole end. To let the peer read everything first:
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -203,7 +205,7 @@ for {
 	if err != nil {
 		return err
 	}
-	if ev.Kind == zmux.EventPipeFailed && ev.Pipe == p.ID() {
+	if ev.Kind == zmux.EventPipeFailed && ev.PipeID == p.ID() {
 		log.Println("backup path failed")
 	}
 }
@@ -212,10 +214,26 @@ for {
 The pointer fields of `PipeOptions` (`SendPriority`, `SendStandby`,
 `Weight`) are nil to follow the peer's request or the default; a set value,
 zero included, wins, so `Weight: new(uint64(0))` excludes the pipe from
-spreading. `Probation` is the base of a pipe's probation (zero: the
-session's `Config.SchedulerParams.Probation`, whose zero derives it from
-the RTT and the pipe's history); `NoProbation` turns it off, and both
-exist in `SchedulerParams` too. `PipeStats` reports per-pipe loss:
+spreading. `Direction` makes a pipe an uplink (`DirectionSendOnly`) or a
+downlink (`DirectionReceiveOnly`). `Probation` is the base of a pipe's
+probation (zero: the session's `Config.SchedulerParams.Probation`, whose
+zero derives it from the RTT and the pipe's history; negative: off).
+`Pipe.Update` changes a live pipe's settings in one call, each field a
+`zmux.Set(v)` or a `zmux.Clear` that returns it to the peer's request or
+the session's default:
+
+```go
+err := p.Update(zmux.PipeUpdate{SendStandby: zmux.Set(false), Weight: zmux.Clear[uint64]()})
+```
+
+`Config.Scheduler` picks how records spread over pipes:
+`SchedulerAffinity()`, `SchedulerSessionAffinity()`, `SchedulerSpreadETA()`,
+`SchedulerSpreadRoundRobin()`, `SchedulerSpreadRateWeighted()` or
+`SchedulerCustom(pick)`. Every pipe has a `PipeID`, which events
+(`Event.PipeID`) and statistics name. `Conn.ReplacePipes(ctx)` replaces every
+pipe through `Config.Redial`, make before break, after a session secret may
+have leaked. On the server, `zmux.AdmittedAs[T](conn)` (or a `*Pipe`)
+returns the value the admission attached to the carrier. `PipeStats` reports per-pipe loss:
 `BytesLost` and `RecordsLost` when a pipe fails, `BytesRetransmitted` and
 `LossRate` from the carrier's own retransmissions; see the godoc for
 their exact definitions.
@@ -252,10 +270,13 @@ if err != nil {
 // survive a carrier that fails and is redialled within 30 s.
 ```
 
-Liveness can change while a session runs: `Conn.SetLiveness` replaces the
-keep-alive period and the failure-detection and probe settings as a whole
-(zero fields are the defaults, `Conn.Liveness` returns the values in
-effect), `Pipe.SetLiveness` and `ClearLiveness` set or drop a pipe's own.
+`Config.Liveness` holds the keep-alive period and the failure-detection
+and probe settings; `Conn.SetLiveness` replaces them as a whole while the
+session runs (zero fields are the defaults, negative ones off, and
+`Conn.Liveness` returns the values in effect). A pipe's own `PipeLiveness`
+is set with `PipeOptions.Liveness`, or later with
+`Pipe.Update(zmux.PipeUpdate{Liveness: zmux.Set(pl)})`, and dropped with
+`zmux.Clear[zmux.PipeLiveness]()`.
 A pipe already suspect keeps the dead timeout it turned suspect under.
 `Conn.RaiseIncomingStreams` raises the incoming stream limits, for example
 after the peer has authenticated; the limits only grow.
@@ -271,7 +292,10 @@ accepted as its draft-01 alias.
 ```go
 // server: upgrades go to l; other requests, and those the admission
 // does not accept, to Next
-h, err := zmuxws.Handler(l, &zmux.HTTPOptions{Next: site})
+h, err := zmuxws.NewHandler(l, &zmuxhttp.Options{Next: site})
+if err != nil {
+	return nil, err
+}
 http.Handle("/zmux", h)
 
 // client
@@ -282,10 +306,10 @@ Nothing is answered before a request is accepted: a request that is not a
 WebSocket upgrade, or offers no accepted subprotocol, goes to `Next`, and
 the admission decides on the upgrade request's head. A client's
 credential travels in the upgrade request: `Dial` presents
-`Config.Credential` and `DialPipe` `DialOptions.Credential`, for a
-`PrefixAuth` in its `Zmux-Prefix-Auth` field, which
-`PrefixAuthVerifier.Decide` checks.
-`DialPipe` opens a further pipe for `AddPipe`, and `zmuxws.Pipe` adapts a
+`Config.CarrierCredential` and `DialPipe` `DialOptions.CarrierCredential`,
+for an `admit.PrefixAuth` in its `Zmux-Prefix-Auth` field, which
+`admit.PrefixAuthVerifier.Decide` checks.
+`DialPipe` opens a further pipe for `AddPipe`, and `zmuxws.ConnPipe` adapts a
 WebSocket connection established otherwise. A close frame ends a pipe
 gracefully; an aborted pipe closes the connection without one.
 
@@ -301,15 +325,20 @@ binding or a client that pins the server proves the TLS end to end.
 ## Protected carriers (experimental)
 
 The `seal` module runs a handshake on a session's first carrier and takes the session's
-secret from it. Each carrier has a record mode: Sealed protects every record end to end
-where an intermediary terminates the carrier's TLS, Bound leaves records to a carrier that
-protects them and binds its exporter, and Trusted leaves them to the deployment. Further
+secret from it. Each carrier has a record mode (`PipeOptions.RecordMode`): `RecordSealed`
+protects every record end to end where an intermediary terminates the carrier's TLS,
+`RecordBound` leaves records to a carrier that protects them and binds its exporter, and
+`RecordTrusted` leaves them to the deployment. Further
 carriers join the session in any mode the acceptor allows. The wire format and the API are
 experimental and may change.
 
 ```go
 server := &seal.ServerConfig{Gate: gate, Key: nodeKey}
 l, err := zmux.NewListener(&zmux.ListenerConfig{WrapPipe: server}) // validates server
+if err != nil {
+	return nil, err
+}
+defer func() { _ = l.Close() }()
 
 ctx, cancel := context.WithTimeout(ctx, 10*time.Second) // a refused handshake gets no reply
 defer cancel()
@@ -318,12 +347,15 @@ p, err := seal.Establish(ctx, carrier, &seal.ClientConfig{
 	Handle: handle,
 	PSK:    psk,
 })
+if err != nil {
+	return nil, err
+}
 conn, err := zmux.Start(ctx, p, zmux.RoleClient, cfg)
 ```
 
 `Gate` decides who may establish on the server and `Anchor` whom the client trusts. An
 `Anchor` judges the peer's static key, its one opaque credential and the PSK identity, and
-its `Verdict` can require a transcript signature, which makes the peer post-quantum
+its `VerifyVerdict` can require a transcript signature, which makes the peer post-quantum
 authenticated (`RequirePQAuth` insists on it). Both ends can exchange opaque application
 data in the handshake through `AppData` callbacks. A server refuses silently, so a refused
 client fails with `seal.ErrNoReply`; a rejected peer fails with an error matching `seal.ErrVerifyRejected`,
@@ -338,7 +370,7 @@ sequence of short POST requests. The server mounts a handler in front of
 its `Listener`:
 
 ```go
-h, err := zmux.NewHTTPExchangeHandler(l, nil, &zmux.HTTPExchangeConfig{PSK: psk})
+h, err := zmuxhttp.NewExchangeHandler(l, nil, &zmuxhttp.ExchangeConfig{PSK: psk})
 if err != nil {
 	return err
 }
@@ -349,8 +381,8 @@ http.Handle("/x/", h)
 and the client opens the carrier with the same PSK:
 
 ```go
-p, err := zmux.HTTPExchangePipe(ctx, client, "https://example.com/x/{instance}/{nonce}",
-	&zmux.HTTPExchangeConfig{PSK: psk})
+p, err := zmuxhttp.ExchangePipe(ctx, client, "https://example.com/x/{instance}/{nonce}",
+	&zmuxhttp.ExchangeConfig{PSK: psk})
 if err != nil {
 	return err
 }
@@ -375,7 +407,7 @@ recovered. Every request carries its send time and a random nonce: the
 server takes a request only within `MaxClockSkew` of its own clock and only
 once per (carrier ID, nonce), so both ends need roughly synchronized
 clocks. Requests it does not take go to `Next` (`http.NotFound` without
-one), with their body; `HTTPExchangeConfig` documents the timers, sizes and limits and
+one), with their body; `zmuxhttp.ExchangeConfig` documents the timers, sizes and limits and
 their defaults. Keep the server's `HoldTime` below every intermediary's
 response timeout, and the client transport's `MaxIdleConnsPerHost` at least
 `DownRequests+UpRequests`.
@@ -394,50 +426,59 @@ bodies passes only the exchange carrier, and some fronts pass WebSocket
 only. The server can serve every kind on one target, and the client can
 choose among them.
 
-**One endpoint.** `HTTPEndpoint` classifies each request by its head
-(`ClassifyHTTP`) and hands it to the adapter of its class; requests that
-are not carriers, and those an adapter's admission does not take, go to
-the host's handler with their body. The endpoint and its adapters share
-one `HTTPOptions`:
+**One endpoint.** `zmuxhttp.Endpoint` classifies each request by its head
+(`zmuxhttp.Options.Classify`) and hands it to the adapter of its class;
+requests that are not carriers, and those an adapter's admission does not
+take, go to the host's handler with their body. The endpoint and its
+adapters share one `zmuxhttp.Options`:
 
 ```go
-o := &zmux.HTTPOptions{Next: site, Trusted: trusted}
-stream, err := zmux.NewHTTPHandler(l, o)
-ex, err := zmux.NewHTTPExchangeHandler(l, o, &zmux.HTTPExchangeConfig{PSK: psk})
-ws, err := zmuxws.Handler(l, o)
-http.Handle("/zmux", &zmux.HTTPEndpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
+o := &zmuxhttp.Options{Next: site, Trusted: trusted}
+stream, err := zmuxhttp.NewHandler(l, o)
+if err != nil {
+	return err
+}
+ex, err := zmuxhttp.NewExchangeHandler(l, o, &zmuxhttp.ExchangeConfig{PSK: psk})
+if err != nil {
+	return err
+}
+ws, err := zmuxws.NewHandler(l, o)
+if err != nil {
+	return err
+}
+http.Handle("/zmux", &zmuxhttp.Endpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
 ```
 
 Its `WebTransport` field takes a WebTransport handler such as
-`zmuxh3.Handler` for the WebTransport sessions served on the same target.
+`zmuxh3.NewHandler` for the WebTransport sessions served on the same target.
 
-**Choosing a carrier.** `DialMode` takes a mode: `ExplicitMode(c)` uses one
-kind and reports its failure as it is; `AutoMode(c...)` tries candidates in
+**Choosing a carrier.** `DialChoice` takes a `CarrierChoice`: `ExplicitChoice(c)` uses one
+kind and reports its failure as it is; `AutoChoice(c...)` tries candidates in
 order of preference and keeps the first whose peer answers within a short
 timer, without early data and without racing them. With `Config.MaxPipes`
 above 1 it establishes the session on the most robust kind (the exchange
 carrier unless a kind is known to work) and moves the session to preferred
 kinds by joining them as further pipes, without a second session. A
-`CarrierCache` in `ModePolicy` remembers per server and local network which
+`CarrierCache` in `CarrierChoicePolicy` remembers per server and local network which
 kinds worked; a kind that failed, or dropped soon after it was chosen, is
 skipped until its backoff expires. Each try and the choice are reported as
 `EventCarrierCandidate` and `EventCarrierChosen`, and in `ConnectionStats`.
 `CarrierCache.Snapshot` and `Restore` carry what it knows across restarts
 as versioned JSON. The moves to preferred kinds are a `PipePool` with a
-`Mode`: each member is dialed over the most robust kind available and
+`Choice`: each member is dialed over the most robust kind available and
 rotated to a preferred one, make before break, so `MaintainPipes` can keep
 a session's further pipes on the best kind a path passes.
 
 ```go
-conn, err := zmux.DialMode(ctx, zmux.AutoMode(
+conn, err := zmux.DialChoice(ctx, zmux.AutoChoice(
 	zmuxws.Candidate("wss://example.com/zmux", nil),
-	zmux.StreamingCandidate(client, "https://example.com/zmux", nil),
-	zmux.SplitCandidate(client, "https://example.com/zmux", nil),
-	zmux.ExchangeCandidate(client, "https://example.com/zmux", &zmux.HTTPExchangeConfig{PSK: psk}),
-), cfg, &zmux.ModePolicy{Cache: cache, Key: "example.com|" + network})
+	zmuxhttp.StreamCandidate(client, "https://example.com/zmux", nil),
+	zmuxhttp.SplitCandidate(client, "https://example.com/zmux", nil),
+	zmuxhttp.ExchangeCandidate(client, "https://example.com/zmux", &zmuxhttp.ExchangeConfig{PSK: psk}),
+), cfg, &zmux.CarrierChoicePolicy{Cache: cache, Key: "example.com|" + network})
 ```
 
-`zmuxquic.Candidate` and `zmuxh3.WebTransportCandidate` add the kinds a
+`zmuxquic.Candidate` and `zmuxh3.Candidate` (WebTransport) add the kinds a
 client can use when it reaches the server directly, and
 `zmuxh3.HTTP3Candidate` a streaming request over HTTP/3. A carrier kind
 describes only this end's hop, not what lies beyond its first peer.
@@ -445,7 +486,7 @@ describes only this end's hop, not what lies beyond its first peer.
 **Client addresses.** Behind a proxy every carrier comes from the proxy's
 address. `TrustedProxies` names the proxies whose report of the client
 address is believed: its `Listener` wraps a `net.Listener` that receives
-the PROXY protocol from them, and `HTTPOptions.Trusted` reads the
+the PROXY protocol from them, and `zmuxhttp.Options.Trusted` reads the
 forwarding header field they set.
 The reported address is then the source that admissions see and that the
 listener's per-source limits count; the same report from any other peer is
@@ -503,7 +544,7 @@ location /zmux {
   completes; the adapters answer those carrier requests 425 as well.
 - Idle limits: proxies end requests that stay silent (60 s by default for
   the read and send timeouts, 30 s to 125 s for a CDN's response): keep
-  `Config.KeepAlivePeriod` (15 s by default, at most half the idle timeout; negative turns it off)
+  `Config.Liveness.KeepAlivePeriod` (15 s by default, at most half the idle timeout; negative turns it off)
   and, with multipath, the probe interval below the shortest limit on the
   path, and the
   exchange server's `HoldTime` below the CDN's response timeout.
@@ -513,18 +554,18 @@ location /zmux {
 An `Admission` is configured on the listener (`ListenerConfig.Admission`)
 and decides on every carrier of it before anything is sent on it,
 whatever entry point took it: `Listener.Serve` and `HandlePipe`,
-`NewHTTPHandler`, the exchange handler, `zmuxws.Handler`, `zmuxh3.Handler`
-and `zmuxquic.Serve`. Every entry runs the same steps: the carrier takes a
-slot of its source (`MaxPendingPerSource`) before its outer handshake
+`zmuxhttp.NewHandler`, the exchange handler, `zmuxws.NewHandler`,
+`zmuxh3.NewHandler` and `zmuxquic.Serve`. Every entry runs the same steps: the carrier takes a
+slot of the listener (`MaxPending`) and of its source (`MaxPendingPerSource`) before its outer handshake
 (TLS, an HTTP upgrade, QUIC), the admission reads up to `Peek` bytes (on a
 message-framed carrier its first message) and
 calls `Decide` with them and the carrier's metadata (`CarrierInfo`: its
 `Source` and `Peer`, TLS state, HTTP request), then `WrapPipe` runs and the
 carrier is classified. `Decide` gets a context that ends with what remains
-of `PeekTimeout` and when the listener stops. It accepts the carrier
+of `PeekTimeout` and when the listener stops. Its `AdmissionVerdict` accepts the carrier
 (without the bytes it skips), hands it with every byte read to the
 fallback of its kind (`ListenerConfig.Fallback` for byte streams,
-`HTTPOptions.Next` for HTTP, the `fallback` of `zmuxquic.Serve`), stalls
+`zmuxhttp.Options.Next` for HTTP, the `fallback` of `zmuxquic.Serve`), stalls
 it, or closes it; `VerdictMore` reads a longer prefix (up to `MaxPeek`)
 and decides again, and `Decision.Variant` labels the carrier, counted per
 label in `Listener.VariantStats` (one of a few host constants, never derived
@@ -533,43 +574,49 @@ carriers, and a stall lasts the same duration for every carrier from one
 source during the listener's lifetime (`Listener.StallDuration`).
 `ListenerStats.Admission` counts the outcomes. An adapter with its own
 accept loop takes a carrier with `Listener.Arrive` (`AdmitUpgrade` for an
-HTTP upgrade) and hands it on with `Arrival.HandlePipe`. `PrefixAuth` is one `Decide`: a carrier starts with a token of
-`PrefixTokenLen` bytes, optionally bound to its TLS handshake; a carrier
+HTTP upgrade) and hands it on with `Arrival.HandlePipe`. `admit.PrefixAuth` is one `Decide`: a carrier starts with a token of
+`admit.PrefixTokenLen` bytes, optionally bound to its TLS handshake; a carrier
 decided on its request head (a WebSocket or WebTransport upgrade, an HTTP
 request carrier without a body such as a downlink `GET`) carries it in
-the `Zmux-Prefix-Auth` request field instead (`HeaderPrefixAuth`, 43
+the `Zmux-Prefix-Auth` request field instead (`admit.HeaderPrefixAuth`, 43
 characters of base64url). The same `Admission` serves both:
 
 ```go
-auth := &zmux.PrefixAuth{Key: key, Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-v, err := zmux.NewPrefixAuthVerifier(auth)
+auth := &admit.PrefixAuth{Key: key, Slot: 30 * time.Second, Skew: 1, BindTLS: true}
+v, err := admit.NewPrefixAuthVerifier(auth)
+if err != nil {
+	return nil, err
+}
 l, err := zmux.NewListener(&zmux.ListenerConfig{Config: cfg,
-	Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}, Fallback: fallback})
+	Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide}, Fallback: fallback})
+if err != nil {
+	return nil, err
+}
 go func() { _ = l.Serve(ctx, tls.NewListener(ln, tlsConf)) }()
 
-// client: Config.Credential is presented by the dialers
-conn, err := zmux.DialTLS(ctx, "tcp", addr, tlsConf, &zmux.Config{Credential: auth})
+// client: Config.CarrierCredential is presented by the dialers
+conn, err := zmux.DialTLS(ctx, "tcp", addr, tlsConf, &zmux.Config{CarrierCredential: auth})
 ```
 
-A `Credential` is the client side of an admission: `Prefix` gives the
+A `CarrierCredential` is the client side of an admission: `Prefix` gives the
 first bytes of a carrier, `Header` the request field of a carrier decided
 on its request head, each
 from the carrier's metadata (`CarrierInfo`, with its TLS state for a
 binding). `Client`, `Dial`, `DialTLS`, `zmuxquic.Dial` and `Client`,
-`zmuxws.Dial` and `zmuxh3.Dial` present `Config.Credential`; the pipe
-dialers for joins take theirs in `zmuxws.DialOptions.Credential`,
+`zmuxws.Dial` and `zmuxh3.Dial` present `Config.CarrierCredential`; the pipe
+dialers for joins take theirs in `zmuxws.DialOptions.CarrierCredential`,
 `zmuxquic.NewPool`, `zmuxh3.NewPool` and `zmuxh3.DialSession`;
-`HTTPPipe` and `HTTPSplitPipe` take one (unbound: the request's connection
+`zmuxhttp.StreamPipe` and `zmuxhttp.SplitPipe` take one (unbound: the request's connection
 is not known in advance), and `PresentPipe` presents one on any other
 byte-stream pipe.
 
-A split bootstrap (`HTTPSplitPipe`, `SplitCandidate`) holds its first half
+A split bootstrap (`zmuxhttp.SplitPipe`, `zmuxhttp.SplitCandidate`) holds its first half
 in a pairing slot until the other half arrives or the handshake timeout
 ends: 64 slots per listener and 8 per source ([pairing a split bootstrap](https://github.com/zmuxio/zmux-spec/blob/main/SPEC.md#611-pairing-a-split-bootstrap)), counted by
 the source that `MaxPendingPerSource` counts (an IPv6 client by its /64).
 Without an `Admission`, a few sources can keep those slots full and delay
 other clients' split bootstraps; serve a split bootstrap that the open
-Internet reaches with an `Admission`, such as `PrefixAuth`.
+Internet reaches with an `Admission`, such as `admit.PrefixAuth`.
 
 
 ## Carrier transforms
@@ -578,7 +625,7 @@ A transform (compression, a byte transform, a handshake of its own) wraps
 a carrier on both ends with the public API alone: the client in a
 `Candidate`'s `Dial` (or before `Start`, `AddPipe`), the server in
 `ListenerConfig.WrapPipe`, after an `Admission` that tells its first bytes
-from a zmux first record (`ClassifyFirstBytes`, `VerdictMore`,
+from a zmux first record (`admit.ClassifyFirstBytes`, `VerdictMore`,
 `Decision.Variant`). A batch of records is one write on the wrapped half
 (one `WriteMessages` on a message-framed `MessageBatchWriter`). The halves
 offer capabilities as interfaces (`CloseWriter`, `Aborter`,
@@ -586,7 +633,7 @@ offer capabilities as interfaces (`CloseWriter`, `Aborter`,
 meaning survives. A transform whose first message carries the client's
 first flight uses `EarlyData.HoldFirstFlight` with `Conn.ReleaseFirstFlight`
 and reports the server's verdict as carrier early data
-(`EarlyClientCarrier.SendsEarlyData`); `ReplayFilter` is the single-use
+(`EarlyClientCarrier.SendsEarlyData`); `admit.ReplayFilter` is the single-use
 cache for its nonces, checked only after the nonce and its timestamp were
 authenticated together. `PipeIO.Variant` labels the carriers
 in events, statistics, shaping and `CarrierCache` (with
@@ -599,7 +646,7 @@ in events, statistics, shaping and `CarrierCache` (with
 conn, err := zmuxquic.Dial(ctx, "example.com:4433", tlsConf, nil, nil)
 ```
 
-On the server, `zmuxquic.Serve(ctx, ln, l, nil)` hands the streams of a QUIC
+On the server, `zmuxquic.Serve(ctx, l, ln, nil)` hands the streams of a QUIC
 listener to a `zmux.Listener`; `zmuxquic.ServeConn` serves one QUIC
 connection the caller already accepted or dialled, such as one made by hole
 punching. `zmuxh3.Dial` and `zmuxh3.Serve` do the same for WebTransport
@@ -609,7 +656,9 @@ The default dialer of `zmuxquic.Dial` and `NewPool` binds `udp4` or `udp6`
 by the destination's address family. Native QUIC 0-RTT streams are
 currently created only after the handshake completes; zmux's own
 replayable startup and resumption are not affected. A `quic.Conn` passed
-to `Client` or `OpenPipe` stays owned by the caller.
+to `zmuxquic.Client` or `zmuxquic.ConnPipe` stays owned by the caller.
+`zmuxh3.SessionPipe` and `zmuxh3.StreamPipe` do the same for a WebTransport
+session or stream.
 
 ## Datagram channels
 
@@ -622,27 +671,29 @@ changes for the application: the same calls, sizes and queues; larger
 datagrams, pipes whose records are shaped, and peers without the channel
 use records. `ConnectionStats` counts the datagrams that went on channels
 (`DatagramsSentChannel`, `DatagramsReceivedChannel`), and
-`zmuxquic.ChannelDropped` the QUIC datagrams that named no attached pipe.
+`zmuxquic.ChannelDropped` and `zmuxh3.ChannelDropped` the datagrams that
+named no attached pipe.
 
 - QUIC: the connection's QUIC datagrams, each naming its pipe by stream
-  ID, so several pipes and sessions share a connection. `QUICConfig`
+  ID, so several pipes and sessions share a connection. `zmuxquic.Config`
   enables them; a connection that carries pipes leaves its datagrams to
   zmux.
 - WebTransport: the session's datagrams, named the same way.
 - HTTP/3: the HTTP Datagrams of a bidirectional carrier's request stream.
-  `NewHTTP3Server` enables them (`HTTP3Handler` wraps the handler of any
-  other HTTP/3 server); both take the `HTTPOptions` of the zmux handler. Pipes opened with an `http.Client`, as
-  `HTTP3Candidate` does, keep datagrams in records.
+  `zmuxh3.NewServer` enables them (`zmuxh3.HTTP3Handler` wraps the handler
+  of any other HTTP/3 server); both take the `zmuxhttp.Options` of the zmux
+  handler. Pipes opened with an `http.Client`, as `zmuxh3.HTTP3Candidate`
+  does, keep datagrams in records.
 
 A carrier of another kind offers its own channel by implementing
-`zmux.DatagramChannel` on a half of its `PipeIO`; `zmux.ChannelDemux`
+`zmux.DatagramChannel` on a half of its `PipeIO`; `carrier.ChannelDemux`
 routes the datagrams of a connection shared by several pipes.
 
 ## Shaping
 
 `Config.Shaper`, `Config.HandshakeShaper`, `Config.ShapingLimits` and
-`Config.ShapingBudget` take hooks and bounds for the sizes and timing of what a session writes, and `PipePool.Policy` and
-`CarrierPool.Policy` a pool's decisions (packages `shaping` and `shaping/machine`,
+`Config.ShapingBudget` take hooks and bounds for the sizes and timing of what a session writes, and `PipePool.Policy`,
+`Config.RedialPolicy` and `carrier.Pool.Policy` a pool's decisions (packages `shaping` and `shaping/machine`,
 `shaping/bundle`).
 
 ## More

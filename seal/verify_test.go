@@ -24,17 +24,17 @@ type credAnchor struct {
 	err   error
 }
 
-func (a credAnchor) Verify(_ context.Context, in seal.VerifyInput) (seal.Verdict, error) {
+func (a credAnchor) Verify(_ context.Context, in seal.VerifyInput) (seal.VerifyVerdict, error) {
 	if a.got != nil {
 		*a.got = in
 	}
 	if a.err != nil {
-		return seal.Verdict{}, a.err
+		return seal.VerifyVerdict{}, a.err
 	}
 	if in.Credential == nil || in.Credential.Type != 7 || string(in.Credential.Data) != "ok" {
-		return seal.Verdict{}, errors.New("no credential of type 7")
+		return seal.VerifyVerdict{}, errors.New("no credential of type 7")
 	}
-	return seal.Verdict{Principal: seal.Principal{Type: 9, Bytes: []byte("node")}, ProofKey: a.proof}, nil
+	return seal.VerifyVerdict{Principal: seal.Principal{Type: 9, Bytes: []byte("node")}, ProofKey: a.proof}, nil
 }
 
 // The Anchor gets the credential, the PSK identity and the local context; the
@@ -67,8 +67,8 @@ func TestVerifyAndTranscriptSignature(t *testing.T) {
 	if !cpeer.PQAuthenticated || !speer.PQAuthenticated || !cpeer.PQConfidential || string(cpeer.Verdict.Principal.Bytes) != "node" {
 		t.Fatalf("client %+v server %+v", cpeer, speer)
 	}
-	if !bytes.Equal(gotC.PSKIdentity, f.handle) || gotC.LocalContext != "dialer B" || gotC.Role != seal.RoleServer ||
-		gotS.LocalContext != "listener A" || gotS.Role != seal.RoleClient || len(g.asked) != 1 || g.asked[0].LocalContext != "listener A" {
+	if !bytes.Equal(gotC.PSKIdentity, f.handle) || gotC.LocalContext != "dialer B" || gotC.Role != zmux.RoleServer ||
+		gotS.LocalContext != "listener A" || gotS.Role != zmux.RoleClient || len(g.asked) != 1 || g.asked[0].LocalContext != "listener A" {
 		t.Fatalf("inputs %+v %+v %+v", gotC, gotS, g.asked)
 	}
 	if len(g.commits) != 1 || g.commits[0].Peer != speer {
@@ -168,9 +168,9 @@ func TestPinPQAuth(t *testing.T) {
 // before it returns.
 type cancelAnchor struct{ cancel context.CancelFunc }
 
-func (a cancelAnchor) Verify(context.Context, seal.VerifyInput) (seal.Verdict, error) {
+func (a cancelAnchor) Verify(context.Context, seal.VerifyInput) (seal.VerifyVerdict, error) {
 	a.cancel()
-	return seal.Verdict{Principal: seal.Principal{Type: 9, Bytes: []byte("node")}}, nil
+	return seal.VerifyVerdict{Principal: seal.Principal{Type: 9, Bytes: []byte("node")}}, nil
 }
 
 // A context cancelled once Verify passed fails WrapPipe with its error and
@@ -215,7 +215,7 @@ func TestVerifyThenCancel(t *testing.T) {
 // secretPanic panics with a value that must not reach the error text.
 type secretPanic struct{}
 
-func (secretPanic) Verify(context.Context, seal.VerifyInput) (seal.Verdict, error) {
+func (secretPanic) Verify(context.Context, seal.VerifyInput) (seal.VerifyVerdict, error) {
 	panic("token=hunter2")
 }
 

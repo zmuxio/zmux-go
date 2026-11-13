@@ -100,7 +100,7 @@ func closeExitChild(addr string) {
 	if _, err := c.Ping(ctx); err != nil {
 		os.Exit(4)
 	}
-	_ = c.CloseWithError(7, "bye")
+	c.closeGraceful(7, "bye") // Close with an application code
 	_ = c.Close()
 	os.Exit(0)
 }
@@ -179,8 +179,48 @@ func TestCloseHandOffLimit(t *testing.T) {
 	})
 }
 
+// A Close after an Abort returns at once, as the Abort did, though the
+// carrier has not taken the Abort's CONNECTION_CLOSE.
+func TestCloseAfterAbortReturnsAtOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		a, b := net.Pipe()
+		sc := &stallConn{Conn: a, closed: make(chan struct{})}
+		ch := make(chan *Conn, 1)
+		go func() {
+			s, err := Server(ctx, b, &Config{Clock: timeshim.Real})
+			if err != nil {
+				s = nil
+			}
+			ch <- s
+		}()
+		client, err := Client(ctx, sc, &Config{Clock: timeshim.Real})
+		if err != nil {
+			t.Fatal(err)
+		}
+		server := <-ch
+		if server == nil {
+			t.Fatal("no server session")
+		}
+		defer func() { _ = server.Close(); _ = server.Wait() }()
+		if _, err := client.Ping(ctx); err != nil {
+			t.Fatal(err)
+		}
+		sc.stall.Store(true)
+		t0 := time.Now()
+		client.Abort(7, "abort")
+		_ = client.Close()
+		if d := time.Since(t0); d != 0 {
+			t.Fatalf("Abort then Close took %v", d)
+		}
+		_ = client.Wait()
+	})
+}
+
 // On a synchronous carrier (net.Pipe), which has no half-close, Close
-// drains until the linger timeout, within the close limit.
+// returns at the hand-off, within the close limit, and the session drains
+// in the background until the linger timeout.
 func TestCloseHandOffSyncCarrier(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -207,10 +247,13 @@ func TestCloseHandOffSyncCarrier(t *testing.T) {
 		}
 		t0 := time.Now()
 		_ = client.Close()
-		if d := time.Since(t0); d == 0 || d > closeLimit {
+		if d := time.Since(t0); d > closeLimit {
 			t.Fatalf("Close took %v", d)
 		}
 		_ = client.Wait()
+		if d := time.Since(t0); d == 0 {
+			t.Fatal("the session ended without lingering")
+		}
 		_ = server.Close()
 		_ = server.Wait()
 	})
@@ -230,10 +273,10 @@ func (r *resetSpy) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// A server that closes with a code while the peer keeps writing, and
-// drops its socket as soon as CloseWithError returns (a process exit),
-// ends the TCP connection with a FIN, not a reset: the peer reads the
-// close code.
+// A server that aborts with a code while the peer keeps writing, and
+// drops its socket once its session has ended (the background half-close
+// and linger), ends the TCP connection with a FIN, not a reset: the peer
+// reads the close code.
 func TestCloseUnderPeerWritesNoReset(t *testing.T) {
 	leakcheck.Check(t)
 	for i := range 5 {
@@ -301,8 +344,9 @@ func closeUnderPeerWrites(t *testing.T, round int) {
 		}
 	})
 	time.Sleep(100 * time.Millisecond) // the peer writes at full speed
-	_ = server.CloseWithError(9, "bye")
-	_ = sr.nc.Close() // the process exits: unread data would reset
+	server.Abort(9, "bye")
+	_ = server.Wait() // the background half-close and linger
+	_ = sr.nc.Close() // then the process exits: no unread data resets
 	err = client.Wait()
 	var ae *ApplicationError
 	if !errors.As(err, &ae) || ae.ErrorCode != 9 {
@@ -311,7 +355,6 @@ func closeUnderPeerWrites(t *testing.T, round int) {
 	if spy.reset.Load() {
 		t.Fatalf("round %d: the peer's carrier was reset", round)
 	}
-	_ = server.Wait()
 	wg.Wait()
 }
 

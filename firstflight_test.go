@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 // writeLog is a sending half (a layer, no net.Conn) that records each
@@ -30,7 +32,7 @@ func (w *writeLog) Write(b []byte) (int, error) {
 }
 
 func (w *writeLog) WriteBuffers(bufs [][]byte) (int, error) {
-	return WriteFlat(w, bufs)
+	return carrierio.WriteFlat(w, bufs)
 }
 
 func (w *writeLog) Close() error { return w.c.Close() }
@@ -96,7 +98,7 @@ func TestHoldFirstFlight(t *testing.T) {
 	}
 	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
 	first := wl.log()[0]
-	if cls, _ := ClassifyFirstBytes(first, FramingByteStream); cls != FirstBytesRecord || !bytes.Contains(first, hello) {
+	if cls, _ := wire.ClassifyFirstBytes(first, false); cls != wire.FirstRecord || !bytes.Contains(first, hello) {
 		t.Fatalf("first write %x", first)
 	}
 	ss, err := s.AcceptStream(ctx)

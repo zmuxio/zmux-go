@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"bytes"
@@ -15,7 +15,8 @@ import (
 	"time"
 
 	"github.com/djylb/netx/proxyproto"
-
+	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
@@ -41,42 +42,42 @@ func TestClassifyHTTP(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		r    *http.Request
-		want HTTPClass
+		want Class
 	}{
-		{"websocket", req(http.MethodGet, map[string]string{"Upgrade": "WebSocket", "Connection": "Upgrade"}, nil, 0), HTTPClassWebSocket},
-		{"extended connect websocket", h2ws, HTTPClassWebSocket},
-		{"webtransport", h3, HTTPClassWebTransport},
-		{"webtransport draft", h3draft, HTTPClassWebTransport},
-		{"other webtransport-*", h3other, HTTPClassNone},
-		{"downlink pair", req(http.MethodGet, map[string]string{HeaderPair: "x"}, nil, 0), HTTPClassDownlink},
-		{"plain get", req(http.MethodGet, nil, nil, 0), HTTPClassNone},
-		{"split uplink", req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, -1), HTTPClassUplink},
-		{"split uplink with a length", req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, 1), HTTPClassUplink},
-		{"exchange", req(http.MethodPost, nil, body, 1), HTTPClassExchange},
-		{"bidirectional", req(http.MethodPost, nil, body, -1), HTTPClassBidirectional},
-		{"put", req(http.MethodPut, nil, body, -1), HTTPClassNone},
-		{"plain connect", req(http.MethodConnect, nil, nil, -1), HTTPClassNone},
+		{"websocket", req(http.MethodGet, map[string]string{"Upgrade": "WebSocket", "Connection": "Upgrade"}, nil, 0), ClassWebSocket},
+		{"extended connect websocket", h2ws, ClassWebSocket},
+		{"webtransport", h3, ClassWebTransport},
+		{"webtransport draft", h3draft, ClassWebTransport},
+		{"other webtransport-*", h3other, ClassNone},
+		{"downlink pair", req(http.MethodGet, map[string]string{HeaderPair: "x"}, nil, 0), ClassDownlink},
+		{"plain get", req(http.MethodGet, nil, nil, 0), ClassNone},
+		{"split uplink", req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, -1), ClassUplink},
+		{"split uplink with a length", req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, 1), ClassUplink},
+		{"exchange", req(http.MethodPost, nil, body, 1), ClassExchange},
+		{"bidirectional", req(http.MethodPost, nil, body, -1), ClassBidirectional},
+		{"put", req(http.MethodPut, nil, body, -1), ClassNone},
+		{"plain connect", req(http.MethodConnect, nil, nil, -1), ClassNone},
 	} {
-		if got := ClassifyHTTP(c.r); got != c.want {
+		if got := Classify(c.r); got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
 }
 
-// unifiedEnv is a listener behind an HTTPEndpoint that serves stream and
+// unifiedEnv is a listener behind an Endpoint that serves stream and
 // exchange carriers on one target, with a host handler that records what
 // it was given.
 type unifiedEnv struct {
-	lst  *Listener
-	ex   *HTTPExchangeHandler
+	lst  *zmux.Listener
+	ex   *ExchangeHandler
 	srv  *httptest.Server
 	mu   sync.Mutex
 	host []string // "METHOD body" of the complete requests the host served
 }
 
-func newUnifiedEnv(t *testing.T, adm *Admission, trusted *TrustedProxies) *unifiedEnv {
+func newUnifiedEnv(t *testing.T, adm *zmux.Admission, trusted *zmux.TrustedProxies) *unifiedEnv {
 	t.Helper()
-	e := &unifiedEnv{lst: mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})}
+	e := &unifiedEnv{lst: mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})}
 	host := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -91,16 +92,16 @@ func newUnifiedEnv(t *testing.T, adm *Admission, trusted *TrustedProxies) *unifi
 		e.mu.Unlock()
 		http.Error(w, "host", http.StatusTeapot)
 	})
-	o := &HTTPOptions{Next: host, Trusted: trusted}
-	stream, err := NewHTTPHandler(e.lst, o)
+	o := &Options{Next: host, Trusted: trusted}
+	stream, err := NewHandler(e.lst, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.ex, err = NewHTTPExchangeHandler(e.lst, o, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32), HoldTime: time.Second})
+	e.ex, err = NewExchangeHandler(e.lst, o, &ExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32), HoldTime: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.srv = httptest.NewServer(&HTTPEndpoint{Options: o, Stream: stream, Exchange: e.ex})
+	e.srv = httptest.NewServer(&Endpoint{Options: o, Stream: stream, Exchange: e.ex})
 	return e
 }
 
@@ -130,11 +131,13 @@ func TestHTTPEndpoint(t *testing.T) {
 	hc := &http.Client{Transport: tr}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	dials := map[string]func() (PipeIO, error){
-		"streaming": func() (PipeIO, error) { return HTTPPipe(ctx, hc, e.srv.URL, nil, DirBidirectional, nil) },
-		"split":     func() (PipeIO, error) { return HTTPSplitPipe(ctx, hc, e.srv.URL, nil, nil) },
-		"exchange": func() (PipeIO, error) {
-			return HTTPExchangePipe(ctx, hc, e.srv.URL, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
+	dials := map[string]func() (zmux.PipeIO, error){
+		"streaming": func() (zmux.PipeIO, error) {
+			return StreamPipe(ctx, hc, e.srv.URL, nil, zmux.DirectionBidirectional, nil)
+		},
+		"split": func() (zmux.PipeIO, error) { return SplitPipe(ctx, hc, e.srv.URL, nil, nil) },
+		"exchange": func() (zmux.PipeIO, error) {
+			return ExchangePipe(ctx, hc, e.srv.URL, &ExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
 		},
 	}
 	for name, dial := range dials {
@@ -143,7 +146,7 @@ func TestHTTPEndpoint(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			c, err := Start(ctx, p, RoleClient, mpConfig())
+			c, err := zmux.Start(ctx, p, zmux.RoleClient, mpConfig())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -152,9 +155,9 @@ func TestHTTPEndpoint(t *testing.T) {
 				t.Fatal(err)
 			}
 			echoOnce(t, ctx, c, s)
-			want := map[string]CarrierKind{"streaming": CarrierStreaming, "split": CarrierSplit,
-				"exchange": CarrierExchange}[name]
-			for _, x := range []*Conn{c, s} {
+			want := map[string]zmux.CarrierKind{"streaming": zmux.CarrierStream, "split": zmux.CarrierSplit,
+				"exchange": zmux.CarrierExchange}[name]
+			for _, x := range []*zmux.Conn{c, s} {
 				if st := x.PipeStats(); len(st) == 0 || st[0].Carrier != want {
 					t.Fatalf("carrier kind %+v, want %v", st, want)
 				}
@@ -182,7 +185,7 @@ func TestHTTPEndpoint(t *testing.T) {
 }
 
 // echoOnce echoes one message over a new stream of c served by s.
-func echoOnce(t *testing.T, ctx context.Context, c, s *Conn) {
+func echoOnce(t *testing.T, ctx context.Context, c, s *zmux.Conn) {
 	t.Helper()
 	go func() {
 		st, err := s.AcceptStream(ctx)
@@ -209,9 +212,9 @@ func echoOnce(t *testing.T, ctx context.Context, c, s *Conn) {
 func TestHTTPEarlyData(t *testing.T) {
 	leakcheck.Check(t)
 	var decided sync.Map
-	adm := &Admission{Decide: func(_ context.Context, info *CarrierInfo, _ []byte) Decision {
+	adm := &zmux.Admission{Decide: func(_ context.Context, info *zmux.CarrierInfo, _ []byte) zmux.Decision {
 		decided.Store(info.Request.Method, true)
-		return Decision{Verdict: VerdictAccept}
+		return zmux.Decision{Verdict: zmux.VerdictAccept}
 	}}
 	e := newUnifiedEnv(t, adm, nil)
 	defer e.close()
@@ -277,30 +280,30 @@ func TestHTTPTrustedSource(t *testing.T) {
 	other := netip.MustParsePrefix("10.0.0.0/8")
 	for _, c := range []struct {
 		name    string
-		trusted *TrustedProxies
+		trusted *zmux.TrustedProxies
 		proxy   bool // send a PROXY protocol header
 		want    string
 	}{
-		{"header trusted", &TrustedProxies{Prefixes: []netip.Prefix{loop}, Header: "X-Forwarded-For"}, false, "203.0.113.7:0"},
-		{"header untrusted", &TrustedProxies{Prefixes: []netip.Prefix{other}, Header: "X-Forwarded-For"}, false, "127.0.0.1"},
+		{"header trusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, Header: "X-Forwarded-For"}, false, "203.0.113.7:0"},
+		{"header untrusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{other}, Header: "X-Forwarded-For"}, false, "127.0.0.1"},
 		{"header not configured", nil, false, "127.0.0.1"},
-		{"forwarded trusted", &TrustedProxies{Prefixes: []netip.Prefix{loop}, Header: "Forwarded"}, false, "198.51.100.9:0"},
-		{"proxy protocol trusted", &TrustedProxies{Prefixes: []netip.Prefix{loop}, ProxyProtocol: true}, true, "192.0.2.4:4242"},
-		{"proxy protocol untrusted", &TrustedProxies{Prefixes: []netip.Prefix{other}, ProxyProtocol: true}, true, "bad request"},
+		{"forwarded trusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, Header: "Forwarded"}, false, "198.51.100.9:0"},
+		{"proxy protocol trusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, ProxyProtocol: true}, true, "192.0.2.4:4242"},
+		{"proxy protocol untrusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{other}, ProxyProtocol: true}, true, "bad request"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got := make(chan string, 1)
-			adm := &Admission{Decide: func(_ context.Context, info *CarrierInfo, _ []byte) Decision {
+			adm := &zmux.Admission{Decide: func(_ context.Context, info *zmux.CarrierInfo, _ []byte) zmux.Decision {
 				if !c.proxy && info.Peer.Addr() != netip.MustParseAddr("127.0.0.1") {
 					got <- "peer " + info.Peer.String() // the peer is the connection's
 				} else {
 					got <- info.Source.String()
 				}
-				return Decision{Verdict: VerdictFallback}
+				return zmux.Decision{Verdict: zmux.VerdictFallback}
 			}}
-			lst := mustNewListener(&ListenerConfig{Admission: adm})
+			lst := mustNewListener(&zmux.ListenerConfig{Admission: adm})
 			defer func() { _ = lst.Close() }()
-			h, err := NewHTTPHandler(lst, &HTTPOptions{Trusted: c.trusted})
+			h, err := NewHandler(lst, &Options{Trusted: c.trusted})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -349,22 +352,22 @@ func TestHTTPTrustedSource(t *testing.T) {
 func TestHTTPPairField(t *testing.T) {
 	leakcheck.Check(t)
 	for _, bad := range []string{"bad name", "x:y", "é"} {
-		if err := (&HTTPOptions{PairField: bad}).Validate(); !errors.Is(err, ErrInvalidConfig) {
+		if err := (&Options{PairField: bad}).Validate(); !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Errorf("server PairField %q: %v", bad, err)
 		}
-		if err := (&HTTPSplitOptions{PairField: bad}).Validate(); !errors.Is(err, ErrInvalidConfig) {
+		if err := (&SplitOptions{PairField: bad}).Validate(); !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Errorf("client PairField %q: %v", bad, err)
 		}
 	}
-	o := &HTTPOptions{PairField: "x-link-id"}
+	o := &Options{PairField: "x-link-id"}
 	for _, c := range []struct {
 		method, field string
-		want          HTTPClass
+		want          Class
 	}{
-		{http.MethodGet, "X-Link-Id", HTTPClassDownlink},
-		{http.MethodGet, HeaderPair, HTTPClassNone},
-		{http.MethodPost, "X-Link-Id", HTTPClassUplink},
-		{http.MethodPost, HeaderPair, HTTPClassBidirectional},
+		{http.MethodGet, "X-Link-Id", ClassDownlink},
+		{http.MethodGet, HeaderPair, ClassNone},
+		{http.MethodPost, "X-Link-Id", ClassUplink},
+		{http.MethodPost, HeaderPair, ClassBidirectional},
 	} {
 		r := httptest.NewRequest(c.method, "http://example.test/zmux", nil)
 		r.ContentLength = -1
@@ -374,21 +377,21 @@ func TestHTTPPairField(t *testing.T) {
 		}
 	}
 
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
-	stream, err := NewHTTPHandler(lst, o)
+	stream, err := NewHandler(lst, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(&HTTPEndpoint{Stream: stream, Options: o})
+	srv := httptest.NewServer(&Endpoint{Stream: stream, Options: o})
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	p, err := (&HTTPSplitOptions{PairField: "X-Link-Id"}).Pipe(ctx, srv.Client(), srv.URL, nil, nil)
+	p, err := (&SplitOptions{PairField: "X-Link-Id"}).Pipe(ctx, srv.Client(), srv.URL, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := Start(ctx, p, RoleClient, mpConfig())
+	c, err := zmux.Start(ctx, p, zmux.RoleClient, mpConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +400,7 @@ func TestHTTPPairField(t *testing.T) {
 		t.Fatal(err)
 	}
 	echoOnce(t, ctx, c, s)
-	if st := s.PipeStats(); len(st) == 0 || st[0].Carrier != CarrierSplit {
+	if st := s.PipeStats(); len(st) == 0 || st[0].Carrier != zmux.CarrierSplit {
 		t.Fatalf("carrier %+v, want split", st)
 	}
 	_ = c.Close()
@@ -407,12 +410,13 @@ func TestHTTPPairField(t *testing.T) {
 }
 
 // TestPairFieldReserved refuses names that HTTP, WebSocket or the adapters
-// use.
+// use, and names that ordinary requests carry.
 func TestPairFieldReserved(t *testing.T) {
 	for _, bad := range []string{"Content-Length", "content-type", "Transfer-Encoding", "HOST", "connection", "Upgrade",
 		"Keep-Alive", "TE", "Trailer", "Proxy-Authorization", "proxy-x", "Authorization", "Sec-WebSocket-Key",
-		"sec-websocket-protocol", HeaderPrefixAuth, "X-Forwarded-For"} {
-		if err := checkPairField(bad); !errors.Is(err, ErrInvalidConfig) {
+		"sec-websocket-protocol", admit.HeaderPrefixAuth, "X-Forwarded-For", "Cache-Control", "pragma", "Accept",
+		"Accept-Encoding", "User-Agent", "Referer", "If-None-Match", "Range", "Sec-Fetch-Mode"} {
+		if err := checkPairField(bad); !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Errorf("%q: %v", bad, err)
 		}
 	}
@@ -427,17 +431,17 @@ func TestPairFieldReserved(t *testing.T) {
 // options, so a POST with a length and their pairing field is a split
 // uplink that it hands to the fallback, and the endpoint to Stream.
 func TestExchangePairField(t *testing.T) {
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
-	o := &HTTPOptions{PairField: "x-link-id",
+	o := &Options{PairField: "x-link-id",
 		Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })}
-	ex, err := NewHTTPExchangeHandler(lst, o, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
+	ex, err := NewExchangeHandler(lst, o, &ExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ex.Close() }()
 	streamed := false
-	e := &HTTPEndpoint{Options: o, Exchange: ex,
+	e := &Endpoint{Options: o, Exchange: ex,
 		Stream: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { streamed = true })}
 	req := func() *http.Request {
 		r := httptest.NewRequest(http.MethodPost, "http://example.test/", strings.NewReader("x"))

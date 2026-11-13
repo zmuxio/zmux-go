@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"bytes"
@@ -11,21 +11,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
 // refusedEnv is a carrier handler whose fallback records the body of every
 // request it serves.
 type refusedEnv struct {
-	lst  *Listener
+	lst  *zmux.Listener
 	srv  *httptest.Server
 	mu   sync.Mutex
 	host [][]byte
 }
 
-func newRefusedEnv(t *testing.T, adm *Admission) *refusedEnv {
+func newRefusedEnv(t *testing.T, adm *zmux.Admission) *refusedEnv {
 	t.Helper()
-	e := &refusedEnv{lst: mustNewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: time.Second, Admission: adm})}
+	e := &refusedEnv{lst: mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), FirstRecordTimeout: time.Second, Admission: adm})}
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -36,7 +37,7 @@ func newRefusedEnv(t *testing.T, adm *Admission) *refusedEnv {
 		e.mu.Unlock()
 		http.Error(w, "host", http.StatusTeapot)
 	})
-	h, err := NewHTTPHandler(e.lst, &HTTPOptions{Next: next})
+	h, err := NewHandler(e.lst, &Options{Next: next})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,17 +94,17 @@ func TestHTTPRefusedCarrierFallback(t *testing.T) {
 	defer e.close()
 
 	// A join naming a session of another listener.
-	other := mustNewListener(&ListenerConfig{Config: mpConfig()})
+	other := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	defer func() { _ = other.Close() }()
 	osrv := httptest.NewServer(mustHTTPHandler(t, other))
 	defer osrv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := HTTPPipe(ctx, osrv.Client(), osrv.URL, nil, DirBidirectional, nil)
+	p, err := StreamPipe(ctx, osrv.Client(), osrv.URL, nil, zmux.DirectionBidirectional, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := Start(ctx, p, RoleClient, mpConfig())
+	c, err := zmux.Start(ctx, p, zmux.RoleClient, mpConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,17 +160,17 @@ func TestHTTPAdmittedCarrierNotHandedOn(t *testing.T) {
 	garbage := bytes.Repeat([]byte{0xff}, 4096)
 	for _, x := range []struct {
 		name string
-		v    Verdict
+		v    zmux.AdmissionVerdict
 		want int
 	}{
-		{"accept", VerdictAccept, http.StatusOK},
-		{"close", VerdictClose, 0},
-		{"stall", VerdictStall, 0},
+		{"accept", zmux.VerdictAccept, http.StatusOK},
+		{"close", zmux.VerdictClose, 0},
+		{"stall", zmux.VerdictStall, 0},
 	} {
 		t.Run(x.name, func(t *testing.T) {
-			e := newRefusedEnv(t, &Admission{Peek: 8, PeekTimeout: time.Second,
+			e := newRefusedEnv(t, &zmux.Admission{Peek: 8, PeekTimeout: time.Second,
 				StallMin: 10 * time.Millisecond, StallMax: 20 * time.Millisecond,
-				Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: x.v} }})
+				Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision { return zmux.Decision{Verdict: x.v} }})
 			defer e.close()
 			if code := e.send(t, http.MethodPost, garbage, nil); code != x.want {
 				t.Fatalf("status %d, want %d", code, x.want)
@@ -181,9 +182,9 @@ func TestHTTPAdmittedCarrierNotHandedOn(t *testing.T) {
 	}
 }
 
-func mustHTTPHandler(t *testing.T, l *Listener) http.Handler {
+func mustHTTPHandler(t *testing.T, l *zmux.Listener) http.Handler {
 	t.Helper()
-	h, err := NewHTTPHandler(l, nil)
+	h, err := NewHandler(l, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,14 +197,16 @@ func mustHTTPHandler(t *testing.T, l *Listener) http.Handler {
 // the body is still being streamed.
 func TestHTTPRejectedStreamFallbackFullDuplex(t *testing.T) {
 	leakcheck.Check(t)
-	adm := &Admission{Peek: 4, PeekTimeout: time.Second,
-		Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictFallback} }}
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
+	adm := &zmux.Admission{Peek: 4, PeekTimeout: time.Second,
+		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+			return zmux.Decision{Verdict: zmux.VerdictFallback}
+		}}
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
 	defer func() { _ = lst.Close() }()
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
 	})
-	h, err := NewHTTPHandler(lst, &HTTPOptions{Next: next})
+	h, err := NewHandler(lst, &Options{Next: next})
 	if err != nil {
 		t.Fatal(err)
 	}

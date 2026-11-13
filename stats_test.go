@@ -108,7 +108,7 @@ func TestStreamAndSessionStats(t *testing.T) {
 func TestStreamCreditWaits(t *testing.T) {
 	leakcheck.Check(t)
 	a, b := tcpPair(t)
-	c, _ := pair(t, a, b, nil, &Config{NoIncomingStreams: true})
+	c, _ := pair(t, a, b, nil, &Config{MaxIncomingStreams: -1})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := c.OpenStream(); err == nil {

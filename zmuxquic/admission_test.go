@@ -10,6 +10,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
+	"github.com/zmuxio/zmux-go/carrier"
 )
 
 // TestServeAdmission admits connections whose first stream starts with a
@@ -17,27 +19,27 @@ import (
 // one whose first stream does not.
 func TestServeAdmission(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth := &zmux.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-	v, err := zmux.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
+	v, err := admit.NewPrefixAuthVerifier(auth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	adm := &zmux.Admission{Peek: zmux.PrefixTokenLen, PeekTimeout: time.Second, Decide: v.Decide,
+	adm := &zmux.Admission{Peek: admit.PrefixTokenLen, PeekTimeout: time.Second, Decide: v.Decide,
 		StallMin: 10 * time.Millisecond, StallMax: 20 * time.Millisecond}
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
-	go func() { _ = Serve(ctx, ln, lst, nil); close(done) }()
+	go func() { _ = Serve(ctx, lst, ln, nil); close(done) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
 
 	// A valid carrier: Dial presents the credential on its first stream.
 	cfg := mpConfig()
-	cfg.Credential = auth
+	cfg.CarrierCredential = auth
 	c, err := Dial(ctx, ln.Addr().String(), cli, nil, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +56,7 @@ func TestServeAdmission(t *testing.T) {
 
 	// A pool presents it on the first stream of each connection: a
 	// bootstrap, a join on its connection, a join on a second connection.
-	pool := NewPool(ln.Addr().String(), cli, nil, auth, zmux.PoolLimits{MaxPipesPerConnection: 2})
+	pool := NewPool(ln.Addr().String(), cli, nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer pool.Shutdown()
 	first, err := pool.OpenPipe(ctx)
 	if err != nil {
@@ -85,15 +87,15 @@ func TestServeAdmission(t *testing.T) {
 	_ = s.Wait()
 
 	// A first stream without a token.
-	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := OpenPipe(ctx, qc)
+	p, err := ConnPipe(ctx, qc)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.W.Write(make([]byte, zmux.PrefixTokenLen)); err != nil {
+	if _, err := p.W.Write(make([]byte, admit.PrefixTokenLen)); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := io.ReadAll(p.R); len(n) != 0 {
@@ -112,7 +114,7 @@ func TestServeAdmission(t *testing.T) {
 // Serve closes the connection without calling Decide.
 func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(&quic.Config{Allow0RTT: true}))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(&quic.Config{Allow0RTT: true}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,10 +128,10 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
-	go func() { _ = Serve(ctx, ln, lst, nil); close(done) }()
+	go func() { _ = Serve(ctx, lst, ln, nil); close(done) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
 
-	warm, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+	warm, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +147,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	}
 	_ = warm.CloseWithError(0, "")
 
-	early, err := quic.DialAddrEarly(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+	early, err := quic.DialAddrEarly(ctx, ln.Addr().String(), cli, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,14 +176,14 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 // VerdictMore and accepted past it; the session runs on the rest.
 func TestServeAdmissionMore(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	header := append([]byte{0x01, 20}, make([]byte, 18)...)
 	adm := &zmux.Admission{Peek: 2, MaxPeek: 64, PeekTimeout: 5 * time.Second,
 		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
-			if c, _ := zmux.ClassifyFirstBytes(prefix, zmux.FramingByteStream); c != zmux.FirstBytesOther || prefix[0] != 0x01 {
+			if c, _ := admit.ClassifyFirstBytes(prefix, zmux.FramingByteStream); c != admit.FirstBytesOther || prefix[0] != 0x01 {
 				return zmux.Decision{Verdict: zmux.VerdictClose}
 			}
 			if len(prefix) < int(prefix[1]) {
@@ -193,14 +195,14 @@ func TestServeAdmissionMore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
-	go func() { _ = Serve(ctx, ln, lst, nil); close(done) }()
+	go func() { _ = Serve(ctx, lst, ln, nil); close(done) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
-	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = qc.CloseWithError(0, "") }()
-	p, err := OpenPipe(ctx, qc)
+	p, err := ConnPipe(ctx, qc)
 	if err != nil {
 		t.Fatal(err)
 	}

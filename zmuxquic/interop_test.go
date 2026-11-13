@@ -181,7 +181,7 @@ func TestInteropQUICServer(t *testing.T) {
 	}
 	srv, _ := tlsConfigs(t)
 	srv.NextProtos = []string{"qmux-02"}
-	ln, err := quic.ListenAddrEarly("127.0.0.1:0", srv, QUICConfig(&quic.Config{Allow0RTT: true}))
+	ln, err := quic.ListenAddrEarly("127.0.0.1:0", srv, Config(&quic.Config{Allow0RTT: true}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestInteropQUICServer(t *testing.T) {
 	defer cancel()
 	l := mustNewListener(&zmux.ListenerConfig{Config: interopConfig(nil)})
 	defer func() { _ = l.Close() }()
-	go func() { _ = Serve(ctx, ln, l, nil) }()
+	go func() { _ = Serve(ctx, l, ln, nil) }()
 	p := startPeer(t, "quic-client", ln.Addr().String())
 	c, err := l.Accept(ctx)
 	if err != nil {
@@ -364,7 +364,7 @@ func TestInteropQUICExporterEarlyToPeerServer(t *testing.T) {
 	exporterKeys(t, c, p.reports(t, "ESTABLISHED", "KEYS ")["KEYS "])
 	closeByPeer(t, ctx, c, p)
 
-	qc, err := dialNative(ctx, addr, tc, QUICConfig(nil), true)
+	qc, err := dialNative(ctx, addr, tc, Config(nil), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestInteropQUICExporterEarlyFromPeerClient(t *testing.T) {
 	}
 	srv, _ := tlsConfigs(t)
 	srv.NextProtos = []string{"qmux-02"}
-	ln, err := quic.ListenAddrEarly("127.0.0.1:0", srv, QUICConfig(&quic.Config{Allow0RTT: true}))
+	ln, err := quic.ListenAddrEarly("127.0.0.1:0", srv, Config(&quic.Config{Allow0RTT: true}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestInteropQUICExporterEarlyFromPeerClient(t *testing.T) {
 	defer cancel()
 	l := mustNewListener(&zmux.ListenerConfig{Config: exporterConfig(nil)})
 	defer func() { _ = l.Close() }()
-	go func() { _ = Serve(ctx, ln, l, nil) }()
+	go func() { _ = Serve(ctx, l, ln, nil) }()
 	p := startPeer(t, "quic-client", holdRelay(t, ln.Addr().String(), exporterHold), "exporter")
 	c, err := l.Accept(ctx)
 	if err != nil {

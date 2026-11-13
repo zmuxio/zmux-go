@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/seal"
 	"github.com/zmuxio/zmux-go/seal/proto"
 )
@@ -106,7 +107,7 @@ func newFixture(t *testing.T) *fixture {
 		server: seal.ServerConfig{Gate: &gate{handle: handle, psk: psk}, Key: node}}
 }
 
-func anyMode(zmux.CarrierInfo, zmux.RecordMode, any) bool { return true }
+func anyMode(zmux.RecordPolicyInput, zmux.RecordMode, any) bool { return true }
 
 func listen(t *testing.T, ctx context.Context, lc *zmux.ListenerConfig) (*zmux.Listener, string) {
 	t.Helper()
@@ -163,7 +164,7 @@ func echo(t *testing.T, ctx context.Context, c, s *zmux.Conn) {
 
 // Each mode establishes a session over TCP, and a further carrier joins it.
 func TestModesAndJoin(t *testing.T) {
-	for _, mode := range []zmux.RecordMode{zmux.Sealed, zmux.Bound, zmux.Trusted} {
+	for _, mode := range []zmux.RecordMode{zmux.RecordSealed, zmux.RecordBound, zmux.RecordTrusted} {
 		t.Run(mode.String(), func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
@@ -171,7 +172,7 @@ func TestModesAndJoin(t *testing.T) {
 			f.server.AllowRecordMode = anyMode
 			exp := bytes.Repeat([]byte{7}, 32)
 			wrap := func(ctx context.Context, p zmux.PipeIO, h zmux.PipeHint) (zmux.PipeIO, error) {
-				if mode == zmux.Bound {
+				if mode == zmux.RecordBound {
 					p = zmux.NetPipe(&secureConn{Conn: p.W.(net.Conn), exp: exp})
 				}
 				return f.server.WrapPipe(ctx, p, h)
@@ -182,21 +183,21 @@ func TestModesAndJoin(t *testing.T) {
 			})
 			carrier := func() zmux.PipeIO {
 				nc := dial(t, addr)
-				if mode == zmux.Bound {
+				if mode == zmux.RecordBound {
 					return zmux.NetPipe(&secureConn{Conn: nc, exp: exp})
 				}
 				return zmux.NetPipe(nc)
 			}
 			cc := f.client
-			cc.Mode = mode
+			cc.RecordMode = mode
 			p, err := seal.Establish(ctx, carrier(), &cc)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if peer, ok := seal.PeerOf(p); !ok || !bytes.Equal(peer.Static, f.node.PublicKey().Bytes()) || peer.Mode != mode {
+			if peer, ok := seal.PeerOf(p); !ok || !bytes.Equal(peer.Static, f.node.PublicKey().Bytes()) || peer.RecordMode != mode {
 				t.Fatalf("PeerOf: %+v %v", peer, ok)
 			}
-			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4, RecordPolicy: func(zmux.CarrierInfo) zmux.RecordMode { return zmux.Trusted }})
+			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4, RecordPolicy: func(zmux.RecordPolicyInput) zmux.RecordMode { return zmux.RecordTrusted }})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -206,8 +207,8 @@ func TestModesAndJoin(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = s.Close() }()
-			if v, ok := s.Admitted().(*seal.Peer); !ok || v.Value != "client 1" || v.Mode != mode {
-				t.Fatalf("Admitted: %+v", s.Admitted())
+			if v, ok := zmux.AdmittedAs[*seal.Peer](s); !ok || v.Value != "client 1" || v.RecordMode != mode {
+				t.Fatalf("AdmittedAs: %+v", v)
 			}
 			echo(t, ctx, c, s)
 			if _, err := c.AddPipe(ctx, zmux.NetPipe(dial(t, addr)), zmux.PipeOptions{}); err != nil {
@@ -279,7 +280,7 @@ func TestHiddenCapabilities(t *testing.T) {
 	if other, err := se.ExportKeyingMaterial(proto.BoundExporterLabel, nil, 32); err != nil || !bytes.Equal(got, other) {
 		t.Fatalf("exporters differ: %v", err)
 	}
-	if m, ok := cp.W.(zmux.CarrierRecordMode); !ok || m.RecordMode() != zmux.Sealed {
+	if m, ok := cp.W.(zmux.CarrierRecordMode); !ok || m.RecordMode() != zmux.RecordSealed {
 		t.Fatal("no Sealed mode")
 	}
 	if cp.Framing != zmux.FramingRecords {
@@ -319,7 +320,7 @@ func TestBoundNeedsSecureCarrier(t *testing.T) {
 	defer cancel()
 	f := newFixture(t)
 	cc := f.client
-	cc.Mode = zmux.Bound
+	cc.RecordMode = zmux.RecordBound
 	a, b := net.Pipe()
 	defer func() { _ = b.Close() }()
 	if _, err := seal.Establish(ctx, zmux.NetPipe(a), &cc); !errors.Is(err, proto.ErrInvalidConfig) {
@@ -333,7 +334,7 @@ func TestServerRefusesModeByDefault(t *testing.T) {
 	defer cancel()
 	f := newFixture(t)
 	cc := f.client
-	cc.Mode = zmux.Trusted
+	cc.RecordMode = zmux.RecordTrusted
 	a, b := net.Pipe()
 	_, _, cerr, serr := establishPair(t, ctx, &cc, &f.server, zmux.NetPipe(a), zmux.NetPipe(b))
 	var rej *zmux.RejectError
@@ -371,14 +372,14 @@ func TestOnReject(t *testing.T) {
 
 // A lane's first record passes the transform; a plain session start does not.
 func TestWrapPipeLaneFirstRecord(t *testing.T) {
-	lane, need := zmux.FirstRecordIsLane([]byte{0x16, 0xba}, zmux.FramingByteStream)
+	lane, need := admit.FirstRecordIsLane([]byte{0x16, 0xba}, zmux.FramingByteStream)
 	if !lane || need != 0 {
 		t.Fatal(lane, need)
 	}
-	if lane, _ := zmux.FirstRecordIsLane([]byte{0x16, 0xff}, zmux.FramingByteStream); lane {
+	if lane, _ := admit.FirstRecordIsLane([]byte{0x16, 0xff}, zmux.FramingByteStream); lane {
 		t.Fatal("parameters read as a lane")
 	}
-	if _, need := zmux.FirstRecordIsLane([]byte{0x40}, zmux.FramingByteStream); need != 2 {
+	if _, need := admit.FirstRecordIsLane([]byte{0x40}, zmux.FramingByteStream); need != 2 {
 		t.Fatal(need)
 	}
 }
@@ -437,7 +438,7 @@ func TestLaneThroughWrapPipe(t *testing.T) {
 	serve(zmux.PipeIO{R: sh, W: sh})
 	h := &laneHalf{Conn: a, exp: exp, id: conn, open: open}
 	cc := f.client
-	cc.Mode = zmux.Bound
+	cc.RecordMode = zmux.RecordBound
 	p, err := seal.Establish(ctx, zmux.PipeIO{R: h, W: h, Carrier: zmux.CarrierQUIC}, &cc)
 	if err != nil {
 		t.Fatal(err)
@@ -471,7 +472,7 @@ func TestLaneThroughWrapPipe(t *testing.T) {
 			t.Fatalf("lanes out %d, in %d, opened %d", out, in, lanes.Load())
 		}
 	}
-	if m := s.WeakestRecordMode(); m != zmux.Bound {
+	if m := s.WeakestRecordMode(); m != zmux.RecordBound {
 		t.Fatalf("mode %v", m)
 	}
 }
@@ -517,7 +518,7 @@ func TestRawCarrierHints(t *testing.T) {
 	f := newFixture(t)
 	f.server.AllowRecordMode = anyMode
 	cc := f.client
-	cc.Mode = zmux.Trusted
+	cc.RecordMode = zmux.RecordTrusted
 	_, cert := testCert(t)
 	cl, sv := net.Pipe()
 	tc := tls.Client(cl, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // a test carrier
@@ -553,7 +554,7 @@ func TestSecureTLSBound(t *testing.T) {
 	f := newFixture(t)
 	f.server.AllowRecordMode = anyMode
 	cc := f.client
-	cc.Mode = zmux.Bound
+	cc.RecordMode = zmux.RecordBound
 	_, cert := testCert(t)
 	cl, sv := net.Pipe()
 	cp, sp, cerr, serr := establishPair(t, ctx, &cc, &f.server,

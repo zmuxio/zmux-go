@@ -21,31 +21,65 @@ import (
 // from strongest to weakest.
 type RecordMode uint8
 
+// The record modes; the values are those of the Mode field of a Join
+// (secure-carrier Section 11).
 const (
-	// Sealed protects records with the handshake's keys.
-	Sealed = RecordMode(join.Sealed)
-	// Bound leaves records to the carrier and binds its exporter into the handshake.
-	Bound = RecordMode(join.Bound)
-	// Trusted leaves records to the deployment; both ends configure it explicitly.
-	Trusted = RecordMode(join.Trusted)
-	// Unmanaged is a first pipe without the secure carrier. No Join has this mode.
-	Unmanaged RecordMode = 3
+	// RecordSealed protects records with the handshake's keys.
+	RecordSealed RecordMode = 0
+	// RecordBound leaves records to the carrier and binds its exporter into
+	// the handshake.
+	RecordBound RecordMode = 1
+	// RecordTrusted leaves records to the deployment; both ends configure it
+	// explicitly.
+	RecordTrusted RecordMode = 2
+	// RecordUnmanaged is a first pipe without the secure carrier. It is only
+	// reported: no Join has this mode.
+	RecordUnmanaged RecordMode = 3
+)
+
+// The record modes share the values of the join's modes.
+var (
+	_ = [1]struct{}{}[int(join.Sealed)-int(RecordSealed)]
+	_ = [1]struct{}{}[int(join.Bound)-int(RecordBound)]
+	_ = [1]struct{}{}[int(join.Trusted)-int(RecordTrusted)]
 )
 
 // String returns "sealed", "bound", "trusted" or "unmanaged".
 func (m RecordMode) String() string {
-	if m == Unmanaged {
+	if m == RecordUnmanaged {
 		return "unmanaged"
 	}
 	return join.Mode(m).String()
 }
 
+// errRefusalSent is a join refused with a Reply that was written: its
+// carrier is closed gracefully so that the joiner reads the refusal.
+var errRefusalSent = fmt.Errorf("%w: refusal sent", errRefused)
+
+// errJoinHeld marks a join whose bound ended while the attachment cap or
+// the refusal backoff still held it: it never sent its Hello, which says
+// nothing about its carrier.
+var errJoinHeld = errors.New("zmux: join held back by the attachment cap")
+
+// RecordPolicyInput describes a carrier to RecordPolicy and AllowRecordMode.
+type RecordPolicyInput struct {
+	// HasExporter reports that the carrier has a keying material exporter.
+	HasExporter bool
+	// Secure reports that the carrier declares the Bound contract
+	// (CarrierSecure).
+	Secure bool
+	// Label is the carrier's PipeIO.Label.
+	Label string
+	// IsFirstPipe reports that the carrier is the session's first pipe.
+	IsFirstPipe bool
+}
+
 // RecordPolicy chooses the record mode of a carrier the local endpoint joins.
-type RecordPolicy func(c CarrierInfo) RecordMode
+type RecordPolicy func(c RecordPolicyInput) RecordMode
 
 // AllowRecordMode is the acceptor's check of a Hello's mode; peer is the session's
-// host value (Conn.Admitted).
-type AllowRecordMode func(c CarrierInfo, m RecordMode, peer any) bool
+// host value (AdmittedAs).
+type AllowRecordMode func(c RecordPolicyInput, m RecordMode, peer any) bool
 
 // CarrierSecure is implemented by a carrier half whose carrier meets the Bound
 // contract (the carrier protects the records end to end: confidentiality and
@@ -62,7 +96,7 @@ type CarrierRecordLimit interface{ MaxRecord() int }
 type CarrierRecordMode interface{ RecordMode() RecordMode }
 
 // CarrierPeer is implemented by the halves of a carrier transform that authenticated the
-// peer: its value is the session's host value in place of Decision.Value (Conn.Admitted).
+// peer: its value is the session's host value in place of Decision.Value (AdmittedAs).
 type CarrierPeer interface{ CarrierPeer() any }
 
 func carrierPeer(p PipeIO) any {
@@ -109,9 +143,9 @@ func carrierRecordLimit(p PipeIO) int {
 }
 
 // joinCarrierInfo is the description AllowRecordMode and RecordPolicy see.
-func joinCarrierInfo(p PipeIO, first bool) CarrierInfo {
+func joinCarrierInfo(p PipeIO, first bool) RecordPolicyInput {
 	_, exp := Exporter(p)
-	return CarrierInfo{Peer: peerOf(p), HasExporter: exp, Secure: IsCarrierSecure(p), Label: p.Label, IsFirstPipe: first}
+	return RecordPolicyInput{HasExporter: exp, Secure: IsCarrierSecure(p), Label: p.Label, IsFirstPipe: first}
 }
 
 // joinBinding reads the Binding of a Bound carrier; a
@@ -204,7 +238,7 @@ func (c *Conn) joinCarrier(ctx context.Context, pd *pipeDrv, p PipeIO, dir Direc
 		select {
 		case <-timeshim.After(c.clk.source(), joinHoldPoll):
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("%w: %w", errJoinHeld, ctx.Err())
 		case <-c.done:
 			return c.closedErr()
 		}
@@ -280,7 +314,7 @@ func (c *Conn) joinCarrier(ctx context.Context, pd *pipeDrv, p PipeIO, dir Direc
 				return err
 			}
 			pd.adopt(q)
-			c.startPipeLocked(pd, dir != DirSendOnly, dir != DirReceiveOnly)
+			c.startPipeLocked(pd, dir != DirectionSendOnly, dir != DirectionReceiveOnly)
 			c.unlock()
 			// Nothing started uses the half a direction leaves unused.
 			c.endUnusedHalf(q, dir)
@@ -373,17 +407,17 @@ func joinFraming(p PipeIO) join.Framing {
 // endUnusedHalf ends what a direction does not use after the handshake.
 func (c *Conn) endUnusedHalf(p PipeIO, dir Direction) {
 	switch dir {
-	case DirSendOnly:
+	case DirectionSendOnly:
 		if p.R != nil && !sameHalf(p.R, p.W) {
 			_ = p.R.Close()
 		}
-	case DirReceiveOnly:
+	case DirectionReceiveOnly:
 		if cw, ok := p.W.(CloseWriter); ok {
 			_ = cw.CloseWrite()
 		} else if p.W != nil && !sameHalf(p.R, p.W) {
 			_ = p.W.Close()
 		}
-	case DirBidirectional:
+	case DirectionBidirectional:
 	}
 }
 
@@ -444,8 +478,8 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 	mode := RecordMode(pj.Mode)
 	info := joinCarrierInfo(p, false)
 	allow := c.cfg.AllowRecordMode
-	if allow == nil && mode != Sealed || allow != nil && !allow(info, mode, c.admitted) ||
-		c.cfg.AuthorizeJoin != nil && !c.cfg.AuthorizeJoin(c, pj.Pipe.ID) {
+	if allow == nil && mode != RecordSealed || allow != nil && !allow(info, mode, c.admitted) ||
+		c.cfg.AuthorizeJoin != nil && !c.cfg.AuthorizeJoin(c, PipeID(pj.Pipe.ID)) {
 		return 0, errRejected // the Pipe ID's bit stays clear
 	}
 	dirIn, dirOut := pj.Pipe.Direction != 1, pj.Pipe.Direction != 0
@@ -485,7 +519,7 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 		return 0, ended(errRejected)
 	}
 	if res == core.JoinRefused {
-		return 0, errRefused
+		return 0, errRefusalSent
 	}
 	defer c.dropUnconfirmed(p)
 	// The acceptor's records wait for Confirmed.
@@ -547,9 +581,9 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 	// The acceptor's unused half: nothing started uses it.
 	switch pj.Pipe.Direction {
 	case 0:
-		c.endUnusedHalf(q, DirReceiveOnly)
+		c.endUnusedHalf(q, DirectionReceiveOnly)
 	case 1:
-		c.endUnusedHalf(q, DirSendOnly)
+		c.endUnusedHalf(q, DirectionSendOnly)
 	}
 	return id, nil
 }
@@ -589,7 +623,7 @@ const SealedMaxRecord = join.MaxMessage - 16
 
 // sealResult wraps a carrier with the records of a finished Sealed Join.
 func sealResult(p PipeIO, r *join.Result) PipeIO {
-	return SealRecords(p, r.Sealer, r.Opener, Sealed, exportResult{r})
+	return SealRecords(p, r.Sealer, r.Opener, RecordSealed, exportResult{r})
 }
 
 type exportResult struct{ r *join.Result }
@@ -598,11 +632,31 @@ func (e exportResult) ExportKeyingMaterial(label string, ctx []byte, n int) ([]b
 	return e.r.Export(label, ctx, n)
 }
 
-// SealRecords returns p as a carrier of Sealed records: a message carrier with one zmux
-// record in each AEAD message. It offers only what its halves implement here, so the
+// RecordSealer seals the records one direction of a carrier sends, one AEAD
+// message per record, with nonces of its own.
+type RecordSealer interface {
+	// Overhead is the bytes Seal adds to a plaintext.
+	Overhead() int
+	// Seal appends the sealed plaintext to dst.
+	Seal(dst, plaintext []byte) ([]byte, error)
+}
+
+// RecordOpener opens the records one direction of a carrier receives, as a
+// RecordSealer of the peer sealed them.
+type RecordOpener interface {
+	// Open appends the opened ciphertext to dst; an error is an
+	// authentication failure, which fails the carrier for good.
+	Open(dst, ciphertext []byte) ([]byte, error)
+}
+
+// SealRecords returns p as a carrier of Sealed records: a message carrier
+// with one zmux record in each AEAD message, sealed by s and opened by o.
+// mode is what the carrier reports as its RecordMode and exp its exporter
+// (nil: none). It offers only what its halves implement here, so the
 // carrier's lanes, datagram channel and exporter are hidden. It is the one
-// implementation of Sealed records, for a Join and for an Establish.
-func SealRecords(p PipeIO, s *join.Sealer, o *join.Opener, mode RecordMode, exp KeyingMaterialExporter) PipeIO {
+// implementation of Sealed records, for a Join and for an Establish of the
+// secure carrier.
+func SealRecords(p PipeIO, s RecordSealer, o RecordOpener, mode RecordMode, exp KeyingMaterialExporter) PipeIO {
 	r := &sealedReader{lower: p, o: o, msgs: p.Framing == FramingRecords, exp: exp, mode: mode}
 	w := &sealedWriter{lower: p, s: s, msgs: p.Framing == FramingRecords, exp: exp, mode: mode}
 	overhead := p.WriteOverhead + s.Overhead()
@@ -615,7 +669,7 @@ func SealRecords(p PipeIO, s *join.Sealer, o *join.Opener, mode RecordMode, exp 
 
 type sealedReader struct {
 	lower PipeIO
-	o     *join.Opener
+	o     RecordOpener
 	msgs  bool
 	head  [sealedLen]byte
 	mode  RecordMode
@@ -662,7 +716,7 @@ func (r *sealedReader) RecordMode() RecordMode { return r.mode }
 
 type sealedWriter struct {
 	lower PipeIO
-	s     *join.Sealer
+	s     RecordSealer
 	msgs  bool
 	mode  RecordMode
 	mu    sync.Mutex

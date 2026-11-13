@@ -9,7 +9,7 @@
 // Handler serves upgrade requests to a zmux.Listener; Dial and DialPipe
 // open a WebSocket to a ws:// or wss:// URL; Pipe adapts a connection
 // established otherwise. A client's credential travels
-// in its header form, such as zmux.PrefixAuth's Zmux-Prefix-Auth field.
+// in its header form, such as admit.PrefixAuth's Zmux-Prefix-Auth field.
 //
 // A carrier has the state of the TLS beneath it that this process
 // terminates (ConnectionState): a client's wss connection, or the TLS
@@ -43,6 +43,7 @@ import (
 	"github.com/djylb/netx/wsconn"
 	"github.com/djylb/netx/wsconn/wshttp"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 // options are the connection settings of both ends: messages up to one
@@ -102,7 +103,7 @@ func offered(protocols []string) ([]string, error) {
 
 // ---- server ----
 
-// Handler returns an http.Handler that upgrades WebSocket requests to
+// NewHandler returns an http.Handler that upgrades WebSocket requests to
 // carriers of l. protocols are the subprotocols it accepts, by preference
 // (none: zmux.DefaultALPN), each also as its alias. NoSubprotocol among
 // them also accepts a request with no Sec-WebSocket-Protocol field; a
@@ -121,7 +122,7 @@ func offered(protocols []string) ([]string, error) {
 //
 // HTTP/1.1 requests are hijacked; an HTTP/2 extended CONNECT (RFC 8441,
 // see package wshttp) runs over its stream.
-func Handler(l *zmux.Listener, o *zmux.HTTPOptions, protocols ...string) (http.Handler, error) {
+func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, protocols ...string) (http.Handler, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
@@ -141,7 +142,7 @@ func Handler(l *zmux.Listener, o *zmux.HTTPOptions, protocols ...string) (http.H
 
 type handler struct {
 	l  *zmux.Listener
-	o  zmux.HTTPOptions
+	o  zmuxhttp.Options
 	so wsconn.ServerOptions
 	// none accepts a request without a Sec-WebSocket-Protocol field.
 	none bool
@@ -159,7 +160,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.o.Fallback(w, r)
 		return
 	}
-	a, ok := h.l.AdmitUpgrade(w, r, &h.o)
+	a, ok := h.l.AdmitUpgrade(w, r, h.o.Trusted, http.HandlerFunc(h.o.Fallback))
 	if !ok {
 		return
 	}
@@ -194,10 +195,10 @@ type DialOptions struct {
 	// a credential's. A Host field sets the
 	// request's Host; the handshake's own fields are refused.
 	Header http.Header
-	// Credential is presented in the upgrade request (its Header form,
+	// CarrierCredential is presented in the upgrade request (its Header form,
 	// bound to the TLS connection of a wss URL) for the server's
-	// admission; nil: none. Dial takes zmux.Config.Credential instead.
-	Credential zmux.Credential
+	// admission; nil: none. Dial takes zmux.Config.CarrierCredential instead.
+	CarrierCredential zmux.CarrierCredential
 	// TLSConfig configures the TLS of wss URLs; nil verifies the URL's
 	// host with the system roots. Without a ServerName, the URL's host is
 	// verified.
@@ -213,12 +214,10 @@ type DialOptions struct {
 	HandshakeTimeout time.Duration
 	// MaxRedirects bounds the redirects of the upgrade followed, each on a
 	// new connection with the credential presented anew, as
-	// zmux.CheckHTTPRedirect allows. Zero is zmux.DefaultHTTPRedirects
-	// (5); following none takes NoRedirects; a negative value is
-	// zmux.ErrInvalidConfig. A refused one is a *zmux.HTTPRedirectError.
+	// zmuxhttp.CheckRedirect allows. Zero is zmuxhttp.DefaultRedirects
+	// (5); a negative value follows none. A refused one is a
+	// *zmuxhttp.RedirectError.
 	MaxRedirects int
-	// NoRedirects follows no redirect of the upgrade.
-	NoRedirects bool
 }
 
 // DialPipe opens a WebSocket to rawURL (ws:// or wss://) and returns it as
@@ -228,7 +227,7 @@ func DialPipe(ctx context.Context, rawURL string, o *DialOptions) (zmux.PipeIO, 
 	if o == nil {
 		o = &DialOptions{}
 	}
-	p, _, err := dialPipe(ctx, rawURL, o, o.Credential)
+	p, _, err := dialPipe(ctx, rawURL, o, o.CarrierCredential)
 	return p, err
 }
 
@@ -240,11 +239,11 @@ func Dial(ctx context.Context, rawURL string, o *DialOptions, cfg *zmux.Config) 
 	if o == nil {
 		o = &DialOptions{}
 	}
-	var cred zmux.Credential
+	var cred zmux.CarrierCredential
 	if cfg != nil {
-		cred = cfg.Credential
+		cred = cfg.CarrierCredential
 	}
-	if o.Credential != nil {
+	if o.CarrierCredential != nil {
 		return nil, fmt.Errorf("%w: zmuxws.Dial takes Config.Credential, not DialOptions.Credential", zmux.ErrInvalidConfig)
 	}
 	p, _, err := dialPipe(ctx, rawURL, o, cred)
@@ -255,9 +254,9 @@ func Dial(ctx context.Context, rawURL string, o *DialOptions, cfg *zmux.Config) 
 }
 
 // dialPipe dials rawURL, following redirects of the upgrade as
-// zmux.CheckHTTPRedirect allows, each over a new connection with the
+// zmuxhttp.CheckRedirect allows, each over a new connection with the
 // credential presented anew; it returns the final URL.
-func dialPipe(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Credential) (zmux.PipeIO, string, error) {
+func dialPipe(ctx context.Context, rawURL string, o *DialOptions, cred zmux.CarrierCredential) (zmux.PipeIO, string, error) {
 	timeout := o.HandshakeTimeout
 	if timeout == 0 {
 		timeout = wsconn.DefaultHandshakeTimeout
@@ -270,16 +269,14 @@ func dialPipe(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Cred
 	bound := o.MaxRedirects
 	switch {
 	case bound < 0:
-		return zmux.PipeIO{}, rawURL, fmt.Errorf("%w: negative zmuxws.DialOptions.MaxRedirects", zmux.ErrInvalidConfig)
-	case o.NoRedirects:
 		bound = 0
 	case bound == 0:
-		bound = zmux.DefaultHTTPRedirects
+		bound = zmuxhttp.DefaultRedirects
 	}
 	for hops := 0; ; hops++ {
 		p, err := dialOnce(ctx, rawURL, o, cred)
 		var he *wsconn.HandshakeError
-		if !errors.As(err, &he) || he.Response == nil || !zmux.IsHTTPRedirect(he.Status) {
+		if !errors.As(err, &he) || he.Response == nil || !zmuxhttp.IsRedirect(he.Status) {
 			return p, rawURL, err
 		}
 		from, perr := url.Parse(rawURL)
@@ -287,9 +284,9 @@ func dialPipe(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Cred
 			return p, rawURL, err
 		}
 		loc := he.Response.Header.Get("Location")
-		next, rerr := zmux.CheckHTTPRedirect(from, http.MethodGet, he.Status, loc)
+		next, rerr := zmuxhttp.CheckRedirect(from, http.MethodGet, he.Status, loc)
 		if rerr == nil && hops >= bound {
-			rerr = &zmux.HTTPRedirectError{StatusCode: he.Status, Location: loc, Reason: "too many redirects"}
+			rerr = &zmuxhttp.RedirectError{StatusCode: he.Status, Location: loc, Reason: "too many redirects"}
 		}
 		if rerr != nil {
 			return zmux.PipeIO{}, rawURL, rerr
@@ -298,7 +295,7 @@ func dialPipe(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Cred
 	}
 }
 
-func dialOnce(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Credential) (zmux.PipeIO, error) {
+func dialOnce(ctx context.Context, rawURL string, o *DialOptions, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return zmux.PipeIO{}, err
@@ -398,7 +395,7 @@ func handshake(ctx context.Context, nc net.Conn, rawURL string, co *wsconn.Clien
 // follows.
 func handshakeErr(err, credErr error) error {
 	var he *wsconn.HandshakeError
-	if credErr != nil && (!errors.As(err, &he) || !zmux.IsHTTPRedirect(he.Status)) {
+	if credErr != nil && (!errors.As(err, &he) || !zmuxhttp.IsRedirect(he.Status)) {
 		return credErr
 	}
 	return err
@@ -442,13 +439,13 @@ func (d *tlsDialer) DialContext(ctx context.Context, network, addr string) (net.
 
 // ---- carrier ----
 
-// Pipe returns a WebSocket connection, client or server, as a pipe input
+// ConnPipe returns a WebSocket connection, client or server, as a pipe input
 // with message framing. A connection established by other means should
 // have a read limit of at least zmux.MaxRecordSize+1, 64 bytes more under a
 // transform (wsconn's default
 // is above it). Its ConnectionState is that of c's own connection when
 // that is a TLS connection, else not HandshakeComplete.
-func Pipe(c *wsconn.Conn) zmux.PipeIO { return pipe(c, tlsState(c.NetConn()), true) }
+func ConnPipe(c *wsconn.Conn) zmux.PipeIO { return pipe(c, tlsState(c.NetConn()), true) }
 
 // own says that the connection beneath c carries only c.
 func pipe(c *wsconn.Conn, st *tls.ConnectionState, own bool) zmux.PipeIO {
@@ -564,24 +561,24 @@ func (p *carrier) Abort(error) {
 // SetReadDeadline bounds reads, as zmux.Admission.AdmitPipe needs.
 func (p *carrier) SetReadDeadline(t time.Time) error { return p.c.SetReadDeadline(t) }
 
-// Candidate is a WebSocket to rawURL for zmux.DialMode, dialed as DialPipe
+// Candidate is a WebSocket to rawURL for zmux.DialChoice, dialed as DialPipe
 // does with o (nil: the zero DialOptions) and the session's credential in
 // place of o.Credential. A refused upgrade is reported as a
-// *zmux.HTTPStatusError, so that the mode reports the candidate refused.
+// *zmuxhttp.StatusError, so that the mode reports the candidate refused.
 func Candidate(rawURL string, o *DialOptions) zmux.Candidate {
 	var opts DialOptions
 	if o != nil {
 		opts = *o
 	}
-	t := zmux.NewHTTPTarget(rawURL)
-	return zmux.Candidate{Kind: zmux.CarrierWebSocket, Target: t, Dial: func(ctx context.Context, cred zmux.Credential) (zmux.PipeIO, error) {
+	t := zmuxhttp.NewTarget(rawURL)
+	return zmux.Candidate{Kind: zmux.CarrierWebSocket, Target: t, Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 		p, final, err := dialPipe(ctx, t.URL(), &opts, cred)
 		if err == nil {
 			t.Redirected(final)
 		}
 		var he *wsconn.HandshakeError
 		if errors.As(err, &he) && he.Status != 0 {
-			return p, fmt.Errorf("%w: %w", &zmux.HTTPStatusError{StatusCode: he.Status,
+			return p, fmt.Errorf("%w: %w", &zmuxhttp.StatusError{StatusCode: he.Status,
 				Status: strconv.Itoa(he.Status) + " " + http.StatusText(he.Status)}, err)
 		}
 		return p, err

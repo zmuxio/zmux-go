@@ -90,14 +90,14 @@ func (p *wssPeer) expect(t *testing.T, prefix string) string {
 func wssConfig() *zmux.Config {
 	return &zmux.Config{EnableDatagrams: true, MaxPipes: 4,
 		PipeAuth:        zmux.PipeAuth{Exporter: true, EndToEnd: true},
-		AllowRecordMode: func(zmux.CarrierInfo, zmux.RecordMode, any) bool { return true },
+		AllowRecordMode: func(zmux.RecordPolicyInput, zmux.RecordMode, any) bool { return true },
 		// A join on a carrier declared secure (a WebSocket on a TLS
 		// connection of its own) is Bound.
-		RecordPolicy: func(c zmux.CarrierInfo) zmux.RecordMode {
+		RecordPolicy: func(c zmux.RecordPolicyInput) zmux.RecordMode {
 			if c.Secure {
-				return zmux.Bound
+				return zmux.RecordBound
 			}
-			return zmux.Sealed
+			return zmux.RecordSealed
 		}}
 }
 
@@ -138,7 +138,7 @@ func wssCheck(t *testing.T, ctx context.Context, c *zmux.Conn, p *wssPeer) {
 		t.Fatalf("%d pipes, want the joined one too", len(ps))
 	}
 	for _, s := range ps[1:] {
-		if s.RecordMode != zmux.Bound {
+		if s.RecordMode != zmux.RecordBound {
 			t.Fatalf("join in record mode %v, want Bound: %+v", s.RecordMode, ps)
 		}
 	}
@@ -188,7 +188,7 @@ func TestInteropWSSServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = l.Close() }()
-	h, err := zmuxws.Handler(l, nil)
+	h, err := zmuxws.NewHandler(l, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

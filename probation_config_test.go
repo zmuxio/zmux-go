@@ -8,9 +8,8 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-// TestProbationSettings: Probation zero is the default, NoProbation turns
-// probation off, and a negative Probation or one set with NoProbation is
-// invalid, for the session's setting and a pipe's.
+// TestProbationSettings: Probation zero is the default and a negative
+// Probation turns probation off, for the session's setting and a pipe's.
 func TestProbationSettings(t *testing.T) {
 	for _, x := range []struct {
 		p    SchedulerParams
@@ -18,10 +17,9 @@ func TestProbationSettings(t *testing.T) {
 		bad  bool
 	}{
 		{SchedulerParams{}, -1, false},
-		{SchedulerParams{NoProbation: true}, 0, false},
+		{SchedulerParams{Probation: -1}, 0, false},
 		{SchedulerParams{Probation: 2 * time.Second}, core.Duration(2 * time.Second), false},
-		{SchedulerParams{Probation: -1}, 0, true},
-		{SchedulerParams{Probation: time.Second, NoProbation: true}, 0, true},
+		{SchedulerParams{Probation: -time.Hour}, 0, false},
 	} {
 		cc, err := (&Config{SchedulerParams: x.p}).coreConfig(core.RoleInitiator, core.RoleInitiator)
 		if x.bad {
@@ -43,12 +41,11 @@ func TestProbationSettings(t *testing.T) {
 		bad  bool
 	}{
 		{PipeOptions{}, nil, false},
-		{PipeOptions{NoProbation: true}, new(core.Duration), false},
+		{PipeOptions{Probation: -1}, new(core.Duration), false},
 		{PipeOptions{Probation: time.Second}, func() *core.Duration { d := core.Duration(time.Second); return &d }(), false},
-		{PipeOptions{Probation: -1}, nil, true},
-		{PipeOptions{Probation: time.Second, NoProbation: true}, nil, true},
+		{PipeOptions{Probation: -time.Hour}, new(core.Duration), false},
 	} {
-		j, err := x.o.join(DirBidirectional)
+		j, err := x.o.join(DirectionBidirectional)
 		if x.bad {
 			if !errors.Is(err, ErrInvalidConfig) {
 				t.Fatalf("%+v: %v", x.o, err)

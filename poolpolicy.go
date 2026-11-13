@@ -14,16 +14,24 @@ type PoolPolicy interface {
 
 // PoolView is the state of a pool.
 type PoolView struct {
-	Now      time.Time
-	Members  []PoolMember
-	Failures int       // consecutive failed dials
-	LastDial time.Time // zero: none
+	Now time.Time
+	// Connections reports a carrier.Pool: its members are connections,
+	// named by FateGroup and retired with RetireConnections. Otherwise they
+	// are the pipes of a PipePool, named by PipeID and retired with
+	// RetirePipes.
+	Connections bool
+	Members     []PoolMember
+	Failures    int       // consecutive failed dials
+	LastDial    time.Time // zero: none
 }
 
-// PoolMember is a pipe of a PipePool, or a connection of a CarrierPool.
+// PoolMember is a pipe of a PipePool, or a connection of a carrier.Pool.
 type PoolMember struct {
-	ID  uint64 // pipe ID, or the connection's fate group
-	Age time.Duration
+	// PipeID is the pipe of a PipePool member; FateGroup the fate group
+	// of a carrier.Pool connection. The other is zero.
+	PipeID    PipeID
+	FateGroup uint64
+	Age       time.Duration
 	// Idle: for a pipe, its PipeStats.SinceLastTraffic (probes,
 	// acknowledgements and padding do not end it); for a connection, 0
 	// while it carries pipes, otherwise since its last pipe ended, or
@@ -45,55 +53,53 @@ type PoolDecision struct {
 	// the pool's backoff (at most its maximum). Zero is the pool's
 	// backoff; a negative value is invalid.
 	DialAfter time.Duration
-	// Retire lists the members to retire now (a pipe is replaced before
-	// it closes).
-	Retire []uint64
+	// RetirePipes lists the pipes of a PipePool to retire now (a pipe is
+	// replaced before it closes); RetireConnections lists the connections
+	// of a carrier.Pool to retire, by fate group.
+	RetirePipes       []PipeID
+	RetireConnections []uint64
 	// Recheck asks for the next Decide within this time even when nothing
 	// else happens. Zero is none; a negative value is invalid. Pools wait
 	// at least MinRecheck.
 	Recheck time.Duration
-	// ProbeInterval, ProbeJitter, DisableIdleProbe and NoProbeJitter are
-	// set on the pipes a pool dials after this decision, over its
-	// PipeOptions: the zero values keep the pool's (else the session's)
-	// settings; DisableIdleProbe turns their idle probes off and
-	// NoProbeJitter makes their jitter 0; ProbeInterval is otherwise at
-	// least 1 s and ProbeJitter from 0 to below 1. Unlike
-	// PipeOptions.ProbeInterval, a negative ProbeInterval is invalid here,
-	// as the pool decisions shared by every implementation have it. A pool that dials no pipes ignores
-	// valid ones. Validate reports values outside these ranges, which a
-	// pool (or Config.RedialPolicy's session) does not clamp: it rejects
-	// the whole decision and reports the error to its DecisionRejected
-	// callback.
-	ProbeInterval    time.Duration
-	ProbeJitter      float64
-	DisableIdleProbe bool
-	NoProbeJitter    bool
+	// Liveness is set on the pipes a pool dials after this decision, over
+	// its PipeOptions.Liveness: a zero field keeps the pool's (else the
+	// session's) setting, and the others take the forms and bounds of
+	// PipeLiveness (a negative ProbeInterval turns their idle probes off).
+	// A pool that dials no pipes ignores it. Validate reports values
+	// outside these bounds, which a pool (or Config.RedialPolicy's session)
+	// does not clamp: it rejects the whole decision and reports the error
+	// to its DecisionRejected callback.
+	Liveness PipeLiveness
 }
 
 // Validate reports, with ErrInvalidConfig, a decision with a negative
-// Count, DialAfter or Recheck, a ProbeInterval neither 0 nor at least
-// 1 s, or a ProbeJitter outside [0, 1).
+// Count, DialAfter or Recheck, or a Liveness outside the bounds of
+// PipeLiveness.
 func (d *PoolDecision) Validate() error {
 	if d.Count < 0 || d.DialAfter < 0 || d.Recheck < 0 {
 		return fmt.Errorf("%w: PoolDecision with a negative Count, DialAfter or Recheck", ErrInvalidConfig)
 	}
-	if d.ProbeInterval < 0 {
-		return fmt.Errorf("%w: negative PoolDecision.ProbeInterval", ErrInvalidConfig)
+	if _, err := d.Liveness.core(); err != nil {
+		return fmt.Errorf("PoolDecision.Liveness: %w", err)
 	}
-	if err := checkProbeInterval(d.ProbeInterval, "PoolDecision.ProbeInterval"); err != nil {
-		return err
-	}
-	return checkProbeJitter(d.ProbeJitter, "PoolDecision.ProbeJitter")
+	return nil
 }
 
 // MinRecheck is the shortest wait a pool applies to PoolDecision.Recheck.
 const MinRecheck = 10 * time.Millisecond
 
+// Ask fills d with pol's decision on v, as every pool asks its policy: a
+// panic in Decide is contained (the zero decision then applies), and the
+// error is the decision's Validate error, the decision left as it is; a
+// pool that rejects the decision goes on as with the zero one.
+func (d *PoolDecision) Ask(pol PoolPolicy, v *PoolView) error { return decide(nil, pol, v, d) }
+
 // decide asks pol, containing a panic (the zero decision then applies,
 // and the panic is logged to l), and returns the decision's Validate
 // error, the decision left as it is.
 func decide(l *slog.Logger, pol PoolPolicy, v *PoolView, d *PoolDecision) error {
-	*d = PoolDecision{Retire: d.Retire[:0]}
+	*d = PoolDecision{RetirePipes: d.RetirePipes[:0], RetireConnections: d.RetireConnections[:0]}
 	if !safeLog(l, "PoolPolicy.Decide", func() { pol.Decide(v, d) }) {
 		*d = PoolDecision{}
 	}
@@ -109,25 +115,27 @@ func reportRejected(l *slog.Logger, f func(error), err error) {
 	}
 }
 
-// probeOptions returns o with d's probe settings over it.
+// probeOptions returns o with d's liveness settings over it.
 func (d *PoolDecision) probeOptions(o PipeOptions) PipeOptions {
-	switch {
-	case d.DisableIdleProbe:
-		o.ProbeInterval = -1
-	case d.ProbeInterval > 0:
-		o.ProbeInterval = d.ProbeInterval
+	l, dl := &o.Liveness, &d.Liveness
+	if dl.SuspectFloor != 0 {
+		l.SuspectFloor = dl.SuspectFloor
 	}
-	switch {
-	case d.NoProbeJitter:
-		o.ProbeJitter, o.NoProbeJitter = 0, true
-	case d.ProbeJitter > 0:
-		o.ProbeJitter, o.NoProbeJitter = d.ProbeJitter, false
+	if dl.DeadTimeout != 0 {
+		l.DeadTimeout = dl.DeadTimeout
+	}
+	if dl.ProbeInterval != 0 {
+		l.ProbeInterval = dl.ProbeInterval
+	}
+	if dl.ProbeJitter != 0 {
+		l.ProbeJitter = dl.ProbeJitter
 	}
 	return o
 }
 
-// recheckAfter is the wait d asks for before the next Decide; 0: none.
-func recheckAfter(d *PoolDecision) time.Duration {
+// RecheckAfter is the wait d asks for before the next Decide, Recheck
+// raised to MinRecheck; 0: none.
+func (d *PoolDecision) RecheckAfter() time.Duration {
 	if d.Recheck <= 0 {
 		return 0
 	}

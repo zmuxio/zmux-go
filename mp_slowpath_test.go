@@ -146,8 +146,8 @@ func echoed(t *testing.T, links []link, win uint64, at time.Duration) (int64, Co
 		ccfg.Clock, scfg.Clock = timeshim.Real, timeshim.Real
 		if win != 0 {
 			for _, c := range []*Config{ccfg, scfg} {
-				c.InitialStreamReceiveWindow, c.MaxStreamReceiveWindow = win, win
-				c.InitialConnectionReceiveWindow, c.MaxConnectionReceiveWindow = 2*win, 2*win
+				c.InitialStreamReceiveWindow, c.MaxStreamReceiveWindow = int64(win), int64(win)
+				c.InitialConnectionReceiveWindow, c.MaxConnectionReceiveWindow = 2*int64(win), 2*int64(win)
 			}
 		}
 		ln := netx.NewChanListener(nil, 0)
@@ -178,7 +178,9 @@ func echoed(t *testing.T, links []link, win uint64, at time.Duration) (int64, Co
 			t.Fatal(err)
 		}
 		var n atomic.Int64
+		wrote := make(chan struct{})
 		go func() {
+			defer close(wrote)
 			buf := make([]byte, 32<<10)
 			for {
 				if _, err := st.Write(buf); err != nil {
@@ -204,6 +206,7 @@ func echoed(t *testing.T, links []link, win uint64, at time.Duration) (int64, Co
 			firstSent = ps.BytesSent
 		}
 		_ = st.Close()
+		<-wrote // its next Write fails: the bubble ends without it
 	})
 	return got, cs, firstSent
 }

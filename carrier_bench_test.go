@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 // benchBulk measures one bulk stream from c to s.
@@ -111,7 +112,7 @@ func BenchmarkBulkRecords(b *testing.B) {
 // BenchmarkBulkHTTP2: a full-duplex HTTP/2 request carrier.
 func BenchmarkBulkHTTP2(b *testing.B) {
 	lst := mustNewListener(nil)
-	hh, err := zmux.NewHTTPHandler(lst, nil)
+	hh, err := zmuxhttp.NewHandler(lst, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -122,7 +123,7 @@ func BenchmarkBulkHTTP2(b *testing.B) {
 	defer func() { _ = lst.Close() }()
 	// The request lives as long as its context: no timeout on it.
 	ctx := b.Context()
-	p, err := zmux.HTTPPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirBidirectional, nil)
+	p, err := zmuxhttp.StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionBidirectional, nil)
 	if err != nil {
 		b.Fatal(err)
 	}

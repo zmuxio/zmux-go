@@ -109,10 +109,16 @@ type Conn struct {
 	carrierVariant string
 	needRedial     bool        // a direction may have been lost (under the lock)
 	dialed         Endpoint    // who dialed the bootstrap carrier; 0: unknown
-	carrier        CarrierKind // the kind DialMode chose
+	carrier        CarrierKind // the kind DialChoice chose
 
-	fired    bool // the timeout ran: rearm no earlier than G
-	closing  bool // CLOSED: no new goroutines
+	fired   bool // the timeout ran: rearm no earlier than G
+	closing bool // CLOSED: no new goroutines
+	// ending is closed when the first Close or Abort has returned; nil
+	// before either. closeSig, while Close waits, is woken at every
+	// unlock. aborted: Abort was called.
+	ending   chan struct{}
+	closeSig *core.Signal
+	aborted  bool
 	poisoned bool
 	// A shaping deadline is met in place: the timer is armed lead before
 	// it, by the host timer's observed lateness, and the callback waits
@@ -122,7 +128,7 @@ type Conn struct {
 	chIn    chIn // received channel datagrams for the session
 	chInMax int  // the hand-off's length: the datagram receive queue's
 
-	carrierTries []CandidateResult // DialMode's tries, in order
+	carrierTries []CandidateResult // DialChoice's tries, in order
 }
 
 var sigPool = sync.Pool{New: func() any { s := make([]*core.Signal, 0, 16); return &s }}
@@ -149,6 +155,9 @@ func (c *Conn) unlock() {
 	}
 	wp := sigPool.Get().(*[]*core.Signal)
 	ws := c.s.TakeWakes((*wp)[:0])
+	if c.closeSig != nil {
+		ws = append(ws, c.closeSig)
+	}
 	ap := actPool.Get().(*[]core.Action)
 	acts := c.s.TakeActions((*ap)[:0])
 	c.drainEventsLocked()
@@ -486,7 +495,7 @@ func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 		if closed {
 			c.unlock()
 			closePipeIO(p)
-			c.closeWith(0, "listener closed")
+			c.Abort(0, "listener closed")
 			return c, errRejected
 		}
 	}
@@ -507,7 +516,7 @@ func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 		return c, nil
 	}
 	if err := c.waitEstablished(ctx); err != nil {
-		c.closeWith(0, "")
+		c.Abort(0, "")
 		return c, err
 	}
 	return c, nil
@@ -666,7 +675,7 @@ func DialTLS(ctx context.Context, network, addr string, tlsConf *tls.Config, cfg
 func Client(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
 	p := NetPipe(c)
 	if cfg != nil {
-		if err := PresentPipe(ctx, p, cfg.Credential); err != nil {
+		if err := PresentPipe(ctx, p, cfg.CarrierCredential); err != nil {
 			_ = c.Close()
 			return nil, err
 		}
@@ -750,87 +759,143 @@ func (c *Conn) closedErr() error {
 	return net.ErrClosed
 }
 
-// CloseWithError closes the session immediately with an application error,
-// discarding data not yet sent. It writes CONNECTION_CLOSE to every usable
-// outbound pipe, then ends each carrier's write direction gracefully (TCP
-// FIN, TLS close_notify, the carrier's own close where it has no
-// half-close) and keeps reading and discarding what the peer still sends,
-// so that unread data does not turn the final close into a reset that
-// could destroy CONNECTION_CLOSE at the peer. It returns once every
-// carrier's read side has ended (the peer closed), or after the linger
-// timeout, or at the latest one second after the call, whichever comes
-// first; it does not otherwise wait for the peer.
+// closeLimit bounds the whole of Close: the flush and the hand-off of
+// CONNECTION_CLOSE to the carriers.
+const closeLimit = time.Second
+
+// Close closes the session gracefully, without error (code 0). The data
+// the streams have written and not yet sent is sent first, as far as flow
+// control and the carriers allow; then CONNECTION_CLOSE is handed to the
+// carrier of every usable outbound pipe, after which each pipe's write
+// side is shut down gracefully and its inbound side read until the peer
+// ends it or the linger timeout passes. Streams still open fail with the
+// session's error. Close returns once CONNECTION_CLOSE has been handed to
+// every such carrier (written to it; for a socket, taken into the
+// kernel's send buffer), at once when no pipe can carry it, and at the
+// latest one second after the call, flushing included: what has not been
+// handed over by then is discarded and the carriers that did not take
+// CONNECTION_CLOSE are closed. The half-close and the linger go on in the
+// background, so a process may exit as soon as Close returns; Wait waits
+// for them.
 //
-// A process that exits as soon as CloseWithError returns has therefore
-// handed CONNECTION_CLOSE to the carriers and half-closed them, and has
-// drained them until the peer closed or for the time left of that second.
-// Only if a carrier did not take CONNECTION_CLOSE or complete its
-// half-close within the second (a peer that does not read) are the
-// carriers closed at once. A session that keeps running drains in the
-// background until the linger timeout (at most two seconds) and then
-// closes the carriers.
-//
-// A repeated call returns at once once the close has completed. Wait waits
-// for the session's end and its goroutines.
-func (c *Conn) CloseWithError(code ApplicationErrorCode, msg string) error {
-	c.closeWith(code, msg)
-	c.awaitClose()
+// Close and Abort are idempotent: the first call of either decides what is
+// sent, and a later call returns no later than the first, except that an
+// Abort while Close is still flushing discards what remains unsent and
+// ends the flush at once. Either returns at once on an ended session.
+// Close always returns nil.
+func (c *Conn) Close() error {
+	c.closeGraceful(0, "")
 	return nil
 }
 
-// closeWith starts the immediate close; it cannot fail.
-func (c *Conn) closeWith(code ApplicationErrorCode, msg string) {
+// closeGraceful is Close with an application error code and reason.
+func (c *Conn) closeGraceful(code ApplicationErrorCode, msg string) {
 	c.lock()
-	defer c.unlock()
-	c.s.SetNow(c.clk.now())
-	c.s.Close(uint64(code), []byte(msg))
-}
-
-// closeLimit bounds how long a close waits for the carriers to take
-// CONNECTION_CLOSE and to drain.
-const closeLimit = time.Second
-
-// awaitClose waits until the session has ended (the carriers drained, or
-// the linger timeout passed) or closeLimit has passed. At the limit it
-// ends the session unless every carrier took CONNECTION_CLOSE and
-// completed its half-close; then the drain continues in the background.
-// It never waits on a carrier itself: the half-close runs on the lane's
-// writer (a TLS CloseWrite can block on a peer that does not read), and
-// ending the session aborts the carriers, which releases it.
-func (c *Conn) awaitClose() {
+	// After an Abort, which returned at once, a Close returns at once too.
+	if c.ending != nil || c.closing || c.aborted {
+		ch := c.ending
+		c.unlock()
+		if ch != nil {
+			select {
+			case <-ch:
+			case <-c.done:
+			}
+		}
+		return
+	}
+	c.ending = make(chan struct{})
+	sig := core.NewSignal()
+	c.closeSig = sig
+	c.unlock()
+	defer func() {
+		c.lock()
+		c.closeSig = nil
+		c.unlock()
+		close(c.ending)
+	}()
 	t := time.NewTimer(closeLimit) // real time: a bound on carrier IO
 	defer t.Stop()
-	select {
-	case <-c.done:
-		return
-	case <-t.C:
+	expired := false
+	// The flush: until nothing written can be sent now. The checks read
+	// under the bare mutex: an unlock would wake sig itself.
+	for !expired {
+		c.mu.Lock()
+		flushing := !c.aborted && c.s.Flushable()
+		c.mu.Unlock()
+		if !flushing {
+			break
+		}
+		select {
+		case <-sig.C:
+		case <-c.done:
+			return
+		case <-t.C:
+			expired = true
+		}
+	}
+	c.lock()
+	c.s.SetNow(c.clk.now())
+	c.s.Close(uint64(code), []byte(msg)) // nothing when an Abort closed it first
+	c.unlock()
+	// The hand-off: until every carrier took CONNECTION_CLOSE.
+	for !expired {
+		c.mu.Lock()
+		done := c.handedOffLocked()
+		c.mu.Unlock()
+		if done {
+			return
+		}
+		select {
+		case <-sig.C:
+		case <-c.done:
+			return
+		case <-t.C:
+			expired = true
+		}
 	}
 	c.lock()
 	defer c.unlock()
 	c.s.SetNow(c.clk.now())
-	done := c.s.CloseHandedOff()
-	for _, pd := range c.pipes {
-		if done && pd.shutdownRequested() && !pd.hc.wDone.Load() {
-			done = false
-		}
-	}
-	if !done {
+	if !c.handedOffLocked() {
 		c.s.EndClose()
 	}
 }
 
-// Close is CloseWithError(0, ""): it closes the session at once,
-// discarding data not yet sent, and returns once CONNECTION_CLOSE has been
-// handed to the carriers and they have been half-closed and drained (at
-// most about one second, see CloseWithError). Unlike net.Conn.Close
-// it does not flush: to let the peer read what was written, call
-// Shutdown(ctx, 0, "") instead.
-func (c *Conn) Close() error { return c.CloseWithError(0, "") }
+// handedOffLocked reports whether CONNECTION_CLOSE has been handed to
+// every carrier that can take it and their half-close requested.
+func (c *Conn) handedOffLocked() bool {
+	if !c.s.CloseHandedOff() {
+		return false
+	}
+	for _, pd := range c.pipes {
+		if pd.shutdownRequested() && !pd.hc.wDone.Load() {
+			return false
+		}
+	}
+	return true
+}
+
+// Abort ends the session at once with an application error: it sends
+// CONNECTION_CLOSE with code and reason on each usable outbound pipe whose
+// carrier takes it, discards the data not yet sent, fails the open streams
+// with the session's error and returns without waiting for any carrier.
+// The carriers are then shut down gracefully in the background, as Close
+// does after its hand-off. Code 0 is allowed and differs from Close only
+// in what is drained. An Abort after Close or Abort sends nothing more,
+// except that one while Close is still flushing ends the flush.
+func (c *Conn) Abort(code ApplicationErrorCode, reason string) {
+	c.lock()
+	defer c.unlock()
+	c.aborted = true
+	c.s.SetNow(c.clk.now())
+	c.s.Close(uint64(code), []byte(reason))
+}
 
 // Shutdown closes gracefully: it sends GOAWAY when the session negotiated
 // it, so that the peer opens no new stream, waits until the open streams
 // have ended, then closes with code and msg. When ctx ends first
-// it falls back to CloseWithError(code, msg) and returns ctx's error. The
+// it falls back to the graceful close of Close, with code and msg, and
+// returns ctx's error. The
 // usual call is
 //
 //	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -845,7 +910,7 @@ func (c *Conn) Shutdown(ctx context.Context, code ApplicationErrorCode, msg stri
 	case <-c.done:
 		return nil
 	case <-ctx.Done():
-		_ = c.CloseWithError(code, msg)
+		c.closeGraceful(code, msg)
 		return ctx.Err()
 	}
 }
@@ -1044,7 +1109,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 	st.Multipath, st.PipeAck, st.Resume, st.JoinSecurityAbsent = f.Multipath, f.PipeAck, f.Resume, f.JoinSecurityUnavailable
 	st.JoinPending = c.s.JoinPendingNow()
 	if m, unmanaged := c.s.WeakestMode(); unmanaged {
-		st.WeakestRecordMode = Unmanaged
+		st.WeakestRecordMode = RecordUnmanaged
 	} else {
 		st.WeakestRecordMode = RecordMode(m)
 	}
@@ -1070,7 +1135,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 // the fields marked gauge are current values. A duration or RTT that is
 // absent (before the first sample) is 0.
 type ConnectionStats struct {
-	// Carrier is the carrier kind a carrier mode chose (DialMode), the
+	// Carrier is the carrier kind a carrier mode chose (DialChoice), the
 	// latest after a switch; 0 for a session not dialed in a mode. The
 	// chosen candidate's Variant is its pipe's PipeStats.Variant.
 	Carrier CarrierKind
@@ -1201,11 +1266,28 @@ func (c *Conn) releaseFirst(timeout bool) {
 	}
 }
 
-// Admitted returns the Decision.Value of the admission that accepted the
-// session's bootstrap carrier (for a split bootstrap, its uplink half's),
-// nil without one and on the dialing side. It does not change for the
-// session's lifetime, resumes included; Pipe.Admitted is each pipe's.
-func (c *Conn) Admitted() any { return c.admitted }
+// admittedValue is the Decision.Value of the admission that accepted the
+// session's bootstrap carrier (for a split bootstrap, its uplink half's).
+func (c *Conn) admittedValue() any { return c.admitted }
+
+// Admitted is a session or one of its pipes, whose admission value
+// AdmittedAs reads: a *Conn or a *Pipe.
+type Admitted interface{ admittedValue() any }
+
+// AdmittedAs returns the Decision.Value of the admission that accepted a,
+// as a T; ok is false when there is none or it is not a T. For a *Conn it
+// is the value of the session's bootstrap carrier (for a split bootstrap,
+// its uplink half's), which does not change for the session's lifetime,
+// resumes included; for a *Pipe it is that of the pipe's carrier, the one
+// that carried its Hello (the session's for the bootstrap pipe), and there
+// is none once the session no longer knows the pipe. There is none on the
+// dialing side. zmux does not compare a pipe's value with the session's: a
+// host that requires a join to come from the session's client compares
+// them, in WrapPipe or after the pipe event.
+func AdmittedAs[T any](a Admitted) (v T, ok bool) {
+	v, ok = a.admittedValue().(T)
+	return v, ok
+}
 
 // LocalAddr returns the local address of pipe 0 when its carrier has one.
 func (c *Conn) LocalAddr() net.Addr {

@@ -49,7 +49,7 @@ type PickRequest struct {
 
 // PickPipe is a pipe as a custom policy sees it (values only).
 type PickPipe struct {
-	Pipe      uint64 // pipe ID
+	PipeID    PipeID
 	SRTT      time.Duration
 	RTTVar    time.Duration
 	Rate      float64 // delivery rate estimate, bytes per second
@@ -79,8 +79,8 @@ type PickAnswer struct {
 	Wait  bool
 }
 
-// Custom returns a scheduler that asks p.
-func Custom(p Pick) Scheduler { return customPolicy{p} }
+// SchedulerCustom returns a scheduler that asks p.
+func SchedulerCustom(p Pick) Scheduler { return customPolicy{p} }
 
 type customPolicy struct{ p Pick }
 
@@ -277,7 +277,7 @@ func (h *hooks) runPick() {
 	}
 	pipes := make([]PickPipe, len(req.Pipes))
 	for i, p := range req.Pipes {
-		pipes[i] = PickPipe{Pipe: p.Pipe, State: OutboundState(p.State), SRTT: time.Duration(p.SRTT),
+		pipes[i] = PickPipe{PipeID: PipeID(p.Pipe), State: OutboundState(p.State), SRTT: time.Duration(p.SRTT),
 			RTTVar: time.Duration(p.RTTVar), Rate: p.Rate, Unsent: p.Unsent, InFlight: p.InFlight,
 			Writable: p.Writable, Priority: p.Priority, Standby: p.Standby, Saturated: p.Saturated,
 			Probation: p.Probation, Eligible: p.Eligible, Weight: p.Weight,
@@ -352,11 +352,11 @@ func (c *Conn) maybeRedial() {
 	case out && in:
 		return
 	case !out && !in:
-		need = DirBidirectional
+		need = DirectionBidirectional
 	case !out:
-		need = DirSendOnly
+		need = DirectionSendOnly
 	default:
-		need = DirReceiveOnly
+		need = DirectionReceiveOnly
 	}
 	r := &c.redial
 	r.mu.Lock()
@@ -406,7 +406,7 @@ func (c *Conn) redialLoop(need Direction) {
 		v := &st.view
 		v.Now, v.Failures, v.LastDial, v.Members = clk.Now(), st.failures, st.lastDial, v.Members[:0]
 		for _, ps := range c.PipeStats() {
-			v.Members = append(v.Members, PoolMember{ID: ps.Pipe, Age: ps.AttachedFor, Idle: ps.SinceLastTraffic,
+			v.Members = append(v.Members, PoolMember{PipeID: ps.PipeID, Age: ps.AttachedFor, Idle: ps.SinceLastTraffic,
 				Pipes: 1, BytesSent: ps.BytesSent, BytesReceived: ps.BytesReceived})
 		}
 		if err := decide(c.cfg.Logger, pol, v, &st.dec); err != nil {
@@ -446,7 +446,7 @@ func (c *Conn) redialLoop(need Direction) {
 		}
 		if ok && err == nil {
 			ctx, cancel := timeshim.WithDeadline(c.ctx, clk, clk.Now().Add(c.cfg.joinTimeout()))
-			_, err = c.AddPipe(ctx, p, st.dec.probeOptions(PipeOptions{Direction: need, NoWaitAttached: true}))
+			_, err = c.AddPipe(ctx, p, st.dec.probeOptions(PipeOptions{Direction: need, ReturnOnReply: true}))
 			cancel()
 			if err == nil {
 				st.failures, st.backoff = 0, lo

@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"context"
@@ -18,32 +18,32 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/labels"
-	"github.com/zmuxio/zmux-go/varint"
 )
 
-// HTTPExchangePipe opens an HTTP exchange carrier (see HTTPExchangeConfig)
-// to the HTTPExchangeHandler at rawURL and returns it as a bidirectional
-// pipe for Start or Conn.AddPipe. It sends nothing before zmux writes; the
+// ExchangePipe opens an HTTP exchange carrier (see ExchangeConfig)
+// to the ExchangeHandler at rawURL and returns it as a bidirectional
+// pipe for Start or zmux.Conn.AddPipe. It sends nothing before zmux writes; the
 // carrier is ready at once. rawURL may contain {instance} and {nonce}
 // placeholders, anywhere in its path or query. client may be nil
 // (http.DefaultClient); keep its transport's MaxIdleConnsPerHost at least
 // DownRequests+UpRequests so that connections are reused. ctx bounds the
 // setting up: ending it before the first verified response fails the
 // carrier, which otherwise lives until zmux closes it. An invalid cfg (nil, or
-// without a PSK and AllowInsecure) is an ErrInvalidConfig error.
+// without a PSK and AllowInsecure) is a zmux.ErrInvalidConfig error.
 //
-// Every request follows redirects as HTTPPipe does; a pure scheme upgrade
-// (CheckHTTPRedirect) is remembered, and the carrier's later requests go
+// Every request follows redirects as StreamPipe does; a pure scheme upgrade
+// (CheckRedirect) is remembered, and the carrier's later requests go
 // to the new origin at once.
-func HTTPExchangePipe(ctx context.Context, client *http.Client, rawURL string, cfg *HTTPExchangeConfig) (PipeIO, error) {
+func ExchangePipe(ctx context.Context, client *http.Client, rawURL string, cfg *ExchangeConfig) (zmux.PipeIO, error) {
 	return httpExchangePipe(ctx, client, rawURL, nil, cfg)
 }
 
-func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTarget, cfg *HTTPExchangeConfig) (PipeIO, error) {
+func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t *Target, cfg *ExchangeConfig) (zmux.PipeIO, error) {
 	p, err := cfg.resolve()
 	if err != nil {
-		return PipeIO{}, err
+		return zmux.PipeIO{}, err
 	}
 	if t != nil {
 		rawURL = t.URL()
@@ -51,7 +51,7 @@ func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t
 	c := &exClient{p: p, hc: client, nc: noRedirectClient(client), ht: t, wake: make(chan struct{}, 1),
 		downs: map[uint64]*exReqState{}, held: map[uint64]*exPiece{}}
 	if _, err := rand.Read(c.cid[:]); err != nil {
-		return PipeIO{}, err
+		return zmux.PipeIO{}, err
 	}
 	c.key = newExKey(c.p.psk, c.cid[:])
 	inst := c.p.instance
@@ -69,7 +69,7 @@ func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t
 			bust: c.p.cacheBust && !strings.Contains(u, "{nonce}"), origin: new(atomic.Pointer[string])}
 		var probe [exNonceLen]byte
 		if _, err := url.Parse(tg.build(probe[:])); err != nil {
-			return PipeIO{}, fmt.Errorf("%w: exchange URL: %w", ErrInvalidConfig, err)
+			return zmux.PipeIO{}, fmt.Errorf("%w: exchange URL: %w", zmux.ErrInvalidConfig, err)
 		}
 		if i == 0 {
 			c.target = tg
@@ -84,7 +84,7 @@ func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t
 	c.ctx, c.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	c.setup = context.AfterFunc(ctx, c.cancel)
 	labels.Go(ctx, "exchange-client", func() { c.run() })
-	return PipeIO{R: &exClientReader{c}, W: &exClientWriter{c}, Carrier: CarrierExchange}, nil
+	return zmux.PipeIO{R: &exClientReader{c}, W: &exClientWriter{c}, Carrier: zmux.CarrierExchange}, nil
 }
 
 // exTarget builds request targets from the URL template.
@@ -142,7 +142,7 @@ type exClient struct {
 	p          exParams
 	hc         *http.Client // the caller's client (nil: the default)
 	nc         *http.Client // hc returning redirects
-	ht         *HTTPTarget  // the candidate's target, if any
+	ht         *Target      // the candidate's target, if any
 	cid        [exCIDLen]byte
 	key        *exKey
 	target     exTarget // UP and CLOSE requests
@@ -494,26 +494,27 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 		release()
 		return res
 	}
-	hdr := appendExReqHdr(make([]byte, 0, exReqHdrMax), &c.cid, a.kind, a.flags, a.seq, a.ack, uint32(time.Now().Unix()), &nonce)
-	seqRaw := hdr[exCIDLen+2 : exCIDLen+2+varint.SizeVarint(a.seq)]
-	mac := c.key.requestMAC(hdr, a.data)
-	hdr = append(hdr, mac[:]...)
+	// One allocation holds the authentication header and the Data MAC.
+	hdr := appendExAuth(make([]byte, 0, exReqOverhead), c.key, &c.cid, a.kind, a.flags, a.seq, a.ack, uint32(time.Now().Unix()), &nonce, len(a.data))
+	mac := c.key.dataMAC(hdr[exFieldsLen:], a.data)
+	tail := append(hdr[exAuthLen:], mac[:]...)
 	var body io.ReadCloser
-	n := len(hdr) + len(a.data)
+	n := exReqOverhead + len(a.data)
 	if c.p.b64 {
 		enc := getExBuf(b64Len(n))
-		// Encode the header and the data in one run: the header's length
-		// need not be a multiple of three.
-		bin := getExBuf(n)
-		copy(bin.b, hdr)
-		copy(bin.b[len(hdr):], a.data)
-		base64.StdEncoding.Encode(enc.b, bin.b[:n])
+		// The header's 66 bytes encode to 88 characters on their own; the
+		// data and the Data MAC follow in one run.
+		base64.StdEncoding.Encode(enc.b, hdr)
+		bin := getExBuf(len(a.data) + exMACLen)
+		copy(bin.b, a.data)
+		copy(bin.b[len(a.data):], tail)
+		base64.StdEncoding.Encode(enc.b[b64Len(exAuthLen):], bin.b[:len(a.data)+exMACLen])
 		bin.unref()
 		release()
-		n = b64Len(n)
+		n = b64Len(exAuthLen) + b64Len(len(a.data)+exMACLen)
 		body = &exBody{data: enc.b[:n], done: enc.unref}
 	} else {
-		body = &exBody{hdr: hdr, data: a.data, done: release}
+		body = &exBody{hdr: hdr, data: a.data, tail: tail, done: release}
 	}
 	tg := &c.target
 	if a.kind == exKindDown {
@@ -533,7 +534,7 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 	from := tg.build(nonce[:])
 	resp, final, err := doHTTP(a.ctx, c.hc, c.nc, from, func(u *url.URL) (*http.Request, error) {
 		hops.Add(1)
-		hb := &exBody{hdr: src.hdr, data: src.data, done: unhop}
+		hb := &exBody{hdr: src.hdr, data: src.data, tail: src.tail, done: unhop}
 		req, err := http.NewRequestWithContext(a.ctx, http.MethodPost, u.String(), hb)
 		if err != nil {
 			_ = hb.Close()
@@ -547,7 +548,7 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 		return req, nil
 	})
 	if err != nil {
-		if _, ok := errors.AsType[*HTTPRedirectError](err); ok {
+		if _, ok := errors.AsType[*RedirectError](err); ok {
 			// A redirect the carrier must not follow fails it.
 			res.ok, res.bad, res.err = true, true, err
 		}
@@ -581,7 +582,7 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 		return res
 	}
 	flags, data := b[exMACLen], b[exRespHdr:]
-	want := c.key.responseMAC(c.cid[:], a.kind, seqRaw, nonce[:], flags, data)
+	want := c.key.responseMAC(c.cid[:], a.kind, a.seq, nonce[:], flags, data)
 	if !c.p.skipRespMAC && !hmac.Equal(want[:], b[:exMACLen]) {
 		buf.unref()
 		return res
@@ -703,23 +704,20 @@ func (c *exClient) receiveLocked(n uint64, buf *exBuf, data []byte, fin bool) {
 // exBody is a request body over a header and data that it does not own;
 // done runs once the transport closed it.
 type exBody struct {
-	hdr, data []byte
-	done      func()
-	once      sync.Once
+	hdr, data, tail []byte
+	done            func()
+	once            sync.Once
 }
 
 func (b *exBody) Read(p []byte) (int, error) {
-	if len(b.hdr) > 0 {
-		n := copy(p, b.hdr)
-		b.hdr = b.hdr[n:]
-		return n, nil
+	for _, part := range []*[]byte{&b.hdr, &b.data, &b.tail} {
+		if len(*part) > 0 {
+			n := copy(p, *part)
+			*part = (*part)[n:]
+			return n, nil
+		}
 	}
-	if len(b.data) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, b.data)
-	b.data = b.data[n:]
-	return n, nil
+	return 0, io.EOF
 }
 
 func (b *exBody) Close() error {

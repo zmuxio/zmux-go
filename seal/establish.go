@@ -18,7 +18,7 @@ import (
 )
 
 // Peer is what an Establish learned of the other end. A client gets it with PeerOf; on a
-// server it is Conn.Admitted.
+// server it is AdmittedAs.
 type Peer struct {
 	// Static is the peer's static key.
 	Static []byte
@@ -29,12 +29,12 @@ type Peer struct {
 	AppData []AppData
 	// Verdict is the Anchor's; zero when the peer was not judged (a client of a
 	// server without ClientAnchor, a server under AllowPSKOnly).
-	Verdict Verdict
+	Verdict VerifyVerdict
 	// Value is Gate.Commit's result (server only).
 	Value any
 	// Profile and Mode are those of the handshake.
-	Profile proto.Profile
-	Mode    zmux.RecordMode
+	Profile    proto.Profile
+	RecordMode zmux.RecordMode
 	// PQConfidential reports that the handshake's Profile resists a quantum
 	// adversary; PQAuthenticated that the peer's transcript signature, which
 	// the verdict asked for, is post-quantum and verified.
@@ -64,8 +64,8 @@ type ClientConfig struct {
 	// RequirePQAuth fails a server that is not authenticated by a post-quantum
 	// transcript signature.
 	RequirePQAuth bool
-	// Mode is the carrier's record mode; the zero value is Sealed.
-	Mode zmux.RecordMode
+	// RecordMode is the carrier's record mode; the zero value is Sealed.
+	RecordMode zmux.RecordMode
 	// Handle and PSK select a profile with a pre-shared key; both empty
 	// selects one without.
 	Handle, PSK []byte
@@ -159,12 +159,12 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 		}
 	}
 	var binding []byte
-	if cfg.Mode == zmux.Bound {
+	if cfg.RecordMode == zmux.RecordBound {
 		if binding, err = readBinding(ctx, p, true); err != nil {
 			return q, err
 		}
 	}
-	hs, err := proto.NewInitiator(proto.Config{Profile: profile, Mode: proto.Mode(cfg.Mode), Handle: handle, PSK: psk, Binding: binding, Static: key,
+	hs, err := proto.NewInitiator(proto.Config{Profile: profile, Mode: proto.Mode(cfg.RecordMode), Handle: handle, PSK: psk, Binding: binding, Static: key,
 		MaxAppData: cfg.MaxAppData})
 	if err != nil {
 		return q, err
@@ -184,7 +184,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 	if err != nil {
 		return q, err
 	}
-	hello, err := proto.AppendHello(nil, f, proto.Hello{Profile: profile, Mode: proto.Mode(cfg.Mode), Handle: handle, Msg1: msg})
+	hello, err := proto.AppendHello(nil, f, proto.Hello{Profile: profile, Mode: proto.Mode(cfg.RecordMode), Handle: handle, Msg1: msg})
 	if err != nil {
 		return q, err
 	}
@@ -203,7 +203,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 	if err != nil {
 		return q, err
 	}
-	peer := &Peer{Static: bytes.Clone(hs.PeerStatic()), Credential: pl.Credential, AppData: appData(2, pl.AppData), Profile: profile, Mode: cfg.Mode,
+	peer := &Peer{Static: bytes.Clone(hs.PeerStatic()), Credential: pl.Credential, AppData: appData(2, pl.AppData), Profile: profile, RecordMode: cfg.RecordMode,
 		PQConfidential: profile.PQConfidential()}
 	// The server is judged before anything of this client is written.
 	in, err := cfg.verify(ctx, peer, handle, pl)
@@ -284,7 +284,7 @@ func proofPlaceholder(signer Signer) *proto.Proof {
 // verify runs the Anchor over the server's message 2 and returns what it
 // judged.
 func (c *ClientConfig) verify(ctx context.Context, peer *Peer, handle []byte, pl proto.Payload) (*VerifyInput, error) {
-	in := &VerifyInput{Role: RoleServer, Profile: peer.Profile, PeerStatic: peer.Static, PSKIdentity: handle,
+	in := &VerifyInput{Role: zmux.RoleServer, Profile: peer.Profile, PeerStatic: peer.Static, PSKIdentity: handle,
 		Credential: pl.Credential, PeerAppData: slices.Clone(peer.AppData), LocalContext: c.LocalContext}
 	if c.Anchor == nil {
 		return in, nil // AllowPSKOnly
@@ -402,10 +402,10 @@ func carrierExport(p zmux.PipeIO) ([]byte, error) {
 func wrapResult(p zmux.PipeIO, rest []byte, res *proto.Result, peer *Peer) zmux.PipeIO {
 	lower := zmux.PrefixedPipe(p, rest)
 	exp := &resultExporter{res: res, peer: peer}
-	if peer.Mode == zmux.Sealed {
-		return zmux.SealRecords(lower, res.Sealer, res.Opener, zmux.Sealed, exp)
+	if peer.RecordMode == zmux.RecordSealed {
+		return zmux.SealRecords(lower, res.Sealer, res.Opener, zmux.RecordSealed, exp)
 	}
-	return rawCarrier(p, lower, peer.Mode, exp)
+	return rawCarrier(p, lower, peer.RecordMode, exp)
 }
 
 // resultExporter is the handshake's exporter: no exporter of the carrier passes through.

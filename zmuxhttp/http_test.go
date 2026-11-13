@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"bytes"
@@ -8,9 +8,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
@@ -20,14 +23,14 @@ import (
 // of a downlink joined out of band.
 func TestHTTPCarriers(t *testing.T) {
 	leakcheck.Check(t)
-	auth := &PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1}
-	v, err := NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1}
+	v, err := admit.NewPrefixAuthVerifier(auth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: PrefixTokenLen, Decide: v.Decide,
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide,
 		PeekTimeout: 2 * time.Second, StallMax: 100 * time.Millisecond}})
-	hh, err := NewHTTPHandler(lst, nil)
+	hh, err := NewHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,17 +41,17 @@ func TestHTTPCarriers(t *testing.T) {
 	defer cancel()
 	for _, mode := range []string{"duplex", "split"} {
 		t.Run(mode, func(t *testing.T) {
-			var p PipeIO
+			var p zmux.PipeIO
 			var err error
 			if mode == "duplex" {
-				p, err = HTTPPipe(ctx, srv.Client(), srv.URL, nil, DirBidirectional, auth)
+				p, err = StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionBidirectional, auth)
 			} else {
-				p, err = HTTPSplitPipe(ctx, srv.Client(), srv.URL, nil, auth)
+				p, err = SplitPipe(ctx, srv.Client(), srv.URL, nil, auth)
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			c, err := Start(ctx, p, RoleClient, mpConfig())
+			c, err := zmux.Start(ctx, p, zmux.RoleClient, mpConfig())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +85,7 @@ func TestHTTPCarriers(t *testing.T) {
 			}
 			// A downlink joined over two requests.
 			if mode == "duplex" {
-				if _, err := HTTPSplitJoin(ctx, c, srv.Client(), srv.URL, nil, auth, PipeOptions{Direction: DirReceiveOnly}); err != nil {
+				if _, err := SplitJoin(ctx, c, srv.Client(), srv.URL, nil, auth, zmux.PipeOptions{Direction: zmux.DirectionReceiveOnly}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -99,12 +102,12 @@ func TestHTTPPipeSendOnlyStatus(t *testing.T) {
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := HTTPPipe(ctx, srv.Client(), srv.URL, nil, DirSendOnly, nil)
+	p, err := StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionSendOnly, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = p.W.Close() }()
-	var se *HTTPStatusError
+	var se *StatusError
 	for !errors.As(err, &se) {
 		if _, err = p.W.Write([]byte("x")); err != nil && !errors.As(err, &se) {
 			t.Fatalf("write: %v", err)
@@ -164,5 +167,71 @@ func TestBodyPipe(t *testing.T) {
 	go func() { time.Sleep(10 * time.Millisecond); w.Abort(stop) }()
 	if _, err := p.read(buf); !errors.Is(err, stop) {
 		t.Fatalf("read after the writer aborted: %v", err)
+	}
+}
+
+// A Join runs across a pair of requests, and the pipe does not live by the context of
+// the request that arrived second.
+func TestSplitJoinHandlerLifetime(t *testing.T) {
+	t.Parallel()
+	scfg, ccfg := atkConfig(), atkConfig()
+	lst := mustNewListener(&zmux.ListenerConfig{Config: scfg})
+	defer func() { _ = lst.Close() }()
+	hh, err := NewHandler(lst, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var cancels []context.CancelFunc
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		mu.Lock()
+		cancels = append(cancels, cancel)
+		mu.Unlock()
+		hh.ServeHTTP(w, r.WithContext(ctx))
+	}))
+	defer srv.Close()
+	defer srv.CloseClientConnections()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	p0, err := StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionBidirectional, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := zmux.Start(ctx, p0, zmux.RoleClient, ccfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	s, err := lst.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	mu.Lock()
+	before := len(cancels)
+	mu.Unlock()
+	p, err := SplitJoin(ctx, c, srv.Client(), srv.URL, nil, nil, zmux.PipeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 30*time.Second, "the origin's pipe", func() bool { _, ok := s.Pipe(p.ID()); return ok })
+	mu.Lock()
+	second := cancels[len(cancels)-1]
+	if len(cancels) != before+2 {
+		mu.Unlock()
+		t.Fatalf("%d requests for a split join", len(cancels)-before)
+	}
+	mu.Unlock()
+	second()
+	first, _ := c.Pipe(0)
+	_ = first.Abort(nil)
+	echoOnce(t, ctx, c, s)
+	if st, ok := p.Stats(); !ok || st.FailureCount != 0 {
+		t.Fatalf("the pipe died with the request's context: %+v", st)
+	}
+	if st, _ := p.Stats(); st.Carrier != zmux.CarrierSplit {
+		t.Fatalf("carrier %v", st.Carrier)
 	}
 }

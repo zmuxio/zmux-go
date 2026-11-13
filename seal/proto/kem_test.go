@@ -308,3 +308,19 @@ func TestCheckEncapsulationKey(t *testing.T) {
 		t.Error("a short key accepted")
 	}
 }
+
+// TestResponderBindingLength checks that a responder's Binding of the wrong
+// length in Bound is a configuration error; a responder without one in
+// Bound is configured and fails when it reads.
+func TestResponderBindingLength(t *testing.T) {
+	for _, c := range []struct {
+		mode Mode
+		n    int
+		ok   bool
+	}{{Bound, 0, true}, {Bound, BoundExporterLen, true}, {Bound, 31, false}, {Bound, 33, false}} {
+		_, err := NewResponder(Config{Profile: ProfileEstablish, Mode: c.mode, Static: newKey(t), Binding: make([]byte, c.n)})
+		if (err == nil) != c.ok || err != nil && !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("mode %v binding of %d bytes: %v", c.mode, c.n, err)
+		}
+	}
+}

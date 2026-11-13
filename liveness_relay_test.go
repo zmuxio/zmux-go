@@ -28,11 +28,11 @@ func suspectAfter(t *testing.T, e *relayEnv, id uint64, limit time.Duration) tim
 		if at.IsZero() {
 			ev.mu.Lock()
 			for i, x := range ev.got {
-				t.Logf("%v %v pipe %d", ev.at[i].Sub(start), x.Kind, x.Pipe)
+				t.Logf("%v %v pipe %d", ev.at[i].Sub(start), x.Kind, x.PipeID)
 			}
 			ev.mu.Unlock()
 			for _, st := range e.client.PipeStats() {
-				t.Logf("pipe %d %+v", st.Pipe, st)
+				t.Logf("pipe %d %+v", st.PipeID, st)
 			}
 		}
 	}()
@@ -40,7 +40,7 @@ func suspectAfter(t *testing.T, e *relayEnv, id uint64, limit time.Duration) tim
 		ev.mu.Lock()
 		defer ev.mu.Unlock()
 		for i, x := range ev.got {
-			if x.Kind == zmux.EventPipeSuspect && x.Pipe == id && ev.at[i].After(start) {
+			if x.Kind == zmux.EventPipeSuspect && uint64(x.PipeID) == id && ev.at[i].After(start) {
 				at = ev.at[i]
 				return true
 			}
@@ -119,7 +119,7 @@ func TestLivenessStandbyBusy(t *testing.T) {
 		}
 		busy(t, e)
 		time.Sleep(1500 * time.Millisecond) // the join settles and a standby probe runs
-		if d := suspectAfter(t, e, p.ID(), 4*time.Second); d > 2500*time.Millisecond {
+		if d := suspectAfter(t, e, uint64(p.ID()), 4*time.Second); d > 2500*time.Millisecond {
 			t.Fatalf("standby pipe suspect after %v (standby_probe 1 s + T_suspect)", d)
 		}
 	})
@@ -163,7 +163,7 @@ func TestRelaySetLivenessDeadTimeout(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		c := relayConfig(0)
-		c.SchedulerParams.ProbeInterval = time.Second
+		c.Liveness.ProbeInterval = time.Second
 		e := newMemRelayEnv(t, c, relayConfig(0), zmuxtest.RelayOptions{}, true)
 		if err := e.client.SetLiveness(zmux.Liveness{ProbeInterval: time.Second, DeadTimeout: time.Second}); err != nil {
 			t.Fatal(err)

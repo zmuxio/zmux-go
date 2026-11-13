@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"bufio"
@@ -195,7 +195,7 @@ func (p *faultProxy) replay(random bool, reqBody, resp []byte) []byte {
 	}
 	ok200 := bytes.HasPrefix(resp, []byte("HTTP/1.0 200 "))
 	if p.replayDown {
-		if q, ok := parseExReq(reqBody); ok && q.kind == exKindDown && ok200 {
+		if q, ok := parseExRequest(reqBody); ok && q.kind == exKindDown && ok200 {
 			switch {
 			case p.downResp == nil && len(resp)-bytes.Index(resp, []byte("\r\n\r\n"))-4 > exRespHdr:
 				p.downResp, p.downSeq = resp, q.seq
@@ -250,8 +250,8 @@ func (p *faultProxy) forward(target string, body []byte) ([]byte, error) {
 // faultConfig is the exchange configuration of the fault runs: small
 // pieces and short timers so that a run sees many exchanges and recovers
 // quickly.
-func faultConfig() *HTTPExchangeConfig {
-	return &HTTPExchangeConfig{PSK: []byte("fault"), UpPieceSize: 32 << 10, DownPieceSize: 32 << 10,
+func faultConfig() *ExchangeConfig {
+	return &ExchangeConfig{PSK: []byte("fault"), UpPieceSize: 32 << 10, DownPieceSize: 32 << 10,
 		HoldTime: 300 * time.Millisecond, RequestTimeout: 2 * time.Second,
 		BackoffMin: 5 * time.Millisecond, BackoffMax: 100 * time.Millisecond, Deadline: 20 * time.Second}
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/examples/xorpipe"
 )
 
@@ -50,7 +51,7 @@ type server struct {
 
 func newServer(t *testing.T) *server {
 	t.Helper()
-	filter, err := zmux.NewReplayFilter(zmux.ReplayConfig{Window: time.Minute, Max: 1 << 10})
+	filter, err := admit.NewReplayFilter(admit.ReplayConfig{Window: time.Minute, Max: 1 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +138,7 @@ func TestFirstFlight(t *testing.T) {
 	if len(first) <= xorpipe.HeaderLen || !bytes.Contains(xorBytes(first[xorpipe.HeaderLen:]), hello) {
 		t.Fatalf("first write of %d bytes lacks the stream data", len(first))
 	}
-	if cls, _ := zmux.ClassifyFirstBytes(first, zmux.FramingByteStream); cls != zmux.FirstBytesOther {
+	if cls, _ := admit.ClassifyFirstBytes(first, zmux.FramingByteStream); cls != admit.FirstBytesOther {
 		t.Fatalf("the header is classified %v", cls)
 	}
 	echo(t, ctx, c, sc)

@@ -21,10 +21,8 @@ type QualityBand struct {
 	// turns this half off.
 	RateRatio float64
 	// MinInterval is the least time between two events of a pipe. Zero
-	// is 1 s; no minimum takes NoMinInterval.
+	// is 1 s; a negative value sets no minimum.
 	MinInterval time.Duration
-	// NoMinInterval sets no minimum time between events.
-	NoMinInterval bool
 }
 
 // CapacityFloor asks for EventCapacityBelow once the summed delivery rate
@@ -41,13 +39,10 @@ type CapacityFloor struct {
 // core resolves b for the core, whose MinInterval is 0 for the default
 // and negative for none.
 func (b QualityBand) core() (core.QualityBand, error) {
-	if b.RTT < 0 || !(b.RateRatio >= 0) || b.MinInterval < 0 {
+	if b.RTT < 0 || !(b.RateRatio >= 0) {
 		return core.QualityBand{}, fmt.Errorf("%w: negative or NaN QualityBand field", ErrInvalidConfig)
 	}
-	mi := core.Duration(b.MinInterval)
-	if b.NoMinInterval {
-		mi = -1
-	}
+	mi := core.Duration(max(b.MinInterval, -1))
 	return core.QualityBand{RTT: core.Duration(b.RTT), RateRatio: b.RateRatio, MinInterval: mi}, nil
 }
 

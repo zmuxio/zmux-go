@@ -98,9 +98,7 @@ func TestShapingDelayedFirstRecordCloseAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.CloseWithError(0x77, "bye"); err != nil {
-		t.Fatal(err)
-	}
+	c.Abort(0x77, "bye")
 	select {
 	case err := <-sc:
 		var ae *ApplicationError

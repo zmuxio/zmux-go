@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
@@ -29,7 +29,7 @@ const sizeRefresh = 250 * time.Millisecond
 // connChannel is the datagram channel of one QUIC connection.
 type connChannel struct {
 	qc       *quic.Conn
-	demux    zmux.ChannelDemux
+	demux    carrier.ChannelDemux
 	recvOnce sync.Once
 	max      atomic.Int64 // largest QUIC datagram payload; 0: none
 	probedAt atomic.Int64 // monotonic nanoseconds of the last probe

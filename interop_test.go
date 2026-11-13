@@ -329,7 +329,7 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 
 var interopPSK = []byte("zmux interop pre-shared key 0123")
 
-func interopAnyMode(CarrierInfo, RecordMode, any) bool { return true }
+func interopAnyMode(RecordPolicyInput, RecordMode, any) bool { return true }
 
 func interopMPConfig() *Config {
 	return &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{PSK: interopPSK, EndToEnd: true}, AllowRecordMode: interopAnyMode}
@@ -361,10 +361,10 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 			t.Fatalf("pipe not eligible before spreading: %+v", ready)
 		}
 	}
-	c.SetScheduler(SpreadRoundRobin())
+	c.SetScheduler(SchedulerSpreadRoundRobin())
 	before := map[uint64]uint64{}
 	for _, p := range c.PipeStats() {
-		before[p.Pipe] = p.BytesSent
+		before[uint64(p.PipeID)] = p.BytesSent
 	}
 	msg := make([]byte, 16<<20)
 	_, _ = rand.Read(msg)
@@ -376,8 +376,8 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 		t.Fatalf("pipes: %d", len(ps))
 	}
 	for _, p := range ps {
-		if p.BytesSent-before[p.Pipe] < 1<<20 {
-			t.Fatalf("pipe %d carried %d bytes; stats: %+v", p.Pipe, p.BytesSent-before[p.Pipe], ps)
+		if p.BytesSent-before[uint64(p.PipeID)] < 1<<20 {
+			t.Fatalf("pipe %d carried %d bytes; stats: %+v", p.PipeID, p.BytesSent-before[uint64(p.PipeID)], ps)
 		}
 	}
 	c.SetScheduler(nil)
@@ -456,11 +456,11 @@ const (
 
 func interopTLSConfig() *Config {
 	// Joins on a Secure carrier are Bound, so the interop covers that mode.
-	bound := func(c CarrierInfo) RecordMode {
+	bound := func(c RecordPolicyInput) RecordMode {
 		if c.Secure {
-			return Bound
+			return RecordBound
 		}
-		return Sealed
+		return RecordSealed
 	}
 	return &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, AllowRecordMode: interopAnyMode, RecordPolicy: bound}
 }

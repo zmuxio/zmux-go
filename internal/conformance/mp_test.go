@@ -103,7 +103,7 @@ func (r *runner) listenerUp(st map[string]any) error {
 		var t [16]byte
 		copy(t[:], hexb(tok))
 		up := c.dir == "in" // the responder reads the initiator's uplink
-		res, partner := r.pairing.Offer(t, up, "", c)
+		res, partner := r.pairing.Offer(t, up, c)
 		switch res {
 		case core.PairReject:
 			c.rejected = true
@@ -124,8 +124,8 @@ func (r *runner) listenerUp(st map[string]any) error {
 	}
 	r.carriers[name] = c
 	if src, ok := st["source"].(string); ok {
-		slot, _, ok := r.pending.Admit(src, nil)
-		if !ok {
+		slot, _, res := r.pending.Enter(src)
+		if res != core.EnterOK {
 			c.rejected = true
 			return nil
 		}
@@ -147,7 +147,7 @@ func (r *runner) coreCarrier(c *rcarrier) core.Carrier {
 func (r *runner) closeCarrier(c *rcarrier, outcome string) {
 	c.rejected, c.outcome = true, outcome
 	c.buf, c.msgs, c.heldHello, c.pj = nil, nil, nil, nil
-	r.pending.Release(c.slot)
+	r.pending.Leave(c.slot)
 	c.slot = nil
 }
 
@@ -240,7 +240,7 @@ func (r *runner) readConfirm(c *rcarrier, b []byte) {
 		return
 	}
 	c.pj, c.attached, c.lane = nil, true, 0
-	r.pending.Release(c.slot)
+	r.pending.Leave(c.slot)
 	c.slot = nil
 	cc := r.coreCarrier(c)
 	p := &rpipe{id: pj.Pipe.ID, lanes: map[uint64]*rlane{}, writable: true, framing: c.framing}
@@ -670,7 +670,7 @@ func (r *runner) listenerSend(c *rcarrier, st map[string]any) error {
 	}
 	if c.slot != nil {
 		// The first record is complete: the slot is free again.
-		r.pending.Release(c.slot)
+		r.pending.Leave(c.slot)
 		c.slot = nil
 	}
 	c.via = "lane"

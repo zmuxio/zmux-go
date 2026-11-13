@@ -25,7 +25,7 @@ func TestTracerSeesEstablishedAndClosed(t *testing.T) {
 	a, b := tcpPair(t)
 	c, s := pair(t, a, b, &Config{Tracer: tr}, nil)
 	_ = s
-	_ = c.CloseWithError(3, "bye")
+	c.Abort(3, "bye")
 	select {
 	case err := <-closed:
 		var ae *ApplicationError
@@ -56,7 +56,7 @@ func TestCustomPolicy(t *testing.T) {
 	leakcheck.Check(t)
 	pol := &pickLast{}
 	ccfg := mpConfig()
-	ccfg.Scheduler = Custom(pol)
+	ccfg.Scheduler = SchedulerCustom(pol)
 	e := newMPEnv(t, ccfg, mpConfig())
 	p2 := e.addPipe(t, PipeOptions{})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -158,7 +158,7 @@ func TestRedialPolicyInvalidDecision(t *testing.T) {
 		return NetPipe(nc), nil
 	}
 	ccfg.RedialPolicy = policyFunc(func(_ *PoolView, d *PoolDecision) {
-		d.DialAfter, d.ProbeInterval = time.Hour, 500*time.Millisecond
+		d.DialAfter, d.Liveness.ProbeInterval = time.Hour, 500*time.Millisecond
 	})
 	var e *mpEnv
 	var rejected atomic.Int32

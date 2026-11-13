@@ -30,12 +30,13 @@ type PipeOptions struct {
 	// SendStandby makes the local outbound direction carry data only on
 	// failover. nil: the peer's request, else active.
 	SendStandby *bool
-	// Weight is the share for SpreadRoundRobin and the factor of
-	// SpreadRateWeighted. nil: 1; 0 excludes the pipe unless every
+	// Weight is the share for SchedulerSpreadRoundRobin and the factor of
+	// SchedulerSpreadRateWeighted. nil: 1; 0 excludes the pipe unless every
 	// candidate has 0.
 	Weight *uint64
 	// Probation is the base of the pipe's probation. Zero is the
-	// session's; a negative value is invalid.
+	// session's (SchedulerParams.Probation); a negative value turns the
+	// pipe's probation off.
 	Probation time.Duration
 	// Label names the pipe in statistics.
 	Label string
@@ -46,78 +47,58 @@ type PipeOptions struct {
 	// failed one on the same path reuses its fate group. 0: the carrier's
 	// PipeIO.FateGroup, else none (an independent path).
 	FateGroup uint64
-	// SuspectFloor (at least 50 ms) and DeadTimeout (at least 1 s) of the
-	// pipe. Zero uses the session's.
-	SuspectFloor time.Duration
-	DeadTimeout  time.Duration
-	// ProbeInterval is the probe interval k of the pipe while it is idle
-	// (at least 1 s), measured to the carrier: with a shaping delay of up
-	// to H, probes wait k_eff = max(1 s, k - H). Zero uses the session's;
-	// a negative value turns the idle probes of the pipe off, as
-	// SchedulerParams.ProbeInterval does; otherwise at least 1 s. On an
-	// attachment without an outbound direction at the peer at most 15 s
-	// takes effect, and the probes stay.
-	ProbeInterval time.Duration
-	// ProbeJitter is the probe jitter j of the pipe, from 0 to below 1:
-	// each probe waits a uniform draw from [k_eff x (1 - j), k_eff]. Zero
-	// uses the session's; a jitter of 0 takes NoProbeJitter.
-	ProbeJitter float64
-	// NoProbeJitter makes the pipe's j 0, the fixed schedule.
-	NoProbeJitter bool
-	// NoProbation turns the pipe's probation off; Probation must then be
-	// zero.
-	NoProbation bool
-	// Direction from the local endpoint: DirBidirectional (the zero
-	// value), DirSendOnly (an uplink) or DirReceiveOnly (a downlink).
+	// Liveness are the pipe's own liveness settings; a zero field follows
+	// the session's (Config.Liveness).
+	Liveness PipeLiveness
+	// Direction from the local endpoint: DirectionBidirectional (the zero
+	// value), DirectionSendOnly (an uplink) or DirectionReceiveOnly (a downlink).
 	Direction Direction
 	// ReceiveStandby asks the peer to make its outbound direction standby
 	// (zero: active).
 	ReceiveStandby bool
-	// NoWaitAttached makes AddPipe return at the verified Reply instead of
+	// ReturnOnReply makes AddPipe return at the verified Reply instead of
 	// once the peer has attached the pipe. The caller then keeps the
 	// session's other pipes until Pipe.WaitAttached returns.
-	NoWaitAttached bool
-	// Mode is the record mode of this carrier. nil: Config.RecordPolicy, else Sealed.
-	Mode *RecordMode
-	// Group is the key exchange of the Join's key share. Zero: Group 1 when it is usable, otherwise Group 2. A Group that is
-	// not usable in the session fails AddPipe with ErrInvalidConfig.
-	Group uint64
+	ReturnOnReply bool
+	// RecordMode is the record mode of this carrier. nil:
+	// Config.RecordPolicy, else RecordSealed.
+	RecordMode *RecordMode
+	// KeyGroup is the key-exchange group of the Join's key share. Zero:
+	// group 1 when it is usable, otherwise group 2. A group that is not
+	// usable in the session fails AddPipe with ErrInvalidConfig.
+	KeyGroup uint64
 }
 
 func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 	var j core.JoinOptions
-	j.Dir = 2 // DirBidirectional, and any value out of range
+	j.Dir = 2 // DirectionBidirectional, and any value out of range
 	switch dir {
-	case DirSendOnly:
+	case DirectionSendOnly:
 		j.Dir = 0
-	case DirReceiveOnly:
+	case DirectionReceiveOnly:
 		j.Dir = 1
-	case DirBidirectional:
+	case DirectionBidirectional:
 	}
-	live := PipeLiveness{SuspectFloor: o.SuspectFloor, DeadTimeout: o.DeadTimeout, ProbeInterval: o.ProbeInterval,
-		ProbeJitter: o.ProbeJitter, NoProbeJitter: o.NoProbeJitter}
 	var err error
-	if j.Live, err = live.core(); err != nil {
+	if j.Live, err = o.Liveness.core(); err != nil {
 		return j, err
 	}
-	if o.Probation < 0 {
-		return j, fmt.Errorf("%w: negative Probation", ErrInvalidConfig)
-	}
-	if o.NoProbation && o.Probation != 0 {
-		return j, fmt.Errorf("%w: Probation with NoProbation", ErrInvalidConfig)
-	}
-	j.FateGroup, j.SendPriority, j.SendStandby, j.Group = o.FateGroup, o.SendPriority, o.SendStandby, o.Group
+	j.FateGroup, j.SendPriority, j.SendStandby, j.Group = o.FateGroup, o.SendPriority, o.SendStandby, o.KeyGroup
 	j.RecvPriority, j.RecvStandby = o.ReceivePriority, o.ReceiveStandby
 	j.Weight = 1
 	if o.Weight != nil {
 		j.Weight = *o.Weight
 	}
-	if o.NoProbation || o.Probation != 0 {
-		d := core.Duration(o.Probation)
+	if o.Probation != 0 {
+		d := core.Duration(max(o.Probation, 0)) // 0: off
 		j.Probation = &d
 	}
 	return j, nil
 }
+
+// PipeID identifies a pipe for the life of its session; the bootstrap pipe
+// is 0. It is an unsigned 62-bit value.
+type PipeID uint64
 
 // Pipe is one attachment of a session. Its methods are safe for concurrent
 // use; they fail with ErrPipeGone once the attachment is retired.
@@ -127,15 +108,11 @@ type Pipe struct {
 }
 
 // ID returns the pipe ID.
-func (p *Pipe) ID() uint64 { return p.id }
+func (p *Pipe) ID() PipeID { return PipeID(p.id) }
 
-// Admitted returns the Decision.Value of the admission that accepted the
-// pipe's carrier, the one that carried its Hello (or the session's
-// value for the bootstrap pipe, Conn.Admitted). It is nil without one, on
-// the dialing side, and once the session no longer knows the pipe. zmux
-// does not compare it with the session's: a host that requires a join to
-// come from the session's client compares them, in WrapPipe or here.
-func (p *Pipe) Admitted() any {
+// admittedValue is the Decision.Value of the admission that accepted the
+// pipe's carrier (AdmittedAs).
+func (p *Pipe) admittedValue() any {
 	if p.id == 0 {
 		return p.c.admitted
 	}
@@ -149,7 +126,7 @@ func (p *Pipe) Admitted() any {
 
 // AddPipe joins a new carrier to the session with the Join handshake and returns
 // once the peer has attached the pipe (Pipe.WaitAttached), or with
-// PipeOptions.NoWaitAttached once the Reply has been verified. ctx bounds the call,
+// PipeOptions.ReturnOnReply once the Reply has been verified. ctx bounds the call,
 // and otherwise Config.JoinTimeout. The carrier belongs to zmux from the call on:
 // when AddPipe fails, ErrInvalidConfig included, it has been closed. A refusal returns ErrJoinRefused and starts the
 // backoff. A join that the attachment cap or the refusal backoff holds waits for room.
@@ -184,18 +161,18 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 	if err != nil {
 		return nil, false, err
 	}
-	mode := Sealed
+	mode := RecordSealed
 	switch {
-	case o.Mode != nil:
-		mode = *o.Mode
+	case o.RecordMode != nil:
+		mode = *o.RecordMode
 	case c.cfg.RecordPolicy != nil:
 		mode = c.cfg.RecordPolicy(joinCarrierInfo(p, false))
 	}
-	if mode > Trusted {
+	if mode > RecordTrusted {
 		return nil, false, fmt.Errorf("%w: record mode %v for a join", ErrInvalidConfig, mode)
 	}
 	j.Mode = join.Mode(mode)
-	if mode == Bound {
+	if mode == RecordBound {
 		if p.Carrier == CarrierSplit {
 			return nil, false, fmt.Errorf("%w: Bound on a split carrier", ErrInvalidConfig)
 		}
@@ -224,7 +201,7 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 		}
 		return nil, true, err
 	}
-	if o.NoWaitAttached {
+	if o.ReturnOnReply {
 		return pp, true, nil
 	}
 	if err := pp.WaitAttached(jctx); err != nil {
@@ -241,7 +218,7 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 // already has: the bootstrap pipe, a pipe the peer joined, or one this
 // endpoint joined that has received a PIPE_ACK acknowledging a byte (one
 // with only an inbound direction: a record). AddPipe waits for it unless
-// PipeOptions.NoWaitAttached is set; until then the peer may have no state
+// PipeOptions.ReturnOnReply is set; until then the peer may have no state
 // of the pipe, and closing the session's other pipes would leave it none. It returns
 // ctx's error, ErrPipeGone once the pipe failed, closed or is gone before
 // it is attached, or the session's error once the session ends.
@@ -337,45 +314,142 @@ func (p *Pipe) set(o core.PipeSettings) error {
 	return nil
 }
 
-// SetSendPriority sets the tier of the local outbound direction; it wins
-// over the peer's request. Nothing is sent.
-func (p *Pipe) SetSendPriority(v uint64) error { return p.set(core.PipeSettings{SendPriority: &v}) }
-
-// ClearSendPriority returns the outbound tier to the peer's request.
-func (p *Pipe) ClearSendPriority() error { return p.set(core.PipeSettings{ClearSendPriority: true}) }
-
-// SetReceivePriority asks the peer to use v for its outbound direction;
-// the request is sent at once as PIPE_STATUS (once the pipe is ACTIVE).
-func (p *Pipe) SetReceivePriority(v uint64) error { return p.set(core.PipeSettings{RecvPriority: &v}) }
-
-// SetSendStandby makes the local outbound direction standby (or not).
-func (p *Pipe) SetSendStandby(b bool) error { return p.set(core.PipeSettings{SendStandby: &b}) }
-
-// ClearSendStandby returns the standby flag to the peer's request.
-func (p *Pipe) ClearSendStandby() error { return p.set(core.PipeSettings{ClearSendStandby: true}) }
-
-// SetReceiveStandby asks the peer to treat its outbound direction as
-// standby (or not).
-func (p *Pipe) SetReceiveStandby(b bool) error { return p.set(core.PipeSettings{RecvStandby: &b}) }
-
-// SetWeight sets the pipe's weight for the round-robin policies (local).
-func (p *Pipe) SetWeight(w uint64) error { return p.set(core.PipeSettings{Weight: &w}) }
-
-// SetProbation sets the base of the pipe's probation; 0 disables it, and
-// a negative value is invalid (ErrInvalidConfig).
-func (p *Pipe) SetProbation(d time.Duration) error {
-	if d < 0 {
-		return fmt.Errorf("%w: negative Probation", ErrInvalidConfig)
-	}
-	v := core.Duration(d)
-	return p.set(core.PipeSettings{Probation: &v})
+// Change is one field of a PipeUpdate, in one of three states: the zero
+// value keeps the setting, Set(v) sets it to v and Clear returns it to its
+// default.
+type Change[T any] struct {
+	v     T
+	state uint8 // 0 keep, 1 set, 2 clear
 }
 
-// ClearProbation returns the base of the pipe's probation to the
-// session's.
-func (p *Pipe) ClearProbation() error {
-	v := core.Duration(-1)
-	return p.set(core.PipeSettings{Probation: &v})
+// Set returns a Change that sets a setting to v.
+func Set[T any](v T) Change[T] { return Change[T]{v: v, state: 1} }
+
+// Clear returns a Change that returns a setting to its default.
+func Clear[T any]() Change[T] { return Change[T]{state: 2} }
+
+// PipeUpdate changes a live pipe's runtime settings in one call
+// (Pipe.Update). Every field is a Change; a field left at its zero value
+// keeps its setting. Set and Clear mean, per field:
+//
+//   - SendPriority, SendStandby (the local outbound direction): set wins
+//     over the peer's request; clear follows the peer's latest PIPE_STATUS
+//     request, else the default (tier 0, active). Nothing is sent.
+//   - ReceivePriority, ReceiveStandby (the request for the peer's outbound
+//     direction): set requests the value, clear the default (tier 0,
+//     active); a PIPE_STATUS is sent when the request differs from the one
+//     in force, at once while the pipe is ACTIVE and when it becomes
+//     ACTIVE otherwise. One call that changes both sends one PIPE_STATUS.
+//   - Weight: set to v (0 excludes the pipe); clear is 1.
+//   - Probation: set to v in the forms of PipeOptions.Probation (negative:
+//     off; zero: the session's); clear follows the session's.
+//   - Liveness: set replaces the pipe's own PipeLiveness as a whole; clear
+//     follows the session's. A pipe already suspect keeps the SuspectFloor
+//     and DeadTimeout it turned suspect under.
+//
+// The fields fixed when the pipe is added (Direction, RecordMode, KeyGroup,
+// Label, FateGroup, ReturnOnReply) are not in PipeUpdate.
+type PipeUpdate struct {
+	SendPriority    Change[uint64]
+	ReceivePriority Change[uint64]
+	SendStandby     Change[bool]
+	ReceiveStandby  Change[bool]
+	Weight          Change[uint64]
+	Probation       Change[time.Duration]
+	Liveness        Change[PipeLiveness]
+}
+
+// Update applies u to the pipe, all its fields together, from the next
+// scheduling decision. An invalid value is an ErrInvalidConfig error that
+// changes nothing; a pipe that is gone fails with ErrPipeGone. The settings
+// in force are in the pipe statistics.
+func (p *Pipe) Update(u PipeUpdate) error {
+	var o core.PipeSettings
+	switch u.SendPriority.state {
+	case 1:
+		o.SendPriority = &u.SendPriority.v
+	case 2:
+		o.ClearSendPriority = true
+	}
+	switch u.SendStandby.state {
+	case 1:
+		o.SendStandby = &u.SendStandby.v
+	case 2:
+		o.ClearSendStandby = true
+	}
+	var zp uint64
+	var zs bool
+	switch u.ReceivePriority.state {
+	case 1:
+		o.RecvPriority = &u.ReceivePriority.v
+	case 2:
+		o.RecvPriority = &zp
+	}
+	switch u.ReceiveStandby.state {
+	case 1:
+		o.RecvStandby = &u.ReceiveStandby.v
+	case 2:
+		o.RecvStandby = &zs
+	}
+	one := uint64(1)
+	switch u.Weight.state {
+	case 1:
+		o.Weight = &u.Weight.v
+	case 2:
+		o.Weight = &one
+	}
+	var prob core.Duration
+	switch u.Probation.state {
+	case 1:
+		switch d := u.Probation.v; {
+		case d < 0:
+			prob = 0 // off
+		case d == 0:
+			prob = -1 // the session's
+		default:
+			prob = core.Duration(d)
+		}
+		o.Probation = &prob
+	case 2:
+		prob = -1
+		o.Probation = &prob
+	}
+	var live core.PipeLiveness
+	switch u.Liveness.state {
+	case 1:
+		var err error
+		if live, err = u.Liveness.v.core(); err != nil {
+			return err
+		}
+		o.Liveness = &live
+	case 2:
+		o.Liveness = &live
+	}
+	return p.set(o)
+}
+
+// SetSendPriority sets the tier of the local outbound direction, which
+// wins over the peer's request: Update with SendPriority set to v.
+func (p *Pipe) SetSendPriority(v uint64) error {
+	return p.Update(PipeUpdate{SendPriority: Set(v)})
+}
+
+// SetReceivePriority requests tier v for the peer's outbound direction:
+// Update with ReceivePriority set to v.
+func (p *Pipe) SetReceivePriority(v uint64) error {
+	return p.Update(PipeUpdate{ReceivePriority: Set(v)})
+}
+
+// SetSendStandby makes the local outbound direction standby, or active,
+// winning over the peer's request: Update with SendStandby set to b.
+func (p *Pipe) SetSendStandby(b bool) error {
+	return p.Update(PipeUpdate{SendStandby: Set(b)})
+}
+
+// SetReceiveStandby asks the peer to make its outbound direction standby,
+// or active: Update with ReceiveStandby set to b.
+func (p *Pipe) SetReceiveStandby(b bool) error {
+	return p.Update(PipeUpdate{ReceiveStandby: Set(b)})
 }
 
 // Revalidate sends a PIPE_PING at once; the pipe takes no new stream data
@@ -450,7 +524,7 @@ func (c *Conn) SetScheduler(s Scheduler) {
 	c.lock()
 	defer c.unlock()
 	if s == nil {
-		s = Affinity()
+		s = SchedulerAffinity()
 	}
 	if cp, ok := s.(customPolicy); ok {
 		if c.hk == nil {
@@ -539,7 +613,7 @@ func (s InboundState) String() string {
 // of a direction the attachment does not have, whose state is then
 // OutboundNone or InboundNone.
 type PipeStats struct {
-	Pipe       uint64 // the pipe ID
+	PipeID     PipeID
 	FateGroup  uint64
 	Label      string
 	Variant    string     // PipeIO.Variant
@@ -711,17 +785,17 @@ func (c *Conn) PipeStats() []PipeStats {
 }
 
 // Pipe returns the handle of attachment id while the session knows it.
-func (c *Conn) Pipe(id uint64) (*Pipe, bool) {
+func (c *Conn) Pipe(id PipeID) (*Pipe, bool) {
 	c.lock()
 	defer c.unlock()
-	if _, ok := c.s.PipeInfo(id); !ok {
+	if _, ok := c.s.PipeInfo(uint64(id)); !ok {
 		return nil, false
 	}
-	return &Pipe{c: c, id: id}, true
+	return &Pipe{c: c, id: uint64(id)}, true
 }
 
 func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
-	st := PipeStats{Pipe: pi.ID, RecordMode: c.pipeModeLocked(pi.ID), Local: pi.Local, PeerAttached: pi.PeerAttached, FateGroup: pi.FateGroup, Label: c.labels[pi.ID],
+	st := PipeStats{PipeID: PipeID(pi.ID), RecordMode: c.pipeModeLocked(pi.ID), Local: pi.Local, PeerAttached: pi.PeerAttached, FateGroup: pi.FateGroup, Label: c.labels[pi.ID],
 		Carrier: CarrierKind(pi.Carrier), Variant: c.variantLocked(pi.ID), Outbound: OutboundState(pi.OutState), Inbound: InboundState(pi.InState),
 		AttachedFor: time.Duration(pi.AttachedFor), SuspectCount: pi.SuspectCount, FailureCount: pi.FailureCount,
 		Failure: pi.Failure, SendPriority: pi.SendPriority, SendPrioritySource: pi.PrioritySource,
@@ -793,7 +867,7 @@ func (st *PipeStats) clearInbound() {
 // pipeModeLocked is the record mode of an attachment.
 func (c *Conn) pipeModeLocked(id uint64) RecordMode {
 	if id == 0 && !c.cc.SecureFirstPipe {
-		return Unmanaged
+		return RecordUnmanaged
 	}
 	return RecordMode(c.s.PipeMode(id))
 }
@@ -805,7 +879,7 @@ func (c *Conn) WeakestRecordMode() RecordMode {
 	defer c.unlock()
 	m, unmanaged := c.s.WeakestMode()
 	if unmanaged {
-		return Unmanaged
+		return RecordUnmanaged
 	}
 	return RecordMode(m)
 }

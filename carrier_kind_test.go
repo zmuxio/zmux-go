@@ -44,8 +44,8 @@ func TestShaperFromFirstRecord(t *testing.T) {
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: rs, W: rs, Carrier: CarrierStreaming}, PipeHint{}) }()
-	c, err := Start(ctx, PipeIO{R: a, W: a, Carrier: CarrierStreaming}, RoleClient, nil)
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: rs, W: rs, Carrier: CarrierStream}, PipeHint{}) }()
+	c, err := Start(ctx, PipeIO{R: a, W: a, Carrier: CarrierStream}, RoleClient, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,11 +58,11 @@ func TestShaperFromFirstRecord(t *testing.T) {
 	if len(sizes) == 0 || wireLen(sizes[0]) < 700 {
 		t.Fatalf("server records %v, the first not shaped", sizes)
 	}
-	if got := k.seen(); len(got) == 0 || got[0] != (ShapedPipe{ID: 0, Carrier: CarrierStreaming}) {
+	if got := k.seen(); len(got) == 0 || got[0] != (ShapedPipe{PipeID: 0, Carrier: CarrierStream}) {
 		t.Fatalf("factory saw %v", got)
 	}
 	for _, x := range []*Conn{c, s} {
-		if st := x.PipeStats(); len(st) != 1 || st[0].Carrier != CarrierStreaming {
+		if st := x.PipeStats(); len(st) != 1 || st[0].Carrier != CarrierStream {
 			t.Fatalf("pipe stats %+v", st)
 		}
 	}
@@ -124,16 +124,16 @@ func TestCarrierKindJoin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[uint64]CarrierKind{0: CarrierWebSocket, p.ID(): CarrierQUIC}
+	want := map[uint64]CarrierKind{0: CarrierWebSocket, uint64(p.ID()): CarrierQUIC}
 	// PipeAdded of the join is queued before AddPipe returned.
 	for {
 		ev, err := c.NextEvent(ctx)
 		if err != nil {
 			t.Fatalf("no PipeAdded for pipe %d: %v", p.ID(), err)
 		}
-		if ev.Kind == EventPipeAdded && ev.Pipe == p.ID() {
+		if ev.Kind == EventPipeAdded && ev.PipeID == p.ID() {
 			if ev.Carrier != CarrierQUIC {
-				t.Fatalf("PipeAdded %d: carrier %v", ev.Pipe, ev.Carrier)
+				t.Fatalf("PipeAdded %d: carrier %v", ev.PipeID, ev.Carrier)
 			}
 			break
 		}
@@ -149,7 +149,7 @@ func TestCarrierKindJoin(t *testing.T) {
 	}
 	for name, k := range map[string]*kindRecorder{"client": kc, "server": ks} {
 		for _, sp := range k.seen() {
-			if want[sp.ID] != sp.Carrier {
+			if want[uint64(sp.PipeID)] != sp.Carrier {
 				t.Fatalf("%s factory saw %v, want %v", name, k.seen(), want)
 			}
 		}
@@ -160,8 +160,8 @@ func TestCarrierKindJoin(t *testing.T) {
 			t.Fatalf("pipe stats %+v", st)
 		}
 		for _, ps := range st {
-			if want[ps.Pipe] != ps.Carrier {
-				t.Fatalf("pipe %d: carrier %v, want %v", ps.Pipe, ps.Carrier, want[ps.Pipe])
+			if want[uint64(ps.PipeID)] != ps.Carrier {
+				t.Fatalf("pipe %d: carrier %v, want %v", ps.PipeID, ps.Carrier, want[uint64(ps.PipeID)])
 			}
 		}
 	}

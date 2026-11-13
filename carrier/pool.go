@@ -1,4 +1,4 @@
-package zmux
+package carrier
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
@@ -29,19 +30,19 @@ type PoolLimits struct {
 	// is the connections to spread pipes over, Retire retires connections
 	// by fate group. Its ProbeInterval and ProbeJitter are not used (the
 	// pool dials no pipes), but a decision that fails
-	// PoolDecision.Validate is rejected as a whole, as by MaintainPipes:
+	// zmux.PoolDecision.Validate is rejected as a whole, as by MaintainPipes:
 	// the pool goes on as with the zero decision and reports the error to
 	// DecisionRejected.
-	Policy PoolPolicy
-	// DecisionRejected, when set, receives the PoolDecision.Validate error
-	// (ErrInvalidConfig) of each decision of Policy the pool rejected,
+	Policy zmux.PoolPolicy
+	// DecisionRejected, when set, receives the zmux.PoolDecision.Validate error
+	// (zmux.ErrInvalidConfig) of each decision of Policy the pool rejected,
 	// outside the pool's lock, on the goroutine of the Get, Release or
 	// recheck that asked the policy (so calls may run concurrently); it
 	// must not block, and a panic in it is contained.
 	DecisionRejected func(err error)
 }
 
-// CarrierPool shares underlying connections between pipes, for adapters
+// Pool shares underlying connections between pipes, for adapters
 // that carry several pipes over one connection (HTTP/2 and HTTP/3 request
 // streams, QUIC streams). A new pipe goes to the open
 // connection with the most room within the limits, else to a new one; a
@@ -50,7 +51,7 @@ type PoolLimits struct {
 // fate group: they fail together and are never counted as independent
 // paths. The zero value with Dial set is ready; it is safe for concurrent
 // use.
-type CarrierPool[C comparable] struct {
+type Pool[C comparable] struct {
 	// Dial opens an underlying connection.
 	Dial func(ctx context.Context) (C, error)
 	// Close closes a connection the pool retired once no pipe uses it.
@@ -62,8 +63,8 @@ type CarrierPool[C comparable] struct {
 	mu       sync.Mutex
 	conns    []*pooledConn[C]
 	closed   bool
-	view     PoolView
-	dec      PoolDecision
+	view     zmux.PoolView
+	dec      zmux.PoolDecision
 	lastDial time.Time
 	failures int
 	recheck  *time.Timer // asks the policy again after its Recheck
@@ -85,10 +86,10 @@ type pooledConn[C comparable] struct {
 type Lease[C comparable] struct {
 	// Conn is the connection to open the pipe on.
 	Conn C
-	// FateGroup is the connection's fate group (set it as the PipeIO's).
+	// FateGroup is the connection's fate group (set it as the zmux.PipeIO's).
 	FateGroup uint64
 
-	p    *CarrierPool[C]
+	p    *Pool[C]
 	pc   *pooledConn[C]
 	once sync.Once
 }
@@ -106,7 +107,7 @@ var errPoolClosed = errors.New("zmux: carrier pool closed")
 // Get returns a lease on a connection with room, dialling one when none
 // has; the dial runs outside the pool's lock. The lease is non-nil exactly
 // when the error is nil.
-func (p *CarrierPool[C]) Get(ctx context.Context) (*Lease[C], error) {
+func (p *Pool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -163,7 +164,7 @@ func (p *CarrierPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	return &Lease[C]{Conn: c, FateGroup: pc.fate, p: p, pc: pc}, nil
 }
 
-func (p *CarrierPool[C]) maxActive() int {
+func (p *Pool[C]) maxActive() int {
 	if p.MaxPipesPerConnection > 0 {
 		return p.MaxPipesPerConnection
 	}
@@ -171,7 +172,7 @@ func (p *CarrierPool[C]) maxActive() int {
 }
 
 // take leases the open connection with the most room, if any.
-func (p *CarrierPool[C]) take() (*Lease[C], error) {
+func (p *Pool[C]) take() (*Lease[C], error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -213,7 +214,7 @@ func (p *CarrierPool[C]) take() (*Lease[C], error) {
 	return lease, nil
 }
 
-func (p *CarrierPool[C]) room(pc *pooledConn[C]) int {
+func (p *Pool[C]) room(pc *pooledConn[C]) int {
 	r := p.maxActive() - pc.active
 	if m := p.MaxPipesPerConnectionLifetime; m > 0 {
 		r = min(r, m-pc.total)
@@ -222,7 +223,7 @@ func (p *CarrierPool[C]) room(pc *pooledConn[C]) int {
 }
 
 // retireLocked retires a connection that reached a lifetime limit.
-func (p *CarrierPool[C]) retireLocked(pc *pooledConn[C]) {
+func (p *Pool[C]) retireLocked(pc *pooledConn[C]) {
 	if m := p.MaxPipesPerConnectionLifetime; m > 0 && pc.total >= m {
 		pc.retired = true
 	}
@@ -231,7 +232,7 @@ func (p *CarrierPool[C]) retireLocked(pc *pooledConn[C]) {
 	}
 }
 
-func (p *CarrierPool[C]) release(pc *pooledConn[C]) {
+func (p *Pool[C]) release(pc *pooledConn[C]) {
 	p.mu.Lock()
 	pc.active--
 	if pc.active == 0 {
@@ -255,7 +256,7 @@ func (p *CarrierPool[C]) release(pc *pooledConn[C]) {
 
 // RetireConn retires connection c (for example when it failed): it takes
 // no new pipe and closes once its pipes are released.
-func (p *CarrierPool[C]) RetireConn(c C) {
+func (p *Pool[C]) RetireConn(c C) {
 	p.mu.Lock()
 	var pc *pooledConn[C]
 	for _, x := range p.conns {
@@ -269,7 +270,7 @@ func (p *CarrierPool[C]) RetireConn(c C) {
 	}
 }
 
-func (p *CarrierPool[C]) retire(pc *pooledConn[C]) {
+func (p *Pool[C]) retire(pc *pooledConn[C]) {
 	p.mu.Lock()
 	pc.retired = true
 	done := pc.active == 0
@@ -282,7 +283,7 @@ func (p *CarrierPool[C]) retire(pc *pooledConn[C]) {
 	}
 }
 
-func (p *CarrierPool[C]) drop(pc *pooledConn[C]) bool {
+func (p *Pool[C]) drop(pc *pooledConn[C]) bool {
 	for i, x := range p.conns {
 		if x == pc {
 			copy(p.conns[i:], p.conns[i+1:])
@@ -296,7 +297,7 @@ func (p *CarrierPool[C]) drop(pc *pooledConn[C]) bool {
 
 // Shutdown retires every connection: idle ones close now, the others when
 // their last pipe ends; Get fails afterwards.
-func (p *CarrierPool[C]) Shutdown() {
+func (p *Pool[C]) Shutdown() {
 	p.mu.Lock()
 	p.closed = true
 	if p.recheck != nil {
@@ -331,7 +332,7 @@ func keepActive[C comparable](cs []*pooledConn[C]) []*pooledConn[C] {
 
 // recheckNow asks the policy again when nothing else did within the last
 // decision's Recheck, and closes the idle connections it retired.
-func (p *CarrierPool[C]) recheckNow() {
+func (p *Pool[C]) recheckNow() {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -356,20 +357,20 @@ func (p *CarrierPool[C]) recheckNow() {
 
 // consultLocked asks the policy, retires the connections it names and
 // reports whether a new connection is due.
-func (p *CarrierPool[C]) consultLocked() bool {
+func (p *Pool[C]) consultLocked() bool {
 	if p.Policy == nil {
 		return false
 	}
 	now := time.Now()
 	v := &p.view
-	v.Now, v.Failures, v.LastDial, v.Members = now, p.failures, p.lastDial, v.Members[:0]
+	v.Now, v.Connections, v.Failures, v.LastDial, v.Members = now, true, p.failures, p.lastDial, v.Members[:0]
 	open := 0
 	for _, pc := range p.conns {
 		if pc.retired {
 			continue
 		}
 		open++
-		m := PoolMember{ID: pc.fate, Age: now.Sub(pc.born), Pipes: pc.active}
+		m := zmux.PoolMember{FateGroup: pc.fate, Age: now.Sub(pc.born), Pipes: pc.active}
 		if pc.active == 0 {
 			// Since its last pipe ended, or since it was established when
 			// it never carried one.
@@ -381,20 +382,20 @@ func (p *CarrierPool[C]) consultLocked() bool {
 		}
 		v.Members = append(v.Members, m)
 	}
-	if err := decide(nil, p.Policy, v, &p.dec); err != nil { // a CarrierPool has no Logger
-		p.dec = PoolDecision{Retire: p.dec.Retire[:0]} // rejected, as by MaintainPipes
+	if err := p.dec.Ask(p.Policy, v); err != nil {
+		p.dec = zmux.PoolDecision{RetirePipes: p.dec.RetirePipes[:0], RetireConnections: p.dec.RetireConnections[:0]} // rejected, as by MaintainPipes
 		if p.DecisionRejected != nil {
 			p.rejected = append(p.rejected, err)
 		}
 	}
-	if r := recheckAfter(&p.dec); r > 0 && !p.closed {
+	if r := p.dec.RecheckAfter(); r > 0 && !p.closed {
 		if p.recheck == nil {
 			p.recheck = time.AfterFunc(r, p.recheckNow)
 		} else {
 			p.recheck.Reset(r)
 		}
 	}
-	for _, id := range p.dec.Retire {
+	for _, id := range p.dec.RetireConnections {
 		for _, pc := range p.conns {
 			if pc.fate == id && !pc.retired {
 				pc.retired = true
@@ -407,12 +408,18 @@ func (p *CarrierPool[C]) consultLocked() bool {
 
 // unlockReport unlocks the pool and reports the decisions rejected under
 // the lock to DecisionRejected.
-func (p *CarrierPool[C]) unlockReport() {
+func (p *Pool[C]) unlockReport() {
 	errs := p.rejected
 	p.rejected = nil
 	f := p.DecisionRejected
 	p.mu.Unlock()
 	for _, err := range errs {
-		reportRejected(nil, f, err)
+		reportRejected(f, err)
 	}
+}
+
+// reportRejected hands err to f, containing a panic.
+func reportRejected(f func(error), err error) {
+	defer func() { _ = recover() }()
+	f(err)
 }

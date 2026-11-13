@@ -172,7 +172,7 @@ type rcarrier struct {
 	buf      []byte
 	pipe     uint64
 	lane     uint64
-	slot     *core.PendingCarrier // listener slot held until the first record
+	slot     *core.PendingSlot // listener slot held until the first record
 	deadline core.Time
 	framing  core.Framing
 	attached bool
@@ -591,7 +591,7 @@ func (r *runner) advance(d core.Duration) error {
 	r.handshakeDeadlines()
 	for _, c := range r.carriers {
 		if c.slot != nil && !c.rejected && r.now >= c.deadline {
-			r.pending.Release(c.slot)
+			r.pending.Leave(c.slot)
 			c.slot = nil
 			c.rejected = true
 		}

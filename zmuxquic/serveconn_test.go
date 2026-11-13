@@ -16,7 +16,7 @@ import (
 // session on the first and joins it with a pipe on the second.
 func TestServeConnDialled(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,11 +38,11 @@ func TestServeConnDialled(t *testing.T) {
 			qc, err := ln.Accept(ctx)
 			acc <- res{qc, err}
 		}()
-		qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+		qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
-		go func() { served <- ServeConn(sctx, qc, lst, nil) }()
+		go func() { served <- ServeConn(sctx, lst, qc, nil) }()
 		r := <-acc
 		if r.err != nil {
 			t.Fatal(r.err)
@@ -68,7 +68,7 @@ func TestServeConnDialled(t *testing.T) {
 	sctx, scancel := context.WithCancel(ctx)
 	q2 := connect(sctx)
 	defer func() { _ = q2.CloseWithError(0, "") }()
-	pio, err := OpenPipe(ctx, q2)
+	pio, err := ConnPipe(ctx, q2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestServeConnDialled(t *testing.T) {
 // refuses, and reports net.ErrClosed.
 func TestServeConnRefused(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,11 +108,11 @@ func TestServeConnRefused(t *testing.T) {
 	_ = lst.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ServeConn(ctx, qc, lst, nil); !errors.Is(err, net.ErrClosed) {
+	if err := ServeConn(ctx, lst, qc, nil); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("ServeConn on a closed listener: %v", err)
 	}
 	select {

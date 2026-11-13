@@ -70,7 +70,7 @@ func TestRejectReasonsAndNoReply(t *testing.T) {
 		{"unknown handle", func(c *seal.ClientConfig) { c.Handle = []byte("nobody-knows-me!") }, nil, "unknown_handle"},
 		{"no PSK by default", func(c *seal.ClientConfig) { c.Handle, c.PSK = nil, nil }, nil, "profile_disabled"},
 		{"Profile not listed", nil, func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{4, 5} }, "profile_disabled"},
-		{"record mode", func(c *seal.ClientConfig) { c.Mode = zmux.Trusted }, nil, "record_mode"},
+		{"record mode", func(c *seal.ClientConfig) { c.RecordMode = zmux.RecordTrusted }, nil, "record_mode"},
 	} {
 		cc, sc := f.client, f.server
 		if c.client != nil {
@@ -122,7 +122,7 @@ func TestHandleWithoutPSK(t *testing.T) {
 
 type panicAnchor struct{}
 
-func (panicAnchor) Verify(context.Context, seal.VerifyInput) (seal.Verdict, error) {
+func (panicAnchor) Verify(context.Context, seal.VerifyInput) (seal.VerifyVerdict, error) {
 	panic("anchor")
 }
 

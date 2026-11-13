@@ -306,7 +306,7 @@ func ExampleConn_AddPipe() {
 			fmt.Println(err)
 			return
 		}
-		if ev.Kind == zmux.EventPipeJoined && ev.Pipe == p.ID() {
+		if ev.Kind == zmux.EventPipeJoined && ev.PipeID == p.ID() {
 			break
 		}
 	}
@@ -347,7 +347,7 @@ func ExampleEarlyData() {
 	_ = st.SetReadDeadline(time.Now().Add(5 * time.Second))
 	ga.releaseAfter(ctx, []byte("request")) // the server starts only now
 	go func() {
-		server, err := zmux.Server(ctx, b, &zmux.Config{NoIncomingStreams: true})
+		server, err := zmux.Server(ctx, b, &zmux.Config{MaxIncomingStreams: -1})
 		if err == nil {
 			_ = server.Wait()
 		}

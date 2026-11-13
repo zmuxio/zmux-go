@@ -13,7 +13,7 @@ import (
 
 func tlsAuthConfig() *zmux.Config {
 	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true},
-		AllowRecordMode: func(zmux.CarrierInfo, zmux.RecordMode, any) bool { return true }}
+		AllowRecordMode: func(zmux.RecordPolicyInput, zmux.RecordMode, any) bool { return true }}
 }
 
 // A WebSocket stream sharing an HTTP/2 connection's TLS has no Bound contract.
@@ -34,7 +34,7 @@ func TestCarrierSecure(t *testing.T) {
 func TestPipeAuthExporter(t *testing.T) {
 	ctx := testContext(t)
 	l := mustNewListener(&zmux.ListenerConfig{Config: tlsAuthConfig()})
-	h, err := Handler(l, nil)
+	h, err := NewHandler(l, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestPipeAuthExporter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{Mode: new(zmux.Bound)}); err != nil {
+	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{RecordMode: new(zmux.RecordBound)}); err != nil {
 		t.Fatal(err)
 	}
 	echo(t, ctx, c, s, 64<<10)

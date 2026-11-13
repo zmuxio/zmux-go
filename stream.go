@@ -512,7 +512,7 @@ type StreamStats struct {
 	// PipeID is the pipe the sending direction is bound to under the
 	// affinity scheduler while PipeBound is true; pipe 0 is a pipe, so an
 	// unbound direction reports PipeBound false (and PipeID 0).
-	PipeID    uint64
+	PipeID    PipeID
 	PipeBound bool
 }
 
@@ -526,7 +526,7 @@ func (h *handle) stats() StreamStats {
 		DatagramsSent: in.DatagramsSent, DatagramsReceived: in.DatagramsReceived,
 		DatagramsDroppedRecv: in.DatagramsDroppedRecv, DatagramBytesSent: in.DatagramBytesSent,
 		DatagramBytesReceived: in.DatagramBytesReceived, SendBuffered: in.SendBuffered,
-		RecvBuffered: in.RecvBuffered, RecvWindow: in.RecvWindow, PipeID: in.Pipe, PipeBound: in.PipeBound}
+		RecvBuffered: in.RecvBuffered, RecvWindow: in.RecvWindow, PipeID: PipeID(in.Pipe), PipeBound: in.PipeBound}
 }
 
 // Stats returns a snapshot of the stream's statistics; a nil s returns

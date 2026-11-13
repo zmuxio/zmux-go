@@ -25,7 +25,7 @@ func dialAddr(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.
 }
 
 // dialNative owns socket allocation and release only. Production stream users
-// enter through dialAddr/OpenPipe, which apply the temporary handshake barrier.
+// enter through dialAddr/ConnPipe, which apply the temporary handshake barrier.
 func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config, early bool) (*quic.Conn, error) {
 	remote, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -79,7 +79,7 @@ func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *qui
 // default rejection test exercises the guarded adapter. The barrier gives up
 // native 0-RTT payload latency only: zmux replayable and resumed startup, TLS
 // validation, cancellation and socket ownership stay. It covers the default
-// dialers and borrowed connections passed to OpenPipe and Client; incoming
+// dialers and borrowed connections passed to ConnPipe and Client; incoming
 // early data is unchanged. qStream.EarlyAccepted relies on it: every outgoing
 // stream is created as 1-RTT, so its bytes were not invalidated by a 0-RTT
 // rejection. When removing the barrier, decide the verdict per pipe for its

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
@@ -574,7 +575,7 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 	}
 	if tlsRecords(w) {
 		// A gather write would cost a TLS record per buffer.
-		return WriteFlat(w, bufs)
+		return carrierio.WriteFlat(w, bufs)
 	}
 	if nc, ok := w.(net.Conn); ok {
 		nb := net.Buffers(bufs)
@@ -585,7 +586,7 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 		return bw.WriteBuffers(bufs)
 	}
 	// Any other writer (a transform) gets one write per batch.
-	return WriteFlat(w, bufs)
+	return carrierio.WriteFlat(w, bufs)
 }
 
 // ---- lanes ----

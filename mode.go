@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -16,8 +15,8 @@ import (
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
-// Carrier selection: DialMode dials a session over one carrier
-// kind (ExplicitMode) or chooses among candidates (AutoMode), for paths
+// Carrier selection: DialChoice dials a session over one carrier
+// kind (ExplicitChoice) or chooses among candidates (AutoChoice), for paths
 // through reverse proxies and CDNs where which kinds pass depends on the
 // path. Every kind keeps its own dialer; a Candidate wraps one. A kind
 // describes only this end's hop of a carrier, not what lies beyond its
@@ -29,15 +28,15 @@ type CarrierKind uint8
 const (
 	// CarrierWebSocket is a WebSocket (zmuxws.Candidate).
 	CarrierWebSocket CarrierKind = iota + 1
-	// CarrierStreaming is a bidirectional streaming request: one request
+	// CarrierStream is a bidirectional streaming request: one request
 	// whose body is the uplink and whose response body the downlink
-	// (StreamingCandidate).
-	CarrierStreaming
+	// (zmuxhttp.StreamCandidate).
+	CarrierStream
 	// CarrierSplit is a split bootstrap: an uplink POST and a downlink GET
-	// (SplitCandidate).
+	// (zmuxhttp.SplitCandidate).
 	CarrierSplit
 	// CarrierExchange is the exchange carrier of bounded requests
-	// (ExchangeCandidate).
+	// (zmuxhttp.ExchangeCandidate).
 	CarrierExchange
 	// CarrierQUIC is a QUIC stream (zmuxquic.Candidate), direct only.
 	CarrierQUIC
@@ -45,7 +44,7 @@ const (
 	// (zmuxh3.HTTP3Candidate).
 	CarrierHTTP3
 	// CarrierWebTransport is a WebTransport stream
-	// (zmuxh3.WebTransportCandidate), direct only.
+	// (zmuxh3.Candidate), direct only.
 	CarrierWebTransport
 )
 
@@ -98,105 +97,68 @@ type CandidateResult struct {
 	Joined bool
 }
 
-// Candidate is one carrier kind that DialMode may use. Dial opens a
+// Candidate is one carrier kind that DialChoice may use. Dial opens a
 // carrier of the kind, presenting cred (the session's Config.Credential)
-// for the server's admission; DialMode sets its PipeIO.Carrier to Kind.
+// for the server's admission; DialChoice sets its PipeIO.Carrier to Kind.
 // The carrier must live until the pipe ends, not until ctx does, which
 // bounds only the opening. The constructors of each adapter return ready
 // candidates.
 type Candidate struct {
 	Kind CarrierKind
-	Dial func(ctx context.Context, cred Credential) (PipeIO, error)
+	Dial func(ctx context.Context, cred CarrierCredential) (PipeIO, error)
 	// Target, for a kind dialed at a URL, is where its carriers start and
-	// what redirects led them to (nil: not known). DialMode keeps it per
-	// server in ModePolicy.Cache, and starts it at the base URL again
+	// what redirects led them to (nil: not known). DialChoice keeps it per
+	// server in CarrierChoicePolicy.Cache, and starts it at the base URL again
 	// after a failure.
-	Target *HTTPTarget
+	Target CarrierTarget
 	// Variant labels a transform the candidate's carriers run (PipeIO.Variant,
-	// which DialMode sets on what Dial returns when it is not ""). A kind
+	// which DialChoice sets on what Dial returns when it is not ""). A kind
 	// with different variants makes different candidates, each with its
-	// own CarrierCache entry; DialMode orders them as for different kinds,
+	// own CarrierCache entry; DialChoice orders them as for different kinds,
 	// so that the host states its preference by their order.
 	Variant string
 
-	// join joins a carrier of the kind to c, for a kind whose Dial does
+	// Join joins carriers of the kind to c, for a kind whose Dial does
 	// not open a carrier that can join (a split bootstrap); nil: AddPipe
 	// on a carrier from Dial. ctx bounds the attempt, life the carriers.
-	join func(ctx, life context.Context, c *Conn, cred Credential, o PipeOptions) ([]*Pipe, error)
+	Join func(ctx, life context.Context, c *Conn, cred CarrierCredential, o PipeOptions) ([]*Pipe, error)
 }
 
-// StreamingCandidate is a bidirectional streaming request (HTTPPipe) to
-// url with client and the fields h. It passes intermediaries that forward
-// both bodies at once: HTTP/2 or HTTP/3 to the server, or HTTP/1.1 hops
-// that do not buffer request bodies.
-func StreamingCandidate(client *http.Client, url string, h http.Header) Candidate {
-	t := NewHTTPTarget(url)
-	return Candidate{Kind: CarrierStreaming, Target: t, Dial: func(ctx context.Context, cred Credential) (PipeIO, error) {
-		return httpPipe(ctx, client, url, t, h, DirBidirectional, cred)
-	}}
+// CarrierTarget is where the carriers of a kind dialed at a URL start, and
+// what redirects led them to; zmuxhttp.Target is one. CarrierCache
+// remembers the URL a usable kind's redirects found and starts the target
+// there in later dials.
+type CarrierTarget interface {
+	// URL is where the next carrier starts.
+	URL() string
+	// Base is the URL the target was made with.
+	Base() string
+	// Redirected moves the target to url, a URL redirects led to.
+	Redirected(url string)
+	// Reset starts the target at its base URL again.
+	Reset()
 }
 
-// SplitCandidate is a split bootstrap (HTTPSplitPipe) to url with client
-// and the fields h. As a further pipe of a session it joins as an uplink
-// POST and a downlink GET that one Join pairs into one pipe. Its carriers must
-// be confidential end to end or up to a trusted TLS-terminating
-// intermediary.
-func SplitCandidate(client *http.Client, url string, h http.Header) Candidate {
-	return splitCandidate(client, url, h, HeaderPair)
-}
-
-// Candidate is SplitCandidate with o's pairing field.
-func (o *HTTPSplitOptions) Candidate(client *http.Client, url string, h http.Header) (Candidate, error) {
-	if err := o.Validate(); err != nil {
-		return Candidate{}, err
-	}
-	return splitCandidate(client, url, h, o.pairField()), nil
-}
-
-func splitCandidate(client *http.Client, url string, h http.Header, pair string) Candidate {
-	t := NewHTTPTarget(url)
-	return Candidate{Kind: CarrierSplit, Target: t,
-		Dial: func(ctx context.Context, cred Credential) (PipeIO, error) {
-			return httpSplitPipe(ctx, client, url, t, h, cred, pair)
-		},
-		join: func(ctx, _ context.Context, c *Conn, cred Credential, o PipeOptions) ([]*Pipe, error) {
-			p, err := httpSplitJoin(ctx, c, client, url, t, h, cred, o, pair)
-			if err != nil {
-				return nil, err
-			}
-			return []*Pipe{p}, nil
-		}}
-}
-
-// ExchangeCandidate is an exchange carrier (HTTPExchangePipe) to url with
-// client and cfg. It passes intermediaries that buffer whole bodies; it
-// authenticates with cfg's PSK, and the session's credential is not
-// presented on it.
-func ExchangeCandidate(client *http.Client, url string, cfg *HTTPExchangeConfig) Candidate {
-	t := NewHTTPTarget(url)
-	return Candidate{Kind: CarrierExchange, Target: t, Dial: func(ctx context.Context, _ Credential) (PipeIO, error) {
-		return httpExchangePipe(ctx, client, url, t, cfg)
-	}}
-}
-
-// Mode is how DialMode, or a PipePool, chooses the carrier: ExplicitMode
-// or AutoMode.
-type Mode struct {
+// CarrierChoice is how DialChoice, or a PipePool, chooses the carrier: ExplicitChoice
+// or AutoChoice.
+type CarrierChoice struct {
 	auto       bool
 	candidates []Candidate
 }
 
-// ExplicitMode dials c only: a failure is reported, never replaced by
+// ExplicitChoice dials c only: a failure is reported, never replaced by
 // another kind.
-func ExplicitMode(c Candidate) Mode { return Mode{candidates: []Candidate{c}} }
+func ExplicitChoice(c Candidate) CarrierChoice { return CarrierChoice{candidates: []Candidate{c}} }
 
-// AutoMode chooses among the candidates, in their order of preference
+// AutoChoice chooses among the candidates, in their order of preference
 // (most preferred first).
-func AutoMode(c ...Candidate) Mode { return Mode{auto: true, candidates: slices.Clone(c)} }
+func AutoChoice(c ...Candidate) CarrierChoice {
+	return CarrierChoice{auto: true, candidates: slices.Clone(c)}
+}
 
-// ModePolicy is the local policy of AutoMode; the zero value of every
-// field selects its default, and a nil *ModePolicy is all defaults.
-type ModePolicy struct {
+// CarrierChoicePolicy is the local policy of AutoChoice; the zero value of every
+// field selects its default, and a nil *CarrierChoicePolicy is all defaults.
+type CarrierChoicePolicy struct {
 	// Cache remembers the outcomes per server and local network across
 	// dials (nil: a cache private to the session).
 	Cache *CarrierCache
@@ -217,10 +179,10 @@ type ModePolicy struct {
 	// long of being chosen counts as failed, so that the next dials skip it
 	// until its backoff expires (30 s).
 	DropWindow time.Duration
-	// NoJoin turns off establishing on the most robust candidate and
-	// joining the preferred ones: the candidates are then tried one after
-	// another, in order.
-	NoJoin bool
+	// Join establishes a session on the most robust candidate and joins
+	// the preferred ones. It is on by default; with SwitchOff the
+	// candidates are tried one after another, in order.
+	Join Switch
 }
 
 type modeParams struct {
@@ -232,19 +194,19 @@ type modeParams struct {
 	noJoin             bool
 }
 
-func (p *ModePolicy) resolve() (modeParams, error) {
-	var x ModePolicy
+func (p *CarrierChoicePolicy) resolve() (modeParams, error) {
+	var x CarrierChoicePolicy
 	if p != nil {
 		x = *p
 	}
 	r := modeParams{cache: x.Cache, key: x.Key, factor: x.TimerFactor, timerMin: x.TimerMin,
-		timerMax: x.TimerMax, settle: x.Settle, drop: x.DropWindow, noJoin: x.NoJoin}
+		timerMax: x.TimerMax, settle: x.Settle, drop: x.DropWindow, noJoin: !x.Join.On()}
 	if r.cache == nil {
 		r.cache = &CarrierCache{}
 	}
 	if cc := r.cache; !(r.factor >= 0) || r.timerMin < 0 || r.timerMax < 0 || r.settle < 0 || r.drop < 0 ||
 		cc.SuccessTTL < 0 || cc.BackoffMin < 0 || cc.BackoffMax < 0 {
-		return r, fmt.Errorf("%w: negative or NaN ModePolicy or CarrierCache field", ErrInvalidConfig)
+		return r, fmt.Errorf("%w: negative or NaN CarrierChoicePolicy or CarrierCache field", ErrInvalidConfig)
 	}
 	if r.factor <= 0 {
 		r.factor = 3
@@ -271,10 +233,10 @@ func (p *modeParams) timer(rtt time.Duration) time.Duration {
 }
 
 // CarrierCache remembers which carrier kinds worked per server and local
-// network (ModePolicy.Key): a usable kind for SuccessTTL, a failed one is
+// network (CarrierChoicePolicy.Key): a usable kind for SuccessTTL, a failed one is
 // skipped for a backoff that doubles with every failure in a row, from
 // BackoffMin to BackoffMax. A kind that fails soon after it was chosen
-// (ModePolicy.DropWindow) counts as failed, so that a path that lets a
+// (CarrierChoicePolicy.DropWindow) counts as failed, so that a path that lets a
 // kind through only briefly is not tried again at once. The zero value is
 // ready; the fields must not change once it is in use. It is safe for
 // concurrent use.
@@ -318,9 +280,9 @@ const (
 	CacheRejected
 )
 
-// Report records an outcome the host learnt after DialMode for the
-// candidate of kind and variant under key (the ModePolicy.Key in use),
-// in the entry DialMode's own outcomes use. Safe for concurrent use.
+// Report records an outcome the host learnt after DialChoice for the
+// candidate of kind and variant under key (the CarrierChoicePolicy.Key in use),
+// in the entry DialChoice's own outcomes use. Safe for concurrent use.
 func (cc *CarrierCache) Report(key string, kind CarrierKind, variant string, o CacheOutcome) {
 	cc.update(cacheKey{key, kind, variant}, nil, o, time.Now())
 }
@@ -367,7 +329,7 @@ func (cc *CarrierCache) record(key string, cand Candidate, ok bool, now time.Tim
 
 // update applies o to the entry of k; target, when known, is the
 // candidate's.
-func (cc *CarrierCache) update(k cacheKey, target *HTTPTarget, o CacheOutcome, now time.Time) {
+func (cc *CarrierCache) update(k cacheKey, target CarrierTarget, o CacheOutcome, now time.Time) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	if cc.m == nil {
@@ -577,13 +539,13 @@ func (cc *CarrierCache) Restore(data []byte) error {
 	return nil
 }
 
-// ModeError reports that DialMode found no usable candidate, with the
+// CarrierChoiceError reports that DialChoice found no usable candidate, with the
 // outcome of every one it tried.
-type ModeError struct {
+type CarrierChoiceError struct {
 	Results []CandidateResult
 }
 
-func (e *ModeError) Error() string {
+func (e *CarrierChoiceError) Error() string {
 	var b strings.Builder
 	b.WriteString("zmux: no usable carrier")
 	for i, r := range e.Results {
@@ -603,7 +565,7 @@ func (e *ModeError) Error() string {
 }
 
 // Unwrap returns the candidates' errors.
-func (e *ModeError) Unwrap() []error {
+func (e *CarrierChoiceError) Unwrap() []error {
 	var errs []error
 	for _, r := range e.Results {
 		if r.Err != nil {
@@ -613,11 +575,11 @@ func (e *ModeError) Unwrap() []error {
 	return errs
 }
 
-// DialMode dials a client session over the carrier the mode selects. ctx
+// DialChoice dials a client session over the carrier the mode selects. ctx
 // bounds the dial and the handshakes; each carrier presents
-// cfg.Credential. pol is the policy of AutoMode (nil: the defaults).
+// cfg.Credential. pol is the policy of AutoChoice (nil: the defaults).
 //
-// ExplicitMode dials its one candidate as its own dialer does. AutoMode
+// ExplicitChoice dials its one candidate as its own dialer does. AutoChoice
 // does not use early data (cfg.EarlyData is ignored), so that nothing the
 // application sends goes out before a carrier is chosen, and it does not
 // race candidates: it skips the kinds the cache holds as failed (unless
@@ -625,22 +587,22 @@ func (e *ModeError) Unwrap() []error {
 // the most robust candidate (a kind the cache holds as usable, else the
 // exchange carrier, else the last) and joins the preferred ones as further
 // pipes in the background, retiring the pipes of the kind they replace
-// once one has stayed joined for ModePolicy.Settle; it keeps retrying
+// once one has stayed joined for CarrierChoicePolicy.Settle; it keeps retrying
 // preferred kinds as their backoff expires, and joins the best kind
 // available again when the active one fails. Without joins (MaxPipes 1,
-// NoJoin, or a peer without multipath) it tries the candidates one after
+// Join off, or a peer without multipath) it tries the candidates one after
 // another, in order, and keeps the first usable one.
 //
 // Each try of a candidate is reported as an EventCarrierCandidate, the
 // choice as an EventCarrierChosen (again on every switch), and both in
-// ConnectionStats. When no candidate is usable, the error is a *ModeError.
-func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn, error) {
+// ConnectionStats. When no candidate is usable, the error is a *CarrierChoiceError.
+func DialChoice(ctx context.Context, m CarrierChoice, cfg *Config, pol *CarrierChoicePolicy) (*Conn, error) {
 	if err := m.validate(); err != nil {
 		return nil, err
 	}
-	var cred Credential
+	var cred CarrierCredential
 	if cfg != nil {
-		cred = cfg.Credential
+		cred = cfg.CarrierCredential
 	}
 	if !m.auto {
 		cand := m.candidates[0]
@@ -649,7 +611,7 @@ func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn,
 			if cand.Target != nil {
 				cand.Target.Reset()
 			}
-			return nil, &ModeError{Results: []CandidateResult{res}}
+			return nil, &CarrierChoiceError{Results: []CandidateResult{res}}
 		}
 		c.reportCarrier(cand, []CandidateResult{res}, true)
 		return c, nil
@@ -700,12 +662,12 @@ func DialMode(ctx context.Context, m Mode, cfg *Config, pol *ModePolicy) (*Conn,
 		})
 		return c, nil
 	}
-	return nil, &ModeError{Results: results}
+	return nil, &CarrierChoiceError{Results: results}
 }
 
 // validate checks that m has candidates, each with a kind and a Dial, and
 // no kind and variant twice.
-func (m Mode) validate() error {
+func (m CarrierChoice) validate() error {
 	if len(m.candidates) == 0 {
 		return fmt.Errorf("%w: a Mode without a candidate", ErrInvalidConfig)
 	}
@@ -767,7 +729,7 @@ func lifeErr(life context.Context, err error) error {
 // timer; a carrier that misses it is closed, which sends nothing.
 // dial opens a carrier of the candidate, labelled with its Kind
 // (PipeIO.Carrier).
-func (c Candidate) dial(ctx context.Context, cred Credential) (PipeIO, error) {
+func (c Candidate) dial(ctx context.Context, cred CarrierCredential) (PipeIO, error) {
 	p, err := c.Dial(ctx, cred)
 	if err == nil {
 		p.Carrier = c.Kind
@@ -778,7 +740,7 @@ func (c Candidate) dial(ctx context.Context, cred Credential) (PipeIO, error) {
 	return p, err
 }
 
-func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Credential, p *modeParams) (*Conn, CandidateResult) {
+func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred CarrierCredential, p *modeParams) (*Conn, CandidateResult) {
 	res := CandidateResult{Kind: cand.Kind, Variant: cand.Variant}
 	life, cancel, stop := candidateLife(ctx, cfg.handshakeTimeout())
 	t0 := time.Now()
@@ -802,14 +764,14 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Crede
 	if tm != nil && !tm.Stop() {
 		<-expired
 		if c != nil {
-			c.closeWith(0, "")
+			c.Abort(0, "")
 		}
 		c, err = nil, fmt.Errorf("zmux: %v carrier: no transport parameters within the timer", cand.Kind)
 		res.Outcome = CandidateTimedOut
 	}
 	if c == nil || !stop() {
 		if c != nil {
-			c.closeWith(0, "")
+			c.Abort(0, "")
 			err = ctx.Err()
 			if err == nil {
 				err = ErrHandshakeTimeout
@@ -831,15 +793,17 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Crede
 
 // joinCandidate joins a carrier of cand to c with the options o within the
 // candidate's timer; ctx bounds the attempt, and the carriers then live
-// until the session ends.
-func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred Credential, p *modeParams, o PipeOptions) ([]*Pipe, CandidateResult) {
+// until the session ends. A join that the attachment cap still held when
+// the timer ended was never tried: its result has no Outcome, and the
+// kind is neither failed nor reported.
+func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred CarrierCredential, p *modeParams, o PipeOptions) ([]*Pipe, CandidateResult) {
 	res := CandidateResult{Kind: cand.Kind, Variant: cand.Variant, Joined: true}
 	life, cancel, stop := candidateLife(ctx, c.cfg.joinTimeout())
 	var pipes []*Pipe
 	var err error
-	if cand.join != nil {
+	if cand.Join != nil {
 		jctx, jcancel := context.WithTimeout(ctx, p.timerMin)
-		pipes, err = cand.join(jctx, life, c, cred, o)
+		pipes, err = cand.Join(jctx, life, c, cred, o)
 		jcancel()
 	} else {
 		t0 := time.Now()
@@ -862,7 +826,10 @@ func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred Credential
 	if err != nil {
 		err = lifeErr(life, err)
 		cancel()
-		res.Outcome, res.Err = outcomeOf(err), err
+		res.Err = err
+		if !errors.Is(err, errJoinHeld) {
+			res.Outcome = outcomeOf(err)
+		}
 		return nil, res
 	}
 	context.AfterFunc(c.Context(), cancel)
@@ -872,11 +839,9 @@ func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred Credential
 
 // outcomeOf classifies the failure of a try.
 func outcomeOf(err error) CandidateOutcome {
-	var se *HTTPStatusError
 	var ht *HandshakeTimeoutError
-	var re *HTTPRedirectError
 	switch {
-	case errors.As(err, &se), errors.As(err, &re), connRefused(err):
+	case errors.Is(err, ErrCarrierRefused), connRefused(err):
 		return CandidateRefused
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, ErrHandshakeTimeout), errors.As(err, &ht):
 		return CandidateTimedOut
@@ -885,7 +850,7 @@ func outcomeOf(err error) CandidateOutcome {
 }
 
 // modePool chooses the carrier kinds of a pipe pool dialed by a mode
-// (PipePool.Mode): stable first, then upgrade. A member is dialed over
+// (PipePool.Choice): stable first, then upgrade. A member is dialed over
 // the most robust kind available (baseCandidate), and a member of a kind
 // a preferred kind could replace is rotated to it, make before break; the
 // replacement takes over once it has stayed usable for Settle. A kind
@@ -895,10 +860,10 @@ type modePool struct {
 	cands []Candidate
 	auto  bool
 	p     modeParams
-	cred  Credential
+	cred  CarrierCredential
 }
 
-func newModePool(m Mode, pol *ModePolicy, cred Credential) (*modePool, error) {
+func newModePool(m CarrierChoice, pol *CarrierChoicePolicy, cred CarrierCredential) (*modePool, error) {
 	if err := m.validate(); err != nil {
 		return nil, err
 	}
@@ -957,6 +922,9 @@ func (mp *modePool) join(ctx context.Context, c *Conn, i int, o PipeOptions) ([]
 		mp.p.cache.prime(mp.p.key, cand)
 	}
 	pipes, res := joinCandidate(ctx, c, cand, mp.cred, &mp.p, o)
+	if res.Outcome == 0 {
+		return nil, res.Err // held back by the cap: deferred, not failed
+	}
 	c.reportCarrier(cand, []CandidateResult{res}, false)
 	if pipes == nil {
 		mp.record(i, false)
@@ -992,7 +960,7 @@ func (mp *modePool) dropped(i int, born time.Time) {
 	}
 }
 
-// modeSeed hands MaintainPipes the pipes a session dialed by DialMode was
+// modeSeed hands MaintainPipes the pipes a session dialed by DialChoice was
 // established on, as the pool's first member, with the pool's mode.
 type modeSeed struct {
 	mp    *modePool

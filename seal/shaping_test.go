@@ -160,10 +160,10 @@ func TestJoinWireLengths(t *testing.T) {
 		within       bool
 		reply, wantR int
 	}{
-		{"sealed", zmux.Sealed, false, 1500, 1500},
-		{"trusted", zmux.Trusted, false, 1500, 1500},
-		{"bound", zmux.Bound, false, 1500, 1500},
-		{"sealed-limit", zmux.Sealed, true, 60000, 0},
+		{"sealed", zmux.RecordSealed, false, 1500, 1500},
+		{"trusted", zmux.RecordTrusted, false, 1500, 1500},
+		{"bound", zmux.RecordBound, false, 1500, 1500},
+		{"sealed-limit", zmux.RecordSealed, true, 60000, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -179,7 +179,7 @@ func TestJoinWireLengths(t *testing.T) {
 			var mu sync.Mutex
 			var accepted []*writesConn
 			wrapConn := func(nc net.Conn) zmux.PipeIO {
-				if tc.mode == zmux.Bound {
+				if tc.mode == zmux.RecordBound {
 					return zmux.NetPipe(&secureConn{Conn: nc, exp: exp})
 				}
 				return zmux.NetPipe(nc)
@@ -196,13 +196,13 @@ func TestJoinWireLengths(t *testing.T) {
 				WrapPipe: zmux.WrapPipeFunc(wrap),
 			})
 			cc := f.client
-			cc.Mode = tc.mode
+			cc.RecordMode = tc.mode
 			p, err := seal.Establish(ctx, wrapConn(dial(t, addr)), &cc)
 			if err != nil {
 				t.Fatal(err)
 			}
 			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4, HandshakeShaper: sh,
-				RecordPolicy: func(zmux.CarrierInfo) zmux.RecordMode { return tc.mode }})
+				RecordPolicy: func(zmux.RecordPolicyInput) zmux.RecordMode { return tc.mode }})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -234,7 +234,7 @@ func TestJoinWireLengths(t *testing.T) {
 			if cw[0] != hello || sw[0] != tc.wantR {
 				t.Fatalf("client %v, server %v", cw, sw)
 			}
-			if tc.mode != zmux.Bound && (len(cw) < 2 || cw[1] != 800) {
+			if tc.mode != zmux.RecordBound && (len(cw) < 2 || cw[1] != 800) {
 				t.Fatalf("confirm: client %v", cw)
 			}
 			if st := c.ShapingStats(); st.WireSpent == 0 {

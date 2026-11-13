@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 )
 
 // rawCarrier makes the carrier of Bound or Trusted: raw records on the lower halves,
@@ -210,7 +211,7 @@ func (w *rawWriter) WriteBuffers(bufs [][]byte) (int, error) {
 		n, err := nb.WriteTo(c)
 		return int(n), err
 	}
-	return zmux.WriteFlat(w.WriteCloser, bufs)
+	return carrier.WriteFlat(w.WriteCloser, bufs)
 }
 
 // CloseWrite ends the sending direction where the carrier can.

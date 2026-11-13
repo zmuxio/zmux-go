@@ -37,7 +37,7 @@ func twoPipeSession() (*Conn, *Conn, error) {
 		if err != nil {
 			return client, server, err
 		}
-		if ev.Kind == EventPipeJoined && ev.Pipe == p.ID() {
+		if ev.Kind == EventPipeJoined && ev.PipeID == p.ID() {
 			break
 		}
 	}

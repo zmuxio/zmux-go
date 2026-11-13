@@ -75,7 +75,7 @@ func TestAppDataVerdict(t *testing.T) {
 	id := pk.ID()
 	cc, sc := f.client, f.server
 	sc.Signer = seal.KeySigner(pk)
-	cc.Anchor = verdictAnchor{seal.Verdict{Principal: seal.Principal{Type: 9, Bytes: []byte("node 7")}, ProofKey: &id, Value: "tenant"}}
+	cc.Anchor = verdictAnchor{seal.VerifyVerdict{Principal: seal.Principal{Type: 9, Bytes: []byte("node 7")}, ProofKey: &id, Value: "tenant"}}
 	var got []seal.AppDataRequest
 	cc.AppData = func(_ context.Context, r seal.AppDataRequest) ([]byte, error) { got = append(got, r); return nil, nil }
 	x, y := net.Pipe()
@@ -102,9 +102,9 @@ func TestAppDataVerdict(t *testing.T) {
 	}
 }
 
-type verdictAnchor struct{ v seal.Verdict }
+type verdictAnchor struct{ v seal.VerifyVerdict }
 
-func (a verdictAnchor) Verify(context.Context, seal.VerifyInput) (seal.Verdict, error) {
+func (a verdictAnchor) Verify(context.Context, seal.VerifyInput) (seal.VerifyVerdict, error) {
 	return a.v, nil
 }
 
@@ -168,9 +168,9 @@ func TestAppDataLimits(t *testing.T) {
 
 type recordAnchor struct{ got *seal.VerifyInput }
 
-func (a recordAnchor) Verify(_ context.Context, in seal.VerifyInput) (seal.Verdict, error) {
+func (a recordAnchor) Verify(_ context.Context, in seal.VerifyInput) (seal.VerifyVerdict, error) {
 	*a.got = in
-	return seal.Verdict{}, nil
+	return seal.VerifyVerdict{}, nil
 }
 
 func appDataEqual(a, b []seal.AppData) bool {

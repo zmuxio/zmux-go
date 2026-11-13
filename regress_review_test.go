@@ -69,7 +69,7 @@ func TestUnusedHalfOutsideLock(t *testing.T) {
 	g := &gatedWrite{Conn: e.dial(e.addr), gate: make(chan struct{}), blocked: make(chan struct{}), nth: -1}
 	done := make(chan error, 1)
 	go func() {
-		_, err := e.c.AddPipe(e.ctx, PipeIO{R: g, W: g}, PipeOptions{Direction: DirReceiveOnly})
+		_, err := e.c.AddPipe(e.ctx, PipeIO{R: g, W: g}, PipeOptions{Direction: DirectionReceiveOnly})
 		done <- err
 	}()
 	<-g.blocked

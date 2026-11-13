@@ -35,9 +35,7 @@ func TestConfigBounds(t *testing.T) {
 		{"ReplayWindow at MaxPipes+H", Config{MaxPipes: 4, ReplayWindow: 12, PipeAuth: psk}, core.RoleInitiator, true},
 		{"negative ResumeTimeout", Config{ResumeTimeout: -1}, core.RoleInitiator, false},
 		{"negative JoinTimeout", Config{JoinTimeout: -1}, core.RoleInitiator, false},
-		{"negative JoinEarlyHello", Config{JoinEarlyHello: -1}, core.RoleInitiator, false},
-		{"JoinEarlyHello with NoJoinEarlyHello", Config{JoinEarlyHello: 1024, NoJoinEarlyHello: true}, core.RoleInitiator, false},
-		{"NoJoinEarlyHello", Config{NoJoinEarlyHello: true}, core.RoleInitiator, true},
+		{"negative JoinEarlyHello", Config{JoinEarlyHello: -1}, core.RoleInitiator, true},
 		{"negative RedialMinBackoff", Config{RedialMinBackoff: -1}, core.RoleInitiator, false},
 		{"RedialMinBackoff above the default maximum", Config{RedialMinBackoff: 2 * time.Minute}, core.RoleInitiator, false},
 		{"RedialMinBackoff above RedialMaxBackoff", Config{RedialMinBackoff: 5 * time.Second, RedialMaxBackoff: 2 * time.Second}, core.RoleInitiator, false},
@@ -140,7 +138,7 @@ func TestOwnershipOnFailure(t *testing.T) {
 // exporter, as a secure-carrier transform's halves do.
 type secureTestConn struct{ net.Conn }
 
-func (secureTestConn) RecordMode() RecordMode { return Sealed }
+func (secureTestConn) RecordMode() RecordMode { return RecordSealed }
 func (secureTestConn) ExportKeyingMaterial(_ string, _ []byte, n int) ([]byte, error) {
 	return make([]byte, n), nil
 }

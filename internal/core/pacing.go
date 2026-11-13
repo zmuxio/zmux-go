@@ -13,14 +13,13 @@ func (s *Session) paced(p *Pipe) bool {
 // limInFlight is the bytes in flight as the limiter counts them: the
 // ack-eliciting bytes beyond the cumulative point, less the held bytes of
 // a pipe with lanes that it leaves out.
-func (s *Session) limInFlight(p *Pipe) (uint64, uint64) {
+func (s *Session) limInFlight(p *Pipe) uint64 {
 	ps := &p.out.snd
 	raw := ps.elicitEnd - min64(ps.elicitEnd, ps.cum)
-	held := s.heldBytes(p)
 	if ps.lim != nil {
-		return raw - min64(raw, ps.lim.leftOut(held)), held
+		return raw - min64(raw, ps.lim.leftOut(s.heldBytes(p)))
 	}
-	return raw, held
+	return raw
 }
 
 // heldBytes are the bytes acknowledged on their own lanes beyond the
@@ -69,7 +68,7 @@ func (s *Session) paceRoom(p *Pipe) int64 {
 		return -1
 	}
 	pp := s.limParams()
-	in, _ := s.limInFlight(p)
+	in := s.limInFlight(p)
 	r := min(l.room(s.now, in, p.out.snd.re.value(), s.srttOf(p), &pp), 1<<40)
 	return int64(r)
 }
@@ -109,7 +108,7 @@ func (s *Session) paceSent(p *Pipe, bytes uint64) {
 	pp := s.limParams()
 	srtt, rate := s.srttOf(p), p.out.snd.re.value()
 	l.settle(s.now, bytes, rate, srtt, &pp)
-	in, _ := s.limInFlight(p)
+	in := s.limInFlight(p)
 	l.refresh(s.now, in, rate, srtt, &pp)
 }
 
@@ -154,7 +153,7 @@ func (s *Session) paceTimeout(now Time) {
 		if l == nil || !l.held || l.release > now {
 			continue
 		}
-		in, _ := s.limInFlight(p)
+		in := s.limInFlight(p)
 		l.refresh(now, in, p.out.snd.re.value(), s.srttOf(p), &pp)
 		if !l.held {
 			s.wakePipe(p)

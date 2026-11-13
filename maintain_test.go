@@ -31,7 +31,7 @@ func TestMaintainPipesRedials(t *testing.T) {
 	count := func() int {
 		n := 0
 		for _, p := range e.client.PipeStats() {
-			if p.Pipe != 0 && p.Outbound == OutboundActive {
+			if p.PipeID != 0 && p.Outbound == OutboundActive {
 				n++
 			}
 		}
@@ -48,8 +48,8 @@ func TestMaintainPipesRedials(t *testing.T) {
 	}
 	wait(2)
 	for _, p := range e.client.PipeStats() {
-		if p.Pipe != 0 {
-			pp, _ := e.client.Pipe(p.Pipe)
+		if p.PipeID != 0 {
+			pp, _ := e.client.Pipe(p.PipeID)
 			_ = pp.Abort(nil)
 			break
 		}
@@ -302,7 +302,7 @@ func (c *heldCarrier) Close() error {
 // The peer's attachment: the bootstrap pipe and a pipe
 // the peer joined are attached from the start; a pipe this endpoint joined
 // is attached by an acknowledged byte, or a record for one that only
-// receives, and AddPipe with NoWaitAttached returns before that.
+// receives, and AddPipe with ReturnOnReply returns before that.
 func TestWaitAttached(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newMemMPEnv(t, mpConfig(), mpConfig())
@@ -317,12 +317,12 @@ func TestWaitAttached(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		for _, dir := range []Direction{DirBidirectional, DirSendOnly, DirReceiveOnly} {
+		for _, dir := range []Direction{DirectionBidirectional, DirectionSendOnly, DirectionReceiveOnly} {
 			nc, err := e.dial(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
-			p, err := e.client.AddPipe(ctx, NetPipe(newHeldCarrier(nc, 300*time.Millisecond)), PipeOptions{Direction: dir, NoWaitAttached: true})
+			p, err := e.client.AddPipe(ctx, NetPipe(newHeldCarrier(nc, 300*time.Millisecond)), PipeOptions{Direction: dir, ReturnOnReply: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -357,7 +357,7 @@ func TestWaitAttached(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		p, err := e.client.AddPipe(ctx, NetPipe(newHeldCarrier(nc, 5*time.Second)), PipeOptions{NoWaitAttached: true})
+		p, err := e.client.AddPipe(ctx, NetPipe(newHeldCarrier(nc, 5*time.Second)), PipeOptions{ReturnOnReply: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -372,7 +372,7 @@ func TestWaitAttached(t *testing.T) {
 }
 
 // The pool judges a member usable by the peer's attachment alone: the
-// bootstrap pipe and an accepted pipe need no acknowledgement (a DialMode
+// bootstrap pipe and an accepted pipe need no acknowledgement (a DialChoice
 // pool's first member is pipe 0), a joined one does.
 func TestMemberStateAttachment(t *testing.T) {
 	leakcheck.Check(t)
@@ -389,7 +389,7 @@ func TestMemberStateAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := e.client.AddPipe(ctx, NetPipe(newHeldCarrier(nc, 300*time.Millisecond)), PipeOptions{NoWaitAttached: true})
+	p, err := e.client.AddPipe(ctx, NetPipe(newHeldCarrier(nc, 300*time.Millisecond)), PipeOptions{ReturnOnReply: true})
 	if err != nil {
 		t.Fatal(err)
 	}

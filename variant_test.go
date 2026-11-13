@@ -16,20 +16,20 @@ import (
 // only.
 func TestCarrierCacheReport(t *testing.T) {
 	cc := &CarrierCache{BackoffMin: time.Minute, BackoffMax: time.Hour}
-	x := Candidate{Kind: CarrierStreaming, Variant: "x"}
+	x := Candidate{Kind: CarrierStream, Variant: "x"}
 	now := time.Now()
-	cc.Report("k", CarrierStreaming, "x", CacheUsable)
+	cc.Report("k", CarrierStream, "x", CacheUsable)
 	if good, _ := cc.state("k", x, now); !good {
 		t.Fatal("usable not recorded")
 	}
-	if good, until := cc.state("k", Candidate{Kind: CarrierStreaming}, now); good || !until.IsZero() {
+	if good, until := cc.state("k", Candidate{Kind: CarrierStream}, now); good || !until.IsZero() {
 		t.Fatal("variant \"\" shares the entry")
 	}
-	cc.Report("k", CarrierStreaming, "x", CacheFailed)
+	cc.Report("k", CarrierStream, "x", CacheFailed)
 	if _, until := cc.state("k", x, now); until.Sub(now) < 50*time.Second || until.Sub(now) > 2*time.Minute {
 		t.Fatalf("failed: skipped until %v from now", until.Sub(now))
 	}
-	cc.Report("k", CarrierStreaming, "x", CacheRejected)
+	cc.Report("k", CarrierStream, "x", CacheRejected)
 	if _, until := cc.state("k", x, now); until.Sub(now) < 59*time.Minute {
 		t.Fatalf("rejected: skipped until %v from now", until.Sub(now))
 	}
@@ -59,9 +59,9 @@ func TestDialModeVariants(t *testing.T) {
 	defer cancel()
 	lst := mustNewListener(&ListenerConfig{Config: &Config{}})
 	defer func() { _ = lst.Close() }()
-	failing := Candidate{Kind: CarrierStreaming, Variant: "a",
-		Dial: func(context.Context, Credential) (PipeIO, error) { return PipeIO{}, errors.New("no") }}
-	working := Candidate{Kind: CarrierStreaming, Variant: "b", Dial: func(context.Context, Credential) (PipeIO, error) {
+	failing := Candidate{Kind: CarrierStream, Variant: "a",
+		Dial: func(context.Context, CarrierCredential) (PipeIO, error) { return PipeIO{}, errors.New("no") }}
+	working := Candidate{Kind: CarrierStream, Variant: "b", Dial: func(context.Context, CarrierCredential) (PipeIO, error) {
 		a, b := net.Pipe()
 		go func() { _ = lst.HandlePipe(ctx, NetPipe(b), PipeHint{}) }()
 		return NetPipe(a), nil
@@ -72,7 +72,7 @@ func TestDialModeVariants(t *testing.T) {
 		return nil
 	}}
 	cache := &CarrierCache{}
-	c, err := DialMode(ctx, AutoMode(failing, working), cfg, &ModePolicy{Cache: cache, Key: "k"})
+	c, err := DialChoice(ctx, AutoChoice(failing, working), cfg, &CarrierChoicePolicy{Cache: cache, Key: "k"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestDialModeVariants(t *testing.T) {
 		}
 		chosen = ev.Kind == EventCarrierChosen && ev.Variant == "b"
 	}
-	if _, err := DialMode(ctx, AutoMode(working, working), cfg, nil); !errors.Is(err, ErrInvalidConfig) {
+	if _, err := DialChoice(ctx, AutoChoice(working, working), cfg, nil); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("duplicate kind and variant: %v", err)
 	}
 }

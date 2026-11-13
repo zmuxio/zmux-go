@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/seal/proto"
 )
 
@@ -28,8 +29,10 @@ const PrincipalNodeKey uint16 = 1
 
 // VerifyInput is everything an Anchor judges a peer by.
 type VerifyInput struct {
-	// Role is the role expected of the peer: RoleServer or RoleClient.
-	Role Role
+	// Role is the role expected of the peer: zmux.RoleServer when a client
+	// verifies its server, zmux.RoleClient when a server verifies its
+	// client.
+	Role zmux.Role
 	// Profile is the handshake's.
 	Profile proto.Profile
 	// PeerStatic is the peer's static key.
@@ -92,7 +95,7 @@ func authenticated(d []AppData) {
 type AppDataRequest struct {
 	Message int
 	Peer    *VerifyInput
-	Verdict *Verdict
+	Verdict *VerifyVerdict
 }
 
 // AppDataSource supplies the application data of the messages an end sends: a
@@ -101,17 +104,8 @@ type AppDataRequest struct {
 // data sends nothing.
 type AppDataSource func(ctx context.Context, r AppDataRequest) ([]byte, error)
 
-// Role is the role of a peer.
-type Role uint8
-
-// Roles of a peer.
-const (
-	RoleServer Role = 1
-	RoleClient Role = 2
-)
-
-// Verdict is the judgement of a peer that passed.
-type Verdict struct {
+// VerifyVerdict is the judgement of a peer that passed.
+type VerifyVerdict struct {
 	Principal Principal
 	// ProofKey, when set, is the KeyId of the key whose transcript signature
 	// the message must carry: the handshake fails without a signature that
@@ -122,11 +116,11 @@ type Verdict struct {
 }
 
 // Anchor judges the peer in one call. It does not see the transcript: the
-// handshake checks the transcript signature against Verdict.ProofKey. An error
+// handshake checks the transcript signature against VerifyVerdict.ProofKey. An error
 // that wraps ErrVerifyUnavailable is temporary; any other error, or a panic,
 // rejects the peer.
 type Anchor interface {
-	Verify(ctx context.Context, in VerifyInput) (Verdict, error)
+	Verify(ctx context.Context, in VerifyInput) (VerifyVerdict, error)
 }
 
 // Reasons of a rejected peer; they stay local.
@@ -189,12 +183,12 @@ func PinAnchor(node proto.KeyID, proof ...proto.KeyID) *Pin {
 }
 
 // Verify judges the peer by its key.
-func (a *Pin) Verify(_ context.Context, in VerifyInput) (Verdict, error) {
+func (a *Pin) Verify(_ context.Context, in VerifyInput) (VerifyVerdict, error) {
 	id, err := proto.KeyIDOf(proto.KeyAlgX25519, in.PeerStatic)
 	if err != nil || id != a.node {
-		return Verdict{}, ErrNotPinned
+		return VerifyVerdict{}, ErrNotPinned
 	}
-	return Verdict{Principal: Principal{Type: PrincipalNodeKey, Bytes: id[:]}, ProofKey: a.proof}, nil
+	return VerifyVerdict{Principal: Principal{Type: PrincipalNodeKey, Bytes: id[:]}, ProofKey: a.proof}, nil
 }
 
 // checkPQAuth is the configuration rule of RequirePQAuth: a pin without a
@@ -209,7 +203,7 @@ func checkPQAuth(require bool, a Anchor) error {
 // judge runs an Anchor and checks the transcript signature its verdict asks
 // for. It returns whether the peer is authenticated by a post-quantum
 // signature.
-func judge(ctx context.Context, a Anchor, in VerifyInput, proof *proto.Proof, requirePQ bool) (v Verdict, pq bool, err error) {
+func judge(ctx context.Context, a Anchor, in VerifyInput, proof *proto.Proof, requirePQ bool) (v VerifyVerdict, pq bool, err error) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -220,15 +214,15 @@ func judge(ctx context.Context, a Anchor, in VerifyInput, proof *proto.Proof, re
 	}()
 	if err != nil {
 		if ctx.Err() != nil {
-			return Verdict{}, false, ctx.Err()
+			return VerifyVerdict{}, false, ctx.Err()
 		}
 		if errors.Is(err, ErrVerifyUnavailable) {
-			return Verdict{}, false, err
+			return VerifyVerdict{}, false, err
 		}
-		return Verdict{}, false, rejected(err)
+		return VerifyVerdict{}, false, rejected(err)
 	}
 	if pq, err = proto.CheckProof(v.ProofKey, proof, requirePQ); err != nil {
-		return Verdict{}, false, rejected(err)
+		return VerifyVerdict{}, false, rejected(err)
 	}
 	return v, pq, nil
 }

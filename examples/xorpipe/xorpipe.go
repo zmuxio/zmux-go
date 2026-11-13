@@ -7,7 +7,7 @@
 //
 // XOR is no protection: the package shows the hooks a transform uses
 // (EarlyClientCarrier, Admission with VerdictMore and Variant,
-// ListenerConfig.WrapPipe, ReplayFilter, EarlyData.HoldFirstFlight), not a
+// ListenerConfig.WrapPipe, admit.ReplayFilter, EarlyData.HoldFirstFlight), not a
 // transform to deploy.
 //
 // Wire format, client to server: a 20-byte header (0x01, 20, the first
@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
 )
 
 // Variant labels the transform's carriers (zmux.PipeIO.Variant).
@@ -36,7 +37,7 @@ const Variant = "xor"
 // HeaderLen is the length of the client's header.
 const HeaderLen = 20
 
-const lead = 0x01 // ClassifyFirstBytes judges a byte stream starting so Other
+const lead = 0x01 // admit.ClassifyFirstBytes judges a byte stream starting so Other
 
 // Client returns the client pipe of the transform over c, with key and
 // nonce (draw it at random for each carrier; a repeated nonce is
@@ -185,11 +186,11 @@ func (r *clientReader) Close() error { return r.c.Close() }
 func Admission() *zmux.Admission {
 	return &zmux.Admission{Peek: 2, MaxPeek: HeaderLen,
 		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
-			c, need := zmux.ClassifyFirstBytes(prefix, zmux.FramingByteStream)
+			c, need := admit.ClassifyFirstBytes(prefix, zmux.FramingByteStream)
 			switch {
-			case c == zmux.FirstBytesRecord:
+			case c == admit.FirstBytesRecord:
 				return zmux.Decision{Verdict: zmux.VerdictAccept}
-			case c == zmux.FirstBytesNeedMore:
+			case c == admit.FirstBytesNeedMore:
 				return zmux.Decision{Verdict: zmux.VerdictMore, Need: need}
 			case prefix[0] != lead || prefix[1] != HeaderLen:
 				return zmux.Decision{Verdict: zmux.VerdictClose}
@@ -205,7 +206,7 @@ func Admission() *zmux.Admission {
 // of the transform it checks the header against filter, answers the
 // verdict, drops a refused flight and returns the XOR pipe; other carriers
 // pass as they are.
-func WrapPipe(filter *zmux.ReplayFilter, key byte) zmux.WrapPipeFunc {
+func WrapPipe(filter *admit.ReplayFilter, key byte) zmux.WrapPipeFunc {
 	return func(_ context.Context, p zmux.PipeIO, hint zmux.PipeHint) (zmux.PipeIO, error) {
 		h, ok := hint.Admitted.([HeaderLen]byte)
 		if !ok {
@@ -213,7 +214,7 @@ func WrapPipe(filter *zmux.ReplayFilter, key byte) zmux.WrapPipeFunc {
 		}
 		flight := int64(binary.BigEndian.Uint16(h[2:]))
 		t := int64(binary.BigEndian.Uint64(h[4:]))
-		fresh := filter.Check(h[12:], t) == zmux.ReplayFresh
+		fresh := filter.Check(h[12:], t) == admit.ReplayFresh
 		v := []byte{0}
 		if fresh {
 			v[0] = 1

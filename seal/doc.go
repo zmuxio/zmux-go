@@ -16,7 +16,7 @@
 // Who the peer is, is the host's decision. An Anchor (ClientConfig.Anchor,
 // ServerConfig.ClientAnchor) judges the peer once per handshake from a VerifyInput: the
 // peer's static key, its one opaque credential, the PSK identity, the host's
-// LocalContext and the application data received so far. Its Verdict names the peer and
+// LocalContext and the application data received so far. Its VerifyVerdict names the peer and
 // may ask for a transcript signature by a key it names; the handshake checks that
 // signature, and a post-quantum one makes the peer PQ-authenticated (Peer.PQAuthenticated,
 // required with RequirePQAuth). PinAnchor trusts one static key, optionally with a

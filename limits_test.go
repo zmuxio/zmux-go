@@ -18,18 +18,15 @@ func TestConfigLimitsValidation(t *testing.T) {
 		{ShapingLimits: shaping.Limits{Wire: shaping.Account{Initial: shaping.MaxAccountInitial + 1}}},
 		{ShapingLimits: shaping.Limits{Wire: shaping.Account{PerMB: shaping.MaxAccountRate + 1}}},
 		{ShapingLimits: shaping.Limits{Wire: shaping.Account{PerSec: math.MaxUint64}}},
-		{SchedulerParams: SchedulerParams{ProbeInterval: time.Nanosecond}},
-		{SchedulerParams: SchedulerParams{ProbeInterval: 999 * time.Millisecond}},
-		{SchedulerParams: SchedulerParams{StandbyProbe: 500 * time.Millisecond}},
-		{SchedulerParams: SchedulerParams{ProbeJitter: -0.1}},
-		{KeepAlivePeriod: time.Nanosecond},
-		{KeepAlivePeriod: 999 * time.Millisecond},
+		{Liveness: Liveness{ProbeInterval: time.Nanosecond}},
+		{Liveness: Liveness{ProbeInterval: 999 * time.Millisecond}},
+		{Liveness: Liveness{StandbyProbe: 500 * time.Millisecond}},
+		{Liveness: Liveness{ProbeJitter: 1}},
+		{Liveness: Liveness{KeepAlivePeriod: time.Nanosecond}},
+		{Liveness: Liveness{KeepAlivePeriod: 999 * time.Millisecond}},
 		{MaxIdleTimeout: time.Nanosecond},
 		{MaxIdleTimeout: 999 * time.Microsecond},
 		{SchedulerParams: SchedulerParams{OverflowDelay: -time.Second}},
-		{MemoryBudget: -2},
-		{MaxIncomingStreams: -1},
-		{MaxIncomingUniStreams: -1},
 	}
 	for i := range bad {
 		if _, err := bad[i].coreConfig(core.RoleInitiator, core.RoleInitiator); !errors.Is(err, ErrInvalidConfig) {
@@ -39,11 +36,13 @@ func TestConfigLimitsValidation(t *testing.T) {
 	good := []Config{
 		{ShapingLimits: shaping.Limits{Wire: shaping.Account{Initial: shaping.MaxAccountInitial, PerMB: shaping.MaxAccountRate, PerSec: shaping.MaxAccountRate}, MaxDelay: time.Second}},
 		{ShapingLimits: shaping.Limits{MaxDelay: -1}},
-		{SchedulerParams: SchedulerParams{ProbeInterval: time.Second}},
-		{KeepAlivePeriod: time.Second, MaxIdleTimeout: time.Millisecond},
-		{SchedulerParams: SchedulerParams{ProbeInterval: -1, StandbyProbe: -1, NoProbeJitter: true}},
+		{Liveness: Liveness{ProbeInterval: time.Second}},
+		{Liveness: Liveness{KeepAlivePeriod: time.Second}, MaxIdleTimeout: time.Millisecond},
+		{Liveness: Liveness{ProbeInterval: -1, StandbyProbe: -1, ProbeJitter: -1}},
+		{Liveness: Liveness{ProbeJitter: -0.1}},
 		{ShapingLimits: shaping.Limits{NoPadding: true, NoInjection: true, NoPause: true}},
-		{MemoryBudget: NoMemoryLimit, HandshakeTimeout: -1, KeepAlivePeriod: -1, MaxIdleTimeout: -1, NoIncomingStreams: true, NoIncomingUniStreams: true},
+		{MemoryBudget: -1, HandshakeTimeout: -1, Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1, MaxIncomingStreams: -1, MaxIncomingUniStreams: -1},
+		{MemoryBudget: -2},
 	}
 	for i := range good {
 		if _, err := good[i].coreConfig(core.RoleInitiator, core.RoleInitiator); err != nil {
@@ -51,8 +50,8 @@ func TestConfigLimitsValidation(t *testing.T) {
 		}
 	}
 	// A negative per-pipe ProbeInterval turns the pipe's idle probes off.
-	o := PipeOptions{ProbeInterval: -time.Second}
-	if j, err := o.join(DirBidirectional); err != nil || j.Live.ProbeInterval >= 0 {
+	o := PipeOptions{Liveness: PipeLiveness{ProbeInterval: -time.Second}}
+	if j, err := o.join(DirectionBidirectional); err != nil || j.Live.ProbeInterval >= 0 {
 		t.Errorf("PipeOptions ProbeInterval negative: %+v %v", j, err)
 	}
 }

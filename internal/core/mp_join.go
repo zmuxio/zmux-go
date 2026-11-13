@@ -46,7 +46,11 @@ func (s *Session) NextPipeID() uint64 {
 	return s.mp.nextID
 }
 
-// joinAllowedFor reports whether a held local join may go now.
+// joinAllowedFor reports whether a held local join may go now. Held joins
+// are judged one by one, not in the order they were held: below the cap
+// each goes; at the cap a suspended session displaces an attachment for a
+// join that provides a direction it lacks (makeRoom), and the others keep
+// waiting.
 func (s *Session) joinAllowedFor(p *Pipe) bool {
 	a := p.mp
 	if !a.held {
@@ -55,18 +59,25 @@ func (s *Session) joinAllowedFor(p *Pipe) bool {
 	if s.now < s.mp.backoffUntil {
 		return false
 	}
-	n := 0
-	for _, q := range s.pipes {
-		if q != p && q.mp != nil && q.mp.joinerLocal && !q.mp.retired && !q.mp.held {
-			n++
-		}
-	}
-	if n >= s.mp.ownCap {
+	if s.ownGoing() >= s.mp.ownCap &&
+		(s.state != StateSuspended || !s.makeRoom(true, p.in != nil, p.out != nil) || s.ownGoing() >= s.mp.ownCap) {
 		return false
 	}
 	a.held = false
 	a.attachedAt = s.now
 	return true
+}
+
+// ownGoing counts this endpoint's own unretired attachments, those its cap
+// holds back excluded.
+func (s *Session) ownGoing() int {
+	n := 0
+	for _, q := range s.pipes {
+		if q.mp != nil && q.mp.joinerLocal && !q.mp.retired && !q.mp.held {
+			n++
+		}
+	}
+	return n
 }
 
 // joinAllowed reports whether a local join may start now.
@@ -104,9 +115,6 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	}
 	if m.ep.join == nil || len(m.ep.join.peer) == 0 {
 		return 0, 0, ErrNotNegotiated
-	}
-	if s.state == StateSuspended && s.ownAttachments() >= m.ownCap {
-		s.makeRoom(true, o.Dir != 0, o.Dir != 1)
 	}
 	group := join.DefaultJoinGroup(m.usableGroups)
 	if o.Group != 0 {
@@ -816,77 +824,92 @@ func (s *Session) AttachedPipes(dst []uint64) []uint64 {
 	return dst
 }
 
-// makeRoom frees a place among the unretired attachments of one joiner
-// (local: this endpoint's own) while suspended: the oldest
-// failed attachment is retired locally; when none has failed and the new
-// attachment provides a missing direction (provideIn: the local endpoint
-// reads on it, provideOut: it writes), the live attachment with the oldest
-// last progress is displaced, failed locally without PIPE_ABANDON.
+// roomCandidate is the attachment of one joiner (local: this endpoint's
+// own) that the cap displaces while the session is suspended for a join
+// that provides a missing direction (provideIn: the local endpoint reads
+// on it, provideOut: it writes), in this order: the oldest failed
+// attachment whose own PIPE_ABANDON was acknowledged, else the oldest
+// failed one whose PIPE_ABANDON was not, and only when none has failed,
+// the live attachment with the oldest last progress. A join that provides
+// no missing direction displaces nothing, and local joins that the cap
+// holds back are never displaced. nil: none.
 func (s *Session) roomCandidate(local, provideIn, provideOut bool) *Pipe {
+	if !s.lacks(provideIn, provideOut) {
+		return nil
+	}
+	var acked, pending *Pipe
+	for _, p := range s.pipes {
+		a := p.mp
+		if a == nil || a.retired || a.held || a.joinerLocal != local || a.alive() {
+			continue
+		}
+		if a.abandonAcked {
+			if acked == nil || a.attachedAt < acked.mp.attachedAt {
+				acked = p
+			}
+		} else if pending == nil || a.attachedAt < pending.mp.attachedAt {
+			pending = p
+		}
+	}
+	switch {
+	case acked != nil:
+		return acked
+	case pending != nil:
+		return pending
+	}
 	var oldest *Pipe
 	for _, p := range s.pipes {
 		a := p.mp
-		if a == nil || a.retired || a.joinerLocal != local {
+		if a == nil || a.retired || a.held || a.joinerLocal != local {
 			continue
 		}
-		if a.liveOut() || a.in == InOpen || a.in == InJoining {
-			continue
-		}
-		if oldest == nil || a.attachedAt < oldest.mp.attachedAt {
+		if oldest == nil || a.progress() < oldest.mp.progress() {
 			oldest = p
-		}
-	}
-	if oldest == nil {
-		out, in := s.liveCounts()
-		if (!provideOut || out != 0) && (!provideIn || in != 0) {
-			return nil
-		}
-		for _, p := range s.pipes {
-			a := p.mp
-			if a == nil || a.retired || a.joinerLocal != local {
-				continue
-			}
-			if oldest == nil || a.progress() < oldest.mp.progress() {
-				oldest = p
-			}
-		}
-		if oldest == nil {
-			return nil
 		}
 	}
 	return oldest
 }
 
+// alive reports an attachment with a direction that has not failed or ended.
+func (a *attach) alive() bool { return a.liveOut() || a.in == InOpen || a.in == InJoining }
+
+// lacks reports whether a join that provides the directions provideIn and
+// provideOut provides one that no live attachment has. Joins the cap holds
+// back provide nothing yet: each would otherwise find its own direction.
+func (s *Session) lacks(provideIn, provideOut bool) bool {
+	in, out := false, false
+	for _, p := range s.pipes {
+		a := p.mp
+		if a == nil || a.retired || a.held {
+			continue
+		}
+		out = out || p.out != nil && a.liveOut()
+		in = in || p.in != nil && (a.in == InJoining || a.in == InOpen)
+	}
+	return provideOut && !out || provideIn && !in
+}
+
+// makeRoom displaces the roomCandidate, if any: a failed attachment is
+// retired locally, dropping its state and any PIPE_ABANDON still pending
+// for it (the peer retires it by unilateral retirement); a live one is
+// failed locally without PIPE_ABANDON and retired.
 func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 	oldest := s.roomCandidate(local, provideIn, provideOut)
 	if oldest == nil {
 		return false
 	}
 	a := oldest.mp
-	if a.liveOut() || a.in == InOpen || a.in == InJoining {
+	if a.alive() {
 		a.abandonSent = true // displaced without PIPE_ABANDON
 		s.failPipe(oldest, wire.PipeFailed, nil)
 	}
-	s.retireLocally(oldest)
+	a.abandonQueued = false
+	s.retire(oldest)
 	return true
 }
 
 // progress is the attachment's last progress: acknowledgement or record.
 func (a *attach) progress() Time { return maxT(a.lastAdvance, a.lastRecord) }
-
-// retireLocally retires a failed attachment without the PIPE_ABANDON
-// exchange; a PIPE_ABANDON still owed for it stays owed by ID.
-func (s *Session) retireLocally(p *Pipe) {
-	a := p.mp
-	if a.abandonQueued && !a.abandonSent {
-		s.mp.pendAbandon[p.id] = true
-		if s.mp.pendCode == nil {
-			s.mp.pendCode = map[uint64]uint64{}
-		}
-		s.mp.pendCode[p.id] = a.abandonCode
-	}
-	s.retire(p)
-}
 
 // JoinReady reports whether maintenance has target room and a local join
 // may start now. Failed attachments retain physical headroom until retirement.

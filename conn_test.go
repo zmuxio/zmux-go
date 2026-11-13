@@ -175,7 +175,7 @@ func TestCloseWakesReaders(t *testing.T) {
 		errc <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
-	_ = c.CloseWithError(7, "bye")
+	c.Abort(7, "bye")
 	select {
 	case err := <-errc:
 		var ae *ApplicationError
@@ -258,5 +258,27 @@ func TestPanicClosesWithInternalError(t *testing.T) {
 	if err := s.Wait(); !errors.As(err, &te) || !te.Remote || te.ErrorCode != TransportInternalError ||
 		te.ErrorMessage != "internal error: boom" {
 		t.Fatalf("peer ended with %v", err)
+	}
+}
+
+// echoOnce echoes one message over a new stream of c served by s.
+func echoOnce(t *testing.T, ctx context.Context, c, s *Conn) {
+	t.Helper()
+	go func() {
+		st, err := s.AcceptStream(ctx)
+		if err == nil {
+			_, _ = io.Copy(st, st)
+			_ = st.Close()
+		}
+	}()
+	st, err := c.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := bytes.Repeat([]byte("zmux"), 4096)
+	go func() { _, _ = st.Write(msg); _ = st.Close() }()
+	got, err := io.ReadAll(st)
+	if err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("echo: %d bytes, %v", len(got), err)
 	}
 }

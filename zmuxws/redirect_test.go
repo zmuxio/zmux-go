@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
@@ -21,14 +23,14 @@ import (
 // another host or a downgrade is refused and the other host gets nothing.
 func TestRedirect(t *testing.T) {
 	ctx := testContext(t)
-	auth := &zmux.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-	v, err := zmux.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
+	v, err := admit.NewPrefixAuthVerifier(auth)
 	if err != nil {
 		t.Fatal(err)
 	}
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
-		Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}})
-	h, err := Handler(l, &zmux.HTTPOptions{Next: next})
+		Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide}})
+	h, err := NewHandler(l, &zmuxhttp.Options{Next: next})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,13 +49,13 @@ func TestRedirect(t *testing.T) {
 	roots.AddCert(srv.Certificate())
 	o := &DialOptions{TLSConfig: &tls.Config{RootCAs: roots, ServerName: "example.com"}}
 	cfg := mpConfig()
-	cfg.Credential = auth
+	cfg.CarrierCredential = auth
 	ws := func(u string) string { return "ws" + strings.TrimPrefix(u, "http") }
 
 	for _, st := range []int{301, 302, 307, 308} {
 		rd := zmuxtest.New("http://unused.invalid", zmuxtest.RedirectToHTTPS(srv.URL, st))
 		cand := Candidate(ws(rd.URL)+"/zmux", o)
-		c, err := zmux.DialMode(ctx, zmux.ExplicitMode(cand), cfg, nil)
+		c, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(cand), cfg, nil)
 		if err != nil {
 			t.Fatalf("%d: %v", st, err)
 		}
@@ -67,7 +69,7 @@ func TestRedirect(t *testing.T) {
 			t.Fatalf("%d: target %s, want %s", st, got, want)
 		}
 		n := rd.Redirects()
-		c, err = zmux.DialMode(ctx, zmux.ExplicitMode(cand), cfg, nil)
+		c, err = zmux.DialChoice(ctx, zmux.ExplicitChoice(cand), cfg, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -96,9 +98,9 @@ func TestRedirect(t *testing.T) {
 		{ws(cross.URL), o},
 		{ws(down.URL), &DialOptions{TLSConfig: &tls.Config{RootCAs: droots, ServerName: "example.com"}}},
 	} {
-		_, err := zmux.DialMode(ctx, zmux.ExplicitMode(Candidate(c.url, c.o)), cfg, nil)
-		var me *zmux.ModeError
-		var re *zmux.HTTPRedirectError
+		_, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(Candidate(c.url, c.o)), cfg, nil)
+		var me *zmux.CarrierChoiceError
+		var re *zmuxhttp.RedirectError
 		if !errors.As(err, &me) || me.Results[0].Outcome != zmux.CandidateRefused || !errors.As(err, &re) {
 			t.Fatalf("%s: %v", c.url, err)
 		}

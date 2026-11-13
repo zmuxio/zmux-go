@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/seal/proto"
 	"github.com/zmuxio/zmux-go/shaping"
@@ -56,7 +57,7 @@ type ServerConfig struct {
 	Gate Gate
 	// Key is the node's static key; required.
 	Key *ecdh.PrivateKey
-	// ClientAnchor, when set, judges the client after message 3 (RoleClient).
+	// ClientAnchor, when set, judges the client after message 3 (zmux.RoleClient).
 	// nil: clients are not authenticated beyond the pre-shared key.
 	ClientAnchor Anchor
 	// RequirePQAuth fails a client that is not authenticated by a post-quantum
@@ -123,7 +124,7 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 			if f == proto.Message {
 				fr = zmux.FramingRecords
 			}
-			lane, need := zmux.FirstRecordIsLane(u.buf, fr)
+			lane, need := admit.FirstRecordIsLane(u.buf, fr)
 			if need > 0 {
 				if err := u.fill(); err != nil {
 					return zmux.PipeIO{}, err
@@ -156,13 +157,13 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 		if ctx.Err() != nil {
 			return zmux.PipeIO{}, ctx.Err()
 		}
-		return zmux.PipeIO{}, &zmux.RejectError{Profile: uint64(h.Profile), Mode: mode, Reason: reasonOf(err), Err: err}
+		return zmux.PipeIO{}, &zmux.RejectError{Profile: uint64(h.Profile), RecordMode: mode, Reason: reasonOf(err), Err: err}
 	}
 	if !slices.Contains(accepted, h.Profile) {
 		return reject(errProfile)
 	}
 	withPSK := h.Profile.HasPSK()
-	if mode != zmux.Sealed && c.AllowRecordMode == nil {
+	if mode != zmux.RecordSealed && c.AllowRecordMode == nil {
 		return reject(errMode)
 	}
 	src := hint.Source
@@ -174,7 +175,7 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 		}
 	}
 	var binding []byte
-	if mode == zmux.Bound {
+	if mode == zmux.RecordBound {
 		var err error
 		// A Hello in Bound is never carrier early data; a carrier without the Bound
 		// contract has no Binding to check it with, which ends as auth.
@@ -200,7 +201,7 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 		return reject(fmt.Errorf("%w: %w", errGate, err))
 	}
 	second := proto.Payload{Credential: cred, Proof: proofPlaceholder(c.Signer)}
-	known := &VerifyInput{Role: RoleClient, Profile: h.Profile, PSKIdentity: h.Handle, PeerAppData: early, LocalContext: c.LocalContext}
+	known := &VerifyInput{Role: zmux.RoleClient, Profile: h.Profile, PSKIdentity: h.Handle, PeerAppData: early, LocalContext: c.LocalContext}
 	if second.AppData, err = askAppData(ctx, c.AppData, AppDataRequest{Message: 2, Peer: known}); err != nil {
 		return reject(fmt.Errorf("%w: %w", errGate, err))
 	}
@@ -231,10 +232,10 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 		return reject(err)
 	}
 	peer := &Peer{Static: append([]byte(nil), hs.PeerStatic()...), Credential: third.Credential,
-		AppData: append(early, appData(3, third.AppData)...), Profile: h.Profile, Mode: mode,
+		AppData: append(early, appData(3, third.AppData)...), Profile: h.Profile, RecordMode: mode,
 		PQConfidential: h.Profile.PQConfidential()}
 	if c.ClientAnchor != nil {
-		in := VerifyInput{Role: RoleClient, Profile: h.Profile, PeerStatic: peer.Static, PSKIdentity: h.Handle,
+		in := VerifyInput{Role: zmux.RoleClient, Profile: h.Profile, PeerStatic: peer.Static, PSKIdentity: h.Handle,
 			Credential: third.Credential, PeerAppData: slices.Clone(peer.AppData), LocalContext: c.LocalContext}
 		v, pq, err := judge(ctx, c.ClientAnchor, in, third.Proof, c.RequirePQAuth)
 		if e := ctx.Err(); e != nil {
@@ -251,7 +252,7 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 		peer.Verdict, peer.PQAuthenticated = v, pq
 		authenticated(peer.AppData)
 	}
-	if c.AllowRecordMode != nil && !c.AllowRecordMode(carrierInfo(p, src), mode, peer) {
+	if c.AllowRecordMode != nil && !c.AllowRecordMode(carrierInfo(p), mode, peer) {
 		return reject(errMode)
 	}
 	if peer.Value, err = c.Gate.Commit(ctx, Admission{Handle: h.Handle, Source: src, Peer: peer}); err != nil {
@@ -312,9 +313,9 @@ func (c *ServerConfig) accepted() ([]proto.Profile, error) {
 	return c.AcceptedProfiles, nil
 }
 
-func carrierInfo(p zmux.PipeIO, src netip.AddrPort) zmux.CarrierInfo {
+func carrierInfo(p zmux.PipeIO) zmux.RecordPolicyInput {
 	_, exp := zmux.Exporter(p)
-	return zmux.CarrierInfo{Source: src, HasExporter: exp, Secure: zmux.IsCarrierSecure(p), Label: p.Label, IsFirstPipe: true}
+	return zmux.RecordPolicyInput{HasExporter: exp, Secure: zmux.IsCarrierSecure(p), Label: p.Label, IsFirstPipe: true}
 }
 
 // protocolError reports whether err is the peer's protocol violation, not

@@ -20,7 +20,7 @@ func TestOrphanReleasedInBubble(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
 		cfg := func() *Config {
-			return &Config{Clock: timeshim.Real, KeepAlivePeriod: -1, MaxIdleTimeout: -1}
+			return &Config{Clock: timeshim.Real, Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1}
 		}
 		a, b := net.Pipe()
 		ch := make(chan *Conn, 1)

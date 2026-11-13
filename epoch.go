@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 )
@@ -34,21 +33,27 @@ func (c *Conn) Epoch() uint64 {
 	return c.s.Epoch()
 }
 
-// ForceEpochAdvance advances the epoch as AdvanceEpoch does and then replaces
-// every carrier the session had, through Config.Redial, within deadline: a new
-// pipe joins with the new epoch and the old one is removed gracefully. It
-// serves only a suspected leak of a session-level secret; ordinary rotation is
-// AdvanceEpoch or the epoch policy. Without Config.Redial it is
-// ErrInvalidConfig.
-func (c *Conn) ForceEpochAdvance(deadline time.Duration) error {
+// ReplacePipes advances the epoch as AdvanceEpoch does, waits until new
+// joins use the new epoch, and then replaces every pipe the session had
+// when it was called: for each, it dials a carrier of the same direction
+// through Config.Redial, joins it, and closes the old pipe gracefully once
+// the new one is attached (make before break). It serves only a suspected
+// leak of a session-level secret; ordinary rotation is AdvanceEpoch or the
+// epoch policy. Without Config.Redial it is ErrInvalidConfig.
+//
+// ctx bounds the whole call: when it ends, the call fails with ctx's error,
+// the pipes already replaced stay replaced and the old pipes not yet
+// replaced are kept. A dial or join that fails ends the call with its error
+// on the same terms. While the previous epoch is still kept, the next offer
+// waits until it is deleted, so a ctx shorter than that wait fails the
+// call before any pipe is replaced.
+func (c *Conn) ReplacePipes(ctx context.Context) error {
 	if c == nil {
 		return net.ErrClosed
 	}
 	if c.cfg.Redial == nil {
-		return fmt.Errorf("%w: ForceEpochAdvance without Config.Redial", ErrInvalidConfig)
+		return fmt.Errorf("%w: ReplacePipes without Config.Redial", ErrInvalidConfig)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
-	defer cancel()
 	old := c.Pipes()
 	start := c.Epoch()
 	if err := c.AdvanceEpoch(); err != nil {
@@ -58,21 +63,21 @@ func (c *Conn) ForceEpochAdvance(deadline time.Duration) error {
 		return err
 	}
 	for _, p := range old {
-		dir := DirBidirectional
+		dir := DirectionBidirectional
 		if st, ok := p.Stats(); ok {
 			switch {
 			case st.Inbound == InboundNone:
-				dir = DirSendOnly
+				dir = DirectionSendOnly
 			case st.Outbound == OutboundNone:
-				dir = DirReceiveOnly
+				dir = DirectionReceiveOnly
 			}
 		}
 		io, err := c.cfg.Redial(ctx, dir)
 		if err != nil {
-			return fmt.Errorf("zmux: ForceEpochAdvance: redial: %w", err)
+			return fmt.Errorf("zmux: ReplacePipes: redial: %w", err)
 		}
 		if _, err := c.AddPipe(ctx, io, PipeOptions{Direction: dir}); err != nil {
-			return fmt.Errorf("zmux: ForceEpochAdvance: %w", err)
+			return fmt.Errorf("zmux: ReplacePipes: %w", err)
 		}
 		_ = p.Close() // a pipe already gone needs no replacement
 	}

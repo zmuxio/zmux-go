@@ -27,7 +27,7 @@ func TestWrapPipeTLS(t *testing.T) {
 
 	cfg := func() *zmux.Config {
 		return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true},
-			SchedulerParams: zmux.SchedulerParams{NoProbation: true}}
+			SchedulerParams: zmux.SchedulerParams{Probation: -1}}
 	}
 	l := mustNewListener(&zmux.ListenerConfig{Config: cfg(),
 		WrapPipe: zmux.WrapPipeFunc(func(ctx context.Context, p zmux.PipeIO, _ zmux.PipeHint) (zmux.PipeIO, error) {
@@ -37,7 +37,7 @@ func TestWrapPipeTLS(t *testing.T) {
 			}
 			return zmux.NetPipe(tc), nil
 		})})
-	h, err := Handler(l, nil)
+	h, err := NewHandler(l, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestWrapPipeTLS(t *testing.T) {
 	})
 	cand := Candidate("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
 	dial := cand.Dial
-	cand.Dial = func(ctx context.Context, cred zmux.Credential) (zmux.PipeIO, error) {
+	cand.Dial = func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 		p, err := dial(ctx, cred)
 		if err != nil {
 			return p, err
@@ -60,7 +60,7 @@ func TestWrapPipeTLS(t *testing.T) {
 		}
 		return zmux.NetPipe(tc), nil
 	}
-	c, err := zmux.DialMode(ctx, zmux.ExplicitMode(cand), cfg(), nil)
+	c, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(cand), cfg(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

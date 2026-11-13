@@ -35,8 +35,10 @@ func TestErrorCodeRegistry(t *testing.T) {
 	}
 }
 
-// TestSessionErrorSentinels checks that every session end matches
-// net.ErrClosed and its own sentinel, and only that one.
+// TestSessionErrorSentinels checks that every end of an established
+// session matches net.ErrClosed, a handshake timeout (no session was
+// established) does not, and each matches its own sentinel and only that
+// one.
 func TestSessionErrorSentinels(t *testing.T) {
 	cause := errors.New("carrier reset")
 	sentinels := []error{ErrIdleTimeout, ErrHandshakeTimeout, ErrEarlyDataRejected, ErrResumeTimeout, ErrPipesLost}
@@ -53,8 +55,8 @@ func TestSessionErrorSentinels(t *testing.T) {
 		{&TransportError{}, nil},
 	} {
 		err := fmt.Errorf("op: %w", c.err)
-		if !errors.Is(err, net.ErrClosed) {
-			t.Errorf("%T does not match net.ErrClosed", c.err)
+		if hs := errors.Is(c.err, ErrHandshakeTimeout); errors.Is(err, net.ErrClosed) == hs {
+			t.Errorf("%T: errors.Is(net.ErrClosed) = %v", c.err, !hs)
 		}
 		for _, s := range sentinels {
 			if got := errors.Is(err, s); got != errors.Is(c.want, s) {

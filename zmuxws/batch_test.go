@@ -111,7 +111,7 @@ func countedPair(t *testing.T) (srv, cli zmux.PipeIO, cc *countConn) {
 		_ = sc.NetConn().Close()
 	})
 	cc.reset()
-	return Pipe(sc), Pipe(c), cc
+	return ConnPipe(sc), ConnPipe(c), cc
 }
 
 // A batch of records leaves in one write, as one message each.

@@ -162,7 +162,7 @@ func ExampleTransportError() {
 func ExampleScheduler() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cfg := &zmux.Config{Scheduler: zmux.SessionAffinity()} // one active pipe per tier
+	cfg := &zmux.Config{Scheduler: zmux.SchedulerSessionAffinity()} // one active pipe per tier
 	client, server, err := sessions(ctx, cfg, nil)
 	if err != nil {
 		fmt.Println(err)
@@ -171,7 +171,7 @@ func ExampleScheduler() {
 	defer closeBoth(client, server)
 
 	// Share chunks by weight times measured rate from now on.
-	client.SetScheduler(zmux.SpreadRateWeighted())
+	client.SetScheduler(zmux.SchedulerSpreadRateWeighted())
 	fmt.Println(len(client.PipeStats()))
 	// Output: 1
 }

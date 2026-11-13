@@ -40,7 +40,7 @@ func TestGoroutineLabels(t *testing.T) {
 			served <- err
 			return
 		}
-		served <- Serve(sctx, sess, lst)
+		served <- Serve(sctx, lst, sess)
 	})
 	go func() { _ = ws.Serve(pc) }()
 	defer func() { _ = ws.Close() }()

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 )
 
 // TestCandidate dials in auto mode a candidate that does not answer, then
@@ -27,8 +28,8 @@ func TestCandidate(t *testing.T) {
 	// another kind.
 	first := Candidate(dead.LocalAddr().String(), e.cli, nil)
 	first.Kind = zmux.CarrierWebTransport
-	c, err := zmux.DialMode(ctx, zmux.AutoMode(first, Candidate(e.ln.Addr().String(), e.cli, nil)),
-		cfg, &zmux.ModePolicy{NoJoin: true})
+	c, err := zmux.DialChoice(ctx, zmux.AutoChoice(first, Candidate(e.ln.Addr().String(), e.cli, nil)),
+		cfg, &zmux.CarrierChoicePolicy{Join: zmux.SwitchOff})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,14 +54,14 @@ func TestQUICJoinModes(t *testing.T) {
 	for _, tc := range []struct {
 		mode  zmux.RecordMode
 		lanes bool
-	}{{zmux.Bound, true}, {zmux.Sealed, false}} {
+	}{{zmux.RecordBound, true}, {zmux.RecordSealed, false}} {
 		t.Run(tc.mode.String(), func(t *testing.T) {
 			scfg := mpConfig()
-			scfg.AllowRecordMode = func(_ zmux.CarrierInfo, m zmux.RecordMode, _ any) bool { return m == tc.mode }
+			scfg.AllowRecordMode = func(_ zmux.RecordPolicyInput, m zmux.RecordMode, _ any) bool { return m == tc.mode }
 			e := newEnv(t, scfg)
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			p := NewPool(e.ln.Addr().String(), e.cli, nil, nil, zmux.PoolLimits{MaxPipesPerConnection: 1})
+			p := NewPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{MaxPipesPerConnection: 1})
 			defer p.Shutdown()
 			first, err := p.OpenPipe(ctx)
 			if err != nil {
@@ -84,7 +85,7 @@ func TestQUICJoinModes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := c.AddPipe(ctx, second, zmux.PipeOptions{Mode: &tc.mode}); err != nil {
+			if _, err := c.AddPipe(ctx, second, zmux.PipeOptions{RecordMode: &tc.mode}); err != nil {
 				t.Fatal(err)
 			}
 			// The traffic goes to the joined pipe, which then wants lanes of its own.
@@ -97,7 +98,7 @@ func TestQUICJoinModes(t *testing.T) {
 			}
 			lanes := func() (n int) {
 				for _, ps := range c.PipeStats() {
-					if ps.Pipe != 0 {
+					if ps.PipeID != 0 {
 						n = max(n, ps.LanesOut)
 					}
 				}

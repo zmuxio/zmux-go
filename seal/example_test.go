@@ -62,6 +62,7 @@ func Example() {
 	defer func() { _ = conn.Close() }()
 
 	sc, _ := lst.Accept(ctx)
-	fmt.Println(sc.Admitted().(*seal.Peer).Value)
+	peer, _ := zmux.AdmittedAs[*seal.Peer](sc)
+	fmt.Println(peer.Value)
 	// Output: client 1
 }

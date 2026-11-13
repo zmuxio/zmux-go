@@ -20,6 +20,8 @@ import (
 
 	"github.com/djylb/netx/wsconn"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 func mpConfig() *zmux.Config {
@@ -40,9 +42,9 @@ var next = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
 // server serves the handler of l and o on a test server and returns its
 // ws:// URL.
-func server(t *testing.T, l *zmux.Listener, o *zmux.HTTPOptions, protocols ...string) string {
+func server(t *testing.T, l *zmux.Listener, o *zmuxhttp.Options, protocols ...string) string {
 	t.Helper()
-	h, err := Handler(l, o, protocols...)
+	h, err := NewHandler(l, o, protocols...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,14 +121,14 @@ func TestSession(t *testing.T) {
 // Config.Credential, DialPipe DialOptions.Credential for a join.
 func TestTLS(t *testing.T) {
 	ctx := testContext(t)
-	auth := &zmux.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-	v, err := zmux.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
+	v, err := admit.NewPrefixAuthVerifier(auth)
 	if err != nil {
 		t.Fatal(err)
 	}
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
-		Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}})
-	h, err := Handler(l, &zmux.HTTPOptions{Next: next})
+		Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide}})
+	h, err := NewHandler(l, &zmuxhttp.Options{Next: next})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +141,7 @@ func TestTLS(t *testing.T) {
 	roots.AddCert(srv.Certificate())
 	u := "wss" + strings.TrimPrefix(srv.URL, "https")
 	cfg := mpConfig()
-	cfg.Credential = auth
+	cfg.CarrierCredential = auth
 	for _, d := range []*net.Dialer{nil, {}} {
 		o := &DialOptions{TLSConfig: &tls.Config{RootCAs: roots, ServerName: "example.com"}}
 		if d != nil {
@@ -154,7 +156,7 @@ func TestTLS(t *testing.T) {
 			t.Fatal(err)
 		}
 		jo := *o
-		jo.Credential = auth
+		jo.CarrierCredential = auth
 		p, err := DialPipe(ctx, u, &jo)
 		if err != nil {
 			t.Fatal(err)
@@ -187,7 +189,7 @@ func TestTLS(t *testing.T) {
 func TestSubprotocols(t *testing.T) {
 	ctx := testContext(t)
 	var decided atomic.Int32
-	o := &zmux.HTTPOptions{Next: next}
+	o := &zmuxhttp.Options{Next: next}
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{
 		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
 			decided.Add(1)
@@ -241,17 +243,17 @@ func TestSubprotocols(t *testing.T) {
 // back to the next handler, which gets the request as it came.
 func TestAdmissionAcceptAndFallback(t *testing.T) {
 	ctx := testContext(t)
-	auth := &zmux.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1}
-	v, err := zmux.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1}
+	v, err := admit.NewPrefixAuthVerifier(auth)
 	if err != nil {
 		t.Fatal(err)
 	}
-	o := &zmux.HTTPOptions{Next: next}
+	o := &zmuxhttp.Options{Next: next}
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
-		Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}})
+		Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide}})
 	u := server(t, l, o)
 	name, value, err := auth.Header(&zmux.CarrierInfo{Head: true})
-	if err != nil || name != zmux.HeaderPrefixAuth {
+	if err != nil || name != admit.HeaderPrefixAuth {
 		t.Fatal(name, err)
 	}
 	h := http.Header{name: {value}}
@@ -274,7 +276,7 @@ func TestAdmissionAcceptAndFallback(t *testing.T) {
 		}
 	}
 	// One credential source per call.
-	if _, err := Dial(ctx, u+"/z", &DialOptions{Credential: auth}, mpConfig()); !errors.Is(err, zmux.ErrInvalidConfig) {
+	if _, err := Dial(ctx, u+"/z", &DialOptions{CarrierCredential: auth}, mpConfig()); !errors.Is(err, zmux.ErrInvalidConfig) {
 		t.Fatalf("Dial with DialOptions.Credential: %v", err)
 	}
 }
@@ -307,13 +309,13 @@ func rawUpgrade(t *testing.T, u string) ([]byte, time.Duration) {
 // duration, a closed one at once.
 func TestAdmissionStallAndClose(t *testing.T) {
 	for _, tc := range []struct {
-		verdict zmux.Verdict
+		verdict zmux.AdmissionVerdict
 		min     time.Duration
 	}{
 		{zmux.VerdictStall, 300 * time.Millisecond},
 		{zmux.VerdictClose, 0},
 	} {
-		o := &zmux.HTTPOptions{Next: next}
+		o := &zmuxhttp.Options{Next: next}
 		l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{
 			StallMin: 300 * time.Millisecond, StallMax: 400 * time.Millisecond,
 			Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
@@ -358,7 +360,7 @@ func pipePair(t *testing.T) (srv, cli zmux.PipeIO) {
 		_ = cc.NetConn().Close()
 		_ = sc.NetConn().Close()
 	})
-	return Pipe(sc), Pipe(cc)
+	return ConnPipe(sc), ConnPipe(cc)
 }
 
 // A message is a record as it was written; a close frame is the end, a
@@ -440,7 +442,7 @@ func checkKind(t *testing.T, k zmux.CarrierKind, cs ...*zmux.Conn) {
 		}
 		for _, p := range st {
 			if p.Carrier != k {
-				t.Fatalf("pipe %d: carrier %v, want %v", p.Pipe, p.Carrier, k)
+				t.Fatalf("pipe %d: carrier %v, want %v", p.PipeID, p.Carrier, k)
 			}
 		}
 	}
@@ -452,7 +454,7 @@ func checkKind(t *testing.T, k zmux.CarrierKind, cs ...*zmux.Conn) {
 func TestUpgradeFailureCounted(t *testing.T) {
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
-	h, err := Handler(lst, nil)
+	h, err := NewHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +476,7 @@ func TestUpgradeFailureCounted(t *testing.T) {
 // request.
 func TestNoSubprotocol(t *testing.T) {
 	ctx := testContext(t)
-	o := &zmux.HTTPOptions{Next: next}
+	o := &zmuxhttp.Options{Next: next}
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	u := server(t, l, o, "qmux-02.chat", NoSubprotocol)
 

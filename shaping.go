@@ -4,8 +4,8 @@ import "github.com/zmuxio/zmux-go/shaping"
 
 // ShapedPipe is the outbound pipe a ShaperFactory makes a Shaper for.
 type ShapedPipe struct {
-	// ID is the pipe ID.
-	ID uint64
+	// PipeID is the pipe ID.
+	PipeID PipeID
 	// Carrier is the pipe's carrier kind (PipeIO.Carrier); 0 for a carrier
 	// of no listed kind, such as raw TCP or TLS.
 	Carrier CarrierKind
@@ -30,7 +30,7 @@ func (c *Conn) coreFactory(f ShaperFactory) func(uint64, uint8, int) shaping.Sha
 		return nil
 	}
 	return func(id uint64, kind uint8, overhead int) shaping.Shaper {
-		return f(ShapedPipe{ID: id, Carrier: CarrierKind(kind), WriteOverhead: overhead, Variant: c.variantLocked(id)})
+		return f(ShapedPipe{PipeID: PipeID(id), Carrier: CarrierKind(kind), WriteOverhead: overhead, Variant: c.variantLocked(id)})
 	}
 }
 
@@ -57,10 +57,10 @@ func (c *Conn) SetShaper(f ShaperFactory, budget func() shaping.Budget) {
 
 // SetPipeShaper installs s on one outbound pipe until the next SetShaper;
 // nil: the pipe is not shaped. It reports whether the pipe exists.
-func (c *Conn) SetPipeShaper(pipe uint64, s shaping.Shaper) bool {
+func (c *Conn) SetPipeShaper(pipe PipeID, s shaping.Shaper) bool {
 	c.lock()
 	defer c.unlock()
-	return c.s.SetPipeShaper(pipe, s)
+	return c.s.SetPipeShaper(uint64(pipe), s)
 }
 
 // SetShapingLimits replaces the session's Config.ShapingLimits, tighter or

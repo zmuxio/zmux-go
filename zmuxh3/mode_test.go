@@ -11,10 +11,11 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 // TestCandidates serves WebTransport and HTTP/3 request carriers on one
-// target (zmux.HTTPEndpoint) and dials each in auto and explicit mode.
+// target (zmuxhttp.Endpoint) and dials each in auto and explicit mode.
 func TestCandidates(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: pskCfg()})
@@ -28,15 +29,15 @@ func TestCandidates(t *testing.T) {
 		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
 	webtransport.ConfigureHTTP3Server(h3)
 	wts := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
-	wh, err := Handler(wts, lst, nil)
+	wh, err := NewHandler(lst, nil, wts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sh, err := zmux.NewHTTPHandler(lst, nil)
+	sh, err := zmuxhttp.NewHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h3.Handler = &zmux.HTTPEndpoint{Stream: sh, WebTransport: wh}
+	h3.Handler = &zmuxhttp.Endpoint{Stream: sh, WebTransport: wh}
 	go func() { _ = wts.Serve(pc) }()
 	defer func() { _ = wts.Close() }()
 	url := "https://" + pc.LocalAddr().String() + "/zmux"
@@ -46,13 +47,13 @@ func TestCandidates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	for _, c := range []struct {
-		mode zmux.Mode
+		mode zmux.CarrierChoice
 		want zmux.CarrierKind
 	}{
-		{zmux.AutoMode(WebTransportCandidate(wt, url, nil), HTTP3Candidate(client, url, nil)), zmux.CarrierWebTransport},
-		{zmux.ExplicitMode(HTTP3Candidate(client, url, nil)), zmux.CarrierHTTP3},
+		{zmux.AutoChoice(Candidate(wt, url, nil), HTTP3Candidate(client, url, nil)), zmux.CarrierWebTransport},
+		{zmux.ExplicitChoice(HTTP3Candidate(client, url, nil)), zmux.CarrierHTTP3},
 	} {
-		conn, err := zmux.DialMode(ctx, c.mode, pskCfg(), &zmux.ModePolicy{NoJoin: true})
+		conn, err := zmux.DialChoice(ctx, c.mode, pskCfg(), &zmux.CarrierChoicePolicy{Join: zmux.SwitchOff})
 		if err != nil {
 			t.Fatal(err)
 		}

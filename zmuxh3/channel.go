@@ -13,7 +13,9 @@ import (
 	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 	"github.com/zmuxio/zmux-go/internal/labels"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 // Datagram channels: the HTTP Datagrams (RFC 9297) of
@@ -128,18 +130,18 @@ func (c *h3Channel) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 	return cancel
 }
 
-// HTTP3Handler wraps h, typically the handler of zmux.NewHTTPHandler, for
+// HTTP3Handler wraps h, typically the handler of zmuxhttp.NewHandler, for
 // an HTTP/3 server with HTTP Datagrams enabled (http3.Server's
-// EnableDatagrams, as NewHTTP3Server sets): a bidirectional carrier's
+// EnableDatagrams, as NewServer sets): a bidirectional carrier's
 // request stream offers its HTTP Datagrams as the pipe's datagram channel
-// (zmux.HTTPDatagramChannel). Other requests pass unchanged. o (nil:
-// defaults) are the HTTPOptions of the zmux handler inside h, whose pairing
+// (zmuxhttp.DatagramChannel). Other requests pass unchanged. o (nil:
+// defaults) are the zmuxhttp.Options of the zmux handler inside h, whose pairing
 // field decides which requests are bidirectional carriers.
-func HTTP3Handler(h http.Handler, o *zmux.HTTPOptions) http.Handler {
+func HTTP3Handler(h http.Handler, o *zmuxhttp.Options) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hs, ok := w.(http3.HTTPStreamer)
 		st, sok := w.(http3.Settingser)
-		if !ok || !sok || o.Classify(r) != zmux.HTTPClassBidirectional {
+		if !ok || !sok || o.Classify(r) != zmuxhttp.ClassBidirectional {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -181,7 +183,7 @@ func (w *h3ChanWriter) DatagramChannel() zmux.DatagramChannel {
 // wtChannel is the datagram channel of one WebTransport session.
 type wtChannel struct {
 	sess     *webtransport.Session
-	demux    zmux.ChannelDemux
+	demux    carrier.ChannelDemux
 	recvOnce sync.Once
 	size     dgramSize
 }
@@ -246,9 +248,9 @@ func (w *wtStream) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 	return wtChannelOf(w.sess).register(uint64(w.s.StreamID()), deliver)
 }
 
-// WebTransportChannelDropped returns the datagrams received on sess that
+// ChannelDropped returns the datagrams received on sess that
 // named no pipe attached to a session.
-func WebTransportChannelDropped(sess *webtransport.Session) uint64 {
+func ChannelDropped(sess *webtransport.Session) uint64 {
 	if c, ok := wtChannels.Load(sess); ok {
 		return c.(*wtChannel).demux.Dropped()
 	}

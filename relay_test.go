@@ -23,6 +23,7 @@ import (
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/shaping/machine"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
@@ -33,7 +34,7 @@ import (
 func relayConfig(resume time.Duration) *zmux.Config {
 	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true},
 		ResumeTimeout:   resume,
-		SchedulerParams: zmux.SchedulerParams{NoProbation: true}}
+		SchedulerParams: zmux.SchedulerParams{Probation: -1}}
 }
 
 // relayEnv is a listener of a server, a relay in front of it and a
@@ -211,8 +212,8 @@ func poll(t *testing.T, d time.Duration, what string, cond func() bool) {
 func activePool(c *zmux.Conn) []uint64 {
 	var ids []uint64
 	for _, st := range c.PipeStats() {
-		if st.Pipe != 0 && st.Outbound == zmux.OutboundActive {
-			ids = append(ids, st.Pipe)
+		if st.PipeID != 0 && st.Outbound == zmux.OutboundActive {
+			ids = append(ids, uint64(st.PipeID))
 		}
 	}
 	return ids
@@ -225,8 +226,8 @@ func activePool(c *zmux.Conn) []uint64 {
 func attachedPool(c *zmux.Conn) []uint64 {
 	var ids []uint64
 	for _, st := range c.PipeStats() {
-		if st.Pipe != 0 && st.Outbound == zmux.OutboundActive && st.PeerAttached {
-			ids = append(ids, st.Pipe)
+		if st.PipeID != 0 && st.Outbound == zmux.OutboundActive && st.PeerAttached {
+			ids = append(ids, uint64(st.PipeID))
 		}
 	}
 	return ids
@@ -243,7 +244,7 @@ func TestRelayIdleLimit(t *testing.T) {
 			e := newMemRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{IdleCut: 2500 * time.Millisecond}, false)
 			d := e.relayDialer()
 			maintain(t, e.client, zmux.PipePool{Dial: d.dial,
-				Options: zmux.PipeOptions{ProbeInterval: time.Second, ProbeJitter: 0.3}})
+				Options: zmux.PipeOptions{Liveness: zmux.PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.3}}})
 			poll(t, 5*time.Second, "pool pipe", func() bool { return len(activePool(e.client)) == 1 })
 			id := activePool(e.client)[0]
 			synctest.Sleep(7 * time.Second)
@@ -266,10 +267,10 @@ func TestRelayIdleLimit(t *testing.T) {
 			// (j = 0) puts pipe 0's probes and keep-alives at 15 s, so the
 			// pool pipe is silent after its join until its own probe at 4 s.
 			ccfg, scfg := relayConfig(0), relayConfig(0)
-			ccfg.SchedulerParams.NoProbeJitter, scfg.SchedulerParams.NoProbeJitter = true, true
+			ccfg.Liveness.ProbeJitter, scfg.Liveness.ProbeJitter = -1, -1
 			e := newMemRelayEnv(t, ccfg, scfg, zmuxtest.RelayOptions{IdleCut: 2500 * time.Millisecond}, false)
 			d := e.relayDialer()
-			maintain(t, e.client, zmux.PipePool{Dial: d.dial, Options: zmux.PipeOptions{ProbeInterval: 4 * time.Second}})
+			maintain(t, e.client, zmux.PipePool{Dial: d.dial, Options: zmux.PipeOptions{Liveness: zmux.PipeLiveness{ProbeInterval: 4 * time.Second}}})
 			poll(t, 5*time.Second, "pool pipe", func() bool { return len(activePool(e.client)) == 1 })
 			// The cut falls due IdleCut (2.5 s) after the join's last byte,
 			// plus the relay's 10 ms check, well before the probe at 4 s; the
@@ -298,10 +299,10 @@ func TestRelayBlackHole(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newMemRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, false)
 		d := e.relayDialer()
-		maintain(t, e.client, zmux.PipePool{Dial: d.dial, Options: zmux.PipeOptions{ProbeInterval: time.Second}})
+		maintain(t, e.client, zmux.PipePool{Dial: d.dial, Options: zmux.PipeOptions{Liveness: zmux.PipeLiveness{ProbeInterval: time.Second}}})
 		poll(t, 5*time.Second, "pool pipe", func() bool { return len(activePool(e.client)) == 1 })
 		id := activePool(e.client)[0]
-		p, _ := e.client.Pipe(id)
+		p, _ := e.client.Pipe(zmux.PipeID(id))
 		// The probe goes at most k after the pipe's last ack-eliciting byte
 		// and the pipe fails T_fail_p = max(2 s, 8 x PTO_p) after t_ref
 		// (another pipe is active; queue_p is 0 on an idle pipe).
@@ -316,7 +317,7 @@ func TestRelayBlackHole(t *testing.T) {
 		// can lift T_fail_p above 2 s. The margin of 1 s covers the lateness
 		// of the timers and of this poll on a loaded host.
 		tFail := func(c *zmux.Conn) time.Duration {
-			q, ok := c.Pipe(id)
+			q, ok := c.Pipe(zmux.PipeID(id))
 			if !ok {
 				t.Fatalf("pipe %d gone", id)
 			}
@@ -396,7 +397,7 @@ func (ev *events) writeTo(t *testing.T, name string) {
 	defer ev.mu.Unlock()
 	var b []byte
 	for i, e := range ev.got {
-		b = fmt.Appendf(b, "%s %v pipe %d %+v\n", ev.at[i].Format(time.RFC3339Nano), e.Kind, e.Pipe, e)
+		b = fmt.Appendf(b, "%s %v pipe %d %+v\n", ev.at[i].Format(time.RFC3339Nano), e.Kind, e.PipeID, e)
 	}
 	if err := os.WriteFile(name, b, 0o644); err != nil {
 		t.Log(err)
@@ -548,7 +549,7 @@ type httpRelayEnv struct {
 func newHTTPRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, split bool) *httpRelayEnv {
 	t.Helper()
 	lst := mustNewListener(&zmux.ListenerConfig{Config: scfg, InstanceID: []byte("instance")})
-	hh, err := zmux.NewHTTPHandler(lst, nil)
+	hh, err := zmuxhttp.NewHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -576,9 +577,9 @@ func newHTTPRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, split bool) *httpRel
 	defer cancel()
 	var p zmux.PipeIO
 	if split {
-		p, err = zmux.HTTPSplitPipe(life, e.hc, e.url, nil, nil)
+		p, err = zmuxhttp.SplitPipe(life, e.hc, e.url, nil, nil)
 	} else {
-		p, err = zmux.HTTPPipe(life, e.hc, e.url, nil, zmux.DirBidirectional, nil)
+		p, err = zmuxhttp.StreamPipe(life, e.hc, e.url, nil, zmux.DirectionBidirectional, nil)
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -617,7 +618,7 @@ func TestRelaySplitDownlinkSilenced(t *testing.T) {
 		t.Parallel()
 		cfg := func() *zmux.Config {
 			c := relayConfig(30 * time.Second)
-			c.SchedulerParams.ProbeInterval = time.Second
+			c.Liveness.ProbeInterval = time.Second
 			return c
 		}
 		e := newHTTPRelayEnv(t, cfg(), cfg(), true)
@@ -626,7 +627,7 @@ func TestRelaySplitDownlinkSilenced(t *testing.T) {
 		maintain(t, e.client, zmux.PipePool{MinBackoff: 100 * time.Millisecond,
 			Join: func(ctx context.Context, c *zmux.Conn, o zmux.PipeOptions) ([]*zmux.Pipe, error) {
 				joins.Add(1)
-				p, err := zmux.HTTPSplitJoin(ctx, c, e.hc, e.url, nil, nil, o)
+				p, err := zmuxhttp.SplitJoin(ctx, c, e.hc, e.url, nil, nil, o)
 				if err != nil {
 					return nil, err
 				}
@@ -634,8 +635,8 @@ func TestRelaySplitDownlinkSilenced(t *testing.T) {
 			}})
 		member := func() (up, down bool) {
 			for _, st := range e.client.PipeStats() {
-				up = up || st.Pipe != 0 && st.Outbound == zmux.OutboundActive
-				down = down || st.Pipe != 0 && st.Inbound == zmux.InboundOpen
+				up = up || st.PipeID != 0 && st.Outbound == zmux.OutboundActive
+				down = down || st.PipeID != 0 && st.Inbound == zmux.InboundOpen
 			}
 			return
 		}
@@ -660,7 +661,7 @@ func TestRelaySplitDownlinkSilenced(t *testing.T) {
 		e := newHTTPRelayEnv(t, relayConfig(0), relayConfig(0), true)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		p, err := zmux.HTTPSplitPipe(ctx, e.hc, e.url, nil, nil)
+		p, err := zmuxhttp.SplitPipe(ctx, e.hc, e.url, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -675,7 +676,7 @@ func TestRelaySplitDownlinkSilenced(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		// The downlink takes the second path, so that only it goes silent.
-		p, err := zmux.HTTPSplitJoin(ctx, e.client, e.hc2, e.url, nil, nil, zmux.PipeOptions{Direction: zmux.DirReceiveOnly})
+		p, err := zmuxhttp.SplitJoin(ctx, e.client, e.hc2, e.url, nil, nil, zmux.PipeOptions{Direction: zmux.DirectionReceiveOnly})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -770,12 +771,12 @@ func TestRelayAgeLimitRotation(t *testing.T) {
 		for _, x := range ev.got {
 			switch x.Kind {
 			case zmux.EventPipeFailed, zmux.EventPipeSuspect:
-				t.Errorf("event %v on pipe %d", x.Kind, x.Pipe)
+				t.Errorf("event %v on pipe %d", x.Kind, x.PipeID)
 			case zmux.EventPipeJoined:
-				joined[x.Pipe] = true
+				joined[uint64(x.PipeID)] = true
 			case zmux.EventPipeClosed:
-				if x.Pipe != 0 && !joined[x.Pipe+2] {
-					t.Errorf("pipe %d closed before its replacement joined", x.Pipe)
+				if x.PipeID != 0 && !joined[uint64(x.PipeID)+2] {
+					t.Errorf("pipe %d closed before its replacement joined", x.PipeID)
 				}
 			default:
 				// The other kinds are not checked here.
@@ -833,7 +834,7 @@ func TestRotationWaitsForAcceptor(t *testing.T) {
 			defer ev.mu.Unlock()
 			n := 0
 			for _, x := range ev.got {
-				if x.Kind == zmux.EventPipeClosed && x.Pipe != 0 {
+				if x.Kind == zmux.EventPipeClosed && x.PipeID != 0 {
 					n++
 				}
 			}
@@ -854,8 +855,8 @@ func TestRelayDeadTimeoutAtSuspicion(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := func() *zmux.Config {
 			c := relayConfig(0)
-			c.SchedulerParams.ProbeInterval = time.Second
-			c.SchedulerParams.DeadTimeout = time.Second
+			c.Liveness.ProbeInterval = time.Second
+			c.Liveness.DeadTimeout = time.Second
 			return c
 		}
 		e := newMemRelayEnv(t, cfg(), relayConfig(0), zmuxtest.RelayOptions{}, true)
@@ -883,16 +884,16 @@ func TestRelayDeadTimeoutAtSuspicion(t *testing.T) {
 // the requests outlive it, and the pipe stays without redials.
 func TestPoolHTTPPipeOutlivesDialContext(t *testing.T) {
 	t.Parallel()
-	for _, dir := range []zmux.Direction{zmux.DirBidirectional, zmux.DirSendOnly} {
+	for _, dir := range []zmux.Direction{zmux.DirectionBidirectional, zmux.DirectionSendOnly} {
 		e := newHTTPRelayEnv(t, relayConfig(0), relayConfig(0), false)
 		var dials atomic.Int64
 		maintain(t, e.client, zmux.PipePool{Options: zmux.PipeOptions{Direction: dir},
 			Dial: func(ctx context.Context) (zmux.PipeIO, error) {
 				dials.Add(1)
-				if dir == zmux.DirSendOnly {
-					return zmux.HTTPSplitPipe(ctx, e.hc, e.url, nil, nil)
+				if dir == zmux.DirectionSendOnly {
+					return zmuxhttp.SplitPipe(ctx, e.hc, e.url, nil, nil)
 				}
-				return zmux.HTTPPipe(ctx, e.hc, e.url, nil, dir, nil)
+				return zmuxhttp.StreamPipe(ctx, e.hc, e.url, nil, dir, nil)
 			}})
 		poll(t, 5*time.Second, "pool pipe", func() bool { return len(activePool(e.client)) == 1 })
 		id := activePool(e.client)[0]
@@ -914,7 +915,7 @@ func TestRelaySplitDownlinkSilencedClose(t *testing.T) {
 			t.Parallel()
 			cfg := func() *zmux.Config {
 				c := relayConfig(30 * time.Second)
-				c.SchedulerParams.ProbeInterval = time.Second
+				c.Liveness.ProbeInterval = time.Second
 				return c
 			}
 			e := newHTTPRelayEnv(t, cfg(), cfg(), true)
@@ -937,7 +938,7 @@ func TestRelaySplitDownlinkSilencedClose(t *testing.T) {
 			maintain(t, e.client, zmux.PipePool{MinBackoff: 100 * time.Millisecond,
 				Join: func(ctx context.Context, c *zmux.Conn, o zmux.PipeOptions) ([]*zmux.Pipe, error) {
 					joins.Add(1)
-					p, err := zmux.HTTPSplitJoin(ctx, c, e.hc, e.url, nil, nil, o)
+					p, err := zmuxhttp.SplitJoin(ctx, c, e.hc, e.url, nil, nil, o)
 					if err != nil {
 						return nil, err
 					}
@@ -949,7 +950,7 @@ func TestRelaySplitDownlinkSilencedClose(t *testing.T) {
 			// bounds its PTO, and with it the failure time below.
 			poll(t, 30*time.Second, "pool member", func() bool {
 				for _, st := range e.client.PipeStats() {
-					if st.Pipe != 0 && st.Outbound == zmux.OutboundActive && st.Inbound == zmux.InboundOpen && st.BytesAcked > 0 {
+					if st.PipeID != 0 && st.Outbound == zmux.OutboundActive && st.Inbound == zmux.InboundOpen && st.BytesAcked > 0 {
 						return true
 					}
 				}
@@ -957,11 +958,11 @@ func TestRelaySplitDownlinkSilencedClose(t *testing.T) {
 			})
 			var upID uint64
 			for _, st := range e.client.PipeStats() {
-				if st.Pipe != 0 && st.Outbound == zmux.OutboundActive && st.PeerAttached {
-					upID = st.Pipe
+				if st.PipeID != 0 && st.Outbound == zmux.OutboundActive && st.PeerAttached {
+					upID = uint64(st.PipeID)
 				}
 			}
-			up, _ := e.client.Pipe(upID)
+			up, _ := e.client.Pipe(zmux.PipeID(upID))
 			e.relay.Blackhole(false, true)
 			// Its uplink works but is never acknowledged: T_fail of pipe 0
 			// and then T_dead = T_fail (resume) of the uplink, 2 s each at

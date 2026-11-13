@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 	"github.com/zmuxio/zmux-go/zmuxtest"
 )
@@ -40,8 +41,8 @@ func TestCheckHTTPRedirect(t *testing.T) {
 		{"http://A.example/z", "GET", 302, "https://a.EXAMPLE/z#f", "https://a.EXAMPLE/z"},
 	} {
 		from, _ := url.Parse(c.from)
-		got, err := CheckHTTPRedirect(from, c.method, c.status, c.loc)
-		var re *HTTPRedirectError
+		got, err := CheckRedirect(from, c.method, c.status, c.loc)
+		var re *RedirectError
 		switch {
 		case c.want == "" && !errors.As(err, &re):
 			t.Errorf("%s %s %d %q: %v, %v; want refused", c.method, c.from, c.status, c.loc, got, err)
@@ -70,7 +71,7 @@ func (e *redirectEnv) close() {
 	e.modeEnv.close()
 }
 
-func (e *redirectEnv) candidate(k CarrierKind, url string) Candidate {
+func (e *redirectEnv) candidate(k zmux.CarrierKind, url string) zmux.Candidate {
 	for _, c := range e.candidates(url) {
 		if c.Kind == k {
 			return c
@@ -88,14 +89,14 @@ func TestHTTPRedirectUpgrade(t *testing.T) {
 	e := newRedirectEnv(t)
 	defer e.close()
 	for _, st := range []int{301, 302, 303, 307, 308} {
-		for _, k := range []CarrierKind{CarrierStreaming, CarrierSplit, CarrierExchange} {
+		for _, k := range []zmux.CarrierKind{zmux.CarrierStream, zmux.CarrierSplit, zmux.CarrierExchange} {
 			t.Run(http.StatusText(st)+"/"+k.String(), func(t *testing.T) {
 				rd := zmuxtest.New("http://unused.invalid", zmuxtest.RedirectToHTTPS(e.front.URL, st))
 				defer rd.Close()
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
 				cand := e.candidate(k, rd.URL+"/zmux")
-				conn, err := DialMode(ctx, ExplicitMode(cand), modeCfg(), nil)
+				conn, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(cand), modeCfg(), nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -111,7 +112,7 @@ func TestHTTPRedirectUpgrade(t *testing.T) {
 				}
 				// The next carrier of the candidate goes to https at once.
 				n := rd.Redirects()
-				conn, err = DialMode(ctx, ExplicitMode(cand), modeCfg(), nil)
+				conn, err = zmux.DialChoice(ctx, zmux.ExplicitChoice(cand), modeCfg(), nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -149,21 +150,21 @@ func TestHTTPRedirectRefused(t *testing.T) {
 	defer cross.Close()
 	for _, c := range []struct {
 		name, url string
-		kinds     []CarrierKind
+		kinds     []zmux.CarrierKind
 	}{
-		{"cross-host", cross.URL, []CarrierKind{CarrierStreaming, CarrierSplit, CarrierExchange}},
-		{"downgrade", downgrade.URL, []CarrierKind{CarrierStreaming, CarrierSplit, CarrierExchange}},
+		{"cross-host", cross.URL, []zmux.CarrierKind{zmux.CarrierStream, zmux.CarrierSplit, zmux.CarrierExchange}},
+		{"downgrade", downgrade.URL, []zmux.CarrierKind{zmux.CarrierStream, zmux.CarrierSplit, zmux.CarrierExchange}},
 		// A split bootstrap's GET follows the 301; its POST does not.
-		{"301 POST moved", moved.URL, []CarrierKind{CarrierStreaming, CarrierSplit, CarrierExchange}},
+		{"301 POST moved", moved.URL, []zmux.CarrierKind{zmux.CarrierStream, zmux.CarrierSplit, zmux.CarrierExchange}},
 	} {
 		for _, k := range c.kinds {
 			t.Run(c.name+"/"+k.String(), func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				_, err := DialMode(ctx, ExplicitMode(e.candidate(k, c.url)), modeCfg(), nil)
-				var me *ModeError
-				var re *HTTPRedirectError
-				if !errors.As(err, &me) || me.Results[0].Outcome != CandidateRefused || !errors.As(err, &re) {
+				_, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(e.candidate(k, c.url)), modeCfg(), nil)
+				var me *zmux.CarrierChoiceError
+				var re *RedirectError
+				if !errors.As(err, &me) || me.Results[0].Outcome != zmux.CandidateRefused || !errors.As(err, &re) {
 					t.Fatalf("got %v", err)
 				}
 			})
@@ -176,8 +177,8 @@ func TestHTTPRedirectRefused(t *testing.T) {
 	defer moved307.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cand := e.candidate(CarrierStreaming, moved307.URL+"/zmux")
-	conn, err := DialMode(ctx, ExplicitMode(cand), modeCfg(), nil)
+	cand := e.candidate(zmux.CarrierStream, moved307.URL+"/zmux")
+	conn, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(cand), modeCfg(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +219,7 @@ func TestHTTPRedirectReplay(t *testing.T) {
 	defer partial.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, err := DialMode(ctx, ExplicitMode(e.candidate(CarrierStreaming, partial.URL+"/zmux")), modeCfg(), nil)
+	conn, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(e.candidate(zmux.CarrierStream, partial.URL+"/zmux")), modeCfg(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,9 +228,9 @@ func TestHTTPRedirectReplay(t *testing.T) {
 	closeConn(t, conn)
 	_ = s.Close()
 
-	_, err = DialMode(ctx, ExplicitMode(e.candidate(CarrierStreaming, partial.URL+"/loop")), modeCfg(), nil)
-	var re *HTTPRedirectError
-	if !errors.As(err, &re) || hits.Load() != DefaultHTTPRedirects+1 {
+	_, err = zmux.DialChoice(ctx, zmux.ExplicitChoice(e.candidate(zmux.CarrierStream, partial.URL+"/loop")), modeCfg(), nil)
+	var re *RedirectError
+	if !errors.As(err, &re) || hits.Load() != DefaultRedirects+1 {
 		t.Fatalf("loop: %v after %d requests", err, hits.Load())
 	}
 }
@@ -244,16 +245,16 @@ func TestDialModeRedirectCache(t *testing.T) {
 	rd := zmuxtest.New("http://unused.invalid", zmuxtest.RedirectToHTTPS(e.front.URL, 308))
 	defer rd.Close()
 	pol := fastPolicy(true)
-	pol.Cache, pol.Key = &CarrierCache{}, "redirect"
+	pol.Cache, pol.Key = &zmux.CarrierCache{}, "redirect"
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	dial := func() {
 		t.Helper()
-		conn, err := DialMode(ctx, AutoMode(e.candidates(rd.URL)...), modeCfg(), pol)
+		conn, err := zmux.DialChoice(ctx, zmux.AutoChoice(e.candidates(rd.URL)...), modeCfg(), pol)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if k := conn.ConnectionStats().Carrier; k != CarrierStreaming {
+		if k := conn.ConnectionStats().Carrier; k != zmux.CarrierStream {
 			t.Fatalf("chose %v", k)
 		}
 		s := <-e.sessions
@@ -286,7 +287,7 @@ func TestHTTPRedirectPastReplayBound(t *testing.T) {
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := HTTPPipe(ctx, srv.Client(), srv.URL, nil, DirSendOnly, nil)
+	p, err := StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionSendOnly, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +296,7 @@ func TestHTTPRedirectPastReplayBound(t *testing.T) {
 	for err == nil {
 		_, err = p.W.Write(buf)
 	}
-	if _, ok := errors.AsType[*HTTPRedirectError](err); !ok {
+	if _, ok := errors.AsType[*RedirectError](err); !ok {
 		t.Fatalf("got %v", err)
 	}
 }

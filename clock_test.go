@@ -61,7 +61,7 @@ func TestFakeClockIdleTimeout(t *testing.T) {
 	t.Parallel()
 	clk, cc, sc := fakeConfigs(func(c *Config) {
 		c.MaxIdleTimeout = time.Hour
-		c.KeepAlivePeriod = -1
+		c.Liveness.KeepAlivePeriod = -1
 	})
 	e := newMPEnv(t, cc, sc)
 	start := time.Now()
@@ -82,8 +82,8 @@ func TestFakeClockKeepAliveAndProbes(t *testing.T) {
 	t.Parallel()
 	clk, cc, sc := fakeConfigs(func(c *Config) {
 		c.MaxIdleTimeout = time.Minute
-		c.KeepAlivePeriod = 10 * time.Second
-		c.SchedulerParams.ProbeInterval = 5 * time.Second
+		c.Liveness.KeepAlivePeriod = 10 * time.Second
+		c.Liveness.ProbeInterval = 5 * time.Second
 	})
 	e := newMPEnv(t, cc, sc)
 	pings := func() (n uint64) {
@@ -109,7 +109,7 @@ func TestFakeClockResumeGrace(t *testing.T) {
 	t.Parallel()
 	clk, cc, sc := fakeConfigs(func(c *Config) {
 		c.MaxIdleTimeout = -1
-		c.KeepAlivePeriod = -1
+		c.Liveness.KeepAlivePeriod = -1
 		c.ResumeTimeout = 10 * time.Minute
 	})
 	e := newMPEnv(t, cc, sc)

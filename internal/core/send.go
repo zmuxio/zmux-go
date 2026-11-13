@@ -630,3 +630,34 @@ func (s *Session) WriteBatch(st *Stream, b *Batch, skip int) (int, error) {
 	}
 	return taken, nil
 }
+
+// Flushable reports whether a stream holds written data or a FIN that it
+// may still send now, within its own and the session's credit, on a
+// session that has a live outbound pipe: what a graceful close sends
+// before CONNECTION_CLOSE. Data that waits for credit or for a pipe does
+// not count.
+func (s *Session) Flushable() bool {
+	if s.isClosing() {
+		return false
+	}
+	if out, _ := s.LiveDirections(); !out {
+		return false
+	}
+	for _, st := range s.streams {
+		sp := &st.snd
+		if sp.state >= sendDataSent || sp.reset {
+			continue
+		}
+		unsent := st.unsent()
+		if unsent == 0 {
+			if sp.finWr && !sp.finSent {
+				return true
+			}
+			continue
+		}
+		if max64(sp.sent, sp.q.base) < sp.maxData && s.conn.sent < s.conn.sendMax {
+			return true
+		}
+	}
+	return false
+}

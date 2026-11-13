@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import "testing"
 

@@ -151,7 +151,7 @@ func BenchmarkMultipathSpread(b *testing.B) {
 	for _, sched := range []struct {
 		name string
 		s    Scheduler
-	}{{"round-robin", SpreadRoundRobin()}, {"eta", SpreadETA()}} {
+	}{{"round-robin", SchedulerSpreadRoundRobin()}, {"eta", SchedulerSpreadETA()}} {
 		b.Run(sched.name, func(b *testing.B) {
 			cfg := &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true}}
 			ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -216,7 +216,7 @@ func BenchmarkMultipathSpread(b *testing.B) {
 				total += float64(p.BytesSent)
 			}
 			for _, p := range ps {
-				b.ReportMetric(float64(p.BytesSent)/total*100, fmt.Sprintf("pipe%d-%%", p.Pipe))
+				b.ReportMetric(float64(p.BytesSent)/total*100, fmt.Sprintf("pipe%d-%%", p.PipeID))
 			}
 		})
 	}

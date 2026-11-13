@@ -17,6 +17,7 @@ import (
 
 	"github.com/flynn/noise"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
@@ -106,9 +107,26 @@ type parties struct {
 	// profiles with a KEM.
 	InitiatorKEMSeed   hexb `json:"initiator_kem_seed,omitempty"`
 	ResponderKEMRandom hexb `json:"responder_encaps_m,omitempty"`
-	// MaxAppData is the receivers' local bound on application data; absent:
-	// the default of 256 bytes.
-	MaxAppData int `json:"max_app_data,omitempty"`
+	// MaxAppData is the receivers' local bound on application data: a
+	// positive bound, 0 the default of 256 bytes, negative no bound beyond
+	// the message; absent (nil): 0. A pointer, so that an explicit 0 is
+	// written.
+	MaxAppData *int `json:"max_app_data,omitempty"`
+}
+
+// maxAppData is the bound the vector gives its receivers.
+func (v *parties) maxAppData() int {
+	if v.MaxAppData == nil {
+		return 0
+	}
+	return *v.MaxAppData
+}
+
+// withMaxAppData returns v with the receivers' bound set to n, written
+// even when 0.
+func withMaxAppData(v parties, n int) parties {
+	v.MaxAppData = &n
+	return v
 }
 
 func defaults(p Profile, m Mode) parties {
@@ -140,7 +158,7 @@ func defaults(p Profile, m Mode) parties {
 }
 
 func (v parties) config(t testing.TB, static []byte) Config {
-	c := Config{Profile: Profile(v.Profile), Mode: Mode(v.Mode), Handle: v.Handle, PSK: v.PSK, Binding: v.Binding, MaxAppData: v.MaxAppData}
+	c := Config{Profile: Profile(v.Profile), Mode: Mode(v.Mode), Handle: v.Handle, PSK: v.PSK, Binding: v.Binding, MaxAppData: v.maxAppData()}
 	if len(static) > 0 {
 		c.Static = x25519(t, static)
 	}
@@ -335,11 +353,14 @@ func genHandshakes(t testing.TB) []handshakeVector {
 			testPayload(Payload{AppData: []byte("client message 3")})}),
 		genHandshake(t, "profile3-sealed-app-data-msg1", defaults(ProfileEstablishPSKAES, Sealed), [][]byte{
 			testPayload(Payload{AppData: bytes.Repeat([]byte{0xa5}, DefaultMaxAppData)})}),
+		genHandshake(t, "profile3-sealed-app-data-msg1-bound-zero", withMaxAppData(defaults(ProfileEstablishPSKAES, Sealed), 0), [][]byte{
+			testPayload(Payload{AppData: bytes.Repeat([]byte{0xa5}, DefaultMaxAppData)})}),
 		genHandshake(t, "profile4-sealed-app-data", defaults(ProfileEstablish, Sealed), [][]byte{nil,
 			testPayload(Payload{AppData: []byte("server message 2")}),
 			testPayload(Payload{Credential: &Credential{Type: 7, Data: []byte("c")}, AppData: []byte("client message 3")})}),
 		genHandshake(t, "profile1-sealed-app-data-empty", defaults(ProfileEstablishPSK, Sealed), [][]byte{nil, item(2, 0), nil}),
-		fullAppData(t),
+		fullAppData(t, false),
+		fullAppData(t, true),
 		genHandshake(t, "profile4-trusted-client-first-bytes", defaults(ProfileEstablish, Trusted), [][]byte{nil, nil, testPayload(Payload{FirstBytes: []byte("client first record")})}),
 		genHandshake(t, "profile3-sealed-credentials", defaults(ProfileEstablishPSKAES, Sealed),
 			[][]byte{testPayload(Payload{Padding: 32}), cred, nil}),
@@ -351,13 +372,16 @@ func genHandshakes(t testing.TB) []handshakeVector {
 }
 
 // fullAppData is a message 3 whose application data fills the message, with
-// the receivers' bound raised to that length.
-func fullAppData(t testing.TB) handshakeVector {
-	v := defaults(ProfileEstablishPSK, Sealed)
+// the receivers' bound raised to that length, or with no bound when
+// unbounded.
+func fullAppData(t testing.TB, unbounded bool) handshakeVector {
 	n := maxMessage - 64 // message 3 with an empty payload is 64 bytes
 	n -= 1 + varint.SizeVarint(uint64(n))
-	v.MaxAppData = n
-	out := genHandshake(t, "profile1-sealed-app-data-fills-msg3", v, [][]byte{nil, nil, testPayload(Payload{AppData: bytes.Repeat([]byte{0x5a}, n)})})
+	v, name := withMaxAppData(defaults(ProfileEstablishPSK, Sealed), n), "profile1-sealed-app-data-fills-msg3"
+	if unbounded {
+		v, name = withMaxAppData(v, -1), name+"-unbounded"
+	}
+	out := genHandshake(t, name, v, [][]byte{nil, nil, testPayload(Payload{AppData: bytes.Repeat([]byte{0x5a}, n)})})
 	if len(out.Messages[2].Noise) != maxMessage {
 		t.Fatalf("message 3 of %d bytes", len(out.Messages[2].Noise))
 	}
@@ -751,6 +775,7 @@ func genNegatives(t testing.TB) []negativeVector {
 	// Application data: the local bound, one item per message.
 	over := make([]byte, DefaultMaxAppData+1)
 	add("app-data-over-the-bound-msg1", p1, "responder", "too_large", hello(crafted{v: p1, raw: [][]byte{item(2, len(over), over...)}}.run(t)[0]))
+	add("app-data-over-the-bound-msg1-bound-zero", withMaxAppData(p1, 0), "responder", "too_large", hello(crafted{v: p1, raw: [][]byte{item(2, len(over), over...)}}.run(t)[0]))
 	add("app-data-over-the-bound-msg2", p4, "initiator", "too_large", write, read(crafted{v: p4, raw: [][]byte{nil, item(2, len(over), over...)}}.run(t)[1]))
 	am3 := crafted{v: p1, raw: [][]byte{nil, nil, item(2, len(over), over...)}}.run(t)
 	add("app-data-over-the-bound-msg3", p1, "responder", "too_large", hello(am3[0]), write, read(am3[2]))
@@ -1133,12 +1158,12 @@ func dispatchClass(b []byte, f Framing) (string, int) {
 	if f == Message {
 		zf = zmux.FramingRecords
 	}
-	switch c, need := zmux.ClassifyFirstBytes(b, zf); c {
-	case zmux.FirstBytesRecord:
+	switch c, need := admit.ClassifyFirstBytes(b, zf); c {
+	case admit.FirstBytesRecord:
 		return "record", 0
-	case zmux.FirstBytesNeedMore:
+	case admit.FirstBytesNeedMore:
 		return "incomplete", need
-	case zmux.FirstBytesOther:
+	case admit.FirstBytesOther:
 	}
 	return "other", 0
 }
@@ -1183,8 +1208,8 @@ func TestDispatchVectors(t *testing.T) {
 		if v.Framing == "message" {
 			f = zmux.FramingRecords
 		}
-		c, _ := zmux.ClassifyFirstBytes(v.Bytes, f)
-		if (c == zmux.FirstBytesRecord) != v.Record || (v.Hello && c != zmux.FirstBytesOther) {
+		c, _ := admit.ClassifyFirstBytes(v.Bytes, f)
+		if (c == admit.FirstBytesRecord) != v.Record || (v.Hello && c != admit.FirstBytesOther) {
 			t.Errorf("% x on %s: classified %v", []byte(v.Bytes), v.Framing, c)
 		}
 		if len(v.Bytes) > 0 && IsHelloFirstByte(v.Bytes[0]) != v.Hello {

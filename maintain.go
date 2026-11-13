@@ -21,30 +21,30 @@ type PipePool struct {
 	Dial func(ctx context.Context) (PipeIO, error)
 	// Join, in place of Dial, joins the pipes of one member of the path
 	// itself, such as an uplink and a downlink of a split carrier
-	// (HTTPSplitJoin), with the options given; the member is usable while
+	// (zmuxhttp.SplitJoin), with the options given; the member is usable while
 	// all of them are, and they are replaced together. ctx bounds the
-	// joins; o has NoWaitAttached set, as the pool's own joins do.
+	// joins; o has ReturnOnReply set, as the pool's own joins do.
 	Join func(ctx context.Context, c *Conn, o PipeOptions) ([]*Pipe, error)
-	// Mode, in place of Dial and Join, dials each member over a carrier
+	// Choice, in place of Dial and Join, dials each member over a carrier
 	// kind of the mode's candidates (a split candidate joins as a split
 	// carrier), presenting the session's Config.Credential. Stable first,
 	// then upgrade: a member is dialed over the most robust kind available
-	// (a kind ModePolicy.Cache holds as usable, else the exchange carrier,
+	// (a kind CarrierChoicePolicy.Cache holds as usable, else the exchange carrier,
 	// else the last), skipping the kinds the cache holds as failed unless
 	// all are; a member of a kind that a preferred kind not backing off
 	// could replace is rotated to it, make before break, and the
 	// replacement takes over once it has stayed usable for
-	// ModePolicy.Settle. A kind whose join fails, whose replacement ends
+	// CarrierChoicePolicy.Settle. A kind whose join fails, whose replacement ends
 	// before it settled, or whose member fails within
-	// ModePolicy.DropWindow of being joined, is recorded as failed. Each
+	// CarrierChoicePolicy.DropWindow of being joined, is recorded as failed. Each
 	// try is reported as an EventCarrierCandidate, and a member joined
 	// over a kind other than the session's carrier as an
-	// EventCarrierChosen. ExplicitMode dials its one kind only, without
+	// EventCarrierChosen. ExplicitChoice dials its one kind only, without
 	// the cache.
-	Mode Mode
-	// ModePolicy is the policy of Mode (nil: the defaults, with a cache
-	// private to the pool); its NoJoin does not apply.
-	ModePolicy *ModePolicy
+	Choice CarrierChoice
+	// ChoicePolicy is the policy of Choice (nil: the defaults, with a cache
+	// private to the pool); its Join does not apply.
+	ChoicePolicy *CarrierChoicePolicy
 	// Count is the number of usable pipes to keep (0: 1, as a pool of no
 	// pipes has nothing to maintain).
 	Count int
@@ -62,7 +62,7 @@ type PipePool struct {
 	MinBackoff, MaxBackoff time.Duration
 	// Policy, when set, is asked on every pass of the pool; its
 	// DialAfter replaces the backoff, bounded by MaxBackoff, and its
-	// ProbeInterval and ProbeJitter apply to the pipes dialled after it.
+	// Liveness applies to the pipes dialled after it.
 	// A decision that fails PoolDecision.Validate is rejected: the pass
 	// goes on as with the zero decision and the error is reported to
 	// DecisionRejected.
@@ -142,7 +142,7 @@ func (c *Conn) MaintainPipes(ctx context.Context, pool PipePool) error {
 }
 
 // maintainPipes is MaintainPipes; seed, when set, is the pool's mode and
-// its first member (DialMode).
+// its first member (DialChoice).
 func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed) error {
 	if c == nil {
 		return net.ErrClosed
@@ -172,9 +172,9 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	switch {
 	case seed != nil:
 		mp = seed.mp
-	case len(pool.Mode.candidates) > 0:
+	case len(pool.Choice.candidates) > 0:
 		var err error
-		if mp, err = newModePool(pool.Mode, pool.ModePolicy, c.cfg.Credential); err != nil {
+		if mp, err = newModePool(pool.Choice, pool.ChoicePolicy, c.cfg.CarrierCredential); err != nil {
 			return err
 		}
 	}
@@ -234,7 +234,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		// A replacement closes its old pipe only once attached by the peer
 		// (memberState), and a redial must not wait for an acknowledgement
 		// that only the direction it restores could carry.
-		o.NoWaitAttached = true
+		o.ReturnOnReply = true
 		if pool.Policy != nil {
 			o = dec.probeOptions(o)
 		}
@@ -332,7 +332,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 			if alive {
 				live = append(live, m)
 				m.idle = st.SinceLastTraffic
-				view.Members = append(view.Members, PoolMember{ID: m.ps[0].ID(), Age: now.Sub(m.born),
+				view.Members = append(view.Members, PoolMember{PipeID: m.ps[0].ID(), Age: now.Sub(m.born),
 					Idle: m.idle, Pipes: len(m.ps), BytesSent: st.BytesSent, BytesReceived: st.BytesReceived})
 			} else {
 				closeAll(m.ps) // the rest of a member goes with its failed pipe
@@ -354,7 +354,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		if pool.Policy != nil {
 			view.Now, view.Failures, view.LastDial = now, failures, lastDial
 			if err := decide(c.cfg.Logger, pool.Policy, &view, &dec); err != nil {
-				dec = PoolDecision{Retire: dec.Retire[:0]} // rejected, as a policy that panics
+				dec = PoolDecision{RetirePipes: dec.RetirePipes[:0]} // rejected, as a policy that panics
 				reportRejected(c.cfg.Logger, pool.DecisionRejected, err)
 			}
 			if dec.DialAfter > 0 {
@@ -363,7 +363,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 			if dec.Count > 0 {
 				count = dec.Count
 			}
-			for _, id := range dec.Retire {
+			for _, id := range dec.RetirePipes {
 				for _, m := range members {
 					if m.ps[0].ID() == id {
 						m.retire = true
@@ -489,7 +489,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 			}
 		}
 		next := time.Duration(-1)
-		if r := recheckAfter(&dec); r > 0 && pool.Policy != nil {
+		if r := dec.RecheckAfter(); r > 0 && pool.Policy != nil {
 			next = r
 		}
 		if !dialAt.IsZero() {

@@ -23,7 +23,9 @@ import (
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/httpx"
 	"github.com/zmuxio/zmux-go/internal/labels"
+	"github.com/zmuxio/zmux-go/internal/setting"
 )
 
 // Admission is a decision taken on a new carrier before any byte is sent on
@@ -38,7 +40,7 @@ import (
 // WebSocket) the prefix is the carrier's first message, whole. Decide may
 // ask for more of a byte stream (VerdictMore, up to MaxPeek bytes), as a
 // host that tells several kinds of carrier apart by their first bytes
-// does (ClassifyFirstBytes).
+// does (admit.ClassifyFirstBytes).
 //
 // The fields are read by NewListener; an Admission must not be changed or
 // copied afterwards.
@@ -106,12 +108,6 @@ type CarrierInfo struct {
 	// per-source limits and the stall duration count it aggregated: an
 	// IPv6 address to its /64 prefix, the port ignored.
 	Source netip.AddrPort
-	// HasExporter, Secure, Label and IsFirstPipe describe a carrier to RecordPolicy and
-	// AllowRecordMode: whether it has an exporter, declares the Bound contract
-	// (CarrierSecure), its label, and whether it is the session's first pipe.
-	Label               string
-	HasExporter, Secure bool
-	IsFirstPipe         bool
 	// Head marks a carrier decided on its HTTP request head, before any
 	// body byte is read: an HTTP upgrade such as WebSocket or
 	// WebTransport, an exchange carrier, or an HTTP request carrier
@@ -133,16 +129,16 @@ type CarrierInfo struct {
 	Request *http.Request
 }
 
-// Verdict is the outcome of an admission.
-type Verdict uint8
+// AdmissionVerdict is the outcome of an admission.
+type AdmissionVerdict uint8
 
 const (
 	// VerdictAccept hands the carrier to the Listener, without the first
 	// Decision.Skip bytes of the prefix.
-	VerdictAccept Verdict = iota
+	VerdictAccept AdmissionVerdict = iota
 	// VerdictFallback hands the carrier, with every byte read replayed, to
 	// the fallback target of its kind (ListenerConfig.Fallback for byte
-	// streams, HTTPOptions.Next for HTTP carriers, the QUIC adapter's).
+	// streams, zmuxhttp.Options.Next for HTTP carriers, the QUIC adapter's).
 	// Without one a stream carrier is stalled, and an HTTP request gets
 	// the server's not-found response.
 	VerdictFallback
@@ -166,18 +162,18 @@ const (
 
 // verdictFailed is the outcome of a carrier whose outer handshake failed:
 // it reached no decision and is closed.
-const verdictFailed Verdict = 255
+const verdictFailed AdmissionVerdict = 255
 
 // Decision is what Admission.Decide returns.
 type Decision struct {
-	Verdict Verdict
+	Verdict AdmissionVerdict
 	// Skip is the number of leading prefix bytes that are not carrier bytes
 	// (VerdictAccept only); the rest is replayed to the Listener.
 	Skip int
 	// Value is the host's value for an accepted carrier (VerdictAccept
 	// only; ignored otherwise): zmux hands it on without looking at it to
-	// WrapPipe (PipeHint.Admitted) and to the session (Conn.Admitted) or
-	// pipe (Pipe.Admitted) the carrier makes, and holds it until their
+	// WrapPipe (PipeHint.Admitted) and to the session (AdmittedAs) or
+	// pipe (AdmittedAs) the carrier makes, and holds it until their
 	// state is released. Whether a join comes from the same client as its
 	// session is the host's to decide: zmux compares no values.
 	Value any
@@ -249,7 +245,7 @@ type admissionCounters struct {
 }
 
 // variant counts a final verdict of variant v.
-func (c *admissionCounters) variant(v string, verdict Verdict) {
+func (c *admissionCounters) variant(v string, verdict AdmissionVerdict) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	vs := c.variants[v]
@@ -328,7 +324,7 @@ func (a *Admission) Validate() error {
 		if r.peekTimeout == 0 {
 			r.peekTimeout = drawDuration(5*time.Second, 30*time.Second)
 		}
-		r.peekTimeout = timeout(r.peekTimeout, 0)
+		r.peekTimeout = setting.Timeout(r.peekTimeout, 0)
 		if r.stallMax == 0 {
 			r.stallMax = drawDuration(30*time.Second, 120*time.Second)
 			r.stallMin = drawDuration(r.stallMax/4, r.stallMax*3/4)
@@ -419,9 +415,10 @@ func (l *Listener) stallDuration(key string) time.Duration {
 // ---- arrivals ----
 
 // Arrival is a carrier that an entry point of a Listener took: it holds a
-// slot of its source (ListenerConfig.MaxPendingPerSource) from its
-// arrival, before any handshake, through the admission and until the
-// listener classifies the carrier. Listener.Serve, HandlePipe and the
+// slot of its source (ListenerConfig.MaxPendingPerSource) and a slot of
+// the listener (MaxPending) from its arrival, before any handshake,
+// through the admission and until the carrier enters a session, is closed
+// or is handed to a fallback. Listener.Serve, HandlePipe and the
 // HTTP handlers make their own; an adapter with its own accept loop takes
 // one with Arrive (or AdmitUpgrade for an HTTP upgrade) as soon as it
 // accepts a connection, and hands its carriers on with HandlePipe.
@@ -432,54 +429,80 @@ type Arrival struct {
 	key  string
 
 	mu       sync.Mutex
-	held     bool   // the source slot Arrive took is held and not yet handed on
-	accepted bool   // the admission accepted the carrier
-	value    any    // Decision.Value of that acceptance
-	variant  string // Decision.Variant of that acceptance
+	slot     *core.PendingSlot // the slots Arrive took, until handed on
+	accepted bool              // the admission accepted the carrier
+	value    any               // Decision.Value of that acceptance
+	variant  string            // Decision.Variant of that acceptance
 }
 
-// Arrive takes a slot of source for a carrier that arrived from peer
-// (source zero: peer). A source without a free slot, or a closed listener
-// (net.ErrClosed), refuses it (ListenerStats.Refused): the caller closes
-// the carrier without a handshake.
+// Arrive takes a slot of source and a slot of the listener for a carrier
+// that arrived from peer (source zero: peer). When every slot of the
+// listener is taken, the oldest stalled carrier is closed to make room; a
+// source without a free slot or a closed listener (net.ErrClosed) refuses
+// the carrier (ListenerStats.Refused), and so does a full listener with no
+// stalled carrier (ListenerStats.Rejected): the caller closes the carrier
+// without a handshake.
 func (l *Listener) Arrive(source, peer netip.AddrPort) (*Arrival, error) {
 	source, peer = unmapped(source), unmapped(peer)
 	if !source.IsValid() {
 		source = peer
 	}
 	key := sourceKey(source)
-	l.mu.Lock()
-	closed := l.closed
-	ok := !closed && l.pending.Enter(key)
-	var watch func()
-	if ok {
-		watch = l.startWatchLocked()
+	slot, err := l.enter(key)
+	if err != nil {
+		return nil, err
 	}
+	l.mu.Lock()
+	watch := l.startWatchLocked()
 	l.mu.Unlock()
 	if watch != nil {
 		watch()
 	}
-	if !ok {
-		l.st.refused.Add(1)
-		if closed {
-			return nil, net.ErrClosed
-		}
-		return nil, errRefused
-	}
-	return &Arrival{l: l, src: source, peer: peer, key: key, held: true}, nil
+	return &Arrival{l: l, src: source, peer: peer, key: key, slot: slot}, nil
 }
 
-// Release gives back the arrival's source slot when no carrier of it is
-// handed on (the connection ended first). It may be called more than
-// once, also after HandlePipe.
-func (a *Arrival) Release() {
-	a.mu.Lock()
-	held := a.held
-	a.held = false
-	a.mu.Unlock()
-	if held {
-		a.l.leave(a.key)
+// enter takes the slots of a carrier from the source of key, counting a
+// refusal; the error is net.ErrClosed, errRefused (the source's share) or
+// errRejected (every slot taken, none stalled).
+func (l *Listener) enter(key string) (*core.PendingSlot, error) {
+	l.mu.Lock()
+	closed := l.closed
+	var slot *core.PendingSlot
+	var evicted func()
+	r := core.EnterSourceFull
+	if !closed {
+		slot, evicted, r = l.pending.Enter(key)
 	}
+	l.mu.Unlock()
+	if evicted != nil {
+		evicted()
+	}
+	switch {
+	case closed:
+		l.st.refused.Add(1)
+		return nil, net.ErrClosed
+	case r == core.EnterFull:
+		l.st.rejected.Add(1)
+		return nil, errRejected
+	case r != core.EnterOK:
+		l.st.refused.Add(1)
+		return nil, errRefused
+	}
+	return slot, nil
+}
+
+// Release gives back the arrival's slots when no carrier of it is handed
+// on (the connection ended first). It may be called more than once, also
+// after HandlePipe.
+func (a *Arrival) Release() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	slot := a.slot
+	a.slot = nil
+	a.mu.Unlock()
+	a.l.leave(slot)
 }
 
 // HandshakeFailed records that the arrival's outer handshake (an HTTP
@@ -495,28 +518,29 @@ func (a *Arrival) HandshakeFailed() {
 	a.Release()
 }
 
-func (l *Listener) leave(key string) {
+// leave gives back the slots of a carrier; nil, or slots given back
+// already or evicted, do nothing.
+func (l *Listener) leave(slot *core.PendingSlot) {
+	if slot == nil {
+		return
+	}
 	l.mu.Lock()
-	l.pending.Leave(key)
+	l.pending.Leave(slot)
 	l.mu.Unlock()
 }
 
-// takeSlot hands the arrival's source slot on to a carrier: the one Arrive
-// took for the first, a new one for each further carrier of an accepted
-// arrival (a QUIC connection's further streams).
-func (a *Arrival) takeSlot() bool {
+// takeSlot hands the arrival's slots on to a carrier: the ones Arrive took
+// for the first, new ones for each further carrier of an accepted arrival
+// (a QUIC connection's further streams). The error is that of enter.
+func (a *Arrival) takeSlot() (*core.PendingSlot, error) {
 	a.mu.Lock()
-	held := a.held
-	a.held = false
+	slot := a.slot
+	a.slot = nil
 	a.mu.Unlock()
-	if held {
-		return true
+	if slot != nil {
+		return slot, nil
 	}
-	l := a.l
-	l.mu.Lock()
-	ok := !l.closed && l.pending.Enter(a.key)
-	l.mu.Unlock()
-	return ok
+	return a.l.enter(a.key)
 }
 
 // Admitted reports whether the arrival's carriers are handed on without
@@ -564,7 +588,7 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error
 		case VerdictFallback:
 			if nc, ok := p.R.(net.Conn); ok && sameHalf(p.W, p.R) && l.cfg.Fallback != nil {
 				a.Release()
-				l.cfg.Fallback(ctx, PrefixedConn(nc, prefix))
+				l.cfg.Fallback(ctx, prefixConn(nc, prefix))
 				return errRejected
 			}
 			a.stallPipe(ctx, p, false)
@@ -573,13 +597,35 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error
 			return errRejected
 		}
 	}
-	if !a.takeSlot() {
-		l.st.refused.Add(1)
-		if l.isClosed() {
-			closePipeIO(p)
-			return errRefused
+	run, err := a.Take(ctx, p, hint)
+	if err != nil {
+		return err
+	}
+	return run(ctx)
+}
+
+// Take hands p, a carrier of the arrival that its admission accepted
+// (Admitted), to the listener, or refuses it at once, before it waits for
+// anything: the listener is closed, it is shutting down and p is a split
+// half, or the source has no slot for a further carrier. p takes the
+// arrival's slots, as with HandlePipe, and is closed when refused. run
+// does the rest of HandlePipe: it blocks for the lifetime of the pipe.
+// Take serves an adapter that answers a carrier's request according to
+// whether the listener took it (the exchange carrier); HandlePipe is Take
+// and run in one.
+func (a *Arrival) Take(ctx context.Context, p PipeIO, hint PipeHint) (run func(context.Context) error, err error) {
+	l := a.l
+	if !a.isAccepted() {
+		closePipeIO(p)
+		return nil, errRejected
+	}
+	slot, err := a.takeSlot()
+	if err != nil {
+		if errors.Is(err, errRefused) && !l.isClosed() {
+			return nil, l.refusePending(ctx, p, a.src, a.peer)
 		}
-		return l.refusePending(ctx, p, a.src, a.peer)
+		closePipeIO(p)
+		return nil, err
 	}
 	hint.Source = a.src
 	a.mu.Lock()
@@ -588,11 +634,7 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error
 		p.Variant = a.variant // the admission labels the carrier
 	}
 	a.mu.Unlock()
-	run, err := l.take(p, hint, a.key)
-	if err != nil {
-		return err
-	}
-	return run(ctx)
+	return l.take(p, hint, slot)
 }
 
 // Admit runs the listener's admission on p, the first carrier of the
@@ -637,7 +679,7 @@ func (l *Listener) stopContext(ctx context.Context) (context.Context, context.Ca
 // VerdictFallback p is untouched and prefix what was read; otherwise p is
 // closed (VerdictStall: after nothing, the caller stalls only a fallback
 // without target; the decision's own stall has run).
-func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []byte, v Verdict) {
+func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []byte, v AdmissionVerdict) {
 	l := a.l
 	adm := l.cfg.Admission
 	ctx, cancel := l.stopContext(ctx)
@@ -766,9 +808,9 @@ func (a *Arrival) peekMessage(p PipeIO, limit int, deadline time.Time) (msg []by
 	if !ok {
 		return nil, false, false
 	}
-	var once atomic.Bool
+	done := make(chan struct{})
 	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
-		once.Store(true)
+		defer close(done)
 		interruptRead(p)
 	})
 	var err error
@@ -777,7 +819,8 @@ func (a *Arrival) peekMessage(p PipeIO, limit int, deadline time.Time) (msg []by
 	} else {
 		msg, err = mr.ReadMessage()
 	}
-	if !t.Stop() && once.Load() {
+	if !t.Stop() {
+		<-done // it fired: the carrier's reads have ended
 		return nil, false, true
 	}
 	if errors.Is(err, ErrMessageTooLarge) || len(msg) > limit {
@@ -903,12 +946,17 @@ func (a *Arrival) count(d Decision) Decision {
 	return d
 }
 
-// stallSlot counts a stalled carrier of the arrival; ok false: the source
-// holds its share of stalled carriers (StallOverflow), close it at once.
-func (a *Arrival) stallSlot(counted bool) (d time.Duration, release func(), ok bool) {
+// stallSlot marks the arrival's carrier stalled, evict ending the stall
+// when a new carrier takes its slots; ok false: the source holds its share
+// of stalled carriers, or the listener half of MaxPending
+// (StallOverflow), close it at once.
+func (a *Arrival) stallSlot(counted bool, evict func()) (d time.Duration, release func(), ok bool) {
 	l := a.l
+	a.mu.Lock()
+	slot := a.slot
+	a.mu.Unlock()
 	l.mu.Lock()
-	ok = !l.closed && l.pending.Stall(a.key)
+	ok = !l.closed && l.pending.Stall(slot, evict)
 	l.mu.Unlock()
 	if counted {
 		if ok {
@@ -922,7 +970,7 @@ func (a *Arrival) stallSlot(counted bool) (d time.Duration, release func(), ok b
 	}
 	return l.stallDuration(a.key), func() {
 		l.mu.Lock()
-		l.pending.Unstall(a.key)
+		l.pending.Unstall(slot)
 		l.mu.Unlock()
 	}, true
 }
@@ -934,7 +982,7 @@ func (a *Arrival) stallSlot(counted bool) (d time.Duration, release func(), ok b
 // counted: the decision was VerdictStall, not a fallback without target.
 func (a *Arrival) stallPipe(ctx context.Context, p PipeIO, counted bool) {
 	defer a.Release()
-	d, release, ok := a.stallSlot(counted)
+	d, release, ok := a.stallSlot(counted, func() { interruptRead(p) })
 	if !ok || p.R == nil {
 		closePipeIO(p)
 		if ok {
@@ -991,10 +1039,10 @@ func discard(r io.Reader) {
 // are unchanged. It is how bytes read before HandlePipe are given back.
 func PrefixedPipe(p PipeIO, prefix []byte) PipeIO { return withPrefix(p, prefix) }
 
-// PrefixedConn returns c with prefix read before the rest of c. Once the
+// prefixConn returns c with prefix read before the rest of c. Once the
 // prefix is consumed, WriteTo and ReadFrom use c's own (splice and
 // sendfile where c offers them), and Unwrap returns c.
-func PrefixedConn(c net.Conn, prefix []byte) net.Conn {
+func prefixConn(c net.Conn, prefix []byte) net.Conn {
 	if len(prefix) == 0 {
 		return c
 	}
@@ -1049,100 +1097,41 @@ func (p *prefixedConn) CloseWrite() error {
 // Unwrap returns the connection under the prefix.
 func (p *prefixedConn) Unwrap() net.Conn { return p.Conn }
 
-// ---- HTTP carriers ----
-
-// HTTPOptions configure the HTTP adapters (NewHTTPHandler, the exchange
-// handler, and HTTP upgrades such as WebSocket and WebTransport); the
-// admission they run is their listener's (ListenerConfig.Admission).
-type HTTPOptions struct {
-	// Next serves the requests that are not carriers: VerdictFallback, and
-	// requests the adapter does not take (nil: http.NotFound).
-	// An HTTP/1.1 request with a body reaches it full duplex
-	// (http.ResponseController.EnableFullDuplex), so its response can go
-	// out while the client still streams the body.
-	Next http.Handler
-	// Trusted names the intermediaries whose forwarding header field gives
-	// a request's source (nil: the request's peer is its source). Without
-	// it zmux takes r.RemoteAddr as it finds it, so a host that resolves
-	// the source itself rewrites r.RemoteAddr before the handler runs and
-	// leaves Trusted nil.
-	Trusted *TrustedProxies
-	// PairField is the request field that pairs the uplink POST and the
-	// downlink GET of a split bootstrap (empty: HeaderPair), another name
-	// only where an intermediary strips unknown fields. The client side
-	// uses the same name (HTTPSplitOptions.PairField).
-	PairField string
-}
-
-// Validate checks o (nil is valid); the HTTP adapters call it when they
-// are set up.
-func (o *HTTPOptions) Validate() error {
-	if o == nil {
-		return nil
-	}
-	if err := checkPairField(o.PairField); err != nil {
-		return err
-	}
-	return o.Trusted.validate()
-}
-
-// trusted returns o.Trusted; nil for a nil o.
-func (o *HTTPOptions) trusted() *TrustedProxies {
-	if o == nil {
-		return nil
-	}
-	return o.Trusted
-}
-
-// Fallback serves r with Next (http.NotFound without one). An HTTP/1.1
-// request with a body reaches Next full duplex (see serveFallback).
-func (o *HTTPOptions) Fallback(w http.ResponseWriter, r *http.Request) {
-	var next http.Handler
-	if o != nil {
-		next = o.Next
-	}
-	serveFallback(next, w, r)
-}
-
-// serveFallback serves r with next (http.NotFound when nil). An HTTP/1.1
-// request with a body is switched to full duplex first: net/http would
-// otherwise read the rest of the body before the response header goes
-// out, and a streaming body that the client keeps open until it sees a
-// response would stall both sides. The error of a writer that cannot
-// switch is ignored.
-func serveFallback(next http.Handler, w http.ResponseWriter, r *http.Request) {
-	if r.ProtoMajor == 1 && r.ContentLength != 0 && r.Body != nil && r.Body != http.NoBody {
-		_ = http.NewResponseController(w).EnableFullDuplex()
-	}
-	if next == nil {
-		http.NotFound(w, r)
-		return
-	}
-	next.ServeHTTP(w, r)
-}
+// ---- HTTP requests as carriers ----
 
 // AdmitUpgrade takes r, the request of an HTTP upgrade (WebSocket,
 // WebTransport), as a carrier of l and runs l's admission on its head,
 // before anything is written to w: the decision gets no prefix,
 // CarrierInfo.Head is set, and the body is not read. Its source is what
-// o.Trusted resolves. A request that an intermediary forwarded from TLS
-// early data (Early-Data: 1, RFC 8470), or read before the TLS handshake
-// completed (0-RTT on HTTP/3), is answered 425 (Too Early) first and is
-// no carrier. On VerdictAccept (or without an Admission) it returns the
-// arrival and true: the caller completes the upgrade and hands the
-// carrier on with Arrival.HandlePipe, or calls Arrival.HandshakeFailed.
-// Otherwise it has answered r (VerdictFallback, or a carrier the listener
-// refuses, with o.Next) or ended it (VerdictStall, VerdictClose, which
-// abort the request with http.ErrAbortHandler), and the caller returns.
-func (l *Listener) AdmitUpgrade(w http.ResponseWriter, r *http.Request, o *HTTPOptions) (*Arrival, bool) {
-	return l.admitRequest(w, r, o, false)
+// trusted resolves (TrustedProxies.RequestSource). A request that an
+// intermediary forwarded from TLS early data (Early-Data: 1, RFC 8470), or
+// read before the TLS handshake completed (0-RTT on HTTP/3), is answered
+// 425 (Too Early) first and is no carrier (EarlyRequest). On VerdictAccept
+// (or without an Admission) it returns the arrival and true: the caller
+// completes the upgrade and hands the carrier on with Arrival.HandlePipe,
+// or calls Arrival.HandshakeFailed. Otherwise it has answered r
+// (VerdictFallback, or a carrier the listener refuses, with fallback;
+// nil: http.NotFound) or ended it (VerdictStall, VerdictClose, which abort
+// the request with http.ErrAbortHandler), and the caller returns.
+func (l *Listener) AdmitUpgrade(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
+	return l.admitRequest(w, r, trusted, false, fallback)
 }
 
-// earlyRequest reports whether r may have been received in TLS early
+// AdmitRequest is AdmitUpgrade for a request whose body is the carrier:
+// the decision's prefix is the start of the body (none for a request
+// without one, decided on its head), and on VerdictAccept r.Body
+// continues after the skipped bytes. On VerdictFallback r.Body replays
+// the bytes read.
+func (l *Listener) AdmitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
+	return l.admitRequest(w, r, trusted, true, fallback)
+}
+
+// EarlyRequest reports whether r may have been received in TLS early
 // data: an intermediary forwarded it from early data (Early-Data: 1, RFC
 // 8470), or the server read it on a connection whose handshake has not
-// completed, as an HTTP/3 server listening for 0-RTT does.
-func earlyRequest(r *http.Request) bool {
+// completed, as an HTTP/3 server listening for 0-RTT does. Such a request
+// is no carrier; AdmitUpgrade and AdmitRequest answer it 425.
+func EarlyRequest(r *http.Request) bool {
 	if r.TLS != nil && !r.TLS.HandshakeComplete {
 		return true
 	}
@@ -1154,34 +1143,48 @@ func earlyRequest(r *http.Request) bool {
 	return false
 }
 
-// admitRequest is AdmitUpgrade, and with body set the admission of a
-// request carrier: its prefix is the start of the body (none for a
-// request without one, decided on its head), and on VerdictAccept r.Body
-// continues after the skipped bytes.
-func (l *Listener) admitRequest(w http.ResponseWriter, r *http.Request, o *HTTPOptions, body bool) (*Arrival, bool) {
-	if earlyRequest(r) {
+// admitRequest is AdmitUpgrade, and with body set AdmitRequest.
+func (l *Listener) admitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, body bool, fallback http.Handler) (*Arrival, bool) {
+	if EarlyRequest(r) {
 		w.WriteHeader(http.StatusTooEarly)
 		l.CountSetupFailure() // it needs the handshake: no pipe input
 		return nil, false
 	}
-	a, err := l.Arrive(requestSource(o.trusted(), r))
+	a, err := l.Arrive(trusted.RequestSource(r))
 	if err != nil {
 		// Refused (its source holds its share, or the listener is
 		// closed): nothing was read or written, the host serves it.
-		o.Fallback(w, r)
+		serveHTTP(fallback, w, r)
 		return nil, false
 	}
-	if !a.decideRequest(w, r, body, func() { o.Fallback(w, r) }) {
+	if !a.decideRequest(w, r, body, fallback) {
 		return nil, false
 	}
 	return a, true
 }
 
-// decideRequest runs the admission of the arrival of r (see
-// admitRequest); fallback serves r on VerdictFallback, r.Body replaying
-// the bytes read. It returns true on VerdictAccept, or without an
-// Admission.
-func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body bool, fallback func()) bool {
+// serveHTTP serves r with h, http.NotFound when h is nil.
+func serveHTTP(h http.Handler, w http.ResponseWriter, r *http.Request) {
+	if h == nil {
+		http.NotFound(w, r)
+		return
+	}
+	h.ServeHTTP(w, r)
+}
+
+// DecideRequest runs the admission of the arrival of r, a request taken
+// as a carrier on its head (see AdmitUpgrade), for a host that checks the
+// request between Listener.Arrive and the decision. On VerdictFallback it
+// serves r with fallback (nil: http.NotFound); on VerdictStall and
+// VerdictClose it aborts the request with http.ErrAbortHandler. It returns
+// true on VerdictAccept, or without an Admission.
+func (a *Arrival) DecideRequest(w http.ResponseWriter, r *http.Request, fallback http.Handler) bool {
+	return a.decideRequest(w, r, false, fallback)
+}
+
+// decideRequest is DecideRequest, and with body set the decision on the
+// start of the body (see AdmitRequest).
+func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body bool, fallback http.Handler) bool {
 	l := a.l
 	adm := l.cfg.Admission
 	if adm == nil {
@@ -1196,14 +1199,15 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 	var prefix []byte
 	if !head && adm.Peek > 0 {
 		rc := http.NewResponseController(w)
-		var fired atomic.Bool
+		done := make(chan struct{})
 		t := l.clk.AfterFunc(deadline.Sub(l.clk.Now()), func() {
-			fired.Store(true)
+			defer close(done)
 			_ = rc.SetReadDeadline(time.Now())
 		})
 		b := make([]byte, adm.Peek)
 		n, err := io.ReadFull(r.Body, b)
-		if !t.Stop() && fired.Load() {
+		if !t.Stop() {
+			<-done // it fired: the request's reads have ended
 			l.st.adm.peekTimedOut.Add(1)
 			a.Release()
 			panic(http.ErrAbortHandler)
@@ -1214,13 +1218,14 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 	if !head && adm.Peek > 0 {
 		more = func(have []byte, need int) ([]byte, bool, bool) {
 			rc := http.NewResponseController(w)
-			var fired atomic.Bool
+			done := make(chan struct{})
 			t := l.clk.AfterFunc(deadline.Sub(l.clk.Now()), func() {
-				fired.Store(true)
+				defer close(done)
 				_ = rc.SetReadDeadline(time.Now())
 			})
 			b := peek(r.Body, have, need)
-			if !t.Stop() && fired.Load() {
+			if !t.Stop() {
+				<-done // it fired: the request's reads have ended
 				return nil, true, false
 			}
 			return b, false, false
@@ -1232,22 +1237,24 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 	switch d.Verdict {
 	case VerdictAccept:
 		if rest := prefix[d.Skip:]; len(rest) > 0 {
-			r.Body = &replayBody{Reader: io.MultiReader(bytesReader(rest), r.Body), c: r.Body}
+			r.Body = httpx.ReplayBody(rest, r.Body, r.Body)
 		}
 		a.accept()
 		return true
 	case VerdictFallback:
 		if len(prefix) > 0 {
-			r.Body = &replayBody{Reader: io.MultiReader(bytesReader(prefix), r.Body), c: r.Body}
+			r.Body = httpx.ReplayBody(prefix, r.Body, r.Body)
 		}
 		a.Release()
-		fallback()
+		serveHTTP(fallback, w, r)
 	case VerdictStall:
-		if d, release, ok := a.stallSlot(true); ok {
+		evicted := make(chan struct{})
+		if d, release, ok := a.stallSlot(true, sync.OnceFunc(func() { close(evicted) })); ok {
 			t := timeshim.NewTimer(l.clk, d)
 			select {
 			case <-t.C:
 			case <-ctx.Done():
+			case <-evicted:
 			}
 			t.Stop()
 			release()
@@ -1260,29 +1267,3 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 	}
 	return false
 }
-
-// replayBody is a request body with bytes read earlier put back in front.
-type replayBody struct {
-	io.Reader
-	c io.Closer
-}
-
-func (b *replayBody) Close() error { return b.c.Close() }
-
-type sliceReader struct{ b []byte }
-
-func (s *sliceReader) Read(p []byte) (int, error) {
-	if len(s.b) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, s.b)
-	s.b = s.b[n:]
-	return n, nil
-}
-
-func bytesReader(b []byte) io.Reader { return &sliceReader{b: b} }
-
-// errReader returns its error from every Read.
-type errReader struct{ err error }
-
-func (e errReader) Read([]byte) (int, error) { return 0, e.err }

@@ -76,7 +76,7 @@ func (s *Session) Locator() []byte { return s.cfg.Local.Locator }
 
 // Recommended limits on pending and unverified carriers.
 const (
-	DefaultMaxPending          = 64
+	DefaultMaxPending          = 1024
 	DefaultMaxPendingPerSource = 8
 	DefaultFirstRecordTimeout  = 2 * Second
 	DefaultHandshakeTimeout    = 10 * Second
@@ -106,29 +106,40 @@ func SourceKey(addr string) string {
 	return p.String()
 }
 
-// PendingCarriers bounds the carriers of one listener that have not yet
-// passed join verification: at most MaxPerSource per
-// source, refused beyond it, and at most MaxTotal in all, a new carrier
-// evicting the oldest when they are full; each is closed when its first
-// record does not arrive within Timeout. A carrier holds its source slot
-// (Enter) from its arrival, and a slot of the total (Take) only once it
-// is read for its first record. Callers serialise access.
+// PendingCarriers bounds the carriers of one listener before they belong
+// to a session: at most MaxPerSource per source and MaxTotal in all, from
+// a carrier's arrival until it enters a session, is closed or is handed to
+// a fallback, a stall included. A new carrier that finds MaxTotal taken
+// evicts the oldest stalled carrier, or is refused when none is stalled.
+// Stalled carriers hold at most MaxPerSource - 1 slots of their source and
+// half of MaxTotal. Callers serialise access.
 type PendingCarriers struct {
-	MaxTotal     int      // 0: DefaultMaxPending
+	MaxTotal     int      // 0: DefaultMaxPending; negative: unlimited
 	MaxPerSource int      // 0: DefaultMaxPendingPerSource
 	Timeout      Duration // 0: DefaultFirstRecordTimeout
 	bySource     map[string]int
-	stalled      map[string]int
-	order        list.List // of *PendingCarrier, oldest first
+	stalledBy    map[string]int
+	total        int
+	stalls       list.List // of *PendingSlot, the stalled ones, oldest first
 }
 
-// PendingCarrier is the slot of the total of one carrier.
-type PendingCarrier struct {
+// PendingSlot is the source slot and the slot of the total that one
+// carrier holds.
+type PendingSlot struct {
 	source string
-	owns   bool // Admit took its source slot as well
+	held   bool
+	stall  *list.Element // non-nil while stalled
 	evict  func()
-	elem   *list.Element // nil once released or evicted
 }
+
+// EnterResult is the outcome of Enter.
+type EnterResult uint8
+
+const (
+	EnterOK         EnterResult = iota
+	EnterSourceFull             // the source holds its share: close the carrier
+	EnterFull                   // every slot is taken and none is stalled
+)
 
 func (p *PendingCarriers) maxPer() int {
 	if p.MaxPerSource <= 0 {
@@ -137,98 +148,103 @@ func (p *PendingCarriers) maxPer() int {
 	return p.MaxPerSource
 }
 
-// Enter takes a source slot for a carrier that arrived from source; false:
-// the source holds its share, close the carrier. Leave gives it back.
-func (p *PendingCarriers) Enter(source string) bool {
+// maxTotal is the bound of the total; 0: none.
+func (p *PendingCarriers) maxTotal() int {
+	switch {
+	case p.MaxTotal < 0:
+		return 0
+	case p.MaxTotal == 0:
+		return DefaultMaxPending
+	}
+	return p.MaxTotal
+}
+
+// Enter takes a source slot and a slot of the total for a carrier that
+// arrived from source. When every slot of the total is taken it evicts the
+// oldest stalled carrier, whose slots are free at once, and returns that
+// carrier's evict function for the caller to call outside its lock. Leave
+// gives the slots back.
+func (p *PendingCarriers) Enter(source string) (s *PendingSlot, evicted func(), r EnterResult) {
 	if p.bySource == nil {
 		p.bySource = map[string]int{}
 	}
 	if p.bySource[source] >= p.maxPer() {
-		return false
+		return nil, nil, EnterSourceFull
+	}
+	if m := p.maxTotal(); m > 0 && p.total >= m {
+		f := p.stalls.Front()
+		if f == nil {
+			return nil, nil, EnterFull
+		}
+		old := f.Value.(*PendingSlot)
+		evicted = old.evict
+		p.Leave(old)
+		if p.bySource[source] >= p.maxPer() { // the evicted carrier was of this source
+			return nil, evicted, EnterSourceFull
+		}
 	}
 	p.bySource[source]++
-	return true
+	p.total++
+	return &PendingSlot{source: source, held: true}, evicted, EnterOK
 }
 
 // Held is the number of source slots source holds.
 func (p *PendingCarriers) Held(source string) int { return p.bySource[source] }
 
-// Leave gives back a source slot Enter took.
-func (p *PendingCarriers) Leave(source string) {
-	if n := p.bySource[source]; n > 1 {
-		p.bySource[source] = n - 1
-	} else {
-		delete(p.bySource, source)
-	}
-}
+// Total is the number of slots of the total taken.
+func (p *PendingCarriers) Total() int { return p.total }
 
-// Take takes a slot of the total for a carrier that holds its source
-// slot. evict closes the carrier when a newer one takes its slot; Take
-// returns it as evicted instead of calling it, for the caller to call
-// outside its lock.
-func (p *PendingCarriers) Take(source string, evict func()) (c *PendingCarrier, evicted func()) {
-	maxTotal := p.MaxTotal
-	if maxTotal <= 0 {
-		maxTotal = DefaultMaxPending
-	}
-	if f := p.order.Front(); f != nil && p.order.Len() >= maxTotal {
-		old := f.Value.(*PendingCarrier)
-		p.Release(old)
-		evicted = old.evict
-	}
-	c = &PendingCarrier{source: source, evict: evict}
-	c.elem = p.order.PushBack(c)
-	return c, evicted
-}
-
-// Admit is Enter and Take in one: ok false, close the carrier. Release
-// then gives back both slots.
-func (p *PendingCarriers) Admit(source string, evict func()) (c *PendingCarrier, evicted func(), ok bool) {
-	if !p.Enter(source) {
-		return nil, nil, false
-	}
-	c, evicted = p.Take(source, evict)
-	c.owns = true
-	return c, evicted, true
-}
-
-// Release returns the slot of the total of a carrier that was classified
-// as a new session or a lane, passed join verification, or was closed,
-// and its source slot when Admit took it. Releasing a slot again, or one
-// that was evicted, does nothing.
-func (p *PendingCarriers) Release(c *PendingCarrier) {
-	if c == nil || c.elem == nil {
+// Leave gives back the slots of s, ending its stall. Leaving a slot again,
+// or one that was evicted, does nothing.
+func (p *PendingCarriers) Leave(s *PendingSlot) {
+	if s == nil || !s.held {
 		return
 	}
-	p.order.Remove(c.elem)
-	c.elem = nil
-	if c.owns {
-		p.Leave(c.source)
+	p.Unstall(s)
+	s.held = false
+	if n := p.bySource[s.source]; n > 1 {
+		p.bySource[s.source] = n - 1
+	} else {
+		delete(p.bySource, s.source)
 	}
+	p.total--
 }
 
-// Stall counts a carrier from source that an admission stalls; it keeps
-// its source slot and takes no slot of the total, so it is neither
-// evicted nor timed out. A source holds at most MaxPerSource - 1 stalled
-// carriers, so that it keeps a slot for a new attempt: false, close the
-// carrier at once. Unstall ends the count.
-func (p *PendingCarriers) Stall(source string) bool {
-	if p.stalled == nil {
-		p.stalled = map[string]int{}
-	}
-	if p.stalled[source] >= p.maxPer()-1 {
+// Stall marks the carrier of s stalled: it keeps its slots, and evict
+// closes it when a new carrier needs its slot of the total. A source holds
+// at most MaxPerSource - 1 stalled carriers, so that it keeps a slot for a
+// new attempt, and the listener at most half of MaxTotal: false, close the
+// carrier at once. Unstall ends the stall; Leave ends it too.
+func (p *PendingCarriers) Stall(s *PendingSlot, evict func()) bool {
+	if s == nil || !s.held || s.stall != nil {
 		return false
 	}
-	p.stalled[source]++
+	if p.stalledBy == nil {
+		p.stalledBy = map[string]int{}
+	}
+	if p.stalledBy[s.source] >= p.maxPer()-1 {
+		return false
+	}
+	if m := p.maxTotal(); m > 0 && p.stalls.Len() >= m/2 {
+		return false
+	}
+	p.stalledBy[s.source]++
+	s.evict = evict
+	s.stall = p.stalls.PushBack(s)
 	return true
 }
 
-// Unstall ends the count of a carrier Stall counted.
-func (p *PendingCarriers) Unstall(source string) {
-	if n := p.stalled[source]; n > 1 {
-		p.stalled[source] = n - 1
+// Unstall ends the stall of s; it does nothing for a slot not stalled.
+func (p *PendingCarriers) Unstall(s *PendingSlot) {
+	if s == nil || s.stall == nil {
+		return
+	}
+	p.stalls.Remove(s.stall)
+	s.stall, s.evict = nil, nil
+	if n := p.stalledBy[s.source]; n > 1 {
+		p.stalledBy[s.source] = n - 1
 	} else {
-		delete(p.stalled, source)
+		delete(p.stalledBy, s.source)
 	}
 }
 
@@ -242,20 +258,17 @@ func (p *PendingCarriers) Deadline(t Time) Time {
 }
 
 // SplitPairing pairs the two unidirectional carriers of a split bootstrap
-// by their pairing token. The listener holds the first
-// carrier of a pair until the opposite one arrives; a token is used for
-// exactly one pair. Callers serialise access.
+// by their pairing token. The listener holds the first carrier of a pair
+// until the opposite one arrives; a token is used for exactly one pair.
+// The waiting carriers are bounded by the slots they hold
+// (PendingCarriers). Callers serialise access.
 type SplitPairing struct {
-	MaxTotal     int // 0: the default 64
-	MaxPerSource int // 0: the default 8
-	wait         map[[16]byte]pairWait
-	used         map[[16]byte]bool
-	bySource     map[string]int
+	wait map[[16]byte]pairWait
+	used map[[16]byte]bool
 }
 
 type pairWait struct {
 	up      bool
-	source  string
 	carrier any
 }
 
@@ -268,12 +281,12 @@ const (
 	PairReject                   // close the carrier
 )
 
-// Offer presents a carrier with its pairing token, direction (up: the
-// initiator writes on it) and source. On PairDone it returns the partner's
-// carrier value.
-func (sp *SplitPairing) Offer(token [16]byte, up bool, source string, carrier any) (PairResult, any) {
+// Offer presents a carrier with its pairing token and direction (up: the
+// initiator writes on it). On PairDone it returns the partner's carrier
+// value.
+func (sp *SplitPairing) Offer(token [16]byte, up bool, carrier any) (PairResult, any) {
 	if sp.wait == nil {
-		sp.wait, sp.used, sp.bySource = map[[16]byte]pairWait{}, map[[16]byte]bool{}, map[string]int{}
+		sp.wait, sp.used = map[[16]byte]pairWait{}, map[[16]byte]bool{}
 	}
 	if sp.used[token] {
 		return PairReject, nil
@@ -283,31 +296,11 @@ func (sp *SplitPairing) Offer(token [16]byte, up bool, source string, carrier an
 			return PairReject, nil
 		}
 		delete(sp.wait, token)
-		sp.release(w.source)
 		sp.used[token] = true
 		return PairDone, w.carrier
 	}
-	maxT, maxS := sp.MaxTotal, sp.MaxPerSource
-	if maxT <= 0 {
-		maxT = 64
-	}
-	if maxS <= 0 {
-		maxS = 8
-	}
-	if len(sp.wait) >= maxT || sp.bySource[source] >= maxS {
-		return PairReject, nil
-	}
-	sp.wait[token] = pairWait{up: up, source: source, carrier: carrier}
-	sp.bySource[source]++
+	sp.wait[token] = pairWait{up: up, carrier: carrier}
 	return PairWait, nil
-}
-
-func (sp *SplitPairing) release(source string) {
-	if n := sp.bySource[source]; n > 1 {
-		sp.bySource[source] = n - 1
-	} else {
-		delete(sp.bySource, source)
-	}
 }
 
 // Withdraw removes a held carrier that gave up waiting (timeout or
@@ -319,7 +312,6 @@ func (sp *SplitPairing) Withdraw(token [16]byte, carrier any) bool {
 		return false
 	}
 	delete(sp.wait, token)
-	sp.release(w.source)
 	return true
 }
 

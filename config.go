@@ -11,17 +11,18 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
+	"github.com/zmuxio/zmux-go/internal/setting"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // Session defaults, which the zero values of Config fields select.
 const (
-	// DefaultKeepAlivePeriod is the default Config.KeepAlivePeriod.
+	// DefaultKeepAlivePeriod is the default Liveness.KeepAlivePeriod.
 	DefaultKeepAlivePeriod = time.Duration(core.DefaultKeepAlive)
 	// DefaultMaxIdleTimeout is the default Config.MaxIdleTimeout.
 	DefaultMaxIdleTimeout = time.Duration(core.DefaultIdleTimeout)
-	// DefaultProbeJitter is the default SchedulerParams.ProbeJitter.
+	// DefaultProbeJitter is the default Liveness.ProbeJitter.
 	DefaultProbeJitter = core.DefaultProbeJitter
 	// DefaultJoinTimeout is the default Config.JoinTimeout.
 	DefaultJoinTimeout = time.Duration(core.DefaultHandshakeTimeout)
@@ -40,10 +41,10 @@ const DefaultMaxRecordSize = wire.DefaultMaxRecordSize
 
 // Config configures a session; nil *Config means all defaults. Its fields
 // follow the Settings rules of the package documentation: the zero value
-// selects the stated default, a negative timeout is no timeout where the
-// field says so, other negative values are invalid (ErrInvalidConfig)
-// unless the field gives them a meaning, and the Disable and No fields
-// switch features off. A value out of range is an error, never corrected.
+// selects the stated default, a negative value is the off, none, no
+// timeout or unlimited setting where the field says so and invalid
+// (ErrInvalidConfig) otherwise, and a Switch turns off a feature that is on
+// by default. A value out of range is an error, never corrected.
 type Config struct {
 	// HandshakeTimeout bounds establishment: the peer's transport
 	// parameters must arrive within it. Zero is 10 s; a negative value is
@@ -57,66 +58,58 @@ type Config struct {
 	// value is invalid, and so is one above the maximum join deadline of 60 s,
 	// on which epoch retention rests. It is independent of HandshakeTimeout.
 	JoinTimeout time.Duration
-	// EpochPeriod, EpochJoins, NoEpochAfterFirstPipe and NoEpochAfterResume
+	// EpochPeriod, EpochJoins, EpochAfterFirstPipe and EpochAfterResume
 	// are the policy of session epochs, the key exchanges that evolve the
 	// session secret. A multipath session advances its epoch after EpochPeriod
 	// in one epoch, after EpochJoins joins in it, once when its first Sealed or
 	// Bound pipe exists if its secret comes from a TLS exporter or a pre-shared
-	// key, and once after a suspension ends. Zero EpochPeriod and EpochJoins are
-	// the defaults, every hour and every 65536 joins; a negative one turns that
-	// trigger off, and the two booleans turn theirs off.
-	EpochPeriod           time.Duration
-	EpochJoins            int
-	NoEpochAfterFirstPipe bool
-	NoEpochAfterResume    bool
+	// key (EpochAfterFirstPipe), and once after a suspension ends
+	// (EpochAfterResume). Zero EpochPeriod and EpochJoins are the defaults,
+	// every hour and every 65536 joins; a negative one turns that trigger
+	// off. The two switches are on by default; SwitchOff turns theirs off.
+	EpochPeriod         time.Duration
+	EpochJoins          int
+	EpochAfterFirstPipe Switch
+	EpochAfterResume    Switch
 	// MaxIdleTimeout is max_idle_timeout, the time without inbound
 	// activity after which the session closes. Zero is 30 s; a negative
 	// value announces no idle timeout; a positive one is at least 1 ms.
 	MaxIdleTimeout time.Duration
-	// KeepAlivePeriod sends a QX_PING when the session has had no activity
-	// this long. Zero is 15 s; a negative value turns keep-alive off, as
-	// for net.Dialer.KeepAlive; a positive one is at least 1 s. The period in effect is capped at half the
-	// effective idle timeout, and each wait is drawn from [k x (1 - j), k]
-	// with j the probe jitter (SchedulerParams.ProbeJitter). On, an idle
-	// session stays open while the peer answers and closes within the
-	// idle timeout once its carrier dies; off, the idle timeout ends any
-	// session without application activity.
-	KeepAlivePeriod time.Duration
+	// Liveness are the keep-alive, failure detection and probe settings
+	// of the session and the defaults of its pipes; Conn.SetLiveness
+	// replaces them while the session runs.
+	Liveness Liveness
 
 	// InitialStreamReceiveWindow is the initial receive window of a
-	// stream. Zero is 256 KiB; otherwise at least 4 KiB.
-	InitialStreamReceiveWindow uint64
-	// MaxStreamReceiveWindow caps the auto-tuning of a stream's window.
-	// Zero is automatic: a 64 MiB floor that grows within the memory
-	// budget.
-	MaxStreamReceiveWindow uint64
+	// stream, in bytes. Zero is 256 KiB; otherwise at least 4 KiB; a
+	// negative value is invalid.
+	InitialStreamReceiveWindow int64
+	// MaxStreamReceiveWindow caps the auto-tuning of a stream's window, in
+	// bytes. Zero is automatic: a 64 MiB floor that grows within the memory
+	// budget; a negative value is invalid.
+	MaxStreamReceiveWindow int64
 	// LatencyBudget is the B of window auto-tuning. Zero is 100 us (tuning
 	// needs a positive budget); a negative value is invalid.
 	LatencyBudget time.Duration
-	// InitialConnectionReceiveWindow is the initial session window. Zero
-	// is 1 MiB; otherwise at least 16 KiB.
-	InitialConnectionReceiveWindow uint64
-	// MaxConnectionReceiveWindow caps the session window. Zero is
-	// automatic: a 96 MiB floor.
-	MaxConnectionReceiveWindow uint64
-	// MemoryBudget bounds the memory of a session without a listener.
-	// Zero is 1 GiB; NoMemoryLimit is unlimited; another negative value
-	// is invalid.
+	// InitialConnectionReceiveWindow is the initial session window, in
+	// bytes. Zero is 1 MiB; otherwise at least 16 KiB; a negative value is
+	// invalid.
+	InitialConnectionReceiveWindow int64
+	// MaxConnectionReceiveWindow caps the session window, in bytes. Zero
+	// is automatic: a 96 MiB floor; a negative value is invalid.
+	MaxConnectionReceiveWindow int64
+	// MemoryBudget bounds the memory of a session without a listener, in
+	// bytes. Zero is 1 GiB; a negative value is unlimited.
 	MemoryBudget int64
 
 	// MaxIncomingStreams is initial_max_streams_bidi, the bidirectional
-	// streams the peer may open at first. Zero is 256; otherwise at least
-	// 4; granting none takes NoIncomingStreams; a negative value is
-	// invalid.
+	// streams the peer may open at first. Zero is 256; a negative value
+	// grants none; otherwise at least 4.
 	MaxIncomingStreams int64
 	// MaxIncomingUniStreams is initial_max_streams_uni. Zero is a staged
 	// credit: 16, raised to 256 on the first AcceptUniStream; a negative
-	// value is invalid.
+	// value grants none.
 	MaxIncomingUniStreams int64
-	// NoIncomingStreams grants the peer no bidirectional stream.
-	NoIncomingStreams bool
-	// NoIncomingUniStreams grants the peer no unidirectional stream.
-	NoIncomingUniStreams bool
 
 	// EnableDatagrams announces max_datagram_frame_size and datagram flows.
 	EnableDatagrams bool
@@ -129,14 +122,14 @@ type Config struct {
 	DatagramStreamQueue  int
 	DatagramReceiveBytes int
 
-	// SendBuffer starts the written-but-unreleased byte budget. Zero is
-	// 4 MiB. Multipath sessions grow it to the retransmit budget, within
-	// MaxSendBuffer.
-	SendBuffer uint64
-	// MaxSendBuffer fixes its growth maximum; one below SendBuffer (or
-	// its default) is invalid. Zero is automatic: a 64 MiB floor, above it
-	// within the memory budget.
-	MaxSendBuffer uint64
+	// SendBuffer starts the written-but-unreleased byte budget, in bytes.
+	// Zero is 4 MiB; a negative value is invalid. Multipath sessions grow
+	// it to the retransmit budget, within MaxSendBuffer.
+	SendBuffer int64
+	// MaxSendBuffer fixes its growth maximum, in bytes; one below
+	// SendBuffer (or its default), or a negative one, is invalid. Zero is
+	// automatic: a 64 MiB floor, above it within the memory budget.
+	MaxSendBuffer int64
 
 	// MaxPipes is the attachments this endpoint aims for. Zero or 1 is
 	// multipath off; 8 is recommended when multipath is used.
@@ -157,7 +150,7 @@ type Config struct {
 	// source (Redial or MaintainPipes).
 	ResumeTimeout time.Duration
 
-	// Scheduler is the session's scheduling policy (nil: Affinity).
+	// Scheduler is the session's scheduling policy (nil: SchedulerAffinity).
 	Scheduler Scheduler
 	// SchedulerParams tune the scheduler and failure detection.
 	SchedulerParams SchedulerParams
@@ -191,19 +184,16 @@ type Config struct {
 	// session.
 	PipeAuth PipeAuth
 	// RecordPolicy chooses the record mode of each carrier this endpoint joins; nil is
-	// always Sealed. PipeOptions.Mode wins over it.
+	// always Sealed. PipeOptions.RecordMode wins over it.
 	RecordPolicy RecordPolicy
 	// AllowRecordMode is the acceptor's check of a Hello's mode; nil passes only Sealed.
 	AllowRecordMode AllowRecordMode
 	// AuthorizeJoin is an acceptor's further check of a join; nil passes all.
-	AuthorizeJoin func(c *Conn, pipe uint64) bool
-	// JoinEarlyHello is the size of a Hello's first batch: 0 takes 8 KiB; a
-	// negative value is invalid. Larger batches outgrow the first congestion
-	// window and delay both the Hello and the Reply.
+	AuthorizeJoin func(c *Conn, pipe PipeID) bool
+	// JoinEarlyHello is the size of a Hello's first batch in bytes: 0 takes
+	// 8 KiB; a negative value sends no first batch. Larger batches outgrow
+	// the first congestion window and delay both the Hello and the Reply.
 	JoinEarlyHello int
-	// NoJoinEarlyHello sends no first batch with a Hello; JoinEarlyHello
-	// must then be zero.
-	NoJoinEarlyHello bool
 
 	// EarlyData enables early data: stream data before the peer's
 	// transport parameters arrive.
@@ -223,12 +213,12 @@ type Config struct {
 	// outside every lock and must not block; nil logs nothing. What the
 	// events and the Tracer report is not logged again.
 	Logger *slog.Logger
-	// Credential is presented on the carrier of a client session by the
+	// CarrierCredential is presented on the carrier of a client session by the
 	// functions that open one with this Config: Client, Dial and DialTLS
 	// and the dialers of zmuxquic, zmuxws and zmuxh3 (nil: none). Pipes
 	// opened otherwise, for AddPipe or Redial, present theirs where they
 	// are dialed (PresentPipe, the adapters' options).
-	Credential Credential
+	CarrierCredential CarrierCredential
 	// Redial re-establishes pipes after failures (resume): it is called
 	// as soon as the session lacks a direction or suspends, delayed only
 	// by the redial backoff since its previous call for that direction,
@@ -247,8 +237,8 @@ type Config struct {
 	RedialMinBackoff, RedialMaxBackoff time.Duration
 	// RedialPolicy, when set, is asked before each Redial call; DialAfter
 	// is the wait from the previous call to the next (at most
-	// RedialMaxBackoff; 0: the backoff), and ProbeInterval and ProbeJitter
-	// apply to the pipe a call yields. Count and Retire are not used. A
+	// RedialMaxBackoff; 0: the backoff), and Liveness applies to the pipe a
+	// call yields. Count and Retire are not used. A
 	// decision that fails PoolDecision.Validate is rejected: the call goes
 	// ahead as with the zero decision and the error is reported to
 	// DecisionRejected.
@@ -275,47 +265,22 @@ type DatagramLimiter struct {
 	Send, Receive Limiter
 }
 
-// SchedulerParams tune multipath scheduling and failure detection, under
-// the rules of Config.
+// SchedulerParams tune multipath scheduling, under the rules of Config.
 type SchedulerParams struct {
-	// SuspectFloor is the least time before a pipe without
-	// acknowledgements turns suspect. Zero is 250 ms; otherwise at least
-	// 50 ms.
-	SuspectFloor time.Duration
-	// DeadTimeout is the time after which a suspect pipe fails. Zero is
-	// derived from the RTT; otherwise at least 1 s.
-	DeadTimeout time.Duration
 	// Probation is the base of a pipe's probation. Zero is the default
-	// (from the RTT and the pipe's history); a negative value is invalid.
+	// (from the RTT and the pipe's history); a negative value turns
+	// probation off. PipeOptions.Probation overrides it per pipe.
 	Probation time.Duration
 	// OverflowDelay is how long higher tiers stay saturated before a
 	// lower tier takes data. Zero is 1 s; a negative value is invalid.
 	OverflowDelay time.Duration
-	// StandbyProbe is the probe interval of standby pipes while the
-	// session carries traffic. Zero is 1 s; a negative value turns these
-	// standby probes off (standby pipes are then probed at the probe
-	// interval), as for net.KeepAliveConfig.Interval; otherwise at least
-	// 1 s.
-	StandbyProbe time.Duration
-	// ProbeInterval is the probe interval k of idle pipe pairs, measured
-	// to the carrier. Zero is 15 s; a negative value turns these idle
-	// probes off, as for net.KeepAliveConfig.Idle, which leaves the
-	// PIPE_PING of an answer, the standby probes and the probes of
-	// uplinks and downlinks; otherwise at least 1 s.
-	ProbeInterval time.Duration
-	// ProbeJitter is the probe jitter j, from 0 to below 1: each probe waits a uniform draw from [k_eff x (1 - j), k_eff],
-	// the first one of pipe 0 from [0, k_eff]. Zero is 0.25; a jitter of 0
-	// takes NoProbeJitter.
-	ProbeJitter float64
-	// SpreadChunk is the unit the spreading policies split data into. Zero
-	// is 16 KiB; a negative value is invalid.
+	// SpreadChunk is the unit the spreading policies split data into, in
+	// bytes. Zero is 16 KiB; a negative value is invalid.
 	SpreadChunk int
-	// NoProbation turns probation off; Probation must then be zero.
-	NoProbation bool
-	// NoProbeJitter makes j 0, the fixed schedule.
-	NoProbeJitter bool
-	// NoRedundancy turns redundancy off.
-	NoRedundancy bool
+	// Redundancy sends the data of urgent stream directions (urgency 0
+	// to 2) and the first chunk after an idle period redundantly on a
+	// second pipe. It is on by default; SwitchOff turns it off.
+	Redundancy Switch
 }
 
 // EarlyData lets a client send stream data before the server's transport
@@ -437,27 +402,12 @@ func (c *Config) clock() timeshim.Clock {
 	return c.Clock
 }
 
-// noTimeout stands for "no timeout" (a negative timeout setting): long
-// enough never to pass, short enough to add to any clock reading.
-const noTimeout = 100 * 365 * 24 * time.Hour
-
-// timeout resolves a timeout setting: 0 is def, a negative value none.
-func timeout(v, def time.Duration) time.Duration {
-	switch {
-	case v < 0:
-		return noTimeout
-	case v == 0:
-		return def
-	}
-	return v
-}
-
 // handshakeTimeout is the effective HandshakeTimeout; c may be nil.
 func (c *Config) handshakeTimeout() time.Duration {
 	if c == nil {
 		return time.Duration(core.DefaultHandshakeTimeout)
 	}
-	return timeout(c.HandshakeTimeout, time.Duration(core.DefaultHandshakeTimeout))
+	return setting.Timeout(c.HandshakeTimeout, time.Duration(core.DefaultHandshakeTimeout))
 }
 
 // joinTimeout is the effective JoinTimeout; c may be nil (a negative
@@ -488,9 +438,19 @@ func dur(d, def time.Duration) core.Duration {
 	return core.Duration(d)
 }
 
-// NoMemoryLimit as a MemoryBudget (Config or ListenerConfig) leaves the
-// memory unlimited; it is the only value that lifts a size limit.
-const NoMemoryLimit int64 = -1
+// Switch turns a feature that is on by default off or on. The zero value
+// is the default; SwitchOff, or any negative value, turns the feature off,
+// and SwitchOn, or any positive value, on.
+type Switch int8
+
+// The settings of a Switch other than the default.
+const (
+	SwitchOff Switch = -1
+	SwitchOn  Switch = 1
+)
+
+// On reports whether a feature that is on by default is on.
+func (s Switch) On() bool { return s >= 0 }
 
 // checkProbeInterval reports a probe interval that is neither 0 (the
 // default), negative (off) nor at least 1 s.
@@ -501,10 +461,11 @@ func checkProbeInterval(v time.Duration, what string) error {
 	return nil
 }
 
-// checkProbeJitter reports a probe jitter outside [0, 1).
+// checkProbeJitter reports a probe jitter of 1 or more, or NaN (a negative
+// jitter is 0).
 func checkProbeJitter(v float64, what string) error {
-	if !(v >= 0 && v < 1) { // NaN included
-		return fmt.Errorf("%w: %s %v outside [0, 1)", ErrInvalidConfig, what, v)
+	if !(v < 1) { // NaN included
+		return fmt.Errorf("%w: %s %v not below 1", ErrInvalidConfig, what, v)
 	}
 	return nil
 }
@@ -538,11 +499,12 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	cc.Role, cc.TransportRole = role, transport
 	l := &cc.Local
 	p := &c.SchedulerParams
-	if c.LatencyBudget < 0 || c.MemoryBudget < 0 && c.MemoryBudget != NoMemoryLimit || c.MaxIncomingStreams < 0 || c.MaxIncomingUniStreams < 0 ||
+	if c.LatencyBudget < 0 || c.InitialStreamReceiveWindow < 0 || c.MaxStreamReceiveWindow < 0 ||
+		c.InitialConnectionReceiveWindow < 0 || c.MaxConnectionReceiveWindow < 0 || c.SendBuffer < 0 || c.MaxSendBuffer < 0 ||
 		c.DatagramSendQueue < 0 || c.DatagramReceiveQueue < 0 || c.DatagramStreamQueue < 0 || c.DatagramReceiveBytes < 0 ||
 		c.MaxPipes < 0 || c.PipeHeadroom < 0 || c.ReplayWindow < 0 || c.MaxLanes < 0 || c.ResumeTimeout < 0 ||
-		c.JoinTimeout < 0 || c.JoinEarlyHello < 0 || c.RedialMinBackoff < 0 || c.RedialMaxBackoff < 0 ||
-		p.Probation < 0 || p.OverflowDelay < 0 ||
+		c.JoinTimeout < 0 || c.RedialMinBackoff < 0 || c.RedialMaxBackoff < 0 ||
+		p.OverflowDelay < 0 ||
 		p.SpreadChunk < 0 {
 		return cc, fmt.Errorf("%w: negative Config count, size or duration", ErrInvalidConfig)
 	}
@@ -552,16 +514,13 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	if lo, hi := c.redialBackoff(); lo > hi {
 		return cc, fmt.Errorf("%w: RedialMinBackoff %v above RedialMaxBackoff %v", ErrInvalidConfig, lo, hi)
 	}
-	if c.NoJoinEarlyHello && c.JoinEarlyHello != 0 {
-		return cc, fmt.Errorf("%w: JoinEarlyHello with NoJoinEarlyHello", ErrInvalidConfig)
-	}
 	if c.EarlyData.ZmuxPeer && role == core.RoleAuto {
 		return cc, fmt.Errorf("%w: EarlyData.ZmuxPeer with RoleAuto", ErrInvalidConfig)
 	}
 	cc.HandshakeTimeout = core.Duration(c.handshakeTimeout())
 	cc.JoinTimeout = core.Duration(c.joinTimeout())
 	cc.EpochPeriod, cc.EpochJoins = core.Duration(c.EpochPeriod), int64(c.EpochJoins)
-	cc.NoEpochAfterFirstPipe, cc.NoEpochAfterResume = c.NoEpochAfterFirstPipe, c.NoEpochAfterResume
+	cc.NoEpochAfterFirstPipe, cc.NoEpochAfterResume = !c.EpochAfterFirstPipe.On(), !c.EpochAfterResume.On()
 	switch {
 	case c.MaxIdleTimeout < 0:
 		l.Has &^= wire.HasIdle
@@ -571,37 +530,36 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	case c.MaxIdleTimeout > 0:
 		l.MaxIdleTimeout = uint64(c.MaxIdleTimeout / time.Millisecond)
 	}
-	lv := c.liveness()
-	clv, err := lv.core()
+	clv, err := c.Liveness.core()
 	if err != nil {
 		return cc, err
 	}
 	cc.SetLiveness(clv)
-	if v := c.InitialStreamReceiveWindow; v != 0 {
+	if v := uint64(c.InitialStreamReceiveWindow); v != 0 {
 		if v < 4096 {
 			return cc, fmt.Errorf("%w: InitialStreamReceiveWindow below 4 KiB", ErrInvalidConfig)
 		}
 		l.MaxStreamDataBidiLoc, l.MaxStreamDataBidiRem, l.MaxStreamDataUni = v, v, v
 	}
-	if v := c.InitialConnectionReceiveWindow; v != 0 {
+	if v := uint64(c.InitialConnectionReceiveWindow); v != 0 {
 		if v < 16384 {
 			return cc, fmt.Errorf("%w: InitialConnectionReceiveWindow below 16 KiB", ErrInvalidConfig)
 		}
 		l.InitialMaxData = v
 	}
-	cc.StreamWindowCap = c.MaxStreamReceiveWindow
-	cc.ConnWindowCap = c.MaxConnectionReceiveWindow
+	cc.StreamWindowCap = uint64(c.MaxStreamReceiveWindow)
+	cc.ConnWindowCap = uint64(c.MaxConnectionReceiveWindow)
 	if c.LatencyBudget > 0 {
 		cc.LatencyBudget = core.Duration(c.LatencyBudget)
 	}
 	switch {
-	case c.MemoryBudget == NoMemoryLimit:
+	case c.MemoryBudget < 0:
 		cc.MemoryBudget = 0 // unlimited
 	case c.MemoryBudget > 0:
 		cc.MemoryBudget = uint64(c.MemoryBudget)
 	}
 	switch {
-	case c.NoIncomingStreams:
+	case c.MaxIncomingStreams < 0:
 		l.MaxStreamsBidi = 0
 	case c.MaxIncomingStreams > 0:
 		if c.MaxIncomingStreams < 4 {
@@ -610,7 +568,7 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 		l.MaxStreamsBidi = uint64(c.MaxIncomingStreams)
 	}
 	switch {
-	case c.NoIncomingUniStreams:
+	case c.MaxIncomingUniStreams < 0:
 		cc.StagedUni, l.MaxStreamsUni = false, 0
 	case c.MaxIncomingUniStreams > 0:
 		cc.StagedUni, l.MaxStreamsUni = false, uint64(c.MaxIncomingUniStreams)
@@ -636,12 +594,12 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 		cc.DgramRecvSize = uint64(c.DatagramReceiveBytes)
 	}
 	if c.SendBuffer > 0 {
-		cc.SendBuffer = c.SendBuffer
+		cc.SendBuffer = uint64(c.SendBuffer)
 	}
-	if c.MaxSendBuffer != 0 && c.MaxSendBuffer < cc.SendBuffer {
+	if c.MaxSendBuffer != 0 && uint64(c.MaxSendBuffer) < cc.SendBuffer {
 		return cc, fmt.Errorf("%w: MaxSendBuffer %d below SendBuffer %d", ErrInvalidConfig, c.MaxSendBuffer, cc.SendBuffer)
 	}
-	cc.SendBufferMax = c.MaxSendBuffer
+	cc.SendBufferMax = uint64(c.MaxSendBuffer)
 	if c.MaxLanes > 0 {
 		l.MaxLanes = uint64(c.MaxLanes)
 	}
@@ -660,15 +618,13 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	cc.ReplayWindow = c.ReplayWindow
 	cc.Resume = core.Duration(c.ResumeTimeout)
 	switch {
-	case p.NoProbation && p.Probation != 0:
-		return cc, fmt.Errorf("%w: Probation with NoProbation", ErrInvalidConfig)
-	case p.NoProbation:
+	case p.Probation < 0:
 		cc.Probation = 0
-	case p.Probation != 0:
+	case p.Probation > 0:
 		cc.Probation = core.Duration(p.Probation)
 	}
 	cc.OverflowDelay = dur(p.OverflowDelay, time.Second)
-	cc.Redundancy = !p.NoRedundancy
+	cc.Redundancy = p.Redundancy.On()
 	if p.SpreadChunk > 0 {
 		cc.SpreadChunk = p.SpreadChunk
 	}
@@ -687,7 +643,7 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	cc.Declared = a.EndToEnd
 	cc.JoinEarlyHello = 8 << 10
 	switch {
-	case c.NoJoinEarlyHello:
+	case c.JoinEarlyHello < 0:
 		cc.JoinEarlyHello = 0
 	case c.JoinEarlyHello > 0:
 		cc.JoinEarlyHello = c.JoinEarlyHello

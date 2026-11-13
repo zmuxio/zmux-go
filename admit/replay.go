@@ -1,4 +1,4 @@
-package zmux
+package admit
 
 import (
 	"fmt"
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/djylb/timeshim"
+	"github.com/zmuxio/zmux-go"
 )
 
 // ReplayVerdict is the outcome of ReplayFilter.Check.
@@ -86,14 +87,14 @@ type replayBucket struct {
 }
 
 // NewReplayFilter returns a filter for c; an invalid c is an
-// ErrInvalidConfig error.
+// zmux.ErrInvalidConfig error.
 func NewReplayFilter(c ReplayConfig) (*ReplayFilter, error) {
 	w := c.Window.Milliseconds()
 	switch {
 	case w <= 0:
-		return nil, fmt.Errorf("%w: ReplayConfig.Window %v below 1ms", ErrInvalidConfig, c.Window)
+		return nil, fmt.Errorf("%w: ReplayConfig.Window %v below 1ms", zmux.ErrInvalidConfig, c.Window)
 	case c.Max <= 0:
-		return nil, fmt.Errorf("%w: ReplayConfig.Max %d", ErrInvalidConfig, c.Max)
+		return nil, fmt.Errorf("%w: ReplayConfig.Max %d", zmux.ErrInvalidConfig, c.Max)
 	}
 	width := max(w/4, 1)
 	// A key lives in the bucket of t+window: buckets from now-window+window

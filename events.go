@@ -29,7 +29,7 @@ const (
 	// Direction).
 	EventPipeFailed
 	// EventPipeClosed reports that a pipe direction ended: the outbound
-	// one closed (DirSendOnly) or the inbound one ended (DirReceiveOnly)
+	// one closed (DirectionSendOnly) or the inbound one ended (DirectionReceiveOnly)
 	// (Pipe, Direction). Retirement is reported by EventPipesRetired.
 	EventPipeClosed
 	// EventPipePriorityChanged reports that the effective tier, standby state
@@ -66,10 +66,10 @@ const (
 	// EventCapacityRestored reports that the outbound capacity is back above
 	// the CapacityFloor (DeliveryRate: the capacity).
 	EventCapacityRestored
-	// EventCarrierCandidate reports a try of a candidate of DialMode
+	// EventCarrierCandidate reports a try of a candidate of DialChoice
 	// (Carrier, Outcome).
 	EventCarrierCandidate
-	// EventCarrierChosen reports the carrier kind DialMode chose, and every
+	// EventCarrierChosen reports the carrier kind DialChoice chose, and every
 	// later switch to another kind (Carrier).
 	EventCarrierChosen
 	// EventPipesRetired is the one report of retirement (Retired, Failed,
@@ -140,8 +140,8 @@ type Event struct {
 	// pipe has one, and the candidate's of EventCarrierCandidate and
 	// EventCarrierChosen.
 	Variant string
-	// Pipe is the pipe ID of a pipe event.
-	Pipe uint64
+	// PipeID is the pipe ID of a pipe event.
+	PipeID PipeID
 	// Priority is the tier (EventPipePriorityChanged,
 	// EventTierSaturation); Weight the pipe's weight
 	// (EventPipePriorityChanged).
@@ -162,7 +162,7 @@ type Event struct {
 	// retired pipes, at most four, oldest first. An application that
 	// needs every retired ID compares Pipes with the handles it holds.
 	Retired, Failed, Closed, Dropped uint64
-	Last                             []uint64
+	Last                             []PipeID
 }
 
 // retiredLast is the number of IDs EventPipesRetired keeps.
@@ -230,10 +230,10 @@ func (e *eventQueue) push(ev Event) {
 	}
 	if terminal(ev.Kind) {
 		bit := dirOutEnded
-		if ev.Direction == DirReceiveOnly {
+		if ev.Direction == DirectionReceiveOnly {
 			bit = dirInEnded
 		}
-		e.mark(ev.Pipe, bit)
+		e.mark(uint64(ev.PipeID), bit)
 	}
 	e.q = append(e.q, ev)
 	e.fresh = append(e.fresh, ev)
@@ -268,7 +268,7 @@ func (e *eventQueue) retire(id uint64, failed bool) Event {
 	unreadEnd := outSeen && d&dirOutEnded == 0 || d&dirInSeen != 0 && d&dirInEnded == 0 ||
 		d&(dirInEnded|dirOutEnded) == 0
 	e.q = slices.DeleteFunc(e.q, func(x Event) bool {
-		if x.Pipe != id || !pipeEvent(x.Kind) {
+		if uint64(x.PipeID) != id || !pipeEvent(x.Kind) {
 			return false
 		}
 		unreadEnd = unreadEnd || terminal(x.Kind)
@@ -276,7 +276,7 @@ func (e *eventQueue) retire(id uint64, failed bool) Event {
 	})
 	delete(e.dirs, id)
 	delete(e.seenOut, id)
-	one := Event{Kind: EventPipesRetired, Retired: 1, Last: []uint64{id}}
+	one := Event{Kind: EventPipesRetired, Retired: 1, Last: []PipeID{PipeID(id)}}
 	if unreadEnd && failed {
 		one.Failed = 1
 	} else if unreadEnd {
@@ -293,7 +293,7 @@ func (e *eventQueue) retire(id uint64, failed bool) Event {
 	sum.Closed += one.Closed
 	sum.Dropped += e.dropped
 	e.dropped = 0
-	sum.Last = append(sum.Last, id)
+	sum.Last = append(sum.Last, PipeID(id))
 	if n := len(sum.Last); n > retiredLast {
 		sum.Last = append(sum.Last[:0], sum.Last[n-retiredLast:]...)
 	}
@@ -349,14 +349,14 @@ func (c *Conn) drainEventsLocked() {
 		case core.EvTierSaturation:
 			q.push(Event{Kind: EventTierSaturation, Priority: e.Code, Saturated: e.Saturated})
 		case core.EvPipeQuality:
-			q.push(Event{Kind: EventPipeQualityChanged, Pipe: e.Pipe, SmoothedRTT: time.Duration(e.RTT),
+			q.push(Event{Kind: EventPipeQualityChanged, PipeID: PipeID(e.Pipe), SmoothedRTT: time.Duration(e.RTT),
 				DeliveryRate: e.Rate, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
 		case core.EvCapacityBelow:
 			q.push(Event{Kind: EventCapacityBelow, DeliveryRate: e.Rate})
 		case core.EvCapacityRestored:
 			q.push(Event{Kind: EventCapacityRestored, DeliveryRate: e.Rate})
 		case core.EvPipePriority:
-			q.push(Event{Kind: EventPipePriorityChanged, Pipe: e.Pipe, Priority: e.Code, Standby: e.Saturated,
+			q.push(Event{Kind: EventPipePriorityChanged, PipeID: PipeID(e.Pipe), Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
 		case core.EvPipeAttached:
 			c.firePipeWaiters() // WaitAttached and the pool
@@ -425,7 +425,7 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 			q.fresh = append(q.fresh, q.retire(e.Pipe, e.Failed))
 		case core.InEnded:
 			if q.dirs[e.Pipe]&dirInEnded == 0 {
-				q.push(Event{Kind: EventPipeClosed, Pipe: e.Pipe, Direction: DirReceiveOnly,
+				q.push(Event{Kind: EventPipeClosed, PipeID: PipeID(e.Pipe), Direction: DirectionReceiveOnly,
 					Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
 			}
 		case core.InNone:
@@ -439,7 +439,7 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 	prev, seen := q.seenOut[e.Pipe]
 	q.seenOut[e.Pipe] = e.OutState
 	if !seen {
-		q.push(Event{Kind: EventPipeAdded, Pipe: e.Pipe, Direction: DirSendOnly, Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
+		q.push(Event{Kind: EventPipeAdded, PipeID: PipeID(e.Pipe), Direction: DirectionSendOnly, Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
 	}
 	var k EventKind
 	switch e.OutState {
@@ -459,7 +459,7 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 		// reported once it settles, retirement by EventPipesRetired.
 	}
 	if k != 0 && prev != e.OutState {
-		q.push(Event{Kind: k, Pipe: e.Pipe, Direction: DirSendOnly, Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
+		q.push(Event{Kind: k, PipeID: PipeID(e.Pipe), Direction: DirectionSendOnly, Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
 	}
 }
 

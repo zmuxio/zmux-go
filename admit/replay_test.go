@@ -1,4 +1,4 @@
-package zmux
+package admit
 
 import (
 	"encoding/hex"
@@ -8,11 +8,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zmuxio/zmux-go"
 )
 
 // TestReplayFilterVectors checks the shared vectors.
 func TestReplayFilterVectors(t *testing.T) {
-	raw, err := os.ReadFile("testdata/replay.json")
+	raw, err := os.ReadFile("../testdata/replay.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +58,7 @@ func TestReplayFilterVectors(t *testing.T) {
 
 func TestReplayFilterConfig(t *testing.T) {
 	for _, c := range []ReplayConfig{{}, {Window: time.Second}, {Max: 1}, {Window: time.Microsecond, Max: 1}} {
-		if _, err := NewReplayFilter(c); !errors.Is(err, ErrInvalidConfig) {
+		if _, err := NewReplayFilter(c); !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Fatalf("%+v: %v", c, err)
 		}
 	}

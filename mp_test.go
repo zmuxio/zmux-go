@@ -31,7 +31,7 @@ type mpEnv struct {
 
 func mpConfig() *Config {
 	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true},
-		SchedulerParams: SchedulerParams{NoProbation: true}}
+		SchedulerParams: SchedulerParams{Probation: -1}}
 }
 
 func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
@@ -135,7 +135,7 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 		t.Fatal("multipath not negotiated")
 	}
 	p2 := e.addPipe(t, PipeOptions{})
-	e.client.SetScheduler(SpreadRoundRobin())
+	e.client.SetScheduler(SchedulerSpreadRoundRobin())
 
 	payload := make([]byte, 4<<20)
 	_, _ = rand.Read(payload)
@@ -237,7 +237,7 @@ func TestMultipathEventsAndStats(t *testing.T) {
 		t.Fatalf("pipes active %d, added %d, want 2, 2", cs.PipesActive, cs.PipesAdded)
 	}
 	for _, ps := range e.server.PipeStats() {
-		if ps.Pipe != 0 && ps.Local {
+		if ps.PipeID != 0 && ps.Local {
 			t.Fatalf("the acceptor reports the peer's join as its own: %+v", ps)
 		}
 	}
@@ -250,7 +250,7 @@ func TestMultipathEventsAndStats(t *testing.T) {
 			t.Fatal(err)
 		}
 		if ev.Kind == EventPipePriorityChanged {
-			if ev.Pipe != p.ID() || ev.Priority != 5 {
+			if ev.PipeID != p.ID() || ev.Priority != 5 {
 				t.Fatalf("event %+v", ev)
 			}
 			break
@@ -264,7 +264,7 @@ func TestMultipathEventsAndStats(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ev.Kind == EventPipeClosed && ev.Pipe == p.ID() ||
+		if ev.Kind == EventPipeClosed && ev.PipeID == p.ID() ||
 			ev.Kind == EventPipesRetired && slices.Contains(ev.Last, p.ID()) {
 			break
 		}
@@ -375,14 +375,14 @@ func TestClearRedundant(t *testing.T) {
 func TestPipeStatsAbsentDirection(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, mpConfig(), mpConfig())
-	p := e.addPipe(t, PipeOptions{Direction: DirSendOnly})
+	p := e.addPipe(t, PipeOptions{Direction: DirectionSendOnly})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var peer PipeStats
 	for {
 		var found bool
 		for _, ps := range e.server.PipeStats() {
-			if ps.Pipe == p.ID() && ps.Inbound == InboundOpen && ps.BytesReceived > 0 {
+			if ps.PipeID == p.ID() && ps.Inbound == InboundOpen && ps.BytesReceived > 0 {
 				peer, found = ps, true
 			}
 		}
@@ -394,7 +394,7 @@ func TestPipeStatsAbsentDirection(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	want := PipeStats{Pipe: peer.Pipe, Local: peer.Local, PeerAttached: peer.PeerAttached, FateGroup: peer.FateGroup, Label: peer.Label,
+	want := PipeStats{PipeID: peer.PipeID, Local: peer.Local, PeerAttached: peer.PeerAttached, FateGroup: peer.FateGroup, Label: peer.Label,
 		Carrier: peer.Carrier, Inbound: peer.Inbound, AttachedFor: peer.AttachedFor,
 		FailureCount: peer.FailureCount, Failure: peer.Failure, ReceivePriority: peer.ReceivePriority,
 		ReceiveStandby: peer.ReceiveStandby, RequestSeq: peer.RequestSeq, BytesReceived: peer.BytesReceived,
@@ -433,7 +433,7 @@ func TestRetiredPipeHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitUntil(t, 5*time.Second, "the pipe retired", func() bool { _, ok := p.Stats(); return !ok })
-	for name, err := range map[string]error{"SetWeight": p.SetWeight(2), "SetSendPriority": p.SetSendPriority(1),
+	for name, err := range map[string]error{"SetWeight": p.Update(PipeUpdate{Weight: Set[uint64](2)}), "SetSendPriority": p.SetSendPriority(1),
 		"Revalidate": p.Revalidate(), "Close": p.Close(), "Abort": p.Abort(nil)} {
 		if !errors.Is(err, ErrPipeGone) {
 			t.Errorf("%s on a retired pipe: %v", name, err)
@@ -461,7 +461,7 @@ func TestPipesRetiredEvent(t *testing.T) {
 		if err != nil {
 			break
 		}
-		if ev.Pipe == p.ID() && pipeEvent(ev.Kind) {
+		if ev.PipeID == p.ID() && pipeEvent(ev.Kind) {
 			t.Fatalf("event %v of the retired pipe", ev.Kind)
 		}
 		if ev.Kind == EventPipesRetired {
@@ -469,7 +469,7 @@ func TestPipesRetiredEvent(t *testing.T) {
 			break
 		}
 	}
-	if sum == nil || sum.Retired != 1 || sum.Failed != 1 || !slices.Equal(sum.Last, []uint64{p.ID()}) {
+	if sum == nil || sum.Retired != 1 || sum.Failed != 1 || !slices.Equal(sum.Last, []PipeID{p.ID()}) {
 		t.Fatalf("summary %+v", sum)
 	}
 }

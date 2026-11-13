@@ -7,8 +7,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -21,7 +19,7 @@ import (
 )
 
 // decideWith is an Admission whose every decision is v, counted in n.
-func decideWith(v Verdict, n *atomic.Int32) *Admission {
+func decideWith(v AdmissionVerdict, n *atomic.Int32) *Admission {
 	return &Admission{PeekTimeout: 5 * time.Second, StallMin: time.Millisecond, StallMax: time.Millisecond,
 		Decide: func(context.Context, *CarrierInfo, []byte) Decision {
 			n.Add(1)
@@ -83,38 +81,6 @@ func TestAdmissionEveryEntry(t *testing.T) {
 	_ = lst.HandlePipe(ctx, NetPipe(a), PipeHint{})
 	_ = b.Close()
 	expect("HandlePipe")
-	// HTTP carriers and the exchange carrier.
-	hh, err := NewHTTPHandler(lst, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ex := newExHandler(t, lst, nil, &HTTPExchangeConfig{PSK: make([]byte, 32)})
-	defer func() { _ = ex.Close() }()
-	srv := httptest.NewServer(&HTTPEndpoint{Stream: hh, Exchange: ex})
-	defer srv.Close()
-	dctx, dcancel := context.WithTimeout(ctx, 2*time.Second)
-	defer dcancel()
-	fresh := func() context.Context {
-		dcancel()
-		dctx, dcancel = context.WithTimeout(ctx, 2*time.Second)
-		return dctx
-	}
-	if p, err := HTTPPipe(dctx, srv.Client(), srv.URL, nil, DirBidirectional, nil); err == nil {
-		_, _ = Start(dctx, p, RoleClient, mpConfig())
-	}
-	expect("streaming")
-	fresh()
-	if p, err := HTTPSplitPipe(dctx, srv.Client(), srv.URL, nil, nil); err == nil {
-		_, _ = Start(dctx, p, RoleClient, mpConfig())
-	}
-	waitUntil(t, 5*time.Second, "split", func() bool { return decided.Load() >= want+1 })
-	want = decided.Load()
-	fresh()
-	if p, err := HTTPExchangePipe(dctx, srv.Client(), srv.URL, &HTTPExchangeConfig{PSK: make([]byte, 32)}); err == nil {
-		_, _ = Start(dctx, p, RoleClient, mpConfig())
-	}
-	waitUntil(t, 5*time.Second, "exchange", func() bool { return decided.Load() > want })
-	srv.Client().Transport.(*http.Transport).CloseIdleConnections()
 	if st := lst.Stats(); st.Sessions != 0 || st.Admission.Closed != uint64(decided.Load()) {
 		t.Fatalf("stats %+v after %d decisions", st, decided.Load())
 	}
@@ -245,7 +211,7 @@ func TestAdmissionStats(t *testing.T) {
 	var n atomic.Int32
 	for _, x := range []struct {
 		name string
-		v    Verdict
+		v    AdmissionVerdict
 		fb   bool
 		want AdmissionStats
 	}{
@@ -253,7 +219,7 @@ func TestAdmissionStats(t *testing.T) {
 		{"fallback without target", VerdictFallback, false, AdmissionStats{Fallback: 1}},
 		{"stall", VerdictStall, false, AdmissionStats{Stalled: 1}},
 		{"close", VerdictClose, false, AdmissionStats{Closed: 1}},
-		{"unknown", Verdict(9), false, AdmissionStats{Closed: 1}},
+		{"unknown", AdmissionVerdict(9), false, AdmissionStats{Closed: 1}},
 	} {
 		var fb func(context.Context, net.Conn)
 		if x.fb {

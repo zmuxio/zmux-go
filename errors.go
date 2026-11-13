@@ -108,16 +108,17 @@ func (e *IdleTimeoutError) Is(t error) bool {
 func (e *IdleTimeoutError) Timeout() bool { return true }
 
 // HandshakeTimeoutError reports that the peer's transport parameters did not
-// arrive within Config.HandshakeTimeout. It matches ErrHandshakeTimeout,
-// net.ErrClosed and os.ErrDeadlineExceeded.
+// arrive within Config.HandshakeTimeout: the session was never
+// established. It matches ErrHandshakeTimeout and os.ErrDeadlineExceeded,
+// not net.ErrClosed, which the ends of established sessions match.
 type HandshakeTimeoutError struct{}
 
 // Error describes the timeout.
 func (e *HandshakeTimeoutError) Error() string { return "zmux: handshake timeout" }
 
-// Is matches ErrHandshakeTimeout, net.ErrClosed and os.ErrDeadlineExceeded.
+// Is matches ErrHandshakeTimeout and os.ErrDeadlineExceeded.
 func (e *HandshakeTimeoutError) Is(t error) bool {
-	return t == ErrHandshakeTimeout || t == net.ErrClosed || t == os.ErrDeadlineExceeded
+	return t == ErrHandshakeTimeout || t == os.ErrDeadlineExceeded
 }
 
 // Timeout reports true.
@@ -275,6 +276,10 @@ var (
 	ErrJoinPending = errors.New("zmux: join pending")
 	// ErrJoinRefused is returned by AddPipe when the peer's Reply refused the join.
 	ErrJoinRefused = errors.New("zmux: join refused")
+	// ErrCarrierRefused matches an error by which the server or an
+	// intermediary refused a carrier, such as an HTTP status other than 2xx
+	// or a redirect not followed; a carrier choice counts the try as refused.
+	ErrCarrierRefused = errors.New("zmux: carrier refused")
 	// ErrJoinSecretSet is returned by a second Conn.SetJoinSecret.
 	ErrJoinSecretSet = errors.New("zmux: join secret already set")
 	// ErrNoExporter is returned by Conn.ExportKeyingMaterial when the

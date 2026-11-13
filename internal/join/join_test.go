@@ -369,3 +369,31 @@ func TestReservedTypeFourSkipped(t *testing.T) {
 		t.Fatal(rp, err)
 	}
 }
+
+// TestAcceptBindingLength checks that an acceptor's Binding of the wrong
+// length is a configuration error, while a missing one in Bound fails the
+// Hello as ErrAuth.
+func TestAcceptBindingLength(t *testing.T) {
+	su, _ := LookupSuite(SuiteAES)
+	psk, _ := PSK(su, bytes.Repeat([]byte{1}, 32), RoleResponder, testSuites)
+	b := bytes.Repeat([]byte{7}, BindingLen)
+	j, _ := NewJoiner(JoinerConfig{Suite: su, Group: testGroup, Mode: Bound, Framing: Message, Locator: []byte("l"), PSK: psk, Binding: b})
+	w, err := j.WriteHello(nil, HelloPayload{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, _, _ := ParseHello(w, Message)
+	for _, n := range []int{1, BindingLen - 1, BindingLen + 1} {
+		if _, _, err := Accept(h, Message, psk, b[:min(n, BindingLen)], anyGroup); n > BindingLen {
+			_, _, err = Accept(h, Message, psk, append(bytes.Clone(b), 0), anyGroup)
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("binding of %d bytes: %v", n, err)
+			}
+		} else if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("binding of %d bytes: %v", n, err)
+		}
+	}
+	if _, _, err := Accept(h, Message, psk, nil, anyGroup); !errors.Is(err, ErrAuth) {
+		t.Fatalf("no binding: %v", err)
+	}
+}

@@ -14,22 +14,22 @@ import (
 // read counts as retired only.
 func TestEventQueueRetirement(t *testing.T) {
 	var q eventQueue
-	q.push(Event{Kind: EventPipeAdded, Pipe: 2})
-	q.push(Event{Kind: EventPipeFailed, Pipe: 2})
+	q.push(Event{Kind: EventPipeAdded, PipeID: 2})
+	q.push(Event{Kind: EventPipeFailed, PipeID: 2})
 	q.push(Event{Kind: EventSessionResumed})
-	q.push(Event{Kind: EventPipeClosed, Pipe: 4})
+	q.push(Event{Kind: EventPipeClosed, PipeID: 4})
 	q.retire(2, true)  // its failure unread
 	q.retire(4, false) // its end unread
 	if len(q.q) != 2 || q.q[0].Kind != EventSessionResumed || q.q[1].Kind != EventPipesRetired {
 		t.Fatalf("queue %+v", q.q)
 	}
 	sum := q.q[1]
-	if sum.Retired != 2 || sum.Failed != 1 || sum.Closed != 0+1 || !slices.Equal(sum.Last, []uint64{2, 4}) {
+	if sum.Retired != 2 || sum.Failed != 1 || sum.Closed != 0+1 || !slices.Equal(sum.Last, []PipeID{2, 4}) {
 		t.Fatalf("summary %+v", sum)
 	}
 	q.q = nil // read
 	// A pipe whose terminal event was read: retired only.
-	q.push(Event{Kind: EventPipeClosed, Pipe: 6})
+	q.push(Event{Kind: EventPipeClosed, PipeID: 6})
 	q.q = nil
 	q.retire(6, false)
 	for id := uint64(8); id <= 14; id += 2 {
@@ -39,15 +39,15 @@ func TestEventQueueRetirement(t *testing.T) {
 		t.Fatalf("one summary expected: %+v", q.q)
 	}
 	sum = q.q[0]
-	if sum.Retired != 5 || sum.Closed != 4 || sum.Failed != 0 || !slices.Equal(sum.Last, []uint64{8, 10, 12, 14}) {
+	if sum.Retired != 5 || sum.Closed != 4 || sum.Failed != 0 || !slices.Equal(sum.Last, []PipeID{8, 10, 12, 14}) {
 		t.Fatalf("summary %+v", sum)
 	}
 	// The bound drops non-terminal events, keeps terminal ones and the
 	// summary, and the next summary carries the drops.
 	q.q = nil
-	q.push(Event{Kind: EventPipeFailed, Pipe: 20})
+	q.push(Event{Kind: EventPipeFailed, PipeID: 20})
 	for range eventQueueMax + 9 {
-		q.push(Event{Kind: EventPipeQualityChanged, Pipe: 22})
+		q.push(Event{Kind: EventPipeQualityChanged, PipeID: 22})
 	}
 	if len(q.q) != eventQueueMax || q.q[0].Kind != EventPipeFailed {
 		t.Fatalf("bound: %d events, first %v", len(q.q), q.q[0].Kind)
@@ -57,7 +57,7 @@ func TestEventQueueRetirement(t *testing.T) {
 	if i < 0 || q.q[i].Dropped != 10 {
 		t.Fatalf("drops not reported: %+v", q.q[i:])
 	}
-	if slices.ContainsFunc(q.q, func(x Event) bool { return x.Pipe == 22 && pipeEvent(x.Kind) }) {
+	if slices.ContainsFunc(q.q, func(x Event) bool { return x.PipeID == 22 && pipeEvent(x.Kind) }) {
 		t.Fatal("a retired pipe's events stayed queued")
 	}
 }
@@ -69,10 +69,10 @@ func TestEventQueueBoundKeepsSummary(t *testing.T) {
 	var q eventQueue
 	q.retire(1, false)
 	for id := uint64(2); len(q.q) < eventQueueMax; id += 2 {
-		q.push(Event{Kind: EventPipeClosed, Pipe: id})
+		q.push(Event{Kind: EventPipeClosed, PipeID: PipeID(id)})
 	}
-	q.push(Event{Kind: EventPipeQualityChanged, Pipe: 3})
-	q.push(Event{Kind: EventPipeFailed, Pipe: 5})
+	q.push(Event{Kind: EventPipeQualityChanged, PipeID: 3})
+	q.push(Event{Kind: EventPipeFailed, PipeID: 5})
 	if len(q.q) != eventQueueMax+1 || q.q[0].Kind != EventPipesRetired || q.q[0].Dropped != 1 ||
 		q.q[len(q.q)-1].Kind != EventPipeFailed {
 		t.Fatalf("%d events, first %+v, last %v", len(q.q), q.q[0], q.q[len(q.q)-1].Kind)
@@ -84,9 +84,9 @@ func TestEventQueueBoundKeepsSummary(t *testing.T) {
 	q = eventQueue{}
 	q.retire(1, false)
 	for len(q.q) < eventQueueMax {
-		q.push(Event{Kind: EventPipeQualityChanged, Pipe: 3})
+		q.push(Event{Kind: EventPipeQualityChanged, PipeID: 3})
 	}
-	q.push(Event{Kind: EventPipeQualityChanged, Pipe: 3})
+	q.push(Event{Kind: EventPipeQualityChanged, PipeID: 3})
 	if q.q[0].Kind != EventPipesRetired || q.q[0].Dropped != 1 || q.dropped != 0 {
 		t.Fatalf("summary %+v, pending drops %d", q.q[0], q.dropped)
 	}
@@ -99,8 +99,8 @@ func TestEventQueueRetireUnreadDirection(t *testing.T) {
 	var q eventQueue
 	q.seenOut = map[uint64]core.OutState{2: core.OutActive, 4: core.OutFailed}
 	q.mark(2, dirInSeen)
-	q.push(Event{Kind: EventPipeClosed, Pipe: 2, Direction: DirReceiveOnly})
-	q.push(Event{Kind: EventPipeFailed, Pipe: 4, Direction: DirSendOnly})
+	q.push(Event{Kind: EventPipeClosed, PipeID: 2, Direction: DirectionReceiveOnly})
+	q.push(Event{Kind: EventPipeFailed, PipeID: 4, Direction: DirectionSendOnly})
 	q.mark(6, dirInSeen) // inbound only, its end never queued
 	q.q = nil            // read
 	q.retire(2, false)

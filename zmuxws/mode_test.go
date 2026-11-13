@@ -11,30 +11,31 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 // TestDialModeProfiles serves every HTTP carrier kind on one target
-// (zmux.HTTPEndpoint) and dials it in auto mode, WebSocket preferred,
+// (zmuxhttp.Endpoint) and dials it in auto mode, WebSocket preferred,
 // directly and through each proxy profile: the most preferred kind that
 // the path passes is chosen.
 func TestDialModeProfiles(t *testing.T) {
 	psk := bytes.Repeat([]byte{3}, 32)
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
-	o := &zmux.HTTPOptions{Next: next}
-	stream, err := zmux.NewHTTPHandler(l, o)
+	o := &zmuxhttp.Options{Next: next}
+	stream, err := zmuxhttp.NewHandler(l, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex, err := zmux.NewHTTPExchangeHandler(l, o, &zmux.HTTPExchangeConfig{PSK: psk, HoldTime: time.Second})
+	ex, err := zmuxhttp.NewExchangeHandler(l, o, &zmuxhttp.ExchangeConfig{PSK: psk, HoldTime: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ws, err := Handler(l, o)
+	ws, err := NewHandler(l, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(&zmux.HTTPEndpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
+	srv := httptest.NewServer(&zmuxhttp.Endpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
 	ctx, cancel := context.WithCancel(context.Background())
 	accepted := make(chan *zmux.Conn, 8)
 	done := make(chan struct{})
@@ -78,15 +79,15 @@ func TestDialModeProfiles(t *testing.T) {
 			}
 			cands := []zmux.Candidate{
 				Candidate("ws"+strings.TrimPrefix(u, "http")+"/zmux", nil),
-				zmux.StreamingCandidate(hc, u+"/zmux", nil),
-				zmux.ExchangeCandidate(hc, u+"/zmux", &zmux.HTTPExchangeConfig{PSK: psk}),
+				zmuxhttp.StreamCandidate(hc, u+"/zmux", nil),
+				zmuxhttp.ExchangeCandidate(hc, u+"/zmux", &zmuxhttp.ExchangeConfig{PSK: psk}),
 			}
 			dctx, dcancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer dcancel()
 			cfg := mpConfig()
 			cfg.HandshakeTimeout = 3 * time.Second
-			conn, err := zmux.DialMode(dctx, zmux.AutoMode(cands...), cfg,
-				&zmux.ModePolicy{TimerMin: 400 * time.Millisecond, TimerMax: time.Second, NoJoin: true})
+			conn, err := zmux.DialChoice(dctx, zmux.AutoChoice(cands...), cfg,
+				&zmux.CarrierChoicePolicy{TimerMin: 400 * time.Millisecond, TimerMax: time.Second, Join: zmux.SwitchOff})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -107,8 +108,8 @@ func TestDialModeProfiles(t *testing.T) {
 	// other kind is tried.
 	px := zmuxtest.New(srv.URL, zmuxtest.NginxDefaults())
 	defer px.Close()
-	_, err = zmux.DialMode(context.Background(), zmux.ExplicitMode(Candidate("ws"+strings.TrimPrefix(px.URL, "http")+"/zmux", nil)), mpConfig(), nil)
-	var me *zmux.ModeError
+	_, err = zmux.DialChoice(context.Background(), zmux.ExplicitChoice(Candidate("ws"+strings.TrimPrefix(px.URL, "http")+"/zmux", nil)), mpConfig(), nil)
+	var me *zmux.CarrierChoiceError
 	if !errors.As(err, &me) || len(me.Results) != 1 || me.Results[0].Outcome != zmux.CandidateRefused {
 		t.Fatalf("explicit WebSocket: %v", err)
 	}

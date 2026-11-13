@@ -26,7 +26,7 @@ import (
 //     or 2) and report its source as their RemoteAddr. Serve it with
 //     Listener.Serve or an http.Server.
 //   - A forwarding header field on HTTP carriers (Header): set
-//     HTTPOptions.Trusted for the HTTP
+//     zmuxhttp.Options.Trusted for the HTTP
 //     adapters to read it on requests from a trusted address.
 //
 // The fields are read when an adapter is set up; a TrustedProxies must not
@@ -106,7 +106,9 @@ func (t *TrustedProxies) Source(r *http.Request, peer netip.AddrPort) netip.Addr
 	return t.resolver().Resolve(peer, r.Header).Addr // a nil resolver returns peer
 }
 
-func (t *TrustedProxies) validate() error {
+// Validate checks t (nil is valid) and builds its prefix set; the
+// adapters call it when they are set up.
+func (t *TrustedProxies) Validate() error {
 	if t == nil {
 		return nil
 	}
@@ -130,10 +132,10 @@ func (t *TrustedProxies) Listener(ln net.Listener) net.Listener {
 	return &proxyproto.Listener{Listener: ln, PolicyFor: proxyproto.TrustPrefixes(t.Prefixes...)}
 }
 
-// requestSource returns the source and the peer of r: the peer is
+// RequestSource returns the source and the peer of r: the peer is
 // r.RemoteAddr (zero when it is not an IP address and port, such as a Unix
-// socket), the source what t.Source resolves from it.
-func requestSource(t *TrustedProxies, r *http.Request) (source, peer netip.AddrPort) {
+// socket), the source what t.Source resolves from it (a nil t: the peer).
+func (t *TrustedProxies) RequestSource(r *http.Request) (source, peer netip.AddrPort) {
 	peer, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
 		return netip.AddrPort{}, netip.AddrPort{}

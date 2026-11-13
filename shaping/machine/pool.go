@@ -214,6 +214,15 @@ func metricOf(k metric, m *zmux.PoolMember) uint64 {
 	return x
 }
 
+// memberKey names member m of v: its fate group in a carrier.Pool, its pipe
+// ID in a PipePool.
+func memberKey(v *zmux.PoolView, m *zmux.PoolMember) uint64 {
+	if v.Connections {
+		return m.FateGroup
+	}
+	return uint64(m.PipeID)
+}
+
 // Decide sets d as the policy states, and d.Recheck to the earliest of the
 // time until an age or idle rule of a member not retired would hold and the
 // time until the dial wait after the last dial elapses (0: neither).
@@ -225,7 +234,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 	}
 	clear(p.seen)
 	for i := range v.Members {
-		p.seen[v.Members[i].ID] = true
+		p.seen[memberKey(v, &v.Members[i])] = true
 	}
 	for id := range p.members {
 		if !p.seen[id] {
@@ -245,11 +254,15 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 		d.DialAfter = micros(x)
 	}
 	if s.probeInterval.set {
-		d.ProbeInterval = micros(s.probeInterval.drawTable(p.src))
-		d.DisableIdleProbe = d.ProbeInterval == 0
+		d.Liveness.ProbeInterval = micros(s.probeInterval.drawTable(p.src))
+		if d.Liveness.ProbeInterval == 0 {
+			d.Liveness.ProbeInterval = -1 // off
+		}
 		if s.hasProbeJit {
-			d.ProbeJitter = float64(s.probeJitter) / 1e6
-			d.NoProbeJitter = s.probeJitter == 0
+			d.Liveness.ProbeJitter = float64(s.probeJitter) / 1e6
+			if s.probeJitter == 0 {
+				d.Liveness.ProbeJitter = -1 // no jitter
+			}
 		}
 	}
 	var recheck time.Duration
@@ -264,10 +277,11 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 	if len(s.retire) > 0 {
 		for i := range v.Members {
 			m := &v.Members[i]
-			if !p.seen[m.ID] { // a repeated ID, retired already
+			key := memberKey(v, m)
+			if !p.seen[key] { // a repeated ID, retired already
 				continue
 			}
-			pm := p.members[m.ID]
+			pm := p.members[key]
 			if pm == nil {
 				pm = &poolMember{above: make([]uint64, len(s.retire)), has: make([]bool, len(s.retire)), u: make([]uint64, len(s.retire))}
 				for j := range s.retire {
@@ -275,7 +289,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 						pm.u[j] = p.src.Uint64()
 					}
 				}
-				p.members[m.ID] = pm
+				p.members[key] = pm
 			}
 			var soon time.Duration
 			for j := range s.retire {
@@ -294,8 +308,12 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 					above = jitterWith(above, r.jitter, pm.u[j])
 				}
 				if x > above {
-					d.Retire = append(d.Retire, m.ID)
-					p.seen[m.ID] = false
+					if v.Connections {
+						d.RetireConnections = append(d.RetireConnections, m.FateGroup)
+					} else {
+						d.RetirePipes = append(d.RetirePipes, m.PipeID)
+					}
+					p.seen[key] = false
 					soon = 0
 					break
 				}

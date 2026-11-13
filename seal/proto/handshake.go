@@ -84,8 +84,12 @@ func newHandshake(cfg Config, initiator bool, pat *pattern, genKey func() (keypa
 	if pat.hasPSK() != (len(cfg.PSK) == pat.suite.pskLen) {
 		return nil, fmt.Errorf("%w: pre-shared key", ErrInvalidConfig)
 	}
-	// Only a sender judges its Binding here: a responder fails as ErrAuth when it reads.
-	if initiator && ((cfg.Mode == Bound && len(cfg.Binding) != BoundExporterLen) || (cfg.Mode != Bound && len(cfg.Binding) != 0)) {
+	// In Bound a Binding is exactly BoundExporterLen bytes on both ends; a
+	// responder may lack one and then fails as ErrAuth when it reads. A
+	// sender has none outside Bound; a responder's surplus Binding fails
+	// as ErrAuth, its prologue differing from the sender's.
+	if (cfg.Mode == Bound && len(cfg.Binding) != BoundExporterLen && (initiator || len(cfg.Binding) != 0)) ||
+		(initiator && cfg.Mode != Bound && len(cfg.Binding) != 0) {
 		return nil, fmt.Errorf("%w: binding", ErrInvalidConfig)
 	}
 	hs := &Handshake{pat: pat, cfg: cfg, initiator: initiator, genKey: genKey}

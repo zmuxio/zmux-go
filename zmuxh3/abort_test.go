@@ -50,7 +50,7 @@ func TestAbortReleasesSessionGoneWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = sess.CloseWithError(0, "") }()
-	pio, err := OpenPipe(ctx, sess)
+	pio, err := SessionPipe(ctx, sess)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,7 +13,7 @@ func TestSinceLastTraffic(t *testing.T) {
 	t.Parallel()
 	cfg := func() *Config {
 		c := mpConfig()
-		c.SchedulerParams.ProbeInterval = time.Second
+		c.Liveness.ProbeInterval = time.Second
 		return c
 	}
 	e := newMPEnv(t, cfg(), cfg())

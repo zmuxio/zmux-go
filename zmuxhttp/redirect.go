@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"context"
@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+
+	"github.com/zmuxio/zmux-go"
 )
 
 // Redirects of HTTP carriers: a carrier
@@ -16,27 +18,30 @@ import (
 // from https to http, so that no credential, pairing token, join frame or
 // prefix reaches another origin.
 
-// DefaultHTTPRedirects is the number of redirects an HTTP carrier request
+// DefaultRedirects is the number of redirects an HTTP carrier request
 // follows unless its client's CheckRedirect decides (or, for a WebSocket,
 // its dial options set another bound).
-const DefaultHTTPRedirects = 5
+const DefaultRedirects = 5
 
-// HTTPRedirectError reports a redirect that an HTTP carrier did not
+// RedirectError reports a redirect that an HTTP carrier did not
 // follow: to another host, from https to http, one that would change a
 // POST into a GET, past the bound, or without a valid Location.
-type HTTPRedirectError struct {
+type RedirectError struct {
 	StatusCode int
 	Location   string
 	Reason     string
 }
 
-func (e *HTTPRedirectError) Error() string {
+func (e *RedirectError) Error() string {
 	return "zmux: HTTP carrier redirect " + strconv.Itoa(e.StatusCode) + " to " + strconv.Quote(e.Location) + " refused: " + e.Reason
 }
 
-// IsHTTPRedirect reports whether status is a redirect an HTTP carrier
+// Is matches zmux.ErrCarrierRefused.
+func (e *RedirectError) Is(target error) bool { return target == zmux.ErrCarrierRefused }
+
+// IsRedirect reports whether status is a redirect an HTTP carrier
 // considers (301, 302, 303, 307, 308).
-func IsHTTPRedirect(status int) bool {
+func IsRedirect(status int) bool {
 	switch status {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
 		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
@@ -45,18 +50,18 @@ func IsHTTPRedirect(status int) bool {
 	return false
 }
 
-// CheckHTTPRedirect decides whether a carrier request with method to from,
+// CheckRedirect decides whether a carrier request with method to from,
 // answered with the redirect status and location, is repeated at the URL
 // it returns, with the same method, fields and body. It refuses, with an
-// *HTTPRedirectError, a redirect to another host name, from a secure
+// *RedirectError, a redirect to another host name, from a secure
 // scheme (https, wss) to an insecure one, to another port without a
 // scheme upgrade, and a 301, 302 or 303 of a request other than GET
 // unless it is a pure scheme upgrade (the same host, path and query over
 // https). The schemes ws and wss count as http and https; the result
-// keeps the family of from. status must satisfy IsHTTPRedirect.
-func CheckHTTPRedirect(from *url.URL, method string, status int, location string) (*url.URL, error) {
+// keeps the family of from. status must satisfy IsRedirect.
+func CheckRedirect(from *url.URL, method string, status int, location string) (*url.URL, error) {
 	refuse := func(reason string) (*url.URL, error) {
-		return nil, &HTTPRedirectError{StatusCode: status, Location: location, Reason: reason}
+		return nil, &RedirectError{StatusCode: status, Location: location, Reason: reason}
 	}
 	if location == "" {
 		return refuse("no Location")
@@ -136,20 +141,20 @@ func effectivePort(u *url.URL, secure bool) string {
 	return "80"
 }
 
-// HTTPTarget is the URL of a carrier candidate and the URL that redirects
+// Target is the URL of a carrier candidate and the URL that redirects
 // last led it to: later carriers of the candidate start from the final
-// URL, and DialMode remembers it per server in its CarrierCache. It is
+// URL, and zmux.DialChoice remembers it per server in its zmux.CarrierCache. It is
 // safe for concurrent use.
-type HTTPTarget struct {
+type Target struct {
 	base string
 	cur  atomic.Pointer[string]
 }
 
-// NewHTTPTarget returns a target at rawURL.
-func NewHTTPTarget(rawURL string) *HTTPTarget { return &HTTPTarget{base: rawURL} }
+// NewTarget returns a target at rawURL.
+func NewTarget(rawURL string) *Target { return &Target{base: rawURL} }
 
 // URL is the URL the next carrier starts from.
-func (t *HTTPTarget) URL() string {
+func (t *Target) URL() string {
 	if p := t.cur.Load(); p != nil {
 		return *p
 	}
@@ -157,10 +162,10 @@ func (t *HTTPTarget) URL() string {
 }
 
 // Base is the URL the target was made with.
-func (t *HTTPTarget) Base() string { return t.base }
+func (t *Target) Base() string { return t.base }
 
 // Redirected records the final URL of a carrier that redirects led to.
-func (t *HTTPTarget) Redirected(final string) {
+func (t *Target) Redirected(final string) {
 	if final == t.base {
 		t.cur.Store(nil)
 		return
@@ -169,7 +174,7 @@ func (t *HTTPTarget) Redirected(final string) {
 }
 
 // Reset starts the next carrier from the base URL again.
-func (t *HTTPTarget) Reset() { t.cur.Store(nil) }
+func (t *Target) Reset() { t.cur.Store(nil) }
 
 // noRedirectClient is client (nil: http.DefaultClient) with redirects
 // returned to the carrier, which follows them itself.
@@ -185,20 +190,20 @@ func noRedirectClient(client *http.Client) *http.Client {
 // errRedirectBound is the bound of hops when the client does not set one.
 var errRedirectBound = errors.New("too many redirects")
 
-// checkHop applies the client's CheckRedirect, or DefaultHTTPRedirects
+// checkHop applies the client's CheckRedirect, or DefaultRedirects
 // when it has none, to the next hop req after via.
 func checkHop(client *http.Client, req *http.Request, via []*http.Request) error {
 	if client != nil && client.CheckRedirect != nil {
 		return client.CheckRedirect(req, via)
 	}
-	if len(via) > DefaultHTTPRedirects {
+	if len(via) > DefaultRedirects {
 		return errRedirectBound
 	}
 	return nil
 }
 
 // doHTTP sends the request newReq builds for a URL, following redirects
-// by CheckHTTPRedirect and checkHop: the last response (a non-redirect)
+// by CheckRedirect and checkHop: the last response (a non-redirect)
 // and its URL. orig is the caller's client, nc its noRedirectClient;
 // newReq builds a hop's request, and for a further hop gives up the one
 // before.
@@ -212,7 +217,7 @@ func doHTTP(ctx context.Context, orig, nc *http.Client, u string, newReq func(u 
 		req, err := newReq(cur)
 		if err != nil {
 			if len(via) > 0 && errors.Is(err, errUpReplay) {
-				err = &HTTPRedirectError{StatusCode: via[len(via)-1].Response.StatusCode,
+				err = &RedirectError{StatusCode: via[len(via)-1].Response.StatusCode,
 					Location: cur.String(), Reason: err.Error()}
 			}
 			return nil, nil, err
@@ -222,7 +227,7 @@ func doHTTP(ctx context.Context, orig, nc *http.Client, u string, newReq func(u 
 				if req.Body != nil {
 					_ = req.Body.Close()
 				}
-				return nil, nil, &HTTPRedirectError{StatusCode: via[len(via)-1].Response.StatusCode,
+				return nil, nil, &RedirectError{StatusCode: via[len(via)-1].Response.StatusCode,
 					Location: cur.String(), Reason: err.Error()}
 			}
 		}
@@ -230,10 +235,10 @@ func doHTTP(ctx context.Context, orig, nc *http.Client, u string, newReq func(u 
 		if err != nil {
 			return nil, nil, err
 		}
-		if !IsHTTPRedirect(resp.StatusCode) {
+		if !IsRedirect(resp.StatusCode) {
 			return resp, cur, nil
 		}
-		next, err := CheckHTTPRedirect(cur, req.Method, resp.StatusCode, resp.Header.Get("Location"))
+		next, err := CheckRedirect(cur, req.Method, resp.StatusCode, resp.Header.Get("Location"))
 		// The redirect's body is not the carrier's.
 		_, _ = io.CopyN(io.Discard, resp.Body, 4<<10)
 		_ = resp.Body.Close()

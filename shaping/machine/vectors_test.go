@@ -476,7 +476,7 @@ func TestPoolDecideVectors(t *testing.T) {
 				v.LastDial = base.Add(-us(st.Since))
 			}
 			for _, m := range st.Members {
-				v.Members = append(v.Members, zmux.PoolMember{ID: m.ID, Age: us(&m.Age), Idle: us(&m.Idle), Pipes: m.Pipes, BytesSent: m.BytesSent, BytesReceived: m.BytesReceived})
+				v.Members = append(v.Members, zmux.PoolMember{PipeID: zmux.PipeID(m.ID), Age: us(&m.Age), Idle: us(&m.Idle), Pipes: m.Pipes, BytesSent: m.BytesSent, BytesReceived: m.BytesReceived})
 			}
 			var g zmux.PoolDecision
 			p.Decide(v, &g)
@@ -489,8 +489,19 @@ func TestPoolDecideVectors(t *testing.T) {
 			if w.ProbeJitter != nil {
 				wj = float64(*w.ProbeJitter) / 1e6
 			}
-			if g.Count != wc || g.DialAfter != us(w.DialAfter) || g.ProbeInterval != us(w.ProbeInterval) || g.ProbeJitter != wj ||
-				g.Recheck != us(w.Recheck) || len(g.Retire)+len(w.Retire) > 0 && !reflect.DeepEqual(g.Retire, w.Retire) || s.n != st.Consumed {
+			gi, gj := g.Liveness.ProbeInterval, g.Liveness.ProbeJitter
+			if gi < 0 { // off
+				gi = 0
+			}
+			if gj < 0 { // no jitter
+				gj = 0
+			}
+			var wr []zmux.PipeID
+			for _, id := range w.Retire {
+				wr = append(wr, zmux.PipeID(id))
+			}
+			if g.Count != wc || g.DialAfter != us(w.DialAfter) || gi != us(w.ProbeInterval) || gj != wj ||
+				g.Recheck != us(w.Recheck) || len(g.RetirePipes)+len(wr) > 0 && !reflect.DeepEqual(g.RetirePipes, wr) || s.n != st.Consumed {
 				t.Errorf("%s step %d: %+v consumed %d, want %+v %d", c.Name, i, g, s.n, w, st.Consumed)
 			}
 		}

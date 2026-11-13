@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 )
 
 func TestPoolDialUsesDestinationUDPFamily(t *testing.T) {
@@ -24,7 +24,7 @@ func TestPoolDialUsesDestinationUDPFamily(t *testing.T) {
 			e := newEnvAt(t, tc.address, mpConfig())
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			pool := NewPool(e.ln.Addr().String(), e.cli, nil, nil, zmux.PoolLimits{})
+			pool := NewPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{})
 			defer pool.Shutdown()
 			pc, err := pool.pool.Dial(ctx)
 			if err != nil {
@@ -63,7 +63,7 @@ func TestPoolDialPreservesHostnameWithoutChangingCallerTLS(t *testing.T) {
 	address := net.JoinHostPort("localhost", strconv.Itoa(e.ln.Addr().(*net.UDPAddr).Port))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	pool := NewPool(address, cfg, nil, nil, zmux.PoolLimits{})
+	pool := NewPool(address, cfg, nil, nil, carrier.PoolLimits{})
 	defer pool.Shutdown()
 	pc, err := pool.pool.Dial(ctx)
 	if err != nil {
@@ -84,7 +84,7 @@ func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, st
 	serverTLS, clientTLS := tlsConfigs(t)
 	var allow atomic.Bool
 	allow.Store(true)
-	base := QUICConfig(&quic.Config{Allow0RTT: true})
+	base := Config(&quic.Config{Allow0RTT: true})
 	base.GetConfigForClient = func(*quic.ClientInfo) (*quic.Config, error) {
 		c := base.Clone()
 		c.GetConfigForClient = nil
@@ -98,7 +98,7 @@ func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, st
 	defer func() { _ = listener.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	warm, err := dial(ctx, listener.Addr().String(), clientTLS, QUICConfig(nil), false)
+	warm, err := dial(ctx, listener.Addr().String(), clientTLS, Config(nil), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, st
 	_ = warm.CloseWithError(0, "")
 	_ = accepted.CloseWithError(0, "")
 	allow.Store(false)
-	early, err := dial(ctx, listener.Addr().String(), clientTLS, QUICConfig(nil), true)
+	early, err := dial(ctx, listener.Addr().String(), clientTLS, Config(nil), true)
 	if err != nil {
 		t.Fatal(err)
 	}

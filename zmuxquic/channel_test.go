@@ -13,6 +13,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 )
 
 // lossyRelay forwards UDP between one client and a server with a one-way
@@ -312,7 +313,7 @@ func TestChannelSessionsShareConnection(t *testing.T) {
 		t.Fatalf("%d dropped", ChannelDropped(qc))
 	}
 	// A datagram naming no pipe is dropped and counted.
-	if err := qc.SendDatagram(zmux.AppendChannelDatagram(nil, true, 1<<20, []byte{0, 'x'})); err != nil {
+	if err := qc.SendDatagram(carrier.AppendChannelDatagram(nil, true, 1<<20, []byte{0, 'x'})); err != nil {
 		t.Fatal(err)
 	}
 	// The server side counts it; the client's connection object is ours.

@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -16,42 +17,44 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/httpx"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
-// HTTP carriers: a request body carries the up direction, a
-// response body the down direction. HTTP/2 and HTTP/3 requests (and
-// HTTP/1.1 with full duplex) carry both; a split bootstrap pairs an uplink
-// POST and a downlink GET by a pairing header.
+// A request body carries the up direction, a response body the down
+// direction. HTTP/2 and HTTP/3 requests (and HTTP/1.1 with full duplex)
+// carry both; a split bootstrap pairs an uplink POST and a downlink GET by
+// a pairing header.
 
 // HeaderPair is the default header that pairs the uplink POST and the
-// downlink GET of a split bootstrap (HTTPOptions.PairField and
-// HTTPSplitOptions.PairField name another).
-const HeaderPair = "Zmux-Pipe-Pair"
+// downlink GET of a split bootstrap (Options.PairField and
+// SplitOptions.PairField name another).
+const HeaderPair = httpx.FieldPair
 
-// HTTPPipe opens a carrier over an HTTP request: dir DirBidirectional sends
+// StreamPipe opens a carrier over an HTTP request: dir zmux.DirectionBidirectional sends
 // the request body up and reads the response body (HTTP/2, HTTP/3, or an
-// HTTP/1.1 server with full duplex); DirSendOnly is a POST whose body is the
-// uplink; DirReceiveOnly is a GET whose response body is the downlink. ctx bounds the setting
+// HTTP/1.1 server with full duplex); zmux.DirectionSendOnly is a POST whose body is the
+// uplink; zmux.DirectionReceiveOnly is a GET whose response body is the downlink. ctx bounds the setting
 // up: ending it before the request is under way (its body read by the
 // transport, or its response arrived) fails the carrier; after that the
 // request lives until the pipe ends, as for any dialled connection.
 //
-// The PipeIO has the halves of dir only: W alone for DirSendOnly, R alone
-// for DirReceiveOnly. Its Carrier is CarrierStreaming for DirBidirectional
-// and CarrierSplit for a one-way half; the request's protocol is not known
-// yet, so a caller dialing over HTTP/3 sets CarrierHTTP3 itself
-// (zmuxh3.HTTP3Candidate does). Pass a one-way pipe to Conn.AddPipe with the same
-// PipeOptions.Direction, or combine two as HTTPSplitPipe does.
+// The zmux.PipeIO has the halves of dir only: W alone for zmux.DirectionSendOnly, R alone
+// for zmux.DirectionReceiveOnly. Its Carrier is zmux.CarrierStream for zmux.DirectionBidirectional
+// and zmux.CarrierSplit for a one-way half; the request's protocol is not known
+// yet, so a caller dialing over HTTP/3 sets zmux.CarrierHTTP3 itself
+// (zmuxh3.HTTP3Candidate does). Pass a one-way pipe to zmux.Conn.AddPipe with the same
+// zmux.PipeOptions.Direction, or combine two as SplitPipe does.
 //
-// A response status other than 2xx fails the pipe with an *HTTPStatusError:
-// the read half returns it, and for DirSendOnly the write half does once
+// A response status other than 2xx fails the pipe with a *StatusError:
+// the read half returns it, and for zmux.DirectionSendOnly the write half does once
 // the response arrives. A transport failure is reported the same way.
 //
-// A redirect is followed as CheckHTTPRedirect allows, up to the bound of
-// client.CheckRedirect (DefaultHTTPRedirects hops when it is nil, which
+// A redirect is followed as CheckRedirect allows, up to the bound of
+// client.CheckRedirect (DefaultRedirects hops when it is nil, which
 // is consulted for every hop); a redirect it refuses fails the pipe with
-// an *HTTPRedirectError. The request is repeated whole at the new URL,
+// a *RedirectError. The request is repeated whole at the new URL,
 // with a fresh credential and every uplink byte written so far: until the
 // first response that is not a redirect, the uplink is kept (and, past
 // 64 KiB, held back), so that no byte is lost or sent twice.
@@ -59,14 +62,14 @@ const HeaderPair = "Zmux-Pipe-Pair"
 // cred, when set, is presented for the server's admission: its Prefix
 // starts the request body, and a GET, which has none, carries its Header
 // form. The connection under client is not known when the request is
-// built, so a credential bound to TLS (PrefixAuth.BindTLS) is an error.
-func HTTPPipe(ctx context.Context, client *http.Client, url string, h http.Header, dir Direction, cred Credential) (PipeIO, error) {
+// built, so a credential bound to TLS (admit.PrefixAuth.BindTLS) is an error.
+func StreamPipe(ctx context.Context, client *http.Client, url string, h http.Header, dir zmux.Direction, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 	return httpPipe(ctx, client, url, nil, h, dir, cred)
 }
 
-// httpPipe is HTTPPipe; with t, the carrier starts at t's URL and records
+// httpPipe is StreamPipe; with t, the carrier starts at t's URL and records
 // in t the URL redirects led it to.
-func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTarget, h http.Header, dir Direction, cred Credential) (PipeIO, error) {
+func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target, h http.Header, dir zmux.Direction, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 	if t != nil {
 		rawURL = t.URL()
 	}
@@ -80,7 +83,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 	ctx = life
 	method := http.MethodPost
 	var s *upStream
-	if dir == DirReceiveOnly {
+	if dir == zmux.DirectionReceiveOnly {
 		method = http.MethodGet
 	} else {
 		s = newUpStream()
@@ -106,11 +109,16 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 		addHeader(req.Header, h)
 		if cred != nil {
 			peer, _ := netip.ParseAddrPort(req.URL.Host)
-			info := &CarrierInfo{Peer: peer, Head: up == nil}
+			info := &zmux.CarrierInfo{Peer: peer, Head: up == nil}
 			if up == nil {
 				var name, value string
 				if name, value, err = cred.Header(info); err == nil {
-					req.Header.Add(name, value)
+					if len(req.Header.Values(name)) > 0 {
+						// The pairing field of a split half, or another field of h.
+						err = fmt.Errorf("%w: carrier credential field %q is also a field of the request", zmux.ErrInvalidConfig, name)
+					} else {
+						req.Header.Add(name, value)
+					}
 				}
 			} else {
 				up.pre, err = cred.Prefix(info)
@@ -132,12 +140,12 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 	u0, err := url.Parse(rawURL)
 	if err != nil {
 		cancel()
-		return PipeIO{}, err
+		return zmux.PipeIO{}, err
 	}
 	first, err := newReq(u0)
 	if err != nil {
 		cancel()
-		return PipeIO{}, err
+		return zmux.PipeIO{}, err
 	}
 	labels.Go(ctx, "http-pipe", func() {
 		resp, final, err := doHTTP(ctx, client, nc, rawURL, func(u *url.URL) (*http.Request, error) {
@@ -159,7 +167,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 			s.settle()
 		}
 		close(call.done)
-		if dir != DirSendOnly {
+		if dir != zmux.DirectionSendOnly {
 			return // the response is the downlink
 		}
 		// An uplink's response carries no data: its end is the end of
@@ -172,14 +180,14 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *HTTPTa
 		s.p.closeRead(call.end())
 		cancel()
 	})
-	p := PipeIO{Carrier: CarrierSplit}
-	if dir == DirBidirectional {
-		p.Carrier = CarrierStreaming
+	p := zmux.PipeIO{Carrier: zmux.CarrierSplit}
+	if dir == zmux.DirectionBidirectional {
+		p.Carrier = zmux.CarrierStream
 	}
 	if s != nil {
 		p.W = &httpReqWriter{p: s.p, call: call, cancel: cancel}
 	}
-	if dir != DirSendOnly {
+	if dir != zmux.DirectionSendOnly {
 		p.R = &httpRespReader{call: call, cancel: cancel}
 	}
 	return p, nil
@@ -192,23 +200,23 @@ type httpCall struct {
 	resp *http.Response // a 2xx response
 	err  error
 
-	// The connection a transport declared secure (HTTPCarrierBody), and
+	// The connection a transport declared secure (CarrierBody), and
 	// the end of the wait for it: the request's headers went out.
-	conn      atomic.Pointer[ConnectionStater]
+	conn      atomic.Pointer[zmux.ConnectionStater]
 	wrote     chan struct{}
 	wroteOnce sync.Once
 }
 
 func (c *httpCall) headersWritten() { c.wroteOnce.Do(func() { close(c.wrote) }) }
 
-// HTTPCarrierBody is implemented by the request body of an HTTP carrier. A
+// CarrierBody is implemented by the request body of an HTTP carrier. A
 // client transport whose connection protects the request end to end, such
 // as HTTP/3 over QUIC (zmuxh3.HTTPClient), calls SetSecureConnection with
 // that connection before it writes the request's headers: the carrier then
-// declares the Bound contract (CarrierSecure) with the connection's
+// declares the Bound contract (zmux.CarrierSecure) with the connection's
 // exporter, which identifies the connection, not the request stream.
-type HTTPCarrierBody interface {
-	SetSecureConnection(ConnectionStater)
+type CarrierBody interface {
+	SetSecureConnection(zmux.ConnectionStater)
 }
 
 // end is the error the carrier's halves report once the request ended.
@@ -299,9 +307,9 @@ type httpUpBody struct {
 	once sync.Once
 }
 
-// SetSecureConnection implements HTTPCarrierBody; a body a redirect
+// SetSecureConnection implements CarrierBody; a body a redirect
 // replaced declares nothing.
-func (b *httpUpBody) SetSecureConnection(c ConnectionStater) {
+func (b *httpUpBody) SetSecureConnection(c zmux.ConnectionStater) {
 	if c != nil && !b.dead.Load() {
 		b.call.conn.Store(&c)
 	}
@@ -406,24 +414,27 @@ func (b *httpUpBody) Close() error {
 	return nil
 }
 
-// HTTPStatusError reports that an HTTP carrier's request was answered with
+// StatusError reports that an HTTP carrier's request was answered with
 // a status other than 2xx.
-type HTTPStatusError struct {
+type StatusError struct {
 	StatusCode int
 	Status     string // as the response gave it, e.g. "403 Forbidden"
 }
 
-func (e *HTTPStatusError) Error() string { return "zmux: HTTP carrier status " + e.Status }
+func (e *StatusError) Error() string { return "zmux: HTTP carrier status " + e.Status }
+
+// Is matches zmux.ErrCarrierRefused.
+func (e *StatusError) Is(target error) bool { return target == zmux.ErrCarrierRefused }
 
 // httpCarrierErr is the outcome of a carrier request: Do's error, an
-// *HTTPStatusError (the unused body is closed) or nil for a 2xx response.
+// *StatusError (the unused body is closed) or nil for a 2xx response.
 func httpCarrierErr(resp *http.Response, err error) error {
 	switch {
 	case err != nil:
 		return err
 	case resp.StatusCode/100 != 2:
 		_ = resp.Body.Close() // the status is the error
-		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
+		return &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	return nil
 }
@@ -436,25 +447,25 @@ func addHeader(dst, src http.Header) {
 	}
 }
 
-// HTTPSplitPipe opens a split bootstrap over two requests, a POST uplink
+// SplitPipe opens a split bootstrap over two requests, a POST uplink
 // and a GET downlink, paired by a random pairing token,
-// each presenting cred as HTTPPipe does. The carriers must be
+// each presenting cred as StreamPipe does. The carriers must be
 // confidential end to end (TLS to the server).
-func HTTPSplitPipe(ctx context.Context, client *http.Client, url string, h http.Header, cred Credential) (PipeIO, error) {
+func SplitPipe(ctx context.Context, client *http.Client, url string, h http.Header, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 	return httpSplitPipe(ctx, client, url, nil, h, cred, HeaderPair)
 }
 
-// HTTPSplitOptions configure the pairing of a split bootstrap on the
+// SplitOptions configure the pairing of a split bootstrap on the
 // client side. The zero value, and nil, pair by HeaderPair.
-type HTTPSplitOptions struct {
+type SplitOptions struct {
 	// PairField is the request field that pairs the uplink POST and the
-	// downlink GET (empty: HeaderPair). The server's HTTPOptions.PairField
+	// downlink GET (empty: HeaderPair). The server's Options.PairField
 	// must be the same.
 	PairField string
 }
 
 // Validate checks o (nil is valid).
-func (o *HTTPSplitOptions) Validate() error {
+func (o *SplitOptions) Validate() error {
 	if o == nil {
 		return nil
 	}
@@ -462,52 +473,52 @@ func (o *HTTPSplitOptions) Validate() error {
 }
 
 // pairField returns the canonical pairing field of o.
-func (o *HTTPSplitOptions) pairField() string {
+func (o *SplitOptions) pairField() string {
 	if o == nil {
 		return HeaderPair
 	}
-	return (&HTTPOptions{PairField: o.PairField}).pairField()
+	return (&Options{PairField: o.PairField}).pairField()
 }
 
-// Pipe is HTTPSplitPipe with o's pairing field.
-func (o *HTTPSplitOptions) Pipe(ctx context.Context, client *http.Client, url string, h http.Header, cred Credential) (PipeIO, error) {
+// Pipe is SplitPipe with o's pairing field.
+func (o *SplitOptions) Pipe(ctx context.Context, client *http.Client, url string, h http.Header, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
 	if err := o.Validate(); err != nil {
-		return PipeIO{}, err
+		return zmux.PipeIO{}, err
 	}
 	return httpSplitPipe(ctx, client, url, nil, h, cred, o.pairField())
 }
 
-// Join is HTTPSplitJoin with o's pairing field.
-func (o *HTTPSplitOptions) Join(ctx context.Context, c *Conn, client *http.Client, url string, h http.Header, cred Credential, po PipeOptions) (*Pipe, error) {
+// Join is SplitJoin with o's pairing field.
+func (o *SplitOptions) Join(ctx context.Context, c *zmux.Conn, client *http.Client, url string, h http.Header, cred zmux.CarrierCredential, po zmux.PipeOptions) (*zmux.Pipe, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
 	return httpSplitJoin(ctx, c, client, url, nil, h, cred, po, o.pairField())
 }
 
-// httpSplitPipe is HTTPSplitPipe; pair is the canonical pairing field.
-func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *HTTPTarget, h http.Header, cred Credential, pair string) (PipeIO, error) {
+// httpSplitPipe is SplitPipe; pair is the canonical pairing field.
+func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *Target, h http.Header, cred zmux.CarrierCredential, pair string) (zmux.PipeIO, error) {
 	if t != nil {
 		// Both requests start where the last carrier ended up.
 		url = t.URL()
 	}
 	var tok [16]byte
 	if _, err := rand.Read(tok[:]); err != nil {
-		return PipeIO{}, err
+		return zmux.PipeIO{}, err
 	}
 	hh := h.Clone()
 	if hh == nil {
 		hh = http.Header{}
 	}
 	hh.Set(pair, base64.RawURLEncoding.EncodeToString(tok[:]))
-	up, err := httpPipe(ctx, client, url, t, hh, DirSendOnly, cred)
+	up, err := httpPipe(ctx, client, url, t, hh, zmux.DirectionSendOnly, cred)
 	if err != nil {
-		return PipeIO{}, err
+		return zmux.PipeIO{}, err
 	}
-	down, err := httpPipe(ctx, client, url, t, hh, DirReceiveOnly, cred)
+	down, err := httpPipe(ctx, client, url, t, hh, zmux.DirectionReceiveOnly, cred)
 	if err != nil {
 		_ = up.W.Close() // abandon the uplink; err is the one to report
-		return PipeIO{}, err
+		return zmux.PipeIO{}, err
 	}
 	// The pipe fails as soon as either request does: an uplink refused
 	// after its first bytes were taken fails the downlink's reads.
@@ -519,17 +530,17 @@ func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *HTTP
 			dr.cancel()
 		}
 	})
-	return PipeIO{R: down.R, W: up.W, Carrier: CarrierSplit}, nil
+	return zmux.PipeIO{R: down.R, W: up.W, Carrier: zmux.CarrierSplit}, nil
 }
 
-// HTTPSplitJoin joins a split carrier to c as one further pipe of the session: one Join
+// SplitJoin joins a split carrier to c as one further pipe of the session: one Join
 // across a paired POST and GET, a bidi attachment by default. ctx
 // bounds the join; the requests then live until the pipe ends.
-func HTTPSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, h http.Header, cred Credential, o PipeOptions) (*Pipe, error) {
+func SplitJoin(ctx context.Context, c *zmux.Conn, client *http.Client, url string, h http.Header, cred zmux.CarrierCredential, o zmux.PipeOptions) (*zmux.Pipe, error) {
 	return httpSplitJoin(ctx, c, client, url, nil, h, cred, o, HeaderPair)
 }
 
-func httpSplitJoin(ctx context.Context, c *Conn, client *http.Client, url string, t *HTTPTarget, h http.Header, cred Credential, o PipeOptions, pair string) (*Pipe, error) {
+func httpSplitJoin(ctx context.Context, c *zmux.Conn, client *http.Client, url string, t *Target, h http.Header, cred zmux.CarrierCredential, o zmux.PipeOptions, pair string) (*zmux.Pipe, error) {
 	p, err := httpSplitPipe(ctx, client, url, t, h, cred, pair)
 	if err != nil {
 		return nil, err
@@ -566,7 +577,7 @@ func (w *httpReqWriter) WriteBuffers(bufs [][]byte) (int, error) {
 }
 
 // CarrierSecure declares the Bound contract once the transport named a
-// secure connection (HTTPCarrierBody).
+// secure connection (CarrierBody).
 func (w *httpReqWriter) CarrierSecure() bool { return w.call.conn.Load() != nil }
 
 // ConnectionState is that connection's TLS state; without one, none.
@@ -756,11 +767,11 @@ func (r *httpRespReader) Close() error {
 	return nil
 }
 
-// NewHTTPHandler returns a handler that hands HTTP requests to l as
-// carriers, by their class (ClassifyHTTP): a downlink (the response body),
+// NewHandler returns a handler that hands HTTP requests to l as
+// carriers, by their class (Classify): a downlink (the response body),
 // an uplink (the request body) or a bidirectional carrier (both, full
 // duplex). Requests of other classes are served by o.Next. Each carrier
-// first passes l's admission (ListenerConfig.Admission); a request forwarded from
+// first passes l's admission (zmux.ListenerConfig.Admission); a request forwarded from
 // early data is answered 425. Nothing is written before a carrier is
 // accepted: with an Admission, the response header goes out when it
 // accepts the request; without one, with the first downlink bytes, and an
@@ -770,12 +781,12 @@ func (r *httpRespReader) Close() error {
 // to which nothing was written is served by o.Next, with every body byte
 // that l read replayed in front of the rest. The
 // handler returns when the pipe ends. o may be nil; an invalid o is an
-// ErrInvalidConfig error.
-func NewHTTPHandler(l *Listener, o *HTTPOptions) (http.Handler, error) {
+// zmux.ErrInvalidConfig error.
+func NewHandler(l *zmux.Listener, o *Options) (http.Handler, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
-	var opts HTTPOptions
+	var opts Options
 	if o != nil {
 		opts = *o
 	}
@@ -783,23 +794,23 @@ func NewHTTPHandler(l *Listener, o *HTTPOptions) (http.Handler, error) {
 }
 
 type httpHandler struct {
-	l *Listener
-	o HTTPOptions
+	l *zmux.Listener
+	o Options
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	class := h.o.Classify(r)
 	switch class {
-	case HTTPClassDownlink, HTTPClassUplink, HTTPClassBidirectional:
+	case ClassDownlink, ClassUplink, ClassBidirectional:
 	default:
 		h.o.Fallback(w, r)
 		return
 	}
-	a, ok := h.l.admitRequest(w, r, &h.o, true)
+	a, ok := h.l.AdmitRequest(w, r, h.o.Trusted, http.HandlerFunc(h.o.Fallback))
 	if !ok {
 		return
 	}
-	hint := PipeHint{Pair: r.Header.Get(h.o.pairField())}
+	hint := zmux.PipeHint{Pair: r.Header.Get(h.o.pairField())}
 	rc := http.NewResponseController(w)
 	// An HTTP/1.1 connection is not reused after a carrier: the server
 	// does not read what is left of a full-duplex request body, so a
@@ -820,12 +831,12 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		hw.closed = true
 		hw.mu.Unlock()
 	}()
-	p := PipeIO{Carrier: CarrierSplit}
+	p := zmux.PipeIO{Carrier: zmux.CarrierSplit}
 	var body *httpReqBody
 	switch class {
-	case HTTPClassDownlink:
+	case ClassDownlink:
 		p.W = hw
-	case HTTPClassUplink:
+	case ClassUplink:
 		hint.Uplink = true
 		// An admitted uplink's response header goes out while its body
 		// is read.
@@ -833,9 +844,9 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		body = &httpReqBody{b: r.Body, rc: rc, life: life}
 		p.R = body
 	default:
-		p.Carrier = CarrierStreaming
+		p.Carrier = zmux.CarrierStream
 		if r.ProtoMajor == 3 {
-			p.Carrier = CarrierHTTP3
+			p.Carrier = zmux.CarrierHTTP3
 		}
 		_ = rc.EnableFullDuplex()
 		body = &httpReqBody{b: r.Body, rc: rc, life: life}
@@ -853,7 +864,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.W = &httpChanWriter{httpRespWriter: hw}
 		}
 	}
-	if h.l.cfg.Admission != nil {
+	if h.l.HasAdmission() {
 		// Admitted: the carrier is valid, its header goes out now.
 		hw.mu.Lock()
 		hw.start()
@@ -870,7 +881,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = rc.SetReadDeadline(time.Time{})
 			_ = rc.SetWriteDeadline(time.Time{})
 			if len(read) > 0 {
-				r.Body = &replayBody{Reader: io.MultiReader(bytesReader(read), r.Body), c: r.Body}
+				r.Body = httpx.ReplayBody(read, r.Body, r.Body)
 			}
 			fellBack = true
 			h.o.Fallback(w, r)
@@ -896,8 +907,8 @@ type httpRespWriter struct {
 	// the channel once the header went out. The receiver's state has a
 	// lock of its own, taken after mu, so that a session registering its
 	// receiver under its own lock never waits for a blocked write.
-	chp     HTTPDatagramChannel
-	ch      atomic.Pointer[DatagramChannel]
+	chp     DatagramChannel
+	ch      atomic.Pointer[zmux.DatagramChannel]
 	chMu    sync.Mutex
 	deliver func([]byte) // a receiver waiting for the channel (under chMu)
 	chStop  func()       // the receiver's stop (under chMu)
@@ -998,7 +1009,7 @@ func (l *httpLife) end() {
 // interrupts a blocked read; the body itself is closed only once the
 // listener took the carrier, as a request handed to the fallback still
 // reads it. Until the listener takes the
-// carrier, it keeps what was read (at most firstReadBound bytes, what the
+// carrier, it keeps what was read (at most zmux.MaxUntakenRead bytes, what the
 // listener reads before it decides) for the fallback.
 type httpReqBody struct {
 	b    io.ReadCloser
@@ -1018,7 +1029,7 @@ func (r *httpReqBody) Read(p []byte) (int, error) {
 	defer r.mu.Unlock()
 	r.ended = r.ended || errors.Is(err, io.EOF)
 	if n > 0 && !r.taken {
-		if len(r.read)+n > firstReadBound {
+		if len(r.read)+n > zmux.MaxUntakenRead {
 			r.taken, r.read = true, nil
 		} else {
 			r.read = append(r.read, p[:n]...)
@@ -1038,7 +1049,7 @@ func (r *httpReqBody) ConnectionState() tls.ConnectionState {
 	return *r.tls
 }
 
-func (r *httpReqBody) carrierTaken() {
+func (r *httpReqBody) CarrierTaken() {
 	r.mu.Lock()
 	r.taken, r.read = true, nil
 	r.mu.Unlock()
@@ -1070,21 +1081,21 @@ func (r *httpReqBody) Close() error {
 	return r.b.Close()
 }
 
-// HTTPDatagramChannel is an optional capability of an http.ResponseWriter,
+// DatagramChannel is an optional capability of an http.ResponseWriter,
 // found through Unwrap: the datagram channel of the request's stream, for
 // HTTP versions that have one, such as HTTP/3 with HTTP Datagrams (RFC
-// 9297; zmuxh3 provides it). The handler of NewHTTPHandler uses it for
+// 9297; zmuxh3 provides it). The handler of NewHandler uses it for
 // bidirectional carriers.
-type HTTPDatagramChannel interface {
+type DatagramChannel interface {
 	// DatagramChannel returns the request stream's datagram channel. The
 	// handler calls it once, after the response header was written, while
 	// no other write to the response runs.
-	DatagramChannel() DatagramChannel
+	DatagramChannel() zmux.DatagramChannel
 }
 
-func httpChannelOf(w http.ResponseWriter) HTTPDatagramChannel {
+func httpChannelOf(w http.ResponseWriter) DatagramChannel {
 	for {
-		if dc, ok := w.(HTTPDatagramChannel); ok {
+		if dc, ok := w.(DatagramChannel); ok {
 			return dc
 		}
 		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
@@ -1118,7 +1129,7 @@ func (h *httpRespWriter) openChannel() {
 // channel takes nothing.
 type httpChanWriter struct{ *httpRespWriter }
 
-func (h *httpChanWriter) channel() DatagramChannel {
+func (h *httpChanWriter) channel() zmux.DatagramChannel {
 	if p := h.ch.Load(); p != nil {
 		return *p
 	}

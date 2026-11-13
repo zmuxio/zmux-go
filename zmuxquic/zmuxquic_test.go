@@ -19,6 +19,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 )
 
 func tlsConfigs(t testing.TB) (*tls.Config, *tls.Config) {
@@ -71,7 +72,7 @@ func newEnvQUIC(t testing.TB, address string, scfg *zmux.Config, qconf *quic.Con
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &env{ln: ln, lst: mustNewListener(&zmux.ListenerConfig{Config: scfg}), cli: cli, cancel: cancel}
 	tl := &trackedListener{ConnListener: ln}
-	go func() { _ = Serve(ctx, tl, e.lst, nil) }()
+	go func() { _ = Serve(ctx, e.lst, tl, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		_ = ln.Close()
@@ -203,7 +204,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 	defer cancel()
 	// A first session gets a session ticket and the parameters; it runs on
 	// a connection the test dials itself (Client).
-	qc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, QUICConfig(nil))
+	qc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, Config(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,12 +266,12 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 		t.Fatalf("early stream %q %v", b, err)
 	}
 	if exporter {
-		jc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, QUICConfig(nil))
+		jc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, Config(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = jc.CloseWithError(0, "") }()
-		pio, err := OpenPipe(ctx, jc)
+		pio, err := ConnPipe(ctx, jc)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -319,7 +320,7 @@ func TestQUICPool(t *testing.T) {
 	e := newEnv(t, mpConfig())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p := NewPool(e.ln.Addr().String(), e.cli, nil, nil, zmux.PoolLimits{MaxPipesPerConnection: 2})
+	p := NewPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer p.Shutdown()
 	first, err := p.OpenPipe(ctx)
 	if err != nil {
@@ -418,11 +419,11 @@ func TestQUICCopyLane(t *testing.T) {
 	t.Fatalf("no copy on the copy lane: %+v", c.PipeStats())
 }
 
-// testQUIC is QUICConfig(base) with a handshake timeout that tolerates a
+// testQUIC is Config(base) with a handshake timeout that tolerates a
 // loaded test host: the default 5 s fails handshakes under -race with
 // many packages running at once.
 func testQUIC(base *quic.Config) *quic.Config {
-	c := QUICConfig(base)
+	c := Config(base)
 	c.HandshakeIdleTimeout = 30 * time.Second
 	return c
 }
@@ -438,7 +439,7 @@ func checkKind(t *testing.T, k zmux.CarrierKind, cs ...*zmux.Conn) {
 		}
 		for _, p := range st {
 			if p.Carrier != k {
-				t.Fatalf("pipe %d: carrier %v, want %v", p.Pipe, p.Carrier, k)
+				t.Fatalf("pipe %d: carrier %v, want %v", p.PipeID, p.Carrier, k)
 			}
 		}
 	}
@@ -461,7 +462,7 @@ func TestQUICHandshakeFailureCounted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	served := make(chan struct{})
-	go func() { _ = Serve(ctx, ln, lst, nil); close(served) }()
+	go func() { _ = Serve(ctx, lst, ln, nil); close(served) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-served }()
 	if qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, testQUIC(nil)); err == nil {
 		// The client finishes first; the server's verdict closes the

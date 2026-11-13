@@ -12,19 +12,21 @@ import (
 // A decision whose probe settings are out of range is an error, never
 // clamped; set ones pass.
 func TestPoolDecisionValidate(t *testing.T) {
-	for _, d := range []PoolDecision{{ProbeInterval: 200 * time.Millisecond}, {ProbeInterval: -time.Second},
-		{ProbeInterval: time.Second - 1}, {ProbeJitter: 1}, {ProbeJitter: math.NaN()}, {ProbeJitter: -0.1}, {Count: -1}, {DialAfter: -time.Second}, {Recheck: -1}} {
+	for _, d := range []PoolDecision{{Liveness: PipeLiveness{ProbeInterval: 200 * time.Millisecond}},
+		{Liveness: PipeLiveness{ProbeInterval: time.Second - 1}}, {Liveness: PipeLiveness{ProbeJitter: 1}},
+		{Liveness: PipeLiveness{ProbeJitter: math.NaN()}}, {Count: -1}, {DialAfter: -time.Second}, {Recheck: -1}} {
 		if err := d.Validate(); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%+v: %v", d, err)
 		}
 		var got PoolDecision
 		err := decide(nil, policyFunc(func(_ *PoolView, x *PoolDecision) { *x = d }), &PoolView{}, &got)
-		if !errors.Is(err, ErrInvalidConfig) || got.ProbeInterval != d.ProbeInterval {
+		if !errors.Is(err, ErrInvalidConfig) || got.Liveness.ProbeInterval != d.Liveness.ProbeInterval {
 			t.Errorf("decide %+v: %v, %+v", d, err, got)
 		}
 	}
-	for _, d := range []PoolDecision{{}, {ProbeInterval: time.Second}, {ProbeInterval: time.Hour, ProbeJitter: 0.99},
-		{NoProbeJitter: true}, {DisableIdleProbe: true}} {
+	for _, d := range []PoolDecision{{}, {Liveness: PipeLiveness{ProbeInterval: time.Second}},
+		{Liveness: PipeLiveness{ProbeInterval: time.Hour, ProbeJitter: 0.99}}, {Liveness: PipeLiveness{ProbeJitter: -1}},
+		{Liveness: PipeLiveness{ProbeInterval: -time.Second}}, {Liveness: PipeLiveness{ProbeJitter: -0.1}}} {
 		if err := d.Validate(); err != nil {
 			t.Errorf("%+v: %v", d, err)
 		}
@@ -40,7 +42,7 @@ func TestMaintainPipesInvalidDecision(t *testing.T) {
 	var asked atomic.Int64
 	pol := policyFunc(func(_ *PoolView, d *PoolDecision) {
 		asked.Add(1)
-		d.Count, d.ProbeInterval, d.Recheck = 3, 500*time.Millisecond, 20*time.Millisecond
+		d.Count, d.Liveness.ProbeInterval, d.Recheck = 3, 500*time.Millisecond, 20*time.Millisecond
 	})
 	var rejected atomic.Int64
 	report := func(err error) {
@@ -79,7 +81,7 @@ func TestMaintainPipesInvalidDecision(t *testing.T) {
 		t.Fatalf("%d rejections reported for more than %d decisions", r, n+3)
 	}
 	e.client.lock()
-	pi, _ := e.client.s.PipeInfo(pp.ID())
+	pi, _ := e.client.s.PipeInfo(uint64(pp.ID()))
 	e.client.unlock()
 	if k := time.Duration(pi.ProbeInterval); k != 15*time.Second {
 		t.Fatalf("probe interval %v; the rejected 500 ms applied", k)
@@ -87,12 +89,12 @@ func TestMaintainPipesInvalidDecision(t *testing.T) {
 }
 
 func TestPoolDecisionProbeOptions(t *testing.T) {
-	o := (&PoolDecision{DisableIdleProbe: true, NoProbeJitter: true}).probeOptions(PipeOptions{ProbeInterval: 5 * time.Second, ProbeJitter: 0.2, Label: "x"})
-	if o.ProbeInterval >= 0 || !o.NoProbeJitter || o.ProbeJitter != 0 || o.Label != "x" {
+	o := (&PoolDecision{Liveness: PipeLiveness{ProbeInterval: -1, ProbeJitter: -1}}).probeOptions(PipeOptions{Liveness: PipeLiveness{ProbeInterval: 5 * time.Second, ProbeJitter: 0.2}, Label: "x"})
+	if o.Liveness.ProbeInterval >= 0 || o.Liveness.ProbeJitter >= 0 || o.Label != "x" {
 		t.Fatalf("options %+v", o)
 	}
-	o = (&PoolDecision{}).probeOptions(PipeOptions{ProbeInterval: 5 * time.Second, ProbeJitter: 0.2})
-	if o.ProbeInterval != 5*time.Second || o.ProbeJitter != 0.2 {
+	o = (&PoolDecision{}).probeOptions(PipeOptions{Liveness: PipeLiveness{ProbeInterval: 5 * time.Second, ProbeJitter: 0.2}})
+	if o.Liveness.ProbeInterval != 5*time.Second || o.Liveness.ProbeJitter != 0.2 {
 		t.Fatalf("unset decision changed the options: %+v", o)
 	}
 }

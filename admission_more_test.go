@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 // headerLen is the length of the test transform's header: a lead byte
@@ -33,11 +33,11 @@ func classifyingAdmission(calls *sync.Map) *Admission {
 		Decide: func(_ context.Context, info *CarrierInfo, prefix []byte) Decision {
 			n, _ := calls.LoadOrStore("n", new(int))
 			*n.(*int)++
-			c, need := ClassifyFirstBytes(prefix, FramingByteStream)
+			c, need := wire.ClassifyFirstBytes(prefix, false)
 			switch {
-			case c == FirstBytesRecord:
+			case c == wire.FirstRecord:
 				return Decision{Verdict: VerdictAccept}
-			case c == FirstBytesNeedMore:
+			case c == wire.FirstNeedMore:
 				return Decision{Verdict: VerdictMore, Need: need}
 			case len(prefix) < 2 || prefix[0] != 0x01:
 				return Decision{Verdict: VerdictClose, Variant: "unknown"}
@@ -291,44 +291,6 @@ func TestAdmissionFirstMessage(t *testing.T) {
 		if sum.Accepted != st.Accepted || sum.Closed != st.Closed {
 			t.Fatalf("%s: variants %+v do not add up", x.name, vs)
 		}
-	}
-}
-
-// An HTTP request carrier reads more of its body on VerdictMore.
-func TestAdmissionMoreHTTP(t *testing.T) {
-	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	var calls sync.Map
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: classifyingAdmission(&calls)})
-	defer func() { _ = lst.Close() }()
-	hh, err := NewHTTPHandler(lst, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewUnstartedServer(hh)
-	srv.EnableHTTP2 = true
-	srv.StartTLS()
-	defer srv.Close()
-	p, err := StreamingCandidate(srv.Client(), srv.URL, nil).Dial(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := p.W.Write(testHeader()); err != nil {
-		t.Fatal(err)
-	}
-	c, err := Start(ctx, p, RoleClient, mpConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := lst.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
-	echoOnce(t, ctx, c, s)
-	if vs := lst.VariantStats(); variantNamed(vs, "x").Accepted != 1 {
-		t.Fatalf("variants %+v", vs)
 	}
 }
 

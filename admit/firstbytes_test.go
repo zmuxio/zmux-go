@@ -1,4 +1,4 @@
-package zmux
+package admit
 
 import (
 	"encoding/hex"
@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
@@ -13,7 +14,7 @@ import (
 
 // TestClassifyFirstBytesVectors checks the shared vectors.
 func TestClassifyFirstBytesVectors(t *testing.T) {
-	raw, err := os.ReadFile("testdata/firstbytes.json")
+	raw, err := os.ReadFile("../testdata/firstbytes.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,9 +33,9 @@ func TestClassifyFirstBytesVectors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		f := FramingByteStream
+		f := zmux.FramingByteStream
 		if v.Framing == "records" {
-			f = FramingRecords
+			f = zmux.FramingRecords
 		}
 		c, need := ClassifyFirstBytes(b, f)
 		if c != classes[v.Class] || need != v.Need {
@@ -52,17 +53,19 @@ func TestClassifyFirstBytesVectors(t *testing.T) {
 // The first frame types are the ones the session accepts as first
 // records, and their leads are ff and ba.
 func TestClassifyFirstBytesTable(t *testing.T) {
-	if firstLeads != [2]byte{0xff, 0xba} {
-		t.Fatalf("leads %x", firstLeads)
+	for i, ty := range wire.FirstFrameTypes {
+		if lead := varint.AppendVarint(nil, ty)[0]; lead != [...]byte{0xff, 0xba}[i] {
+			t.Fatalf("lead of %x: %x", ty, lead)
+		}
 	}
 	for _, ty := range wire.FirstFrameTypes {
 		for _, size := range []uint64{30, 200, 20000} {
 			rec := varint.AppendVarint(nil, size)
 			rec = varint.AppendVarint(rec, ty)
-			if c, _ := core.Classify(rec, MaxRecordSize); c == core.ClassReject {
+			if c, _ := core.Classify(rec, zmux.MaxRecordSize); c == core.ClassReject {
 				t.Fatalf("type %x size %d: core rejects", ty, size)
 			}
-			if c, _ := ClassifyFirstBytes(rec, FramingByteStream); c != FirstBytesRecord {
+			if c, _ := ClassifyFirstBytes(rec, zmux.FramingByteStream); c != FirstBytesRecord {
 				t.Fatalf("type %x size %d: %v", ty, size, c)
 			}
 		}
@@ -76,15 +79,15 @@ func TestClassifyFirstBytesAgreesWithCore(t *testing.T) {
 		for b1 := range 256 {
 			for _, tail := range [][]byte{{0xff, 0x9a, 0xba}, {0x00, 0x40, 0xff}, {0x00, 0xff, 0xff}} {
 				b := append([]byte{byte(b0), byte(b1)}, tail...)
-				cc, _ := core.Classify(b, MaxRecordSize)
-				c, _ := ClassifyFirstBytes(b, FramingByteStream)
+				cc, _ := core.Classify(b, zmux.MaxRecordSize)
+				c, _ := ClassifyFirstBytes(b, zmux.FramingByteStream)
 				if cc != core.ClassReject && cc != core.ClassMore && cc != core.ClassJoin && c == FirstBytesOther {
 					t.Fatalf("% x: core %v, classified Other", b, cc)
 				}
 			}
 		}
 	}
-	if c, _ := ClassifyFirstBytes([]byte{0x16, 0x03}, FramingByteStream); c != FirstBytesOther {
+	if c, _ := ClassifyFirstBytes([]byte{0x16, 0x03}, zmux.FramingByteStream); c != FirstBytesOther {
 		t.Fatal("16 03 not Other")
 	}
 }

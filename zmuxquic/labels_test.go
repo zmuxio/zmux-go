@@ -24,7 +24,7 @@ func TestGoroutineLabels(t *testing.T) {
 	tl := &trackedListener{ConnListener: ln}
 	sctx, scancel := context.WithCancel(pprof.WithLabels(context.Background(), pprof.Labels("app.req", "42")))
 	served := make(chan struct{})
-	go func() { _ = Serve(sctx, tl, lst, nil); close(served) }()
+	go func() { _ = Serve(sctx, lst, tl, nil); close(served) }()
 	defer func() {
 		scancel()
 		_ = ln.Close()

@@ -17,7 +17,7 @@ func TestPoolIdleRuleWithProbes(t *testing.T) {
 	pol := policyFunc(func(v *PoolView, d *PoolDecision) {
 		for _, m := range v.Members {
 			if m.Idle > 1500*time.Millisecond {
-				d.Retire = append(d.Retire, m.ID)
+				d.RetirePipes = append(d.RetirePipes, m.PipeID)
 				retired.Add(1)
 			}
 		}
@@ -26,7 +26,7 @@ func TestPoolIdleRuleWithProbes(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- e.client.MaintainPipes(ctx, PipePool{Policy: pol, MinBackoff: 10 * time.Millisecond,
-			Options: PipeOptions{ProbeInterval: time.Second}, Dial: tcpDialer(e.ln.Addr().String())})
+			Options: PipeOptions{Liveness: PipeLiveness{ProbeInterval: time.Second}}, Dial: tcpDialer(e.ln.Addr().String())})
 	}()
 	defer func() {
 		cancel()
@@ -77,7 +77,7 @@ func TestPoolDialAfterReplacesBackoff(t *testing.T) {
 			start := time.Now()
 			waitUntil(t, c.within, "pool pipe", func() bool {
 				for _, st := range e.client.PipeStats() {
-					if st.Pipe != 0 && st.Outbound == OutboundActive {
+					if st.PipeID != 0 && st.Outbound == OutboundActive {
 						return true
 					}
 				}
@@ -99,7 +99,7 @@ func TestPoolProbeSettingsOnNewPipes(t *testing.T) {
 	pol := policyFunc(func(_ *PoolView, d *PoolDecision) {
 		d.Count = 1
 		if stage.Load() > 0 {
-			d.Count, d.ProbeInterval, d.NoProbeJitter = 2, time.Second, true
+			d.Count, d.Liveness.ProbeInterval, d.Liveness.ProbeJitter = 2, time.Second, -1
 		}
 	})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -138,7 +138,7 @@ func TestPoolProbeSettingsOnNewPipes(t *testing.T) {
 	probe := func(p *Pipe) (time.Duration, float64) {
 		e.client.lock()
 		defer e.client.unlock()
-		pi, _ := e.client.s.PipeInfo(p.ID())
+		pi, _ := e.client.s.PipeInfo(uint64(p.ID()))
 		return time.Duration(pi.ProbeInterval), pi.ProbeJitter
 	}
 	if k, j := probe(second); k != time.Second || j != 0 {

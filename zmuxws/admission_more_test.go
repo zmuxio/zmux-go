@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 // A WebSocket carrier handed to HandlePipe is admitted on its first
@@ -18,7 +20,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 	var seen atomic.Int32
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: 1, MaxPeek: 1 << 16,
 		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
-			if c, _ := zmux.ClassifyFirstBytes(prefix, zmux.FramingRecords); c != zmux.FirstBytesRecord || len(prefix) < 9 {
+			if c, _ := admit.ClassifyFirstBytes(prefix, zmux.FramingRecords); c != admit.FirstBytesRecord || len(prefix) < 9 {
 				return zmux.Decision{Verdict: zmux.VerdictClose}
 			}
 			seen.Store(int32(len(prefix)))
@@ -44,7 +46,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 
 // An upgrade is decided on its head: VerdictMore is VerdictClose.
 func TestAdmissionMoreOnHead(t *testing.T) {
-	o := &zmux.HTTPOptions{Next: next}
+	o := &zmuxhttp.Options{Next: next}
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: 4, MaxPeek: 64,
 		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
 			return zmux.Decision{Verdict: zmux.VerdictMore, Need: 8, Variant: "h"}

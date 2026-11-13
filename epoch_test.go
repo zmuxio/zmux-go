@@ -13,7 +13,7 @@ import (
 func TestEpochAdvanceThenJoin(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, mpConfig(), mpConfig())
-	e.addPipe(t, PipeOptions{}) // Sealed: the exchange's pipe
+	e.addPipe(t, PipeOptions{}) // RecordSealed: the exchange's pipe
 	if err := e.client.AdvanceEpoch(); err != nil {
 		t.Fatal(err)
 	}
@@ -30,20 +30,22 @@ func TestEpochAdvanceThenJoin(t *testing.T) {
 	if err := e.client.AdvanceEpoch(); err != nil {
 		t.Fatal(err)
 	}
-	e.addPipe(t, PipeOptions{Group: 1})
+	e.addPipe(t, PipeOptions{KeyGroup: 1})
 	if e.client.Epoch() != 1 || e.server.Epoch() != 1 {
 		t.Fatalf("epochs %d %d during the retention", e.client.Epoch(), e.server.Epoch())
 	}
 }
 
 // The first Sealed or Bound pipe of a session whose secret comes from a
-// pre-shared key starts one exchange on its own; NoEpochAfterFirstPipe at both
+// pre-shared key starts one exchange on its own; EpochAfterFirstPipe off at both
 // ends leaves the epoch alone.
 func TestEpochAfterFirstPipe(t *testing.T) {
 	leakcheck.Check(t)
 	for _, off := range []bool{false, true} {
 		ccfg, scfg := mpConfig(), mpConfig()
-		ccfg.NoEpochAfterFirstPipe, scfg.NoEpochAfterFirstPipe = off, off
+		if off {
+			ccfg.EpochAfterFirstPipe, scfg.EpochAfterFirstPipe = SwitchOff, SwitchOff
+		}
 		e := newMPEnv(t, ccfg, scfg)
 		e.addPipe(t, PipeOptions{})
 		if !off {
@@ -60,13 +62,15 @@ func TestEpochAfterFirstPipe(t *testing.T) {
 }
 
 // The end of a suspension starts one exchange on its own once Stable;
-// NoEpochAfterResume at both ends leaves the epoch alone.
+// EpochAfterResume off at both ends leaves the epoch alone.
 func TestEpochAfterResume(t *testing.T) {
 	leakcheck.Check(t)
 	for _, off := range []bool{false, true} {
 		ccfg, scfg := mpConfig(), mpConfig()
-		ccfg.NoEpochAfterFirstPipe, scfg.NoEpochAfterFirstPipe = true, true
-		ccfg.NoEpochAfterResume, scfg.NoEpochAfterResume = off, off
+		ccfg.EpochAfterFirstPipe, scfg.EpochAfterFirstPipe = SwitchOff, SwitchOff
+		if off {
+			ccfg.EpochAfterResume, scfg.EpochAfterResume = SwitchOff, SwitchOff
+		}
 		ccfg.ResumeTimeout, scfg.ResumeTimeout = 10*time.Second, 10*time.Second
 		e := newMPEnv(t, ccfg, scfg)
 		p := e.addPipe(t, PipeOptions{})

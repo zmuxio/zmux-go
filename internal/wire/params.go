@@ -275,14 +275,23 @@ func (p *Params) decodeOne(id uint64, v []byte) *Error {
 			err = ErrParam("zmux_resume grace 0")
 		}
 	case ParamAppProtocols:
+		// zmux does not define this parameter (SPEC 13.2, 13.3): a value
+		// that is not a non-empty list of varint-length-prefixed names is
+		// ignored like an unknown parameter.
+		var names [][]byte
 		for len(v) > 0 {
-			l := int(v[0])
-			if 1+l > len(v) {
-				return ErrParam("application_protocols")
+			l, n := varint.ConsumeVarint(v)
+			if n == 0 || l > uint64(len(v)-n) {
+				names = nil
+				break
 			}
-			p.AppProtocols = append(p.AppProtocols, bytes.Clone(v[1:1+l]))
-			v = v[1+l:]
+			names = append(names, bytes.Clone(v[n:n+int(l)]))
+			v = v[n+int(l):]
 		}
+		if len(names) == 0 {
+			p.Has &^= HasAppProtocols
+		}
+		p.AppProtocols = names
 	}
 	return err
 }
@@ -412,7 +421,7 @@ func AppendParams(b []byte, p *Params) ([]byte, *Error) {
 	if h&HasAppProtocols != 0 {
 		var v []byte
 		for _, a := range p.AppProtocols {
-			v = append(v, byte(len(a)))
+			v = varint.AppendVarint(v, uint64(len(a)))
 			v = append(v, a...)
 		}
 		b = appendParam(b, ParamAppProtocols, v)

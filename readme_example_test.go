@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
+	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 // The examples in this file hold the Go code of README.md that uses this
@@ -132,10 +134,18 @@ func Example_readmeMultipath() {
 			if err != nil {
 				return err
 			}
-			if ev.Kind == zmux.EventPipeFailed && ev.Pipe == p.ID() {
+			if ev.Kind == zmux.EventPipeFailed && ev.PipeID == p.ID() {
 				log.Println("backup path failed")
 			}
 		}
+	}
+}
+
+// Example_readmePipeUpdate is README.md "Multipath" (Pipe.Update).
+func Example_readmePipeUpdate() {
+	_ = func(p *zmux.Pipe) error {
+		err := p.Update(zmux.PipeUpdate{SendStandby: zmux.Set(false), Weight: zmux.Clear[uint64]()})
+		return err
 	}
 }
 
@@ -167,7 +177,7 @@ func Example_readmeRedial() {
 // Example_readmeHTTPExchange is README.md "HTTP exchanges".
 func Example_readmeHTTPExchange() {
 	_ = func(l *zmux.Listener, psk []byte) error {
-		h, err := zmux.NewHTTPExchangeHandler(l, nil, &zmux.HTTPExchangeConfig{PSK: psk})
+		h, err := zmuxhttp.NewExchangeHandler(l, nil, &zmuxhttp.ExchangeConfig{PSK: psk})
 		if err != nil {
 			return err
 		}
@@ -176,8 +186,8 @@ func Example_readmeHTTPExchange() {
 		return nil
 	}
 	_ = func(ctx context.Context, client *http.Client, psk []byte, cfg *zmux.Config) (*zmux.Conn, error) {
-		p, err := zmux.HTTPExchangePipe(ctx, client, "https://example.com/x/{instance}/{nonce}",
-			&zmux.HTTPExchangeConfig{PSK: psk})
+		p, err := zmuxhttp.ExchangePipe(ctx, client, "https://example.com/x/{instance}/{nonce}",
+			&zmuxhttp.ExchangeConfig{PSK: psk})
 		if err != nil {
 			return nil, err
 		}
@@ -205,20 +215,20 @@ func Example_readmeProxy() {
 func Example_readmeAdmission() {
 	_ = func(ctx context.Context, key []byte, cfg *zmux.Config, fallback func(context.Context, net.Conn),
 		ln net.Listener, tlsConf *tls.Config, addr string) (*zmux.Conn, error) {
-		auth := &zmux.PrefixAuth{Key: key, Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-		v, err := zmux.NewPrefixAuthVerifier(auth)
+		auth := &admit.PrefixAuth{Key: key, Slot: 30 * time.Second, Skew: 1, BindTLS: true}
+		v, err := admit.NewPrefixAuthVerifier(auth)
 		if err != nil {
 			return nil, err
 		}
 		l, err := zmux.NewListener(&zmux.ListenerConfig{Config: cfg,
-			Admission: &zmux.Admission{Peek: zmux.PrefixTokenLen, Decide: v.Decide}, Fallback: fallback})
+			Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide}, Fallback: fallback})
 		if err != nil {
 			return nil, err
 		}
 		go func() { _ = l.Serve(ctx, tls.NewListener(ln, tlsConf)) }()
 
-		// client: Config.Credential is presented by the dialers
-		conn, err := zmux.DialTLS(ctx, "tcp", addr, tlsConf, &zmux.Config{Credential: auth})
+		// client: Config.CarrierCredential is presented by the dialers
+		conn, err := zmux.DialTLS(ctx, "tcp", addr, tlsConf, &zmux.Config{CarrierCredential: auth})
 		return conn, err
 	}
 }

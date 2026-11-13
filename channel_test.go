@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
@@ -21,7 +23,7 @@ type chanConn struct {
 	net.Conn
 	id    uint64
 	max   atomic.Int64
-	demux ChannelDemux
+	demux carrierio.ChannelDemux
 	peer  *chanConn
 	sent  atomic.Int64
 	drop  atomic.Bool // lose every channel datagram
@@ -193,7 +195,7 @@ func TestChannelDatagramsReceiveErrors(t *testing.T) {
 	t.Run("unknown pipe", func(t *testing.T) {
 		a, b := chanPair(t, 1200)
 		c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-		b.demux.Deliver(AppendChannelDatagram(nil, true, 8, []byte{0, 'x'}))
+		b.demux.Deliver(wire.AppendChannelDatagram(nil, true, 8, []byte{0, 'x'}))
 		b.demux.Deliver([]byte{0x40}) // truncated Pipe Stream ID
 		if b.demux.Dropped() != 2 {
 			t.Fatalf("dropped %d", b.demux.Dropped())
@@ -227,17 +229,17 @@ func TestChannelDatagramsReceiveErrors(t *testing.T) {
 }
 
 func TestChannelDemuxSessions(t *testing.T) {
-	var d ChannelDemux
+	var d carrierio.ChannelDemux
 	var got [3][]string
 	var stops [3]func()
 	for i := range 3 {
 		stops[i] = d.Register(uint64(i*4), func(f []byte) { got[i] = append(got[i], string(f)) })
 	}
 	for i := range 3 {
-		d.Deliver(AppendChannelDatagram(nil, true, uint64(i*4), []byte(fmt.Sprint(i))))
+		d.Deliver(wire.AppendChannelDatagram(nil, true, uint64(i*4), []byte(fmt.Sprint(i))))
 	}
 	stops[1]()
-	d.Deliver(AppendChannelDatagram(nil, true, 4, []byte("late")))
+	d.Deliver(wire.AppendChannelDatagram(nil, true, 4, []byte("late")))
 	for i, g := range got {
 		if len(g) != 1 || g[0] != "\x30"+fmt.Sprint(i) {
 			t.Fatalf("pipe %d got %q", i, g)
@@ -251,7 +253,7 @@ func TestChannelDemuxSessions(t *testing.T) {
 	n := 0
 	_ = d.Register(0, func([]byte) { n++ })
 	s1()
-	d.Deliver(AppendChannelDatagram(nil, true, 0, nil))
+	d.Deliver(wire.AppendChannelDatagram(nil, true, 0, nil))
 	if n != 1 {
 		t.Fatal("stale stop removed the new registration")
 	}

@@ -64,34 +64,13 @@ type MessageBatchWriter interface {
 // BuffersWriter is an optional capability of a byte-stream sending half
 // that takes a batch of buffers in one call, as net.Buffers does for a
 // net.Conn: one flush or one locked copy per batch instead of one per
-// buffer.
+// buffer. carrier.WriteFlat implements WriteBuffers over a single Write.
 type BuffersWriter interface {
 	// WriteBuffers writes bufs in order, as one Write of their
 	// concatenation would. It may consume bufs (advance or empty its
 	// elements) but retains neither bufs nor their contents once it
 	// returns.
 	WriteBuffers(bufs [][]byte) (int, error)
-}
-
-var flatPool = sync.Pool{New: func() any { return new([]byte) }}
-
-// WriteFlat writes bufs to w with one Write of their concatenation, copied
-// into a pooled buffer: one call per batch for a writer whose every call
-// costs a record or a locked hand-over (TLS, a QUIC stream). A
-// BuffersWriter may implement WriteBuffers with it.
-func WriteFlat(w io.Writer, bufs [][]byte) (int, error) {
-	if len(bufs) == 1 {
-		return w.Write(bufs[0])
-	}
-	bp := flatPool.Get().(*[]byte)
-	b := (*bp)[:0]
-	for _, p := range bufs {
-		b = append(b, p...)
-	}
-	n, err := w.Write(b) // w retains nothing of b once it returns
-	*bp = b[:0]
-	flatPool.Put(bp)
-	return n, err
 }
 
 // PipeIO is a pipe input: at most one receiving half and at most one

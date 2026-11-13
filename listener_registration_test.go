@@ -22,7 +22,7 @@ func TestListenerRegistersBeforeBootstrapParameters(t *testing.T) {
 	server, peer := net.Pipe()
 	defer func() { _ = peer.Close() }()
 	ended := make(chan error, 1)
-	go func() { ended <- listener.startSession(ctx, NetPipe(server), nil, netip.AddrPort{}) }()
+	go func() { ended <- listener.startSession(ctx, NetPipe(server), nil, netip.AddrPort{}, func() {}) }()
 	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}

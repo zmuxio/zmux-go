@@ -1,40 +1,46 @@
-package zmux
+package zmuxhttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/admit"
+	"github.com/zmuxio/zmux-go/internal/httpx"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
-// HTTPExchangeHandler serves HTTP exchange carriers (see
-// HTTPExchangeConfig) into a Listener: every carrier is handed to
-// Listener.HandlePipe as a bidirectional carrier that starts or joins a
+// ExchangeHandler serves HTTP exchange carriers (see
+// ExchangeConfig) into a Listener: every carrier is handed to
+// zmux.Listener.HandlePipe as a bidirectional carrier that starts or joins a
 // session. Mount it at the path (or path prefix) that the clients' URL
 // template points to; the request target and headers are otherwise
 // ignored. The bytes it holds for its carriers count against the
 // listener's memory budget.
 //
-// Once the listener is closed (Listener.Close or Shutdown) or the handler
+// Once the listener is closed (zmux.Listener.Close or Shutdown) or the handler
 // is, a request for a new carrier is answered with GONE, so the client
 // fails it at once. Carriers already serving sessions continue: they end
 // with their sessions, as other carriers do, or all at once with Close.
-type HTTPExchangeHandler struct {
-	l      *Listener
-	o      HTTPOptions
+type ExchangeHandler struct {
+	l      *zmux.Listener
+	o      Options
 	p      exParams
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup // HandlePipe goroutines
 
-	nonces *ReplayFilter
+	nonces *admit.ReplayFilter
 
 	mu       sync.Mutex
 	closed   bool
@@ -48,16 +54,16 @@ type exGone struct {
 	until time.Time
 }
 
-// NewHTTPExchangeHandler returns a handler that serves exchange carriers
+// NewExchangeHandler returns a handler that serves exchange carriers
 // into l. o are the endpoint's HTTP options (nil: the defaults), the same
-// as NewHTTPHandler's: their Next serves the requests that are not
-// authenticated exchange requests and VerdictFallback, their Trusted
+// as NewHandler's: their Next serves the requests that are not
+// authenticated exchange requests and zmux.VerdictFallback, their Trusted
 // resolves a request's source, and their PairField tells a split half
 // from an exchange request. The listener's admission decides on the
-// request that creates a carrier, on its head (CarrierInfo.Head): Peek
+// request that creates a carrier, on its head (zmux.CarrierInfo.Head): Peek
 // does not apply. An invalid o or cfg (nil, without a PSK and
-// AllowInsecure) is an ErrInvalidConfig error.
-func NewHTTPExchangeHandler(l *Listener, o *HTTPOptions, cfg *HTTPExchangeConfig) (*HTTPExchangeHandler, error) {
+// AllowInsecure) is a zmux.ErrInvalidConfig error.
+func NewExchangeHandler(l *zmux.Listener, o *Options, cfg *ExchangeConfig) (*ExchangeHandler, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
@@ -65,14 +71,14 @@ func NewHTTPExchangeHandler(l *Listener, o *HTTPOptions, cfg *HTTPExchangeConfig
 	if err != nil {
 		return nil, err
 	}
-	h := &HTTPExchangeHandler{l: l, p: p,
+	h := &ExchangeHandler{l: l, p: p,
 		carriers: map[[exCIDLen]byte]*exServer{}, gone: map[[exCIDLen]byte]*exKey{}}
 	if o != nil {
 		h.o = *o
 	}
 	// Stamps are whole seconds, checked against MaxClockSkew first: the
 	// window takes the second of rounding.
-	if h.nonces, err = NewReplayFilter(ReplayConfig{Window: p.skew.Truncate(time.Second) + time.Second, Max: p.nonceCache}); err != nil {
+	if h.nonces, err = admit.NewReplayFilter(admit.ReplayConfig{Window: p.skew.Truncate(time.Second) + time.Second, Max: p.nonceCache}); err != nil {
 		return nil, err
 	}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
@@ -81,7 +87,7 @@ func NewHTTPExchangeHandler(l *Listener, o *HTTPOptions, cfg *HTTPExchangeConfig
 
 // Close fails every carrier, refuses new requests and returns once the
 // carriers' pipes have ended.
-func (h *HTTPExchangeHandler) Close() error {
+func (h *ExchangeHandler) Close() error {
 	h.mu.Lock()
 	h.closed = true
 	cs := make([]*exServer, 0, len(h.carriers))
@@ -97,62 +103,106 @@ func (h *HTTPExchangeHandler) Close() error {
 	return nil
 }
 
-// ServeHTTP answers one exchange request. A request that is not an
-// authenticated, fresh exchange request is served by the fallback
-// (HTTPOptions.Next) with its body replayed, and changes nothing.
-func (h *HTTPExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.o.Classify(r) != HTTPClassExchange {
+// ServeHTTP answers one exchange request. Every request holds a slot of
+// its source and of the listener (zmux.ListenerConfig.MaxPendingPerSource,
+// MaxPending) from its arrival until its authentication header has been
+// authenticated (one that creates a carrier keeps them until the carrier
+// enters a session); a request without a free slot is answered 503. The
+// server reads the 66-byte authentication header within the listener's
+// FirstRecordTimeout and authenticates it before it reads anything else; a
+// request that is not an authenticated, fresh exchange request is served
+// by the fallback (Options.Next) with the bytes read replayed, and
+// changes nothing. The rest of the body is read within the handshake
+// timeout, into a buffer that grows with the bytes that arrive, and its
+// Data MAC verified before the request is acted on; a body that ends
+// early, arrives late or does not verify is answered 400 and changes
+// nothing.
+func (h *ExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.o.Classify(r) != ClassExchange {
 		h.o.Fallback(w, r)
 		return
 	}
-	if earlyRequest(r) {
+	if zmux.EarlyRequest(r) {
 		w.WriteHeader(http.StatusTooEarly)
 		h.l.CountSetupFailure() // it needs the handshake: no pipe input
 		return
 	}
-	limit := exReqHdrMax + h.p.upLimit
-	if h.p.b64 {
-		limit = b64Len(limit)
+	arrived := h.l.Clock().Now()
+	a, err := h.l.Arrive(h.o.Trusted.RequestSource(r))
+	switch {
+	case errors.Is(err, net.ErrClosed):
+		// A closed listener takes no carrier and holds nothing: its
+		// requests are authenticated to answer GONE.
+	case err != nil:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
 	}
-	if r.ContentLength > int64(limit) {
+	defer a.Release() // nothing once a carrier took the slots
+	authLen, minLen := exAuthLen, exReqOverhead
+	limit := exReqOverhead + h.p.upLimit
+	if h.p.b64 {
+		authLen, minLen, limit = b64Len(exAuthLen), b64Len(exReqOverhead), b64Len(limit)
+	}
+	if r.ContentLength < int64(minLen) || r.ContentLength > int64(limit) {
+		a.Release()
 		h.o.Fallback(w, r)
 		return
 	}
 	cl := int(r.ContentLength)
-	raw := getExBuf(cl)
-	defer raw.unref()
-	n, err := io.ReadFull(r.Body, raw.b[:cl])
+	// The authentication header, within the first-record timeout.
+	var raw [b64AuthLen]byte
+	n, err := h.readBounded(w, r.Body, raw[:authLen], arrived.Add(h.l.FirstRecordTimeout()))
 	if err != nil {
-		// The body ended before its Content-Length (its client aborted
-		// it): the fallback gets what arrived and then the same error,
-		// as it would have read it, not a body that seems complete.
-		r.Body = &replayBody{Reader: io.MultiReader(bytesReader(raw.b[:n]), errReader{err}), c: r.Body}
+		a.Release()
+		// The body ended early or late: the fallback gets what arrived and
+		// then the same error, as it would have read it.
+		r.Body = httpx.ReplayBody(bytes.Clone(raw[:n]), httpx.ErrReader(err), r.Body)
 		h.o.Fallback(w, r)
 		return
 	}
-	buf, body := raw, raw.b[:cl]
+	var bin [exAuthLen]byte
 	if h.p.b64 {
-		dec := getExBuf(base64.StdEncoding.DecodedLen(cl))
-		m, err := base64.StdEncoding.Strict().Decode(dec.b, raw.b[:cl])
-		if err != nil {
-			dec.unref()
-			h.fallback(w, r, raw.b[:cl])
+		if m, err := base64.StdEncoding.Strict().Decode(bin[:], raw[:authLen]); err != nil || m != exAuthLen {
+			a.Release()
+			h.fallback(w, r, bytes.Clone(raw[:authLen]))
 			return
 		}
-		buf, body = dec, dec.b[:m]
-		defer dec.unref()
+	} else {
+		copy(bin[:], raw[:exAuthLen])
 	}
-	// The request's fields alias buf until the response is written.
-	q, ok := parseExReq(body)
-	if !ok {
-		h.fallback(w, r, raw.b[:cl])
+	q := parseExAuth(&bin)
+	body := exReqOverhead + int(q.dlen)
+	if h.p.b64 {
+		body = b64Len(body)
+	}
+	if body != cl || int(q.dlen) > exDataLimit(q.kind, h.p.upLimit) {
+		a.Release()
+		h.fallback(w, r, bytes.Clone(raw[:authLen]))
 		return
 	}
-	c, key, gone := h.authenticate(&q)
+	c, key, gone := h.authenticate(&q, bin[:exFieldsLen])
+	if key == nil {
+		a.Release()
+		h.fallback(w, r, bytes.Clone(raw[:authLen]))
+		return
+	}
+	if c != nil || gone {
+		a.Release() // a request of a known carrier holds no slot from now on
+	}
+	// Data and the Data MAC, within the handshake timeout.
+	buf, rest, err := h.readBody(w, r.Body, cl-authLen, h.l.Clock().Now().Add(h.l.HandshakeTimeout()))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	defer buf.unref()
+	q.data = rest[:q.dlen]
+	if m := key.dataMAC(q.hmac, q.data); !hmac.Equal(m[:], rest[q.dlen:]) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	switch {
-	case key == nil:
-		h.fallback(w, r, raw.b[:cl])
-	case !q.valid:
+	case !q.valid():
 		// Authenticated, but its fields are malformed.
 		if c != nil {
 			c.fail(errExchangeProtocol)
@@ -164,7 +214,7 @@ func (h *HTTPExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	case gone:
 		h.respond(w, key, &q, exFlagGone, nil)
 	default:
-		c, flags := h.create(w, r, &q, key, raw.b[:cl])
+		c, flags := h.create(w, r, a, &q, key, raw, authLen, rest)
 		if flags == exAnswered {
 			return
 		}
@@ -177,23 +227,89 @@ func (h *HTTPExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// errReadTimedOut is a request body that did not arrive by its deadline.
+var errReadTimedOut = errors.New("zmuxhttp: request body timed out")
+
+// b64AuthLen is the length of the authentication header in the base64
+// body encoding.
+const b64AuthLen = (exAuthLen + 2) / 3 * 4
+
+// readBounded reads len(b) bytes of body by deadline; n is what it read.
+func (h *ExchangeHandler) readBounded(w http.ResponseWriter, body io.Reader, b []byte, deadline time.Time) (n int, err error) {
+	stop := h.readDeadline(w, deadline)
+	n, err = io.ReadFull(body, b)
+	if !stop() && err == nil {
+		err = errReadTimedOut
+	}
+	return n, err
+}
+
+// readBody reads the n bytes of a request body after the authentication
+// header by deadline, into a buffer that grows with what arrives, and
+// decodes them when the body is base64: the result is Data followed by
+// the Data MAC.
+func (h *ExchangeHandler) readBody(w http.ResponseWriter, body io.Reader, n int, deadline time.Time) (*exBuf, []byte, error) {
+	stop := h.readDeadline(w, deadline)
+	buf, b, err := readExBody(body, n, h.p.b64)
+	if !stop() && err == nil {
+		buf.unref()
+		err = errReadTimedOut
+	}
+	if err == nil && len(b) < exMACLen {
+		buf.unref()
+		err = errExchangeProtocol
+	}
+	return buf, b, err
+}
+
+// readDeadline ends the reads of the request at deadline, on the
+// listener's clock; stop reports whether it had not fired.
+func (h *ExchangeHandler) readDeadline(w http.ResponseWriter, deadline time.Time) (stop func() bool) {
+	rc := http.NewResponseController(w)
+	done := make(chan struct{})
+	t := h.l.Clock().AfterFunc(deadline.Sub(h.l.Clock().Now()), func() {
+		defer close(done)
+		_ = rc.SetReadDeadline(time.Now())
+	})
+	return func() bool {
+		if t.Stop() {
+			return true
+		}
+		<-done // the deadline it set is cleared after it, not before
+		_ = rc.SetReadDeadline(time.Time{})
+		return false
+	}
+}
+
 // exAnswered is create's flags for a request the admission answered.
 const exAnswered = 0xff
 
 // fallback serves a request that is not authenticated with the fallback,
 // the bytes read from its body put back in front of the rest.
-func (h *HTTPExchangeHandler) fallback(w http.ResponseWriter, r *http.Request, read []byte) {
+func (h *ExchangeHandler) fallback(w http.ResponseWriter, r *http.Request, read []byte) {
 	if len(read) > 0 {
-		r.Body = &replayBody{Reader: io.MultiReader(bytesReader(read), r.Body), c: r.Body}
+		r.Body = httpx.ReplayBody(read, r.Body, r.Body)
 	}
 	h.o.Fallback(w, r)
 }
 
-// authenticate verifies q's MAC with the key of its carrier (live c,
-// remembered as gone, or new), then its freshness: its Time within
-// MaxClockSkew of the clock and its (Carrier ID, Nonce) not seen before.
-// key is nil when q is not authenticated.
-func (h *HTTPExchangeHandler) authenticate(q *exReq) (c *exServer, key *exKey, gone bool) {
+// replayed is the body of an authenticated request as it was read: the
+// authentication header auth as read, then Data and the Data MAC rest,
+// encoded again when the body is base64 (the strict decoding they passed
+// makes the encoding the bytes that arrived).
+func (h *ExchangeHandler) replayed(auth, rest []byte) []byte {
+	if !h.p.b64 {
+		return append(append(make([]byte, 0, len(auth)+len(rest)), auth...), rest...)
+	}
+	b := make([]byte, 0, len(auth)+base64.StdEncoding.EncodedLen(len(rest)))
+	return base64.StdEncoding.AppendEncode(append(b, auth...), rest)
+}
+
+// authenticate verifies q's Header MAC over fields with the key of its
+// carrier (live c, remembered as gone, or new), then its freshness: its
+// Time within MaxClockSkew of the clock and its (Carrier ID, Nonce) not
+// seen before, which it records. key is nil when q is not authenticated.
+func (h *ExchangeHandler) authenticate(q *exReq, fields []byte) (c *exServer, key *exKey, gone bool) {
 	h.mu.Lock()
 	c = h.carriers[q.cid]
 	g, gone := h.goneLocked(q.cid)
@@ -206,7 +322,7 @@ func (h *HTTPExchangeHandler) authenticate(q *exReq) (c *exServer, key *exKey, g
 	default:
 		key = newExKey(h.p.psk, q.cid[:])
 	}
-	if m := key.requestMAC(q.hdr, q.data); !hmac.Equal(m[:], q.mac) {
+	if m := key.headerMAC(fields); !hmac.Equal(m[:], q.hmac) {
 		return nil, nil, false
 	}
 	now := time.Now().Unix()
@@ -218,7 +334,7 @@ func (h *HTTPExchangeHandler) authenticate(q *exReq) (c *exServer, key *exKey, g
 	var k [exCIDLen + exNonceLen]byte
 	copy(k[:], q.cid[:])
 	copy(k[exCIDLen:], q.nonce)
-	if h.nonces.checkAt(k[:], (now+d)*1000, now*1000) != ReplayFresh {
+	if h.nonces.Check(k[:], (now+d)*1000) != admit.ReplayFresh {
 		return nil, nil, false
 	}
 	return c, key, gone
@@ -228,14 +344,16 @@ func (h *HTTPExchangeHandler) authenticate(q *exReq) (c *exServer, key *exKey, g
 // Carrier ID. Without a carrier, flags is the answer: GONE when the
 // handler or its listener is closed, BUSY under memory pressure or when the
 // listener refuses the carrier (its source holds its share of pending
-// carriers, ListenerConfig.MaxPendingPerSource), processed
+// carriers, zmux.ListenerConfig.MaxPendingPerSource), processed
 // for a CLOSE (which creates none and remembers the carrier as gone).
 //
-// The request that creates a carrier takes a slot of its source and
+// The request that creates a carrier keeps the slots of its arrival a and
 // passes the listener's admission, decided on its head; one that is not
 // accepted has been answered (the fallback, or the request aborted) and
-// create returns exAnswered.
-func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *exReq, key *exKey, read []byte) (*exServer, byte) {
+// create returns exAnswered. The fallback gets the request with its body
+// as it arrived: raw[:authLen], the authentication header as read, and
+// rest, the decoded Data and Data MAC, encoded back as they were read.
+func (h *ExchangeHandler) create(w http.ResponseWriter, r *http.Request, a *zmux.Arrival, q *exReq, key *exKey, raw [b64AuthLen]byte, authLen int, rest []byte) (*exServer, byte) {
 	if q.kind == exKindClose {
 		h.mu.Lock()
 		h.forgetLocked(q.cid, key)
@@ -246,16 +364,15 @@ func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *
 	closed := h.closed
 	h.mu.Unlock()
 	switch {
-	case closed || h.l.isClosed():
+	case closed || a == nil: // a nil arrival: the listener is closed
 		return nil, exFlagGone
-	case h.l.budget.Pressure():
+	case h.l.MemoryPressure():
 		return nil, exFlagBusy
 	}
-	a, err := h.l.Arrive(requestSource(h.o.Trusted, r))
-	if err != nil {
-		return nil, exFlagBusy // the source holds its share
-	}
-	if !a.decideRequest(w, r, false, func() { h.fallback(w, r, read) }) {
+	fallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.fallback(w, r, h.replayed(raw[:authLen], rest))
+	})
+	if !a.DecideRequest(w, r, fallback) {
 		return nil, exAnswered
 	}
 	nc := newExServer(h, q.cid, key)
@@ -278,25 +395,18 @@ func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *
 	// The listener takes or refuses the carrier now, before it waits for
 	// anything: one it refuses is answered BUSY and leaves no state, live
 	// or gone.
-	a.takeSlot()
-	a.mu.Lock()
-	hint := PipeHint{Source: a.src, Admitted: a.value}
-	a.mu.Unlock()
-	run, err := h.l.take(PipeIO{R: &exServerReader{nc}, W: &exServerWriter{nc},
-		Carrier: CarrierExchange}, hint, a.key)
+	run, err := a.Take(r.Context(), zmux.PipeIO{R: &exServerReader{nc}, W: &exServerWriter{nc},
+		Carrier: zmux.CarrierExchange}, zmux.PipeHint{})
 	if err != nil {
 		h.mu.Lock()
 		if h.carriers[q.cid] == nc {
 			delete(h.carriers, q.cid)
 		}
-		if _, gone := h.gone[q.cid]; gone {
-			if n := len(h.goneQ); n > 0 && h.goneQ[n-1].cid == q.cid {
-				// Remembered by the refused pipe's close just now.
-				delete(h.gone, q.cid)
-				h.goneQ[n-1] = exGone{}
-				h.goneQ = h.goneQ[:n-1]
-			}
-		}
+		// The refused pipe's close may have remembered it meanwhile, with
+		// other carriers forgotten after it: no Carrier ID but this one's
+		// was free of state when it was created, so any record of it is
+		// this carrier's.
+		h.unforgetLocked(q.cid)
 		h.mu.Unlock()
 		nc.idle.Stop()
 		h.wg.Done()
@@ -310,7 +420,7 @@ func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *
 }
 
 // goneLocked looks a remembered carrier up, forgetting the expired ones.
-func (h *HTTPExchangeHandler) goneLocked(cid [exCIDLen]byte) (*exKey, bool) {
+func (h *ExchangeHandler) goneLocked(cid [exCIDLen]byte) (*exKey, bool) {
 	now := time.Now()
 	for len(h.goneQ) > 0 && now.After(h.goneQ[0].until) {
 		delete(h.gone, h.goneQ[0].cid)
@@ -322,7 +432,7 @@ func (h *HTTPExchangeHandler) goneLocked(cid [exCIDLen]byte) (*exKey, bool) {
 }
 
 // forgetLocked removes a carrier and remembers it for GoneMemory.
-func (h *HTTPExchangeHandler) forgetLocked(cid [exCIDLen]byte, key *exKey) {
+func (h *ExchangeHandler) forgetLocked(cid [exCIDLen]byte, key *exKey) {
 	delete(h.carriers, cid)
 	if _, ok := h.gone[cid]; !ok {
 		h.gone[cid] = key
@@ -330,9 +440,23 @@ func (h *HTTPExchangeHandler) forgetLocked(cid [exCIDLen]byte, key *exKey) {
 	}
 }
 
+// unforgetLocked drops what forgetLocked remembered of cid.
+func (h *ExchangeHandler) unforgetLocked(cid [exCIDLen]byte) {
+	if _, ok := h.gone[cid]; !ok {
+		return
+	}
+	delete(h.gone, cid)
+	for i := len(h.goneQ) - 1; i >= 0; i-- {
+		if h.goneQ[i].cid == cid {
+			h.goneQ = slices.Delete(h.goneQ, i, i+1)
+			break
+		}
+	}
+}
+
 // respond writes a response with flags and data to q.
-func (h *HTTPExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exReq, flags byte, data []byte) {
-	mac := key.responseMAC(q.cid[:], q.kind, q.seqRaw, q.nonce, flags, data)
+func (h *ExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exReq, flags byte, data []byte) {
+	mac := key.responseMAC(q.cid[:], q.kind, q.seq, q.nonce, flags, data)
 	var hdr [exRespHdr]byte
 	copy(hdr[:], mac[:])
 	hdr[exMACLen] = flags
@@ -365,7 +489,7 @@ func (h *HTTPExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exRe
 // is owned by mu. Held DOWN requests wait in their HTTP handlers, each
 // bounded by the hold time; zmux reads and writes through the halves.
 type exServer struct {
-	h   *HTTPExchangeHandler
+	h   *ExchangeHandler
 	cid [exCIDLen]byte
 	key *exKey
 
@@ -415,7 +539,7 @@ type exAssign struct {
 	released bool
 }
 
-func newExServer(h *HTTPExchangeHandler, cid [exCIDLen]byte, key *exKey) *exServer {
+func newExServer(h *ExchangeHandler, cid [exCIDLen]byte, key *exKey) *exServer {
 	c := &exServer{h: h, cid: cid, key: key, assigned: make(chan struct{}), dead: make(chan struct{}),
 		upOOO: map[uint64]*exPiece{}, pieces: map[uint64]*exAssign{}, last: time.Now()}
 	c.rc.L, c.wc.L = &c.mu, &c.mu
@@ -425,7 +549,7 @@ func newExServer(h *HTTPExchangeHandler, cid [exCIDLen]byte, key *exKey) *exServ
 
 func (c *exServer) charge(d int64) {
 	c.mem += d
-	c.h.l.budget.Add(d)
+	c.h.l.ChargeMemory(d)
 }
 
 func (c *exServer) onIdle() {
@@ -636,7 +760,7 @@ func (c *exServer) upLocked(q *exReq, buf *exBuf) byte {
 		// a fixed cost per held piece, empty ones too, so that their
 		// number is bounded.
 		room -= c.h.p.upLimit
-		if c.h.l.budget.Pressure() {
+		if c.h.l.MemoryPressure() {
 			room = 0
 		}
 		need += exPieceCost

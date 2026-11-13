@@ -1,4 +1,4 @@
-package zmux
+package zmuxhttp
 
 import (
 	"crypto/hmac"
@@ -15,7 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zmuxio/zmux-go/varint"
+	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/setting"
 )
 
 // HTTP exchange carriers: one bidirectional carrier made of a sequence of
@@ -31,7 +32,7 @@ import (
 // authenticate both ends with the PSK, but they do not encrypt. When TLS
 // ends at a proxy or CDN, that intermediary can read the carrier.
 
-// HTTPExchangeConfig configures both ends of an HTTP exchange carrier. A
+// ExchangeConfig configures both ends of an HTTP exchange carrier. A
 // PSK is required unless AllowInsecure is set; the zero value of every
 // other field selects its default. PSK (or AllowInsecure) and Base64 must
 // be the same on both ends; the other fields are local to one end. The
@@ -46,8 +47,8 @@ import (
 // Under the Settings rules of the package documentation, a field of 0
 // selects its default; a negative RequestTimeout, Deadline, HoldTime or
 // IdleTimeout is no timeout, and a negative Coalesce sends every piece at
-// once; another negative value is invalid (ErrInvalidConfig).
-type HTTPExchangeConfig struct {
+// once; another negative value is invalid (zmux.ErrInvalidConfig).
+type ExchangeConfig struct {
 	// PSK is the pre-shared key: the MACs authenticate both ends with it.
 	PSK []byte
 	// AllowInsecure runs the carrier without a PSK, for tests and
@@ -59,21 +60,21 @@ type HTTPExchangeConfig struct {
 	// for paths that do not pass binary bodies unchanged.
 	Base64 bool
 
-	// NoCacheBust leaves a URL without {nonce} unchanged (client). By
-	// default such a URL gets the NonceParam query parameter with a random
-	// value per request, so that no cache keyed on the target can answer
-	// one request with the response to another. Set it for a server or
-	// intermediary that refuses unknown query parameters, when nothing on
-	// the path caches POST responses; a cached response would still fail
-	// its MAC and be repeated, but not get through.
-	NoCacheBust bool
+	// CacheBust gives a URL without {nonce} the NonceParam query parameter
+	// with a random value per request (client), so that no cache keyed on
+	// the target can answer one request with the response to another. It
+	// is on by default; zmux.SwitchOff leaves such a URL unchanged, for a server
+	// or intermediary that refuses unknown query parameters, when nothing
+	// on the path caches POST responses: a cached response would still
+	// fail its MAC and be repeated, but not get through.
+	CacheBust zmux.Switch
 	// testSkipResponseMAC disables the client's response MAC check (tests
 	// only: shows that the check is what rejects replayed responses).
 	testSkipResponseMAC bool
 	// Header is added to every request (client).
 	Header http.Header
 	// DownURL is the target template of DOWN requests (client; empty: the
-	// URL given to HTTPExchangePipe, which UP and CLOSE requests use). It
+	// URL given to ExchangePipe, which UP and CLOSE requests use). It
 	// may differ in scheme, host, port and path and pass other
 	// intermediaries, as long as every request of a carrier reaches the
 	// server process that holds it; it takes the same placeholders.
@@ -96,7 +97,7 @@ type HTTPExchangeConfig struct {
 	// limit when above 1 MiB, the default limit of piece data a request may
 	// carry. A request whose Content-Length exceeds that limit plus the
 	// largest request header, after the body encoding, is not read: it goes
-	// to the fallback (HTTPOptions.Next) as a request that is not an exchange request.
+	// to the fallback (Options.Next) as a request that is not an exchange request.
 	// The default (DefaultExchangePieceSize) keeps every request body at
 	// most 1,000,000 bytes after the body encoding.
 	UpPieceSize int
@@ -160,12 +161,12 @@ const exLimit = 1 << 20
 // encoding (base64 or not), stay at most 1,000,000 bytes.
 func DefaultExchangePieceSize(base64 bool) int {
 	if base64 {
-		return exBodyMax/4*3 - exReqHdrMax
+		return exBodyMax/4*3 - exReqOverhead
 	}
-	return exBodyMax - exReqHdrMax
+	return exBodyMax - exReqOverhead
 }
 
-// exParams is a resolved HTTPExchangeConfig.
+// exParams is a resolved ExchangeConfig.
 type exParams struct {
 	psk                    []byte
 	header                 http.Header
@@ -190,16 +191,16 @@ type exParams struct {
 }
 
 // resolve validates c (nil: the zero config) and fills in the defaults.
-func (c *HTTPExchangeConfig) resolve() (exParams, error) {
-	var x HTTPExchangeConfig
+func (c *ExchangeConfig) resolve() (exParams, error) {
+	var x ExchangeConfig
 	if c != nil {
 		x = *c
 	}
 	switch {
 	case x.AllowInsecure && len(x.PSK) > 0:
-		return exParams{}, fmt.Errorf("%w: HTTPExchangeConfig.AllowInsecure with a PSK", ErrInvalidConfig)
+		return exParams{}, fmt.Errorf("%w: ExchangeConfig.AllowInsecure with a PSK", zmux.ErrInvalidConfig)
 	case !x.AllowInsecure && len(x.PSK) == 0:
-		return exParams{}, fmt.Errorf("%w: HTTPExchangeConfig needs a PSK or AllowInsecure", ErrInvalidConfig)
+		return exParams{}, fmt.Errorf("%w: ExchangeConfig needs a PSK or AllowInsecure", zmux.ErrInvalidConfig)
 	}
 	neg := false
 	pos := func(v, d int) int {
@@ -218,21 +219,21 @@ func (c *HTTPExchangeConfig) resolve() (exParams, error) {
 	}
 	p := exParams{
 		psk: x.PSK, b64: x.Base64, header: x.Header, instance: x.Instance,
-		nonceParam: x.NonceParam, downURL: x.DownURL, cacheBust: !x.NoCacheBust,
+		nonceParam: x.NonceParam, downURL: x.DownURL, cacheBust: x.CacheBust.On(),
 		downs: pos(x.DownRequests, 2), ups: pos(x.UpRequests, 2),
 		upPiece:    pos(x.UpPieceSize, DefaultExchangePieceSize(x.Base64)),
 		downPiece:  pos(x.DownPieceSize, DefaultExchangePieceSize(x.Base64)),
-		reqTimeout: timeout(x.RequestTimeout, 25*time.Second),
+		reqTimeout: setting.Timeout(x.RequestTimeout, 25*time.Second),
 		backoffMin: dur(x.BackoffMin, 20*time.Millisecond), backoffMax: dur(x.BackoffMax, 2*time.Second),
-		deadline: timeout(x.Deadline, 30*time.Second),
-		hold:     timeout(x.HoldTime, 20*time.Second), coalesce: max(x.Coalesce, 0),
+		deadline: setting.Timeout(x.Deadline, 30*time.Second),
+		hold:     setting.Timeout(x.HoldTime, 20*time.Second), coalesce: max(x.Coalesce, 0),
 		window: pos(x.DownWindow, 32), upStore: pos(x.UpStoreLimit, 4<<20),
-		idle: timeout(x.IdleTimeout, 60*time.Second), goneFor: dur(x.GoneMemory, 60*time.Second),
+		idle: setting.Timeout(x.IdleTimeout, 60*time.Second), goneFor: dur(x.GoneMemory, 60*time.Second),
 		skipRespMAC: x.testSkipResponseMAC,
 		skew:        dur(x.MaxClockSkew, 60*time.Second), nonceCache: pos(x.NonceCacheSize, 1<<18),
 	}
 	if neg {
-		return exParams{}, fmt.Errorf("%w: negative HTTPExchangeConfig field", ErrInvalidConfig)
+		return exParams{}, fmt.Errorf("%w: negative ExchangeConfig field", zmux.ErrInvalidConfig)
 	}
 	if x.Coalesce == 0 {
 		p.coalesce = 2 * time.Millisecond
@@ -257,18 +258,21 @@ const (
 	exFlagBusy = 0x02
 	exFlagGone = 0x04
 
-	exCIDLen    = 16
-	exTimeLen   = 4
-	exNonceLen  = 8
-	exMACLen    = 16
-	exReqHdrMax = exCIDLen + 2 + 8 + 8 + exTimeLen + exNonceLen + exMACLen // with the longest varints
-	exRespHdr   = exMACLen + 1
-	exReasonMax = 256
+	exCIDLen      = 16
+	exTimeLen     = 4
+	exNonceLen    = 8
+	exMACLen      = 16
+	exFieldsLen   = exCIDLen + 2 + 8 + 8 + exTimeLen + exNonceLen + 4 // Carrier ID through Data Length
+	exAuthLen     = exFieldsLen + exMACLen                            // the authentication header
+	exReqOverhead = exAuthLen + exMACLen                              // the header and the Data MAC
+	exRespHdr     = exMACLen + 1
+	exReasonMax   = 256
 )
 
 var (
 	exLabel = []byte("zmux-http-exchange/1")
 	exQ     = []byte{'Q'}
+	exD     = []byte{'D'}
 )
 
 var (
@@ -309,88 +313,105 @@ func (k *exKey) mac(a, b, c []byte) (out [exMACLen]byte) {
 	return out
 }
 
-// requestMAC covers "Q" || hdr || data, where hdr is the request from its
-// Carrier ID through its Nonce, as sent.
-func (k *exKey) requestMAC(hdr, data []byte) [exMACLen]byte { return k.mac(exQ, hdr, data) }
+// headerMAC is the Header MAC: it covers "Q" || fields, the request from
+// its Carrier ID through its Data Length.
+func (k *exKey) headerMAC(fields []byte) [exMACLen]byte { return k.mac(exQ, fields, nil) }
 
-// responseMAC covers "R" || Carrier ID || Kind || Sequence (as sent) ||
-// Nonce || Flags || Data.
-func (k *exKey) responseMAC(cid []byte, kind byte, seqRaw, nonce []byte, flags byte, data []byte) [exMACLen]byte {
+// dataMAC is the Data MAC: it covers "D" || Header MAC || Data.
+func (k *exKey) dataMAC(hmac, data []byte) [exMACLen]byte { return k.mac(exD, hmac, data) }
+
+// responseMAC covers "R" || Carrier ID || Kind || Sequence || Nonce ||
+// Flags || Data.
+func (k *exKey) responseMAC(cid []byte, kind byte, seq uint64, nonce []byte, flags byte, data []byte) [exMACLen]byte {
 	var pre [1 + exCIDLen + 1 + 8 + exNonceLen + 1]byte
 	b := append(pre[:0], 'R')
 	b = append(b, cid...)
 	b = append(b, kind)
-	b = append(b, seqRaw...)
+	b = binary.BigEndian.AppendUint64(b, seq)
 	b = append(b, nonce...)
 	b = append(b, flags)
 	return k.mac(b, data, nil)
 }
 
-// appendExReqHdr appends a request from its Carrier ID through its Nonce;
-// ts is the Time field.
-func appendExReqHdr(b []byte, cid *[exCIDLen]byte, kind, flags byte, seq, ack uint64, ts uint32, nonce *[exNonceLen]byte) []byte {
+// appendExAuth appends the authentication header of a request with n bytes
+// of Data: its fields and their Header MAC; ts is the Time field.
+func appendExAuth(b []byte, k *exKey, cid *[exCIDLen]byte, kind, flags byte, seq, ack uint64, ts uint32, nonce *[exNonceLen]byte, n int) []byte {
+	start := len(b)
 	b = append(b, cid[:]...)
 	b = append(b, kind, flags)
-	b = varint.AppendVarint(b, seq)
-	b = varint.AppendVarint(b, ack)
+	b = binary.BigEndian.AppendUint64(b, seq)
+	b = binary.BigEndian.AppendUint64(b, ack)
 	b = binary.BigEndian.AppendUint32(b, ts)
-	return append(b, nonce[:]...)
+	b = append(b, nonce[:]...)
+	b = binary.BigEndian.AppendUint32(b, uint32(n))
+	mac := k.headerMAC(b[start:])
+	return append(b, mac[:]...)
 }
 
-// exReq is a parsed request; its slices alias the body.
+// appendExRequest appends a whole binary request body.
+func appendExRequest(b []byte, k *exKey, cid *[exCIDLen]byte, kind, flags byte, seq, ack uint64, ts uint32, nonce *[exNonceLen]byte, data []byte) []byte {
+	start := len(b)
+	b = appendExAuth(b, k, cid, kind, flags, seq, ack, ts, nonce, len(data))
+	b = append(b, data...)
+	mac := k.dataMAC(b[start+exFieldsLen:start+exAuthLen], data)
+	return append(b, mac[:]...)
+}
+
+// exReq is a parsed request. nonce and hmac alias the authentication
+// header, data the body.
 type exReq struct {
-	cid    [exCIDLen]byte
-	kind   byte
-	flags  byte
-	valid  bool // Kind, Flags, Data and reason are well formed
-	ts     uint32
-	seq    uint64
-	ack    uint64
-	seqRaw []byte
-	nonce  []byte
-	hdr    []byte // Carrier ID through Nonce
-	mac    []byte
-	data   []byte
+	cid   [exCIDLen]byte
+	kind  byte
+	flags byte
+	ts    uint32
+	seq   uint64
+	ack   uint64
+	dlen  uint32
+	nonce []byte
+	hmac  []byte
+	data  []byte
 }
 
-// parseExReq parses a binary request body; ok reports a complete header,
-// q.valid whether its fields are well formed.
-func parseExReq(b []byte) (q exReq, ok bool) {
-	if len(b) < exCIDLen+2 {
-		return q, false
-	}
-	copy(q.cid[:], b)
+// parseExAuth parses an authentication header.
+func parseExAuth(b *[exAuthLen]byte) (q exReq) {
+	copy(q.cid[:], b[:])
 	q.kind, q.flags = b[exCIDLen], b[exCIDLen+1]
 	off := exCIDLen + 2
-	var n int
-	if q.seq, n = varint.ConsumeVarint(b[off:]); n == 0 {
-		return q, false
-	}
-	q.seqRaw = b[off : off+n]
-	off += n
-	if q.ack, n = varint.ConsumeVarint(b[off:]); n == 0 {
-		return q, false
-	}
-	off += n
-	if len(b) < off+exTimeLen+exNonceLen+exMACLen {
-		return q, false
-	}
+	q.seq = binary.BigEndian.Uint64(b[off:])
+	q.ack = binary.BigEndian.Uint64(b[off+8:])
+	off += 16
 	q.ts = binary.BigEndian.Uint32(b[off:])
 	off += exTimeLen
 	q.nonce = b[off : off+exNonceLen]
 	off += exNonceLen
-	q.hdr = b[:off]
-	q.mac = b[off : off+exMACLen]
-	q.data = b[off+exMACLen:]
+	q.dlen = binary.BigEndian.Uint32(b[off:])
+	q.hmac = b[exFieldsLen:exAuthLen]
+	return q
+}
+
+// valid reports whether q's Kind, Flags and Data are well formed.
+func (q *exReq) valid() bool {
 	switch q.kind {
 	case exKindUp:
-		q.valid = q.flags&^exFlagFin == 0
+		return q.flags&^exFlagFin == 0
 	case exKindDown:
-		q.valid = q.flags == 0 && len(q.data) == 0
+		return q.flags == 0 && len(q.data) == 0
 	case exKindClose:
-		q.valid = q.flags == 0 && q.seq == 0 && len(q.data) <= exReasonMax
+		return q.flags == 0 && q.seq == 0 && len(q.data) <= exReasonMax
 	}
-	return q, true
+	return false
+}
+
+// exDataLimit is the most Data a request of kind may declare: up for UP,
+// the reason bound for CLOSE, none for DOWN or an unknown kind.
+func exDataLimit(kind byte, up int) int {
+	switch kind {
+	case exKindUp:
+		return up
+	case exKindClose:
+		return exReasonMax
+	}
+	return 0
 }
 
 // exRespValid reports whether response flags and data are well formed for
@@ -410,26 +431,57 @@ func exRespValid(kind, flags byte, data []byte) bool {
 // b64Len is the length of the padded base64 encoding of n bytes.
 func b64Len(n int) int { return base64.StdEncoding.EncodedLen(n) }
 
-// readExBody reads a body of exactly cl bytes (a complete HTTP body) into a
-// pooled buffer and decodes it when b64; the result is the binary body.
+// readExBody reads a body of exactly cl bytes (a complete HTTP body) and
+// decodes it when b64; the result is the binary body. The buffer grows
+// with the bytes that arrive, never from cl alone, up to cl.
 func readExBody(r io.Reader, cl int, b64 bool) (*exBuf, []byte, error) {
-	raw := getExBuf(cl)
-	if _, err := io.ReadFull(r, raw.b[:cl]); err != nil {
-		raw.unref()
+	raw, n, err := readExGrow(r, cl)
+	if err != nil {
 		return nil, nil, err
 	}
 	if !b64 {
-		return raw, raw.b[:cl], nil
+		return raw, raw.b[:n], nil
 	}
-	dec := getExBuf(base64.StdEncoding.DecodedLen(cl))
-	n, err := base64.StdEncoding.Strict().Decode(dec.b, raw.b[:cl])
+	dec := getExBuf(base64.StdEncoding.DecodedLen(n))
+	m, err := base64.StdEncoding.Strict().Decode(dec.b, raw.b[:n])
 	raw.unref()
 	if err != nil {
 		dec.unref()
 		return nil, nil, err
 	}
-	return dec, dec.b[:n], nil
+	return dec, dec.b[:m], nil
 }
+
+// readExGrow reads exactly n bytes from r into a pooled buffer that grows
+// as they arrive; on an error nothing is returned.
+func readExGrow(r io.Reader, n int) (*exBuf, int, error) {
+	var b *exBuf
+	got := 0
+	for got < n {
+		b = exGrow(b, got, min(got+exReadChunk, n), n)
+		m, err := r.Read(b.b[got:min(len(b.b), n)])
+		got += m
+		if got == n {
+			break
+		}
+		if err != nil {
+			if b != nil {
+				b.unref()
+			}
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, 0, err
+		}
+	}
+	if b == nil {
+		b = getExBuf(0)
+	}
+	return b, n, nil
+}
+
+// exReadChunk is the least a body buffer grows by before more bytes arrive.
+const exReadChunk = 4 << 10
 
 // ---- buffers ----
 

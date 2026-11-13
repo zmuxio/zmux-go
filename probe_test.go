@@ -54,18 +54,17 @@ func (e *mpEnv) addPipeVia(t *testing.T, addr string, o PipeOptions) *Pipe {
 
 func TestProbeOptionsValidation(t *testing.T) {
 	for _, j := range []float64{1, 1.5, math.NaN()} {
-		c := &Config{SchedulerParams: SchedulerParams{ProbeJitter: j}}
+		c := &Config{Liveness: Liveness{ProbeJitter: j}}
 		if _, err := c.coreConfig(core.RoleInitiator, core.RoleInitiator); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("session ProbeJitter %v: %v", j, err)
 		}
 	}
-	// 0 is the default 0.25; NoProbeJitter is 0.
+	// 0 is the default 0.25; a negative jitter is 0.
 	for _, c := range []struct {
 		set  float64
-		no   bool
 		want float64
-	}{{0, false, 0.25}, {0, true, 0}, {0.3, false, 0.3}} {
-		cfg := &Config{SchedulerParams: SchedulerParams{ProbeJitter: c.set, NoProbeJitter: c.no, ProbeInterval: 20 * time.Second}}
+	}{{0, 0.25}, {-1, 0}, {-0.1, 0}, {0.3, 0.3}} {
+		cfg := &Config{Liveness: Liveness{ProbeJitter: c.set, ProbeInterval: 20 * time.Second}}
 		cc, err := cfg.coreConfig(core.RoleInitiator, core.RoleInitiator)
 		if err != nil {
 			t.Errorf("session ProbeJitter %v: %v", c.set, err)
@@ -75,15 +74,15 @@ func TestProbeOptionsValidation(t *testing.T) {
 			t.Errorf("session ProbeJitter %v: %v %v", c.set, cc.ProbeJitter, cc.ProbeInterval)
 		}
 	}
-	for _, o := range []PipeOptions{{ProbeInterval: 999 * time.Millisecond}, {ProbeInterval: time.Nanosecond},
-		{ProbeJitter: 1}, {ProbeJitter: math.NaN()}, {ProbeJitter: -2}} {
-		if _, err := o.join(DirBidirectional); !errors.Is(err, ErrInvalidConfig) {
+	for _, o := range []PipeOptions{{Liveness: PipeLiveness{ProbeInterval: 999 * time.Millisecond}}, {Liveness: PipeLiveness{ProbeInterval: time.Nanosecond}},
+		{Liveness: PipeLiveness{ProbeJitter: 1}}, {Liveness: PipeLiveness{ProbeJitter: math.NaN()}}} {
+		if _, err := o.join(DirectionBidirectional); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%+v: %v", o, err)
 		}
 	}
-	for _, o := range []PipeOptions{{ProbeInterval: time.Second, ProbeJitter: 0.99}} {
-		j, err := o.join(DirBidirectional)
-		if err != nil || j.Live.ProbeInterval != core.Duration(o.ProbeInterval) || j.Live.ProbeJitter != o.ProbeJitter {
+	for _, o := range []PipeOptions{{Liveness: PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.99}}} {
+		j, err := o.join(DirectionBidirectional)
+		if err != nil || j.Live.ProbeInterval != core.Duration(o.Liveness.ProbeInterval) || j.Live.ProbeJitter != o.Liveness.ProbeJitter {
 			t.Errorf("%+v: %+v %v", o, j, err)
 		}
 	}
@@ -95,7 +94,7 @@ func TestProbePerPipeInterval(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		e := newMemMPEnv(t, mpConfig(), mpConfig())
-		p := e.addPipe(t, PipeOptions{ProbeInterval: time.Second})
+		p := e.addPipe(t, PipeOptions{Liveness: PipeLiveness{ProbeInterval: time.Second}})
 		base := pipeStat(t, p).PingsSent
 		synctest.Sleep(3500 * time.Millisecond)
 		if n := pipeStat(t, p).PingsSent - base; n < 2 || n > 5 {
@@ -120,8 +119,8 @@ func TestProbesDoNotKeepSessionAlive(t *testing.T) {
 	cfg := func(keep time.Duration) *Config {
 		c := mpConfig()
 		c.MaxIdleTimeout = 3 * time.Second
-		c.KeepAlivePeriod = keep
-		c.SchedulerParams.ProbeInterval = time.Second
+		c.Liveness.KeepAlivePeriod = keep
+		c.Liveness.ProbeInterval = time.Second
 		return c
 	}
 	t.Run("idle", func(t *testing.T) {
@@ -187,7 +186,7 @@ func TestProbeAnsweredOnSamePairWithJitter(t *testing.T) {
 	t.Parallel()
 	clk, cc, sc := fakeConfigs(func(c *Config) {
 		c.MaxIdleTimeout = -1
-		c.KeepAlivePeriod = -1
+		c.Liveness.KeepAlivePeriod = -1
 	})
 	e := newMPEnv(t, cc, sc)
 	rl, err := zmuxtest.NewRelay(e.ln.Addr().String(), zmuxtest.RelayOptions{})
@@ -195,7 +194,7 @@ func TestProbeAnsweredOnSamePairWithJitter(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = rl.Close() })
-	p := e.addPipeVia(t, rl.Addr(), PipeOptions{ProbeInterval: time.Second, ProbeJitter: 0.5})
+	p := e.addPipeVia(t, rl.Addr(), PipeOptions{Liveness: PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.5}})
 	// settled reports whether both endpoints have nothing to write, no
 	// write call in progress (one the host is slow to complete would
 	// otherwise turn into a write stall as the clock moves on) and every
@@ -206,8 +205,8 @@ func TestProbeAnsweredOnSamePairWithJitter(t *testing.T) {
 			c.lock()
 			ok := true
 			for _, st := range ids {
-				pi, live := c.s.PipeInfo(st.Pipe)
-				ok = ok && (!live || pi.PingsAnswered >= pi.PingsSent && !c.s.WantsWrite(st.Pipe, 0) &&
+				pi, live := c.s.PipeInfo(uint64(st.PipeID))
+				ok = ok && (!live || pi.PingsAnswered >= pi.PingsSent && !c.s.WantsWrite(uint64(st.PipeID), 0) &&
 					(!pi.HasOut || pi.Writable))
 			}
 			c.unlock()
@@ -226,7 +225,7 @@ func TestProbeAnsweredOnSamePairWithJitter(t *testing.T) {
 	})
 	sent := func() uint64 {
 		for _, st := range e.server.PipeStats() {
-			if st.Pipe == p.ID() {
+			if st.PipeID == p.ID() {
 				return st.RecordsSent
 			}
 		}
@@ -311,8 +310,8 @@ func (d delayCounter) OnEvent(*shaping.Event, *shaping.Effects) {}
 func TestProbeThroughShaperNotSuspect(t *testing.T) {
 	t.Parallel()
 	c := mpConfig()
-	c.SchedulerParams.ProbeInterval = time.Second
-	c.SchedulerParams.SuspectFloor = 50 * time.Millisecond
+	c.Liveness.ProbeInterval = time.Second
+	c.Liveness.SuspectFloor = 50 * time.Millisecond
 	e := newMPEnv(t, c, mpConfig())
 	var plans atomic.Int64
 	e.client.SetShaper(func(ShapedPipe) shaping.Shaper { return delayCounter{400 * time.Millisecond, &plans} }, nil)
@@ -326,7 +325,7 @@ func TestProbeThroughShaperNotSuspect(t *testing.T) {
 			break
 		}
 		if ev.Kind == EventPipeSuspect || ev.Kind == EventPipeFailed {
-			t.Fatalf("event %v on pipe %d under a 400 ms shaping delay", ev.Kind, ev.Pipe)
+			t.Fatalf("event %v on pipe %d under a 400 ms shaping delay", ev.Kind, ev.PipeID)
 		}
 	}
 	n := pipeStat(t, p0).PingsSent - base

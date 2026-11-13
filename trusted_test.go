@@ -47,10 +47,10 @@ func TestTrustedProxiesTrustsSource(t *testing.T) {
 		t.Errorf("invalid peer: %v", got)
 	}
 	// A Unix socket peer has no address: source and peer are zero.
-	if src, peer := requestSource(tp, &http.Request{RemoteAddr: "@", Header: r.Header}); src.IsValid() || peer.IsValid() {
+	if src, peer := tp.RequestSource(&http.Request{RemoteAddr: "@", Header: r.Header}); src.IsValid() || peer.IsValid() {
 		t.Errorf("requestSource of a Unix peer = %v %v", src, peer)
 	}
-	src, peer := requestSource(tp, &http.Request{RemoteAddr: "10.0.0.1:443", Header: r.Header})
+	src, peer := tp.RequestSource(&http.Request{RemoteAddr: "10.0.0.1:443", Header: r.Header})
 	if src != netip.MustParseAddrPort("203.0.113.7:0") || peer != netip.MustParseAddrPort("10.0.0.1:443") {
 		t.Errorf("requestSource behind a trusted proxy = %v %v", src, peer)
 	}

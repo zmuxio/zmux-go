@@ -1,4 +1,4 @@
-package zmux
+package carrier
 
 import (
 	"context"
@@ -6,13 +6,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-func TestCarrierPool(t *testing.T) {
+func TestPool(t *testing.T) {
 	n := 0
 	closed := map[int]bool{}
-	p := &CarrierPool[int]{
+	p := &Pool[int]{
 		Dial:                  func(context.Context) (int, error) { n++; return n, nil },
 		Close:                 func(c int) { closed[c] = true },
 		MaxPipesPerConnection: 2, MaxPipesPerConnectionLifetime: 3,
@@ -58,7 +59,7 @@ func TestCarrierPool(t *testing.T) {
 		t.Fatal("Get after Shutdown")
 	}
 	// Age: an old connection takes no new pipe.
-	p2 := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Millisecond}
+	p2 := &Pool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Millisecond}
 	x, _ := p2.Get(ctx)
 	time.Sleep(2 * time.Millisecond)
 	if y, _ := p2.Get(ctx); y.Conn == x.Conn {
@@ -66,9 +67,9 @@ func TestCarrierPool(t *testing.T) {
 	}
 }
 
-func TestCarrierPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
+func TestPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
 	n := 0
-	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxPipesPerConnectionLifetime: 1}
+	p := &Pool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxPipesPerConnectionLifetime: 1}
 	defer p.Shutdown()
 	for range 32 {
 		lease, err := p.Get(context.Background())
@@ -84,10 +85,10 @@ func TestCarrierPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
 	}
 }
 
-func TestCarrierPoolShutdownAndCancelledContextDoNotDial(t *testing.T) {
+func TestPoolShutdownAndCancelledContextDoNotDial(t *testing.T) {
 	for _, shutdown := range []bool{false, true} {
 		calls := 0
-		p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { calls++; return calls, nil }}
+		p := &Pool[int]{Dial: func(context.Context) (int, error) { calls++; return calls, nil }}
 		ctx := context.Background()
 		want := errPoolClosed
 		if shutdown {
@@ -109,11 +110,11 @@ func TestCarrierPoolShutdownAndCancelledContextDoNotDial(t *testing.T) {
 	}
 }
 
-func TestCarrierPoolCancelledLateDialReturnsItsConnection(t *testing.T) {
+func TestPoolCancelledLateDialReturnsItsConnection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	closed := 0
-	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { cancel(); return 1, nil }, Close: func(int) { closed++ }}
+	p := &Pool[int]{Dial: func(context.Context) (int, error) { cancel(); return 1, nil }, Close: func(int) { closed++ }}
 	lease, err := p.Get(ctx)
 	if lease != nil {
 		lease.Release()
@@ -124,9 +125,9 @@ func TestCarrierPoolCancelledLateDialReturnsItsConnection(t *testing.T) {
 	}
 }
 
-func TestCarrierPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *testing.T) {
+func TestPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *testing.T) {
 	n, closed := 0, 0
-	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Minute}
+	p := &Pool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Minute}
 	p.Close = func(int) {
 		closed++
 		if !p.mu.TryLock() {
@@ -154,9 +155,9 @@ func TestCarrierPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *tes
 	}
 }
 
-func TestCarrierPoolStaleLeaseRetirementCannotCloseTwice(t *testing.T) {
+func TestPoolStaleLeaseRetirementCannotCloseTwice(t *testing.T) {
 	closed := 0
-	p := &CarrierPool[int]{Dial: func(context.Context) (int, error) { return 1, nil }, Close: func(int) { closed++ }, MaxPipesPerConnectionLifetime: 1}
+	p := &Pool[int]{Dial: func(context.Context) (int, error) { return 1, nil }, Close: func(int) { closed++ }, MaxPipesPerConnectionLifetime: 1}
 	lease, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -172,14 +173,14 @@ func TestCarrierPoolStaleLeaseRetirementCannotCloseTwice(t *testing.T) {
 
 // A decision that fails Validate is rejected as a whole and reported to
 // DecisionRejected outside the pool's lock; the pool goes on.
-func TestCarrierPoolRejectsAndReportsInvalidDecision(t *testing.T) {
+func TestPoolRejectsAndReportsInvalidDecision(t *testing.T) {
 	n := 0
-	var p *CarrierPool[int]
+	var p *Pool[int]
 	var reported []error
-	p = &CarrierPool[int]{
+	p = &Pool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
-		Policy: policyFunc(func(_ *PoolView, d *PoolDecision) {
-			d.Count, d.ProbeInterval = 3, 500*time.Millisecond
+		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
+			d.Count, d.Liveness.ProbeInterval = 3, 500*time.Millisecond
 		}),
 		DecisionRejected: func(err error) {
 			if !p.mu.TryLock() {
@@ -205,7 +206,7 @@ func TestCarrierPoolRejectsAndReportsInvalidDecision(t *testing.T) {
 		t.Fatalf("%d rejections reported", len(reported))
 	}
 	for _, err := range reported {
-		if !errors.Is(err, ErrInvalidConfig) {
+		if !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Fatalf("reported %v", err)
 		}
 	}

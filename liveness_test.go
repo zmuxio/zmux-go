@@ -28,7 +28,7 @@ func (c *countConn) Write(b []byte) (int, error) {
 // is ErrInvalidConfig with nothing changed.
 func TestSetLivenessValidation(t *testing.T) {
 	a, b := tcpPair(t)
-	c, _ := pair(t, a, b, &Config{KeepAlivePeriod: 5 * time.Second}, nil)
+	c, _ := pair(t, a, b, &Config{Liveness: Liveness{KeepAlivePeriod: 5 * time.Second}}, nil)
 	l := c.Liveness()
 	if l.KeepAlivePeriod != 5*time.Second || l.SuspectFloor != 250*time.Millisecond || l.DeadTimeout != 0 ||
 		l.ProbeInterval != 15*time.Second || l.StandbyProbe != time.Second || l.ProbeJitter != DefaultProbeJitter {
@@ -37,7 +37,7 @@ func TestSetLivenessValidation(t *testing.T) {
 	for _, bad := range []Liveness{
 		{KeepAlivePeriod: time.Millisecond}, {SuspectFloor: -1}, {SuspectFloor: time.Millisecond},
 		{DeadTimeout: -1}, {DeadTimeout: 500 * time.Millisecond}, {ProbeInterval: time.Millisecond},
-		{StandbyProbe: time.Millisecond}, {ProbeJitter: 1}, {ProbeJitter: -0.1},
+		{StandbyProbe: time.Millisecond}, {ProbeJitter: 1},
 	} {
 		if err := c.SetLiveness(bad); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%+v: %v", bad, err)
@@ -57,12 +57,12 @@ func TestSetLivenessValidation(t *testing.T) {
 	if got := c.Liveness(); got != want {
 		t.Fatalf("zero value: %+v", got)
 	}
-	off := Liveness{KeepAlivePeriod: -1, StandbyProbe: -1, ProbeInterval: -1, NoProbeJitter: true, DeadTimeout: 3 * time.Second}
+	off := Liveness{KeepAlivePeriod: -1, StandbyProbe: -1, ProbeInterval: -1, ProbeJitter: -1, DeadTimeout: 3 * time.Second}
 	if err := c.SetLiveness(off); err != nil {
 		t.Fatal(err)
 	}
 	if got := c.Liveness(); got.KeepAlivePeriod != -1 || got.StandbyProbe != -1 || got.ProbeInterval != -1 ||
-		!got.NoProbeJitter || got.ProbeJitter != 0 || got.DeadTimeout != 3*time.Second {
+		got.ProbeJitter != -1 || got.DeadTimeout != 3*time.Second {
 		t.Fatalf("off: %+v", got)
 	}
 }
@@ -73,14 +73,14 @@ func TestSetLivenessKeepAliveRuns(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		a, b := net.Pipe()
 		cc := &countConn{Conn: a}
-		c, _ := pair(t, cc, b, &Config{KeepAlivePeriod: -1, Clock: timeshim.Real}, &Config{KeepAlivePeriod: -1, Clock: timeshim.Real})
+		c, _ := pair(t, cc, b, &Config{Liveness: Liveness{KeepAlivePeriod: -1}, Clock: timeshim.Real}, &Config{Liveness: Liveness{KeepAlivePeriod: -1}, Clock: timeshim.Real})
 		synctest.Sleep(200 * time.Millisecond)
 		cc.n.Store(0)
 		synctest.Sleep(1200 * time.Millisecond)
 		if n := cc.n.Load(); n != 0 {
 			t.Fatalf("%d writes with keep-alive off", n)
 		}
-		if err := c.SetLiveness(Liveness{KeepAlivePeriod: time.Second, NoProbeJitter: true}); err != nil {
+		if err := c.SetLiveness(Liveness{KeepAlivePeriod: time.Second, ProbeJitter: -1}); err != nil {
 			t.Fatal(err)
 		}
 		synctest.Sleep(2500 * time.Millisecond)
@@ -94,10 +94,10 @@ func TestSetLivenessKeepAliveRuns(t *testing.T) {
 // pipe; the settings race with traffic and session changes cleanly.
 func TestPipeSetLiveness(t *testing.T) {
 	e := newMPEnv(t, mpConfig(), mpConfig())
-	p := e.addPipe(t, PipeOptions{ProbeInterval: 5 * time.Second})
+	p := e.addPipe(t, PipeOptions{Liveness: PipeLiveness{ProbeInterval: 5 * time.Second}})
 	for _, bad := range []PipeLiveness{{SuspectFloor: time.Millisecond}, {DeadTimeout: time.Millisecond},
 		{ProbeInterval: time.Millisecond}, {ProbeJitter: 1}} {
-		if err := p.SetLiveness(bad); !errors.Is(err, ErrInvalidConfig) {
+		if err := p.Update(PipeUpdate{Liveness: Set(bad)}); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%+v: %v", bad, err)
 		}
 	}
@@ -151,9 +151,9 @@ func TestPipeSetLiveness(t *testing.T) {
 		for i := range 200 {
 			var err error
 			if i%2 == 0 {
-				err = p.SetLiveness(PipeLiveness{ProbeInterval: 2 * time.Second, NoProbeJitter: true})
+				err = p.Update(PipeUpdate{Liveness: Set(PipeLiveness{ProbeInterval: 2 * time.Second, ProbeJitter: -1})})
 			} else {
-				err = p.ClearLiveness()
+				err = p.Update(PipeUpdate{Liveness: Clear[PipeLiveness]()})
 			}
 			if err != nil {
 				t.Error(err)
@@ -170,10 +170,10 @@ func TestPipeSetLiveness(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for p.SetLiveness(PipeLiveness{}) == nil && time.Now().Before(deadline) {
+	for p.Update(PipeUpdate{Liveness: Set(PipeLiveness{})}) == nil && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err := p.SetLiveness(PipeLiveness{}); !errors.Is(err, ErrPipeGone) {
+	if err := p.Update(PipeUpdate{Liveness: Set(PipeLiveness{})}); !errors.Is(err, ErrPipeGone) {
 		t.Fatalf("retired pipe: %v", err)
 	}
 }
