@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/quic-go/quic-go v0.64.1
-	github.com/zmuxio/zmux-go v1.4.4
+	github.com/zmuxio/zmux-go v1.4.5-0.20261113164315-b3b7eb4a05d4
 )
 
 require (
