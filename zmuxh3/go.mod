@@ -13,8 +13,8 @@ require (
 	github.com/djylb/timeshim v0.0.0-20261031100623-0e5ae6a85c7f // indirect
 	github.com/dunglas/httpsfv v1.1.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 )

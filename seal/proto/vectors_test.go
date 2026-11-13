@@ -115,7 +115,7 @@ type parties struct {
 }
 
 // maxAppData is the bound the vector gives its receivers.
-func (v *parties) maxAppData() int {
+func (v parties) maxAppData() int {
 	if v.MaxAppData == nil {
 		return 0
 	}

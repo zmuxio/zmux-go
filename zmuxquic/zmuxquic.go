@@ -66,10 +66,11 @@ func Config(base *quic.Config) *quic.Config {
 // connection's handshake, and 0-RTT is not used.
 func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Config, cfg *zmux.Config) (*zmux.Conn, error) {
 	var cred zmux.CarrierCredential
+	early := false
 	if cfg != nil {
 		cred = cfg.CarrierCredential
+		early = cfg.EarlyData.Replayable && len(cfg.EarlyData.Remembered) > 0 && cred == nil
 	}
-	early := cfg != nil && cfg.EarlyData.Replayable && len(cfg.EarlyData.Remembered) > 0 && cred == nil
 	qc, err := dialAddr(ctx, addr, tlsConf, Config(qconf), early)
 	if err != nil {
 		return nil, err

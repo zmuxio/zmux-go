@@ -63,13 +63,13 @@ var errJoinHeld = errors.New("zmux: join held back by the attachment cap")
 
 // RecordPolicyInput describes a carrier to RecordPolicy and AllowRecordMode.
 type RecordPolicyInput struct {
+	// Label is the carrier's PipeIO.Label.
+	Label string
 	// HasExporter reports that the carrier has a keying material exporter.
 	HasExporter bool
 	// Secure reports that the carrier declares the Bound contract
 	// (CarrierSecure).
 	Secure bool
-	// Label is the carrier's PipeIO.Label.
-	Label string
 	// IsFirstPipe reports that the carrier is the session's first pipe.
 	IsFirstPipe bool
 }
