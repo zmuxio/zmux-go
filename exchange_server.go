@@ -28,6 +28,7 @@ import (
 // with their sessions, as other carriers do, or all at once with Close.
 type HTTPExchangeHandler struct {
 	l      *Listener
+	o      HTTPOptions
 	p      exParams
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -48,15 +49,27 @@ type exGone struct {
 }
 
 // NewHTTPExchangeHandler returns a handler that serves exchange carriers
-// into l. An invalid cfg (nil, without a PSK and AllowInsecure, or with an
-// invalid Admission) is an ErrInvalidConfig error.
-func NewHTTPExchangeHandler(l *Listener, cfg *HTTPExchangeConfig) (*HTTPExchangeHandler, error) {
+// into l. o are the endpoint's HTTP options (nil: the defaults), the same
+// as NewHTTPHandler's: their Next serves the requests that are not
+// authenticated exchange requests and VerdictFallback, their Trusted
+// resolves a request's source, and their PairField tells a split half
+// from an exchange request. The listener's admission decides on the
+// request that creates a carrier, on its head (CarrierInfo.Head): Peek
+// does not apply. An invalid o or cfg (nil, without a PSK and
+// AllowInsecure) is an ErrInvalidConfig error.
+func NewHTTPExchangeHandler(l *Listener, o *HTTPOptions, cfg *HTTPExchangeConfig) (*HTTPExchangeHandler, error) {
+	if err := o.Validate(); err != nil {
+		return nil, err
+	}
 	p, err := cfg.resolve()
 	if err != nil {
 		return nil, err
 	}
 	h := &HTTPExchangeHandler{l: l, p: p,
 		carriers: map[[exCIDLen]byte]*exServer{}, gone: map[[exCIDLen]byte]*exKey{}}
+	if o != nil {
+		h.o = *o
+	}
 	// Stamps are whole seconds, checked against MaxClockSkew first: the
 	// window takes the second of rounding.
 	if h.nonces, err = NewReplayFilter(ReplayConfig{Window: p.skew.Truncate(time.Second) + time.Second, Max: p.nonceCache}); err != nil {
@@ -64,13 +77,6 @@ func NewHTTPExchangeHandler(l *Listener, cfg *HTTPExchangeConfig) (*HTTPExchange
 	}
 	h.ctx, h.cancel = context.WithCancel(context.Background())
 	return h, nil
-}
-
-// HTTPOptions returns the options the handler serves with (see
-// HandlerOptions).
-func (h *HTTPExchangeHandler) HTTPOptions() *HTTPOptions {
-	o := h.p.http
-	return &o
 }
 
 // Close fails every carrier, refuses new requests and returns once the
@@ -93,10 +99,10 @@ func (h *HTTPExchangeHandler) Close() error {
 
 // ServeHTTP answers one exchange request. A request that is not an
 // authenticated, fresh exchange request is served by the fallback
-// (HTTPExchangeConfig.Next) with its body replayed, and changes nothing.
+// (HTTPOptions.Next) with its body replayed, and changes nothing.
 func (h *HTTPExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.p.http.Classify(r) != HTTPClassExchange {
-		h.p.http.Fallback(w, r)
+	if h.o.Classify(r) != HTTPClassExchange {
+		h.o.Fallback(w, r)
 		return
 	}
 	if earlyRequest(r) {
@@ -109,7 +115,7 @@ func (h *HTTPExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		limit = b64Len(limit)
 	}
 	if r.ContentLength > int64(limit) {
-		h.p.http.Fallback(w, r)
+		h.o.Fallback(w, r)
 		return
 	}
 	cl := int(r.ContentLength)
@@ -121,7 +127,7 @@ func (h *HTTPExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		// it): the fallback gets what arrived and then the same error,
 		// as it would have read it, not a body that seems complete.
 		r.Body = &replayBody{Reader: io.MultiReader(bytesReader(raw.b[:n]), errReader{err}), c: r.Body}
-		h.p.http.Fallback(w, r)
+		h.o.Fallback(w, r)
 		return
 	}
 	buf, body := raw, raw.b[:cl]
@@ -180,7 +186,7 @@ func (h *HTTPExchangeHandler) fallback(w http.ResponseWriter, r *http.Request, r
 	if len(read) > 0 {
 		r.Body = &replayBody{Reader: io.MultiReader(bytesReader(read), r.Body), c: r.Body}
 	}
-	h.p.http.Fallback(w, r)
+	h.o.Fallback(w, r)
 }
 
 // authenticate verifies q's MAC with the key of its carrier (live c,
@@ -245,7 +251,7 @@ func (h *HTTPExchangeHandler) create(w http.ResponseWriter, r *http.Request, q *
 	case h.l.budget.Pressure():
 		return nil, exFlagBusy
 	}
-	a, err := h.l.Arrive(requestSource(h.p.http.Trusted, r))
+	a, err := h.l.Arrive(requestSource(h.o.Trusted, r))
 	if err != nil {
 		return nil, exFlagBusy // the source holds its share
 	}

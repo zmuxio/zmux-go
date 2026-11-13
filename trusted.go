@@ -26,7 +26,7 @@ import (
 //     or 2) and report its source as their RemoteAddr. Serve it with
 //     Listener.Serve or an http.Server.
 //   - A forwarding header field on HTTP carriers (Header): set
-//     HTTPOptions.Trusted (and HTTPExchangeConfig.Trusted) for the HTTP
+//     HTTPOptions.Trusted for the HTTP
 //     adapters to read it on requests from a trusted address.
 //
 // The fields are read when an adapter is set up; a TrustedProxies must not

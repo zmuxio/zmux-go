@@ -145,7 +145,7 @@ func TestAdmittedValueExchange(t *testing.T) {
 		}}})
 	defer func() { _ = lst.Close() }()
 	xc := &HTTPExchangeConfig{AllowInsecure: true}
-	eh, err := NewHTTPExchangeHandler(lst, xc)
+	eh, err := NewHTTPExchangeHandler(lst, nil, xc)
 	if err != nil {
 		t.Fatal(err)
 	}

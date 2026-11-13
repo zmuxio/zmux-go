@@ -338,7 +338,7 @@ sequence of short POST requests. The server mounts a handler in front of
 its `Listener`:
 
 ```go
-h, err := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk})
+h, err := zmux.NewHTTPExchangeHandler(l, nil, &zmux.HTTPExchangeConfig{PSK: psk})
 if err != nil {
 	return err
 }
@@ -397,13 +397,15 @@ choose among them.
 **One endpoint.** `HTTPEndpoint` classifies each request by its head
 (`ClassifyHTTP`) and hands it to the adapter of its class; requests that
 are not carriers, and those an adapter's admission does not take, go to
-the host's handler with their body:
+the host's handler with their body. The endpoint and its adapters share
+one `HTTPOptions`:
 
 ```go
-stream, err := zmux.NewHTTPHandler(l, &zmux.HTTPOptions{Next: site, Trusted: trusted})
-ex, err := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk, Next: site, Trusted: trusted})
-ws, err := zmuxws.Handler(l, &zmux.HTTPOptions{Next: site, Trusted: trusted})
-http.Handle("/zmux", &zmux.HTTPEndpoint{Stream: stream, Exchange: ex, WebSocket: ws, Next: site})
+o := &zmux.HTTPOptions{Next: site, Trusted: trusted}
+stream, err := zmux.NewHTTPHandler(l, o)
+ex, err := zmux.NewHTTPExchangeHandler(l, o, &zmux.HTTPExchangeConfig{PSK: psk})
+ws, err := zmuxws.Handler(l, o)
+http.Handle("/zmux", &zmux.HTTPEndpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
 ```
 
 Its `WebTransport` field takes a WebTransport handler such as
@@ -443,8 +445,8 @@ describes only this end's hop, not what lies beyond its first peer.
 **Client addresses.** Behind a proxy every carrier comes from the proxy's
 address. `TrustedProxies` names the proxies whose report of the client
 address is believed: its `Listener` wraps a `net.Listener` that receives
-the PROXY protocol from them, and `HTTPOptions.Trusted` (and
-`HTTPExchangeConfig.Trusted`) reads the forwarding header field they set.
+the PROXY protocol from them, and `HTTPOptions.Trusted` reads the
+forwarding header field they set.
 The reported address is then the source that admissions see and that the
 listener's per-source limits count; the same report from any other peer is
 ignored.

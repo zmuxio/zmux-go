@@ -91,16 +91,16 @@ func newUnifiedEnv(t *testing.T, adm *Admission, trusted *TrustedProxies) *unifi
 		e.mu.Unlock()
 		http.Error(w, "host", http.StatusTeapot)
 	})
-	stream, err := NewHTTPHandler(e.lst, &HTTPOptions{Next: host, Trusted: trusted})
+	o := &HTTPOptions{Next: host, Trusted: trusted}
+	stream, err := NewHTTPHandler(e.lst, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.ex, err = NewHTTPExchangeHandler(e.lst, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32),
-		HoldTime: time.Second, Next: host, Trusted: trusted})
+	e.ex, err = NewHTTPExchangeHandler(e.lst, o, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32), HoldTime: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.srv = httptest.NewServer(&HTTPEndpoint{Stream: stream, Exchange: e.ex, Next: host})
+	e.srv = httptest.NewServer(&HTTPEndpoint{Options: o, Stream: stream, Exchange: e.ex})
 	return e
 }
 
@@ -423,48 +423,34 @@ func TestPairFieldReserved(t *testing.T) {
 	}
 }
 
-// TestEndpointPairFieldAgreement: the endpoint takes the pairing field from
-// its handlers, an exchange handler honours its own, and a mismatch is an
-// error.
-func TestEndpointPairFieldAgreement(t *testing.T) {
+// TestExchangePairField: an exchange handler classifies with the shared
+// options, so a POST with a length and their pairing field is a split
+// uplink that it hands to the fallback, and the endpoint to Stream.
+func TestExchangePairField(t *testing.T) {
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
-	custom := &HTTPOptions{PairField: "X-Link-Id"}
-	stream, err := NewHTTPHandler(lst, custom)
+	o := &HTTPOptions{PairField: "x-link-id",
+		Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })}
+	ex, err := NewHTTPExchangeHandler(lst, o, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	mk := func(field string) *HTTPExchangeHandler {
-		ex, err := NewHTTPExchangeHandler(lst, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32), PairField: field})
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = ex.Close() })
-		return ex
+	defer func() { _ = ex.Close() }()
+	streamed := false
+	e := &HTTPEndpoint{Options: o, Exchange: ex,
+		Stream: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { streamed = true })}
+	req := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "http://example.test/", strings.NewReader("x"))
+		r.Header.Set("X-Link-Id", "x")
+		return r
 	}
-	if o, ok := HandlerOptions(mk("x-link-id")); !ok || o.pairField() != "X-Link-Id" {
-		t.Fatalf("exchange handler options %+v", o)
+	rec := httptest.NewRecorder()
+	ex.ServeHTTP(rec, req())
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("exchange handler served %d", rec.Code)
 	}
-	if err := (&HTTPEndpoint{Stream: stream, Exchange: mk("X-Link-Id")}).Validate(); err != nil {
-		t.Fatalf("agreeing handlers: %v", err)
-	}
-	for name, e := range map[string]*HTTPEndpoint{
-		"exchange differs": {Stream: stream, Exchange: mk("")},
-		"options differ":   {Stream: stream, Options: &HTTPOptions{}},
-	} {
-		if err := e.Validate(); !errors.Is(err, ErrInvalidConfig) {
-			t.Errorf("%s: %v", name, err)
-		}
-		rec := httptest.NewRecorder()
-		e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://example.test/", nil))
-		if rec.Code != http.StatusInternalServerError {
-			t.Errorf("%s: served %d", name, rec.Code)
-		}
-	}
-	// A POST with a length and the custom field is an uplink, not an exchange request.
-	r := httptest.NewRequest(http.MethodPost, "http://example.test/", strings.NewReader("x"))
-	r.Header.Set("X-Link-Id", "x")
-	if got := mk("X-Link-Id").HTTPOptions().Classify(r); got != HTTPClassUplink {
-		t.Fatalf("classified %v", got)
+	e.ServeHTTP(httptest.NewRecorder(), req())
+	if !streamed {
+		t.Fatal("endpoint did not dispatch the uplink to Stream")
 	}
 }

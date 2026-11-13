@@ -167,7 +167,7 @@ func Example_readmeRedial() {
 // Example_readmeHTTPExchange is README.md "HTTP exchanges".
 func Example_readmeHTTPExchange() {
 	_ = func(l *zmux.Listener, psk []byte) error {
-		h, err := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk})
+		h, err := zmux.NewHTTPExchangeHandler(l, nil, &zmux.HTTPExchangeConfig{PSK: psk})
 		if err != nil {
 			return err
 		}

@@ -21,19 +21,20 @@ import (
 func TestDialModeProfiles(t *testing.T) {
 	psk := bytes.Repeat([]byte{3}, 32)
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
-	stream, err := zmux.NewHTTPHandler(l, &zmux.HTTPOptions{Next: next})
+	o := &zmux.HTTPOptions{Next: next}
+	stream, err := zmux.NewHTTPHandler(l, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex, err := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk, HoldTime: time.Second, Next: next})
+	ex, err := zmux.NewHTTPExchangeHandler(l, o, &zmux.HTTPExchangeConfig{PSK: psk, HoldTime: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ws, err := Handler(l, &zmux.HTTPOptions{Next: next})
+	ws, err := Handler(l, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(&zmux.HTTPEndpoint{Stream: stream, Exchange: ex, WebSocket: ws, Next: next})
+	srv := httptest.NewServer(&zmux.HTTPEndpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
 	ctx, cancel := context.WithCancel(context.Background())
 	accepted := make(chan *zmux.Conn, 8)
 	done := make(chan struct{})

@@ -486,8 +486,8 @@ func TestAdmissionExchange(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, &HTTPExchangeConfig{PSK: []byte("k"), HoldTime: 50 * time.Millisecond,
-		MaxClockSkew: 30 * time.Second, Next: siteHandler()})
+	h := newExHandler(t, lst, &HTTPOptions{Next: siteHandler()},
+		&HTTPExchangeConfig{PSK: []byte("k"), HoldTime: 50 * time.Millisecond, MaxClockSkew: 30 * time.Second})
 	defer func() { _ = h.Close() }()
 	srv := httptest.NewServer(h)
 	defer srv.Close()

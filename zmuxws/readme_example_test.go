@@ -32,19 +32,20 @@ func Example_readmeWebSocket() {
 // Example_readmeProxy is README.md "Behind a reverse proxy or CDN".
 func Example_readmeProxy() {
 	_ = func(l *zmux.Listener, site http.Handler, trusted *zmux.TrustedProxies, psk []byte) error {
-		stream, err := zmux.NewHTTPHandler(l, &zmux.HTTPOptions{Next: site, Trusted: trusted})
+		o := &zmux.HTTPOptions{Next: site, Trusted: trusted}
+		stream, err := zmux.NewHTTPHandler(l, o)
 		if err != nil {
 			return err
 		}
-		ex, err := zmux.NewHTTPExchangeHandler(l, &zmux.HTTPExchangeConfig{PSK: psk, Next: site, Trusted: trusted})
+		ex, err := zmux.NewHTTPExchangeHandler(l, o, &zmux.HTTPExchangeConfig{PSK: psk})
 		if err != nil {
 			return err
 		}
-		ws, err := zmuxws.Handler(l, &zmux.HTTPOptions{Next: site, Trusted: trusted})
+		ws, err := zmuxws.Handler(l, o)
 		if err != nil {
 			return err
 		}
-		http.Handle("/zmux", &zmux.HTTPEndpoint{Stream: stream, Exchange: ex, WebSocket: ws, Next: site})
+		http.Handle("/zmux", &zmux.HTTPEndpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
 		return nil
 	}
 	_ = func(ctx context.Context, client *http.Client, psk []byte, cfg *zmux.Config,

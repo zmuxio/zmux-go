@@ -91,9 +91,9 @@ func TestHTTPExchangeVectors(t *testing.T) {
 }
 
 // newExHandler returns a handler of l or fails the test.
-func newExHandler(t testing.TB, l *Listener, cfg *HTTPExchangeConfig) *HTTPExchangeHandler {
+func newExHandler(t testing.TB, l *Listener, o *HTTPOptions, cfg *HTTPExchangeConfig) *HTTPExchangeHandler {
 	t.Helper()
-	h, err := NewHTTPExchangeHandler(l, cfg)
+	h, err := NewHTTPExchangeHandler(l, o, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func newExHandler(t testing.TB, l *Listener, cfg *HTTPExchangeConfig) *HTTPExcha
 // explicitly disabled.
 func TestHTTPExchangeConfigAuth(t *testing.T) {
 	for _, cfg := range []*HTTPExchangeConfig{nil, {}, {PSK: []byte("k"), AllowInsecure: true}} {
-		if _, err := NewHTTPExchangeHandler(nil, cfg); !errors.Is(err, ErrInvalidConfig) {
+		if _, err := NewHTTPExchangeHandler(nil, nil, cfg); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("handler %+v: %v", cfg, err)
 		}
 		if _, err := HTTPExchangePipe(context.Background(), nil, "http://x/", cfg); !errors.Is(err, ErrInvalidConfig) {
@@ -129,7 +129,7 @@ type exEnv struct {
 func newExEnv(t *testing.T, ccfg, scfg *HTTPExchangeConfig, front func(origin string) string) *exEnv {
 	t.Helper()
 	e := &exEnv{lst: mustNewListener(&ListenerConfig{Config: mpConfig()})}
-	e.h = newExHandler(t, e.lst, scfg)
+	e.h = newExHandler(t, e.lst, nil, scfg)
 	e.srv = httptest.NewServer(e.h)
 	e.tr = &http.Transport{MaxIdleConnsPerHost: 16}
 	u := e.srv.URL + "/x/{instance}/{nonce}"
@@ -235,7 +235,7 @@ func TestHTTPExchangeServerRules(t *testing.T) {
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
 	cfg := &HTTPExchangeConfig{PSK: []byte("k"), DownWindow: 4, HoldTime: 50 * time.Millisecond}
-	h := newExHandler(t, lst, cfg)
+	h := newExHandler(t, lst, nil, cfg)
 	defer func() { _ = h.Close() }()
 	var cid [exCIDLen]byte
 	_, _ = rand.Read(cid[:])
@@ -335,7 +335,7 @@ func TestHTTPExchangeInterop(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), d)
 		defer cancel()
 		lst := mustNewListener(&ListenerConfig{Config: zcfg})
-		h := newExHandler(t, lst, cfg)
+		h := newExHandler(t, lst, nil, cfg)
 		srv := &http.Server{Addr: envOr("ZMUX_EXCHANGE_ADDR", "127.0.0.1:8080"), Handler: h, ReadHeaderTimeout: 10 * time.Second}
 		go func() { _ = srv.ListenAndServe() }()
 		go func() {
@@ -410,7 +410,7 @@ func TestHTTPExchangeCompletion(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
+	h := newExHandler(t, lst, nil, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
 	defer func() { _ = h.Close() }()
 	var cid [exCIDLen]byte
 	_, _ = rand.Read(cid[:])
@@ -468,7 +468,7 @@ func TestHTTPExchangeCompletion(t *testing.T) {
 func TestHTTPExchangeListenerClosed(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
-	h := newExHandler(t, lst, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
+	h := newExHandler(t, lst, nil, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
 	defer func() { _ = h.Close() }()
 	_ = lst.Close()
 	var cid [exCIDLen]byte
@@ -514,7 +514,7 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 	ctx := context.Background()
 	t.Run("up", func(t *testing.T) {
 		lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
-		h := newExHandler(t, lst, &HTTPExchangeConfig{UpPieceSize: 16 << 10, HoldTime: 100 * time.Millisecond, AllowInsecure: true})
+		h := newExHandler(t, lst, nil, &HTTPExchangeConfig{UpPieceSize: 16 << 10, HoldTime: 100 * time.Millisecond, AllowInsecure: true})
 		srv := httptest.NewServer(h)
 		defer func() { srv.Close(); _ = h.Close(); _ = lst.Close() }()
 		tr := &http.Transport{}
@@ -552,7 +552,7 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 func TestHTTPExchangeSplitTargets(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
-	h := newExHandler(t, lst, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
+	h := newExHandler(t, lst, nil, &HTTPExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
 	var mu sync.Mutex
 	hits := map[string]int{}
 	front := func(prefix string) *httptest.Server {
@@ -671,8 +671,9 @@ func TestExchangeHandlerClass(t *testing.T) {
 		return Decision{Verdict: VerdictAccept}
 	}}})
 	defer func() { _ = l.Close() }()
-	h := newExHandler(t, l, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32),
-		Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })})
+	h := newExHandler(t, l,
+		&HTTPOptions{Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })},
+		&HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
 	defer func() { _ = h.Close() }()
 	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("xxxx"))
 	r.Header.Set(HeaderPair, "AAAA")
@@ -698,7 +699,7 @@ func TestHTTPExchangeTruncatedFallback(t *testing.T) {
 		b, err := io.ReadAll(r.Body)
 		got <- seen{b, err}
 	})
-	h := newExHandler(t, lst, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32), Next: next})
+	h := newExHandler(t, lst, &HTTPOptions{Next: next}, &HTTPExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
 	srv := httptest.NewServer(h)
 	defer func() { srv.Close(); _ = h.Close(); _ = lst.Close() }()
 	c, err := net.Dial("tcp", srv.Listener.Addr().String())
@@ -724,7 +725,7 @@ func TestHTTPExchangeOutOfOrderCost(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, &HTTPExchangeConfig{PSK: []byte("k"), UpStoreLimit: 1})
+	h := newExHandler(t, lst, nil, &HTTPExchangeConfig{PSK: []byte("k"), UpStoreLimit: 1})
 	defer func() { _ = h.Close() }()
 	var cid [exCIDLen]byte
 	_, _ = rand.Read(cid[:])
@@ -765,7 +766,7 @@ func TestHTTPExchangePendingShare(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1, FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, &HTTPExchangeConfig{PSK: []byte("k")})
+	h := newExHandler(t, lst, nil, &HTTPExchangeConfig{PSK: []byte("k")})
 	defer func() { _ = h.Close() }()
 	send := func(cid *[exCIDLen]byte, kind byte, seq uint64) byte {
 		key := newExKey([]byte("k"), cid[:])

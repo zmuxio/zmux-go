@@ -70,10 +70,6 @@ type HTTPExchangeConfig struct {
 	// testSkipResponseMAC disables the client's response MAC check (tests
 	// only: shows that the check is what rejects replayed responses).
 	testSkipResponseMAC bool
-	// PairField is the HTTPOptions.PairField of the endpoint that serves
-	// the handler (server): the field that makes a request a split half and
-	// not an exchange request.
-	PairField string
 	// Header is added to every request (client).
 	Header http.Header
 	// DownURL is the target template of DOWN requests (client; empty: the
@@ -100,7 +96,7 @@ type HTTPExchangeConfig struct {
 	// limit when above 1 MiB, the default limit of piece data a request may
 	// carry. A request whose Content-Length exceeds that limit plus the
 	// largest request header, after the body encoding, is not read: it goes
-	// to the fallback (Next) as a request that is not an exchange request.
+	// to the fallback (HTTPOptions.Next) as a request that is not an exchange request.
 	// The default (DefaultExchangePieceSize) keeps every request body at
 	// most 1,000,000 bytes after the body encoding.
 	UpPieceSize int
@@ -149,15 +145,6 @@ type HTTPExchangeConfig struct {
 	// remembers within the time window (262144); a request that finds it
 	// full is not authenticated.
 	NonceCacheSize int
-	// Next is the handler of the requests the server does not
-	// authenticate, and of VerdictFallback (HTTPOptions.Next; nil:
-	// http.NotFound). The listener's admission decides on the request
-	// that creates a carrier, on its head (CarrierInfo.Head): Peek does
-	// not apply.
-	Next http.Handler
-	// Trusted names the intermediaries whose forwarding header field gives
-	// a request's source (HTTPOptions.Trusted).
-	Trusted *TrustedProxies
 }
 
 // exBodyMax bounds every exchange body of the default piece size, after
@@ -197,7 +184,6 @@ type exParams struct {
 	idle, goneFor          time.Duration
 	skew                   time.Duration
 	nonceCache             int
-	http                   HTTPOptions
 	b64                    bool
 	cacheBust              bool
 	skipRespMAC            bool
@@ -244,10 +230,6 @@ func (c *HTTPExchangeConfig) resolve() (exParams, error) {
 		idle: timeout(x.IdleTimeout, 60*time.Second), goneFor: dur(x.GoneMemory, 60*time.Second),
 		skipRespMAC: x.testSkipResponseMAC,
 		skew:        dur(x.MaxClockSkew, 60*time.Second), nonceCache: pos(x.NonceCacheSize, 1<<18),
-		http: HTTPOptions{Next: x.Next, Trusted: x.Trusted, PairField: x.PairField},
-	}
-	if err := p.http.Validate(); err != nil {
-		return exParams{}, err
 	}
 	if neg {
 		return exParams{}, fmt.Errorf("%w: negative HTTPExchangeConfig field", ErrInvalidConfig)

@@ -782,12 +782,6 @@ func NewHTTPHandler(l *Listener, o *HTTPOptions) (http.Handler, error) {
 	return &httpHandler{l: l, o: opts}, nil
 }
 
-// HTTPOptions returns the options the handler serves with.
-func (h *httpHandler) HTTPOptions() *HTTPOptions {
-	o := h.o
-	return &o
-}
-
 type httpHandler struct {
 	l *Listener
 	o HTTPOptions

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 )
 
 // HTTPClass is the carrier class of an HTTP request on a unified endpoint,
@@ -104,14 +103,15 @@ func headerHasToken(h http.Header, name, token string) bool {
 }
 
 // HTTPEndpoint serves every HTTP carrier kind on one request target:
-// it classifies each request with
-// Options.Classify and hands it to the adapter of its class, which runs its
-// own admission and serves what it does not accept with its own fallback.
-// It adds no behaviour of its own: a request of a class without an adapter,
-// and every request that is not a carrier, goes to Next. Give each adapter
-// the same host handler as its HTTPOptions.Next (HTTPExchangeConfig.Next)
-// so that every request that is not taken reaches the host, with the body
-// bytes the adapter read replayed.
+// it classifies each request with Options.Classify and hands it to the
+// adapter of its class, which runs its own admission and serves what it
+// does not accept with its own fallback. It adds no behaviour of its own:
+// a request of a class without an adapter, and every request that is not
+// a carrier, goes to Options.Fallback. Options is the one HTTPOptions of
+// the endpoint: make every adapter with the same value (NewHTTPHandler,
+// NewHTTPExchangeHandler, zmuxws.Handler, zmuxh3.HTTP3Handler), so that
+// they classify alike and every request that is not taken reaches the
+// host, with the body bytes the adapter read replayed.
 //
 // Behind a reverse proxy that speaks HTTP/2 to the server without TLS,
 // serve the endpoint with prior-knowledge HTTP/2 enabled, so that
@@ -121,16 +121,10 @@ func headerHasToken(h http.Header, name, token string) bool {
 //	srv.Protocols.SetHTTP1(true)
 //	srv.Protocols.SetUnencryptedHTTP2(true)
 type HTTPEndpoint struct {
-	// Options are the HTTPOptions of handlers that are wrapped in
-	// middleware (nil: none), as HandlerOptions cannot see them. The
-	// endpoint classifies with the PairField of the handlers it can see and
-	// of Options; they must agree, or the endpoint serves 500 and Validate
-	// returns ErrInvalidConfig.
+	// Options are the endpoint's HTTP options (nil: the defaults): their
+	// PairField classifies requests and their Next (HTTPOptions.Fallback)
+	// serves the requests that no adapter takes.
 	Options *HTTPOptions
-
-	once sync.Once
-	pair string
-	err  error
 	// Stream serves downlinks, uplinks and bidirectional carriers: the
 	// handler of NewHTTPHandler.
 	Stream http.Handler
@@ -141,67 +135,12 @@ type HTTPEndpoint struct {
 	WebSocket http.Handler
 	// WebTransport serves WebTransport sessions, such as zmuxh3.Handler.
 	WebTransport http.Handler
-	// Next is the host's handler (nil: http.NotFound). It is served as
-	// HTTPOptions.Fallback serves: an HTTP/1.1 request with a body arrives
-	// full duplex.
-	Next http.Handler
-}
-
-// HandlerOptions returns the HTTPOptions of a handler made by NewHTTPHandler
-// or NewHTTPExchangeHandler; ok is false for any other handler (such as one
-// wrapped in middleware).
-func HandlerOptions(h http.Handler) (o *HTTPOptions, ok bool) {
-	p, ok := h.(interface{ HTTPOptions() *HTTPOptions })
-	if !ok {
-		return nil, false
-	}
-	return p.HTTPOptions(), true
-}
-
-// Validate checks that the pairing fields of Options, Stream and Exchange
-// agree (ErrInvalidConfig otherwise); ServeHTTP checks it on first use.
-func (e *HTTPEndpoint) Validate() error {
-	_, err := e.pairField()
-	return err
-}
-
-// pairField returns the pairing field the endpoint classifies by.
-func (e *HTTPEndpoint) pairField() (string, error) {
-	var pair string
-	seen := false
-	for _, o := range []*HTTPOptions{e.Options, handlerOpts(e.Stream), handlerOpts(e.Exchange)} {
-		if o == nil {
-			continue
-		}
-		if f := o.pairField(); !seen {
-			pair, seen = f, true
-		} else if f != pair {
-			return "", fmt.Errorf("%w: HTTPEndpoint handlers disagree on the pairing field (%q, %q)", ErrInvalidConfig, pair, f)
-		}
-	}
-	if !seen {
-		pair = HeaderPair
-	}
-	return pair, nil
-}
-
-func handlerOpts(h http.Handler) *HTTPOptions {
-	if h == nil {
-		return nil
-	}
-	o, _ := HandlerOptions(h)
-	return o
 }
 
 // ServeHTTP dispatches r by its class.
 func (e *HTTPEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	e.once.Do(func() { e.pair, e.err = e.pairField() })
-	if e.err != nil {
-		http.Error(w, "zmux: misconfigured endpoint", http.StatusInternalServerError)
-		return
-	}
 	var h http.Handler
-	switch classifyHTTP(r, e.pair) {
+	switch e.Options.Classify(r) {
 	case HTTPClassWebSocket:
 		h = e.WebSocket
 	case HTTPClassWebTransport:
@@ -214,7 +153,7 @@ func (e *HTTPEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Not a zmux request: the host's handler.
 	}
 	if h == nil {
-		serveFallback(e.Next, w, r)
+		e.Options.Fallback(w, r)
 		return
 	}
 	h.ServeHTTP(w, r)

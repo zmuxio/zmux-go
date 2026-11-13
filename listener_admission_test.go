@@ -88,7 +88,7 @@ func TestAdmissionEveryEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex := newExHandler(t, lst, &HTTPExchangeConfig{PSK: make([]byte, 32)})
+	ex := newExHandler(t, lst, nil, &HTTPExchangeConfig{PSK: make([]byte, 32)})
 	defer func() { _ = ex.Close() }()
 	srv := httptest.NewServer(&HTTPEndpoint{Stream: hh, Exchange: ex})
 	defer srv.Close()
