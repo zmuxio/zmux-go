@@ -214,7 +214,7 @@ func metricOf(k metric, m *zmux.PoolMember) uint64 {
 	return x
 }
 
-// memberKey names member m of v: its fate group in a carrier.Pool, its pipe
+// memberKey names member m of v: its fate group in a carrier.ConnPool, its pipe
 // ID in a PipePool.
 func memberKey(v *zmux.PoolView, m *zmux.PoolMember) uint64 {
 	if v.Connections {

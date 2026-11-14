@@ -89,12 +89,12 @@ func TestMaintainPipesInvalidDecision(t *testing.T) {
 }
 
 func TestPoolDecisionProbeOptions(t *testing.T) {
-	o := (&PoolDecision{Liveness: PipeLiveness{ProbeInterval: -1, ProbeJitter: -1}}).probeOptions(PipeOptions{Liveness: PipeLiveness{ProbeInterval: 5 * time.Second, ProbeJitter: 0.2}, Label: "x"})
-	if o.Liveness.ProbeInterval >= 0 || o.Liveness.ProbeJitter >= 0 || o.Label != "x" {
+	o := (&PoolDecision{Liveness: PipeLiveness{ProbeInterval: -1, ProbeJitter: -1}}).probeOptions(PipeOptions{Liveness: Set(PipeLiveness{ProbeInterval: 5 * time.Second, ProbeJitter: 0.2}), Label: "x"})
+	if l, _ := o.Liveness.get(); l.ProbeInterval >= 0 || l.ProbeJitter >= 0 || o.Label != "x" {
 		t.Fatalf("options %+v", o)
 	}
-	o = (&PoolDecision{}).probeOptions(PipeOptions{Liveness: PipeLiveness{ProbeInterval: 5 * time.Second, ProbeJitter: 0.2}})
-	if o.Liveness.ProbeInterval != 5*time.Second || o.Liveness.ProbeJitter != 0.2 {
+	o = (&PoolDecision{}).probeOptions(PipeOptions{Liveness: Set(PipeLiveness{ProbeInterval: 5 * time.Second, ProbeJitter: 0.2})})
+	if l, _ := o.Liveness.get(); l.ProbeInterval != 5*time.Second || l.ProbeJitter != 0.2 {
 		t.Fatalf("unset decision changed the options: %+v", o)
 	}
 }

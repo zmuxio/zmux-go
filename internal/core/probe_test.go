@@ -408,3 +408,26 @@ func acceptJoinForTest(t *testing.T, s *Session, id uint64) bool {
 	}
 	return s.ConfirmJoin(pj, c) == JoinAccepted
 }
+
+// The answer to a PIPE_PING carries a PIPE_PING of its own only when the
+// pipe has gone unproven for R_p = max(1 s, T_suspect): an advance of its
+// acknowledged position proves it as a sent ack-eliciting byte does, so
+// an answer that acknowledges the PIPE_PING the pipe sent carries none,
+// however long that exchange took.
+func TestAnswerPingAfterAdvance(t *testing.T) {
+	cfg := DefaultConfig()
+	s, p := probeSession(cfg)
+	a := p.mp
+	s.now = Time(10 * Second)
+	a.lastElicit = 0
+	a.lastAdvance = s.now
+	s.answerPing(p)
+	if a.needPing {
+		t.Fatal("PIPE_PING added to an answer that follows an advance")
+	}
+	a.lastAdvance = s.now.Add(-2 * max(Second, s.tSuspect(a)))
+	s.answerPing(p)
+	if !a.needPing {
+		t.Fatal("no PIPE_PING on a pipe unproven for longer than R_p")
+	}
+}

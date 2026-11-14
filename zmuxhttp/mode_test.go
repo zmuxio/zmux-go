@@ -79,9 +79,9 @@ func (e *modeEnv) session(t *testing.T, ctx context.Context) *zmux.Conn {
 // candidates are the HTTP kinds to url, by preference.
 func (e *modeEnv) candidates(url string) []zmux.Candidate {
 	return []zmux.Candidate{
-		StreamCandidate(e.hc, url, nil),
-		SplitCandidate(e.hc, url, nil),
-		ExchangeCandidate(e.hc, url, &ExchangeConfig{PSK: modePSK}),
+		Streaming{Client: e.hc, URL: url}.Candidate(),
+		Split{Client: e.hc, URL: url}.Candidate(),
+		(&exCfg{PSK: modePSK}).exchange(e.hc, url).Candidate(),
 	}
 }
 
@@ -208,7 +208,7 @@ func TestDialModeExplicit(t *testing.T) {
 	defer cancel()
 	cfg := modeCfg()
 	cfg.HandshakeTimeout = time.Second
-	_, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(StreamCandidate(e.hc, px.URL, nil)), cfg, nil)
+	_, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(Streaming{Client: e.hc, URL: px.URL}.Candidate()), cfg, nil)
 	var me *zmux.CarrierChoiceError
 	if !errors.As(err, &me) || len(me.Results) != 1 || me.Results[0].Kind != zmux.CarrierStream ||
 		me.Results[0].Outcome != zmux.CandidateTimedOut || !errors.Is(err, zmux.ErrHandshakeTimeout) {
@@ -217,7 +217,7 @@ func TestDialModeExplicit(t *testing.T) {
 	// A WebSocket-only front refuses the request.
 	ws := zmuxtest.New(e.srv.URL, zmuxtest.WebSocketFront())
 	defer ws.Close()
-	_, err = zmux.DialChoice(ctx, zmux.ExplicitChoice(ExchangeCandidate(e.hc, ws.URL, &ExchangeConfig{PSK: modePSK})), cfg, nil)
+	_, err = zmux.DialChoice(ctx, zmux.ExplicitChoice((&exCfg{PSK: modePSK}).exchange(e.hc, ws.URL).Candidate()), cfg, nil)
 	if !errors.As(err, &me) || len(me.Results) != 1 || me.Results[0].Kind != zmux.CarrierExchange {
 		t.Fatalf("explicit exchange through a WebSocket front: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestDialModeExplicit(t *testing.T) {
 		t.Fatalf("outcome %v", o)
 	}
 	// Explicit and passing: no other kind is tried.
-	c, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(ExchangeCandidate(e.hc, px.URL, &ExchangeConfig{PSK: modePSK})), cfg, nil)
+	c, err := zmux.DialChoice(ctx, zmux.ExplicitChoice((&exCfg{PSK: modePSK}).exchange(e.hc, px.URL).Candidate()), cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +378,7 @@ func TestDialModeJoin(t *testing.T) {
 // Mode pool to add members to.
 func exchangeBase(t *testing.T, ctx context.Context, e *modeEnv) (*zmux.Conn, *zmux.Conn) {
 	t.Helper()
-	c, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(ExchangeCandidate(e.hc, e.srv.URL, &ExchangeConfig{PSK: modePSK})), modeCfg(), nil)
+	c, err := zmux.DialChoice(ctx, zmux.ExplicitChoice((&exCfg{PSK: modePSK}).exchange(e.hc, e.srv.URL).Candidate()), modeCfg(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +477,7 @@ func TestPipePoolModeFallback(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- c.MaintainPipes(ctx, zmux.PipePool{Choice: zmux.AutoChoice(e.candidates(pass.URL)...), ChoicePolicy: pol,
-			MinBackoff: 100 * time.Millisecond})
+			Backoff: zmux.Backoff{Min: 100 * time.Millisecond}})
 	}()
 	waitCarrier(t, c, zmux.CarrierStream, 10*time.Second)
 	waitCached(t, pol.Cache, "k", zmux.CarrierStream, true)
@@ -497,7 +497,7 @@ func TestPipePoolModeFallback(t *testing.T) {
 	pol.Cache = &zmux.CarrierCache{}
 	go func() {
 		done <- c.MaintainPipes(ctx, zmux.PipePool{Choice: zmux.AutoChoice(e.candidates(nginx.URL)...), ChoicePolicy: pol,
-			MinBackoff: 100 * time.Millisecond})
+			Backoff: zmux.Backoff{Min: 100 * time.Millisecond}})
 	}()
 	waitCached(t, pol.Cache, "k", zmux.CarrierStream, false)
 	waitCached(t, pol.Cache, "k", zmux.CarrierSplit, false)

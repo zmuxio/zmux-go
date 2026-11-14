@@ -118,11 +118,11 @@ func TestSession(t *testing.T) {
 
 // wss://, with TLS over the default dialer and over the application's,
 // admitted by a token bound to the TLS connection: Dial presents
-// Config.Credential, DialPipe DialOptions.Credential for a join.
+// Config.CarrierCredential, DialPipe DialOptions.CarrierCredential for a join.
 func TestTLS(t *testing.T) {
 	ctx := testContext(t)
-	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-	v, err := admit.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, BindTLS: true}
+	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,8 +243,8 @@ func TestSubprotocols(t *testing.T) {
 // back to the next handler, which gets the request as it came.
 func TestAdmissionAcceptAndFallback(t *testing.T) {
 	ctx := testContext(t)
-	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1}
-	v, err := admit.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second}
+	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestAdmissionAcceptAndFallback(t *testing.T) {
 	}
 	// One credential source per call.
 	if _, err := Dial(ctx, u+"/z", &DialOptions{CarrierCredential: auth}, mpConfig()); !errors.Is(err, zmux.ErrInvalidConfig) {
-		t.Fatalf("Dial with DialOptions.Credential: %v", err)
+		t.Fatalf("Dial with DialOptions.CarrierCredential: %v", err)
 	}
 }
 

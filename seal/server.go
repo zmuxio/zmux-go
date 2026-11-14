@@ -26,7 +26,7 @@ type Gate interface {
 	// Commit accepts a client after message 3 passed. It is where any state that
 	// takes effect only with a successful handshake is stored. Its value is
 	// Peer.Value; an error closes the carrier.
-	Commit(ctx context.Context, a Admission) (any, error)
+	Commit(ctx context.Context, r CommitRequest) (any, error)
 }
 
 // CredentialRequest is what Gate.Credential knows of a handshake: the gate
@@ -38,8 +38,8 @@ type CredentialRequest struct {
 	LocalContext any
 }
 
-// Admission is what Gate.Commit receives of a client that passed message 3.
-type Admission struct {
+// CommitRequest is what Gate.Commit receives of a client that passed message 3.
+type CommitRequest struct {
 	Handle []byte         // nil on a profile without a pre-shared key
 	Source netip.AddrPort // may be the zero value
 	// Peer is the client: its static key, credential, the ClientAnchor's
@@ -255,7 +255,7 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 	if c.AllowRecordMode != nil && !c.AllowRecordMode(carrierInfo(p), mode, peer) {
 		return reject(errMode)
 	}
-	if peer.Value, err = c.Gate.Commit(ctx, Admission{Handle: h.Handle, Source: src, Peer: peer}); err != nil {
+	if peer.Value, err = c.Gate.Commit(ctx, CommitRequest{Handle: h.Handle, Source: src, Peer: peer}); err != nil {
 		return reject(fmt.Errorf("%w: %w", errCommit, err))
 	}
 	res, err := hs.Finish()

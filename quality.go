@@ -32,8 +32,16 @@ type QualityBand struct {
 // turns it off, so the zero CapacityFloor reports nothing; a zero
 // RateRatio means 1.25.
 type CapacityFloor struct {
-	Rate      float64
+	Rate      uint64
 	RateRatio float64
+}
+
+// rateBytes is a rate estimate of the core in whole bytes per second.
+func rateBytes(f float64) uint64 {
+	if f > 0 {
+		return uint64(f)
+	}
+	return 0
 }
 
 // core resolves b for the core, whose MinInterval is 0 for the default
@@ -54,25 +62,13 @@ func (c *Conn) SetQualityBand(b QualityBand) error {
 	}
 	c.lock()
 	defer c.unlock()
-	_ = c.s.SetQualityBand(-1, cb)
+	_ = c.s.SetQualityBand(-1, &cb)
 	return nil
-}
-
-// SetQualityBand sets the band of this pipe.
-func (p *Pipe) SetQualityBand(b QualityBand) error {
-	cb, err := b.core()
-	if err != nil {
-		return err
-	}
-	c := p.c
-	c.lock()
-	defer c.unlock()
-	return pipeErr(c.s.SetQualityBand(int64(p.id), cb))
 }
 
 // SetCapacityFloor sets the capacity floor of the outbound direction.
 func (c *Conn) SetCapacityFloor(f CapacityFloor) {
 	c.lock()
 	defer c.unlock()
-	c.s.SetCapacityFloor(core.CapacityFloor{Rate: f.Rate, RateRatio: f.RateRatio})
+	c.s.SetCapacityFloor(core.CapacityFloor{Rate: float64(f.Rate), RateRatio: f.RateRatio})
 }

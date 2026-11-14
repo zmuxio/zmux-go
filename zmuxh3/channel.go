@@ -134,7 +134,7 @@ func (c *h3Channel) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 // an HTTP/3 server with HTTP Datagrams enabled (http3.Server's
 // EnableDatagrams, as NewServer sets): a bidirectional carrier's
 // request stream offers its HTTP Datagrams as the pipe's datagram channel
-// (zmuxhttp.DatagramChannel). Other requests pass unchanged. o (nil:
+// (zmuxhttp.DatagramProvider). Other requests pass unchanged. o (nil:
 // defaults) are the zmuxhttp.Options of the zmux handler inside h, whose pairing
 // field decides which requests are bidirectional carriers.
 func HTTP3Handler(h http.Handler, o *zmuxhttp.Options) http.Handler {

@@ -218,7 +218,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 				_ = s.ack.onPipeAck(&f, s.now)
 			}
 			if f.Kind == wire.KindClose {
-				s.closeFr.waitLanes = false
+				s.endLaneWait()
 			}
 			rec = rec[n:]
 			idx++
@@ -244,7 +244,7 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 		s.shapeRecordIn(p, il.lane, size, facts.onlyPad)
 	}
 	if s.ack != nil {
-		s.ack.onRecord(il, posBytes, facts, s.now)
+		s.ack.onRecord(p, il, posBytes, facts, s.now)
 	}
 	if facts.traffic {
 		p.lastTraffic = s.now

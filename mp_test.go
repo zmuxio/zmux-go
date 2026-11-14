@@ -207,7 +207,7 @@ func TestMultipathEventsAndStats(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, mpConfig(), mpConfig())
 	w := uint64(3)
-	p := e.addPipe(t, PipeOptions{Weight: &w, Label: "second"})
+	p := e.addPipe(t, PipeOptions{Weight: Set(w), Label: "second"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	seen := map[EventKind]bool{}
@@ -241,7 +241,7 @@ func TestMultipathEventsAndStats(t *testing.T) {
 			t.Fatalf("the acceptor reports the peer's join as its own: %+v", ps)
 		}
 	}
-	if err := p.SetSendPriority(5); err != nil {
+	if err := p.Update(PipeUpdate{SendPriority: Set[uint64](5)}); err != nil {
 		t.Fatal(err)
 	}
 	for {
@@ -433,7 +433,7 @@ func TestRetiredPipeHandle(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitUntil(t, 5*time.Second, "the pipe retired", func() bool { _, ok := p.Stats(); return !ok })
-	for name, err := range map[string]error{"SetWeight": p.Update(PipeUpdate{Weight: Set[uint64](2)}), "SetSendPriority": p.SetSendPriority(1),
+	for name, err := range map[string]error{"SetWeight": p.Update(PipeUpdate{Weight: Set[uint64](2)}), "SetSendPriority": p.Update(PipeUpdate{SendPriority: Set[uint64](1)}),
 		"Revalidate": p.Revalidate(), "Close": p.Close(), "Abort": p.Abort(nil)} {
 		if !errors.Is(err, ErrPipeGone) {
 			t.Errorf("%s on a retired pipe: %v", name, err)

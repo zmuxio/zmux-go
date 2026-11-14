@@ -23,8 +23,8 @@ import (
 // another host or a downgrade is refused and the other host gets nothing.
 func TestRedirect(t *testing.T) {
 	ctx := testContext(t)
-	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-	v, err := admit.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("psk"), Slot: 30 * time.Second, BindTLS: true}
+	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

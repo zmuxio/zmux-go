@@ -16,8 +16,8 @@
 // explicit Role, and Listener.HandlePipe or zmuxhttp.NewHandler accept any
 // carrier. An Admission on the Listener (ListenerConfig.Admission,
 // admit.PrefixAuth) decides on every carrier before anything is sent on it,
-// whatever entry point took it, and a Credential is what a
-// client presents for it (Config.Credential, PresentPipe).
+// whatever entry point took it, and a CarrierCredential is what a
+// client presents for it (Config.CarrierCredential, PresentPipe).
 //
 // Packages beside this one: zmuxhttp carries sessions over HTTP requests
 // (stream, split and exchange carriers; the exchange carrier, of short
@@ -60,7 +60,8 @@
 // does the same for every session of a listener.
 //
 // Ownership: a Stream handle that is garbage-collected without being
-// closed resets and stops its stream, so keep it while it is in use. A
+// closed resets its sending part with StreamCancelled and stops its
+// receiving part with code 0, so keep it while it is in use. A
 // net.Conn given to Client, Server or a Dial function and a PipeIO given to
 // Start, AddPipe or HandlePipe belong to zmux from then on, whether the
 // call succeeds or fails (ErrInvalidConfig, a refused or failed join, a
@@ -82,9 +83,10 @@
 // *ResumeTimeoutError or *PipesLostError. Every one matches net.ErrClosed
 // with errors.Is; the last five also match their sentinel
 // (ErrIdleTimeout, ErrHandshakeTimeout, ErrEarlyDataRejected,
-// ErrResumeTimeout, ErrPipesLost), the timeouts also
-// os.ErrDeadlineExceeded, and the two that a lost pipe caused unwrap to
-// that pipe's error. A stream the peer reset or stopped gives a
+// ErrResumeTimeout, ErrPipesLost), and the two that a lost pipe caused
+// unwrap to that pipe's error. A session's end is never a timeout of the
+// call that observed it: none of these matches os.ErrDeadlineExceeded, and
+// none has a Timeout method; only a call's own deadline or context does. A stream the peer reset or stopped gives a
 // *StreamError. IsRetryable reports streams the peer did not process
 // (ErrRejected, ErrGoingAway, ErrEarlyDataRejected), which can be sent
 // again. Calls fail with ErrStreamClosed, ErrNotNegotiated,
@@ -100,9 +102,9 @@
 // transport error codes (TransportProtocolViolation) and Stream for stream
 // error codes (StreamCancelled).
 //
-// Rates are float64 bytes per second throughout (PickPipe.Rate,
+// Rates are integer (uint64) bytes per second throughout (PickPipe.Rate,
 // PipeStats.DeliveryRate, Event.DeliveryRate, CapacityFloor.Rate); memory
-// budgets and usage are int64 bytes.
+// budgets and usage, and byte sizes and limits, are int64 bytes.
 //
 // # Configuration
 //
@@ -117,7 +119,7 @@
 // MemoryBudget is unlimited, a negative DatagramStreamBytes leaves a
 // stream's datagram queue without a byte bound, a negative
 // SchedulerParams.Probation turns
-// probation off and a negative zmuxhttp.ExchangeConfig.Coalesce sends at once.
+// probation off and a negative zmuxhttp.Exchange.Coalesce sends at once.
 // A negative value of a field without such a setting (JoinTimeout,
 // ResumeTimeout, the windows, MaxPipes) is an error. A feature that is on
 // by default is turned off with a Switch field set to SwitchOff

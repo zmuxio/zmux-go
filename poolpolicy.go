@@ -15,7 +15,7 @@ type PoolPolicy interface {
 // PoolView is the state of a pool.
 type PoolView struct {
 	Now time.Time
-	// Connections reports a carrier.Pool: its members are connections,
+	// Connections reports a carrier.ConnPool: its members are connections,
 	// named by FateGroup and retired with RetireConnections. Otherwise they
 	// are the pipes of a PipePool, named by PipeID and retired with
 	// RetirePipes.
@@ -25,10 +25,10 @@ type PoolView struct {
 	LastDial    time.Time // zero: none
 }
 
-// PoolMember is a pipe of a PipePool, or a connection of a carrier.Pool.
+// PoolMember is a pipe of a PipePool, or a connection of a carrier.ConnPool.
 type PoolMember struct {
 	// PipeID is the pipe of a PipePool member; FateGroup the fate group
-	// of a carrier.Pool connection. The other is zero.
+	// of a carrier.ConnPool connection. The other is zero.
 	PipeID    PipeID
 	FateGroup uint64
 	Age       time.Duration
@@ -55,7 +55,7 @@ type PoolDecision struct {
 	DialAfter time.Duration
 	// RetirePipes lists the pipes of a PipePool to retire now (a pipe is
 	// replaced before it closes); RetireConnections lists the connections
-	// of a carrier.Pool to retire, by fate group.
+	// of a carrier.ConnPool to retire, by fate group.
 	RetirePipes       []PipeID
 	RetireConnections []uint64
 	// Recheck asks for the next Decide within this time even when nothing
@@ -117,7 +117,11 @@ func reportRejected(l *slog.Logger, f func(error), err error) {
 
 // probeOptions returns o with d's liveness settings over it.
 func (d *PoolDecision) probeOptions(o PipeOptions) PipeOptions {
-	l, dl := &o.Liveness, &d.Liveness
+	dl := &d.Liveness
+	if *dl == (PipeLiveness{}) {
+		return o
+	}
+	l, _ := o.Liveness.get()
 	if dl.SuspectFloor != 0 {
 		l.SuspectFloor = dl.SuspectFloor
 	}
@@ -130,6 +134,7 @@ func (d *PoolDecision) probeOptions(o PipeOptions) PipeOptions {
 	if dl.ProbeJitter != 0 {
 		l.ProbeJitter = dl.ProbeJitter
 	}
+	o.Liveness = Set(l)
 	return o
 }
 

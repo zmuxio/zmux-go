@@ -51,7 +51,25 @@ type pipeDrv struct {
 	// has returned.
 	wstop bool
 	wdone chan struct{}
+
+	// The end of the attachment (Pipe.Wait, Pipe.Done); a handle keeps it
+	// after the session has forgotten the attachment.
+	end *pipeEnd
 }
+
+// pipeEnd is how an attachment ended: retired is closed when the session
+// retires it (err, guarded by the session lock, is set before),
+// waited when, besides, its goroutines ended.
+type pipeEnd struct {
+	drv     atomic.Pointer[pipeDrv] // the current driver (an early-data restart replaces pipe 0's)
+	retired chan struct{}
+	err     error
+	once    sync.Once
+	waited  chan struct{}
+}
+
+// goneEnd is the end of an attachment the session no longer knows.
+var goneEnd = &pipeEnd{retired: closedChan, waited: closedChan}
 
 // laneOut is the writer side of one outbound lane above 0.
 type laneOut struct {
@@ -157,6 +175,8 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
 	c.s.ShapeSpendHandshake(p.HandshakePadding)
 	pd := &pipeDrv{c: c, id: id, hc: newHalfCloser(p), framing: p.Framing, wsig: core.NewSignal(), lctx: c.pipeLabels(id)}
+	pd.end = &pipeEnd{retired: make(chan struct{})}
+	pd.end.drv.Store(pd)
 	if o, ok := p.W.(LaneOpener); ok {
 		pd.opener = o
 	} else if o, ok := p.R.(LaneOpener); ok {
@@ -438,6 +458,7 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 	}
 	var retransAt time.Time
 	var werr error
+	retired, ended := pd.end.retired, false
 	for {
 		// Read outside the session lock.
 		var unsent, retrans uint64
@@ -503,7 +524,7 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 			}
 			continue
 		}
-		if closing || werr != nil {
+		if closing || werr != nil || ended {
 			return
 		}
 		if b != nil {
@@ -514,6 +535,10 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 		case <-sig.C:
 		case <-c.done:
 			return
+		case <-retired:
+			// The attachment is gone: one more pass for what was queued
+			// (a shutdown), then the writer ends.
+			retired, ended = nil, true
 		}
 	}
 }

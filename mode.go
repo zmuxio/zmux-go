@@ -30,13 +30,13 @@ const (
 	CarrierWebSocket CarrierKind = iota + 1
 	// CarrierStream is a bidirectional streaming request: one request
 	// whose body is the uplink and whose response body the downlink
-	// (zmuxhttp.StreamCandidate).
+	// (zmuxhttp.Streaming.Candidate).
 	CarrierStream
 	// CarrierSplit is a split bootstrap: an uplink POST and a downlink GET
-	// (zmuxhttp.SplitCandidate).
+	// (zmuxhttp.Split.Candidate).
 	CarrierSplit
 	// CarrierExchange is the exchange carrier of bounded requests
-	// (zmuxhttp.ExchangeCandidate).
+	// (zmuxhttp.Exchange.Candidate).
 	CarrierExchange
 	// CarrierQUIC is a QUIC stream (zmuxquic.Candidate), direct only.
 	CarrierQUIC
@@ -44,7 +44,7 @@ const (
 	// (zmuxh3.HTTP3Candidate).
 	CarrierHTTP3
 	// CarrierWebTransport is a WebTransport stream
-	// (zmuxh3.Candidate), direct only.
+	// (zmuxh3.WebTransportCandidate), direct only.
 	CarrierWebTransport
 )
 
@@ -98,7 +98,7 @@ type CandidateResult struct {
 }
 
 // Candidate is one carrier kind that DialChoice may use. Dial opens a
-// carrier of the kind, presenting cred (the session's Config.Credential)
+// carrier of the kind, presenting cred (the session's Config.CarrierCredential)
 // for the server's admission; DialChoice sets its PipeIO.Carrier to Kind.
 // The carrier must live until the pipe ends, not until ctx does, which
 // bounds only the opening. The constructors of each adapter return ready
@@ -577,7 +577,7 @@ func (e *CarrierChoiceError) Unwrap() []error {
 
 // DialChoice dials a client session over the carrier the mode selects. ctx
 // bounds the dial and the handshakes; each carrier presents
-// cfg.Credential. pol is the policy of AutoChoice (nil: the defaults).
+// cfg.CarrierCredential. pol is the policy of AutoChoice (nil: the defaults).
 //
 // ExplicitChoice dials its one candidate as its own dialer does. AutoChoice
 // does not use early data (cfg.EarlyData is ignored), so that nothing the

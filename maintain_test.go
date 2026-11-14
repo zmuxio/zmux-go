@@ -19,7 +19,7 @@ func TestMaintainPipesRedials(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- e.client.MaintainPipes(ctx, PipePool{Count: 2, MinBackoff: 10 * time.Millisecond,
+		done <- e.client.MaintainPipes(ctx, PipePool{Count: 2, Backoff: Backoff{Min: 10 * time.Millisecond},
 			Dial: func(context.Context) (PipeIO, error) {
 				nc, err := net.Dial("tcp", e.ln.Addr().String())
 				if err != nil {
@@ -115,7 +115,7 @@ func TestMaintainPipesRotationBacksOff(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
-			done <- e.client.MaintainPipes(ctx, PipePool{MinBackoff: 400 * time.Millisecond, MaxBackoff: 10 * time.Second,
+			done <- e.client.MaintainPipes(ctx, PipePool{Backoff: Backoff{Min: 400 * time.Millisecond, Max: 10 * time.Second},
 				Rotate: Rotation{MaxAge: time.Millisecond},
 				Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
 					if f := int64(v.Failures); f > maxFailures.Load() {
@@ -207,7 +207,7 @@ func TestMaintainPipesStopClosesReplacement(t *testing.T) {
 				n := len(joined)
 				mu.Unlock()
 				if n > 0 {
-					o.Probation = time.Hour // never usable while the test runs
+					o.Probation = Set(time.Hour) // never usable while the test runs
 				}
 				pio, err := dial(ctx)
 				if err != nil {

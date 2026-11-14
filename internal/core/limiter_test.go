@@ -187,7 +187,7 @@ func TestLimiterPacingQuantum(t *testing.T) {
 	}
 	l.settle(at, room, est.value(), 10*Millisecond, &pp)
 	l.refresh(at, 0, est.value(), 10*Millisecond, &pp)
-	if !l.held || l.release <= at || l.release.Sub(at) >= limGranularity {
+	if !l.held || l.release != at.Add(limGranularity) {
 		t.Fatalf("held %v release %v", l.held, l.release.Sub(at))
 	}
 }

@@ -244,3 +244,63 @@ func atkConfig() *zmux.Config {
 const headerLen = 24
 
 var atkPSK = bytes.Repeat([]byte{0x5a}, 32)
+
+// exCfg holds the settings of both ends of an exchange carrier in one
+// value, as the tests of one carrier use them.
+type exCfg struct {
+	PSK                        []byte
+	AllowInsecure, Base64      bool
+	UpPieceSize, DownPieceSize int64
+	CacheBust                  zmux.Switch
+	testSkipResponseMAC        bool
+	Header                     http.Header
+	DownURL, Instance          string
+	NonceParam                 string
+	DownRequests, UpRequests   int
+	RequestTimeout, Deadline   time.Duration
+	BackoffMin, BackoffMax     time.Duration
+	HoldTime, Coalesce         time.Duration
+	DownWindow                 int
+	UpStoreLimit               int64
+	IdleTimeout, GoneMemory    time.Duration
+	MaxClockSkew               time.Duration
+	NonceCacheSize             int
+}
+
+func (x *exCfg) config() ExchangeConfig {
+	if x == nil {
+		return ExchangeConfig{}
+	}
+	return ExchangeConfig{PSK: x.PSK, AllowInsecure: x.AllowInsecure, Base64: x.Base64,
+		UpPieceSize: x.UpPieceSize, DownPieceSize: x.DownPieceSize}
+}
+
+// exchange is the client end at url.
+func (x *exCfg) exchange(client *http.Client, url string) Exchange {
+	if x == nil {
+		return Exchange{Client: client, URL: url}
+	}
+	return Exchange{Client: client, URL: url, Config: x.config(), CacheBust: x.CacheBust,
+		testSkipResponseMAC: x.testSkipResponseMAC, Header: x.Header, DownURL: x.DownURL, Instance: x.Instance,
+		NonceParam: x.NonceParam, DownRequests: x.DownRequests, UpRequests: x.UpRequests,
+		RequestTimeout: x.RequestTimeout, Deadline: x.Deadline, Coalesce: x.Coalesce,
+		Backoff: zmux.Backoff{Min: x.BackoffMin, Max: x.BackoffMax}}
+}
+
+// server is the server end's options with o's HTTP options.
+func (x *exCfg) server(o *Options) *ExchangeOptions {
+	s := &ExchangeOptions{}
+	if o != nil {
+		s.Options = *o
+	}
+	if x != nil {
+		s.HoldTime, s.Coalesce, s.DownWindow, s.UpStoreLimit = x.HoldTime, x.Coalesce, x.DownWindow, x.UpStoreLimit
+		s.IdleTimeout, s.GoneMemory, s.MaxClockSkew, s.NonceCacheSize = x.IdleTimeout, x.GoneMemory, x.MaxClockSkew, x.NonceCacheSize
+	}
+	return s
+}
+
+// handler is NewExchangeHandler with the server end of x.
+func (x *exCfg) handler(l *zmux.Listener, o *Options) (*ExchangeHandler, error) {
+	return NewExchangeHandler(l, x.server(o), x.config())
+}

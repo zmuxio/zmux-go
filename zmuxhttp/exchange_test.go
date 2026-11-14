@@ -60,7 +60,7 @@ func TestHTTPExchangeVectors(t *testing.T) {
 		if got := hex.EncodeToString(key.k[:]); got != v.k {
 			t.Fatalf("K = %s, want %s", got, v.k)
 		}
-		p, err := (&ExchangeConfig{PSK: psk, AllowInsecure: len(psk) == 0}).resolve()
+		p, err := (&exCfg{PSK: psk, AllowInsecure: len(psk) == 0}).config().resolve(nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -98,9 +98,9 @@ func TestHTTPExchangeVectors(t *testing.T) {
 }
 
 // newExHandler returns a handler of l or fails the test.
-func newExHandler(t testing.TB, l *zmux.Listener, o *Options, cfg *ExchangeConfig) *ExchangeHandler {
+func newExHandler(t testing.TB, l *zmux.Listener, o *Options, cfg *exCfg) *ExchangeHandler {
 	t.Helper()
-	h, err := NewExchangeHandler(l, o, cfg)
+	h, err := cfg.handler(l, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,11 +110,11 @@ func newExHandler(t testing.TB, l *zmux.Listener, o *Options, cfg *ExchangeConfi
 // TestHTTPExchangeConfigAuth checks that authentication is off only when
 // explicitly disabled.
 func TestHTTPExchangeConfigAuth(t *testing.T) {
-	for _, cfg := range []*ExchangeConfig{nil, {}, {PSK: []byte("k"), AllowInsecure: true}} {
-		if _, err := NewExchangeHandler(nil, nil, cfg); !errors.Is(err, zmux.ErrInvalidConfig) {
+	for _, cfg := range []*exCfg{nil, {}, {PSK: []byte("k"), AllowInsecure: true}} {
+		if _, err := cfg.handler(nil, nil); !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Fatalf("handler %+v: %v", cfg, err)
 		}
-		if _, err := ExchangePipe(context.Background(), nil, "http://x/", cfg); !errors.Is(err, zmux.ErrInvalidConfig) {
+		if _, err := cfg.exchange(nil, "http://x/").Pipe(context.Background()); !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Fatalf("pipe %+v: %v", cfg, err)
 		}
 	}
@@ -133,7 +133,7 @@ type exEnv struct {
 
 // newExEnv starts the environment; front, when set, is the URL clients
 // use instead of the server's (a proxy in front of it).
-func newExEnv(t *testing.T, ccfg, scfg *ExchangeConfig, front func(origin string) string) *exEnv {
+func newExEnv(t *testing.T, ccfg, scfg *exCfg, front func(origin string) string) *exEnv {
 	t.Helper()
 	e := &exEnv{lst: mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})}
 	e.h = newExHandler(t, e.lst, nil, scfg)
@@ -146,7 +146,7 @@ func newExEnv(t *testing.T, ccfg, scfg *ExchangeConfig, front func(origin string
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// ctx ends when this returns: it bounds the setting up only.
-	p, err := ExchangePipe(ctx, &http.Client{Transport: e.tr}, u, ccfg)
+	p, err := ccfg.exchange(&http.Client{Transport: e.tr}, u).Pipe(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func (e *exEnv) close(t *testing.T) {
 	_ = e.lst.Close()
 	e.srv.Close()
 	e.tr.CloseIdleConnections()
-	if m := e.lst.MemoryUsed(); m != 0 {
+	if m := e.lst.Adapter().MemoryUsed(); m != 0 {
 		t.Errorf("%d bytes still charged to the memory budget", m)
 	}
 }
@@ -223,7 +223,7 @@ func TestHTTPExchangeEcho(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			leakcheck.Check(t)
-			cfg := &ExchangeConfig{PSK: bytes.Repeat([]byte{9}, 32), Base64: b64,
+			cfg := &exCfg{PSK: bytes.Repeat([]byte{9}, 32), Base64: b64,
 				UpPieceSize: 256 << 10, DownPieceSize: 256 << 10, HoldTime: 2 * time.Second}
 			e := newExEnv(t, cfg, cfg, nil)
 			e.echo(t, 4<<20, 30*time.Second)
@@ -241,7 +241,7 @@ func TestHTTPExchangeServerRules(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
-	cfg := &ExchangeConfig{PSK: []byte("k"), DownWindow: 4, HoldTime: 50 * time.Millisecond}
+	cfg := &exCfg{PSK: []byte("k"), DownWindow: 4, HoldTime: 50 * time.Millisecond}
 	h := newExHandler(t, lst, nil, cfg)
 	defer func() { _ = h.Close() }()
 	var cid [exCIDLen]byte
@@ -327,7 +327,7 @@ func TestHTTPExchangeInterop(t *testing.T) {
 		t.Fatal(err)
 	}
 	// An empty ZMUX_EXCHANGE_PSK runs without authentication.
-	cfg := &ExchangeConfig{PSK: psk, AllowInsecure: len(psk) == 0, Base64: os.Getenv("ZMUX_EXCHANGE_BASE64") == "1",
+	cfg := &exCfg{PSK: psk, AllowInsecure: len(psk) == 0, Base64: os.Getenv("ZMUX_EXCHANGE_BASE64") == "1",
 		DownURL: os.Getenv("ZMUX_EXCHANGE_DOWN_URL")}
 	zcfg := &zmux.Config{}
 	switch mode {
@@ -373,7 +373,7 @@ func TestHTTPExchangeInterop(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		p, err := ExchangePipe(ctx, nil, os.Getenv("ZMUX_EXCHANGE_URL"), cfg)
+		p, err := cfg.exchange(nil, os.Getenv("ZMUX_EXCHANGE_URL")).Pipe(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -414,7 +414,7 @@ func TestHTTPExchangeCompletion(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, nil, &ExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
+	h := newExHandler(t, lst, nil, &exCfg{HoldTime: time.Second, AllowInsecure: true})
 	defer func() { _ = h.Close() }()
 	var cid [exCIDLen]byte
 	_, _ = rand.Read(cid[:])
@@ -470,7 +470,7 @@ func TestHTTPExchangeCompletion(t *testing.T) {
 func TestHTTPExchangeListenerClosed(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
-	h := newExHandler(t, lst, nil, &ExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
+	h := newExHandler(t, lst, nil, &exCfg{HoldTime: time.Second, AllowInsecure: true})
 	defer func() { _ = h.Close() }()
 	_ = lst.Close()
 	var cid [exCIDLen]byte
@@ -514,12 +514,12 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 	ctx := context.Background()
 	t.Run("up", func(t *testing.T) {
 		lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
-		h := newExHandler(t, lst, nil, &ExchangeConfig{UpPieceSize: 16 << 10, HoldTime: 100 * time.Millisecond, AllowInsecure: true})
+		h := newExHandler(t, lst, nil, &exCfg{UpPieceSize: 16 << 10, HoldTime: 100 * time.Millisecond, AllowInsecure: true})
 		srv := httptest.NewServer(h)
 		defer func() { srv.Close(); _ = h.Close(); _ = lst.Close() }()
 		tr := &http.Transport{}
 		defer tr.CloseIdleConnections()
-		p, err := ExchangePipe(ctx, &http.Client{Transport: tr}, srv.URL, &ExchangeConfig{UpPieceSize: 2 << 20, Coalesce: -1, AllowInsecure: true, Deadline: time.Second})
+		p, err := (&exCfg{UpPieceSize: 2 << 20, Coalesce: -1, AllowInsecure: true, Deadline: time.Second}).exchange(&http.Client{Transport: tr}, srv.URL).Pipe(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -537,7 +537,7 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 		defer srv.Close()
 		tr := &http.Transport{}
 		defer tr.CloseIdleConnections()
-		p, err := ExchangePipe(ctx, &http.Client{Transport: tr}, srv.URL, &ExchangeConfig{DownPieceSize: 16 << 10, AllowInsecure: true})
+		p, err := (&exCfg{DownPieceSize: 16 << 10, AllowInsecure: true}).exchange(&http.Client{Transport: tr}, srv.URL).Pipe(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -552,7 +552,7 @@ func TestHTTPExchangeBodyLimits(t *testing.T) {
 func TestHTTPExchangeSplitTargets(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
-	h := newExHandler(t, lst, nil, &ExchangeConfig{HoldTime: time.Second, AllowInsecure: true})
+	h := newExHandler(t, lst, nil, &exCfg{HoldTime: time.Second, AllowInsecure: true})
 	var mu sync.Mutex
 	hits := map[string]int{}
 	front := func(prefix string) *httptest.Server {
@@ -571,8 +571,7 @@ func TestHTTPExchangeSplitTargets(t *testing.T) {
 	tr := &http.Transport{MaxIdleConnsPerHost: 8}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	p, err := ExchangePipe(context.Background(), &http.Client{Transport: tr}, up.URL+"/up/{instance}",
-		&ExchangeConfig{DownURL: down.URL + "/down/{instance}/{nonce}", AllowInsecure: true})
+	p, err := (&exCfg{DownURL: down.URL + "/down/{instance}/{nonce}", AllowInsecure: true}).exchange(&http.Client{Transport: tr}, up.URL+"/up/{instance}").Pipe(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +604,7 @@ func TestHTTPExchangeBodySize(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			leakcheck.Check(t)
-			p, err := (&ExchangeConfig{AllowInsecure: true, Base64: b64}).resolve()
+			p, err := (&exCfg{AllowInsecure: true, Base64: b64}).config().resolve(nil, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -644,7 +643,7 @@ func TestHTTPExchangeBodySize(t *testing.T) {
 				return srv.URL
 			}
 			// A long coalescing delay fills the pieces.
-			cfg := &ExchangeConfig{PSK: bytes.Repeat([]byte{9}, 32), Base64: b64, HoldTime: 2 * time.Second,
+			cfg := &exCfg{PSK: bytes.Repeat([]byte{9}, 32), Base64: b64, HoldTime: 2 * time.Second,
 				Coalesce: 200 * time.Millisecond}
 			e := newExEnv(t, cfg, cfg, front)
 			e.echo(t, 3<<20, 30*time.Second)
@@ -673,7 +672,7 @@ func TestExchangeHandlerClass(t *testing.T) {
 	defer func() { _ = l.Close() }()
 	h := newExHandler(t, l,
 		&Options{Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })},
-		&ExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
+		&exCfg{PSK: bytes.Repeat([]byte{5}, 32)})
 	defer func() { _ = h.Close() }()
 	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("xxxx"))
 	r.Header.Set(HeaderPair, "AAAA")
@@ -699,7 +698,7 @@ func TestHTTPExchangeTruncatedFallback(t *testing.T) {
 		b, err := io.ReadAll(r.Body)
 		got <- seen{b, err}
 	})
-	h := newExHandler(t, lst, &Options{Next: next}, &ExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
+	h := newExHandler(t, lst, &Options{Next: next}, &exCfg{PSK: bytes.Repeat([]byte{5}, 32)})
 	srv := httptest.NewServer(h)
 	defer func() { srv.Close(); _ = h.Close(); _ = lst.Close() }()
 	c, err := net.Dial("tcp", srv.Listener.Addr().String())
@@ -725,7 +724,7 @@ func TestHTTPExchangeOutOfOrderCost(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, nil, &ExchangeConfig{PSK: []byte("k"), UpStoreLimit: 1})
+	h := newExHandler(t, lst, nil, &exCfg{PSK: []byte("k"), UpStoreLimit: 1})
 	defer func() { _ = h.Close() }()
 	var cid [exCIDLen]byte
 	_, _ = rand.Read(cid[:])
@@ -766,7 +765,7 @@ func TestHTTPExchangePendingShare(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 2, FirstRecordTimeout: 10 * time.Second})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, nil, &ExchangeConfig{PSK: []byte("k")})
+	h := newExHandler(t, lst, nil, &exCfg{PSK: []byte("k")})
 	defer func() { _ = h.Close() }()
 	send := func(cid *[exCIDLen]byte, kind byte, seq uint64) (int, byte) {
 		key := newExKey([]byte("k"), cid[:])
@@ -842,7 +841,7 @@ func TestHTTPExchangeAdmissionFallbackBody(t *testing.T) {
 			w.WriteHeader(http.StatusTeapot)
 		})
 		psk := bytes.Repeat([]byte{7}, 32)
-		h := newExHandler(t, lst, &Options{Next: next}, &ExchangeConfig{PSK: psk, Base64: b64})
+		h := newExHandler(t, lst, &Options{Next: next}, &exCfg{PSK: psk, Base64: b64})
 		var cid [exCIDLen]byte
 		_, _ = rand.Read(cid[:])
 		var nonce [exNonceLen]byte
@@ -872,7 +871,7 @@ func TestHTTPExchangeRefusedLeavesNoGone(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, nil, &ExchangeConfig{PSK: make([]byte, 32)})
+	h := newExHandler(t, lst, nil, &exCfg{PSK: make([]byte, 32)})
 	defer func() { _ = h.Close() }()
 	refused, other := [exCIDLen]byte{1}, [exCIDLen]byte{2}
 	h.mu.Lock()
@@ -934,7 +933,7 @@ func TestHTTPExchangeReadDeadlineLateTimer(t *testing.T) {
 	cfg.Clock = clk
 	lst := mustNewListener(&zmux.ListenerConfig{Config: cfg})
 	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, nil, &ExchangeConfig{PSK: make([]byte, 32)})
+	h := newExHandler(t, lst, nil, &exCfg{PSK: make([]byte, 32)})
 	defer func() { _ = h.Close() }()
 	w := &deadlineWriter{ResponseWriter: httptest.NewRecorder()}
 	clk.armed.Store(true)
@@ -947,5 +946,26 @@ func TestHTTPExchangeReadDeadlineLateTimer(t *testing.T) {
 	w.mu.Unlock()
 	if !last.IsZero() {
 		t.Fatalf("read deadline %v left after stop", last)
+	}
+}
+
+// The Exchange backoff is checked as every zmux.Backoff is, with its own
+// defaults filled in.
+func TestExchangeBackoffChecked(t *testing.T) {
+	for _, c := range []struct {
+		b  zmux.Backoff
+		ok bool
+	}{
+		{zmux.Backoff{}, true},
+		{zmux.Backoff{Min: time.Second}, true},
+		{zmux.Backoff{Min: 3 * time.Second}, false}, // above the 2 s default Max
+		{zmux.Backoff{Min: time.Second, Max: time.Millisecond}, false},
+		{zmux.Backoff{Max: -1}, false},
+		{zmux.Backoff{Jitter: 1}, false},
+	} {
+		_, err := ExchangeConfig{AllowInsecure: true}.resolve(&Exchange{Backoff: c.b}, nil)
+		if (err == nil) != c.ok || err != nil && !errors.Is(err, zmux.ErrInvalidConfig) {
+			t.Errorf("%+v: %v", c.b, err)
+		}
 	}
 }

@@ -328,7 +328,7 @@ func TestHTTP3ChannelFallback(t *testing.T) {
 	defer func() { _ = tr.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := zmuxhttp.StreamPipe(ctx, client, "https://"+pc.LocalAddr().String()+"/", nil, zmux.DirectionBidirectional, nil)
+	p, err := zmuxhttp.Streaming{Client: client, URL: "https://" + pc.LocalAddr().String() + "/"}.Pipe(ctx, zmux.DirectionBidirectional)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -134,7 +134,7 @@ func TestJoinSecretClientLate(t *testing.T) {
 	if _, err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinPending) {
 		t.Fatalf("join before the client's secret: %v", err)
 	}
-	if e.client.JoinReady() {
+	if e.client.Adapter().JoinReady() {
 		t.Fatal("JoinReady while the secret is pending")
 	}
 	mustSet(t, e.client, joinSecret)

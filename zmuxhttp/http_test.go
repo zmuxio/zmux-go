@@ -23,8 +23,8 @@ import (
 // of a downlink joined out of band.
 func TestHTTPCarriers(t *testing.T) {
 	leakcheck.Check(t)
-	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1}
-	v, err := admit.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second}
+	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,9 +44,9 @@ func TestHTTPCarriers(t *testing.T) {
 			var p zmux.PipeIO
 			var err error
 			if mode == "duplex" {
-				p, err = StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionBidirectional, auth)
+				p, err = Streaming{Client: srv.Client(), URL: srv.URL, CarrierCredential: auth}.Pipe(ctx, zmux.DirectionBidirectional)
 			} else {
-				p, err = SplitPipe(ctx, srv.Client(), srv.URL, nil, auth)
+				p, err = Split{Client: srv.Client(), URL: srv.URL, CarrierCredential: auth}.Pipe(ctx)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -85,7 +85,7 @@ func TestHTTPCarriers(t *testing.T) {
 			}
 			// A downlink joined over two requests.
 			if mode == "duplex" {
-				if _, err := SplitJoin(ctx, c, srv.Client(), srv.URL, nil, auth, zmux.PipeOptions{Direction: zmux.DirectionReceiveOnly}); err != nil {
+				if _, err := (Split{Client: srv.Client(), URL: srv.URL, CarrierCredential: auth}).Join(ctx, c, zmux.PipeOptions{Direction: zmux.DirectionReceiveOnly}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -102,7 +102,7 @@ func TestHTTPPipeSendOnlyStatus(t *testing.T) {
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionSendOnly, nil)
+	p, err := Streaming{Client: srv.Client(), URL: srv.URL}.Pipe(ctx, zmux.DirectionSendOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestSplitJoinHandlerLifetime(t *testing.T) {
 	defer srv.CloseClientConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	p0, err := StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionBidirectional, nil)
+	p0, err := Streaming{Client: srv.Client(), URL: srv.URL}.Pipe(ctx, zmux.DirectionBidirectional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestSplitJoinHandlerLifetime(t *testing.T) {
 	mu.Lock()
 	before := len(cancels)
 	mu.Unlock()
-	p, err := SplitJoin(ctx, c, srv.Client(), srv.URL, nil, nil, zmux.PipeOptions{})
+	p, err := Split{Client: srv.Client(), URL: srv.URL}.Join(ctx, c, zmux.PipeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

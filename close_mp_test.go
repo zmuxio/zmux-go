@@ -28,7 +28,7 @@ func twoPipeSession() (*Conn, *Conn, error) {
 		return nil, nil, err
 	}
 	standby := true
-	p, err := client.AddPipe(ctx, NetPipe(a1), PipeOptions{Label: "backup", SendStandby: &standby})
+	p, err := client.AddPipe(ctx, NetPipe(a1), PipeOptions{Label: "backup", SendStandby: Set(standby)})
 	if err != nil {
 		return client, server, err
 	}

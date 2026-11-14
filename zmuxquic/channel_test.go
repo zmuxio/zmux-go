@@ -119,10 +119,11 @@ func latencyOf(b []byte) time.Duration {
 // lossLatencies runs a session through a relay with one-way delay d,
 // writes a burst of stream data whose first large packets are lost, sends
 // datagrams right after it, and returns their latencies and the client's
-// statistics. qconf configures the client's connection.
-func lossLatencies(t *testing.T, d time.Duration, qconf *quic.Config) ([]time.Duration, zmux.ConnectionStats) {
+// statistics. qconf configures the client's connection; lanes is the
+// endpoints' MaxLanes (0: the default).
+func lossLatencies(t *testing.T, d time.Duration, qconf *quic.Config, lanes int) ([]time.Duration, zmux.ConnectionStats) {
 	t.Helper()
-	cfg := &zmux.Config{EnableDatagrams: true}
+	cfg := &zmux.Config{EnableDatagrams: true, MaxLanes: lanes}
 	e := newEnv(t, cfg)
 	r := newLossyRelay(t, e.ln.Addr().String(), d)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -206,11 +207,12 @@ func lossLatencies(t *testing.T, d time.Duration, qconf *quic.Config) ([]time.Du
 }
 
 // Datagrams on the QUIC connection's datagram channel are not held behind
-// a lost packet of the pipe's stream; datagrams in records are.
+// a lost packet of the pipe's stream; datagrams in records on the same QUIC
+// stream are.
 func TestChannelNotHeadOfLineBlocked(t *testing.T) {
 	const d = 40 * time.Millisecond
 	t.Run("channel", func(t *testing.T) {
-		lat, st := lossLatencies(t, d, testQUIC(nil))
+		lat, st := lossLatencies(t, d, testQUIC(nil), 0)
 		if st.DatagramsSentChannel < 10 {
 			t.Fatalf("datagrams not on the channel: %+v", st)
 		}
@@ -227,7 +229,11 @@ func TestChannelNotHeadOfLineBlocked(t *testing.T) {
 	t.Run("records", func(t *testing.T) {
 		qconf := testQUIC(nil)
 		qconf.EnableDatagrams = false // no channel: records
-		lat, st := lossLatencies(t, d, qconf)
+		// Without lanes the stream data and the records share one QUIC
+		// stream; with them the data goes on a lane of its own once the
+		// peer has acknowledged that lane, and the records on lane 0 are
+		// not held.
+		lat, st := lossLatencies(t, d, qconf, 1)
 		if st.DatagramsSentChannel != 0 {
 			t.Fatalf("channel used: %+v", st)
 		}

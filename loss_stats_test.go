@@ -21,7 +21,7 @@ func TestPipeStatsLoss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	sb := true // the data goes on the bootstrap pipe until it is suspect
-	if _, err := e.client.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{SendStandby: &sb}); err != nil {
+	if _, err := e.client.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{SendStandby: zmux.Set(sb)}); err != nil {
 		t.Fatal(err)
 	}
 	busy(t, e)

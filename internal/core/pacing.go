@@ -135,8 +135,7 @@ func (s *Session) paceDeadline() Time {
 	t := Never
 	for _, p := range s.pipes {
 		if p.out != nil && p.out.snd.lim != nil && p.out.snd.lim.held {
-			// G: no pacing timer earlier than the granularity.
-			t = minT(t, max(p.out.snd.lim.release, s.now.Add(limGranularity)))
+			t = minT(t, p.out.snd.lim.release)
 		}
 	}
 	return t

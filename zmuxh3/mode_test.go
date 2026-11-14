@@ -15,7 +15,7 @@ import (
 )
 
 // TestCandidates serves WebTransport and HTTP/3 request carriers on one
-// target (zmuxhttp.Endpoint) and dials each in auto and explicit mode.
+// target (zmuxhttp.Mux) and dials each in auto and explicit mode.
 func TestCandidates(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: pskCfg()})
@@ -37,7 +37,7 @@ func TestCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h3.Handler = &zmuxhttp.Endpoint{Stream: sh, WebTransport: wh}
+	h3.Handler = &zmuxhttp.Mux{Stream: sh, WebTransport: wh}
 	go func() { _ = wts.Serve(pc) }()
 	defer func() { _ = wts.Close() }()
 	url := "https://" + pc.LocalAddr().String() + "/zmux"
@@ -50,7 +50,7 @@ func TestCandidates(t *testing.T) {
 		mode zmux.CarrierChoice
 		want zmux.CarrierKind
 	}{
-		{zmux.AutoChoice(Candidate(wt, url, nil), HTTP3Candidate(client, url, nil)), zmux.CarrierWebTransport},
+		{zmux.AutoChoice(WebTransportCandidate(wt, url, nil), HTTP3Candidate(client, url, nil)), zmux.CarrierWebTransport},
 		{zmux.ExplicitChoice(HTTP3Candidate(client, url, nil)), zmux.CarrierHTTP3},
 	} {
 		conn, err := zmux.DialChoice(ctx, c.mode, pskCfg(), &zmux.CarrierChoicePolicy{Join: zmux.SwitchOff})

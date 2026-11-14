@@ -99,7 +99,7 @@ type admParams struct {
 }
 
 // CarrierInfo is the metadata of a carrier under admission, or of one a
-// client opens (Credential). Fields that do not apply to the carrier are
+// client opens (CarrierCredential). Fields that do not apply to the carrier are
 // zero.
 type CarrierInfo struct {
 	// Source is the carrier's client address: what a trusted intermediary
@@ -403,7 +403,8 @@ func peerOf(p PipeIO) netip.AddrPort {
 // l's lifetime. It is HMAC-SHA-256, under a key NewListener drew, of the
 // source, reduced to the interval; no state is kept per source. It is 0
 // without an Admission.
-func (l *Listener) StallDuration(source netip.AddrPort) time.Duration {
+func (a *ListenerAdapter) StallDuration(source netip.AddrPort) time.Duration {
+	l := (*Listener)(a)
 	if l.cfg.Admission == nil {
 		return 0
 	}
@@ -453,7 +454,11 @@ type Arrival struct {
 // the carrier (ListenerStats.Refused), and so does a full listener with no
 // stalled carrier (ListenerStats.Rejected): the caller closes the carrier
 // without a handshake.
-func (l *Listener) Arrive(source, peer netip.AddrPort) (*Arrival, error) {
+func (a *ListenerAdapter) Arrive(source, peer netip.AddrPort) (*Arrival, error) {
+	return (*Listener)(a).arrive(source, peer)
+}
+
+func (l *Listener) arrive(source, peer netip.AddrPort) (*Arrival, error) {
 	source, peer = unmapped(source), unmapped(peer)
 	if !source.IsValid() {
 		source = peer
@@ -524,7 +529,7 @@ func (a *Arrival) HandshakeFailed() {
 	if a.l.cfg.Admission != nil {
 		a.l.st.adm.handshakeFailed.Add(1)
 	} else {
-		a.l.CountSetupFailure()
+		a.l.countSetupFailure()
 	}
 	a.Release()
 }
@@ -587,7 +592,7 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error
 	if err := p.checkOverhead(); err != nil {
 		a.Release()
 		closePipeIO(p)
-		l.CountSetupFailure()
+		l.countSetupFailure()
 		return err
 	}
 	if !a.isAccepted() {
@@ -1124,8 +1129,8 @@ func (p *prefixedConn) Unwrap() net.Conn { return p.Conn }
 // (VerdictFallback, or a carrier the listener refuses, with fallback;
 // nil: http.NotFound) or ended it (VerdictStall, VerdictClose, which abort
 // the request with http.ErrAbortHandler), and the caller returns.
-func (l *Listener) AdmitUpgrade(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
-	return l.admitRequest(w, r, trusted, false, fallback)
+func (a *ListenerAdapter) AdmitUpgrade(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
+	return (*Listener)(a).admitRequest(w, r, trusted, false, fallback)
 }
 
 // AdmitRequest is AdmitUpgrade for a request whose body is the carrier:
@@ -1133,8 +1138,8 @@ func (l *Listener) AdmitUpgrade(w http.ResponseWriter, r *http.Request, trusted 
 // without one, decided on its head), and on VerdictAccept r.Body
 // continues after the skipped bytes. On VerdictFallback r.Body replays
 // the bytes read.
-func (l *Listener) AdmitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
-	return l.admitRequest(w, r, trusted, true, fallback)
+func (a *ListenerAdapter) AdmitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
+	return (*Listener)(a).admitRequest(w, r, trusted, true, fallback)
 }
 
 // EarlyRequest reports whether r may have been received in TLS early
@@ -1158,10 +1163,10 @@ func EarlyRequest(r *http.Request) bool {
 func (l *Listener) admitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, body bool, fallback http.Handler) (*Arrival, bool) {
 	if EarlyRequest(r) {
 		w.WriteHeader(http.StatusTooEarly)
-		l.CountSetupFailure() // it needs the handshake: no pipe input
+		l.countSetupFailure() // it needs the handshake: no pipe input
 		return nil, false
 	}
-	a, err := l.Arrive(trusted.RequestSource(r))
+	a, err := l.arrive(trusted.RequestSource(r))
 	if err != nil {
 		// Refused (its source holds its share, or the listener is
 		// closed): nothing was read or written, the host serves it.

@@ -9,60 +9,65 @@ import (
 	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
+	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 // PipeOptions are the options of an attachment. The zero value is a
 // bidirectional pipe that follows the peer's priority requests and the
 // session's defaults.
 //
-// The Send fields are pointers because nil has its own meaning: the local
-// outbound direction then follows the peer's request (PIPE_STATUS), which
-// can change at any time; a set value, the zero value included, wins over
-// it. Weight is a pointer because 0 is a weight of its own (excluded).
-// Set a pointer field with new, as in SendStandby: new(true) or
-// Weight: new(uint64(0)). The Receive fields are plain values because
-// they are always sent: the Hello carries a request for the peer's outbound
-// direction, so the zero values ask for tier 0, not standby.
+// The fields of PipeUpdate (SendPriority, ReceivePriority, SendStandby,
+// ReceiveStandby, Weight, Probation, Liveness, QualityBand) and RecordMode
+// are Change values of the same types as in PipeUpdate: at AddPipe the zero
+// Change and Clear both mean the default and Set gives a value, the zero
+// value included, as in SendStandby: Set(true) or Weight: Set(uint64(0)).
+// A set Send field wins over the peer's request (PIPE_STATUS), which can
+// change at any time; the Receive fields are always sent: the Hello
+// carries a request for the peer's outbound direction.
 type PipeOptions struct {
 	// SendPriority is the tier of the local outbound direction (lower is
-	// preferred). nil: the peer's request, else tier 0.
-	SendPriority *uint64
+	// preferred). Default: the peer's request, else tier 0.
+	SendPriority Change[uint64]
 	// SendStandby makes the local outbound direction carry data only on
-	// failover. nil: the peer's request, else active.
-	SendStandby *bool
+	// failover. Default: the peer's request, else active.
+	SendStandby Change[bool]
+	// ReceivePriority is the tier requested for the peer's outbound
+	// direction. Default: tier 0.
+	ReceivePriority Change[uint64]
+	// ReceiveStandby asks the peer to make its outbound direction standby.
+	// Default: active.
+	ReceiveStandby Change[bool]
 	// Weight is the share for SchedulerSpreadRoundRobin and the factor of
-	// SchedulerSpreadRateWeighted. nil: 1; 0 excludes the pipe unless every
-	// candidate has 0.
-	Weight *uint64
-	// Probation is the base of the pipe's probation. Zero is the
-	// session's (SchedulerParams.Probation); a negative value turns the
-	// pipe's probation off.
-	Probation time.Duration
+	// SchedulerSpreadRateWeighted. Default 1; 0 excludes the pipe unless
+	// every candidate has 0.
+	Weight Change[uint64]
+	// Probation is the base of the pipe's probation. Default (and Set(0)):
+	// the session's (SchedulerParams.Probation); a negative value turns
+	// the pipe's probation off.
+	Probation Change[time.Duration]
+	// Liveness are the pipe's own liveness settings; a zero field follows
+	// the session's (Config.Liveness). Default: the session's.
+	Liveness Change[PipeLiveness]
+	// QualityBand is the pipe's own quality band for EventPipeQualityChanged
+	// (its outbound direction). Default: the session's (Conn.SetQualityBand).
+	// A receive-only pipe has none: setting it is an ErrInvalidConfig error.
+	QualityBand Change[QualityBand]
+	// RecordMode is the record mode of this carrier. Default:
+	// Config.RecordPolicy, else RecordSealed.
+	RecordMode Change[RecordMode]
 	// Label names the pipe in statistics.
 	Label string
-	// ReceivePriority is the tier requested for the peer's outbound
-	// direction (zero: tier 0).
-	ReceivePriority uint64
 	// FateGroup groups pipes that share a path; a pipe that replaces a
 	// failed one on the same path reuses its fate group. 0: the carrier's
 	// PipeIO.FateGroup, else none (an independent path).
 	FateGroup uint64
-	// Liveness are the pipe's own liveness settings; a zero field follows
-	// the session's (Config.Liveness).
-	Liveness PipeLiveness
 	// Direction from the local endpoint: DirectionBidirectional (the zero
 	// value), DirectionSendOnly (an uplink) or DirectionReceiveOnly (a downlink).
 	Direction Direction
-	// ReceiveStandby asks the peer to make its outbound direction standby
-	// (zero: active).
-	ReceiveStandby bool
 	// ReturnOnReply makes AddPipe return at the verified Reply instead of
 	// once the peer has attached the pipe. The caller then keeps the
 	// session's other pipes until Pipe.WaitAttached returns.
 	ReturnOnReply bool
-	// RecordMode is the record mode of this carrier. nil:
-	// Config.RecordPolicy, else RecordSealed.
-	RecordMode *RecordMode
 	// KeyGroup is the key-exchange group of the Join's key share. Zero:
 	// group 1 when it is usable, otherwise group 2. A group that is not
 	// usable in the session fails AddPipe with ErrInvalidConfig.
@@ -79,18 +84,34 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 		j.Dir = 1
 	case DirectionBidirectional:
 	}
+	live, _ := o.Liveness.get()
 	var err error
-	if j.Live, err = o.Liveness.core(); err != nil {
+	if j.Live, err = live.core(); err != nil {
 		return j, err
 	}
-	j.FateGroup, j.SendPriority, j.SendStandby, j.Group = o.FateGroup, o.SendPriority, o.SendStandby, o.KeyGroup
-	j.RecvPriority, j.RecvStandby = o.ReceivePriority, o.ReceiveStandby
-	j.Weight = 1
-	if o.Weight != nil {
-		j.Weight = *o.Weight
+	if _, ok := o.QualityBand.get(); ok {
+		if dir == DirectionReceiveOnly {
+			return j, fmt.Errorf("%w: QualityBand on a receive-only pipe", ErrInvalidConfig)
+		}
+		if _, err = o.QualityBand.v.core(); err != nil {
+			return j, err
+		}
 	}
-	if o.Probation != 0 {
-		d := core.Duration(max(o.Probation, 0)) // 0: off
+	j.FateGroup, j.Group = o.FateGroup, o.KeyGroup
+	if v, ok := o.SendPriority.get(); ok {
+		j.SendPriority = &v
+	}
+	if v, ok := o.SendStandby.get(); ok {
+		j.SendStandby = &v
+	}
+	j.RecvPriority, _ = o.ReceivePriority.get()
+	j.RecvStandby, _ = o.ReceiveStandby.get()
+	j.Weight = 1
+	if v, ok := o.Weight.get(); ok {
+		j.Weight = v
+	}
+	if v, ok := o.Probation.get(); ok && v != 0 {
+		d := core.Duration(max(v, 0)) // 0: off
 		j.Probation = &d
 	}
 	return j, nil
@@ -103,8 +124,9 @@ type PipeID uint64
 // Pipe is one attachment of a session. Its methods are safe for concurrent
 // use; they fail with ErrPipeGone once the attachment is retired.
 type Pipe struct {
-	c  *Conn
-	id uint64
+	c   *Conn
+	id  uint64
+	end *pipeEnd // never nil
 }
 
 // ID returns the pipe ID.
@@ -136,6 +158,7 @@ func (p *Pipe) admittedValue() any {
 // direction: without another pipe that receives, the default wait lasts until the
 // deadline. In Bound, a carrier whose handshake (a *tls.Conn half, or a Handshaker)
 // has not completed is first driven through it with ctx; a failed handshake closes it.
+// On a session that returned before establishment (EarlyData), AddPipe first waits for it.
 func (c *Conn) AddPipe(ctx context.Context, p PipeIO, o PipeOptions) (*Pipe, error) {
 	pp, taken, err := c.addPipeCall(ctx, p, o)
 	if err != nil && !taken {
@@ -162,9 +185,10 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 		return nil, false, err
 	}
 	mode := RecordSealed
+	rm, rmSet := o.RecordMode.get()
 	switch {
-	case o.RecordMode != nil:
-		mode = *o.RecordMode
+	case rmSet:
+		mode = rm
 	case c.cfg.RecordPolicy != nil:
 		mode = c.cfg.RecordPolicy(joinCarrierInfo(p, false))
 	}
@@ -189,9 +213,20 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 			return nil, false, err
 		}
 	}
+	// A session that returned early (EarlyData) learns from the peer's
+	// parameters whether it has multipath at all.
+	if err := c.waitEstablished(ctx); err != nil {
+		return nil, false, err
+	}
 	pp, pd, err := c.addPipe(p, o, j)
 	if err != nil {
 		return nil, false, err
+	}
+	if b, ok := o.QualityBand.get(); ok {
+		cb, _ := b.core() // checked by join
+		c.lock()
+		_ = c.s.SetQualityBand(int64(pp.id), &cb) // join refused it on a receive-only pipe
+		c.unlock()
 	}
 	jctx, cancel := timeshim.WithTimeout(ctx, c.clk.source(), c.cfg.joinTimeout())
 	defer cancel()
@@ -285,12 +320,15 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions) (*Pipe, *pip
 	pd.id = id
 	c.pipes[id] = pd
 	c.labels[id] = o.Label
-	return &Pipe{c: c, id: id}, pd, nil
+	return &Pipe{c: c, id: id, end: pd.end}, pd, nil
 }
 
 // JoinReady reports whether the maintenance target and join admission permit
-// dialing another pipe now. Explicit AddPipe still follows the physical cap.
-func (c *Conn) JoinReady() bool {
+// dialing another pipe now: for a pool or an own redial loop, which dials
+// only when it may. Explicit AddPipe still follows the physical cap.
+func (a *ConnAdapter) JoinReady() bool { return (*Conn)(a).joinReady() }
+
+func (c *Conn) joinReady() bool {
 	if c == nil {
 		return false
 	}
@@ -301,19 +339,6 @@ func (c *Conn) JoinReady() bool {
 
 // ---- settings ----
 
-func (p *Pipe) set(o core.PipeSettings) error {
-	c := p.c
-	c.lock()
-	defer c.unlock()
-	if err := c.s.SetPipe(p.id, o); err != nil {
-		if errors.Is(err, core.ErrInvalid) {
-			return ErrPipeGone
-		}
-		return apiErr(err)
-	}
-	return nil
-}
-
 // Change is one field of a PipeUpdate, in one of three states: the zero
 // value keeps the setting, Set(v) sets it to v and Clear returns it to its
 // default.
@@ -321,6 +346,9 @@ type Change[T any] struct {
 	v     T
 	state uint8 // 0 keep, 1 set, 2 clear
 }
+
+// get returns the value of a Set change.
+func (c Change[T]) get() (T, bool) { return c.v, c.state == 1 }
 
 // Set returns a Change that sets a setting to v.
 func Set[T any](v T) Change[T] { return Change[T]{v: v, state: 1} }
@@ -346,6 +374,9 @@ func Clear[T any]() Change[T] { return Change[T]{state: 2} }
 //   - Liveness: set replaces the pipe's own PipeLiveness as a whole; clear
 //     follows the session's. A pipe already suspect keeps the SuspectFloor
 //     and DeadTimeout it turned suspect under.
+//   - QualityBand: set replaces the pipe's own band; clear follows the
+//     session's (Conn.SetQualityBand). Nothing is sent. A pipe without an
+//     outbound direction refuses either with ErrInvalidConfig.
 //
 // The fields fixed when the pipe is added (Direction, RecordMode, KeyGroup,
 // Label, FateGroup, ReturnOnReply) are not in PipeUpdate.
@@ -357,6 +388,7 @@ type PipeUpdate struct {
 	Weight          Change[uint64]
 	Probation       Change[time.Duration]
 	Liveness        Change[PipeLiveness]
+	QualityBand     Change[QualityBand]
 }
 
 // Update applies u to the pipe, all its fields together, from the next
@@ -425,31 +457,85 @@ func (p *Pipe) Update(u PipeUpdate) error {
 	case 2:
 		o.Liveness = &live
 	}
-	return p.set(o)
+	var band *core.QualityBand
+	if u.QualityBand.state == 1 {
+		cb, err := u.QualityBand.v.core()
+		if err != nil {
+			return err
+		}
+		band = &cb
+	}
+	other := u.SendPriority.state|u.SendStandby.state|u.ReceivePriority.state|u.ReceiveStandby.state|
+		u.Weight.state|u.Probation.state|u.Liveness.state != 0
+	c := p.c
+	c.lock()
+	defer c.unlock()
+	if u.QualityBand.state != 0 {
+		// Checked before anything applies: a band needs an outbound direction.
+		hasOut, ok := c.s.PipeHasOut(p.id)
+		if !ok {
+			return ErrPipeGone
+		}
+		if !hasOut {
+			return fmt.Errorf("%w: QualityBand on a pipe without an outbound direction", ErrInvalidConfig)
+		}
+	}
+	if other {
+		if err := c.s.SetPipe(p.id, o); err != nil {
+			if errors.Is(err, core.ErrInvalid) {
+				return ErrPipeGone
+			}
+			return apiErr(err)
+		}
+	}
+	if u.QualityBand.state != 0 {
+		return pipeErr(c.s.SetQualityBand(int64(p.id), band))
+	}
+	return nil
 }
 
-// SetSendPriority sets the tier of the local outbound direction, which
-// wins over the peer's request: Update with SendPriority set to v.
-func (p *Pipe) SetSendPriority(v uint64) error {
-	return p.Update(PipeUpdate{SendPriority: Set(v)})
+// Done returns a channel that is closed once the pipe has been removed and
+// its carrier's work in the library has ended, or the session has ended
+// (Wait then returns the session's error). It is closed at once for a pipe
+// that is gone. A select on it bounds the wait with a timer or a context.
+func (p *Pipe) Done() <-chan struct{} {
+	e, c := p.end, p.c
+	if e == goneEnd {
+		return closedChan
+	}
+	e.once.Do(func() {
+		e.waited = make(chan struct{})
+		labels.Go(e.drv.Load().lctx, "done", func() {
+			defer close(e.waited)
+			select {
+			case <-e.retired:
+				<-e.drv.Load().gs.wait()
+			case <-c.done:
+			}
+		})
+	})
+	return e.waited
 }
 
-// SetReceivePriority requests tier v for the peer's outbound direction:
-// Update with ReceivePriority set to v.
-func (p *Pipe) SetReceivePriority(v uint64) error {
-	return p.Update(PipeUpdate{ReceivePriority: Set(v)})
-}
-
-// SetSendStandby makes the local outbound direction standby, or active,
-// winning over the peer's request: Update with SendStandby set to b.
-func (p *Pipe) SetSendStandby(b bool) error {
-	return p.Update(PipeUpdate{SendStandby: Set(b)})
-}
-
-// SetReceiveStandby asks the peer to make its outbound direction standby,
-// or active: Update with ReceiveStandby set to b.
-func (p *Pipe) SetReceiveStandby(b bool) error {
-	return p.Update(PipeUpdate{ReceiveStandby: Set(b)})
+// Wait blocks until Done is closed and returns how the pipe ended: nil for a
+// graceful removal (Close, or the peer's) and for a pipe that is gone, the
+// cause for a failed or aborted one (ErrPipeGone without a known cause),
+// and the session's error when the session ended first. Wait does not
+// remove the pipe: it waits for Close, Abort or the pipe's own end.
+func (p *Pipe) Wait() error {
+	e, c := p.end, p.c
+	<-p.Done()
+	if e == goneEnd {
+		return nil
+	}
+	select {
+	case <-e.retired:
+	default:
+		return c.closedErr()
+	}
+	c.lock()
+	defer c.unlock()
+	return e.err
 }
 
 // Revalidate sends a PIPE_PING at once; the pipe takes no new stream data
@@ -506,7 +592,7 @@ func (p *Pipe) Abort(cause error) error {
 	c := p.c
 	c.lock()
 	defer c.unlock()
-	c.s.SetPipeCause(p.id, cause)
+	c.s.SetPipeCause(p.id, cause) // reported back with the retirement
 	c.warnLastPipeLocked(p.id)
 	return pipeErr(c.s.RemovePipe(p.id, false))
 }
@@ -754,6 +840,14 @@ func (p *Pipe) Stats() (PipeStats, bool) {
 	return c.pipeStats(pi), true
 }
 
+// endLocked is the end record of attachment id (under the lock).
+func (c *Conn) endLocked(id uint64) *pipeEnd {
+	if pd := c.pipes[id]; pd != nil {
+		return pd.end
+	}
+	return goneEnd
+}
+
 // Pipes returns the handles of the session's current attachments. A
 // session without multipath has pipe 0.
 func (c *Conn) Pipes() []*Pipe {
@@ -763,7 +857,7 @@ func (c *Conn) Pipes() []*Pipe {
 	ids := c.s.PipeIDs(nil)
 	out := make([]*Pipe, len(ids))
 	for i, id := range ids {
-		out[i] = &Pipe{c: c, id: id}
+		out[i] = &Pipe{c: c, id: id, end: c.endLocked(id)}
 	}
 	return out
 }
@@ -791,7 +885,7 @@ func (c *Conn) Pipe(id PipeID) (*Pipe, bool) {
 	if _, ok := c.s.PipeInfo(uint64(id)); !ok {
 		return nil, false
 	}
-	return &Pipe{c: c, id: uint64(id)}, true
+	return &Pipe{c: c, id: uint64(id), end: c.endLocked(uint64(id))}, true
 }
 
 func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
@@ -805,7 +899,7 @@ func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
 		Writable: pi.Writable, Saturated: pi.Saturated, RTTSource: pi.RTTSource,
 		SmoothedRTT: time.Duration(pi.SmoothedRTT), MinRTT: time.Duration(pi.MinRTT),
 		RTTVar: time.Duration(pi.RTTVar), OneWayDelay: time.Duration(pi.OWD),
-		DeliveryRate: uint64(pi.DeliveryRate), QueuedBytes: pi.QueuedBytes, BytesInFlight: pi.BytesInFlight,
+		DeliveryRate: rateBytes(pi.DeliveryRate), QueuedBytes: pi.QueuedBytes, BytesInFlight: pi.BytesInFlight,
 		BytesSent: pi.BytesSent, BytesReceived: pi.BytesReceived, BytesAcked: pi.BytesAcked,
 		RecordsSent: pi.RecordsSent, RecordsReceived: pi.RecordsReceived, BytesReinjected: pi.BytesReinjected,
 		RecordsLost: pi.RecordsLost, BytesLost: pi.BytesLost, BytesRetransmitted: pi.BytesRetransmitted,

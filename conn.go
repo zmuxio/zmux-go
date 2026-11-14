@@ -678,7 +678,7 @@ func DialTLS(ctx context.Context, network, addr string, tlsConf *tls.Config, cfg
 
 // Client starts a client session on a connection the caller established
 // (TCP, TLS, Unix or any net.Conn), like tls.Client; it returns as Start
-// does. With cfg.Credential, the connection starts with its prefix
+// does. With cfg.CarrierCredential, the connection starts with its prefix
 // (PresentPipe; a *tls.Conn is handshaken first). zmux owns c from then
 // on, whether Client succeeds or fails (as Start).
 func Client(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
@@ -773,7 +773,7 @@ func (c *Conn) closedErr() error {
 // that a carrier that takes data, when the data waits for credit, still
 // gets CONNECTION_CLOSE within the bound.
 const (
-	closeLimit      = time.Second
+	closeLimit      = time.Duration(core.CloseLimit)
 	closeFlushLimit = closeLimit * 9 / 10
 )
 

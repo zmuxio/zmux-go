@@ -61,7 +61,7 @@ func TestQUICJoinModes(t *testing.T) {
 			e := newEnv(t, scfg)
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			p := NewPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{MaxPipesPerConnection: 1})
+			p := NewConnPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{MaxPipesPerConnection: 1})
 			defer p.Shutdown()
 			first, err := p.OpenPipe(ctx)
 			if err != nil {
@@ -85,11 +85,11 @@ func TestQUICJoinModes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := c.AddPipe(ctx, second, zmux.PipeOptions{RecordMode: &tc.mode}); err != nil {
+			if _, err := c.AddPipe(ctx, second, zmux.PipeOptions{RecordMode: zmux.Set(tc.mode)}); err != nil {
 				t.Fatal(err)
 			}
 			// The traffic goes to the joined pipe, which then wants lanes of its own.
-			if err := c.Pipes()[0].SetSendStandby(true); err != nil {
+			if err := c.Pipes()[0].Update(zmux.PipeUpdate{SendStandby: zmux.Set(true)}); err != nil {
 				t.Fatal(err)
 			}
 			echo(t, c, s, 1<<20)

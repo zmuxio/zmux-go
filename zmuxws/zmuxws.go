@@ -160,7 +160,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.o.Fallback(w, r)
 		return
 	}
-	a, ok := h.l.AdmitUpgrade(w, r, h.o.Trusted, http.HandlerFunc(h.o.Fallback))
+	a, ok := h.l.Adapter().AdmitUpgrade(w, r, h.o.Trusted, http.HandlerFunc(h.o.Fallback))
 	if !ok {
 		return
 	}
@@ -222,7 +222,7 @@ type DialOptions struct {
 
 // DialPipe opens a WebSocket to rawURL (ws:// or wss://) and returns it as
 // a pipe input: for zmux.Start, Conn.AddPipe, or a carrier pool. The
-// upgrade request carries o.Credential.
+// upgrade request carries o.CarrierCredential.
 func DialPipe(ctx context.Context, rawURL string, o *DialOptions) (zmux.PipeIO, error) {
 	if o == nil {
 		o = &DialOptions{}
@@ -233,7 +233,7 @@ func DialPipe(ctx context.Context, rawURL string, o *DialOptions) (zmux.PipeIO, 
 
 // Dial opens a WebSocket to rawURL and starts a zmux client session on
 // it, as zmux.Dial does over TCP; the upgrade request carries
-// cfg.Credential. A Credential in o as well is a zmux.ErrInvalidConfig
+// cfg.CarrierCredential. A Credential in o as well is a zmux.ErrInvalidConfig
 // error.
 func Dial(ctx context.Context, rawURL string, o *DialOptions, cfg *zmux.Config) (*zmux.Conn, error) {
 	if o == nil {
@@ -244,7 +244,7 @@ func Dial(ctx context.Context, rawURL string, o *DialOptions, cfg *zmux.Config) 
 		cred = cfg.CarrierCredential
 	}
 	if o.CarrierCredential != nil {
-		return nil, fmt.Errorf("%w: zmuxws.Dial takes Config.Credential, not DialOptions.Credential", zmux.ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: zmuxws.Dial takes Config.CarrierCredential, not DialOptions.CarrierCredential", zmux.ErrInvalidConfig)
 	}
 	p, _, err := dialPipe(ctx, rawURL, o, cred)
 	if err != nil {
@@ -563,7 +563,7 @@ func (p *carrier) SetReadDeadline(t time.Time) error { return p.c.SetReadDeadlin
 
 // Candidate is a WebSocket to rawURL for zmux.DialChoice, dialed as DialPipe
 // does with o (nil: the zero DialOptions) and the session's credential in
-// place of o.Credential. A refused upgrade is reported as a
+// place of o.CarrierCredential. A refused upgrade is reported as a
 // *zmuxhttp.StatusError, so that the mode reports the candidate refused.
 func Candidate(rawURL string, o *DialOptions) zmux.Candidate {
 	var opts DialOptions

@@ -41,9 +41,10 @@ var prefixHeaderLen = base64.RawURLEncoding.EncodedLen(PrefixTokenLen)
 
 var prefixLabel = []byte("zmux-prefix-auth/1")
 
-// PrefixAuth configures prefix authentication tokens. Key, Slot, BindTLS
-// and Header must be the same on both ends; Skew and CacheSize are the
-// verifier's. As a Credential it presents a fresh token on every carrier.
+// PrefixAuth configures prefix authentication tokens: what both ends must
+// agree on (Key, Slot, BindTLS and HeaderField); the verifier's own settings
+// are PrefixAuthVerifierOptions. As a zmux.CarrierCredential it presents a
+// fresh token on every carrier.
 type PrefixAuth struct {
 	// Key is the pre-shared key (required).
 	Key []byte
@@ -54,13 +55,6 @@ type PrefixAuth struct {
 	// exporter (PrefixAuthBinding); tokens are then valid on that carrier
 	// only.
 	BindTLS bool
-	// Skew is the number of slots on either side of the verifier's current
-	// slot that it also accepts (0: only the current one).
-	Skew int
-	// CacheSize bounds the Nonces the verifier remembers while their slot
-	// is acceptable (0: 65536, as an empty cache would reject every
-	// token); a token that finds it full is rejected.
-	CacheSize int
 	// HeaderField is the request field of the header form (empty:
 	// HeaderPrefixAuth), another name only where an intermediary strips
 	// unknown fields.
@@ -104,8 +98,8 @@ func (a *PrefixAuth) Header(info *zmux.CarrierInfo) (name, value string, err err
 
 // prefixKey derives the token key from a PrefixAuth.
 func (a *PrefixAuth) prefixKey() ([]byte, int64, error) {
-	if len(a.Key) == 0 || a.Slot < time.Second || a.Slot%time.Second != 0 || a.Skew < 0 || a.CacheSize < 0 {
-		return nil, 0, fmt.Errorf("%w: PrefixAuth needs a Key, a whole-second Slot and non-negative bounds", zmux.ErrInvalidConfig)
+	if len(a.Key) == 0 || a.Slot < time.Second || a.Slot%time.Second != 0 {
+		return nil, 0, fmt.Errorf("%w: PrefixAuth needs a Key, and a whole-second Slot", zmux.ErrInvalidConfig)
 	}
 	if f := a.HeaderField; f != "" && !strings.EqualFold(f, HeaderPrefixAuth) {
 		// The pairing field's rules: a field no protocol uses, the
@@ -170,21 +164,36 @@ type PrefixAuthVerifier struct {
 	now    func() time.Time
 }
 
-// NewPrefixAuthVerifier returns a verifier for a; an invalid a is an
-// zmux.ErrInvalidConfig error.
-func NewPrefixAuthVerifier(a *PrefixAuth) (*PrefixAuthVerifier, error) {
+// PrefixAuthVerifierOptions are the settings only a verifier reads; the zero
+// value is the default.
+type PrefixAuthVerifierOptions struct {
+	// Skew is the number of slots on either side of the verifier's current
+	// slot that it also accepts (0: only the current one).
+	Skew int
+	// CacheSize bounds the Nonces the verifier remembers while their slot
+	// is acceptable (0: 65536, as an empty cache would reject every
+	// token); a token that finds it full is rejected.
+	CacheSize int
+}
+
+// NewPrefixAuthVerifier returns a verifier for a with o's settings; an
+// invalid a or o (a negative field) is an zmux.ErrInvalidConfig error.
+func NewPrefixAuthVerifier(a *PrefixAuth, o PrefixAuthVerifierOptions) (*PrefixAuthVerifier, error) {
 	k, slot, err := a.prefixKey()
 	if err != nil {
 		return nil, err
 	}
-	size := a.CacheSize
+	if o.Skew < 0 || o.CacheSize < 0 {
+		return nil, fmt.Errorf("%w: PrefixAuthVerifierOptions with a negative field", zmux.ErrInvalidConfig)
+	}
+	size := o.CacheSize
 	if size == 0 {
 		size = 1 << 16
 	}
-	v := &PrefixAuthVerifier{bind: a.BindTLS, header: a.headerName(), slot: slot, skew: int64(a.Skew), now: time.Now}
+	v := &PrefixAuthVerifier{bind: a.BindTLS, header: a.headerName(), slot: slot, skew: int64(o.Skew), now: time.Now}
 	// A token of slot s verifies while the clock is within skew slots of
 	// s: within (skew+1) slots of the slot's start.
-	v.cache, err = NewReplayFilter(ReplayConfig{Window: time.Duration(int64(a.Skew)+1) * time.Duration(slot) * time.Second,
+	v.cache, err = NewReplayFilter(ReplayConfig{Window: time.Duration(int64(o.Skew)+1) * time.Duration(slot) * time.Second,
 		Max: size})
 	if err != nil {
 		return nil, err

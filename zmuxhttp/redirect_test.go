@@ -287,7 +287,7 @@ func TestHTTPRedirectPastReplayBound(t *testing.T) {
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionSendOnly, nil)
+	p, err := Streaming{Client: srv.Client(), URL: srv.URL}.Pipe(ctx, zmux.DirectionSendOnly)
 	if err != nil {
 		t.Fatal(err)
 	}

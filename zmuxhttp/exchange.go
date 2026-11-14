@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"math/bits"
 	"net/http"
 	"sync"
@@ -32,22 +33,20 @@ import (
 // authenticate both ends with the PSK, but they do not encrypt. When TLS
 // ends at a proxy or CDN, that intermediary can read the carrier.
 
-// ExchangeConfig configures both ends of an HTTP exchange carrier. A
-// PSK is required unless AllowInsecure is set; the zero value of every
-// other field selects its default. PSK (or AllowInsecure) and Base64 must
-// be the same on both ends; the other fields are local to one end. The
-// server's HoldTime must stay below the response timeout of every
-// intermediary on the path, and the client's RequestTimeout above the
-// HoldTime.
+// ExchangeConfig holds what both ends of an HTTP exchange carrier must
+// agree on: Exchange (the client) and ExchangeOptions (the server) each
+// have the rest. A PSK is required unless AllowInsecure is set; the zero
+// value of every other field selects its default. PSK (or AllowInsecure)
+// and Base64 must be the same on both ends, and a piece size is the largest
+// piece its sender sends and, above 1 MiB, the receiver's limit.
 //
 // The MACs authenticate and bind responses to requests, but nothing is
 // encrypted: when TLS is terminated by a proxy or CDN, that intermediary
 // can read the carrier.
 //
 // Under the Settings rules of the package documentation, a field of 0
-// selects its default; a negative RequestTimeout, Deadline, HoldTime or
-// IdleTimeout is no timeout, and a negative Coalesce sends every piece at
-// once; another negative value is invalid (zmux.ErrInvalidConfig).
+// selects its default and a negative value is invalid
+// (zmux.ErrInvalidConfig).
 type ExchangeConfig struct {
 	// PSK is the pre-shared key: the MACs authenticate both ends with it.
 	PSK []byte
@@ -59,40 +58,6 @@ type ExchangeConfig struct {
 	// Base64 sends every body base64-encoded (standard alphabet, padded),
 	// for paths that do not pass binary bodies unchanged.
 	Base64 bool
-
-	// CacheBust gives a URL without {nonce} the NonceParam query parameter
-	// with a random value per request (client), so that no cache keyed on
-	// the target can answer one request with the response to another. It
-	// is on by default; zmux.SwitchOff leaves such a URL unchanged, for a server
-	// or intermediary that refuses unknown query parameters, when nothing
-	// on the path caches POST responses: a cached response would still
-	// fail its MAC and be repeated, but not get through.
-	CacheBust zmux.Switch
-	// testSkipResponseMAC disables the client's response MAC check (tests
-	// only: shows that the check is what rejects replayed responses).
-	testSkipResponseMAC bool
-	// Header is added to every request (client).
-	Header http.Header
-	// DownURL is the target template of DOWN requests (client; empty: the
-	// URL given to ExchangePipe, which UP and CLOSE requests use). It
-	// may differ in scheme, host, port and path and pass other
-	// intermediaries, as long as every request of a carrier reaches the
-	// server process that holds it; it takes the same placeholders.
-	DownURL string
-	// Instance replaces {instance} in the URL (client). The default is a
-	// random token per carrier, the same in every request of the carrier,
-	// so that a load balancer hashing the target keeps a carrier on one
-	// server.
-	Instance string
-	// NonceParam names the query parameter that carries a random value per
-	// request when the URL has no {nonce} placeholder ("n"), so that no
-	// cache keyed on the target matches (client).
-	NonceParam string
-	// DownRequests is the number of DOWN requests the client keeps
-	// outstanding (2); it is lowered while the server answers BUSY.
-	DownRequests int
-	// UpRequests bounds the UP requests outstanding at once (2).
-	UpRequests int
 	// UpPieceSize is the largest UP piece the client sends, and the server's
 	// limit when above 1 MiB, the default limit of piece data a request may
 	// carry. A request whose Content-Length exceeds that limit plus the
@@ -100,31 +65,100 @@ type ExchangeConfig struct {
 	// to the fallback (Options.Next) as a request that is not an exchange request.
 	// The default (DefaultExchangePieceSize) keeps every request body at
 	// most 1,000,000 bytes after the body encoding.
-	UpPieceSize int
-	// RequestTimeout bounds one attempt of one request (25 s; negative: no timeout); it must
-	// exceed the server's HoldTime.
-	RequestTimeout time.Duration
-	// BackoffMin and BackoffMax bound the randomized, doubling delay
-	// before a request without a result is repeated (20 ms, 2 s).
-	BackoffMin, BackoffMax time.Duration
-	// Deadline fails the carrier when a request has had no result for this
-	// long (30 s); zmux then recovers on its own.
-	Deadline time.Duration
-
-	// HoldTime bounds how long the server holds a DOWN request without
-	// data (20 s).
-	HoldTime time.Duration
-	// Coalesce is how long a piece waits for more bytes after its first
-	// byte while a request can take it. Zero is 2 ms; a negative value
-	// sends every piece at once, as httputil.ReverseProxy.FlushInterval
-	// does. The client coalesces UP pieces the same way.
-	Coalesce time.Duration
+	UpPieceSize int64
 	// DownPieceSize is the largest DOWN piece the server sends, and the
 	// client's limit when above 1 MiB, the default limit of piece data a
 	// response may carry; a larger piece fails the carrier. The default
 	// (DefaultExchangePieceSize) keeps every response body at most
 	// 1,000,000 bytes after the body encoding.
-	DownPieceSize int
+	DownPieceSize int64
+}
+
+// Exchange is the client of an HTTP exchange carrier to the
+// ExchangeHandler at URL: its methods are the operations on it. The zero
+// value of every field but URL and Config selects its default. The server's
+// HoldTime (ExchangeOptions) must stay below the response timeout of every
+// intermediary on the path, and the client's RequestTimeout above the
+// HoldTime. A negative RequestTimeout or Deadline is no timeout, a negative
+// Coalesce sends every piece at once; another negative value is invalid
+// (zmux.ErrInvalidConfig).
+type Exchange struct {
+	// Client sends the requests (nil: http.DefaultClient); keep its
+	// transport's MaxIdleConnsPerHost at least DownRequests+UpRequests so
+	// that connections are reused.
+	Client *http.Client
+	// URL is the target template of UP and CLOSE requests. It may contain
+	// {instance} and {nonce} placeholders, anywhere in its path or query.
+	URL string
+	// Config is what both ends agree on.
+	Config ExchangeConfig
+	// Header is added to every request.
+	Header http.Header
+	// DownURL is the target template of DOWN requests (empty: URL). It
+	// may differ in scheme, host, port and path and pass other
+	// intermediaries, as long as every request of a carrier reaches the
+	// server process that holds it; it takes the same placeholders.
+	DownURL string
+	// Instance replaces {instance} in the URL. The default is a
+	// random token per carrier, the same in every request of the carrier,
+	// so that a load balancer hashing the target keeps a carrier on one
+	// server.
+	Instance string
+	// NonceParam names the query parameter that carries a random value per
+	// request when the URL has no {nonce} placeholder ("n"), so that no
+	// cache keyed on the target matches.
+	NonceParam string
+	// CacheBust gives a URL without {nonce} the NonceParam query parameter
+	// with a random value per request. It is on by default; zmux.SwitchOff
+	// leaves such a URL unchanged, for a server or intermediary that
+	// refuses unknown query parameters, when nothing on the path caches
+	// POST responses: a cached response would still fail its MAC and be
+	// repeated, but not get through.
+	CacheBust zmux.Switch
+	// DownRequests is the number of DOWN requests the client keeps
+	// outstanding (2); it is lowered while the server answers BUSY.
+	DownRequests int
+	// UpRequests bounds the UP requests outstanding at once (2).
+	UpRequests int
+	// RequestTimeout bounds one attempt of one request (25 s; negative: no
+	// timeout); it must exceed the server's HoldTime.
+	RequestTimeout time.Duration
+	// Backoff is the randomized, doubling delay before a request without a
+	// result is repeated: from Min (20 ms) up to Max (2 s), each delay
+	// reduced by a random fraction of up to Jitter (0.5). A zero field is
+	// its default; a negative Jitter is none.
+	Backoff zmux.Backoff
+	// Deadline fails the carrier when a request has had no result for this
+	// long (30 s; negative: no deadline); zmux then recovers on its own.
+	Deadline time.Duration
+	// Coalesce is how long an UP piece waits for more bytes after its first
+	// byte while a request can take it. Zero is 2 ms; a negative value
+	// sends every piece at once, as httputil.ReverseProxy.FlushInterval
+	// does.
+	Coalesce time.Duration
+
+	// testSkipResponseMAC disables the client's response MAC check (tests
+	// only: shows that the check is what rejects replayed responses).
+	testSkipResponseMAC bool
+}
+
+// ExchangeOptions configure the server end of exchange carriers
+// (NewExchangeHandler): the HTTP options shared by every adapter and what
+// only the server reads. The zero value of every other field selects its
+// default; a negative IdleTimeout or HoldTime is no timeout, a negative
+// Coalesce sends every piece at once, another negative value is invalid
+// (zmux.ErrInvalidConfig).
+type ExchangeOptions struct {
+	// Options are the endpoint's HTTP options (Next, Trusted, PairField).
+	Options
+	// HoldTime bounds how long the server holds a DOWN request without
+	// data (20 s). It must stay below the response timeout of every
+	// intermediary on the path.
+	HoldTime time.Duration
+	// Coalesce is how long a DOWN piece waits for more bytes after its
+	// first byte while a request can take it. Zero is 2 ms; a negative
+	// value sends every piece at once.
+	Coalesce time.Duration
 	// DownWindow is the number of downlink pieces the server assigns ahead
 	// of the client's acknowledgement (32); requests beyond it get BUSY.
 	DownWindow int
@@ -132,7 +166,7 @@ type ExchangeConfig struct {
 	// (4 MiB; at least twice the largest UP piece accepted). Each piece
 	// held out of order also counts a fixed 64 bytes, which bounds how
 	// many are held.
-	UpStoreLimit int
+	UpStoreLimit int64
 	// IdleTimeout fails a server carrier without requests (60 s; negative:
 	// no timeout).
 	IdleTimeout time.Duration
@@ -178,6 +212,7 @@ type exParams struct {
 	upLimit, downLimit     int // the largest piece accepted
 	reqTimeout             time.Duration
 	backoffMin, backoffMax time.Duration
+	backoffJitter          float64
 	deadline               time.Duration
 	hold, coalesce         time.Duration
 	window                 int
@@ -190,23 +225,35 @@ type exParams struct {
 	skipRespMAC            bool
 }
 
-// resolve validates c (nil: the zero config) and fills in the defaults.
-func (c *ExchangeConfig) resolve() (exParams, error) {
-	var x ExchangeConfig
-	if c != nil {
-		x = *c
-	}
+// resolve validates the configuration of one end (cl is the client's
+// settings, sv the server's; nil: the defaults) and fills in the defaults.
+func (c ExchangeConfig) resolve(cl *Exchange, sv *ExchangeOptions) (exParams, error) {
 	switch {
-	case x.AllowInsecure && len(x.PSK) > 0:
+	case c.AllowInsecure && len(c.PSK) > 0:
 		return exParams{}, fmt.Errorf("%w: ExchangeConfig.AllowInsecure with a PSK", zmux.ErrInvalidConfig)
-	case !x.AllowInsecure && len(x.PSK) == 0:
+	case !c.AllowInsecure && len(c.PSK) == 0:
 		return exParams{}, fmt.Errorf("%w: ExchangeConfig needs a PSK or AllowInsecure", zmux.ErrInvalidConfig)
+	}
+	var x Exchange
+	if cl != nil {
+		x = *cl
+	}
+	var o ExchangeOptions
+	if sv != nil {
+		o = *sv
 	}
 	neg := false
 	pos := func(v, d int) int {
 		neg = neg || v < 0
 		if v > 0 {
 			return v
+		}
+		return d
+	}
+	size := func(v int64, d int) int {
+		neg = neg || v < 0
+		if v > 0 {
+			return int(min(v, math.MaxInt32))
 		}
 		return d
 	}
@@ -217,25 +264,36 @@ func (c *ExchangeConfig) resolve() (exParams, error) {
 		}
 		return d
 	}
+	bo, err := x.Backoff.WithDefaults(zmux.Backoff{Min: 20 * time.Millisecond, Max: 2 * time.Second, Jitter: 0.5})
+	if err != nil {
+		return exParams{}, fmt.Errorf("Exchange.Backoff: %w", err)
+	}
 	p := exParams{
-		psk: x.PSK, b64: x.Base64, header: x.Header, instance: x.Instance,
+		psk: c.PSK, b64: c.Base64, header: x.Header, instance: x.Instance,
 		nonceParam: x.NonceParam, downURL: x.DownURL, cacheBust: x.CacheBust.On(),
 		downs: pos(x.DownRequests, 2), ups: pos(x.UpRequests, 2),
-		upPiece:    pos(x.UpPieceSize, DefaultExchangePieceSize(x.Base64)),
-		downPiece:  pos(x.DownPieceSize, DefaultExchangePieceSize(x.Base64)),
+		upPiece:    size(c.UpPieceSize, DefaultExchangePieceSize(c.Base64)),
+		downPiece:  size(c.DownPieceSize, DefaultExchangePieceSize(c.Base64)),
 		reqTimeout: setting.Timeout(x.RequestTimeout, 25*time.Second),
-		backoffMin: dur(x.BackoffMin, 20*time.Millisecond), backoffMax: dur(x.BackoffMax, 2*time.Second),
+		backoffMin: bo.Min, backoffMax: bo.Max, backoffJitter: bo.Jitter,
 		deadline: setting.Timeout(x.Deadline, 30*time.Second),
-		hold:     setting.Timeout(x.HoldTime, 20*time.Second), coalesce: max(x.Coalesce, 0),
-		window: pos(x.DownWindow, 32), upStore: pos(x.UpStoreLimit, 4<<20),
-		idle: setting.Timeout(x.IdleTimeout, 60*time.Second), goneFor: dur(x.GoneMemory, 60*time.Second),
+		hold:     setting.Timeout(o.HoldTime, 20*time.Second),
+		window:   pos(o.DownWindow, 32), upStore: size(o.UpStoreLimit, 4<<20),
+		idle: setting.Timeout(o.IdleTimeout, 60*time.Second), goneFor: dur(o.GoneMemory, 60*time.Second),
 		skipRespMAC: x.testSkipResponseMAC,
-		skew:        dur(x.MaxClockSkew, 60*time.Second), nonceCache: pos(x.NonceCacheSize, 1<<18),
+		skew:        dur(o.MaxClockSkew, 60*time.Second), nonceCache: pos(o.NonceCacheSize, 1<<18),
 	}
 	if neg {
-		return exParams{}, fmt.Errorf("%w: negative ExchangeConfig field", zmux.ErrInvalidConfig)
+		return exParams{}, fmt.Errorf("%w: negative Exchange field", zmux.ErrInvalidConfig)
 	}
-	if x.Coalesce == 0 {
+	// One coalescing time per end: the client's for UP pieces, the
+	// server's for DOWN pieces.
+	co := x.Coalesce
+	if sv != nil {
+		co = o.Coalesce
+	}
+	p.coalesce = max(co, 0)
+	if co == 0 {
 		p.coalesce = 2 * time.Millisecond
 	}
 	if p.nonceParam == "" {

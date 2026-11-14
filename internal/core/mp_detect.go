@@ -205,7 +205,10 @@ func (a *attach) tref() Time {
 }
 
 // writeStall returns the start of the oldest write stall on p: a lane
-// whose carrier takes no bytes while records wait for it.
+// whose carrier takes no bytes while records or stream data wait for it
+// (waitsFor). A lane refused only because nothing could be written,
+// whether for lack of data or of the peer's credit or under the limiter,
+// has no stall.
 func (s *Session) writeStall(p *Pipe) (Time, bool) {
 	if p.out == nil {
 		return 0, false
@@ -216,7 +219,7 @@ func (s *Session) writeStall(p *Pipe) (Time, bool) {
 		if !ol.stalled() || ol.shut {
 			continue
 		}
-		if !ol.writing && !s.mpWantsWrite(p, ol) {
+		if !ol.writing && !s.waitsFor(p, ol) {
 			continue
 		}
 		if !ok || ol.stallAt < t {

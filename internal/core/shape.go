@@ -515,9 +515,23 @@ func (s *Session) shapeHeld(p *Pipe) bool {
 	return false
 }
 
-// delayed reports whether the planned record may not go yet.
+// delayed reports whether the planned record may not go yet: its delay
+// has not passed, and it carries no PIPE_ACK whose deadline has.
 func (ps *pipeShape) delayed(now Time) bool {
-	return ps.sh != nil && ps.planned && ps.delayWake && now < ps.delayUntil
+	return ps.sh != nil && ps.planned && ps.delayWake && now < ps.delayUntil && now < ps.s.ackRelease(ps.p)
+}
+
+// ackRelease is when a shaping delay of p's next record ends because the
+// record carries a pending PIPE_ACK: the acknowledgement's deadline. A
+// shaper never holds an acknowledgement beyond zmux_max_ack_delay, which
+// the peer's PTO and so its T_suspect count on (MULTIPATH.md Section
+// 7.1); held longer, the peer's working pipe turns suspect at every
+// exchange. Never when p carries none.
+func (s *Session) ackRelease(p *Pipe) Time {
+	if s.ack == nil || !s.carriesAck(p) {
+		return Never
+	}
+	return s.ack.deadline()
 }
 
 // shapeDelayed reports whether p's planned record waits for its delay.
@@ -811,6 +825,7 @@ func (s *Session) ShapingDeadline() Time {
 // shapeDeadline is the earliest shaping timer.
 func (s *Session) shapeDeadline() Time {
 	t := Never
+	ackDl, ackDlSet := Never, false // the acknowledgement deadline, computed once
 	for _, p := range s.pipes {
 		ps := p.sh
 		if ps == nil || ps.sh == nil {
@@ -821,7 +836,14 @@ func (s *Session) shapeDeadline() Time {
 			t = minT(t, ps.injAt)
 		}
 		if ps.delayWake {
-			t = minT(t, ps.delayUntil) // exactly: no granularity floor
+			rel := Never
+			if s.ack != nil && s.carriesAck(p) {
+				if !ackDlSet {
+					ackDl, ackDlSet = s.ack.deadline(), true
+				}
+				rel = ackDl // ackRelease(p)
+			}
+			t = minT(t, minT(ps.delayUntil, rel)) // exactly: no granularity floor
 		}
 		if ps.wake && s.sched.mask != 0 {
 			r := ps.hold

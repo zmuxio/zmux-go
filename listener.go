@@ -461,7 +461,9 @@ func (l *Listener) VariantStats() []VariantStat {
 // loops call it for a failed TLS handshake or its timeout, a failed HTTP
 // or WebSocket upgrade, or their setup limit; the listener's own serve
 // loops count theirs. A nil l does nothing.
-func (l *Listener) CountSetupFailure() {
+func (a *ListenerAdapter) CountSetupFailure() { (*Listener)(a).countSetupFailure() }
+
+func (l *Listener) countSetupFailure() {
 	if l != nil {
 		l.st.setupFailures.Add(1)
 	}
@@ -542,34 +544,34 @@ func (l *Listener) startWatchLocked() (start func()) {
 
 // MemoryUsed reports the bytes charged to the listener's memory budget,
 // in the unit of ListenerConfig.MemoryBudget.
-func (l *Listener) MemoryUsed() int64 { return int64(l.budget.Used()) }
+func (a *ListenerAdapter) MemoryUsed() int64 { return int64(a.budget.Used()) }
 
 // MemoryPressure reports whether the memory charged to the listener's
 // budget is above ListenerConfig.MemoryBudget: an adapter that buffers a
 // carrier's data outside a session (the exchange carrier) then takes no
 // more.
-func (l *Listener) MemoryPressure() bool { return l.budget.Pressure() }
+func (a *ListenerAdapter) MemoryPressure() bool { return a.budget.Pressure() }
 
 // ChargeMemory charges delta bytes (negative: gives them back) to the
 // listener's memory budget, for data an adapter buffers outside a
 // session; it is safe for concurrent use and does not block.
-func (l *Listener) ChargeMemory(delta int64) { l.budget.Add(delta) }
+func (a *ListenerAdapter) ChargeMemory(delta int64) { a.budget.Add(delta) }
 
 // HasAdmission reports whether the listener runs an admission
 // (ListenerConfig.Admission): an adapter that answered a carrier's request
 // only once the listener took the carrier answers an admitted one at once.
-func (l *Listener) HasAdmission() bool { return l.cfg.Admission != nil }
+func (a *ListenerAdapter) HasAdmission() bool { return a.cfg.Admission != nil }
 
 // Clock is the listener's clock (Config.Clock, or the host's).
-func (l *Listener) Clock() timeshim.Clock { return l.clk }
+func (a *ListenerAdapter) Clock() timeshim.Clock { return a.clk }
 
 // FirstRecordTimeout is the effective ListenerConfig.FirstRecordTimeout,
 // the bound an adapter applies to the start of a carrier it reads itself.
-func (l *Listener) FirstRecordTimeout() time.Duration { return l.cfg.FirstRecordTimeout }
+func (a *ListenerAdapter) FirstRecordTimeout() time.Duration { return a.cfg.FirstRecordTimeout }
 
 // HandshakeTimeout is the effective Config.HandshakeTimeout of the
 // listener's sessions.
-func (l *Listener) HandshakeTimeout() time.Duration { return l.cfg.Config.handshakeTimeout() }
+func (a *ListenerAdapter) HandshakeTimeout() time.Duration { return a.cfg.Config.handshakeTimeout() }
 
 // watchBudget is the serial context of the memory budget: it calls the
 // pressure hook and, under pressure, closes suspended sessions holding the
@@ -751,7 +753,7 @@ var (
 // A carrier that is not yet classified, or that joins a session and is
 // not yet verified, also holds a pending slot (ListenerConfig.MaxPending).
 func (l *Listener) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error {
-	a, err := l.Arrive(hint.Source, peerOf(p))
+	a, err := l.arrive(hint.Source, peerOf(p))
 	if errors.Is(err, errRefused) {
 		return l.refusePending(ctx, p, unmapped(hint.Source), peerOf(p))
 	}
@@ -862,7 +864,7 @@ func (l *Listener) wrapFailed(p, q PipeIO, fired bool, err error) (PipeIO, error
 	if !fired {
 		closePipeIO(p)
 	}
-	l.CountSetupFailure()
+	l.countSetupFailure()
 	return PipeIO{}, fmt.Errorf("zmux: WrapPipe: %w", err)
 }
 
@@ -872,7 +874,7 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint PipeHint, 
 	if err != nil {
 		closePipeIO(p)
 		if tlsSetupFailed(p) {
-			l.CountSetupFailure()
+			l.countSetupFailure()
 		} else {
 			l.rejectedBy(err)
 		}
@@ -1128,7 +1130,8 @@ func sameClock(a, b timeshim.Clock) (same bool) {
 // The answer is advisory: the join still authenticates, and a session that
 // ended meanwhile gets OnReject as for any unknown Locator. l.mu is held
 // for the lookup only.
-func (l *Listener) KnownJoin(prefix []byte) (known bool, need int) {
+func (a *ListenerAdapter) KnownJoin(prefix []byte) (known bool, need int) {
+	l := (*Listener)(a)
 	if len(prefix) == 0 || prefix[0] != join.ProfileJoin {
 		return false, 0
 	}
@@ -1194,14 +1197,14 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 		case <-es.HandshakeComplete():
 		case <-timer.C:
 			closePipeIO(p)
-			l.CountSetupFailure()
+			l.countSetupFailure()
 			return errRejected
 		case <-ctx.Done():
 		case <-l.done:
 		}
 		if ctx.Err() != nil || l.isClosed() {
 			closePipeIO(p)
-			l.CountSetupFailure()
+			l.countSetupFailure()
 			return errRejected
 		}
 	}

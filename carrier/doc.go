@@ -1,4 +1,4 @@
-// Package carrier holds the building blocks of carrier adapters: Pool
+// Package carrier holds the building blocks of carrier adapters: ConnPool
 // shares underlying connections (HTTP/2 and HTTP/3 request streams, QUIC
 // streams) between pipes within PoolLimits, ChannelDemux routes the
 // datagrams of a connection shared by several pipes to their channels,

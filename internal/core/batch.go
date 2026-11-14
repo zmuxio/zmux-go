@@ -158,6 +158,7 @@ type recWriter struct {
 	newData     bool // new stream data was written (idle copy)
 	revalPing   bool // the PIPE_PING of a revalidation was written
 	pingWritten bool // a PIPE_PING was written
+	suspPing    bool // it is the PIPE_PING of a suspicion
 	capped      bool // nextRecord stopped at recBound while data may wait
 	// Stream data opens no further record once the batch holds this many
 	// bytes (nextRecord); 0: one record.

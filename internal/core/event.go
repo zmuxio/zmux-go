@@ -63,7 +63,8 @@ type Event struct {
 	Role     Role
 
 	Saturated bool
-	Failed    bool // retirement (EvPipeState of OutRetired): the attachment failed
+	Failed    bool  // retirement (EvPipeState of OutRetired): the attachment failed
+	Cause     error // retirement: why the attachment failed, nil when it did not
 	RTT       Duration
 	Rate      float64
 }

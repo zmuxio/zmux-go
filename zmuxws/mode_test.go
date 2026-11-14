@@ -16,7 +16,7 @@ import (
 )
 
 // TestDialModeProfiles serves every HTTP carrier kind on one target
-// (zmuxhttp.Endpoint) and dials it in auto mode, WebSocket preferred,
+// (zmuxhttp.Mux) and dials it in auto mode, WebSocket preferred,
 // directly and through each proxy profile: the most preferred kind that
 // the path passes is chosen.
 func TestDialModeProfiles(t *testing.T) {
@@ -27,7 +27,7 @@ func TestDialModeProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex, err := zmuxhttp.NewExchangeHandler(l, o, &zmuxhttp.ExchangeConfig{PSK: psk, HoldTime: time.Second})
+	ex, err := zmuxhttp.NewExchangeHandler(l, &zmuxhttp.ExchangeOptions{Options: *o, HoldTime: time.Second}, zmuxhttp.ExchangeConfig{PSK: psk})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestDialModeProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(&zmuxhttp.Endpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
+	srv := httptest.NewServer(&zmuxhttp.Mux{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
 	ctx, cancel := context.WithCancel(context.Background())
 	accepted := make(chan *zmux.Conn, 8)
 	done := make(chan struct{})
@@ -79,8 +79,8 @@ func TestDialModeProfiles(t *testing.T) {
 			}
 			cands := []zmux.Candidate{
 				Candidate("ws"+strings.TrimPrefix(u, "http")+"/zmux", nil),
-				zmuxhttp.StreamCandidate(hc, u+"/zmux", nil),
-				zmuxhttp.ExchangeCandidate(hc, u+"/zmux", &zmuxhttp.ExchangeConfig{PSK: psk}),
+				zmuxhttp.Streaming{Client: hc, URL: u + "/zmux"}.Candidate(),
+				zmuxhttp.Exchange{Client: hc, URL: u + "/zmux", Config: zmuxhttp.ExchangeConfig{PSK: psk}}.Candidate(),
 			}
 			dctx, dcancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer dcancel()

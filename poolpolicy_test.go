@@ -24,7 +24,7 @@ func TestMaintainPipesPolicy(t *testing.T) {
 	var views []int
 	done := make(chan error, 1)
 	go func() {
-		done <- e.client.MaintainPipes(ctx, PipePool{Count: 1, MinBackoff: 10 * time.Millisecond,
+		done <- e.client.MaintainPipes(ctx, PipePool{Count: 1, Backoff: Backoff{Min: 10 * time.Millisecond},
 			Policy: policyFunc(func(v *PoolView, d *PoolDecision) {
 				mu.Lock()
 				defer mu.Unlock()

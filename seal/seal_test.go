@@ -40,7 +40,7 @@ type gate struct {
 
 	mu      sync.Mutex
 	asked   []seal.CredentialRequest
-	commits []seal.Admission
+	commits []seal.CommitRequest
 }
 
 func (g *gate) Resolve(_ context.Context, h []byte, _ netip.AddrPort) ([]byte, error) {
@@ -57,7 +57,7 @@ func (g *gate) Credential(_ context.Context, r seal.CredentialRequest) (*proto.C
 	return g.cred, nil
 }
 
-func (g *gate) Commit(_ context.Context, a seal.Admission) (any, error) {
+func (g *gate) Commit(_ context.Context, a seal.CommitRequest) (any, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.commits = append(g.commits, a)

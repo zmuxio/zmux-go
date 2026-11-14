@@ -25,7 +25,7 @@ type Options struct {
 	// PairField is the request field that pairs the uplink POST and the
 	// downlink GET of a split bootstrap (empty: HeaderPair), another name
 	// only where an intermediary strips unknown fields. The client side
-	// uses the same name (SplitOptions.PairField).
+	// uses the same name (Split.PairField).
 	PairField string
 }
 

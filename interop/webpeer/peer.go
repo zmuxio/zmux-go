@@ -15,14 +15,14 @@ import (
 	"github.com/zmuxio/zmux-go/admit"
 )
 
-// Auth is the prefix authentication of key: 30 s slots, skew 1, no TLS binding.
+// Auth is the prefix authentication of key: 30 s slots, no TLS binding; the listener accepts one slot of skew.
 func Auth(key string) *admit.PrefixAuth {
-	return &admit.PrefixAuth{Key: []byte(key), Slot: 30 * time.Second, Skew: 1}
+	return &admit.PrefixAuth{Key: []byte(key), Slot: 30 * time.Second}
 }
 
 // NewListener returns a listener that admits carriers presenting Auth(key).
 func NewListener(key string) (*zmux.Listener, error) {
-	v, err := admit.NewPrefixAuthVerifier(Auth(key))
+	v, err := admit.NewPrefixAuthVerifier(Auth(key), admit.PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		return nil, err
 	}

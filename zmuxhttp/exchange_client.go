@@ -22,29 +22,29 @@ import (
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
-// ExchangePipe opens an HTTP exchange carrier (see ExchangeConfig)
-// to the ExchangeHandler at rawURL and returns it as a bidirectional
-// pipe for Start or zmux.Conn.AddPipe. It sends nothing before zmux writes; the
-// carrier is ready at once. rawURL may contain {instance} and {nonce}
-// placeholders, anywhere in its path or query. client may be nil
-// (http.DefaultClient); keep its transport's MaxIdleConnsPerHost at least
-// DownRequests+UpRequests so that connections are reused. ctx bounds the
-// setting up: ending it before the first verified response fails the
-// carrier, which otherwise lives until zmux closes it. An invalid cfg (nil, or
-// without a PSK and AllowInsecure) is a zmux.ErrInvalidConfig error.
+// Pipe opens the exchange carrier to the ExchangeHandler at e.URL and
+// returns it as a bidirectional pipe for zmux.Start or zmux.Conn.AddPipe. It
+// sends nothing before zmux writes; the carrier is ready at once. ctx
+// bounds the setting up: ending it before the first verified response fails
+// the carrier, which otherwise lives until zmux closes it. An invalid
+// configuration (no PSK and no AllowInsecure, a negative field, a URL that
+// does not parse) is a zmux.ErrInvalidConfig error.
 //
-// Every request follows redirects as StreamPipe does; a pure scheme upgrade
-// (CheckRedirect) is remembered, and the carrier's later requests go
-// to the new origin at once.
-func ExchangePipe(ctx context.Context, client *http.Client, rawURL string, cfg *ExchangeConfig) (zmux.PipeIO, error) {
-	return httpExchangePipe(ctx, client, rawURL, nil, cfg)
+// Every request follows redirects as Streaming.Pipe does; a pure scheme
+// upgrade (CheckRedirect) is remembered, and the carrier's later requests
+// go to the new origin at once.
+func (e Exchange) Pipe(ctx context.Context) (zmux.PipeIO, error) {
+	return e.pipe(ctx, nil)
 }
 
-func httpExchangePipe(ctx context.Context, client *http.Client, rawURL string, t *Target, cfg *ExchangeConfig) (zmux.PipeIO, error) {
-	p, err := cfg.resolve()
+// pipe is Pipe; with t, the carrier starts at t's URL and records in t the
+// URL redirects led it to.
+func (e Exchange) pipe(ctx context.Context, t *Target) (zmux.PipeIO, error) {
+	p, err := e.Config.resolve(&e, nil)
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
+	client, rawURL := e.Client, e.URL
 	if t != nil {
 		rawURL = t.URL()
 	}
@@ -622,7 +622,7 @@ func (c *exClient) applyLocked(a *exAttempt, r exResult, now time.Time) {
 		return
 	}
 	retry := func() {
-		d := st.backoff/2 + mrand.N(st.backoff/2+1)
+		d := time.Duration(float64(st.backoff) * (1 - c.p.backoffJitter*mrand.Float64()))
 		st.retryAt = now.Add(d)
 		st.backoff = min(2*st.backoff, c.p.backoffMax)
 	}

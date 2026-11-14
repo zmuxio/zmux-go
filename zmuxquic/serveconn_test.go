@@ -16,7 +16,7 @@ import (
 // session on the first and joins it with a pipe on the second.
 func TestServeConnDialled(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(nil))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestServeConnDialled(t *testing.T) {
 			qc, err := ln.Accept(ctx)
 			acc <- res{qc, err}
 		}()
-		qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
+		qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -99,7 +99,7 @@ func TestServeConnDialled(t *testing.T) {
 // refuses, and reports net.ErrClosed.
 func TestServeConnRefused(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(nil))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestServeConnRefused(t *testing.T) {
 	_ = lst.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}

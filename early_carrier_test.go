@@ -532,3 +532,48 @@ func TestEarlyCarrierPeerBytesBeforeVerdict(t *testing.T) {
 		waitDone(t, c)
 	})
 }
+
+// AddPipe on a session that returned before establishment (early data)
+// waits for the peer's parameters instead of failing with
+// ErrNotNegotiated: multipath is decided only by them.
+func TestAddPipeBeforeEstablishment(t *testing.T) {
+	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	l := mustNewListener(&ListenerConfig{Config: mpConfig()})
+	defer func() { _ = l.Close() }()
+	a0, b0 := net.Pipe()
+	c, err := Start(ctx, NetPipe(a0), RoleClient, earlyFloorConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close(); waitDone(t, c) }()
+	if c.s.Established() {
+		t.Fatal("established without a peer")
+	}
+	// No peer yet: the call waits until its context ends.
+	short, cancelShort := context.WithTimeout(ctx, 20*time.Millisecond)
+	ap, bp := net.Pipe()
+	_, err = c.AddPipe(short, NetPipe(ap), PipeOptions{})
+	cancelShort()
+	_ = bp.Close()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AddPipe before establishment: %v, want the context's error", err)
+	}
+	a1, b1 := net.Pipe()
+	go func() { _ = l.HandlePipe(ctx, NetPipe(b0), PipeHint{}) }()
+	go func() { _ = l.HandlePipe(ctx, NetPipe(b1), PipeHint{}) }()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.AddPipe(ctx, NetPipe(a1), PipeOptions{})
+		done <- err
+	}()
+	s, err := l.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close(); waitDone(t, s) }()
+	if err := <-done; err != nil {
+		t.Fatalf("AddPipe: %v", err)
+	}
+}

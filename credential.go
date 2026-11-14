@@ -8,13 +8,13 @@ import (
 
 // CarrierCredential is what a client presents on a carrier it opens, for the
 // server's Admission: the client side of an Admission. info describes
-// the carrier as CarrierInfo does on the server: Remote is the server's
+// the carrier as CarrierInfo does on the server: Peer is the server's
 // address and TLS the carrier's completed handshake (nil without TLS);
 // Head is set for Header. admit.PrefixAuth is a CarrierCredential.
 //
 // The adapters present it: zmux.Client, Dial and DialTLS take
 // Config.CarrierCredential, as the QUIC, WebSocket and WebTransport dialers of
-// the sub-modules do; zmuxhttp.StreamPipe and zmuxhttp.SplitPipe take one; PresentPipe
+// the sub-modules do; zmuxhttp.Streaming and zmuxhttp.Split take one; PresentPipe
 // presents it on any other byte-stream pipe. Methods are called
 // concurrently.
 type CarrierCredential interface {

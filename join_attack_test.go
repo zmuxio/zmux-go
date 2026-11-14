@@ -301,7 +301,7 @@ func (e *atkEnv) capture(mode RecordMode) []byte {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := e.c.AddPipe(ctx, NetPipe(e.dial(addr)), PipeOptions{RecordMode: new(mode)})
+		_, err := e.c.AddPipe(ctx, NetPipe(e.dial(addr)), PipeOptions{RecordMode: Set(mode)})
 		done <- err
 	}()
 	var hello []byte
@@ -386,7 +386,7 @@ func (e *atkEnv) offer(b []byte) (net.Conn, bool) {
 // rejoin joins the origin and checks that msg, written earlier, arrives whole.
 func (e *atkEnv) rejoinDelivers(mode RecordMode, msg []byte) {
 	e.t.Helper()
-	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dialTLS(e.tlsTo)), PipeOptions{RecordMode: new(mode)}); err != nil {
+	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dialTLS(e.tlsTo)), PipeOptions{RecordMode: Set(mode)}); err != nil {
 		e.t.Fatalf("join to the origin: %v", err)
 	}
 	ss, err := e.s.AcceptStream(e.ctx)
@@ -462,7 +462,7 @@ func TestJoinThirdParty(t *testing.T) {
 				carrier := e.dialTLS(addr)
 				added := make(chan error, 1)
 				go func() {
-					_, err := e.c.AddPipe(ctx, NetPipe(carrier), PipeOptions{RecordMode: new(mode)})
+					_, err := e.c.AddPipe(ctx, NetPipe(carrier), PipeOptions{RecordMode: Set(mode)})
 					added <- err
 				}()
 				// The third party has its one Hello; from here the join has
@@ -547,7 +547,7 @@ func TestJoinBoundRelayRefused(t *testing.T) {
 	a := &tap{}
 	addr := e.tlsRelay(a)
 	start := time.Now()
-	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dialTLS(addr)), PipeOptions{RecordMode: new(RecordBound)}); err == nil {
+	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dialTLS(addr)), PipeOptions{RecordMode: Set(RecordBound)}); err == nil {
 		t.Fatal("Bound passed a third party")
 	}
 	if took := time.Since(start); took > DefaultJoinTimeout/2 {
@@ -797,7 +797,7 @@ func TestReplayMovesNothing(t *testing.T) {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Parallel()
 			e := newAtkEnv(t, atkOpts{})
-			p, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{RecordMode: new(mode)})
+			p, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{RecordMode: Set(mode)})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -854,7 +854,7 @@ func TestReplayMovesNothing(t *testing.T) {
 			if s := e.s.ConnectionStats(); s.PipesActive != 0 || s.PipesAdded != added {
 				t.Fatalf("a replay ended the suspension: %+v", s)
 			}
-			if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{RecordMode: new(mode)}); err != nil {
+			if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{RecordMode: Set(mode)}); err != nil {
 				t.Fatal(err)
 			}
 			e.until("the resumption", func() bool { return e.s.ConnectionStats().PipesActive == 1 })
@@ -992,7 +992,7 @@ func TestReplayFirstBatchDeduplicated(t *testing.T) {
 func TestJoiningHasNoLiveness(t *testing.T) {
 	t.Parallel()
 	e := newAtkEnv(t, atkOpts{})
-	live := PipeOptions{Liveness: PipeLiveness{SuspectFloor: 50 * time.Millisecond, DeadTimeout: time.Second}}
+	live := PipeOptions{Liveness: Set(PipeLiveness{SuspectFloor: 50 * time.Millisecond, DeadTimeout: time.Second})}
 	st, err := e.c.OpenStreamSync(e.ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1376,7 +1376,7 @@ func TestWeakestRecordModeSecure(t *testing.T) {
 	}
 	a, b := tcpPair(t)
 	go func() { _ = lst.HandlePipe(ctx, NetPipe(b), PipeHint{}) }()
-	p, err := c.AddPipe(ctx, NetPipe(a), PipeOptions{RecordMode: new(RecordTrusted)})
+	p, err := c.AddPipe(ctx, NetPipe(a), PipeOptions{RecordMode: Set(RecordTrusted)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1393,7 +1393,7 @@ func TestWeakestRecordModeSecure(t *testing.T) {
 func TestAcceptorDefaultSealedOnly(t *testing.T) {
 	t.Parallel()
 	e := newAtkEnv(t, atkOpts{server: func(c *Config) { c.AllowRecordMode = nil }})
-	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{RecordMode: new(RecordTrusted)}); err == nil {
+	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{RecordMode: Set(RecordTrusted)}); err == nil {
 		t.Fatal("Trusted at a default acceptor")
 	}
 	e.alive(e.s)

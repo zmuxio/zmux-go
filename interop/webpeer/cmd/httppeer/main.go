@@ -22,7 +22,7 @@ import (
 
 func main() {
 	if len(os.Args) != 4 {
-		fmt.Fprintln(os.Stderr, "usage: httppeer server|client|bad KIND ADDR")
+		_, _ = fmt.Fprintln(os.Stderr, "usage: httppeer server|client|bad KIND ADDR")
 		os.Exit(2)
 	}
 	mode, kind, addr := os.Args[1], os.Args[2], os.Args[3]
@@ -57,9 +57,9 @@ func main() {
 		url := "http://" + addr + "/zmux"
 		var cand zmux.Candidate
 		if split {
-			cand = zmuxhttp.SplitCandidate(client, url, nil)
+			cand = zmuxhttp.Split{Client: client, URL: url}.Candidate()
 		} else {
-			cand = zmuxhttp.StreamCandidate(client, url, nil)
+			cand = zmuxhttp.Streaming{Client: client, URL: url}.Candidate()
 		}
 		pipe, err := cand.Dial(ctx, peer.Auth(key))
 		var c *zmux.Conn

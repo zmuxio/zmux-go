@@ -42,7 +42,7 @@ func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, rea
 	case "dial":
 		client, err = Dial(ctx, e.ln.Addr().String(), e.cli, nil, nil)
 	default:
-		p := NewPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
+		p := NewConnPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 		var pio zmux.PipeIO
 		if pio, err = p.OpenPipe(ctx); err == nil {
 			client, err = zmux.Start(ctx, pio, zmux.RoleClient, nil)

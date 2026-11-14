@@ -113,7 +113,7 @@ func TestLivenessStandbyBusy(t *testing.T) {
 			t.Fatal(err)
 		}
 		sb := true
-		p, err := e.client.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{SendStandby: &sb})
+		p, err := e.client.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{SendStandby: zmux.Set(sb)})
 		if err != nil {
 			t.Fatal(err)
 		}

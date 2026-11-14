@@ -218,6 +218,45 @@ func TestCloseAfterAbortReturnsAtOnce(t *testing.T) {
 	})
 }
 
+// A session that ends by its idle timeout while the carrier is stuck in an
+// earlier write still ends: the close limit bounds the hand-off of
+// CONNECTION_CLOSE whoever closed.
+func TestIdleCloseStalledCarrierEnds(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		a, b := net.Pipe()
+		sc := &stallConn{Conn: a, closed: make(chan struct{})}
+		cfg := func() *Config {
+			return &Config{Clock: timeshim.Real, MaxIdleTimeout: 3 * time.Second,
+				Liveness: Liveness{KeepAlivePeriod: -1}}
+		}
+		ch := make(chan *Conn, 1)
+		go func() {
+			s, err := Server(ctx, b, cfg())
+			if err != nil {
+				s = nil
+			}
+			ch <- s
+		}()
+		client, err := Client(ctx, sc, cfg())
+		if err != nil {
+			t.Fatal(err)
+		}
+		server := <-ch
+		if server == nil {
+			t.Fatal("no server session")
+		}
+		defer func() { _ = server.Close(); _ = server.Wait() }()
+		sc.stall.Store(true)
+		t0 := time.Now()
+		_ = client.Wait()
+		if d := time.Since(t0); d > 3*time.Second+closeLimit+time.Second {
+			t.Fatalf("the idle session took %v to end", d)
+		}
+	})
+}
+
 // On a synchronous carrier (net.Pipe), which has no half-close, Close
 // returns at the hand-off, within the close limit, and the session drains
 // in the background until the linger timeout.

@@ -86,6 +86,7 @@ type multiPath struct {
 	pickQ        []*Stream // directions waiting for a custom decision
 	inputEpoch   uint64
 	pickDeadline Time
+	openAs       *Pipe // a pipe evaluated as if its carrier took bytes (waitsFor)
 
 	suspendCause error // the pipe loss that suspended the session
 
@@ -184,6 +185,7 @@ type attach struct {
 	unacked     bool     // unacknowledged ack-eliciting bytes exist
 	lingering   bool
 	noSample    bool
+	suspPing    bool // the pending PIPE_PING is that of a suspicion
 	suspHeld    bool // suspFloor and suspDead hold: set on turning suspect
 
 	// Tiers.

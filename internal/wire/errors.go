@@ -29,6 +29,9 @@ const (
 	IdleTimeout             uint64 = 0x2736d55c
 )
 
+// CodeCancelled is ZMUX_CANCELLED, the code of a stream released unfinished.
+const CodeCancelled uint64 = 0x5a4d0001
+
 // CodeRejected is ZMUX_REJECTED, an application-level stream refusal.
 const CodeRejected uint64 = 0x5a4d0002
 

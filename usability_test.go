@@ -36,11 +36,11 @@ func TestConfigBounds(t *testing.T) {
 		{"negative ResumeTimeout", Config{ResumeTimeout: -1}, core.RoleInitiator, false},
 		{"negative JoinTimeout", Config{JoinTimeout: -1}, core.RoleInitiator, false},
 		{"negative JoinEarlyHello", Config{JoinEarlyHello: -1}, core.RoleInitiator, true},
-		{"negative RedialMinBackoff", Config{RedialMinBackoff: -1}, core.RoleInitiator, false},
-		{"RedialMinBackoff above the default maximum", Config{RedialMinBackoff: 2 * time.Minute}, core.RoleInitiator, false},
-		{"RedialMinBackoff above RedialMaxBackoff", Config{RedialMinBackoff: 5 * time.Second, RedialMaxBackoff: 2 * time.Second}, core.RoleInitiator, false},
-		{"RedialMaxBackoff below the default minimum", Config{RedialMaxBackoff: 500 * time.Millisecond}, core.RoleInitiator, false},
-		{"redial backoff bounds", Config{RedialMinBackoff: 2 * time.Second, RedialMaxBackoff: 2 * time.Second}, core.RoleInitiator, true},
+		{"negative RedialMinBackoff", Config{RedialBackoff: Backoff{Min: -1}}, core.RoleInitiator, false},
+		{"RedialMinBackoff above the default maximum", Config{RedialBackoff: Backoff{Min: 2 * time.Minute}}, core.RoleInitiator, false},
+		{"RedialMinBackoff above RedialMaxBackoff", Config{RedialBackoff: Backoff{Min: 5 * time.Second, Max: 2 * time.Second}}, core.RoleInitiator, false},
+		{"RedialMaxBackoff below the default minimum", Config{RedialBackoff: Backoff{Max: 500 * time.Millisecond}}, core.RoleInitiator, false},
+		{"redial backoff bounds", Config{RedialBackoff: Backoff{Min: 2 * time.Second, Max: 2 * time.Second}}, core.RoleInitiator, true},
 		{"ZmuxPeer with RoleAuto", Config{EarlyData: EarlyData{ZmuxPeer: true}}, core.RoleAuto, false},
 		{"ZmuxPeer as a client", Config{EarlyData: EarlyData{ZmuxPeer: true}}, core.RoleInitiator, true},
 	} {
@@ -320,8 +320,8 @@ func TestJoinPendingText(t *testing.T) {
 	}
 }
 
-// The Redial backoff starts at RedialMinBackoff, doubles up to
-// RedialMaxBackoff, and counts from the start of the previous call.
+// The Redial backoff starts at RedialBackoff.Min, doubles up to
+// RedialBackoff.Max, and counts from the start of the previous call.
 func TestRedialBackoffSequence(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex
@@ -329,7 +329,7 @@ func TestRedialBackoffSequence(t *testing.T) {
 		cfg := mpConfig()
 		cfg.Clock = timeshim.Real
 		cfg.ResumeTimeout = 10 * time.Minute
-		cfg.RedialMinBackoff, cfg.RedialMaxBackoff = time.Second, 8*time.Second
+		cfg.RedialBackoff = Backoff{Min: time.Second, Max: 8 * time.Second}
 		cfg.Redial = func(context.Context, Direction) (PipeIO, error) {
 			mu.Lock()
 			calls = append(calls, time.Now())

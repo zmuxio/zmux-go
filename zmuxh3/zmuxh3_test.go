@@ -95,11 +95,11 @@ func TestHTTP3RequestStream(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	url := "https://" + pc.LocalAddr().String() + "/"
-	p, err := zmuxhttp.StreamPipe(ctx, client, url, nil, zmux.DirectionBidirectional, nil)
+	p, err := zmuxhttp.Streaming{Client: client, URL: url}.Pipe(ctx, zmux.DirectionBidirectional)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.Carrier = zmux.CarrierHTTP3 // zmuxhttp.StreamPipe cannot know the protocol yet
+	p.Carrier = zmux.CarrierHTTP3 // zmuxhttp.Streaming.Pipe cannot know the protocol yet
 	c, err := zmux.Start(ctx, p, zmux.RoleClient, pskCfg())
 	if err != nil {
 		t.Fatal(err)
@@ -129,8 +129,8 @@ func TestWebTransport(t *testing.T) {
 	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
 	// Sessions are admitted by a token bound to the QUIC connection, in
 	// the CONNECT request's Zmux-Prefix-Auth field.
-	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-	v, err := admit.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, BindTLS: true}
+	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestWebTransport(t *testing.T) {
 	echo(t, c, s)
 	checkKind(t, zmux.CarrierWebTransport, c, s)
 	// Pooled pipes: two per WebTransport session, then a new session.
-	pool := NewPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
+	pool := NewConnPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer pool.Shutdown()
 	var fates []uint64
 	for range 3 {
@@ -323,7 +323,7 @@ func TestBoundOverHTTP3(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	url := "https://" + pc.LocalAddr().String() + "/"
-	p, err := zmuxhttp.StreamPipe(ctx, client, url, nil, zmux.DirectionBidirectional, nil)
+	p, err := zmuxhttp.Streaming{Client: client, URL: url}.Pipe(ctx, zmux.DirectionBidirectional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,13 +339,13 @@ func TestBoundOverHTTP3(t *testing.T) {
 	}
 	defer func() { _ = s.Close(); _ = s.Wait() }()
 	echo(t, c, s)
-	q, err := zmuxhttp.StreamPipe(ctx, client, url, nil, zmux.DirectionBidirectional, nil)
+	q, err := zmuxhttp.Streaming{Client: client, URL: url}.Pipe(ctx, zmux.DirectionBidirectional)
 	if err != nil {
 		t.Fatal(err)
 	}
 	q.Carrier = zmux.CarrierHTTP3
 	bound := zmux.RecordBound
-	pp, err := c.AddPipe(ctx, q, zmux.PipeOptions{RecordMode: &bound})
+	pp, err := c.AddPipe(ctx, q, zmux.PipeOptions{RecordMode: zmux.Set(bound)})
 	if err != nil {
 		t.Fatal(err)
 	}

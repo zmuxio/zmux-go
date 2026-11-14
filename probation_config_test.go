@@ -41,9 +41,9 @@ func TestProbationSettings(t *testing.T) {
 		bad  bool
 	}{
 		{PipeOptions{}, nil, false},
-		{PipeOptions{Probation: -1}, new(core.Duration), false},
-		{PipeOptions{Probation: time.Second}, func() *core.Duration { d := core.Duration(time.Second); return &d }(), false},
-		{PipeOptions{Probation: -time.Hour}, new(core.Duration), false},
+		{PipeOptions{Probation: Set(time.Duration(-1))}, new(core.Duration), false},
+		{PipeOptions{Probation: Set(time.Duration(time.Second))}, func() *core.Duration { d := core.Duration(time.Second); return &d }(), false},
+		{PipeOptions{Probation: Set(time.Duration(-time.Hour))}, new(core.Duration), false},
 	} {
 		j, err := x.o.join(DirectionBidirectional)
 		if x.bad {

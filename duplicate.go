@@ -81,7 +81,7 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 	lose.s.Shutdown(0, nil)
 	lose.unlock()
 	res := DuplicateResult{Survivor: win, Loser: lose}
-	if o.Rejoin && o.Dial != nil && loserDialer == EndpointLocal && win.ConnectionState().Multipath && win.JoinReady() {
+	if o.Rejoin && o.Dial != nil && loserDialer == EndpointLocal && win.ConnectionState().Multipath && win.joinReady() {
 		res.RejoinStarted = true
 		labels.Go(win.lctx, "duplicate-rejoin", func() {
 			clk := win.clk.source()

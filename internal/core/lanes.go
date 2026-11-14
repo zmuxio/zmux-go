@@ -233,8 +233,7 @@ func (s *Session) lanesAcked(p *Pipe, ol *outLane) {
 		i++
 	}
 	if s.closeFr.waitLanes && s.lanesCovered() {
-		s.closeFr.waitLanes = false
-		s.wakeAllWriters()
+		s.endLaneWait()
 	}
 	s.wakeAllWriters()
 }

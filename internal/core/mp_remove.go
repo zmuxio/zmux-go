@@ -98,7 +98,7 @@ func (s *Session) makeSuspect(p *Pipe) {
 	s.unsettle(p)
 	s.checkTakeover()
 	s.reinjectPipe(p)
-	a.needPing = true
+	a.needPing, a.suspPing = true, true
 	a.pingSince = s.now
 	s.emitPipeState(p)
 	if prim, _ := s.primary(); prim != nil && s.mp.ackChanged {
@@ -277,7 +277,7 @@ func (s *Session) retire(p *Pipe) {
 	}
 	s.mp.stateGen++
 	s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirBidi, OutState: OutRetired, InState: InRetired,
-		Carrier: p.carrier, Failed: a.failures > 0})
+		Carrier: p.carrier, Failed: a.failures > 0, Cause: a.failCause})
 	s.checkLastPipe(nil)
 	if a.joinerLocal && !a.resLimited && !a.hs {
 		// Another attachment that the acceptor had attached retired: the refusal

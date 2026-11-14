@@ -13,7 +13,7 @@ import (
 func TestPool(t *testing.T) {
 	n := 0
 	closed := map[int]bool{}
-	p := &Pool[int]{
+	p := &ConnPool[int]{
 		Dial:                  func(context.Context) (int, error) { n++; return n, nil },
 		Close:                 func(c int) { closed[c] = true },
 		MaxPipesPerConnection: 2, MaxPipesPerConnectionLifetime: 3,
@@ -59,7 +59,7 @@ func TestPool(t *testing.T) {
 		t.Fatal("Get after Shutdown")
 	}
 	// Age: an old connection takes no new pipe.
-	p2 := &Pool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Millisecond}
+	p2 := &ConnPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Millisecond}
 	x, _ := p2.Get(ctx)
 	time.Sleep(2 * time.Millisecond)
 	if y, _ := p2.Get(ctx); y.Conn == x.Conn {
@@ -69,7 +69,7 @@ func TestPool(t *testing.T) {
 
 func TestPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
 	n := 0
-	p := &Pool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxPipesPerConnectionLifetime: 1}
+	p := &ConnPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxPipesPerConnectionLifetime: 1}
 	defer p.Shutdown()
 	for range 32 {
 		lease, err := p.Get(context.Background())
@@ -88,7 +88,7 @@ func TestPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
 func TestPoolShutdownAndCancelledContextDoNotDial(t *testing.T) {
 	for _, shutdown := range []bool{false, true} {
 		calls := 0
-		p := &Pool[int]{Dial: func(context.Context) (int, error) { calls++; return calls, nil }}
+		p := &ConnPool[int]{Dial: func(context.Context) (int, error) { calls++; return calls, nil }}
 		ctx := context.Background()
 		want := errPoolClosed
 		if shutdown {
@@ -114,7 +114,7 @@ func TestPoolCancelledLateDialReturnsItsConnection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	closed := 0
-	p := &Pool[int]{Dial: func(context.Context) (int, error) { cancel(); return 1, nil }, Close: func(int) { closed++ }}
+	p := &ConnPool[int]{Dial: func(context.Context) (int, error) { cancel(); return 1, nil }, Close: func(int) { closed++ }}
 	lease, err := p.Get(ctx)
 	if lease != nil {
 		lease.Release()
@@ -127,7 +127,7 @@ func TestPoolCancelledLateDialReturnsItsConnection(t *testing.T) {
 
 func TestPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *testing.T) {
 	n, closed := 0, 0
-	p := &Pool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Minute}
+	p := &ConnPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Minute}
 	p.Close = func(int) {
 		closed++
 		if !p.mu.TryLock() {
@@ -157,7 +157,7 @@ func TestPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *testing.T)
 
 func TestPoolStaleLeaseRetirementCannotCloseTwice(t *testing.T) {
 	closed := 0
-	p := &Pool[int]{Dial: func(context.Context) (int, error) { return 1, nil }, Close: func(int) { closed++ }, MaxPipesPerConnectionLifetime: 1}
+	p := &ConnPool[int]{Dial: func(context.Context) (int, error) { return 1, nil }, Close: func(int) { closed++ }, MaxPipesPerConnectionLifetime: 1}
 	lease, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -175,9 +175,9 @@ func TestPoolStaleLeaseRetirementCannotCloseTwice(t *testing.T) {
 // DecisionRejected outside the pool's lock; the pool goes on.
 func TestPoolRejectsAndReportsInvalidDecision(t *testing.T) {
 	n := 0
-	var p *Pool[int]
+	var p *ConnPool[int]
 	var reported []error
-	p = &Pool[int]{
+	p = &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
 		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
 			d.Count, d.Liveness.ProbeInterval = 3, 500*time.Millisecond

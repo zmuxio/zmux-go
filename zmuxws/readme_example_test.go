@@ -38,7 +38,7 @@ func Example_readmeProxy() {
 		if err != nil {
 			return err
 		}
-		ex, err := zmuxhttp.NewExchangeHandler(l, o, &zmuxhttp.ExchangeConfig{PSK: psk})
+		ex, err := zmuxhttp.NewExchangeHandler(l, &zmuxhttp.ExchangeOptions{Options: *o}, zmuxhttp.ExchangeConfig{PSK: psk})
 		if err != nil {
 			return err
 		}
@@ -46,16 +46,16 @@ func Example_readmeProxy() {
 		if err != nil {
 			return err
 		}
-		http.Handle("/zmux", &zmuxhttp.Endpoint{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
+		http.Handle("/zmux", &zmuxhttp.Mux{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
 		return nil
 	}
 	_ = func(ctx context.Context, client *http.Client, psk []byte, cfg *zmux.Config,
 		cache *zmux.CarrierCache, network string) (*zmux.Conn, error) {
 		conn, err := zmux.DialChoice(ctx, zmux.AutoChoice(
 			zmuxws.Candidate("wss://example.com/zmux", nil),
-			zmuxhttp.StreamCandidate(client, "https://example.com/zmux", nil),
-			zmuxhttp.SplitCandidate(client, "https://example.com/zmux", nil),
-			zmuxhttp.ExchangeCandidate(client, "https://example.com/zmux", &zmuxhttp.ExchangeConfig{PSK: psk}),
+			zmuxhttp.Streaming{Client: client, URL: "https://example.com/zmux"}.Candidate(),
+			zmuxhttp.Split{Client: client, URL: "https://example.com/zmux"}.Candidate(),
+			zmuxhttp.Exchange{Client: client, URL: "https://example.com/zmux", Config: zmuxhttp.ExchangeConfig{PSK: psk}}.Candidate(),
 		), cfg, &zmux.CarrierChoicePolicy{Cache: cache, Key: "example.com|" + network})
 		return conn, err
 	}

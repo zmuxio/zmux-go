@@ -2,47 +2,45 @@ package zmuxhttp
 
 import (
 	"context"
-	"net/http"
 
 	"github.com/zmuxio/zmux-go"
 )
 
-// StreamCandidate is a bidirectional streaming request (StreamPipe) to
-// url with client and the fields h. It passes intermediaries that forward
-// both bodies at once: HTTP/2 or HTTP/3 to the server, or HTTP/1.1 hops
-// that do not buffer request bodies.
-func StreamCandidate(client *http.Client, url string, h http.Header) zmux.Candidate {
-	t := NewTarget(url)
+// Candidate is the streaming carrier as a candidate of a carrier choice: a
+// bidirectional streaming request (Streaming.Pipe). It presents the
+// CarrierCredential of s, else the session's (Config.CarrierCredential), as
+// the split candidate does. It passes
+// intermediaries that forward both bodies at once: HTTP/2 or HTTP/3 to the
+// server, or HTTP/1.1 hops that do not buffer request bodies.
+func (s Streaming) Candidate() zmux.Candidate {
+	t := NewTarget(s.URL)
 	return zmux.Candidate{Kind: zmux.CarrierStream, Target: t, Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
-		return httpPipe(ctx, client, url, t, h, zmux.DirectionBidirectional, cred)
+		return httpPipe(ctx, s.Client, s.URL, t, s.Header, zmux.DirectionBidirectional, either(s.CarrierCredential, cred))
 	}}
 }
 
-// SplitCandidate is a split bootstrap (SplitPipe) to url with client
-// and the fields h. As a further pipe of a session it joins as an uplink
-// POST and a downlink GET that one Join pairs into one pipe. Its carriers must
+// Candidate is the split carrier as a candidate of a carrier choice
+// (Split.Pipe). As a further pipe of a session it joins as an uplink POST
+// and a downlink GET that one Join pairs into one pipe. Its carriers must
 // be confidential end to end or up to a trusted TLS-terminating
-// intermediary.
-func SplitCandidate(client *http.Client, url string, h http.Header) zmux.Candidate {
-	return splitCandidate(client, url, h, HeaderPair)
-}
-
-// Candidate is SplitCandidate with o's pairing field.
-func (o *SplitOptions) Candidate(client *http.Client, url string, h http.Header) (zmux.Candidate, error) {
-	if err := o.Validate(); err != nil {
-		return zmux.Candidate{}, err
-	}
-	return splitCandidate(client, url, h, o.pairField()), nil
-}
-
-func splitCandidate(client *http.Client, url string, h http.Header, pair string) zmux.Candidate {
-	t := NewTarget(url)
+// intermediary. An invalid s (Validate) fails every dial and join of
+// the candidate with its error.
+func (s Split) Candidate() zmux.Candidate {
+	t := NewTarget(s.URL)
+	pair := s.pairField()
+	bad := s.Validate()
 	return zmux.Candidate{Kind: zmux.CarrierSplit, Target: t,
 		Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
-			return httpSplitPipe(ctx, client, url, t, h, cred, pair)
+			if bad != nil {
+				return zmux.PipeIO{}, bad
+			}
+			return httpSplitPipe(ctx, s.Client, s.URL, t, s.Header, either(s.CarrierCredential, cred), pair)
 		},
 		Join: func(ctx, _ context.Context, c *zmux.Conn, cred zmux.CarrierCredential, o zmux.PipeOptions) ([]*zmux.Pipe, error) {
-			p, err := httpSplitJoin(ctx, c, client, url, t, h, cred, o, pair)
+			if bad != nil {
+				return nil, bad
+			}
+			p, err := httpSplitJoin(ctx, c, s.Client, s.URL, t, s.Header, either(s.CarrierCredential, cred), o, pair)
 			if err != nil {
 				return nil, err
 			}
@@ -50,13 +48,21 @@ func splitCandidate(client *http.Client, url string, h http.Header, pair string)
 		}}
 }
 
-// ExchangeCandidate is an exchange carrier (ExchangePipe) to url with
-// client and cfg. It passes intermediaries that buffer whole bodies; it
-// authenticates with cfg's PSK, and the session's credential is not
+// Candidate is the exchange carrier as a candidate of a carrier choice
+// (Exchange.Pipe). It passes intermediaries that buffer whole bodies; it
+// authenticates with Config's PSK, and the session's credential is not
 // presented on it.
-func ExchangeCandidate(client *http.Client, url string, cfg *ExchangeConfig) zmux.Candidate {
-	t := NewTarget(url)
+func (e Exchange) Candidate() zmux.Candidate {
+	t := NewTarget(e.URL)
 	return zmux.Candidate{Kind: zmux.CarrierExchange, Target: t, Dial: func(ctx context.Context, _ zmux.CarrierCredential) (zmux.PipeIO, error) {
-		return httpExchangePipe(ctx, client, url, t, cfg)
+		return e.pipe(ctx, t)
 	}}
+}
+
+// either returns own when set, else the session's credential.
+func either(own, session zmux.CarrierCredential) zmux.CarrierCredential {
+	if own != nil {
+		return own
+	}
+	return session
 }

@@ -63,7 +63,7 @@ func TestWrapPipeTLS(t *testing.T) {
 		srv.EnableHTTP2 = true
 		srv.StartTLS()
 		defer srv.Close()
-		cand := clientTLSWrap(StreamCandidate(srv.Client(), srv.URL, nil), ccfg)
+		cand := clientTLSWrap(Streaming{Client: srv.Client(), URL: srv.URL}.Candidate(), ccfg)
 		c, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(cand), tlsWrapConfig(), nil)
 		if err != nil {
 			t.Fatal(err)
@@ -106,7 +106,7 @@ func TestWrapPipeSplit(t *testing.T) {
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := SplitPipe(ctx, srv.Client(), srv.URL, nil, nil)
+	p, err := Split{Client: srv.Client(), URL: srv.URL}.Pipe(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

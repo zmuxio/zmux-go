@@ -94,7 +94,7 @@ func TestSetLivenessKeepAliveRuns(t *testing.T) {
 // pipe; the settings race with traffic and session changes cleanly.
 func TestPipeSetLiveness(t *testing.T) {
 	e := newMPEnv(t, mpConfig(), mpConfig())
-	p := e.addPipe(t, PipeOptions{Liveness: PipeLiveness{ProbeInterval: 5 * time.Second}})
+	p := e.addPipe(t, PipeOptions{Liveness: Set(PipeLiveness{ProbeInterval: 5 * time.Second})})
 	for _, bad := range []PipeLiveness{{SuspectFloor: time.Millisecond}, {DeadTimeout: time.Millisecond},
 		{ProbeInterval: time.Millisecond}, {ProbeJitter: 1}} {
 		if err := p.Update(PipeUpdate{Liveness: Set(bad)}); !errors.Is(err, ErrInvalidConfig) {
@@ -220,13 +220,13 @@ func TestRaiseIncomingStreams(t *testing.T) {
 	}
 }
 
+// MaxStreamCredit is 2^60: a constant index outside the array fails to compile.
+var _ = [1]struct{}{}[MaxStreamCredit-1<<60]
+
 // TestMaxStreamCredit (N19): MaxStreamCredit is 2^60, the stream count
 // options set to it advertise it, and one above it is the configuration
 // error.
 func TestMaxStreamCredit(t *testing.T) {
-	if MaxStreamCredit != 1<<60 {
-		t.Fatalf("MaxStreamCredit %d", MaxStreamCredit)
-	}
 	for _, cfg := range []*Config{{MaxIncomingStreams: MaxStreamCredit + 1}, {MaxIncomingUniStreams: MaxStreamCredit + 1}} {
 		a, b := net.Pipe()
 		_, err := Client(context.Background(), a, cfg)
@@ -247,16 +247,16 @@ func TestMaxStreamCredit(t *testing.T) {
 	}
 }
 
-// A MinBackoff above MaxBackoff is invalid, the defaults filled in.
+// A Backoff.Min above Backoff.Max is invalid, the defaults filled in.
 func TestMaintainPipesBackoffOrder(t *testing.T) {
 	e := newMPEnv(t, mpConfig(), mpConfig())
 	dial := func(context.Context) (PipeIO, error) { return PipeIO{}, errors.New("unused") }
 	for _, pool := range []PipePool{
-		{MinBackoff: 2 * time.Second, MaxBackoff: time.Second, Dial: dial},
-		{MinBackoff: 2 * DefaultMaxBackoff, Dial: dial},
+		{Backoff: Backoff{Min: 2 * time.Second, Max: time.Second}, Dial: dial},
+		{Backoff: Backoff{Min: 2 * DefaultMaxBackoff}, Dial: dial},
 	} {
 		if err := e.client.MaintainPipes(context.Background(), pool); !errors.Is(err, ErrInvalidConfig) {
-			t.Fatalf("%v > %v: %v", pool.MinBackoff, pool.MaxBackoff, err)
+			t.Fatalf("%v > %v: %v", pool.Backoff.Min, pool.Backoff.Max, err)
 		}
 	}
 }

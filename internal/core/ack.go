@@ -15,7 +15,12 @@ type ackState struct {
 	delay     Duration // own zmux_max_ack_delay
 	peerDelay Duration // peer's zmux_max_ack_delay
 	immediate bool     // a PIPE_PING asked for an immediate PIPE_ACK
-	woken     bool     // the delay expired and the writers were woken
+	// An ack-eliciting record arrived on an inbound pipe without a
+	// PIPE_ACK during the preceding zmux_max_ack_delay: acknowledged at
+	// once, so that a sparse record is not held back by the delay and
+	// the RTT samples stay free of it.
+	prompt bool
+	woken  bool // the delay expired and the writers were woken
 	// Since the last PIPE_ACK that discharged the acknowledgement: an
 	// ack-eliciting frame other than PIPE_PING arrived (other), and a
 	// PIPE_PING arrived on a pipe pair without a usable outbound direction
@@ -36,9 +41,13 @@ type pipeSend struct {
 	firstSentAt Time
 	rtt         rttEst // single-pipe sessions; multipath uses the attachment's
 	re          rateEst
-	rttAt       Time     // last RTT sample
-	elicitEnd   uint64   // send order after the last ack-eliciting byte
-	lim         *limiter // carrier queue limiter; nil when not paced
+	rttAt       Time   // last RTT sample
+	elicitEnd   uint64 // send order after the last ack-eliciting byte
+	// The send time of the last batch an earlier advance acknowledged, and
+	// when that advance arrived (paced).
+	prevSent, prevAckAt Time
+	prevOK              bool
+	lim                 *limiter // carrier queue limiter; nil when not paced
 }
 
 // sendSeg maps lane positions [pos, end) to send order from so.
@@ -53,6 +62,11 @@ type sample struct {
 	epoch       uint64    // rateEst.blockEpoch at send
 	bubble      bool      // sent while an application-limited bubble was in flight
 	ahead       aheadSnap // when it was handed over
+	// The batch carries the PIPE_PING sent because the pipe became suspect
+	// (MULTIPATH.md Section 7.2 step 3): its RTT sample is taken despite a
+	// suspicion since its sending when the path delivered it at its own
+	// pace (paced).
+	probe bool
 }
 
 // rttEst is RFC 9002 Section 5 with a 300 s minimum filter.
@@ -124,13 +138,16 @@ func (a *ackState) srttMax() Duration {
 	return m
 }
 
-// onRecord accounts a processed inbound record.
-func (a *ackState) onRecord(il *inLane, n uint64, f recordFacts, now Time) {
+// onRecord accounts a processed inbound record of pipe p.
+func (a *ackState) onRecord(p *Pipe, il *inLane, n uint64, f recordFacts, now Time) {
 	if f.elicit {
 		if il.elicit == 0 {
 			il.elicitAt = now
 		}
 		il.elicit += n
+		if !p.in.acked || now.Sub(p.in.ackedAt) >= a.delay {
+			a.prompt = true
+		}
 	}
 	if f.pipePing {
 		a.immediate = true
@@ -143,7 +160,7 @@ func (a *ackState) onRecord(il *inLane, n uint64, f recordFacts, now Time) {
 
 // due reports whether a PIPE_ACK must be sent now.
 func (a *ackState) due(now Time) bool {
-	if a.immediate {
+	if a.immediate || a.prompt {
 		return true
 	}
 	for _, p := range a.s.pipes {
@@ -166,6 +183,40 @@ func (a *ackState) due(now Time) bool {
 		}
 	}
 	return false
+}
+
+// paced reports whether the acknowledgement arriving now of the sample
+// ending at samples[i-1], a suspicion's PIPE_PING, came apart from that of
+// the bytes acknowledged before it by at least half the time between
+// their sending: the path delivered them at their own pace, as on a path
+// whose round trip exceeds T_suspect, and the sample measures that path.
+// Released together after an outage (in one advance, or a gap that shrank
+// to nothing), the sample would measure the outage, which no sample does.
+func (ps *pipeSend) paced(i int, now Time) bool {
+	last := &ps.samples[i-1]
+	if i >= 2 || !ps.prevOK {
+		return false // acknowledged together with earlier bytes, or nothing to compare
+	}
+	return now.Sub(ps.prevAckAt) >= last.sent.Sub(ps.prevSent)/2
+}
+
+// deadline is the latest time the pending acknowledgement may be sent:
+// own zmux_max_ack_delay after the first ack-eliciting byte it covers
+// (MULTIPATH.md Section 6.3), the one bound that a shaping delay of the
+// record carrying it never passes; Never when none is pending.
+func (a *ackState) deadline() Time {
+	t := Never
+	for _, p := range a.s.pipes {
+		if p.in == nil {
+			continue
+		}
+		for _, il := range p.in.lanes {
+			if il.elicit > 0 {
+				t = minT(t, il.elicitAt.Add(a.delay))
+			}
+		}
+	}
+	return t
 }
 
 // nextTimeout is the earliest acknowledgement delay deadline.
@@ -194,9 +245,10 @@ func (a *ackState) handleTimeout(now Time) {
 	}
 }
 
-// write adds a PIPE_ACK snapshot when one is due (single pipe).
+// write adds a PIPE_ACK snapshot when one is due, or when unreported
+// positions can ride along with credit frames (single pipe).
 func (a *ackState) write(w *recWriter, _ *Pipe, now Time) {
-	if a.due(now) {
+	if a.due(now) || a.unreported() && a.s.creditPending() {
 		a.writeSnapshot(w, true)
 	}
 }
@@ -212,7 +264,7 @@ func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 	var ents [16]wire.AckEntry
 	es := ents[:0]
 	for _, p := range a.s.pipes {
-		if p.in == nil || p.retired() {
+		if !hasAckEntry(p) {
 			continue
 		}
 		for _, il := range p.in.lanes {
@@ -225,7 +277,7 @@ func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 	}
 	if len(es) == 0 {
 		if discharge {
-			a.immediate, a.other, a.pairless = false, false, false
+			a.immediate, a.prompt, a.other, a.pairless = false, false, false, false
 		}
 		return true
 	}
@@ -255,10 +307,15 @@ func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 		}
 		es = es[k:]
 	}
+	for _, p := range a.s.pipes {
+		if hasAckEntry(p) {
+			p.in.ackedAt, p.in.acked = now, true
+		}
+	}
 	if !discharge {
 		return true
 	}
-	a.immediate, a.woken, a.other, a.pairless = false, false, false, false
+	a.immediate, a.prompt, a.woken, a.other, a.pairless = false, false, false, false, false
 	for _, p := range a.s.pipes {
 		if p.in == nil {
 			continue
@@ -269,6 +326,20 @@ func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 		}
 	}
 	return true
+}
+
+// hasAckEntry reports whether a snapshot holds an entry of p: an inbound
+// pipe, not retired, with a lane at a position above 0.
+func hasAckEntry(p *Pipe) bool {
+	if p.in == nil || p.retired() {
+		return false
+	}
+	for _, il := range p.in.lanes {
+		if il.pos != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func sortEntries(es []wire.AckEntry) {
@@ -313,7 +384,7 @@ func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now 
 		ps.elicitEnd = max64(ps.elicitEnd, end)
 		bubble, epoch := ps.re.sendFlags(ps.cum)
 		ps.samples = append(ps.samples, sample{end: end, sent: now, delivered: ps.delivered,
-			deliveredAt: ps.deliveredAt, firstSentAt: ps.firstSentAt, epoch: epoch, bubble: bubble, ahead: ahead})
+			deliveredAt: ps.deliveredAt, firstSentAt: ps.firstSentAt, epoch: epoch, bubble: bubble, ahead: ahead, probe: w.suspPing})
 	}
 }
 
@@ -428,7 +499,7 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 			// the redundant copy) gives no RTT sample, unless the pipe has
 			// had none for 1 s or has never had one.
 			late := ad > a.peerDelay && ps.rttAt != 0 && now.Sub(ps.rttAt) < Second
-			if !late && p.sampleOK(last.sent) {
+			if !late && (p.sampleOK(last.sent) || last.probe && ps.paced(i, now)) {
 				ev.rtt = r.update(rtt, minD(ad, a.peerDelay), a.peerDelay, now, s.mp != nil && s.quiet())
 				ev.rttSentAt = last.sent
 				ps.rttAt = now
@@ -444,6 +515,9 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 				ev.rate = ps.re.sample(float64(ps.delivered-last.delivered)*1e9/float64(iv), last.bubble, proven, last.epoch, now)
 			}
 			ps.firstSentAt = last.sent
+		}
+		if last != nil {
+			ps.prevSent, ps.prevAckAt, ps.prevOK = last.sent, now, true
 		}
 		ps.samples = append(ps.samples[:0], ps.samples[i:]...)
 		ps.deliveredAt = now

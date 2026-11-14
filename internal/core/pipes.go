@@ -112,6 +112,11 @@ func (p *Pipe) retired() bool { return p.mp != nil && p.mp.retired }
 type inDir struct {
 	lanes []*inLane
 	ended bool
+	// The last PIPE_ACK sent (acked: one was), for the
+	// immediate acknowledgement of an ack-eliciting record after
+	// zmux_max_ack_delay without one.
+	ackedAt Time
+	acked   bool
 }
 
 type inLane struct {

@@ -16,7 +16,7 @@ import (
 	"github.com/zmuxio/zmux-go/carrier"
 )
 
-// A pooled WebTransport session (Candidate's) is closed once its pipe has
+// A pooled WebTransport session (WebTransportCandidate's) is closed once its pipe has
 // ended, after the peer read the zmux close, with that close's code.
 func TestPoolCloseCode(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
@@ -45,7 +45,7 @@ func TestPoolCloseCode(t *testing.T) {
 	go func() { _ = ws.Serve(pc) }()
 	defer func() { _ = ws.Close() }()
 	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
-	pool := NewPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, nil, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
+	pool := NewConnPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, nil, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 	defer pool.Shutdown()
 	p, err := pool.OpenPipe(ctx)
 	if err != nil {

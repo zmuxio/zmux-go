@@ -55,6 +55,7 @@ type limiter struct {
 	refilled Time
 	inFlight uint64
 	release  Time // Never: until an acknowledgement makes room
+	heldAt   Time // when the current hold began
 	heldMin  winMin
 
 	nearAt, explainedAt Time
@@ -267,15 +268,26 @@ func (l *limiter) room(now Time, inFlight uint64, rate float64, srtt Duration, p
 // refresh decides whether the pipe is held and until when.
 func (l *limiter) refresh(now Time, inFlight uint64, rate float64, srtt Duration, p *limParams) {
 	l.advance(now, inFlight, rate, srtt, p)
+	was := l.held
 	l.held = l.room(now, inFlight, rate, srtt, p) == 0
 	l.release = Never
-	if t := l.bucket(now, rate, srtt, p); l.held && t < 1 {
-		// The driver's timer is armed no earlier than G (paceDeadline).
+	if !l.held {
+		return
+	}
+	if !was {
+		l.heldAt = now
+	}
+	if t := l.bucket(now, rate, srtt, p); t < 1 {
+		// An absolute time, no earlier than G after the hold began and
+		// kept until the next refresh: a deadline taken as G from the
+		// current time whenever it is read moves on with every event that
+		// reads it, and a pipe whose events come faster than G is then
+		// released only by acknowledgements.
 		d := limGranularity
 		if pr, _ := l.pace(now, rate, srtt, p); pr > 0 {
 			d = Duration(min((1-t)/pr*1e9, float64(Never)/2)) + Microsecond
 		}
-		l.release = now.Add(d)
+		l.release = maxT(now.Add(d), l.heldAt.Add(limGranularity))
 	}
 }
 

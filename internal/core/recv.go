@@ -476,11 +476,11 @@ func (s *Session) stopRecv(st *Stream, code uint64) {
 	s.recvProgress(st)
 }
 
-// Release drops every handle: an unfinished sending part is reset and an
-// unread receiving part stopped, both with code 0.
+// Release drops every handle: an unfinished sending part is reset with
+// ZMUX_CANCELLED and an unread receiving part stopped with code 0.
 func (s *Session) Release(st *Stream) {
 	if st.hasS && !st.snd.finWr && !st.snd.reset {
-		s.Reset(st, 0)
+		s.Reset(st, wire.CodeCancelled)
 	}
 	st.releasedS = true
 	if st.hasR && st.rcv.state != recvDataRead && st.rcv.state != recvResetRead {

@@ -52,7 +52,7 @@ func TestPeekMessageLateTimer(t *testing.T) {
 	lst := mustNewListener(&ListenerConfig{Config: cfg})
 	defer func() { _ = lst.Close() }()
 	src := netip.MustParseAddrPort("192.0.2.1:1")
-	a, err := lst.Arrive(src, src)
+	a, err := lst.Adapter().Arrive(src, src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestTakePendingLimitRejects(t *testing.T) {
 		OnReject: func(i RejectInfo) RejectAction { got <- i; return RejectClose }})
 	defer func() { _ = lst.Close() }()
 	src := netip.MustParseAddrPort("192.0.2.1:1")
-	a, err := lst.Arrive(src, src)
+	a, err := lst.Adapter().Arrive(src, src)
 	if err != nil {
 		t.Fatal(err)
 	}

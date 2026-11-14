@@ -154,7 +154,7 @@ type Event struct {
 	// DeliveryRate is also the capacity of EventCapacityBelow and
 	// EventCapacityRestored.
 	SmoothedRTT  time.Duration
-	DeliveryRate float64
+	DeliveryRate uint64
 	// Retired counts the pipes retired since EventPipesRetired was last
 	// read; Failed and Closed, of those, the ones whose failure or end
 	// without failure had not been read; Dropped the non-terminal events
@@ -300,6 +300,27 @@ func (e *eventQueue) retire(id uint64, failed bool) Event {
 	return one
 }
 
+// endPipeLocked records how pipe id ended and releases its waiters.
+func (c *Conn) endPipeLocked(id uint64, failed bool, cause error) {
+	pd := c.pipes[id]
+	if pd == nil {
+		return
+	}
+	e := pd.end
+	select {
+	case <-e.retired:
+		return
+	default:
+	}
+	if failed {
+		e.err = ErrPipeGone
+	}
+	if cause != nil {
+		e.err = cause
+	}
+	close(e.retired)
+}
+
 // drainEventsLocked turns core events into pipe events and wakes waiters.
 func (c *Conn) drainEventsLocked() {
 	for _, id := range c.retiredDone {
@@ -350,11 +371,11 @@ func (c *Conn) drainEventsLocked() {
 			q.push(Event{Kind: EventTierSaturation, Priority: e.Code, Saturated: e.Saturated})
 		case core.EvPipeQuality:
 			q.push(Event{Kind: EventPipeQualityChanged, PipeID: PipeID(e.Pipe), SmoothedRTT: time.Duration(e.RTT),
-				DeliveryRate: e.Rate, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
+				DeliveryRate: rateBytes(e.Rate), Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
 		case core.EvCapacityBelow:
-			q.push(Event{Kind: EventCapacityBelow, DeliveryRate: e.Rate})
+			q.push(Event{Kind: EventCapacityBelow, DeliveryRate: rateBytes(e.Rate)})
 		case core.EvCapacityRestored:
-			q.push(Event{Kind: EventCapacityRestored, DeliveryRate: e.Rate})
+			q.push(Event{Kind: EventCapacityRestored, DeliveryRate: rateBytes(e.Rate)})
 		case core.EvPipePriority:
 			q.push(Event{Kind: EventPipePriorityChanged, PipeID: PipeID(e.Pipe), Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
@@ -417,6 +438,7 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 			q.mark(e.Pipe, dirInSeen)
 		case core.InRetired:
 			delete(c.labels, e.Pipe)
+			c.endPipeLocked(e.Pipe, e.Failed, e.Cause)
 			if e.Pipe != 0 {
 				// Forgotten at the next critical section, once the
 				// carrier commands of this one have run.

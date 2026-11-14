@@ -64,7 +64,7 @@ func TestClassifyHTTP(t *testing.T) {
 	}
 }
 
-// unifiedEnv is a listener behind an Endpoint that serves stream and
+// unifiedEnv is a listener behind a Mux that serves stream and
 // exchange carriers on one target, with a host handler that records what
 // it was given.
 type unifiedEnv struct {
@@ -97,11 +97,11 @@ func newUnifiedEnv(t *testing.T, adm *zmux.Admission, trusted *zmux.TrustedProxi
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.ex, err = NewExchangeHandler(e.lst, o, &ExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32), HoldTime: time.Second})
+	e.ex, err = (&exCfg{PSK: bytes.Repeat([]byte{5}, 32), HoldTime: time.Second}).handler(e.lst, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.srv = httptest.NewServer(&Endpoint{Options: o, Stream: stream, Exchange: e.ex})
+	e.srv = httptest.NewServer(&Mux{Options: o, Stream: stream, Exchange: e.ex})
 	return e
 }
 
@@ -118,11 +118,11 @@ func (e *unifiedEnv) hostRequests() []string {
 	return append([]string(nil), e.host...)
 }
 
-// TestHTTPEndpoint serves a bidirectional carrier, a split bootstrap and
+// TestHTTPMux serves a bidirectional carrier, a split bootstrap and
 // an exchange carrier on one target, and gives the host the requests that
 // are not carriers, an exchange request that fails authentication with its
 // body.
-func TestHTTPEndpoint(t *testing.T) {
+func TestHTTPMux(t *testing.T) {
 	leakcheck.Check(t)
 	e := newUnifiedEnv(t, nil, nil)
 	defer e.close()
@@ -133,11 +133,11 @@ func TestHTTPEndpoint(t *testing.T) {
 	defer cancel()
 	dials := map[string]func() (zmux.PipeIO, error){
 		"streaming": func() (zmux.PipeIO, error) {
-			return StreamPipe(ctx, hc, e.srv.URL, nil, zmux.DirectionBidirectional, nil)
+			return Streaming{Client: hc, URL: e.srv.URL}.Pipe(ctx, zmux.DirectionBidirectional)
 		},
-		"split": func() (zmux.PipeIO, error) { return SplitPipe(ctx, hc, e.srv.URL, nil, nil) },
+		"split": func() (zmux.PipeIO, error) { return Split{Client: hc, URL: e.srv.URL}.Pipe(ctx) },
 		"exchange": func() (zmux.PipeIO, error) {
-			return ExchangePipe(ctx, hc, e.srv.URL, &ExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
+			return (&exCfg{PSK: bytes.Repeat([]byte{5}, 32)}).exchange(hc, e.srv.URL).Pipe(ctx)
 		},
 	}
 	for name, dial := range dials {
@@ -355,7 +355,7 @@ func TestHTTPPairField(t *testing.T) {
 		if err := (&Options{PairField: bad}).Validate(); !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Errorf("server PairField %q: %v", bad, err)
 		}
-		if err := (&SplitOptions{PairField: bad}).Validate(); !errors.Is(err, zmux.ErrInvalidConfig) {
+		if err := (Split{PairField: bad}).Validate(); !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Errorf("client PairField %q: %v", bad, err)
 		}
 	}
@@ -383,11 +383,11 @@ func TestHTTPPairField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(&Endpoint{Stream: stream, Options: o})
+	srv := httptest.NewServer(&Mux{Stream: stream, Options: o})
 	defer srv.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	p, err := (&SplitOptions{PairField: "X-Link-Id"}).Pipe(ctx, srv.Client(), srv.URL, nil, nil)
+	p, err := Split{Client: srv.Client(), URL: srv.URL, PairField: "X-Link-Id"}.Pipe(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,13 +435,13 @@ func TestExchangePairField(t *testing.T) {
 	defer func() { _ = lst.Close() }()
 	o := &Options{PairField: "x-link-id",
 		Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })}
-	ex, err := NewExchangeHandler(lst, o, &ExchangeConfig{PSK: bytes.Repeat([]byte{5}, 32)})
+	ex, err := (&exCfg{PSK: bytes.Repeat([]byte{5}, 32)}).handler(lst, o)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ex.Close() }()
 	streamed := false
-	e := &Endpoint{Options: o, Exchange: ex,
+	e := &Mux{Options: o, Exchange: ex,
 		Stream: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { streamed = true })}
 	req := func() *http.Request {
 		r := httptest.NewRequest(http.MethodPost, "http://example.test/", strings.NewReader("x"))

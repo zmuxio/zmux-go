@@ -51,28 +51,28 @@ func TestStallDurationBySource(t *testing.T) {
 	defer func() { _ = lst.Close() }()
 	ap := netip.MustParseAddrPort
 	for _, r := range []string{"192.0.2.1:1", "198.51.100.7:2", "[2001:db8::1]:3"} {
-		d := lst.StallDuration(ap(r))
+		d := lst.Adapter().StallDuration(ap(r))
 		if d < a.StallMin || d > a.StallMax {
 			t.Fatalf("%s: %v outside the interval", r, d)
 		}
-		if d2 := lst.StallDuration(ap(r)); d2 != d {
+		if d2 := lst.Adapter().StallDuration(ap(r)); d2 != d {
 			t.Fatalf("%s: %v then %v", r, d, d2)
 		}
 	}
 	same := [][2]string{{"[2001:db8::1]:1", "[2001:db8::ffff:2]:9"}, {"[::ffff:192.0.2.1]:1", "192.0.2.1:2"}, {"192.0.2.1:1", "192.0.2.1:0"}}
 	for _, p := range same {
-		if x, y := lst.StallDuration(ap(p[0])), lst.StallDuration(ap(p[1])); x != y {
+		if x, y := lst.Adapter().StallDuration(ap(p[0])), lst.Adapter().StallDuration(ap(p[1])); x != y {
 			t.Fatalf("%s %v, %s %v", p[0], x, p[1], y)
 		}
 	}
 	fixed := mustNewListener(&ListenerConfig{Admission: &Admission{Decide: stall, StallMin: 5 * time.Second, StallMax: 5 * time.Second}})
 	defer func() { _ = fixed.Close() }()
-	if d := fixed.StallDuration(ap("192.0.2.1:1")); d != 5*time.Second {
+	if d := fixed.Adapter().StallDuration(ap("192.0.2.1:1")); d != 5*time.Second {
 		t.Fatalf("fixed interval: %v", d)
 	}
 	none := mustNewListener(nil)
 	defer func() { _ = none.Close() }()
-	if d := none.StallDuration(ap("192.0.2.1:1")); d != 0 {
+	if d := none.Adapter().StallDuration(ap("192.0.2.1:1")); d != 0 {
 		t.Fatalf("without an admission: %v", d)
 	}
 }
@@ -264,16 +264,16 @@ func TestSourcePrefixes(t *testing.T) {
 	} {
 		var held []*Arrival
 		for _, s := range g[:2] {
-			ar, err := lst.Arrive(ap(s), netip.AddrPort{})
+			ar, err := lst.Adapter().Arrive(ap(s), netip.AddrPort{})
 			if err != nil {
 				t.Fatalf("%s: %v", s, err)
 			}
 			held = append(held, ar)
 		}
-		if _, err := lst.Arrive(ap(g[2]), netip.AddrPort{}); err == nil {
+		if _, err := lst.Adapter().Arrive(ap(g[2]), netip.AddrPort{}); err == nil {
 			t.Fatalf("%s: a third source of a full prefix was let in", g[2])
 		}
-		if x, y := lst.StallDuration(ap(g[0])), lst.StallDuration(ap(g[2])); x != y {
+		if x, y := lst.Adapter().StallDuration(ap(g[0])), lst.Adapter().StallDuration(ap(g[2])); x != y {
 			t.Fatalf("stall durations in one prefix: %v %v", x, y)
 		}
 		for _, ar := range held {
@@ -283,18 +283,18 @@ func TestSourcePrefixes(t *testing.T) {
 	for _, p := range [][2]string{{"192.0.2.1:1", "192.0.3.1:1"}, {"[2001:db8:0:1::1]:1", "[2001:db8:0:100::1]:1"}} {
 		var held []*Arrival
 		for range 2 {
-			ar, err := lst.Arrive(ap(p[0]), netip.AddrPort{})
+			ar, err := lst.Adapter().Arrive(ap(p[0]), netip.AddrPort{})
 			if err != nil {
 				t.Fatal(err)
 			}
 			held = append(held, ar)
 		}
-		ar, err := lst.Arrive(ap(p[1]), netip.AddrPort{})
+		ar, err := lst.Adapter().Arrive(ap(p[1]), netip.AddrPort{})
 		if err != nil {
 			t.Fatalf("%s shares the full prefix of %s: %v", p[1], p[0], err)
 		}
 		held = append(held, ar)
-		if x, y := lst.StallDuration(ap(p[0])), lst.StallDuration(ap(p[1])); x == y {
+		if x, y := lst.Adapter().StallDuration(ap(p[0])), lst.Adapter().StallDuration(ap(p[1])); x == y {
 			t.Fatalf("one stall duration %v in different prefixes %s %s", x, p[0], p[1])
 		}
 		for _, ar := range held {

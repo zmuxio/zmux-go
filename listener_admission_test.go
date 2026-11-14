@@ -600,7 +600,7 @@ func TestKnownJoin(t *testing.T) {
 		{"zero locator length", []byte{0x02, 1, 0, 0}, false, 0},
 		{"unknown locator", hello(1, 0, []byte("other-locator")), false, 0},
 	} {
-		known, need := lst.KnownJoin(c.prefix)
+		known, need := lst.Adapter().KnownJoin(c.prefix)
 		if known != c.known || need != c.need {
 			t.Errorf("%s: KnownJoin = %v, %d; want %v, %d", c.name, known, need, c.known, c.need)
 		}
@@ -608,7 +608,7 @@ func TestKnownJoin(t *testing.T) {
 	lst.mu.Lock()
 	delete(lst.sessions, string(loc))
 	lst.mu.Unlock()
-	if known, _ := lst.KnownJoin(full); known {
+	if known, _ := lst.Adapter().KnownJoin(full); known {
 		t.Error("a session that ended is still known")
 	}
 }

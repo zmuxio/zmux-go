@@ -22,7 +22,7 @@ func (g oneToken) Credential(context.Context, seal.CredentialRequest) (*seal.Cre
 	return nil, nil
 }
 
-func (g oneToken) Commit(context.Context, seal.Admission) (any, error) {
+func (g oneToken) Commit(context.Context, seal.CommitRequest) (any, error) {
 	return "client 1", nil
 }
 

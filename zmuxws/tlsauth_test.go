@@ -59,7 +59,7 @@ func TestPipeAuthExporter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{RecordMode: new(zmux.RecordBound)}); err != nil {
+	if _, err := c.AddPipe(ctx, p, zmux.PipeOptions{RecordMode: zmux.Set(zmux.RecordBound)}); err != nil {
 		t.Fatal(err)
 	}
 	echo(t, ctx, c, s, 64<<10)

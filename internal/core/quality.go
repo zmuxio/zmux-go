@@ -38,20 +38,25 @@ type sessQuality struct {
 }
 
 // SetQualityBand sets the band of one pipe, or (pipe < 0) the default of
-// the session's pipes.
-func (s *Session) SetQualityBand(pipe int64, b QualityBand) error {
-	if b.MinInterval == 0 {
-		b.MinInterval = Second
+// the session's pipes; a nil band returns the pipe to the session's
+// default, or the session's to none.
+func (s *Session) SetQualityBand(pipe int64, b *QualityBand) error {
+	if b != nil {
+		c := *b
+		if c.MinInterval == 0 {
+			c.MinInterval = Second
+		}
+		b = &c
 	}
 	if pipe < 0 {
-		s.q.band = &b
+		s.q.band = b
 		return nil
 	}
 	p := s.pipe(uint64(pipe))
 	if p == nil || p.out == nil {
 		return ErrInvalid
 	}
-	p.out.q.band = &b
+	p.out.q.band = b
 	return nil
 }
 
@@ -178,4 +183,14 @@ func (s *Session) capacityChanged() {
 	if s.q.floorSet {
 		s.checkCapacityFloor()
 	}
+}
+
+// PipeHasOut reports whether pipe id has an outbound direction; ok is false
+// for a pipe that is gone.
+func (s *Session) PipeHasOut(id uint64) (hasOut, ok bool) {
+	p := s.pipe(id)
+	if p == nil || p.mp != nil && p.mp.retired {
+		return false, false
+	}
+	return p.out != nil, true
 }

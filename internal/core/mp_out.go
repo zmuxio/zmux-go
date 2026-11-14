@@ -231,6 +231,7 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 			a.needPing = false
 			a.pingsSent++
 			w.pingWritten = true
+			w.suspPing, a.suspPing = a.suspPing, false
 			s.drawProbe(a, p, false)
 			if s.shp != nil {
 				s.shp.mark(s.now)
@@ -327,11 +328,15 @@ func (s *Session) primaryAckSent(p *Pipe) {
 	s.returnLiveness(p)
 }
 
-// idleFor reports whether p has had no ack-eliciting byte, and was not
-// made live, for more than R_p = max(1 s, T_suspect_p).
+// idleFor reports whether p is unproven (MULTIPATH.md Section 6.4): for
+// more than R_p = max(1 s, T_suspect_p) no ack-eliciting byte was sent on
+// it, its acknowledged position did not advance and it was not made live.
+// An advance proves the direction as a sent byte does, so an answer that
+// acknowledges p's own PIPE_PING carries none, and PIPE_PING frames never
+// answer each other however long an exchange takes.
 func (s *Session) idleFor(p *Pipe) bool {
 	a := p.mp
-	return !a.needPing && s.now.Sub(maxT(a.lastElicit, a.liveAt)) > max(Second, s.tSuspect(a))
+	return !a.needPing && s.now.Sub(max(a.lastElicit, a.liveAt, a.lastAdvance)) > max(Second, s.tSuspect(a))
 }
 
 // answerPing adds a PIPE_PING to the answer that p carries when p has been
@@ -351,6 +356,21 @@ func (s *Session) returnLiveness(p *Pipe) {
 	if !s.quiet() && s.idleFor(p) {
 		p.mp.needPing, p.mp.pingSince = true, s.now
 	}
+}
+
+// carriesAck reports whether p's next record carries the pending
+// PIPE_ACK that discharges the acknowledgement, or the answer to a
+// PIPE_PING on p's pipe pair.
+func (s *Session) carriesAck(p *Pipe) bool {
+	if s.mp == nil || p.mp == nil {
+		return true
+	}
+	a := p.mp
+	if a.firstRecord || a.ackPair {
+		return true
+	}
+	prim, _ := s.primary()
+	return (p == prim || prim == nil) && !s.ackPairOnly()
 }
 
 // mpWantsWrite is WantsWrite for a pipe of a multipath session: true only
@@ -390,10 +410,21 @@ func (s *Session) mpWantsWrite(p *Pipe, ol *outLane) bool {
 	if ol.lane == 0 && len(a.copyQ) > 0 && s.open(p) {
 		return true
 	}
-	if ol == p.out.lo.copyLane && len(a.selfCopyQ) > 0 && !ol.writing && !ol.notWritable && !s.limHeld(p) {
+	if ol == p.out.lo.copyLane && len(a.selfCopyQ) > 0 && s.laneOpen(p, ol) {
 		return true
 	}
 	return s.dataPendingOn(p, ol) && s.anyStreamOn(p, ol) && (s.shp == nil || !s.shapeHeld(p))
+}
+
+// waitsFor reports whether records or stream data wait for lane ol of p:
+// mpWantsWrite with p's carrier taken to accept bytes. Data that the
+// peer's credit, the limiter or a shaping delay holds back does not wait
+// for the carrier, nor does data the scheduler would place on another
+// pipe.
+func (s *Session) waitsFor(p *Pipe, ol *outLane) bool {
+	s.mp.openAs = p
+	defer func() { s.mp.openAs = nil }()
+	return s.mpWantsWrite(p, ol)
 }
 
 // anyStreamOn reports whether some stream direction would put data on
@@ -436,7 +467,7 @@ func (s *Session) mpAfterBatch(w *recWriter, p *Pipe, ol *outLane, start uint64,
 	}
 	if w.pingWritten {
 		// Answered once the batch's end is acknowledged (pingsAcked).
-		w.pingWritten = false
+		w.pingWritten, w.suspPing = false, false
 		a.pingEnds = append(a.pingEnds, p.out.snd.so)
 	}
 	if w.traffic {

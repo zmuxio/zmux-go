@@ -1,9 +1,11 @@
 package zmux
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"testing"
 )
 
@@ -35,9 +37,9 @@ func TestErrorCodeRegistry(t *testing.T) {
 	}
 }
 
-// TestSessionErrorSentinels checks that every end of an established
-// session matches net.ErrClosed, a handshake timeout (no session was
-// established) does not, and each matches its own sentinel and only that
+// TestSessionErrorSentinels checks that every end of a session, a
+// handshake timeout included, matches net.ErrClosed and never
+// os.ErrDeadlineExceeded, and each matches its own sentinel and only that
 // one.
 func TestSessionErrorSentinels(t *testing.T) {
 	cause := errors.New("carrier reset")
@@ -55,8 +57,13 @@ func TestSessionErrorSentinels(t *testing.T) {
 		{&TransportError{}, nil},
 	} {
 		err := fmt.Errorf("op: %w", c.err)
-		if hs := errors.Is(c.err, ErrHandshakeTimeout); errors.Is(err, net.ErrClosed) == hs {
-			t.Errorf("%T: errors.Is(net.ErrClosed) = %v", c.err, !hs)
+		if !errors.Is(err, net.ErrClosed) {
+			t.Errorf("%T: errors.Is(net.ErrClosed) = false", c.err)
+		}
+		// A session's end is never a timeout of the operation that saw it.
+		var te interface{ Timeout() bool }
+		if errors.Is(err, os.ErrDeadlineExceeded) || errors.As(err, &te) {
+			t.Errorf("%T matches os.ErrDeadlineExceeded or has Timeout()", c.err)
 		}
 		for _, s := range sentinels {
 			if got := errors.Is(err, s); got != errors.Is(c.want, s) {
@@ -66,6 +73,21 @@ func TestSessionErrorSentinels(t *testing.T) {
 	}
 	if !errors.Is(&ResumeTimeoutError{LastPipeErr: cause}, cause) || !errors.Is(&PipesLostError{LastPipeErr: cause}, cause) {
 		t.Error("a pipe-loss end does not unwrap to its cause")
+	}
+	// A timeout of the last pipe is not reachable through the session's end.
+	for _, last := range []error{os.ErrDeadlineExceeded, context.DeadlineExceeded,
+		fmt.Errorf("read: %w", &net.OpError{Op: "read", Err: os.ErrDeadlineExceeded}),
+		errors.Join(cause, os.ErrDeadlineExceeded)} {
+		for _, end := range []error{&ResumeTimeoutError{LastPipeErr: last}, &PipesLostError{LastPipeErr: last}} {
+			err := fmt.Errorf("op: %w", end)
+			var te interface{ Timeout() bool }
+			if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &te) {
+				t.Errorf("%T over %v reads as a timeout", end, last)
+			}
+			if !errors.Is(err, net.ErrClosed) {
+				t.Errorf("%T over %v: errors.Is(net.ErrClosed) = false", end, last)
+			}
+		}
 	}
 	if !IsRetryable(fmt.Errorf("x: %w", &EarlyDataRejectedError{})) {
 		t.Error("a rejected early-data session is not retryable")

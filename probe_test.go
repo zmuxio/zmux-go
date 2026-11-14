@@ -74,15 +74,15 @@ func TestProbeOptionsValidation(t *testing.T) {
 			t.Errorf("session ProbeJitter %v: %v %v", c.set, cc.ProbeJitter, cc.ProbeInterval)
 		}
 	}
-	for _, o := range []PipeOptions{{Liveness: PipeLiveness{ProbeInterval: 999 * time.Millisecond}}, {Liveness: PipeLiveness{ProbeInterval: time.Nanosecond}},
-		{Liveness: PipeLiveness{ProbeJitter: 1}}, {Liveness: PipeLiveness{ProbeJitter: math.NaN()}}} {
+	for _, o := range []PipeOptions{{Liveness: Set(PipeLiveness{ProbeInterval: 999 * time.Millisecond})}, {Liveness: Set(PipeLiveness{ProbeInterval: time.Nanosecond})},
+		{Liveness: Set(PipeLiveness{ProbeJitter: 1})}, {Liveness: Set(PipeLiveness{ProbeJitter: math.NaN()})}} {
 		if _, err := o.join(DirectionBidirectional); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%+v: %v", o, err)
 		}
 	}
-	for _, o := range []PipeOptions{{Liveness: PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.99}}} {
+	for _, o := range []PipeOptions{{Liveness: Set(PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.99})}} {
 		j, err := o.join(DirectionBidirectional)
-		if err != nil || j.Live.ProbeInterval != core.Duration(o.Liveness.ProbeInterval) || j.Live.ProbeJitter != o.Liveness.ProbeJitter {
+		if l, _ := o.Liveness.get(); err != nil || j.Live.ProbeInterval != core.Duration(l.ProbeInterval) || j.Live.ProbeJitter != l.ProbeJitter {
 			t.Errorf("%+v: %+v %v", o, j, err)
 		}
 	}
@@ -94,7 +94,7 @@ func TestProbePerPipeInterval(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		e := newMemMPEnv(t, mpConfig(), mpConfig())
-		p := e.addPipe(t, PipeOptions{Liveness: PipeLiveness{ProbeInterval: time.Second}})
+		p := e.addPipe(t, PipeOptions{Liveness: Set(PipeLiveness{ProbeInterval: time.Second})})
 		base := pipeStat(t, p).PingsSent
 		synctest.Sleep(3500 * time.Millisecond)
 		if n := pipeStat(t, p).PingsSent - base; n < 2 || n > 5 {
@@ -194,7 +194,7 @@ func TestProbeAnsweredOnSamePairWithJitter(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = rl.Close() })
-	p := e.addPipeVia(t, rl.Addr(), PipeOptions{Liveness: PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.5}})
+	p := e.addPipeVia(t, rl.Addr(), PipeOptions{Liveness: Set(PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.5})})
 	// settled reports whether both endpoints have nothing to write, no
 	// write call in progress (one the host is slow to complete would
 	// otherwise turn into a write stall as the clock moves on) and every

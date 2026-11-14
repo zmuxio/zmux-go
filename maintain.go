@@ -21,13 +21,13 @@ type PipePool struct {
 	Dial func(ctx context.Context) (PipeIO, error)
 	// Join, in place of Dial, joins the pipes of one member of the path
 	// itself, such as an uplink and a downlink of a split carrier
-	// (zmuxhttp.SplitJoin), with the options given; the member is usable while
+	// (zmuxhttp.Split.Join), with the options given; the member is usable while
 	// all of them are, and they are replaced together. ctx bounds the
 	// joins; o has ReturnOnReply set, as the pool's own joins do.
 	Join func(ctx context.Context, c *Conn, o PipeOptions) ([]*Pipe, error)
 	// Choice, in place of Dial and Join, dials each member over a carrier
 	// kind of the mode's candidates (a split candidate joins as a split
-	// carrier), presenting the session's Config.Credential. Stable first,
+	// carrier), presenting the session's Config.CarrierCredential. Stable first,
 	// then upgrade: a member is dialed over the most robust kind available
 	// (a kind CarrierChoicePolicy.Cache holds as usable, else the exchange carrier,
 	// else the last), skipping the kinds the cache holds as failed unless
@@ -52,16 +52,15 @@ type PipePool struct {
 	Options PipeOptions
 	// Rotate replaces pipes that carried MaxBytes or are MaxAge old.
 	Rotate Rotation
-	// Backoff bounds the redial backoff (from 1 s, at most 60 s), counted
-	// from the start of the previous dial attempt, whether it succeeded or
-	// failed, or from the start of the pool before its first; each wait is
-	// reduced by a random fraction of up to 0.2, drawn once per wait. 0
-	// selects the default: no backoff would redial a failing path in a
-	// busy loop. A MinBackoff above MaxBackoff (the defaults filled in) is
-	// invalid.
-	MinBackoff, MaxBackoff time.Duration
+	// Backoff bounds the redial backoff (from 1 s, at most 60 s, jitter
+	// 0.2 when unset), counted from the start of the previous dial attempt,
+	// whether it succeeded or failed, or from the start of the pool before
+	// its first; each wait is reduced by a random fraction of up to the
+	// jitter, drawn once per wait. The zero value selects the defaults: no
+	// backoff would redial a failing path in a busy loop.
+	Backoff Backoff
 	// Policy, when set, is asked on every pass of the pool; its
-	// DialAfter replaces the backoff, bounded by MaxBackoff, and its
+	// DialAfter replaces the backoff, bounded by Backoff.Max, and its
 	// Liveness applies to the pipes dialled after it.
 	// A decision that fails PoolDecision.Validate is rejected: the pass
 	// goes on as with the zero decision and the error is reported to
@@ -81,7 +80,7 @@ type PipePool struct {
 // old pipe is closed gracefully once the replacement is usable and attached
 // by the peer (Pipe.WaitAttached): make before break.
 type Rotation struct {
-	MaxBytes uint64        // 0: no byte limit
+	MaxBytes int64         // 0: no byte limit
 	MaxAge   time.Duration // 0: no age limit
 	Jitter   float64       // 0 to 1
 }
@@ -118,15 +117,6 @@ func memberState(ps []*Pipe) (sum PipeStats, alive, usable bool) {
 	return sum, alive, usable
 }
 
-// backoffJitter is the jitter of the built-in redial backoffs: a wait is
-// the backoff reduced by a random fraction of up to it, drawn once per
-// wait, as a pool policy's dial_jitter.
-const backoffJitter = 0.2
-
-func backoffWait(b time.Duration) time.Duration {
-	return time.Duration(float64(b) * (1 - backoffJitter*rand.Float64()))
-}
-
 // MaintainPipes keeps pool.Count usable pipes dialled by pool.Dial: it
 // redials failed pipes with exponential backoff and rotates pipes by
 // pool.Rotate, until ctx ends or the session closes. The backoff, or the
@@ -153,21 +143,16 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	if !multipath {
 		return ErrNotNegotiated
 	}
-	if pool.Count < 0 || pool.MinBackoff < 0 || pool.MaxBackoff < 0 || pool.Rotate.MaxAge < 0 || !(pool.Rotate.Jitter >= 0 && pool.Rotate.Jitter <= 1) {
+	if pool.Count < 0 || pool.Rotate.MaxAge < 0 || pool.Rotate.MaxBytes < 0 || !(pool.Rotate.Jitter >= 0 && pool.Rotate.Jitter <= 1) {
 		return fmt.Errorf("%w: PipePool with a negative field or a Rotate.Jitter outside [0, 1]", ErrInvalidConfig)
 	}
 	if pool.Count == 0 {
 		pool.Count = 1
 	}
-	if pool.MinBackoff == 0 {
-		pool.MinBackoff = DefaultMinBackoff
+	if err := pool.Backoff.validate("PipePool.Backoff"); err != nil {
+		return err
 	}
-	if pool.MaxBackoff == 0 {
-		pool.MaxBackoff = DefaultMaxBackoff
-	}
-	if pool.MinBackoff > pool.MaxBackoff {
-		return fmt.Errorf("%w: PipePool MinBackoff %v above MaxBackoff %v", ErrInvalidConfig, pool.MinBackoff, pool.MaxBackoff)
-	}
+	pool.Backoff = pool.Backoff.filled()
 	var mp *modePool
 	switch {
 	case seed != nil:
@@ -209,7 +194,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		dec      PoolDecision
 		failures int
 		lastDial time.Time
-		backoff  = pool.MinBackoff
+		backoff  = pool.Backoff.Min
 		wait     time.Duration // the built-in wait after lastDial
 	)
 	jitter := func(v float64) float64 {
@@ -269,12 +254,12 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		ps, err := join(kind)
 		if err != nil {
 			failures++
-			wait = backoffWait(backoff)
-			backoff = min(2*backoff, pool.MaxBackoff)
+			wait = pool.Backoff.wait(backoff)
+			backoff = min(2*backoff, pool.Backoff.Max)
 			return nil, err
 		}
-		backoff, failures = pool.MinBackoff, 0
-		wait = backoffWait(backoff)
+		backoff, failures = pool.Backoff.Min, 0
+		wait = pool.Backoff.wait(backoff)
 		return ps, nil
 	}
 	newMember := func(ps []*Pipe, kind int) *member {
@@ -358,7 +343,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 				reportRejected(c.cfg.Logger, pool.DecisionRejected, err)
 			}
 			if dec.DialAfter > 0 {
-				delay = min(dec.DialAfter, pool.MaxBackoff)
+				delay = min(dec.DialAfter, pool.Backoff.Max)
 			}
 			if dec.Count > 0 {
 				count = dec.Count
@@ -400,7 +385,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		// dial waits for the longer of the two.
 		dialDue := now.Sub(from) >= delay
 		var dialAt time.Time
-		if len(members) < count && c.JoinReady() {
+		if len(members) < count && c.joinReady() {
 			if dialDue {
 				kind := -1
 				if mp != nil {
@@ -425,7 +410,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 			if mp != nil && m.repl == nil {
 				upgrade = mp.better(m.kind, time.Now())
 			}
-			if lacking || !c.JoinReady() || m.repl != nil ||
+			if lacking || !c.joinReady() || m.repl != nil ||
 				!m.retire && upgrade < 0 && pool.Rotate.MaxBytes == 0 && pool.Rotate.MaxAge == 0 {
 				continue
 			}

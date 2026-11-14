@@ -88,8 +88,7 @@ func (s *Session) HandleTimeout(now Time) {
 		}
 	}
 	if s.closeFr.waitLanes && now >= s.timers.laneWait {
-		s.closeFr.waitLanes = false
-		s.wakeAllWriters()
+		s.endLaneWait()
 	}
 	if s.state >= StateClosing {
 		return

@@ -99,7 +99,7 @@ func TestExporterTransform(t *testing.T) {
 	}
 	cj, sj := kmPair("j1")
 	serve(sj)
-	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{RecordMode: new(RecordBound)}); err != nil {
+	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{RecordMode: Set(RecordBound)}); err != nil {
 		t.Fatalf("Bound join: %v", err)
 	}
 	echoOnce(t, ctx, c, s)
@@ -108,7 +108,7 @@ func TestExporterTransform(t *testing.T) {
 	serve(sb)
 	jctx, jcancel := context.WithTimeout(ctx, time.Second)
 	defer jcancel()
-	if _, err := c.AddPipe(jctx, PipeIO{R: cb, W: cb}, PipeOptions{RecordMode: new(RecordBound)}); err == nil {
+	if _, err := c.AddPipe(jctx, PipeIO{R: cb, W: cb}, PipeOptions{RecordMode: Set(RecordBound)}); err == nil {
 		t.Fatal("join with a different exporter succeeded")
 	}
 }
@@ -141,7 +141,7 @@ func TestExporterTLSBeforeHandshake(t *testing.T) {
 	// A Bound join over a TLS client whose handshake has not
 	// run: AddPipe runs it before reading the exporter.
 	jc := pair()
-	if _, err := c.AddPipe(ctx, NetPipe(secureTLS{jc}), PipeOptions{RecordMode: new(RecordBound)}); err != nil {
+	if _, err := c.AddPipe(ctx, NetPipe(secureTLS{jc}), PipeOptions{RecordMode: Set(RecordBound)}); err != nil {
 		t.Fatalf("Bound join: %v", err)
 	}
 	echoOnce(t, ctx, c, s)
@@ -149,7 +149,7 @@ func TestExporterTLSBeforeHandshake(t *testing.T) {
 	a, b := tcpPair(t)
 	go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), PipeHint{}) }()
 	bad := tls.Client(b, &tls.Config{ServerName: "elsewhere.invalid"})
-	if _, err := c.AddPipe(ctx, NetPipe(secureTLS{bad}), PipeOptions{RecordMode: new(RecordBound)}); err == nil ||
+	if _, err := c.AddPipe(ctx, NetPipe(secureTLS{bad}), PipeOptions{RecordMode: Set(RecordBound)}); err == nil ||
 		!strings.Contains(err.Error(), "carrier handshake") {
 		t.Fatalf("join over a failing handshake: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestExporterEarlyJoin(t *testing.T) {
 	ej := &earlyKM{kmConn: sj, done: make(chan struct{})}
 	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: ej, W: ej}, PipeHint{}) }()
 	time.AfterFunc(100*time.Millisecond, func() { close(ej.done) })
-	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{RecordMode: new(RecordBound)}); err != nil {
+	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{RecordMode: Set(RecordBound)}); err != nil {
 		t.Fatalf("Bound join: %v", err)
 	}
 	waitUntil(t, 5*time.Second, "the join", func() bool { return len(s.PipeStats()) == 2 })

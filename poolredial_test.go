@@ -25,8 +25,8 @@ func TestPoolIdleRuleWithProbes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- e.client.MaintainPipes(ctx, PipePool{Policy: pol, MinBackoff: 10 * time.Millisecond,
-			Options: PipeOptions{Liveness: PipeLiveness{ProbeInterval: time.Second}}, Dial: tcpDialer(e.ln.Addr().String())})
+		done <- e.client.MaintainPipes(ctx, PipePool{Policy: pol, Backoff: Backoff{Min: 10 * time.Millisecond},
+			Options: PipeOptions{Liveness: Set(PipeLiveness{ProbeInterval: time.Second})}, Dial: tcpDialer(e.ln.Addr().String())})
 	}()
 	defer func() {
 		cancel()
@@ -38,8 +38,8 @@ func TestPoolIdleRuleWithProbes(t *testing.T) {
 }
 
 // The policy's DialAfter replaces the pool's backoff: a 10 ms DialAfter
-// redials long before a 5 s MinBackoff would; a long DialAfter is bounded
-// by MaxBackoff.
+// redials long before a 5 s Backoff.Min would; a long DialAfter is bounded
+// by Backoff.Max.
 func TestPoolDialAfterReplacesBackoff(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
@@ -59,7 +59,7 @@ func TestPoolDialAfterReplacesBackoff(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
 			go func() {
-				done <- e.client.MaintainPipes(ctx, PipePool{MinBackoff: c.minB, MaxBackoff: c.maxB,
+				done <- e.client.MaintainPipes(ctx, PipePool{Backoff: Backoff{Min: c.minB, Max: c.maxB},
 					Policy: policyFunc(func(_ *PoolView, d *PoolDecision) { d.DialAfter = c.after }),
 					Dial: func(ctx context.Context) (PipeIO, error) {
 						if dials.Add(1) <= 3 {
@@ -159,7 +159,7 @@ func TestBackoffWaitJitter(t *testing.T) {
 	const b = 10 * time.Second
 	var low, high bool
 	for range 1000 {
-		w := backoffWait(b)
+		w := Backoff{}.filled().wait(b)
 		if w < 8*time.Second || w > b {
 			t.Fatalf("wait %v outside [8 s, 10 s]", w)
 		}

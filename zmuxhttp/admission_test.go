@@ -34,7 +34,7 @@ func TestAdmissionMoreHTTP(t *testing.T) {
 	srv.EnableHTTP2 = true
 	srv.StartTLS()
 	defer srv.Close()
-	p, err := StreamCandidate(srv.Client(), srv.URL, nil).Dial(ctx, nil)
+	p, err := Streaming{Client: srv.Client(), URL: srv.URL}.Candidate().Dial(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestAdmissionMoreHTTP(t *testing.T) {
 func TestAdmissionHTTP(t *testing.T) {
 	leakcheck.Check(t)
 	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second}
-	v, err := admit.NewPrefixAuthVerifier(auth)
+	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestAdmissionExchange(t *testing.T) {
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
 	h := newExHandler(t, lst, &Options{Next: siteHandler()},
-		&ExchangeConfig{PSK: []byte("k"), HoldTime: 50 * time.Millisecond, MaxClockSkew: 30 * time.Second})
+		&exCfg{PSK: []byte("k"), HoldTime: 50 * time.Millisecond, MaxClockSkew: 30 * time.Second})
 	defer func() { _ = h.Close() }()
 	srv := httptest.NewServer(h)
 	defer srv.Close()
@@ -189,7 +189,7 @@ func TestAdmittedValueSplit(t *testing.T) {
 	defer hs.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := SplitPipe(ctx, hs.Client(), hs.URL, nil, nil)
+	p, err := Split{Client: hs.Client(), URL: hs.URL}.Pipe(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,8 +220,8 @@ func TestAdmittedValueExchange(t *testing.T) {
 			return zmux.Decision{Verdict: zmux.VerdictAccept, Value: "ex"}
 		}}})
 	defer func() { _ = lst.Close() }()
-	xc := &ExchangeConfig{AllowInsecure: true}
-	eh, err := NewExchangeHandler(lst, nil, xc)
+	xc := &exCfg{AllowInsecure: true}
+	eh, err := xc.handler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestAdmittedValueExchange(t *testing.T) {
 	defer hs.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p, err := ExchangePipe(ctx, hs.Client(), hs.URL, xc)
+	p, err := xc.exchange(hs.Client(), hs.URL).Pipe(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestListenerStatsIdentity(t *testing.T) {
 	expect("a join", 1)
 
 	// A split bootstrap: two carriers, one input.
-	sp, err := SplitPipe(dctx, srv.Client(), srv.URL, nil, nil)
+	sp, err := Split{Client: srv.Client(), URL: srv.URL}.Pipe(dctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,12 +363,12 @@ func TestListenerStatsIdentity(t *testing.T) {
 
 	// Setup failures are outside the sum.
 	before := lst.Stats()
-	lst.CountSetupFailure()
+	lst.Adapter().CountSetupFailure()
 	if got := lst.Stats(); got.SetupFailures != before.SetupFailures+1 || sum(got) != sum(before) {
 		t.Fatalf("CountSetupFailure: %+v after %+v", got, before)
 	}
 	var none *zmux.Listener
-	none.CountSetupFailure() // a nil listener does nothing
+	none.Adapter().CountSetupFailure() // a nil listener does nothing
 
 	// After Close the carrier is refused.
 	_ = lst.Close()
@@ -404,9 +404,9 @@ func TestAdmissionEveryHTTPEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ex := newExHandler(t, lst, nil, &ExchangeConfig{PSK: make([]byte, 32)})
+	ex := newExHandler(t, lst, nil, &exCfg{PSK: make([]byte, 32)})
 	defer func() { _ = ex.Close() }()
-	srv := httptest.NewServer(&Endpoint{Stream: hh, Exchange: ex})
+	srv := httptest.NewServer(&Mux{Stream: hh, Exchange: ex})
 	defer srv.Close()
 	dctx, dcancel := context.WithTimeout(ctx, 2*time.Second)
 	defer dcancel()
@@ -415,18 +415,18 @@ func TestAdmissionEveryHTTPEntry(t *testing.T) {
 		dctx, dcancel = context.WithTimeout(ctx, 2*time.Second)
 		return dctx
 	}
-	if p, err := StreamPipe(dctx, srv.Client(), srv.URL, nil, zmux.DirectionBidirectional, nil); err == nil {
+	if p, err := (Streaming{Client: srv.Client(), URL: srv.URL}).Pipe(dctx, zmux.DirectionBidirectional); err == nil {
 		_, _ = zmux.Start(dctx, p, zmux.RoleClient, mpConfig())
 	}
 	expect("streaming")
 	fresh()
-	if p, err := SplitPipe(dctx, srv.Client(), srv.URL, nil, nil); err == nil {
+	if p, err := (Split{Client: srv.Client(), URL: srv.URL}).Pipe(dctx); err == nil {
 		_, _ = zmux.Start(dctx, p, zmux.RoleClient, mpConfig())
 	}
 	waitUntil(t, 5*time.Second, "split", func() bool { return decided.Load() >= want+1 })
 	want = decided.Load()
 	fresh()
-	if p, err := ExchangePipe(dctx, srv.Client(), srv.URL, &ExchangeConfig{PSK: make([]byte, 32)}); err == nil {
+	if p, err := (&exCfg{PSK: make([]byte, 32)}).exchange(srv.Client(), srv.URL).Pipe(dctx); err == nil {
 		_, _ = zmux.Start(dctx, p, zmux.RoleClient, mpConfig())
 	}
 	waitUntil(t, 5*time.Second, "exchange", func() bool { return decided.Load() > want })

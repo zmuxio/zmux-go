@@ -128,8 +128,20 @@ func (s *Session) open(p *Pipe) bool {
 	if p.out == nil || p.out.failed {
 		return false
 	}
-	ol := p.out.lanes[0]
-	return !ol.notWritable && !ol.writing && !s.limHeld(p)
+	return s.laneOpen(p, p.out.lanes[0])
+}
+
+// laneOpen reports whether lane ol of p takes bytes now: its carrier
+// accepts them and the limiter does not hold p. While waitsFor evaluates
+// p, its carrier counts as accepting them.
+func (s *Session) laneOpen(p *Pipe, ol *outLane) bool {
+	if s.limHeld(p) {
+		return false
+	}
+	if s.mp != nil && s.mp.openAs == p {
+		return true
+	}
+	return !ol.notWritable && !ol.writing
 }
 
 // buildGate works out the gate now (nil when no pipe is usable).

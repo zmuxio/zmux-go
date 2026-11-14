@@ -165,3 +165,41 @@ func TestLaneFirstRecordShaped(t *testing.T) {
 		t.Fatalf("PIPE_LANE record of %d bytes on the wire, want the planned 200", int(size)+n)
 	}
 }
+
+// A close that first waits for lanes (up to the 2 s linger at a long RTT)
+// still gives CONNECTION_CLOSE its CloseLimit once the wait ends, and the
+// whole close stays bounded.
+func TestCloseLaneWaitKeepsHandOff(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Test.RTT = Second // linger: min(2 s, 3 x SRTT) = 2 s
+	s := New(cfg, 0)
+	info := CarrierInfo{Lanes: true}
+	p := s.AttachBootstrap(info, info, nil)
+	s.peerSeen = true
+	s.state = StateActive
+	s.feat = Features{PipeAck: true, LanesOut: true, LanesIn: true}
+	p.out.lanes = append(p.out.lanes, &outLane{lane: 1, info: info, confirmed: true, pos: 10})
+	start := s.now
+	s.Close(0, nil)
+	if !s.closeFr.waitLanes || !s.closeFr.pending {
+		t.Fatal("close did not wait for the unacknowledged lane")
+	}
+	wait := s.timers.laneWait
+	if wait.Sub(start) != 2*Second {
+		t.Fatalf("lane wait %v, want 2s", wait.Sub(start))
+	}
+	if s.timers.linger != wait.Add(CloseLimit) {
+		t.Fatalf("hand-off ends %v after the lane wait, want %v", s.timers.linger.Sub(wait), CloseLimit)
+	}
+	s.HandleTimeout(wait)
+	if s.state != StateClosing || s.closeFr.waitLanes || !s.closeFr.pending {
+		t.Fatalf("lane wait end: state %v waitLanes %v pending %v", s.state, s.closeFr.waitLanes, s.closeFr.pending)
+	}
+	if s.timers.linger != wait.Add(CloseLimit) {
+		t.Fatal("hand-off not counted from the end of the lane wait")
+	}
+	s.HandleTimeout(wait.Add(CloseLimit))
+	if s.state != StateClosed {
+		t.Fatalf("close not bounded: state %v", s.state)
+	}
+}

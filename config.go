@@ -26,12 +26,14 @@ const (
 	DefaultProbeJitter = core.DefaultProbeJitter
 	// DefaultJoinTimeout is the default Config.JoinTimeout.
 	DefaultJoinTimeout = time.Duration(core.DefaultHandshakeTimeout)
-	// DefaultMinBackoff and DefaultMaxBackoff are the default bounds of
-	// the redial backoff, Config.RedialMinBackoff and RedialMaxBackoff for
-	// the Redial hook and PipePool.MinBackoff and MaxBackoff for each
-	// pool: the wait starts at the minimum and doubles up to the maximum.
-	DefaultMinBackoff = time.Second
-	DefaultMaxBackoff = 60 * time.Second
+	// DefaultMinBackoff, DefaultMaxBackoff and DefaultBackoffJitter are the
+	// defaults of Backoff, the redial backoff of the Redial hook
+	// (Config.RedialBackoff) and of each pool (PipePool.Backoff): the wait
+	// starts at the minimum and doubles up to the maximum, each wait
+	// reduced by a random fraction of up to the jitter.
+	DefaultMinBackoff    = time.Second
+	DefaultMaxBackoff    = 60 * time.Second
+	DefaultBackoffJitter = 0.2
 )
 
 // MaxStreamCredit is the largest stream count credit the encoding allows,
@@ -130,7 +132,7 @@ type Config struct {
 	DatagramSendQueue    int
 	DatagramReceiveQueue int
 	DatagramStreamQueue  int
-	DatagramReceiveBytes int
+	DatagramReceiveBytes int64
 	// DatagramStreamBytes bounds the payload bytes of each stream's
 	// datagram queue, per direction of receipt, beside DatagramStreamQueue:
 	// a datagram that would exceed either drops the oldest of that queue
@@ -140,7 +142,7 @@ type Config struct {
 	// does not include the stream queues, so with the defaults a session's
 	// received datagrams are bounded by about MaxIncomingStreams x
 	// DatagramStreamBytes (256 x 512 KiB) beside it.
-	DatagramStreamBytes int
+	DatagramStreamBytes int64
 
 	// SendBuffer starts the written-but-unreleased byte budget, in bytes.
 	// Zero is 4 MiB; a negative value is invalid. Multipath sessions grow
@@ -247,17 +249,16 @@ type Config struct {
 	// several pipes is maintained with Conn.MaintainPipes and a PipePool,
 	// which also replaces failed pipes, and leaves Redial nil.
 	Redial func(ctx context.Context, need Direction) (PipeIO, error)
-	// RedialMinBackoff and RedialMaxBackoff bound the backoff of Redial:
-	// after a failed call the wait, counted from the start of the previous
-	// call, starts at the minimum and doubles up to the maximum, each wait
-	// reduced by a random fraction of up to 0.2. Zero is DefaultMinBackoff
-	// (1 s) and DefaultMaxBackoff (60 s); a negative value, or a minimum
-	// above the maximum with the defaults filled in, is invalid. The pools
-	// of MaintainPipes follow the same rule with state of their own.
-	RedialMinBackoff, RedialMaxBackoff time.Duration
+	// RedialBackoff is the backoff of Redial: after a failed call the wait,
+	// counted from the start of the previous call, starts at Min and
+	// doubles up to Max, each wait reduced by a random fraction of up to
+	// Jitter. The zero value is the default (1 s, 60 s, 0.2). The pools of
+	// MaintainPipes follow the same rule with state of their own
+	// (PipePool.Backoff).
+	RedialBackoff Backoff
 	// RedialPolicy, when set, is asked before each Redial call; DialAfter
 	// is the wait from the previous call to the next (at most
-	// RedialMaxBackoff; 0: the backoff), and Liveness applies to the pipe a
+	// RedialBackoff.Max; 0: the backoff), and Liveness applies to the pipe a
 	// call yields. Count and Retire are not used. A
 	// decision that fails PoolDecision.Validate is rejected: the call goes
 	// ahead as with the zero decision and the error is reported to
@@ -296,7 +297,7 @@ type SchedulerParams struct {
 	OverflowDelay time.Duration
 	// SpreadChunk is the unit the spreading policies split data into, in
 	// bytes. Zero is 16 KiB; a negative value is invalid.
-	SpreadChunk int
+	SpreadChunk int64
 	// Redundancy sends the data of urgent stream directions (urgency 0
 	// to 2) and the first chunk after an idle period redundantly on a
 	// second pipe. It is on by default; SwitchOff turns it off.
@@ -439,16 +440,12 @@ func (c *Config) joinTimeout() time.Duration {
 	return c.JoinTimeout
 }
 
-// redialBackoff returns the bounds of the Redial backoff.
-func (c *Config) redialBackoff() (lo, hi time.Duration) {
-	lo, hi = DefaultMinBackoff, DefaultMaxBackoff
-	if c != nil && c.RedialMinBackoff > 0 {
-		lo = c.RedialMinBackoff
+// redialBackoff returns the Redial backoff with the defaults filled in.
+func (c *Config) redialBackoff() Backoff {
+	if c == nil {
+		return Backoff{}.filled()
 	}
-	if c != nil && c.RedialMaxBackoff > 0 {
-		hi = c.RedialMaxBackoff
-	}
-	return lo, hi
+	return c.RedialBackoff.filled()
 }
 
 func dur(d, def time.Duration) core.Duration {
@@ -523,7 +520,7 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 		c.InitialConnectionReceiveWindow < 0 || c.MaxConnectionReceiveWindow < 0 || c.SendBuffer < 0 || c.MaxSendBuffer < 0 ||
 		c.DatagramSendQueue < 0 || c.DatagramReceiveQueue < 0 || c.DatagramStreamQueue < 0 || c.DatagramReceiveBytes < 0 ||
 		c.MaxPipes < 0 || c.PipeHeadroom < 0 || c.ReplayWindow < 0 || c.MaxLanes < 0 || c.ResumeTimeout < 0 ||
-		c.JoinTimeout < 0 || c.RedialMinBackoff < 0 || c.RedialMaxBackoff < 0 ||
+		c.JoinTimeout < 0 ||
 		p.OverflowDelay < 0 ||
 		p.SpreadChunk < 0 {
 		return cc, fmt.Errorf("%w: negative Config count, size or duration", ErrInvalidConfig)
@@ -531,8 +528,8 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	if c.JoinTimeout > time.Duration(core.MaxJoinDeadline) {
 		return cc, fmt.Errorf("%w: JoinTimeout %v above the maximum join deadline %v", ErrInvalidConfig, c.JoinTimeout, time.Duration(core.MaxJoinDeadline))
 	}
-	if lo, hi := c.redialBackoff(); lo > hi {
-		return cc, fmt.Errorf("%w: RedialMinBackoff %v above RedialMaxBackoff %v", ErrInvalidConfig, lo, hi)
+	if err := c.RedialBackoff.validate("Config.RedialBackoff"); err != nil {
+		return cc, err
 	}
 	if c.EarlyData.ZmuxPeer && role == core.RoleAuto {
 		return cc, fmt.Errorf("%w: EarlyData.ZmuxPeer with RoleAuto", ErrInvalidConfig)
@@ -543,7 +540,9 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	cc.NoEpochAfterFirstPipe, cc.NoEpochAfterResume = !c.EpochAfterFirstPipe.On(), !c.EpochAfterResume.On()
 	switch {
 	case c.MaxIdleTimeout < 0:
+		// No idle timeout: neither sent nor applied locally.
 		l.Has &^= wire.HasIdle
+		l.MaxIdleTimeout = 0
 	case c.MaxIdleTimeout > 0 && c.MaxIdleTimeout < time.Millisecond:
 		// The parameter is in milliseconds and its 0 means none.
 		return cc, fmt.Errorf("%w: MaxIdleTimeout %v below 1 ms", ErrInvalidConfig, c.MaxIdleTimeout)
@@ -654,7 +653,7 @@ func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, e
 	cc.OverflowDelay = dur(p.OverflowDelay, time.Second)
 	cc.Redundancy = p.Redundancy.On()
 	if p.SpreadChunk > 0 {
-		cc.SpreadChunk = p.SpreadChunk
+		cc.SpreadChunk = int(p.SpreadChunk)
 	}
 	if err := checkLimits(&c.ShapingLimits); err != nil {
 		return cc, err

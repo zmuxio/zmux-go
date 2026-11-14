@@ -125,7 +125,7 @@ func Example_readmeMultipath() {
 		if err != nil {
 			return err
 		}
-		p, err := conn.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{Label: "backup", SendStandby: new(true)})
+		p, err := conn.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{Label: "backup", SendStandby: zmux.Set(true)})
 		if err != nil {
 			return err
 		}
@@ -177,7 +177,7 @@ func Example_readmeRedial() {
 // Example_readmeHTTPExchange is README.md "HTTP exchanges".
 func Example_readmeHTTPExchange() {
 	_ = func(l *zmux.Listener, psk []byte) error {
-		h, err := zmuxhttp.NewExchangeHandler(l, nil, &zmuxhttp.ExchangeConfig{PSK: psk})
+		h, err := zmuxhttp.NewExchangeHandler(l, nil, zmuxhttp.ExchangeConfig{PSK: psk})
 		if err != nil {
 			return err
 		}
@@ -186,8 +186,8 @@ func Example_readmeHTTPExchange() {
 		return nil
 	}
 	_ = func(ctx context.Context, client *http.Client, psk []byte, cfg *zmux.Config) (*zmux.Conn, error) {
-		p, err := zmuxhttp.ExchangePipe(ctx, client, "https://example.com/x/{instance}/{nonce}",
-			&zmuxhttp.ExchangeConfig{PSK: psk})
+		p, err := zmuxhttp.Exchange{Client: client, URL: "https://example.com/x/{instance}/{nonce}",
+			Config: zmuxhttp.ExchangeConfig{PSK: psk}}.Pipe(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -215,8 +215,8 @@ func Example_readmeProxy() {
 func Example_readmeAdmission() {
 	_ = func(ctx context.Context, key []byte, cfg *zmux.Config, fallback func(context.Context, net.Conn),
 		ln net.Listener, tlsConf *tls.Config, addr string) (*zmux.Conn, error) {
-		auth := &admit.PrefixAuth{Key: key, Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-		v, err := admit.NewPrefixAuthVerifier(auth)
+		auth := &admit.PrefixAuth{Key: key, Slot: 30 * time.Second, BindTLS: true}
+		v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
 		if err != nil {
 			return nil, err
 		}

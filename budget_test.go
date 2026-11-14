@@ -66,7 +66,7 @@ func TestListenerMemoryBudget(t *testing.T) {
 			t.Fatalf("pressure note %+v", n)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatalf("no pressure (used %d)", l.MemoryUsed())
+		t.Fatalf("no pressure (used %d)", l.Adapter().MemoryUsed())
 	}
 	// Under pressure a new peer stream is rejected and a session refused.
 	st2, _ := c.OpenStreamSync(ctx)
@@ -89,7 +89,7 @@ func TestListenerMemoryBudget(t *testing.T) {
 			t.Fatalf("relief note %+v", n)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatalf("no relief (used %d)", l.MemoryUsed())
+		t.Fatalf("no relief (used %d)", l.Adapter().MemoryUsed())
 	}
 	runtime.KeepAlive(st) // a collected handle would reset the stream
 }

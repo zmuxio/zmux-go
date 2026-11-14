@@ -492,6 +492,10 @@ func (s *Session) srtt() Duration {
 	return 333 * Millisecond
 }
 
+// CloseLimit bounds how long a close waits for the carriers to take
+// CONNECTION_CLOSE; after it the carriers are closed and the session ends.
+const CloseLimit = Second
+
 // lingerTimeout is min(2 s, max(250 ms, 3 x SRTT)).
 func (s *Session) lingerTimeout() Duration {
 	return minD(2*Second, maxD(250*Millisecond, MulD(s.srtt(), 3)))
@@ -527,10 +531,29 @@ func (s *Session) closeWith(e *SessionError, fr *closeFrame) {
 	}
 	s.closeFr = *fr
 	s.closeFr.pending = true
-	s.timers.linger = Never
+	// A carrier stuck in an earlier write never takes CONNECTION_CLOSE:
+	// the hand-off ends CloseLimit after CONNECTION_CLOSE may first be
+	// written, whoever closed (an application call, the idle timeout, a
+	// protocol error, the end of a shutdown). The wait for lanes comes
+	// before it, so the frame always gets its CloseLimit.
+	s.timers.linger = s.now.Add(CloseLimit)
 	if !s.feat.Multipath && !e.Remote && (fr.app || fr.code == wire.NoError) && !s.lanesCovered() {
 		s.closeFr.waitLanes = true
 		s.timers.laneWait = s.now.Add(s.lingerTimeout())
+		s.timers.linger = s.timers.laneWait.Add(CloseLimit)
+	}
+	s.wakeAllWriters()
+}
+
+// endLaneWait ends the wait for lanes before CONNECTION_CLOSE: the
+// hand-off has CloseLimit from now.
+func (s *Session) endLaneWait() {
+	if !s.closeFr.waitLanes {
+		return
+	}
+	s.closeFr.waitLanes = false
+	if s.state == StateClosing && s.closeFr.pending {
+		s.timers.linger = s.now.Add(CloseLimit)
 	}
 	s.wakeAllWriters()
 }

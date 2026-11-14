@@ -46,7 +46,7 @@ func (c Class) String() string {
 // byte is read, by the first of its rules that matches, with the pairing
 // field HeaderPair; Options.Classify does so with the configured one.
 // It is the one classification of every HTTP adapter: NewHandler
-// serves the downlink, uplink and bidirectional classes and Endpoint
+// serves the downlink, uplink and bidirectional classes and Mux
 // dispatches all of them.
 func Classify(r *http.Request) Class { return classifyHTTP(r, HeaderPair) }
 
@@ -105,7 +105,7 @@ func headerHasToken(h http.Header, name, token string) bool {
 	return false
 }
 
-// Endpoint serves every HTTP carrier kind on one request target:
+// Mux serves every HTTP carrier kind on one request target:
 // it classifies each request with Options.Classify and hands it to the
 // adapter of its class, which runs its own admission and serves what it
 // does not accept with its own fallback. It adds no behaviour of its own:
@@ -123,7 +123,7 @@ func headerHasToken(h http.Header, name, token string) bool {
 //	srv := &http.Server{Handler: endpoint, Protocols: new(http.Protocols)}
 //	srv.Protocols.SetHTTP1(true)
 //	srv.Protocols.SetUnencryptedHTTP2(true)
-type Endpoint struct {
+type Mux struct {
 	// Options are the endpoint's HTTP options (nil: the defaults): their
 	// PairField classifies requests and their Next (Options.Fallback)
 	// serves the requests that no adapter takes.
@@ -141,7 +141,7 @@ type Endpoint struct {
 }
 
 // ServeHTTP dispatches r by its class.
-func (e *Endpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (e *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var h http.Handler
 	switch e.Options.Classify(r) {
 	case ClassWebSocket:

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
@@ -50,7 +51,7 @@ func TestConfigLimitsValidation(t *testing.T) {
 		}
 	}
 	// A negative per-pipe ProbeInterval turns the pipe's idle probes off.
-	o := PipeOptions{Liveness: PipeLiveness{ProbeInterval: -time.Second}}
+	o := PipeOptions{Liveness: Set(PipeLiveness{ProbeInterval: -time.Second})}
 	if j, err := o.join(DirectionBidirectional); err != nil || j.Live.ProbeInterval >= 0 {
 		t.Errorf("PipeOptions ProbeInterval negative: %+v %v", j, err)
 	}
@@ -89,10 +90,25 @@ func TestExportedDefaults(t *testing.T) {
 // TestDatagramStreamBytesSetting: zero is 512 KiB, a negative value
 // unlimited, a positive value itself.
 func TestDatagramStreamBytesSetting(t *testing.T) {
-	for v, want := range map[int]uint64{0: 512 << 10, -1: 0, 4096: 4096} {
+	for v, want := range map[int64]uint64{0: 512 << 10, -1: 0, 4096: 4096} {
 		cc, err := (&Config{DatagramStreamBytes: v}).coreConfig(core.RoleInitiator, core.RoleInitiator)
-		if err != nil || cc.DgramStreamSize != want {
-			t.Fatalf("%d: %d, %v", v, cc.DgramStreamSize, err)
+		if err != nil {
+			t.Fatalf("%d: %v", v, err)
 		}
+		if cc.DgramStreamSize != want {
+			t.Fatalf("%d: %d", v, cc.DgramStreamSize)
+		}
+	}
+}
+
+// A negative MaxIdleTimeout turns the idle timeout off: the parameter is
+// not sent and the local value is none, so only the peer's applies.
+func TestMaxIdleTimeoutOff(t *testing.T) {
+	cc, err := (&Config{MaxIdleTimeout: -1}).coreConfig(core.RoleInitiator, core.RoleInitiator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.Local.Has&wire.HasIdle != 0 || cc.Local.MaxIdleTimeout != 0 {
+		t.Fatalf("idle timeout off: Has %v, MaxIdleTimeout %d", cc.Local.Has&wire.HasIdle != 0, cc.Local.MaxIdleTimeout)
 	}
 }

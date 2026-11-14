@@ -27,13 +27,13 @@ import (
 // carrierFailed is ZMUX_CARRIER_FAILED as a QUIC stream error code.
 const carrierFailed = quic.StreamErrorCode(zmux.StreamCarrierFailed)
 
-// Config returns a QUIC configuration sized for lanes: unidirectional
+// QUICConfig returns a QUIC configuration sized for lanes: unidirectional
 // stream credit for the lanes the endpoint carries, and a connection window
 // above the stream windows of the lanes that can be blocked at once. It
 // enables QUIC datagrams, the datagram channel of the connection's pipes
 // that sessions with datagrams use (zmux.DatagramChannel); the datagrams of
 // a connection carrying pipes belong to zmux. base may be nil.
-func Config(base *quic.Config) *quic.Config {
+func QUICConfig(base *quic.Config) *quic.Config {
 	c := &quic.Config{}
 	if base != nil {
 		c = base.Clone()
@@ -61,8 +61,8 @@ func Config(base *quic.Config) *quic.Config {
 // early-stream race is fixed. The session owns the connection: it is closed once the session
 // has wholly ended (the peer read its CONNECTION_CLOSE and ended its side, or
 // the linger timeout expired), with the session's application error code
-// (0 after any other end). qconf may be nil; Config sizes it for lanes. With
-// cfg.Credential, the first stream starts with its prefix, bound to the
+// (0 after any other end). qconf may be nil; QUICConfig sizes it for lanes. With
+// cfg.CarrierCredential, the first stream starts with its prefix, bound to the
 // connection's handshake, and 0-RTT is not used.
 func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Config, cfg *zmux.Config) (*zmux.Conn, error) {
 	var cred zmux.CarrierCredential
@@ -71,7 +71,7 @@ func Dial(ctx context.Context, addr string, tlsConf *tls.Config, qconf *quic.Con
 		cred = cfg.CarrierCredential
 		early = cfg.EarlyData.Replayable && len(cfg.EarlyData.Remembered) > 0 && cred == nil
 	}
-	qc, err := dialAddr(ctx, addr, tlsConf, Config(qconf), early)
+	qc, err := dialAddr(ctx, addr, tlsConf, QUICConfig(qconf), early)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +127,7 @@ func closeCode(err error) (quic.ApplicationErrorCode, string) {
 
 // Client starts a client session on the first bidirectional stream of an
 // established QUIC connection that the caller dialled, as zmux.Client does
-// on a net.Conn, with cfg.Credential's prefix; the caller keeps ownership
+// on a net.Conn, with cfg.CarrierCredential's prefix; the caller keeps ownership
 // of qc and closes it once the session has wholly ended (Wait returned,
 // or Done is closed), not sooner: a QUIC close discards the stream data
 // the peer has not acknowledged, the zmux close included. Its code is the
@@ -208,7 +208,7 @@ func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener, fallback func
 // closed with code 0; one that did stays open after its sessions end, for
 // the client to close with the last session's code, or its idle timeout.
 func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) error {
-	a, err := l.Arrive(netip.AddrPort{}, addrPort(qc.RemoteAddr()))
+	a, err := l.Adapter().Arrive(netip.AddrPort{}, addrPort(qc.RemoteAddr()))
 	if err != nil {
 		_ = qc.CloseWithError(0, "")
 		if errors.Is(err, net.ErrClosed) {
@@ -638,12 +638,12 @@ func (l *laneReader) Close() error {
 }
 func (l *laneReader) CarrierConn() any { return l.qc }
 
-// Pool opens pipes on a pool of QUIC connections to one server: at most
+// ConnPool opens pipes on a pool of QUIC connections to one server: at most
 // PoolLimits.MaxPipesPerConnection pipes per connection at once,
 // connections retired by lifetime limits or failure; the pipes of one
 // connection share a fate group. It is safe for concurrent use.
-type Pool struct {
-	pool carrier.Pool[*pooled]
+type ConnPool struct {
+	pool carrier.ConnPool[*pooled]
 	cred zmux.CarrierCredential
 }
 
@@ -657,16 +657,16 @@ type pooled struct {
 
 // Shutdown retires every connection: idle ones close now, the others once
 // their pipes end; OpenPipe fails afterwards.
-func (p *Pool) Shutdown() { p.pool.Shutdown() }
+func (p *ConnPool) Shutdown() { p.pool.Shutdown() }
 
-// NewPool returns a pool that dials addr with tlsConf and qconf (may be
+// NewConnPool returns a pool that dials addr with tlsConf and qconf (may be
 // nil), within lim. The first stream of each connection starts with
 // cred's prefix (nil: none), as a server admission reads it.
-func NewPool(addr string, tlsConf *tls.Config, qconf *quic.Config, cred zmux.CarrierCredential, lim carrier.PoolLimits) *Pool {
-	p := &Pool{cred: cred}
-	p.pool = carrier.Pool[*pooled]{PoolLimits: lim, Close: closePooled,
+func NewConnPool(addr string, tlsConf *tls.Config, qconf *quic.Config, cred zmux.CarrierCredential, lim carrier.PoolLimits) *ConnPool {
+	p := &ConnPool{cred: cred}
+	p.pool = carrier.ConnPool[*pooled]{PoolLimits: lim, Close: closePooled,
 		Dial: func(ctx context.Context) (*pooled, error) {
-			qc, err := dialAddr(ctx, addr, tlsConf, Config(qconf), false)
+			qc, err := dialAddr(ctx, addr, tlsConf, QUICConfig(qconf), false)
 			if err != nil {
 				return nil, err
 			}
@@ -688,9 +688,9 @@ func closePooled(pc *pooled) {
 
 // OpenPipe opens a pipe (a bidirectional stream with its lanes) on a
 // pooled connection; its PipeIO carries the connection's fate group.
-func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
+func (p *ConnPool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	if p.pool.Dial == nil {
-		return zmux.PipeIO{}, errors.New("zmuxquic: a Pool is made by NewPool")
+		return zmux.PipeIO{}, errors.New("zmuxquic: a ConnPool is made by NewConnPool")
 	}
 	l, err := p.pool.Get(ctx)
 	if err != nil {
@@ -713,7 +713,7 @@ func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 
 // open opens a stream of pc. The first one (the lowest stream ID) starts
 // with the credential's prefix; streams are opened one at a time.
-func (p *Pool) open(ctx context.Context, pc *pooled) (zmux.PipeIO, error) {
+func (p *ConnPool) open(ctx context.Context, pc *pooled) (zmux.PipeIO, error) {
 	qc := pc.qc
 	if p.cred == nil {
 		return openPipe(ctx, &qc)
@@ -743,12 +743,12 @@ func (r *qReader) SetReadDeadline(t time.Time) error {
 
 // Candidate is a QUIC stream to addr for zmux.DialChoice, for a client that
 // reaches the server directly: each carrier is the first stream of a new
-// connection (dialed as NewPool does, without 0-RTT), which starts with
+// connection (dialed as NewConnPool does, without 0-RTT), which starts with
 // the session's credential and is closed once the pipe has ended, with
 // the session's code.
 func Candidate(addr string, tlsConf *tls.Config, qconf *quic.Config) zmux.Candidate {
 	return zmux.Candidate{Kind: zmux.CarrierQUIC, Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
-		p := NewPool(addr, tlsConf, qconf, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
+		p := NewConnPool(addr, tlsConf, qconf, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 		return p.OpenPipe(ctx)
 	}}
 }

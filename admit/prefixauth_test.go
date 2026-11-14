@@ -40,7 +40,7 @@ func TestPrefixAuthVectors(t *testing.T) {
 		{bind, "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf36747d163099e42de649d7159d462334"},
 	} {
 		tok, _ := hex.DecodeString(x.token)
-		v, err := NewPrefixAuthVerifier(a)
+		v, err := NewPrefixAuthVerifier(a, PrefixAuthVerifierOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -68,7 +68,7 @@ func TestPrefixAuthHeaderVectors(t *testing.T) {
 			t.Fatalf("header form %s, want %s", got, x.header)
 		}
 	}
-	v, err := NewPrefixAuthVerifier(a)
+	v, err := NewPrefixAuthVerifier(a, PrefixAuthVerifierOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,15 +90,15 @@ func TestPrefixAuthHeaderVectors(t *testing.T) {
 // another name are not.
 func TestPrefixAuthHeader(t *testing.T) {
 	leakcheck.Check(t)
-	auth := &PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1, BindTLS: true, HeaderField: "x-auth"}
-	v, err := NewPrefixAuthVerifier(auth)
+	auth := &PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, BindTLS: true, HeaderField: "x-auth"}
+	v, err := NewPrefixAuthVerifier(auth, PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: PrefixTokenLen, Decide: v.Decide}})
 	defer func() { _ = lst.Close() }()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if a, ok := lst.AdmitUpgrade(w, r, nil, nil); ok {
+		if a, ok := lst.Adapter().AdmitUpgrade(w, r, nil, nil); ok {
 			a.Release()
 			_, _ = io.WriteString(w, "accepted")
 		}
@@ -177,8 +177,8 @@ func TestPrefixAuthHeader(t *testing.T) {
 
 // TestPrefixAuthWindow checks the slot window and the cache bound.
 func TestPrefixAuthWindow(t *testing.T) {
-	a := &PrefixAuth{Key: []byte("k"), Slot: 10 * time.Second, Skew: 1, CacheSize: 2}
-	v, err := NewPrefixAuthVerifier(a)
+	a := &PrefixAuth{Key: []byte("k"), Slot: 10 * time.Second}
+	v, err := NewPrefixAuthVerifier(a, PrefixAuthVerifierOptions{Skew: 1, CacheSize: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,8 +216,8 @@ func TestPrefixAuthWindow(t *testing.T) {
 func TestAdmissionStream(t *testing.T) {
 	leakcheck.Check(t)
 	srvTLS, cliTLS := selfSignedTLS(t)
-	auth := &PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-	v, err := NewPrefixAuthVerifier(auth)
+	auth := &PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, BindTLS: true}
+	v, err := NewPrefixAuthVerifier(auth, PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

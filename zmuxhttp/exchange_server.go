@@ -55,26 +55,31 @@ type exGone struct {
 }
 
 // NewExchangeHandler returns a handler that serves exchange carriers
-// into l. o are the endpoint's HTTP options (nil: the defaults), the same
-// as NewHandler's: their Next serves the requests that are not
-// authenticated exchange requests and zmux.VerdictFallback, their Trusted
-// resolves a request's source, and their PairField tells a split half
-// from an exchange request. The listener's admission decides on the
-// request that creates a carrier, on its head (zmux.CarrierInfo.Head): Peek
-// does not apply. An invalid o or cfg (nil, without a PSK and
-// AllowInsecure) is a zmux.ErrInvalidConfig error.
-func NewExchangeHandler(l *zmux.Listener, o *Options, cfg *ExchangeConfig) (*ExchangeHandler, error) {
-	if err := o.Validate(); err != nil {
+// into l. o (nil: the defaults) holds the endpoint's HTTP options, the same
+// as NewHandler's, and the server's own settings: Options.Next serves the
+// requests that are not authenticated exchange requests and
+// zmux.VerdictFallback, Options.Trusted resolves a request's source, and
+// Options.PairField tells a split half from an exchange request. cfg is what
+// the clients' Exchange values agree on. The listener's admission decides on
+// the request that creates a carrier, on its head (zmux.CarrierInfo.Head):
+// Peek does not apply. An invalid o or cfg (without a PSK and AllowInsecure,
+// a negative field) is a zmux.ErrInvalidConfig error.
+func NewExchangeHandler(l *zmux.Listener, o *ExchangeOptions, cfg ExchangeConfig) (*ExchangeHandler, error) {
+	var ho *Options
+	if o != nil {
+		ho = &o.Options
+	}
+	if err := ho.Validate(); err != nil {
 		return nil, err
 	}
-	p, err := cfg.resolve()
+	p, err := cfg.resolve(nil, o)
 	if err != nil {
 		return nil, err
 	}
 	h := &ExchangeHandler{l: l, p: p,
 		carriers: map[[exCIDLen]byte]*exServer{}, gone: map[[exCIDLen]byte]*exKey{}}
-	if o != nil {
-		h.o = *o
+	if ho != nil {
+		h.o = *ho
 	}
 	// Stamps are whole seconds, checked against MaxClockSkew first: the
 	// window takes the second of rounding.
@@ -124,11 +129,11 @@ func (h *ExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if zmux.EarlyRequest(r) {
 		w.WriteHeader(http.StatusTooEarly)
-		h.l.CountSetupFailure() // it needs the handshake: no pipe input
+		h.l.Adapter().CountSetupFailure() // it needs the handshake: no pipe input
 		return
 	}
-	arrived := h.l.Clock().Now()
-	a, err := h.l.Arrive(h.o.Trusted.RequestSource(r))
+	arrived := h.l.Adapter().Clock().Now()
+	a, err := h.l.Adapter().Arrive(h.o.Trusted.RequestSource(r))
 	switch {
 	case errors.Is(err, net.ErrClosed):
 		// A closed listener takes no carrier and holds nothing: its
@@ -151,7 +156,7 @@ func (h *ExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cl := int(r.ContentLength)
 	// The authentication header, within the first-record timeout.
 	var raw [b64AuthLen]byte
-	n, err := h.readBounded(w, r.Body, raw[:authLen], arrived.Add(h.l.FirstRecordTimeout()))
+	n, err := h.readBounded(w, r.Body, raw[:authLen], arrived.Add(h.l.Adapter().FirstRecordTimeout()))
 	if err != nil {
 		a.Release()
 		// The body ended early or late: the fallback gets what arrived and
@@ -190,7 +195,7 @@ func (h *ExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.Release() // a request of a known carrier holds no slot from now on
 	}
 	// Data and the Data MAC, within the handshake timeout.
-	buf, rest, err := h.readBody(w, r.Body, cl-authLen, h.l.Clock().Now().Add(h.l.HandshakeTimeout()))
+	buf, rest, err := h.readBody(w, r.Body, cl-authLen, h.l.Adapter().Clock().Now().Add(h.l.Adapter().HandshakeTimeout()))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -267,7 +272,7 @@ func (h *ExchangeHandler) readBody(w http.ResponseWriter, body io.Reader, n int,
 func (h *ExchangeHandler) readDeadline(w http.ResponseWriter, deadline time.Time) (stop func() bool) {
 	rc := http.NewResponseController(w)
 	done := make(chan struct{})
-	t := h.l.Clock().AfterFunc(deadline.Sub(h.l.Clock().Now()), func() {
+	t := h.l.Adapter().Clock().AfterFunc(deadline.Sub(h.l.Adapter().Clock().Now()), func() {
 		defer close(done)
 		_ = rc.SetReadDeadline(time.Now())
 	})
@@ -366,7 +371,7 @@ func (h *ExchangeHandler) create(w http.ResponseWriter, r *http.Request, a *zmux
 	switch {
 	case closed || a == nil: // a nil arrival: the listener is closed
 		return nil, exFlagGone
-	case h.l.MemoryPressure():
+	case h.l.Adapter().MemoryPressure():
 		return nil, exFlagBusy
 	}
 	fallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -549,7 +554,7 @@ func newExServer(h *ExchangeHandler, cid [exCIDLen]byte, key *exKey) *exServer {
 
 func (c *exServer) charge(d int64) {
 	c.mem += d
-	c.h.l.ChargeMemory(d)
+	c.h.l.Adapter().ChargeMemory(d)
 }
 
 func (c *exServer) onIdle() {
@@ -760,7 +765,7 @@ func (c *exServer) upLocked(q *exReq, buf *exBuf) byte {
 		// a fixed cost per held piece, empty ones too, so that their
 		// number is bounded.
 		room -= c.h.p.upLimit
-		if c.h.l.MemoryPressure() {
+		if c.h.l.Adapter().MemoryPressure() {
 			room = 0
 		}
 		need += exPieceCost

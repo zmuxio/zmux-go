@@ -15,16 +15,16 @@ import (
 )
 
 // TestServeAdmission admits connections whose first stream starts with a
-// valid prefix token, from Dial and a Pool with a Credential, and closes
+// valid prefix token, from Dial and a ConnPool with a CarrierCredential, and closes
 // one whose first stream does not.
 func TestServeAdmission(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(nil))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, Skew: 1, BindTLS: true}
-	v, err := admit.NewPrefixAuthVerifier(auth)
+	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, BindTLS: true}
+	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestServeAdmission(t *testing.T) {
 
 	// A pool presents it on the first stream of each connection: a
 	// bootstrap, a join on its connection, a join on a second connection.
-	pool := NewPool(ln.Addr().String(), cli, nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
+	pool := NewConnPool(ln.Addr().String(), cli, nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer pool.Shutdown()
 	first, err := pool.OpenPipe(ctx)
 	if err != nil {
@@ -87,7 +87,7 @@ func TestServeAdmission(t *testing.T) {
 	_ = s.Wait()
 
 	// A first stream without a token.
-	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestServeAdmission(t *testing.T) {
 // Serve closes the connection without calling Decide.
 func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(&quic.Config{Allow0RTT: true}))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(&quic.Config{Allow0RTT: true}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	go func() { _ = Serve(ctx, lst, ln, nil); close(done) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
 
-	warm, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
+	warm, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	}
 	_ = warm.CloseWithError(0, "")
 
-	early, err := quic.DialAddrEarly(ctx, ln.Addr().String(), cli, Config(nil))
+	early, err := quic.DialAddrEarly(ctx, ln.Addr().String(), cli, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 // VerdictMore and accepted past it; the session runs on the rest.
 func TestServeAdmissionMore(t *testing.T) {
 	srv, cli := tlsConfigs(t)
-	ln, err := quic.ListenAddr("127.0.0.1:0", srv, Config(nil))
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestServeAdmissionMore(t *testing.T) {
 	done := make(chan struct{})
 	go func() { _ = Serve(ctx, lst, ln, nil); close(done) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
-	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, Config(nil))
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -123,7 +123,7 @@ func BenchmarkBulkHTTP2(b *testing.B) {
 	defer func() { _ = lst.Close() }()
 	// The request lives as long as its context: no timeout on it.
 	ctx := b.Context()
-	p, err := zmuxhttp.StreamPipe(ctx, srv.Client(), srv.URL, nil, zmux.DirectionBidirectional, nil)
+	p, err := zmuxhttp.Streaming{Client: srv.Client(), URL: srv.URL}.Pipe(ctx, zmux.DirectionBidirectional)
 	if err != nil {
 		b.Fatal(err)
 	}

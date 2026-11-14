@@ -36,7 +36,7 @@ const carrierFailed = webtransport.StreamErrorCode(zmux.StreamCarrierFailed)
 // ---- HTTP/3 request streams ----
 
 // HTTPClient returns an http.Client whose requests run over HTTP/3, for
-// zmuxhttp.StreamPipe and zmuxhttp.SplitPipe, and its transport, which the
+// zmuxhttp.Streaming and zmuxhttp.Split, and its transport, which the
 // caller closes when done. qconf may be nil. A carrier's request names its
 // QUIC connection to the carrier (zmuxhttp.CarrierBody), which then declares
 // the Bound contract with the connection's exporter. The transport dials each
@@ -142,7 +142,7 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 	}
 	fallback := http.HandlerFunc(o.Fallback)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a, ok := l.AdmitUpgrade(w, r, o.Trusted, fallback)
+		a, ok := l.Adapter().AdmitUpgrade(w, r, o.Trusted, fallback)
 		if !ok {
 			return
 		}
@@ -209,7 +209,7 @@ func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a 
 // Dial opens a WebTransport session to url with t and the headers h and
 // starts a zmux client session on its first bidirectional stream, as
 // zmuxquic.Dial does on a QUIC connection; the lanes the server opens are
-// accepted. The CONNECT request carries cfg.Credential (DialSession). The
+// accepted. The CONNECT request carries cfg.CarrierCredential (DialSession). The
 // caller, which may start further zmux sessions on the returned
 // WebTransport session (SessionPipe), closes it once the last of them has
 // wholly ended (Wait returned, or Done is closed), not sooner: closing it
@@ -378,12 +378,12 @@ func acceptLanes(sess *webtransport.Session) {
 	}
 }
 
-// Pool opens pipes on a pool of WebTransport sessions to one URL: at most
+// ConnPool opens pipes on a pool of WebTransport sessions to one URL: at most
 // PoolLimits.MaxPipesPerConnection pipes per session at once, sessions
 // retired by lifetime limits or failure; the pipes of one session share a
 // fate group. It is safe for concurrent use.
-type Pool struct {
-	pool carrier.Pool[*wtPooled]
+type ConnPool struct {
+	pool carrier.ConnPool[*wtPooled]
 }
 
 // wtPooled is a pooled WebTransport session.
@@ -418,13 +418,13 @@ func (r *closeRecord) get() (webtransport.SessionErrorCode, string) {
 
 // Shutdown retires every session: idle ones close now, the others once
 // their pipes end; OpenPipe fails afterwards.
-func (p *Pool) Shutdown() { p.pool.Shutdown() }
+func (p *ConnPool) Shutdown() { p.pool.Shutdown() }
 
-// NewPool returns a pool that dials url with t, the headers h and cred
+// NewConnPool returns a pool that dials url with t, the headers h and cred
 // (DialSession), within lim.
-func NewPool(t *webtransport.Transport, url string, h http.Header, cred zmux.CarrierCredential, lim carrier.PoolLimits) *Pool {
-	p := &Pool{}
-	p.pool = carrier.Pool[*wtPooled]{PoolLimits: lim, Close: closePooled,
+func NewConnPool(t *webtransport.Transport, url string, h http.Header, cred zmux.CarrierCredential, lim carrier.PoolLimits) *ConnPool {
+	p := &ConnPool{}
+	p.pool = carrier.ConnPool[*wtPooled]{PoolLimits: lim, Close: closePooled,
 		Dial: func(ctx context.Context) (*wtPooled, error) {
 			sess, err := DialSession(ctx, t, url, h, cred)
 			if err != nil {
@@ -448,9 +448,9 @@ func closePooled(wp *wtPooled) {
 
 // OpenPipe opens a pipe on a pooled session; its PipeIO carries the
 // session's fate group.
-func (p *Pool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
+func (p *ConnPool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	if p.pool.Dial == nil {
-		return zmux.PipeIO{}, errors.New("zmuxh3: a Pool is made by NewPool")
+		return zmux.PipeIO{}, errors.New("zmuxh3: a ConnPool is made by NewConnPool")
 	}
 	l, err := p.pool.Get(ctx)
 	if err != nil {
@@ -607,24 +607,24 @@ func (l *laneReader) Close() error {
 }
 func (l *laneReader) CarrierConn() any { return l.sess }
 
-// Candidate is a WebTransport stream to url for zmux.DialChoice,
+// WebTransportCandidate is a WebTransport stream to url for zmux.DialChoice,
 // for a client that reaches the server directly: each carrier is the first
 // stream of a new WebTransport session (DialSession with the headers h and
 // the session's credential), which is closed once the pipe has ended, with
 // the zmux session's code.
-func Candidate(t *webtransport.Transport, url string, h http.Header) zmux.Candidate {
+func WebTransportCandidate(t *webtransport.Transport, url string, h http.Header) zmux.Candidate {
 	return zmux.Candidate{Kind: zmux.CarrierWebTransport, Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
-		p := NewPool(t, url, h, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
+		p := NewConnPool(t, url, h, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 		return p.OpenPipe(ctx)
 	}}
 }
 
 // HTTP3Candidate is a bidirectional streaming request over HTTP/3 to url
-// for zmux.DialChoice (zmuxhttp.StreamCandidate with an HTTP/3 client, such
+// for zmux.DialChoice (zmuxhttp.Streaming.Candidate with an HTTP/3 client, such
 // as HTTPClient's). Its kind describes this end's hop only: the first
 // peer may be an HTTP/3 intermediary in front of the server.
 func HTTP3Candidate(client *http.Client, url string, h http.Header) zmux.Candidate {
-	c := zmuxhttp.StreamCandidate(client, url, h)
+	c := zmuxhttp.Streaming{Client: client, URL: url, Header: h}.Candidate()
 	c.Kind = zmux.CarrierHTTP3
 	return c
 }

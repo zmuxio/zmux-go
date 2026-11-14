@@ -208,9 +208,6 @@ type sendPart struct {
 }
 
 type recvPart struct {
-	// drainWait: the session waits for the application to read this
-	// part's buffered data before CLOSED (Session.readDrain).
-	drainWait bool
 	buf       recvBuf
 	arrived   rangeSet
 	highest   uint64
@@ -234,6 +231,9 @@ type recvPart struct {
 	stopSent bool
 	reset    bool
 	preDone  bool
+	// drainWait: the session waits for the application to read this
+	// part's buffered data before CLOSED (Session.readDrain).
+	drainWait bool
 }
 
 // StreamID returns the identifier and whether it is allocated.

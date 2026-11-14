@@ -52,8 +52,8 @@ type PickPipe struct {
 	PipeID    PipeID
 	SRTT      time.Duration
 	RTTVar    time.Duration
-	Rate      float64 // delivery rate estimate, bytes per second
-	Unsent    uint64  // Q_p: handed to the carrier and not taken yet, plus its own unsent count where reported
+	Rate      uint64 // delivery rate estimate, bytes per second
+	Unsent    uint64 // Q_p: handed to the carrier and not taken yet, plus its own unsent count where reported
 	InFlight  uint64
 	Priority  uint64
 	Weight    uint64
@@ -278,7 +278,7 @@ func (h *hooks) runPick() {
 	pipes := make([]PickPipe, len(req.Pipes))
 	for i, p := range req.Pipes {
 		pipes[i] = PickPipe{PipeID: PipeID(p.Pipe), State: OutboundState(p.State), SRTT: time.Duration(p.SRTT),
-			RTTVar: time.Duration(p.RTTVar), Rate: p.Rate, Unsent: p.Unsent, InFlight: p.InFlight,
+			RTTVar: time.Duration(p.RTTVar), Rate: rateBytes(p.Rate), Unsent: p.Unsent, InFlight: p.InFlight,
 			Writable: p.Writable, Priority: p.Priority, Standby: p.Standby, Saturated: p.Saturated,
 			Probation: p.Probation, Eligible: p.Eligible, Weight: p.Weight,
 			ShapingActive: p.Shaping, ShapingWeight: p.ShapingW}
@@ -390,10 +390,11 @@ func (c *Conn) redialLoop(need Direction) {
 	r.mu.Lock()
 	st := &r.state[need]
 	r.mu.Unlock()
-	lo, hi := c.cfg.redialBackoff()
+	bo := c.cfg.redialBackoff()
+	lo, hi := bo.Min, bo.Max
 	if st.backoff == 0 {
 		st.backoff = lo
-		st.wait = backoffWait(lo)
+		st.wait = bo.wait(lo)
 	}
 	// delay is the wait after the previous attempt: the policy's
 	// DialAfter, else the backoff.
@@ -450,7 +451,7 @@ func (c *Conn) redialLoop(need Direction) {
 			cancel()
 			if err == nil {
 				st.failures, st.backoff = 0, lo
-				st.wait = backoffWait(lo)
+				st.wait = bo.wait(lo)
 				return
 			}
 		}
@@ -464,7 +465,7 @@ func (c *Conn) redialLoop(need Direction) {
 			st.backoff = min(2*st.backoff, hi)
 		}
 		st.failures++
-		st.wait = backoffWait(st.backoff)
+		st.wait = bo.wait(st.backoff)
 	}
 }
 

@@ -239,7 +239,9 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 		c.failRestartLocked(old, "early data rejected after the peer's parameters")
 		return
 	}
-	old.dead = true // its goroutines no longer report to the core
+	old.dead = true  // its goroutines no longer report to the core
+	pd.end = old.end // a handle of pipe 0 follows the restart
+	pd.end.drv.Store(pd)
 	c.s.SetWriterSignal(0, pd.wsig)
 	c.startPipeLocked(pd, true, true)
 	old.wsig.Fire()   // its writer sees it is dead and ends

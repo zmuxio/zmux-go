@@ -42,7 +42,7 @@ type PoolLimits struct {
 	DecisionRejected func(err error)
 }
 
-// Pool shares underlying connections between pipes, for adapters
+// ConnPool shares underlying connections between pipes, for adapters
 // that carry several pipes over one connection (HTTP/2 and HTTP/3 request
 // streams, QUIC streams). A new pipe goes to the open
 // connection with the most room within the limits, else to a new one; a
@@ -51,7 +51,7 @@ type PoolLimits struct {
 // fate group: they fail together and are never counted as independent
 // paths. The zero value with Dial set is ready; it is safe for concurrent
 // use.
-type Pool[C comparable] struct {
+type ConnPool[C comparable] struct {
 	// Dial opens an underlying connection.
 	Dial func(ctx context.Context) (C, error)
 	// Close closes a connection the pool retired once no pipe uses it.
@@ -89,7 +89,7 @@ type Lease[C comparable] struct {
 	// FateGroup is the connection's fate group (set it as the zmux.PipeIO's).
 	FateGroup uint64
 
-	p    *Pool[C]
+	p    *ConnPool[C]
 	pc   *pooledConn[C]
 	once sync.Once
 }
@@ -107,7 +107,7 @@ var errPoolClosed = errors.New("zmux: carrier pool closed")
 // Get returns a lease on a connection with room, dialling one when none
 // has; the dial runs outside the pool's lock. The lease is non-nil exactly
 // when the error is nil.
-func (p *Pool[C]) Get(ctx context.Context) (*Lease[C], error) {
+func (p *ConnPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -164,7 +164,7 @@ func (p *Pool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	return &Lease[C]{Conn: c, FateGroup: pc.fate, p: p, pc: pc}, nil
 }
 
-func (p *Pool[C]) maxActive() int {
+func (p *ConnPool[C]) maxActive() int {
 	if p.MaxPipesPerConnection > 0 {
 		return p.MaxPipesPerConnection
 	}
@@ -172,7 +172,7 @@ func (p *Pool[C]) maxActive() int {
 }
 
 // take leases the open connection with the most room, if any.
-func (p *Pool[C]) take() (*Lease[C], error) {
+func (p *ConnPool[C]) take() (*Lease[C], error) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -214,7 +214,7 @@ func (p *Pool[C]) take() (*Lease[C], error) {
 	return lease, nil
 }
 
-func (p *Pool[C]) room(pc *pooledConn[C]) int {
+func (p *ConnPool[C]) room(pc *pooledConn[C]) int {
 	r := p.maxActive() - pc.active
 	if m := p.MaxPipesPerConnectionLifetime; m > 0 {
 		r = min(r, m-pc.total)
@@ -223,7 +223,7 @@ func (p *Pool[C]) room(pc *pooledConn[C]) int {
 }
 
 // retireLocked retires a connection that reached a lifetime limit.
-func (p *Pool[C]) retireLocked(pc *pooledConn[C]) {
+func (p *ConnPool[C]) retireLocked(pc *pooledConn[C]) {
 	if m := p.MaxPipesPerConnectionLifetime; m > 0 && pc.total >= m {
 		pc.retired = true
 	}
@@ -232,7 +232,7 @@ func (p *Pool[C]) retireLocked(pc *pooledConn[C]) {
 	}
 }
 
-func (p *Pool[C]) release(pc *pooledConn[C]) {
+func (p *ConnPool[C]) release(pc *pooledConn[C]) {
 	p.mu.Lock()
 	pc.active--
 	if pc.active == 0 {
@@ -256,7 +256,7 @@ func (p *Pool[C]) release(pc *pooledConn[C]) {
 
 // RetireConn retires connection c (for example when it failed): it takes
 // no new pipe and closes once its pipes are released.
-func (p *Pool[C]) RetireConn(c C) {
+func (p *ConnPool[C]) RetireConn(c C) {
 	p.mu.Lock()
 	var pc *pooledConn[C]
 	for _, x := range p.conns {
@@ -270,7 +270,7 @@ func (p *Pool[C]) RetireConn(c C) {
 	}
 }
 
-func (p *Pool[C]) retire(pc *pooledConn[C]) {
+func (p *ConnPool[C]) retire(pc *pooledConn[C]) {
 	p.mu.Lock()
 	pc.retired = true
 	done := pc.active == 0
@@ -283,7 +283,7 @@ func (p *Pool[C]) retire(pc *pooledConn[C]) {
 	}
 }
 
-func (p *Pool[C]) drop(pc *pooledConn[C]) bool {
+func (p *ConnPool[C]) drop(pc *pooledConn[C]) bool {
 	for i, x := range p.conns {
 		if x == pc {
 			copy(p.conns[i:], p.conns[i+1:])
@@ -297,7 +297,7 @@ func (p *Pool[C]) drop(pc *pooledConn[C]) bool {
 
 // Shutdown retires every connection: idle ones close now, the others when
 // their last pipe ends; Get fails afterwards.
-func (p *Pool[C]) Shutdown() {
+func (p *ConnPool[C]) Shutdown() {
 	p.mu.Lock()
 	p.closed = true
 	if p.recheck != nil {
@@ -332,7 +332,7 @@ func keepActive[C comparable](cs []*pooledConn[C]) []*pooledConn[C] {
 
 // recheckNow asks the policy again when nothing else did within the last
 // decision's Recheck, and closes the idle connections it retired.
-func (p *Pool[C]) recheckNow() {
+func (p *ConnPool[C]) recheckNow() {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -357,7 +357,7 @@ func (p *Pool[C]) recheckNow() {
 
 // consultLocked asks the policy, retires the connections it names and
 // reports whether a new connection is due.
-func (p *Pool[C]) consultLocked() bool {
+func (p *ConnPool[C]) consultLocked() bool {
 	if p.Policy == nil {
 		return false
 	}
@@ -408,7 +408,7 @@ func (p *Pool[C]) consultLocked() bool {
 
 // unlockReport unlocks the pool and reports the decisions rejected under
 // the lock to DecisionRejected.
-func (p *Pool[C]) unlockReport() {
+func (p *ConnPool[C]) unlockReport() {
 	errs := p.rejected
 	p.rejected = nil
 	f := p.DecisionRejected

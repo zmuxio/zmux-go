@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -92,37 +91,30 @@ func (e *TransportError) Is(t error) bool {
 }
 
 // IdleTimeoutError reports the idle timeout; Remote when the peer's timer
-// expired. It matches ErrIdleTimeout, net.ErrClosed and
-// os.ErrDeadlineExceeded.
+// expired. It matches ErrIdleTimeout and net.ErrClosed: the session ended,
+// which is not a timeout of the operation that observed it.
 type IdleTimeoutError struct{ Remote bool }
 
 // Error describes the timeout.
 func (e *IdleTimeoutError) Error() string { return "zmux: idle timeout (" + remoteStr(e.Remote) + ")" }
 
-// Is matches ErrIdleTimeout, net.ErrClosed and os.ErrDeadlineExceeded.
+// Is matches ErrIdleTimeout and net.ErrClosed.
 func (e *IdleTimeoutError) Is(t error) bool {
-	return t == ErrIdleTimeout || t == net.ErrClosed || t == os.ErrDeadlineExceeded
+	return t == ErrIdleTimeout || t == net.ErrClosed
 }
-
-// Timeout reports true.
-func (e *IdleTimeoutError) Timeout() bool { return true }
 
 // HandshakeTimeoutError reports that the peer's transport parameters did not
 // arrive within Config.HandshakeTimeout: the session was never
-// established. It matches ErrHandshakeTimeout and os.ErrDeadlineExceeded,
-// not net.ErrClosed, which the ends of established sessions match.
+// established. It matches ErrHandshakeTimeout and net.ErrClosed.
 type HandshakeTimeoutError struct{}
 
 // Error describes the timeout.
 func (e *HandshakeTimeoutError) Error() string { return "zmux: handshake timeout" }
 
-// Is matches ErrHandshakeTimeout and os.ErrDeadlineExceeded.
+// Is matches ErrHandshakeTimeout and net.ErrClosed.
 func (e *HandshakeTimeoutError) Is(t error) bool {
-	return t == ErrHandshakeTimeout || t == os.ErrDeadlineExceeded
+	return t == ErrHandshakeTimeout || t == net.ErrClosed
 }
-
-// Timeout reports true.
-func (e *HandshakeTimeoutError) Timeout() bool { return true }
 
 // EarlyDataRejectedError reports that the peer could not take early data
 // and processed none of it: retry on a new session (see EarlyData). It
@@ -140,21 +132,24 @@ func (e *EarlyDataRejectedError) Is(t error) bool {
 
 // ResumeTimeoutError reports that a suspended session found no pipe within
 // the resume grace period. It matches ErrResumeTimeout and net.ErrClosed
-// and unwraps to the error of the last pipe lost, if any.
+// and unwraps to the error of the last pipe lost, if any, unless that error
+// is a timeout: the end of a session never matches a timeout.
 type ResumeTimeoutError struct{ LastPipeErr error }
 
 // Error describes the timeout.
 func (e *ResumeTimeoutError) Error() string { return "zmux: resume timeout" }
 
-// Unwrap returns LastPipeErr.
-func (e *ResumeTimeoutError) Unwrap() error { return e.LastPipeErr }
+// Unwrap returns LastPipeErr, or nil when it is a timeout.
+func (e *ResumeTimeoutError) Unwrap() error { return unlessTimeout(e.LastPipeErr) }
 
 // Is matches ErrResumeTimeout and net.ErrClosed.
 func (e *ResumeTimeoutError) Is(t error) bool { return t == ErrResumeTimeout || t == net.ErrClosed }
 
 // PipesLostError reports that the carrier failed or every pipe of a
 // direction was lost without resume. It matches ErrPipesLost and
-// net.ErrClosed and unwraps to the error of the last pipe lost, if any.
+// net.ErrClosed and unwraps to the error of the last pipe lost, if any,
+// unless that error is a timeout: the end of a session never matches a
+// timeout.
 type PipesLostError struct{ LastPipeErr error }
 
 // Error describes the loss.
@@ -165,8 +160,41 @@ func (e *PipesLostError) Error() string {
 	return "zmux: pipes lost"
 }
 
-// Unwrap returns LastPipeErr.
-func (e *PipesLostError) Unwrap() error { return e.LastPipeErr }
+// Unwrap returns LastPipeErr, or nil when it is a timeout.
+func (e *PipesLostError) Unwrap() error { return unlessTimeout(e.LastPipeErr) }
+
+// unlessTimeout returns err, or nil when anything in its chain is a
+// timeout (an error whose Timeout method reports true, as
+// os.ErrDeadlineExceeded and context.DeadlineExceeded do): a session's
+// end wrapping it would otherwise read as a deadline to retry after.
+func unlessTimeout(err error) error {
+	if isTimeout(err) {
+		return nil
+	}
+	return err
+}
+
+func isTimeout(err error) bool {
+	for err != nil {
+		if t, ok := err.(interface{ Timeout() bool }); ok && t.Timeout() {
+			return true
+		}
+		switch u := err.(type) {
+		case interface{ Unwrap() error }:
+			err = u.Unwrap()
+		case interface{ Unwrap() []error }:
+			for _, e := range u.Unwrap() {
+				if isTimeout(e) {
+					return true
+				}
+			}
+			return false
+		default:
+			return false
+		}
+	}
+	return false
+}
 
 // Is matches ErrPipesLost and net.ErrClosed.
 func (e *PipesLostError) Is(t error) bool { return t == ErrPipesLost || t == net.ErrClosed }
@@ -206,7 +234,7 @@ func (e *DatagramTooLargeError) Error() string {
 // floor every endpoint accepts. The setter that would exceed it returns it
 // and leaves the preamble as it was; a stream whose limit shrank before it
 // was announced fails with it locally, and nothing of it is sent.
-type PreambleTooLargeError struct{ Max int }
+type PreambleTooLargeError struct{ Max int64 }
 
 // Error describes the limit.
 func (e *PreambleTooLargeError) Error() string {
@@ -247,11 +275,21 @@ var (
 	ErrPipesLost = errors.New("zmux: pipes lost")
 )
 
+// localClosedError is a sentinel for an operation on an object this endpoint
+// closed; it matches net.ErrClosed.
+type localClosedError struct{ msg string }
+
+func (e *localClosedError) Error() string { return e.msg }
+
+// Is matches net.ErrClosed.
+func (e *localClosedError) Is(t error) bool { return t == net.ErrClosed }
+
 // Errors of individual calls.
 var (
 	// ErrStreamClosed is returned for operations on a direction the
 	// application closed itself.
-	ErrStreamClosed = errors.New("zmux: stream closed")
+	// It matches net.ErrClosed.
+	ErrStreamClosed error = &localClosedError{"zmux: stream closed"}
 	// ErrNotNegotiated is returned for features the session does not use.
 	ErrNotNegotiated = errors.New("zmux: feature not negotiated")
 	// ErrNotEstablished is returned for calls that need the peer's
@@ -354,7 +392,7 @@ func apiErr(err error) error {
 		case core.StreamGoingAway:
 			return ErrGoingAway
 		case core.StreamPreambleTooLarge:
-			return &PreambleTooLargeError{Max: int(st.Code)}
+			return &PreambleTooLargeError{Max: int64(st.Code)}
 		case core.StreamClosedLocally:
 		}
 		return ErrStreamClosed

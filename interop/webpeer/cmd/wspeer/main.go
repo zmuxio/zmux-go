@@ -21,7 +21,7 @@ import (
 
 func main() {
 	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: wspeer server|client|bad ADDR")
+		_, _ = fmt.Fprintln(os.Stderr, "usage: wspeer server|client|bad ADDR")
 		os.Exit(2)
 	}
 	mode, addr := os.Args[1], os.Args[2]

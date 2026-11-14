@@ -213,7 +213,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 	defer cancel()
 	// A first session gets a session ticket and the parameters; it runs on
 	// a connection the test dials itself (Client).
-	qc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, Config(nil))
+	qc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, testQUIC(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 	// The second uses replayable parameters and a resumed native connection.
 	// Native streams currently wait for handshake completion (upstream race).
 	cfg := withAuth(&zmux.Config{EarlyData: zmux.EarlyData{Replayable: true, Remembered: remembered}})
-	c2, err := Dial(ctx, e.ln.Addr().String(), secondTLS, nil, cfg)
+	c2, err := Dial(ctx, e.ln.Addr().String(), secondTLS, testQUIC(nil), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 		t.Fatalf("early stream %q %v", b, err)
 	}
 	if exporter {
-		jc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, Config(nil))
+		jc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, testQUIC(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -329,7 +329,7 @@ func TestQUICPool(t *testing.T) {
 	e := newEnv(t, mpConfig())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	p := NewPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{MaxPipesPerConnection: 2})
+	p := NewConnPool(e.ln.Addr().String(), e.cli, nil, nil, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer p.Shutdown()
 	first, err := p.OpenPipe(ctx)
 	if err != nil {
@@ -428,11 +428,11 @@ func TestQUICCopyLane(t *testing.T) {
 	t.Fatalf("no copy on the copy lane: %+v", c.PipeStats())
 }
 
-// testQUIC is Config(base) with a handshake timeout that tolerates a
+// testQUIC is QUICConfig(base) with a handshake timeout that tolerates a
 // loaded test host: the default 5 s fails handshakes under -race with
 // many packages running at once.
 func testQUIC(base *quic.Config) *quic.Config {
-	c := Config(base)
+	c := QUICConfig(base)
 	c.HandshakeIdleTimeout = 30 * time.Second
 	return c
 }

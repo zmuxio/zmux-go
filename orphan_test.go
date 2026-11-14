@@ -2,6 +2,7 @@ package zmux
 
 import (
 	"context"
+	"errors"
 	"net"
 	"runtime"
 	"testing"
@@ -82,8 +83,9 @@ func TestOrphanReleasedInBubble(t *testing.T) {
 		}
 		select {
 		case err := <-read:
-			if err == nil {
-				t.Fatal("the read ended without an error")
+			var se *StreamError
+			if !errors.As(err, &se) || se.ErrorCode != StreamCancelled {
+				t.Fatalf("the read ended with %v, want a reset with StreamCancelled", err)
 			}
 		default:
 			t.Fatal("the peer's stream did not end")
