@@ -27,9 +27,9 @@ const DefaultRedirects = 5
 // follow: to another host, from https to http, one that would change a
 // POST into a GET, past the bound, or without a valid Location.
 type RedirectError struct {
-	StatusCode int
 	Location   string
 	Reason     string
+	StatusCode int
 }
 
 func (e *RedirectError) Error() string {
@@ -146,8 +146,8 @@ func effectivePort(u *url.URL, secure bool) string {
 // URL, and zmux.DialChoice remembers it per server in its zmux.CarrierCache. It is
 // safe for concurrent use.
 type Target struct {
-	base string
 	cur  atomic.Pointer[string]
+	base string
 }
 
 // NewTarget returns a target at rawURL.

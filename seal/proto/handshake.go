@@ -10,8 +10,9 @@ import (
 
 // Config is one end's side of a handshake.
 type Config struct {
-	Profile Profile
-	Mode    Mode
+	// Static is the key of this role, for profiles where it has one: an
+	// *ecdh.PrivateKey on X25519 for every profile today.
+	Static crypto.PrivateKey
 	// Handle names the key, for profiles with a handle: 16 bytes.
 	Handle []byte
 	// PSK is the key of the length of the profile's suite (32 bytes for every
@@ -19,14 +20,13 @@ type Config struct {
 	PSK []byte
 	// Binding is the 32-byte BoundExporter of the carrier, exactly for Bound.
 	Binding []byte
-	// Static is the key of this role, for profiles where it has one: an
-	// *ecdh.PrivateKey on X25519 for every profile today.
-	Static crypto.PrivateKey
+	Profile Profile
 	// MaxAppData bounds the application data of a received message; zero is
 	// DefaultMaxAppData, negative no bound beyond the message. More is
 	// ErrTooLarge. What is sent is bounded only by
 	// the message: application data the message cannot hold is ErrTooLarge.
 	MaxAppData int
+	Mode       Mode
 }
 
 // Handshake is the state machine of one handshake, driven by the pattern of

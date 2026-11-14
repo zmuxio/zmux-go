@@ -314,10 +314,10 @@ func TestCheckEncapsulationKey(t *testing.T) {
 // Bound is configured and fails when it reads.
 func TestResponderBindingLength(t *testing.T) {
 	for _, c := range []struct {
-		mode Mode
 		n    int
+		mode Mode
 		ok   bool
-	}{{Bound, 0, true}, {Bound, BoundExporterLen, true}, {Bound, 31, false}, {Bound, 33, false}} {
+	}{{mode: Bound, n: 0, ok: true}, {mode: Bound, n: BoundExporterLen, ok: true}, {mode: Bound, n: 31}, {mode: Bound, n: 33}} {
 		_, err := NewResponder(Config{Profile: ProfileEstablish, Mode: c.mode, Static: newKey(t), Binding: make([]byte, c.n)})
 		if (err == nil) != c.ok || err != nil && !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("mode %v binding of %d bytes: %v", c.mode, c.n, err)

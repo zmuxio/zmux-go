@@ -13,10 +13,10 @@ import (
 // reaches the limit and ends when it falls below three quarters of it, and each
 // transition is signalled on Changed for the listener's serial context.
 type Budget struct {
-	limit   uint64 // 0: unlimited
+	Changed chan struct{} // capacity 1
+	limit   uint64        // 0: unlimited
 	used    atomic.Int64
 	over    atomic.Bool
-	Changed chan struct{} // capacity 1
 }
 
 // NewBudget returns a budget of limit bytes (0: unlimited).

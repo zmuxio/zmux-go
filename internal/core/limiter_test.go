@@ -8,6 +8,8 @@ import "testing"
 // acknowledges what arrived one way back later.
 type pathSim struct {
 	lim      *limiter
+	flight   []simBatch
+	arrivals []simArrival
 	est      rateEst
 	rtt      rttEst
 	now      Time
@@ -15,9 +17,7 @@ type pathSim struct {
 	delay    Duration // round trip
 	sent     uint64
 	acked    uint64
-	flight   []simBatch
 	busy     Time // the path has delivered everything sent by then
-	arrivals []simArrival
 	roundEnd uint64
 	lastAck  Time
 }

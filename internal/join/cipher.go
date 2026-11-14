@@ -8,9 +8,9 @@ import (
 // CipherState is the CipherState of Noise revision 34 over a cipher function.
 type CipherState struct {
 	Fn   AEADFunc
+	AEAD cipher.AEAD // nil until a key is set
 	K    []byte
 	N    uint64
-	AEAD cipher.AEAD // nil until a key is set
 }
 
 // Init sets the key and resets n.
@@ -71,8 +71,8 @@ const MaxMessage = 65535
 // Sealer protects the records of one direction, without framing. It is not
 // safe for concurrent use.
 type Sealer struct {
-	CS  CipherState
 	err error
+	CS  CipherState
 }
 
 // NewSealer returns a Sealer at n = 0.
@@ -109,8 +109,8 @@ func (s *Sealer) Seal(dst, plaintext []byte) ([]byte, error) {
 // Opener verifies the records of one direction. Any failure is permanent. It
 // is not safe for concurrent use.
 type Opener struct {
-	CS  CipherState
 	err error
+	CS  CipherState
 }
 
 // NewOpener returns an Opener at n = 0.

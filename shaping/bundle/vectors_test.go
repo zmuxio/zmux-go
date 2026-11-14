@@ -35,13 +35,13 @@ func TestFormatVectors(t *testing.T) {
 	}
 	var d struct {
 		Bundles []struct {
+			Selected map[string]*int `json:"selected"`
 			Name     string          `json:"name"`
 			Bundle   string          `json:"bundle"`
-			Features []string        `json:"features"`
-			Allow    bool            `json:"allow_unshaped"`
-			Selected map[string]*int `json:"selected"`
-			Unshaped []string        `json:"unshaped"`
 			Error    string          `json:"error"`
+			Features []string        `json:"features"`
+			Unshaped []string        `json:"unshaped"`
+			Allow    bool            `json:"allow_unshaped"`
 		} `json:"bundles"`
 		Handshake []struct {
 			Name   string `json:"name"`
@@ -52,15 +52,15 @@ func TestFormatVectors(t *testing.T) {
 			} `json:"source"`
 			Resolved string `json:"resolved"`
 			Calls    []struct {
-				Handshake string `json:"handshake"`
-				Message   string `json:"message"`
-				Plan      *struct {
+				Plan *struct {
 					PadTo       int   `json:"pad_to"`
 					PadMultiple int   `json:"pad_multiple"`
 					Pad         int   `json:"pad"`
 					Delay       int64 `json:"delay"`
 				} `json:"plan"`
-				Consumed uint64 `json:"consumed"`
+				Handshake string `json:"handshake"`
+				Message   string `json:"message"`
+				Consumed  uint64 `json:"consumed"`
 			} `json:"calls"`
 		} `json:"handshake"`
 	}

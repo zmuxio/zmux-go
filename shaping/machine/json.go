@@ -29,8 +29,8 @@ func fail(class, format string, a ...any) *FormatError {
 // jobject is a decoded JSON object; its values are nil, bool, string,
 // json.Number, []any or *jobject.
 type jobject struct {
-	keys []string
 	vals map[string]any
+	keys []string
 }
 
 func (o *jobject) get(k string) any { return o.vals[k] }

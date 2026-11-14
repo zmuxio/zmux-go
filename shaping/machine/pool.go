@@ -23,19 +23,19 @@ var metricNames = map[string]metric{"age": metricAge, "idle": metricIdle, "pipes
 	"bytes_sent": metricBytesSent, "bytes_received": metricBytesReceived, "bytes": metricBytes}
 
 type retireRule struct {
-	metric metric
 	above  value
 	jitter uint32
 	slot   int32 // into a member's kept thresholds
+	metric metric
 }
 
 // poolDef is a pool policy. Absent members keep the pool's own behaviour.
 type poolDef struct {
-	count         value
 	dialAfter     []value
-	dialJitter    uint32
 	retire        []retireRule
+	count         value
 	probeInterval value
+	dialJitter    uint32
 	probeJitter   uint32
 	hasProbeJit   bool
 }
@@ -175,16 +175,16 @@ func (c *Compiled) PoolPolicy() zmux.PoolPolicy {
 // poolPolicy decides under its lock: a pool decides serially, so the lock is
 // not contended.
 type poolPolicy struct {
-	mu      sync.Mutex
-	s       *poolDef
-	src     rand.Source
-	members map[uint64]*poolMember
-	seen    map[uint64]bool
-	// The current dial wait: its draw and the view it began from.
-	waiting   bool
+	src       rand.Source
+	s         *poolDef
+	members   map[uint64]*poolMember
+	seen      map[uint64]bool
 	waitU     uint64
 	waitFails int
 	waitSince int64 // microseconds since the last dial; <0: no dial
+	mu        sync.Mutex
+	// The current dial wait: its draw and the view it began from.
+	waiting bool
 }
 
 type poolMember struct {

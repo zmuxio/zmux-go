@@ -21,13 +21,13 @@ import (
 type earlyLayer struct {
 	net.Conn
 	verdict  chan bool
-	mu       sync.Mutex
-	state    int // 0 holding, 1 passing, 2 dropping
 	held     [][]byte
+	state    int // 0 holding, 1 passing, 2 dropping
 	dropped  atomic.Int64
+	mu       sync.Mutex
 	restarts atomic.Int32
-	late     bool // no early data this time: writes pass from the start
 	waits    atomic.Int32
+	late     bool // no early data this time: writes pass from the start
 }
 
 func (l *earlyLayer) SendsEarlyData() bool { return !l.late }

@@ -93,27 +93,27 @@ const hookQueueMax = 256
 // own, started when the first one is needed (an idle session without hooks
 // keeps its footprint). Its lock is a leaf.
 type hooks struct {
+	pick  Pick
 	c     *Conn
 	tr    *Tracer
-	pick  Pick
 	allow func(delta uint64) bool
 	log   *slog.Logger
 	warns []string // warnings for log, queued under the session lock
 
-	mu      sync.Mutex
+	kick    chan struct{}
 	q       []traceItem
 	dropped uint64
+	mu      sync.Mutex
 	wantWin bool
 	wantPk  bool
 	running bool
-	kick    chan struct{}
 }
 
 type traceItem struct {
+	err    error
 	ev     Event
 	est    bool
 	closed bool
-	err    error
 }
 
 func newHooks(c *Conn) *hooks {
@@ -321,18 +321,18 @@ func safeLog(l *slog.Logger, what string, f func()) (ok bool) {
 // losses of the direction, so that a wait counts from the previous
 // attempt.
 type redialer struct {
+	state    [3]redialState
 	mu       sync.Mutex
 	inFlight [3]bool
-	state    [3]redialState
 }
 
 type redialState struct {
-	failures int
+	view     PoolView
 	lastDial time.Time
+	dec      PoolDecision
+	failures int
 	backoff  time.Duration // the current backoff; 0: not started
 	wait     time.Duration // the wait after lastDial, jittered
-	view     PoolView
-	dec      PoolDecision
 }
 
 // maybeRedial starts redials for the directions the session lacks.

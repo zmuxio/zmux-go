@@ -15,6 +15,7 @@ import (
 
 // DuplicateOptions are the inputs of ResolveDuplicate.
 type DuplicateOptions struct {
+	Dial func(ctx context.Context) (PipeIO, error)
 	// LocalID and PeerID are the application identities of the two
 	// endpoints (the same byte strings at both ends), when it has them.
 	LocalID, PeerID []byte
@@ -22,7 +23,6 @@ type DuplicateOptions struct {
 	// survivor uses multipath, Dial the route again and join it to the
 	// survivor (in the background; a hint).
 	Rejoin bool
-	Dial   func(ctx context.Context) (PipeIO, error)
 }
 
 // DuplicateResult reports a resolution.

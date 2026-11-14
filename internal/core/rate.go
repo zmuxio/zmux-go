@@ -13,9 +13,9 @@ const (
 
 // rateEst is R_p of one outbound pipe.
 type rateEst struct {
+	samples []rateSmp
 	r       float64 // the windowed maximum; 0 before the first sample
 	lo      float64 // R_lo, the limiter's rate bound; 0: none
-	samples []rateSmp
 
 	// Round trips: a round ends when a byte sent after it began is
 	// acknowledged.

@@ -15,6 +15,13 @@ import (
 
 // PipePool keeps pipes of one path up.
 type PipePool struct {
+	// Policy, when set, is asked on every pass of the pool; its
+	// DialAfter replaces the backoff, bounded by Backoff.Max, and its
+	// Liveness applies to the pipes dialled after it.
+	// A decision that fails PoolDecision.Validate is rejected: the pass
+	// goes on as with the zero decision and the error is reported to
+	// DecisionRejected.
+	Policy PoolPolicy
 	// Dial opens a carrier of the path. Its context bounds the dial and
 	// ends once the join completes; the carrier then lives until the pipe
 	// is closed.
@@ -25,6 +32,15 @@ type PipePool struct {
 	// all of them are, and they are replaced together. ctx bounds the
 	// joins; o has ReturnOnReply set, as the pool's own joins do.
 	Join func(ctx context.Context, c *Conn, o PipeOptions) ([]*Pipe, error)
+	// ChoicePolicy is the policy of Choice (nil: the defaults, with a cache
+	// private to the pool); its Join does not apply.
+	ChoicePolicy *CarrierChoicePolicy
+	// DecisionRejected, when set, receives the PoolDecision.Validate error
+	// (ErrInvalidConfig) of each decision of Policy the pool rejected, on
+	// the goroutine of MaintainPipes and outside every lock; it must not
+	// block, and a panic in it is contained. The pool goes on maintaining
+	// its pipes whether it is set or not.
+	DecisionRejected func(err error)
 	// Choice, in place of Dial and Join, dials each member over a carrier
 	// kind of the mode's candidates (a split candidate joins as a split
 	// carrier), presenting the session's Config.CarrierCredential. Stable first,
@@ -42,12 +58,6 @@ type PipePool struct {
 	// EventCarrierChosen. ExplicitChoice dials its one kind only, without
 	// the cache.
 	Choice CarrierChoice
-	// ChoicePolicy is the policy of Choice (nil: the defaults, with a cache
-	// private to the pool); its Join does not apply.
-	ChoicePolicy *CarrierChoicePolicy
-	// Count is the number of usable pipes to keep (0: 1, as a pool of no
-	// pipes has nothing to maintain).
-	Count int
 	// Options of the pipes the pool joins.
 	Options PipeOptions
 	// Rotate replaces pipes that carried MaxBytes or are MaxAge old.
@@ -59,19 +69,9 @@ type PipePool struct {
 	// jitter, drawn once per wait. The zero value selects the defaults: no
 	// backoff would redial a failing path in a busy loop.
 	Backoff Backoff
-	// Policy, when set, is asked on every pass of the pool; its
-	// DialAfter replaces the backoff, bounded by Backoff.Max, and its
-	// Liveness applies to the pipes dialled after it.
-	// A decision that fails PoolDecision.Validate is rejected: the pass
-	// goes on as with the zero decision and the error is reported to
-	// DecisionRejected.
-	Policy PoolPolicy
-	// DecisionRejected, when set, receives the PoolDecision.Validate error
-	// (ErrInvalidConfig) of each decision of Policy the pool rejected, on
-	// the goroutine of MaintainPipes and outside every lock; it must not
-	// block, and a panic in it is contained. The pool goes on maintaining
-	// its pipes whether it is set or not.
-	DecisionRejected func(err error)
+	// Count is the number of usable pipes to keep (0: 1, as a pool of no
+	// pipes has nothing to maintain).
+	Count int
 }
 
 // Rotation replaces pipes before a lifetime limit: when a pipe has carried
@@ -169,17 +169,17 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	c.pools.Add(1) // a running pool attends a suspension (EventResumeUnattended)
 	defer c.pools.Add(-1)
 	type member struct {
-		ps     []*Pipe
-		born   time.Time
-		limitB uint64
-		limitT time.Duration
-		repl   []*Pipe // its replacement while rotating
-		idle   time.Duration
-		retire bool // the policy asked for its replacement
+		joined, replSeen time.Time
+		born             time.Time
+		ps               []*Pipe
+		repl             []*Pipe // its replacement while rotating
 		// With a mode: the kind of ps and of repl, when ps were joined
 		// and repl became usable (wall clock, for the cache).
-		kind, replKind   int
-		joined, replSeen time.Time
+		kind, replKind int
+		limitB         uint64
+		limitT         time.Duration
+		idle           time.Duration
+		retire         bool // the policy asked for its replacement
 	}
 	closeAll := func(ps []*Pipe) {
 		for _, p := range ps {

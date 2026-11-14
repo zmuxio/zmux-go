@@ -32,8 +32,8 @@ type Batch struct {
 }
 
 type bseg struct {
-	ext    []byte
 	pin    pin // what keeps ext alive (none: owned bytes)
+	ext    []byte
 	a0, a1 int
 }
 
@@ -218,12 +218,12 @@ type pendPiece struct {
 }
 
 type pendStream struct {
+	pin  pin
+	data []byte
+	more []pendPiece // further contiguous segments of the same STREAM frame
 	id   uint64
 	off  uint64
-	data []byte
-	pin  pin
-	more []pendPiece // further contiguous segments of the same STREAM frame
-	n    int         // total data bytes (data and more)
+	n    int // total data bytes (data and more)
 	on   bool
 	fin  bool
 	dg   bool // a DATAGRAM instead of STREAM
@@ -400,24 +400,75 @@ func (w *recWriter) stream(id, off uint64, data []byte, pn pin, fin bool) bool {
 }
 
 // datagram adds a DATAGRAM frame (LEN elided when last).
-func (w *recWriter) datagram(data []byte) bool {
-	n := 1 + varint.SizeVarint(uint64(len(data))) + len(data)
+func (w *recWriter) datagram(data []byte, frameMax uint64) (ok, never bool) {
+	capy := min(uint64(w.recMax), frameMax)
+	n := datagramFrameLen(len(data), true)
+	if uint64(n) > capy {
+		// Only without its Length field, as the last frame of a record,
+		// and never in a shaped record (padding may follow it).
+		last := datagramFrameLen(len(data), false)
+		if uint64(last) > capy || w.sh != nil {
+			return false, true
+		}
+		if w.open {
+			w.end()
+			if w.blocked() {
+				return false, false
+			}
+		}
+		if !w.newRecordFits(last) {
+			return false, false
+		}
+		w.addDatagram(data)
+		w.end()
+		return true, false
+	}
 	if !w.fits(n) {
 		if !w.open || !w.newRecordFits(n) {
-			return false
+			return false, false
 		}
 		w.end()
 		if w.blocked() {
-			return false
+			return false, false
 		}
 	}
+	w.addDatagram(data)
+	return true, false
+}
+
+// addDatagram makes data the pending DATAGRAM frame of the open record.
+func (w *recWriter) addDatagram(data []byte) {
 	w.begin()
 	w.flushPend(true)
 	w.pend = pendStream{on: true, data: data, dg: true, more: w.pend.more[:0], n: len(data)}
 	w.elicit = true
 	w.activity, w.traffic = true, true
 	w.onlyPing = false
-	return true
+}
+
+// datagramFrameLen returns the bytes of a DATAGRAM frame with n bytes of
+// data (Flow and Context ID included): its type, its Length field when
+// withLen, the data.
+func datagramFrameLen(n int, withLen bool) int {
+	if withLen {
+		return 1 + varint.SizeVarint(uint64(n)) + n
+	}
+	return 1 + n
+}
+
+// datagramDataMax returns the most data whose DATAGRAM frame fits capy
+// bytes, with or without its Length field; 0 when none fits.
+func datagramDataMax(capy uint64, withLen bool) int {
+	if !withLen {
+		return int(max(capy, 1) - 1)
+	}
+	best := uint64(0)
+	for k, top := range [...]uint64{1: 1<<6 - 1, 2: 1<<14 - 1, 4: 1<<30 - 1, 8: varint.MaxVarint} {
+		if top != 0 && capy >= 1+uint64(k) {
+			best = max(best, min(capy-1-uint64(k), top))
+		}
+	}
+	return int(best)
 }
 
 func (w *recWriter) flushPend(withLen bool) {

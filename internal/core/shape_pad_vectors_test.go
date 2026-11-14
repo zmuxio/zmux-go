@@ -42,9 +42,9 @@ func TestPadVectors(t *testing.T) {
 			Result planJSON `json:"result"`
 		} `json:"limits"`
 		Item []struct {
+			ValueLen *int `json:"value_len"`
 			Gap      int  `json:"gap"`
 			Room     int  `json:"room"`
-			ValueLen *int `json:"value_len"`
 			Added    int  `json:"added"`
 		} `json:"item"`
 		Raw []struct {
@@ -53,24 +53,24 @@ func TestPadVectors(t *testing.T) {
 			Fill int `json:"fill"`
 		} `json:"raw_fill"`
 		Unit []struct {
+			ValueLen *int     `json:"value_len"`
+			Filler   string   `json:"filler"`
 			Plan     planJSON `json:"plan"`
 			Room     int      `json:"room"`
 			W        int      `json:"w"`
 			Target   int      `json:"target"`
-			Filler   string   `json:"filler"`
-			ValueLen *int     `json:"value_len"`
 			Added    int      `json:"added"`
 			Wire     int      `json:"wire"`
 		} `json:"unit"`
 		ReplyRoom []struct {
+			Result struct {
+				PaddingRoom *int `json:"padding_room"`
+				FramesLimit int  `json:"frames_limit"`
+			} `json:"result"`
 			Mode       string `json:"mode"`
 			Received   int    `json:"received"`
 			Base       int    `json:"base"`
 			WantFrames int    `json:"want_frames"`
-			Result     struct {
-				FramesLimit int  `json:"frames_limit"`
-				PaddingRoom *int `json:"padding_room"`
-			} `json:"result"`
 		} `json:"reply_room"`
 	}
 	if err := json.Unmarshal(b, &d); err != nil {

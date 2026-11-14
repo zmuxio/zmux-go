@@ -122,14 +122,14 @@ func atkConfig() *Config {
 }
 
 type atkEnv struct {
-	t     *testing.T
 	ctx   context.Context
+	c, s  *Conn
+	first net.Conn
+	t     *testing.T
 	pki   *atkPKI
 	lst   *Listener
 	tlsTo string // the origin over TLS
 	addr  string // the origin over plain TCP
-	c, s  *Conn
-	first net.Conn
 }
 
 type atkOpts struct {
@@ -243,8 +243,8 @@ func (e *atkEnv) alive(c *Conn) {
 
 // tap is what a third party read.
 type tap struct {
-	mu sync.Mutex
 	b  bytes.Buffer
+	mu sync.Mutex
 }
 
 func (a *tap) add(p []byte) {
@@ -701,8 +701,8 @@ func startTampered(t *testing.T, cfg func() *Config, f func(*wire.Params)) (*Lis
 }
 
 type tamperKM struct {
-	paramTamper
 	km *kmConn
+	paramTamper
 }
 
 func (c *tamperKM) ExportKeyingMaterial(l string, ctx []byte, n int) ([]byte, error) {

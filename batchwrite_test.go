@@ -17,9 +17,9 @@ import (
 // batchCarrier is a message carrier with WriteMessages, counting calls.
 type batchCarrier struct {
 	*msgCarrier
-	batches, msgs, single atomic.Int64
-	firstBatch            atomic.Int64           // messages in the first call
 	first                 atomic.Pointer[[]byte] // their concatenation
+	batches, msgs, single atomic.Int64
+	firstBatch            atomic.Int64 // messages in the first call
 }
 
 func (b *batchCarrier) WriteMessages(msgs [][]byte) error {

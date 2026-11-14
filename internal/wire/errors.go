@@ -68,11 +68,11 @@ func TransportErrorCode(name string) (uint64, bool) {
 // Error is a protocol violation detected while decoding or processing peer
 // input. It becomes a CONNECTION_CLOSE of type 0x1c.
 type Error struct {
+	Reason string
+	// Details are the key=value pairs of the diagnostic line.
+	Details   string
 	Code      uint64
 	FrameType uint64
-	Reason    string
-	// Details are the key=value pairs of the diagnostic line.
-	Details string
 }
 
 func (e *Error) Error() string {

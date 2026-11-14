@@ -576,11 +576,11 @@ func testTLSConfigs() (server, client *tls.Config, err error) {
 // example can start its server only once the client has sent something.
 type heldConn struct {
 	net.Conn
-	mu      sync.Mutex
-	buf     []byte
-	held    bool
 	more    chan struct{}
 	flushed chan struct{} // closed once the held bytes were passed on
+	buf     []byte
+	mu      sync.Mutex
+	held    bool
 }
 
 func newHeldConn(c net.Conn) *heldConn {

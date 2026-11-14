@@ -28,14 +28,14 @@ type TLV struct {
 
 // Preamble is a parsed stream preamble; byte fields alias the input.
 type Preamble struct {
-	Size        int // Length field plus Length
 	OpenInfo    []byte
+	App         []TLV
+	Size        int // Length field plus Length
 	HasOpenInfo bool
 	HasPriority bool
 	Urgency     uint8
 	Incr        bool
 	PipeCarrier bool
-	App         []TLV
 }
 
 // ParsePreamble parses a preamble from the data of the STREAM frame at
@@ -102,14 +102,14 @@ func appendTLV(b []byte, t uint64, v []byte) []byte {
 // PreambleSpec describes a preamble to encode. TLVs are written in
 // increasing type order with the GREASE TLV last.
 type PreambleSpec struct {
+	Grease      *TLV
 	OpenInfo    []byte
+	App         []TLV
 	HasOpenInfo bool
 	HasPriority bool
 	Urgency     uint8
 	Incr        bool
 	PipeCarrier bool
-	App         []TLV
-	Grease      *TLV
 }
 
 // BodyLen is the length of the TLVs.

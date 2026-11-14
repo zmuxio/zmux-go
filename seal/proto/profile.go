@@ -87,16 +87,16 @@ const (
 // shape is a handshake pattern with what each of its messages can carry.
 type shape struct {
 	name      string
-	hasHandle bool
 	msgs      [][]token
 	known     []payloadSet
+	hasHandle bool
 }
 
 // pattern is one row of the profile table. The state machine is driven by
 // it alone: a new profile is a new row.
 type pattern struct {
+	suite suite
 	shape
-	suite  suite
 	pqConf bool
 }
 

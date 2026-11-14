@@ -81,17 +81,17 @@ func knownHandshake(hs string) bool {
 
 // unitValues are the values of one handshake message.
 type unitValues struct {
-	set                     bool
 	padTo, padMul, pad, dly value
+	set                     bool
 }
 
 // Candidate is a validated candidate of a kind: handshakes, machines, limits
 // and pool, each possibly absent. It is immutable.
 type Candidate struct {
-	hs       [len(handshakeOrder)]unitValues
-	machines []machineDef
 	budget   *budgetDef
 	pool     *poolDef
+	machines []machineDef
+	hs       [len(handshakeOrder)]unitValues
 }
 
 // ParseCandidate reads a candidate's JSON. A member named in requires is not
@@ -185,10 +185,10 @@ func (c *Candidate) HasPool() bool { return c.pool != nil }
 type Compiled struct {
 	c        *Candidate
 	o        Options
-	hs       [len(handshakeOrder)]unitValues
 	machines *compiledMachines
 	pool     *poolDef
 	shared   []uint64 // in the order drawn
+	hs       [len(handshakeOrder)]unitValues
 }
 
 // Compile draws the shared values of c from one source, in a fixed order.

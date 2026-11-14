@@ -45,23 +45,27 @@ type StreamID int64
 // a reader and a writer goroutine; wake-ups are queued under the lock and
 // delivered after it is released.
 type Conn struct {
-	mu  sync.Mutex
-	s   *core.Session
 	clk clock
+	s   *core.Session // the sans-IO core (session lock)
 	cfg *Config
+	mu  sync.Mutex // the session lock: guards s and the fields marked so
 
+	// The timer and its bookkeeping (session lock).
 	timer     timeshim.Timer
 	timerAt   core.Time
 	timerArm  core.Time     // when the timer was armed to fire
 	timerLate time.Duration // smoothed lateness of the host timer
 
-	pipes  map[uint64]*pipeDrv
-	wg     sync.WaitGroup
-	done   chan struct{}
 	ctx    context.Context
-	cancel context.CancelCauseFunc
 	err    error // terminal error once done
+	pipes  map[uint64]*pipeDrv
+	done   chan struct{}
+	cancel context.CancelCauseFunc
+	wg     sync.WaitGroup
 
+	// firstTimer releases a held first flight at the handshake timeout;
+	// firstTimeouts counts that (session lock).
+	firstTimer timeshim.Timer
 	// exp is the late exporter of PipeAuth.Exporter, nil without it.
 	exp *lateExporter
 	// boot holds the bootstrap carrier's exporters (ExportKeyingMaterial),
@@ -69,10 +73,7 @@ type Conn struct {
 	boot *lateExporter
 	// bootIO is the bootstrap carrier, for ConnectionState's TLS state and
 	// application protocol; set before the session is shared.
-	bootIO PipeIO
-	// firstTimer releases a held first flight at the handshake timeout;
-	// firstTimeouts counts that (session lock).
-	firstTimer    timeshim.Timer
+	bootIO        PipeIO
 	firstTimeouts uint64
 
 	// verdictDone closes once the carrier's early-data verdict has been
@@ -83,56 +84,57 @@ type Conn struct {
 	// before the session is shared, never changed).
 	admitted any
 
+	lctx context.Context // the goroutine labels of the session (labels.go)
 	// orphans are the handles collected unclosed (cleanupHandle); handles
 	// counts those not released, and while there are any the timer also
 	// fires at sweepAt to release orphans (session lock).
 	orphans orphanQueue
 	handles int
-	pools   atomic.Int32 // MaintainPipes calls running
 	// shapeFaults are the shaper panics already logged (session lock).
 	shapeFaults uint64
 	sweepAt     core.Time
-	lctx        context.Context // the goroutine labels of the session (labels.go)
 
 	events      eventQueue
 	pipeWaiters []*core.Signal // AddPipe waiting for a join (woken on pipe state changes)
 
-	unconfirmed []PipeIO          // carriers Unconfirmed at the acceptor
-	cc          core.Config       // the session's resolved configuration
-	labels      map[uint64]string // pipe labels
-	lst         *Listener         // the listener that accepted the session
-	nestedLanes int               // lanes that nested pipes hold on this session
-	retiredIDs  []uint64          // pipes retired in this critical section
-	retiredDone []uint64          // pipes retired in the previous one
-	hk          *hooks            // application hooks (nil: none)
-	redial      redialer
+	labels map[uint64]string // pipe labels
+	lst    *Listener         // the listener that accepted the session
+	hk     *hooks            // application hooks (nil: none)
 	// carrierVariant is the chosen candidate's Variant.
 	carrierVariant string
+	unconfirmed    []PipeIO    // carriers Unconfirmed at the acceptor
+	retiredIDs     []uint64    // pipes retired in this critical section
+	retiredDone    []uint64    // pipes retired in the previous one
+	cc             core.Config // the session's resolved configuration
+	redial         redialer
+	nestedLanes    int         // lanes that nested pipes hold on this session
 	needRedial     bool        // a direction may have been lost (under the lock)
 	dialed         Endpoint    // who dialed the bootstrap carrier; 0: unknown
 	carrier        CarrierKind // the kind DialChoice chose
-
-	fired   bool // the timeout ran: rearm no earlier than G
-	closing bool // CLOSED: no new goroutines
-	// ending is closed when the first Close or Abort has returned; nil
-	// before either. closeSig, while Close waits, is woken at every
-	// unlock. aborted: Abort was called.
-	ending   chan struct{}
-	closeSig *core.Signal
-	aborted  bool
+	// The small flags sit together, so that they pack into one word.
+	fired    bool // the timeout ran: rearm no earlier than G
+	closing  bool // CLOSED: no new goroutines
+	aborted  bool // Abort was called
 	poisoned bool
-	// closeCode and closeMsg are the first Close's, which an Abort during
-	// its flush sends instead of its own (the first call decides).
-	closeCode ApplicationErrorCode
-	closeMsg  string
-
-	// waited is Done's channel, made and closed by its goroutine.
-	waitOnce sync.Once
-	waited   chan struct{}
 	// A shaping deadline is met in place: the timer is armed lead before
 	// it, by the host timer's observed lateness, and the callback waits
 	// for the deadline itself.
 	timerPrecise bool
+
+	// ending is closed when the first Close or Abort has returned; nil
+	// before either. closeSig, while Close waits, is woken at every
+	// unlock.
+	ending   chan struct{}
+	closeSig *core.Signal
+	closeMsg string
+	// closeCode and closeMsg are the first Close's, which an Abort during
+	// its flush sends instead of its own (the first call decides).
+	closeCode ApplicationErrorCode
+
+	// waited is Done's channel, made and closed by its goroutine.
+	waited   chan struct{}
+	waitOnce sync.Once
+	pools    atomic.Int32 // MaintainPipes calls running
 
 	chIn    chIn // received channel datagrams for the session
 	chInMax int  // the hand-off's length: the datagram receive queue's
@@ -540,11 +542,11 @@ func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 // exporter followed by the downlink's.
 type lateExporter struct {
 	up, down KeyingMaterialExporter // either may be nil
-	early    []EarlyServerCarrier   // the halves' carriers with early data
+	err      error
+	early    []EarlyServerCarrier // the halves' carriers with early data
+	b        []byte
 	once     sync.Once
 	loaded   atomic.Bool
-	b        []byte
-	err      error
 }
 
 // bootExporters finds the exporters of p's halves (Exporter's rule per
@@ -1390,12 +1392,19 @@ func (c *Conn) SendDatagram(p []byte) error { return c.sendDatagram(nil, 0, p) }
 // sendDatagram queues a session (st nil) or stream datagram through the
 // send limiter, which runs outside the lock.
 func (c *Conn) sendDatagram(st *core.Stream, cx uint64, p []byte) error {
+	_, err := c.sendDatagramLimited(st, cx, p)
+	return err
+}
+
+// sendDatagramLimited is sendDatagram that also reports a drop by the
+// send limiter (limited true, err nil).
+func (c *Conn) sendDatagramLimited(st *core.Stream, cx uint64, p []byte) (bool, error) {
 	lim := c.cfg.DatagramLimiter.Send
 	if lim != nil && lim.TryReady(len(p)) < len(p) {
 		c.lock()
 		c.s.DeliverDatagram(core.PendingDatagram{}, true)
 		c.unlock()
-		return nil
+		return true, nil
 	}
 	c.lock()
 	err := c.s.SendDatagram(st, cx, p)
@@ -1403,7 +1412,7 @@ func (c *Conn) sendDatagram(st *core.Stream, cx uint64, p []byte) error {
 	if err == nil && lim != nil {
 		lim.Charge(len(p))
 	}
-	return apiErr(err)
+	return false, apiErr(err)
 }
 
 // SendDatagramWait queues a session datagram, waiting for room in the send

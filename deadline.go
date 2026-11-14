@@ -11,9 +11,9 @@ import (
 // is closed when the deadline passes and replaced when it is moved (the
 // pipeDeadline pattern of package net). Its lock is a leaf (L3).
 type deadline struct {
-	mu     sync.Mutex
 	timer  timeshim.Timer
 	cancel chan struct{}
+	mu     sync.Mutex
 }
 
 // set moves the deadline to t on clk.

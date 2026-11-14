@@ -51,8 +51,8 @@ func HTTPClient(tlsConf *tls.Config, qconf *quic.Config) (*http.Client, *http3.T
 // own socket, so that the connection a request went out on is found from
 // what httptrace reports.
 type h3Conns struct {
-	mu      sync.Mutex
 	byLocal map[string]*quic.Conn
+	mu      sync.Mutex
 }
 
 func (c *h3Conns) dial(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
@@ -395,9 +395,9 @@ type wtPooled struct {
 // closeRecord is the close code of the last zmux session a pooled
 // WebTransport session carried.
 type closeRecord struct {
-	mu     sync.Mutex
-	code   zmux.ApplicationErrorCode
 	reason string
+	code   zmux.ApplicationErrorCode
+	mu     sync.Mutex
 	set    bool
 }
 
@@ -491,15 +491,15 @@ func (w *wtStream) pipe() zmux.PipeIO {
 }
 
 type wtStream struct {
-	sess  *webtransport.Session
-	s     *webtransport.Stream
-	wOnce sync.Once
-	rOnce sync.Once
+	sess *webtransport.Session
+	s    *webtransport.Stream
 	// rec, when set, records the close code of the pipe's session for its
 	// pooled WebTransport session (zmux.CloseCodeRecorder); ended, when
 	// set, is called once both halves have ended.
 	rec    *closeRecord
 	ended  func()
+	wOnce  sync.Once
+	rOnce  sync.Once
 	halves atomic.Int32
 }
 

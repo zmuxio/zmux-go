@@ -15,8 +15,8 @@ import (
 // A session's time starts at 0 and is never negative.
 type clock struct {
 	base   time.Time
-	origin int64          // monoNow at base (the host clock)
 	ext    timeshim.Clock // nil: the host clock
+	origin int64          // monoNow at base (the host clock)
 }
 
 func newClock(ext timeshim.Clock) clock {

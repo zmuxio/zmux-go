@@ -24,11 +24,11 @@ const (
 
 // epoch is one epoch an endpoint accepts.
 type epoch struct {
-	n      uint64
-	secret []byte
 	keys   map[uint64]*joinKeys // per usable Suite
-	local  []byte               // the local Locator joins of this epoch name
-	peer   []byte               // the peer's Locator for this epoch
+	secret []byte
+	local  []byte // the local Locator joins of this epoch name
+	peer   []byte // the peer's Locator for this epoch
+	n      uint64
 }
 
 func (e *epoch) wipe() {
@@ -58,24 +58,24 @@ const (
 )
 
 type epochs struct {
-	d      uint64
-	list   []*epoch // the accepted epochs, ascending
-	join   *epoch   // the epoch new local joins use
-	crypto []byte   // session_crypto
+	join *epoch // the epoch new local joins use
 	// The exchange: the private values of an offer, the bodies, the frame
 	// repeated until the next phase and the last phase of d+1 processed or sent.
-	offer     *join.Offer
-	offerBody []byte
-	frame     []byte
-	last      int
-	nextLocal []byte // the local Locator announced for d+1, nil to keep
-	dropAt    Time   // Retaining: when d is deleted
-	st        epochState
-	// Policy: an exchange asked for (AdvanceEpoch) or due.
-	advance     bool
-	firstPipe   bool // the first Sealed or Bound pipe was seen
+	offer       *join.Offer
+	list        []*epoch // the accepted epochs, ascending
+	crypto      []byte   // session_crypto
+	offerBody   []byte
+	frame       []byte
+	nextLocal   []byte // the local Locator announced for d+1, nil to keep
+	d           uint64
+	last        int
+	dropAt      Time // Retaining: when d is deleted
 	stableSince Time
 	joins       uint64 // joins since the last Stable
+	st          epochState
+	// Policy: an exchange asked for (AdvanceEpoch) or due.
+	advance   bool
+	firstPipe bool // the first Sealed or Bound pipe was seen
 }
 
 // byPhase is the accepted epoch of a key phase; at most one matches.

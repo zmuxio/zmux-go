@@ -19,8 +19,8 @@ import (
 // recConn records the bytes written to a carrier.
 type recConn struct {
 	net.Conn
-	mu  sync.Mutex
 	out []byte
+	mu  sync.Mutex
 	on  bool
 }
 
@@ -61,9 +61,9 @@ func (c *recConn) records() (sizes, zeros []int) {
 
 // fnShaper is a Shaper made of functions.
 type fnShaper struct {
-	caps  shaping.Caps
 	plan  func(*shaping.RecordView, *shaping.RecordPlan)
 	event func(*shaping.Event, *shaping.Effects)
+	caps  shaping.Caps
 }
 
 func (f *fnShaper) Capabilities() shaping.Caps { return f.caps }

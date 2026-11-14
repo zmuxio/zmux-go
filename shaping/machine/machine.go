@@ -15,13 +15,13 @@ func micros(x uint64) time.Duration { return time.Duration(x) * time.Microsecond
 // compiledMachines are machines with their shared values drawn and pipe
 // values given slots. They are read only.
 type compiledMachines struct {
+	o        *Options
 	ms       []machineDef
-	npipe    int32
-	caps     shaping.Caps
 	ncounter int
 	ntimer   int
 	queue    int // the most triggers pending in one call
-	o        *Options
+	npipe    int32
+	caps     shaping.Caps
 }
 
 func compileMachines(defs []machineDef, src rand.Source, shared *[]uint64, o *Options) *compiledMachines {
@@ -103,15 +103,15 @@ func NewFactory(b []byte, o Options) (zmux.ShaperFactory, error) {
 }
 
 type mstate struct {
-	cur    int32
-	weight uint32
-	gen    uint64
 	ctr    []uint64
 	tm     []int64 // deadlines; noTime: none
+	gen    uint64
 	injAt  int64
 	injLen int64 // <0: none
 	rate   uint64
 	burst  uint64
+	cur    int32
+	weight uint32
 }
 
 const noTime = int64(math.MinInt64)

@@ -35,12 +35,12 @@ func newKey(t *testing.T) *ecdh.PrivateKey {
 }
 
 type gate struct {
-	handle, psk []byte
 	cred        *proto.Credential
+	handle, psk []byte
 
-	mu      sync.Mutex
 	asked   []seal.CredentialRequest
 	commits []seal.CommitRequest
+	mu      sync.Mutex
 }
 
 func (g *gate) Resolve(_ context.Context, h []byte, _ netip.AddrPort) ([]byte, error) {
@@ -387,9 +387,9 @@ func TestWrapPipeLaneFirstRecord(t *testing.T) {
 // laneHalf is one end of a carrier connection with lanes over net.Pipe. Lanes the client
 // opens reach the listener as carriers of their own, as streams of a QUIC connection do.
 type laneHalf struct {
-	secureConn
 	id   any
 	open func(context.Context) (io.WriteCloser, error)
+	secureConn
 }
 
 func (h *laneHalf) CarrierConn() any { return h.id }

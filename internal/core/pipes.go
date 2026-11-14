@@ -12,9 +12,15 @@ const (
 
 // CarrierInfo describes a carrier half to the core.
 type CarrierInfo struct {
+	// Channel is the carrier's datagram channel for the pipe,
+	// nil when it has none.
+	Channel Channel
 	// MaxRecord bounds the record size locally; 0: no bound.
 	MaxRecord int
-	Framing   Framing
+	// WriteOverhead is the fixed number of bytes each carrier write adds
+	// below the pipe (PipeIO.WriteOverhead), handed to the shaper factory.
+	WriteOverhead int
+	Framing       Framing
 	// TLS: build records of at most 16382 bytes of frames.
 	TLS bool
 	// MinRTT reports whether the carrier provides a minimum RTT; without it
@@ -26,12 +32,6 @@ type CarrierInfo struct {
 	// or an unsent count; otherwise the carrier queue limiter
 	// paces it.
 	QueueBound bool
-	// WriteOverhead is the fixed number of bytes each carrier write adds
-	// below the pipe (PipeIO.WriteOverhead), handed to the shaper factory.
-	WriteOverhead int
-	// Channel is the carrier's datagram channel for the pipe,
-	// nil when it has none.
-	Channel Channel
 }
 
 // Channel is a pipe carrier's datagram channel as the core uses it to
@@ -50,20 +50,20 @@ type Channel interface {
 
 // Pipe is one attachment.
 type Pipe struct {
-	id   uint64
 	conn any     // carrier connection of lane 0 (lanes)
 	mp   *attach // multipath side storage; nil outside multipath
 	in   *inDir
 	out  *outDir
 	sh   *pipeShape // nil: not shaped
-	// carrier is the carrier's kind, opaque to the core: what the shaper
-	// factory, pipe events and statistics report (SetPipeKind).
-	carrier uint8
 	// chSig wakes the sender of the carrier's datagram channel.
 	chSig *Signal
+	id    uint64
 	// lastTraffic is when a record with a traffic frame
 	// was last produced or completely received on the pipe.
 	lastTraffic Time
+	// carrier is the carrier's kind, opaque to the core: what the shaper
+	// factory, pipe events and statistics report (SetPipeKind).
+	carrier uint8
 }
 
 // sinceTraffic is the time since a record with a traffic frame was sent
@@ -111,18 +111,18 @@ func (p *Pipe) retired() bool { return p.mp != nil && p.mp.retired }
 
 type inDir struct {
 	lanes []*inLane
-	ended bool
 	// The last PIPE_ACK sent (acked: one was), for the
 	// immediate acknowledgement of an ack-eliciting record after
 	// zmux_max_ack_delay without one.
 	ackedAt Time
 	acked   bool
+	ended   bool
 }
 
 type inLane struct {
+	info CarrierInfo
 	lane uint64
 	pos  uint64
-	info CarrierInfo
 	recs uint64
 	// Acknowledgement generation.
 	elicit     uint64 // ack-eliciting bytes since the last PIPE_ACK
@@ -135,12 +135,12 @@ type inLane struct {
 }
 
 type outDir struct {
+	sig     *Signal
 	lo      laneOut
 	lanes   []*outLane
+	q       pipeQuality
 	snd     pipeSend
 	records uint64 // records written
-	q       pipeQuality
-	sig     *Signal
 	// The carrier's own retransmissions (SetCarrierRetransmitted) and the
 	// smoothed loss rate sampled from them.
 	retrans      uint64

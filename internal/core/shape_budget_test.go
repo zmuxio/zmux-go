@@ -50,14 +50,14 @@ func TestBudgetVectors(t *testing.T) {
 			Name    string      `json:"name"`
 			Account *vecAccount `json:"account"`
 			Steps   []struct {
-				Now     uint64      `json:"now"`
-				Earn    uint64      `json:"earn"`
-				Op      string      `json:"op"`
-				N       uint64      `json:"n"`
 				Account *vecAccount `json:"account"`
 				Granted *bool       `json:"granted"`
-				Left    uint64      `json:"left"`
 				Level   *uint64     `json:"level"`
+				Op      string      `json:"op"`
+				Now     uint64      `json:"now"`
+				Earn    uint64      `json:"earn"`
+				N       uint64      `json:"n"`
+				Left    uint64      `json:"left"`
 				Spent   uint64      `json:"spent"`
 			} `json:"steps"`
 		} `json:"account"`
@@ -74,15 +74,15 @@ func TestBudgetVectors(t *testing.T) {
 		} `json:"wire_ppm"`
 		Gate []struct {
 			Name  string `json:"name"`
-			Rate  uint64 `json:"rate"`
-			Burst int64  `json:"burst"`
 			Steps []struct {
+				Release *uint64 `json:"release"`
 				Now     uint64  `json:"now"`
 				Take    int64   `json:"take"`
-				Held    bool    `json:"held"`
 				Tokens  int64   `json:"tokens"`
-				Release *uint64 `json:"release"`
+				Held    bool    `json:"held"`
 			} `json:"steps"`
+			Rate  uint64 `json:"rate"`
+			Burst int64  `json:"burst"`
 		} `json:"gate"`
 	}
 	if err := json.Unmarshal(raw, &d); err != nil {

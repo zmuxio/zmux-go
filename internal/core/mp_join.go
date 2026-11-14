@@ -11,21 +11,21 @@ import (
 
 // JoinOptions are the options of a local join.
 type JoinOptions struct {
-	FateGroup    uint64
-	Binding      []byte // Bound: the Binding of the new carrier
 	SendPriority *uint64
 	SendStandby  *bool
+	Probation    *Duration // nil: the session default; 0 disables
+	OutSig       *Signal
+	Binding      []byte // Bound: the Binding of the new carrier
+	In, Out      CarrierInfo
+	Live         PipeLiveness // the pipe's own liveness settings
+	FateGroup    uint64
 	RecvPriority uint64
 	Weight       uint64
-	Probation    *Duration    // nil: the session default; 0 disables
-	Live         PipeLiveness // the pipe's own liveness settings
-	In, Out      CarrierInfo
-	OutSig       *Signal
+	Group        uint64 // 0: the default Group of the session
 	Mode         join.Mode
 	Dir          uint8 // pipe direction: 0 up, 1 down, 2 bidi (joiner's view)
 	RecvStandby  bool
-	Kind         uint8  // the carrier's kind (SetPipeKind)
-	Group        uint64 // 0: the default Group of the session
+	Kind         uint8 // the carrier's kind (SetPipeKind)
 }
 
 // AddPipeResult says what happened to a local join.
@@ -556,10 +556,10 @@ const (
 
 // Carrier describes the carrier of a peer join to the acceptor.
 type Carrier struct {
-	In, Out       CarrierInfo
 	OutSig        *Signal // wakes the outbound writer
-	HasIn, HasOut bool    // the directions the carrier provides to the acceptor
-	Kind          uint8   // the carrier's kind (SetPipeKind)
+	In, Out       CarrierInfo
+	HasIn, HasOut bool  // the directions the carrier provides to the acceptor
+	Kind          uint8 // the carrier's kind (SetPipeKind)
 	// Refuse: the join would run over its own session.
 	Refuse bool
 }
@@ -567,11 +567,11 @@ type Carrier struct {
 // PeerJoin is an authenticated Hello: Unconfirmed once Claim has set its bit. It
 // holds no session state.
 type PeerJoin struct {
+	acc  *join.Acceptor
+	h    *join.Suite
+	pl   join.HelloPayload
 	Pipe join.Pipe
 	Mode join.Mode
-	acc  *join.Acceptor
-	pl   join.HelloPayload
-	h    *join.Suite
 }
 
 // HelloWithoutBinding records a Hello in Bound refused because its carrier has no Binding.

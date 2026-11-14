@@ -20,8 +20,8 @@ import (
 // write call, a WriteBuffers call as one.
 type writeLog struct {
 	c      net.Conn
-	mu     sync.Mutex
 	writes [][]byte
+	mu     sync.Mutex
 }
 
 func (w *writeLog) Write(b []byte) (int, error) {

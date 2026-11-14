@@ -13,6 +13,7 @@ type connFlow struct {
 	bigCount  int    // directions that are not small
 
 	// Receiving.
+	tune      *tuner
 	win       uint64 // window W
 	adv       uint64 // advertised limit L
 	rel       uint64 // released credit (C = rel + win)
@@ -21,7 +22,6 @@ type connFlow struct {
 	held      uint64 // received at or above the cap, credit not released
 	blockSeen uint64 // largest DATA_BLOCKED limit reported
 	peerBlock bool   // DATA_BLOCKED at the current limit received
-	tune      *tuner
 }
 
 func (c *connFlow) initRecv(w uint64) {

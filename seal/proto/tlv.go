@@ -20,8 +20,8 @@ const (
 
 // Credential is an opaque credential; its Type selects how it is verified.
 type Credential struct {
-	Type uint64
 	Data []byte
+	Type uint64
 }
 
 // Payload is the content of a handshake message.
@@ -29,15 +29,15 @@ type Payload struct {
 	// Credential is the sender's credential, at most one per message; only
 	// messages that transmit a static key carry it.
 	Credential *Credential
+	// Proof is the transcript signature of the message (messages 2 and 3). When
+	// read, its Message is the M it signs; when written, Message is not used.
+	Proof *Proof
 	// AppData is the application's handshake data (messages 2 and 3), opaque
 	// here; nil or empty sends nothing.
 	AppData []byte
 	// FirstBytes is the start of the carrier's byte stream, handed to the
 	// upper layer in place of its first record.
 	FirstBytes []byte
-	// Proof is the transcript signature of the message (messages 2 and 3). When
-	// read, its Message is the M it signs; when written, Message is not used.
-	Proof *Proof
 	// Padding is the length of an ignorable padding item; 0 omits it unless
 	// PadEmpty asks for an item with no value.
 	Padding  int

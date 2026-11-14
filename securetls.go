@@ -35,7 +35,14 @@ type secureTLSConn struct{ *tls.Conn }
 // CarrierSecure declares the contract; before the handshake it is only the host's word.
 func (c *secureTLSConn) CarrierSecure() bool {
 	st := c.ConnectionState()
-	return !st.HandshakeComplete || st.Version >= tls.VersionTLS13 || st.Version == tls.VersionTLS12 && !st.DidResume
+	return !st.HandshakeComplete || BoundTLS(st)
+}
+
+// BoundTLS reports whether a completed TLS handshake can carry the Bound contract
+// (CarrierSecure): TLS 1.3, or TLS 1.2 that did not resume. A missing extended master
+// secret fails the export.
+func BoundTLS(st tls.ConnectionState) bool {
+	return st.HandshakeComplete && (st.Version >= tls.VersionTLS13 || st.Version == tls.VersionTLS12 && !st.DidResume)
 }
 
 // TLSRecords is true: this is a TLS record layer.

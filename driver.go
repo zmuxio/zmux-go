@@ -61,11 +61,11 @@ type pipeDrv struct {
 // retires it (err, guarded by the session lock, is set before),
 // waited when, besides, its goroutines ended.
 type pipeEnd struct {
+	err     error
 	drv     atomic.Pointer[pipeDrv] // the current driver (an early-data restart replaces pipe 0's)
 	retired chan struct{}
-	err     error
-	once    sync.Once
 	waited  chan struct{}
+	once    sync.Once
 }
 
 // goneEnd is the end of an attachment the session no longer knows.
@@ -73,9 +73,9 @@ var goneEnd = &pipeEnd{retired: closedChan, waited: closedChan}
 
 // laneOut is the writer side of one outbound lane above 0.
 type laneOut struct {
-	lane uint64
 	w    io.WriteCloser
 	sig  *core.Signal
+	lane uint64
 	once sync.Once
 	smu  sync.Mutex
 	shut bool
@@ -94,9 +94,9 @@ func (l *laneOut) close(abort bool) {
 // its own to wait for them: ended is closed when the count drops to zero
 // (lock level L3).
 type pipeGoroutines struct {
-	mu    sync.Mutex
-	n     int
 	ended chan struct{}
+	n     int
+	mu    sync.Mutex
 }
 
 func (g *pipeGoroutines) add() {
@@ -659,18 +659,18 @@ func (c *Conn) openLane(pd *pipeDrv) {
 // performed, and a command looked up then would be lost (an aborted half
 // that is never closed blocks its goroutine for good).
 type pendingAct struct {
-	a     core.Action
-	pd    *pipeDrv
-	lo    *laneOut
-	start bool
+	pd     *pipeDrv
+	lo     *laneOut
+	reason string
+	a      core.Action
+	code   ApplicationErrorCode
+	start  bool
 	// coded: the session has ended, with an application close of code and
 	// reason or (0, "") otherwise, before this command ended the pipe
 	// (CloseCodeRecorder). The
 	// shutdown of a closing session's pipe comes before its inbound side
 	// ends, so the code is recorded before either half has ended.
-	coded  bool
-	code   ApplicationErrorCode
-	reason string
+	coded bool
 }
 
 // resolveActionLocked binds a to its attachment (under the lock).

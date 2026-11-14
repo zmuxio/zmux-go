@@ -83,8 +83,8 @@ func settle(before map[string]string) []string {
 // reported holds the goroutines newLeaks reported: a leaked goroutine
 // stays leaked, and only the first check to see it fails.
 var reported struct {
-	sync.Mutex
 	ids map[string]bool
+	sync.Mutex
 }
 
 // newLeaks returns the stacks of the goroutines in the goroutineleak

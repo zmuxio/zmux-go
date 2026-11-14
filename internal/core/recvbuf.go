@@ -6,9 +6,9 @@ import "sync/atomic"
 // refs is atomic because the driver drops its own reference outside the
 // session lock. Free returns it to its pool when the last reference goes.
 type Buf struct {
+	Free func(*Buf)
 	B    []byte
 	refs atomic.Int32
-	Free func(*Buf)
 }
 
 // Ref adds a reference.
@@ -28,9 +28,9 @@ func (b *Buf) Unref() {
 const refThreshold = 4096
 
 type rpiece struct {
-	off uint64
-	b   []byte
 	buf *Buf // nil: owned copy
+	b   []byte
+	off uint64
 }
 
 // recvBuf holds received, unread stream data as disjoint pieces sorted by

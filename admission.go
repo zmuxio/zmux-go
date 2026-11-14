@@ -45,6 +45,21 @@ import (
 // The fields are read by NewListener; an Admission must not be changed or
 // copied afterwards.
 type Admission struct {
+	// Decide returns the decision for a carrier. prefix is what was read,
+	// valid only during the call. ctx ends at what remains of PeekTimeout
+	// and when the listener stops taking carriers (Close, or the end of
+	// Shutdown); a decision not returned by then is VerdictClose, and so
+	// is a panic. It is called once per carrier and once more after each
+	// VerdictMore, concurrently for different carriers, outside every
+	// lock.
+	Decide func(ctx context.Context, info *CarrierInfo, prefix []byte) Decision
+	// StallMin and StallMax bound the duration of a VerdictStall. The
+	// duration is a function of the carrier's source alone for the
+	// Listener's lifetime (Listener.StallDuration). When both are zero,
+	// the bounds are drawn once per Admission from a secure random source:
+	// StallMax between 30 s and 120 s, StallMin between a quarter and
+	// three quarters of it.
+	StallMin, StallMax time.Duration
 	// Peek is the number of bytes read before Decide (0: none). Decide
 	// receives fewer when the carrier ends first. On a message-framed
 	// carrier any Peek above 0 reads the first message, of at most
@@ -70,23 +85,8 @@ type Admission struct {
 	// the timeout as when it is false. A Decide that does not return in
 	// time is VerdictClose, and a failed outer handshake is not affected.
 	FallbackOnPeekTimeout bool
-	// Decide returns the decision for a carrier. prefix is what was read,
-	// valid only during the call. ctx ends at what remains of PeekTimeout
-	// and when the listener stops taking carriers (Close, or the end of
-	// Shutdown); a decision not returned by then is VerdictClose, and so
-	// is a panic. It is called once per carrier and once more after each
-	// VerdictMore, concurrently for different carriers, outside every
-	// lock.
-	Decide func(ctx context.Context, info *CarrierInfo, prefix []byte) Decision
-	// StallMin and StallMax bound the duration of a VerdictStall. The
-	// duration is a function of the carrier's source alone for the
-	// Listener's lifetime (Listener.StallDuration). When both are zero,
-	// the bounds are drawn once per Admission from a secure random source:
-	// StallMax between 30 s and 120 s, StallMin between a quarter and
-	// three quarters of it.
-	StallMin, StallMax time.Duration
 
-	once sync.Once
+	once sync.Once // before err: it fills the padding after the bool
 	err  error
 	r    admParams // resolved
 }
@@ -102,23 +102,6 @@ type admParams struct {
 // client opens (CarrierCredential). Fields that do not apply to the carrier are
 // zero.
 type CarrierInfo struct {
-	// Source is the carrier's client address: what a trusted intermediary
-	// reports (TrustedProxies; port 0 when it reports none), what the
-	// host gave as PipeHint.Source, and otherwise Peer. The listener's
-	// per-source limits and the stall duration count it aggregated to
-	// its source prefix (ListenerConfig.SourcePrefixV4, SourcePrefixV6),
-	// the port ignored.
-	Source netip.AddrPort
-	// Head marks a carrier decided on its HTTP request head, before any
-	// body byte is read: an HTTP upgrade such as WebSocket or
-	// WebTransport, an exchange carrier, or an HTTP request carrier
-	// without a body, such as a downlink GET. There is no prefix, and a
-	// credential travels in a request header field.
-	Head bool
-	// Peer is the address the carrier arrived from: the remote address of
-	// its connection, or an HTTP request's RemoteAddr. Zero when it is not
-	// an IP address and port, such as a Unix socket.
-	Peer netip.AddrPort
 	// TLS is the state of the carrier's TLS (or QUIC) handshake, which has
 	// completed; ExportKeyingMaterial binds data to it. For a carrier
 	// decided on an HTTP request head it is the state of the connection
@@ -128,6 +111,23 @@ type CarrierInfo struct {
 	// Request is the request of an HTTP carrier. Its body must not be read
 	// by Decide; the bytes the listener read are the prefix.
 	Request *http.Request
+	// Source is the carrier's client address: what a trusted intermediary
+	// reports (TrustedProxies; port 0 when it reports none), what the
+	// host gave as PipeHint.Source, and otherwise Peer. The listener's
+	// per-source limits and the stall duration count it aggregated to
+	// its source prefix (ListenerConfig.SourcePrefixV4, SourcePrefixV6),
+	// the port ignored.
+	Source netip.AddrPort
+	// Peer is the address the carrier arrived from: the remote address of
+	// its connection, or an HTTP request's RemoteAddr. Zero when it is not
+	// an IP address and port, such as a Unix socket.
+	Peer netip.AddrPort
+	// Head marks a carrier decided on its HTTP request head, before any
+	// body byte is read: an HTTP upgrade such as WebSocket or
+	// WebTransport, an exchange carrier, or an HTTP request carrier
+	// without a body, such as a downlink GET. There is no prefix, and a
+	// credential travels in a request header field.
+	Head bool
 }
 
 // AdmissionVerdict is the outcome of an admission.
@@ -167,10 +167,6 @@ const verdictFailed AdmissionVerdict = 255
 
 // Decision is what Admission.Decide returns.
 type Decision struct {
-	Verdict AdmissionVerdict
-	// Skip is the number of leading prefix bytes that are not carrier bytes
-	// (VerdictAccept only); the rest is replayed to the Listener.
-	Skip int
 	// Value is the host's value for an accepted carrier (VerdictAccept
 	// only; ignored otherwise): zmux hands it on without looking at it to
 	// WrapPipe (PipeHint.Admitted) and to the session (AdmittedAs) or
@@ -178,14 +174,18 @@ type Decision struct {
 	// state is released. Whether a join comes from the same client as its
 	// session is the host's to decide: zmux compares no values.
 	Value any
-	// Need is, with VerdictMore, the total prefix length Decide needs.
-	Need int
 	// Variant labels the carrier with any verdict, for
 	// Listener.VariantStats; on VerdictAccept it is the PipeIO.Variant
 	// handed to WrapPipe (which may change it). "" for none. Use one of a
 	// few constants of the host, never a value derived from the peer's
 	// bytes: at most MaxAdmissionVariants are counted apart.
 	Variant string
+	// Skip is the number of leading prefix bytes that are not carrier bytes
+	// (VerdictAccept only); the rest is replayed to the Listener.
+	Skip int
+	// Need is, with VerdictMore, the total prefix length Decide needs.
+	Need    int
+	Verdict AdmissionVerdict
 }
 
 // VariantStat are the admission outcomes of one Decision.Variant
@@ -240,9 +240,9 @@ type AdmissionStats struct {
 type admissionCounters struct {
 	accepted, fallback, stalled, closed, stallOverflow, peekTimedOut, handshakeFailed atomic.Uint64
 
-	mu       sync.Mutex
 	variants map[string]*VariantStat
 	overflow *VariantStat // the variants past MaxAdmissionVariants
+	mu       sync.Mutex
 }
 
 // variant counts a final verdict of variant v.
@@ -440,11 +440,11 @@ type Arrival struct {
 	peer netip.AddrPort
 	key  netip.Prefix
 
-	mu       sync.Mutex
-	slot     *core.PendingSlot // the slots Arrive took, until handed on
-	accepted bool              // the admission accepted the carrier
 	value    any               // Decision.Value of that acceptance
+	slot     *core.PendingSlot // the slots Arrive took, until handed on
 	variant  string            // Decision.Variant of that acceptance
+	mu       sync.Mutex
+	accepted bool // the admission accepted the carrier
 }
 
 // Arrive takes a slot of source and a slot of the listener for a carrier

@@ -16,19 +16,19 @@ import (
 
 // delayConn delivers what is written to it after a one-way delay.
 type delayConn struct {
+	last time.Time
 	net.Conn
+	room chan struct{}
+	sig  chan struct{}
+	done chan struct{}
+	q    [][]byte
+	at   []time.Time
 	d    time.Duration
 	rate float64 // bytes per second
 	cap  int     // bytes buffered before Write blocks
-	last time.Time
 	held int
-	room chan struct{}
-	mu   sync.Mutex
-	q    [][]byte
-	at   []time.Time
-	sig  chan struct{}
-	done chan struct{}
 	once sync.Once
+	mu   sync.Mutex
 }
 
 func newDelayConn(c net.Conn, d time.Duration, rate float64, cap int) *delayConn {

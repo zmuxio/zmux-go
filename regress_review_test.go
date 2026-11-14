@@ -36,11 +36,11 @@ func TestJoinEarlyHelloBeyondCiphertext(t *testing.T) {
 // its closing.
 type gatedWrite struct {
 	net.Conn
-	nth     int32
-	writes  atomic.Int32
 	gate    chan struct{}
 	blocked chan struct{}
 	once    sync.Once
+	nth     int32
+	writes  atomic.Int32
 	closed  atomic.Bool
 }
 

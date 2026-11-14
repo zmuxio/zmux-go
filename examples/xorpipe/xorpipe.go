@@ -59,14 +59,14 @@ const (
 
 type clientWriter struct {
 	c       net.Conn
-	key     byte
-	nonce   [8]byte
 	verdict chan bool
 	r       *clientReader
+	nonce   [8]byte
+	key     byte
 
-	mu    sync.Mutex
-	state int
 	held  [][]byte
+	state int
+	mu    sync.Mutex
 }
 
 func xor(b []byte, k byte) []byte {

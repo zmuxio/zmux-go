@@ -88,9 +88,9 @@ func (o CandidateOutcome) String() string {
 
 // CandidateResult is the outcome of one try of a candidate.
 type CandidateResult struct {
-	Variant string // the candidate's Variant
 	// Err is the failure (nil when usable).
 	Err     error
+	Variant string // the candidate's Variant
 	Kind    CarrierKind
 	Outcome CandidateOutcome
 	// Joined is set for a try as a further pipe of the established session.
@@ -142,8 +142,8 @@ type CarrierTarget interface {
 // CarrierChoice is how DialChoice, or a PipePool, chooses the carrier: ExplicitChoice
 // or AutoChoice.
 type CarrierChoice struct {
-	auto       bool
 	candidates []Candidate
+	auto       bool
 }
 
 // ExplicitChoice dials c only: a failure is reported, never replaced by
@@ -241,14 +241,14 @@ func (p *modeParams) timer(rtt time.Duration) time.Duration {
 // ready; the fields must not change once it is in use. It is safe for
 // concurrent use.
 type CarrierCache struct {
-	// SuccessTTL is how long a usable kind is remembered (6 h).
-	SuccessTTL time.Duration
 	// BackoffMin and BackoffMax bound the backoff of a failed kind (1 min,
 	// 6 h).
 	BackoffMin, BackoffMax time.Duration
+	// SuccessTTL is how long a usable kind is remembered (6 h).
+	SuccessTTL time.Duration
 
-	mu sync.Mutex
 	m  map[cacheKey]*cacheEntry
+	mu sync.Mutex
 }
 
 type cacheKey struct {
@@ -262,8 +262,8 @@ func candKey(key string, c Candidate) cacheKey { return cacheKey{key, c.Kind, c.
 type cacheEntry struct {
 	goodUntil time.Time
 	failUntil time.Time
-	backoff   time.Duration
 	url       string // where redirects led the usable kind ("": its base)
+	backoff   time.Duration
 }
 
 // CacheOutcome is what a host learnt of a candidate (CarrierCache.Report).
@@ -857,10 +857,10 @@ func outcomeOf(err error) CandidateOutcome {
 // whose join fails, whose replacement ends before it settled, or whose
 // member fails within DropWindow of being joined counts as failed.
 type modePool struct {
-	cands []Candidate
-	auto  bool
-	p     modeParams
 	cred  CarrierCredential
+	cands []Candidate
+	p     modeParams
+	auto  bool
 }
 
 func newModePool(m CarrierChoice, pol *CarrierChoicePolicy, cred CarrierCredential) (*modePool, error) {
@@ -963,10 +963,10 @@ func (mp *modePool) dropped(i int, born time.Time) {
 // modeSeed hands MaintainPipes the pipes a session dialed by DialChoice was
 // established on, as the pool's first member, with the pool's mode.
 type modeSeed struct {
+	born  time.Time
 	mp    *modePool
 	pipes []*Pipe
 	kind  int
-	born  time.Time
 }
 
 // carrierTriesKept is the number of the latest tries that ConnectionStats

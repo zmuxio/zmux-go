@@ -24,9 +24,9 @@ const (
 
 // keyAlgInfo is one row of the KeyAlg table.
 type keyAlgInfo struct {
+	verify         func(key, message, sig []byte) bool
 	keyLen, sigLen int // sigLen 0: the algorithm does not sign
 	pq             bool
-	verify         func(key, message, sig []byte) bool
 }
 
 var keyAlgs = map[KeyAlg]keyAlgInfo{

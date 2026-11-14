@@ -33,25 +33,25 @@ import (
 // fails it at once. Carriers already serving sessions continue: they end
 // with their sessions, as other carriers do, or all at once with Close.
 type ExchangeHandler struct {
+	ctx    context.Context
 	l      *zmux.Listener
+	cancel context.CancelFunc
 	o      Options
 	p      exParams
-	ctx    context.Context
-	cancel context.CancelFunc
 	wg     sync.WaitGroup // HandlePipe goroutines
 
 	nonces *admit.ReplayFilter
 
-	mu       sync.Mutex
-	closed   bool
 	carriers map[[exCIDLen]byte]*exServer
 	gone     map[[exCIDLen]byte]*exKey
 	goneQ    []exGone // in expiry order
+	mu       sync.Mutex
+	closed   bool
 }
 
 type exGone struct {
-	cid   [exCIDLen]byte
 	until time.Time
+	cid   [exCIDLen]byte
 }
 
 // NewExchangeHandler returns a handler that serves exchange carriers

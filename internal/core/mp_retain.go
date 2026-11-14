@@ -49,10 +49,10 @@ type retained struct {
 type mpSend struct {
 	acked      rangeSet   // acknowledged byte ranges
 	resend     rangeSet   // ranges to send again
-	bind       binding    // affinity
 	rr         []rrVal    // own round-robin values
-	pick       pickAnswer // custom policy answer
 	oppSent    rangeSet   // bytes re-sent opportunistically (once each)
+	pick       pickAnswer // custom policy answer
+	bind       binding    // affinity
 	finAcked   bool
 	finResend  bool
 	pickQueued bool

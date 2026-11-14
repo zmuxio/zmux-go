@@ -36,15 +36,15 @@ const HeaderPair = httpx.FieldPair
 // carries the up direction and whose response body carries the down
 // direction. Its methods are the operations on it.
 type Streaming struct {
-	// Client sends the request (nil: http.DefaultClient).
-	Client *http.Client
-	// URL is the request target.
-	URL string
-	// Header is added to the request.
-	Header http.Header
 	// CarrierCredential is presented for the server's admission (nil:
 	// none), as the documentation of Pipe says.
 	CarrierCredential zmux.CarrierCredential
+	// Client sends the request (nil: http.DefaultClient).
+	Client *http.Client
+	// Header is added to the request.
+	Header http.Header
+	// URL is the request target.
+	URL string
 }
 
 // Pipe opens a carrier over an HTTP request: dir zmux.DirectionBidirectional sends
@@ -94,7 +94,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 	// the carrier lives until it is closed.
 	life, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	stop := context.AfterFunc(ctx, cancel)
-	call := &httpCall{done: make(chan struct{}), wrote: make(chan struct{}), up: func() { stop() }}
+	call := &httpCall{done: make(chan struct{}), up: func() { stop() }}
 	ctx = life
 	method := http.MethodPost
 	var s *upStream
@@ -111,11 +111,24 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 		var body io.ReadCloser = http.NoBody
 		var up *httpUpBody
 		if s != nil {
-			up = &httpUpBody{s: s, call: call, closed: make(chan struct{})}
+			up = &httpUpBody{s: s, call: call, closed: make(chan struct{}), wrote: make(chan struct{}), gone: make(chan struct{})}
 			body = up
 		}
 		actx, acancel := context.WithCancel(ctx)
-		actx = httptrace.WithClientTrace(actx, &httptrace.ClientTrace{WroteHeaders: call.headersWritten})
+		trace := &httptrace.ClientTrace{}
+		if up != nil {
+			trace.WroteHeaders = up.headersWritten
+		}
+		if dir == zmux.DirectionBidirectional && u.Scheme == "https" {
+			// The TLS connection the request goes out on; through a proxy
+			// an https request is tunnelled, so the TLS is the origin's.
+			trace.GotConn = func(i httptrace.GotConnInfo) {
+				if tc, ok := i.Conn.(*tls.Conn); ok && zmux.BoundTLS(tc.ConnectionState()) {
+					up.SetSecureConnection(tc)
+				}
+			}
+		}
+		actx = httptrace.WithClientTrace(actx, trace)
 		req, err := http.NewRequestWithContext(actx, method, u.String(), body)
 		if err != nil {
 			acancel()
@@ -147,6 +160,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 			prev() // the redirected request: its body is given up below
 		}
 		if s != nil {
+			call.cur.Store(up) // before setLive ends the body it replaces
 			s.setLive(up)
 		}
 		prev = acancel
@@ -215,18 +229,20 @@ type httpCall struct {
 	resp *http.Response // a 2xx response
 	err  error
 
-	// The connection a transport declared secure (CarrierBody), and
-	// the end of the wait for it: the request's headers went out.
-	conn      atomic.Pointer[zmux.ConnectionStater]
-	wrote     chan struct{}
-	wroteOnce sync.Once
+	// The request body of the current hop, which holds the connection a
+	// transport declared secure for that hop (CarrierBody) and the end
+	// of the wait for it, the hop's headers going out. A redirect
+	// replaces it, so a hop without a connection is not secure.
+	cur atomic.Pointer[httpUpBody]
 }
 
-func (c *httpCall) headersWritten() { c.wroteOnce.Do(func() { close(c.wrote) }) }
+func (b *httpUpBody) headersWritten() { b.wroteOnce.Do(func() { close(b.wrote) }) }
 
 // CarrierBody is implemented by the request body of an HTTP carrier. A
-// client transport whose connection protects the request end to end, such
-// as HTTP/3 over QUIC (zmuxh3.HTTPClient), calls SetSecureConnection with
+// bidirectional carrier on an https TLS connection of net/http's transport
+// names that connection itself. Another client transport whose connection
+// protects the request end to end, such as HTTP/3 over QUIC
+// (zmuxh3.HTTPClient), calls SetSecureConnection with
 // that connection before it writes the request's headers: the carrier then
 // declares the Bound contract (zmux.CarrierSecure) with the connection's
 // exporter, which identifies the connection, not the request stream.
@@ -265,12 +281,12 @@ type upStream struct {
 	p    *bodyPipe
 	rdMu sync.Mutex
 
+	live    *httpUpBody // under mu
+	carry   []byte      // under mu
 	mu      sync.Mutex
-	live    *httpUpBody
-	carry   []byte
-	pending bool        // no response other than a redirect yet
-	over    bool        // more than upReplayMax sent while pending: no repeat
 	direct  atomic.Bool // settled and carry drained: the live body reads p only
+	pending bool        // no response other than a redirect yet (under mu)
+	over    bool        // more than upReplayMax sent while pending: no repeat (under mu)
 }
 
 func newUpStream() *upStream {
@@ -283,6 +299,7 @@ func (s *upStream) setLive(b *httpUpBody) {
 	s.mu.Lock()
 	if s.live != nil {
 		s.live.dead.Store(true)
+		s.live.goneOnce.Do(func() { close(s.live.gone) })
 	}
 	s.live = b
 	s.mu.Unlock()
@@ -316,23 +333,29 @@ func (s *upStream) isLive(b *httpUpBody) bool {
 type httpUpBody struct {
 	s    *upStream
 	call *httpCall
-	pre  []byte // a credential's prefix, read first
-	off  int    // of s.carry sent by this body (under s.mu)
-	dead atomic.Bool
-	once sync.Once
 	// closed closes when the transport closes the body: a Read waiting
 	// on the pipe returns at once. An HTTP/2 transport's response body
 	// Close waits for the request body's writer, so a refused or
 	// redirected request's Close would otherwise wait for the carrier's
 	// next write.
 	closed chan struct{}
+	// wrote closes when this hop's request headers went out; gone, when a
+	// redirect replaced the hop.
+	wrote, gone chan struct{}
+	conn        atomic.Pointer[zmux.ConnectionStater] // this hop's secure connection
+	pre         []byte                                // a credential's prefix, read first
+	off         int                                   // of s.carry sent by this body (under s.mu)
+	once        sync.Once
+	dead        atomic.Bool
+	wroteOnce   sync.Once
+	goneOnce    sync.Once
 }
 
 // SetSecureConnection implements CarrierBody; a body a redirect
 // replaced declares nothing.
 func (b *httpUpBody) SetSecureConnection(c zmux.ConnectionStater) {
 	if c != nil && !b.dead.Load() {
-		b.call.conn.Store(&c)
+		b.conn.Store(&c)
 	}
 }
 
@@ -439,8 +462,8 @@ func (b *httpUpBody) Close() error {
 // StatusError reports that an HTTP carrier's request was answered with
 // a status other than 2xx.
 type StatusError struct {
-	StatusCode int
 	Status     string // as the response gave it, e.g. "403 Forbidden"
+	StatusCode int
 }
 
 func (e *StatusError) Error() string { return "zmux: HTTP carrier status " + e.Status }
@@ -593,26 +616,41 @@ func (w *httpReqWriter) WriteBuffers(bufs [][]byte) (int, error) {
 
 // CarrierSecure declares the Bound contract once the transport named a
 // secure connection (CarrierBody).
-func (w *httpReqWriter) CarrierSecure() bool { return w.call.conn.Load() != nil }
+func (w *httpReqWriter) CarrierSecure() bool { return w.connection() != nil }
+
+// connection is the current hop's secure connection, if it declared one.
+func (w *httpReqWriter) connection() *zmux.ConnectionStater {
+	if b := w.call.cur.Load(); b != nil {
+		return b.conn.Load()
+	}
+	return nil
+}
 
 // ConnectionState is that connection's TLS state; without one, none.
 func (w *httpReqWriter) ConnectionState() tls.ConnectionState {
-	if c := w.call.conn.Load(); c != nil {
+	if c := w.connection(); c != nil {
 		return (*c).ConnectionState()
 	}
 	return tls.ConnectionState{}
 }
 
-// HandshakeContext waits until the request's headers went out (or the
-// request ended): a transport names the connection before then.
+// HandshakeContext waits until the current hop's request headers went out
+// (or the request ended): a transport names the connection before then.
 func (w *httpReqWriter) HandshakeContext(ctx context.Context) error {
-	select {
-	case <-w.call.wrote:
-	case <-w.call.done:
-	case <-ctx.Done():
-		return context.Cause(ctx)
+	for {
+		b := w.call.cur.Load()
+		select {
+		case <-b.wrote:
+			if w.call.cur.Load() == b {
+				return nil
+			}
+		case <-b.gone: // redirected: wait for the next hop's headers
+		case <-w.call.done:
+			return nil
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
 	}
-	return nil
 }
 
 func (w *httpReqWriter) Close() error {
@@ -632,17 +670,17 @@ func (w *httpReqWriter) Abort(err error) {
 // takes, and the write returns once all of it was copied, so nothing is
 // retained and a batch costs one hand-over instead of one per buffer.
 type bodyPipe struct {
-	wrMu sync.Mutex // serializes writes; guards one
-	one  [1][]byte  // a plain Write's buffer
-	bufs [][]byte   // what is left of the write; the reader's while it holds a turn
 	wrCh chan struct{}
 	rdCh chan int // bytes copied in a turn
-	once sync.Once
 	done chan struct{}
+	one  [1][]byte // a plain Write's buffer
+	bufs [][]byte  // what is left of the write; the reader's while it holds a turn
+	once sync.Once
+	wrMu sync.Mutex // serializes writes; guards one
 
-	emu  sync.Mutex
 	rerr error // the read side's close error
 	werr error // the write side's close error
+	emu  sync.Mutex
 }
 
 func newBodyPipe() *bodyPipe {
@@ -870,10 +908,10 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = rc.EnableFullDuplex()
 		body = &httpReqBody{b: r.Body, rc: rc, life: life}
-		if r.ProtoMajor == 3 && r.TLS != nil && r.TLS.HandshakeComplete {
-			// This process ended the request's QUIC connection, which
-			// protects the stream end to end: the carrier declares the
-			// Bound contract, its Binding from the connection's exporter.
+		if r.TLS != nil && zmux.BoundTLS(*r.TLS) {
+			// This process terminates the request's TLS (or QUIC)
+			// connection: the carrier declares the Bound contract, its
+			// Binding from the connection's exporter.
 			body.tls = r.TLS
 		}
 		p.R = body
@@ -914,14 +952,14 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // httpRespWriter is the response body as the sending half of a pipe; every
 // write, and every batch as a whole, is flushed.
 type httpRespWriter struct {
-	mu      sync.Mutex
 	w       http.ResponseWriter
 	rc      *http.ResponseController
+	life    *httpLife
+	mu      sync.Mutex
 	closed  bool
 	written bool // the response header went out
 	close   bool // Connection: close
 	stopped bool // the receiver was stopped (under chMu)
-	life    *httpLife
 
 	// The request stream's datagram channel: its provider (under mu), and
 	// the channel once the header went out. The receiver's state has a
@@ -929,9 +967,9 @@ type httpRespWriter struct {
 	// receiver under its own lock never waits for a blocked write.
 	chp     DatagramProvider
 	ch      atomic.Pointer[zmux.DatagramChannel]
-	chMu    sync.Mutex
 	deliver func([]byte) // a receiver waiting for the channel (under chMu)
 	chStop  func()       // the receiver's stop (under chMu)
+	chMu    sync.Mutex
 }
 
 // start writes the response header, once; under mu or after the pipe ended.
@@ -1037,8 +1075,8 @@ type httpReqBody struct {
 	life *httpLife
 	tls  *tls.ConnectionState // the request's QUIC connection (HTTP/3)
 
-	mu    sync.Mutex
 	read  []byte
+	mu    sync.Mutex
 	taken bool // the listener took the carrier, or read past the bound
 	ended bool // the body hit its end: net/http now reads the connection itself
 }
@@ -1058,7 +1096,7 @@ func (r *httpReqBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// CarrierSecure declares the Bound contract on an HTTP/3 request.
+// CarrierSecure declares the Bound contract on a request whose TLS this process terminates.
 func (r *httpReqBody) CarrierSecure() bool { return r.tls != nil }
 
 // ConnectionState is that connection's TLS state; otherwise none.

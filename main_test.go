@@ -15,8 +15,8 @@ import (
 // flight records the last seconds of the execution trace of the whole
 // test binary, for tests to write out when they fail (WriteFlightTrace).
 var flight struct {
-	sync.Mutex // one WriteTo at a time
 	fr         *trace.FlightRecorder
+	sync.Mutex // one WriteTo at a time
 }
 
 // TestMain starts the flight recorder and fails the binary on goroutines

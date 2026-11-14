@@ -133,27 +133,27 @@ func TestTraces(t *testing.T) {
 }
 
 type rlane struct {
+	closed  string // "", "graceful", "abort"
 	in      []byte // unconsumed inbound bytes
 	frames  []map[string]any
 	first   []map[string]any
 	recIdx  []int
 	recs    int
 	written uint64
-	closed  string // "", "graceful", "abort"
 }
 
 type rpipe struct {
-	id       uint64
 	lanes    map[uint64]*rlane
-	framing  core.Framing
+	acc      *join.Acceptor
+	hello    []byte
+	replyIn  []byte
+	id       uint64
 	in, out  bool
+	framing  core.Framing
 	writable bool
 	// A local join: joining until the Reply; hello holds what JoinHello wrote and
 	// acc reads it as the peer (Hello last read).
 	joining bool
-	hello   []byte
-	acc     *join.Acceptor
-	replyIn []byte
 }
 
 func (p *rpipe) lane(l uint64) *rlane {

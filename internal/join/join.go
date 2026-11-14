@@ -145,8 +145,8 @@ func freshEntropy(s *Suite) (Entropy, error) {
 
 // KeyShare is a key share item: a Group and the share of the sender's role.
 type KeyShare struct {
-	Group uint64
 	Share []byte
+	Group uint64
 }
 
 // appendKeyShare appends the item; a zero Group, which no sender uses, omits it
@@ -191,11 +191,11 @@ type Pipe struct {
 
 // HelloPayload is the content of a Hello.
 type HelloPayload struct {
-	Pipe Pipe
 	// FirstBatch is the encoded frames of the first batch, opaque here.
 	FirstBatch []byte
 	// KeyShare is the joiner's share; the Joiner writes its own.
 	KeyShare KeyShare
+	Pipe     Pipe
 	// Padding is the length of an ignorable padding item; 0 omits it unless
 	// PadEmpty asks for an item with no value.
 	Padding  int
@@ -379,14 +379,14 @@ func parseReplyPayload(b []byte, group uint64) (ReplyPayload, error) {
 
 // Hello is a parsed Join Hello. Its fields alias the parsed bytes.
 type Hello struct {
-	Suite *Suite
-	Mode  Mode
-	// Phase is the key phase, e mod 2 of the joiner's epoch.
-	Phase      uint8
+	Suite      *Suite
 	Locator    []byte
 	R          []byte
 	Ciphertext []byte
 	clear      []byte
+	Mode       Mode
+	// Phase is the key phase, e mod 2 of the joiner's epoch.
+	Phase uint8
 }
 
 // ParseHello parses the Join Hello at the start of b and returns the bytes it
@@ -509,10 +509,10 @@ type Secrets struct {
 
 type schedule struct {
 	suite *Suite
+	sec   Secrets
+	psk   []byte
 	mode  Mode
 	f     Framing
-	psk   []byte
-	sec   Secrets
 }
 
 func (c *schedule) h(parts ...[]byte) []byte {
@@ -627,16 +627,16 @@ func (c *schedule) result(joiner bool) *Result {
 type JoinerConfig struct {
 	Suite *Suite
 	// Group is the key exchange, one usable in the session.
-	Group *Group
-	Mode  Mode
-	// Phase is the key phase of the epoch whose PSK this is: 0 or 1.
-	Phase   uint8
-	Framing Framing
+	Group   *Group
 	Locator []byte
 	// PSK is the join PSK of the local role in the session.
 	PSK []byte
 	// Binding is present exactly in Bound.
 	Binding []byte
+	Mode    Mode
+	// Phase is the key phase of the epoch whose PSK this is: 0 or 1.
+	Phase   uint8
+	Framing Framing
 }
 
 type joinerState uint8
@@ -652,14 +652,14 @@ const (
 // Joiner is the joiner's state machine: Pending, HelloSent, Proven, Active. It
 // is not safe for concurrent use.
 type Joiner struct {
-	c       schedule
-	cfg     JoinerConfig
+	err     error
 	entropy *Entropy // nil takes fresh entropy at the write
 	offer   *Offer
-	helloCT []byte
-	state   joinerState
-	err     error
 	result  *Result
+	helloCT []byte
+	c       schedule
+	cfg     JoinerConfig
+	state   joinerState
 }
 
 // NewJoiner starts a Join; its R is made fresh when the Hello is written.
@@ -882,15 +882,15 @@ const (
 // Acceptor is the acceptor's state machine: Unconfirmed, then Confirmed. It is
 // not safe for concurrent use.
 type Acceptor struct {
-	c       schedule
+	err     error
 	group   *Group
+	result  *Result
 	share   []byte // the joiner's, until Exchange
 	reply   []byte // this end's share, after Exchange
 	ss      [][]byte
 	helloCT []byte
+	c       schedule
 	state   acceptorState
-	err     error
-	result  *Result
 }
 
 // Accept opens a parsed Hello with the join PSK of the joiner's role and the

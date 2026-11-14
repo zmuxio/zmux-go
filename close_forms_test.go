@@ -188,9 +188,9 @@ func TestDone(t *testing.T) {
 // though its carrier takes the bytes.
 type holdReads struct {
 	net.Conn
-	stall  atomic.Bool
-	once   sync.Once
 	closed chan struct{}
+	once   sync.Once
+	stall  atomic.Bool
 }
 
 func (h *holdReads) Read(b []byte) (int, error) {
@@ -312,9 +312,9 @@ func TestCloseDeliveryByteStream(t *testing.T) {
 // codeConn records the close codes zmux passes to it.
 type codeConn struct {
 	net.Conn
-	mu     sync.Mutex
-	code   ApplicationErrorCode
 	reason string
+	code   ApplicationErrorCode
+	mu     sync.Mutex
 }
 
 func (c *codeConn) RecordCloseCode(code ApplicationErrorCode, reason string) {

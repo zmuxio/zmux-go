@@ -13,13 +13,13 @@ import (
 )
 
 type corpusEntry struct {
+	Limits        map[string]uint64 `json:"limits"`
 	ID            string            `json:"id"`
 	Kind          string            `json:"kind"`
-	Gates         []string          `json:"gates"`
 	Hex           string            `json:"hex"`
-	Messages      []string          `json:"messages"`
 	Error         string            `json:"error"`
-	Limits        map[string]uint64 `json:"limits"`
+	Gates         []string          `json:"gates"`
+	Messages      []string          `json:"messages"`
 	MaxRecordSize uint64            `json:"max_record_size"`
 	NonMinimal    bool              `json:"non_minimal"`
 }

@@ -21,11 +21,11 @@ import (
 // dropMin bytes when armed.
 type lossyRelay struct {
 	ln, up  *net.UDPConn
+	client  atomic.Pointer[net.UDPAddr]
 	delay   time.Duration
 	dropMin int
 	drop    atomic.Int32 // packets still to drop
 	dropped atomic.Int32
-	client  atomic.Pointer[net.UDPAddr]
 }
 
 func newLossyRelay(t *testing.T, server string, delay time.Duration) *lossyRelay {

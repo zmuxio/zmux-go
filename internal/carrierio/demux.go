@@ -15,9 +15,9 @@ import (
 // Register. The pipes may belong to several sessions. The zero value is
 // ready to use.
 type ChannelDemux struct {
-	mu      sync.Mutex
 	pipes   map[uint64]*channelSink
 	dropped atomic.Uint64
+	mu      sync.Mutex
 }
 
 type channelSink struct{ deliver func([]byte) }

@@ -24,8 +24,8 @@ const key = 0x5a
 // carrier's first write.
 type recConn struct {
 	net.Conn
-	mu     sync.Mutex
 	writes [][]byte
+	mu     sync.Mutex
 }
 
 func (c *recConn) Write(b []byte) (int, error) {

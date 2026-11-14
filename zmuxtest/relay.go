@@ -13,6 +13,10 @@ import (
 // RelayOptions are the behaviour of a Relay toward the connections it
 // relays, as intermediaries on a path behave.
 type RelayOptions struct {
+	// OnData, when set, is called for every chunk relayed: the
+	// connection's number (from 1, in accept order), its direction (up:
+	// from the client) and its size.
+	OnData func(conn int, up bool, n int)
 	// IdleCut ends a connection that carried no byte in either direction
 	// for this long, as a NAT mapping or a load balancer's idle limit
 	// (zero: never).
@@ -21,10 +25,6 @@ type RelayOptions struct {
 	// not, as a load balancer's limit on a connection's duration (zero:
 	// never).
 	MaxAge time.Duration
-	// OnData, when set, is called for every chunk relayed: the
-	// connection's number (from 1, in accept order), its direction (up:
-	// from the client) and its size.
-	OnData func(conn int, up bool, n int)
 }
 
 // Relay is a TCP relay from a local listener to a target address for
@@ -33,29 +33,29 @@ type RelayOptions struct {
 // black hole), refuses new connections, or cuts the current ones.
 type Relay struct {
 	o    RelayOptions
-	dial func(context.Context) (net.Conn, error)
 	ln   net.Listener
+	dial func(context.Context) (net.Conn, error)
 	wg   sync.WaitGroup
 
-	mu      sync.Mutex
 	conns   map[*relayConn]struct{}
-	refuse  bool
-	closed  bool
+	quit    chan struct{}
 	n       int
 	cuts    atomic.Int64
 	refused atomic.Int64
-	quit    chan struct{}
+	mu      sync.Mutex
+	refuse  bool
+	closed  bool
 }
 
 type relayConn struct {
-	id     int
 	c, u   net.Conn
 	born   time.Time
+	done   chan struct{}
+	id     int
 	last   atomic.Int64 // UnixNano of the last relayed byte
+	once   sync.Once
 	dropUp atomic.Bool
 	dropDn atomic.Bool
-	once   sync.Once
-	done   chan struct{}
 }
 
 // NewRelay listens on 127.0.0.1 and relays each accepted connection to

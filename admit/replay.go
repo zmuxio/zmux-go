@@ -41,16 +41,16 @@ func (v ReplayVerdict) String() string {
 
 // ReplayConfig configures a ReplayFilter.
 type ReplayConfig struct {
-	// Window is how far a stamp may be from the clock (> 0).
-	Window time.Duration
-	// Max bounds the keys held (> 0).
-	Max int
 	// NotBefore rejects stamps before it (ReplayOutside), such as the
 	// process start, so that what was sent to an earlier process with an
 	// empty filter is not accepted again; zero: none.
 	NotBefore time.Time
 	// Clock is the filter's clock; nil: the host clock.
 	Clock timeshim.Clock
+	// Window is how far a stamp may be from the clock (> 0).
+	Window time.Duration
+	// Max bounds the keys held (> 0).
+	Max int
 }
 
 // ReplayFilter remembers keys for a window of time so that each is
@@ -67,23 +67,23 @@ type ReplayConfig struct {
 // keys let anyone fill the filter (ReplayFull) and so refuse every honest
 // key until the window passes.
 type ReplayFilter struct {
+	clk       timeshim.Clock
+	seeds     [2]maphash.Seed
 	window    int64 // ms
 	width     int64 // ms per bucket
 	max       int
 	notBefore int64 // Unix ms; 0: none
-	clk       timeshim.Clock
-	seeds     [2]maphash.Seed
 
-	mu sync.Mutex
-	n  int
 	b  []replayBucket
+	n  int
+	mu sync.Mutex
 }
 
 type replayKey [2]uint64
 
 type replayBucket struct {
-	idx int64
 	m   map[replayKey]struct{}
+	idx int64
 }
 
 // NewReplayFilter returns a filter for c; an invalid c is an

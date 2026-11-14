@@ -22,11 +22,11 @@ type handle struct {
 	// orphanNext links the handle into Conn.orphans once it was collected
 	// unclosed; written before the push publishes it.
 	orphanNext *handle
-	rsig       core.Signal // lazy: its channel is made by the first wait
+	dl         atomic.Pointer[deadlines] // nil until a deadline is set
+	rsig       core.Signal               // lazy: its channel is made by the first wait
 	wsig       core.Signal
 	rmu        sync.Mutex
 	wmu        sync.Mutex
-	dl         atomic.Pointer[deadlines] // nil until a deadline is set
 
 	// Guarded by the session lock.
 	sendDone, recvDone, released bool

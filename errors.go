@@ -25,6 +25,7 @@ const (
 	StreamCancelled     StreamErrorCode = 0x5a4d0001
 	StreamRejected      StreamErrorCode = 0x5a4d0002
 	StreamCarrierFailed StreamErrorCode = 0x5a4d0003
+	StreamPacketError   StreamErrorCode = 0x5a4d0004
 )
 
 // Transport error codes.
@@ -52,9 +53,9 @@ func (c TransportErrorCode) String() string { return wire.TransportErrorName(uin
 // ApplicationError is a session closed by an application (CONNECTION_CLOSE
 // 0x1d).
 type ApplicationError struct {
-	Remote       bool
-	ErrorCode    ApplicationErrorCode
 	ErrorMessage string
+	ErrorCode    ApplicationErrorCode
+	Remote       bool
 }
 
 // Error describes the close.
@@ -67,12 +68,12 @@ func (e *ApplicationError) Is(t error) bool { return t == net.ErrClosed }
 
 // TransportError is a session closed for a protocol error (0x1c).
 type TransportError struct {
-	Remote       bool
-	ErrorCode    TransportErrorCode
-	FrameType    uint64
 	ErrorMessage string
 	// Details are the key=value pairs of the diagnostic line.
-	Details string
+	Details   string
+	ErrorCode TransportErrorCode
+	FrameType uint64
+	Remote    bool
 }
 
 // Error describes the close.

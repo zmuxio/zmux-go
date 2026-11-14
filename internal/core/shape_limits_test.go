@@ -9,8 +9,8 @@ import (
 
 // injectShaper asks for one injection of n frame bytes when installed.
 type injectShaper struct {
-	n        int
 	injected []int
+	n        int
 }
 
 func (x *injectShaper) Capabilities() shaping.Caps                    { return 0 }

@@ -20,8 +20,8 @@ type Proof = proto.Proof
 
 // Principal is whom a verdict names. It does not change when the node's key does.
 type Principal struct {
-	Type  uint16
 	Bytes []byte
+	Type  uint16
 }
 
 // PrincipalNodeKey is a node named by its pinned static key's KeyId.
@@ -29,33 +29,33 @@ const PrincipalNodeKey uint16 = 1
 
 // VerifyInput is everything an Anchor judges a peer by.
 type VerifyInput struct {
-	// Role is the role expected of the peer: zmux.RoleServer when a client
-	// verifies its server, zmux.RoleClient when a server verifies its
-	// client.
-	Role zmux.Role
-	// Profile is the handshake's.
-	Profile proto.Profile
+	// LocalContext is the host's label of the configuration that runs the
+	// handshake (ClientConfig.LocalContext, ServerConfig.LocalContext).
+	LocalContext any
+	// Credential is the peer's credential, nil when its message had none.
+	Credential *Credential
 	// PeerStatic is the peer's static key.
 	PeerStatic []byte
 	// PSKIdentity is the Handle of the handshake's pre-shared key, nil in a
 	// Profile without one.
 	PSKIdentity []byte
-	// Credential is the peer's credential, nil when its message had none.
-	Credential *Credential
 	// PeerAppData is the application data the peer has sent so far, in
 	// message order; each piece states its message and protection.
 	PeerAppData []AppData
-	// LocalContext is the host's label of the configuration that runs the
-	// handshake (ClientConfig.LocalContext, ServerConfig.LocalContext).
-	LocalContext any
+	// Profile is the handshake's.
+	Profile proto.Profile
+	// Role is the role expected of the peer: zmux.RoleServer when a client
+	// verifies its server, zmux.RoleClient when a server verifies its
+	// client.
+	Role zmux.Role
 }
 
 // AppData is application handshake data of one message: opaque bytes, with
 // the message that carried them and what that message protects.
 type AppData struct {
+	Data []byte
 	// Message is 1, 2 or 3.
 	Message int
-	Data    []byte
 	// ForwardSecret: the data is encrypted under keys with forward secrecy.
 	// Message 1 (Profiles 1 and 3 only) is under the pre-shared key alone: an
 	// eavesdropper who later learns the key reads it, and it can be replayed
@@ -93,9 +93,9 @@ func authenticated(d []AppData) {
 // a client chooses its data by who the server is; it is nil for messages 1
 // and 2, and for message 3 under AllowPSKOnly, where no Anchor judges.
 type AppDataRequest struct {
-	Message int
 	Peer    *VerifyInput
 	Verdict *VerifyVerdict
+	Message int
 }
 
 // AppDataSource supplies the application data of the messages an end sends: a
@@ -106,13 +106,13 @@ type AppDataSource func(ctx context.Context, r AppDataRequest) ([]byte, error)
 
 // VerifyVerdict is the judgement of a peer that passed.
 type VerifyVerdict struct {
-	Principal Principal
+	// Value is the Anchor's own result, for the host.
+	Value any
 	// ProofKey, when set, is the KeyId of the key whose transcript signature
 	// the message must carry: the handshake fails without a signature that
 	// verifies with it.
-	ProofKey *proto.KeyID
-	// Value is the Anchor's own result, for the host.
-	Value any
+	ProofKey  *proto.KeyID
+	Principal Principal
 }
 
 // Anchor judges the peer in one call. It does not see the transcript: the
@@ -167,8 +167,8 @@ func NodeKeyID(pub []byte) proto.KeyID {
 
 // Pin is the anchor of PinAnchor.
 type Pin struct {
-	node  proto.KeyID
 	proof *proto.KeyID
+	node  proto.KeyID
 }
 
 // PinAnchor trusts the one X25519 key with this KeyId, the key itself with no

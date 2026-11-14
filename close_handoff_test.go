@@ -108,9 +108,9 @@ func closeExitChild(addr string) {
 // stallConn blocks its writes while stalled, until it is closed.
 type stallConn struct {
 	net.Conn
-	stall  atomic.Bool
-	once   sync.Once
 	closed chan struct{}
+	once   sync.Once
+	stall  atomic.Bool
 }
 
 func (s *stallConn) Write(b []byte) (int, error) {
@@ -401,8 +401,8 @@ func closeUnderPeerWrites(t *testing.T, round int) {
 // like a TLS close_notify behind a full send buffer.
 type stuckCloseWrite struct {
 	net.Conn
-	once   sync.Once
 	closed chan struct{}
+	once   sync.Once
 }
 
 func (s *stuckCloseWrite) CloseWrite() error {
@@ -418,9 +418,9 @@ func (s *stuckCloseWrite) Close() error {
 // stallReads blocks its reads while stalled, until it is closed.
 type stallReads struct {
 	net.Conn
-	stall  atomic.Bool
-	once   sync.Once
 	closed chan struct{}
+	once   sync.Once
+	stall  atomic.Bool
 }
 
 func (s *stallReads) Read(b []byte) (int, error) {

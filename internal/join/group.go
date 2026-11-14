@@ -23,14 +23,14 @@ const x25519Len = 32
 
 // Group is one row of the key exchange table of Join and of session epochs.
 type Group struct {
-	ID   uint64
 	Name string
-	// Priority is the order of the table, higher preferred.
-	Priority int
 	// ShareI and ShareR are the share lengths of the initiator (the joiner or
 	// the offering end) and of the responder.
 	ShareI, ShareR int
-	kem            bool
+	ID             uint64
+	// Priority is the order of the table, higher preferred.
+	Priority int
+	kem      bool
 }
 
 var groups = map[uint64]*Group{
@@ -71,9 +71,9 @@ func DefaultJoinGroup(usable []uint64) *Group {
 // system. X25519 is the private scalar, KEMSeed the ML-KEM seed d ‖ z of an
 // initiator, and Encaps an encapsulation with fixed randomness at a responder.
 type GroupRand struct {
+	Encaps  func(ek *mlkem.EncapsulationKey768) (ss, ct []byte, err error)
 	X25519  []byte
 	KEMSeed []byte
-	Encaps  func(ek *mlkem.EncapsulationKey768) (ss, ct []byte, err error)
 }
 
 // Offer is the initiator's half of one exchange. Its private values serve one

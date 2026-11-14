@@ -911,9 +911,9 @@ func (lateTimer) Reset(time.Duration) bool { return false }
 
 // deadlineWriter records the read deadlines set on a response.
 type deadlineWriter struct {
-	http.ResponseWriter
-	mu   sync.Mutex
 	last time.Time
+	http.ResponseWriter
+	mu sync.Mutex
 }
 
 func (w *deadlineWriter) SetReadDeadline(t time.Time) error {

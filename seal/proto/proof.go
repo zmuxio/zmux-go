@@ -45,10 +45,10 @@ func CheckProof(proofKey *KeyID, p *Proof, requirePQ bool) (pq bool, err error) 
 
 // Proof is the transcript signature of a handshake message: Sig by the key Pub of KeyAlg Alg over Message, which is M.
 type Proof struct {
-	Alg     KeyAlg
 	Pub     []byte
 	Sig     []byte
 	Message []byte
+	Alg     KeyAlg
 }
 
 // VerifyProof checks a proof against the proof key named by want: the KeyId of
@@ -80,9 +80,9 @@ func verifyMLDSA44(pub, message, sig []byte) bool {
 
 // SigningKey is a key of a transcript signature.
 type SigningKey struct {
-	alg KeyAlg
 	ml  *mldsa.PrivateKey
 	pub []byte
+	alg KeyAlg
 	// deterministic signs with rnd of zero bytes, for vectors only.
 	deterministic bool
 }

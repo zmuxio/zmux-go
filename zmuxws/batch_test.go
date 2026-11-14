@@ -17,8 +17,8 @@ import (
 // countConn records the writes to a connection.
 type countConn struct {
 	net.Conn
-	mu     sync.Mutex
 	writes [][]byte
+	mu     sync.Mutex
 }
 
 func (c *countConn) Write(p []byte) (int, error) {

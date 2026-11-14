@@ -192,12 +192,12 @@ func terminal(k EventKind) bool { return k == EventPipeFailed || k == EventPipeC
 // so the queue stays bounded however many pipes
 // a session goes through.
 type eventQueue struct {
-	q       []Event
-	waiters []*core.Signal
 	seenOut map[uint64]core.OutState
 	dirs    map[uint64]uint8 // per pipe: dirInSeen, dirInEnded, dirOutEnded
-	dropped uint64           // non-terminal events dropped and not yet in a summary
-	fresh   []Event          // events added in this drain, for the tracer
+	q       []Event
+	waiters []*core.Signal
+	fresh   []Event // events added in this drain, for the tracer
+	dropped uint64  // non-terminal events dropped and not yet in a summary
 }
 
 const eventQueueMax = 1024

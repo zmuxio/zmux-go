@@ -150,9 +150,9 @@ func TestStreamPipeLocalOpen(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	type res struct {
+		err  error
 		c    *Conn
 		info []byte
-		err  error
 	}
 	srv := make(chan res, 1)
 	go func() {

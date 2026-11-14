@@ -199,9 +199,9 @@ func TestShapingPadPlacement(t *testing.T) {
 // record_out: state 0 pads to 768 after a delay and sets a wake time on its
 // first plan, state 1 pads to 300. The wake only arrives as an event.
 type stateShaper struct {
+	seqs  []uint64 // RecordView.Seq of each Plan call
 	state int
 	armed bool
-	seqs  []uint64 // RecordView.Seq of each Plan call
 }
 
 func (x *stateShaper) Capabilities() shaping.Caps { return shaping.CapPlan }

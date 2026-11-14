@@ -248,23 +248,23 @@ var atkPSK = bytes.Repeat([]byte{0x5a}, 32)
 // exCfg holds the settings of both ends of an exchange carrier in one
 // value, as the tests of one carrier use them.
 type exCfg struct {
-	PSK                        []byte
-	AllowInsecure, Base64      bool
-	UpPieceSize, DownPieceSize int64
-	CacheBust                  zmux.Switch
-	testSkipResponseMAC        bool
 	Header                     http.Header
 	DownURL, Instance          string
 	NonceParam                 string
+	PSK                        []byte
+	UpPieceSize, DownPieceSize int64
 	DownRequests, UpRequests   int
 	RequestTimeout, Deadline   time.Duration
 	BackoffMin, BackoffMax     time.Duration
 	HoldTime, Coalesce         time.Duration
+	IdleTimeout, GoneMemory    time.Duration
 	DownWindow                 int
 	UpStoreLimit               int64
-	IdleTimeout, GoneMemory    time.Duration
 	MaxClockSkew               time.Duration
 	NonceCacheSize             int
+	AllowInsecure, Base64      bool
+	CacheBust                  zmux.Switch
+	testSkipResponseMAC        bool
 }
 
 func (x *exCfg) config() ExchangeConfig {

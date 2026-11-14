@@ -18,8 +18,8 @@ import (
 
 type writesConn struct {
 	net.Conn
-	mu sync.Mutex
 	n  []int
+	mu sync.Mutex
 }
 
 func (c *writesConn) Write(b []byte) (int, error) {

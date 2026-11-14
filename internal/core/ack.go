@@ -33,21 +33,21 @@ type ackState struct {
 // in send order across its lanes: estimates and
 // detection use its cumulative acknowledgement point.
 type pipeSend struct {
-	so          uint64   // send-order number of the next byte
-	cum         uint64   // cumulative acknowledgement point
-	samples     []sample // per ack-eliciting batch in flight (ends in send order)
-	delivered   uint64
-	deliveredAt Time
-	firstSentAt Time
-	rtt         rttEst // single-pipe sessions; multipath uses the attachment's
-	re          rateEst
-	rttAt       Time   // last RTT sample
-	elicitEnd   uint64 // send order after the last ack-eliciting byte
+	lim     *limiter // carrier queue limiter; nil when not paced
+	samples []sample // per ack-eliciting batch in flight (ends in send order)
+	re      rateEst
+	rtt     rttEst // single-pipe sessions; multipath uses the attachment's
 	// The send time of the last batch an earlier advance acknowledged, and
 	// when that advance arrived (paced).
 	prevSent, prevAckAt Time
+	so                  uint64 // send-order number of the next byte
+	cum                 uint64 // cumulative acknowledgement point
+	delivered           uint64
+	deliveredAt         Time
+	firstSentAt         Time
+	rttAt               Time   // last RTT sample
+	elicitEnd           uint64 // send order after the last ack-eliciting byte
 	prevOK              bool
-	lim                 *limiter // carrier queue limiter; nil when not paced
 }
 
 // sendSeg maps lane positions [pos, end) to send order from so.
@@ -60,13 +60,14 @@ type sample struct {
 	deliveredAt Time
 	firstSentAt Time
 	epoch       uint64    // rateEst.blockEpoch at send
-	bubble      bool      // sent while an application-limited bubble was in flight
 	ahead       aheadSnap // when it was handed over
 	// The batch carries the PIPE_PING sent because the pipe became suspect
 	// (MULTIPATH.md Section 7.2 step 3): its RTT sample is taken despite a
 	// suspicion since its sending when the path delivered it at its own
 	// pace (paced).
 	probe bool
+	// sent while an application-limited bubble was in flight
+	bubble bool
 }
 
 // rttEst is RFC 9002 Section 5 with a 300 s minimum filter.

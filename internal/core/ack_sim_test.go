@@ -22,10 +22,10 @@ import (
 // simLink is one direction of a carrier on a virtual clock: a serialising
 // bottleneck of rate bytes per second, then a fixed delay.
 type simLink struct {
+	q     []simMsg
 	rate  float64
 	delay Duration
 	free  Time // when the bottleneck finishes what it holds
-	q     []simMsg
 	// jitter: each message's delay gains a uniform extra in [0, jitter),
 	// order kept.
 	jitter Duration
@@ -45,8 +45,8 @@ func (l *simLink) extra() Duration {
 }
 
 type simMsg struct {
-	at   Time
 	data []byte
+	at   Time
 }
 
 func (l *simLink) send(now Time, b []byte) {

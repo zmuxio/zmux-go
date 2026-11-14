@@ -17,9 +17,9 @@ import (
 
 // laneOut is the lane state of an outbound pipe.
 type laneOut struct {
-	next      uint64 // next lane number
 	pending   *outLane
 	copyLane  *outLane // the copy lane, nil when none
+	next      uint64   // next lane number
 	offered   bool     // the carrier offers lanes
 	requested bool     // a lane open is pending at the driver
 	refused   bool

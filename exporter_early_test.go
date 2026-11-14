@@ -15,11 +15,11 @@ import (
 // exporter errors until its handshake completes.
 type earlyExporterConn struct {
 	net.Conn
-	mu       sync.Mutex
+	startErr error
 	done     chan struct{}
 	failed   chan struct{}
+	mu       sync.Mutex
 	complete bool
-	startErr error
 }
 
 func (c *earlyExporterConn) startErrIs(target error) bool {

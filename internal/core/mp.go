@@ -193,6 +193,15 @@ type attach struct {
 	peerStandby bool
 	recvStandby bool
 	takeover    bool
+	// The flags of the Scheduler and Reinjection hold groups sit here, so
+	// that all the flags pack into whole words.
+	wasSuspect  bool
+	reval       bool // awaiting revalidation
+	revalPing   bool // its PIPE_PING is still to be written
+	needPing    bool // a PIPE_PING is owed on this pipe
+	placedSet   bool
+	penalized   bool // opportunistic penalization: no new data until penaltyEnd is acknowledged
+	held1       bool
 	sendPrio    *uint64
 	sendStandby *bool
 	peerPrio    uint64
@@ -215,16 +224,9 @@ type attach struct {
 	selfCopyQ  []*copyRec // copies for p's own copy lane (a single-pipe tier)
 	idleArm    uint64     // bytes of the idle copy left
 	placedFrom uint64
-	wasSuspect bool
-	reval      bool // awaiting revalidation
-	revalPing  bool // its PIPE_PING is still to be written
-	needPing   bool // a PIPE_PING is owed on this pipe
-	placedSet  bool
 
 	// Reinjection hold: a new pipe reinjects one chunk until
 	// the first PIPE_ACK after it became live, or one smoothed RTT.
-	penalized  bool // opportunistic penalization: no new data until penaltyEnd is acknowledged
-	held1      bool
 	penaltyEnd uint64
 	holdUntil  Time
 	holdSent   uint64

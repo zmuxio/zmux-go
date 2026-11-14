@@ -38,8 +38,8 @@ func rawCarrier(base, lower zmux.PipeIO, mode zmux.RecordMode, exp *resultExport
 // rawCommon is what both halves report.
 type rawCommon struct {
 	exp  *resultExporter
-	mode zmux.RecordMode
 	base zmux.PipeIO
+	mode zmux.RecordMode
 }
 
 func (c *rawCommon) RecordMode() zmux.RecordMode { return c.mode }

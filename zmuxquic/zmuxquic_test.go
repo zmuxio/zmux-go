@@ -89,8 +89,8 @@ func newEnvQUIC(t testing.TB, address string, scfg *zmux.Config, qconf *quic.Con
 // arrive (a test's relay drops it).
 type trackedListener struct {
 	ConnListener
-	mu    sync.Mutex
 	conns []*quic.Conn
+	mu    sync.Mutex
 }
 
 func (l *trackedListener) Accept(ctx context.Context) (*quic.Conn, error) {

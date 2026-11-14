@@ -46,17 +46,17 @@ func (b *block) unref() {
 // sendQ holds the retained bytes of a sending part, [base, end), as slices
 // of pooled blocks or owned small buffers.
 type sendQ struct {
+	tail *block
 	segs []seg // a window of arr
 	arr  []seg // the segment array, reused as the window moves on
-	tail *block
 	base uint64
 	end  uint64
 }
 
 type seg struct {
-	b   []byte
 	blk *block // a pooled block, or nil
 	rb  *Buf   // a received buffer passed on without a copy (WriteChunk), or nil
+	b   []byte
 }
 
 // pin keeps the memory of a frame's data alive while a batch references

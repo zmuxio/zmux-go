@@ -26,13 +26,14 @@ const (
 	DefaultProbeJitter = core.DefaultProbeJitter
 	// DefaultJoinTimeout is the default Config.JoinTimeout.
 	DefaultJoinTimeout = time.Duration(core.DefaultHandshakeTimeout)
-	// DefaultMinBackoff, DefaultMaxBackoff and DefaultBackoffJitter are the
-	// defaults of Backoff, the redial backoff of the Redial hook
-	// (Config.RedialBackoff) and of each pool (PipePool.Backoff): the wait
-	// starts at the minimum and doubles up to the maximum, each wait
-	// reduced by a random fraction of up to the jitter.
-	DefaultMinBackoff    = time.Second
-	DefaultMaxBackoff    = 60 * time.Second
+	// DefaultMinBackoff is the default Backoff.Min, the first wait of the
+	// redial backoff of the Redial hook (Config.RedialBackoff) and of each
+	// pool (PipePool.Backoff); each wait doubles up to the maximum.
+	DefaultMinBackoff = time.Second
+	// DefaultMaxBackoff is the default Backoff.Max, the longest wait.
+	DefaultMaxBackoff = 60 * time.Second
+	// DefaultBackoffJitter is the default Backoff.Jitter: each wait is
+	// reduced by a random fraction of up to it.
 	DefaultBackoffJitter = 0.2
 )
 
@@ -81,6 +82,14 @@ type Config struct {
 	EpochJoins          int
 	EpochAfterFirstPipe Switch
 	EpochAfterResume    Switch
+	// EnableDatagrams announces max_datagram_frame_size and datagram flows.
+	EnableDatagrams bool
+	// ShapingPreciseTimer meets shaping deadlines in place: the session's
+	// timer is armed ahead by the host timer's observed lateness, at most
+	// 2 ms, and its callback yields in a loop until the deadline, which costs
+	// CPU time up to that lead on one goroutine per deadline. Off: deadlines
+	// are met as the host timer allows.
+	ShapingPreciseTimer bool
 	// MaxIdleTimeout is max_idle_timeout, the time without inbound
 	// activity after which the session closes. Zero is 30 s; a negative
 	// value announces no idle timeout; a positive one is at least 1 ms.
@@ -121,8 +130,6 @@ type Config struct {
 	// value grants none; otherwise at most MaxStreamCredit.
 	MaxIncomingUniStreams int64
 
-	// EnableDatagrams announces max_datagram_frame_size and datagram flows.
-	EnableDatagrams bool
 	// DatagramSendQueue, DatagramReceiveQueue, DatagramStreamQueue (per
 	// stream) and DatagramReceiveBytes size the datagram queues. Zero is
 	// 64, 128, 32 and 1 MiB (an empty queue would drop every datagram); a
@@ -185,12 +192,6 @@ type Config struct {
 	// HandshakeShaper is asked for the plan of each Join message this session
 	// writes; nil: none.
 	HandshakeShaper shaping.HandshakeShaper
-	// ShapingPreciseTimer meets shaping deadlines in place: the session's
-	// timer is armed ahead by the host timer's observed lateness, at most
-	// 2 ms, and its callback yields in a loop until the deadline, which costs
-	// CPU time up to that lead on one goroutine per deadline. Off: deadlines
-	// are met as the host timer allows.
-	ShapingPreciseTimer bool
 	// Shaper is installed when the session is created, as by SetShaper
 	// (nil: no shaping): every outbound pipe of the session, the
 	// bootstrap pipe of an accepted session and joined pipes included, is

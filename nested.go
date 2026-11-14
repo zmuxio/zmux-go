@@ -224,8 +224,8 @@ func (c *Conn) releaseNestedLane() {
 // pipe of n carried by a stream of o. No pipe of a session may run over
 // that session, directly or through others. The lock is a leaf.
 var nesting = struct {
-	mu    sync.Mutex
 	edges map[*Conn]map[*Conn]int
+	mu    sync.Mutex
 }{edges: map[*Conn]map[*Conn]int{}}
 
 // errNestingLoop refuses a pipe whose carrier runs over its own session.

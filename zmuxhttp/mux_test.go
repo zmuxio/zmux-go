@@ -71,8 +71,8 @@ type unifiedEnv struct {
 	lst  *zmux.Listener
 	ex   *ExchangeHandler
 	srv  *httptest.Server
-	mu   sync.Mutex
 	host []string // "METHOD body" of the complete requests the host served
+	mu   sync.Mutex
 }
 
 func newUnifiedEnv(t *testing.T, adm *zmux.Admission, trusted *zmux.TrustedProxies) *unifiedEnv {

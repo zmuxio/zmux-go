@@ -7,24 +7,24 @@ import (
 
 // dgramState holds the datagram queues.
 type dgramState struct {
-	send     []outDgram
-	recv     [][]byte
-	recvSize uint64 // bytes of the session queue and the held datagrams
-	recvW    []*Signal
-	sendW    []*Signal
+	send  []outDgram
+	recv  [][]byte
+	recvW []*Signal
+	sendW []*Signal
 	// Received datagrams that wait for the receive limiter, which the
 	// driver runs outside the lock.
 	limited []PendingDatagram
 	// Received datagrams of peer streams not opened yet, in arrival order
 	// and so in the order they expire.
-	held []heldDgram
+	held     []heldDgram
+	recvSize uint64 // bytes of the session queue and the held datagrams
 }
 
 // heldDgram is a datagram held for a peer stream within the limit that
 // has not been opened yet, until its opening frame arrives or until.
 type heldDgram struct {
-	id    uint64
 	e     []byte // context-prefixed payload
+	id    uint64
 	until Time
 	ch    bool // received on a carrier datagram channel
 }
@@ -55,8 +55,8 @@ func (p *PendingDatagram) Len() int {
 // and, for a stream datagram, its stream, whose opening frame it must not
 // overtake.
 type outDgram struct {
-	data []byte
 	st   *Stream
+	data []byte
 	n    int // payload bytes (data without the flow and context prefix)
 }
 
@@ -76,8 +76,8 @@ func (s *Session) countSent(o *outDgram) {
 // and ChannelDone then counts it.
 type ChannelOut struct {
 	Frame  []byte
-	Failed bool
 	d      outDgram
+	Failed bool
 }
 
 // ready reports whether the datagram may go now; dead reports one of a
@@ -266,9 +266,9 @@ func (s *Session) ReceiveChannelDatagram(pipe uint64, frame []byte, now Time) {
 }
 
 type streamDgrams struct {
+	sig  *Signal
 	q    [][]byte // context-prefixed payloads
 	size uint64   // their payload bytes (DgramStreamSize)
-	sig  *Signal
 }
 
 // dgPayloadLen is the payload length of a context-prefixed stream datagram.
@@ -299,14 +299,35 @@ func (s *Session) MaxDatagramPayload(flowLen int) int {
 	if !s.peerSeen || s.peerMaxDgram == 0 {
 		return 0
 	}
-	m := min64(s.peerMaxDgram, s.peerMaxRecord)
+	// What writeDatagrams can send in a record of every pipe that may
+	// carry it: the Length field is left out as the last frame of a
+	// record, except where a shaper may pad after it.
+	m := datagramDataMax(min(s.peerMaxDgram, s.dgRecordCap()), s.shp != nil)
 	if s.feat.Flows {
-		m -= uint64(flowLen)
+		m -= flowLen
 	}
-	if m < 1 {
-		return 0
+	return max(m, 0)
+}
+
+// dgRecordCap returns the smallest record capacity (frames bytes) of the
+// pipes that may carry datagrams in records.
+func (s *Session) dgRecordCap() uint64 {
+	c := min(s.peerMaxRecord, wire.MaxRecordSize)
+	add := func(p *Pipe) {
+		for _, ol := range p.out.lanes {
+			c = min(c, uint64(s.recMax(ol)))
+		}
 	}
-	return int(m - 1)
+	if p := s.dgPipe(); p != nil {
+		add(p)
+		return c
+	}
+	for _, p := range s.pipes {
+		if p.out != nil && !p.out.failed {
+			add(p)
+		}
+	}
+	return c
 }
 
 // StreamMaxDatagramPayload returns the largest datagram payload the peer
@@ -396,7 +417,14 @@ func (s *Session) writeDatagrams(w *recWriter, p *Pipe) {
 			s.wake(p.chSig)
 			continue
 		}
-		if !w.datagram(o.data) {
+		sent, never := w.datagram(o.data, s.peerMaxDgram)
+		if never {
+			// It can never fit this pipe's records: drop it rather than
+			// hold back the datagrams queued after it.
+			s.stats.DatagramsDroppedSend++
+			continue
+		}
+		if !sent {
 			break
 		}
 		s.countSent(&o)

@@ -30,6 +30,16 @@ import (
 
 // Profile is the behaviour of a Proxy.
 type Profile struct {
+	// RedirectTo answers every request with RedirectStatus (308 when zero)
+	// to this base URL followed by the request's path and query, as a
+	// front that upgrades http to https or moves a path.
+	RedirectTo string
+	// ResponseTimeout answers 504 when the upstream's response has not
+	// arrived whole within it (buffered responses only; zero: none).
+	ResponseTimeout time.Duration
+	// MaxBody answers 413 for a request body above it (zero: no limit).
+	MaxBody        int64
+	RedirectStatus int
 	// BufferRequests reads every request body whole before forwarding it
 	// with a Content-Length.
 	BufferRequests bool
@@ -51,16 +61,6 @@ type Profile struct {
 	EarlyData bool
 	// TLS serves the proxy over TLS (its Server.Client trusts it).
 	TLS bool
-	// ResponseTimeout answers 504 when the upstream's response has not
-	// arrived whole within it (buffered responses only; zero: none).
-	ResponseTimeout time.Duration
-	// MaxBody answers 413 for a request body above it (zero: no limit).
-	MaxBody int64
-	// RedirectTo answers every request with RedirectStatus (308 when zero)
-	// to this base URL followed by the request's path and query, as a
-	// front that upgrades http to https or moves a path.
-	RedirectTo     string
-	RedirectStatus int
 }
 
 // RedirectToHTTPS answers every request with status to the https base
@@ -91,11 +91,11 @@ func WebSocketFront() Profile {
 // Proxy is a running proxy; URL is its address.
 type Proxy struct {
 	*httptest.Server
-	p   Profile
 	up  *url.URL
 	tr  *http.Transport
-	mu  sync.Mutex
 	hij map[net.Conn]struct{} // tunnels, closed with the proxy
+	p   Profile
+	mu  sync.Mutex
 
 	redirects atomic.Int64
 }

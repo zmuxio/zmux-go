@@ -87,13 +87,11 @@ type Exchange struct {
 	// transport's MaxIdleConnsPerHost at least DownRequests+UpRequests so
 	// that connections are reused.
 	Client *http.Client
+	// Header is added to every request.
+	Header http.Header
 	// URL is the target template of UP and CLOSE requests. It may contain
 	// {instance} and {nonce} placeholders, anywhere in its path or query.
 	URL string
-	// Config is what both ends agree on.
-	Config ExchangeConfig
-	// Header is added to every request.
-	Header http.Header
 	// DownURL is the target template of DOWN requests (empty: URL). It
 	// may differ in scheme, host, port and path and pass other
 	// intermediaries, as long as every request of a carrier reaches the
@@ -108,13 +106,13 @@ type Exchange struct {
 	// request when the URL has no {nonce} placeholder ("n"), so that no
 	// cache keyed on the target matches.
 	NonceParam string
-	// CacheBust gives a URL without {nonce} the NonceParam query parameter
-	// with a random value per request. It is on by default; zmux.SwitchOff
-	// leaves such a URL unchanged, for a server or intermediary that
-	// refuses unknown query parameters, when nothing on the path caches
-	// POST responses: a cached response would still fail its MAC and be
-	// repeated, but not get through.
-	CacheBust zmux.Switch
+	// Config is what both ends agree on.
+	Config ExchangeConfig
+	// Backoff is the randomized, doubling delay before a request without a
+	// result is repeated: from Min (20 ms) up to Max (2 s), each delay
+	// reduced by a random fraction of up to Jitter (0.5). A zero field is
+	// its default; a negative Jitter is none.
+	Backoff zmux.Backoff
 	// DownRequests is the number of DOWN requests the client keeps
 	// outstanding (2); it is lowered while the server answers BUSY.
 	DownRequests int
@@ -123,11 +121,6 @@ type Exchange struct {
 	// RequestTimeout bounds one attempt of one request (25 s; negative: no
 	// timeout); it must exceed the server's HoldTime.
 	RequestTimeout time.Duration
-	// Backoff is the randomized, doubling delay before a request without a
-	// result is repeated: from Min (20 ms) up to Max (2 s), each delay
-	// reduced by a random fraction of up to Jitter (0.5). A zero field is
-	// its default; a negative Jitter is none.
-	Backoff zmux.Backoff
 	// Deadline fails the carrier when a request has had no result for this
 	// long (30 s; negative: no deadline); zmux then recovers on its own.
 	Deadline time.Duration
@@ -136,6 +129,13 @@ type Exchange struct {
 	// sends every piece at once, as httputil.ReverseProxy.FlushInterval
 	// does.
 	Coalesce time.Duration
+	// CacheBust gives a URL without {nonce} the NonceParam query parameter
+	// with a random value per request. It is on by default; zmux.SwitchOff
+	// leaves such a URL unchanged, for a server or intermediary that
+	// refuses unknown query parameters, when nothing on the path caches
+	// POST responses: a cached response would still fail its MAC and be
+	// repeated, but not get through.
+	CacheBust zmux.Switch
 
 	// testSkipResponseMAC disables the client's response MAC check (tests
 	// only: shows that the check is what rejects replayed responses).
@@ -418,16 +418,16 @@ func appendExRequest(b []byte, k *exKey, cid *[exCIDLen]byte, kind, flags byte, 
 // exReq is a parsed request. nonce and hmac alias the authentication
 // header, data the body.
 type exReq struct {
-	cid   [exCIDLen]byte
-	kind  byte
-	flags byte
-	ts    uint32
-	seq   uint64
-	ack   uint64
-	dlen  uint32
 	nonce []byte
 	hmac  []byte
 	data  []byte
+	seq   uint64
+	ack   uint64
+	ts    uint32
+	dlen  uint32
+	cid   [exCIDLen]byte
+	kind  byte
+	flags byte
 }
 
 // parseExAuth parses an authentication header.

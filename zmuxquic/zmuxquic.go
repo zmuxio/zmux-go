@@ -375,19 +375,19 @@ func openPipe(ctx context.Context, qc **quic.Conn) (zmux.PipeIO, error) {
 
 // qStream is the sending half, with the carrier capabilities.
 type qStream struct {
-	mu     sync.Mutex
-	qc     *quic.Conn
-	s      *quic.Stream
-	closed bool // Dial's session ended: a replacement connection is closed
-	early  bool // Dial sent the stream in 0-RTT
-	wOnce  sync.Once
-	rOnce  sync.Once
+	qc *quic.Conn
+	s  *quic.Stream
 	// rec, when set, records the close code of the pipe's session for its
 	// connection (zmux.CloseCodeRecorder); ended, when set, is called once
 	// both halves have ended.
 	rec    *closeRecord
 	ended  func()
+	wOnce  sync.Once
+	rOnce  sync.Once
+	mu     sync.Mutex
 	halves atomic.Int32
+	closed bool // Dial's session ended: a replacement connection is closed
+	early  bool // Dial sent the stream in 0-RTT
 }
 
 // halfEnded counts the end of one half; the second calls ended.
@@ -408,9 +408,9 @@ func (q *qStream) RecordCloseCode(code zmux.ApplicationErrorCode, reason string)
 // closeRecord is the close code of the last session a pooled connection
 // carried.
 type closeRecord struct {
-	mu     sync.Mutex
-	code   quic.ApplicationErrorCode
 	reason string
+	code   quic.ApplicationErrorCode
+	mu     sync.Mutex
 }
 
 func (r *closeRecord) set(code quic.ApplicationErrorCode, reason string) {
@@ -643,16 +643,16 @@ func (l *laneReader) CarrierConn() any { return l.qc }
 // connections retired by lifetime limits or failure; the pipes of one
 // connection share a fate group. It is safe for concurrent use.
 type ConnPool struct {
-	pool carrier.ConnPool[*pooled]
 	cred zmux.CarrierCredential
+	pool carrier.ConnPool[*pooled]
 }
 
 // pooled is a pooled connection; its first stream carries the credential.
 type pooled struct {
 	qc        *quic.Conn
-	mu        sync.Mutex // held while the first stream is opened
-	presented bool
 	rec       closeRecord // the close code of the last session it carried
+	mu        sync.Mutex  // held while the first stream is opened
+	presented bool
 }
 
 // Shutdown retires every connection: idle ones close now, the others once

@@ -28,7 +28,7 @@ func TestErrorCodeRegistry(t *testing.T) {
 		}
 	}
 	app := map[StreamErrorCode]uint64{
-		StreamNoError: 0, StreamCancelled: 0x5a4d0001, StreamRejected: 0x5a4d0002, StreamCarrierFailed: 0x5a4d0003,
+		StreamNoError: 0, StreamCancelled: 0x5a4d0001, StreamRejected: 0x5a4d0002, StreamCarrierFailed: 0x5a4d0003, StreamPacketError: 0x5a4d0004,
 	}
 	for c, v := range app {
 		if uint64(c) != v {

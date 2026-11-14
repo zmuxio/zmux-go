@@ -62,14 +62,14 @@ func KindName(k zmux.CarrierKind) string {
 // ParseOptions bound a bundle and say what its reader knows. The zero value is
 // valid.
 type ParseOptions struct {
-	// MaxBytes bounds the bundle's bytes; 0 is DefaultMaxBytes and a
-	// negative value is no bound.
-	MaxBytes int
-	// Size bounds each chosen candidate. Zero values: unbounded.
-	Size machine.SizeLimits
 	// Features are the names a candidate's requires may hold. A candidate
 	// that requires another is skipped.
 	Features []string
+	// Size bounds each chosen candidate. Zero values: unbounded.
+	Size machine.SizeLimits
+	// MaxBytes bounds the bundle's bytes; 0 is DefaultMaxBytes and a
+	// negative value is no bound.
+	MaxBytes int
 	// AllowUnshaped accepts a kind none of whose candidates can be chosen:
 	// it has no entry, and Bundle.Unshaped reports it. Otherwise that fails
 	// the bundle.
@@ -90,9 +90,9 @@ func (o ParseOptions) ByteLimit() int {
 
 // Entry is the candidate chosen for one kind.
 type Entry struct {
-	// Index is the candidate's place in the kind's list.
-	Index     int
 	Candidate *machine.Candidate
+	// Index is the candidate's place in the kind's list.
+	Index int
 }
 
 // Bundle is a parsed and validated bundle. It is immutable and safe for

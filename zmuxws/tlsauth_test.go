@@ -16,13 +16,14 @@ func tlsAuthConfig() *zmux.Config {
 		AllowRecordMode: func(zmux.RecordPolicyInput, zmux.RecordMode, any) bool { return true }}
 }
 
-// A WebSocket stream sharing an HTTP/2 connection's TLS has no Bound contract.
+// A carrier on TLS terminated here declares the Bound contract.
 func TestCarrierSecure(t *testing.T) {
-	st := &tls.ConnectionState{Version: tls.VersionTLS13}
+	st := &tls.ConnectionState{Version: tls.VersionTLS13, HandshakeComplete: true}
+	resumed12 := &tls.ConnectionState{Version: tls.VersionTLS12, HandshakeComplete: true, DidResume: true}
 	for _, c := range []struct {
 		p    carrier
 		want bool
-	}{{carrier{tls: st, own: true}, true}, {carrier{tls: st}, false}, {carrier{own: true}, false}} {
+	}{{carrier{tls: st}, true}, {carrier{tls: resumed12}, false}, {carrier{}, false}} {
 		if got := c.p.CarrierSecure(); got != c.want {
 			t.Errorf("%+v: %v", c.p, got)
 		}

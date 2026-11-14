@@ -202,9 +202,9 @@ func (invalidWrapper) Validate() error { return ErrInvalidConfig }
 
 // logRecorder is a slog.Handler that keeps the messages.
 type logRecorder struct {
-	mu    sync.Mutex
 	msgs  []string
 	attrs []string // the values of the "callback" attribute
+	mu    sync.Mutex
 }
 
 func (r *logRecorder) Enabled(context.Context, slog.Level) bool { return true }

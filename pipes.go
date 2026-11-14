@@ -25,18 +25,21 @@ import (
 // change at any time; the Receive fields are always sent: the Hello
 // carries a request for the peer's outbound direction.
 type PipeOptions struct {
+	// Label names the pipe in statistics.
+	Label string
+	// Liveness are the pipe's own liveness settings; a zero field follows
+	// the session's (Config.Liveness). Default: the session's.
+	Liveness Change[PipeLiveness]
+	// QualityBand is the pipe's own quality band for EventPipeQualityChanged
+	// (its outbound direction). Default: the session's (Conn.SetQualityBand).
+	// A receive-only pipe has none: setting it is an ErrInvalidConfig error.
+	QualityBand Change[QualityBand]
 	// SendPriority is the tier of the local outbound direction (lower is
 	// preferred). Default: the peer's request, else tier 0.
 	SendPriority Change[uint64]
-	// SendStandby makes the local outbound direction carry data only on
-	// failover. Default: the peer's request, else active.
-	SendStandby Change[bool]
 	// ReceivePriority is the tier requested for the peer's outbound
 	// direction. Default: tier 0.
 	ReceivePriority Change[uint64]
-	// ReceiveStandby asks the peer to make its outbound direction standby.
-	// Default: active.
-	ReceiveStandby Change[bool]
 	// Weight is the share for SchedulerSpreadRoundRobin and the factor of
 	// SchedulerSpreadRateWeighted. Default 1; 0 excludes the pipe unless
 	// every candidate has 0.
@@ -45,22 +48,23 @@ type PipeOptions struct {
 	// the session's (SchedulerParams.Probation); a negative value turns
 	// the pipe's probation off.
 	Probation Change[time.Duration]
-	// Liveness are the pipe's own liveness settings; a zero field follows
-	// the session's (Config.Liveness). Default: the session's.
-	Liveness Change[PipeLiveness]
-	// QualityBand is the pipe's own quality band for EventPipeQualityChanged
-	// (its outbound direction). Default: the session's (Conn.SetQualityBand).
-	// A receive-only pipe has none: setting it is an ErrInvalidConfig error.
-	QualityBand Change[QualityBand]
-	// RecordMode is the record mode of this carrier. Default:
-	// Config.RecordPolicy, else RecordSealed.
-	RecordMode Change[RecordMode]
-	// Label names the pipe in statistics.
-	Label string
 	// FateGroup groups pipes that share a path; a pipe that replaces a
 	// failed one on the same path reuses its fate group. 0: the carrier's
 	// PipeIO.FateGroup, else none (an independent path).
 	FateGroup uint64
+	// KeyGroup is the key-exchange group of the Join's key share. Zero:
+	// group 1 when it is usable, otherwise group 2. A group that is not
+	// usable in the session fails AddPipe with ErrInvalidConfig.
+	KeyGroup uint64
+	// SendStandby makes the local outbound direction carry data only on
+	// failover. Default: the peer's request, else active.
+	SendStandby Change[bool]
+	// ReceiveStandby asks the peer to make its outbound direction standby.
+	// Default: active.
+	ReceiveStandby Change[bool]
+	// RecordMode is the record mode of this carrier. Default:
+	// Config.RecordPolicy, else RecordSealed.
+	RecordMode Change[RecordMode]
 	// Direction from the local endpoint: DirectionBidirectional (the zero
 	// value), DirectionSendOnly (an uplink) or DirectionReceiveOnly (a downlink).
 	Direction Direction
@@ -68,10 +72,6 @@ type PipeOptions struct {
 	// once the peer has attached the pipe. The caller then keeps the
 	// session's other pipes until Pipe.WaitAttached returns.
 	ReturnOnReply bool
-	// KeyGroup is the key-exchange group of the Join's key share. Zero:
-	// group 1 when it is usable, otherwise group 2. A group that is not
-	// usable in the session fails AddPipe with ErrInvalidConfig.
-	KeyGroup uint64
 }
 
 func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
@@ -125,8 +125,8 @@ type PipeID uint64
 // use; they fail with ErrPipeGone once the attachment is retired.
 type Pipe struct {
 	c   *Conn
-	id  uint64
 	end *pipeEnd // never nil
+	id  uint64
 }
 
 // ID returns the pipe ID.

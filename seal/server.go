@@ -32,20 +32,20 @@ type Gate interface {
 // CredentialRequest is what Gate.Credential knows of a handshake: the gate
 // chooses the credential the client can accept.
 type CredentialRequest struct {
-	Handle       []byte // nil on a profile without a pre-shared key
-	Profile      proto.Profile
-	Source       netip.AddrPort // may be the zero value
 	LocalContext any
+	Source       netip.AddrPort // may be the zero value
+	Handle       []byte         // nil on a profile without a pre-shared key
+	Profile      proto.Profile
 }
 
 // CommitRequest is what Gate.Commit receives of a client that passed message 3.
 type CommitRequest struct {
-	Handle []byte         // nil on a profile without a pre-shared key
-	Source netip.AddrPort // may be the zero value
 	// Peer is the client: its static key, credential, the ClientAnchor's
 	// verdict (zero without a ClientAnchor), and the Profile and Mode of the
 	// handshake.
-	Peer *Peer
+	Peer   *Peer
+	Source netip.AddrPort // may be the zero value
+	Handle []byte         // nil on a profile without a pre-shared key
 }
 
 // ServerConfig is the server's side of Establish. A *ServerConfig is a
@@ -55,20 +55,17 @@ type CommitRequest struct {
 type ServerConfig struct {
 	// Gate is the host's decision on clients; required.
 	Gate Gate
-	// Key is the node's static key; required.
-	Key *ecdh.PrivateKey
 	// ClientAnchor, when set, judges the client after message 3 (zmux.RoleClient).
 	// nil: clients are not authenticated beyond the pre-shared key.
 	ClientAnchor Anchor
-	// RequirePQAuth fails a client that is not authenticated by a post-quantum
-	// transcript signature; it needs ClientAnchor.
-	RequirePQAuth bool
 	// Signer, when set, signs the transcript in message 2, for clients whose
 	// Anchor asks for it. In Profiles 4 and 5 anyone can ask for a signature:
 	// limit their rate in the Signer.
 	Signer Signer
 	// LocalContext is passed to Gate.Credential, AppData and the ClientAnchor.
 	LocalContext any
+	// Key is the node's static key; required.
+	Key *ecdh.PrivateKey
 	// AppData supplies the application data of message 2; its request holds
 	// what is known of the client then (the Profile, the PSK identity and the
 	// data of message 1; the client's static key and credential arrive in
@@ -80,22 +77,25 @@ type ServerConfig struct {
 	// included: it must be light and without side effects, and anything that
 	// queries other systems waits until the handshake completes (Gate.Commit).
 	AppData AppDataSource
-	// MaxAppData bounds the application data of a received message; zero is
-	// proto.DefaultMaxAppData, negative no bound beyond the message.
-	MaxAppData int
-	// AcceptedProfiles are the Profiles accepted. nil or empty: the default
-	// set, the Profiles with a pre-shared key (1 and 3). Listing a Profile
-	// without one (4, 5), which sends the node's credential to anonymous
-	// clients, is the only way to accept it.
-	AcceptedProfiles []proto.Profile
 	// AllowRecordMode is the check of a Hello's mode, with the Establish's Peer as its
 	// peer. nil: only Sealed. Joins have their own check, Config.AllowRecordMode.
 	AllowRecordMode zmux.AllowRecordMode
 	// Shaper is asked for the plan of each handshake message; nil: none. It is
 	// called from concurrent handshakes.
 	Shaper shaping.HandshakeShaper
+	// AcceptedProfiles are the Profiles accepted. nil or empty: the default
+	// set, the Profiles with a pre-shared key (1 and 3). Listing a Profile
+	// without one (4, 5), which sends the node's credential to anonymous
+	// clients, is the only way to accept it.
+	AcceptedProfiles []proto.Profile
 	// ShapingLimits limit those plans.
 	ShapingLimits shaping.Limits
+	// MaxAppData bounds the application data of a received message; zero is
+	// proto.DefaultMaxAppData, negative no bound beyond the message.
+	MaxAppData int
+	// RequirePQAuth fails a client that is not authenticated by a post-quantum
+	// transcript signature; it needs ClientAnchor.
+	RequirePQAuth bool
 }
 
 // WrapPipe runs the server's side of Establish on a new carrier. A carrier whose first

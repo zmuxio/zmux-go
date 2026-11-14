@@ -201,9 +201,9 @@ type readDrainState struct {
 }
 
 type closeFrame struct {
+	reason    []byte
 	code      uint64
 	frameType uint64
-	reason    []byte
 	pending   bool
 	app       bool
 	sentAll   bool

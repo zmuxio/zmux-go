@@ -21,10 +21,10 @@ import (
 // Stream ID id and go to the peer's demultiplexer.
 type chanConn struct {
 	net.Conn
+	peer  *chanConn
+	demux carrierio.ChannelDemux
 	id    uint64
 	max   atomic.Int64
-	demux carrierio.ChannelDemux
-	peer  *chanConn
 	sent  atomic.Int64
 	drop  atomic.Bool // lose every channel datagram
 }

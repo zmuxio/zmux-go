@@ -33,10 +33,10 @@ const (
 // Hello is the first unit of a handshake. Handle and Msg1 alias the parsed
 // bytes.
 type Hello struct {
-	Profile Profile
-	Mode    Mode
 	Handle  []byte
 	Msg1    []byte
+	Profile Profile
+	Mode    Mode
 }
 
 // AppendHello appends the encoding of h. The profile must be known and the

@@ -97,22 +97,22 @@ const (
 // Stalled carriers hold at most MaxPerSource - 1 slots of their source and
 // half of MaxTotal. Callers serialise access.
 type PendingCarriers struct {
-	MaxTotal     int      // 0: DefaultMaxPending; negative: unlimited
-	MaxPerSource int      // 0: DefaultMaxPendingPerSource
-	Timeout      Duration // 0: DefaultFirstRecordTimeout
 	bySource     map[netip.Prefix]int
 	stalledBy    map[netip.Prefix]int
-	total        int
 	stalls       list.List // of *PendingSlot, the stalled ones, oldest first
+	MaxTotal     int       // 0: DefaultMaxPending; negative: unlimited
+	MaxPerSource int       // 0: DefaultMaxPendingPerSource
+	Timeout      Duration  // 0: DefaultFirstRecordTimeout
+	total        int
 }
 
 // PendingSlot is the source slot and the slot of the total that one
 // carrier holds.
 type PendingSlot struct {
-	source netip.Prefix
-	held   bool
 	stall  *list.Element // non-nil while stalled
 	evict  func()
+	source netip.Prefix
+	held   bool
 }
 
 // EnterResult is the outcome of Enter.
@@ -251,8 +251,8 @@ type SplitPairing struct {
 }
 
 type pairWait struct {
-	up      bool
 	carrier any
+	up      bool
 }
 
 // PairResult is the outcome of offering a carrier.

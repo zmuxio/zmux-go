@@ -246,11 +246,11 @@ func TestMaintainPipesStopClosesReplacement(t *testing.T) {
 // writes after the Confirm and its reads after the Reply, so that no
 // evidence of the acceptor's attachment arrives meanwhile.
 type heldCarrier struct {
+	until time.Time
 	net.Conn
-	writes, reads atomic.Int32
-	until         time.Time
-	once          sync.Once
 	closed        chan struct{}
+	once          sync.Once
+	writes, reads atomic.Int32
 }
 
 func newHeldCarrier(c net.Conn, d time.Duration) *heldCarrier {

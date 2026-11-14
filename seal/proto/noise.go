@@ -13,9 +13,9 @@ type cipherState = join.CipherState
 
 type symmetricState struct {
 	suite suite
-	cs    cipherState
 	ck    []byte
 	h     []byte
+	cs    cipherState
 }
 
 func (s *symmetricState) init(name string, su suite) {

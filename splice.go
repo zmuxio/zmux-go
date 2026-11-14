@@ -26,19 +26,29 @@ type Limiter interface {
 
 // SpliceOptions configure Splice.
 type SpliceOptions struct {
+	// AtoB and BtoA limit the two directions (nil: none).
+	AtoB, BtoA Limiter
 	// Chunk is the most one direction holds at once (64 KiB; a splice
 	// moves data, so 0 has no other meaning).
 	Chunk int
-	// AtoB and BtoA limit the two directions (nil: none).
-	AtoB, BtoA Limiter
 }
 
 // SpliceDirection is the result of one direction of a splice.
 type SpliceDirection struct {
-	Bytes            uint64 // stream bytes forwarded
-	DatagramBytes    uint64 // datagram bytes forwarded
-	DatagramsDropped uint64
-	End              SpliceEnd // how the direction ended
+	Bytes         uint64 // stream bytes forwarded
+	DatagramBytes uint64 // datagram payload bytes forwarded
+	// DatagramsDropped counts every datagram not forwarded; of them,
+	// DatagramsTooLarge did not fit the next hop's MaxDatagramPayload and
+	// DatagramsLimited were refused by the direction's Limiter or the next
+	// session's send limiter. SplicePackets forwards datagrams that do not
+	// fit as capsules instead (DatagramsEncapsulated), so its
+	// DatagramsTooLarge stays 0.
+	DatagramsDropped, DatagramsTooLarge, DatagramsLimited uint64
+	// DatagramsEncapsulated counts the datagrams SplicePackets forwarded
+	// as DATAGRAM capsules on the stream (their payload is in
+	// DatagramBytes); 0 for Splice.
+	DatagramsEncapsulated uint64
+	End                   SpliceEnd // how the direction ended
 }
 
 // SpliceEndKind is the event that ended a direction of a splice.
@@ -158,69 +168,90 @@ func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResul
 	wg.Wait()
 	cancel()
 	dg.Wait()
-	ab.DatagramBytes, ab.DatagramsDropped = dgs.AtoB.DatagramBytes, dgs.AtoB.DatagramsDropped
-	ba.DatagramBytes, ba.DatagramsDropped = dgs.BtoA.DatagramBytes, dgs.BtoA.DatagramsDropped
+	ab.mergeDatagrams(&dgs.AtoB)
+	ba.mergeDatagrams(&dgs.BtoA)
 	return SpliceResult{AtoB: ab, BtoA: ba}, nil
+}
+
+// mergeDatagrams copies the datagram counts of d into the direction.
+func (s *SpliceDirection) mergeDatagrams(d *SpliceDirection) {
+	s.DatagramBytes, s.DatagramsDropped = d.DatagramBytes, d.DatagramsDropped
+	s.DatagramsTooLarge, s.DatagramsLimited = d.DatagramsTooLarge, d.DatagramsLimited
+	s.DatagramsEncapsulated = d.DatagramsEncapsulated
 }
 
 // spliceDir forwards r's receiving part to w's sending part.
 func spliceDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter) SpliceDirection {
 	var d SpliceDirection
 	for {
-		n, end, werr, err := r.h.waitReadable(ctx, w.h)
-		if werr != nil {
-			spliceWriteErr(r, w, werr)
-			d.End = spliceEnd(werr, true)
+		_, eof, stop := spliceStep(ctx, r, w, chunk, lim, 1<<62, &d)
+		if stop {
 			return d
 		}
-		if err != nil {
-			spliceAbort(r, w, err)
-			d.End = spliceEnd(err, false)
-			return d
-		}
-		var want int
-		if !end {
-			want = min(chunk, int(min(n, 16<<10)))
-			capy, err := w.h.waitSendCapacity(ctx, uint64(want))
-			if err != nil {
-				spliceWriteErr(r, w, err)
-				d.End = spliceEnd(err, true)
-				return d
-			}
-			take := min(int(capy), chunk)
-			if lim != nil {
-				take, err = lim.Ready(ctx, min(want, take), take)
-				if err != nil {
-					spliceAbort(r, w, err)
-					d.End = SpliceEnd{Kind: SpliceCancelled}
-					return d
-				}
-			}
-			want = take
-		}
-		ch, err := r.h.readChunk(ctx, max(want, 1))
-		if len(ch.Data) > 0 {
-			m := len(ch.Data)
-			if werr := w.h.writeChunk(ctx, ch); werr != nil {
-				spliceWriteErr(r, w, werr)
-				d.End = spliceEnd(werr, true)
-				return d
-			}
-			if lim != nil {
-				lim.Charge(m)
-			}
-			d.Bytes += uint64(m)
-		}
-		switch {
-		case errors.Is(err, io.EOF):
+		if eof {
 			_ = w.h.close()
-			return d
-		case err != nil:
-			spliceReadErr(r, w, err)
-			d.End = spliceEnd(err, false)
 			return d
 		}
 	}
+}
+
+// spliceStep forwards one chunk of at most limit bytes from r to w and
+// counts it in d. eof reports r's FIN (w is not finished); stop that the
+// direction ended otherwise, with both sides ended and d.End set.
+func spliceStep(ctx context.Context, r, w *Stream, chunk int, lim Limiter, limit uint64, d *SpliceDirection) (int, bool, bool) {
+	n, end, werr, err := r.h.waitReadable(ctx, w.h)
+	if werr != nil {
+		spliceWriteErr(r, w, werr)
+		d.End = spliceEnd(werr, true)
+		return 0, false, true
+	}
+	if err != nil {
+		spliceAbort(r, w, err)
+		d.End = spliceEnd(err, false)
+		return 0, false, true
+	}
+	var want int
+	if !end {
+		want = int(min(uint64(chunk), n, 16<<10, limit))
+		capy, err := w.h.waitSendCapacity(ctx, uint64(want))
+		if err != nil {
+			spliceWriteErr(r, w, err)
+			d.End = spliceEnd(err, true)
+			return 0, false, true
+		}
+		take := int(min(capy, uint64(chunk), limit))
+		if lim != nil {
+			take, err = lim.Ready(ctx, min(want, take), take)
+			if err != nil {
+				spliceAbort(r, w, err)
+				d.End = SpliceEnd{Kind: SpliceCancelled}
+				return 0, false, true
+			}
+		}
+		want = take
+	}
+	ch, err := r.h.readChunk(ctx, max(want, 1))
+	m := len(ch.Data)
+	if m > 0 {
+		if werr := w.h.writeChunk(ctx, ch); werr != nil {
+			spliceWriteErr(r, w, werr)
+			d.End = spliceEnd(werr, true)
+			return 0, false, true
+		}
+		if lim != nil {
+			lim.Charge(m)
+		}
+		d.Bytes += uint64(m)
+	}
+	switch {
+	case errors.Is(err, io.EOF):
+		return m, true, false
+	case err != nil:
+		spliceReadErr(r, w, err)
+		d.End = spliceEnd(err, false)
+		return m, false, true
+	}
+	return m, false, false
 }
 
 // spliceReadErr ends w after r's end other than FIN.
@@ -311,22 +342,52 @@ func spliceDatagrams(ctx context.Context, a, b *Stream, res *SpliceResult, o Spl
 			if err != nil {
 				return
 			}
-			if lim != nil && lim.TryReady(len(p)) < len(p) {
-				d.DatagramsDropped++
+			switch spliceSendDatagram(w, d, lim, cx, p) {
+			case datagramSent:
 				continue
+			case datagramTooLarge:
+				d.DatagramsTooLarge++
+			case datagramLimited:
+				d.DatagramsLimited++
 			}
-			if w.h.sendDatagram(cx, p) != nil {
-				d.DatagramsDropped++
-				continue
-			}
-			if lim != nil {
-				lim.Charge(len(p))
-			}
-			d.DatagramBytes += uint64(len(p))
+			d.DatagramsDropped++
 		}
 	}
 	wg.Add(2)
 	go fwd(a, b, &res.AtoB, o.AtoB)
 	go fwd(b, a, &res.BtoA, o.BtoA)
 	return &wg
+}
+
+// datagramOutcome is what became of a forwarded datagram.
+type datagramOutcome uint8
+
+const (
+	datagramSent     datagramOutcome = iota
+	datagramTooLarge                 // above the next hop's MaxDatagramPayload
+	datagramLimited                  // refused by a limiter
+	datagramFailed                   // not sent for another reason
+)
+
+// spliceSendDatagram sends a forwarded datagram on w through the
+// direction's limiter, counting its bytes in d when it was sent.
+func spliceSendDatagram(w *Stream, d *SpliceDirection, lim Limiter, cx uint64, p []byte) datagramOutcome {
+	if lim != nil && lim.TryReady(len(p)) < len(p) {
+		return datagramLimited
+	}
+	limited, err := w.h.c.sendDatagramLimited(w.h.st, cx, p)
+	var tl *DatagramTooLargeError
+	switch {
+	case limited:
+		return datagramLimited
+	case errors.As(err, &tl):
+		return datagramTooLarge
+	case err != nil:
+		return datagramFailed
+	}
+	if lim != nil {
+		lim.Charge(len(p))
+	}
+	d.DatagramBytes += uint64(len(p))
+	return datagramSent
 }

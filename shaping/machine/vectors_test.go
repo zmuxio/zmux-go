@@ -18,10 +18,10 @@ import (
 
 // testSource is a splitmix64 generator or a fixed list, counting its draws.
 type testSource struct {
-	seeded bool
-	state  uint64
 	list   []uint64
+	state  uint64
 	n      uint64
+	seeded bool
 }
 
 func (s *testSource) Uint64() uint64 {
@@ -100,18 +100,18 @@ func TestDrawVectors(t *testing.T) {
 		} `json:"values"`
 		Prob []struct {
 			Name     string  `json:"name"`
-			P        uint64  `json:"p"`
 			Source   srcSpec `json:"source"`
-			Result   bool    `json:"result"`
+			P        uint64  `json:"p"`
 			Consumed uint64  `json:"consumed"`
+			Result   bool    `json:"result"`
 		} `json:"prob"`
 		Jitter []struct {
 			Name     string  `json:"name"`
-			Value    uint64  `json:"value"`
-			J        uint32  `json:"jitter_ppm"`
 			Source   srcSpec `json:"source"`
+			Value    uint64  `json:"value"`
 			Result   uint64  `json:"result"`
 			Consumed uint64  `json:"consumed"`
+			J        uint32  `json:"jitter_ppm"`
 		} `json:"jitter"`
 		Compile []struct {
 			Name      string                     `json:"name"`
@@ -221,21 +221,11 @@ func checkEffects(t *testing.T, where string, r *shaping.Effects, want effectsJS
 func TestMachineVectors(t *testing.T) {
 	var d struct {
 		Run []struct {
-			Name       string                     `json:"name"`
-			Definition json.RawMessage            `json:"definition"`
 			Tables     map[string]json.RawMessage `json:"tables"`
+			Name       string                     `json:"name"`
 			Source     srcSpec                    `json:"source"`
-			Pipes      int                        `json:"pipes"`
-			Compile    struct {
-				Shared   []uint64 `json:"shared"`
-				Consumed uint64   `json:"consumed"`
-				Caps     []string `json:"caps"`
-			} `json:"compile"`
-			Steps []struct {
-				Op     string `json:"op"`
-				Now    int64  `json:"now"`
-				Len    int    `json:"len"`
-				Pipe   int    `json:"pipe"`
+			Definition json.RawMessage            `json:"definition"`
+			Steps      []struct {
 				Meters *struct {
 					WireLeft  *uint64 `json:"wire_left"`
 					StallLeft *uint64 `json:"stall_left"`
@@ -252,16 +242,26 @@ func TestMachineVectors(t *testing.T) {
 					Stop        bool `json:"stop"`
 				} `json:"plan"`
 				Effects  effectsJSON `json:"effects"`
-				Consumed uint64      `json:"consumed"`
+				Op       string      `json:"op"`
 				State    []int32     `json:"state"`
 				Counters [][]uint64  `json:"counters"`
+				Now      int64       `json:"now"`
+				Len      int         `json:"len"`
+				Pipe     int         `json:"pipe"`
+				Consumed uint64      `json:"consumed"`
 			} `json:"steps"`
+			Compile struct {
+				Shared   []uint64 `json:"shared"`
+				Caps     []string `json:"caps"`
+				Consumed uint64   `json:"consumed"`
+			} `json:"compile"`
+			Pipes int `json:"pipes"`
 		} `json:"run"`
 		Invalid []struct {
-			Name       string                     `json:"name"`
-			Definition json.RawMessage            `json:"definition"`
 			Tables     map[string]json.RawMessage `json:"tables"`
+			Name       string                     `json:"name"`
 			Error      string                     `json:"error"`
+			Definition json.RawMessage            `json:"definition"`
 		} `json:"invalid"`
 	}
 	readVectors(t, "machine.json", &d)
@@ -421,17 +421,20 @@ func BenchmarkPlan(b *testing.B) {
 func TestPoolDecideVectors(t *testing.T) {
 	var d struct {
 		Decide []struct {
-			Name    string          `json:"name"`
-			Policy  json.RawMessage `json:"policy"`
-			Source  srcSpec         `json:"source"`
-			Compile struct {
-				Shared   []uint64 `json:"shared"`
-				Consumed uint64   `json:"consumed"`
-			} `json:"compile"`
-			Steps []struct {
-				Failures int    `json:"failures"`
-				Since    *int64 `json:"since_dial"`
-				Members  []struct {
+			Name   string          `json:"name"`
+			Source srcSpec         `json:"source"`
+			Policy json.RawMessage `json:"policy"`
+			Steps  []struct {
+				Want struct {
+					Count         *int     `json:"count"`
+					DialAfter     *int64   `json:"dial_after"`
+					ProbeInterval *int64   `json:"probe_interval"`
+					ProbeJitter   *int64   `json:"probe_jitter"`
+					Recheck       *int64   `json:"recheck"`
+					Retire        []uint64 `json:"retire"`
+				} `json:"want"`
+				Since   *int64 `json:"since_dial"`
+				Members []struct {
 					ID            uint64 `json:"id"`
 					Age           int64  `json:"age"`
 					Idle          int64  `json:"idle"`
@@ -439,16 +442,13 @@ func TestPoolDecideVectors(t *testing.T) {
 					BytesSent     uint64 `json:"bytes_sent"`
 					BytesReceived uint64 `json:"bytes_received"`
 				} `json:"members"`
-				Want struct {
-					Count         *int     `json:"count"`
-					DialAfter     *int64   `json:"dial_after"`
-					Retire        []uint64 `json:"retire"`
-					ProbeInterval *int64   `json:"probe_interval"`
-					ProbeJitter   *int64   `json:"probe_jitter"`
-					Recheck       *int64   `json:"recheck"`
-				} `json:"want"`
+				Failures int    `json:"failures"`
 				Consumed uint64 `json:"consumed"`
 			} `json:"steps"`
+			Compile struct {
+				Shared   []uint64 `json:"shared"`
+				Consumed uint64   `json:"consumed"`
+			} `json:"compile"`
 		} `json:"decide"`
 	}
 	readVectors(t, "pool_policy.json", &d)
@@ -512,8 +512,8 @@ func TestLimitsParseVectors(t *testing.T) {
 	var d struct {
 		Parse []struct {
 			Name   string          `json:"name"`
-			Limits json.RawMessage `json:"limits"`
 			Error  string          `json:"error"`
+			Limits json.RawMessage `json:"limits"`
 			Want   struct {
 				Wire struct {
 					Initial uint64 `json:"initial"`

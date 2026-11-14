@@ -89,11 +89,11 @@ func (e Exchange) pipe(ctx context.Context, t *Target) (zmux.PipeIO, error) {
 
 // exTarget builds request targets from the URL template.
 type exTarget struct {
-	tmpl, param, instance string
-	bust                  bool
 	// origin replaces the template's scheme and authority once a request
 	// was upgraded to https (nil: none).
-	origin *atomic.Pointer[string]
+	origin                *atomic.Pointer[string]
+	tmpl, param, instance string
+	bust                  bool
 }
 
 // tmplRest is the template after its scheme and authority.
@@ -186,18 +186,18 @@ type exClient struct {
 
 // exReqState is one request number's retry state.
 type exReqState struct {
-	inflight bool
-	cancel   context.CancelFunc
 	retryAt  time.Time
 	since    time.Time // first attempt without a result since the last result
+	cancel   context.CancelFunc
 	backoff  time.Duration
+	inflight bool
 }
 
 type exUp struct {
+	buf *exBuf // nil for an empty piece
 	exReqState
-	seq  uint64
-	buf  *exBuf // nil for an empty piece
 	data []byte
+	seq  uint64
 	fin  bool
 }
 
@@ -427,12 +427,12 @@ type exAttempt struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	st     *exReqState
-	kind   byte
-	flags  byte
-	seq    uint64
-	ack    uint64
 	buf    *exBuf // the attempt's reference to data's buffer, if any
 	data   []byte
+	seq    uint64
+	ack    uint64
+	kind   byte
+	flags  byte
 }
 
 func (c *exClient) newAttemptLocked(kind byte, seq uint64, st *exReqState, buf *exBuf, data []byte, fin bool, now time.Time) *exAttempt {
@@ -455,12 +455,12 @@ func (c *exClient) newAttemptLocked(kind byte, seq uint64, st *exReqState, buf *
 
 // exResult is what an attempt brought back.
 type exResult struct {
-	ok    bool // a verified response
-	bad   bool // a verified response that fails the carrier
-	flags byte
 	err   error // the failure of bad, if not a protocol error
 	buf   *exBuf
 	data  []byte
+	ok    bool // a verified response
+	bad   bool // a verified response that fails the carrier
+	flags byte
 }
 
 func (c *exClient) attempt(a *exAttempt) {
@@ -704,8 +704,8 @@ func (c *exClient) receiveLocked(n uint64, buf *exBuf, data []byte, fin bool) {
 // exBody is a request body over a header and data that it does not own;
 // done runs once the transport closed it.
 type exBody struct {
-	hdr, data, tail []byte
 	done            func()
+	hdr, data, tail []byte
 	once            sync.Once
 }
 

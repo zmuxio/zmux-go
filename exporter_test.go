@@ -21,11 +21,11 @@ import (
 // had been read when the exporter was first read.
 type kmConn struct {
 	net.Conn
-	secret     string
 	fail       error
+	secret     string
 	read       atomic.Int64
-	calls      atomic.Int32
 	readAtCall atomic.Int64
+	calls      atomic.Int32
 }
 
 func (k *kmConn) Read(b []byte) (int, error) {

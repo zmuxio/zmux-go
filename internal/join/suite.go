@@ -64,9 +64,9 @@ func (SHA256) New() hash.Hash { return sha256.New() }
 
 // Suite is one row of the Join suite table.
 type Suite struct {
-	ID   uint64
 	AEAD AEADFunc
 	Hash HashFunc
+	ID   uint64
 	// NonceLen is N, the length of R on the wire: at least 16, at most the
 	// output of Hash.
 	NonceLen int

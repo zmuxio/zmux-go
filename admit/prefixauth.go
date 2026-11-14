@@ -46,6 +46,10 @@ var prefixLabel = []byte("zmux-prefix-auth/1")
 // are PrefixAuthVerifierOptions. As a zmux.CarrierCredential it presents a
 // fresh token on every carrier.
 type PrefixAuth struct {
+	// HeaderField is the request field of the header form (empty:
+	// HeaderPrefixAuth), another name only where an intermediary strips
+	// unknown fields.
+	HeaderField string
 	// Key is the pre-shared key (required).
 	Key []byte
 	// Slot is the length of a time slot (required, a whole number of
@@ -55,10 +59,6 @@ type PrefixAuth struct {
 	// exporter (PrefixAuthBinding); tokens are then valid on that carrier
 	// only.
 	BindTLS bool
-	// HeaderField is the request field of the header form (empty:
-	// HeaderPrefixAuth), another name only where an intermediary strips
-	// unknown fields.
-	HeaderField string
 }
 
 // headerName is the request field of the header form.
@@ -155,13 +155,13 @@ func PrefixAuthBinding(e zmux.KeyingMaterialExporter) ([]byte, error) {
 // PrefixAuthVerifier verifies tokens and rejects each Nonce after its
 // first use. It is safe for concurrent use.
 type PrefixAuthVerifier struct {
-	bind   bool
-	header string
-	slot   int64
-	skew   int64
 	pool   sync.Pool
 	cache  *ReplayFilter
 	now    func() time.Time
+	header string
+	slot   int64
+	skew   int64
+	bind   bool
 }
 
 // PrefixAuthVerifierOptions are the settings only a verifier reads; the zero

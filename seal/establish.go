@@ -20,18 +20,18 @@ import (
 // Peer is what an Establish learned of the other end. A client gets it with PeerOf; on a
 // server it is AdmittedAs.
 type Peer struct {
-	// Static is the peer's static key.
-	Static []byte
+	// Value is Gate.Commit's result (server only).
+	Value any
 	// Credential is the credential the peer presented, nil: none.
 	Credential *Credential
+	// Static is the peer's static key.
+	Static []byte
 	// AppData is the application data the peer sent, in message order (from a
 	// client messages 1 and 3, from a server message 2).
 	AppData []AppData
 	// Verdict is the Anchor's; zero when the peer was not judged (a client of a
 	// server without ClientAnchor, a server under AllowPSKOnly).
 	Verdict VerifyVerdict
-	// Value is Gate.Commit's result (server only).
-	Value any
 	// Profile and Mode are those of the handshake.
 	Profile    proto.Profile
 	RecordMode zmux.RecordMode
@@ -58,6 +58,32 @@ func PeerOf(p zmux.PipeIO) (*Peer, bool) {
 type ClientConfig struct {
 	// Anchor judges the server. It is required unless AllowPSKOnly.
 	Anchor Anchor
+	// Signer, when set, signs the transcript in message 3, for a server whose
+	// ClientAnchor asks for it.
+	Signer Signer
+	// LocalContext is passed to the Anchor as VerifyInput.LocalContext.
+	LocalContext any
+	// Key is the client's static key; nil is a key generated once per process.
+	Key *ecdh.PrivateKey
+	// Credential goes in message 3; nil: none.
+	Credential *Credential
+	// AppData supplies the application data of message 1, in Profiles 1 and 3
+	// only, and of message 3, after the server is judged; nil: none.
+	AppData AppDataSource
+	// Shaper is asked for the plan of each handshake message; nil: none.
+	Shaper shaping.HandshakeShaper
+	// Handle and PSK select a profile with a pre-shared key; both empty
+	// selects one without.
+	Handle, PSK []byte
+	// AllowedProfiles are the profiles this client may use, the first that fits Handle,
+	// and PSK being used. nil: both ciphers, the one with hardware support
+	// first. A refusal never makes a client choose another profile.
+	AllowedProfiles []proto.Profile
+	// ShapingLimits limit those plans.
+	ShapingLimits shaping.Limits
+	// MaxAppData bounds the application data of a received message; zero is
+	// proto.DefaultMaxAppData, negative no bound beyond the message.
+	MaxAppData int
 	// AllowPSKOnly accepts any server that knows the pre-shared key. It is an explicit
 	// bootstrap and must not override trust the host already holds.
 	AllowPSKOnly bool
@@ -66,32 +92,6 @@ type ClientConfig struct {
 	RequirePQAuth bool
 	// RecordMode is the carrier's record mode; the zero value is Sealed.
 	RecordMode zmux.RecordMode
-	// Handle and PSK select a profile with a pre-shared key; both empty
-	// selects one without.
-	Handle, PSK []byte
-	// Key is the client's static key; nil is a key generated once per process.
-	Key *ecdh.PrivateKey
-	// AllowedProfiles are the profiles this client may use, the first that fits Handle,
-	// and PSK being used. nil: both ciphers, the one with hardware support
-	// first. A refusal never makes a client choose another profile.
-	AllowedProfiles []proto.Profile
-	// Credential goes in message 3; nil: none.
-	Credential *Credential
-	// Signer, when set, signs the transcript in message 3, for a server whose
-	// ClientAnchor asks for it.
-	Signer Signer
-	// LocalContext is passed to the Anchor as VerifyInput.LocalContext.
-	LocalContext any
-	// AppData supplies the application data of message 1, in Profiles 1 and 3
-	// only, and of message 3, after the server is judged; nil: none.
-	AppData AppDataSource
-	// MaxAppData bounds the application data of a received message; zero is
-	// proto.DefaultMaxAppData, negative no bound beyond the message.
-	MaxAppData int
-	// Shaper is asked for the plan of each handshake message; nil: none.
-	Shaper shaping.HandshakeShaper
-	// ShapingLimits limit those plans.
-	ShapingLimits shaping.Limits
 }
 
 var processKey = sync.OnceValues(func() (*ecdh.PrivateKey, error) {
@@ -450,9 +450,9 @@ func writeUnit(p zmux.PipeIO, b []byte) error {
 
 // unitReader reads handshake units from a carrier and keeps what is beyond them.
 type unitReader struct {
+	buf []byte
 	p   zmux.PipeIO
 	f   proto.Framing
-	buf []byte
 }
 
 // readChunk is the size of a read of a byte stream during the handshake.

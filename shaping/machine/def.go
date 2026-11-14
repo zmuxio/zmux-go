@@ -36,10 +36,10 @@ const (
 )
 
 type action struct {
+	a, b   value // inject after,len; pause after; rate rate,burst; timer after; counter value; weight value
+	slot   int32 // into the machine's counters or timers
 	op     opcode
 	cancel bool
-	slot   int32 // into the machine's counters or timers
-	a, b   value // inject after,len; pause after; rate rate,burst; timer after; counter value; weight value
 }
 
 type quantity uint8
@@ -69,15 +69,15 @@ const (
 var comparisons = map[string]comparison{"lt": cmpLT, "le": cmpLE, "eq": cmpEQ, "ne": cmpNE, "ge": cmpGE, "gt": cmpGT}
 
 type transition struct {
+	val   value
+	prob  value
+	slot  int32
+	to    int32
+	cslot int32
 	on    trigger
 	cond  bool
 	what  quantity
 	cmp   comparison
-	slot  int32
-	to    int32
-	cslot int32
-	val   value
-	prob  value
 }
 
 type record struct {
@@ -92,8 +92,8 @@ type stateDef struct {
 }
 
 type machineDef struct {
-	start, counters, timers int
 	states                  []stateDef
+	start, counters, timers int
 }
 
 func parseMachines(x any, t *tables) ([]machineDef, error) {

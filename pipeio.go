@@ -102,14 +102,8 @@ type BuffersWriter interface {
 //
 // A half's Close must interrupt a blocked Read or Write.
 type PipeIO struct {
-	R       io.ReadCloser
-	W       io.WriteCloser
-	Framing Framing
-	// Carrier is the carrier's kind, which the adapters set on both ends
-	// and a Candidate's dial sets to its Kind; 0 for a carrier of no listed
-	// kind, such as raw TCP or TLS. The session reports it to its
-	// ShaperFactory, in pipe events and in PipeStats.
-	Carrier CarrierKind
+	R io.ReadCloser
+	W io.WriteCloser
 	// Protocol is the application protocol the carrier negotiated other
 	// than by the ALPN of a TLS handshake this process runs, such as a
 	// WebSocket subprotocol (ConnectionState.ApplicationProtocol); empty
@@ -117,6 +111,12 @@ type PipeIO struct {
 	Protocol string
 	// Label names the pipe in statistics.
 	Label string
+	// Variant is a short host label (at most 32 bytes advised) for the
+	// transform the carrier runs, "" for none: set by a Candidate
+	// (Candidate.Variant), an admission (Decision.Variant) or WrapPipe.
+	// zmux only reports it, in pipe events, PipeStats, ShapedPipe and
+	// CarrierCache keys; the host bounds the number of variants.
+	Variant string
 	// FateGroup is the carrier's own fate group (a carrier pool's pipes on
 	// one connection share one), used when PipeOptions.FateGroup is 0.
 	FateGroup uint64
@@ -127,16 +127,16 @@ type PipeIO struct {
 	// is used (Start, AddPipe, the listener's HandlePipe and WrapPipe's
 	// result). WrapPipe's result keeps the WriteOverhead it sets.
 	WriteOverhead int
-	// Variant is a short host label (at most 32 bytes advised) for the
-	// transform the carrier runs, "" for none: set by a Candidate
-	// (Candidate.Variant), an admission (Decision.Variant) or WrapPipe.
-	// zmux only reports it, in pipe events, PipeStats, ShapedPipe and
-	// CarrierCache keys; the host bounds the number of variants.
-	Variant string
 	// HandshakePadding is the padding bytes a handshake run on the carrier
 	// before this PipeIO added; the session the carrier becomes part of, by
 	// starting it or by joining it, meters it once. 0: none.
 	HandshakePadding uint64
+	Framing          Framing
+	// Carrier is the carrier's kind, which the adapters set on both ends
+	// and a Candidate's dial sets to its Kind; 0 for a carrier of no listed
+	// kind, such as raw TCP or TLS. The session reports it to its
+	// ShaperFactory, in pipe events and in PipeStats.
+	Carrier CarrierKind
 }
 
 // MaxWriteOverhead is the largest PipeIO.WriteOverhead.

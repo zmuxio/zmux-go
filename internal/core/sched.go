@@ -97,9 +97,9 @@ func (sc *scheduler) rotate(st *Stream) {
 // iterator over ready streams in priority order, each visited once.
 type schedIter struct {
 	sc    *scheduler
-	level int
 	cur   *Stream
 	first *Stream
+	level int
 }
 
 func (sc *scheduler) iter() schedIter { return schedIter{sc: sc, level: -1} }

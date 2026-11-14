@@ -36,13 +36,13 @@ func PipeConn(p PipeIO) net.Conn {
 var errNoSendingHalf = errors.New("zmux: pipe without a sending half")
 
 type pipeConn struct {
-	p    PipeIO
 	mr   MessageReader
 	mw   MessageWriter
+	p    PipeIO
 	once sync.Once
 
-	rmu sync.Mutex
 	buf []byte // the rest of the current message
+	rmu sync.Mutex
 }
 
 func (c *pipeConn) Read(b []byte) (int, error) {

@@ -94,9 +94,9 @@ func TestBatchKeepsDirectionOnItsPhysicalLane(t *testing.T) {
 // planShaper plans every record with a fixed delay and padding target and
 // records the lanes it planned.
 type planShaper struct {
+	lanes []uint64
 	delay time.Duration
 	padTo int
-	lanes []uint64
 }
 
 func (d *planShaper) Capabilities() shaping.Caps { return shaping.CapPlan }

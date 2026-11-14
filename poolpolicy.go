@@ -14,15 +14,15 @@ type PoolPolicy interface {
 
 // PoolView is the state of a pool.
 type PoolView struct {
-	Now time.Time
+	Now      time.Time
+	LastDial time.Time // zero: none
+	Members  []PoolMember
+	Failures int // consecutive failed dials
 	// Connections reports a carrier.ConnPool: its members are connections,
 	// named by FateGroup and retired with RetireConnections. Otherwise they
 	// are the pipes of a PipePool, named by PipeID and retired with
 	// RetirePipes.
 	Connections bool
-	Members     []PoolMember
-	Failures    int       // consecutive failed dials
-	LastDial    time.Time // zero: none
 }
 
 // PoolMember is a pipe of a PipePool, or a connection of a carrier.ConnPool.
@@ -45,23 +45,11 @@ type PoolMember struct {
 // PoolDecision is the answer to Decide. Its zero value keeps the pool's
 // own behaviour.
 type PoolDecision struct {
-	// Count is the members to keep. Zero is the pool's value (a pool
-	// keeps one at least); a negative value is invalid.
-	Count int
-	// DialAfter is the earliest next dial after the start of the last
-	// dial attempt (the start of the pool before the first), in place of
-	// the pool's backoff (at most its maximum). Zero is the pool's
-	// backoff; a negative value is invalid.
-	DialAfter time.Duration
 	// RetirePipes lists the pipes of a PipePool to retire now (a pipe is
 	// replaced before it closes); RetireConnections lists the connections
 	// of a carrier.ConnPool to retire, by fate group.
 	RetirePipes       []PipeID
 	RetireConnections []uint64
-	// Recheck asks for the next Decide within this time even when nothing
-	// else happens. Zero is none; a negative value is invalid. Pools wait
-	// at least MinRecheck.
-	Recheck time.Duration
 	// Liveness is set on the pipes a pool dials after this decision, over
 	// its PipeOptions.Liveness: a zero field keeps the pool's (else the
 	// session's) setting, and the others take the forms and bounds of
@@ -71,6 +59,18 @@ type PoolDecision struct {
 	// does not clamp: it rejects the whole decision and reports the error
 	// to its DecisionRejected callback.
 	Liveness PipeLiveness
+	// Count is the members to keep. Zero is the pool's value (a pool
+	// keeps one at least); a negative value is invalid.
+	Count int
+	// DialAfter is the earliest next dial after the start of the last
+	// dial attempt (the start of the pool before the first), in place of
+	// the pool's backoff (at most its maximum). Zero is the pool's
+	// backoff; a negative value is invalid.
+	DialAfter time.Duration
+	// Recheck asks for the next Decide within this time even when nothing
+	// else happens. Zero is none; a negative value is invalid. Pools wait
+	// at least MinRecheck.
+	Recheck time.Duration
 }
 
 // Validate reports, with ErrInvalidConfig, a decision with a negative

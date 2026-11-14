@@ -8,22 +8,22 @@ import (
 // pingState is QX_PING: at most one request outstanding, one
 // response owed.
 type pingState struct {
+	waiters      []*Signal
 	next         uint64 // next request sequence number
 	outstanding  uint64 // seq+1 of the outstanding request, 0 = none
 	sentAt       Time   // when it was produced
 	expires      Time   // stops being outstanding then
-	want         bool   // a request should be sent
-	requestFirst bool   // the first record of an endpoint without a carrier RTT
-	owe          bool   // a response is owed
 	oweSeq       uint64 // the largest unanswered request
 	reqSeen      uint64 // largest request seq + 1 received
 	respSeen     uint64 // largest response seq + 1 received
 	maxSent      uint64 // largest request seq + 1 sent
-	waiters      []*Signal
 	completed    uint64 // responses received (tickets)
 	lastRTT      Duration
 	fence        uint64 // seq+1 that completes the GOAWAY fence
 	pipe         uint64 // pipe that carried the outstanding request
+	want         bool   // a request should be sent
+	requestFirst bool   // the first record of an endpoint without a carrier RTT
+	owe          bool   // a response is owed
 }
 
 func (p *pingState) wants() bool { return p.owe || p.want && p.outstanding == 0 || p.requestFirst }

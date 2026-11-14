@@ -4,17 +4,17 @@ import "github.com/zmuxio/zmux-go/shaping"
 
 // ShapedPipe is the outbound pipe a ShaperFactory makes a Shaper for.
 type ShapedPipe struct {
-	// PipeID is the pipe ID.
-	PipeID PipeID
-	// Carrier is the pipe's carrier kind (PipeIO.Carrier); 0 for a carrier
-	// of no listed kind, such as raw TCP or TLS.
-	Carrier CarrierKind
-	// WriteOverhead is the pipe's PipeIO.WriteOverhead: the fixed number
-	// of bytes each carrier write adds below the pipe.
-	WriteOverhead int
 	// Variant is the pipe's PipeIO.Variant, so that a factory can choose a
 	// policy per transform.
 	Variant string
+	// PipeID is the pipe ID.
+	PipeID PipeID
+	// WriteOverhead is the pipe's PipeIO.WriteOverhead: the fixed number
+	// of bytes each carrier write adds below the pipe.
+	WriteOverhead int
+	// Carrier is the pipe's carrier kind (PipeIO.Carrier); 0 for a carrier
+	// of no listed kind, such as raw TCP or TLS.
+	Carrier CarrierKind
 }
 
 // ShaperFactory returns the Shaper of an outbound pipe; nil: the pipe is

@@ -95,8 +95,8 @@ func TestListenerStats(t *testing.T) {
 // handshake never completes; asked closes when the join waits for it.
 type earlyHalf struct {
 	net.Conn
-	once  sync.Once
 	asked chan struct{}
+	once  sync.Once
 }
 
 func (*earlyHalf) UsedEarlyData() bool { return true }

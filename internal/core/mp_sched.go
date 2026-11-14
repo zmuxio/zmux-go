@@ -215,11 +215,11 @@ func (s *Session) earliestTwo(g *gate, ti int, l uint64, except *Pipe) (*Pipe, *
 // levelStats are the ready amounts of the stream directions by urgency
 // level, for ECF's backlog and BLEST's share.
 type levelStats struct {
-	valid   bool
-	total   [8]uint64   // ready data of the level
-	nonIncr [8]uint64   // ready data of its non-incremental directions
 	incr    [8][]uint64 // ready data of its incremental directions, sorted
 	prefix  [8][]uint64 // prefix sums of incr
+	total   [8]uint64   // ready data of the level
+	nonIncr [8]uint64   // ready data of its non-incremental directions
+	valid   bool
 }
 
 func (s *Session) levels(d *decision) *levelStats {
@@ -849,10 +849,10 @@ type PickAnswer struct {
 
 // PickRequest is one call of the custom policy.
 type PickRequest struct {
-	Gen    uint64
 	Frames []PickFrame
 	Pipes  []PickPipe
 	keys   []*Stream
+	Gen    uint64
 }
 
 // WantsPick reports whether directions wait for a custom decision.

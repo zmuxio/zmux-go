@@ -16,15 +16,6 @@ import (
 // PoolLimits bound how a carrier pool uses each underlying connection. The
 // zero value selects the defaults.
 type PoolLimits struct {
-	// MaxPipesPerConnection bounds the pipes on a connection at once
-	// (0: 8).
-	MaxPipesPerConnection int
-	// MaxPipesPerConnectionLifetime bounds the pipes a connection carries
-	// over its life (0: unlimited).
-	MaxPipesPerConnectionLifetime int
-	// MaxConnectionAge stops giving pipes to a connection this old (0:
-	// unlimited).
-	MaxConnectionAge time.Duration
 	// Policy, when set, is asked when a pipe is taken or released, and
 	// again after the decision's Recheck; Count
 	// is the connections to spread pipes over, Retire retires connections
@@ -40,6 +31,15 @@ type PoolLimits struct {
 	// recheck that asked the policy (so calls may run concurrently); it
 	// must not block, and a panic in it is contained.
 	DecisionRejected func(err error)
+	// MaxPipesPerConnection bounds the pipes on a connection at once
+	// (0: 8).
+	MaxPipesPerConnection int
+	// MaxPipesPerConnectionLifetime bounds the pipes a connection carries
+	// over its life (0: unlimited).
+	MaxPipesPerConnectionLifetime int
+	// MaxConnectionAge stops giving pipes to a connection this old (0:
+	// unlimited).
+	MaxConnectionAge time.Duration
 }
 
 // ConnPool shares underlying connections between pipes, for adapters
@@ -52,33 +52,33 @@ type PoolLimits struct {
 // paths. The zero value with Dial set is ready; it is safe for concurrent
 // use.
 type ConnPool[C comparable] struct {
+	// PoolLimits bound the use of each connection; set them before the
+	// first Get.
+	PoolLimits
 	// Dial opens an underlying connection.
 	Dial func(ctx context.Context) (C, error)
 	// Close closes a connection the pool retired once no pipe uses it.
 	Close func(C)
-	// PoolLimits bound the use of each connection; set them before the
-	// first Get.
-	PoolLimits
 
-	mu       sync.Mutex
-	conns    []*pooledConn[C]
-	closed   bool
 	view     zmux.PoolView
-	dec      zmux.PoolDecision
 	lastDial time.Time
-	failures int
 	recheck  *time.Timer // asks the policy again after its Recheck
-	rejected []error     // errors of rejected decisions, reported after unlocking
+	conns    []*pooledConn[C]
+	rejected []error // errors of rejected decisions, reported after unlocking
+	dec      zmux.PoolDecision
+	failures int
+	mu       sync.Mutex
+	closed   bool
 }
 
 type pooledConn[C comparable] struct {
+	born    time.Time
+	idle    time.Time // when its last pipe ended; zero until one did
 	c       C
 	fate    uint64
-	born    time.Time
 	active  int
 	total   int
 	retired bool
-	idle    time.Time // when its last pipe ended; zero until one did
 }
 
 // Lease is one pipe's use of a pooled connection; the adapter releases it

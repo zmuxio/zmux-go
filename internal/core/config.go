@@ -149,18 +149,18 @@ type Config struct {
 
 // TestHooks are the trace runner's deterministic values.
 type TestHooks struct {
-	Enabled      bool
-	GreaseTLV    *wire.TLV
-	PingSeqStart uint64
-	RTT          Duration
-	PipeRTT      map[uint64]Duration
-	PipeCap      int
+	GreaseTLV *wire.TLV
+	PipeRTT   map[uint64]Duration
 	// EpochLocatorPrefix, when set, makes the Locator of epoch e this prefix and
 	// e in decimal ASCII, for traces.
 	EpochLocatorPrefix []byte
+	PingSeqStart       uint64
+	RTT                Duration
+	PipeCap            int
 	// Seed seeds the session's random source of non-secret draws (probe
 	// jitter); 0: a random seed. Honoured without Enabled.
-	Seed uint64
+	Seed    uint64
+	Enabled bool
 }
 
 // DefaultConfig returns the default configuration with the local

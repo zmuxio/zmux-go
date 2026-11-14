@@ -27,13 +27,13 @@ type tcpInfo struct {
 // and their results, so that a query allocates nothing (a closure per call
 // would escape through Control); mu serialises the queries.
 type tcpQuery struct {
-	mu                   sync.Mutex
+	unsent, retrans, rtt func(uintptr)
+	lowWater             func(uintptr)
 	n                    uint64
 	d                    time.Duration
 	low                  int
+	mu                   sync.Mutex
 	ok                   bool
-	unsent, retrans, rtt func(uintptr)
-	lowWater             func(uintptr)
 }
 
 func newTCPQuery() *tcpQuery {

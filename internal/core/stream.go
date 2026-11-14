@@ -150,12 +150,12 @@ func (st *Stream) preSize() int {
 
 type peerPreamble struct {
 	openInfo    []byte
+	app         []wire.TLV
 	hasOpenInfo bool
 	hasPrio     bool
 	urgency     uint8
 	incr        bool
 	pipeCarrier bool
-	app         []wire.TLV
 }
 
 // pending control bits of a stream
@@ -659,12 +659,12 @@ func (s *Session) dropProvisional(st *Stream) {
 // PeerPreamble is the preamble a peer stream arrived with.
 type PeerPreamble struct {
 	OpenInfo    []byte
+	App         []wire.TLV
 	HasOpenInfo bool
 	HasPriority bool
 	Urgency     uint8
 	Incremental bool
 	PipeCarrier bool
-	App         []wire.TLV
 }
 
 // PeerPreamble returns the stream's peer preamble, ok false when none.

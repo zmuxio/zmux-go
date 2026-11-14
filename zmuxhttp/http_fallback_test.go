@@ -21,8 +21,8 @@ import (
 type refusedEnv struct {
 	lst  *zmux.Listener
 	srv  *httptest.Server
-	mu   sync.Mutex
 	host [][]byte
+	mu   sync.Mutex
 }
 
 func newRefusedEnv(t *testing.T, adm *zmux.Admission) *refusedEnv {

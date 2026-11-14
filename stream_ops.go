@@ -13,8 +13,8 @@ import (
 
 // TLV is an application TLV of a stream's preamble.
 type TLV struct {
-	Type  uint64
 	Value []byte
+	Type  uint64
 }
 
 // Chunk is stream data passed on without a copy. A chunk read
@@ -32,8 +32,8 @@ type TLV struct {
 // bufio writer; WebSocket flattens once per record; a stream of an outer
 // session (nested sessions) takes them without a copy.
 type Chunk struct {
-	Data []byte
 	buf  *core.Buf
+	Data []byte
 }
 
 // Release returns the chunk's buffer; the chunk must not be used after.

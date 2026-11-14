@@ -14,8 +14,8 @@ import (
 // lanes are routed by key over every session, whatever accepted them. The
 // registry's lock is a leaf.
 var laneKeys = struct {
-	mu sync.Mutex
 	m  map[[16]byte]*Conn
+	mu sync.Mutex
 }{m: map[[16]byte]*Conn{}}
 
 func registerLaneKey(c *Conn) {

@@ -15,9 +15,9 @@ import (
 // kindRecorder is a ShaperFactory that pads every record to padTo and
 // records the pipes it was asked for.
 type kindRecorder struct {
+	pipes []ShapedPipe
 	padTo int
 	mu    sync.Mutex
-	pipes []ShapedPipe
 }
 
 func (k *kindRecorder) factory(p ShapedPipe) shaping.Shaper {

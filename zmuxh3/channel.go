@@ -161,8 +161,8 @@ type h3ChanWriter struct {
 	http.ResponseWriter
 	hs  http3.HTTPStreamer
 	st  http3.Settingser
-	mu  sync.Mutex
 	str *http3.Stream
+	mu  sync.Mutex
 }
 
 func (w *h3ChanWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

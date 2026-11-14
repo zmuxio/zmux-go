@@ -155,8 +155,8 @@ func (e *relayEnv) relayDialer() *dialer { return &dialer{dial0: e.dialRelay} }
 // dialer dials and records when each dial started.
 type dialer struct {
 	dial0 func(context.Context) (net.Conn, error)
-	mu    sync.Mutex
 	at    []time.Time
+	mu    sync.Mutex
 }
 
 func (d *dialer) dial(ctx context.Context) (zmux.PipeIO, error) {
@@ -359,9 +359,9 @@ func echoAll(ctx context.Context, s *zmux.Conn) {
 
 // events collects the client's events.
 type events struct {
-	mu  sync.Mutex
 	got []zmux.Event
 	at  []time.Time
+	mu  sync.Mutex
 }
 
 func watchEvents(t *testing.T, c *zmux.Conn) *events {
@@ -541,9 +541,9 @@ type httpRelayEnv struct {
 	// relay's faults must not reach.
 	relay2 *zmuxtest.Relay
 	hc2    *http.Client
-	url    string
 	client *zmux.Conn
 	server *zmux.Conn
+	url    string
 }
 
 func newHTTPRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, split bool) *httpRelayEnv {

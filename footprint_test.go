@@ -91,7 +91,6 @@ func fpMPPairs(t *testing.T, l *Listener, n int) [][2]*Conn {
 	t.Helper()
 	ctx := context.Background()
 	out := make([][2]*Conn, n)
-	standby := true
 	for i := range out {
 		a, b := net.Pipe()
 		go func() { _ = l.HandlePipe(ctx, NetPipe(b), PipeHint{}) }()
@@ -105,7 +104,7 @@ func fpMPPairs(t *testing.T, l *Listener, n int) [][2]*Conn {
 		}
 		a2, b2 := net.Pipe()
 		go func() { _ = l.HandlePipe(ctx, NetPipe(b2), PipeHint{}) }()
-		if _, err := c.AddPipe(ctx, NetPipe(a2), PipeOptions{SendStandby: Set(standby), ReceiveStandby: Set(true)}); err != nil {
+		if _, err := c.AddPipe(ctx, NetPipe(a2), PipeOptions{SendStandby: Set(true), ReceiveStandby: Set(true)}); err != nil {
 			t.Fatal(err)
 		}
 		out[i] = [2]*Conn{c, s}

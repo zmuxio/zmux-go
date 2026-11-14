@@ -272,13 +272,13 @@ func (c *ListenerConfig) resolve() (ListenerConfig, error) {
 
 // RejectInfo describes an unauthenticated carrier to ListenerConfig.OnReject.
 type RejectInfo struct {
-	Profile    uint64     // 2 for a Join
-	RecordMode RecordMode // the mode its Hello names
-	Reason     string     // "unknown_locator", "unknown_suite", "auth", "pending_limit" or the like
-	Src        netip.AddrPort
 	// Err is the underlying error of a transform's rejection
 	// (RejectError.Err), nil for a join.
-	Err error
+	Err        error
+	Src        netip.AddrPort
+	Reason     string     // "unknown_locator", "unknown_suite", "auth", "pending_limit" or the like
+	Profile    uint64     // 2 for a Join
+	RecordMode RecordMode // the mode its Hello names
 }
 
 // RejectAction is the answer of ListenerConfig.OnReject.
@@ -295,10 +295,10 @@ const (
 // carrier then goes to OnReject, and WrapPipe does not close it. Err is the
 // underlying error, if any.
 type RejectError struct {
+	Err        error
+	Reason     string
 	Profile    uint64
 	RecordMode RecordMode
-	Reason     string
-	Err        error
 }
 
 func (e *RejectError) Error() string {
@@ -313,6 +313,14 @@ func (e *RejectError) Unwrap() error { return e.Err }
 
 // PipeHint is what a carrier's request said out of band (HTTP headers).
 type PipeHint struct {
+	// Admitted is Decision.Value of the admission that accepted the
+	// carrier (nil: none). The listener sets it for WrapPipe; a value
+	// passed to HandlePipe is replaced.
+	Admitted any
+	// Source is the carrier's client address (CarrierInfo.Source), for a
+	// host that resolves it itself (zero: the address the carrier arrived
+	// from). The adapters set it from TrustedProxies.
+	Source netip.AddrPort
 	// Pair is the Zmux-Pipe-Pair header: the pairing token of split
 	// carriers; Uplink says which half this carrier is.
 	// A half waits for its partner within the handshake timeout, holding
@@ -320,14 +328,6 @@ type PipeHint struct {
 	// pair is complete.
 	Pair   string
 	Uplink bool
-	// Source is the carrier's client address (CarrierInfo.Source), for a
-	// host that resolves it itself (zero: the address the carrier arrived
-	// from). The adapters set it from TrustedProxies.
-	Source netip.AddrPort
-	// Admitted is Decision.Value of the admission that accepted the
-	// carrier (nil: none). The listener sets it for WrapPipe; a value
-	// passed to HandlePipe is replaced.
-	Admitted any
 }
 
 // Listener is the server side of zmux: it accepts sessions and the pipes
@@ -431,8 +431,8 @@ type ListenerStats struct {
 // listenerCounters are the ListenerStats counts, each updated with one
 // atomic add when a carrier's outcome is decided and read without a lock.
 type listenerCounters struct {
-	sessions, joins, setupFailures, rejected, refused, timedOut atomic.Uint64
 	adm                                                         admissionCounters
+	sessions, joins, setupFailures, rejected, refused, timedOut atomic.Uint64
 }
 
 // Stats returns the listener's counts. A nil l returns zero counts.
@@ -486,11 +486,11 @@ func (l *Listener) rejectedBy(err error) {
 }
 
 type pairWait struct {
-	p        PipeIO
 	admitted any        // the half's admission value
 	paired   chan error // the partner arrived
 	done     chan error // the session's result for the waiting half
 	end      chan struct{}
+	p        PipeIO
 }
 
 // MaxInstanceIDLen bounds ListenerConfig.InstanceID so that at least 8
@@ -1485,8 +1485,8 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, rele
 // prefixReader returns what was read for classification before the rest
 // of the carrier.
 type prefixReader struct {
-	pre []byte
 	r   io.ReadCloser
+	pre []byte
 }
 
 func (p *prefixReader) Read(b []byte) (int, error) {
@@ -1502,8 +1502,8 @@ func (p *prefixReader) Close() error { return p.r.Close() }
 
 // prefixMessages returns the first message before the rest.
 type prefixMessages struct {
-	first []byte
 	r     io.ReadCloser
+	first []byte
 }
 
 func (p *prefixMessages) Read([]byte) (int, error) { return 0, errors.New("zmux: message carrier") }

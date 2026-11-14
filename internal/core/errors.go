@@ -22,11 +22,11 @@ const (
 
 // SessionError is the terminal error of a session.
 type SessionError struct {
-	Code      uint64
-	FrameType uint64
+	Cause     error // last pipe error for PipesLost/ResumeTimeout
 	Reason    string
 	Details   string
-	Cause     error // last pipe error for PipesLost/ResumeTimeout
+	Code      uint64
+	FrameType uint64
 	Kind      CloseKind
 	Remote    bool
 }

@@ -140,10 +140,10 @@ func (c *Conn) channelLoop(pd *pipeDrv) {
 // most the session's datagram receive queue length; beyond it a datagram
 // is dropped and counted (DatagramsDroppedRecv).
 type chIn struct {
-	mu       sync.Mutex
 	q        []chInDgram
 	spare    []chInDgram
 	dropped  uint64
+	mu       sync.Mutex
 	draining bool
 }
 

@@ -183,8 +183,8 @@ func writeUnit(p PipeIO, b []byte) error {
 
 // unitReader reads what a handshake step asks for from a carrier and keeps the rest.
 type unitReader struct {
-	p   PipeIO
 	buf []byte
+	p   PipeIO
 }
 
 // more reads at least once and appends. A message carrier gives one unit.
@@ -668,12 +668,12 @@ func SealRecords(p PipeIO, s RecordSealer, o RecordOpener, mode RecordMode, exp 
 }
 
 type sealedReader struct {
-	lower PipeIO
 	o     RecordOpener
-	msgs  bool
-	head  [sealedLen]byte
-	mode  RecordMode
 	exp   KeyingMaterialExporter
+	lower PipeIO
+	head  [sealedLen]byte
+	msgs  bool
+	mode  RecordMode
 }
 
 func (r *sealedReader) Read([]byte) (int, error) { return 0, errors.New("zmux: message carrier") }
@@ -715,13 +715,13 @@ func (r *sealedReader) ExportKeyingMaterial(l string, c []byte, n int) ([]byte, 
 func (r *sealedReader) RecordMode() RecordMode { return r.mode }
 
 type sealedWriter struct {
-	lower PipeIO
 	s     RecordSealer
+	exp   KeyingMaterialExporter
+	buf   []byte
+	lower PipeIO
+	mu    sync.Mutex
 	msgs  bool
 	mode  RecordMode
-	mu    sync.Mutex
-	buf   []byte
-	exp   KeyingMaterialExporter
 }
 
 func (w *sealedWriter) Write(b []byte) (int, error) {

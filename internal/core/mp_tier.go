@@ -21,10 +21,10 @@ type class struct {
 
 // tierInfo is one usable tier of a gate.
 type tierInfo struct {
-	prio    uint64
-	lo, hi  int     // its pipes: gate.pipes[lo:hi]
 	active  *Pipe   // the usable pipe with the smallest OWD (session-affinity)
+	lo, hi  int     // its pipes: gate.pipes[lo:hi]
 	q, r    float64 // Q_t and R_t
+	prio    uint64
 	offered float64 // X_t
 	sat     bool
 }
@@ -449,13 +449,13 @@ func (st *Stream) waitStart() Time {
 type PipeSettings struct {
 	SendPriority      *uint64
 	SendStandby       *bool
-	ClearSendPriority bool
-	ClearSendStandby  bool
 	RecvPriority      *uint64
 	RecvStandby       *bool
 	Weight            *uint64
 	Probation         *Duration // <0: the session default; 0 disables
 	Liveness          *PipeLiveness
+	ClearSendPriority bool
+	ClearSendStandby  bool
 }
 
 // SetPipe applies tier settings to an attachment.
