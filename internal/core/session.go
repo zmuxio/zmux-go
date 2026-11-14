@@ -704,5 +704,14 @@ func (s *Session) wakePipe(p *Pipe) {
 	}
 }
 
+// wakeLaneWriter wakes the writer of lane l of the outbound pipe p.
+func (s *Session) wakeLaneWriter(p *Pipe, l *outLane) {
+	if l.lane == 0 {
+		s.wake(p.out.sig)
+		return
+	}
+	s.wake(l.sig)
+}
+
 // StreamByID returns a live stream by identifier.
 func (s *Session) StreamByID(id uint64) *Stream { return s.streams[id] }

@@ -61,8 +61,10 @@ func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, rea
 		msg[i] = byte(i * 7)
 	}
 	read := make(chan error, 1)
+	accepted := make(chan struct{})
 	go func() {
 		in, err := server.AcceptStream(ctx)
+		close(accepted)
 		if err == nil {
 			var got []byte
 			got, err = io.ReadAll(in)
@@ -87,6 +89,9 @@ func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, rea
 	if _, err := open.Write([]byte("left open")); err != nil {
 		t.Fatal(err)
 	}
+	// A stream the peer has not accepted is discarded by the close (SPEC.md
+	// Section 6.5): close once it was accepted.
+	<-accepted
 	t0 := time.Now()
 	_ = client.CloseWithError(code, reason)
 	if d := time.Since(t0); d > time.Second {

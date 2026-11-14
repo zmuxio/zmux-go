@@ -184,7 +184,7 @@ func (f *faultConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-func (f *faultConn) brk() { close(f.broken); _ = f.Conn.Close() }
+func (f *faultConn) brk() { close(f.broken); _ = f.Close() }
 
 // A pipe whose carrier fails reports the carrier's error through Wait.
 func TestPipeWaitCarrierFault(t *testing.T) {

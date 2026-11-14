@@ -873,7 +873,9 @@ func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 					continue
 				}
 				if l, _, _ := s.laneFor(lp, st); l != ol {
-					s.bindLane(lp, st)
+					// Bound to another lane: its writer may be idle, so it
+					// is woken to take the data.
+					s.wakeLaneWriter(lp, s.bindLane(lp, st))
 					continue
 				}
 				s.bindLane(lp, st)

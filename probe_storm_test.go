@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/djylb/netx"
+	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
@@ -86,6 +87,8 @@ func TestLongRoundTripLearnedDespiteSuspicion(t *testing.T) {
 		pingStormConfig(cc)
 		pingStormConfig(sc)
 		sc.Liveness.ProbeInterval = time.Hour
+		// The bubble's clock: the Windows default reads QueryPerformanceCounter.
+		cc.Clock, sc.Clock = timeshim.Real, timeshim.Real
 		ln := netx.NewChanListener(nil, 0)
 		k := link{2 * time.Second, 1e9, 1 << 30}
 		// The first record arrives a round trip after the carrier: above

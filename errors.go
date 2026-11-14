@@ -179,19 +179,18 @@ func isTimeout(err error) bool {
 		if t, ok := err.(interface{ Timeout() bool }); ok && t.Timeout() {
 			return true
 		}
-		switch u := err.(type) {
-		case interface{ Unwrap() error }:
+		if u, ok := err.(interface{ Unwrap() error }); ok {
 			err = u.Unwrap()
-		case interface{ Unwrap() []error }:
+			continue
+		}
+		if u, ok := err.(interface{ Unwrap() []error }); ok {
 			for _, e := range u.Unwrap() {
 				if isTimeout(e) {
 					return true
 				}
 			}
-			return false
-		default:
-			return false
 		}
+		return false
 	}
 	return false
 }
