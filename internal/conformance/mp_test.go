@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net/netip"
+	"strconv"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
@@ -295,7 +296,7 @@ func (r *runner) feedCarrier(c *rcarrier) {
 func (r *runner) peerJoin(st map[string]any) error {
 	c := r.carriers[st["carrier"].(string)]
 	if c == nil {
-		return fmt.Errorf("unknown carrier")
+		return errors.New("unknown carrier")
 	}
 	mode := join.Trusted
 	if m, ok := st["mode"].(string); ok {
@@ -388,7 +389,7 @@ func (r *runner) checkOutcome(c *rcarrier, st map[string]any) error {
 func (r *runner) peerJoinFinish(st map[string]any) error {
 	c := r.carriers[st["carrier"].(string)]
 	if c == nil {
-		return fmt.Errorf("unknown carrier")
+		return errors.New("unknown carrier")
 	}
 	r.retryHeld()
 	if c.heldHello != nil {
@@ -624,7 +625,7 @@ func (r *runner) listenerSend(c *rcarrier, st map[string]any) error {
 			h, _, err := join.ParseHello(m, join.Message)
 			if err != nil {
 				r.closeCarrier(c, "reject")
-				return nil
+				return nil //nolint:nilerr // a malformed carrier is the scenario's reject, not a step failure
 			}
 			r.offerHello(c, &h)
 		}
@@ -661,7 +662,7 @@ func (r *runner) listenerSend(c *rcarrier, st map[string]any) error {
 		}
 		if err != nil {
 			r.closeCarrier(c, "reject")
-			return nil
+			return nil //nolint:nilerr // a malformed carrier is the scenario's reject, not a step failure
 		}
 		c.buf = append([]byte(nil), c.buf[hn:]...)
 		r.offerHello(c, &h)
@@ -741,7 +742,7 @@ func (e *runnerEpochs) init() {
 func (e *runnerEpochs) latest(phase uint8) uint64 {
 	best := uint64(0)
 	for n := range e.secrets {
-		if uint8(n&1) == phase && n > best {
+		if n&1 == uint64(phase) && n > best {
 			best = n
 		}
 	}
@@ -825,7 +826,7 @@ func (r *runner) peerEpoch(st map[string]any) error {
 		if l, ok := st["share_len"]; ok {
 			share = make([]byte, num(l))
 		}
-		fr = map[string]any{"type": "SESSION_EPOCH", "phase": st["phase"], "epoch": json.Number(fmt.Sprint(n)),
+		fr = map[string]any{"type": "SESSION_EPOCH", "phase": st["phase"], "epoch": json.Number(strconv.FormatUint(n, 10)),
 			"share": hex.EncodeToString(share), "locator": loc}
 		r.ep.peer[key] = fr
 	}

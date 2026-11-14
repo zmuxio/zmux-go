@@ -143,7 +143,7 @@ func (hs *Handshake) WriteMessage(dst []byte, p Payload) ([]byte, error) {
 	if p.Credential != nil && p.Credential.Type == 0 {
 		return nil, hs.fail(fmt.Errorf("%w: CredType 0 is no credential", ErrInvalidConfig))
 	}
-	plain, err := appendPayload(nil, p, !hs.nextKeyed())
+	plain, err := appendPayload(p, !hs.nextKeyed())
 	if err != nil {
 		return nil, hs.fail(err)
 	}
@@ -220,7 +220,7 @@ func (hs *Handshake) WriteMessageProof(dst []byte, p Payload, sign func(m []byte
 		pr := *p.Proof
 		pr.Sig = sig
 		q.Proof = &pr
-		return appendPayload(nil, q, random)
+		return appendPayload(q, random)
 	})
 }
 
@@ -411,7 +411,7 @@ func (hs *Handshake) readRaw(msg []byte) ([]byte, error) {
 			hs.ss.mixKey(ss)
 			clear(ss)
 		default:
-			if err = hs.mixDH(t); err != nil {
+			if err := hs.mixDH(t); err != nil {
 				return nil, err
 			}
 		}

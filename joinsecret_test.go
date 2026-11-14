@@ -22,18 +22,18 @@ func deferredConfig() *Config {
 }
 
 // tryPipe joins a carrier to the client within d.
-func (e *mpEnv) tryPipe(d time.Duration) (*Pipe, error) {
+func (e *mpEnv) tryPipe(d time.Duration) error {
 	nc, err := net.Dial("tcp", e.ln.Addr().String())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
-	p, err := e.client.AddPipe(ctx, NetPipe(nc), PipeOptions{})
-	if err != nil {
+	if _, err := e.client.AddPipe(ctx, NetPipe(nc), PipeOptions{}); err != nil {
 		_ = nc.Close()
+		return err
 	}
-	return p, err
+	return nil
 }
 
 func mustSet(t *testing.T, c *Conn, psk []byte) {
@@ -66,7 +66,7 @@ func TestJoinSecretBothDeferred(t *testing.T) {
 			t.Fatalf("state %+v", st)
 		}
 	}
-	if _, err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinPending) {
+	if err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinPending) {
 		t.Fatalf("join before the secret: %v", err)
 	}
 	mustSet(t, e.client, joinSecret)
@@ -77,14 +77,14 @@ func TestJoinSecretBothDeferred(t *testing.T) {
 	if err := e.client.SetJoinSecret(joinSecret); !errors.Is(err, ErrJoinSecretSet) {
 		t.Fatalf("second SetJoinSecret: %v", err)
 	}
-	if _, err := e.tryPipe(5 * time.Second); err != nil {
+	if err := e.tryPipe(5 * time.Second); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	echoOnce(t, ctx, e.client, e.server)
 	e.client.lock()
-	var pds []*pipeDrv
+	pds := make([]*pipeDrv, 0, len(e.client.pipes))
 	for _, pd := range e.client.pipes {
 		pds = append(pds, pd)
 	}
@@ -114,7 +114,7 @@ func TestJoinSecretServerLate(t *testing.T) {
 	e := newMPEnv(t, deferredConfig(), deferredConfig())
 	mustSet(t, e.client, joinSecret)
 	done := make(chan error, 1)
-	go func() { _, err := e.tryPipe(5 * time.Second); done <- err }()
+	go func() { done <- e.tryPipe(5 * time.Second) }()
 	waitUntil(t, 5*time.Second, "held join", func() bool { return e.server.ConnectionStats().JoinPending == 1 })
 	mustSet(t, e.server, joinSecret)
 	if err := <-done; err != nil {
@@ -131,14 +131,14 @@ func TestJoinSecretClientLate(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, deferredConfig(), deferredConfig())
 	mustSet(t, e.server, joinSecret)
-	if _, err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinPending) {
+	if err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinPending) {
 		t.Fatalf("join before the client's secret: %v", err)
 	}
 	if e.client.Adapter().JoinReady() {
 		t.Fatal("JoinReady while the secret is pending")
 	}
 	mustSet(t, e.client, joinSecret)
-	if _, err := e.tryPipe(5 * time.Second); err != nil {
+	if err := e.tryPipe(5 * time.Second); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -149,7 +149,7 @@ func TestJoinSecretMismatch(t *testing.T) {
 	e := newMPEnv(t, deferredConfig(), deferredConfig())
 	mustSet(t, e.client, joinSecret)
 	mustSet(t, e.server, bytes.Repeat([]byte{8}, 32))
-	if _, err := e.tryPipe(time.Second); err == nil {
+	if err := e.tryPipe(time.Second); err == nil {
 		t.Fatal("join with a different secret succeeded")
 	}
 	waitUntil(t, 5*time.Second, "auth failure", func() bool { return e.server.ConnectionStats().JoinAuthFailures == 1 })
@@ -165,7 +165,7 @@ func TestJoinSecretDeferredAndStatic(t *testing.T) {
 		t.Fatal("static end pending")
 	}
 	mustSet(t, e.client, joinSecret)
-	if _, err := e.tryPipe(5 * time.Second); err != nil {
+	if err := e.tryPipe(5 * time.Second); err != nil {
 		t.Fatal(err)
 	}
 }

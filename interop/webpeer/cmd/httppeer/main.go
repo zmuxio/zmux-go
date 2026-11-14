@@ -83,13 +83,10 @@ func main() {
 			c, err = zmux.Start(ctx, pipe, zmux.RoleClient, &zmux.Config{})
 		}
 		if err == nil {
-			defer func() { _ = c.Close() }()
 			err = peer.Ping(ctx, c)
+			_ = c.Close()
 		}
-		if err != nil {
-			fmt.Printf("REFUSED %v\n", err)
-			os.Exit(1)
-		}
+		refuse(err)
 	default:
 		check(fmt.Errorf("unknown mode %q", mode))
 	}
@@ -147,6 +144,15 @@ func mp(mode, kind, addr string) {
 		check(peer.Ping(ctx, c))
 	default:
 		check(fmt.Errorf("unknown mode %q", mode))
+	}
+}
+
+// refuse reports a refused client and exits, without running defers: the
+// process ends.
+func refuse(err error) {
+	if err != nil {
+		fmt.Printf("REFUSED %v\n", err)
+		os.Exit(1)
 	}
 }
 

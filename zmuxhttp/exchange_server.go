@@ -451,8 +451,8 @@ func (h *ExchangeHandler) unforgetLocked(cid [exCIDLen]byte) {
 		return
 	}
 	delete(h.gone, cid)
-	for i := len(h.goneQ) - 1; i >= 0; i-- {
-		if h.goneQ[i].cid == cid {
+	for i, g := range slices.Backward(h.goneQ) {
+		if g.cid == cid {
 			h.goneQ = slices.Delete(h.goneQ, i, i+1)
 			break
 		}
@@ -484,9 +484,9 @@ func (h *ExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exReq, f
 	}
 	hh.Set("Content-Length", strconv.Itoa(n))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(hdr[:])
+	_, _ = w.Write(hdr[:]) //nolint:gosec // G705: octet-stream body, not HTML
 	if len(data) > 0 {
-		_, _ = w.Write(data)
+		_, _ = w.Write(data) //nolint:gosec // G705: octet-stream body, not HTML
 	}
 }
 

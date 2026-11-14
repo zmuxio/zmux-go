@@ -57,10 +57,12 @@ type env struct {
 }
 
 func newEnv(t testing.TB, scfg *zmux.Config) *env {
+	t.Helper()
 	return newEnvAt(t, "127.0.0.1:0", scfg)
 }
 
 func newEnvAt(t testing.TB, address string, scfg *zmux.Config) *env {
+	t.Helper()
 	return newEnvQUIC(t, address, scfg, &quic.Config{Allow0RTT: true})
 }
 func newEnvQUIC(t testing.TB, address string, scfg *zmux.Config, qconf *quic.Config) *env {
@@ -349,7 +351,7 @@ func TestQUICPool(t *testing.T) {
 		_ = c.Wait()
 		_ = s.Wait()
 	}()
-	var fates []uint64
+	fates := make([]uint64, 0, 2)
 	for range 2 {
 		pio, err := p.OpenPipe(ctx)
 		if err != nil {

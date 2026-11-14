@@ -25,6 +25,7 @@ type corpusEntry struct {
 }
 
 func loadCorpus(t testing.TB, name string) []corpusEntry {
+	t.Helper()
 	f, err := os.Open(filepath.Join("..", "..", "testdata", "spec", "fixtures", "wire", name))
 	if err != nil {
 		t.Fatal(err)
@@ -178,6 +179,7 @@ func TestCorpusInvalid(t *testing.T) {
 // checkRoundTrip checks the round-trip rule: re-encoding is no longer, decodes
 // to an equal frame and is stable.
 func checkRoundTrip(t testing.TB, id string, b []byte, exact bool) {
+	t.Helper()
 	var f1, f2 Frame
 	n, err := DecodeFrame(b, &f1)
 	if err != nil || n != len(b) {

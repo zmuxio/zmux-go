@@ -70,7 +70,7 @@ func uniReport(t *testing.T, ctx context.Context, c *Conn) string {
 	return string(b)
 }
 
-func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
+func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	p.expect(t, "ESTABLISHED")
 	big := make([]byte, 8<<20)
 	for i := range big {

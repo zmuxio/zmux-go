@@ -45,21 +45,29 @@ func main() {
 		}
 		c, err := zmuxws.Dial(ctx, "ws://"+addr+"/zmux", nil, cfg)
 		if err != nil {
-			fmt.Printf("REFUSED %v\n", err)
 			if mode == "bad" {
+				fmt.Printf("REFUSED %v\n", err)
 				return
 			}
-			os.Exit(1)
+			exit1(fmt.Sprintf("REFUSED %v", err))
 		}
-		defer func() { _ = c.Close() }()
 		if mode == "bad" {
-			fmt.Println("ACCEPTED")
-			os.Exit(1)
+			_ = c.Close()
+			exit1("ACCEPTED")
 		}
-		check(peer.Ping(ctx, c))
+		err = peer.Ping(ctx, c)
+		_ = c.Close()
+		check(err)
 	default:
 		check(fmt.Errorf("unknown mode %q", mode))
 	}
+}
+
+// exit1 prints line and exits with status 1, without running defers: the
+// process ends.
+func exit1(line string) {
+	fmt.Println(line)
+	os.Exit(1)
 }
 
 func check(err error) {

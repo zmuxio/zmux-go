@@ -92,7 +92,7 @@ func TestRejectReasonsAndNoReply(t *testing.T) {
 			t.Errorf("%s: client %v", c.name, cerr)
 		}
 	}
-	g := &profileGate{gate: gate{handle: f.handle, psk: f.psk}}
+	g := &profileGate{gate: gate{handle: f.handle, psk: f.psk}} //nolint:modernize // embedlit: the go1.27 compiler rejects the elided form
 	sc := f.server
 	sc.Gate = g
 	a, b := net.Pipe()

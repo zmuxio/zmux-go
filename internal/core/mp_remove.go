@@ -301,7 +301,7 @@ func (s *Session) liveCounts() (out, in int) {
 			in++
 		}
 	}
-	return
+	return out, in
 }
 
 // checkLastPipe handles the loss of the last live pipe of a direction:

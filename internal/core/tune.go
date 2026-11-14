@@ -156,7 +156,7 @@ func (s *Session) tuneScopeData(t *tuner, off uint64) {
 
 // tuneBlocked records a BLOCKED frame at limit.
 func (t *tuner) blockedAt(limit uint64) {
-	for i := 0; i < t.pn; i++ {
+	for i := range t.pn {
 		p := &t.pend[(t.ph+i)%tunePendMax]
 		if p.oldLimit == limit {
 			p.blocked = true

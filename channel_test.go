@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,13 +45,15 @@ func (c *chanConn) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 	return c.demux.Register(c.id, deliver)
 }
 
-// chanPair returns two connected chanConns of channel size max.
-func chanPair(t *testing.T, max int) (*chanConn, *chanConn) {
+// chanPair returns two connected chanConns of channel size 1200.
+func chanPair(t *testing.T) (*chanConn, *chanConn) {
+	t.Helper()
+	const maxSize = 1200
 	a, b := tcpPair(t)
 	ca, cb := &chanConn{Conn: a, id: 4}, &chanConn{Conn: b, id: 4}
 	ca.peer, cb.peer = cb, ca
-	ca.max.Store(int64(max))
-	cb.max.Store(int64(max))
+	ca.max.Store(int64(maxSize))
+	cb.max.Store(int64(maxSize))
 	return ca, cb
 }
 
@@ -104,7 +106,7 @@ func sentStats(t *testing.T, c *Conn, sent uint64) ConnectionStats {
 }
 
 func TestChannelDatagrams(t *testing.T) {
-	a, b := chanPair(t, 1200)
+	a, b := chanPair(t)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
 	if got := exchangeDatagrams(t, c, s, 50, 100); got != 50 {
 		t.Fatalf("%d of 50 datagrams", got)
@@ -155,7 +157,7 @@ func TestChannelDatagrams(t *testing.T) {
 
 // A lost channel datagram is lost: it is not resent in a record.
 func TestChannelDatagramsLost(t *testing.T) {
-	a, b := chanPair(t, 1200)
+	a, b := chanPair(t)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
 	a.drop.Store(true)
 	if got := exchangeDatagrams(t, c, s, 5, 100); got != 0 {
@@ -167,7 +169,7 @@ func TestChannelDatagramsLost(t *testing.T) {
 func TestChannelDatagramsNegotiation(t *testing.T) {
 	for _, side := range []string{"client", "server"} {
 		t.Run("plain "+side, func(t *testing.T) {
-			a, b := chanPair(t, 1200)
+			a, b := chanPair(t)
 			var ca, cb net.Conn = a, b
 			if side == "client" {
 				ca = a.Conn
@@ -187,7 +189,7 @@ func TestChannelDatagramsNegotiation(t *testing.T) {
 		})
 	}
 	t.Run("datagrams disabled on one side", func(t *testing.T) {
-		a, b := chanPair(t, 1200)
+		a, b := chanPair(t)
 		c, s := pair(t, a, b, dgramCfg(), nil)
 		if err := c.SendDatagram([]byte("x")); err == nil {
 			t.Fatal("datagram sent to a peer without datagrams")
@@ -200,7 +202,7 @@ func TestChannelDatagramsNegotiation(t *testing.T) {
 }
 
 func TestChannelDatagramsShaped(t *testing.T) {
-	a, b := chanPair(t, 1200)
+	a, b := chanPair(t)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
 	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 1 }), nil)
 	if got := exchangeDatagrams(t, c, s, 5, 100); got != 5 {
@@ -213,7 +215,7 @@ func TestChannelDatagramsShaped(t *testing.T) {
 
 func TestChannelDatagramsReceiveErrors(t *testing.T) {
 	t.Run("unknown pipe", func(t *testing.T) {
-		a, b := chanPair(t, 1200)
+		a, b := chanPair(t)
 		c, s := pair(t, a, b, dgramCfg(), dgramCfg())
 		b.demux.Deliver(wire.AppendChannelDatagram(nil, true, 8, []byte{0, 'x'}))
 		b.demux.Deliver([]byte{0x40}) // truncated Pipe Stream ID
@@ -230,7 +232,7 @@ func TestChannelDatagramsReceiveErrors(t *testing.T) {
 		"empty":       {},
 	} {
 		t.Run(name, func(t *testing.T) {
-			a, b := chanPair(t, 1200)
+			a, b := chanPair(t)
 			_, s := pair(t, a, b, dgramCfg(), dgramCfg())
 			b.demux.Deliver(append([]byte{4}, frame...))
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -256,12 +258,12 @@ func TestChannelDemuxSessions(t *testing.T) {
 		stops[i] = d.Register(uint64(i*4), func(f []byte) { got[i] = append(got[i], string(f)) })
 	}
 	for i := range 3 {
-		d.Deliver(wire.AppendChannelDatagram(nil, true, uint64(i*4), []byte(fmt.Sprint(i))))
+		d.Deliver(wire.AppendChannelDatagram(nil, true, uint64(i*4), []byte(strconv.Itoa(i))))
 	}
 	stops[1]()
 	d.Deliver(wire.AppendChannelDatagram(nil, true, 4, []byte("late")))
 	for i, g := range got {
-		if len(g) != 1 || g[0] != "\x30"+fmt.Sprint(i) {
+		if len(g) != 1 || g[0] != "\x30"+strconv.Itoa(i) {
 			t.Fatalf("pipe %d got %q", i, g)
 		}
 	}
@@ -284,7 +286,7 @@ func TestChannelDemuxSessions(t *testing.T) {
 // A stream datagram sent on the channel right after the stream's opening
 // frame may overtake it; the receiver holds it until the stream opens.
 func TestChannelStreamDatagramOvertakesOpening(t *testing.T) {
-	a, b := chanPair(t, 1200)
+	a, b := chanPair(t)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -319,7 +321,7 @@ func TestChannelStreamDatagramOvertakesOpening(t *testing.T) {
 // without waiting for its lock, so that a connection's receive loop shared
 // by several sessions is not held up by one of them.
 func TestChannelHandOff(t *testing.T) {
-	a, b := chanPair(t, 1200)
+	a, b := chanPair(t)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
 	// Capture what c sends on the channel instead of delivering it.
 	capture := &chanConn{}
@@ -380,7 +382,7 @@ func TestChannelHandOff(t *testing.T) {
 // The channel of a read half stays visible behind the bytes classification
 // read back; the write half need not offer it.
 func TestChannelOfBehindPrefix(t *testing.T) {
-	a, _ := chanPair(t, 1200)
+	a, _ := chanPair(t)
 	w := struct{ io.WriteCloser }{a}
 	for _, framing := range []Framing{FramingByteStream, FramingRecords} {
 		p := withPrefix(PipeIO{R: a, W: w, Framing: framing}, []byte{1})

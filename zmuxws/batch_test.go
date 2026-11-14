@@ -59,7 +59,7 @@ func frames(t *testing.T, b []byte) [][]byte {
 			hl += 4
 		}
 		if uint64(len(b)-hl) < l {
-			t.Fatalf("a frame cut across writes")
+			t.Fatal("a frame cut across writes")
 		}
 		p := bytes.Clone(b[hl : hl+int(l)])
 		for i := range p {

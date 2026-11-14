@@ -120,9 +120,7 @@ func TestPipeSetLiveness(t *testing.T) {
 	}
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		buf := make([]byte, 16<<10)
 		for {
 			select {
@@ -134,9 +132,8 @@ func TestPipeSetLiveness(t *testing.T) {
 				return
 			}
 		}
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		for i := range 200 {
 			l := Liveness{ProbeInterval: time.Duration(1+i%5) * time.Second, DeadTimeout: time.Duration(1+i%3) * time.Second}
 			if err := e.client.SetLiveness(l); err != nil {
@@ -145,9 +142,8 @@ func TestPipeSetLiveness(t *testing.T) {
 			}
 			_ = e.client.Liveness()
 		}
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		for i := range 200 {
 			var err error
 			if i%2 == 0 {
@@ -161,7 +157,7 @@ func TestPipeSetLiveness(t *testing.T) {
 			}
 			_ = e.server.RaiseIncomingStreams(int64(300+i), 0)
 		}
-	}()
+	})
 	time.Sleep(300 * time.Millisecond)
 	close(stop)
 	wg.Wait()

@@ -61,7 +61,7 @@ type relayConn struct {
 // NewRelay listens on 127.0.0.1 and relays each accepted connection to
 // target.
 func NewRelay(target string, o RelayOptions) (*Relay, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}

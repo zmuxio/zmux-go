@@ -237,7 +237,6 @@ func chooseCandidate(raw json.RawMessage, tables map[string]json.RawMessage, o *
 	if json.Unmarshal(raw, &cands) != nil || cands == nil {
 		return nil, bad("candidates")
 	}
-next:
 	for i, c := range cands {
 		var m map[string]json.RawMessage
 		if json.Unmarshal(c, &m) != nil || m == nil {
@@ -257,7 +256,7 @@ next:
 				known = known && slices.Contains(o.Features, *s)
 			}
 			if !known {
-				continue next
+				continue
 			}
 		}
 		cand, err := machine.ParseCandidate(c, tables, o.Size)
@@ -266,5 +265,5 @@ next:
 		}
 		return &Entry{Index: i, Candidate: cand}, nil
 	}
-	return nil, nil
+	return nil, nil //nolint:nilnil // no applicable candidate is not an error
 }

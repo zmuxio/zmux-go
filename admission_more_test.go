@@ -30,7 +30,7 @@ func testHeader() []byte {
 // skips; calls counts its calls.
 func classifyingAdmission(calls *sync.Map) *Admission {
 	return &Admission{Peek: 2, MaxPeek: 64, PeekTimeout: 5 * time.Second,
-		Decide: func(_ context.Context, info *CarrierInfo, prefix []byte) Decision {
+		Decide: func(_ context.Context, _ *CarrierInfo, prefix []byte) Decision {
 			n, _ := calls.LoadOrStore("n", new(int))
 			*n.(*int)++
 			c, need := wire.ClassifyFirstBytes(prefix, false)

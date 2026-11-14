@@ -103,7 +103,7 @@ func command(t *testing.T, ctx context.Context, c *zmux.Conn, cmd string, body [
 
 // bulkAndClose runs parallel bulk echoes (which open lanes), checks the
 // lanes, then has the peer close the session.
-func bulkAndClose(t *testing.T, ctx context.Context, c *zmux.Conn, p *peerProc) {
+func bulkAndClose(t *testing.T, ctx context.Context, c *zmux.Conn, p *peerProc) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	var wg sync.WaitGroup
 	errs := make(chan error, 6)
 	for range 6 {

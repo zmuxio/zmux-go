@@ -31,8 +31,8 @@ type delayConn struct {
 	mu   sync.Mutex
 }
 
-func newDelayConn(c net.Conn, d time.Duration, rate float64, cap int) *delayConn {
-	dc := &delayConn{Conn: c, d: d, rate: rate, cap: cap, sig: make(chan struct{}, 1), room: make(chan struct{}, 1), done: make(chan struct{})}
+func newDelayConn(c net.Conn, d time.Duration, rate float64, capacity int) *delayConn {
+	dc := &delayConn{Conn: c, d: d, rate: rate, cap: capacity, sig: make(chan struct{}, 1), room: make(chan struct{}, 1), done: make(chan struct{})}
 	go dc.run()
 	return dc
 }
@@ -136,6 +136,7 @@ func (l *linkListener) Accept() (net.Conn, error) {
 // links (the first is the bootstrap pair, the others join) in a synctest
 // bubble and returns the bytes echoed after at.
 func echoed(t *testing.T, links []link, win uint64, at time.Duration) (int64, ConnectionStats, uint64) {
+	t.Helper()
 	var got int64
 	var cs ConnectionStats
 	var firstSent uint64 // bytes sent on the bootstrap pipe

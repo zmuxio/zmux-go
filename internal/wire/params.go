@@ -156,18 +156,17 @@ func DecodeParams(b []byte, p *Params) *Error {
 			return ErrParam("prohibited QUIC parameter")
 		}
 		bit, known := paramBits[id]
-		if known {
-			if p.Has&bit != 0 {
-				return ErrParam("duplicate parameter")
-			}
-			p.Has |= bit
-		} else {
+		if !known {
 			if slices.Contains(seenUnknown, id) {
 				return ErrParam("duplicate parameter")
 			}
 			seenUnknown = append(seenUnknown, id)
 			continue
 		}
+		if p.Has&bit != 0 {
+			return ErrParam("duplicate parameter")
+		}
+		p.Has |= bit
 		if err := p.decodeOne(id, v); err != nil {
 			return err
 		}

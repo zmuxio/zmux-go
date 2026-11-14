@@ -1,6 +1,7 @@
 package seal_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -42,15 +43,14 @@ func echo1(t *testing.T, cp, sp zmux.PipeIO) {
 		}
 		go func() { _ = w.WriteMessage(msg) }()
 		got, err := r.ReadMessage()
-		if err != nil || string(got) != string(msg) {
+		if err != nil || !bytes.Equal(got, msg) {
 			t.Fatalf("read %q: %v", got, err)
 		}
 	}
 }
 
 func rejectReason(err error) string {
-	var rej *zmux.RejectError
-	if errors.As(err, &rej) {
+	if rej, ok := errors.AsType[*zmux.RejectError](err); ok {
 		return rej.Reason
 	}
 	return ""

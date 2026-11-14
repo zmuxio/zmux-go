@@ -138,15 +138,17 @@ func TestEstablishHookPanicAndLimits(t *testing.T) {
 		return [2]int{w[0], w[1]}
 	}
 	base := run(func(*fixture) {})
-	if got := run(func(f *fixture) {
+	got := run(func(f *fixture) {
 		f.client.Shaper = func(*shaping.HandshakeView, *shaping.UnitPlan) bool { panic("x") }
-	}); got != base {
+	})
+	if got != base {
 		t.Fatalf("panic: %v, want %v", got, base)
 	}
-	if got := run(func(f *fixture) {
+	got = run(func(f *fixture) {
 		f.client.Shaper = byName(map[string]int{proto.HandshakeEstablish + "/hello": 900})
 		f.client.ShapingLimits.NoPadding = true
-	}); got != base {
+	})
+	if got != base {
 		t.Fatalf("no padding: %v, want %v", got, base)
 	}
 }

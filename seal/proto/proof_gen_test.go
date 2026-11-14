@@ -13,10 +13,11 @@ type vkey struct {
 	seed []byte
 }
 
-func newVKey(t testing.TB, alg KeyAlg, label string) vkey {
+// newVKey is the deterministic ML-DSA-44 key of label.
+func newVKey(t testing.TB, label string) vkey {
 	t.Helper()
 	seed := fixed(label)
-	k, err := NewSigningKey(alg, seed)
+	k, err := NewSigningKey(KeyAlgMLDSA44, seed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,6 +27,7 @@ func newVKey(t testing.TB, alg KeyAlg, label string) vkey {
 
 // proofOf signs M of message idx with k.
 func proofOf(t testing.TB, k vkey, idx int, hp []byte) *Proof {
+	t.Helper()
 	sig, err := k.Sign(ProofMessage(idx, hp))
 	if err != nil {
 		t.Fatal(err)
@@ -85,8 +87,9 @@ type sideOpts struct {
 // credHandshake is an Establish whose message 2 carries the server's side of
 // srv and message 3 the client's side of cli (nil: an empty message 3).
 func credHandshake(t testing.TB, name string, p Profile, srv sideOpts, cli *sideOpts) handshakeVector {
+	t.Helper()
 	v := defaults(p, Sealed)
-	keys := [3]vkey{1: newVKey(t, KeyAlgMLDSA44, "server proof key"), 2: newVKey(t, KeyAlgMLDSA44, "client proof key")}
+	keys := [3]vkey{1: newVKey(t, "server proof key"), 2: newVKey(t, "client proof key")}
 	sides := [3]*sideOpts{1: &srv, 2: cli}
 	creds := [3]*Credential{1: {Type: privateCredType, Data: []byte("server credential")}, 2: {Type: privateCredType, Data: []byte("client credential")}}
 	var proofs [3]*Proof
@@ -138,6 +141,7 @@ func credHandshake(t testing.TB, name string, p Profile, srv sideOpts, cli *side
 }
 
 func genCredHandshakes(t testing.TB) []handshakeVector {
+	t.Helper()
 	var out []handshakeVector
 	for _, p := range allProfiles {
 		out = append(out, credHandshake(t, fmt.Sprintf("profile%d-sealed-opaque-credential", p), p, sideOpts{cred: true}, nil))

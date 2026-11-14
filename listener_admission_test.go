@@ -132,7 +132,9 @@ func TestAdmissionSource(t *testing.T) {
 	close(release)
 	<-done
 	<-done2
-	_, _, _ = b.Close(), d.Close(), f.Close()
+	_ = b.Close()
+	_ = d.Close()
+	_ = f.Close()
 	if st := lst.Stats(); st.Refused != 1 || st.Admission.Closed != 2 {
 		t.Fatalf("stats %+v", st)
 	}
@@ -152,7 +154,7 @@ func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 	defer cancel()
 	src := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}
 	var wg sync.WaitGroup
-	var clients []net.Conn
+	clients := make([]net.Conn, 0, 2)
 	for range 2 { // silent clients: their handshakes never finish
 		a, b := net.Pipe()
 		clients = append(clients, b)
@@ -242,8 +244,8 @@ func TestAdmissionStats(t *testing.T) {
 		t.Fatalf("skip: %+v", st)
 	}
 	// Accepted: the carrier goes on to the listener, counted there once.
-	if st := run(&Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{} }}, nil,
-		[]byte("GET / HTTP/1.1\r\n\r\n"), false); !eqAdm(st.Admission, AdmissionStats{Accepted: 1}) || st.Rejected != 1 {
+	accept := &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{} }}
+	if st := run(accept, nil, []byte("GET / HTTP/1.1\r\n\r\n"), false); !eqAdm(st.Admission, AdmissionStats{Accepted: 1}) || st.Rejected != 1 {
 		t.Fatalf("accept: %+v", st)
 	}
 	// A failed TLS handshake is HandshakeFailed, not a setup failure.

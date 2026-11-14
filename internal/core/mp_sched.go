@@ -744,12 +744,11 @@ func (s *Session) customOK(d *decision, st *Stream) bool {
 	mp := s.mp
 	a := m.pick
 	if a.set && a.gen == mp.pickGen {
-		if a.wait {
-			if a.epoch == mp.inputEpoch {
-				return false
-			}
-		} else {
+		if !a.wait {
 			return a.pipe == d.p.id && s.pipeTakesAny(d.p)
+		}
+		if a.epoch == mp.inputEpoch {
+			return false
 		}
 	}
 	if !a.asked || a.gen != mp.pickGen {

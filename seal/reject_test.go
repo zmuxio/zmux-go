@@ -158,7 +158,7 @@ func TestFinishFramingRejected(t *testing.T) {
 	// The end of the carrier before the Finish is no rejection.
 	a, b = msgPair()
 	a.end = true
-	_, _, _, serr = establishPair(t, ctx, &f.client, &f.server, a.pipe(), b.pipe())
+	_, serr = establishErrs(t, ctx, &f.client, &f.server, a.pipe(), b.pipe())
 	if serr == nil || errors.As(serr, &rej) {
 		t.Fatalf("carrier end: server %v", serr)
 	}
@@ -189,7 +189,7 @@ func TestBindingMismatch(t *testing.T) {
 		srv := &secureConn{Conn: b, exp: bytes.Repeat([]byte{1}, 32)}
 		served := make(chan struct{})
 		go func() { defer close(served); _ = l.HandlePipe(ctx, zmux.PipeIO{R: srv, W: srv}, zmux.PipeHint{}) }()
-		cli := &readCounter{secureConn: secureConn{Conn: a, exp: bytes.Repeat([]byte{2}, 32)}}
+		cli := &readCounter{secureConn: secureConn{Conn: a, exp: bytes.Repeat([]byte{2}, 32)}} //nolint:modernize // embedlit: the go1.27 compiler rejects the elided form
 		cc := f.client
 		cc.RecordMode = zmux.RecordBound
 		start := time.Now()

@@ -78,6 +78,7 @@ type joinCase struct {
 }
 
 func (c joinCase) group(t testing.TB) *join.Group {
+	t.Helper()
 	g, ok := join.LookupGroup(c.Group)
 	if !ok {
 		t.Fatal("no group", c.Group)
@@ -232,6 +233,7 @@ func (c joinCase) withPayloads(h join.HelloPayload, r join.ReplyPayload) joinCas
 }
 
 func (c joinCase) joiner(t testing.TB, f Framing) (*join.Joiner, error) {
+	t.Helper()
 	return join.NewJoinerFixed(join.JoinerConfig{
 		Suite: joinSuite(t, c.Suite), Group: c.group(t), Phase: c.ModeByte >> 7, Mode: Mode(c.Mode), Framing: f, Locator: c.Locator, PSK: c.JoinPSK, Binding: c.Binding,
 	}, join.Entropy{Attempt: c.Attempt, Random: c.RandomI}, c.randI())
@@ -338,6 +340,7 @@ var (
 // genJoins builds join.json: each Suite, Group, Mode, joiner role and phase, with
 // and without a batch, and variants.
 func genJoins(t testing.TB) []joinVector {
+	t.Helper()
 	var out []joinVector
 	for _, id := range []uint64{join.SuiteAES, join.SuiteChaCha} {
 		for _, g := range []uint64{join.GroupX25519, join.GroupX25519MLKEM768} {
@@ -528,7 +531,8 @@ func (c joinCase) replyOf(t testing.TB, f Framing, payload []byte) []byte {
 
 // honestConfirm is the Confirm of an honest Join of c on f.
 func (c joinCase) honestConfirm(t testing.TB, f Framing) []byte {
-	_, _, confirm, _ := c.run(t, f)
+	t.Helper()
+	_, _, confirm, _ := c.run(t, f) //nolint:dogsled // only the Confirm of the run is checked
 	return confirm
 }
 
@@ -540,6 +544,7 @@ func setByte(b []byte, at int, v byte) []byte {
 
 // genJoinNegatives builds join_negative.json.
 func genJoinNegatives(t testing.TB) []joinNegative {
+	t.Helper()
 	var out []joinNegative
 	add := func(name string, c joinCase, side, framing, want string, steps ...joinStep) {
 		v := joinNegative{Name: name, joinCase: c, Side: side, Framing: framing, Steps: steps, Error: want}

@@ -509,7 +509,7 @@ func askBudget(l *slog.Logger, f func() shaping.Budget) (b shaping.Budget) {
 }
 
 // coreConfig validates c and resolves it for the core.
-func (c *Config) coreConfig(role core.Role, transport core.Role) (core.Config, error) {
+func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	if c == nil {
 		return (&Config{}).coreConfig(role, transport)
 	}

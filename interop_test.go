@@ -170,7 +170,7 @@ func command(t *testing.T, ctx context.Context, c *Conn, cmd string, body []byte
 	return string(b)
 }
 
-func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
+func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	// Bulk echo, several at once.
 	errs := make(chan error, 4)
 	for range 4 {
@@ -235,19 +235,17 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 		}
 	}
 	// A bidirectional stream the peer opens.
-	{
-		go func() {
-			st, err := c.AcceptStream(ctx)
-			if err != nil {
-				return
-			}
-			b, _ := io.ReadAll(st)
-			_, _ = st.Write(append([]byte(string(st.Preamble())+":"), b...))
-			_ = st.Close()
-		}()
-		if r := command(t, ctx, c, "open-bidi:hello", nil); r != "opened=back:hello" {
-			t.Fatalf("open-bidi: %q", r)
+	go func() {
+		st, err := c.AcceptStream(ctx)
+		if err != nil {
+			return
 		}
+		b, _ := io.ReadAll(st)
+		_, _ = st.Write(append([]byte(string(st.Preamble())+":"), b...))
+		_ = st.Close()
+	}()
+	if r := command(t, ctx, c, "open-bidi:hello", nil); r != "opened=back:hello" {
+		t.Fatalf("open-bidi: %q", r)
 	}
 	// A unidirectional stream the peer opens.
 	{
@@ -480,6 +478,7 @@ func interopKeys(t *testing.T, c *Conn, p *peerProc, wantLen int) {
 }
 
 func interopTLSClient(t *testing.T, split bool) {
+	t.Helper()
 	p := startPeer(t, "tls-server")
 	addr := p.expect(t, "LISTEN ")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -516,6 +515,7 @@ func interopTLSClient(t *testing.T, split bool) {
 }
 
 func interopTLSServer(t *testing.T, mode string, wantLen int) {
+	t.Helper()
 	if os.Getenv("ZMUX_INTEROP_PEER") == "" {
 		t.Skip("ZMUX_INTEROP_PEER not set")
 	}

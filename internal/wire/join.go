@@ -9,7 +9,7 @@ import (
 const ExporterSession = "EXPORTER-zmux-session"
 
 // SessionSecret derives the session secret.
-func SessionSecret(initNonce, respNonce []byte, exporter, psk []byte) []byte {
+func SessionSecret(initNonce, respNonce, exporter, psk []byte) []byte {
 	salt := make([]byte, 0, 12+32)
 	salt = append(salt, "zmux session"...)
 	salt = append(salt, initNonce...)

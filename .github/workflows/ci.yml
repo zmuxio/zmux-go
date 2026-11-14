@@ -69,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", zmuxquic, zmuxh3, zmuxws, seal, examples/xorpipe]
+        module: [".", zmuxquic, zmuxh3, zmuxws, seal, examples/xorpipe, interop/webpeer]
     steps:
       - uses: actions/checkout@v7
 
@@ -80,5 +80,8 @@ jobs:
 
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          # Pinned: the config enables every linter by default, so a newer release adds checks.
+          version: v2.15.0
           working-directory: ${{ matrix.module }}
+          # One config for every module; paths in it are relative to it.
+          args: --config=${{ github.workspace }}/.golangci.yml

@@ -11,8 +11,9 @@ import (
 func TestCarrierCacheRestoreBoundsTimes(t *testing.T) {
 	far := formatCacheTime(time.Now().Add(10 * 365 * 24 * time.Hour))
 	cc := &CarrierCache{}
-	if err := cc.Restore([]byte(`{"version":1,"entries":[{"key":"g","kind":"split","good_until":"` + far +
-		`"},{"key":"f","kind":"split","fail_until":"` + far + `","backoff_ms":60000}]}`)); err != nil {
+	doc := `{"version":1,"entries":[{"key":"g","kind":"split","good_until":"` + far +
+		`"},{"key":"f","kind":"split","fail_until":"` + far + `","backoff_ms":60000}]}`
+	if err := cc.Restore([]byte(doc)); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := cc.Snapshot()

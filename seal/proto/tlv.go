@@ -65,7 +65,8 @@ func (p Payload) known() (k payloadSet) {
 
 // appendPayload encodes p in the order of its types. Padding bytes are zero,
 // or random when the payload goes without a key.
-func appendPayload(b []byte, p Payload, random bool) ([]byte, error) {
+func appendPayload(p Payload, random bool) ([]byte, error) {
+	var b []byte
 	if p.Padding > 0 || p.PadEmpty {
 		b = appendItemHeader(b, tlvPadding, p.Padding)
 		v := make([]byte, p.Padding)
@@ -96,7 +97,7 @@ func appendPayload(b []byte, p Payload, random bool) ([]byte, error) {
 // PayloadLen is the plaintext length of p without padding.
 func PayloadLen(p Payload) int {
 	p.Padding, p.PadEmpty = 0, false
-	b, _ := appendPayload(nil, p, false)
+	b, _ := appendPayload(p, false)
 	return len(b)
 }
 

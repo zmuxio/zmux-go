@@ -163,6 +163,7 @@ type configVector struct {
 }
 
 func (v configVector) start(t testing.TB) error {
+	t.Helper()
 	if v.Kind == "session_crypto" {
 		_, err := join.SessionCrypto(v.Crypto.wire(), fullCrypto.wire())
 		return err
@@ -204,6 +205,7 @@ func (v configVector) start(t testing.TB) error {
 }
 
 func genConfigs(t testing.TB) []configVector {
+	t.Helper()
 	psk, h, st, b := fixed("psk"), fixed("handle")[:16], fixed("initiator static"), fixed("binding")
 	out := []configVector{
 		{Name: "establish-binding-surplus-sealed", Kind: "establish", Profile: 1, Handle: h, Static: st, PSK: psk, Binding: b},
@@ -268,6 +270,7 @@ type receiverVectors struct {
 }
 
 func genReceivers(t testing.TB) receiverVectors {
+	t.Helper()
 	var out receiverVectors
 	p1 := defaults(ProfileEstablishPSK, Sealed)
 	hello := func(w []byte) stepVector { return stepVector{Op: "hello", Wire: w} }

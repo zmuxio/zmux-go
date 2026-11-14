@@ -102,6 +102,7 @@ func (j *Joiner) ConfirmWire() (w, room int) {
 	case Trusted:
 		h := j.cfg.Suite.Hash.Size()
 		return framingLen(j.cfg.Framing) + h, MaxMessage - h
+	default:
+		return 0, 0
 	}
-	return 0, 0
 }

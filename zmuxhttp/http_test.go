@@ -96,7 +96,7 @@ func TestHTTPCarriers(t *testing.T) {
 // A refused uplink reports the status through its write half.
 func TestHTTPPipeSendOnlyStatus(t *testing.T) {
 	leakcheck.Check(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "no", http.StatusForbidden)
 	}))
 	defer srv.Close()

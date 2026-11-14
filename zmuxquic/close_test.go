@@ -33,6 +33,7 @@ func TestCloseDelivery(t *testing.T) {
 }
 
 func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, reason string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	e := newEnv(t, nil)

@@ -1,7 +1,8 @@
 package core
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
@@ -53,7 +54,7 @@ func (a *attach) liveOut() bool {
 // controlRank orders outbound pipes for control frames.
 func (s *Session) controlRank(p *Pipe) (int, uint64, int, Duration) {
 	a := p.mp
-	r := 0
+	var r int
 	switch {
 	case a.out == OutActive:
 		r = 0
@@ -84,22 +85,22 @@ func (s *Session) controlOrder(dst []*Pipe) []*Pipe {
 			dst = append(dst, p)
 		}
 	}
-	sort.SliceStable(dst, func(i, j int) bool {
-		ri, pi, si, oi := s.controlRank(dst[i])
-		rj, pj, sj, oj := s.controlRank(dst[j])
-		if ri != rj {
-			return ri < rj
+	slices.SortStableFunc(dst, func(x, y *Pipe) int {
+		rx, px, sx, ox := s.controlRank(x)
+		ry, py, sy, oy := s.controlRank(y)
+		if c := cmp.Compare(rx, ry); c != 0 {
+			return c
 		}
-		if si != sj {
-			return si < sj
+		if c := cmp.Compare(sx, sy); c != 0 {
+			return c
 		}
-		if pi != pj {
-			return pi < pj
+		if c := cmp.Compare(px, py); c != 0 {
+			return c
 		}
-		if oi != oj {
-			return oi < oj
+		if c := cmp.Compare(ox, oy); c != 0 {
+			return c
 		}
-		return dst[i].id < dst[j].id
+		return cmp.Compare(x.id, y.id)
 	})
 	return dst
 }

@@ -36,6 +36,7 @@ func newEnds(tb testing.TB, p Profile, m Mode, iStatic, rStatic *ecdh.PrivateKey
 
 // run makes a whole handshake and returns the three messages.
 func (e handshakeEnds) run(tb testing.TB) (msgs [3][]byte, ri, rr *Result) {
+	tb.Helper()
 	i, err := NewInitiator(e.cfgI)
 	if err != nil {
 		tb.Fatal(err)

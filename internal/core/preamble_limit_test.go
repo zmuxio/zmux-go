@@ -47,7 +47,9 @@ func TestPreambleSetterLimit(t *testing.T) {
 		t.Fatalf("preamble changed: %+v", st.pre)
 	}
 	// Exactly at the limit fits.
-	for v := 100; s.AddPreambleTLV(st, 0x1000, make([]byte, v)) != nil; v-- {
+	v := 100
+	for s.AddPreambleTLV(st, 0x1000, make([]byte, v)) != nil {
+		v--
 	}
 	if st.preSize() != 100 {
 		t.Fatalf("preamble of %d bytes, want 100", st.preSize())

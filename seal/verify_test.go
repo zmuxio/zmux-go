@@ -107,7 +107,7 @@ func TestVerifyErrorKinds(t *testing.T) {
 		sc := f.server
 		sc.ClientAnchor = c.anchor
 		x, y := net.Pipe()
-		_, _, _, serr := establishPair(t, ctx, &f.client, &sc, zmux.NetPipe(x), zmux.NetPipe(y))
+		_, serr := establishErrs(t, ctx, &f.client, &sc, zmux.NetPipe(x), zmux.NetPipe(y))
 		var re *zmux.RejectError
 		if errors.As(serr, &re) != c.reject {
 			t.Errorf("%s: %v", c.name, serr)
@@ -226,7 +226,7 @@ func TestVerifierPanicHidesValue(t *testing.T) {
 	sc := f.server
 	sc.ClientAnchor = secretPanic{}
 	x, y := net.Pipe()
-	_, _, _, serr := establishPair(t, ctx, &f.client, &sc, zmux.NetPipe(x), zmux.NetPipe(y))
+	_, serr := establishErrs(t, ctx, &f.client, &sc, zmux.NetPipe(x), zmux.NetPipe(y))
 	if serr == nil || strings.Contains(serr.Error(), "hunter2") || !strings.Contains(serr.Error(), "verifier panicked (string)") {
 		t.Fatalf("error %v", serr)
 	}

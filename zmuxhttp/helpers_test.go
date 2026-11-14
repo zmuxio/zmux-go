@@ -40,12 +40,13 @@ func mustNewListener(cfg *zmux.ListenerConfig) *zmux.Listener {
 }
 
 func waitDone(t testing.TB, c *zmux.Conn) {
+	t.Helper()
 	done := make(chan struct{})
 	go func() { _ = c.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatalf("session did not end")
+		t.Fatal("session did not end")
 	}
 }
 
@@ -159,7 +160,7 @@ func testHeader() []byte {
 // skips; calls counts its calls.
 func classifyingAdmission(calls *sync.Map) *zmux.Admission {
 	return &zmux.Admission{Peek: 2, MaxPeek: 64, PeekTimeout: 5 * time.Second,
-		Decide: func(_ context.Context, info *zmux.CarrierInfo, prefix []byte) zmux.Decision {
+		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
 			n, _ := calls.LoadOrStore("n", new(int))
 			*n.(*int)++
 			c, need := admit.ClassifyFirstBytes(prefix, zmux.FramingByteStream)

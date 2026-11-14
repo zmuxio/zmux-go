@@ -126,6 +126,7 @@ func duplicateSnapshot(c *Conn) duplicateInput {
 // Endpoint names one end of a session, seen from this end.
 type Endpoint uint8
 
+// The two ends of a session.
 const (
 	EndpointLocal Endpoint = iota + 1
 	EndpointPeer

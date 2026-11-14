@@ -67,7 +67,7 @@ func TestDatagramMaxPayloadIsSendable(t *testing.T) {
 }
 
 func TestDatagramDataMax(t *testing.T) {
-	for capy := uint64(0); capy < 20000; capy++ {
+	for capy := range uint64(20000) {
 		for _, wl := range []bool{false, true} {
 			n := datagramDataMax(capy, wl)
 			if n > 0 && uint64(datagramFrameLen(n, wl)) > capy || uint64(datagramFrameLen(n+1, wl)) <= capy {

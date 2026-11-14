@@ -255,7 +255,7 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte{2, 0, 1, 'h', 0, 0})
 	f.Add([]byte{8, 0x40, 9})
 	f.Add(append(item(1, 2, 1, 0), item(8, 2, 3, 0)...))
-	f.Fuzz(func(t *testing.T, b []byte) {
+	f.Fuzz(func(_ *testing.T, b []byte) {
 		_, _, _ = ParseHello(b, Stream)
 		_, _, _ = ParseHello(b, Message)
 		_, _ = parsePayload(b, knownCredential|knownAppData|knownFirstBytes|knownProof, DefaultMaxAppData, false)

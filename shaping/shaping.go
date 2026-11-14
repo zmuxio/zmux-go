@@ -89,6 +89,7 @@ type Shaper interface {
 // Caps is a set of capabilities.
 type Caps uint32
 
+// Capabilities a Shaper declares.
 const (
 	CapPlan     Caps = 1 << iota // Plan is called
 	CapRecordIn                  // EventRecordIn is delivered
@@ -124,6 +125,7 @@ type RecordPlan struct {
 // EventKind identifies an Event.
 type EventKind uint8
 
+// Event kinds.
 const (
 	EventStart         EventKind = iota + 1 // the instance was installed
 	EventReplaced                           // the instance was replaced; no further calls
@@ -151,6 +153,7 @@ type Event struct {
 // EffectSet says which items of Effects change.
 type EffectSet uint8
 
+// Effect items.
 const (
 	EffectInject EffectSet = 1 << iota
 	EffectWake

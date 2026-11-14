@@ -143,7 +143,7 @@ func TestAppDataLimits(t *testing.T) {
 
 	cc.AppData = func(context.Context, seal.AppDataRequest) ([]byte, error) { return make([]byte, 300), nil }
 	x, y = net.Pipe()
-	_, _, _, serr = establishPair(t, ctx, &cc, &f.server, zmux.NetPipe(x), zmux.NetPipe(y))
+	_, serr = establishErrs(t, ctx, &cc, &f.server, zmux.NetPipe(x), zmux.NetPipe(y))
 	if !errors.Is(serr, proto.ErrTooLarge) {
 		t.Fatalf("over the bound: %v", serr)
 	}

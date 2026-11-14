@@ -50,7 +50,7 @@ func (s *Session) OutLanes(pipe uint64, dst []uint64) []uint64 {
 // laneFor returns the lane a stream direction's next chunk would go on,
 // without changing anything; needNew reports that every data lane is
 // taken, so a new lane would be useful.
-func (s *Session) laneFor(p *Pipe, st *Stream) (l *outLane, keep bool, needNew bool) {
+func (s *Session) laneFor(p *Pipe, st *Stream) (l *outLane, keep, needNew bool) {
 	sp := &st.snd
 	d := p.out
 	if sp.laneBound && sp.lanePipe == p.id {
@@ -128,13 +128,14 @@ func (s *Session) unbindLane(st *Stream) {
 	}
 	if l := p.out.lane(sp.lane); l != nil {
 		for i, x := range l.boundSt {
-			if x == st {
-				last := len(l.boundSt) - 1
-				l.boundSt[i] = l.boundSt[last]
-				l.boundSt[last] = nil
-				l.boundSt = l.boundSt[:last]
-				break
+			if x != st {
+				continue
 			}
+			last := len(l.boundSt) - 1
+			l.boundSt[i] = l.boundSt[last]
+			l.boundSt[last] = nil
+			l.boundSt = l.boundSt[:last]
+			break
 		}
 	}
 }

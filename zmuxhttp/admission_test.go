@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,7 +102,7 @@ func TestAdmissionHTTP(t *testing.T) {
 		{http.MethodGet, nil, bodyless(base64.RawURLEncoding.EncodeToString(tok))}, // replayed
 		{http.MethodPost, random, nil},
 		{http.MethodPost, rec, nil},
-		{http.MethodPost, append(append([]byte{}, tok...), rec...), nil}, // replayed
+		{http.MethodPost, slices.Concat(tok, rec), nil}, // replayed
 		{http.MethodPost, tok[:10], nil},
 	} {
 		got := doReqHeader(t, srv.Client(), x.method, srv.URL+"/p", x.body, x.h)
@@ -134,7 +135,7 @@ func TestAdmissionExchange(t *testing.T) {
 	req := func(ts uint32) []byte {
 		var nonce [exNonceLen]byte
 		_, _ = rand.Read(nonce[:])
-		return appendExRequest(nil, key, &cid, exKindClose, 0, 0, 0, ts, &nonce, nil)
+		return exRequest(key, &cid, exKindClose, 0, 0, 0, ts, &nonce, nil)
 	}
 	now := uint32(time.Now().Unix())
 	first := req(now)
@@ -410,10 +411,10 @@ func TestAdmissionEveryHTTPEntry(t *testing.T) {
 	defer srv.Close()
 	dctx, dcancel := context.WithTimeout(ctx, 2*time.Second)
 	defer dcancel()
-	fresh := func() context.Context {
+	// fresh replaces dctx with a new deadline derived from ctx.
+	fresh := func() {
 		dcancel()
-		dctx, dcancel = context.WithTimeout(ctx, 2*time.Second)
-		return dctx
+		dctx, dcancel = context.WithTimeout(ctx, 2*time.Second) //nolint:fatcontext // replaces dctx from ctx, does not nest
 	}
 	if p, err := (Streaming{Client: srv.Client(), URL: srv.URL}).Pipe(dctx, zmux.DirectionBidirectional); err == nil {
 		_, _ = zmux.Start(dctx, p, zmux.RoleClient, mpConfig())
@@ -423,7 +424,7 @@ func TestAdmissionEveryHTTPEntry(t *testing.T) {
 	if p, err := (Split{Client: srv.Client(), URL: srv.URL}).Pipe(dctx); err == nil {
 		_, _ = zmux.Start(dctx, p, zmux.RoleClient, mpConfig())
 	}
-	waitUntil(t, 5*time.Second, "split", func() bool { return decided.Load() >= want+1 })
+	waitUntil(t, 5*time.Second, "split", func() bool { return decided.Load() > want })
 	want = decided.Load()
 	fresh()
 	if p, err := (&exCfg{PSK: make([]byte, 32)}).exchange(srv.Client(), srv.URL).Pipe(dctx); err == nil {

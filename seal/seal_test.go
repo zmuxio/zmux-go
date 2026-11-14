@@ -222,6 +222,13 @@ func TestModesAndJoin(t *testing.T) {
 	}
 }
 
+// establishErrs is establishPair for a test that checks only the errors.
+func establishErrs(t *testing.T, ctx context.Context, cc *seal.ClientConfig, sc *seal.ServerConfig, cl, sv zmux.PipeIO) (cerr, serr error) {
+	t.Helper()
+	_, _, cerr, serr = establishPair(t, ctx, cc, sc, cl, sv)
+	return cerr, serr
+}
+
 func establishPair(t *testing.T, ctx context.Context, cc *seal.ClientConfig, sc *seal.ServerConfig, cl, sv zmux.PipeIO) (zmux.PipeIO, zmux.PipeIO, error, error) {
 	t.Helper()
 	type res struct {
@@ -309,7 +316,7 @@ func TestPeerIsSelf(t *testing.T) {
 	cc := f.client
 	cc.Key = f.node
 	a, b := net.Pipe()
-	_, _, cerr, _ := establishPair(t, ctx, &cc, &f.server, zmux.NetPipe(a), zmux.NetPipe(b))
+	cerr, _ := establishErrs(t, ctx, &cc, &f.server, zmux.NetPipe(a), zmux.NetPipe(b))
 	if !errors.Is(cerr, proto.ErrPeerIsSelf) {
 		t.Fatalf("client %v", cerr)
 	}
@@ -519,9 +526,9 @@ func TestRawCarrierHints(t *testing.T) {
 	f.server.AllowRecordMode = anyMode
 	cc := f.client
 	cc.RecordMode = zmux.RecordTrusted
-	_, cert := testCert(t)
+	cert := testCert(t)
 	cl, sv := net.Pipe()
-	tc := tls.Client(cl, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // a test carrier
+	tc := tls.Client(cl, &tls.Config{InsecureSkipVerify: true})
 	ts := tls.Server(sv, &tls.Config{Certificates: []tls.Certificate{cert}})
 	cp, sp, cerr, serr := establishPair(t, ctx, &cc, &f.server, zmux.SecureTLS(tc), zmux.SecureTLS(ts))
 	if cerr != nil || serr != nil {
@@ -555,10 +562,10 @@ func TestSecureTLSBound(t *testing.T) {
 	f.server.AllowRecordMode = anyMode
 	cc := f.client
 	cc.RecordMode = zmux.RecordBound
-	_, cert := testCert(t)
+	cert := testCert(t)
 	cl, sv := net.Pipe()
 	cp, sp, cerr, serr := establishPair(t, ctx, &cc, &f.server,
-		zmux.SecureTLS(tls.Client(cl, &tls.Config{InsecureSkipVerify: true})), //nolint:gosec // a test carrier
+		zmux.SecureTLS(tls.Client(cl, &tls.Config{InsecureSkipVerify: true})),
 		zmux.SecureTLS(tls.Server(sv, &tls.Config{Certificates: []tls.Certificate{cert}})))
 	if cerr != nil || serr != nil {
 		t.Fatal(cerr, serr)
@@ -567,7 +574,7 @@ func TestSecureTLSBound(t *testing.T) {
 	_ = sp.W.Close()
 }
 
-func testCert(t *testing.T) (ed25519.PrivateKey, tls.Certificate) {
+func testCert(t *testing.T) tls.Certificate {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -578,5 +585,5 @@ func testCert(t *testing.T) (ed25519.PrivateKey, tls.Certificate) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return priv, tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
 }

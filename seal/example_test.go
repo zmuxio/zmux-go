@@ -19,7 +19,7 @@ func (g oneToken) Resolve(context.Context, []byte, netip.AddrPort) ([]byte, erro
 }
 
 func (g oneToken) Credential(context.Context, seal.CredentialRequest) (*seal.Credential, error) {
-	return nil, nil
+	return nil, nil //nolint:nilnil // a nil Credential means none, per Gate
 }
 
 func (g oneToken) Commit(context.Context, seal.CommitRequest) (any, error) {

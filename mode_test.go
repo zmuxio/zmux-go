@@ -11,7 +11,7 @@ import (
 func TestModeBookkeepingBounded(t *testing.T) {
 	a, b := tcpPair(t)
 	c, _ := pair(t, a, b, nil, nil)
-	var tries []CandidateResult
+	tries := make([]CandidateResult, 0, 100)
 	for i := range 100 {
 		tries = append(tries, CandidateResult{Kind: CarrierKind(i)})
 	}

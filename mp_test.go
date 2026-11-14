@@ -401,7 +401,7 @@ func TestPipeStatsAbsentDirection(t *testing.T) {
 		RecordsReceived: peer.RecordsReceived, BytesDuplicateReceived: peer.BytesDuplicateReceived,
 		SinceLastReceive: peer.SinceLastReceive, SinceLastTraffic: peer.SinceLastTraffic, LanesIn: peer.LanesIn,
 		Lanes: peer.Lanes}
-	if !reflect.DeepEqual(peer, want) {
+	if !reflect.DeepEqual(peer, want) { //nolint:govet // want copies peer.Failure as is; only the send-side fields must be zero
 		t.Fatalf("receive-only pipe at the peer: %+v", peer)
 	}
 	if peer.BytesReceived == 0 || peer.LanesIn == 0 {

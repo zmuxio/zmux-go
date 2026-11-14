@@ -16,7 +16,12 @@ type vecAccount struct {
 	PerSec  uint64 `json:"per_sec"`
 }
 
-func (a *vecAccount) go_() shaping.Account {
+type vecLimits struct {
+	Wire     vecAccount `json:"wire"`
+	MaxDelay int64      `json:"max_delay"`
+}
+
+func (a *vecAccount) account() shaping.Account {
 	if a == nil {
 		return shaping.Account{}
 	}
@@ -30,11 +35,9 @@ func TestBudgetVectors(t *testing.T) {
 	}
 	var d struct {
 		Merge []struct {
-			Local, Config struct {
-				Wire     vecAccount `json:"wire"`
-				MaxDelay int64      `json:"max_delay"`
-			}
-			Want struct {
+			Local  vecLimits `json:"local"`
+			Config vecLimits `json:"config"`
+			Want   struct {
 				Wire        vecAccount `json:"wire"`
 				NoInjection bool       `json:"no_injection"`
 				MaxDelay    int64      `json:"max_delay"`
@@ -92,19 +95,19 @@ func TestBudgetVectors(t *testing.T) {
 		t.Fatal("empty vectors")
 	}
 	for i, c := range d.Merge {
-		got := shaping.Limits{Wire: c.Local.Wire.go_(), MaxDelay: time.Duration(c.Local.MaxDelay) * time.Microsecond}.With(
-			shaping.Budget{Wire: c.Config.Wire.go_(), MaxDelay: time.Duration(c.Config.MaxDelay) * time.Microsecond})
+		got := shaping.Limits{Wire: c.Local.Wire.account(), MaxDelay: time.Duration(c.Local.MaxDelay) * time.Microsecond}.With(
+			shaping.Budget{Wire: c.Config.Wire.account(), MaxDelay: time.Duration(c.Config.MaxDelay) * time.Microsecond})
 		md := got.MaxDelay
 		if md > 0 {
 			md /= time.Microsecond
 		}
-		if got.Wire != c.Want.Wire.go_() || got.NoInjection != c.Want.NoInjection || int64(md) != c.Want.MaxDelay && c.Want.MaxDelay >= 0 || c.Want.MaxDelay < 0 && md >= 0 {
+		if got.Wire != c.Want.Wire.account() || got.NoInjection != c.Want.NoInjection || int64(md) != c.Want.MaxDelay && c.Want.MaxDelay >= 0 || c.Want.MaxDelay < 0 && md >= 0 {
 			t.Errorf("merge %d: %+v", i, got)
 		}
 	}
 	for _, c := range d.Account {
 		var a wireAccount
-		a.set(0, 0, c.Account.go_())
+		a.set(0, 0, c.Account.account())
 		for i, st := range c.Steps {
 			switch st.Op {
 			case "spend":
@@ -114,7 +117,7 @@ func TestBudgetVectors(t *testing.T) {
 					t.Errorf("%s %d: granted %v", c.Name, i, g)
 				}
 			case "set":
-				a.set(st.Now, st.Earn, st.Account.go_())
+				a.set(st.Now, st.Earn, st.Account.account())
 			}
 			a.accrue(st.Now, st.Earn)
 			if a.left() != st.Left || a.spent != st.Spent || (st.Level == nil) == a.on || st.Level != nil && *st.Level != a.level {
@@ -442,11 +445,12 @@ func TestMetersNoAllocs(t *testing.T) {
 	f.plan.Pad = 10
 	s, _, _ := budgetSession(t, shaping.Limits{}, shaping.Budget{}, f)
 	var sink shaping.Meters
-	if n := testing.AllocsPerRun(100, func() {
+	n := testing.AllocsPerRun(100, func() {
 		sink = s.shapeMeters()
 		s.shp.acct.spend(10)
 		_ = s.shp.acct.charge(1, 1, 1)
-	}); n != 0 {
+	})
+	if n != 0 {
 		t.Fatalf("%v allocations", n)
 	}
 	if sink.WireLeft != math.MaxUint64 || sink.StallLeft != math.MaxUint64 {

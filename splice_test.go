@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -14,11 +15,12 @@ import (
 
 // relayEnv is client -> relay -> server over two sessions.
 func relayEnv(t *testing.T) (client, relayIn, relayOut, server *Conn) {
+	t.Helper()
 	a1, b1 := tcpPair(t)
 	client, relayIn = pair(t, a1, b1, nil, nil)
 	a2, b2 := tcpPair(t)
 	relayOut, server = pair(t, a2, b2, nil, nil)
-	return
+	return client, relayIn, relayOut, server
 }
 
 func TestSpliceForwardsBothWays(t *testing.T) {
@@ -120,7 +122,7 @@ func TestSpliceEnds(t *testing.T) {
 		{"downstream lost", func(_ *testing.T, _, server *Conn, _, _ *Stream, _ context.CancelFunc) { _ = server.Close() },
 			SpliceEnd{Kind: SpliceDownstreamLost}},
 		{"cancelled", func(_ *testing.T, _, _ *Conn, _, _ *Stream, cancel context.CancelFunc) { cancel() },
-			SpliceEnd{Kind: SpliceCancelled}},
+			SpliceEnd{Kind: SpliceCancelled, Code: StreamCancelled}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			leakcheck.Check(t)
@@ -171,8 +173,9 @@ func TestSpliceEnds(t *testing.T) {
 				t.Fatalf("client -> server ended %v, want %v (%+v)", r.AtoB.End, c.want, r)
 			}
 			// A lost session ends the other direction too, from its side.
-			if lost := map[SpliceEndKind]SpliceEndKind{SpliceUpstreamLost: SpliceDownstreamLost,
-				SpliceDownstreamLost: SpliceUpstreamLost}; lost[c.want.Kind] != 0 && r.BtoA.End.Kind != lost[c.want.Kind] {
+			lost := map[SpliceEndKind]SpliceEndKind{SpliceUpstreamLost: SpliceDownstreamLost,
+				SpliceDownstreamLost: SpliceUpstreamLost}
+			if lost[c.want.Kind] != 0 && r.BtoA.End.Kind != lost[c.want.Kind] {
 				t.Fatalf("server -> client ended %v", r.BtoA.End)
 			}
 			cs.CancelWrite(0)
@@ -183,5 +186,68 @@ func TestSpliceEnds(t *testing.T) {
 	}
 	if got := (SpliceEnd{Kind: SpliceReset, Code: 0x77}).String(); got != "reset 0x77" {
 		t.Errorf("String = %q", got)
+	}
+}
+
+// TestSpliceCancelCause: a ctx cancelled with a cause that carries a stream
+// code ends both streams of both directions with that code; any other cause
+// or a plain cancel ends them with 0.
+func TestSpliceCancelCause(t *testing.T) {
+	for _, f := range []struct {
+		name string
+		fn   func(context.Context, *Stream, *Stream, *SpliceOptions) (SpliceResult, error)
+	}{{"Splice", Splice}, {"SplicePackets", SplicePackets}} {
+		for _, c := range []struct {
+			name  string
+			cause error
+			want  StreamErrorCode // of the reset and of SpliceEnd
+			stop  StreamErrorCode // of the stop
+		}{
+			{"code", CancelCause(0x77), 0x77, 0x77},
+			{"wrapped code", fmt.Errorf("refused: %w", CancelCause(0x77)), 0x77, 0x77},
+			{"stream error", &StreamError{ErrorCode: 0x77, Remote: true}, 0x77, 0x77},
+			{"explicit zero", CancelCause(0), 0, 0},
+			{"other cause", errors.New("shutdown"), StreamCancelled, 0},
+			{"plain cancel", nil, StreamCancelled, 0},
+		} {
+			t.Run(f.name+"/"+c.name, func(t *testing.T) {
+				leakcheck.Check(t)
+				client, rin, rout, server := packetRelayEnv(t, "tcp")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				sctx, scancel := context.WithCancelCause(ctx)
+				defer scancel(nil)
+				cs, ss, done := relayStreams(t, ctx, client, rin, rout, server,
+					func(_ context.Context, a, b *Stream) (SpliceResult, error) { return f.fn(sctx, a, b, nil) })
+				scancel(c.cause)
+				var r SpliceResult
+				select {
+				case r = <-done:
+				case <-ctx.Done():
+					t.Fatal("the splice did not end")
+				}
+				want := SpliceEnd{Kind: SpliceCancelled, Code: c.want}
+				if r.AtoB.End != want || r.BtoA.End != want {
+					t.Fatalf("ends %v / %v, want %v", r.AtoB.End, r.BtoA.End, want)
+				}
+				// Each peer sees a reset on its receiving side and a stop on
+				// its sending side.
+				for name, s := range map[string]*Stream{"client": cs, "server": ss} {
+					_, rerr := s.Read(make([]byte, 1))
+					var se *StreamError
+					if !errors.As(rerr, &se) || se.ErrorCode != c.want {
+						t.Errorf("%s read: %v, want code %#x", name, rerr, uint64(c.want))
+					}
+					waitUntil(t, 5*time.Second, name+" stop", func() bool {
+						_, err := s.Write([]byte("x"))
+						return err != nil
+					})
+					_, werr := s.Write([]byte("x"))
+					if !errors.As(werr, &se) || se.ErrorCode != c.stop {
+						t.Errorf("%s write: %v, want code %#x", name, werr, uint64(c.stop))
+					}
+				}
+			})
+		}
 	}
 }

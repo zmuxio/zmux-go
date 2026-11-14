@@ -53,9 +53,13 @@ func fpMPConfig() *Config {
 	return &Config{MaxIdleTimeout: -1, Liveness: Liveness{KeepAlivePeriod: -1}, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes...."), EndToEnd: true}}
 }
 
-func fpPairs(t *testing.T, n int) [][2]*Conn { return fpPairsOver(t, n, nil) }
+func fpPairs(t *testing.T, n int) [][2]*Conn {
+	t.Helper()
+	return fpPairsOver(t, n, nil)
+}
 
 func fpPairsOver(t *testing.T, n int, ln net.Listener) [][2]*Conn {
+	t.Helper()
 	t.Helper()
 	ctx := context.Background()
 	out := make([][2]*Conn, n)

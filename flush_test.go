@@ -140,3 +140,42 @@ func TestFlushEarly(t *testing.T) {
 	}
 	runtime.KeepAlive(st)
 }
+
+// A peer that refuses at once (reads, then STOP_SENDING) while the opener is
+// in Flush: Flush reports success, the next Write reports the stop.
+func TestFlushPeerStopsAfterSend(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	a, b := net.Pipe()
+	c, s := pair(t, a, b, nil, nil)
+	go func() {
+		for {
+			ss, err := s.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			buf := make([]byte, 1)
+			_, _ = io.ReadFull(ss, buf)
+			ss.CancelRead(0x77)
+		}
+	}()
+	for i := range 100 {
+		st, err := c.OpenStreamSync(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = st.Write([]byte("hello"))
+		if err := st.Flush(); err != nil {
+			t.Fatalf("iteration %d: Flush: %v", i, err)
+		}
+		waitUntil(t, 5*time.Second, "stop reported", func() bool {
+			_, err := st.Write([]byte("x"))
+			return err != nil
+		})
+		_, err = st.Write([]byte("x"))
+		var se *StreamError
+		if !errors.As(err, &se) || se.ErrorCode != 0x77 {
+			t.Fatalf("iteration %d: Write after the stop: %v", i, err)
+		}
+	}
+}

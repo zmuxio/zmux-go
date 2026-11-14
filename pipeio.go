@@ -287,11 +287,7 @@ func (h *halfCloser) shutdownWrite() {
 func (h *halfCloser) closeAll(abort bool, cause error) {
 	h.allOnce.Do(func() {
 		if abort {
-			if a, ok := h.io.W.(Aborter); ok {
-				a.Abort(cause)
-			} else if tc, ok := h.io.W.(*tls.Conn); ok {
-				_ = tc.NetConn().Close()
-			}
+			h.abort(cause)
 		}
 		if h.io.W != nil {
 			_ = h.io.W.Close()
@@ -300,6 +296,18 @@ func (h *halfCloser) closeAll(abort bool, cause error) {
 			_ = h.io.R.Close()
 		}
 	})
+}
+
+// abort aborts the write side, also after a graceful closeAll: Abort where
+// offered, else the lowest connection of a TLS carrier is closed. It ends
+// what a graceful close left running.
+func (h *halfCloser) abort(cause error) {
+	switch w := h.io.W.(type) {
+	case Aborter:
+		w.Abort(cause)
+	case *tls.Conn:
+		_ = w.NetConn().Close()
+	}
 }
 
 // KeyingMaterialExporter is a half that terminates an end-to-end

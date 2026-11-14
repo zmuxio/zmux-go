@@ -213,7 +213,8 @@ func (u *unitReader) more() error {
 func (c *Conn) joinCarrier(ctx context.Context, pd *pipeDrv, p PipeIO, dir Direction) error {
 	ctx, cancel := context.WithCancel(ctx) // AddPipe set the join deadline
 	defer cancel()
-	defer context.AfterFunc(c.ctx, cancel)() // the session's end ends the handshake
+	stopEnd := context.AfterFunc(c.ctx, cancel) // the session's end ends the handshake
+	defer stopEnd()
 	stop := context.AfterFunc(ctx, func() { closePipeIO(p) })
 	defer stop()
 	var msg string
@@ -434,7 +435,8 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 	// handshake is not (Config.joinWaitTimeout).
 	ctx, cancel := timeshim.WithTimeout(ctx, c.clk.source(), c.cfg.joinTimeout())
 	defer cancel()
-	defer context.AfterFunc(c.ctx, cancel)() // the session's end ends the handshake
+	stopEnd := context.AfterFunc(c.ctx, cancel) // the session's end ends the handshake
+	defer stopEnd()
 	stop := context.AfterFunc(ctx, func() { closePipeIO(p) })
 	defer stop()
 	// ended is the error of a failure caused by this end stopping the wait: no peer's
@@ -524,7 +526,7 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 	defer c.dropUnconfirmed(p)
 	// The acceptor's records wait for Confirmed.
 	u := &unitReader{p: p}
-	used := 0
+	var used int
 	if pj.Mode != join.Bound {
 		if err := u.more(); err != nil {
 			unnestPipe(c, outer)
@@ -780,10 +782,15 @@ func (w *sealedWriter) WriteMessages(ms [][]byte) error {
 
 func (w *sealedWriter) Close() error { return w.lower.W.Close() }
 
-// CloseWrite ends the sending direction where the carrier can.
+// CloseWrite ends the sending direction where the carrier can. A carrier that
+// cannot, and whose halves are one connection, is left open: closing W would
+// close the receiving direction too (the rule of halfCloser.shutdownWrite).
 func (w *sealedWriter) CloseWrite() error {
 	if cw, ok := w.lower.W.(CloseWriter); ok {
 		return cw.CloseWrite()
+	}
+	if sameHalf(w.lower.R, w.lower.W) {
+		return nil
 	}
 	return w.lower.W.Close()
 }

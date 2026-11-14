@@ -20,9 +20,12 @@ func TestClassifyFirstBytesVectors(t *testing.T) {
 	}
 	var doc struct {
 		Vectors []struct {
-			Hex, Framing, Class, Note string
-			Need                      int
-		}
+			Hex     string `json:"hex"`
+			Framing string `json:"framing"`
+			Class   string `json:"class"`
+			Note    string `json:"note"`
+			Need    int    `json:"need"`
+		} `json:"vectors"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)

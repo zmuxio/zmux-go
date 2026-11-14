@@ -7,7 +7,7 @@ import (
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
-// refill adds what d units earn at per per 10^6 units; rem keeps the remainder.
+// refill adds what d units earn when 10^6 units earn per; rem keeps the remainder.
 // per is at most 2^43, so r*per stays below 2^63.
 func refill(d, per uint64, rem *uint64) uint64 {
 	q, r := d/1_000_000, d%1_000_000

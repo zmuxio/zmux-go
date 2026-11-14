@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,7 +67,7 @@ func shapeTrace(t *testing.T, d *diffShaper) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := ""
+	var out strings.Builder
 	for i := range 6000 {
 		now := Time(Second) + Time(i)*Time(Millisecond)
 		s.SetNow(now)
@@ -81,10 +82,10 @@ func shapeTrace(t *testing.T, d *diffShaper) string {
 			if sizes == nil {
 				break
 			}
-			out += fmt.Sprintln(i, sizes)
+			fmt.Fprintln(&out, i, sizes)
 		}
 	}
-	return out
+	return out.String()
 }
 
 // With no limit set, record lengths and times follow the plans alone.

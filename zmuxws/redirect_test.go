@@ -36,7 +36,7 @@ func TestRedirect(t *testing.T) {
 	}
 	srv := httptest.NewTLSServer(h)
 	var other atomic.Int64
-	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		other.Add(1)
 		http.Error(w, "no", http.StatusTeapot)
 	}))

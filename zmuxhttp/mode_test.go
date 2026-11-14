@@ -101,7 +101,7 @@ func fastPolicy(noJoin bool) *zmux.CarrierChoicePolicy {
 
 // kinds lists the kinds and outcomes of results.
 func kinds(rs []zmux.CandidateResult) []string {
-	var s []string
+	s := make([]string, 0, len(rs))
 	for _, r := range rs {
 		k := r.Kind.String() + ":" + r.Outcome.String()
 		if r.Joined {
@@ -114,6 +114,7 @@ func kinds(rs []zmux.CandidateResult) []string {
 
 // closeConn closes a client session and waits for its end.
 func closeConn(t *testing.T, c *zmux.Conn) {
+	t.Helper()
 	_ = c.Close()
 	waitDone(t, c)
 }
@@ -385,10 +386,11 @@ func exchangeBase(t *testing.T, ctx context.Context, e *modeEnv) (*zmux.Conn, *z
 	return c, <-e.sessions
 }
 
-// waitCached waits until the cache holds kind under key as usable (good)
+// waitCached waits until the cache holds kind under "k" as usable (good)
 // or as failed.
-func waitCached(t *testing.T, cc *zmux.CarrierCache, key string, kind zmux.CarrierKind, good bool) {
+func waitCached(t *testing.T, cc *zmux.CarrierCache, kind zmux.CarrierKind, good bool) {
 	t.Helper()
+	const key = "k"
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		g, failed := cacheState(t, cc, key, kind)
@@ -421,7 +423,7 @@ func TestPipePoolModeUpgrade(t *testing.T) {
 		done <- c.MaintainPipes(pctx, zmux.PipePool{Choice: zmux.AutoChoice(e.candidates(e.srv.URL)...), ChoicePolicy: pol})
 	}()
 	waitCarrier(t, c, zmux.CarrierStream, 10*time.Second)
-	waitCached(t, pol.Cache, "k", zmux.CarrierStream, true)
+	waitCached(t, pol.Cache, zmux.CarrierStream, true)
 	tries := kinds(c.ConnectionStats().CarrierCandidates)
 	// The base, the pool's exchange member, its streaming replacement.
 	if len(tries) < 3 || tries[1] != "exchange:usable(join)" || tries[2] != "streaming:usable(join)" {
@@ -480,9 +482,9 @@ func TestPipePoolModeFallback(t *testing.T) {
 			Backoff: zmux.Backoff{Min: 100 * time.Millisecond}})
 	}()
 	waitCarrier(t, c, zmux.CarrierStream, 10*time.Second)
-	waitCached(t, pol.Cache, "k", zmux.CarrierStream, true)
+	waitCached(t, pol.Cache, zmux.CarrierStream, true)
 	pass.CloseClientConnections()
-	waitCached(t, pol.Cache, "k", zmux.CarrierStream, false)
+	waitCached(t, pol.Cache, zmux.CarrierStream, false)
 	waitCarrier(t, c, zmux.CarrierSplit, 10*time.Second)
 	echoOnce(t, ctx, c, s)
 	closeConn(t, c)
@@ -499,8 +501,8 @@ func TestPipePoolModeFallback(t *testing.T) {
 		done <- c.MaintainPipes(ctx, zmux.PipePool{Choice: zmux.AutoChoice(e.candidates(nginx.URL)...), ChoicePolicy: pol,
 			Backoff: zmux.Backoff{Min: 100 * time.Millisecond}})
 	}()
-	waitCached(t, pol.Cache, "k", zmux.CarrierStream, false)
-	waitCached(t, pol.Cache, "k", zmux.CarrierSplit, false)
+	waitCached(t, pol.Cache, zmux.CarrierStream, false)
+	waitCached(t, pol.Cache, zmux.CarrierSplit, false)
 	deadline := time.Now().Add(5 * time.Second)
 	for len(c.Pipes()) != 2 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
@@ -579,10 +581,12 @@ func cacheState(t *testing.T, cc *zmux.CarrierCache, key string, kind zmux.Carri
 	}
 	var snap struct {
 		Entries []struct {
-			Key, Kind, Variant string
-			GoodUntil          string `json:"good_until"`
-			FailUntil          string `json:"fail_until"`
-		}
+			Key       string `json:"key"`
+			Kind      string `json:"kind"`
+			Variant   string `json:"variant"`
+			GoodUntil string `json:"good_until"`
+			FailUntil string `json:"fail_until"`
+		} `json:"entries"`
 	}
 	if err := json.Unmarshal(data, &snap); err != nil {
 		t.Fatal(err)

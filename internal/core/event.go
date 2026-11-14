@@ -121,8 +121,12 @@ const (
 type Action struct {
 	Pipe uint64
 	Lane uint64
-	Kind ActionKind
-	Dir  Dir
+	// After: an ActClose of both directions aborts what of the carrier has
+	// not ended this long after the graceful close (SPEC.md Section 6.5
+	// step 4), so that no carrier outlives its session unbounded.
+	After Duration
+	Kind  ActionKind
+	Dir   Dir
 }
 
 func (s *Session) act(a Action) { s.actions = append(s.actions, a) }

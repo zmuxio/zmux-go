@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -145,7 +146,7 @@ func TestExporterTLSBeforeHandshake(t *testing.T) {
 		t.Fatalf("Bound join: %v", err)
 	}
 	echoOnce(t, ctx, c, s)
-	// A handshake that fails fails the join.
+	// A failing handshake fails the join.
 	a, b := tcpPair(t)
 	go func() { _ = lst.HandlePipe(ctx, NetPipe(tls.Server(a, scfg)), PipeHint{}) }()
 	bad := tls.Client(b, &tls.Config{ServerName: "elsewhere.invalid"})
@@ -323,8 +324,8 @@ func TestExporterSplit(t *testing.T) {
 		initiator bool
 		want      []byte
 	}{
-		{"initiator", PipeIO{W: up, R: down}, true, append(append([]byte{}, u...), d...)},
-		{"responder", PipeIO{R: up, W: down}, false, append(append([]byte{}, u...), d...)},
+		{"initiator", PipeIO{W: up, R: down}, true, slices.Concat(u, d)},
+		{"responder", PipeIO{R: up, W: down}, false, slices.Concat(u, d)},
 		{"one", PipeIO{R: up, W: up}, true, u},
 		{"uplink only", PipeIO{W: up, R: &net.TCPConn{}}, true, u},
 	} {

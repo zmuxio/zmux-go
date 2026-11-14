@@ -1,6 +1,7 @@
 package zmux
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -40,7 +41,7 @@ func TestCarrierCacheVectors(t *testing.T) {
 	if err := json.Unmarshal(raw, &v); err != nil {
 		t.Fatal(err)
 	}
-	rel := regexp.MustCompile(`@([+-][0-9]+)`)
+	rel := regexp.MustCompile(`@([+-]\d+)`)
 	for _, c := range v.Cases {
 		t.Run(c.Name, func(t *testing.T) {
 			now := time.Now()
@@ -54,8 +55,8 @@ func TestCarrierCacheVectors(t *testing.T) {
 				err := cc.Restore([]byte(snap))
 				if st.Error {
 					after, _ := cc.Snapshot()
-					if !errors.Is(err, ErrInvalidConfig) || string(before) != string(after) {
-						t.Fatalf("step %d: %v, cache changed %v", i, err, string(before) != string(after))
+					if !errors.Is(err, ErrInvalidConfig) || !bytes.Equal(before, after) {
+						t.Fatalf("step %d: %v, cache changed %v", i, err, !bytes.Equal(before, after))
 					}
 				} else if err != nil {
 					t.Fatalf("step %d: %v", i, err)
@@ -70,7 +71,7 @@ func TestCarrierCacheVectors(t *testing.T) {
 				t.Fatal(err)
 			}
 			at := time.Now()
-			var es []expect
+			es := make([]expect, 0, len(got.Entries))
 			for _, e := range got.Entries {
 				g, _ := parseCacheTime(e.GoodUntil)
 				f, _ := parseCacheTime(e.FailUntil)
@@ -96,7 +97,11 @@ func TestCarrierCacheVectors(t *testing.T) {
 			}
 			snap.Entries[i].GoodUntil, snap.Entries[i].FailUntil = formatCacheTime(g), formatCacheTime(f)
 		}
-		if data, _ := json.Marshal(snap); string(data) != x {
+		data, err := json.Marshal(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != x {
 			t.Fatalf("round trip\n got %s\nwant %s", data, x)
 		}
 	}

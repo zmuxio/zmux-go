@@ -49,6 +49,7 @@ func loadCapsuleCases(t *testing.T) []capsuleCase {
 }
 
 func (c *capsuleCase) bytes(t *testing.T) []byte {
+	t.Helper()
 	b, err := hex.DecodeString(c.Hex)
 	if err != nil {
 		t.Fatal(err)
@@ -131,6 +132,7 @@ func samePackets(a, b []capsulePacket) bool {
 }
 
 func packetEnv(t *testing.T, dgrams bool) (client, server *Conn) {
+	t.Helper()
 	a, b := tcpPair(t)
 	cfg := &Config{EnableDatagrams: dgrams}
 	return pair(t, a, b, cfg, cfg)

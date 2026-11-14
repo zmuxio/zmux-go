@@ -231,3 +231,38 @@ func TestRestartPreambleBlocked(t *testing.T) {
 		t.Fatalf("after the credit: %+v (opened=%v)", fs, st.opened)
 	}
 }
+
+// A STOP_SENDING that arrives after the opening frame and the data were sent
+// does not fail the Flush that waited for them; the next Write reports it.
+// A stop before anything was sent still fails the Flush.
+func TestFlushDoneStopAfterSent(t *testing.T) {
+	for _, sentFirst := range []bool{true, false} {
+		s, p := channelSession(t, nil, false)
+		s.peer.MaxStreamDataBidiRem = 1 << 20
+		s.loc[0].limit = 10
+		s.conn.sendMax = 1 << 20
+		st, _ := s.OpenStream(true)
+		_, _ = s.Write(st, []byte("data"), false)
+		target, err := s.Flush(st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sentFirst {
+			pollStream(t, s, p)
+		}
+		s.onStopSending(st, 7)
+		done, err := s.FlushDone(st, target, NewSignal())
+		if !done {
+			t.Fatalf("sentFirst=%v: not done", sentFirst)
+		}
+		if sentFirst && err != nil {
+			t.Fatalf("Flush after the data was sent: %v", err)
+		}
+		if !sentFirst && err == nil {
+			t.Fatal("stop before the send did not fail the Flush")
+		}
+		if _, err := s.Write(st, []byte("more"), false); err == nil {
+			t.Fatalf("sentFirst=%v: Write after the stop succeeded", sentFirst)
+		}
+	}
+}

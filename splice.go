@@ -54,6 +54,7 @@ type SpliceDirection struct {
 // SpliceEndKind is the event that ended a direction of a splice.
 type SpliceEndKind uint8
 
+// The events that end a splice direction.
 const (
 	SpliceFinished       SpliceEndKind = iota // FIN read upstream and passed on
 	SpliceReset                               // the upstream stream was reset with Code
@@ -84,7 +85,9 @@ func (k SpliceEndKind) String() string {
 
 // SpliceEnd is how a direction of a splice ended; Code is the
 // application error code of SpliceReset and SpliceStopped, which travels
-// unchanged to the other side, and 0 for the other kinds.
+// unchanged to the other side, that of the context's cause for
+// SpliceCancelled (ZMUX_CANCELLED, the code of the reset, for a plain cancel or
+// a deadline), and 0 for the other kinds.
 type SpliceEnd struct {
 	Kind SpliceEndKind
 	Code StreamErrorCode
@@ -99,18 +102,23 @@ func (e SpliceEnd) String() string {
 	return e.Kind.String()
 }
 
+// isCtxErr reports whether err is the end of a context.
+func isCtxErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // spliceEnd classifies the error that ended a direction: a remote reset
 // (read side) or stop (write side) with its code, a cancellation, or the
 // loss of the session on that side.
-func spliceEnd(err error, write bool) SpliceEnd {
+func spliceEnd(ctx context.Context, err error, write bool) SpliceEnd {
 	var se *StreamError
 	switch {
 	case errors.As(err, &se) && se.Remote && !write:
 		return SpliceEnd{Kind: SpliceReset, Code: se.ErrorCode}
 	case errors.As(err, &se) && se.Remote:
 		return SpliceEnd{Kind: SpliceStopped, Code: se.ErrorCode}
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return SpliceEnd{Kind: SpliceCancelled}
+	case isCtxErr(err):
+		return SpliceEnd{Kind: SpliceCancelled, Code: spliceCode(context.Cause(ctx))}
 	case write:
 		return SpliceEnd{Kind: SpliceDownstreamLost}
 	}
@@ -131,7 +139,17 @@ var errSpliceSelf = errors.New("zmux: cannot splice a stream into itself")
 // relay hop by hop. Ends travel across: FIN finishes the
 // other side, a reset resets it with its code after the bytes below its
 // Reliable Size, a stop stops the upstream, a lost session fails the other
-// side with ZMUX_CARRIER_FAILED, and cancelling ctx ends both with code 0.
+// side with ZMUX_CARRIER_FAILED, and cancelling ctx ends both with the code
+// of its cause (below), else ZMUX_CANCELLED.
+//
+// A ctx cancelled by context.WithCancelCause with a cause that is, or wraps,
+// a *StreamError (CancelCause(code) makes one) ends both streams in both
+// directions with its ErrorCode: the downstream sending sides are reset and
+// the upstream receiving sides stopped with it, and each direction's End is
+// SpliceCancelled with Code set (an explicit 0 included). Any other cause, a plain
+// cancel and a deadline reset the downstream sending sides with ZMUX_CANCELLED
+// (StreamCancelled) and stop the upstream receiving sides with 0, and Code is
+// ZMUX_CANCELLED.
 func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResult, error) {
 	if a == b || a.h == b.h {
 		return SpliceResult{}, errSpliceSelf
@@ -155,15 +173,8 @@ func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResul
 	var ab, ba SpliceDirection
 	var dgs SpliceResult // datagram counts, merged at the end
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		ab = spliceDir(ctx, a, b, o.Chunk, o.AtoB)
-	}()
-	go func() {
-		defer wg.Done()
-		ba = spliceDir(ctx, b, a, o.Chunk, o.BtoA)
-	}()
+	wg.Go(func() { ab = spliceDir(ctx, a, b, o.Chunk, o.AtoB) })
+	wg.Go(func() { ba = spliceDir(ctx, b, a, o.Chunk, o.BtoA) })
 	dg := spliceDatagrams(ctx, a, b, &dgs, o)
 	wg.Wait()
 	cancel()
@@ -201,13 +212,13 @@ func spliceDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter) Splice
 func spliceStep(ctx context.Context, r, w *Stream, chunk int, lim Limiter, limit uint64, d *SpliceDirection) (int, bool, bool) {
 	n, end, werr, err := r.h.waitReadable(ctx, w.h)
 	if werr != nil {
-		spliceWriteErr(r, w, werr)
-		d.End = spliceEnd(werr, true)
+		spliceWriteErr(ctx, r, w, werr)
+		d.End = spliceEnd(ctx, werr, true)
 		return 0, false, true
 	}
 	if err != nil {
-		spliceAbort(r, w, err)
-		d.End = spliceEnd(err, false)
+		spliceAbort(ctx, r, w, err)
+		d.End = spliceEnd(ctx, err, false)
 		return 0, false, true
 	}
 	var want int
@@ -215,27 +226,29 @@ func spliceStep(ctx context.Context, r, w *Stream, chunk int, lim Limiter, limit
 		want = int(min(uint64(chunk), n, 16<<10, limit))
 		capy, err := w.h.waitSendCapacity(ctx, uint64(want))
 		if err != nil {
-			spliceWriteErr(r, w, err)
-			d.End = spliceEnd(err, true)
+			spliceWriteErr(ctx, r, w, err)
+			d.End = spliceEnd(ctx, err, true)
 			return 0, false, true
 		}
 		take := int(min(capy, uint64(chunk), limit))
 		if lim != nil {
 			take, err = lim.Ready(ctx, min(want, take), take)
 			if err != nil {
-				spliceAbort(r, w, err)
-				d.End = SpliceEnd{Kind: SpliceCancelled}
+				spliceAbort(ctx, r, w, err)
+				d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
 				return 0, false, true
 			}
 		}
 		want = take
 	}
 	ch, err := r.h.readChunk(ctx, max(want, 1))
+	// A chunk carries the bytes read before an error, as io.Reader does.
+	//goland:noinspection GoDfaErrorMayBeNotNil
 	m := len(ch.Data)
 	if m > 0 {
 		if werr := w.h.writeChunk(ctx, ch); werr != nil {
-			spliceWriteErr(r, w, werr)
-			d.End = spliceEnd(werr, true)
+			spliceWriteErr(ctx, r, w, werr)
+			d.End = spliceEnd(ctx, werr, true)
 			return 0, false, true
 		}
 		if lim != nil {
@@ -247,15 +260,15 @@ func spliceStep(ctx context.Context, r, w *Stream, chunk int, lim Limiter, limit
 	case errors.Is(err, io.EOF):
 		return m, true, false
 	case err != nil:
-		spliceReadErr(r, w, err)
-		d.End = spliceEnd(err, false)
+		spliceReadErr(ctx, r, w, err)
+		d.End = spliceEnd(ctx, err, false)
 		return m, false, true
 	}
 	return m, false, false
 }
 
 // spliceReadErr ends w after r's end other than FIN.
-func spliceReadErr(r, w *Stream, err error) {
+func spliceReadErr(ctx context.Context, r, w *Stream, err error) {
 	var se *StreamError
 	if errors.As(err, &se) && se.Remote {
 		// r was reset: the bytes below its Reliable Size were forwarded;
@@ -267,28 +280,42 @@ func spliceReadErr(r, w *Stream, err error) {
 		w.h.cancelWrite(se.ErrorCode)
 		return
 	}
-	spliceAbort(r, w, err)
+	spliceAbort(ctx, r, w, err)
 }
 
 // spliceWriteErr: w was stopped (stop r with its code), or w's session
 // ended (fail r).
-func spliceWriteErr(r, w *Stream, err error) {
+func spliceWriteErr(ctx context.Context, r, w *Stream, err error) {
 	var se *StreamError
 	if errors.As(err, &se) && se.Remote {
 		r.h.cancelRead(se.ErrorCode)
 		return
 	}
-	spliceAbort(r, w, err)
+	spliceAbort(ctx, r, w, err)
 }
 
-// spliceAbort ends both sides: code 0 on cancellation, ZMUX_CARRIER_FAILED
-// when a session was closed or lost.
-func spliceAbort(r, w *Stream, err error) {
-	code := StreamErrorCode(0)
-	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		code = StreamCarrierFailed
+// spliceAbortCode is the code spliceAbort ends both sides with: the code of
+// ctx's cancellation cause (ZMUX_CANCELLED for a plain cancel), ZMUX_CARRIER_FAILED when a
+// session was closed or lost.
+func spliceAbortCode(ctx context.Context, err error) StreamErrorCode {
+	if isCtxErr(err) {
+		return spliceCode(context.Cause(ctx))
 	}
-	r.h.cancelRead(code)
+	return StreamCarrierFailed
+}
+
+// spliceAbort resets w with spliceAbortCode and stops r with it, except that
+// a cancellation without a code stops r with 0: an abandoned receiving part
+// is stopped with no code (EXTENSIONS.md Section 7.4).
+func spliceAbort(ctx context.Context, r, w *Stream, err error) {
+	code := spliceAbortCode(ctx, err)
+	stop := code
+	if isCtxErr(err) {
+		if _, ok := errors.AsType[*StreamError](context.Cause(ctx)); !ok {
+			stop = 0
+		}
+	}
+	r.h.cancelRead(stop)
 	w.h.cancelWrite(code)
 }
 
@@ -349,6 +376,7 @@ func spliceDatagrams(ctx context.Context, a, b *Stream, res *SpliceResult, o Spl
 				d.DatagramsTooLarge++
 			case datagramLimited:
 				d.DatagramsLimited++
+			case datagramFailed:
 			}
 			d.DatagramsDropped++
 		}

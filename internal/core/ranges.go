@@ -13,7 +13,8 @@ func (r *rangeSet) add(lo, hi uint64) uint64 {
 	s := *r
 	// Fast path: append or extend the last range.
 	if n := len(s); n == 0 || lo > s[n-1].hi {
-		*r = append(s, rng{lo, hi})
+		s = append(s, rng{lo, hi})
+		*r = s
 		return hi - lo
 	} else if lo >= s[n-1].lo {
 		if hi <= s[n-1].hi {

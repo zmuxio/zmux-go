@@ -760,6 +760,8 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Carri
 			closePipeIO(pio) // no CONNECTION_CLOSE: the carrier ends
 		})
 	}
+	// Every path below either aborts c or returns it to the caller.
+	//goland:noinspection GoResourceLeak
 	c, err := Start(life, pio, RoleClient, cfg)
 	if tm != nil && !tm.Stop() {
 		<-expired

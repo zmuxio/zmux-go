@@ -153,7 +153,7 @@ func (c *Conn) lock() { c.mu.Lock() }
 // the core into a closed session, collects the wake-ups, carrier commands
 // and timer change, releases the lock and only then signals.
 func (c *Conn) unlock() {
-	r := recover()
+	r := recover() //nolint:revive // defer: unlock is the deferred function itself
 	if r != nil {
 		c.poison(r)
 	} else {
@@ -363,7 +363,6 @@ func (c *Conn) onTimer() {
 		c.sweepAt = 0 // the orphans are released in unlock; rearm moves it
 	}
 	c.s.HandleTimeout(now)
-
 }
 
 // Start establishes a session over any carrier with an explicit role. It

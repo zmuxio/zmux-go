@@ -8,11 +8,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,8 +120,8 @@ func (p *interopPeer) expect(t *testing.T, prefix string) string {
 			if !ok {
 				t.Fatalf("peer exited before %q", prefix)
 			}
-			if strings.HasPrefix(l, prefix) {
-				return strings.TrimSpace(strings.TrimPrefix(l, prefix))
+			if rest, ok := strings.CutPrefix(l, prefix); ok {
+				return strings.TrimSpace(rest)
 			}
 		case <-deadline:
 			t.Fatalf("peer: no %q", prefix)
@@ -169,8 +169,8 @@ func interopConfig() *zmux.Config { return &zmux.Config{EnableDatagrams: true} }
 
 func TestInteropEstablishClient(t *testing.T) {
 	for _, pr := range interopProfiles {
-		t.Run(fmt.Sprint(uint64(pr)), func(t *testing.T) {
-			p := startInteropPeer(t, "seal-server", fmt.Sprint(uint64(pr)))
+		t.Run(strconv.FormatUint(uint64(pr), 10), func(t *testing.T) {
+			p := startInteropPeer(t, "seal-server", strconv.FormatUint(uint64(pr), 10))
 			addr := p.expect(t, "LISTEN ")
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -206,7 +206,7 @@ func TestInteropEstablishClient(t *testing.T) {
 
 func TestInteropEstablishServer(t *testing.T) {
 	for _, pr := range interopProfiles {
-		t.Run(fmt.Sprint(uint64(pr)), func(t *testing.T) {
+		t.Run(strconv.FormatUint(uint64(pr), 10), func(t *testing.T) {
 			if os.Getenv("ZMUX_INTEROP_PEER") == "" {
 				t.Skip("ZMUX_INTEROP_PEER not set")
 			}
@@ -230,8 +230,8 @@ func TestInteropEstablishServer(t *testing.T) {
 			served := make(chan struct{})
 			go func() { defer close(served); _ = l.Serve(ctx, ln) }()
 			defer func() { cancel(); _ = ln.Close(); <-served }()
-			p := startInteropPeer(t, "seal-client", ln.Addr().String(), fmt.Sprint(uint64(pr)))
-			if got := p.expect(t, "PROFILE "); got != fmt.Sprint(uint64(pr)) {
+			p := startInteropPeer(t, "seal-client", ln.Addr().String(), strconv.FormatUint(uint64(pr), 10))
+			if got := p.expect(t, "PROFILE "); got != strconv.FormatUint(uint64(pr), 10) {
 				t.Fatalf("profile %s", got)
 			}
 			c, err := l.Accept(ctx)

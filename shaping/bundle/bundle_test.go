@@ -50,23 +50,23 @@ func TestParseValid(t *testing.T) {
 		t.Fatalf("websocket entry %+v", ws)
 	}
 	if ws.Candidate.Compile(machine.Options{}).Budget() == nil {
-		t.Errorf("no budget")
+		t.Error("no budget")
 	}
 	if e := b.Entry(zmux.CarrierSplit); e == nil || e.Candidate.HasMachines() || e.Candidate.HasPool() {
 		t.Errorf("split entry %+v: a listed empty kind does not fall back", e)
 	}
 	def, _ := b.Default()
 	if b.Entry(zmux.CarrierHTTP3) != def || b.Entry(0) != def || def == nil {
-		t.Errorf("default fallback")
+		t.Error("default fallback")
 	}
 	if def.Candidate.Compile(machine.Options{}).Budget() == nil {
-		t.Errorf("default budget")
+		t.Error("default budget")
 	}
 	if _, ok := b.Lookup(zmux.CarrierHTTP3); ok {
-		t.Errorf("Lookup falls back")
+		t.Error("Lookup falls back")
 	}
 	if !strings.Contains(string(b.Raw()), `"quic"`) {
-		t.Errorf("raw")
+		t.Error("raw")
 	}
 }
 
@@ -78,7 +78,7 @@ func TestKindNames(t *testing.T) {
 		}
 	}
 	if KindName(0) != DefaultKind {
-		t.Errorf("KindName(0)")
+		t.Error("KindName(0)")
 	}
 }
 

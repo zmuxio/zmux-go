@@ -629,6 +629,7 @@ func (c *Conn) SetScheduler(s Scheduler) {
 // cycle; OutboundNone when the pipe has none.
 type OutboundState uint8
 
+// Outbound states, mirroring the core.
 const (
 	OutboundNone     = OutboundState(core.OutNone)
 	OutboundJoining  = OutboundState(core.OutJoining)
@@ -664,6 +665,7 @@ func (s OutboundState) String() string {
 // cycle; InboundNone when the pipe has none.
 type InboundState uint8
 
+// Inbound states, mirroring the core.
 const (
 	InboundNone    = InboundState(core.InNone)
 	InboundJoining = InboundState(core.InJoining)

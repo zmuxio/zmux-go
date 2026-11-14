@@ -12,13 +12,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/netip"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -413,7 +413,8 @@ func framed(body []byte) []byte {
 // answer delivers nothing, confirms nothing and closes nothing: only the attachment
 // fails, the session stays suspended and a real join delivers the data.
 func TestJoinThirdParty(t *testing.T) {
-	var fakeReply []byte
+	t.Parallel()
+	fakeReply := make([]byte, 0, 1+32+2+16)
 	fakeReply = append(fakeReply, join.ReplyType)
 	fakeReply = append(fakeReply, make([]byte, 32)...)
 	fakeReply = append(fakeReply, 0, 16)
@@ -691,7 +692,8 @@ func startTampered(t *testing.T, cfg func() *Config, f func(*wire.Params)) (*Lis
 	// A session the tampering ended never reaches Accept: stop with it.
 	actx, acancel := context.WithCancel(ctx)
 	defer acancel()
-	defer context.AfterFunc(c.Context(), acancel)()
+	stopAfter := context.AfterFunc(c.Context(), acancel)
+	defer stopAfter()
 	s, err := lst.Accept(actx)
 	if err != nil {
 		return lst, c, nil, err
@@ -793,6 +795,7 @@ func TestSessionCryptoTamperFailsJoins(t *testing.T) {
 
 // A replayed Hello moves no pipe, evicts nothing and ends no suspension.
 func TestReplayMovesNothing(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []RecordMode{RecordSealed, RecordTrusted} {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Parallel()
@@ -1048,6 +1051,7 @@ watch:
 // ---- first batch ----
 
 func TestFirstBatchSize(t *testing.T) {
+	t.Parallel()
 	const over = 256 // the Hello without its batch
 	for _, x := range []struct {
 		name          string
@@ -1200,17 +1204,20 @@ func TestFirstBatchResetFinalSize(t *testing.T) {
 func TestUnconfirmedEviction(t *testing.T) {
 	t.Parallel()
 	for _, limit := range []int{0, 2} {
-		t.Run(fmt.Sprint(limit), func(t *testing.T) { testUnconfirmedEviction(t, limit) })
+		t.Run(strconv.Itoa(limit), func(t *testing.T) {
+			t.Parallel()
+			testUnconfirmedEviction(t, limit)
+		})
 	}
 }
 
-func testUnconfirmedEviction(t *testing.T, limit int) {
+func testUnconfirmedEviction(t *testing.T, limit int) { //nolint:thelper // subtest body, not a helper: failures point inside it
 	e := newAtkEnv(t, atkOpts{listener: func(lc *ListenerConfig) { lc.MaxPendingPerSession = limit }})
 	want := limit
 	if want == 0 {
 		want = 4
 	}
-	var held []net.Conn
+	held := make([]net.Conn, 0, want+2)
 	for i := range want + 2 {
 		hello, _ := e.forge(uint64(20+2*i), join.Sealed, nil, nil)
 		nc, replied := e.offer(hello)
@@ -1405,6 +1412,7 @@ func TestAcceptorDefaultSealedOnly(t *testing.T) {
 // ---- the reject policy ----
 
 func TestOnReject(t *testing.T) {
+	t.Parallel()
 	unknown := func() []byte {
 		h := []byte{join.ProfileJoin, join.SuiteAES, byte(join.Sealed), 16}
 		h = append(h, make([]byte, 16)...)
@@ -1787,7 +1795,7 @@ func TestPendingLimitRejects(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			src := netip.MustParseAddrPort("192.0.2.1:1000")
-			var held []net.Conn
+			held := make([]net.Conn, 0, 2)
 			defer func() {
 				for _, a := range held {
 					_ = a.Close()

@@ -74,7 +74,7 @@ func TestHTTPExchangeVectors(t *testing.T) {
 			{exKindUp, 0, 0, 0, "hello", "", v.up, v.upR},
 			{exKindDown, exFlagFin, 300, 299, "", "world", v.down, v.downR},
 		} {
-			b := appendExRequest(nil, key, &cid, x.kind, 0, x.seq, x.ack, 1767225600, &nonce, []byte(x.data))
+			b := exRequest(key, &cid, x.kind, 0, x.seq, x.ack, 1767225600, &nonce, []byte(x.data))
 			if got := hex.EncodeToString(b); got != x.req {
 				t.Fatalf("request = %s, want %s", got, x.req)
 			}
@@ -250,7 +250,7 @@ func TestHTTPExchangeServerRules(t *testing.T) {
 	send := func(kind byte, seq, ack uint64, corrupt bool) (int, byte) {
 		var nonce [exNonceLen]byte
 		_, _ = rand.Read(nonce[:])
-		b := appendExRequest(nil, key, &cid, kind, 0, seq, ack, uint32(time.Now().Unix()), &nonce, nil)
+		b := exRequest(key, &cid, kind, 0, seq, ack, uint32(time.Now().Unix()), &nonce, nil)
 		if corrupt {
 			b[exFieldsLen] ^= 1 // the Header MAC
 		}
@@ -296,7 +296,7 @@ func TestHTTPExchangeServerRules(t *testing.T) {
 	if _, f := send(exKindDown, 0, 0, false); f != 0 {
 		t.Fatalf("new carrier: flags %#x", f)
 	}
-	bad := appendExRequest(nil, key, &cid, exKindDown, exFlagFin, 1, 0, uint32(time.Now().Unix()), &[exNonceLen]byte{1}, nil)
+	bad := exRequest(key, &cid, exKindDown, exFlagFin, 1, 0, uint32(time.Now().Unix()), &[exNonceLen]byte{1}, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(bad)))
 	if rec.Code != http.StatusOK || rec.Body.Bytes()[exMACLen] != exFlagGone {
@@ -422,7 +422,7 @@ func TestHTTPExchangeCompletion(t *testing.T) {
 	send := func(kind, flags byte, seq, ack uint64, data []byte) byte {
 		var nonce [exNonceLen]byte
 		_, _ = rand.Read(nonce[:])
-		b := appendExRequest(nil, key, &cid, kind, flags, seq, ack, uint32(time.Now().Unix()), &nonce, data)
+		b := exRequest(key, &cid, kind, flags, seq, ack, uint32(time.Now().Unix()), &nonce, data)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b)))
 		if rec.Code != http.StatusOK {
@@ -477,7 +477,7 @@ func TestHTTPExchangeListenerClosed(t *testing.T) {
 	_, _ = rand.Read(cid[:])
 	key := newExKey(nil, cid[:])
 	var nonce [exNonceLen]byte
-	b := appendExRequest(nil, key, &cid, exKindUp, 0, 0, 0, uint32(time.Now().Unix()), &nonce, []byte{1})
+	b := exRequest(key, &cid, exKindUp, 0, 0, 0, uint32(time.Now().Unix()), &nonce, []byte{1})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b)))
 	if rec.Code != http.StatusOK || rec.Body.Bytes()[exMACLen] != exFlagGone {
@@ -694,7 +694,7 @@ func TestHTTPExchangeTruncatedFallback(t *testing.T) {
 		err  error
 	}
 	got := make(chan seen, 1)
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		got <- seen{b, err}
 	})
@@ -732,7 +732,7 @@ func TestHTTPExchangeOutOfOrderCost(t *testing.T) {
 	up := func(seq uint64) byte {
 		var nonce [exNonceLen]byte
 		_, _ = rand.Read(nonce[:])
-		b := appendExRequest(nil, key, &cid, exKindUp, 0, seq, 0, uint32(time.Now().Unix()), &nonce, nil)
+		b := exRequest(key, &cid, exKindUp, 0, seq, 0, uint32(time.Now().Unix()), &nonce, nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b)))
 		if rec.Code != http.StatusOK {
@@ -771,7 +771,7 @@ func TestHTTPExchangePendingShare(t *testing.T) {
 		key := newExKey([]byte("k"), cid[:])
 		var nonce [exNonceLen]byte
 		_, _ = rand.Read(nonce[:])
-		b := appendExRequest(nil, key, cid, kind, 0, seq, 0, uint32(time.Now().Unix()), &nonce, nil)
+		b := exRequest(key, cid, kind, 0, seq, 0, uint32(time.Now().Unix()), &nonce, nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b)))
 		if rec.Code != http.StatusOK {
@@ -784,7 +784,7 @@ func TestHTTPExchangePendingShare(t *testing.T) {
 		defer h.mu.Unlock()
 		c = h.carriers[*cid]
 		_, gone = h.gone[*cid]
-		return
+		return c, gone
 	}
 	c1, c2, c3 := &[exCIDLen]byte{1}, &[exCIDLen]byte{2}, &[exCIDLen]byte{3}
 	for _, c := range []*[exCIDLen]byte{c1, c2} {
@@ -846,7 +846,7 @@ func TestHTTPExchangeAdmissionFallbackBody(t *testing.T) {
 		_, _ = rand.Read(cid[:])
 		var nonce [exNonceLen]byte
 		_, _ = rand.Read(nonce[:])
-		b := appendExRequest(nil, newExKey(psk, cid[:]), &cid, exKindUp, 0, 0, 0, uint32(time.Now().Unix()), &nonce, []byte("some data"))
+		b := exRequest(newExKey(psk, cid[:]), &cid, exKindUp, 0, 0, 0, uint32(time.Now().Unix()), &nonce, []byte("some data"))
 		if b64 {
 			auth := base64.StdEncoding.EncodeToString(b[:exAuthLen])
 			b = []byte(auth + base64.StdEncoding.EncodeToString(b[exAuthLen:]))
@@ -967,5 +967,42 @@ func TestExchangeBackoffChecked(t *testing.T) {
 		if (err == nil) != c.ok || err != nil && !errors.Is(err, zmux.ErrInvalidConfig) {
 			t.Errorf("%+v: %v", c.b, err)
 		}
+	}
+}
+
+// TestHTTPExchangeClosedEndsUnreachable closes both halves of a client
+// carrier whose server answers nothing usable: the final pieces are not
+// repeated (here without a Deadline) once zmux waits for nothing more, and
+// the carrier's goroutines end at once.
+func TestHTTPExchangeClosedEndsUnreachable(t *testing.T) {
+	leakcheck.Check(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+	p, err := Exchange{URL: srv.URL, Config: ExchangeConfig{AllowInsecure: true}, Deadline: -1}.Pipe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.W.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // pieces fail and wait to be repeated
+	_ = p.W.Close()
+	_ = p.R.Close()
+	c := p.W.(*exClientWriter).c
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.mu.Lock()
+		ended := c.ended
+		c.mu.Unlock()
+		if ended {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a closed carrier keeps repeating its final pieces")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

@@ -285,7 +285,7 @@ func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 	sortEntries(es)
 	for len(es) > 0 {
 		k := len(es)
-		n := 0
+		var n int
 		for {
 			n = varint.SizeVarint(wire.TypePipeAck) + varint.SizeVarint(uint64(k))
 			for _, e := range es[:k] {

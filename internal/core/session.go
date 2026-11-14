@@ -266,7 +266,7 @@ func (s *Session) rand() *mrand.Rand {
 		if seed == 0 {
 			seed = randUint64()
 		}
-		s.rng = mrand.New(mrand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+		s.rng = mrand.New(mrand.NewPCG(seed, seed^0x9e3779b97f4a7c15)) //nolint:gosec // G404: scheduling randomness, seedable for tests
 	}
 	return s.rng
 }
@@ -622,7 +622,9 @@ func (s *Session) finishClose() {
 	s.endSuspension()
 	s.state = StateClosed
 	for _, p := range s.pipes {
-		s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
+		if p.in == nil || !p.in.closed {
+			s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
+		}
 	}
 	s.timers = timers{handshake: Never, linger: Never, grace: Never}
 	s.emitClosedEvent()

@@ -34,6 +34,7 @@ const localVectors = "testdata/vectors"
 // specVectors returns the vector directory of the specification checkout
 // named by ZMUX_SPEC_DIR, or "" when it is not set.
 func specVectors(t testing.TB) string {
+	t.Helper()
 	root := os.Getenv("ZMUX_SPEC_DIR")
 	if root == "" {
 		return ""
@@ -81,6 +82,7 @@ func x25519(t testing.TB, seed []byte) *ecdh.PrivateKey {
 }
 
 func fixedKeygen(t testing.TB, seed, pub []byte) func() (keypair, error) {
+	t.Helper()
 	return func() (keypair, error) {
 		k := x25519(t, seed)
 		kp := keypair{priv: k, pub: k.PublicKey().Bytes()}
@@ -158,6 +160,7 @@ func defaults(p Profile, m Mode) parties {
 }
 
 func (v parties) config(t testing.TB, static []byte) Config {
+	t.Helper()
 	c := Config{Profile: Profile(v.Profile), Mode: Mode(v.Mode), Handle: v.Handle, PSK: v.PSK, Binding: v.Binding, MaxAppData: v.maxAppData()}
 	if len(static) > 0 {
 		c.Static = x25519(t, static)
@@ -259,8 +262,8 @@ func genHandshake(t testing.TB, name string, v parties, raw [][]byte) handshakeV
 // payloads as read.
 func genHandshakeFn(t testing.TB, name string, v parties, build func(idx int, hp []byte) []byte) (handshakeVector, []Payload) {
 	t.Helper()
-	var read []Payload
 	pat := profiles[Profile(v.Profile)]
+	read := make([]Payload, 0, len(pat.msgs))
 	out := handshakeVector{
 		Name: name, parties: v, NoiseName: pat.noiseName(),
 		Prologue:        prologue(Profile(v.Profile), Mode(v.Mode), v.Handle, v.Binding),
@@ -329,6 +332,7 @@ func genHandshakeFn(t testing.TB, name string, v parties, build func(idx int, hp
 var allProfiles = []Profile{ProfileEstablishPSK, ProfileEstablishPSKAES, ProfileEstablish, ProfileEstablishAES}
 
 func genHandshakes(t testing.TB) []handshakeVector {
+	t.Helper()
 	var out []handshakeVector
 	for _, p := range allProfiles {
 		for _, m := range []Mode{Sealed, Bound, Trusted} {
@@ -375,6 +379,7 @@ func genHandshakes(t testing.TB) []handshakeVector {
 // the receivers' bound raised to that length, or with no bound when
 // unbounded.
 func fullAppData(t testing.TB, unbounded bool) handshakeVector {
+	t.Helper()
 	n := maxMessage - 64 // message 3 with an empty payload is 64 bytes
 	n -= 1 + varint.SizeVarint(uint64(n))
 	v, name := withMaxAppData(defaults(ProfileEstablishPSK, Sealed), n), "profile1-sealed-app-data-fills-msg3"
@@ -517,6 +522,7 @@ type crafted struct {
 }
 
 func (c crafted) run(t testing.TB) [][]byte {
+	t.Helper()
 	i := c.v.side(t, true, c.iEph, c.iStatic)
 	r := c.v.side(t, false, c.rEph, c.rStatic)
 	if c.iEK != nil {
@@ -582,6 +588,7 @@ var lowOrder = func() []byte {
 }()
 
 func genNegatives(t testing.TB) []negativeVector {
+	t.Helper()
 	p1, p4 := defaults(ProfileEstablishPSK, Sealed), defaults(ProfileEstablish, Sealed)
 	var out []negativeVector
 	add := func(name string, v parties, side, class string, steps ...stepVector) {
@@ -786,7 +793,7 @@ func genNegatives(t testing.TB) []negativeVector {
 
 	// A verdict that names a proof key: the message's proof must be there,
 	// under that key, of a proof key's KeyAlg, and verify.
-	pk := newVKey(t, KeyAlgMLDSA44, "server proof key")
+	pk := newVKey(t, "server proof key")
 	verify := func(key []byte, pq bool) stepVector {
 		return stepVector{Op: "verify", ProofKey: key, RequirePQAuth: pq}
 	}
@@ -807,7 +814,7 @@ func genNegatives(t testing.TB) []negativeVector {
 	if got, _ := runNegative(t, negativeVector{parties: p1, Side: "initiator", Framing: "stream", Steps: []stepVector{write, read(good), verify(pk.ID().slice(), true)}}); got != "" {
 		t.Fatalf("the valid proof fails: %s", got)
 	}
-	other := newVKey(t, KeyAlgMLDSA44, "client proof key")
+	other := newVKey(t, "client proof key")
 	add("proof-key-named-no-proof", p1, "initiator", "credentials_failed", write, read(h1[1]), verify(pk.ID().slice(), false))
 	add("proof-key-id-mismatch", p1, "initiator", "credentials_failed", write, read(good), verify(other.ID().slice(), false))
 	add("proof-keyalg-not-3", p1, "initiator", "credentials_failed", write, read(withProof(func(hp []byte) *Proof {
@@ -908,11 +915,13 @@ type recordVector struct {
 func withN(s *join.Sealer, n uint64) *join.Sealer { s.CS.N = n; return s }
 
 func genRecords(t testing.TB) []recordVector {
+	t.Helper()
 	out := append(genRecordsFor(t, chachaPolyAEAD{}), genRecordsFor(t, join.AESGCM{})...)
 	return append(out, genSplitRecords(t)...)
 }
 
 func genRecordsFor(t testing.TB, kind join.AEADFunc) []recordVector {
+	t.Helper()
 	key := fixed("record key")
 	p := []byte("a zmux record")
 	const (
@@ -994,6 +1003,7 @@ func (v exporterVector) fillContext() []byte {
 }
 
 func genExporters(t testing.TB) []exporterVector {
+	t.Helper()
 	sec := fixed("exporter secret")
 	var out []exporterVector
 	for _, c := range []struct {
@@ -1236,6 +1246,7 @@ func bodyOf(f []byte) []byte {
 }
 
 func genDerive(t testing.TB) deriveVectors {
+	t.Helper()
 	var d deriveVectors
 	one := cryptoSet{Suites: []uint64{1}, Groups: []uint64{2}}
 	e1 := fixed("epoch secret 1")
@@ -1391,6 +1402,7 @@ func encode(t testing.TB, v any) []byte {
 }
 
 func generated(t testing.TB) map[string][]byte {
+	t.Helper()
 	return map[string][]byte{
 		"handshake.json":     encode(t, genHandshakes(t)),
 		"negative.json":      encode(t, genNegatives(t)),
@@ -1534,7 +1546,7 @@ func TestRecordVectorsAgainstNoise(t *testing.T) {
 }
 
 func testPayload(p Payload) []byte {
-	b, err := appendPayload(nil, p, false)
+	b, err := appendPayload(p, false)
 	if err != nil {
 		panic(err)
 	}

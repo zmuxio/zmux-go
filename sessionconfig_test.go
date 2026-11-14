@@ -98,7 +98,7 @@ func TestSessionConfigOutcomes(t *testing.T) {
 		f    func() (*Config, error)
 		ok   bool
 	}{
-		{"nil", func() (*Config, error) { return nil, nil }, true},
+		{"nil", func() (*Config, error) { return nil, nil }, true}, //nolint:nilnil // the case under test: no config and no error
 		{"error", func() (*Config, error) { return nil, errors.New("no") }, false},
 		{"panic", func() (*Config, error) { panic("no") }, false},
 		{"clock", func() (*Config, error) { c := mpConfig(); c.Clock = other; return c, nil }, false},

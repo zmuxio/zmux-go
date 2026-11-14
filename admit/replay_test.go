@@ -20,17 +20,17 @@ func TestReplayFilterVectors(t *testing.T) {
 	}
 	var doc struct {
 		Cases []struct {
-			Name  string
+			Name  string `json:"name"`
 			Steps []struct {
 				KeyHex  string `json:"key_hex"`
-				Verdict string
-				NowMs   int64 `json:"now_ms"`
-				TMs     int64 `json:"t_ms"`
-			}
+				Verdict string `json:"verdict"`
+				NowMs   int64  `json:"now_ms"`
+				TMs     int64  `json:"t_ms"`
+			} `json:"steps"`
 			WindowMs    int64 `json:"window_ms"`
-			Max         int
+			Max         int   `json:"max"`
 			NotBeforeMs int64 `json:"not_before_ms"`
-		}
+		} `json:"cases"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)

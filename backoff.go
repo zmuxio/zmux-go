@@ -75,5 +75,5 @@ func (b Backoff) wait(d time.Duration) time.Duration {
 	if b.Jitter == 0 {
 		return d
 	}
-	return time.Duration(float64(d) * (1 - b.Jitter*rand.Float64()))
+	return time.Duration(float64(d) * (1 - b.Jitter*rand.Float64())) //nolint:gosec // G404: jitter needs no unpredictability
 }

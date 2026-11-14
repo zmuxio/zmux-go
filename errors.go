@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -15,6 +16,20 @@ type ApplicationErrorCode uint64
 
 // StreamErrorCode is an application error code of a stream.
 type StreamErrorCode uint64
+
+// CancelCause returns an error carrying code, for context.WithCancelCause:
+// Splice and SplicePackets end both streams of both directions with the code
+// of a cancellation cause (a *StreamError's ErrorCode, wrapped or not).
+func CancelCause(code StreamErrorCode) error { return &StreamError{ErrorCode: code} }
+
+// spliceCode is the stream code that cause carries (an explicit 0 too), else
+// ZMUX_CANCELLED: a splice abandoned without a code is cancelled.
+func spliceCode(cause error) StreamErrorCode {
+	if se, ok := errors.AsType[*StreamError](cause); ok {
+		return se.ErrorCode
+	}
+	return StreamCancelled
+}
 
 // TransportErrorCode is a transport error code.
 type TransportErrorCode uint64
@@ -185,11 +200,7 @@ func isTimeout(err error) bool {
 			continue
 		}
 		if u, ok := err.(interface{ Unwrap() []error }); ok {
-			for _, e := range u.Unwrap() {
-				if isTimeout(e) {
-					return true
-				}
-			}
+			return slices.ContainsFunc(u.Unwrap(), isTimeout)
 		}
 		return false
 	}

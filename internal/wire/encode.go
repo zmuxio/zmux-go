@@ -112,7 +112,7 @@ func AppendDatagramHeader(b []byte, n int, withLen bool) []byte {
 	return append(b, byte(TypeDatagram))
 }
 
-func AppendTransportParams(b []byte, block []byte) []byte {
+func AppendTransportParams(b, block []byte) []byte {
 	b = varint.AppendVarint(b, TypeTransportParams)
 	b = varint.AppendVarint(b, uint64(len(block)))
 	return append(b, block...)
@@ -160,7 +160,7 @@ func AckEntryLen(e AckEntry) int {
 	return varint.SizeVarint(e.PipeID) + varint.SizeVarint(e.Lane) + varint.SizeVarint(e.Position) + varint.SizeVarint(e.Delay)
 }
 
-func AppendPipeLane(b []byte, key []byte, pipe, lane uint64) []byte {
+func AppendPipeLane(b, key []byte, pipe, lane uint64) []byte {
 	b = varint.AppendVarint(b, TypePipeLane)
 	b = append(b, key...)
 	return varint.AppendVarint(varint.AppendVarint(b, pipe), lane)

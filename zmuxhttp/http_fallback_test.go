@@ -204,7 +204,7 @@ func TestHTTPRejectedStreamFallbackFullDuplex(t *testing.T) {
 		}}
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
 	defer func() { _ = lst.Close() }()
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
 	})
 	h, err := NewHandler(lst, &Options{Next: next})

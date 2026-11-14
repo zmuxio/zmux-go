@@ -273,7 +273,7 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 	}
 	s.epochTimers(apply, due)
 	liveIn := s.hasLiveInbound()
-	for i := 0; i < len(s.pipes); i++ {
+	for i := 0; i < len(s.pipes); i++ { //nolint:intrange // failing a pipe may shrink s.pipes; the bound is re-read
 		p := s.pipes[i]
 		a := p.mp
 		if a == nil || a.retired {
@@ -311,11 +311,10 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 					a.drainSuspect = true
 					s.reinjectPipe(p)
 				}
-			case OutJoining:
+			case OutJoining, OutNone, OutFailed, OutClosed, OutRetired:
 				// An unconfirmed join fails at the join timeout above, and
-				// the peer's join is not supervised before it is confirmed.
-			case OutNone, OutFailed, OutClosed, OutRetired:
-				// liveOut excludes these.
+				// the peer's join is not supervised before it is confirmed;
+				// liveOut excludes the others.
 			}
 		}
 		if a.out == OutDraining && due(a.drainStart.Add(s.tFail(a))) && apply {

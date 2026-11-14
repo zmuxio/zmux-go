@@ -125,7 +125,7 @@ func TestPrefixAuthHeader(t *testing.T) {
 		return val
 	}
 	send := func(c *tls.Conn, h http.Header) string {
-		req, _ := http.NewRequest(http.MethodGet, "https://localhost/", nil)
+		req, _ := http.NewRequest(http.MethodGet, "https://localhost/", http.NoBody)
 		req.Header = h
 		_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 		if err := req.Write(c); err != nil {

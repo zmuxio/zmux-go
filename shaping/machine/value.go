@@ -259,7 +259,7 @@ func (v *value) drawTable(src rand.Source) uint64 {
 			i = lo
 		} else {
 			var acc uint64
-			for i = 0; i < len(segs)-1; i++ {
+			for i = 0; i < len(segs)-1; i++ { //nolint:intrange // i must end at len(segs)-1 when no segment matches
 				acc += segs[i].w
 				if c < acc {
 					break

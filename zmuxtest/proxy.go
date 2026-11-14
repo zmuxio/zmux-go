@@ -202,7 +202,7 @@ func (x *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := x.tr.RoundTrip(out.WithContext(ctx))
 	if err != nil {
-		x.gatewayError(w, ctx)
+		x.gatewayError(ctx, w)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -216,7 +216,7 @@ func (x *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	if buffer {
 		b, err := io.ReadAll(resp.Body)
 		if err != nil {
-			x.gatewayError(w, ctx)
+			x.gatewayError(ctx, w)
 			return
 		}
 		hh.Set("Content-Length", strconv.Itoa(len(b)))
@@ -253,7 +253,7 @@ func (x *Proxy) target(r *http.Request) *url.URL {
 	return &u
 }
 
-func (x *Proxy) gatewayError(w http.ResponseWriter, ctx context.Context) {
+func (x *Proxy) gatewayError(ctx context.Context, w http.ResponseWriter) {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
 		return
@@ -263,7 +263,7 @@ func (x *Proxy) gatewayError(w http.ResponseWriter, ctx context.Context) {
 
 // tunnel forwards a WebSocket upgrade and then the bytes both ways.
 func (x *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
-	uc, err := net.Dial("tcp", x.up.Host)
+	uc, err := (&net.Dialer{}).DialContext(r.Context(), "tcp", x.up.Host)
 	if err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return

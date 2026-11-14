@@ -386,7 +386,7 @@ func TestPlanAllocs(t *testing.T) {
 	var e shaping.Effects
 	var v shaping.RecordView
 	var ev shaping.Event
-	if n := testing.AllocsPerRun(2000, func() {
+	n := testing.AllocsPerRun(2000, func() {
 		now += time.Millisecond
 		p, v = shaping.RecordPlan{}, shaping.RecordView{Now: now}
 		sh.Plan(&v, &p)
@@ -394,7 +394,8 @@ func TestPlanAllocs(t *testing.T) {
 		sh.OnEvent(&ev, &e)
 		e, ev = shaping.Effects{}, shaping.Event{Kind: shaping.EventInjected, Now: now, Len: 64}
 		sh.OnEvent(&ev, &e)
-	}); n != 0 {
+	})
+	if n != 0 {
 		t.Errorf("%v allocations per plan", n)
 	}
 }

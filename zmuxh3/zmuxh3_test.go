@@ -27,6 +27,7 @@ import (
 )
 
 func tlsConfigs(t *testing.T) (*tls.Config, *tls.Config) {
+	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"},
 		DNSNames: []string{"localhost"}, IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
@@ -43,6 +44,7 @@ func tlsConfigs(t *testing.T) (*tls.Config, *tls.Config) {
 }
 
 func echo(t *testing.T, c, s *zmux.Conn) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	go func() {
@@ -165,7 +167,7 @@ func TestWebTransport(t *testing.T) {
 	// Pooled pipes: two per WebTransport session, then a new session.
 	pool := NewConnPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer pool.Shutdown()
-	var fates []uint64
+	fates := make([]uint64, 0, 3)
 	for range 3 {
 		// The dial's context bounds the dial only: the pipes outlive it.
 		dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
@@ -231,7 +233,7 @@ func TestUpgradeFailureCounted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, _ := http.NewRequest(http.MethodGet, "https://localhost/", nil)
+	r, _ := http.NewRequest(http.MethodGet, "https://localhost/", http.NoBody)
 	r.RemoteAddr = "192.0.2.1:443"
 	h.ServeHTTP(&discardWriter{h: http.Header{}}, r)
 	if st := lst.Stats(); !reflect.DeepEqual(st, zmux.ListenerStats{SetupFailures: 1}) {
@@ -303,7 +305,7 @@ func TestServe(t *testing.T) {
 func TestBoundOverHTTP3(t *testing.T) {
 	srvTLS, cliTLS := tlsConfigs(t)
 	scfg := pskCfg()
-	scfg.AllowRecordMode = func(c zmux.RecordPolicyInput, m zmux.RecordMode, _ any) bool { return c.Secure && c.HasExporter }
+	scfg.AllowRecordMode = func(c zmux.RecordPolicyInput, _ zmux.RecordMode, _ any) bool { return c.Secure && c.HasExporter }
 	lst := mustNewListener(&zmux.ListenerConfig{Config: scfg})
 	defer func() { _ = lst.Close() }()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")

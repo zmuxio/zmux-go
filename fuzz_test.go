@@ -46,6 +46,7 @@ func clientOpening(f *testing.F, cfg *Config, stream bool) []byte {
 // feed runs a session over one end of a pipe and writes data into the
 // other: the session must end (no panic, no hang) once the input ends.
 func feed(t *testing.T, data []byte, serve func(ctx context.Context, p PipeIO) (*Conn, error)) {
+	t.Helper()
 	a, b := net.Pipe()
 	go func() { _, _ = io.Copy(io.Discard, b) }()
 	go func() {

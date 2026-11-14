@@ -44,9 +44,8 @@ func newLossyRelay(t *testing.T, server string, delay time.Duration) *lossyRelay
 	}
 	r := &lossyRelay{ln: ln, up: up, delay: delay, dropMin: 1000}
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); r.pump(true) }()
-	go func() { defer wg.Done(); r.pump(false) }()
+	wg.Go(func() { r.pump(true) })
+	wg.Go(func() { r.pump(false) })
 	t.Cleanup(func() {
 		_ = ln.Close()
 		_ = up.Close()
@@ -281,7 +280,7 @@ func TestChannelSessionsShareConnection(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = qc.CloseWithError(0, "") })
 	type pair struct{ c, s *zmux.Conn }
-	var ps []pair
+	ps := make([]pair, 0, 3)
 	for range 3 {
 		c, s := dialClient(t, e, qc, cfg)
 		ps = append(ps, pair{c, s})

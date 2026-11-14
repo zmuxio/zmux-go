@@ -119,7 +119,7 @@ func (p *ConnPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 		return l, nil
 	}
 	// An expired-connection Close callback may have stopped this pool or context.
-	if err = ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	p.mu.Lock()
@@ -341,7 +341,6 @@ func (p *ConnPool[C]) recheckNow() {
 	p.consultLocked()
 	var idle []C
 	for _, x := range slices.Backward(p.conns) {
-
 		p.retireLocked(x)
 		if x.retired && x.active == 0 && p.drop(x) {
 			idle = append(idle, x.c)

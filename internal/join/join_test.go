@@ -226,6 +226,7 @@ func TestSuite1Vectors(t *testing.T) {
 
 // vectorRand reads the fixed private values of one end of a join vector.
 func vectorRand(t *testing.T, v map[string]any, joiner bool) *GroupRand {
+	t.Helper()
 	hx := func(k string) []byte {
 		s, _ := v[k].(string)
 		b, err := hex.DecodeString(s)

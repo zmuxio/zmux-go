@@ -38,9 +38,9 @@ func (s *Session) bufferCap() uint64 {
 		c = s.cfg.ConnWindowCap
 	}
 	l := &s.cfg.Local
-	S := s.rem[0].initial*l.MaxStreamDataBidiRem + s.rem[1].initial*l.MaxStreamDataUni
-	S += s.openLocalBidiRecv * l.MaxStreamDataBidiLoc
-	return max64(c, S)
+	sum := s.rem[0].initial*l.MaxStreamDataBidiRem + s.rem[1].initial*l.MaxStreamDataUni
+	sum += s.openLocalBidiRecv * l.MaxStreamDataBidiLoc
+	return max64(c, sum)
 }
 
 // bufAdd accounts n bytes stored in a stream buffer and releases session

@@ -322,7 +322,7 @@ func (s *shaper) fire(t trigger, slot int32, n uint64, only int32) {
 // drain runs the queue first in, first out; a trigger of an earlier entry of
 // its machine's state is dropped.
 func (s *shaper) drain() {
-	for i := 0; i < len(s.q); i++ {
+	for i := 0; i < len(s.q); i++ { //nolint:intrange // step appends to s.q; the bound is re-read
 		g := s.q[i]
 		if g.gen == s.ms[g.m].gen {
 			s.step(g.m, g.t, g.slot)

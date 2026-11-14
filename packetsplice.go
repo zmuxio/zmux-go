@@ -21,6 +21,9 @@ import (
 // DATAGRAM capsule (counted in DatagramsEncapsulated). Capsules are never
 // turned into datagrams: a packet sent reliably stays reliable. The
 // helper does not check the capsules it forwards; the receiving end does.
+// A ctx cancelled with a cause made by CancelCause ends both
+// streams in both directions with that code, as in Splice; a plain cancel
+// or a deadline resets with ZMUX_CANCELLED and stops with 0.
 func SplicePackets(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResult, error) {
 	if a == b || a.h == b.h {
 		return SpliceResult{}, errSpliceSelf
@@ -42,22 +45,13 @@ func SplicePackets(ctx context.Context, a, b *Stream, opts *SpliceOptions) (Spli
 	toB, toA := newCapsuleGate(), newCapsuleGate()
 	var ab, ba, dab, dba SpliceDirection
 	var wg, dg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		ab = splicePacketDir(ctx, a, b, o.Chunk, o.AtoB, toB)
-	}()
-	go func() {
-		defer wg.Done()
-		ba = splicePacketDir(ctx, b, a, o.Chunk, o.BtoA, toA)
-	}()
+	wg.Go(func() { ab = splicePacketDir(ctx, a, b, o.Chunk, o.AtoB, toB) })
+	wg.Go(func() { ba = splicePacketDir(ctx, b, a, o.Chunk, o.BtoA, toA) })
 	if a.h.c.ConnectionState().SupportsDatagrams.Local {
-		dg.Add(1)
-		go func() { defer dg.Done(); splicePacketDatagrams(ctx, a, b, o.AtoB, toB, &dab) }()
+		dg.Go(func() { splicePacketDatagrams(ctx, a, b, o.AtoB, toB, &dab) })
 	}
 	if b.h.c.ConnectionState().SupportsDatagrams.Local {
-		dg.Add(1)
-		go func() { defer dg.Done(); splicePacketDatagrams(ctx, b, a, o.BtoA, toA, &dba) }()
+		dg.Go(func() { splicePacketDatagrams(ctx, b, a, o.BtoA, toA, &dba) })
 	}
 	wg.Wait()
 	cancel()
@@ -97,18 +91,18 @@ func splicePacketDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter, 
 		// datagrams can be inserted while the stream is idle.
 		_, _, werr, err := r.h.waitReadable(ctx, w.h)
 		if werr != nil {
-			spliceWriteErr(r, w, werr)
-			d.End = spliceEnd(werr, true)
+			spliceWriteErr(ctx, r, w, werr)
+			d.End = spliceEnd(ctx, werr, true)
 			return d
 		}
 		if err != nil {
-			spliceAbort(r, w, err)
-			d.End = spliceEnd(err, false)
+			spliceAbort(ctx, r, w, err)
+			d.End = spliceEnd(ctx, err, false)
 			return d
 		}
 		if err := g.lock(ctx); err != nil {
-			spliceAbort(r, w, err)
-			d.End = SpliceEnd{Kind: SpliceCancelled}
+			spliceAbort(ctx, r, w, err)
+			d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
 			return d
 		}
 		end, done := splicePacketCapsule(ctx, r, w, chunk, lim, &hdr, &d)
@@ -140,14 +134,16 @@ func splicePacketCapsule(ctx context.Context, r, w *Stream, chunk int, lim Limit
 			break
 		}
 		ch, err := r.h.readChunk(ctx, need)
+		// A chunk carries the bytes read before an error, as io.Reader does.
+		//goland:noinspection GoDfaErrorMayBeNotNil
 		hn += copy(hdr[hn:], ch.Data)
 		ch.Release()
 		if errors.Is(err, io.EOF) {
 			return true, !splicePacketWrite(ctx, r, w, lim, hdr[:hn], d)
 		}
 		if err != nil {
-			spliceReadErr(r, w, err)
-			d.End = spliceEnd(err, false)
+			spliceReadErr(ctx, r, w, err)
+			d.End = spliceEnd(ctx, err, false)
 			return false, true
 		}
 	}
@@ -176,14 +172,14 @@ func splicePacketWrite(ctx context.Context, r, w *Stream, lim Limiter, b []byte,
 	if lim != nil {
 		// The header waits for its allowance like value bytes do.
 		if _, err := lim.Ready(ctx, len(b), len(b)); err != nil {
-			spliceAbort(r, w, err)
-			d.End = SpliceEnd{Kind: SpliceCancelled}
+			spliceAbort(ctx, r, w, err)
+			d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
 			return false
 		}
 	}
 	if _, err := w.h.writeCtx(ctx, b); err != nil {
-		spliceWriteErr(r, w, err)
-		d.End = spliceEnd(err, true)
+		spliceWriteErr(ctx, r, w, err)
+		d.End = spliceEnd(ctx, err, true)
 		return false
 	}
 	if lim != nil {
@@ -226,8 +222,9 @@ func splicePacketDatagrams(ctx context.Context, r, w *Stream, lim Limiter, g *ca
 			case datagramFailed:
 				d.DatagramsDropped++
 				continue
+			case datagramTooLarge:
+				// The bound shrank since it was read: send it as a capsule.
 			}
-			// The bound shrank since it was read: send it as a capsule.
 		}
 		if lim != nil && lim.TryReady(len(p)) < len(p) {
 			d.DatagramsLimited++

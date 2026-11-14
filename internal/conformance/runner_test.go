@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 
@@ -54,6 +53,7 @@ func decodeJSON(b []byte, v any) error {
 }
 
 func loadProfiles(t *testing.T) map[string]profile {
+	t.Helper()
 	b, err := os.ReadFile(filepath.Join(specDir, "profiles.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func traceFiles(dir string) []string {
 		}
 		return nil
 	})
-	sort.Strings(files)
+	slices.Sort(files)
 	return files
 }
 
@@ -220,6 +220,7 @@ func merge(dst, src map[string]any) map[string]any {
 func ms(v any) core.Duration { return core.Duration(num(v)) * core.Millisecond }
 
 func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
+	t.Helper()
 	p := profiles[h.Profile]
 	tp := merge(p.TP, h.Overrides.TP)
 	cf := merge(p.Config, h.Overrides.Config)
@@ -429,7 +430,7 @@ func (r *runner) step(st map[string]any) error {
 	case "expect_reject_carrier":
 		c := r.carriers[st["carrier"].(string)]
 		if c == nil || !c.rejected {
-			return fmt.Errorf("carrier not rejected")
+			return errors.New("carrier not rejected")
 		}
 		return nil
 	}
@@ -715,12 +716,14 @@ func (r *runner) capture(p *rpipe, lane uint64) {
 			}
 			o := frameObj(&f)
 			if os.Getenv("ZTRACE") != "" {
-				j, _ := json.Marshal(o)
+				show := o
 				if d, ok := o["data"].(string); ok && len(d) > 40 {
-					o2 := map[string]any{}
-					maps.Copy(o2, o)
-					o2["data"] = fmt.Sprintf("<%d bytes>", len(d)/2)
-					j, _ = json.Marshal(o2)
+					show = maps.Clone(o)
+					show["data"] = fmt.Sprintf("<%d bytes>", len(d)/2)
+				}
+				j, err := json.Marshal(show)
+				if err != nil {
+					r.t.Fatal(err)
 				}
 				if len(j) > 200 {
 					j = j[:200]
@@ -747,7 +750,7 @@ func (r *runner) lanesFor(st map[string]any) []*rlane {
 	lane := getU(st, "lane")
 	if s, ok := st["pipe"].(string); ok && s == "*" {
 		var out []*rlane
-		ids := make([]uint64, 0)
+		ids := make([]uint64, 0, len(r.pipes))
 		for id := range r.pipes {
 			ids = append(ids, id)
 		}
@@ -769,7 +772,10 @@ func (r *runner) lanesFor(st map[string]any) []*rlane {
 func dumpFrames(fs []map[string]any) string {
 	var b strings.Builder
 	for _, f := range fs {
-		j, _ := json.Marshal(f)
+		j, err := json.Marshal(f)
+		if err != nil {
+			j = []byte(err.Error())
+		}
 		b.Write(j)
 		b.WriteByte('\n')
 	}
@@ -791,8 +797,9 @@ func (r *runner) expectFrames(st map[string]any) error {
 			frames = append(frames, l.first...)
 		}
 	}
-	var pats []map[string]any
-	for _, p := range st["frames"].([]any) {
+	framePats := st["frames"].([]any)
+	pats := make([]map[string]any, 0, len(framePats))
+	for _, p := range framePats {
 		pats = append(pats, p.(map[string]any))
 	}
 	err := matchFrames(mode, pats, nonPadding(frames, pats))
@@ -828,14 +835,14 @@ func oneCreditPerRecord(frames []map[string]any, recIdx []int) error {
 			continue
 		}
 		if seen[k] {
-			return fmt.Errorf("two credit frames of one scope in a record")
+			return errors.New("two credit frames of one scope in a record")
 		}
 		seen[k] = true
 	}
 	return nil
 }
 
-func nonPadding(fs []map[string]any, pats []map[string]any) []map[string]any {
+func nonPadding(fs, pats []map[string]any) []map[string]any {
 	for _, p := range pats {
 		if p["type"] == "PADDING" {
 			return fs
@@ -850,7 +857,7 @@ func nonPadding(fs []map[string]any, pats []map[string]any) []map[string]any {
 	return out
 }
 
-func matchFrames(mode string, pats []map[string]any, frames []map[string]any) error {
+func matchFrames(mode string, pats, frames []map[string]any) error {
 	switch mode {
 	case "exact", "first":
 		i := 0
@@ -1060,7 +1067,7 @@ func errorObj(e *core.SessionError) map[string]any {
 	return o
 }
 
-func matchObj(pat map[string]any, got map[string]any) bool {
+func matchObj(pat, got map[string]any) bool {
 	for k, v := range pat {
 		g, ok := got[k]
 		if !ok {
@@ -1275,7 +1282,7 @@ func (r *runner) expectPipeClosed(st map[string]any) error {
 // is routed by its PIPE_LANE, the rest is the lane's.
 func (r *runner) carrierSend(c *rcarrier, st map[string]any) error {
 	if c == nil {
-		return fmt.Errorf("unknown carrier")
+		return errors.New("unknown carrier")
 	}
 	var data []byte
 	if hx, ok := st["hex"].(string); ok {
@@ -1298,7 +1305,7 @@ func (r *runner) carrierSend(c *rcarrier, st map[string]any) error {
 			!r.s.LaneKeyMatches(f.LaneKey) {
 			c.rejected = true
 			c.buf = nil
-			return nil
+			return nil //nolint:nilerr // a malformed carrier is the scenario's reject, not a step failure
 		}
 		if !r.s.AcceptLane(c.conn, f.PipeID, f.Lane, core.CarrierInfo{QueueBound: true, MinRTT: true, Lanes: true}) {
 			c.rejected = r.s.State() < core.StateClosing

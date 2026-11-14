@@ -56,7 +56,7 @@ func (c *recConn) records() (sizes, zeros []int) {
 		sizes, zeros = append(sizes, int(v)), append(zeros, z)
 		b = b[n+int(v):]
 	}
-	return
+	return sizes, zeros
 }
 
 // fnShaper is a Shaper made of functions.
@@ -340,7 +340,7 @@ func reachableWire(l, minFrames int) int {
 // boundary with no PADDING needed.
 func TestShapingExactSize(t *testing.T) {
 	type plan struct{ maxLen, padTo, mult, pad int }
-	var plans []plan
+	plans := make([]plan, 0, 25)
 	for _, n := range []int{64, 65, 66, 127, 128, 199, 200, 201, 998, 1000, 16383, 16384, 16385} {
 		plans = append(plans, plan{maxLen: n, padTo: n})
 	}

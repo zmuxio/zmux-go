@@ -18,7 +18,7 @@ const (
 	// BoundExporterLen is the length of a carrier exporter and a Binding.
 	BoundExporterLen = join.BindingLen
 
-	labelToken = "zmux-seal token"
+	labelToken = "zmux-seal token" //nolint:gosec // G101: a KDF label, not a credential
 	// MinTokenSecret is the shortest secret of DeriveHandlePSK.
 	MinTokenSecret = 16
 

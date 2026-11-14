@@ -158,7 +158,7 @@ type peerPreamble struct {
 	pipeCarrier bool
 }
 
-// pending control bits of a stream
+// pending control bits of a stream.
 const (
 	ctlMaxStreamData uint8 = 1 << iota
 	ctlStop
@@ -260,7 +260,7 @@ func typeIndex(bidi bool) int {
 }
 
 // streamID composes an identifier (RFC 9000 Section 2.1).
-func streamID(idx uint64, bidi bool, responder bool) uint64 {
+func streamID(idx uint64, bidi, responder bool) uint64 {
 	id := idx << 2
 	if !bidi {
 		id |= 2
@@ -547,17 +547,19 @@ func (s *Session) Flush(st *Stream) (uint64, error) {
 
 // FlushDone reports whether st's opening frame and its data up to target
 // were sent (or are queued in the held first flight, which leaves with
-// it), or the stream or session failed (err).
+// it), or the stream or session failed (err). What was sent counts even if
+// a STOP_SENDING or reset arrived afterwards: that error is reported by the
+// next operation, not by the Flush it overtook.
 func (s *Session) FlushDone(st *Stream, target uint64, sig *Signal) (bool, error) {
 	sp := &st.snd
 	switch {
+	case st.opened && sp.sent >= min64(target, sp.q.end):
+		return true, nil
 	case sp.reset || sp.errState != nil:
 		return true, sp.errState
 	case s.err != nil:
 		return true, s.err
 	case s.firstHeld:
-		return true, nil
-	case st.opened && sp.sent >= min64(target, sp.q.end):
 		return true, nil
 	}
 	st.wsig = sig
@@ -644,15 +646,16 @@ func (s *Session) SetPeerPriority(st *Stream, urgency uint8, incr bool) error {
 
 func (s *Session) dropProvisional(st *Stream) {
 	for i, x := range s.provisional {
-		if x == st {
-			copy(s.provisional[i:], s.provisional[i+1:])
-			s.provisional[len(s.provisional)-1] = nil
-			s.provisional = s.provisional[:len(s.provisional)-1]
-			if s.ga.closeWhenDone {
-				s.ga.recheck = true
-			}
-			return
+		if x != st {
+			continue
 		}
+		copy(s.provisional[i:], s.provisional[i+1:])
+		s.provisional[len(s.provisional)-1] = nil
+		s.provisional = s.provisional[:len(s.provisional)-1]
+		if s.ga.closeWhenDone {
+			s.ga.recheck = true
+		}
+		return
 	}
 }
 

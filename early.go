@@ -161,7 +161,7 @@ func (c *Conn) awaitVerdict(pd *pipeDrv, lane uint64) {
 }
 
 // earlyVerdict applies the carrier's verdict; on rejection the restart
-// hook is called first, and a hook that fails fails the session. boot is
+// hook is called first, and a failing hook fails the session. boot is
 // the bootstrap pipe.
 func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	defer c.wg.Done()

@@ -269,7 +269,7 @@ func (c *Compiled) Handshake() shaping.HandshakeShaper {
 // runtimeSource is the runtime's per-thread generator; it takes no lock.
 type runtimeSource struct{}
 
-func (runtimeSource) Uint64() uint64 { return rand.Uint64() }
+func (runtimeSource) Uint64() uint64 { return rand.Uint64() } //nolint:gosec // G404: shaping draws hide no secret
 
 // compile-time assertion that the names stay in byte order.
 var _ = func() bool {

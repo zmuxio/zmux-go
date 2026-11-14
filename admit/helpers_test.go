@@ -34,12 +34,13 @@ func mustNewListener(cfg *zmux.ListenerConfig) *zmux.Listener {
 }
 
 func waitDone(t testing.TB, c *zmux.Conn) {
+	t.Helper()
 	done := make(chan struct{})
 	go func() { _ = c.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatalf("session did not end")
+		t.Fatal("session did not end")
 	}
 }
 

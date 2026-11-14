@@ -47,12 +47,13 @@ func pair(t testing.TB, a, b net.Conn, ccfg, scfg *Config) (*Conn, *Conn) {
 }
 
 func waitDone(t testing.TB, c *Conn) {
+	t.Helper()
 	done := make(chan struct{})
 	go func() { _ = c.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatalf("session did not end")
+		t.Fatal("session did not end")
 	}
 }
 
@@ -183,7 +184,7 @@ func TestCloseWakesReaders(t *testing.T) {
 			t.Fatalf("read error %v", err)
 		}
 		if !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("not net.ErrClosed")
+			t.Fatal("not net.ErrClosed")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("reader not woken")

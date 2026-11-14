@@ -25,7 +25,7 @@ func (c *panicChan) MaxChannelDatagram() int {
 // TestDriverPanicClosesSession: a panic under the session lock in a
 // driver loop closes the session instead of leaving the lock held.
 func TestDriverPanicClosesSession(t *testing.T) {
-	a, b := chanPair(t, 1200)
+	a, b := chanPair(t)
 	pa := &panicChan{chanConn: a, armed: make(chan struct{})}
 	c, s := pair(t, pa, b, dgramCfg(), dgramCfg())
 	if got := exchangeDatagrams(t, c, s, 1, 100); got != 1 {

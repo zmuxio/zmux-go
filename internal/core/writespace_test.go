@@ -26,6 +26,7 @@ func lentSession(t *testing.T) (*Session, *Pipe, *Stream) {
 // fillLent writes total bytes of val through WriteSpace and CommitWrite in
 // steps of at most step bytes, as ReadFrom does with a reader.
 func fillLent(t *testing.T, s *Session, st *Stream, total, step int, val byte) {
+	t.Helper()
 	for total > 0 {
 		buf, err := s.WriteSpace(st, min(step, total))
 		if err != nil || len(buf) == 0 {
@@ -43,6 +44,7 @@ func fillLent(t *testing.T, s *Session, st *Stream, total, step int, val byte) {
 
 // drainLent sends everything queued and returns the stream bytes.
 func drainLent(t *testing.T, s *Session, p *Pipe, b *Batch, out []byte) []byte {
+	t.Helper()
 	now := Time(Second)
 	for s.PollTransmit(p.id, 0, b, DefaultBatch, now) {
 		for _, r := range recordData(t, b) {

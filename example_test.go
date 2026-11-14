@@ -15,12 +15,14 @@ import (
 func sessions(ctx context.Context, ccfg, scfg *zmux.Config) (client, server *zmux.Conn, err error) {
 	a, b := net.Pipe()
 	ch := make(chan error, 1)
+	srv := make(chan *zmux.Conn, 1)
 	go func() {
-		var err error
-		server, err = zmux.Server(ctx, b, scfg)
+		s, err := zmux.Server(ctx, b, scfg)
+		srv <- s
 		ch <- err
 	}()
 	client, err = zmux.Client(ctx, a, ccfg)
+	server = <-srv
 	if serr := <-ch; err == nil {
 		err = serr
 	}

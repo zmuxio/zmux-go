@@ -32,16 +32,16 @@ func step(clk *timeshim.Fake, d, inc time.Duration) {
 	}
 }
 
-// waitErr waits up to real for c to end while it keeps clk moving in
+// waitErr waits up to wall for c to end while it keeps clk moving in
 // steps of a second. A Fake calls a timer armed for a time already past at
 // its next Advance, not on its own: a driver that lags behind step and
 // arms the deadline it computed after the last step's Advance would
 // otherwise wait for an Advance that never comes.
-func waitErr(t *testing.T, clk *timeshim.Fake, c *Conn, real time.Duration) error {
+func waitErr(t *testing.T, clk *timeshim.Fake, c *Conn, wall time.Duration) error {
 	t.Helper()
 	done := make(chan error, 1)
 	go func() { done <- c.Wait() }()
-	stop := time.After(real)
+	stop := time.After(wall)
 	tick := time.NewTicker(time.Millisecond)
 	defer tick.Stop()
 	for {

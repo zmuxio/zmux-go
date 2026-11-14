@@ -266,16 +266,16 @@ func TestHTTPExchangeFaults(t *testing.T) {
 		maxDur time.Duration
 		check  exFault
 	}
-	var runs []run
+	runs := make([]run, 0, faultCount+2)
 	for f := range faultCount {
 		var r [faultCount]float64
 		r[f] = 0.15
 		runs = append(runs, run{name: faultNames[f], rates: r, check: f})
 	}
 	// Held DOWN requests outlive the proxy's limit and are cut.
-	runs = append(runs, run{name: "cut", maxDur: 150 * time.Millisecond, check: -1})
-	runs = append(runs, run{name: "mix", rates: [faultCount]float64{0.04, 0.04, 0.04, 0.04, 0.1, 0.04},
-		maxDur: time.Second, check: -1})
+	runs = append(runs, run{name: "cut", maxDur: 150 * time.Millisecond, check: -1},
+		run{name: "mix", rates: [faultCount]float64{0.04, 0.04, 0.04, 0.04, 0.1, 0.04},
+			maxDur: time.Second, check: -1})
 	for i, r := range runs {
 		t.Run(r.name, func(t *testing.T) {
 			leakcheck.Check(t)

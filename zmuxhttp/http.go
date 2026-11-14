@@ -236,8 +236,6 @@ type httpCall struct {
 	cur atomic.Pointer[httpUpBody]
 }
 
-func (b *httpUpBody) headersWritten() { b.wroteOnce.Do(func() { close(b.wrote) }) }
-
 // CarrierBody is implemented by the request body of an HTTP carrier. A
 // bidirectional carrier on an https TLS connection of net/http's transport
 // names that connection itself. Another client transport whose connection
@@ -351,6 +349,8 @@ type httpUpBody struct {
 	goneOnce    sync.Once
 }
 
+func (b *httpUpBody) headersWritten() { b.wroteOnce.Do(func() { close(b.wrote) }) }
+
 // SetSecureConnection implements CarrierBody; a body a redirect
 // replaced declares nothing.
 func (b *httpUpBody) SetSecureConnection(c zmux.ConnectionStater) {
@@ -369,7 +369,7 @@ func (b *httpUpBody) Read(p []byte) (int, error) {
 	s := b.s
 	for {
 		if !s.direct.Load() {
-			if n, err, ok := b.fromCarry(p); ok {
+			if n, ok, err := b.fromCarry(p); ok {
 				return n, err
 			}
 		}
@@ -417,13 +417,13 @@ func (b *httpUpBody) Read(p []byte) (int, error) {
 
 // fromCarry serves p from carry; ok is false when the caller reads the
 // pipe.
-func (b *httpUpBody) fromCarry(p []byte) (n int, err error, ok bool) {
+func (b *httpUpBody) fromCarry(p []byte) (n int, ok bool, err error) {
 	s := b.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
 	case b.dead.Load():
-		return 0, errUpAbandoned, true
+		return 0, true, errUpAbandoned
 	case b.off < len(s.carry):
 		n = copy(p, s.carry[b.off:])
 		b.off += n
@@ -431,12 +431,12 @@ func (b *httpUpBody) fromCarry(p []byte) (n int, err error, ok bool) {
 			s.carry, b.off = nil, 0
 			s.direct.Store(true)
 		}
-		return n, nil, true
+		return n, true, nil
 	case !s.pending:
 		s.carry, b.off = nil, 0
 		s.direct.Store(true)
 	}
-	return 0, nil, false
+	return 0, false, nil
 }
 
 func (b *httpUpBody) Close() error {
@@ -619,9 +619,11 @@ func (w *httpReqWriter) WriteBuffers(bufs [][]byte) (int, error) {
 func (w *httpReqWriter) CarrierSecure() bool { return w.connection() != nil }
 
 // connection is the current hop's secure connection, if it declared one.
-func (w *httpReqWriter) connection() *zmux.ConnectionStater {
+func (w *httpReqWriter) connection() zmux.ConnectionStater {
 	if b := w.call.cur.Load(); b != nil {
-		return b.conn.Load()
+		if c := b.conn.Load(); c != nil {
+			return *c
+		}
 	}
 	return nil
 }
@@ -629,7 +631,7 @@ func (w *httpReqWriter) connection() *zmux.ConnectionStater {
 // ConnectionState is that connection's TLS state; without one, none.
 func (w *httpReqWriter) ConnectionState() tls.ConnectionState {
 	if c := w.connection(); c != nil {
-		return (*c).ConnectionState()
+		return c.ConnectionState()
 	}
 	return tls.ConnectionState{}
 }

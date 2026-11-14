@@ -372,7 +372,7 @@ type failingRestart struct{ *earlyLayer }
 func (l failingRestart) RestartEarly(context.Context) (PipeIO, error) {
 	l.restarts.Add(1)
 	l.mu.Lock()
-	l.state = 1
+	l.state = 1 //nolint:revive // state lives behind the embedded pointer
 	l.mu.Unlock()
 	return PipeIO{}, errors.New("no restart")
 }

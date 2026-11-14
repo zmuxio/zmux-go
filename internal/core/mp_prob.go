@@ -42,7 +42,7 @@ func (h *history) recent(at Time) bool {
 	return h.ended && at <= h.endAt.Add(MulD(probRecent, h.endBase))
 }
 
-func (h *history) troubleAt(inProb bool, upCounted bool, upSince, at Time) {
+func (h *history) troubleAt(inProb, upCounted bool, upSince, at Time) {
 	if upCounted {
 		up := at.Sub(upSince)
 		if !h.hasUMax || up > h.uMax {

@@ -248,7 +248,9 @@ func Dial(ctx context.Context, t *webtransport.Transport, url string, h http.Hea
 // cred it is t.Dial.
 func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, h http.Header, cred zmux.CarrierCredential) (*webtransport.Session, error) {
 	if cred == nil {
-		_, sess, err := t.Dial(ctx, rawURL, h)
+		// The response body is the session's CONNECT stream, owned and
+		// closed by the session.
+		_, sess, err := t.Dial(ctx, rawURL, h) //nolint:bodyclose // body is the session stream
 		return sess, err
 	}
 	u, err := url.Parse(rawURL)
@@ -299,7 +301,7 @@ func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, 
 	if err != nil {
 		return fail(err)
 	}
-	_, sess, err := cc.Dial(ctx, rawURL, hh)
+	_, sess, err := cc.Dial(ctx, rawURL, hh) //nolint:bodyclose // body is the session stream
 	if err != nil {
 		return fail(err)
 	}
@@ -311,8 +313,7 @@ func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, 
 	context.AfterFunc(sess.Context(), func() {
 		var code quic.ApplicationErrorCode
 		var reason string
-		var se *webtransport.SessionError
-		if errors.As(closeError(sess), &se) {
+		if se, ok := errors.AsType[*webtransport.SessionError](closeError(sess)); ok {
 			code, reason = quic.ApplicationErrorCode(se.ErrorCode), se.Message
 		}
 		t := time.NewTimer(lingerTimeout(qc.ConnectionStats().SmoothedRTT))
@@ -485,11 +486,6 @@ func StreamPipe(sess *webtransport.Session, s *webtransport.Stream) zmux.PipeIO 
 	return (&wtStream{sess: sess, s: s}).pipe()
 }
 
-// pipe is the pipe input over w.
-func (w *wtStream) pipe() zmux.PipeIO {
-	return zmux.PipeIO{R: (*wtReader)(w), W: w, Carrier: zmux.CarrierWebTransport}
-}
-
 type wtStream struct {
 	sess *webtransport.Session
 	s    *webtransport.Stream
@@ -501,6 +497,11 @@ type wtStream struct {
 	wOnce  sync.Once
 	rOnce  sync.Once
 	halves atomic.Int32
+}
+
+// pipe is the pipe input over w.
+func (w *wtStream) pipe() zmux.PipeIO {
+	return zmux.PipeIO{R: (*wtReader)(w), W: w, Carrier: zmux.CarrierWebTransport}
 }
 
 // halfEnded counts the end of one half; the second calls ended.

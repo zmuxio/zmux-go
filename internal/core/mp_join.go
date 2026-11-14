@@ -660,7 +660,7 @@ func replyRoom(mode join.Mode, received, base, wantFrames int) (framesLimit, pad
 
 // ClaimHello is the rest of step 7: it sets the Pipe ID's bit, applies the first
 // batch and writes the Reply with its read-only decision, under plan, on a carrier
-// that adds over bytes to a write and has received received bytes. It changes no
+// that adds over bytes to a write and has taken in received bytes. It changes no
 // pipe, cap or suspension.
 func (s *Session) ClaimHello(pj *PeerJoin, c Carrier, over, received int, plan *shaping.UnitPlan) (reply []byte, res JoinResult) {
 	m := s.mp

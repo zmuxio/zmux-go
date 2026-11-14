@@ -31,6 +31,7 @@ func SchedulerSpreadRateWeighted() Scheduler { return builtin(core.PolicySpreadR
 // Direction is a pipe direction from the local endpoint's view.
 type Direction uint8
 
+// Pipe directions.
 const (
 	DirectionBidirectional Direction = iota
 	DirectionSendOnly

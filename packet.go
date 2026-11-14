@@ -431,11 +431,11 @@ func varintNeed(b []byte) int {
 }
 
 // parseCapsuleHeader parses a capsule header (Type, Length, and for
-// DATAGRAM the Context ID) at the start of b with a receive bound of max
+// DATAGRAM the Context ID) at the start of b with a receive bound of limit
 // payload bytes; need is the bytes still missing (0: complete). A Length
-// above max + 8 (any type), a DATAGRAM payload above max, and a DATAGRAM
+// above limit + 8 (any type), a DATAGRAM payload above limit, and a DATAGRAM
 // Value too short for its Context ID are errors.
-func parseCapsuleHeader(b []byte, max int) (h capsuleHeader, need int, err error) {
+func parseCapsuleHeader(b []byte, limit int) (h capsuleHeader, need int, err error) {
 	typ, i := varint.ConsumeVarint(b)
 	if i == 0 {
 		return h, varintNeed(b), nil
@@ -445,7 +445,7 @@ func parseCapsuleHeader(b []byte, max int) (h capsuleHeader, need int, err error
 		return h, varintNeed(b[i:]), nil
 	}
 	i += k
-	if ln > uint64(max)+8 {
+	if ln > uint64(limit)+8 {
 		return h, 0, errCapsuleOversized
 	}
 	h.typ = typ
@@ -468,7 +468,7 @@ func parseCapsuleHeader(b []byte, max int) (h capsuleHeader, need int, err error
 	}
 	h.cx, _ = varint.ConsumeVarint(b[i:])
 	h.payload, h.n = ln-uint64(l), i+l
-	if h.payload > uint64(max) {
+	if h.payload > uint64(limit) {
 		return h, 0, errCapsuleOversized
 	}
 	return h, 0, nil

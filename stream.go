@@ -348,7 +348,11 @@ func (s *Stream) StreamID() StreamID { defer runtime.KeepAlive(s); id, _ := s.h.
 // in that one frame, and the rest of the buffered data, as flow control
 // allows. It waits until they were sent or the write deadline passed
 // (os.ErrDeadlineExceeded), and fails as Write does on a reset or closed
-// stream or session; after Close it flushes the FIN as well. Stream
+// stream or session; after Close it flushes the FIN as well. Flush
+// succeeds once the data was sent: a STOP_SENDING or reset that the peer
+// sent afterwards (a peer that refuses at once) is reported by the next
+// Write, Read or Flush, not by this one; a stop or reset that came before
+// the data was sent fails it. Stream
 // credit is reserved by OpenStream, so the opening frame never waits for
 // it. Data written after Flush goes in later frames. Before
 // establishment the opening frame goes as soon as the stream may open (in

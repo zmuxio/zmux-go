@@ -29,8 +29,9 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 		return len(data)
 	}
 	if s.state == StateClosing && !s.closeFr.waitLanes {
-		// Lingering: discard without processing.
-		return len(data)
+		// Lingering: discard without processing, but look for the peer's
+		// CONNECTION_CLOSE on lane 0.
+		return s.lingerScan(p, il, data)
 	}
 	consumed := 0
 	for consumed < len(data) && (s.state < StateClosing || s.closeFr.waitLanes) {
@@ -66,7 +67,7 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 func (s *Session) ReceiveMessage(pipe, lane uint64, buf *Buf, msg []byte, now Time) {
 	s.SetNow(now)
 	p := s.pipe(pipe)
-	if p == nil || p.in == nil || s.state >= StateClosing {
+	if p == nil || p.in == nil || s.state >= StateClosing && (s.state != StateClosing || s.closeFr.waitLanes) {
 		return
 	}
 	if p.mp != nil && p.mp.hs {
@@ -74,6 +75,12 @@ func (s *Session) ReceiveMessage(pipe, lane uint64, buf *Buf, msg []byte, now Ti
 	}
 	il := p.in.lane(lane)
 	if il == nil || il.ended {
+		return
+	}
+	if s.state == StateClosing {
+		if lane == 0 && !p.in.ccRead && !il.noScan && recordHasClose(msg) {
+			s.peerCloseRead(p)
+		}
 		return
 	}
 	if uint64(len(msg)) > s.cfg.Local.MaxRecordSize {
@@ -219,6 +226,9 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 			}
 			if f.Kind == wire.KindClose {
 				s.endLaneWait()
+				if il.lane == 0 {
+					s.peerCloseRead(p)
+				}
 			}
 			rec = rec[n:]
 			idx++
@@ -269,9 +279,9 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 // dispatch applies one decoded frame.
 func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
 	switch f.Kind {
-	case wire.KindPadding:
-	case wire.KindTransportParams:
-		// Only the first frame of the first record, consumed before dispatch.
+	case wire.KindPadding, wire.KindTransportParams:
+		// Padding carries nothing; TRANSPORT_PARAMETERS is only the first
+		// frame of the first record, consumed before dispatch.
 	case wire.KindStream:
 		eff, e := s.onStream(f, buf)
 		if e != nil {
@@ -427,6 +437,56 @@ func (s *Session) onClose(f *wire.Frame) {
 		s.drain.on = true // only a processed CONNECTION_CLOSE drains reads
 	}
 	s.closeWith(e, &closeFrame{code: wire.NoError})
+	if s.rxPipe != nil && s.state == StateClosing {
+		s.peerCloseRead(s.rxPipe)
+	}
+}
+
+// lingerScan discards the bytes read from an inbound lane while the session
+// is closing, and returns how many it consumed: whole records of lane 0
+// are looked through for the peer's CONNECTION_CLOSE (SPEC.md Section 6.5
+// step 3), the rest of a partial record is kept for the next call.
+func (s *Session) lingerScan(p *Pipe, il *inLane, data []byte) int {
+	if il.lane != 0 || p.in.ccRead || il.noScan {
+		return len(data)
+	}
+	consumed := 0
+	for {
+		rest := data[consumed:]
+		size, n := varint.ConsumeVarint(rest)
+		if n == 0 {
+			return consumed
+		}
+		if size == 0 || size > s.cfg.Local.MaxRecordSize {
+			il.noScan = true
+			return len(data)
+		}
+		if uint64(len(rest)-n) < size {
+			return consumed
+		}
+		consumed += n + int(size)
+		if recordHasClose(rest[n : n+int(size)]) {
+			s.peerCloseRead(p)
+			return len(data)
+		}
+	}
+}
+
+// recordHasClose reports whether the record holds a CONNECTION_CLOSE; a
+// record that does not decode holds none.
+func recordHasClose(rec []byte) bool {
+	var f wire.Frame
+	for len(rec) > 0 {
+		n, e := wire.DecodeFrame(rec, &f)
+		if e != nil {
+			return false
+		}
+		if f.Kind == wire.KindClose {
+			return true
+		}
+		rec = rec[n:]
+	}
+	return false
 }
 
 // splitDetails separates the diagnostic line.
@@ -442,7 +502,7 @@ func splitDetails(r string) (string, string) {
 // PipeEnded reports the end of an inbound lane: graceful (eof) or failed
 // with cause (the read error, if any). The driver calls it after feeding
 // every complete record it read.
-func (s *Session) PipeEnded(pipe, lane uint64, graceful bool, partial bool, cause error, now Time) {
+func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause error, now Time) {
 	s.SetNow(now)
 	p := s.pipe(pipe)
 	if p == nil || p.in == nil {

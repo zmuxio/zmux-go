@@ -90,19 +90,20 @@ func TestPipeQualityBand(t *testing.T) {
 	if err := p.Update(PipeUpdate{QualityBand: Set(band), Weight: Set[uint64](2)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.addPipeErr(PipeOptions{QualityBand: Set(QualityBand{RateRatio: math.NaN()})}); !errors.Is(err, ErrInvalidConfig) {
+	if err := e.addPipeErr(PipeOptions{QualityBand: Set(QualityBand{RateRatio: math.NaN()})}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("a NaN band at AddPipe: %v", err)
 	}
 }
 
-func (e *mpEnv) addPipeErr(o PipeOptions) (*Pipe, error) {
+func (e *mpEnv) addPipeErr(o PipeOptions) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	nc, err := e.dial(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return e.client.AddPipe(ctx, NetPipe(nc), o)
+	_, err = e.client.AddPipe(ctx, NetPipe(nc), o)
+	return err
 }
 
 // Every error of a session's end, the timeouts included, is a closed
@@ -221,7 +222,7 @@ func TestPipeQualityBandReceiveOnly(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, mpConfig(), mpConfig())
 	band := QualityBand{RTT: 50 * time.Millisecond}
-	if _, err := e.addPipeErr(PipeOptions{Direction: DirectionReceiveOnly, QualityBand: Set(band)}); !errors.Is(err, ErrInvalidConfig) {
+	if err := e.addPipeErr(PipeOptions{Direction: DirectionReceiveOnly, QualityBand: Set(band)}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("AddPipe of a receive-only pipe with a band: %v", err)
 	}
 	p := e.addPipe(t, PipeOptions{Direction: DirectionReceiveOnly})

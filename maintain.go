@@ -201,7 +201,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		if pool.Rotate.Jitter == 0 {
 			return v
 		}
-		return v * (1 - rand.Float64()*pool.Rotate.Jitter)
+		return v * (1 - rand.Float64()*pool.Rotate.Jitter) //nolint:gosec // G404: jitter needs no unpredictability
 	}
 	// Pipe state changes, the loss of a direction and the suspension of
 	// the session wake the pool at once.

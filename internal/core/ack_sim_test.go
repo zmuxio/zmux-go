@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,6 +106,7 @@ func (r simResult) String() string {
 }
 
 func countAcks(t testing.TB, rec []byte) int {
+	t.Helper()
 	n := 0
 	for len(rec) > 0 {
 		var f wire.Frame
@@ -122,6 +124,7 @@ func countAcks(t testing.TB, rec []byte) int {
 
 // flush writes everything the endpoint wants to write now.
 func (e *simEnd) flush(t testing.TB, now Time, sc simCfg) {
+	t.Helper()
 	for range 1000 {
 		if sc.queueBound && e.out.queued(now) >= 256<<10 {
 			return
@@ -374,7 +377,7 @@ func TestAckSimMatrix(t *testing.T) {
 			}
 			for _, rate := range []float64{5e6, 20e6, 50e6, 200e6} {
 				for _, rtt := range []Duration{1, 10, 20, 80} {
-					var line string
+					var line strings.Builder
 					minG, maxG := 1e18, 0.0
 					for seed := 1; seed <= seeds; seed++ {
 						sc := simCfg{queueBound: qb, rate: rate, rtt: rtt * Millisecond, dur: 4 * Second,
@@ -383,10 +386,10 @@ func TestAckSimMatrix(t *testing.T) {
 						m.set(&sc)
 						r := runSim(t, sc)
 						minG, maxG = min(minG, r.goodput), max(maxG, r.goodput)
-						line += fmt.Sprintf(" | srtt %5.1f min %5.1f R %6.1f G %6.1f ack %4.0f",
+						fmt.Fprintf(&line, " | srtt %5.1f min %5.1f R %6.1f G %6.1f ack %4.0f",
 							float64(r.srtt)/1e6, float64(r.minRTT)/1e6, r.rate/1e6, r.goodput/1e6, r.acksPerSec)
 					}
-					t.Logf("qb=%-5v %-12s %3.0fMB/s %2dms G[%6.1f..%6.1f]%s", qb, m.name, rate/1e6, rtt, minG/1e6, maxG/1e6, line)
+					t.Logf("qb=%-5v %-12s %3.0fMB/s %2dms G[%6.1f..%6.1f]%s", qb, m.name, rate/1e6, rtt, minG/1e6, maxG/1e6, line.String())
 				}
 			}
 		}

@@ -96,7 +96,7 @@ func readPackets(t *testing.T, ctx context.Context, ps *PacketStream) []Packet {
 // interopPacketEcho sends small packets (datagrams when the session has
 // them), and two above MaxDatagramPayload (capsules), with Context IDs 0
 // and 5. Capsules must all come back; datagrams at least one of them.
-func interopPacketEcho(t *testing.T, ctx context.Context, c *Conn, datagrams bool) {
+func interopPacketEcho(t *testing.T, ctx context.Context, c *Conn, datagrams bool) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	st, ps := openPacketStream(t, ctx, c, "packets", PacketPreferDatagram)
 	maxDgram := st.MaxDatagramPayload(5)
 	if datagrams && maxDgram <= 0 || !datagrams && maxDgram != 0 {
@@ -135,7 +135,7 @@ func interopPacketEcho(t *testing.T, ctx context.Context, c *Conn, datagrams boo
 		switch {
 		case big[k]:
 			if pk.Datagram {
-				t.Fatalf("a packet above MaxDatagramPayload came back as a datagram")
+				t.Fatal("a packet above MaxDatagramPayload came back as a datagram")
 			}
 			delete(big, k)
 		case small[k]:
@@ -143,7 +143,7 @@ func interopPacketEcho(t *testing.T, ctx context.Context, c *Conn, datagrams boo
 				smallDgram++
 			}
 			if pk.Datagram && !datagrams {
-				t.Fatalf("a datagram without datagrams")
+				t.Fatal("a datagram without datagrams")
 			}
 			delete(small, k)
 			smallGot++
@@ -160,9 +160,9 @@ func interopPacketEcho(t *testing.T, ctx context.Context, c *Conn, datagrams boo
 }
 
 // interopPacketStreamOnly: capsules only both ways, in order.
-func interopPacketStreamOnly(t *testing.T, ctx context.Context, c *Conn) {
+func interopPacketStreamOnly(t *testing.T, ctx context.Context, c *Conn) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	_, ps := openPacketStream(t, ctx, c, "packets:stream", PacketStreamOnly)
-	var want []interopPacket
+	want := make([]interopPacket, 0, 6)
 	for i, n := range []int{0, 1, 100, 1500, 20000, 65535} {
 		want = append(want, interopPacket{uint64(5 * (i % 2)), string(bytes.Repeat([]byte{byte(i)}, n))})
 	}
@@ -188,7 +188,7 @@ var truncatedCapsule = []byte{0x00, 0x0a, 0x00, 0xab}
 
 // interopPacketMalformed: a truncated capsule then FIN, either way, ends the
 // stream with ZMUX_PACKET_ERROR, seen by the writer.
-func interopPacketMalformed(t *testing.T, ctx context.Context, c *Conn) {
+func interopPacketMalformed(t *testing.T, ctx context.Context, c *Conn) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	{
 		st, err := c.OpenStreamSync(ctx)
 		if err != nil {
@@ -230,7 +230,7 @@ func interopPacketMalformed(t *testing.T, ctx context.Context, c *Conn) {
 // interopPacketRelay: this side relays the peer's packet stream with
 // SplicePackets onto a hop without datagrams; the peer's datagram echoes
 // reach the far end as capsules.
-func interopPacketRelay(t *testing.T, ctx context.Context, c *Conn) {
+func interopPacketRelay(t *testing.T, ctx context.Context, c *Conn) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	a, b := net.Pipe()
 	type res struct {
 		c   *Conn

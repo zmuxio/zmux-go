@@ -1,6 +1,7 @@
 package conformance
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -556,7 +557,7 @@ func typeMatches(pat any, got string) bool {
 }
 
 // matchFrame matches a frame pattern against a decoded frame object.
-func matchFrame(pat map[string]any, got map[string]any) bool {
+func matchFrame(pat, got map[string]any) bool {
 	if !typeMatches(pat["type"], got["type"].(string)) {
 		return false
 	}
@@ -619,7 +620,7 @@ func matchParams(pat, got map[string]any) bool {
 				continue
 			}
 			want := encodeParamValue(name, v)
-			if string(want) != string(val) {
+			if !bytes.Equal(want, val) {
 				return false
 			}
 		}

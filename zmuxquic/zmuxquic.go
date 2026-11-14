@@ -118,8 +118,7 @@ func closeDialled(qc *quic.Conn, sp *qStream, code quic.ApplicationErrorCode, re
 // err: its application error code and reason, 0 and none after any other
 // end.
 func closeCode(err error) (quic.ApplicationErrorCode, string) {
-	var ae *zmux.ApplicationError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[*zmux.ApplicationError](err); ok {
 		return quic.ApplicationErrorCode(ae.ErrorCode), ae.ErrorMessage
 	}
 	return 0, ""
@@ -357,11 +356,6 @@ func streamPipe(qc *quic.Conn, s *quic.Stream) zmux.PipeIO {
 	return (&qStream{qc: qc, s: s}).pipe()
 }
 
-// pipe is the pipe input over q.
-func (q *qStream) pipe() zmux.PipeIO {
-	return zmux.PipeIO{R: (*qReader)(q), W: q, Carrier: zmux.CarrierQUIC}
-}
-
 // openPipe opens the first bidirectional stream of *qc (see openStream) as a
 // pipe input.
 func openPipe(ctx context.Context, qc **quic.Conn) (zmux.PipeIO, error) {
@@ -388,6 +382,11 @@ type qStream struct {
 	halves atomic.Int32
 	closed bool // Dial's session ended: a replacement connection is closed
 	early  bool // Dial sent the stream in 0-RTT
+}
+
+// pipe is the pipe input over q.
+func (q *qStream) pipe() zmux.PipeIO {
+	return zmux.PipeIO{R: (*qReader)(q), W: q, Carrier: zmux.CarrierQUIC}
 }
 
 // halfEnded counts the end of one half; the second calls ended.

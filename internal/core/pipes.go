@@ -32,6 +32,11 @@ type CarrierInfo struct {
 	// or an unsent count; otherwise the carrier queue limiter
 	// paces it.
 	QueueBound bool
+	// HalfClose: ending the write side makes the peer's read end (a
+	// half-close, or a separate write half that is closed). Without it the
+	// peer's end may never arrive on a carrier whose close is whole, and the
+	// peer's CONNECTION_CLOSE ends the linger (SPEC.md Section 6.5 step 3).
+	HalfClose bool
 }
 
 // Channel is a pipe carrier's datagram channel as the core uses it to
@@ -117,6 +122,11 @@ type inDir struct {
 	ackedAt Time
 	acked   bool
 	ended   bool
+	// ccRead: the peer's CONNECTION_CLOSE was read on lane 0 (the peer sends
+	// nothing after it); closed: the pipe's carrier was closed on that
+	// account (SPEC.md Section 6.5 step 3).
+	ccRead bool
+	closed bool
 }
 
 type inLane struct {
@@ -132,6 +142,7 @@ type inLane struct {
 	expectLane bool   // the first record must start with PIPE_LANE
 	expectTP   bool   // the first record must start with QX_TRANSPORT_PARAMETERS
 	ended      bool
+	noScan     bool // lingering: the framing is unusable, nothing is looked for
 }
 
 type outDir struct {

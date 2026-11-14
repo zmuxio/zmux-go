@@ -50,7 +50,7 @@ func holdConfig() *Config {
 }
 
 // startHeld starts a held client on p and its server on the other end.
-func startHeld(t *testing.T, ctx context.Context, p PipeIO, peer PipeIO, cfg *Config) (c *Conn, server func() *Conn) {
+func startHeld(t *testing.T, ctx context.Context, p, peer PipeIO, cfg *Config) (c *Conn, server func() *Conn) {
 	t.Helper()
 	c, err := Start(ctx, p, RoleClient, cfg)
 	if err != nil {

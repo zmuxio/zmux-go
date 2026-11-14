@@ -60,6 +60,7 @@ type redirectEnv struct {
 }
 
 func newRedirectEnv(t *testing.T) *redirectEnv {
+	t.Helper()
 	e := &redirectEnv{modeEnv: newModeEnv(t)}
 	e.front = zmuxtest.New(e.srv.URL, zmuxtest.Profile{TLS: true})
 	e.tr.TLSClientConfig = e.front.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
@@ -136,7 +137,7 @@ func TestHTTPRedirectRefused(t *testing.T) {
 	e := newRedirectEnv(t)
 	defer e.close()
 	var other atomic.Int64
-	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		other.Add(1)
 		http.Error(w, "no", http.StatusTeapot)
 	}))

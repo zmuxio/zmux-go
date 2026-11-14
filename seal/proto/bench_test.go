@@ -7,6 +7,7 @@ import (
 )
 
 func benchKey(b *testing.B, alg KeyAlg) *SigningKey {
+	b.Helper()
 	seed := make([]byte, 32)
 	_, _ = rand.Read(seed)
 	k, err := NewSigningKey(alg, seed)

@@ -497,7 +497,7 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 	// One allocation holds the authentication header and the Data MAC.
 	hdr := appendExAuth(make([]byte, 0, exReqOverhead), c.key, &c.cid, a.kind, a.flags, a.seq, a.ack, uint32(time.Now().Unix()), &nonce, len(a.data))
 	mac := c.key.dataMAC(hdr[exFieldsLen:], a.data)
-	tail := append(hdr[exAuthLen:], mac[:]...)
+	tail := append(hdr[exAuthLen:], mac[:]...) //nolint:gocritic // appendAssign: the MAC follows the header in hdr's spare capacity
 	var body io.ReadCloser
 	n := exReqOverhead + len(a.data)
 	if c.p.b64 {
@@ -622,7 +622,14 @@ func (c *exClient) applyLocked(a *exAttempt, r exResult, now time.Time) {
 		return
 	}
 	retry := func() {
-		d := time.Duration(float64(st.backoff) * (1 - c.p.backoffJitter*mrand.Float64()))
+		if c.wclosed && c.rclosed {
+			// zmux closed the carrier and waits for nothing more of it:
+			// what is left ends at the first attempt without a result
+			// instead of being repeated up to the Deadline.
+			c.failLocked(net.ErrClosed)
+			return
+		}
+		d := time.Duration(float64(st.backoff) * (1 - c.p.backoffJitter*mrand.Float64())) //nolint:gosec // G404: jitter needs no unpredictability
 		st.retryAt = now.Add(d)
 		st.backoff = min(2*st.backoff, c.p.backoffMax)
 	}

@@ -90,7 +90,7 @@ func TestStallCountsPerSource(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	src := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}
-	var clients []net.Conn
+	clients := make([]net.Conn, 0, 2)
 	done := make(chan struct{}, 3)
 	for range 2 {
 		c, s := net.Pipe()
@@ -181,7 +181,7 @@ func TestServeConnSource(t *testing.T) {
 	}}
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1, FirstRecordTimeout: 10 * time.Second, Admission: a})
 	ctx, cancel := context.WithCancel(context.Background())
-	var clients []net.Conn
+	clients := make([]net.Conn, 0, 2)
 	done := make(chan struct{}, 2)
 	for _, host := range []string{"192.0.2.1", "192.0.2.2"} {
 		c, s := net.Pipe()
@@ -281,7 +281,7 @@ func TestSourcePrefixes(t *testing.T) {
 		}
 	}
 	for _, p := range [][2]string{{"192.0.2.1:1", "192.0.3.1:1"}, {"[2001:db8:0:1::1]:1", "[2001:db8:0:100::1]:1"}} {
-		var held []*Arrival
+		held := make([]*Arrival, 0, 3)
 		for range 2 {
 			ar, err := lst.Adapter().Arrive(ap(p[0]), netip.AddrPort{})
 			if err != nil {

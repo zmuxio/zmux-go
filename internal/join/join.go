@@ -38,8 +38,9 @@ func (m Mode) String() string {
 		return "bound"
 	case Trusted:
 		return "trusted"
+	default:
+		return "invalid"
 	}
-	return "invalid"
 }
 
 // Role is an endpoint's role in the session.
@@ -527,8 +528,8 @@ func (c *schedule) key(prk []byte, label string, th []byte, n int) []byte {
 	return Expand(c.suite.Hash.New, prk, label+string(th), n)
 }
 
-func (c *schedule) begin(clear, binding []byte) {
-	c.sec.TH = c.h(clear, binding)
+func (c *schedule) begin(plain, binding []byte) {
+	c.sec.TH = c.h(plain, binding)
 	c.sec.K0 = c.key(c.psk, "hello", c.sec.TH, c.suite.AEAD.KeyLen())
 }
 
@@ -852,8 +853,9 @@ func (j *Joiner) WriteConfirm(dst []byte, zeros int) ([]byte, error) {
 		}
 		dst = append(dst, j.c.sec.Confirm...)
 		return append(dst, make([]byte, zeros)...), nil
+	default:
+		return dst, nil
 	}
-	return dst, nil
 }
 
 // Finish returns the result after WriteConfirm.

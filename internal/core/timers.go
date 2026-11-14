@@ -76,16 +76,15 @@ func (s *Session) HandleTimeout(now Time) {
 		}
 	}
 	if now >= s.timers.linger {
-		if s.state == StateClosing && s.closeFr.sentAll && !s.closeFr.lingering {
-			// Step 1's wait ended without every carrier taking
-			// CONNECTION_CLOSE: linger from now, once.
-			s.closeFr.lingering = true
-			s.timers.linger = now.Add(s.lingerTimeout())
-		} else {
+		if s.state != StateClosing || !s.closeFr.sentAll || s.closeFr.lingering {
 			s.timers.linger = Never
 			s.finishClose()
 			return
 		}
+		// Step 1's wait ended without every carrier taking
+		// CONNECTION_CLOSE: linger from now, once.
+		s.closeFr.lingering = true
+		s.timers.linger = now.Add(s.lingerTimeout())
 	}
 	if s.closeFr.waitLanes && now >= s.timers.laneWait {
 		s.endLaneWait()

@@ -160,7 +160,9 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 	if !lanes {
 		_, lanes = p.R.(LaneOpener)
 	}
-	info := core.CarrierInfo{Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
+	_, half := p.W.(CloseWriter)
+	half = half || p.R == nil || p.W == nil || !sameHalf(p.R, p.W)
+	info := core.CarrierInfo{HalfClose: half, Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
 		Lanes: lanes, QueueBound: lowWater, WriteOverhead: p.WriteOverhead, MaxRecord: carrierRecordLimit(p)}
 	if ch := channelOf(p); ch != nil {
 		info.Channel = ch
@@ -300,7 +302,7 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 		if exp != nil && n > 0 {
 			if lerr := exp.load(c.done); lerr != nil {
 				// What was read waited for a handshake that failed.
-				n, err, used = 0, lerr, 0
+				err, used = lerr, 0
 			}
 			exp = nil
 		}
@@ -719,6 +721,10 @@ func (c *Conn) doAction(pa pendingAct) {
 		if pa.coded {
 			pd.hc.recordCloseCode(pa.code, pa.reason)
 		}
+		if a.Dir == core.DirBidi {
+			pd.closeGraceful(time.Duration(a.After)) // the peer's CONNECTION_CLOSE was read: SPEC Section 6.5 step 4
+			return
+		}
 		if a.Dir&core.DirIn != 0 {
 			pd.hc.closeRead()
 		}
@@ -741,9 +747,29 @@ func (c *Conn) doAction(pa pendingAct) {
 }
 
 // closeAll aborts every half and lane of the attachment.
-func (pd *pipeDrv) closeAll() {
+func (pd *pipeDrv) closeAll() { pd.closeHalves(true) }
+
+// closeGraceful closes every half and lane of the attachment without
+// aborting: the write sides end as a close, never as a reset. A carrier
+// whose graceful close has not ended after bound is aborted then (SPEC.md
+// Section 6.5 step 4): a close never leaves the carrier's work unbounded.
+func (pd *pipeDrv) closeGraceful(bound time.Duration) {
+	lanes := pd.closeHalves(false)
+	time.AfterFunc(bound, func() {
+		pd.hc.abort(net.ErrClosed)
+		for _, l := range lanes {
+			if a, ok := l.w.(Aborter); ok {
+				a.Abort(net.ErrClosed)
+			}
+		}
+	})
+}
+
+// closeHalves closes every half and lane of the attachment and returns the
+// outbound lanes it closed.
+func (pd *pipeDrv) closeHalves(abort bool) []*laneOut {
 	pd.endChannel()
-	pd.hc.closeAll(true, net.ErrClosed)
+	pd.hc.closeAll(abort, net.ErrClosed)
 	pd.c.mu.Lock()
 	lanes := make([]*laneOut, 0, len(pd.lanes))
 	for _, l := range pd.lanes {
@@ -753,11 +779,12 @@ func (pd *pipeDrv) closeAll() {
 	pd.inLanes = nil
 	pd.c.mu.Unlock()
 	for _, l := range lanes {
-		l.close(true)
+		l.close(abort)
 	}
 	for _, r := range in {
 		_ = r.Close()
 	}
+	return lanes
 }
 
 // fail closes the session after a panic outside the lock.

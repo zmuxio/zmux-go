@@ -406,12 +406,11 @@ func appendExAuth(b []byte, k *exKey, cid *[exCIDLen]byte, kind, flags byte, seq
 	return append(b, mac[:]...)
 }
 
-// appendExRequest appends a whole binary request body.
-func appendExRequest(b []byte, k *exKey, cid *[exCIDLen]byte, kind, flags byte, seq, ack uint64, ts uint32, nonce *[exNonceLen]byte, data []byte) []byte {
-	start := len(b)
-	b = appendExAuth(b, k, cid, kind, flags, seq, ack, ts, nonce, len(data))
+// exRequest builds a whole binary request body.
+func exRequest(k *exKey, cid *[exCIDLen]byte, kind, flags byte, seq, ack uint64, ts uint32, nonce *[exNonceLen]byte, data []byte) []byte {
+	b := appendExAuth(nil, k, cid, kind, flags, seq, ack, ts, nonce, len(data))
 	b = append(b, data...)
-	mac := k.dataMAC(b[start+exFieldsLen:start+exAuthLen], data)
+	mac := k.dataMAC(b[exFieldsLen:exAuthLen], data)
 	return append(b, mac[:]...)
 }
 

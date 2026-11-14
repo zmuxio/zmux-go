@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -176,5 +177,5 @@ func Join(ctx context.Context, c *zmux.Conn, dial func() (zmux.PipeIO, error)) e
 		fmt.Printf("MODE %v\n", s.RecordMode)
 		return nil
 	}
-	return fmt.Errorf("no join")
+	return errors.New("no join")
 }

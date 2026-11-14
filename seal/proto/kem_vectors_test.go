@@ -20,6 +20,7 @@ import (
 
 // fixedKEM makes the ML-KEM-768 key pair of a 64-byte seed (d, z).
 func fixedKEM(t testing.TB, seed []byte) func() (keypair, error) {
+	t.Helper()
 	return func() (keypair, error) {
 		dk, err := mlkem.NewDecapsulationKey768(seed)
 		if err != nil {
@@ -58,6 +59,7 @@ func setCoefficient(ek []byte, i int, v uint16) []byte {
 
 // kemPub returns the encapsulation key of a KEM seed.
 func kemPub(t testing.TB, seed []byte) []byte {
+	t.Helper()
 	kp, _ := fixedKEM(t, seed)()
 	return kp.pub
 }
@@ -65,6 +67,7 @@ func kemPub(t testing.TB, seed []byte) []byte {
 // genSplitRecords seals with the split keys of handshakes, which checks the
 // chain from the handshake to the records end to end.
 func genSplitRecords(t testing.TB) []recordVector {
+	t.Helper()
 	var out []recordVector
 	p := []byte("a zmux record")
 	for _, pr := range []Profile{ProfileEstablishPSK, ProfileEstablishPSKAES} {
@@ -98,6 +101,7 @@ type sessionVector struct {
 }
 
 func genSessions(t testing.TB) []sessionVector {
+	t.Helper()
 	var out []sessionVector
 	both := []uint64{join.SuiteAES, join.SuiteChaCha}
 	for _, p := range []Profile{ProfileEstablishPSK, ProfileEstablishAES} {
@@ -141,7 +145,7 @@ func (r *refNoise) hkdf(ikm []byte) (a, b, c []byte) {
 	a = refHMAC(tk, []byte{1})
 	b = refHMAC(tk, a, []byte{2})
 	c = refHMAC(tk, b, []byte{3})
-	return
+	return a, b, c
 }
 
 func (r *refNoise) mixHash(b []byte) { r.h = sha256Of(r.h, b) }

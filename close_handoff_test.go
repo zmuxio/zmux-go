@@ -32,7 +32,7 @@ func closeExitConfig() *Config {
 // timeout, ends with the application close.
 func TestCloseThenExit(t *testing.T) {
 	if addr := os.Getenv(closeExitEnv); addr != "" {
-		closeExitChild(addr)
+		os.Exit(closeExitChild(addr))
 		return
 	}
 	leakcheck.Check(t)
@@ -86,23 +86,23 @@ func TestCloseThenExit(t *testing.T) {
 
 // closeExitChild opens a session, closes it (twice: a repeat is safe) and
 // exits at once.
-func closeExitChild(addr string) {
+func closeExitChild(addr string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	nc, err := net.Dial("tcp", addr)
 	if err != nil {
-		os.Exit(2)
+		return 2
 	}
 	c, err := Client(ctx, nc, closeExitConfig())
 	if err != nil {
-		os.Exit(3)
+		return 3
 	}
 	if _, err := c.Ping(ctx); err != nil {
-		os.Exit(4)
+		return 4
 	}
 	_ = c.CloseWithError(7, "bye")
 	_ = c.Close()
-	os.Exit(0)
+	return 0
 }
 
 // stallConn blocks its writes while stalled, until it is closed.
@@ -290,8 +290,10 @@ func TestCloseHandOffSyncCarrier(t *testing.T) {
 			t.Fatalf("Close took %v", d)
 		}
 		_ = client.Wait()
-		if d := time.Since(t0); d == 0 {
-			t.Fatal("the session ended without lingering")
+		// The peer answered with its CONNECTION_CLOSE: no linger wait
+		// without a half-close underneath (SPEC.md Section 6.5 step 3).
+		if d := time.Since(t0); d >= 250*time.Millisecond {
+			t.Fatalf("the session lingered %v after the peer's CONNECTION_CLOSE", d)
 		}
 		_ = server.Close()
 		_ = server.Wait()
@@ -324,6 +326,7 @@ func TestCloseUnderPeerWritesNoReset(t *testing.T) {
 }
 
 func closeUnderPeerWrites(t *testing.T, round int) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

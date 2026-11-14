@@ -162,8 +162,7 @@ func TestCloseErrorResetsTakenStream(t *testing.T) {
 		_ = closeError(sess)
 		select {
 		case err := <-reset:
-			var se *webtransport.StreamError
-			if !errors.As(err, &se) {
+			if _, ok := errors.AsType[*webtransport.StreamError](err); !ok {
 				t.Fatalf("the sender ended with %v, not a reset", err)
 			}
 			return

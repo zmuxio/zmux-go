@@ -17,6 +17,7 @@ import (
 // hop; the second hop has none ("off"), runs over TCP ("tcp") or over TLS
 // ("tls"), whose smaller records give it a smaller datagram bound.
 func packetRelayEnv(t *testing.T, hop2 string) (client, relayIn, relayOut, server *Conn) {
+	t.Helper()
 	cfg := &Config{EnableDatagrams: true}
 	a1, b1 := tcpPair(t)
 	client, relayIn = pair(t, a1, b1, cfg, cfg)
@@ -26,7 +27,7 @@ func packetRelayEnv(t *testing.T, hop2 string) (client, relayIn, relayOut, serve
 		a2, b2 = tls.Client(a2, cli), tls.Server(b2, srv)
 	}
 	relayOut, server = pair(t, a2, b2, cfg, &Config{EnableDatagrams: hop2 != "off"})
-	return
+	return client, relayIn, relayOut, server
 }
 
 // relayStreams opens client -> relay -> server and runs fwd on the relay.
@@ -71,6 +72,7 @@ func TestSplicePacketsConvertsDatagrams(t *testing.T) {
 }
 
 func testSplicePacketsConverts(t *testing.T, hop2 string) {
+	t.Helper()
 	leakcheck.Check(t)
 	client, rin, rout, server := packetRelayEnv(t, hop2)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

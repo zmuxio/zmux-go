@@ -358,7 +358,7 @@ func TestInboundSilenceLastPipe(t *testing.T) {
 	}
 	s.mpHandleTimeout(Time(30 * Second))
 	if p.mp.in != InOpen {
-		t.Fatalf("last inbound pipe failed at 30 s, past L_in but within T_dead")
+		t.Fatal("last inbound pipe failed at 30 s, past L_in but within T_dead")
 	}
 	// With another live inbound pipe the limit is L_in alone.
 	q := &Pipe{id: 1, in: p.in, mp: &attach{out: OutNone, in: InOpen}}

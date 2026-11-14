@@ -455,7 +455,58 @@ func (s *Session) WriteDone(b *Batch, err error, now Time) {
 	if err != nil {
 		s.pipeWriteFailed(b.Pipe, b.Lane, err)
 	}
+	s.closeDonePipes()
 	s.startLinger()
+}
+
+// peerCloseRead records that the peer's CONNECTION_CLOSE was read on p.
+func (s *Session) peerCloseRead(p *Pipe) {
+	if p.in == nil {
+		return
+	}
+	p.in.ccRead = true
+	s.closePipeIfDone(p)
+}
+
+// closeDonePipes closes the carrier of every pipe that is done.
+func (s *Session) closeDonePipes() {
+	for _, p := range s.pipes {
+		if s.state != StateClosing {
+			return
+		}
+		s.closePipeIfDone(p)
+	}
+}
+
+// closePipeIfDone ends the linger of p and closes its carrier gracefully
+// once the peer's CONNECTION_CLOSE was read on it and nothing more of ours
+// follows on it (SPEC.md Section 6.5 steps 3 and 4): the peer sends
+// nothing after it, so waiting for the carrier's end or the linger timeout
+// would only delay the close.
+func (s *Session) closePipeIfDone(p *Pipe) {
+	if s.state != StateClosing || p.in == nil || !p.in.ccRead || p.in.closed || !s.pipeOutDone(p) {
+		return
+	}
+	if l := p.in.lane(0); l == nil || l.info.HalfClose {
+		return // the peer's end follows its CONNECTION_CLOSE at once
+	}
+	p.in.closed, p.in.ended = true, true
+	for _, l := range p.in.lanes {
+		l.ended = true
+	}
+	s.act(Action{Kind: ActClose, Pipe: p.id, Dir: DirBidi, After: s.lingerTimeout()})
+	s.checkLingerDone()
+}
+
+// pipeOutDone reports that nothing more is to be written to p: its outbound
+// side failed, has none, carried CONNECTION_CLOSE to the carrier, or will
+// carry none.
+func (s *Session) pipeOutDone(p *Pipe) bool {
+	if p.out == nil || p.out.failed {
+		return true
+	}
+	l := p.out.lane(0)
+	return l == nil || l.closeDone || !l.closeSent && !s.closeFr.pending
 }
 
 // startLinger arms the linger timeout once CONNECTION_CLOSE was handed to
@@ -591,6 +642,7 @@ func (s *Session) closeSentOn() {
 	// CONNECTION_CLOSE; lingering starts at the hand-off (startLinger).
 	s.timers.linger = s.now.Add(s.lingerTimeout())
 	s.emitClosedEvent()
+	s.closeDonePipes()
 	s.startLinger()
 	s.checkLingerDone()
 }
@@ -1066,13 +1118,14 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	if st.ext != nil && st.ext.capSig != nil {
 		s.checkCapacity(st)
 	}
-	if s.feat.Multipath {
+	switch {
+	case s.feat.Multipath:
 		sp.mpState()
 		s.wake(st.wsig)
-	} else if s.holdSends() {
+	case s.holdSends():
 		// Carrier early data: the bytes stay until the verdict.
 		s.wake(st.wsig)
-	} else {
+	default:
 		h := s.heldEnter(st)
 		sp.q.release(sp.sent)
 		s.heldLeave(st, h)

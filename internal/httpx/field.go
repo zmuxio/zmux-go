@@ -34,7 +34,7 @@ var reservedPrefixes = []string{"proxy-", "sec-", "x-forwarded-", "accept-", "if
 // ordinary requests do not carry; otherwise the reason, to follow the
 // field's name in an error.
 func CheckField(field string) string {
-	for i := 0; i < len(field); i++ {
+	for i := range len(field) {
 		c := field[i]
 		switch {
 		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z',
@@ -44,7 +44,7 @@ func CheckField(field string) string {
 		}
 	}
 	l := strings.ToLower(field)
-	r := reserved[l] || l == strings.ToLower(FieldPrefixAuth)
+	r := reserved[l] || strings.EqualFold(l, FieldPrefixAuth)
 	for _, p := range reservedPrefixes {
 		r = r || strings.HasPrefix(l, p)
 	}

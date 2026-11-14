@@ -17,7 +17,7 @@ func TestPoolPolicyCountAndRetire(t *testing.T) {
 	p := &ConnPool[int]{
 		Dial:  func(context.Context) (int, error) { n++; return n, nil },
 		Close: func(c int) { mu.Lock(); closed = append(closed, c); mu.Unlock() },
-		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
 			d.Count = 2
 			d.RetireConnections = append(d.RetireConnections, retire...)
 		}),
@@ -45,7 +45,7 @@ func TestPoolPolicyDialAfter(t *testing.T) {
 	n := 0
 	p := &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
-		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
 			d.Count, d.DialAfter = 3, time.Hour
 		}),
 	}

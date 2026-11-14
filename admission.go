@@ -951,12 +951,12 @@ func (a *Arrival) count(d Decision) Decision {
 		l.st.adm.accepted.Add(1)
 	case VerdictFallback:
 		l.st.adm.fallback.Add(1)
-	case VerdictStall:
-		// The aggregate is counted by stallSlot.
 	case VerdictClose:
 		l.st.adm.closed.Add(1)
-	case VerdictMore:
-		// Never final: decide turns it into a longer prefix or a close.
+	case VerdictStall, VerdictMore, verdictFailed:
+		// A stall's aggregate is counted by stallSlot; More is never
+		// final: decide turns it into a longer prefix or a close, and
+		// bound turns a failure into a close.
 	}
 	l.st.adm.variant(d.Variant, d.Verdict)
 	return d

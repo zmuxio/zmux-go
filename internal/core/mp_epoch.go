@@ -81,7 +81,7 @@ type epochs struct {
 // byPhase is the accepted epoch of a key phase; at most one matches.
 func (ep *epochs) byPhase(phase uint8) *epoch {
 	for _, e := range ep.list {
-		if uint8(e.n&1) == phase {
+		if e.n&1 == uint64(phase) {
 			return e
 		}
 	}

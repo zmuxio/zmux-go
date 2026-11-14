@@ -102,13 +102,6 @@ type multiPath struct {
 	pickTimer   bool // a direction waits for an answer until pickDeadline
 }
 
-// peerAttached reports whether the peer has attached the attachment
-// (the peer holds it as an attachment of its own): one the endpoint joined
-// itself once it has evidence (peerSeen), every other from its creation.
-func (a *attach) peerAttached(id uint64) bool {
-	return a.peerSeen || !a.joinerLocal || id == 0
-}
-
 // sawPeer records the evidence of the peer's attachment of a joined
 // attachment, waking the waiters on the first.
 func (s *Session) sawPeer(p *Pipe) {
@@ -240,6 +233,13 @@ type attach struct {
 	// Inbound silence.
 	lastRecord Time
 	maxGap     Duration
+}
+
+// peerAttached reports whether the peer has attached the attachment
+// (the peer holds it as an attachment of its own): one the endpoint joined
+// itself once it has evidence (peerSeen), every other from its creation.
+func (a *attach) peerAttached(id uint64) bool {
+	return a.peerSeen || !a.joinerLocal || id == 0
 }
 
 // startMultipath allocates the path layer at establishment.

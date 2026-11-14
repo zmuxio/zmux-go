@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -86,6 +87,7 @@ func newMemRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, ro zmuxtest.RelayOpti
 // artifactsOnFailure writes, when t fails, the flight recorder's trace of
 // the last seconds to t.ArtifactDir() (kept with go test -artifacts).
 func artifactsOnFailure(t *testing.T) {
+	t.Helper()
 	t.Cleanup(func() {
 		if !t.Failed() {
 			return
@@ -179,6 +181,7 @@ func (d *dialer) times() []time.Time {
 // maintain runs a pool on c until the test ends; the channel gets its
 // result once.
 func maintain(t *testing.T, c *zmux.Conn, pool zmux.PipePool) <-chan error {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	res := make(chan error, 1)
 	stopped := make(chan struct{})
@@ -365,6 +368,7 @@ type events struct {
 }
 
 func watchEvents(t *testing.T, c *zmux.Conn) *events {
+	t.Helper()
 	ev := &events{}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -393,6 +397,7 @@ func watchEvents(t *testing.T, c *zmux.Conn) *events {
 
 // writeTo writes the events, one per line with its time, to name.
 func (ev *events) writeTo(t *testing.T, name string) {
+	t.Helper()
 	ev.mu.Lock()
 	defer ev.mu.Unlock()
 	var b []byte
@@ -406,15 +411,15 @@ func (ev *events) writeTo(t *testing.T, name string) {
 	t.Logf("events in %s", name)
 }
 
-func (ev *events) first(k zmux.EventKind) (time.Time, bool) {
+func (ev *events) seen(k zmux.EventKind) bool {
 	ev.mu.Lock()
 	defer ev.mu.Unlock()
-	for i, e := range ev.got {
+	for _, e := range ev.got {
 		if e.Kind == k {
-			return ev.at[i], true
+			return true
 		}
 	}
-	return time.Time{}, false
+	return false
 }
 
 // The relay cuts every pipe while a transfer runs, the bootstrap pipe
@@ -477,12 +482,12 @@ func TestRelayLastPipeCutResumes(t *testing.T) {
 	if read.Load() >= int64(len(msg)) {
 		t.Fatal("the transfer ended before the cut")
 	}
-	poll(t, 5*time.Second, "suspension", func() bool { _, ok := ev.first(zmux.EventSessionSuspended); return ok })
+	poll(t, 5*time.Second, "suspension", func() bool { return ev.seen(zmux.EventSessionSuspended) })
 	poll(t, 5*time.Second, "redial", func() bool { return len(d.times()) > dials })
 	if lag := d.times()[dials].Sub(cut); lag > 300*time.Millisecond {
 		t.Fatalf("pool redialled %v after the cut", lag)
 	}
-	poll(t, 10*time.Second, "resume", func() bool { _, ok := ev.first(zmux.EventSessionResumed); return ok })
+	poll(t, 10*time.Second, "resume", func() bool { return ev.seen(zmux.EventSessionResumed) })
 	select {
 	case err := <-readDone:
 		if err != nil {
@@ -638,7 +643,7 @@ func TestRelaySplitDownlinkSilenced(t *testing.T) {
 				up = up || st.PipeID != 0 && st.Outbound == zmux.OutboundActive
 				down = down || st.PipeID != 0 && st.Inbound == zmux.InboundOpen
 			}
-			return
+			return up, down
 		}
 		poll(t, 60*time.Second, "pool member", func() bool { u, d := member(); return u && d })
 		p0, _ := e.client.Pipe(0)
@@ -651,8 +656,8 @@ func TestRelaySplitDownlinkSilenced(t *testing.T) {
 			return !ok || st.Outbound == zmux.OutboundFailed || st.Outbound == zmux.OutboundClosed
 		})
 		poll(t, 60*time.Second, "new member", func() bool { return joins.Load() >= 2 })
-		if _, ok := ev.first(zmux.EventSessionSuspended); ok {
-			poll(t, 60*time.Second, "resume", func() bool { _, ok := ev.first(zmux.EventSessionResumed); return ok })
+		if ev.seen(zmux.EventSessionSuspended) {
+			poll(t, 60*time.Second, "resume", func() bool { return ev.seen(zmux.EventSessionResumed) })
 		}
 		poll(t, 60*time.Second, "both directions", func() bool { u, d := member(); return u && d })
 	})
@@ -911,7 +916,7 @@ func TestPoolHTTPPipeOutlivesDialContext(t *testing.T) {
 func TestRelaySplitDownlinkSilencedClose(t *testing.T) {
 	t.Parallel()
 	for i := range 4 {
-		t.Run(fmt.Sprint(i), func(t *testing.T) {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			t.Parallel()
 			cfg := func() *zmux.Config {
 				c := relayConfig(30 * time.Second)

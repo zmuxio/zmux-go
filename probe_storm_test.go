@@ -13,19 +13,18 @@ import (
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
-// probeTraffic returns the PIPE_PING frames and records both ends of e
-// sent and the client's smoothed RTT.
-func probeTraffic(e *mpEnv) (pings, recs uint64, srtt time.Duration) {
+// probeTraffic returns the PIPE_PING frames both ends of e sent and the
+// client's smoothed RTT.
+func probeTraffic(e *mpEnv) (pings uint64, srtt time.Duration) {
 	for _, c := range []*Conn{e.client, e.server} {
 		for _, st := range c.PipeStats() {
 			pings += st.PingsSent
-			recs += st.RecordsSent
 			if c == e.client {
 				srtt = st.SmoothedRTT
 			}
 		}
 	}
-	return
+	return pings, srtt
 }
 
 // pingStormConfig is an idle session whose client probes every 15 s and
@@ -58,9 +57,9 @@ func TestShapingDelayKeepsAcknowledgementsInTime(t *testing.T) {
 	e.server.SetShaper(shp, nil)
 	const inc = 20 * time.Millisecond
 	step(clk, 20*time.Second, inc)
-	p0, _, _ := probeTraffic(e)
+	p0, _ := probeTraffic(e)
 	step(clk, time.Minute, inc)
-	p1, _, _ := probeTraffic(e)
+	p1, _ := probeTraffic(e)
 	if n := p1 - p0; n > pingStormLimit {
 		t.Fatalf("%d PIPE_PING in a minute of idle probing", n)
 	}
@@ -103,9 +102,9 @@ func TestLongRoundTripLearnedDespiteSuspicion(t *testing.T) {
 				return newDelayConn(c, k.d, k.rate, k.cap), nil
 			})
 		time.Sleep(30 * time.Second)
-		p0, _, _ := probeTraffic(e)
+		p0, _ := probeTraffic(e)
 		time.Sleep(time.Minute)
-		p1, _, srtt := probeTraffic(e)
+		p1, srtt := probeTraffic(e)
 		if srtt < 3*time.Second {
 			t.Fatalf("smoothed RTT %v on a 4 s path", srtt)
 		}

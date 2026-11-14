@@ -15,7 +15,10 @@ type rateFeeder struct {
 	end uint64
 }
 
-func (f *rateFeeder) ack(sent, now Time, n uint64, iv Duration) {
+// ack acknowledges n more bytes sent at sent, now, with a 100 ms delivery
+// interval.
+func (f *rateFeeder) ack(sent, now Time, n uint64) {
+	const iv = 100 * Millisecond
 	ol := f.p.out.lanes[0]
 	ps := &f.p.out.snd
 	start := f.end
@@ -35,13 +38,13 @@ func TestRateConvergesOnDeepBuffer(t *testing.T) {
 	s := capacitySession()
 	f := &rateFeeder{a: newAckState(s), p: s.pipes[0]}
 	e := &f.p.out.snd.re
-	f.ack(0, Time(20*Millisecond), 3000, 100*Millisecond) // min_rtt 20 ms, no queue
+	f.ack(0, Time(20*Millisecond), 3000) // min_rtt 20 ms, no queue
 	if e.measured || e.value() != initialRate {
 		t.Fatalf("an unqueued application-limited sample was taken: R_p %v", e.value())
 	}
 	at := Time(Second)
 	for range 20 {
-		f.ack(at, at.Add(500*Millisecond), 3000, 100*Millisecond) // queued 480 ms
+		f.ack(at, at.Add(500*Millisecond), 3000) // queued 480 ms
 		at = at.Add(100 * Millisecond)
 	}
 	if !e.measured || e.value() != 3e4 {
@@ -59,7 +62,7 @@ func TestRateLeavesOldMaximumAfterSuspect(t *testing.T) {
 	s := capacityMP()
 	f := &rateFeeder{a: newAckState(s), p: s.pipes[0]}
 	e := &f.p.out.snd.re
-	f.ack(0, Time(20*Millisecond), 3000, 100*Millisecond)
+	f.ack(0, Time(20*Millisecond), 3000)
 	measuredRate(f.p, 2e6)
 	e.samples[0].at = Time(20 * Millisecond)
 	a := f.p.mp
@@ -68,7 +71,7 @@ func TestRateLeavesOldMaximumAfterSuspect(t *testing.T) {
 	srtt := f.p.rtt().smoothed
 	at := suspectAt.Add(-5 * Second)
 	for range 10 {
-		f.ack(at, suspectAt.Add(Second), 3000, 100*Millisecond) // sent before the suspicion, queued
+		f.ack(at, suspectAt.Add(Second), 3000) // sent before the suspicion, queued
 		at = at.Add(100 * Millisecond)
 	}
 	if got := f.p.rtt().smoothed; got != srtt {
@@ -79,7 +82,7 @@ func TestRateLeavesOldMaximumAfterSuspect(t *testing.T) {
 	}
 	// An unqueued range sent before the suspicion still gives nothing.
 	n := len(e.samples)
-	f.ack(suspectAt.Add(-Second), suspectAt.Add(-Second+20*Millisecond), 30000, 100*Millisecond)
+	f.ack(suspectAt.Add(-Second), suspectAt.Add(-Second+20*Millisecond), 30000)
 	if len(e.samples) != n {
 		t.Fatal("an unqueued range sent before the suspicion gave a rate sample")
 	}

@@ -369,7 +369,7 @@ func TestHTTPPairField(t *testing.T) {
 		{http.MethodPost, "X-Link-Id", ClassUplink},
 		{http.MethodPost, HeaderPair, ClassBidirectional},
 	} {
-		r := httptest.NewRequest(c.method, "http://example.test/zmux", nil)
+		r := httptest.NewRequest(c.method, "http://example.test/zmux", http.NoBody)
 		r.ContentLength = -1
 		r.Header.Set(c.field, "x")
 		if got := o.Classify(r); got != c.want {

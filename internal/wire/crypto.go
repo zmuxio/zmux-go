@@ -1,6 +1,10 @@
 package wire
 
-import "github.com/zmuxio/zmux-go/varint"
+import (
+	"slices"
+
+	"github.com/zmuxio/zmux-go/varint"
+)
 
 // Suite and Group values that the secure carrier requires in every set.
 const (
@@ -76,11 +80,8 @@ func DecodeSessionCrypto(v []byte) (SessionCrypto, bool) {
 func Intersect(a, b []uint64) []uint64 {
 	var out []uint64
 	for _, x := range a {
-		for _, y := range b {
-			if x == y {
-				out = append(out, x)
-				break
-			}
+		if slices.Contains(b, x) {
+			out = append(out, x)
 		}
 	}
 	return out

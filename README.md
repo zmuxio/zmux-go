@@ -37,7 +37,7 @@ and datagram flows.
 
 ```go
 conn, err := zmux.Dial(ctx, "tcp", "example.com:4433", nil)
-// or: zmux.DialTLS(ctx, "tcp", "example.com:4433", tlsConf, nil)
+// or zmux.DialTLS(ctx, "tcp", "example.com:4433", tlsConf, nil)
 if err != nil {
 	return err
 }

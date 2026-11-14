@@ -25,7 +25,7 @@ import (
 func Example_readmeClient() {
 	_ = func(ctx context.Context) ([]byte, error) {
 		conn, err := zmux.Dial(ctx, "tcp", "example.com:4433", nil)
-		// or: zmux.DialTLS(ctx, "tcp", "example.com:4433", tlsConf, nil)
+		// or zmux.DialTLS(ctx, "tcp", "example.com:4433", tlsConf, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -155,7 +155,7 @@ func Example_readmeRedial() {
 		cfg := &zmux.Config{
 			ResumeTimeout: 30 * time.Second,
 			PipeAuth:      zmux.PipeAuth{PSK: psk, EndToEnd: true},
-			Redial: func(ctx context.Context, need zmux.Direction) (zmux.PipeIO, error) {
+			Redial: func(ctx context.Context, _ zmux.Direction) (zmux.PipeIO, error) {
 				var d net.Dialer
 				nc, err := d.DialContext(ctx, "tcp", addr)
 				if err != nil {
@@ -201,7 +201,7 @@ func Example_readmeHTTPExchange() {
 func Example_readmeProxy() {
 	trusted := &zmux.TrustedProxies{Prefixes: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
 		Header: "X-Forwarded-For"}
-	_ = trusted
+	_ = trusted.RequestSource
 
 	_ = func(endpoint http.Handler) *http.Server {
 		srv := &http.Server{Addr: "127.0.0.1:8080", Handler: endpoint, Protocols: new(http.Protocols)}
