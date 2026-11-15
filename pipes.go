@@ -174,7 +174,7 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 	if p.W == nil || p.R == nil {
 		return nil, false, fmt.Errorf("%w: a join needs both directions of the carrier; pair two with PairedPipe", ErrInvalidConfig)
 	}
-	if err := p.checkOverhead(); err != nil {
+	if err := p.validate(); err != nil {
 		return nil, false, err
 	}
 	if o.FateGroup == 0 {
@@ -298,17 +298,24 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions) (*Pipe, *pip
 	if err := nestPipe(c, outer); err != nil {
 		return nil, nil, err
 	}
+	if j.Mode == join.Sealed {
+		if err := sealedLimitErr(p, sealOverhead(p.Framing)); err != nil {
+			unnestPipe(c, outer)
+			return nil, nil, err
+		}
+	}
 	pd := c.newPipeDrv(c.s.NextPipeID(), p)
 	pd.outer = outer
 	low := pd.tcp.setLowWater(multiLowWater)
 	info := carrierInfo(p, pd.tcp, low)
 	if j.Mode == join.Sealed {
-		overhead := p.WriteOverhead + 16
-		if p.Framing != FramingRecords {
-			overhead += sealedLen
+		overhead := p.WriteOverhead + sealOverhead(p.Framing)
+		maxRec := SealedMaxRecord
+		if lim := sealedRecordLimit(p, sealOverhead(p.Framing)); lim > 0 {
+			maxRec = min(maxRec, lim)
 		}
 		info = core.CarrierInfo{Framing: core.FramingRecords, MinRTT: info.MinRTT, QueueBound: low,
-			WriteOverhead: overhead, MaxRecord: SealedMaxRecord}
+			WriteOverhead: overhead, MaxRecord: maxRec}
 		pd.opener, pd.ch = nil, nil
 	}
 	j.In, j.Out, j.OutSig, j.Kind = info, info, pd.wsig, uint8(p.Carrier)

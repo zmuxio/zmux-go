@@ -1058,7 +1058,7 @@ func TestFirstBatchSize(t *testing.T) {
 		cfg           int
 		atLeast, most int
 	}{
-		{"default", 0, 4 << 10, 8<<10 + over},
+		{"default", 0, 4 << 10, 8192}, // the batch gives way to the Hello floor
 		{"set", 1 << 10, 512, 1<<10 + over},
 		{"off", -1, 0, over},
 	} {
@@ -1074,6 +1074,9 @@ func TestFirstBatchSize(t *testing.T) {
 				t.Fatal(err)
 			}
 			hello := e.capture(RecordSealed)
+			if len(hello) > 8192 {
+				t.Fatalf("Hello of %d bytes, over the handshake message floor", len(hello))
+			}
 			if len(hello) < x.atLeast || len(hello) > x.most {
 				t.Fatalf("Hello of %d bytes, want %d to %d", len(hello), x.atLeast, x.most)
 			}

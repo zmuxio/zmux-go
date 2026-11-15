@@ -253,7 +253,7 @@ func (s *Session) JoinHello(id uint64, f Framing, over int, plan *shaping.UnitPl
 	if a.early && p.out != nil && s.ack != nil {
 		lim := firstBatchLimit(s.cfg.JoinEarlyHello, plan.PadTo, j.HelloWire(plain)+over)
 		// The frames item stays within what the Hello's ciphertext holds.
-		if v, ok := join.FitValue(join.CiphertextRoom(suite, plain)); ok {
+		if v, ok := join.FitValue(j.HelloRoom(plain)); ok {
 			lim = min(lim, v)
 		} else {
 			lim = 0
@@ -266,7 +266,7 @@ func (s *Session) JoinHello(id uint64, f Framing, over int, plan *shaping.UnitPl
 		}
 	}
 	w := j.HelloWire(plain) + over
-	if v, ok := join.ItemFor(shaping.PadFor(w, plan)-w, join.CiphertextRoom(suite, plain)); ok {
+	if v, ok := join.ItemFor(shaping.PadFor(w, plan)-w, j.HelloRoom(plain)); ok {
 		pl.Padding, pl.PadEmpty = v, v == 0
 		s.shapeSpend(join.ItemSize(v))
 	}
@@ -689,7 +689,7 @@ func (s *Session) ClaimHello(pj *PeerJoin, c Carrier, over, received int, plan *
 		return nil, JoinClose
 	}
 	w := pj.acc.ReplyWire(plain) + over
-	room := join.CiphertextRoom(pj.h, plain)
+	room := pj.acc.ReplyRoom(plain)
 	if _, padRoom, bounded := replyRoom(pj.Mode, received, w, 0); bounded {
 		room = min(room, padRoom)
 	}

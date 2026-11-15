@@ -275,6 +275,9 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 		}
 		s.shapeInject(&w)
 	}
+	if w.oversize {
+		s.FailInternal("a frame exceeds the record limit")
+	}
 	w.end()
 	w.chargeGate()
 	if w.dataSpent > 0 {

@@ -134,3 +134,38 @@ func TestPreambleGreaseFits(t *testing.T) {
 		t.Fatalf("preamble %d bytes, grease pending %v", st.snd.preLen, s.greaseFirst)
 	}
 }
+
+// A preamble whose first STREAM frame the record floor cannot hold fails
+// locally with the preamble-too-large error, before anything is sent, with
+// the real maximum in Code; one within it goes out whole on a pipe capped at
+// the floor, whatever the peer's own limit allows.
+func TestPreambleRecordCap(t *testing.T) {
+	const rec = wire.RecordFloor
+	s, p := preambleSession(t, rec-32)
+	s.peerMaxRecord = rec << 3
+	p.out.lanes[0].info.MaxRecord = rec
+	big, err := s.OpenStream(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lim := s.preambleMax()
+	if lim != rec-32 {
+		t.Fatalf("preambleMax %d", lim)
+	}
+	wantPreambleErr(t, s.SetOpenInfo(big, make([]byte, rec-31)), lim)
+	ok, err := s.OpenStream(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetOpenInfo(ok, make([]byte, lim-8)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(ok, []byte("data"), true); err != nil {
+		t.Fatal(err)
+	}
+	b := GetBatch()
+	defer PutBatch(b)
+	if !s.PollTransmit(p.id, 0, b, DefaultBatch, Time(Second)) || sum(recordData(t, b)) == 0 {
+		t.Fatal("a preamble that fits sent nothing")
+	}
+}

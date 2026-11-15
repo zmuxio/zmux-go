@@ -76,3 +76,63 @@ func TestDatagramDataMax(t *testing.T) {
 		}
 	}
 }
+
+// TestDatagramAtRecordFloor: on a pipe whose records take the floor of 8192
+// bytes, MaxDatagramPayload is what one such record holds; a datagram over
+// it is refused when queued, and one queued while the limits were unknown is
+// dropped and counted without stalling the ones behind it. A lane applies
+// the same cap.
+func TestDatagramAtRecordFloor(t *testing.T) {
+	s, p := channelSession(t, nil, false)
+	p.out.lanes[0].info.MaxRecord = 8192
+	m := s.MaxDatagramPayload(1)
+	if m != 8192-2 {
+		t.Fatalf("MaxDatagramPayload %d, want %d", m, 8192-2)
+	}
+	if err := s.SendDatagram(nil, 0, make([]byte, m+1)); err == nil {
+		t.Fatal("one byte above the maximum was accepted")
+	}
+	if err := s.SendDatagram(nil, 0, make([]byte, m)); err != nil {
+		t.Fatal(err)
+	}
+	if n := datagramFrames(t, s, p); n != 1 {
+		t.Fatalf("%d DATAGRAM frames sent, want 1", n)
+	}
+	s.peerSeen = false
+	if err := s.SendDatagram(nil, 0, make([]byte, 9000)); err != nil {
+		t.Fatal(err)
+	}
+	s.peerSeen = true
+	if err := s.SendDatagram(nil, 0, []byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	if n := datagramFrames(t, s, p); n != 1 {
+		t.Fatalf("%d DATAGRAM frames after a too-large one, want 1", n)
+	}
+	if st := s.SessionStats(); st.DatagramsDroppedSend != 1 {
+		t.Fatalf("DatagramsDroppedSend %d", st.DatagramsDroppedSend)
+	}
+	// A lane of the pipe carries the pipe's cap: it lowers the bound too.
+	s.peerMaxRecord = 65535
+	p.out.lanes[0].info.MaxRecord = 0
+	l := &outLane{lane: 1, info: CarrierInfo{MaxRecord: 8192}}
+	p.out.lanes = append(p.out.lanes, l)
+	if m := s.MaxDatagramPayload(1); m != 8192-2 {
+		t.Fatalf("with a capped lane: %d", m)
+	}
+}
+
+// A frame that no record can hold is flagged (PollTransmit then fails the session) instead of waiting for
+// room that never comes.
+func TestOversizeFrameIsFlagged(t *testing.T) {
+	var w recWriter
+	b := GetBatch()
+	defer PutBatch(b)
+	w.init(b, FramingBytes, 4096, DefaultBatch)
+	if !w.frame(4000, true, func(b []byte) []byte { return append(b, make([]byte, 4000)...) }) || w.oversize {
+		t.Fatal("a frame within the record was refused")
+	}
+	if w.frame(4097, true, func(b []byte) []byte { return b }) || !w.oversize {
+		t.Fatal("a frame over the record limit was not flagged")
+	}
+}

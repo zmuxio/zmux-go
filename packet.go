@@ -548,8 +548,10 @@ func (h *handle) writeCtx(ctx context.Context, p []byte) (int, error) {
 		select {
 		case <-h.wsig.C:
 		case <-ctx.Done():
+			h.endWait()
 			return total, ctx.Err()
 		case <-h.wwait():
+			h.endWait()
 			return total, os.ErrDeadlineExceeded
 		}
 	}

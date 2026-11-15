@@ -152,6 +152,11 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 	if cfg.AllowPSKOnly && !profile.HasPSK() {
 		return q, fmt.Errorf("%w: AllowPSKOnly without a pre-shared key", proto.ErrInvalidConfig)
 	}
+	if cfg.RecordMode == zmux.RecordSealed {
+		if err := zmux.CheckSealedCarrier(p); err != nil {
+			return q, err
+		}
+	}
 	key := cfg.Key
 	if key == nil {
 		if key, err = processKey(); err != nil {
@@ -177,6 +182,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 			return q, err
 		}
 	}
+	hs.SetHead(proto.HelloHeaderLen(f, profile))
 	if err := shape(ctx, cfg.Shaper, &cfg.ShapingLimits, p, msgHello, hs, proto.HelloHeaderLen(f, profile), &first, &padded); err != nil {
 		return q, err
 	}
@@ -219,6 +225,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 	if last.AppData, err = askAppData(ctx, cfg.AppData, r); err != nil {
 		return q, err
 	}
+	hs.SetHead(proto.FrameHeaderLen(f))
 	if err := shape(ctx, cfg.Shaper, &cfg.ShapingLimits, p, msgFinish, hs, proto.FrameHeaderLen(f), &last, &padded); err != nil {
 		return q, err
 	}
@@ -344,7 +351,7 @@ func shape(ctx context.Context, s shaping.HandshakeShaper, l *shaping.Limits, p 
 	}
 	noise := hs.EmptyMessageLen() + proto.PayloadLen(*pl)
 	w := head + noise + max(p.WriteOverhead, 0)
-	if v, ok := join.ItemFor(shaping.PadFor(w, &plan)-w, join.MaxMessage-noise); ok {
+	if v, ok := join.ItemFor(shaping.PadFor(w, &plan)-w, join.HandshakeFloor-head-noise); ok {
 		pl.Padding, pl.PadEmpty = v, v == 0
 		*padded += uint64(join.ItemSize(v))
 	}

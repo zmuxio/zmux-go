@@ -35,6 +35,15 @@ const (
 	ParamAppProtocols         uint64 = 0x3d4f9c2a8b1e6075 // the qmux crate's hook
 )
 
+// RecordFloor is the carrier record floor: every carrier takes records of
+// this many bytes (SPEC.md Section 3.2).
+const RecordFloor = 8192
+
+// MaxPreambleSize is the largest zmux_preamble value (EXTENSIONS.md Section
+// 4.1): the record floor less 32, so that the offset-0 STREAM frame carrying a
+// full preamble fits any carrier.
+const MaxPreambleSize = RecordFloor - 32
+
 // DefaultMaxRecordSize is the limit when max_record_size is absent.
 const DefaultMaxRecordSize = 16382
 
@@ -310,7 +319,7 @@ func (p *Params) validate() *Error {
 		if p.Has&HasResetAt == 0 {
 			return ErrParam("zmux_preamble without reset_stream_at")
 		}
-		if p.Preamble < 1 || p.Preamble > p.MaxRecordSize-32 ||
+		if p.Preamble < 1 || p.Preamble > MaxPreambleSize || p.Preamble > p.MaxRecordSize-32 ||
 			p.Preamble > p.MaxStreamDataBidiRem || p.Preamble > p.MaxStreamDataUni {
 			return ErrParam("zmux_preamble out of range")
 		}

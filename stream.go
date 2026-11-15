@@ -200,6 +200,7 @@ func (h *handle) write(p []byte, fin bool) (int, error) {
 		select {
 		case <-h.wsig.C:
 		case <-h.wwait():
+			h.endWait()
 			return total, os.ErrDeadlineExceeded
 		}
 	}
@@ -233,6 +234,7 @@ func (h *handle) writeBatch(b *core.Batch) (int, error) {
 		select {
 		case <-h.wsig.C:
 		case <-h.wwait():
+			h.endWait()
 			return total, os.ErrDeadlineExceeded
 		}
 	}

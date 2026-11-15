@@ -309,7 +309,23 @@ func (s *Session) WaitWrite(st *Stream, sig *Signal) {
 	}
 }
 
-// Finish queues FIN after the buffered data (Close of a SendStream).
+// EndWaitWrite ends the wait WaitWrite began: the stream no longer counts as
+// a waiting writer (its size class, the scheduler's expected bytes and the
+// tier's aging). A write that waits calls it when it stops waiting without
+// having taken its last byte: room found, cancelled, past its deadline, or
+// failed.
+func (s *Session) EndWaitWrite(st *Stream) {
+	sp := &st.snd
+	if !sp.wwait {
+		return
+	}
+	h := s.heldEnter(st)
+	sp.wwait = false
+	s.heldLeave(st, h)
+}
+
+// Finish queues FIN after the buffered data (Close of a SendStream). It
+// wakes a writer that waits for room: its write fails now.
 func (s *Session) Finish(st *Stream) error {
 	if st.hasS && st.snd.finWr && st.snd.errState == nil {
 		return nil
@@ -318,6 +334,7 @@ func (s *Session) Finish(st *Stream) error {
 		return err
 	}
 	st.snd.finWr = true
+	s.wake(st.wsig)
 	s.checkCapacity(st)
 	s.becomeSend(st)
 	return nil

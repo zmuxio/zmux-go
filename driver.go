@@ -24,6 +24,7 @@ type pipeDrv struct {
 	hc     *halfCloser
 	wsig   *core.Signal    // wakes the lane-0 writer
 	opener LaneOpener      // nil: the carrier offers no lanes
+	maxRec int             // the pipe's local record limit (carrierRecordLimit), applied to every lane
 	tcp    tcpInfo         // the TCP socket under the carrier, if any
 	outer  outerRef        // the outer session of a stream-backed carrier
 	gs     pipeGoroutines  // the attachment's goroutines (HandlePipe waits on them)
@@ -186,13 +187,14 @@ func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
 	}
 	pd.tcp = tcpOf(p.W)
 	pd.ch = channelOf(p)
+	pd.maxRec = carrierRecordLimit(p)
 	return pd
 }
 
 // adopt makes q the carrier of a joined attachment; the TCP socket stays the one
 // below it, for the statistics.
 func (pd *pipeDrv) adopt(q PipeIO) {
-	pd.hc, pd.framing = newHalfCloser(q), q.Framing
+	pd.hc, pd.framing, pd.maxRec = newHalfCloser(q), q.Framing, carrierRecordLimit(q)
 }
 
 // startPipeLocked starts the goroutines of an attachment.
@@ -634,7 +636,7 @@ func (c *Conn) openLane(pd *pipeDrv) {
 		return
 	}
 	lo := &laneOut{w: w, sig: core.NewSignal()}
-	info := core.CarrierInfo{Framing: core.Framing(pd.framing), Lanes: true}
+	info := core.CarrierInfo{Framing: core.Framing(pd.framing), Lanes: true, MaxRecord: pd.maxRec}
 	lane, ok := c.s.LaneOpened(pd.id, info, lo.sig)
 	if !ok {
 		_ = w.Close()

@@ -199,7 +199,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 		err = errors.New("no pipe halves")
 	}
 	if err == nil {
-		err = p.checkOverhead()
+		err = p.validate()
 		if err != nil {
 			closePipeIO(p)
 		}

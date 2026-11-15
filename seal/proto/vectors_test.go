@@ -270,6 +270,7 @@ func genHandshakeFn(t testing.TB, name string, v parties, build func(idx int, hp
 		RecordsUseSplit: Mode(v.Mode) == Sealed,
 	}
 	i, r := v.side(t, true, nil, nil), v.side(t, false, nil, nil)
+	i.sendMax, r.sendMax = maxMessage, maxMessage // receivers take what senders do not write
 	for idx := range pat.msgs {
 		w, rd, sender := i, r, "initiator"
 		if idx%2 == 1 {

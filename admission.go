@@ -589,7 +589,7 @@ func (a *Arrival) accept() {
 // decision each.
 func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error {
 	l := a.l
-	if err := p.checkOverhead(); err != nil {
+	if err := p.validate(); err != nil {
 		a.Release()
 		closePipeIO(p)
 		l.countSetupFailure()

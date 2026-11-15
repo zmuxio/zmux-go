@@ -48,6 +48,12 @@ type Handshake struct {
 	genKEM func() (keypair, error)
 	encaps func(ek []byte) (ct, ss []byte, err error)
 	idx    int
+	// head is the bytes the unit of the message carries before its Noise
+	// message (SetHead).
+	head int
+	// sendMax is the largest message written, HandshakeFloor when 0; the
+	// vector generator raises it to produce messages only receivers meet.
+	sendMax int
 	// hp is h_p of the last message read.
 	hp  []byte
 	err error
@@ -137,7 +143,7 @@ func (hs *Handshake) WriteMessage(dst []byte, p Payload) ([]byte, error) {
 	if p.known()&^hs.pat.known[hs.idx] != 0 {
 		return nil, hs.fail(fmt.Errorf("%w: payload type not allowed in this message", ErrInvalidConfig))
 	}
-	if err := hs.checkAppData(&p); err != nil {
+	if err := hs.fit(&p); err != nil {
 		return nil, hs.fail(err)
 	}
 	if p.Credential != nil && p.Credential.Type == 0 {
@@ -164,16 +170,75 @@ func (hs *Handshake) maxAppData() int {
 	return DefaultMaxAppData
 }
 
-// checkAppData refuses application data the message cannot hold.
-func (hs *Handshake) checkAppData(p *Payload) error {
-	if len(p.AppData) == 0 {
-		return nil
+// SetHead sets the bytes the unit of each message this Handshake writes
+// carries before its Noise message (the Hello header and Len, or Len): a
+// handshake message is at most HandshakeFloor bytes as written.
+func (hs *Handshake) SetHead(n int) { hs.head = n }
+
+// HandshakeFloor is the largest handshake message a sender writes (the
+// carrier record floor); receivers accept up to 65535 bytes.
+const HandshakeFloor = join.HandshakeFloor
+
+// room is the largest Noise message the next write may produce.
+func (hs *Handshake) room() int {
+	m := HandshakeFloor
+	if hs.sendMax > 0 {
+		m = hs.sendMax
 	}
-	q := *p
-	if hs.minMessage()+PayloadLen(q) > maxMessage {
-		return fmt.Errorf("%w: application data of %d bytes does not fit the message", ErrTooLarge, len(p.AppData))
+	return min(m-hs.head, maxMessage)
+}
+
+// fit trims the optional contents of p to the room: the carrier's first bytes
+// carry as many bytes as fit (FirstBytesRoom), and it fails with ErrTooLarge
+// when the required contents (the credential, the proof and application data)
+// exceed the room.
+func (hs *Handshake) fit(p *Payload) error {
+	room, err := hs.firstBytesRoom(*p)
+	if err != nil {
+		return err
+	}
+	if p.FirstBytes != nil && room < len(p.FirstBytes) {
+		if room == 0 {
+			p.FirstBytes = nil
+		} else {
+			p.FirstBytes = p.FirstBytes[:room]
+		}
 	}
 	return nil
+}
+
+// FirstBytesRoom is how many bytes of p.FirstBytes the next written message
+// carries beside the rest of p (the credential, the proof, the application
+// data and the padding): WriteMessage and WriteMessageProof send that many
+// of them and drop the rest without an error, so a caller that must hand on
+// every byte asks first and keeps the remainder for the carrier's records.
+// It is 0 when no first byte fits, and ErrTooLarge when the rest of p alone
+// does not fit the message.
+func (hs *Handshake) FirstBytesRoom(p Payload) (int, error) {
+	if err := hs.ready(true); err != nil {
+		return 0, err
+	}
+	return hs.firstBytesRoom(p)
+}
+
+func (hs *Handshake) firstBytesRoom(p Payload) (int, error) {
+	q := p
+	q.FirstBytes, q.Padding, q.PadEmpty = nil, 0, false
+	base := hs.minMessage() + PayloadLen(q)
+	room := hs.room()
+	if base > room {
+		return 0, fmt.Errorf("%w: the message needs %d bytes without its optional contents (%d of key material and tags, %d of credential, proof and %d bytes of application data) and has %d after its %d-byte head",
+			ErrTooLarge, base, hs.minMessage(), PayloadLen(q), len(p.AppData), room, hs.head)
+	}
+	room -= base
+	if p.Padding > 0 || p.PadEmpty {
+		room -= join.ItemSize(p.Padding)
+	}
+	v, ok := join.FitValue(room)
+	if !ok {
+		return 0, nil
+	}
+	return v, nil
 }
 
 // Proof labels: the role of the signature is in the signed message.
@@ -203,7 +268,7 @@ func (hs *Handshake) WriteMessageProof(dst []byte, p Payload, sign func(m []byte
 	if p.Proof == nil || p.known()&^hs.pat.known[hs.idx] != 0 {
 		return nil, hs.fail(fmt.Errorf("%w: payload type not allowed in this message", ErrInvalidConfig))
 	}
-	if err := hs.checkAppData(&p); err != nil {
+	if err := hs.fit(&p); err != nil {
 		return nil, hs.fail(err)
 	}
 	random := !hs.nextKeyed()
@@ -309,7 +374,7 @@ func (hs *Handshake) writeRawFunc(dst []byte, payload func(hp []byte) ([]byte, e
 	if err != nil {
 		return nil, hs.fail(err)
 	}
-	if len(dst)-start > maxMessage {
+	if len(dst)-start > hs.room() {
 		return nil, hs.fail(ErrTooLarge)
 	}
 	hs.idx++

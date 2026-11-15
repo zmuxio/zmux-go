@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -586,4 +587,19 @@ func testCert(t *testing.T) tls.Certificate {
 		t.Fatal(err)
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+}
+
+// A carrier whose record limit is below the Sealed floor is refused before
+// any handshake byte is written, naming the limit.
+func TestSealedCarrierLimitRefusedBeforeHandshake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := newFixture(t)
+	a, b := net.Pipe()
+	cl, sv := zmux.NetPipe(a), zmux.NetPipe(b)
+	cl.MaxRecord, sv.MaxRecord = 1000, 1000
+	cerr, serr := establishErrs(t, ctx, &f.client, &f.server, cl, sv)
+	if cerr == nil || !strings.Contains(cerr.Error(), "record limit 1000") || serr == nil {
+		t.Fatalf("not refused naming the limit: %v / %v", cerr, serr)
+	}
 }

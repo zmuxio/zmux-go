@@ -415,15 +415,22 @@ func (s *Session) allocID(st *Stream) bool {
 // least (FloorParams).
 const floorPreamble = 1024
 
-// preambleMax is the largest preamble the peer accepts: its parameter,
-// known or assumed for early data (remembered or the floor), else the
-// floor.
+// preambleMax is the largest preamble a stream can send: the peer's
+// parameter, known or assumed for early data (remembered or the floor),
+// else the floor, and no more than the carrier record floor less the 32-byte
+// margin for the first STREAM frame's header (EXTENSIONS.md Section 4.1).
+// Every pipe's records are at least the floor, so a preamble within this
+// bound fits any pipe, attached now or later, and never stalls.
 func (s *Session) preambleMax() uint64 {
+	lim := uint64(floorPreamble)
 	if (s.peerSeen || s.earlyActive()) && s.peer.Has&wire.HasPreamble != 0 {
-		return s.peer.Preamble
+		lim = s.peer.Preamble
 	}
-	return floorPreamble
+	return min(lim, preambleRecordMax)
 }
+
+// preambleRecordMax is the record floor less the frame-header margin.
+const preambleRecordMax = wire.MaxPreambleSize
 
 // preambleErr is the error of a preamble above lim.
 func preambleErr(lim uint64) *StreamError {

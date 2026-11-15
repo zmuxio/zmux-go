@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash"
+	"strings"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/internal/join"
@@ -428,5 +429,27 @@ func TestStateMachineAssumesNoSizes(t *testing.T) {
 		if !bytes.Equal(a, b) {
 			t.Fatal("exporter")
 		}
+	}
+}
+
+// TestFirstBytesRoom: the room the next message leaves for first bytes is
+// known before it is written, shrinks with the other contents, and a message
+// whose required contents alone overflow fails with the sizes in the error.
+func TestFirstBytesRoom(t *testing.T) {
+	c, err := NewInitiator(Config{Profile: ProfileEstablishPSK, Mode: Sealed, Handle: make([]byte, HandleLen), PSK: fixed("psk"), Static: newKey(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := c.FirstBytesRoom(Payload{})
+	if err != nil || empty <= 0 || empty >= HandshakeFloor {
+		t.Fatalf("room of an empty payload: %d, %v", empty, err)
+	}
+	withData, err := c.FirstBytesRoom(Payload{AppData: make([]byte, 100)})
+	if err != nil || withData >= empty-100+1 {
+		t.Fatalf("room beside 100 bytes of app data: %d (empty %d), %v", withData, empty, err)
+	}
+	_, err = c.FirstBytesRoom(Payload{AppData: make([]byte, HandshakeFloor)})
+	if !errors.Is(err, ErrTooLarge) || !strings.Contains(err.Error(), "application data") {
+		t.Fatalf("overflow: %v", err)
 	}
 }

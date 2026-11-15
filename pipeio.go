@@ -127,6 +127,16 @@ type PipeIO struct {
 	// is used (Start, AddPipe, the listener's HandlePipe and WrapPipe's
 	// result). WrapPipe's result keeps the WriteOverhead it sets.
 	WriteOverhead int
+	// MaxRecord is the largest record plaintext zmux writes on the carrier,
+	// a local bound applied beside the peer's max_record_size and never
+	// negotiated; 0: the carrier's default. A half implementing
+	// CarrierRecordLimit lowers it further (the smaller bound holds). It
+	// applies to the first pipe and to added pipes alike. It has a floor
+	// but no upper bound: a value below MinMaxRecord other than 0 is
+	// ErrInvalidConfig where the PipeIO is used, as for WriteOverhead; any
+	// larger value is a cap that the peer's max_record_size and the
+	// implementation's own record limit (MaxRecordSize) reduce further.
+	MaxRecord int
 	// HandshakePadding is the padding bytes a handshake run on the carrier
 	// before this PipeIO added; the session the carrier becomes part of, by
 	// starting it or by joining it, meters it once. 0: none.
@@ -142,10 +152,25 @@ type PipeIO struct {
 // MaxWriteOverhead is the largest PipeIO.WriteOverhead.
 const MaxWriteOverhead = 65535
 
-// checkOverhead reports a WriteOverhead outside [0, MaxWriteOverhead].
-func (p PipeIO) checkOverhead() error {
+// MinMaxRecord is the carrier record floor: every carrier of a pipe, each
+// lane included, takes records of this many bytes, so it is the smallest
+// nonzero PipeIO.MaxRecord and the smallest limit a carrier may report
+// (CarrierRecordLimit, less the overhead of a record transform). Every
+// frame that cannot be split across records fits one record of it.
+const MinMaxRecord = wire.RecordFloor
+
+// validate reports a WriteOverhead outside [0, MaxWriteOverhead], a
+// MaxRecord that is neither 0 nor at least MinMaxRecord, or a limit a
+// carrier half reports (CarrierRecordLimit) below MinMaxRecord.
+func (p PipeIO) validate() error {
 	if p.WriteOverhead < 0 || p.WriteOverhead > MaxWriteOverhead {
 		return fmt.Errorf("%w: PipeIO.WriteOverhead %d outside [0, %d]", ErrInvalidConfig, p.WriteOverhead, MaxWriteOverhead)
+	}
+	if p.MaxRecord != 0 && p.MaxRecord < MinMaxRecord {
+		return fmt.Errorf("%w: PipeIO.MaxRecord %d is below %d", ErrInvalidConfig, p.MaxRecord, MinMaxRecord)
+	}
+	if lim := carrierRecordLimit(p); lim != 0 && lim < MinMaxRecord {
+		return fmt.Errorf("%w: the carrier's record limit %d is below %d", ErrInvalidConfig, lim, MinMaxRecord)
 	}
 	return nil
 }

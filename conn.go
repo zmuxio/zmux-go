@@ -395,7 +395,7 @@ func start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 	if p.R == nil || p.W == nil {
 		return nil, fmt.Errorf("%w: the bootstrap carrier needs both halves", ErrInvalidConfig)
 	}
-	if err := p.checkOverhead(); err != nil {
+	if err := p.validate(); err != nil {
 		return nil, err
 	}
 	cfg = cfg.Clone()
@@ -786,7 +786,8 @@ func (c *Conn) Close() error {
 
 // CloseWithError closes the session gracefully with an application error
 // code and reason, which the peer sees as ApplicationError (code 0 and an
-// empty reason is the close without error). The data the streams have
+// empty reason is the close without error; a reason over 1024 bytes is cut at a
+// UTF-8 character boundary). The data the streams have
 // written and not yet sent is sent first, as far as flow control and the
 // carriers allow; then CONNECTION_CLOSE is handed to the carrier of every
 // usable outbound pipe, after which each pipe's write side is shut down
@@ -824,6 +825,7 @@ func (c *Conn) CloseWithError(code ApplicationErrorCode, reason string) error {
 		return nil
 	}
 	c.ending = make(chan struct{})
+	reason = wire.TruncateReason(reason)
 	c.closeCode, c.closeMsg = code, reason
 	sig := core.NewSignal()
 	c.closeSig = sig

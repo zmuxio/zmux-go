@@ -68,6 +68,11 @@ func (c *CipherState) stepRekey() {
 // and record ciphertext.
 const MaxMessage = 65535
 
+// HandshakeFloor is the largest handshake message a sender writes: the
+// carrier record floor, which every carrier carries (secure-carrier/SPEC.md
+// Section 4.1). Receivers accept up to MaxMessage.
+const HandshakeFloor = 8192
+
 // Sealer protects the records of one direction, without framing. It is not
 // safe for concurrent use.
 type Sealer struct {

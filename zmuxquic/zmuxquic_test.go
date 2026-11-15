@@ -494,3 +494,52 @@ func TestQUICHandshakeFailureCounted(t *testing.T) {
 		t.Fatalf("stats %+v", st)
 	}
 }
+
+// PipeIO.MaxRecord applies to every lane of the pipe: lanes are streams of
+// the same QUIC connection, and their records are as short as lane 0's.
+func TestQUICLanesHonourMaxRecord(t *testing.T) {
+	const capRec = zmux.MinMaxRecord
+	e := newEnv(t, mpConfig())
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	qc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, testQUIC(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = qc.CloseWithError(0, "") }()
+	p, err := ConnPipe(ctx, qc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.MaxRecord = capRec
+	c, err := zmux.Start(ctx, p, zmux.RoleClient, mpConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := e.lst.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = c.Close()
+		_ = s.Close()
+		_ = c.Wait()
+		_ = s.Wait()
+	}()
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() { echo(t, c, s, 2<<20) })
+	}
+	wg.Wait()
+	var lanes int
+	for _, ps := range c.PipeStats() {
+		lanes += ps.LanesOut
+		// A record is its Size field and at most capRec bytes.
+		if ps.RecordsSent == 0 || ps.BytesSent > ps.RecordsSent*(capRec+2) {
+			t.Fatalf("pipe: %d bytes in %d records", ps.BytesSent, ps.RecordsSent)
+		}
+	}
+	if lanes < 2 {
+		t.Fatalf("no lanes were opened: %+v", c.PipeStats())
+	}
+}

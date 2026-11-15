@@ -133,9 +133,9 @@ func secureFirstMode(p PipeIO) (RecordMode, bool) {
 }
 
 func carrierRecordLimit(p PipeIO) int {
-	lim := 0
+	lim := p.MaxRecord
 	for _, x := range []any{p.W, p.R} {
-		if s, ok := x.(CarrierRecordLimit); ok && (lim == 0 || s.MaxRecord() < lim) {
+		if s, ok := x.(CarrierRecordLimit); ok && s.MaxRecord() > 0 && (lim == 0 || s.MaxRecord() < lim) {
 			lim = s.MaxRecord()
 		}
 	}
@@ -300,6 +300,12 @@ func (c *Conn) joinCarrier(ctx context.Context, pd *pipeDrv, p PipeIO, dir Direc
 			}
 			q := withPrefix(p, u.buf[st.N:])
 			if res.Mode == join.Sealed {
+				// The acceptor learns the limit is too small only here, after its
+				// Reply went out: the dialer checks before it sends its Hello
+				// (the pipe is refused, which the dialer sees as a failed Join).
+				if err := sealedLimitErr(p, sealOverhead(p.Framing)); err != nil {
+					return c.joinIOFailed(ctx, pd.id, err)
+				}
 				q = sealResult(q, res)
 			}
 			// The session may have ended, or the attachment failed, while the
@@ -555,6 +561,10 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 	}
 	q := withPrefix(p, u.buf[used:])
 	if pj.Mode == join.Sealed {
+		if sealedLimitErr(p, sealOverhead(p.Framing)) != nil {
+			unnestPipe(c, outer)
+			return 0, errRejected
+		}
 		q = sealResult(q, result)
 	}
 	c.lock()
@@ -613,7 +623,7 @@ func (c *Conn) dropUnconfirmed(p PipeIO) {
 // uplink and downlink. The attachment fails as one.
 func PairedPipe(up, down PipeIO) PipeIO {
 	return PipeIO{R: down.R, W: up.W, Framing: up.Framing, Carrier: CarrierSplit, Label: up.Label, FateGroup: up.FateGroup,
-		WriteOverhead: up.WriteOverhead, Variant: up.Variant}
+		WriteOverhead: up.WriteOverhead, MaxRecord: up.MaxRecord, Variant: up.Variant}
 }
 
 // ---- Sealed records ----
@@ -657,7 +667,8 @@ type RecordOpener interface {
 // (nil: none). It offers only what its halves implement here, so the
 // carrier's lanes, datagram channel and exporter are hidden. It is the one
 // implementation of Sealed records, for a Join and for an Establish of the
-// secure carrier.
+// secure carrier. It does not check the carrier's record limit against the
+// Sealed floor: CheckSealedCarrier does, before the handshake.
 func SealRecords(p PipeIO, s RecordSealer, o RecordOpener, mode RecordMode, exp KeyingMaterialExporter) PipeIO {
 	r := &sealedReader{lower: p, o: o, msgs: p.Framing == FramingRecords, exp: exp, mode: mode}
 	w := &sealedWriter{lower: p, s: s, msgs: p.Framing == FramingRecords, exp: exp, mode: mode}
@@ -666,7 +677,44 @@ func SealRecords(p PipeIO, s RecordSealer, o RecordOpener, mode RecordMode, exp 
 		overhead += sealedLen
 	}
 	return PipeIO{R: r, W: w, Framing: FramingRecords, Carrier: p.Carrier, Protocol: p.Protocol, Label: p.Label, FateGroup: p.FateGroup,
-		WriteOverhead: overhead, Variant: p.Variant, HandshakePadding: p.HandshakePadding}
+		WriteOverhead: overhead, MaxRecord: sealedRecordLimit(p, overhead-p.WriteOverhead), Variant: p.Variant, HandshakePadding: p.HandshakePadding}
+}
+
+// sealedRecordLimit is the record plaintext limit of p's records sealed
+// with seal bytes added to each: a record limit of the lower carrier bounds
+// a sealed message, so the plaintext is that less the sealing; 0: none.
+func sealedRecordLimit(p PipeIO, seal int) int {
+	lim := carrierRecordLimit(p)
+	if lim == 0 {
+		return 0
+	}
+	return max(lim-seal, 1)
+}
+
+// sealOverhead is the bytes a Sealed record adds to its plaintext on a
+// carrier of framing: the AEAD tag, and a Size field on a byte stream.
+func sealOverhead(f Framing) int {
+	if f == FramingRecords {
+		return 16
+	}
+	return 16 + sealedLen
+}
+
+// CheckSealedCarrier reports whether p, the carrier of a Sealed pipe, has the
+// record limit Sealed needs once the AEAD sealing is added to each record
+// (ErrInvalidConfig naming the limit). A handshake that ends in SealRecords
+// calls it before it begins, so that a carrier too small for Sealed fails
+// before any handshake byte is written, not after.
+func CheckSealedCarrier(p PipeIO) error { return sealedLimitErr(p, sealOverhead(p.Framing)) }
+
+// sealedLimitErr reports a lower carrier whose record limit, less seal bytes
+// of sealing, falls below MinMaxRecord (ErrInvalidConfig).
+func sealedLimitErr(p PipeIO, seal int) error {
+	if lim := carrierRecordLimit(p); lim != 0 && lim-seal < MinMaxRecord {
+		return fmt.Errorf("%w: the carrier's record limit %d is too small for a Sealed pipe, which needs at least %d (%d plus %d bytes of sealing)",
+			ErrInvalidConfig, lim, MinMaxRecord+seal, MinMaxRecord, seal)
+	}
+	return nil
 }
 
 type sealedReader struct {

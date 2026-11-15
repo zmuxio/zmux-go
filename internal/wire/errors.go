@@ -86,7 +86,7 @@ func (e *Error) Error() string {
 	return s
 }
 
-// maxPhrase bounds the Reason Phrase a transport close carries.
+// maxPhrase bounds the Reason Phrase of any CONNECTION_CLOSE.
 const maxPhrase = 1024
 
 // Phrase renders the Reason Phrase of a transport close: reason, then the
@@ -97,14 +97,22 @@ func Phrase(reason, details string) string {
 	if details != "" {
 		s += "\n" + details
 	}
-	if len(s) > maxPhrase {
-		n := maxPhrase
-		for n > 0 && !utf8.RuneStart(s[n]) {
-			n--
-		}
-		s = s[:n]
+	return TruncateReason(s)
+}
+
+// TruncateReason cuts a Reason Phrase, an application's included, to at
+// most 1024 bytes at a UTF-8 character boundary (a phrase that is not valid
+// UTF-8 is cut at the byte limit's nearest start byte): the one bound every
+// CONNECTION_CLOSE sender applies.
+func TruncateReason(s string) string {
+	if len(s) <= maxPhrase {
+		return s
 	}
-	return s
+	n := maxPhrase
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // NewError builds an Error. kv are key/value pairs for the diagnostic line.

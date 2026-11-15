@@ -743,7 +743,7 @@ func (j *Joiner) WriteHelloRaw(dst, plain []byte) ([]byte, error) {
 	if err != nil {
 		return nil, j.fail(err)
 	}
-	if len(ct) > MaxMessage {
+	if len(head)+framingLen(j.cfg.Framing)+len(ct) > HandshakeFloor {
 		return nil, j.fail(ErrTooLarge)
 	}
 	dst = append(dst, head...)
@@ -835,6 +835,9 @@ func CutReply(b []byte, f Framing, s *Suite) (rr, ct []byte, n int, err error) {
 func (j *Joiner) WriteConfirm(dst []byte, zeros int) ([]byte, error) {
 	if j.state != joinerProven {
 		return nil, ErrState
+	}
+	if _, room := j.ConfirmWire(); zeros > room || zeros < 0 {
+		return nil, j.fail(ErrTooLarge)
 	}
 	j.state = joinerDone
 	switch j.cfg.Mode {
@@ -984,7 +987,7 @@ func (a *Acceptor) WriteReplyRaw(dst, plain []byte, e Entropy) ([]byte, error) {
 		a.state, a.err = acceptorFailed, err
 		return nil, err
 	}
-	if len(ct) > MaxMessage {
+	if 1+len(rr)+framingLen(a.c.f)+len(ct) > HandshakeFloor {
 		a.state, a.err = acceptorFailed, ErrTooLarge
 		return nil, ErrTooLarge
 	}

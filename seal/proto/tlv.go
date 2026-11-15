@@ -36,7 +36,9 @@ type Payload struct {
 	// here; nil or empty sends nothing.
 	AppData []byte
 	// FirstBytes is the start of the carrier's byte stream, handed to the
-	// upper layer in place of its first record.
+	// upper layer in place of its first record. A written message carries
+	// as many as fit and drops the rest without an error: see
+	// Handshake.FirstBytesRoom.
 	FirstBytes []byte
 	// Padding is the length of an ignorable padding item; 0 omits it unless
 	// PadEmpty asks for an item with no value.

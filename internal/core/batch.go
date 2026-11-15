@@ -180,6 +180,7 @@ type recWriter struct {
 	gateBase uint64 // dataSpent when that gate took effect in the batch
 	gateShut bool   // that gate holds stream data for the rest of the batch
 	gateOn   bool   // gateGen and gateBase are set
+	oversize bool   // an unsplittable frame was longer than recMax: it could never be written
 }
 
 // batchRecBound is the bytes after which stream data opens no further
@@ -332,6 +333,13 @@ func (w *recWriter) openCost() int {
 
 // raw appends frame bytes built by f to the open record.
 func (w *recWriter) frame(n int, elicit bool, f func([]byte) []byte) bool {
+	if n > w.recMax {
+		// No record holds it (the carrier record floor, SPEC.md Section
+		// 3.2, keeps every such frame within recMax): not a wait the
+		// caller may retry, so PollTransmit fails the session.
+		w.oversize = true
+		return false
+	}
 	if !w.fits(n) {
 		if !w.open || !w.newRecordFits(n) {
 			return false

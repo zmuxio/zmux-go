@@ -166,6 +166,11 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 	if mode != zmux.RecordSealed && c.AllowRecordMode == nil {
 		return reject(errMode)
 	}
+	if mode == zmux.RecordSealed {
+		if err := zmux.CheckSealedCarrier(p); err != nil {
+			return reject(err)
+		}
+	}
 	src := hint.Source
 	var psk []byte
 	if withPSK {
@@ -206,6 +211,7 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 		return reject(fmt.Errorf("%w: %w", errGate, err))
 	}
 	var padded uint64
+	hs.SetHead(proto.FrameHeaderLen(f))
 	if err := shape(ctx, c.Shaper, &c.ShapingLimits, p, msgReply, hs, proto.FrameHeaderLen(f), &second, &padded); err != nil {
 		return zmux.PipeIO{}, err
 	}

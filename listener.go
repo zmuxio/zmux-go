@@ -841,7 +841,7 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint PipeHint) (PipeI
 	if q.R == nil && q.W == nil {
 		return l.wrapFailed(p, q, fired, errors.New("no pipe halves"))
 	}
-	if err := q.checkOverhead(); err != nil {
+	if err := q.validate(); err != nil {
 		return l.wrapFailed(p, q, fired, err)
 	}
 	if !sameHalf(q.R, p.R) || !sameHalf(q.W, p.W) {
@@ -1462,7 +1462,7 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, rele
 	// up and down are named for the peer: this end writes on down. What describes the
 	// write is the writing half's.
 	both := PipeIO{R: up.R, W: down.W, Framing: up.Framing, Label: up.Label, Carrier: up.Carrier, FateGroup: up.FateGroup,
-		WriteOverhead: down.WriteOverhead, Variant: up.Variant}
+		WriteOverhead: down.WriteOverhead, MaxRecord: down.MaxRecord, Variant: up.Variant}
 	// Closing one half is no pipe event, so the pipe does not live by the context of
 	// whichever request arrived second. WrapPipe runs on the pair, and classification
 	// again, so that a pair can start a session or carry a Join.

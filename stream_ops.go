@@ -194,12 +194,23 @@ func (h *handle) writeChunk(ctx context.Context, ch Chunk) error {
 		select {
 		case <-h.wsig.C:
 		case <-ctx.Done():
+			h.endWait()
 			return ctx.Err()
 		case <-h.wwait():
+			h.endWait()
 			return os.ErrDeadlineExceeded
 		}
 	}
 	return nil
+}
+
+// endWait ends the stream's wait for write room (Session.EndWaitWrite) after
+// a blocked write stops on cancellation or its deadline.
+func (h *handle) endWait() {
+	c := h.c
+	c.lock()
+	c.s.EndWaitWrite(h.st)
+	c.unlock()
 }
 
 // tryWriteAll writes all of p now or nothing (no buffer space: false).
@@ -216,6 +227,65 @@ func (h *handle) tryWriteAll(p []byte) (bool, error) {
 	}
 	_, err := c.s.Write(h.st, p, false)
 	return err == nil, apiErr(err)
+}
+
+// waitWritable waits until a write takes bytes now and returns how many:
+// the send-buffer room TryWrite admits. It holds wmu while it waits, as a
+// write that waits for room does, so no other write of the stream shares
+// wsig with it.
+func (h *handle) waitWritable(ctx context.Context) (uint64, error) {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	c := h.c
+	for {
+		c.lock()
+		c.s.SetNow(c.clk.now())
+		err := c.s.WriteErrOf(h.st)
+		var room uint64
+		if err == nil {
+			if room = c.s.SendRoom(h.st); room == 0 {
+				h.wsig.Drain()
+				c.s.WaitWrite(h.st, &h.wsig)
+			}
+		}
+		if err != nil || room > 0 {
+			c.s.EndWaitWrite(h.st)
+		}
+		c.unlock()
+		if err != nil {
+			return 0, apiErr(err)
+		}
+		if room > 0 {
+			return room, nil
+		}
+		select {
+		case <-h.wsig.C:
+		case <-ctx.Done():
+			h.endWait()
+			return 0, ctx.Err()
+		case <-h.wwait():
+			h.endWait()
+			return 0, os.ErrDeadlineExceeded
+		}
+	}
+}
+
+// tryWrite writes the prefix of p that fits now, never waiting: 0 when
+// nothing fits or another write holds the stream.
+func (h *handle) tryWrite(p []byte) (int, error) {
+	if !h.wmu.TryLock() {
+		return 0, nil
+	}
+	defer h.wmu.Unlock()
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	c.s.SetNow(c.clk.now())
+	n, err := c.s.Write(h.st, p, false)
+	if n > 0 {
+		c.s.EndWaitWrite(h.st)
+	}
+	return n, apiErr(err)
 }
 
 func (h *handle) reject() {
@@ -312,6 +382,7 @@ func (h *handle) readFrom(r io.Reader) (int64, error) {
 			select {
 			case <-h.wsig.C:
 			case <-h.wwait():
+				h.endWait()
 				return n, os.ErrDeadlineExceeded
 			}
 			continue
@@ -410,7 +481,8 @@ func (s *Stream) PipeCarrier() bool { defer runtime.KeepAlive(s); _, _, p := s.h
 func (s *Stream) SendCapacity() uint64 { defer runtime.KeepAlive(s); return s.h.sendCapacity() }
 
 // WaitSendCapacity waits until SendCapacity is at least n (or above 0
-// while nothing is unsent) and returns it.
+// while nothing is unsent) and returns it. It waits for credit, not for
+// what a write takes: see WaitWritable.
 func (s *Stream) WaitSendCapacity(ctx context.Context, n uint64) (uint64, error) {
 	defer runtime.KeepAlive(s)
 	return s.h.waitSendCapacity(ctx, n)
@@ -485,6 +557,33 @@ func (s *Stream) Reject() { defer runtime.KeepAlive(s); s.h.reject() }
 func (s *Stream) TryWriteAll(p []byte) (bool, error) {
 	defer runtime.KeepAlive(s)
 	return s.h.tryWriteAll(p)
+}
+
+// TryWrite writes the prefix of p that fits in the send buffer now and
+// returns its length, never waiting: 0 when nothing fits or another write
+// is in progress (a WaitWritable included: pair the two in one goroutine).
+// With WaitWritable it is a write that consumes nothing
+// while it waits.
+func (s *Stream) TryWrite(p []byte) (int, error) {
+	defer runtime.KeepAlive(s)
+	return s.h.tryWrite(p)
+}
+
+// WaitWritable waits until the send buffer has room for a write and
+// returns the bytes TryWrite takes now (above 0), or the error that ended
+// the sending part. Room, not credit, admits a write: it may be there
+// while SendCapacity is 0, and the other way round. It consumes nothing,
+// so ctx may cancel it at any point; the write deadline bounds it too. A
+// write in progress on the stream finishes first. Then TryWrite takes at
+// least the returned bytes unless other streams took the shared buffer
+// meanwhile (0: wait again).
+//
+// A WaitWritable in progress holds the stream's write turn, as a blocked
+// Write does: a TryWrite from another goroutine returns 0 meanwhile. Call
+// the two in one goroutine, WaitWritable then TryWrite.
+func (s *Stream) WaitWritable(ctx context.Context) (uint64, error) {
+	defer runtime.KeepAlive(s)
+	return s.h.waitWritable(ctx)
 }
 
 // ReadChunk returns up to n bytes without copying; release the chunk, or
@@ -626,6 +725,18 @@ func (s *SendStream) SetReliableBoundary() {
 func (s *SendStream) TryWriteAll(p []byte) (bool, error) {
 	defer runtime.KeepAlive(s)
 	return s.h.tryWriteAll(p)
+}
+
+// TryWrite writes the prefix of p that fits now, as Stream.TryWrite.
+func (s *SendStream) TryWrite(p []byte) (int, error) {
+	defer runtime.KeepAlive(s)
+	return s.h.tryWrite(p)
+}
+
+// WaitWritable waits for room for a write (see Stream.WaitWritable).
+func (s *SendStream) WaitWritable(ctx context.Context) (uint64, error) {
+	defer runtime.KeepAlive(s)
+	return s.h.waitWritable(ctx)
 }
 
 // WriteChunk writes a chunk without copying and takes ownership of it.

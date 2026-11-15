@@ -73,3 +73,19 @@ func TestCarrierDatagramsParam(t *testing.T) {
 		t.Fatal("non-empty zmux_carrier_datagrams accepted")
 	}
 }
+
+func TestPreambleParamBound(t *testing.T) {
+	ok := func(v uint64) *Error {
+		p := Params{Has: HasPreamble | HasResetAt | HasBidiRemote | HasUni, Preamble: v, MaxRecordSize: DefaultMaxRecordSize,
+			MaxStreamDataBidiRem: 1 << 20, MaxStreamDataUni: 1 << 20}
+		b, _ := AppendParams(nil, &p)
+		var q Params
+		return DecodeParams(b, &q)
+	}
+	if err := ok(MaxPreambleSize); err != nil {
+		t.Fatalf("the bound itself: %v", err)
+	}
+	if err := ok(MaxPreambleSize + 1); err == nil {
+		t.Fatal("zmux_preamble above 8160 accepted")
+	}
+}

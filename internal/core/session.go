@@ -559,9 +559,11 @@ func (s *Session) endLaneWait() {
 }
 
 // Close closes the session with an application error.
+// The reason is cut to the Reason Phrase bound (wire.TruncateReason).
 func (s *Session) Close(code uint64, reason []byte) {
-	s.closeWith(&SessionError{Kind: CloseApplication, Code: code, Reason: string(reason)},
-		&closeFrame{app: true, code: code, reason: reason})
+	phrase := wire.TruncateReason(string(reason))
+	s.closeWith(&SessionError{Kind: CloseApplication, Code: code, Reason: phrase},
+		&closeFrame{app: true, code: code, reason: []byte(phrase)})
 }
 
 // FailInternal closes the session with a transport INTERNAL_ERROR carrying
@@ -622,7 +624,15 @@ func (s *Session) finishClose() {
 	s.endSuspension()
 	s.state = StateClosed
 	for _, p := range s.pipes {
-		if p.in == nil || !p.in.closed {
+		switch {
+		case p.in != nil && p.in.closed:
+		case p.in != nil && p.in.ccRead && p.in.ended:
+			// The peer's CONNECTION_CLOSE and then its end were read before
+			// closePipeIfDone ran: the carrier closes gracefully as it
+			// would have (SPEC.md Section 6.5 step 4), not by an abort.
+			p.in.closed = true
+			s.act(Action{Kind: ActClose, Pipe: p.id, Dir: DirBidi, After: s.lingerTimeout()})
+		default:
 			s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
 		}
 	}

@@ -85,9 +85,13 @@ func (a *Acceptor) ReplyWire(plain int) int {
 	return 1 + s.NonceLen + framingLen(a.c.f) + plain + s.TagLen()
 }
 
-// CiphertextRoom is what a plaintext of plain bytes leaves below the ciphertext
-// limit of the Suite.
-func CiphertextRoom(s *Suite, plain int) int { return MaxMessage - plain - s.TagLen() }
+// HelloRoom is the bytes of items a Hello with plain bytes of plaintext can
+// still take below the handshake message floor (negative: it is over).
+func (j *Joiner) HelloRoom(plain int) int { return HandshakeFloor - j.HelloWire(plain) }
+
+// ReplyRoom is the bytes of items a Reply with plain bytes of plaintext can
+// still take below the handshake message floor (negative: it is over).
+func (a *Acceptor) ReplyRoom(plain int) int { return HandshakeFloor - a.ReplyWire(plain) }
 
 // WireLen is the length on the wire of a parsed Hello.
 func (h *Hello) WireLen(f Framing) int { return len(h.clear) + framingLen(f) + len(h.Ciphertext) }
@@ -98,10 +102,10 @@ func (j *Joiner) ConfirmWire() (w, room int) {
 	switch j.cfg.Mode {
 	case Sealed:
 		t := j.cfg.Suite.TagLen()
-		return framingLen(j.cfg.Framing) + t, MaxMessage - t
+		return framingLen(j.cfg.Framing) + t, HandshakeFloor - framingLen(j.cfg.Framing) - t
 	case Trusted:
 		h := j.cfg.Suite.Hash.Size()
-		return framingLen(j.cfg.Framing) + h, MaxMessage - h
+		return framingLen(j.cfg.Framing) + h, HandshakeFloor - framingLen(j.cfg.Framing) - h
 	default:
 		return 0, 0
 	}
