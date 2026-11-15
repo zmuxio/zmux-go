@@ -58,15 +58,21 @@ func TestPrimaryControlOrder(t *testing.T) {
 	ps[0].mp.out = OutSuspect           // after every active one
 	ps[1].mp.peerStandby = true         // after the non-standby ones
 	ps[2].mp.rtt.min = 50 * Millisecond // the largest OWD of the rest
-	if a, b := s.primary(); a == nil || b == nil || a != ps[3] || b != ps[4] {
+	if a, b := s.primary(); a == nil || b == nil {
+		t.Fatal("no primary pair")
+	} else if a != ps[3] || b != ps[4] {
 		t.Fatalf("primary %v %v, want pipes %d %d", a.id, b.id, ps[3].id, ps[4].id)
 	}
 	ps[4].mp.rtt.min = ps[3].mp.rtt.min // equal OWD: the lower ID first
-	if a, b := s.primary(); a == nil || b == nil || a != ps[3] || b != ps[4] {
+	if a, b := s.primary(); a == nil || b == nil {
+		t.Fatal("no primary pair")
+	} else if a != ps[3] || b != ps[4] {
 		t.Fatalf("on a tie %v %v", a.id, b.id)
 	}
 	ps[3].mp.out, ps[4].mp.out = OutSuspect, OutSuspect
-	if a, b := s.primary(); a == nil || b == nil || a != ps[2] || b != ps[1] {
+	if a, b := s.primary(); a == nil || b == nil {
+		t.Fatal("no primary pair")
+	} else if a != ps[2] || b != ps[1] {
 		t.Fatalf("with two suspects %v %v", a.id, b.id)
 	}
 }
