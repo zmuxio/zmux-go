@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"github.com/zmuxio/zmux-go/varint"
 	"log/slog"
 	"math"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/setting"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
+	"github.com/zmuxio/zmux-go/varint"
 )
 
 // Session defaults, which the zero values of Config fields select.

@@ -76,7 +76,9 @@ func (s *Session) oppSend(w *recWriter, f *Pipe, st *Stream) bool {
 	if s.now.Sub(e.sent) <= thr {
 		return true
 	}
-	st = s.sendOf(&e.d) // blockingFrame found it live
+	if st = s.sendOf(&e.d); st == nil { // blockingFrame found it live
+		return true
+	}
 	sp := &st.snd
 	ms := sp.mpState()
 	// The next part of the blocking data not acknowledged and not re-sent.
