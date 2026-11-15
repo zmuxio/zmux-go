@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"math"
 	"runtime"
+	"runtime/debug"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -191,15 +193,24 @@ func TestReadFromNoBuffer(t *testing.T) {
 	for range 20 {
 		run()
 	}
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	before := ms.TotalAlloc
-	const runs = 50
-	for range runs {
-		run()
+	// The figure is process-wide and counts pool misses: a collection
+	// empties the pools, and the blocks and read buffers are then made
+	// again. No collection runs while it is measured, and the least of
+	// several rounds leaves out what other goroutines allocated meanwhile.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	per := uint64(math.MaxUint64)
+	for range 5 {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		before := ms.TotalAlloc
+		const runs = 20
+		for range runs {
+			run()
+		}
+		runtime.ReadMemStats(&ms)
+		per = min(per, (ms.TotalAlloc-before)/runs)
 	}
-	runtime.ReadMemStats(&ms)
-	if per := (ms.TotalAlloc - before) / runs; per >= 48<<10 {
+	if per >= 48<<10 {
 		t.Fatalf("ReadFrom of 256 KiB: %d bytes allocated per call", per)
 	}
 }

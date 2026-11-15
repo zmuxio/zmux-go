@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/testscale"
 )
 
 // Helpers of the root package's tests that these tests share.
@@ -39,7 +40,7 @@ func waitDone(t testing.TB, c *zmux.Conn) {
 	go func() { _ = c.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testscale.D(10 * time.Second)):
 		t.Fatal("session did not end")
 	}
 }

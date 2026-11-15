@@ -22,6 +22,7 @@ import (
 
 	"github.com/djylb/timeshim"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/httpx"
 	"github.com/zmuxio/zmux-go/internal/labels"
@@ -51,7 +52,8 @@ type Admission struct {
 	// Shutdown); a decision not returned by then is VerdictClose, and so
 	// is a panic. It is called once per carrier and once more after each
 	// VerdictMore, concurrently for different carriers, outside every
-	// lock.
+	// lock. Decide must return once ctx ends: one that does not keeps its
+	// goroutine, the request and prefix past the carrier's end.
 	Decide func(ctx context.Context, info *CarrierInfo, prefix []byte) Decision
 	// StallMin and StallMax bound the duration of a VerdictStall. The
 	// duration is a function of the carrier's source alone for the
@@ -588,10 +590,11 @@ func (a *Arrival) accept() {
 // carriers handed on concurrently are each admitted on their own, with a
 // decision each.
 func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error {
+	p = owned(p) // the peeks, their timers, a stall and the verdict close it through one closer
 	l := a.l
 	if err := p.validate(); err != nil {
 		a.Release()
-		closePipeIO(p)
+		closePipe(p)
 		l.countSetupFailure()
 		return err
 	}
@@ -602,9 +605,14 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error
 			p = q
 			a.accept()
 		case VerdictFallback:
-			if nc, ok := p.R.(net.Conn); ok && sameHalf(p.W, p.R) && l.cfg.Fallback != nil {
+			if nc, ok := p.R.(net.Conn); ok && carrierio.SameHalf(p.W, p.R) && l.cfg.Fallback != nil {
 				a.Release()
-				l.cfg.Fallback(ctx, prefixConn(nc, prefix))
+				// A peer reaches the host's fallback with any non-zmux bytes:
+				// its panic closes the carrier, not the process.
+				pc := prefixConn(nc, prefix)
+				if hostCall(l.cfg.Logger, "ListenerConfig.Fallback", func() error { l.cfg.Fallback(ctx, pc); return nil }) != nil {
+					closePipe(p)
+				}
 				return errRejected
 			}
 			a.stallPipe(ctx, p, false)
@@ -630,9 +638,10 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error
 // whether the listener took it (the exchange carrier); HandlePipe is Take
 // and run in one.
 func (a *Arrival) Take(ctx context.Context, p PipeIO, hint PipeHint) (run func(context.Context) error, err error) {
+	p = owned(p) // the peeks, their timers, a stall and the verdict close it through one closer
 	l := a.l
 	if !a.isAccepted() {
-		closePipeIO(p)
+		closePipe(p)
 		return nil, errRejected
 	}
 	slot, err := a.takeSlot()
@@ -640,7 +649,7 @@ func (a *Arrival) Take(ctx context.Context, p PipeIO, hint PipeHint) (run func(c
 		if errors.Is(err, errRefused) && !l.isClosed() {
 			return nil, l.refusePending(ctx, p, a.src, a.peer)
 		}
-		closePipeIO(p)
+		closePipe(p)
 		return nil, err
 	}
 	hint.Source = a.src
@@ -661,6 +670,7 @@ func (a *Arrival) Take(ctx context.Context, p PipeIO, hint PipeHint) (run func(c
 // to fallback (nil: the carrier is stalled), VerdictStall stalls it and
 // VerdictClose closes it. Without an Admission it returns p and true.
 func (a *Arrival) Admit(ctx context.Context, p PipeIO, fallback func(context.Context, PipeIO)) (PipeIO, bool) {
+	p = owned(p) // the peeks, their timers, a stall and the verdict close it through one closer
 	if a.isAccepted() {
 		return p, true
 	}
@@ -672,7 +682,9 @@ func (a *Arrival) Admit(ctx context.Context, p PipeIO, fallback func(context.Con
 	case VerdictFallback:
 		if fallback != nil {
 			a.Release()
-			fallback(ctx, PrefixedPipe(p, prefix))
+			if hostCall(a.l.cfg.Logger, "Admit fallback", func() error { fallback(ctx, PrefixedPipe(p, prefix)); return nil }) != nil {
+				closePipe(p)
+			}
 		} else {
 			a.stallPipe(ctx, p, false)
 		}
@@ -705,7 +717,7 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 		err := handshake(hctx)
 		hcancel()
 		if err != nil {
-			closePipeIO(p)
+			closePipe(p)
 			l.st.adm.handshakeFailed.Add(1)
 			a.Release()
 			return PipeIO{}, nil, verdictFailed
@@ -730,7 +742,7 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 		if fired {
 			l.st.adm.peekTimedOut.Add(1)
 			if !resumable {
-				closePipeIO(p)
+				closePipe(p)
 				a.Release()
 				return PipeIO{}, nil, VerdictClose
 			}
@@ -755,7 +767,7 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 		a.stallPipe(ctx, p, true)
 		return PipeIO{}, nil, VerdictStall
 	default: // VerdictClose
-		closePipeIO(p)
+		closePipe(p)
 		a.Release()
 		return PipeIO{}, nil, VerdictClose
 	}
@@ -795,7 +807,7 @@ func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (pr
 	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
 		defer close(done)
 		fired = true
-		deadlined = interruptRead(p)
+		deadlined = a.interruptRead(p)
 	})
 	prefix = peek(p.R, have, n)
 	if t.Stop() {
@@ -811,14 +823,13 @@ func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (pr
 			return prefix, !complete, !complete
 		}
 	}
-	closePipeIO(p)
+	closePipe(p)
 	return nil, true, false
 }
 
 // peekMessage reads the first message of a message-framed p by deadline
 // (none when the carrier ends or its half is no MessageReader), at most
-// limit; tooLong: it held more (read no further than limit+1 bytes with a
-// MessageLimitReader).
+// limit; tooLong: it held more (read no further than limit+1 bytes).
 func (a *Arrival) peekMessage(p PipeIO, limit int, deadline time.Time) (msg []byte, tooLong, fired bool) {
 	mr, ok := p.R.(MessageReader)
 	if !ok {
@@ -827,14 +838,9 @@ func (a *Arrival) peekMessage(p PipeIO, limit int, deadline time.Time) (msg []by
 	done := make(chan struct{})
 	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
 		defer close(done)
-		interruptRead(p)
+		a.interruptRead(p)
 	})
-	var err error
-	if lr, ok := p.R.(MessageLimitReader); ok {
-		msg, err = lr.ReadMessageLimit(limit)
-	} else {
-		msg, err = mr.ReadMessage()
-	}
+	msg, err := mr.ReadMessage(limit)
 	if !t.Stop() {
 		<-done // it fired: the carrier's reads have ended
 		return nil, false, true
@@ -847,11 +853,11 @@ func (a *Arrival) peekMessage(p PipeIO, limit int, deadline time.Time) (msg []by
 
 // interruptRead ends a blocked read of p: a passed read deadline where
 // the receiving half takes one (deadlined), a close otherwise.
-func interruptRead(p PipeIO) (deadlined bool) {
+func (a *Arrival) interruptRead(p PipeIO) (deadlined bool) {
 	if d, ok := p.R.(interface{ SetReadDeadline(time.Time) error }); ok && d.SetReadDeadline(time.Now()) == nil {
 		return true
 	}
-	closePipeIO(p)
+	closePipe(p)
 	return false
 }
 
@@ -998,9 +1004,9 @@ func (a *Arrival) stallSlot(counted bool, evict func()) (d time.Duration, releas
 // counted: the decision was VerdictStall, not a fallback without target.
 func (a *Arrival) stallPipe(ctx context.Context, p PipeIO, counted bool) {
 	defer a.Release()
-	d, release, ok := a.stallSlot(counted, func() { interruptRead(p) })
+	d, release, ok := a.stallSlot(counted, func() { a.interruptRead(p) })
 	if !ok || p.R == nil {
-		closePipeIO(p)
+		closePipe(p)
 		if ok {
 			release()
 		}
@@ -1009,15 +1015,15 @@ func (a *Arrival) stallPipe(ctx context.Context, p PipeIO, counted bool) {
 	defer release()
 	ctx, cancel := a.l.stopContext(ctx) // Listener.Close ends a stall
 	defer cancel()
-	t := a.l.clk.AfterFunc(d, func() { interruptRead(p) })
-	stop := context.AfterFunc(ctx, func() { interruptRead(p) })
+	t := a.l.clk.AfterFunc(d, func() { a.interruptRead(p) })
+	stop := context.AfterFunc(ctx, func() { a.interruptRead(p) })
 	discard(p.R)
 	stop()
 	t.Stop()
 	if cw, ok := p.W.(CloseWriter); ok {
 		_ = cw.CloseWrite()
 	}
-	closePipeIO(p)
+	closePipe(p)
 }
 
 // peek reads from r until have holds n bytes (a new buffer when have has

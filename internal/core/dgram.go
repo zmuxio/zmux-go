@@ -17,7 +17,8 @@ type dgramState struct {
 	// Received datagrams of peer streams not opened yet, in arrival order
 	// and so in the order they expire.
 	held     []heldDgram
-	recvSize uint64 // bytes of the session queue and the held datagrams
+	heldIDs  map[uint64]int // held datagrams per stream ID (releaseHeld)
+	recvSize uint64         // bytes of the session queue and the held datagrams
 }
 
 // heldDgram is a datagram held for a peer stream within the limit that
@@ -133,37 +134,24 @@ func (s *Session) dgPipe() *Pipe {
 	return nil
 }
 
-// chanUse is the use of a pipe's datagram channel for the frames being
-// sent: room 0 when they go in records.
-type chanUse struct {
-	room  int
-	id    uint64
-	hasID bool
-}
-
 // takes reports whether a DATAGRAM frame of n bytes of data goes on the
 // channel.
-func (c chanUse) takes(n int) bool {
-	return c.room > 0 && wire.ChannelDatagramLen(c.hasID, c.id, n) <= c.room
+func (c ChannelUse) takes(n int) bool {
+	return c.Room > 0 && wire.ChannelDatagramLen(c.HasID, c.ID, n) <= c.Room
 }
 
 // channelOf returns how DATAGRAM frames for p may use its carrier's
 // datagram channel: when both endpoints sent
 // zmux_carrier_datagrams, the carrier has a channel, and p's records are
 // not shaped.
-func (s *Session) channelOf(p *Pipe) chanUse {
+func (s *Session) channelOf(p *Pipe) ChannelUse {
 	if !s.feat.CarrierDatagrams || p == nil || p.out == nil || p.out.failed {
-		return chanUse{}
+		return ChannelUse{}
 	}
-	ch := p.out.lanes[0].info.Channel
-	if ch == nil || s.shp != nil && s.shapeOf(p) != nil {
-		return chanUse{}
+	if !p.out.lanes[0].info.Channel || s.shp != nil && s.shapeOf(p) != nil {
+		return ChannelUse{}
 	}
-	c := chanUse{room: ch.MaxChannelDatagram()}
-	if c.room > 0 {
-		c.id, c.hasID = ch.ChannelStreamID()
-	}
-	return c
+	return p.chUse
 }
 
 // SetChannelSignal sets the signal that wakes the sender of a pipe's
@@ -185,18 +173,21 @@ func (s *Session) wakeChannels() {
 // PollChannel appends to dst the channel datagrams due on the datagram
 // channel of pipe, each a new slice the driver sends outside the lock and
 // in order; live is false once the pipe can send no
-// more. ChannelDone counts them once the driver tried them.
-func (s *Session) PollChannel(pipe uint64, dst []ChannelOut) (_ []ChannelOut, live bool) {
+// more. use is what the channel takes now, read by the driver outside the
+// lock; the core decides with it until the next poll. ChannelDone counts
+// the datagrams once the driver tried them.
+func (s *Session) PollChannel(pipe uint64, use ChannelUse, dst []ChannelOut) (_ []ChannelOut, live bool) {
 	p := s.pipe(pipe)
 	if p == nil || p.out == nil || p.out.failed || s.state == StateClosed {
 		return dst, false
 	}
+	p.chUse = use
 	d := s.dg
 	if d == nil || len(d.send) == 0 || !s.peerSeen || s.state >= StateClosing || p != s.dgPipe() {
 		return dst, true
 	}
 	ch := s.channelOf(p)
-	if ch.room == 0 {
+	if ch.Room == 0 {
 		return dst, true
 	}
 	kept := d.send[:0]
@@ -210,8 +201,8 @@ func (s *Session) PollChannel(pipe uint64, dst []ChannelOut) (_ []ChannelOut, li
 			kept = append(kept, o)
 			continue
 		}
-		b := make([]byte, 0, wire.ChannelDatagramLen(ch.hasID, ch.id, len(o.data)))
-		dst = append(dst, ChannelOut{Frame: wire.AppendChannelDatagram(b, ch.hasID, ch.id, o.data), d: outDgram{st: o.st, n: o.n}})
+		b := make([]byte, 0, wire.ChannelDatagramLen(ch.HasID, ch.ID, len(o.data)))
+		dst = append(dst, ChannelOut{Frame: wire.AppendChannelDatagram(b, ch.HasID, ch.ID, o.data), d: outDgram{st: o.st, n: o.n}})
 		if len(d.sendW) > 0 {
 			s.wake(d.sendW[0])
 			d.sendW = d.sendW[1:]
@@ -266,7 +257,6 @@ func (s *Session) ReceiveChannelDatagram(pipe uint64, frame []byte, now Time) {
 }
 
 type streamDgrams struct {
-	sig  *Signal
 	q    [][]byte // context-prefixed payloads
 	size uint64   // their payload bytes (DgramStreamSize)
 }
@@ -395,7 +385,7 @@ func (s *Session) SendDatagram(st *Stream, context uint64, p []byte) error {
 // for p's datagram channel to PollChannel.
 func (s *Session) writeDatagrams(w *recWriter, p *Pipe) {
 	d := s.dg
-	var ch chanUse
+	var ch ChannelUse
 	if p == s.dgPipe() {
 		ch = s.channelOf(p)
 	}
@@ -555,6 +545,10 @@ func (s *Session) holdDatagram(id uint64, e []byte, ch bool) {
 		until = d.held[n-1].until
 	}
 	d.held = append(d.held, heldDgram{id: id, e: e, until: until, ch: ch})
+	if d.heldIDs == nil {
+		d.heldIDs = map[uint64]int{}
+	}
+	d.heldIDs[id]++
 	d.recvSize += d.held[len(d.held)-1].cost()
 	s.trimRecvBytes()
 }
@@ -563,6 +557,7 @@ func (s *Session) holdDatagram(id uint64, e []byte, ch bool) {
 func (s *Session) dropHeldHead() {
 	d := s.dg
 	d.recvSize -= d.held[0].cost()
+	d.unhold(d.held[0].id)
 	d.held[0] = heldDgram{}
 	d.held = d.held[1:]
 	s.dropRecv(1)
@@ -572,9 +567,10 @@ func (s *Session) dropHeldHead() {
 // in arrival order.
 func (s *Session) releaseHeld(st *Stream) {
 	d := s.dg
-	if d == nil || len(d.held) == 0 {
+	if d == nil || d.heldIDs[st.id] == 0 { // a stream opening scans nothing when none is held for it
 		return
 	}
+	delete(d.heldIDs, st.id)
 	kept := d.held[:0]
 	for _, h := range d.held {
 		if h.id != st.id {
@@ -587,6 +583,13 @@ func (s *Session) releaseHeld(st *Stream) {
 	}
 	clear(d.held[len(kept):])
 	d.held = kept
+}
+
+// unhold counts one held datagram of id gone.
+func (d *dgramState) unhold(id uint64) {
+	if d.heldIDs[id]--; d.heldIDs[id] <= 0 {
+		delete(d.heldIDs, id)
+	}
 }
 
 // heldDeadline is when the first held datagram expires: the oldest.
@@ -639,8 +642,7 @@ func (s *Session) queueDatagram(st *Stream, e []byte) {
 		st.cnt.dgReceived++
 		st.dg.q = append(st.dg.q, e)
 		st.dg.size += n
-		s.wake(st.dg.sig)
-		s.wake(st.rsig)
+		s.dgramChanged(st)
 		return
 	}
 	if len(d.recv) >= s.cfg.DgramRecvQ {
@@ -663,6 +665,12 @@ func (s *Session) DropReceivedDatagrams(n uint64) { s.dropRecv(n) }
 
 func (s *Session) dropRecv(n uint64) {
 	s.stats.DatagramsDroppedRecv += n
+	// The count is cumulative: drops in a row update the one event not yet
+	// taken, so a flood of drops queues one event, not one per datagram.
+	if k := len(s.events); k > s.evHead && s.events[k-1].Kind == EvDatagramDropped {
+		s.events[k-1].Count = s.stats.DatagramsDroppedRecv
+		return
+	}
 	s.emit(Event{Kind: EvDatagramDropped, Count: s.stats.DatagramsDroppedRecv})
 }
 
@@ -720,14 +728,17 @@ func (s *Session) RecvStreamDatagram(st *Stream) (uint64, []byte, bool) {
 	return ctx, p, true
 }
 
-// WaitStreamDatagram registers sig for a stream datagram.
-func (s *Session) WaitStreamDatagram(st *Stream, sig *Signal) {
-	if st.dg == nil {
-		st.dg = &streamDgrams{}
+// StreamDatagramsEnded reports whether no stream datagram can arrive any
+// more: the session ended (err) or the stream was discarded or its
+// receiving part stopped (no error: the flow's end).
+func (s *Session) StreamDatagramsEnded(st *Stream) (bool, error) {
+	if s.err != nil {
+		return true, s.err
 	}
-	st.dg.sig = sig
+	return st.discarded || st.hasR && st.rcv.stopped, nil
 }
 
 func (s *Session) dropStreamDgrams(st *Stream) {
 	st.dg = nil
+	s.dgramChanged(st) // a waiter sees the end
 }

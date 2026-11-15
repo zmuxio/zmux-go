@@ -16,6 +16,7 @@ import (
 
 	"github.com/djylb/timeshim"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/labels"
@@ -45,10 +46,10 @@ type StreamID int64
 // a reader and a writer goroutine; wake-ups are queued under the lock and
 // delivered after it is released.
 type Conn struct {
-	clk clock
-	s   *core.Session // the sans-IO core (session lock)
-	cfg *Config
-	mu  sync.Mutex // the session lock: guards s and the fields marked so
+	clk    clock
+	s      *core.Session // the sans-IO core (session lock)
+	cfg    *Config
+	sessMu sync.Mutex // the session lock (lock, peek): guards s and the fields marked so
 
 	// The timer and its bookkeeping (session lock).
 	timer     timeshim.Timer
@@ -56,12 +57,20 @@ type Conn struct {
 	timerArm  core.Time     // when the timer was armed to fire
 	timerLate time.Duration // smoothed lateness of the host timer
 
-	ctx    context.Context
-	err    error // terminal error once done
-	pipes  map[uint64]*pipeDrv
-	done   chan struct{}
-	cancel context.CancelCauseFunc
-	wg     sync.WaitGroup
+	ctx   context.Context
+	err   error // terminal error once done
+	pipes map[uint64]*pipeDrv
+	done  chan struct{}
+	// doneOnce closes done: at the end the unlock publishes, or in a
+	// poisoned session's salvage.
+	doneOnce sync.Once
+	cancel   context.CancelCauseFunc
+	wg       sync.WaitGroup
+	// side counts the session's goroutines started outside its critical
+	// sections (redial, rejoins, channel drain, lane opens, pools), which a
+	// WaitGroup cannot count once Wait may run; Wait waits for both. It is
+	// sealed when done is closed: none starts after that (goSide).
+	side pipeGoroutines
 
 	// firstTimer releases a held first flight at the handshake timeout;
 	// firstTimeouts counts that (session lock).
@@ -115,7 +124,7 @@ type Conn struct {
 	fired    bool // the timeout ran: rearm no earlier than G
 	closing  bool // CLOSED: no new goroutines
 	aborted  bool // Abort was called
-	poisoned bool
+	poisonSt poisonState
 	// A shaping deadline is met in place: the timer is armed lead before
 	// it, by the host timer's observed lateness, and the callback waits
 	// for the deadline itself.
@@ -142,19 +151,67 @@ type Conn struct {
 	carrierTries []CandidateResult // DialChoice's tries, in order
 }
 
+// poisonState is how far a panic under the lock got the session.
+type poisonState uint8
+
+const (
+	poisonNone   poisonState = iota
+	poisonFailed             // the core failed the session (FailInternal)
+	poisonTorn               // FailInternal panicked as well: the session ends without the core
+)
+
 var sigPool = sync.Pool{New: func() any { s := make([]*core.Signal, 0, 16); return &s }}
 var actPool = sync.Pool{New: func() any { s := make([]core.Action, 0, 4); return &s }}
 var pendPool = sync.Pool{New: func() any { s := make([]pendingAct, 0, 4); return &s }}
 
 // lock takes the session lock; the caller defers c.unlock().
-func (c *Conn) lock() { c.mu.Lock() }
+func (c *Conn) lock() { c.sessMu.Lock() }
+
+// peek runs f under the session lock without the epilogue of unlock, for
+// a section that leaves the core no work (no wake, carrier command or
+// timer change): it neither collects nor fires wakes, so a waiter whose
+// own slot an unlock would fire (closeSig) can poll with it. A panic in f
+// still ends the session as in any critical section. lock and peek are
+// the only ways to take the session lock (TestSessionLockEntries).
+func (c *Conn) peek(f func()) {
+	c.sessMu.Lock()
+	defer c.unlockPeek()
+	f()
+}
+
+// unlockPeek ends peek's critical section: the bare unlock, or unlock's
+// epilogue after a panic.
+func (c *Conn) unlockPeek() {
+	r := recover() //nolint:revive // defer: unlockPeek is the deferred function itself
+	if r == nil {
+		c.sessMu.Unlock()
+		return
+	}
+	c.unlockWith(r)
+}
+
+// locked runs f in a critical section whose unlock is deferred, so a panic
+// in f poisons the session (unlock) instead of leaving the lock held.
+func (c *Conn) locked(f func()) {
+	c.lock()
+	defer c.unlock()
+	f()
+}
 
 // unlock is the epilogue of every critical section: it converts a panic of
 // the core into a closed session, collects the wake-ups, carrier commands
 // and timer change, releases the lock and only then signals.
 func (c *Conn) unlock() {
-	r := recover() //nolint:revive // defer: unlock is the deferred function itself
+	c.unlockWith(recover())
+}
+
+// unlockWith is unlock after the panic r (nil: none).
+func (c *Conn) unlockWith(r any) {
+	released := false
 	if r != nil {
+		// The core's state may be torn: a second panic in the epilogue
+		// still releases the lock and ends the session.
+		defer c.salvage(&released)
 		c.poison(r)
 	} else {
 		if !c.closing {
@@ -176,11 +233,12 @@ func (c *Conn) unlock() {
 		c.shapeFaults = f
 		c.hk.warn("zmux: a Shaper, its factory or the HandshakeShaper panicked; the panic was contained (ShapingStats.Faults)")
 	}
-	closed := c.s.State() == core.StateClosed && !c.closing
+	// A torn session ends whether or not the core reached CLOSED: it runs
+	// on no further.
+	closed := (c.poisonSt == poisonTorn || c.s.State() == core.StateClosed) && !c.closing
+	var abort []*pipeDrv
 	if closed {
-		c.closing = true
-		c.err = sessionErr(c.s.Err())
-		c.hk.trace(traceItem{closed: true, err: c.err})
+		abort = c.recordEndLocked()
 	}
 	hk := c.hk
 	hk.note(c.s.HasWindowProposal(), c.s.WantsPick())
@@ -209,18 +267,24 @@ func (c *Conn) unlock() {
 	clear(acts)
 	*ap = acts[:0]
 	actPool.Put(ap)
-	c.mu.Unlock()
-	if closed && c.lst != nil {
-		// Unregistered before any waiter learns of the end, so that a
-		// failed establishment returns with its registration gone.
-		c.lst.sessionClosed(c)
+	c.sessMu.Unlock()
+	released = true
+	if closed {
+		// Deferred: a panic of host code below (a carrier) still
+		// publishes the end.
+		defer c.publishEnd(abort)
+		if c.lst != nil {
+			// Unregistered before any waiter learns of the end, so that a
+			// failed establishment returns with its registration gone.
+			c.lst.sessionClosed(c)
+		}
 	}
 	core.FireAll(ws)
 	clear(ws)
 	*wp = ws[:0]
 	sigPool.Put(wp)
 	for _, pa := range pend {
-		c.doAction(pa)
+		c.doActionContained(pa)
 	}
 	clear(pend)
 	*pp = pend[:0]
@@ -229,17 +293,96 @@ func (c *Conn) unlock() {
 	if redial {
 		c.maybeRedial()
 	}
-	if closed {
-		c.cancel(c.err)
-		close(c.done)
-		unregisterLaneKey(c)
-		forgetNesting(c)
-	}
 	if r != nil {
 		// The session is closed; the panic is not propagated to the caller,
 		// which gets the session error.
 		_ = r
 	}
+}
+
+// recordEndLocked records the session's end under the lock (once: closing): its
+// error, the Closed trace, the pipe waiters. For a torn session it returns
+// every attachment to abort: its core queued no carrier command for them.
+func (c *Conn) recordEndLocked() []*pipeDrv {
+	c.closing = true
+	c.err = sessionErr(c.s.Err())
+	if c.err == nil {
+		c.err = &TransportError{ErrorCode: TransportInternalError, ErrorMessage: "internal error"}
+	}
+	c.hk.trace(traceItem{closed: true, err: c.err})
+	c.firePipeWaiters() // every wait on pipe changes sees the end (closing)
+	if c.poisonSt != poisonTorn {
+		return nil // the core's own commands end the pipes
+	}
+	abort := make([]*pipeDrv, 0, len(c.pipes))
+	for _, pd := range c.pipes {
+		abort = append(abort, pd)
+	}
+	return abort
+}
+
+// publishEnd publishes the end recorded by recordEndLocked, outside the lock: the
+// listener forgets the session, the attachments in abort are aborted, done
+// is closed (sealing the side goroutines) and the session's process-wide
+// registrations are dropped. Every step is idempotent, and the
+// unlock that records the end and a salvage both run it.
+func (c *Conn) publishEnd(abort []*pipeDrv) {
+	if c.lst != nil {
+		c.lst.sessionClosed(c)
+	}
+	for _, pd := range abort {
+		safeLog(c.cfg.Logger, "carrier", pd.closeAll)
+	}
+	c.doneOnce.Do(func() {
+		c.side.seal()
+		c.cancel(c.err)
+		close(c.done)
+	})
+	unregisterLaneKey(c)
+	forgetNesting(c)
+}
+
+// doActionContained performs a carrier command; a panic of the carrier's
+// code is contained (logged), so that the epilogue still runs.
+func (c *Conn) doActionContained(pa pendingAct) {
+	safeLog(c.cfg.Logger, "carrier", func() { c.doAction(pa) })
+}
+
+// salvage ends a poisoned session whose unlock epilogue panicked again:
+// the lock is released (if still held) and the session's end published,
+// so that no goroutine waits on either.
+func (c *Conn) salvage(released *bool) {
+	if recover() == nil { //nolint:revive // defer: salvage is the deferred function itself
+		return
+	}
+	var abort []*pipeDrv
+	if !*released {
+		if !c.closing {
+			func() {
+				defer func() {
+					if recover() != nil && c.err == nil {
+						c.err = &TransportError{ErrorCode: TransportInternalError, ErrorMessage: "internal error"}
+					}
+				}()
+				_ = c.recordEndLocked()
+			}()
+			c.closing = true
+		}
+		// Every attachment is aborted: the torn core's commands are lost.
+		abort = make([]*pipeDrv, 0, len(c.pipes))
+		for _, pd := range c.pipes {
+			abort = append(abort, pd)
+		}
+		if c.timer != nil {
+			c.timer.Stop()
+		}
+		if c.firstTimer != nil {
+			c.firstTimer.Stop()
+			c.firstTimer = nil
+		}
+		c.sessMu.Unlock()
+	}
+	c.publishEnd(abort)
 }
 
 // settle runs the core's pending completion, converting a panic like the
@@ -256,11 +399,15 @@ func (c *Conn) settle() {
 // poison closes the session after a panic under the lock without running
 // more core logic than the close itself.
 func (c *Conn) poison(r any) {
-	if c.poisoned {
+	if c.poisonSt != poisonNone {
 		return
 	}
-	c.poisoned = true
-	defer func() { _ = recover() }()
+	c.poisonSt = poisonFailed
+	defer func() {
+		if recover() != nil {
+			c.poisonSt = poisonTorn // the core could not even fail: the session ends here
+		}
+	}()
 	c.s.FailInternal(fmt.Sprint("internal error: ", r))
 }
 
@@ -335,13 +482,16 @@ const maxTimerLead = 2 * time.Millisecond
 
 func (c *Conn) onTimer() {
 	timerFires.Add(1)
-	c.mu.Lock()
-	now := c.clk.now()
-	if late := time.Duration(now - c.timerArm); late >= 0 && late < time.Second {
-		c.timerLate += (late - c.timerLate) / 8
-	}
-	at, precise := c.timerAt, c.timerPrecise
-	c.mu.Unlock()
+	var now core.Time
+	var at core.Time
+	var precise bool
+	c.peek(func() {
+		now = c.clk.now()
+		if late := time.Duration(now - c.timerArm); late >= 0 && late < time.Second {
+			c.timerLate += (late - c.timerLate) / 8
+		}
+		at, precise = c.timerAt, c.timerPrecise
+	})
 	if precise && at != core.Never && time.Duration(at-now) <= maxTimerLead {
 		// Wait in place for the deadline the timer fired ahead of. A
 		// callback that started before a rearm reads the new deadline,
@@ -381,10 +531,11 @@ func (c *Conn) onTimer() {
 // it cannot take joins: MaxPipes above 1 or ResumeTimeout is
 // ErrInvalidConfig (serve such sessions with a Listener).
 func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error) {
+	p = owned(p)
 	c, err := start(ctx, p, role, cfg)
 	if err != nil {
 		if c == nil {
-			closePipeIO(p)
+			closePipe(p)
 		}
 		return nil, err
 	}
@@ -435,7 +586,7 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 	c, err := setupCore(ctx, p, cfg, cc, lst, admitted)
 	if err != nil {
 		if c == nil {
-			closePipeIO(p)
+			closePipe(p)
 		}
 		return nil, err
 	}
@@ -489,38 +640,42 @@ func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 		c.dialed = EndpointLocal
 	}
 	registerLaneKey(c)
-	c.lock()
-	// Publish the locator before bootstrap I/O can expose it to the peer.
-	// AcceptJoin already holds joins until negotiation completes.
-	if lst != nil {
-		lst.mu.Lock()
-		closed := lst.closed
-		if !closed {
-			lst.live[c] = struct{}{}
-			if len(cc.Local.Locator) > 0 {
-				lst.sessions[string(cc.Local.Locator)] = c
+	refused, early := false, false
+	c.locked(func() {
+		// Publish the locator before bootstrap I/O can expose it to the peer.
+		// AcceptJoin already holds joins until negotiation completes.
+		if lst != nil {
+			lst.mu.Lock()
+			closed := lst.closed
+			if !closed {
+				lst.live[c] = struct{}{}
+				if len(cc.Local.Locator) > 0 {
+					lst.sessions[string(cc.Local.Locator)] = c
+				}
+			}
+			lst.mu.Unlock()
+			if closed {
+				refused = true
+				return
 			}
 		}
-		lst.mu.Unlock()
-		if closed {
-			c.unlock()
-			closePipeIO(p)
-			c.Abort(0, "listener closed")
-			return c, errRejected
+		if _, ok := earlyIn(p, &c.cfg.EarlyData); ok {
+			c.s.CarrierEarlyIn()
 		}
+		if _, ok := earlyCarrier(p, &c.cfg.EarlyData); ok {
+			c.verdictDone = make(chan struct{})
+		}
+		c.addBootstrap(p)
+		if cc.HoldFirstFlight {
+			c.firstTimer = c.clk.source().AfterFunc(cfg.handshakeTimeout(), func() { c.releaseFirst(true) })
+		}
+		early = cc.EarlyZmuxPeer || cc.EarlyRemembered != nil && cc.EarlyReplayable
+	})
+	if refused {
+		closePipe(p)
+		c.Abort(0, "listener closed")
+		return c, errRejected
 	}
-	if _, ok := earlyIn(p, &c.cfg.EarlyData); ok {
-		c.s.CarrierEarlyIn()
-	}
-	if _, ok := earlyCarrier(p, &c.cfg.EarlyData); ok {
-		c.verdictDone = make(chan struct{})
-	}
-	c.addBootstrap(p)
-	if cc.HoldFirstFlight {
-		c.firstTimer = c.clk.source().AfterFunc(cfg.handshakeTimeout(), func() { c.releaseFirst(true) })
-	}
-	early := cc.EarlyZmuxPeer || cc.EarlyRemembered != nil && cc.EarlyReplayable
-	c.unlock()
 	c.watchEarly(p)
 	if early {
 		return c, nil
@@ -557,12 +712,12 @@ func bootExporters(p PipeIO, initiator bool) *lateExporter {
 	}
 	e := &lateExporter{}
 	for _, h := range []any{p.W, p.R} {
-		if es, ok := h.(EarlyServerCarrier); ok && (len(e.early) == 0 || !sameHalf(h, e.early[0])) {
+		if es, ok := h.(EarlyServerCarrier); ok && (len(e.early) == 0 || !carrierio.SameHalf(h, e.early[0])) {
 			e.early = append(e.early, es)
 		}
 	}
 	e.up, _ = exporterOf(up)
-	if !sameHalf(unprefixed(down), unprefixed(up)) { // the halves of one carrier: one exporter
+	if !carrierio.SameHalf(unprefixed(down), unprefixed(up)) { // the halves of one carrier: one exporter
 		e.down, _ = exporterOf(down)
 	}
 	if e.up == nil && e.down == nil {
@@ -712,17 +867,19 @@ func newConn(cfg *Config, cc core.Config) *Conn {
 		c.s.SetShaper(c.coreFactory(cfg.Shaper))
 	}
 	c.chInMax = c.s.Config().DgramRecvQ
-	c.hk = newHooks(c)
+	c.hk = newHooks(c, nil)
 	return c
 }
 
 func (c *Conn) waitEstablished(ctx context.Context) error {
 	sig := core.NewSignal()
 	for {
-		c.lock()
-		ready := c.s.WaitEstablished(sig)
-		est, err := c.s.Established(), c.s.Err()
-		c.unlock()
+		var ready, est bool
+		var err *core.SessionError
+		c.locked(func() {
+			ready = c.s.WaitEstablished(sig)
+			est, err = c.s.Established(), c.s.Err()
+		})
 		if ready {
 			if err != nil {
 				return sessionErr(err)
@@ -757,16 +914,18 @@ func (c *Conn) errLocked() error {
 }
 
 // closedErr returns the terminal error (call after done is closed).
-func (c *Conn) closedErr() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.err != nil {
-		return c.err
-	}
-	if e := c.s.Err(); e != nil {
-		return sessionErr(e)
-	}
-	return net.ErrClosed
+func (c *Conn) closedErr() (err error) {
+	c.peek(func() {
+		switch e := c.s.Err(); {
+		case c.err != nil:
+			err = c.err
+		case e != nil:
+			err = sessionErr(e)
+		default:
+			err = net.ErrClosed
+		}
+	})
+	return err
 }
 
 // closeLimit bounds the whole of Close: the flush and the hand-off of
@@ -831,9 +990,9 @@ func (c *Conn) CloseWithError(code ApplicationErrorCode, reason string) error {
 	c.closeSig = sig
 	c.unlock()
 	defer func() {
-		c.lock()
-		c.closeSig = nil
-		c.unlock()
+		c.locked(func() {
+			c.closeSig = nil
+		})
 		close(c.ending)
 	}()
 	c.closeFlush(sig, code, reason)
@@ -847,12 +1006,11 @@ func (c *Conn) closeFlush(sig *core.Signal, code ApplicationErrorCode, msg strin
 	t := time.NewTimer(closeFlushLimit) // real time: a bound on carrier IO
 	defer t.Stop()
 	// The flush: until nothing written can be sent now, data that waits
-	// for credit included. The checks read under the bare mutex: an unlock
-	// would wake sig itself.
+	// for credit included. The checks peek: an unlock would wake sig
+	// itself.
 	for flushed := false; !flushed; {
-		c.mu.Lock()
-		flushing := !c.aborted && c.s.Flushable()
-		c.mu.Unlock()
+		var flushing bool
+		c.peek(func() { flushing = !c.aborted && c.s.Flushable() })
 		if !flushing {
 			break
 		}
@@ -864,10 +1022,10 @@ func (c *Conn) closeFlush(sig *core.Signal, code ApplicationErrorCode, msg strin
 			flushed = true // given up: the rest is discarded
 		}
 	}
-	c.lock()
-	c.s.SetNow(c.clk.now())
-	c.s.Close(uint64(code), []byte(msg)) // nothing when an Abort closed it first
-	c.unlock()
+	c.locked(func() {
+		c.s.SetNow(c.clk.now())
+		c.s.Close(uint64(code), []byte(msg)) // nothing when an Abort closed it first
+	})
 	// The hand-off: until every carrier took CONNECTION_CLOSE, within what
 	// remains of closeLimit.
 	if !t.Stop() {
@@ -878,9 +1036,8 @@ func (c *Conn) closeFlush(sig *core.Signal, code ApplicationErrorCode, msg strin
 	}
 	t.Reset(closeLimit - time.Since(start))
 	for expired := false; !expired; {
-		c.mu.Lock()
-		done := c.handedOffLocked()
-		c.mu.Unlock()
+		var done bool
+		c.peek(func() { done = c.handedOffLocked() })
 		if done {
 			return
 		}
@@ -945,10 +1102,10 @@ func (c *Conn) Abort(code ApplicationErrorCode, reason string) {
 //	defer cancel()
 //	err := conn.Shutdown(ctx, 0, "")
 func (c *Conn) Shutdown(ctx context.Context, code ApplicationErrorCode, msg string) error {
-	c.lock()
-	c.s.SetNow(c.clk.now())
-	c.s.Shutdown(uint64(code), []byte(msg))
-	c.unlock()
+	c.locked(func() {
+		c.s.SetNow(c.clk.now())
+		c.s.Shutdown(uint64(code), []byte(msg))
+	})
 	select {
 	case <-c.done:
 		return nil
@@ -962,13 +1119,30 @@ func (c *Conn) Shutdown(ctx context.Context, code ApplicationErrorCode, msg stri
 // session's error: until it is closed, every pipe's inbound side has ended
 // (the peer read CONNECTION_CLOSE and ended its side of the carrier) or
 // the linger timeout has expired, and every goroutine of the session has
-// ended. After CloseWithError, a Wait that returns before the linger
+// ended, except the one running the host's hooks (Tracer, Pick,
+// AllowConnectionWindowIncrease), which may call Wait. After CloseWithError, a Wait that returns before the linger
 // timeout confirms that the peer read the close. Done is its selectable
 // form.
 func (c *Conn) Wait() error {
 	<-c.done
 	c.wg.Wait()
+	<-c.side.wait()
 	return c.closedErr()
+}
+
+// goSide runs f on a goroutine of the session that Wait waits for (side),
+// labelled from lctx. Once the session's end is published (done) it
+// refuses, runs nothing and reports false: Wait covers every goroutine the
+// session ever starts, and the caller undoes what it prepared for f.
+func (c *Conn) goSide(lctx context.Context, name string, f func()) bool {
+	if !c.side.tryAdd() {
+		return false
+	}
+	labels.Go(lctx, name, func() {
+		defer c.side.done()
+		f()
+	})
+	return true
 }
 
 // Done returns a channel that is closed when Wait would return; Wait then
@@ -988,6 +1162,7 @@ func (c *Conn) Done() <-chan struct{} {
 		labels.Go(c.lctx, "done", func() {
 			<-c.done
 			c.wg.Wait()
+			<-c.side.wait()
 			close(c.waited)
 		})
 	})
@@ -998,27 +1173,32 @@ func (c *Conn) Done() <-chan struct{} {
 // the measured round-trip time.
 func (c *Conn) Ping(ctx context.Context) (time.Duration, error) {
 	sig := core.NewSignal()
-	c.lock()
-	c.s.SetNow(c.clk.now())
-	ticket, err := c.s.Ping(sig)
-	c.unlock()
+	var ticket uint64
+	var err error
+	c.locked(func() {
+		c.s.SetNow(c.clk.now())
+		ticket, err = c.s.Ping(sig)
+	})
 	if err != nil {
 		return 0, apiErr(err)
 	}
 	defer func() {
-		c.lock()
-		c.s.CancelPingWait(sig)
-		c.unlock()
+		c.locked(func() {
+			c.s.CancelPingWait(sig)
+		})
 	}()
 	for {
-		c.lock()
-		done, rtt, err := c.s.PingDone(ticket)
-		if !done && err == nil {
-			c.s.CancelPingWait(sig)
-			sig.Drain()
-			_, err = c.s.Ping(sig)
-		}
-		c.unlock()
+		var done bool
+		var rtt core.Duration
+		var err error
+		c.locked(func() {
+			done, rtt, err = c.s.PingDone(ticket)
+			if !done && err == nil {
+				c.s.CancelPingWait(sig)
+				sig.Drain()
+				_, err = c.s.Ping(sig)
+			}
+		})
 		if done {
 			return time.Duration(rtt), nil
 		}
@@ -1362,24 +1542,31 @@ func AdmittedAs[T any](a Admitted) (v T, ok bool) {
 
 // LocalAddr returns the local address of pipe 0 when its carrier has one.
 func (c *Conn) LocalAddr() net.Addr {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if pd := c.pipes[0]; pd != nil {
-		if nc, ok := pd.hc.io.W.(net.Conn); ok {
-			return nc.LocalAddr()
-		}
+	if nc := c.pipe0Conn(); nc != nil {
+		var a net.Addr
+		safeLog(c.cfg.Logger, "carrier LocalAddr", func() { a = nc.LocalAddr() })
+		return a
 	}
 	return nil
 }
 
+// pipe0Conn returns pipe 0's sending half when it is a net.Conn, read
+// under the lock; its methods are the host's and run outside it.
+func (c *Conn) pipe0Conn() (nc net.Conn) {
+	c.peek(func() {
+		if pd := c.pipes[0]; pd != nil {
+			nc, _ = pd.hc.io.W.(net.Conn)
+		}
+	})
+	return nc
+}
+
 // RemoteAddr returns the remote address of pipe 0 when its carrier has one.
 func (c *Conn) RemoteAddr() net.Addr {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if pd := c.pipes[0]; pd != nil {
-		if nc, ok := pd.hc.io.W.(net.Conn); ok {
-			return nc.RemoteAddr()
-		}
+	if nc := c.pipe0Conn(); nc != nil {
+		var a net.Addr
+		safeLog(c.cfg.Logger, "carrier RemoteAddr", func() { a = nc.RemoteAddr() })
+		return a
 	}
 	return nil
 }
@@ -1400,17 +1587,17 @@ func (c *Conn) sendDatagram(st *core.Stream, cx uint64, p []byte) error {
 // sendDatagramLimited is sendDatagram that also reports a drop by the
 // send limiter (limited true, err nil).
 func (c *Conn) sendDatagramLimited(st *core.Stream, cx uint64, p []byte) (bool, error) {
-	lim := c.cfg.DatagramLimiter.Send
-	if lim != nil && lim.TryReady(len(p)) < len(p) {
-		c.lock()
-		c.s.DeliverDatagram(core.PendingDatagram{}, true)
-		c.unlock()
+	l := c.cfg.DatagramLimiter.Send
+	lim := guardedLimiter{l} // concrete: no allocation per datagram
+	if l != nil && lim.TryReady(len(p)) < len(p) {
+		c.locked(func() {
+			c.s.DeliverDatagram(core.PendingDatagram{}, true)
+		})
 		return true, nil
 	}
-	c.lock()
-	err := c.s.SendDatagram(st, cx, p)
-	c.unlock()
-	if err == nil && lim != nil {
+	var err error
+	c.locked(func() { err = c.s.SendDatagram(st, cx, p) })
+	if err == nil && l != nil {
 		lim.Charge(len(p))
 	}
 	return false, apiErr(err)
@@ -1427,19 +1614,19 @@ func (c *Conn) SendDatagramWait(ctx context.Context, p []byte) error {
 func (c *Conn) sendDatagramWait(ctx context.Context, st *core.Stream, cx uint64, p []byte) error {
 	sig := core.NewSignal()
 	defer func() {
-		c.lock()
-		c.s.CancelDatagramSendWait(sig)
-		c.unlock()
+		c.locked(func() {
+			c.s.CancelDatagramSendWait(sig)
+		})
 	}()
 	for {
-		c.lock()
-		full := c.s.DatagramQueueFull() && c.s.Err() == nil
-		if full {
-			sig.Drain()
-			c.s.CancelDatagramSendWait(sig)
-			c.s.WaitDatagramSend(sig)
-		}
-		c.unlock()
+		full := false
+		c.locked(func() {
+			if full = c.s.DatagramQueueFull() && c.s.Err() == nil; full {
+				sig.Drain()
+				c.s.CancelDatagramSendWait(sig)
+				c.s.WaitDatagramSend(sig)
+			}
+		})
 		if !full {
 			return c.sendDatagram(st, cx, p)
 		}
@@ -1456,13 +1643,12 @@ func (c *Conn) sendDatagramWait(ctx context.Context, st *core.Stream, cx uint64,
 // passDatagrams runs received datagrams through the receive limiter,
 // outside the lock.
 func (c *Conn) passDatagrams() {
-	lim := c.cfg.DatagramLimiter.Receive
-	if lim == nil {
+	if c.cfg.DatagramLimiter.Receive == nil {
 		return
 	}
-	c.lock()
-	ds := c.s.TakeLimitedDatagrams(nil)
-	c.unlock()
+	lim := guardedLimiter{c.cfg.DatagramLimiter.Receive} // a panic drops the datagram, not the session
+	var ds []core.PendingDatagram
+	c.locked(func() { ds = c.s.TakeLimitedDatagrams(nil) })
 	if len(ds) == 0 {
 		return
 	}
@@ -1474,35 +1660,36 @@ func (c *Conn) passDatagrams() {
 			pass[i] = true
 		}
 	}
-	c.lock()
-	for i := range ds {
-		c.s.DeliverDatagram(ds[i], !pass[i])
-	}
-	c.unlock()
+	c.locked(func() {
+		for i := range ds {
+			c.s.DeliverDatagram(ds[i], !pass[i])
+		}
+	})
 }
 
 // ReceiveDatagram returns the next session datagram.
 func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	sig := core.NewSignal()
 	defer func() {
-		c.lock()
-		c.s.CancelDatagramWait(sig)
-		c.unlock()
+		c.locked(func() {
+			c.s.CancelDatagramWait(sig)
+		})
 	}()
 	for {
-		c.lock()
-		d, ok := c.s.RecvDatagram()
+		var d []byte
+		var ok bool
 		var err error
-		if !ok {
-			if e := c.s.Err(); e != nil {
-				err = sessionErr(e)
-			} else {
-				sig.Drain()
-				c.s.CancelDatagramWait(sig)
-				c.s.WaitDatagram(sig)
+		c.locked(func() {
+			if d, ok = c.s.RecvDatagram(); !ok {
+				if e := c.s.Err(); e != nil {
+					err = sessionErr(e)
+				} else {
+					sig.Drain()
+					c.s.CancelDatagramWait(sig)
+					c.s.WaitDatagram(sig)
+				}
 			}
-		}
-		c.unlock()
+		})
 		if ok {
 			return d, nil
 		}
@@ -1563,31 +1750,31 @@ func (c *Conn) open(ctx context.Context, bidi, wait bool) (*handle, error) {
 	var sig *core.Signal
 	defer func() {
 		if sig != nil {
-			c.lock()
-			c.s.CancelOpenWait(bidi, sig)
-			c.unlock()
+			c.locked(func() {
+				c.s.CancelOpenWait(bidi, sig)
+			})
 		}
 	}()
 	for {
-		c.lock()
-		c.s.SetNow(c.clk.now())
-		st, err := c.s.OpenStream(bidi)
-		if errors.Is(err, core.ErrStreamLimit) && wait && ctx != nil {
-			if sig == nil {
-				sig = core.NewSignal()
-				c.s.CountCreditWait()
-			} else {
-				c.s.CancelOpenWait(bidi, sig)
-			}
-			sig.Drain()
-			c.s.WaitOpen(bidi, sig)
-			err = nil
-		}
+		var st *core.Stream
+		var err error
 		var h *handle
-		if st != nil {
-			h = c.newHandle(st)
-		}
-		c.unlock()
+		c.locked(func() {
+			c.s.SetNow(c.clk.now())
+			st, err = c.s.OpenStream(bidi)
+			if errors.Is(err, core.ErrStreamLimit) && wait && ctx != nil {
+				if sig == nil {
+					sig = core.NewSignal()
+					c.s.CountCreditWait()
+				}
+				sig.Drain()
+				c.s.WaitOpen(bidi, sig)
+				err = nil
+			}
+			if st != nil {
+				h = c.newHandle(st)
+			}
+		})
 		if st != nil {
 			return h, nil
 		}
@@ -1627,29 +1814,28 @@ func (c *Conn) accept(ctx context.Context, bidi bool) (*handle, error) {
 	registered := false
 	defer func() {
 		if registered {
-			c.lock()
-			c.s.CancelAcceptWait(bidi, sig)
-			c.unlock()
+			c.locked(func() {
+				c.s.CancelAcceptWait(bidi, sig)
+			})
 		}
 	}()
 	for {
-		c.lock()
-		st, ok := c.s.AcceptStream(bidi)
 		var h *handle
 		var err error
-		if ok {
-			h = c.newHandle(st)
-		} else if e := c.s.Err(); e != nil {
-			err = sessionErr(e)
-		} else {
-			if registered {
-				c.s.CancelAcceptWait(bidi, sig)
+		c.locked(func() {
+			if st, ok := c.s.AcceptStream(bidi); ok {
+				h = c.newHandle(st)
+			} else if e := c.s.Err(); e != nil {
+				err = sessionErr(e)
+			} else {
+				if registered {
+					c.s.CancelAcceptWait(bidi, sig)
+				}
+				sig.Drain()
+				c.s.WaitAccept(bidi, sig)
+				registered = true
 			}
-			sig.Drain()
-			c.s.WaitAccept(bidi, sig)
-			registered = true
-		}
-		c.unlock()
+		})
 		if h != nil {
 			return h, nil
 		}

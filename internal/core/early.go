@@ -18,12 +18,21 @@ type earlyState struct {
 
 // holdSends reports whether sent stream data must be kept: carrier early
 // data the carrier has not accepted yet.
-func (s *Session) holdSends() bool { return s.early != nil && s.early.carrier || s.earlyHeld }
+func (s *Session) holdSends() bool { return s.early != nil && s.early.carrier || s.earlyHold != nil }
+
+// earlyHold is a hold of the provisional sends once the early flight left
+// s.early: waiting for the carrier's verdict, or (restart) for the peer's
+// parameters after a rejected carrier restarted them, with the set they
+// were made under when any went out.
+type earlyHold struct {
+	assumed wire.Params
+	check   bool // a restart's: the re-issued sends took identifiers and preambles under assumed
+}
 
 // CarrierEarlyAccepted reports the carrier's verdict "accepted": the early
 // sends are final.
 func (s *Session) CarrierEarlyAccepted() {
-	s.earlyHeld, s.earlyAccepted = false, true
+	s.earlyHold, s.earlyAccepted = nil, true
 	if s.early != nil {
 		s.early.carrier = false
 	}
@@ -43,7 +52,7 @@ func (s *Session) releaseProvisional() {
 		h := s.heldEnter(st)
 		sp.q.release(min64(sp.sent, sp.q.end))
 		s.heldLeave(st, h)
-		s.wake(st.wsig)
+		s.sendChanged(st)
 		if sp.finSent && sp.state == sendDataSent && !sp.reset {
 			s.sendTerminal(st, sendDataRecvd)
 		}
@@ -84,8 +93,13 @@ func (s *Session) RestartEarly(info CarrierInfo, now Time) bool {
 	p.in = &inDir{lanes: []*inLane{{info: info, expectTP: true}}}
 	s.earnSkip = s.earnBytes // nothing of it reached the peer; it goes again
 	s.conn.sent = 0
-	// The early sends are re-issued after the peer's parameters.
-	s.earlyHeld = true
+	// The early sends are re-issued after the peer's parameters, with the
+	// identifiers and preambles they took under the assumed set.
+	h := &earlyHold{}
+	if e := s.early; e != nil && e.sentAny {
+		h.assumed, h.check = e.assumed, true
+	}
+	s.earlyHold = h
 	s.early = nil
 	s.peer = wire.Params{}
 	s.conn.sendMax = 0
@@ -106,6 +120,10 @@ func (s *Session) RestartEarly(info CarrierInfo, now Time) bool {
 		if sp.reset {
 			sp.resetSent = false
 			s.queueCtl(st, ctlReset)
+		}
+		if x := st.ext; x != nil && x.reqPrio {
+			// A PRIORITY_UPDATE written on the early carrier goes again.
+			s.queueCtl(st, ctlPrio)
 		}
 		if r := &st.rcv; st.hasR {
 			// Nothing of the early carrier reached the peer: a
@@ -159,11 +177,11 @@ func (s *Session) startEarly(assumed wire.Params, floor bool) {
 // earlyActive reports whether early data may be sent now.
 func (s *Session) earlyActive() bool { return s.early != nil && !s.peerSeen }
 
-func (s *Session) earlyWants() bool { return s.dataPending(nil) }
+func (s *Session) earlyWants() bool { return s.dataPendingOn(nil, nil) }
 
 // writeEarly writes the fence and the early STREAM frames.
 func (s *Session) writeEarly(w *recWriter) {
-	if !s.dataPending(nil) {
+	if !s.dataPendingOn(nil, nil) {
 		return
 	}
 	e := s.early
@@ -184,10 +202,13 @@ func (s *Session) writeEarly(w *recWriter) {
 func (s *Session) earlyOutcome() *wire.Error {
 	e := s.early
 	p := &s.peer
-	if e == nil && s.earlyHeld {
+	if h := s.earlyHold; e == nil && h != nil {
 		// Re-issued after a rejection: what follows the peer's
-		// parameters is final.
-		s.earlyHeld = false
+		// parameters is final, once they admit what the sends assumed.
+		s.earlyHold = nil
+		if h.check && assumedBelow(&h.assumed, p) {
+			return wire.ErrParam("peer parameters below the assumed set")
+		}
 		s.earlyAdopt()
 		return nil
 	}
@@ -198,7 +219,9 @@ func (s *Session) earlyOutcome() *wire.Error {
 		// Carrier early data: the carrier's verdict decides; the
 		// remembered parameters only bound what was sent.
 		e.carrier = false
-		s.earlyHeld = !s.earlyAccepted
+		if !s.earlyAccepted {
+			s.earlyHold = &earlyHold{} // the verdict still decides
+		}
 	}
 	if !e.sentAny {
 		s.early = nil
@@ -211,7 +234,17 @@ func (s *Session) earlyOutcome() *wire.Error {
 		s.closeWith(&SessionError{Kind: CloseEarlyRejected}, &closeFrame{code: wire.NoError})
 		return nil
 	}
-	a := &e.assumed
+	s.early = nil
+	if assumedBelow(&e.assumed, p) {
+		return wire.ErrParam("peer parameters below the assumed set")
+	}
+	s.earlyAdopt()
+	return nil
+}
+
+// assumedBelow reports whether the peer's parameters p admit less than the
+// set a the early sends assumed.
+func assumedBelow(a, p *wire.Params) bool {
 	below := p.InitialMaxData < a.InitialMaxData || p.MaxStreamsBidi < a.MaxStreamsBidi ||
 		p.MaxStreamDataBidiRem < a.MaxStreamDataBidiRem || p.MaxRecordSize < a.MaxRecordSize
 	if a.Has&wire.HasPreamble != 0 && (p.Has&wire.HasPreamble == 0 || p.Preamble < a.Preamble) {
@@ -221,12 +254,7 @@ func (s *Session) earlyOutcome() *wire.Error {
 		a.Has&wire.HasResetAt != 0 && p.Has&wire.HasResetAt == 0 {
 		below = true
 	}
-	s.early = nil
-	if below {
-		return wire.ErrParam("peer parameters below the assumed set")
-	}
-	s.earlyAdopt()
-	return nil
+	return below
 }
 
 // earlyAdopt raises the early streams' credit to the peer's values.

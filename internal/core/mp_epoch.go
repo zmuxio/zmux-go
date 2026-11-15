@@ -198,6 +198,7 @@ func (s *Session) commit(offerBody, answerBody []byte, ss [][]byte, localLoc, pe
 		e.peer = bytes.Clone(peerLoc)
 	}
 	if err := s.deriveEpochKeys(e); err != nil {
+		clear(e.secret) // never used: no copy of it stays
 		return err
 	}
 	ep.list = append(ep.list, e)
@@ -335,6 +336,9 @@ func (s *Session) epochJoined() {
 	}
 }
 
+// epochOfferCost is the frame budget a peer's new epoch offer takes.
+const epochOfferCost = 8
+
 // onSessionEpoch processes a SESSION_EPOCH frame received on p.
 func (s *Session) onSessionEpoch(p *Pipe, f *wire.Frame) *wire.Error {
 	m := s.mp
@@ -346,6 +350,14 @@ func (s *Session) onSessionEpoch(p *Pipe, f *wire.Frame) *wire.Error {
 	}
 	ep := &m.ep
 	e, phase := f.Seq, int(f.Status)
+	if phase == wire.EpochOffer && e > ep.d {
+		// A new offer costs a key exchange and a derivation per suite: a
+		// peer pays for the exchanges it starts, at most a few a second
+		// sustained (copies of an offer cost nothing).
+		if e != ep.d+1 || phase > ep.last {
+			s.chargeN(epochOfferCost)
+		}
+	}
 	pv := func(why string) *wire.Error {
 		return wire.NewError(wire.ProtocolViolation, "SESSION_EPOCH "+why, "epoch", e)
 	}

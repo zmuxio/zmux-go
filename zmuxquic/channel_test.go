@@ -14,6 +14,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 )
 
 // lossyRelay forwards UDP between one client and a server with a one-way
@@ -172,7 +173,7 @@ func lossLatencies(t *testing.T, d time.Duration, qconf *quic.Config, lanes int)
 			t.Fatal(err)
 		}
 	}
-	time.Sleep(sizeRefresh + 4*d)
+	time.Sleep(carrierio.DatagramSizeRefresh + 4*d)
 	r.drop.Store(2)
 	if _, err := st.Write(make([]byte, 32<<10)); err != nil {
 		t.Fatal(err)

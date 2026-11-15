@@ -101,9 +101,8 @@ func (l *Liveness) core() (core.Liveness, error) {
 // 0 included), and a derived DeadTimeout is zero, so that SetLiveness with
 // the result changes nothing.
 func (c *Conn) Liveness() Liveness {
-	c.lock()
-	cl := c.s.Liveness()
-	c.unlock()
+	var cl core.Liveness
+	c.locked(func() { cl = c.s.Liveness() })
 	off := func(d core.Duration) time.Duration {
 		if d == 0 {
 			return -1

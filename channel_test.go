@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/testscale"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
 )
@@ -284,13 +285,18 @@ func TestChannelDemuxSessions(t *testing.T) {
 }
 
 // A stream datagram sent on the channel right after the stream's opening
-// frame may overtake it; the receiver holds it until the stream opens.
+// frame may overtake it; the receiver holds it until the stream opens, for
+// at most one smoothed RTT (EXTENSIONS 6.8): on a loaded host the opening
+// may come later than that, and the datagram is then dropped and counted,
+// never lost unaccounted.
 func TestChannelStreamDatagramOvertakesOpening(t *testing.T) {
 	a, b := chanPair(t)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), testscale.D(10*time.Second))
 	defer cancel()
-	for i := range 20 {
+	const n = 20
+	delivered := 0
+	for i := range n {
 		st, err := c.OpenStream()
 		if err != nil {
 			t.Fatal(err)
@@ -298,22 +304,38 @@ func TestChannelStreamDatagramOvertakesOpening(t *testing.T) {
 		if _, err := st.Write([]byte{byte(i)}); err != nil {
 			t.Fatal(err)
 		}
-		for st.SendDatagram(0, []byte{byte(i)}) != nil {
+		if st.SendDatagram(0, []byte{byte(i)}) != nil {
 			t.Fatal("stream datagram refused")
 		}
 		in, err := s.AcceptStream(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, p, err := in.ReceiveDatagram(ctx)
-		if err != nil || len(p) != 1 || p[0] != byte(i) {
-			t.Fatalf("stream %d: %v %v", i, p, err)
+		// The datagram arrives, or its drop is counted.
+		for dropped := uint64(i - delivered); ; {
+			wctx, wcancel := context.WithTimeout(ctx, 10*time.Millisecond)
+			_, p, err := in.ReceiveDatagram(wctx)
+			wcancel()
+			if err == nil {
+				if len(p) != 1 || p[0] != byte(i) {
+					t.Fatalf("stream %d: datagram %v", i, p)
+				}
+				delivered++
+				break
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("stream %d: datagram neither delivered nor dropped", i)
+			}
+			if s.ConnectionStats().DatagramsDroppedRecv > dropped {
+				break
+			}
 		}
 		_ = st.Close()
 	}
-	if st := s.ConnectionStats(); st.DatagramsDroppedRecv != 0 || st.DatagramsReceivedChannel != 20 ||
+	st := s.ConnectionStats()
+	if delivered == 0 || st.DatagramsReceivedChannel != uint64(delivered) || st.DatagramsDroppedRecv != uint64(n-delivered) ||
 		st.DatagramsReceivedChannel > st.DatagramsReceived {
-		t.Fatalf("%+v", st)
+		t.Fatalf("delivered %d: %+v", delivered, st)
 	}
 }
 
@@ -389,5 +411,99 @@ func TestChannelOfBehindPrefix(t *testing.T) {
 		if channelOf(p) == nil {
 			t.Fatalf("framing %v: channel lost", framing)
 		}
+	}
+}
+
+// panicChanConn is a chanConn whose receiver registration panics.
+type panicChanConn struct{ *chanConn }
+
+func (panicChanConn) ReceiveChannelDatagrams(func([]byte)) func() { panic("register") }
+
+// A channel whose receiver registration panics fails its pipe, outside
+// the session's lock: the session ends and nothing deadlocks.
+func TestChannelRegistrationPanicFailsPipe(t *testing.T) {
+	a, b := chanPair(t)
+	ch := make(chan *Conn, 1)
+	go func() {
+		s, err := startServerNoListener(t.Context(), NetPipe(b), dgramCfg())
+		if err != nil {
+			s = nil
+		}
+		ch <- s
+	}()
+	c, err := Start(t.Context(), PipeIO{R: panicChanConn{a}, W: panicChanConn{a}}, RoleClient, dgramCfg())
+	if err == nil {
+		waitDone(t, c)
+	}
+	if s := <-ch; s != nil {
+		_ = s.Close()
+		waitDone(t, s)
+	}
+}
+
+// readGate is a chanConn whose reliable stream reads, once they have read,
+// wait while its gate is closed before they return; its channel datagrams
+// do not.
+type readGate struct {
+	*chanConn
+	gate atomic.Pointer[chan struct{}] // nil: reads return at once
+}
+
+func (g *readGate) Read(p []byte) (int, error) {
+	n, err := g.chanConn.Read(p)
+	if ch := g.gate.Load(); ch != nil {
+		<-*ch
+	}
+	return n, err
+}
+
+// TestChannelHeldDatagramExpires forces the ordering that drops a held
+// stream datagram: the stream's opening record reaches the receiver later
+// than one smoothed RTT after the datagram that overtook it. The datagram
+// is dropped and counted (EXTENSIONS 6.8); the stream itself opens.
+func TestChannelHeldDatagramExpires(t *testing.T) {
+	a, b := chanPair(t)
+	gb := &readGate{chanConn: b}
+	c, s := pair(t, a, gb, dgramCfg(), dgramCfg())
+	if got := exchangeDatagrams(t, c, s, 1, 10); got != 1 { // a measured, small RTT
+		t.Fatal("warm-up datagram lost")
+	}
+	gate := make(chan struct{})
+	gb.gate.Store(&gate)
+	st, err := c.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SendDatagram(0, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	// The record, read, waits behind the gate while the datagram that
+	// overtook it is held, until the hold (one smoothed RTT, the initial
+	// RTT before one is measured) expires and drops it.
+	for s.ConnectionStats().DatagramsDroppedRecv == 0 {
+		select {
+		case <-t.Context().Done():
+			t.Fatal("the held datagram never expired")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	gb.gate.Store(nil)
+	close(gate)
+	ctx, cancel := context.WithTimeout(t.Context(), testscale.D(5*time.Second))
+	defer cancel()
+	in, err := s.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, wcancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer wcancel()
+	if _, p, err := in.ReceiveDatagram(wctx); err == nil {
+		t.Fatalf("a datagram held past its RTT was delivered: %v", p)
+	}
+	if d := s.ConnectionStats().DatagramsDroppedRecv; d != 1 {
+		t.Fatalf("dropped %d, want 1", d)
 	}
 }

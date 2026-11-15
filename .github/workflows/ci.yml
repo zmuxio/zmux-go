@@ -60,7 +60,22 @@ jobs:
         run: go vet ./...
 
       - name: test
-        run: go test -race -count=1 ./...
+        # The JSON log keeps every test's output, also of a failure at the
+        # end of a package (a leak check after its last test); the console
+        # shows the results and what failed.
+        run: |
+          status=0
+          go test -race -count=1 -json ./... > "$RUNNER_TEMP/test.json" || status=$?
+          jq -rj 'select(.Action == "output" and (.Test == null or (.Output | test("^(ok|FAIL|--- FAIL|panic:|    |\\t)")))) | .Output' "$RUNNER_TEMP/test.json"
+          exit $status
+
+      - name: test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.module.name }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/test.json
+          if-no-files-found: ignore
 
   lint:
     name: golangci-lint (${{ matrix.module }})

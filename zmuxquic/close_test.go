@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,19 +124,5 @@ func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, rea
 	var qe *quic.ApplicationError
 	if err := context.Cause(sqc.Context()); !errors.As(err, &qe) || !qe.Remote || qe.ErrorCode != quic.ApplicationErrorCode(code) {
 		t.Fatalf("the peer's QUIC connection ended with %v, want application code %#x", err, uint64(code))
-	}
-}
-
-// pipeRelease withdraws its registration on the connection's context once
-// the pipe ended: the connection's end calls release no more.
-func TestPipeReleaseWithdraws(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	var n atomic.Int32
-	ended := pipeRelease(ctx, func() { n.Add(1) })
-	ended()
-	cancel()
-	time.Sleep(20 * time.Millisecond)
-	if got := n.Load(); got != 1 {
-		t.Fatalf("release called %d times", got)
 	}
 }

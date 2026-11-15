@@ -76,17 +76,17 @@ func (s *Session) oppSend(w *recWriter, f *Pipe, st *Stream) bool {
 	if s.now.Sub(e.sent) <= thr {
 		return true
 	}
-	st = s.streams[e.d.id]
+	st = s.sendOf(&e.d) // blockingFrame found it live
 	sp := &st.snd
 	ms := sp.mpState()
 	// The next part of the blocking data not acknowledged and not re-sent.
 	lo := max64(e.d.off, ms.acked.prefix())
 	hi := e.d.off + e.d.n
-	for _, r := range ms.oppSent {
+	ms.oppSent.each(func(r rng) {
 		if r.lo <= lo && lo < r.hi {
 			lo = r.hi
 		}
-	}
+	})
 	if lo < sp.preLen {
 		lo = 0
 	}
@@ -150,6 +150,9 @@ func (s *Session) blockingFrame(f *Pipe, st *Stream) (*Pipe, *retained) {
 				if st != nil && (e.d.id != id || lo < e.d.off || lo >= e.d.off+e.d.n) {
 					continue
 				}
+				if !s.sendsData(&e.d) {
+					continue // its stream ended: nothing of it blocks
+				}
 				if best == nil || e.sent < best.sent {
 					bp, best = q, e
 				}
@@ -161,6 +164,13 @@ func (s *Session) blockingFrame(f *Pipe, st *Stream) (*Pipe, *retained) {
 		return nil, nil
 	}
 	return bp, best
+}
+
+// sendsData reports whether a retained STREAM frame's stream still sends
+// data: not discarded, not reset, not yet terminal.
+func (s *Session) sendsData(d *frameDesc) bool {
+	st := s.sendOf(d)
+	return st != nil && !st.snd.reset && st.snd.state < sendDataRecvd
 }
 
 // penalize halves R_p, discards its samples and keeps new data off p until
@@ -200,8 +210,8 @@ func (s *Session) reinjectPenalized(p *Pipe) {
 			if e.d.kind != dStream || e.reinjected || e.penalized {
 				continue
 			}
-			st := s.streams[e.d.id]
-			if st == nil || !st.hasS || s.policyOf(st) != PolicyAffinity {
+			st := s.sendOf(&e.d)
+			if st == nil || s.policyOf(st) != PolicyAffinity {
 				continue
 			}
 			if m := st.snd.mps; m == nil || !m.bind.set || m.bind.pipe != p.id {

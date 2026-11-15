@@ -190,3 +190,70 @@ func TestRedialPolicyInvalidDecision(t *testing.T) {
 		t.Fatal("rejected decision not reported")
 	}
 }
+
+// TestTracerMayWait: Tracer callbacks may call Wait and Done; neither they
+// nor another Wait deadlock.
+func TestTracerMayWait(t *testing.T) {
+	var c *Conn
+	ready := make(chan struct{})
+	waited := make(chan struct{}, 2)
+	tr := &Tracer{
+		Event: func(Event) { <-ready; <-c.Done() },
+		Closed: func(error) {
+			<-ready
+			_ = c.Wait()
+			waited <- struct{}{}
+			<-c.Done()
+			waited <- struct{}{}
+		},
+	}
+	a, b := tcpPair(t)
+	c, _ = pair(t, a, b, &Config{Tracer: tr}, nil)
+	close(ready)
+	c.Abort(3, "bye")
+	waitDone(t, c)
+	for range 2 {
+		select {
+		case <-waited:
+		case <-time.After(10 * time.Second):
+			t.Fatal("Wait inside Tracer.Closed blocked")
+		}
+	}
+}
+
+// TestSlowTracerDoesNotDelayPick: a Tracer blocked in a callback delays
+// none of the scheduler's decisions.
+func TestSlowTracerDoesNotDelayPick(t *testing.T) {
+	pol := &pickLast{}
+	release := make(chan struct{})
+	defer close(release)
+	ccfg := mpConfig()
+	ccfg.Scheduler = SchedulerCustom(pol)
+	ccfg.Tracer = &Tracer{Established: func() { <-release }, Event: func(Event) { <-release }}
+	e := newMPEnv(t, ccfg, mpConfig())
+	_ = e.addPipe(t, PipeOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	got := make(chan int64, 1)
+	go func() {
+		s, err := e.server.AcceptStream(ctx)
+		var n int64
+		if err == nil {
+			n, _ = io.Copy(io.Discard, s)
+		}
+		got <- n
+	}()
+	s, err := e.client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(make([]byte, 64<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := <-got; n != 64<<10 || pol.calls.Load() == 0 {
+		t.Fatalf("the peer read %d bytes, Pick asked %d times, while the Tracer was blocked", n, pol.calls.Load())
+	}
+}

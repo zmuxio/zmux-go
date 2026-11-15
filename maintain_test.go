@@ -173,7 +173,7 @@ func TestMaintainPipesJoinMemberPipes(t *testing.T) {
 					}
 					p, err := c.AddPipe(ctx, io, o)
 					if err != nil {
-						closePipeIO(io)
+						ClosePipeIO(io)
 						return ps, err
 					}
 					ps = append(ps, p)
@@ -215,7 +215,7 @@ func TestMaintainPipesStopClosesReplacement(t *testing.T) {
 				}
 				p, err := c.AddPipe(ctx, pio, o)
 				if err != nil {
-					closePipeIO(pio)
+					ClosePipeIO(pio)
 					return nil, err
 				}
 				mu.Lock()

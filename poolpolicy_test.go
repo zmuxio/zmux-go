@@ -142,3 +142,19 @@ func TestMaintainPipesRecheck(t *testing.T) {
 		}
 	}
 }
+
+// TestRecheckAfter: a zero Recheck asks for no recheck beyond the pool's
+// own look; a positive one is floored at MinRecheck and capped by that look.
+func TestRecheckAfter(t *testing.T) {
+	for _, c := range []struct{ r, want time.Duration }{
+		{0, poolLook}, {time.Nanosecond, MinRecheck}, {30 * time.Millisecond, 30 * time.Millisecond}, {time.Hour, poolLook},
+	} {
+		d := PoolDecision{Recheck: c.r}
+		if got := d.RecheckAfter(); got != c.want {
+			t.Errorf("Recheck %v: RecheckAfter %v, want %v", c.r, got, c.want)
+		}
+	}
+	if err := (&PoolDecision{Recheck: -1}).Validate(); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("negative Recheck: %v", err)
+	}
+}

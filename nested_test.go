@@ -80,14 +80,37 @@ func TestNestedSession(t *testing.T) {
 
 func TestNestingLoopRefused(t *testing.T) {
 	a, b := new(Conn), new(Conn)
-	if err := nestPipe(a, outerRef{b}); err != nil {
+	if _, err := nestPipe(a, outerRef{b}); err != nil {
 		t.Fatal(err)
 	}
-	if err := nestPipe(b, outerRef{a}); !errors.Is(err, errNestingLoop) {
+	if _, err := nestPipe(b, outerRef{a}); !errors.Is(err, errNestingLoop) {
 		t.Fatalf("loop accepted: %v", err)
 	}
 	forgetNesting(a)
-	if err := nestPipe(b, outerRef{a}); err != nil {
+	if _, err := nestPipe(b, outerRef{a}); err != nil {
+		t.Fatal(err)
+	}
+	forgetNesting(b)
+}
+
+// TestNestEdgeDropAfterClose: an edge dropped after its session forgot
+// every edge (the session closed while a join or a retired pipe still held
+// one), or dropped twice, changes nothing and does not panic; the other
+// edges of a live session keep counting.
+func TestNestEdgeDropAfterClose(t *testing.T) {
+	a, b := new(Conn), new(Conn)
+	e1, _ := nestPipe(a, outerRef{b})
+	e2, _ := nestPipe(a, outerRef{b})
+	e1.drop()
+	e1.drop() // a second drop of one edge leaves the other's count
+	if _, err := nestPipe(b, outerRef{a}); !errors.Is(err, errNestingLoop) {
+		t.Fatal("a double drop released another holder's edge")
+	}
+	forgetNesting(a) // the session closed
+	e2.drop()        // the late exit of a join or a retired pipe
+	var none *nestEdge
+	none.drop()
+	if _, err := nestPipe(b, outerRef{a}); err != nil {
 		t.Fatal(err)
 	}
 	forgetNesting(b)
@@ -242,5 +265,38 @@ func TestPreamblePriority(t *testing.T) {
 	}
 	if _, _, ok := r2.PreamblePriority(); ok {
 		t.Fatal("PRIORITY reported for a stream that sent none")
+	}
+}
+
+// An edge dropped after its session's edges were forgotten leaves the
+// edges recorded since alone.
+func TestNestEdgeStaleDropAfterForget(t *testing.T) {
+	n, o := &Conn{}, &Conn{}
+	stale, err := nestPipe(n, outerRef{o})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgetNesting(n)
+	live, err := nestPipe(n, outerRef{o})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.drop()
+	nesting.mu.Lock()
+	out := nesting.edges[n]
+	got := 0
+	if out != nil {
+		got = out.n[o]
+	}
+	nesting.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("edges n -> o after a stale drop: %d, want 1", got)
+	}
+	live.drop()
+	nesting.mu.Lock()
+	_, left := nesting.edges[n]
+	nesting.mu.Unlock()
+	if left {
+		t.Fatal("edges remain after the last drop")
 	}
 }

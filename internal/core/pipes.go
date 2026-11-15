@@ -12,15 +12,15 @@ const (
 
 // CarrierInfo describes a carrier half to the core.
 type CarrierInfo struct {
-	// Channel is the carrier's datagram channel for the pipe,
-	// nil when it has none.
-	Channel Channel
 	// MaxRecord bounds the record size locally; 0: no bound.
 	MaxRecord int
 	// WriteOverhead is the fixed number of bytes each carrier write adds
 	// below the pipe (PipeIO.WriteOverhead), handed to the shaper factory.
 	WriteOverhead int
 	Framing       Framing
+	// Channel reports that the carrier has a datagram channel for the
+	// pipe; what it takes comes with PollChannel (ChannelUse).
+	Channel bool
 	// TLS: build records of at most 16382 bytes of frames.
 	TLS bool
 	// MinRTT reports whether the carrier provides a minimum RTT; without it
@@ -39,18 +39,14 @@ type CarrierInfo struct {
 	HalfClose bool
 }
 
-// Channel is a pipe carrier's datagram channel as the core uses it to
-// decide where a DATAGRAM frame goes; the driver sends what PollChannel
-// returns.
-type Channel interface {
-	// ChannelStreamID returns the Pipe Stream ID that starts the pipe's
-	// channel datagrams; ok is false where the channel names the pipe
-	// itself (HTTP/3).
-	ChannelStreamID() (id uint64, ok bool)
-	// MaxChannelDatagram returns the largest channel datagram, Pipe Stream
-	// ID included, that the channel takes now; 0 while it has none. It is
-	// called under the session lock and must not block.
-	MaxChannelDatagram() int
+// ChannelUse is what a pipe's datagram channel takes now, as the driver
+// read it from the channel outside the lock (PollChannel): the core never
+// calls the host's channel, and decides where a DATAGRAM frame goes from
+// the last reading.
+type ChannelUse struct {
+	Room  int    // the largest channel datagram, Pipe Stream ID included; 0: none now
+	ID    uint64 // the Pipe Stream ID that starts the pipe's channel datagrams
+	HasID bool   // false where the channel names the pipe itself (HTTP/3)
 }
 
 // Pipe is one attachment.
@@ -62,6 +58,7 @@ type Pipe struct {
 	sh   *pipeShape // nil: not shaped
 	// chSig wakes the sender of the carrier's datagram channel.
 	chSig *Signal
+	chUse ChannelUse // the channel's last reading (PollChannel)
 	id    uint64
 	// lastTraffic is when a record with a traffic frame
 	// was last produced or completely received on the pipe.
@@ -202,7 +199,7 @@ func (s *Session) AttachBootstrap(in, out CarrierInfo, writer *Signal) *Pipe {
 	p.out = &outDir{lanes: []*outLane{{info: out, confirmed: true}}, sig: writer}
 	p.out.lo.offered = out.Lanes
 	s.pipes = append(s.pipes, p)
-	if l := &s.cfg.Local; l.Has&wire.HasDatagram != 0 && (out.Channel != nil || l.Has&wire.HasMultipath != 0) {
+	if l := &s.cfg.Local; l.Has&wire.HasDatagram != 0 && (out.Channel || l.Has&wire.HasMultipath != 0) {
 		// A pipe carrier can have a datagram channel: the bootstrap's, or
 		// one a multipath session joins.
 		l.Has |= wire.HasCarrierDatagrams
@@ -269,7 +266,7 @@ func (s *Session) SetWritable(pipe, lane uint64, writable bool, now Time) {
 	if s.ack != nil {
 		e := &p.out.snd.re
 		e.blockedNow = !writable
-		if !writable && s.dataPending(ol) {
+		if !writable && s.dataPendingOn(p, ol) {
 			e.blocked()
 		}
 	}

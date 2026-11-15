@@ -15,14 +15,17 @@ import (
 type ChannelDemux struct{ d carrierio.ChannelDemux }
 
 // Register hands the datagrams for Pipe Stream ID id to deliver until stop
-// is called; a later Register of the same ID replaces it.
+// is called; a later Register of the same ID replaces it. deliver takes
+// the frame over, as zmux.DatagramChannel's deliver does.
 func (d *ChannelDemux) Register(id uint64, deliver func(frame []byte)) (stop func()) {
 	return d.d.Register(id, deliver)
 }
 
 // Deliver routes one channel datagram to the pipe its Pipe Stream ID
-// names; one that names no registered pipe (unknown, not yet attached, or
-// closed) or whose ID is truncated is dropped and counted.
+// names, handing the pipe's deliver the bytes of b after the ID: Deliver
+// takes b over, and its caller must not reuse them. One that names no
+// registered pipe (unknown, not yet attached, or closed) or whose ID is
+// truncated is dropped and counted.
 func (d *ChannelDemux) Deliver(b []byte) { d.d.Deliver(b) }
 
 // Dropped returns the datagrams Deliver dropped because they named no

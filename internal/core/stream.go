@@ -1,6 +1,8 @@
 package core
 
 import (
+	"slices"
+
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
 )
@@ -47,6 +49,7 @@ type Stream struct {
 
 	rsig *Signal
 	wsig *Signal
+	dsig *Signal // stream datagrams (dgramChanged)
 
 	// Scheduler and control links.
 	sch     schedLink
@@ -121,8 +124,7 @@ type streamExt struct {
 	reqIncr        bool
 	prioApplied    bool
 
-	capSig *Signal // a WaitSendCapacity waiter
-	capMin uint64
+	capWait bool // in Session.capWaiters (WaitSendCapacity)
 }
 
 func (st *Stream) x() *streamExt {
@@ -249,8 +251,9 @@ func (st *Stream) Bidi() bool { return st.bidi }
 // and the carrier handshake has not completed.
 func (st *Stream) Replayable() bool { return st.replayable }
 
-// SetSignals installs the waiter slots of the handle.
-func (st *Stream) SetSignals(r, w *Signal) { st.rsig, st.wsig = r, w }
+// SetSignals installs the waiter slots of the handle: the core wakes them
+// (sendChanged, recvChanged) whenever what its waiters wait for changed.
+func (st *Stream) SetSignals(r, w, d *Signal) { st.rsig, st.wsig, st.dsig = r, w, d }
 
 func typeIndex(bidi bool) int {
 	if bidi {
@@ -310,18 +313,24 @@ func (s *Session) openErr() error {
 }
 
 // WaitOpen registers sig until credit for an open of this type may exist.
+// A waiter that asks again keeps its place (FIFO).
 func (s *Session) WaitOpen(bidi bool, sig *Signal) {
 	t := typeIndex(bidi)
-	s.openW[t] = append(s.openW[t], sig)
+	if !slices.Contains(s.openW[t], sig) {
+		s.openW[t] = append(s.openW[t], sig)
+	}
 }
 
 // OpenersWaiting reports application openers waiting for stream credit.
 func (s *Session) OpenersWaiting(bidi bool) bool { return len(s.openW[typeIndex(bidi)]) > 0 }
 
 // CancelOpenWait removes sig from the open waiters.
+// The waiter's turn passes on: it is called when its open succeeded, as
+// when it gave up.
 func (s *Session) CancelOpenWait(bidi bool, sig *Signal) {
 	t := typeIndex(bidi)
 	s.openW[t] = removeSig(s.openW[t], sig)
+	s.wakeOpeners()
 }
 
 func removeSig(l []*Signal, sig *Signal) []*Signal {
@@ -335,11 +344,12 @@ func removeSig(l []*Signal, sig *Signal) []*Signal {
 	return l
 }
 
+// wakeOpeners is the one entry of the open waiters: while credit is left
+// it wakes the first waiter (FIFO), which re-checks; the next one is woken
+// when the first leaves the queue (CancelOpenWait), opened or not.
 func (s *Session) wakeOpeners() {
 	for t := range 2 {
 		if s.loc[t].reserved < s.loc[t].limit && len(s.openW[t]) > 0 {
-			// FIFO: wake the first waiter; it re-checks and the next one is
-			// woken when it gets its credit.
 			s.wake(s.openW[t][0])
 		}
 	}
@@ -351,6 +361,7 @@ func (s *Session) newStream(bidi, local bool) *Stream {
 	st.hasR = !local || bidi
 	if st.hasR {
 		st.rcv.relLo = 1<<62 - 1
+		st.rcv.buf.pin = &s.conn.pins
 	}
 	return st
 }
@@ -533,10 +544,11 @@ func (s *Session) Flush(st *Stream) (uint64, error) {
 		return 0, ErrInvalid
 	case s.err != nil:
 		return 0, s.err
-	case st.opened && sp.sent >= sp.q.end:
+	case st.opened && sp.sent >= sp.q.end && !sp.cancelledLocally():
 		// Everything written already left (the scheduler sends without a
-		// Flush): a STOP_SENDING or reset that came since is reported by the
-		// next operation, as FlushDone does.
+		// Flush): a STOP_SENDING or peer reset that came since is reported
+		// by the next operation, as FlushDone does. A local CancelWrite
+		// fails the Flush that follows it.
 		return sp.q.end, nil
 	case sp.errState != nil:
 		return 0, sp.errState
@@ -562,7 +574,7 @@ func (s *Session) Flush(st *Stream) (uint64, error) {
 // it), or the stream or session failed (err). What was sent counts even if
 // a STOP_SENDING or reset arrived afterwards: that error is reported by the
 // next operation, not by the Flush it overtook.
-func (s *Session) FlushDone(st *Stream, target uint64, sig *Signal) (bool, error) {
+func (s *Session) FlushDone(st *Stream, target uint64) (bool, error) {
 	sp := &st.snd
 	switch {
 	case st.opened && sp.sent >= min64(target, sp.q.end):
@@ -574,7 +586,6 @@ func (s *Session) FlushDone(st *Stream, target uint64, sig *Signal) (bool, error
 	case s.firstHeld:
 		return true, nil
 	}
-	st.wsig = sig
 	return false, nil
 }
 

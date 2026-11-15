@@ -5,8 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -14,6 +12,7 @@ import (
 	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
@@ -27,40 +26,14 @@ import (
 // with the connection's current maximum, and nothing is sent.
 var sizeProbe = make([]byte, 1<<16)
 
-// sizeRefresh bounds how stale a channel's maximum may be.
-const sizeRefresh = time.Second
-
-var epoch = time.Now()
-
-// dgramSize is a channel's current maximum, learned from refused sends.
-type dgramSize struct {
-	max      atomic.Int64
-	probedAt atomic.Int64
-}
-
-// get returns the maximum less overhead, probing at most once per
-// sizeRefresh; probe sends sizeProbe, which a connection without datagrams
-// refuses for another reason.
-func (d *dgramSize) get(overhead int, probe func() error) int {
-	now := int64(time.Since(epoch))
-	if last := d.probedAt.Load(); last != 0 && now-last < int64(sizeRefresh) {
-		return int(d.max.Load())
-	}
-	if !d.learn(probe(), overhead) {
-		d.max.Store(0)
-	}
-	// After the result: a concurrent caller that sees a recent probe reads it.
-	d.probedAt.Store(now)
-	return int(d.max.Load())
-}
-
-// learn takes the maximum from a send refused for size.
-func (d *dgramSize) learn(err error, overhead int) bool {
+// tooLarge returns the maximum a send refused for size reports, less
+// overhead.
+func tooLarge(err error, overhead int) (int64, bool) {
 	tl, ok := errors.AsType[*quic.DatagramTooLargeError](err)
-	if ok {
-		d.max.Store(max(tl.MaxDatagramPayloadSize-int64(overhead), 0))
+	if !ok {
+		return 0, false
 	}
-	return ok
+	return tl.MaxDatagramPayloadSize - int64(overhead), true
 }
 
 // ---- HTTP/3 request streams ----
@@ -79,7 +52,7 @@ type h3Stream interface {
 type h3Channel struct {
 	str      h3Stream
 	settings http3.Settingser
-	size     dgramSize
+	size     carrierio.DatagramSize
 }
 
 // newH3Channel returns the channel of str, whose HTTP/3 connection's
@@ -92,7 +65,9 @@ func newH3Channel(str h3Stream, s http3.Settingser) *h3Channel {
 // request stream itself.
 func (c *h3Channel) ChannelStreamID() (uint64, bool) { return 0, false }
 
-// MaxChannelDatagram is the largest HTTP Datagram payload the stream takes.
+// MaxChannelDatagram is the largest HTTP Datagram payload the stream takes,
+// refreshed at most once per carrierio.DatagramSizeRefresh by an oversized
+// send the connection refuses without sending it.
 func (c *h3Channel) MaxChannelDatagram() int {
 	select {
 	case <-c.settings.ReceivedSettings():
@@ -102,7 +77,7 @@ func (c *h3Channel) MaxChannelDatagram() int {
 	if !c.settings.Settings().EnableDatagrams {
 		return 0
 	}
-	return c.size.get(c.overhead(), func() error { return c.str.SendDatagram(sizeProbe) })
+	return c.size.Get(func() (int64, bool) { return tooLarge(c.str.SendDatagram(sizeProbe), c.overhead()) })
 }
 
 // overhead is the Quarter Stream ID before the payload.
@@ -111,7 +86,9 @@ func (c *h3Channel) overhead() int { return quicvarint.Len(uint64(c.str.StreamID
 // SendChannelDatagram sends an HTTP Datagram of the stream.
 func (c *h3Channel) SendChannelDatagram(b []byte) error {
 	err := c.str.SendDatagram(b)
-	c.size.learn(err, c.overhead())
+	if n, ok := tooLarge(err, c.overhead()); ok {
+		c.size.Set(n)
+	}
 	return err
 }
 
@@ -124,7 +101,7 @@ func (c *h3Channel) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 			if err != nil {
 				return
 			}
-			deliver(b)
+			deliver(b) // a fresh slice: deliver takes it over
 		}
 	})
 	return cancel
@@ -185,7 +162,7 @@ type wtChannel struct {
 	sess     *webtransport.Session
 	demux    carrier.ChannelDemux
 	recvOnce sync.Once
-	size     dgramSize
+	size     carrierio.DatagramSize
 }
 
 var wtChannels sync.Map // *webtransport.Session -> *wtChannel
@@ -205,17 +182,21 @@ func wtChannelOf(sess *webtransport.Session) *wtChannel {
 // that precedes each of its datagrams.
 const wtOverhead = 8
 
+// maxDatagram is the largest datagram payload the session takes,
+// refreshed as an HTTP/3 channel's is.
 func (c *wtChannel) maxDatagram() int {
 	st := c.sess.SessionState().ConnectionState
 	if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
 		return 0
 	}
-	return c.size.get(wtOverhead, func() error { return c.sess.SendDatagram(sizeProbe) })
+	return c.size.Get(func() (int64, bool) { return tooLarge(c.sess.SendDatagram(sizeProbe), wtOverhead) })
 }
 
 func (c *wtChannel) send(b []byte) error {
 	err := c.sess.SendDatagram(b)
-	c.size.learn(err, wtOverhead)
+	if n, ok := tooLarge(err, wtOverhead); ok {
+		c.size.Set(n)
+	}
 	return err
 }
 
@@ -227,7 +208,7 @@ func (c *wtChannel) register(id uint64, deliver func([]byte)) func() {
 				if err != nil {
 					return
 				}
-				c.demux.Deliver(b)
+				c.demux.Deliver(b) // a fresh slice: the demux takes it over
 			}
 		})
 	})

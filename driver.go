@@ -26,7 +26,7 @@ type pipeDrv struct {
 	opener LaneOpener      // nil: the carrier offers no lanes
 	maxRec int             // the pipe's local record limit (carrierRecordLimit), applied to every lane
 	tcp    tcpInfo         // the TCP socket under the carrier, if any
-	outer  outerRef        // the outer session of a stream-backed carrier
+	nest   *nestEdge       // the nesting edge of a stream-backed carrier (nil: none)
 	gs     pipeGoroutines  // the attachment's goroutines (HandlePipe waits on them)
 	lctx   context.Context // the goroutine labels of the pipe (labels.go)
 
@@ -37,10 +37,18 @@ type pipeDrv struct {
 	inLanes []io.ReadCloser     // inbound lanes above 0
 
 	// The carrier's datagram channel (nil: none) and its sender.
-	ch     DatagramChannel
-	chSig  *core.Signal
-	chEnd  chan struct{}
-	chOnce sync.Once
+	ch    DatagramChannel
+	chSig *core.Signal
+	chEnd chan struct{}
+	// chReady is closed once the channel's receiver is registered: the
+	// first record waits for it.
+	chReady chan struct{}
+	chOnce  sync.Once
+
+	// graceT is the abort bound of a graceful close (closeGraceful), with
+	// the lanes it aborts (graceAb); under smu.
+	graceT  *time.Timer
+	graceAb []Aborter
 
 	smu      sync.Mutex // leaf: shutdown request of lane 0
 	shutdown bool
@@ -95,17 +103,41 @@ func (l *laneOut) close(abort bool) {
 // its own to wait for them: ended is closed when the count drops to zero
 // (lock level L3).
 type pipeGoroutines struct {
-	ended chan struct{}
-	n     int
-	mu    sync.Mutex
+	ended  chan struct{}
+	n      int
+	mu     sync.Mutex
+	sealed bool // seal: no goroutine joins any more
 }
 
 func (g *pipeGoroutines) add() {
 	g.mu.Lock()
+	g.addLocked()
+	g.mu.Unlock()
+}
+
+func (g *pipeGoroutines) addLocked() {
 	if g.n == 0 {
 		g.ended = make(chan struct{})
 	}
 	g.n++
+}
+
+// tryAdd counts one more goroutine unless the count was sealed.
+func (g *pipeGoroutines) tryAdd() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.sealed {
+		return false
+	}
+	g.addLocked()
+	return true
+}
+
+// seal refuses every later tryAdd: a wait that starts after it covers
+// every goroutine the count will ever have.
+func (g *pipeGoroutines) seal() {
+	g.mu.Lock()
+	g.sealed = true
 	g.mu.Unlock()
 }
 
@@ -162,21 +194,15 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 		_, lanes = p.R.(LaneOpener)
 	}
 	_, half := p.W.(CloseWriter)
-	half = half || p.R == nil || p.W == nil || !sameHalf(p.R, p.W)
+	half = half || p.R == nil || p.W == nil || !carrierio.SameHalf(p.R, p.W)
 	info := core.CarrierInfo{HalfClose: half, Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
 		Lanes: lanes, QueueBound: lowWater, WriteOverhead: p.WriteOverhead, MaxRecord: carrierRecordLimit(p)}
-	if ch := channelOf(p); ch != nil {
-		info.Channel = ch
-	}
+	info.Channel = channelOf(p) != nil
 	return info
 }
 
 // newPipeDrv prepares the driver of an attachment (under the lock).
-//
-// Every PipeIO that becomes part of a session comes through here once, so this
-// is where the padding of the handshake run on it is metered.
 func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
-	c.s.ShapeSpendHandshake(p.HandshakePadding)
 	pd := &pipeDrv{c: c, id: id, hc: newHalfCloser(p), framing: p.Framing, wsig: core.NewSignal(), lctx: c.pipeLabels(id)}
 	pd.end = &pipeEnd{retired: make(chan struct{})}
 	pd.end.drv.Store(pd)
@@ -198,7 +224,13 @@ func (pd *pipeDrv) adopt(q PipeIO) {
 }
 
 // startPipeLocked starts the goroutines of an attachment.
+//
+// Every PipeIO that becomes part of a session starts here once, so this is
+// where the padding of the handshake run on it is metered: an attachment
+// that fails before (a join not confirmed) spends nothing.
 func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool) {
+	c.s.ShapeSpendHandshake(pd.hc.io.HandshakePadding)
+	pd.hc.take(pd.closeAll)
 	c.pipes[pd.id] = pd
 	for _, x := range []any{pd.hc.io.W, pd.hc.io.R} {
 		if cc, ok := x.(CarrierConner); ok {
@@ -229,9 +261,13 @@ func (c *Conn) startWriterLocked(pd *pipeDrv) {
 	pd.wstop, pd.wdone = false, done
 	c.wg.Add(1)
 	pd.gs.add()
+	ready := pd.chReady
 	labels.Go(pd.lctx, "write", func() {
 		defer pd.gs.done()
 		defer close(done)
+		if ready != nil {
+			<-ready // the channel's receiver is registered (startChannel)
+		}
 		c.writeLoop(pd, 0, pd.wsig, nil)
 	})
 }
@@ -239,8 +275,7 @@ func (c *Conn) startWriterLocked(pd *pipeDrv) {
 // addBootstrap attaches pipe 0 and starts its goroutines (under the lock).
 func (c *Conn) addBootstrap(p PipeIO) {
 	pd := c.newPipeDrv(0, p)
-	pd.outer = outerOf(p)
-	_ = nestPipe(c, pd.outer) // a new session cannot form a loop
+	pd.nest, _ = nestPipe(c, outerOf(p)) // a new session cannot form a loop
 	low := pd.tcp.setLowWater(singleLowWater)
 	info := carrierInfo(p, pd.tcp, low)
 	c.s.AttachBootstrap(info, info, pd.wsig)
@@ -261,11 +296,12 @@ func (c *Conn) bootstrapExporter(pd *pipeDrv, lane uint64) *lateExporter {
 	return c.exp
 }
 
-// readLoop feeds what a carrier half delivers into the core. It never
-// waits for anything but the carrier (its handshake, its early-data
-// verdict), so reads never wait behind writes.
-// A quiet pipe blocks on a small buffer and holds no pooled
-// read buffer.
+// readLoop feeds what a carrier half delivers into the core: the bytes of
+// a byte stream, or the messages of a message carrier (FramingRecords),
+// each of at most MaxRecordSize bytes. It never waits for anything but the
+// carrier (its handshake, its early-data verdict), so reads never wait
+// behind writes. A quiet byte stream blocks on a small buffer and holds no
+// pooled read buffer.
 func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 	defer c.wg.Done()
 	defer func() {
@@ -273,38 +309,46 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 			c.fail(p)
 		}
 	}()
+	var mr MessageReader
 	if pd.framing == FramingRecords {
-		c.readMessages(pd, lane, r)
-		return
+		var ok bool
+		if mr, ok = r.(MessageReader); !ok {
+			mr = noMessages{}
+		}
 	}
 	exp := c.bootstrapExporter(pd, lane)
 	first := true
 	var small [idleBufSize]byte
 	var buf *core.Buf
+	var msg []byte
 	used := 0
 	reads := 0
 	for {
 		var n int
 		var err error
-		if buf == nil {
+		switch {
+		case mr != nil:
+			msg, err = mr.ReadMessage(MaxRecordSize)
+		case buf == nil:
 			n, err = r.Read(small[:])
 			if n > 0 {
 				buf = getReadBuf()
 				copy(buf.B, small[:n])
 				used = n
 			}
-		} else {
+		default:
 			n, err = r.Read(buf.B[used:])
 			used += n
 		}
-		if first && n > 0 {
+		got := n > 0 || mr != nil && err == nil
+		if first && got {
 			first = false
 			c.awaitVerdict(pd, lane)
 		}
-		if exp != nil && n > 0 {
+		if exp != nil && got {
 			if lerr := exp.load(c.done); lerr != nil {
 				// What was read waited for a handshake that failed.
-				err, used = lerr, 0
+				err, used, msg = lerr, 0, nil
 			}
 			exp = nil
 		}
@@ -314,12 +358,15 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 		func() {
 			c.lock()
 			defer c.unlock()
-			if pd.dead {
+			if pd.dead { // replaced (an early-data restart): its ID is another pipe's now
 				dead = true
 				return
 			}
 			now := c.clk.now()
-			if used > 0 {
+			switch {
+			case mr != nil && err == nil:
+				c.s.ReceiveMessage(pd.id, lane, &core.Buf{B: msg}, msg, now)
+			case used > 0:
 				consumed = c.s.Receive(pd.id, lane, buf, buf.B[:used], now)
 			}
 			if err != nil {
@@ -337,6 +384,7 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 				}
 			}
 		}()
+		msg = nil
 		if dead {
 			if buf != nil {
 				buf.Unref()
@@ -381,47 +429,12 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 	}
 }
 
-// readMessages reads a message-framed carrier.
-func (c *Conn) readMessages(pd *pipeDrv, lane uint64, r io.Reader) {
-	mr, ok := r.(MessageReader)
-	exp := c.bootstrapExporter(pd, lane)
-	first := true
-	for {
-		var msg []byte
-		var err error
-		if ok {
-			msg, err = mr.ReadMessage()
-		} else {
-			err = errors.New("zmux: Records framing needs a MessageReader")
-		}
-		if first && err == nil {
-			first = false
-			c.awaitVerdict(pd, lane)
-		}
-		if exp != nil && err == nil {
-			err = exp.load(c.done)
-			exp = nil
-		}
-		func() {
-			c.lock()
-			defer c.unlock()
-			now := c.clk.now()
-			if err == nil {
-				c.s.ReceiveMessage(pd.id, lane, &core.Buf{B: msg}, msg, now)
-			} else {
-				var cause error
-				if !errors.Is(err, io.EOF) {
-					cause = err
-				}
-				c.s.PipeEnded(pd.id, lane, cause == nil, false, cause, now)
-			}
-		}()
-		c.passDatagrams()
-		if err != nil {
-			pd.hc.closeRead()
-			return
-		}
-	}
+// noMessages is the message source of a Records carrier whose receiving
+// half reads no messages: it fails the pipe.
+type noMessages struct{}
+
+func (noMessages) ReadMessage(int) ([]byte, error) {
+	return nil, errors.New("zmux: Records framing needs a MessageReader")
 }
 
 // writeLoop produces batches for one outbound lane and writes them. It owns
@@ -735,11 +748,17 @@ func (c *Conn) doAction(pa pendingAct) {
 		}
 	case core.ActOpenLane:
 		if start {
-			labels.Go(pd.lctx, "lane-open", func() { c.openLane(pd) })
+			if !c.goSide(pd.lctx, "lane-open", func() { c.openLane(pd) }) {
+				c.wg.Done() // the session ended: no lane opens
+			}
 		} else if pd.opener == nil {
-			c.mu.Lock()
-			c.s.LaneOpenFailed(pd.id)
-			c.mu.Unlock()
+			// A full critical section: the wakes and actions the failure
+			// produces run now, and a panic poisons the session.
+			func() {
+				c.lock()
+				defer c.unlock()
+				c.s.LaneOpenFailed(pd.id)
+			}()
 		}
 	case core.ActResetLane:
 		if lo != nil {
@@ -749,7 +768,19 @@ func (c *Conn) doAction(pa pendingAct) {
 }
 
 // closeAll aborts every half and lane of the attachment.
-func (pd *pipeDrv) closeAll() { pd.closeHalves(true) }
+func (pd *pipeDrv) closeAll() {
+	pd.smu.Lock()
+	t := pd.graceT
+	pd.smu.Unlock()
+	if t != nil {
+		// Closed gracefully before: the abort the bound holds runs now.
+		if t.Stop() {
+			pd.graceAbort()
+		}
+		return
+	}
+	pd.closeHalves(true)
+}
 
 // closeGraceful closes every half and lane of the attachment without
 // aborting: the write sides end as a close, never as a reset. A carrier
@@ -757,14 +788,30 @@ func (pd *pipeDrv) closeAll() { pd.closeHalves(true) }
 // Section 6.5 step 4): a close never leaves the carrier's work unbounded.
 func (pd *pipeDrv) closeGraceful(bound time.Duration) {
 	lanes := pd.closeHalves(false)
-	time.AfterFunc(bound, func() {
-		pd.hc.abort(net.ErrClosed)
-		for _, l := range lanes {
-			if a, ok := l.w.(Aborter); ok {
-				a.Abort(net.ErrClosed)
-			}
+	pd.smu.Lock()
+	defer pd.smu.Unlock()
+	if pd.graceT != nil {
+		return
+	}
+	for _, l := range lanes {
+		if a, ok := l.w.(Aborter); ok {
+			pd.graceAb = append(pd.graceAb, a)
 		}
-	})
+	}
+	// Host clock: a bound on carrier IO (Time). Nothing tells when the
+	// carrier's own close work ends, so the abort runs at the bound (on a
+	// carrier that already ended it does nothing), or earlier when the
+	// attachment is aborted meanwhile (closeAll).
+	pd.graceT = time.AfterFunc(bound, pd.graceAbort)
+}
+
+// graceAbort aborts what closeGraceful closed: the pipe's write side and
+// its lanes.
+func (pd *pipeDrv) graceAbort() {
+	pd.hc.abort(net.ErrClosed)
+	for _, a := range pd.graceAb {
+		a.Abort(net.ErrClosed)
+	}
 }
 
 // closeHalves closes every half and lane of the attachment and returns the
@@ -772,14 +819,16 @@ func (pd *pipeDrv) closeGraceful(bound time.Duration) {
 func (pd *pipeDrv) closeHalves(abort bool) []*laneOut {
 	pd.endChannel()
 	pd.hc.closeAll(abort, net.ErrClosed)
-	pd.c.mu.Lock()
-	lanes := make([]*laneOut, 0, len(pd.lanes))
-	for _, l := range pd.lanes {
-		lanes = append(lanes, l)
-	}
-	in := pd.inLanes
-	pd.inLanes = nil
-	pd.c.mu.Unlock()
+	var lanes []*laneOut
+	var in []io.ReadCloser
+	pd.c.peek(func() {
+		lanes = make([]*laneOut, 0, len(pd.lanes))
+		for _, l := range pd.lanes {
+			lanes = append(lanes, l)
+		}
+		in = pd.inLanes
+		pd.inLanes = nil
+	})
 	for _, l := range lanes {
 		l.close(abort)
 	}
@@ -827,9 +876,7 @@ func (c *Conn) releaseOrphansLocked() {
 	for h := c.orphans.head.Swap(nil); h != nil; {
 		next := h.orphanNext
 		h.orphanNext = nil
-		if !h.released {
-			h.release()
-		}
+		h.released(c.s.Release(h.st))
 		h = next
 	}
 }

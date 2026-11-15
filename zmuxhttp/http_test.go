@@ -123,7 +123,7 @@ func TestHTTPPipeSendOnlyStatus(t *testing.T) {
 func TestBodyPipe(t *testing.T) {
 	leakcheck.Check(t)
 	p := newBodyPipe()
-	w := &httpReqWriter{p: p, cancel: func() {}}
+	w := &httpReqWriter{p: p, call: settledCall(), cancel: func() {}}
 	bufs := [][]byte{[]byte("ab"), nil, []byte("cdefg"), []byte("h")}
 	done := make(chan error, 1)
 	go func() {
@@ -155,7 +155,7 @@ func TestBodyPipe(t *testing.T) {
 
 	// The reader gives up: a blocked write fails with its error.
 	p = newBodyPipe()
-	w = &httpReqWriter{p: p, cancel: func() {}}
+	w = &httpReqWriter{p: p, call: settledCall(), cancel: func() {}}
 	stop := errors.New("refused")
 	go func() { time.Sleep(10 * time.Millisecond); p.closeRead(stop) }()
 	if _, err := w.WriteBuffers([][]byte{[]byte("x")}); !errors.Is(err, stop) {
@@ -163,7 +163,7 @@ func TestBodyPipe(t *testing.T) {
 	}
 	// The writer aborts: a blocked read fails with its error.
 	p = newBodyPipe()
-	w = &httpReqWriter{p: p, cancel: func() {}}
+	w = &httpReqWriter{p: p, call: settledCall(), cancel: func() {}}
 	go func() { time.Sleep(10 * time.Millisecond); w.Abort(stop) }()
 	if _, err := p.read(buf, nil); !errors.Is(err, stop) {
 		t.Fatalf("read after the writer aborted: %v", err)
@@ -234,4 +234,11 @@ func TestSplitJoinHandlerLifetime(t *testing.T) {
 	if st, _ := p.Stats(); st.Carrier != zmux.CarrierSplit {
 		t.Fatalf("carrier %v", st.Carrier)
 	}
+}
+
+// settledCall is the call of a request whose response already came.
+func settledCall() *httpCall {
+	c := &httpCall{done: make(chan struct{})}
+	close(c.done)
+	return c
 }

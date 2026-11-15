@@ -10,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
@@ -119,7 +118,6 @@ var (
 // any time.
 type PacketStream struct {
 	st   *Stream
-	dsig *core.Signal
 	wbuf []byte // capsule header being written (under wmu)
 	werr error  // the write side's capsule framing broke (under wmu)
 	rerr error  // the read side ended for good (under rmu)
@@ -161,7 +159,7 @@ func NewPacketStream(st *Stream, opts *PacketOptions) (*PacketStream, error) {
 	if o.MaxPacket == 0 {
 		o.MaxPacket = DefaultMaxPacket
 	}
-	return &PacketStream{st: st, max: o.MaxPacket, policy: o.Policy, dsig: core.NewSignal()}, nil
+	return &PacketStream{st: st, max: o.MaxPacket, policy: o.Policy}, nil
 }
 
 // WritePacket sends a packet with Context ID contextID (0 when the
@@ -217,10 +215,10 @@ func (p *PacketStream) writeCapsule(ctx context.Context, cx uint64, b []byte) er
 	}
 	p.wbuf = appendCapsuleHeader(p.wbuf[:0], cx, len(b))
 	h := p.st.h
-	n, err := h.writeCtx(ctx, p.wbuf)
+	n, err := h.write(ctx, p.wbuf)
 	if err == nil {
 		var m int
-		m, err = h.writeCtx(ctx, b)
+		m, err = h.write(ctx, b)
 		n += m
 	}
 	if err != nil {
@@ -272,7 +270,7 @@ func (p *PacketStream) ReadPacket(ctx context.Context, buf []byte) (Packet, erro
 			// datagram goes first.
 			p.ch.Release()
 			p.off = 0
-			cx, d, ok, err := h.waitPacket(ctx, p.dsig)
+			cx, d, ok, err := h.waitPacket(ctx)
 			if err != nil {
 				return Packet{}, err
 			}
@@ -476,40 +474,23 @@ func parseCapsuleHeader(b []byte, limit int) (h capsuleHeader, need int, err err
 
 // waitPacket waits until the stream has a datagram (returned, ok true) or
 // bytes or its end to read (ok false).
-func (h *handle) waitPacket(ctx context.Context, dsig *core.Signal) (uint64, []byte, bool, error) {
+func (h *handle) waitPacket(ctx context.Context) (uint64, []byte, bool, error) {
 	h.rmu.Lock()
 	defer h.rmu.Unlock()
+	h.dmu.Lock()
+	defer h.dmu.Unlock()
 	c := h.c
-	for {
-		c.lock()
-		cx, d, ok := c.s.RecvStreamDatagram(h.st)
-		var n uint64
-		var end bool
-		if !ok {
-			n, end = c.s.ReadReady(h.st)
-			if n == 0 && !end {
-				h.rsig.Drain()
-				c.s.WaitRead(h.st, &h.rsig)
-				dsig.Drain()
-				c.s.WaitStreamDatagram(h.st, dsig)
-			}
+	var cx uint64
+	var d []byte
+	var ok bool
+	err := h.awaitRead(ctx, true, func() (bool, error) {
+		if cx, d, ok = c.s.RecvStreamDatagram(h.st); ok {
+			return true, nil
 		}
-		c.unlock()
-		if ok {
-			return cx, d, true, nil
-		}
-		if n > 0 || end {
-			return 0, nil, false, nil
-		}
-		select {
-		case <-h.rsig.C:
-		case <-dsig.C:
-		case <-ctx.Done():
-			return 0, nil, false, ctx.Err()
-		case <-h.rwait():
-			return 0, nil, false, os.ErrDeadlineExceeded
-		}
-	}
+		n, end := c.s.ReadReady(h.st)
+		return n > 0 || end, nil
+	})
+	return cx, d, ok, err
 }
 
 // tryPacket returns a queued stream datagram without waiting.
@@ -519,41 +500,4 @@ func (h *handle) tryPacket() (uint64, []byte, bool) {
 	h.c.lock()
 	defer h.c.unlock()
 	return h.c.s.RecvStreamDatagram(h.st)
-}
-
-// writeCtx writes all of p (copied), waiting for room until ctx ends or
-// the write deadline passes.
-func (h *handle) writeCtx(ctx context.Context, p []byte) (int, error) {
-	h.wmu.Lock()
-	defer h.wmu.Unlock()
-	c := h.c
-	total := 0
-	for total < len(p) {
-		c.lock()
-		c.s.SetNow(c.clk.now())
-		n, err := c.s.Write(h.st, p[total:], false)
-		total += n
-		wait := err == nil && total < len(p)
-		if wait {
-			h.wsig.Drain()
-			c.s.WaitWrite(h.st, &h.wsig)
-		}
-		c.unlock()
-		if err != nil {
-			return total, apiErr(err)
-		}
-		if !wait {
-			break
-		}
-		select {
-		case <-h.wsig.C:
-		case <-ctx.Done():
-			h.endWait()
-			return total, ctx.Err()
-		case <-h.wwait():
-			h.endWait()
-			return total, os.ErrDeadlineExceeded
-		}
-	}
-	return total, nil
 }

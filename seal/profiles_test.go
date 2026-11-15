@@ -42,7 +42,7 @@ func echo1(t *testing.T, cp, sp zmux.PipeIO) {
 			t.Fatal("not a message carrier")
 		}
 		go func() { _ = w.WriteMessage(msg) }()
-		got, err := r.ReadMessage()
+		got, err := r.ReadMessage(zmux.MaxRecordSize)
 		if err != nil || !bytes.Equal(got, msg) {
 			t.Fatalf("read %q: %v", got, err)
 		}

@@ -27,8 +27,8 @@ func TestQueuedOnSlowCarrier(t *testing.T) {
 	idle := s.pipes[0]
 	measuredRate(p, 1e6)
 	measuredRate(idle, 1e6)
-	if s.eta(p, 1000) <= s.eta(idle, 1000) {
-		t.Fatalf("ETA on the slow pipe %v, on the idle one %v", s.eta(p, 1000), s.eta(idle, 1000))
+	if etaOf(s, p) <= etaOf(s, idle) {
+		t.Fatalf("ETA on the slow pipe %v, on the idle one %v", etaOf(s, p), etaOf(s, idle))
 	}
 	var req PickRequest
 	s.TakePick(&req)
@@ -111,4 +111,11 @@ func TestQueueDelaySnapshotsRate(t *testing.T) {
 	if got := s.queueDelay(p.mp); got != 200*Millisecond {
 		t.Fatalf("queue_p %v, want the 200 ms of the handover", got)
 	}
+}
+
+// etaOf is ETA_p(1000) worked out alone.
+func etaOf(s *Session, p *Pipe) float64 {
+	pr, _ := p.mp.effPrio()
+	t := s.fastestOf(pr)
+	return s.eta(p, 1000, s.owdBase(), &t)
 }

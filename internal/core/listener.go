@@ -31,7 +31,7 @@ func Classify(b []byte, maxRecord uint64) (Class, int) {
 	if len(b) == 0 {
 		return ClassMore, 0
 	}
-	if b[0] == join.ProfileJoin {
+	if join.IsHello(b) {
 		return ClassJoin, 0
 	}
 	size, n := varint.ConsumeVarint(b)

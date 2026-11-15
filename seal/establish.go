@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/seal/proto"
 	"github.com/zmuxio/zmux-go/shaping"
@@ -118,18 +119,28 @@ func (c *ClientConfig) profile(withPSK bool) (proto.Profile, error) {
 // Establish runs the client's handshake on p and returns the carrier for zmux.Start. On
 // a failure p is closed, and nothing is retried: a different choice is a new carrier.
 func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.PipeIO, err error) {
-	stop := context.AfterFunc(ctx, func() { closeCarrier(p) })
+	// The bound and every failure close p through one closer: once. q is
+	// a layer over p, so it ends with p.
+	own := carrierio.NewCloser(p.R, p.W)
+	stop := context.AfterFunc(ctx, own.Close)
 	defer func() {
 		if !stop() && err == nil {
-			err = context.Cause(ctx)
-			closeCarrier(q)
+			err = context.Cause(ctx) // the bound closed p
 		}
 		if err != nil {
 			if ctx.Err() != nil && !errors.Is(err, ErrNoReply) {
 				err = context.Cause(ctx)
 			}
-			closeCarrier(p)
+			own.Close()
 			q = zmux.PipeIO{}
+		}
+	}()
+	// The AppData source, the Signer and the Anchor are host code: a panic
+	// in one fails the handshake (and closes p above) instead of the
+	// process. Deferred after the cleanup, so it runs first.
+	defer func() {
+		if r := recover(); r != nil {
+			err = hostPanic(r)
 		}
 	}()
 	if cfg.Anchor == nil && !cfg.AllowPSKOnly {
@@ -434,15 +445,6 @@ func framingOf(p zmux.PipeIO) proto.Framing {
 	return proto.Stream
 }
 
-func closeCarrier(p zmux.PipeIO) {
-	if p.W != nil {
-		_ = p.W.Close()
-	}
-	if p.R != nil && any(p.R) != any(p.W) {
-		_ = p.R.Close()
-	}
-}
-
 func writeUnit(p zmux.PipeIO, b []byte) error {
 	if p.Framing == zmux.FramingRecords {
 		mw, ok := p.W.(zmux.MessageWriter)
@@ -472,7 +474,7 @@ func (u *unitReader) fill() error {
 		if !ok {
 			return errors.New("seal: Records framing needs a MessageReader")
 		}
-		m, err := mr.ReadMessage()
+		m, err := mr.ReadMessage(zmux.MaxRecordSize)
 		if err != nil {
 			return err
 		}

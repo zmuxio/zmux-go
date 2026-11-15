@@ -9,7 +9,6 @@ import (
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
-	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -76,18 +75,18 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 		loserDialer = a.dialer
 	}
 	// Commit the existing drain state before returning; no separate waiter is needed.
-	lose.lock()
-	lose.s.SetNow(lose.clk.now())
-	lose.s.Shutdown(0, nil)
-	lose.unlock()
+	lose.locked(func() {
+		lose.s.SetNow(lose.clk.now())
+		lose.s.Shutdown(0, nil)
+	})
 	res := DuplicateResult{Survivor: win, Loser: lose}
 	if o.Rejoin && o.Dial != nil && loserDialer == EndpointLocal && win.ConnectionState().Multipath && win.joinReady() {
-		res.RejoinStarted = true
-		labels.Go(win.lctx, "duplicate-rejoin", func() {
+		res.RejoinStarted = win.goSide(win.lctx, "duplicate-rejoin", func() {
 			clk := win.clk.source()
 			ctx, cancel := timeshim.WithDeadline(win.ctx, clk, clk.Now().Add(win.cfg.joinTimeout()))
 			defer cancel()
-			if p, err := o.Dial(ctx); err == nil {
+			var p PipeIO
+			if err := hostCall(win.cfg.Logger, "DuplicateOptions.Dial", func() error { var err error; p, err = o.Dial(ctx); return err }); err == nil {
 				_, _ = win.AddPipe(ctx, p, PipeOptions{})
 			}
 		})

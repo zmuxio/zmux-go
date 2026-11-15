@@ -38,9 +38,9 @@ func (lateTimer) Reset(time.Duration) bool { return false }
 // its closes.
 type msgHalf struct{ closed atomic.Int32 }
 
-func (h *msgHalf) Read([]byte) (int, error)     { return 0, nil }
-func (h *msgHalf) ReadMessage() ([]byte, error) { return []byte("m"), nil }
-func (h *msgHalf) Close() error                 { h.closed.Add(1); return nil }
+func (h *msgHalf) Read([]byte) (int, error)        { return 0, nil }
+func (h *msgHalf) ReadMessage(int) ([]byte, error) { return []byte("m"), nil }
+func (h *msgHalf) Close() error                    { h.closed.Add(1); return nil }
 
 // TestPeekMessageLateTimer reads a first message while the peek timer
 // fires: the peek reports the timeout only after the timer's interruption

@@ -92,9 +92,24 @@ func (s *Session) dataPendingOn(p *Pipe, ol *outLane) bool {
 	return false
 }
 
+// dataBlockedDue and streamsBlockedDue are the one test of whether a
+// DATA_BLOCKED or STREAMS_BLOCKED goes out: pending and still at the limit
+// it names (writeControl sends exactly when controlPending reports it).
+func (s *Session) dataBlockedDue() bool {
+	return s.pend.dataBlocked && s.conn.blocked == s.conn.sendMax+1
+}
+
+func (s *Session) streamsBlockedDue(t int) bool {
+	return s.pend.streamsBlocked[t] && s.loc[t].blocked == s.loc[t].limit+1
+}
+
+func (s *Session) blockedDue() bool {
+	return s.dataBlockedDue() || s.streamsBlockedDue(0) || s.streamsBlockedDue(1)
+}
+
 func (s *Session) controlPending() bool {
-	if s.pend.maxData || s.pend.maxStreams[0] || s.pend.maxStreams[1] || s.pend.dataBlocked ||
-		s.pend.streamsBlocked[0] || s.pend.streamsBlocked[1] || s.pend.goaway || s.ctlHead != nil {
+	if s.pend.maxData || s.pend.maxStreams[0] || s.pend.maxStreams[1] || s.blockedDue() ||
+		s.pend.goaway || s.ctlHead != nil {
 		return true
 	}
 	if s.ping.wants() {
@@ -105,8 +120,6 @@ func (s *Session) controlPending() bool {
 	}
 	return s.dg != nil && s.dg.sendable(s)
 }
-
-func (s *Session) dataPending(_ *outLane) bool { return s.dataPendingOn(nil, nil) }
 
 // canSendNow reports whether the stream could put a frame out now; it uses
 // the same plan as sendChunk so that write interest never spins (W8).
@@ -144,14 +157,14 @@ func (s *Session) planResend(st *Stream) (chunkPlan, bool) {
 	m := sp.mps
 	var p chunkPlan
 	p.resend = true
-	for len(m.resend) > 0 {
-		r := m.resend[0]
+	for m.resend.len() > 0 {
+		r := m.resend.first()
 		lo, hi := max64(r.lo, sp.q.base), min64(r.hi, sp.q.end)
 		if sp.reset {
 			hi = min64(hi, sp.resetRel)
 		}
 		if lo >= hi {
-			m.resend = m.resend[1:]
+			m.resend.popFirst()
 			continue
 		}
 		p.off, p.n = lo, min64(hi-lo, maxStreamFrame)
@@ -173,7 +186,7 @@ func (s *Session) planResend(st *Stream) (chunkPlan, bool) {
 func (s *Session) planChunk(st *Stream) chunkPlan {
 	sp := &st.snd
 	var p chunkPlan
-	if m := sp.mps; m != nil && (len(m.resend) > 0 || m.finResend) {
+	if m := sp.mps; m != nil && (m.resend.len() > 0 || m.finResend) {
 		if rp, ok := s.planResend(st); ok {
 			return rp
 		}
@@ -270,13 +283,17 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 			s.writeControl(&w, p)
 		}
 		s.writeData(&w, p, ol)
-		if lane == 0 && (s.pend.dataBlocked || s.pend.streamsBlocked[0] || s.pend.streamsBlocked[1] || s.ctlHead != nil) {
+		if lane == 0 && (s.blockedDue() || s.ctlHead != nil) {
 			s.writeControl(&w, p)
 		}
 		s.shapeInject(&w)
 	}
 	if w.oversize {
+		// The session fails: what the batch took is not handed to a carrier.
 		s.FailInternal("a frame exceeds the record limit")
+		w.b.release()
+		w.b.reset()
+		return false
 	}
 	w.end()
 	w.chargeGate()
@@ -293,7 +310,7 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 	}
 	s.afterBatch(&w, p, ol)
 	if s.ack != nil {
-		if (w.budget < 1024 || w.capped || w.dataHeld()) && s.dataPending(ol) {
+		if (w.budget < 1024 || w.capped || w.dataHeld()) && s.dataPendingOn(p, ol) {
 			p.out.snd.re.blocked() // the write runs, or the limiter holds, while more data waits
 		} else {
 			p.out.snd.re.appLimited(p.out.snd.so)
@@ -426,7 +443,13 @@ func (s *Session) SetCarrierRetransmitted(pipe, n uint64) {
 		d.lossAt, d.lossSent, d.lossRetrans = s.now, sent, n
 		return
 	}
-	if s.now.Sub(d.lossAt) < lossSampleGap || sent <= d.lossSent {
+	if sent < d.lossSent {
+		// The lanes' total moved back (a lane went): a new baseline,
+		// or the rate would stall until the old total came back.
+		d.lossAt, d.lossSent, d.lossRetrans = s.now, sent, n
+		return
+	}
+	if s.now.Sub(d.lossAt) < lossSampleGap || sent == d.lossSent {
 		return
 	}
 	x := float64(n-min64(n, d.lossRetrans)) / float64(sent-d.lossSent)
@@ -760,7 +783,7 @@ func (s *Session) writeControl(w *recWriter, p *Pipe) {
 		}
 		st = next
 	}
-	if s.pend.dataBlocked && s.conn.blocked == s.conn.sendMax+1 {
+	if s.dataBlockedDue() {
 		v := s.conn.sendMax
 		if !w.frame(1+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendDataBlocked(b, v) }) {
 			return
@@ -769,7 +792,7 @@ func (s *Session) writeControl(w *recWriter, p *Pipe) {
 	}
 	s.pend.dataBlocked = false
 	for t := range 2 {
-		if s.pend.streamsBlocked[t] && s.loc[t].blocked == s.loc[t].limit+1 {
+		if s.streamsBlockedDue(t) {
 			v := s.loc[t].limit
 			if !w.frame(1+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendStreamsBlocked(b, t == 0, v) }) {
 				return
@@ -786,7 +809,6 @@ func (s *Session) writeControl(w *recWriter, p *Pipe) {
 		}
 		w.logFrame(frameDesc{kind: dGoAway})
 		s.pend.goaway = false
-		s.goawaySent()
 	}
 	s.writePing(w)
 	if s.dg != nil {
@@ -1118,21 +1140,18 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		sp.finSent = true
 		sp.state = sendDataSent
 	}
-	if st.ext != nil && st.ext.capSig != nil {
-		s.checkCapacity(st)
-	}
 	switch {
 	case s.feat.Multipath:
 		sp.mpState()
-		s.wake(st.wsig)
+		s.sendChanged(st)
 	case s.holdSends():
 		// Carrier early data: the bytes stay until the verdict.
-		s.wake(st.wsig)
+		s.sendChanged(st)
 	default:
 		h := s.heldEnter(st)
 		sp.q.release(sp.sent)
 		s.heldLeave(st, h)
-		s.wake(st.wsig)
+		s.sendChanged(st)
 		if fin {
 			s.sendTerminal(st, sendDataRecvd)
 		}

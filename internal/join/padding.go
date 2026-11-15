@@ -66,7 +66,8 @@ func ReplyPlainLen(p ReplyPayload) (int, error) {
 // TagLen is the AEAD tag length of the Suite.
 func (s *Suite) TagLen() int { return s.AEAD.TagLen() }
 
-func framingLen(f Framing) int {
+// FramingLen is the length prefix a unit has under f.
+func FramingLen(f Framing) int {
 	if f == Stream {
 		return lenPrefix
 	}
@@ -76,13 +77,13 @@ func framingLen(f Framing) int {
 // HelloWire is the length on the wire of a Hello with plain bytes of plaintext.
 func (j *Joiner) HelloWire(plain int) int {
 	s := j.cfg.Suite
-	return 1 + varint.SizeVarint(s.ID) + 1 + 1 + len(j.cfg.Locator) + s.NonceLen + framingLen(j.cfg.Framing) + plain + s.TagLen()
+	return 1 + varint.SizeVarint(s.ID) + 1 + 1 + len(j.cfg.Locator) + s.NonceLen + FramingLen(j.cfg.Framing) + plain + s.TagLen()
 }
 
 // ReplyWire is the length on the wire of a Reply with plain bytes of plaintext.
 func (a *Acceptor) ReplyWire(plain int) int {
 	s := a.c.suite
-	return 1 + s.NonceLen + framingLen(a.c.f) + plain + s.TagLen()
+	return 1 + s.NonceLen + FramingLen(a.c.f) + plain + s.TagLen()
 }
 
 // HelloRoom is the bytes of items a Hello with plain bytes of plaintext can
@@ -94,7 +95,7 @@ func (j *Joiner) HelloRoom(plain int) int { return HandshakeFloor - j.HelloWire(
 func (a *Acceptor) ReplyRoom(plain int) int { return HandshakeFloor - a.ReplyWire(plain) }
 
 // WireLen is the length on the wire of a parsed Hello.
-func (h *Hello) WireLen(f Framing) int { return len(h.clear) + framingLen(f) + len(h.Ciphertext) }
+func (h *Hello) WireLen(f Framing) int { return len(h.clear) + FramingLen(f) + len(h.Ciphertext) }
 
 // ConfirmWire is the length on the wire of the Confirm without zero bytes, and
 // the zero bytes it can hold; 0, 0 in Bound.
@@ -102,10 +103,10 @@ func (j *Joiner) ConfirmWire() (w, room int) {
 	switch j.cfg.Mode {
 	case Sealed:
 		t := j.cfg.Suite.TagLen()
-		return framingLen(j.cfg.Framing) + t, HandshakeFloor - framingLen(j.cfg.Framing) - t
+		return FramingLen(j.cfg.Framing) + t, HandshakeFloor - FramingLen(j.cfg.Framing) - t
 	case Trusted:
 		h := j.cfg.Suite.Hash.Size()
-		return framingLen(j.cfg.Framing) + h, HandshakeFloor - framingLen(j.cfg.Framing) - h
+		return FramingLen(j.cfg.Framing) + h, HandshakeFloor - FramingLen(j.cfg.Framing) - h
 	default:
 		return 0, 0
 	}

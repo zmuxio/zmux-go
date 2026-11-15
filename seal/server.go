@@ -100,7 +100,25 @@ type ServerConfig struct {
 
 // WrapPipe runs the server's side of Establish on a new carrier. A carrier whose first
 // byte is 02 is a Join and passes on untouched; any other first byte is refused.
-func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.PipeHint) (zmux.PipeIO, error) {
+func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.PipeHint) (q zmux.PipeIO, err error) {
+	// The Gate, AppData, Signer and AllowRecordMode are host code that an
+	// unauthenticated peer reaches: a panic in any of them rejects the
+	// carrier (gate_error), as an Anchor's does, and ends nothing else.
+	defer func() {
+		if r := recover(); r != nil {
+			q, err = zmux.PipeIO{}, &zmux.RejectError{Reason: "gate_error", Err: hostPanic(r)}
+		}
+	}()
+	return c.wrapPipe(ctx, p, hint)
+}
+
+// hostPanic is the error of a host callback that panicked; not the value,
+// which may hold secrets.
+func hostPanic(r any) error {
+	return fmt.Errorf("%w: a host callback panicked (%T)", errGate, r)
+}
+
+func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.PipeHint) (zmux.PipeIO, error) {
 	accepted, err := c.accepted()
 	if err != nil {
 		return zmux.PipeIO{}, err
@@ -245,8 +263,8 @@ func (c *ServerConfig) WrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 			Credential: third.Credential, PeerAppData: slices.Clone(peer.AppData), LocalContext: c.LocalContext}
 		v, pq, err := judge(ctx, c.ClientAnchor, in, third.Proof, c.RequirePQAuth)
 		if e := ctx.Err(); e != nil {
-			// Cancelled during or right after Verify: not a refusal.
-			closeCarrier(p)
+			// Cancelled during or right after Verify: not a refusal (the
+			// caller closes the carrier, as on every other failure).
 			return zmux.PipeIO{}, e
 		}
 		if errors.Is(err, ErrVerifyUnavailable) {
@@ -334,19 +352,14 @@ func protocolError(err error) bool {
 // reasonOf is the local reject reason of a failure: the error class of
 // the protocol, or a finer local reason.
 func reasonOf(err error) string {
+	if n, ok := proto.ErrorClass(err); ok {
+		return n // the one table of the handshake's error classes
+	}
 	for _, c := range []struct {
 		err  error
 		name string
 	}{
-		{proto.ErrMalformed, "malformed"}, {proto.ErrTrailing, "trailing_bytes"},
-		{proto.ErrUnknownProfile, "unknown_profile"}, {proto.ErrBadFlags, "bad_flags"},
-		{proto.ErrBadHandle, "bad_handle"}, {proto.ErrAuth, "auth"}, {proto.ErrKex, "kex"},
-		{proto.ErrPeerIsSelf, "peer_is_self"}, {proto.ErrTooLarge, "too_large"},
-		{proto.ErrTLVTruncated, "tlv_truncated"}, {proto.ErrTLVNonMinimal, "tlv_non_minimal"},
-		{proto.ErrTLVOrder, "tlv_order"}, {proto.ErrTLVUnknownCritical, "tlv_unknown_critical"},
-		{proto.ErrTLVCredentials, "tlv_credentials"}, {proto.ErrInvalidConfig, "invalid_config"},
 		{ErrProof, "proof"}, {ErrPQAuthRequired, "pq_auth_required"}, {ErrNotPinned, "not_pinned"},
-		{ErrCredentialsFailed, "credentials_failed"},
 		{errProfile, "profile_disabled"}, {errMode, "record_mode"},
 		{errEarly, "early_data"}, {errBinding, "binding_unavailable"}, {errHandle, "unknown_handle"},
 		{errGate, "gate_error"}, {errCommit, "commit"},

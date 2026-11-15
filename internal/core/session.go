@@ -58,7 +58,6 @@ type Session struct {
 	greaseFirst    bool
 	closedEmitted  bool
 	preSuspend     State // the state before the suspension, restored at its end
-	earlyHeld      bool  // provisional sends wait for the carrier's verdict
 	firstHeld      bool  // pipe 0 writes nothing until ReleaseFirstFlight
 	earlyAccepted  bool
 	carrierEarlyIn bool // the bootstrap carrier delivers early data not yet confirmed by its handshake
@@ -92,6 +91,7 @@ type Session struct {
 	dg                *dgramState
 	budget            budget
 	early             *earlyState
+	earlyHold         *earlyHold // provisional sends held after the early flight (holdSends)
 	pipes             []*Pipe    // pipe 0 first
 	mp                *multiPath // nil unless multipath is in use
 	ack               *ackState
@@ -338,6 +338,7 @@ func (s *Session) isClosing() bool { return s.state >= StateClosing }
 func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	s.peer = *p
 	s.peerSeen = true
+	s.wakeCapacityWaiters() // an unopened stream's credit is the peer's initial window
 	s.peerZmux = p.IsZmux()
 	l := &s.cfg.Local
 	s.feat = Features{}
@@ -659,24 +660,39 @@ func (s *Session) hasLiveOutbound() bool {
 	return slices.ContainsFunc(s.pipes, s.canCarryClose)
 }
 
-// wakeAll queues every waiter of the session (close, GOAWAY).
-func (s *Session) wakeStream(st *Stream) {
-	s.wake(st.rsig)
-	s.wake(st.wsig)
-	if st.dg != nil {
-		s.wake(st.dg.sig)
-	}
+// sendChanged, recvChanged and streamChanged are the only ways the core
+// wakes a stream's waiters (the handle's slots, SetSignals): every change of
+// what a part's waiter waits for goes through them. sendChanged: the
+// sending part's room, credit, progress or end changed (a writer, a
+// Flush, a capacity wait). recvChanged: the receiving part has bytes, its
+// end or an error. dgramChanged: the stream's datagram queue has one, or
+// ended.
+// streamChanged: both parts and the stream's datagram flow (the stream's
+// end, the session's end, GOAWAY). Each direction has its own slot, so a
+// change of one part never wakes the other part's waiter.
+func (s *Session) sendChanged(st *Stream) { s.wake(st.wsig) }
+
+func (s *Session) recvChanged(st *Stream) { s.wake(st.rsig) }
+
+func (s *Session) dgramChanged(st *Stream) { s.wake(st.dsig) }
+
+func (s *Session) streamChanged(st *Stream) {
+	s.recvChanged(st)
+	s.sendChanged(st)
+	s.dgramChanged(st)
 }
 
+// wakeStreams wakes the waiters of every stream (the session's end).
 func (s *Session) wakeStreams() {
 	for _, st := range s.streams {
-		s.wakeStream(st)
+		s.streamChanged(st)
 	}
 	for _, st := range s.provisional {
-		s.wakeStream(st)
+		s.streamChanged(st)
 	}
 }
 
+// wakeAll queues every waiter of the session (close, GOAWAY).
 func (s *Session) wakeAll() {
 	s.wakeStreams()
 	for i := range 2 {

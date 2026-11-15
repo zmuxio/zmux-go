@@ -4,11 +4,10 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
@@ -22,22 +21,15 @@ import (
 // with the connection's current maximum, and nothing is sent.
 var sizeProbe = make([]byte, 1<<16)
 
-// sizeRefresh bounds how stale the maximum a channel reports may be: the
-// path MTU, and with it the maximum, may grow.
-const sizeRefresh = 250 * time.Millisecond
-
 // connChannel is the datagram channel of one QUIC connection.
 type connChannel struct {
 	qc       *quic.Conn
 	demux    carrier.ChannelDemux
 	recvOnce sync.Once
-	max      atomic.Int64 // largest QUIC datagram payload; 0: none
-	probedAt atomic.Int64 // monotonic nanoseconds of the last probe
+	size     carrierio.DatagramSize // largest QUIC datagram payload; 0: none
 }
 
 var connChannels sync.Map // *quic.Conn -> *connChannel
-
-var epoch = time.Now()
 
 // channelOf returns the datagram channel of qc, created on first use and
 // forgotten when qc ends.
@@ -54,36 +46,34 @@ func channelOf(qc *quic.Conn) *connChannel {
 
 // maxDatagram returns the largest QUIC datagram payload the connection
 // takes now, 0 while datagrams are not negotiated, refreshed at most once
-// per sizeRefresh. A probe does not block and sends nothing.
+// per carrierio.DatagramSizeRefresh. A probe does not block and sends
+// nothing.
 func (c *connChannel) maxDatagram() int {
-	now := int64(time.Since(epoch))
-	if last := c.probedAt.Load(); last != 0 && now-last < int64(sizeRefresh) {
-		return int(c.max.Load())
-	}
-	st := c.qc.ConnectionState()
-	if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
-		c.max.Store(0)
-		return 0
-	}
-	c.learn(c.qc.SendDatagram(sizeProbe))
-	// The probe time is published after the maximum it produced, so a
-	// concurrent caller never reads a fresh time with a stale maximum.
-	c.probedAt.Store(now)
-	return int(c.max.Load())
+	return c.size.Get(func() (int64, bool) {
+		st := c.qc.ConnectionState()
+		if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
+			return 0, false
+		}
+		return tooLarge(c.qc.SendDatagram(sizeProbe))
+	})
 }
 
-// learn takes the current maximum from a refused datagram.
-func (c *connChannel) learn(err error) {
-	if tl, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
-		c.max.Store(max(tl.MaxDatagramPayloadSize, 0))
+// tooLarge returns the maximum a datagram refused for size reports.
+func tooLarge(err error) (int64, bool) {
+	tl, ok := errors.AsType[*quic.DatagramTooLargeError](err)
+	if !ok {
+		return 0, false
 	}
+	return tl.MaxDatagramPayloadSize, true
 }
 
 // send sends one QUIC datagram; it blocks while the connection's datagram
 // queue is full.
 func (c *connChannel) send(b []byte) error {
 	err := c.qc.SendDatagram(b)
-	c.learn(err)
+	if n, ok := tooLarge(err); ok {
+		c.size.Set(n)
+	}
 	return err
 }
 
@@ -100,7 +90,7 @@ func (c *connChannel) register(id uint64, deliver func([]byte)) func() {
 				if err != nil {
 					return
 				}
-				c.demux.Deliver(b)
+				c.demux.Deliver(b) // a fresh slice: the demux takes it over
 			}
 		})
 	})

@@ -25,20 +25,17 @@ type handle struct {
 	dl         atomic.Pointer[deadlines] // nil until a deadline is set
 	rsig       core.Signal               // lazy: its channel is made by the first wait
 	wsig       core.Signal
+	dsig       core.Signal // the stream's datagrams
+	dmu        sync.Mutex  // serialises datagram reads (lock level L0, after rmu)
 	rmu        sync.Mutex
 	wmu        sync.Mutex
-
-	// Guarded by the session lock.
-	sendDone, recvDone, released bool
 }
 
 // newHandle makes the handle of st (under the lock).
 func (c *Conn) newHandle(st *core.Stream) *handle {
 	h := &handle{c: c, st: st}
 	c.handles++
-	st.SetSignals(&h.rsig, &h.wsig)
-	h.sendDone = !st.Bidi() && !st.Local()
-	h.recvDone = !st.Bidi() && st.Local()
+	st.SetSignals(&h.rsig, &h.wsig, &h.dsig)
 	return h
 }
 
@@ -88,23 +85,27 @@ func (h *handle) setDeadline(read, write bool, t time.Time) {
 	if write {
 		d.w.set(t, h.c.clk.source())
 	}
-	h.c.lock()
-	if read {
-		h.rsig.FireLocked()
-	}
-	if write {
-		h.wsig.FireLocked()
-	}
-	h.c.unlock()
+	// The one wake of a slot outside the core: deadlines are the handle's
+	// own condition, which the core knows nothing of.
+	h.c.locked(func() {
+		if read {
+			h.rsig.FireLocked()
+			h.dsig.FireLocked()
+		}
+		if write {
+			h.wsig.FireLocked()
+		}
+	})
 }
 
-// release releases the core stream of a handle not yet released (under
-// the lock).
-func (h *handle) release() {
-	h.released = true
-	h.c.handles--
-	h.c.s.Release(h.st)
-	h.stopDeadlines()
+// released ends the handle's share of the session once the core released
+// its stream (Session.Release, ReleaseSend, ReleaseRecv, Reject report it),
+// under the lock.
+func (h *handle) released(now bool) {
+	if now {
+		h.c.handles--
+		h.stopDeadlines()
+	}
 }
 
 func (h *handle) stopDeadlines() {
@@ -114,12 +115,88 @@ func (h *handle) stopDeadlines() {
 	}
 }
 
-// maybeRelease releases the core stream once the application is done with
-// both directions (under the lock).
-func (h *handle) maybeReleaseLocked() {
-	if h.sendDone && h.recvDone && !h.released {
-		h.release()
+// ---- waiting ----
+
+// waitOn runs try under the session lock until it reports done or fails,
+// waiting between tries for the core to wake one of the handle's slots
+// (a, and b when given: what the try waits for changed), ctx or the
+// deadline dl. A try that is not done is followed, under the same lock,
+// by drain: it empties the slots of tokens fired for changes the try
+// already saw, so a change after the unlock wakes them again, and a lazy
+// slot gets its channel only once a wait needs it. When the critical
+// section panics the session is closed (unlock) and its error returned.
+// It returns the try's error as the API's, or (cut) the end of ctx or dl.
+func (h *handle) waitOn(ctx context.Context, a, b *core.Signal, dl func() chan struct{}, try func() (bool, error), wait func()) (cut bool, err error) {
+	c := h.c
+	done := ctx.Done()
+	for {
+		var ok, ran bool
+		c.locked(func() {
+			if ok, err = try(); !ok && err == nil {
+				a.Drain()
+				if b != nil {
+					b.Drain()
+				}
+				if wait != nil {
+					wait()
+				}
+			}
+			ran = true
+		})
+		switch {
+		case !ran:
+			return false, c.closedErr()
+		case ok || err != nil:
+			return false, apiErr(err)
+		}
+		var bc <-chan struct{}
+		if b != nil {
+			bc = b.C
+		}
+		select {
+		case <-a.C:
+		case <-bc:
+		case <-done:
+			return true, ctx.Err()
+		case <-dl():
+			return true, os.ErrDeadlineExceeded
+		}
 	}
+}
+
+// awaitRead waits for the receiving part (and with dgram for the stream's
+// datagrams too) as waitOn does, within the read deadline. Every read that
+// waits goes through it.
+func (h *handle) awaitRead(ctx context.Context, dgram bool, try func() (bool, error)) error {
+	var b *core.Signal
+	if dgram {
+		b = &h.dsig
+	}
+	_, err := h.waitOn(ctx, &h.rsig, b, h.rwait, try, nil)
+	return err
+}
+
+// awaitWrite waits for the sending part as waitOn does, within the write
+// deadline. With room, a try that is not done waits for send-buffer room:
+// the stream counts as a waiting writer (core WaitWrite) until the core
+// ends that wait (the write took its last byte, failed, found room or the
+// part ended), or this does when ctx or the deadline cut it. Every write
+// that waits goes through it; the caller holds wmu, so no other write
+// shares the slot.
+func (h *handle) awaitWrite(ctx context.Context, room bool, try func() (bool, error)) error {
+	c := h.c
+	var wait func()
+	if room {
+		wait = func() { c.s.WaitWrite(h.st) }
+	}
+	cut, err := h.waitOn(ctx, &h.wsig, nil, h.wwait, func() (bool, error) {
+		c.s.SetNow(c.clk.now())
+		return try()
+	}, wait)
+	if cut && room {
+		c.locked(func() { c.s.EndWaitWrite(h.st) }) // the one end of the wait the core cannot see
+	}
+	return err
 }
 
 // ---- reading ----
@@ -128,36 +205,24 @@ func (h *handle) read(p []byte) (int, error) {
 	h.rmu.Lock()
 	defer h.rmu.Unlock()
 	c := h.c
-	for {
-		c.lock()
-		n, fin, err := c.s.Read(h.st, p)
-		if n == 0 && !fin && err == nil {
-			h.rsig.Drain()
-			c.s.WaitRead(h.st, &h.rsig)
-		}
+	n, eof := 0, false
+	err := h.awaitRead(context.Background(), false, func() (bool, error) {
+		var fin bool
+		var err error
+		n, fin, err = c.s.Read(h.st, p)
 		if fin || err != nil {
-			h.recvDone = true
-			h.maybeReleaseLocked()
+			h.released(c.s.ReleaseRecv(h.st))
 		}
-		c.unlock()
-		if n > 0 || len(p) == 0 && err == nil {
-			if fin && n == 0 {
-				return 0, io.EOF
-			}
-			return n, nil
-		}
-		if fin {
-			return 0, io.EOF
-		}
-		if err != nil {
-			return 0, apiErr(err)
-		}
-		select {
-		case <-h.rsig.C:
-		case <-h.rwait():
-			return 0, os.ErrDeadlineExceeded
-		}
+		eof = fin && n == 0
+		return n > 0 || fin || len(p) == 0, err
+	})
+	switch {
+	case n > 0:
+		return n, nil
+	case eof:
+		return 0, io.EOF
 	}
+	return 0, err
 }
 
 func (h *handle) cancelRead(code StreamErrorCode) {
@@ -165,79 +230,39 @@ func (h *handle) cancelRead(code StreamErrorCode) {
 	c.lock()
 	defer c.unlock()
 	c.s.Stop(h.st, uint64(code))
-	h.recvDone = true
-	h.maybeReleaseLocked()
+	h.released(c.s.ReleaseRecv(h.st))
 }
 
 // ---- writing ----
 
-func (h *handle) write(p []byte, fin bool) (int, error) {
+// write writes all of p (copied), waiting for room until ctx
+// ends or the write deadline passes.
+func (h *handle) write(ctx context.Context, p []byte) (int, error) {
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
 	c := h.c
 	total := 0
-	for {
-		c.lock()
-		c.s.SetNow(c.clk.now())
-		n, err := c.s.Write(h.st, p[total:], fin)
+	err := h.awaitWrite(ctx, true, func() (bool, error) {
+		n, err := c.s.Write(h.st, p[total:], false)
 		total += n
-		wait := err == nil && total < len(p)
-		if wait {
-			h.wsig.Drain()
-			c.s.WaitWrite(h.st, &h.wsig)
-		}
-		if err == nil && fin && total == len(p) {
-			h.sendDone = true
-			h.maybeReleaseLocked()
-		}
-		c.unlock()
-		if err != nil {
-			return total, apiErr(err)
-		}
-		if !wait {
-			return total, nil
-		}
-		select {
-		case <-h.wsig.C:
-		case <-h.wwait():
-			h.endWait()
-			return total, os.ErrDeadlineExceeded
-		}
-	}
+		return total == len(p), err
+	})
+	return total, err
 }
 
 // writeBatch writes a nested session's batch into the stream without
-// copying its payload, waiting for send-buffer room like
-// write.
+// copying its payload, waiting for send-buffer room like write.
 func (h *handle) writeBatch(b *core.Batch) (int, error) {
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
 	c := h.c
 	total := 0
-	for {
-		c.lock()
-		c.s.SetNow(c.clk.now())
+	err := h.awaitWrite(context.Background(), true, func() (bool, error) {
 		n, err := c.s.WriteBatch(h.st, b, total)
 		total += n
-		wait := err == nil && total < b.Len()
-		if wait {
-			h.wsig.Drain()
-			c.s.WaitWrite(h.st, &h.wsig)
-		}
-		c.unlock()
-		if err != nil {
-			return total, apiErr(err)
-		}
-		if !wait {
-			return total, nil
-		}
-		select {
-		case <-h.wsig.C:
-		case <-h.wwait():
-			h.endWait()
-			return total, os.ErrDeadlineExceeded
-		}
-	}
+		return total == b.Len(), err
+	})
+	return total, err
 }
 
 func (h *handle) close() error {
@@ -245,8 +270,7 @@ func (h *handle) close() error {
 	c.lock()
 	defer c.unlock()
 	err := c.s.Finish(h.st)
-	h.sendDone = true
-	h.maybeReleaseLocked()
+	h.released(c.s.ReleaseSend(h.st))
 	return apiErr(err)
 }
 
@@ -256,8 +280,7 @@ func (h *handle) cancelWrite(code StreamErrorCode) {
 	defer c.unlock()
 	c.s.SetNow(c.clk.now())
 	c.s.Reset(h.st, uint64(code))
-	h.sendDone = true
-	h.maybeReleaseLocked()
+	h.released(c.s.ReleaseSend(h.st))
 }
 
 func (h *handle) streamID() (StreamID, error) {
@@ -274,27 +297,17 @@ func (h *handle) flush() error {
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
 	c := h.c
-	c.lock()
-	c.s.SetNow(c.clk.now())
-	target, err := c.s.Flush(h.st)
-	c.unlock()
-	if err != nil {
-		return apiErr(err)
-	}
-	for {
-		c.lock()
-		h.wsig.Drain()
-		done, err := c.s.FlushDone(h.st, target, &h.wsig)
-		c.unlock()
-		if done {
-			return apiErr(err)
+	target, flushed := uint64(0), false
+	return h.awaitWrite(context.Background(), false, func() (bool, error) {
+		if !flushed {
+			t, err := c.s.Flush(h.st)
+			if err != nil {
+				return false, err
+			}
+			target, flushed = t, true
 		}
-		select {
-		case <-h.wsig.C:
-		case <-h.wwait():
-			return os.ErrDeadlineExceeded
-		}
-	}
+		return c.s.FlushDone(h.st, target)
+	})
 }
 
 // ---- public types ----
@@ -370,7 +383,10 @@ func (s *Stream) Flush() error { defer runtime.KeepAlive(s); return s.h.flush() 
 func (s *Stream) Read(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.read(p) }
 
 // Write writes p, waiting for send-buffer space.
-func (s *Stream) Write(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.write(p, false) }
+func (s *Stream) Write(p []byte) (int, error) {
+	defer runtime.KeepAlive(s)
+	return s.h.write(context.Background(), p)
+}
 
 // Close finishes the sending part (FIN after the buffered data); it never
 // blocks and does not stop reading (CancelRead does).
@@ -420,7 +436,7 @@ func (s *SendStream) Flush() error { defer runtime.KeepAlive(s); return s.h.flus
 // Write writes p.
 func (s *SendStream) Write(p []byte) (int, error) {
 	defer runtime.KeepAlive(s)
-	return s.h.write(p, false)
+	return s.h.write(context.Background(), p)
 }
 
 // Close finishes the stream (FIN after the buffered data); it never

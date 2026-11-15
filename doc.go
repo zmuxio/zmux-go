@@ -147,7 +147,8 @@
 // the Redial and MaintainPipes waits run on it, so a timeshim.Fake drives a
 // session deterministically. Carrier read and write deadlines of
 // net.Conn, Listener and endpoint timers (first record, pairing, carrier
-// upgrade, the exchange carrier) and the transports of the QUIC adapters
+// upgrade, the exchange carrier), the bounds of a carrier's dial and of its
+// graceful close, and the transports of the QUIC adapters
 // (zmuxquic, zmuxh3: quic-go's loss recovery, idle and handshake timers)
 // stay on the host clock.
 package zmux

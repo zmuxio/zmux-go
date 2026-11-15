@@ -13,12 +13,13 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
+	"github.com/zmuxio/zmux-go/internal/testscale"
 )
 
 // pair returns a client and a server session over a carrier pair.
 func pair(t testing.TB, a, b net.Conn, ccfg, scfg *Config) (*Conn, *Conn) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testscale.D(5*time.Second))
 	defer cancel()
 	type res struct {
 		c   *Conn
@@ -52,7 +53,7 @@ func waitDone(t testing.TB, c *Conn) {
 	go func() { _ = c.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testscale.D(10 * time.Second)):
 		t.Fatal("session did not end")
 	}
 }

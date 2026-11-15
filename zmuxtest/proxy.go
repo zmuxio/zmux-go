@@ -98,6 +98,7 @@ type Proxy struct {
 	mu  sync.Mutex
 
 	redirects atomic.Int64
+	closed    bool // under mu
 }
 
 // Redirects is the number of requests answered with a redirect.
@@ -121,6 +122,7 @@ func New(upstream string, p Profile) *Proxy {
 // Close stops the proxy and its tunnels.
 func (x *Proxy) Close() {
 	x.mu.Lock()
+	x.closed = true // a tunnel hijacked from now on is closed at once
 	for c := range x.hij {
 		_ = c.Close()
 	}
@@ -194,11 +196,12 @@ func (x *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	} else if out.Body != nil {
 		_ = http.NewResponseController(w).EnableFullDuplex()
 	}
-	ctx := r.Context()
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	var bound *time.Timer // ResponseTimeout: the round trip and a buffered body only
 	if x.p.ResponseTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, x.p.ResponseTimeout)
-		defer cancel()
+		bound = time.AfterFunc(x.p.ResponseTimeout, cancel)
+		defer bound.Stop()
 	}
 	resp, err := x.tr.RoundTrip(out.WithContext(ctx))
 	if err != nil {
@@ -207,6 +210,9 @@ func (x *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	buffer := x.p.BufferResponses && (!x.p.HonorAccel || !strings.EqualFold(resp.Header.Get("X-Accel-Buffering"), "no"))
+	if bound != nil && !buffer {
+		bound.Stop() // a streamed body lives with the request
+	}
 	hh := w.Header()
 	maps.Copy(hh, resp.Header)
 	for _, h := range hopByHop {
@@ -274,6 +280,12 @@ func (x *Proxy) tunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	x.mu.Lock()
+	if x.closed {
+		x.mu.Unlock()
+		_ = cc.Close()
+		_ = uc.Close()
+		return
+	}
 	x.hij[cc], x.hij[uc] = struct{}{}, struct{}{}
 	x.mu.Unlock()
 	defer func() {

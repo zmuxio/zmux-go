@@ -144,14 +144,15 @@ func (s *Session) laneOpen(p *Pipe, ol *outLane) bool {
 	return !ol.notWritable && !ol.writing
 }
 
-// buildGate works out the gate now (nil when no pipe is usable).
-func (s *Session) buildGate() *gate {
+// buildGate works out the gate now into g, whose storage it reuses, and
+// returns it (nil when no pipe is usable). Each holder of a gate owns its
+// storage (a decision its own, one-shot readers the session's scratch
+// gate), so building one never changes a gate another holder still reads.
+func (s *Session) buildGate(g *gate) *gate {
 	c, ok := s.usableClass()
 	if !ok {
 		return nil
 	}
-	m := s.mp
-	g := &m.gateBuf
 	g.cls = c
 	g.pipes = g.pipes[:0]
 	g.tiers = g.tiers[:0]
@@ -172,17 +173,18 @@ func (s *Session) buildGate() *gate {
 		return 0
 	})
 	sa := s.cfg.Policy == PolicySessionAffinity
+	base := s.owdBase()
 	for lo := 0; lo < len(g.pipes); {
 		pr, _ := g.pipes[lo].mp.effPrio()
 		active := g.pipes[lo]
-		aOWD := s.owd(active)
+		aOWD := owdFrom(active.mp, base)
 		hi := lo + 1
 		for hi < len(g.pipes) {
 			q, _ := g.pipes[hi].mp.effPrio()
 			if q != pr {
 				break
 			}
-			o := s.owd(g.pipes[hi])
+			o := owdFrom(g.pipes[hi].mp, base)
 			if o < aOWD {
 				active, aOWD = g.pipes[hi], o
 			}
@@ -217,7 +219,7 @@ func (s *Session) buildGate() *gate {
 		if has {
 			since := oldest
 			if i > 0 {
-				if e, ok := m.eligibleSince(t.prio); ok && e > since {
+				if e, ok := s.mp.eligibleSince(t.prio); ok && e > since {
 					since = e
 				} else if !ok {
 					since = s.now
@@ -286,7 +288,7 @@ func (m *multiPath) eligibleSince(prio uint64) (Time, bool) {
 // reports saturation changes (at most one event per tier per second).
 func (s *Session) refreshTiers() {
 	m := s.mp
-	g := s.buildGate()
+	g := s.buildGate(&m.gateBuf)
 	keep := m.tierSince[:0]
 	if g != nil {
 		for i := 0; i <= g.last; i++ {
@@ -395,12 +397,10 @@ func (s *Session) waitingData() (uint64, Time, bool) {
 	for st := it.next(); st != nil; st = it.next() {
 		sp := &st.snd
 		if m := sp.mps; m != nil {
-			for _, r := range m.resend {
-				lost += r.hi - r.lo
-			}
+			lost += m.resend.total()
 		}
 		r := s.readyBytes(st)
-		if r == 0 && (sp.mps == nil || len(sp.mps.resend) == 0) {
+		if r == 0 && (sp.mps == nil || sp.mps.resend.len() == 0) {
 			continue
 		}
 		fresh += r

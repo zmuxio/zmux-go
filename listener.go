@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/djylb/timeshim"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/labels"
@@ -41,7 +41,8 @@ type ListenerConfig struct {
 	// its JoinTimeout bounds a stalled join.
 	Config *Config
 	// Logger receives the listener's warnings and the panics of its host
-	// callbacks that it contains (OnReject, SessionConfig, Admission) and
+	// callbacks that it contains (OnReject, SessionConfig, Admission,
+	// WrapPipe, Fallback) and
 	// the errors SessionConfig returns;
 	// nil logs nothing. The sessions log to their Config.Logger.
 	Logger *slog.Logger
@@ -606,9 +607,8 @@ func (l *Listener) largestSuspended() *Conn {
 	var best *Conn
 	var most uint64
 	for _, c := range cs { // session locks outside the listener lock
-		c.lock()
-		m := c.s.Charged()
-		c.unlock()
+		var m uint64
+		c.locked(func() { m = c.s.Charged() })
 		if best == nil || m > most {
 			best, most = c, m
 		}
@@ -624,6 +624,11 @@ func (l *Listener) largestSuspended() *Conn {
 // Accept returns the next session a carrier started.
 func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 	select {
+	case <-l.drain: // first: after Close or Shutdown, never a session
+		return nil, net.ErrClosed
+	default:
+	}
+	select {
 	case c := <-l.accept:
 		return c, nil
 	case <-ctx.Done():
@@ -638,8 +643,8 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 // is refused, joins and resumptions included, the admissions,
 // handshakes and pairing waits in progress are cancelled, and the
 // memory-pressure watcher stops. It does not block; sessions already
-// started continue, without new pipes from the listener (Shutdown ends
-// them).
+// accepted continue, without new pipes from the listener (Shutdown ends
+// them), and those still waiting for Accept are aborted.
 func (l *Listener) Close() error {
 	l.mu.Lock()
 	if !l.closed {
@@ -652,7 +657,17 @@ func (l *Listener) Close() error {
 	}
 	l.mu.Unlock()
 	l.stopCancel()
-	return nil
+	// Sessions in the backlog have no one to accept them now (no more
+	// arrive once draining is set, under l.mu): they end here. Shutdown
+	// ends them with every other session instead.
+	for {
+		select {
+		case c := <-l.accept:
+			c.Abort(0, "")
+		default:
+			return nil
+		}
+	}
 }
 
 // Shutdown closes the listener gracefully, as http.Server.Shutdown does:
@@ -753,12 +768,13 @@ var (
 // A carrier that is not yet classified, or that joins a session and is
 // not yet verified, also holds a pending slot (ListenerConfig.MaxPending).
 func (l *Listener) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error {
+	p = owned(p)
 	a, err := l.arrive(hint.Source, peerOf(p))
 	if errors.Is(err, errRefused) {
 		return l.refusePending(ctx, p, unmapped(hint.Source), peerOf(p))
 	}
 	if err != nil {
-		closePipeIO(p)
+		closePipe(p)
 		return err
 	}
 	return a.HandlePipe(ctx, p, hint)
@@ -772,7 +788,7 @@ func (l *Listener) refusePending(ctx context.Context, p PipeIO, src, peer netip.
 		src = unmapped(peer)
 	}
 	l.onReject(ctx, p, RejectInfo{Reason: "pending_limit", Src: src})
-	closePipeIO(p)
+	closePipe(p)
 	return errRefused
 }
 
@@ -787,7 +803,7 @@ func (l *Listener) take(p PipeIO, hint PipeHint, slot *core.PendingSlot) (run fu
 	l.mu.Unlock()
 	if !ok {
 		release()
-		closePipeIO(p)
+		closePipe(p)
 		l.st.refused.Add(1)
 		return nil, errRefused
 	}
@@ -820,33 +836,44 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint PipeHint) (PipeI
 	defer stopL()
 	ctx, cancel := timeshim.WithTimeout(ctx, l.clk, l.cfg.Config.handshakeTimeout())
 	defer cancel()
-	// A layer that does not watch ctx is interrupted by closing p.
-	stop := context.AfterFunc(ctx, func() { closePipeIO(p) })
-	q, err := wrap.WrapPipe(ctx, p, hint)
+	// A layer that does not watch ctx is interrupted by closing p, through
+	// the closer every failure below shares.
+	stop := context.AfterFunc(ctx, func() { closePipe(p) })
+	// The layer is a host callback the peer drives (seal's Gate, AppData,
+	// Signer included): a panic in it fails this carrier, not the process.
+	var q PipeIO
+	err := hostCall(l.cfg.Logger, "ListenerConfig.WrapPipe", func() error { var err error; q, err = wrap.WrapPipe(ctx, p, hint); return err })
 	fired := !stop()
 	if rej := (*RejectError)(nil); !fired && errors.As(err, &rej) {
 		markTaken(p)
 		l.st.rejected.Add(1)
 		l.onReject(ctx, p, RejectInfo{Profile: rej.Profile, RecordMode: rej.RecordMode, Reason: rej.Reason, Src: hint.Source, Err: rej.Err})
-		closePipeIO(p)
+		closePipe(p)
 		return PipeIO{}, errRejected
 	}
 	if err != nil {
 		// Halves a failing layer returned anyway are closed too.
-		return l.wrapFailed(p, q, fired, err)
+		return l.wrapFailed(p, q, err)
 	}
 	if fired {
-		return l.wrapFailed(p, q, fired, context.Cause(ctx))
+		return l.wrapFailed(p, q, context.Cause(ctx))
 	}
 	if q.R == nil && q.W == nil {
-		return l.wrapFailed(p, q, fired, errors.New("no pipe halves"))
+		return l.wrapFailed(p, q, errors.New("no pipe halves"))
 	}
 	if err := q.validate(); err != nil {
-		return l.wrapFailed(p, q, fired, err)
+		return l.wrapFailed(p, q, err)
 	}
-	if !sameHalf(q.R, p.R) || !sameHalf(q.W, p.W) {
+	if !carrierio.SameHalf(q.R, p.R) || !carrierio.SameHalf(q.W, p.W) {
+		// New halves are the layer's, over p: closing them ends p (through
+		// p's closer where the layer uses PipeConn), so they get a closer
+		// of their own.
 		markTaken(p)
+		q.own = nil
+	} else {
+		q.own = p.own
 	}
+	q = owned(q)
 	q.Carrier, q.Label, q.FateGroup = p.Carrier, p.Label, p.FateGroup
 	if q.Variant == "" {
 		q.Variant = p.Variant
@@ -854,16 +881,14 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint PipeHint) (PipeI
 	return q, nil
 }
 
-// wrapFailed closes what wrapPipe holds after err: q's halves, and p
-// unless the bound fired (which closed it), and counts a setup failure.
-func (l *Listener) wrapFailed(p, q PipeIO, fired bool, err error) (PipeIO, error) {
+// wrapFailed closes what wrapPipe holds after err: q's new halves, and p
+// (once: the bound may have closed it), and counts a setup failure.
+func (l *Listener) wrapFailed(p, q PipeIO, err error) (PipeIO, error) {
 	markTaken(p) // what the layer read is no longer a request to hand on
-	if q.R != nil || q.W != nil {
-		closePipeIO(q)
+	if r, w := newHalf(q.R, p.R, p.W), newHalf(q.W, p.R, p.W); r != nil || w != nil {
+		carrierio.NewCloser(r, w).Close()
 	}
-	if !fired {
-		closePipeIO(p)
-	}
+	closePipe(p)
 	l.countSetupFailure()
 	return PipeIO{}, fmt.Errorf("zmux: WrapPipe: %w", err)
 }
@@ -872,7 +897,7 @@ func (l *Listener) wrapFailed(p, q PipeIO, fired bool, err error) (PipeIO, error
 func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint PipeHint, release func()) error {
 	first, cls, err := l.readFirst(ctx, p)
 	if err != nil {
-		closePipeIO(p)
+		closePipe(p)
 		if tlsSetupFailed(p) {
 			l.countSetupFailure()
 		} else {
@@ -894,7 +919,7 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint PipeHint, 
 		return handleLane(ctx, l, withPrefix(p, first), first)
 	case core.ClassMore, core.ClassReject:
 	}
-	closePipeIO(p)
+	closePipe(p)
 	l.st.rejected.Add(1)
 	return errRejected
 }
@@ -926,7 +951,7 @@ func (l *Listener) readFirst(ctx context.Context, p PipeIO) ([]byte, core.Class,
 	case <-l.done:
 		err = net.ErrClosed
 	}
-	closePipeIO(p) // interrupts the read
+	closePipe(p) // interrupts the read
 	<-ch
 	return nil, core.ClassReject, err
 }
@@ -974,11 +999,11 @@ func readFirstRecord(p PipeIO) ([]byte, core.Class, error) {
 		if !ok {
 			return nil, core.ClassReject, errors.New("zmux: Records framing needs a MessageReader")
 		}
-		m, err := mr.ReadMessage()
+		m, err := mr.ReadMessage(MaxRecordSize)
 		if err != nil {
 			return nil, core.ClassReject, err
 		}
-		if len(m) > 0 && m[0] == join.ProfileJoin {
+		if join.IsHello(m) {
 			return m, core.ClassJoin, nil
 		}
 		framed := varint.AppendVarint(nil, uint64(len(m)))
@@ -1016,13 +1041,13 @@ func readFirstRecord(p PipeIO) ([]byte, core.Class, error) {
 func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src netip.AddrPort, release func()) error {
 	cfg, err := l.sessionConfig(ctx, p, admitted, src)
 	if err != nil {
-		closePipeIO(p)
+		closePipe(p)
 		l.st.rejected.Add(1)
 		return err
 	}
 	cc, err := cfg.coreConfig(core.RoleResponder, core.RoleResponder)
 	if err != nil {
-		closePipeIO(p)
+		closePipe(p)
 		l.st.rejected.Add(1)
 		return err
 	}
@@ -1035,7 +1060,11 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src
 	}
 	cc.Budget = l.budget
 	markTaken(p)
-	c, err := startCore(ctx, p, cfg, cc, l, admitted)
+	// Close cancels the bootstrap handshake; the session no longer
+	// depends on the context once established.
+	hctx, unlink := l.stopContext(ctx)
+	c, err := startCore(hctx, p, cfg, cc, l, admitted)
+	unlink()
 	release()
 	if err != nil {
 		l.st.rejected.Add(1)
@@ -1064,9 +1093,9 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src
 	}
 	if reason != "" {
 		// Refused by policy after its own parameters.
-		c.lock()
-		c.s.Refuse(reason)
-		c.unlock()
+		c.locked(func() {
+			c.s.Refuse(reason)
+		})
 		_ = c.Wait()
 		l.st.refused.Add(1)
 		return errRefused
@@ -1132,7 +1161,7 @@ func sameClock(a, b timeshim.Clock) (same bool) {
 // for the lookup only.
 func (a *ListenerAdapter) KnownJoin(prefix []byte) (known bool, need int) {
 	l := (*Listener)(a)
-	if len(prefix) == 0 || prefix[0] != join.ProfileJoin {
+	if !join.IsHello(prefix) {
 		return false, 0
 	}
 	h, n, err := join.ParseHelloHead(prefix, join.Stream)
@@ -1158,7 +1187,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 	reject := func(mode RecordMode, reason string) error {
 		l.st.rejected.Add(1)
 		l.onReject(ctx, p, RejectInfo{Profile: join.ProfileJoin, RecordMode: mode, Reason: reason, Src: hint.Source})
-		closePipeIO(p)
+		closePipe(p)
 		return errRejected
 	}
 	h, _, err := join.ParseHelloExact(b, jf)
@@ -1172,7 +1201,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 	c, closed := l.sessions[string(h.Locator)], l.closed
 	l.mu.Unlock()
 	if closed {
-		closePipeIO(p)
+		closePipe(p)
 		l.st.refused.Add(1)
 		return errRefused
 	}
@@ -1196,14 +1225,14 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 		select {
 		case <-es.HandshakeComplete():
 		case <-timer.C:
-			closePipeIO(p)
+			closePipe(p)
 			l.countSetupFailure()
 			return errRejected
 		case <-ctx.Done():
 		case <-l.done:
 		}
 		if ctx.Err() != nil || l.isClosed() {
-			closePipeIO(p)
+			closePipe(p)
 			l.countSetupFailure()
 			return errRejected
 		}
@@ -1233,7 +1262,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 		if errors.Is(err, errRefusalSent) {
 			l.lingerClose(ctx, p)
 		} else {
-			closePipeIO(p)
+			closePipe(p)
 		}
 		l.rejectedBy(err)
 		return err
@@ -1258,7 +1287,7 @@ func (l *Listener) lingerClose(ctx context.Context, p PipeIO) {
 	ctx, cancelT := timeshim.WithTimeout(ctx, l.clk, joinLinger)
 	defer cancelT()
 	// A blocked half-close or read ends with the carrier.
-	stop := context.AfterFunc(ctx, func() { closePipeIO(p) })
+	stop := context.AfterFunc(ctx, func() { closePipe(p) })
 	defer stop()
 	if cw, ok := p.W.(CloseWriter); ok {
 		_ = cw.CloseWrite()
@@ -1266,7 +1295,7 @@ func (l *Listener) lingerClose(ctx context.Context, p PipeIO) {
 	if p.R != nil {
 		discard(p.R)
 	}
-	closePipeIO(p)
+	closePipe(p)
 }
 
 // onReject decides the response to a rejected carrier, OnReject or the
@@ -1393,7 +1422,7 @@ func (l *Listener) dropSuspended(c *Conn) {
 func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, release func()) error {
 	tok, err := base64.RawURLEncoding.DecodeString(hint.Pair)
 	if err != nil || len(tok) != 16 {
-		closePipeIO(p)
+		closePipe(p)
 		l.st.rejected.Add(1)
 		return errRejected
 	}
@@ -1406,7 +1435,7 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, rele
 	l.mu.Unlock()
 	switch res {
 	case core.PairReject:
-		closePipeIO(p)
+		closePipe(p)
 		l.st.rejected.Add(1)
 		return errRejected
 	case core.PairWait:
@@ -1432,7 +1461,7 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, rele
 		l.mu.Unlock()
 		if mine {
 			// A half never paired is an input of its own.
-			closePipeIO(p)
+			closePipe(p)
 			if ctx.Err() != nil {
 				l.st.rejected.Add(1) // abandoned by its caller
 				return ctx.Err()
@@ -1461,8 +1490,8 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, rele
 	}
 	// up and down are named for the peer: this end writes on down. What describes the
 	// write is the writing half's.
-	both := PipeIO{R: up.R, W: down.W, Framing: up.Framing, Label: up.Label, Carrier: up.Carrier, FateGroup: up.FateGroup,
-		WriteOverhead: down.WriteOverhead, MaxRecord: down.MaxRecord, Variant: up.Variant}
+	both := owned(PipeIO{R: up.R, W: down.W, Framing: up.Framing, Label: up.Label, Carrier: up.Carrier, FateGroup: up.FateGroup,
+		WriteOverhead: down.WriteOverhead, MaxRecord: down.MaxRecord, Variant: up.Variant})
 	// Closing one half is no pipe event, so the pipe does not live by the context of
 	// whichever request arrived second. WrapPipe runs on the pair, and classification
 	// again, so that a pair can start a session or carry a Join.
@@ -1508,13 +1537,16 @@ type prefixMessages struct {
 
 func (p *prefixMessages) Read([]byte) (int, error) { return 0, errors.New("zmux: message carrier") }
 func (p *prefixMessages) Close() error             { return p.r.Close() }
-func (p *prefixMessages) ReadMessage() ([]byte, error) {
+func (p *prefixMessages) ReadMessage(limit int) ([]byte, error) {
 	if p.first != nil {
 		m := p.first
 		p.first = nil
+		if len(m) > limit {
+			return nil, ErrMessageTooLarge
+		}
 		return m, nil
 	}
-	return p.r.(MessageReader).ReadMessage()
+	return p.r.(MessageReader).ReadMessage(limit)
 }
 
 func withPrefix(p PipeIO, first []byte) PipeIO {
@@ -1525,7 +1557,7 @@ func withPrefix(p PipeIO, first []byte) PipeIO {
 		p.R = &prefixMessages{first: first, r: p.R}
 		return p
 	}
-	if same := sameHalf(p.R, p.W); same {
+	if same := carrierio.SameHalf(p.R, p.W); same {
 		// Keep the write half as it is; the read half is wrapped.
 		p.R = &prefixReader{pre: bytes.Clone(first), r: readOnly{p.R}}
 		return p
@@ -1559,22 +1591,12 @@ func carrierConnOf(x any) any {
 func (p *prefixReader) CarrierConn() any   { return carrierConnOf(p.r) }
 func (p *prefixMessages) CarrierConn() any { return carrierConnOf(p.r) }
 
-func closePipeIO(p PipeIO) {
-	if p.W != nil {
-		_ = p.W.Close()
+// newHalf is h unless it is one of the halves r and w (nil then).
+func newHalf(h io.Closer, r, w any) io.Closer {
+	if h == nil || carrierio.SameHalf(h, r) || carrierio.SameHalf(h, w) {
+		return nil
 	}
-	if p.R != nil && !sameHalf(p.R, p.W) {
-		_ = p.R.Close()
-	}
-}
-
-// sameHalf reports whether two halves of a carrier are one value. The halves come
-// from the host and may be of a type that cannot be compared; those count as two.
-func sameHalf(a, b any) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return reflect.ValueOf(a).Comparable() && reflect.ValueOf(b).Comparable() && a == b
+	return h
 }
 
 // tlsSetupFailed reports whether p is a TLS connection whose handshake did

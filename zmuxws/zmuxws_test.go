@@ -373,7 +373,7 @@ func TestCarrier(t *testing.T) {
 		if err := w.WriteMessage(m); err != nil {
 			t.Fatal(err)
 		}
-		if got, err := r.ReadMessage(); err != nil || !bytes.Equal(got, m) {
+		if got, err := r.ReadMessage(zmux.MaxRecordSize); err != nil || !bytes.Equal(got, m) {
 			t.Fatalf("read %d bytes, %v", len(got), err)
 		}
 	}
@@ -382,23 +382,23 @@ func TestCarrier(t *testing.T) {
 	if err := w.WriteMessage(make([]byte, zmux.MaxRecordSize+66)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.ReadMessage(); err == nil {
+	if _, err := r.ReadMessage(zmux.MaxRecordSize); err == nil {
 		t.Fatal("oversized message read")
 	}
 
 	// A bounded read: a message of the limit is read, a longer one fails
 	// the carrier with zmux.ErrMessageTooLarge and close status 1009.
 	srv, cli = pipePair(t)
-	w, lr := cli.W.(zmux.MessageWriter), srv.R.(zmux.MessageLimitReader)
+	w, lr := cli.W.(zmux.MessageWriter), srv.R.(zmux.MessageReader)
 	for _, n := range []int{64, 65} {
 		if err := w.WriteMessage(make([]byte, n)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got, err := lr.ReadMessageLimit(64); err != nil || len(got) != 64 {
+	if got, err := lr.ReadMessage(64); err != nil || len(got) != 64 {
 		t.Fatalf("read %d bytes, %v", len(got), err)
 	}
-	if _, err := lr.ReadMessageLimit(64); !errors.Is(err, zmux.ErrMessageTooLarge) {
+	if _, err := lr.ReadMessage(64); !errors.Is(err, zmux.ErrMessageTooLarge) {
 		t.Fatalf("over the limit: %v", err)
 	}
 	var ce *wsconn.CloseError
@@ -410,16 +410,16 @@ func TestCarrier(t *testing.T) {
 	if err := cli.W.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); !errors.Is(err, io.EOF) {
+	if _, err := srv.R.(zmux.MessageReader).ReadMessage(zmux.MaxRecordSize); !errors.Is(err, io.EOF) {
 		t.Fatalf("after a close frame: %v", err)
 	}
-	if _, err := cli.R.(zmux.MessageReader).ReadMessage(); !errors.Is(err, io.EOF) {
+	if _, err := cli.R.(zmux.MessageReader).ReadMessage(zmux.MaxRecordSize); !errors.Is(err, io.EOF) {
 		t.Fatalf("after the echoed close frame: %v", err)
 	}
 
 	srv, cli = pipePair(t)
 	cli.W.(interface{ Abort(error) }).Abort(nil)
-	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); err == nil || errors.Is(err, io.EOF) {
+	if _, err := srv.R.(zmux.MessageReader).ReadMessage(zmux.MaxRecordSize); err == nil || errors.Is(err, io.EOF) {
 		t.Fatalf("after an abort: %v", err)
 	}
 
@@ -427,7 +427,7 @@ func TestCarrier(t *testing.T) {
 	if err := cli.W.(*carrier).c.WriteMessage(wsconn.Text, []byte("text")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := srv.R.(zmux.MessageReader).ReadMessage(); err == nil || errors.Is(err, io.EOF) {
+	if _, err := srv.R.(zmux.MessageReader).ReadMessage(zmux.MaxRecordSize); err == nil || errors.Is(err, io.EOF) {
 		t.Fatalf("after a text message: %v", err)
 	}
 }

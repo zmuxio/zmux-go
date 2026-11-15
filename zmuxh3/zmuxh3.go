@@ -19,7 +19,6 @@ import (
 	"net/netip"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -27,6 +26,7 @@ import (
 	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
@@ -56,7 +56,12 @@ type h3Conns struct {
 }
 
 func (c *h3Conns) dial(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-	qc, err := quic.DialAddrEarly(ctx, addr, tlsCfg, cfg)
+	// On a socket of the destination's family (carrierio.DialPacket), and
+	// not in 0-RTT: a carrier request sent in early data is answered 425
+	// (Too Early), so a resumed session would refuse every carrier.
+	qc, err := carrierio.DialPacket(ctx, addr, func(pc net.PacketConn, dst net.Addr) (*quic.Conn, error) {
+		return quic.Dial(ctx, pc, dst, tlsCfg, cfg)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -114,10 +119,14 @@ func (s quicState) ConnectionState() tls.ConnectionState { return s.qc.Connectio
 // handler of zmuxhttp.NewHandler, which hands requests to a listener as
 // carriers; the caller starts it (ListenAndServe or Serve) and closes it.
 // It enables HTTP Datagrams, which bidirectional carriers use as their
-// datagram channel (HTTP3Handler, whose o it takes). qconf may be nil. With
-// qconf.Allow0RTT a request may arrive in 0-RTT, before the handshake
-// completes; the zmux adapters answer such a carrier request 425 (Too Early).
+// datagram channel (HTTP3Handler, whose o it takes). qconf may be nil: no
+// 0-RTT. With qconf.Allow0RTT a request may arrive in 0-RTT, before the
+// handshake completes; the zmux adapters answer such a carrier request 425
+// (Too Early).
 func NewServer(addr string, tlsConf *tls.Config, qconf *quic.Config, h http.Handler, o *zmuxhttp.Options) *http3.Server {
+	if qconf == nil {
+		qconf = &quic.Config{} // http3 would otherwise allow 0-RTT
+	}
 	return &http3.Server{Addr: addr, TLSConfig: http3.ConfigureTLSConfig(tlsConf), QUICConfig: qconf,
 		Handler: HTTP3Handler(h, o), EnableDatagrams: true}
 }
@@ -394,7 +403,9 @@ type wtPooled struct {
 }
 
 // closeRecord is the close code of the last zmux session a pooled
-// WebTransport session carried.
+// WebTransport session carried. A WebTransport session's code has 32 bits:
+// a larger code closes it with 0 (SessionCloseCode), where zmuxquic keeps
+// the 62-bit QUIC code as is.
 type closeRecord struct {
 	reason string
 	code   zmux.ApplicationErrorCode
@@ -464,7 +475,7 @@ func (p *ConnPool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	}
 	// The lease ends once both halves of the pipe have ended, after its
 	// inbound side ended or lingered out, or with the session.
-	ws := &wtStream{sess: l.Conn.sess, s: s, rec: &l.Conn.rec, ended: pipeRelease(l.Conn.sess.Context(), l.Release)}
+	ws := &wtStream{sess: l.Conn.sess, s: s, rec: &l.Conn.rec, lease: carrierio.NewHalfLease(l.Conn.sess.Context(), l.Release)}
 	pio := ws.pipe()
 	pio.FateGroup = l.FateGroup
 	return pio, nil
@@ -490,13 +501,12 @@ type wtStream struct {
 	sess *webtransport.Session
 	s    *webtransport.Stream
 	// rec, when set, records the close code of the pipe's session for its
-	// pooled WebTransport session (zmux.CloseCodeRecorder); ended, when
-	// set, is called once both halves have ended.
-	rec    *closeRecord
-	ended  func()
-	wOnce  sync.Once
-	rOnce  sync.Once
-	halves atomic.Int32
+	// pooled WebTransport session (zmux.CloseCodeRecorder); lease, when
+	// set, ends the pooled session's lease once both halves have ended.
+	rec   *closeRecord
+	lease *carrierio.HalfLease
+	wOnce sync.Once
+	rOnce sync.Once
 }
 
 // pipe is the pipe input over w.
@@ -504,12 +514,8 @@ func (w *wtStream) pipe() zmux.PipeIO {
 	return zmux.PipeIO{R: (*wtReader)(w), W: w, Carrier: zmux.CarrierWebTransport}
 }
 
-// halfEnded counts the end of one half; the second calls ended.
-func (w *wtStream) halfEnded() {
-	if w.halves.Add(1) == 2 && w.ended != nil {
-		w.ended()
-	}
-}
+// halfEnded counts the end of one half (lease).
+func (w *wtStream) halfEnded() { w.lease.HalfEnded() }
 
 // RecordCloseCode records the code of the pipe's session
 // (zmux.CloseCodeRecorder).
@@ -638,15 +644,3 @@ func addrPort(a net.Addr) netip.AddrPort {
 
 // CloseIdleConnections passes to the transport (http.Client.CloseIdleConnections).
 func (r *h3RoundTripper) CloseIdleConnections() { r.t.CloseIdleConnections() }
-
-// pipeRelease calls release when the connection's ctx ends or when the
-// returned function is called, which the pipe calls once both its halves
-// ended; it then also withdraws the registration on ctx, so that a
-// long-lived connection does not accumulate one per pipe.
-func pipeRelease(ctx context.Context, release func()) func() {
-	stop := context.AfterFunc(ctx, release)
-	return func() {
-		stop()
-		release()
-	}
-}

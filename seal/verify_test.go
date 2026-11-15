@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -173,8 +172,9 @@ func (a cancelAnchor) Verify(context.Context, seal.VerifyInput) (seal.VerifyVerd
 	return seal.VerifyVerdict{Principal: seal.Principal{Type: 9, Bytes: []byte("node")}}, nil
 }
 
-// A context cancelled once Verify passed fails WrapPipe with its error and
-// closes the carrier, rather than returning nothing.
+// A context cancelled once Verify passed fails WrapPipe with its error,
+// rather than returning nothing; the caller closes the carrier, as after
+// every failure (ListenerConfig.WrapPipe).
 func TestVerifyThenCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -198,17 +198,7 @@ func TestVerifyThenCancel(t *testing.T) {
 	if !errors.Is(r.err, context.Canceled) || r.p.W != nil || r.p.R != nil {
 		t.Fatalf("WrapPipe returned %+v, %v; want the context's error", r.p, r.err)
 	}
-	// The client end sees the server's end closed.
-	_ = x.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 64)
-	for {
-		if _, err := x.Read(buf); err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				t.Fatal("the server's carrier was left open")
-			}
-			break
-		}
-	}
+	_ = y.Close()
 	_ = x.Close()
 }
 

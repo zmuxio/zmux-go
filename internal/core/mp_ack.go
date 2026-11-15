@@ -131,8 +131,7 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 			}
 			if m.inWindow(f.PipeID) && !m.bits[f.PipeID] {
 				m.bits[f.PipeID] = true
-				m.pendAbandon[f.PipeID] = true
-				m.abandonCodes(f.PipeID, wire.PipeFailed)
+				m.pendAbandon[f.PipeID] = wire.PipeFailed
 				s.wakeAllWriters()
 			}
 			return nil

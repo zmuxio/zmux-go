@@ -2,8 +2,10 @@ package zmux
 
 import (
 	"context"
+	"io"
 	"sync"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -45,9 +47,10 @@ func unregisterLaneKey(c *Conn) {
 // first record names the session by Lane Key. A stream that names no pipe
 // is closed. It blocks until the lane ends.
 func HandleLane(ctx context.Context, p PipeIO) error {
+	p = owned(p)
 	first, cls, err := readFirstRecord(p)
 	if err != nil || cls != core.ClassLane {
-		closePipeIO(p)
+		closePipe(p)
 		if err == nil {
 			err = errRejected
 		}
@@ -66,7 +69,7 @@ func handleLane(ctx context.Context, l *Listener, p PipeIO, first []byte) error 
 	}
 	var f wire.Frame
 	if _, err := wire.DecodeFrame(body, &f); err != nil || f.Kind != wire.KindPipeLane {
-		closePipeIO(p)
+		closePipe(p)
 		l.rejectedBy(errRejected)
 		return errRejected
 	}
@@ -76,7 +79,7 @@ func handleLane(ctx context.Context, l *Listener, p PipeIO, first []byte) error 
 	c := laneKeys.m[k]
 	laneKeys.mu.Unlock()
 	if c == nil {
-		closePipeIO(p)
+		closePipe(p)
 		l.rejectedBy(errRejected)
 		return errRejected
 	}
@@ -86,7 +89,7 @@ func handleLane(ctx context.Context, l *Listener, p PipeIO, first []byte) error 
 	} else if cc, ok := p.W.(CarrierConner); ok {
 		conn = cc.CarrierConn()
 	}
-	done, err := c.acceptLane(p, conn, f.PipeID, f.Lane)
+	done, r, err := c.acceptLane(p, conn, f.PipeID, f.Lane)
 	if err != nil {
 		l.rejectedBy(err)
 		return err
@@ -97,29 +100,55 @@ func handleLane(ctx context.Context, l *Listener, p PipeIO, first []byte) error 
 	select {
 	case <-done:
 	case <-ctx.Done():
-		_ = p.R.Close()
+		_ = r.Close()
 		<-done
 	}
 	return nil
 }
 
 // acceptLane attaches an inbound lane and starts its reader.
-func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{}, error) {
+func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{}, io.Closer, error) {
+	// Halves are closed after the unlock (deferred first, so run last): a
+	// host lane's Close may block, and never holds the session's lock.
+	var refused, released, unusedW bool
+	defer func() {
+		switch {
+		case refused && released:
+			ClosePipeIO(p) // the setup's closer let go of the halves: they are ours
+		case refused:
+			closePipe(p)
+		case unusedW:
+			_ = p.W.Close()
+		}
+	}()
 	c.lock()
 	defer c.unlock()
 	pd := c.pipes[pipe]
 	info := core.CarrierInfo{Framing: core.Framing(p.Framing), Lanes: true}
-	if pd == nil || c.closing || !c.s.AcceptLane(conn, pipe, lane, info) {
-		closePipeIO(p)
-		return nil, errRejected
+	if pd == nil || c.closing {
+		refused = true
+		return nil, nil, errRejected
+	}
+	// The lane's halves leave the setup's closer: R goes to the lane's
+	// onceCloser, an unused W is closed below. Nothing else holds a lane
+	// before it is accepted, so the release should not find it closed; if
+	// it does (a holder added later), the halves are closed already and
+	// the lane is refused before the session sees it.
+	if !releasePipe(p, nil) {
+		refused = true
+		return nil, nil, errRejected
+	}
+	released = true
+	if !c.s.AcceptLane(conn, pipe, lane, info) {
+		refused = true
+		return nil, nil, errRejected
 	}
 	markTaken(p)
-	if p.W != nil && !sameHalf(p.W, p.R) {
-		// The reverse half of a bidirectional stream used as a lane is
-		// unused: it ends at once.
-		_ = p.W.Close()
-	}
-	pd.inLanes = append(pd.inLanes, p.R)
+	// The reverse half of a bidirectional stream used as a lane is
+	// unused: it ends at once.
+	unusedW = p.W != nil && !carrierio.SameHalf(p.W, p.R)
+	r := &onceCloser{ReadCloser: p.R} // the pipe's end and the handler's ctx both close it: once
+	pd.inLanes = append(pd.inLanes, r)
 	done := make(chan struct{})
 	c.wg.Add(1)
 	pd.gs.add()
@@ -128,7 +157,19 @@ func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{
 		defer pd.gs.done()
 		c.readLoop(pd, lane, p.R)
 	})
-	return done, nil
+	return done, r, nil
+}
+
+// onceCloser closes its half once, whoever asks first.
+type onceCloser struct {
+	io.ReadCloser
+	once sync.Once
+}
+
+func (o *onceCloser) Close() error {
+	var err error
+	o.once.Do(func() { err = o.ReadCloser.Close() })
+	return err
 }
 
 // waitJoinKeys waits until the join keys exist (Conn.SetJoinSecret) or
@@ -136,9 +177,8 @@ func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{
 func (c *Conn) waitJoinKeys(ctx context.Context) error {
 	sig := core.NewSignal()
 	for {
-		c.lock()
-		ready := c.s.WaitJoinKeys(sig)
-		c.unlock()
+		var ready bool
+		c.locked(func() { ready = c.s.WaitJoinKeys(sig) })
 		if ready {
 			return nil
 		}
@@ -148,9 +188,9 @@ func (c *Conn) waitJoinKeys(ctx context.Context) error {
 		case <-ctx.Done():
 		case <-c.done:
 		}
-		c.lock()
-		c.s.UnwaitJoinKeys(sig)
-		c.unlock()
+		c.locked(func() {
+			c.s.UnwaitJoinKeys(sig)
+		})
 		return errRejected
 	}
 }

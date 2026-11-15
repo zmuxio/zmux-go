@@ -111,7 +111,7 @@ func msgPair() (a, b *msgEnd) {
 	return &msgEnd{in: x, out: y, done: done, once: once}, &msgEnd{in: y, out: x, done: done, once: once}
 }
 
-func (m *msgEnd) ReadMessage() ([]byte, error) {
+func (m *msgEnd) ReadMessage(int) ([]byte, error) {
 	select {
 	case b := <-m.in:
 		return b, nil

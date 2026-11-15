@@ -7,6 +7,8 @@ import (
 	"net"
 
 	"github.com/quic-go/quic-go"
+
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 )
 
 // dialAddr keeps the destination's UDP family instead of binding a dual-stack
@@ -24,25 +26,12 @@ func dialAddr(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.
 	return qc, nil
 }
 
-// dialNative owns socket allocation and release only. Production stream users
-// enter through dialAddr/ConnPipe, which apply the temporary handshake barrier.
+// dialNative dials over a socket that carrierio.DialPacket owns. Production
+// stream users enter through dialAddr/ConnPipe, which apply the temporary
+// handshake barrier.
 func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config, early bool) (*quic.Conn, error) {
-	remote, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
-	}
 	if tlsConf == nil {
 		return nil, errors.New("zmuxquic: TLS config required")
-	}
-	network := "udp4"
-	local := &net.UDPAddr{IP: net.IPv4zero}
-	if remote.IP != nil && remote.IP.To4() == nil {
-		network = "udp6"
-		local.IP = net.IPv6unspecified
-	}
-	socket, err := net.ListenUDP(network, local)
-	if err != nil {
-		return nil, err
 	}
 	if tlsConf.ServerName == "" {
 		tlsConf = tlsConf.Clone()
@@ -52,21 +41,12 @@ func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *qui
 		}
 		tlsConf.ServerName = host
 	}
-	var qc *quic.Conn
-	if early {
-		qc, err = quic.DialEarly(ctx, socket, remote, tlsConf, conf)
-	} else {
-		qc, err = quic.Dial(ctx, socket, remote, tlsConf, conf)
-	}
-	if err != nil {
-		_ = socket.Close()
-		return nil, err
-	}
-	// Conn.Context ends after the native run loop finishes, including any final
-	// close write. NextConnection after 0-RTT rejection uses the same connection/context.
-	// quic.Dial owns its single-use transport, while we own the supplied socket.
-	context.AfterFunc(qc.Context(), func() { _ = socket.Close() })
-	return qc, nil
+	return carrierio.DialPacket(ctx, addr, func(pc net.PacketConn, dst net.Addr) (*quic.Conn, error) {
+		if early {
+			return quic.DialEarly(ctx, pc, dst, tlsConf, conf)
+		}
+		return quic.Dial(ctx, pc, dst, tlsConf, conf)
+	})
 }
 
 // handshakeReady is a temporary quic-go v0.64.1 boundary: opening native streams

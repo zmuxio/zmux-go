@@ -224,9 +224,14 @@ func (c *Conn) releaseNestedLane() {
 // pipe of n carried by a stream of o. No pipe of a session may run over
 // that session, directly or through others. The lock is a leaf.
 var nesting = struct {
-	edges map[*Conn]map[*Conn]int
+	edges map[*Conn]*nestOut
 	mu    sync.Mutex
-}{edges: map[*Conn]map[*Conn]int{}}
+}{edges: map[*Conn]*nestOut{}}
+
+// nestOut is the outer sessions one session runs over, each with the
+// number of its edges to it. forgetNesting discards it whole; a session's
+// later edges count in a new one.
+type nestOut struct{ n map[*Conn]int }
 
 // errNestingLoop refuses a pipe whose carrier runs over its own session.
 var errNestingLoop = errors.New("zmux: the carrier runs over the session it would join")
@@ -249,41 +254,58 @@ func outerOf(p PipeIO) outerRef {
 	return outerRef{}
 }
 
+// nestEdge is one recorded edge n -> o of the nesting graph, held by
+// exactly one owner at a time (a join attempt, then the pipe it made); drop
+// releases it once, whoever calls it and however late (forgetNesting may
+// have dropped the session's edges already).
+type nestEdge struct {
+	n, o    *Conn
+	out     *nestOut // what the edge counts in
+	dropped bool     // under nesting.mu
+}
+
 // nestPipe records that n runs over ref, unless ref runs over n already;
-// the check and the record are one atomic step.
-func nestPipe(n *Conn, ref outerRef) error {
+// the check and the record are one atomic step. The edge is nil when the
+// carrier runs over no session.
+func nestPipe(n *Conn, ref outerRef) (*nestEdge, error) {
 	o := ref.c
 	if o == nil {
-		return nil
+		return nil, nil //nolint:nilnil // no outer session, no edge: a nil edge is "none", which drop takes
 	}
 	nesting.mu.Lock()
 	defer nesting.mu.Unlock()
 	if o == n || reaches(o, n, map[*Conn]bool{}) {
-		return errNestingLoop
+		return nil, errNestingLoop
 	}
-	m := nesting.edges[n]
-	if m == nil {
-		m = map[*Conn]int{}
-		nesting.edges[n] = m
+	out := nesting.edges[n]
+	if out == nil {
+		out = &nestOut{n: map[*Conn]int{}}
+		nesting.edges[n] = out
 	}
-	m[o]++
-	return nil
+	out.n[o]++
+	return &nestEdge{n: n, o: o, out: out}, nil
 }
 
-// unnestPipe drops one edge n -> o (the pipe ended).
-func unnestPipe(n *Conn, ref outerRef) {
-	o := ref.c
-	if o == nil {
+// drop releases the edge (nil: none); a second drop does nothing.
+func (e *nestEdge) drop() {
+	if e == nil {
 		return
 	}
 	nesting.mu.Lock()
 	defer nesting.mu.Unlock()
-	m := nesting.edges[n]
-	if m[o]--; m[o] <= 0 {
-		delete(m, o)
+	if e.dropped {
+		return
+	}
+	e.dropped = true
+	if nesting.edges[e.n] != e.out { // forgetNesting dropped them all
+		return
+	}
+	m := e.out.n
+	if m[e.o]--; m[e.o] <= 0 {
+		delete(m, e.o)
 	}
 	if len(m) == 0 {
-		delete(nesting.edges, n)
+		delete(nesting.edges, e.n)
 	}
 }
 
@@ -302,7 +324,11 @@ func reaches(from, to *Conn, seen map[*Conn]bool) bool {
 		return false
 	}
 	seen[from] = true
-	for o := range nesting.edges[from] {
+	out := nesting.edges[from]
+	if out == nil {
+		return false
+	}
+	for o := range out.n {
 		if reaches(o, to, seen) {
 			return true
 		}

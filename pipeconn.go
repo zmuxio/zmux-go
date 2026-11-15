@@ -13,19 +13,21 @@ import (
 // tls.Client to run over a carrier (ListenerConfig.WrapPipe, or a
 // Candidate's Dial). On a byte-stream carrier Read and Write go to p's
 // halves as they are; on a message carrier (FramingRecords) each Write is
-// one message and Read returns the bytes of the messages in order. Every
+// one message and Read returns the bytes of the messages in order (each
+// of at most MaxRecordSize bytes, the largest any zmux layer writes). Every
 // Write is exactly one write on p, never merged with another, and a layer
 // over the conn must keep that: one write on p for each write it takes.
 //
 // Read on a carrier without a receiving half returns io.EOF, and Write
-// without a sending half an error. Close closes both halves, once;
+// without a sending half an error. Close closes both halves, once,
+// also beside zmux closing the p it handed to WrapPipe;
 // CloseWrite ends the sending half where it offers CloseWrite. Addresses
 // and deadlines are those of the halves that have them; a deadline with no
 // half to take it is os.ErrNoDeadline. The conn exposes none of p's other
 // capabilities. The PipeIO of a layer over the conn may set WriteOverhead
 // to the bytes that layer adds to each of its writes.
 func PipeConn(p PipeIO) net.Conn {
-	c := &pipeConn{p: p}
+	c := &pipeConn{p: owned(p)} // closed through the closer zmux shares while it sets p up
 	if p.Framing == FramingRecords {
 		c.mr, _ = p.R.(MessageReader)
 		c.mw, _ = p.W.(MessageWriter)
@@ -36,12 +38,10 @@ func PipeConn(p PipeIO) net.Conn {
 var errNoSendingHalf = errors.New("zmux: pipe without a sending half")
 
 type pipeConn struct {
-	mr   MessageReader
-	mw   MessageWriter
-	p    PipeIO
-	once sync.Once
-
+	mr  MessageReader
+	mw  MessageWriter
 	buf []byte // the rest of the current message
+	p   PipeIO
 	rmu sync.Mutex
 }
 
@@ -61,7 +61,7 @@ func (c *pipeConn) Read(b []byte) (int, error) {
 		if len(b) == 0 {
 			return 0, nil
 		}
-		m, err := c.mr.ReadMessage()
+		m, err := c.mr.ReadMessage(MaxRecordSize)
 		if err != nil {
 			return 0, err
 		}
@@ -89,7 +89,7 @@ func (c *pipeConn) Write(b []byte) (int, error) {
 }
 
 func (c *pipeConn) Close() error {
-	c.once.Do(func() { closePipeIO(c.p) })
+	c.p.own.Close()
 	return nil
 }
 

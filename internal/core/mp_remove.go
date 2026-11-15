@@ -250,12 +250,17 @@ func (s *Session) maybeRetire(p *Pipe) {
 	if p.in != nil && a.in != InEnded {
 		return
 	}
-	s.retire(p)
+	s.retire(p, false)
 }
 
-// retire frees the attachment's state; its ID stays used.
-func (s *Session) retire(p *Pipe) {
+// retire frees the attachment's state; its ID stays used. refused: the
+// acceptor refused its join (the refusal backoff stays).
+func (s *Session) retire(p *Pipe, refused bool) {
 	a := p.mp
+	// The pipe's end, whichever path led here: what it still retains is
+	// owed again (once per frame, so an earlier reinjection is not
+	// repeated), or a unilateral end would drop it with the log.
+	s.reinjectPipe(p)
 	a.retired = true
 	// A peer-parity ID stays used, pipe 0 of an initiator peer included:
 	// its later PIPE_ACK entries are ignored.
@@ -276,12 +281,14 @@ func (s *Session) retire(p *Pipe) {
 		s.retiredPipes = s.retiredPipes[1:]
 	}
 	s.mp.stateGen++
+	s.joinHoldChanged() // one attachment fewer under the cap
 	s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirBidi, OutState: OutRetired, InState: InRetired,
 		Carrier: p.carrier, Failed: a.failures > 0, Cause: a.failCause})
 	s.checkLastPipe(nil)
-	if a.joinerLocal && !a.resLimited && !a.hs {
-		// Another attachment that the acceptor had attached retired: the refusal
-		// backoff ends.
+	if a.joinerLocal && !a.resLimited && !refused && !a.hs {
+		// Another attachment that the acceptor had attached retired: the
+		// refusal backoff ends. A refused join, or one still in its
+		// handshake (never attached), ends nothing.
 		s.mp.backoffUntil = 0
 		s.wakeAllWriters()
 	}

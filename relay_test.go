@@ -23,6 +23,7 @@ import (
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/testscale"
 	"github.com/zmuxio/zmux-go/shaping/machine"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 	"github.com/zmuxio/zmux-go/zmuxtest"
@@ -202,6 +203,7 @@ func maintain(t *testing.T, c *zmux.Conn, pool zmux.PipePool) <-chan error {
 
 func poll(t *testing.T, d time.Duration, what string, cond func() bool) {
 	t.Helper()
+	d = testscale.D(d)
 	deadline := time.Now().Add(d)
 	for !cond() {
 		if time.Now().After(deadline) {
@@ -985,7 +987,7 @@ func TestRelaySplitDownlinkSilencedClose(t *testing.T) {
 			go func() { _ = e.client.Wait(); close(done) }()
 			select {
 			case <-done:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testscale.D(5 * time.Second)):
 				t.Fatal("Wait did not return after Close")
 			}
 		})

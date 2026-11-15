@@ -16,24 +16,27 @@ type testChannel struct {
 	max   int
 }
 
-func (c *testChannel) ChannelStreamID() (uint64, bool) { return c.id, c.hasID }
-func (c *testChannel) MaxChannelDatagram() int         { return c.max }
+// use is what the driver reads from the channel for PollChannel.
+func (c *testChannel) use() ChannelUse {
+	if c == nil {
+		return ChannelUse{}
+	}
+	return ChannelUse{Room: c.max, ID: c.id, HasID: c.hasID}
+}
 
 // channelSession is an established session whose pipe 0 has ch and whose
 // peer accepts datagrams; negotiated tells whether both endpoints sent
 // zmux_carrier_datagrams.
-func channelSession(t *testing.T, ch *testChannel, negotiated bool) (*Session, *Pipe) {
+func channelSession(t testing.TB, ch *testChannel, negotiated bool) (*Session, *Pipe) {
 	t.Helper()
 	cfg := DefaultConfig()
 	cfg.Datagrams = true
 	cfg.Local.Has |= wire.HasDatagram | wire.HasFlows
 	cfg.Local.MaxDatagramFrameSize = 65535
 	s := New(cfg, 0)
-	info := CarrierInfo{}
-	if ch != nil {
-		info.Channel = ch
-	}
+	info := CarrierInfo{Channel: ch != nil}
 	p := s.AttachBootstrap(info, info, nil)
+	p.chUse = ch.use() // as the channel goroutine's first poll reads it
 	if ch != nil && s.cfg.Local.Has&wire.HasCarrierDatagrams == 0 {
 		t.Fatal("zmux_carrier_datagrams not sent with a channel")
 	}
@@ -61,7 +64,7 @@ func TestChannelSend(t *testing.T) {
 	if s.controlPending() {
 		t.Fatal("a datagram for the channel is pending for records")
 	}
-	out, live := s.PollChannel(p.id, nil)
+	out, live := s.PollChannel(p.id, p.chUse, nil)
 	want := wire.AppendChannelDatagram(nil, true, 4, append([]byte{0}, "hello"...))
 	if !live || len(out) != 1 || !bytes.Equal(out[0].Frame, want) {
 		t.Fatalf("PollChannel: %v %v, want %x", out, live, want)
@@ -80,7 +83,7 @@ func TestChannelSend(t *testing.T) {
 	if err := s.SendDatagram(nil, 0, []byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	out, _ = s.PollChannel(p.id, nil)
+	out, _ = s.PollChannel(p.id, p.chUse, nil)
 	s.ChannelDone(out)
 	if st := s.SessionStats(); st.DatagramsSent != 1 || st.DatagramsSentChannel != 1 || st.BytesSent != 0 ||
 		st.DatagramBytesSent != 5 {
@@ -92,7 +95,7 @@ func TestChannelSend(t *testing.T) {
 	if err := s.SendDatagram(nil, 0, big); err != nil {
 		t.Fatal(err)
 	}
-	if out, _ := s.PollChannel(p.id, nil); len(out) != 0 {
+	if out, _ := s.PollChannel(p.id, p.chUse, nil); len(out) != 0 {
 		t.Fatal("datagram above the channel maximum sent on it")
 	}
 	if !s.controlPending() {
@@ -103,7 +106,7 @@ func TestChannelSend(t *testing.T) {
 	if err := s.SendDatagram(nil, 0, big[1:]); err != nil {
 		t.Fatal(err)
 	}
-	if out, _ := s.PollChannel(p.id, nil); len(out) != 1 || len(out[0].Frame) != ch.max {
+	if out, _ := s.PollChannel(p.id, p.chUse, nil); len(out) != 1 || len(out[0].Frame) != ch.max {
 		t.Fatalf("datagram of the channel maximum: %d", len(out))
 	}
 }
@@ -127,7 +130,7 @@ func TestChannelSendFallback(t *testing.T) {
 			if err := s.SendDatagram(nil, 0, []byte("x")); err != nil {
 				t.Fatal(err)
 			}
-			if out, _ := s.PollChannel(p.id, nil); len(out) != 0 {
+			if out, _ := s.PollChannel(p.id, p.chUse, nil); len(out) != 0 {
 				t.Fatal("sent on the channel")
 			}
 			if !s.controlPending() {

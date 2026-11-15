@@ -345,17 +345,6 @@ func TestBoundIsConfirmedAtAccept(t *testing.T) {
 	}
 }
 
-func TestDispatchAndReply(t *testing.T) {
-	if Dispatch(nil, Stream) != ClassIncomplete || Dispatch(nil, Message) != ClassNotHello {
-		t.Fatal("empty")
-	}
-	for b, want := range map[byte]Class{0: ClassNotHello, 1: ClassEstablish, 2: ClassJoin, 3: ClassEstablish, 4: ClassEstablish, 5: ClassEstablish, 6: ClassReserved, 7: ClassReserved, 8: ClassEstablish, 9: ClassNotHello, 0xff: ClassNotHello} {
-		if Dispatch([]byte{b}, Stream) != want {
-			t.Fatal(b)
-		}
-	}
-}
-
 func TestReservedTypeFourSkipped(t *testing.T) {
 	pipe, _ := EncodePipe(Pipe{ID: 2})
 	b := appendItem(appendItem(nil, 4, []byte{2, 2, 0x40, 0xff}), tlvPipe, pipe)

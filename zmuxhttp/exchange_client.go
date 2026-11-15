@@ -484,21 +484,19 @@ func (c *exClient) attempt(a *exAttempt) {
 // exchange performs one attempt: it sends the request with a fresh nonce
 // and returns the verified response, or no result.
 func (c *exClient) exchange(a *exAttempt) (res exResult) {
-	release := func() {
+	var nonce [exNonceLen]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
 		if a.buf != nil {
 			a.buf.unref()
 		}
-	}
-	var nonce [exNonceLen]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		release()
 		return res
 	}
 	// One allocation holds the authentication header and the Data MAC.
 	hdr := appendExAuth(make([]byte, 0, exReqOverhead), c.key, &c.cid, a.kind, a.flags, a.seq, a.ack, uint32(time.Now().Unix()), &nonce, len(a.data))
 	mac := c.key.dataMAC(hdr[exFieldsLen:], a.data)
 	tail := append(hdr[exAuthLen:], mac[:]...) //nolint:gocritic // appendAssign: the MAC follows the header in hdr's spare capacity
-	var body io.ReadCloser
+	// src holds the attempt's reference; every hop's body takes its own.
+	src := exBody{buf: a.buf, hdr: hdr, data: a.data, tail: tail}
 	n := exReqOverhead + len(a.data)
 	if c.p.b64 {
 		enc := getExBuf(b64Len(n))
@@ -510,31 +508,18 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 		copy(bin.b[len(a.data):], tail)
 		base64.StdEncoding.Encode(enc.b[b64Len(exAuthLen):], bin.b[:len(a.data)+exMACLen])
 		bin.unref()
-		release()
 		n = b64Len(exAuthLen) + b64Len(len(a.data)+exMACLen)
-		body = &exBody{data: enc.b[:n], done: enc.unref}
-	} else {
-		body = &exBody{hdr: hdr, data: a.data, tail: tail, done: release}
+		_ = src.Close()
+		src = exBody{buf: enc, data: enc.b[:n]}
 	}
+	defer func() { _ = src.Close() }()
 	tg := &c.target
 	if a.kind == exKindDown {
 		tg = &c.downTarget
 	}
-	// Every hop of a redirect sends the same body; it is given up once
-	// the transport closed every one.
-	var hops atomic.Int32
-	hops.Store(1)
-	unhop := func() {
-		if hops.Add(-1) == 0 {
-			_ = body.Close()
-		}
-	}
-	defer unhop()
-	src := body.(*exBody)
 	from := tg.build(nonce[:])
 	resp, final, err := doHTTP(a.ctx, c.hc, c.nc, from, func(u *url.URL) (*http.Request, error) {
-		hops.Add(1)
-		hb := &exBody{hdr: src.hdr, data: src.data, tail: src.tail, done: unhop}
+		hb := src.hop()
 		req, err := http.NewRequestWithContext(a.ctx, http.MethodPost, u.String(), hb)
 		if err != nil {
 			_ = hb.Close()
@@ -677,9 +662,14 @@ func (c *exClient) applyLocked(a *exAttempt, r exResult, now time.Time) {
 	c.receiveLocked(a.seq, r.buf, r.data, r.flags&exFlagFin != 0)
 }
 
-// receiveLocked takes downlink piece n.
+// receiveLocked takes downlink piece n. Once the reader closed, only its
+// number counts (the Down Ack); its bytes are dropped.
 func (c *exClient) receiveLocked(n uint64, buf *exBuf, data []byte, fin bool) {
 	delete(c.downs, n)
+	if c.rclosed && buf != nil {
+		buf.unref()
+		buf, data = nil, nil
+	}
 	_, dup := c.held[n]
 	if dup || n < c.ack || c.finKnown && n > c.fin {
 		if buf != nil {
@@ -708,15 +698,30 @@ func (c *exClient) receiveLocked(n uint64, buf *exBuf, data []byte, fin bool) {
 	c.rc.Broadcast()
 }
 
-// exBody is a request body over a header and data that it does not own;
-// done runs once the transport closed it.
+// exBody is a request body over a header, data and a tail; buf (nil: none)
+// is the body's own reference to the buffer the slices lie in, dropped at
+// Close. The transport may Close the body while another goroutine Reads it
+// (http.Request.Body): mu orders them, so the buffer is never released
+// while a Read copies from it, and a Read after Close finds nothing.
 type exBody struct {
-	done            func()
+	buf             *exBuf
 	hdr, data, tail []byte
-	once            sync.Once
+	mu              sync.Mutex
+	closed          bool
+}
+
+// hop returns a body of the same bytes for one request of a redirect
+// chain, holding a reference of its own.
+func (b *exBody) hop() *exBody {
+	if b.buf != nil {
+		b.buf.ref()
+	}
+	return &exBody{buf: b.buf, hdr: b.hdr, data: b.data, tail: b.tail}
 }
 
 func (b *exBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, part := range []*[]byte{&b.hdr, &b.data, &b.tail} {
 		if len(*part) > 0 {
 			n := copy(p, *part)
@@ -728,7 +733,17 @@ func (b *exBody) Read(p []byte) (int, error) {
 }
 
 func (b *exBody) Close() error {
-	b.once.Do(b.done)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	b.closed = true
+	b.hdr, b.data, b.tail = nil, nil, nil
+	if b.buf != nil {
+		b.buf.unref()
+		b.buf = nil
+	}
 	return nil
 }
 
@@ -764,6 +779,8 @@ func (r *exClientReader) Read(p []byte) (int, error) {
 			c.poke() // the read-ahead bound moved
 			if len(pc.data) > 0 {
 				c.rbuf, c.rdata = pc.buf, pc.data
+			} else if pc.buf != nil {
+				pc.buf.unref() // an empty piece has no bytes to read
 			}
 			continue
 		}
@@ -783,6 +800,12 @@ func (r *exClientReader) Close() error {
 	if c.rbuf != nil {
 		c.rbuf.unref()
 		c.rbuf, c.rdata = nil, nil
+	}
+	for _, p := range c.held { // never read now; kept for the Down Ack
+		if p.buf != nil {
+			p.buf.unref()
+			p.buf, p.data = nil, nil
+		}
 	}
 	for _, s := range c.downs {
 		if s.cancel != nil {

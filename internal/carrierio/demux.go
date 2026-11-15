@@ -20,10 +20,19 @@ type ChannelDemux struct {
 	mu      sync.Mutex
 }
 
-type channelSink struct{ deliver func([]byte) }
+// channelSink is one registration. stop takes mu exclusively, so it
+// returns only once no Deliver runs deliver, and none does after: deliver
+// runs under mu shared (and must not call stop itself).
+type channelSink struct {
+	deliver func([]byte)
+	mu      sync.RWMutex
+	closed  bool
+}
 
 // Register hands the datagrams for Pipe Stream ID id to deliver until stop
-// is called; a later Register of the same ID replaces it.
+// is called, which returns once no call of deliver runs; a later Register
+// of the same ID replaces it. deliver takes the frame over, as
+// zmux.DatagramChannel's deliver does.
 func (d *ChannelDemux) Register(id uint64, deliver func(frame []byte)) (stop func()) {
 	k := &channelSink{deliver: deliver}
 	d.mu.Lock()
@@ -38,12 +47,17 @@ func (d *ChannelDemux) Register(id uint64, deliver func(frame []byte)) (stop fun
 			delete(d.pipes, id)
 		}
 		d.mu.Unlock()
+		k.mu.Lock()
+		k.closed = true
+		k.mu.Unlock()
 	}
 }
 
 // Deliver routes one channel datagram to the pipe its Pipe Stream ID
-// names; one that names no registered pipe (unknown, not yet attached, or
-// closed) or whose ID is truncated is dropped and counted.
+// names, handing the pipe's deliver the bytes of b after the ID: Deliver
+// takes b over, and its caller must not reuse them. One that names no
+// registered pipe (unknown, not yet attached, or closed) or whose ID is
+// truncated is dropped and counted.
 func (d *ChannelDemux) Deliver(b []byte) {
 	id, frame, ok := wire.SplitChannelDatagram(b)
 	var k *channelSink
@@ -56,7 +70,13 @@ func (d *ChannelDemux) Deliver(b []byte) {
 		d.dropped.Add(1)
 		return
 	}
-	k.deliver(frame)
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	if k.closed {
+		d.dropped.Add(1)
+		return
+	}
+	k.deliver(frame) // deliver takes frame over: it is part of b, which Deliver was given
 }
 
 // Dropped returns the datagrams Deliver dropped because they named no

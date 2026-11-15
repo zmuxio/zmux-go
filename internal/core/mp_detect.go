@@ -321,6 +321,12 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 			s.failPipe(p, 0x296a5bf5, nil)
 			continue
 		}
+		// The end of a reinjection hold: the re-sends it held back may go,
+		// with or without the PIPE_ACK that would have ended it sooner.
+		if a.held1 && due(a.holdUntil) && apply {
+			a.held1 = false
+			s.wakeAllWriters()
+		}
 		// Idle-pipe probe.
 		if p.out != nil && (a.out == OutActive || a.out == OutSuspect) && !a.unacked && !a.needPing {
 			iv := s.probeWait(p)
@@ -379,6 +385,7 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 	} else if apply && m.backoffUntil != 0 {
 		m.backoffUntil = 0
 		s.wakeAllWriters()
+		s.joinHoldChanged()
 	}
 	// Redundant snapshot copy.
 	if m.ackChanged && at(m.redundantAt) && apply {
@@ -464,6 +471,7 @@ func (s *Session) suspend(cause error) {
 	s.mp.suspendCause = cause
 	s.preSuspend = s.state
 	s.state = StateSuspended
+	s.joinHoldChanged()
 	s.suspendedAt = s.now
 	s.stats.Suspensions++
 	s.timers.grace = s.now.Add(s.graceDur())

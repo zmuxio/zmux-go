@@ -414,7 +414,7 @@ func (r *runner) writeHellos() {
 		if !p.joining || p.hello != nil {
 			continue
 		}
-		_, ready, err := r.s.JoinPrepare(p.id)
+		_, ready, err := r.s.JoinPrepare(p.id, nil)
 		var hello []byte
 		if err == nil && ready {
 			hello, err = r.s.JoinHello(p.id, p.framing, 0, &shaping.UnitPlan{})

@@ -326,14 +326,12 @@ func (c *Conn) drainEventsLocked() {
 	for _, id := range c.retiredDone {
 		if pd := c.pipes[id]; pd != nil {
 			delete(c.pipes, id)
-			unnestPipe(c, pd.outer)
+			pd.nest.drop()
 		}
 	}
 	c.retiredDone = append(c.retiredDone[:0], c.retiredIDs...)
 	c.retiredIDs = c.retiredIDs[:0]
 	q := &c.events
-	clear(q.fresh)
-	q.fresh = q.fresh[:0]
 	for {
 		e, ok := c.s.PollEvent()
 		if !ok {
@@ -417,6 +415,10 @@ func (c *Conn) drainEventsLocked() {
 		}
 		q.waiters = q.waiters[:0]
 	}
+	// Pushed since the last drain, inside it or by another critical
+	// section (reportCarrier): each traced and woken for once, here.
+	clear(q.fresh)
+	q.fresh = q.fresh[:0]
 }
 
 // firePipeWaiters wakes the waiters of pipe state changes.
@@ -539,8 +541,8 @@ func (c *Conn) NextEvent(ctx context.Context) (Event, error) {
 // longest-suspended first, with ZMUX_RESUME_TIMEOUT.
 func closeSuspended(cs []*Conn) {
 	for _, c := range cs {
-		c.lock()
-		c.s.CloseResumeTimeout()
-		c.unlock()
+		c.locked(func() {
+			c.s.CloseResumeTimeout()
+		})
 	}
 }

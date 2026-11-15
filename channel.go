@@ -25,8 +25,10 @@ type DatagramChannel interface {
 	ChannelStreamID() (id uint64, ok bool)
 	// MaxChannelDatagram returns the largest channel datagram, Pipe Stream
 	// ID included, that the channel takes now; 0 while it takes none (the
-	// carrier did not negotiate datagrams, or has not yet). It must be
-	// cheap and must not block: it is called under the session's lock.
+	// carrier did not negotiate datagrams, or has not yet). It is called
+	// by the pipe's channel goroutine, outside the session's lock, before
+	// each round of channel datagrams; the session places datagrams by the
+	// last answer until the next.
 	MaxChannelDatagram() int
 	// SendChannelDatagram sends one channel datagram. It may block while
 	// the carrier's own queue is full: a goroutine of the pipe calls it,
@@ -37,8 +39,9 @@ type DatagramChannel interface {
 	// for the pipe, Pipe Stream ID removed, to deliver, one call at a time,
 	// until stop is called. deliver takes the argument over: the channel
 	// does not reuse its bytes. It does not wait for the session's lock.
-	// It is called under the session's lock, when the pipe attaches and
-	// before its first record, so it must not block.
+	// It is called outside the session's lock, by the pipe's channel
+	// goroutine when the pipe attaches; the pipe's first record waits for
+	// it, so it must return promptly. A panic in it fails the pipe.
 	ReceiveChannelDatagrams(deliver func(frame []byte)) (stop func())
 }
 
@@ -54,25 +57,49 @@ func channelOf(p PipeIO) DatagramChannel {
 	return nil
 }
 
-// startChannel registers the receiver of the attachment's datagram channel
-// and starts its sender (under the lock). It runs before the attachment's
-// first record, so that no datagram the peer sends once it learns the
-// session's parameters arrives before the receiver.
+// startChannel starts the goroutine of the attachment's datagram channel
+// (under the lock): it registers the channel's receiver, outside the lock
+// (host code), then runs the sender. The lane-0 writer waits for the
+// registration (chReady) before the attachment's first record, so that no
+// datagram the peer sends once it learns the session's parameters arrives
+// before the receiver.
 func (c *Conn) startChannel(pd *pipeDrv) {
 	if pd.ch == nil || !c.cfg.EnableDatagrams {
 		return
 	}
 	pd.chSig = core.NewSignal()
 	pd.chEnd = make(chan struct{})
+	pd.chReady = make(chan struct{})
 	c.s.SetChannelSignal(pd.id, pd.chSig)
-	stop := pd.ch.ReceiveChannelDatagrams(func(frame []byte) { c.receiveChannel(pd, frame) })
 	c.wg.Add(1)
 	pd.gs.add()
 	labels.Go(pd.lctx, "channel", func() {
 		defer pd.gs.done()
-		defer stop()
+		var stop func()
+		err := hostCall(c.cfg.Logger, "DatagramChannel.ReceiveChannelDatagrams", func() error {
+			stop = pd.ch.ReceiveChannelDatagrams(func(frame []byte) { c.receiveChannel(pd, frame) })
+			return nil
+		})
+		close(pd.chReady)
+		if err != nil {
+			c.wg.Done()
+			pd.closeAll() // a carrier whose channel panicked fails
+			return
+		}
+		if stop != nil {
+			defer safeLog(c.cfg.Logger, "DatagramChannel stop", stop)
+		}
 		c.channelLoop(pd)
 	})
+}
+
+// channelUse reads what the attachment's datagram channel takes now.
+func (pd *pipeDrv) channelUse() core.ChannelUse {
+	u := core.ChannelUse{Room: pd.ch.MaxChannelDatagram()}
+	if u.Room > 0 {
+		u.ID, u.HasID = pd.ch.ChannelStreamID()
+	}
+	return u
 }
 
 // endChannel ends the attachment's channel sender and receiver.
@@ -97,12 +124,14 @@ func (c *Conn) channelLoop(pd *pipeDrv) {
 	for {
 		// Deferred unlocks turn a panic of the core into a closed session
 		// (Conn.unlock) instead of leaving the lock held.
+		// The channel is host code: read outside the lock.
+		use := pd.channelUse()
 		live := false
 		func() {
 			c.lock()
 			defer c.unlock()
 			if !pd.dead {
-				out, live = c.s.PollChannel(pd.id, out[:0])
+				out, live = c.s.PollChannel(pd.id, use, out[:0])
 			}
 		}()
 		if !live {
@@ -166,8 +195,12 @@ func (c *Conn) receiveChannel(pd *pipeDrv, frame []byte) {
 	start := !in.draining
 	in.draining = true
 	in.mu.Unlock()
-	if start {
-		labels.Go(c.lctx, "channel-drain", func() { c.drainChannel() })
+	if start && !c.goSide(c.lctx, "channel-drain", c.drainChannel) {
+		// The session ended: nothing will take the queue.
+		in.mu.Lock()
+		clear(in.q)
+		in.q, in.dropped, in.draining = in.q[:0], 0, false
+		in.mu.Unlock()
 	}
 }
 
@@ -185,16 +218,16 @@ func (c *Conn) drainChannel() {
 		in.q, in.spare, in.dropped = in.spare[:0], nil, 0
 		in.mu.Unlock()
 		now := c.clk.now()
-		c.lock()
-		if dropped > 0 {
-			c.s.DropReceivedDatagrams(dropped)
-		}
-		for _, d := range q {
-			if !d.pd.dead {
-				c.s.ReceiveChannelDatagram(d.pd.id, d.frame, now)
+		c.locked(func() {
+			if dropped > 0 {
+				c.s.DropReceivedDatagrams(dropped)
 			}
-		}
-		c.unlock()
+			for _, d := range q {
+				if !d.pd.dead {
+					c.s.ReceiveChannelDatagram(d.pd.id, d.frame, now)
+				}
+			}
+		})
 		clear(q)
 		in.mu.Lock()
 		in.spare = q[:0]

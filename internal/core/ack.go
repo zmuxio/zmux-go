@@ -352,11 +352,23 @@ func sortEntries(es []wire.AckEntry) {
 	}
 }
 
+// ackKeepMany bounds a pipe's unacknowledged RTT samples and a lane's
+// activity marks: far more than any window in flight holds batches, so
+// only a peer withholding acknowledgements reaches it.
+const ackKeepMany = 1 << 14
+
 // onSent records a produced batch for RTT samples and idle accounting.
 // The PIPE_LANE record of an unconfirmed lane is outside the send order.
 func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now Time, ahead aheadSnap) {
 	if w.activity {
-		ol.activity = append(ol.activity, ol.pos)
+		// Past ackKeepMany unacknowledged entries (a peer that withholds
+		// PIPE_ACK on a pipe no limiter bounds) the newest absorbs the
+		// next: its acknowledgement covers both.
+		if k := len(ol.activity); k >= ackKeepMany {
+			ol.activity[k-1] = ol.pos
+		} else {
+			ol.activity = append(ol.activity, ol.pos)
+		}
 	}
 	if w.epochAnswer != 0 {
 		ol.answers = append(ol.answers, epochAck{pos: ol.pos, n: w.epochAnswer})
@@ -367,7 +379,13 @@ func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now 
 	ps := &p.out.snd
 	so := ps.so
 	n := ol.pos - start
-	if k := len(ol.segs); k > 0 && ol.segs[k-1].end == start && ol.segs[k-1].so+(start-ol.segs[k-1].pos) == so {
+	if k := len(ol.segs); k > 0 && ol.segs[k-1].end == start && (k >= ackKeepMany || ol.segs[k-1].so+(start-ol.segs[k-1].pos) == so) {
+		// Contiguous in send order, or, past ackKeepMany segments (lanes
+		// interleaving at a high batch rate, or a peer withholding
+		// PIPE_ACK), the newest absorbs the next as for activity: inside
+		// it the lane position maps to a send order at or below the true
+		// one, so the cumulative point is only reached later, never
+		// overstated, and the map takes no more memory.
 		ol.segs[k-1].end = ol.pos
 	} else {
 		ol.segs = append(ol.segs, sendSeg{pos: start, end: ol.pos, so: so})
@@ -384,8 +402,13 @@ func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now 
 		}
 		ps.elicitEnd = max64(ps.elicitEnd, end)
 		bubble, epoch := ps.re.sendFlags(ps.cum)
-		ps.samples = append(ps.samples, sample{end: end, sent: now, delivered: ps.delivered,
-			deliveredAt: ps.deliveredAt, firstSentAt: ps.firstSentAt, epoch: epoch, bubble: bubble, ahead: ahead, probe: w.suspPing})
+		smp := sample{end: end, sent: now, delivered: ps.delivered,
+			deliveredAt: ps.deliveredAt, firstSentAt: ps.firstSentAt, epoch: epoch, bubble: bubble, ahead: ahead, probe: w.suspPing}
+		if k := len(ps.samples); k >= ackKeepMany {
+			ps.samples[k-1] = smp // as for activity: a coarser sample, not more memory
+		} else {
+			ps.samples = append(ps.samples, smp)
+		}
 	}
 }
 

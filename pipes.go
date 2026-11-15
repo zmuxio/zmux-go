@@ -160,9 +160,10 @@ func (p *Pipe) admittedValue() any {
 // has not completed is first driven through it with ctx; a failed handshake closes it.
 // On a session that returned before establishment (EarlyData), AddPipe first waits for it.
 func (c *Conn) AddPipe(ctx context.Context, p PipeIO, o PipeOptions) (*Pipe, error) {
+	p = owned(p)
 	pp, taken, err := c.addPipeCall(ctx, p, o)
 	if err != nil && !taken {
-		closePipeIO(p)
+		closePipe(p)
 	}
 	return pp, err
 }
@@ -190,7 +191,10 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 	case rmSet:
 		mode = rm
 	case c.cfg.RecordPolicy != nil:
-		mode = c.cfg.RecordPolicy(joinCarrierInfo(p, false))
+		pol := c.cfg.RecordPolicy
+		if !safeLog(c.cfg.Logger, "Config.RecordPolicy", func() { mode = pol(joinCarrierInfo(p, false)) }) {
+			return nil, false, fmt.Errorf("%w: Config.RecordPolicy panicked", ErrInvalidConfig)
+		}
 	}
 	if mode > RecordTrusted {
 		return nil, false, fmt.Errorf("%w: record mode %v for a join", ErrInvalidConfig, mode)
@@ -224,9 +228,9 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 	}
 	if b, ok := o.QualityBand.get(); ok {
 		cb, _ := b.core() // checked by join
-		c.lock()
-		_ = c.s.SetQualityBand(int64(pp.id), &cb) // join refused it on a receive-only pipe
-		c.unlock()
+		c.locked(func() {
+			_ = c.s.SetQualityBand(int64(pp.id), &cb) // join refused it on a receive-only pipe
+		})
 	}
 	jctx, cancel := timeshim.WithTimeout(ctx, c.clk.source(), c.cfg.joinTimeout())
 	defer cancel()
@@ -262,11 +266,13 @@ func (p *Pipe) WaitAttached(ctx context.Context) error {
 	sig := core.NewSignal()
 	defer c.unwatchPipes(sig)
 	for {
-		c.lock()
-		sig.Drain()
-		c.watchPipes(sig)
-		pi, ok := c.s.PipeInfo(p.id)
-		c.unlock()
+		var pi core.PipeInfo
+		var ok bool
+		c.locked(func() {
+			sig.Drain()
+			c.watchPipes(sig)
+			pi, ok = c.s.PipeInfo(p.id)
+		})
 		switch {
 		case c.isDone():
 			return c.closedErr()
@@ -294,18 +300,18 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions) (*Pipe, *pip
 	if c.closing {
 		return nil, nil, c.errLocked()
 	}
-	outer := outerOf(p)
-	if err := nestPipe(c, outer); err != nil {
+	edge, err := nestPipe(c, outerOf(p))
+	if err != nil {
 		return nil, nil, err
 	}
 	if j.Mode == join.Sealed {
 		if err := sealedLimitErr(p, sealOverhead(p.Framing)); err != nil {
-			unnestPipe(c, outer)
+			edge.drop()
 			return nil, nil, err
 		}
 	}
 	pd := c.newPipeDrv(c.s.NextPipeID(), p)
-	pd.outer = outer
+	pd.nest = edge
 	low := pd.tcp.setLowWater(multiLowWater)
 	info := carrierInfo(p, pd.tcp, low)
 	if j.Mode == join.Sealed {
@@ -321,7 +327,7 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions) (*Pipe, *pip
 	j.In, j.Out, j.OutSig, j.Kind = info, info, pd.wsig, uint8(p.Carrier)
 	id, _, err := c.s.AddPipe(j)
 	if err != nil {
-		unnestPipe(c, pd.outer)
+		pd.nest.drop()
 		return nil, nil, apiErr(err)
 	}
 	pd.id = id
@@ -621,7 +627,7 @@ func (c *Conn) SetScheduler(s Scheduler) {
 	}
 	if cp, ok := s.(customPolicy); ok {
 		if c.hk == nil {
-			c.hk = &hooks{c: c, kick: make(chan struct{}, 1)}
+			c.hk = newHooks(c, cp.p)
 		}
 		c.hk.mu.Lock()
 		c.hk.pick = cp.p

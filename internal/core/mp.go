@@ -56,17 +56,17 @@ type multiPath struct {
 	// exporter is the exporter value read at establishment, kept only
 	// while keysPending: the keys wait for the deferred PSK or the declaration.
 	exporter     []byte
-	nextID       uint64          // next own pipe ID
-	cap          int             // unretired attachments of the peer we keep
-	ownCap       int             // unretired attachments we joined ourselves
-	replayW      uint64          // W
-	h            uint64          // highest verified peer pipe ID
-	bits         map[uint64]bool // replay bits of peer IDs without state
-	pendAbandon  map[uint64]bool // PIPE_ABANDON owed for IDs without state
-	pendCode     map[uint64]uint64
+	nextID       uint64            // next own pipe ID
+	cap          int               // unretired attachments of the peer we keep
+	ownCap       int               // unretired attachments we joined ourselves
+	replayW      uint64            // W
+	h            uint64            // highest verified peer pipe ID
+	bits         map[uint64]bool   // replay bits of peer IDs without state
+	pendAbandon  map[uint64]uint64 // PIPE_ABANDON owed for IDs without state: its code
 	backoffUntil Time
 	backoffExp   int
-	pingTimes    [8]Time // send times of the last 8 PIPE_PINGs
+	joinW        []*Signal // local joins the cap or the backoff holds (JoinPrepare)
+	pingTimes    [8]Time   // send times of the last 8 PIPE_PINGs
 	pingIdx      int
 	pingCount    int
 	redundantAt  Time   // when the redundant snapshot copy is due
@@ -75,8 +75,9 @@ type multiPath struct {
 	retained     uint64 // unacknowledged stream bytes
 
 	// Scheduler.
-	gateBuf      gate
-	dec          decision
+	gateBuf      gate     // one-shot readers' gate (bindings, tiers, picks, PipeInfo)
+	dec          decision // the writer's (mpWrite, writeData)
+	probe        decision // anyStreamOn's
 	tierSince    []tierMark
 	satRep       []satReport
 	fateHist     map[fateKey]*history
@@ -246,7 +247,7 @@ func (a *attach) peerAttached(id uint64) bool {
 // A failed read of the exporter is the session's INTERNAL_ERROR.
 func (s *Session) startMultipath() *wire.Error {
 	l, p := &s.cfg.Local, &s.peer
-	m := &multiPath{bits: map[uint64]bool{}, pendAbandon: map[uint64]bool{}, usePSK: l.SecretFlags&wire.SecretPSK != 0}
+	m := &multiPath{bits: map[uint64]bool{}, pendAbandon: map[uint64]uint64{}, usePSK: l.SecretFlags&wire.SecretPSK != 0}
 	m.usable = wire.Intersect(l.SessionCrypto.Suites, p.SessionCrypto.Suites)
 	m.usableGroups = wire.Intersect(l.SessionCrypto.Groups, p.SessionCrypto.Groups)
 	if l.SecretFlags&wire.SecretExporter != 0 && s.cfg.Exporter != nil {

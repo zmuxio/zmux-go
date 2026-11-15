@@ -120,7 +120,8 @@ type Candidate struct {
 
 	// Join joins carriers of the kind to c, for a kind whose Dial does
 	// not open a carrier that can join (a split bootstrap); nil: AddPipe
-	// on a carrier from Dial. ctx bounds the attempt, life the carriers.
+	// on a carrier from Dial. ctx bounds the attempt, life the carriers;
+	// pipes it returns with an error are aborted.
 	Join func(ctx, life context.Context, c *Conn, cred CarrierCredential, o PipeOptions) ([]*Pipe, error)
 }
 
@@ -247,8 +248,9 @@ type CarrierCache struct {
 	// SuccessTTL is how long a usable kind is remembered (6 h).
 	SuccessTTL time.Duration
 
-	m  map[cacheKey]*cacheEntry
-	mu sync.Mutex
+	m       map[cacheKey]*cacheEntry
+	inserts uint64 // entries added: every 64th prunes the expired
+	mu      sync.Mutex
 }
 
 type cacheKey struct {
@@ -330,6 +332,13 @@ func (cc *CarrierCache) record(key string, cand Candidate, ok bool, now time.Tim
 // update applies o to the entry of k; target, when known, is the
 // candidate's.
 func (cc *CarrierCache) update(k cacheKey, target CarrierTarget, o CacheOutcome, now time.Time) {
+	// The target is host code: asked and reset outside the lock.
+	var turl, tbase string
+	if target != nil && o == CacheUsable {
+		turl, tbase = target.URL(), target.Base()
+	} else if target != nil {
+		target.Reset()
+	}
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	if cc.m == nil {
@@ -339,28 +348,39 @@ func (cc *CarrierCache) update(k cacheKey, target CarrierTarget, o CacheOutcome,
 	if e == nil {
 		e = &cacheEntry{}
 		cc.m[k] = e
+		if cc.inserts++; cc.inserts%64 == 0 {
+			cc.pruneLocked(now)
+		}
 	}
 	if o == CacheUsable {
 		url := e.url
 		*e = cacheEntry{goodUntil: now.Add(cc.successTTL())}
 		switch {
-		case target != nil && target.URL() != target.Base():
-			e.url = target.URL()
+		case target != nil && turl != tbase:
+			e.url = turl
 		case target == nil:
 			e.url = url // a report keeps what redirects found
 		}
 		return
 	}
 	e.url = ""
-	if target != nil {
-		target.Reset()
-	}
 	lo, hi := cc.backoffBounds()
 	e.backoff = min(max(2*e.backoff, lo), hi)
 	if o == CacheRejected {
 		e.backoff = hi
 	}
 	e.goodUntil, e.failUntil = time.Time{}, now.Add(e.backoff)
+}
+
+// pruneLocked drops the expired entries, so that keys a host stops using
+// (a network left) do not stay for the process's life.
+func (cc *CarrierCache) pruneLocked(now time.Time) {
+	_, hi := cc.backoffBounds()
+	for k, e := range cc.m {
+		if e.expired(now, hi) {
+			delete(cc.m, k)
+		}
+	}
 }
 
 // backoffBounds returns BackoffMin and BackoffMax with their defaults,
@@ -649,7 +669,7 @@ func DialChoice(ctx context.Context, m CarrierChoice, cfg *Config, pol *CarrierC
 		if join && c.ConnectionState().Multipath {
 			pipe0, _ := c.Pipe(0)
 			seed := &modeSeed{mp: mp, pipes: []*Pipe{pipe0}, kind: i, born: chosen}
-			labels.Go(c.lctx, "pool", func() { _ = c.maintainPipes(c.Context(), PipePool{Count: 1}, seed) })
+			_ = c.goSide(c.lctx, "pool", func() { _ = c.maintainPipes(c.Context(), PipePool{Count: 1}, seed) })
 			return c, nil
 		}
 		// One carrier: the session ends with it, and counts against its
@@ -711,8 +731,11 @@ func candidateLife(ctx context.Context, bound time.Duration) (life context.Conte
 	life, cancelCause := context.WithCancelCause(context.WithoutCancel(ctx))
 	cancel = func() { cancelCause(nil) }
 	stopCtx := context.AfterFunc(ctx, func() { cancelCause(context.Cause(ctx)) })
-	t := time.AfterFunc(bound, func() { cancelCause(ErrHandshakeTimeout) })
-	return life, cancel, func() bool { return stopCtx() && t.Stop() }
+	t := time.AfterFunc(bound, func() { cancelCause(ErrHandshakeTimeout) }) // host clock: a carrier bound (Time)
+	return life, cancel, func() bool {
+		ctxLive := stopCtx()
+		return t.Stop() && ctxLive // both stopped, whichever already ran
+	}
 }
 
 // lifeErr is err of a try under life: ErrHandshakeTimeout when life
@@ -730,7 +753,8 @@ func lifeErr(life context.Context, err error) error {
 // dial opens a carrier of the candidate, labelled with its Kind
 // (PipeIO.Carrier).
 func (c Candidate) dial(ctx context.Context, cred CarrierCredential) (PipeIO, error) {
-	p, err := c.Dial(ctx, cred)
+	var p PipeIO
+	err := hostCall(nil, "Candidate.Dial", func() error { var err error; p, err = c.Dial(ctx, cred); return err })
 	if err == nil {
 		p.Carrier = c.Kind
 		if c.Variant != "" {
@@ -751,13 +775,16 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Carri
 		res.Outcome, res.Err = outcomeOf(err), err
 		return nil, res
 	}
+	// The timer, Start and the failure below share the carrier's closer;
+	// once the session drives it, the closer ends the session's pipe.
+	pio = owned(pio)
 	var expired chan struct{}
 	var tm *time.Timer
 	if p != nil {
 		expired = make(chan struct{})
 		tm = time.AfterFunc(p.timer(time.Since(t0)), func() {
 			close(expired)
-			closePipeIO(pio) // no CONNECTION_CLOSE: the carrier ends
+			closePipe(pio) // no CONNECTION_CLOSE: the carrier ends
 		})
 	}
 	// Every path below either aborts c or returns it to the caller.
@@ -781,7 +808,7 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Carri
 		}
 		err = lifeErr(life, err)
 		cancel()
-		closePipeIO(pio)
+		closePipe(pio)
 		if res.Outcome == 0 {
 			res.Outcome = outcomeOf(err)
 		}
@@ -805,7 +832,7 @@ func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred CarrierCre
 	var err error
 	if cand.Join != nil {
 		jctx, jcancel := context.WithTimeout(ctx, p.timerMin)
-		pipes, err = cand.Join(jctx, life, c, cred, o)
+		err = hostCall(c.cfg.Logger, "Candidate.Join", func() error { var err error; pipes, err = cand.Join(jctx, life, c, cred, o); return err })
 		jcancel()
 	} else {
 		t0 := time.Now()
@@ -826,6 +853,9 @@ func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred CarrierCre
 		err = ErrHandshakeTimeout
 	}
 	if err != nil {
+		for _, pp := range pipes { // a Join that failed after some pipes: none is left orphaned
+			_ = pp.Abort(err)
+		}
 		err = lifeErr(life, err)
 		cancel()
 		res.Err = err
@@ -834,7 +864,17 @@ func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred CarrierCre
 		}
 		return nil, res
 	}
-	context.AfterFunc(c.Context(), cancel)
+	// The carriers' life ends with their pipes (each Done also ends with
+	// the session), not later: a long session keeps nothing of a join
+	// whose pipes are gone.
+	if !c.goSide(c.lctx, "join-life", func() {
+		for _, p := range pipes {
+			<-p.Done()
+		}
+		cancel()
+	}) {
+		cancel() // the session ended, and with it the pipes
+	}
 	res.Outcome = CandidateUsable
 	return pipes, res
 }
@@ -914,6 +954,21 @@ func (mp *modePool) better(cur int, now time.Time) int {
 		}
 	}
 	return -1
+}
+
+// betterIn returns how long until a kind preferred to cur is no longer
+// failed (better then finds it), -1 when none is waiting.
+func (mp *modePool) betterIn(cur int, now time.Time) time.Duration {
+	d := time.Duration(-1)
+	if !mp.auto {
+		return d
+	}
+	for i := range cur {
+		if _, until := mp.p.cache.state(mp.p.key, mp.cands[i], now); !until.IsZero() && (d < 0 || until.Sub(now) < d) {
+			d = until.Sub(now)
+		}
+	}
+	return d
 }
 
 // join joins a member of kind i to c, reporting the try; a failed try is
@@ -1003,18 +1058,11 @@ func (c *Conn) reportCarrier(cand Candidate, results []CandidateResult, chosen b
 			c.carrierTries = append(c.carrierTries[:0], c.carrierTries[1:]...)
 		}
 		c.carrierTries = append(c.carrierTries, r)
-		ev := Event{Kind: EventCarrierCandidate, Carrier: r.Kind, Variant: r.Variant, Outcome: r.Outcome}
-		q.push(ev)
-		c.hk.trace(traceItem{ev: ev})
+		q.push(Event{Kind: EventCarrierCandidate, Carrier: r.Kind, Variant: r.Variant, Outcome: r.Outcome})
 	}
 	if chosen {
 		c.carrier, c.carrierVariant = cand.Kind, cand.Variant
-		ev := Event{Kind: EventCarrierChosen, Carrier: cand.Kind, Variant: cand.Variant}
-		q.push(ev)
-		c.hk.trace(traceItem{ev: ev})
+		q.push(Event{Kind: EventCarrierChosen, Carrier: cand.Kind, Variant: cand.Variant})
 	}
-	for _, w := range q.waiters {
-		w.Fire()
-	}
-	q.waiters = q.waiters[:0]
+	// The unlock's drain traces the events and wakes their waiters.
 }

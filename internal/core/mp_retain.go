@@ -22,6 +22,7 @@ const (
 	dPrio
 	dStatus
 	dAbandon
+	dAbandonID // PIPE_ABANDON for an ID without attachment state; val: its code
 )
 
 type frameDesc struct {
@@ -147,12 +148,25 @@ func (s *Session) reinjectPipe(p *Pipe) {
 	s.wakeAllWriters()
 }
 
+// streamOf returns the stream a retained frame is about, nil once the
+// stream was discarded: a retained frame outlives its stream, so every
+// reader of a logged stream frame takes the stream through it.
+func (s *Session) streamOf(d *frameDesc) *Stream { return s.streams[d.id] }
+
+// sendOf is streamOf for a frame of the sending part (STREAM).
+func (s *Session) sendOf(d *frameDesc) *Stream {
+	if st := s.streamOf(d); st != nil && st.hasS {
+		return st
+	}
+	return nil
+}
+
 // acked applies the acknowledgement of one frame.
 func (s *Session) acked(d *frameDesc) {
 	switch d.kind {
 	case dStream:
-		st := s.streams[d.id]
-		if st == nil || !st.hasS {
+		st := s.sendOf(d)
+		if st == nil {
 			return
 		}
 		sp := &st.snd
@@ -165,11 +179,11 @@ func (s *Session) acked(d *frameDesc) {
 		}
 		s.streamAckProgress(st)
 	case dReset:
-		if st := s.streams[d.id]; st != nil && st.hasS && st.snd.resetSent {
+		if st := s.streamOf(d); st != nil && st.hasS && st.snd.resetSent {
 			s.sendTerminal(st, sendResetRecvd)
 		}
 	case dPrio:
-		if st := s.streams[d.id]; st != nil && st.ext != nil && st.ext.reqSent == d.val {
+		if st := s.streamOf(d); st != nil && st.ext != nil && st.ext.reqSent == d.val {
 			st.ext.reqAcked = d.val
 		}
 	case dAbandon:
@@ -179,7 +193,7 @@ func (s *Session) acked(d *frameDesc) {
 			s.maybeRetire(p)
 		}
 	case dStop, dMaxData, dMaxStreamData, dMaxStreams, dDataBlocked, dStreamDataBlocked,
-		dStreamsBlocked, dGoAway, dStatus:
+		dStreamsBlocked, dGoAway, dStatus, dAbandonID:
 		// Delivered; nothing waits on the acknowledgement.
 	}
 }
@@ -195,7 +209,7 @@ func (s *Session) streamAckProgress(st *Stream) {
 		sp.q.release(min64(pre, sp.q.end))
 		s.heldLeave(st, h)
 		s.mp.release(min64(sp.q.base, sp.sent) - min64(rel, sp.sent))
-		s.wake(st.wsig)
+		s.sendChanged(st)
 	}
 	end := sp.q.end
 	if sp.reset {
@@ -210,8 +224,8 @@ func (s *Session) streamAckProgress(st *Stream) {
 func (s *Session) lost(d *frameDesc) {
 	switch d.kind {
 	case dStream:
-		st := s.streams[d.id]
-		if st == nil || !st.hasS {
+		st := s.sendOf(d)
+		if st == nil {
 			return
 		}
 		sp := &st.snd
@@ -230,11 +244,11 @@ func (s *Session) lost(d *frameDesc) {
 		}
 		s.sched.ensure(st)
 	case dReset:
-		if st := s.streams[d.id]; st != nil && st.hasS && st.snd.reset && st.snd.state != sendResetRecvd {
+		if st := s.streamOf(d); st != nil && st.hasS && st.snd.reset && st.snd.state != sendResetRecvd {
 			s.queueCtl(st, ctlReset)
 		}
 	case dStop:
-		if st := s.streams[d.id]; st != nil && st.hasR && st.rcv.stopped &&
+		if st := s.streamOf(d); st != nil && st.hasR && st.rcv.stopped &&
 			st.rcv.state != recvDataRead && st.rcv.state != recvResetRead {
 			s.queueCtl(st, ctlStop)
 		}
@@ -242,7 +256,7 @@ func (s *Session) lost(d *frameDesc) {
 		s.pend.maxData = true
 		s.pend.forceMaxData = true
 	case dMaxStreamData:
-		if st := s.streams[d.id]; st != nil && st.hasR && st.rcv.state == recvRecv {
+		if st := s.streamOf(d); st != nil && st.hasR && st.rcv.state == recvRecv {
 			st.forceMSD = true
 			s.queueCtl(st, ctlMaxStreamData)
 		}
@@ -254,7 +268,7 @@ func (s *Session) lost(d *frameDesc) {
 			s.pend.dataBlocked = true
 		}
 	case dStreamDataBlocked:
-		if st := s.streams[d.id]; st != nil && st.snd.blocked == st.snd.maxData+1 {
+		if st := s.streamOf(d); st != nil && st.snd.blocked == st.snd.maxData+1 {
 			s.queueCtl(st, ctlBlocked)
 		}
 	case dStreamsBlocked:
@@ -267,7 +281,7 @@ func (s *Session) lost(d *frameDesc) {
 			s.pend.goaway = true
 		}
 	case dPrio:
-		if st := s.streams[d.id]; st != nil && st.ext != nil && st.ext.reqAcked < st.ext.reqSeq {
+		if st := s.streamOf(d); st != nil && st.ext != nil && st.ext.reqAcked < st.ext.reqSeq {
 			s.queueCtl(st, ctlPrio)
 		}
 	case dStatus:
@@ -278,27 +292,18 @@ func (s *Session) lost(d *frameDesc) {
 		if p := s.pipe(d.id); p != nil && p.mp != nil && !p.mp.abandonAcked {
 			p.mp.abandonQueued = true
 		}
+	case dAbandonID:
+		// The same frame until acknowledged (MULTIPATH.md Section 7.4),
+		// while the ID is still in the replay window.
+		if m := s.mp; s.pipe(d.id) == nil && !m.stale(d.id) {
+			m.pendAbandon[d.id] = d.val
+		}
 	}
 	s.wakeAllWriters()
 }
 
 // dropResend removes [lo, hi) from the resend set.
-func (s *Session) dropResend(m *mpSend, lo, hi uint64) {
-	out := m.resend[:0]
-	for _, r := range m.resend {
-		if r.hi <= lo || r.lo >= hi {
-			out = append(out, r)
-			continue
-		}
-		if r.lo < lo {
-			out = append(out, rng{r.lo, lo})
-		}
-		if r.hi > hi {
-			out = append(out, rng{hi, r.hi})
-		}
-	}
-	m.resend = out
-}
+func (s *Session) dropResend(m *mpSend, lo, hi uint64) { m.resend.remove(lo, hi) }
 
 // retransmitBudget bounds the retained unacknowledged stream data: four
 // times the summed delivery rate times (smoothed RTT + the peer's ack

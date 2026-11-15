@@ -30,7 +30,7 @@ func (s *Session) Shutdown(code uint64, reason []byte) {
 		for _, w := range s.openW[i] {
 			s.wake(w)
 		}
-		s.openW[i] = s.openW[i][:0]
+		s.openW[i] = nil
 	}
 	g.code, g.reason = code, reason
 	if !s.feat.GoAway || !s.peerSeen {
@@ -51,9 +51,6 @@ func (s *Session) Shutdown(code uint64, reason []byte) {
 	}
 	s.checkShutdownDone()
 }
-
-// goawaySent runs when a GOAWAY frame left.
-func (s *Session) goawaySent() {}
 
 // fenceDone sends the final GOAWAY, the second phase of the shutdown.
 func (s *Session) fenceDone() {
@@ -110,7 +107,7 @@ func (s *Session) checkShutdownDone() {
 // onGoAway processes a received GOAWAY.
 func (s *Session) onGoAway(f *wire.Frame) {
 	g := &s.ga
-	lowered := false
+	lowered, first := false, !g.received
 	if !g.received {
 		g.received = true
 		g.recvWater = [2]uint64{f.MaxBidi, f.MaxUni}
@@ -133,18 +130,30 @@ func (s *Session) onGoAway(f *wire.Frame) {
 	if s.state == StateActive {
 		s.state = StateDraining
 	}
+	// A later lowering only rejects streams already allocated at or above
+	// the new mark (the first ended the unopened ones): a peer lowering it
+	// step by step gets the scan only while it rejects something, and is
+	// charged for each step that does nothing.
+	if !first && g.recvWater[0] >= s.loc[0].next && g.recvWater[1] >= s.loc[1].next {
+		s.charge()
+		s.emit(Event{Kind: EvGoAwayReceived, MaxBidi: g.recvWater[0], MaxUni: g.recvWater[1], Code: f.Code})
+		return
+	}
+	rejected := 0
 	for _, st := range s.allLocalStreams() {
 		if !st.idSet {
 			// Neither emitted nor pinned: fails with "going away".
 			st.snd.errState = &StreamError{Kind: StreamGoingAway}
 			st.rcv.errState = st.snd.errState
 			s.cancelUnopened(st)
-			s.wake(st.wsig)
-			s.wake(st.rsig)
+			s.streamChanged(st)
 			continue
 		}
 		t := typeIndex(st.bidi)
 		if st.id>>2 >= g.recvWater[t] {
+			if st.hasS && st.snd.errState == nil || st.hasR && st.rcv.errState == nil {
+				rejected++
+			}
 			e := &StreamError{Kind: StreamRejected, StreamID: st.id}
 			if st.hasS && st.snd.errState == nil {
 				st.snd.errState = e
@@ -152,9 +161,11 @@ func (s *Session) onGoAway(f *wire.Frame) {
 			if st.hasR && st.rcv.errState == nil {
 				st.rcv.errState = e
 			}
-			s.wake(st.wsig)
-			s.wake(st.rsig)
+			s.streamChanged(st)
 		}
+	}
+	if !first && rejected == 0 {
+		s.charge()
 	}
 	for t := range 2 {
 		for _, w := range s.openW[t] {

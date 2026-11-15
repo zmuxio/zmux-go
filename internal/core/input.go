@@ -25,16 +25,17 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 	if il == nil || il.ended {
 		return len(data)
 	}
-	if s.state == StateClosed {
+	switch s.inputMode() {
+	case inputProcess:
+	case inputDrop:
 		return len(data)
-	}
-	if s.state == StateClosing && !s.closeFr.waitLanes {
+	case inputScan:
 		// Lingering: discard without processing, but look for the peer's
 		// CONNECTION_CLOSE on lane 0.
 		return s.lingerScan(p, il, data)
 	}
 	consumed := 0
-	for consumed < len(data) && (s.state < StateClosing || s.closeFr.waitLanes) {
+	for consumed < len(data) && s.inputMode() == inputProcess {
 		rest := data[consumed:]
 		if il.expectTP {
 			if e := s.checkFirstRecord(rest); e != nil {
@@ -62,12 +63,36 @@ func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) in
 	return consumed
 }
 
+// inputMode is how input is taken now, the one rule of both entries
+// (Receive, ReceiveMessage): processed until CLOSING, and while a graceful
+// close waits for its lanes (PIPE_ACK and the peer's CONNECTION_CLOSE
+// still count); scanned for the peer's CONNECTION_CLOSE while lingering;
+// dropped once CLOSED.
+func (s *Session) inputMode() inputMode {
+	switch {
+	case s.state == StateClosed:
+		return inputDrop
+	case s.state == StateClosing && !s.closeFr.waitLanes:
+		return inputScan
+	}
+	return inputProcess
+}
+
+type inputMode uint8
+
+const (
+	inputProcess inputMode = iota
+	inputScan
+	inputDrop
+)
+
 // ReceiveMessage processes one message of a message-framed carrier:
 // the message is one record's Frames field.
 func (s *Session) ReceiveMessage(pipe, lane uint64, buf *Buf, msg []byte, now Time) {
 	s.SetNow(now)
 	p := s.pipe(pipe)
-	if p == nil || p.in == nil || s.state >= StateClosing && (s.state != StateClosing || s.closeFr.waitLanes) {
+	mode := s.inputMode()
+	if p == nil || p.in == nil || mode == inputDrop {
 		return
 	}
 	if p.mp != nil && p.mp.hs {
@@ -77,7 +102,7 @@ func (s *Session) ReceiveMessage(pipe, lane uint64, buf *Buf, msg []byte, now Ti
 	if il == nil || il.ended {
 		return
 	}
-	if s.state == StateClosing {
+	if mode == inputScan {
 		if lane == 0 && !p.in.ccRead && !il.noScan && recordHasClose(msg) {
 			s.peerCloseRead(p)
 		}
@@ -320,7 +345,7 @@ func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
 			}
 			s.conn.sendMax = f.Value
 			s.wakeAllWriters()
-			s.wakeCapacity()
+			s.wakeCapacityWaiters()
 		} else if !s.feat.Multipath {
 			s.charge()
 		}

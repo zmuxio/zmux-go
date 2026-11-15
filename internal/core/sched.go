@@ -30,7 +30,7 @@ func (st *Stream) sendable() bool {
 	if st.unsent() > 0 {
 		return true
 	}
-	if m := sp.mps; m != nil && (len(m.resend) > 0 || m.finResend) {
+	if m := sp.mps; m != nil && (m.resend.len() > 0 || m.finResend) {
 		return true
 	}
 	if sp.finWr && !sp.finSent && !sp.reset {

@@ -3,7 +3,9 @@ package zmux
 import (
 	"context"
 	"errors"
+	"io"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -99,9 +101,9 @@ func (c *Conn) watchEarly(p PipeIO) {
 			defer c.wg.Done()
 			select {
 			case <-es.HandshakeComplete():
-				c.lock()
-				c.s.CarrierHandshakeDone()
-				c.unlock()
+				c.locked(func() {
+					c.s.CarrierHandshakeDone()
+				})
 			case <-c.done:
 			}
 		})
@@ -166,14 +168,19 @@ func (c *Conn) awaitVerdict(pd *pipeDrv, lane uint64) {
 func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	defer c.wg.Done()
 	defer close(c.verdictDone)
-	ok, err := ec.EarlyAccepted(c.ctx)
+	var ok bool
+	var err error
+	if !safeLog(c.cfg.Logger, "EarlyClientCarrier.EarlyAccepted", func() { ok, err = ec.EarlyAccepted(c.ctx) }) {
+		c.locked(func() { c.s.FailInternal("the early carrier's verdict panicked") })
+		return
+	}
 	if err != nil {
 		return // the carrier failed: the pipe's own end reports it
 	}
 	if ok {
-		c.lock()
-		c.s.CarrierEarlyAccepted()
-		c.unlock()
+		c.locked(func() {
+			c.s.CarrierEarlyAccepted()
+		})
 		return
 	}
 	// What the carrier is given from here on follows the restart: the
@@ -194,36 +201,50 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 			return
 		}
 	}
-	p, err := ec.RestartEarly(c.ctx)
+	var p PipeIO
+	err = hostCall(c.cfg.Logger, "EarlyClientCarrier.RestartEarly", func() (err error) {
+		p, err = ec.RestartEarly(c.ctx)
+		return err
+	}) // a failure, a panic included, fails the session below
 	if err == nil && p.R == nil && p.W == nil {
 		err = errors.New("no pipe halves")
 	}
 	if err == nil {
+		// The restart's closer owns the halves of p that are not the boot
+		// carrier's (a restart that returned one new half and one old
+		// included); the boot carrier stays its pipe's.
+		var r, w io.Closer
+		if p.R != nil && !carrierio.SameHalf(p.R, boot.R) {
+			r = p.R
+		}
+		if p.W != nil && !carrierio.SameHalf(p.W, boot.W) {
+			w = p.W
+		}
+		p.own = carrierio.NewCloser(r, w)
 		err = p.validate()
 		if err != nil {
-			closePipeIO(p)
+			closePipe(p)
 		}
 	}
 	if err != nil {
-		c.lock()
-		c.failRestartLocked(old, "early data restart failed")
-		c.unlock()
+		c.locked(func() {
+			c.failRestartLocked(old, "early data restart failed")
+		})
 		return
 	}
 	p.Carrier, p.Label, p.FateGroup, p.Variant = boot.Carrier, boot.Label, boot.FateGroup, boot.Variant
-	sameR, sameW := sameHalf(p.R, boot.R), sameHalf(p.W, boot.W)
+	sameR, sameW := carrierio.SameHalf(p.R, boot.R), carrierio.SameHalf(p.W, boot.W)
 	c.lock()
 	defer c.unlock()
 	if c.closing || old == nil || c.pipes[0] != old {
-		if !sameR && !sameW {
-			closePipeIO(p)
-		}
+		closePipe(p)
 		return
 	}
 	if sameR || sameW {
 		// The same carrier past its handshake: its reader goes on, its
 		// writer starts again on the restarted session.
 		if !sameR || !sameW || p.Framing != boot.Framing || !c.s.RestartEarly(carrierInfo(p, old.tcp, false), c.clk.now()) {
+			closePipe(p)
 			c.failRestartLocked(old, "early data restart failed")
 			return
 		}
@@ -235,7 +256,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	if !c.s.RestartEarly(info, c.clk.now()) {
 		// The verdict contradicts what the early carrier delivered (the
 		// peer's parameters arrived on it): fail rather than mix carriers.
-		closePipeIO(p)
+		closePipe(p)
 		c.failRestartLocked(old, "early data rejected after the peer's parameters")
 		return
 	}

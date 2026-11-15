@@ -333,8 +333,8 @@ func (fakeAEADFunc) KeyLen() int            { return 24 }
 func (fakeAEADFunc) TagLen() int            { return 25 }
 func (fakeAEADFunc) RekeyInterval() uint64  { return 3 }
 func (fakeAEADFunc) MaxBytesPerKey() uint64 { return 0 }
-func (fakeAEADFunc) Nonce(n uint64) []byte {
-	return append(binary.BigEndian.AppendUint64(nil, n), make([]byte, 12)...)
+func (fakeAEADFunc) AppendNonce(dst []byte, n uint64) []byte {
+	return append(binary.BigEndian.AppendUint64(dst, n), make([]byte, 12)...)
 }
 func (fakeAEADFunc) New(k []byte) (cipher.AEAD, error) {
 	d := sha256.Sum256(k)

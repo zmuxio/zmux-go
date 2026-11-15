@@ -450,35 +450,51 @@ type winSample struct {
 	v  float64
 }
 
-// winMin is a minimum over a sliding time span (monotonic deque).
-type winMin struct{ q []winSample }
+// winMin is a minimum over a sliding time span (monotonic deque). The
+// samples that leave its front are cut lazily: q[h:] is the deque, and the
+// slice is compacted only once the dead front is its larger part, so a
+// peer that feeds a monotonic series costs amortised O(1) per sample.
+type winMin struct {
+	q []winSample
+	h int
+}
 
 func (w *winMin) update(now Time, v float64, span Duration) {
-	for len(w.q) > 0 && w.q[len(w.q)-1].v >= v {
+	for len(w.q) > w.h && w.q[len(w.q)-1].v >= v {
 		w.q = w.q[:len(w.q)-1]
 	}
 	w.q = append(w.q, winSample{now, v})
-	cut := 0
-	for cut < len(w.q)-1 && now.Sub(w.q[cut].at) > span {
-		cut++
+	for w.h < len(w.q)-1 && now.Sub(w.q[w.h].at) > span {
+		w.h++
 	}
-	if cut > 0 {
-		w.q = append(w.q[:0], w.q[cut:]...)
-	}
+	w.q, w.h = compactWin(w.q, w.h)
 }
 
 func (w *winMin) get() (Duration, bool) {
-	if len(w.q) == 0 {
+	if len(w.q) == w.h {
 		return 0, false
 	}
-	return Duration(w.q[0].v), true
+	return Duration(w.q[w.h].v), true
 }
 
-// winMax is a maximum over a sliding time span (monotonic deque).
-type winMax struct{ q []winSample }
+// compactWin drops a deque's dead front once it outweighs the live part.
+func compactWin(q []winSample, h int) ([]winSample, int) {
+	if h == 0 || 2*h < len(q) {
+		return q, h
+	}
+	n := copy(q, q[h:])
+	return q[:n], 0
+}
+
+// winMax is a maximum over a sliding time span (monotonic deque, cut
+// lazily as winMin is).
+type winMax struct {
+	q []winSample
+	h int
+}
 
 func (w *winMax) update(now Time, v float64, span Duration) {
-	for len(w.q) > 0 && w.q[len(w.q)-1].v <= v {
+	for len(w.q) > w.h && w.q[len(w.q)-1].v <= v {
 		w.q = w.q[:len(w.q)-1]
 	}
 	w.q = append(w.q, winSample{now, v})
@@ -486,19 +502,16 @@ func (w *winMax) update(now Time, v float64, span Duration) {
 }
 
 func (w *winMax) prune(now Time, span Duration) {
-	cut := 0
-	for cut < len(w.q) && now.Sub(w.q[cut].at) > span {
-		cut++
+	for w.h < len(w.q) && now.Sub(w.q[w.h].at) > span {
+		w.h++
 	}
-	if cut > 0 {
-		w.q = append(w.q[:0], w.q[cut:]...)
-	}
+	w.q, w.h = compactWin(w.q, w.h)
 }
 
 func (w *winMax) get(now Time, span Duration) (float64, bool) {
 	w.prune(now, span)
-	if len(w.q) == 0 {
+	if len(w.q) == w.h {
 		return 0, false
 	}
-	return w.q[0].v, true
+	return w.q[w.h].v, true
 }

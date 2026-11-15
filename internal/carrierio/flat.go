@@ -8,6 +8,10 @@ import (
 	"sync"
 )
 
+// flatKeep is the largest buffer the pool keeps: sixteen records of the
+// largest size.
+const flatKeep = 16 << 16
+
 var flatPool = sync.Pool{New: func() any { return new([]byte) }}
 
 // WriteFlat writes bufs to w with one Write of their concatenation, copied
@@ -23,7 +27,9 @@ func WriteFlat(w io.Writer, bufs [][]byte) (int, error) {
 		b = append(b, p...)
 	}
 	n, err := w.Write(b) // w retains nothing of b once it returns
-	*bp = b[:0]
-	flatPool.Put(bp)
+	if cap(b) <= flatKeep {
+		*bp = b[:0]
+		flatPool.Put(bp)
+	} // a rare huge batch goes to the collector, not into the pool for good
 	return n, err
 }

@@ -211,7 +211,7 @@ func TestInteropQUICServer(t *testing.T) {
 	b, _ := io.ReadAll(st)
 	_, _ = st.Write([]byte("ok"))
 	_ = st.Close()
-	if r := p.expect(t, "EARLY "); !strings.HasPrefix(r, "sent=true ") || !strings.HasSuffix(r, " reply=ok") {
+	if r := p.expect(t, "EARLY "); !peerEarlyOK(t, r) {
 		t.Fatalf("peer early: %q", r)
 	}
 	// Replayable holds only until the handshake completes, which on a
@@ -383,7 +383,9 @@ func TestInteropQUICExporterEarlyToPeerServer(t *testing.T) {
 		t.Fatalf("early: %q; session %v", r, context.Cause(c2.Context()))
 	}
 	if !qc.ConnectionState().Used0RTT {
-		t.Fatal("the connection did not use 0-RTT")
+		// 0-RTT is optional (SPEC Section 6.1.2): a peer server may refuse it,
+		// and the stream then goes after the handshake.
+		t.Log("the peer's server refused 0-RTT")
 	}
 	exporterKeys(t, c2, p.reports(t, "ESTABLISHED", "KEYS ")["KEYS "])
 	closeByPeer(t, ctx, c2, p)
@@ -432,9 +434,24 @@ func TestInteropQUICExporterEarlyFromPeerClient(t *testing.T) {
 		t.Fatalf("early stream: %q %q", st.Preamble(), b)
 	}
 	rep := p.reports(t, "EARLY ", "KEYS ", "ESTABLISHED")
-	if r := rep["EARLY "]; !strings.HasPrefix(r, "sent=true accepted=Some(true) ") || !strings.HasSuffix(r, " reply=ok") {
+	if r := rep["EARLY "]; !peerEarlyOK(t, r) {
 		t.Fatalf("peer early: %q", r)
 	}
 	exporterKeys(t, c2, rep["KEYS "])
 	closeByPeer(t, ctx, c2, p)
+}
+
+// peerEarlyOK reports whether a peer's EARLY report shows its early stream
+// answered: sent in 0-RTT and accepted, or, from a peer whose client offers
+// no 0-RTT (optional, SPEC Section 6), sent after the handshake.
+func peerEarlyOK(t *testing.T, r string) bool {
+	t.Helper()
+	if !strings.HasSuffix(r, " reply=ok") {
+		return false
+	}
+	if strings.HasPrefix(r, "sent=false ") {
+		t.Log("the peer's client offers no 0-RTT: its early stream went after the handshake")
+		return true
+	}
+	return strings.HasPrefix(r, "sent=true accepted=Some(true) ") || strings.HasPrefix(r, "sent=true accepted=true ")
 }

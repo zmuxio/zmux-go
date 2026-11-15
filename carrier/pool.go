@@ -16,10 +16,12 @@ import (
 // PoolLimits bound how a carrier pool uses each underlying connection. The
 // zero value selects the defaults.
 type PoolLimits struct {
-	// Policy, when set, is asked when a pipe is taken or released, and
-	// again after the decision's Recheck; Count
-	// is the connections to spread pipes over, Retire retires connections
-	// by fate group. Its ProbeInterval and ProbeJitter are not used (the
+	// Policy, when set, is asked when a pipe is taken or released, when a
+	// connection joins, and again after the decision's Recheck (none for
+	// a negative one); Count is the connections to spread pipes over,
+	// dialled as pipes are taken (0: a connection is dialled only when a
+	// pipe finds none with room), RetireConnections retires connections by
+	// fate group. Its ProbeInterval and ProbeJitter are not used (the
 	// pool dials no pipes), but a decision that fails
 	// zmux.PoolDecision.Validate is rejected as a whole, as by MaintainPipes:
 	// the pool goes on as with the zero decision and reports the error to
@@ -60,15 +62,22 @@ type ConnPool[C comparable] struct {
 	// Close closes a connection the pool retired once no pipe uses it.
 	Close func(C)
 
-	view     zmux.PoolView
+	view     zmux.PoolView     // under decMu: what the policy is asked about
+	next     zmux.PoolDecision // under decMu: the decision being asked for
 	lastDial time.Time
 	recheck  *time.Timer // asks the policy again after its Recheck
 	conns    []*pooledConn[C]
 	rejected []error // errors of rejected decisions, reported after unlocking
 	dec      zmux.PoolDecision
 	failures int
+	dialing  int // dials under way: counted as connections against the decision
 	mu       sync.Mutex
-	closed   bool
+	// decMu serialises the policy's decisions, asked without mu (the
+	// policy is host code and may call back into the pool); lock order
+	// decMu before mu, and a decision asked meanwhile keeps the last one.
+	decMu   sync.Mutex
+	closed  bool
+	pending bool // under mu: an event came while a decision was under way
 }
 
 type pooledConn[C comparable] struct {
@@ -111,13 +120,23 @@ func (p *ConnPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	l, err := p.take()
+	l, err := p.take(false)
 	if err != nil {
 		return nil, err
 	}
 	if l != nil {
 		return l, nil
 	}
+	// take counted this dial (dialing) with its time (lastDial): calls
+	// that find the pool short meanwhile do not dial past the decision.
+	dialed := false
+	defer func() {
+		if !dialed {
+			p.mu.Lock()
+			p.dialing--
+			p.mu.Unlock()
+		}
+	}()
 	// An expired-connection Close callback may have stopped this pool or context.
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -128,9 +147,6 @@ func (p *ConnPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	if closed {
 		return nil, errPoolClosed
 	}
-	p.mu.Lock()
-	p.lastDial = time.Now()
-	p.mu.Unlock()
 	c, err := p.Dial(ctx)
 	p.mu.Lock()
 	if err != nil {
@@ -140,6 +156,15 @@ func (p *ConnPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 	}
 	p.mu.Unlock()
 	if err != nil {
+		// A connection with room still serves (the dial was the policy's
+		// wish for another): the failure costs the caller nothing then,
+		// unless the caller gave up, as when the dial succeeds.
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		if l, terr := p.take(true); terr == nil && l != nil {
+			return l, nil
+		}
 		return nil, err
 	}
 	var b [8]byte
@@ -158,7 +183,10 @@ func (p *ConnPool[C]) Get(ctx context.Context) (*Lease[C], error) {
 		return nil, cancelled
 	}
 	p.conns = append(p.conns, pc)
-	p.consultLocked() // a member joined
+	p.dialing--
+	dialed = true
+	p.mu.Unlock()
+	p.lockConsulted() // a member joined
 	p.retireLocked(pc)
 	p.unlockReport()
 	return &Lease[C]{Conn: c, FateGroup: pc.fate, p: p, pc: pc}, nil
@@ -171,14 +199,15 @@ func (p *ConnPool[C]) maxActive() int {
 	return 8
 }
 
-// take leases the open connection with the most room, if any.
-func (p *ConnPool[C]) take() (*Lease[C], error) {
-	p.mu.Lock()
+// take leases the open connection with the most room, if any, unless the
+// policy asks for a new connection first (and anyRoom is false); a nil
+// lease counts the dial its caller makes (dialing, lastDial).
+func (p *ConnPool[C]) take(anyRoom bool) (*Lease[C], error) {
+	dial := p.lockConsulted()
 	if p.closed {
 		p.mu.Unlock()
 		return nil, errPoolClosed
 	}
-	dial := p.consultLocked()
 	var best *pooledConn[C]
 	var idle []C
 	live := p.conns[:0]
@@ -199,11 +228,14 @@ func (p *ConnPool[C]) take() (*Lease[C], error) {
 	clear(p.conns[len(live):])
 	p.conns = live
 	var lease *Lease[C]
-	if best != nil && !dial {
+	if best != nil && (!dial || anyRoom) {
 		best.active++
 		best.total++
 		p.retireLocked(best)
 		lease = &Lease[C]{Conn: best.c, FateGroup: best.fate, p: p, pc: best}
+	} else if !anyRoom {
+		p.dialing++
+		p.lastDial = time.Now()
 	}
 	p.unlockReport()
 	if p.Close != nil {
@@ -238,7 +270,8 @@ func (p *ConnPool[C]) release(pc *pooledConn[C]) {
 	if pc.active == 0 {
 		pc.idle = time.Now()
 	}
-	p.consultLocked()
+	p.mu.Unlock()
+	p.lockConsulted()
 	p.retireLocked(pc)
 	var idle []C
 	for _, x := range slices.Backward(p.conns) {
@@ -333,12 +366,11 @@ func keepActive[C comparable](cs []*pooledConn[C]) []*pooledConn[C] {
 // recheckNow asks the policy again when nothing else did within the last
 // decision's Recheck, and closes the idle connections it retired.
 func (p *ConnPool[C]) recheckNow() {
-	p.mu.Lock()
+	p.lockConsulted()
 	if p.closed {
 		p.mu.Unlock()
 		return
 	}
-	p.consultLocked()
 	var idle []C
 	for _, x := range slices.Backward(p.conns) {
 		p.retireLocked(x)
@@ -354,21 +386,49 @@ func (p *ConnPool[C]) recheckNow() {
 	}
 }
 
-// consultLocked asks the policy, retires the connections it names and
-// reports whether a new connection is due.
-func (p *ConnPool[C]) consultLocked() bool {
+// lockConsulted locks the pool after asking the policy, outside the lock,
+// and applying its decision: it retires the connections the decision
+// names and reports whether a new connection is due. While another
+// decision is under way (the policy calling back into the pool among
+// them) the last decision stands, and the one under way asks once more
+// before it ends, so that the event is decided on.
+func (p *ConnPool[C]) lockConsulted() bool {
 	if p.Policy == nil {
+		p.mu.Lock()
 		return false
 	}
+	if !p.decMu.TryLock() {
+		p.mu.Lock()
+		// The decision under way checks pending, and ends, under mu.
+		if !p.decMu.TryLock() {
+			p.pending = true
+			return p.dueLocked(time.Now(), p.openLocked())
+		}
+		p.mu.Unlock()
+	}
+	defer p.decMu.Unlock() // under mu, after the last look at pending
+	p.mu.Lock()
+	now := p.askLocked()
+	if p.pending {
+		now = p.askLocked()
+	}
+	return !p.closed && p.dueLocked(now, p.openLocked())
+}
+
+// askLocked asks the policy, outside mu, and applies its decision; under
+// decMu and mu.
+func (p *ConnPool[C]) askLocked() time.Time {
+	p.pending = false
 	now := time.Now()
+	if p.closed {
+		return now
+	}
 	v := &p.view
 	v.Now, v.Connections, v.Failures, v.LastDial, v.Members = now, true, p.failures, p.lastDial, v.Members[:0]
-	open := 0
 	for _, pc := range p.conns {
 		if pc.retired {
 			continue
 		}
-		open++
 		m := zmux.PoolMember{FateGroup: pc.fate, Age: now.Sub(pc.born), Pipes: pc.active}
 		if pc.active == 0 {
 			// Since its last pipe ended, or since it was established when
@@ -381,13 +441,17 @@ func (p *ConnPool[C]) consultLocked() bool {
 		}
 		v.Members = append(v.Members, m)
 	}
-	if err := p.dec.Ask(p.Policy, v); err != nil {
-		p.dec = zmux.PoolDecision{RetirePipes: p.dec.RetirePipes[:0], RetireConnections: p.dec.RetireConnections[:0]} // rejected, as by MaintainPipes
+	p.mu.Unlock()
+	err := p.next.Ask(p.Policy, v)
+	p.mu.Lock()
+	if err != nil {
+		p.next = zmux.PoolDecision{RetirePipes: p.next.RetirePipes[:0], RetireConnections: p.next.RetireConnections[:0]} // rejected, as by MaintainPipes
 		if p.DecisionRejected != nil {
 			p.rejected = append(p.rejected, err)
 		}
 	}
-	if r := p.dec.RecheckAfter(); r > 0 && !p.closed {
+	p.dec, p.next = p.next, p.dec
+	if r := p.dec.RecheckAfter(); !p.closed {
 		if p.recheck == nil {
 			p.recheck = time.AfterFunc(r, p.recheckNow)
 		} else {
@@ -398,10 +462,25 @@ func (p *ConnPool[C]) consultLocked() bool {
 		for _, pc := range p.conns {
 			if pc.fate == id && !pc.retired {
 				pc.retired = true
-				open--
 			}
 		}
 	}
+	return now
+}
+
+// openLocked counts the connections not retired, and those being dialled.
+func (p *ConnPool[C]) openLocked() int {
+	open := p.dialing
+	for _, pc := range p.conns {
+		if !pc.retired {
+			open++
+		}
+	}
+	return open
+}
+
+// dueLocked reports whether the decision asks for another connection now.
+func (p *ConnPool[C]) dueLocked(now time.Time, open int) bool {
 	return open < p.dec.Count && (p.lastDial.IsZero() || now.Sub(p.lastDial) >= p.dec.DialAfter)
 }
 

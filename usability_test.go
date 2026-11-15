@@ -168,7 +168,7 @@ func TestSecureFirstPipeEndToEnd(t *testing.T) {
 			_ = c.Close()
 			_ = c.Wait()
 		} else {
-			closePipeIO(p)
+			ClosePipeIO(p)
 		}
 	}
 }

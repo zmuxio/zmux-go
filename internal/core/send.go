@@ -1,6 +1,10 @@
 package core
 
-import "github.com/zmuxio/zmux-go/internal/wire"
+import (
+	"slices"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
+)
 
 // ---- writing (sending part) ----
 
@@ -8,7 +12,7 @@ import "github.com/zmuxio/zmux-go/internal/wire"
 // the smaller remaining credit minus what it already holds unsent.
 func (s *Session) SendCapacity(st *Stream) uint64 {
 	sp := &st.snd
-	if !st.hasS || st.cancelled || sp.errState != nil || sp.finWr || sp.reset || sp.stopped || s.err != nil {
+	if !s.writable(st) {
 		return 0
 	}
 	unsent := st.unsent()
@@ -60,8 +64,20 @@ func (sp *sendPart) sendEnd() uint64 {
 	return sp.q.end
 }
 
-// writeErr returns the error a write gets now, nil when it may proceed.
+// writable reports whether the part takes writes now: the one test of
+// every write, capacity and room check (writeErr names why not). A part
+// that was reset, stopped, cancelled or discarded has its error state set
+// or its FIN written, so these four cover them.
+func (s *Session) writable(st *Stream) bool {
+	return st.hasS && st.snd.errState == nil && s.err == nil && !st.snd.finWr
+}
+
+// writeErr returns the error a write gets now, nil when it may proceed
+// (writable).
 func (s *Session) writeErr(st *Stream) error {
+	if s.writable(st) {
+		return nil
+	}
 	sp := &st.snd
 	switch {
 	case !st.hasS:
@@ -70,10 +86,22 @@ func (s *Session) writeErr(st *Stream) error {
 		return sp.errState
 	case s.err != nil:
 		return s.err
-	case sp.finWr:
-		return &StreamError{Kind: StreamClosedLocally, StreamID: st.id}
 	}
-	return nil
+	return &StreamError{Kind: StreamClosedLocally, StreamID: st.id}
+}
+
+// admitWrite is writeErr for a write that takes bytes: a write that fails
+// also ends its wait for room, so the stream stops counting as a waiting
+// writer whatever ended the part (Close, reset, stop, session end).
+func (s *Session) admitWrite(st *Stream) error {
+	if st.snd.res != nil {
+		panic("zmux: a write during a WriteSpace loan") // one writer at a time (the caller's wmu)
+	}
+	err := s.writeErr(st)
+	if err != nil {
+		s.endWaitWrite(st)
+	}
+	return err
 }
 
 // Write takes as much of p as the send buffer admits and returns the count;
@@ -81,7 +109,7 @@ func (s *Session) writeErr(st *Stream) error {
 // all of p was taken.
 func (s *Session) Write(st *Stream, p []byte, fin bool) (int, error) {
 	s.pickInput()
-	if err := s.writeErr(st); err != nil {
+	if err := s.admitWrite(st); err != nil {
 		return 0, err
 	}
 	sp := &st.snd
@@ -121,7 +149,7 @@ func (s *Session) Write(st *Stream, p []byte, fin bool) (int, error) {
 // reads or writes.
 func (s *Session) WriteSpace(st *Stream, limit int) ([]byte, error) {
 	s.pickInput()
-	if err := s.writeErr(st); err != nil {
+	if err := s.admitWrite(st); err != nil {
 		return nil, err
 	}
 	sp := &st.snd
@@ -138,6 +166,7 @@ func (s *Session) WriteSpace(st *Stream, limit int) ([]byte, error) {
 		n = int(room)
 	}
 	sp.res = blk
+	s.endWaitWrite(st) // room found: the writer fills it, it no longer waits
 	return blk.b[blk.n : blk.n+n : blk.n+n], nil
 }
 
@@ -153,7 +182,7 @@ func (s *Session) CommitWrite(st *Stream, n int) error {
 	}
 	sp.res = nil
 	s.pickInput()
-	if err := s.writeErr(st); err != nil || n == 0 {
+	if err := s.admitWrite(st); err != nil || n == 0 {
 		blk.unref()
 		return err
 	}
@@ -290,14 +319,15 @@ func (s *Session) sendRoom(st *Stream) uint64 {
 // SetSendBuffer bounds the part's written-but-unreleased bytes.
 func (s *Session) SetSendBuffer(st *Stream, n uint64) {
 	st.snd.bufLimit = max64(n, 16<<10)
-	s.wake(st.wsig)
+	s.sendChanged(st)
 }
 
-// WaitWrite registers sig for write progress of st.
+// WaitWrite makes st a writer that waits for send-buffer room, until the
+// write takes its last byte, fails or ends its wait (EndWaitWrite); the core
+// wakes its slot (SetSignals) on every change of room, credit or state.
 // A write that begins waiting within 1 ms of the stream's previous write
 // completing continues the same wait (age).
-func (s *Session) WaitWrite(st *Stream, sig *Signal) {
-	st.wsig = sig
+func (s *Session) WaitWrite(st *Stream) {
 	sp := &st.snd
 	if !sp.wwait {
 		if !sp.wwaitSet || s.now.Sub(sp.writeDone) > Millisecond {
@@ -312,9 +342,12 @@ func (s *Session) WaitWrite(st *Stream, sig *Signal) {
 // EndWaitWrite ends the wait WaitWrite began: the stream no longer counts as
 // a waiting writer (its size class, the scheduler's expected bytes and the
 // tier's aging). A write that waits calls it when it stops waiting without
-// having taken its last byte: room found, cancelled, past its deadline, or
-// failed.
-func (s *Session) EndWaitWrite(st *Stream) {
+// having taken its last byte: room found, cancelled or past its deadline.
+// The core ends the wait itself when the write completes or fails, and
+// when the part ends (Finish, reset).
+func (s *Session) EndWaitWrite(st *Stream) { s.endWaitWrite(st) }
+
+func (s *Session) endWaitWrite(st *Stream) {
 	sp := &st.snd
 	if !sp.wwait {
 		return
@@ -334,8 +367,8 @@ func (s *Session) Finish(st *Stream) error {
 		return err
 	}
 	st.snd.finWr = true
-	s.wake(st.wsig)
-	s.checkCapacity(st)
+	s.endWaitWrite(st)
+	s.sendChanged(st)
 	s.becomeSend(st)
 	return nil
 }
@@ -345,6 +378,12 @@ func (s *Session) Finish(st *Stream) error {
 func (s *Session) SetReliableBoundary(st *Stream) {
 	st.snd.boundary = st.snd.appWritten
 	st.snd.hasBound = true
+}
+
+// cancelledLocally reports whether the application reset the sending part
+// (CancelWrite) before any STOP_SENDING ended it.
+func (sp *sendPart) cancelledLocally() bool {
+	return sp.errState != nil && sp.errState.Kind == StreamClosedLocally
 }
 
 // Reset resets the sending part with code (CancelWrite).
@@ -403,9 +442,10 @@ func (s *Session) startReset(st *Stream, code uint64, stopReply bool) {
 		sp.resetAt = false
 	}
 	sp.finWr = false
+	s.endWaitWrite(st)
 	s.queueCtl(st, ctlReset)
 	s.sched.ensure(st)
-	s.checkCapacity(st)
+	s.sendChanged(st) // the part takes no more writes: a blocked one fails now
 	s.wakeAllWriters()
 }
 
@@ -419,8 +459,7 @@ func (s *Session) cancelUnopened(st *Stream) {
 	if st.hasR {
 		st.rcv.state = recvDataRead
 	}
-	s.wakeStream(st)
-	s.checkCapacity(st)
+	s.streamChanged(st)
 	s.unlinkCtl(st)
 	st.ctl = 0
 	s.dropProvisional(st)
@@ -453,7 +492,6 @@ func (s *Session) onStopSending(st *Stream, code uint64) {
 		rc = sp.resetCode
 	}
 	s.startReset(st, rc, true)
-	s.wake(st.wsig)
 }
 
 // onSendCredit applies MAX_STREAM_DATA.
@@ -465,9 +503,8 @@ func (s *Session) onSendCredit(st *Stream, v uint64) bool {
 		st.snd.creditAt = s.now
 	}
 	st.snd.maxData = v
-	s.checkCapacity(st)
 	s.sched.ensure(st)
-	s.wake(st.wsig)
+	s.sendChanged(st)
 	s.wakeAllWriters()
 	return true
 }
@@ -484,70 +521,55 @@ func (s *Session) sendTerminal(st *Stream, state sendState) {
 	sp.q.drop()
 	s.heldLeave(st, h)
 	s.sched.remove(st)
-	s.wake(st.wsig)
+	s.sendChanged(st)
 	s.maybeDiscard(st)
 }
 
 // ---- send capacity ----
 
-// WaitSendCapacity registers sig to be woken once the part's capacity is
-// at least n, or above 0 while it holds nothing unsent, or the part can
-// no longer send. It reports whether the condition holds now (sig is then
-// not registered).
-func (s *Session) WaitSendCapacity(st *Stream, n uint64, sig *Signal) bool {
+// WaitSendCapacity reports whether the part's capacity is at least n, or
+// above 0 while it holds nothing unsent, or the part can no longer send.
+// When not, st waits for capacity until CancelCapacityWait or a later call
+// that holds: its waiter (the handle's write slot) is woken through
+// sendChanged by every change the condition depends on, the session's
+// credit included (wakeCapacityWaiters).
+func (s *Session) WaitSendCapacity(st *Stream, n uint64) bool {
 	if s.capReady(st, n) {
+		s.CancelCapacityWait(st)
 		return true
 	}
-	x := st.x()
-	if x.capSig == nil {
+	if x := st.x(); !x.capWait {
+		x.capWait = true
 		s.capWaiters = append(s.capWaiters, st)
 	}
-	x.capSig, x.capMin = sig, max64(n, 1)
 	return false
 }
 
-// CancelCapacityWait drops a waiter.
+// CancelCapacityWait ends st's capacity wait.
 func (s *Session) CancelCapacityWait(st *Stream) {
-	if st.ext != nil {
-		st.ext.capSig = nil
+	if st.ext == nil || !st.ext.capWait {
+		return
 	}
-	for i, x := range s.capWaiters {
-		if x == st {
-			s.capWaiters = append(s.capWaiters[:i], s.capWaiters[i+1:]...)
-			return
-		}
+	st.ext.capWait = false
+	if i := slices.Index(s.capWaiters, st); i >= 0 {
+		s.capWaiters = slices.Delete(s.capWaiters, i, i+1)
 	}
 }
 
 func (s *Session) capReady(st *Stream, n uint64) bool {
-	sp := &st.snd
-	if !st.hasS || st.cancelled || sp.errState != nil || sp.finWr || sp.reset || sp.stopped || s.err != nil || st.discarded {
+	if !s.writable(st) {
 		return true
 	}
 	c := s.SendCapacity(st)
 	return c >= max64(n, 1) || c > 0 && st.unsent() == 0
 }
 
-// checkCapacity wakes st's capacity waiter when its condition holds.
-func (s *Session) checkCapacity(st *Stream) {
-	if x := st.ext; x != nil && x.capSig != nil && s.capReady(st, x.capMin) {
-		s.wake(x.capSig)
-		s.CancelCapacityWait(st)
-	}
-}
-
-// wakeCapacity re-evaluates every capacity waiter (session credit or state
-// changed).
-func (s *Session) wakeCapacity() {
-	for i := 0; i < len(s.capWaiters); {
-		st := s.capWaiters[i]
-		if x := st.ext; x != nil && x.capSig != nil && s.capReady(st, x.capMin) {
-			s.wake(x.capSig)
-			x.capSig = nil
-			s.capWaiters = append(s.capWaiters[:i], s.capWaiters[i+1:]...)
-			continue
-		}
-		i++
+// wakeCapacityWaiters wakes the streams that wait for capacity when the
+// session's credit or parameters changed, the one input of SendCapacity
+// that is not the stream's own.
+func (s *Session) wakeCapacityWaiters() {
+	for _, st := range s.capWaiters {
+		s.sendChanged(st)
 	}
 }
 
@@ -558,7 +580,7 @@ func (s *Session) WriteChunk(st *Stream, data []byte, buf *Buf, fin bool) (int, 
 	if buf == nil {
 		return s.Write(st, data, fin)
 	}
-	if err := s.writeErr(st); err != nil {
+	if err := s.admitWrite(st); err != nil {
 		return 0, err
 	}
 	sp := &st.snd
@@ -593,6 +615,19 @@ func (s *Session) WriteChunk(st *Stream, data []byte, buf *Buf, fin bool) (int, 
 // proceed.
 func (s *Session) WriteErrOf(st *Stream) error { return s.writeErr(st) }
 
+// WritableRoom returns the room a write takes now, or the error it gets;
+// room found ends a write's wait for it (the caller writes next or not).
+func (s *Session) WritableRoom(st *Stream) (uint64, error) {
+	if err := s.admitWrite(st); err != nil {
+		return 0, err
+	}
+	room := s.sendRoom(st)
+	if room > 0 {
+		s.endWaitWrite(st)
+	}
+	return room, nil
+}
+
 // SendRoom returns what the send buffer admits for the part now.
 func (s *Session) SendRoom(st *Stream) uint64 { return s.sendRoom(st) }
 
@@ -603,7 +638,7 @@ func (s *Session) SendRoom(st *Stream) uint64 { return s.sendRoom(st) }
 // headers are copied. The caller owns b until it reports the write to b's
 // session. It returns the bytes taken.
 func (s *Session) WriteBatch(st *Stream, b *Batch, skip int) (int, error) {
-	if err := s.writeErr(st); err != nil {
+	if err := s.admitWrite(st); err != nil {
 		return 0, err
 	}
 	sp := &st.snd

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -30,19 +31,14 @@ const MaxRecordSize = wire.MaxRecordSize
 
 // MessageReader is the receiving half of a message-framed carrier.
 type MessageReader interface {
-	// ReadMessage returns the next whole message. The caller owns the returned slice.
-	ReadMessage() ([]byte, error)
-}
-
-// MessageLimitReader is an optional capability of a MessageReader:
-// ReadMessageLimit returns the next message when it holds at most limit
-// bytes, and fails with ErrMessageTooLarge for a longer one after reading
-// no more than limit+1 of its bytes into memory (the carrier is then
-// unusable). The admission of a listener reads a first message with it
-// (Admission.Peek, MaxPeek); without it, the message is read whole, up
-// to the carrier's own limit, and then checked.
-type MessageLimitReader interface {
-	ReadMessageLimit(limit int) ([]byte, error)
+	// ReadMessage returns the next whole message when it holds at most
+	// limit bytes, and fails with ErrMessageTooLarge for a longer one
+	// after reading no more than limit+1 of its bytes into memory (the
+	// carrier is then unusable). limit is always positive: zmux never asks
+	// for more than MaxRecordSize, and the admission of a listener asks for
+	// its peek (Admission.Peek, MaxPeek). The caller owns the returned
+	// slice.
+	ReadMessage(limit int) ([]byte, error)
 }
 
 // MessageWriter is the sending half of a message-framed carrier.
@@ -104,6 +100,10 @@ type BuffersWriter interface {
 type PipeIO struct {
 	R io.ReadCloser
 	W io.WriteCloser
+	// own is the one closer of the carrier while zmux sets it up (owned),
+	// shared by every copy and prefixed view of it; nil for a PipeIO zmux
+	// has not taken.
+	own *carrierio.Closer
 	// Protocol is the application protocol the carrier negotiated other
 	// than by the ALPN of a TLS handshake this process runs, such as a
 	// WebSocket subprotocol (ConnectionState.ApplicationProtocol); empty
@@ -213,7 +213,9 @@ type Handshaker interface {
 type CloseWriter interface{ CloseWrite() error }
 
 // Aborter is a sending half that fails abruptly: Abort is used before
-// Close when a pipe fails.
+// Close when a pipe fails, and after a graceful Close whose work (a
+// final flush, a TLS close_notify) has not ended within the close bound,
+// to end what that Close left running.
 type Aborter interface{ Abort(cause error) }
 
 // UnsentReporter is a sending half (or a lane's writer) that counts the
@@ -252,20 +254,62 @@ type CloseCodeRecorder interface {
 	RecordCloseCode(code ApplicationErrorCode, reason string)
 }
 
+// owned returns p with the closer that ends it while zmux sets it up: the
+// one it has, or a new one when zmux takes it here.
+func owned(p PipeIO) PipeIO {
+	if p.own == nil {
+		p.own = carrierio.NewCloser(p.R, p.W)
+	}
+	return p
+}
+
+// closePipe closes a carrier zmux sets up through its closer: each half
+// once, whichever of its holders asks first; once its attachment owns it
+// (halfCloser.take), the attachment closes it.
+func closePipe(p PipeIO) {
+	if p.own != nil {
+		p.own.Close()
+		return
+	}
+	ClosePipeIO(p)
+}
+
+// releasePipe hands p from its setup closer to the next owner, whose close
+// is next (nil: none); false: it was closed already.
+func releasePipe(p PipeIO, next func()) bool { return p.own == nil || p.own.Release(next) }
+
 // halfCloser closes the halves of a carrier exactly once each, also when R
-// and W are the same object.
+// and W are the same object. It owns them from take on; until then the
+// setup's closer (PipeIO.own) does.
 type halfCloser struct {
 	io      PipeIO
 	same    bool
 	rOnce   sync.Once
-	wOnce   sync.Once
+	wOnce   sync.Once   // the write side's graceful end
+	wClose  sync.Once   // W.Close: once, whichever end calls it (each half is closed exactly once)
 	wDone   atomic.Bool // the write side's graceful end has returned
 	allOnce sync.Once
 }
 
 func newHalfCloser(p PipeIO) *halfCloser {
-	same := p.R != nil && p.W != nil && sameHalf(p.R, p.W)
+	same := p.R != nil && p.W != nil && carrierio.SameHalf(p.R, p.W)
 	return &halfCloser{io: p, same: same}
+}
+
+// setupClose closes the halves through the setup's closer while it owns
+// them (before take), and reports whether it did.
+func (h *halfCloser) setupClose() bool {
+	return h.io.own != nil && !h.io.own.CloseUnreleased()
+}
+
+// take makes h the owner of the halves as the attachment starts; a later
+// close through the setup's closer is next. Halves the setup closed
+// already are not closed again.
+func (h *halfCloser) take(next func()) {
+	if !releasePipe(h.io, next) {
+		h.rOnce.Do(func() {})
+		h.wClose.Do(func() {})
+	}
 }
 
 // recordCloseCode passes the session's close code to the halves that take
@@ -284,7 +328,7 @@ func (h *halfCloser) closeRead() {
 	if h.io.R == nil {
 		return
 	}
-	if h.same {
+	if h.same || h.setupClose() {
 		return // closed with the write half or by closeAll
 	}
 	h.rOnce.Do(func() { _ = h.io.R.Close() })
@@ -302,9 +346,16 @@ func (h *halfCloser) shutdownWrite() {
 			return
 		}
 		if !h.same {
-			_ = h.io.W.Close()
+			h.closeW()
 		}
 	})
+}
+
+func (h *halfCloser) closeW() {
+	if h.setupClose() {
+		return
+	}
+	h.wClose.Do(func() { _ = h.io.W.Close() })
 }
 
 // closeAll closes every half; abort uses Abort where offered and closes the
@@ -314,11 +365,14 @@ func (h *halfCloser) closeAll(abort bool, cause error) {
 		if abort {
 			h.abort(cause)
 		}
+		if h.setupClose() {
+			return
+		}
 		if h.io.W != nil {
-			_ = h.io.W.Close()
+			h.closeW()
 		}
 		if h.io.R != nil && !h.same {
-			_ = h.io.R.Close()
+			h.rOnce.Do(func() { _ = h.io.R.Close() })
 		}
 	})
 }
@@ -446,4 +500,19 @@ func terminatedTLS(x any) (tls.ConnectionState, bool) {
 		}
 	}
 	return tls.ConnectionState{}, false
+}
+
+// ClosePipeIO closes a carrier's halves: W, then R unless it is W. Each
+// call closes each distinct half once; it is not idempotent, so the
+// holders of one carrier must agree on which of them closes it. R and W
+// are one half when they are the same comparable value (a pointer, as a
+// net.Conn usually is); one value of a type that cannot be compared (a
+// struct holding a slice, say) counts as two halves and is closed twice.
+func ClosePipeIO(p PipeIO) {
+	if p.W != nil {
+		_ = p.W.Close()
+	}
+	if p.R != nil && !carrierio.SameHalf(p.R, p.W) {
+		_ = p.R.Close()
+	}
 }

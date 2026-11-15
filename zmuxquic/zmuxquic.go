@@ -21,6 +21,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
@@ -372,14 +373,13 @@ type qStream struct {
 	qc *quic.Conn
 	s  *quic.Stream
 	// rec, when set, records the close code of the pipe's session for its
-	// connection (zmux.CloseCodeRecorder); ended, when set, is called once
-	// both halves have ended.
+	// connection (zmux.CloseCodeRecorder); lease, when set, ends the pooled
+	// connection's lease once both halves have ended.
 	rec    *closeRecord
-	ended  func()
+	lease  *carrierio.HalfLease
 	wOnce  sync.Once
 	rOnce  sync.Once
 	mu     sync.Mutex
-	halves atomic.Int32
 	closed bool // Dial's session ended: a replacement connection is closed
 	early  bool // Dial sent the stream in 0-RTT
 }
@@ -389,12 +389,8 @@ func (q *qStream) pipe() zmux.PipeIO {
 	return zmux.PipeIO{R: (*qReader)(q), W: q, Carrier: zmux.CarrierQUIC}
 }
 
-// halfEnded counts the end of one half; the second calls ended.
-func (q *qStream) halfEnded() {
-	if q.halves.Add(1) == 2 && q.ended != nil {
-		q.ended()
-	}
-}
+// halfEnded counts the end of one half (lease).
+func (q *qStream) halfEnded() { q.lease.HalfEnded() }
 
 // RecordCloseCode records the code of the pipe's session for the pooled
 // connection's close (zmux.CloseCodeRecorder).
@@ -405,7 +401,8 @@ func (q *qStream) RecordCloseCode(code zmux.ApplicationErrorCode, reason string)
 }
 
 // closeRecord is the close code of the last session a pooled connection
-// carried.
+// carried. A QUIC application error code holds the whole 62-bit code, so
+// unlike zmuxh3's (WebTransport's are 32-bit) it keeps any code as is.
 type closeRecord struct {
 	reason string
 	code   quic.ApplicationErrorCode
@@ -652,7 +649,12 @@ type pooled struct {
 	rec       closeRecord // the close code of the last session it carried
 	mu        sync.Mutex  // held while the first stream is opened
 	presented bool
+	failed    bool // the credential failed to go out (under mu)
 }
+
+// errCredentialFailed reports a connection whose first stream failed to
+// carry the credential: the server rejects every later stream of it.
+var errCredentialFailed = errors.New("zmuxquic: the connection's credential failed")
 
 // Shutdown retires every connection: idle ones close now, the others once
 // their pipes end; OpenPipe fails afterwards.
@@ -691,13 +693,8 @@ func (p *ConnPool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	if p.pool.Dial == nil {
 		return zmux.PipeIO{}, errors.New("zmuxquic: a ConnPool is made by NewConnPool")
 	}
-	l, err := p.pool.Get(ctx)
+	l, pio, err := p.lease(ctx)
 	if err != nil {
-		return zmux.PipeIO{}, err
-	}
-	pio, err := p.open(ctx, l.Conn)
-	if err != nil {
-		l.Release()
 		return zmux.PipeIO{}, err
 	}
 	// The lease ends with the pipe: once both of its halves have ended,
@@ -705,13 +702,35 @@ func (p *ConnPool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	// lingered out, so that the connection is never closed under a zmux
 	// close the peer has not read; or with the connection.
 	q := pio.W.(*qStream)
-	q.rec, q.ended = &l.Conn.rec, pipeRelease(l.Conn.qc.Context(), l.Release)
+	q.rec, q.lease = &l.Conn.rec, carrierio.NewHalfLease(l.Conn.qc.Context(), l.Release)
 	pio.FateGroup = l.FateGroup
 	return pio, nil
 }
 
+// lease opens a stream on a pooled connection. A call that waited for a
+// connection whose credential then failed to go out takes another one.
+func (p *ConnPool) lease(ctx context.Context) (*carrier.Lease[*pooled], zmux.PipeIO, error) {
+	for {
+		l, err := p.pool.Get(ctx)
+		if err != nil {
+			return nil, zmux.PipeIO{}, err
+		}
+		pio, err := p.open(ctx, l.Conn)
+		if err == nil {
+			return l, pio, nil
+		}
+		l.Release()
+		if !errors.Is(err, errCredentialFailed) {
+			return nil, zmux.PipeIO{}, err
+		}
+	}
+}
+
 // open opens a stream of pc. The first one (the lowest stream ID) starts
-// with the credential's prefix; streams are opened one at a time.
+// with the credential's prefix; streams are opened one at a time. When
+// the credential fails to go out, the connection is retired under pc.mu,
+// so the calls waiting for it fail with errCredentialFailed and no later
+// stream goes on it.
 func (p *ConnPool) open(ctx context.Context, pc *pooled) (zmux.PipeIO, error) {
 	qc := pc.qc
 	if p.cred == nil {
@@ -719,15 +738,20 @@ func (p *ConnPool) open(ctx context.Context, pc *pooled) (zmux.PipeIO, error) {
 	}
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
+	if pc.failed {
+		return zmux.PipeIO{}, errCredentialFailed
+	}
 	if pc.presented {
 		return openPipe(ctx, &qc)
 	}
 	pio, err := openPipe(ctx, &qc)
 	if err != nil {
-		return pio, err
+		return pio, err // nothing went out: the next first stream presents
 	}
 	if err := zmux.PresentPipe(ctx, pio, p.cred); err != nil {
 		pio.W.(*qStream).Abort(err)
+		pc.failed = true
+		p.pool.RetireConn(pc)
 		return zmux.PipeIO{}, err
 	}
 	pc.presented = true
@@ -750,16 +774,4 @@ func Candidate(addr string, tlsConf *tls.Config, qconf *quic.Config) zmux.Candid
 		p := NewConnPool(addr, tlsConf, qconf, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 		return p.OpenPipe(ctx)
 	}}
-}
-
-// pipeRelease calls release when the connection's ctx ends or when the
-// returned function is called, which the pipe calls once both its halves
-// ended; it then also withdraws the registration on ctx, so that a
-// long-lived connection does not accumulate one per pipe.
-func pipeRelease(ctx context.Context, release func()) func() {
-	stop := context.AfterFunc(ctx, release)
-	return func() {
-		stop()
-		release()
-	}
 }

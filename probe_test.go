@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/testscale"
 	"github.com/zmuxio/zmux-go/shaping"
 	"github.com/zmuxio/zmux-go/zmuxtest"
 )
@@ -18,6 +19,7 @@ import (
 // waitUntil polls cond every 10 ms until it holds or d passes.
 func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
 	t.Helper()
+	d = testscale.D(d)
 	deadline := time.Now().Add(d)
 	for !cond() {
 		if time.Now().After(deadline) {

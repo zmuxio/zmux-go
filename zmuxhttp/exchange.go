@@ -551,10 +551,14 @@ const exHeadroom = 64
 var exPools [64]sync.Pool
 
 // exBuf is a pooled, reference-counted buffer: it returns to its pool when
-// the last reference is dropped.
+// the last reference is dropped, unless it was kept. It is not the session
+// core's Buf: that one is a fixed-size read block with an owner's release
+// hook, shared across sessions; this one comes in size classes with header
+// room and may have to outlive its references in an HTTP transport (keep).
 type exBuf struct {
 	b    []byte
 	refs atomic.Int32
+	kept atomic.Bool
 	cls  uint8
 }
 
@@ -578,14 +582,24 @@ func getExBuf(n int) *exBuf {
 
 func (b *exBuf) ref() { b.refs.Add(1) }
 
-func (b *exBuf) unref() {
+// unref drops a reference and reports whether it was the last.
+func (b *exBuf) unref() bool {
 	switch n := b.refs.Add(-1); {
 	case n == 0:
-		exPools[b.cls].Put(b)
+		if !b.kept.Load() {
+			exPools[b.cls].Put(b)
+		}
+		return true
 	case n < 0:
 		panic("zmux: exchange buffer released twice")
 	}
+	return false
 }
+
+// keep leaves the buffer to the garbage collector instead of its pool: a
+// response write failed, and an HTTP/2 transport may still send the bytes
+// of a write that returned early (a reset stream).
+func (b *exBuf) keep() { b.kept.Store(true) }
 
 // exGrow returns a buffer that holds need bytes and keeps the first used
 // bytes of b (nil: none); it at least doubles, up to limit.

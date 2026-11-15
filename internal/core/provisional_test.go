@@ -9,8 +9,8 @@ func TestCancelUnopenedEndsReceiveAndWakesCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	read, capacity := NewSignal(), NewSignal()
-	s.WaitRead(st, read)
-	if s.WaitSendCapacity(st, 1, capacity) {
+	st.SetSignals(read, capacity, nil)
+	if s.WaitSendCapacity(st, 1) {
 		t.Fatal("unestablished stream unexpectedly has capacity")
 	}
 	s.Reset(st, 91)
@@ -42,7 +42,7 @@ func TestCloseWakesProvisionalObservers(t *testing.T) {
 		t.Fatal(err)
 	}
 	read, write := NewSignal(), NewSignal()
-	st.SetSignals(read, write)
+	st.SetSignals(read, write, nil)
 	s.Close(0, nil)
 	wakes := s.TakeWakes(nil)
 	seenRead, seenWrite := false, false

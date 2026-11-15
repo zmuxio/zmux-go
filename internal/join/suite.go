@@ -18,8 +18,9 @@ type AEADFunc interface {
 	KeyLen() int
 	TagLen() int
 	New(key []byte) (cipher.AEAD, error)
-	// Nonce encodes n in the nonce format of the cipher.
-	Nonce(n uint64) []byte
+	// AppendNonce appends n in the nonce format of the cipher to dst: a
+	// record reuses one buffer, so its nonce costs no allocation.
+	AppendNonce(dst []byte, n uint64) []byte
 	// RekeyInterval is the number of records under one key of a direction.
 	RekeyInterval() uint64
 	// MaxBytesPerKey is the data volume limit of one key; 0 means none.
@@ -51,8 +52,8 @@ func (AESGCM) New(k []byte) (cipher.AEAD, error) {
 }
 func (AESGCM) RekeyInterval() uint64  { return DefaultRekeyInterval }
 func (AESGCM) MaxBytesPerKey() uint64 { return 1 << 56 } // Noise Section 14
-func (AESGCM) Nonce(n uint64) []byte {
-	return binary.BigEndian.AppendUint64(make([]byte, 4, 12), n)
+func (AESGCM) AppendNonce(dst []byte, n uint64) []byte {
+	return binary.BigEndian.AppendUint64(append(dst, 0, 0, 0, 0), n)
 }
 
 // SHA256 is SHA-256.

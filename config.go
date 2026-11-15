@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"github.com/zmuxio/zmux-go/varint"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/djylb/timeshim"
@@ -654,7 +656,7 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	cc.OverflowDelay = dur(p.OverflowDelay, time.Second)
 	cc.Redundancy = p.Redundancy.On()
 	if p.SpreadChunk > 0 {
-		cc.SpreadChunk = int(p.SpreadChunk)
+		cc.SpreadChunk = int(min(p.SpreadChunk, int64(math.MaxInt32))) // a chunk above 2 GiB is no smaller unit, and fits every int
 	}
 	if err := checkLimits(&c.ShapingLimits); err != nil {
 		return cc, err
@@ -695,8 +697,13 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 		}
 		if cc.Resume > 0 {
 			l.Has |= wire.HasResume
-			// A fraction of a millisecond is rounded up (the unit).
-			l.ResumeGrace = uint64((cc.Resume + core.Millisecond - 1) / core.Millisecond)
+			// A fraction of a millisecond is rounded up (the unit), within
+			// the parameter's encoding (a varint below 2^62).
+			ms := cc.Resume / core.Millisecond
+			if cc.Resume%core.Millisecond != 0 {
+				ms++
+			}
+			l.ResumeGrace = min(uint64(ms), varint.MaxVarint)
 		}
 	}
 	if role == core.RoleAuto {

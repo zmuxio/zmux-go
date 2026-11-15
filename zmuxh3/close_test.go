@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,20 +94,6 @@ func TestSessionCloseCode(t *testing.T) {
 		if code, msg := SessionCloseCode(c.err); code != c.code || msg != c.msg {
 			t.Fatalf("%v: %#x %q", c.err, code, msg)
 		}
-	}
-}
-
-// pipeRelease withdraws its registration on the connection's context once
-// the pipe ended: the connection's end calls release no more.
-func TestPipeReleaseWithdraws(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	var n atomic.Int32
-	ended := pipeRelease(ctx, func() { n.Add(1) })
-	ended()
-	cancel()
-	time.Sleep(20 * time.Millisecond)
-	if got := n.Load(); got != 1 {
-		t.Fatalf("release called %d times", got)
 	}
 }
 

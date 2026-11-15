@@ -69,6 +69,7 @@ type pipeShape struct {
 	wake                  bool // a writer waits for hold or tokens
 	injDue                bool
 	injFirst              bool // the injection waited for batch room: it leads the next batch
+	explicit              bool // installed by SetPipeShaper: a kind change keeps it
 }
 
 // SetShapeLimits replaces the session's local limits; the account carries over.
@@ -181,8 +182,8 @@ func (s *Session) SetPipeKind(pipe uint64, carrier uint8) bool {
 	if p == nil {
 		return false
 	}
-	if p.carrier != carrier && p.sh != nil && s.shp != nil && p.sh.gen == s.shp.gen {
-		p.sh.gen-- // stale: reinstalled from the factory
+	if p.carrier != carrier && p.sh != nil && s.shp != nil && p.sh.gen == s.shp.gen && !p.sh.explicit {
+		p.sh.gen-- // stale: reinstalled from the factory (one SetPipeShaper installed stays)
 	}
 	p.carrier = carrier
 	return true
@@ -196,14 +197,15 @@ func (s *Session) PipeKind(pipe uint64) uint8 {
 	return 0
 }
 
-// SetPipeShaper installs x on an outbound pipe until the next SetShaper.
+// SetPipeShaper installs x on an outbound pipe until the next SetShaper; a
+// change of the pipe's kind (SetPipeKind) keeps it.
 func (s *Session) SetPipeShaper(pipe uint64, x shaping.Shaper) bool {
 	p := s.pipe(pipe)
 	if p == nil || p.out == nil {
 		return false
 	}
 	s.shapeSess()
-	s.shapeInstall(p, x)
+	s.shapeInstall(p, x).explicit = true
 	s.wakePipe(p)
 	return true
 }

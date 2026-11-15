@@ -87,15 +87,7 @@ func (x25519Kex) importStatic(k crypto.PrivateKey) (keypair, error) {
 // exchange relies on crypto/ecdh, which fails on an all-zero output and keeps
 // the precomputation of the private key object.
 func (x25519Kex) exchange(priv any, pub []byte) ([]byte, error) {
-	p, err := ecdh.X25519().NewPublicKey(pub)
-	if err != nil {
-		return nil, ErrKex
-	}
-	out, err := priv.(*ecdh.PrivateKey).ECDH(p)
-	if err != nil {
-		return nil, ErrKex
-	}
-	return out, nil
+	return join.X25519Exchange(priv.(*ecdh.PrivateKey), pub)
 }
 
 // mlkem768 is ML-KEM-768 of FIPS 203.
@@ -147,8 +139,8 @@ func (chachaPolyAEAD) KeyLen() int                       { return chacha20poly13
 func (chachaPolyAEAD) New(k []byte) (cipher.AEAD, error) { return chacha20poly1305.New(k) }
 func (chachaPolyAEAD) RekeyInterval() uint64             { return join.DefaultRekeyInterval }
 func (chachaPolyAEAD) MaxBytesPerKey() uint64            { return 0 }
-func (chachaPolyAEAD) Nonce(n uint64) []byte {
-	return binary.LittleEndian.AppendUint64(make([]byte, 4, 12), n)
+func (chachaPolyAEAD) AppendNonce(dst []byte, n uint64) []byte {
+	return binary.LittleEndian.AppendUint64(append(dst, 0, 0, 0, 0), n)
 }
 
 func init() {

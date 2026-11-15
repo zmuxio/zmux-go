@@ -10,7 +10,14 @@ type CipherState struct {
 	Fn   AEADFunc
 	AEAD cipher.AEAD // nil until a key is set
 	K    []byte
+	nb   []byte // the nonce buffer, reused for every record
 	N    uint64
+}
+
+// nonce encodes n into the state's own buffer.
+func (c *CipherState) nonce(n uint64) []byte {
+	c.nb = c.Fn.AppendNonce(c.nb[:0], n)
+	return c.nb
 }
 
 // Init sets the key and resets n.
@@ -33,7 +40,7 @@ func (c *CipherState) Encrypt(dst, ad, plaintext []byte) ([]byte, error) {
 	if c.N == math.MaxUint64 {
 		return nil, ErrExhausted
 	}
-	out := c.AEAD.Seal(dst, c.Fn.Nonce(c.N), plaintext, ad)
+	out := c.AEAD.Seal(dst, c.nonce(c.N), plaintext, ad)
 	c.N++
 	return out, nil
 }
@@ -43,7 +50,7 @@ func (c *CipherState) Decrypt(dst, ad, ciphertext []byte) ([]byte, error) {
 	if c.N == math.MaxUint64 {
 		return nil, ErrExhausted
 	}
-	out, err := c.AEAD.Open(dst, c.Fn.Nonce(c.N), ciphertext, ad)
+	out, err := c.AEAD.Open(dst, c.nonce(c.N), ciphertext, ad)
 	if err != nil {
 		return nil, ErrAuth
 	}
@@ -53,7 +60,7 @@ func (c *CipherState) Decrypt(dst, ad, ciphertext []byte) ([]byte, error) {
 
 // Rekey is REKEY of Noise Section 11.3; n is unchanged.
 func (c *CipherState) Rekey() {
-	out := c.AEAD.Seal(nil, c.Fn.Nonce(math.MaxUint64), make([]byte, len(c.K)), nil)
+	out := c.AEAD.Seal(nil, c.nonce(math.MaxUint64), make([]byte, len(c.K)), nil)
 	c.K = append(c.K[:0], out[:len(c.K)]...)
 	c.setAEAD()
 }

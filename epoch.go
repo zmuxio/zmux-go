@@ -72,7 +72,8 @@ func (c *Conn) ReplacePipes(ctx context.Context) error {
 				dir = DirectionReceiveOnly
 			}
 		}
-		io, err := c.cfg.Redial(ctx, dir)
+		var io PipeIO
+		err := hostCall(c.cfg.Logger, "Config.Redial", func() error { var err error; io, err = c.cfg.Redial(ctx, dir); return err })
 		if err != nil {
 			return fmt.Errorf("zmux: ReplacePipes: redial: %w", err)
 		}
@@ -89,17 +90,21 @@ func (c *Conn) waitEpoch(ctx context.Context, n uint64) error {
 	sig := core.NewSignal()
 	defer c.unwatchPipes(sig)
 	for {
-		c.lock()
-		if c.s.Epoch() >= n {
-			c.unlock()
-			return nil
+		var err error
+		done := false
+		c.locked(func() {
+			switch {
+			case c.s.Epoch() >= n:
+				done = true
+			case c.closing:
+				done, err = true, net.ErrClosed
+			default:
+				c.watchPipes(sig)
+			}
+		})
+		if done {
+			return err
 		}
-		if c.closing {
-			c.unlock()
-			return net.ErrClosed
-		}
-		c.watchPipes(sig)
-		c.unlock()
 		select {
 		case <-sig.C:
 		case <-ctx.Done():

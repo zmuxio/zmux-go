@@ -71,11 +71,15 @@ func ClassifyFirstBytes(b []byte, messages bool) (class, need int) {
 	return FirstOther, 0
 }
 
+// laneLead is the first byte of the PIPE_LANE frame type, as firstLeads
+// are derived from their types.
+var laneLead = varint.AppendVarint(nil, TypePipeLane)[0]
+
 // FirstRecordIsLane tells whether b, the first bytes of a carrier (with
 // messages set, of its first message), begin a lane's first record. need
 // is the total number of bytes needed when more are wanted, else 0.
 func FirstRecordIsLane(b []byte, messages bool) (lane bool, need int) {
-	lead := byte(0xba)
+	lead := laneLead
 	if messages {
 		return len(b) > 0 && b[0] == lead, 0
 	}

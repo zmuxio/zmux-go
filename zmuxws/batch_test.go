@@ -126,7 +126,7 @@ func TestWriteMessages(t *testing.T) {
 	}
 	r := srv.R.(zmux.MessageReader)
 	for _, m := range msgs {
-		if got, err := r.ReadMessage(); err != nil || !bytes.Equal(got, m) {
+		if got, err := r.ReadMessage(zmux.MaxRecordSize); err != nil || !bytes.Equal(got, m) {
 			t.Fatalf("read %d bytes, %v", len(got), err)
 		}
 	}

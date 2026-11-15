@@ -125,6 +125,38 @@ func TestPoolCancelledLateDialReturnsItsConnection(t *testing.T) {
 	}
 }
 
+// A dial that failed because its caller gave up hands out no lease, even
+// when a connection with room could serve, as a cancelled successful dial.
+func TestPoolCancelledFailedDialTakesNoLease(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := 0
+	p := &ConnPool[int]{
+		Dial: func(ctx context.Context) (int, error) {
+			if n++; n == 1 {
+				return n, nil
+			}
+			cancel()
+			return 0, ctx.Err()
+		},
+		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) { d.Count = 2 }),
+	}
+	defer p.Shutdown()
+	a, err := p.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Release()
+	lease, err := p.Get(ctx) // the policy wants a second connection
+	if lease != nil {
+		lease.Release()
+		t.Fatalf("a lease after the caller gave up: %+v", lease)
+	}
+	if !errors.Is(err, context.Canceled) || n != 2 {
+		t.Fatalf("err=%v dials=%d", err, n)
+	}
+}
+
 func TestPoolCollectsExpiredIdleConnectionsAndClosesOutsideItsLock(t *testing.T) {
 	n, closed := 0, 0
 	p := &ConnPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Minute}

@@ -18,8 +18,24 @@ const (
 	Message = join.Message
 )
 
-// Dispatch classifies the first byte of a carrier; see join.Class.
-var Dispatch = join.Dispatch
+// Dispatch classifies the first byte of a carrier; see join.Class. The
+// Establish profiles are this package's (profiles, the escape): the one
+// table both the Hello parser and the dispatch read.
+func Dispatch(b []byte, f Framing) join.Class {
+	switch {
+	case len(b) == 0 && f == Stream:
+		return join.ClassIncomplete
+	case len(b) == 0:
+		return join.ClassNotHello
+	case join.IsHello(b):
+		return join.ClassJoin
+	case b[0] == profileEscape || profiles[Profile(b[0])] != nil:
+		return join.ClassEstablish
+	case b[0] > 0 && b[0] < profileEscape:
+		return join.ClassReserved
+	}
+	return join.ClassNotHello
+}
 
 // HandleLen is the length of every Handle.
 const HandleLen = 16
@@ -71,13 +87,8 @@ func HelloHeaderLen(f Framing, p Profile) int {
 	return n + FrameHeaderLen(f)
 }
 
-// FrameHeaderLen is the length prefix of a unit.
-func FrameHeaderLen(f Framing) int {
-	if f == Stream {
-		return lenPrefix
-	}
-	return 0
-}
+// FrameHeaderLen is the length prefix of a unit (join.FramingLen).
+func FrameHeaderLen(f Framing) int { return join.FramingLen(f) }
 
 func appendWireProfile(dst []byte, p Profile) []byte {
 	if p >= profileEscape {

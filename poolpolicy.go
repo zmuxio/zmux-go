@@ -59,8 +59,10 @@ type PoolDecision struct {
 	// does not clamp: it rejects the whole decision and reports the error
 	// to its DecisionRejected callback.
 	Liveness PipeLiveness
-	// Count is the members to keep. Zero is the pool's value (a pool
-	// keeps one at least); a negative value is invalid.
+	// Count is the members to keep. Zero keeps the pool's own behaviour:
+	// a PipePool keeps its Count (at least one), a carrier.ConnPool dials
+	// a connection only when a pipe finds none with room. A negative
+	// value is invalid.
 	Count int
 	// DialAfter is the earliest next dial after the start of the last
 	// dial attempt (the start of the pool before the first), in place of
@@ -68,8 +70,9 @@ type PoolDecision struct {
 	// backoff; a negative value is invalid.
 	DialAfter time.Duration
 	// Recheck asks for the next Decide within this time even when nothing
-	// else happens. Zero is none; a negative value is invalid. Pools wait
-	// at least MinRecheck.
+	// else happens; zero asks for none beyond the pool's own looks (its
+	// events, dials and maintenance cadence), and a negative value is
+	// invalid. Pools wait at least MinRecheck.
 	Recheck time.Duration
 }
 
@@ -85,6 +88,10 @@ func (d *PoolDecision) Validate() error {
 	}
 	return nil
 }
+
+// poolLook is the maintenance cadence of a pool with a policy or a byte
+// rotation limit: byte counts change with no event of their own.
+const poolLook = 250 * time.Millisecond
 
 // MinRecheck is the shortest wait a pool applies to PoolDecision.Recheck.
 const MinRecheck = 10 * time.Millisecond
@@ -138,11 +145,12 @@ func (d *PoolDecision) probeOptions(o PipeOptions) PipeOptions {
 	return o
 }
 
-// RecheckAfter is the wait d asks for before the next Decide, Recheck
-// raised to MinRecheck; 0: none.
+// RecheckAfter is the wait before a pool asks its policy again after d:
+// d's Recheck, raised to MinRecheck, when it comes before the pool's own
+// maintenance look, else that look.
 func (d *PoolDecision) RecheckAfter() time.Duration {
 	if d.Recheck <= 0 {
-		return 0
+		return poolLook
 	}
-	return max(d.Recheck, MinRecheck)
+	return min(max(d.Recheck, MinRecheck), poolLook)
 }

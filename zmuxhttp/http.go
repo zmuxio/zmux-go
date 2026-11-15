@@ -95,6 +95,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 	life, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	stop := context.AfterFunc(ctx, cancel)
 	call := &httpCall{done: make(chan struct{}), up: func() { stop() }}
+	dial := ctx // still bounds the redirects the request follows
 	ctx = life
 	method := http.MethodPost
 	var s *upStream
@@ -107,6 +108,11 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 	newReq := func(u *url.URL) (*http.Request, error) {
 		if prev != nil && s != nil && !s.replayable() {
 			return nil, errUpReplay
+		}
+		if prev != nil && dial.Err() != nil {
+			// A body already read lets the carrier outlive ctx, but not a
+			// redirect chain the server drives: each hop is a new setup.
+			return nil, context.Cause(dial)
 		}
 		var body io.ReadCloser = http.NoBody
 		var up *httpUpBody
@@ -168,11 +174,13 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 	}
 	u0, err := url.Parse(rawURL)
 	if err != nil {
+		stop()
 		cancel()
 		return zmux.PipeIO{}, err
 	}
 	first, err := newReq(u0)
 	if err != nil {
+		stop()
 		cancel()
 		return zmux.PipeIO{}, err
 	}
@@ -192,6 +200,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 				t.Redirected(final.String())
 			}
 		}
+		stop() // settled either way: ctx holds nothing of the carrier now
 		if s != nil {
 			s.settle()
 		}
@@ -214,7 +223,7 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 		p.Carrier = zmux.CarrierStream
 	}
 	if s != nil {
-		p.W = &httpReqWriter{p: s.p, call: call, cancel: cancel}
+		p.W = &httpReqWriter{p: s.p, call: call, cancel: cancel, linger: dir == zmux.DirectionSendOnly}
 	}
 	if dir != zmux.DirectionSendOnly {
 		p.R = &httpRespReader{call: call, cancel: cancel}
@@ -562,7 +571,7 @@ func httpSplitPipe(ctx context.Context, client *http.Client, url string, t *Targ
 	}
 	down, err := httpPipe(ctx, client, url, t, hh, zmux.DirectionReceiveOnly, cred)
 	if err != nil {
-		_ = up.W.Close() // abandon the uplink; err is the one to report
+		up.W.(*httpReqWriter).Abort(err) // cancel the uplink's request: the server must not hold its half
 		return zmux.PipeIO{}, err
 	}
 	// The pipe fails as soon as either request does: an uplink refused
@@ -592,6 +601,11 @@ type httpReqWriter struct {
 	call   *httpCall
 	cancel context.CancelFunc
 	once   sync.Once
+	// linger bounds the wait for an uplink's response once its body
+	// ended. A bidirectional carrier's response is its downlink, which
+	// its read half ends: a proxy may hold back its header until the
+	// request body ended, or longer.
+	linger bool
 }
 
 func (w *httpReqWriter) Write(p []byte) (int, error) {
@@ -656,9 +670,31 @@ func (w *httpReqWriter) HandshakeContext(ctx context.Context) error {
 }
 
 func (w *httpReqWriter) Close() error {
-	w.once.Do(func() { w.p.closeWrite(nil) })
+	w.once.Do(func() {
+		w.p.closeWrite(nil)
+		if !w.linger {
+			return
+		}
+		// The response ends an uplink's request; a server that never
+		// sends it no longer holds the connection and the request's
+		// goroutine past the linger bound.
+		go func() {
+			t := time.NewTimer(reqLinger)
+			defer t.Stop()
+			select {
+			case <-w.call.done:
+			case <-t.C:
+				w.cancel()
+			}
+		}()
+	})
 	return nil
 }
+
+// reqLinger bounds how long an uplink whose body ended waits for its
+// response (host clock: a bound on carrier IO).
+const reqLinger = 30 * time.Second
+
 func (w *httpReqWriter) Abort(err error) {
 	w.once.Do(func() {
 		w.p.closeWrite(err)
@@ -961,7 +997,6 @@ type httpRespWriter struct {
 	closed  bool
 	written bool // the response header went out
 	close   bool // Connection: close
-	stopped bool // the receiver was stopped (under chMu)
 
 	// The request stream's datagram channel: its provider (under mu), and
 	// the channel once the header went out. The receiver's state has a
@@ -970,6 +1005,7 @@ type httpRespWriter struct {
 	chp     DatagramProvider
 	ch      atomic.Pointer[zmux.DatagramChannel]
 	deliver func([]byte) // a receiver waiting for the channel (under chMu)
+	chGen   uint64       // the current registration's number (under chMu)
 	chStop  func()       // the receiver's stop (under chMu)
 	chMu    sync.Mutex
 }
@@ -1179,8 +1215,9 @@ func (h *httpRespWriter) openChannel() {
 	h.chMu.Lock()
 	defer h.chMu.Unlock()
 	h.ch.Store(&ch)
-	if h.deliver != nil && !h.stopped {
+	if h.deliver != nil {
 		h.chStop = ch.ReceiveChannelDatagrams(h.deliver)
+		h.deliver = nil
 	}
 }
 
@@ -1220,6 +1257,11 @@ func (h *httpChanWriter) SendChannelDatagram(b []byte) error {
 func (h *httpChanWriter) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 	h.chMu.Lock()
 	defer h.chMu.Unlock()
+	// A later registration replaces the earlier receiver; the earlier
+	// one's stop then does nothing.
+	h.stopLocked()
+	h.chGen++
+	gen := h.chGen
 	if ch := h.channel(); ch != nil {
 		h.chStop = ch.ReceiveChannelDatagrams(deliver)
 	} else {
@@ -1228,10 +1270,18 @@ func (h *httpChanWriter) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 	return func() {
 		h.chMu.Lock()
 		defer h.chMu.Unlock()
-		h.stopped = true
-		if h.chStop != nil {
-			h.chStop()
-			h.chStop = nil
+		if h.chGen == gen {
+			h.stopLocked()
 		}
+	}
+}
+
+// stopLocked stops the current receiver, or drops the one waiting for the
+// channel; under chMu.
+func (h *httpChanWriter) stopLocked() {
+	h.deliver = nil
+	if h.chStop != nil {
+		h.chStop()
+		h.chStop = nil
 	}
 }

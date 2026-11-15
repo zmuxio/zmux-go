@@ -430,23 +430,8 @@ func framingOf(name string) Framing {
 }
 
 func errorClass(err error) string {
-	for _, c := range []struct {
-		e error
-		n string
-	}{
-		{ErrIncomplete, "incomplete"}, {ErrMalformed, "malformed"}, {ErrTrailing, "trailing_bytes"},
-		{ErrUnknownProfile, "unknown_profile"}, {join.ErrUnknownSuite, "unknown_suite"},
-		{ErrPeerIsSelf, "peer_is_self"}, {ErrRandomFailed, "random_failed"}, {ErrInvalidConfig, "invalid_config"},
-		{join.ErrMissingField, "missing_field"}, {join.ErrBadField, "bad_field"}, {join.ErrBadConfirm, "bad_confirm"},
-		{ErrBadFlags, "bad_flags"}, {ErrBadHandle, "bad_handle"}, {ErrAuth, "auth"}, {ErrKex, "kex"},
-		{ErrTooLarge, "too_large"}, {ErrExhausted, "exhausted"}, {ErrTLVTruncated, "tlv_truncated"},
-		{ErrTLVNonMinimal, "tlv_non_minimal"}, {ErrTLVOrder, "tlv_order"},
-		{ErrTLVUnknownCritical, "tlv_unknown_critical"}, {ErrTLVCredentials, "tlv_credentials"},
-		{ErrCredentialsFailed, "credentials_failed"},
-	} {
-		if errors.Is(err, c.e) {
-			return c.n
-		}
+	if n, ok := ErrorClass(err); ok {
+		return n
 	}
 	return fmt.Sprintf("other: %v", err)
 }

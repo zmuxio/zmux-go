@@ -29,24 +29,9 @@ const (
 // ProfileJoin is the first byte of a Join Hello.
 const ProfileJoin = 2
 
-// Dispatch classifies the first byte of a carrier.
-func Dispatch(b []byte, f Framing) Class {
-	if len(b) == 0 {
-		if f == Stream {
-			return ClassIncomplete
-		}
-		return ClassNotHello
-	}
-	switch b[0] {
-	case 1, 3, 4, 5, 8:
-		return ClassEstablish
-	case ProfileJoin:
-		return ClassJoin
-	case 6, 7:
-		return ClassReserved
-	}
-	return ClassNotHello
-}
+// IsHello reports whether a carrier's first bytes begin a Join Hello: the
+// one test of it, for every classifier of a first record.
+func IsHello(b []byte) bool { return len(b) > 0 && b[0] == ProfileJoin }
 
 // ReplyType is the first byte of a Join Reply.
 const ReplyType = 0x03

@@ -164,7 +164,7 @@ func TestUncomparableHalves(t *testing.T) {
 	if _, err := joinBinding(p); err == nil {
 		t.Fatal("Bound without a declaration")
 	}
-	closePipeIO(p)
+	ClosePipeIO(p)
 	q := PipeIO{R: secureSlice{sliceHalf{Conn: b}}, W: secureSlice{sliceHalf{Conn: b}}}
 	if _, err := joinBinding(q); err == nil {
 		t.Fatal("Bound without an exporter")

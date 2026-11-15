@@ -19,7 +19,8 @@ const (
 // (several tiers).
 type decision struct {
 	p         *Pipe
-	g         *gate
+	g         *gate // &gb, or nil when no pipe is usable
+	gb        gate
 	fastest   *Pipe // the eligible pipe of p's tier with the smallest ETA for a chunk
 	lv        *levelStats
 	tier      int
@@ -31,9 +32,9 @@ type decision struct {
 
 // newDecision prepares the decision for pipe p now.
 func (s *Session) newDecision(d *decision, p *Pipe) {
-	*d = decision{p: p, lv: d.lv}
+	*d = decision{p: p, lv: d.lv, gb: d.gb}
 	d.open = s.open(p)
-	d.g = s.buildGate()
+	d.g = s.buildGate(&d.gb)
 	if d.g == nil {
 		return
 	}
@@ -76,7 +77,7 @@ func (s *Session) onPipe(d *decision, st *Stream) bool {
 		// No pipe is usable: only a Hello's first batch, outside this path, goes.
 		return false
 	}
-	if m := sp.mps; m != nil && (len(m.resend) > 0 || m.finResend) {
+	if m := sp.mps; m != nil && (m.resend.len() > 0 || m.finResend) {
 		// Reinjected information goes on the eligible pipe of the tier
 		// with the earliest arrival, within the reinjection hold.
 		return d.takes && d.fastest == p && s.reinjectRoom(p)
@@ -144,25 +145,61 @@ func (s *Session) chunkSent(d *decision, w *recWriter, st *Stream, off, n uint64
 
 // ---- estimates ----
 
+// rateTops are the two largest measured rates of the usable pipes of one
+// priority and standby class, with the pipe of the largest.
+type rateTops struct {
+	p1     *Pipe
+	r1, r2 float64
+}
+
+// fastestOf works out the rateTops of priority pr, by standby flag, once
+// for a caller that needs the placement rate of many pipes.
+func (s *Session) fastestOf(pr uint64) (t [2]rateTops) {
+	for _, q := range s.pipes {
+		if q.mp == nil || q.out == nil || !q.out.snd.re.measured || !s.pipeUsable(q, false) {
+			continue
+		}
+		qp, qs := q.mp.effPrio()
+		if qp != pr {
+			continue
+		}
+		c := &t[b2i(qs)]
+		switch r := q.out.snd.re.value(); {
+		case c.p1 == nil || r > c.r1:
+			if c.p1 != nil {
+				c.r2 = c.r1
+			}
+			c.p1, c.r1 = q, r
+		case r > c.r2:
+			c.r2 = r
+		}
+	}
+	return t
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // placementRate is the rate the spreading policies place data with: R_p, or for
 // a usable pipe without a bottleneck sample the fastest measured pipe of its
-// tier and standby flag, for four of its round trips.
-func (s *Session) placementRate(p *Pipe) float64 {
+// tier and standby flag (tops: fastestOf p's priority), for four of its
+// round trips.
+func (s *Session) placementRate(p *Pipe, tops *[2]rateTops) float64 {
 	e := &p.out.snd.re
 	own := e.value()
 	a := p.mp
 	if e.measured || a.placedSet && e.round >= a.placedFrom+placementRounds || !s.pipeUsable(p, false) {
 		return own
 	}
-	pr, sb := a.effPrio()
-	fastest := 0.0
-	for _, q := range s.pipes {
-		if q == p || q.mp == nil || q.out == nil || !q.out.snd.re.measured || !s.pipeUsable(q, false) {
-			continue
-		}
-		if qp, qs := q.mp.effPrio(); qp == pr && qs == sb {
-			fastest = max(fastest, q.out.snd.re.value())
-		}
+	_, sb := a.effPrio()
+	t := &tops[b2i(sb)]
+	fastest := t.r1 // the fastest other pipe of p's class
+	if t.p1 == p {
+		fastest = t.r2
 	}
 	if fastest <= own {
 		return own
@@ -173,10 +210,11 @@ func (s *Session) placementRate(p *Pipe) float64 {
 	return fastest
 }
 
-// eta is ETA_p(L) in seconds.
-func (s *Session) eta(p *Pipe, l uint64) float64 {
-	r := max(s.placementRate(p), 1)
-	return (s.queued(p)+float64(l))/r + float64(s.owd(p))/1e9
+// eta is ETA_p(L) in seconds, given owdBase and the rateTops of p's
+// priority.
+func (s *Session) eta(p *Pipe, l uint64, base Duration, tops *[2]rateTops) float64 {
+	r := max(s.placementRate(p, tops), 1)
+	return (s.queued(p)+float64(l))/r + float64(owdFrom(p.mp, base))/1e9
 }
 
 // fastestIn returns the pipe of tier ti with the smallest ETA for l bytes,
@@ -194,11 +232,12 @@ func (s *Session) earliestTwo(g *gate, ti int, l uint64, except *Pipe) (*Pipe, *
 	}
 	var a, b *Pipe
 	var ea, eb float64
+	base, tops := s.owdBase(), s.fastestOf(g.tiers[ti].prio)
 	for _, q := range g.tierPipes(ti) {
 		if q == except {
 			continue
 		}
-		e := s.eta(q, l)
+		e := s.eta(q, l, base, &tops)
 		switch {
 		case a == nil || e < ea || e == ea && q.id < a.id:
 			b, eb = a, ea
@@ -250,7 +289,7 @@ func (s *Session) levels(d *decision) *levelStats {
 	}
 	for u := range lv.incr {
 		x := lv.incr[u]
-		sortU64(x)
+		slices.Sort(x)
 		ps := lv.prefix[u][:0]
 		var sum uint64
 		for _, v := range x {
@@ -261,14 +300,6 @@ func (s *Session) levels(d *decision) *levelStats {
 	}
 	lv.valid = true
 	return lv
-}
-
-func sortU64(x []uint64) {
-	for i := 1; i < len(x); i++ {
-		for j := i; j > 0 && x[j] < x[j-1]; j-- {
-			x[j], x[j-1] = x[j-1], x[j]
-		}
-	}
 }
 
 // cappedSum is the sum over the level's incremental directions of
@@ -306,8 +337,10 @@ func (s *Session) spreadETAOK(d *decision, st *Stream) bool {
 	if f == p {
 		return true
 	}
-	etaP := s.eta(p, chunk)
-	if etaP <= s.eta(f, chunk) {
+	// f is of p's tier: one priority.
+	base, tops := s.owdBase(), s.fastestOf(g.tiers[d.tier].prio)
+	etaP := s.eta(p, chunk, base, &tops)
+	if etaP <= s.eta(f, chunk, base, &tops) {
 		return true
 	}
 	// ECF with the backlog f carries before this direction's last ready byte.
@@ -331,11 +364,11 @@ func (s *Session) spreadETAOK(d *decision, st *Stream) bool {
 		backlog = min64(room, more+level)
 		backlog -= min64(backlog, chunk)
 	}
-	if etaP > (1+beta)*s.eta(f, backlog+chunk) {
+	if etaP > (1+beta)*s.eta(f, backlog+chunk, base, &tops) {
 		return false
 	}
 	// BLEST: what f sends while the chunk travels must fit the credit.
-	need := s.rateOf(f) * max(0, etaP-float64(s.owd(f))/1e9)
+	need := s.rateOf(f) * max(0, etaP-float64(owdFrom(f.mp, base))/1e9)
 	w := min64(room, s.reorderBudget())
 	if need > float64(w) {
 		return false
@@ -356,6 +389,7 @@ func (s *Session) reorderBudget() uint64 {
 	var sum float64
 	var lo, hi Duration
 	first := true
+	base := s.owdBase()
 	for _, p := range s.pipes {
 		a := p.mp
 		if a == nil || p.out == nil || !a.liveOut() {
@@ -363,7 +397,7 @@ func (s *Session) reorderBudget() uint64 {
 		}
 		sum += s.rateOf(p)
 		if s.pipeUsable(p, true) {
-			o := s.owd(p)
+			o := owdFrom(a, base)
 			if first || o < lo {
 				lo = o
 			}
@@ -384,6 +418,10 @@ func (s *Session) reorderBudget() uint64 {
 
 // rrWeights calls f with each candidate of tier ti and its weight.
 func (s *Session) rrWeights(g *gate, ti int, byRate bool, f func(p *Pipe, w float64)) {
+	var tops [2]rateTops
+	if byRate {
+		tops = s.fastestOf(g.tiers[ti].prio)
+	}
 	allZero := true
 	for _, q := range g.tierPipes(ti) {
 		if s.open(q) && q.mp.weight > 0 {
@@ -402,7 +440,7 @@ func (s *Session) rrWeights(g *gate, ti int, byRate bool, f func(p *Pipe, w floa
 			continue
 		}
 		if byRate {
-			w *= max(s.placementRate(q), 1)
+			w *= max(s.placementRate(q, &tops), 1)
 		}
 		f(q, w)
 	}
@@ -465,20 +503,25 @@ func (s *Session) rrCommit(g *gate, ti int, p *Pipe, st *Stream) {
 			add(q, w)
 		}
 	})
-	for _, q := range s.pipes {
-		if q.mp == nil || g.admits(s, q) {
-			continue
-		}
-		if !own {
-			q.mp.rrCur = 0
-		} else if m := st.snd.mps; m != nil {
-			for i := range m.rr {
-				if m.rr[i].pipe == q.id {
-					m.rr[i].v = 0
-				}
+	if !own {
+		for _, q := range s.pipes {
+			if q.mp != nil && !g.admits(s, q) {
+				q.mp.rrCur = 0
 			}
 		}
+		return
 	}
+	// A value of a pipe not eligible (or gone) is dropped: absent is 0, so
+	// the list holds only the gate's pipes however many came and went.
+	m := st.snd.mpState()
+	kept := m.rr[:0]
+	for _, e := range m.rr {
+		if q := s.pipe(e.pipe); q != nil && q.mp != nil && g.admits(s, q) {
+			kept = append(kept, e)
+		}
+	}
+	clear(m.rr[len(kept):])
+	m.rr = kept
 }
 
 type rrVal struct {
@@ -513,6 +556,13 @@ func (s *Session) expectedBytes(st *Stream) uint64 {
 
 // affinityLoad is A_p: the expected bytes of the other directions bound to p.
 func (s *Session) affinityLoad(p *Pipe, except *Stream) uint64 {
+	if af := &s.mp.aff; af.loadValid {
+		a := af.load[p.id]
+		if t, ok := affinityTargetID(except); ok && t == p.id {
+			a -= min64(a, s.expectedBytes(except))
+		}
+		return a
+	}
 	var a uint64
 	it := s.sched.iter()
 	for st := it.next(); st != nil; st = it.next() {
@@ -531,13 +581,26 @@ func (s *Session) affinityLoad(p *Pipe, except *Stream) uint64 {
 	return a
 }
 
+// affinityTargetID is the pipe a bound stream's load counts on (its move
+// target while moving).
+func affinityTargetID(st *Stream) (uint64, bool) {
+	if st == nil || st.snd.mps == nil || !st.snd.mps.bind.set {
+		return 0, false
+	}
+	b := st.snd.mps.bind
+	if b.moving {
+		return b.moveTo, true
+	}
+	return b.pipe, true
+}
+
 func (s *Session) affinityIdle(st *Stream) bool {
 	sp := &st.snd
 	m := sp.mps
 	if m == nil {
 		return true
 	}
-	return m.acked.prefix() >= sp.sent && len(m.resend) == 0
+	return m.acked.prefix() >= sp.sent && m.resend.len() == 0
 }
 
 // affinityTarget is the pipe an affinity direction sends on now.
@@ -602,8 +665,9 @@ func (s *Session) bindingChoice(g *gate, st *Stream) *Pipe {
 	}
 	var best *Pipe
 	var bs float64
+	base := s.owdBase()
 	for _, q := range within {
-		score := float64(s.owd(q)) / 1e9
+		score := float64(owdFrom(q.mp, base)) / 1e9
 		if !small {
 			load := s.queued(q) + float64(s.affinityLoad(q, st)) + float64(e)
 			score += load / max(s.rateOf(q), 1)
@@ -641,8 +705,13 @@ func (s *Session) bindOnSend(d *decision, st *Stream) {
 
 // affinityState is the re-evaluation state of affinity bindings.
 type affinityState struct {
+	// load is each pipe's affinity load while refreshBindings runs (valid):
+	// computed once per refresh and kept up to date as bindings move, so a
+	// refresh costs O(streams x pipes), not O(streams^2 x pipes).
+	load        map[uint64]uint64
 	seen        []uint64
 	epoch       uint64
+	loadValid   bool
 	provisional bool
 	stale       bool
 }
@@ -692,7 +761,19 @@ func (s *Session) refreshBindings(g *gate) {
 	if sampled {
 		af.stale = false
 	}
+	if af.load == nil {
+		af.load = map[uint64]uint64{}
+	}
+	clear(af.load)
 	it := s.sched.iter()
+	for st := it.next(); st != nil; st = it.next() {
+		if t, ok := affinityTargetID(st); ok {
+			af.load[t] += s.expectedBytes(st)
+		}
+	}
+	af.loadValid = true
+	defer func() { af.loadValid = false }()
+	it = s.sched.iter()
 	for st := it.next(); st != nil; st = it.next() {
 		if s.policyOf(st) != PolicyAffinity || st.snd.mps == nil {
 			continue
@@ -723,7 +804,10 @@ func (s *Session) refreshBindings(g *gate) {
 			b.epoch = af.epoch
 		}
 		if target != nil && target.id != b.pipe {
+			e := s.expectedBytes(st)
+			af.load[b.pipe] -= min64(af.load[b.pipe], e)
 			b.moving, b.moveTo = true, target.id
+			af.load[target.id] += e
 			s.noteBlocked(st)
 		}
 	}
@@ -866,7 +950,7 @@ func (s *Session) TakePick(req *PickRequest) bool {
 	}
 	mp.pickWanted = false
 	req.Gen = mp.pickGen
-	g := s.buildGate()
+	g := s.buildGate(&mp.gateBuf)
 	for _, p := range s.pipes {
 		if p.mp == nil || p.out == nil || p.mp.hs || !p.mp.liveOut() {
 			continue

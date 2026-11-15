@@ -13,7 +13,7 @@ import (
 // statsMP is a multipath session with pipe 0 and one more attachment.
 func statsMP() (*Session, *Pipe) {
 	s := capacityMP()
-	s.mp.bits, s.mp.pendAbandon = map[uint64]bool{}, map[uint64]bool{}
+	s.mp.bits, s.mp.pendAbandon = map[uint64]bool{}, map[uint64]uint64{}
 	s.mp.usableGroups = []uint64{join.GroupX25519, join.GroupX25519MLKEM768}
 	p := capacityExtra(s)
 	return s, p

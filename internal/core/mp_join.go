@@ -184,12 +184,15 @@ const (
 // its Hello: the one of a session without a usable pipe, whose first batch
 // recovers it, or the plain one. ready is false while the cap or the refusal
 // backoff holds it; nothing is drawn or written yet.
-func (s *Session) JoinPrepare(id uint64) (msg string, ready bool, err error) {
+func (s *Session) JoinPrepare(id uint64, sig *Signal) (msg string, ready bool, err error) {
 	p := s.pipe(id)
 	if p == nil || p.mp == nil || !p.mp.joining() || s.isClosing() {
 		return "", false, ErrInvalid
 	}
 	if !s.joinAllowedFor(p) {
+		if sig != nil && !slices.Contains(s.mp.joinW, sig) { // nil: the caller asks again on its own
+			s.mp.joinW = append(s.mp.joinW, sig)
+		}
 		return "", false, nil
 	}
 	if _, ok := s.mp.suiteKeys(join.Preferred(s.mp.usable).ID); !ok {
@@ -200,6 +203,24 @@ func (s *Session) JoinPrepare(id uint64) (msg string, ready bool, err error) {
 		return JoinMsgHelloEarly, true, nil
 	}
 	return JoinMsgHello, true, nil
+}
+
+// CancelJoinWait drops a held join's signal (its wait ended).
+func (s *Session) CancelJoinWait(sig *Signal) {
+	if s.mp != nil {
+		s.mp.joinW = slices.DeleteFunc(s.mp.joinW, func(w *Signal) bool { return w == sig })
+	}
+}
+
+// joinHoldChanged wakes the held local joins: what holds them (the
+// cap's count, the backoff, a suspension that lets one displace another)
+// changed.
+func (s *Session) joinHoldChanged() {
+	for _, w := range s.mp.joinW {
+		s.wake(w)
+	}
+	clear(s.mp.joinW)
+	s.mp.joinW = s.mp.joinW[:0]
 }
 
 // firstBatchLimit is the limit of a Hello's first batch: limit, and with a
@@ -362,10 +383,7 @@ func (s *Session) firstBatch(limit int) []byte {
 			if sp.state == sendReady {
 				sp.state = sendSend
 			}
-			if st.ext != nil && st.ext.capSig != nil {
-				s.checkCapacity(st)
-			}
-			s.wake(st.wsig)
+			s.sendChanged(st)
 		}
 		s.lost(&frameDesc{kind: dStream, id: st.id, off: off, n: have})
 	}
@@ -477,9 +495,8 @@ func (s *Session) VerifyReply(id uint64, b []byte, now Time) JoinStep {
 		s.joinRefused()
 		a.out, a.in = OutFailed, InEnded
 		a.abandonSent, a.abandonAcked = true, true
-		s.retire(p)
 		a.hs = false
-		s.emit(Event{Kind: EvPipeState, Pipe: id, Dir: DirOut, OutState: OutRetired, Carrier: p.carrier})
+		s.retire(p, true) // its EvPipeState reports the retirement
 		return JoinStep{Status: JoinDeclined, N: skip + n}
 	}
 	a.proven, a.provenFrames = true, slices.Clone(pl.Frames)
@@ -744,8 +761,7 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 	id, j := pj.Pipe.ID, pj.Pipe
 	needIn, needOut := j.Direction != 1, j.Direction != 0
 	if c.Refuse || s.peerAttachments() >= m.cap && (s.state != StateSuspended || !s.makeRoom(false, needIn, needOut)) {
-		m.pendAbandon[id] = true
-		m.abandonCodes(id, wire.PipeResourceLimit)
+		m.pendAbandon[id] = wire.PipeResourceLimit
 		s.wakeAllWriters()
 		return JoinRefused
 	}
@@ -793,15 +809,6 @@ func (s *Session) peerAttachments() int {
 		}
 	}
 	return n
-}
-
-// abandonCodes remembers the code of an owed PIPE_ABANDON for an ID
-// without attachment state.
-func (m *multiPath) abandonCodes(id, code uint64) {
-	if m.pendCode == nil {
-		m.pendCode = map[uint64]uint64{}
-	}
-	m.pendCode[id] = code
 }
 
 func (s *Session) emitPipeState(p *Pipe) {
@@ -904,7 +911,7 @@ func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 		s.failPipe(oldest, wire.PipeFailed, nil)
 	}
 	a.abandonQueued = false
-	s.retire(oldest)
+	s.retire(oldest, false)
 	return true
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"runtime"
 	"sync"
 
@@ -22,6 +23,47 @@ type Limiter interface {
 	TryReady(maxBytes int) int
 	// Charge accounts n bytes actually forwarded.
 	Charge(n int)
+}
+
+// guardedLimiter runs a host Limiter on the package's goroutines: a panic
+// in Ready fails the wait (errLimiterPanicked), one in TryReady allows
+// nothing (the datagram is dropped as limited) and one in Charge is lost;
+// none ends the process.
+type guardedLimiter struct{ l Limiter }
+
+var errLimiterPanicked = errors.New("zmux: the Limiter panicked")
+
+func guardLimiter(l Limiter) Limiter {
+	if l == nil {
+		return nil
+	}
+	if _, ok := l.(guardedLimiter); ok {
+		return l
+	}
+	return guardedLimiter{l}
+}
+
+func (g guardedLimiter) Ready(ctx context.Context, minBytes, maxBytes int) (n int, err error) {
+	defer func() {
+		if recover() != nil {
+			n, err = 0, errLimiterPanicked
+		}
+	}()
+	return g.l.Ready(ctx, minBytes, maxBytes)
+}
+
+func (g guardedLimiter) TryReady(maxBytes int) (n int) {
+	defer func() {
+		if recover() != nil {
+			n = 0
+		}
+	}()
+	return g.l.TryReady(maxBytes)
+}
+
+func (g guardedLimiter) Charge(n int) {
+	defer func() { _ = recover() }()
+	g.l.Charge(n)
 }
 
 // SpliceOptions configure Splice.
@@ -151,6 +193,9 @@ var errSpliceSelf = errors.New("zmux: cannot splice a stream into itself")
 // (StreamCancelled) and stop the upstream receiving sides with 0, and Code is
 // ZMUX_CANCELLED.
 func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResult, error) {
+	if a == nil || b == nil {
+		return SpliceResult{}, net.ErrClosed
+	}
 	if a == b || a.h == b.h {
 		return SpliceResult{}, errSpliceSelf
 	}
@@ -168,6 +213,7 @@ func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResul
 	if o.Chunk == 0 {
 		o.Chunk = 64 << 10
 	}
+	o.AtoB, o.BtoA = guardLimiter(o.AtoB), guardLimiter(o.BtoA) // host code on the splice's goroutines
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var ab, ba SpliceDirection
@@ -325,23 +371,26 @@ func spliceAbort(ctx context.Context, r, w *Stream, err error) {
 // longer send (stopped, or its session closed or lost).
 func (h *handle) waitReadable(ctx context.Context, w *handle) (uint64, bool, error, error) {
 	c := h.c
+	// The one wait on two sessions' slots (the plan's exception to
+	// awaitRead): each is drained under its own session's lock.
 	for {
-		c.lock()
-		n, end := c.s.ReadReady(h.st)
-		if n == 0 && !end {
-			h.rsig.Drain()
-			c.s.WaitRead(h.st, &h.rsig)
-		}
-		c.unlock()
+		var n uint64
+		var end bool
+		c.locked(func() {
+			if n, end = c.s.ReadReady(h.st); n == 0 && !end {
+				h.rsig.Drain()
+			}
+		})
 		if n > 0 || end {
 			return n, end, nil, nil
 		}
 		// w's signal is woken by a STOP_SENDING and by the end of its
 		// session; drained before the check, so neither is missed.
-		w.c.lock()
-		w.wsig.Drain()
-		e := w.c.s.WriteErrOf(w.st)
-		w.c.unlock()
+		var e error
+		w.c.locked(func() {
+			w.wsig.Drain()
+			e = w.c.s.WriteErrOf(w.st)
+		})
 		if e != nil {
 			return 0, false, apiErr(e), nil
 		}

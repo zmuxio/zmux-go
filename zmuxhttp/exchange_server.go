@@ -459,8 +459,10 @@ func (h *ExchangeHandler) unforgetLocked(cid [exCIDLen]byte) {
 	}
 }
 
-// respond writes a response with flags and data to q.
-func (h *ExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exReq, flags byte, data []byte) {
+// respond writes a response with flags and data to q. held: a write of
+// data itself failed, so the transport may still read it (an HTTP/2 write
+// returns early when its stream is reset while its frame is in flight).
+func (h *ExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exReq, flags byte, data []byte) (held bool) {
 	mac := key.responseMAC(q.cid[:], q.kind, q.seq, q.nonce, flags, data)
 	var hdr [exRespHdr]byte
 	copy(hdr[:], mac[:])
@@ -478,16 +480,19 @@ func (h *ExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exReq, f
 		bin.unref()
 		hh.Set("Content-Length", strconv.Itoa(b64Len(n)))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(enc.b[:b64Len(n)]) // the client repeats what it lacks
+		if _, err := w.Write(enc.b[:b64Len(n)]); err != nil { // the client repeats what it lacks
+			enc.keep()
+		}
 		enc.unref()
-		return
+		return false
 	}
 	hh.Set("Content-Length", strconv.Itoa(n))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(hdr[:]) //nolint:gosec // G705: octet-stream body, not HTML
-	if len(data) > 0 {
-		_, _ = w.Write(data) //nolint:gosec // G705: octet-stream body, not HTML
+	if _, err := w.Write(hdr[:]); err != nil || len(data) == 0 { //nolint:gosec // G705: octet-stream body, not HTML
+		return false
 	}
+	_, err := w.Write(data) //nolint:gosec // G705: octet-stream body, not HTML
+	return err != nil
 }
 
 // exServer is the server end of one exchange carrier. Every field below mu
@@ -534,14 +539,13 @@ type exServer struct {
 	finLow uint64 // lowest FIN piece, when finOK
 }
 
-// exAssign is an assigned downlink piece; refs counts the responses being
-// written from it.
+// exAssign is an assigned downlink piece. pieces holds one reference to
+// buf (nil: an empty piece); every response written from it holds its own,
+// and whoever drops the last returns the piece's memory charge.
 type exAssign struct {
-	buf      *exBuf
-	data     []byte
-	refs     int
-	fin      bool
-	released bool
+	buf  *exBuf
+	data []byte
+	fin  bool
 }
 
 func newExServer(h *ExchangeHandler, cid [exCIDLen]byte, key *exKey) *exServer {
@@ -649,16 +653,18 @@ func (c *exServer) freePieceLocked(p *exPiece) {
 	}
 }
 
-func (c *exServer) releaseLocked(a *exAssign) {
-	if a.released {
+// releaseLocked drops the reference pieces holds to a, which the caller
+// removes from pieces.
+func (c *exServer) releaseLocked(a *exAssign) { c.dropPieceLocked(a.buf) }
+
+// dropPieceLocked drops one reference to a piece's buffer and returns its
+// memory charge with the last.
+func (c *exServer) dropPieceLocked(b *exBuf) {
+	if b == nil {
 		return
 	}
-	a.released = true
-	if a.buf != nil {
-		c.charge(-int64(len(a.buf.b)))
-		if a.refs == 0 {
-			a.buf.unref()
-		}
+	if size := int64(len(b.b)); b.unref() {
+		c.charge(-size)
 	}
 }
 
@@ -864,8 +870,8 @@ func (c *exServer) down(w http.ResponseWriter, r *http.Request, q *exReq) {
 		if held {
 			c.nheld--
 		}
-		if a != nil {
-			a.refs++
+		if a != nil && a.buf != nil {
+			a.buf.ref() // the response's own: the piece may be released meanwhile
 		}
 		c.last = time.Now()
 		c.mu.Unlock()
@@ -876,12 +882,11 @@ func (c *exServer) down(w http.ResponseWriter, r *http.Request, q *exReq) {
 		if a.fin {
 			flags = exFlagFin
 		}
-		h.respond(w, c.key, q, flags, a.data)
-		c.mu.Lock()
-		a.refs--
-		if a.released && a.refs == 0 && a.buf != nil {
-			a.buf.unref()
+		if h.respond(w, c.key, q, flags, a.data) && a.buf != nil {
+			a.buf.keep()
 		}
+		c.mu.Lock()
+		c.dropPieceLocked(a.buf)
 		c.mu.Unlock()
 		return
 	}

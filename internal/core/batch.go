@@ -53,6 +53,7 @@ func GetBatch() *Batch { return batchPool.Get().(*Batch) }
 
 // PutBatch gives back a batch whose write was reported (WriteDone).
 func PutBatch(b *Batch) {
+	b.release() // a batch never reported (its writer failed) still pins blocks
 	b.reset()
 	b.Pipe, b.Lane = 0, 0
 	clear(b.bufs)
@@ -65,7 +66,7 @@ func PutBatch(b *Batch) {
 // Len returns the number of bytes in the batch.
 func (b *Batch) Len() int { return b.n }
 
-// Reset empties the batch for reuse; it must have been released.
+// reset empties the batch for reuse; it must have been released.
 func (b *Batch) reset() {
 	b.arena = b.arena[:0]
 	clear(b.segs)
@@ -152,6 +153,11 @@ type recWriter struct {
 	onlyPing    bool   // records so far carry only QX_PING requests and PADDING
 	epochAnswer uint64 // the epoch of a SESSION_EPOCH answer written, 0: none
 	pend        pendStream
+	// The batch pins from pendPins on are the pending frame's, in piece
+	// order: pieces are pinned when added (their stream may release its
+	// bytes before the frame is encoded) and flushPend releases the pins
+	// of those it copies.
+	pendPins    int
 	closed      bool // nothing else: CONNECTION_CLOSE written, or laneOnly
 	laneOnly    bool // the first record of a lane: PIPE_LANE only
 	retain      bool
@@ -244,7 +250,7 @@ func (w *recWriter) init(b *Batch, framing Framing, recMax, budget int) {
 		descs: w.descs[:0], dataRoom: -1, recBound: batchRecBound}
 }
 
-// headroom returns the bytes a new record's Size field costs.
+// sizeCost returns the bytes a new record's Size field costs.
 func (w *recWriter) sizeCost() int {
 	if w.framing == FramingRecords {
 		return 0
@@ -331,7 +337,7 @@ func (w *recWriter) openCost() int {
 	return w.pendLen(false)
 }
 
-// raw appends frame bytes built by f to the open record.
+// frame appends frame bytes built by f to the open record.
 func (w *recWriter) frame(n int, elicit bool, f func([]byte) []byte) bool {
 	if n > w.recMax {
 		// No record holds it (the carrier record floor, SPEC.md Section
@@ -388,16 +394,18 @@ func (w *recWriter) stream(id, off uint64, data []byte, pn pin, fin bool) bool {
 			return false
 		}
 		w.end()
-		if w.blocked() {
+		if w.blocked() || !w.fits(n) { // the next record's plan may hold less (as frame)
 			return false
 		}
 	}
 	w.begin()
 	w.flushPend(true)
 	w.pend = pendStream{on: true, id: id, off: off, data: data, pin: pn, fin: fin, more: w.pend.more[:0], n: len(data)}
+	w.pendPins = len(w.b.pins)
 	if !pn.none() {
 		// Pinned now: the stream may release its bytes before the frame is
-		// encoded; the batch keeps the block alive until WriteDone.
+		// encoded; a referenced piece keeps the block alive until
+		// WriteDone, a copied one until flushPend.
 		pn.ref()
 		w.b.pins = append(w.b.pins, pn)
 	}
@@ -436,7 +444,7 @@ func (w *recWriter) datagram(data []byte, frameMax uint64) (ok, never bool) {
 			return false, false
 		}
 		w.end()
-		if w.blocked() {
+		if w.blocked() || !w.fits(n) {
 			return false, false
 		}
 	}
@@ -492,10 +500,18 @@ func (w *recWriter) flushPend(withLen bool) {
 		w.b.arena = wire.AppendStreamHeader(w.b.arena, p.id, p.off, p.n, p.fin, withLen)
 	}
 	hl := len(w.b.arena) - a0
-	if len(p.more) == 0 && (len(p.data) < refThreshold || p.pin.none() && !p.dg) {
+	if len(p.more) == 0 && (len(p.data) < refThreshold || p.pin.none()) {
 		w.b.arena = append(w.b.arena, p.data...)
 		w.b.segs = append(w.b.segs, bseg{a0: a0, a1: len(w.b.arena)})
+		if !p.pin.none() {
+			// Its pin is the batch's last.
+			p.pin.unref()
+			k := len(w.b.pins) - 1
+			w.b.pins[k] = pin{}
+			w.b.pins = w.b.pins[:k]
+		}
 	} else {
+		kept := w.pendPins
 		w.b.segs = append(w.b.segs, bseg{a0: a0, a1: a0 + hl})
 		for i := -1; i < len(p.more); i++ {
 			d, pn := p.data, p.pin
@@ -503,9 +519,13 @@ func (w *recWriter) flushPend(withLen bool) {
 				d, pn = p.more[i].data, p.more[i].pin
 			}
 			if len(d) < refThreshold || pn.none() {
-				// Small pieces are copied: they extend the arena segment.
+				// Small pieces are copied: they extend the arena segment
+				// and need their block no longer.
 				b0 := len(w.b.arena)
 				w.b.arena = append(w.b.arena, d...)
+				if !pn.none() {
+					pn.unref()
+				}
 				if last := &w.b.segs[len(w.b.segs)-1]; last.ext == nil && last.a1 == b0 {
 					last.a1 = len(w.b.arena)
 				} else {
@@ -513,9 +533,15 @@ func (w *recWriter) flushPend(withLen bool) {
 				}
 				continue
 			}
+			w.b.pins[kept] = pn
+			kept++
 			w.b.segs = append(w.b.segs, bseg{ext: d, pin: pn})
 		}
 		clear(p.more)
+		if kept != len(w.b.pins) {
+			clear(w.b.pins[kept:])
+			w.b.pins = w.b.pins[:kept]
+		}
 	}
 	l := hl + p.n
 	w.recBytes += l

@@ -1,9 +1,6 @@
 package core
 
 import (
-	"cmp"
-	"slices"
-
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
 )
@@ -32,27 +29,64 @@ func (a *attach) minRTT() Duration {
 	return a.rtt.smoothed
 }
 
-// owd is OWD_p.
-func (s *Session) owd(p *Pipe) Duration {
-	a := p.mp
-	if !a.rtt.has {
-		return a.rtt.smoothed / 2
-	}
-	m := a.rtt.min
+// owdBase is the smallest min_rtt of the live outbound pipes with an RTT
+// sample (the reference of every OWD_p; noRTT when there is none),
+// worked out once by a caller that needs the OWD of many pipes.
+func (s *Session) owdBase() Duration {
+	m := noRTT
 	for _, q := range s.pipes {
 		if q.mp != nil && q.out != nil && q.mp.liveOut() && q.mp.rtt.has && q.mp.rtt.min < m {
 			m = q.mp.rtt.min
 		}
 	}
-	return a.rtt.min - m/2
+	return m
+}
+
+// noRTT is owdBase without a sample.
+const noRTT = Duration(1<<63 - 1)
+
+// owd is OWD_p.
+func (s *Session) owd(p *Pipe) Duration { return owdFrom(p.mp, s.owdBase()) }
+
+// owdFrom is OWD_p given owdBase.
+func owdFrom(a *attach, base Duration) Duration {
+	if !a.rtt.has {
+		return a.rtt.smoothed / 2
+	}
+	return a.rtt.min - min(a.rtt.min, base)/2
 }
 
 func (a *attach) liveOut() bool {
 	return a.out == OutJoining || a.out == OutActive || a.out == OutSuspect || a.out == OutDraining
 }
 
-// controlRank orders outbound pipes for control frames.
-func (s *Session) controlRank(p *Pipe) (int, uint64, int, Duration) {
+// controlKey orders outbound pipes for control frames, lowest first.
+type controlKey struct {
+	rank int
+	sb   int
+	prio uint64
+	owd  Duration
+	id   uint64
+}
+
+func (k controlKey) less(o controlKey) bool {
+	if k.rank != o.rank {
+		return k.rank < o.rank
+	}
+	if k.sb != o.sb {
+		return k.sb < o.sb
+	}
+	if k.prio != o.prio {
+		return k.prio < o.prio
+	}
+	if k.owd != o.owd {
+		return k.owd < o.owd
+	}
+	return k.id < o.id
+}
+
+// controlKeyOf is p's control order key given owdBase.
+func controlKeyOf(p *Pipe, base Duration) controlKey {
 	a := p.mp
 	var r int
 	switch {
@@ -68,53 +102,31 @@ func (s *Session) controlRank(p *Pipe) (int, uint64, int, Duration) {
 		r = 4
 	}
 	pr, sb := a.effPrio()
-	sbi := 0
+	k := controlKey{rank: r, prio: pr, owd: owdFrom(a, base), id: p.id}
 	if sb {
-		sbi = 1
+		k.sb = 1
 	}
-	return r, pr, sbi, s.owd(p)
+	return k
 }
 
-// controlOrder returns the live outbound pipes in the control order.
-func (s *Session) controlOrder(dst []*Pipe) []*Pipe {
-	for _, p := range s.pipes {
-		if p.mp != nil && p.out != nil && !p.out.failed && p.mp.liveOut() && !p.mp.hs && !p.mp.retired {
-			if p.mp.out == OutDraining && p.mp.abandonSent && p.mp.abandonRecv {
-				continue
-			}
-			dst = append(dst, p)
-		}
-	}
-	slices.SortStableFunc(dst, func(x, y *Pipe) int {
-		rx, px, sx, ox := s.controlRank(x)
-		ry, py, sy, oy := s.controlRank(y)
-		if c := cmp.Compare(rx, ry); c != 0 {
-			return c
-		}
-		if c := cmp.Compare(sx, sy); c != 0 {
-			return c
-		}
-		if c := cmp.Compare(px, py); c != 0 {
-			return c
-		}
-		if c := cmp.Compare(ox, oy); c != 0 {
-			return c
-		}
-		return cmp.Compare(x.id, y.id)
-	})
-	return dst
-}
-
-// primary returns the first pipe of the control order (and the second).
+// primary returns the first two live outbound pipes of the control order.
 func (s *Session) primary() (*Pipe, *Pipe) {
-	var buf [8]*Pipe
-	o := s.controlOrder(buf[:0])
+	base := s.owdBase()
 	var a, b *Pipe
-	if len(o) > 0 {
-		a = o[0]
-	}
-	if len(o) > 1 {
-		b = o[1]
+	var ka, kb controlKey
+	for _, p := range s.pipes {
+		if p.mp == nil || p.out == nil || p.out.failed || !p.mp.liveOut() || p.mp.hs || p.mp.retired ||
+			p.mp.out == OutDraining && p.mp.abandonSent && p.mp.abandonRecv {
+			continue
+		}
+		k := controlKeyOf(p, base)
+		switch {
+		case a == nil || k.less(ka):
+			b, kb = a, ka
+			a, ka = p, k
+		case b == nil || k.less(kb):
+			b, kb = p, k
+		}
 	}
 	return a, b
 }
@@ -175,7 +187,7 @@ func (s *Session) mpWrite(w *recWriter, p *Pipe, ol *outLane) {
 	}
 	d := &s.mp.dec
 	if ol.lane == 0 {
-		s.refreshBindings(s.buildGate())
+		s.refreshBindings(s.buildGate(&s.mp.gateBuf))
 	}
 	s.newDecision(d, p)
 	if ol.lane == 0 {
@@ -250,10 +262,7 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 		if qa == nil || !qa.abandonQueued || qa.retired {
 			continue
 		}
-		// A graceful removal of an own outbound pipe puts its PIPE_ABANDON
-		// on that pipe; otherwise another pipe carries it.
-		selfGraceful := qa.abandonCode == wire.NoError && q.out != nil && qa.liveOut() && !qa.drainSuspect
-		if selfGraceful && q != p || !selfGraceful && q == p && prim != nil && prim != p {
+		if !s.abandonGoesOn(q, p, prim) {
 			continue
 		}
 		code := qa.abandonCode
@@ -269,14 +278,13 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 			w.abandonsSent = append(w.abandonsSent, q)
 		}
 	}
-	for id := range m.pendAbandon {
-		code := m.pendCode[id]
+	for id, code := range m.pendAbandon {
 		n := varint.SizeVarint(wire.TypePipeAbandon) + varint.SizeVarint(id) + varint.SizeVarint(code)
 		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPipeAbandon(b, id, code) }) {
 			return
 		}
+		w.logFrame(frameDesc{kind: dAbandonID, id: id, val: code})
 		delete(m.pendAbandon, id)
-		delete(m.pendCode, id)
 	}
 	s.epochProgress()
 	s.writeEpoch(w, p)
@@ -431,7 +439,7 @@ func (s *Session) waitsFor(p *Pipe, ol *outLane) bool {
 // anyStreamOn reports whether some stream direction would put data on
 // lane ol of p now.
 func (s *Session) anyStreamOn(p *Pipe, ol *outLane) bool {
-	d := &s.mp.dec
+	d := &s.mp.probe
 	s.newDecision(d, p)
 	it := s.sched.iter()
 	for st := it.next(); st != nil; st = it.next() {

@@ -257,7 +257,7 @@ func (s *Session) lanesCovered() bool {
 
 // ---- inbound lanes ----
 
-// laneTimeouts refuses lanes not confirmed within the handshake timeout.
+// laneTimeouts refuses lanes not confirmed within the join timeout.
 func (s *Session) laneTimeouts(now Time, apply bool) Time {
 	t := Never
 	for _, p := range s.pipes {

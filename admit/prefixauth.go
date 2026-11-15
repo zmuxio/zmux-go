@@ -10,10 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/internal/httpx"
@@ -174,6 +177,9 @@ type PrefixAuthVerifierOptions struct {
 	// is acceptable (0: 65536, as an empty cache would reject every
 	// token); a token that finds it full is rejected.
 	CacheSize int
+	// Clock is the verifier's time source, its replay filter's included
+	// (nil: the host clock).
+	Clock timeshim.Clock
 }
 
 // NewPrefixAuthVerifier returns a verifier for a with o's settings; an
@@ -186,15 +192,20 @@ func NewPrefixAuthVerifier(a *PrefixAuth, o PrefixAuthVerifierOptions) (*PrefixA
 	if o.Skew < 0 || o.CacheSize < 0 {
 		return nil, fmt.Errorf("%w: PrefixAuthVerifierOptions with a negative field", zmux.ErrInvalidConfig)
 	}
+	// The acceptance window, (Skew+1) slots, must be a duration.
+	if int64(o.Skew) >= math.MaxInt64/int64(time.Second)/slot {
+		return nil, fmt.Errorf("%w: PrefixAuthVerifierOptions.Skew %d slots is beyond any duration", zmux.ErrInvalidConfig, o.Skew)
+	}
+	clk := timeshim.Or(o.Clock)
 	size := o.CacheSize
 	if size == 0 {
 		size = 1 << 16
 	}
-	v := &PrefixAuthVerifier{bind: a.BindTLS, header: a.headerName(), slot: slot, skew: int64(o.Skew), now: time.Now}
+	v := &PrefixAuthVerifier{bind: a.BindTLS, header: a.headerName(), slot: slot, skew: int64(o.Skew), now: clk.Now}
 	// A token of slot s verifies while the clock is within skew slots of
 	// s: within (skew+1) slots of the slot's start.
 	v.cache, err = NewReplayFilter(ReplayConfig{Window: time.Duration(int64(o.Skew)+1) * time.Duration(slot) * time.Second,
-		Max: size})
+		Max: size, Clock: o.Clock})
 	if err != nil {
 		return nil, err
 	}

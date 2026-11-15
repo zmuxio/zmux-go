@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
+	"github.com/zmuxio/zmux-go/internal/testscale"
 )
 
 var joinSecret = bytes.Repeat([]byte{9}, 32)
@@ -246,7 +247,7 @@ func TestJoinSecretHoldTimeout(t *testing.T) {
 	}
 	var read atomic.Int64
 	counted := countingConn{Conn: nc, n: &read}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testscale.D(5*time.Second))
 	defer cancel()
 	if _, err := e.client.AddPipe(ctx, NetPipe(counted), PipeOptions{}); err == nil {
 		t.Fatal("held join was accepted")

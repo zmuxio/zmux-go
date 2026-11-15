@@ -152,7 +152,8 @@ var paramBits = map[uint64]uint32{
 func DecodeParams(b []byte, p *Params) *Error {
 	*p = Params{MaxRecordSize: DefaultMaxRecordSize}
 	// Duplicate detection: known parameters use the Has bits; unknown ones
-	// are compared against the IDs seen before (bounded by the block size).
+	// are collected and checked once sorted (n log n: a block of thousands
+	// of distinct unknown IDs costs no quadratic scan).
 	r := reader{b: b}
 	var seenUnknown []uint64
 	for r.i < len(b) {
@@ -166,9 +167,6 @@ func DecodeParams(b []byte, p *Params) *Error {
 		}
 		bit, known := paramBits[id]
 		if !known {
-			if slices.Contains(seenUnknown, id) {
-				return ErrParam("duplicate parameter")
-			}
 			seenUnknown = append(seenUnknown, id)
 			continue
 		}
@@ -178,6 +176,12 @@ func DecodeParams(b []byte, p *Params) *Error {
 		p.Has |= bit
 		if err := p.decodeOne(id, v); err != nil {
 			return err
+		}
+	}
+	slices.Sort(seenUnknown)
+	for i := 1; i < len(seenUnknown); i++ {
+		if seenUnknown[i] == seenUnknown[i-1] {
+			return ErrParam("duplicate parameter")
 		}
 	}
 	return p.validate()

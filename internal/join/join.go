@@ -560,7 +560,7 @@ func (c *schedule) seal1(key, plaintext []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return a.Seal(nil, c.suite.AEAD.Nonce(0), plaintext, nil), nil
+	return a.Seal(nil, c.suite.AEAD.AppendNonce(nil, 0), plaintext, nil), nil
 }
 
 func (c *schedule) open1(key, ciphertext []byte) ([]byte, error) {
@@ -571,7 +571,7 @@ func (c *schedule) open1(key, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < a.Overhead() {
 		return nil, ErrMalformed
 	}
-	out, err := a.Open(nil, c.suite.AEAD.Nonce(0), ciphertext, nil)
+	out, err := a.Open(nil, c.suite.AEAD.AppendNonce(nil, 0), ciphertext, nil)
 	if err != nil {
 		return nil, ErrAuth
 	}
@@ -743,7 +743,7 @@ func (j *Joiner) WriteHelloRaw(dst, plain []byte) ([]byte, error) {
 	if err != nil {
 		return nil, j.fail(err)
 	}
-	if len(head)+framingLen(j.cfg.Framing)+len(ct) > HandshakeFloor {
+	if len(head)+FramingLen(j.cfg.Framing)+len(ct) > HandshakeFloor {
 		return nil, j.fail(ErrTooLarge)
 	}
 	dst = append(dst, head...)
@@ -987,7 +987,7 @@ func (a *Acceptor) WriteReplyRaw(dst, plain []byte, e Entropy) ([]byte, error) {
 		a.state, a.err = acceptorFailed, err
 		return nil, err
 	}
-	if 1+len(rr)+framingLen(a.c.f)+len(ct) > HandshakeFloor {
+	if 1+len(rr)+FramingLen(a.c.f)+len(ct) > HandshakeFloor {
 		a.state, a.err = acceptorFailed, ErrTooLarge
 		return nil, ErrTooLarge
 	}

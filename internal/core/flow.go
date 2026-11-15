@@ -19,6 +19,7 @@ type connFlow struct {
 	rel       uint64 // released credit (C = rel + win)
 	recv      uint64 // sum over streams of max(highest, final)
 	buffered  uint64 // unread buffered bytes
+	pins      pinSet // read buffers pinned by buffered pieces (recvBuf)
 	held      uint64 // received at or above the cap, credit not released
 	blockSeen uint64 // largest DATA_BLOCKED limit reported
 	peerBlock bool   // DATA_BLOCKED at the current limit received
@@ -52,8 +53,8 @@ func (s *Session) bufAdd(n uint64) {
 	}
 	c := &s.conn
 	cp := s.bufferCap()
-	if c.buffered < cp && !s.underPressure() {
-		r := min64(n, cp-c.buffered)
+	if held := c.buffered + c.pins.extra; held < cp && !s.underPressure() {
+		r := min64(n, cp-held)
 		c.rel += r
 		c.held += n - r
 	} else {
@@ -73,9 +74,10 @@ func (s *Session) bufSub(n uint64) {
 	if n > c.buffered {
 		panic("zmux: buffered bytes below zero")
 	}
+	s.compactPins(nil)
 	c.buffered -= n
 	if c.held > 0 {
-		if c.buffered < s.bufferCap() && !s.underPressure() {
+		if c.buffered+c.pins.extra < s.bufferCap() && !s.underPressure() {
 			c.rel += c.held
 			c.held = 0
 		} else {

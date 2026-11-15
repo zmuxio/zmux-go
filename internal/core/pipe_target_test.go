@@ -12,6 +12,65 @@ func targetSession() *Session {
 	return s
 }
 
+// A refused join keeps the refusal backoff whatever its handshake state;
+// the retirement of an attachment the acceptor had attached ends it.
+func TestRetireRefusedKeepsBackoff(t *testing.T) {
+	s, _ := statsMP()
+	ref, att := capacityExtra(s), capacityExtra(s)
+	ref.mp.joinerLocal, att.mp.joinerLocal = true, true
+	s.mp.backoffUntil = Time(5 * Second)
+	s.retire(ref, true)
+	if s.mp.backoffUntil == 0 {
+		t.Fatal("a refused join ended the refusal backoff")
+	}
+	s.retire(att, false)
+	if s.mp.backoffUntil != 0 {
+		t.Fatal("an attached pipe's retirement kept the backoff")
+	}
+}
+
+// The writer's decision keeps its own gate: building the gate for
+// another reader, or anyStreamOn's decision, leaves it as it was.
+func TestDecisionOwnsGate(t *testing.T) {
+	s, p := statsMP()
+	d := &s.mp.dec
+	s.newDecision(d, p)
+	if d.g == nil {
+		t.Fatal("no usable pipe")
+	}
+	tiers := len(d.g.tiers)
+	pipes := append([]*Pipe(nil), d.g.pipes...)
+	capacityExtra(s).mp.peerPrio = 7 // a new tier for the other readers
+	s.mp.stateGen++
+	if g := s.buildGate(&s.mp.gateBuf); g == d.g || len(g.tiers) == tiers {
+		t.Fatalf("scratch gate %p, decision gate %p, tiers %d", g, d.g, len(g.tiers))
+	}
+	s.anyStreamOn(p, p.out.lanes[0])
+	if d.g != &d.gb || len(d.g.tiers) != tiers || len(d.g.pipes) != len(pipes) {
+		t.Fatalf("decision gate changed: %d tiers, %d pipes", len(d.g.tiers), len(d.g.pipes))
+	}
+}
+
+// The control order: state, standby, priority, OWD, then ID.
+func TestPrimaryControlOrder(t *testing.T) {
+	s, _ := mpBenchSession(5)
+	ps := s.pipes
+	ps[0].mp.out = OutSuspect           // after every active one
+	ps[1].mp.peerStandby = true         // after the non-standby ones
+	ps[2].mp.rtt.min = 50 * Millisecond // the largest OWD of the rest
+	if a, b := s.primary(); a != ps[3] || b != ps[4] {
+		t.Fatalf("primary %v %v, want pipes %d %d", a.id, b.id, ps[3].id, ps[4].id)
+	}
+	ps[4].mp.rtt.min = ps[3].mp.rtt.min // equal OWD: the lower ID first
+	if a, b := s.primary(); a != ps[3] || b != ps[4] {
+		t.Fatalf("on a tie %v %v", a.id, b.id)
+	}
+	ps[3].mp.out, ps[4].mp.out = OutSuspect, OutSuspect
+	if a, b := s.primary(); a != ps[2] || b != ps[1] {
+		t.Fatalf("with two suspects %v %v", a.id, b.id)
+	}
+}
+
 func TestJoinReadyUsesMaintenanceTarget(t *testing.T) {
 	s := targetSession()
 	if !s.JoinReady() {

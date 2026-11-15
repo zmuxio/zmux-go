@@ -178,7 +178,10 @@ type budget struct {
 }
 
 // charge subtracts one token for a chargeable frame.
-func (s *Session) charge() {
+func (s *Session) charge() { s.chargeN(1) }
+
+// chargeN subtracts n tokens for work a peer frame costs n frames' worth.
+func (s *Session) chargeN(n int64) {
 	b := &s.budget
 	el := s.now.Sub(b.last)
 	if el >= Second/budgetRefill {
@@ -189,7 +192,7 @@ func (s *Session) charge() {
 			b.last = s.now
 		}
 	}
-	b.tokens--
+	b.tokens -= n
 	if b.tokens < 0 {
 		s.failLocal(wire.NewError(wire.ExcessiveLoad, "no-effect budget exhausted"))
 	}

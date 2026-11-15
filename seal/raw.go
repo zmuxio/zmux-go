@@ -6,11 +6,11 @@ import (
 	"errors"
 	"io"
 	"net"
-	"reflect"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 )
 
 // rawCarrier makes the carrier of Bound or Trusted: raw records on the lower halves,
@@ -21,7 +21,7 @@ func rawCarrier(base, lower zmux.PipeIO, mode zmux.RecordMode, exp *resultExport
 	common := rawCommon{exp: exp, mode: mode, base: base}
 	q := lower
 	if lower.R != nil {
-		r := &rawReader{ReadCloser: lower.R, rawCommon: common, same: sameConn(base.R, base.W)}
+		r := &rawReader{ReadCloser: lower.R, rawCommon: common, same: carrierio.SameHalf(base.R, base.W)}
 		q.R = r
 		for _, x := range []any{base.W, base.R} {
 			if ch, ok := x.(zmux.DatagramChannel); ok {
@@ -104,12 +104,12 @@ func (r *rawReader) SetReadDeadline(t time.Time) error {
 }
 
 // ReadMessage reads a message of a message carrier.
-func (r *rawReader) ReadMessage() ([]byte, error) {
+func (r *rawReader) ReadMessage(limit int) ([]byte, error) {
 	mr, ok := r.ReadCloser.(zmux.MessageReader)
 	if !ok {
 		return nil, errNotMessages
 	}
-	return mr.ReadMessage()
+	return mr.ReadMessage(limit)
 }
 
 // CarrierConn names the carrier's connection, nil without one.
@@ -220,7 +220,7 @@ func (w *rawWriter) CloseWrite() error {
 	if cw, ok := w.WriteCloser.(zmux.CloseWriter); ok {
 		return cw.CloseWrite()
 	}
-	if sameConn(w.base.R, w.base.W) {
+	if carrierio.SameHalf(w.base.R, w.base.W) {
 		return nil // one connection: closing W would end the receiving direction too
 	}
 	return w.Close()
@@ -261,12 +261,3 @@ func (w *laneWriter) OpenLane(ctx context.Context) (io.WriteCloser, error) {
 }
 
 var errNotMessages = errors.New("seal: not a message carrier")
-
-// sameConn reports whether two halves of a carrier are one value; halves that
-// cannot be compared count as two.
-func sameConn(a, b any) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return reflect.TypeOf(a).Comparable() && reflect.TypeOf(b).Comparable() && a == b
-}

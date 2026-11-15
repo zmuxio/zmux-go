@@ -128,7 +128,7 @@ func (o *Offer) Finish(share []byte) ([][]byte, error) {
 	if x == nil || len(share) != o.g.ShareR {
 		return nil, ErrKex
 	}
-	ss1, err := exchange(x, share[:x25519Len])
+	ss1, err := X25519Exchange(x, share[:x25519Len])
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +166,7 @@ func (g *Group) Respond(share []byte, r *GroupRand) (out []byte, ss [][]byte, er
 	if err != nil {
 		return nil, nil, err
 	}
-	ss1, err := exchange(x, share[:x25519Len])
+	ss1, err := X25519Exchange(x, share[:x25519Len])
 	if err != nil {
 		return nil, nil, err
 	}
@@ -185,8 +185,9 @@ func (g *Group) Respond(share []byte, r *GroupRand) (out []byte, ss [][]byte, er
 	return append(out, ct...), [][]byte{ss1, ss2}, nil
 }
 
-// exchange relies on crypto/ecdh, which refuses an all-zero output.
-func exchange(x *ecdh.PrivateKey, pub []byte) ([]byte, error) {
+// X25519Exchange is the X25519 exchange of every suite; it relies on
+// crypto/ecdh, which refuses an all-zero output.
+func X25519Exchange(x *ecdh.PrivateKey, pub []byte) ([]byte, error) {
 	p, err := ecdh.X25519().NewPublicKey(pub)
 	if err != nil {
 		return nil, ErrKex

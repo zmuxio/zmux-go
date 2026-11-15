@@ -149,7 +149,7 @@ func TestFlushFrames(t *testing.T) {
 			t.Fatal(err)
 		}
 		fs := pollStream(t, s, p)
-		if done, _ := s.FlushDone(st, target, NewSignal()); !done {
+		if done, _ := s.FlushDone(st, target); !done {
 			t.Fatal("Flush not done after the opening frame")
 		}
 		if !before {
@@ -192,7 +192,7 @@ func TestRestartPreambleBlocked(t *testing.T) {
 	s.peer.MaxStreamDataBidiRem = 1 << 20
 	s.loc[0].limit = 10
 	s.conn.sendMax = 1 << 20
-	s.earlyHeld = true // carrier early data: the bytes stay for a re-issue
+	s.earlyHold = &earlyHold{} // carrier early data: the bytes stay for a re-issue
 	st, _ := s.OpenStream(true)
 	if err := s.SetOpenInfo(st, make([]byte, 16)); err != nil {
 		t.Fatal(err)
@@ -251,7 +251,7 @@ func TestFlushDoneStopAfterSent(t *testing.T) {
 			pollStream(t, s, p)
 		}
 		s.onStopSending(st, 7)
-		done, err := s.FlushDone(st, target, NewSignal())
+		done, err := s.FlushDone(st, target)
 		if !done {
 			t.Fatalf("sentFirst=%v: not done", sentFirst)
 		}
@@ -282,10 +282,71 @@ func TestFlushStopBeforeFlushAfterSent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Flush after the data was sent: %v", err)
 	}
-	if done, err := s.FlushDone(st, target, NewSignal()); !done || err != nil {
+	if done, err := s.FlushDone(st, target); !done || err != nil {
 		t.Fatalf("FlushDone: %v %v", done, err)
 	}
 	if _, err := s.Write(st, []byte("more"), false); err == nil {
 		t.Fatal("Write after the stop succeeded")
+	}
+}
+
+// A PRIORITY_UPDATE written on a rejected early carrier is queued again
+// by the restart.
+func TestRestartEarlyRequeuesPriority(t *testing.T) {
+	s, p := channelSession(t, nil, false)
+	s.feat.Priority = true
+	s.peer.MaxStreamDataBidiRem = 1 << 20
+	s.loc[0].limit = 10
+	s.conn.sendMax = 1 << 20
+	s.earlyHold = &earlyHold{}
+	st, _ := s.OpenStream(true)
+	_, _ = s.Write(st, []byte("data"), false)
+	pollKinds(t, s, p, 2)
+	if err := s.SetPeerPriority(st, 2, false); err != nil {
+		t.Fatal(err)
+	}
+	if k := pollKinds(t, s, p, 2); !slices.Contains(k, wire.KindPriorityUpdate) || st.ctl&ctlPrio != 0 {
+		t.Fatalf("PRIORITY_UPDATE not written: %v", k)
+	}
+	s.peerSeen = false
+	if !s.RestartEarly(CarrierInfo{}, Time(Second)) {
+		t.Fatal("RestartEarly refused")
+	}
+	if st.ctl&ctlPrio == 0 {
+		t.Fatal("PRIORITY_UPDATE of the early carrier not queued again")
+	}
+}
+
+// A local CancelWrite after everything written was sent fails the Flush
+// that follows it.
+func TestFlushAfterLocalCancelWrite(t *testing.T) {
+	s, p := channelSession(t, nil, false)
+	s.peer.MaxStreamDataBidiRem = 1 << 20
+	s.loc[0].limit = 10
+	s.conn.sendMax = 1 << 20
+	st, _ := s.OpenStream(true)
+	_, _ = s.Write(st, []byte("data"), false)
+	pollStream(t, s, p)
+	s.Reset(st, 3)
+	_, err := s.Flush(st)
+	var se *StreamError
+	if !errors.As(err, &se) || se.Kind != StreamClosedLocally {
+		t.Fatalf("Flush after CancelWrite: %v", err)
+	}
+}
+
+// TestRestartEarlyChecksAssumed: early sends re-issued after a rejected
+// carrier keep the identifiers and preambles of the set they assumed, so
+// peer parameters below it end the session locally, as without a restart.
+func TestRestartEarlyChecksAssumed(t *testing.T) {
+	s, _ := channelSession(t, nil, false)
+	s.earlyHold = &earlyHold{check: true, assumed: wire.Params{MaxStreamsBidi: 100}}
+	s.peer = wire.Params{MaxStreamsBidi: 10}
+	if err := s.earlyOutcome(); err == nil {
+		t.Fatal("peer parameters below the assumed set taken after a restart")
+	}
+	s.earlyHold = &earlyHold{check: true, assumed: wire.Params{MaxStreamsBidi: 10}}
+	if err := s.earlyOutcome(); err != nil || s.earlyHold != nil {
+		t.Fatalf("parameters that admit the assumed set: %v", err)
 	}
 }

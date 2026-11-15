@@ -30,7 +30,8 @@ type PipePool struct {
 	// itself, such as an uplink and a downlink of a split carrier
 	// (zmuxhttp.Split.Join), with the options given; the member is usable while
 	// all of them are, and they are replaced together. ctx bounds the
-	// joins; o has ReturnOnReply set, as the pool's own joins do.
+	// joins; o has ReturnOnReply set, as the pool's own joins do. Pipes it
+	// returns with an error are aborted.
 	Join func(ctx context.Context, c *Conn, o PipeOptions) ([]*Pipe, error)
 	// ChoicePolicy is the policy of Choice (nil: the defaults, with a cache
 	// private to the pool); its Join does not apply.
@@ -137,9 +138,8 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	if c == nil {
 		return net.ErrClosed
 	}
-	c.lock()
-	multipath := c.s.Features().Multipath
-	c.unlock()
+	var multipath bool
+	c.locked(func() { multipath = c.s.Features().Multipath })
 	if !multipath {
 		return ErrNotNegotiated
 	}
@@ -180,6 +180,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		limitT         time.Duration
 		idle           time.Duration
 		retire         bool // the policy asked for its replacement
+		promoted       bool // a replacement that took over a failed member before it settled: established once it does
 	}
 	closeAll := func(ps []*Pipe) {
 		for _, p := range ps {
@@ -207,8 +208,6 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	// the session wake the pool at once.
 	sig := core.NewSignal()
 	defer c.unwatchPipes(sig)
-	tick := timeshim.NewTicker(clk, 250*time.Millisecond)
-	defer tick.Stop()
 	timer := timeshim.NewTimer(clk, time.Hour) // the next recheck or dial, per pass
 	timer.Stop()
 	defer timer.Stop()
@@ -228,16 +227,20 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		}
 		if pool.Join != nil {
 			var ps []*Pipe
-			var err error
-			if !safeLog(c.cfg.Logger, "PipePool.Join", func() { ps, err = pool.Join(dctx, c, o) }) {
-				err = errors.New("zmux: PipePool.Join panicked")
-			}
+			err := hostCall(c.cfg.Logger, "PipePool.Join", func() error { var err error; ps, err = pool.Join(dctx, c, o); return err })
 			if err == nil && len(ps) == 0 {
 				err = errors.New("zmux: PipePool.Join joined no pipe")
 			}
-			return ps, err
+			if err != nil {
+				for _, pp := range ps { // pipes of a Join that failed: none is left orphaned
+					_ = pp.Abort(err)
+				}
+				return nil, err
+			}
+			return ps, nil
 		}
-		p, err := pool.Dial(dctx)
+		var p PipeIO
+		err := hostCall(c.cfg.Logger, "PipePool.Dial", func() error { var err error; p, err = pool.Dial(dctx); return err })
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +258,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		if err != nil {
 			failures++
 			wait = pool.Backoff.wait(backoff)
-			backoff = min(2*backoff, pool.Backoff.Max)
+			backoff = min(satDouble(backoff), pool.Backoff.Max)
 			return nil, err
 		}
 		backoff, failures = pool.Backoff.Min, 0
@@ -276,7 +279,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 	sessionEnded := func() error {
 		err := c.closedErr()
 		var ae *ApplicationError
-		if mp != nil && !errors.As(c.Wait(), &ae) {
+		if mp != nil && !errors.As(err, &ae) {
 			for _, m := range members {
 				mp.dropped(m.kind, m.joined)
 			}
@@ -304,17 +307,23 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		}
 		// Watch before reading the state: a change after the read wakes
 		// the pass's wait.
-		c.lock()
-		sig.Drain()
-		c.watchPipes(sig)
-		c.unlock()
+		c.locked(func() {
+			sig.Drain()
+			c.watchPipes(sig)
+		})
 		// Drop members whose pipe is gone or failed.
 		live := members[:0]
 		now := clk.Now()
 		view.Members = view.Members[:0]
 		for _, m := range members {
-			st, alive, _ := memberState(m.ps)
+			st, alive, usable := memberState(m.ps)
 			if alive {
+				if m.promoted && usable && (mp == nil || time.Since(m.joined) >= mp.p.settle) {
+					m.promoted = false
+					if mp != nil {
+						mp.established(c, m.kind)
+					}
+				}
 				live = append(live, m)
 				m.idle = st.SinceLastTraffic
 				view.Members = append(view.Members, PoolMember{PipeID: m.ps[0].ID(), Age: now.Sub(m.born),
@@ -326,9 +335,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 				}
 				if m.repl != nil {
 					r := newMember(m.repl, m.replKind)
-					if mp != nil {
-						mp.established(c, r.kind)
-					}
+					r.promoted = true // usable and settled first, then the kind counts as chosen
 					live = append(live, r)
 				}
 			}
@@ -370,11 +377,11 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 			}
 		}
 		out, in := false, false
-		c.lock()
-		if c.s.Features().Multipath {
-			out, in = c.s.LiveDirections()
-		}
-		c.unlock()
+		c.locked(func() {
+			if c.s.Features().Multipath {
+				out, in = c.s.LiveDirections()
+			}
+		})
 		lacking := !out || !in
 		// Redial the missing ones, delay after the previous attempt.
 		from := lastDial
@@ -404,11 +411,29 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		// Rotate: only usable pipes, never while a direction is lacking, one
 		// dial per pass under the same backoff as a redial.
 		// With a mode, a member is also rotated to a preferred kind.
+		// soon is the earliest moment a pass has something time-bound to do
+		// (an age rotation, a settled replacement, a better kind again, the
+		// refusal backoff's end): the pass waits for it, not for a tick.
+		soon := time.Duration(-1)
+		at := func(d time.Duration) {
+			if d <= 0 {
+				return // due now: this pass acts on it, or what holds it (dialAt) wakes the next
+			}
+			if soon < 0 || d < soon {
+				soon = d
+			}
+		}
+		if len(members) < count && !c.joinReady() {
+			at(c.refusalWait())
+		}
 		dialed := false
 		for _, m := range members {
 			upgrade := -1
 			if mp != nil && m.repl == nil {
 				upgrade = mp.better(m.kind, time.Now())
+				if d := mp.betterIn(m.kind, time.Now()); d >= 0 {
+					at(d)
+				}
 			}
 			if lacking || !c.joinReady() || m.repl != nil ||
 				!m.retire && upgrade < 0 && pool.Rotate.MaxBytes == 0 && pool.Rotate.MaxAge == 0 {
@@ -417,6 +442,9 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 			st, _, usable := memberState(m.ps)
 			if !usable {
 				continue
+			}
+			if pool.Rotate.MaxAge > 0 {
+				at(m.limitT - timeshim.Since(clk, m.born))
 			}
 			due := m.retire || upgrade >= 0 || pool.Rotate.MaxBytes > 0 && max(st.BytesSent, st.BytesReceived) >= m.limitB ||
 				pool.Rotate.MaxAge > 0 && timeshim.Since(clk, m.born) >= m.limitT
@@ -463,8 +491,9 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 				if m.replSeen.IsZero() {
 					m.replSeen = time.Now()
 				}
-				if time.Since(m.replSeen) < mp.p.settle {
-					continue // the pass tick looks again
+				if left := mp.p.settle - time.Since(m.replSeen); left > 0 {
+					at(left) // the pass looks again once it settled
+					continue
 				}
 			}
 			closeAll(m.ps)
@@ -473,9 +502,19 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 				mp.established(c, m.kind)
 			}
 		}
-		next := time.Duration(-1)
-		if r := dec.RecheckAfter(); r > 0 && pool.Policy != nil {
-			next = r
+		next := soon
+		if pool.Policy != nil {
+			// The view a policy decides on (ages, idle times, bytes) moves
+			// with time: it is asked again at its Recheck, or at the
+			// default one, unless it asked for none.
+			if r := dec.RecheckAfter(); next < 0 || r < next {
+				next = r
+			}
+		}
+		if pool.Rotate.MaxBytes > 0 && len(members) > 0 && (next < 0 || poolLook < next) {
+			// Byte counts change with no event of their own: the one
+			// built-in rotation a pass looks at again on a clock.
+			next = poolLook
 		}
 		if !dialAt.IsZero() {
 			if d := max(timeshim.Until(clk, dialAt), MinRecheck); next < 0 || d < next {
@@ -489,7 +528,6 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		}
 		select {
 		case <-sig.C:
-		case <-tick.C:
 		case <-wake:
 		case <-ctx.Done():
 			return stopped()

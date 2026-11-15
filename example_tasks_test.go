@@ -451,9 +451,15 @@ func wsPipe(c wsConn) zmux.PipeIO {
 
 type wsAdapter struct{ c wsConn }
 
-func (a *wsAdapter) ReadMessage() ([]byte, error) {
+// ReadMessage returns the next binary message of at most limit bytes. A
+// library with a read limit (SetReadLimit) should be given it instead, so
+// that a longer message is never read whole.
+func (a *wsAdapter) ReadMessage(limit int) ([]byte, error) {
 	for {
 		t, p, err := a.c.ReadMessage()
+		if err == nil && len(p) > limit {
+			return nil, zmux.ErrMessageTooLarge
+		}
 		if err != nil || t == wsBinary {
 			return p, err
 		}

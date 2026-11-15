@@ -54,6 +54,7 @@ type relayConn struct {
 	id     int
 	last   atomic.Int64 // UnixNano of the last relayed byte
 	once   sync.Once
+	halfs  atomic.Int32 // directions that ended with a half-close
 	dropUp atomic.Bool
 	dropDn atomic.Bool
 }
@@ -182,7 +183,16 @@ func (r *Relay) accept() {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		u, err := r.dial(ctx)
+		qctx, qcancel := context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-r.quit: // Close does not wait out a dial
+				qcancel()
+			case <-qctx.Done():
+			}
+		}()
+		u, err := r.dial(qctx)
+		qcancel()
 		cancel()
 		if err != nil {
 			_ = c.Close()
@@ -237,6 +247,9 @@ func (r *Relay) copy(rc *relayConn, dst, src net.Conn, up bool) {
 			if errors.Is(err, io.EOF) {
 				if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 					_ = cw.CloseWrite()
+					if rc.halfs.Add(1) == 2 {
+						return // both directions ended: the connection ends
+					}
 					// The other direction ends the connection.
 					<-rc.done
 				}

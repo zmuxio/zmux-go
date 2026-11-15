@@ -14,7 +14,7 @@ import (
 func TestPoolDecisionValidate(t *testing.T) {
 	for _, d := range []PoolDecision{{Liveness: PipeLiveness{ProbeInterval: 200 * time.Millisecond}},
 		{Liveness: PipeLiveness{ProbeInterval: time.Second - 1}}, {Liveness: PipeLiveness{ProbeJitter: 1}},
-		{Liveness: PipeLiveness{ProbeJitter: math.NaN()}}, {Count: -1}, {DialAfter: -time.Second}, {Recheck: -1}} {
+		{Liveness: PipeLiveness{ProbeJitter: math.NaN()}}, {Count: -1}, {DialAfter: -time.Second}} {
 		if err := d.Validate(); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%+v: %v", d, err)
 		}

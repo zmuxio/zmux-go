@@ -3,6 +3,7 @@ package zmux
 import (
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -16,6 +17,9 @@ import (
 // run serially and in order on a goroutine of the session, never under a
 // lock; the session never waits for them: a bounded queue holds events,
 // and on overflow the events other than Closed are dropped and counted.
+// Wait and Done do not wait for them either (nor for Pick or
+// AllowConnectionWindowIncrease), so a hook may call Wait or Done; Closed
+// may run after Wait returned.
 type Tracer struct {
 	// Established: the peer's transport parameters were processed.
 	Established func()
@@ -89,9 +93,12 @@ func (customPolicy) policy() core.Policy { return core.PolicyCustom }
 // hookQueueMax bounds the tracer queue.
 const hookQueueMax = 256
 
-// hooks runs the application's hooks of one session on a goroutine of its
-// own, started when the first one is needed (an idle session without hooks
-// keeps its footprint). Its lock is a leaf.
+// hooks runs the application's hooks of one session on two goroutines of
+// their own, each started when its first hook is needed (an idle session
+// without hooks keeps its footprint): one answers the scheduler (Pick,
+// AllowConnectionWindowIncrease), the other delivers the Tracer's events
+// and the Logger's warnings, so a slow Tracer or Logger never delays a
+// decision. Its lock is a leaf.
 type hooks struct {
 	pick  Pick
 	c     *Conn
@@ -100,13 +107,13 @@ type hooks struct {
 	log   *slog.Logger
 	warns []string // warnings for log, queued under the session lock
 
-	kick    chan struct{}
 	q       []traceItem
 	dropped uint64
 	mu      sync.Mutex
 	wantWin bool
 	wantPk  bool
-	running bool
+	decRun  bool // the decision goroutine runs
+	trRun   bool // the trace goroutine runs
 }
 
 type traceItem struct {
@@ -116,10 +123,14 @@ type traceItem struct {
 	closed bool
 }
 
-func newHooks(c *Conn) *hooks {
+// newHooks returns the hooks of c's configuration with the custom policy
+// pick (nil: the configured one), or nil when there are none: the one
+// constructor, so a hook set late (SetScheduler) keeps the configured
+// Tracer and Logger.
+func newHooks(c *Conn, pick Pick) *hooks {
 	cfg := c.cfg
-	h := &hooks{c: c, tr: cfg.Tracer, allow: cfg.AllowConnectionWindowIncrease, log: cfg.Logger, kick: make(chan struct{}, 1)}
-	if cp, ok := cfg.Scheduler.(customPolicy); ok {
+	h := &hooks{c: c, tr: cfg.Tracer, allow: cfg.AllowConnectionWindowIncrease, log: cfg.Logger, pick: pick}
+	if cp, ok := cfg.Scheduler.(customPolicy); ok && pick == nil {
 		h.pick = cp.p
 	}
 	if h.tr == nil && h.pick == nil && h.allow == nil && h.log == nil {
@@ -174,48 +185,57 @@ func (h *hooks) note(win, pick bool) {
 	h.mu.Unlock()
 }
 
-// start runs the hook goroutine when there is work (outside the lock).
+// start runs the hook goroutines that have work (outside the lock). They
+// are not side goroutines: Wait never waits for host hooks, which may call
+// Wait themselves. A running one finds new work in its next check (h.mu).
 func (h *hooks) start() {
 	if h == nil {
 		return
 	}
 	h.mu.Lock()
-	work := len(h.q) > 0 || h.wantWin || h.wantPk || h.dropped > 0 || len(h.warns) > 0
-	run := work && !h.running
-	if run {
-		h.running = true
-	}
+	dec := (h.wantWin || h.wantPk) && !h.decRun
+	tr := (len(h.q) > 0 || h.dropped > 0 || len(h.warns) > 0) && !h.trRun
+	h.decRun = h.decRun || dec
+	h.trRun = h.trRun || tr
 	h.mu.Unlock()
-	if run {
-		labels.Go(h.c.lctx, "hooks", func() { h.run() })
-	} else if work {
-		select {
-		case h.kick <- struct{}{}:
-		default:
-		}
+	if dec {
+		labels.Go(h.c.lctx, "hooks-decide", h.runDecide)
+	}
+	if tr {
+		labels.Go(h.c.lctx, "hooks-trace", h.runTrace)
 	}
 }
 
-// run serves the hooks until no work is left.
-func (h *hooks) run() {
+// runDecide answers the scheduler's questions until none is pending.
+func (h *hooks) runDecide() {
 	for {
 		h.mu.Lock()
-		q := h.q
-		h.q = nil
-		dropped := h.dropped
-		h.dropped = 0
 		win, pk := h.wantWin, h.wantPk
 		h.wantWin, h.wantPk = false, false
-		warns := h.warns
-		h.warns = nil
-		if len(q) == 0 && dropped == 0 && !win && !pk && len(warns) == 0 {
-			h.running = false
+		if !win && !pk {
+			h.decRun = false
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Unlock()
+		h.decide(win, pk)
+	}
+}
+
+// runTrace delivers the warnings and trace items until none is queued.
+func (h *hooks) runTrace() {
+	for {
+		h.mu.Lock()
+		q, dropped, warns := h.q, h.dropped, h.warns
+		h.q, h.dropped, h.warns = nil, 0, nil
+		if len(q) == 0 && dropped == 0 && len(warns) == 0 {
+			h.trRun = false
 			h.mu.Unlock()
 			return
 		}
 		h.mu.Unlock()
 		for _, w := range warns {
-			h.log.Warn(w)
+			safeLog(h.log, "Logger", func() { h.log.Warn(w) })
 		}
 		for _, it := range q {
 			h.deliver(it)
@@ -223,12 +243,16 @@ func (h *hooks) run() {
 		if dropped > 0 && h.tr.Dropped != nil {
 			safeLog(h.log, "Tracer.Dropped", func() { h.tr.Dropped(dropped) })
 		}
-		if win {
-			h.window()
-		}
-		if pk {
-			h.runPick()
-		}
+	}
+}
+
+// decide answers a pending window proposal and Pick request.
+func (h *hooks) decide(win, pk bool) {
+	if win {
+		h.window()
+	}
+	if pk {
+		h.runPick()
 	}
 }
 
@@ -247,26 +271,25 @@ func (h *hooks) deliver(it traceItem) {
 // window asks allow_connection_window_increase about a pending growth.
 func (h *hooks) window() {
 	c := h.c
-	c.lock()
-	w, delta, ok := c.s.WindowProposal()
-	c.unlock()
+	var w, delta uint64
+	var ok bool
+	c.locked(func() { w, delta, ok = c.s.WindowProposal() })
 	if !ok {
 		return
 	}
 	allow := false
 	safeLog(h.log, "Config.AllowConnectionWindowIncrease", func() { allow = h.allow(delta) })
-	c.lock()
-	c.s.ApplyWindowProposal(w, allow)
-	c.unlock()
+	c.locked(func() {
+		c.s.ApplyWindowProposal(w, allow)
+	})
 }
 
 // runPick asks the custom policy for the directions that wait.
 func (h *hooks) runPick() {
 	c := h.c
 	var req core.PickRequest
-	c.lock()
-	ok := c.s.TakePick(&req)
-	c.unlock()
+	var ok bool
+	c.locked(func() { ok = c.s.TakePick(&req) })
 	if !ok {
 		return
 	}
@@ -292,9 +315,9 @@ func (h *hooks) runPick() {
 	for i, a := range out {
 		ans[i] = core.PickAnswer{Wait: a.Wait, Index: a.Index, Bytes: a.Bytes}
 	}
-	c.lock()
-	c.s.AnswerPick(&req, ans, failed)
-	c.unlock()
+	c.locked(func() {
+		c.s.AnswerPick(&req, ans, failed)
+	})
 }
 
 // safeLog runs the host callback f, containing a panic (ok false), which
@@ -310,6 +333,26 @@ func safeLog(l *slog.Logger, what string, f func()) (ok bool) {
 	}()
 	f()
 	return true
+}
+
+// satDouble doubles a backoff, saturating instead of wrapping negative for
+// a very large configured maximum.
+func satDouble(d time.Duration) time.Duration {
+	if d > math.MaxInt64/2 {
+		return math.MaxInt64
+	}
+	return 2 * d
+}
+
+// hostCall runs a host callback that fails what it serves when it panics:
+// the panic is contained (and logged) and comes back as an error naming
+// the callback, never ending the process from an internal goroutine.
+func hostCall(l *slog.Logger, what string, f func() error) error {
+	var err error
+	if !safeLog(l, what, func() { err = f() }) {
+		return fmt.Errorf("zmux: %s panicked", what)
+	}
+	return err
 }
 
 // ---- redial ----
@@ -340,10 +383,11 @@ func (c *Conn) maybeRedial() {
 	if c.cfg.Redial == nil || c.closingNow() {
 		return
 	}
-	c.lock()
-	out, in := c.s.LiveDirections()
-	pending := c.s.JoinPendingNow() // EvJoinKeys asks again
-	c.unlock()
+	var out, in, pending bool
+	c.locked(func() {
+		out, in = c.s.LiveDirections()
+		pending = c.s.JoinPendingNow() // EvJoinKeys asks again
+	})
 	if pending {
 		return
 	}
@@ -366,7 +410,11 @@ func (c *Conn) maybeRedial() {
 	}
 	r.inFlight[need] = true
 	r.mu.Unlock()
-	labels.Go(c.lctx, "redial", func() { c.redialLoop(need) })
+	if !c.goSide(c.lctx, "redial", func() { c.redialLoop(need) }) {
+		r.mu.Lock()
+		r.inFlight[need] = false
+		r.mu.Unlock()
+	}
 }
 
 func (c *Conn) closingNow() bool {
@@ -441,7 +489,7 @@ func (c *Conn) redialLoop(need Direction) {
 		ok := safeLog(c.cfg.Logger, "Config.Redial", func() { p, err = c.cfg.Redial(c.ctx, need) })
 		if c.closingNow() {
 			if ok && err == nil {
-				closePipeIO(p)
+				closePipe(p)
 			}
 			return
 		}
@@ -455,14 +503,13 @@ func (c *Conn) redialLoop(need Direction) {
 				return
 			}
 		}
-		c.lock()
-		out, in := c.s.LiveDirections()
-		c.unlock()
+		var out, in bool
+		c.locked(func() { out, in = c.s.LiveDirections() })
 		if out && in {
 			return
 		}
 		if st.failures > 0 {
-			st.backoff = min(2*st.backoff, hi)
+			st.backoff = min(satDouble(st.backoff), hi)
 		}
 		st.failures++
 		st.wait = bo.wait(st.backoff)

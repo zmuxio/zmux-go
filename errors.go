@@ -315,8 +315,8 @@ var (
 	ErrTooLate = errors.New("zmux: too late: the stream's first frame was sent")
 	// ErrInvalidConfig wraps configuration errors.
 	ErrInvalidConfig = errors.New("zmux: invalid configuration")
-	// ErrMessageTooLarge is returned by MessageLimitReader.ReadMessageLimit
-	// for a message above its limit.
+	// ErrMessageTooLarge is returned by MessageReader.ReadMessage for a
+	// message above its limit.
 	ErrMessageTooLarge = errors.New("zmux: message too large")
 	// ErrJoinPending is returned by joins of a session without join keys yet: a
 	// deferred PSK not supplied (Conn.SetJoinSecret), or an Unmanaged first pipe not

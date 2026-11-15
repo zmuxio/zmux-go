@@ -477,7 +477,7 @@ func TestFirstBatchChargesCreditOnce(t *testing.T) {
 	if len(out) == 0 || carried == 0 || s.conn.sent != carried || s.mp.retained != carried {
 		t.Fatalf("batch %d: sent %d, session %d, retained %d", len(out), carried, s.conn.sent, s.mp.retained)
 	}
-	if m := st.snd.mps; m == nil || len(m.resend) != 1 || m.resend[0].lo != 0 || m.resend[0].hi != carried {
+	if m := st.snd.mps; m == nil || m.resend.len() != 1 || m.resend.first().lo != 0 || m.resend.first().hi != carried {
 		t.Fatalf("not owed again: %+v", st.snd.mps)
 	}
 	// A later batch carries the same bytes: only what is new counts.

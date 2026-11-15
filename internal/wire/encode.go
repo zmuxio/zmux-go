@@ -177,8 +177,13 @@ func AppendPipeStatus(b []byte, pipe, seq, status, prio uint64) []byte {
 	return varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(varint.AppendVarint(b, pipe), seq), status), prio)
 }
 
-// AppendSessionEpoch appends a SESSION_EPOCH frame.
+// AppendSessionEpoch appends a SESSION_EPOCH frame. The locator is one the
+// parameters already carried, or one of the same length (AppendParams
+// refuses one beyond 255 bytes): a longer one is a bug, not truncated.
 func AppendSessionEpoch(b []byte, phase uint8, epoch uint64, share, locator []byte) []byte {
+	if len(locator) > 255 {
+		panic("zmux: SESSION_EPOCH locator beyond 255 bytes")
+	}
 	b = append(varint.AppendVarint(b, TypeSessionEpoch), phase)
 	b = varint.AppendVarint(b, epoch)
 	b = append(varint.AppendVarint(b, uint64(len(share))), share...)

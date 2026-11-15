@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"runtime"
 	"sync"
 
@@ -25,6 +26,9 @@ import (
 // streams in both directions with that code, as in Splice; a plain cancel
 // or a deadline resets with ZMUX_CANCELLED and stops with 0.
 func SplicePackets(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResult, error) {
+	if a == nil || b == nil {
+		return SpliceResult{}, net.ErrClosed
+	}
 	if a == b || a.h == b.h {
 		return SpliceResult{}, errSpliceSelf
 	}
@@ -40,6 +44,7 @@ func SplicePackets(ctx context.Context, a, b *Stream, opts *SpliceOptions) (Spli
 	if o.Chunk == 0 {
 		o.Chunk = 64 << 10
 	}
+	o.AtoB, o.BtoA = guardLimiter(o.AtoB), guardLimiter(o.BtoA) // host code on the splice's goroutines
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	toB, toA := newCapsuleGate(), newCapsuleGate()
@@ -177,7 +182,7 @@ func splicePacketWrite(ctx context.Context, r, w *Stream, lim Limiter, b []byte,
 			return false
 		}
 	}
-	if _, err := w.h.writeCtx(ctx, b); err != nil {
+	if _, err := w.h.write(ctx, b); err != nil {
 		spliceWriteErr(ctx, r, w, err)
 		d.End = spliceEnd(ctx, err, true)
 		return false
@@ -238,9 +243,9 @@ func splicePacketDatagrams(ctx context.Context, r, w *Stream, lim Limiter, g *ca
 		ok := !g.closed
 		if ok {
 			hdr = appendCapsuleHeader(hdr[:0], cx, len(p))
-			_, err = w.h.writeCtx(ctx, hdr)
+			_, err = w.h.write(ctx, hdr)
 			if err == nil {
-				_, err = w.h.writeCtx(ctx, p)
+				_, err = w.h.write(ctx, p)
 			}
 			ok = err == nil
 		}

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"runtime"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -100,34 +99,31 @@ func (h *handle) sendCapacity() uint64 {
 	return c.s.SendCapacity(h.st)
 }
 
+// waitSendCapacity waits for capacity as a write waits for room: it holds
+// the write slot (wmu), so a capacity wait and a write of the stream are
+// served one after the other.
 func (h *handle) waitSendCapacity(ctx context.Context, n uint64) (uint64, error) {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
 	c := h.c
-	sig := core.NewSignal()
-	defer func() {
-		c.lock()
-		c.s.CancelCapacityWait(h.st)
-		c.unlock()
-	}()
-	for {
-		c.lock()
-		ready := c.s.WaitSendCapacity(h.st, n, sig)
-		cp := c.s.SendCapacity(h.st)
-		err := c.s.WriteErrOf(h.st)
-		c.unlock()
-		if err != nil {
-			return 0, apiErr(err)
+	var cp uint64
+	waiting := false
+	err := h.awaitWrite(ctx, false, func() (bool, error) {
+		if err := c.s.WriteErrOf(h.st); err != nil {
+			return false, err
 		}
-		if ready {
-			return cp, nil
-		}
-		select {
-		case <-sig.C:
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-h.deadlines().w.wait():
-			return 0, os.ErrDeadlineExceeded
-		}
+		ready := c.s.WaitSendCapacity(h.st, n)
+		waiting = !ready
+		cp = c.s.SendCapacity(h.st)
+		return ready, nil
+	})
+	if waiting {
+		c.locked(func() { c.s.CancelCapacityWait(h.st) })
 	}
+	if err != nil {
+		return 0, err
+	}
+	return cp, nil
 }
 
 func (h *handle) readChunk(ctx context.Context, limit int) (Chunk, error) {
@@ -137,35 +133,23 @@ func (h *handle) readChunk(ctx context.Context, limit int) (Chunk, error) {
 	if limit <= 0 {
 		limit = 1 << 20
 	}
-	for {
-		c.lock()
+	var ch Chunk
+	eof := false
+	err := h.awaitRead(ctx, false, func() (bool, error) {
 		data, buf, fin, err := c.s.ReadChunk(h.st, limit)
-		if len(data) == 0 && !fin && err == nil {
-			h.rsig.Drain()
-			c.s.WaitRead(h.st, &h.rsig)
-		}
 		if fin || err != nil {
-			h.recvDone = true
-			h.maybeReleaseLocked()
+			h.released(c.s.ReleaseRecv(h.st))
 		}
-		c.unlock()
-		if len(data) > 0 {
-			return Chunk{Data: data, buf: buf}, nil
-		}
-		if fin {
-			return Chunk{}, io.EOF
-		}
-		if err != nil {
-			return Chunk{}, apiErr(err)
-		}
-		select {
-		case <-h.rsig.C:
-		case <-ctx.Done():
-			return Chunk{}, ctx.Err()
-		case <-h.rwait():
-			return Chunk{}, os.ErrDeadlineExceeded
-		}
+		ch, eof = Chunk{Data: data, buf: buf}, fin
+		return len(data) > 0 || fin, err
+	})
+	switch {
+	case len(ch.Data) > 0:
+		return ch, nil
+	case eof:
+		return Chunk{}, io.EOF
 	}
+	return Chunk{}, err
 }
 
 func (h *handle) writeChunk(ctx context.Context, ch Chunk) error {
@@ -174,43 +158,14 @@ func (h *handle) writeChunk(ctx context.Context, ch Chunk) error {
 	defer h.wmu.Unlock()
 	c := h.c
 	p := ch.Data
-	for len(p) > 0 {
-		c.lock()
-		c.s.SetNow(c.clk.now())
+	if len(p) == 0 {
+		return nil
+	}
+	return h.awaitWrite(ctx, true, func() (bool, error) {
 		n, err := c.s.WriteChunk(h.st, p, ch.buf, false)
 		p = p[n:]
-		wait := err == nil && len(p) > 0
-		if wait {
-			h.wsig.Drain()
-			c.s.WaitWrite(h.st, &h.wsig)
-		}
-		c.unlock()
-		if err != nil {
-			return apiErr(err)
-		}
-		if !wait {
-			return nil
-		}
-		select {
-		case <-h.wsig.C:
-		case <-ctx.Done():
-			h.endWait()
-			return ctx.Err()
-		case <-h.wwait():
-			h.endWait()
-			return os.ErrDeadlineExceeded
-		}
-	}
-	return nil
-}
-
-// endWait ends the stream's wait for write room (Session.EndWaitWrite) after
-// a blocked write stops on cancellation or its deadline.
-func (h *handle) endWait() {
-	c := h.c
-	c.lock()
-	c.s.EndWaitWrite(h.st)
-	c.unlock()
+		return len(p) == 0, err
+	})
 }
 
 // tryWriteAll writes all of p now or nothing (no buffer space: false).
@@ -222,6 +177,7 @@ func (h *handle) tryWriteAll(p []byte) (bool, error) {
 	c := h.c
 	c.lock()
 	defer c.unlock()
+	c.s.SetNow(c.clk.now())
 	if uint64(len(p)) > c.s.SendRoom(h.st) {
 		return false, apiErr(c.s.WriteErrOf(h.st))
 	}
@@ -237,37 +193,16 @@ func (h *handle) waitWritable(ctx context.Context) (uint64, error) {
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
 	c := h.c
-	for {
-		c.lock()
-		c.s.SetNow(c.clk.now())
-		err := c.s.WriteErrOf(h.st)
-		var room uint64
-		if err == nil {
-			if room = c.s.SendRoom(h.st); room == 0 {
-				h.wsig.Drain()
-				c.s.WaitWrite(h.st, &h.wsig)
-			}
-		}
-		if err != nil || room > 0 {
-			c.s.EndWaitWrite(h.st)
-		}
-		c.unlock()
-		if err != nil {
-			return 0, apiErr(err)
-		}
-		if room > 0 {
-			return room, nil
-		}
-		select {
-		case <-h.wsig.C:
-		case <-ctx.Done():
-			h.endWait()
-			return 0, ctx.Err()
-		case <-h.wwait():
-			h.endWait()
-			return 0, os.ErrDeadlineExceeded
-		}
+	var room uint64
+	err := h.awaitWrite(ctx, true, func() (bool, error) {
+		var err error
+		room, err = c.s.WritableRoom(h.st)
+		return room > 0, err
+	})
+	if err != nil {
+		return 0, err
 	}
+	return room, nil
 }
 
 // tryWrite writes the prefix of p that fits now, never waiting: 0 when
@@ -282,9 +217,6 @@ func (h *handle) tryWrite(p []byte) (int, error) {
 	defer c.unlock()
 	c.s.SetNow(c.clk.now())
 	n, err := c.s.Write(h.st, p, false)
-	if n > 0 {
-		c.s.EndWaitWrite(h.st)
-	}
 	return n, apiErr(err)
 }
 
@@ -292,41 +224,34 @@ func (h *handle) reject() {
 	c := h.c
 	c.lock()
 	defer c.unlock()
-	c.s.Reject(h.st)
-	h.sendDone, h.recvDone = true, true
-	h.maybeReleaseLocked()
+	h.released(c.s.Reject(h.st))
 }
 
 func (h *handle) sendDatagram(ctx uint64, p []byte) error { return h.c.sendDatagram(h.st, ctx, p) }
 
 func (h *handle) receiveDatagram(ctx context.Context) (uint64, []byte, error) {
+	h.dmu.Lock()
+	defer h.dmu.Unlock()
 	c := h.c
-	sig := core.NewSignal()
-	for {
-		c.lock()
-		cx, d, ok := c.s.RecvStreamDatagram(h.st)
+	var cx uint64
+	var d []byte
+	end := false
+	_, err := h.waitOn(ctx, &h.dsig, nil, h.rwait, func() (bool, error) {
+		var ok bool
+		if cx, d, ok = c.s.RecvStreamDatagram(h.st); ok {
+			return true, nil
+		}
 		var err error
-		if !ok {
-			if e := c.s.Err(); e != nil {
-				err = sessionErr(e)
-			} else {
-				sig.Drain()
-				c.s.WaitStreamDatagram(h.st, sig)
-			}
-		}
-		c.unlock()
-		if ok {
-			return cx, d, nil
-		}
-		if err != nil {
-			return 0, nil, err
-		}
-		select {
-		case <-sig.C:
-		case <-ctx.Done():
-			return 0, nil, ctx.Err()
-		}
+		end, err = c.s.StreamDatagramsEnded(h.st)
+		return end, err
+	}, nil)
+	switch {
+	case err != nil:
+		return 0, nil, err
+	case end && d == nil:
+		return 0, nil, io.EOF
 	}
+	return cx, d, nil
 }
 
 // writeTo copies the stream to w without an intermediate buffer.
@@ -360,32 +285,19 @@ func (h *handle) readFrom(r io.Reader) (int64, error) {
 	lent := false
 	defer func() {
 		if lent { // r panicked: end the loan
-			c.lock()
-			_ = c.s.CommitWrite(h.st, 0)
-			c.unlock()
+			c.locked(func() { _ = c.s.CommitWrite(h.st, 0) })
 		}
 	}()
 	var n int64
 	for {
-		c.lock()
-		c.s.SetNow(c.clk.now())
-		buf, err := c.s.WriteSpace(h.st, 1<<30)
-		if err == nil && len(buf) == 0 {
-			h.wsig.Drain()
-			c.s.WaitWrite(h.st, &h.wsig)
-		}
-		c.unlock()
+		var buf []byte
+		err := h.awaitWrite(context.Background(), true, func() (bool, error) {
+			var err error
+			buf, err = c.s.WriteSpace(h.st, 1<<30)
+			return len(buf) > 0, err
+		})
 		if err != nil {
-			return n, apiErr(err)
-		}
-		if len(buf) == 0 {
-			select {
-			case <-h.wsig.C:
-			case <-h.wwait():
-				h.endWait()
-				return n, os.ErrDeadlineExceeded
-			}
-			continue
+			return n, err
 		}
 		lent = true
 		m, rerr := r.Read(buf)
@@ -393,10 +305,16 @@ func (h *handle) readFrom(r io.Reader) (int64, error) {
 			m, rerr = 0, errInvalidRead
 		}
 		lent = false
-		c.lock()
-		c.s.SetNow(c.clk.now())
-		werr := c.s.CommitWrite(h.st, m)
-		c.unlock()
+		var werr error
+		ran := false
+		c.locked(func() {
+			c.s.SetNow(c.clk.now())
+			werr = c.s.CommitWrite(h.st, m)
+			ran = true
+		})
+		if !ran { // the commit panicked: the session is closed
+			return n, c.closedErr()
+		}
 		if werr != nil {
 			return n, apiErr(werr)
 		}
@@ -482,7 +400,9 @@ func (s *Stream) SendCapacity() uint64 { defer runtime.KeepAlive(s); return s.h.
 
 // WaitSendCapacity waits until SendCapacity is at least n (or above 0
 // while nothing is unsent) and returns it. It waits for credit, not for
-// what a write takes: see WaitWritable.
+// what a write takes: see WaitWritable. It waits in turn with the
+// stream's writes: a write blocked for room delays it, and it delays the
+// next write.
 func (s *Stream) WaitSendCapacity(ctx context.Context, n uint64) (uint64, error) {
 	defer runtime.KeepAlive(s)
 	return s.h.waitSendCapacity(ctx, n)

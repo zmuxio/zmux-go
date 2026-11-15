@@ -236,6 +236,10 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		}
 		if lo < hi {
 			nb := r.arrived.add(lo, hi)
+			if r.arrived.len() > maxRecvRanges(r.adv-min64(r.adv, r.readOff)) {
+				return false, wire.NewError(wire.ExcessiveLoad, "stream data in too many pieces", "stream", st.id,
+					"ranges", r.arrived.len())
+			}
 			if nb > 0 {
 				effect = true
 			}
@@ -244,6 +248,7 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 			} else if nb > 0 {
 				part := data[lo-off : hi-off]
 				stored := r.buf.insert(lo, part, buf)
+				s.compactPins(buf)
 				s.bufAdd(stored)
 				if stored < nb {
 					s.releaseUnbuffered(nb - stored)
@@ -294,6 +299,17 @@ func (s *Session) checkPreambleReset(st *Stream) *wire.Error {
 	return nil
 }
 
+// maxRecvRanges bounds the disjoint ranges of a stream's received data
+// (out of order only on multipath): every range costs a piece of its own
+// and makes inserts linear in their number, so a peer sending bytes far
+// apart would otherwise grow memory and CPU well beyond the bytes its
+// window lets it buffer. The bound grows with the window open to the peer
+// (one range per 16 KiB), from 1024, ample for the reordering of any
+// pipe mix within it.
+func maxRecvRanges(window uint64) int {
+	return int(max64(1024, window>>14))
+}
+
 // recvProgress updates the receiving state after input and wakes the reader.
 func (s *Session) recvProgress(st *Stream) {
 	r := &st.rcv
@@ -309,7 +325,7 @@ func (s *Session) recvProgress(st *Stream) {
 		}
 		s.maybeDiscard(st)
 	}
-	s.wake(st.rsig)
+	s.recvChanged(st)
 	s.streamCreditChanged(st)
 }
 
@@ -389,7 +405,7 @@ func (s *Session) onReset(f *wire.Frame, at bool) (bool, *wire.Error) {
 }
 
 // Read copies contiguous data into p. It returns (0, false, nil) when the
-// caller must wait (WaitRead).
+// caller waits for its read slot (recvChanged).
 func (s *Session) Read(st *Stream, p []byte) (int, bool, error) {
 	if !st.hasR {
 		return 0, false, ErrInvalid
@@ -441,9 +457,6 @@ func (s *Session) Readable(st *Stream) uint64 {
 	return r.buf.contiguous(r.readOff) - r.readOff
 }
 
-// WaitRead registers sig for read progress.
-func (s *Session) WaitRead(st *Stream, sig *Signal) { st.rsig = sig }
-
 // Stop abandons the receiving part with code (CancelRead).
 func (s *Session) Stop(st *Stream, code uint64) {
 	if !st.hasR {
@@ -474,34 +487,82 @@ func (s *Session) stopRecv(st *Stream, code uint64) {
 		s.queueCtl(st, ctlStop)
 	}
 	s.recvProgress(st)
+	s.dgramChanged(st) // the stream's datagram flow ended with the part
 }
 
 // Release drops every handle: an unfinished sending part is reset with
 // ZMUX_CANCELLED and an unread receiving part stopped with code 0.
-func (s *Session) Release(st *Stream) {
+func (s *Session) Release(st *Stream) bool {
+	if st.appReleased() {
+		return false
+	}
+	st.releasedS, st.releasedR = true, true
+	s.release(st)
+	return true
+}
+
+// ReleaseSend and ReleaseRecv record that the application is done with
+// one part (closed or cancelled it, read its end or failure); the stream
+// is released (Release) once it is done with both. They report whether
+// that happened now: the application's one record of which parts it
+// still holds.
+func (s *Session) ReleaseSend(st *Stream) bool {
+	if st.releasedS {
+		return false
+	}
+	st.releasedS = true
+	return s.releaseIfDone(st)
+}
+
+func (s *Session) ReleaseRecv(st *Stream) bool {
+	if st.releasedR {
+		return false
+	}
+	st.releasedR = true
+	return s.releaseIfDone(st)
+}
+
+func (s *Session) releaseIfDone(st *Stream) bool {
+	if !st.appReleased() {
+		return false
+	}
+	s.release(st)
+	return true
+}
+
+// appReleased reports whether the application is done with every part
+// the stream has.
+func (st *Stream) appReleased() bool {
+	return (st.releasedS || !st.hasS) && (st.releasedR || !st.hasR)
+}
+
+// release ends what the application left of a stream it is done with.
+func (s *Session) release(st *Stream) {
 	if st.hasS && !st.snd.finWr && !st.snd.reset {
 		s.Reset(st, wire.CodeCancelled)
 	}
-	st.releasedS = true
 	if st.hasR && st.rcv.state != recvDataRead && st.rcv.state != recvResetRead {
 		s.Stop(st, 0)
 	}
-	st.releasedR = true
 	s.maybeDiscard(st)
 }
 
-// Reject declines an accepted stream before reading.
-func (s *Session) Reject(st *Stream) {
+// Reject declines an accepted stream before reading; it reports whether
+// the stream was released now (Release).
+func (s *Session) Reject(st *Stream) bool {
+	if st.appReleased() {
+		return false
+	}
 	if st.hasS && !st.snd.reset {
 		st.snd.errState = &StreamError{Kind: StreamRejected, StreamID: st.id}
 		s.startReset(st, wire.CodeRejected, false)
 	}
-	st.releasedS = true
+	st.releasedS, st.releasedR = true, true
 	if st.hasR {
-		st.releasedR = true
 		s.stopRecv(st, wire.CodeRejected)
 	}
 	s.maybeDiscard(st)
+	return true
 }
 
 // maybeDiscard discards the stream's state once both parts are terminal and
@@ -512,7 +573,7 @@ func (s *Session) maybeDiscard(st *Stream) {
 	}
 	sendDone := !st.hasS || st.snd.state == sendDataRecvd || st.snd.state == sendResetRecvd
 	recvDone := !st.hasR || st.rcv.state == recvDataRead || st.rcv.state == recvResetRead
-	released := st.releasedS && st.releasedR || st.stackReject
+	released := st.appReleased() || st.stackReject
 	if !st.local && !st.offered && !st.stackReject {
 		released = false
 	}
@@ -552,9 +613,7 @@ func (s *Session) maybeDiscard(st *Stream) {
 			s.loc[t].reserved--
 		}
 	}
-	if st.dg != nil {
-		s.dropStreamDgrams(st)
-	}
+	s.dropStreamDgrams(st) // a datagram waiter sees the end, queue or not
 	// A graceful shutdown closes once its last stream is gone: checked by
 	// Settle, after the operation that discarded the stream.
 	if s.ga.closeWhenDone {
@@ -589,23 +648,30 @@ func (s *Session) unlinkCtl(st *Stream) {
 // failAllStreams gives every stream the session error (close).
 func (s *Session) failAllStreams() {
 	s.wakeStreams()
-	s.wakeCapacity()
 }
 
 // releaseAll drops every buffer of the session (CLOSED).
 func (s *Session) releaseAll() {
-	for _, st := range s.streams {
+	// Each stream leaves the scheduler and the control list through their
+	// own exits, so its links never claim a membership the lists dropped.
+	drop := func(st *Stream) {
 		if st.hasR {
 			st.rcv.buf.clear()
 		}
 		if st.hasS {
 			st.snd.q.drop()
 		}
+		s.sched.remove(st)
+		s.unlinkCtl(st)
+	}
+	for _, st := range s.streams {
+		drop(st)
 	}
 	for _, st := range s.provisional {
-		st.snd.q.drop()
+		drop(st)
 	}
 	s.conn.buffered, s.conn.sendHeld, s.conn.smallHeld, s.conn.bigCount = 0, 0, 0, 0
+	s.conn.pins = pinSet{}
 	s.sched = scheduler{}
 	s.ctlHead, s.ctlTail = nil, nil
 }

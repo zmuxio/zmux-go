@@ -58,7 +58,7 @@ func startServerNoListener(ctx context.Context, p PipeIO, cfg *Config) (*Conn, e
 	cfg = cfg.Clone()
 	cc, err := cfg.coreConfig(core.RoleResponder, core.RoleResponder)
 	if err != nil {
-		closePipeIO(p)
+		ClosePipeIO(p)
 		return nil, err
 	}
 	return startCore(ctx, p, cfg, cc, nil, nil)

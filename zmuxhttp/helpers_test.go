@@ -21,6 +21,7 @@ import (
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
+	"github.com/zmuxio/zmux-go/internal/testscale"
 )
 
 // Helpers of the root package's tests that these tests share.
@@ -45,7 +46,7 @@ func waitDone(t testing.TB, c *zmux.Conn) {
 	go func() { _ = c.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testscale.D(10 * time.Second)):
 		t.Fatal("session did not end")
 	}
 }
@@ -53,6 +54,7 @@ func waitDone(t testing.TB, c *zmux.Conn) {
 // waitUntil polls cond every 10 ms until it holds or d passes.
 func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
 	t.Helper()
+	d = testscale.D(d)
 	deadline := time.Now().Add(d)
 	for !cond() {
 		if time.Now().After(deadline) {

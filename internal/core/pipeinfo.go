@@ -194,7 +194,7 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 	if p.out != nil {
 		pi.OWD = s.owd(p)
 		pi.SinceLastAck = s.now.Sub(a.lastAdvance)
-		if g := s.buildGate(); g != nil {
+		if g := s.buildGate(&s.mp.gateBuf); g != nil {
 			pi.Eligible = g.admits(s, p)
 			if ti := g.tierOf(p); ti >= 0 && ti <= g.last {
 				pi.Saturated = g.tiers[ti].sat

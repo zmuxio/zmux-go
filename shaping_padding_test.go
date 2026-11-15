@@ -43,6 +43,25 @@ func TestHandshakePaddingOnEveryAttachment(t *testing.T) {
 	}
 }
 
+// A join that fails before its pipe starts spends none of its carrier's
+// handshake padding.
+func TestHandshakePaddingNotSpentOnFailedJoin(t *testing.T) {
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	before := e.client.ShapingMeters().WireSpent
+	a, b := net.Pipe()
+	_ = b.Close() // the join's Hello fails
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	p := NetPipe(a)
+	p.HandshakePadding = 1000
+	if _, err := e.client.AddPipe(ctx, p, PipeOptions{}); err == nil {
+		t.Fatal("join on a dead carrier succeeded")
+	}
+	if got := e.client.ShapingMeters().WireSpent; got != before {
+		t.Fatalf("spent %d after a failed join, want %d", got, before)
+	}
+}
+
 // SetShaper without a budget function leaves no configuration budget; the
 // spending stays.
 func TestSetShaperNilBudgetIsUnset(t *testing.T) {

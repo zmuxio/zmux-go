@@ -232,7 +232,7 @@ func newFirstMsgCarrier(msgs ...[]byte) *firstMsgCarrier {
 	return m
 }
 
-func (m *firstMsgCarrier) ReadMessage() ([]byte, error) {
+func (m *firstMsgCarrier) ReadMessage(int) ([]byte, error) {
 	select {
 	case b := <-m.msgs:
 		return b, nil
@@ -336,22 +336,16 @@ func TestAdmissionVariantBound(t *testing.T) {
 	}
 }
 
-// limitMsgCarrier is a firstMsgCarrier with ReadMessageLimit; ReadMessage
-// must not be used.
+// limitMsgCarrier is a firstMsgCarrier that records the limits it is
+// asked for and enforces them.
 type limitMsgCarrier struct {
 	*firstMsgCarrier
 	limits []int
-	whole  bool
 }
 
-func (m *limitMsgCarrier) ReadMessage() ([]byte, error) {
-	m.whole = true
-	return m.firstMsgCarrier.ReadMessage()
-}
-
-func (m *limitMsgCarrier) ReadMessageLimit(limit int) ([]byte, error) {
+func (m *limitMsgCarrier) ReadMessage(limit int) ([]byte, error) {
 	m.limits = append(m.limits, limit)
-	b, err := m.firstMsgCarrier.ReadMessage()
+	b, err := m.firstMsgCarrier.ReadMessage(limit)
 	if len(b) > limit {
 		return nil, ErrMessageTooLarge
 	}
@@ -381,7 +375,7 @@ func TestAdmissionFirstMessageLimit(t *testing.T) {
 			t.Fatalf("MaxPeek %d: stats %+v", x.adm.MaxPeek, st)
 		}
 		if len(m.limits) == 0 || m.limits[0] != x.adm.MaxPeek {
-			t.Fatalf("MaxPeek %d: limits %v, whole read %v", x.adm.MaxPeek, m.limits, m.whole)
+			t.Fatalf("MaxPeek %d: limits %v", x.adm.MaxPeek, m.limits)
 		}
 	}
 }

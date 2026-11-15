@@ -40,15 +40,26 @@ func (b *Budget) Add(d int64) {
 	if b.limit == 0 {
 		return
 	}
-	switch {
-	case u >= int64(b.limit) && !b.over.Load():
-		if b.over.CompareAndSwap(false, true) {
+	// The flag follows the sum: after a flip the sum is read again, so a
+	// change that raced with it (and found the flag not yet flipped) is not
+	// lost; the loop ends once flag and sum agree.
+	for {
+		over := b.over.Load()
+		switch {
+		case u >= int64(b.limit) && !over:
+			if !b.over.CompareAndSwap(false, true) {
+				continue
+			}
 			b.signal()
-		}
-	case u < int64(b.limit/4*3) && b.over.Load():
-		if b.over.CompareAndSwap(true, false) {
+		case u < int64(b.limit/4*3) && over:
+			if !b.over.CompareAndSwap(true, false) {
+				continue
+			}
 			b.signal()
+		default:
+			return
 		}
+		u = b.used.Load()
 	}
 }
 
@@ -65,7 +76,7 @@ func (s *Session) memUsage() uint64 {
 		return 0
 	}
 	c := &s.conn
-	return c.buffered + c.sendHeld + c.win - min64(c.win, s.initConnWin)
+	return c.buffered + c.pins.extra + c.sendHeld + c.win - min64(c.win, s.initConnWin)
 }
 
 // ChargeBudget brings the session's charge on a shared budget up to date;

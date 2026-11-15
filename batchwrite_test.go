@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -88,18 +89,21 @@ func msgCarriers() (*msgCarrier, *msgCarrier) {
 	return &msgCarrier{in: x, out: y, once: once, done: done}, &msgCarrier{in: y, out: x, once: once, done: done}
 }
 
-func (m *msgCarrier) ReadMessage() ([]byte, error) {
+func (m *msgCarrier) ReadMessage(limit int) ([]byte, error) {
+	var b []byte
 	select {
-	case b := <-m.in:
-		return b, nil
+	case b = <-m.in:
 	case <-m.done:
 		select {
-		case b := <-m.in:
-			return b, nil
+		case b = <-m.in:
 		default:
 			return nil, io.EOF
 		}
 	}
+	if len(b) > limit {
+		return nil, ErrMessageTooLarge
+	}
+	return b, nil
 }
 
 func (m *msgCarrier) WriteMessage(p []byte) error {
@@ -115,3 +119,34 @@ func (m *msgCarrier) WriteMessage(p []byte) error {
 func (m *msgCarrier) Read([]byte) (int, error)  { return 0, errors.New("message carrier") }
 func (m *msgCarrier) Write([]byte) (int, error) { return 0, errors.New("message carrier") }
 func (m *msgCarrier) Close() error              { m.once.Do(func() { close(m.done) }); return nil }
+
+// TestOversizedMessageFailsPipe: a message above MaxRecordSize fails the
+// pipe that carried it; the session reads no more of it.
+func TestOversizedMessageFailsPipe(t *testing.T) {
+	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	x, y := msgCarriers()
+	ch := make(chan *Conn, 1)
+	go func() {
+		s, err := startServerNoListener(ctx, PipeIO{R: y, W: y, Framing: FramingRecords}, nil)
+		if err != nil {
+			s = nil
+		}
+		ch <- s
+	}()
+	c, err := Start(ctx, PipeIO{R: x, W: x, Framing: FramingRecords}, RoleClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := <-ch
+	if s == nil {
+		t.Fatal("no server session")
+	}
+	defer func() { _ = c.Close(); waitDone(t, c); waitDone(t, s) }()
+	x.out <- make([]byte, MaxRecordSize+1)
+	waitDone(t, s)
+	if err := s.Wait(); err == nil || !errors.Is(err, ErrMessageTooLarge) && !strings.Contains(err.Error(), "lost") {
+		t.Fatalf("the session ended with %v", err)
+	}
+}
