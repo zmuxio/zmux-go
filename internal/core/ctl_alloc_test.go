@@ -266,3 +266,26 @@ func TestFlushDoneStopAfterSent(t *testing.T) {
 		}
 	}
 }
+
+// A STOP_SENDING that arrives before Flush is called, after everything
+// written was sent: Flush succeeds, the next Write reports the stop.
+func TestFlushStopBeforeFlushAfterSent(t *testing.T) {
+	s, p := channelSession(t, nil, false)
+	s.peer.MaxStreamDataBidiRem = 1 << 20
+	s.loc[0].limit = 10
+	s.conn.sendMax = 1 << 20
+	st, _ := s.OpenStream(true)
+	_, _ = s.Write(st, []byte("data"), false)
+	pollStream(t, s, p)
+	s.onStopSending(st, 7)
+	target, err := s.Flush(st)
+	if err != nil {
+		t.Fatalf("Flush after the data was sent: %v", err)
+	}
+	if done, err := s.FlushDone(st, target, NewSignal()); !done || err != nil {
+		t.Fatalf("FlushDone: %v %v", done, err)
+	}
+	if _, err := s.Write(st, []byte("more"), false); err == nil {
+		t.Fatal("Write after the stop succeeded")
+	}
+}

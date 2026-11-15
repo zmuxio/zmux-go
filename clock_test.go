@@ -70,8 +70,11 @@ func TestFakeClockIdleTimeout(t *testing.T) {
 		t.Fatalf("closed before the idle timeout: %v", e.client.closedErr())
 	}
 	step(clk, 2*time.Minute, time.Minute)
-	if err := waitErr(t, clk, e.client, 5*time.Second); !errors.Is(err, ErrIdleTimeout) {
-		t.Fatalf("session ended with %v", err)
+	// Both ends hold the same timeout: the one whose timer fires first ends
+	// with it and closes its carrier, which the other sees as lost pipes.
+	if err := waitErr(t, clk, e.client, 5*time.Second); !errors.Is(err, ErrIdleTimeout) &&
+		!errors.Is(e.server.closedErr(), ErrIdleTimeout) {
+		t.Fatalf("session ended with %v (server: %v)", err, e.server.closedErr())
 	}
 	if el := time.Since(start); el > 10*time.Second {
 		t.Fatalf("an hour of fake time took %v", el)

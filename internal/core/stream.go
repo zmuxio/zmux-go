@@ -531,10 +531,15 @@ func (s *Session) Flush(st *Stream) (uint64, error) {
 	switch {
 	case !st.hasS:
 		return 0, ErrInvalid
-	case sp.errState != nil:
-		return 0, sp.errState
 	case s.err != nil:
 		return 0, s.err
+	case st.opened && sp.sent >= sp.q.end:
+		// Everything written already left (the scheduler sends without a
+		// Flush): a STOP_SENDING or reset that came since is reported by the
+		// next operation, as FlushDone does.
+		return sp.q.end, nil
+	case sp.errState != nil:
+		return 0, sp.errState
 	}
 	if !st.idSet {
 		if st.cancelled {
