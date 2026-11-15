@@ -40,11 +40,17 @@ func TestListenerCloseEndsBacklog(t *testing.T) {
 
 // closeOnWrite closes a listener at the first write of its carrier: the
 // server's flight, which lets the client count the session established.
+// It offers CloseWrite as the TCP connection under it does: without it the
+// session can only close the socket, and a socket closed with the client's
+// data unread is reset (on Windows at once), which drops the
+// CONNECTION_CLOSE the client has not read yet.
 type closeOnWrite struct {
 	net.Conn
 	l    *Listener
 	once sync.Once
 }
+
+func (w *closeOnWrite) CloseWrite() error { return w.Conn.(*net.TCPConn).CloseWrite() }
 
 func (w *closeOnWrite) Write(b []byte) (int, error) {
 	w.once.Do(func() { _ = w.l.Close() })
