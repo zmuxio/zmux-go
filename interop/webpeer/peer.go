@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
@@ -128,14 +129,19 @@ func SelfSignedTLS() (*tls.Config, error) {
 }
 
 // ServeEcho echoes every stream of every session l accepts until l closes.
-// After each stream it prints SESSION with the content and, once the
-// session has joined pipes, MODE with the record mode of each of them.
+// It prints SESSION with each stream's content, and MODE with the record
+// mode of each pipe other than pipe 0 once that pipe has joined.
 func ServeEcho(ctx context.Context, l *zmux.Listener) {
+	serveEcho(ctx, l, os.Stdout)
+}
+
+func serveEcho(ctx context.Context, l *zmux.Listener, w io.Writer) {
 	for {
 		c, err := l.Accept(ctx)
 		if err != nil {
 			return
 		}
+		go reportJoins(ctx, c, w)
 		go func() {
 			defer func() { _ = c.Close() }()
 			for {
@@ -149,14 +155,29 @@ func ServeEcho(ctx context.Context, l *zmux.Listener) {
 				}
 				_, _ = st.Write(b)
 				_ = st.Close()
-				fmt.Printf("SESSION %s\n", b)
-				for _, p := range c.Pipes() {
-					if s, ok := p.Stats(); ok && p.ID() != 0 {
-						fmt.Printf("MODE %v\n", s.RecordMode)
-					}
-				}
+				_, _ = fmt.Fprintf(w, "SESSION %s\n", b)
 			}
 		}()
+	}
+}
+
+// reportJoins prints MODE for every pipe other than pipe 0 as it joins c,
+// until c ends. Reporting on the join event, not after a stream, covers a
+// pipe that joins after the last stream.
+func reportJoins(ctx context.Context, c *zmux.Conn, w io.Writer) {
+	for {
+		ev, err := c.NextEvent(ctx)
+		if err != nil {
+			return
+		}
+		if ev.Kind != zmux.EventPipeJoined || ev.PipeID == 0 {
+			continue
+		}
+		for _, p := range c.Pipes() {
+			if s, ok := p.Stats(); ok && p.ID() == ev.PipeID {
+				_, _ = fmt.Fprintf(w, "MODE %v\n", s.RecordMode)
+			}
+		}
 	}
 }
 

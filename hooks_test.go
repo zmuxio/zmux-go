@@ -19,8 +19,8 @@ func TestTracerSeesEstablishedAndClosed(t *testing.T) {
 	var got []string
 	closed := make(chan error, 1)
 	tr := &Tracer{
-		Established: func() { mu.Lock(); got = append(got, "est"); mu.Unlock() },
-		Closed:      func(err error) { closed <- err },
+		Established: func(SessionID) { mu.Lock(); got = append(got, "est"); mu.Unlock() },
+		Closed:      func(_ SessionID, err error) { closed <- err },
 	}
 	a, b := tcpPair(t)
 	c, s := pair(t, a, b, &Config{Tracer: tr}, nil)
@@ -198,8 +198,8 @@ func TestTracerMayWait(t *testing.T) {
 	ready := make(chan struct{})
 	waited := make(chan struct{}, 2)
 	tr := &Tracer{
-		Event: func(Event) { <-ready; <-c.Done() },
-		Closed: func(error) {
+		Event: func(SessionID, Event) { <-ready; <-c.Done() },
+		Closed: func(SessionID, error) {
 			<-ready
 			_ = c.Wait()
 			waited <- struct{}{}
@@ -229,7 +229,7 @@ func TestSlowTracerDoesNotDelayPick(t *testing.T) {
 	defer close(release)
 	ccfg := mpConfig()
 	ccfg.Scheduler = SchedulerCustom(pol)
-	ccfg.Tracer = &Tracer{Established: func() { <-release }, Event: func(Event) { <-release }}
+	ccfg.Tracer = &Tracer{Established: func(SessionID) { <-release }, Event: func(SessionID, Event) { <-release }}
 	e := newMPEnv(t, ccfg, mpConfig())
 	_ = e.addPipe(t, PipeOptions{})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -255,5 +255,39 @@ func TestSlowTracerDoesNotDelayPick(t *testing.T) {
 	}
 	if n := <-got; n != 64<<10 || pol.calls.Load() == 0 {
 		t.Fatalf("the peer read %d bytes, Pick asked %d times, while the Tracer was blocked", n, pol.calls.Load())
+	}
+}
+
+// TestTracerNamesTheSession: one Tracer shared by both ends of a pair is
+// told which session each record belongs to.
+func TestTracerNamesTheSession(t *testing.T) {
+	var mu sync.Mutex
+	est := map[SessionID]int{}
+	closed := make(chan SessionID, 2)
+	tr := &Tracer{
+		Established: func(id SessionID) { mu.Lock(); est[id]++; mu.Unlock() },
+		Closed:      func(id SessionID, _ error) { closed <- id },
+	}
+	a, b := tcpPair(t)
+	c, s := pair(t, a, b, &Config{Tracer: tr}, &Config{Tracer: tr})
+	if c.ID() == s.ID() || c.ID() == 0 || s.ID() == 0 {
+		t.Fatalf("ids %d %d", c.ID(), s.ID())
+	}
+	c.Abort(0, "")
+	waitDone(t, c)
+	waitDone(t, s)
+	got := map[SessionID]bool{}
+	for range 2 {
+		select {
+		case id := <-closed:
+			got[id] = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("no Closed")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !got[c.ID()] || !got[s.ID()] || est[c.ID()] != 1 || est[s.ID()] != 1 {
+		t.Fatalf("closed %v established %v for %d and %d", got, est, c.ID(), s.ID())
 	}
 }

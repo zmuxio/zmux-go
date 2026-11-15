@@ -117,7 +117,10 @@ type ListenerConfig struct {
 	// Config's handshake timeout, at most the listener's stall bound
 	// (Admission.StallMax; without one, drawn as Admission draws it). No verdict sends anything. An acceptor
 	// that closes at once keeps at least 8 random bytes after InstanceID in
-	// every locator, which NewListener guarantees.
+	// every locator, which NewListener guarantees. It is called
+	// synchronously on the carrier's goroutine, under no deadline of its
+	// own: it must return promptly, well within the peer's handshake or
+	// join timeout.
 	OnReject func(RejectInfo) RejectAction
 	// MemoryBudget bounds the sum over the listener's sessions of buffered
 	// receive data, retained data and session window growth. Zero is
@@ -185,7 +188,10 @@ type ListenerConfig struct {
 	// be nil or Config's. A returned Config that violates that or is
 	// invalid for a server session (ErrInvalidConfig), an error and a
 	// panic close the carrier without a byte, counted as rejected; an
-	// error and a panic are logged (Logger).
+	// error and a panic are logged (Logger). It is called synchronously
+	// before the session and its handshake timer exist, under no deadline
+	// of its own (ctx is HandlePipe's): it must return well before the
+	// peer's handshake deadline, which keeps running meanwhile.
 	SessionConfig func(ctx context.Context, info *CarrierInfo, admitted any) (*Config, error)
 }
 
@@ -1068,6 +1074,15 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src
 	release()
 	if err != nil {
 		l.st.rejected.Add(1)
+		if c != nil {
+			// The session was aborted during its handshake (by Close, or
+			// it failed) and still owns p: HandlePipe lasts as long as the
+			// pipe, so that the caller does not close the carrier before
+			// the CONNECTION_CLOSE reached the peer. A peer that
+			// considered the session established would otherwise see a
+			// bare carrier loss and wait to resume it.
+			_ = c.waitPipe(ctx, 0)
+		}
 		return err
 	}
 	reason := ""

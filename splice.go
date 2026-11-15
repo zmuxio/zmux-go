@@ -13,25 +13,43 @@ import (
 )
 
 // Limiter lets an external limiter, budget or meter act on bytes that zmux
-// forwards itself (Splice, datagrams). zmux calls it outside
-// every session lock.
+// forwards itself (Splice, SplicePackets, datagrams). The model is reserve,
+// then refund: zmux takes bytes before it moves them and gives back what
+// it did not use. Units are bytes.
+//
+// Arguments: maxBytes <= 0 takes nothing and returns 0 at once; minBytes
+// < 1 is taken as 1; minBytes > maxBytes as minBytes = maxBytes. (n, n) is
+// therefore an all-or-nothing request and (1, max) a request for as much
+// as possible. A grant n satisfies min' <= n <= maxBytes, where min' is
+// minBytes, or less when the limiter can never allow minBytes at once (its
+// burst). For an atomic unit requested as (n, n), a successful grant lets
+// the whole unit pass, even when fewer bytes were returned.
+//
+// Every method is safe for concurrent use. zmux calls them outside every
+// session lock, never from inside the session core, and never while it
+// holds a buffer of its own in Acquire.
 type Limiter interface {
-	// Ready waits until at least minBytes bytes (or the limiter's burst, if
-	// less) are allowed and returns the allowance, at most maxBytes.
-	Ready(ctx context.Context, minBytes, maxBytes int) (int, error)
-	// TryReady returns the allowance now, 0 when it would have to wait.
-	TryReady(maxBytes int) int
-	// Charge accounts n bytes actually forwarded.
-	Charge(n int)
+	// Acquire waits until it can grant. When ctx ends it returns the
+	// cancellation and nothing is taken in net; an error takes nothing
+	// and fails the operation that asked.
+	Acquire(ctx context.Context, minBytes, maxBytes int64) (int64, error)
+	// TryAcquire grants without blocking, or returns 0 with the reason
+	// and nothing taken.
+	TryAcquire(minBytes, maxBytes int64) (int64, error)
+	// Refund gives back n granted bytes that were not used. It is
+	// best-effort, never blocks and is called from any goroutine; n <= 0
+	// does nothing.
+	Refund(n int64)
 }
 
 // guardedLimiter runs a host Limiter on the package's goroutines: a panic
-// in Ready fails the wait (errLimiterPanicked), one in TryReady allows
-// nothing (the datagram is dropped as limited) and one in Charge is lost;
-// none ends the process.
+// or an invalid grant (outside [1, maxBytes]) in Acquire fails the
+// operation (errLimiterFailed), in TryAcquire counts as nothing taken, and
+// a panic in Refund is ignored; none ends the process. A positive invalid
+// grant is refunded.
 type guardedLimiter struct{ l Limiter }
 
-var errLimiterPanicked = errors.New("zmux: the Limiter panicked")
+var errLimiterFailed = errors.New("zmux: the Limiter panicked or returned an invalid grant")
 
 func guardLimiter(l Limiter) Limiter {
 	if l == nil {
@@ -43,27 +61,71 @@ func guardLimiter(l Limiter) Limiter {
 	return guardedLimiter{l}
 }
 
-func (g guardedLimiter) Ready(ctx context.Context, minBytes, maxBytes int) (n int, err error) {
-	defer func() {
-		if recover() != nil {
-			n, err = 0, errLimiterPanicked
-		}
-	}()
-	return g.l.Ready(ctx, minBytes, maxBytes)
+// limitArgs normalizes a request as the contract reads it; ok is false
+// when it takes nothing.
+func limitArgs(minBytes, maxBytes int64) (int64, int64, bool) {
+	if maxBytes <= 0 {
+		return 0, 0, false
+	}
+	return min(max(minBytes, 1), maxBytes), maxBytes, true
 }
 
-func (g guardedLimiter) TryReady(maxBytes int) (n int) {
+func (g guardedLimiter) Acquire(ctx context.Context, minBytes, maxBytes int64) (n int64, err error) {
+	minBytes, maxBytes, ok := limitArgs(minBytes, maxBytes)
+	if !ok {
+		return 0, nil
+	}
 	defer func() {
 		if recover() != nil {
-			n = 0
+			n, err = 0, errLimiterFailed
 		}
 	}()
-	return g.l.TryReady(maxBytes)
+	n, err = g.l.Acquire(ctx, minBytes, maxBytes)
+	if err != nil {
+		return 0, err
+	}
+	if n < 1 || n > maxBytes {
+		g.Refund(n)
+		return 0, errLimiterFailed
+	}
+	return n, nil
 }
 
-func (g guardedLimiter) Charge(n int) {
+func (g guardedLimiter) TryAcquire(minBytes, maxBytes int64) (n int64, err error) {
+	minBytes, maxBytes, ok := limitArgs(minBytes, maxBytes)
+	if !ok {
+		return 0, nil
+	}
+	defer func() {
+		if recover() != nil {
+			n, err = 0, errLimiterFailed
+		}
+	}()
+	n, err = g.l.TryAcquire(minBytes, maxBytes)
+	if n < 0 || n > maxBytes || n > 0 && err != nil {
+		g.Refund(n)
+		return 0, errLimiterFailed
+	}
+	return n, err
+}
+
+func (g guardedLimiter) Refund(n int64) {
+	if n <= 0 {
+		return
+	}
 	defer func() { _ = recover() }()
-	g.l.Charge(n)
+	g.l.Refund(n)
+}
+
+// police asks for n bytes all or nothing, without waiting: it reports
+// whether the unit may pass and returns the grant to refund if it is then
+// not used.
+func (g guardedLimiter) police(n int) (int64, bool) {
+	if n <= 0 {
+		return 0, true // an empty unit takes nothing
+	}
+	got, _ := g.TryAcquire(int64(n), int64(n))
+	return got, got > 0
 }
 
 // SpliceOptions configure Splice.
@@ -268,37 +330,46 @@ func spliceStep(ctx context.Context, r, w *Stream, chunk int, lim Limiter, limit
 		return 0, false, true
 	}
 	var want int
+	var granted int64
 	if !end {
-		want = int(min(uint64(chunk), n, 16<<10, limit))
-		capy, err := w.h.waitSendCapacity(ctx, uint64(want))
+		// Step 1: w's capacity for at least min(chunk, readable, 16 KiB).
+		need := min(uint64(chunk), n, 16<<10, limit)
+		capy, err := w.h.waitSendCapacity(ctx, need)
 		if err != nil {
 			spliceWriteErr(ctx, r, w, err)
 			d.End = spliceEnd(ctx, err, true)
 			return 0, false, true
 		}
-		take := int(min(capy, uint64(chunk), limit))
+		want = int(min(capy, uint64(chunk), limit))
 		if lim != nil {
-			take, err = lim.Ready(ctx, min(want, take), take)
+			// Step 2: r is readable and nothing was consumed; reserve
+			// at least one byte, at most what is readable.
+			granted, err = lim.Acquire(ctx, 1, int64(min(uint64(want), n)))
 			if err != nil {
 				spliceAbort(ctx, r, w, err)
 				d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
 				return 0, false, true
 			}
+			want = int(granted)
 		}
-		want = take
 	}
+	// Step 3: r has want bytes readable (or its end), so this does not
+	// block; at most the grant is taken.
 	ch, err := r.h.readChunk(ctx, max(want, 1))
 	// A chunk carries the bytes read before an error, as io.Reader does.
 	//goland:noinspection GoDfaErrorMayBeNotNil
 	m := len(ch.Data)
+	if lim != nil {
+		lim.Refund(granted - int64(m)) // step 4: granted and not forwarded
+	}
 	if m > 0 {
 		if werr := w.h.writeChunk(ctx, ch); werr != nil {
+			if lim != nil {
+				lim.Refund(int64(m)) // read, not forwarded
+			}
 			spliceWriteErr(ctx, r, w, werr)
 			d.End = spliceEnd(ctx, werr, true)
 			return 0, false, true
-		}
-		if lim != nil {
-			lim.Charge(m)
 		}
 		d.Bytes += uint64(m)
 	}
@@ -404,8 +475,8 @@ func (h *handle) waitReadable(ctx context.Context, w *handle) (uint64, bool, err
 }
 
 // spliceDatagrams forwards the streams' datagrams to each other when they
-// have datagram flows, through each direction's limiter (try_ready, then
-// charge), without a queue of its own.
+// have datagram flows, through each direction's limiter (TryAcquire(n, n),
+// refunded if not sent), without a queue of its own.
 func spliceDatagrams(ctx context.Context, a, b *Stream, res *SpliceResult, o SpliceOptions) *sync.WaitGroup {
 	var wg sync.WaitGroup
 	if !a.h.c.ConnectionState().SupportsDatagrams.Remote || !b.h.c.ConnectionState().SupportsDatagrams.Remote {
@@ -449,10 +520,17 @@ const (
 // spliceSendDatagram sends a forwarded datagram on w through the
 // direction's limiter, counting its bytes in d when it was sent.
 func spliceSendDatagram(w *Stream, d *SpliceDirection, lim Limiter, cx uint64, p []byte) datagramOutcome {
-	if lim != nil && lim.TryReady(len(p)) < len(p) {
-		return datagramLimited
+	var granted int64
+	if lim != nil {
+		var ok bool
+		if granted, ok = (guardedLimiter{lim}).police(len(p)); !ok {
+			return datagramLimited
+		}
 	}
 	limited, err := w.h.c.sendDatagramLimited(w.h.st, cx, p)
+	if lim != nil && (limited || err != nil) {
+		lim.Refund(granted) // not sent
+	}
 	var tl *DatagramTooLargeError
 	switch {
 	case limited:
@@ -461,9 +539,6 @@ func spliceSendDatagram(w *Stream, d *SpliceDirection, lim Limiter, cx uint64, p
 		return datagramTooLarge
 	case err != nil:
 		return datagramFailed
-	}
-	if lim != nil {
-		lim.Charge(len(p))
 	}
 	d.DatagramBytes += uint64(len(p))
 	return datagramSent

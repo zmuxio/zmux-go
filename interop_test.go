@@ -26,6 +26,7 @@ import (
 type peerProc struct {
 	cmd   *exec.Cmd
 	lines chan string
+	held  []string
 }
 
 func startPeer(t *testing.T, args ...string) *peerProc {
@@ -92,18 +93,35 @@ func startPeerEnv(t *testing.T, env string, args ...string) *peerProc {
 	return p
 }
 
+// expect consumes the first line with prefix, in whatever order the peer
+// printed it relative to its other reports: the peer prints some of them
+// from concurrent tasks ("KEYS" may come before "ESTABLISHED"), so a line
+// expect passes over is held for a later expect, never dropped. The root,
+// seal and zmuxws interop tests keep identical copies of this helper (the
+// submodules require a published root version, so they cannot share one).
 func (p *peerProc) expect(t *testing.T, prefix string) string {
 	t.Helper()
-	select {
-	case l, ok := <-p.lines:
-		if !ok || !strings.HasPrefix(l, prefix) {
-			t.Fatalf("peer: want %q, got %q", prefix, l)
+	for i, l := range p.held {
+		if rest, ok := strings.CutPrefix(l, prefix); ok {
+			p.held = append(p.held[:i], p.held[i+1:]...)
+			return strings.TrimSpace(rest)
 		}
-		return strings.TrimSpace(strings.TrimPrefix(l, prefix))
-	case <-time.After(10 * time.Second):
-		t.Fatalf("peer: no %q", prefix)
 	}
-	return ""
+	deadline := time.After(15 * time.Second)
+	for {
+		select {
+		case l, ok := <-p.lines:
+			if !ok {
+				t.Fatalf("peer exited before %q (held %q)", prefix, p.held)
+			}
+			if rest, ok := strings.CutPrefix(l, prefix); ok {
+				return strings.TrimSpace(rest)
+			}
+			p.held = append(p.held, l)
+		case <-deadline:
+			t.Fatalf("peer: no %q (held %q)", prefix, p.held)
+		}
+	}
 }
 
 func interopConfig() *Config { return &Config{EnableDatagrams: true} }
@@ -573,3 +591,16 @@ func TestInteropTLSExporterJoinClient(t *testing.T)  { interopTLSClient(t, false
 func TestInteropTLSExporterSplitClient(t *testing.T) { interopTLSClient(t, true) }
 func TestInteropTLSExporterJoinServer(t *testing.T)  { interopTLSServer(t, "tls-client", 16) }
 func TestInteropTLSExporterSplitServer(t *testing.T) { interopTLSServer(t, "tls-split-client", 32) }
+
+// The peer prints some reports from concurrent tasks; expect must hold the
+// line it passes over for the next expect.
+func TestInteropExpectOutOfOrder(t *testing.T) {
+	p := &peerProc{lines: make(chan string, 4)}
+	p.lines <- "KEYS 00ff"
+	p.lines <- "ESTABLISHED"
+	close(p.lines)
+	p.expect(t, "ESTABLISHED")
+	if got := p.expect(t, "KEYS "); got != "00ff" {
+		t.Fatalf("KEYS %q", got)
+	}
+}

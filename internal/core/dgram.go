@@ -16,9 +16,10 @@ type dgramState struct {
 	limited []PendingDatagram
 	// Received datagrams of peer streams not opened yet, in arrival order
 	// and so in the order they expire.
-	held     []heldDgram
-	heldIDs  map[uint64]int // held datagrams per stream ID (releaseHeld)
-	recvSize uint64         // bytes of the session queue and the held datagrams
+	held        []heldDgram
+	heldIDs     map[uint64]int // held datagrams per stream ID (releaseHeld)
+	recvSize    uint64         // bytes of the session queue and the held datagrams
+	limitedSize uint64         // bytes of limited, kept within DgramRecvSize
 }
 
 // heldDgram is a datagram held for a peer stream within the limit that
@@ -455,17 +456,18 @@ func (s *Session) TakeLimitedDatagrams(dst []PendingDatagram) []PendingDatagram 
 	dst = append(dst, s.dg.limited...)
 	clear(s.dg.limited)
 	s.dg.limited = s.dg.limited[:0]
+	s.dg.limitedSize = 0
 	return dst
 }
 
-// DeliverDatagram queues a datagram the receive limiter passed; drop
-// counts one it did not.
-func (s *Session) DeliverDatagram(p PendingDatagram, drop bool) {
+// DeliverDatagram queues a datagram the receive limiter passed and
+// reports whether it was queued; drop counts one it did not pass.
+func (s *Session) DeliverDatagram(p PendingDatagram, drop bool) bool {
 	if drop {
 		s.stats.DatagramsDroppedLimit++
-		return
+		return false
 	}
-	s.queueDatagram(p.st, p.e)
+	return s.queueDatagram(p.st, p.e)
 }
 
 // onDatagram processes a received DATAGRAM, from a carrier datagram
@@ -613,19 +615,28 @@ func (s *Session) expireHeld(now Time) {
 func (s *Session) receivedDatagram(st *Stream, e []byte) {
 	d := s.dg
 	if s.cfg.DgramRecvLimited {
+		// Waiting for the limiter stays within the byte limit: the
+		// oldest go, each counted.
 		d.limited = append(d.limited, PendingDatagram{st: st, e: e})
+		d.limitedSize += uint64(len(e))
+		for d.limitedSize > s.cfg.DgramRecvSize && len(d.limited) > 1 {
+			d.limitedSize -= uint64(len(d.limited[0].e))
+			d.limited[0] = PendingDatagram{}
+			d.limited = d.limited[1:]
+			s.dropRecv(1)
+		}
 		return
 	}
 	s.queueDatagram(st, e)
 }
 
 // queueDatagram puts a datagram in its stream's or the session's queue.
-func (s *Session) queueDatagram(st *Stream, e []byte) {
+func (s *Session) queueDatagram(st *Stream, e []byte) bool {
 	d := s.dgState()
 	if st != nil {
 		if st.discarded || st.rcv.stopped {
 			s.dropRecv(1)
-			return
+			return false
 		}
 		if st.dg == nil {
 			st.dg = &streamDgrams{}
@@ -643,7 +654,7 @@ func (s *Session) queueDatagram(st *Stream, e []byte) {
 		st.dg.q = append(st.dg.q, e)
 		st.dg.size += n
 		s.dgramChanged(st)
-		return
+		return true
 	}
 	if len(d.recv) >= s.cfg.DgramRecvQ {
 		d.recvSize -= uint64(len(d.recv[0]))
@@ -657,6 +668,7 @@ func (s *Session) queueDatagram(st *Stream, e []byte) {
 	if len(d.recvW) > 0 {
 		s.wake(d.recvW[0])
 	}
+	return len(d.recv) > 0 // trimmed from the front: e is last to go
 }
 
 // DropReceivedDatagrams counts n received datagrams that the host dropped

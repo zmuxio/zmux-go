@@ -72,7 +72,8 @@ type PoolDecision struct {
 	// Recheck asks for the next Decide within this time even when nothing
 	// else happens; zero asks for none beyond the pool's own looks (its
 	// events, dials and maintenance cadence), and a negative value is
-	// invalid. Pools wait at least MinRecheck.
+	// invalid. A positive value is lengthened to MinRecheck at least, so
+	// the shortest recheck is MinRecheck; zero is never "at once".
 	Recheck time.Duration
 }
 

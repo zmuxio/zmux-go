@@ -70,7 +70,7 @@ func TestGoroutineLabelsKeepCaller(t *testing.T) {
 // BenchmarkGoTask is the cost of starting a goroutine with labels.Go (its
 // label set and SetGoroutineLabels) against a bare go statement.
 func BenchmarkGoTask(b *testing.B) {
-	base := sessionLabels(0)
+	base := sessionLabels(nextSessionID(), 0)
 	done := make(chan struct{}, 1)
 	f := func() { done <- struct{}{} }
 	b.Run("go", func(b *testing.B) {

@@ -224,9 +224,9 @@ type Config struct {
 	// transport parameters arrive.
 	EarlyData EarlyData
 
-	// DatagramLimiter polices datagrams in each direction:
-	// a datagram passes when TryReady allows its whole payload, and is
-	// then charged; otherwise it is dropped and counted.
+	// DatagramLimiter polices datagrams in each direction: a datagram
+	// passes when TryAcquire(n, n) grants its payload of n bytes (refunded
+	// when it is then not queued); otherwise it is dropped and counted.
 	DatagramLimiter DatagramLimiter
 
 	// Tracer receives session events on a goroutine of its own.

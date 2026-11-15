@@ -65,6 +65,8 @@ type ServerConfig struct {
 	// LocalContext is passed to Gate.Credential, AppData and the ClientAnchor.
 	LocalContext any
 	// Key is the node's static key; required.
+	// crypto/ecdh keeps the private key unexported, so it cannot be
+	// zeroed when no longer used; it lives as long as the key value.
 	Key *ecdh.PrivateKey
 	// AppData supplies the application data of message 2; its request holds
 	// what is known of the client then (the Profile, the PSK identity and the

@@ -65,6 +65,8 @@ type ClientConfig struct {
 	// LocalContext is passed to the Anchor as VerifyInput.LocalContext.
 	LocalContext any
 	// Key is the client's static key; nil is a key generated once per process.
+	// crypto/ecdh keeps the private key unexported, so it cannot be
+	// zeroed when no longer used; it lives as long as the key value.
 	Key *ecdh.PrivateKey
 	// Credential goes in message 3; nil: none.
 	Credential *Credential

@@ -726,6 +726,36 @@ and payload bytes (`DatagramStreamBytes`, 512 KiB; negative: no byte
 bound), a single larger datagram being kept alone. An application that
 forwards packets at a high rate raises both.
 
+## Limiters
+
+`Splice`, `SplicePackets` and datagrams take bytes from a `zmux.Limiter`
+(`SpliceOptions.AtoB`/`BtoA`, `Config.DatagramLimiter.Send`/`Receive`),
+so any byte-rate limiter, budget or meter written to this interface plugs
+in without an adapter:
+
+```go
+type Limiter interface {
+	Acquire(ctx context.Context, minBytes, maxBytes int64) (int64, error)
+	TryAcquire(minBytes, maxBytes int64) (int64, error)
+	Refund(n int64)
+}
+```
+
+zmux reserves before it moves bytes and refunds what it did not use. A
+spliced stream waits until its source is readable, then asks
+`Acquire(1, k)` for at most what it can read and send at once; a whole
+capsule of `SplicePackets` is asked as `Acquire(n, n)`. Datagrams are
+policed, never delayed: `TryAcquire(n, n)` for the payload, the datagram
+dropped and counted (`DatagramsDroppedLimit`) when it grants nothing.
+`maxBytes <= 0` takes nothing, `minBytes < 1` counts as 1 and `minBytes >
+maxBytes` as `maxBytes`; a grant may be below `minBytes` when the limiter's
+burst is smaller, and for `(n, n)` any grant lets the whole unit pass. An
+`Acquire` that is cancelled or fails must leave nothing taken. zmux calls
+the limiter outside every session lock and from any goroutine; a panic or
+a grant outside `[1, maxBytes]` fails the `Acquire` (the splice direction
+ends cancelled), counts as nothing in `TryAcquire`, and is ignored in
+`Refund`.
+
 ## Datagram channels
 
 QUIC, HTTP/3 and WebTransport carriers have an unreliable datagram service

@@ -94,6 +94,7 @@ type Conn struct {
 	admitted any
 
 	lctx context.Context // the goroutine labels of the session (labels.go)
+	id   SessionID
 	// orphans are the handles collected unclosed (cleanupHandle); handles
 	// counts those not released, and while there are any the timer also
 	// fires at sweepAt to release orphans (session lock).
@@ -581,16 +582,16 @@ func start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 
 // startCore starts a session from a resolved core configuration; lst is
 // the listener that owns it, if any, and admitted the admission value of
-// its bootstrap carrier. It closes p on every error.
+// its bootstrap carrier. On an error it closes p, or, when the session
+// already owned p, returns the session too: it is ending and closes p
+// itself once its CONNECTION_CLOSE is out, so the caller must not close p
+// before the session's pipe has ended.
 func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted any) (*Conn, error) {
 	c, err := setupCore(ctx, p, cfg, cc, lst, admitted)
-	if err != nil {
-		if c == nil {
-			closePipe(p)
-		}
-		return nil, err
+	if err != nil && c == nil {
+		closePipe(p)
 	}
-	return c, nil
+	return c, err
 }
 
 // setupCore is startCore without the close: a Conn returned with an error
@@ -861,7 +862,8 @@ func newConn(cfg *Config, cc core.Config) *Conn {
 	c := &Conn{cfg: cfg, clk: newClock(cfg.clock()), pipes: make(map[uint64]*pipeDrv, 1), done: make(chan struct{}),
 		timerAt: core.Never, labels: map[uint64]string{}}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
-	c.lctx = sessionLabels(cc.TransportRole)
+	c.id = nextSessionID()
+	c.lctx = sessionLabels(c.id, cc.TransportRole)
 	c.s = core.New(cc, c.clk.now())
 	if cfg != nil && cfg.Shaper != nil {
 		c.s.SetShaper(c.coreFactory(cfg.Shaper))
@@ -901,6 +903,10 @@ func (c *Conn) waitEstablished(ctx context.Context) error {
 // error. It does not inherit the context passed to Start, Client or Dial,
 // which bounds establishment only.
 func (c *Conn) Context() context.Context { return c.ctx }
+
+// ID is the session's identity within the process, as a Tracer is given
+// it.
+func (c *Conn) ID() SessionID { return c.id }
 
 // errLocked is the session's error, or net.ErrClosed (under the lock).
 func (c *Conn) errLocked() error {
@@ -1589,16 +1595,21 @@ func (c *Conn) sendDatagram(st *core.Stream, cx uint64, p []byte) error {
 func (c *Conn) sendDatagramLimited(st *core.Stream, cx uint64, p []byte) (bool, error) {
 	l := c.cfg.DatagramLimiter.Send
 	lim := guardedLimiter{l} // concrete: no allocation per datagram
-	if l != nil && lim.TryReady(len(p)) < len(p) {
-		c.locked(func() {
-			c.s.DeliverDatagram(core.PendingDatagram{}, true)
-		})
-		return true, nil
+	var granted int64
+	if l != nil {
+		// Asked before the lock is taken: a limiter is host code.
+		var ok bool
+		if granted, ok = lim.police(len(p)); !ok {
+			c.locked(func() {
+				c.s.DeliverDatagram(core.PendingDatagram{}, true)
+			})
+			return true, nil
+		}
 	}
 	var err error
 	c.locked(func() { err = c.s.SendDatagram(st, cx, p) })
-	if err == nil && l != nil {
-		lim.Charge(len(p))
+	if err != nil && l != nil {
+		lim.Refund(granted) // not queued; refunded after the lock
 	}
 	return false, apiErr(err)
 }
@@ -1652,19 +1663,25 @@ func (c *Conn) passDatagrams() {
 	if len(ds) == 0 {
 		return
 	}
+	// Policed here, on the driver, outside the lock; a datagram the
+	// queue then refuses is refunded after the lock.
+	granted := make([]int64, len(ds))
 	pass := make([]bool, len(ds))
 	for i := range ds {
-		n := ds[i].Len()
-		if lim.TryReady(n) >= n {
-			lim.Charge(n)
-			pass[i] = true
-		}
+		granted[i], pass[i] = lim.police(ds[i].Len())
 	}
 	c.locked(func() {
 		for i := range ds {
-			c.s.DeliverDatagram(ds[i], !pass[i])
+			if pass[i] && c.s.DeliverDatagram(ds[i], false) {
+				granted[i] = 0 // queued: the grant is used
+			} else if !pass[i] {
+				c.s.DeliverDatagram(ds[i], true)
+			}
 		}
 	})
+	for _, g := range granted {
+		lim.Refund(g)
+	}
 }
 
 // ReceiveDatagram returns the next session datagram.

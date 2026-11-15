@@ -125,9 +125,11 @@ func splicePacketDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter, 
 }
 
 // splicePacketCapsule forwards one capsule: its header as it is, then its
-// value through spliceStep. end reports r's FIN (also inside the capsule:
-// the bytes so far are forwarded and the receiver sees the truncation);
-// done that the direction ended otherwise.
+// value through spliceStep. The whole capsule is taken from lim with
+// Acquire(n, n) once its header is read, before any of it is forwarded,
+// and what is not forwarded is refunded. end reports r's FIN (also inside
+// the capsule: the bytes so far are forwarded and the receiver sees the
+// truncation); done that the direction ended otherwise.
 func splicePacketCapsule(ctx context.Context, r, w *Stream, chunk int, lim Limiter, hdr *[3 * 8]byte, d *SpliceDirection) (end, done bool) {
 	hn := 0
 	var length uint64
@@ -144,7 +146,12 @@ func splicePacketCapsule(ctx context.Context, r, w *Stream, chunk int, lim Limit
 		hn += copy(hdr[hn:], ch.Data)
 		ch.Release()
 		if errors.Is(err, io.EOF) {
-			return true, !splicePacketWrite(ctx, r, w, lim, hdr[:hn], d)
+			// A truncated header: forwarded as it is, as a unit.
+			granted, ok := splicePacketAcquire(ctx, r, w, lim, uint64(hn), d)
+			if !ok {
+				return true, true
+			}
+			return true, !splicePacketWrite(ctx, r, w, lim, granted, hdr[:hn], d)
 		}
 		if err != nil {
 			spliceReadErr(ctx, r, w, err)
@@ -152,43 +159,58 @@ func splicePacketCapsule(ctx context.Context, r, w *Stream, chunk int, lim Limit
 			return false, true
 		}
 	}
-	if !splicePacketWrite(ctx, r, w, lim, hdr[:hn], d) {
+	// A Length beyond what a stream can carry is clamped: the limiter is
+	// asked for the whole unit, and the stream ends long before.
+	granted, ok := splicePacketAcquire(ctx, r, w, lim, uint64(hn)+min(length, 1<<62), d)
+	if !ok {
 		return false, true
 	}
+	if !splicePacketWrite(ctx, r, w, lim, granted, hdr[:hn], d) {
+		return false, true
+	}
+	granted = max(granted-int64(hn), 0)
 	for length > 0 {
-		m, eof, stop := spliceStep(ctx, r, w, chunk, lim, length, d)
-		if stop {
-			return false, true
-		}
-		if eof {
-			return true, false
+		m, eof, stop := spliceStep(ctx, r, w, chunk, nil, length, d)
+		granted = max(granted-int64(m), 0)
+		if stop || eof {
+			if lim != nil {
+				lim.Refund(granted) // the rest of the capsule never came
+			}
+			return eof, stop
 		}
 		length -= uint64(m)
 	}
 	return false, false
 }
 
-// splicePacketWrite writes b (a capsule header) on w, charged to lim;
-// false when the direction ended.
-func splicePacketWrite(ctx context.Context, r, w *Stream, lim Limiter, b []byte, d *SpliceDirection) bool {
+// splicePacketAcquire takes a capsule of n bytes from lim with
+// Acquire(n, n) and returns the grant; false when the direction ended.
+func splicePacketAcquire(ctx context.Context, r, w *Stream, lim Limiter, n uint64, d *SpliceDirection) (int64, bool) {
+	if lim == nil || n == 0 {
+		return 0, true
+	}
+	granted, err := lim.Acquire(ctx, int64(n), int64(n))
+	if err != nil {
+		spliceAbort(ctx, r, w, err)
+		d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
+		return 0, false
+	}
+	return granted, true
+}
+
+// splicePacketWrite writes b (a capsule header) on w; false when the
+// direction ended, with the capsule's grant refunded.
+func splicePacketWrite(ctx context.Context, r, w *Stream, lim Limiter, granted int64, b []byte, d *SpliceDirection) bool {
 	if len(b) == 0 {
 		return true
 	}
-	if lim != nil {
-		// The header waits for its allowance like value bytes do.
-		if _, err := lim.Ready(ctx, len(b), len(b)); err != nil {
-			spliceAbort(ctx, r, w, err)
-			d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
-			return false
-		}
-	}
 	if _, err := w.h.write(ctx, b); err != nil {
+		if lim != nil {
+			lim.Refund(granted)
+		}
 		spliceWriteErr(ctx, r, w, err)
 		d.End = spliceEnd(ctx, err, true)
 		return false
-	}
-	if lim != nil {
-		lim.Charge(len(b))
 	}
 	d.Bytes += uint64(len(b))
 	return true
@@ -231,12 +253,19 @@ func splicePacketDatagrams(ctx context.Context, r, w *Stream, lim Limiter, g *ca
 				// The bound shrank since it was read: send it as a capsule.
 			}
 		}
-		if lim != nil && lim.TryReady(len(p)) < len(p) {
-			d.DatagramsLimited++
-			d.DatagramsDropped++
-			continue
+		var granted int64
+		if lim != nil {
+			var ok bool
+			if granted, ok = (guardedLimiter{lim}).police(len(p)); !ok {
+				d.DatagramsLimited++
+				d.DatagramsDropped++
+				continue
+			}
 		}
 		if g.lock(ctx) != nil {
+			if lim != nil {
+				lim.Refund(granted)
+			}
 			d.DatagramsDropped++ // read, never written
 			return
 		}
@@ -251,11 +280,11 @@ func splicePacketDatagrams(ctx context.Context, r, w *Stream, lim Limiter, g *ca
 		}
 		g.unlock()
 		if !ok {
+			if lim != nil {
+				lim.Refund(granted)
+			}
 			d.DatagramsDropped++
 			continue
-		}
-		if lim != nil {
-			lim.Charge(len(p))
 		}
 		d.DatagramsEncapsulated++
 		d.DatagramBytes += uint64(len(p))

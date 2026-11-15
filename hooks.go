@@ -22,13 +22,14 @@ import (
 // may run after Wait returned.
 type Tracer struct {
 	// Established: the peer's transport parameters were processed.
-	Established func()
+	Established func(id SessionID)
 	// Event: a pipe or session event (as NextEvent reports them).
-	Event func(Event)
-	// Dropped: events lost to overflow since the previous call.
-	Dropped func(count uint64)
-	// Closed: the session ended; nothing follows.
-	Closed func(err error)
+	Event func(id SessionID, ev Event)
+	// Dropped: this many of the session's events were lost since the
+	// previous call because its trace backlog was full.
+	Dropped func(id SessionID, count uint64)
+	// Closed: the session ended; nothing of it follows.
+	Closed func(id SessionID, err error)
 }
 
 // Pick is a custom scheduling policy. It runs outside every
@@ -241,7 +242,7 @@ func (h *hooks) runTrace() {
 			h.deliver(it)
 		}
 		if dropped > 0 && h.tr.Dropped != nil {
-			safeLog(h.log, "Tracer.Dropped", func() { h.tr.Dropped(dropped) })
+			safeLog(h.log, "Tracer.Dropped", func() { h.tr.Dropped(h.c.id, dropped) })
 		}
 	}
 }
@@ -260,11 +261,11 @@ func (h *hooks) deliver(it traceItem) {
 	t := h.tr
 	switch {
 	case it.est && t.Established != nil:
-		safeLog(h.log, "Tracer.Established", t.Established)
+		safeLog(h.log, "Tracer.Established", func() { t.Established(h.c.id) })
 	case it.closed && t.Closed != nil:
-		safeLog(h.log, "Tracer.Closed", func() { t.Closed(it.err) })
+		safeLog(h.log, "Tracer.Closed", func() { t.Closed(h.c.id, it.err) })
 	case !it.est && !it.closed && t.Event != nil:
-		safeLog(h.log, "Tracer.Event", func() { t.Event(it.ev) })
+		safeLog(h.log, "Tracer.Event", func() { t.Event(h.c.id, it.ev) })
 	}
 }
 

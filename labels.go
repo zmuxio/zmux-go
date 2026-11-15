@@ -28,11 +28,21 @@ import (
 // internal/labels starts these goroutines, here and in the adapter
 // modules (zmuxquic, zmuxh3), by the same rules.
 
-// sessionSeq numbers the sessions of the process for their labels.
+// sessionSeq numbers the sessions of the process (SessionID).
 var sessionSeq atomic.Uint64
 
-// sessionLabels is the label set of a new session in role r.
-func sessionLabels(r core.Role) context.Context {
+// SessionID is a session's identity within the process: distinct for
+// every session the process makes (a counter from 1, never reused), so
+// that hooks shared by the sessions of one Config, such as a Tracer, tell
+// them apart. It is the "zmux.session" goroutine label. It is not sent to
+// the peer.
+type SessionID uint64
+
+// nextSessionID is the identity of a new session.
+func nextSessionID() SessionID { return SessionID(sessionSeq.Add(1)) }
+
+// sessionLabels is the label set of new session id in role r.
+func sessionLabels(id SessionID, r core.Role) context.Context {
 	role := "auto"
 	switch r {
 	case core.RoleInitiator:
@@ -43,7 +53,7 @@ func sessionLabels(r core.Role) context.Context {
 		// Not resolved yet when the session starts: the label stays "auto".
 	}
 	return pprof.WithLabels(context.Background(), pprof.Labels(
-		"zmux.role", role, "zmux.session", strconv.FormatUint(sessionSeq.Add(1), 10)))
+		"zmux.role", role, "zmux.session", strconv.FormatUint(uint64(id), 10)))
 }
 
 // pipeLabels is the label set of pipe id of session c.

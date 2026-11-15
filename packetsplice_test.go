@@ -174,14 +174,16 @@ func TestSplicePacketsMalformedReachesEnd(t *testing.T) {
 // dropLimiter refuses datagrams of one size and allows everything else.
 type dropLimiter struct{ size int }
 
-func (l dropLimiter) Ready(_ context.Context, _, maxBytes int) (int, error) { return maxBytes, nil }
-func (l dropLimiter) TryReady(maxBytes int) int {
-	if maxBytes == l.size {
-		return 0
-	}
-	return maxBytes
+func (l dropLimiter) Acquire(_ context.Context, _, maxBytes int64) (int64, error) {
+	return maxBytes, nil
 }
-func (dropLimiter) Charge(int) {}
+func (l dropLimiter) TryAcquire(_, maxBytes int64) (int64, error) {
+	if maxBytes == int64(l.size) {
+		return 0, errors.New("refused")
+	}
+	return maxBytes, nil
+}
+func (dropLimiter) Refund(int64) {}
 
 // TestSpliceDatagramDropCauses: Splice counts a datagram too large for the
 // next hop and one its limiter refused apart, within DatagramsDropped.
