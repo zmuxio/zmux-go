@@ -386,7 +386,7 @@ func TestAckSimMatrix(t *testing.T) {
 						m.set(&sc)
 						r := runSim(t, sc)
 						minG, maxG = min(minG, r.goodput), max(maxG, r.goodput)
-						fmt.Fprintf(&line, " | srtt %5.1f min %5.1f R %6.1f G %6.1f ack %4.0f",
+						_, _ = fmt.Fprintf(&line, " | srtt %5.1f min %5.1f R %6.1f G %6.1f ack %4.0f",
 							float64(r.srtt)/1e6, float64(r.minRTT)/1e6, r.rate/1e6, r.goodput/1e6, r.acksPerSec)
 					}
 					t.Logf("qb=%-5v %-12s %3.0fMB/s %2dms G[%6.1f..%6.1f]%s", qb, m.name, rate/1e6, rtt, minG/1e6, maxG/1e6, line.String())

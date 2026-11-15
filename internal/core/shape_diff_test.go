@@ -82,7 +82,7 @@ func shapeTrace(t *testing.T, d *diffShaper) string {
 			if sizes == nil {
 				break
 			}
-			fmt.Fprintln(&out, i, sizes)
+			_, _ = fmt.Fprintln(&out, i, sizes)
 		}
 	}
 	return out.String()
