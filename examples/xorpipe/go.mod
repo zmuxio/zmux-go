@@ -5,8 +5,8 @@ go 1.27
 require github.com/zmuxio/zmux-go v1.4.0
 
 require (
-	github.com/djylb/netx v0.0.0-20261107123044-7640ba4c50af // indirect
-	github.com/djylb/timeshim v0.0.0-20261031100623-0e5ae6a85c7f // indirect
+	github.com/djylb/netx v0.0.0-20261114154740-c89a319ecfb2 // indirect
+	github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc // indirect
 )
 
 replace github.com/zmuxio/zmux-go => ../..
