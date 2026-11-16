@@ -83,6 +83,7 @@ type multiPath struct {
 	fateHist     map[fateKey]*history
 	copies       []*copyRec
 	aff          affinityState
+	rrFill       rrFill // the session round-robin chunk being filled
 	pickGen      uint64
 	pickQ        []*Stream // directions waiting for a custom decision
 	inputEpoch   uint64

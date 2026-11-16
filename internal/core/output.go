@@ -1029,9 +1029,9 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		return chunkSkip
 	}
 	off, n, fin := p.off, p.n, p.fin
-	if d != nil && !p.resend && n > uint64(s.cfg.SpreadChunk) {
+	if c := s.chunkRoom(d, st); d != nil && !p.resend && n > c {
 		// One scheduling decision per chunk.
-		n, fin = uint64(s.cfg.SpreadChunk), false
+		n, fin = c, false
 		if off == 0 && sp.preLen > n {
 			n = sp.preLen
 		}

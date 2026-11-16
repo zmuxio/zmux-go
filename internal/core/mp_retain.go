@@ -51,6 +51,7 @@ type mpSend struct {
 	acked      rangeSet   // acknowledged byte ranges
 	resend     rangeSet   // ranges to send again
 	rr         []rrVal    // own round-robin values
+	rrFill     rrFill     // the own round-robin chunk being filled
 	oppSent    rangeSet   // bytes re-sent opportunistically (once each)
 	pick       pickAnswer // custom policy answer
 	bind       binding    // affinity

@@ -131,7 +131,7 @@ func (s *Session) chunkSent(d *decision, w *recWriter, st *Stream, off, n uint64
 		s.bindOnSend(d, st)
 	case PolicySpreadRoundRobin, PolicySpreadRateWeighted:
 		if d.g != nil {
-			s.rrCommit(d.g, d.tier, p, st)
+			s.rrSent(d.g, d.tier, p, st, off, n)
 		}
 	case PolicyCustom:
 		s.customUsed(st, n)
@@ -472,6 +472,67 @@ func (s *Session) rrPick(g *gate, ti int, st *Stream) *Pipe {
 		}
 	})
 	return best
+}
+
+// rrFill is the round-robin chunk being filled: its pipe and the bytes so far.
+type rrFill struct {
+	pipe uint64
+	n    uint64
+}
+
+// rrFillOf is the round-robin chunk being filled for st.
+func (s *Session) rrFillOf(st *Stream) *rrFill {
+	if st.pol != 0 {
+		return &st.snd.mpState().rrFill
+	}
+	return &s.mp.rrFill
+}
+
+// chunkRoom is the most new data of st one write on the decision's pipe
+// takes: a chunk, or under a round-robin policy what is left of the chunk
+// the pipe is filling, so that a turn ends at its chunk's end.
+func (s *Session) chunkRoom(d *decision, st *Stream) uint64 {
+	c := max64(uint64(s.cfg.SpreadChunk), 1)
+	if d == nil || d.g == nil {
+		return c
+	}
+	switch s.policyOf(st) {
+	case PolicySpreadRoundRobin, PolicySpreadRateWeighted:
+		if f := s.rrFillOf(st); f.pipe == d.p.id && f.n < c {
+			return c - f.n
+		}
+	case PolicyAffinity, PolicySessionAffinity, PolicySpreadETA, PolicyCustom:
+		// Every write is a whole decision.
+	}
+	return c
+}
+
+// rrSent accounts n bytes of new data of st, from off, written on p under a
+// round-robin policy. A chunk is SpreadChunk bytes, or less when the write
+// took all the data ready: a write that a limit cut short (stream or session
+// credit, record room) while more data waits does not end the pipe's turn,
+// so a pipe whose turns meet a trickle of credit does not give up the turn
+// after a few bytes while another fills whole chunks. A write on another
+// pipe (the turn's pipe stopped being a candidate) starts a chunk there.
+func (s *Session) rrSent(g *gate, ti int, p *Pipe, st *Stream, off, n uint64) {
+	if n == 0 {
+		return // a FIN alone fills nothing
+	}
+	chunk := max64(uint64(s.cfg.SpreadChunk), 1)
+	f := s.rrFillOf(st)
+	b := n
+	if f.pipe == p.id {
+		b += f.n
+	}
+	for ; b >= chunk; b -= chunk {
+		s.rrCommit(g, ti, p, st)
+	}
+	if b > 0 && off+n >= st.snd.sendEnd() {
+		// The application, not a limit, made the write short.
+		s.rrCommit(g, ti, p, st)
+		b = 0
+	}
+	*f = rrFill{p.id, b}
 }
 
 // rrCommit applies a chunk given to p: every candidate gains its weight,
@@ -1064,6 +1125,7 @@ func (s *Session) SetPolicy(p Policy) {
 				q.mp.rrCur = 0
 			}
 		}
+		s.mp.rrFill = rrFill{}
 		for _, st := range s.streams {
 			if st.pol == 0 && st.snd.mps != nil {
 				st.snd.mps.bind = binding{}
@@ -1083,7 +1145,7 @@ func (s *Session) SetStreamPolicy(st *Stream, p Policy, inherit bool) {
 		st.pol = uint8(p) + 1
 	}
 	if m := st.snd.mps; m != nil {
-		m.bind, m.rr, m.pick = binding{}, nil, pickAnswer{}
+		m.bind, m.rr, m.rrFill, m.pick = binding{}, nil, rrFill{}, pickAnswer{}
 	}
 	s.wakeAllWriters()
 }
