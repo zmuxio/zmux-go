@@ -1,5 +1,5 @@
 // Command wspeer is a scripted WebSocket peer: `server|client|bad ADDR`.
-// The server prints READY, serves ws://ADDR/ with prefix authentication
+// The server prints `READY <bound address>` (port 0 picks a free port), serves ws://ADDR/ with prefix authentication
 // "ws-interop" in the upgrade's header field, answers anything else 418
 // and prints FALLBACK; the client prints OK ping, bad (no credential)
 // prints REFUSED with the error.
@@ -36,7 +36,7 @@ func main() {
 		ln, err := net.Listen("tcp", addr)
 		check(err)
 		go peer.Serve(ctx, l)
-		fmt.Println("READY")
+		peer.Ready(os.Stdout, ln)
 		check((&http.Server{Handler: h}).Serve(ln))
 	case "client", "bad":
 		cfg := &zmux.Config{}

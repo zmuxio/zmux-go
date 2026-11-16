@@ -26,6 +26,12 @@ import (
 	"github.com/zmuxio/zmux-go/admit"
 )
 
+// Ready prints the ready line `READY <address>` with the address ln is bound
+// to, so a caller that listens on port 0 learns the port it got.
+func Ready(w io.Writer, ln net.Listener) {
+	_, _ = fmt.Fprintf(w, "READY %s\n", ln.Addr())
+}
+
 // Auth is the prefix authentication of key: 30 s slots, no TLS binding; the listener accepts one slot of skew.
 func Auth(key string) *admit.PrefixAuth {
 	return &admit.PrefixAuth{Key: []byte(key), Slot: 30 * time.Second}

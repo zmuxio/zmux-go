@@ -1,7 +1,7 @@
 // Command tlsfront is a reverse proxy that terminates TLS: `tlsfront ADDR
 // UPSTREAM` serves HTTP/1.1 and HTTP/2 over TLS 1.3 on ADDR (self-signed)
 // and forwards every request to http://UPSTREAM over h2c, streaming both
-// bodies. It prints READY.
+// bodies. It prints `READY <bound address>`; port 0 picks a free port.
 package main
 
 import (
@@ -37,7 +37,7 @@ func main() {
 	check(err)
 	ln, err := net.Listen("tcp", os.Args[1])
 	check(err)
-	fmt.Println("READY")
+	peer.Ready(os.Stdout, ln)
 	check((&http.Server{Handler: h, TLSConfig: cfg}).ServeTLS(ln, "", ""))
 }
 

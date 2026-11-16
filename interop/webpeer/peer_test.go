@@ -73,3 +73,16 @@ func TestServeEchoReportsLateJoin(t *testing.T) {
 		}
 	}
 }
+
+func TestReadyReportsBoundAddress(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	var out lockedBuf
+	Ready(&out, ln)
+	if want := "READY " + ln.Addr().String() + "\n"; out.String() != want || strings.HasSuffix(ln.Addr().String(), ":0") {
+		t.Fatalf("ready line %q, want %q", out.String(), want)
+	}
+}

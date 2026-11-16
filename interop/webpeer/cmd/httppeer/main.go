@@ -11,7 +11,7 @@
 // that terminates TLS. The server prints MODE for each joined pipe after a
 // stream. WebSocket over HTTP/2 needs GODEBUG=http2xconnect=1 in the
 // server's environment.
-// The server prints READY, prints FALLBACK for a refused request (answered
+// The server prints `READY <bound address>` (port 0 picks a free port), prints FALLBACK for a refused request (answered
 // 418) and SESSION for an echoed stream; the client prints OK ping; bad
 // (key "wrong") prints REFUSED with the error.
 package main
@@ -58,7 +58,7 @@ func main() {
 		ln, err := net.Listen("tcp", addr)
 		check(err)
 		go peer.Serve(ctx, l)
-		fmt.Println("READY")
+		peer.Ready(os.Stdout, ln)
 		srv := &http.Server{Handler: h, Protocols: &p}
 		if h2 {
 			p.SetHTTP1(true) // h2c with prior knowledge still shares the listener
@@ -119,12 +119,12 @@ func mp(mode, kind, addr string) {
 			p.SetHTTP1(true)
 			p.SetUnencryptedHTTP2(true)
 			srv.Protocols = &p
-			fmt.Println("READY")
+			peer.Ready(os.Stdout, ln)
 			check(srv.Serve(ln))
 		}
 		srv.TLSConfig, err = peer.SelfSignedTLS()
 		check(err)
-		fmt.Println("READY")
+		peer.Ready(os.Stdout, ln)
 		check(srv.ServeTLS(ln, "", ""))
 	case "client":
 		var p http.Protocols
