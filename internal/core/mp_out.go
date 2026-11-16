@@ -183,6 +183,8 @@ func (s *Session) mpWrite(w *recWriter, p *Pipe, ol *outLane) {
 		prim, _ := s.primary()
 		if prim == p || prim == nil {
 			s.writeControl(w, p)
+		} else if s.dg != nil && len(s.dg.send) > 0 {
+			s.writeDatagrams(w, p) // those that follow an opening frame sent here
 		}
 	}
 	d := &s.mp.dec

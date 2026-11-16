@@ -312,7 +312,8 @@ func TestHTTPExchangeServerRules(t *testing.T) {
 //	ZMUX_EXCHANGE=client ZMUX_EXCHANGE_URL=http://host:port/x go test -run TestHTTPExchangeInterop
 //	ZMUX_EXCHANGE=server ZMUX_EXCHANGE_ADDR=127.0.0.1:8080 go test -run TestHTTPExchangeInterop
 //
-// ZMUX_EXCHANGE_PSK (hex) and ZMUX_EXCHANGE_BASE64=1 configure the
+// The server prints `READY <address>` once it listens (port 0 binds a free
+// port). ZMUX_EXCHANGE_PSK (hex) and ZMUX_EXCHANGE_BASE64=1 configure the
 // carrier; ZMUX_EXCHANGE_DOWN_URL the client's DOWN target (default
 // ZMUX_EXCHANGE_URL); ZMUX_EXCHANGE_BYTES the client's echo size (1 MiB);
 // ZMUX_EXCHANGE_FOR how long the server serves (60s). The server echoes
@@ -340,8 +341,15 @@ func TestHTTPExchangeInterop(t *testing.T) {
 		defer cancel()
 		lst := mustNewListener(&zmux.ListenerConfig{Config: zcfg})
 		h := newExHandler(t, lst, nil, cfg)
-		srv := &http.Server{Addr: envOr("ZMUX_EXCHANGE_ADDR", "127.0.0.1:8080"), Handler: h, ReadHeaderTimeout: 10 * time.Second}
-		go func() { _ = srv.ListenAndServe() }()
+		ln, err := net.Listen("tcp", envOr("ZMUX_EXCHANGE_ADDR", "127.0.0.1:8080"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The ready line names the bound address: a caller that asks for
+		// port 0 learns the port it got.
+		_, _ = fmt.Fprintf(os.Stdout, "READY %s\n", ln.Addr())
+		srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
+		go func() { _ = srv.Serve(ln) }()
 		go func() {
 			for {
 				c, err := lst.Accept(ctx)

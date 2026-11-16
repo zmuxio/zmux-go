@@ -111,7 +111,7 @@ func (d *dgramState) sendable(s *Session) bool {
 	ch := s.channelOf(s.dgPipe())
 	for i := range d.send {
 		ok, dead := d.send[i].ready()
-		if dead || ok && !ch.takes(len(d.send[i].data)) {
+		if dead || ok && (!ch.takes(len(d.send[i].data)) || s.followPipe(d.send[i].st) != nil) {
 			return true
 		}
 	}
@@ -133,6 +133,38 @@ func (s *Session) dgPipe() *Pipe {
 		}
 	}
 	return nil
+}
+
+// dgInRecords reports whether p's lane 0 records carry the queued
+// datagrams that follow no opening frame: every pipe of a session without
+// multipath, and the primary pipe of a multipath one (every pipe while it
+// has none).
+func (s *Session) dgInRecords(p *Pipe) bool {
+	if s.mp == nil {
+		return true
+	}
+	prim, _ := s.primary()
+	return prim == nil || prim == p
+}
+
+// followPipe returns the pipe a stream datagram follows in a multipath
+// session: the pipe of its stream's opening frame (or of the latest
+// reinjected copy) while that frame is unacknowledged and the pipe is
+// live (MULTIPATH.md S7, EXTENSIONS.md 6.4); nil when it goes by the
+// usual rule.
+func (s *Session) followPipe(st *Stream) *Pipe {
+	if s.mp == nil || st == nil || st.snd.mps == nil {
+		return nil
+	}
+	m := st.snd.mps
+	if !m.openSet || m.openAcked {
+		return nil
+	}
+	p := s.pipe(m.openPipe)
+	if p == nil || p.mp == nil || p.out == nil || p.out.failed || !p.mp.liveOut() || p.mp.retired {
+		return nil
+	}
+	return p
 }
 
 // takes reports whether a DATAGRAM frame of n bytes of data goes on the
@@ -198,7 +230,7 @@ func (s *Session) PollChannel(pipe uint64, use ChannelUse, dst []ChannelOut) (_ 
 			s.stats.DatagramsDroppedSend++
 			continue
 		}
-		if !ok || !ch.takes(len(o.data)) {
+		if !ok || !ch.takes(len(o.data)) || s.followPipe(o.st) != nil {
 			kept = append(kept, o)
 			continue
 		}
@@ -390,6 +422,7 @@ func (s *Session) writeDatagrams(w *recWriter, p *Pipe) {
 	if p == s.dgPipe() {
 		ch = s.channelOf(p)
 	}
+	usual := s.dgInRecords(p)
 	held := d.send[:0] // in place: datagrams waiting for their stream's opening frame or the channel
 	i := 0
 	for ; i < len(d.send); i++ {
@@ -403,7 +436,17 @@ func (s *Session) writeDatagrams(w *recWriter, p *Pipe) {
 			held = append(held, o)
 			continue
 		}
-		if ch.takes(len(o.data)) {
+		if f := s.followPipe(o.st); f != nil {
+			// While no pipe of the opening frame may carry it (SUSPECT,
+			// DRAINING), it stays queued.
+			if f != p || f.mp.out != OutActive {
+				held = append(held, o)
+				continue
+			}
+		} else if !usual {
+			held = append(held, o)
+			continue
+		} else if ch.takes(len(o.data)) {
 			held = append(held, o)
 			s.wake(p.chSig)
 			continue
@@ -753,4 +796,14 @@ func (s *Session) StreamDatagramsEnded(st *Stream) (bool, error) {
 func (s *Session) dropStreamDgrams(st *Stream) {
 	st.dg = nil
 	s.dgramChanged(st) // a waiter sees the end
+}
+
+// waitsFor reports a queued datagram of st.
+func (d *dgramState) waitsFor(st *Stream) bool {
+	for i := range d.send {
+		if d.send[i].st == st {
+			return true
+		}
+	}
+	return false
 }

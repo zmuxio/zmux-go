@@ -1036,7 +1036,14 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 			n = sp.preLen
 		}
 	}
-	if (p.n > 0 || p.fin) && w.dataHeld() {
+	// Datagrams queued for a stream not opened yet go right behind its
+	// opening frame, ahead of its data and FIN: the opening chunk is the
+	// opening frame alone.
+	dgWait := off == 0 && !p.resend && !st.opened && s.peerSeen && s.dg != nil && s.dg.waitsFor(st)
+	if dgWait {
+		n, fin = min64(n, sp.preLen), false
+	}
+	if (n > 0 || fin) && w.dataHeld() {
 		return chunkFull // the limiter or the shaping gate holds the pipe's data back
 	}
 	hdr := wire.StreamHeaderLen(st.id, off, int(n), true)
@@ -1100,6 +1107,9 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 			d.p.mp.holdSent += n
 		}
 		m := sp.mps
+		if off == 0 && d != nil {
+			m.openPipe, m.openSet = d.p.id, true // a reinjected copy of the opening frame
+		}
 		s.dropResend(m, off, off+n)
 		if fin {
 			m.finResend = false
@@ -1109,8 +1119,17 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		}
 		return chunkSent
 	}
+	if !st.opened && d != nil {
+		m := sp.mpState()
+		m.openPipe, m.openSet = d.p.id, true
+	}
 	st.opened = true
 	s.openedCtl(st)
+	if dgWait && w.b.Lane == 0 && s.state < StateClosing {
+		if wp := s.pipe(w.b.Pipe); wp != nil {
+			s.writeDatagrams(w, wp)
+		}
+	}
 	if s.dg != nil && len(s.dg.send) > 0 {
 		s.wakeAllWriters() // its held datagrams may follow
 	}

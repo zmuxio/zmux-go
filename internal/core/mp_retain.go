@@ -54,6 +54,9 @@ type mpSend struct {
 	oppSent    rangeSet   // bytes re-sent opportunistically (once each)
 	pick       pickAnswer // custom policy answer
 	bind       binding    // affinity
+	openPipe   uint64     // the pipe of the opening frame or of its latest reinjected copy, when openSet
+	openSet    bool
+	openAcked  bool // the opening frame was acknowledged
 	finAcked   bool
 	finResend  bool
 	pickQueued bool
@@ -173,6 +176,12 @@ func (s *Session) acked(d *frameDesc) {
 		m := sp.mpState()
 		if d.n > 0 {
 			m.acked.add(d.off, d.off+d.n)
+		}
+		if d.off == 0 && !m.openAcked {
+			m.openAcked = true
+			if s.dg != nil && len(s.dg.send) > 0 {
+				s.wakeAllWriters() // its datagrams go by the usual rule now
+			}
 		}
 		if d.fin {
 			m.finAcked = true
