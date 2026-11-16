@@ -207,7 +207,7 @@ type logRecorder struct {
 	mu    sync.Mutex
 }
 
-func (r *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
+func (r *logRecorder) Enabled(_ context.Context, _ slog.Level) bool { return true }
 func (r *logRecorder) Handle(_ context.Context, rec slog.Record) error {
 	r.mu.Lock()
 	r.msgs = append(r.msgs, rec.Message)
@@ -220,8 +220,8 @@ func (r *logRecorder) Handle(_ context.Context, rec slog.Record) error {
 	r.mu.Unlock()
 	return nil
 }
-func (r *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return r }
-func (r *logRecorder) WithGroup(string) slog.Handler      { return r }
+func (r *logRecorder) WithAttrs(_ []slog.Attr) slog.Handler { return r }
+func (r *logRecorder) WithGroup(_ string) slog.Handler      { return r }
 
 func (r *logRecorder) has(sub string) bool {
 	r.mu.Lock()

@@ -245,7 +245,7 @@ type discardWriter struct{ h http.Header }
 
 func (w *discardWriter) Header() http.Header         { return w.h }
 func (w *discardWriter) Write(b []byte) (int, error) { return len(b), nil }
-func (w *discardWriter) WriteHeader(int)             {}
+func (w *discardWriter) WriteHeader(_ int)           {}
 
 // Serve runs the accept loop of a WebTransport session the application
 // upgraded itself: its streams carry a zmux session to the listener, and
