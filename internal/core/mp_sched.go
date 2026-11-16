@@ -973,7 +973,21 @@ func (s *Session) TakePick(req *PickRequest) bool {
 	}
 	for _, st := range mp.pickQ {
 		st.snd.mps.pickQueued = false
-		if st.discarded || !st.sendable() {
+		if st.discarded {
+			continue
+		}
+		// A question nothing waits for any more (the fallback carried
+		// the data) is withdrawn, as is one about a direction that cannot
+		// be named yet: its next data asks the policy again instead of
+		// staying a miss. The policy names a direction by its identifier,
+		// so one not opened yet is pinned now (PinID), as its next chunk
+		// would be.
+		if !st.sendable() {
+			st.snd.mps.pick = pickAnswer{}
+			continue
+		}
+		if _, err := s.PinID(st); err != nil {
+			st.snd.mps.pick = pickAnswer{}
 			continue
 		}
 		f := PickFrame{Stream: st.id, Urgency: st.urgency, Len: s.readyBytes(st)}

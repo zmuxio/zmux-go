@@ -221,10 +221,72 @@ func TestTracerMayWait(t *testing.T) {
 	}
 }
 
+// gatedPick answers every chunk with the last pipe; it reports each call's
+// streams on asked and holds the first call until gate is closed.
+type gatedPick struct {
+	asked chan []StreamID
+	gate  chan struct{}
+	first atomic.Bool
+}
+
+func newGatedPick(held bool) *gatedPick {
+	p := &gatedPick{asked: make(chan []StreamID, 64), gate: make(chan struct{})}
+	if !held {
+		close(p.gate)
+	}
+	return p
+}
+
+func (p *gatedPick) Pick(reqs []PickRequest, pipes []PickPipe, out []PickAnswer) {
+	ids := make([]StreamID, len(reqs))
+	for i := range reqs {
+		ids[i] = reqs[i].Stream
+		out[i] = PickAnswer{Index: len(pipes) - 1}
+	}
+	select {
+	case p.asked <- ids:
+	default:
+	}
+	if !p.first.Swap(true) {
+		<-p.gate
+	}
+}
+
+// writeUntilAsked writes a byte to s every few milliseconds until a Pick
+// call names s, and returns the bytes written.
+// A direction asks when it has data to place, and the fallback after
+// pickWait may carry it before the policy runs, which withdraws the
+// question: writing again asks again.
+func (p *gatedPick) writeUntilAsked(t *testing.T, s *Stream, what string) int {
+	t.Helper()
+	timeout := time.After(10 * time.Second)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	n := 0
+	for {
+		select {
+		case ids := <-p.asked:
+			for _, x := range ids {
+				if x == s.StreamID() {
+					return n
+				}
+			}
+		case <-tick.C:
+			if _, err := s.Write([]byte{0}); err != nil {
+				t.Fatal(err)
+			}
+			n++
+		case <-timeout:
+			t.Fatalf("Pick not asked %s", what)
+		}
+	}
+}
+
 // TestSlowTracerDoesNotDelayPick: a Tracer blocked in a callback delays
-// none of the scheduler's decisions.
+// none of the scheduler's decisions: the policy is asked while the Tracer
+// stays blocked.
 func TestSlowTracerDoesNotDelayPick(t *testing.T) {
-	pol := &pickLast{}
+	pol := newGatedPick(false)
 	release := make(chan struct{})
 	defer close(release)
 	ccfg := mpConfig()
@@ -250,11 +312,80 @@ func TestSlowTracerDoesNotDelayPick(t *testing.T) {
 	if _, err := s.Write(make([]byte, 64<<10)); err != nil {
 		t.Fatal(err)
 	}
+	want := int64(64<<10 + pol.writeUntilAsked(t, s, "while the Tracer was blocked"))
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if n := <-got; n != 64<<10 || pol.calls.Load() == 0 {
-		t.Fatalf("the peer read %d bytes, Pick asked %d times, while the Tracer was blocked", n, pol.calls.Load())
+	if n := <-got; n != want {
+		t.Fatalf("the peer read %d bytes of %d while the Tracer was blocked", n, want)
+	}
+}
+
+// TestPickAskedAgainAfterWithdrawnQuestion: a direction whose question the
+// fallback made moot (all its data went before the policy ran) asks the
+// policy again for its next data instead of staying a miss, and a stream
+// asked about before its opening frame is named by its own identifier.
+func TestPickAskedAgainAfterWithdrawnQuestion(t *testing.T) {
+	pol := newGatedPick(true)
+	ccfg := mpConfig()
+	ccfg.Scheduler = SchedulerCustom(pol)
+	e := newMPEnv(t, ccfg, mpConfig())
+	_ = e.addPipe(t, PipeOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var readB atomic.Int64
+	go func() {
+		for range 3 {
+			s, err := e.server.AcceptStream(ctx)
+			if err != nil {
+				return
+			}
+			go func() {
+				buf := make([]byte, 512)
+				for {
+					n, err := s.Read(buf)
+					if s.StreamID() == 4 {
+						readB.Add(int64(n))
+					}
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	open := func() *Stream {
+		s, err := e.client.OpenStreamSync(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	// The first call (stream a) holds the policy.
+	a := open()
+	pol.writeUntilAsked(t, a, "for the first stream")
+	// Stream b asks meanwhile; the fallback carries all its data.
+	b := open()
+	if b.StreamID() != 4 {
+		t.Fatalf("stream b is %d", b.StreamID())
+	}
+	if _, err := b.Write([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	for readB.Load() == 0 {
+		if ctx.Err() != nil {
+			t.Fatal("the fallback did not carry stream b's data")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Release the policy; new stream c is asked about only after b's
+	// question was taken with nothing of b left to place.
+	close(pol.gate)
+	c := open()
+	pol.writeUntilAsked(t, c, "for a new stream")
+	pol.writeUntilAsked(t, b, "for data after a withdrawn question")
+	for _, s := range []*Stream{a, b, c} {
+		_ = s.Close()
 	}
 }
 
