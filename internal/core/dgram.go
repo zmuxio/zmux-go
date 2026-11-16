@@ -793,9 +793,18 @@ func (s *Session) StreamDatagramsEnded(st *Stream) (bool, error) {
 	return st.discarded || st.hasR && st.rcv.stopped, nil
 }
 
-func (s *Session) dropStreamDgrams(st *Stream) {
-	st.dg = nil
-	s.dgramChanged(st) // a waiter sees the end
+// endStreamDgrams ends the datagram flow of a discarded stream. The
+// datagrams that arrived before the end stay in the queue, bound by the
+// stream queue limits and owned by the application's handle, which reads
+// them (RecvStreamDatagram) and frees them with itself; the handle is
+// what the application reads the stream's data through, so a datagram
+// reader running beside it does not lose them to the automatic release.
+// Datagrams arriving later are dropped and counted (queueDatagram).
+func (s *Session) endStreamDgrams(st *Stream) {
+	if st.dg != nil && len(st.dg.q) == 0 {
+		st.dg = nil
+	}
+	s.dgramChanged(st) // a waiter sees the end, or the queue
 }
 
 // waitsFor reports a queued datagram of st.

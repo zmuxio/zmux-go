@@ -613,7 +613,7 @@ func (s *Session) maybeDiscard(st *Stream) {
 			s.loc[t].reserved--
 		}
 	}
-	s.dropStreamDgrams(st) // a datagram waiter sees the end, queue or not
+	s.endStreamDgrams(st) // a datagram waiter sees the end; the queue stays
 	// A graceful shutdown closes once its last stream is gone: checked by
 	// Settle, after the operation that discarded the stream.
 	if s.ga.closeWhenDone {

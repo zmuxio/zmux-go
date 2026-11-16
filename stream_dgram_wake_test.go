@@ -84,3 +84,58 @@ func TestStreamDatagramReaderWakes(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamDatagramsSurviveAutoRelease: a stream whose application read
+// the end and closed its side is released by itself; the datagrams that
+// arrived before the end, and were not taken yet, stay readable through the
+// handle. Datagrams of a released stream that arrive later are dropped.
+func TestStreamDatagramsSurviveAutoRelease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client, server := bubblePair(t, func() *Config {
+			return &Config{Clock: timeshim.Real, EnableDatagrams: true, Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1}
+		})
+		ctx := context.Background()
+		st, err := client.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range byte(3) {
+			if err := st.SendDatagram(1, []byte{i}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := st.Write([]byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		rst, err := server.AcceptStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, err := io.ReadAll(rst); err != nil || string(b) != "data" {
+			t.Fatalf("read %q, %v", b, err)
+		}
+		if err := rst.Close(); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		for server.ConnectionStats().StreamsActive != 0 {
+			time.Sleep(time.Millisecond)
+			synctest.Wait()
+		}
+		for i := range byte(3) {
+			_, p, err := rst.ReceiveDatagram(ctx)
+			if err != nil || len(p) != 1 || p[0] != i {
+				t.Fatalf("datagram %d: %v, %v", i, p, err)
+			}
+		}
+		if _, _, err := rst.ReceiveDatagram(ctx); !errors.Is(err, io.EOF) {
+			t.Fatalf("after the queue: %v", err)
+		}
+		if n := server.ConnectionStats().DatagramsDroppedRecv; n != 0 {
+			t.Fatalf("%d datagrams dropped", n)
+		}
+	})
+}
