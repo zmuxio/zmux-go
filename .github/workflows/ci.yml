@@ -100,3 +100,36 @@ jobs:
           working-directory: ${{ matrix.module }}
           # One config for every module; paths in it are relative to it.
           args: --config=${{ github.workspace }}/.golangci.yml
+
+  cross:
+    name: 32-bit and ARM targets (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", seal, zmuxws, zmuxquic, zmuxh3]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      # Nothing is run here: a 32-bit int, a 32-bit uintptr and 4-byte
+      # alignment of 64-bit atomics fail to compile or vet, not at run time.
+      - name: vet linux/386 (includes test code)
+        run: GOOS=linux GOARCH=386 go vet ./...
+
+      - name: build windows/386
+        run: GOOS=windows GOARCH=386 go build ./...
+
+      - name: build linux/arm
+        run: GOOS=linux GOARCH=arm go build ./...
+
+      - name: build linux/arm64
+        run: GOOS=linux GOARCH=arm64 go build ./...
