@@ -97,6 +97,9 @@ func TestStreamDatagramsFollowUnackedOpening(t *testing.T) {
 			open = p
 		}
 	}
+	if open == nil {
+		t.Fatal("statsMP has no pipe besides the primary")
+	}
 	st := &Stream{id: 4, idSet: true, bidi: true, local: true, opened: true, hasS: true}
 	s.streams[st.id] = st
 	m := st.snd.mpState()
