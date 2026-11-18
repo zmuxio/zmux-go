@@ -13,11 +13,23 @@ import (
 type deadline struct {
 	timer  timeshim.Timer
 	cancel chan struct{}
-	mu     sync.Mutex
+	// expired, if set, is called once the deadline passes, outside mu
+	// (the read deadline's: NotifyReadable). Set before the deadline is
+	// published and never changed.
+	expired func()
+	mu      sync.Mutex
 }
 
 // set moves the deadline to t on clk.
 func (d *deadline) set(t time.Time, clk timeshim.Clock) {
+	if d.setLocked(t, clk) && d.expired != nil {
+		d.expired()
+	}
+}
+
+// setLocked moves the deadline under mu and reports whether it has passed
+// already.
+func (d *deadline) setLocked(t time.Time, clk timeshim.Clock) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.timer != nil && !d.timer.Stop() {
@@ -29,17 +41,23 @@ func (d *deadline) set(t time.Time, clk timeshim.Clock) {
 		if closed || d.cancel == nil {
 			d.cancel = make(chan struct{})
 		}
-		return
+		return false
 	}
 	if closed || d.cancel == nil {
 		d.cancel = make(chan struct{})
 	}
 	if dur := timeshim.Until(clk, t); dur > 0 {
-		ch := d.cancel
-		d.timer = clk.AfterFunc(dur, func() { close(ch) })
-		return
+		ch, expired := d.cancel, d.expired
+		d.timer = clk.AfterFunc(dur, func() {
+			close(ch)
+			if expired != nil {
+				expired()
+			}
+		})
+		return false
 	}
 	close(d.cancel)
+	return true
 }
 
 // wait returns the channel to select on.

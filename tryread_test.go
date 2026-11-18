@@ -11,7 +11,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
-// TryRead takes what is readable now and never waits: (0, nil) while nothing is,
+// TryRead takes what is readable now and never waits: ErrWouldBlock while nothing is,
 // the data, io.EOF at the FIN, the stream's error after a reset, and with
 // WaitReadable it reads without a Read that blocks.
 func TestTryRead(t *testing.T) {
@@ -24,7 +24,7 @@ func TestTryRead(t *testing.T) {
 	if n, err := ss.TryRead(buf); n != 1 || err != nil || buf[0] != 'a' {
 		t.Fatalf("buffered byte: %d %v", n, err)
 	}
-	if n, err := ss.TryRead(buf); n != 0 || err != nil {
+	if n, err := ss.TryRead(buf); n != 0 || !errors.Is(err, ErrWouldBlock) {
 		t.Fatalf("nothing readable: %d %v", n, err)
 	}
 	if n, err := ss.TryRead(nil); n != 0 || err != nil {
@@ -47,7 +47,7 @@ func TestTryRead(t *testing.T) {
 	if string(got) != "hello" {
 		t.Fatalf("read %q", got)
 	}
-	if n, err := ss.TryRead(buf); n != 0 || err != nil {
+	if n, err := ss.TryRead(buf); n != 0 || !errors.Is(err, ErrWouldBlock) {
 		t.Fatalf("drained: %d %v", n, err)
 	}
 	// The end: io.EOF, after the data, and again on a repeated call.
@@ -96,7 +96,7 @@ func TestTryReadErrors(t *testing.T) {
 	// A Read that waits holds the read turn: TryRead answers "nothing now".
 	read := make(chan error, 1)
 	go func() { _, err := ss.Read(buf); read <- err }()
-	if n, err := ss.TryRead(buf); n != 0 || err != nil {
+	if n, err := ss.TryRead(buf); n != 0 || !errors.Is(err, ErrWouldBlock) {
 		t.Fatalf("beside a waiting Read: %d %v", n, err)
 	}
 	cs.CancelWrite(9)

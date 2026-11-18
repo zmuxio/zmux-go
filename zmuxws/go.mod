@@ -3,7 +3,7 @@ module github.com/zmuxio/zmux-go/zmuxws
 go 1.27
 
 require (
-	github.com/djylb/netx v0.0.0-20261117215339-191b9e603b52
+	github.com/djylb/netx v0.0.0-20261118123252-73956d2fc343
 	github.com/zmuxio/zmux-go v1.5.1
 )
 

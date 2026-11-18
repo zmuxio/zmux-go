@@ -299,6 +299,17 @@ func (e *localClosedError) Error() string { return e.msg }
 // Is matches net.ErrClosed.
 func (e *localClosedError) Is(t error) bool { return t == net.ErrClosed }
 
+// ErrWouldBlock is returned by TryRead when nothing is readable yet and the
+// receiving part has neither ended nor failed. Its WouldBlock method
+// reports true, so code that tests for that method (errors.As) recognises
+// it without importing this package.
+var ErrWouldBlock error = wouldBlockError{}
+
+type wouldBlockError struct{}
+
+func (wouldBlockError) Error() string    { return "zmux: read would block" }
+func (wouldBlockError) WouldBlock() bool { return true }
+
 // Errors of individual calls.
 var (
 	// ErrStreamClosed is returned for operations on a direction the

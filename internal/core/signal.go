@@ -5,7 +5,14 @@ package core
 // driver delivers it after releasing the lock. Its channel has capacity one
 // so a signal sent before the waiter selects is never lost.
 type Signal struct {
-	C      chan struct{}
+	C chan struct{}
+	// Hook, when set, is called by FireAll after the token, outside the
+	// session lock: a callback reader of the slot (a readiness
+	// notification) that selects on no channel. It is set before the slot
+	// is handed to the core and never changed. Like the token it needs the
+	// channel: a callback reader makes it (Make) before it relies on the
+	// Hook. FireLocked never calls it.
+	Hook   func()
 	queued bool
 }
 
@@ -24,6 +31,14 @@ func (s *Signal) Drain() {
 	select {
 	case <-s.C:
 	default:
+	}
+}
+
+// Make gives a lazy slot its channel, keeping a token it holds; under the
+// session lock.
+func (s *Signal) Make() {
+	if s.C == nil {
+		s.C = make(chan struct{}, 1)
 	}
 }
 
@@ -71,5 +86,8 @@ func (s *Session) TakeWakes(dst []*Signal) []*Signal {
 func FireAll(sigs []*Signal) {
 	for _, s := range sigs {
 		s.fire()
+		if s.Hook != nil {
+			s.Hook()
+		}
 	}
 }

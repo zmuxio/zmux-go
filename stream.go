@@ -30,11 +30,14 @@ type handle struct {
 	rmu        sync.Mutex
 	wmu        sync.Mutex
 	rwaiters   atomic.Int32 // WaitReadable calls and the reads inside their wait, for passing the wake on
+	// rnote is the pending NotifyReadable call, nil while there is none.
+	rnote atomic.Pointer[readNote]
 }
 
 // newHandle makes the handle of st (under the lock).
 func (c *Conn) newHandle(st *core.Stream) *handle {
 	h := &handle{c: c, st: st}
+	h.rsig.Hook = h.readChanged
 	c.handles++
 	st.SetSignals(&h.rsig, &h.wsig, &h.dsig)
 	return h
@@ -56,7 +59,9 @@ func (h *handle) deadlines() *deadlines {
 	if d := h.dl.Load(); d != nil {
 		return d
 	}
-	h.dl.CompareAndSwap(nil, &deadlines{})
+	d := &deadlines{}
+	d.r.expired = h.rsig.Hook // the read deadline makes the stream readable
+	h.dl.CompareAndSwap(nil, d)
 	return h.dl.Load()
 }
 
@@ -240,12 +245,13 @@ func (h *handle) read(p []byte) (int, error) {
 	return 0, err
 }
 
-// tryRead is read without waiting: what is readable now, (0, nil) when
-// nothing is or another read is in progress, io.EOF at the FIN once
-// everything was read.
+// tryRead is read without waiting: what is readable now, io.EOF at the
+// FIN once everything was read, the part's error, os.ErrDeadlineExceeded
+// once the read deadline passed with nothing readable, and ErrWouldBlock
+// when nothing is readable yet or another read is in progress.
 func (h *handle) tryRead(p []byte) (int, error) {
 	if !h.rmu.TryLock() {
-		return 0, nil
+		return 0, ErrWouldBlock
 	}
 	defer h.rmu.Unlock()
 	c := h.c
@@ -260,8 +266,95 @@ func (h *handle) tryRead(p []byte) (int, error) {
 		return n, nil
 	case fin:
 		return 0, io.EOF
+	case err != nil:
+		return 0, apiErr(err)
+	case len(p) == 0:
+		return 0, nil
+	case h.readDeadlinePassed():
+		return 0, os.ErrDeadlineExceeded
 	}
-	return 0, apiErr(err)
+	return 0, ErrWouldBlock
+}
+
+// readDeadlinePassed reports whether the read deadline has passed.
+func (h *handle) readDeadlinePassed() bool {
+	d := h.dl.Load()
+	return d != nil && isClosed(d.r.wait())
+}
+
+// readNote is a pending NotifyReadable call. done is set by the one that
+// wins it: the call of f or stop.
+type readNote struct {
+	f    func()
+	h    *handle
+	done atomic.Bool
+}
+
+// notifyReadable registers f for the next time the receiving part is
+// readable (ReadReady, the same test as WaitReadable and Read) or the read
+// deadline passes. The note is published before the test, under the
+// session lock: a change after the test queues rsig, whose Hook
+// (readChanged) runs after the unlock and sees the note, and a deadline
+// that passes after it calls the same hook. Every event tests again, so
+// none is lost to a token another waiter took.
+func (h *handle) notifyReadable(f func()) func() bool {
+	n := &readNote{f: f, h: h}
+	if !h.rnote.CompareAndSwap(nil, n) {
+		panic("zmux: NotifyReadable while a call is pending")
+	}
+	ready := h.readDeadlinePassed()
+	h.c.peek(func() {
+		h.rsig.Make() // the core wakes (and FireAll calls the Hook of) a slot with its channel only
+		if !ready {
+			r, end := h.c.s.ReadReady(h.st)
+			ready = r > 0 || end
+		}
+	})
+	if ready {
+		n.fire()
+	}
+	return n.stop
+}
+
+// readChanged is rsig's Hook and the read deadline's expiry: it calls the
+// pending note's f if the part is readable now. It runs outside the
+// session lock.
+func (h *handle) readChanged() {
+	if n := h.rnote.Load(); n != nil && h.readableNow() {
+		n.fire()
+	}
+}
+
+// readableNow reports whether TryRead would return anything but
+// ErrWouldBlock (a concurrent blocked Read aside).
+func (h *handle) readableNow() bool {
+	if h.readDeadlinePassed() {
+		return true
+	}
+	ready := false
+	h.c.peek(func() {
+		n, end := h.c.s.ReadReady(h.st)
+		ready = n > 0 || end
+	})
+	return ready
+}
+
+// fire calls f unless the note was fired or stopped already. The note is
+// unpublished first, so f may register the next one.
+func (n *readNote) fire() {
+	if n.done.CompareAndSwap(false, true) {
+		n.h.rnote.CompareAndSwap(n, nil)
+		n.f()
+	}
+}
+
+// stop is NotifyReadable's stop.
+func (n *readNote) stop() bool {
+	if n.done.CompareAndSwap(false, true) {
+		n.h.rnote.CompareAndSwap(n, nil)
+		return true
+	}
+	return false
 }
 
 // awaitReadable waits as a read does, within the read deadline, for data
@@ -438,14 +531,40 @@ func (s *Stream) Flush() error { defer runtime.KeepAlive(s); return s.h.flush() 
 // Read reads stream data; io.EOF only after a FIN that was not reset.
 func (s *Stream) Read(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.read(p) }
 
-// TryRead reads what is readable now, up to len(p) bytes, and never waits:
-// it returns (0, nil) when nothing is readable (or another read of the
-// stream is in progress: a blocked Read holds the read turn), and io.EOF
-// once the part ended with a FIN and everything was read. A reset, a stop by
-// this endpoint and the session's end are the read's errors, as for Read; the
-// read deadline does not apply. It does not allocate. With WaitReadable it is
-// a Read that consumes nothing while it waits: wait, then TryRead.
+// TryRead reads what is readable now, up to len(p) bytes, and never waits.
+// It returns what a Read would return at once: n > 0 bytes, io.EOF once the
+// part ended with a FIN and everything was read, the read's error for a
+// reset, a stop by this endpoint or the session's end, and
+// os.ErrDeadlineExceeded once the read deadline passed with nothing
+// readable. When nothing is readable yet it returns (0, ErrWouldBlock), as
+// it does while another read of the stream is in progress (a blocked Read
+// holds the read turn). An empty p returns (0, nil) unless the part ended.
+// It does not allocate. With WaitReadable or NotifyReadable it is a Read
+// that consumes nothing while it waits.
 func (s *Stream) TryRead(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.tryRead(p) }
+
+// NotifyReadable arranges for f to be called once a TryRead would return
+// anything but ErrWouldBlock: data arrives, the part ends (FIN, reset,
+// CancelRead, the session's end) or the read deadline passes. It returns
+// stop, which cancels the call as the stop of context.AfterFunc does: true
+// if it kept f from being called, false if f was called or started, or the
+// call was stopped already; it does not wait for f, and calling it again is
+// harmless.
+//
+// f is called at most once, and exactly once unless stop cancels it. When
+// the stream is readable already, f is called on the calling goroutine
+// before NotifyReadable returns. Otherwise it runs on the goroutine of the
+// event, such as the one that reads the connection or the deadline's timer,
+// without any lock of the session held: f must not block, and may call the
+// stream's methods, NotifyReadable included. Moving the read deadline while
+// a call is pending calls f when the new deadline passes. The stream's
+// datagrams and Close (which finishes only the sending part) do not make it
+// readable. One call may be pending at a time: NotifyReadable panics while
+// another is. No goroutine waits for a pending call.
+func (s *Stream) NotifyReadable(f func()) (stop func() bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.notifyReadable(f)
+}
 
 // WaitReadable waits until a Read would not block: data is readable, or
 // the receiving part ended (FIN, reset, CancelRead or the session's end),
@@ -552,6 +671,13 @@ func (s *ReceiveStream) TryRead(p []byte) (int, error) {
 	return s.h.tryRead(p)
 }
 
+// NotifyReadable calls f once the stream is readable, as
+// Stream.NotifyReadable.
+func (s *ReceiveStream) NotifyReadable(f func()) (stop func() bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.notifyReadable(f)
+}
+
 // CancelRead stops reading.
 func (s *ReceiveStream) CancelRead(code StreamErrorCode) {
 	defer runtime.KeepAlive(s)
@@ -583,6 +709,10 @@ func (c *streamConn) Close() error {
 	c.CancelRead(StreamNoError)
 	return err
 }
+
+// CloseWrite finishes the stream's sending part and keeps reading, as
+// net.TCPConn.CloseWrite does, so that a relay can pass an end on.
+func (c *streamConn) CloseWrite() error { return c.Stream.Close() }
 
 func (c *streamConn) LocalAddr() net.Addr  { return c.local }
 func (c *streamConn) RemoteAddr() net.Addr { return c.remote }
