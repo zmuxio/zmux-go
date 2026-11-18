@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,15 +82,60 @@ func TestListenerMemoryBudget(t *testing.T) {
 			t.Fatalf("new session under pressure: %v", werr)
 		}
 	}
-	// Reading drains the buffer: pressure ends.
+	// Reading drains the buffer: pressure ends. The writer still has data
+	// to send, which a fast reader can leave above the budget again before
+	// the hook runs, and calls that find the state changed again report the
+	// state they find (TestMemoryPressureNotesCoalesce): the relief note is
+	// the one that ends the run of notes above the limit.
 	go func() { _, _ = io.Copy(io.Discard, ss) }()
-	select {
-	case n := <-notes:
-		if n.used >= budget/4*3 {
-			t.Fatalf("relief note %+v", n)
+	relief := time.After(10 * time.Second)
+	for relieved := false; !relieved; {
+		select {
+		case n := <-notes:
+			relieved = n.used < budget/4*3
+		case <-relief:
+			t.Fatalf("no relief (used %d)", l.Adapter().MemoryUsed())
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatalf("no relief (used %d)", l.Adapter().MemoryUsed())
 	}
 	runtime.KeepAlive(st) // a collected handle would reset the stream
+}
+
+// The hook runs on one serial context and reads the budget when it runs:
+// a pressure start and its end that follow each other while a call is
+// still running coalesce into one more call, which reports the state at
+// that time, and the last call always reports the final state.
+func TestMemoryPressureNotesCoalesce(t *testing.T) {
+	leakcheck.Check(t)
+	const budget = 1 << 10
+	type note struct{ used, budget int64 }
+	notes := make(chan note, 16)
+	gate := make(chan struct{})
+	var first sync.Once
+	l := mustNewListener(&ListenerConfig{MemoryBudget: budget, Config: &Config{},
+		OnMemoryPressure: func(used, b int64) {
+			notes <- note{used, b}
+			first.Do(func() { <-gate }) // the first call does not return until released
+		}})
+	defer func() { _ = l.Close() }()
+	a := l.Adapter()
+	// The watcher starts with the first carrier the listener takes.
+	cl, sv := net.Pipe()
+	handled := make(chan struct{})
+	go func() { defer close(handled); _ = l.HandlePipe(context.Background(), NetPipe(sv), PipeHint{}) }()
+	defer func() { _ = cl.Close(); <-handled }()
+	a.ChargeMemory(budget) // pressure starts
+	if n := <-notes; n.used != budget || n.budget != budget {
+		t.Fatalf("start note %+v", n)
+	}
+	a.ChargeMemory(-budget) // ends, and starts again, while the hook still runs
+	a.ChargeMemory(budget)
+	close(gate)
+	n := <-notes
+	if n.used != budget || !a.MemoryPressure() {
+		t.Fatalf("the note after the flap %+v, pressure %v", n, a.MemoryPressure())
+	}
+	a.ChargeMemory(-budget)
+	if n := <-notes; n.used != 0 {
+		t.Fatalf("relief note %+v", n)
+	}
 }

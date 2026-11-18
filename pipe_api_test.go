@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -312,6 +313,13 @@ func TestPipeOptionsFixedFields(t *testing.T) {
 	}
 	def := e.addPipe(t, PipeOptions{Label: "default group"})
 	two := e.addPipe(t, PipeOptions{KeyGroup: 2, Direction: DirectionSendOnly, ReturnOnReply: true, Weight: Set[uint64](5)})
+	// ReturnOnReply returns before the peer has the pipe (see
+	// TestReturnOnReplyPeerHasNoPipeYet): its view waits for the attachment.
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelWait()
+	if err := two.WaitAttached(waitCtx); err != nil {
+		t.Fatal(err)
+	}
 	o := def.Options()
 	if o.KeyGroup != 1 || o.Label != "default group" || o.Direction != DirectionBidirectional || o.RecordMode != Set(RecordSealed) || o.ReturnOnReply {
 		t.Fatalf("the default pipe: %+v", o)
@@ -349,5 +357,90 @@ func TestPipeOptionsFixedFields(t *testing.T) {
 	// The bootstrap pipe was not joined: no key group.
 	if p0, ok := e.client.Pipe(0); !ok || p0.Options().KeyGroup != 0 {
 		t.Fatalf("the bootstrap pipe: %v", ok)
+	}
+}
+
+// laterWritesHeld forwards a connection's first write at once and holds the
+// writes after it until release is closed, in order: the Hello of a join
+// goes out, the Confirm and what follows it wait.
+type laterWritesHeld struct {
+	net.Conn
+	mu      sync.Mutex
+	first   bool
+	q       chan []byte
+	closing chan struct{}
+	once    sync.Once
+}
+
+func holdLaterWrites(c net.Conn, release <-chan struct{}) *laterWritesHeld {
+	h := &laterWritesHeld{Conn: c, q: make(chan []byte, 64), closing: make(chan struct{})}
+	go func() {
+		select {
+		case <-release:
+		case <-h.closing:
+			return
+		}
+		for {
+			select {
+			case b := <-h.q:
+				_, _ = h.Conn.Write(b)
+			case <-h.closing:
+				return
+			}
+		}
+	}()
+	return h
+}
+
+func (h *laterWritesHeld) Write(b []byte) (int, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.first {
+		h.first = true
+		return h.Conn.Write(b)
+	}
+	h.q <- append([]byte(nil), b...)
+	return len(b), nil
+}
+
+func (h *laterWritesHeld) Close() error {
+	h.once.Do(func() { close(h.closing) })
+	return h.Conn.Close()
+}
+
+// With ReturnOnReply, AddPipe returns once the Reply has verified, and the
+// peer attaches the pipe only when it has the Confirm: the peer has no pipe
+// until then, and Pipe.WaitAttached is what waits for it. The Confirm is
+// held back here, so the order does not depend on the scheduler.
+func TestReturnOnReplyPeerHasNoPipeYet(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	release := make(chan struct{})
+	dial := e.dial
+	e.dial = func(ctx context.Context) (net.Conn, error) {
+		nc, err := dial(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return holdLaterWrites(nc, release), nil
+	}
+	p := e.addPipe(t, PipeOptions{ReturnOnReply: true})
+	e.dial = dial
+	if _, ok := e.server.Pipe(p.ID()); ok {
+		t.Fatal("the peer has the pipe before it has the Confirm")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	short, cancelShort := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancelShort()
+	if err := p.WaitAttached(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitAttached before the Confirm arrived: %v", err)
+	}
+	close(release)
+	if err := p.WaitAttached(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.server.Pipe(p.ID()); !ok {
+		t.Fatal("the peer has no pipe once it is attached")
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,12 +294,19 @@ func TestPoolCountDropRetiresIdlest(t *testing.T) {
 	closed := map[int]bool{}
 	count := 2
 	var views []zmux.PoolView
+	// Get asks the policy when it counts its dial, before the connection
+	// exists, and again when the member joins; the first dial waits for the
+	// first look so that both orders of the two are fixed, not left to the
+	// scheduler.
+	looked := make(chan struct{})
+	var once sync.Once
 	p := &ConnPool[int]{
-		Dial:  func(context.Context) (int, error) { n++; return n, nil },
+		Dial:  func(context.Context) (int, error) { <-looked; n++; return n, nil },
 		Close: func(c int) { closed[c] = true },
 		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
 			views = append(views, zmux.PoolView{SinceLastDial: v.SinceLastDial, Members: append([]zmux.PoolMember(nil), v.Members...)})
 			d.Count = count
+			once.Do(func() { close(looked) })
 		}),
 	}
 	defer p.Shutdown()
@@ -314,8 +322,11 @@ func TestPoolCountDropRetiresIdlest(t *testing.T) {
 	if err != nil || b.Conn == a.Conn {
 		t.Fatalf("second lease %+v, %v", b, err)
 	}
-	if len(views[0].Members) != 1 || views[0].Members[0].Pipes != 1 { // the look after the first member joined
+	if len(views[0].Members) != 0 || views[0].SinceLastDial < 0 { // the look at the dial: no member yet
 		t.Fatalf("first view %+v", views[0])
+	}
+	if len(views[1].Members) != 1 || views[1].Members[0].Pipes != 1 { // the look after the first member joined
+		t.Fatalf("second view %+v", views[1])
 	}
 	v := views[len(views)-1]
 	if v.SinceLastDial < 0 || len(v.Members) != 2 || !v.Members[0].Usable || !v.Members[1].Usable {
