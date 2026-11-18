@@ -2,10 +2,10 @@ go 1.27
 
 use (
 	.
+	./examples/xorpipe
+	./interop/webpeer
+	./seal
 	./zmuxh3
 	./zmuxquic
 	./zmuxws
-	./seal
-	./examples/xorpipe
-	./interop/webpeer
 )
