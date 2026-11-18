@@ -237,6 +237,16 @@ for {
 }
 ```
 
+`NextEvent` reads a queue that holds at most one unread event per key (a
+pipe's state of one direction, a tier, a kind of session event) and never
+drops one: a new occurrence of a key updates its unread event and moves it
+to the tail, so events come in the order of the keys' latest occurrences and
+the last one read of a key is its latest state. `EventJoinAuthFailed` counts
+the failures of its reason in `Count`, and `EventPipesRetired` is the one
+report of retired pipes. A `Config.Tracer` instead receives every
+occurrence, through a backlog of 256 events per session; `Tracer.Dropped`
+says how many it lost, and `Tracer.Closed` is always the last call.
+
 The runtime settings in `PipeOptions` (`SendPriority`, `ReceivePriority`,
 `SendStandby`, `ReceiveStandby`, `Weight`, `Probation`, `Liveness`,
 `QualityBand`) and its `RecordMode` are `zmux.Change` values, the types of

@@ -311,6 +311,7 @@ func (c *Conn) unlockWith(r any) {
 // every attachment to abort: its core queued no carrier command for them.
 func (c *Conn) recordEndLocked() []*pipeDrv {
 	c.closing = true
+	c.events.freeze() // CLOSED: nothing more enters the queue or the tracer's view
 	c.err = sessionErr(c.s.Err())
 	if c.err == nil {
 		c.err = &TransportError{ErrorCode: TransportInternalError, ErrorMessage: "internal error"}
@@ -377,6 +378,7 @@ func (c *Conn) salvage(released *bool) {
 				_ = c.recordEndLocked()
 			}()
 			c.closing = true
+			c.events.freeze()
 		}
 		// Every attachment is aborted: the torn core's commands are lost.
 		abort = make([]*pipeDrv, 0, len(c.pipes))
@@ -1430,6 +1432,11 @@ type ConnectionStats struct {
 	// datagram limiter dropped, either way.
 	DatagramsDroppedSend, DatagramsDroppedRecv, DatagramsDroppedLimit uint64
 
+	// LogLinesDropped counts the warnings not delivered to Config.Logger
+	// because the session's queue of 256 lines was full (the Logger blocked
+	// or slow); it is not configurable.
+	LogLinesDropped uint64
+
 	NoEffectBudget uint64 // gauge: tokens of the no-effect budget
 
 	// The RTT of pipe 0 outside multipath, of the primary pipe in a
@@ -1497,7 +1504,7 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		JoinAuthFailures: s.JoinAuthFailures, JoinReplays: s.JoinReplays, JoinPending: s.JoinPending, JoinFailures: c.s.JoinFailures(), JoinBatchDropped: s.JoinBatchDropped, JoinRefusals: s.JoinRefusals,
 		Suspensions: s.Suspensions, SuspendedTime: time.Duration(s.SuspendedTime),
 		SchedulerAnswers: s.SchedulerAnswers, SchedulerFallbacks: s.SchedulerFallbacks,
-		FirstFlightTimeouts: c.firstTimeouts}
+		FirstFlightTimeouts: c.firstTimeouts, LogLinesDropped: c.hk.logLinesDropped()}
 }
 
 // ReleaseFirstFlight ends EarlyData.HoldFirstFlight: everything queued so

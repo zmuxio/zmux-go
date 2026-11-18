@@ -35,7 +35,7 @@ type PipeInfo struct {
 
 	SendPriority    uint64
 	PrioritySource  string // local, peer, default
-	StandbySource   string
+	StandbySource   string // local, peer, default
 	ReceivePriority uint64
 	StatusSeq       uint64
 	PeerPriority    uint64
@@ -121,7 +121,7 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 	pi.HasOut, pi.HasIn = p.out != nil, p.in != nil
 	pi.SinceLastTraffic = s.sinceTraffic(p)
 	pi.OutState, pi.InState, _ = s.PipeState(id)
-	pi.PrioritySource, pi.StandbySource = "default", "default"
+	pi.PrioritySource, pi.StandbySource = SourceDefault, SourceDefault
 	pi.Weight = 1
 	if p.out != nil {
 		d := p.out
@@ -176,18 +176,8 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 	pi.Revalidating = a.reval
 	pi.SuspectCount, pi.FailureCount = a.suspects, a.failures
 	pi.SendPriority, pi.Standby = a.effPrio()
-	switch {
-	case a.sendPrio != nil:
-		pi.PrioritySource = "local"
-	case a.peerSeq > 0 || a.peerPrio != 0:
-		pi.PrioritySource = "peer"
-	}
-	switch {
-	case a.sendStandby != nil:
-		pi.StandbySource = "local"
-	case a.peerSeq > 0 || a.peerStandby:
-		pi.StandbySource = "peer"
-	}
+	pi.PrioritySource = a.prioSource()
+	pi.StandbySource = a.standbySource()
 	pi.ReceivePriority, pi.ReceiveStandby, pi.StatusSeq = a.recvPrio, a.recvStandby, a.statusSeq
 	pi.PeerRequest, pi.PeerStandby, pi.PeerPriority = a.peerSeq > 0, a.peerStandby, a.peerPrio
 	pi.Weight = a.weight

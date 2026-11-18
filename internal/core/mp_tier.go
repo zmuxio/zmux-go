@@ -524,7 +524,7 @@ func (s *Session) emitPriority(p *Pipe) {
 		return
 	}
 	pr, sb := p.mp.effPrio()
-	s.emit(Event{Kind: EvPipePriority, Pipe: p.id, Code: pr, Saturated: sb, Count: p.mp.weight})
+	s.emit(Event{Kind: EvPipePriority, Pipe: p.id, Code: pr, Saturated: sb, Count: p.mp.weight, Source: p.mp.prioSource()})
 }
 
 // statusReq is one PIPE_STATUS owed.

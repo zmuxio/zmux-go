@@ -2,7 +2,6 @@ package zmux
 
 import (
 	"context"
-	"slices"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -33,13 +32,15 @@ const (
 	// (Pipe, Direction). Retirement is reported by EventPipesRetired.
 	EventPipeClosed
 	// EventPipePriorityChanged reports that the effective tier, standby state
-	// or weight of an outbound pipe changed (Pipe, Priority, Standby, Weight).
+	// or weight of an outbound pipe changed (Pipe, Priority, Standby, Weight,
+	// Source).
 	EventPipePriorityChanged
 	// EventTierSaturation reports that the usable pipes of a tier became
 	// saturated or stopped being so (Priority, Saturated).
 	EventTierSaturation
-	// EventJoinAuthFailed reports that a join failed authentication
-	// (Reason).
+	// EventJoinAuthFailed reports that joins failed authentication for a
+	// Reason (Reason, Count: the failures of that reason since the event
+	// was last read).
 	EventJoinAuthFailed
 	// EventSessionSuspended reports that every pipe of a direction was lost and
 	// the session waits for a resume (no fields).
@@ -55,7 +56,8 @@ const (
 	// MaintainPipes pool, so it ends at its resume timeout unless the
 	// application adds a pipe (no fields). It is also logged as a warning
 	// (Config.Logger). An application that resumes with its own AddPipe
-	// calls reacts to EventSessionSuspended and can ignore it.
+	// calls reacts to EventSessionSuspended and can ignore it. An unread
+	// one leaves the queue when EventSessionResumed occurs.
 	EventResumeUnattended
 	// EventPipeQualityChanged reports that an outbound pipe left its
 	// QualityBand (Pipe, SmoothedRTT, DeliveryRate).
@@ -73,9 +75,9 @@ const (
 	// later switch to another kind (Carrier).
 	EventCarrierChosen
 	// EventPipesRetired is the one report of retirement (Retired, Failed,
-	// Closed, Dropped, Last): it enters the queue at the first retirement
-	// after the previous one was read and accumulates until it is read, the
-	// unread events of each retired pipe leaving the queue for it.
+	// Closed, Last): it enters the queue at the first retirement after the
+	// previous one was read and accumulates until it is read, the unread
+	// events of each retired pipe leaving the queue for it.
 	EventPipesRetired
 	// EventEpochCommitted reports that the session committed an epoch (Epoch):
 	// its secret is known, and joins of it are accepted.
@@ -136,6 +138,10 @@ type Event struct {
 	Outcome CandidateOutcome
 	// Epoch of EventEpochCommitted and EventEpochDeleted.
 	Epoch uint64
+	// Count of EventJoinAuthFailed: the failures with its Reason since the
+	// event was last read, at least 1 (a Tracer gets one event per
+	// failure, with Count 1).
+	Count uint64
 	// Variant is the PipeIO.Variant of a pipe event's carrier while the
 	// pipe has one, and the candidate's of EventCarrierCandidate and
 	// EventCarrierChosen.
@@ -144,9 +150,12 @@ type Event struct {
 	PipeID PipeID
 	// Priority is the tier (EventPipePriorityChanged,
 	// EventTierSaturation); Weight the pipe's weight
-	// (EventPipePriorityChanged).
+	// (EventPipePriorityChanged); Source where the priority comes from, as
+	// PipeStats.SendPrioritySource says: "local" (a setting of this
+	// endpoint), "peer" (the peer's request) or "default".
 	Priority uint64
 	Weight   uint64
+	Source   string
 	// GoAway of EventGoAwayReceived.
 	GoAway *GoAway
 	// SmoothedRTT and DeliveryRate (bytes per second) of
@@ -157,77 +166,200 @@ type Event struct {
 	DeliveryRate uint64
 	// Retired counts the pipes retired since EventPipesRetired was last
 	// read; Failed and Closed, of those, the ones whose failure or end
-	// without failure had not been read; Dropped the non-terminal events
-	// the queue's bound dropped meanwhile; Last the IDs of the last
-	// retired pipes, at most four, oldest first. An application that
-	// needs every retired ID compares Pipes with the handles it holds.
-	Retired, Failed, Closed, Dropped uint64
-	Last                             []PipeID
+	// without failure had not been read; Last the IDs of the last retired
+	// pipes, at most four, oldest first. An application that needs every
+	// retired ID compares Pipes with the handles it holds. A Tracer gets
+	// one event per retired pipe (Retired 1, Last that pipe, Failed 1 if
+	// the pipe failed, else Closed 1).
+	Retired, Failed, Closed uint64
+	Last                    []PipeID
 }
 
 // retiredLast is the number of IDs EventPipesRetired keeps.
 const retiredLast = 4
 
+// terminal reports a pipe's terminal event.
+func terminal(k EventKind) bool { return k == EventPipeFailed || k == EventPipeClosed }
+
+// eventKey identifies the one unread event a queue holds for it (the event key
+// table): the kind plus what distinguishes the occurrences of the
+// kind. Fields a kind does not use are zero.
+type eventKey struct {
+	variant string // CarrierCandidate
+	pipe    uint64 // the pipe events
+	prio    uint64 // TierSaturation
+	kind    EventKind
+	dir     Direction // Suspect, Recovered, Failed, Closed
+	carrier CarrierKind
+	reason  JoinAuthReason
+}
+
+// pipeKeys lists the events keyed by pipe, and whether their key holds the
+// direction: the keys a retired pipe leaves the queue with.
+var pipeKeys = [...]struct {
+	kind EventKind
+	dir  bool
+}{
+	{EventPipeAdded, false}, {EventPipeJoined, false}, {EventPipePriorityChanged, false},
+	{EventPipeQualityChanged, false}, {EventPipeSuspect, true}, {EventPipeRecovered, true},
+	{EventPipeFailed, true}, {EventPipeClosed, true},
+}
+
 // pipeEvent reports whether events of kind k belong to a pipe (Pipe set).
 func pipeEvent(k EventKind) bool {
-	switch k {
-	case EventPipeAdded, EventPipeJoined, EventPipeSuspect, EventPipeRecovered, EventPipeFailed, EventPipeClosed,
-		EventPipePriorityChanged, EventPipeQualityChanged:
-		return true
-	case EventTierSaturation, EventJoinAuthFailed, EventSessionSuspended, EventSessionResumed,
-		EventGoAwayReceived, EventResumeUnattended, EventCapacityBelow, EventCapacityRestored,
-		EventCarrierCandidate, EventCarrierChosen, EventPipesRetired, EventEpochCommitted, EventEpochDeleted:
-		return false
+	for _, p := range pipeKeys {
+		if p.kind == k {
+			return true
+		}
 	}
 	return false
 }
 
-// terminal reports a pipe's terminal event, which the queue's bound keeps.
-func terminal(k EventKind) bool { return k == EventPipeFailed || k == EventPipeClosed }
-
-// eventQueue holds session events for NextEvent; it is guarded by the
-// session lock. It is bounded (eventQueueMax): when the application does
-// not read events, the oldest non-terminal ones are dropped and counted;
-// a retired pipe's unread events are folded into one EventPipesRetired,
-// so the queue stays bounded however many pipes
-// a session goes through.
-type eventQueue struct {
-	seenOut map[uint64]core.OutState
-	dirs    map[uint64]uint8 // per pipe: dirInSeen, dirInEnded, dirOutEnded
-	q       []Event
-	waiters []*core.Signal
-	fresh   []Event // events added in this drain, for the tracer
-	dropped uint64  // non-terminal events dropped and not yet in a summary
+// keyOf returns the key of ev.
+func keyOf(ev *Event) eventKey {
+	k := eventKey{kind: ev.Kind}
+	for _, p := range pipeKeys {
+		if p.kind == ev.Kind {
+			k.pipe = uint64(ev.PipeID)
+			if p.dir {
+				k.dir = ev.Direction
+			}
+			return k
+		}
+	}
+	switch ev.Kind {
+	case EventTierSaturation:
+		k.prio = ev.Priority
+	case EventJoinAuthFailed:
+		k.reason = ev.Reason
+	case EventCarrierCandidate:
+		k.carrier, k.variant = ev.Carrier, ev.Variant
+	case EventPipeAdded, EventPipeJoined, EventPipeSuspect, EventPipeRecovered, EventPipeFailed, EventPipeClosed,
+		EventPipePriorityChanged, EventPipeQualityChanged, EventSessionSuspended, EventSessionResumed,
+		EventGoAwayReceived, EventResumeUnattended, EventCapacityBelow, EventCapacityRestored, EventCarrierChosen,
+		EventPipesRetired, EventEpochCommitted, EventEpochDeleted:
+		// Keyed by the kind alone (the pipe events above by their entry in pipeKeys).
+	}
+	return k
 }
 
-const eventQueueMax = 1024
+// keepFirst reports the kinds whose unread event a later occurrence of the
+// key leaves as it is: each occurs once per pipe (direction).
+func keepFirst(k EventKind) bool {
+	return k == EventPipeAdded || k == EventPipeJoined || terminal(k)
+}
 
-// Bits of eventQueue.dirs: an inbound direction was reported, and the
-// terminal event of a direction entered the queue.
+// eventNode is the one unread event of a key, on the queue's list.
+type eventNode struct {
+	prev, next *eventNode
+	key        eventKey
+	ev         Event
+}
+
+// eventQueue holds session events for NextEvent; it is guarded by the
+// session lock. It is the keyed queue of the event key table: a map from
+// key to a node of one list in the order of the keys' latest occurrences.
+// It holds at most one unread event per key and never drops one, so its
+// size is bounded by what the session holds (pipes, tiers, carrier
+// candidates) plus a fixed number of keys; a retired pipe's keys leave it.
+type eventQueue struct {
+	idx        map[eventKey]*eventNode
+	seenOut    map[uint64]core.OutState
+	dirs       map[uint64]uint8 // per pipe: dirInEnded, dirOutEnded
+	head, tail *eventNode
+	waiters    []*core.Signal
+	fresh      []Event // occurrences in this drain, for the tracer and the waiters
+	frozen     bool    // the session is CLOSED: nothing more enters
+}
+
+// Bits of eventQueue.dirs: the terminal event of a direction entered the
+// queue.
 const (
-	dirInSeen uint8 = 1 << iota
-	dirInEnded
+	dirInEnded uint8 = 1 << iota
 	dirOutEnded
 )
 
-// keptEvent reports the events the queue's bound never drops: terminal
-// events and the retirement summary.
-func keptEvent(k EventKind) bool { return terminal(k) || k == EventPipesRetired }
+// freeze ends what enters the queue and the tracer's view: the session is
+// CLOSED (what is queued is still read).
+func (e *eventQueue) freeze() { e.frozen = true }
 
-func (e *eventQueue) push(ev Event) {
-	if len(e.q) >= eventQueueMax {
-		i := slices.IndexFunc(e.q, func(x Event) bool { return !keptEvent(x.Kind) })
-		if i < 0 && !keptEvent(ev.Kind) {
-			// Only kept events are queued: the new one is dropped. Kept
-			// events stay bounded, as retirement folds a pipe's away.
-			e.drop()
-			return
-		}
-		if i >= 0 {
-			e.q = slices.Delete(e.q, i, i+1)
-			e.drop()
-		}
+func (e *eventQueue) link(n *eventNode) {
+	n.prev = e.tail
+	if e.tail != nil {
+		e.tail.next = n
+	} else {
+		e.head = n
 	}
+	e.tail = n
+}
+
+func (e *eventQueue) unlink(n *eventNode) {
+	if n.prev != nil {
+		n.prev.next = n.next
+	} else {
+		e.head = n.next
+	}
+	if n.next != nil {
+		n.next.prev = n.prev
+	} else {
+		e.tail = n.prev
+	}
+	n.prev, n.next = nil, nil
+}
+
+// remove takes the unread event of k off the queue, if any.
+func (e *eventQueue) remove(k eventKey) *eventNode {
+	n := e.idx[k]
+	if n != nil {
+		e.unlink(n)
+		delete(e.idx, k)
+	}
+	return n
+}
+
+// touch returns the node of k, appended at the tail when the key had none
+// and moved there otherwise (isNew: it had none).
+func (e *eventQueue) touch(k eventKey) (n *eventNode, isNew bool) {
+	if n = e.idx[k]; n != nil {
+		e.unlink(n)
+		e.link(n)
+		return n, false
+	}
+	if e.idx == nil {
+		e.idx = map[eventKey]*eventNode{}
+	}
+	n = &eventNode{key: k}
+	e.idx[k] = n
+	e.link(n)
+	return n, true
+}
+
+// len is the number of unread events.
+func (e *eventQueue) len() int { return len(e.idx) }
+
+// pop takes the oldest unread event.
+func (e *eventQueue) pop() (Event, bool) {
+	n := e.head
+	if n == nil {
+		return Event{}, false
+	}
+	e.unlink(n)
+	delete(e.idx, n.key)
+	return n.ev, true
+}
+
+// push records an occurrence of ev: it is appended at the tail, or, when
+// its key has an unread event, merged into it as the event key table says
+// and moved to the tail. The tracer and the waiters see every occurrence
+// (fresh).
+func (e *eventQueue) push(ev Event) {
+	if e.frozen {
+		return
+	}
+	if ev.Kind == EventJoinAuthFailed && ev.Count == 0 {
+		ev.Count = 1
+	}
+	e.fresh = append(e.fresh, ev)
 	if terminal(ev.Kind) {
 		bit := dirOutEnded
 		if ev.Direction == DirectionReceiveOnly {
@@ -235,17 +367,22 @@ func (e *eventQueue) push(ev Event) {
 		}
 		e.mark(uint64(ev.PipeID), bit)
 	}
-	e.q = append(e.q, ev)
-	e.fresh = append(e.fresh, ev)
-}
-
-// drop counts a dropped event, in the unread summary when there is one.
-func (e *eventQueue) drop() {
-	if i := slices.IndexFunc(e.q, func(x Event) bool { return x.Kind == EventPipesRetired }); i >= 0 {
-		e.q[i].Dropped++
+	if ev.Kind == EventSessionResumed {
+		e.remove(eventKey{kind: EventResumeUnattended}) // stale once resumed
+	}
+	k := keyOf(&ev)
+	if n := e.idx[k]; n != nil && keepFirst(ev.Kind) {
 		return
 	}
-	e.dropped++
+	n, isNew := e.touch(k)
+	switch {
+	case isNew:
+		n.ev = ev
+	case ev.Kind == EventJoinAuthFailed:
+		n.ev.Count += ev.Count
+	default:
+		n.ev = ev
+	}
 }
 
 // mark sets bits of a pipe's dirs.
@@ -257,47 +394,59 @@ func (e *eventQueue) mark(id uint64, bits uint8) {
 }
 
 // retire folds the unread events of a retired pipe into the queue's
-// EventPipesRetired, adding one when none is unread, and returns the
-// retirement alone for a tracer.
-func (e *eventQueue) retire(id uint64, failed bool) Event {
-	// A terminal state that never entered the queue was not read: that of
-	// a reported direction without its terminal event, or any when nothing
-	// terminal of the pipe was ever queued.
-	d := e.dirs[id]
-	_, outSeen := e.seenOut[id]
-	unreadEnd := outSeen && d&dirOutEnded == 0 || d&dirInSeen != 0 && d&dirInEnded == 0 ||
-		d&(dirInEnded|dirOutEnded) == 0
-	e.q = slices.DeleteFunc(e.q, func(x Event) bool {
-		if uint64(x.PipeID) != id || !pipeEvent(x.Kind) {
-			return false
-		}
-		unreadEnd = unreadEnd || terminal(x.Kind)
-		return true
-	})
+// EventPipesRetired, adding one when none is unread; the tracer gets the
+// retirement alone (Retired 1, Failed or Closed 1, by the pipe's own
+// failure flag, whether or not its end was read). The queue counts the
+// pipe, in Failed when failed and in Closed otherwise, only when the
+// application read none of its terminal events; a terminal event that
+// never entered the queue was not read.
+func (e *eventQueue) retire(id uint64, failed bool) {
+	queued := e.dirs[id] & (dirInEnded | dirOutEnded) // terminal events that entered the queue
 	delete(e.dirs, id)
 	delete(e.seenOut, id)
+	if e.frozen {
+		return
+	}
+	var unread uint8 // of those, the ones still in the queue
+	for _, p := range pipeKeys {
+		dirs := [...]Direction{DirectionBidirectional, DirectionSendOnly, DirectionReceiveOnly}
+		n := 1 // keys without a direction hold the zero value
+		if p.dir {
+			n = len(dirs)
+		}
+		for _, dir := range dirs[:n] {
+			if e.remove(eventKey{kind: p.kind, pipe: id, dir: dir}) != nil && terminal(p.kind) {
+				if dir == DirectionReceiveOnly {
+					unread |= dirInEnded
+				} else {
+					unread |= dirOutEnded
+				}
+			}
+		}
+	}
+	unreadEnd := queued&^unread == 0 // no queued terminal event was read (none queued counts)
 	one := Event{Kind: EventPipesRetired, Retired: 1, Last: []PipeID{PipeID(id)}}
-	if unreadEnd && failed {
+	if failed {
 		one.Failed = 1
-	} else if unreadEnd {
+	} else {
 		one.Closed = 1
 	}
-	i := slices.IndexFunc(e.q, func(x Event) bool { return x.Kind == EventPipesRetired })
-	if i < 0 {
-		e.q = append(e.q, Event{Kind: EventPipesRetired})
-		i = len(e.q) - 1
+	e.fresh = append(e.fresh, one)
+	n, isNew := e.touch(eventKey{kind: EventPipesRetired})
+	if isNew {
+		n.ev = Event{Kind: EventPipesRetired}
 	}
-	sum := &e.q[i]
+	sum := &n.ev
 	sum.Retired++
-	sum.Failed += one.Failed
-	sum.Closed += one.Closed
-	sum.Dropped += e.dropped
-	e.dropped = 0
-	sum.Last = append(sum.Last, PipeID(id))
-	if n := len(sum.Last); n > retiredLast {
-		sum.Last = append(sum.Last[:0], sum.Last[n-retiredLast:]...)
+	if unreadEnd && failed {
+		sum.Failed++
+	} else if unreadEnd {
+		sum.Closed++
 	}
-	return one
+	sum.Last = append(sum.Last, PipeID(id))
+	if l := len(sum.Last); l > retiredLast {
+		sum.Last = append(sum.Last[:0], sum.Last[l-retiredLast:]...)
+	}
 }
 
 // endPipeLocked records how pipe id ended and releases its waiters.
@@ -343,7 +492,7 @@ func (c *Conn) drainEventsLocked() {
 		case core.EvPipeState:
 			c.pipeStateEvent(e)
 		case core.EvJoinAuthFailed:
-			q.push(Event{Kind: EventJoinAuthFailed, Reason: JoinAuthReason(e.Reason)})
+			q.push(Event{Kind: EventJoinAuthFailed, Reason: JoinAuthReason(e.Reason), Count: 1})
 		case core.EvEstablished:
 			c.hk.trace(traceItem{est: true})
 		case core.EvSuspended:
@@ -378,7 +527,7 @@ func (c *Conn) drainEventsLocked() {
 			q.push(Event{Kind: EventCapacityRestored, DeliveryRate: rateBytes(e.Rate)})
 		case core.EvPipePriority:
 			q.push(Event{Kind: EventPipePriorityChanged, PipeID: PipeID(e.Pipe), Priority: e.Code, Standby: e.Saturated,
-				Weight: e.Count, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
+				Weight: e.Count, Source: e.Source, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
 		case core.EvPipeAttached:
 			c.firePipeWaiters() // WaitAttached and the pool
 		case core.EvJoinKeys:
@@ -438,8 +587,6 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 	c.firePipeWaiters()
 	if e.Dir != core.DirOut {
 		switch e.InState {
-		case core.InJoining, core.InOpen:
-			q.mark(e.Pipe, dirInSeen)
 		case core.InRetired:
 			c.endPipeLocked(e.Pipe, e.Failed, e.Cause)
 			if e.Pipe != 0 {
@@ -447,14 +594,14 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 				// carrier commands of this one have run.
 				c.retiredIDs = append(c.retiredIDs, e.Pipe)
 			}
-			q.fresh = append(q.fresh, q.retire(e.Pipe, e.Failed))
+			q.retire(e.Pipe, e.Failed)
 		case core.InEnded:
 			if q.dirs[e.Pipe]&dirInEnded == 0 {
 				q.push(Event{Kind: EventPipeClosed, PipeID: PipeID(e.Pipe), Direction: DirectionReceiveOnly,
 					Carrier: CarrierKind(e.Carrier), Variant: c.variantLocked(e.Pipe)})
 			}
-		case core.InNone:
-			// No inbound direction: nothing to report.
+		case core.InNone, core.InJoining, core.InOpen:
+			// No inbound direction, or one not ended: nothing to report.
 		}
 		return
 	}
@@ -492,23 +639,23 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 // ctx ends or the session ends. Once the session has ended and no event is
 // left it returns the session's error.
 //
-// Events wait in a queue of the session bounded at 1024 events. Reading it
-// is optional: when nobody calls NextEvent the oldest events are dropped,
-// so a reader that falls
-// behind sees the latest events and can read the current state with
-// PipeStats. The queue is independent of Config.Tracer: a Tracer receives
-// every event as well, on its own bounded queue, whether or not NextEvent
+// Events wait in a keyed queue: at most one unread event per key (a pipe's
+// state of one direction, a tier, a carrier candidate, a kind of session
+// event), which a new occurrence of the key updates and moves to the tail,
+// so events are read in the order of their keys' latest occurrences and the
+// last one read of a key is its latest state. The queue never drops an
+// event and needs no bound of its own: its keys are those of the pipes,
+// tiers and candidates the session holds, and a retired pipe's keys leave
+// it for EventPipesRetired. Reading it is optional. Once the session has
+// ended nothing more enters it. It is independent of Config.Tracer, which
+// receives every occurrence, on its own backlog, whether or not NextEvent
 // is called. Concurrent callers each receive different events.
 func (c *Conn) NextEvent(ctx context.Context) (Event, error) {
 	sig := core.NewSignal()
 	for {
 		c.lock()
 		q := &c.events
-		if len(q.q) > 0 {
-			ev := q.q[0]
-			copy(q.q, q.q[1:])
-			q.q[len(q.q)-1] = Event{}
-			q.q = q.q[:len(q.q)-1]
+		if ev, ok := q.pop(); ok {
 			c.unlock()
 			return ev, nil
 		}

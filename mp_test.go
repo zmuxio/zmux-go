@@ -250,7 +250,7 @@ func TestMultipathEventsAndStats(t *testing.T) {
 			t.Fatal(err)
 		}
 		if ev.Kind == EventPipePriorityChanged {
-			if ev.PipeID != p.ID() || ev.Priority != 5 {
+			if ev.PipeID != p.ID() || ev.Priority != 5 || ev.Source != "local" {
 				t.Fatalf("event %+v", ev)
 			}
 			break
@@ -471,5 +471,47 @@ func TestPipesRetiredEvent(t *testing.T) {
 	}
 	if sum == nil || sum.Retired != 1 || sum.Failed != 1 || !slices.Equal(sum.Last, []PipeID{p.ID()}) {
 		t.Fatalf("summary %+v", sum)
+	}
+}
+
+// EventPipePriorityChanged names where the priority comes from: a setting
+// of this endpoint is "local", the peer's request "peer", and the source
+// agrees with PipeStats.SendPrioritySource.
+func TestPriorityChangedSource(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	p := e.addPipe(t, PipeOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	next := func(c *Conn, prio uint64) Event {
+		t.Helper()
+		for {
+			ev, err := c.NextEvent(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ev.Kind == EventPipePriorityChanged && ev.PipeID == p.ID() && ev.Priority == prio {
+				return ev
+			}
+		}
+	}
+	// The client requests a priority of the server's outbound direction.
+	if err := p.Update(PipeUpdate{ReceivePriority: Set[uint64](6)}); err != nil {
+		t.Fatal(err)
+	}
+	if ev := next(e.server, 6); ev.Source != "peer" {
+		t.Fatalf("the peer's request reported as %q", ev.Source)
+	}
+	for _, ps := range e.server.PipeStats() {
+		if ps.PipeID == p.ID() && ps.SendPrioritySource != "peer" {
+			t.Fatalf("stats say %q", ps.SendPrioritySource)
+		}
+	}
+	// A local setting wins over the request.
+	if err := p.Update(PipeUpdate{SendPriority: Set[uint64](2)}); err != nil {
+		t.Fatal(err)
+	}
+	if ev := next(e.client, 2); ev.Source != "local" {
+		t.Fatalf("a local setting reported as %q", ev.Source)
 	}
 }

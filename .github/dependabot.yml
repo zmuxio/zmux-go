@@ -17,6 +17,7 @@ updates:
       - /seal
       - /zmuxws
       - /examples/xorpipe
+      - /interop/dgpeer
       - /interop/webpeer
     schedule:
       interval: weekly

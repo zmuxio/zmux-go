@@ -21,6 +21,37 @@ func (a *attach) effPrio() (uint64, bool) {
 	return pr, sb
 }
 
+// Sources of an effective setting, as PipeInfo and EvPipePriority report them.
+const (
+	SourceDefault = "default"
+	SourceLocal   = "local"
+	SourcePeer    = "peer"
+)
+
+// prioSource is where effPrio's priority comes from: the local setting, the
+// peer's request, or the default.
+func (a *attach) prioSource() string {
+	switch {
+	case a.sendPrio != nil:
+		return SourceLocal
+	case a.peerSeq > 0 || a.peerPrio != 0:
+		return SourcePeer
+	}
+	return SourceDefault
+}
+
+// standbySource is where effPrio's standby flag comes from, by the same
+// sources as prioSource.
+func (a *attach) standbySource() string {
+	switch {
+	case a.sendStandby != nil:
+		return SourceLocal
+	case a.peerSeq > 0 || a.peerStandby:
+		return SourcePeer
+	}
+	return SourceDefault
+}
+
 // minRTT is min_rtt_p, or the smoothed initial value before a sample.
 func (a *attach) minRTT() Duration {
 	if a.rtt.has {

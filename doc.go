@@ -72,9 +72,12 @@
 // # Events
 //
 // Pipe changes and other session events (EventKind) can be read with
-// Conn.NextEvent, or received with a Config.Tracer; both are optional and
-// bounded, and the current state is always available from Conn.PipeStats
-// and Conn.ConnectionState.
+// Conn.NextEvent, or received with a Config.Tracer; both are optional. The
+// NextEvent queue holds at most one unread event per key (a pipe's state, a
+// tier, a kind of session event) and never drops one; a Tracer sees every
+// occurrence on a backlog of 256 events per session and is told how many it
+// lost. The current state is always available from Conn.PipeStats and
+// Conn.ConnectionState.
 //
 // # Errors
 //

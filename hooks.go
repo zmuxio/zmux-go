@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -16,20 +17,29 @@ import (
 
 // Tracer receives session events. Its functions
 // run serially and in order on a goroutine of the session, never under a
-// lock; the session never waits for them: a bounded queue holds events,
-// and on overflow the events other than Closed are dropped and counted.
-// Wait and Done do not wait for them either (nor for Pick or
+// lock; the session never waits for them: each session has a backlog of
+// 256 events, fixed and not configurable, and an event that finds it full
+// is dropped and counted (the Tracer observes; an application that must not lose
+// events reads NextEvent, whose queue never drops). Established, Dropped
+// and Closed take no room of the backlog and are never dropped. Wait and
+// Done do not wait for the Tracer (nor for Pick or
 // AllowConnectionWindowIncrease), so a hook may call Wait or Done; Closed
 // may run after Wait returned.
 type Tracer struct {
-	// Established: the peer's transport parameters were processed.
+	// Established: the peer's transport parameters were processed. It is
+	// the first call.
 	Established func(id SessionID)
-	// Event: a pipe or session event (as NextEvent reports them).
+	// Event: each occurrence of a pipe or session event, before NextEvent's
+	// queue merges it: a JoinAuthFailed has Count 1, and every retired pipe
+	// is one EventPipesRetired.
 	Event func(id SessionID, ev Event)
 	// Dropped: this many of the session's events were lost since the
-	// previous call because its trace backlog was full.
+	// previous call because its backlog was full. It is called where the
+	// lost events stood: before the next event the backlog accepted, or
+	// before Closed, never after it.
 	Dropped func(id SessionID, count uint64)
-	// Closed: the session ended; nothing of it follows.
+	// Closed: the session ended. It is the last call: nothing follows it,
+	// and what occurs after the session ended is not traced.
 	Closed func(id SessionID, err error)
 }
 
@@ -92,8 +102,13 @@ type customPolicy struct{ p Pick }
 
 func (customPolicy) policy() core.Policy { return core.PolicyCustom }
 
-// hookQueueMax bounds the tracer queue.
-const hookQueueMax = 256
+// traceBacklog is the tracer's backlog per session: the events waiting for
+// the Tracer, fixed. The established, dropped and closed calls take none of it.
+const traceBacklog = 256
+
+// warnQueueMax bounds the warnings waiting for the Logger per session: a
+// warning arriving at a full queue is dropped and counted (LogLinesDropped).
+const warnQueueMax = 256
 
 // hooks runs the application's hooks of one session on two goroutines of
 // their own, each started when its first hook is needed (an idle session
@@ -109,18 +124,25 @@ type hooks struct {
 	log   *slog.Logger
 	warns []string // warnings for log, queued under the session lock
 
-	q       []traceItem
-	dropped uint64
+	logLost uint64      // warnings dropped at a full queue (ConnectionStats.LogLinesDropped)
+	q       []traceItem // from qh: the calls waiting for the Tracer
+	qh      int
+	nev     int // the events among them: the backlog's fill
 	mu      sync.Mutex
 	wantWin bool
 	wantPk  bool
 	decRun  bool // the decision goroutine runs
 	trRun   bool // the trace goroutine runs
+	estQ    bool // the established call is queued: events may be delivered
+	ended   bool // the closed call is queued: nothing follows it
 }
 
+// traceItem is one call of the Tracer: established, closed, dropped (lost
+// events) or an event.
 type traceItem struct {
 	err    error
 	ev     Event
+	lost   uint64
 	est    bool
 	closed bool
 }
@@ -148,10 +170,22 @@ func (h *hooks) warn(msg string) {
 		return
 	}
 	h.mu.Lock()
-	if len(h.warns) < hookQueueMax {
+	if len(h.warns) < warnQueueMax {
 		h.warns = append(h.warns, msg)
+	} else {
+		h.logLost++
 	}
 	h.mu.Unlock()
+}
+
+// logLinesDropped is the count of warnings dropped at a full queue; h may be nil.
+func (h *hooks) logLinesDropped() uint64 {
+	if h == nil {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.logLost
 }
 
 // logger is h's Config.Logger; h may be nil.
@@ -162,18 +196,57 @@ func (h *hooks) logger() *slog.Logger {
 	return h.log
 }
 
-// trace queues a tracer item (under the session lock; the leaf lock only).
+// trace queues a tracer call (under the session lock; the leaf lock only).
+// established goes first and closed last, neither takes room of the
+// backlog, and nothing is queued after closed. An event that finds the
+// backlog full is lost: the count stands where it would have been, and is
+// delivered before the next event the backlog accepts or before closed.
 func (h *hooks) trace(it traceItem) {
 	if h == nil || h.tr == nil {
 		return
 	}
 	h.mu.Lock()
-	if len(h.q) >= hookQueueMax && !it.closed {
-		h.dropped++
-	} else {
+	defer h.mu.Unlock()
+	switch {
+	case h.ended:
+		return
+	case it.closed:
+		h.ended = true
+		h.q = append(h.q, it)
+	case it.est:
+		h.estQ = true
+		h.q = slices.Insert(h.q, h.qh, it)
+	case h.nev >= traceBacklog:
+		if n := len(h.q); n > h.qh && h.q[n-1].lost > 0 {
+			h.q[n-1].lost++
+		} else {
+			h.q = append(h.q, traceItem{lost: 1})
+		}
+	default:
+		h.nev++
 		h.q = append(h.q, it)
 	}
-	h.mu.Unlock()
+}
+
+// next takes the next call for the Tracer, if one may be delivered: events
+// wait for established, which is the first call.
+func (h *hooks) next() (traceItem, bool) {
+	if h.qh >= len(h.q) || !h.estQ && !h.ended {
+		return traceItem{}, false
+	}
+	it := h.q[h.qh]
+	h.q[h.qh] = traceItem{}
+	h.qh++
+	if h.qh == len(h.q) {
+		h.q, h.qh = h.q[:0], 0
+	} else if h.qh >= traceBacklog {
+		h.q = h.q[:copy(h.q, h.q[h.qh:])]
+		h.qh = 0
+	}
+	if !it.est && !it.closed && it.lost == 0 {
+		h.nev--
+	}
+	return it, true
 }
 
 // note records the work the critical section left for the hooks.
@@ -196,7 +269,7 @@ func (h *hooks) start() {
 	}
 	h.mu.Lock()
 	dec := (h.wantWin || h.wantPk) && !h.decRun
-	tr := (len(h.q) > 0 || h.dropped > 0 || len(h.warns) > 0) && !h.trRun
+	tr := (len(h.warns) > 0 || h.qh < len(h.q) && (h.estQ || h.ended)) && !h.trRun
 	h.decRun = h.decRun || dec
 	h.trRun = h.trRun || tr
 	h.mu.Unlock()
@@ -224,13 +297,15 @@ func (h *hooks) runDecide() {
 	}
 }
 
-// runTrace delivers the warnings and trace items until none is queued.
+// runTrace delivers the warnings and the tracer's calls until none is
+// queued.
 func (h *hooks) runTrace() {
 	for {
 		h.mu.Lock()
-		q, dropped, warns := h.q, h.dropped, h.warns
-		h.q, h.dropped, h.warns = nil, 0, nil
-		if len(q) == 0 && dropped == 0 && len(warns) == 0 {
+		warns := h.warns
+		h.warns = nil
+		it, ok := h.next()
+		if !ok && len(warns) == 0 {
 			h.trRun = false
 			h.mu.Unlock()
 			return
@@ -239,11 +314,8 @@ func (h *hooks) runTrace() {
 		for _, w := range warns {
 			safeLog(h.log, "Logger", func() { h.log.Warn(w) })
 		}
-		for _, it := range q {
+		if ok {
 			h.deliver(it)
-		}
-		if dropped > 0 && h.tr.Dropped != nil {
-			safeLog(h.log, "Tracer.Dropped", func() { h.tr.Dropped(h.c.id, dropped) })
 		}
 	}
 }
@@ -265,7 +337,9 @@ func (h *hooks) deliver(it traceItem) {
 		safeLog(h.log, "Tracer.Established", func() { t.Established(h.c.id) })
 	case it.closed && t.Closed != nil:
 		safeLog(h.log, "Tracer.Closed", func() { t.Closed(h.c.id, it.err) })
-	case !it.est && !it.closed && t.Event != nil:
+	case it.lost > 0 && t.Dropped != nil:
+		safeLog(h.log, "Tracer.Dropped", func() { t.Dropped(h.c.id, it.lost) })
+	case !it.est && !it.closed && it.lost == 0 && t.Event != nil:
 		safeLog(h.log, "Tracer.Event", func() { t.Event(h.c.id, it.ev) })
 	}
 }

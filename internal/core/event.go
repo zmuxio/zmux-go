@@ -23,7 +23,8 @@ const (
 	// EvTierSaturation reports that a tier (priority in Code) entered or left saturation.
 	EvTierSaturation
 	// EvPipePriority reports that the effective priority (Code), standby flag
-	// (Saturated) or weight (Count) of an outbound direction changed.
+	// (Saturated) or weight (Count) of an outbound direction changed; Source
+	// says where the priority comes from.
 	EvPipePriority
 	// EvPipeQuality reports that a pipe's smoothed RTT (RTT) or rate (Rate) left its band.
 	EvPipeQuality
@@ -46,27 +47,29 @@ const (
 
 // Event is one core event.
 type Event struct {
-	Pipe     uint64
+	Pipe    uint64
+	MaxBidi uint64
+	MaxUni  uint64
+	Code    uint64
+	Count   uint64
+	RTT     Duration
+	Rate    float64
+	Err     *SessionError
+	Frame   []byte
+	Source  string // EvPipePriority: SourceLocal, SourcePeer or SourceDefault
+	Cause   error  // retirement: why the attachment failed, nil when it did not
+
 	Kind     EventKind
 	Dir      Dir
-	OutState OutState // EvPipeState of DirOut
-	InState  InState  // EvPipeState of DirIn
-	Carrier  uint8    // EvPipeState: the pipe's carrier kind
-	Err      *SessionError
-	MaxBidi  uint64
-	MaxUni   uint64
-	Code     uint64
-	Count    uint64
-	Frame    []byte
+	OutState OutState       // EvPipeState of DirOut
+	InState  InState        // EvPipeState of DirIn
+	Carrier  uint8          // EvPipeState: the pipe's carrier kind
 	Reason   JoinAuthReason // EvJoinAuthFailed
-	Features Features
 	Role     Role
+	Features Features
 
 	Saturated bool
-	Failed    bool  // retirement (EvPipeState of OutRetired): the attachment failed
-	Cause     error // retirement: why the attachment failed, nil when it did not
-	RTT       Duration
-	Rate      float64
+	Failed    bool // retirement (EvPipeState of OutRetired): the attachment failed
 }
 
 // Dir is a pipe direction from the local endpoint's view.

@@ -35,6 +35,8 @@ jobs:
             path: seal
           - name: examples
             path: examples/xorpipe
+          - name: dgpeer
+            path: interop/dgpeer
     defaults:
       run:
         shell: bash
@@ -84,7 +86,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", zmuxquic, zmuxh3, zmuxws, seal, examples/xorpipe, interop/webpeer]
+        module: [".", zmuxquic, zmuxh3, zmuxws, seal, examples/xorpipe, interop/dgpeer, interop/webpeer]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

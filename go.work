@@ -7,5 +7,6 @@ use (
 	./zmuxws
 	./seal
 	./examples/xorpipe
+	./interop/dgpeer
 	./interop/webpeer
 )

@@ -240,7 +240,8 @@ type Config struct {
 	// when it is then not queued); otherwise it is dropped and counted.
 	DatagramLimiter DatagramLimiter
 
-	// Tracer receives session events on a goroutine of its own.
+	// Tracer receives session events on a goroutine of its own, through a
+	// backlog of 256 events per session that is not configurable.
 	Tracer *Tracer
 	// Logger receives what the application would otherwise not see: a
 	// warning when the last pipe of a direction is removed while streams

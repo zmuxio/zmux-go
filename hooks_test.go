@@ -3,8 +3,11 @@ package zmux
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -420,5 +423,193 @@ func TestTracerNamesTheSession(t *testing.T) {
 	defer mu.Unlock()
 	if !got[c.ID()] || !got[s.ID()] || est[c.ID()] != 1 || est[s.ID()] != 1 {
 		t.Fatalf("closed %v established %v for %d and %d", got, est, c.ID(), s.ID())
+	}
+}
+
+// traceCalls records the calls of a Tracer.
+type traceCalls struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *traceCalls) add(s string) {
+	r.mu.Lock()
+	r.calls = append(r.calls, s)
+	r.mu.Unlock()
+}
+
+func (r *traceCalls) get() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+// The tracer's backlog is 256 events per session: established takes no
+// room and is first, the count of lost events stands where they would
+// have stood (before the next event the backlog accepts, or before
+// closed), and closed is last, with nothing after it.
+func TestTraceBacklogOrder(t *testing.T) {
+	h := &hooks{tr: &Tracer{}}
+	ev := func(i int) traceItem { return traceItem{ev: Event{Kind: EventCapacityBelow, DeliveryRate: uint64(i)}} }
+	h.trace(ev(0)) // before established: held back
+	if _, ok := h.next(); ok {
+		t.Fatal("an event is delivered before established")
+	}
+	h.trace(traceItem{est: true})
+	for i := 1; i < traceBacklog+5; i++ {
+		h.trace(ev(i)) // 255 more fill the backlog; 5 are lost
+	}
+	var got []string
+	take := func() {
+		it, ok := h.next()
+		if !ok {
+			t.Fatal("nothing to deliver")
+		}
+		switch {
+		case it.est:
+			got = append(got, "est")
+		case it.closed:
+			got = append(got, "closed")
+		case it.lost > 0:
+			got = append(got, fmt.Sprintf("dropped %d", it.lost))
+		default:
+			got = append(got, fmt.Sprintf("ev %d", it.ev.DeliveryRate))
+		}
+	}
+	take() // est
+	take() // ev 0: one slot is free again
+	h.trace(ev(1000))
+	h.trace(ev(1001)) // the backlog is full again: this one is lost with ...
+	h.trace(traceItem{closed: true})
+	h.trace(ev(1002)) // nothing follows closed
+	h.trace(traceItem{est: true})
+	for h.qh < len(h.q) {
+		take()
+	}
+	n := len(got)
+	// est, ev 0, then ev 1..255, the 5 lost, ev 1000, the one lost, closed.
+	want := []string{"est", "ev 0"}
+	for i := 1; i < traceBacklog; i++ {
+		want = append(want, fmt.Sprintf("ev %d", i))
+	}
+	want = append(want, "dropped 5", "ev 1000", "dropped 1", "closed")
+	if !slices.Equal(got, want) {
+		t.Fatalf("calls (%d): %v", n, got)
+	}
+	if h.nev != 0 {
+		t.Fatalf("backlog fill %d after everything was delivered", h.nev)
+	}
+}
+
+// A Tracer that blocks: it gets established first, the first 256 of the
+// events the session reported (those it produced itself before the test
+// froze its queue, then the test's 300), every lost event counted in one
+// dropped call before closed, and closed last.
+func TestTraceBlockedTracerSession(t *testing.T) {
+	leakcheck.Check(t)
+	var rec traceCalls
+	started, release := make(chan struct{}), make(chan struct{})
+	closed := make(chan struct{})
+	tr := &Tracer{
+		Established: func(SessionID) { rec.add("est"); close(started); <-release },
+		Event: func(_ SessionID, ev Event) {
+			if ev.Kind == EventCapacityBelow {
+				rec.add(fmt.Sprintf("ev %d", ev.DeliveryRate))
+			} else {
+				rec.add("own")
+			}
+		},
+		Dropped: func(_ SessionID, n uint64) { rec.add(fmt.Sprintf("dropped %d", n)) },
+		Closed:  func(SessionID, error) { rec.add("closed"); close(closed) },
+	}
+	a, b := tcpPair(t)
+	c, _ := pair(t, a, b, &Config{Tracer: tr}, nil)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Established not called")
+	}
+	const sent = 300
+	var own int // events the session traced itself before the freeze
+	c.locked(func() {
+		// Every earlier critical section has traced its events by now; the
+		// freeze keeps later ones out.
+		c.events.freeze()
+		c.hk.mu.Lock()
+		own = c.hk.nev
+		c.hk.mu.Unlock()
+		for i := range sent {
+			c.hk.trace(traceItem{ev: Event{Kind: EventCapacityBelow, DeliveryRate: uint64(i)}})
+		}
+	})
+	c.Abort(1, "end")
+	<-c.Done()
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Closed not called")
+	}
+	want := []string{"est"}
+	for range own {
+		want = append(want, "own")
+	}
+	for i := range traceBacklog - own {
+		want = append(want, fmt.Sprintf("ev %d", i))
+	}
+	want = append(want, fmt.Sprintf("dropped %d", sent-(traceBacklog-own)), "closed")
+	if got := rec.get(); !slices.Equal(got, want) {
+		t.Fatalf("calls: %d, first %v, last %v", len(got), got[:min(3, len(got))], got[max(0, len(got)-3):])
+	}
+}
+
+// slowHandler is a slog.Handler that blocks its first record until
+// released and counts the records it gets.
+type slowHandler struct {
+	first   chan struct{}
+	release chan struct{}
+	n       atomic.Int64
+	once    sync.Once
+}
+
+func (*slowHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *slowHandler) Handle(context.Context, slog.Record) error {
+	h.once.Do(func() { close(h.first); <-h.release })
+	h.n.Add(1)
+	return nil
+}
+func (h *slowHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *slowHandler) WithGroup(string) slog.Handler      { return h }
+
+// A Logger that blocks: the session queues 256 warnings, drops the ones
+// arriving at the full queue and counts them in LogLinesDropped; nothing
+// else counts them.
+func TestLogLinesDropped(t *testing.T) {
+	leakcheck.Check(t)
+	h := &slowHandler{first: make(chan struct{}), release: make(chan struct{})}
+	a, b := tcpPair(t)
+	c, _ := pair(t, a, b, &Config{Logger: slog.New(h)}, nil)
+	if n := c.ConnectionStats().LogLinesDropped; n != 0 {
+		t.Fatalf("%d lines dropped before any", n)
+	}
+	c.locked(func() { c.hk.warn("first") })
+	select {
+	case <-h.first: // the logger holds the line: the queue is empty again
+	case <-time.After(5 * time.Second):
+		t.Fatal("Logger not called")
+	}
+	const sent = warnQueueMax + 44
+	c.locked(func() {
+		for range sent {
+			c.hk.warn("line")
+		}
+	})
+	if n := c.ConnectionStats().LogLinesDropped; n != sent-warnQueueMax {
+		t.Fatalf("%d lines dropped, want %d", n, sent-warnQueueMax)
+	}
+	close(h.release)
+	waitUntil(t, 5*time.Second, "the queued lines", func() bool { return h.n.Load() == 1+warnQueueMax })
+	if n := c.ConnectionStats().LogLinesDropped; n != sent-warnQueueMax {
+		t.Fatalf("%d lines dropped after delivery", n)
 	}
 }
