@@ -3,7 +3,7 @@ module github.com/zmuxio/zmux-go/interop/dgpeer
 go 1.27
 
 require (
-	github.com/quic-go/quic-go v0.64.1
+	github.com/quic-go/quic-go v0.65.0
 	github.com/zmuxio/zmux-go v1.5.2
 	github.com/zmuxio/zmux-go/zmuxquic v0.0.0
 )
