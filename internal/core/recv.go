@@ -310,6 +310,13 @@ func maxRecvRanges(window uint64) int {
 	return int(max64(1024, window>>14))
 }
 
+// unread reports whether the part holds received data the application has
+// not read, or an end it has not been told of: a FIN whose data all arrived,
+// or a reset (the states before DATA_READ and RESET_READ).
+func (r *recvPart) unread() bool {
+	return r.buf.contiguous(r.readOff) > r.readOff || r.state == recvDataRecvd || r.state == recvResetRecvd
+}
+
 // recvProgress updates the receiving state after input and wakes the reader.
 func (s *Session) recvProgress(st *Stream) {
 	r := &st.rcv
@@ -324,6 +331,7 @@ func (s *Session) recvProgress(st *Stream) {
 			r.state = recvResetRead
 		}
 		s.maybeDiscard(st)
+		s.drainRead(st)
 	}
 	s.recvChanged(st)
 	s.streamCreditChanged(st)
@@ -438,11 +446,13 @@ func (s *Session) Read(st *Stream, p []byte) (int, bool, error) {
 		}
 		r.state = recvResetRead
 		s.maybeDiscard(st)
+		s.drainRead(st)
 		return 0, false, r.errState
 	}
 	if r.finKnown && r.readOff == r.final && !r.reset {
 		r.state = recvDataRead
 		s.maybeDiscard(st)
+		s.drainRead(st)
 		return n, true, nil
 	}
 	if n == 0 && s.err != nil {
@@ -824,11 +834,13 @@ func (s *Session) ReadChunk(st *Stream, limit int) (data []byte, buf *Buf, fin b
 	if r.reset && r.readOff >= r.resetRel {
 		r.state = recvResetRead
 		s.maybeDiscard(st)
+		s.drainRead(st)
 		return nil, nil, false, r.errState
 	}
 	if r.finKnown && r.readOff == r.final && !r.reset {
 		r.state = recvDataRead
 		s.maybeDiscard(st)
+		s.drainRead(st)
 		return nil, nil, true, nil
 	}
 	if s.err != nil {

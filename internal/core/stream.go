@@ -244,7 +244,7 @@ type recvPart struct {
 	reset    bool
 	preDone  bool
 	// drainWait: the session waits for the application to read this
-	// part's buffered data before CLOSED (Session.readDrain).
+	// part's buffered data and end before CLOSED (Session.readDrain).
 	drainWait bool
 }
 

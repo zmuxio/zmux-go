@@ -1,6 +1,9 @@
 package zmux
 
 import (
+	"context"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -158,5 +161,80 @@ func TestCloseGracefulAbortBound(t *testing.T) {
 	}
 	if d := time.Since(t0); d < 200*time.Millisecond {
 		t.Fatalf("aborted %v after the close, before the linger bound", d)
+	}
+}
+
+// The read drain keeps a stream's end, not only its bytes (SPEC.md Section
+// 6.5): a FIN or a reset received before the peer's close holds the
+// closing session until the application reads it, though the carrier has
+// ended, and the read reports the end, not the session's error.
+func TestCloseReadDrainKeepsReceivedEnd(t *testing.T) {
+	for _, reset := range []bool{false, true} {
+		name := "fin"
+		if reset {
+			name = "reset"
+		}
+		t.Run(name, func(t *testing.T) {
+			leakcheck.Check(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			a, b := net.Pipe()
+			ch := make(chan *Conn, 1)
+			go func() {
+				s, err := Server(ctx, b, nil)
+				if err != nil {
+					s = nil
+				}
+				ch <- s
+			}()
+			client, err := Client(ctx, a, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := <-ch
+			if server == nil {
+				t.Fatal("no server session")
+			}
+			cs, err := client.OpenStreamSync(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cs.Write([]byte{7}); err != nil {
+				t.Fatal(err)
+			}
+			ss, err := server.AcceptStream(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The end alone: the client's stream never receives a byte.
+			if reset {
+				ss.CancelWrite(9)
+			} else if err := ss.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Ping(ctx); err != nil { // the end reached the client
+				t.Fatal(err)
+			}
+			_ = server.CloseWithError(0x2a, "bye")
+			_ = server.Wait()
+			select {
+			case <-client.Done():
+				t.Fatal("the unread end did not hold the closing session")
+			case <-time.After(300 * time.Millisecond):
+			}
+			n, err := cs.Read(make([]byte, 16))
+			var se *StreamError
+			switch {
+			case reset && (n != 0 || !errors.As(err, &se) || se.ErrorCode != 9):
+				t.Fatalf("reset: read = %d, %v", n, err)
+			case !reset && (n != 0 || !errors.Is(err, io.EOF)):
+				t.Fatalf("fin: read = %d, %v", n, err)
+			}
+			select {
+			case <-client.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("the session did not end once the end was read")
+			}
+		})
 	}
 }
