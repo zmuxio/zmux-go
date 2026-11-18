@@ -535,6 +535,12 @@ func TestPoolOnDemandDialSurvivesCount(t *testing.T) {
 	if r.err != nil || r.l.Conn != 2 {
 		t.Fatalf("second Get: %v", r.err)
 	}
+	// The shrink order breaks equal ages by the random fate group, and a
+	// coarse clock (Windows) gives both connections the same birth: make
+	// a the older one by construction.
+	p.mu.Lock()
+	p.conns[0].born = p.conns[0].born.Add(-time.Hour)
+	p.mu.Unlock()
 	p.recheckNow() // now two connections against Count 1: the younger retires
 	p.settle()
 	mu.Lock()
