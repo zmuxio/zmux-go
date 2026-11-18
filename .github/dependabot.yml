@@ -17,7 +17,6 @@ updates:
       - /seal
       - /zmuxws
       - /examples/xorpipe
-      - /interop/dgpeer
       - /interop/webpeer
     schedule:
       interval: weekly
@@ -28,14 +27,17 @@ updates:
       - dependency-name: github.com/zmuxio/zmux-go
       - dependency-name: github.com/zmuxio/zmux-go/*
 
+  # The modules that build on quic-go: it stays pinned until webtransport-go
+  # follows (the weekly workflow tests zmuxquic against the latest quic-go).
   - package-ecosystem: gomod
     directories:
       - /zmuxquic
       - /zmuxh3
+      - /interop/dgpeer
     schedule:
       interval: weekly
     groups:
-      go-modules:
+      quic-modules:
         patterns: ["*"]
     ignore:
       - dependency-name: github.com/zmuxio/zmux-go
