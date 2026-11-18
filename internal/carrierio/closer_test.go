@@ -1,6 +1,9 @@
 package carrierio
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 type countCloser struct{ n int }
 
@@ -42,3 +45,29 @@ func TestCloserForwardsAfterRelease(t *testing.T) {
 		t.Fatalf("closes %d, forwarded %d; want 0 and 1", h.n, forwarded)
 	}
 }
+
+// A Close that finds another one in progress returns only once the halves
+// are closed.
+func TestCloserWaitsForCloseInProgress(t *testing.T) {
+	in, release := make(chan struct{}), make(chan struct{})
+	c := NewCloser(blockCloser{in, release}, nil)
+	go c.Close()
+	<-in // the first Close is inside the half's Close
+	returned := make(chan struct{})
+	go func() { c.Close(); close(returned) }()
+	select {
+	case <-returned:
+		t.Fatal("Close returned while the halves were still closing")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the halves closed")
+	}
+}
+
+type blockCloser struct{ in, release chan struct{} }
+
+func (b blockCloser) Close() error { close(b.in); <-b.release; return nil }

@@ -22,6 +22,7 @@ type Closer struct {
 	r, w  io.Closer // r nil when it is w
 	next  func()    // the next owner's close; set before the release
 	state atomic.Uint32
+	done  chan struct{} // closed once the halves are closed
 }
 
 // NewCloser returns the closer of the halves r and w (either may be nil).
@@ -29,11 +30,15 @@ func NewCloser(r, w io.Closer) *Closer {
 	if r != nil && SameHalf(r, w) {
 		r = nil
 	}
-	return &Closer{r: r, w: w}
+	return &Closer{r: r, w: w, done: make(chan struct{})}
 }
 
 // Close closes the halves, the write half first, unless they were closed
-// already; once they were released it asks their next owner to close them.
+// already, and returns once they are closed: a Close that finds another
+// one in progress waits for it, as sync.Once.Do does, so that a carrier is
+// closed when the call that ended it returns, whichever party closed it.
+// The halves' own Close must therefore not call back into the Closer. Once
+// they were released it asks their next owner to close them.
 func (c *Closer) Close() {
 	if c.CloseUnreleased() && c.next != nil {
 		c.next()
@@ -45,8 +50,13 @@ func (c *Closer) Close() {
 // next owner itself, which closes released halves on its own.
 func (c *Closer) CloseUnreleased() (released bool) {
 	if !c.state.CompareAndSwap(closerOpen, closerClosed) {
-		return c.state.Load() == closerReleased
+		if c.state.Load() == closerReleased {
+			return true
+		}
+		<-c.done
+		return false
 	}
+	defer close(c.done)
 	if c.w != nil {
 		_ = c.w.Close()
 	}
