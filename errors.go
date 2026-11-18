@@ -244,8 +244,12 @@ func (e *DatagramTooLargeError) Error() string {
 // the peer's limit once known or assumed for early data, else the 1024-byte
 // floor every endpoint accepts. The setter that would exceed it returns it
 // and leaves the preamble as it was; a stream whose limit shrank before it
-// was announced fails with it locally, and nothing of it is sent.
+// was announced fails with it locally, and nothing of it is sent. It is an
+// argument error: it matches ErrInvalidConfig.
 type PreambleTooLargeError struct{ Max int64 }
+
+// Is matches ErrInvalidConfig.
+func (e *PreambleTooLargeError) Is(target error) bool { return target == ErrInvalidConfig }
 
 // Error describes the limit.
 func (e *PreambleTooLargeError) Error() string {
@@ -337,9 +341,15 @@ var (
 	// ErrPipeGone is returned by Pipe methods once the session no longer
 	// knows the attachment.
 	ErrPipeGone = errors.New("zmux: pipe gone")
-	// ErrNoDecision is returned by ResolveDuplicate when no input of the
-	// duplicate-session rule decides between the two sessions.
-	ErrNoDecision = errors.New("zmux: the duplicate-session rule has no input that decides")
+	// ErrPipeAborted is what Pipe.Wait returns for a pipe this endpoint
+	// removed abruptly: with Pipe.Abort, or to make room for another.
+	ErrPipeAborted = core.ErrPipeAborted
+	// ErrDuplicateUndecided is returned by ResolveDuplicate when the two
+	// sessions have the same dialer or no input of the duplicate-session
+	// rule decides between them. It is an argument error: it matches
+	// ErrInvalidConfig, and the caller can supply the identities that
+	// decide (DuplicateOptions).
+	ErrDuplicateUndecided = fmt.Errorf("%w: the duplicate-session rule has no input that decides", ErrInvalidConfig)
 )
 
 // IsRetryable reports whether err says that the peer did not process the
@@ -425,7 +435,7 @@ func apiErr(err error) error {
 		return &StreamLimitReachedError{}
 	case errors.Is(err, core.ErrTooLate):
 		return ErrTooLate
-	case errors.Is(err, core.ErrGroupNotUsable):
+	case errors.Is(err, core.ErrGroupNotUsable), errors.Is(err, core.ErrInvalid):
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	return err

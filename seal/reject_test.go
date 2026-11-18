@@ -67,7 +67,7 @@ func TestReplyKexRejected(t *testing.T) {
 			got := make(chan zmux.RejectInfo, 1)
 			_, addr := listen(t, ctx, &zmux.ListenerConfig{
 				Config:   &zmux.Config{HandshakeTimeout: 400 * time.Millisecond},
-				WrapPipe: &seal.ServerConfig{Key: key, Gate: &gate{}, AcceptedProfiles: []proto.Profile{4}},
+				WrapPipe: &seal.ServerConfig{StaticKey: key, Gate: &gate{}, AcceptedProfiles: []proto.Profile{4}},
 				OnReject: func(i zmux.RejectInfo) zmux.RejectAction { got <- i; return zmux.RejectStall },
 			})
 			nc := dial(t, addr)

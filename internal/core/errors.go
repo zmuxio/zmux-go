@@ -115,6 +115,9 @@ var (
 	ErrJoinPending = errors.New("zmux: join pending")
 	// ErrJoinSecretSet reports that the deferred PSK was already supplied.
 	ErrJoinSecretSet = errors.New("zmux: join secret already set")
+	// ErrPipeAborted is the cause of a pipe this endpoint removed abruptly
+	// (RemovePipe, not graceful), also one it removed to make room.
+	ErrPipeAborted = errors.New("zmux: pipe aborted locally")
 )
 
 // DatagramTooLargeError reports the largest payload the peer accepts.

@@ -231,6 +231,7 @@ func classOf(st *Stream) heldClass {
 func (s *Session) heldEnter(st *Stream) heldClass { return classOf(st) }
 
 func (s *Session) heldLeave(st *Stream, before heldClass) {
+	s.syncUnsent(st)
 	after := classOf(st)
 	if st.discarded || st.cancelled {
 		after = heldClass{}
@@ -314,6 +315,15 @@ func (s *Session) sendRoom(st *Stream) uint64 {
 	}
 	floorRoom := floor - min64(floor, cl.held)
 	return min64(room, max64(totalRoom, floorRoom))
+}
+
+// SendBuffer returns the bound of the part's written-but-unreleased bytes:
+// the one SetSendBuffer set, else the session's configured send buffer.
+func (s *Session) SendBuffer(st *Stream) uint64 {
+	if st.snd.bufLimit > 0 {
+		return st.snd.bufLimit
+	}
+	return s.cfg.SendBuffer
 }
 
 // SetSendBuffer bounds the part's written-but-unreleased bytes.
@@ -417,6 +427,7 @@ func (s *Session) startReset(st *Stream, code uint64, stopReply bool) {
 	if sp.reset {
 		if stopReply && sp.resetRel > sp.sent {
 			sp.resetRel = sp.sent
+			s.syncUnsent(st)
 			sp.resetSent = false
 			s.queueCtl(st, ctlReset)
 		}
@@ -443,6 +454,7 @@ func (s *Session) startReset(st *Stream, code uint64, stopReply bool) {
 	}
 	sp.finWr = false
 	s.endWaitWrite(st)
+	s.syncUnsent(st)
 	s.queueCtl(st, ctlReset)
 	s.sched.ensure(st)
 	s.sendChanged(st) // the part takes no more writes: a blocked one fails now

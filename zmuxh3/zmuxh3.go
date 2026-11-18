@@ -168,9 +168,16 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 // Serve hands the streams of an accepted WebTransport session to l, as
 // zmuxquic.Serve does for a QUIC listener: each bidirectional stream is a
 // carrier (a bootstrap or a join), each unidirectional stream a lane,
-// each passing l's admission on its own (zmux.Listener.HandlePipe). It
-// returns, with the error that ended the accept loop, when the session
-// ends or ctx ends; the zmux sessions continue on their pipes.
+// each passing l's admission on its own (zmux.Listener.HandlePipe).
+//
+// The HTTP/3 session is served request by request: a source slot that is
+// full, the admission, a refusal at a limit and a closed listener are
+// answered on the stream they concern (it is reset or closed), and never end
+// the call, unlike zmuxquic.ServeConn, which hands a whole connection over.
+// Serve reports only the end of the session: nil when it was closed (by
+// either side, with any application code), the connection's error when it
+// failed (an idle timeout, a transport error), and ctx's error when ctx ends
+// first; the zmux sessions continue on their pipes.
 func Serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session) error {
 	return serve(ctx, l, sess, nil)
 }
@@ -212,6 +219,51 @@ func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a 
 		labels.Go(ctx, "wt-pipe", func() { handle(p) })
 	}
 	wg.Wait()
+	return sessionEnd(err)
+}
+
+// connectStreamEnd is the message of the HTTP/3 datagram error that
+// webtransport-go raises when the CONNECT stream ends with H3_NO_ERROR.
+var connectStreamEnd = (&http3.Error{ErrorCode: http3.ErrCodeNoError, Remote: true}).Error()
+
+// sessionEnd is the result of Serve for the error that ended its accept
+// loop: nil for a session that was closed, whoever closed it and with
+// whatever code; the error itself for ctx's end and for a failure of the
+// connection (a QUIC transport error, an idle or handshake timeout, a
+// stateless reset, an application close other than H3_NO_ERROR) or of the
+// session (a WebTransport flow control violation or another HTTP/3 error).
+// webtransport-go reports the end of the CONNECT stream, which is how a peer
+// that closes the session without a close capsule ends it, as an HTTP/3
+// datagram error that carries the stream's message; only that message,
+// the CONNECT stream's end with H3_NO_ERROR, is a close: another datagram
+// error (a malformed capsule, a stream failure) is a failure.
+func sessionEnd(err error) error {
+	var (
+		se  *webtransport.SessionError
+		h3e *http3.Error
+		ae  *quic.ApplicationError
+		te  *quic.TransportError
+		ide *quic.IdleTimeoutError
+		hte *quic.HandshakeTimeoutError
+		sre *quic.StatelessResetError
+		vne *quic.VersionNegotiationError
+	)
+	switch {
+	case errors.As(err, &se):
+		return nil
+	case errors.As(err, &te), errors.As(err, &ide), errors.As(err, &hte), errors.As(err, &sre), errors.As(err, &vne):
+		return err
+	case errors.As(err, &ae):
+		if ae.ErrorCode == quic.ApplicationErrorCode(http3.ErrCodeNoError) {
+			return nil
+		}
+		return err
+	case errors.As(err, &h3e):
+		if h3e.ErrorCode == http3.ErrCodeNoError || (h3e.ErrorCode == http3.ErrCodeDatagramError && h3e.ErrorMessage == connectStreamEnd) {
+			return nil
+		}
+		return err
+	}
 	return err
 }
 

@@ -602,7 +602,7 @@ func TestJoinSealedRelay(t *testing.T) {
 	out := <-outs
 	e.until("the origin's pipe", func() bool { _, ok := e.s.Pipe(p.ID()); return ok })
 	first, _ := e.c.Pipe(0)
-	_ = first.Abort(nil)
+	_ = first.Abort()
 	st, err := e.c.OpenStreamSync(e.ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1240,6 +1240,12 @@ func testUnconfirmedEviction(t *testing.T, limit int) { //nolint:thelper // subt
 	if drained(held[2]) || drained(held[len(held)-1]) {
 		t.Fatal("an Unconfirmed carrier within the cap was closed")
 	}
+	// An eviction is a limit of the session: each evicted join counts as
+	// refused, and none counts as a join (Joins is for Confirmed ones).
+	e.until("the evictions to be counted", func() bool { return e.lst.Stats().Refused == 2 })
+	if st := e.lst.Stats(); st.Rejected != 0 || st.Joins != 0 {
+		t.Fatalf("stats after the evictions: %+v", st)
+	}
 	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{}); err != nil {
 		t.Fatalf("a real join among replays: %v", err)
 	}
@@ -1345,7 +1351,7 @@ func TestWeakestRecordModeUnmanaged(t *testing.T) {
 	}
 	e.until("the origin's pipe", func() bool { _, ok := e.s.Pipe(p.ID()); return ok })
 	first, _ := e.c.Pipe(0)
-	_ = first.Abort(nil)
+	_ = first.Abort()
 	if m := e.c.WeakestRecordMode(); m != RecordUnmanaged {
 		t.Fatalf("after the first pipe: %v", m)
 	}
@@ -1394,7 +1400,7 @@ func TestWeakestRecordModeSecure(t *testing.T) {
 		t.Fatalf("with a Trusted pipe: %v", m)
 	}
 	waitUntil(t, 30*time.Second, "the acceptor's view", func() bool { return s.WeakestRecordMode() == RecordTrusted })
-	_ = p.Abort(nil)
+	_ = p.Abort()
 	waitUntil(t, 30*time.Second, "Trusted retired", func() bool { return c.WeakestRecordMode() == RecordSealed })
 }
 
@@ -1551,7 +1557,7 @@ func TestSealedRefusesLanes(t *testing.T) {
 	}
 	first, _ := e.c.Pipe(0)
 	e.until("the origin's pipe", func() bool { _, ok := e.s.Pipe(p.ID()); return ok })
-	_ = first.Abort(nil)
+	_ = first.Abort()
 	ctx, cancel := context.WithTimeout(e.ctx, 60*time.Second)
 	defer cancel()
 	echoOnce(t, ctx, e.c, e.s)
@@ -1811,9 +1817,9 @@ func TestPendingLimitRejects(t *testing.T) {
 			}
 			deadline := time.Now().Add(10 * time.Second)
 			for {
-				lst.mu.Lock()
+				lst.pmu.Lock()
 				n := lst.pending.Held(lst.sourceKey(src))
-				lst.mu.Unlock()
+				lst.pmu.Unlock()
 				if n == 2 {
 					break
 				}

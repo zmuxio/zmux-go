@@ -184,3 +184,48 @@ func TestExpiredProbationRemainsAnImmediateDeadline(t *testing.T) {
 		t.Fatal("due probation was not cleared")
 	}
 }
+func pipeQualityEvents(s *Session) int {
+	n := 0
+	for {
+		e, ok := s.PollEvent()
+		if !ok {
+			return n
+		}
+		if e.Kind == EvPipeQuality {
+			n++
+		}
+	}
+}
+
+// A pipe's own zero band turns its reports off whatever the session's
+// band is; clearing it follows the session's band again.
+func TestPipeQualityBandOff(t *testing.T) {
+	s := capacitySession()
+	p := s.pipes[0]
+	p.rtt().has, p.rtt().smoothed = true, 100*Millisecond
+	sample := func(rtt Duration) {
+		p.rtt().smoothed = rtt
+		s.qualitySample(p)
+	}
+	if err := s.SetQualityBand(-1, &QualityBand{RTT: 10 * Millisecond}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetQualityBand(int64(p.id), &QualityBand{}); err != nil {
+		t.Fatal(err)
+	}
+	sample(100 * Millisecond)
+	s.now = s.now.Add(2 * Second)
+	sample(300 * Millisecond)
+	if n := pipeQualityEvents(s); n != 0 {
+		t.Fatalf("%d reports with the pipe's band off", n)
+	}
+	if err := s.SetQualityBand(int64(p.id), nil); err != nil {
+		t.Fatal(err)
+	}
+	sample(300 * Millisecond)
+	s.now = s.now.Add(2 * Second) // past the band's MinInterval
+	sample(600 * Millisecond)
+	if n := pipeQualityEvents(s); n != 2 { // 100 -> 300 -> 600 ms, each beyond 10 ms
+		t.Fatalf("%d reports following the session's band, want 2", n)
+	}
+}

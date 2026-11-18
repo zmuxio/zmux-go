@@ -838,7 +838,7 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 			}
 			w.logFrame(frameDesc{kind: dMaxStreamData, id: id})
 			if s.mp != nil && (r.highest >= r.adv || r.blockSeen == r.adv && r.blockSeen > 0) {
-				st.copyMSD = true
+				s.markCopyMSD(st)
 			}
 			if r.tune != nil && v > r.adv {
 				r.tune.sent(r.adv, s.now, r.highest == r.adv)
@@ -887,6 +887,7 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 				s.conn.sent += final - sp.sent
 			}
 			sp.sent = final
+			s.syncUnsent(st)
 			w.activity, w.traffic = true, true
 			w.onlyPing = false
 			// Outside multipath a written reset is acknowledged.
@@ -1148,6 +1149,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		s.conn.sent += newEnd - sp.sent
 		s.mp.retain(newEnd - sp.sent)
 		sp.sent = newEnd
+		s.syncUnsent(st)
 	}
 	if sp.sent >= sp.maxData && sp.sendEnd() > sp.sent {
 		// The chunk used the last of the peer's stream credit while data

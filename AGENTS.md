@@ -18,8 +18,11 @@
   of that pipe. A `HandshakeShaper` is no exception.
 - Tests must not leak goroutines, sockets or timers, and must not rely on OS
   socket buffer sizes.
-- `testdata/spec`, `testdata/carrier-cache`, `testdata/shaping` and
+- `testdata/spec`, `testdata/carrier-cache`, `testdata/pool-shrink`, `testdata/shaping` and
   `seal/proto/testdata/vectors` are copied from the specification; do not
   edit them by hand.
+- Native fuzz targets (`FuzzXxx`) keep their seeds in the package's
+  `testdata/fuzz`; `tools/fuzz.sh [time]` runs them all, and a failing input
+  stays there as a regression seed.
 - Commit subjects are short, English and imperative.
 - Never commit host names, IP addresses or credentials.

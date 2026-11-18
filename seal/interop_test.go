@@ -196,7 +196,7 @@ func TestInteropEstablishClient(t *testing.T) {
 				t.Fatal(err)
 			}
 			cfg := &seal.ClientConfig{
-				Anchor:          seal.PinAnchor(seal.NodeKeyID(nk.PublicKey().Bytes())),
+				Anchor:          seal.PinAnchor(seal.StaticKeyID(nk.PublicKey().Bytes())),
 				AllowedProfiles: []proto.Profile{pr},
 			}
 			if pr.HasPSK() {
@@ -228,7 +228,7 @@ func TestInteropEstablishServer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			srv := &seal.ServerConfig{Gate: &gate{handle: h, psk: k}, Key: nk, AcceptedProfiles: []proto.Profile{pr}}
+			srv := &seal.ServerConfig{Gate: &gate{handle: h, psk: k}, StaticKey: nk, AcceptedProfiles: []proto.Profile{pr}}
 			l, err := zmux.NewListener(&zmux.ListenerConfig{Config: interopConfig(), WrapPipe: srv})
 			if err != nil {
 				t.Fatal(err)

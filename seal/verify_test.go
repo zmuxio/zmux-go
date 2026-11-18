@@ -132,7 +132,7 @@ func TestPinPQAuth(t *testing.T) {
 	defer cancel()
 	f := newFixture(t)
 	pk, _ := seal.GenerateSigningKey(proto.KeyAlgMLDSA44)
-	id := seal.NodeKeyID(f.node.PublicKey().Bytes())
+	id := seal.StaticKeyID(f.node.PublicKey().Bytes())
 	cc := f.client
 	cc.RequirePQAuth = true
 	x, _ := net.Pipe()
@@ -226,7 +226,7 @@ func TestVerifierPanicHidesValue(t *testing.T) {
 	}
 }
 
-// KeyID names a public key alone as SigningKey.ID and NodeKeyID name it, and
+// KeyID names a public key alone as SigningKey.ID and StaticKeyID name it, and
 // refuses a key of the wrong length.
 func TestKeyID(t *testing.T) {
 	sk, err := seal.GenerateSigningKey(proto.KeyAlgMLDSA44)
@@ -237,7 +237,7 @@ func TestKeyID(t *testing.T) {
 		t.Fatalf("ML-DSA-44: %x, %v; want %x", id, err, sk.ID())
 	}
 	node := bytes.Repeat([]byte{9}, 32)
-	if id, err := seal.KeyID(proto.KeyAlgX25519, node); err != nil || id != seal.NodeKeyID(node) {
+	if id, err := seal.KeyID(proto.KeyAlgX25519, node); err != nil || id != seal.StaticKeyID(node) {
 		t.Fatalf("X25519: %x, %v", id, err)
 	}
 	if _, err := seal.KeyID(proto.KeyAlgX25519, node[:31]); err == nil {

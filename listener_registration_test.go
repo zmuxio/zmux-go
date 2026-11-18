@@ -30,9 +30,9 @@ func TestListenerRegistersBeforeBootstrapParameters(t *testing.T) {
 	if _, err := io.ReadFull(peer, first[:]); err != nil {
 		t.Fatal(err)
 	}
-	listener.mu.Lock()
+	listener.regMu.Lock()
 	locators, live := len(listener.sessions), len(listener.live)
-	listener.mu.Unlock()
+	listener.regMu.Unlock()
 	if locators != 1 || live != 1 {
 		t.Errorf("bootstrap parameters exposed before registration: locators=%d live=%d", locators, live)
 	}
@@ -48,8 +48,8 @@ func TestListenerRegistersBeforeBootstrapParameters(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
 	}
-	listener.mu.Lock()
-	defer listener.mu.Unlock()
+	listener.regMu.Lock()
+	defer listener.regMu.Unlock()
 	if len(listener.sessions) != 0 || len(listener.live) != 0 {
 		t.Error("failed establishment retained its registration")
 	}

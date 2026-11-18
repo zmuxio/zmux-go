@@ -319,6 +319,8 @@ func (c *Conn) endPipeLocked(id uint64, failed bool, cause error) {
 		e.err = cause
 	}
 	close(e.retired)
+	// Pipe.Done closes once the driver's goroutines have ended too.
+	e.drv.Load().gs.finishThen(e.end)
 }
 
 // drainEventsLocked turns core events into pipe events and wakes waiters.
@@ -439,7 +441,6 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 		case core.InJoining, core.InOpen:
 			q.mark(e.Pipe, dirInSeen)
 		case core.InRetired:
-			delete(c.labels, e.Pipe)
 			c.endPipeLocked(e.Pipe, e.Failed, e.Cause)
 			if e.Pipe != 0 {
 				// Forgotten at the next critical section, once the

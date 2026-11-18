@@ -219,6 +219,8 @@ func TestStatsGauges(t *testing.T) {
 	st.snd.sent = 5
 	st.rcv.buf.bytes = 7
 	s.streams[0] = st
+	s.syncUnsent(st)
+	s.conn.buffered = 7
 	g = s.Gauges()
 	if g.StreamsActive != 1 || g.SendBuffered != 6 || g.RecvBuffered != 7 {
 		t.Fatalf("stream gauges %+v", g)

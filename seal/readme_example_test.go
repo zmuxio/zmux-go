@@ -15,7 +15,7 @@ import (
 func Example_readme() {
 	_ = func(ctx context.Context, gate seal.Gate, nodeKey *ecdh.PrivateKey, nodePub []byte,
 		carrier zmux.PipeIO, handle, psk []byte, cfg *zmux.Config) (*zmux.Conn, error) {
-		server := &seal.ServerConfig{Gate: gate, Key: nodeKey}
+		server := &seal.ServerConfig{Gate: gate, StaticKey: nodeKey}
 		l, err := zmux.NewListener(&zmux.ListenerConfig{WrapPipe: server}) // validates server
 		if err != nil {
 			return nil, err
@@ -25,7 +25,7 @@ func Example_readme() {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second) // a refused handshake gets no reply
 		defer cancel()
 		p, err := seal.Establish(ctx, carrier, &seal.ClientConfig{
-			Anchor: seal.PinAnchor(seal.NodeKeyID(nodePub)),
+			Anchor: seal.PinAnchor(seal.StaticKeyID(nodePub)),
 			Handle: handle,
 			PSK:    psk,
 		})

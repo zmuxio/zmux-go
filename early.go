@@ -92,13 +92,13 @@ func decodeRemembered(b []byte) *wire.Params {
 // watchEarly follows the bootstrap carrier's early data (after Start).
 func (c *Conn) watchEarly(p PipeIO) {
 	if ec, ok := earlyCarrier(p, &c.cfg.EarlyData); ok {
-		c.wg.Add(1)
+		c.side.add()
 		labels.Go(c.lctx, "early-verdict", func() { c.earlyVerdict(ec, p) })
 	}
 	if es, ok := earlyIn(p, &c.cfg.EarlyData); ok {
-		c.wg.Add(1)
+		c.side.add()
 		labels.Go(c.lctx, "early-watch", func() {
-			defer c.wg.Done()
+			defer c.side.done()
 			select {
 			case <-es.HandshakeComplete():
 				c.locked(func() {
@@ -166,7 +166,7 @@ func (c *Conn) awaitVerdict(pd *pipeDrv, lane uint64) {
 // hook is called first, and a failing hook fails the session. boot is
 // the bootstrap pipe.
 func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
-	defer c.wg.Done()
+	defer c.side.done()
 	defer close(c.verdictDone)
 	var ok bool
 	var err error

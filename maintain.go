@@ -6,21 +6,24 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"time"
 
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/poolhost"
 )
 
 // PipePool keeps pipes of one path up.
 type PipePool struct {
-	// Policy, when set, is asked on every pass of the pool; its
-	// DialAfter replaces the backoff, bounded by Backoff.Max, and its
-	// Liveness applies to the pipes dialled after it.
-	// A decision that fails PoolDecision.Validate is rejected: the pass
-	// goes on as with the zero decision and the error is reported to
-	// DecisionRejected.
+	// Policy, when set, is asked on every pass of the pool: on a pipe or
+	// session event, after each dial attempt, at its Recheck and every
+	// 100 ms. Its DialAfter replaces the backoff, bounded by Backoff.Max,
+	// and its Liveness applies to the pipes dialled after it. A Decide
+	// that returns an error or panics, or a decision that fails
+	// PoolDecision.Validate, is rejected: the pass goes on as with the zero decision and the error
+	// is reported to DecisionRejected, else logged to Config.Logger.
 	Policy PoolPolicy
 	// Dial opens a carrier of the path. Its context bounds the dial and
 	// ends once the join completes; the carrier then lives until the pipe
@@ -36,11 +39,11 @@ type PipePool struct {
 	// ChoicePolicy is the policy of Choice (nil: the defaults, with a cache
 	// private to the pool); its Join does not apply.
 	ChoicePolicy *CarrierChoicePolicy
-	// DecisionRejected, when set, receives the PoolDecision.Validate error
-	// (ErrInvalidConfig) of each decision of Policy the pool rejected, on
+	// DecisionRejected, when set, receives the error of each look of
+	// Policy the pool rejected, on
 	// the goroutine of MaintainPipes and outside every lock; it must not
-	// block, and a panic in it is contained. The pool goes on maintaining
-	// its pipes whether it is set or not.
+	// block, and a panic in it is contained. Unset, the error is logged to
+	// Config.Logger. The pool goes on maintaining its pipes either way.
 	DecisionRejected func(err error)
 	// Choice, in place of Dial and Join, dials each member over a carrier
 	// kind of the mode's candidates (a split candidate joins as a split
@@ -106,16 +109,20 @@ func memberState(ps []*Pipe) (sum PipeStats, alive, usable bool) {
 		if i == 0 || st.SinceLastTraffic < sum.SinceLastTraffic {
 			sum.SinceLastTraffic = st.SinceLastTraffic
 		}
-		usable = usable && st.PeerAttached
-		if st.Outbound == OutboundNone {
-			alive = alive && st.Inbound == InboundOpen || alive && st.Inbound == InboundJoining
-			usable = usable && st.Inbound == InboundOpen
-			continue
-		}
-		alive = alive && st.Outbound != OutboundFailed && st.Outbound != OutboundClosed
-		usable = usable && st.Outbound == OutboundActive && st.ProbationUntil.IsZero()
+		a, u := pipeState(&st)
+		alive, usable = alive && a, usable && u
 	}
 	return sum, alive, usable
+}
+
+// pipeState reports whether a pipe is alive and usable, as memberState
+// reads them.
+func pipeState(st *PipeStats) (alive, usable bool) {
+	if st.Outbound == OutboundNone {
+		return st.Inbound == InboundOpen || st.Inbound == InboundJoining, st.PeerAttached && st.Inbound == InboundOpen
+	}
+	return st.Outbound != OutboundFailed && st.Outbound != OutboundClosed,
+		st.PeerAttached && st.Outbound == OutboundActive && st.ProbationUntil.IsZero()
 }
 
 // MaintainPipes keeps pool.Count usable pipes dialled by pool.Dial: it
@@ -233,7 +240,7 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 			}
 			if err != nil {
 				for _, pp := range ps { // pipes of a Join that failed: none is left orphaned
-					_ = pp.Abort(err)
+					_ = pp.Abort()
 				}
 				return nil, err
 			}
@@ -327,7 +334,8 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 				live = append(live, m)
 				m.idle = st.SinceLastTraffic
 				view.Members = append(view.Members, PoolMember{PipeID: m.ps[0].ID(), Age: now.Sub(m.born),
-					Idle: m.idle, Pipes: len(m.ps), BytesSent: st.BytesSent, BytesReceived: st.BytesReceived})
+					Idle: m.idle, Pipes: len(m.ps), BytesSent: st.BytesSent, BytesReceived: st.BytesReceived,
+					Usable: usable, Replacing: m.repl != nil})
 			} else {
 				closeAll(m.ps) // the rest of a member goes with its failed pipe
 				if mp != nil && !c.isDone() {
@@ -344,10 +352,10 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		count := pool.Count
 		delay := wait
 		if pool.Policy != nil {
-			view.Now, view.Failures, view.LastDial = now, failures, lastDial
-			if err := decide(c.cfg.Logger, pool.Policy, &view, &dec); err != nil {
-				dec = PoolDecision{RetirePipes: dec.RetirePipes[:0]} // rejected, as a policy that panics
-				reportRejected(c.cfg.Logger, pool.DecisionRejected, err)
+			view.Failures, view.SinceLastDial = failures, sinceDial(now, lastDial)
+			if err := decide(pool.Policy, &view, &dec); err != nil {
+				dec = PoolDecision{RetirePipes: dec.RetirePipes[:0]} // rejected
+				poolhost.ReportRejected(c.cfg.Logger, pool.DecisionRejected, err)
 			}
 			if dec.DialAfter > 0 {
 				delay = min(dec.DialAfter, pool.Backoff.Max)
@@ -362,18 +370,19 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 					}
 				}
 			}
-			// Members beyond the count close, the longest idle first.
-			for len(members) > count {
-				k := 0
-				for i, m := range members {
-					if m.retire && !members[k].retire || m.retire == members[k].retire && m.idle > members[k].idle {
-						k = i
-					}
+			// Members beyond the count close gracefully (PoolDecision.Count;
+			// the pool dials between its looks, so no dial is under way).
+			ms := make([]poolhost.Member, len(members))
+			for i, m := range members {
+				ms[i] = poolhost.Member{Idle: m.idle, Age: now.Sub(m.born), Key: uint64(m.ps[0].ID()), Pipes: len(m.ps), Retire: m.retire}
+			}
+			if _, closing := poolhost.Plan(0, ms, count); len(closing) > 0 {
+				for _, k := range closing {
+					closeAll(members[k].ps)
+					closeAll(members[k].repl)
+					members[k] = nil
 				}
-				m := members[k]
-				closeAll(m.ps)
-				closeAll(m.repl)
-				members = append(members[:k], members[k+1:]...)
+				members = slices.DeleteFunc(members, func(m *member) bool { return m == nil })
 			}
 		}
 		out, in := false, false
@@ -536,6 +545,15 @@ func (c *Conn) maintainPipes(ctx context.Context, pool PipePool, seed *modeSeed)
 		}
 		timer.Stop()
 	}
+}
+
+// sinceDial is PoolView.SinceLastDial: the time since last, negative when
+// the pool has not dialled.
+func sinceDial(now, last time.Time) time.Duration {
+	if last.IsZero() {
+		return -1
+	}
+	return now.Sub(last)
 }
 
 func btoi(b bool) int {

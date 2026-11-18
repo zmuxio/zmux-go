@@ -378,6 +378,7 @@ func (s *Session) firstBatch(limit int) []byte {
 			s.conn.sent += newEnd - sp.sent
 			s.mp.retain(newEnd - sp.sent)
 			sp.sent = newEnd
+			s.syncUnsent(st)
 			st.opened = true
 			s.openedCtl(st)
 			if sp.state == sendReady {
@@ -770,6 +771,7 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 	s.epochJoined()
 	a := &attach{out: OutNone, in: InNone, dir: j.Direction, fate: j.FateGroup, attachedAt: s.now, liveAt: s.now, lastAdvance: s.now,
 		lastRecord: s.now, weight: 1, peerPrio: j.Priority, peerStandby: j.Standby, probOpt: -1, mode: pj.Mode}
+	a.group, _ = join.LookupGroup(pj.pl.KeyShare.Group)
 	a.rtt = s.initialRTT(id)
 	s.drawProbe(a, nil, false)
 	p.mp = a
@@ -908,7 +910,7 @@ func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 	a := oldest.mp
 	if a.alive() {
 		a.abandonSent = true // displaced without PIPE_ABANDON
-		s.failPipe(oldest, wire.PipeFailed, nil)
+		s.failPipe(oldest, wire.PipeFailed, ErrPipeAborted)
 	}
 	a.abandonQueued = false
 	s.retire(oldest, false)
@@ -936,14 +938,6 @@ func (s *Session) JoinReady() bool {
 		n++
 	}
 	return n < max(1, s.cfg.MaxPipes)
-}
-
-// SetPipeCause records the error that ends an attachment (reported with
-// the session's error when it was the last pipe).
-func (s *Session) SetPipeCause(id uint64, err error) {
-	if p := s.pipe(id); p != nil && p.mp != nil && p.mp.failCause == nil {
-		p.mp.failCause = err
-	}
 }
 
 // firstPipeMode is the record mode of pipe 0. An Unmanaged pipe has raw records.

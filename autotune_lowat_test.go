@@ -134,4 +134,9 @@ func TestAutotuneGrowsWithIdleReverseOnLowWaterCarrier(t *testing.T) {
 	if w := as.Stats().RecvWindow; w <= 256<<10 {
 		t.Fatalf("receive window stayed at %d", w)
 	}
+	// The getter reads the setting, not what auto-tuning reached: the
+	// session's initial window, and the cap 0 of an automatic one.
+	if initial, limit := as.ReceiveWindow(); initial != 256<<10 || limit != 0 {
+		t.Fatalf("receive window setting %d %d after auto-tuning, want 262144 0", initial, limit)
+	}
 }

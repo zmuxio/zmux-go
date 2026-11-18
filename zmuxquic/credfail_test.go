@@ -34,7 +34,7 @@ func (*gatedCred) Header(*zmux.CarrierInfo) (name, value string, err error) { re
 // fatePolicy reports the members of each decision.
 type fatePolicy chan []uint64
 
-func (p fatePolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
+func (p fatePolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) error {
 	fates := make([]uint64, 0, len(v.Members))
 	for _, m := range v.Members {
 		fates = append(fates, m.FateGroup)
@@ -44,6 +44,7 @@ func (p fatePolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 	case p <- fates:
 	default:
 	}
+	return nil
 }
 
 // A call that waited for a connection whose credential then failed to go

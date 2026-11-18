@@ -70,15 +70,49 @@ type pipeDrv struct {
 // retires it (err, guarded by the session lock, is set before),
 // waited when, besides, its goroutines ended.
 type pipeEnd struct {
-	err     error
+	err error
+	// opts are the pipe's options as the application set them, every
+	// update applied (guarded by the session lock, like err); a pipe the
+	// application added has its Direction, RecordMode and FateGroup resolved.
+	// Pipe.Options reads them, also once the pipe is gone.
+	opts    PipeOptions
 	drv     atomic.Pointer[pipeDrv] // the current driver (an early-data restart replaces pipe 0's)
 	retired chan struct{}
-	waited  chan struct{}
-	once    sync.Once
+	// waited is Pipe.Done's channel, made on demand; ended is set once
+	// the pipe was retired and its goroutines ended, or the session ended.
+	waited chan struct{}
+	mu     sync.Mutex
+	ended  bool
+}
+
+// done returns Pipe.Done's channel, without a goroutine to close it.
+func (e *pipeEnd) done() <-chan struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ended {
+		return closedChan
+	}
+	if e.waited == nil {
+		e.waited = make(chan struct{})
+	}
+	return e.waited
+}
+
+// end closes Pipe.Done's channel.
+func (e *pipeEnd) end() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ended {
+		return
+	}
+	e.ended = true
+	if e.waited != nil {
+		close(e.waited)
+	}
 }
 
 // goneEnd is the end of an attachment the session no longer knows.
-var goneEnd = &pipeEnd{retired: closedChan, waited: closedChan}
+var goneEnd = &pipeEnd{retired: closedChan, waited: closedChan, ended: true}
 
 // laneOut is the writer side of one outbound lane above 0.
 type laneOut struct {
@@ -103,10 +137,17 @@ func (l *laneOut) close(abort bool) {
 // its own to wait for them: ended is closed when the count drops to zero
 // (lock level L3).
 type pipeGoroutines struct {
-	ended  chan struct{}
+	ended chan struct{}
+	// fin is closed once finish was called and the count is zero, by
+	// whichever of the two comes last; made on demand (finished).
+	fin chan struct{}
+	// onFin, when set before finish, runs (under mu) when fin would close.
+	onFin  func()
 	n      int
 	mu     sync.Mutex
 	sealed bool // seal: no goroutine joins any more
+	final  bool // finish: the owner ended
+	fired  bool // the owner ended and no goroutine ran since
 }
 
 func (g *pipeGoroutines) add() {
@@ -145,8 +186,54 @@ func (g *pipeGoroutines) done() {
 	g.mu.Lock()
 	if g.n--; g.n == 0 {
 		close(g.ended)
+		g.closeFinLocked()
 	}
 	g.mu.Unlock()
+}
+
+// finishThen is finish, with f run once no goroutine runs.
+func (g *pipeGoroutines) finishThen(f func()) {
+	g.mu.Lock()
+	g.onFin = f
+	g.final = true
+	g.closeFinLocked()
+	g.mu.Unlock()
+}
+
+// finish marks the owner ended: finished's channel closes once no
+// goroutine runs, at once when none does.
+func (g *pipeGoroutines) finish() {
+	g.mu.Lock()
+	g.final = true
+	g.closeFinLocked()
+	g.mu.Unlock()
+}
+
+func (g *pipeGoroutines) closeFinLocked() {
+	if !g.final || g.n != 0 || g.fired {
+		return
+	}
+	g.fired = true
+	if g.fin != nil {
+		close(g.fin)
+	}
+	if g.onFin != nil {
+		g.onFin()
+	}
+}
+
+// finished returns a channel closed once finish was called and no
+// goroutine runs; no goroutine waits for it.
+func (g *pipeGoroutines) finished() <-chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.fired {
+		return closedChan
+	}
+	if g.fin == nil {
+		g.fin = make(chan struct{})
+	}
+	return g.fin
 }
 
 // wait returns a channel closed once no goroutine of the attachment runs.
@@ -240,7 +327,7 @@ func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool) {
 	}
 	c.startChannel(pd) // its receiver before the first record
 	if read && pd.hc.io.R != nil {
-		c.wg.Add(1)
+		c.side.add()
 		pd.gs.add()
 		labels.Go(pd.lctx, "read", func() {
 			defer pd.gs.done()
@@ -259,7 +346,7 @@ func (c *Conn) startWriterLocked(pd *pipeDrv) {
 	}
 	done := make(chan struct{})
 	pd.wstop, pd.wdone = false, done
-	c.wg.Add(1)
+	c.side.add()
 	pd.gs.add()
 	ready := pd.chReady
 	labels.Go(pd.lctx, "write", func() {
@@ -303,7 +390,7 @@ func (c *Conn) bootstrapExporter(pd *pipeDrv, lane uint64) *lateExporter {
 // behind writes. A quiet byte stream blocks on a small buffer and holds no
 // pooled read buffer.
 func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
-	defer c.wg.Done()
+	defer c.side.done()
 	defer func() {
 		if p := recover(); p != nil {
 			c.fail(p)
@@ -440,7 +527,7 @@ func (noMessages) ReadMessage(int) ([]byte, error) {
 // writeLoop produces batches for one outbound lane and writes them. It owns
 // the lane's write side: no other goroutine writes to it.
 func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut) {
-	defer c.wg.Done()
+	defer c.side.done()
 	defer func() {
 		if p := recover(); p != nil {
 			c.fail(p)
@@ -635,7 +722,7 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 
 // openLane opens a requested outbound lane outside the lock.
 func (c *Conn) openLane(pd *pipeDrv) {
-	defer c.wg.Done()
+	defer c.side.done()
 	ctx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
 	w, err := pd.opener.OpenLane(ctx)
@@ -660,7 +747,7 @@ func (c *Conn) openLane(pd *pipeDrv) {
 		pd.lanes = map[uint64]*laneOut{}
 	}
 	pd.lanes[lane] = lo
-	c.wg.Add(1)
+	c.side.add()
 	pd.gs.add()
 	labels.Go(pd.lctx, "lane-write", func() {
 		defer pd.gs.done()
@@ -696,7 +783,7 @@ func (c *Conn) resolveActionLocked(a core.Action) pendingAct {
 	if pd := pa.pd; pd != nil {
 		pa.lo = pd.lanes[a.Lane]
 		if a.Kind == core.ActOpenLane && pd.opener != nil && !c.closing {
-			c.wg.Add(1)
+			c.side.add()
 			pa.start = true
 		}
 		if a.Kind == core.ActShutdown || a.Kind == core.ActAbort || a.Kind == core.ActClose {
@@ -749,7 +836,7 @@ func (c *Conn) doAction(pa pendingAct) {
 	case core.ActOpenLane:
 		if start {
 			if !c.goSide(pd.lctx, "lane-open", func() { c.openLane(pd) }) {
-				c.wg.Done() // the session ended: no lane opens
+				c.side.done() // the session ended: no lane opens
 			}
 		} else if pd.opener == nil {
 			// A full critical section: the wakes and actions the failure

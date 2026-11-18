@@ -64,10 +64,10 @@ type ServerConfig struct {
 	Signer Signer
 	// LocalContext is passed to Gate.Credential, AppData and the ClientAnchor.
 	LocalContext any
-	// Key is the node's static key; required.
+	// StaticKey is the node's static key; required.
 	// crypto/ecdh keeps the private key unexported, so it cannot be
 	// zeroed when no longer used; it lives as long as the key value.
-	Key *ecdh.PrivateKey
+	StaticKey *ecdh.PrivateKey
 	// AppData supplies the application data of message 2; its request holds
 	// what is known of the client then (the Profile, the PSK identity and the
 	// data of message 1; the client's static key and credential arrive in
@@ -211,7 +211,7 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 			return reject(fmt.Errorf("%w: %w", errBinding, err))
 		}
 	}
-	hs, err := proto.NewResponder(proto.Config{Profile: h.Profile, Mode: h.Mode, Handle: h.Handle, PSK: psk, Binding: binding, Static: c.Key,
+	hs, err := proto.NewResponder(proto.Config{Profile: h.Profile, Mode: h.Mode, Handle: h.Handle, PSK: psk, Binding: binding, Static: c.StaticKey,
 		MaxAppData: c.MaxAppData})
 	if err != nil {
 		return reject(err)
@@ -307,7 +307,7 @@ var (
 func supported(p proto.Profile) bool { return p.Supported() }
 
 // Validate reports a configuration that cannot serve (ErrInvalidConfig): a
-// missing Key or Gate, or an unknown or reserved Profile among
+// missing StaticKey or Gate, or an unknown or reserved Profile among
 // AcceptedProfiles. zmux.NewListener calls it for a ServerConfig in
 // ListenerConfig.WrapPipe.
 func (c *ServerConfig) Validate() error {
@@ -318,8 +318,8 @@ func (c *ServerConfig) Validate() error {
 // accepted is the accepted set, or the configuration error.
 func (c *ServerConfig) accepted() ([]proto.Profile, error) {
 	switch {
-	case c.Key == nil:
-		return nil, fmt.Errorf("%w: ServerConfig without a Key", proto.ErrInvalidConfig)
+	case c.StaticKey == nil:
+		return nil, fmt.Errorf("%w: ServerConfig without a StaticKey", proto.ErrInvalidConfig)
 	case c.Gate == nil:
 		return nil, fmt.Errorf("%w: ServerConfig without a Gate", proto.ErrInvalidConfig)
 	case c.RequirePQAuth && c.ClientAnchor == nil:

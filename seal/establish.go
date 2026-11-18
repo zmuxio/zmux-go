@@ -64,10 +64,10 @@ type ClientConfig struct {
 	Signer Signer
 	// LocalContext is passed to the Anchor as VerifyInput.LocalContext.
 	LocalContext any
-	// Key is the client's static key; nil is a key generated once per process.
+	// StaticKey is the client's static key; nil is a key generated once per process.
 	// crypto/ecdh keeps the private key unexported, so it cannot be
 	// zeroed when no longer used; it lives as long as the key value.
-	Key *ecdh.PrivateKey
+	StaticKey *ecdh.PrivateKey
 	// Credential goes in message 3; nil: none.
 	Credential *Credential
 	// AppData supplies the application data of message 1, in Profiles 1 and 3
@@ -170,7 +170,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 			return q, err
 		}
 	}
-	key := cfg.Key
+	key := cfg.StaticKey
 	if key == nil {
 		if key, err = processKey(); err != nil {
 			return q, err

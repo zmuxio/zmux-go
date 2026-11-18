@@ -42,11 +42,11 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 		o = *opts
 	}
 	if s1 == nil || s2 == nil || s1 == s2 {
-		return DuplicateResult{}, ErrNoDecision
+		return DuplicateResult{}, ErrDuplicateUndecided
 	}
 	a, b := duplicateSnapshot(s1), duplicateSnapshot(s2)
 	if !a.established || !b.established || a.dialer == b.dialer || a.dialer == 0 || b.dialer == 0 {
-		return DuplicateResult{}, ErrNoDecision
+		return DuplicateResult{}, ErrDuplicateUndecided
 	}
 	var v1, v2 []byte
 	switch {
@@ -62,7 +62,7 @@ func ResolveDuplicate(s1, s2 *Conn, opts *DuplicateOptions) (DuplicateResult, er
 		binary.BigEndian.PutUint64(v1, a.roleNonce)
 		binary.BigEndian.PutUint64(v2, b.roleNonce)
 	default:
-		return DuplicateResult{}, ErrNoDecision
+		return DuplicateResult{}, ErrDuplicateUndecided
 	}
 	cmp := bytes.Compare(v1, v2)
 	if cmp == 0 {

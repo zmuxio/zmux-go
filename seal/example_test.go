@@ -34,7 +34,7 @@ func Example() {
 	handle, psk, _ := seal.DeriveHandlePSK(secret, []byte("example"), nil)
 	node, _ := ecdh.X25519().GenerateKey(rand.Reader)
 
-	server := &seal.ServerConfig{Gate: oneToken{handle, psk}, Key: node}
+	server := &seal.ServerConfig{Gate: oneToken{handle, psk}, StaticKey: node}
 	lst, err := zmux.NewListener(&zmux.ListenerConfig{WrapPipe: server})
 	if err != nil {
 		fmt.Println(err)
@@ -46,7 +46,7 @@ func Example() {
 
 	nc, _ := net.Dial("tcp", ln.Addr().String())
 	p, err := seal.Establish(ctx, zmux.NetPipe(nc), &seal.ClientConfig{
-		Anchor: seal.PinAnchor(seal.NodeKeyID(node.PublicKey().Bytes())),
+		Anchor: seal.PinAnchor(seal.StaticKeyID(node.PublicKey().Bytes())),
 		Handle: handle,
 		PSK:    psk,
 	})

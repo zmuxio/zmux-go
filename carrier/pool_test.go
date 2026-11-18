@@ -1,8 +1,11 @@
 package carrier
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,6 +150,7 @@ func TestPoolCancelledFailedDialTakesNoLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Release()
+	p.settle()
 	lease, err := p.Get(ctx) // the policy wants a second connection
 	if lease != nil {
 		lease.Release()
@@ -227,10 +231,12 @@ func TestPoolRejectsAndReportsInvalidDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.settle()
 	b, err := p.Get(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.settle()
 	if a.Conn != b.Conn {
 		t.Fatalf("connections %d and %d: the rejected Count 3 applied", a.Conn, b.Conn)
 	}
@@ -245,4 +251,80 @@ func TestPoolRejectsAndReportsInvalidDecision(t *testing.T) {
 	a.Release()
 	b.Release()
 	p.Shutdown()
+}
+
+// A Decide that returns an error rejects the look: the pool goes on as
+// with the zero decision and, without DecisionRejected, logs the error to
+// its own Logger at warning level.
+func TestPoolRejectedLookLogged(t *testing.T) {
+	errNo := errors.New("no")
+	var buf bytes.Buffer
+	n := 0
+	p := &ConnPool[int]{
+		Dial:   func(context.Context) (int, error) { n++; return n, nil },
+		Policy: rejectPolicy{errNo},
+	}
+	p.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+	a, _ := p.Get(context.Background())
+	p.settle()
+	b, _ := p.Get(context.Background())
+	p.settle()
+	if n != 1 || a.Conn != b.Conn {
+		t.Fatalf("%d dials: the rejected Count 3 applied", n)
+	}
+	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "error=no") {
+		t.Fatalf("logged %q", out)
+	}
+	a.Release()
+	b.Release()
+	p.Shutdown()
+}
+
+// rejectPolicy sets a decision and rejects the look.
+type rejectPolicy struct{ err error }
+
+func (p rejectPolicy) Decide(_ *zmux.PoolView, d *zmux.PoolDecision) error { d.Count = 3; return p.err }
+
+// TestPoolCountDropRetiresIdlest: a policy's Count below the open
+// connections retires the surplus, the longest idle first, which closes
+// once idle; the view reports SinceLastDial and Usable.
+func TestPoolCountDropRetiresIdlest(t *testing.T) {
+	n := 0
+	closed := map[int]bool{}
+	count := 2
+	var views []zmux.PoolView
+	p := &ConnPool[int]{
+		Dial:  func(context.Context) (int, error) { n++; return n, nil },
+		Close: func(c int) { closed[c] = true },
+		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
+			views = append(views, zmux.PoolView{SinceLastDial: v.SinceLastDial, Members: append([]zmux.PoolMember(nil), v.Members...)})
+			d.Count = count
+		}),
+	}
+	defer p.Shutdown()
+	ctx := context.Background()
+	a, err := p.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Release()
+	p.settle()
+	b, err := p.Get(ctx) // the policy wants a second connection
+	p.settle()
+	if err != nil || b.Conn == a.Conn {
+		t.Fatalf("second lease %+v, %v", b, err)
+	}
+	if len(views[0].Members) != 1 || views[0].Members[0].Pipes != 1 { // the look after the first member joined
+		t.Fatalf("first view %+v", views[0])
+	}
+	v := views[len(views)-1]
+	if v.SinceLastDial < 0 || len(v.Members) != 2 || !v.Members[0].Usable || !v.Members[1].Usable {
+		t.Fatalf("view %+v", v)
+	}
+	count = 1
+	b.Release() // b's connection is now idle, a's carries a pipe
+	p.settle()
+	if !closed[b.Conn] || closed[a.Conn] {
+		t.Fatalf("closed %v; want %d closed, %d open", closed, b.Conn, a.Conn)
+	}
 }

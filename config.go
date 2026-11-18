@@ -26,6 +26,16 @@ const (
 	DefaultMaxIdleTimeout = time.Duration(core.DefaultIdleTimeout)
 	// DefaultProbeJitter is the default Liveness.ProbeJitter.
 	DefaultProbeJitter = core.DefaultProbeJitter
+	// DefaultMaxLanes is the default Config.MaxLanes, the lanes accepted
+	// per inbound pipe.
+	DefaultMaxLanes = core.DefaultMaxLanes
+	// DefaultRecoveryRatio is the default CapacityFloor.RecoveryRatio.
+	DefaultRecoveryRatio = core.DefaultRecoveryRatio
+	// DefaultMinInterval is the default QualityBand.MinInterval.
+	DefaultMinInterval = time.Duration(core.DefaultMinInterval)
+	// DefaultFirstRecordTimeout is the default ListenerConfig.FirstRecordTimeout,
+	// and the time HandleLane waits for a lane's header.
+	DefaultFirstRecordTimeout = time.Duration(core.DefaultFirstRecordTimeout)
 	// DefaultJoinTimeout is the default Config.JoinTimeout.
 	DefaultJoinTimeout = time.Duration(core.DefaultHandshakeTimeout)
 	// DefaultMinBackoff is the default Backoff.Min, the first wait of the
@@ -155,12 +165,12 @@ type Config struct {
 
 	// SendBuffer starts the written-but-unreleased byte budget, in bytes.
 	// Zero is 4 MiB; a negative value is invalid. Multipath sessions grow
-	// it to the retransmit budget, within MaxSendBuffer.
+	// it to the retransmit budget, within SendBufferMax.
 	SendBuffer int64
-	// MaxSendBuffer fixes its growth maximum, in bytes; one below
+	// SendBufferMax fixes its growth maximum, in bytes; one below
 	// SendBuffer (or its default), or a negative one, is invalid. Zero is
 	// automatic: a 64 MiB floor, above it within the memory budget.
-	MaxSendBuffer int64
+	SendBufferMax int64
 
 	// MaxPipes is the attachments this endpoint aims for. Zero or 1 is
 	// multipath off; 8 is recommended when multipath is used.
@@ -170,7 +180,8 @@ type Config struct {
 	// ReplayWindow is W, the join replay window. Zero is
 	// max(64, 2*(MaxPipes+H)); a window below MaxPipes+H is invalid.
 	ReplayWindow int
-	// MaxLanes is the lanes accepted per inbound pipe. Zero is 258; 1
+	// MaxLanes is the lanes accepted per inbound pipe. Zero is
+	// DefaultMaxLanes (258); 1
 	// accepts the stream lane only.
 	MaxLanes int
 
@@ -234,7 +245,8 @@ type Config struct {
 	// Logger receives what the application would otherwise not see: a
 	// warning when the last pipe of a direction is removed while streams
 	// are open, a warning with EventResumeUnattended, and the failures of
-	// host callbacks that zmux contains (a panic in a hook). It is called
+	// host callbacks that zmux contains (a panic in a hook), and the pool
+	// policy decisions rejected without a DecisionRejected callback. It is called
 	// outside every lock and must not block; nil logs nothing. What the
 	// events and the Tracer report is not logged again.
 	Logger *slog.Logger
@@ -263,15 +275,14 @@ type Config struct {
 	// is the wait from the previous call to the next (at most
 	// RedialBackoff.Max; 0: the backoff), and Liveness applies to the pipe a
 	// call yields. Count and Retire are not used. A
-	// decision that fails PoolDecision.Validate is rejected: the call goes
-	// ahead as with the zero decision and the error is reported to
-	// DecisionRejected.
+	// Decide that returns an error or panics, or a decision that fails
+	// PoolDecision.Validate, is rejected: the call goes ahead as with the
+	// zero decision and the error is reported to DecisionRejected.
 	RedialPolicy PoolPolicy
-	// DecisionRejected, when set, receives the PoolDecision.Validate error
-	// (ErrInvalidConfig) of each decision of RedialPolicy the session
-	// rejected, on the goroutine that calls Redial and outside every lock;
-	// it must not block, and a panic in it is contained. Redialling goes
-	// on whether it is set or not.
+	// DecisionRejected, when set, receives the error of each look of
+	// RedialPolicy the session rejected, on the goroutine that calls Redial and outside every lock;
+	// it must not block, and a panic in it is contained. Unset, the error
+	// is logged to Logger. Redialling goes on either way.
 	DecisionRejected func(err error)
 	// AllowConnectionWindowIncrease approves session window growth.
 	AllowConnectionWindowIncrease func(delta uint64) bool
@@ -520,7 +531,7 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	l := &cc.Local
 	p := &c.SchedulerParams
 	if c.LatencyBudget < 0 || c.InitialStreamReceiveWindow < 0 || c.MaxStreamReceiveWindow < 0 ||
-		c.InitialConnectionReceiveWindow < 0 || c.MaxConnectionReceiveWindow < 0 || c.SendBuffer < 0 || c.MaxSendBuffer < 0 ||
+		c.InitialConnectionReceiveWindow < 0 || c.MaxConnectionReceiveWindow < 0 || c.SendBuffer < 0 || c.SendBufferMax < 0 ||
 		c.DatagramSendQueue < 0 || c.DatagramReceiveQueue < 0 || c.DatagramStreamQueue < 0 || c.DatagramReceiveBytes < 0 ||
 		c.MaxPipes < 0 || c.PipeHeadroom < 0 || c.ReplayWindow < 0 || c.MaxLanes < 0 || c.ResumeTimeout < 0 ||
 		c.JoinTimeout < 0 ||
@@ -558,7 +569,7 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	}
 	cc.SetLiveness(clv)
 	if v := uint64(c.InitialStreamReceiveWindow); v != 0 {
-		if v < 4096 {
+		if v < core.MinStreamWindow {
 			return cc, fmt.Errorf("%w: InitialStreamReceiveWindow below 4 KiB", ErrInvalidConfig)
 		}
 		l.MaxStreamDataBidiLoc, l.MaxStreamDataBidiRem, l.MaxStreamDataUni = v, v, v
@@ -599,7 +610,7 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	}
 	// The preamble limit: 4096, or the smallest initial window and a
 	// quarter of the session window when smaller, at least 1024.
-	pre := min(uint64(4096), l.MaxStreamDataBidiRem, l.MaxStreamDataUni, l.InitialMaxData/4)
+	pre := min(uint64(core.MinStreamWindow), l.MaxStreamDataBidiRem, l.MaxStreamDataUni, l.InitialMaxData/4)
 	l.Preamble = max(pre, 1024)
 	if c.EnableDatagrams {
 		cc.Datagrams = true
@@ -626,10 +637,10 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	if c.SendBuffer > 0 {
 		cc.SendBuffer = uint64(c.SendBuffer)
 	}
-	if c.MaxSendBuffer != 0 && uint64(c.MaxSendBuffer) < cc.SendBuffer {
-		return cc, fmt.Errorf("%w: MaxSendBuffer %d below SendBuffer %d", ErrInvalidConfig, c.MaxSendBuffer, cc.SendBuffer)
+	if c.SendBufferMax != 0 && uint64(c.SendBufferMax) < cc.SendBuffer {
+		return cc, fmt.Errorf("%w: SendBufferMax %d below SendBuffer %d", ErrInvalidConfig, c.SendBufferMax, cc.SendBuffer)
 	}
-	cc.SendBufferMax = uint64(c.MaxSendBuffer)
+	cc.SendBufferMax = uint64(c.SendBufferMax)
 	if c.MaxLanes > 0 {
 		l.MaxLanes = uint64(c.MaxLanes)
 	}

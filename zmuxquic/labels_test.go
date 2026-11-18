@@ -49,14 +49,17 @@ func TestGoroutineLabels(t *testing.T) {
 		_ = s.Wait()
 	}()
 	dump, missing := labelled(t, ctx, []string{
-		`{"app.req":"42", "zmux":"quic-conn"}`,
 		`{"app.req":"42", "zmux":"quic-accept-pipes"}`,
 		`{"app.req":"42", "zmux":"quic-accept-lanes"}`,
-		`{"app.req":"42", "zmux":"quic-release"}`,
 		`{"zmux":"quic-client-lanes"}`,
 	})
 	for _, want := range missing {
 		t.Errorf("no goroutine labelled %s", want)
+	}
+	// A connection is served by its two accept loops alone: no goroutine
+	// waits for its end, its handshake or its ServeConn.
+	if regexp.MustCompile(`"zmux":"quic-(conn|release|handshake)"`).Match(dump) {
+		t.Error("a resident goroutine per connection beyond the accept loops")
 	}
 	if regexp.MustCompile(`"app.req":"42", "zmux":"(read|write)"`).Match(dump) {
 		t.Error("a session goroutine took the caller's labels")

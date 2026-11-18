@@ -156,8 +156,8 @@ func rejected(err error) error {
 // KeyID is the KeyId of a key, the name a pin and a verdict use for it.
 func KeyID(alg proto.KeyAlg, key []byte) (proto.KeyID, error) { return proto.KeyIDOf(alg, key) }
 
-// NodeKeyID is the KeyId of an X25519 node key, for PinAnchor.
-func NodeKeyID(pub []byte) proto.KeyID {
+// StaticKeyID is the KeyId of an X25519 static public key, for PinAnchor.
+func StaticKeyID(pub []byte) proto.KeyID {
 	id, err := proto.KeyIDOf(proto.KeyAlgX25519, pub)
 	if err != nil {
 		return proto.KeyID{}

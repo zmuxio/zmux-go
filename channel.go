@@ -71,7 +71,7 @@ func (c *Conn) startChannel(pd *pipeDrv) {
 	pd.chEnd = make(chan struct{})
 	pd.chReady = make(chan struct{})
 	c.s.SetChannelSignal(pd.id, pd.chSig)
-	c.wg.Add(1)
+	c.side.add()
 	pd.gs.add()
 	labels.Go(pd.lctx, "channel", func() {
 		defer pd.gs.done()
@@ -82,7 +82,7 @@ func (c *Conn) startChannel(pd *pipeDrv) {
 		})
 		close(pd.chReady)
 		if err != nil {
-			c.wg.Done()
+			c.side.done()
 			pd.closeAll() // a carrier whose channel panicked fails
 			return
 		}
@@ -114,7 +114,7 @@ func (pd *pipeDrv) endChannel() {
 // startChannel is stopped when it returns. It owns the channel's sending
 // side.
 func (c *Conn) channelLoop(pd *pipeDrv) {
-	defer c.wg.Done()
+	defer c.side.done()
 	defer func() {
 		if p := recover(); p != nil {
 			c.fail(p)

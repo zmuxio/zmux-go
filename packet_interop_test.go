@@ -291,7 +291,7 @@ func interopPacketRelay(t *testing.T, ctx context.Context, c *Conn) { //nolint:t
 		t.Fatalf("relay: %d packets back of %d", len(rest)+got, n)
 	}
 	sr := <-spliced
-	if sr.AtoB.DatagramsEncapsulated < 1 || sr.AtoB.End.Kind != SpliceFinished || sr.BtoA.End.Kind != SpliceFinished {
+	if sr.AtoB.DatagramsAsCapsules < 1 || sr.AtoB.End.Kind != SpliceFinished || sr.BtoA.End.Kind != SpliceFinished {
 		t.Fatalf("relay: %+v", sr)
 	}
 }

@@ -20,7 +20,7 @@ func TestPreambleTooLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 	var tl *PreambleTooLargeError
-	if err := st.SetPreamble(make([]byte, 5000)); !errors.As(err, &tl) || tl.Max != 4096 {
+	if err := st.SetPreamble(make([]byte, 5000)); !errors.As(err, &tl) || tl.Max != 4096 || !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("SetPreamble = %v, want max 4096", err)
 	}
 	if err := st.AddPreambleTLV(0x1000, make([]byte, 5000)); !errors.As(err, &tl) {

@@ -89,7 +89,7 @@ func TestStreamWaitWritableIsRoomNotCredit(t *testing.T) {
 	gb := &gatedConn{Conn: b}
 	scfg := &Config{InitialStreamReceiveWindow: 32 << 20, MaxStreamReceiveWindow: 32 << 20,
 		InitialConnectionReceiveWindow: 32 << 20, MaxConnectionReceiveWindow: 32 << 20}
-	client, server := pair(t, a, gb, &Config{SendBuffer: 64 << 10, MaxSendBuffer: 64 << 10}, scfg)
+	client, server := pair(t, a, gb, &Config{SendBuffer: 64 << 10, SendBufferMax: 64 << 10}, scfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	st, err := client.OpenStreamSync(ctx)
@@ -155,7 +155,7 @@ func TestStreamCloseWakesWaitWritable(t *testing.T) {
 	gb := &gatedConn{Conn: b}
 	scfg := &Config{InitialStreamReceiveWindow: 32 << 20, MaxStreamReceiveWindow: 32 << 20,
 		InitialConnectionReceiveWindow: 32 << 20, MaxConnectionReceiveWindow: 32 << 20}
-	client, server := pair(t, a, gb, &Config{SendBuffer: 64 << 10, MaxSendBuffer: 64 << 10}, scfg)
+	client, server := pair(t, a, gb, &Config{SendBuffer: 64 << 10, SendBufferMax: 64 << 10}, scfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	st, err := client.OpenStreamSync(ctx)

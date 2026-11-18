@@ -150,6 +150,9 @@ func (r *runner) coreCarrier(c *rcarrier) core.Carrier {
 // closeCarrier ends a carrier of the listener.
 func (r *runner) closeCarrier(c *rcarrier, outcome string) {
 	c.rejected, c.outcome = true, outcome
+	if c.pj != nil {
+		r.unconfirmed.Drop(c.pj)
+	}
 	c.buf, c.msgs, c.heldHello, c.pj = nil, nil, nil, nil
 	r.pending.Leave(c.slot)
 	c.slot = nil
@@ -191,6 +194,9 @@ func (r *runner) offerHello(c *rcarrier, h *join.Hello) {
 	case core.JoinAccepted:
 		c.reply, c.pj, c.outcome = reply, pj, "accept"
 		c.pipe = pj.Pipe.ID
+		if old, ok := r.unconfirmed.Hold(pj, c, r.unconfirmedCap); ok {
+			r.closeCarrier(old, "accept") // a failed join; its outcome stays the accepted join's
+		}
 		r.peerReadsReply(c)
 		if c.joiner != nil && c.confirm {
 			r.writeConfirm(c)
@@ -237,6 +243,7 @@ func (r *runner) readConfirm(c *rcarrier, b []byte) {
 		return
 	}
 	pj := c.pj
+	r.unconfirmed.Drop(pj)
 	res := r.s.ConfirmJoin(pj, r.coreCarrier(c))
 	r.drainEvents()
 	if res != core.JoinAccepted {

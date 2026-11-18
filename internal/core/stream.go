@@ -54,6 +54,10 @@ type Stream struct {
 	// Scheduler and control links.
 	sch     schedLink
 	ctlNext *Stream
+	ctlPrev *Stream
+	// copyNext and copyPrev link the streams whose latest MAX_STREAM_DATA
+	// rides the redundant snapshot (copyMSD; Session.copyHead).
+	copyNext, copyPrev *Stream
 
 	dg *streamDgrams
 
@@ -122,6 +126,9 @@ type streamExt struct {
 	reqPrio        bool // a priority request exists
 	reqUrgency     uint8
 	reqIncr        bool
+	openPrio       bool // the opening preamble carried a PRIORITY request
+	openUrgency    uint8
+	openIncr       bool
 	prioApplied    bool
 
 	capWait bool // in Session.capWaiters (WaitSendCapacity)
@@ -171,6 +178,7 @@ const (
 
 type sendPart struct {
 	q        sendQ
+	unsentC  uint64 // the part's share of Session.unsent (syncUnsent)
 	sent     uint64 // every byte below was sent at least once
 	maxData  uint64 // peer's limit
 	blocked  uint64 // limit+1 at which STREAM_DATA_BLOCKED was sent
@@ -215,7 +223,8 @@ type recvPart struct {
 	highest   uint64
 	final     uint64
 	readOff   uint64 // wire offset consumed (read, discarded or preamble)
-	window    uint64
+	window    uint64 // the advertised window: auto-tuning grows it
+	initWin   uint64 // the initial window as set (0: the local parameters')
 	adv       uint64 // advertised limit L
 	stopCode  uint64
 	resetCode uint64
@@ -225,9 +234,10 @@ type recvPart struct {
 	preSize   uint64
 	blockSeen uint64 // largest STREAM_DATA_BLOCKED limit reported
 	tune      *tuner
-	maxWin    uint64 // SetReceiveWindow max (0: the session's cap)
+	maxWin    uint64 // the cap SetReceiveWindow set (0: automatic), when maxSet
 
 	state    recvState
+	maxSet   bool // SetReceiveWindow set the cap, automatic or not; else the session's
 	finKnown bool
 	stopped  bool
 	stopSent bool
@@ -409,6 +419,10 @@ func (s *Session) allocID(st *Stream) bool {
 				s.greaseFirst = false
 			}
 		}
+		if pre.HasPriority {
+			x := st.x()
+			x.openPrio, x.openUrgency, x.openIncr = true, pre.Urgency, pre.Incr
+		}
 		b := wire.AppendPreamble(make([]byte, 0, pre.Size()), &pre)
 		st.snd.preLen = uint64(len(b))
 		h := s.heldEnter(st)
@@ -494,16 +508,7 @@ func (st *Stream) applyPeerParams() {
 		// Receive windows come from the local parameters, which are what
 		// the peer knows: a window SetReceiveWindow raised before is
 		// advertised by MAX_STREAM_DATA.
-		l := &s.cfg.Local
-		var w uint64
-		switch {
-		case !st.bidi:
-			w = l.MaxStreamDataUni
-		case st.local:
-			w = l.MaxStreamDataBidiLoc
-		default:
-			w = l.MaxStreamDataBidiRem
-		}
+		w := s.localWindow(st)
 		r.adv = w
 		if r.window == 0 {
 			r.window = w
@@ -640,6 +645,28 @@ func (s *Session) SetPriority(st *Stream, urgency uint8, incr bool) {
 	}
 	st.urgency, st.incr = urgency, incr
 	s.sched.reprio(st)
+}
+
+// Priority returns the local scheduling priority of st's sending part:
+// the last value set by SetPriority or by the peer's PRIORITY signals.
+func (s *Session) Priority(st *Stream) (urgency uint8, incr bool) { return st.urgency, st.incr }
+
+// PeerPriority returns the priority this endpoint last requested for the
+// peer's sending part of st (the preamble's PRIORITY TLV or a PRIORITY_UPDATE,
+// whichever came last); ok is false when none was requested.
+func (s *Session) PeerPriority(st *Stream) (urgency uint8, incr, ok bool) {
+	if x := st.ext; x != nil {
+		if x.reqPrio {
+			return x.reqUrgency, x.reqIncr, true
+		}
+		if x.openPrio {
+			return x.openUrgency, x.openIncr, true
+		}
+	}
+	if p := st.pre; p != nil && p.HasPriority {
+		return p.Urgency, p.Incr, true
+	}
+	return 0, false, false
 }
 
 // SetPeerPriority requests a priority for the peer's sending part:

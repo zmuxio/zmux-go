@@ -87,6 +87,11 @@ const (
 	DefaultKeepAlive   = 15 * Second // keep-alive period
 	DefaultIdleTimeout = 30 * Second // max_idle_timeout
 	DefaultProbeJitter = 0.25        // probe jitter j
+	DefaultMaxLanes    = 258         // lanes accepted per inbound pipe
+	// DefaultRecoveryRatio is the capacity floor's recovery ratio.
+	DefaultRecoveryRatio = 1.25
+	// DefaultMinInterval is the least time between two quality events of a pipe.
+	DefaultMinInterval = Second
 )
 
 // PendingCarriers bounds the carriers of one listener before they belong

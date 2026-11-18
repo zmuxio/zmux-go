@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("\x2a\x40\xc8")
+uint16(100)

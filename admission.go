@@ -470,12 +470,7 @@ func (l *Listener) arrive(source, peer netip.AddrPort) (*Arrival, error) {
 	if err != nil {
 		return nil, err
 	}
-	l.mu.Lock()
-	watch := l.startWatchLocked()
-	l.mu.Unlock()
-	if watch != nil {
-		watch()
-	}
+	l.startWatch()
 	return &Arrival{l: l, src: source, peer: peer, key: key, slot: slot}, nil
 }
 
@@ -483,15 +478,15 @@ func (l *Listener) arrive(source, peer netip.AddrPort) (*Arrival, error) {
 // refusal; the error is net.ErrClosed, errRefused (the source's share) or
 // errRejected (every slot taken, none stalled).
 func (l *Listener) enter(key netip.Prefix) (*core.PendingSlot, error) {
-	l.mu.Lock()
-	closed := l.closed
+	l.pmu.Lock()
+	closed := l.pclosed
 	var slot *core.PendingSlot
 	var evicted func()
 	r := core.EnterSourceFull
 	if !closed {
 		slot, evicted, r = l.pending.Enter(key)
 	}
-	l.mu.Unlock()
+	l.pmu.Unlock()
 	if evicted != nil {
 		evicted()
 	}
@@ -542,9 +537,9 @@ func (l *Listener) leave(slot *core.PendingSlot) {
 	if slot == nil {
 		return
 	}
-	l.mu.Lock()
+	l.pmu.Lock()
 	l.pending.Leave(slot)
-	l.mu.Unlock()
+	l.pmu.Unlock()
 }
 
 // takeSlot hands the arrival's slots on to a carrier: the ones Arrive took
@@ -977,9 +972,9 @@ func (a *Arrival) stallSlot(counted bool, evict func()) (d time.Duration, releas
 	a.mu.Lock()
 	slot := a.slot
 	a.mu.Unlock()
-	l.mu.Lock()
-	ok = !l.closed && l.pending.Stall(slot, evict)
-	l.mu.Unlock()
+	l.pmu.Lock()
+	ok = !l.pclosed && l.pending.Stall(slot, evict)
+	l.pmu.Unlock()
 	if counted {
 		if ok {
 			l.st.adm.stalled.Add(1)
@@ -991,9 +986,9 @@ func (a *Arrival) stallSlot(counted bool, evict func()) (d time.Duration, releas
 		return 0, nil, false
 	}
 	return l.stallDuration(a.key), func() {
-		l.mu.Lock()
+		l.pmu.Lock()
 		l.pending.Unstall(slot)
-		l.mu.Unlock()
+		l.pmu.Unlock()
 	}, true
 }
 

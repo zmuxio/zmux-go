@@ -117,7 +117,7 @@ func (s *Session) sawPeer(p *Pipe) {
 
 // attach is the per-attachment state of a multipath session.
 type attach struct {
-	group     *join.Group // a local join's key exchange
+	group     *join.Group // the key exchange of the pipe's Join
 	joinEpoch uint64      // the epoch of a local join's Hello
 	// The SESSION_EPOCH frame repeated until the next phase: sent on this pipe
 	// (epochSent) at epochAt, again one probe interval later.

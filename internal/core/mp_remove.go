@@ -116,7 +116,7 @@ func (s *Session) RemovePipe(id uint64, graceful bool) error {
 		return ErrInvalid
 	}
 	if !graceful {
-		s.failPipe(p, wire.PipeFailed, nil)
+		s.failPipe(p, wire.PipeFailed, ErrPipeAborted)
 		return nil
 	}
 	s.startDrain(p)
@@ -130,8 +130,8 @@ func (s *Session) startDrain(p *Pipe) {
 		return
 	}
 	if a.hs {
-		// A graceful removal needs the carrier.
-		s.failPipe(p, wire.PipeFailed, nil)
+		// A graceful removal needs the carrier: this endpoint aborts it.
+		s.failPipe(p, wire.PipeFailed, ErrPipeAborted)
 		return
 	}
 	a.draining = true

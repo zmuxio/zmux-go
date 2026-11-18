@@ -186,10 +186,18 @@ func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener, fallback func
 		if err != nil {
 			return err
 		}
-		labels.Go(ctx, "quic-conn", func() { _ = ServeConn(ctx, l, qc, fallback) })
+		if err := ServeConn(ctx, l, qc, fallback); err != nil {
+			return err
+		}
 	}
 }
 
+// ServeConn does not block: it returns once the connection is handed to l,
+// not when the connection ends. Code that waited for ServeConn to learn that
+// the connection ended must wait for its sessions, or for qc's Context,
+// instead; closing qc or cancelling a defer after ServeConn returns ends
+// the connection's service.
+//
 // ServeConn serves one established QUIC connection that the caller
 // accepted or dialled, such as one made by hole punching, exactly as Serve
 // serves each connection it accepts (Serve calls it): the connection takes
@@ -200,13 +208,14 @@ func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener, fallback func
 // that sessions started on it are returned by Accept on l and its pipes
 // join sessions of l. A connection refused is closed.
 //
-// ServeConn returns when the connection ends (nil) or ctx ends
-// (ctx.Err()); after ctx ends no further stream of the connection is
-// handed to l, while the connection and its sessions continue, as with
-// Serve. On a closed listener it closes qc and returns net.ErrClosed. A
-// connection that never carried a session (refused, stalled, fallback) is
-// closed with code 0; one that did stays open after its sessions end, for
-// the client to close with the last session's code, or its idle timeout.
+// ServeConn returns nil once the connection is handed to l, or net.ErrClosed (after closing qc) on a closed listener. The
+// connection is then served on two goroutines, which accept its
+// bidirectional and unidirectional streams, until it ends; after ctx ends
+// no further stream of it is handed to l, while the connection and its
+// sessions continue, as with Serve. A connection that never carried a
+// session (refused, stalled, fallback) is closed with code 0; one that did
+// stays open after its sessions end, for the client to close with the last
+// session's code, or its idle timeout.
 func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) error {
 	a, err := l.Adapter().Arrive(netip.AddrPort{}, addrPort(qc.RemoteAddr()))
 	if err != nil {
@@ -216,39 +225,54 @@ func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn, fallback fu
 		}
 		return nil // refused: the connection ended
 	}
-	// A connection without a stream gives its slot back when it ends.
-	labels.Go(ctx, "quic-release", func() {
-		<-qc.Context().Done()
-		a.Release()
-	})
 	if a.Admitted() {
-		var used atomic.Bool
-		labels.Go(ctx, "quic-handshake", func() { watchHandshake(qc, a, &used) })
-		labels.Go(ctx, "quic-accept-lanes", func() { acceptLanes(ctx, qc, a, &used) })
-		labels.Go(ctx, "quic-accept-pipes", func() { acceptPipes(ctx, qc, a, &used) })
-		return served(ctx, qc)
+		// The connection's end gives its slot back, and counts a handshake
+		// that failed before any of its streams became a pipe input (a
+		// stream that arrived in 0-RTT is counted by the listener itself).
+		used := new(atomic.Bool)
+		context.AfterFunc(qc.Context(), func() {
+			select {
+			case <-qc.HandshakeComplete():
+			default:
+				if !used.Load() {
+					a.HandshakeFailed()
+				}
+			}
+			a.Release()
+		})
+		labels.Go(ctx, "quic-accept-lanes", func() { acceptLanes(ctx, qc, a, used) })
+		labels.Go(ctx, "quic-accept-pipes", func() { acceptPipes(ctx, qc, a, used) })
+		return nil
 	}
+	context.AfterFunc(qc.Context(), a.Release) // a connection without a stream gives its slot back when it ends
+	labels.Go(ctx, "quic-accept-pipes", func() { admitConn(ctx, qc, a, fallback) })
+	return nil
+}
+
+// admitConn admits qc by its first bidirectional stream once its handshake
+// completed, then accepts its streams: the bidirectional ones on this
+// goroutine, the lanes on another.
+func admitConn(ctx context.Context, qc *quic.Conn, a *zmux.Arrival, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) {
 	select {
 	case <-qc.HandshakeComplete():
 	case <-qc.Context().Done():
 		a.HandshakeFailed()
-		return nil
+		return
 	case <-ctx.Done():
-		return ctx.Err()
+		return
 	}
 	if qc.ConnectionState().Used0RTT {
 		a.HandshakeFailed()
 		_ = qc.CloseWithError(0, "")
-		return nil
+		return
 	}
 	// A connection without a stream ends with its idle timeout.
 	s, err := qc.AcceptStream(ctx)
 	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if ctx.Err() == nil {
+			_ = qc.CloseWithError(0, "")
 		}
-		_ = qc.CloseWithError(0, "")
-		return nil
+		return
 	}
 	var fb func(context.Context, zmux.PipeIO)
 	if fallback != nil {
@@ -257,38 +281,11 @@ func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn, fallback fu
 	p, ok := a.Admit(ctx, streamPipe(qc, s), fb)
 	if !ok {
 		_ = qc.CloseWithError(0, "")
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return nil
+		return
 	}
 	labels.Go(ctx, "quic-accept-lanes", func() { acceptLanes(ctx, qc, a, nil) })
-	labels.Go(ctx, "quic-accept-pipes", func() { acceptPipes(ctx, qc, a, nil) })
 	labels.Go(ctx, "quic-pipe", func() { _ = a.HandlePipe(ctx, p, zmux.PipeHint{}) })
-	return served(ctx, qc)
-}
-
-// served waits for the end of qc (nil) or of ctx (its error).
-func served(ctx context.Context, qc *quic.Conn) error {
-	select {
-	case <-qc.Context().Done():
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// watchHandshake counts a connection whose handshake failed before any of
-// its streams became a pipe input; a stream that arrived in 0-RTT is
-// counted by the listener itself.
-func watchHandshake(qc *quic.Conn, a *zmux.Arrival, used *atomic.Bool) {
-	select {
-	case <-qc.HandshakeComplete():
-	case <-qc.Context().Done():
-		if !used.Load() {
-			a.HandshakeFailed()
-		}
-	}
+	acceptPipes(ctx, qc, a, nil)
 }
 
 // acceptPipes hands the bidirectional streams of a connection to a's

@@ -519,13 +519,12 @@ func (s *Session) writeCreditCopies(w *recWriter) {
 			s.copyMaxData = false
 		}
 	}
-	for _, st := range s.streams {
-		if !st.copyMSD {
-			continue
-		}
+	for st := s.copyHead; st != nil; {
+		next := st.copyNext
 		id, v := st.id, st.rcv.adv
 		if w.frame(1+varint.SizeVarint(id)+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendMaxStreamData(b, id, v) }) {
-			st.copyMSD = false
+			s.unlinkCopyMSD(st)
 		}
+		st = next
 	}
 }

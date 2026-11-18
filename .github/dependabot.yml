@@ -1,0 +1,43 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Every module of the workspace. The sibling modules of this repository are
+  # resolved through go.work, and quic-go moves with webtransport-go (see the
+  # weekly workflow), so none of them is proposed here.
+  - package-ecosystem: gomod
+    directories:
+      - /
+      - /seal
+      - /zmuxws
+      - /examples/xorpipe
+      - /interop/webpeer
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: github.com/zmuxio/zmux-go
+      - dependency-name: github.com/zmuxio/zmux-go/*
+
+  - package-ecosystem: gomod
+    directories:
+      - /zmuxquic
+      - /zmuxh3
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: github.com/zmuxio/zmux-go
+      - dependency-name: github.com/zmuxio/zmux-go/*
+      - dependency-name: github.com/quic-go/quic-go
+      - dependency-name: github.com/quic-go/webtransport-go

@@ -379,6 +379,9 @@ func (s *Session) SendDatagram(st *Stream, context uint64, p []byte) error {
 	}
 	var prefix []byte
 	if st != nil {
+		if st.appReleased() {
+			return &StreamError{Kind: StreamClosedLocally, StreamID: st.id} // the application is done with the stream
+		}
 		if s.peerSeen && !s.feat.Flows || !st.bidi {
 			return ErrNotNegotiated
 		}

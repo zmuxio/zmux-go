@@ -581,12 +581,14 @@ func (s *Session) maybeDiscard(st *Stream) {
 		return
 	}
 	st.discarded = true
+	s.syncUnsent(st)
 	delete(s.streams, st.id)
 	if s.shp != nil {
 		s.shapeStream(shaping.EventStreamEnd, st.id)
 	}
 	s.sched.remove(st)
 	s.unlinkCtl(st)
+	s.unlinkCopyMSD(st)
 	s.unbindLane(st)
 	if st.hasR {
 		if d := st.rcv.buf.clear(); d > 0 {
@@ -627,22 +629,48 @@ func (s *Session) unlinkCtl(st *Stream) {
 	}
 	st.ctl = 0
 	st.inCtl = false
-	var prev *Stream
-	for x := s.ctlHead; x != nil; x = x.ctlNext {
-		if x == st {
-			if prev == nil {
-				s.ctlHead = x.ctlNext
-			} else {
-				prev.ctlNext = x.ctlNext
-			}
-			if s.ctlTail == x {
-				s.ctlTail = prev
-			}
-			x.ctlNext = nil
-			return
-		}
-		prev = x
+	if st.ctlPrev == nil {
+		s.ctlHead = st.ctlNext
+	} else {
+		st.ctlPrev.ctlNext = st.ctlNext
 	}
+	if st.ctlNext == nil {
+		s.ctlTail = st.ctlPrev
+	} else {
+		st.ctlNext.ctlPrev = st.ctlPrev
+	}
+	st.ctlNext, st.ctlPrev = nil, nil
+}
+
+// markCopyMSD lists st for a copy of its latest MAX_STREAM_DATA in the
+// redundant snapshot.
+func (s *Session) markCopyMSD(st *Stream) {
+	if st.copyMSD {
+		return
+	}
+	st.copyMSD = true
+	st.copyPrev, st.copyNext = nil, s.copyHead
+	if s.copyHead != nil {
+		s.copyHead.copyPrev = st
+	}
+	s.copyHead = st
+}
+
+// unlinkCopyMSD takes st off the copy list.
+func (s *Session) unlinkCopyMSD(st *Stream) {
+	if !st.copyMSD {
+		return
+	}
+	st.copyMSD = false
+	if st.copyPrev == nil {
+		s.copyHead = st.copyNext
+	} else {
+		st.copyPrev.copyNext = st.copyNext
+	}
+	if st.copyNext != nil {
+		st.copyNext.copyPrev = st.copyPrev
+	}
+	st.copyNext, st.copyPrev = nil, nil
 }
 
 // failAllStreams gives every stream the session error (close).
@@ -663,6 +691,8 @@ func (s *Session) releaseAll() {
 		}
 		s.sched.remove(st)
 		s.unlinkCtl(st)
+		s.unlinkCopyMSD(st)
+		st.snd.unsentC = 0
 	}
 	for _, st := range s.streams {
 		drop(st)
@@ -673,7 +703,8 @@ func (s *Session) releaseAll() {
 	s.conn.buffered, s.conn.sendHeld, s.conn.smallHeld, s.conn.bigCount = 0, 0, 0, 0
 	s.conn.pins = pinSet{}
 	s.sched = scheduler{}
-	s.ctlHead, s.ctlTail = nil, nil
+	s.ctlHead, s.ctlTail, s.copyHead = nil, nil, nil
+	s.unsent = 0
 }
 
 // streamFIFO is a FIFO of streams.
@@ -701,25 +732,63 @@ func (f *streamFIFO) pop() *Stream {
 
 func (f *streamFIFO) len() int { return len(f.q) - f.head }
 
-// SetReceiveWindow sets a receiving part's window: initial raises the
-// advertised limit at once, limit caps auto-tuning and the unread bytes. Values
-// below 16 KiB are raised to 16 KiB; 0 leaves a value as it is.
-func (s *Session) SetReceiveWindow(st *Stream, initial, limit uint64) {
+// localWindow is the initial receive window the local parameters give a
+// stream's receiving part: what the peer is told when the stream opens.
+func (s *Session) localWindow(st *Stream) uint64 {
+	l := &s.cfg.Local
+	switch {
+	case !st.bidi:
+		return l.MaxStreamDataUni
+	case st.local:
+		return l.MaxStreamDataBidiLoc
+	default:
+		return l.MaxStreamDataBidiRem
+	}
+}
+
+// ReceiveWindow returns a receiving part's window settings as they were set:
+// the initial window (SetReceiveWindow, else the session's), never the window
+// auto-tuning has grown it to, and the cap (SetReceiveWindow, else the
+// session's StreamWindowCap; 0: automatic).
+func (s *Session) ReceiveWindow(st *Stream) (initial, limit uint64) {
 	r := &st.rcv
-	if limit > 0 {
-		r.maxWin = max64(limit, 16<<10)
+	initial = r.initWin
+	if initial == 0 {
+		initial = s.localWindow(st)
 	}
-	if initial > 0 {
-		w := max64(initial, 16<<10)
-		if r.maxWin > 0 {
-			w = min64(w, r.maxWin)
-		}
-		if w > r.window {
-			r.window = w
-			s.queueCtl(st, ctlMaxStreamData)
-			s.wakeAllWriters()
-		}
+	limit = r.maxWin
+	if !r.maxSet {
+		limit = s.cfg.StreamWindowCap
 	}
+	return initial, limit
+}
+
+// MinStreamWindow is the smallest initial stream receive window: the floor of
+// the configured one, and of what SetReceiveWindow takes.
+const MinStreamWindow = 4096
+
+// SetReceiveWindow sets a receiving part's window: initial is advertised at
+// once when it is above the window in force, limit caps auto-tuning (0: no
+// cap but the session's memory allowance, whatever the session's configured
+// cap is). An initial below 4 KiB (the floor of the configured initial
+// window) or a nonzero limit below initial is ErrInvalid and changes nothing.
+// Credit already advertised is never withdrawn: an initial below the window in
+// force changes only what ReceiveWindow reads back.
+func (s *Session) SetReceiveWindow(st *Stream, initial, limit uint64) error {
+	if initial < MinStreamWindow || (limit != 0 && limit < initial) {
+		return ErrInvalid
+	}
+	r := &st.rcv
+	w := initial
+	r.initWin = w
+	r.maxSet = true
+	r.maxWin = limit
+	if w > r.window {
+		r.window = w
+		s.queueCtl(st, ctlMaxStreamData)
+		s.wakeAllWriters()
+	}
+	return nil
 }
 
 // ReadChunk consumes up to max contiguous bytes without copying. buf, when not

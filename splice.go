@@ -128,6 +128,16 @@ func (g guardedLimiter) police(n int) (int64, bool) {
 	return got, got > 0
 }
 
+// policeGuarded is police on l, which the splice entry guarded already (it
+// is wrapped here only when a caller passed it unguarded).
+func policeGuarded(l Limiter, n int) (int64, bool) {
+	g, ok := l.(guardedLimiter)
+	if !ok {
+		g = guardedLimiter{l}
+	}
+	return g.police(n)
+}
+
 // SpliceOptions configure Splice.
 type SpliceOptions struct {
 	// AtoB and BtoA limit the two directions (nil: none).
@@ -142,17 +152,21 @@ type SpliceDirection struct {
 	Bytes         uint64 // stream bytes forwarded
 	DatagramBytes uint64 // datagram payload bytes forwarded
 	// DatagramsDropped counts every datagram not forwarded; of them,
-	// DatagramsTooLarge did not fit the next hop's MaxDatagramPayload and
-	// DatagramsLimited were refused by the direction's Limiter or the next
-	// session's send limiter. SplicePackets forwards datagrams that do not
-	// fit as capsules instead (DatagramsEncapsulated), so its
-	// DatagramsTooLarge stays 0.
+	// DatagramsTooLarge were dropped for their size and DatagramsLimited
+	// were refused by the direction's Limiter or the next session's send
+	// limiter. Splice drops for its size a datagram larger than the next
+	// hop's MaxDatagramPayload. SplicePackets forwards such a datagram as
+	// a capsule instead (DatagramsAsCapsules) and drops for its size only
+	// one larger than DefaultMaxPacket; a capsule it could not write for
+	// another reason (the downstream stream ended or was reset, the splice
+	// ended) counts in DatagramsDropped alone, as does a datagram whose next
+	// session does not use stream datagrams.
 	DatagramsDropped, DatagramsTooLarge, DatagramsLimited uint64
-	// DatagramsEncapsulated counts the datagrams SplicePackets forwarded
-	// as DATAGRAM capsules on the stream (their payload is in
-	// DatagramBytes); 0 for Splice.
-	DatagramsEncapsulated uint64
-	End                   SpliceEnd // how the direction ended
+	// DatagramsAsCapsules counts the datagrams SplicePackets forwarded
+	// as DATAGRAM capsules on the stream, once written whole (their
+	// payload is in DatagramBytes); 0 for Splice.
+	DatagramsAsCapsules uint64
+	End                 SpliceEnd // how the direction ended
 }
 
 // SpliceEndKind is the event that ended a direction of a splice.
@@ -165,7 +179,8 @@ const (
 	SpliceStopped                             // the downstream stream was stopped with Code
 	SpliceUpstreamLost                        // the upstream stream's session closed or was lost
 	SpliceDownstreamLost                      // the downstream stream's session closed or was lost
-	SpliceCancelled                           // ctx ended, or the direction's Limiter failed
+	SpliceCancelled                           // ctx ended, with Code
+	SpliceLimiterFailed                       // the direction's Limiter failed in Acquire
 )
 
 // String returns the kind's name ("finished").
@@ -183,6 +198,8 @@ func (k SpliceEndKind) String() string {
 		return "downstream lost"
 	case SpliceCancelled:
 		return "cancelled"
+	case SpliceLimiterFailed:
+		return "limiter failed"
 	}
 	return "SpliceEndKind(?)"
 }
@@ -191,16 +208,18 @@ func (k SpliceEndKind) String() string {
 // application error code of SpliceReset and SpliceStopped, which travels
 // unchanged to the other side, that of the context's cause for
 // SpliceCancelled (ZMUX_CANCELLED, the code of the reset, for a plain cancel or
-// a deadline), and 0 for the other kinds.
+// a deadline), and 0 for the other kinds. SpliceLimiterFailed resets the
+// downstream and stops the upstream with ZMUX_CANCELLED; the other
+// direction goes on.
 type SpliceEnd struct {
 	Kind SpliceEndKind
 	Code StreamErrorCode
 }
 
-// String returns the end's kind, with its code for a reset or a stop
-// ("reset 0x77").
+// String returns the end's kind, with its code for a reset, a stop or a
+// cancellation ("reset 0x77").
 func (e SpliceEnd) String() string {
-	if e.Kind == SpliceReset || e.Kind == SpliceStopped {
+	if e.Kind == SpliceReset || e.Kind == SpliceStopped || e.Kind == SpliceCancelled {
 		return fmt.Sprintf("%v %#x", e.Kind, uint64(e.Code))
 	}
 	return e.Kind.String()
@@ -296,7 +315,7 @@ func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResul
 func (s *SpliceDirection) mergeDatagrams(d *SpliceDirection) {
 	s.DatagramBytes, s.DatagramsDropped = d.DatagramBytes, d.DatagramsDropped
 	s.DatagramsTooLarge, s.DatagramsLimited = d.DatagramsTooLarge, d.DatagramsLimited
-	s.DatagramsEncapsulated = d.DatagramsEncapsulated
+	s.DatagramsAsCapsules = d.DatagramsAsCapsules
 }
 
 // spliceDir forwards r's receiving part to w's sending part.
@@ -346,8 +365,7 @@ func spliceStep(ctx context.Context, r, w *Stream, chunk int, lim Limiter, limit
 			// at least one byte, at most what is readable.
 			granted, err = lim.Acquire(ctx, 1, int64(min(uint64(want), n)))
 			if err != nil {
-				spliceAbort(ctx, r, w, err)
-				d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
+				d.End = spliceAcquireFailed(ctx, r, w, err)
 				return 0, false, true
 			}
 			want = int(granted)
@@ -436,6 +454,20 @@ func spliceAbort(ctx context.Context, r, w *Stream, err error) {
 	w.h.cancelWrite(code)
 }
 
+// spliceAcquireFailed ends a direction whose Limiter.Acquire returned err:
+// a cancellation of ctx as such, any other error (the limiter's own, a
+// panic or an invalid grant) with SpliceLimiterFailed, w reset and r
+// stopped with ZMUX_CANCELLED; the other direction goes on.
+func spliceAcquireFailed(ctx context.Context, r, w *Stream, err error) SpliceEnd {
+	if ctx.Err() != nil && isCtxErr(err) {
+		spliceAbort(ctx, r, w, err)
+		return SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
+	}
+	r.h.cancelRead(StreamCancelled)
+	w.h.cancelWrite(StreamCancelled)
+	return SpliceEnd{Kind: SpliceLimiterFailed}
+}
+
 // waitReadable waits until the receiving part has bytes, or its end is
 // due at once (end true); the first error is w's, the second ctx's. The
 // wait also ends at once when w, the sending part the bytes go to, can no
@@ -479,11 +511,14 @@ func (h *handle) waitReadable(ctx context.Context, w *handle) (uint64, bool, err
 // refunded if not sent), without a queue of its own.
 func spliceDatagrams(ctx context.Context, a, b *Stream, res *SpliceResult, o SpliceOptions) *sync.WaitGroup {
 	var wg sync.WaitGroup
-	if !a.h.c.ConnectionState().SupportsDatagrams.Remote || !b.h.c.ConnectionState().SupportsDatagrams.Remote {
-		return &wg
-	}
+	// A direction reads the datagrams its source session can receive. One
+	// whose next session does not use stream datagrams (not in use) counts
+	// them in DatagramsDropped alone: not for their size.
 	fwd := func(r, w *Stream, d *SpliceDirection, lim Limiter) {
 		defer wg.Done()
+		if !r.h.c.ConnectionState().SupportsDatagrams.Local {
+			return
+		}
 		for {
 			cx, p, err := r.h.receiveDatagram(ctx)
 			if err != nil {
@@ -523,7 +558,7 @@ func spliceSendDatagram(w *Stream, d *SpliceDirection, lim Limiter, cx uint64, p
 	var granted int64
 	if lim != nil {
 		var ok bool
-		if granted, ok = (guardedLimiter{lim}).police(len(p)); !ok {
+		if granted, ok = policeGuarded(lim, len(p)); !ok {
 			return datagramLimited
 		}
 	}

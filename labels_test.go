@@ -39,9 +39,9 @@ func testGoroutineLabels(t *testing.T) {
 	}
 }
 
-// A goroutine working for one call keeps the caller's labels under its
-// own: the first-record read of a carrier fed to a Listener with a
-// labelled context.
+// A carrier fed to a Listener is read on the caller's goroutine, with no
+// goroutine of its own, and the listener's own goroutine takes none of the
+// caller's labels.
 func TestGoroutineLabelsKeepCaller(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		l := mustNewListener(nil)
@@ -58,8 +58,8 @@ func TestGoroutineLabelsKeepCaller(t *testing.T) {
 		}
 		cancel()
 		<-done
-		if !bytes.Contains(buf.Bytes(), []byte(`"app.req":"42", "zmux":"first-record"`)) {
-			t.Errorf("the first-record goroutine lost the caller's labels:\n%s", buf.Bytes())
+		if bytes.Contains(buf.Bytes(), []byte(`"zmux":"first-record"`)) {
+			t.Errorf("a goroutine of its own reads the first record:\n%s", buf.Bytes())
 		}
 		if bytes.Contains(buf.Bytes(), []byte(`"app.req":"42", "zmux":"listener-budget"`)) {
 			t.Error("the listener's own goroutine took a caller's labels")

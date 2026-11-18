@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"runtime"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -56,6 +58,69 @@ func (h *handle) do(f func(s *core.Session) error) error {
 
 func (h *handle) setPriority(u Urgency, inc bool) {
 	_ = h.do(func(s *core.Session) error { s.SetPriority(h.st, uint8(u), inc); return nil })
+}
+
+// held reads from the core under the session's lock, without the clock.
+func (h *handle) priority() (Urgency, bool) {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	u, inc := c.s.Priority(h.st)
+	return Urgency(u), inc
+}
+
+func (h *handle) redundant() (on, set bool) {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	if p := c.s.Redundant(h.st); p != nil {
+		return *p, true
+	}
+	return false, false
+}
+
+func (h *handle) peerPriority() (Urgency, bool, bool) {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	u, inc, ok := c.s.PeerPriority(h.st)
+	return Urgency(u), inc, ok
+}
+
+func (h *handle) scheduler() Scheduler {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	p, own := c.s.StreamPolicy(h.st)
+	if !own {
+		return nil
+	}
+	return c.schedulerLocked(p)
+}
+
+func (h *handle) sendBuffer() int {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	return int(min(c.s.SendBuffer(h.st), math.MaxInt))
+}
+
+func (h *handle) receiveWindow() (initial, limit uint64) {
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	return c.s.ReceiveWindow(h.st)
+}
+
+func (h *handle) setScheduler(p Scheduler) {
+	_ = h.do(func(c *core.Session) error {
+		if p == nil {
+			c.SetStreamPolicy(h.st, 0, true)
+		} else {
+			c.SetStreamPolicy(h.st, p.policy(), false)
+		}
+		return nil
+	})
 }
 
 func (h *handle) setPeerPriority(u Urgency, inc bool) error {
@@ -343,6 +408,22 @@ func (s *Stream) SetPriority(urgency Urgency, incremental bool) {
 	s.h.setPriority(urgency, incremental)
 }
 
+// Priority returns the local scheduling priority of the stream's sending
+// part now: the last value SetPriority set or, where the peer's PRIORITY
+// signals adjust it, the peer set. It does not fail or wait, and answers on
+// a closed stream with the value it held last.
+func (s *Stream) Priority() (urgency Urgency, incremental bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.priority()
+}
+
+// Redundant returns what SetRedundant set: on, and whether it is set; unset,
+// the stream follows the session. It does not fail or wait.
+func (s *Stream) Redundant() (on, set bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.redundant()
+}
+
 // SetPeerPriority asks the peer to schedule its sending part of the stream
 // so: in the preamble before the first frame, PRIORITY_UPDATE after. An
 // urgency above UrgencyLowest is ErrInvalidConfig.
@@ -419,11 +500,16 @@ func (s *Stream) Replayable() bool {
 	return s.h.st.Replayable()
 }
 
-// SetReceiveWindow sets the stream's initial and maximum receive window
-// (0 leaves a value; at least 16 KiB).
-func (s *Stream) SetReceiveWindow(initial, limit uint64) {
+// SetReceiveWindow sets the stream's initial and maximum receive window.
+// initial is advertised at once when it is above the window in force; credit
+// already advertised is never withdrawn, so a lower initial only changes what
+// ReceiveWindow reads back. limit caps auto-tuning, 0 making the cap
+// automatic (whatever the session's configuration says). An initial below
+// 4 KiB or a nonzero limit below initial is ErrInvalidConfig and changes
+// nothing.
+func (s *Stream) SetReceiveWindow(initial, limit uint64) error {
 	defer runtime.KeepAlive(s)
-	_ = s.h.do(func(c *core.Session) error { c.SetReceiveWindow(s.h.st, initial, limit); return nil })
+	return s.h.do(func(c *core.Session) error { return c.SetReceiveWindow(s.h.st, initial, limit) })
 }
 
 // SetSendBuffer bounds the stream's written-but-unreleased bytes.
@@ -432,18 +518,46 @@ func (s *Stream) SetSendBuffer(n uint64) {
 	_ = s.h.do(func(c *core.Session) error { c.SetSendBuffer(s.h.st, n); return nil })
 }
 
-// SetScheduler sets the stream's own scheduling policy (nil: the
-// session's).
+// SetScheduler sets the stream's own scheduling policy; nil, the zero
+// Scheduler, makes the stream follow the session's again.
 func (s *Stream) SetScheduler(p Scheduler) {
 	defer runtime.KeepAlive(s)
-	_ = s.h.do(func(c *core.Session) error {
-		if p == nil {
-			c.SetStreamPolicy(s.h.st, 0, true)
-		} else {
-			c.SetStreamPolicy(s.h.st, p.policy(), false)
-		}
-		return nil
-	})
+	s.h.setScheduler(p)
+}
+
+// Scheduler returns the stream's own scheduling policy, nil while it
+// follows the session's (never the session's policy it resolves to). It
+// does not fail or wait, and answers on a closed stream with the value it
+// held last.
+func (s *Stream) Scheduler() Scheduler {
+	defer runtime.KeepAlive(s)
+	return s.h.scheduler()
+}
+
+// SendBuffer returns the bound of the stream's written-but-unreleased
+// bytes: the value SetSendBuffer set, else the one the session's
+// configuration gave it. It does not fail or wait.
+func (s *Stream) SendBuffer() int {
+	defer runtime.KeepAlive(s)
+	return s.h.sendBuffer()
+}
+
+// PeerPriority returns the priority this endpoint requested for the peer's
+// sending part of the stream (the preamble's PRIORITY TLV or the last
+// PRIORITY_UPDATE); ok is false when none was requested. It does not fail or
+// wait.
+func (s *Stream) PeerPriority() (urgency Urgency, incremental, ok bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.peerPriority()
+}
+
+// ReceiveWindow returns the stream's receive window settings: the initial
+// window as set (or copied from the session), never the window auto-tuning
+// has grown it to (that is the statistic RecvWindow), and the cap on it as
+// set (0: automatic). It does not fail or wait.
+func (s *Stream) ReceiveWindow() (initial, limit uint64) {
+	defer runtime.KeepAlive(s)
+	return s.h.receiveWindow()
 }
 
 // SetRedundant turns redundant sending of the stream's chunks on or off
@@ -582,6 +696,18 @@ func (s *SendStream) SetPriority(urgency Urgency, incremental bool) {
 	s.h.setPriority(urgency, incremental)
 }
 
+// Priority returns the local scheduling priority, as Stream.Priority.
+func (s *SendStream) Priority() (urgency Urgency, incremental bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.priority()
+}
+
+// Redundant returns what SetRedundant set, as Stream.Redundant.
+func (s *SendStream) Redundant() (on, set bool) {
+	defer runtime.KeepAlive(s)
+	return s.h.redundant()
+}
+
 // SetPreamble sets OPEN_INFO before the first frame. A preamble that
 // would exceed the peer's limit is *PreambleTooLargeError.
 func (s *SendStream) SetPreamble(b []byte) error {
@@ -610,17 +736,24 @@ func (s *SendStream) SetSendBuffer(n uint64) {
 	_ = s.h.do(func(c *core.Session) error { c.SetSendBuffer(s.h.st, n); return nil })
 }
 
-// SetScheduler sets the stream's own scheduling policy (nil: the session's).
+// SetScheduler sets the stream's own scheduling policy; nil makes it
+// follow the session's again.
 func (s *SendStream) SetScheduler(p Scheduler) {
 	defer runtime.KeepAlive(s)
-	_ = s.h.do(func(c *core.Session) error {
-		if p == nil {
-			c.SetStreamPolicy(s.h.st, 0, true)
-		} else {
-			c.SetStreamPolicy(s.h.st, p.policy(), false)
-		}
-		return nil
-	})
+	s.h.setScheduler(p)
+}
+
+// Scheduler returns the stream's own scheduling policy, as Stream.Scheduler.
+func (s *SendStream) Scheduler() Scheduler {
+	defer runtime.KeepAlive(s)
+	return s.h.scheduler()
+}
+
+// SendBuffer returns the bound of the stream's written-but-unreleased
+// bytes, as Stream.SendBuffer.
+func (s *SendStream) SendBuffer() int {
+	defer runtime.KeepAlive(s)
+	return s.h.sendBuffer()
 }
 
 // SetRedundant turns redundant sending on or off (multipath).
@@ -673,6 +806,15 @@ func (s *SendStream) ReadFrom(r io.Reader) (int64, error) {
 
 // ---- ReceiveStream ----
 
+// WaitReadable waits until a Read would not block, as Stream.WaitReadable.
+func (s *ReceiveStream) WaitReadable(ctx context.Context) error {
+	if s == nil || s.h == nil {
+		return net.ErrClosed
+	}
+	defer runtime.KeepAlive(s)
+	return s.h.awaitReadable(ctx)
+}
+
 // SetPeerPriority asks the peer to schedule the stream so, as
 // Stream.SetPeerPriority.
 func (s *ReceiveStream) SetPeerPriority(urgency Urgency, incremental bool) error {
@@ -701,10 +843,25 @@ func (s *ReceiveStream) PreambleTLVs() []TLV {
 	return t
 }
 
-// SetReceiveWindow sets the stream's initial and maximum receive window.
-func (s *ReceiveStream) SetReceiveWindow(initial, limit uint64) {
+// PeerPriority returns the priority requested for the peer's sending part,
+// as Stream.PeerPriority.
+func (s *ReceiveStream) PeerPriority() (urgency Urgency, incremental, ok bool) {
 	defer runtime.KeepAlive(s)
-	_ = s.h.do(func(c *core.Session) error { c.SetReceiveWindow(s.h.st, initial, limit); return nil })
+	return s.h.peerPriority()
+}
+
+// ReceiveWindow returns the stream's receive window, as
+// Stream.ReceiveWindow.
+func (s *ReceiveStream) ReceiveWindow() (initial, limit uint64) {
+	defer runtime.KeepAlive(s)
+	return s.h.receiveWindow()
+}
+
+// SetReceiveWindow sets the stream's initial and maximum receive window, as
+// Stream.SetReceiveWindow.
+func (s *ReceiveStream) SetReceiveWindow(initial, limit uint64) error {
+	defer runtime.KeepAlive(s)
+	return s.h.do(func(c *core.Session) error { return c.SetReceiveWindow(s.h.st, initial, limit) })
 }
 
 // Reject declines the stream before reading it.

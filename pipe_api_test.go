@@ -13,7 +13,7 @@ import (
 )
 
 // Pipe.Wait and Done return once a pipe is gone: nil for a graceful removal,
-// the cause for an abort; a pipe that is already gone answers at once.
+// ErrPipeAborted for an abort; a pipe that is already gone answers at once.
 func TestPipeWaitDone(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, mpConfig(), mpConfig())
@@ -24,11 +24,10 @@ func TestPipeWaitDone(t *testing.T) {
 		t.Fatal("Done of a live pipe")
 	default:
 	}
-	cause := errors.New("test abort")
 	if err := closed.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := aborted.Abort(cause); err != nil {
+	if err := aborted.Abort(); err != nil {
 		t.Fatal(err)
 	}
 	for name, c := range map[string]struct {
@@ -36,7 +35,7 @@ func TestPipeWaitDone(t *testing.T) {
 		want func(error) bool
 	}{
 		"close": {closed, func(err error) bool { return err == nil }},
-		"abort": {aborted, func(err error) bool { return errors.Is(err, cause) }},
+		"abort": {aborted, func(err error) bool { return errors.Is(err, ErrPipeAborted) }},
 	} {
 		done := make(chan error, 1)
 		go func() { done <- c.p.Wait() }()
@@ -250,10 +249,105 @@ func TestGonePipeHandle(t *testing.T) {
 	if err := p.Wait(); err != nil {
 		t.Fatalf("Wait = %v", err)
 	}
-	if err := p.Abort(errors.New("x")); !errors.Is(err, ErrPipeGone) {
+	if err := p.Abort(); !errors.Is(err, ErrPipeGone) {
 		t.Fatalf("Abort = %v", err)
 	}
 	if goneEnd.err != nil || goneEnd.waited != closedChan {
 		t.Fatal("the shared gone record changed")
+	}
+}
+
+// Options reads back what AddPipe was given with every Update applied, in the
+// form it was set; a cleared field reads as the zero Change, and the last
+// options stay readable once the pipe is gone.
+func TestPipeOptionsReadBack(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	band := QualityBand{RTT: 50 * time.Millisecond}
+	live := PipeLiveness{ProbeInterval: -5 * time.Second}
+	p := e.addPipe(t, PipeOptions{Label: "a", Weight: Set[uint64](3), QualityBand: Set(band), Liveness: Set(live)})
+	o := p.Options()
+	if o.Label != "a" || o.Weight != Set[uint64](3) || o.QualityBand != Set(band) || o.Liveness != Set(live) ||
+		o.Direction != DirectionBidirectional || o.RecordMode != Set(RecordSealed) {
+		t.Fatalf("options at add: %+v", o)
+	}
+	upd := PipeUpdate{Weight: Clear[uint64](), Probation: Set(-time.Second), SendPriority: Set[uint64](4),
+		QualityBand: Set(QualityBand{}), Liveness: Clear[PipeLiveness]()}
+	if err := p.Update(upd); err != nil {
+		t.Fatal(err)
+	}
+	o = p.Options()
+	if o.Weight != (Change[uint64]{}) || o.Probation != Set(-time.Second) || o.SendPriority != Set[uint64](4) ||
+		o.QualityBand != Set(QualityBand{}) || o.Liveness != (Change[PipeLiveness]{}) || o.ReceivePriority != (Change[uint64]{}) {
+		t.Fatalf("options after the update: %+v", o)
+	}
+	if err := p.Update(PipeUpdate{Weight: Set[uint64](-1 + 1), QualityBand: Set(QualityBand{RTT: -1})}); err == nil {
+		t.Fatal("an invalid band was accepted")
+	}
+	if got := p.Options(); got.Weight != (Change[uint64]{}) {
+		t.Fatalf("a refused update changed the options: %+v", got)
+	}
+	_ = p.Abort()
+	<-p.Done()
+	if got := p.Options(); got.Label != "a" || got.SendPriority != Set[uint64](4) {
+		t.Fatalf("options after the pipe ended: %+v", got)
+	}
+}
+
+// The fields a pipe has from its creation read as the values it has: the
+// key group the Join used when AddPipe left it zero, the direction from this
+// endpoint's view, ReturnOnReply as AddPipe was given it; a pipe the peer
+// joined reads the Join's direction, record mode and key group and the
+// defaults elsewhere.
+func TestPipeOptionsFixedFields(t *testing.T) {
+	leakcheck.Check(t)
+	e := newMPEnv(t, mpConfig(), mpConfig())
+	peerOf := func(p *Pipe) *Pipe {
+		t.Helper()
+		q, ok := e.server.Pipe(p.ID())
+		if !ok {
+			t.Fatalf("the server has no pipe %d", p.ID())
+		}
+		return q
+	}
+	def := e.addPipe(t, PipeOptions{Label: "default group"})
+	two := e.addPipe(t, PipeOptions{KeyGroup: 2, Direction: DirectionSendOnly, ReturnOnReply: true, Weight: Set[uint64](5)})
+	o := def.Options()
+	if o.KeyGroup != 1 || o.Label != "default group" || o.Direction != DirectionBidirectional || o.RecordMode != Set(RecordSealed) || o.ReturnOnReply {
+		t.Fatalf("the default pipe: %+v", o)
+	}
+	o = two.Options()
+	if o.KeyGroup != 2 || o.Direction != DirectionSendOnly || !o.ReturnOnReply || o.Weight != Set[uint64](5) {
+		t.Fatalf("the group 2 pipe: %+v", o)
+	}
+	// Options read back and handed to the AddPipe of a replacing pipe: the
+	// same fixed fields, whatever they were given as.
+	re := e.addPipe(t, two.Options())
+	if r := re.Options(); r.KeyGroup != 2 || r.Direction != DirectionSendOnly || !r.ReturnOnReply {
+		t.Fatalf("the replacing pipe: %+v", r)
+	}
+
+	// The peer's view of the same pipes.
+	o = peerOf(def).Options()
+	if o.KeyGroup != 1 || o.Direction != DirectionBidirectional || o.RecordMode != Set(RecordSealed) ||
+		o.Label != "" || o.ReturnOnReply || o.Weight != (Change[uint64]{}) {
+		t.Fatalf("the peer's default pipe: %+v", o)
+	}
+	o = peerOf(two).Options()
+	if o.KeyGroup != 2 || o.Direction != DirectionReceiveOnly || o.RecordMode != Set(RecordSealed) || o.ReturnOnReply ||
+		o.Weight != (Change[uint64]{}) {
+		t.Fatalf("the peer's group 2 pipe: %+v", o)
+	}
+	// An update on the peer's side sets its own field, the fixed ones stay.
+	q := peerOf(def)
+	if err := q.Update(PipeUpdate{Weight: Set[uint64](7)}); err != nil {
+		t.Fatal(err)
+	}
+	if o := q.Options(); o.Weight != Set[uint64](7) || o.KeyGroup != 1 {
+		t.Fatalf("after the peer's update: %+v", o)
+	}
+	// The bootstrap pipe was not joined: no key group.
+	if p0, ok := e.client.Pipe(0); !ok || p0.Options().KeyGroup != 0 {
+		t.Fatalf("the bootstrap pipe: %v", ok)
 	}
 }

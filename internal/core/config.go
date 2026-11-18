@@ -206,6 +206,6 @@ func DefaultConfig() Config {
 	p.MaxStreamsUni = 16
 	p.MaxRecordSize = wire.MaxRecordSize
 	p.Preamble = 4096
-	p.MaxLanes = 258
+	p.MaxLanes = DefaultMaxLanes
 	return c
 }

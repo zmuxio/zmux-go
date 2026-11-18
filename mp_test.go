@@ -165,7 +165,7 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 		st, ok := p2.Stats()
 		return ok && st.BytesSent >= 1<<16
 	})
-	if err := p2.Abort(nil); err != nil {
+	if err := p2.Abort(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Write(payload[half:]); err != nil {
@@ -429,12 +429,12 @@ func TestRetiredPipeHandle(t *testing.T) {
 	if _, ok := p.Stats(); !ok {
 		t.Fatal("a live pipe reads as gone")
 	}
-	if err := p.Abort(nil); err != nil {
+	if err := p.Abort(); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, 5*time.Second, "the pipe retired", func() bool { _, ok := p.Stats(); return !ok })
 	for name, err := range map[string]error{"SetWeight": p.Update(PipeUpdate{Weight: Set[uint64](2)}), "SetSendPriority": p.Update(PipeUpdate{SendPriority: Set[uint64](1)}),
-		"Revalidate": p.Revalidate(), "Close": p.Close(), "Abort": p.Abort(nil)} {
+		"Revalidate": p.Revalidate(), "Close": p.Close(), "Abort": p.Abort()} {
 		if !errors.Is(err, ErrPipeGone) {
 			t.Errorf("%s on a retired pipe: %v", name, err)
 		}
@@ -449,7 +449,7 @@ func TestPipesRetiredEvent(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, mpConfig(), mpConfig())
 	p := e.addPipe(t, PipeOptions{})
-	if err := p.Abort(nil); err != nil {
+	if err := p.Abort(); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, 5*time.Second, "the pipe retired", func() bool { _, ok := p.Stats(); return !ok })

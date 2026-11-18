@@ -50,7 +50,7 @@ func TestMaintainPipesRedials(t *testing.T) {
 	for _, p := range e.client.PipeStats() {
 		if p.PipeID != 0 {
 			pp, _ := e.client.Pipe(p.PipeID)
-			_ = pp.Abort(nil)
+			_ = pp.Abort()
 			break
 		}
 	}
@@ -94,7 +94,7 @@ func TestMaintainPipesDoesNotDialWhenTargetIsFull(t *testing.T) {
 		t.Fatal("dialed while existing bootstrap and pipe filled target")
 	case <-time.After(550 * time.Millisecond):
 	}
-	if err := occupied.Abort(nil); err != nil {
+	if err := occupied.Abort(); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -348,7 +348,7 @@ func TestWaitAttached(t *testing.T) {
 			if st, _ := sp.Stats(); !st.PeerAttached {
 				t.Fatalf("%v: an accepted pipe not attached: %+v", dir, st)
 			}
-			if err := p.Abort(nil); err != nil {
+			if err := p.Abort(); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -364,7 +364,7 @@ func TestWaitAttached(t *testing.T) {
 		werr := make(chan error, 1)
 		go func() { werr <- p.WaitAttached(ctx) }()
 		time.Sleep(20 * time.Millisecond)
-		_ = p.Abort(nil)
+		_ = p.Abort()
 		if err := <-werr; !errors.Is(err, ErrPipeGone) {
 			t.Fatalf("wait on an aborted pipe returned %v", err)
 		}
@@ -432,7 +432,7 @@ func TestAddPipeWaitsAttached(t *testing.T) {
 		if st, _ := p.Stats(); !st.PeerAttached {
 			t.Fatalf("AddPipe returned before the attachment: %+v", st)
 		}
-		if err := p.Abort(nil); err != nil {
+		if err := p.Abort(); err != nil {
 			t.Fatal(err)
 		}
 		waitUntil(t, 5*time.Second, "the aborted pipe to go", func() bool { return len(e.client.PipeStats()) == 1 })

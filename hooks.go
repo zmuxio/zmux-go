@@ -11,6 +11,7 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/labels"
+	"github.com/zmuxio/zmux-go/internal/poolhost"
 )
 
 // Tracer receives session events. Its functions
@@ -324,16 +325,7 @@ func (h *hooks) runPick() {
 // safeLog runs the host callback f, containing a panic (ok false), which
 // it logs as the panic of what to l (nil: not logged), outside every lock.
 func safeLog(l *slog.Logger, what string, f func()) (ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			ok = false
-			if l != nil {
-				l.Warn("zmux: a host callback panicked; the panic was contained", "callback", what, "panic", fmt.Sprint(r))
-			}
-		}
-	}()
-	f()
-	return true
+	return poolhost.Safe(l, what, f)
 }
 
 // satDouble doubles a backoff, saturating instead of wrapping negative for
@@ -454,14 +446,15 @@ func (c *Conn) redialLoop(need Direction) {
 			return d
 		}
 		v := &st.view
-		v.Now, v.Failures, v.LastDial, v.Members = clk.Now(), st.failures, st.lastDial, v.Members[:0]
+		v.Failures, v.SinceLastDial, v.Members = st.failures, sinceDial(clk.Now(), st.lastDial), v.Members[:0]
 		for _, ps := range c.PipeStats() {
+			_, usable := pipeState(&ps)
 			v.Members = append(v.Members, PoolMember{PipeID: ps.PipeID, Age: ps.AttachedFor, Idle: ps.SinceLastTraffic,
-				Pipes: 1, BytesSent: ps.BytesSent, BytesReceived: ps.BytesReceived})
+				Pipes: 1, BytesSent: ps.BytesSent, BytesReceived: ps.BytesReceived, Usable: usable})
 		}
-		if err := decide(c.cfg.Logger, pol, v, &st.dec); err != nil {
-			st.dec = PoolDecision{} // as a policy that panics
-			reportRejected(c.cfg.Logger, c.cfg.DecisionRejected, err)
+		if err := decide(pol, v, &st.dec); err != nil {
+			st.dec = PoolDecision{} // rejected
+			poolhost.ReportRejected(c.cfg.Logger, c.cfg.DecisionRejected, err)
 		}
 		if st.dec.DialAfter > 0 {
 			d = min(st.dec.DialAfter, hi)

@@ -85,9 +85,11 @@ type ListenerConfig struct {
 	SourcePrefixV4, SourcePrefixV6 int
 	// MaxPendingPerSession bounds the Unconfirmed carriers of one session:
 	// joins that passed authentication and wait for the joiner's
-	// confirmation. Zero is 4; a new authenticated Hello beyond it evicts
-	// the one that has been Unconfirmed longest and is never refused for
-	// lack of room.
+	// confirmation (a join in Bound Mode is confirmed by its verification
+	// and holds no place). Zero is 4. A new authenticated Hello is never
+	// refused for lack of room: once the bound is reached, the carrier
+	// that has been Unconfirmed longest is closed first, as a failed join;
+	// below it, none is.
 	MaxPendingPerSession int
 	// FirstRecordTimeout closes a carrier whose first record does not
 	// arrive in time. Zero is 2 s; a negative value is no timeout.
@@ -200,9 +202,7 @@ type ListenerConfig struct {
 const (
 	defaultMaxSuspended = 1024
 	defaultBacklog      = 128
-	// defaultMaxPendingPerSession is the default ListenerConfig.MaxPendingPerSession.
-	defaultMaxPendingPerSession = 4
-	defaultMemoryBudget         = 1 << 30
+	defaultMemoryBudget = 1 << 30
 	// The default source prefixes: an IPv4 address on its own, an IPv6
 	// address to its /64.
 	defaultSourcePrefixV4 = 32
@@ -253,7 +253,7 @@ func (c *ListenerConfig) resolve() (ListenerConfig, error) {
 		r.MaxPendingPerSource = core.DefaultMaxPendingPerSource
 	}
 	if r.MaxPendingPerSession == 0 {
-		r.MaxPendingPerSession = defaultMaxPendingPerSession
+		r.MaxPendingPerSession = core.DefaultMaxUnconfirmed
 	}
 	if r.SourcePrefixV4 < 0 || r.SourcePrefixV4 > 32 || r.SourcePrefixV6 < 0 || r.SourcePrefixV6 > 128 {
 		return r, fmt.Errorf("%w: ListenerConfig.SourcePrefixV4 beyond 0..32 or SourcePrefixV6 beyond 0..128", ErrInvalidConfig)
@@ -264,7 +264,7 @@ func (c *ListenerConfig) resolve() (ListenerConfig, error) {
 	if r.SourcePrefixV6 == 0 {
 		r.SourcePrefixV6 = defaultSourcePrefixV6
 	}
-	r.FirstRecordTimeout = setting.Timeout(r.FirstRecordTimeout, time.Duration(core.DefaultFirstRecordTimeout))
+	r.FirstRecordTimeout = setting.Timeout(r.FirstRecordTimeout, DefaultFirstRecordTimeout)
 	if err := r.Admission.Validate(); err != nil {
 		return r, err
 	}
@@ -361,20 +361,33 @@ type PipeHint struct {
 // A listener that took a carrier runs a goroutine until it is closed:
 // call Close (or Shutdown) when done with it, as for a net.Listener.
 // Close stops accepting; Shutdown also closes the accepted sessions
-// gracefully. Its lock is a leaf: it never takes a session lock while held.
+// gracefully. Its locks are leaves: none takes a session lock while held.
 type Listener struct {
 	cfg ListenerConfig
 
-	mu        sync.Mutex
-	live      map[*Conn]struct{} // every session it started, until it ends
-	sessions  map[string]*Conn   // by locator
-	suspended []*Conn            // in suspension order
-	pending   core.PendingCarriers
-	pairing   core.SplitPairing
-	pairs     map[[16]byte]*pairWait
-	closed    bool
-	draining  bool // Shutdown: no new sessions
-	watching  bool // the memory-pressure watcher was started (startWatchLocked)
+	// pmu guards the pending carriers' slots, apart from mu: every carrier
+	// takes and gives back slots, so they do not wait for the session
+	// registry. A leaf: nothing is locked under it.
+	pmu     sync.Mutex
+	pending core.PendingCarriers // under pmu
+	mu      sync.RWMutex         // read: a new session's handoff to Accept, the checks of closed and draining
+	// regMu guards the session registry (live, sessions, the suspension
+	// list), apart from mu: a session's end does not wait for handoffs. A
+	// leaf: nothing is locked under it.
+	regMu    sync.Mutex
+	live     map[*Conn]struct{} // every session it started, until it ends
+	sessions map[string]*Conn   // by locator
+	// The suspended sessions in suspension order (Conn.suspPrev and
+	// suspNext): the oldest first.
+	suspHead, suspTail *Conn
+	suspN              int
+	pairing            core.SplitPairing
+	pairs              map[[16]byte]*pairWait
+	closed             bool
+	draining           bool        // Shutdown: no new sessions
+	pclosed            bool        // under pmu: closed, for the slots
+	rclosed            bool        // under regMu: closed, for the registry
+	watching           atomic.Bool // the memory-pressure watcher was started (startWatch)
 
 	accept     chan *Conn
 	done       chan struct{} // closed by Close
@@ -413,7 +426,9 @@ type ListenerStats struct {
 	Rejected uint64
 	// Refused counts inputs refused at a limit: of the listener
 	// (MaxPendingPerSource, the memory budget), of the session (a join
-	// refused with ZMUX_PIPE_RESOURCE_LIMIT), new sessions during
+	// refused with ZMUX_PIPE_RESOURCE_LIMIT, and an Unconfirmed carrier
+	// closed to make room for a newer join, which counts here and in
+	// Joins only if it was Confirmed), new sessions during
 	// Shutdown, or after the listener was closed.
 	Refused uint64
 	// TimedOut counts inputs without a first record, or join, within
@@ -537,16 +552,14 @@ func NewListener(cfg *ListenerConfig) (*Listener, error) {
 	return l, nil
 }
 
-// startWatchLocked starts the memory-pressure watcher with the first
-// carrier the listener takes, so that a listener that never serves owns no
-// goroutine; Close stops it. The caller holds l.mu, the listener is open,
-// and it calls the returned function, if any, after unlocking.
-func (l *Listener) startWatchLocked() (start func()) {
-	if l.watching || l.budget.Limit() == 0 {
-		return nil
+// startWatch starts the memory-pressure watcher with the first carrier
+// the listener takes, so that a listener that never serves owns no
+// goroutine; Close stops it (one started after Close returns at once).
+func (l *Listener) startWatch() {
+	if l.budget.Limit() == 0 || l.watching.Load() || !l.watching.CompareAndSwap(false, true) {
+		return
 	}
-	l.watching = true
-	return func() { labels.Go(context.Background(), "listener-budget", func() { l.watchBudget() }) }
+	labels.Go(context.Background(), "listener-budget", func() { l.watchBudget() })
 }
 
 // MemoryUsed reports the bytes charged to the listener's memory budget,
@@ -607,9 +620,12 @@ func (l *Listener) watchBudget() {
 // largestSuspended removes and returns the suspended session that holds
 // the most memory.
 func (l *Listener) largestSuspended() *Conn {
-	l.mu.Lock()
-	cs := append([]*Conn(nil), l.suspended...)
-	l.mu.Unlock()
+	l.regMu.Lock()
+	cs := make([]*Conn, 0, l.suspN)
+	for c := l.suspHead; c != nil; c = c.suspNext {
+		cs = append(cs, c)
+	}
+	l.regMu.Unlock()
 	var best *Conn
 	var most uint64
 	for _, c := range cs { // session locks outside the listener lock
@@ -620,9 +636,9 @@ func (l *Listener) largestSuspended() *Conn {
 		}
 	}
 	if best != nil {
-		l.mu.Lock()
+		l.regMu.Lock()
 		l.dropSuspended(best)
-		l.mu.Unlock()
+		l.regMu.Unlock()
 	}
 	return best
 }
@@ -662,6 +678,12 @@ func (l *Listener) Close() error {
 		}
 	}
 	l.mu.Unlock()
+	l.pmu.Lock()
+	l.pclosed = true
+	l.pmu.Unlock()
+	l.regMu.Lock()
+	l.rclosed = true
+	l.regMu.Unlock()
 	l.stopCancel()
 	// Sessions in the backlog have no one to accept them now (no more
 	// arrive once draining is set, under l.mu): they end here. Shutdown
@@ -690,11 +712,15 @@ func (l *Listener) Shutdown(ctx context.Context, code ApplicationErrorCode, msg 
 		l.draining = true
 		close(l.drain)
 	}
+	l.mu.Unlock()
+	// A session registered after this snapshot is refused at its handoff
+	// (draining).
+	l.regMu.Lock()
 	cs := make([]*Conn, 0, len(l.live))
 	for c := range l.live {
 		cs = append(cs, c)
 	}
-	l.mu.Unlock()
+	l.regMu.Unlock()
 	errs := make(chan error, len(cs))
 	for _, c := range cs {
 		go func() { errs <- c.Shutdown(ctx, code, msg) }()
@@ -804,9 +830,9 @@ func (l *Listener) refusePending(ctx context.Context, p PipeIO, src, peer netip.
 // slots are given back once the carrier enters a session or is closed.
 func (l *Listener) take(p PipeIO, hint PipeHint, slot *core.PendingSlot) (run func(context.Context) error, err error) {
 	release := func() { l.leave(slot) }
-	l.mu.Lock()
+	l.mu.RLock()
 	ok := !l.closed && (hint.Pair == "" || !l.draining)
-	l.mu.Unlock()
+	l.mu.RUnlock()
 	if !ok {
 		release()
 		closePipe(p)
@@ -932,34 +958,39 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint PipeHint, 
 
 // readFirst reads until the first record is complete (or rejected),
 // within the first-record timeout; ctx ending or the listener closing
-// abandon the carrier as well.
+// abandon the carrier as well. It reads on the caller's goroutine: the
+// timeout and the two ends close the carrier from callbacks, with no
+// goroutine or shared channel per carrier.
 func (l *Listener) readFirst(ctx context.Context, p PipeIO) ([]byte, core.Class, error) {
-	type res struct {
-		b   []byte
-		cls core.Class
-		err error
+	return readFirstWithin(ctx, l.stopCtx, l.clk, l.cfg.FirstRecordTimeout, p)
+}
+
+// readFirstWithin reads the first record of p within d on clk; ctx or stop
+// ending abandons the carrier as well (stop ends as net.ErrClosed).
+func readFirstWithin(ctx, stop context.Context, clk timeshim.Clock, d time.Duration, p PipeIO) ([]byte, core.Class, error) {
+	var once sync.Once
+	var why error
+	abandon := func(err func() error) func() {
+		return func() {
+			once.Do(func() {
+				why = err()
+				closePipe(p) // interrupts the read
+			})
+		}
 	}
-	ch := make(chan res, 1)
-	labels.Go(ctx, "first-record", func() {
-		b, cls, err := readFirstRecord(p)
-		ch <- res{b, cls, err}
-	})
-	timer := timeshim.NewTimer(l.clk, l.cfg.FirstRecordTimeout)
-	defer timer.Stop()
-	var err error
-	select {
-	case r := <-ch:
-		return r.b, r.cls, r.err
-	case <-timer.C:
-		err = errTimedOut
-	case <-ctx.Done():
-		err = ctx.Err()
-	case <-l.done:
-		err = net.ErrClosed
+	t := clk.AfterFunc(d, abandon(func() error { return errTimedOut }))
+	stopCtx := context.AfterFunc(ctx, abandon(ctx.Err))
+	stopListener := context.AfterFunc(stop, abandon(func() error { return net.ErrClosed }))
+	b, cls, err := readFirstRecord(p)
+	t.Stop()
+	stopCtx()
+	stopListener()
+	abandoned := true
+	once.Do(func() { abandoned = false }) // waits for an abandon under way
+	if abandoned {
+		return nil, core.ClassReject, why
 	}
-	closePipe(p) // interrupts the read
-	<-ch
-	return nil, core.ClassReject, err
+	return b, cls, err
 }
 
 // firstReadChunk is the size of readFirstRecord's reads.
@@ -1089,7 +1120,9 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src
 	if l.budget.Pressure() {
 		reason = "memory budget"
 	} else {
-		l.mu.Lock()
+		// Read-locked: handoffs run concurrently, and Close and Shutdown
+		// (write-locked) see every one before they empty the backlog.
+		l.mu.RLock()
 		if l.draining {
 			reason = "draining"
 		} else {
@@ -1104,7 +1137,7 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src
 				reason = "backlog"
 			}
 		}
-		l.mu.Unlock()
+		l.mu.RUnlock()
 	}
 	if reason != "" {
 		// Refused by policy after its own parameters.
@@ -1186,9 +1219,9 @@ func (a *ListenerAdapter) KnownJoin(prefix []byte) (known bool, need int) {
 	if err != nil {
 		return false, 0
 	}
-	l.mu.Lock()
+	l.regMu.Lock()
 	_, ok := l.sessions[string(h.Locator)]
-	l.mu.Unlock()
+	l.regMu.Unlock()
 	return ok, 0
 }
 
@@ -1212,9 +1245,9 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 	if err != nil {
 		return reject(0, "malformed")
 	}
-	l.mu.Lock()
-	c, closed := l.sessions[string(h.Locator)], l.closed
-	l.mu.Unlock()
+	l.regMu.Lock()
+	c, closed := l.sessions[string(h.Locator)], l.rclosed
+	l.regMu.Unlock()
 	if closed {
 		closePipe(p)
 		l.st.refused.Add(1)
@@ -1225,9 +1258,9 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 	}
 	if l.budget.Pressure() {
 		// Under pressure only a join that lets a suspended session resume.
-		l.mu.Lock()
-		susp := slices.Contains(l.suspended, c)
-		l.mu.Unlock()
+		l.regMu.Lock()
+		susp := c.inSusp
+		l.regMu.Unlock()
 		if !susp {
 			return reject(RecordMode(h.Mode), "memory_pressure")
 		}
@@ -1340,16 +1373,16 @@ func (l *Listener) onReject(ctx context.Context, p PipeIO, info RejectInfo) {
 func (l *Listener) stall(ctx context.Context, p PipeIO, info RejectInfo) {
 	slot, _ := ctx.Value(slotKey{}).(*core.PendingSlot)
 	evicted := make(chan struct{})
-	l.mu.Lock()
-	ok := slot != nil && !l.closed && l.pending.Stall(slot, sync.OnceFunc(func() { close(evicted) }))
-	l.mu.Unlock()
+	l.pmu.Lock()
+	ok := slot != nil && !l.pclosed && l.pending.Stall(slot, sync.OnceFunc(func() { close(evicted) }))
+	l.pmu.Unlock()
 	if !ok {
 		return
 	}
 	defer func() {
-		l.mu.Lock()
+		l.pmu.Lock()
 		l.pending.Unstall(slot)
-		l.mu.Unlock()
+		l.pmu.Unlock()
 	}()
 	markTaken(p)
 	var d time.Duration
@@ -1371,63 +1404,87 @@ func (l *Listener) stall(ctx context.Context, p PipeIO, info RejectInfo) {
 
 // addLocator lets joins name a session by a Locator of a new epoch.
 func (l *Listener) addLocator(c *Conn, loc []byte) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if _, live := l.live[c]; live && !l.closed {
-		l.sessions[string(loc)] = c
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	if _, live := l.live[c]; live && !l.rclosed {
+		k := string(loc)
+		l.sessions[k] = c
+		if !slices.Contains(c.lstLocs, k) {
+			c.lstLocs = append(c.lstLocs, k)
+		}
 	}
 }
 
 // removeLocator forgets the Locator of a deleted epoch.
 func (l *Listener) removeLocator(c *Conn, loc []byte) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.sessions[string(loc)] == c {
-		delete(l.sessions, string(loc))
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	k := string(loc)
+	if l.sessions[k] == c {
+		delete(l.sessions, k)
 	}
+	c.lstLocs = slices.DeleteFunc(c.lstLocs, func(x string) bool { return x == k })
 }
 
 // sessionClosed forgets a session that ended.
 func (l *Listener) sessionClosed(c *Conn) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
 	delete(l.live, c)
-	for k, v := range l.sessions {
-		if v == c {
+	for _, k := range c.lstLocs {
+		if l.sessions[k] == c {
 			delete(l.sessions, k)
 		}
 	}
+	c.lstLocs = nil
 	l.dropSuspended(c)
 }
 
 // sessionSuspended records a suspension and returns the sessions to close
 // beyond MaxSuspended (closed by the caller outside every lock).
 func (l *Listener) sessionSuspended(c *Conn) []*Conn {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
 	l.dropSuspended(c)
-	l.suspended = append(l.suspended, c)
+	c.inSusp, c.suspPrev, c.suspNext = true, l.suspTail, nil
+	if l.suspTail == nil {
+		l.suspHead = c
+	} else {
+		l.suspTail.suspNext = c
+	}
+	l.suspTail = c
+	l.suspN++
 	var over []*Conn
-	for len(l.suspended) > l.cfg.MaxSuspended {
-		over = append(over, l.suspended[0])
-		l.suspended = l.suspended[1:]
+	for l.suspN > l.cfg.MaxSuspended {
+		old := l.suspHead
+		l.dropSuspended(old)
+		over = append(over, old)
 	}
 	return over
 }
 
 func (l *Listener) sessionResumed(c *Conn) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
 	l.dropSuspended(c)
 }
 
 func (l *Listener) dropSuspended(c *Conn) {
-	for i, x := range l.suspended {
-		if x == c {
-			l.suspended = append(l.suspended[:i], l.suspended[i+1:]...)
-			return
-		}
+	if !c.inSusp {
+		return
 	}
+	if c.suspPrev == nil {
+		l.suspHead = c.suspNext
+	} else {
+		c.suspPrev.suspNext = c.suspNext
+	}
+	if c.suspNext == nil {
+		l.suspTail = c.suspPrev
+	} else {
+		c.suspNext.suspPrev = c.suspPrev
+	}
+	c.inSusp, c.suspPrev, c.suspNext = false, nil, nil
+	l.suspN--
 }
 
 // ---- split bootstrap ----

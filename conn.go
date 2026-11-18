@@ -41,6 +41,11 @@ type StreamID int64
 
 // Conn is a zmux session. Its methods are safe for concurrent use.
 //
+// A session is not closed by the garbage collector: like a net.Conn it
+// holds its carriers, goroutines and timers until Close (or
+// CloseWithError, Shutdown or the peer's close) ends it, so every session
+// must be closed, also when its streams are all done.
+//
 // Concurrency model: one mutex guards the sans-IO core; no
 // I/O, blocking or application code runs under it. Each pipe direction has
 // a reader and a writer goroutine; wake-ups are queued under the lock and
@@ -64,12 +69,13 @@ type Conn struct {
 	// doneOnce closes done: at the end the unlock publishes, or in a
 	// poisoned session's salvage.
 	doneOnce sync.Once
+	pools    atomic.Int32 // MaintainPipes calls running
 	cancel   context.CancelCauseFunc
-	wg       sync.WaitGroup
-	// side counts the session's goroutines started outside its critical
-	// sections (redial, rejoins, channel drain, lane opens, pools), which a
-	// WaitGroup cannot count once Wait may run; Wait waits for both. It is
-	// sealed when done is closed: none starts after that (goSide).
+	// side counts every goroutine of the session that Wait waits for:
+	// those started in its critical sections (add) and those started
+	// outside them (goSide: redial, rejoins, channel drain, lane opens,
+	// pools). It is sealed when done is closed: no goSide starts after
+	// that, and the last goroutine to end closes Done's channel.
 	side pipeGoroutines
 
 	// firstTimer releases a held first flight at the handshake timeout;
@@ -107,29 +113,33 @@ type Conn struct {
 	events      eventQueue
 	pipeWaiters []*core.Signal // AddPipe waiting for a join (woken on pipe state changes)
 
-	labels map[uint64]string // pipe labels
-	lst    *Listener         // the listener that accepted the session
-	hk     *hooks            // application hooks (nil: none)
+	lst *Listener // the listener that accepted the session
+	// Under lst.regMu: the Locators lst knows the session by (at most two,
+	// MULTIPATH.md 10.7), and its links in lst's suspension list.
+	lstLocs            []string
+	suspPrev, suspNext *Conn
+	hk                 *hooks // application hooks (nil: none)
 	// carrierVariant is the chosen candidate's Variant.
 	carrierVariant string
-	unconfirmed    []PipeIO    // carriers Unconfirmed at the acceptor
-	retiredIDs     []uint64    // pipes retired in this critical section
-	retiredDone    []uint64    // pipes retired in the previous one
-	cc             core.Config // the session's resolved configuration
+	unconfirmed    core.Unconfirmed[*heldJoin] // carriers Unconfirmed at the acceptor
+	retiredIDs     []uint64                    // pipes retired in this critical section
+	retiredDone    []uint64                    // pipes retired in the previous one
+	cc             core.Config                 // the session's resolved configuration
 	redial         redialer
 	nestedLanes    int         // lanes that nested pipes hold on this session
-	needRedial     bool        // a direction may have been lost (under the lock)
 	dialed         Endpoint    // who dialed the bootstrap carrier; 0: unknown
 	carrier        CarrierKind // the kind DialChoice chose
 	// The small flags sit together, so that they pack into one word.
 	fired    bool // the timeout ran: rearm no earlier than G
 	closing  bool // CLOSED: no new goroutines
 	aborted  bool // Abort was called
+	inSusp   bool // under lst.regMu: in lst's suspension list
 	poisonSt poisonState
 	// A shaping deadline is met in place: the timer is armed lead before
 	// it, by the host timer's observed lateness, and the callback waits
 	// for the deadline itself.
 	timerPrecise bool
+	needRedial   bool // a direction may have been lost (under the lock)
 
 	// ending is closed when the first Close or Abort has returned; nil
 	// before either. closeSig, while Close waits, is woken at every
@@ -140,11 +150,6 @@ type Conn struct {
 	// closeCode and closeMsg are the first Close's, which an Abort during
 	// its flush sends instead of its own (the first call decides).
 	closeCode ApplicationErrorCode
-
-	// waited is Done's channel, made and closed by its goroutine.
-	waited   chan struct{}
-	waitOnce sync.Once
-	pools    atomic.Int32 // MaintainPipes calls running
 
 	chIn    chIn // received channel datagrams for the session
 	chInMax int  // the hand-off's length: the datagram receive queue's
@@ -312,6 +317,9 @@ func (c *Conn) recordEndLocked() []*pipeDrv {
 	}
 	c.hk.trace(traceItem{closed: true, err: c.err})
 	c.firePipeWaiters() // every wait on pipe changes sees the end (closing)
+	for _, pd := range c.pipes {
+		pd.end.end() // Pipe.Done: the session ended
+	}
 	if c.poisonSt != poisonTorn {
 		return nil // the core's own commands end the pipes
 	}
@@ -338,6 +346,7 @@ func (c *Conn) publishEnd(abort []*pipeDrv) {
 		c.side.seal()
 		c.cancel(c.err)
 		close(c.done)
+		c.side.finish()
 	})
 	unregisterLaneKey(c)
 	forgetNesting(c)
@@ -373,6 +382,7 @@ func (c *Conn) salvage(released *bool) {
 		abort = make([]*pipeDrv, 0, len(c.pipes))
 		for _, pd := range c.pipes {
 			abort = append(abort, pd)
+			pd.end.end() // Pipe.Done: the session ended
 		}
 		if c.timer != nil {
 			c.timer.Stop()
@@ -646,15 +656,17 @@ func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 		// Publish the locator before bootstrap I/O can expose it to the peer.
 		// AcceptJoin already holds joins until negotiation completes.
 		if lst != nil {
-			lst.mu.Lock()
-			closed := lst.closed
+			lst.regMu.Lock()
+			closed := lst.rclosed
 			if !closed {
 				lst.live[c] = struct{}{}
 				if len(cc.Local.Locator) > 0 {
-					lst.sessions[string(cc.Local.Locator)] = c
+					k := string(cc.Local.Locator)
+					lst.sessions[k] = c
+					c.lstLocs = append(c.lstLocs, k)
 				}
 			}
-			lst.mu.Unlock()
+			lst.regMu.Unlock()
 			if closed {
 				refused = true
 				return
@@ -860,7 +872,7 @@ func Server(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
 
 func newConn(cfg *Config, cc core.Config) *Conn {
 	c := &Conn{cfg: cfg, clk: newClock(cfg.clock()), pipes: make(map[uint64]*pipeDrv, 1), done: make(chan struct{}),
-		timerAt: core.Never, labels: map[uint64]string{}}
+		timerAt: core.Never}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
 	c.id = nextSessionID()
 	c.lctx = sessionLabels(c.id, cc.TransportRole)
@@ -1130,9 +1142,7 @@ func (c *Conn) Shutdown(ctx context.Context, code ApplicationErrorCode, msg stri
 // timeout confirms that the peer read the close. Done is its selectable
 // form.
 func (c *Conn) Wait() error {
-	<-c.done
-	c.wg.Wait()
-	<-c.side.wait()
+	<-c.side.finished()
 	return c.closedErr()
 }
 
@@ -1162,18 +1172,7 @@ func (c *Conn) goSide(lctx context.Context, name string, f func()) bool {
 //	}
 //
 // A wait given up this way changes nothing in the session.
-func (c *Conn) Done() <-chan struct{} {
-	c.waitOnce.Do(func() {
-		c.waited = make(chan struct{})
-		labels.Go(c.lctx, "done", func() {
-			<-c.done
-			c.wg.Wait()
-			<-c.side.wait()
-			close(c.waited)
-		})
-	})
-	return c.waited
-}
+func (c *Conn) Done() <-chan struct{} { return c.side.finished() }
 
 // Ping sends a QX_PING request (or joins the outstanding one) and returns
 // the measured round-trip time.

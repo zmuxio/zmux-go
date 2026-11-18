@@ -13,7 +13,7 @@ func TestListenerWatcherLifetime(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		l := mustNewListener(nil)
 		synctest.Wait()
-		if l.watching {
+		if l.watching.Load() {
 			t.Fatal("watcher started before the listener took a carrier")
 		}
 		a, b := net.Pipe()
@@ -22,10 +22,7 @@ func TestListenerWatcherLifetime(t *testing.T) {
 		done := make(chan struct{})
 		go func() { _ = l.HandlePipe(ctx, NetPipe(a), PipeHint{}); close(done) }()
 		synctest.Wait()
-		l.mu.Lock()
-		w := l.watching
-		l.mu.Unlock()
-		if !w {
+		if !l.watching.Load() {
 			t.Fatal("no watcher once the listener took a carrier")
 		}
 		cancel()

@@ -40,9 +40,9 @@ jobs:
         shell: bash
         working-directory: ${{ matrix.module.path }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: ${{ matrix.module.path }}/go.mod
           cache-dependency-path: "**/go.sum"
@@ -71,7 +71,7 @@ jobs:
 
       - name: test log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-log-${{ matrix.module.name }}-${{ matrix.os }}
           path: ${{ runner.temp }}/test.json
@@ -86,14 +86,14 @@ jobs:
       matrix:
         module: [".", zmuxquic, zmuxh3, zmuxws, seal, examples/xorpipe, interop/webpeer]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache-dependency-path: "**/go.sum"
 
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           # Pinned: the config enables every linter by default, so a newer release adds checks.
           version: v2.15.0
@@ -113,9 +113,9 @@ jobs:
       run:
         working-directory: ${{ matrix.module }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache-dependency-path: "**/go.sum"
@@ -133,3 +133,29 @@ jobs:
 
       - name: build linux/arm64
         run: GOOS=linux GOARCH=arm64 go build ./...
+
+  # A short run of each native fuzz target; the seeds in testdata/fuzz run in
+  # every test job already. The weekly workflow fuzzes longer.
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: "**/go.sum"
+
+      - name: fuzz
+        run: tools/fuzz.sh 10s
+
+      - name: failing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-inputs
+          path: |
+            **/testdata/fuzz/**
+          if-no-files-found: ignore

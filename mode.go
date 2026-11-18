@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
-	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 // Carrier selection: DialChoice dials a session over one carrier
@@ -674,9 +673,9 @@ func DialChoice(ctx context.Context, m CarrierChoice, cfg *Config, pol *CarrierC
 		}
 		// One carrier: the session ends with it, and counts against its
 		// kind when it fails soon after it was chosen.
-		labels.Go(c.lctx, "mode-watch", func() {
+		context.AfterFunc(c.ctx, func() { // the session's end, with no goroutine waiting for it
 			var ae *ApplicationError
-			if err := c.Wait(); !errors.As(err, &ae) {
+			if err := c.closedErr(); !errors.As(err, &ae) {
 				mp.dropped(i, chosen)
 			}
 		})
@@ -848,13 +847,13 @@ func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred CarrierCre
 	}
 	if err == nil && !stop() {
 		for _, pp := range pipes {
-			_ = pp.Abort(ErrHandshakeTimeout)
+			_ = pp.Abort()
 		}
 		err = ErrHandshakeTimeout
 	}
 	if err != nil {
 		for _, pp := range pipes { // a Join that failed after some pipes: none is left orphaned
-			_ = pp.Abort(err)
+			_ = pp.Abort()
 		}
 		err = lifeErr(life, err)
 		cancel()

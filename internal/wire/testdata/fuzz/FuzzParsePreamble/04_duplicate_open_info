@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("\x06\x01\x01\x61\x01\x01\x62")
+uint64(65536)

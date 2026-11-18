@@ -88,7 +88,8 @@ type PipeInfo struct {
 	Lanes []LaneInfo
 
 	FateGroup uint64
-	Failure   error // why the attachment failed, once it did
+	KeyGroup  uint64 // the key exchange group of the pipe's Join; 0 for the bootstrap pipe
+	Failure   error  // why the attachment failed, once it did
 }
 
 // LaneInfo is the positions of one lane of a pipe; a direction the lane
@@ -166,6 +167,9 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 		return pi, true
 	}
 	pi.Local, pi.FateGroup, pi.Failure = a.joinerLocal, a.fate, a.failCause
+	if a.group != nil {
+		pi.KeyGroup = a.group.ID
+	}
 	pi.PeerAttached = a.peerAttached(id)
 	pi.BytesRedundant, pi.BytesDuplicateRecv, pi.PingsAnswered = a.redundantBytes, a.dupBytes, a.pingsAnswered
 	pi.AttachedFor = s.now.Sub(a.attachedAt)
@@ -264,13 +268,7 @@ type SessionGauges struct {
 func (s *Session) Gauges() SessionGauges {
 	var g SessionGauges
 	g.StreamsActive = uint64(len(s.streams))
-	for _, st := range s.streams {
-		g.SendBuffered += st.unsentPayload()
-		g.RecvBuffered += st.rcv.buf.bytes
-	}
-	for _, st := range s.provisional {
-		g.SendBuffered += st.unsentPayload()
-	}
+	g.SendBuffered, g.RecvBuffered = s.unsent, s.conn.buffered
 	src := s.pipe(0)
 	if s.mp != nil {
 		g.Retained = s.mp.retained
@@ -290,6 +288,45 @@ func (s *Session) Gauges() SessionGauges {
 		}
 	}
 	return g
+}
+
+// syncUnsent brings st's share of the session's unsent bytes up to date;
+// it follows every change of what unsentPayload reads (the queue's end,
+// the sent offset, the preamble, a reset) and the stream's end.
+func (s *Session) syncUnsent(st *Stream) {
+	var v uint64
+	if !st.discarded && !st.cancelled {
+		v = st.unsentPayload()
+	}
+	sp := &st.snd
+	s.unsent = s.unsent - sp.unsentC + v
+	sp.unsentC = v
+}
+
+// SendBufferedSum recomputes SessionGauges.SendBuffered from every stream,
+// for tests that check the running sum.
+func (s *Session) SendBufferedSum() uint64 {
+	if s.state >= StateClosed {
+		return 0 // the buffers were released: nothing is left to send
+	}
+	var n uint64
+	for _, st := range s.streams {
+		n += st.unsentPayload()
+	}
+	for _, st := range s.provisional {
+		n += st.unsentPayload()
+	}
+	return n
+}
+
+// RecvBufferedSum recomputes SessionGauges.RecvBuffered from every
+// stream, for tests that check the running sum.
+func (s *Session) RecvBufferedSum() uint64 {
+	var n uint64
+	for _, st := range s.streams {
+		n += st.rcv.buf.bytes
+	}
+	return n
 }
 
 // unsentPayload is the written payload of st's sending part not yet sent.

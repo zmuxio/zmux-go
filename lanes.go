@@ -5,6 +5,8 @@ import (
 	"io"
 	"sync"
 
+	"github.com/djylb/timeshim"
+
 	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/labels"
@@ -45,10 +47,18 @@ func unregisterLaneKey(c *Conn) {
 // HandleLane routes a stream that the peer opened on a lane-capable
 // carrier connection, on an endpoint without a listener: its
 // first record names the session by Lane Key. A stream that names no pipe
-// is closed. It blocks until the lane ends.
+// is closed, and so is one whose first record, the lane header, does not
+// arrive within DefaultFirstRecordTimeout (the session is not known before
+// the header is read, so a listener's FirstRecordTimeout cannot apply). It
+// blocks until the lane ends.
 func HandleLane(ctx context.Context, p PipeIO) error {
+	return handleLaneOn(ctx, timeshim.Or(nil), p)
+}
+
+// handleLaneOn is HandleLane on clk.
+func handleLaneOn(ctx context.Context, clk timeshim.Clock, p PipeIO) error {
 	p = owned(p)
-	first, cls, err := readFirstRecord(p)
+	first, cls, err := readFirstWithin(ctx, context.Background(), clk, DefaultFirstRecordTimeout, p)
 	if err != nil || cls != core.ClassLane {
 		closePipe(p)
 		if err == nil {
@@ -150,7 +160,7 @@ func (c *Conn) acceptLane(p PipeIO, conn any, pipe, lane uint64) (<-chan struct{
 	r := &onceCloser{ReadCloser: p.R} // the pipe's end and the handler's ctx both close it: once
 	pd.inLanes = append(pd.inLanes, r)
 	done := make(chan struct{})
-	c.wg.Add(1)
+	c.side.add()
 	pd.gs.add()
 	labels.Go(pd.lctx, "lane-read", func() {
 		defer close(done)

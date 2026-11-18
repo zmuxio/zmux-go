@@ -22,7 +22,7 @@ func TestServerConfigValidate(t *testing.T) {
 		ok   bool
 	}{
 		{"default", func(*seal.ServerConfig) {}, true},
-		{"no Key", func(s *seal.ServerConfig) { s.Key = nil }, false},
+		{"no Key", func(s *seal.ServerConfig) { s.StaticKey = nil }, false},
 		{"no Gate", func(s *seal.ServerConfig) { s.Gate = nil }, false},
 		{"Join among the Profiles", func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{1, 2} }, false},
 		{"unknown Profile, not first", func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{1, 3, 77} }, false},

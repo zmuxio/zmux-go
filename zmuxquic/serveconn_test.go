@@ -80,18 +80,16 @@ func TestServeConnDialled(t *testing.T) {
 		t.Fatalf("server: %d pipes, want 2", n)
 	}
 	scancel()
-	if err := <-served; !errors.Is(err, context.Canceled) {
-		t.Fatalf("ServeConn after its context ended: %v", err)
-	}
 	echo(t, c, s, 1<<16) // the session continues
 	if q2.Context().Err() != nil {
 		t.Fatal("ServeConn closed the connection when its context ended")
 	}
-	// The first connection's ServeConn returns nil once it ends.
 	_ = c.Close()
 	_ = q1.CloseWithError(0, "")
-	if err := <-served; err != nil {
-		t.Fatalf("ServeConn after the connection ended: %v", err)
+	for range 2 { // ServeConn returned once each connection was handed on
+		if err := <-served; err != nil {
+			t.Fatalf("ServeConn: %v", err)
+		}
 	}
 }
 

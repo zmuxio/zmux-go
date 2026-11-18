@@ -2,44 +2,75 @@ package zmux
 
 import (
 	"fmt"
-	"log/slog"
 	"time"
 )
 
 // PoolPolicy decides the members a pool keeps and when it dials. Decide
-// must not block; the pool clamps values outside its limits.
+// runs on the pool's goroutine, must return promptly and must not block or
+// call into the session. A non-nil error rejects the look: the pool goes
+// on as with the zero decision and reports the error to its
+// DecisionRejected callback, else logs it at warning level (a PipePool to
+// Config.Logger, a carrier.ConnPool to its Logger). A decision with a value
+// out of range is rejected the same way (PoolDecision.Validate), and so is
+// a Decide that panics; no value is corrected into range.
 type PoolPolicy interface {
-	Decide(v *PoolView, d *PoolDecision)
+	Decide(v *PoolView, d *PoolDecision) error
 }
 
-// PoolView is the state of a pool.
+// PoolView is the state of a pool. It holds durations, not points in
+// time, so that a policy reads no clock of its own.
 type PoolView struct {
-	Now      time.Time
-	LastDial time.Time // zero: none
-	Members  []PoolMember
-	Failures int // consecutive failed dials
-	// Connections reports a carrier.ConnPool: its members are connections,
-	// named by FateGroup and retired with RetireConnections. Otherwise they
-	// are the pipes of a PipePool, named by PipeID and retired with
-	// RetirePipes.
-	Connections bool
+	// Members are the pool's members; a replacement being joined is not
+	// one until it replaces its member.
+	Members []PoolMember
+	// Failures counts the consecutive failed dial attempts of the pool
+	// (redials and replacements alike); 0 once a dial gives a usable
+	// member.
+	Failures int
+	// SinceLastDial is the time since the start of the pool's last dial
+	// attempt; negative before the first.
+	SinceLastDial time.Duration
+	// Dialing counts the pool's own growth dials in progress: the dial
+	// attempts it started to reach its count (first dials and redials),
+	// and a replacement whose member has gone meanwhile, which then adds
+	// one. A replacement of a member still there is not counted, and
+	// neither is a dial on demand, one a carrier.ConnPool.Get makes because
+	// no connection has room. A pool that dials inside its looks, so that
+	// none is in progress when it asks its policy, always reports 0: a
+	// PipePool (MaintainPipes) does.
+	Dialing int
 }
 
-// PoolMember is a pipe of a PipePool, or a connection of a carrier.ConnPool.
+// PoolMember is a member of a PipePool (a pipe, or the pipes a Join joined
+// together), or a connection of a carrier.ConnPool. One key identifies it,
+// and a decision names it by that key: a PipePool member by PipeID, a
+// connection by FateGroup. A member is a connection exactly when its
+// FateGroup is non-zero (a carrier pool never gives a connection fate
+// group 0); PipeID cannot tell, since pipe 0 is a pipe.
 type PoolMember struct {
-	// PipeID is the pipe of a PipePool member; FateGroup the fate group
-	// of a carrier.ConnPool connection. The other is zero.
-	PipeID    PipeID
+	// PipeID is the ID of the first pipe of a PipePool member, pipe 0
+	// included; it means nothing for a connection.
+	PipeID PipeID
+	// FateGroup is the fate group of a carrier.ConnPool connection, never
+	// 0; 0 for a PipePool member.
 	FateGroup uint64
-	Age       time.Duration
-	// Idle: for a pipe, its PipeStats.SinceLastTraffic (probes,
-	// acknowledgements and padding do not end it); for a connection, 0
-	// while it carries pipes, otherwise since its last pipe ended, or
-	// since it was established when it never carried one.
+	// Age is the time since its oldest pipe was attached, or since the
+	// connection was established.
+	Age time.Duration
+	// Idle: for a member, the least PipeStats.SinceLastTraffic of its
+	// pipes (probes, acknowledgements and padding do not end it); for a
+	// connection, 0 while it carries pipes, otherwise since its last pipe
+	// ended, or since it was established when it never carried one.
 	Idle          time.Duration
-	Pipes         int    // pipes on the connection; 1 for a pipe
-	BytesSent     uint64 // 0 for a connection
-	BytesReceived uint64 // 0 for a connection
+	Pipes         int    // its pipes: 1 for a dialled pipe, the group's size for a joined member, the pipes on a connection
+	BytesSent     uint64 // over its pipes; 0 for a connection
+	BytesReceived uint64 // over its pipes; 0 for a connection
+	// Usable: every pipe serves its direction and the peer attached it;
+	// for a connection, it takes new pipes (it is not retired).
+	Usable bool
+	// Replacing: a replacement of it is being dialled or joined; always
+	// false for a connection.
+	Replacing bool
 }
 
 // PoolDecision is the answer to Decide. Its zero value keeps the pool's
@@ -61,19 +92,32 @@ type PoolDecision struct {
 	Liveness PipeLiveness
 	// Count is the members to keep. Zero keeps the pool's own behaviour:
 	// a PipePool keeps its Count (at least one), a carrier.ConnPool dials
-	// a connection only when a pipe finds none with room. A negative
-	// value is invalid.
+	// a connection only when a pipe finds none with room. A Count below
+	// the pool's size, its members and Dialing together, shrinks the pool
+	// one step at a time: the growth dials under way are cancelled first,
+	// the most recently started first (a dial on demand is not one, is
+	// not counted and is never cancelled); then members close, those in
+	// RetirePipes (RetireConnections) first, then the longest Idle, ties
+	// broken by the fewest Pipes, the least Age, then the highest key. A
+	// PipePool member closes gracefully, with its replacement if one is
+	// being joined. A connection is retired: it takes no new pipe at once,
+	// no longer counts, is reported with Usable false and closes once its
+	// last pipe ends (at once when it carries none). A negative value is
+	// invalid.
 	Count int
 	// DialAfter is the earliest next dial after the start of the last
 	// dial attempt (the start of the pool before the first), in place of
-	// the pool's backoff (at most its maximum). Zero is the pool's
-	// backoff; a negative value is invalid.
+	// the pool's backoff (at most its maximum). Zero leaves the pool's
+	// backoff in force where it has one (a PipePool or a redial policy) and
+	// asks for no delay of a carrier.ConnPool, which has none; a negative
+	// value is invalid.
 	DialAfter time.Duration
 	// Recheck asks for the next Decide within this time even when nothing
 	// else happens; zero asks for none beyond the pool's own looks (its
-	// events, dials and maintenance cadence), and a negative value is
-	// invalid. A positive value is lengthened to MinRecheck at least, so
-	// the shortest recheck is MinRecheck; zero is never "at once".
+	// events, dials and the maintenance interval of 100 ms), and a
+	// negative value is invalid. A positive value is lengthened to
+	// MinRecheck at least, so the shortest recheck is MinRecheck; zero is
+	// never "at once". It has no upper bound of its own.
 	Recheck time.Duration
 }
 
@@ -90,37 +134,30 @@ func (d *PoolDecision) Validate() error {
 	return nil
 }
 
-// poolLook is the maintenance cadence of a pool with a policy or a byte
-// rotation limit: byte counts change with no event of their own.
-const poolLook = 250 * time.Millisecond
+// poolLook is the maintenance interval of a pool with a policy or a byte
+// rotation limit, the same in every language: byte counts change with no
+// event of their own.
+const poolLook = 100 * time.Millisecond
 
 // MinRecheck is the shortest wait a pool applies to PoolDecision.Recheck.
 const MinRecheck = 10 * time.Millisecond
 
-// Ask fills d with pol's decision on v, as every pool asks its policy: a
-// panic in Decide is contained (the zero decision then applies), and the
-// error is the decision's Validate error, the decision left as it is; a
-// pool that rejects the decision goes on as with the zero one.
-func (d *PoolDecision) Ask(pol PoolPolicy, v *PoolView) error { return decide(nil, pol, v, d) }
+// Ask fills d with pol's decision on v, as every pool asks its policy. A
+// Decide that returns an error or panics rejects the look: d is then the
+// zero decision and the error is Decide's, or names the panic. Otherwise
+// the error is the decision's Validate error, the decision left as it is. A pool that gets an error rejects the
+// decision and goes on as with the zero one.
+func (d *PoolDecision) Ask(pol PoolPolicy, v *PoolView) error { return decide(pol, v, d) }
 
-// decide asks pol, containing a panic (the zero decision then applies,
-// and the panic is logged to l), and returns the decision's Validate
-// error, the decision left as it is.
-func decide(l *slog.Logger, pol PoolPolicy, v *PoolView, d *PoolDecision) error {
+// decide is Ask. The panic is contained without logging: the error that
+// names it is reported as the rejection.
+func decide(pol PoolPolicy, v *PoolView, d *PoolDecision) error {
 	*d = PoolDecision{RetirePipes: d.RetirePipes[:0], RetireConnections: d.RetireConnections[:0]}
-	if !safeLog(l, "PoolPolicy.Decide", func() { pol.Decide(v, d) }) {
-		*d = PoolDecision{}
+	if err := hostCall(nil, "PoolPolicy.Decide", func() error { return pol.Decide(v, d) }); err != nil {
+		*d = PoolDecision{RetirePipes: d.RetirePipes[:0], RetireConnections: d.RetireConnections[:0]}
+		return err
 	}
 	return d.Validate()
-}
-
-// reportRejected hands the error of a rejected decision to a pool's
-// DecisionRejected callback f, if set, containing a panic (logged to l).
-// Callers hold no lock.
-func reportRejected(l *slog.Logger, f func(error), err error) {
-	if f != nil {
-		safeLog(l, "DecisionRejected", func() { f(err) })
-	}
 }
 
 // probeOptions returns o with d's liveness settings over it.
@@ -147,8 +184,8 @@ func (d *PoolDecision) probeOptions(o PipeOptions) PipeOptions {
 }
 
 // RecheckAfter is the wait before a pool asks its policy again after d:
-// d's Recheck, raised to MinRecheck, when it comes before the pool's own
-// maintenance look, else that look.
+// d's Recheck, raised to MinRecheck, when it comes before the pool's
+// maintenance interval (100 ms), else that interval.
 func (d *PoolDecision) RecheckAfter() time.Duration {
 	if d.Recheck <= 0 {
 		return poolLook

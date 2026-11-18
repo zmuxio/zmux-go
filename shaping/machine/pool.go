@@ -214,19 +214,24 @@ func metricOf(k metric, m *zmux.PoolMember) uint64 {
 	return x
 }
 
-// memberKey names member m of v: its fate group in a carrier.ConnPool, its pipe
+// memberKey names member m: its fate group in a carrier.ConnPool, its pipe
 // ID in a PipePool.
-func memberKey(v *zmux.PoolView, m *zmux.PoolMember) uint64 {
-	if v.Connections {
+func memberKey(m *zmux.PoolMember) uint64 {
+	if isConnection(m) {
 		return m.FateGroup
 	}
 	return uint64(m.PipeID)
 }
 
+// isConnection reports whether m is a connection of a carrier.ConnPool,
+// whose fate group is never 0; a PipePool member's is 0 (its PipeID may
+// be 0, the bootstrap pipe).
+func isConnection(m *zmux.PoolMember) bool { return m.FateGroup != 0 }
+
 // Decide sets d as the policy states, and d.Recheck to the earliest of the
 // time until an age or idle rule of a member not retired would hold and the
 // time until the dial wait after the last dial elapses (0: neither).
-func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
+func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.seen == nil {
@@ -234,7 +239,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 	}
 	clear(p.seen)
 	for i := range v.Members {
-		p.seen[memberKey(v, &v.Members[i])] = true
+		p.seen[memberKey(&v.Members[i])] = true
 	}
 	for id := range p.members {
 		if !p.seen[id] {
@@ -271,13 +276,13 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 			recheck = t
 		}
 	}
-	if !v.LastDial.IsZero() && d.DialAfter > 0 {
-		ask(v.LastDial.Add(d.DialAfter).Sub(v.Now))
+	if v.SinceLastDial >= 0 && d.DialAfter > 0 {
+		ask(d.DialAfter - v.SinceLastDial)
 	}
 	if len(s.retire) > 0 {
 		for i := range v.Members {
 			m := &v.Members[i]
-			key := memberKey(v, m)
+			key := memberKey(m)
 			if !p.seen[key] { // a repeated ID, retired already
 				continue
 			}
@@ -308,7 +313,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 					above = jitterWith(above, r.jitter, pm.u[j])
 				}
 				if x > above {
-					if v.Connections {
+					if isConnection(m) {
 						d.RetireConnections = append(d.RetireConnections, m.FateGroup)
 					} else {
 						d.RetirePipes = append(d.RetirePipes, m.PipeID)
@@ -328,6 +333,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 		}
 	}
 	d.Recheck = recheck
+	return nil
 }
 
 // dialDraw returns the draw of the current dial wait, starting a new wait
@@ -335,8 +341,8 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) {
 // since the last dial got shorter, or when a first dial appeared.
 func (p *poolPolicy) dialDraw(v *zmux.PoolView) uint64 {
 	since := int64(-1)
-	if !v.LastDial.IsZero() {
-		since = int64(v.Now.Sub(v.LastDial) / time.Microsecond)
+	if v.SinceLastDial >= 0 {
+		since = int64(v.SinceLastDial / time.Microsecond)
 	}
 	if !p.waiting || v.Failures != p.waitFails || since >= 0 && (p.waitSince < 0 || since < p.waitSince) {
 		p.waiting, p.waitU = true, p.src.Uint64()

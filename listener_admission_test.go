@@ -163,8 +163,8 @@ func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 		})
 	}
 	waitUntil(t, 5*time.Second, "two slots", func() bool {
-		lst.mu.Lock()
-		defer lst.mu.Unlock()
+		lst.pmu.Lock()
+		defer lst.pmu.Unlock()
 		return lst.pending.Held(lst.sourceKey(netip.MustParseAddrPort("192.0.2.1:1"))) == 2
 	})
 	a, b := net.Pipe()
@@ -564,13 +564,13 @@ func TestKnownJoin(t *testing.T) {
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
 	loc := []byte("known-locator")
-	lst.mu.Lock()
+	lst.regMu.Lock()
 	lst.sessions[string(loc)] = new(Conn)
-	lst.mu.Unlock()
+	lst.regMu.Unlock()
 	t.Cleanup(func() {
-		lst.mu.Lock()
+		lst.regMu.Lock()
 		delete(lst.sessions, string(loc))
-		lst.mu.Unlock()
+		lst.regMu.Unlock()
 	})
 	hello := func(suite, mode byte, locator []byte) []byte {
 		b := []byte{0x02, suite, mode, byte(len(locator))}
@@ -607,9 +607,9 @@ func TestKnownJoin(t *testing.T) {
 			t.Errorf("%s: KnownJoin = %v, %d; want %v, %d", c.name, known, need, c.known, c.need)
 		}
 	}
-	lst.mu.Lock()
+	lst.regMu.Lock()
 	delete(lst.sessions, string(loc))
-	lst.mu.Unlock()
+	lst.regMu.Unlock()
 	if known, _ := lst.Adapter().KnownJoin(full); known {
 		t.Error("a session that ended is still known")
 	}

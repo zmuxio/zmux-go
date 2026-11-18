@@ -16,6 +16,7 @@ import (
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/poolhost"
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
@@ -28,9 +29,9 @@ func TestConfigBounds(t *testing.T) {
 		role core.Role
 		ok   bool
 	}{
-		{"MaxSendBuffer below SendBuffer", Config{SendBuffer: 8 << 20, MaxSendBuffer: 4 << 20}, core.RoleInitiator, false},
-		{"MaxSendBuffer below the default SendBuffer", Config{MaxSendBuffer: 1 << 20}, core.RoleInitiator, false},
-		{"MaxSendBuffer at SendBuffer", Config{SendBuffer: 4 << 20, MaxSendBuffer: 4 << 20}, core.RoleInitiator, true},
+		{"SendBufferMax below SendBuffer", Config{SendBuffer: 8 << 20, SendBufferMax: 4 << 20}, core.RoleInitiator, false},
+		{"SendBufferMax below the default SendBuffer", Config{SendBufferMax: 1 << 20}, core.RoleInitiator, false},
+		{"SendBufferMax at SendBuffer", Config{SendBuffer: 4 << 20, SendBufferMax: 4 << 20}, core.RoleInitiator, true},
 		{"ReplayWindow below MaxPipes+H", Config{MaxPipes: 4, ReplayWindow: 11, PipeAuth: psk}, core.RoleInitiator, false},
 		{"ReplayWindow at MaxPipes+H", Config{MaxPipes: 4, ReplayWindow: 12, PipeAuth: psk}, core.RoleInitiator, true},
 		{"negative ResumeTimeout", Config{ResumeTimeout: -1}, core.RoleInitiator, false},
@@ -358,15 +359,49 @@ func TestRedialBackoffSequence(t *testing.T) {
 	})
 }
 
+// TestPoolDecisionRejectedLogged: a policy that panics or decides out of
+// range is rejected with an error, reset to the zero decision on a panic,
+// and the error goes to DecisionRejected, or to the logger without one.
+func TestPoolDecisionRejectedLogged(t *testing.T) {
+	var d PoolDecision
+	err := decide(policyFunc(func(_ *PoolView, x *PoolDecision) { x.Count = 3; panic("decide") }), &PoolView{}, &d)
+	if err == nil || !strings.Contains(err.Error(), "PoolPolicy.Decide") || d.Count != 0 {
+		t.Fatalf("panic: %v, %+v", err, d)
+	}
+	errNo := errors.New("no")
+	err = decide(rejectPolicy{errNo}, &PoolView{}, &d)
+	if !errors.Is(err, errNo) || d.Count != 0 {
+		t.Fatalf("returned error: %v, %+v", err, d)
+	}
+	err = decide(policyFunc(func(_ *PoolView, x *PoolDecision) { x.Recheck = -1 }), &PoolView{}, &d)
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("out of range: %v", err)
+	}
+	rec := &logRecorder{}
+	var got error
+	poolhost.ReportRejected(slog.New(rec), func(e error) { got = e }, err)
+	if !errors.Is(got, err) || len(rec.msgs) != 0 {
+		t.Fatalf("callback %v, logged %q", got, rec.msgs)
+	}
+	poolhost.ReportRejected(slog.New(rec), nil, err)
+	if !rec.has("rejected") {
+		t.Fatalf("not logged: %q", rec.msgs)
+	}
+	poolhost.ReportRejected(nil, nil, err) // no logger: nothing
+}
+
+// rejectPolicy sets a decision and rejects the look.
+type rejectPolicy struct{ err error }
+
+func (p rejectPolicy) Decide(_ *PoolView, d *PoolDecision) error { d.Count = 3; return p.err }
+
 // Contained panics of host callbacks reach Config.Logger.
 func TestLoggerContainedPanics(t *testing.T) {
 	rec := &logRecorder{}
 	l := slog.New(rec)
 	_ = askBudget(l, func() shaping.Budget { panic("budget") })
-	var d PoolDecision
-	_ = decide(l, policyFunc(func(*PoolView, *PoolDecision) { panic("decide") }), &PoolView{}, &d)
-	reportRejected(l, func(error) { panic("rejected") }, ErrInvalidConfig)
-	for _, w := range []string{"Config.ShapingBudget", "PoolPolicy.Decide", "DecisionRejected"} {
+	poolhost.ReportRejected(l, func(error) { panic("rejected") }, ErrInvalidConfig)
+	for _, w := range []string{"Config.ShapingBudget", "DecisionRejected"} {
 		found := false
 		rec.mu.Lock()
 		for _, a := range rec.attrs {

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"sync"
 
 	"github.com/djylb/timeshim"
@@ -458,6 +457,21 @@ func (c *Conn) helloWithoutBinding() {
 	c.s.HelloWithoutBinding()
 }
 
+// heldJoin is an Unconfirmed carrier as the session keeps it, for the
+// eviction by a newer Hello.
+type heldJoin struct {
+	p      PipeIO
+	cancel context.CancelFunc // of the join's own bound
+}
+
+// evict ends the join as one the session refused to keep: the bound's
+// end is not the peer's fault (errRefused, counted in ListenerStats.Refused),
+// and the carrier is closed at once.
+func (h *heldJoin) evict() {
+	h.cancel()
+	closePipe(h.p)
+}
+
 // acceptHello authenticates and confirms a Hello that named this session.
 func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding []byte, admitted any, maxUnconfirmed int) (uint64, error) {
 	// Waiting for establishment or the join keys is bounded even when the
@@ -539,6 +553,7 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 	var res core.JoinResult
 	var evict func()
 	closing := false
+	held := &heldJoin{p: p, cancel: cancel}
 	c.locked(func() {
 		if closing = c.closing; closing {
 			return
@@ -548,7 +563,9 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 		c.s.SetNow(c.clk.now())
 		reply, res = c.s.ClaimHello(pj, core.Carrier{HasIn: p.R != nil, HasOut: p.W != nil, Refuse: loop}, p.WriteOverhead, h.WireLen(joinFraming(p)), &plan)
 		if res == core.JoinAccepted {
-			evict = c.holdUnconfirmed(p, maxUnconfirmed)
+			if old, ok := c.unconfirmed.Hold(pj, held, maxUnconfirmed); ok {
+				evict = old.evict
+			}
 		}
 	})
 	if closing {
@@ -558,7 +575,7 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 		evict()
 	}
 	if res == core.JoinAccepted {
-		defer c.dropUnconfirmed(p)
+		defer c.locked(func() { c.unconfirmed.Drop(pj) })
 	}
 	markTaken(p)
 	if res == core.JoinClose {
@@ -623,8 +640,8 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 			return
 		}
 		pd.admitted = admitted
-		pd.nest, edge = edge, nil  // the session's now: its pipe's end drops the edge
-		c.dropUnconfirmedLocked(p) // no later join evicts it
+		pd.nest, edge = edge, nil // the session's now: its pipe's end drops the edge
+		c.unconfirmed.Drop(pj)    // no later join evicts it
 		c.startPipeLocked(pd, dirIn, dirOut)
 		confirmed = true
 	})
@@ -639,29 +656,6 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 		pd.endUnusedHalf(DirectionSendOnly)
 	}
 	return id, nil
-}
-
-// holdUnconfirmed records p and returns what closes an evicted carrier (under the
-// lock): at most limit Unconfirmed carriers are held (ListenerConfig.MaxPendingPerSession),
-// a new one evicting the oldest.
-func (c *Conn) holdUnconfirmed(p PipeIO, limit int) (evict func()) {
-	if len(c.unconfirmed) >= limit {
-		old := c.unconfirmed[0]
-		c.unconfirmed = c.unconfirmed[1:]
-		evict = func() { closePipe(old) }
-	}
-	c.unconfirmed = append(c.unconfirmed, p)
-	return evict
-}
-
-func (c *Conn) dropUnconfirmed(p PipeIO) {
-	c.lock()
-	defer c.unlock()
-	c.dropUnconfirmedLocked(p)
-}
-
-func (c *Conn) dropUnconfirmedLocked(p PipeIO) {
-	c.unconfirmed = slices.DeleteFunc(c.unconfirmed, func(q PipeIO) bool { return carrierio.SameHalf(q.W, p.W) && carrierio.SameHalf(q.R, p.R) })
 }
 
 // PairedPipe makes one carrier of two unidirectional ones, the local endpoint's

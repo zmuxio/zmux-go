@@ -23,6 +23,10 @@ var (
 	ErrInvalidConfig  = join.ErrInvalidConfig
 	ErrState          = join.ErrState
 	ErrRandomFailed   = join.ErrRandomFailed
+	ErrUnknownSuite   = join.ErrUnknownSuite
+	ErrMissingField   = join.ErrMissingField
+	ErrBadField       = join.ErrBadField
+	ErrBadConfirm     = join.ErrBadConfirm
 
 	ErrTLVTruncated       = join.ErrTLVTruncated
 	ErrTLVNonMinimal      = join.ErrTLVNonMinimal
@@ -54,9 +58,9 @@ var errorClasses = []struct {
 	n string
 }{
 	{ErrIncomplete, "incomplete"}, {ErrMalformed, "malformed"}, {ErrTrailing, "trailing_bytes"},
-	{ErrUnknownProfile, "unknown_profile"}, {join.ErrUnknownSuite, "unknown_suite"},
+	{ErrUnknownProfile, "unknown_profile"}, {ErrUnknownSuite, "unknown_suite"},
 	{ErrPeerIsSelf, "peer_is_self"}, {ErrRandomFailed, "random_failed"}, {ErrInvalidConfig, "invalid_config"},
-	{join.ErrMissingField, "missing_field"}, {join.ErrBadField, "bad_field"}, {join.ErrBadConfirm, "bad_confirm"},
+	{ErrMissingField, "missing_field"}, {ErrBadField, "bad_field"}, {ErrBadConfirm, "bad_confirm"},
 	{ErrBadFlags, "bad_flags"}, {ErrBadHandle, "bad_handle"}, {ErrAuth, "auth"}, {ErrKex, "kex"},
 	{ErrTooLarge, "too_large"}, {ErrExhausted, "exhausted"}, {ErrTLVTruncated, "tlv_truncated"},
 	{ErrTLVNonMinimal, "tlv_non_minimal"}, {ErrTLVOrder, "tlv_order"},

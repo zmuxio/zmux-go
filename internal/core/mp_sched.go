@@ -66,6 +66,18 @@ func (s *Session) policyOf(st *Stream) Policy {
 	return s.cfg.Policy
 }
 
+// Policy returns the session's scheduling policy.
+func (s *Session) Policy() Policy { return s.cfg.Policy }
+
+// StreamPolicy returns the policy a stream direction set for itself; own is
+// false when it follows the session's.
+func (s *Session) StreamPolicy(st *Stream) (p Policy, own bool) {
+	if st.pol == 0 {
+		return 0, false
+	}
+	return Policy(st.pol - 1), true
+}
+
 // onPipe reports whether the next chunk of st may go on the decision's pipe.
 func (s *Session) onPipe(d *decision, st *Stream) bool {
 	if !d.open {
@@ -1148,6 +1160,20 @@ func (s *Session) SetStreamPolicy(st *Stream, p Policy, inherit bool) {
 		m.bind, m.rr, m.rrFill, m.pick = binding{}, nil, rrFill{}, pickAnswer{}
 	}
 	s.wakeAllWriters()
+}
+
+// Redundant returns the stream's own redundancy setting; nil follows the
+// session's.
+func (s *Session) Redundant(st *Stream) *bool {
+	switch {
+	case st.redund > 0:
+		on := true
+		return &on
+	case st.redund < 0:
+		on := false
+		return &on
+	}
+	return nil
 }
 
 // SetRedundant overrides the session's redundancy for a stream direction;

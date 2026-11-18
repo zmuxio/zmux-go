@@ -464,7 +464,6 @@ func TestPoolDecideVectors(t *testing.T) {
 			t.Errorf("%s: compile %v %d", c.Name, cc.shared, s.n)
 		}
 		p := cc.PoolPolicy()
-		base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 		us := func(x *int64) time.Duration {
 			if x == nil {
 				return 0
@@ -472,15 +471,17 @@ func TestPoolDecideVectors(t *testing.T) {
 			return time.Duration(*x) * time.Microsecond
 		}
 		for i, st := range c.Steps {
-			v := &zmux.PoolView{Now: base, Failures: st.Failures}
+			v := &zmux.PoolView{Failures: st.Failures, SinceLastDial: -1}
 			if st.Since != nil {
-				v.LastDial = base.Add(-us(st.Since))
+				v.SinceLastDial = us(st.Since)
 			}
 			for _, m := range st.Members {
 				v.Members = append(v.Members, zmux.PoolMember{PipeID: zmux.PipeID(m.ID), Age: us(&m.Age), Idle: us(&m.Idle), Pipes: m.Pipes, BytesSent: m.BytesSent, BytesReceived: m.BytesReceived})
 			}
 			var g zmux.PoolDecision
-			p.Decide(v, &g)
+			if err := p.Decide(v, &g); err != nil {
+				t.Fatalf("step %d: %v", i, err)
+			}
 			w := st.Want
 			wc := 0
 			if w.Count != nil {

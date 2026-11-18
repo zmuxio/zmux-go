@@ -226,7 +226,7 @@ func TestSplitJoinHandlerLifetime(t *testing.T) {
 	mu.Unlock()
 	second()
 	first, _ := c.Pipe(0)
-	_ = first.Abort(nil)
+	_ = first.Abort()
 	echoOnce(t, ctx, c, s)
 	if st, ok := p.Stats(); !ok || st.FailureCount != 0 {
 		t.Fatalf("the pipe died with the request's context: %+v", st)

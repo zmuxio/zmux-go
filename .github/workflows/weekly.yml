@@ -1,0 +1,241 @@
+name: Weekly
+
+# What CI cannot show: the newest Go with the newest dependencies, the newest
+# quic-go in zmuxquic, longer fuzzing, and the newest released Rust and Java
+# peers. A failure opens (or comments on) an issue labelled weekly-ci.
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly
+  cancel-in-progress: false
+
+jobs:
+  latest:
+    name: latest Go and dependencies (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", zmuxws, seal, examples/xorpipe, interop/webpeer]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: update dependencies
+        working-directory: ${{ matrix.module }}
+        run: |
+          GOWORK=off go get -u ./...
+          GOWORK=off go mod tidy
+          git diff --stat
+
+      - name: vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+      - name: test
+        working-directory: ${{ matrix.module }}
+        run: go test -race -count=1 -timeout 20m ./...
+
+  # zmuxh3 and zmuxquic share one quic-go in the workspace. zmuxh3 stays on the
+  # version of its go.mod (webtransport-go has to build against it); the
+  # other dependencies move, and a second step reports whether it can move too.
+  h3:
+    name: latest dependencies (zmuxh3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: update dependencies, quic-go held
+        working-directory: zmuxh3
+        run: |
+          quic=$(GOWORK=off go list -m -f '{{.Version}}' github.com/quic-go/quic-go)
+          GOWORK=off go get -u ./...
+          GOWORK=off go get "github.com/quic-go/quic-go@$quic"
+          GOWORK=off go mod tidy
+          git diff --stat
+          go vet ./...
+          go test -race -count=1 -timeout 20m ./...
+
+      - name: can zmuxh3 follow quic-go
+        continue-on-error: true
+        working-directory: zmuxh3
+        run: |
+          GOWORK=off go get -u github.com/quic-go/quic-go github.com/quic-go/webtransport-go
+          GOWORK=off go mod tidy
+          if go vet ./... && go test -race -count=1 -timeout 20m ./...; then
+            echo "::notice::zmuxh3 builds and passes with the newest quic-go and webtransport-go; move the pins of zmuxquic and zmuxh3"
+          else
+            echo "::notice::zmuxh3 does not yet build with the newest quic-go"
+            exit 1
+          fi
+
+  quic:
+    name: newest quic-go (zmuxquic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: update quic-go and the rest
+        working-directory: zmuxquic
+        run: |
+          GOWORK=off go get -u ./...
+          GOWORK=off go mod tidy
+          git diff --stat
+          # The workspace takes this quic-go for zmuxh3 too; only zmuxquic is built.
+          go vet ./...
+          go test -race -count=1 -timeout 20m ./...
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - run: tools/fuzz.sh 3m
+
+      - name: failing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-inputs
+          path: |
+            **/testdata/fuzz/**
+          if-no-files-found: ignore
+
+  # The scripted peers of the newest released Rust and Java libraries against
+  # the Go suites that drive them.
+  interop:
+    name: interop with the newest ${{ matrix.peer }} release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        peer: [rust, java]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: fetch the newest release
+        id: peer
+        run: |
+          case "${{ matrix.peer }}" in rust) repo=zmux-rs ;; java) repo=zmux-java ;; esac
+          tag=$(git ls-remote --tags --refs --sort=-v:refname "https://github.com/zmuxio/$repo" 'v*' | head -n 1 | sed 's|.*refs/tags/||')
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "::notice::${{ matrix.peer }} peer $tag"
+          git clone --depth 1 --branch "$tag" "https://github.com/zmuxio/$repo" "$RUNNER_TEMP/peer"
+
+      - name: build the Rust peer
+        if: matrix.peer == 'rust'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          timeout 900 cargo build --release --locked --manifest-path "$RUNNER_TEMP/peer/interop/peer/Cargo.toml"
+          echo "ZMUX_INTEROP_PEER=$RUNNER_TEMP/peer/interop/peer/target/release/zmux-interop-peer" >> "$GITHUB_ENV"
+
+      - name: build the Rust shaping and datagram peers
+        id: rspeers
+        if: matrix.peer == 'rust'
+        run: |
+          if [ -d "$RUNNER_TEMP/peer/interop/shaping-peer" ] && [ -d "$RUNNER_TEMP/peer/interop/datagram-peer" ]; then
+            timeout 900 cargo build --release --locked --manifest-path "$RUNNER_TEMP/peer/interop/shaping-peer/Cargo.toml" --target-dir "$RUNNER_TEMP/peer/interop/shaping-peer/target"
+            echo "ZMUX_SHAPING_PEER=$RUNNER_TEMP/peer/interop/shaping-peer/target/release/zmux-shaping-peer" >> "$GITHUB_ENV"
+            timeout 900 cargo build --release --locked --manifest-path "$RUNNER_TEMP/peer/interop/datagram-peer/Cargo.toml" --target-dir "$RUNNER_TEMP/peer/interop/datagram-peer/target"
+            echo "ZMUX_RS_QUIC_CHANNEL_PEER=$RUNNER_TEMP/peer/interop/datagram-peer/target/release/zmux-datagram-peer" >> "$GITHUB_ENV"
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Rust ${{ steps.peer.outputs.tag }} has no interop/shaping-peer or interop/datagram-peer; those suites are skipped"
+          fi
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        if: matrix.peer == 'java'
+        with:
+          distribution: zulu
+          java-version: 25
+
+      - name: build the Java peer
+        if: matrix.peer == 'java'
+        working-directory: ${{ runner.temp }}/peer
+        run: |
+          timeout 900 mvn -B -q -pl zmux -am -DskipTests test-compile
+          echo "ZMUX_INTEROP_PEER=$RUNNER_TEMP/peer/tools/interop-peer.sh" >> "$GITHUB_ENV"
+
+      - name: root suites
+        run: go test -race -count=1 -timeout 5m -run '^TestInterop(Client|Server|MultipathClient|MultipathServer|Packets|TLSExporter)' .
+
+      - name: secure carrier
+        working-directory: seal
+        run: go test -race -count=1 -timeout 5m -run '^TestInteropEstablish' .
+
+      - name: shaping
+        if: matrix.peer == 'rust' && steps.rspeers.outputs.present == 'true'
+        run: go test -race -count=1 -timeout 10m -run '^TestInteropShaping' ./shaping/machine
+
+      - name: QUIC datagram channel
+        if: matrix.peer == 'rust' && steps.rspeers.outputs.present == 'true'
+        working-directory: zmuxquic
+        run: go test -race -count=1 -timeout 5m -run '^TestInteropQUICChannel' .
+
+  report:
+    name: report
+    needs: [latest, h3, quic, fuzz, interop]
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create weekly-ci --color B60205 --description "Failure of the weekly workflow" 2>/dev/null || true
+          body="The weekly workflow failed: $RUN_URL"
+          n=$(gh issue list --label weekly-ci --state open --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "$body"
+          else
+            gh issue create --label weekly-ci --title "Weekly workflow failed" --body "$body"
+          fi

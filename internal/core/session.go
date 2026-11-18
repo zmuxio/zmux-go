@@ -83,6 +83,8 @@ type Session struct {
 	sched             scheduler
 	ctlHead           *Stream
 	ctlTail           *Stream
+	copyHead          *Stream // streams with copyMSD set
+	unsent            uint64  // sum of the streams' unsentPayload (syncUnsent): SessionGauges.SendBuffered
 	conn              connFlow
 	pend              pendingCtl
 	ping              pingState

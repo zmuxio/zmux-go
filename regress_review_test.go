@@ -132,7 +132,7 @@ func TestConfirmWriteRacesEnd(t *testing.T) {
 				if len(ps) != before+1 {
 					t.Fatalf("%d pipes", len(ps))
 				}
-				if err := ps[len(ps)-1].Abort(errors.New("test")); err != nil {
+				if err := ps[len(ps)-1].Abort(); err != nil {
 					t.Fatal(err)
 				}
 			}

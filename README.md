@@ -129,7 +129,9 @@ carriers allow, then hands CONNECTION_CLOSE to every usable carrier (written
 to it; for a socket, taken into the kernel's send buffer). It returns at the
 latest 1 s after the call, flushing included, so a process may exit as soon
 as it returns; what was not handed over by then is discarded. Open streams
-are not waited for; they fail with the session's error.
+are not waited for; they fail with the session's error. A session is not
+closed by the garbage collector: like a `net.Conn` it must be closed, also
+when its streams are done.
 `Conn.Abort(code, reason)` ends the session at once with an application
 error and discards unsent data. The first close or abort decides the code
 and reason; an abort while a close is still flushing ends the flush at once.
@@ -366,7 +368,7 @@ carriers join the session in any mode the acceptor allows. The wire format and t
 experimental and may change.
 
 ```go
-server := &seal.ServerConfig{Gate: gate, Key: nodeKey}
+server := &seal.ServerConfig{Gate: gate, StaticKey: nodeKey}
 l, err := zmux.NewListener(&zmux.ListenerConfig{WrapPipe: server}) // validates server
 if err != nil {
 	return nil, err
@@ -376,7 +378,7 @@ defer func() { _ = l.Close() }()
 ctx, cancel := context.WithTimeout(ctx, 10*time.Second) // a refused handshake gets no reply
 defer cancel()
 p, err := seal.Establish(ctx, carrier, &seal.ClientConfig{
-	Anchor: seal.PinAnchor(seal.NodeKeyID(nodePub)),
+	Anchor: seal.PinAnchor(seal.StaticKeyID(nodePub)),
 	Handle: handle,
 	PSK:    psk,
 })
@@ -751,10 +753,12 @@ dropped and counted (`DatagramsDroppedLimit`) when it grants nothing.
 maxBytes` as `maxBytes`; a grant may be below `minBytes` when the limiter's
 burst is smaller, and for `(n, n)` any grant lets the whole unit pass. An
 `Acquire` that is cancelled or fails must leave nothing taken. zmux calls
-the limiter outside every session lock and from any goroutine; a panic or
-a grant outside `[1, maxBytes]` fails the `Acquire` (the splice direction
-ends cancelled), counts as nothing in `TryAcquire`, and is ignored in
-`Refund`.
+the limiter outside every session lock and from any goroutine. An error,
+a panic or a grant outside `[1, maxBytes]` fails the `Acquire`: the splice
+direction ends `SpliceLimiterFailed`, its downstream reset and its upstream
+stopped with `ZMUX_CANCELLED`, while the other direction goes on. In
+`TryAcquire` it only drops that datagram, counted as limited; in `Refund`
+it is ignored.
 
 ## Datagram channels
 
@@ -790,7 +794,9 @@ routes the datagrams of a connection shared by several pipes.
 `Config.Shaper`, `Config.HandshakeShaper`, `Config.ShapingLimits` and
 `Config.ShapingBudget` take hooks and bounds for the sizes and timing of what a session writes, and `PipePool.Policy`,
 `Config.RedialPolicy` and `carrier.ConnPool.Policy` a pool's decisions (packages `shaping` and `shaping/machine`,
-`shaping/bundle`).
+`shaping/bundle`). A policy rejects a look by returning an error from `Decide`; the pool then keeps its own
+behaviour and reports the error to its `DecisionRejected` callback, else logs it (a `carrier.ConnPool` to its own
+`Logger`, unset meaning nothing is logged).
 
 ## More
 

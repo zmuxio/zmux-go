@@ -9,7 +9,6 @@ import (
 	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
-	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
 // PipeOptions are the options of an attachment. The zero value is a
@@ -32,7 +31,9 @@ type PipeOptions struct {
 	Liveness Change[PipeLiveness]
 	// QualityBand is the pipe's own quality band for EventPipeQualityChanged
 	// (its outbound direction). Default: the session's (Conn.SetQualityBand).
-	// A receive-only pipe has none: setting it is an ErrInvalidConfig error.
+	// Set(QualityBand{}) turns the pipe's reports off whatever the
+	// session's band is (the zero band is both halves off). A receive-only
+	// pipe has none: setting it is an ErrInvalidConfig error.
 	QualityBand Change[QualityBand]
 	// SendPriority is the tier of the local outbound direction (lower is
 	// preferred). Default: the peer's request, else tier 0.
@@ -236,7 +237,7 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 	defer cancel()
 	if err := c.joinCarrier(jctx, pd, p, dir); err != nil {
 		if !errors.Is(err, ErrJoinRefused) {
-			_ = pp.Abort(err)
+			_ = pp.Abort()
 		}
 		return nil, true, err
 	}
@@ -244,7 +245,7 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 		return pp, true, nil
 	}
 	if err := pp.WaitAttached(jctx); err != nil {
-		_ = pp.Abort(err)
+		_ = pp.Abort()
 		if jctx.Err() != nil && c.ctx.Err() == nil {
 			return nil, true, fmt.Errorf("zmux: pipe %d not attached by the peer: %w", pp.id, err)
 		}
@@ -332,7 +333,8 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions) (*Pipe, *pip
 	}
 	pd.id = id
 	c.pipes[id] = pd
-	c.labels[id] = o.Label
+	o.RecordMode = Set(RecordMode(j.Mode))
+	pd.end.opts = o
 	return &Pipe{c: c, id: id, end: pd.end}, pd, nil
 }
 
@@ -387,8 +389,9 @@ func Clear[T any]() Change[T] { return Change[T]{state: 2} }
 //   - Liveness: set replaces the pipe's own PipeLiveness as a whole; clear
 //     follows the session's. A pipe already suspect keeps the SuspectFloor
 //     and DeadTimeout it turned suspect under.
-//   - QualityBand: set replaces the pipe's own band; clear follows the
-//     session's (Conn.SetQualityBand). Nothing is sent. A pipe without an
+//   - QualityBand: set replaces the pipe's own band, the zero band
+//     turning the pipe's reports off; clear follows the session's
+//     (Conn.SetQualityBand). Nothing is sent. A pipe without an
 //     outbound direction refuses either with ErrInvalidConfig.
 //
 // The fields fixed when the pipe is added (Direction, RecordMode, KeyGroup,
@@ -500,11 +503,88 @@ func (p *Pipe) Update(u PipeUpdate) error {
 			}
 			return apiErr(err)
 		}
+		p.held().apply(u)
 	}
 	if u.QualityBand.state != 0 {
-		return pipeErr(c.s.SetQualityBand(int64(p.id), band))
+		if err := pipeErr(c.s.SetQualityBand(int64(p.id), band)); err != nil {
+			return err
+		}
+		change(&p.held().QualityBand, u.QualityBand)
 	}
 	return nil
+}
+
+// held is the record of the options the pipe holds, a scratch one for a
+// pipe the session no longer knows (the shared goneEnd is never written).
+func (p *Pipe) held() *PipeOptions {
+	if p.end == goneEnd {
+		return new(PipeOptions)
+	}
+	return &p.end.opts
+}
+
+// change applies one Change of an update to the option it names: Set takes
+// its value, Clear returns the option to its default (the zero Change),
+// and the zero Change keeps it.
+func change[T any](dst *Change[T], u Change[T]) {
+	switch u.state {
+	case 1:
+		*dst = u
+	case 2:
+		*dst = Change[T]{}
+	}
+}
+
+// apply applies the fields of u, but QualityBand, to o.
+func (o *PipeOptions) apply(u PipeUpdate) {
+	change(&o.SendPriority, u.SendPriority)
+	change(&o.ReceivePriority, u.ReceivePriority)
+	change(&o.SendStandby, u.SendStandby)
+	change(&o.ReceiveStandby, u.ReceiveStandby)
+	change(&o.Weight, u.Weight)
+	change(&o.Probation, u.Probation)
+	change(&o.Liveness, u.Liveness)
+}
+
+// Options returns the pipe's options: those given at AddPipe with every
+// Update applied, each as the pipe holds it. A field that follows the
+// session or the peer (a Change that was never set, or was cleared) reads
+// as the zero Change, not as the value in force, which PipeStats reports.
+// The fields fixed when the pipe was created read the values it has:
+// Direction (from this endpoint's view), RecordMode (the mode chosen, also
+// when Config.RecordPolicy chose it), KeyGroup (the group of its Join, also
+// when AddPipe left it zero), FateGroup and Label. ReturnOnReply is what
+// AddPipe was given, so options read back and handed to the AddPipe of a
+// replacing pipe behave alike. It does not fail or wait, and once the pipe is
+// gone it returns the options the pipe last held. A pipe that this
+// endpoint's AddPipe did not add (the bootstrap pipe, one the peer joined)
+// holds the defaults, Label empty and ReturnOnReply false, but for Direction,
+// RecordMode and KeyGroup, which are those of its Join, until an Update sets
+// a field.
+func (p *Pipe) Options() PipeOptions {
+	if p == nil || p.c == nil {
+		return PipeOptions{}
+	}
+	c := p.c
+	c.lock()
+	defer c.unlock()
+	o := p.end.opts
+	if pi, ok := c.s.PipeInfo(p.id); ok {
+		switch {
+		case pi.HasOut && !pi.HasIn:
+			o.Direction = DirectionSendOnly
+		case pi.HasIn && !pi.HasOut:
+			o.Direction = DirectionReceiveOnly
+		default:
+			o.Direction = DirectionBidirectional
+		}
+		o.FateGroup = pi.FateGroup
+		if pi.KeyGroup != 0 {
+			o.KeyGroup = pi.KeyGroup
+		}
+		o.RecordMode = Set(c.pipeModeLocked(p.id))
+	}
+	return o
 }
 
 // Done returns a channel that is closed once the pipe has been removed and
@@ -512,27 +592,13 @@ func (p *Pipe) Update(u PipeUpdate) error {
 // (Wait then returns the session's error). It is closed at once for a pipe
 // that is gone. A select on it bounds the wait with a timer or a context.
 func (p *Pipe) Done() <-chan struct{} {
-	e, c := p.end, p.c
-	if e == goneEnd {
-		return closedChan
-	}
-	e.once.Do(func() {
-		e.waited = make(chan struct{})
-		labels.Go(e.drv.Load().lctx, "done", func() {
-			defer close(e.waited)
-			select {
-			case <-e.retired:
-				<-e.drv.Load().gs.wait()
-			case <-c.done:
-			}
-		})
-	})
-	return e.waited
+	return p.end.done()
 }
 
 // Wait blocks until Done is closed and returns how the pipe ended: nil for a
-// graceful removal (Close, or the peer's) and for a pipe that is gone, the
-// cause for a failed or aborted one (ErrPipeGone without a known cause),
+// graceful removal (Close, or the peer's) and for a pipe that is gone,
+// ErrPipeAborted for one this endpoint aborted, the cause for a failed one
+// (ErrPipeGone without a known cause),
 // and the session's error when the session ended first. Wait does not
 // remove the pipe: it waits for Close, Abort or the pipe's own end.
 func (p *Pipe) Wait() error {
@@ -600,12 +666,13 @@ func (c *Conn) unattendedLocked() bool {
 }
 
 // Abort removes the pipe abruptly: failure, reinjection and
-// PIPE_ABANDON(ZMUX_PIPE_FAILED).
-func (p *Pipe) Abort(cause error) error {
+// PIPE_ABANDON(ZMUX_PIPE_FAILED). It takes no code and no cause: the wire
+// code is fixed and the caller knows why it aborted; Wait reports
+// ErrPipeAborted.
+func (p *Pipe) Abort() error {
 	c := p.c
 	c.lock()
 	defer c.unlock()
-	c.s.SetPipeCause(p.id, cause) // reported back with the retirement
 	c.warnLastPipeLocked(p.id)
 	return pipeErr(c.s.RemovePipe(p.id, false))
 }
@@ -618,7 +685,9 @@ func pipeErr(err error) error {
 }
 
 // SetScheduler changes the session's scheduling policy; it applies from
-// the next chunk.
+// the next chunk. The session always has one: nil sets the default,
+// SchedulerAffinity. Streams that follow the session (Stream.SetScheduler
+// with nil) take the new policy too.
 func (c *Conn) SetScheduler(s Scheduler) {
 	c.lock()
 	defer c.unlock()
@@ -634,6 +703,30 @@ func (c *Conn) SetScheduler(s Scheduler) {
 		c.hk.mu.Unlock()
 	}
 	c.s.SetPolicy(s.policy())
+}
+
+// Scheduler returns the session's scheduling policy: never nil, the
+// configured one until SetScheduler changes it. It does not fail or wait,
+// and answers on a closed session with the value it held last.
+func (c *Conn) Scheduler() Scheduler {
+	c.lock()
+	defer c.unlock()
+	return c.schedulerLocked(c.s.Policy())
+}
+
+// schedulerLocked is the Scheduler of policy p: a built-in one, or the
+// custom policy with the session's Pick.
+func (c *Conn) schedulerLocked(p core.Policy) Scheduler {
+	if p != core.PolicyCustom {
+		return builtin(p)
+	}
+	var pick Pick
+	if h := c.hk; h != nil {
+		h.mu.Lock()
+		pick = h.pick
+		h.mu.Unlock()
+	}
+	return customPolicy{pick}
 }
 
 // ---- statistics ----
@@ -904,7 +997,7 @@ func (c *Conn) Pipe(id PipeID) (*Pipe, bool) {
 }
 
 func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
-	st := PipeStats{PipeID: PipeID(pi.ID), RecordMode: c.pipeModeLocked(pi.ID), Local: pi.Local, PeerAttached: pi.PeerAttached, FateGroup: pi.FateGroup, Label: c.labels[pi.ID],
+	st := PipeStats{PipeID: PipeID(pi.ID), RecordMode: c.pipeModeLocked(pi.ID), Local: pi.Local, PeerAttached: pi.PeerAttached, FateGroup: pi.FateGroup, Label: c.endLocked(pi.ID).opts.Label,
 		Carrier: CarrierKind(pi.Carrier), Variant: c.variantLocked(pi.ID), Outbound: OutboundState(pi.OutState), Inbound: InboundState(pi.InState),
 		AttachedFor: time.Duration(pi.AttachedFor), SuspectCount: pi.SuspectCount, FailureCount: pi.FailureCount,
 		Failure: pi.Failure, SendPriority: pi.SendPriority, SendPrioritySource: pi.PrioritySource,

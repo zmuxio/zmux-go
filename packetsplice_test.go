@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -137,7 +138,7 @@ func testSplicePacketsConverts(t *testing.T, hop2 string) {
 	case !bigFits:
 		enc = 1
 	}
-	if ab.End.Kind != SpliceFinished || res.BtoA.End.Kind != SpliceFinished || ab.DatagramsEncapsulated != enc ||
+	if ab.End.Kind != SpliceFinished || res.BtoA.End.Kind != SpliceFinished || ab.DatagramsAsCapsules != enc ||
 		ab.DatagramBytes != uint64(len(dg)+5) || ab.DatagramsDropped != 0 {
 		t.Fatalf("result %+v", res)
 	}
@@ -218,6 +219,95 @@ func TestSpliceDatagramDropCauses(t *testing.T) {
 	}
 	ab := (<-done).AtoB
 	if ab.DatagramsLimited != 1 || ab.DatagramsDropped != 2 || ab.DatagramsTooLarge != 1 || ab.DatagramBytes != 4 {
+		t.Fatalf("AtoB %+v", ab)
+	}
+}
+
+// failLimiter fails every Acquire, as an exhausted budget does.
+type failLimiter struct{}
+
+func (failLimiter) Acquire(context.Context, int64, int64) (int64, error) {
+	return 0, errors.New("budget exhausted")
+}
+func (failLimiter) TryAcquire(int64, int64) (int64, error) { return 0, errors.New("budget exhausted") }
+func (failLimiter) Refund(int64)                           {}
+
+// TestSpliceLimiterFailed: a failed Acquire ends its direction
+// SpliceLimiterFailed, resetting the downstream and stopping the upstream
+// with ZMUX_CANCELLED, while the other direction goes on and the call
+// returns its result.
+func TestSpliceLimiterFailed(t *testing.T) {
+	for _, packets := range []bool{false, true} {
+		t.Run(fmt.Sprint("packets=", packets), func(t *testing.T) {
+			leakcheck.Check(t)
+			client, rin, rout, server := packetRelayEnv(t, "tcp")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			opts := &SpliceOptions{AtoB: failLimiter{}}
+			cs, ss, done := relayStreams(t, ctx, client, rin, rout, server,
+				func(ctx context.Context, a, b *Stream) (SpliceResult, error) {
+					if packets {
+						return SplicePackets(ctx, a, b, opts)
+					}
+					return Splice(ctx, a, b, opts)
+				})
+			if _, err := cs.Write([]byte{0x00, 0x01, 'x'}); err != nil {
+				t.Fatal(err)
+			}
+			var se *StreamError
+			if _, err := io.ReadAll(ss); !errors.As(err, &se) || se.ErrorCode != StreamCancelled {
+				t.Fatalf("downstream: %v", err)
+			}
+			for {
+				if _, err := cs.Write([]byte("more")); err != nil {
+					if !errors.As(err, &se) || se.ErrorCode != StreamCancelled {
+						t.Fatalf("upstream: %v", err)
+					}
+					break
+				}
+				time.Sleep(time.Millisecond) // until the STOP_SENDING arrives
+			}
+			// The other direction goes on.
+			if _, err := ss.Write([]byte{0x00, 0x04, 'b', 'a', 'c', 'k'}); err != nil {
+				t.Fatal(err)
+			}
+			_ = ss.Close()
+			got, err := io.ReadAll(cs)
+			if err != nil || string(got) != "\x00\x04back" {
+				t.Fatalf("other direction: %q, %v", got, err)
+			}
+			res := <-done
+			if res.AtoB.End != (SpliceEnd{Kind: SpliceLimiterFailed}) || res.BtoA.End.Kind != SpliceFinished || res.AtoB.Bytes != 0 {
+				t.Fatalf("result %+v", res)
+			}
+		})
+	}
+}
+
+// A datagram whose next session does not use stream datagrams is dropped
+// and counted in DatagramsDropped alone, not as too large.
+func TestSpliceDatagramNotInUseCountsDropped(t *testing.T) {
+	leakcheck.Check(t)
+	client, rin, rout, server := packetRelayEnv(t, "off")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cs, ss, done := relayStreams(t, ctx, client, rin, rout, server,
+		func(ctx context.Context, a, b *Stream) (SpliceResult, error) { return Splice(ctx, a, b, nil) })
+	for _, p := range [][]byte{make([]byte, 10), make([]byte, 5000)} {
+		if err := cs.SendDatagram(0, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = cs.Close()
+	_ = ss.Close()
+	if _, err := io.ReadAll(ss); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(cs); err != nil {
+		t.Fatal(err)
+	}
+	ab := (<-done).AtoB
+	if ab.DatagramsDropped != 2 || ab.DatagramsTooLarge != 0 || ab.DatagramsLimited != 0 || ab.DatagramBytes != 0 {
 		t.Fatalf("AtoB %+v", ab)
 	}
 }

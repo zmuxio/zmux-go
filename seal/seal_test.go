@@ -104,8 +104,8 @@ func newFixture(t *testing.T) *fixture {
 	}
 	node := newKey(t)
 	return &fixture{psk: psk, handle: handle, node: node,
-		client: seal.ClientConfig{Anchor: seal.PinAnchor(seal.NodeKeyID(node.PublicKey().Bytes())), Handle: handle, PSK: psk},
-		server: seal.ServerConfig{Gate: &gate{handle: handle, psk: psk}, Key: node}}
+		client: seal.ClientConfig{Anchor: seal.PinAnchor(seal.StaticKeyID(node.PublicKey().Bytes())), Handle: handle, PSK: psk},
+		server: seal.ServerConfig{Gate: &gate{handle: handle, psk: psk}, StaticKey: node}}
 }
 
 func anyMode(zmux.RecordPolicyInput, zmux.RecordMode, any) bool { return true }
@@ -315,7 +315,7 @@ func TestPeerIsSelf(t *testing.T) {
 	defer cancel()
 	f := newFixture(t)
 	cc := f.client
-	cc.Key = f.node
+	cc.StaticKey = f.node
 	a, b := net.Pipe()
 	cerr, _ := establishErrs(t, ctx, &cc, &f.server, zmux.NetPipe(a), zmux.NetPipe(b))
 	if !errors.Is(cerr, proto.ErrPeerIsSelf) {

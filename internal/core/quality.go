@@ -42,10 +42,7 @@ type sessQuality struct {
 // default, or the session's to none.
 func (s *Session) SetQualityBand(pipe int64, b *QualityBand) error {
 	if b != nil {
-		c := *b
-		if c.MinInterval == 0 {
-			c.MinInterval = Second
-		}
+		c := *b // kept as set: the default MinInterval applies where it is read
 		b = &c
 	}
 	if pipe < 0 {
@@ -60,6 +57,10 @@ func (s *Session) SetQualityBand(pipe int64, b *QualityBand) error {
 	return nil
 }
 
+// DefaultQualityBand returns the default band of the session's pipes, nil
+// when none is set.
+func (s *Session) DefaultQualityBand() *QualityBand { return s.q.band }
+
 // SetCapacityFloor sets the capacity floor; it reports at once when the
 // capacity is below it.
 func (s *Session) SetCapacityFloor(f CapacityFloor) {
@@ -67,12 +68,20 @@ func (s *Session) SetCapacityFloor(f CapacityFloor) {
 		s.q.floor, s.q.below, s.q.floorSet = nil, false, false
 		return
 	}
-	if f.RateRatio <= 0 {
-		f.RateRatio = 1.25
-	}
 	s.q.floor, s.q.below, s.q.floorSet = &f, false, true
 	s.checkCapacityFloor()
 }
+
+// recovery is the ratio the capacity must regain, the default when unset.
+func (f *CapacityFloor) recovery() float64 {
+	if f.RateRatio <= 0 {
+		return DefaultRecoveryRatio
+	}
+	return f.RateRatio
+}
+
+// CapacityFloor returns the floor set, nil when none is.
+func (s *Session) CapacityFloor() *CapacityFloor { return s.q.floor }
 
 // qualitySample judges p's estimates after they changed.
 func (s *Session) qualitySample(p *Pipe) {
@@ -91,8 +100,12 @@ func (s *Session) qualitySample(p *Pipe) {
 			case !q.has:
 				q.has, q.rtt, q.rate, q.lastAt = true, rtt, rate, s.now
 			case outOfBand(b, q, rtt, rate):
-				if b.MinInterval > 0 && s.now < q.lastAt.Add(b.MinInterval) {
-					q.pending, q.pendTime = true, q.lastAt.Add(b.MinInterval)
+				mi := b.MinInterval // zero: the default; negative: none
+				if mi == 0 {
+					mi = DefaultMinInterval
+				}
+				if mi > 0 && s.now < q.lastAt.Add(mi) {
+					q.pending, q.pendTime = true, q.lastAt.Add(mi)
 				} else {
 					s.reportQuality(p, rtt, rate)
 				}
@@ -172,7 +185,7 @@ func (s *Session) checkCapacityFloor() {
 	case !s.q.below && sum < f.Rate:
 		s.q.below = true
 		s.emit(Event{Kind: EvCapacityBelow, Rate: sum})
-	case s.q.below && sum >= f.Rate*f.RateRatio:
+	case s.q.below && sum >= f.Rate*f.recovery():
 		s.q.below = false
 		s.emit(Event{Kind: EvCapacityRestored, Rate: sum})
 	}

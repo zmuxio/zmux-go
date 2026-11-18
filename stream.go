@@ -29,6 +29,7 @@ type handle struct {
 	dmu        sync.Mutex  // serialises datagram reads (lock level L0, after rmu)
 	rmu        sync.Mutex
 	wmu        sync.Mutex
+	rwaiters   atomic.Int32 // WaitReadable calls and the reads inside their wait, for passing the wake on
 }
 
 // newHandle makes the handle of st (under the lock).
@@ -172,8 +173,22 @@ func (h *handle) awaitRead(ctx context.Context, dgram bool, try func() (bool, er
 	if dgram {
 		b = &h.dsig
 	}
+	h.rwaiters.Add(1)
 	_, err := h.waitOn(ctx, &h.rsig, b, h.rwait, try, nil)
+	h.passReadWake(1)
+	h.rwaiters.Add(-1)
 	return err
+}
+
+// passReadWake hands the receiving part's one wake token on to the other
+// waiters: the token a waiter or read consumed may be the arrival the
+// others wait for too, and the slot holds a single token. A woken waiter
+// that finds nothing readable drains it again, so passing costs only a
+// spurious pass of the loop. others counts the callers' own entries in rwaiters.
+func (h *handle) passReadWake(others int32) {
+	if h.rwaiters.Load() > others {
+		h.c.locked(h.rsig.FireLocked)
+	}
 }
 
 // awaitWrite waits for the sending part as waitOn does, within the write
@@ -223,6 +238,47 @@ func (h *handle) read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	return 0, err
+}
+
+// tryRead is read without waiting: what is readable now, (0, nil) when
+// nothing is or another read is in progress, io.EOF at the FIN once
+// everything was read.
+func (h *handle) tryRead(p []byte) (int, error) {
+	if !h.rmu.TryLock() {
+		return 0, nil
+	}
+	defer h.rmu.Unlock()
+	c := h.c
+	c.lock()
+	defer c.unlock()
+	n, fin, err := c.s.Read(h.st, p)
+	if fin || err != nil {
+		h.released(c.s.ReleaseRecv(h.st))
+	}
+	switch {
+	case n > 0:
+		return n, nil
+	case fin:
+		return 0, io.EOF
+	}
+	return 0, apiErr(err)
+}
+
+// awaitReadable waits as a read does, within the read deadline, for data
+// or the part's end, without taking any.
+func (h *handle) awaitReadable(ctx context.Context) error {
+	c := h.c
+	h.rwaiters.Add(1)
+	defer h.rwaiters.Add(-1)
+	defer func() { h.passReadWake(1) }()
+	cut, err := h.waitOn(ctx, &h.rsig, nil, h.rwait, func() (bool, error) {
+		n, end := c.s.ReadReady(h.st)
+		return n > 0 || end, nil
+	}, nil)
+	if cut {
+		return err
+	}
+	return nil // readable, or the end the next Read returns
 }
 
 func (h *handle) cancelRead(code StreamErrorCode) {
@@ -382,6 +438,30 @@ func (s *Stream) Flush() error { defer runtime.KeepAlive(s); return s.h.flush() 
 // Read reads stream data; io.EOF only after a FIN that was not reset.
 func (s *Stream) Read(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.read(p) }
 
+// TryRead reads what is readable now, up to len(p) bytes, and never waits:
+// it returns (0, nil) when nothing is readable (or another read of the
+// stream is in progress: a blocked Read holds the read turn), and io.EOF
+// once the part ended with a FIN and everything was read. A reset, a stop by
+// this endpoint and the session's end are the read's errors, as for Read; the
+// read deadline does not apply. It does not allocate. With WaitReadable it is
+// a Read that consumes nothing while it waits: wait, then TryRead.
+func (s *Stream) TryRead(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.tryRead(p) }
+
+// WaitReadable waits until a Read would not block: data is readable, or
+// the receiving part ended (FIN, reset, CancelRead or the session's end),
+// so that the next Read returns the data or that end, once, in its own
+// form. It consumes nothing and returns nil in each of these cases; it
+// fails only with its own bound: ctx's error when ctx ends first, and
+// os.ErrDeadlineExceeded when the read deadline passes. Any number of
+// goroutines may wait at once. A nil s returns net.ErrClosed.
+func (s *Stream) WaitReadable(ctx context.Context) error {
+	if s == nil || s.h == nil {
+		return net.ErrClosed
+	}
+	defer runtime.KeepAlive(s)
+	return s.h.awaitReadable(ctx)
+}
+
 // Write writes p, waiting for send-buffer space.
 func (s *Stream) Write(p []byte) (int, error) {
 	defer runtime.KeepAlive(s)
@@ -465,6 +545,12 @@ func (s *ReceiveStream) StreamID() StreamID {
 
 // Read reads stream data.
 func (s *ReceiveStream) Read(p []byte) (int, error) { defer runtime.KeepAlive(s); return s.h.read(p) }
+
+// TryRead reads what is readable now without waiting, as Stream.TryRead.
+func (s *ReceiveStream) TryRead(p []byte) (int, error) {
+	defer runtime.KeepAlive(s)
+	return s.h.tryRead(p)
+}
 
 // CancelRead stops reading.
 func (s *ReceiveStream) CancelRead(code StreamErrorCode) {

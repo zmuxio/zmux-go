@@ -91,7 +91,7 @@
 // (ErrRejected, ErrGoingAway, ErrEarlyDataRejected), which can be sent
 // again. Calls fail with ErrStreamClosed, ErrNotNegotiated,
 // ErrNotEstablished, ErrTooLate, ErrInvalidConfig, ErrPipeGone or
-// ErrNoDecision where their documentation says so.
+// ErrDuplicateUndecided where their documentation says so.
 //
 // # Names
 //

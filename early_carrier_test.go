@@ -332,7 +332,7 @@ func TestEarlyCarrierRejectedStop(t *testing.T) {
 		defer layer.mu.Unlock()
 		return len(layer.held) > 0
 	})
-	st.SetReceiveWindow(1<<22, 1<<22)
+	_ = st.SetReceiveWindow(1<<22, 1<<22)
 	st.CancelRead(5)
 	time.Sleep(20 * time.Millisecond) // let the frames join the held flight
 	layer.decide(false)

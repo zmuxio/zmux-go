@@ -269,7 +269,7 @@ func (s *Session) tuneStreamUpdate(st *Stream) {
 		return
 	}
 	maxW := s.cfg.StreamWindowCap
-	if r.maxWin > 0 && (maxW == 0 || r.maxWin < maxW) {
+	if r.maxSet {
 		maxW = r.maxWin
 	}
 	w := s.tuneGrow(r.tune, r.window, maxW, s.connAllowance())

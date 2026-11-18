@@ -19,7 +19,7 @@ import (
 // type, unknown ones included, reach the other side unchanged. A datagram
 // is forwarded as a datagram when it fits the other stream's
 // MaxDatagramPayload, and otherwise inserted between two capsules as a
-// DATAGRAM capsule (counted in DatagramsEncapsulated). Capsules are never
+// DATAGRAM capsule (counted in DatagramsAsCapsules). Capsules are never
 // turned into datagrams: a packet sent reliably stays reliable. The
 // helper does not check the capsules it forwards; the receiving end does.
 // A ctx cancelled with a cause made by CancelCause ends both
@@ -191,8 +191,7 @@ func splicePacketAcquire(ctx context.Context, r, w *Stream, lim Limiter, n uint6
 	}
 	granted, err := lim.Acquire(ctx, int64(n), int64(n))
 	if err != nil {
-		spliceAbort(ctx, r, w, err)
-		d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
+		d.End = spliceAcquireFailed(ctx, r, w, err)
 		return 0, false
 	}
 	return granted, true
@@ -253,10 +252,15 @@ func splicePacketDatagrams(ctx context.Context, r, w *Stream, lim Limiter, g *ca
 				// The bound shrank since it was read: send it as a capsule.
 			}
 		}
+		if len(p) > DefaultMaxPacket {
+			d.DatagramsTooLarge++ // larger than any packet a capsule carries
+			d.DatagramsDropped++
+			continue
+		}
 		var granted int64
 		if lim != nil {
 			var ok bool
-			if granted, ok = (guardedLimiter{lim}).police(len(p)); !ok {
+			if granted, ok = policeGuarded(lim, len(p)); !ok {
 				d.DatagramsLimited++
 				d.DatagramsDropped++
 				continue
@@ -266,7 +270,7 @@ func splicePacketDatagrams(ctx context.Context, r, w *Stream, lim Limiter, g *ca
 			if lim != nil {
 				lim.Refund(granted)
 			}
-			d.DatagramsDropped++ // read, never written
+			d.DatagramsDropped++ // the splice ended before the capsule was written
 			return
 		}
 		ok := !g.closed
@@ -283,10 +287,10 @@ func splicePacketDatagrams(ctx context.Context, r, w *Stream, lim Limiter, g *ca
 			if lim != nil {
 				lim.Refund(granted)
 			}
-			d.DatagramsDropped++
+			d.DatagramsDropped++ // the capsule could not be written
 			continue
 		}
-		d.DatagramsEncapsulated++
+		d.DatagramsAsCapsules++
 		d.DatagramBytes += uint64(len(p))
 	}
 }

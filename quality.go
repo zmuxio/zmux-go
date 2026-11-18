@@ -23,7 +23,7 @@ type QualityBand struct {
 	// turns this half off.
 	RateRatio float64
 	// MinInterval is the least time between two events of a pipe. Zero
-	// is 1 s; a negative value sets no minimum.
+	// is DefaultMinInterval (1 s); a negative value sets no minimum.
 	MinInterval time.Duration
 }
 
@@ -32,7 +32,7 @@ type QualityBand struct {
 // second, as every delivery rate of the API), and
 // EventCapacityRestored once it is back at Rate*RecoveryRatio. A zero Rate
 // turns it off, so the zero CapacityFloor reports nothing. A zero
-// RecoveryRatio means 1.25 (1 is no hysteresis); any other must be a
+// RecoveryRatio means DefaultRecoveryRatio, 1.25 (1 is no hysteresis); any other must be a
 // finite number of at least 1 (a smaller one would restore below the
 // floor, an infinite one never), else SetCapacityFloor returns
 // ErrInvalidConfig.
@@ -59,16 +59,45 @@ func (b QualityBand) core() (core.QualityBand, error) {
 	return core.QualityBand{RTT: core.Duration(b.RTT), RateRatio: b.RateRatio, MinInterval: mi}, nil
 }
 
-// SetQualityBand sets the default band of the session's pipes.
+// SetQualityBand sets the default band of the session's pipes; the zero
+// QualityBand clears it.
 func (c *Conn) SetQualityBand(b QualityBand) error {
 	cb, err := b.core()
 	if err != nil {
 		return err
 	}
+	var p *core.QualityBand
+	if b != (QualityBand{}) {
+		p = &cb
+	}
 	c.lock()
 	defer c.unlock()
-	_ = c.s.SetQualityBand(-1, &cb)
+	_ = c.s.SetQualityBand(-1, p)
 	return nil
+}
+
+// QualityBand returns the default band of the session's pipes, the zero
+// QualityBand when none is set. It does not fail or wait.
+func (c *Conn) QualityBand() QualityBand {
+	c.lock()
+	defer c.unlock()
+	b := c.s.DefaultQualityBand()
+	if b == nil {
+		return QualityBand{}
+	}
+	return QualityBand{RTT: time.Duration(b.RTT), RateRatio: b.RateRatio, MinInterval: time.Duration(b.MinInterval)}
+}
+
+// CapacityFloor returns the capacity floor of the outbound direction, the
+// zero CapacityFloor when none is set. It does not fail or wait.
+func (c *Conn) CapacityFloor() CapacityFloor {
+	c.lock()
+	defer c.unlock()
+	f := c.s.CapacityFloor()
+	if f == nil {
+		return CapacityFloor{}
+	}
+	return CapacityFloor{Rate: rateBytes(f.Rate), RecoveryRatio: f.RateRatio}
 }
 
 // validRatio reports whether r is a valid ratio of a QualityBand or a

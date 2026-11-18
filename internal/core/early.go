@@ -109,6 +109,7 @@ func (s *Session) RestartEarly(info CarrierInfo, now Time) bool {
 		}
 		sp := &st.snd
 		sp.sent = 0
+		s.syncUnsent(st)
 		sp.finSent = false
 		sp.maxData = 0
 		if sp.state == sendDataSent {

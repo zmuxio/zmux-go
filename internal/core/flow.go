@@ -151,7 +151,7 @@ func (s *Session) queueCtl(st *Stream, bit uint8) {
 	}
 	if !st.inCtl {
 		st.inCtl = true
-		st.ctlNext = nil
+		st.ctlNext, st.ctlPrev = nil, s.ctlTail
 		if s.ctlTail == nil {
 			s.ctlHead = st
 		} else {

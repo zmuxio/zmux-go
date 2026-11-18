@@ -67,7 +67,7 @@ func TestResolveDuplicateRejectsDifferentNonceDomainsWithoutChangingSessions(t *
 	environment := newMPEnv(t, mpConfig(), mpConfig())
 	multipath := environment.client
 	auto, _ := autoDuplicatePair(t)
-	if _, err := ResolveDuplicate(multipath, auto, nil); !errors.Is(err, ErrNoDecision) {
+	if _, err := ResolveDuplicate(multipath, auto, nil); !errors.Is(err, ErrDuplicateUndecided) {
 		t.Fatalf("MP explicit-role and non-MP auto have no common nonce domain: %v", err)
 	}
 	// A failed decision cannot start draining either session.
@@ -114,17 +114,17 @@ func TestResolveDuplicateRejectsNilAndClosedSessions(t *testing.T) {
 	leakcheck.Check(t)
 	a, b := tcpPair(t)
 	first, peer := pair(t, a, b, nil, nil)
-	if _, err := ResolveDuplicate(nil, first, nil); !errors.Is(err, ErrNoDecision) {
+	if _, err := ResolveDuplicate(nil, first, nil); !errors.Is(err, ErrDuplicateUndecided) || !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("nil input: %v", err)
 	}
-	if _, err := ResolveDuplicate(first, nil, nil); !errors.Is(err, ErrNoDecision) {
+	if _, err := ResolveDuplicate(first, nil, nil); !errors.Is(err, ErrDuplicateUndecided) {
 		t.Fatalf("nil input: %v", err)
 	}
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
 	waitDone(t, first)
-	if _, err := ResolveDuplicate(first, peer, &DuplicateOptions{LocalID: []byte{1}, PeerID: []byte{2}}); !errors.Is(err, ErrNoDecision) {
+	if _, err := ResolveDuplicate(first, peer, &DuplicateOptions{LocalID: []byte{1}, PeerID: []byte{2}}); !errors.Is(err, ErrDuplicateUndecided) {
 		t.Fatalf("closed input: %v", err)
 	}
 }

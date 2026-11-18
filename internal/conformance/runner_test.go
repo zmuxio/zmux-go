@@ -27,7 +27,7 @@ import (
 // repository's own traces of local behaviour. A missing one is skipped.
 const (
 	specDir    = "../../testdata/spec/fixtures"
-	specTraces = 376
+	specTraces = 379
 )
 
 var localDirs = []string{"../../testdata/local/spec-traces", "../../testdata/local/traces"}
@@ -124,6 +124,11 @@ func TestTraces(t *testing.T) {
 				if err := r.step(st); err != nil {
 					t.Fatalf("step %d (%s): %v\n%s", i+1, st["op"], err, l)
 				}
+				// The gauges are running sums: they match a recount.
+				if g := r.s.Gauges(); g.SendBuffered != r.s.SendBufferedSum() || g.RecvBuffered != r.s.RecvBufferedSum() {
+					t.Fatalf("step %d: gauges send %d recv %d, recounted %d, %d", i+1,
+						g.SendBuffered, g.RecvBuffered, r.s.SendBufferedSum(), r.s.RecvBufferedSum())
+				}
 			}
 			if e := r.s.Err(); e != nil && !r.closeCovered {
 				t.Fatalf("session closed without expect_close: %v", e)
@@ -190,24 +195,26 @@ type rcarrier struct {
 }
 
 type runner struct {
-	pending      core.PendingCarriers
-	pairing      core.SplitPairing
-	carriers     map[string]*rcarrier
-	t            *testing.T
-	h            header
-	s            *core.Session
-	now          core.Time
-	streams      map[string]*core.Stream
-	pipes        map[uint64]*rpipe
-	events       []core.Event
-	evSeen       map[string]int
-	closeCovered bool
-	closesSent   []map[string]any
-	b            core.Batch
-	enc          encodeCtx
-	stepNo       any
-	modes        map[string]bool // AllowRecordMode; nil accepts every mode
-	ep           runnerEpochs
+	pending        core.PendingCarriers
+	unconfirmed    core.Unconfirmed[*rcarrier] // the listener's Unconfirmed carriers (MULTIPATH.md 5.4 step 7)
+	unconfirmedCap int                         // their bound (MULTIPATH.md 5.6)
+	pairing        core.SplitPairing
+	carriers       map[string]*rcarrier
+	t              *testing.T
+	h              header
+	s              *core.Session
+	now            core.Time
+	streams        map[string]*core.Stream
+	pipes          map[uint64]*rpipe
+	events         []core.Event
+	evSeen         map[string]int
+	closeCovered   bool
+	closesSent     []map[string]any
+	b              core.Batch
+	enc            encodeCtx
+	stepNo         any
+	modes          map[string]bool // AllowRecordMode; nil accepts every mode
+	ep             runnerEpochs
 }
 
 func merge(dst, src map[string]any) map[string]any {
@@ -266,6 +273,10 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	}
 	if v, ok := th["pipe_cap"]; ok {
 		cfg.Test.PipeCap = int(num(v))
+	}
+	unconfirmedCap := core.DefaultMaxUnconfirmed
+	if v, ok := th["unconfirmed_cap"]; ok {
+		unconfirmedCap = int(num(v))
 	}
 	if v, ok := th["role_nonce"]; ok {
 		cfg.Local.RoleNonce = num(v)
@@ -359,7 +370,7 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 		}
 	}
 	r := &runner{t: t, h: h, streams: map[string]*core.Stream{}, pipes: map[uint64]*rpipe{}, evSeen: map[string]int{},
-		carriers: map[string]*rcarrier{}, modes: modes}
+		carriers: map[string]*rcarrier{}, modes: modes, unconfirmedCap: unconfirmedCap}
 	r.s = core.New(cfg, 0)
 	r.enc.sent = func(pipe, lane uint64) uint64 {
 		if p := r.pipes[pipe]; p != nil {
@@ -1264,8 +1275,25 @@ func matchEventFields(pat, got map[string]any) bool {
 }
 
 func (r *runner) expectPipeClosed(st map[string]any) error {
-	p := r.pipes[num(st["pipe"])]
 	how := st["how"].(string)
+	p := r.pipes[num(st["pipe"])]
+	if p == nil {
+		// A join carrier closed before its pipe was attached (an evicted
+		// Unconfirmed carrier): after the listener accepted its join, the
+		// pipe ID names the carrier (TRACES.md 5.1).
+		for _, c := range r.carriers {
+			if c.pipe == num(st["pipe"]) && c.outcome == "accept" && !c.attached {
+				if !c.rejected {
+					return errors.New("join carrier still open")
+				}
+				if how != "any" {
+					return fmt.Errorf("join carrier closed before attachment, want %s", how)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("no pipe %v", st["pipe"])
+	}
 	lanes := p.lanes
 	if ln, ok := st["lane"]; ok {
 		lanes = map[uint64]*rlane{num(ln): p.lane(num(ln))}

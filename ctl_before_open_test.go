@@ -50,7 +50,7 @@ func TestStreamCtlBeforeOpen(t *testing.T) {
 				if op == "CancelRead" {
 					ns.CancelRead(7)
 				} else {
-					ns.SetReceiveWindow(1<<20, 1<<20)
+					_ = ns.SetReceiveWindow(1<<20, 1<<20)
 				}
 				if _, err := ns.Write([]byte("grant")); err != nil {
 					t.Fatal(err)
