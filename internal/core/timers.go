@@ -26,24 +26,13 @@ func (s *Session) NextTimeout() Time {
 	if s.closeFr.waitLanes {
 		t = minT(t, s.timers.laneWait)
 	}
-	if s.state >= StateClosing {
+	if !s.transportLive() {
 		return t
 	}
+	if s.state < StateClosing {
+		t = minT(t, s.sessionTimeout())
+	}
 	t = minT(t, s.laneTimeouts(0, false))
-	if s.state == StateSuspended {
-		t = minT(t, s.timers.grace)
-	}
-	if s.peerSeen && s.state != StateSuspended {
-		if d := s.idleTimeout(); d > 0 {
-			t = minT(t, s.timers.lastActivity.Add(d))
-		}
-		if at, ok := s.keepAliveAt(); ok && s.ping.outstanding == 0 && s.timers.lastKeepRef != s.timers.lastActivity {
-			t = minT(t, at)
-		}
-	}
-	if s.ping.outstanding != 0 {
-		t = minT(t, s.ping.expires)
-	}
 	if s.ack != nil {
 		t = minT(t, s.ack.nextTimeout())
 	}
@@ -89,32 +78,14 @@ func (s *Session) HandleTimeout(now Time) {
 	if s.closeFr.waitLanes && now >= s.timers.laneWait {
 		s.endLaneWait()
 	}
-	if s.state >= StateClosing {
+	if !s.transportLive() {
 		return
 	}
+	// The session's own deadlines end with CLOSING; the transport's run
+	// on while the close waits for PIPE_ACK coverage.
 	s.laneTimeouts(now, true)
-	if s.state == StateSuspended && now >= s.timers.grace {
-		// Grace expiry: CONNECTION_CLOSE on any live
-		// outbound pipe, otherwise a local close.
-		s.timers.grace = Never
-		s.closeWith(&SessionError{Kind: CloseResumeTimeout, Cause: s.lastPipeErr()},
-			&closeFrame{code: wire.ResumeTimeout})
+	if s.state < StateClosing && !s.sessionTimers(now) {
 		return
-	}
-	if s.ping.outstanding != 0 && now >= s.ping.expires {
-		s.pingExpired()
-	}
-	if s.peerSeen && s.state != StateSuspended {
-		if d := s.idleTimeout(); d > 0 && now >= s.timers.lastActivity.Add(d) {
-			s.idleExpired()
-			return
-		}
-		if at, ok := s.keepAliveAt(); ok && s.ping.outstanding == 0 && now >= at &&
-			s.timers.lastKeepRef != s.timers.lastActivity {
-			s.timers.lastKeepRef = s.timers.lastActivity
-			s.ping.want = true
-			s.wakeAllWriters()
-		}
 	}
 	if s.ack != nil {
 		s.ack.handleTimeout(now)
@@ -130,6 +101,56 @@ func (s *Session) HandleTimeout(now Time) {
 		s.paceTimeout(now)
 		s.qualityTimers(now, true)
 	}
+}
+
+// sessionTimeout is the earliest deadline of the session itself (resume
+// grace, idle timeout, keep-alive, the outstanding PING) before CLOSING.
+func (s *Session) sessionTimeout() Time {
+	t := Never
+	if s.state == StateSuspended {
+		t = minT(t, s.timers.grace)
+	}
+	if s.peerSeen && s.state != StateSuspended {
+		if d := s.idleTimeout(); d > 0 {
+			t = minT(t, s.timers.lastActivity.Add(d))
+		}
+		if at, ok := s.keepAliveAt(); ok && s.ping.outstanding == 0 && s.timers.lastKeepRef != s.timers.lastActivity {
+			t = minT(t, at)
+		}
+	}
+	if s.ping.outstanding != 0 {
+		t = minT(t, s.ping.expires)
+	}
+	return t
+}
+
+// sessionTimers runs the due deadlines of sessionTimeout; it reports false
+// when one closed the session.
+func (s *Session) sessionTimers(now Time) bool {
+	if s.state == StateSuspended && now >= s.timers.grace {
+		// Grace expiry: CONNECTION_CLOSE on any live
+		// outbound pipe, otherwise a local close.
+		s.timers.grace = Never
+		s.closeWith(&SessionError{Kind: CloseResumeTimeout, Cause: s.lastPipeErr()},
+			&closeFrame{code: wire.ResumeTimeout})
+		return false
+	}
+	if s.ping.outstanding != 0 && now >= s.ping.expires {
+		s.pingExpired()
+	}
+	if s.peerSeen && s.state != StateSuspended {
+		if d := s.idleTimeout(); d > 0 && now >= s.timers.lastActivity.Add(d) {
+			s.idleExpired()
+			return false
+		}
+		if at, ok := s.keepAliveAt(); ok && s.ping.outstanding == 0 && now >= at &&
+			s.timers.lastKeepRef != s.timers.lastActivity {
+			s.timers.lastKeepRef = s.timers.lastActivity
+			s.ping.want = true
+			s.wakeAllWriters()
+		}
+	}
+	return true
 }
 
 // keepAliveAt returns when the next keep-alive falls due:

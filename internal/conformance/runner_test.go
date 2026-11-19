@@ -27,7 +27,7 @@ import (
 // repository's own traces of local behaviour. A missing one is skipped.
 const (
 	specDir    = "../../testdata/spec/fixtures"
-	specTraces = 379
+	specTraces = 381
 )
 
 var localDirs = []string{"../../testdata/local/spec-traces", "../../testdata/local/traces"}

@@ -9,10 +9,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -189,6 +192,11 @@ func command(t *testing.T, ctx context.Context, c *Conn, cmd string, body []byte
 }
 
 func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) { //nolint:thelper // scenario body, not a helper: failures point inside it
+	interopSteps(t, ctx, c)
+	interopPeerClose(t, ctx, c, p)
+}
+
+func interopSteps(t *testing.T, ctx context.Context, c *Conn) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	// Bulk echo, several at once.
 	errs := make(chan error, 4)
 	for range 4 {
@@ -324,7 +332,10 @@ func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) { //
 			t.Fatalf("dgram: %q", b)
 		}
 	}
-	// The peer closes with a code and reason.
+}
+
+// interopPeerClose has the peer close with a code and reason.
+func interopPeerClose(t *testing.T, ctx context.Context, c *Conn, p *peerProc) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	closeStream, err := c.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -421,7 +432,8 @@ func TestInteropMultipathClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	spreadCheck(t, ctx, c)
-	interopScript(t, ctx, c, p)
+	interopSteps(t, ctx, c)
+	interopPeerCloseTail(t, ctx, c, p)
 }
 
 func TestInteropMultipathServer(t *testing.T) {
@@ -457,7 +469,67 @@ func TestInteropMultipathServer(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	spreadCheck(t, ctx, c)
-	interopScript(t, ctx, c, p)
+	interopSteps(t, ctx, c)
+	interopCloseTail(t, ctx, c, p)
+}
+
+// interopTail is the stream written just before a close in a multipath
+// session: the close must not overtake it on another pipe.
+const interopTail = 256 << 10
+
+// interopPeerCloseTail has the peer write interopTail bytes on a stream it
+// opens and close with a code at once; every byte must arrive first.
+func interopPeerCloseTail(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
+	t.Helper()
+	cmd, err := c.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.SetPreamble([]byte(fmt.Sprintf("close-tail:42:%d", interopTail))); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := c.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(st)
+	if len(b) != interopTail {
+		t.Fatalf("tail: read %d of %d (%v)", len(b), interopTail, err)
+	}
+	var ae *ApplicationError
+	if err := c.Wait(); !errors.As(err, &ae) || ae.ErrorCode != 42 || !ae.Remote {
+		t.Fatalf("close: %v", err)
+	}
+	p.expect(t, "CLOSED")
+}
+
+// interopCloseTail writes interopTail bytes on a stream and closes with a
+// code at once; the peer reports how many bytes it read.
+func interopCloseTail(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
+	t.Helper()
+	st, err := c.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetPreamble([]byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Write(make([]byte, interopTail)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CloseWithError(42, "bye"); err != nil {
+		t.Fatal(err)
+	}
+	if got := p.expect(t, "TAIL "); got != strconv.Itoa(interopTail) {
+		t.Fatalf("tail: peer read %s of %d", got, interopTail)
+	}
+	runtime.KeepAlive(st)
 }
 
 // TLS with the join secret from the exporter alone: the

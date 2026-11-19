@@ -243,9 +243,9 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 			wire.KindPipeAck, wire.KindPipeLane, wire.KindPipeAbandon, wire.KindPipeStatus, wire.KindSessionEpoch:
 			// Neither activity nor a PIPE_PING.
 		}
-		if s.state >= StateClosing {
-			// Waiting for lanes before CONNECTION_CLOSE: only
-			// acknowledgements and the peer's close still matter.
+		if s.state >= StateClosing && (!s.closeFr.waitLanes || !closeWaitFrame(f.Kind)) {
+			// Closing: acknowledgements and the peer's close still matter
+			// (the close waits for no more once the peer's arrives).
 			if f.Kind == wire.KindPipeAck {
 				_ = s.ack.onPipeAck(&f, s.now)
 			}
@@ -299,6 +299,23 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 	if !s.feat.Acked() || facts.activity {
 		s.timers.lastActivity = s.now
 	}
+}
+
+// closeWaitFrame reports a frame that is still applied while a graceful
+// close waits for PIPE_ACK coverage (transportLive): the path and credit
+// frames that work depends on. The peer's streams and datagrams are not
+// taken any more.
+func closeWaitFrame(k wire.Kind) bool {
+	switch k {
+	case wire.KindPipeAck, wire.KindPipePing, wire.KindPipeAbandon, wire.KindPipeStatus,
+		wire.KindMaxData, wire.KindMaxStreamData:
+		return true
+	case wire.KindPadding, wire.KindStream, wire.KindResetStream, wire.KindResetStreamAt,
+		wire.KindStopSending, wire.KindMaxStreams, wire.KindDataBlocked, wire.KindStreamDataBlocked,
+		wire.KindStreamsBlocked, wire.KindClose, wire.KindDatagram, wire.KindTransportParams,
+		wire.KindPing, wire.KindGoAway, wire.KindPriorityUpdate, wire.KindPipeLane, wire.KindSessionEpoch:
+	}
+	return false
 }
 
 // dispatch applies one decoded frame.
@@ -549,15 +566,18 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause err
 	if allEnded {
 		p.in.ended = true
 	}
-	if s.state >= StateClosing {
-		s.checkLingerDone()
-		return
-	}
 	failed := (!graceful || partial) && !early
-	if s.feat.Multipath {
+	if s.feat.Multipath && s.transportLive() {
+		// While a close waits for coverage the pipe's loss reinjects
+		// what it carried, as before CLOSING.
 		if failed || allEnded {
 			s.mpInboundEnded(p, !failed, cause)
 		}
+		s.checkLingerDone()
+		return
+	}
+	if s.state >= StateClosing {
+		s.checkLingerDone()
 		return
 	}
 	if failed {
@@ -580,7 +600,7 @@ func (s *Session) pipeWriteFailed(pipe, lane uint64, err error) {
 	if p := s.pipe(pipe); s.shp != nil && lane == 0 && p != nil {
 		s.shapePipeDown(p)
 	}
-	if s.state >= StateClosing {
+	if s.state >= StateClosing && (!s.feat.Multipath || !s.transportLive()) {
 		if s.state == StateClosing {
 			if p := s.pipe(pipe); p != nil && p.out != nil {
 				p.out.failed = true

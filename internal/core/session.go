@@ -335,6 +335,16 @@ func (s *Session) Established() bool { return s.peerSeen }
 
 func (s *Session) isClosing() bool { return s.state >= StateClosing }
 
+// transportLive reports whether the session still does transport work:
+// before CLOSING, and while a graceful close's CONNECTION_CLOSE waits for
+// the PIPE_ACK coverage of what was handed to the carriers (SPEC.md
+// Section 6.5 step 1). Then records still go (acknowledgements, path
+// frames, credit, reinjected and queued data), received ones are counted
+// and acknowledged, the path layer's timers run and a failed pipe's
+// records are reinjected; only the application's new writes and opens are
+// refused, as in every CLOSING session.
+func (s *Session) transportLive() bool { return s.state < StateClosing || s.closeFr.waitLanes }
+
 // processPeerParams runs when the first frame of the inbound bootstrap pipe
 // decoded.
 func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
@@ -540,7 +550,7 @@ func (s *Session) closeWith(e *SessionError, fr *closeFrame) {
 	// protocol error, the end of a shutdown). The wait for lanes comes
 	// before it, so the frame always gets its CloseLimit.
 	s.timers.linger = s.now.Add(CloseLimit)
-	if !s.feat.Multipath && !e.Remote && (fr.app || fr.code == wire.NoError) && !s.lanesCovered() {
+	if !e.Remote && (fr.app || fr.code == wire.NoError) && !s.lanesCovered() {
 		s.closeFr.waitLanes = true
 		s.timers.laneWait = s.now.Add(s.lingerTimeout())
 		s.timers.linger = s.timers.laneWait.Add(CloseLimit)

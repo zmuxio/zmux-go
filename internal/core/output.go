@@ -42,8 +42,8 @@ func (s *Session) WantsWrite(pipe, lane uint64) bool {
 		// record holds them like any other record.
 		return s.closeFr.pending || s.shp == nil || !s.shapeDelayed(p)
 	}
-	if s.closeFr.pending {
-		return lane == 0 && !s.closeFr.waitLanes
+	if s.closeFr.pending && !s.closeFr.waitLanes {
+		return lane == 0
 	}
 	if s.shp != nil && s.shapeDelayed(p) {
 		return false // the planned record waits for its delay
@@ -54,7 +54,7 @@ func (s *Session) WantsWrite(pipe, lane uint64) bool {
 	if !ol.confirmed {
 		return false
 	}
-	if s.state == StateClosing {
+	if !s.transportLive() {
 		return false
 	}
 	if !s.peerSeen {
@@ -259,11 +259,9 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 			s.writeLaneFirst(&w, p, ol)
 		}
 	case lane > 0 && !ol.confirmed:
-	case s.closeFr.pending && !ol.closeSent && lane == 0:
-		if !s.closeFr.waitLanes {
-			s.writeClose(&w, ol)
-		}
-	case s.state == StateClosing || ol.closeSent:
+	case s.closeFr.pending && !s.closeFr.waitLanes && !ol.closeSent && lane == 0:
+		s.writeClose(&w, ol)
+	case !s.transportLive() || ol.closeSent:
 	case !s.peerSeen:
 		s.writePing(&w)
 		if s.earlyActive() {
@@ -337,6 +335,13 @@ func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
 	w.b.pos = uint64(pos)
 	for _, st := range w.touched {
 		st.snd.laneEnd = ol.pos
+	}
+	if w.anyElic {
+		// A message carrier's batch counts whole, as for the samples.
+		ol.elicitPos = ol.pos
+		if w.framing != FramingRecords {
+			ol.elicitPos = min64(start+uint64(w.elicEnd), ol.pos)
+		}
 	}
 	s.stats.BytesSent += uint64(pos)
 	// Earned are the bytes given to the carrier: a message carries no size field.
@@ -682,6 +687,9 @@ func (s *Session) checkLingerDone() {
 		return
 	}
 	if s.closeFr.pending {
+		if s.closeFr.waitLanes && s.lanesCovered() {
+			s.endLaneWait() // a failed pipe is no longer waited for
+		}
 		if !s.closeFr.waitLanes {
 			s.closeSentOn() // calls back once it is no longer pending
 		}

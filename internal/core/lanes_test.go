@@ -178,7 +178,7 @@ func TestCloseLaneWaitKeepsHandOff(t *testing.T) {
 	s.peerSeen = true
 	s.state = StateActive
 	s.feat = Features{PipeAck: true, LanesOut: true, LanesIn: true}
-	p.out.lanes = append(p.out.lanes, &outLane{lane: 1, info: info, confirmed: true, pos: 10})
+	p.out.lanes = append(p.out.lanes, &outLane{lane: 1, info: info, confirmed: true, pos: 10, elicitPos: 10})
 	start := s.now
 	s.Close(0, nil)
 	if !s.closeFr.waitLanes || !s.closeFr.pending {

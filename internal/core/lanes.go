@@ -218,6 +218,7 @@ func (s *Session) laneRefused(p *Pipe, ol *outLane) {
 		p.out.lo.pending = nil
 	}
 	s.act(Action{Kind: ActResetLane, Pipe: p.id, Lane: ol.lane})
+	s.checkLingerDone() // a close's wait no longer counts the lane
 }
 
 // lanesAcked runs after an acknowledgement advance on a lane.
@@ -239,20 +240,50 @@ func (s *Session) lanesAcked(p *Pipe, ol *outLane) {
 	s.wakeAllWriters()
 }
 
-// lanesCovered reports whether every record written on lanes other than 0
-// is acknowledged.
+// lanesCovered reports whether the records CONNECTION_CLOSE must not
+// overtake are acknowledged (up to the last ack-eliciting one: a record of
+// PIPE_ACK or PADDING alone is never acknowledged): those on lanes other
+// than 0 or, in a
+// multipath session, whose peer closes on the first copy it reads, those
+// on every lane of every pipe that has not failed, and what a failed or
+// suspect pipe's loss queued to go again (it is covered once a live pipe's
+// PIPE_ACK covers its new copy). Without a live outbound pipe nothing more
+// can be covered.
 func (s *Session) lanesCovered() bool {
+	live := false
 	for _, p := range s.pipes {
-		if p.out == nil {
+		if p.out == nil || p.out.failed {
 			continue
 		}
-		for _, l := range p.out.lanes[1:] {
-			if !l.refused && l.acked < l.pos {
+		live = true
+		lanes := p.out.lanes[1:]
+		if s.feat.Multipath {
+			lanes = p.out.lanes
+		}
+		for _, l := range lanes {
+			if !l.refused && l.acked < l.elicitPos {
 				return false
 			}
 		}
 	}
-	return true
+	return !live || !s.feat.Multipath || !s.resendPending()
+}
+
+// resendPending reports information a pipe's loss queued to go again and
+// not yet sent: stream data or a FIN to re-send, or a queued stream
+// control frame (RESET_STREAM, STOP_SENDING, ...).
+func (s *Session) resendPending() bool {
+	if s.ctlHead != nil {
+		return true
+	}
+	for _, st := range s.streams {
+		if m := st.snd.mps; st.hasS && m != nil && (m.resend.len() > 0 || m.finResend) {
+			if _, ok := s.planResend(st); ok { // drops what is no longer to send
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ---- inbound lanes ----

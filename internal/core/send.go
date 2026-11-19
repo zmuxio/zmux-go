@@ -695,8 +695,8 @@ func (s *Session) WriteBatch(st *Stream, b *Batch, skip int) (int, error) {
 	return taken, nil
 }
 
-// Flushable reports whether a stream holds written data or a FIN not yet
-// sent, on a session that has a live outbound pipe: what a graceful close
+// Flushable reports whether a stream holds written data, a FIN or a
+// RESET_STREAM not yet sent, on a session that has a live outbound pipe: what a graceful close
 // sends before CONNECTION_CLOSE, waiting for credit as for the carriers
 // within the close's bound, streams that have no identifier yet included.
 // Data that waits for a pipe does not count.
@@ -720,11 +720,17 @@ func (s *Session) Flushable() bool {
 	return false
 }
 
-// flushable reports whether the stream holds written data or a FIN not yet
-// sent.
+// flushable reports whether the stream holds written data, a FIN or a
+// RESET_STREAM not yet sent.
 func (st *Stream) flushable() bool {
 	sp := &st.snd
-	if !st.hasS || st.cancelled || sp.state >= sendDataSent || sp.reset {
+	if !st.hasS || st.cancelled {
+		return false
+	}
+	if sp.reset {
+		return !sp.resetSent && st.idSet
+	}
+	if sp.state >= sendDataSent {
 		return false
 	}
 	return st.unsent() > 0 || sp.finWr && !sp.finSent

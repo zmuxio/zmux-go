@@ -464,7 +464,9 @@ func (s *Session) epochRepeat(p *Pipe) Duration {
 // epochTimers re-arms the repeat of each pipe and finds the policy deadlines.
 func (s *Session) epochTimers(apply bool, at func(Time) bool) {
 	m := s.mp
-	if m == nil || m.keysPending || len(m.ep.list) == 0 {
+	// A closing session starts no exchange (epochProgress): its timers
+	// would stay due while the close waits for PIPE_ACK coverage.
+	if m == nil || m.keysPending || len(m.ep.list) == 0 || s.isClosing() {
 		return
 	}
 	ep := &m.ep

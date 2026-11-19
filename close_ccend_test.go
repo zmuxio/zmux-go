@@ -217,10 +217,13 @@ func TestCloseReadDrainKeepsReceivedEnd(t *testing.T) {
 			}
 			_ = server.CloseWithError(0x2a, "bye")
 			_ = server.Wait()
+			// The read drain lasts at most the linger timeout, 250 ms on
+			// this link, which runs from the client's own close: check
+			// well inside it.
 			select {
 			case <-client.Done():
 				t.Fatal("the unread end did not hold the closing session")
-			case <-time.After(300 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):
 			}
 			n, err := cs.Read(make([]byte, 16))
 			var se *StreamError

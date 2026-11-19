@@ -9,7 +9,7 @@ require (
 )
 
 require (
-	github.com/djylb/netx v0.0.0-20261118123252-73956d2fc343 // indirect
+	github.com/djylb/netx v0.0.0-20261118191910-b28403c6c1bd // indirect
 	github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc // indirect
 	github.com/dunglas/httpsfv v1.1.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect

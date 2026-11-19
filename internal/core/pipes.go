@@ -165,6 +165,7 @@ type outLane struct {
 	lane        uint64
 	pos         uint64 // bytes produced for the carrier (sender's position)
 	acked       uint64
+	elicitPos   uint64 // pos after the last ack-eliciting record: what a peer acknowledges
 	info        CarrierInfo
 	handed      uint64 // bytes of the batch being written: produced, not yet taken by the carrier
 	unsent      uint64 // the carrier's own unsent count, as the adapter last reported it

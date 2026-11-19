@@ -818,7 +818,7 @@ func (s *Session) shapeRecordIn(p *Pipe, lane uint64, n int, padOnly bool) {
 // delayed record, an injection or a shaping timer, which a driver meets
 // without its host timer's lateness.
 func (s *Session) ShapingDeadline() Time {
-	if s.shp == nil || s.state >= StateClosing {
+	if s.shp == nil || !s.transportLive() {
 		return Never
 	}
 	return s.shapeDeadline()
