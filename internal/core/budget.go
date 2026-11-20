@@ -14,18 +14,27 @@ import (
 // transition is signalled on Changed for the listener's serial context.
 type Budget struct {
 	Changed chan struct{} // capacity 1
-	limit   uint64        // 0: unlimited
+	limit   atomic.Uint64 // 0: unlimited
 	used    atomic.Int64
 	over    atomic.Bool
 }
 
 // NewBudget returns a budget of limit bytes (0: unlimited).
 func NewBudget(limit uint64) *Budget {
-	return &Budget{limit: limit, Changed: make(chan struct{}, 1)}
+	b := &Budget{Changed: make(chan struct{}, 1)}
+	b.limit.Store(limit)
+	return b
 }
 
 // Limit is the budget's size (0: unlimited).
-func (b *Budget) Limit() uint64 { return b.limit }
+func (b *Budget) Limit() uint64 { return b.limit.Load() }
+
+// SetLimit replaces the budget's size (0: unlimited); pressure starts or
+// ends at once when the sum is past the new bounds, signalled on Changed.
+func (b *Budget) SetLimit(limit uint64) {
+	b.limit.Store(limit)
+	b.Add(0)
+}
 
 // Used is the sum currently charged.
 func (b *Budget) Used() uint64 { return uint64(max(b.used.Load(), 0)) }
@@ -37,21 +46,21 @@ func (b *Budget) Pressure() bool { return b.over.Load() }
 // the bytes they hold for the listener's sessions this way.
 func (b *Budget) Add(d int64) {
 	u := b.used.Add(d)
-	if b.limit == 0 {
-		return
-	}
 	// The flag follows the sum: after a flip the sum is read again, so a
 	// change that raced with it (and found the flag not yet flipped) is not
 	// lost; the loop ends once flag and sum agree.
 	for {
 		over := b.over.Load()
+		limit := b.limit.Load()
 		switch {
-		case u >= int64(b.limit) && !over:
+		case limit == 0 && !over:
+			return
+		case u >= int64(limit) && limit != 0 && !over:
 			if !b.over.CompareAndSwap(false, true) {
 				continue
 			}
 			b.signal()
-		case u < int64(b.limit/4*3) && over:
+		case (limit == 0 || u < int64(limit/4*3)) && over:
 			if !b.over.CompareAndSwap(true, false) {
 				continue
 			}

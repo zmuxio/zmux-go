@@ -6,7 +6,7 @@ import "testing"
 // member in constant time.
 func TestListenerSuspendedList(t *testing.T) {
 	l := &Listener{}
-	l.cfg.MaxSuspended = 2
+	l.lim.Store(&ListenerLimits{MaxSuspended: 2})
 	a, b, c, d := &Conn{}, &Conn{}, &Conn{}, &Conn{}
 	l.sessionSuspended(a)
 	l.sessionSuspended(b)
@@ -29,7 +29,7 @@ func BenchmarkListenerSuspendResume(b *testing.B) {
 	for _, n := range []int{1, 10000} {
 		b.Run(map[int]string{1: "1", 10000: "10000"}[n], func(b *testing.B) {
 			l := &Listener{}
-			l.cfg.MaxSuspended = n + 1
+			l.lim.Store(&ListenerLimits{MaxSuspended: n + 1})
 			for range n {
 				l.sessionSuspended(&Conn{})
 			}

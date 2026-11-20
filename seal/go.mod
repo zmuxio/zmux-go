@@ -10,6 +10,6 @@ require (
 )
 
 require (
-	github.com/djylb/netx v0.0.0-20261120005204-a5e31d2ce17e // indirect
+	github.com/djylb/netx v0.0.0-20261120185208-bdc2b8cd835f // indirect
 	github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc // indirect
 )

@@ -116,7 +116,21 @@ values are invalid. A feature that is on by default has a `Switch` field
 never corrected. `JoinTimeout` (10 s) bounds every join and cannot be
 switched off; `HandshakeTimeout` bounds establishment only.
 `ListenerConfig.MaxPending` (1024 by default) bounds the carriers a
-listener holds before they belong to a session. `Config.Logger` (a `*slog.Logger`) receives the
+listener holds before they belong to a session. The listener's bounds
+(`ListenerLimits`: the pending, join and suspension counts, the
+first-record timeout and the memory budget) change while it runs:
+
+```go
+lim := l.Limits()
+lim.MaxPending = 4096
+if err := l.SetLimits(lim); err != nil { // invalid: nothing changes
+	return err
+}
+```
+
+New carriers and the next decisions use them at once. A new session's
+own bounds come from `ListenerConfig.SessionConfig`, called for each new
+session. `Config.Logger` (a `*slog.Logger`) receives the
 warnings an application would otherwise not see.
 
 ## Closing

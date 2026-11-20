@@ -262,8 +262,8 @@ func (s *Session) sendBufferLimit() uint64 {
 	left := ^uint64(0)
 	used := s.memUsage()
 	if b := s.cfg.Budget; b != nil {
-		if b.limit > 0 {
-			left = b.limit - min64(b.limit, b.Used())
+		if limit := b.Limit(); limit > 0 {
+			left = limit - min64(limit, b.Used())
 			growth := used - min64(used, s.charged)
 			left -= min64(left, growth)
 		}

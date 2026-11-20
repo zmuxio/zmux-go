@@ -205,11 +205,12 @@ func (t *tuner) sent(oldLimit uint64, now Time, blocked bool) {
 func (s *Session) connAllowance() uint64 {
 	c := &s.conn
 	if sb := s.cfg.Budget; sb != nil {
-		if sb.limit == 0 {
+		limit := sb.Limit()
+		if limit == 0 {
 			return ^uint64(0)
 		}
-		if u := sb.Used(); u < sb.limit {
-			return c.win + (sb.limit - u)
+		if u := sb.Used(); u < limit {
+			return c.win + (limit - u)
 		}
 		return c.win
 	}

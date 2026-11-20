@@ -1,0 +1,74 @@
+package zmux
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/internal/setting"
+)
+
+// SetLimits validates, fills defaults, reaches the slot table and trims
+// the suspension list at once.
+func TestListenerSetLimits(t *testing.T) {
+	l := mustNewListener(&ListenerConfig{MaxSuspended: 3})
+	defer func() { _ = l.Close() }()
+	if got := l.Limits(); got.MaxSuspended != 3 || got.FirstRecordTimeout != DefaultFirstRecordTimeout {
+		t.Fatalf("initial %+v", got)
+	}
+	if err := l.SetLimits(ListenerLimits{MaxPendingPerSource: -1}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("invalid: %v", err)
+	}
+	if l.Limits().MaxSuspended != 3 {
+		t.Fatal("invalid limits changed the listener")
+	}
+	a, b, c := &Conn{}, &Conn{}, &Conn{}
+	for _, x := range []*Conn{a, b, c} {
+		l.sessionSuspended(x)
+	}
+	r, err := ListenerLimits{MaxPending: 7, MaxSuspended: 1, FirstRecordTimeout: -1}.resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// SetLimits closes these; the stand-ins have no session to close.
+	if over := l.applyLimits(&r); len(over) != 2 || over[0] != a || over[1] != b {
+		t.Fatalf("over %v", over)
+	}
+	l.regMu.Lock()
+	n, head := l.suspN, l.suspHead
+	l.regMu.Unlock()
+	if n != 1 || head != c {
+		t.Fatalf("suspended %d, head %p", n, head)
+	}
+	l.pmu.Lock()
+	total, per := l.pending.MaxTotal, l.pending.MaxPerSource
+	l.pmu.Unlock()
+	if total != 7 || per != core.DefaultMaxPendingPerSource || l.Limits().FirstRecordTimeout != -1 || l.lim.Load().firstRecord() != setting.NoTimeout {
+		t.Fatalf("pending %d/%d, limits %+v", total, per, l.Limits())
+	}
+	if l.budget.Limit() != 1<<30 {
+		t.Fatalf("budget %d", l.budget.Limit())
+	}
+}
+
+// A lowered MemoryBudget starts pressure at once; unlimited ends it.
+func TestListenerSetMemoryBudget(t *testing.T) {
+	l := mustNewListener(&ListenerConfig{})
+	defer func() { _ = l.Close() }()
+	l.budget.Add(4096)
+	lim := l.Limits()
+	lim.MemoryBudget = 1024
+	if err := l.SetLimits(lim); err != nil {
+		t.Fatal(err)
+	}
+	if !l.budget.Pressure() {
+		t.Fatal("no pressure below the charged sum")
+	}
+	lim.MemoryBudget = -1
+	if err := l.SetLimits(lim); err != nil {
+		t.Fatal(err)
+	}
+	if l.budget.Pressure() || l.Limits().MemoryBudget != -1 {
+		t.Fatalf("pressure %v, limits %+v", l.budget.Pressure(), l.Limits())
+	}
+}

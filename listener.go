@@ -23,7 +23,6 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/labels"
-	"github.com/zmuxio/zmux-go/internal/setting"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
 )
@@ -46,30 +45,9 @@ type ListenerConfig struct {
 	// the errors SessionConfig returns;
 	// nil logs nothing. The sessions log to their Config.Logger.
 	Logger *slog.Logger
-	// MaxSuspended bounds the suspended sessions it holds. Zero is 1024;
-	// the longest-suspended are closed with ZMUX_RESUME_TIMEOUT.
-	MaxSuspended int
-	// MaxPending bounds the carriers of the listener before they belong to
-	// a session: a carrier holds one of its slots from its arrival, through
-	// its handshake, the admission, the inbound transform, a split half's
-	// wait for its partner, the classification, join verification and the
-	// exchange of transport parameters, and through a stall, until it
-	// enters a session, is closed or is handed to a fallback. Zero is 1024;
-	// a negative value is unlimited. When every slot is taken, a new
-	// carrier closes the oldest stalled carrier to take its slot, or, with
-	// none stalled, is closed at once (ListenerStats.Rejected). Stalled
-	// carriers hold at most half of MaxPending; a carrier to be stalled
-	// beyond that is closed (AdmissionStats.StallOverflow).
-	MaxPending int
-	// MaxPendingPerSource bounds those carriers per source (zero: 8),
-	// stalled ones included: a new carrier beyond it is refused, and a
-	// source holds at most MaxPendingPerSource - 1 stalled carriers, a
-	// carrier to be stalled beyond that being closed. A source is a client
-	// address aggregated to its source prefix (SourcePrefixV4,
-	// SourcePrefixV6); deployments behind a carrier-grade NAT raise it.
-	// Each half of a split bootstrap holds a slot until the pair is
-	// complete, so split bootstraps need at least 2.
-	MaxPendingPerSource int
+	// ListenerLimits are the bounds SetLimits changes while the listener
+	// runs; these are their initial values.
+	ListenerLimits
 	// SourcePrefixV4 and SourcePrefixV6 aggregate a source to its prefix:
 	// an IPv4 source (an IPv4-mapped IPv6 one included) counts by its first
 	// SourcePrefixV4 bits (1 to 32; zero: 32, the address on its own), an
@@ -83,17 +61,6 @@ type ListenerConfig struct {
 	// negative value or one beyond the address length makes NewListener
 	// fail with ErrInvalidConfig; there is no off setting.
 	SourcePrefixV4, SourcePrefixV6 int
-	// MaxPendingPerSession bounds the Unconfirmed carriers of one session:
-	// joins that passed authentication and wait for the joiner's
-	// confirmation (a join in Bound Mode is confirmed by its verification
-	// and holds no place). Zero is 4. A new authenticated Hello is never
-	// refused for lack of room: once the bound is reached, the carrier
-	// that has been Unconfirmed longest is closed first, as a failed join;
-	// below it, none is.
-	MaxPendingPerSession int
-	// FirstRecordTimeout closes a carrier whose first record does not
-	// arrive in time. Zero is 2 s; a negative value is no timeout.
-	FirstRecordTimeout time.Duration
 	// Backlog is the number of sessions waiting for Accept (zero: 128); a new
 	// session beyond it is refused with CONNECTION_REFUSED.
 	Backlog int
@@ -124,14 +91,6 @@ type ListenerConfig struct {
 	// own: it must return promptly, well within the peer's handshake or
 	// join timeout.
 	OnReject func(RejectInfo) RejectAction
-	// MemoryBudget bounds the sum over the listener's sessions of buffered
-	// receive data, retained data and session window growth. Zero is
-	// 1 GiB; a negative value is unlimited. It replaces the sessions' own
-	// Config.MemoryBudget. Above it sessions grant no new credit, refuse
-	// new peer streams, new sessions and pipes are refused, and suspended
-	// sessions are closed, the largest first; normal operation resumes
-	// below three quarters of it.
-	MemoryBudget int64
 	// OnMemoryPressure is called with the bytes in use and the budget when
 	// pressure starts (used >= budget) and when it ends, outside every
 	// lock, one call at a time; it may close sessions.
@@ -244,8 +203,12 @@ func (c *ListenerConfig) resolve() (ListenerConfig, error) {
 	if len(r.InstanceID) > MaxInstanceIDLen {
 		return r, fmt.Errorf("%w: ListenerConfig.InstanceID longer than MaxInstanceIDLen", ErrInvalidConfig)
 	}
-	if r.MaxSuspended < 0 || r.MaxPendingPerSource < 0 || r.MaxPendingPerSession < 0 || r.Backlog < 0 {
+	if r.Backlog < 0 {
 		return r, fmt.Errorf("%w: negative ListenerConfig count", ErrInvalidConfig)
+	}
+	var err error
+	if r.ListenerLimits, err = r.ListenerLimits.resolve(); err != nil {
+		return r, err
 	}
 	if _, err := r.Config.coreConfig(core.RoleResponder, core.RoleResponder); err != nil {
 		return r, fmt.Errorf("ListenerConfig.Config: %w", err)
@@ -254,18 +217,6 @@ func (c *ListenerConfig) resolve() (ListenerConfig, error) {
 		if err := v.Validate(); err != nil {
 			return r, fmt.Errorf("ListenerConfig.WrapPipe: %w", err)
 		}
-	}
-	if r.MaxSuspended == 0 {
-		r.MaxSuspended = defaultMaxSuspended
-	}
-	if r.MaxPending == 0 {
-		r.MaxPending = core.DefaultMaxPending
-	}
-	if r.MaxPendingPerSource == 0 {
-		r.MaxPendingPerSource = core.DefaultMaxPendingPerSource
-	}
-	if r.MaxPendingPerSession == 0 {
-		r.MaxPendingPerSession = core.DefaultMaxUnconfirmed
 	}
 	if r.SourcePrefixV4 < 0 || r.SourcePrefixV4 > 32 || r.SourcePrefixV6 < 0 || r.SourcePrefixV6 > 128 {
 		return r, fmt.Errorf("%w: ListenerConfig.SourcePrefixV4 beyond 0..32 or SourcePrefixV6 beyond 0..128", ErrInvalidConfig)
@@ -276,15 +227,11 @@ func (c *ListenerConfig) resolve() (ListenerConfig, error) {
 	if r.SourcePrefixV6 == 0 {
 		r.SourcePrefixV6 = defaultSourcePrefixV6
 	}
-	r.FirstRecordTimeout = setting.Timeout(r.FirstRecordTimeout, DefaultFirstRecordTimeout)
 	if err := r.Admission.Validate(); err != nil {
 		return r, err
 	}
 	if r.Backlog == 0 {
 		r.Backlog = defaultBacklog
-	}
-	if r.MemoryBudget == 0 {
-		r.MemoryBudget = defaultMemoryBudget
 	}
 	return r, nil
 }
@@ -376,6 +323,11 @@ type PipeHint struct {
 // gracefully. Its locks are leaves: none takes a session lock while held.
 type Listener struct {
 	cfg ListenerConfig
+	// lim holds the limits in effect (SetLimits); cfg keeps none.
+	lim atomic.Pointer[ListenerLimits]
+	// served is set by the first carrier: SetLimits starts the memory
+	// watcher only on a listener that serves.
+	served atomic.Bool
 
 	// pmu guards the pending carriers' slots, apart from mu: every carrier
 	// takes and gives back slots, so they do not wait for the session
@@ -548,12 +500,15 @@ func NewListener(cfg *ListenerConfig) (*Listener, error) {
 	l.stopCtx, l.stopCancel = context.WithCancel(context.Background())
 	l.accept = make(chan *Conn, l.cfg.Backlog)
 	_, _ = rand.Read(l.stallKey[:])
-	l.pending.MaxTotal = l.cfg.MaxPending
-	l.pending.MaxPerSource = l.cfg.MaxPendingPerSource
-	l.pending.Timeout = core.Duration(l.cfg.FirstRecordTimeout)
+	lim := l.cfg.ListenerLimits
+	l.cfg.ListenerLimits = ListenerLimits{} // lim is the only live copy
+	l.lim.Store(&lim)
+	l.pending.MaxTotal = lim.MaxPending
+	l.pending.MaxPerSource = lim.MaxPendingPerSource
+	l.pending.Timeout = core.Duration(lim.firstRecord())
 	var limit uint64 // unlimited
-	if l.cfg.MemoryBudget > 0 {
-		limit = uint64(l.cfg.MemoryBudget)
+	if lim.MemoryBudget > 0 {
+		limit = uint64(lim.MemoryBudget)
 	}
 	l.budget = core.NewBudget(limit)
 	if a := l.cfg.Admission; a != nil {
@@ -568,6 +523,7 @@ func NewListener(cfg *ListenerConfig) (*Listener, error) {
 // the listener takes, so that a listener that never serves owns no
 // goroutine; Close stops it (one started after Close returns at once).
 func (l *Listener) startWatch() {
+	l.served.Store(true)
 	if l.budget.Limit() == 0 || l.watching.Load() || !l.watching.CompareAndSwap(false, true) {
 		return
 	}
@@ -599,7 +555,7 @@ func (a *ListenerAdapter) Clock() timeshim.Clock { return a.clk }
 
 // FirstRecordTimeout is the effective ListenerConfig.FirstRecordTimeout,
 // the bound an adapter applies to the start of a carrier it reads itself.
-func (a *ListenerAdapter) FirstRecordTimeout() time.Duration { return a.cfg.FirstRecordTimeout }
+func (a *ListenerAdapter) FirstRecordTimeout() time.Duration { return a.lim.Load().firstRecord() }
 
 // HandshakeTimeout is the effective Config.HandshakeTimeout of the
 // listener's sessions.
@@ -974,7 +930,7 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint PipeHint, 
 // timeout and the two ends close the carrier from callbacks, with no
 // goroutine or shared channel per carrier.
 func (l *Listener) readFirst(ctx context.Context, p PipeIO) ([]byte, core.Class, error) {
-	return readFirstWithin(ctx, l.stopCtx, l.clk, l.cfg.FirstRecordTimeout, p)
+	return readFirstWithin(ctx, l.stopCtx, l.clk, l.lim.Load().firstRecord(), p)
 }
 
 // readFirstWithin reads the first record of p within d on clk; ctx or stop
@@ -1294,7 +1250,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 	}
 	// Closing the listener ends the handshake, not an attached pipe.
 	hctx, unlink := l.stopContext(ctx)
-	id, err := c.acceptHello(hctx, p, h, binding, hint.Admitted, l.cfg.MaxPendingPerSession)
+	id, err := c.acceptHello(hctx, p, h, binding, hint.Admitted, l.lim.Load().MaxPendingPerSession)
 	unlink()
 	if err == nil {
 		release() // Confirmed: the carrier is the session's
@@ -1453,8 +1409,14 @@ func (l *Listener) sessionSuspended(c *Conn) []*Conn {
 	}
 	l.suspTail = c
 	l.suspN++
+	return l.trimSuspended()
+}
+
+// trimSuspended drops the longest-suspended sessions beyond MaxSuspended
+// and returns them, for the caller to close outside every lock. Under regMu.
+func (l *Listener) trimSuspended() []*Conn {
 	var over []*Conn
-	for l.suspN > l.cfg.MaxSuspended {
+	for l.suspN > l.lim.Load().MaxSuspended {
 		old := l.suspHead
 		l.dropSuspended(old)
 		over = append(over, old)
