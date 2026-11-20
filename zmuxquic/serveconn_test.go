@@ -42,7 +42,7 @@ func TestServeConnDialled(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		go func() { served <- ServeConn(sctx, lst, qc, nil) }()
+		go func() { served <- ServeConn(sctx, lst, qc) }()
 		r := <-acc
 		if r.err != nil {
 			t.Fatal(r.err)
@@ -110,7 +110,7 @@ func TestServeConnRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ServeConn(ctx, lst, qc, nil); !errors.Is(err, net.ErrClosed) {
+	if err := ServeConn(ctx, lst, qc); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("ServeConn on a closed listener: %v", err)
 	}
 	select {

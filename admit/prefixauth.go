@@ -242,13 +242,13 @@ func (v *PrefixAuthVerifier) Verify(token, binding []byte) bool {
 
 // Decide is a zmux.Admission.Decide that accepts a carrier whose prefix is a
 // valid token, without the token, and returns zmux.VerdictFallback otherwise.
-// On a carrier decided on its request head (zmux.CarrierInfo.Head) the
+// On a carrier decided on its request head (zmux.CarrierInfo.Stage StageHead) the
 // token is the request's only HeaderField field (HeaderPrefixAuth), 43
 // characters of base64url without padding, and the decision has no
 // prefix. With BindTLS, a carrier without TLS is not accepted. The
 // Admission's Peek must be PrefixTokenLen; a carrier decided on its
 // request head reads none.
-func (v *PrefixAuthVerifier) Decide(_ context.Context, info *zmux.CarrierInfo, prefix []byte) zmux.Decision {
+func (v *PrefixAuthVerifier) Decide(_ context.Context, info zmux.CarrierInfo, prefix []byte) zmux.Decision {
 	no := zmux.Decision{Verdict: zmux.VerdictFallback}
 	var binding []byte
 	if v.bind {
@@ -261,7 +261,7 @@ func (v *PrefixAuthVerifier) Decide(_ context.Context, info *zmux.CarrierInfo, p
 		}
 		binding = b
 	}
-	if !info.Head {
+	if info.Stage != zmux.StageHead {
 		if !v.Verify(prefix, binding) {
 			return no
 		}

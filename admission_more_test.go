@@ -30,7 +30,7 @@ func testHeader() []byte {
 // skips; calls counts its calls.
 func classifyingAdmission(calls *sync.Map) *Admission {
 	return &Admission{Peek: 2, MaxPeek: 64, PeekTimeout: 5 * time.Second,
-		Decide: func(_ context.Context, _ *CarrierInfo, prefix []byte) Decision {
+		Decide: func(_ context.Context, _ CarrierInfo, prefix []byte) Decision {
 			n, _ := calls.LoadOrStore("n", new(int))
 			*n.(*int)++
 			c, need := wire.ClassifyFirstBytes(prefix, false)
@@ -111,7 +111,7 @@ func admitOnce(t *testing.T, adm *Admission, p func() (PipeIO, func()), seen *[]
 	t.Helper()
 	decide := adm.Decide
 	var mu sync.Mutex
-	adm.Decide = func(ctx context.Context, info *CarrierInfo, prefix []byte) Decision {
+	adm.Decide = func(ctx context.Context, info CarrierInfo, prefix []byte) Decision {
 		mu.Lock()
 		*seen = append(*seen, len(prefix))
 		mu.Unlock()
@@ -151,10 +151,10 @@ func streamCarrier(send []byte, end bool) func() (PipeIO, func()) {
 	}
 }
 
-func seq(ds ...Decision) func(context.Context, *CarrierInfo, []byte) Decision {
+func seq(ds ...Decision) func(context.Context, CarrierInfo, []byte) Decision {
 	var mu sync.Mutex
 	i := 0
-	return func(context.Context, *CarrierInfo, []byte) Decision {
+	return func(context.Context, CarrierInfo, []byte) Decision {
 		mu.Lock()
 		defer mu.Unlock()
 		d := ds[min(i, len(ds)-1)]
@@ -256,8 +256,8 @@ func (m *firstMsgCarrier) Close() error {
 }
 
 // On a message-framed carrier the prefix is the first message, whole,
-// within max(Peek, MaxPeek); Skip is 0 or all of it; VerdictMore is
-// VerdictClose.
+// within MaxMessage (MaxRecordSize by default; Peek and MaxPeek do not
+// bound it); Skip is 0 or all of it; VerdictMore is VerdictClose.
 func TestAdmissionFirstMessage(t *testing.T) {
 	leakcheck.Check(t)
 	msg := bytes.Repeat([]byte{1}, 40)
@@ -270,8 +270,8 @@ func TestAdmissionFirstMessage(t *testing.T) {
 		{"whole", &Admission{Peek: 1, MaxPeek: 64, Decide: seq(Decision{Verdict: VerdictAccept, Skip: 40, Variant: "w"})}, []int{40}, 1, 0},
 		{"replayed", &Admission{Peek: 1, MaxPeek: 64, Decide: seq(Decision{Verdict: VerdictAccept, Variant: "w"})}, []int{40}, 1, 0},
 		{"partial skip", &Admission{Peek: 1, MaxPeek: 64, Decide: seq(Decision{Verdict: VerdictAccept, Skip: 3, Variant: "w"})}, []int{40}, 0, 1},
-		{"Peek bounds without MaxPeek", &Admission{Peek: 40, Decide: seq(Decision{Verdict: VerdictAccept, Variant: "w"})}, []int{40}, 1, 0},
-		{"too long", &Admission{Peek: 1, MaxPeek: 39, Decide: seq(Decision{Verdict: VerdictAccept})}, nil, 0, 1},
+		{"default bound", &Admission{Peek: 1, Decide: seq(Decision{Verdict: VerdictAccept, Variant: "w"})}, []int{40}, 1, 0},
+		{"too long", &Admission{Peek: 1, MaxMessage: 39, Decide: seq(Decision{Verdict: VerdictAccept})}, nil, 0, 1},
 		{"more", &Admission{Peek: 1, MaxPeek: 64, Decide: seq(Decision{Verdict: VerdictMore, Need: 50, Variant: "w"})}, []int{40}, 0, 1},
 	} {
 		var seen []int
@@ -280,7 +280,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 			m := newFirstMsgCarrier(msg)
 			return PipeIO{R: m, W: m, Framing: FramingRecords}, func() { _ = m.Close() }
 		}, &seen)
-		if st.Accepted != x.accepted || st.Closed != x.closed || !equalInts(seen, x.seen) {
+		if st.Accepted != x.accepted || st.Closed+st.TooLarge != x.closed || !equalInts(seen, x.seen) {
 			t.Fatalf("%s: stats %+v, Decide saw %v", x.name, st, seen)
 		}
 		var sum VariantStat
@@ -288,7 +288,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 			sum.Accepted += v.Accepted
 			sum.Closed += v.Closed
 		}
-		if sum.Accepted != st.Accepted || sum.Closed != st.Closed {
+		if sum.Accepted != st.Accepted || sum.Closed != st.Closed+st.TooLarge {
 			t.Fatalf("%s: variants %+v do not add up", x.name, vs)
 		}
 	}
@@ -298,6 +298,8 @@ func TestAdmissionMaxPeekConfig(t *testing.T) {
 	for _, a := range []*Admission{
 		{Peek: 4, MaxPeek: 3, Decide: seq(Decision{})},
 		{MaxPeek: -1, Decide: seq(Decision{})},
+		{MaxMessage: -1, Decide: seq(Decision{})},
+		{MaxMessage: MaxRecordSize + 1, Decide: seq(Decision{})},
 	} {
 		if err := a.Validate(); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%+v: %v", a, err)
@@ -352,9 +354,9 @@ func (m *limitMsgCarrier) ReadMessage(limit int) ([]byte, error) {
 	return b, err
 }
 
-// The first message is read with the admission's bound,
-// max(Peek, MaxPeek), where the carrier can bound the read: a longer one
-// is refused before Decide.
+// The first message is read with the admission's bound, MaxMessage
+// (MaxRecordSize for 0), where the carrier can bound the read: a longer
+// one is refused before Decide, counted TooLarge.
 func TestAdmissionFirstMessageLimit(t *testing.T) {
 	leakcheck.Check(t)
 	msg := bytes.Repeat([]byte{1}, 40)
@@ -362,8 +364,9 @@ func TestAdmissionFirstMessageLimit(t *testing.T) {
 		adm              *Admission
 		accepted, closed uint64
 	}{
-		{&Admission{Peek: 1, MaxPeek: 39, Decide: seq(Decision{Verdict: VerdictAccept})}, 0, 1},
-		{&Admission{Peek: 1, MaxPeek: 40, Decide: seq(Decision{Verdict: VerdictAccept})}, 1, 0},
+		{&Admission{Peek: 1, MaxMessage: 39, Decide: seq(Decision{Verdict: VerdictAccept})}, 0, 1},
+		{&Admission{Peek: 1, MaxMessage: 40, Decide: seq(Decision{Verdict: VerdictAccept})}, 1, 0},
+		{&Admission{Peek: 1, Decide: seq(Decision{Verdict: VerdictAccept})}, 1, 0},
 	} {
 		var seen []int
 		var m *limitMsgCarrier
@@ -371,11 +374,15 @@ func TestAdmissionFirstMessageLimit(t *testing.T) {
 			m = &limitMsgCarrier{firstMsgCarrier: newFirstMsgCarrier(msg)}
 			return PipeIO{R: m, W: m, Framing: FramingRecords}, func() { _ = m.Close() }
 		}, &seen)
-		if st.Accepted != x.accepted || st.Closed != x.closed {
-			t.Fatalf("MaxPeek %d: stats %+v", x.adm.MaxPeek, st)
+		want := x.adm.MaxMessage
+		if want == 0 {
+			want = MaxRecordSize
 		}
-		if len(m.limits) == 0 || m.limits[0] != x.adm.MaxPeek {
-			t.Fatalf("MaxPeek %d: limits %v", x.adm.MaxPeek, m.limits)
+		if st.Accepted != x.accepted || st.TooLarge != x.closed || st.Closed != 0 {
+			t.Fatalf("MaxMessage %d: stats %+v", x.adm.MaxMessage, st)
+		}
+		if len(m.limits) == 0 || m.limits[0] != want {
+			t.Fatalf("MaxMessage %d: limits %v", x.adm.MaxMessage, m.limits)
 		}
 	}
 }
@@ -384,7 +391,7 @@ func TestAdmissionFirstMessageLimit(t *testing.T) {
 // concurrent snapshot never sees it accepted.
 func TestAdmissionPartialSkipCountedOnce(t *testing.T) {
 	leakcheck.Check(t)
-	adm := &Admission{Peek: 1, MaxPeek: 64, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+	adm := &Admission{Peek: 1, MaxPeek: 64, Decide: func(context.Context, CarrierInfo, []byte) Decision {
 		return Decision{Verdict: VerdictAccept, Skip: 3, Variant: "w"}
 	}}
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})

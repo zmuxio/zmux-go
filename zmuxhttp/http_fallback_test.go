@@ -171,7 +171,7 @@ func TestHTTPAdmittedCarrierNotHandedOn(t *testing.T) {
 		t.Run(x.name, func(t *testing.T) {
 			e := newRefusedEnv(t, &zmux.Admission{Peek: 8, PeekTimeout: time.Second,
 				StallMin: 10 * time.Millisecond, StallMax: 20 * time.Millisecond,
-				Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision { return zmux.Decision{Verdict: x.v} }})
+				Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision { return zmux.Decision{Verdict: x.v} }})
 			defer e.close()
 			if code := e.send(t, http.MethodPost, garbage, nil); code != x.want {
 				t.Fatalf("status %d, want %d", code, x.want)
@@ -199,7 +199,7 @@ func mustHTTPHandler(t *testing.T, l *zmux.Listener) http.Handler {
 func TestHTTPRejectedStreamFallbackFullDuplex(t *testing.T) {
 	leakcheck.Check(t)
 	adm := &zmux.Admission{Peek: 4, PeekTimeout: time.Second,
-		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+		Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 			return zmux.Decision{Verdict: zmux.VerdictFallback}
 		}}
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})

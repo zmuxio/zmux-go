@@ -192,7 +192,7 @@ func TestSubprotocols(t *testing.T) {
 	var decided atomic.Int32
 	o := &zmuxhttp.Options{Next: next}
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{
-		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+		Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 			decided.Add(1)
 			return zmux.Decision{}
 		}}})
@@ -253,7 +253,7 @@ func TestAdmissionAcceptAndFallback(t *testing.T) {
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
 		Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide}})
 	u := server(t, l, o)
-	name, value, err := auth.Header(&zmux.CarrierInfo{Head: true})
+	name, value, err := auth.Header(&zmux.CarrierInfo{Stage: zmux.StageHead})
 	if err != nil || name != admit.HeaderPrefixAuth {
 		t.Fatal(name, err)
 	}
@@ -319,7 +319,7 @@ func TestAdmissionStallAndClose(t *testing.T) {
 		o := &zmuxhttp.Options{Next: next}
 		l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{
 			StallMin: 300 * time.Millisecond, StallMax: 400 * time.Millisecond,
-			Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+			Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 				return zmux.Decision{Verdict: tc.verdict}
 			}}})
 		u := server(t, l, o)

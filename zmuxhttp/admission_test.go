@@ -178,7 +178,7 @@ func TestAdmissionExchange(t *testing.T) {
 func TestAdmittedValueSplit(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
-		Admission: &zmux.Admission{PeekTimeout: 5 * time.Second, Decide: func(_ context.Context, info *zmux.CarrierInfo, _ []byte) zmux.Decision {
+		Admission: &zmux.Admission{PeekTimeout: 5 * time.Second, Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
 			return zmux.Decision{Verdict: zmux.VerdictAccept, Value: info.Request.Method}
 		}}})
 	defer func() { _ = lst.Close() }()
@@ -217,7 +217,7 @@ func TestAdmittedValueSplit(t *testing.T) {
 func TestAdmittedValueExchange(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(),
-		Admission: &zmux.Admission{PeekTimeout: 5 * time.Second, Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+		Admission: &zmux.Admission{PeekTimeout: 5 * time.Second, Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 			return zmux.Decision{Verdict: zmux.VerdictAccept, Value: "ex"}
 		}}})
 	defer func() { _ = lst.Close() }()
@@ -348,9 +348,9 @@ func TestListenerStatsIdentity(t *testing.T) {
 	// Admission verdicts other than accept count in Admission alone.
 	for _, v := range []zmux.AdmissionVerdict{zmux.VerdictClose, zmux.VerdictFallback, zmux.VerdictStall} {
 		adm := &zmux.Admission{StallMin: time.Millisecond, StallMax: 10 * time.Millisecond,
-			Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision { return zmux.Decision{Verdict: v} }}
+			Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision { return zmux.Decision{Verdict: v} }}
 		al := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm,
-			Fallback: func(_ context.Context, c net.Conn) { _ = c.Close() }})
+			Fallback: func(context.Context, *zmux.Takeover) {}})
 		a1, a2 := net.Pipe()
 		_ = al.HandlePipe(ctx, zmux.NetPipe(a2), zmux.PipeHint{})
 		_ = a1.Close()

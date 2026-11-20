@@ -115,7 +115,12 @@ func offered(protocols []string) ([]string, error) {
 // (zmux.Listener.AdmitUpgrade, decided on the request head, without a
 // prefix). An accepted request is answered with 101 and its connection is
 // handed to the listener for its lifetime (zmux.Arrival.HandlePipe), with
-// the request's source (o.Trusted). A request forwarded from
+// the request's source (o.Trusted). A head decision of zmux.VerdictDefer
+// defers the admission to the connection's first message: the request is
+// answered with 101 (zmux.Arrival.AdmitFirst), and the decision on that
+// message accepts the connection as above, or hands it, the message
+// replayed, to zmux.ListenerConfig.Fallback, or stalls or closes it; the
+// handler returns once that is done. A request forwarded from
 // early data is answered 425 (Too Early). o may be nil; an invalid o is an
 // error.
 //
@@ -163,16 +168,24 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	c, err := wshttp.Accept(w, r, hs)
-	if err != nil {
-		if _, ok := errors.AsType[*wsconn.HandshakeError](err); ok {
-			// Nothing was answered.
-			h.o.Fallback(w, r)
+	var c *wsconn.Conn
+	p, ok := a.AdmitFirst(r.Context(), func(context.Context) (zmux.PipeIO, error) {
+		var err error
+		if c, err = wshttp.Accept(w, r, hs); err != nil {
+			if _, ok := errors.AsType[*wsconn.HandshakeError](err); ok {
+				// Nothing was answered.
+				h.o.Fallback(w, r)
+			}
+			return zmux.PipeIO{}, err // the upgrade failed: no pipe input
 		}
-		a.HandshakeFailed() // the upgrade failed: no pipe input
+		return pipe(c, r.TLS), nil
+	})
+	if c == nil {
 		return
 	}
-	_ = a.HandlePipe(r.Context(), pipe(c, r.TLS), zmux.PipeHint{})
+	if ok {
+		_ = a.HandlePipe(r.Context(), p, zmux.PipeHint{})
+	}
 	// Over an HTTP/2 stream, the handler outlives the connection.
 	select {
 	case <-wshttp.Done(c):
@@ -347,7 +360,7 @@ func dialOnce(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Carr
 	var credErr error
 	if cred != nil {
 		peer, _ := netip.ParseAddrPort(nc.RemoteAddr().String())
-		info := &zmux.CarrierInfo{Peer: peer, Head: true}
+		info := &zmux.CarrierInfo{Peer: peer, Stage: zmux.StageHead}
 		if tc, ok := nc.(*tls.Conn); ok {
 			cs := tc.ConnectionState()
 			info.TLS = &cs

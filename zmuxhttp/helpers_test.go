@@ -162,7 +162,7 @@ func testHeader() []byte {
 // skips; calls counts its calls.
 func classifyingAdmission(calls *sync.Map) *zmux.Admission {
 	return &zmux.Admission{Peek: 2, MaxPeek: 64, PeekTimeout: 5 * time.Second,
-		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
+		Decide: func(_ context.Context, _ zmux.CarrierInfo, prefix []byte) zmux.Decision {
 			n, _ := calls.LoadOrStore("n", new(int))
 			*n.(*int)++
 			c, need := admit.ClassifyFirstBytes(prefix, zmux.FramingByteStream)
@@ -230,7 +230,7 @@ func eqAdm(a, b zmux.AdmissionStats) bool { return a == b }
 // decideWith is an Admission whose every decision is v, counted in n.
 func decideWith(v zmux.AdmissionVerdict, n *atomic.Int32) *zmux.Admission {
 	return &zmux.Admission{PeekTimeout: 5 * time.Second, StallMin: time.Millisecond, StallMax: time.Millisecond,
-		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+		Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 			n.Add(1)
 			return zmux.Decision{Verdict: v}
 		}}

@@ -76,7 +76,7 @@ func newEnvQUIC(t testing.TB, address string, scfg *zmux.Config, qconf *quic.Con
 	e := &env{ln: ln, lst: mustNewListener(&zmux.ListenerConfig{Config: scfg}), cli: cli, cancel: cancel}
 	tl := &trackedListener{ConnListener: ln}
 	e.tl = tl
-	go func() { _ = Serve(ctx, e.lst, tl, nil) }()
+	go func() { _ = Serve(ctx, e.lst, tl) }()
 	t.Cleanup(func() {
 		cancel()
 		_ = ln.Close()
@@ -473,7 +473,7 @@ func TestQUICHandshakeFailureCounted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	served := make(chan struct{})
-	go func() { _ = Serve(ctx, lst, ln, nil); close(served) }()
+	go func() { _ = Serve(ctx, lst, ln); close(served) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-served }()
 	if qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, testQUIC(nil)); err == nil {
 		// The client finishes first; the server's verdict closes the

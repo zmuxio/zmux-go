@@ -136,8 +136,13 @@ func NewServer(addr string, tlsConf *tls.Config, qconf *quic.Config, h http.Hand
 // NewHandler returns an http.Handler that serves WebTransport carriers of l
 // through s, a WebTransport server whose HTTP/3 server is configured with
 // webtransport.ConfigureHTTP3Server: each request passes l's admission on
-// its head (zmux.Listener.AdmitUpgrade; the body is not read), is
-// upgraded to a WebTransport session, and the session's bidirectional
+// its head (zmux.Listener.AdmitUpgrade; the body is not read), or defers
+// it to the session's first bidirectional stream (zmux.VerdictDefer;
+// zmux.Arrival.AdmitFirst bounds the wait for that stream), is upgraded
+// to a WebTransport session; nothing else of the session is handed on
+// before its first stream is admitted, and a session whose first stream
+// is not accepted, or comes too late, is closed once the verdict was
+// acted on; and the session's bidirectional
 // streams go to l as carriers and its unidirectional streams as lanes,
 // until the session ends, with the request's source (o.Trusted). A request
 // forwarded from early data, or received in 0-RTT, is answered 425; one that cannot be upgraded
@@ -155,13 +160,29 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 		if !ok {
 			return
 		}
-		sess, err := s.Upgrade(w, r)
-		if err != nil {
-			a.HandshakeFailed() // the upgrade failed: no pipe input
-			o.Fallback(w, r)
+		// The first bidirectional stream is the session's first carrier:
+		// nothing else of it is handed on before it is decided, and
+		// AdmitFirst bounds the wait for it while the decision is deferred.
+		var sess *webtransport.Session
+		p, ok := a.AdmitFirst(r.Context(), func(ctx context.Context) (zmux.PipeIO, error) {
+			var err error
+			if sess, err = s.Upgrade(w, r); err != nil {
+				o.Fallback(w, r)
+				return zmux.PipeIO{}, err // the upgrade failed: no pipe input
+			}
+			st, err := sess.AcceptStream(ctx)
+			if err != nil {
+				return zmux.PipeIO{}, err
+			}
+			return StreamPipe(sess, st), nil
+		})
+		if !ok {
+			if sess != nil {
+				_ = sess.CloseWithError(0, "")
+			}
 			return
 		}
-		_ = serve(sess.Context(), l, sess, a)
+		_ = serve(sess.Context(), l, sess, a, p)
 	}), nil
 }
 
@@ -179,12 +200,12 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 // failed (an idle timeout, a transport error), and ctx's error when ctx ends
 // first; the zmux sessions continue on their pipes.
 func Serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session) error {
-	return serve(ctx, l, sess, nil)
+	return serve(ctx, l, sess, nil, zmux.PipeIO{})
 }
 
 // serve is Serve, or with a the streams of a session admitted as one
-// arrival.
-func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a *zmux.Arrival) error {
+// arrival by its first stream, first.
+func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a *zmux.Arrival, first zmux.PipeIO) error {
 	handle := func(p zmux.PipeIO) {
 		if a != nil {
 			_ = a.HandlePipe(ctx, p, zmux.PipeHint{})
@@ -194,6 +215,7 @@ func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a 
 	}
 	if a != nil {
 		defer a.Release()
+		labels.Go(ctx, "wt-pipe", func() { _ = a.HandlePipe(ctx, first, zmux.PipeHint{}) })
 	}
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -349,7 +371,7 @@ func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, 
 		return fail(context.Cause(ctx))
 	}
 	cs := qc.ConnectionState().TLS
-	name, value, err := cred.Header(&zmux.CarrierInfo{Peer: addrPort(qc.RemoteAddr()), TLS: &cs, Head: true})
+	name, value, err := cred.Header(&zmux.CarrierInfo{Peer: addrPort(qc.RemoteAddr()), TLS: &cs, Stage: zmux.StageHead})
 	if err != nil {
 		return fail(err)
 	}

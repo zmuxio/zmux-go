@@ -19,7 +19,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 	ctx := testContext(t)
 	var seen atomic.Int32
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: 1, MaxPeek: 1 << 16,
-		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
+		Decide: func(_ context.Context, _ zmux.CarrierInfo, prefix []byte) zmux.Decision {
 			if c, _ := admit.ClassifyFirstBytes(prefix, zmux.FramingRecords); c != admit.FirstBytesRecord || len(prefix) < 9 {
 				return zmux.Decision{Verdict: zmux.VerdictClose}
 			}
@@ -44,11 +44,13 @@ func TestAdmissionFirstMessage(t *testing.T) {
 	}
 }
 
-// An upgrade is decided on its head: VerdictMore is VerdictClose.
+// VerdictMore on an upgrade's head is VerdictClose, before anything is
+// answered: a head has no bytes to read more of (VerdictDefer decides on
+// the carrier).
 func TestAdmissionMoreOnHead(t *testing.T) {
 	o := &zmuxhttp.Options{Next: next}
 	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: 4, MaxPeek: 64,
-		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+		Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 			return zmux.Decision{Verdict: zmux.VerdictMore, Need: 8, Variant: "h"}
 		}}})
 	u := server(t, l, o)

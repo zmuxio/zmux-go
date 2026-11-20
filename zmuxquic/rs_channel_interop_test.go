@@ -186,7 +186,7 @@ func TestInteropQUICChannelGoServer(t *testing.T) {
 	defer cancel()
 	l := mustNewListener(&zmux.ListenerConfig{Config: &zmux.Config{EnableDatagrams: true}})
 	defer func() { _ = l.Close() }()
-	go func() { _ = Serve(ctx, l, ln, nil) }()
+	go func() { _ = Serve(ctx, l, ln) }()
 	const n = 20
 	p := startChannelPeer(t, "client", ln.Addr().String(), strconv.Itoa(n))
 	c, err := l.Accept(ctx)

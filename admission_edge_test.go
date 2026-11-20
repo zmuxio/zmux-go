@@ -59,7 +59,7 @@ func TestPeekMessageLateTimer(t *testing.T) {
 	defer a.Release()
 	h := &msgHalf{}
 	clk.armed.Store(true)
-	msg, _, fired := a.peekMessage(PipeIO{R: h}, 64, time.Now().Add(time.Hour))
+	msg, _, _, fired := a.peekMessage(context.Background(), PipeIO{R: h}, 64, time.Now().Add(time.Hour))
 	if !fired || msg != nil || h.closed.Load() != 1 {
 		t.Fatalf("message %q, fired %v, closed %d times", msg, fired, h.closed.Load())
 	}

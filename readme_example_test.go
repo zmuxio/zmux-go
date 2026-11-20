@@ -213,7 +213,7 @@ func Example_readmeProxy() {
 
 // Example_readmeAdmission is README.md "Admission".
 func Example_readmeAdmission() {
-	_ = func(ctx context.Context, key []byte, cfg *zmux.Config, fallback func(context.Context, net.Conn),
+	_ = func(ctx context.Context, key []byte, cfg *zmux.Config, fallback func(context.Context, *zmux.Takeover),
 		ln net.Listener, tlsConf *tls.Config, addr string) (*zmux.Conn, error) {
 		auth := &admit.PrefixAuth{Key: key, Slot: 30 * time.Second, BindTLS: true}
 		v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})

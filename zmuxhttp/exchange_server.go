@@ -61,7 +61,7 @@ type exGone struct {
 // zmux.VerdictFallback, Options.Trusted resolves a request's source, and
 // Options.PairField tells a split half from an exchange request. cfg is what
 // the clients' Exchange values agree on. The listener's admission decides on
-// the request that creates a carrier, on its head (zmux.CarrierInfo.Head):
+// the request that creates a carrier, on its head (zmux.CarrierInfo.Stage StageHead):
 // Peek does not apply. An invalid o or cfg (without a PSK and AllowInsecure,
 // a negative field) is a zmux.ErrInvalidConfig error.
 func NewExchangeHandler(l *zmux.Listener, o *ExchangeOptions, cfg ExchangeConfig) (*ExchangeHandler, error) {

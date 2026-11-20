@@ -34,7 +34,7 @@ func TestServeAdmission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
-	go func() { _ = Serve(ctx, lst, ln, nil); close(done) }()
+	go func() { _ = Serve(ctx, lst, ln); close(done) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
 
 	// A valid carrier: Dial presents the credential on its first stream.
@@ -120,7 +120,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	}
 	var decided atomic.Int32
 	adm := &zmux.Admission{Peek: 4, PeekTimeout: time.Second,
-		Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+		Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 			decided.Add(1)
 			return zmux.Decision{Verdict: zmux.VerdictAccept}
 		}}
@@ -128,7 +128,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
-	go func() { _ = Serve(ctx, lst, ln, nil); close(done) }()
+	go func() { _ = Serve(ctx, lst, ln); close(done) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
 
 	warm, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
@@ -182,7 +182,7 @@ func TestServeAdmissionMore(t *testing.T) {
 	}
 	header := append([]byte{0x01, 20}, make([]byte, 18)...)
 	adm := &zmux.Admission{Peek: 2, MaxPeek: 64, PeekTimeout: 5 * time.Second,
-		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
+		Decide: func(_ context.Context, _ zmux.CarrierInfo, prefix []byte) zmux.Decision {
 			if c, _ := admit.ClassifyFirstBytes(prefix, zmux.FramingByteStream); c != admit.FirstBytesOther || prefix[0] != 0x01 {
 				return zmux.Decision{Verdict: zmux.VerdictClose}
 			}
@@ -195,7 +195,7 @@ func TestServeAdmissionMore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	done := make(chan struct{})
-	go func() { _ = Serve(ctx, lst, ln, nil); close(done) }()
+	go func() { _ = Serve(ctx, lst, ln); close(done) }()
 	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
 	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
 	if err != nil {

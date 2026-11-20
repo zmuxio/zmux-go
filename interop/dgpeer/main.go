@@ -85,7 +85,7 @@ func serve(ctx context.Context, certFile, keyFile string, out io.Writer) error {
 		return err
 	}
 	defer func() { _ = l.Close() }()
-	go func() { _ = zmuxquic.Serve(ctx, l, ln, nil) }()
+	go func() { _ = zmuxquic.Serve(ctx, l, ln) }()
 	if _, err := fmt.Fprintln(out, "LISTEN", ln.Addr()); err != nil {
 		return err
 	}

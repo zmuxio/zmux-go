@@ -21,7 +21,7 @@ import (
 // decideWith is an Admission whose every decision is v, counted in n.
 func decideWith(v AdmissionVerdict, n *atomic.Int32) *Admission {
 	return &Admission{PeekTimeout: 5 * time.Second, StallMin: time.Millisecond, StallMax: time.Millisecond,
-		Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+		Decide: func(context.Context, CarrierInfo, []byte) Decision {
 			n.Add(1)
 			return Decision{Verdict: v}
 		}}
@@ -93,8 +93,8 @@ func TestAdmissionSource(t *testing.T) {
 	leakcheck.Check(t)
 	infos := make(chan CarrierInfo, 4)
 	release := make(chan struct{})
-	adm := &Admission{PeekTimeout: 5 * time.Second, Decide: func(ctx context.Context, info *CarrierInfo, _ []byte) Decision {
-		infos <- *info
+	adm := &Admission{PeekTimeout: 5 * time.Second, Decide: func(ctx context.Context, info CarrierInfo, _ []byte) Decision {
+		infos <- info
 		select {
 		case <-release:
 		case <-ctx.Done():
@@ -189,7 +189,7 @@ func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 func TestAdmissionStats(t *testing.T) {
 	leakcheck.Check(t)
 	ctx := context.Background()
-	run := func(adm *Admission, fallback func(context.Context, net.Conn), send []byte, tlsServer bool) ListenerStats {
+	run := func(adm *Admission, fallback func(context.Context, *Takeover), send []byte, tlsServer bool) ListenerStats {
 		t.Helper()
 		lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, Fallback: fallback})
 		defer func() { _ = lst.Close() }()
@@ -223,9 +223,9 @@ func TestAdmissionStats(t *testing.T) {
 		{"close", VerdictClose, false, AdmissionStats{Closed: 1}},
 		{"unknown", AdmissionVerdict(9), false, AdmissionStats{Closed: 1}},
 	} {
-		var fb func(context.Context, net.Conn)
+		var fb func(context.Context, *Takeover)
 		if x.fb {
-			fb = func(_ context.Context, c net.Conn) { _ = c.Close() }
+			fb = func(context.Context, *Takeover) {} // zmux closes the carrier
 		}
 		st := run(decideWith(x.v, &n), fb, nil, false)
 		if !eqAdm(st.Admission, x.want) || st.Rejected != 0 {
@@ -233,18 +233,18 @@ func TestAdmissionStats(t *testing.T) {
 		}
 	}
 	// A panic, and a Skip outside the prefix, are VerdictClose.
-	panicking := &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision { panic("decide") }}
+	panicking := &Admission{Decide: func(context.Context, CarrierInfo, []byte) Decision { panic("decide") }}
 	if st := run(panicking, nil, nil, false); !eqAdm(st.Admission, AdmissionStats{Closed: 1}) {
 		t.Fatalf("panic: %+v", st)
 	}
-	skip := &Admission{Peek: 2, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+	skip := &Admission{Peek: 2, Decide: func(context.Context, CarrierInfo, []byte) Decision {
 		return Decision{Verdict: VerdictAccept, Skip: 3}
 	}}
 	if st := run(skip, nil, []byte{1, 2}, false); !eqAdm(st.Admission, AdmissionStats{Closed: 1}) {
 		t.Fatalf("skip: %+v", st)
 	}
 	// Accepted: the carrier goes on to the listener, counted there once.
-	accept := &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{} }}
+	accept := &Admission{Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{} }}
 	if st := run(accept, nil, []byte("GET / HTTP/1.1\r\n\r\n"), false); !eqAdm(st.Admission, AdmissionStats{Accepted: 1}) || st.Rejected != 1 {
 		t.Fatalf("accept: %+v", st)
 	}
@@ -305,7 +305,7 @@ func TestAdmissionFakeClock(t *testing.T) {
 	leakcheck.Check(t)
 	t.Run("peek", func(t *testing.T) {
 		e := newFakeEnv(t, &Admission{Peek: 4, PeekTimeout: 10 * time.Second,
-			Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{} }}, 0)
+			Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{} }}, 0)
 		_, _ = e.peer.Write([]byte{1})
 		e.advance(t, 1, 10*time.Second-time.Nanosecond)
 		select {
@@ -321,7 +321,7 @@ func TestAdmissionFakeClock(t *testing.T) {
 	})
 	t.Run("decision deadline", func(t *testing.T) {
 		dls := make(chan time.Time, 1)
-		e := newFakeEnv(t, &Admission{PeekTimeout: 10 * time.Second, Decide: func(ctx context.Context, _ *CarrierInfo, _ []byte) Decision {
+		e := newFakeEnv(t, &Admission{PeekTimeout: 10 * time.Second, Decide: func(ctx context.Context, _ CarrierInfo, _ []byte) Decision {
 			dl, _ := ctx.Deadline()
 			<-ctx.Done()
 			dls <- dl
@@ -337,7 +337,7 @@ func TestAdmissionFakeClock(t *testing.T) {
 	})
 	t.Run("stall", func(t *testing.T) {
 		e := newFakeEnv(t, &Admission{PeekTimeout: time.Second, StallMin: 30 * time.Second, StallMax: 30 * time.Second,
-			Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }}, 0)
+			Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }}, 0)
 		go func() { _, _ = io.Copy(io.Discard, e.peer) }()
 		waitUntil(t, 5*time.Second, "stalled", func() bool { return e.lst.Stats().Admission.Stalled == 1 })
 		e.advance(t, 1, 30*time.Second-time.Nanosecond)
@@ -365,7 +365,7 @@ func TestAdmissionDecideCancel(t *testing.T) {
 	leakcheck.Check(t)
 	errc := make(chan error, 1)
 	started := make(chan struct{})
-	adm := &Admission{PeekTimeout: time.Minute, Decide: func(ctx context.Context, _ *CarrierInfo, _ []byte) Decision {
+	adm := &Admission{PeekTimeout: time.Minute, Decide: func(ctx context.Context, _ CarrierInfo, _ []byte) Decision {
 		close(started)
 		<-ctx.Done()
 		errc <- ctx.Err()
@@ -486,9 +486,15 @@ func TestAdmissionFallbackOnPeekTimeout(t *testing.T) {
 		cfg := mpConfig()
 		cfg.Clock = clk
 		got := make(chan net.Conn, 1)
+		hold := make(chan struct{}) // the carrier is the fallback's while it runs
 		e := &fakeEnv{clk: clk, done: make(chan struct{}),
 			lst: mustNewListener(&ListenerConfig{Config: cfg, Admission: adm,
-				Fallback: func(_ context.Context, c net.Conn) { got <- c }})}
+				Fallback: func(_ context.Context, tk *Takeover) {
+					c, _ := tk.Conn()
+					got <- c
+					<-hold
+				}})}
+		t.Cleanup(func() { close(hold) })
 		a, b := net.Pipe()
 		e.peer = b
 		go func() { _ = e.lst.HandlePipe(context.Background(), NetPipe(a), PipeHint{}); close(e.done) }()
@@ -521,7 +527,7 @@ func TestAdmissionFallbackOnPeekTimeout(t *testing.T) {
 		}
 		_ = c.Close()
 	}
-	decide := func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictAccept} }
+	decide := func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictAccept} }
 	t.Run("first read", func(t *testing.T) {
 		e, got := run(t, &Admission{Peek: 4, PeekTimeout: 10 * time.Second, FallbackOnPeekTimeout: true, Decide: decide}, []byte("ab"), 1)
 		replayed(t, e, got, "ab")
@@ -549,7 +555,7 @@ func TestAdmissionFallbackOnPeekTimeout(t *testing.T) {
 		}
 	})
 	t.Run("decision not returned", func(t *testing.T) {
-		block := func(ctx context.Context, _ *CarrierInfo, _ []byte) Decision { <-ctx.Done(); return Decision{} }
+		block := func(ctx context.Context, _ CarrierInfo, _ []byte) Decision { <-ctx.Done(); return Decision{} }
 		e, _ := run(t, &Admission{PeekTimeout: 10 * time.Second, FallbackOnPeekTimeout: true, Decide: block}, nil, 1)
 		e.ended(t)
 		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1}) {

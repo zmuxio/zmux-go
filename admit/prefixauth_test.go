@@ -73,12 +73,12 @@ func TestPrefixAuthHeaderVectors(t *testing.T) {
 		t.Fatal(err)
 	}
 	v.now = func() time.Time { return time.Unix(1767225600, 0) }
-	info := &zmux.CarrierInfo{Head: true, Request: &http.Request{Header: http.Header{
+	info := &zmux.CarrierInfo{Stage: zmux.StageHead, Request: &http.Request{Header: http.Header{
 		HeaderPrefixAuth: {"oKGio6SlpqeoqaqrrK2urz_tXlDcj8j84uli3bE9v64"}}}}
-	if d := v.Decide(context.Background(), info, nil); d != (zmux.Decision{Verdict: zmux.VerdictAccept}) {
+	if d := v.Decide(context.Background(), *info, nil); d != (zmux.Decision{Verdict: zmux.VerdictAccept}) {
 		t.Fatalf("unbound vector: %+v", d)
 	}
-	if d := v.Decide(context.Background(), info, nil); d.Verdict != zmux.VerdictFallback {
+	if d := v.Decide(context.Background(), *info, nil); d.Verdict != zmux.VerdictFallback {
 		t.Fatalf("replayed vector: %+v", d)
 	}
 }
@@ -115,7 +115,7 @@ func TestPrefixAuthHeader(t *testing.T) {
 			t.Fatal(err)
 		}
 		cs := c.ConnectionState()
-		return c, &zmux.CarrierInfo{TLS: &cs, Head: true}
+		return c, &zmux.CarrierInfo{TLS: &cs, Stage: zmux.StageHead}
 	}
 	header := func(info *zmux.CarrierInfo) string {
 		name, val, err := auth.Header(info)
@@ -224,16 +224,16 @@ func TestAdmissionStream(t *testing.T) {
 	adm := &zmux.Admission{Peek: PrefixTokenLen, PeekTimeout: 300 * time.Millisecond, Decide: v.Decide,
 		StallMin: 50 * time.Millisecond, StallMax: 100 * time.Millisecond}
 	got := make(chan []byte, 8)
-	fallback := func(_ context.Context, c net.Conn) {
+	fallback := func(_ context.Context, tk *zmux.Takeover) {
+		c, _ := tk.Conn()
 		b, _ := io.ReadAll(c)
 		got <- b
-		_, _ = c.Write([]byte("fallback"))
-		_ = c.Close()
+		_, _ = c.Write([]byte("fallback")) // zmux closes c on return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	var lst *zmux.Listener
-	serve := func(fb func(context.Context, net.Conn)) string {
+	serve := func(fb func(context.Context, *zmux.Takeover)) string {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)

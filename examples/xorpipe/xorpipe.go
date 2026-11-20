@@ -185,7 +185,7 @@ func (r *clientReader) Close() error { return r.c.Close() }
 // read with VerdictMore); anything else is closed.
 func Admission() *zmux.Admission {
 	return &zmux.Admission{Peek: 2, MaxPeek: HeaderLen,
-		Decide: func(_ context.Context, _ *zmux.CarrierInfo, prefix []byte) zmux.Decision {
+		Decide: func(_ context.Context, _ zmux.CarrierInfo, prefix []byte) zmux.Decision {
 			c, need := admit.ClassifyFirstBytes(prefix, zmux.FramingByteStream)
 			switch {
 			case c == admit.FirstBytesRecord:

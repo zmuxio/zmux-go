@@ -175,18 +175,19 @@ type ConnListener interface {
 // its handshake completed (one that used 0-RTT is closed without
 // admission): only once that stream is accepted are the connection's
 // further streams and lanes handed to l. A connection whose first stream
-// is not accepted is closed once the decision has been acted on; fallback,
-// when set, receives that stream on VerdictFallback with its bytes
-// replayed. Run it once per listener; it returns when ln is closed or ctx
-// ends, and the connections and sessions it accepted continue (close
+// is not accepted is closed once the decision has been acted on (on
+// VerdictFallback, once zmux.ListenerConfig.Fallback returned; it receives
+// that stream with its bytes replayed, and TakeoverConn gives its
+// connection). Run it once per listener; it returns when ln is closed or
+// ctx ends, and the connections and sessions it accepted continue (close
 // them to end them; closing ln leaves established connections alone).
-func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) error {
+func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener) error {
 	for {
 		qc, err := ln.Accept(ctx)
 		if err != nil {
 			return err
 		}
-		if err := ServeConn(ctx, l, qc, fallback); err != nil {
+		if err := ServeConn(ctx, l, qc); err != nil {
 			return err
 		}
 	}
@@ -216,7 +217,7 @@ func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener, fallback func
 // session (refused, stalled, fallback) is closed with code 0; one that did
 // stays open after its sessions end, for the client to close with the last
 // session's code, or its idle timeout.
-func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) error {
+func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn) error {
 	a, err := l.Adapter().Arrive(netip.AddrPort{}, addrPort(qc.RemoteAddr()))
 	if err != nil {
 		_ = qc.CloseWithError(0, "")
@@ -245,14 +246,14 @@ func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn, fallback fu
 		return nil
 	}
 	context.AfterFunc(qc.Context(), a.Release) // a connection without a stream gives its slot back when it ends
-	labels.Go(ctx, "quic-accept-pipes", func() { admitConn(ctx, qc, a, fallback) })
+	labels.Go(ctx, "quic-accept-pipes", func() { admitConn(ctx, qc, a) })
 	return nil
 }
 
 // admitConn admits qc by its first bidirectional stream once its handshake
 // completed, then accepts its streams: the bidirectional ones on this
 // goroutine, the lanes on another.
-func admitConn(ctx context.Context, qc *quic.Conn, a *zmux.Arrival, fallback func(context.Context, *quic.Conn, zmux.PipeIO)) {
+func admitConn(ctx context.Context, qc *quic.Conn, a *zmux.Arrival) {
 	select {
 	case <-qc.HandshakeComplete():
 	case <-qc.Context().Done():
@@ -274,11 +275,7 @@ func admitConn(ctx context.Context, qc *quic.Conn, a *zmux.Arrival, fallback fun
 		}
 		return
 	}
-	var fb func(context.Context, zmux.PipeIO)
-	if fallback != nil {
-		fb = func(ctx context.Context, p zmux.PipeIO) { fallback(ctx, qc, p) }
-	}
-	p, ok := a.Admit(ctx, streamPipe(qc, s), fb)
+	p, ok := a.Admit(ctx, streamPipe(qc, s))
 	if !ok {
 		_ = qc.CloseWithError(0, "")
 		return
@@ -771,4 +768,17 @@ func Candidate(addr string, tlsConf *tls.Config, qconf *quic.Config) zmux.Candid
 		p := NewConnPool(addr, tlsConf, qconf, cred, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 		return p.OpenPipe(ctx)
 	}}
+}
+
+// TakeoverConn returns the QUIC connection of a carrier that the admission
+// handed to zmux.ListenerConfig.Fallback, when it is a stream of one
+// (Serve, ServeConn); false otherwise. The connection is closed once the
+// fallback returned, as the stream is.
+func TakeoverConn(t *zmux.Takeover) (*quic.Conn, bool) {
+	cc, ok := t.Pipe().W.(zmux.CarrierConner)
+	if !ok {
+		return nil, false
+	}
+	qc, ok := cc.CarrierConn().(*quic.Conn)
+	return qc, ok && qc != nil
 }

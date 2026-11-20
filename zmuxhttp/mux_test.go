@@ -212,7 +212,7 @@ func echoOnce(t *testing.T, ctx context.Context, c, s *zmux.Conn) {
 func TestHTTPEarlyData(t *testing.T) {
 	leakcheck.Check(t)
 	var decided sync.Map
-	adm := &zmux.Admission{Decide: func(_ context.Context, info *zmux.CarrierInfo, _ []byte) zmux.Decision {
+	adm := &zmux.Admission{Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
 		decided.Store(info.Request.Method, true)
 		return zmux.Decision{Verdict: zmux.VerdictAccept}
 	}}
@@ -293,7 +293,7 @@ func TestHTTPTrustedSource(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got := make(chan string, 1)
-			adm := &zmux.Admission{Decide: func(_ context.Context, info *zmux.CarrierInfo, _ []byte) zmux.Decision {
+			adm := &zmux.Admission{Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
 				if !c.proxy && info.Peer.Addr() != netip.MustParseAddr("127.0.0.1") {
 					got <- "peer " + info.Peer.String() // the peer is the connection's
 				} else {

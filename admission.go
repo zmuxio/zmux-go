@@ -38,10 +38,14 @@ import (
 // handshake, an HTTP request's body), never more, and calls Decide with
 // what it read and the carrier's metadata; the Decision says what happens
 // to the carrier. On a message-framed carrier (FramingRecords, such as
-// WebSocket) the prefix is the carrier's first message, whole. Decide may
-// ask for more of a byte stream (VerdictMore, up to MaxPeek bytes), as a
-// host that tells several kinds of carrier apart by their first bytes
-// does (admit.ClassifyFirstBytes).
+// WebSocket) the prefix is the carrier's first message, whole (at most
+// MaxMessage bytes). Decide may ask for more of a byte stream
+// (VerdictMore, up to MaxPeek bytes), as a host that tells several kinds
+// of carrier apart by their first bytes does (admit.ClassifyFirstBytes
+// with CarrierInfo.Framing). An HTTP request carrier is decided on its
+// request head (CarrierInfo.Stage StageHead); on an upgrade's head
+// VerdictDefer decides again on the carrier's first message or bytes
+// once the upgrade completed (CarrierInfo.Upgrade).
 //
 // The fields are read by NewListener; an Admission must not be changed or
 // copied afterwards.
@@ -50,11 +54,12 @@ type Admission struct {
 	// valid only during the call. ctx ends at what remains of PeekTimeout
 	// and when the listener stops taking carriers (Close, or the end of
 	// Shutdown); a decision not returned by then is VerdictClose, and so
-	// is a panic. It is called once per carrier and once more after each
-	// VerdictMore, concurrently for different carriers, outside every
-	// lock. Decide must return once ctx ends: one that does not keeps its
+	// is a panic. It is called once per carrier, once more after each
+	// VerdictMore and once more after a VerdictDefer, concurrently for
+	// different carriers, outside every lock; info is each call's own
+	// copy. Decide must return once ctx ends: one that does not keeps its
 	// goroutine, the request and prefix past the carrier's end.
-	Decide func(ctx context.Context, info *CarrierInfo, prefix []byte) Decision
+	Decide func(ctx context.Context, info CarrierInfo, prefix []byte) Decision
 	// StallMin and StallMax bound the duration of a VerdictStall. The
 	// duration is a function of the carrier's source alone for the
 	// Listener's lifetime (Listener.StallDuration). When both are zero,
@@ -62,15 +67,23 @@ type Admission struct {
 	// StallMax between 30 s and 120 s, StallMin between a quarter and
 	// three quarters of it.
 	StallMin, StallMax time.Duration
-	// Peek is the number of bytes read before Decide (0: none). Decide
-	// receives fewer when the carrier ends first. On a message-framed
-	// carrier any Peek above 0 reads the first message, of at most
-	// max(Peek, MaxPeek) bytes; a longer one is VerdictClose.
+	// Peek is the number of bytes of a byte stream read before Decide (0:
+	// none). Decide receives fewer when the carrier ends first. On a
+	// message-framed carrier any Peek above 0, and a decision deferred to
+	// the carrier (VerdictDefer) with any Peek, reads the first message
+	// instead (MaxMessage).
 	Peek int
-	// MaxPeek bounds Decision.Need, the prefix that VerdictMore may ask
-	// for, and a first message (0: Peek, so that VerdictMore is
+	// MaxPeek bounds Decision.Need, the prefix of a byte stream that
+	// VerdictMore may ask for (0: Peek, so that VerdictMore is
 	// VerdictClose). It is not below Peek, or ErrInvalidConfig.
 	MaxPeek int
+	// MaxMessage bounds the first message that the decision on a
+	// message-framed carrier reads: a longer one is closed without a
+	// decision (AdmissionStats.TooLarge). Zero is MaxRecordSize, the
+	// largest record (the most a zmux first record can be); a host that
+	// decides on messages of its own sets the largest it accepts. Above
+	// MaxRecordSize it is ErrInvalidConfig.
+	MaxMessage int
 	// PeekTimeout bounds the reading of the prefix, every VerdictMore
 	// round included, and the decisions, from the end of the carrier's
 	// outer handshake (TLS). Zero selects a
@@ -96,6 +109,7 @@ type Admission struct {
 // admParams are the resolved bounds of an Admission.
 type admParams struct {
 	maxPeek            int // max(Peek, MaxPeek)
+	maxMessage         int // MaxMessage, MaxRecordSize for 0
 	peekTimeout        time.Duration
 	stallMin, stallMax time.Duration
 }
@@ -124,13 +138,63 @@ type CarrierInfo struct {
 	// its connection, or an HTTP request's RemoteAddr. Zero when it is not
 	// an IP address and port, such as a Unix socket.
 	Peer netip.AddrPort
-	// Head marks a carrier decided on its HTTP request head, before any
-	// body byte is read: an HTTP upgrade such as WebSocket or
+	// Stage is what of the carrier the decision is taken on: its request
+	// head (StageHead) or its start (StageCarrier, the zero value).
+	Stage AdmissionStage
+	// Framing is the carrier's framing at StageCarrier (the prefix is the
+	// start of a byte stream, or a first message with FramingRecords), as
+	// admit.ClassifyFirstBytes takes it; zero on a head.
+	Framing Framing
+	// Upgrade marks the carrier of an HTTP upgrade (WebSocket,
+	// WebTransport; ListenerAdapter.AdmitUpgrade), on its head and on the
+	// decision a VerdictDefer on that head takes on the carrier.
+	Upgrade bool
+}
+
+// AdmissionStage is what of a carrier a decision is taken on
+// (CarrierInfo.Stage).
+type AdmissionStage uint8
+
+const (
+	// StageCarrier is the carrier's start: the prefix is its first bytes
+	// (Peek, VerdictMore) or its first message.
+	StageCarrier AdmissionStage = iota
+	// StageHead is an HTTP request's head, before any body byte is read
+	// or the upgrade is answered: an HTTP upgrade such as WebSocket or
 	// WebTransport, an exchange carrier, or an HTTP request carrier
 	// without a body, such as a downlink GET. There is no prefix, and a
 	// credential travels in a request header field.
-	Head bool
+	StageHead
+)
+
+// Takeover is a carrier that the admission hands to the host
+// (ListenerConfig.Fallback): on VerdictFallback, or on a prefix that
+// Admission.FallbackOnPeekTimeout gave up on. What was read of it is
+// replayed: the bytes of a byte stream, the first message of a
+// message-framed carrier (always a whole binary message: a carrier whose
+// first read fails is closed without a decision). The carrier is the
+// host's for the call of Fallback only: zmux closes it when Fallback
+// returns, so a host that serves it stays in the call.
+type Takeover struct {
+	// Info is the carrier's metadata, as Decide saw it.
+	Info CarrierInfo
+	conn net.Conn
+	pipe PipeIO
 }
+
+// Pipe returns the carrier with what was read replayed: on a
+// message-framed carrier (Framing FramingRecords) its receiving half is a
+// MessageReader that returns the first message again first; its sending
+// half and the carrier capabilities zmux discovers (CarrierConner,
+// ConnectionStater, ...) are the carrier's own, except where Conn
+// applies, whose view both halves then are.
+func (t *Takeover) Pipe() PipeIO { return t.pipe }
+
+// Conn returns the carrier as a net.Conn when it is a byte stream on a
+// single net.Conn (TCP, TLS), sharing Pipe's replay: once the replayed
+// bytes are read, WriteTo and ReadFrom use the connection's own (splice
+// and sendfile where it offers them), and Unwrap returns it.
+func (t *Takeover) Conn() (net.Conn, bool) { return t.conn, t.conn != nil }
 
 // AdmissionVerdict is the outcome of an admission.
 type AdmissionVerdict uint8
@@ -139,11 +203,13 @@ const (
 	// VerdictAccept hands the carrier to the Listener, without the first
 	// Decision.Skip bytes of the prefix.
 	VerdictAccept AdmissionVerdict = iota
-	// VerdictFallback hands the carrier, with every byte read replayed, to
-	// the fallback target of its kind (ListenerConfig.Fallback for byte
-	// streams, zmuxhttp.Options.Next for HTTP carriers, the QUIC adapter's).
-	// Without one a stream carrier is stalled, and an HTTP request gets
-	// the server's not-found response.
+	// VerdictFallback hands the carrier, with every byte or message read
+	// replayed, to ListenerConfig.Fallback (a Takeover; without a Fallback
+	// it is stalled). A carrier that is an HTTP request, decided on its
+	// head or body, is a request rather than a carrier to take over: it is
+	// served by zmuxhttp.Options.Next (without one: the server's not-found
+	// response). The carrier of an upgrade decided after a VerdictDefer is
+	// a carrier: it goes to ListenerConfig.Fallback.
 	VerdictFallback
 	// VerdictStall reads and discards what arrives, sends nothing, and
 	// closes the carrier gracefully when the peer ends it or after a
@@ -159,8 +225,16 @@ const (
 	// PeekTimeout passes, and calls Decide again with the longer prefix.
 	// Need must exceed the prefix and not exceed MaxPeek, and VerdictMore
 	// after a carrier ended short of Need, on a message-framed carrier or
-	// on one decided on its request head is VerdictClose.
+	// on a request head is VerdictClose.
 	VerdictMore
+	// VerdictDefer completes an HTTP upgrade whose head is being decided
+	// (CarrierInfo.Upgrade, Stage StageHead) and decides again on the
+	// carrier: Decide is called with the same metadata at StageCarrier and
+	// the carrier's first message, or its first Peek bytes (the first
+	// stream of a WebTransport session). PeekTimeout runs on from the
+	// head's decision, and the carrier keeps its slots throughout. On any
+	// other decision it is VerdictClose.
+	VerdictDefer
 )
 
 // verdictFailed is the outcome of a carrier whose outer handshake failed:
@@ -202,7 +276,9 @@ type VariantStat struct {
 	Accepted, Fallback uint64
 	// Stalled counts VerdictStall decisions, StallOverflow included.
 	Stalled uint64
-	Closed  uint64
+	// Closed counts VerdictClose and the carriers closed without a
+	// decision of the variant (AdmissionStats.TooLarge: variant "").
+	Closed uint64
 }
 
 // MaxAdmissionVariants bounds the distinct Decision.Variant values a
@@ -229,6 +305,10 @@ type AdmissionStats struct {
 	// StallOverflow counts VerdictStall closed at once: the source held
 	// MaxPendingPerSource - 1 stalled carriers.
 	StallOverflow uint64
+	// TooLarge counts message-framed carriers closed because their first
+	// message held more than Admission.MaxMessage bytes, without a
+	// decision.
+	TooLarge uint64
 	// PeekTimedOut counts carriers whose prefix or decision did not
 	// arrive within PeekTimeout. A carrier that Admission.FallbackOnPeekTimeout
 	// takes to fallback is counted both here and in Fallback: the two
@@ -240,7 +320,7 @@ type AdmissionStats struct {
 }
 
 type admissionCounters struct {
-	accepted, fallback, stalled, closed, stallOverflow, peekTimedOut, handshakeFailed atomic.Uint64
+	accepted, fallback, stalled, closed, stallOverflow, tooLarge, peekTimedOut, handshakeFailed atomic.Uint64
 
 	variants map[string]*VariantStat
 	overflow *VariantStat // the variants past MaxAdmissionVariants
@@ -280,7 +360,7 @@ func (c *admissionCounters) variant(v string, verdict AdmissionVerdict) {
 
 func (c *admissionCounters) snapshot() AdmissionStats {
 	return AdmissionStats{Accepted: c.accepted.Load(), Fallback: c.fallback.Load(), Stalled: c.stalled.Load(),
-		Closed: c.closed.Load(), StallOverflow: c.stallOverflow.Load(), PeekTimedOut: c.peekTimedOut.Load(),
+		Closed: c.closed.Load(), StallOverflow: c.stallOverflow.Load(), TooLarge: c.tooLarge.Load(), PeekTimedOut: c.peekTimedOut.Load(),
 		HandshakeFailed: c.handshakeFailed.Load()}
 }
 
@@ -315,6 +395,8 @@ func (a *Admission) Validate() error {
 			a.err = fmt.Errorf("%w: Admission.Decide is nil", ErrInvalidConfig)
 		case a.Peek < 0 || a.MaxPeek < 0 || a.StallMin < 0 || a.StallMax < 0:
 			a.err = fmt.Errorf("%w: negative Admission field", ErrInvalidConfig)
+		case a.MaxMessage < 0 || a.MaxMessage > MaxRecordSize:
+			a.err = fmt.Errorf("%w: Admission.MaxMessage outside [0, %d]", ErrInvalidConfig, MaxRecordSize)
 		case a.MaxPeek != 0 && a.MaxPeek < a.Peek:
 			a.err = fmt.Errorf("%w: Admission.MaxPeek below Peek", ErrInvalidConfig)
 		case a.StallMin > a.StallMax:
@@ -323,7 +405,11 @@ func (a *Admission) Validate() error {
 		if a.err != nil {
 			return
 		}
-		r := admParams{maxPeek: max(a.Peek, a.MaxPeek), peekTimeout: a.PeekTimeout, stallMin: a.StallMin, stallMax: a.StallMax}
+		r := admParams{maxPeek: max(a.Peek, a.MaxPeek), maxMessage: a.MaxMessage, peekTimeout: a.PeekTimeout,
+			stallMin: a.StallMin, stallMax: a.StallMax}
+		if r.maxMessage == 0 {
+			r.maxMessage = MaxRecordSize
+		}
 		if r.peekTimeout == 0 {
 			r.peekTimeout = drawDuration(5*time.Second, 30*time.Second)
 		}
@@ -444,9 +530,18 @@ type Arrival struct {
 
 	value    any               // Decision.Value of that acceptance
 	slot     *core.PendingSlot // the slots Arrive took, until handed on
+	deferred *deferral         // a head decision deferred to the first carrier
 	variant  string            // Decision.Variant of that acceptance
 	mu       sync.Mutex
 	accepted bool // the admission accepted the carrier
+}
+
+// deferral is an upgrade's head decision deferred to its carrier
+// (VerdictDefer): the metadata of the second decision and the deadline
+// that runs on from the head's.
+type deferral struct {
+	deadline time.Time
+	info     CarrierInfo
 }
 
 // Arrive takes a slot of source and a slot of the listener for a carrier
@@ -514,8 +609,68 @@ func (a *Arrival) Release() {
 	a.mu.Lock()
 	slot := a.slot
 	a.slot = nil
+	dfr := a.deferred
+	a.deferred = nil
 	a.mu.Unlock()
+	if dfr != nil {
+		// A deferred decision that never came: its carrier did not arrive
+		// in time (PeekTimedOut) or ended first, also by the listener's
+		// stop (Closed).
+		if !a.l.clk.Now().Before(dfr.deadline) {
+			a.l.st.adm.peekTimedOut.Add(1)
+		} else {
+			a.l.st.adm.closed.Add(1)
+			a.l.st.adm.variant("", VerdictClose)
+		}
+	}
 	a.l.leave(slot)
+}
+
+// deferralContext is ctx, also ended when the listener stops taking
+// carriers and, while the arrival's decision is deferred to its carrier,
+// at that decision's deadline.
+func (a *Arrival) deferralContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := a.l.stopContext(ctx)
+	a.mu.Lock()
+	dfr := a.deferred
+	a.mu.Unlock()
+	if dfr == nil {
+		return ctx, cancel
+	}
+	dctx, dcancel := timeshim.WithDeadline(ctx, a.l.clk, dfr.deadline)
+	return dctx, func() { dcancel(); cancel() }
+}
+
+// AdmitFirst is Admit for an adapter whose first carrier comes after the
+// arrival's head decision (an HTTP upgrade): first completes the upgrade
+// or waits for the carrier (the first stream of a WebTransport session)
+// and returns it. While the decision is deferred (VerdictDefer) first
+// runs under a context that also ends at the decision's PeekTimeout and
+// when the listener stops taking carriers; a carrier that does not come
+// in time is counted (AdmissionStats.PeekTimedOut, or Closed on the
+// listener's stop). An error of first otherwise is the failure of the
+// arrival's outer handshake (HandshakeFailed), unless ctx ended. On an
+// error the arrival is released and the adapter closes what it
+// upgraded. The carrier then passes the admission as with Admit: on
+// VerdictAccept, and when the head was accepted already, AdmitFirst
+// returns it and true, to be handed on with HandlePipe.
+func (a *Arrival) AdmitFirst(ctx context.Context, first func(context.Context) (PipeIO, error)) (PipeIO, bool) {
+	fctx, cancel := a.deferralContext(ctx)
+	p, err := first(fctx)
+	ended := fctx.Err() != nil
+	cancel()
+	if err != nil {
+		if p.R != nil || p.W != nil {
+			closePipe(p)
+		}
+		if ended {
+			a.Release() // counts a deferral that the bound or ctx ended
+		} else {
+			a.HandshakeFailed()
+		}
+		return PipeIO{}, false
+	}
+	return a.Admit(ctx, p)
 }
 
 // HandshakeFailed records that the arrival's outer handshake (an HTTP
@@ -523,6 +678,9 @@ func (a *Arrival) Release() {
 // an Admission it counts as AdmissionStats.HandshakeFailed, otherwise as
 // a setup failure.
 func (a *Arrival) HandshakeFailed() {
+	a.mu.Lock()
+	a.deferred = nil // counted as the handshake's failure, not as a decision
+	a.mu.Unlock()
 	if a.l.cfg.Admission != nil {
 		a.l.st.adm.handshakeFailed.Add(1)
 	} else {
@@ -574,9 +732,11 @@ func (a *Arrival) accept() {
 
 // HandlePipe hands a carrier of the arrival to the listener and blocks for
 // the lifetime of its pipe, as Listener.HandlePipe does. The first carrier
-// passes the listener's admission (unless AdmitUpgrade decided it
-// already): its outer TLS handshake is completed, its prefix read and the
-// decision taken, and VerdictFallback hands a net.Conn carrier to
+// passes the listener's admission (unless it was accepted already; one
+// whose decision AdmitUpgrade deferred is decided here, on its first
+// message or bytes, although AdmitFirst is the upgrade adapters' entry,
+// which also bounds the wait for that carrier): its outer TLS handshake is completed, its
+// prefix read and the decision taken, and VerdictFallback hands it to
 // ListenerConfig.Fallback. Once the arrival is accepted, further
 // carriers of it (a QUIC connection's further streams) are handed on
 // without an admission, each taking a slot of the source. hint.Source is
@@ -593,30 +753,11 @@ func (a *Arrival) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error
 		l.countSetupFailure()
 		return err
 	}
-	if !a.isAccepted() {
-		q, prefix, v := a.admitPipe(ctx, p)
-		switch v {
-		case VerdictAccept:
-			p = q
-			a.accept()
-		case VerdictFallback:
-			if nc, ok := p.R.(net.Conn); ok && carrierio.SameHalf(p.W, p.R) && l.cfg.Fallback != nil {
-				a.Release()
-				// A peer reaches the host's fallback with any non-zmux bytes:
-				// its panic closes the carrier, not the process.
-				pc := prefixConn(nc, prefix)
-				if hostCall(l.cfg.Logger, "ListenerConfig.Fallback", func() error { l.cfg.Fallback(ctx, pc); return nil }) != nil {
-					closePipe(p)
-				}
-				return errRejected
-			}
-			a.stallPipe(ctx, p, false)
-			return errRejected
-		default:
-			return errRejected
-		}
+	q, ok := a.Admit(ctx, p)
+	if !ok {
+		return errRejected
 	}
-	run, err := a.Take(ctx, p, hint)
+	run, err := a.Take(ctx, q, hint)
 	if err != nil {
 		return err
 	}
@@ -658,36 +799,54 @@ func (a *Arrival) Take(ctx context.Context, p PipeIO, hint PipeHint) (run func(c
 }
 
 // Admit runs the listener's admission on p, the first carrier of the
-// arrival, for an adapter with a fallback target of its own: on
+// arrival, for an adapter that must know the outcome before it hands
+// further carriers on (a QUIC connection, a WebTransport session): on
 // VerdictAccept it returns p without the skipped bytes and true, to be
-// handed on with HandlePipe. Otherwise it has acted on the verdict and
-// returns false: VerdictFallback hands p, with every byte read replayed,
-// to fallback (nil: the carrier is stalled), VerdictStall stalls it and
-// VerdictClose closes it. Without an Admission it returns p and true.
-func (a *Arrival) Admit(ctx context.Context, p PipeIO, fallback func(context.Context, PipeIO)) (PipeIO, bool) {
+// handed on with HandlePipe or Take. Otherwise it has acted on the
+// verdict and returns false: VerdictFallback hands p, with every byte or
+// message read replayed, to ListenerConfig.Fallback (without one the
+// carrier is stalled) and returns once the fallback did, VerdictStall
+// stalls it and VerdictClose closes it. Without an Admission, or once the
+// arrival is accepted, it returns p and true. HandlePipe is Admit, Take
+// and the pipe's run in one.
+func (a *Arrival) Admit(ctx context.Context, p PipeIO) (PipeIO, bool) {
 	p = owned(p) // the peeks, their timers, a stall and the verdict close it through one closer
 	if a.isAccepted() {
 		return p, true
 	}
-	q, prefix, v := a.admitPipe(ctx, p)
+	q, prefix, info, v := a.admitPipe(ctx, p)
 	switch v {
 	case VerdictAccept:
 		a.accept()
 		return q, true
 	case VerdictFallback:
-		if fallback != nil {
-			a.Release()
-			if hostCall(a.l.cfg.Logger, "Admit fallback", func() error { fallback(ctx, PrefixedPipe(p, prefix)); return nil }) != nil {
-				closePipe(p)
-			}
-		} else {
-			a.stallPipe(ctx, p, false)
-		}
+		a.fallback(ctx, p, prefix, info)
 	default:
 		// VerdictStall, VerdictClose and a failed handshake: admitPipe
 		// has acted.
 	}
 	return PipeIO{}, false
+}
+
+// fallback hands p, with prefix replayed, to ListenerConfig.Fallback as a
+// Takeover and closes it when the call returns, the arrival's slots given
+// back first; without a Fallback it stalls p (not counted as a stall: the
+// decision was VerdictFallback). A panic of the fallback closes the
+// carrier, not the process: a peer reaches it with any non-zmux bytes.
+func (a *Arrival) fallback(ctx context.Context, p PipeIO, prefix []byte, info *CarrierInfo) {
+	l := a.l
+	if l.cfg.Fallback == nil {
+		a.stallPipe(ctx, p, false)
+		return
+	}
+	a.Release()
+	t := &Takeover{Info: *info, pipe: withPrefix(p, prefix)}
+	if nc, ok := p.R.(net.Conn); ok && p.Framing != FramingRecords && carrierio.SameHalf(p.W, p.R) {
+		t.conn = prefixConn(nc, prefix)
+		t.pipe.R, t.pipe.W = t.conn, t.conn // one replay for both views
+	}
+	_ = hostCall(l.cfg.Logger, "ListenerConfig.Fallback", func() error { l.cfg.Fallback(ctx, t); return nil })
+	closePipe(p)
 }
 
 // stopContext is ctx, also ended when the listener stops taking carriers.
@@ -698,11 +857,11 @@ func (l *Listener) stopContext(ctx context.Context) (context.Context, context.Ca
 }
 
 // admitPipe completes p's outer TLS handshake, reads its prefix and takes
-// the decision. On VerdictAccept q is p without the skipped bytes; on
-// VerdictFallback p is untouched and prefix what was read; otherwise p is
-// closed (VerdictStall: after nothing, the caller stalls only a fallback
-// without target; the decision's own stall has run).
-func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []byte, v AdmissionVerdict) {
+// the decision, or the decision an upgrade's head deferred to it. On
+// VerdictAccept q is p without the skipped bytes; on VerdictFallback p is
+// untouched, prefix what was read and info the carrier's metadata;
+// otherwise p is closed (VerdictStall: the decision's stall has run).
+func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []byte, info *CarrierInfo, v AdmissionVerdict) {
 	l := a.l
 	adm := l.cfg.Admission
 	ctx, cancel := l.stopContext(ctx)
@@ -715,56 +874,74 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 			closePipe(p)
 			l.st.adm.handshakeFailed.Add(1)
 			a.Release()
-			return PipeIO{}, nil, verdictFailed
+			return PipeIO{}, nil, nil, verdictFailed
 		}
 	}
+	a.mu.Lock()
+	dfr := a.deferred
+	a.deferred = nil
+	a.mu.Unlock()
 	deadline := l.clk.Now().Add(adm.r.peekTimeout)
-	info := &CarrierInfo{Source: a.src, Peer: a.peer}
+	info = &CarrierInfo{Source: a.src, Peer: a.peer}
 	if cs, ok := TerminatedTLS(p); ok {
 		info.TLS = &cs
 	}
+	if dfr != nil {
+		info, deadline = &dfr.info, dfr.deadline
+	}
+	info.Framing = p.Framing
 	var more peekMore
 	records := p.Framing == FramingRecords
 	tooLong := false
-	if adm.Peek > 0 && p.R != nil {
-		var fired, resumable bool
+	if (adm.Peek > 0 || records && dfr != nil) && p.R != nil {
+		var fired, resumable, failed bool
 		if records {
-			prefix, tooLong, fired = a.peekMessage(p, adm.r.maxPeek, deadline)
+			prefix, tooLong, failed, fired = a.peekMessage(ctx, p, adm.r.maxMessage, deadline)
 		} else {
-			prefix, fired, resumable = a.peekPipe(p, prefix, adm.Peek, deadline)
-			more = func(have []byte, need int) ([]byte, bool, bool) { return a.peekPipe(p, have, need, deadline) }
+			prefix, fired, resumable = a.peekPipe(ctx, p, prefix, adm.Peek, deadline)
+			more = func(have []byte, need int) ([]byte, bool, bool) { return a.peekPipe(ctx, p, have, need, deadline) }
 		}
 		if fired {
 			l.st.adm.peekTimedOut.Add(1)
 			if !resumable {
 				closePipe(p)
 				a.Release()
-				return PipeIO{}, nil, VerdictClose
+				return PipeIO{}, nil, nil, VerdictClose
 			}
 			a.count(Decision{Verdict: VerdictFallback})
-			return p, prefix, VerdictFallback
+			return p, prefix, info, VerdictFallback
+		}
+		if failed {
+			// Nothing to decide on, and nothing a fallback could be given
+			// back whole.
+			a.count(Decision{Verdict: VerdictClose})
+			closePipe(p)
+			a.Release()
+			return PipeIO{}, nil, nil, VerdictClose
 		}
 	}
 	var dd decided
 	if tooLong {
-		dd = decided{a.count(Decision{Verdict: VerdictClose}), prefix}
+		l.st.adm.tooLarge.Add(1)
+		l.st.adm.variant("", VerdictClose)
+		dd = decided{Decision{Verdict: VerdictClose}, prefix}
 	} else {
-		dd = a.decide(ctx, info, prefix, deadline, more, records)
+		dd = a.decide(ctx, info, prefix, deadline, more, records, false)
 	}
 	d := dd.Decision
 	prefix = dd.prefix
 	switch d.Verdict {
 	case VerdictAccept:
-		return withPrefix(p, prefix[d.Skip:]), nil, VerdictAccept
+		return withPrefix(p, prefix[d.Skip:]), nil, nil, VerdictAccept
 	case VerdictFallback:
-		return p, prefix, VerdictFallback
+		return p, prefix, info, VerdictFallback
 	case VerdictStall:
 		a.stallPipe(ctx, p, true)
-		return PipeIO{}, nil, VerdictStall
+		return PipeIO{}, nil, nil, VerdictStall
 	default: // VerdictClose
 		closePipe(p)
 		a.Release()
-		return PipeIO{}, nil, VerdictClose
+		return PipeIO{}, nil, nil, VerdictClose
 	}
 }
 
@@ -792,11 +969,12 @@ func pendingHandshake(p PipeIO) func(context.Context) error {
 type peekMore func(have []byte, need int) (prefix []byte, fired, resumable bool)
 
 // peekPipe reads p by deadline until have holds n bytes, and returns
-// them (fewer when the carrier ends); fired: the deadline passed first.
+// them (fewer when the carrier ends or ctx ends, which interrupts the
+// read); fired: the deadline passed first.
 // Then resumable: Admission.FallbackOnPeekTimeout is set and p's read
 // deadline is cleared again, so that prefix, the bytes read, is the carrier's
 // to fall back with; otherwise the carrier is closed.
-func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (prefix []byte, fired, resumable bool) {
+func (a *Arrival) peekPipe(ctx context.Context, p PipeIO, have []byte, n int, deadline time.Time) (prefix []byte, fired, resumable bool) {
 	var deadlined bool
 	done := make(chan struct{})
 	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
@@ -804,8 +982,16 @@ func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (pr
 		fired = true
 		deadlined = a.interruptRead(p)
 	})
+	stop := context.AfterFunc(ctx, func() { a.interruptRead(p) })
 	prefix = peek(p.R, have, n)
+	interrupted := !stop() // ctx ended: the read may have been cut short
 	if t.Stop() {
+		if interrupted {
+			// The carrier is no longer whole: close it; the decision
+			// that follows sees ctx ended and is VerdictClose.
+			closePipe(p)
+			return nil, false, false
+		}
 		return prefix, false, false
 	}
 	<-done // the timer's function has run
@@ -822,28 +1008,37 @@ func (a *Arrival) peekPipe(p PipeIO, have []byte, n int, deadline time.Time) (pr
 	return nil, true, false
 }
 
-// peekMessage reads the first message of a message-framed p by deadline
-// (none when the carrier ends or its half is no MessageReader), at most
-// limit; tooLong: it held more (read no further than limit+1 bytes).
-func (a *Arrival) peekMessage(p PipeIO, limit int, deadline time.Time) (msg []byte, tooLong, fired bool) {
+// peekMessage reads the first message of a message-framed p by deadline,
+// at most limit; tooLong: it held more (read no further than limit+1
+// bytes); failed: there is no first message to decide on (the carrier
+// ended or failed, sent a message that is not binary, has no
+// MessageReader, or ctx ended, which interrupts the read).
+func (a *Arrival) peekMessage(ctx context.Context, p PipeIO, limit int, deadline time.Time) (msg []byte, tooLong, failed, fired bool) {
 	mr, ok := p.R.(MessageReader)
 	if !ok {
-		return nil, false, false
+		return nil, false, true, false
 	}
 	done := make(chan struct{})
 	t := a.l.clk.AfterFunc(deadline.Sub(a.l.clk.Now()), func() {
 		defer close(done)
 		a.interruptRead(p)
 	})
+	stop := context.AfterFunc(ctx, func() { a.interruptRead(p) })
 	msg, err := mr.ReadMessage(limit)
+	interrupted := !stop() // ctx ended: the read may have been cut short
 	if !t.Stop() {
 		<-done // it fired: the carrier's reads have ended
-		return nil, false, true
+		return nil, false, false, true
 	}
-	if errors.Is(err, ErrMessageTooLarge) || len(msg) > limit {
-		return nil, true, false
+	switch {
+	case interrupted:
+		return nil, false, true, false
+	case errors.Is(err, ErrMessageTooLarge) || err == nil && len(msg) > limit:
+		return nil, true, false, false
+	case err != nil:
+		return nil, false, true, false
 	}
-	return bytes.Clone(msg), false, false
+	return bytes.Clone(msg), false, false, false
 }
 
 // interruptRead ends a blocked read of p: a passed read deadline where
@@ -866,10 +1061,12 @@ type decided struct {
 // again after each VerdictMore with the longer prefix that more reads (nil:
 // VerdictMore is VerdictClose), bounds the result and counts the outcome
 // (a stall's aggregate count is stallSlot's); whole: the prefix is a
-// message, replayed whole or not at all. A decision not returned in
-// time is VerdictClose.
+// message, replayed whole or not at all. With deferrable (an upgrade's
+// head) VerdictDefer is returned as it is, uncounted: the decision is
+// deferred to the carrier; elsewhere it is VerdictClose. A decision not
+// returned in time is VerdictClose.
 func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, deadline time.Time,
-	more peekMore, whole bool) decided {
+	more peekMore, whole, deferrable bool) decided {
 	l := a.l
 	dctx, cancel := timeshim.WithDeadline(ctx, l.clk, deadline)
 	defer cancel()
@@ -884,6 +1081,12 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 				l.st.adm.variant("", VerdictClose)
 			}
 			return decided{Decision{Verdict: VerdictClose}, prefix}
+		}
+		if d.Verdict == VerdictDefer {
+			if deferrable {
+				return decided{Decision{Verdict: VerdictDefer}, prefix}
+			}
+			return decided{a.count(Decision{Verdict: VerdictClose, Variant: d.Variant}), prefix}
 		}
 		if d.Verdict != VerdictMore {
 			d = d.bound(len(prefix))
@@ -911,12 +1114,15 @@ func (a *Arrival) decide(ctx context.Context, info *CarrierInfo, prefix []byte, 
 // callDecide runs Decide once; ok false: dctx ended first (a decision
 // returned after that is not used, however the select chose).
 func (a *Arrival) callDecide(dctx context.Context, info *CarrierInfo, prefix []byte) (Decision, bool) {
+	if dctx.Err() != nil {
+		return Decision{}, false // ended before the call: Decide is not run
+	}
 	res := make(chan Decision, 1)
 	labels.Go(dctx, "admission", func() {
 		d := Decision{Verdict: VerdictClose}
 		defer func() { res <- d }()
 		// A panicking decision is VerdictClose.
-		safeLog(a.l.cfg.Logger, "Admission.Decide", func() { d = a.l.cfg.Admission.Decide(dctx, info, prefix) })
+		safeLog(a.l.cfg.Logger, "Admission.Decide", func() { d = a.l.cfg.Admission.Decide(dctx, *info, prefix) })
 	})
 	var d Decision
 	select {
@@ -954,7 +1160,7 @@ func (a *Arrival) count(d Decision) Decision {
 		l.st.adm.fallback.Add(1)
 	case VerdictClose:
 		l.st.adm.closed.Add(1)
-	case VerdictStall, VerdictMore, verdictFailed:
+	case VerdictStall, VerdictMore, VerdictDefer, verdictFailed:
 		// A stall's aggregate is counted by stallSlot; More is never
 		// final: decide turns it into a longer prefix or a close, and
 		// bound turns a failure into a close.
@@ -1012,7 +1218,15 @@ func (a *Arrival) stallPipe(ctx context.Context, p PipeIO, counted bool) {
 	defer cancel()
 	t := a.l.clk.AfterFunc(d, func() { a.interruptRead(p) })
 	stop := context.AfterFunc(ctx, func() { a.interruptRead(p) })
-	discard(p.R)
+	if mr, ok := p.R.(MessageReader); ok && p.Framing == FramingRecords {
+		for {
+			if _, err := mr.ReadMessage(MaxRecordSize); err != nil {
+				break
+			}
+		}
+	} else {
+		discard(p.R)
+	}
 	stop()
 	t.Stop()
 	if cw, ok := p.W.(CloseWriter); ok {
@@ -1119,19 +1333,22 @@ func (p *prefixedConn) Unwrap() net.Conn { return p.Conn }
 // AdmitUpgrade takes r, the request of an HTTP upgrade (WebSocket,
 // WebTransport), as a carrier of l and runs l's admission on its head,
 // before anything is written to w: the decision gets no prefix,
-// CarrierInfo.Head is set, and the body is not read. Its source is what
+// CarrierInfo.Stage is StageHead and Upgrade is set, and the body is not
+// read. Its source is what
 // trusted resolves (TrustedProxies.RequestSource). A request that an
 // intermediary forwarded from TLS early data (Early-Data: 1, RFC 8470), or
 // read before the TLS handshake completed (0-RTT on HTTP/3), is answered
 // 425 (Too Early) first and is no carrier (EarlyRequest). On VerdictAccept
-// (or without an Admission) it returns the arrival and true: the caller
-// completes the upgrade and hands the carrier on with Arrival.HandlePipe,
-// or calls Arrival.HandshakeFailed. Otherwise it has answered r
+// (or without an Admission), and on VerdictDefer, which defers the
+// decision to the carrier, it returns the arrival and true: the caller
+// completes the upgrade and takes its first carrier through
+// Arrival.AdmitFirst, which also takes a deferred decision, and hands it
+// on with Arrival.HandlePipe. Otherwise it has answered r
 // (VerdictFallback, or a carrier the listener refuses, with fallback;
 // nil: http.NotFound) or ended it (VerdictStall, VerdictClose, which abort
 // the request with http.ErrAbortHandler), and the caller returns.
 func (a *ListenerAdapter) AdmitUpgrade(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
-	return (*Listener)(a).admitRequest(w, r, trusted, false, fallback)
+	return (*Listener)(a).admitRequest(w, r, trusted, reqUpgrade, fallback)
 }
 
 // AdmitRequest is AdmitUpgrade for a request whose body is the carrier:
@@ -1140,8 +1357,17 @@ func (a *ListenerAdapter) AdmitUpgrade(w http.ResponseWriter, r *http.Request, t
 // continues after the skipped bytes. On VerdictFallback r.Body replays
 // the bytes read.
 func (a *ListenerAdapter) AdmitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
-	return (*Listener)(a).admitRequest(w, r, trusted, true, fallback)
+	return (*Listener)(a).admitRequest(w, r, trusted, reqBody, fallback)
 }
+
+// reqKind is what of an HTTP request is its carrier.
+type reqKind uint8
+
+const (
+	reqHead    reqKind = iota // nothing after the head (an exchange carrier)
+	reqBody                   // the body (AdmitRequest)
+	reqUpgrade                // the connection after an upgrade (AdmitUpgrade)
+)
 
 // EarlyRequest reports whether r may have been received in TLS early
 // data: an intermediary forwarded it from early data (Early-Data: 1, RFC
@@ -1160,8 +1386,8 @@ func EarlyRequest(r *http.Request) bool {
 	return false
 }
 
-// admitRequest is AdmitUpgrade, and with body set AdmitRequest.
-func (l *Listener) admitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, body bool, fallback http.Handler) (*Arrival, bool) {
+// admitRequest is AdmitUpgrade and AdmitRequest.
+func (l *Listener) admitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, kind reqKind, fallback http.Handler) (*Arrival, bool) {
 	if EarlyRequest(r) {
 		w.WriteHeader(http.StatusTooEarly)
 		l.countSetupFailure() // it needs the handshake: no pipe input
@@ -1174,7 +1400,7 @@ func (l *Listener) admitRequest(w http.ResponseWriter, r *http.Request, trusted 
 		serveHTTP(fallback, w, r)
 		return nil, false
 	}
-	if !a.decideRequest(w, r, body, fallback) {
+	if !a.decideRequest(w, r, kind, fallback) {
 		return nil, false
 	}
 	return a, true
@@ -1196,12 +1422,13 @@ func serveHTTP(h http.Handler, w http.ResponseWriter, r *http.Request) {
 // VerdictClose it aborts the request with http.ErrAbortHandler. It returns
 // true on VerdictAccept, or without an Admission.
 func (a *Arrival) DecideRequest(w http.ResponseWriter, r *http.Request, fallback http.Handler) bool {
-	return a.decideRequest(w, r, false, fallback)
+	return a.decideRequest(w, r, reqHead, fallback)
 }
 
-// decideRequest is DecideRequest, and with body set the decision on the
-// start of the body (see AdmitRequest).
-func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body bool, fallback http.Handler) bool {
+// decideRequest is DecideRequest, the decision on the start of the body
+// (reqBody, see AdmitRequest) and on an upgrade's head, which may defer
+// it (reqUpgrade, see AdmitUpgrade).
+func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, kind reqKind, fallback http.Handler) bool {
 	l := a.l
 	adm := l.cfg.Admission
 	if adm == nil {
@@ -1212,7 +1439,7 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 	deadline := l.clk.Now().Add(adm.r.peekTimeout)
 	// A request without a body is decided on its head: one known to have
 	// none, or one whose body ends before its first byte.
-	head := !body || r.Body == nil || r.Body == http.NoBody
+	head := kind != reqBody || r.Body == nil || r.Body == http.NoBody
 	var prefix []byte
 	if !head && adm.Peek > 0 {
 		rc := http.NewResponseController(w)
@@ -1248,10 +1475,21 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, body boo
 			return b, false, false
 		}
 	}
-	info := &CarrierInfo{Source: a.src, Peer: a.peer, TLS: r.TLS, Request: r, Head: head}
-	dd := a.decide(ctx, info, prefix, deadline, more, false)
+	upgrade := kind == reqUpgrade
+	info := &CarrierInfo{Source: a.src, Peer: a.peer, TLS: r.TLS, Request: r, Upgrade: upgrade}
+	if head {
+		info.Stage = StageHead
+	}
+	dd := a.decide(ctx, info, prefix, deadline, more, false, upgrade)
 	d, prefix := dd.Decision, dd.prefix
 	switch d.Verdict {
+	case VerdictDefer: // the decision is the carrier's (AdmitFirst, HandlePipe)
+		dfr := &deferral{info: *info, deadline: deadline}
+		dfr.info.Stage = StageCarrier
+		a.mu.Lock()
+		a.deferred = dfr
+		a.mu.Unlock()
+		return true
 	case VerdictAccept:
 		if rest := prefix[d.Skip:]; len(rest) > 0 {
 			r.Body = httpx.ReplayBody(rest, r.Body, r.Body)

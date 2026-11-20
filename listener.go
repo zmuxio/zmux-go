@@ -147,12 +147,17 @@ type ListenerConfig struct {
 	// classified (FirstRecordTimeout) as a join or a new session. NewListener
 	// fails if it is invalid (Admission.Validate).
 	Admission *Admission
-	// Fallback receives the byte-stream carriers that the admission
-	// decides on with VerdictFallback, with every byte read replayed (once
-	// they are read, WriteTo and ReadFrom use the carrier's own, and Unwrap
-	// returns it); nil: they are stalled. It returns when it is done
-	// with c, and closes it. HTTP carriers fall back to zmuxhttp.Options.Next.
-	Fallback func(ctx context.Context, c net.Conn)
+	// Fallback takes over the carriers that the admission decides on with
+	// VerdictFallback, whatever entry point took them: byte streams (TCP,
+	// TLS, a QUIC or WebTransport stream) and message-framed carriers
+	// (WebSocket), the carrier of an upgrade decided after a VerdictDefer
+	// included, each with what was read replayed (Takeover); nil: they are
+	// stalled. It runs on the goroutine that handles the carrier, after
+	// the carrier's slots were given back; the carrier is the host's for
+	// the call only, and zmux closes it when Fallback returns. An HTTP
+	// request that is itself the carrier is taken over as a request
+	// instead, by zmuxhttp.Options.Next.
+	Fallback func(ctx context.Context, t *Takeover)
 	// WrapPipe, when set, is called once for every carrier the listener
 	// takes, whatever fed it (Serve, HandlePipe, the HTTP,
 	// exchange and adapter handlers), before the carrier is classified. It

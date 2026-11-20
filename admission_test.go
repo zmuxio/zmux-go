@@ -45,7 +45,7 @@ func selfSignedTLS(t testing.TB) (srv, cli *tls.Config) {
 // TestStallDurationBySource checks that a stall's duration is in the
 // interval and the same for every carrier from one source.
 func TestStallDurationBySource(t *testing.T) {
-	stall := func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }
+	stall := func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }
 	a := &Admission{Decide: stall, StallMin: time.Second, StallMax: 1000 * time.Second}
 	lst := mustNewListener(&ListenerConfig{Admission: a})
 	defer func() { _ = lst.Close() }()
@@ -83,7 +83,7 @@ func TestStallDurationBySource(t *testing.T) {
 // a slot for a new attempt.
 func TestStallCountsPerSource(t *testing.T) {
 	leakcheck.Check(t)
-	a := &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} },
+	a := &Admission{Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} },
 		StallMin: time.Minute, StallMax: time.Minute}
 	lst := mustNewListener(&ListenerConfig{MaxPendingPerSource: 3, Admission: a})
 	defer func() { _ = lst.Close() }()
@@ -122,7 +122,7 @@ func TestStallCountsPerSource(t *testing.T) {
 // decision.
 func TestAdmitBeforeHandshake(t *testing.T) {
 	decided := false
-	adm := &Admission{Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+	adm := &Admission{Decide: func(context.Context, CarrierInfo, []byte) Decision {
 		decided = true
 		return Decision{Verdict: VerdictAccept}
 	}}
@@ -132,7 +132,7 @@ func TestAdmitBeforeHandshake(t *testing.T) {
 			r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
 			r.TLS = &tls.ConnectionState{HandshakeComplete: false}
 			w := httptest.NewRecorder()
-			if _, ok := lst.admitRequest(w, r, nil, !upgrade, nil); ok || w.Code != http.StatusTooEarly {
+			if _, ok := lst.admitRequest(w, r, nil, map[bool]reqKind{false: reqBody, true: reqUpgrade}[upgrade], nil); ok || w.Code != http.StatusTooEarly {
 				t.Fatalf("admitted %v, status %d", ok, w.Code)
 			}
 		}
@@ -149,7 +149,7 @@ func TestAdmitBeforeHandshake(t *testing.T) {
 	defer func() { _ = lst.Close() }()
 	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
 	r.TLS = &tls.ConnectionState{HandshakeComplete: true}
-	a, ok := lst.admitRequest(httptest.NewRecorder(), r, nil, true, nil)
+	a, ok := lst.admitRequest(httptest.NewRecorder(), r, nil, reqBody, nil)
 	if !ok {
 		t.Fatal("refused a request after the handshake")
 	}
@@ -158,7 +158,7 @@ func TestAdmitBeforeHandshake(t *testing.T) {
 	r = httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
 	r.Header.Add("Early-Data", "0")
 	r.Header.Add("Early-Data", "1")
-	if w := httptest.NewRecorder(); func() bool { _, ok := lst.admitRequest(w, r, nil, true, nil); return ok }() || w.Code != http.StatusTooEarly {
+	if w := httptest.NewRecorder(); func() bool { _, ok := lst.admitRequest(w, r, nil, reqBody, nil); return ok }() || w.Code != http.StatusTooEarly {
 		t.Fatalf("second Early-Data field: status %d", w.Code)
 	}
 }
@@ -176,7 +176,7 @@ func (c addrConn) RemoteAddr() net.Addr { return c.remote }
 // each hold a pending slot under MaxPendingPerSource 1.
 func TestServeConnSource(t *testing.T) {
 	leakcheck.Check(t)
-	a := &Admission{Peek: 2, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+	a := &Admission{Peek: 2, Decide: func(context.Context, CarrierInfo, []byte) Decision {
 		return Decision{Verdict: VerdictAccept, Skip: 1}
 	}}
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1, FirstRecordTimeout: 10 * time.Second, Admission: a})
@@ -219,7 +219,7 @@ func TestCloseEndsFallbackStall(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: 4, PeekTimeout: 5 * time.Second,
 		StallMin: time.Minute, StallMax: time.Minute,
-		Decide: func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictFallback} }}})
+		Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictFallback} }}})
 	a, b := net.Pipe()
 	defer func() { _ = a.Close() }()
 	done := make(chan struct{})
@@ -252,7 +252,7 @@ func TestSourcePrefixes(t *testing.T) {
 			t.Fatalf("%+v: %v", lc, err)
 		}
 	}
-	stall := func(context.Context, *CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }
+	stall := func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }
 	a := &Admission{Decide: stall, StallMin: time.Second, StallMax: 1 << 40}
 	lst := mustNewListener(&ListenerConfig{MaxPendingPerSource: 2, SourcePrefixV4: 24, SourcePrefixV6: 56, Admission: a})
 	defer func() { _ = lst.Close() }()

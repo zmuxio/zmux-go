@@ -143,7 +143,10 @@ func httpPipe(ctx context.Context, client *http.Client, rawURL string, t *Target
 		addHeader(req.Header, h)
 		if cred != nil {
 			peer, _ := netip.ParseAddrPort(req.URL.Host)
-			info := &zmux.CarrierInfo{Peer: peer, Head: up == nil}
+			info := &zmux.CarrierInfo{Peer: peer}
+			if up == nil {
+				info.Stage = zmux.StageHead
+			}
 			if up == nil {
 				var name, value string
 				if name, value, err = cred.Header(info); err == nil {

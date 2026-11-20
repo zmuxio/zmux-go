@@ -22,7 +22,7 @@ func TestAdmittedValue(t *testing.T) {
 	var mu sync.Mutex
 	var wrapped []any
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), InstanceID: []byte("inst"),
-		Admission: &Admission{PeekTimeout: 5 * time.Second, Decide: func(context.Context, *CarrierInfo, []byte) Decision {
+		Admission: &Admission{PeekTimeout: 5 * time.Second, Decide: func(context.Context, CarrierInfo, []byte) Decision {
 			return Decision{Verdict: VerdictAccept, Value: fmt.Sprintf("v%d", n.Add(1))}
 		}},
 		WrapPipe: WrapPipeFunc(func(_ context.Context, p PipeIO, h PipeHint) (PipeIO, error) {

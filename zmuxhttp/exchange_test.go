@@ -673,7 +673,7 @@ func TestHTTPExchangeBodySize(t *testing.T) {
 // with the fallback before any admission.
 func TestExchangeHandlerClass(t *testing.T) {
 	decided := false
-	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Decide: func(context.Context, *zmux.CarrierInfo, []byte) zmux.Decision {
+	l := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 		decided = true
 		return zmux.Decision{Verdict: zmux.VerdictAccept}
 	}}})

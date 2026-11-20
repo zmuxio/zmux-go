@@ -190,7 +190,7 @@ func TestInteropQUICServer(t *testing.T) {
 	defer cancel()
 	l := mustNewListener(&zmux.ListenerConfig{Config: interopConfig(nil)})
 	defer func() { _ = l.Close() }()
-	go func() { _ = Serve(ctx, l, ln, nil) }()
+	go func() { _ = Serve(ctx, l, ln) }()
 	p := startPeer(t, "quic-client", ln.Addr().String())
 	c, err := l.Accept(ctx)
 	if err != nil {
@@ -407,7 +407,7 @@ func TestInteropQUICExporterEarlyFromPeerClient(t *testing.T) {
 	defer cancel()
 	l := mustNewListener(&zmux.ListenerConfig{Config: exporterConfig(nil)})
 	defer func() { _ = l.Close() }()
-	go func() { _ = Serve(ctx, l, ln, nil) }()
+	go func() { _ = Serve(ctx, l, ln) }()
 	p := startPeer(t, "quic-client", holdRelay(t, ln.Addr().String(), exporterHold), "exporter")
 	c, err := l.Accept(ctx)
 	if err != nil {

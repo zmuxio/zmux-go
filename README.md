@@ -606,16 +606,25 @@ whatever entry point took it: `Listener.Serve` and `HandlePipe`,
 `zmuxh3.NewHandler` and `zmuxquic.Serve`. Every entry runs the same steps: the carrier takes a
 slot of the listener (`MaxPending`) and of its source (`MaxPendingPerSource`) before its outer handshake
 (TLS, an HTTP upgrade, QUIC), the admission reads up to `Peek` bytes (on a
-message-framed carrier its first message) and
-calls `Decide` with them and the carrier's metadata (`CarrierInfo`: its
-`Source` and `Peer`, TLS state, HTTP request), then `WrapPipe` runs and the
-carrier is classified. `Decide` gets a context that ends with what remains
-of `PeekTimeout` and when the listener stops. Its `AdmissionVerdict` accepts the carrier
-(without the bytes it skips), hands it with every byte read to the
-fallback of its kind (`ListenerConfig.Fallback` for byte streams,
-`zmuxhttp.Options.Next` for HTTP, the `fallback` of `zmuxquic.Serve`), stalls
-it, or closes it; `VerdictMore` reads a longer prefix (up to `MaxPeek`)
-and decides again, and `Decision.Variant` labels the carrier, counted per
+message-framed carrier its first message, at most `MaxMessage` bytes, by
+default the largest record) and calls `Decide` with them and the carrier's
+metadata (`CarrierInfo`: its `Source` and `Peer`, TLS state, HTTP request,
+`Stage` — the request head or the carrier's start — and `Framing`), then
+`WrapPipe` runs and the carrier is classified. `Decide` gets a context that
+ends with what remains of `PeekTimeout` and when the listener stops. Its
+`AdmissionVerdict` accepts the carrier (without the bytes it skips), hands it
+to the host with what was read replayed, stalls it, or closes it;
+`VerdictMore` reads a longer prefix of a byte stream (up to `MaxPeek`) and
+decides again. The host takes over a carrier in `ListenerConfig.Fallback`,
+which gets a `Takeover` (the metadata, the carrier as a `PipeIO`, and as a
+`net.Conn` where it is one) and owns it for the call: zmux closes it when
+`Fallback` returns. An HTTP request that is itself the carrier is taken over
+as a request instead, by `zmuxhttp.Options.Next`. On the head of an HTTP
+upgrade (WebSocket, WebTransport; `CarrierInfo.Upgrade`) `VerdictDefer`
+completes the upgrade and decides again on the carrier's first message (or
+the first `Peek` bytes of the first WebTransport stream), within the same
+`PeekTimeout`; that decision may accept the carrier, hand it to
+`ListenerConfig.Fallback`, stall it or close it. `Decision.Variant` labels the carrier, counted per
 label in `Listener.VariantStats` (one of a few host constants, never derived
 from the peer's bytes; past `MaxAdmissionVariants` labels share one bucket). A source holds at most `MaxPendingPerSource - 1` stalled
 carriers, and a stall lasts the same duration for every carrier from one
@@ -702,7 +711,7 @@ in events, statistics, shaping and `CarrierCache` (with
 conn, err := zmuxquic.Dial(ctx, "example.com:4433", tlsConf, nil, nil)
 ```
 
-On the server, `zmuxquic.Serve(ctx, l, ln, nil)` hands the streams of a QUIC
+On the server, `zmuxquic.Serve(ctx, l, ln)` hands the streams of a QUIC
 listener to a `zmux.Listener`; `zmuxquic.ServeConn` serves one QUIC
 connection the caller already accepted or dialled, such as one made by hole
 punching. `zmuxh3.Dial` and `zmuxh3.Serve` do the same for WebTransport
