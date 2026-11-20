@@ -14,19 +14,29 @@ func TestDeadTimeoutOff(t *testing.T) {
 	for _, d := range []time.Duration{-1, -time.Hour, math.MinInt64} {
 		pl := PipeLiveness{DeadTimeout: d}
 		cl, err := pl.core()
-		if err != nil || cl.DeadTimeout != -1 {
-			t.Fatalf("pipe %v: %v, %v", d, cl.DeadTimeout, err)
+		if err != nil {
+			t.Fatalf("pipe %v: %v", d, err)
+		}
+		if cl.DeadTimeout != -1 {
+			t.Fatalf("pipe %v: %v", d, cl.DeadTimeout)
 		}
 		l := Liveness{DeadTimeout: d}
 		sl, err := l.core()
-		if err != nil || sl.DeadTimeout != -1 {
-			t.Fatalf("session %v: %v, %v", d, sl.DeadTimeout, err)
+		if err != nil {
+			t.Fatalf("session %v: %v", d, err)
+		}
+		if sl.DeadTimeout != -1 {
+			t.Fatalf("session %v: %v", d, sl.DeadTimeout)
 		}
 	}
 	for _, d := range []time.Duration{time.Second, math.MaxInt64} {
 		pl := PipeLiveness{DeadTimeout: d}
-		if cl, err := pl.core(); err != nil || cl.DeadTimeout != int64(d) {
-			t.Fatalf("pipe %v: %v, %v", d, cl.DeadTimeout, err)
+		cl, err := pl.core()
+		if err != nil {
+			t.Fatalf("pipe %v: %v", d, err)
+		}
+		if cl.DeadTimeout != int64(d) {
+			t.Fatalf("pipe %v: %v", d, cl.DeadTimeout)
 		}
 	}
 	pl := PipeLiveness{DeadTimeout: time.Second - 1}

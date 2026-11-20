@@ -771,8 +771,8 @@ func (a *Arrival) deferralContext(ctx context.Context) (context.Context, context
 // in time is counted (AdmissionStats.PeekTimedOut, or Closed on the
 // listener's stop). An error of first otherwise is the failure of the
 // arrival's outer handshake (HandshakeFailed), unless ctx ended. On an
-// error the arrival is released and the adapter closes what it
-// upgraded. The carrier then passes the admission as with Admit: on
+// error first returns no carrier: it closes what it upgraded, and the
+// arrival is released. The carrier then passes the admission as with Admit: on
 // VerdictAccept, and when the head was accepted already, AdmitFirst
 // returns it and true, to be handed on with HandlePipe.
 func (a *Arrival) AdmitFirst(ctx context.Context, first func(context.Context) (PipeIO, error)) (PipeIO, bool) {
@@ -781,9 +781,6 @@ func (a *Arrival) AdmitFirst(ctx context.Context, first func(context.Context) (P
 	ended := fctx.Err() != nil
 	cancel()
 	if err != nil {
-		if p.R != nil || p.W != nil {
-			closePipe(p)
-		}
 		if ended {
 			a.Release() // counts a deferral that the bound or ctx ended
 		} else {
