@@ -240,7 +240,9 @@ type RetransReporter interface{ Retransmitted() (n uint64, ok bool) }
 // ReportsFailure true means that when the path under the carrier fails,
 // its reads or writes fail (an error, a reset, an unexpected end), as a
 // stream of an outer zmux session does when that session's liveness ends
-// it (StreamPipe, Conn.OpenPipeStream). Either half may report it. Stall
+// it (StreamPipe, Conn.OpenPipeStream). The carrier reports it only when
+// every half does: a split carrier with one plain half (a raw
+// connection, which can stall silently) keeps stall detection. Stall
 // detection then never fails the pipe: a carrier queued behind a rate
 // limit stalls without being dead, and its own end is the failure signal.
 // The pipe still turns suspect and is avoided and probed while it

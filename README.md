@@ -325,7 +325,9 @@ turns suspect and traffic moves away from it, but only its carrier's error
 or end (or its removal) fails it. It is off by default on carriers that
 report their own failure (`zmux.FailureReporter`), such as `StreamPipe` and
 `Conn.OpenPipeStream`, whose outer session ends them when its path fails;
-a pipe's own `DeadTimeout` overrides that.
+a carrier split into halves reports it only when both halves do, so a raw
+connection half keeps stall-based failure; a pipe's own `DeadTimeout`
+overrides that.
 `Conn.RaiseIncomingStreams` raises the incoming stream limits, for example
 after the peer has authenticated; the limits only grow. `zmux.MaxStreamCredit`
 (2^60) is the largest stream credit, the value of `MaxIncomingStreams`,

@@ -99,6 +99,9 @@ func (r *stPipeR) CarrierConn() any { return r.outer }
 // queues or rate limits never fails the nested pipe.
 func (r *stPipeR) ReportsFailure() bool { return true }
 
+// ReportsFailure: as the receiving half's, for the same stream.
+func (w *stPipeW) ReportsFailure() bool { return true }
+
 func (w *stPipeW) Write(p []byte) (int, error) { return w.s.Write(p) }
 
 // WriteBatch hands a batch of the nested session to the outer stream

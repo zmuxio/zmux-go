@@ -289,10 +289,18 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 	return info
 }
 
-// reportsFailure reports whether a half of p reports its carrier's own
-// failure (FailureReporter).
+// reportsFailure reports whether p's carrier reports its own failure
+// (FailureReporter): every half p has must report it, since a half that
+// does not (a raw connection) can stall silently beside one that does.
+// One value as both halves counts once.
 func reportsFailure(p PipeIO) bool {
-	return halfReportsFailure(p.W) || halfReportsFailure(p.R)
+	switch {
+	case p.R == nil:
+		return halfReportsFailure(p.W)
+	case p.W == nil:
+		return halfReportsFailure(p.R)
+	}
+	return halfReportsFailure(p.W) && halfReportsFailure(p.R)
 }
 
 // newPipeDrv prepares the driver of an attachment (under the lock).

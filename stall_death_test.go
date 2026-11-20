@@ -54,6 +54,37 @@ func TestStreamPipeReportsFailure(t *testing.T) {
 	}
 }
 
+// A split carrier reports its own failure only when every half does: a
+// plain half beside a stream keeps stall-based failure, through the views.
+func TestSplitCarrierReportsFailure(t *testing.T) {
+	a, b := streamPipe(&Stream{}, nil), streamPipe(&Stream{}, nil)
+	cases := []struct {
+		name string
+		p    PipeIO
+		want bool
+	}{
+		{"plain writer", PipeIO{R: a.R, W: nopWriter{}}, false},
+		{"plain reader", PipeIO{R: &msgHalf{}, W: a.W}, false},
+		{"both report", PipeIO{R: a.R, W: b.W}, true},
+		{"writer only", PipeIO{W: a.W}, true},
+	}
+	for _, c := range cases {
+		views := map[string]PipeIO{
+			"direct": c.p,
+			"prefix": withPrefix(c.p, []byte("x")),
+			"sealed": SealRecords(c.p, nopSealer{}, nil, RecordSealed, nil),
+		}
+		if c.p.R == nil {
+			delete(views, "prefix") // a prefix is read data
+		}
+		for v, p := range views {
+			if got := carrierInfo(p, tcpInfo{}, false).OwnFailure; got != c.want {
+				t.Errorf("%s, %s: OwnFailure %v, want %v", c.name, v, got, c.want)
+			}
+		}
+	}
+}
+
 type nopSealer struct{}
 
 func (nopSealer) Overhead() int                      { return 16 }

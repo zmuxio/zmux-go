@@ -818,8 +818,8 @@ func (r *sealedReader) ExportKeyingMaterial(l string, c []byte, n int) ([]byte, 
 }
 func (r *sealedReader) RecordMode() RecordMode { return r.mode }
 
-// ReportsFailure forwards the lower carrier's: sealed records fail when it
-// fails.
+// ReportsFailure forwards the lower carrier's (both halves alike): sealed
+// records fail when it fails.
 func (r *sealedReader) ReportsFailure() bool { return reportsFailure(r.lower) }
 
 type sealedWriter struct {
@@ -907,6 +907,10 @@ func (w *sealedWriter) Abort(err error) {
 		a.Abort(err)
 	}
 }
+
+// ReportsFailure forwards the lower carrier's, as the reader does.
+func (w *sealedWriter) ReportsFailure() bool { return reportsFailure(w.lower) }
+
 func (w *sealedWriter) MaxRecord() int { return SealedMaxRecord }
 func (w *sealedWriter) ExportKeyingMaterial(l string, c []byte, n int) ([]byte, error) {
 	return w.exp.ExportKeyingMaterial(l, c, n)
