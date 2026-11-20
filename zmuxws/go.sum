@@ -2,5 +2,5 @@ github.com/djylb/netx v0.0.0-20261120005204-a5e31d2ce17e h1:HEHdHsl1uuALHkvgtpaG
 github.com/djylb/netx v0.0.0-20261120005204-a5e31d2ce17e/go.mod h1:Zi8xVsLCr7IPHcf3i+iSygxEeW623tZPjrFOcQ8T0no=
 github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc h1:sDzU+rT2s2drGdRiHb/0gAIAkPmAD3krLKkHE3vTrRE=
 github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
-github.com/zmuxio/zmux-go v1.5.4 h1:HZZ/mMUmawvBdy3DLWFMX4vBLKBC6eff4R4DKqN7p9g=
-github.com/zmuxio/zmux-go v1.5.4/go.mod h1:eUoY7fIjEY0/XVJEoAV+NtnKl1S8ilR4wAydQ3/7cf0=
+github.com/zmuxio/zmux-go v1.5.5 h1:BQ9LOaZaT98WSuDjUSC7SX4Pm3nJ0LDcPDT1G7A7YNE=
+github.com/zmuxio/zmux-go v1.5.5/go.mod h1:l9LNVp2CZcFbWmvylPu7AYDkGk27tUS0UBreDADjKQM=

@@ -122,6 +122,13 @@ func (r *rawReader) CarrierConn() any {
 	return nil
 }
 
+// ReportsFailure is the receiving half of the carrier's: sealing adds no
+// failure of its own (zmux.FailureReporter).
+func (r *rawReader) ReportsFailure() bool {
+	f, ok := r.base.R.(zmux.FailureReporter)
+	return ok && f.ReportsFailure()
+}
+
 // channelReader adds the carrier's datagram channel.
 type channelReader struct {
 	*rawReader
@@ -147,6 +154,12 @@ func newRawWriter(w io.WriteCloser, c rawCommon) io.WriteCloser {
 		return &reportingWriter{base}
 	}
 	return base
+}
+
+// ReportsFailure is the sending half of the carrier's (zmux.FailureReporter).
+func (w *rawWriter) ReportsFailure() bool {
+	f, ok := w.base.W.(zmux.FailureReporter)
+	return ok && f.ReportsFailure()
 }
 
 // NetConn is the connection below a TLS or TCP carrier, for the socket's statistics.
