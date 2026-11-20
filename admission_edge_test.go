@@ -107,3 +107,36 @@ func TestTakePendingLimitRejects(t *testing.T) {
 		t.Fatal("the refused carrier was not closed")
 	}
 }
+
+// emptyMsgHalf is a message-framed half whose first message is empty.
+type emptyMsgHalf struct{ closed atomic.Int32 }
+
+func (h *emptyMsgHalf) Read([]byte) (int, error)        { return 0, nil }
+func (h *emptyMsgHalf) ReadMessage(int) ([]byte, error) { return []byte{}, nil }
+func (h *emptyMsgHalf) Write(p []byte) (int, error)     { return len(p), nil }
+func (h *emptyMsgHalf) Close() error                    { h.closed.Add(1); return nil }
+
+// TestAdmitEmptyFirstMessageCloses closes a message-framed carrier whose
+// first message is empty without calling Decide: a takeover could not
+// replay an empty message.
+func TestAdmitEmptyFirstMessageCloses(t *testing.T) {
+	var decided atomic.Int32
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: 1, PeekTimeout: time.Minute,
+		Decide: func(context.Context, CarrierInfo, []byte) Decision {
+			decided.Add(1)
+			return Decision{Verdict: VerdictFallback}
+		}}})
+	defer func() { _ = lst.Close() }()
+	src := netip.MustParseAddrPort("192.0.2.1:1")
+	a, err := lst.Adapter().Arrive(src, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &emptyMsgHalf{}
+	if _, ok := a.Admit(context.Background(), PipeIO{R: h, W: h, Framing: FramingRecords}); ok {
+		t.Fatal("admitted")
+	}
+	if decided.Load() != 0 || h.closed.Load() == 0 {
+		t.Fatalf("Decide called %d times, closed %d times", decided.Load(), h.closed.Load())
+	}
+}

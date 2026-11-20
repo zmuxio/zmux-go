@@ -191,7 +191,9 @@ func NetPipe(c net.Conn) PipeIO { return PipeIO{R: c, W: c} }
 // only by a transparent transform (such as compression), never by one
 // that terminates its own handshake, which reports its own state or none,
 // so that TerminatedTLS and Exporter describe the innermost handshake;
-// LaneOpener is offered only when every lane can be wrapped alike.
+// LaneOpener is offered only when every lane can be wrapped alike;
+// FailureReporter may be forwarded by any transform that fails when the
+// carrier below it fails.
 
 // ConnectionStater is a half whose TLS (or QUIC) handshake this process
 // runs: the state behind TerminatedTLS and CarrierInfo.TLS. A state
@@ -207,6 +209,11 @@ type ConnectionStater interface {
 type Handshaker interface {
 	HandshakeContext(ctx context.Context) error
 }
+
+// NetConner is a half over a connection that it names: the connection
+// below it, as a TLS connection's NetConn. The listener measures the TCP
+// socket under a half through it (Unsent, Retransmitted).
+type NetConner interface{ NetConn() net.Conn }
 
 // CloseWriter is a sending half with a graceful end of its write side,
 // used instead of Close when the session ends its sending.
@@ -228,6 +235,17 @@ type UnsentReporter interface{ Unsent() (n uint64, ok bool) }
 // retransmitted; ok false when it cannot tell. Queried as Unsent is, at
 // most once a second (PipeStats.BytesRetransmitted, LossRate).
 type RetransReporter interface{ Retransmitted() (n uint64, ok bool) }
+
+// FailureReporter is a half whose carrier reports its own failure:
+// ReportsFailure true means that when the path under the carrier fails,
+// its reads or writes fail (an error, a reset, an unexpected end), as a
+// stream of an outer zmux session does when that session's liveness ends
+// it (StreamPipe, Conn.OpenPipeStream). Either half may report it. Stall
+// detection then never fails the pipe: a carrier queued behind a rate
+// limit stalls without being dead, and its own end is the failure signal.
+// The pipe still turns suspect and is avoided and probed while it
+// stalls. An explicit PipeLiveness.DeadTimeout of the pipe overrides it.
+type FailureReporter interface{ ReportsFailure() bool }
 
 // LaneOpener is a half whose carrier opens further write lanes
 // (lanes): each a writer of whole records.
@@ -414,22 +432,6 @@ func Exporter(p PipeIO) (e KeyingMaterialExporter, ok bool) {
 		}
 	}
 	return nil, false
-}
-
-// unprefixed is the half behind what classification read back.
-func unprefixed(x any) any {
-	for {
-		switch v := x.(type) {
-		case *prefixReader:
-			x = v.r
-		case *prefixMessages:
-			x = v.r
-		case readOnly:
-			x = v.r
-		default:
-			return x
-		}
-	}
 }
 
 // exporterOf is Exporter for one half of a pipe.

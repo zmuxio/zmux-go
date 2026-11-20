@@ -120,7 +120,9 @@ func offered(protocols []string) ([]string, error) {
 // answered with 101 (zmux.Arrival.AdmitFirst), and the decision on that
 // message accepts the connection as above, or hands it, the message
 // replayed, to zmux.ListenerConfig.Fallback, or stalls or closes it; the
-// handler returns once that is done. A request forwarded from
+// handler returns once that is done (a connection over an HTTP/2 stream
+// that the host detached, zmux.Takeover.Detach, keeps it until the host
+// closes the connection or the request ends). A request forwarded from
 // early data is answered 425 (Too Early). o may be nil; an invalid o is an
 // error.
 //
@@ -553,7 +555,7 @@ func (p *carrier) Close() error { return p.c.Close() }
 // without a close frame.
 func (p *carrier) Abort(error) {
 	nc := p.c.NetConn()
-	if tc, ok := nc.(interface{ NetConn() net.Conn }); ok {
+	if tc, ok := nc.(zmux.NetConner); ok {
 		nc = tc.NetConn()
 	}
 	_ = nc.Close()

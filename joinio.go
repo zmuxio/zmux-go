@@ -818,6 +818,10 @@ func (r *sealedReader) ExportKeyingMaterial(l string, c []byte, n int) ([]byte, 
 }
 func (r *sealedReader) RecordMode() RecordMode { return r.mode }
 
+// ReportsFailure forwards the lower carrier's: sealed records fail when it
+// fails.
+func (r *sealedReader) ReportsFailure() bool { return reportsFailure(r.lower) }
+
 type sealedWriter struct {
 	s     RecordSealer
 	exp   KeyingMaterialExporter

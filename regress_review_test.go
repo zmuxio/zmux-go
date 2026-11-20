@@ -254,7 +254,7 @@ func TestJoinPlanCancelIsNoReject(t *testing.T) {
 func TestPrefixKeepsExporter(t *testing.T) {
 	a, b := kmPair("x")
 	defer func() { _ = a.Close(); _ = b.Close() }()
-	if _, ok := exporterOf(&prefixReader{pre: []byte{1}, r: a}); !ok {
+	if _, ok := exporterOf(withPrefix(PipeIO{R: a}, []byte{1}).R); !ok {
 		t.Fatal("no exporter behind a prefix")
 	}
 }

@@ -10,8 +10,13 @@ import (
 // handler, and HTTP upgrades such as WebSocket and WebTransport); the
 // admission they run is their listener's (zmux.ListenerConfig.Admission).
 type Options struct {
-	// Next serves the requests that are not carriers: zmux.VerdictFallback, and
-	// requests the adapter does not take (nil: http.NotFound).
+	// Next serves the requests that are not carriers (nil:
+	// http.NotFound): requests the adapter does not take, and
+	// zmux.VerdictFallback decided on a request's head (zmux.StageHead: an
+	// upgrade's head, an exchange request, a request without a body). A
+	// request carrier decided on its body is a carrier, which a
+	// zmux.VerdictFallback hands to zmux.ListenerConfig.Fallback (Next
+	// serves it only when the listener has none).
 	// An HTTP/1.1 request with a body reaches it full duplex
 	// (http.ResponseController.EnableFullDuplex), so its response can go
 	// out while the client still streams the body.

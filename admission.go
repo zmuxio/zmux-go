@@ -22,7 +22,6 @@ import (
 
 	"github.com/djylb/timeshim"
 
-	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/httpx"
 	"github.com/zmuxio/zmux-go/internal/labels"
@@ -171,30 +170,129 @@ const (
 // (ListenerConfig.Fallback): on VerdictFallback, or on a prefix that
 // Admission.FallbackOnPeekTimeout gave up on. What was read of it is
 // replayed: the bytes of a byte stream, the first message of a
-// message-framed carrier (always a whole binary message: a carrier whose
-// first read fails is closed without a decision). The carrier is the
-// host's for the call of Fallback only: zmux closes it when Fallback
-// returns, so a host that serves it stays in the call.
+// message-framed carrier (always a whole, non-empty binary message: a
+// carrier whose first read fails or returns an empty message is closed
+// without a decision).
+//
+// The carrier is the host's for the call of Fallback, whose context ends
+// with the call at every entry point, and zmux closes it when Fallback
+// returns, unless the host called Detach during the call:
+// the carrier, and what an adapter runs it on (the QUIC connection of a
+// stream, zmuxquic.TakeoverConn; the WebTransport session; the HTTP request
+// of a request carrier), is then the host's for good, to be served after
+// Fallback returned, on any goroutine and with a context of the host's,
+// and closed by the host, which must close it once done.
+//
+// Conn and Pipe are views of the one carrier, valid for as long as it is
+// open: the host closes it through either (Conn's Close, or ClosePipeIO on
+// Pipe). The views forward the capabilities of the carrier's halves
+// (ConnectionStater, CarrierSecure, CloseWriter, Aborter, ...; see
+// carrierview.go for the complete set and what a view reports for a
+// capability its half lacks), and Unwrap returns the half under a view.
 type Takeover struct {
 	// Info is the carrier's metadata, as Decide saw it.
 	Info CarrierInfo
-	conn net.Conn
-	pipe PipeIO
+	// Value is Decision.Value of the VerdictFallback that handed the
+	// carrier over (nil after FallbackOnPeekTimeout): the host's routing
+	// of the carrier, as an accepted carrier's Value is its session's.
+	Value any
+	conn  *prefixedConn
+	owner *halfOwner
+	pipe  PipeIO
+	mu    sync.Mutex
+	state takeoverState
 }
 
-// Pipe returns the carrier with what was read replayed: on a
-// message-framed carrier (Framing FramingRecords) its receiving half is a
-// MessageReader that returns the first message again first; its sending
-// half and the carrier capabilities zmux discovers (CarrierConner,
-// ConnectionStater, ...) are the carrier's own, except where Conn
-// applies, whose view both halves then are.
+// takeoverState is where a Takeover is in its hand-over.
+type takeoverState uint8
+
+const (
+	takeoverHeld     takeoverState = iota // Fallback runs: zmux closes the carrier when it returns
+	takeoverDetached                      // the host owns the carrier
+	takeoverReturned                      // Fallback returned without Detach: zmux closed it
+)
+
+// ErrTakeoverReturned is Takeover.Detach called after Fallback returned
+// without it: zmux has closed the carrier.
+var ErrTakeoverReturned = errors.New("zmux: Takeover.Detach after Fallback returned")
+
+// Detach makes the carrier the host's: zmux does not close it when
+// Fallback returns, and never touches it again; the host must close it
+// once done (an HTTP request carrier's handler waits for that, bounded
+// only by the request's context). It is called during Fallback, which may
+// then hand Conn or Pipe to another goroutine and return; the context
+// Fallback got ends with the call, so the host serves the carrier on with
+// a context of its own. A second Detach returns nil. After Fallback
+// returned without Detach it returns ErrTakeoverReturned (the carrier is
+// closed), and net.ErrClosed when the host closed every half of the
+// carrier before.
+func (t *Takeover) Detach() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch t.state {
+	case takeoverDetached:
+		return nil
+	case takeoverReturned:
+		return ErrTakeoverReturned
+	case takeoverHeld:
+	}
+	if t.owner.closed() {
+		return net.ErrClosed
+	}
+	t.state = takeoverDetached
+	return nil
+}
+
+// returned ends the call of Fallback: whether the host detached the
+// carrier (otherwise Detach is refused from now on).
+func (t *Takeover) returned() (detached bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.state == takeoverDetached {
+		return true
+	}
+	t.state = takeoverReturned
+	return false
+}
+
+// Pipe returns the carrier with what was read replayed: its receiving
+// half is a view that returns what was read first (on a message-framed
+// carrier, Framing FramingRecords, a MessageReader that returns the first
+// message again first); its sending half is the carrier's own, except
+// where Conn applies, whose view both halves then are. Each half is a
+// view that closes the carrier's half once, whoever closes it (the host,
+// or zmux when Fallback returns without Detach): ClosePipeIO closes the
+// carrier, and a half can be closed on its own (close the sending half,
+// read the receiving one to its end).
 func (t *Takeover) Pipe() PipeIO { return t.pipe }
 
 // Conn returns the carrier as a net.Conn when it is a byte stream on a
 // single net.Conn (TCP, TLS), sharing Pipe's replay: once the replayed
 // bytes are read, WriteTo and ReadFrom use the connection's own (splice
-// and sendfile where it offers them), and Unwrap returns it.
-func (t *Takeover) Conn() (net.Conn, bool) { return t.conn, t.conn != nil }
+// and sendfile where it offers them). It is a view of the connection
+// that forwards its capabilities (ConnectionState, NetConn, CarrierSecure,
+// CloseWrite, Abort, HandshakeContext, ...), its Close closing the
+// connection once, and Unwrap returns the connection (read through it
+// only once the replayed bytes were read).
+func (t *Takeover) Conn() (net.Conn, bool) {
+	if t.conn == nil {
+		return nil, false
+	}
+	return t.conn, true
+}
+
+// Messages returns the halves of a message-framed carrier (Framing
+// FramingRecords, such as WebSocket), the reader returning the first
+// message again first; false for a byte stream. A half the carrier does
+// not have is nil.
+func (t *Takeover) Messages() (MessageReader, MessageWriter, bool) {
+	if t.pipe.Framing != FramingRecords {
+		return nil, nil, false
+	}
+	mr, _ := t.pipe.R.(MessageReader)
+	mw, _ := t.pipe.W.(MessageWriter)
+	return mr, mw, true
+}
 
 // AdmissionVerdict is the outcome of an admission.
 type AdmissionVerdict uint8
@@ -204,12 +302,20 @@ const (
 	// Decision.Skip bytes of the prefix.
 	VerdictAccept AdmissionVerdict = iota
 	// VerdictFallback hands the carrier, with every byte or message read
-	// replayed, to ListenerConfig.Fallback (a Takeover; without a Fallback
-	// it is stalled). A carrier that is an HTTP request, decided on its
-	// head or body, is a request rather than a carrier to take over: it is
-	// served by zmuxhttp.Options.Next (without one: the server's not-found
-	// response). The carrier of an upgrade decided after a VerdictDefer is
-	// a carrier: it goes to ListenerConfig.Fallback.
+	// replayed and Decision.Value, to ListenerConfig.Fallback (a Takeover;
+	// without a Fallback it is stalled). The stage decides what an HTTP
+	// request is: decided on its head (StageHead: an upgrade's head, an
+	// exchange request, a request without a body) it is a request, served
+	// by zmuxhttp.Options.Next (without one: the server's not-found
+	// response); decided on its start as a carrier (StageCarrier: the
+	// carrier of an upgrade after VerdictDefer, the body of a request
+	// carrier, AdmitRequest) it is a carrier, taken over by
+	// ListenerConfig.Fallback; a request carrier's Takeover is the full
+	// duplex byte stream of its request body (Pipe's R, the bytes read
+	// replayed) and its response body (Pipe's W), the response head
+	// written by zmux. Without a ListenerConfig.Fallback such a request,
+	// to which nothing was written, is served as a request by
+	// zmuxhttp.Options.Next.
 	VerdictFallback
 	// VerdictStall reads and discards what arrives, sends nothing, and
 	// closes the carrier gracefully when the peer ends it or after a
@@ -243,11 +349,15 @@ const verdictFailed AdmissionVerdict = 255
 
 // Decision is what Admission.Decide returns.
 type Decision struct {
-	// Value is the host's value for an accepted carrier (VerdictAccept
-	// only; ignored otherwise): zmux hands it on without looking at it to
-	// WrapPipe (PipeHint.Admitted) and to the session (AdmittedAs) or
-	// pipe (AdmittedAs) the carrier makes, and holds it until their
-	// state is released. Whether a join comes from the same client as its
+	// Value is the host's value for an accepted carrier or one it takes
+	// over (VerdictAccept and VerdictFallback; ignored otherwise): zmux
+	// hands it on without looking at it, on VerdictAccept to WrapPipe
+	// (PipeHint.Admitted) and to the session (AdmittedAs) or pipe
+	// (AdmittedAs) the carrier makes, holding it until their state is
+	// released, and on VerdictFallback to ListenerConfig.Fallback
+	// (Takeover.Value), where it routes the carrier: a listener has one
+	// Fallback, and the Value says which of the host's services the
+	// carrier goes to. Whether a join comes from the same client as its
 	// session is the host's to decide: zmux compares no values.
 	Value any
 	// Variant labels the carrier with any verdict, for
@@ -531,9 +641,19 @@ type Arrival struct {
 	value    any               // Decision.Value of that acceptance
 	slot     *core.PendingSlot // the slots Arrive took, until handed on
 	deferred *deferral         // a head decision deferred to the first carrier
+	takeover *pendingTakeover  // a request carrier's VerdictFallback, taken over by Admit
 	variant  string            // Decision.Variant of that acceptance
 	mu       sync.Mutex
 	accepted bool // the admission accepted the carrier
+	detached bool // the host detached the carrier it took over
+}
+
+// pendingTakeover is the VerdictFallback of a request carrier decided on
+// its start (AdmitRequest), which the carrier the adapter then builds of
+// the request is taken over with (Admit).
+type pendingTakeover struct {
+	value any
+	info  CarrierInfo
 }
 
 // deferral is an upgrade's head decision deferred to its carrier
@@ -611,6 +731,7 @@ func (a *Arrival) Release() {
 	a.slot = nil
 	dfr := a.deferred
 	a.deferred = nil
+	a.takeover = nil
 	a.mu.Unlock()
 	if dfr != nil {
 		// A deferred decision that never came: its carrier did not arrive
@@ -805,22 +926,32 @@ func (a *Arrival) Take(ctx context.Context, p PipeIO, hint PipeHint) (run func(c
 // handed on with HandlePipe or Take. Otherwise it has acted on the
 // verdict and returns false: VerdictFallback hands p, with every byte or
 // message read replayed, to ListenerConfig.Fallback (without one the
-// carrier is stalled) and returns once the fallback did, VerdictStall
+// carrier is stalled) and returns once the fallback did (Detached reports
+// whether the host kept the carrier), VerdictStall
 // stalls it and VerdictClose closes it. Without an Admission, or once the
 // arrival is accepted, it returns p and true. HandlePipe is Admit, Take
 // and the pipe's run in one.
 func (a *Arrival) Admit(ctx context.Context, p PipeIO) (PipeIO, bool) {
 	p = owned(p) // the peeks, their timers, a stall and the verdict close it through one closer
+	a.mu.Lock()
+	tk := a.takeover
+	a.takeover = nil
+	a.mu.Unlock()
+	if tk != nil {
+		// A request carrier decided on its start (AdmitRequest).
+		a.fallback(ctx, p, nil, &tk.info, tk.value)
+		return PipeIO{}, false
+	}
 	if a.isAccepted() {
 		return p, true
 	}
-	q, prefix, info, v := a.admitPipe(ctx, p)
+	q, prefix, info, value, v := a.admitPipe(ctx, p)
 	switch v {
 	case VerdictAccept:
 		a.accept()
 		return q, true
 	case VerdictFallback:
-		a.fallback(ctx, p, prefix, info)
+		a.fallback(ctx, p, prefix, info, value)
 	default:
 		// VerdictStall, VerdictClose and a failed handshake: admitPipe
 		// has acted.
@@ -829,24 +960,49 @@ func (a *Arrival) Admit(ctx context.Context, p PipeIO) (PipeIO, bool) {
 }
 
 // fallback hands p, with prefix replayed, to ListenerConfig.Fallback as a
-// Takeover and closes it when the call returns, the arrival's slots given
-// back first; without a Fallback it stalls p (not counted as a stall: the
-// decision was VerdictFallback). A panic of the fallback closes the
-// carrier, not the process: a peer reaches it with any non-zmux bytes.
-func (a *Arrival) fallback(ctx context.Context, p PipeIO, prefix []byte, info *CarrierInfo) {
+// Takeover and closes it when the call returns unless the host detached
+// it, the arrival's slots given back first; without a Fallback it stalls
+// p (not counted as a stall: the decision was VerdictFallback). A panic of
+// the fallback closes the carrier, not the process (a detached one stays
+// the host's): a peer reaches it with any non-zmux bytes.
+func (a *Arrival) fallback(ctx context.Context, p PipeIO, prefix []byte, info *CarrierInfo, value any) {
 	l := a.l
 	if l.cfg.Fallback == nil {
 		a.stallPipe(ctx, p, false)
 		return
 	}
 	a.Release()
-	t := &Takeover{Info: *info, pipe: withPrefix(p, prefix)}
-	if nc, ok := p.R.(net.Conn); ok && p.Framing != FramingRecords && carrierio.SameHalf(p.W, p.R) {
-		t.conn = prefixConn(nc, prefix)
-		t.pipe.R, t.pipe.W = t.conn, t.conn // one replay for both views
+	markTaken(p) // nothing more is replayed once the host has it
+	o := newHalfOwner(p)
+	if !releasePipe(p, o.closeAll) {
+		return // closed already (the listener's stop)
 	}
-	_ = hostCall(l.cfg.Logger, "ListenerConfig.Fallback", func() error { l.cfg.Fallback(ctx, t); return nil })
-	closePipe(p)
+	t := &Takeover{Info: *info, Value: value, owner: o}
+	t.pipe, t.conn = takeoverPipe(p, prefix, o)
+	// The call's context ends with the call, at every entry point: a host
+	// that serves a detached carrier on uses a context of its own.
+	fctx, cancel := context.WithCancel(ctx)
+	_ = hostCall(l.cfg.Logger, "ListenerConfig.Fallback", func() error { l.cfg.Fallback(fctx, t); return nil })
+	cancel()
+	if t.returned() {
+		a.mu.Lock()
+		a.detached = true
+		a.mu.Unlock()
+		return
+	}
+	o.closeAll() // the halves the host has not closed
+}
+
+// Detached reports whether the host detached the carrier of the arrival
+// that Admit, AdmitFirst or HandlePipe handed to ListenerConfig.Fallback
+// (Takeover.Detach): the adapter then leaves the carrier, and what it runs
+// on, to the host. An adapter whose carrier lives only as long as a call
+// of its own (an HTTP handler serving an HTTP/2 stream or a request
+// carrier) keeps that call until the host closed the carrier.
+func (a *Arrival) Detached() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.detached
 }
 
 // stopContext is ctx, also ended when the listener stops taking carriers.
@@ -859,9 +1015,10 @@ func (l *Listener) stopContext(ctx context.Context) (context.Context, context.Ca
 // admitPipe completes p's outer TLS handshake, reads its prefix and takes
 // the decision, or the decision an upgrade's head deferred to it. On
 // VerdictAccept q is p without the skipped bytes; on VerdictFallback p is
-// untouched, prefix what was read and info the carrier's metadata;
+// untouched, prefix what was read, info the carrier's metadata and value
+// the decision's Value;
 // otherwise p is closed (VerdictStall: the decision's stall has run).
-func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []byte, info *CarrierInfo, v AdmissionVerdict) {
+func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []byte, info *CarrierInfo, value any, v AdmissionVerdict) {
 	l := a.l
 	adm := l.cfg.Admission
 	ctx, cancel := l.stopContext(ctx)
@@ -874,7 +1031,7 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 			closePipe(p)
 			l.st.adm.handshakeFailed.Add(1)
 			a.Release()
-			return PipeIO{}, nil, nil, verdictFailed
+			return PipeIO{}, nil, nil, nil, verdictFailed
 		}
 	}
 	a.mu.Lock()
@@ -906,10 +1063,10 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 			if !resumable {
 				closePipe(p)
 				a.Release()
-				return PipeIO{}, nil, nil, VerdictClose
+				return PipeIO{}, nil, nil, nil, VerdictClose
 			}
 			a.count(Decision{Verdict: VerdictFallback})
-			return p, prefix, info, VerdictFallback
+			return p, prefix, info, nil, VerdictFallback
 		}
 		if failed {
 			// Nothing to decide on, and nothing a fallback could be given
@@ -917,7 +1074,7 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 			a.count(Decision{Verdict: VerdictClose})
 			closePipe(p)
 			a.Release()
-			return PipeIO{}, nil, nil, VerdictClose
+			return PipeIO{}, nil, nil, nil, VerdictClose
 		}
 	}
 	var dd decided
@@ -932,16 +1089,16 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 	prefix = dd.prefix
 	switch d.Verdict {
 	case VerdictAccept:
-		return withPrefix(p, prefix[d.Skip:]), nil, nil, VerdictAccept
+		return withPrefix(p, prefix[d.Skip:]), nil, nil, nil, VerdictAccept
 	case VerdictFallback:
-		return p, prefix, info, VerdictFallback
+		return p, prefix, info, d.Value, VerdictFallback
 	case VerdictStall:
 		a.stallPipe(ctx, p, true)
-		return PipeIO{}, nil, nil, VerdictStall
+		return PipeIO{}, nil, nil, nil, VerdictStall
 	default: // VerdictClose
 		closePipe(p)
 		a.Release()
-		return PipeIO{}, nil, nil, VerdictClose
+		return PipeIO{}, nil, nil, nil, VerdictClose
 	}
 }
 
@@ -950,6 +1107,7 @@ func (a *Arrival) admitPipe(ctx context.Context, p PipeIO) (q PipeIO, prefix []b
 // handshake is incomplete), nil without one. The half stays p's.
 func pendingHandshake(p PipeIO) func(context.Context) error {
 	for _, x := range []any{p.R, p.W} {
+		x = unprefixed(x)
 		if tc, ok := x.(*tls.Conn); ok {
 			if !tc.ConnectionState().HandshakeComplete {
 				return tc.HandshakeContext
@@ -1012,7 +1170,8 @@ func (a *Arrival) peekPipe(ctx context.Context, p PipeIO, have []byte, n int, de
 // at most limit; tooLong: it held more (read no further than limit+1
 // bytes); failed: there is no first message to decide on (the carrier
 // ended or failed, sent a message that is not binary, has no
-// MessageReader, or ctx ended, which interrupts the read).
+// MessageReader, or ctx ended, which interrupts the read); an empty first
+// message is failed too.
 func (a *Arrival) peekMessage(ctx context.Context, p PipeIO, limit int, deadline time.Time) (msg []byte, tooLong, failed, fired bool) {
 	mr, ok := p.R.(MessageReader)
 	if !ok {
@@ -1035,7 +1194,9 @@ func (a *Arrival) peekMessage(ctx context.Context, p PipeIO, limit int, deadline
 		return nil, false, true, false
 	case errors.Is(err, ErrMessageTooLarge) || err == nil && len(msg) > limit:
 		return nil, true, false, false
-	case err != nil:
+	case err != nil, len(msg) == 0:
+		// An empty first message is no prefix: a takeover could not
+		// replay it, so the carrier closes without a decision.
 		return nil, false, true, false
 	}
 	return bytes.Clone(msg), false, false, false
@@ -1132,12 +1293,15 @@ func (a *Arrival) callDecide(dctx context.Context, info *CarrierInfo, prefix []b
 	return d, dctx.Err() == nil
 }
 
-// bound is d with the fields its verdict does not use cleared; an unknown
+// bound is d with the fields its verdict does not use cleared (Value is
+// VerdictAccept's and VerdictFallback's); an unknown
 // verdict, or a Skip outside a prefix of n bytes, is VerdictClose.
 func (d Decision) bound(n int) Decision {
 	switch {
 	case d.Verdict >= VerdictMore:
 		return Decision{Verdict: VerdictClose, Variant: d.Variant}
+	case d.Verdict == VerdictFallback:
+		return Decision{Verdict: d.Verdict, Variant: d.Variant, Value: d.Value}
 	case d.Verdict != VerdictAccept:
 		return Decision{Verdict: d.Verdict, Variant: d.Variant}
 	case d.Skip < 0 || d.Skip > n:
@@ -1270,64 +1434,6 @@ func discard(r io.Reader) {
 // are unchanged. It is how bytes read before HandlePipe are given back.
 func PrefixedPipe(p PipeIO, prefix []byte) PipeIO { return withPrefix(p, prefix) }
 
-// prefixConn returns c with prefix read before the rest of c. Once the
-// prefix is consumed, WriteTo and ReadFrom use c's own (splice and
-// sendfile where c offers them), and Unwrap returns c.
-func prefixConn(c net.Conn, prefix []byte) net.Conn {
-	if len(prefix) == 0 {
-		return c
-	}
-	return &prefixedConn{Conn: c, pre: prefix}
-}
-
-type prefixedConn struct {
-	net.Conn
-	pre []byte
-}
-
-func (p *prefixedConn) Read(b []byte) (int, error) {
-	if len(p.pre) > 0 {
-		n := copy(b, p.pre)
-		p.pre = p.pre[n:]
-		return n, nil
-	}
-	return p.Conn.Read(b)
-}
-
-// WriteTo writes the prefix, then copies c to w through w's ReadFrom.
-func (p *prefixedConn) WriteTo(w io.Writer) (int64, error) {
-	var n int64
-	if len(p.pre) > 0 {
-		m, err := w.Write(p.pre)
-		n += int64(m)
-		p.pre = p.pre[m:]
-		if err != nil {
-			return n, err
-		}
-	}
-	m, err := io.Copy(w, p.Conn)
-	return n + m, err
-}
-
-// ReadFrom writes r to c through c's ReadFrom where it has one.
-func (p *prefixedConn) ReadFrom(r io.Reader) (int64, error) {
-	if rf, ok := p.Conn.(io.ReaderFrom); ok {
-		return rf.ReadFrom(r)
-	}
-	return io.Copy(struct{ io.Writer }{p.Conn}, r)
-}
-
-// CloseWrite half-closes c where it can.
-func (p *prefixedConn) CloseWrite() error {
-	if cw, ok := p.Conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	return errors.ErrUnsupported
-}
-
-// Unwrap returns the connection under the prefix.
-func (p *prefixedConn) Unwrap() net.Conn { return p.Conn }
-
 // ---- HTTP requests as carriers ----
 
 // AdmitUpgrade takes r, the request of an HTTP upgrade (WebSocket,
@@ -1355,7 +1461,12 @@ func (a *ListenerAdapter) AdmitUpgrade(w http.ResponseWriter, r *http.Request, t
 // the decision's prefix is the start of the body (none for a request
 // without one, decided on its head), and on VerdictAccept r.Body
 // continues after the skipped bytes. On VerdictFallback r.Body replays
-// the bytes read.
+// the bytes read. A VerdictFallback on the start of a body
+// (StageCarrier), with a ListenerConfig.Fallback, takes the request over
+// as a carrier: AdmitRequest returns the arrival and true, nothing is
+// written, and the caller hands the carrier it builds of the request on
+// with Arrival.HandlePipe (or Admit), which hands it to the Fallback as a
+// Takeover instead of the listener (with the decision's Value).
 func (a *ListenerAdapter) AdmitRequest(w http.ResponseWriter, r *http.Request, trusted *TrustedProxies, fallback http.Handler) (*Arrival, bool) {
 	return (*Listener)(a).admitRequest(w, r, trusted, reqBody, fallback)
 }
@@ -1499,6 +1610,14 @@ func (a *Arrival) decideRequest(w http.ResponseWriter, r *http.Request, kind req
 	case VerdictFallback:
 		if len(prefix) > 0 {
 			r.Body = httpx.ReplayBody(prefix, r.Body, r.Body)
+		}
+		if kind == reqBody && !head && l.cfg.Fallback != nil {
+			// A carrier decided on its start: taken over as a carrier
+			// (Admit), not served as a request.
+			a.mu.Lock()
+			a.takeover = &pendingTakeover{info: *info, value: d.Value}
+			a.mu.Unlock()
+			return true
 		}
 		a.Release()
 		serveHTTP(fallback, w, r)

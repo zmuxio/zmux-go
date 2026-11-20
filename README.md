@@ -320,6 +320,12 @@ is set with `PipeOptions.Liveness`, or later with
 `Pipe.Update(zmux.PipeUpdate{Liveness: zmux.Set(pl)})`, and dropped with
 `zmux.Clear[zmux.PipeLiveness]()`.
 A pipe already suspect keeps the dead timeout it turned suspect under.
+A negative `DeadTimeout` turns stall-based failure off: a stalled pipe still
+turns suspect and traffic moves away from it, but only its carrier's error
+or end (or its removal) fails it. It is off by default on carriers that
+report their own failure (`zmux.FailureReporter`), such as `StreamPipe` and
+`Conn.OpenPipeStream`, whose outer session ends them when its path fails;
+a pipe's own `DeadTimeout` overrides that.
 `Conn.RaiseIncomingStreams` raises the incoming stream limits, for example
 after the peer has authenticated; the limits only grow. `zmux.MaxStreamCredit`
 (2^60) is the largest stream credit, the value of `MaxIncomingStreams`,
@@ -616,10 +622,26 @@ ends with what remains of `PeekTimeout` and when the listener stops. Its
 to the host with what was read replayed, stalls it, or closes it;
 `VerdictMore` reads a longer prefix of a byte stream (up to `MaxPeek`) and
 decides again. The host takes over a carrier in `ListenerConfig.Fallback`,
-which gets a `Takeover` (the metadata, the carrier as a `PipeIO`, and as a
-`net.Conn` where it is one) and owns it for the call: zmux closes it when
-`Fallback` returns. An HTTP request that is itself the carrier is taken over
-as a request instead, by `zmuxhttp.Options.Next`. On the head of an HTTP
+which gets a `Takeover`: the metadata, `Decision.Value` (`Takeover.Value`:
+one `Fallback` per listener, the value routes the carrier to the host's
+service), the carrier as a `PipeIO`, as a `net.Conn` where it is one
+(`Conn`) and as message halves where it is message-framed (`Messages`).
+The views keep every capability of the carrier (`ConnectionState`,
+`NetConn`, `CloseWrite`, `CarrierSecure`, ...; `Unwrap` returns the carrier
+under a view; read through it only once the replayed bytes are read).
+The context `Fallback` gets ends when it returns, at every entry point.
+zmux closes the carrier when `Fallback` returns unless the host called
+`Takeover.Detach`: the carrier is then the host's, to serve on another
+goroutine after `Fallback` returned, with a context of its own, and the
+host must close it once done (each half closes once, whoever closes it; an
+HTTP request carrier's handler waits for both halves, bounded only by the
+request's context). What an
+HTTP request is depends on the stage it is decided at: on its head (an
+upgrade's head, an exchange request, a request without a body) it is a
+request, served by `zmuxhttp.Options.Next`; on the start of its body (a
+stream or uplink request carrier) it is a carrier, taken over by
+`ListenerConfig.Fallback` as the full-duplex byte stream of its request and
+response bodies, the response head written by zmux. On the head of an HTTP
 upgrade (WebSocket, WebTransport; `CarrierInfo.Upgrade`) `VerdictDefer`
 completes the upgrade and decides again on the carrier's first message (or
 the first `Peek` bytes of the first WebTransport stream), within the same
@@ -661,6 +683,26 @@ go func() { _ = l.Serve(ctx, tls.NewListener(ln, tlsConf)) }()
 
 // client: Config.CarrierCredential is presented by the dialers
 conn, err := zmux.DialTLS(ctx, "tcp", addr, tlsConf, &zmux.Config{CarrierCredential: auth})
+```
+
+A host that hands taken-over carriers to a long-lived server of its own
+routes by the decision's `Value` and detaches them:
+
+```go
+Fallback: func(_ context.Context, t *zmux.Takeover) {
+	if t.Detach() != nil {
+		return
+	}
+	if c, ok := t.Conn(); ok { // TCP, TLS: a net.Conn with its capabilities
+		tunnels.Hand(t.Value, c) // served with the host's own context, and closed by it
+		return
+	}
+	if r, w, ok := t.Messages(); ok { // WebSocket
+		relays.Hand(t.Value, r, w, t.Pipe())
+		return
+	}
+	streams.Hand(t.Value, t.Pipe()) // a QUIC stream, an HTTP request carrier, ...
+},
 ```
 
 A `CarrierCredential` is the client side of an admission: `Prefix` gives the

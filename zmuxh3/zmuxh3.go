@@ -142,7 +142,9 @@ func NewServer(addr string, tlsConf *tls.Config, qconf *quic.Config, h http.Hand
 // to a WebTransport session; nothing else of the session is handed on
 // before its first stream is admitted, and a session whose first stream
 // is not accepted, or comes too late, is closed once the verdict was
-// acted on; and the session's bidirectional
+// acted on (unless the host detached the stream it took over,
+// zmux.Takeover.Detach: the session, the stream's CarrierConn, is then the
+// host's); and the session's bidirectional
 // streams go to l as carriers and its unidirectional streams as lanes,
 // until the session ends, with the request's source (o.Trusted). A request
 // forwarded from early data, or received in 0-RTT, is answered 425; one that cannot be upgraded
@@ -177,7 +179,7 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 			return StreamPipe(sess, st), nil
 		})
 		if !ok {
-			if sess != nil {
+			if sess != nil && !a.Detached() { // a detached takeover leaves the session to the host
 				_ = sess.CloseWithError(0, "")
 			}
 			return

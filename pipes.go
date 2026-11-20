@@ -322,7 +322,7 @@ func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions) (*Pipe, *pip
 			maxRec = min(maxRec, lim)
 		}
 		info = core.CarrierInfo{Framing: core.FramingRecords, MinRTT: info.MinRTT, QueueBound: low,
-			WriteOverhead: overhead, MaxRecord: maxRec}
+			WriteOverhead: overhead, MaxRecord: maxRec, OwnFailure: info.OwnFailure}
 		pd.opener, pd.ch = nil, nil
 	}
 	j.In, j.Out, j.OutSig, j.Kind = info, info, pd.wsig, uint8(p.Carrier)

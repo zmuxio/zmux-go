@@ -152,7 +152,7 @@ func newRawWriter(w io.WriteCloser, c rawCommon) io.WriteCloser {
 // NetConn is the connection below a TLS or TCP carrier, for the socket's statistics.
 func (w *rawWriter) NetConn() net.Conn {
 	switch c := w.WriteCloser.(type) {
-	case interface{ NetConn() net.Conn }:
+	case zmux.NetConner:
 		return c.NetConn()
 	case net.Conn:
 		return c

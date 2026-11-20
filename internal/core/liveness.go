@@ -6,14 +6,16 @@ package core
 type Liveness struct {
 	KeepAlive     Duration
 	SuspectFloor  Duration
-	DeadTimeout   Duration // 0: derived
+	DeadTimeout   Duration // 0: derived; <0: stall-based failure off
 	StandbyProbe  Duration // 0: off
 	ProbeInterval Duration // 0: off
 	ProbeJitter   float64
 }
 
 // PipeLiveness are a pipe's own liveness settings; a zero field is the
-// session's, a negative ProbeInterval turns the pipe's idle probes off
+// session's (a zero DeadTimeout: off on a carrier that reports its own
+// failure), a negative DeadTimeout turns stall-based failure off, a
+// negative ProbeInterval turns the pipe's idle probes off
 // and a negative ProbeJitter is a jitter of 0.
 type PipeLiveness struct {
 	SuspectFloor  Duration

@@ -87,8 +87,8 @@ func catchAbort(f func()) (err error) {
 }
 
 // A byte-stream carrier that is no net.Conn reaches ListenerConfig.Fallback
-// as a Takeover whose Pipe replays the bytes read, its sending half its
-// own, with no Conn view; zmux closes it when Fallback returns.
+// as a Takeover whose Pipe replays the bytes read, its sending half a view
+// of its own, with no Conn view; zmux closes it when Fallback returns.
 func TestAdmissionFallbackPipe(t *testing.T) {
 	type seen struct {
 		info   CarrierInfo
@@ -107,7 +107,7 @@ func TestAdmissionFallbackPipe(t *testing.T) {
 			_, conn := tk.Conn()
 			buf := make([]byte, 6)
 			_, err := io.ReadFull(tk.Pipe().R, buf)
-			got <- seen{info: tk.Info, read: buf, conn: conn, sameW: tk.Pipe().W == p.W, hasErr: err}
+			got <- seen{info: tk.Info, read: buf, conn: conn, sameW: tk.Pipe().W.(interface{ Unwrap() io.WriteCloser }).Unwrap() == p.W, hasErr: err}
 		}})
 	defer func() { _ = lst.Close() }()
 	done := make(chan error, 1)

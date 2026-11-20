@@ -878,7 +878,15 @@ func (r *httpRespReader) Close() error {
 // with Cache-Control: no-store and X-Accel-Buffering: no and without a
 // Content-Length, so that intermediaries neither cache nor buffer it. A request that l does not take and
 // to which nothing was written is served by o.Next, with every body byte
-// that l read replayed in front of the rest. The
+// that l read replayed in front of the rest. A carrier with a body that
+// the admission decides on its start with zmux.VerdictFallback is no
+// request for o.Next but a carrier: with a zmux.ListenerConfig.Fallback it
+// is taken over there (zmux.Takeover), its response head written (as for
+// an accepted carrier) and its Pipe the request body (with the bytes read
+// replayed) and, for a bidirectional carrier, the response body, full
+// duplex; after Takeover.Detach the handler returns once the host closed
+// every half of the pipe, or the request ended: the host must close it,
+// and only the request's context bounds the handler otherwise. The
 // handler returns when the pipe ends. o may be nil; an invalid o is an
 // zmux.ErrInvalidConfig error.
 func NewHandler(l *zmux.Listener, o *Options) (http.Handler, error) {
@@ -919,7 +927,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hw := &httpRespWriter{w: w, rc: rc, close: r.ProtoMajor == 1, life: life}
 	// After ServeHTTP returns, the response and its controller are not
 	// used again (net/http): a pipe's halves closed later leave them.
-	fellBack := false
+	fellBack := false // or detached: the host closed the halves, the response ends cleanly
 	defer func() {
 		life.end()
 		if fellBack {
@@ -970,7 +978,35 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		hw.mu.Unlock()
 		_ = rc.Flush()
 	}
+	// The carrier's end as its host closes it, when the host detached a
+	// carrier it took over (zmux.Takeover.Detach): each of its halves.
+	hostEnd := make(chan struct{})
+	halves := new(atomic.Int32)
+	halfEnded := func() {
+		if halves.Add(-1) == 0 {
+			close(hostEnd)
+		}
+	}
+	if p.W != nil {
+		halves.Add(1)
+		hw.onClose = sync.OnceFunc(halfEnded)
+	}
+	if body != nil {
+		halves.Add(1)
+		body.onClose = sync.OnceFunc(halfEnded)
+	}
 	_ = a.HandlePipe(r.Context(), p, hint)
+	if a.Detached() {
+		// The request is the carrier: it lives until the host closed both
+		// halves (the request body stays readable after the response's
+		// half was closed), or the request ended.
+		select {
+		case <-hostEnd:
+			fellBack = true
+		case <-r.Context().Done():
+		}
+		return
+	}
 	if !hw.started() {
 		if read, ok := body.replay(); ok {
 			// Not taken, nothing written: the request goes to the
@@ -998,8 +1034,9 @@ type httpRespWriter struct {
 	life    *httpLife
 	mu      sync.Mutex
 	closed  bool
-	written bool // the response header went out
-	close   bool // Connection: close
+	written bool   // the response header went out
+	close   bool   // Connection: close
+	onClose func() // tells the handler that the pipe's sending half was closed
 
 	// The request stream's datagram channel: its provider (under mu), and
 	// the channel once the header went out. The receiver's state has a
@@ -1073,12 +1110,19 @@ func (h *httpRespWriter) WriteBuffers(bufs [][]byte) (int, error) {
 }
 
 // Close ends the response (the handler returns once the pipe has ended);
-// a write blocked on a peer that does not read is interrupted.
+// a write in progress, such as one blocked on a peer that does not read,
+// is interrupted.
 func (h *httpRespWriter) Close() error {
-	h.life.do(func() { _ = h.rc.SetWriteDeadline(time.Now()) })
-	h.mu.Lock()
+	if !h.mu.TryLock() {
+		// A write is in progress: interrupt it.
+		h.life.do(func() { _ = h.rc.SetWriteDeadline(time.Now()) })
+		h.mu.Lock()
+	}
 	h.closed = true
 	h.mu.Unlock()
+	if h.onClose != nil {
+		h.onClose()
+	}
 	return nil
 }
 
@@ -1115,6 +1159,8 @@ type httpReqBody struct {
 	rc   *http.ResponseController
 	life *httpLife
 	tls  *tls.ConnectionState // the request's QUIC connection (HTTP/3)
+	// onClose tells the handler that the body was closed.
+	onClose func()
 
 	read  []byte
 	mu    sync.Mutex
@@ -1166,6 +1212,9 @@ func (r *httpReqBody) replay() ([]byte, bool) {
 }
 
 func (r *httpReqBody) Close() error {
+	if r.onClose != nil {
+		defer r.onClose()
+	}
 	// A deadline during net/http's background read would cancel the connection's
 	// context, and with it the next request on the connection; no read of ours blocks.
 	r.mu.Lock()

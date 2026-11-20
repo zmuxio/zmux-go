@@ -1,6 +1,8 @@
 package core
 
 import (
+	"math"
+
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
 )
@@ -54,17 +56,33 @@ func (s *Session) tSuspect(a *attach) Duration {
 
 func (s *Session) tFail(a *attach) Duration { return maxD(2*Second, 8*(s.pto(a)+s.queueDelay(a))) }
 
-// deadParams are the SuspectFloor and DeadTimeout (0: derived) of a: the
-// pipe's own, else the session's.
+// deadParams are the SuspectFloor and DeadTimeout (0: derived, negative:
+// off) of a: the pipe's own; else off on a carrier that reports its own
+// failure (CarrierInfo.OwnFailure); else the session's.
 func (s *Session) deadParams(a *attach) (f, dt Duration) {
 	f, dt = s.cfg.SuspectFloor, s.cfg.DeadTimeout
 	if a.live.SuspectFloor > 0 {
 		f = a.live.SuspectFloor
 	}
-	if a.live.DeadTimeout > 0 {
+	switch {
+	case a.live.DeadTimeout != 0:
 		dt = a.live.DeadTimeout
+	case a.ownFail:
+		dt = -1
 	}
 	return f, dt
+}
+
+// stallDeathOff reports whether a stall never fails a: its DeadTimeout in
+// force (the one it turned suspect under, while suspect) is off. The pipe
+// still turns suspect, is avoided and probed (Section 7.2), and fails on
+// its carrier's error or end, at the drain deadline and on removal.
+func (s *Session) stallDeathOff(a *attach) bool {
+	dt := a.suspDead
+	if !a.suspHeld {
+		_, dt = s.deadParams(a)
+	}
+	return dt < 0
 }
 
 // tDead is T_dead of a suspect pipe, under the SuspectFloor and
@@ -79,8 +97,11 @@ func (s *Session) tDead(a *attach) Duration {
 }
 
 // deadLimit is T_dead for PTO + queue d, suspect floor
-// f and dead_timeout dt (0: not set).
+// f and dead_timeout dt (0: not set; negative: off, no limit).
 func (s *Session) deadLimit(d, f, dt Duration) Duration {
+	if dt < 0 {
+		return math.MaxInt64
+	}
 	if dt == 0 {
 		dt = maxD(2*Second, 8*d) // T_fail
 		if !s.feat.Resume {
@@ -97,8 +118,8 @@ func (s *Session) deadLimit(d, f, dt Duration) Duration {
 // lastInDead is the T_dead that bounds the silence of the last live
 // inbound pipe: that of the last pipe, with the
 // largest PTO of the live outbound pipes, or the initial values when there
-// are none.
-func (s *Session) lastInDead() Duration {
+// are none, under a's SuspectFloor and DeadTimeout (off: no limit).
+func (s *Session) lastInDead(a *attach) Duration {
 	var d Duration
 	for _, p := range s.pipes {
 		if p.mp != nil && !p.mp.retired && p.out != nil && p.mp.liveOut() {
@@ -110,7 +131,8 @@ func (s *Session) lastInDead() Duration {
 		a.rtt.smoothed, a.rtt.rttvar = 333*Millisecond, 166*Millisecond
 		d = s.pto(&a)
 	}
-	return s.deadLimit(d, s.cfg.SuspectFloor, s.cfg.DeadTimeout)
+	f, dt := s.deadParams(a)
+	return s.deadLimit(d, f, dt)
 }
 
 // probeInterval is the probe interval k of p's outbound direction: the
@@ -298,6 +320,9 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 					s.makeSuspect(p)
 				}
 			case OutSuspect:
+				if s.stallDeathOff(a) {
+					break
+				}
 				lim := s.tDead(a)
 				if s.otherActive(p) {
 					lim = s.tFail(a)
@@ -372,7 +397,7 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 			if nIn <= 1 {
 				// Losing it leaves no live inbound pipe: the patience of
 				// a stalled last outbound pipe.
-				lim = maxD(lim, s.lastInDead())
+				lim = maxD(lim, s.lastInDead(a))
 			}
 			if due(a.lastRecord.Add(lim)) && apply {
 				s.failPipe(p, 0x296a5bf5, nil)

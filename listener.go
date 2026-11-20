@@ -149,14 +149,21 @@ type ListenerConfig struct {
 	Admission *Admission
 	// Fallback takes over the carriers that the admission decides on with
 	// VerdictFallback, whatever entry point took them: byte streams (TCP,
-	// TLS, a QUIC or WebTransport stream) and message-framed carriers
-	// (WebSocket), the carrier of an upgrade decided after a VerdictDefer
-	// included, each with what was read replayed (Takeover); nil: they are
-	// stalled. It runs on the goroutine that handles the carrier, after
-	// the carrier's slots were given back; the carrier is the host's for
-	// the call only, and zmux closes it when Fallback returns. An HTTP
-	// request that is itself the carrier is taken over as a request
-	// instead, by zmuxhttp.Options.Next.
+	// TLS, a QUIC or WebTransport stream), message-framed carriers
+	// (WebSocket), the carrier of an upgrade decided after a VerdictDefer,
+	// and an HTTP request carrier decided on its body (its request and
+	// response bodies as one full duplex pipe), each with what was read
+	// replayed and the decision's Value (Takeover); nil: they are stalled
+	// (an HTTP request carrier is served by zmuxhttp.Options.Next). A
+	// listener has one Fallback: the host routes by Takeover.Value. A
+	// message-framed carrier whose first message is empty is closed before
+	// Decide, so a Takeover's first message is never empty. It runs on the
+	// goroutine that handles the carrier, after the carrier's slots were
+	// given back, with a context that ends when it returns; zmux closes
+	// the carrier when Fallback returns unless the host called
+	// Takeover.Detach, which makes it the host's to serve on any goroutine
+	// (with a context of its own) and to close once done. An HTTP request decided on its head
+	// (StageHead) is a request, served by zmuxhttp.Options.Next.
 	Fallback func(ctx context.Context, t *Takeover)
 	// WrapPipe, when set, is called once for every carrier the listener
 	// takes, whatever fed it (Serve, HandlePipe, the HTTP,
@@ -1013,24 +1020,11 @@ const MaxUntakenRead = MaxRecordSize + 8 + firstReadChunk
 // session, a join or a lane attaches the carrier.
 type CarrierTaker interface{ CarrierTaken() }
 
-// markTaken tells p's receiving half, through the wrappers below, that the
+// markTaken tells p's receiving half, through its views, that the
 // listener took the carrier: a session, a join or a lane attaches it.
 func markTaken(p PipeIO) {
-	x := any(p.R)
-	for x != nil {
-		switch r := x.(type) {
-		case CarrierTaker:
-			r.CarrierTaken()
-			return
-		case *prefixReader:
-			x = r.r
-		case *prefixMessages:
-			x = r.r
-		case readOnly:
-			x = r.r
-		default:
-			return
-		}
+	if t, ok := p.R.(CarrierTaker); ok {
+		t.CarrierTaken()
 	}
 }
 
@@ -1588,85 +1582,28 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, rele
 
 // ---- helpers ----
 
-// prefixReader returns what was read for classification before the rest
-// of the carrier.
-type prefixReader struct {
-	r   io.ReadCloser
-	pre []byte
-}
-
-func (p *prefixReader) Read(b []byte) (int, error) {
-	if len(p.pre) > 0 {
-		n := copy(b, p.pre)
-		p.pre = p.pre[n:]
-		return n, nil
-	}
-	return p.r.Read(b)
-}
-
-func (p *prefixReader) Close() error { return p.r.Close() }
-
-// prefixMessages returns the first message before the rest.
-type prefixMessages struct {
-	r     io.ReadCloser
-	first []byte
-}
-
-func (p *prefixMessages) Read([]byte) (int, error) { return 0, errors.New("zmux: message carrier") }
-func (p *prefixMessages) Close() error             { return p.r.Close() }
-func (p *prefixMessages) ReadMessage(limit int) ([]byte, error) {
-	if p.first != nil {
-		m := p.first
-		p.first = nil
-		if len(m) > limit {
-			return nil, ErrMessageTooLarge
-		}
-		return m, nil
-	}
-	return p.r.(MessageReader).ReadMessage(limit)
-}
-
 func withPrefix(p PipeIO, first []byte) PipeIO {
 	if len(first) == 0 {
 		return p
 	}
 	if p.Framing == FramingRecords {
-		p.R = &prefixMessages{first: first, r: p.R}
+		p.R = &prefixMessages{halfCaps: viewOf(p.R), first: first, r: p.R}
 		return p
 	}
-	if same := carrierio.SameHalf(p.R, p.W); same {
+	r := p.R
+	if carrierio.SameHalf(p.R, p.W) {
 		// Keep the write half as it is; the read half is wrapped.
-		p.R = &prefixReader{pre: bytes.Clone(first), r: readOnly{p.R}}
-		return p
+		r = readOnly{halfCaps: viewOf(p.R), r: p.R}
 	}
-	p.R = &prefixReader{pre: bytes.Clone(first), r: p.R}
+	p.R = &prefixReader{halfCaps: viewOf(p.R), pre: bytes.Clone(first), r: r}
 	return p
 }
 
-// readOnly closes nothing: the carrier is closed through its write half.
-type readOnly struct{ r io.ReadCloser }
-
-func (r readOnly) Read(b []byte) (int, error) { return r.r.Read(b) }
-func (r readOnly) Close() error               { return nil }
-
-// carrierConnOf is the carrier connection of a half, through the wrappers
-// above (lanes are accepted only on their pipe's connection).
-func carrierConnOf(x any) any {
-	switch r := x.(type) {
-	case *prefixReader:
-		return carrierConnOf(r.r)
-	case *prefixMessages:
-		return carrierConnOf(r.r)
-	case readOnly:
-		return carrierConnOf(r.r)
-	case CarrierConner:
-		return r.CarrierConn()
-	}
-	return nil
+// halfReportsFailure reports whether h is a FailureReporter that reports.
+func halfReportsFailure(h any) bool {
+	f, ok := h.(FailureReporter)
+	return ok && f.ReportsFailure()
 }
-
-func (p *prefixReader) CarrierConn() any   { return carrierConnOf(p.r) }
-func (p *prefixMessages) CarrierConn() any { return carrierConnOf(p.r) }
 
 // newHalf is h unless it is one of the halves r and w (nil then).
 func newHalf(h io.Closer, r, w any) io.Closer {
@@ -1679,7 +1616,7 @@ func newHalf(h io.Closer, r, w any) io.Closer {
 // tlsSetupFailed reports whether p is a TLS connection whose handshake did
 // not complete: the read failed below the carrier.
 func tlsSetupFailed(p PipeIO) bool {
-	switch c := p.R.(type) {
+	switch c := unprefixed(p.R).(type) {
 	case *tls.Conn:
 		return !c.ConnectionState().HandshakeComplete
 	case *secureTLSConn:

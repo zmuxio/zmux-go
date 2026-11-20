@@ -176,7 +176,7 @@ type attach struct {
 	queueD      Duration // queue_p of the snapshot
 	noSampleAt  Time     // samples of bytes sent at or before this are discarded (E2)
 	suspFloor   Duration // the SuspectFloor in force when the pipe turned suspect
-	suspDead    Duration // the DeadTimeout in force then (0: derived)
+	suspDead    Duration // the DeadTimeout in force then (0: derived, negative: off)
 	unacked     bool     // unacknowledged ack-eliciting bytes exist
 	lingering   bool
 	noSample    bool
@@ -209,6 +209,7 @@ type attach struct {
 	// Scheduler.
 	probOpt    Duration     // per-pipe Probation; <0: the session default
 	live       PipeLiveness // the pipe's own liveness settings
+	ownFail    bool         // the carrier reports its own failure (CarrierInfo.OwnFailure)
 	probeH     Duration     // H_p of the current probe wait, taken when it started
 	probeCut   float64      // the current probe wait is k_eff x (1 - probeCut): in [0, j], or [0, 1] for the first wait of a bootstrap pipe
 	prob       probState
@@ -288,6 +289,7 @@ func (s *Session) startMultipath() *wire.Error {
 		a := &attach{mode: s.firstPipeMode(), joinerLocal: s.role == RoleInitiator, dir: 2, out: OutActive, in: InOpen,
 			attachedAt: s.now, liveAt: s.now, lastAdvance: s.now, lastRecord: s.now, weight: 1, probOpt: -1}
 		a.rtt = s.initialRTT(pp.id)
+		a.ownFail = pp.ownFailure()
 		s.drawProbe(a, pp, true)
 		pp.mp = a
 	}

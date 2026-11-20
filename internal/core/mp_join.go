@@ -138,6 +138,7 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	}
 	a.rtt = s.initialRTT(id)
 	a.live = o.Live
+	a.ownFail = o.Out.OwnFailure || o.In.OwnFailure
 	s.drawProbe(a, nil, false)
 	a.sendPrio, a.sendStandby = o.SendPriority, o.SendStandby
 	a.recvPrio, a.recvStandby = o.RecvPriority, o.RecvStandby
@@ -773,6 +774,7 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 		lastRecord: s.now, weight: 1, peerPrio: j.Priority, peerStandby: j.Standby, probOpt: -1, mode: pj.Mode}
 	a.group, _ = join.LookupGroup(pj.pl.KeyShare.Group)
 	a.rtt = s.initialRTT(id)
+	a.ownFail = c.HasOut && c.Out.OwnFailure || c.HasIn && c.In.OwnFailure
 	s.drawProbe(a, nil, false)
 	p.mp = a
 	if needIn {

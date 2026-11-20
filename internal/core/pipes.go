@@ -37,6 +37,11 @@ type CarrierInfo struct {
 	// peer's end may never arrive on a carrier whose close is whole, and the
 	// peer's CONNECTION_CLOSE ends the linger (SPEC.md Section 6.5 step 3).
 	HalfClose bool
+	// OwnFailure: the carrier reports its own failure, as an error or an
+	// unexpected end of its reads or writes (a stream of an outer session,
+	// which its own liveness ends). A stall then never fails the pipe,
+	// unless its own PipeLiveness.DeadTimeout says otherwise.
+	OwnFailure bool
 }
 
 // ChannelUse is what a pipe's datagram channel takes now, as the driver
@@ -282,3 +287,15 @@ func (ol *outLane) stalled() bool { return ol.writing || ol.notWritable }
 
 // epochAck is the end position of a record carrying the answer of epoch n.
 type epochAck struct{ pos, n uint64 }
+
+// ownFailure reports whether p's carrier reports its own failure, as its
+// first lane says (CarrierInfo.OwnFailure).
+func (p *Pipe) ownFailure() bool {
+	if p.out != nil && len(p.out.lanes) > 0 {
+		return p.out.lanes[0].info.OwnFailure
+	}
+	if p.in != nil && len(p.in.lanes) > 0 {
+		return p.in.lanes[0].info.OwnFailure
+	}
+	return false
+}

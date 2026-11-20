@@ -94,6 +94,11 @@ func (r *stPipeR) Close() error {
 // CarrierConn reports the outer session as the carrier connection (lanes).
 func (r *stPipeR) CarrierConn() any { return r.outer }
 
+// ReportsFailure: the stream fails (a reset, the end of the outer
+// session) when its path fails, so a stall behind the outer session's
+// queues or rate limits never fails the nested pipe.
+func (r *stPipeR) ReportsFailure() bool { return true }
+
 func (w *stPipeW) Write(p []byte) (int, error) { return w.s.Write(p) }
 
 // WriteBatch hands a batch of the nested session to the outer stream

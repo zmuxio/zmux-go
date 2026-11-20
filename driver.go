@@ -285,7 +285,14 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 	info := core.CarrierInfo{HalfClose: half, Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
 		Lanes: lanes, QueueBound: lowWater, WriteOverhead: p.WriteOverhead, MaxRecord: carrierRecordLimit(p)}
 	info.Channel = channelOf(p) != nil
+	info.OwnFailure = reportsFailure(p)
 	return info
+}
+
+// reportsFailure reports whether a half of p reports its carrier's own
+// failure (FailureReporter).
+func reportsFailure(p PipeIO) bool {
+	return halfReportsFailure(p.W) || halfReportsFailure(p.R)
 }
 
 // newPipeDrv prepares the driver of an attachment (under the lock).

@@ -36,7 +36,7 @@ func TestSetLivenessValidation(t *testing.T) {
 	}
 	for _, bad := range []Liveness{
 		{KeepAlivePeriod: time.Millisecond}, {SuspectFloor: -1}, {SuspectFloor: time.Millisecond},
-		{DeadTimeout: -1}, {DeadTimeout: 500 * time.Millisecond}, {ProbeInterval: time.Millisecond},
+		{DeadTimeout: 500 * time.Millisecond}, {ProbeInterval: time.Millisecond},
 		{StandbyProbe: time.Millisecond}, {ProbeJitter: 1},
 	} {
 		if err := c.SetLiveness(bad); !errors.Is(err, ErrInvalidConfig) {
@@ -64,6 +64,10 @@ func TestSetLivenessValidation(t *testing.T) {
 	if got := c.Liveness(); got.KeepAlivePeriod != -1 || got.StandbyProbe != -1 || got.ProbeInterval != -1 ||
 		got.ProbeJitter != -1 || got.DeadTimeout != 3*time.Second {
 		t.Fatalf("off: %+v", got)
+	}
+	off.DeadTimeout = -time.Minute
+	if err := c.SetLiveness(off); err != nil || c.Liveness().DeadTimeout != -1 {
+		t.Fatalf("DeadTimeout off: %v, %+v", err, c.Liveness())
 	}
 }
 

@@ -67,7 +67,7 @@ type Config struct {
 
 	SpreadChunk   int
 	SuspectFloor  Duration
-	DeadTimeout   Duration // 0 = default
+	DeadTimeout   Duration // 0 = default; <0 = stall-based failure off
 	Probation     Duration // <0 = default
 	OverflowDelay Duration
 	StandbyProbe  Duration

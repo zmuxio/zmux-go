@@ -27,8 +27,15 @@ type Liveness struct {
 	// 50 ms.
 	SuspectFloor time.Duration
 	// DeadTimeout is how long a suspect pipe stays suspect before it
-	// fails. Zero is derived from the RTT and the idle timeout; otherwise
-	// at least 1 s.
+	// fails. Zero is derived from the RTT and the idle timeout; a negative
+	// value turns stall-based failure off: a stalled pipe still turns
+	// suspect, is avoided by the scheduler, has its data reinjected and is
+	// probed, but only its carrier's error or end, its drain deadline or
+	// its removal fail it (and the inbound silence of a receive-only pipe
+	// that is not the last one); otherwise at least 1 s, and any larger
+	// value is safe (deadlines saturate). A pipe whose carrier reports its
+	// own failure (FailureReporter, such as StreamPipe) has it off unless
+	// its own PipeLiveness.DeadTimeout is set.
 	DeadTimeout time.Duration
 	// StandbyProbe is the probe interval of standby pipes and of pipes of
 	// a less-preferred tier while the session carries traffic. Zero is
@@ -98,7 +105,7 @@ func (l *Liveness) core() (core.Liveness, error) {
 
 // Liveness returns the session's liveness settings in effect, resolved:
 // defaults are filled in, a setting that is off is negative (a jitter of
-// 0 included), and a derived DeadTimeout is zero, so that SetLiveness with
+// 0 and a DeadTimeout that is off included), and a derived DeadTimeout is zero, so that SetLiveness with
 // the result changes nothing.
 func (c *Conn) Liveness() Liveness {
 	var cl core.Liveness
@@ -147,7 +154,10 @@ func (c *Conn) SetLiveness(l Liveness) error {
 type PipeLiveness struct {
 	// SuspectFloor is at least 50 ms.
 	SuspectFloor time.Duration
-	// DeadTimeout is at least 1 s.
+	// DeadTimeout is at least 1 s; a negative value turns stall-based
+	// failure of the pipe off, as for Liveness.DeadTimeout. Zero follows
+	// the carrier (off when it reports its own failure, FailureReporter),
+	// else the session's; a nonzero value overrides both.
 	DeadTimeout time.Duration
 	// ProbeInterval is the probe interval of the pipe while it is idle,
 	// measured to the carrier: with a shaping delay of up to H, probes wait
@@ -160,16 +170,16 @@ type PipeLiveness struct {
 }
 
 // core validates l and resolves it for the core: 0 the session's, a
-// negative interval off, a negative jitter 0.
+// negative interval or DeadTimeout off (-1), a negative jitter 0.
 func (l *PipeLiveness) core() (core.PipeLiveness, error) {
 	var cl core.PipeLiveness
-	if l.SuspectFloor < 0 || l.DeadTimeout < 0 {
-		return cl, fmt.Errorf("%w: negative SuspectFloor or DeadTimeout", ErrInvalidConfig)
+	if l.SuspectFloor < 0 {
+		return cl, fmt.Errorf("%w: negative SuspectFloor", ErrInvalidConfig)
 	}
 	if l.SuspectFloor != 0 && l.SuspectFloor < 50*time.Millisecond {
 		return cl, fmt.Errorf("%w: SuspectFloor below 50 ms", ErrInvalidConfig)
 	}
-	if l.DeadTimeout != 0 && l.DeadTimeout < time.Second {
+	if l.DeadTimeout > 0 && l.DeadTimeout < time.Second {
 		return cl, fmt.Errorf("%w: DeadTimeout below 1 s", ErrInvalidConfig)
 	}
 	if err := checkProbeInterval(l.ProbeInterval, "ProbeInterval"); err != nil {
@@ -178,7 +188,7 @@ func (l *PipeLiveness) core() (core.PipeLiveness, error) {
 	if err := checkProbeJitter(l.ProbeJitter, "ProbeJitter"); err != nil {
 		return cl, err
 	}
-	cl.SuspectFloor, cl.DeadTimeout = core.Duration(l.SuspectFloor), core.Duration(l.DeadTimeout)
+	cl.SuspectFloor, cl.DeadTimeout = core.Duration(l.SuspectFloor), core.Duration(max(l.DeadTimeout, -1))
 	cl.ProbeInterval = core.Duration(max(l.ProbeInterval, -1))
 	cl.ProbeJitter = max(l.ProbeJitter, -1)
 	return cl, nil

@@ -181,7 +181,7 @@ func TestInboundSilenceLastPipeAtTDead(t *testing.T) {
 	q := &Pipe{id: 1, in: p.in, mp: &attach{out: OutNone, in: InOpen, lastRecord: Time(Second), weight: 1}}
 	s.pipes = append(s.pipes, q)
 	p.mp.in = InEnded
-	lim := s.lastInDead()
+	lim := s.lastInDead(q.mp)
 	if want := s.deadLimit(s.pto(p.mp), cfg.SuspectFloor, 0); lim != want || lim < 32*Second {
 		t.Fatalf("last-pipe limit %v, want %v, at least 8 x PTO", lim, want)
 	}

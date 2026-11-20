@@ -178,7 +178,7 @@ type ConnListener interface {
 // is not accepted is closed once the decision has been acted on (on
 // VerdictFallback, once zmux.ListenerConfig.Fallback returned; it receives
 // that stream with its bytes replayed, and TakeoverConn gives its
-// connection). Run it once per listener; it returns when ln is closed or
+// connection, which stays open when the host detached the stream). Run it once per listener; it returns when ln is closed or
 // ctx ends, and the connections and sessions it accepted continue (close
 // them to end them; closing ln leaves established connections alone).
 func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener) error {
@@ -277,7 +277,9 @@ func admitConn(ctx context.Context, qc *quic.Conn, a *zmux.Arrival) {
 	}
 	p, ok := a.Admit(ctx, streamPipe(qc, s))
 	if !ok {
-		_ = qc.CloseWithError(0, "")
+		if !a.Detached() { // a detached takeover leaves the connection to the host
+			_ = qc.CloseWithError(0, "")
+		}
 		return
 	}
 	labels.Go(ctx, "quic-accept-lanes", func() { acceptLanes(ctx, qc, a, nil) })
@@ -773,7 +775,9 @@ func Candidate(addr string, tlsConf *tls.Config, qconf *quic.Config) zmux.Candid
 // TakeoverConn returns the QUIC connection of a carrier that the admission
 // handed to zmux.ListenerConfig.Fallback, when it is a stream of one
 // (Serve, ServeConn); false otherwise. The connection is closed once the
-// fallback returned, as the stream is.
+// fallback returned, as the stream is, unless the host detached the
+// carrier (zmux.Takeover.Detach): the connection is then the host's too,
+// and zmux accepts none of its further streams.
 func TakeoverConn(t *zmux.Takeover) (*quic.Conn, bool) {
 	cc, ok := t.Pipe().W.(zmux.CarrierConner)
 	if !ok {

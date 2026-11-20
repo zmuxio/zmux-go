@@ -77,7 +77,7 @@ func (c *counter32) widen(v uint32) uint64 {
 // tcpOf finds the TCP socket under a carrier half (a TCP connection, or a
 // TLS connection over one).
 func tcpOf(x any) tcpInfo {
-	if nc, ok := x.(interface{ NetConn() net.Conn }); ok {
+	if nc, ok := x.(NetConner); ok {
 		x = nc.NetConn() // TLS, or a transform's half over a connection
 		if tc, ok := x.(*tls.Conn); ok {
 			x = tc.NetConn()
