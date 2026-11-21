@@ -320,17 +320,31 @@ func TestAdmissionFakeClock(t *testing.T) {
 		}
 	})
 	t.Run("decision deadline", func(t *testing.T) {
-		dls := make(chan time.Time, 1)
+		entered, dls := make(chan struct{}), make(chan time.Time, 1)
 		e := newFakeEnv(t, &Admission{PeekTimeout: 10 * time.Second, Decide: func(ctx context.Context, _ CarrierInfo, _ []byte) Decision {
+			close(entered)
 			dl, _ := ctx.Deadline()
 			<-ctx.Done()
 			dls <- dl
 			return Decision{}
 		}}, 0)
 		start := e.clk.Now()
-		e.advance(t, 1, 10*time.Second)
+		// The decision's deadline timer exists before Decide is called, and
+		// a deadline already passed when the call is made skips Decide:
+		// advancing on the timer's existence alone can do that.
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Decide not called")
+		}
+		e.clk.Advance(10 * time.Second)
 		e.ended(t)
-		dl := <-dls
+		var dl time.Time
+		select {
+		case dl = <-dls:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Decide's context did not end")
+		}
 		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1}) || !dl.Equal(start.Add(10*time.Second)) {
 			t.Fatalf("stats %+v, deadline %v after the start", st, dl.Sub(start))
 		}
