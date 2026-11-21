@@ -8,7 +8,7 @@ require (
 )
 
 require (
-	github.com/djylb/netx v0.0.0-20261121064300-ffc850492f27 // indirect
+	github.com/djylb/netx v0.0.0-20261121065821-b48dc32ff415 // indirect
 	github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0 // indirect
 	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/net v0.63.0 // indirect
