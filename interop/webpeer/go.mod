@@ -8,8 +8,8 @@ require (
 )
 
 require (
-	github.com/djylb/netx v0.0.0-20261120185208-bdc2b8cd835f // indirect
-	github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc // indirect
+	github.com/djylb/netx v0.0.0-20261121044438-b89037ba532a // indirect
+	github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0 // indirect
 )
 
 replace github.com/zmuxio/zmux-go => ../..

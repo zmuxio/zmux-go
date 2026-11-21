@@ -1,7 +1,7 @@
-github.com/djylb/netx v0.0.0-20261120185208-bdc2b8cd835f h1:ZPPyXC0B6UVwQ8883gyKum1jtn7b57jDv2zFDQBS9Tk=
-github.com/djylb/netx v0.0.0-20261120185208-bdc2b8cd835f/go.mod h1:Zi8xVsLCr7IPHcf3i+iSygxEeW623tZPjrFOcQ8T0no=
-github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc h1:sDzU+rT2s2drGdRiHb/0gAIAkPmAD3krLKkHE3vTrRE=
-github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
+github.com/djylb/netx v0.0.0-20261121044438-b89037ba532a h1:COZ3n95Fb3wTEdltWqYvRfT8SZcRBD+obCuxAgout8k=
+github.com/djylb/netx v0.0.0-20261121044438-b89037ba532a/go.mod h1:Zi8xVsLCr7IPHcf3i+iSygxEeW623tZPjrFOcQ8T0no=
+github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0 h1:BBQv+m6gL1FL9PH25D1OC/SQP4O2I6kY5vzwWI7NGmM=
+github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
 github.com/quic-go/go-ossfuzz-seeds v0.1.0 h1:APacT+iIaNF6fd8AGEiN3bT/Jtkd2jz4v4TzM7MFjy0=
 github.com/quic-go/go-ossfuzz-seeds v0.1.0/go.mod h1:3IOHRbJIc+L6YKMwfDtJAM9Vj9k0YY4muhuyUYk5tbk=
 github.com/quic-go/quic-go v0.64.1 h1:BCNTP+6x6++OPKrGST2FR3f1tycx8O3QOA3QQv09g70=
