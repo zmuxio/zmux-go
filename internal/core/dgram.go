@@ -7,19 +7,22 @@ import (
 
 // dgramState holds the datagram queues.
 type dgramState struct {
-	send  []outDgram
-	recv  [][]byte
-	recvW []*Signal
-	sendW []*Signal
+	send   []outDgram
+	recv   [][]byte
+	recvAt []Time // when each of recv was queued
+	recvW  []*Signal
+	sendW  []*Signal
 	// Received datagrams that wait for the receive limiter, which the
 	// driver runs outside the lock.
 	limited []PendingDatagram
+	heldIDs map[uint64]int // held datagrams per stream ID (releaseHeld)
 	// Received datagrams of peer streams not opened yet, in arrival order
 	// and so in the order they expire.
 	held        []heldDgram
-	heldIDs     map[uint64]int // held datagrams per stream ID (releaseHeld)
-	recvSize    uint64         // bytes of the session queue and the held datagrams
-	limitedSize uint64         // bytes of limited, kept within DgramRecvSize
+	recvSize    uint64 // bytes of the session queue and the held datagrams
+	limitedSize uint64 // bytes of limited, kept within DgramRecvSize
+	recvCd      codel  // the session queue's sojourn bound
+	sendCd      codel  // the send queue's
 }
 
 // heldDgram is a datagram held for a peer stream within the limit that
@@ -59,7 +62,8 @@ func (p *PendingDatagram) Len() int {
 type outDgram struct {
 	st   *Stream
 	data []byte
-	n    int // payload bytes (data without the flow and context prefix)
+	n    int  // payload bytes (data without the flow and context prefix)
+	at   Time // when it was queued (DgramTarget)
 }
 
 // countSent counts a datagram handed to a carrier.
@@ -215,6 +219,7 @@ func (s *Session) PollChannel(pipe uint64, use ChannelUse, dst []ChannelOut) (_ 
 		return dst, false
 	}
 	p.chUse = use
+	s.noteDatagramPath()
 	d := s.dg
 	if d == nil || len(d.send) == 0 || !s.peerSeen || s.state >= StateClosing || p != s.dgPipe() {
 		return dst, true
@@ -224,7 +229,7 @@ func (s *Session) PollChannel(pipe uint64, use ChannelUse, dst []ChannelOut) (_ 
 		return dst, true
 	}
 	kept := d.send[:0]
-	for _, o := range d.send {
+	for i, o := range d.send {
 		ok, dead := o.ready()
 		if dead || uint64(len(o.data)+1) > s.peerMaxDgram {
 			s.stats.DatagramsDroppedSend++
@@ -234,17 +239,18 @@ func (s *Session) PollChannel(pipe uint64, use ChannelUse, dst []ChannelOut) (_ 
 			kept = append(kept, o)
 			continue
 		}
+		if s.sendDrop(&o, len(d.send)-i-1) {
+			continue
+		}
 		b := make([]byte, 0, wire.ChannelDatagramLen(ch.HasID, ch.ID, len(o.data)))
 		dst = append(dst, ChannelOut{Frame: wire.AppendChannelDatagram(b, ch.HasID, ch.ID, o.data), d: outDgram{st: o.st, n: o.n}})
-		if len(d.sendW) > 0 {
-			s.wake(d.sendW[0])
-			d.sendW = d.sendW[1:]
-		}
 	}
+	s.wakeSendRoom(len(d.send) - len(kept))
 	clear(d.send[len(kept):])
 	d.send = kept
 	if len(d.send) == 0 {
 		d.send = nil
+		d.sendCd.idle()
 	}
 	return dst, true
 }
@@ -291,7 +297,9 @@ func (s *Session) ReceiveChannelDatagram(pipe uint64, frame []byte, now Time) {
 
 type streamDgrams struct {
 	q    [][]byte // context-prefixed payloads
+	at   []Time   // when each was queued
 	size uint64   // their payload bytes (DgramStreamSize)
+	cd   codel    // the queue's sojourn bound (DgramTarget)
 }
 
 // dgPayloadLen is the payload length of a context-prefixed stream datagram.
@@ -305,8 +313,39 @@ func (q *streamDgrams) pop() []byte {
 	e := q.q[0]
 	q.q[0] = nil
 	q.q = q.q[1:]
+	q.at = q.at[1:]
 	q.size -= dgPayloadLen(e)
 	return e
+}
+
+// popRecv removes the oldest datagram of the session queue.
+func (d *dgramState) popRecv() []byte {
+	e := d.recv[0]
+	d.recv[0] = nil
+	d.recv = d.recv[1:]
+	d.recvAt = d.recvAt[1:]
+	d.recvSize -= uint64(len(e))
+	return e
+}
+
+// wakeSendRoom wakes a sender waiting for room in the send queue for each
+// of the n datagrams that left it, sent or dropped.
+func (s *Session) wakeSendRoom(n int) {
+	d := s.dg
+	for ; n > 0 && len(d.sendW) > 0; n-- {
+		s.wake(d.sendW[0])
+		d.sendW = d.sendW[1:]
+	}
+}
+
+// sendDrop decides on o, a datagram leaving the send queue with rest
+// queued after it: true drops it, counted, for its sojourn (DgramTarget).
+func (s *Session) sendDrop(o *outDgram, rest int) bool {
+	if !s.dg.sendCd.drop(o.at, s.now, s.cfg.DgramTarget, rest == 0) {
+		return false
+	}
+	s.stats.DatagramsDroppedSend++
+	return true
 }
 
 func (s *Session) dgState() *dgramState {
@@ -330,6 +369,53 @@ func (s *Session) MaxDatagramPayload(flowLen int) int {
 		m -= flowLen
 	}
 	return max(m, 0)
+}
+
+// PathDatagramPayload returns the largest datagram payload, after a flow
+// prefix of flowLen bytes, that leaves as one datagram of the datagram
+// pipe's carrier channel (its size as the carrier last reported it), and
+// where datagrams ride records (no channel, or none now) the largest a
+// record takes (MaxDatagramPayload); 0 when the peer accepts none. A
+// larger datagram goes in a record.
+func (s *Session) PathDatagramPayload(flowLen int) int {
+	m := s.MaxDatagramPayload(flowLen)
+	if m == 0 {
+		return 0
+	}
+	ch := s.channelOf(s.dgPipe())
+	if ch.Room == 0 {
+		return m
+	}
+	c := ch.Room - wire.ChannelDatagramLen(ch.HasID, ch.ID, 0)
+	if s.feat.Flows {
+		c -= flowLen
+	}
+	return max(min(m, c), 0)
+}
+
+// StreamPathDatagramPayload is PathDatagramPayload for a datagram of st
+// with context identifier context (StreamMaxDatagramPayload's prefix).
+func (s *Session) StreamPathDatagramPayload(st *Stream, context uint64) int {
+	if s.StreamMaxDatagramPayload(st, context) == 0 {
+		return 0
+	}
+	idLen := 8
+	if st.idSet {
+		idLen = varint.SizeVarint(st.id + 1)
+	}
+	return s.PathDatagramPayload(idLen + varint.SizeVarint(context))
+}
+
+// noteDatagramPath reports a change of a session datagram's
+// PathDatagramPayload (EvDatagramPath).
+func (s *Session) noteDatagramPath() {
+	if !s.cfg.Datagrams || !s.peerSeen {
+		return
+	}
+	if v := s.PathDatagramPayload(1); v != s.dgPath {
+		s.dgPath = v
+		s.emit(Event{Kind: EvDatagramPath, Count: uint64(v)})
+	}
 }
 
 // dgRecordCap returns the smallest record capacity (frames bytes) of the
@@ -411,7 +497,7 @@ func (s *Session) SendDatagram(st *Stream, context uint64, p []byte) error {
 		d.send = d.send[1:]
 		s.stats.DatagramsDroppedSend++
 	}
-	d.send = append(d.send, outDgram{data: data, st: st, n: len(p)})
+	d.send = append(d.send, outDgram{data: data, st: st, n: len(p), at: s.now})
 	s.wakeAllWriters()
 	s.wakeChannels()
 	return nil
@@ -454,6 +540,9 @@ func (s *Session) writeDatagrams(w *recWriter, p *Pipe) {
 			s.wake(p.chSig)
 			continue
 		}
+		if s.sendDrop(&o, len(d.send)-i-1) {
+			continue
+		}
 		sent, never := w.datagram(o.data, s.peerMaxDgram)
 		if never {
 			// It can never fit this pipe's records: drop it rather than
@@ -465,16 +554,14 @@ func (s *Session) writeDatagrams(w *recWriter, p *Pipe) {
 			break
 		}
 		s.countSent(&o)
-		if len(d.sendW) > 0 {
-			s.wake(d.sendW[0])
-			d.sendW = d.sendW[1:]
-		}
 	}
 	held = append(held, d.send[i:]...)
+	s.wakeSendRoom(len(d.send) - len(held))
 	clear(d.send[len(held):])
 	d.send = held
 	if len(d.send) == 0 {
 		d.send = nil
+		d.sendCd.idle()
 	}
 }
 
@@ -698,17 +785,17 @@ func (s *Session) queueDatagram(st *Stream, e []byte) bool {
 		}
 		st.cnt.dgReceived++
 		st.dg.q = append(st.dg.q, e)
+		st.dg.at = append(st.dg.at, s.now)
 		st.dg.size += n
 		s.dgramChanged(st)
 		return true
 	}
 	if len(d.recv) >= s.cfg.DgramRecvQ {
-		d.recvSize -= uint64(len(d.recv[0]))
-		d.recv[0] = nil
-		d.recv = d.recv[1:]
+		d.popRecv()
 		s.dropRecv(1)
 	}
 	d.recv = append(d.recv, e)
+	d.recvAt = append(d.recvAt, s.now)
 	d.recvSize += uint64(len(e))
 	s.trimRecvBytes()
 	if len(d.recvW) > 0 {
@@ -742,23 +829,28 @@ func (s *Session) trimRecvBytes() {
 		s.dropHeldHead()
 	}
 	for d.recvSize > s.cfg.DgramRecvSize && len(d.recv) > 0 {
-		d.recvSize -= uint64(len(d.recv[0]))
-		d.recv[0] = nil
-		d.recv = d.recv[1:]
+		d.popRecv()
 		s.dropRecv(1)
 	}
 }
 
 // RecvDatagram pops a session datagram; ok is false when none waits.
+// Datagrams queued longer than DgramTarget allows are dropped on the way
+// (CoDel), counted.
 func (s *Session) RecvDatagram() ([]byte, bool) {
 	d := s.dg
-	if d == nil || len(d.recv) == 0 {
+	if d == nil {
 		return nil, false
 	}
-	e := d.recv[0]
-	d.recv[0] = nil
-	d.recv = d.recv[1:]
-	d.recvSize -= uint64(len(e))
+	for len(d.recv) > 0 && d.recvCd.drop(d.recvAt[0], s.now, s.cfg.DgramTarget, len(d.recv) == 1) {
+		d.popRecv()
+		s.dropRecv(1)
+	}
+	if len(d.recv) == 0 {
+		d.recvCd.idle()
+		return nil, false
+	}
+	e := d.popRecv()
 	s.stats.DatagramBytesReceived += uint64(len(e))
 	return e, true
 }
@@ -773,12 +865,23 @@ func (s *Session) CancelDatagramWait(sig *Signal) {
 	}
 }
 
-// RecvStreamDatagram pops a stream datagram.
+// RecvStreamDatagram pops a stream datagram, dropping on the way those
+// queued longer than DgramTarget allows (CoDel), counted.
 func (s *Session) RecvStreamDatagram(st *Stream) (uint64, []byte, bool) {
-	if st.dg == nil || len(st.dg.q) == 0 {
+	q := st.dg
+	if q == nil {
 		return 0, nil, false
 	}
-	e := st.dg.pop()
+	for len(q.q) > 0 && q.cd.drop(q.at[0], s.now, s.cfg.DgramTarget, len(q.q) == 1) {
+		q.pop()
+		s.dropRecv(1)
+		st.cnt.dgDropped++
+	}
+	if len(q.q) == 0 {
+		q.cd.idle()
+		return 0, nil, false
+	}
+	e := q.pop()
 	ctx, n := varint.ConsumeVarint(e)
 	p := e[n:]
 	s.stats.DatagramBytesReceived += uint64(len(p))

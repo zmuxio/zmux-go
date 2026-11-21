@@ -85,12 +85,19 @@ const (
 	// EventEpochDeleted reports that an epoch (Epoch), its keys and its
 	// Locators were deleted.
 	EventEpochDeleted
+	// EventDatagramPathChanged reports a new ConnectionState.
+	// PathDatagramPayload (DatagramPayload): the carrier's datagram size
+	// changed (path MTU discovery), another pipe carries the datagrams, or
+	// they moved between the carrier's datagrams and records. It is
+	// noticed when the session sends or its pipes change.
+	EventDatagramPathChanged
 )
 
 var pipeEventNames = [...]string{"", "PipeAdded", "PipeJoined", "PipeSuspect", "PipeRecovered", "PipeFailed",
 	"PipeClosed", "PipePriorityChanged", "TierSaturation", "JoinAuthFailed", "SessionSuspended",
 	"SessionResumed", "GoAwayReceived", "ResumeUnattended", "PipeQualityChanged", "CapacityBelow",
-	"CapacityRestored", "CarrierCandidate", "CarrierChosen", "PipesRetired", "EpochCommitted", "EpochDeleted"}
+	"CapacityRestored", "CarrierCandidate", "CarrierChosen", "PipesRetired", "EpochCommitted", "EpochDeleted",
+	"DatagramPathChanged"}
 
 func (k EventKind) String() string {
 	if int(k) < len(pipeEventNames) {
@@ -173,6 +180,9 @@ type Event struct {
 	// the pipe failed, else Closed 1).
 	Retired, Failed, Closed uint64
 	Last                    []PipeID
+	// DatagramPayload of EventDatagramPathChanged: the new
+	// PathDatagramPayload of a session datagram.
+	DatagramPayload int
 }
 
 // retiredLast is the number of IDs EventPipesRetired keeps.
@@ -237,7 +247,7 @@ func keyOf(ev *Event) eventKey {
 	case EventPipeAdded, EventPipeJoined, EventPipeSuspect, EventPipeRecovered, EventPipeFailed, EventPipeClosed,
 		EventPipePriorityChanged, EventPipeQualityChanged, EventSessionSuspended, EventSessionResumed,
 		EventGoAwayReceived, EventResumeUnattended, EventCapacityBelow, EventCapacityRestored, EventCarrierChosen,
-		EventPipesRetired, EventEpochCommitted, EventEpochDeleted:
+		EventPipesRetired, EventEpochCommitted, EventEpochDeleted, EventDatagramPathChanged:
 		// Keyed by the kind alone (the pipe events above by their entry in pipeKeys).
 	}
 	return k
@@ -525,6 +535,8 @@ func (c *Conn) drainEventsLocked() {
 			q.push(Event{Kind: EventCapacityBelow, DeliveryRate: rateBytes(e.Rate)})
 		case core.EvCapacityRestored:
 			q.push(Event{Kind: EventCapacityRestored, DeliveryRate: rateBytes(e.Rate)})
+		case core.EvDatagramPath:
+			q.push(Event{Kind: EventDatagramPathChanged, DatagramPayload: int(e.Count)})
 		case core.EvPipePriority:
 			q.push(Event{Kind: EventPipePriorityChanged, PipeID: PipeID(e.Pipe), Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count, Source: e.Source, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})

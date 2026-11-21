@@ -59,6 +59,10 @@ type Config struct {
 	// DgramStreamSize bounds the payload bytes of a stream's datagram
 	// queue; 0 = unlimited.
 	DgramStreamSize uint64
+	// DgramTarget is the CoDel target of every datagram queue: a datagram
+	// whose queue has held datagrams longer than it for an interval is
+	// dropped as it leaves; 0 = off.
+	DgramTarget Duration
 
 	MaxPipes     int
 	Headroom     int
@@ -182,6 +186,7 @@ func DefaultConfig() Config {
 		DgramStreamQ:     32,
 		DgramRecvSize:    1 << 20,
 		DgramStreamSize:  512 << 10,
+		DgramTarget:      DefaultDgramTarget,
 		MaxPipes:         1,
 		Headroom:         8,
 		SpreadChunk:      16384,

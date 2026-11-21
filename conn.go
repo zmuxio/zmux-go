@@ -1262,6 +1262,14 @@ type ConnectionState struct {
 	// accepts now, 0 when it accepts none; Stream.MaxDatagramPayload gives
 	// the one of a stream.
 	MaxDatagramPayload int
+	// PathDatagramPayload is the largest session datagram payload that
+	// leaves as one datagram of the carrier (a QUIC DATAGRAM, its size as
+	// the carrier last reported it, path MTU discovery included) instead
+	// of in a record; on a carrier without datagrams it is
+	// MaxDatagramPayload, since every datagram rides the records there.
+	// Stream.PathDatagramPayload gives the one of a stream;
+	// EventDatagramPathChanged reports changes.
+	PathDatagramPayload int
 }
 
 // GoAway are the watermarks of a received GOAWAY:
@@ -1380,6 +1388,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 		st.PeerIsZmux = p.IsZmux()
 	}
 	st.MaxDatagramPayload = c.s.MaxDatagramPayload(1)
+	st.PathDatagramPayload = c.s.PathDatagramPayload(1)
 	if g, ok := c.s.PeerGoAway(); ok {
 		st.PeerGoAway = &GoAway{MaxBidi: g.MaxBidi, MaxUni: g.MaxUni, ErrorCode: ApplicationErrorCode(g.Code)}
 	}
@@ -1613,7 +1622,10 @@ func (c *Conn) sendDatagramLimited(st *core.Stream, cx uint64, p []byte) (bool, 
 		}
 	}
 	var err error
-	c.locked(func() { err = c.s.SendDatagram(st, cx, p) })
+	c.locked(func() {
+		c.s.SetNow(c.clk.now()) // the datagram's queueing time (DatagramQueueDelay)
+		err = c.s.SendDatagram(st, cx, p)
+	})
 	if err != nil && l != nil {
 		lim.Refund(granted) // not queued; refunded after the lock
 	}
@@ -1703,6 +1715,7 @@ func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 		var ok bool
 		var err error
 		c.locked(func() {
+			c.s.SetNow(c.clk.now()) // sojourns are current (DatagramQueueDelay)
 			if d, ok = c.s.RecvDatagram(); !ok {
 				if e := c.s.Err(); e != nil {
 					err = sessionErr(e)

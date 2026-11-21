@@ -162,6 +162,15 @@ type Config struct {
 	// received datagrams are bounded by about MaxIncomingStreams x
 	// DatagramStreamBytes (256 x 512 KiB) beside it.
 	DatagramStreamBytes int64
+	// DatagramQueueDelay is the target queueing delay of every datagram
+	// queue (the send queue, the session receive queue and each stream's):
+	// once the datagrams leaving a queue have waited longer than it for
+	// 100 ms, CoDel (RFC 8289) drops some as they leave, more the longer
+	// the standing delay lasts, each counted as dropped; a datagram alone
+	// in its queue is never dropped for its delay. The count and byte
+	// bounds stay as memory bounds. Zero is 20 ms; a negative value turns
+	// the delay bound off.
+	DatagramQueueDelay time.Duration
 
 	// SendBuffer starts the written-but-unreleased byte budget, in bytes.
 	// Zero is 4 MiB; a negative value is invalid. Multipath sessions grow
@@ -634,6 +643,12 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 		cc.DgramStreamSize = 0 // unlimited
 	case c.DatagramStreamBytes > 0:
 		cc.DgramStreamSize = uint64(c.DatagramStreamBytes)
+	}
+	switch {
+	case c.DatagramQueueDelay < 0:
+		cc.DgramTarget = 0 // off
+	case c.DatagramQueueDelay > 0:
+		cc.DgramTarget = core.Duration(c.DatagramQueueDelay)
 	}
 	if c.SendBuffer > 0 {
 		cc.SendBuffer = uint64(c.SendBuffer)

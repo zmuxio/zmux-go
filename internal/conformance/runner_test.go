@@ -1215,7 +1215,7 @@ func eventObj(e core.Event) (string, map[string]any) {
 		return "join_auth_failed", map[string]any{"reason": e.Reason.String()}
 	case core.EvTierSaturation, core.EvPipePriority, core.EvPipeQuality,
 		core.EvCapacityBelow, core.EvCapacityRestored, core.EvJoinKeys, core.EvPipeAttached,
-		core.EvEpochCommitted, core.EvEpochDeleted, core.EvLocatorAdded, core.EvLocatorRemoved:
+		core.EvEpochCommitted, core.EvEpochDeleted, core.EvLocatorAdded, core.EvLocatorRemoved, core.EvDatagramPath:
 		// Not in the trace vocabulary.
 	}
 	return "other", nil

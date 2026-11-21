@@ -303,6 +303,7 @@ func (h *handle) receiveDatagram(ctx context.Context) (uint64, []byte, error) {
 	end := false
 	_, err := h.waitOn(ctx, &h.dsig, nil, h.rwait, func() (bool, error) {
 		var ok bool
+		c.s.SetNow(c.clk.now()) // sojourns are current (DatagramQueueDelay)
 		if cx, d, ok = c.s.RecvStreamDatagram(h.st); ok {
 			return true, nil
 		}
@@ -672,6 +673,18 @@ func (s *Stream) MaxDatagramPayload(contextID uint64) int {
 	c.lock()
 	defer c.unlock()
 	return c.s.StreamMaxDatagramPayload(s.h.st, contextID)
+}
+
+// PathDatagramPayload returns the largest stream datagram payload, with
+// context identifier contextID, that leaves as one datagram of the
+// carrier instead of in a record (ConnectionState.PathDatagramPayload);
+// 0 when the peer accepts none on this stream.
+func (s *Stream) PathDatagramPayload(contextID uint64) int {
+	defer runtime.KeepAlive(s)
+	c := s.h.c
+	c.lock()
+	defer c.unlock()
+	return c.s.StreamPathDatagramPayload(s.h.st, contextID)
 }
 
 // SendDatagramWait sends a stream datagram like SendDatagram, waiting for

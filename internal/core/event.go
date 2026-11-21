@@ -43,6 +43,9 @@ const (
 	// name, or no longer.
 	EvLocatorAdded
 	EvLocatorRemoved
+	// EvDatagramPath reports that PathDatagramPayload of a session
+	// datagram changed (Count: the payload).
+	EvDatagramPath
 )
 
 // Event is one core event.

@@ -484,6 +484,7 @@ func (h *handle) waitPacket(ctx context.Context) (uint64, []byte, bool, error) {
 	var d []byte
 	var ok bool
 	err := h.awaitRead(ctx, true, func() (bool, error) {
+		c.s.SetNow(c.clk.now()) // sojourns are current (DatagramQueueDelay)
 		if cx, d, ok = c.s.RecvStreamDatagram(h.st); ok {
 			return true, nil
 		}
@@ -499,5 +500,6 @@ func (h *handle) tryPacket() (uint64, []byte, bool) {
 	defer h.rmu.Unlock()
 	h.c.lock()
 	defer h.c.unlock()
+	h.c.s.SetNow(h.c.clk.now()) // sojourns are current (DatagramQueueDelay)
 	return h.c.s.RecvStreamDatagram(h.st)
 }

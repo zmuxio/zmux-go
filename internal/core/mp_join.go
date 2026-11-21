@@ -818,6 +818,7 @@ func (s *Session) peerAttachments() int {
 func (s *Session) emitPipeState(p *Pipe) {
 	s.mp.stateGen++
 	s.pickChanged()
+	s.noteDatagramPath() // the primary pipe may have changed
 	o, i, _ := s.PipeState(p.id)
 	if p.out != nil {
 		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirOut, OutState: o, Carrier: p.carrier})

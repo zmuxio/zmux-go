@@ -72,6 +72,7 @@ type Session struct {
 	// Peer limits for sending.
 	peerMaxRecord uint64
 	peerMaxDgram  uint64
+	dgPath        int // the last PathDatagramPayload reported (EvDatagramPath)
 
 	streams           map[uint64]*Stream
 	loc               [2]localCount // [bidi, uni]
@@ -455,6 +456,7 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	s.timers.lastActivity = s.now
 	s.timers.lastKeepRef = -1
 	s.emit(Event{Kind: EvEstablished, Features: *f, Role: s.role})
+	s.noteDatagramPath()
 	for _, w := range s.estW {
 		s.wake(w)
 	}

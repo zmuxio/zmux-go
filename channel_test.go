@@ -507,3 +507,49 @@ func TestChannelHeldDatagramExpires(t *testing.T) {
 		t.Fatalf("dropped %d, want 1", d)
 	}
 }
+
+// PathDatagramPayload is what fits one channel datagram: a datagram of
+// it goes on the channel, one byte more in a record; a smaller channel
+// lowers it and EventDatagramPathChanged reports it.
+func TestChannelPathDatagramPayload(t *testing.T) {
+	a, b := chanPair(t)
+	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
+	if got := exchangeDatagrams(t, c, s, 1, 10); got != 1 {
+		t.Fatal("no datagram")
+	}
+	st := c.ConnectionState()
+	if st.PathDatagramPayload <= 0 || st.PathDatagramPayload >= st.MaxDatagramPayload || st.PathDatagramPayload > 1200 {
+		t.Fatalf("path %d, max %d", st.PathDatagramPayload, st.MaxDatagramPayload)
+	}
+	path := st.PathDatagramPayload
+	if got := exchangeDatagrams(t, c, s, 1, path); got != 1 {
+		t.Fatal("no datagram of the path size")
+	}
+	if cs := sentStats(t, c, 2); cs.DatagramsSentChannel != 2 {
+		t.Fatalf("the path size not on the channel: %+v", cs)
+	}
+	if got := exchangeDatagrams(t, c, s, 1, path+1); got != 1 {
+		t.Fatal("no datagram above the path size")
+	}
+	if cs := sentStats(t, c, 3); cs.DatagramsSentChannel != 2 {
+		t.Fatalf("above the path size on the channel: %+v", cs)
+	}
+	a.max.Store(800)
+	if got := exchangeDatagrams(t, c, s, 1, 10); got != 1 {
+		t.Fatal("no datagram after the change")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	for {
+		ev, err := c.NextEvent(ctx)
+		if err != nil {
+			t.Fatalf("no EventDatagramPathChanged: %v", err)
+		}
+		if ev.Kind == EventDatagramPathChanged && ev.DatagramPayload == path-400 {
+			break
+		}
+	}
+	if got := c.ConnectionState().PathDatagramPayload; got != path-400 {
+		t.Fatalf("path %d after the change, want %d", got, path-400)
+	}
+}

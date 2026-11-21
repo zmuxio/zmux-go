@@ -805,6 +805,16 @@ and payload bytes (`DatagramStreamBytes`, 512 KiB; negative: no byte
 bound), a single larger datagram being kept alone. An application that
 forwards packets at a high rate raises both.
 
+Every datagram queue, the send queue included, also bounds how long its
+datagrams wait (`DatagramQueueDelay`, 20 ms; negative: off): once the
+datagrams leaving a queue have waited longer for 100 ms, CoDel drops some
+as they leave, counted, so a slow reader gets fresh datagrams instead of
+stale ones. `ConnectionState.PathDatagramPayload` (and
+`Stream.PathDatagramPayload`) is the largest payload that leaves as one
+carrier datagram, a QUIC DATAGRAM as path MTU discovery sizes it, instead
+of in a record; `EventDatagramPathChanged` reports changes. A packet
+forwarder uses it as its MTU.
+
 ## Limiters
 
 `Splice`, `SplicePackets` and datagrams take bytes from a `zmux.Limiter`
