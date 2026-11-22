@@ -3,7 +3,7 @@ module github.com/zmuxio/zmux-go/interop/webpeer
 go 1.27
 
 require (
-	github.com/zmuxio/zmux-go v1.5.6
+	github.com/zmuxio/zmux-go v1.5.7
 	github.com/zmuxio/zmux-go/zmuxws v1.5.6
 )
 
