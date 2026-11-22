@@ -580,6 +580,9 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause err
 		s.checkLingerDone()
 		return
 	}
+	if cause == nil {
+		cause = s.writeLostErr
+	}
 	if failed {
 		s.closeWith(&SessionError{Kind: ClosePipesLost, Cause: cause}, nil)
 		return
@@ -592,7 +595,7 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause err
 		s.closeSilently(&SessionError{Kind: CloseIdle, Remote: true}, true)
 		return
 	}
-	s.closeWith(&SessionError{Kind: ClosePipesLost}, nil)
+	s.closeWith(&SessionError{Kind: ClosePipesLost, Cause: cause}, nil)
 }
 
 // PipeWriteFailed reports a failed write on an outbound lane.
@@ -619,6 +622,17 @@ func (s *Session) pipeWriteFailed(pipe, lane uint64, err error) {
 	}
 	if s.feat.Multipath {
 		s.mpOutboundFailed(pipe, err)
+		return
+	}
+	if p := s.pipe(pipe); lane == 0 && p != nil && p.out != nil && p.in != nil && !p.in.ended {
+		// Lane 0's carrier may still hold, on its inbound side, records the peer sent
+		// before it went away (its CONNECTION_CLOSE): the end waits for
+		// that side, bounded by the linger timeout.
+		if !p.out.failed {
+			p.out.failed = true
+			s.writeLostErr = err
+			s.timers.writeLost = s.now.Add(s.lingerTimeout())
+		}
 		return
 	}
 	s.closeWith(&SessionError{Kind: ClosePipesLost, Cause: err}, nil)

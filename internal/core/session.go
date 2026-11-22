@@ -99,6 +99,7 @@ type Session struct {
 	mp                *multiPath // nil unless multipath is in use
 	ack               *ackState
 	timers            timers
+	writeLostErr      error // the write failure that armed timers.writeLost
 	err               *SessionError
 	closeFr           closeFrame
 	drain             readDrainState
@@ -254,7 +255,7 @@ func New(cfg Config, now Time) *Session {
 	}
 	s.budget.tokens = budgetCap
 	s.budget.last = now
-	s.timers = timers{handshake: now.Add(cfg.HandshakeTimeout), linger: Never, grace: Never}
+	s.timers = timers{handshake: now.Add(cfg.HandshakeTimeout), linger: Never, grace: Never, writeLost: Never}
 	switch {
 	case cfg.EarlyRemembered != nil && cfg.EarlyReplayable && s.earlyAllowed():
 		s.startEarly(*cfg.EarlyRemembered, false)
@@ -661,7 +662,7 @@ func (s *Session) finishClose() {
 			s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
 		}
 	}
-	s.timers = timers{handshake: Never, linger: Never, grace: Never}
+	s.timers = timers{handshake: Never, linger: Never, grace: Never, writeLost: Never}
 	s.emitClosedEvent()
 	s.releaseAll()
 	s.wakeAll()

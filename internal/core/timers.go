@@ -13,6 +13,10 @@ type timers struct {
 	keepHas      bool
 	laneWait     Time // CONNECTION_CLOSE waits for lanes until then
 	grace        Time // resume grace
+	// writeLost bounds the wait for the inbound side after the only
+	// pipe's write side failed: records already read (a CONNECTION_CLOSE)
+	// still decide the end first.
+	writeLost Time
 }
 
 // NextTimeout returns the earliest deadline, Never when none.
@@ -23,6 +27,7 @@ func (s *Session) NextTimeout() Time {
 	t := Never
 	t = minT(t, s.timers.handshake)
 	t = minT(t, s.timers.linger)
+	t = minT(t, s.timers.writeLost)
 	if s.closeFr.waitLanes {
 		t = minT(t, s.timers.laneWait)
 	}
@@ -74,6 +79,13 @@ func (s *Session) HandleTimeout(now Time) {
 		// CONNECTION_CLOSE: linger from now, once.
 		s.closeFr.lingering = true
 		s.timers.linger = now.Add(s.lingerTimeout())
+	}
+	if now >= s.timers.writeLost {
+		s.timers.writeLost = Never
+		if s.state < StateClosing {
+			s.closeWith(&SessionError{Kind: ClosePipesLost, Cause: s.writeLostErr}, nil)
+			return
+		}
 	}
 	if s.closeFr.waitLanes && now >= s.timers.laneWait {
 		s.endLaneWait()
