@@ -94,7 +94,11 @@ func (s *Session) HandleTimeout(now Time) {
 		s.mpHandleTimeout(now)
 	}
 	if s.shp != nil {
+		due := s.shapeDeadline() <= now
 		s.shapeTimeout(now)
+		if due {
+			s.wakePrefix()
+		}
 	}
 	s.expireHeld(now)
 	if s.ack != nil {
@@ -127,7 +131,7 @@ func (s *Session) sessionTimeout() Time {
 // sessionTimers runs the due deadlines of sessionTimeout; it reports false
 // when one closed the session.
 func (s *Session) sessionTimers(now Time) bool {
-	if s.state == StateSuspended && now >= s.timers.grace {
+	if s.state == StateSuspended && s.timers.grace != Never && now >= s.timers.grace {
 		// Grace expiry: CONNECTION_CLOSE on any live
 		// outbound pipe, otherwise a local close.
 		s.timers.grace = Never
@@ -139,9 +143,11 @@ func (s *Session) sessionTimers(now Time) bool {
 		s.pingExpired()
 	}
 	if s.peerSeen && s.state != StateSuspended {
-		if d := s.idleTimeout(); d > 0 && now >= s.timers.lastActivity.Add(d) {
-			s.idleExpired()
-			return false
+		if d := s.idleTimeout(); d > 0 {
+			if at := s.timers.lastActivity.Add(d); at != Never && now >= at {
+				s.idleExpired()
+				return false
+			}
 		}
 		if at, ok := s.keepAliveAt(); ok && s.ping.outstanding == 0 && now >= at &&
 			s.timers.lastKeepRef != s.timers.lastActivity {

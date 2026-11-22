@@ -101,12 +101,66 @@ for {
 }
 ```
 
-`l.Shutdown(ctx, 0, "")` stops accepting new sessions, ends every session
-gracefully while still taking their joins and resumptions, and then
-closes the listener; `l.Close()` refuses every carrier at once. Close every
-listener you made: one that took a carrier runs a goroutine until then.
+For callback-based reception, register `conn.HandleStreams(f, maxConcurrent)`
+or `conn.HandleUniStreams(f, maxConcurrent)` once per direction. Each callback
+owns its stream and may retain it after returning. When all callback slots are
+busy, further streams stay in the accept queue. Registering a uni handler
+activates staged uni credit. A panic cancels the stream with `StreamCancelled`.
+Blocked and subsequent accepts for that direction return `ErrHandlerRegistered`.
+
+`Listener.HandlePipe` takes ownership of the carrier on entry, including on
+error. A nil result means a bootstrap entered the backlog, a join was confirmed,
+a lane was attached, or a synchronous `Fallback` returned normally. A panic
+in the callback is returned as a setup error. If the panic value was an error,
+`errors.Is` can match its cause. The caller context bounds admission and setup through handoff.
+Cancellation after backlog publication or after the fallback callback returns
+preserves that result, even while `HandlePipe` is still returning the slot or closing the carrier.
+The session owns the carrier from handoff and attempts to flush CONNECTION_CLOSE
+within its shutdown bound, including after a failed handshake or policy refusal.
+Use `Pipe.Abort()` to end a known pipe, or `Conn.Close()` to close its session.
+A local abort matches both `ErrPipeAborted` and `ErrPipeGone` with `errors.Is`.
+`Pipe.Done()` and `Conn.Done()` report the public pipe and session lifetimes.
+An adapter using `Arrival.Take` can wait for the carrier's physical cleanup,
+including lane workers and a pending graceful-close abort. A refused bootstrap
+keeps its pending slot through that cleanup. A stalled carrier keeps its slot
+while a bounded worker serves it, and `HandlePipe` returns at the verdict.
+Cancelling the context of `Serve` stops accepting connections and cancels
+pending setups. Each carrier goroutine exits at handoff and established pipes
+continue under their sessions.
+
+`l.Drain(reason)` refuses new bootstrap sessions after their handshake, including
+paired bootstraps. The dialing side can match `errors.Is(err, zmux.ErrConnectionRefused)`
+and read `ErrorMessage` with `errors.As` into a `*zmux.SessionError`. Depending
+on when the peer's close arrives, the error is returned by establishment or
+by `Conn.Wait`. Joins, lanes and resumptions continue. A later Drain replaces
+the reason and `l.Undrain()` reopens admission. A bootstrap keeps the decision
+it saw at classification. `l.Shutdown(ctx, code, reason)` starts an irreversible
+drain. Accepted sessions receive the supplied code and reason. Sessions
+still negotiating at the cutoff and sessions waiting in the accept backlog
+close with code zero. New bootstraps during the drain receive the protocol
+refusal. The final Close cancels outstanding setup. `l.Close()` immediately stops setup while accepted sessions continue.
+Close every listener you made to stop its watcher.
 `zmux.Server` serves a single connection without multipath or resume, and
 rejects `MaxPipes` above 1 and `ResumeTimeout` with `ErrInvalidConfig`.
+
+`Config.JoinOutcome(conn, pipeID, err)` reports each authorized inbound
+join and each outbound join with a carrier, including redial and pool
+joins. Nil means confirmed attachment. `ReturnOnReply` permits the
+outbound call to return before confirmation. The pipe retains its absolute
+confirmation deadline even without a hook. Expiry terminates a pending pipe.
+A failed decision aborts the locally joined carrier. Later peer acknowledgements
+cannot change that result or set `PipeStats.PeerAttached`. A confirmation
+or failure is final for both the hook and `WaitAttached`.
+For a successful join, `NextEvent` and `HandleEvents` deliver that pipe's
+events after `JoinOutcome` returns. The tracer is an independent per-event
+observation channel. It can drop events and deliver them before the hook
+returns. The hook can close and wait for its session. To drain the application
+event queue to completion, return from the hook first or let a separate
+consumer do it. A bounded `NextEvent` inside the hook can time out while
+the queue holds that hook's keys. Use `errors.Is` for
+`ErrJoinTimeout`, `ErrJoinRefused`, `ErrJoinEvicted`, context errors and
+listener closure. A carrier that fails before a local pipe ID is allocated
+reports `UnassignedPipeID`.
 
 In `Config` and the other configuration structs, the zero value of a field
 selects its stated default, and a negative value turns the setting off, or
@@ -116,7 +170,7 @@ values are invalid. A feature that is on by default has a `Switch` field
 never corrected. `JoinTimeout` (10 s) bounds every join and cannot be
 switched off; `HandshakeTimeout` bounds establishment only.
 `ListenerConfig.MaxPending` (1024 by default) bounds the carriers a
-listener holds before they belong to a session. The listener's bounds
+listener holds during setup and refusal cleanup. The listener's bounds
 (`ListenerLimits`: the pending, join and suspension counts, the
 first-record timeout and the memory budget) change while it runs:
 
@@ -261,6 +315,12 @@ report of retired pipes. A `Config.Tracer` instead receives every
 occurrence, through a backlog of 256 events per session; `Tracer.Dropped`
 says how many it lost, and `Tracer.Closed` is always the last call.
 
+With `conn.HandleEvents(f)`, one callback consumes this same queue in order.
+Each return allows the next event to be read. A panic is logged and delivery
+continues. Registration wakes blocked readers and excludes further `NextEvent`
+calls with `ErrHandlerRegistered`. Queued events can still be delivered after
+session close. `Conn.Wait` does not wait for event or stream callbacks.
+
 The runtime settings in `PipeOptions` (`SendPriority`, `ReceivePriority`,
 `SendStandby`, `ReceiveStandby`, `Weight`, `Probation`, `Liveness`,
 `QualityBand`) and its `RecordMode` are `zmux.Change` values, the types of
@@ -290,9 +350,94 @@ carrier's work has ended, with how it ended.
 pipe through `Config.Redial`, make before break, after a session secret may
 have leaked. On the server, `zmux.AdmittedAs[T](conn)` (or a `*Pipe`)
 returns the value the admission attached to the carrier. `PipeStats` reports per-pipe loss:
-`BytesLost` and `RecordsLost` when a pipe fails, `BytesRetransmitted` and
-`LossRate` from the carrier's own retransmissions; see the godoc for
+`BytesLost` and `RecordsLost` when a pipe fails, and `CarrierSample` for
+shared native connection counters; see the godoc for
 their exact definitions.
+
+### Responding to pipe deterioration
+
+`SchedulerSpreadETA` uses recent ACK RTT and delivery measurements plus
+carrier queue depth and ACK progress. Delivery and carrier-queue samples age
+after 10 seconds and RTT samples after 30 seconds. The RTT minimum is a 30-second lower bound
+when fresh. A pipe without its own bottleneck sample can borrow a recent rate
+from its class for at most four rounds and ten seconds. Idle pipes use the
+configured liveness probe cadence.
+
+A configured `Redial` hook, a `Tracer.Event` callback, or a callback
+registered with `Conn.HandleEvents` enables path quality advice. Polling
+with `Conn.NextEvent` also enables advice. `Conn.StopEvents` releases
+the callback and polling subscription. A configured `Redial` or
+`Tracer.Event` remains active. An
+unobserved bootstrap pipe keeps its ordinary protocol measurements. When
+another attachment is created, the scheduler starts collecting recent
+placement measurements, even without an advice consumer.
+
+For multipath sessions, `EventPipePathQuality` reports sustained outbound
+deterioration through `NextEvent`, `HandleEvents` and `Tracer.Event`. It
+includes the pipe ID, fate group, reason, recent RTT and delivery rate, and
+carrier-reported queued bytes. Use the same nonzero `PipeOptions.FateGroup`
+for sibling pipes sharing a path, including a replacement. Groups from
+different joiners occupy separate namespaces. Group zero carries no sibling
+evidence.
+
+Deterioration must persist across two checks one second apart. The signals
+include recent RTT above twice the fresh reference plus 50 ms, a sustained
+write or ACK stall, a carrier queue of at least 32 KiB exceeding one second
+of measured service, or a recent service estimate below one quarter of the
+short pacing peak with at least 32 KiB in flight. For an RTT-triggered episode,
+recovery requires a fresh RTT below 1.5 times the reference plus 25 ms.
+
+| `Event.PathQuality` | Evidence | Host action |
+| --- | --- | --- |
+| `PipePathQualityHealthySibling` | A sibling in the same fate group delivered a fresh RTT observation after deterioration started and is still healthy. | Consider replacing this connection. |
+| `PipePathQualityLocalStall` | A carrier write stalled or its reported queue exceeds a second of recent service, with a recent RTT and no observed shared RTT rise. | Consider replacing this connection. |
+| `PipePathQualityShared` | All observed outbound siblings in the same fate group are deteriorating. | Let ETA lower the path's share, or set `SendStandby` while another path is healthy. |
+| `PipePathQualityUnknown` | Current observations cannot distinguish the scope. | Wait for more evidence. |
+| `PipePathQualityRestored` | Recent observations passed the recovery threshold. | Cancel pending replacement for that pipe and clear any host standby override. |
+
+Only connection-specific observations with current send demand carry a
+positive `RetryAfter`. Hosts that configure `Redial` may explicitly call
+`Conn.RequestPipeReplacement(Event.PipeID)` after checking the advice.
+Equivalent requests coalesce. Outage coverage and approved replacement
+have separate attempt slots and retry backoffs. Losing a direction
+cancels an in-progress replacement and lets outage recovery start.
+A replacement callback that is still returning may overlap an outage
+callback. The session revalidates replacement before each attempt and
+after the host dial returns. The callback can call
+`zmux.ReplacingPipe(ctx)` to select the carrier's path for a replacement.
+The old pipe stays until its replacement attaches and the episode is
+still current. If the host manages pipes itself, it may consume the event
+and perform its own make-before-break instead.
+
+Performance deterioration affects scheduling and may generate advice while
+a pipe continues making delivery progress. Only the native Liveness
+stall rules enter Suspect and trigger whole-pipe reinjection. Advice is
+cleared after two fresh observations below the recovery threshold a
+second apart. Advisory classifications also require two consecutive
+observations before changing. Dial attempts stop earlier if current
+evidence no longer supports replacement.
+
+For spread ETA data, each handed-off batch freezes a confirmation deadline
+from its queue, recent RTT, rate, variation and the peer ACK delay. A missed
+deadline can put the lowest outstanding byte range into the ordinary
+reinjection queue when its carrier has made insufficient progress and an
+eligible, freshly observed alternative has a materially earlier arrival
+estimate. One stream can have one such range reserved, up to one spread chunk.
+These reservations share the session's redundant-copy byte bound and use
+the existing carrier reinjection, pacing and shaping limits. A session
+token bucket has a burst of one `SpreadChunk` and refills one
+`SpreadChunk` per second. It charges actual encoded STREAM payload
+including preambles at submission. Pending copies reserve credit,
+and a canceled copy releases its unsent reservation. If credit
+runs low, an eligible repair waits until the bucket has enough. Over an
+interval of length T seconds, anticipatory copies add at most
+`SpreadChunk × (1 + T + 0.000001)` bytes, allowing for microsecond clock
+rounding. Frames, records, carrier overhead and shaping padding are
+additional to this payload limit.
+A PIPE_ACK from either copy cancels unsent work and returns the reservation. Native
+pipe failure takes over through ordinary reinjection. Stream credit continues
+to count unique offsets. Actual extra bytes count in `BytesReinjected` and
+`BytesOpportunistic`.
 
 ### Reconnecting after an outage
 
@@ -651,13 +796,25 @@ zmux closes the carrier when `Fallback` returns unless the host called
 goroutine after `Fallback` returned, with a context of its own, and the
 host must close it once done (each half closes once, whoever closes it; an
 HTTP request carrier's handler waits for both halves, bounded only by the
-request's context). What an
-HTTP request is depends on the stage it is decided at: on its head (an
-upgrade's head, an exchange request, a request without a body) it is a
-request, served by `zmuxhttp.Options.Next`; on the start of its body (a
-stream or uplink request carrier) it is a carrier, taken over by
-`ListenerConfig.Fallback` as the full-duplex byte stream of its request and
-response bodies, the response head written by zmux. On the head of an HTTP
+request's context). When `Decide` returns `VerdictFallback` on an HTTP request,
+a configured `zmuxhttp.Options.Next` receives the original headers and
+the entire body before any carrier response header is written. Bytes consumed
+by admission are replayed first. The unread body continues streaming, including
+decoded chunks. Next controls the HTTP status, headers and body. Its request
+context follows client cancellation and listener stop. If Next is nil, the adapter
+responds with HTTP 404, including when `ListenerConfig.Fallback` is configured. A TCP/TLS stream or
+an already upgraded carrier goes directly to the listener's takeover callback.
+`VerdictTakeover` requests the carrier itself on every transport. An HTTP
+request carrier writes and flushes its accepted response head before invoking
+the host. Failure or cancellation during the flush ends setup. The host reads
+the replayed input prefix and remaining request body, and writes the response
+body. A WebTransport upgrade, its CONNECT response and its first stream
+share one effective `HandshakeTimeout`, capped by any earlier Defer deadline.
+Both `AdmissionStats.Takeover` and the matching `VariantStat.Takeover`
+increment once as the carrier enters the host callback, even if it panics.
+A Takeover decision without a byte-stream target follows the stall counters.
+A failed accepted response counts once in `AdmissionStats.HandshakeFailed`.
+On the head of an HTTP
 upgrade (WebSocket, WebTransport; `CarrierInfo.Upgrade`) `VerdictDefer`
 completes the upgrade and decides again on the carrier's first message (or
 the first `Peek` bytes of the first WebTransport stream), within the same
@@ -770,9 +927,11 @@ conn, err := zmuxquic.Dial(ctx, "example.com:4433", tlsConf, nil, nil)
 ```
 
 On the server, `zmuxquic.Serve(ctx, l, ln)` hands the streams of a QUIC
-listener to a `zmux.Listener`; `zmuxquic.ServeConn` serves one QUIC
-connection the caller already accepted or dialled, such as one made by hole
-punching. `zmuxh3.Dial` and `zmuxh3.Serve` do the same for WebTransport
+listener to a `zmux.Listener`. `zmuxquic.ServeConn(ctx, l, qc)` serves one
+QUIC connection the caller already accepted or dialled, such as one made by
+hole punching. Both use `l`’s `ListenerConfig.Fallback` for a first stream
+classified as `VerdictFallback`. The callback receives the replayed stream
+and can access its QUIC connection with `zmuxquic.TakeoverConn`. `zmuxh3.Dial` and `zmuxh3.Serve` do the same for WebTransport
 sessions.
 
 The default dialer of `zmuxquic.Dial` and `NewConnPool` binds `udp4` or `udp6`
@@ -901,9 +1060,8 @@ carrier-cutting relay), outside the API stability promise.
 go test -race ./...
 ```
 
-Run it in each module directory. The root `go.work` makes the sub-modules
-build against the local root module; see RELEASING.md for the release
-order.
+Run it in each module directory. Use a local workspace to test the modules together.
+See RELEASING.md for workspace setup and the release order.
 
 ## License
 

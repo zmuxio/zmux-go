@@ -249,17 +249,22 @@ var errNestingLoop = errors.New("zmux: the carrier runs over the session it woul
 // closes that session.
 type outerRef struct{ c *Conn }
 
-// outerOf returns the outer session of a stream-backed carrier (zero for
-// other carriers).
-func outerOf(p PipeIO) outerRef {
+// carrierIdentity samples the lane identity and the enclosing session, if any.
+// The writer has precedence for lane identity. Either half may identify nesting.
+func carrierIdentity(p PipeIO) (carrier any, outer outerRef) {
+	seen := false
 	for _, x := range []any{p.W, p.R} {
 		if cc, ok := x.(CarrierConner); ok {
-			if o, ok := cc.CarrierConn().(*Conn); ok {
-				return outerRef{o}
+			id := cc.CarrierConn()
+			if !seen {
+				carrier, seen = id, true
+			}
+			if o, ok := id.(*Conn); ok {
+				return carrier, outerRef{o}
 			}
 		}
 	}
-	return outerRef{}
+	return carrier, outer
 }
 
 // nestEdge is one recorded edge n -> o of the nesting graph, held by

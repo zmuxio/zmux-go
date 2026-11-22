@@ -64,7 +64,7 @@ func (c *Conn) ReplacePipes(ctx context.Context) error {
 	}
 	for _, p := range old {
 		dir := DirectionBidirectional
-		if st, ok := p.Stats(); ok {
+		if st, ok := p.stats(false); ok {
 			switch {
 			case st.Inbound == InboundNone:
 				dir = DirectionSendOnly

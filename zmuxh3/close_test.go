@@ -83,13 +83,13 @@ func TestPoolCloseCode(t *testing.T) {
 func TestSessionCloseCode(t *testing.T) {
 	for _, c := range []struct {
 		err  error
-		code webtransport.SessionErrorCode
 		msg  string
+		code webtransport.SessionErrorCode
 	}{
-		{&zmux.ApplicationError{ErrorCode: 0x2a, ErrorMessage: "bye"}, 0x2a, "bye"},
-		{&zmux.ApplicationError{ErrorCode: 1 << 40, ErrorMessage: "big"}, 0, ""},
-		{&zmux.IdleTimeoutError{}, 0, ""},
-		{nil, 0, ""},
+		{err: &zmux.ApplicationError{ErrorCode: 0x2a, ErrorMessage: "bye"}, code: 0x2a, msg: "bye"},
+		{err: &zmux.ApplicationError{ErrorCode: 1 << 40, ErrorMessage: "big"}, code: 0, msg: ""},
+		{err: &zmux.IdleTimeoutError{}, code: 0, msg: ""},
+		{err: nil, code: 0, msg: ""},
 	} {
 		if code, msg := SessionCloseCode(c.err); code != c.code || msg != c.msg {
 			t.Fatalf("%v: %#x %q", c.err, code, msg)

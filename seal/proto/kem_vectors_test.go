@@ -126,9 +126,9 @@ func genSessions(t testing.TB) []sessionVector {
 // refNoise is an independent, plain transcription of Noise with the HFS
 // tokens, used to check the handshake vectors.
 type refNoise struct {
-	aes   bool
 	ck, h []byte
 	k     []byte
+	aes   bool
 	n     uint64
 }
 

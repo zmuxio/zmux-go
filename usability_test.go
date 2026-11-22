@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -24,40 +25,67 @@ import (
 func TestConfigBounds(t *testing.T) {
 	psk := PipeAuth{PSK: bytes.Repeat([]byte{1}, 32)}
 	for _, c := range []struct {
-		name string
 		cfg  Config
+		name string
 		role core.Role
 		ok   bool
 	}{
-		{"SendBufferMax below SendBuffer", Config{SendBuffer: 8 << 20, SendBufferMax: 4 << 20}, core.RoleInitiator, false},
-		{"SendBufferMax below the default SendBuffer", Config{SendBufferMax: 1 << 20}, core.RoleInitiator, false},
-		{"SendBufferMax at SendBuffer", Config{SendBuffer: 4 << 20, SendBufferMax: 4 << 20}, core.RoleInitiator, true},
-		{"ReplayWindow below MaxPipes+H", Config{MaxPipes: 4, ReplayWindow: 11, PipeAuth: psk}, core.RoleInitiator, false},
-		{"ReplayWindow at MaxPipes+H", Config{MaxPipes: 4, ReplayWindow: 12, PipeAuth: psk}, core.RoleInitiator, true},
-		{"negative ResumeTimeout", Config{ResumeTimeout: -1}, core.RoleInitiator, false},
-		{"negative JoinTimeout", Config{JoinTimeout: -1}, core.RoleInitiator, false},
-		{"negative JoinEarlyHello", Config{JoinEarlyHello: -1}, core.RoleInitiator, true},
-		{"negative RedialMinBackoff", Config{RedialBackoff: Backoff{Min: -1}}, core.RoleInitiator, false},
-		{"RedialMinBackoff above the default maximum", Config{RedialBackoff: Backoff{Min: 2 * time.Minute}}, core.RoleInitiator, false},
-		{"RedialMinBackoff above RedialMaxBackoff", Config{RedialBackoff: Backoff{Min: 5 * time.Second, Max: 2 * time.Second}}, core.RoleInitiator, false},
-		{"RedialMaxBackoff below the default minimum", Config{RedialBackoff: Backoff{Max: 500 * time.Millisecond}}, core.RoleInitiator, false},
-		{"redial backoff bounds", Config{RedialBackoff: Backoff{Min: 2 * time.Second, Max: 2 * time.Second}}, core.RoleInitiator, true},
-		{"ZmuxPeer with RoleAuto", Config{EarlyData: EarlyData{ZmuxPeer: true}}, core.RoleAuto, false},
-		{"ZmuxPeer as a client", Config{EarlyData: EarlyData{ZmuxPeer: true}}, core.RoleInitiator, true},
+		{name: "SendBufferMax below SendBuffer", cfg: Config{SendBuffer: 8 << 20, SendBufferMax: 4 << 20}, role: core.RoleInitiator, ok: false},
+		{name: "SendBufferMax below the default SendBuffer", cfg: Config{SendBufferMax: 1 << 20}, role: core.RoleInitiator, ok: false},
+		{name: "SendBufferMax at SendBuffer", cfg: Config{SendBuffer: 4 << 20, SendBufferMax: 4 << 20}, role: core.RoleInitiator, ok: true},
+		{name: "ReplayWindow below MaxPipes+H", cfg: Config{MaxPipes: 4, ReplayWindow: 11, PipeAuth: psk}, role: core.RoleInitiator, ok: false},
+		{name: "ReplayWindow at MaxPipes+H", cfg: Config{MaxPipes: 4, ReplayWindow: 12, PipeAuth: psk}, role: core.RoleInitiator, ok: true},
+		{name: "positive submillisecond ResumeTimeout", cfg: Config{ResumeTimeout: time.Millisecond - 1, PipeAuth: psk}, role: core.RoleInitiator, ok: false},
+		{name: "negative SpreadChunk", cfg: Config{SchedulerParams: SchedulerParams{SpreadChunk: -1}}, role: core.RoleInitiator, ok: false},
+		{name: "oversized SpreadChunk", cfg: Config{SchedulerParams: SchedulerParams{SpreadChunk: math.MaxInt32 + 1}}, role: core.RoleInitiator, ok: false},
+		{name: "negative ResumeTimeout", cfg: Config{ResumeTimeout: -1}, role: core.RoleInitiator, ok: false},
+		{name: "negative JoinTimeout", cfg: Config{JoinTimeout: -1}, role: core.RoleInitiator, ok: false},
+		{name: "negative JoinEarlyHello", cfg: Config{JoinEarlyHello: -1}, role: core.RoleInitiator, ok: true},
+		{name: "negative RedialMinBackoff", cfg: Config{RedialBackoff: Backoff{Min: -1}}, role: core.RoleInitiator, ok: false},
+		{name: "RedialMinBackoff above the default maximum", cfg: Config{RedialBackoff: Backoff{Min: 2 * time.Minute}}, role: core.RoleInitiator, ok: false},
+		{name: "RedialMinBackoff above RedialMaxBackoff", cfg: Config{RedialBackoff: Backoff{Min: 5 * time.Second, Max: 2 * time.Second}}, role: core.RoleInitiator, ok: false},
+		{name: "RedialMaxBackoff below the default minimum", cfg: Config{RedialBackoff: Backoff{Max: 500 * time.Millisecond}}, role: core.RoleInitiator, ok: false},
+		{name: "redial backoff bounds", cfg: Config{RedialBackoff: Backoff{Min: 2 * time.Second, Max: 2 * time.Second}}, role: core.RoleInitiator, ok: true},
+		{name: "ZmuxPeer with RoleAuto", cfg: Config{EarlyData: EarlyData{ZmuxPeer: true}}, role: core.RoleAuto, ok: false},
+		{name: "ZmuxPeer as a client", cfg: Config{EarlyData: EarlyData{ZmuxPeer: true}}, role: core.RoleInitiator, ok: true},
 	} {
 		_, err := c.cfg.coreConfig(c.role, c.role)
 		if c.ok && err != nil || !c.ok && !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%s: %v", c.name, err)
 		}
 	}
-	// A fraction of a millisecond of the grace period is rounded up (the
-	// unit of the parameter), not an error.
-	cc, err := (&Config{ResumeTimeout: 1500 * time.Microsecond, PipeAuth: psk}).coreConfig(core.RoleInitiator, core.RoleInitiator)
-	if err != nil {
-		t.Fatalf("ResumeTimeout 1.5 ms: %v", err)
+	for _, tc := range []struct {
+		duration time.Duration
+		wire     uint64
+	}{
+		{time.Millisecond, 1},
+		{1500 * time.Microsecond, 2},
+		{math.MaxInt64, 9_223_372_036_855},
+	} {
+		cfg := Config{MaxIdleTimeout: tc.duration, ResumeTimeout: tc.duration, PipeAuth: psk}
+		cc, err := cfg.coreConfig(core.RoleInitiator, core.RoleInitiator)
+		if err != nil {
+			t.Fatalf("timeout %v: %v", tc.duration, err)
+		}
+		if cc.Local.MaxIdleTimeout != tc.wire || cc.Local.ResumeGrace != tc.wire ||
+			cc.IdleTimeout != int64(tc.duration) || cc.Resume != int64(tc.duration) {
+			t.Errorf("timeout %v: idle %d/%d, resume %d/%d, error %v",
+				tc.duration, cc.Local.MaxIdleTimeout, cc.IdleTimeout, cc.Local.ResumeGrace, cc.Resume, err)
+		}
 	}
-	if cc.Local.ResumeGrace != 2 {
-		t.Errorf("ResumeTimeout 1.5 ms: grace %d", cc.Local.ResumeGrace)
+	for _, chunk := range []int64{0, 1, math.MaxInt32} {
+		cfg := Config{SchedulerParams: SchedulerParams{SpreadChunk: chunk}}
+		cc, err := cfg.coreConfig(core.RoleInitiator, core.RoleInitiator)
+		if err != nil {
+			t.Fatalf("SpreadChunk %d: %v", chunk, err)
+		}
+		want := int(chunk)
+		if chunk == 0 {
+			want = core.DefaultConfig().SpreadChunk
+		}
+		if cc.SpreadChunk != want {
+			t.Errorf("SpreadChunk %d: got %d, %v, want %d", chunk, cc.SpreadChunk, err, want)
+		}
 	}
 }
 
@@ -78,46 +106,46 @@ func (c *closeCountConn) Close() error {
 func TestOwnershipOnFailure(t *testing.T) {
 	psk := bytes.Repeat([]byte{1}, 32)
 	for _, c := range []struct {
-		name  string
 		start func(ctx context.Context, nc net.Conn) error
+		name  string
 	}{
-		{"invalid config", func(ctx context.Context, nc net.Conn) error {
+		{name: "invalid config", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Client(ctx, nc, &Config{JoinTimeout: -1})
 			return err
 		}},
-		{"multipath without a source", func(ctx context.Context, nc net.Conn) error {
+		{name: "multipath without a source", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Client(ctx, nc, &Config{MaxPipes: 2})
 			return err
 		}},
-		{"resume without a source", func(ctx context.Context, nc net.Conn) error {
+		{name: "resume without a source", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Client(ctx, nc, &Config{ResumeTimeout: time.Second})
 			return err
 		}},
-		{"EndToEnd only", func(ctx context.Context, nc net.Conn) error {
+		{name: "EndToEnd only", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Client(ctx, nc, &Config{MaxPipes: 2, PipeAuth: PipeAuth{EndToEnd: true}})
 			return err
 		}},
-		{"Server with MaxPipes", func(ctx context.Context, nc net.Conn) error {
+		{name: "Server with MaxPipes", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Server(ctx, nc, &Config{MaxPipes: 2, PipeAuth: PipeAuth{PSK: psk}})
 			return err
 		}},
-		{"Server with ResumeTimeout", func(ctx context.Context, nc net.Conn) error {
+		{name: "Server with ResumeTimeout", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Server(ctx, nc, &Config{ResumeTimeout: time.Second, PipeAuth: PipeAuth{PSK: psk}})
 			return err
 		}},
-		{"RoleAuto with MaxPipes", func(ctx context.Context, nc net.Conn) error {
+		{name: "RoleAuto with MaxPipes", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Start(ctx, NetPipe(nc), RoleAuto, &Config{MaxPipes: 2, PipeAuth: PipeAuth{PSK: psk}})
 			return err
 		}},
-		{"secure first pipe with a PSK", func(ctx context.Context, nc net.Conn) error {
+		{name: "secure first pipe with a PSK", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Start(ctx, secureTestPipe(nc), RoleClient, &Config{MaxPipes: 2, PipeAuth: PipeAuth{PSK: psk}})
 			return err
 		}},
-		{"secure first pipe with a deferred PSK", func(ctx context.Context, nc net.Conn) error {
+		{name: "secure first pipe with a deferred PSK", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Start(ctx, secureTestPipe(nc), RoleClient, &Config{MaxPipes: 2, PipeAuth: PipeAuth{DeferredPSK: true}})
 			return err
 		}},
-		{"secure first pipe with the exporter", func(ctx context.Context, nc net.Conn) error {
+		{name: "secure first pipe with the exporter", start: func(ctx context.Context, nc net.Conn) error {
 			_, err := Start(ctx, secureTestPipe(nc), RoleClient, &Config{MaxPipes: 2, PipeAuth: PipeAuth{Exporter: true}})
 			return err
 		}},
@@ -160,7 +188,7 @@ func TestSecureFirstPipeEndToEnd(t *testing.T) {
 		}
 		a, b := net.Pipe()
 		p := secureTestPipe(a)
-		c, err := setupCore(t.Context(), p, cfg, cc, nil, nil)
+		c, err := setupCore(t.Context(), p, cfg, cc, nil, nil, nil)
 		if errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%+v: %v", auth, err)
 		}
@@ -177,15 +205,15 @@ func TestSecureFirstPipeEndToEnd(t *testing.T) {
 // NewListener validates the whole configuration and returns the error.
 func TestNewListenerInvalid(t *testing.T) {
 	for _, c := range []struct {
-		name string
 		cfg  ListenerConfig
+		name string
 	}{
-		{"long InstanceID", ListenerConfig{InstanceID: make([]byte, MaxInstanceIDLen+1)}},
-		{"negative count", ListenerConfig{Backlog: -1}},
-		{"negative per-session count", ListenerConfig{MaxPendingPerSession: -1}},
-		{"invalid session Config", ListenerConfig{Config: &Config{JoinTimeout: -1}}},
-		{"invalid Admission", ListenerConfig{Admission: &Admission{}}},
-		{"invalid WrapPipe", ListenerConfig{WrapPipe: invalidWrapper{}}},
+		{name: "long InstanceID", cfg: ListenerConfig{InstanceID: make([]byte, MaxInstanceIDLen+1)}},
+		{name: "negative count", cfg: ListenerConfig{Backlog: -1}},
+		{name: "negative per-session count", cfg: ListenerConfig{MaxPendingPerSession: -1}},
+		{name: "invalid session Config", cfg: ListenerConfig{Config: &Config{JoinTimeout: -1}}},
+		{name: "invalid Admission", cfg: ListenerConfig{Admission: &Admission{}}},
+		{name: "invalid WrapPipe", cfg: ListenerConfig{WrapPipe: invalidWrapper{}}},
 	} {
 		l, err := NewListener(&c.cfg)
 		if l != nil || !errors.Is(err, ErrInvalidConfig) {
@@ -307,12 +335,12 @@ func TestResumeAttendedByPool(t *testing.T) {
 // ErrJoinPending says what is missing.
 func TestJoinPendingText(t *testing.T) {
 	for _, c := range []struct {
-		jp   core.JoinPendingError
 		want string
+		jp   core.JoinPendingError
 	}{
-		{core.JoinPendingError{Declare: true}, "DeclareEndToEnd"},
-		{core.JoinPendingError{Secret: true}, "SetJoinSecret"},
-		{core.JoinPendingError{Declare: true, Secret: true}, "DeclareEndToEnd) and the deferred PSK"},
+		{jp: core.JoinPendingError{Declare: true}, want: "DeclareEndToEnd"},
+		{jp: core.JoinPendingError{Secret: true}, want: "SetJoinSecret"},
+		{jp: core.JoinPendingError{Declare: true, Secret: true}, want: "DeclareEndToEnd) and the deferred PSK"},
 	} {
 		err := apiErr(&c.jp)
 		if !errors.Is(err, ErrJoinPending) || !strings.Contains(err.Error(), c.want) {

@@ -92,9 +92,14 @@ func (s *Session) ShapeLimitsInForce() shaping.Limits {
 
 // SetShapeBudget replaces the configuration's budget; the account carries over.
 func (s *Session) SetShapeBudget(b shaping.Budget) {
-	sh := s.shapeSess()
+	sh := s.shp
+	if sh == nil && b != (shaping.Budget{}) {
+		sh = s.shapeSess()
+	}
 	s.cfg.ShapeBudget = b
-	s.shapeLimitsChanged(sh)
+	if sh != nil {
+		s.shapeLimitsChanged(sh)
+	}
 }
 
 func (s *Session) shapeLimitsChanged(sh *shapeSess) {
@@ -162,6 +167,9 @@ type Factory func(pipe uint64, carrier uint8, overhead int) shaping.Shaper
 
 // SetShaper installs f on every outbound pipe; nil: no shaping.
 func (s *Session) SetShaper(f Factory) {
+	if f == nil && s.shp == nil {
+		return
+	}
 	sh := s.shapeSess()
 	sh.fac = f
 	sh.gen++
@@ -847,7 +855,9 @@ func (s *Session) shapeDeadline() Time {
 			}
 			t = minT(t, minT(ps.delayUntil, rel)) // exactly: no granularity floor
 		}
-		if ps.wake && s.sched.mask != 0 {
+		// Redundant copies wait on the same gate after their original
+		// stream has left the send scheduler.
+		if ps.wake && (s.sched.mask != 0 || p.mp != nil && (len(p.mp.copyQ) != 0 || len(p.mp.selfCopyQ) != 0)) {
 			r := ps.hold
 			if b := &ps.bucket; b.rate > 0 && b.held() {
 				at := Never

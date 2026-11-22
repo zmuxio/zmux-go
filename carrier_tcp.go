@@ -1,11 +1,11 @@
 package zmux
 
 import (
-	"crypto/tls"
-	"net"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 )
 
 // Low-water marks of TCP carriers:
@@ -18,28 +18,26 @@ const (
 // tcpInfo is the TCP socket under a carrier, when there is one: its
 // low-water mark and its minimum RTT are optional carrier capabilities.
 type tcpInfo struct {
-	rc      syscall.RawConn
-	retrans *counter32 // widens a 32-bit retransmission count (Windows)
-	q       *tcpQuery
+	rc syscall.RawConn
+	q  *tcpQuery
 }
 
 // tcpQuery holds the RawConn.Control callbacks of one socket, bound once,
 // and their results, so that a query allocates nothing (a closure per call
 // would escape through Control); mu serialises the queries.
 type tcpQuery struct {
-	unsent, retrans, rtt func(uintptr)
-	lowWater             func(uintptr)
-	n                    uint64
-	d                    time.Duration
-	low                  int
-	mu                   sync.Mutex
-	ok                   bool
+	unsent, rtt func(uintptr)
+	lowWater    func(uintptr)
+	n           uint64
+	d           time.Duration
+	low         int
+	mu          sync.Mutex
+	ok          bool
 }
 
 func newTCPQuery() *tcpQuery {
 	q := &tcpQuery{}
 	q.unsent = func(fd uintptr) { q.n, q.ok = tcpUnsent(fd) }
-	q.retrans = func(fd uintptr) { q.n, q.ok = tcpRetrans(fd) }
 	q.rtt = func(fd uintptr) { q.d, q.ok = tcpMinRTT(fd) }
 	q.lowWater = func(fd uintptr) { q.ok = setNotsentLowat(fd, q.low) == nil }
 	return q
@@ -56,36 +54,11 @@ func (q *tcpQuery) run(rc syscall.RawConn, f func(uintptr)) (uint64, time.Durati
 	return q.n, q.d, q.ok
 }
 
-// counter32 extends a wrapping 32-bit counter to 64 bits, read often
-// enough that it wraps at most once between reads.
-type counter32 struct {
-	mu   sync.Mutex
-	last uint32
-	high uint64 // wraps seen, << 32
-}
-
-func (c *counter32) widen(v uint32) uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if v < c.last {
-		c.high += 1 << 32
-	}
-	c.last = v
-	return c.high | uint64(v)
-}
-
-// tcpOf finds the TCP socket under a carrier half (a TCP connection, or a
-// TLS connection over one).
 func tcpOf(x any) tcpInfo {
-	if nc, ok := x.(NetConner); ok {
-		x = nc.NetConn() // TLS, or a transform's half over a connection
-		if tc, ok := x.(*tls.Conn); ok {
-			x = tc.NetConn()
-		}
-	}
-	if c, ok := x.(*net.TCPConn); ok {
+	//goland:noinspection GoResourceLeak // borrowed view of the carrier; its owner closes it
+	if c := carrierstats.TCPConnOf(x); c != nil {
 		if rc, err := c.SyscallConn(); err == nil {
-			return tcpInfo{rc: rc, retrans: retransCounter(), q: newTCPQuery()}
+			return tcpInfo{rc: rc, q: newTCPQuery()}
 		}
 	}
 	return tcpInfo{}
@@ -121,23 +94,6 @@ func (t tcpInfo) unsent() (uint64, bool) {
 		return 0, false
 	}
 	n, _, ok := t.q.run(t.rc, t.q.unsent)
-	return n, ok
-}
-
-// retransmitted is the bytes the socket retransmitted, an optional
-// capability: Linux tcpi_bytes_retrans of TCP_INFO (64-bit, Linux 4.19
-// and later), Darwin tcpi_txretransmitbytes of TCP_CONNECTION_INFO
-// (64-bit), Windows BytesRetrans of SIO_TCP_INFO (32-bit in every version
-// of TCP_INFO, widened here: it is read at most once a second, far less
-// than 4 GiB of retransmissions apart).
-func (t tcpInfo) retransmitted() (uint64, bool) {
-	if t.rc == nil {
-		return 0, false
-	}
-	n, _, ok := t.q.run(t.rc, t.q.retrans)
-	if ok && t.retrans != nil {
-		n = t.retrans.widen(uint32(n))
-	}
 	return n, ok
 }
 

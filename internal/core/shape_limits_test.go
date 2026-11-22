@@ -7,6 +7,15 @@ import (
 	"github.com/zmuxio/zmux-go/varint"
 )
 
+func TestDisableShapingWithoutShaper(t *testing.T) {
+	s, p := channelSession(t, nil, false)
+	s.SetShapeBudget(shaping.Budget{})
+	s.SetShaper(nil)
+	if s.shp != nil || p.sh != nil {
+		t.Fatal("disabling shaping allocated shaping state")
+	}
+}
+
 // injectShaper asks for one injection of n frame bytes when installed.
 type injectShaper struct {
 	injected []int

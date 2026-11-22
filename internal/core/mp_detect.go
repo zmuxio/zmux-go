@@ -294,6 +294,8 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 		return true
 	}
 	s.epochTimers(apply, due)
+	next = minT(next, s.pathQualityTimers(now, apply))
+	next = minT(next, s.prefixTimers(now, apply))
 	liveIn := s.hasLiveInbound()
 	for i := 0; i < len(s.pipes); i++ { //nolint:intrange // failing a pipe may shrink s.pipes; the bound is re-read
 		p := s.pipes[i]
@@ -301,12 +303,11 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 		if a == nil || a.retired {
 			continue
 		}
-		// Unconfirmed local joins fail at the join timeout.
-		if a.joinerLocal && (a.out == OutJoining || a.out == OutNone && a.in == InJoining) && p.id != 0 {
-			if due(a.attachedAt.Add(s.cfg.JoinTimeout)) && apply {
-				s.failPipe(p, 0x296a5bf5, nil)
-				continue
-			}
+		// The join deadline runs until the peer proves attachment, even
+		// after the handshake has opened the directions.
+		if a.joinerLocal && a.peer == peerPending && a.joinDeadline != 0 && due(a.joinDeadline) && apply {
+			s.abortUnconfirmed(p, ErrJoinTimeout)
+			continue
 		}
 		ws, wstall := s.writeStall(p)
 		if p.out != nil && a.liveOut() && (a.unacked && liveIn || wstall) {
@@ -350,6 +351,7 @@ func (s *Session) mpTimers(now Time, apply bool) Time {
 		// with or without the PIPE_ACK that would have ended it sooner.
 		if a.held1 && due(a.holdUntil) && apply {
 			a.held1 = false
+			s.wakePrefix()
 			s.wakeAllWriters()
 		}
 		// Idle-pipe probe.

@@ -21,9 +21,9 @@ import (
 func TestCloseDelivery(t *testing.T) {
 	for _, via := range []string{"dial", "pool"} {
 		for _, c := range []struct {
-			code   zmux.ApplicationErrorCode
 			reason string
-		}{{0x2a, "bye"}, {0, ""}} {
+			code   zmux.ApplicationErrorCode
+		}{{code: 0x2a, reason: "bye"}, {code: 0, reason: ""}} {
 			t.Run(fmt.Sprintf("%s/%#x", via, uint64(c.code)), func(t *testing.T) {
 				closeDelivery(t, via, c.code, c.reason)
 			})

@@ -37,6 +37,8 @@ jobs:
             path: examples/xorpipe
           - name: dgpeer
             path: interop/dgpeer
+          - name: webpeer
+            path: interop/webpeer
     defaults:
       run:
         shell: bash
@@ -46,8 +48,12 @@ jobs:
 
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: ${{ matrix.module.path }}/go.mod
+          go-version: "1.27.4"
           cache-dependency-path: "**/go.sum"
+
+      - name: Local workspace
+        working-directory: .
+        run: bash tools/ci-workspace.sh
 
       - name: gofmt
         run: |
@@ -79,6 +85,26 @@ jobs:
           path: ${{ runner.temp }}/test.json
           if-no-files-found: ignore
 
+  independent:
+    name: Published dependencies (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [".", zmuxquic, zmuxws, seal, zmuxh3]
+    env:
+      GOWORK: "off"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: "1.27.4"
+          cache-dependency-path: "**/go.sum"
+      - name: Build and test without a workspace
+        working-directory: ${{ matrix.module }}
+        run: go test -mod=readonly ./...
+
   lint:
     name: golangci-lint (${{ matrix.module }})
     runs-on: ubuntu-latest
@@ -92,8 +118,12 @@ jobs:
 
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: go.mod
+          go-version: "1.27.4"
           cache-dependency-path: "**/go.sum"
+
+      - name: Local workspace
+        working-directory: .
+        run: bash tools/ci-workspace.sh
 
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
@@ -102,6 +132,10 @@ jobs:
           working-directory: ${{ matrix.module }}
           # One config for every module; paths in it are relative to it.
           args: --config=${{ github.workspace }}/.golangci.yml
+
+      - name: Staticcheck (all checks)
+        working-directory: ${{ matrix.module }}
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 -checks all ./...
 
   cross:
     name: 32-bit and ARM targets (${{ matrix.module }})
@@ -119,8 +153,12 @@ jobs:
 
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: go.mod
+          go-version: "1.27.4"
           cache-dependency-path: "**/go.sum"
+
+      - name: Local workspace
+        working-directory: .
+        run: bash tools/ci-workspace.sh
 
       # Nothing is run here: a 32-bit int, a 32-bit uintptr and 4-byte
       # alignment of 64-bit atomics fail to compile or vet, not at run time.
@@ -147,8 +185,12 @@ jobs:
 
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version-file: go.mod
+          go-version: "1.27.4"
           cache-dependency-path: "**/go.sum"
+
+      - name: Local workspace
+        working-directory: .
+        run: bash tools/ci-workspace.sh
 
       - name: fuzz
         run: tools/fuzz.sh 10s

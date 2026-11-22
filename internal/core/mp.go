@@ -44,25 +44,44 @@ var inStateNames = [...]string{"NONE", "JOINING", "OPEN", "ENDED", "RETIRED"}
 
 func (i InState) String() string { return inStateNames[i] }
 
+// additionalPipes groups join-only keys and the history of non-live pipe
+// IDs, and the prefix repair budget. Epoch negotiation and pipe zero's
+// scheduler work before any join.
+type additionalPipes struct {
+	qualityAt          Time        // next placement or advice refresh
+	prefixStreams      []*Stream   // directions with indexed originals for prefix repair
+	prefixAt           Time        // earliest next check of retained prefix deadlines
+	prefixBytes        uint64      // queued and in-flight prefix repairs
+	prefixPending      uint64      // reserved, not yet handed off
+	prefixBucket       tokenBucket // session allowance for extra STREAM payload
+	prefixWaiting      bool        // expired entries waiting on a relevant input
+	prefixStateWaiting bool        // a source is waiting for an attachment state change
+	prefixGate         gate        // the retained-prefix timer's
+
+	usable      []uint64          // the Suites of both sets, ascending
+	phaseKey    []byte            // a random key of the process for a key phase no epoch has
+	bits        map[uint64]bool   // replay bits of peer IDs without state
+	pendAbandon map[uint64]uint64 // PIPE_ABANDON owed for IDs without state: its code
+}
+
 type multiPath struct {
+	*additionalPipes
+	gapTrace *streamGapTrace // nil until stream tracing exposes a receive gap
+
 	// ep holds the accepted epochs, their join keys and Locators, and the
 	// state of the epoch exchange.
 	ep           epochs
-	usable       []uint64 // the Suites of both sets, ascending
 	usableGroups []uint64 // the Groups of both sets, ascending; holds Group 2
-	phaseKey     []byte   // a random key of the process for a key phase no epoch has
 	// joinFailures counts own consecutive failed joins.
 	joinFailures uint64
 	// exporter is the exporter value read at establishment, kept only
 	// while keysPending: the keys wait for the deferred PSK or the declaration.
 	exporter     []byte
-	nextID       uint64            // next own pipe ID
-	cap          int               // unretired attachments of the peer we keep
-	ownCap       int               // unretired attachments we joined ourselves
-	replayW      uint64            // W
-	h            uint64            // highest verified peer pipe ID
-	bits         map[uint64]bool   // replay bits of peer IDs without state
-	pendAbandon  map[uint64]uint64 // PIPE_ABANDON owed for IDs without state: its code
+	nextID       uint64 // next own pipe ID
+	cap          int    // unretired attachments of the peer we keep
+	ownCap       int    // unretired attachments we joined ourselves
+	replayW      uint64 // W
+	h            uint64 // highest verified peer pipe ID
 	backoffUntil Time
 	backoffExp   int
 	joinW        []*Signal // local joins the cap or the backoff holds (JoinPrepare)
@@ -96,19 +115,29 @@ type multiPath struct {
 	blocked []*Stream // stream directions blocked by the peer's stream credit
 
 	// Flags of the groups above, kept together.
-	keysPending bool // the keys wait (exporter)
-	usePSK      bool // the P source is configured
-	hSet        bool // h is set
-	ackChanged  bool // snapshot changed since the last copy
-	pickWanted  bool
-	pickTimer   bool // a direction waits for an answer until pickDeadline
+	bootstrapRetired bool // pipe zero needs no replay table entry
+	keysPending      bool // the keys wait (exporter)
+	usePSK           bool // the P source is configured
+	hSet             bool // h is set
+	ackChanged       bool // snapshot changed since the last copy
+	pickWanted       bool
+	pickTimer        bool // a direction waits for an answer until pickDeadline
 }
+
+type peerEvidence uint8
+
+const (
+	peerPending peerEvidence = iota
+	peerObserved
+	peerDiscarded // the local confirmation attempt failed
+)
 
 // sawPeer records the evidence of the peer's attachment of a joined
 // attachment, waking the waiters on the first.
 func (s *Session) sawPeer(p *Pipe) {
-	if a := p.mp; a != nil && !a.peerSeen {
-		a.peerSeen = true
+	if a := p.mp; a != nil && a.peer == peerPending {
+		a.peer = peerObserved
+		s.wakePrefix()
 		if a.joinerLocal && p.id != 0 {
 			s.emit(Event{Kind: EvPipeAttached, Pipe: p.id})
 		}
@@ -118,32 +147,34 @@ func (s *Session) sawPeer(p *Pipe) {
 // attach is the per-attachment state of a multipath session.
 type attach struct {
 	group     *join.Group // the key exchange of the pipe's Join
-	joinEpoch uint64      // the epoch of a local join's Hello
+	joinEpoch uint64      // the epoch of the authenticated Hello
 	// The SESSION_EPOCH frame repeated until the next phase: sent on this pipe
 	// (epochSent) at epochAt, again one probe interval later.
-	epochAt      Time
-	fate         uint64
-	attachedAt   Time
-	pingSince    Time
-	joiner       *join.Joiner
-	provenFrames []byte // the return frames of a proven Reply
-	binding      []byte
-	epochSent    bool
-	joinerLocal  bool
-	peerSeen     bool  // a joined attachment's evidence of the peer's attachment (peerAttached)
-	dir          uint8 // the pipe direction as the joiner states it: 0 up, 1 down, 2 bidi
-	out          OutState
-	in           InState
-	hs           bool // the Join handshake is running: nothing but it on the carrier
-	mode         join.Mode
-	tpSkipped    bool // the one transport parameters record before the Reply went by
-	framing      join.Framing
-	proven       bool // the Reply verified; JoinFinish is to come
-	early        bool // JoinPrepare found no usable pipe
-	held         bool
-	resLimited   bool // abandoned by the peer with ZMUX_PIPE_RESOURCE_LIMIT // a local join waits for room or the backoff
-	firstRecord  bool // our first record on the outbound direction is still due
-	ackPair      bool // a PIPE_ACK answering a PIPE_PING is owed on this pair
+	epochAt        Time
+	fate           uint64
+	attachedAt     Time
+	joinDeadline   Time
+	pingSince      Time
+	joiner         *join.Joiner
+	provenFrames   []byte // the return frames of a proven Reply
+	binding        []byte
+	joinEpochKnown bool
+	epochSent      bool
+	joinerLocal    bool
+	peer           peerEvidence
+	dir            uint8 // the pipe direction as the joiner states it: 0 up, 1 down, 2 bidi
+	out            OutState
+	in             InState
+	hs             bool // the Join handshake is running: nothing but it on the carrier
+	mode           join.Mode
+	tpSkipped      bool // the one transport parameters record before the Reply went by
+	framing        join.Framing
+	proven         bool // the Reply verified; JoinFinish is to come
+	early          bool // JoinPrepare found no usable pipe
+	held           bool
+	resLimited     bool // abandoned by the peer with ZMUX_PIPE_RESOURCE_LIMIT // a local join waits for room or the backoff
+	firstRecord    bool // our first record on the outbound direction is still due
+	ackPair        bool // a PIPE_ACK answering a PIPE_PING is owed on this pair
 
 	// Removal.
 	abandonCode     uint64
@@ -194,9 +225,9 @@ type attach struct {
 	reval       bool // awaiting revalidation
 	revalPing   bool // its PIPE_PING is still to be written
 	needPing    bool // a PIPE_PING is owed on this pipe
-	placedSet   bool
 	penalized   bool // opportunistic penalization: no new data until penaltyEnd is acknowledged
 	held1       bool
+	ownFail     bool // the carrier reports its own failure (CarrierInfo.OwnFailure)
 	sendPrio    *uint64
 	sendStandby *bool
 	peerPrio    uint64
@@ -207,19 +238,18 @@ type attach struct {
 	weight      uint64
 
 	// Scheduler.
-	probOpt    Duration     // per-pipe Probation; <0: the session default
-	live       PipeLiveness // the pipe's own liveness settings
-	ownFail    bool         // the carrier reports its own failure (CarrierInfo.OwnFailure)
-	probeH     Duration     // H_p of the current probe wait, taken when it started
-	probeCut   float64      // the current probe wait is k_eff x (1 - probeCut): in [0, j], or [0, 1] for the first wait of a bootstrap pipe
-	prob       probState
-	hist       history // fate group 0
-	revalEnd   uint64
-	rrCur      float64
-	copyQ      []*copyRec
-	selfCopyQ  []*copyRec // copies for p's own copy lane (a single-pipe tier)
-	idleArm    uint64     // bytes of the idle copy left
-	placedFrom uint64
+	probOpt   Duration     // per-pipe Probation; <0: the session default
+	live      PipeLiveness // the pipe's own liveness settings
+	probeH    Duration     // H_p of the current probe wait, taken when it started
+	probeCut  float64      // the current probe wait is k_eff x (1 - probeCut): in [0, j], or [0, 1] for the first wait of a bootstrap pipe
+	prob      probState
+	hist      history // fate group 0
+	revalEnd  uint64
+	rrCur     float64
+	copyQ     []*copyRec
+	selfCopyQ []*copyRec   // copies for p's own copy lane (a single-pipe tier)
+	idleArm   uint64       // bytes of the idle copy left
+	quality   *pathQuality // optional placement and advice measurements
 
 	// Reinjection hold: a new pipe reinjects one chunk until
 	// the first PIPE_ACK after it became live, or one smoothed RTT.
@@ -242,15 +272,14 @@ type attach struct {
 // (the peer holds it as an attachment of its own): one the endpoint joined
 // itself once it has evidence (peerSeen), every other from its creation.
 func (a *attach) peerAttached(id uint64) bool {
-	return a.peerSeen || !a.joinerLocal || id == 0
+	return a.peer == peerObserved || !a.joinerLocal || id == 0
 }
 
 // startMultipath allocates the path layer at establishment.
 // A failed read of the exporter is the session's INTERNAL_ERROR.
 func (s *Session) startMultipath() *wire.Error {
 	l, p := &s.cfg.Local, &s.peer
-	m := &multiPath{bits: map[uint64]bool{}, pendAbandon: map[uint64]uint64{}, usePSK: l.SecretFlags&wire.SecretPSK != 0}
-	m.usable = wire.Intersect(l.SessionCrypto.Suites, p.SessionCrypto.Suites)
+	m := &multiPath{usePSK: l.SecretFlags&wire.SecretPSK != 0}
 	m.usableGroups = wire.Intersect(l.SessionCrypto.Groups, p.SessionCrypto.Groups)
 	if l.SecretFlags&wire.SecretExporter != 0 && s.cfg.Exporter != nil {
 		b, err := s.cfg.Exporter()
@@ -286,14 +315,44 @@ func (s *Session) startMultipath() *wire.Error {
 	}
 	m.busyUntil = s.now.Add(15 * Second)
 	for _, pp := range s.pipes {
-		a := &attach{mode: s.firstPipeMode(), joinerLocal: s.role == RoleInitiator, dir: 2, out: OutActive, in: InOpen,
+		a := &attach{joinEpochKnown: true, mode: s.firstPipeMode(), joinerLocal: s.role == RoleInitiator, dir: 2, out: OutActive, in: InOpen,
 			attachedAt: s.now, liveAt: s.now, lastAdvance: s.now, lastRecord: s.now, weight: 1, probOpt: -1}
 		a.rtt = s.initialRTT(pp.id)
 		a.ownFail = pp.ownFailure()
 		s.drawProbe(a, pp, true)
 		pp.mp = a
+		if s.cfg.PathAdvice {
+			s.enablePathQuality(pp)
+		}
 	}
 	return nil
+}
+
+// prepareAdditional activates the join state once, including the keys
+// for every epoch still accepted on this session. It also handles
+// protocol history arriving before a locally requested attachment.
+func (s *Session) prepareAdditional() *additionalPipes {
+	m := s.mp
+	if m.additionalPipes == nil {
+		m.additionalPipes = &additionalPipes{
+			bits: make(map[uint64]bool), pendAbandon: make(map[uint64]uint64),
+			usable: wire.Intersect(s.cfg.Local.SessionCrypto.Suites, s.peer.SessionCrypto.Suites),
+		}
+		for _, e := range m.ep.list {
+			if err := s.deriveEpochKeys(e); err != nil {
+				s.failLocal(err)
+				break
+			}
+		}
+	}
+	return m.additionalPipes
+}
+
+func (m *multiPath) owedAbandons() map[uint64]uint64 {
+	if m.additionalPipes == nil {
+		return nil
+	}
+	return m.pendAbandon
 }
 
 // unknownPhaseKey is the key a Hello of a key phase without an accepted epoch is
@@ -347,6 +406,9 @@ func (s *Session) deriveKeys() *wire.Error {
 // deriveEpochKeys derives both join_psk values of every usable Suite of an
 // epoch, kept while the epoch is.
 func (s *Session) deriveEpochKeys(e *epoch) *wire.Error {
+	if s.mp.additionalPipes == nil {
+		return nil
+	}
 	e.keys = map[uint64]*joinKeys{}
 	for _, id := range s.mp.usable {
 		su, ok := join.LookupSuite(id)
@@ -458,7 +520,7 @@ func (s *Session) ownParity(id uint64) bool { return (id&1 == 1) == (s.role == R
 // peerIDState classifies a peer-parity pipe ID without attachment state:
 // retired (bit set or stale), inWindow, or above.
 func (m *multiPath) idRetired(id uint64) bool {
-	if m.bits[id] {
+	if id == 0 && m.bootstrapRetired || m.additionalPipes != nil && m.bits[id] {
 		return true
 	}
 	return m.stale(id)
@@ -485,6 +547,9 @@ func (m *multiPath) raise(id uint64) {
 		return
 	}
 	m.h, m.hSet = id, true
+	if m.additionalPipes == nil {
+		return
+	}
 	for k := range m.bits {
 		if m.stale(k) {
 			delete(m.bits, k)

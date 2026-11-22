@@ -2,6 +2,7 @@ package zmux
 
 import (
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
@@ -12,8 +13,10 @@ import (
 // listener now finds.
 func TestEpochAdvanceThenJoin(t *testing.T) {
 	leakcheck.Check(t)
-	e := newMPEnv(t, mpConfig(), mpConfig())
-	e.addPipe(t, PipeOptions{}) // RecordSealed: the exchange's pipe
+	cc, sc := mpConfig(), mpConfig()
+	sc.EpochPeriod = -1
+	e := newMPEnv(t, cc, sc)
+	first := e.addPipe(t, PipeOptions{}) // RecordSealed: the exchange's pipe
 	if err := e.client.AdvanceEpoch(); err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +24,22 @@ func TestEpochAdvanceThenJoin(t *testing.T) {
 		return e.client.Epoch() == 1 && e.server.Epoch() == 1
 	})
 	before := e.server.ConnectionStats().JoinAuthFailures
-	e.addPipe(t, PipeOptions{})
+	second := e.addPipe(t, PipeOptions{})
+	for _, tc := range []struct {
+		id    PipeID
+		epoch uint64
+	}{{0, 0}, {first.ID(), 0}, {second.ID(), 1}} {
+		for _, c := range []*Conn{e.client, e.server} {
+			p, ok := c.Pipe(tc.id)
+			if !ok {
+				t.Fatalf("missing pipe %d", tc.id)
+			}
+			st, ok := p.Stats()
+			if !ok || !st.EpochKnown || st.Epoch != tc.epoch || st.ReplaceBy.IsZero() != (c == e.server) {
+				t.Fatalf("pipe %d: epoch %d (known %t), replace by %v", tc.id, st.Epoch, st.EpochKnown, st.ReplaceBy)
+			}
+		}
+	}
 	if got := e.server.ConnectionStats().JoinAuthFailures; got != before {
 		t.Fatalf("%d join authentication failures after the exchange", got-before)
 	}
@@ -91,4 +109,32 @@ func TestEpochAfterResume(t *testing.T) {
 			t.Fatalf("off: epochs %d %d", e.client.Epoch(), e.server.Epoch())
 		}
 	}
+}
+
+// No timer advances between the explicit offer and the responder's answer.
+func TestIdleWriterEpochExchange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cc, sc := mpConfig(), mpConfig()
+		cc.EpochAfterFirstPipe, sc.EpochAfterFirstPipe = SwitchOff, SwitchOff
+		cc.Liveness = Liveness{ProbeInterval: -1, StandbyProbe: -1}
+		sc.Liveness = cc.Liveness
+		e := newMemMPEnv(t, cc, sc)
+		p := e.addPipe(t, PipeOptions{})
+		synctest.Wait()
+		time.Sleep(2 * writerIdle) // synctest virtual time
+		synctest.Wait()
+		e.client.peek(func() {
+			if e.client.pipes[uint64(p.ID())].writer.running {
+				t.Error("sealed pipe still has a writer")
+			}
+		})
+		start := time.Now()
+		if err := e.client.AdvanceEpoch(); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if !time.Now().Equal(start) || e.client.Epoch() != 1 {
+			t.Fatalf("epoch %d after %v", e.client.Epoch(), time.Since(start))
+		}
+	})
 }

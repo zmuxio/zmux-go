@@ -1,13 +1,17 @@
 package zmuxhttp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -127,12 +131,12 @@ func TestHTTPRefusedCarrierFallback(t *testing.T) {
 	for _, x := range []struct {
 		name   string
 		method string
-		body   []byte
 		h      http.Header
+		body   []byte
 	}{
-		{"garbage first record", http.MethodPost, garbage, nil},
-		{"incomplete first record", http.MethodPost, []byte{0x40}, nil},
-		{"small first record", http.MethodPost, small, nil},
+		{name: "garbage first record", method: http.MethodPost, body: garbage, h: nil},
+		{name: "incomplete first record", method: http.MethodPost, body: []byte{0x40}, h: nil},
+		{name: "small first record", method: http.MethodPost, body: small, h: nil},
 	} {
 		if code := e.send(t, x.method, x.body, x.h); code != http.StatusTeapot {
 			t.Fatalf("%s: status %d, want the fallback's", x.name, code)
@@ -290,5 +294,241 @@ func TestHTTP2RefusalWhileUplinkIdle(t *testing.T) {
 				t.Fatalf("read error %v", err)
 			}
 		})
+	}
+}
+
+// The client sends only junk until Next owns the request. In particular
+// admission cannot buffer the rest of a chunked upload to decide its target.
+// HS-13.
+func TestRequestFallbackPrefersNext(t *testing.T) {
+	for _, fixed := range []bool{false, true} {
+		name := "chunked"
+		if fixed {
+			name = "content-length"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			const prefix, tail = "junk", "-unread-upload"
+			entered := make(chan struct{})
+			l := mustNewListener(&zmux.ListenerConfig{
+				MaxPending: 1,
+				Admission: &zmux.Admission{Peek: len(prefix), Decide: func(_ context.Context, info zmux.CarrierInfo, b []byte) zmux.Decision {
+					if string(b) != prefix || info.Stage != zmux.StageCarrier {
+						t.Errorf("admission %q stage %v", b, info.Stage)
+					}
+					return zmux.Decision{Verdict: zmux.VerdictFallback}
+				}},
+				Fallback: func(context.Context, *zmux.Takeover) { t.Error("unexpected stream takeover") },
+			})
+			defer func() { _ = l.Close() }()
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(entered)
+				if r.Header.Get("X-Request-Marker") != "original" || r.URL.RawQuery != "q=keep" {
+					t.Error("request metadata lost")
+				}
+				if fixed && r.ContentLength != int64(len(prefix+tail)) || !fixed && (len(r.TransferEncoding) != 1 || r.TransferEncoding[0] != "chunked") {
+					t.Errorf("request framing: %d %v", r.ContentLength, r.TransferEncoding)
+				}
+				a, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
+				if err != nil {
+					t.Errorf("slot held in Next: %v", err)
+				} else {
+					a.Release()
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil || string(body) != prefix+tail {
+					t.Errorf("replayed body %q: %v", body, err)
+				}
+				if r.Context().Err() != nil {
+					t.Error("request cancelled during handoff")
+				}
+				w.Header().Set("X-Handler", "next")
+				w.WriteHeader(http.StatusTeapot)
+				_, _ = io.WriteString(w, "from Next")
+			})
+			h, err := NewHandler(l, &Options{Next: next})
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+			pr, pw := io.Pipe()
+			defer func() { _ = pw.Close() }()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/upload?q=keep", pr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Request-Marker", "original")
+			if fixed {
+				// A fixed-size request carrier is a split uplink. An unpaired
+				// fixed-size POST is dispatched to the exchange adapter.
+				req.Header.Set(HeaderPair, "AAAAAAAAAAAAAAAAAAAAAA")
+				req.ContentLength = int64(len(prefix + tail))
+			}
+			sent := make(chan error, 1)
+			go func() {
+				_, err := io.WriteString(pw, prefix)
+				if err == nil {
+					select {
+					case <-entered:
+						_, err = io.WriteString(pw, tail)
+					case <-ctx.Done():
+						err = ctx.Err()
+					}
+				}
+				_ = pw.CloseWithError(err)
+				sent <- err
+			}()
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusTeapot || resp.Header.Get("X-Handler") != "next" || string(body) != "from Next" {
+				t.Fatalf("response %d %q: %v", resp.StatusCode, body, err)
+			}
+			if err := <-sent; err != nil {
+				t.Fatal(err)
+			}
+			if n := l.Stats().Admission.Fallback; n != 1 {
+				t.Fatalf("fallback decisions %d", n)
+			}
+		})
+	}
+}
+
+// HS-14.
+func TestRequestFallbackCancellation(t *testing.T) {
+	for _, source := range []string{"listener", "client"} {
+		t.Run(source, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			entered := make(chan struct{})
+			ended := make(chan error, 1)
+			l := mustNewListener(&zmux.ListenerConfig{MaxPending: 1, Admission: &zmux.Admission{Peek: 1, Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
+				return zmux.Decision{Verdict: zmux.VerdictFallback}
+			}}})
+			defer func() { _ = l.Close() }()
+			next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				close(entered)
+				_, _ = io.Copy(io.Discard, r.Body)
+				select {
+				case <-r.Context().Done():
+					ended <- r.Context().Err()
+				case <-ctx.Done():
+					ended <- ctx.Err()
+				}
+			})
+			h, err := NewHandler(l, &Options{Next: next})
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := httptest.NewServer(h)
+			defer srv.Close()
+			pr, pw := io.Pipe()
+			defer func() { _ = pw.Close() }()
+			reqCtx, stop := context.WithCancel(ctx)
+			defer stop()
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, srv.URL, pr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if resp, err := srv.Client().Do(req); err == nil {
+					_ = resp.Body.Close()
+				}
+			}()
+			if _, err = io.WriteString(pw, "junk"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-entered:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			a, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.Release()
+			if source == "listener" {
+				_ = l.Close()
+			} else {
+				stop()
+			}
+			select {
+			case err := <-ended:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("Next retained request")
+			}
+			stop()
+			_ = pw.Close()
+			<-done
+		})
+	}
+}
+
+// HS-13.
+func TestFallbackChunkedTrailers(t *testing.T) {
+	for _, declare := range []bool{false, true} {
+		for _, expect := range []bool{false, true} {
+			for _, peek := range []int{1, 4, 8} {
+				t.Run(fmt.Sprintf("declared=%t/expect=%t/peek=%d", declare, expect, peek), func(t *testing.T) {
+					l := mustNewListener(&zmux.ListenerConfig{Admission: &zmux.Admission{Peek: peek, Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
+						return zmux.Decision{Verdict: zmux.VerdictFallback}
+					}}})
+					defer func() { _ = l.Close() }()
+					h, err := NewHandler(l, &Options{Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						b, err := io.ReadAll(r.Body)
+						if err != nil || string(b) != "abcd" || r.Trailer.Get("X-Final") != "trail" {
+							t.Errorf("body %q trailers %v err %v", b, r.Trailer, err)
+						}
+						w.WriteHeader(http.StatusTeapot)
+					})})
+					if err != nil {
+						t.Fatal(err)
+					}
+					srv := httptest.NewServer(h)
+					defer srv.Close()
+					nc, err := net.DialTimeout("tcp", srv.Listener.Addr().String(), time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = nc.Close() }()
+					_ = nc.SetDeadline(time.Now().Add(5 * time.Second))
+					_, _ = fmt.Fprintf(nc, "POST / HTTP/1.1\r\nHost: %s\r\nTransfer-Encoding: chunked\r\n", srv.Listener.Addr())
+					if declare {
+						_, _ = io.WriteString(nc, "Trailer: X-Final\r\n")
+					}
+					if expect {
+						_, _ = io.WriteString(nc, "Expect: 100-continue\r\n")
+					}
+					_, _ = io.WriteString(nc, "\r\n")
+					reader := bufio.NewReader(nc)
+					status := func(want int) {
+						res, err := http.ReadResponse(reader, nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						_ = res.Body.Close()
+						if res.StatusCode != want {
+							t.Fatal(res.Status)
+						}
+					}
+					if expect {
+						status(http.StatusContinue)
+					}
+					_, _ = io.WriteString(nc, "2\r\nab\r\n2\r\ncd\r\n0\r\nX-Final: trail\r\n\r\n")
+					status(http.StatusTeapot)
+				})
+			}
+		}
 	}
 }

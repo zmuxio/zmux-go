@@ -17,17 +17,17 @@ import (
 func TestServerConfigValidate(t *testing.T) {
 	f := newFixture(t)
 	for _, c := range []struct {
-		name string
 		mod  func(*seal.ServerConfig)
+		name string
 		ok   bool
 	}{
-		{"default", func(*seal.ServerConfig) {}, true},
-		{"no Key", func(s *seal.ServerConfig) { s.StaticKey = nil }, false},
-		{"no Gate", func(s *seal.ServerConfig) { s.Gate = nil }, false},
-		{"Join among the Profiles", func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{1, 2} }, false},
-		{"unknown Profile, not first", func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{1, 3, 77} }, false},
-		{"unassigned Profile", func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{6} }, false},
-		{"explicit Profiles", func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{4} }, true},
+		{name: "default", mod: func(*seal.ServerConfig) {}, ok: true},
+		{name: "no Key", mod: func(s *seal.ServerConfig) { s.StaticKey = nil }, ok: false},
+		{name: "no Gate", mod: func(s *seal.ServerConfig) { s.Gate = nil }, ok: false},
+		{name: "Join among the Profiles", mod: func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{1, 2} }, ok: false},
+		{name: "unknown Profile, not first", mod: func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{1, 3, 77} }, ok: false},
+		{name: "unassigned Profile", mod: func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{6} }, ok: false},
+		{name: "explicit Profiles", mod: func(s *seal.ServerConfig) { s.AcceptedProfiles = []proto.Profile{4} }, ok: true},
 	} {
 		sc := f.server
 		c.mod(&sc)

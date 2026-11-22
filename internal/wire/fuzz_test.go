@@ -16,8 +16,8 @@ func FuzzParsePreamble(f *testing.F) {
 		{HasOpenInfo: true, OpenInfo: []byte("info")},
 		{HasPriority: true, Urgency: 7, Incr: true},
 		{PipeCarrier: true},
-		{HasOpenInfo: true, HasPriority: true, PipeCarrier: true, App: []TLV{{TLVAppFirst, []byte{1, 2}}}},
-		{App: []TLV{{TLVAppFirst, nil}, {TLVAppFirst + 1, bytes.Repeat([]byte{9}, 70)}}, Grease: &TLV{0x21, []byte{0}}},
+		{HasOpenInfo: true, HasPriority: true, PipeCarrier: true, App: []TLV{{Type: TLVAppFirst, Value: []byte{1, 2}}}},
+		{App: []TLV{{Type: TLVAppFirst, Value: nil}, {Type: TLVAppFirst + 1, Value: bytes.Repeat([]byte{9}, 70)}}, Grease: &TLV{Type: 0x21, Value: []byte{0}}},
 	} {
 		f.Add(AppendPreamble(nil, &s), uint64(1<<16))
 	}

@@ -2,6 +2,8 @@ package zmux
 
 import (
 	"context"
+	"errors"
+	"net"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -91,13 +93,25 @@ const (
 	// they moved between the carrier's datagrams and records. It is
 	// noticed when the session sends or its pipes change.
 	EventDatagramPathChanged
+	// EventStreamPlaced reports a STREAM range handed to a multipath
+	// carrier, including copies and retransmissions.
+	EventStreamPlaced
+	// EventStreamGapStarted reports the leading missing offset. PipeID is
+	// the pipe of the arriving STREAM that exposed the gap.
+	EventStreamGapStarted
+	// EventStreamGapFilled reports that the leading missing byte arrived.
+	// PipeID is the pipe of that arrival and GapWait is the elapsed time.
+	EventStreamGapFilled
+	// EventPipePathQuality reports evidence for local replacement or shared
+	// path deterioration, and when the observed deterioration clears.
+	EventPipePathQuality
 )
 
 var pipeEventNames = [...]string{"", "PipeAdded", "PipeJoined", "PipeSuspect", "PipeRecovered", "PipeFailed",
 	"PipeClosed", "PipePriorityChanged", "TierSaturation", "JoinAuthFailed", "SessionSuspended",
 	"SessionResumed", "GoAwayReceived", "ResumeUnattended", "PipeQualityChanged", "CapacityBelow",
 	"CapacityRestored", "CarrierCandidate", "CarrierChosen", "PipesRetired", "EpochCommitted", "EpochDeleted",
-	"DatagramPathChanged"}
+	"DatagramPathChanged", "StreamPlaced", "StreamGapStarted", "StreamGapFilled", "PipePathQuality"}
 
 func (k EventKind) String() string {
 	if int(k) < len(pipeEventNames) {
@@ -127,7 +141,8 @@ const (
 func (r JoinAuthReason) String() string { return core.JoinAuthReason(r).String() }
 
 // Event is a session event, as NextEvent and Tracer.Event report it. Kind
-// says which of the other fields are set (see EventKind).
+// says which of the other fields are set (see EventKind). Stream events
+// are delivered through Tracer.Event when Tracer.StreamEvents is enabled.
 type Event struct {
 	Kind EventKind
 	// Direction of a pipe event, from the local endpoint.
@@ -143,6 +158,8 @@ type Event struct {
 	// Outcome that of EventCarrierCandidate.
 	Carrier CarrierKind
 	Outcome CandidateOutcome
+	// PathQuality is the reason for EventPipePathQuality.
+	PathQuality PipePathQualityReason
 	// Epoch of EventEpochCommitted and EventEpochDeleted.
 	Epoch uint64
 	// Count of EventJoinAuthFailed: the failures with its Reason since the
@@ -155,6 +172,13 @@ type Event struct {
 	Variant string
 	// PipeID is the pipe ID of a pipe event.
 	PipeID PipeID
+	// Stream events are opt-in through Tracer.StreamEvents. Offsets and
+	// lengths are wire bytes, including any preamble. StreamLength is
+	// set for placements. StreamAt is the event time on the session clock.
+	StreamID                   StreamID
+	StreamOffset, StreamLength uint64
+	StreamAt                   time.Time
+	GapWait                    time.Duration
 	// Priority is the tier (EventPipePriorityChanged,
 	// EventTierSaturation); Weight the pipe's weight
 	// (EventPipePriorityChanged); Source where the priority comes from, as
@@ -183,6 +207,11 @@ type Event struct {
 	// DatagramPayload of EventDatagramPathChanged: the new
 	// PathDatagramPayload of a session datagram.
 	DatagramPayload int
+	// FateGroup and QueuedBytes are set for EventPipePathQuality,
+	// together with the recent SmoothedRTT and DeliveryRate estimates.
+	// RetryAfter is a replacement delay suggestion; zero means no redial.
+	FateGroup, QueuedBytes uint64
+	RetryAfter             time.Duration
 }
 
 // retiredLast is the number of IDs EventPipesRetired keeps.
@@ -211,7 +240,7 @@ var pipeKeys = [...]struct {
 	dir  bool
 }{
 	{EventPipeAdded, false}, {EventPipeJoined, false}, {EventPipePriorityChanged, false},
-	{EventPipeQualityChanged, false}, {EventPipeSuspect, true}, {EventPipeRecovered, true},
+	{EventPipeQualityChanged, false}, {EventPipePathQuality, false}, {EventPipeSuspect, true}, {EventPipeRecovered, true},
 	{EventPipeFailed, true}, {EventPipeClosed, true},
 }
 
@@ -247,7 +276,8 @@ func keyOf(ev *Event) eventKey {
 	case EventPipeAdded, EventPipeJoined, EventPipeSuspect, EventPipeRecovered, EventPipeFailed, EventPipeClosed,
 		EventPipePriorityChanged, EventPipeQualityChanged, EventSessionSuspended, EventSessionResumed,
 		EventGoAwayReceived, EventResumeUnattended, EventCapacityBelow, EventCapacityRestored, EventCarrierChosen,
-		EventPipesRetired, EventEpochCommitted, EventEpochDeleted, EventDatagramPathChanged:
+		EventPipesRetired, EventEpochCommitted, EventEpochDeleted, EventDatagramPathChanged,
+		EventStreamPlaced, EventStreamGapStarted, EventStreamGapFilled, EventPipePathQuality:
 		// Keyed by the kind alone (the pipe events above by their entry in pipeKeys).
 	}
 	return k
@@ -273,6 +303,7 @@ type eventNode struct {
 // size is bounded by what the session holds (pipes, tiers, carrier
 // candidates) plus a fixed number of keys; a retired pipe's keys leave it.
 type eventQueue struct {
+	held       map[uint64]*joinEventHold
 	idx        map[eventKey]*eventNode
 	seenOut    map[uint64]core.OutState
 	dirs       map[uint64]uint8 // per pipe: dirInEnded, dirOutEnded
@@ -280,6 +311,7 @@ type eventQueue struct {
 	waiters    []*core.Signal
 	fresh      []Event // occurrences in this drain, for the tracer and the waiters
 	frozen     bool    // the session is CLOSED: nothing more enters
+	pollAdvice bool    // NextEvent enabled advice; StopEvents releases it
 }
 
 // Bits of eventQueue.dirs: the terminal event of a direction entered the
@@ -381,6 +413,14 @@ func (e *eventQueue) push(ev Event) {
 		e.remove(eventKey{kind: EventResumeUnattended}) // stale once resumed
 	}
 	k := keyOf(&ev)
+	if h := e.held[k.pipe]; h != nil {
+		h.queue.merge(k, ev)
+	} else {
+		e.merge(k, ev)
+	}
+}
+
+func (e *eventQueue) merge(k eventKey, ev Event) {
 	if n := e.idx[k]; n != nil && keepFirst(ev.Kind) {
 		return
 	}
@@ -411,12 +451,27 @@ func (e *eventQueue) mark(id uint64, bits uint8) {
 // application read none of its terminal events; a terminal event that
 // never entered the queue was not read.
 func (e *eventQueue) retire(id uint64, failed bool) {
-	queued := e.dirs[id] & (dirInEnded | dirOutEnded) // terminal events that entered the queue
-	delete(e.dirs, id)
-	delete(e.seenOut, id)
 	if e.frozen {
 		return
 	}
+	one := Event{Kind: EventPipesRetired, Retired: 1, Last: []PipeID{PipeID(id)}}
+	if failed {
+		one.Failed = 1
+	} else {
+		one.Closed = 1
+	}
+	e.fresh = append(e.fresh, one)
+	if h := e.held[id]; h != nil {
+		h.retired, h.failed = true, failed
+		return
+	}
+	e.foldRetired(id, failed)
+}
+
+func (e *eventQueue) foldRetired(id uint64, failed bool) {
+	queued := e.dirs[id] & (dirInEnded | dirOutEnded) // terminal events that entered the queue
+	delete(e.dirs, id)
+	delete(e.seenOut, id)
 	var unread uint8 // of those, the ones still in the queue
 	for _, p := range pipeKeys {
 		dirs := [...]Direction{DirectionBidirectional, DirectionSendOnly, DirectionReceiveOnly}
@@ -435,13 +490,6 @@ func (e *eventQueue) retire(id uint64, failed bool) {
 		}
 	}
 	unreadEnd := queued&^unread == 0 // no queued terminal event was read (none queued counts)
-	one := Event{Kind: EventPipesRetired, Retired: 1, Last: []PipeID{PipeID(id)}}
-	if failed {
-		one.Failed = 1
-	} else {
-		one.Closed = 1
-	}
-	e.fresh = append(e.fresh, one)
 	n, isNew := e.touch(eventKey{kind: EventPipesRetired})
 	if isNew {
 		n.ev = Event{Kind: EventPipesRetired}
@@ -477,13 +525,18 @@ func (c *Conn) endPipeLocked(id uint64, failed bool, cause error) {
 	if cause != nil {
 		e.err = cause
 	}
+	if e.join != nil {
+		_ = e.join.settleLocked(ErrPipeGone)
+	}
 	close(e.retired)
 	// Pipe.Done closes once the driver's goroutines have ended too.
 	e.drv.Load().gs.finishThen(e.end)
 }
 
 // drainEventsLocked turns core events into pipe events and wakes waiters.
-func (c *Conn) drainEventsLocked() {
+// drainEventsLocked moves the core's events into the queue and reports
+// whether NextEvent's waiters are due a wake (wakeEventWaitersLocked).
+func (c *Conn) drainEventsLocked() (wakeWaiters bool) {
 	for _, id := range c.retiredDone {
 		if pd := c.pipes[id]; pd != nil {
 			delete(c.pipes, id)
@@ -499,7 +552,31 @@ func (c *Conn) drainEventsLocked() {
 			break
 		}
 		switch e.Kind {
+		case core.EvStreamPlaced:
+			c.traceStream(e, EventStreamPlaced, DirectionSendOnly)
+		case core.EvStreamGapStarted:
+			c.traceStream(e, EventStreamGapStarted, DirectionReceiveOnly)
+		case core.EvStreamGapFilled:
+			c.traceStream(e, EventStreamGapFilled, DirectionReceiveOnly)
 		case core.EvPipeState:
+			// A replacement join still counts as live in the core during
+			// its handshake. A directional loss can need recovery even
+			// when that pending join suppresses EvSuspended.
+			if c.redial != nil && (e.Dir == core.DirOut && (e.OutState == core.OutFailed || e.OutState == core.OutClosed) ||
+				e.Dir == core.DirIn && e.InState == core.InEnded) {
+				c.needRedial = true
+			}
+			if pd := c.pipes[e.Pipe]; pd != nil && pd.end.join != nil && !pd.end.join.settled {
+				switch {
+				case errors.Is(e.Cause, core.ErrJoinTimeout):
+					_ = pd.end.join.settleLocked(ErrJoinTimeout)
+				case errors.Is(e.Cause, core.ErrJoinRefused):
+					_ = pd.end.join.settleLocked(ErrJoinRefused)
+				case e.Dir == core.DirOut && (e.OutState == core.OutFailed || e.OutState == core.OutClosed || e.OutState == core.OutDraining),
+					e.Dir == core.DirIn && e.InState == core.InEnded && pd.end.opts.Direction == DirectionReceiveOnly:
+					_ = pd.end.join.settleLocked(ErrPipeGone)
+				}
+			}
 			c.pipeStateEvent(e)
 		case core.EvJoinAuthFailed:
 			q.push(Event{Kind: EventJoinAuthFailed, Reason: JoinAuthReason(e.Reason), Count: 1})
@@ -528,6 +605,11 @@ func (c *Conn) drainEventsLocked() {
 				ErrorCode: ApplicationErrorCode(e.Code)}})
 		case core.EvTierSaturation:
 			q.push(Event{Kind: EventTierSaturation, Priority: e.Code, Saturated: e.Saturated})
+		case core.EvPipePathQuality:
+			c.redial.qualityChanged(PipeID(e.Pipe))
+			q.push(Event{Kind: EventPipePathQuality, PipeID: PipeID(e.Pipe), Direction: DirectionSendOnly,
+				PathQuality: PipePathQualityReason(e.PathQuality), FateGroup: e.Code, QueuedBytes: e.Count,
+				SmoothedRTT: time.Duration(e.RTT), DeliveryRate: rateBytes(e.Rate), RetryAfter: time.Duration(e.Wait)})
 		case core.EvPipeQuality:
 			q.push(Event{Kind: EventPipeQualityChanged, PipeID: PipeID(e.Pipe), SmoothedRTT: time.Duration(e.RTT),
 				DeliveryRate: rateBytes(e.Rate), Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
@@ -541,6 +623,11 @@ func (c *Conn) drainEventsLocked() {
 			q.push(Event{Kind: EventPipePriorityChanged, PipeID: PipeID(e.Pipe), Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count, Source: e.Source, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
 		case core.EvPipeAttached:
+			if pd := c.pipes[e.Pipe]; pd != nil {
+				if o := pd.end.join; o != nil {
+					_ = o.settleLocked(nil)
+				}
+			}
 			c.firePipeWaiters() // WaitAttached and the pool
 		case core.EvJoinKeys:
 			// Joins are possible: maintenance and redial go on.
@@ -569,19 +656,33 @@ func (c *Conn) drainEventsLocked() {
 			c.hk.trace(traceItem{ev: ev})
 		}
 	}
-	// Only new events wake NextEvent; firePipeWaiters wakes AddPipe and
+	// New events and registration of an exclusive consumer wake NextEvent.
+	// firePipeWaiters wakes AddPipe and
 	// the pool, whose long-lived waiter would otherwise keep NextEvent
 	// spinning.
-	if len(q.fresh) > 0 {
-		for _, w := range q.waiters {
-			w.Fire()
-		}
-		q.waiters = q.waiters[:0]
-	}
+	wakeWaiters = len(q.fresh) > 0 || (c.handlers != nil && c.handlers.eventsRegistered)
 	// Pushed since the last drain, inside it or by another critical
 	// section (reportCarrier): each traced and woken for once, here.
 	clear(q.fresh)
 	q.fresh = q.fresh[:0]
+	return wakeWaiters
+}
+
+// wakeEventWaitersLocked appends NextEvent's waiters to wakes, which the
+// epilogue fires outside the lock.
+
+// traceStream hands one stream placement or gap event to the tracer.
+func (c *Conn) traceStream(e core.Event, kind EventKind, dir Direction) {
+	c.hk.trace(traceItem{ev: Event{Kind: kind, Direction: dir, PipeID: PipeID(e.Pipe), StreamID: StreamID(e.Stream),
+		StreamOffset: e.Offset, StreamLength: e.Count, StreamAt: c.clk.wall(e.At), GapWait: time.Duration(e.Wait)}})
+}
+
+func (c *Conn) wakeEventWaitersLocked(wakes []*core.Signal) []*core.Signal {
+	q := &c.events
+	wakes = append(wakes, q.waiters...)
+	clear(q.waiters)
+	q.waiters = q.waiters[:0]
+	return wakes
 }
 
 // firePipeWaiters wakes the waiters of pipe state changes.
@@ -661,17 +762,35 @@ func (c *Conn) pipeStateEvent(e core.Event) {
 // it for EventPipesRetired. Reading it is optional. Once the session has
 // ended nothing more enters it. It is independent of Config.Tracer, which
 // receives every occurrence, on its own backlog, whether or not NextEvent
-// is called. Concurrent callers each receive different events.
+// is called. Concurrent callers each receive different events. Calling NextEvent
+// enables path quality advice until StopEvents.
 func (c *Conn) NextEvent(ctx context.Context) (Event, error) {
+	if c == nil {
+		return Event{}, net.ErrClosed
+	}
 	sig := core.NewSignal()
+	first := true
 	for {
 		c.lock()
 		q := &c.events
+		if c.handlers != nil && c.handlers.eventsRegistered {
+			c.unlock()
+			return Event{}, ErrHandlerRegistered
+		}
+		if first && !q.frozen && !q.pollAdvice {
+			q.pollAdvice = true
+			c.s.EnablePathAdvice()
+		}
+		first = false
 		if ev, ok := q.pop(); ok {
 			c.unlock()
 			return ev, nil
 		}
-		closing := c.closing
+		sessionDone := c.done
+		closing := c.closing && len(q.held) == 0
+		if c.closing {
+			sessionDone = nil
+		}
 		if !closing {
 			sig.Drain()
 			q.waiters = append(q.waiters, sig)
@@ -692,17 +811,15 @@ func (c *Conn) NextEvent(ctx context.Context) (Event, error) {
 			}
 			c.unlock()
 			return Event{}, ctx.Err()
-		case <-c.done:
+		case <-sessionDone:
 		}
 	}
 }
 
 // closeSuspended closes sessions beyond the listener's MaxSuspended, the
 // longest-suspended first, with ZMUX_RESUME_TIMEOUT.
-func closeSuspended(cs []*Conn) {
-	for _, c := range cs {
-		c.locked(func() {
-			c.s.CloseResumeTimeout()
-		})
+func closeSuspended(cs []suspension) {
+	for _, ticket := range cs {
+		ticket.close()
 	}
 }

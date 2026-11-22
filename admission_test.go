@@ -83,7 +83,9 @@ func TestStallDurationBySource(t *testing.T) {
 // a slot for a new attempt.
 func TestStallCountsPerSource(t *testing.T) {
 	leakcheck.Check(t)
-	a := &Admission{Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} },
+	a := &Admission{Decide: func(context.Context, CarrierInfo, []byte) Decision {
+		return Decision{Verdict: VerdictFallback, Variant: "targetless"}
+	},
 		StallMin: time.Minute, StallMax: time.Minute}
 	lst := mustNewListener(&ListenerConfig{MaxPendingPerSource: 3, Admission: a})
 	defer func() { _ = lst.Close() }()
@@ -108,6 +110,9 @@ func TestStallCountsPerSource(t *testing.T) {
 	_ = c.Close()
 	if st := lst.Stats().Admission; st.StallOverflow != 1 || st.Stalled != 2 {
 		t.Fatalf("stats %+v", st)
+	}
+	if got := lst.VariantStats(); len(got) != 1 || got[0] != (VariantStat{Name: "targetless", Stalled: 3}) {
+		t.Fatalf("variants %+v", got)
 	}
 	cancel()
 	for _, c := range clients {
@@ -227,7 +232,7 @@ func TestCloseEndsFallbackStall(t *testing.T) {
 	if _, err := a.Write([]byte("abcd")); err != nil {
 		t.Fatal(err)
 	}
-	for end := time.Now().Add(5 * time.Second); lst.Stats().Admission.Fallback != 1; time.Sleep(time.Millisecond) {
+	for end := time.Now().Add(5 * time.Second); lst.Stats().Admission.Stalled != 1; time.Sleep(time.Millisecond) {
 		if time.Now().After(end) {
 			t.Fatalf("stats %+v", lst.Stats())
 		}

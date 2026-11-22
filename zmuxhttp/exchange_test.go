@@ -66,13 +66,13 @@ func TestHTTPExchangeVectors(t *testing.T) {
 		}
 		h := &ExchangeHandler{p: p}
 		for _, x := range []struct {
-			kind, respFlags byte
-			seq, ack        uint64
 			data, respData  string
 			req, resp       string
+			seq, ack        uint64
+			kind, respFlags byte
 		}{
-			{exKindUp, 0, 0, 0, "hello", "", v.up, v.upR},
-			{exKindDown, exFlagFin, 300, 299, "", "world", v.down, v.downR},
+			{kind: exKindUp, respFlags: 0, seq: 0, ack: 0, data: "hello", respData: "", req: v.up, resp: v.upR},
+			{kind: exKindDown, respFlags: exFlagFin, seq: 300, ack: 299, data: "", respData: "world", req: v.down, resp: v.downR},
 		} {
 			b := exRequest(key, &cid, x.kind, 0, x.seq, x.ack, 1767225600, &nonce, []byte(x.data))
 			if got := hex.EncodeToString(b); got != x.req {
@@ -698,13 +698,13 @@ func TestHTTPExchangeTruncatedFallback(t *testing.T) {
 	leakcheck.Check(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	type seen struct {
-		body []byte
 		err  error
+		body []byte
 	}
 	got := make(chan seen, 1)
 	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
-		got <- seen{b, err}
+		got <- seen{body: b, err: err}
 	})
 	h := newExHandler(t, lst, &Options{Next: next}, &exCfg{PSK: bytes.Repeat([]byte{5}, 32)})
 	srv := httptest.NewServer(h)

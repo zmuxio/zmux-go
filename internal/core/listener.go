@@ -303,5 +303,5 @@ func (sp *SplitPairing) Withdraw(token [16]byte, carrier any) bool {
 	return true
 }
 
-// Forget releases a used token when its session ends.
+// Forget releases a used token when its paired carrier ends.
 func (sp *SplitPairing) Forget(token [16]byte) { delete(sp.used, token) }

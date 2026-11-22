@@ -227,11 +227,11 @@ func parseRecord(x any, t *tables) (*record, error) {
 	}
 	r := &record{}
 	for _, f := range []struct {
-		k   string
 		to  *value
+		k   string
 		fam family
-	}{{"target", &r.target, famLength}, {"max_len", &r.maxLen, famLength}, {"pad_to", &r.padTo, famLength},
-		{"pad_multiple", &r.padMul, famLength}, {"pad", &r.pad, famLength}, {"delay", &r.delay, famTime}} {
+	}{{k: "target", to: &r.target, fam: famLength}, {k: "max_len", to: &r.maxLen, fam: famLength}, {k: "pad_to", to: &r.padTo, fam: famLength},
+		{k: "pad_multiple", to: &r.padMul, fam: famLength}, {k: "pad", to: &r.pad, fam: famLength}, {k: "delay", to: &r.delay, fam: famTime}} {
 		if v := o.get(f.k); v != nil {
 			if *f.to, err = parseValue(v, f.fam, t, true, f.k); err != nil {
 				return nil, err

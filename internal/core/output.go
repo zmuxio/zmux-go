@@ -26,8 +26,9 @@ func (s *Session) recMax(ol *outLane) int {
 	return m
 }
 
-// WantsWrite reports whether PollTransmit(pipe, lane) would produce bytes
-// now.
+// WantsWrite estimates immediate output for diagnostics and simulations.
+// A poll can also produce protocol feedback or opportunistic data, or find
+// a shaping gate closed. Drivers schedule polls from lane wake requests.
 func (s *Session) WantsWrite(pipe, lane uint64) bool {
 	p := s.pipe(pipe)
 	if p == nil || p.out == nil || p.out.failed || p.mp != nil && p.mp.hs {
@@ -158,21 +159,10 @@ func (s *Session) planResend(st *Stream) (chunkPlan, bool) {
 	var p chunkPlan
 	p.resend = true
 	for m.resend.len() > 0 {
-		r := m.resend.first()
-		lo, hi := max64(r.lo, sp.q.base), min64(r.hi, sp.q.end)
-		if sp.reset {
-			hi = min64(hi, sp.resetRel)
+		if p, ok := s.resendRange(st, m.resend.first()); ok {
+			return p, true
 		}
-		if lo >= hi {
-			m.resend.popFirst()
-			continue
-		}
-		p.off, p.n = lo, min64(hi-lo, maxStreamFrame)
-		if lo == 0 && sp.preLen > p.n {
-			p.n = min64(sp.preLen, sp.q.end)
-		}
-		p.fin = m.finResend && p.off+p.n == sp.q.end && sp.finSent && !sp.reset
-		return p, true
+		m.resend.popFirst()
 	}
 	if m.finResend && !sp.reset && sp.finSent {
 		p.off, p.fin = sp.q.end, true
@@ -182,15 +172,65 @@ func (s *Session) planResend(st *Stream) (chunkPlan, bool) {
 	return p, false
 }
 
+// resendRange plans the first still-missing bytes of a retained range.
+func (s *Session) resendRange(st *Stream, r rng) (chunkPlan, bool) {
+	sp := &st.snd
+	m := sp.mps
+	lo, hi := max64(r.lo, sp.q.base), min64(r.hi, sp.q.end)
+	if sp.reset {
+		hi = min64(hi, sp.resetRel)
+	}
+	if lo >= hi {
+		return chunkPlan{}, false
+	}
+	// Acknowledged higher ranges can precede advancement of the stream prefix.
+	missing := m.acked.firstGap(lo, hi)
+	n := min64(missing.hi-missing.lo, maxStreamFrame)
+	if n == 0 || missing.lo == 0 && n < sp.preLen {
+		return chunkPlan{}, false
+	}
+	return chunkPlan{off: missing.lo, n: n, resend: true,
+		fin: m.finResend && missing.lo+n == sp.q.end && sp.finSent && !sp.reset}, true
+}
+
+// planNativeResend preserves native loss priority while the speculative
+// tail is waiting for its writer. Leave that tail in the shared queue.
+func (s *Session) planNativeResend(st *Stream) (chunkPlan, bool) {
+	sp := &st.snd
+	m := sp.mps
+	q := &m.resend.q
+	for i := q.begin(); q.valid(i); i = q.next(i) {
+		r := *q.at(i)
+		if r.lo < m.repair.sent {
+			if p, ok := s.resendRange(st, rng{r.lo, min64(r.hi, m.repair.sent)}); ok {
+				return p, true
+			}
+		}
+		if r.hi > m.repair.hi {
+			if p, ok := s.resendRange(st, rng{max64(r.lo, m.repair.hi), r.hi}); ok {
+				return p, true
+			}
+		}
+	}
+	if m.finResend && !sp.reset && sp.finSent {
+		return chunkPlan{off: sp.q.end, fin: true, resend: true}, true
+	}
+	return chunkPlan{}, false
+}
+
 // planChunk computes the next frame of a stream that has an identifier.
 func (s *Session) planChunk(st *Stream) chunkPlan {
-	sp := &st.snd
-	var p chunkPlan
-	if m := sp.mps; m != nil && (m.resend.len() > 0 || m.finResend) {
+	if m := st.snd.mps; m != nil && (m.resend.len() > 0 || m.finResend) {
 		if rp, ok := s.planResend(st); ok {
 			return rp
 		}
 	}
+	return s.planNewChunk(st)
+}
+
+func (s *Session) planNewChunk(st *Stream) chunkPlan {
+	sp := &st.snd
+	var p chunkPlan
 	p.off = max64(sp.sent, sp.q.base)
 	if end := sp.sendEnd(); end > p.off {
 		p.avail = end - p.off
@@ -392,6 +432,8 @@ func (s *Session) queuedOn(p *Pipe) uint64 {
 	}
 	var q uint64
 	for _, l := range p.out.lanes {
+		// Retain the last reported backlog for placement until the carrier
+		// reports a replacement value. Age alone is no evidence it drained.
 		q += l.handed + l.unsent
 	}
 	return q
@@ -405,71 +447,49 @@ func (s *Session) carrierUnsent(p *Pipe) (uint64, bool) {
 	}
 	var q uint64
 	var known bool
+	quality := p.pathQuality()
 	for _, l := range p.out.lanes {
-		q += l.unsent
-		known = known || l.unsentKnown
+		if l.freshUnsent(quality, s.now) {
+			q += l.unsent
+			known = true
+		}
 	}
 	return q, known
 }
 
+func (ol *outLane) freshUnsent(q *pathQuality, now Time) bool {
+	if !ol.unsentKnown || q == nil {
+		return ol.unsentKnown
+	}
+	at, ok := q.unsentAt[ol.lane]
+	return ok && now.Sub(at) < rateWindow
+}
+
 // SetCarrierUnsent records the bytes the carrier of a lane holds unsent,
 // as its adapter reports them (an optional capability).
-func (s *Session) SetCarrierUnsent(pipe, lane, n uint64) {
+func (s *Session) SetCarrierUnsent(pipe, lane, n uint64, now Time) {
 	if p := s.pipe(pipe); p != nil && p.out != nil {
 		if ol := p.out.lane(lane); ol != nil {
+			if q := p.pathQuality(); q != nil {
+				changed := !ol.freshUnsent(q, now) || ol.unsent != n
+				if q.unsentAt == nil {
+					q.unsentAt = make(map[uint64]Time)
+				}
+				q.unsentAt[lane] = now
+				if changed {
+					s.wakePrefix()
+				}
+			}
 			ol.unsent, ol.unsentKnown = n, true
 		}
 	}
-}
-
-// lossSampleGap is the shortest time between two samples of a pipe's
-// smoothed loss rate.
-const lossSampleGap = Second
-
-// SetCarrierRetransmitted records the bytes the carrier of a pipe has
-// retransmitted, as its adapter reports them (an optional capability),
-// and samples the pipe's smoothed loss rate: an EWMA with gain 1/8 of the
-// retransmitted bytes per byte sent between samples at least
-// lossSampleGap apart. A count that moves back (a carrier that undoes
-// losses) counts as no retransmission.
-func (s *Session) SetCarrierRetransmitted(pipe, n uint64) {
-	p := s.pipe(pipe)
-	if p == nil || p.out == nil {
-		return
-	}
-	d := p.out
-	var sent uint64
-	for _, l := range d.lanes {
-		sent += l.pos
-	}
-	first := !d.retransKnown
-	d.retrans, d.retransKnown = n, true
-	if first {
-		d.lossAt, d.lossSent, d.lossRetrans = s.now, sent, n
-		return
-	}
-	if sent < d.lossSent {
-		// The lanes' total moved back (a lane went): a new baseline,
-		// or the rate would stall until the old total came back.
-		d.lossAt, d.lossSent, d.lossRetrans = s.now, sent, n
-		return
-	}
-	if s.now.Sub(d.lossAt) < lossSampleGap || sent == d.lossSent {
-		return
-	}
-	x := float64(n-min64(n, d.lossRetrans)) / float64(sent-d.lossSent)
-	if d.lossHas {
-		d.lossRate += (x - d.lossRate) / 8
-	} else {
-		d.lossRate, d.lossHas = x, true
-	}
-	d.lossAt, d.lossSent, d.lossRetrans = s.now, sent, n
 }
 
 // WriteDone reports that a batch was written (or failed); it releases the
 // batch's references. n is the bytes the carrier took.
 func (s *Session) WriteDone(b *Batch, err error, now Time) {
 	s.SetNow(now)
+	s.wakePrefix()
 	b.release()
 	if p := s.pipe(b.Pipe); p != nil && p.out != nil {
 		if ol := p.out.lane(b.Lane); ol != nil {
@@ -1002,6 +1022,8 @@ const (
 )
 
 // sendChunk puts the next frame of st into the record.
+//
+//goland:noinspection GoDfaConstantCondition // d is nil for a single-pipe writer (writeData)
 func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	sp := &st.snd
 	if !st.idSet {
@@ -1024,6 +1046,25 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		}
 	}
 	p := s.planChunk(st)
+	if d != nil && p.resend && p.n != 0 && sp.mps.repair.source != nil && sp.mps.repair.covers(p.off) {
+		r := &sp.mps.repair
+		target, eligible := s.prefixReplacement(d.g, r.source, min64(p.n, r.hi-p.off))
+		switch {
+		case !eligible:
+			s.retryPrefixTail(st)
+			s.wakeAllWriters()
+			return chunkSkip
+		case target == nil:
+			if native, ok := s.planNativeResend(st); ok {
+				p = native
+			} else {
+				p = s.planNewChunk(st)
+			}
+		case target != d.p:
+			s.chosen(d.p, target)
+			return chunkSkip
+		}
+	}
 	if p.preBlocked {
 		if p.avail >= sp.preLen || sp.finWr {
 			s.blockedOn(st, p.credit < sp.preLen, p.connCredit < sp.preLen)
@@ -1040,6 +1081,18 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		return chunkSkip
 	}
 	off, n, fin := p.off, p.n, p.fin
+	repair := p.resend && n != 0 && sp.mps.repair.covers(off)
+	if repair {
+		r := &sp.mps.repair
+		n = min64(n, r.hi-off) // the pending range already reserves bucket credit
+		if n == 0 || off == 0 && n < sp.preLen {
+			return chunkSkip
+		}
+
+		if n != p.n {
+			fin = false
+		}
+	}
 	if c := s.chunkRoom(d, st); d != nil && !p.resend && n > c {
 		// One scheduling decision per chunk.
 		n, fin = c, false
@@ -1108,7 +1161,9 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		n += uint64(len(more))
 		fin = f
 	}
-	w.logFrame(frameDesc{kind: dStream, id: st.id, off: off, n: n, fin: fin})
+	w.logFrame(frameDesc{kind: dStream, id: st.id, off: off, n: n, fin: fin,
+		fresh: d != nil && len(s.pipes) > 1 && s.mp.additionalPipes != nil &&
+			d.p.mp.peerAttached(d.p.id) && !s.cfg.Test.NoPrefixRepair && !p.resend && n > 0 && s.policyOf(st) == PolicySpreadETA, repair: repair})
 	w.spendData(n)
 	st.countFrame(off, n)
 	if p.resend {
@@ -1118,6 +1173,14 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 			d.p.mp.holdSent += n
 		}
 		m := sp.mps
+		if repair {
+			if source := m.repair.source; source != nil {
+				s.penalize(source, false)
+			}
+			s.commitPrefixRepair(m, off, n)
+			s.stats.BytesOpportunistic += n
+			d.p.mp.oppBytes += n
+		}
 		if off == 0 && d != nil {
 			m.openPipe, m.openSet = d.p.id, true // a reinjected copy of the opening frame
 		}

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
 )
@@ -21,7 +24,19 @@ func TestServeConnDialled(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), InstanceID: []byte("instance")})
+	var block atomic.Bool
+	pending := make(chan struct{})
+	ended := make(chan error, 1)
+	wrap := zmux.WrapPipeFunc(func(ctx context.Context, p zmux.PipeIO, _ zmux.PipeHint) (zmux.PipeIO, error) {
+		if block.CompareAndSwap(true, false) {
+			close(pending)
+			<-ctx.Done()
+			ended <- ctx.Err()
+			return zmux.PipeIO{}, ctx.Err()
+		}
+		return p, nil
+	})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), WrapPipe: wrap, InstanceID: []byte("instance")})
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -63,8 +78,7 @@ func TestServeConnDialled(t *testing.T) {
 	defer func() { _ = s.Close() }()
 
 	// The second connection stops being served when its context ends
-	// (its pipe is aborted, as Serve's are); the connection and the
-	// session continue.
+	// while its joined pipe continues to carry traffic.
 	sctx, scancel := context.WithCancel(ctx)
 	q2 := connect(sctx)
 	defer func() { _ = q2.CloseWithError(0, "") }()
@@ -79,7 +93,37 @@ func TestServeConnDialled(t *testing.T) {
 	if n := len(s.PipeStats()); n != 2 {
 		t.Fatalf("server: %d pipes, want 2", n)
 	}
+	// Stop only the listener while a further stream on q2 is in setup.
+	// The caller holds one ServeConn context for the entire connection.
+	block.Store(true)
+	extra, err := q2.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = extra.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-pending:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	_ = lst.Close()
+	select {
+	case err := <-ended:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("listener stop left setup pending")
+	}
+	extra.CancelRead(0)
+	_ = extra.Close()
 	scancel()
+	boot, _ := c.Pipe(0)
+	if err := boot.Abort(); err != nil {
+		t.Fatal(err)
+	}
 	echo(t, c, s, 1<<16) // the session continues
 	if q2.Context().Err() != nil {
 		t.Fatal("ServeConn closed the connection when its context ended")
@@ -117,5 +161,68 @@ func TestServeConnRefused(t *testing.T) {
 	case <-qc.Context().Done():
 	case <-ctx.Done():
 		t.Fatal("refused connection still open")
+	}
+}
+
+// HS-53, HS-57.
+func TestQUICFirstReservationEndsWithServeScope(t *testing.T) {
+	srv, cli := tlsConfigs(t)
+	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = qc.CloseWithError(0, "") }()
+	peer, err := ln.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = peer.CloseWithError(0, "") }()
+	for _, end := range []string{"context", "listener", "deadline", "connection"} {
+		clk := timeshim.NewFake(time.Now())
+		l := mustNewListener(&zmux.ListenerConfig{MaxPending: 1, Config: &zmux.Config{Clock: clk, HandshakeTimeout: time.Second}})
+		setup, stop := context.WithCancel(ctx)
+		a, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() { defer close(done); serveArrival(setup, peer, a) }()
+		if err := clk.WaitDeadline(ctx, clk.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		switch end {
+		case "listener":
+			_ = l.Close()
+		case "deadline":
+			clk.Advance(time.Second)
+		case "connection":
+			_ = qc.CloseWithError(0, "")
+		default:
+			stop()
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatal("accept loops outlived setup")
+		}
+		if end != "connection" && qc.Context().Err() != nil {
+			t.Fatal("accept stopped the connection")
+		}
+		if end != "listener" {
+			next, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			next.Release()
+		}
+		stop()
+		_ = l.Close()
 	}
 }

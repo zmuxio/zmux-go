@@ -68,15 +68,14 @@ type ReplayConfig struct {
 // key until the window passes.
 type ReplayFilter struct {
 	clk       timeshim.Clock
+	b         []replayBucket
+	n         int
 	seeds     [2]maphash.Seed
 	window    int64 // ms
 	width     int64 // ms per bucket
 	max       int
 	notBefore int64 // Unix ms; 0: none
-
-	b  []replayBucket
-	n  int
-	mu sync.Mutex
+	mu        sync.Mutex
 }
 
 type replayKey [2]uint64

@@ -122,39 +122,39 @@ func TestEventQueueRetireRemovesEveryPipeKey(t *testing.T) {
 // and whichever event stays unread.
 func TestEventQueueRetireCountsUnreadEnd(t *testing.T) {
 	type tc struct {
-		name           string
 		setup          func(q *eventQueue)
+		name           string
 		failed         bool
 		failedN, clsdN uint64
 	}
 	read := func(q *eventQueue) { drainEvents(q) }
 	for _, c := range []tc{
-		{"never queued, closed", func(*eventQueue) {}, false, 0, 1},
-		{"never queued, failed", func(*eventQueue) {}, true, 1, 0},
-		{"outbound failed unread", func(q *eventQueue) {
+		{name: "never queued, closed", setup: func(*eventQueue) {}, failed: false, failedN: 0, clsdN: 1},
+		{name: "never queued, failed", setup: func(*eventQueue) {}, failed: true, failedN: 1, clsdN: 0},
+		{name: "outbound failed unread", setup: func(q *eventQueue) {
 			q.push(Event{Kind: EventPipeFailed, PipeID: 2, Direction: DirectionSendOnly})
-		}, true, 1, 0},
-		{"inbound closed unread, flag failed", func(q *eventQueue) {
+		}, failed: true, failedN: 1, clsdN: 0},
+		{name: "inbound closed unread, flag failed", setup: func(q *eventQueue) {
 			q.push(Event{Kind: EventPipeClosed, PipeID: 2, Direction: DirectionReceiveOnly})
-		}, true, 1, 0},
-		{"terminal read", func(q *eventQueue) {
-			q.push(Event{Kind: EventPipeClosed, PipeID: 2, Direction: DirectionReceiveOnly})
-			read(q)
-		}, false, 0, 0},
-		{"outbound failed read, inbound end never queued", func(q *eventQueue) {
-			q.push(Event{Kind: EventPipeFailed, PipeID: 2, Direction: DirectionSendOnly})
-			read(q)
-		}, true, 0, 0},
-		{"outbound failed read, inbound end unread", func(q *eventQueue) {
-			q.push(Event{Kind: EventPipeFailed, PipeID: 2, Direction: DirectionSendOnly})
-			read(q)
-			q.push(Event{Kind: EventPipeClosed, PipeID: 2, Direction: DirectionReceiveOnly})
-		}, true, 0, 0},
-		{"inbound read, outbound unread", func(q *eventQueue) {
+		}, failed: true, failedN: 1, clsdN: 0},
+		{name: "terminal read", setup: func(q *eventQueue) {
 			q.push(Event{Kind: EventPipeClosed, PipeID: 2, Direction: DirectionReceiveOnly})
 			read(q)
+		}, failed: false, failedN: 0, clsdN: 0},
+		{name: "outbound failed read, inbound end never queued", setup: func(q *eventQueue) {
 			q.push(Event{Kind: EventPipeFailed, PipeID: 2, Direction: DirectionSendOnly})
-		}, false, 0, 0},
+			read(q)
+		}, failed: true, failedN: 0, clsdN: 0},
+		{name: "outbound failed read, inbound end unread", setup: func(q *eventQueue) {
+			q.push(Event{Kind: EventPipeFailed, PipeID: 2, Direction: DirectionSendOnly})
+			read(q)
+			q.push(Event{Kind: EventPipeClosed, PipeID: 2, Direction: DirectionReceiveOnly})
+		}, failed: true, failedN: 0, clsdN: 0},
+		{name: "inbound read, outbound unread", setup: func(q *eventQueue) {
+			q.push(Event{Kind: EventPipeClosed, PipeID: 2, Direction: DirectionReceiveOnly})
+			read(q)
+			q.push(Event{Kind: EventPipeFailed, PipeID: 2, Direction: DirectionSendOnly})
+		}, failed: false, failedN: 0, clsdN: 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var q eventQueue
@@ -394,6 +394,26 @@ func TestEventQueueJoinAuthFailedBounded(t *testing.T) {
 	}
 }
 
+// modelEventPush updates the independent slice model in latest-occurrence order.
+func modelEventPush(model []Event, ev Event) []Event {
+	if ev.Kind == EventJoinAuthFailed && ev.Count == 0 {
+		ev.Count = 1
+	}
+	if ev.Kind == EventSessionResumed {
+		model = slices.DeleteFunc(model, func(x Event) bool { return x.Kind == EventResumeUnattended })
+	}
+	if i := slices.IndexFunc(model, func(x Event) bool { return keyOf(&x) == keyOf(&ev) }); i >= 0 {
+		if keepFirst(ev.Kind) {
+			return model
+		}
+		if ev.Kind == EventJoinAuthFailed {
+			ev.Count += model[i].Count
+		}
+		model = slices.Delete(model, i, i+1)
+	}
+	return append(model, ev)
+}
+
 // Model test: the queue against a reference of the rule (one unread event
 // per key, order of the latest occurrence), over random sequences of
 // occurrences, reads and retirements.
@@ -403,23 +423,13 @@ func TestEventQueueModel(t *testing.T) {
 		EventTierSaturation, EventCapacityBelow, EventSessionSuspended, EventSessionResumed, EventCarrierChosen, EventGoAwayReceived}
 	var q eventQueue
 	var model []Event // by latest occurrence; merged like the queue
-	same := func(a, b *Event) bool { return keyOf(a) == keyOf(b) }
 	for step := range 20000 {
 		switch r := rng.IntN(10); {
 		case r < 7:
 			ev := Event{Kind: kinds[rng.IntN(len(kinds))], PipeID: PipeID(2 * (1 + rng.IntN(4))), Priority: uint64(rng.IntN(3)),
 				Direction: Direction(1 + rng.IntN(2)), Weight: uint64(step)}
 			q.push(ev)
-			if ev.Kind == EventSessionResumed {
-				model = slices.DeleteFunc(model, func(x Event) bool { return x.Kind == EventResumeUnattended })
-			}
-			if i := slices.IndexFunc(model, func(x Event) bool { return same(&x, &ev) }); i >= 0 {
-				if keepFirst(ev.Kind) {
-					continue
-				}
-				model = slices.Delete(model, i, i+1)
-			}
-			model = append(model, ev)
+			model = modelEventPush(model, ev)
 		case r < 9:
 			got, ok := q.pop()
 			if ok != (len(model) > 0) {
@@ -454,12 +464,12 @@ func TestEventQueueModel(t *testing.T) {
 
 func TestJoinAuthReasonNames(t *testing.T) {
 	for _, c := range []struct {
-		r    JoinAuthReason
 		want string
-	}{{JoinAuthReasonAuth, "auth"}, {JoinAuthReasonMissingField, "missing_field"}, {JoinAuthReasonBadField, "bad_field"},
-		{JoinAuthReasonTLVTruncated, "tlv_truncated"}, {JoinAuthReasonTLVNonMinimal, "tlv_non_minimal"},
-		{JoinAuthReasonTLVOrder, "tlv_order"},
-		{JoinAuthReasonTLVUnknownCritical, "tlv_unknown_critical"}, {JoinAuthReasonKex, "kex"}} {
+		r    JoinAuthReason
+	}{{r: JoinAuthReasonAuth, want: "auth"}, {r: JoinAuthReasonMissingField, want: "missing_field"}, {r: JoinAuthReasonBadField, want: "bad_field"},
+		{r: JoinAuthReasonTLVTruncated, want: "tlv_truncated"}, {r: JoinAuthReasonTLVNonMinimal, want: "tlv_non_minimal"},
+		{r: JoinAuthReasonTLVOrder, want: "tlv_order"},
+		{r: JoinAuthReasonTLVUnknownCritical, want: "tlv_unknown_critical"}, {r: JoinAuthReasonKex, want: "kex"}} {
 		if got := c.r.String(); got != c.want {
 			t.Errorf("%d: %q, want %q", c.r, got, c.want)
 		}

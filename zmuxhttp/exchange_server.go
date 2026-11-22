@@ -156,7 +156,7 @@ func (h *ExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cl := int(r.ContentLength)
 	// The authentication header, within the first-record timeout.
 	var raw [b64AuthLen]byte
-	n, err := h.readBounded(w, r.Body, raw[:authLen], arrived.Add(h.l.Adapter().FirstRecordTimeout()))
+	n, err := h.readBounded(r.Context(), a, w, r.Body, raw[:authLen], arrived.Add(h.l.Adapter().FirstRecordTimeout()))
 	if err != nil {
 		a.Release()
 		// The body ended early or late: the fallback gets what arrived and
@@ -192,10 +192,11 @@ func (h *ExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if c != nil || gone {
-		a.Release() // a request of a known carrier holds no slot from now on
+		a.Release() // established traffic uses only the request lifetime
+		a = nil
 	}
 	// Data and the Data MAC, within the handshake timeout.
-	buf, rest, err := h.readBody(w, r.Body, cl-authLen, h.l.Adapter().Clock().Now().Add(h.l.Adapter().HandshakeTimeout()))
+	buf, rest, err := h.readBody(r.Context(), a, w, r.Body, cl-authLen, h.l.Adapter().Clock().Now().Add(h.l.Adapter().HandshakeTimeout()))
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -219,7 +220,7 @@ func (h *ExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case gone:
 		h.respond(w, key, &q, exFlagGone, nil)
 	default:
-		c, flags := h.create(w, r, a, &q, key, raw, authLen, rest)
+		c, flags := h.create(w, r, a, &q, key, raw, authLen, rest, buf)
 		if flags == exAnswered {
 			return
 		}
@@ -239,8 +240,29 @@ var errReadTimedOut = errors.New("zmuxhttp: request body timed out")
 // body encoding.
 const b64AuthLen = (exAuthLen + 2) / 3 * 4
 
+// A request still acquiring a carrier can be interrupted at listener
+// stop. Once authenticated as traffic for an existing carrier it follows
+// only the request and its normal protocol deadline.
+func watchExchangeRead(ctx context.Context, a *zmux.Arrival, w http.ResponseWriter) func() {
+	if a == nil {
+		return func() {}
+	}
+	bound, cancel := a.SetupContext(ctx)
+	ended := make(chan struct{})
+	rc := http.NewResponseController(w)
+	stop := context.AfterFunc(bound, func() { defer close(ended); _ = rc.SetReadDeadline(time.Now()) })
+	return func() {
+		if !stop() {
+			<-ended
+		}
+		cancel()
+	}
+}
+
 // readBounded reads len(b) bytes of body by deadline; n is what it read.
-func (h *ExchangeHandler) readBounded(w http.ResponseWriter, body io.Reader, b []byte, deadline time.Time) (n int, err error) {
+func (h *ExchangeHandler) readBounded(ctx context.Context, a *zmux.Arrival, w http.ResponseWriter, body io.Reader, b []byte, deadline time.Time) (n int, err error) {
+	unlink := watchExchangeRead(ctx, a, w)
+	defer unlink()
 	stop := h.readDeadline(w, deadline)
 	n, err = io.ReadFull(body, b)
 	if !stop() && err == nil {
@@ -253,7 +275,9 @@ func (h *ExchangeHandler) readBounded(w http.ResponseWriter, body io.Reader, b [
 // header by deadline, into a buffer that grows with what arrives, and
 // decodes them when the body is base64: the result is Data followed by
 // the Data MAC.
-func (h *ExchangeHandler) readBody(w http.ResponseWriter, body io.Reader, n int, deadline time.Time) (*exBuf, []byte, error) {
+func (h *ExchangeHandler) readBody(ctx context.Context, a *zmux.Arrival, w http.ResponseWriter, body io.Reader, n int, deadline time.Time) (*exBuf, []byte, error) {
+	unlink := watchExchangeRead(ctx, a, w)
+	defer unlink()
 	stop := h.readDeadline(w, deadline)
 	buf, b, err := readExBody(body, n, h.p.b64)
 	if !stop() && err == nil {
@@ -358,7 +382,7 @@ func (h *ExchangeHandler) authenticate(q *exReq, fields []byte) (c *exServer, ke
 // create returns exAnswered. The fallback gets the request with its body
 // as it arrived: raw[:authLen], the authentication header as read, and
 // rest, the decoded Data and Data MAC, encoded back as they were read.
-func (h *ExchangeHandler) create(w http.ResponseWriter, r *http.Request, a *zmux.Arrival, q *exReq, key *exKey, raw [b64AuthLen]byte, authLen int, rest []byte) (*exServer, byte) {
+func (h *ExchangeHandler) create(w http.ResponseWriter, r *http.Request, a *zmux.Arrival, q *exReq, key *exKey, raw [b64AuthLen]byte, authLen int, rest []byte, buf *exBuf) (*exServer, byte) {
 	if q.kind == exKindClose {
 		h.mu.Lock()
 		h.forgetLocked(q.cid, key)
@@ -400,28 +424,94 @@ func (h *ExchangeHandler) create(w http.ResponseWriter, r *http.Request, a *zmux
 	// The listener takes or refuses the carrier now, before it waits for
 	// anything: one it refuses is answered BUSY and leaves no state, live
 	// or gone.
-	run, err := a.Take(r.Context(), zmux.PipeIO{R: &exServerReader{nc}, W: &exServerWriter{nc},
-		Carrier: zmux.CarrierExchange}, zmux.PipeHint{})
-	if err != nil {
-		h.mu.Lock()
-		if h.carriers[q.cid] == nc {
-			delete(h.carriers, q.cid)
-		}
-		// The refused pipe's close may have remembered it meanwhile, with
-		// other carriers forgotten after it: no Carrier ID but this one's
-		// was free of state when it was created, so any record of it is
-		// this carrier's.
-		h.unforgetLocked(q.cid)
-		h.mu.Unlock()
-		nc.idle.Stop()
-		h.wg.Done()
-		return nil, exFlagBusy
+	var run func(context.Context) error
+	accepted := a.Admitted()
+	// After acceptance the exchange is independent of its creating
+	// request. The peer can retry on another connection.
+	setup := h.ctx
+	if !accepted {
+		// Takeover requires the success response to be committed. The
+		// request and the handler both bound that handoff.
+		var cancel context.CancelFunc
+		setup, cancel = context.WithCancel(r.Context())
+		stop := context.AfterFunc(h.ctx, cancel)
+		defer stop()
+		defer cancel()
 	}
-	labels.Go(context.Background(), "exchange-server", func() {
-		defer h.wg.Done()
-		_ = run(h.ctx)
+	var responseErr error
+	err := a.PrepareCarrier(setup, func(ctx context.Context) error {
+		var err error
+		run, err = a.Take(ctx, zmux.PipeIO{R: &exServerReader{nc}, W: &exServerWriter{nc}, Carrier: zmux.CarrierExchange}, zmux.PipeHint{})
+		if err != nil {
+			return err
+		}
+		// The first UP is retained before the host can close the carrier.
+		// A first DOWN can acknowledge creation with an empty assigned piece.
+		responseCtx, cancelResponse := context.WithCancel(ctx)
+		defer cancelResponse()
+		stopResponse := context.AfterFunc(r.Context(), cancelResponse)
+		defer stopResponse()
+		if r.Context().Err() != nil {
+			cancelResponse()
+		}
+		writer := &exchangeSetupWriter{ResponseWriter: w}
+		responseErr = commitResponse(responseCtx, w, func() error {
+			buf.ref()
+			nc.serveRequest(writer, r.WithContext(responseCtx), q, buf, true)
+			return writer.err
+		})
+		if accepted {
+			// A failed response is a lost attempt, not a failed carrier.
+			return nil
+		}
+		return responseErr
 	})
-	return nc, 0
+	if run != nil {
+		lifetime := h.ctx
+		if err != nil {
+			nc.fail(err)
+			// Let run release the setup it took without starting a carrier.
+			canceled, cancel := context.WithCancel(setup)
+			cancel()
+			lifetime = canceled
+		}
+		labels.Go(context.Background(), "exchange-server", func() { defer h.wg.Done(); _ = run(lifetime) })
+		if err != nil || responseErr != nil {
+			panic(http.ErrAbortHandler)
+		}
+		return nil, exAnswered
+	}
+	a.Release()
+	h.mu.Lock()
+	if h.carriers[q.cid] == nc {
+		delete(h.carriers, q.cid)
+	}
+	// The refused pipe's close may have remembered it meanwhile, with
+	// other carriers forgotten after it: no Carrier ID but this one's
+	// was free of state when it was created, so any record of it is
+	// this carrier's.
+	h.unforgetLocked(q.cid)
+	h.mu.Unlock()
+	nc.idle.Stop()
+	h.wg.Done()
+	return nil, exFlagBusy
+}
+
+// exchangeSetupWriter remembers body write failures in the first response.
+type exchangeSetupWriter struct {
+	http.ResponseWriter
+	err error
+}
+
+func (w *exchangeSetupWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.err = err
+	}
+	return n, err
 }
 
 // goneLocked looks a remembered carrier up, forgetting the expired ones.
@@ -678,6 +768,10 @@ func (c *exServer) completeLocked() bool {
 
 // serve processes a request whose MAC verified. buf holds q's body.
 func (c *exServer) serve(w http.ResponseWriter, r *http.Request, q *exReq, buf *exBuf) {
+	c.serveRequest(w, r, q, buf, false)
+}
+
+func (c *exServer) serveRequest(w http.ResponseWriter, r *http.Request, q *exReq, buf *exBuf, first bool) {
 	h := c.h
 	c.mu.Lock()
 	c.last = time.Now()
@@ -722,7 +816,7 @@ func (c *exServer) serve(w http.ResponseWriter, r *http.Request, q *exReq, buf *
 		c.endLocked(errExchangeClosed)
 	default:
 		buf.unref()
-		c.down(w, r, q) // unlocks
+		c.down(w, r, q, first) // unlocks
 		return
 	}
 	ended := c.completeLocked() || c.ended
@@ -813,7 +907,7 @@ func (c *exServer) upLocked(q *exReq, buf *exBuf) byte {
 
 // down answers a DOWN request; it is called locked and
 // unlocks.
-func (c *exServer) down(w http.ResponseWriter, r *http.Request, q *exReq) {
+func (c *exServer) down(w http.ResponseWriter, r *http.Request, q *exReq, expired bool) {
 	h := c.h
 	n := q.seq
 	var hold *time.Timer
@@ -822,7 +916,7 @@ func (c *exServer) down(w http.ResponseWriter, r *http.Request, q *exReq) {
 			hold.Stop()
 		}
 	}()
-	held, expired := false, false
+	held := false
 	for {
 		a := c.pieces[n]
 		var flags byte

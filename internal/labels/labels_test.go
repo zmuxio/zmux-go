@@ -7,6 +7,18 @@ import (
 	"testing"
 )
 
+func TestTaskContextReusesLabels(t *testing.T) {
+	base := t.Context()
+	task := "test-shared"
+	want := taskContext(context.Background(), task)
+	if got := taskContext(base, task); got != want {
+		t.Fatal("unlabelled base did not reuse the task context")
+	}
+	if n := testing.AllocsPerRun(10, func() { taskContext(base, task) }); n != 0 {
+		t.Fatalf("task label allocations = %v, want 0", n)
+	}
+}
+
 // Go keeps the labels of base under the task; a nil base has none.
 func TestGo(t *testing.T) {
 	for _, tc := range []struct {

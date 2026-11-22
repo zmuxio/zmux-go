@@ -27,7 +27,9 @@ import (
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
 	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/internal/labels"
+	"github.com/zmuxio/zmux-go/internal/poolhost"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
@@ -115,6 +117,29 @@ type quicState struct{ qc *quic.Conn }
 
 func (s quicState) ConnectionState() tls.ConnectionState { return s.qc.ConnectionState().TLS }
 
+// CarrierSampler is for internal use by zmux modules.
+func (s quicState) CarrierSampler() *carrierstats.Sampler {
+	return carrierstats.ForQUIC(s.qc, func(c *quic.Conn) (sent, lost uint64) {
+		st := c.ConnectionStats()
+		return st.PacketsSent, st.PacketsLost
+	})
+}
+
+type quicConnKey struct{}
+
+// QUICConnContext makes the concrete connection available to HTTP/3 and
+// WebTransport carrier adapters. Use it as http3.Server.ConnContext for a
+// caller-configured server, or to annotate the context passed to a
+// webtransport.ClientConn's Dial when the caller manages the connection.
+func QUICConnContext(ctx context.Context, conn *quic.Conn) context.Context {
+	return context.WithValue(ctx, quicConnKey{}, quicState{conn})
+}
+
+func quicInContext(ctx context.Context) quicState {
+	s, _ := ctx.Value(quicConnKey{}).(quicState)
+	return s
+}
+
 // NewServer returns an HTTP/3 server that serves h, typically the
 // handler of zmuxhttp.NewHandler, which hands requests to a listener as
 // carriers; the caller starts it (ListenAndServe or Serve) and closes it.
@@ -128,14 +153,16 @@ func NewServer(addr string, tlsConf *tls.Config, qconf *quic.Config, h http.Hand
 		qconf = &quic.Config{} // http3 would otherwise allow 0-RTT
 	}
 	return &http3.Server{Addr: addr, TLSConfig: http3.ConfigureTLSConfig(tlsConf), QUICConfig: qconf,
-		Handler: HTTP3Handler(h, o), EnableDatagrams: true}
+		Handler: HTTP3Handler(h, o), EnableDatagrams: true, ConnContext: QUICConnContext}
 }
 
 // ---- WebTransport ----
 
 // NewHandler returns an http.Handler that serves WebTransport carriers of l
 // through s, a WebTransport server whose HTTP/3 server is configured with
-// webtransport.ConfigureHTTP3Server: each request passes l's admission on
+// webtransport.ConfigureHTTP3Server. Set its ConnContext to QUICConnContext
+// before configuring it to make native connection statistics available.
+// Each request passes l's admission on
 // its head (zmux.Listener.AdmitUpgrade; the body is not read), or defers
 // it to the session's first bidirectional stream (zmux.VerdictDefer;
 // zmux.Arrival.AdmitFirst bounds the wait for that stream), is upgraded
@@ -156,9 +183,8 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 	if o == nil {
 		o = &zmuxhttp.Options{}
 	}
-	fallback := http.HandlerFunc(o.Fallback)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a, ok := l.Adapter().AdmitUpgrade(w, r, o.Trusted, fallback)
+		a, ok := l.Adapter().AdmitUpgrade(w, r, o.Trusted, o.Next)
 		if !ok {
 			return
 		}
@@ -168,15 +194,23 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 		var sess *webtransport.Session
 		p, ok := a.AdmitFirst(r.Context(), func(ctx context.Context) (zmux.PipeIO, error) {
 			var err error
-			if sess, err = s.Upgrade(w, r); err != nil {
+			var unanswered bool
+			sess, unanswered, err = upgradeWithin(ctx, s, w, r)
+			if err == nil {
+				var first *webtransport.Stream
+				first, err = sess.AcceptStream(ctx)
+				if err == nil {
+					return StreamPipe(sess, first), nil
+				}
+			}
+			if sess != nil {
+				// Finish this CONNECT inside the arrival's reservation.
+				_ = sess.CloseWithError(0, "")
+				sess = nil
+			} else if unanswered && ctx.Err() == nil {
 				o.Fallback(w, r)
-				return zmux.PipeIO{}, err // the upgrade failed: no pipe input
 			}
-			st, err := sess.AcceptStream(ctx)
-			if err != nil {
-				return zmux.PipeIO{}, err
-			}
-			return StreamPipe(sess, st), nil
+			return zmux.PipeIO{}, err
 		})
 		if !ok {
 			if sess != nil && !a.Detached() { // a detached takeover leaves the session to the host
@@ -184,8 +218,100 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 			}
 			return
 		}
-		_ = serve(sess.Context(), l, sess, a, p)
+		// The first setup belongs to this CONNECT request. Later streams
+		// use the session lifetime and obtain their own reservations.
+		first, cancel := context.WithCancel(r.Context())
+		dispatched := make(chan struct{})
+		labels.Go(first, "wt-pipe", func() {
+			defer close(dispatched)
+			_ = a.HandlePipe(first, p, zmux.PipeHint{})
+		})
+		_ = serve(sess.Context(), l, sess, a)
+		cancel()
+		<-dispatched
 	}), nil
+}
+
+// upgradeWithin reports whether an unsuccessful request can still be served
+// by the HTTP fallback. It interrupts only the CONNECT stream. Other sessions on
+// the QUIC connection keep their own deadlines and streams.
+func upgradeWithin(ctx context.Context, s *webtransport.Server, w http.ResponseWriter, r *http.Request) (*webtransport.Session, bool, error) {
+	if st, ok := w.(http3.Settingser); ok && r.Method == http.MethodConnect {
+		bound := s.ReorderingTimeout
+		if bound == 0 {
+			bound = 5 * time.Second
+		} // webtransport.Server's default
+		timer := time.NewTimer(bound)
+		defer timer.Stop()
+		select {
+		case <-st.ReceivedSettings():
+		case <-ctx.Done():
+			return nil, true, ctx.Err()
+		case <-timer.C:
+			return nil, true, errors.New("zmuxh3: timed out waiting for SETTINGS")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
+	finished := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(finished)
+		poolhost.Safe(nil, "WebTransport write interrupt", func() { _ = http.NewResponseController(w).SetWriteDeadline(time.Now()) })
+	})
+	defer func() {
+		if !stop() {
+			<-finished
+		}
+	}()
+	st, settings := w.(http3.Settingser)
+	stream, streams := w.(http3.HTTPStreamer)
+	if !settings || !streams {
+		return nil, true, errors.New("zmuxh3: WebTransport requires an HTTP/3 CONNECT stream")
+	}
+	response := &upgradeResponse{ResponseWriter: w, Settingser: st, HTTPStreamer: stream}
+	sess, err := s.Upgrade(response, r.WithContext(ctx))
+	if response.err != nil {
+		err = response.err
+	} else if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err != nil && response.stream != nil {
+		// A close capsule is DATA. If the header did not reach the peer,
+		// sending it would be an HTTP/3 connection error for every session.
+		response.stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		response.stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	}
+	return sess, response.stream == nil, err
+}
+
+// webtransport-go uses http.Flusher, which cannot return an error, and
+// HTTPStream implicitly flushes. Check the header before that implicit
+// flush and preserve any error for the owner of the newly created session.
+type upgradeResponse struct {
+	http.ResponseWriter
+	http3.Settingser
+	http3.HTTPStreamer
+	stream *http3.Stream
+	err    error
+}
+
+func (w *upgradeResponse) HTTPStream() *http3.Stream {
+	w.Flush()
+	w.stream = w.HTTPStreamer.HTTPStream()
+	return w.stream
+}
+
+func (w *upgradeResponse) WriteHeader(status int) {
+	if w.err == nil && !poolhost.Safe(nil, "WebTransport response header", func() { w.ResponseWriter.WriteHeader(status) }) {
+		w.err = errors.New("zmuxh3: WebTransport response header panicked")
+	}
+}
+
+func (w *upgradeResponse) Flush() {
+	if w.err == nil && !poolhost.Safe(nil, "WebTransport flush", func() { w.err = http.NewResponseController(w.ResponseWriter).Flush() }) {
+		w.err = errors.New("zmuxh3: WebTransport flush panicked")
+	}
 }
 
 // Serve hands the streams of an accepted WebTransport session to l, as
@@ -202,12 +328,12 @@ func NewHandler(l *zmux.Listener, o *zmuxhttp.Options, s *webtransport.Server) (
 // failed (an idle timeout, a transport error), and ctx's error when ctx ends
 // first; the zmux sessions continue on their pipes.
 func Serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session) error {
-	return serve(ctx, l, sess, nil, zmux.PipeIO{})
+	return serve(ctx, l, sess, nil)
 }
 
 // serve is Serve, or with a the streams of a session admitted as one
 // arrival by its first stream, first.
-func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a *zmux.Arrival, first zmux.PipeIO) error {
+func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a *zmux.Arrival) error {
 	handle := func(p zmux.PipeIO) {
 		if a != nil {
 			_ = a.HandlePipe(ctx, p, zmux.PipeHint{})
@@ -217,7 +343,6 @@ func serve(ctx context.Context, l *zmux.Listener, sess *webtransport.Session, a 
 	}
 	if a != nil {
 		defer a.Release()
-		labels.Go(ctx, "wt-pipe", func() { _ = a.HandlePipe(ctx, first, zmux.PipeHint{}) })
 	}
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -330,7 +455,7 @@ func Dial(ctx context.Context, t *webtransport.Transport, url string, h http.Hea
 // connection's handshake: the connection is dialed with t.DialAddr (nil:
 // quic.DialAddr), the request is sent after the handshake completed, and
 // t.QUICConfig and t.TLSClientConfig are completed as t.Dial does. Without
-// cred it is t.Dial.
+// cred it is t.Dial, which does not expose the underlying connection.
 func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, h http.Header, cred zmux.CarrierCredential) (*webtransport.Session, error) {
 	if cred == nil {
 		// The response body is the session's CONNECT stream, owned and
@@ -386,7 +511,7 @@ func DialSession(ctx context.Context, t *webtransport.Transport, rawURL string, 
 	if err != nil {
 		return fail(err)
 	}
-	_, sess, err := cc.Dial(ctx, rawURL, hh) //nolint:bodyclose // body is the session stream
+	_, sess, err := cc.Dial(QUICConnContext(ctx, qc), rawURL, hh) //nolint:bodyclose // body is the session stream
 	if err != nil {
 		return fail(err)
 	}
@@ -623,6 +748,11 @@ func (w *wtStream) Abort(error) {
 
 // CarrierConn is the WebTransport session (lanes are its streams).
 func (w *wtStream) CarrierConn() any { return w.sess }
+
+// CarrierSampler is for internal use by zmux modules.
+func (w *wtStream) CarrierSampler() *carrierstats.Sampler {
+	return quicInContext(w.sess.Context()).CarrierSampler()
+}
 
 // ConnectionState exposes the QUIC connection's TLS state (exporter).
 func (w *wtStream) ConnectionState() tls.ConnectionState {

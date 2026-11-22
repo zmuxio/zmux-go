@@ -36,14 +36,14 @@ func TestProbationSettings(t *testing.T) {
 		}
 	}
 	for _, x := range []struct {
-		o    PipeOptions
 		want *core.Duration
+		o    PipeOptions
 		bad  bool
 	}{
-		{PipeOptions{}, nil, false},
-		{PipeOptions{Probation: Set(time.Duration(-1))}, new(core.Duration), false},
-		{PipeOptions{Probation: Set(time.Second)}, func() *core.Duration { d := core.Duration(time.Second); return &d }(), false},
-		{PipeOptions{Probation: Set(-time.Hour)}, new(core.Duration), false},
+		{o: PipeOptions{}, want: nil, bad: false},
+		{o: PipeOptions{Probation: Set(time.Duration(-1))}, want: new(core.Duration), bad: false},
+		{o: PipeOptions{Probation: Set(time.Second)}, want: func() *core.Duration { d := core.Duration(time.Second); return &d }(), bad: false},
+		{o: PipeOptions{Probation: Set(-time.Hour)}, want: new(core.Duration), bad: false},
 	} {
 		j, err := x.o.join(DirectionBidirectional)
 		if x.bad {

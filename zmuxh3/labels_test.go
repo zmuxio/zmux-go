@@ -25,7 +25,6 @@ func TestGoroutineLabels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = pc.Close() }()
 	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
 		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
 	webtransport.ConfigureHTTP3Server(h3)
@@ -42,8 +41,13 @@ func TestGoroutineLabels(t *testing.T) {
 		}
 		served <- Serve(sctx, lst, sess)
 	})
-	go func() { _ = ws.Serve(pc) }()
-	defer func() { _ = ws.Close() }()
+	serveDone := make(chan struct{})
+	go func() { defer close(serveDone); _ = ws.Serve(pc) }()
+	defer func() {
+		_ = pc.Close()
+		<-serveDone
+		_ = ws.Close()
+	}()
 	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
 	c, sess, err := Dial(ctx, tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, cfg())
 	if err != nil {

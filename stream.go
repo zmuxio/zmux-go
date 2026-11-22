@@ -25,13 +25,13 @@ type handle struct {
 	dl         atomic.Pointer[deadlines] // nil until a deadline is set
 	rsig       core.Signal               // lazy: its channel is made by the first wait
 	wsig       core.Signal
-	dsig       core.Signal // the stream's datagrams
-	dmu        sync.Mutex  // serialises datagram reads (lock level L0, after rmu)
-	rmu        sync.Mutex
-	wmu        sync.Mutex
-	rwaiters   atomic.Int32 // WaitReadable calls and the reads inside their wait, for passing the wake on
 	// rnote is the pending NotifyReadable call, nil while there is none.
-	rnote atomic.Pointer[readNote]
+	rnote    atomic.Pointer[readNote]
+	dsig     core.Signal // the stream's datagrams
+	dmu      sync.Mutex  // serialises datagram reads (lock level L0, after rmu)
+	rmu      sync.Mutex
+	wmu      sync.Mutex
+	rwaiters atomic.Int32 // WaitReadable calls and the reads inside their wait, for passing the wake on
 }
 
 // newHandle makes the handle of st (under the lock).

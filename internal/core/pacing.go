@@ -129,8 +129,8 @@ func (s *Session) pacePing(rtt Duration) {
 
 // paceDeadline is the earliest moment a held pipe may send again.
 func (s *Session) paceDeadline() Time {
-	if s.sched.mask == 0 {
-		return Never // nothing waits for a pipe: no timer (a write wakes the writer)
+	if s.sched.mask == 0 && (s.mp == nil || s.mp.additionalPipes == nil || !s.mp.prefixWaiting) {
+		return Never // no queued write or registered repair waits for a pipe
 	}
 	t := Never
 	for _, p := range s.pipes {
@@ -155,6 +155,7 @@ func (s *Session) paceTimeout(now Time) {
 		in := s.limInFlight(p)
 		l.refresh(now, in, p.out.snd.re.value(), s.srttOf(p), &pp)
 		if !l.held {
+			s.wakePrefix()
 			s.wakePipe(p)
 			s.wakeAllWriters()
 		}

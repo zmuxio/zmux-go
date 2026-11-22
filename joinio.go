@@ -11,6 +11,7 @@ import (
 	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/shaping"
@@ -54,11 +55,6 @@ func (m RecordMode) String() string {
 // errRefusalSent is a join refused with a Reply that was written: its
 // carrier is closed gracefully so that the joiner reads the refusal.
 var errRefusalSent = fmt.Errorf("%w: refusal sent", errRefused)
-
-// errJoinHeld marks a join whose bound ended while the attachment cap or
-// the refusal backoff still held it: it never sent its Hello, which says
-// nothing about its carrier.
-var errJoinHeld = errors.New("zmux: join held back by the attachment cap")
 
 // RecordPolicyInput describes a carrier to RecordPolicy and AllowRecordMode.
 type RecordPolicyInput struct {
@@ -134,8 +130,10 @@ func secureFirstMode(p PipeIO) (RecordMode, bool) {
 func carrierRecordLimit(p PipeIO) int {
 	lim := p.MaxRecord
 	for _, x := range []any{p.W, p.R} {
-		if s, ok := x.(CarrierRecordLimit); ok && s.MaxRecord() > 0 && (lim == 0 || s.MaxRecord() < lim) {
-			lim = s.MaxRecord()
+		if s, ok := x.(CarrierRecordLimit); ok {
+			if n := s.MaxRecord(); n > 0 && (lim == 0 || n < lim) {
+				lim = n
+			}
 		}
 	}
 	return lim
@@ -250,7 +248,8 @@ func (c *Conn) joinCarrier(ctx context.Context, pd *pipeDrv, p PipeIO, dir Direc
 		select {
 		case <-held.C:
 		case <-ctx.Done():
-			return fmt.Errorf("%w: %w", errJoinHeld, ctx.Err())
+			markCapacityWait(ctx)
+			return ctx.Err()
 		case <-c.done:
 			return c.closedErr()
 		}
@@ -287,6 +286,9 @@ func (c *Conn) joinCarrier(ctx context.Context, pd *pipeDrv, p PipeIO, dir Direc
 		var mode join.Mode
 		c.locked(func() {
 			st = c.s.VerifyReply(pd.id, u.buf, c.clk.now())
+			if st.Status == core.JoinDeclined {
+				_ = pd.end.join.settleLocked(ErrJoinRefused)
+			}
 			mode = c.s.JoinMode(pd.id)
 		})
 		switch st.Status {
@@ -328,6 +330,12 @@ func (c *Conn) joinCarrier(ctx context.Context, pd *pipeDrv, p PipeIO, dir Direc
 				}
 				q = sealResult(q, res)
 			}
+			var carrier any
+			var maxRec int
+			if !safeLog(c.cfg.Logger, "carrier properties", func() { carrier, _ = carrierIdentity(q); maxRec = carrierRecordLimit(q) }) {
+				return c.joinIOFailed(ctx, pd.id, errRejected)
+			}
+			hc := newHalfCloser(q)
 			// The handover: the bound must not close the carrier once the
 			// session has it; one that already did failed the join.
 			if !stop() {
@@ -335,24 +343,29 @@ func (c *Conn) joinCarrier(ctx context.Context, pd *pipeDrv, p PipeIO, dir Direc
 			}
 			// The session may have ended, or the attachment failed, while the
 			// Confirm was written.
+			if dir != DirectionReceiveOnly {
+				primeCarrierSample(q.W)
+			}
 			var gone error
 			c.locked(func() {
-				if ended := c.closing || c.s.State() >= core.StateClosing; ended || !c.joinedAlive(pd.id) {
+				if err := ctx.Err(); err != nil {
+					gone = err
+					return
+				}
+				if ended := c.closing || c.s.State() >= core.StateClosing; ended || pd.retiring || pd.dead || c.pipes[pd.id] != pd || !c.joinedAlive(pd.id) {
 					gone = fmt.Errorf("zmux: pipe %d not joined: %w", pd.id, ErrPipeGone)
 					if ended {
 						gone = c.errLocked()
 					}
 					return
 				}
-				pd.adopt(q)
-				c.startPipeLocked(pd, dir != DirectionSendOnly, dir != DirectionReceiveOnly)
+				pd.hc, pd.framing, pd.maxRec = hc, q.Framing, maxRec
+				c.startPipeLocked(pd, dir != DirectionSendOnly, dir != DirectionReceiveOnly, carrier)
 			})
 			if gone != nil {
 				closePipe(q)
 				return gone
 			}
-			// Nothing started uses the half a direction leaves unused.
-			pd.endUnusedHalf(dir)
 			return nil
 		case core.JoinDeclined:
 			closePipe(p)
@@ -427,7 +440,7 @@ func (c *Conn) joinIOFailed(ctx context.Context, id uint64, err error) error {
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	}
-	return fmt.Errorf("zmux: pipe %d not joined: %w", id, err)
+	return fmt.Errorf("zmux: pipe %d not joined: %w: %w", id, ErrPipeGone, err)
 }
 
 func joinFraming(p PipeIO) join.Framing {
@@ -435,19 +448,6 @@ func joinFraming(p PipeIO) join.Framing {
 		return join.Message
 	}
 	return join.Stream
-}
-
-// endUnusedHalf ends what a direction does not use after the handshake,
-// through the attachment's closer: a receiving half that is not the
-// sending one is closed, a sending half ended gracefully.
-func (pd *pipeDrv) endUnusedHalf(dir Direction) {
-	switch dir {
-	case DirectionSendOnly:
-		pd.hc.closeRead()
-	case DirectionReceiveOnly:
-		pd.hc.shutdownWrite()
-	case DirectionBidirectional:
-	}
 }
 
 // helloWithoutBinding counts a Hello in Bound on a carrier that has no Binding.
@@ -460,8 +460,9 @@ func (c *Conn) helloWithoutBinding() {
 // heldJoin is an Unconfirmed carrier as the session keeps it, for the
 // eviction by a newer Hello.
 type heldJoin struct {
-	p      PipeIO
+	out    *joinOutcome
 	cancel context.CancelFunc // of the join's own bound
+	p      PipeIO
 }
 
 // evict ends the join as one the session refused to keep: the bound's
@@ -473,30 +474,17 @@ func (h *heldJoin) evict() {
 }
 
 // acceptHello authenticates and confirms a Hello that named this session.
-func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding []byte, admitted any, maxUnconfirmed int) (uint64, error) {
+func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding []byte, admitted any, maxUnconfirmed int, wait *attachment) error {
 	// Waiting for establishment or the join keys is bounded even when the
 	// handshake is not (Config.joinWaitTimeout).
-	ctx, cancel := timeshim.WithTimeout(ctx, c.clk.source(), c.cfg.joinTimeout())
+	parent := ctx
+	deadline := c.clk.source().Now().Add(c.cfg.joinTimeout())
+	ctx, cancel := timeshim.WithDeadline(ctx, c.clk.source(), deadline)
 	defer cancel()
 	stopEnd := context.AfterFunc(c.ctx, cancel) // the session's end ends the handshake
 	defer stopEnd()
-	// The bound interrupts a blocked read or write by closing p; the
-	// caller owns p otherwise and closes it on every failure.
-	stop := context.AfterFunc(ctx, func() { closePipe(p) })
-	defer stop()
-	// outer's nesting edge, while this attempt holds it: every failure
-	// drops it here, the handover to the session keeps it.
-	var edge *nestEdge
-	defer func() { edge.drop() }() // nil once handed over
-
-	// ended is the error of a failure caused by this end stopping the wait: no peer's
-	// fault, so not an authentication failure.
-	ended := func(err error) error {
-		if ctx.Err() != nil {
-			return errRefused
-		}
-		return err
-	}
+	// The setup owner watches the listener and parent. This bound also
+	// interrupts the provisional carrier during the confirmation handshake.
 	var pj *core.PeerJoin
 	for pj == nil {
 		var res core.JoinResult
@@ -509,67 +497,121 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 			pj, res = c.s.OpenHello(h, core.Framing(p.Framing), binding)
 		})
 		if closing {
-			return 0, errRefused
+			return errRefused
 		}
 		switch res {
 		case core.JoinAccepted:
 		case core.JoinHold:
-			if err := c.waitEstablished(ctx); err != nil {
-				return 0, err
+			if err := c.waitEstablished(ctx, nil); err != nil {
+				return err
 			}
 		case core.JoinKeyWait:
 			if err := c.waitJoinKeys(ctx); err != nil {
-				return 0, err // the caller closes p silently
+				return err // the caller closes p silently
 			}
 		case core.JoinUnknownSuite:
-			return 0, errUnknownSuite
+			return errUnknownSuite
 		case core.JoinClose, core.JoinRefused:
-			return 0, errRejected
+			return errRejected
 		}
 	}
+	id := PipeID(pj.Pipe.ID)
+	if auth := c.cfg.AuthorizeJoin; auth != nil {
+		var allowed bool
+		safeLog(c.cfg.Logger, "Config.AuthorizeJoin", func() { allowed = auth(c, id) })
+		if !allowed {
+			return errRejected
+		}
+	}
+	out := c.newJoinOutcome(parent, id, true, deadline)
+	out.cancellation = func() error { return wait.cancellation(parent) }
+	held := &heldJoin{out: out, p: p, cancel: cancel}
+	stop := interruptOnCancel(ctx, func() { c.locked(func() { _ = out.settleLocked(ctx.Err()) }) })
+	defer stop()
+	err := hostCall(c.cfg.Logger, "authorized join", func() error {
+		return c.confirmHello(ctx, p, pj, admitted, maxUnconfirmed, wait, held, out, h)
+	})
+	c.locked(func() {
+		if !out.settled {
+			reason := err
+			if err != nil {
+				reason = fmt.Errorf("%w: %w", ErrJoinRefused, err)
+			}
+			_ = out.settleLocked(reason)
+		}
+	})
+	return err
+}
+
+func (c *Conn) confirmHello(ctx context.Context, p PipeIO, pj *core.PeerJoin, admitted any, maxUnconfirmed int, wait *attachment, held *heldJoin, out *joinOutcome, h join.Hello) error {
+	var edge *nestEdge
+	defer func() { edge.drop() }()
 	mode := RecordMode(pj.Mode)
 	info := joinCarrierInfo(p, false)
-	// The peer drives these host callbacks: a panic in one rejects the
-	// carrier, as in every other callback, instead of ending the process.
 	ok := mode == RecordSealed
 	if allow := c.cfg.AllowRecordMode; allow != nil {
 		ok = false
 		safeLog(c.cfg.Logger, "Config.AllowRecordMode", func() { ok = allow(info, mode, c.admitted) })
 	}
-	if auth := c.cfg.AuthorizeJoin; ok && auth != nil {
-		ok = false
-		safeLog(c.cfg.Logger, "Config.AuthorizeJoin", func() { ok = auth(c, PipeID(pj.Pipe.ID)) })
-	}
 	if !ok {
-		return 0, errRejected // the Pipe ID's bit stays clear
+		return errRejected
 	}
+	ended := func(err error) error {
+		if ctx.Err() != nil {
+			return errRefused
+		}
+		return err
+	}
+	stop := interruptOnCancel(ctx, func() { closePipe(p) })
+	// A successful commit stops the interrupt below.
+	var stopped bool
+	defer func() {
+		if !stopped {
+			stop()
+		}
+	}()
 	dirIn, dirOut := pj.Pipe.Direction != 1, pj.Pipe.Direction != 0
 	plan, err := c.joinPlan(ctx, p, core.JoinMsgReply)
 	if err != nil {
-		return 0, errRefused // the wait was cancelled or the session ended
+		return errRefused // the wait was cancelled or the session ended
 	}
-	outer := outerOf(p)
+	var outer outerRef
+	if !safeLog(c.cfg.Logger, "CarrierConn", func() { _, outer = carrierIdentity(p) }) {
+		return errRejected
+	}
 	var reply []byte
 	var res core.JoinResult
 	var evict func()
 	closing := false
-	held := &heldJoin{p: p, cancel: cancel}
 	c.locked(func() {
-		if closing = c.closing; closing {
+		l := wait.listener
+		l.mu.RLock()
+		defer l.mu.RUnlock()
+		if !out.settled {
+			if reason := out.reasonLocked(nil); reason != nil {
+				out.publishLocked(reason)
+			}
+		}
+		if closing = out.settled; closing {
 			return
 		}
 		edge, err = nestPipe(c, outer)
 		loop := err != nil
 		c.s.SetNow(c.clk.now())
 		reply, res = c.s.ClaimHello(pj, core.Carrier{HasIn: p.R != nil, HasOut: p.W != nil, Refuse: loop}, p.WriteOverhead, h.WireLen(joinFraming(p)), &plan)
-		if res == core.JoinAccepted {
-			if old, ok := c.unconfirmed.Hold(pj, held, maxUnconfirmed); ok {
-				evict = old.evict
+		if res != core.JoinAccepted {
+			if res == core.JoinRefused && wait.commitLocked(ctx, setupPending, setupRejecting) != nil {
+				closing = true
+				return
 			}
+			_ = out.settleLocked(ErrJoinRefused)
+		} else if old, ok := c.unconfirmed.Hold(pj, held, maxUnconfirmed); ok {
+			_ = old.out.settleLocked(ErrJoinEvicted)
+			evict = old.evict
 		}
 	})
 	if closing {
-		return 0, errRefused
+		return errRefused
 	}
 	if evict != nil {
 		evict()
@@ -577,85 +619,97 @@ func (c *Conn) acceptHello(ctx context.Context, p PipeIO, h join.Hello, binding 
 	if res == core.JoinAccepted {
 		defer c.locked(func() { c.unconfirmed.Drop(pj) })
 	}
+	if err := wait.acceptHead(ctx); err != nil {
+		return err
+	}
 	markTaken(p)
 	if res == core.JoinClose {
-		return 0, errRejected
+		return errRejected
 	}
 	if err := writeUnit(p, reply); err != nil {
-		return 0, ended(errRejected)
+		return ended(errRejected)
 	}
 	if res == core.JoinRefused {
-		return 0, errRefusalSent
+		return errRefusalSent
 	}
 	// The acceptor's records wait for Confirmed.
 	u := &unitReader{p: p}
 	var used int
 	if pj.Mode != join.Bound {
 		if err := u.more(); err != nil {
-			return 0, ended(errRejected)
+			return ended(errRejected)
 		}
 	}
 	for {
 		n, _, done, err := pj.ReadConfirm(u.buf)
 		if err != nil {
-			return 0, errRejected
+			return errRejected
 		}
 		if done {
 			used = n
 			break
 		}
 		if err := u.more(); err != nil {
-			return 0, ended(errRejected)
+			return ended(errRejected)
 		}
 	}
 	result, err := pj.Result()
 	if err != nil {
-		return 0, errRejected
+		return errRejected
 	}
 	q := withPrefix(p, u.buf[used:])
 	if pj.Mode == join.Sealed {
 		if sealedLimitErr(p, sealOverhead(p.Framing)) != nil {
-			return 0, errRejected
+			return errRejected
 		}
 		q = sealResult(q, result)
 	}
-	// The handover: from here p is the session's, so the bound must not
-	// close it any more; one that already did failed the join.
-	if !stop() {
-		return 0, errRefused
-	}
 	id := pj.Pipe.ID
 	confirmed := false
-	var pd *pipeDrv
+	attachment, err := c.preparePipe(id, q, p, multiLowWater)
+	if err != nil {
+		return errRejected
+	}
+	pd, ci := attachment.pd, attachment.info
+	// The handover: from here p is the session's, so the bound must not
+	// close it any more; one that already did failed the join.
+	stopped = true
+	if !stop() {
+		return errRefused
+	}
+	if err := c.waitPublication(ctx); err != nil {
+		return errRefused
+	}
+	if dirOut {
+		primeCarrierSample(q.W)
+	}
 	c.locked(func() {
-		if c.closing {
+		if out.settled {
 			return
 		}
-		pd = c.newPipeDrv(id, q)
-		pd.tcp = tcpOf(p.W)
-		low := pd.tcp.setLowWater(multiLowWater)
-		ci := carrierInfo(q, pd.tcp, low)
+		if reason := out.reasonLocked(nil); reason != nil {
+			out.publishLocked(reason)
+			return
+		}
 		c.s.SetNow(c.clk.now())
-		if c.s.ConfirmJoin(pj, core.Carrier{HasIn: dirIn, HasOut: dirOut, In: ci, Out: ci, OutSig: pd.wsig, Kind: uint8(p.Carrier)}) != core.JoinAccepted {
+		if !wait.commitCarrier(ctx, func() bool {
+			return c.unconfirmed.Confirm(pj) && c.s.ConfirmJoin(pj, core.Carrier{HasIn: dirIn, HasOut: dirOut, In: ci, Out: ci, OutSig: &pd.writer.poll, Kind: uint8(p.Carrier)}) == core.JoinAccepted
+		}) {
+			_ = out.settleLocked(ErrJoinRefused)
 			return
 		}
 		pd.admitted = admitted
+		out.holdLocked(id, pd.end)
 		pd.nest, edge = edge, nil // the session's now: its pipe's end drops the edge
-		c.unconfirmed.Drop(pj)    // no later join evicts it
-		c.startPipeLocked(pd, dirIn, dirOut)
+		wait.attach(pd)
+		c.startPipeLocked(pd, dirIn, dirOut, attachment.carrier)
+		out.publishLocked(nil)
 		confirmed = true
 	})
 	if !confirmed {
-		return 0, errRefused
+		return errRefused
 	}
-	// The acceptor's unused half: nothing started uses it.
-	switch pj.Pipe.Direction {
-	case 0:
-		pd.endUnusedHalf(DirectionReceiveOnly)
-	case 1:
-		pd.endUnusedHalf(DirectionSendOnly)
-	}
-	return id, nil
+	return nil
 }
 
 // PairedPipe makes one carrier of two unidirectional ones, the local endpoint's
@@ -749,6 +803,8 @@ const sealTag = 16
 // (ErrInvalidConfig naming the limit). A handshake that ends in SealRecords
 // calls it before it begins, so that a carrier too small for Sealed fails
 // before any handshake byte is written, not after.
+//
+//goland:noinspection GoUnusedExportedFunction // used by the seal module
 func CheckSealedCarrier(p PipeIO) error { return sealedLimitErr(p, sealOverhead(p.Framing)) }
 
 // sealedLimitErr reports a lower carrier whose record limit, less seal bytes
@@ -823,13 +879,15 @@ func (r *sealedReader) RecordMode() RecordMode { return r.mode }
 func (r *sealedReader) ReportsFailure() bool { return reportsFailure(r.lower) }
 
 type sealedWriter struct {
-	s     RecordSealer
-	exp   KeyingMaterialExporter
-	buf   []byte
-	lower PipeIO
-	mu    sync.Mutex
-	msgs  bool
-	mode  RecordMode
+	s         RecordSealer
+	exp       KeyingMaterialExporter
+	buf       []byte
+	lower     PipeIO
+	closeErr  error // published by closeOnce
+	mu        sync.Mutex
+	closeOnce sync.Once
+	msgs      bool
+	mode      RecordMode
 }
 
 func (w *sealedWriter) Write(b []byte) (int, error) {
@@ -886,7 +944,10 @@ func (w *sealedWriter) WriteMessages(ms [][]byte) error {
 	return err
 }
 
-func (w *sealedWriter) Close() error { return w.lower.W.Close() }
+func (w *sealedWriter) Close() error {
+	w.closeOnce.Do(func() { w.closeErr = w.lower.W.Close() })
+	return w.closeErr
+}
 
 // CloseWrite ends the sending direction where the carrier can. A carrier that
 // cannot, and whose halves are one connection, is left open: closing W would
@@ -895,10 +956,10 @@ func (w *sealedWriter) CloseWrite() error {
 	if cw, ok := w.lower.W.(CloseWriter); ok {
 		return cw.CloseWrite()
 	}
-	if carrierio.SameHalf(w.lower.R, w.lower.W) {
+	if carrierio.SameHalf(unprefixed(w.lower.R), unprefixed(w.lower.W)) {
 		return nil
 	}
-	return w.lower.W.Close()
+	return w.Close()
 }
 
 // Abort aborts the carrier where it can.
@@ -910,6 +971,14 @@ func (w *sealedWriter) Abort(err error) {
 
 // ReportsFailure forwards the lower carrier's, as the reader does.
 func (w *sealedWriter) ReportsFailure() bool { return reportsFailure(w.lower) }
+
+// CarrierSampler is for internal use by zmux modules.
+func (w *sealedWriter) CarrierSampler() *carrierstats.Sampler {
+	if sampler := carrierstats.ProviderOf(w.lower.W); sampler != nil {
+		return sampler
+	}
+	return carrierstats.SocketSampler(w.lower.W)
+}
 
 func (w *sealedWriter) MaxRecord() int { return SealedMaxRecord }
 func (w *sealedWriter) ExportKeyingMaterial(l string, c []byte, n int) ([]byte, error) {

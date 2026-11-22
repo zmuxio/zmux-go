@@ -166,7 +166,7 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 			break
 		}
 		if !errors.Is(err, proto.ErrIncomplete) {
-			return zmux.PipeIO{}, &zmux.RejectError{Reason: reasonOf(err)}
+			return zmux.PipeIO{}, &zmux.RejectError{Reason: reasonOf(err), Err: err}
 		}
 		if err := u.fill(); err != nil {
 			return zmux.PipeIO{}, err
@@ -246,9 +246,9 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 		return zmux.PipeIO{}, err
 	}
 	u.buf = nil
-	finish, err := u.frame()
+	finish, _, err := u.frame()
 	if err != nil {
-		if protocolError(err) {
+		if errors.Is(err, proto.ErrTooLarge) || errors.Is(err, proto.ErrMalformed) {
 			return reject(err)
 		}
 		return zmux.PipeIO{}, err // the carrier failed or ended
@@ -344,13 +344,6 @@ func carrierInfo(p zmux.PipeIO) zmux.RecordPolicyInput {
 	return zmux.RecordPolicyInput{HasExporter: exp, Secure: zmux.IsCarrierSecure(p), Label: p.Label, IsFirstPipe: true}
 }
 
-// protocolError reports whether err is the peer's protocol violation, not
-// a failure or the end of the carrier: those are rejected (OnReject), the
-// others close the carrier.
-func protocolError(err error) bool {
-	return errors.Is(err, proto.ErrTooLarge) || errors.Is(err, proto.ErrMalformed)
-}
-
 // reasonOf is the local reject reason of a failure: the error class of
 // the protocol, or a finer local reason.
 func reasonOf(err error) string {
@@ -361,7 +354,6 @@ func reasonOf(err error) string {
 		err  error
 		name string
 	}{
-		{ErrProof, "proof"}, {ErrPQAuthRequired, "pq_auth_required"}, {ErrNotPinned, "not_pinned"},
 		{errProfile, "profile_disabled"}, {errMode, "record_mode"},
 		{errEarly, "early_data"}, {errBinding, "binding_unavailable"}, {errHandle, "unknown_handle"},
 		{errGate, "gate_error"}, {errCommit, "commit"},

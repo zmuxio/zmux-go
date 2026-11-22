@@ -3,8 +3,8 @@
 // of the same connection, its datagrams may go as QUIC
 // datagrams of the connection, the TLS exporter of the
 // connection authenticates joins, and a client may send its first streams
-// as replayable early data. Native stream creation currently
-// waits for the QUIC handshake because of the pinned quic-go 0-RTT race.
+// as replayable early data. Native streams open after the QUIC handshake
+// completes.
 package zmuxquic
 
 import (
@@ -15,13 +15,13 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
 	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
 
@@ -58,8 +58,8 @@ func QUICConfig(base *quic.Config) *quic.Config {
 // Dial opens a QUIC connection to addr and starts a zmux client session on
 // its first bidirectional stream, as zmux.DialTLS does over TCP. With
 // cfg.EarlyData.Replayable and Remembered parameters, replayable startup is
-// enabled; native streams wait for handshake completion until the quic-go
-// early-stream race is fixed. The session owns the connection: it is closed once the session
+// enabled. Native streams open after handshake completion. The session owns
+// the connection: it is closed once the session
 // has wholly ended (the peer read its CONNECTION_CLOSE and ended its side, or
 // the linger timeout expired), with the session's application error code
 // (0 after any other end). qconf may be nil; QUICConfig sizes it for lanes. With
@@ -207,7 +207,8 @@ func Serve(ctx context.Context, l *zmux.Listener, ln ConnListener) error {
 // that used 0-RTT is then closed), and its streams then go through l
 // (ListenerConfig.WrapPipe included) as bootstraps, joins and lanes, so
 // that sessions started on it are returned by Accept on l and its pipes
-// join sessions of l. A connection refused is closed.
+// join sessions of l. A first stream classified as VerdictFallback goes to
+// l’s ListenerConfig.Fallback with its prefix replayed. A refused connection is closed.
 //
 // ServeConn returns nil once the connection is handed to l, or net.ErrClosed (after closing qc) on a closed listener. The
 // connection is then served on two goroutines, which accept its
@@ -226,77 +227,105 @@ func ServeConn(ctx context.Context, l *zmux.Listener, qc *quic.Conn) error {
 		}
 		return nil // refused: the connection ended
 	}
-	if a.Admitted() {
-		// The connection's end gives its slot back, and counts a handshake
-		// that failed before any of its streams became a pipe input (a
-		// stream that arrived in 0-RTT is counted by the listener itself).
-		used := new(atomic.Bool)
-		context.AfterFunc(qc.Context(), func() {
-			select {
-			case <-qc.HandshakeComplete():
-			default:
-				if !used.Load() {
-					a.HandshakeFailed()
-				}
-			}
-			a.Release()
-		})
-		labels.Go(ctx, "quic-accept-lanes", func() { acceptLanes(ctx, qc, a, used) })
-		labels.Go(ctx, "quic-accept-pipes", func() { acceptPipes(ctx, qc, a, used) })
-		return nil
-	}
-	context.AfterFunc(qc.Context(), a.Release) // a connection without a stream gives its slot back when it ends
-	labels.Go(ctx, "quic-accept-pipes", func() { admitConn(ctx, qc, a) })
+	// Accepting streams is listener setup work. Closing the scope releases
+	// the first reservation and joins both accept loops independently of qc.
+	labels.Go(ctx, "quic-accept-pipes", func() { serveArrival(ctx, qc, a) })
 	return nil
+}
+
+func serveArrival(ctx context.Context, qc *quic.Conn, a *zmux.Arrival) {
+	setup, unlink := a.SetupContext(ctx)
+	defer unlink()
+	defer a.Release()
+	if !a.Admitted() {
+		admitConn(setup, qc, a)
+		return
+	}
+	// Either kind of stream can consume the initial reservation. Cancel only
+	// the outstanding accept after the first arrival. Both accepts can already
+	// have succeeded, in which case both streams must be handed on.
+	var bidi *quic.Stream
+	var uni *quic.ReceiveStream
+	err := a.PrepareCarrier(setup, func(bound context.Context) error {
+		first, cancel := context.WithCancel(bound)
+		defer cancel()
+		recv := make(chan error, 1)
+		go func() { var err error; uni, err = qc.AcceptUniStream(first); cancel(); recv <- err }()
+		var err error
+		bidi, err = qc.AcceptStream(first)
+		cancel()
+		uniErr := <-recv
+		if bidi != nil || uni != nil {
+			return nil
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+		return uniErr
+	})
+	if err != nil {
+		if bidi != nil {
+			zmux.ClosePipeIO(streamPipe(qc, bidi))
+		}
+		if uni != nil {
+			uni.CancelRead(0)
+		}
+		if setup.Err() == nil {
+			a.HandshakeFailed()
+		}
+		return
+	}
+	if bidi != nil {
+		labels.Go(setup, "quic-pipe", func() { _ = a.HandlePipe(setup, streamPipe(qc, bidi), zmux.PipeHint{}) })
+	}
+	if uni != nil {
+		dispatchLane(setup, qc, a, uni)
+	}
+	lanesDone := make(chan struct{})
+	labels.Go(setup, "quic-accept-lanes", func() { defer close(lanesDone); acceptLanes(setup, qc, a) })
+	acceptPipes(setup, qc, a)
+	<-lanesDone
 }
 
 // admitConn admits qc by its first bidirectional stream once its handshake
 // completed, then accepts its streams: the bidirectional ones on this
 // goroutine, the lanes on another.
 func admitConn(ctx context.Context, qc *quic.Conn, a *zmux.Arrival) {
-	select {
-	case <-qc.HandshakeComplete():
-	case <-qc.Context().Done():
-		a.HandshakeFailed()
-		return
-	case <-ctx.Done():
-		return
-	}
-	if qc.ConnectionState().Used0RTT {
-		a.HandshakeFailed()
-		_ = qc.CloseWithError(0, "")
-		return
-	}
-	// A connection without a stream ends with its idle timeout.
-	s, err := qc.AcceptStream(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			_ = qc.CloseWithError(0, "")
+	p, ok := a.AdmitFirst(ctx, func(first context.Context) (zmux.PipeIO, error) {
+		select {
+		case <-qc.HandshakeComplete():
+		case <-qc.Context().Done():
+			return zmux.PipeIO{}, qc.Context().Err()
+		case <-first.Done():
+			return zmux.PipeIO{}, first.Err()
 		}
-		return
-	}
-	p, ok := a.Admit(ctx, streamPipe(qc, s))
+		if qc.ConnectionState().Used0RTT {
+			return zmux.PipeIO{}, errors.New("zmuxquic: admission requires a completed handshake")
+		}
+		s, err := qc.AcceptStream(first)
+		if err != nil {
+			return zmux.PipeIO{}, err
+		}
+		return streamPipe(qc, s), nil
+	})
 	if !ok {
 		if !a.Detached() { // a detached takeover leaves the connection to the host
 			_ = qc.CloseWithError(0, "")
 		}
 		return
 	}
-	labels.Go(ctx, "quic-accept-lanes", func() { acceptLanes(ctx, qc, a, nil) })
+	labels.Go(ctx, "quic-accept-lanes", func() { acceptLanes(ctx, qc, a) })
 	labels.Go(ctx, "quic-pipe", func() { _ = a.HandlePipe(ctx, p, zmux.PipeHint{}) })
-	acceptPipes(ctx, qc, a, nil)
+	acceptPipes(ctx, qc, a)
 }
 
 // acceptPipes hands the bidirectional streams of a connection to a's
-// listener; used, when set, records that one arrived.
-func acceptPipes(ctx context.Context, qc *quic.Conn, a *zmux.Arrival, used *atomic.Bool) {
+// listener.
+func acceptPipes(ctx context.Context, qc *quic.Conn, a *zmux.Arrival) {
 	for {
 		s, err := qc.AcceptStream(ctx)
 		if err != nil {
 			return
-		}
-		if used != nil {
-			used.Store(true)
 		}
 		labels.Go(ctx, "quic-pipe", func() { _ = a.HandlePipe(ctx, streamPipe(qc, s), zmux.PipeHint{}) })
 	}
@@ -305,24 +334,25 @@ func acceptPipes(ctx context.Context, qc *quic.Conn, a *zmux.Arrival, used *atom
 // acceptLanes routes the unidirectional streams of a connection: lanes of
 // pipes on it (by Lane Key), through a's listener, or
 // on a client connection (a nil a) to its own pipes.
-func acceptLanes(ctx context.Context, qc *quic.Conn, a *zmux.Arrival, used *atomic.Bool) {
+func acceptLanes(ctx context.Context, qc *quic.Conn, a *zmux.Arrival) {
 	for {
 		s, err := qc.AcceptUniStream(ctx)
 		if err != nil {
 			return
 		}
-		if used != nil {
-			used.Store(true)
-		}
-		p := zmux.PipeIO{R: &laneReader{s: s, qc: qc}, Carrier: zmux.CarrierQUIC}
-		labels.Go(ctx, "quic-lane", func() {
-			if a != nil {
-				_ = a.HandlePipe(ctx, p, zmux.PipeHint{})
-			} else {
-				_ = zmux.HandleLane(ctx, p)
-			}
-		})
+		dispatchLane(ctx, qc, a, s)
 	}
+}
+
+func dispatchLane(ctx context.Context, qc *quic.Conn, a *zmux.Arrival, s *quic.ReceiveStream) {
+	p := zmux.PipeIO{R: &laneReader{s: s, qc: qc}, Carrier: zmux.CarrierQUIC}
+	labels.Go(ctx, "quic-lane", func() {
+		if a != nil {
+			_ = a.HandlePipe(ctx, p, zmux.PipeHint{})
+		} else {
+			_ = zmux.HandleLane(ctx, p)
+		}
+	})
 }
 
 // laneConns are the client connections whose lanes are being accepted.
@@ -334,7 +364,7 @@ func clientLanes(qc *quic.Conn) {
 		return
 	}
 	labels.Go(context.Background(), "quic-client-lanes", func() {
-		acceptLanes(context.Background(), qc, nil, nil)
+		acceptLanes(context.Background(), qc, nil)
 		laneConns.Delete(qc)
 	})
 }
@@ -423,12 +453,13 @@ func (q *qStream) cur() (*quic.Conn, *quic.Stream) {
 	return q.qc, q.s
 }
 
-// Retransmitted reports the bytes the connection declared lost, which
-// it sends again (zmux.PipeIO capability); the streams of a connection
-// share the count.
-func (q *qStream) Retransmitted() (uint64, bool) {
+// CarrierSampler is for internal use by zmux modules.
+func (q *qStream) CarrierSampler() *carrierstats.Sampler {
 	qc, _ := q.cur()
-	return qc.ConnectionStats().BytesLost, true
+	return carrierstats.ForQUIC(qc, func(c *quic.Conn) (sent, lost uint64) {
+		st := c.ConnectionStats()
+		return st.PacketsSent, st.PacketsLost
+	})
 }
 
 func (q *qStream) Write(p []byte) (int, error) {
@@ -554,6 +585,9 @@ func (q *qStream) HandshakeFailed() <-chan struct{} {
 
 // restarted is the byte stream after a 0-RTT rejection.
 type restarted struct{ q *qStream }
+
+// CarrierSampler is for internal use by zmux modules.
+func (r *restarted) CarrierSampler() *carrierstats.Sampler { return r.q.CarrierSampler() }
 
 func (r *restarted) Read(p []byte) (int, error) {
 	_, s := r.q.cur()

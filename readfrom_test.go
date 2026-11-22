@@ -131,12 +131,12 @@ func (panicReader) Read([]byte) (int, error) { panic("reader") }
 func TestReadFromInterrupted(t *testing.T) {
 	leakcheck.Check(t)
 	for _, tc := range []struct {
-		name string
 		stop func(src, dst *Stream)
+		name string
 	}{
-		{"cancelwrite", func(src, _ *Stream) { src.CancelWrite(7) }},
-		{"close", func(src, _ *Stream) { _ = src.Close() }},
-		{"stopsending", func(_, dst *Stream) { dst.CancelRead(9) }},
+		{name: "cancelwrite", stop: func(src, _ *Stream) { src.CancelWrite(7) }},
+		{name: "close", stop: func(src, _ *Stream) { _ = src.Close() }},
+		{name: "stopsending", stop: func(_, dst *Stream) { dst.CancelRead(9) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src, dst := readFromPair(t, nil)

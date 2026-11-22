@@ -8,10 +8,9 @@ func TestTCPQueryAllocs(t *testing.T) {
 	defer func() { _ = a.Close(); _ = b.Close() }()
 	ti := tcpOf(a)
 	for name, f := range map[string]func(){
-		"unsent":        func() { _, _ = ti.unsent() },
-		"retransmitted": func() { _, _ = ti.retransmitted() },
-		"minRTT":        func() { _, _ = ti.minRTT() },
-		"setLowWater":   func() { _ = ti.setLowWater(singleLowWater) },
+		"unsent":      func() { _, _ = ti.unsent() },
+		"minRTT":      func() { _, _ = ti.minRTT() },
+		"setLowWater": func() { _ = ti.setLowWater(singleLowWater) },
 	} {
 		if n := testing.AllocsPerRun(100, f); n != 0 {
 			t.Errorf("%s: %v allocations", name, n)

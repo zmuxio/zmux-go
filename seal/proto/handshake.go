@@ -577,18 +577,18 @@ func (hs *Handshake) Finished() bool {
 
 // Result is what a finished handshake leaves.
 type Result struct {
-	Profile       Profile
-	Mode          Mode
-	PeerStatic    []byte // nil when the profile has none
-	PeerEphemeral []byte
-	HandshakeHash []byte
 	// Sealer and Opener protect the records of a Sealed carrier; they are
 	// nil for the other modes, whose split keys are discarded.
 	Sealer *Sealer
 	Opener *Opener
 
 	suite          suite
+	PeerStatic     []byte // nil when the profile has none
+	PeerEphemeral  []byte
+	HandshakeHash  []byte
 	exporterSecret []byte
+	Profile        Profile
+	Mode           Mode
 }
 
 // Finish ends the handshake and gives up its state; it can succeed once.

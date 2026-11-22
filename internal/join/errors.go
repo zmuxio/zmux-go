@@ -4,6 +4,8 @@ import "errors"
 
 // Failures of parsing and of the handshakes. Each has one error class in the
 // specification; test with errors.Is.
+//
+//goland:noinspection GoUnusedGlobalVariable // the seal module matches these sentinels
 var (
 	ErrIncomplete     = errors.New("zmux join: more bytes are needed")
 	ErrMalformed      = errors.New("zmux join: malformed message")

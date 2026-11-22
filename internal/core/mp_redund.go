@@ -87,6 +87,9 @@ func (s *Session) copyLeft(c *copyRec) uint64 {
 func (s *Session) copiesOutstanding() uint64 {
 	m := s.mp
 	var sum uint64
+	if m.additionalPipes != nil {
+		sum = m.prefixBytes
+	}
 	out := m.copies[:0]
 	for _, c := range m.copies {
 		n := s.copyLeft(c)

@@ -26,6 +26,8 @@ const labelBound = "zmux-seal bound"
 // CombineBinding computes a Binding from the exporters of the uplink and
 // downlink halves of a carrier, which are the same value on one connection.
 // A half without an exporter is ErrInvalidConfig.
+//
+//goland:noinspection GoUnusedExportedFunction // used by the seal module
 func CombineBinding(up, down []byte) ([]byte, error) {
 	if len(up) != BindingLen || len(down) != BindingLen {
 		return nil, fmt.Errorf("%w: a carrier half has no exporter", ErrInvalidConfig)

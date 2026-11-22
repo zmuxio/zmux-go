@@ -42,21 +42,21 @@ type faultProxy struct {
 	rates    [faultCount]float64
 	maxDur   time.Duration
 	maxDelay time.Duration
+
+	mu sync.Mutex
 	// replayDown serves, once, the earliest DOWN response that carried
 	// data to a later DOWN request for another piece (the origin still
 	// processes the request): a deterministic cache replay.
 	replayDown bool
-
-	mu       sync.Mutex
-	replayed bool
-	rng      *mrand.Rand
-	cache    [][]byte // complete 200 responses, newest last
-	downResp []byte   // replayDown: the response to replay
-	downSeq  uint64
-	counts   [faultCount]int
-	conns    map[net.Conn]struct{}
-	done     chan struct{}
-	wg       sync.WaitGroup
+	replayed   bool
+	rng        *mrand.Rand
+	cache      [][]byte // complete 200 responses, newest last
+	downResp   []byte   // replayDown: the response to replay
+	downSeq    uint64
+	counts     [faultCount]int
+	conns      map[net.Conn]struct{}
+	done       chan struct{}
+	wg         sync.WaitGroup
 }
 
 // newFaultProxy starts a proxy to origin, configured by set before it
@@ -313,9 +313,14 @@ func TestHTTPExchangeReplayNeedsMAC(t *testing.T) {
 			ccfg := *cfg
 			ccfg.testSkipResponseMAC = skip
 			e := newExEnv(t, &ccfg, cfg, func(origin string) string {
-				px = newFaultProxy(t, origin[len("http://"):], 1, func(p *faultProxy) { p.replayDown = true })
+				px = newFaultProxy(t, origin[len("http://"):], 1, func(*faultProxy) {})
 				return px.url()
 			})
+			// Exercise replay during echo. Replaying handshake bytes can
+			// abort setup before the negative control starts.
+			px.mu.Lock()
+			px.replayDown = true
+			px.mu.Unlock()
 			err := e.echoErr(1<<20, 15*time.Second)
 			e.close(t)
 			px.close()
@@ -329,5 +334,26 @@ func TestHTTPExchangeReplayNeedsMAC(t *testing.T) {
 				t.Fatal("a replayed response was not noticed without the MAC check")
 			}
 		})
+	}
+}
+
+// A replayed DOWN response during setup has a MAC for the wrong request.
+// The client retries it and still establishes the session.
+func TestHTTPExchangeReplayDuringHandshake(t *testing.T) {
+	leakcheck.Check(t)
+	cfg := faultConfig()
+	// Split the server parameters across DOWN responses so there is a
+	// replay before the client can finish its handshake.
+	cfg.DownPieceSize = 8
+	cfg.DownRequests = 1
+	var px *faultProxy
+	e := newExEnv(t, cfg, cfg, func(origin string) string {
+		px = newFaultProxy(t, origin[len("http://"):], 1, func(p *faultProxy) { p.replayDown = true })
+		t.Cleanup(px.close)
+		return px.url()
+	})
+	defer e.close(t)
+	if got := px.count(faultReplay); got != 1 {
+		t.Fatalf("replays during handshake = %d, want 1", got)
 	}
 }

@@ -18,7 +18,7 @@ func TestQueuedOnSlowCarrier(t *testing.T) {
 	b.Pipe, b.pos = p.id, 3000
 	ol.handed += b.pos
 	ol.writing = true
-	s.SetCarrierUnsent(p.id, 0, 500)
+	s.SetCarrierUnsent(p.id, 0, 500, s.now)
 	if q := s.queuedOn(p); q != 3500 || s.committed(p) != 3500 {
 		t.Fatalf("Q_p %d, committed %v, want 3500", q, s.committed(p))
 	}
@@ -99,7 +99,7 @@ func TestQueueDelaySnapshotsRate(t *testing.T) {
 	s, p := statsMP()
 	ol := p.out.lanes[0]
 	measuredRate(p, 1e6)
-	s.SetCarrierUnsent(p.id, 0, 200_000)
+	s.SetCarrierUnsent(p.id, 0, 200_000, s.now)
 	snap := s.snapAhead(p)
 	if snap.bytes != 200_000 || snap.delay != 200*Millisecond {
 		t.Fatalf("snapshot %+v, want 200000 B, 200 ms", snap)
@@ -116,6 +116,6 @@ func TestQueueDelaySnapshotsRate(t *testing.T) {
 // etaOf is ETA_p(1000) worked out alone.
 func etaOf(s *Session, p *Pipe) float64 {
 	pr, _ := p.mp.effPrio()
-	t := s.fastestOf(pr)
-	return s.eta(p, 1000, s.owdBase(), &t)
+	tops := s.fastestOf(pr)
+	return s.estimate(p, &tops, s.queued(p), 0).eta(1000)
 }

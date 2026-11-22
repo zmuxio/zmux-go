@@ -57,8 +57,8 @@ func TestInteropPackets(t *testing.T) {
 const interopMaxPacket = 1 << 20
 
 type interopPacket struct {
-	cx   uint64
 	data string
+	cx   uint64
 }
 
 func openPacketStream(t *testing.T, ctx context.Context, c *Conn, cmd string, policy PacketPolicy) (*Stream, *PacketStream) {
@@ -108,12 +108,12 @@ func interopPacketEcho(t *testing.T, ctx context.Context, c *Conn, datagrams boo
 	}
 	small, big := map[interopPacket]bool{}, map[interopPacket]bool{}
 	for i := range 8 {
-		k := interopPacket{uint64(5 * (i % 2)), fmt.Sprintf("small-%d", i)}
+		k := interopPacket{cx: uint64(5 * (i % 2)), data: fmt.Sprintf("small-%d", i)}
 		small[k] = true
 	}
 	for i, cx := range []uint64{0, 5} {
 		b := bytes.Repeat([]byte{byte('A' + i)}, large+i)
-		big[interopPacket{cx, string(b)}] = true
+		big[interopPacket{cx: cx, data: string(b)}] = true
 	}
 	for k := range small {
 		if err := ps.WritePacket(ctx, k.cx, []byte(k.data)); err != nil {
@@ -131,7 +131,7 @@ func interopPacketEcho(t *testing.T, ctx context.Context, c *Conn, datagrams boo
 	_ = ps.Close()
 	var smallGot, smallDgram int
 	for _, pk := range readPackets(t, ctx, ps) {
-		k := interopPacket{pk.ContextID, string(pk.Data)}
+		k := interopPacket{cx: pk.ContextID, data: string(pk.Data)}
 		switch {
 		case big[k]:
 			if pk.Datagram {
@@ -164,7 +164,7 @@ func interopPacketStreamOnly(t *testing.T, ctx context.Context, c *Conn) { //nol
 	_, ps := openPacketStream(t, ctx, c, "packets:stream", PacketStreamOnly)
 	want := make([]interopPacket, 0, 6)
 	for i, n := range []int{0, 1, 100, 1500, 20000, 65535} {
-		want = append(want, interopPacket{uint64(5 * (i % 2)), string(bytes.Repeat([]byte{byte(i)}, n))})
+		want = append(want, interopPacket{cx: uint64(5 * (i % 2)), data: string(bytes.Repeat([]byte{byte(i)}, n))})
 	}
 	for _, k := range want {
 		if err := ps.WritePacket(ctx, k.cx, []byte(k.data)); err != nil {

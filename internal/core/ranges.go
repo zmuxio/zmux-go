@@ -125,6 +125,20 @@ func (r *rangeSet) prefix() uint64 {
 	return 0
 }
 
+// firstGap returns the first unacknowledged span, clipped to [lo, hi).
+func (r *rangeSet) firstGap(lo, hi uint64) rng {
+	q := &r.q
+	i := r.from(lo + 1)
+	if q.valid(i) && q.at(i).lo <= lo {
+		lo = min64(hi, q.at(i).hi)
+		i = q.next(i)
+	}
+	if q.valid(i) {
+		hi = min64(hi, q.at(i).lo)
+	}
+	return rng{lo, max64(lo, hi)}
+}
+
 // gaps calls f with each maximal subrange of [lo, hi) not in r, in order.
 func (r *rangeSet) gaps(lo, hi uint64, f func(a, b uint64)) {
 	q := &r.q

@@ -54,10 +54,10 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 	if good, _ := re.state("k2", Candidate{Kind: CarrierStream}, now); !good {
 		t.Fatal("usable entry not restored")
 	}
-	if _, ok := re.m[cacheKey{"old", CarrierSplit, ""}]; ok {
+	if _, ok := re.m[cacheKey{key: "old", kind: CarrierSplit, variant: ""}]; ok {
 		t.Fatal("expired entry restored")
 	}
-	if e := re.m[cacheKey{"k", CarrierStream, ""}]; e.backoff != 2*time.Minute {
+	if e := re.m[cacheKey{key: "k", kind: CarrierStream, variant: ""}]; e.backoff != 2*time.Minute {
 		t.Fatalf("backoff %v", e.backoff)
 	}
 	fresh := targetCandidate(CarrierStream, "https://a.example/z")
@@ -67,7 +67,7 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 	}
 	// The restored backoff doubles on the next failure.
 	re.record("k", st, false, now)
-	if e := re.m[cacheKey{"k", CarrierStream, ""}]; e.backoff != 4*time.Minute {
+	if e := re.m[cacheKey{key: "k", kind: CarrierStream, variant: ""}]; e.backoff != 4*time.Minute {
 		t.Fatalf("backoff after restore %v", e.backoff)
 	}
 
@@ -92,10 +92,10 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 	if good, _ := lc.state("k", Candidate{Kind: CarrierSplit}, now); !good {
 		t.Fatal("split not restored")
 	}
-	if e := lc.m[cacheKey{"k", CarrierExchange, ""}]; e == nil || e.backoff != time.Minute {
+	if e := lc.m[cacheKey{key: "k", kind: CarrierExchange, variant: ""}]; e == nil || e.backoff != time.Minute {
 		t.Fatal("backoff history not restored")
 	}
-	if e := lc.m[cacheKey{"d", CarrierQUIC, ""}]; e == nil || e.backoff != time.Minute {
+	if e := lc.m[cacheKey{key: "d", kind: CarrierQUIC, variant: ""}]; e == nil || e.backoff != time.Minute {
 		t.Fatalf("duplicate entry %+v", e)
 	}
 	// Merge: an older entry does not replace a newer one, a newer does.
@@ -128,7 +128,7 @@ func TestCarrierCacheSnapshot(t *testing.T) {
 			t.Fatalf("restored %s: %v", bad, err)
 		}
 	}
-	if len(lc.m) != 4 || lc.m[cacheKey{"z", CarrierSplit, ""}] != nil {
+	if len(lc.m) != 4 || lc.m[cacheKey{key: "z", kind: CarrierSplit, variant: ""}] != nil {
 		t.Fatal("a rejected snapshot changed the cache")
 	}
 }

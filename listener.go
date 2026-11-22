@@ -8,11 +8,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,11 +33,11 @@ import (
 // timeout and a negative MemoryBudget unlimited; any other negative
 // value makes NewListener fail with ErrInvalidConfig.
 type ListenerConfig struct {
-	// Config is the configuration of the sessions it accepts, validated by
-	// NewListener as a server session's. Its HandshakeTimeout also bounds
-	// how long a carrier of the listener waits for its split-bootstrap
-	// partner or for the handshake of a join that arrived in early data;
-	// its JoinTimeout bounds a stalled join.
+	// Config is the configuration of the sessions it accepts. NewListener
+	// takes a shallow copy and validates it for server sessions. Its
+	// HandshakeTimeout also bounds the wait for a split-bootstrap partner
+	// or for the handshake of a join that arrived in early data. Its
+	// JoinTimeout bounds a stalled join.
 	Config *Config
 	// Logger receives the listener's warnings and the panics of its host
 	// callbacks that it contains (OnReject, SessionConfig, Admission,
@@ -106,23 +106,19 @@ type ListenerConfig struct {
 	// classified (FirstRecordTimeout) as a join or a new session. NewListener
 	// fails if it is invalid (Admission.Validate).
 	Admission *Admission
-	// Fallback takes over the carriers that the admission decides on with
-	// VerdictFallback, whatever entry point took them: byte streams (TCP,
-	// TLS, a QUIC or WebTransport stream), message-framed carriers
-	// (WebSocket), the carrier of an upgrade decided after a VerdictDefer,
-	// and an HTTP request carrier decided on its body (its request and
-	// response bodies as one full duplex pipe), each with what was read
-	// replayed and the decision's Value (Takeover); nil: they are stalled
-	// (an HTTP request carrier is served by zmuxhttp.Options.Next). A
-	// listener has one Fallback: the host routes by Takeover.Value. A
-	// message-framed carrier whose first message is empty is closed before
-	// Decide, so a Takeover's first message is never empty. It runs on the
-	// goroutine that handles the carrier, after the carrier's slots were
-	// given back, with a context that ends when it returns; zmux closes
-	// the carrier when Fallback returns unless the host called
-	// Takeover.Detach, which makes it the host's to serve on any goroutine
-	// (with a context of its own) and to close once done. An HTTP request decided on its head
-	// (StageHead) is a request, served by zmuxhttp.Options.Next.
+	// Fallback is the listener's byte-stream and message-carrier target.
+	// VerdictTakeover selects it on every transport. VerdictFallback selects
+	// it for TCP/TLS, QUIC first streams and already upgraded WebSocket or
+	// WebTransport carriers. While the carrier is an HTTP request,
+	// VerdictFallback serves Options.Next or responds with HTTP 404.
+	// A carrier directed here stalls if Fallback is nil.
+	//
+	// The host receives the inspected prefix replayed and can route by
+	// Takeover.Value. For message framing the replay is a whole non-empty
+	// first message. The callback runs on the carrier's setup goroutine
+	// after its slots are returned. Its context ends when it returns.
+	// Returning closes the carrier unless the host called Takeover.Detach,
+	// in which case the host owns it and closes it once done.
 	Fallback func(ctx context.Context, t *Takeover)
 	// WrapPipe, when set, is called once for every carrier the listener
 	// takes, whatever fed it (Serve, HandlePipe, the HTTP,
@@ -210,6 +206,7 @@ func (c *ListenerConfig) resolve() (ListenerConfig, error) {
 	if r.ListenerLimits, err = r.ListenerLimits.resolve(); err != nil {
 		return r, err
 	}
+	r.Config = r.Config.Clone()
 	if _, err := r.Config.coreConfig(core.RoleResponder, core.RoleResponder); err != nil {
 		return r, fmt.Errorf("ListenerConfig.Config: %w", err)
 	}
@@ -325,33 +322,30 @@ type Listener struct {
 	cfg ListenerConfig
 	// lim holds the limits in effect (SetLimits); cfg keeps none.
 	lim atomic.Pointer[ListenerLimits]
-	// served is set by the first carrier: SetLimits starts the memory
-	// watcher only on a listener that serves.
-	served atomic.Bool
 
 	// pmu guards the pending carriers' slots, apart from mu: every carrier
 	// takes and gives back slots, so they do not wait for the session
 	// registry. A leaf: nothing is locked under it.
-	pmu     sync.Mutex
-	pending core.PendingCarriers // under pmu
-	mu      sync.RWMutex         // read: a new session's handoff to Accept, the checks of closed and draining
-	// regMu guards the session registry (live, sessions, the suspension
-	// list), apart from mu: a session's end does not wait for handoffs. A
-	// leaf: nothing is locked under it.
-	regMu    sync.Mutex
-	live     map[*Conn]struct{} // every session it started, until it ends
-	sessions map[string]*Conn   // by locator
+	pmu      sync.Mutex
+	pending  core.PendingCarriers // under pmu
+	mu       sync.RWMutex         // read: a new session's handoff to Accept, the checks of closed and draining
+	registry sessionRegistry
+	suspMu   sync.Mutex // protects the global oldest-first suspension limit
 	// The suspended sessions in suspension order (Conn.suspPrev and
 	// suspNext): the oldest first.
 	suspHead, suspTail *Conn
 	suspN              int
 	pairing            core.SplitPairing
-	pairs              map[[16]byte]*pairWait
-	closed             bool
-	draining           bool        // Shutdown: no new sessions
-	pclosed            bool        // under pmu: closed, for the slots
-	rclosed            bool        // under regMu: closed, for the registry
-	watching           atomic.Bool // the memory-pressure watcher was started (startWatch)
+	drainReason        string
+	shutdownCtx        context.Context
+	shutdownCancel     context.CancelFunc
+	// served is set by the first carrier: SetLimits starts the memory
+	// watcher only on a listener that serves.
+	served       atomic.Bool
+	closed       bool        // under mu
+	draining     bool        // under mu: policy for new bootstraps
+	shuttingDown bool        // under mu
+	watching     atomic.Bool // the memory-pressure watcher was started (startWatch)
 
 	accept     chan *Conn
 	done       chan struct{} // closed by Close
@@ -434,7 +428,8 @@ func (l *Listener) Stats() ListenerStats {
 // VariantStats returns the admission outcomes by Decision.Variant, a copy
 // sorted by Name, with the bucket of the variants past
 // MaxAdmissionVariants last; their sums are AdmissionStats.Accepted,
-// Fallback, Stalled + StallOverflow and Closed. A nil l returns nil.
+// Fallback, Takeover, Stalled + StallOverflow and Closed + TooLarge, respectively.
+// Takeover is recorded as the carrier enters the host callback. A nil l returns nil.
 func (l *Listener) VariantStats() []VariantStat {
 	if l == nil {
 		return nil
@@ -472,10 +467,10 @@ func (l *Listener) rejectedBy(err error) {
 }
 
 type pairWait struct {
-	admitted any        // the half's admission value
-	paired   chan error // the partner arrived
-	done     chan error // the session's result for the waiting half
-	end      chan struct{}
+	ctx      context.Context
+	admitted any         // the half's admission value
+	wait     *attachment // setup and cleanup of this half
+	done     chan error  // the session's result for the waiting half
 	p        PipeIO
 }
 
@@ -494,10 +489,11 @@ func NewListener(cfg *ListenerConfig) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	l := &Listener{cfg: r, live: map[*Conn]struct{}{}, sessions: map[string]*Conn{},
-		pairs: map[[16]byte]*pairWait{}, done: make(chan struct{}), drain: make(chan struct{})}
+	l := &Listener{cfg: r, registry: sessionRegistry{seed: maphash.MakeSeed()},
+		done: make(chan struct{}), drain: make(chan struct{})}
 	l.clk = timeshim.Or(l.cfg.Config.clock())
 	l.stopCtx, l.stopCancel = context.WithCancel(context.Background())
+	l.shutdownCtx, l.shutdownCancel = context.WithCancel(l.stopCtx)
 	l.accept = make(chan *Conn, l.cfg.Backlog)
 	_, _ = rand.Read(l.stallKey[:])
 	lim := l.cfg.ListenerLimits
@@ -576,37 +572,49 @@ func (l *Listener) watchBudget() {
 			h(int64(l.budget.Used()), int64(l.budget.Limit()))
 		}
 		for over && l.budget.Pressure() {
-			c := l.largestSuspended()
-			if c == nil {
+			candidate := l.largestSuspended()
+			if candidate.c == nil {
 				break
 			}
-			closeSuspended([]*Conn{c})
+			candidate.close()
 		}
 	}
 }
 
-// largestSuspended removes and returns the suspended session that holds
-// the most memory.
-func (l *Listener) largestSuspended() *Conn {
-	l.regMu.Lock()
-	cs := make([]*Conn, 0, l.suspN)
-	for c := l.suspHead; c != nil; c = c.suspNext {
-		cs = append(cs, c)
-	}
-	l.regMu.Unlock()
-	var best *Conn
-	var most uint64
-	for _, c := range cs { // session locks outside the listener lock
-		var m uint64
-		c.locked(func() { m = c.s.Charged() })
-		if best == nil || m > most {
-			best, most = c, m
+// A suspension ticket identifies a particular suspension of a session.
+// The session lock serializes its last validation with resume and close.
+type suspension struct {
+	c          *Conn
+	generation uint64
+}
+
+func (t suspension) close() {
+	c := t.c
+	c.locked(func() {
+		if c.suspGeneration == t.generation && c.s.State() == core.StateSuspended {
+			c.s.CloseResumeTimeout()
 		}
+	})
+}
+
+func (l *Listener) largestSuspended() suspension {
+	l.suspMu.Lock()
+	cs := make([]suspension, 0, l.suspN)
+	for c := l.suspHead; c != nil; c = c.suspNext {
+		cs = append(cs, suspension{c, c.suspGeneration})
 	}
-	if best != nil {
-		l.regMu.Lock()
-		l.dropSuspended(best)
-		l.regMu.Unlock()
+	l.suspMu.Unlock()
+	var best suspension
+	var most uint64
+	for _, ticket := range cs {
+		c := ticket.c
+		c.peek(func() {
+			if c.suspGeneration == ticket.generation && c.s.State() == core.StateSuspended {
+				if m := c.s.Charged(); best.c == nil || m > most {
+					best, most = ticket, m
+				}
+			}
+		})
 	}
 	return best
 }
@@ -620,6 +628,16 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 	}
 	select {
 	case c := <-l.accept:
+		l.mu.Lock()
+		stopped := l.closed || l.shuttingDown
+		if !stopped {
+			c.listenerAccepted = true
+		}
+		l.mu.Unlock()
+		if stopped {
+			c.Abort(0, "")
+			return nil, net.ErrClosed
+		}
 		return c, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -639,22 +657,16 @@ func (l *Listener) Close() error {
 	l.mu.Lock()
 	if !l.closed {
 		l.closed = true
+		l.stopCancel()
 		close(l.done)
-		if !l.draining {
-			l.draining = true
+		if !l.shuttingDown {
 			close(l.drain)
 		}
 	}
 	l.mu.Unlock()
-	l.pmu.Lock()
-	l.pclosed = true
-	l.pmu.Unlock()
-	l.regMu.Lock()
-	l.rclosed = true
-	l.regMu.Unlock()
-	l.stopCancel()
+
 	// Sessions in the backlog have no one to accept them now (no more
-	// arrive once draining is set, under l.mu): they end here. Shutdown
+	// arrive after the stop cutoff under l.mu): they end here. Shutdown
 	// ends them with every other session instead.
 	for {
 		select {
@@ -666,32 +678,47 @@ func (l *Listener) Close() error {
 	}
 }
 
-// Shutdown closes the listener gracefully, as http.Server.Shutdown does:
-// Accept returns net.ErrClosed and new sessions are refused at once, while
-// carriers that join or resume the listener's sessions are still taken
-// (through the same admission); every session it started, accepted or
-// not, is shut down with Conn.Shutdown(ctx, code, msg) in parallel: each
-// sends GOAWAY, lets its open streams finish and closes. Once every
-// session has ended, or ctx has (the remaining sessions are then closed
-// at once and ctx's error is returned), Shutdown calls Close.
+// Drain refuses subsequent bootstrap handshakes with CONNECTION_REFUSED
+// and msg. Existing sessions can still join, add lanes, and resume.
+func (l *Listener) Drain(msg string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.shuttingDown && !l.closed {
+		l.draining, l.drainReason = true, msg
+	}
+}
+
+// Undrain resumes bootstrap admission unless shutdown has started.
+func (l *Listener) Undrain() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.shuttingDown && !l.closed {
+		l.draining, l.drainReason = false, ""
+	}
+}
+
+// Shutdown irreversibly drains bootstrap admission and gracefully closes
+// published sessions. Their joins and resumptions can run until Close.
 func (l *Listener) Shutdown(ctx context.Context, code ApplicationErrorCode, msg string) error {
 	l.mu.Lock()
-	if !l.draining {
-		l.draining = true
+	if !l.shuttingDown && !l.closed {
+		l.shuttingDown, l.draining, l.drainReason = true, true, msg
+		l.shutdownCancel()
 		close(l.drain)
 	}
 	l.mu.Unlock()
 	// A session registered after this snapshot is refused at its handoff
 	// (draining).
-	l.regMu.Lock()
-	cs := make([]*Conn, 0, len(l.live))
-	for c := range l.live {
-		cs = append(cs, c)
-	}
-	l.regMu.Unlock()
+	cs := l.registry.snapshot(true)
 	errs := make(chan error, len(cs))
 	for _, c := range cs {
-		go func() { errs <- c.Shutdown(ctx, code, msg) }()
+		go func() {
+			if !c.listenerAccepted {
+				errs <- c.Close()
+				return
+			}
+			errs <- c.Shutdown(ctx, code, msg)
+		}()
 	}
 	var err error
 	for range cs {
@@ -707,12 +734,11 @@ func (l *Listener) Shutdown(ctx context.Context, code ApplicationErrorCode, msg 
 // goroutine of its own, as a carrier that starts or joins a session; the
 // sessions it starts are returned by Accept. With an Admission, a TLS
 // connection completes its handshake first, and VerdictFallback hands the
-// connection to ListenerConfig.Fallback. During Shutdown it keeps serving
-// joins and resumptions. For TLS, pass a listener made
+// connection to ListenerConfig.Fallback. During Shutdown new carriers are refused. For TLS, pass a listener made
 // by tls.NewListener. Serve closes ln when it returns: when ln.Accept
 // fails, when ctx ends (ctx's error), or when the listener is closed
-// (net.ErrClosed). Cancelling ctx also aborts the carriers Serve handed
-// over, ending their pipes; Shutdown or Close leave them to the sessions.
+// (net.ErrClosed). Each carrier goroutine returns after HandlePipe decides its
+// fate. Cancelling ctx stops pending setup. Established pipes remain with their sessions.
 func (l *Listener) Serve(ctx context.Context, ln net.Listener) error {
 	stop := make(chan struct{})
 	defer close(stop)
@@ -759,19 +785,33 @@ var (
 	errUnknownSuite = fmt.Errorf("zmux: join suite not usable in the session: %w", errRejected)
 )
 
-// HandlePipe classifies a new carrier by its first record (or its hint)
-// and starts a session on it, attaches it to a session as a pipe, or
-// closes it. It blocks for the lifetime of the pipe, so that an HTTP
-// handler stays alive; when ctx ends the pipe is aborted. The carrier
+// HandlePipe takes ownership of p on entry. The caller must never close p,
+// including when HandlePipe returns an error. It returns when the carrier
+// has started or joined a session, has been refused, or Fallback has
+// returned on the caller's goroutine. ctx bounds admission, classification
+// and setup through handoff. Once attached, the session drives the close,
+// including CONNECTION_CLOSE after a handshake failure or policy refusal.
+// A nil result means bootstrap entered the backlog, a join was confirmed, or
+// a lane was attached, or Fallback returned normally. Once committed, the
+// setup result survives cancellation even before HandlePipe returns. I/O can outlive an
+// error return, and later carrier failures are reported by the session.
+//
+// Classification uses the first record or the hint. The carrier
 // takes a slot of its source first (hint.Source, or the remote address of
 // a half: Arrive) and passes the listener's admission (Arrival.HandlePipe).
 // A carrier that is not yet classified, or that joins a session and is
 // not yet verified, also holds a pending slot (ListenerConfig.MaxPending).
 func (l *Listener) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) error {
 	p = owned(p)
-	a, err := l.arrive(hint.Source, peerOf(p))
+	var peer netip.AddrPort
+	if !safeLog(l.cfg.Logger, "carrier peer", func() { peer = peerOf(p) }) {
+		closePipe(p)
+		l.countSetupFailure()
+		return errRejected
+	}
+	a, err := l.arrive(hint.Source, peer)
 	if errors.Is(err, errRefused) {
-		return l.refusePending(ctx, p, unmapped(hint.Source), peerOf(p))
+		return l.refusePending(p, unmapped(hint.Source), peer)
 	}
 	if err != nil {
 		closePipe(p)
@@ -783,62 +823,49 @@ func (l *Listener) HandlePipe(ctx context.Context, p PipeIO, hint PipeHint) erro
 // refusePending refuses a carrier beyond the pending limits, the first check
 // of an accepted carrier: it goes to the reject policy, reason "pending_limit",
 // like every refusal before authentication, and is closed.
-func (l *Listener) refusePending(ctx context.Context, p PipeIO, src, peer netip.AddrPort) error {
+func (l *Listener) refusePending(p PipeIO, src, peer netip.AddrPort) error {
 	if !src.IsValid() {
 		src = unmapped(peer)
 	}
-	l.onReject(ctx, p, RejectInfo{Reason: "pending_limit", Src: src})
+	l.onReject(p, nil, RejectInfo{Reason: "pending_limit", Src: src})
 	closePipe(p)
 	return errRefused
 }
 
 // take hands an admitted carrier, which holds slot, to the listener, or
-// refuses it at once (a closed listener, a split half during Shutdown),
+// refuses it at once when the listener is closed,
 // before it waits for anything. run then does the rest of HandlePipe; the
 // slots are given back once the carrier enters a session or is closed.
-func (l *Listener) take(p PipeIO, hint PipeHint, slot *core.PendingSlot) (run func(context.Context) error, err error) {
-	release := func() { l.leave(slot) }
+func (l *Listener) take(hint PipeHint, wait *attachment) (func(context.Context) error, error) {
+	p := wait.pipe
 	l.mu.RLock()
-	ok := !l.closed && (hint.Pair == "" || !l.draining)
+	ok := l.stopCtx.Err() == nil
 	l.mu.RUnlock()
 	if !ok {
-		release()
 		closePipe(p)
 		l.st.refused.Add(1)
 		return nil, errRefused
 	}
 	return func(ctx context.Context) error {
-		defer release()
-		ctx = context.WithValue(ctx, slotKey{}, slot)
 		if hint.Pair != "" {
-			return l.handlePair(ctx, p, hint, release)
+			return l.handlePair(ctx, p, hint, wait)
 		}
-		p, err := l.wrapPipe(ctx, p, hint)
-		if err != nil {
-			return err
-		}
-		return l.handleAdmitted(ctx, p, hint, release)
+		return l.handleAdmitted(ctx, hint, wait)
 	}, nil
 }
 
-// slotKey is the context key of the slots of the carrier a listener
-// handles, which a stall keeps.
-type slotKey struct{}
-
 // wrapPipe applies ListenerConfig.WrapPipe to p, within the handshake
 // timeout; p is closed when it fails.
-func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint PipeHint) (PipeIO, error) {
+func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint PipeHint, wait *attachment) (PipeIO, error) {
 	wrap := l.cfg.WrapPipe
 	if wrap == nil {
 		return p, nil
 	}
-	ctx, stopL := l.stopContext(ctx)
-	defer stopL()
 	ctx, cancel := timeshim.WithTimeout(ctx, l.clk, l.cfg.Config.handshakeTimeout())
 	defer cancel()
 	// A layer that does not watch ctx is interrupted by closing p, through
 	// the closer every failure below shares.
-	stop := context.AfterFunc(ctx, func() { closePipe(p) })
+	stop := interruptOnCancel(ctx, func() { closePipe(p) })
 	// The layer is a host callback the peer drives (seal's Gate, AppData,
 	// Signer included): a panic in it fails this carrier, not the process.
 	var q PipeIO
@@ -847,8 +874,7 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint PipeHint) (PipeI
 	if rej := (*RejectError)(nil); !fired && errors.As(err, &rej) {
 		markTaken(p)
 		l.st.rejected.Add(1)
-		l.onReject(ctx, p, RejectInfo{Profile: rej.Profile, RecordMode: rej.RecordMode, Reason: rej.Reason, Src: hint.Source, Err: rej.Err})
-		closePipe(p)
+		l.onReject(p, wait, RejectInfo{Profile: rej.Profile, RecordMode: rej.RecordMode, Reason: rej.Reason, Src: hint.Source, Err: rej.Err})
 		return PipeIO{}, errRejected
 	}
 	if err != nil {
@@ -868,7 +894,9 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint PipeHint) (PipeI
 		// New halves are the layer's, over p: closing them ends p (through
 		// p's closer where the layer uses PipeConn), so they get a closer
 		// of their own.
-		markTaken(p)
+		if !safeLog(l.cfg.Logger, "CarrierTaken", func() { markTaken(p) }) {
+			return l.wrapFailed(p, q, errRejected)
+		}
 		q.own = nil
 	} else {
 		q.own = p.own
@@ -884,7 +912,7 @@ func (l *Listener) wrapPipe(ctx context.Context, p PipeIO, hint PipeHint) (PipeI
 // wrapFailed closes what wrapPipe holds after err: q's new halves, and p
 // (once: the bound may have closed it), and counts a setup failure.
 func (l *Listener) wrapFailed(p, q PipeIO, err error) (PipeIO, error) {
-	markTaken(p) // what the layer read is no longer a request to hand on
+	safeLog(l.cfg.Logger, "CarrierTaken", func() { markTaken(p) })
 	if r, w := newHalf(q.R, p.R, p.W), newHalf(q.W, p.R, p.W); r != nil || w != nil {
 		carrierio.NewCloser(r, w).Close()
 	}
@@ -894,7 +922,31 @@ func (l *Listener) wrapFailed(p, q PipeIO, err error) (PipeIO, error) {
 }
 
 // handleAdmitted is HandlePipe for an admitted carrier.
-func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint PipeHint, release func()) error {
+func (l *Listener) handleAdmitted(ctx context.Context, hint PipeHint, wait *attachment) error {
+	wait.ctx = ctx
+	setup, cancel := l.stopContext(ctx)
+	defer cancel()
+	err := hostCall(l.cfg.Logger, "carrier setup", func() error {
+		return l.classify(setup, hint, wait)
+	})
+	if err != nil && wait.rollback() {
+		closePipe(wait.pipe)
+	}
+	wait.ctx = nil
+	wait.parentsEnded = nil
+	wait.pipe = PipeIO{}
+	if err == nil {
+		wait.leave()
+	}
+	return err
+}
+
+func (l *Listener) classify(ctx context.Context, hint PipeHint, wait *attachment) error {
+	p, err := l.wrapPipe(ctx, wait.pipe, hint, wait)
+	if err != nil {
+		return err
+	}
+	wait.pipe = p
 	first, cls, err := l.readFirst(ctx, p)
 	if err != nil {
 		closePipe(p)
@@ -905,18 +957,23 @@ func (l *Listener) handleAdmitted(ctx context.Context, p PipeIO, hint PipeHint, 
 		}
 		return err
 	}
+	stop := wait.watch(ctx, p)
+	defer stop()
+	if (cls == core.ClassSession || cls == core.ClassJoin) && (p.R == nil || p.W == nil) {
+		l.rejectedBy(errRejected)
+		return errRejected
+	}
 	switch cls {
 	case core.ClassSession:
 		admitted := hint.Admitted
 		if v := carrierPeer(p); v != nil {
 			admitted = v
 		}
-		return l.startSession(ctx, withPrefix(p, first), admitted, hint.Source, release)
+		return l.startSession(ctx, withPrefix(p, first), admitted, hint.Source, wait)
 	case core.ClassJoin:
-		return l.join(ctx, p, first, hint, release)
+		return l.join(ctx, p, first, hint, wait)
 	case core.ClassLane:
-		release()
-		return handleLane(ctx, l, withPrefix(p, first), first)
+		return handleLane(ctx, l, withPrefix(p, first), first, wait)
 	case core.ClassMore, core.ClassReject:
 	}
 	closePipe(p)
@@ -949,7 +1006,9 @@ func readFirstWithin(ctx, stop context.Context, clk timeshim.Clock, d time.Durat
 	t := clk.AfterFunc(d, abandon(func() error { return errTimedOut }))
 	stopCtx := context.AfterFunc(ctx, abandon(ctx.Err))
 	stopListener := context.AfterFunc(stop, abandon(func() error { return net.ErrClosed }))
-	b, cls, err := readFirstRecord(p)
+	var b []byte
+	var cls core.Class
+	err := hostCall(nil, "first record", func() error { var e error; b, cls, e = readFirstRecord(p); return e })
 	t.Stop()
 	stopCtx()
 	stopListener()
@@ -986,6 +1045,9 @@ func markTaken(p PipeIO) {
 
 // readFirstRecord reads a carrier's first record.
 func readFirstRecord(p PipeIO) ([]byte, core.Class, error) {
+	if p.R == nil {
+		return nil, core.ClassReject, errRejected
+	}
 	if p.Framing == FramingRecords {
 		mr, ok := p.R.(MessageReader)
 		if !ok {
@@ -1012,6 +1074,9 @@ func readFirstRecord(p PipeIO) ([]byte, core.Class, error) {
 		case cls == core.ClassReject:
 			return nil, cls, errRejected
 		case cls == core.ClassJoin:
+			if p.W == nil {
+				return b, cls, nil
+			} // No further bytes can supply a reply direction.
 			// A joiner sends nothing after a Hello until it has the Reply.
 			if _, _, e := join.ParseHelloExact(b, join.Stream); !errors.Is(e, join.ErrIncomplete) {
 				return b, cls, nil // the parser's verdict is the listener's to act on
@@ -1028,9 +1093,15 @@ func readFirstRecord(p PipeIO) ([]byte, core.Class, error) {
 // startSession starts a server session on a carrier whose first record is
 // QX_TRANSPORT_PARAMETERS; admitted is the carrier's admission value,
 // src its PipeHint.Source.
-// The carrier's slots are given back with release once its transport
-// parameters have been exchanged, or it failed.
-func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src netip.AddrPort, release func()) error {
+func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src netip.AddrPort, wait *attachment) error {
+	// Snapshot the policy once, when this carrier is classified as a
+	// bootstrap (after pairing for split). Undrain cannot reverse its decision.
+	l.mu.RLock()
+	refuse, reason := l.draining, l.drainReason
+	if wait != nil && !refuse {
+		wait.stopHandshake = l.drain
+	}
+	l.mu.RUnlock()
 	cfg, err := l.sessionConfig(ctx, p, admitted, src)
 	if err != nil {
 		closePipe(p)
@@ -1051,68 +1122,120 @@ func (l *Listener) startSession(ctx context.Context, p PipeIO, admitted any, src
 		cc.LocatorPrefix = loc[:n]
 	}
 	cc.Budget = l.budget
+	if err := wait.acceptHead(ctx); err != nil {
+		return err
+	}
 	markTaken(p)
 	// Close cancels the bootstrap handshake; the session no longer
 	// depends on the context once established.
-	hctx, unlink := l.stopContext(ctx)
-	c, err := startCore(hctx, p, cfg, cc, l, admitted)
-	unlink()
-	release()
+	//goland:noinspection GoResourceLeak // a Conn returned with an error owns its own close (setupCore)
+	c, err := startCore(ctx, p, cfg, cc, l, admitted, wait)
+
 	if err != nil {
 		l.st.rejected.Add(1)
-		if c != nil {
-			// The session was aborted during its handshake (by Close, or
-			// it failed) and still owns p: HandlePipe lasts as long as the
-			// pipe, so that the caller does not close the carrier before
-			// the CONNECTION_CLOSE reached the peer. A peer that
-			// considered the session established would otherwise see a
-			// bare carrier loss and wait to resume it.
-			_ = c.waitPipe(ctx, 0)
-		}
 		return err
 	}
-	reason := ""
-	if l.budget.Pressure() {
-		reason = "memory budget"
-	} else {
-		// Read-locked: handoffs run concurrently, and Close and Shutdown
-		// (write-locked) see every one before they empty the backlog.
-		l.mu.RLock()
-		if l.draining {
-			reason = "draining"
-		} else {
-			// Counted before Accept can return it.
-			l.st.sessions.Add(1)
-			select {
-			case l.accept <- c:
-				// startCore registered the locator before bootstrap I/O.
-				// sessionClosed owns its removal, including handshake failures.
-			default:
-				l.st.sessions.Add(^uint64(0))
-				reason = "backlog"
-			}
-		}
-		l.mu.RUnlock()
+	refuse, err = l.publishBootstrap(ctx, c, wait, refuse, reason)
+	if err != nil {
+		c.Abort(0, "")
+		l.st.rejected.Add(1)
+		return err
 	}
-	if reason != "" {
-		// Refused by policy after its own parameters.
-		c.locked(func() {
-			c.s.Refuse(reason)
-		})
-		_ = c.Wait()
+	if refuse {
 		l.st.refused.Add(1)
 		return errRefused
 	}
-	return c.waitPipe(ctx, 0)
+	return nil
 }
 
-// sessionConfig is a copy of the Config of a new session on p:
-// ListenerConfig.SessionConfig's, checked against the listener's, or
-// Config.
+// The provisional driver runs the bootstrap handshake under setup
+// ownership. Publication or refusal decides the attachment only after
+// establishment. The listener lock serializes publishers with its cutoff.
+func (l *Listener) publishBootstrap(ctx context.Context, c *Conn, wait *attachment, refuse bool, reason string) (bool, error) {
+	c.lock()
+	defer c.unlock()
+	if c.closing || c.s.State() >= core.StateClosing {
+		return false, c.errLocked()
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if l.stopCtx.Err() != nil {
+		return false, net.ErrClosed
+	}
+	state := setupAttached
+	switch {
+	case refuse:
+	case l.shuttingDown:
+		refuse, reason = true, l.drainReason
+	case l.budget.Pressure():
+		refuse, reason = true, "memory budget"
+	case len(l.accept) == cap(l.accept):
+		refuse, reason = true, "backlog"
+	}
+	if refuse {
+		state = setupRejecting
+	}
+	if wait != nil {
+		if err := wait.commitLocked(ctx, setupBootstrap, state); err != nil {
+			return false, err
+		}
+	}
+	if refuse {
+		c.s.SetNow(c.clk.now())
+		c.s.Refuse(reason)
+	} else {
+		if !l.registry.publish(c) {
+			return false, net.ErrClosed
+		}
+		l.st.sessions.Add(1)
+		l.accept <- c
+	}
+	c.provisional = false
+	if c.publication != nil {
+		close(c.publication)
+		c.publication = nil
+	}
+	return refuse, nil
+}
+
+// A locator can be visible before the bootstrap has reached the backlog.
+func (c *Conn) waitPublication(ctx context.Context) error {
+	if c.lst == nil {
+		return nil
+	}
+	var published chan struct{}
+	c.peek(func() {
+		if c.provisional {
+			if c.publication == nil {
+				c.publication = make(chan struct{})
+			}
+			published = c.publication
+		}
+	})
+	if published == nil {
+		return nil
+	}
+	select {
+	case <-published:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.lst.done:
+		return net.ErrClosed
+	case <-c.done:
+		return c.closedErr()
+	}
+}
+
+// sessionConfig returns the listener's immutable Config or a copy of the
+// callback's Config checked against it.
 func (l *Listener) sessionConfig(ctx context.Context, p PipeIO, admitted any, src netip.AddrPort) (*Config, error) {
 	f := l.cfg.SessionConfig
 	if f == nil {
-		return l.cfg.Config.Clone(), nil
+		return l.cfg.Config, nil
 	}
 	info := &CarrierInfo{Source: src, Peer: peerOf(p)}
 	if !info.Source.IsValid() {
@@ -1132,7 +1255,7 @@ func (l *Listener) sessionConfig(ctx context.Context, p PipeIO, admitted any, sr
 		return nil, fmt.Errorf("zmux: SessionConfig: %w", err)
 	}
 	if cfg == nil {
-		return l.cfg.Config.Clone(), nil
+		return l.cfg.Config, nil
 	}
 	if c := cfg.clock(); c != nil && !sameClock(c, l.cfg.Config.clock()) {
 		return nil, fmt.Errorf("%w: SessionConfig returned a Clock other than the listener's", ErrInvalidConfig)
@@ -1174,23 +1297,20 @@ func (a *ListenerAdapter) KnownJoin(prefix []byte) (known bool, need int) {
 	if err != nil {
 		return false, 0
 	}
-	l.regMu.Lock()
-	_, ok := l.sessions[string(h.Locator)]
-	l.regMu.Unlock()
+	ok := l.registry.lookup(string(h.Locator)) != nil
 	return ok, 0
 }
 
 // join runs the acceptor's side of a Hello. The carrier keeps its
 // pending slot until it is Confirmed.
-func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, release func()) error {
+func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, wait *attachment) error {
 	jf := join.Stream
 	if p.Framing == FramingRecords {
 		jf = join.Message
 	}
 	reject := func(mode RecordMode, reason string) error {
 		l.st.rejected.Add(1)
-		l.onReject(ctx, p, RejectInfo{Profile: join.ProfileJoin, RecordMode: mode, Reason: reason, Src: hint.Source})
-		closePipe(p)
+		l.onReject(p, wait, RejectInfo{Profile: join.ProfileJoin, RecordMode: mode, Reason: reason, Src: hint.Source})
 		return errRejected
 	}
 	h, _, err := join.ParseHelloExact(b, jf)
@@ -1200,10 +1320,8 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 	if err != nil {
 		return reject(0, "malformed")
 	}
-	l.regMu.Lock()
-	c, closed := l.sessions[string(h.Locator)], l.rclosed
-	l.regMu.Unlock()
-	if closed {
+	c := l.registry.lookup(string(h.Locator))
+	if l.stopCtx.Err() != nil {
 		closePipe(p)
 		l.st.refused.Add(1)
 		return errRefused
@@ -1213,9 +1331,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 	}
 	if l.budget.Pressure() {
 		// Under pressure only a join that lets a suspended session resume.
-		l.regMu.Lock()
-		susp := c.inSusp
-		l.regMu.Unlock()
+		susp := c.inSusp.Load()
 		if !susp {
 			return reject(RecordMode(h.Mode), "memory_pressure")
 		}
@@ -1225,7 +1341,15 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 	if es, ok := p.W.(EarlyServerCarrier); ok && es.UsedEarlyData() {
 		timer := timeshim.NewTimer(l.clk, l.cfg.Config.handshakeTimeout())
 		defer timer.Stop()
+		var failed <-chan struct{}
+		if f, ok := es.(interface{ HandshakeFailed() <-chan struct{} }); ok {
+			failed = f.HandshakeFailed()
+		}
 		select {
+		case <-failed:
+			closePipe(p)
+			l.countSetupFailure()
+			return errRejected
 		case <-es.HandshakeComplete():
 		case <-timer.C:
 			closePipe(p)
@@ -1249,12 +1373,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 		}
 	}
 	// Closing the listener ends the handshake, not an attached pipe.
-	hctx, unlink := l.stopContext(ctx)
-	id, err := c.acceptHello(hctx, p, h, binding, hint.Admitted, l.lim.Load().MaxPendingPerSession)
-	unlink()
-	if err == nil {
-		release() // Confirmed: the carrier is the session's
-	}
+	err = c.acceptHello(ctx, p, h, binding, hint.Admitted, l.lim.Load().MaxPendingPerSession, wait)
 	if err != nil {
 		if errors.Is(err, errUnknownSuite) {
 			return reject(RecordMode(h.Mode), "unknown_suite")
@@ -1271,7 +1390,7 @@ func (l *Listener) join(ctx context.Context, p PipeIO, b []byte, hint PipeHint, 
 		return err
 	}
 	l.st.joins.Add(1)
-	return c.waitPipe(ctx, id)
+	return nil
 }
 
 // joinLinger bounds how long a carrier that carried a refusal is read
@@ -1290,7 +1409,7 @@ func (l *Listener) lingerClose(ctx context.Context, p PipeIO) {
 	ctx, cancelT := timeshim.WithTimeout(ctx, l.clk, joinLinger)
 	defer cancelT()
 	// A blocked half-close or read ends with the carrier.
-	stop := context.AfterFunc(ctx, func() { closePipe(p) })
+	stop := interruptOnCancel(ctx, func() { closePipe(p) })
 	defer stop()
 	if cw, ok := p.W.(CloseWriter); ok {
 		_ = cw.CloseWrite()
@@ -1305,7 +1424,7 @@ func (l *Listener) lingerClose(ctx context.Context, p PipeIO) {
 // default (RejectStall for a transform's rejection before
 // authentication, RejectClose for a join), and stalls it if so. The
 // caller closes p.
-func (l *Listener) onReject(ctx context.Context, p PipeIO, info RejectInfo) {
+func (l *Listener) onReject(p PipeIO, wait *attachment, info RejectInfo) {
 	act := RejectClose
 	if info.Profile != join.ProfileJoin {
 		act = RejectStall
@@ -1313,8 +1432,8 @@ func (l *Listener) onReject(ctx context.Context, p PipeIO, info RejectInfo) {
 	if f := l.cfg.OnReject; f != nil && !safeLog(l.cfg.Logger, "ListenerConfig.OnReject", func() { act = f(info) }) {
 		act = RejectClose
 	}
-	if act == RejectStall {
-		l.stall(ctx, p, info)
+	if act == RejectStall && wait != nil {
+		l.stall(wait.ctx, p, wait, info)
 	}
 }
 
@@ -1325,83 +1444,27 @@ func (l *Listener) onReject(ctx context.Context, p PipeIO, info RejectInfo) {
 // rejection; a transform's rejection at the handshake timeout, at most the
 // listener's stall bound (Admission.StallMax; without one drawn when the
 // listener was made).
-func (l *Listener) stall(ctx context.Context, p PipeIO, info RejectInfo) {
-	slot, _ := ctx.Value(slotKey{}).(*core.PendingSlot)
-	evicted := make(chan struct{})
-	l.pmu.Lock()
-	ok := slot != nil && !l.pclosed && l.pending.Stall(slot, sync.OnceFunc(func() { close(evicted) }))
-	l.pmu.Unlock()
-	if !ok {
+func (l *Listener) stall(ctx context.Context, p PipeIO, wait *attachment, info RejectInfo) {
+	if wait == nil {
 		return
 	}
-	defer func() {
-		l.pmu.Lock()
-		l.pending.Unstall(slot)
-		l.pmu.Unlock()
-	}()
 	markTaken(p)
-	var d time.Duration
-	switch {
-	case info.Profile != join.ProfileJoin:
+	d := l.cfg.Config.joinTimeout()
+	if info.Profile != join.ProfileJoin {
 		d = min(l.cfg.Config.handshakeTimeout(), l.stallMax)
-	default:
-		d = l.cfg.Config.joinTimeout()
 	}
-	t := timeshim.NewTimer(l.clk, d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-	case <-ctx.Done():
-	case <-l.done:
-	case <-evicted:
-	}
-}
-
-// addLocator lets joins name a session by a Locator of a new epoch.
-func (l *Listener) addLocator(c *Conn, loc []byte) {
-	l.regMu.Lock()
-	defer l.regMu.Unlock()
-	if _, live := l.live[c]; live && !l.rclosed {
-		k := string(loc)
-		l.sessions[k] = c
-		if !slices.Contains(c.lstLocs, k) {
-			c.lstLocs = append(c.lstLocs, k)
-		}
-	}
-}
-
-// removeLocator forgets the Locator of a deleted epoch.
-func (l *Listener) removeLocator(c *Conn, loc []byte) {
-	l.regMu.Lock()
-	defer l.regMu.Unlock()
-	k := string(loc)
-	if l.sessions[k] == c {
-		delete(l.sessions, k)
-	}
-	c.lstLocs = slices.DeleteFunc(c.lstLocs, func(x string) bool { return x == k })
-}
-
-// sessionClosed forgets a session that ended.
-func (l *Listener) sessionClosed(c *Conn) {
-	l.regMu.Lock()
-	defer l.regMu.Unlock()
-	delete(l.live, c)
-	for _, k := range c.lstLocs {
-		if l.sessions[k] == c {
-			delete(l.sessions, k)
-		}
-	}
-	c.lstLocs = nil
-	l.dropSuspended(c)
+	wait.stall(ctx, d, nil, true, func(ctx context.Context) { <-ctx.Done(); closePipe(p) })
 }
 
 // sessionSuspended records a suspension and returns the sessions to close
 // beyond MaxSuspended (closed by the caller outside every lock).
-func (l *Listener) sessionSuspended(c *Conn) []*Conn {
-	l.regMu.Lock()
-	defer l.regMu.Unlock()
+func (l *Listener) sessionSuspended(c *Conn) []suspension {
+	l.suspMu.Lock()
+	defer l.suspMu.Unlock()
 	l.dropSuspended(c)
-	c.inSusp, c.suspPrev, c.suspNext = true, l.suspTail, nil
+	c.suspGeneration++
+	c.inSusp.Store(true)
+	c.suspPrev, c.suspNext = l.suspTail, nil
 	if l.suspTail == nil {
 		l.suspHead = c
 	} else {
@@ -1413,25 +1476,25 @@ func (l *Listener) sessionSuspended(c *Conn) []*Conn {
 }
 
 // trimSuspended drops the longest-suspended sessions beyond MaxSuspended
-// and returns them, for the caller to close outside every lock. Under regMu.
-func (l *Listener) trimSuspended() []*Conn {
-	var over []*Conn
+// and returns them, for the caller to close outside every lock. Under suspMu.
+func (l *Listener) trimSuspended() []suspension {
+	var over []suspension
 	for l.suspN > l.lim.Load().MaxSuspended {
 		old := l.suspHead
 		l.dropSuspended(old)
-		over = append(over, old)
+		over = append(over, suspension{old, old.suspGeneration})
 	}
 	return over
 }
 
 func (l *Listener) sessionResumed(c *Conn) {
-	l.regMu.Lock()
-	defer l.regMu.Unlock()
+	l.suspMu.Lock()
+	defer l.suspMu.Unlock()
 	l.dropSuspended(c)
 }
 
 func (l *Listener) dropSuspended(c *Conn) {
-	if !c.inSusp {
+	if !c.inSusp.Load() {
 		return
 	}
 	if c.suspPrev == nil {
@@ -1444,7 +1507,8 @@ func (l *Listener) dropSuspended(c *Conn) {
 	} else {
 		c.suspNext.suspPrev = c.suspPrev
 	}
-	c.inSusp, c.suspPrev, c.suspNext = false, nil, nil
+	c.inSusp.Store(false)
+	c.suspPrev, c.suspNext = nil, nil
 	l.suspN--
 }
 
@@ -1452,42 +1516,39 @@ func (l *Listener) dropSuspended(c *Conn) {
 
 // The half holds its slots until the pair is complete, and the pair goes
 // on with those of the half that completed it; release gives them back.
-func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, release func()) error {
-	tok, err := base64.RawURLEncoding.DecodeString(hint.Pair)
-	if err != nil || len(tok) != 16 {
+func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, wait *attachment) error {
+	reject := func() error {
 		closePipe(p)
 		l.st.rejected.Add(1)
 		return errRejected
 	}
 	var t [16]byte
-	copy(t[:], tok)
+	readOnly := p.R != nil && p.W == nil
+	writeOnly := p.W != nil && p.R == nil
+	if len(hint.Pair) != base64.RawURLEncoding.EncodedLen(len(t)) || hint.Uplink && !readOnly || !hint.Uplink && !writeOnly {
+		return reject()
+	}
+	n, err := base64.RawURLEncoding.Strict().Decode(t[:], []byte(hint.Pair))
+	if err != nil || n != len(t) {
+		return reject()
+	}
 	hto := l.cfg.Config.handshakeTimeout()
-	me := &pairWait{p: p, admitted: hint.Admitted, paired: make(chan error, 1), done: make(chan error, 1), end: make(chan struct{})}
+	me := &pairWait{ctx: ctx, p: p, admitted: hint.Admitted, wait: wait, done: make(chan error, 1)}
 	l.mu.Lock()
 	res, partner := l.pairing.Offer(t, hint.Uplink, me)
 	l.mu.Unlock()
 	switch res {
 	case core.PairReject:
-		closePipe(p)
-		l.st.rejected.Add(1)
-		return errRejected
+		return reject()
 	case core.PairWait:
 		timer := timeshim.NewTimer(l.clk, hto)
 		defer timer.Stop()
 		select {
-		case err := <-me.paired:
-			release() // the pair is complete: its slots are the partner's
-			if err == nil {
-				err = <-me.done
-			}
-			if err != nil {
-				return err
-			}
-			<-me.end
-			return nil
+		case err := <-me.done:
+			return err
 		case <-timer.C:
 		case <-ctx.Done():
-		case <-l.done:
+		case <-l.stopCtx.Done():
 		}
 		l.mu.Lock()
 		mine := l.pairing.Withdraw(t, me)
@@ -1499,24 +1560,20 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, rele
 				l.st.rejected.Add(1) // abandoned by its caller
 				return ctx.Err()
 			}
-			if l.isClosed() {
+			if l.stopCtx.Err() != nil {
 				l.st.refused.Add(1)
 				return net.ErrClosed
 			}
 			l.st.timedOut.Add(1) // no partner within the handshake timeout
 			return errTimedOut
 		}
-		// A partner took this carrier meanwhile: it is the session's now.
-		release()
-		if err := <-me.done; err != nil {
-			return err
-		}
-		<-me.end
-		return nil
+		// The partner took both halves and will report their shared outcome.
+		return <-me.done
 	case core.PairDone:
 	}
 	other := partner.(*pairWait)
-	other.paired <- nil
+	other.wait.pipe = PipeIO{}
+	other.wait.leave() // The pair keeps the completing half's slots.
 	up, down, admitted := p, other.p, hint.Admitted
 	if !hint.Uplink {
 		up, down, admitted = other.p, p, other.admitted
@@ -1525,20 +1582,50 @@ func (l *Listener) handlePair(ctx context.Context, p PipeIO, hint PipeHint, rele
 	// write is the writing half's.
 	both := owned(PipeIO{R: up.R, W: down.W, Framing: up.Framing, Label: up.Label, Carrier: up.Carrier, FateGroup: up.FateGroup,
 		WriteOverhead: down.WriteOverhead, MaxRecord: down.MaxRecord, Variant: up.Variant})
-	// Closing one half is no pipe event, so the pipe does not live by the context of
-	// whichever request arrived second. WrapPipe runs on the pair, and classification
-	// again, so that a pair can start a session or carry a Join.
-	ctx = context.WithoutCancel(ctx)
+	// Once paired, neither individual request can cancel the combined setup.
+	first, second := other.ctx, ctx
+	ctx, cancel := l.stopContext(context.WithoutCancel(second))
+	abandon := func() {
+		if first.Err() != nil && second.Err() != nil {
+			cancel()
+		}
+	}
+	stopFirst := context.AfterFunc(first, abandon)
+	stopSecond := context.AfterFunc(second, abandon)
+	unlink := func() { stopFirst(); stopSecond(); cancel() }
+	abandon()
 	inner := PipeHint{Admitted: admitted, Source: hint.Source}
-	if both, err = l.wrapPipe(ctx, both, inner); err == nil {
-		err = l.handleAdmitted(ctx, both, inner, release)
+	partnerOwner := other.wait
+	// The driver is reserved by the completing attachment. Each half
+	// contributes one reference, released only after its own request
+	// tail and all exclusive work have ended.
+	pair := newAttachment(l, other.wait.done != nil || wait.done != nil)
+	pair.refs.Store(2) // initialized before either half can release it
+	pair.onEnd = func() { l.mu.Lock(); l.pairing.Forget(t); l.mu.Unlock() }
+	partnerOwner.pair, wait.pair = pair, pair
+	if firstHead := partnerOwner.head; firstHead != nil {
+		secondHead := wait.head
+		wait.head = func(ctx context.Context) error {
+			if err := firstHead(ctx); err != nil {
+				return err
+			}
+			if secondHead != nil {
+				return secondHead(ctx)
+			}
+			return nil
+		}
+		partnerOwner.head = nil
+	}
+	partnerOwner.onEnd, wait.onEnd = pair.release, pair.release
+	wait.parentsEnded = func() bool { return first.Err() != nil && second.Err() != nil }
+	wait.pipe = both
+	err = l.handleAdmitted(ctx, inner, wait)
+	if wait.state.Load() == setupStalled {
+		wait.onEnd = func() { unlink(); pair.release() }
+	} else {
+		unlink()
 	}
 	other.done <- err
-	close(other.end)
-	// The token stays used while its session lives (no second pairing).
-	l.mu.Lock()
-	l.pairing.Forget(t)
-	l.mu.Unlock()
 	return err
 }
 
@@ -1548,14 +1635,14 @@ func withPrefix(p PipeIO, first []byte) PipeIO {
 	if len(first) == 0 {
 		return p
 	}
-	if p.Framing == FramingRecords {
-		p.R = &prefixMessages{halfCaps: viewOf(p.R), first: first, r: p.R}
-		return p
-	}
 	r := p.R
-	if carrierio.SameHalf(p.R, p.W) {
-		// Keep the write half as it is; the read half is wrapped.
-		r = readOnly{halfCaps: viewOf(p.R), r: p.R}
+	if carrierio.SameHalf(r, p.W) {
+		// The write half owns the close of a shared carrier in either framing.
+		r = readOnly{halfCaps: viewOf(r), r: r}
+	}
+	if p.Framing == FramingRecords {
+		p.R = &prefixMessages{halfCaps: viewOf(r), first: first, r: r}
+		return p
 	}
 	p.R = &prefixReader{halfCaps: viewOf(p.R), pre: bytes.Clone(first), r: r}
 	return p

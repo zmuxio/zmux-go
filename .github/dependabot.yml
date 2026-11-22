@@ -8,11 +8,8 @@ updates:
       actions:
         patterns: ["*"]
 
-  # Every module of the workspace. The sibling modules of this repository are
-  # resolved through go.work, and quic-go moves with webtransport-go (see the
-  # weekly workflow), so none of them is proposed here. The root directory
-  # holds go.work, so its updates reach every workspace module: quic-go and
-  # webtransport-go are ignored here as well.
+  # Update external dependencies. Sibling module requirements follow the
+  # release order, and QUIC dependencies are checked in the weekly workflow.
   - package-ecosystem: gomod
     directories:
       - /

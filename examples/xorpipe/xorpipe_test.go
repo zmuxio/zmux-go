@@ -184,7 +184,7 @@ func TestPlainNextToTransform(t *testing.T) {
 	}
 	defer func() { _ = c.Close(); _ = sc.Close(); _ = c.Wait(); _ = sc.Wait() }()
 	echo(t, ctx, c, sc)
-	if vs := s.lst.VariantStats(); !slices.Contains(vs, zmux.VariantStat{Accepted: 1}) {
+	if vs := s.lst.VariantStats(); len(vs) != 0 {
 		t.Fatalf("variant stats %+v", vs)
 	}
 }

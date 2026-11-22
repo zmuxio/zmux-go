@@ -58,6 +58,8 @@ func ClassifyFirstBytes(b []byte, f zmux.Framing) (c FirstBytes, need int) {
 // a lane's first record. A transform that handles only its own
 // handshakes passes such a carrier on: the session then checks its Lane Key, connection
 // and record mode. need is the total number of bytes needed when more are wanted, else 0.
+//
+//goland:noinspection GoUnusedExportedFunction // used by the seal module
 func FirstRecordIsLane(b []byte, f zmux.Framing) (lane bool, need int) {
 	return wire.FirstRecordIsLane(b, f == zmux.FramingRecords)
 }

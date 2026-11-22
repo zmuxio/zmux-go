@@ -13,6 +13,7 @@ const (
 // Class is what the first byte of a carrier tells.
 type Class uint8
 
+//goland:noinspection GoUnusedConst // used by the seal module
 const (
 	// ClassIncomplete means no byte has arrived on a byte stream.
 	ClassIncomplete Class = iota

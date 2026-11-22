@@ -13,8 +13,8 @@ import (
 )
 
 type lockedBuf struct {
-	mu sync.Mutex
 	b  bytes.Buffer
+	mu sync.Mutex
 }
 
 func (l *lockedBuf) Write(p []byte) (int, error) {

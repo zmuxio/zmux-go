@@ -10,6 +10,8 @@ func capacitySession() *Session {
 }
 func capacityExtra(s *Session) *Pipe {
 	p := &Pipe{id: uint64(len(s.pipes) * 2), mp: &attach{out: OutActive, in: InOpen, probOpt: -1, weight: 1}, out: &outDir{lanes: []*outLane{{}}}}
+	s.enablePathQuality(s.pipes[0])
+	s.enablePathQuality(p)
 	s.pipes = append(s.pipes, p)
 	return p
 }
@@ -22,7 +24,7 @@ func capacityMP() *Session {
 func measuredRate(p *Pipe, rate float64) {
 	e := &p.out.snd.re
 	e.blockedNow = true
-	e.sample(rate, false, false, 0, 0)
+	e.sample(rate, false, false, 0, 0, nil)
 	e.blockedNow = false
 }
 func takeCapacity(s *Session) (Event, bool) {
@@ -48,7 +50,7 @@ func TestCapacityCountsAcceptedApplicationLimitedSampleWithoutEndingPlacement(t 
 	p := s.pipes[0]
 	s.SetCapacityFloor(CapacityFloor{Rate: 1500000, RateRatio: 1.01})
 	wantCapacity(t, s, EvCapacityBelow, 0)
-	p.out.snd.re.sample(2000000, true, false, 0, 1)
+	p.out.snd.re.sample(2000000, true, false, 0, 1, nil)
 	if p.out.snd.re.measured {
 		t.Fatal("application-limited sample ended placement")
 	}
@@ -57,7 +59,7 @@ func TestCapacityCountsAcceptedApplicationLimitedSampleWithoutEndingPlacement(t 
 }
 func TestCapacityRejectedSampleDoesNotCountTheInitialEstimate(t *testing.T) {
 	s := capacitySession()
-	s.pipes[0].out.snd.re.sample(500000, true, false, 0, 1)
+	s.pipes[0].out.snd.re.sample(500000, true, false, 0, 1, nil)
 	s.SetCapacityFloor(CapacityFloor{Rate: 100000})
 	wantCapacity(t, s, EvCapacityBelow, 0)
 }
@@ -125,7 +127,7 @@ func TestCapacityPenaltyEntryAndLastAcknowledgementNeedNoLaterTraffic(t *testing
 	measuredRate(p, 4000000)
 	s.SetCapacityFloor(CapacityFloor{Rate: 2500000, RateRatio: 1.01})
 	p.out.snd.so = 100
-	s.penalize(p)
+	s.penalize(p, true)
 	wantCapacity(t, s, EvCapacityBelow, 1000000)
 	p.out.snd.cum = 99
 	s.penaltyAcked(p)

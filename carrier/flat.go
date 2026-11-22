@@ -10,4 +10,6 @@ import (
 // into a pooled buffer: one call per batch for a writer whose every call
 // costs a record or a locked hand-over (TLS, a QUIC stream). A
 // zmux.BuffersWriter may implement WriteBuffers with it.
+//
+//goland:noinspection GoUnusedExportedFunction // used by the QUIC and HTTP/3 adapter modules
 func WriteFlat(w io.Writer, bufs [][]byte) (int, error) { return carrierio.WriteFlat(w, bufs) }

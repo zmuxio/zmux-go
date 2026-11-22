@@ -519,12 +519,20 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 			rtt := now.Sub(last.sent)
 			ad := MulD(int64(e.Delay), Microsecond)
 			r := p.rtt()
+			var quality *pathQuality
+			if p.mp != nil {
+				quality = p.mp.quality
+			}
 			// A late entry (ACK Delay above the peer's maximum, typically
 			// the redundant copy) gives no RTT sample, unless the pipe has
 			// had none for 1 s or has never had one.
 			late := ad > a.peerDelay && ps.rttAt != 0 && now.Sub(ps.rttAt) < Second
 			if !late && (p.sampleOK(last.sent) || last.probe && ps.paced(i, now)) {
-				ev.rtt = r.update(rtt, minD(ad, a.peerDelay), a.peerDelay, now, s.mp != nil && s.quiet())
+				quiet := p.mp != nil && s.quiet()
+				ev.rtt = r.update(rtt, minD(ad, a.peerDelay), a.peerDelay, now, quiet)
+				if quality != nil {
+					quality.sampleRTT(rtt, minD(ad, a.peerDelay), now, quiet)
+				}
 				ev.rttSentAt = last.sent
 				ps.rttAt = now
 				s.tuneAckSample(r.min)
@@ -536,7 +544,7 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 			iv := maxD(last.sent.Sub(last.firstSentAt), now.Sub(last.deliveredAt))
 			proven := r.has && r.min > 0 && rtt-minD(ad, a.peerDelay)-r.min >= 4*r.min
 			if iv > 0 && (proven || p.sampleOK(last.sent)) {
-				ev.rate = ps.re.sample(float64(ps.delivered-last.delivered)*1e9/float64(iv), last.bubble, proven, last.epoch, now)
+				ev.rate = ps.re.sample(float64(ps.delivered-last.delivered)*1e9/float64(iv), last.bubble, proven, last.epoch, now, quality)
 			}
 			ps.firstSentAt = last.sent
 		}

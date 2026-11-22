@@ -172,7 +172,7 @@ func TestQUICPipeAndLanes(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	var lanes int
+	var lanes uint64
 	for _, p := range c.PipeStats() {
 		lanes += p.LanesOut
 	}
@@ -366,8 +366,22 @@ func TestQUICPool(t *testing.T) {
 		t.Fatalf("fate groups %d %v", first.FateGroup, fates)
 	}
 	echo(t, c, s, 1<<20)
-	if n := len(c.PipeStats()); n != 3 {
-		t.Fatalf("%d pipes", n)
+	for _, endpoint := range []*zmux.Conn{c, s} {
+		stats := endpoint.PipeStats()
+		if len(stats) != 3 {
+			t.Fatalf("%d pipes", len(stats))
+		}
+		for _, st := range stats {
+			sample := st.CarrierSample
+			if sample == nil || sample.Source != zmux.CarrierSourceQUICGo || sample.Counts.QUIC == nil ||
+				sample.Counts.QUIC.PacketsSent == 0 || sample.Generation != 0 {
+				t.Fatalf("pipe %d (out=%v, in=%v, failure=%v): unexpected carrier sample %+v", st.PipeID, st.Outbound, st.Inbound, st.Failure, sample)
+			}
+		}
+		a, b, replacement := stats[0].CarrierSample, stats[1].CarrierSample, stats[2].CarrierSample
+		if a.CarrierID != b.CarrierID || a.CarrierID == replacement.CarrierID {
+			t.Fatalf("pooled connection identities %v, %v, %v", a.CarrierID, b.CarrierID, replacement.CarrierID)
+		}
 	}
 }
 
@@ -531,7 +545,7 @@ func TestQUICLanesHonourMaxRecord(t *testing.T) {
 		wg.Go(func() { echo(t, c, s, 2<<20) })
 	}
 	wg.Wait()
-	var lanes int
+	var lanes uint64
 	for _, ps := range c.PipeStats() {
 		lanes += ps.LanesOut
 		// A record is its Size field and at most capRec bytes.

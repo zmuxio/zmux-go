@@ -587,15 +587,15 @@ func matchFrame(pat, got map[string]any) bool {
 func matchParams(pat, got map[string]any) bool {
 	block, _ := got["block"].([]byte)
 	type pv struct {
-		id uint64
 		v  []byte
+		id uint64
 	}
 	var ps []pv
 	b := block
 	for len(b) > 0 {
 		id, n := varint.ConsumeVarint(b)
 		l, m := varint.ConsumeVarint(b[n:])
-		ps = append(ps, pv{id, b[n+m : n+m+int(l)]})
+		ps = append(ps, pv{id: id, v: b[n+m : n+m+int(l)]})
 		b = b[n+m+int(l):]
 	}
 	find := func(id uint64) ([]byte, bool) {

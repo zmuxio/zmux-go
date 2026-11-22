@@ -225,21 +225,59 @@ type handshakeVector struct {
 	Name string `json:"name"`
 	parties
 	// PQConfidential is the Profile's PQ confidentiality.
-	PQConfidential bool `json:"pq_confidential"`
+	PQConfidential  bool `json:"pq_confidential"`
+	RecordsUseSplit bool `json:"records_use_split"`
 	// VerifyServer is the client's verification of message 2, VerifyClient
 	// the server's of message 3, when the vector has one.
-	VerifyServer    *verifyVector `json:"verify_server,omitempty"`
-	VerifyClient    *verifyVector `json:"verify_client,omitempty"`
-	NoiseName       string        `json:"noise_name"`
-	Prologue        hexb          `json:"prologue"`
-	Messages        []msgVector   `json:"messages"`
-	HandshakeHash   hexb          `json:"handshake_hash"`
-	ChainingKey     hexb          `json:"chaining_key"`
-	SplitC1         hexb          `json:"split_c1"`
-	SplitC2         hexb          `json:"split_c2"`
-	RecordsUseSplit bool          `json:"records_use_split"`
-	ExporterSecret  hexb          `json:"exporter_secret"`
-	Exporter        exportVector  `json:"exporter"`
+	VerifyServer   *verifyVector `json:"verify_server,omitempty"`
+	VerifyClient   *verifyVector `json:"verify_client,omitempty"`
+	NoiseName      string        `json:"noise_name"`
+	Prologue       hexb          `json:"prologue"`
+	Messages       []msgVector   `json:"messages"`
+	HandshakeHash  hexb          `json:"handshake_hash"`
+	ChainingKey    hexb          `json:"chaining_key"`
+	SplitC1        hexb          `json:"split_c1"`
+	SplitC2        hexb          `json:"split_c2"`
+	ExporterSecret hexb          `json:"exporter_secret"`
+	Exporter       exportVector  `json:"exporter"`
+}
+
+// MarshalJSON keeps the key order of the shared specification vectors.
+func (v handshakeVector) MarshalJSON() ([]byte, error) {
+	out := struct {
+		Name string `json:"name"`
+		parties
+		PQConfidential  *bool         `json:"pq_confidential"`
+		VerifyServer    *verifyVector `json:"verify_server,omitempty"`
+		VerifyClient    *verifyVector `json:"verify_client,omitempty"`
+		NoiseName       string        `json:"noise_name"`
+		Prologue        hexb          `json:"prologue"`
+		Messages        []msgVector   `json:"messages"`
+		HandshakeHash   hexb          `json:"handshake_hash"`
+		ChainingKey     hexb          `json:"chaining_key"`
+		SplitC1         hexb          `json:"split_c1"`
+		SplitC2         hexb          `json:"split_c2"`
+		RecordsUseSplit *bool         `json:"records_use_split"`
+		ExporterSecret  hexb          `json:"exporter_secret"`
+		Exporter        exportVector  `json:"exporter"`
+	}{
+		Name:            v.Name,
+		parties:         v.parties,
+		PQConfidential:  &v.PQConfidential,
+		VerifyServer:    v.VerifyServer,
+		VerifyClient:    v.VerifyClient,
+		NoiseName:       v.NoiseName,
+		Prologue:        v.Prologue,
+		Messages:        v.Messages,
+		HandshakeHash:   v.HandshakeHash,
+		ChainingKey:     v.ChainingKey,
+		SplitC1:         v.SplitC1,
+		SplitC2:         v.SplitC2,
+		RecordsUseSplit: &v.RecordsUseSplit,
+		ExporterSecret:  v.ExporterSecret,
+		Exporter:        v.Exporter,
+	}
+	return json.Marshal(out)
 }
 
 func item(typ, n int, val ...byte) []byte {
@@ -497,7 +535,6 @@ func runNegative(t testing.TB, v negativeVector) (string, int) {
 // the wire units that were produced before anything failed.
 type crafted struct {
 	v                            parties
-	raw                          [][]byte
 	iEph, rEph, iStatic, rStatic []byte
 	// iStaticMsg3 replaces the initiator's static key only as it is sent.
 	iStaticMsg3 []byte
@@ -505,6 +542,7 @@ type crafted struct {
 	// changes the responder's KEM ciphertext before it is sent.
 	iEK []byte
 	rCT func(ct []byte) []byte
+	raw [][]byte
 }
 
 func (c crafted) run(t testing.TB) [][]byte {
@@ -656,12 +694,12 @@ func genNegatives(t testing.TB) []negativeVector {
 
 	// A changed ciphertext decapsulates to another secret: auth, never kex.
 	for _, c := range []struct {
-		name string
 		f    func([]byte) []byte
+		name string
 	}{
-		{"bit-flip", func(ct []byte) []byte { return flip(ct, 100) }},
-		{"all-zero", func(ct []byte) []byte { return make([]byte, len(ct)) }},
-		{"all-ff", func(ct []byte) []byte { return bytes.Repeat([]byte{0xff}, len(ct)) }},
+		{name: "bit-flip", f: func(ct []byte) []byte { return flip(ct, 100) }},
+		{name: "all-zero", f: func(ct []byte) []byte { return make([]byte, len(ct)) }},
+		{name: "all-ff", f: func(ct []byte) []byte { return bytes.Repeat([]byte{0xff}, len(ct)) }},
 	} {
 		add("ciphertext-"+c.name+"-psk", p1, "initiator", "auth", write, read(crafted{v: p1, rCT: c.f}.run(t)[1]))
 		add("ciphertext-"+c.name+"-no-psk", p4, "initiator", "auth", write, read(crafted{v: p4, rCT: c.f}.run(t)[1]))
@@ -717,24 +755,24 @@ func genNegatives(t testing.TB) []negativeVector {
 	nonMinType := []byte{0x40, 0x00, 0x00}
 	for _, c := range []struct {
 		name  string
-		raw   []byte
 		class string
+		raw   []byte
 	}{
-		{"unknown-critical", item(5, 0), "tlv_unknown_critical"},
-		{"order-descending", append(item(14, 0), item(6, 0)...), "tlv_order"},
-		{"duplicate-ignorable", append(item(6, 0), item(6, 0)...), "tlv_order"},
-		{"duplicate-padding", append(item(0, 1, 0), item(0, 1, 0)...), "tlv_order"},
-		{"padding-after-higher-type", append(item(6, 0), item(0, 0)...), "tlv_order"},
-		{"non-minimal-length", nonMinLen, "tlv_non_minimal"},
-		{"non-minimal-type", nonMinType, "tlv_non_minimal"},
-		{"length-beyond-end", item(0, 5, 1, 2), "tlv_truncated"},
-		{"trailing-byte", append(item(0, 0), 0x02), "tlv_truncated"},
+		{name: "unknown-critical", raw: item(5, 0), class: "tlv_unknown_critical"},
+		{name: "order-descending", raw: append(item(14, 0), item(6, 0)...), class: "tlv_order"},
+		{name: "duplicate-ignorable", raw: append(item(6, 0), item(6, 0)...), class: "tlv_order"},
+		{name: "duplicate-padding", raw: append(item(0, 1, 0), item(0, 1, 0)...), class: "tlv_order"},
+		{name: "padding-after-higher-type", raw: append(item(6, 0), item(0, 0)...), class: "tlv_order"},
+		{name: "non-minimal-length", raw: nonMinLen, class: "tlv_non_minimal"},
+		{name: "non-minimal-type", raw: nonMinType, class: "tlv_non_minimal"},
+		{name: "length-beyond-end", raw: item(0, 5, 1, 2), class: "tlv_truncated"},
+		{name: "trailing-byte", raw: append(item(0, 0), 0x02), class: "tlv_truncated"},
 		// Priority: the first violation in byte order; within an item syntax,
 		// then order, then the value and whether the type is known.
-		{"priority-order-before-critical", append(item(6, 0), item(5, 0)...), "tlv_order"},
-		{"priority-truncated-before-order", append(item(6, 0), 0x00, 0x05), "tlv_truncated"},
-		{"priority-critical-before-later-truncation", append(item(5, 0), 0x40), "tlv_unknown_critical"},
-		{"priority-non-minimal-before-order", append(item(6, 0), 0x40, 0x00, 0x00), "tlv_non_minimal"},
+		{name: "priority-order-before-critical", raw: append(item(6, 0), item(5, 0)...), class: "tlv_order"},
+		{name: "priority-truncated-before-order", raw: append(item(6, 0), 0x00, 0x05), class: "tlv_truncated"},
+		{name: "priority-critical-before-later-truncation", raw: append(item(5, 0), 0x40), class: "tlv_unknown_critical"},
+		{name: "priority-non-minimal-before-order", raw: append(item(6, 0), 0x40, 0x00, 0x00), class: "tlv_non_minimal"},
 	} {
 		raw := [][]byte{nil, c.raw}
 		add("payload-psk-"+c.name, p1, "initiator", c.class, write, read(crafted{v: p1, raw: raw}.run(t)[1]))
@@ -742,16 +780,16 @@ func genNegatives(t testing.TB) []negativeVector {
 	}
 	for _, c := range []struct {
 		name  string
-		raw   []byte
 		class string
+		raw   []byte
 	}{
-		{"empty", item(1, 0), "tlv_credentials"},
-		{"credtype-0", item(1, 2, 0, 9), "tlv_credentials"},
-		{"credtype-0-empty-credential", item(1, 1, 0), "tlv_credentials"},
-		{"non-minimal-type", item(1, 3, 0x40, 0x01, 0x00), "tlv_non_minimal"},
-		{"type-truncated", item(1, 1, 0x40), "tlv_truncated"},
-		{"two-items", append(item(1, 2, 1, 0), item(1, 2, 1, 0)...), "tlv_order"},
-		{"empty-before-later-items", append(item(1, 0), item(0, 0)...), "tlv_credentials"},
+		{name: "empty", raw: item(1, 0), class: "tlv_credentials"},
+		{name: "credtype-0", raw: item(1, 2, 0, 9), class: "tlv_credentials"},
+		{name: "credtype-0-empty-credential", raw: item(1, 1, 0), class: "tlv_credentials"},
+		{name: "non-minimal-type", raw: item(1, 3, 0x40, 0x01, 0x00), class: "tlv_non_minimal"},
+		{name: "type-truncated", raw: item(1, 1, 0x40), class: "tlv_truncated"},
+		{name: "two-items", raw: append(item(1, 2, 1, 0), item(1, 2, 1, 0)...), class: "tlv_order"},
+		{name: "empty-before-later-items", raw: append(item(1, 0), item(0, 0)...), class: "tlv_credentials"},
 	} {
 		add("credential-"+c.name, p4, "initiator", c.class, write, read(crafted{v: p4, raw: [][]byte{nil, c.raw}}.run(t)[1]))
 	}

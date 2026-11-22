@@ -78,7 +78,7 @@ func newAtkPKI(t *testing.T) *atkPKI {
 	return &atkPKI{pool: pool, origin: leaf(2), bad: leaf(3)}
 }
 
-// atkServe accepts on a new port until the test ends.
+// atkServe hands each accepted connection to h, which owns it.
 func atkServe(t *testing.T, h func(net.Conn)) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -86,15 +86,8 @@ func atkServe(t *testing.T, h func(net.Conn)) string {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var open []net.Conn
 	t.Cleanup(func() {
 		_ = ln.Close()
-		mu.Lock()
-		for _, c := range open {
-			_ = c.Close()
-		}
-		mu.Unlock()
 		wg.Wait()
 	})
 	wg.Go(func() {
@@ -103,16 +96,22 @@ func atkServe(t *testing.T, h func(net.Conn)) string {
 			if err != nil {
 				return
 			}
-			mu.Lock()
-			open = append(open, c)
-			mu.Unlock()
-			wg.Go(func() {
-				defer func() { _ = c.Close() }()
-				h(c)
-			})
+			wg.Go(func() { h(c) })
 		}
 	})
 	return ln.Addr().String()
+}
+
+// atkRelay owns its accepted sockets until the relay returns or the test ends.
+func atkRelay(t *testing.T, h func(net.Conn)) string {
+	t.Helper()
+	return atkServe(t, func(c net.Conn) {
+		closeConn := sync.OnceFunc(func() { _ = c.Close() })
+		stop := context.AfterFunc(t.Context(), closeConn)
+		defer stop()
+		defer closeConn()
+		h(c)
+	})
 }
 
 func atkConfig() *Config {
@@ -139,7 +138,7 @@ type atkOpts struct {
 
 func newAtkEnv(t *testing.T, o atkOpts) *atkEnv {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
 	t.Cleanup(cancel)
 	ccfg, scfg := atkConfig(), atkConfig()
 	if o.client != nil {
@@ -263,7 +262,7 @@ func (a *tap) bytes() []byte {
 // Hello with answer. No origin stands behind it.
 func (e *atkEnv) rogue(answer []byte) (string, *tap) {
 	a := &tap{}
-	return atkServe(e.t, func(c net.Conn) {
+	return atkRelay(e.t, func(c net.Conn) {
 		in := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{e.pki.bad}, MinVersion: tls.VersionTLS13})
 		b := make([]byte, 64<<10)
 		first := true
@@ -287,7 +286,7 @@ func (e *atkEnv) rogue(answer []byte) (string, *tap) {
 func (e *atkEnv) capture(mode RecordMode) []byte {
 	e.t.Helper()
 	a := &tap{}
-	addr := atkServe(e.t, func(c net.Conn) {
+	addr := atkRelay(e.t, func(c net.Conn) {
 		b := make([]byte, 64<<10)
 		for {
 			n, err := c.Read(b)
@@ -421,25 +420,25 @@ func TestJoinThirdParty(t *testing.T) {
 	fakeReply = append(fakeReply, make([]byte, 16)...)
 	for _, mode := range []RecordMode{RecordSealed, RecordBound, RecordTrusted} {
 		for _, at := range []struct {
-			name   string
 			answer func(id uint64) []byte
+			name   string
 		}{
-			{"A1 silent", nil},
-			{"A2 forged acknowledgement", func(uint64) []byte {
+			{name: "A1 silent", answer: nil},
+			{name: "A2 forged acknowledgement", answer: func(uint64) []byte {
 				return framed(wire.AppendAckEntry(wire.AppendPipeAckHeader(nil, 1), wire.AckEntry{PipeID: 2, Position: 1 << 16}))
 			}},
-			{"A3 forged stream data", func(id uint64) []byte {
+			{name: "A3 forged stream data", answer: func(id uint64) []byte {
 				return framed(append(wire.AppendStreamHeader(nil, id, 0, 6, true, true), "FORGED"...))
 			}},
-			{"A4 forged CONNECTION_CLOSE", func(uint64) []byte {
+			{name: "A4 forged CONNECTION_CLOSE", answer: func(uint64) []byte {
 				return framed(wire.AppendClose(nil, false, wire.ProtocolViolation, 0, nil))
 			}},
-			{"A5 forged Reply", func(uint64) []byte { return fakeReply }},
-			{"A5 record beyond max_record_size", func(uint64) []byte {
+			{name: "A5 forged Reply", answer: func(uint64) []byte { return fakeReply }},
+			{name: "A5 record beyond max_record_size", answer: func(uint64) []byte {
 				return append(varint.AppendVarint(nil, MaxRecordSize+1), 0xff)
 			}},
-			{"A5 length beyond any record", func(uint64) []byte { return varint.AppendVarint(nil, 1<<40) }},
-			{"A5 garbage", func(uint64) []byte { return []byte{2, 0xff, 0xff} }},
+			{name: "A5 length beyond any record", answer: func(uint64) []byte { return varint.AppendVarint(nil, 1<<40) }},
+			{name: "A5 garbage", answer: func(uint64) []byte { return []byte{2, 0xff, 0xff} }},
 		} {
 			t.Run(mode.String()+"/"+at.name, func(t *testing.T) {
 				t.Parallel()
@@ -505,7 +504,7 @@ func TestJoinThirdParty(t *testing.T) {
 // relay carries plaintext between a carrier terminated by the third party and its own
 // connection to the origin.
 func (e *atkEnv) tlsRelay(a *tap) string {
-	return atkServe(e.t, func(c net.Conn) {
+	return atkRelay(e.t, func(c net.Conn) {
 		in := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{e.pki.bad}, MinVersion: tls.VersionTLS13})
 		raw, err := net.Dial("tcp", e.tlsTo)
 		if err != nil {
@@ -573,7 +572,7 @@ func TestJoinSealedRelay(t *testing.T) {
 	secret := atkSecret("sealed-relay")
 	outs := make(chan net.Conn, 1)
 	a := &tap{}
-	addr := atkServe(t, func(in net.Conn) {
+	addr := atkRelay(t, func(in net.Conn) {
 		out, err := net.Dial("tcp", e.addr)
 		if err != nil {
 			return
@@ -903,7 +902,7 @@ func TestReplayBoundOtherCarrierFails(t *testing.T) {
 func TestReplayTakesPipeID(t *testing.T) {
 	t.Parallel()
 	e := newAtkEnv(t, atkOpts{})
-	addr := atkServe(t, func(in net.Conn) {
+	addr := atkRelay(t, func(in net.Conn) {
 		b := make([]byte, 64<<10)
 		n, err := in.Read(b)
 		if err != nil {
@@ -1005,7 +1004,7 @@ func TestJoiningHasNoLiveness(t *testing.T) {
 	}
 	// The path holds the Hello for longer than DeadTimeout.
 	hold := 1500 * time.Millisecond
-	addr := atkServe(t, func(in net.Conn) {
+	addr := atkRelay(t, func(in net.Conn) {
 		time.Sleep(hold)
 		out, err := net.Dial("tcp", e.addr)
 		if err != nil {
@@ -1257,7 +1256,7 @@ func TestCapCheckedAtConfirmed(t *testing.T) {
 	t.Parallel()
 	e := newAtkEnv(t, atkOpts{server: func(c *Config) { c.MaxPipes, c.PipeHeadroom = 2, 1 }})
 	release := make(chan struct{})
-	gated := atkServe(t, func(in net.Conn) {
+	gated := atkRelay(t, func(in net.Conn) {
 		out, err := net.Dial("tcp", e.addr)
 		if err != nil {
 			return
@@ -1626,7 +1625,7 @@ func TestSealedEndAtRecordBoundaryIsAFailure(t *testing.T) {
 	t.Parallel()
 	e := newAtkEnv(t, atkOpts{})
 	r := &finRelay{}
-	addr := atkServe(t, func(in net.Conn) {
+	addr := atkRelay(t, func(in net.Conn) {
 		out, err := net.Dial("tcp", e.addr)
 		if err != nil {
 			return

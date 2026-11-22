@@ -17,9 +17,9 @@ import (
 // session's error; the plain close gives code 0 and an empty reason.
 func TestCloseDelivery(t *testing.T) {
 	for _, c := range []struct {
-		code   zmux.ApplicationErrorCode
 		reason string
-	}{{0x2a, "bye"}, {0, ""}} {
+		code   zmux.ApplicationErrorCode
+	}{{code: 0x2a, reason: "bye"}, {code: 0, reason: ""}} {
 		t.Run(fmt.Sprintf("%#x", uint64(c.code)), func(t *testing.T) {
 			ctx := testContext(t)
 			l := mustNewListener(nil)

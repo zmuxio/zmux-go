@@ -157,7 +157,7 @@ func (s *Session) wantLane(p *Pipe) {
 // LaneOpened attaches the stream the driver opened for a requested lane
 // and returns its lane number.
 // sig wakes the lane's writer.
-func (s *Session) LaneOpened(pipe uint64, info CarrierInfo, sig *Signal) (uint64, bool) {
+func (s *Session) LaneOpened(pipe uint64, info CarrierInfo, sig *WriteSignal) (uint64, bool) {
 	p := s.pipe(pipe)
 	if p == nil || p.out == nil || s.state >= StateClosing {
 		return 0, false
@@ -383,7 +383,7 @@ func (s *Session) tookTurn(p *Pipe, ol *outLane) {
 	ol.served, ol.waiting = true, false
 	for _, x := range p.out.lanes[1:] {
 		if x.waiting {
-			s.wake(x.sig)
+			s.wakeLaneWriter(p, x)
 		}
 	}
 }

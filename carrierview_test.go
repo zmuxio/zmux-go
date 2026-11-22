@@ -13,7 +13,9 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // The classification of every exported interface of the package against
@@ -45,7 +47,6 @@ var (
 		reflect.TypeFor[Aborter](),
 		reflect.TypeFor[BuffersWriter](),
 		reflect.TypeFor[UnsentReporter](),
-		reflect.TypeFor[RetransReporter](),
 		reflect.TypeFor[TLSRecordCarrier](),
 	}
 	// connOnlyCaps are the net.Conn view's (Takeover.Conn) besides.
@@ -144,7 +145,6 @@ func (c *capHalf) CloseWrite() error                                        { c.
 func (c *capHalf) Abort(error)                                              { c.rec("abort") }
 func (c *capHalf) WriteBuffers([][]byte) (int, error)                       { c.rec("wb"); return 7, nil }
 func (c *capHalf) Unsent() (uint64, bool)                                   { return 11, true }
-func (c *capHalf) Retransmitted() (uint64, bool)                            { return 13, true }
 func (c *capHalf) TLSRecords() bool                                         { return true }
 func (c *capHalf) NetConn() net.Conn                                        { return c.Conn }
 
@@ -194,9 +194,6 @@ func TestCarrierViewForwarding(t *testing.T) {
 	if u, ok := conn.(UnsentReporter).Unsent(); u != 11 || !ok {
 		t.Fatal("Unsent")
 	}
-	if r, ok := conn.(RetransReporter).Retransmitted(); r != 13 || !ok {
-		t.Fatal("Retransmitted")
-	}
 	if !conn.(TLSRecordCarrier).TLSRecords() || conn.(NetConner).NetConn() != a {
 		t.Fatal("TLSRecords or NetConn")
 	}
@@ -228,4 +225,76 @@ func takeoverOwnedWriter(w io.WriteCloser) any {
 	p := PipeIO{W: w}
 	q, _ := takeoverPipe(p, nil, newHalfOwner(p))
 	return q.W
+}
+
+// carrierViewReadGate lets the peer finish writing before the server
+// consumes its first inbound bytes.
+type carrierViewReadGate struct {
+	net.Conn
+	afterRead func()
+}
+
+func (g *carrierViewReadGate) Read(p []byte) (int, error) {
+	n, err := g.Conn.Read(p)
+	if n > 0 {
+		g.afterRead()
+	}
+	return n, err
+}
+
+func TestCarrierViewStatsForWriterOnly(t *testing.T) {
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	p := NetPipe(a)
+	p.W = &ownedWriter{
+		sendCaps: sendCaps{viewOf(struct{ io.Writer }{a})},
+		o:        newHalfOwner(p),
+	}
+	read, release := make(chan struct{}), make(chan struct{})
+	openRead := sync.OnceFunc(func() { close(release) })
+	serverPipe := &carrierViewReadGate{Conn: b, afterRead: sync.OnceFunc(func() {
+		close(read)
+		<-release
+	})}
+	serve := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c, err := Server(ctx, serverPipe, nil)
+		serve <- err
+		if err == nil {
+			<-ctx.Done()
+			_ = c.Close()
+		}
+	}()
+	defer func() { openRead(); cancel(); <-done }()
+	c, err := Start(ctx, p, RoleClient, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	// Force the client to finish Start while Server is still waiting for
+	// the client's first record, then let Server report before cleanup.
+	select {
+	case <-read:
+	case <-ctx.Done():
+		t.Fatal("server did not reach the read gate")
+	}
+	openRead()
+	err = <-serve
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats := c.PipeStats(); len(stats) != 1 || stats[0].CarrierSample != nil {
+		t.Fatalf("write-only view stats = %+v", stats)
+	}
+	pipe, ok := c.Pipe(0)
+	if !ok {
+		t.Fatal("bootstrap pipe absent")
+	}
+	if stats, ok := pipe.Stats(); !ok || stats.CarrierSample != nil {
+		t.Fatalf("pipe with no carrier identity: ok = %t, sample = %+v", ok, stats.CarrierSample)
+	}
 }

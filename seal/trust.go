@@ -130,7 +130,9 @@ var (
 	ErrPQAuthRequired = proto.ErrPQAuthRequired
 )
 
-// ErrCredentialsFailed is the error class of a peer that failed verification.
+// ErrCredentialsFailed is the error class for failed credential verification.
+// Use errors.Is with ErrProof, ErrPQAuthRequired, ErrVerifyRejected or
+// ErrVerifyUnavailable to inspect the reason. An Anchor error remains in the chain.
 var ErrCredentialsFailed = proto.ErrCredentialsFailed
 
 // ErrVerifyRejected is a peer the Anchor or the transcript signature

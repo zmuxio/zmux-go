@@ -17,6 +17,8 @@ type Batch struct {
 	recs  []recMark
 	pins  []pin
 	bufs  [][]byte
+	msgs  [][]byte // Messages' result, reused
+	mbuf  []byte   // Messages' storage, reused
 	n     int
 	pos   uint64 // the lane position bytes of the batch, owed to WriteDone
 
@@ -26,9 +28,6 @@ type Batch struct {
 	// Shutdown asks the driver to end the write side gracefully after
 	// writing the batch (after CONNECTION_CLOSE, a drained pipe).
 	Shutdown bool
-
-	msgs [][]byte // Messages' result, reused
-	mbuf []byte   // Messages' storage, reused
 }
 
 type bseg struct {
@@ -220,8 +219,8 @@ func (w *recWriter) nextRecord() bool {
 
 // pendPiece is one buffer segment of a pending STREAM frame.
 type pendPiece struct {
-	data []byte
 	pin  pin
+	data []byte
 }
 
 type pendStream struct {
@@ -378,7 +377,7 @@ func (w *recWriter) stream(id, off uint64, data []byte, pn pin, fin bool) bool {
 		grow := wire.StreamHeaderLen(id, pd.off, pd.n+len(data), true) + len(data) -
 			wire.StreamHeaderLen(id, pd.off, pd.n, true)
 		if w.recBytes+w.pendLen(true)+grow <= w.max() && w.pendLen(true)+grow <= w.budget {
-			pd.more = append(pd.more, pendPiece{data, pn})
+			pd.more = append(pd.more, pendPiece{data: data, pin: pn})
 			pd.n += len(data)
 			pd.fin = fin
 			if !pn.none() {

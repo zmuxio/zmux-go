@@ -22,6 +22,7 @@ import (
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/seal"
 	"github.com/zmuxio/zmux-go/seal/proto"
 )
@@ -198,6 +199,9 @@ func TestModesAndJoin(t *testing.T) {
 			if peer, ok := seal.PeerOf(p); !ok || !bytes.Equal(peer.Static, f.node.PublicKey().Bytes()) || peer.RecordMode != mode {
 				t.Fatalf("PeerOf: %+v %v", peer, ok)
 			}
+			if mode == zmux.RecordTrusted && carrierstats.ProviderOf(p.W) == nil {
+				t.Fatal("raw writer did not forward the TCP sampler")
+			}
 			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4, RecordPolicy: func(zmux.RecordPolicyInput) zmux.RecordMode { return zmux.RecordTrusted }})
 			if err != nil {
 				t.Fatal(err)
@@ -208,6 +212,14 @@ func TestModesAndJoin(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = s.Close() }()
+			if mode == zmux.RecordTrusted {
+				for _, endpoint := range []*zmux.Conn{c, s} {
+					stats := endpoint.PipeStats()
+					if len(stats) != 1 || stats[0].CarrierSample == nil || stats[0].CarrierSample.Source != carrierstats.TCPSource {
+						t.Fatalf("raw seal carrier stats = %+v", stats)
+					}
+				}
+			}
 			if v, ok := zmux.AdmittedAs[*seal.Peer](s); !ok || v.Value != "client 1" || v.RecordMode != mode {
 				t.Fatalf("AdmittedAs: %+v", v)
 			}
@@ -233,8 +245,8 @@ func establishErrs(t *testing.T, ctx context.Context, cc *seal.ClientConfig, sc 
 func establishPair(t *testing.T, ctx context.Context, cc *seal.ClientConfig, sc *seal.ServerConfig, cl, sv zmux.PipeIO) (zmux.PipeIO, zmux.PipeIO, error, error) {
 	t.Helper()
 	type res struct {
-		p   zmux.PipeIO
 		err error
+		p   zmux.PipeIO
 	}
 	ch := make(chan res, 1)
 	go func() {
@@ -242,7 +254,7 @@ func establishPair(t *testing.T, ctx context.Context, cc *seal.ClientConfig, sc 
 		if err != nil {
 			_ = sv.W.Close()
 		}
-		ch <- res{p, err}
+		ch <- res{p: p, err: err}
 	}()
 	p, err := seal.Establish(ctx, cl, cc)
 	r := <-ch
@@ -461,7 +473,7 @@ func TestLaneThroughWrapPipe(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
-	got := func() (out, in int) {
+	got := func() (out, in uint64) {
 		for _, ps := range c.PipeStats() {
 			out = max(out, ps.LanesOut)
 		}
@@ -492,14 +504,14 @@ func TestAnchorWithoutCredential(t *testing.T) {
 	defer cancel()
 	f := newFixture(t)
 	for _, tc := range []struct {
-		name   string
 		anchor seal.Anchor
 		cred   *proto.Credential
+		name   string
 		ok     bool
 	}{
-		{"pin, none", f.client.Anchor, nil, true},
-		{"credential anchor, none", credAnchor{}, nil, false},
-		{"pin, unknown type", f.client.Anchor, &proto.Credential{Type: 77}, true},
+		{name: "pin, none", anchor: f.client.Anchor, cred: nil, ok: true},
+		{name: "credential anchor, none", anchor: credAnchor{}, cred: nil, ok: false},
+		{name: "pin, unknown type", anchor: f.client.Anchor, cred: &proto.Credential{Type: 77}, ok: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cc, sc := f.client, f.server

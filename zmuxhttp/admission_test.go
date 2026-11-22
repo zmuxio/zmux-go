@@ -92,18 +92,18 @@ func TestAdmissionHTTP(t *testing.T) {
 	bodyless := func(v ...string) http.Header { return http.Header{admit.HeaderPrefixAuth: v} }
 	for _, x := range []struct {
 		method string
-		body   []byte
 		h      http.Header
+		body   []byte
 	}{
-		{http.MethodGet, nil, nil},
-		{http.MethodGet, nil, bodyless(field + "=")},
-		{http.MethodGet, nil, bodyless(field[:42])},
-		{http.MethodGet, nil, bodyless(field, base64.RawURLEncoding.EncodeToString(field2))},
-		{http.MethodGet, nil, bodyless(base64.RawURLEncoding.EncodeToString(tok))}, // replayed
-		{http.MethodPost, random, nil},
-		{http.MethodPost, rec, nil},
-		{http.MethodPost, slices.Concat(tok, rec), nil}, // replayed
-		{http.MethodPost, tok[:10], nil},
+		{method: http.MethodGet, body: nil, h: nil},
+		{method: http.MethodGet, body: nil, h: bodyless(field + "=")},
+		{method: http.MethodGet, body: nil, h: bodyless(field[:42])},
+		{method: http.MethodGet, body: nil, h: bodyless(field, base64.RawURLEncoding.EncodeToString(field2))},
+		{method: http.MethodGet, body: nil, h: bodyless(base64.RawURLEncoding.EncodeToString(tok))}, // replayed
+		{method: http.MethodPost, body: random, h: nil},
+		{method: http.MethodPost, body: rec, h: nil},
+		{method: http.MethodPost, body: slices.Concat(tok, rec), h: nil}, // replayed
+		{method: http.MethodPost, body: tok[:10], h: nil},
 	} {
 		got := doReqHeader(t, srv.Client(), x.method, srv.URL+"/p", x.body, x.h)
 		want := doReqHeader(t, site.Client(), x.method, site.URL+"/p", x.body, x.h)

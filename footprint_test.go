@@ -260,9 +260,7 @@ func TestFootprint(t *testing.T) {
 	time.Sleep(16 * time.Second)
 	after = heapNow()
 	check("idle multipath session pair, two pipes", float64(after-before)/fpN, 45056)
-	// The listener side's HandlePipe calls (one per pipe) are the
-	// application's goroutines, not the session's.
-	if g := float64(runtime.NumGoroutine()-g0-2*fpN) / (2 * fpN); g > 4 {
+	if g := float64(runtime.NumGoroutine()-g0) / (2 * fpN); g > 4 {
 		t.Errorf("goroutines per idle multipath session (one end): %.2f, more than 4", g)
 	}
 	closePairs(mv)
@@ -276,7 +274,7 @@ func TestQuietSessionsFireNoTimer(t *testing.T) {
 	f0 := timerFires.Load()
 	v := fpPairs(t, n)
 	defer closePairs(v)
-	time.Sleep(time.Second)
+	time.Sleep(time.Second + writerIdle)
 	settle := timerFires.Load() - f0
 	if settle > 10*2*n {
 		t.Fatalf("%d timer callbacks while %d sessions settled", settle, 2*n)

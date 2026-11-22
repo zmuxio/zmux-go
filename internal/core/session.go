@@ -104,12 +104,13 @@ type Session struct {
 	drain             readDrainState
 	events            []Event
 	evHead            int
+	pollRequests      []PollRequest
 	wakes             []*Signal
 	actions           []Action
 	estW              []*Signal
 	keyW              []*Signal // joins held until the deferred PSK derives the join keys
 	bcast             *Signal   // session-level broadcast for waits that watch state
-	stats             Stats
+	stats             sessionCounters
 	earnBytes         uint64 // own bytes sent: no padding, injections or copies
 	earnSkip          uint64 // bytes earned on a discarded first flight, not earned twice
 	openLocalBidiRecv uint64
@@ -126,6 +127,13 @@ type Session struct {
 
 // Stats are exact counters of the session.
 type Stats struct {
+	sessionCounters
+	StreamGapsStarted, StreamGapsFilled uint64   // with stream tracing enabled
+	StreamGapWait                       Duration // sum over filled gaps
+}
+
+// sessionCounters are the counters kept inline on every session.
+type sessionCounters struct {
 	BytesSent, BytesReceived     uint64
 	RecordsSent, RecordsReceived uint64
 	StreamsOpenedLocal           uint64
@@ -316,9 +324,13 @@ func (s *Session) Config() *Config { return &s.cfg }
 // SessionStats returns a copy of the counters, SuspendedTime including the
 // current suspension.
 func (s *Session) SessionStats() Stats {
-	st := s.stats
+	st := Stats{sessionCounters: s.stats}
+	if s.mp != nil && s.mp.gapTrace != nil {
+		trace := s.mp.gapTrace
+		st.StreamGapsStarted, st.StreamGapsFilled, st.StreamGapWait = trace.started, trace.filled, trace.wait
+	}
 	if s.state == StateSuspended {
-		st.SuspendedTime += s.now.Sub(s.suspendedAt)
+		st.SuspendedTime = Duration(Time(st.SuspendedTime).Add(s.now.Sub(s.suspendedAt)))
 	}
 	return st
 }
@@ -327,7 +339,7 @@ func (s *Session) SessionStats() Stats {
 // called before the state leaves SUSPENDED.
 func (s *Session) endSuspension() {
 	if s.state == StateSuspended {
-		s.stats.SuspendedTime += s.now.Sub(s.suspendedAt)
+		s.stats.SuspendedTime = Duration(Time(s.stats.SuspendedTime).Add(s.now.Sub(s.suspendedAt)))
 	}
 }
 
@@ -477,17 +489,15 @@ func (s *Session) WaitEstablished(sig *Signal) bool {
 
 // idleTimeout is the effective idle timeout.
 func (s *Session) idleTimeout() Duration {
-	a, b := s.cfg.Local.MaxIdleTimeout, s.peer.MaxIdleTimeout
-	switch {
-	case a == 0 && b == 0:
-		return 0
-	case a == 0:
-		return MulD(int64(b), Millisecond)
-	case b == 0 || a < b:
-		return MulD(int64(a), Millisecond)
-	default:
-		return MulD(int64(b), Millisecond)
+	a := s.cfg.IdleTimeout
+	if a == 0 {
+		a = MulD(int64(s.cfg.Local.MaxIdleTimeout), Millisecond)
 	}
+	b := MulD(int64(s.peer.MaxIdleTimeout), Millisecond)
+	if a == 0 || b != 0 && b < a {
+		return b
+	}
+	return a
 }
 
 // srtt is the session SRTT: the largest pipe SRTT, else the initial
@@ -740,19 +750,19 @@ func (s *Session) wakeAllWriters() {
 
 // wakePipe wakes the writers of every lane of an outbound pipe.
 func (s *Session) wakePipe(p *Pipe) {
-	s.wake(p.out.sig)
+	s.requestPoll(p.id, 0, p.out.sig)
 	for _, l := range p.out.lanes[1:] {
-		s.wake(l.sig)
+		s.requestPoll(p.id, l.lane, l.sig)
 	}
 }
 
 // wakeLaneWriter wakes the writer of lane l of the outbound pipe p.
 func (s *Session) wakeLaneWriter(p *Pipe, l *outLane) {
 	if l.lane == 0 {
-		s.wake(p.out.sig)
+		s.requestPoll(p.id, 0, p.out.sig)
 		return
 	}
-	s.wake(l.sig)
+	s.requestPoll(p.id, l.lane, l.sig)
 }
 
 // StreamByID returns a live stream by identifier.

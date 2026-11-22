@@ -127,12 +127,11 @@ type pooledConn[C comparable] struct {
 type Lease[C comparable] struct {
 	// Conn is the connection to open the pipe on.
 	Conn C
-	// FateGroup is the connection's fate group (set it as the zmux.PipeIO's).
-	FateGroup uint64
-
 	p    *ConnPool[C]
 	pc   *pooledConn[C]
-	once sync.Once
+	// FateGroup is the connection's fate group (set it as the zmux.PipeIO's).
+	FateGroup uint64
+	once      sync.Once
 }
 
 // Release ends the lease when its pipe ended; the last lease of a retired

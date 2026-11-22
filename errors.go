@@ -91,6 +91,10 @@ type TransportError struct {
 	Remote    bool
 }
 
+// SessionError is the transport close reported by a session. ErrorMessage
+// contains the peer's reason, including the reason supplied to Listener.Drain.
+type SessionError = TransportError
+
 // Error describes the close.
 func (e *TransportError) Error() string {
 	s := fmt.Sprintf("zmux: transport error %v (%s)", e.ErrorCode, remoteStr(e.Remote))
@@ -103,7 +107,7 @@ func (e *TransportError) Error() string {
 // Is makes every session termination match net.ErrClosed, and
 // ZMUX_RESUME_FAILED match ErrResumeFailed.
 func (e *TransportError) Is(t error) bool {
-	return t == net.ErrClosed || t == ErrResumeFailed && e.ErrorCode == TransportResumeFailed
+	return t == net.ErrClosed || t == ErrResumeFailed && e.ErrorCode == TransportResumeFailed || t == ErrConnectionRefused && e.ErrorCode == TransportConnectionRefused
 }
 
 // IdleTimeoutError reports the idle timeout; Remote when the peer's timer
@@ -210,14 +214,25 @@ func isTimeout(err error) bool {
 // Is matches ErrPipesLost and net.ErrClosed.
 func (e *PipesLostError) Is(t error) bool { return t == ErrPipesLost || t == net.ErrClosed }
 
+// StreamErrorKind identifies the peer frame that ended a stream direction.
+type StreamErrorKind uint8
+
+const (
+	// StreamErrorReset is a RESET_STREAM or RESET_STREAM_AT on reads.
+	StreamErrorReset StreamErrorKind = iota + 1
+	// StreamErrorStopped is a STOP_SENDING on writes.
+	StreamErrorStopped
+)
+
 // StreamError is a stream ended by the peer: a reset on reads, a
 // STOP_SENDING on writes.
 type StreamError struct {
 	StreamID  StreamID
 	ErrorCode StreamErrorCode
-	Remote    bool
 	// ReliableSize is the RESET_STREAM_AT Reliable Size of a reset.
 	ReliableSize uint64
+	Kind         StreamErrorKind
+	Remote       bool
 }
 
 // Error describes the reset or STOP_SENDING.
@@ -330,6 +345,9 @@ var (
 	ErrTooLate = errors.New("zmux: too late: the stream's first frame was sent")
 	// ErrInvalidConfig wraps configuration errors.
 	ErrInvalidConfig = errors.New("zmux: invalid configuration")
+
+	// ErrHandlerRegistered means a callback owns this accept direction or event queue.
+	ErrHandlerRegistered = errors.New("zmux: handler already registered")
 	// ErrMessageTooLarge is returned by MessageReader.ReadMessage for a
 	// message above its limit.
 	ErrMessageTooLarge = errors.New("zmux: message too large")
@@ -338,8 +356,14 @@ var (
 	// declared (Conn.DeclareEndToEnd). The error returned wraps it and says
 	// which of the two, or both, is missing.
 	ErrJoinPending = errors.New("zmux: join pending")
+	// ErrConnectionRefused matches a CONNECTION_REFUSED transport close.
+	ErrConnectionRefused = errors.New("zmux: connection refused")
+	// ErrJoinTimeout identifies a join that exceeded Config.JoinTimeout.
+	ErrJoinTimeout = core.ErrJoinTimeout
+	// ErrJoinEvicted identifies an authorized join displaced before confirmation.
+	ErrJoinEvicted = errors.New("zmux: unconfirmed join evicted")
 	// ErrJoinRefused is returned by AddPipe when the peer's Reply refused the join.
-	ErrJoinRefused = errors.New("zmux: join refused")
+	ErrJoinRefused = core.ErrJoinRefused
 	// ErrCarrierRefused matches an error by which the server or an
 	// intermediary refused a carrier, such as an HTTP status other than 2xx
 	// or a redirect not followed; a carrier choice counts the try as refused.
@@ -351,9 +375,10 @@ var (
 	ErrNoExporter = errors.New("zmux: the carrier has no keying material exporter")
 	// ErrPipeGone is returned by Pipe methods once the session no longer
 	// knows the attachment.
-	ErrPipeGone = errors.New("zmux: pipe gone")
+	ErrPipeGone = core.ErrPipeGone
 	// ErrPipeAborted is what Pipe.Wait returns for a pipe this endpoint
-	// removed abruptly: with Pipe.Abort, or to make room for another.
+	// removed abruptly with Pipe.Abort or to make room for another.
+	// It also matches ErrPipeGone through errors.Is.
 	ErrPipeAborted = core.ErrPipeAborted
 	// ErrDuplicateUndecided is returned by ResolveDuplicate when the two
 	// sessions have the same dialer or no input of the duplicate-session
@@ -417,7 +442,11 @@ func apiErr(err error) error {
 	case errors.As(err, &st):
 		switch st.Kind {
 		case core.StreamReset, core.StreamStopped:
-			return &StreamError{StreamID: StreamID(st.StreamID), ErrorCode: StreamErrorCode(st.Code), Remote: st.Remote,
+			kind := StreamErrorReset
+			if st.Kind == core.StreamStopped {
+				kind = StreamErrorStopped
+			}
+			return &StreamError{Kind: kind, StreamID: StreamID(st.StreamID), ErrorCode: StreamErrorCode(st.Code), Remote: st.Remote,
 				ReliableSize: st.Reliable}
 		case core.StreamRejected:
 			return fmt.Errorf("stream %d: %w", st.StreamID, ErrRejected)

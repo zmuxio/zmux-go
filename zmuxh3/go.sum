@@ -1,5 +1,7 @@
-github.com/djylb/netx v0.0.0-20261121065821-b48dc32ff415 h1:XP8XSPqFrng9VzVJsUVFs5KCqixje4XJSYJ+N+qLRPM=
-github.com/djylb/netx v0.0.0-20261121065821-b48dc32ff415/go.mod h1:Zi8xVsLCr7IPHcf3i+iSygxEeW623tZPjrFOcQ8T0no=
+github.com/djylb/netx v0.0.0-20261121173512-8fdc4ddd3810 h1:PQoneha2SN+FHeucoXW6EGqgEK7HSwtqnqvO6nzAUhE=
+github.com/djylb/netx v0.0.0-20261121173512-8fdc4ddd3810/go.mod h1:y0BAyZQbOnhThRfqyku3Jnnai06ENRHBzYKobkyuunM=
+github.com/djylb/netx v0.0.0-20261122082912-c25ca8c3a7d1 h1:PlrsNBRj8tABRSNgQvGvxT/lBHhoSXd3sY2M5NGd4qE=
+github.com/djylb/netx v0.0.0-20261122082912-c25ca8c3a7d1/go.mod h1:y0BAyZQbOnhThRfqyku3Jnnai06ENRHBzYKobkyuunM=
 github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0 h1:BBQv+m6gL1FL9PH25D1OC/SQP4O2I6kY5vzwWI7NGmM=
 github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
 github.com/dunglas/httpsfv v1.1.2 h1:432E+FKy2DLMbVcZeAnOuM7nhyJ4vTiH7b9iXJ/Dkmc=
@@ -16,6 +18,8 @@ github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWD
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 github.com/zmuxio/zmux-go v1.5.6 h1:Zt6497kCuXivZio35nYXMu5shmBHsZZjjJhRHztbJos=
 github.com/zmuxio/zmux-go v1.5.6/go.mod h1:3E6fA5L/mTPOuomMti0Km/SuiYyG2UvHl+ca+q3GlFU=
+github.com/zmuxio/zmux-go/zmuxquic v1.5.6 h1:72gJ/ItJOfsvIFHSc2oZiTMOklBQ6fTIdQE5XueNmOc=
+github.com/zmuxio/zmux-go/zmuxquic v1.5.6/go.mod h1:dTD6xizl5yL1OvqHPdj275yM05T/Zs9KNQhpmnUyh4M=
 go.uber.org/mock v0.5.2 h1:LbtPTcP8A5k9WPXj54PPPbjcI4Y6lhyOZXn+VS7wNko=
 go.uber.org/mock v0.5.2/go.mod h1:wLlUxC2vVTPTaE3UD51E0BGOAElKrILxhVSDYQLld5o=
 go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=

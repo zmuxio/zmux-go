@@ -2,6 +2,7 @@ package proto
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -132,15 +133,12 @@ func TestHelloBoundsFromFile(t *testing.T) {
 
 // Local configuration failures: nothing is sent.
 
-// configVector keeps the field order of the vector files.
-//
-//goland:noinspection ALL
+// configVector describes a configuration and its expected result.
 type configVector struct {
 	Name    string `json:"name"`
 	Kind    string `json:"kind"`
 	Profile uint64 `json:"profile,omitempty"`
 	Suite   uint64 `json:"suite,omitempty"`
-	Mode    uint8  `json:"mode"`
 	Handle  hexb   `json:"handle,omitempty"`
 	Static  hexb   `json:"static,omitempty"`
 	PSK     hexb   `json:"psk,omitempty"`
@@ -150,7 +148,8 @@ type configVector struct {
 	WriteType int `json:"write_type,omitempty"`
 	// AppDataLen, when not zero, is application data of that many zero bytes
 	// in the first message.
-	AppDataLen int `json:"app_data_len,omitempty"`
+	AppDataLen int   `json:"app_data_len,omitempty"`
+	Mode       uint8 `json:"mode"`
 	// CredType0 makes the credential of WriteType 1 one of CredType 0.
 	CredType0 bool `json:"cred_type_0,omitempty"`
 	// RequirePQAuth, for kind pin, requires PQ authentication of a pin that
@@ -160,6 +159,48 @@ type configVector struct {
 	// zmux_session_crypto.
 	Crypto *cryptoSet `json:"crypto,omitempty"`
 	Error  string     `json:"error"`
+}
+
+// MarshalJSON keeps the key order of the shared specification vectors.
+func (v configVector) MarshalJSON() ([]byte, error) {
+	out := struct {
+		Name          string     `json:"name"`
+		Kind          string     `json:"kind"`
+		Profile       uint64     `json:"profile,omitempty"`
+		Suite         uint64     `json:"suite,omitempty"`
+		Mode          uint64     `json:"mode"`
+		Handle        hexb       `json:"handle,omitempty"`
+		Static        hexb       `json:"static,omitempty"`
+		PSK           hexb       `json:"psk,omitempty"`
+		Binding       hexb       `json:"binding,omitempty"`
+		WriteType     int        `json:"write_type,omitempty"`
+		AppDataLen    int        `json:"app_data_len,omitempty"`
+		CredType0     *bool      `json:"cred_type_0,omitempty"`
+		RequirePQAuth *bool      `json:"require_pq_auth,omitempty"`
+		Crypto        *cryptoSet `json:"crypto,omitempty"`
+		Error         string     `json:"error"`
+	}{
+		Name:       v.Name,
+		Kind:       v.Kind,
+		Profile:    v.Profile,
+		Suite:      v.Suite,
+		Mode:       uint64(v.Mode),
+		Handle:     v.Handle,
+		Static:     v.Static,
+		PSK:        v.PSK,
+		Binding:    v.Binding,
+		WriteType:  v.WriteType,
+		AppDataLen: v.AppDataLen,
+		Crypto:     v.Crypto,
+		Error:      v.Error,
+	}
+	if v.CredType0 {
+		out.CredType0 = &v.CredType0
+	}
+	if v.RequirePQAuth {
+		out.RequirePQAuth = &v.RequirePQAuth
+	}
+	return json.Marshal(out)
 }
 
 func (v configVector) start(t testing.TB) error {

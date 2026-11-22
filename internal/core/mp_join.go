@@ -14,7 +14,7 @@ type JoinOptions struct {
 	SendPriority *uint64
 	SendStandby  *bool
 	Probation    *Duration // nil: the session default; 0 disables
-	OutSig       *Signal
+	OutSig       *WriteSignal
 	Binding      []byte // Bound: the Binding of the new carrier
 	In, Out      CarrierInfo
 	Live         PipeLiveness // the pipe's own liveness settings
@@ -22,6 +22,7 @@ type JoinOptions struct {
 	RecvPriority uint64
 	Weight       uint64
 	Group        uint64 // 0: the default Group of the session
+	Deadline     Time   // absolute join deadline; 0 uses the core default
 	Mode         join.Mode
 	Dir          uint8 // pipe direction: 0 up, 1 down, 2 bidi (joiner's view)
 	RecvStandby  bool
@@ -116,6 +117,7 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	if m.ep.join == nil || len(m.ep.join.peer) == 0 {
 		return 0, 0, ErrNotNegotiated
 	}
+	s.prepareAdditional()
 	group := join.DefaultJoinGroup(m.usableGroups)
 	if o.Group != 0 {
 		g, ok := join.LookupGroup(o.Group)
@@ -128,7 +130,11 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	m.nextID += 2
 	p := &Pipe{id: id, carrier: o.Kind}
 	s.stats.PipesAdded++
-	a := &attach{out: OutNone, in: InNone, joinerLocal: true, dir: o.Dir, fate: o.FateGroup, attachedAt: s.now, liveAt: s.now,
+	deadline := o.Deadline
+	if deadline == 0 {
+		deadline = s.now.Add(s.cfg.JoinTimeout)
+	}
+	a := &attach{out: OutNone, in: InNone, joinerLocal: true, dir: o.Dir, fate: o.FateGroup, attachedAt: s.now, joinDeadline: deadline, liveAt: s.now,
 		lastAdvance: s.now, lastRecord: s.now, weight: 1, probOpt: -1, hs: true, mode: o.Mode, binding: o.Binding, group: group}
 	if o.Probation != nil {
 		a.probOpt = *o.Probation
@@ -158,6 +164,7 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 		res = AddPipePending
 		a.held = true
 	}
+	s.enableJoinedPathQuality(p)
 	s.pipes = append(s.pipes, p)
 	s.emitPipeState(p)
 	return id, res, nil
@@ -259,11 +266,11 @@ func (s *Session) JoinHello(id uint64, f Framing, over int, plan *shaping.UnitPl
 		jf = join.Message
 	}
 	ep := m.ep.join
-	a.joinEpoch = ep.n
 	j, err := join.NewJoiner(join.JoinerConfig{Suite: suite, Group: a.group, Phase: uint8(ep.n & 1), Mode: a.mode, Framing: jf, Locator: ep.peer, PSK: psk, Binding: a.binding})
 	if err != nil {
 		return nil, err
 	}
+	a.joinEpoch, a.joinEpochKnown = ep.n, true
 	pl := join.HelloPayload{Pipe: join.Pipe{ID: id, Direction: a.dir, FateGroup: a.fate, Priority: a.recvPrio, Standby: a.recvStandby}, KeyShare: j.KeyShare()}
 	if a.dir == 0 {
 		pl.Pipe.Priority, pl.Pipe.Standby = 0, false
@@ -575,7 +582,7 @@ const (
 
 // Carrier describes the carrier of a peer join to the acceptor.
 type Carrier struct {
-	OutSig        *Signal // wakes the outbound writer
+	OutSig        *WriteSignal // wakes the outbound writer
 	In, Out       CarrierInfo
 	HasIn, HasOut bool  // the directions the carrier provides to the acceptor
 	Kind          uint8 // the carrier's kind (SetPipeKind)
@@ -586,11 +593,12 @@ type Carrier struct {
 // PeerJoin is an authenticated Hello: Unconfirmed once Claim has set its bit. It
 // holds no session state.
 type PeerJoin struct {
-	acc  *join.Acceptor
-	h    *join.Suite
-	pl   join.HelloPayload
-	Pipe join.Pipe
-	Mode join.Mode
+	acc   *join.Acceptor
+	h     *join.Suite
+	pl    join.HelloPayload
+	epoch uint64
+	Pipe  join.Pipe
+	Mode  join.Mode
 }
 
 // HelloWithoutBinding records a Hello in Bound refused because its carrier has no Binding.
@@ -616,9 +624,10 @@ func (s *Session) OpenHello(h join.Hello, f Framing, binding []byte) (*PeerJoin,
 		s.stats.JoinPending++
 		return nil, JoinKeyWait
 	}
-	if _, ok := m.suiteKeys(h.Suite.ID); !ok {
+	if !s.UsableSuite(h.Suite.ID) {
 		return nil, JoinUnknownSuite // before any AEAD
 	}
+	s.prepareAdditional()
 	var psk []byte
 	e := m.ep.byPhase(h.Phase)
 	if e != nil {
@@ -642,7 +651,9 @@ func (s *Session) OpenHello(h join.Hello, f Framing, binding []byte) (*PeerJoin,
 		s.emit(Event{Kind: EvJoinAuthFailed, Reason: joinAuthReason(err)})
 		return nil, JoinClose
 	}
+	var joinEpoch uint64
 	if e != nil {
+		joinEpoch = e.n
 		s.epochPeerJoined(e.n) // a verified join of d+1: A uses d+1 too
 	}
 	id := pl.Pipe.ID
@@ -654,7 +665,7 @@ func (s *Session) OpenHello(h join.Hello, f Framing, binding []byte) (*PeerJoin,
 		s.stats.JoinReplays++
 		return nil, JoinClose
 	}
-	return &PeerJoin{Pipe: pl.Pipe, Mode: h.Mode, acc: acc, pl: pl, h: h.Suite}, JoinAccepted
+	return &PeerJoin{epoch: joinEpoch, Pipe: pl.Pipe, Mode: h.Mode, acc: acc, pl: pl, h: h.Suite}, JoinAccepted
 }
 
 // replyRoom bounds what a Reply may add to its base wire length before the
@@ -688,7 +699,7 @@ func (s *Session) ClaimHello(pj *PeerJoin, c Carrier, over, received int, plan *
 		return nil, JoinClose
 	}
 	id := pj.Pipe.ID
-	m.bits[id] = true
+	s.prepareAdditional().bits[id] = true
 	m.raise(id)
 	// The key exchange after the bit: a refused share leaves the ID used.
 	if err := pj.acc.Exchange(nil); err != nil {
@@ -763,7 +774,7 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 	id, j := pj.Pipe.ID, pj.Pipe
 	needIn, needOut := j.Direction != 1, j.Direction != 0
 	if c.Refuse || s.peerAttachments() >= m.cap && (s.state != StateSuspended || !s.makeRoom(false, needIn, needOut)) {
-		m.pendAbandon[id] = wire.PipeResourceLimit
+		s.prepareAdditional().pendAbandon[id] = wire.PipeResourceLimit
 		s.wakeAllWriters()
 		return JoinRefused
 	}
@@ -771,7 +782,7 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 	s.stats.PipesAdded++
 	s.epochJoined()
 	a := &attach{out: OutNone, in: InNone, dir: j.Direction, fate: j.FateGroup, attachedAt: s.now, liveAt: s.now, lastAdvance: s.now,
-		lastRecord: s.now, weight: 1, peerPrio: j.Priority, peerStandby: j.Standby, probOpt: -1, mode: pj.Mode}
+		lastRecord: s.now, weight: 1, peerPrio: j.Priority, peerStandby: j.Standby, probOpt: -1, mode: pj.Mode, joinEpoch: pj.epoch, joinEpochKnown: true}
 	a.group, _ = join.LookupGroup(pj.pl.KeyShare.Group)
 	a.rtt = s.initialRTT(id)
 	a.ownFail = c.HasOut && c.Out.OwnFailure || c.HasIn && c.In.OwnFailure
@@ -789,6 +800,7 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 		a.needPing = true
 		a.pingSince = s.now
 	}
+	s.enableJoinedPathQuality(p)
 	s.pipes = append(s.pipes, p)
 	if p.out != nil {
 		s.startProbation(p)
@@ -796,7 +808,7 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 	}
 	s.emitPipeState(p)
 	if p.out != nil {
-		s.wake(c.OutSig)
+		s.requestPoll(p.id, 0, c.OutSig)
 	}
 	s.checkTakeover()
 	s.checkResumed()
@@ -820,11 +832,18 @@ func (s *Session) emitPipeState(p *Pipe) {
 	s.pickChanged()
 	s.noteDatagramPath() // the primary pipe may have changed
 	o, i, _ := s.PipeState(p.id)
+	var cause error
+	switch {
+	case p.mp.resLimited && p.mp.peer != peerObserved:
+		cause = ErrJoinRefused
+	case errors.Is(p.mp.failCause, ErrJoinTimeout):
+		cause = ErrJoinTimeout
+	}
 	if p.out != nil {
-		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirOut, OutState: o, Carrier: p.carrier})
+		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirOut, OutState: o, Carrier: p.carrier, Cause: cause})
 	}
 	if p.in != nil {
-		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirIn, InState: i, Carrier: p.carrier})
+		s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirIn, InState: i, Carrier: p.carrier, Cause: cause})
 	}
 }
 
@@ -987,8 +1006,15 @@ func (s *Session) UsableSuite(id uint64) bool {
 	if s.mp == nil {
 		return false
 	}
-	_, ok := s.mp.suiteKeys(id)
-	return ok
+	if s.mp.keysPending || s.mp.ep.join == nil {
+		return false
+	}
+	if s.mp.additionalPipes != nil {
+		_, ok := s.mp.suiteKeys(id)
+		return ok
+	}
+	_, known := join.LookupSuite(id)
+	return known && slices.Contains(s.cfg.Local.SessionCrypto.Suites, id) && slices.Contains(s.peer.SessionCrypto.Suites, id)
 }
 
 // JoinMode returns the record mode of a joining attachment.

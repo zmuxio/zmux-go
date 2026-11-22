@@ -11,6 +11,7 @@ import (
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
 	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 )
 
 // rawCarrier makes the carrier of Bound or Trusted: raw records on the lower halves,
@@ -146,14 +147,21 @@ func newRawWriter(w io.WriteCloser, c rawCommon) io.WriteCloser {
 	base := &rawWriter{WriteCloser: w, rawCommon: c}
 	_, lanes := w.(zmux.LaneOpener)
 	_, unsent := w.(zmux.UnsentReporter)
-	_, retrans := w.(zmux.RetransReporter)
 	switch {
 	case lanes:
 		return &laneWriter{reportingWriter{base}}
-	case unsent || retrans:
+	case unsent:
 		return &reportingWriter{base}
 	}
 	return base
+}
+
+// CarrierSampler is for internal use by zmux modules.
+func (w *rawWriter) CarrierSampler() *carrierstats.Sampler {
+	if sampler := carrierstats.ProviderOf(w.base.W); sampler != nil {
+		return sampler
+	}
+	return carrierstats.SocketSampler(w.base.W)
 }
 
 // ReportsFailure is the sending half of the carrier's (zmux.FailureReporter).
@@ -255,13 +263,6 @@ type reportingWriter struct{ *rawWriter }
 func (w *reportingWriter) Unsent() (uint64, bool) {
 	if u, ok := w.WriteCloser.(zmux.UnsentReporter); ok {
 		return u.Unsent()
-	}
-	return 0, false
-}
-
-func (w *reportingWriter) Retransmitted() (uint64, bool) {
-	if r, ok := w.WriteCloser.(zmux.RetransReporter); ok {
-		return r.Retransmitted()
 	}
 	return 0, false
 }

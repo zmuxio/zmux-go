@@ -22,8 +22,8 @@ func IsAppTLV(t uint64) bool { return t >= TLVAppFirst && t <= TLVAppLast && !Is
 
 // TLV is one application TLV.
 type TLV struct {
-	Type  uint64
 	Value []byte
+	Type  uint64
 }
 
 // Preamble is a parsed stream preamble; byte fields alias the input.
@@ -86,7 +86,7 @@ func ParsePreamble(data []byte, limit uint64, dst *Preamble) *Error {
 			}
 			dst.PipeCarrier = true
 		case IsAppTLV(t):
-			app = append(app, TLV{t, v})
+			app = append(app, TLV{Type: t, Value: v})
 		}
 	}
 	dst.App = app

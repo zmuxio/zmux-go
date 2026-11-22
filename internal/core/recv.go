@@ -114,6 +114,13 @@ func (s *Session) WaitAccept(bidi bool, sig *Signal) {
 	s.acceptW[t] = append(s.acceptW[t], sig)
 }
 
+// WakeAcceptWaiters signals every blocked accept of this direction to recheck ownership.
+func (s *Session) WakeAcceptWaiters(bidi bool) {
+	for _, w := range s.acceptW[typeIndex(bidi)] {
+		s.wake(w)
+	}
+}
+
 // CancelAcceptWait removes sig.
 func (s *Session) CancelAcceptWait(bidi bool, sig *Signal) {
 	t := typeIndex(bidi)
@@ -264,6 +271,9 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 	if f.Fin && !r.preDone && s.feat.Preamble && !st.local && end == 0 && !r.stopped {
 		return false, wire.NewError(wire.ProtocolViolation, "opener's sending part has final size 0", "stream", st.id)
 	}
+	if s.cfg.TraceStreams && s.rxPipe != nil && s.mp != nil && !r.stopped && !r.reset {
+		s.traceStreamGap(st, f)
+	}
 	s.recvProgress(st)
 	if !effect && (len(f.Data) > 0 || !f.Fin) && !s.feat.Multipath {
 		return false, nil
@@ -390,6 +400,7 @@ func (s *Session) onReset(f *wire.Frame, at bool) (bool, *wire.Error) {
 	if e := s.checkPreambleReset(st); e != nil {
 		return false, e
 	}
+	s.forgetStreamGap(st.id)
 	// Release the gap the reset makes undeliverable.
 	lo, hi := r.resetRel, min64(r.relLo, r.final)
 	if lo < hi {
@@ -482,6 +493,7 @@ func (s *Session) stopRecv(st *Stream, code uint64) {
 		return
 	}
 	r.stopped, r.stopCode = true, code
+	s.forgetStreamGap(st.id)
 	if d := r.buf.clear(); d > 0 {
 		s.bufSub(d)
 	}

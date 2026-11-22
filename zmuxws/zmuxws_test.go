@@ -198,15 +198,15 @@ func TestSubprotocols(t *testing.T) {
 		}}})
 	u := server(t, l, o, "qmux-02.chat", "moq-transport-18")
 	for _, tc := range []struct {
-		offer []string
 		want  string // "" refused
+		offer []string
 	}{
-		{[]string{"qmux-02.chat"}, "qmux-02.chat"},
-		{[]string{"qmux-01.chat"}, "qmux-01.chat"},
-		{[]string{"moq-transport-18"}, "moq-transport-18"},
-		{[]string{"moq-transport-18", "qmux-01.chat"}, "qmux-01.chat"}, // the server's preference
-		{[]string{"qmux-02"}, ""},
-		{[]string{"moq-transport-17"}, ""},
+		{offer: []string{"qmux-02.chat"}, want: "qmux-02.chat"},
+		{offer: []string{"qmux-01.chat"}, want: "qmux-01.chat"},
+		{offer: []string{"moq-transport-18"}, want: "moq-transport-18"},
+		{offer: []string{"moq-transport-18", "qmux-01.chat"}, want: "qmux-01.chat"}, // the server's preference
+		{offer: []string{"qmux-02"}, want: ""},
+		{offer: []string{"moq-transport-17"}, want: ""},
 	} {
 		d := &wsconn.Dialer{Subprotocols: tc.offer}
 		wc, resp, err := d.Dial(ctx, u+"/x")

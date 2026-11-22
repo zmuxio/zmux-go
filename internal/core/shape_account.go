@@ -115,7 +115,7 @@ func shapeRateFloor(rate uint64, md int64) (uint64, bool) {
 	return rate, false
 }
 
-// tokenBucket is the integer gate of a pipe: bytes, in microseconds of the clock.
+// tokenBucket tracks byte credit on the microsecond session clock.
 type tokenBucket struct {
 	rate, rem, filled uint64
 	burst, tokens     int64
@@ -161,7 +161,12 @@ func (b *tokenBucket) held() bool { return b.tokens < b.quantum() }
 // release is the microsecond at which a held bucket reaches its quantum; ok
 // false when it lies beyond any clock.
 func (b *tokenBucket) release() (us uint64, ok bool) {
-	need := uint64(b.quantum() - b.tokens)
+	return b.readyAt(b.quantum())
+}
+
+// readyAt computes when this bucket will reach a level above its current tokens.
+func (b *tokenBucket) readyAt(level int64) (us uint64, ok bool) {
+	need := uint64(level - b.tokens)
 	hi, lo := bits.Mul64(need, 1_000_000)
 	lo, br := bits.Sub64(lo, b.rem, 0)
 	hi -= br

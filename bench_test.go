@@ -1,7 +1,6 @@
 package zmux
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -10,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/djylb/netx"
 )
 
 func BenchmarkBulkTCP(b *testing.B) {
@@ -54,13 +55,21 @@ func BenchmarkRRTCP(b *testing.B) {
 	}()
 	st, _ := c.OpenStreamSync(context.Background())
 	buf := make([]byte, 64)
+	lat := make([]time.Duration, 0, b.N)
+	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
+		t := time.Now()
 		_, _ = st.Write(buf)
 		if _, err := io.ReadFull(st, buf); err != nil {
 			b.Fatal(err)
 		}
+		lat = append(lat, time.Since(t))
 	}
+	b.StopTimer()
+	slices.Sort(lat)
+	b.ReportMetric(float64(lat[(len(lat)*99+99)/100-1])/1e3, "p99-us")
+	b.ReportMetric(float64(c.ConnectionStats().BytesReinjected), "reinjected-B")
 }
 
 // BenchmarkRRUnderBulk measures 64-byte request-response latency while a
@@ -98,7 +107,6 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 	}()
 	bulk, _ := c.OpenStreamSync(ctx)
 	_, _ = bulk.Write([]byte{'b'})
-	var bulkBytes atomic.Int64
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -111,8 +119,7 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 				return
 			default:
 			}
-			n, err := bulk.Write(buf)
-			bulkBytes.Add(int64(n))
+			_, err := bulk.Write(buf)
 			if err != nil {
 				return
 			}
@@ -124,9 +131,10 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 	bulk.SetPriority(UrgencyDefault, false)
 	buf := make([]byte, 64)
 	lat := make([]time.Duration, 0, b.N)
+	b.ReportAllocs()
+	b0 := srv.ConnectionStats().BytesRead
 	b.ResetTimer()
 	t0 := time.Now()
-	b0 := bulkBytes.Load()
 	for range b.N {
 		t := time.Now()
 		_, _ = rr.Write(buf)
@@ -137,89 +145,145 @@ func BenchmarkRRUnderBulk(b *testing.B) {
 	}
 	el := time.Since(t0)
 	b.StopTimer()
+	received := srv.ConnectionStats().BytesRead - b0
 	close(stop)
 	<-done
 	slices.Sort(lat)
 	b.ReportMetric(float64(lat[len(lat)/2].Nanoseconds())/1e3, "p50-us")
 	b.ReportMetric(float64(lat[len(lat)*99/100].Nanoseconds())/1e3, "p99-us")
-	b.ReportMetric(float64(bulkBytes.Load()-b0)/el.Seconds()/1e6, "bulk-MB/s")
+	b.ReportMetric(float64(received-min(received, uint64(b.N)*64))/el.Seconds()/1e6, "bulk-MB/s")
+	b.ReportMetric(float64(c.ConnectionStats().BytesReinjected), "reinjected-B")
 }
 
 // BenchmarkMultipathSpread measures one bulk stream spread over two TCP
-// pipes (round robin), and reports each pipe's share.
+// pipes and reports each pipe's share.
 func BenchmarkMultipathSpread(b *testing.B) {
 	for _, sched := range []struct {
-		name string
 		s    Scheduler
-	}{{"round-robin", SchedulerSpreadRoundRobin()}, {"eta", SchedulerSpreadETA()}} {
+		name string
+	}{{name: "round-robin", s: SchedulerSpreadRoundRobin()}, {name: "eta", s: SchedulerSpreadETA()}} {
 		b.Run(sched.name, func(b *testing.B) {
-			cfg := &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true}}
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer func() { _ = ln.Close() }()
-			l := mustNewListener(&ListenerConfig{Config: cfg})
-			defer func() { _ = l.Close() }()
-			ctx := b.Context()
-			go func() {
-				for {
-					nc, err := ln.Accept()
-					if err != nil {
-						return
-					}
-					go func() { _ = l.HandlePipe(ctx, NetPipe(nc), PipeHint{}) }()
-				}
-			}()
-			nc, _ := net.Dial("tcp", ln.Addr().String())
-			c, err := Client(ctx, nc, cfg)
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer func() { _ = c.Close() }()
-			srv, err := l.Accept(ctx)
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer func() { _ = srv.Close() }()
-			nc2, _ := net.Dial("tcp", ln.Addr().String())
-			if _, err := c.AddPipe(ctx, NetPipe(nc2), PipeOptions{}); err != nil {
-				b.Fatal(err)
-			}
-			c.SetScheduler(sched.s)
-			got := make(chan struct{})
-			go func() {
-				defer close(got)
-				st, err := srv.AcceptStream(ctx)
-				if err != nil {
-					return
-				}
-				_, _ = io.Copy(io.Discard, st)
-				_ = st.Close()
-			}()
-			st, _ := c.OpenStreamSync(ctx)
-			buf := make([]byte, 64<<10)
-			b.SetBytes(int64(len(buf)))
-			b.ResetTimer()
-			for range b.N {
-				if _, err := st.Write(buf); err != nil {
-					b.Fatal(err)
-				}
-			}
-			_ = st.Close()
-			_, _ = io.ReadAll(st)
-			<-got
-			b.StopTimer()
-			var total float64
-			ps := c.PipeStats()
-			for _, p := range ps {
-				total += float64(p.BytesSent)
-			}
-			for _, p := range ps {
-				b.ReportMetric(float64(p.BytesSent)/total*100, fmt.Sprintf("pipe%d-%%", p.PipeID))
-			}
+			c, srv := multipathBenchPair(b, sched.s)
+			benchmarkBulkPair(b, c, srv)
 		})
 	}
+}
+
+// BenchmarkMultipathHeterogeneousBulk sends a saturated stream across two
+// carrier pairs with independently paced delivery and distinct RTTs.
+func BenchmarkMultipathHeterogeneousBulk(b *testing.B) {
+	ln := netx.NewChanListener(nil, 0)
+	links := []link{
+		{d: time.Millisecond, rate: 80e6, cap: 512 << 10},
+		{d: 4 * time.Millisecond, rate: 35e6, cap: 512 << 10},
+	}
+	var dials atomic.Int32
+	env := startMPEnv(b, mpConfig(), &ListenerConfig{Config: mpConfig()},
+		&linkListener{Listener: ln, links: links},
+		func(ctx context.Context) (net.Conn, error) {
+			c, err := ln.Dial(ctx, nil)
+			if err != nil {
+				return nil, err
+			}
+			k := links[min(int(dials.Add(1))-1, len(links)-1)]
+			return newDelayConn(c, k.d, k.rate, k.cap), nil
+		})
+	env.addPipe(b, PipeOptions{})
+	env.client.SetScheduler(SchedulerSpreadETA())
+	env.server.SetScheduler(SchedulerSpreadETA())
+	benchmarkBulkPair(b, env.client, env.server)
+}
+
+func benchmarkBulkPair(b *testing.B, c, srv *Conn) {
+	b.Helper()
+	ctx := b.Context()
+	got := make(chan struct{})
+	go func() {
+		defer close(got)
+		st, err := srv.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, st)
+		_ = st.Close()
+	}()
+	st, _ := c.OpenStreamSync(ctx)
+	buf := make([]byte, 64<<10)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(buf)))
+	b.ResetTimer()
+	for range b.N {
+		if _, err := st.Write(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+	_ = st.Close()
+	_, _ = io.ReadAll(st)
+	<-got
+	b.StopTimer()
+	b.ReportMetric(float64(c.ConnectionStats().BytesReinjected), "reinjected-B")
+	var total float64
+	ps := c.PipeStats()
+	for _, p := range ps {
+		total += float64(p.BytesSent)
+	}
+	for _, p := range ps {
+		b.ReportMetric(float64(p.BytesSent)/total*100, fmt.Sprintf("pipe%d-%%", p.PipeID))
+	}
+}
+
+// BenchmarkMultipathRRTCP measures a 64-byte request and its echo over
+// two TCP carriers with spread ETA selected in both directions.
+func BenchmarkMultipathRRTCP(b *testing.B) {
+	c, srv := multipathBenchPair(b, SchedulerSpreadETA())
+	ctx := b.Context()
+	go func() {
+		st, err := srv.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 64)
+		for {
+			if _, err := io.ReadFull(st, buf); err != nil {
+				return
+			}
+			if _, err := st.Write(buf); err != nil {
+				return
+			}
+		}
+	}()
+	st, err := c.OpenStreamSync(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	lat := make([]time.Duration, 0, b.N)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		at := time.Now()
+		if _, err := st.Write(buf); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.ReadFull(st, buf); err != nil {
+			b.Fatal(err)
+		}
+		lat = append(lat, time.Since(at))
+	}
+	b.StopTimer()
+	slices.Sort(lat)
+	b.ReportMetric(float64(lat[(len(lat)-1)/2])/1e3, "p50-us")
+	b.ReportMetric(float64(lat[(len(lat)*99+99)/100-1])/1e3, "p99-us")
+	b.ReportMetric(float64(c.ConnectionStats().BytesReinjected), "reinjected-B")
+}
+
+func multipathBenchPair(b *testing.B, sched Scheduler) (*Conn, *Conn) {
+	b.Helper()
+	env := newMPEnv(b, mpConfig(), mpConfig())
+	env.addPipe(b, PipeOptions{})
+	env.client.SetScheduler(sched)
+	env.server.SetScheduler(sched)
+	return env.client, env.server
 }
 
 // BenchmarkRRRawTCP is the baseline of BenchmarkRRTCP: 64-byte

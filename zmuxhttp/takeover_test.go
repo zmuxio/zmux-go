@@ -19,18 +19,22 @@ import (
 // decision's Value: the host detaches it, serves it on another goroutine
 // after Fallback returned (an echo, while the client still streams its
 // body), and its Close ends the response. HTTP/1.1 and HTTP/2.
+// HS-15, L06. Without Next the same listener handles Takeover and answers HTTP Fallback with 404.
 func TestHTTPRequestCarrierTakeover(t *testing.T) {
-	for _, mode := range []string{"h1", "h2", "h1-half", "h2-half"} {
+	for _, mode := range []string{"h1", "h2", "h1-half", "h2-half", "h1-no-next", "h2-no-next"} {
 		h2 := strings.HasPrefix(mode, "h2")
 		half := strings.HasSuffix(mode, "-half")
 		t.Run(mode, func(t *testing.T) {
 			leakcheck.Check(t)
 			adm := &zmux.Admission{Peek: 4, PeekTimeout: 5 * time.Second,
 				Decide: func(_ context.Context, info zmux.CarrierInfo, prefix []byte) zmux.Decision {
+					if string(prefix) == "NEXT" {
+						return zmux.Decision{Verdict: zmux.VerdictFallback, Variant: "relay"}
+					}
 					if info.Stage != zmux.StageCarrier || info.Request == nil || string(prefix) != "HOST" {
 						return zmux.Decision{Verdict: zmux.VerdictClose}
 					}
-					return zmux.Decision{Verdict: zmux.VerdictFallback, Value: "echo"}
+					return zmux.Decision{Verdict: zmux.VerdictTakeover, Value: "echo", Variant: "relay"}
 				}}
 			returned := make(chan zmux.PipeIO, 1)
 			lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm,
@@ -46,8 +50,17 @@ func TestHTTPRequestCarrierTakeover(t *testing.T) {
 					returned <- tk.Pipe()
 				}})
 			defer func() { _ = lst.Close() }()
-			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
-			h, err := NewHandler(lst, &Options{Next: next})
+			var opts *Options
+			if !strings.HasSuffix(mode, "-no-next") {
+				opts = &Options{Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil || string(body) != "NEXTdata" || r.Trailer.Get("X-Final") != "trail" {
+						t.Errorf("delegated body %q, trailers %v, err %v", body, r.Trailer, err)
+					}
+					w.WriteHeader(http.StatusTeapot)
+				})}
+			}
+			h, err := NewHandler(lst, opts)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -94,8 +107,32 @@ func TestHTTPRequestCarrierTakeover(t *testing.T) {
 			} else {
 				echoed(t, p, pw, resp.Body)
 			}
-			if st := lst.Stats().Admission; st.Fallback != 1 {
-				t.Fatalf("stats %+v", st)
+			req, err = http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, io.NopCloser(strings.NewReader("NEXTdata")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Trailer = http.Header{"X-Final": []string{"trail"}}
+			res, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = res.Body.Close()
+			wantStatus := http.StatusNotFound
+			if opts != nil {
+				wantStatus = http.StatusTeapot
+			}
+			if res.StatusCode != wantStatus {
+				t.Fatal(res.Status)
+			}
+			stats := lst.VariantStats()
+			want := zmux.VariantStat{Name: "relay", Takeover: 1}
+			if opts == nil {
+				want.Stalled = 1
+			} else {
+				want.Fallback = 1
+			}
+			if len(stats) != 1 || stats[0] != want {
+				t.Fatal(stats)
 			}
 		})
 	}

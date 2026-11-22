@@ -100,7 +100,7 @@ type Rotation struct {
 func memberState(ps []*Pipe) (sum PipeStats, alive, usable bool) {
 	alive, usable = len(ps) > 0, len(ps) > 0
 	for i, p := range ps {
-		st, ok := p.Stats()
+		st, ok := p.stats(false)
 		if !ok {
 			return sum, false, false
 		}

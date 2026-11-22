@@ -320,14 +320,14 @@ func TestExporterSplit(t *testing.T) {
 	down.calls.Store(0)
 	for _, tc := range []struct {
 		name      string
+		want      []byte
 		p         PipeIO
 		initiator bool
-		want      []byte
 	}{
-		{"initiator", PipeIO{W: up, R: down}, true, slices.Concat(u, d)},
-		{"responder", PipeIO{R: up, W: down}, false, slices.Concat(u, d)},
-		{"one", PipeIO{R: up, W: up}, true, u},
-		{"uplink only", PipeIO{W: up, R: &net.TCPConn{}}, true, u},
+		{name: "initiator", p: PipeIO{W: up, R: down}, initiator: true, want: slices.Concat(u, d)},
+		{name: "responder", p: PipeIO{R: up, W: down}, initiator: false, want: slices.Concat(u, d)},
+		{name: "one", p: PipeIO{R: up, W: up}, initiator: true, want: u},
+		{name: "uplink only", p: PipeIO{W: up, R: &net.TCPConn{}}, initiator: true, want: u},
 	} {
 		e := bootExporters(tc.p, tc.initiator)
 		if e == nil {

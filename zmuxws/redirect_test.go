@@ -92,11 +92,11 @@ func TestRedirect(t *testing.T) {
 	droots := x509.NewCertPool()
 	droots.AddCert(down.Certificate())
 	for _, c := range []struct {
-		url string
 		o   *DialOptions
+		url string
 	}{
-		{ws(cross.URL), o},
-		{ws(down.URL), &DialOptions{TLSConfig: &tls.Config{RootCAs: droots, ServerName: "example.com"}}},
+		{url: ws(cross.URL), o: o},
+		{url: ws(down.URL), o: &DialOptions{TLSConfig: &tls.Config{RootCAs: droots, ServerName: "example.com"}}},
 	} {
 		_, err := zmux.DialChoice(ctx, zmux.ExplicitChoice(Candidate(c.url, c.o)), cfg, nil)
 		var me *zmux.CarrierChoiceError

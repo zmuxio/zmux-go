@@ -85,6 +85,7 @@ func (s *Session) mpAdvanced(p *Pipe, ol *outLane, ps *pipeSend, now Time) {
 
 // mpLaneAdvanced runs after any lane of the pipe was acknowledged further.
 func (s *Session) mpLaneAdvanced(p *Pipe, _ *outLane) {
+	s.wakePrefix()
 	if p.mp.out == OutDraining {
 		s.checkDrain(p)
 	}
@@ -129,8 +130,8 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 				}
 				return nil
 			}
-			if m.inWindow(f.PipeID) && !m.bits[f.PipeID] {
-				m.bits[f.PipeID] = true
+			if m.inWindow(f.PipeID) && !m.idRetired(f.PipeID) {
+				s.prepareAdditional().bits[f.PipeID] = true
 				m.pendAbandon[f.PipeID] = wire.PipeFailed
 				s.wakeAllWriters()
 			}

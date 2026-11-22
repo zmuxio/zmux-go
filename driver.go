@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,19 +23,21 @@ type pipeDrv struct {
 	c      *Conn
 	id     uint64
 	hc     *halfCloser
-	wsig   *core.Signal    // wakes the lane-0 writer
+	writer laneWriter      // lane zero
 	opener LaneOpener      // nil: the carrier offers no lanes
 	maxRec int             // the pipe's local record limit (carrierRecordLimit), applied to every lane
 	tcp    tcpInfo         // the TCP socket under the carrier, if any
 	nest   *nestEdge       // the nesting edge of a stream-backed carrier (nil: none)
-	gs     pipeGoroutines  // the attachment's goroutines (HandlePipe waits on them)
+	gs     pipeGoroutines  // the attachment's goroutines (Pipe.Done waits for them)
 	lctx   context.Context // the goroutine labels of the pipe (labels.go)
 
 	admitted any // the admission value of the carrier that joined it (set once, under the session lock)
 
-	// Guarded by the session lock (and dead, below).
-	lanes   map[uint64]*laneOut // outbound lanes above 0
-	inLanes []io.ReadCloser     // inbound lanes above 0
+	// Guarded by the session lock.
+	openCtx  context.Context
+	stopOpen context.CancelFunc
+	lanes    map[uint64]*laneOut       // outbound lanes above 0
+	inLanes  map[*inboundLane]struct{} // inbound lanes above 0
 
 	// The carrier's datagram channel (nil: none) and its sender.
 	ch    DatagramChannel
@@ -43,46 +46,45 @@ type pipeDrv struct {
 	// chReady is closed once the channel's receiver is registered: the
 	// first record waits for it.
 	chReady chan struct{}
-	chOnce  sync.Once
-
 	// graceT is the abort bound of a graceful close (closeGraceful), with
-	// the lanes it aborts (graceAb); under smu.
+	// the abort action for its halves and lanes, under the session lock.
 	graceT  *time.Timer
-	graceAb []Aborter
-
-	smu      sync.Mutex // leaf: shutdown request of lane 0
-	shutdown bool
-	shutReq  bool // lane 0's shutdown was requested (sticky)
-	framing  Framing
-	dead     bool // guarded by the session lock: replaced (early-data restart), its goroutines report nothing
-	// wstop (session lock): the lane-0 writer stops before writing again
-	// (an early-data restart on the same halves); wdone is closed when it
-	// has returned.
-	wstop bool
-	wdone chan struct{}
+	graceAb func()
+	wdone   chan struct{} // closed when a stopped lane-0 writer releases its half
 
 	// The end of the attachment (Pipe.Wait, Pipe.Done); a handle keeps it
 	// after the session has forgotten the attachment.
-	end *pipeEnd
+	end    *pipeEnd
+	chOnce sync.Once
+
+	retiring bool // under the session lock: the carrier close has claimed the lanes.
+	shutReq  bool // under the session lock: lane 0's shutdown was requested (sticky)
+	framing  Framing
+	dead     bool // guarded by the session lock: replaced (early-data restart), its goroutines report nothing
+	// wstop (session lock): the lane-0 writer stops before writing again
+	// (an early-data restart on the same halves).
+	wstop    bool
+	hasOwner bool // holds a close reference until retirement
 }
 
 // pipeEnd is how an attachment ended: retired is closed when the session
 // retires it (err, guarded by the session lock, is set before),
 // waited when, besides, its goroutines ended.
 type pipeEnd struct {
-	err error
-	// opts are the pipe's options as the application set them, every
-	// update applied (guarded by the session lock, like err); a pipe the
-	// application added has its Direction, RecordMode and FateGroup resolved.
-	// Pipe.Options reads them, also once the pipe is gone.
-	opts    PipeOptions
+	join    *joinOutcome // on additional pipes, persists through retirement
+	err     error
 	drv     atomic.Pointer[pipeDrv] // the current driver (an early-data restart replaces pipe 0's)
 	retired chan struct{}
 	// waited is Pipe.Done's channel, made on demand; ended is set once
 	// the pipe was retired and its goroutines ended, or the session ended.
 	waited chan struct{}
-	mu     sync.Mutex
-	ended  bool
+	// opts are the pipe's options as the application set them, every
+	// update applied (guarded by the session lock, like err); a pipe the
+	// application added has its Direction, RecordMode and FateGroup resolved.
+	// Pipe.Options reads them, also once the pipe is gone.
+	opts  PipeOptions
+	mu    sync.Mutex
+	ended bool
 }
 
 // done returns Pipe.Done's channel, without a goroutine to close it.
@@ -116,51 +118,48 @@ var goneEnd = &pipeEnd{retired: closedChan, waited: closedChan, ended: true}
 
 // laneOut is the writer side of one outbound lane above 0.
 type laneOut struct {
-	w    io.WriteCloser
-	sig  *core.Signal
-	lane uint64
-	once sync.Once
-	smu  sync.Mutex
-	shut bool
+	w         io.WriteCloser
+	writer    laneWriter
+	lane      uint64
+	once      sync.Once
+	abortOnce sync.Once
 }
 
-func (l *laneOut) close(abort bool) {
-	l.once.Do(func() {
-		if a, ok := l.w.(Aborter); ok && abort {
-			a.Abort(net.ErrClosed)
+func (l *laneOut) abort() {
+	l.abortOnce.Do(func() {
+		if a, ok := l.w.(Aborter); ok {
+			safeLog(nil, "lane Abort", func() { a.Abort(net.ErrClosed) })
 		}
-		_ = l.w.Close()
 	})
 }
 
+func (l *laneOut) close(abort bool) {
+	if abort {
+		l.abort()
+	}
+	l.once.Do(func() { carrierio.CloseHalf(l.w) })
+}
+
 // pipeGoroutines counts an attachment's goroutines without a goroutine of
-// its own to wait for them: ended is closed when the count drops to zero
-// (lock level L3).
+// its own to wait for them (lock level L3).
 type pipeGoroutines struct {
-	ended chan struct{}
 	// fin is closed once finish was called and the count is zero, by
 	// whichever of the two comes last; made on demand (finished).
 	fin chan struct{}
 	// onFin, when set before finish, runs (under mu) when fin would close.
-	onFin  func()
-	n      int
-	mu     sync.Mutex
-	sealed bool // seal: no goroutine joins any more
-	final  bool // finish: the owner ended
-	fired  bool // the owner ended and no goroutine ran since
+	afterIO func() // Runs outside mu once the carrier closed and no worker remains.
+	onFin   func()
+	n       int
+	mu      sync.Mutex
+	sealed  bool // seal: no goroutine joins any more
+	final   bool // finish: the owner ended
+	fired   bool // the owner ended and no goroutine ran since
 }
 
 func (g *pipeGoroutines) add() {
 	g.mu.Lock()
-	g.addLocked()
-	g.mu.Unlock()
-}
-
-func (g *pipeGoroutines) addLocked() {
-	if g.n == 0 {
-		g.ended = make(chan struct{})
-	}
 	g.n++
+	g.mu.Unlock()
 }
 
 // tryAdd counts one more goroutine unless the count was sealed.
@@ -170,7 +169,7 @@ func (g *pipeGoroutines) tryAdd() bool {
 	if g.sealed {
 		return false
 	}
-	g.addLocked()
+	g.n++
 	return true
 }
 
@@ -184,11 +183,15 @@ func (g *pipeGoroutines) seal() {
 
 func (g *pipeGoroutines) done() {
 	g.mu.Lock()
+	var after func()
 	if g.n--; g.n == 0 {
-		close(g.ended)
 		g.closeFinLocked()
+		after, g.afterIO = g.afterIO, nil
 	}
 	g.mu.Unlock()
+	if after != nil {
+		after()
+	}
 }
 
 // finishThen is finish, with f run once no goroutine runs.
@@ -236,40 +239,7 @@ func (g *pipeGoroutines) finished() <-chan struct{} {
 	return g.fin
 }
 
-// wait returns a channel closed once no goroutine of the attachment runs.
-func (g *pipeGoroutines) wait() <-chan struct{} {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.n == 0 {
-		return closedChan
-	}
-	return g.ended
-}
-
 var closedChan = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
-
-func (pd *pipeDrv) requestShutdown() {
-	pd.smu.Lock()
-	pd.shutdown = true
-	pd.shutReq = true
-	pd.smu.Unlock()
-	pd.wsig.Fire()
-}
-
-// shutdownRequested reports whether lane 0's shutdown was ever requested.
-func (pd *pipeDrv) shutdownRequested() bool {
-	pd.smu.Lock()
-	defer pd.smu.Unlock()
-	return pd.shutReq
-}
-
-func (pd *pipeDrv) takeShutdown() bool {
-	pd.smu.Lock()
-	defer pd.smu.Unlock()
-	s := pd.shutdown
-	pd.shutdown = false
-	return s
-}
 
 // carrierInfo describes a carrier half to the core.
 func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
@@ -303,9 +273,30 @@ func reportsFailure(p PipeIO) bool {
 	return halfReportsFailure(p.W) && halfReportsFailure(p.R)
 }
 
-// newPipeDrv prepares the driver of an attachment (under the lock).
+// preparedPipe holds the host properties sampled before committing an attachment.
+type preparedPipe struct {
+	pd      *pipeDrv
+	carrier any
+	outer   outerRef
+	info    core.CarrierInfo
+}
+
+func (c *Conn) preparePipe(id uint64, p, raw PipeIO, lowWater int) (a preparedPipe, err error) {
+	err = hostCall(c.cfg.Logger, "carrier properties", func() error {
+		a.pd = c.newPipeDrv(id, p)
+		a.pd.tcp = tcpOf(raw.W)
+		a.carrier, a.outer = carrierIdentity(p)
+		low := lowWater > 0 && a.pd.tcp.setLowWater(lowWater)
+		a.info = carrierInfo(p, a.pd.tcp, low)
+		a.pd.maxRec = a.info.MaxRecord
+		return nil
+	})
+	return a, err
+}
+
+// newPipeDrv samples the carrier before the session lock is taken.
 func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
-	pd := &pipeDrv{c: c, id: id, hc: newHalfCloser(p), framing: p.Framing, wsig: core.NewSignal(), lctx: c.pipeLabels(id)}
+	pd := &pipeDrv{c: c, id: id, hc: newHalfCloser(p), framing: p.Framing}
 	pd.end = &pipeEnd{retired: make(chan struct{})}
 	pd.end.drv.Store(pd)
 	if o, ok := p.W.(LaneOpener); ok {
@@ -313,16 +304,8 @@ func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
 	} else if o, ok := p.R.(LaneOpener); ok {
 		pd.opener = o
 	}
-	pd.tcp = tcpOf(p.W)
 	pd.ch = channelOf(p)
-	pd.maxRec = carrierRecordLimit(p)
 	return pd
-}
-
-// adopt makes q the carrier of a joined attachment; the TCP socket stays the one
-// below it, for the statistics.
-func (pd *pipeDrv) adopt(q PipeIO) {
-	pd.hc, pd.framing, pd.maxRec = newHalfCloser(q), q.Framing, carrierRecordLimit(q)
 }
 
 // startPipeLocked starts the goroutines of an attachment.
@@ -330,15 +313,20 @@ func (pd *pipeDrv) adopt(q PipeIO) {
 // Every PipeIO that becomes part of a session starts here once, so this is
 // where the padding of the handshake run on it is metered: an attachment
 // that fails before (a join not confirmed) spends nothing.
-func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool) {
+func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool, carrier any) {
+	pd.lctx = c.pipeLabels(pd.id)
 	c.s.ShapeSpendHandshake(pd.hc.io.HandshakePadding)
 	pd.hc.take(pd.closeAll)
 	c.pipes[pd.id] = pd
-	for _, x := range []any{pd.hc.io.W, pd.hc.io.R} {
-		if cc, ok := x.(CarrierConner); ok {
-			c.s.SetCarrierConn(pd.id, cc.CarrierConn())
-			break
-		}
+	c.s.SetCarrierConn(pd.id, carrier)
+	if !read || !write {
+		pd.worker("pipe-unused", func() {
+			if !read {
+				pd.hc.closeRead()
+			} else {
+				pd.hc.shutdownWrite()
+			}
+		})
 	}
 	c.startChannel(pd) // its receiver before the first record
 	if read && pd.hc.io.R != nil {
@@ -346,46 +334,142 @@ func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool) {
 		pd.gs.add()
 		labels.Go(pd.lctx, "read", func() {
 			defer pd.gs.done()
-			c.readLoop(pd, 0, pd.hc.io.R)
+			c.readLoop(pd, 0, pd.hc.io.R, pd.hc.closeRead)
 		})
 	}
-	if write {
-		c.startWriterLocked(pd)
+	if write && pd.hc.io.W != nil {
+		pd.writer.ctx = labels.With(pd.lctx, "zmux", "write")
+		c.queuePipeWriterLocked(pd)
 	}
 }
 
-// startWriterLocked starts the lane-0 writer of pd.
-func (c *Conn) startWriterLocked(pd *pipeDrv) {
-	if pd.hc.io.W == nil {
-		return
+// queuePipeWriterLocked rechecks work received before handover or
+// while the early-data writer was stopped.
+func (c *Conn) queuePipeWriterLocked(pd *pipeDrv) {
+	if pd.writer.poll.Pending || pd.writer.shutdown != nil {
+		c.s.QueueWriter(pd.id, 0, &pd.writer.poll)
 	}
-	done := make(chan struct{})
-	pd.wstop, pd.wdone = false, done
-	c.side.add()
+}
+
+// worker starts attachment-owned work reserved under the session lock.
+func (pd *pipeDrv) worker(name string, f func()) {
 	pd.gs.add()
-	ready := pd.chReady
-	labels.Go(pd.lctx, "write", func() {
+	pd.c.side.add()
+	labels.Go(pd.lctx, name, func() {
+		defer pd.c.side.done()
 		defer pd.gs.done()
-		defer close(done)
-		if ready != nil {
-			<-ready // the channel's receiver is registered (startChannel)
-		}
-		c.writeLoop(pd, 0, pd.wsig, nil)
+		safeLog(pd.c.cfg.Logger, name, f)
 	})
 }
 
+const writerIdle = time.Second
+
+// A negative idle deadline means the session timer has requested exit.
+const writerExpired core.Time = -1
+
+// laneWriter serializes output on one carrier half. sessMu guards its state.
+type laneWriter struct {
+	wake     core.Signal
+	idleAt   core.Time // zero while active
+	starts   uint64    // reservations over this lane
+	ctx      context.Context
+	shutdown <-chan struct{} // pending half-close, ready after the close code is recorded
+	poll     core.WriteSignal
+	running  bool
+}
+
+func (w *laneWriter) expireLocked(now core.Time) core.Time {
+	if w.idleAt > now {
+		return w.idleAt
+	}
+	if w.idleAt > 0 {
+		w.idleAt = writerExpired
+		w.wake.FireLocked()
+	}
+	return core.Never
+}
+
+type writerStart struct {
+	pd     *pipeDrv
+	lo     *laneOut
+	writer *laneWriter
+	lane   uint64
+}
+
+func (c *Conn) reserveWritersLocked(starts []writerStart) []writerStart {
+	requests := c.s.TakePollRequests()
+	for _, req := range requests {
+		pd := c.pipes[req.Pipe]
+		if c.closing || pd == nil || pd.retiring || pd.dead {
+			continue
+		}
+		select {
+		case <-pd.end.retired:
+			continue
+		default:
+		}
+		if req.Lane == 0 {
+			if !pd.wstop {
+				starts = c.reserveWriterLocked(starts, pd, nil, &pd.writer, 0)
+			}
+		} else if lo := pd.lanes[req.Lane]; lo != nil {
+			starts = c.reserveWriterLocked(starts, pd, lo, &lo.writer, req.Lane)
+		}
+	}
+	clear(requests)
+	return starts
+}
+
+func (c *Conn) reserveWriterLocked(starts []writerStart, pd *pipeDrv, lo *laneOut, w *laneWriter, lane uint64) []writerStart {
+	if w.ctx == nil || w.shutdown == nil && !w.poll.Pending {
+		return starts
+	}
+	if w.running {
+		if w.idleAt != 0 {
+			w.wake.FireLocked()
+		}
+		return starts
+	}
+	w.wake.Make()
+	w.starts++
+	w.running = true
+	pd.gs.add()
+	c.side.add()
+	return append(starts, writerStart{pd, lo, w, lane})
+}
+
+// releaseLocked ends ownership of the carrier half before the epilogue can
+// reserve it again. The worker counts cover the remaining lock-free epilogue.
+func (s writerStart) releaseLocked() {
+	s.writer.idleAt = 0
+	s.writer.running = false
+	if s.lo == nil && s.pd.wdone != nil {
+		close(s.pd.wdone)
+		s.pd.wdone = nil
+	}
+}
+
+func (s writerStart) run() {
+	defer s.pd.c.side.done()
+	defer s.pd.gs.done()
+	pprof.SetGoroutineLabels(s.writer.ctx)
+	if s.lo == nil && s.pd.chReady != nil {
+		<-s.pd.chReady
+	}
+	s.pd.c.writeLoop(s)
+}
+
 // addBootstrap attaches pipe 0 and starts its goroutines (under the lock).
-func (c *Conn) addBootstrap(p PipeIO) {
-	pd := c.newPipeDrv(0, p)
-	pd.nest, _ = nestPipe(c, outerOf(p)) // a new session cannot form a loop
-	low := pd.tcp.setLowWater(singleLowWater)
-	info := carrierInfo(p, pd.tcp, low)
-	c.s.AttachBootstrap(info, info, pd.wsig)
-	c.s.SetPipeKind(0, uint8(p.Carrier)) // before its first record
+func (c *Conn) addBootstrap(a preparedPipe, wait *attachment) {
+	pd := a.pd
+	pd.nest, _ = nestPipe(c, a.outer) // a new session cannot form a loop
+	c.s.AttachBootstrap(a.info, a.info, &pd.writer.poll)
+	c.s.SetPipeKind(0, uint8(pd.hc.io.Carrier)) // before its first record
 	if d, ok := pd.tcp.minRTT(); ok {
 		c.s.SetCarrierMinRTT(core.Duration(d))
 	}
-	c.startPipeLocked(pd, true, true)
+	wait.attach(pd)
+	c.startPipeLocked(pd, true, true, a.carrier)
 }
 
 // bootstrapExporter is the late exporter that the reader of lane 0 of the
@@ -404,13 +488,16 @@ func (c *Conn) bootstrapExporter(pd *pipeDrv, lane uint64) *lateExporter {
 // carrier (its handshake, its early-data verdict), so reads never wait
 // behind writes. A quiet byte stream blocks on a small buffer and holds no
 // pooled read buffer.
-func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
+func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader, closeRead func()) {
 	defer c.side.done()
 	defer func() {
 		if p := recover(); p != nil {
 			c.fail(p)
 		}
 	}()
+	if lane != 0 {
+		defer closeRead() // A replaced driver or a failed reader also releases its lane.
+	}
 	var mr MessageReader
 	if pd.framing == FramingRecords {
 		var ok bool
@@ -499,9 +586,7 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader) {
 				buf.Unref()
 			}
 			if lane == 0 {
-				pd.hc.closeRead()
-			} else if rc, ok := r.(io.Closer); ok {
-				_ = rc.Close()
+				closeRead()
 			}
 			return
 		}
@@ -541,11 +626,16 @@ func (noMessages) ReadMessage(int) ([]byte, error) {
 
 // writeLoop produces batches for one outbound lane and writes them. It owns
 // the lane's write side: no other goroutine writes to it.
-func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut) {
-	defer c.side.done()
+func (c *Conn) writeLoop(start writerStart) {
+	pd, lane, lo := start.pd, start.lane, start.lo
 	defer func() {
 		if p := recover(); p != nil {
-			c.fail(p)
+			c.locked(func() {
+				// A panicking carrier cannot accept another batch.
+				start.writer.ctx = nil
+				start.releaseLocked()
+				c.poison(p)
+			})
 		}
 	}()
 	var w io.Writer = pd.hc.io.W
@@ -566,115 +656,96 @@ func (c *Conn) writeLoop(pd *pipeDrv, lane uint64, sig *core.Signal, lo *laneOut
 	} else if lo == nil && pd.tcp.rc != nil {
 		unsentOf = pd.tcp.unsent
 	}
-	// The carrier's retransmissions (lane 0: lanes share their carrier).
-	var retransOf func() (uint64, bool)
-	if lo == nil {
-		if r, ok := w.(RetransReporter); ok {
-			retransOf = r.Retransmitted
-		} else if pd.tcp.rc != nil {
-			retransOf = pd.tcp.retransmitted
-		}
-	}
-	var retransAt time.Time
+
 	var werr error
-	retired, ended := pd.end.retired, false
+	var ending bool
+
 	for {
 		// Read outside the session lock.
-		var unsent, retrans uint64
-		var unsentOK, retransOK bool
+		var unsent uint64
+		var unsentOK bool
 		if unsentOf != nil {
 			unsent, unsentOK = unsentOf()
 		}
-		if retransOf != nil {
-			if t := time.Now(); t.Sub(retransAt) >= time.Second {
-				retransAt = t
-				retrans, retransOK = retransOf()
-			}
-		}
-		if lo == nil && pd.takeShutdown() {
-			pd.hc.shutdownWrite()
-		}
-		if lo != nil && lo.takeShut() {
-			lo.close(false)
-		}
-		produced, closing, dead := false, false, false
+		var shutdown <-chan struct{}
+		produced, stop, wait := false, false, false
 		func() {
 			c.lock()
 			defer c.unlock()
+			defer func() {
+				if stop {
+					start.releaseLocked()
+				}
+			}()
 			if pd.dead || lo == nil && pd.wstop {
 				if reported {
 					b.Discard()
 					reported = false
 				}
-				dead = true
+				stop = true
 				return
 			}
+			if start.writer.idleAt == writerExpired && !start.writer.poll.Pending && start.writer.shutdown == nil {
+				stop = true
+				return
+			}
+			start.writer.idleAt = 0
 			now := c.clk.now()
 			if unsentOK {
-				c.s.SetCarrierUnsent(pd.id, lane, unsent)
-			}
-			if retransOK {
-				c.s.SetCarrierRetransmitted(pd.id, retrans)
+				c.s.SetCarrierUnsent(pd.id, lane, unsent, now)
 			}
 			if reported {
 				c.s.WriteDone(b, werr, now)
 				reported = false
 			}
-			if werr == nil {
+			shutdown = start.writer.shutdown
+			start.writer.shutdown = nil
+			if shutdown == nil && werr == nil {
 				if b == nil {
 					b = core.GetBatch()
 				}
+				start.writer.poll.Pending = false
 				produced = c.s.PollTransmit(pd.id, lane, b, core.DefaultBatch, now)
 			}
-			closing = c.closing
+			stop = !produced && shutdown == nil && (werr != nil || c.closing || pd.retiring || ending)
+			if !stop && !produced && shutdown == nil && !start.writer.poll.Pending {
+				start.writer.idleAt = now.Add(core.Duration(writerIdle))
+				c.writerIdleAt = min(c.writerIdleAt, start.writer.idleAt)
+				start.writer.wake.Drain()
+				wait = true
+			}
 		}()
-		if dead {
+		if stop {
 			return
+		}
+		if wait {
+			core.PutBatch(b)
+			b = nil
+			select {
+			case <-start.writer.wake.C:
+			case <-pd.end.retired:
+				ending = true
+			case <-c.done:
+				ending = true
+			}
+			continue
 		}
 		if produced {
 			_, werr = writeBatch(w, pd.framing, b)
 			reported = true
 			if b.Shutdown {
-				if lo == nil {
-					pd.requestShutdown()
-				} else {
-					lo.requestShut()
-				}
+				shutdown = closedChan
 			}
-			continue
 		}
-		if closing || werr != nil || ended {
-			return
-		}
-		if b != nil {
-			core.PutBatch(b) // nothing to send: wait without it
-			b = nil
-		}
-		select {
-		case <-sig.C:
-		case <-c.done:
-			return
-		case <-retired:
-			// The attachment is gone: one more pass for what was queued
-			// (a shutdown), then the writer ends.
-			retired, ended = nil, true
+		if shutdown != nil {
+			<-shutdown
+			if lo == nil {
+				pd.hc.shutdownWrite()
+			} else {
+				lo.close(false)
+			}
 		}
 	}
-}
-
-func (l *laneOut) requestShut() {
-	l.smu.Lock()
-	l.shut = true
-	l.smu.Unlock()
-	l.sig.Fire()
-}
-
-func (l *laneOut) takeShut() bool {
-	l.smu.Lock()
-	defer l.smu.Unlock()
-	s := l.shut
-	l.shut = false
-	return s
 }
 
 // batchWriter takes a batch without a copy (a stream carrying a nested
@@ -738,36 +809,39 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 // openLane opens a requested outbound lane outside the lock.
 func (c *Conn) openLane(pd *pipeDrv) {
 	defer c.side.done()
-	ctx, cancel := context.WithCancel(c.ctx)
-	defer cancel()
-	w, err := pd.opener.OpenLane(ctx)
+	defer pd.gs.done()
+	var w io.WriteCloser
+	err := hostCall(c.cfg.Logger, "LaneOpener.OpenLane", func() error {
+		var err error
+		w, err = pd.opener.OpenLane(pd.openCtx)
+		return err
+	})
+	defer func() {
+		if w != nil {
+			safeLog(c.cfg.Logger, "lane close", func() { _ = w.Close() })
+		}
+	}()
 	c.lock()
 	defer c.unlock()
-	if err != nil || c.closing {
+	if pd.retiring || pd.dead || c.pipes[pd.id] != pd {
+		return
+	}
+	if err != nil || c.closing || w == nil {
 		c.s.LaneOpenFailed(pd.id)
-		if w != nil {
-			_ = w.Close()
-		}
 		return
 	}
-	lo := &laneOut{w: w, sig: core.NewSignal()}
+	lo := &laneOut{w: w, writer: laneWriter{ctx: labels.With(pd.lctx, "zmux", "lane-write")}}
 	info := core.CarrierInfo{Framing: core.Framing(pd.framing), Lanes: true, MaxRecord: pd.maxRec}
-	lane, ok := c.s.LaneOpened(pd.id, info, lo.sig)
+	lane, ok := c.s.LaneOpened(pd.id, info, &lo.writer.poll)
 	if !ok {
-		_ = w.Close()
 		return
 	}
+	w = nil // The lane now owns its writer.
 	lo.lane = lane
 	if pd.lanes == nil {
 		pd.lanes = map[uint64]*laneOut{}
 	}
 	pd.lanes[lane] = lo
-	c.side.add()
-	pd.gs.add()
-	labels.Go(pd.lctx, "lane-write", func() {
-		defer pd.gs.done()
-		c.writeLoop(pd, lane, lo.sig, lo)
-	})
 }
 
 // ---- carrier commands ----
@@ -778,12 +852,14 @@ func (c *Conn) openLane(pd *pipeDrv) {
 // performed, and a command looked up then would be lost (an aborted half
 // that is never closed blocks its goroutine for good).
 type pendingAct struct {
-	pd     *pipeDrv
-	lo     *laneOut
-	reason string
-	a      core.Action
-	code   ApplicationErrorCode
-	start  bool
+	pd            *pipeDrv
+	lo            *laneOut
+	reason        string
+	a             core.Action
+	code          ApplicationErrorCode
+	shutdownReady chan struct{}
+	reserved      bool // action may touch the carrier until doAction returns
+	start         bool
 	// coded: the session has ended, with an application close of code and
 	// reason or (0, "") otherwise, before this command ended the pipe
 	// (CloseCodeRecorder). The
@@ -796,8 +872,32 @@ type pendingAct struct {
 func (c *Conn) resolveActionLocked(a core.Action) pendingAct {
 	pa := pendingAct{a: a, pd: c.pipes[a.Pipe]}
 	if pd := pa.pd; pd != nil {
+		if pd.retiring {
+			// An abort may expedite the outstanding graceful-close timer.
+			if a.Kind != core.ActAbort {
+				pa.pd = nil
+			}
+			return pa
+		}
+		pd.gs.add()
+		pa.reserved = true
 		pa.lo = pd.lanes[a.Lane]
-		if a.Kind == core.ActOpenLane && pd.opener != nil && !c.closing {
+		if a.Kind == core.ActShutdown {
+			pa.shutdownReady = make(chan struct{})
+			if a.Lane == 0 {
+				pd.shutReq = true
+				pd.writer.shutdown = pa.shutdownReady
+				c.s.QueueWriter(a.Pipe, a.Lane, &pd.writer.poll)
+			} else if pa.lo != nil {
+				pa.lo.writer.shutdown = pa.shutdownReady
+				c.s.QueueWriter(a.Pipe, a.Lane, &pa.lo.writer.poll)
+			}
+		}
+		if a.Kind == core.ActOpenLane && pd.opener != nil && !c.closing && !pd.retiring {
+			if pd.openCtx == nil {
+				pd.openCtx, pd.stopOpen = context.WithCancel(c.ctx) //nolint:gosec // closeHalves cancels the attachment's pending opens.
+			}
+			pd.gs.add()
 			c.side.add()
 			pa.start = true
 		}
@@ -819,15 +919,15 @@ func (c *Conn) doAction(pa pendingAct) {
 	if pd == nil {
 		return
 	}
+	if pa.reserved {
+		defer pd.gs.done()
+	}
 	switch a.Kind {
 	case core.ActShutdown:
+		// The lane owns the half-close. Release it after the host callback.
+		defer close(pa.shutdownReady)
 		if pa.coded {
 			pd.hc.recordCloseCode(pa.code, pa.reason)
-		}
-		if a.Lane == 0 {
-			pd.requestShutdown()
-		} else if lo != nil {
-			lo.requestShut()
 		}
 	case core.ActAbort:
 		if pa.coded {
@@ -850,9 +950,7 @@ func (c *Conn) doAction(pa pendingAct) {
 		}
 	case core.ActOpenLane:
 		if start {
-			if !c.goSide(pd.lctx, "lane-open", func() { c.openLane(pd) }) {
-				c.side.done() // the session ended: no lane opens
-			}
+			labels.Go(pd.lctx, "lane-open", func() { c.openLane(pd) })
 		} else if pd.opener == nil {
 			// A full critical section: the wakes and actions the failure
 			// produces run now, and a panic poisons the session.
@@ -871,73 +969,87 @@ func (c *Conn) doAction(pa pendingAct) {
 
 // closeAll aborts every half and lane of the attachment.
 func (pd *pipeDrv) closeAll() {
-	pd.smu.Lock()
-	t := pd.graceT
-	pd.smu.Unlock()
-	if t != nil {
-		// Closed gracefully before: the abort the bound holds runs now.
-		if t.Stop() {
-			pd.graceAbort()
-		}
-		return
-	}
-	pd.closeHalves(true)
+	pd.closeHalves(true, 0)
 }
 
-// closeGraceful closes every half and lane of the attachment without
-// aborting: the write sides end as a close, never as a reset. A carrier
-// whose graceful close has not ended after bound is aborted then (SPEC.md
-// Section 6.5 step 4): a close never leaves the carrier's work unbounded.
 func (pd *pipeDrv) closeGraceful(bound time.Duration) {
-	lanes := pd.closeHalves(false)
-	pd.smu.Lock()
-	defer pd.smu.Unlock()
-	if pd.graceT != nil {
+	pd.closeHalves(false, bound)
+}
+
+// Retirement claims the halves and reserves the abort timer before the
+// first host close. A concurrent abort can bring the timer forward.
+func (pd *pipeDrv) closeHalves(abort bool, bound time.Duration) {
+	var lanes []*laneOut
+	var in map[*inboundLane]struct{}
+	var stop context.CancelFunc
+	var escalate func()
+	owner := false
+	pd.c.peek(func() {
+		if pd.retiring {
+			if abort && pd.graceT != nil && pd.graceT.Stop() {
+				escalate = pd.graceAb
+			}
+			return
+		}
+		owner = true
+		pd.retiring = true
+		pd.writer.wake.FireLocked()
+		for _, lo := range pd.lanes {
+			lo.writer.wake.FireLocked()
+			lanes = append(lanes, lo)
+		}
+		stop = pd.stopOpen
+		in, pd.inLanes = pd.inLanes, nil
+		refs := int32(1) // the close pass
+		if !abort {
+			refs++ // independently scheduled abort
+		}
+		for lane := range in {
+			if !lane.owner.reserveRefs(refs) {
+				delete(in, lane)
+			}
+		}
+		if !abort {
+			pd.gs.add()
+			pd.graceAb = func() {
+				defer pd.gs.done()
+				defer pd.c.peek(func() { pd.graceAb, pd.graceT = nil, nil })
+				for lane := range in {
+					lane.abort()
+					lane.owner.release()
+				}
+				safeLog(pd.c.cfg.Logger, "carrier Abort", func() { pd.hc.abort(net.ErrClosed) })
+				for _, lo := range lanes {
+					lo.abort()
+				}
+			}
+			pd.graceT = time.AfterFunc(bound, pd.graceAb)
+		}
+	})
+	if escalate != nil {
+		escalate()
+	}
+	if !owner {
 		return
 	}
-	for _, l := range lanes {
-		if a, ok := l.w.(Aborter); ok {
-			pd.graceAb = append(pd.graceAb, a)
-		}
+	if stop != nil {
+		stop()
 	}
-	// Host clock: a bound on carrier IO (Time). Nothing tells when the
-	// carrier's own close work ends, so the abort runs at the bound (on a
-	// carrier that already ended it does nothing), or earlier when the
-	// attachment is aborted meanwhile (closeAll).
-	pd.graceT = time.AfterFunc(bound, pd.graceAbort)
-}
-
-// graceAbort aborts what closeGraceful closed: the pipe's write side and
-// its lanes.
-func (pd *pipeDrv) graceAbort() {
-	pd.hc.abort(net.ErrClosed)
-	for _, a := range pd.graceAb {
-		a.Abort(net.ErrClosed)
-	}
-}
-
-// closeHalves closes every half and lane of the attachment and returns the
-// outbound lanes it closed.
-func (pd *pipeDrv) closeHalves(abort bool) []*laneOut {
 	pd.endChannel()
-	pd.hc.closeAll(abort, net.ErrClosed)
-	var lanes []*laneOut
-	var in []io.ReadCloser
-	pd.c.peek(func() {
-		lanes = make([]*laneOut, 0, len(pd.lanes))
-		for _, l := range pd.lanes {
-			lanes = append(lanes, l)
+	safeLog(pd.c.cfg.Logger, "carrier close", func() { pd.hc.closeAll(abort, net.ErrClosed) })
+	for _, lo := range lanes {
+		safeLog(pd.c.cfg.Logger, "lane close", func() { lo.close(abort) })
+	}
+	for lane := range in {
+		if abort {
+			lane.abort()
 		}
-		in = pd.inLanes
-		pd.inLanes = nil
-	})
-	for _, l := range lanes {
-		l.close(abort)
+		lane.close()
+		lane.owner.release()
 	}
-	for _, r := range in {
-		_ = r.Close()
+	if pd.hasOwner {
+		pd.gs.done()
 	}
-	return lanes
 }
 
 // fail closes the session after a panic outside the lock.

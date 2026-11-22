@@ -68,6 +68,7 @@ type Config struct {
 	Headroom     int
 	ReplayWindow int
 	Resume       Duration
+	IdleTimeout  Duration // exact local override; zero uses Local.MaxIdleTimeout
 
 	SpreadChunk   int
 	SuspectFloor  Duration
@@ -141,6 +142,9 @@ type Config struct {
 	Policy     Policy
 	Redundancy bool
 
+	PathAdvice   bool // a host consumes sustained path quality events
+	TraceStreams bool // opt-in stream placement and receive-gap tracing
+
 	EarlyZmuxPeer   bool
 	EarlyReplayable bool
 	// EarlyCarrier: the bootstrap carrier reports a verdict on its early
@@ -163,8 +167,9 @@ type TestHooks struct {
 	PipeCap            int
 	// Seed seeds the session's random source of non-secret draws (probe
 	// jitter); 0: a random seed. Honoured without Enabled.
-	Seed    uint64
-	Enabled bool
+	Seed           uint64
+	NoPrefixRepair bool
+	Enabled        bool
 }
 
 // DefaultConfig returns the default configuration with the local

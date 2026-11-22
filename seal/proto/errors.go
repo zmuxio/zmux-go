@@ -57,6 +57,7 @@ var errorClasses = []struct {
 	e error
 	n string
 }{
+	{ErrCredentialsFailed, "credentials_failed"},
 	{ErrIncomplete, "incomplete"}, {ErrMalformed, "malformed"}, {ErrTrailing, "trailing_bytes"},
 	{ErrUnknownProfile, "unknown_profile"}, {ErrUnknownSuite, "unknown_suite"},
 	{ErrPeerIsSelf, "peer_is_self"}, {ErrRandomFailed, "random_failed"}, {ErrInvalidConfig, "invalid_config"},
@@ -65,5 +66,5 @@ var errorClasses = []struct {
 	{ErrTooLarge, "too_large"}, {ErrExhausted, "exhausted"}, {ErrTLVTruncated, "tlv_truncated"},
 	{ErrTLVNonMinimal, "tlv_non_minimal"}, {ErrTLVOrder, "tlv_order"},
 	{ErrTLVUnknownCritical, "tlv_unknown_critical"}, {ErrTLVCredentials, "tlv_credentials"},
-	{ErrCredentialsFailed, "credentials_failed"}, {ErrState, "state"},
+	{ErrState, "state"},
 }

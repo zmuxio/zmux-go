@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // VerdictDefer defers a decision only on an upgrade's head (AdmitUpgrade):
@@ -72,6 +74,99 @@ func TestAdmissionDeferOnlyUpgrades(t *testing.T) {
 	}
 }
 
+type observedPeekConn struct {
+	net.Conn
+	reads chan struct{}
+}
+
+func (c *observedPeekConn) Read(p []byte) (int, error) {
+	c.reads <- struct{}{}
+	return c.Conn.Read(p)
+}
+
+func TestAdmissionDeferredByteStreamTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		peek int
+		more bool
+	}{
+		{name: "initial", peek: 4},
+		{name: "more", peek: 1, more: true},
+		{name: "more from empty", more: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const timeout = time.Second
+			clk := timeshim.NewFake(time.Now())
+			cfg := mpConfig()
+			cfg.Clock = clk
+			called := make(chan struct{}, 1)
+			lst := mustNewListener(&ListenerConfig{Config: cfg,
+				Admission: &Admission{Peek: tc.peek, MaxPeek: 4, PeekTimeout: timeout, FallbackOnPeekTimeout: true,
+					Decide: func(_ context.Context, info CarrierInfo, _ []byte) Decision {
+						if info.Stage == StageHead {
+							return Decision{Verdict: VerdictDefer}
+						}
+						if tc.more {
+							return Decision{Verdict: VerdictMore, Need: 4}
+						}
+						return Decision{Verdict: VerdictAccept}
+					}},
+				Fallback: func(context.Context, *Takeover) { called <- struct{}{} },
+			})
+			t.Cleanup(func() { _ = lst.Close() })
+			a, ok := lst.Adapter().AdmitUpgrade(httptest.NewRecorder(), httptest.NewRequest(http.MethodConnect, "/", http.NoBody), nil, nil)
+			if !ok {
+				t.Fatal("upgrade head did not defer")
+			}
+			t.Cleanup(a.Release)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			x, y := net.Pipe()
+			defer func() { _ = y.Close() }()
+			reads := make(chan struct{}, 2)
+			done := make(chan bool, 1)
+			go func() {
+				_, accepted := a.AdmitFirst(ctx, func(context.Context) (PipeIO, error) {
+					return NetPipe(&observedPeekConn{Conn: x, reads: reads}), nil
+				})
+				done <- accepted
+			}()
+			waitRead := func() {
+				t.Helper()
+				select {
+				case <-reads:
+				case <-ctx.Done():
+					t.Fatal("prefix read did not start")
+				}
+			}
+			waitRead()
+			if tc.more && tc.peek > 0 {
+				if _, err := y.Write([]byte("x")); err != nil {
+					t.Fatal(err)
+				}
+				waitRead()
+			}
+			clk.Advance(timeout)
+			select {
+			case accepted := <-done:
+				if accepted {
+					t.Fatal("accepted an incomplete prefix")
+				}
+			case <-ctx.Done():
+				t.Fatal("admission outlived its peek deadline")
+			}
+			select {
+			case <-called:
+				t.Fatal("incomplete deferred prefix reached fallback")
+			default:
+			}
+			if got := lst.Stats().Admission; got != (AdmissionStats{PeekTimedOut: 1}) {
+				t.Fatalf("stats %+v", got)
+			}
+		})
+	}
+}
+
 // loop is a source for arrivals made by hand.
 var loop = netip.MustParseAddrPort("127.0.0.1:1")
 
@@ -92,10 +187,10 @@ func catchAbort(f func()) (err error) {
 func TestAdmissionFallbackPipe(t *testing.T) {
 	type seen struct {
 		info   CarrierInfo
+		hasErr error
 		read   []byte
 		conn   bool
 		sameW  bool
-		hasErr error
 	}
 	got := make(chan seen, 1)
 	a, b := net.Pipe()
@@ -118,8 +213,8 @@ func TestAdmissionFallbackPipe(t *testing.T) {
 		c.info.Stage != StageCarrier || c.info.Framing != FramingByteStream || c.info.Source != c.info.Peer {
 		t.Fatalf("takeover %+v", c)
 	}
-	if err := <-done; err == nil {
-		t.Fatal("a carrier taken over reported no rejection")
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 	// zmux closed the carrier once Fallback returned.
 	_ = b.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -175,7 +270,7 @@ func TestPeekInterruptedByStop(t *testing.T) {
 	deadline := time.Now().Add(time.Hour)
 	sh := &streamHalf{}
 	sp := owned(PipeIO{R: sh})
-	if prefix, fired, _ := a.peekPipe(ctx, sp, nil, 4, deadline); prefix != nil || fired || sh.closed.Load() != 1 {
+	if prefix, fired, _, failed := a.peekPipe(ctx, sp, nil, 4, deadline, false); prefix != nil || fired || !failed || sh.closed.Load() != 1 {
 		t.Fatalf("stream: prefix %q, fired %v, closed %d", prefix, fired, sh.closed.Load())
 	}
 	mh := &msgHalf{}
@@ -228,33 +323,33 @@ func TestAdmissionAdmitFirst(t *testing.T) {
 	blocked := func(ctx context.Context) (PipeIO, error) { <-ctx.Done(); return PipeIO{}, ctx.Err() }
 	failed := func(context.Context) (PipeIO, error) { return PipeIO{}, io.ErrUnexpectedEOF }
 	for _, x := range []struct {
+		run     func(*Listener, *Arrival) bool
 		name    string
 		verdict AdmissionVerdict
 		timeout time.Duration
-		run     func(*Listener, *Arrival) bool
 		want    AdmissionStats
 	}{
-		{"timed out", VerdictDefer, 20 * time.Millisecond, func(_ *Listener, a *Arrival) bool {
+		{name: "timed out", verdict: VerdictDefer, timeout: 20 * time.Millisecond, run: func(_ *Listener, a *Arrival) bool {
 			_, ok := a.AdmitFirst(context.Background(), blocked)
 			return ok
-		}, AdmissionStats{PeekTimedOut: 1}},
-		{"listener closed", VerdictDefer, time.Minute, func(l *Listener, a *Arrival) bool {
+		}, want: AdmissionStats{PeekTimedOut: 1}},
+		{name: "listener closed", verdict: VerdictDefer, timeout: time.Minute, run: func(l *Listener, a *Arrival) bool {
 			go func() { time.Sleep(10 * time.Millisecond); _ = l.Close() }()
 			_, ok := a.AdmitFirst(context.Background(), blocked)
 			return ok
-		}, AdmissionStats{Closed: 1}},
-		{"upgrade failed", VerdictDefer, time.Minute, func(_ *Listener, a *Arrival) bool {
+		}, want: AdmissionStats{Closed: 1}},
+		{name: "upgrade failed", verdict: VerdictDefer, timeout: time.Minute, run: func(_ *Listener, a *Arrival) bool {
 			_, ok := a.AdmitFirst(context.Background(), failed)
 			return ok
-		}, AdmissionStats{HandshakeFailed: 1}},
-		{"released", VerdictDefer, time.Minute, func(_ *Listener, a *Arrival) bool { a.Release(); return false },
-			AdmissionStats{Closed: 1}},
-		{"head accepted", VerdictAccept, time.Minute, func(_ *Listener, a *Arrival) bool {
+		}, want: AdmissionStats{HandshakeFailed: 1}},
+		{name: "released", verdict: VerdictDefer, timeout: time.Minute, run: func(_ *Listener, a *Arrival) bool { a.Release(); return false },
+			want: AdmissionStats{Closed: 1}},
+		{name: "head accepted", verdict: VerdictAccept, timeout: time.Minute, run: func(_ *Listener, a *Arrival) bool {
 			x, y := net.Pipe()
 			defer func() { _ = x.Close(); _ = y.Close() }()
 			p, ok := a.AdmitFirst(context.Background(), func(context.Context) (PipeIO, error) { return NetPipe(x), nil })
 			return ok && p.R == x
-		}, AdmissionStats{Accepted: 1}},
+		}, want: AdmissionStats{Accepted: 1}},
 	} {
 		lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{PeekTimeout: x.timeout,
 			Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: x.verdict} }}})

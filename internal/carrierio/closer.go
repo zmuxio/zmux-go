@@ -3,6 +3,8 @@ package carrierio
 import (
 	"io"
 	"sync/atomic"
+
+	"github.com/zmuxio/zmux-go/internal/poolhost"
 )
 
 // Closer states.
@@ -19,10 +21,10 @@ const (
 // the halves are one value. Release hands the halves to their next owner,
 // to which a later Close is forwarded.
 type Closer struct {
-	r, w  io.Closer // r nil when it is w
-	next  func()    // the next owner's close; set before the release
-	state atomic.Uint32
+	r, w  io.Closer     // r nil when it is w
+	next  func()        // the next owner's close; set before the release
 	done  chan struct{} // closed once the halves are closed
+	state atomic.Uint32
 }
 
 // NewCloser returns the closer of the halves r and w (either may be nil).
@@ -58,10 +60,10 @@ func (c *Closer) CloseUnreleased() (released bool) {
 	}
 	defer close(c.done)
 	if c.w != nil {
-		_ = c.w.Close()
+		CloseHalf(c.w)
 	}
 	if c.r != nil {
-		_ = c.r.Close()
+		CloseHalf(c.r)
 	}
 	return false
 }
@@ -73,4 +75,9 @@ func (c *Closer) CloseUnreleased() (released bool) {
 func (c *Closer) Release(next func()) bool {
 	c.next = next
 	return c.state.CompareAndSwap(closerOpen, closerReleased)
+}
+
+// CloseHalf contains a host panic so teardown continues with the other half.
+func CloseHalf(h io.Closer) {
+	poolhost.Safe(nil, "carrier Close", func() { _ = h.Close() })
 }

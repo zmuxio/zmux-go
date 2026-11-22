@@ -114,7 +114,7 @@ func offered(protocols []string) ([]string, error) {
 // o.Next, and an upgrade request then passes l's admission
 // (zmux.Listener.AdmitUpgrade, decided on the request head, without a
 // prefix). An accepted request is answered with 101 and its connection is
-// handed to the listener for its lifetime (zmux.Arrival.HandlePipe), with
+// handed to the listener (zmux.Arrival.HandlePipe), with
 // the request's source (o.Trusted). A head decision of zmux.VerdictDefer
 // defers the admission to the connection's first message: the request is
 // answered with 101 (zmux.Arrival.AdmitFirst), and the decision on that
@@ -166,14 +166,28 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.o.Fallback(w, r)
 		return
 	}
-	a, ok := h.l.Adapter().AdmitUpgrade(w, r, h.o.Trusted, http.HandlerFunc(h.o.Fallback))
+	a, ok := h.l.Adapter().AdmitUpgrade(w, r, h.o.Trusted, h.o.Next)
 	if !ok {
 		return
 	}
 	var c *wsconn.Conn
-	p, ok := a.AdmitFirst(r.Context(), func(context.Context) (zmux.PipeIO, error) {
+	p, ok := a.AdmitFirst(r.Context(), func(setup context.Context) (zmux.PipeIO, error) {
+		req := r
+		if hs.ExtendedConnect {
+			// wshttp retains the request context for the HTTP/2 stream.
+			// Bound the upgrade flush without shortening that lifetime.
+			finished := make(chan struct{})
+			stop := context.AfterFunc(setup, func() { defer close(finished); _ = http.NewResponseController(w).SetWriteDeadline(time.Now()) })
+			defer func() {
+				if !stop() {
+					<-finished
+				}
+			}()
+		} else {
+			req = r.WithContext(setup)
+		}
 		var err error
-		if c, err = wshttp.Accept(w, r, hs); err != nil {
+		if c, err = wshttp.Accept(w, req, hs); err != nil {
 			if _, ok := errors.AsType[*wsconn.HandshakeError](err); ok {
 				// Nothing was answered.
 				h.o.Fallback(w, r)
@@ -189,10 +203,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = a.HandlePipe(r.Context(), p, zmux.PipeHint{})
 	}
 	// Over an HTTP/2 stream, the handler outlives the connection.
-	select {
-	case <-wshttp.Done(c):
-	case <-r.Context().Done():
-	}
+	<-wshttp.Done(c)
 }
 
 // ---- client ----
@@ -542,7 +553,11 @@ func (p *carrier) WriteMessages(msgs [][]byte) error {
 
 var _ zmux.MessageBatchWriter = (*carrier)(nil)
 
-func (p *carrier) Read([]byte) (int, error)  { return 0, errMessageCarrier }
+func (p *carrier) Read([]byte) (int, error) { return 0, errMessageCarrier }
+
+// CarrierConn identifies the connection shared by the WebSocket's halves.
+func (p *carrier) CarrierConn() any { return p.c.NetConn() }
+
 func (p *carrier) Write([]byte) (int, error) { return 0, errMessageCarrier }
 
 // CloseWrite sends a close frame: the graceful end of the pipe.

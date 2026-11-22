@@ -64,22 +64,22 @@ func TestExportedDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range []struct {
-		name      string
 		got, want any
+		name      string
 	}{
-		{"DefaultKeepAlivePeriod", DefaultKeepAlivePeriod, 15 * time.Second},
-		{"keep-alive in effect", time.Duration(cc.KeepAlive), DefaultKeepAlivePeriod},
-		{"DefaultMaxIdleTimeout", DefaultMaxIdleTimeout, 30 * time.Second},
-		{"idle timeout in effect", time.Duration(cc.Local.MaxIdleTimeout) * time.Millisecond, DefaultMaxIdleTimeout},
-		{"DefaultProbeJitter", DefaultProbeJitter, 0.25},
-		{"probe jitter in effect", cc.ProbeJitter, DefaultProbeJitter},
-		{"DefaultMaxRecordSize", DefaultMaxRecordSize, 16382},
-		{"shaping.DefaultMaxDelay", shaping.DefaultMaxDelay, time.Second},
-		{"shaping.MinMaxLen", shaping.MinMaxLen, 64},
-		{"DefaultMinBackoff", DefaultMinBackoff, time.Second},
-		{"DefaultMaxBackoff", DefaultMaxBackoff, 60 * time.Second},
-		{"DefaultJoinTimeout", DefaultJoinTimeout, 10 * time.Second},
-		{"join timeout in effect", time.Duration(cc.JoinTimeout), DefaultJoinTimeout},
+		{name: "DefaultKeepAlivePeriod", got: DefaultKeepAlivePeriod, want: 15 * time.Second},
+		{name: "keep-alive in effect", got: time.Duration(cc.KeepAlive), want: DefaultKeepAlivePeriod},
+		{name: "DefaultMaxIdleTimeout", got: DefaultMaxIdleTimeout, want: 30 * time.Second},
+		{name: "idle timeout in effect", got: time.Duration(cc.Local.MaxIdleTimeout) * time.Millisecond, want: DefaultMaxIdleTimeout},
+		{name: "DefaultProbeJitter", got: DefaultProbeJitter, want: 0.25},
+		{name: "probe jitter in effect", got: cc.ProbeJitter, want: DefaultProbeJitter},
+		{name: "DefaultMaxRecordSize", got: DefaultMaxRecordSize, want: 16382},
+		{name: "shaping.DefaultMaxDelay", got: shaping.DefaultMaxDelay, want: time.Second},
+		{name: "shaping.MinMaxLen", got: shaping.MinMaxLen, want: 64},
+		{name: "DefaultMinBackoff", got: DefaultMinBackoff, want: time.Second},
+		{name: "DefaultMaxBackoff", got: DefaultMaxBackoff, want: 60 * time.Second},
+		{name: "DefaultJoinTimeout", got: DefaultJoinTimeout, want: 10 * time.Second},
+		{name: "join timeout in effect", got: time.Duration(cc.JoinTimeout), want: DefaultJoinTimeout},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s: %v (%T), want %v (%T)", c.name, c.got, c.got, c.want, c.want)

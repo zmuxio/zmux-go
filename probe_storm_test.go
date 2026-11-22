@@ -52,7 +52,7 @@ func TestShapingDelayKeepsAcknowledgementsInTime(t *testing.T) {
 	sc.Liveness.ProbeInterval = time.Hour
 	e := newMPEnv(t, cc, sc)
 	var plans atomic.Int64
-	shp := func(ShapedPipe) shaping.Shaper { return delayCounter{2 * time.Second, &plans} }
+	shp := func(ShapedPipe) shaping.Shaper { return delayCounter{delay: 2 * time.Second, plans: &plans} }
 	e.client.SetShaper(shp, nil)
 	e.server.SetShaper(shp, nil)
 	const inc = 20 * time.Millisecond

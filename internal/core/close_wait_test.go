@@ -34,14 +34,14 @@ type cwLink struct {
 }
 
 type cwSim struct {
-	t       *testing.T
-	end     [2]*Session
-	links   map[cwKey]*cwLink
-	delay   Duration // one way
-	info    CarrierInfo
-	now     Time
 	conn    [2]any
+	end     [2]*Session
+	t       *testing.T
+	links   map[cwKey]*cwLink
 	actions []Action
+	info    CarrierInfo
+	delay   Duration // one way
+	now     Time
 }
 
 var errCWDead = errors.New("carrier failed")
@@ -204,10 +204,10 @@ func (m *cwSim) closeSent(i int) bool {
 // reader collects what a stream of side i carries.
 type cwReader struct {
 	m   *cwSim
-	i   int
 	st  *Stream
 	got []byte
 	buf []byte
+	i   int
 }
 
 func (r *cwReader) read() {

@@ -1,5 +1,46 @@
 package core
 
+// WriteSignal coalesces a lane's requests for a transmit poll. The core
+// sets it and the driver clears it immediately before polling, under the
+// same session lock. A request made by the poll itself survives that poll.
+type WriteSignal struct {
+	Pending bool
+	queued  bool // queue membership only, including driver-requested shutdown
+}
+
+// PollRequest identifies a lane to check for a writer reservation.
+type PollRequest struct {
+	signal     *WriteSignal
+	Pipe, Lane uint64
+}
+
+func (s *Session) requestPoll(pipe, lane uint64, w *WriteSignal) {
+	if w != nil && !w.Pending {
+		w.Pending = true
+		s.QueueWriter(pipe, lane, w)
+	}
+}
+
+// QueueWriter schedules a reservation check for a poll, a shutdown, or a
+// writer becoming eligible with work already pending.
+func (s *Session) QueueWriter(pipe, lane uint64, w *WriteSignal) {
+	if !w.queued {
+		w.queued = true
+		s.pollRequests = append(s.pollRequests, PollRequest{Pipe: pipe, Lane: lane, signal: w})
+	}
+}
+
+// TakePollRequests borrows the session's list until the next QueueWriter.
+// The driver resolves all entries under the lock before producing more work.
+func (s *Session) TakePollRequests() []PollRequest {
+	requests := s.pollRequests
+	for _, req := range requests {
+		req.signal.queued = false
+	}
+	s.pollRequests = requests[:0]
+	return requests
+}
+
 // Signal is a single-waiter wake-up slot.
 // The core queues it when the waiter's condition may have become true; the
 // driver delivers it after releasing the lock. Its channel has capacity one

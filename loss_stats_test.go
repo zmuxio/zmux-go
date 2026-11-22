@@ -33,7 +33,4 @@ func TestPipeStatsLoss(t *testing.T) {
 	}
 	// A failed pipe retires at once here, so its failure figures are
 	// checked in the core (TestStatsBytesLost).
-	if st.BytesRetransmitted != 0 || st.LossRate != 0 {
-		t.Fatalf("loopback carrier: %d retransmitted, rate %v", st.BytesRetransmitted, st.LossRate)
-	}
 }

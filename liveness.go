@@ -201,7 +201,7 @@ func (l *PipeLiveness) core() (core.PipeLiveness, error) {
 // value at or below the current one leaves that type as it is, so 0
 // raises nothing. While the unidirectional credit is still staged
 // (MaxIncomingUniStreams zero), uni raises the value the first
-// AcceptUniStream moves it to. After GOAWAY no credit is sent. A negative
+// AcceptUniStream or HandleUniStreams moves it to. After GOAWAY no credit is sent. A negative
 // value or one above MaxStreamCredit is an ErrInvalidConfig error that
 // changes nothing.
 func (c *Conn) RaiseIncomingStreams(bidi, uni int64) error {
@@ -214,3 +214,19 @@ func (c *Conn) RaiseIncomingStreams(bidi, uni int64) error {
 	c.s.RaiseIncomingStreams(false, uint64(uni))
 	return nil
 }
+
+// PipePathQualityReason is the evidence for EventPipePathQuality.
+type PipePathQualityReason uint8
+
+const (
+	// PipePathQualityUnknown lacks enough current evidence to classify the episode.
+	PipePathQualityUnknown = PipePathQualityReason(core.PathQualityUnknown)
+	// PipePathQualityHealthySibling found a recently healthy outbound sibling in the same fate group.
+	PipePathQualityHealthySibling = PipePathQualityReason(core.PathQualityHealthySibling)
+	// PipePathQualityLocalStall found a write stall or sustained queue on this connection with no observed RTT rise.
+	PipePathQualityLocalStall = PipePathQualityReason(core.PathQualityLocalStall)
+	// PipePathQualityShared found that all observed outbound siblings in the fate group are deteriorating.
+	PipePathQualityShared = PipePathQualityReason(core.PathQualityShared)
+	// PipePathQualityRestored reports that recent measurements cleared the deterioration.
+	PipePathQualityRestored = PipePathQualityReason(core.PathQualityRestored)
+)

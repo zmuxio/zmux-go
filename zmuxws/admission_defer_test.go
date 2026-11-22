@@ -312,3 +312,38 @@ func TestAdmissionDeferredUpgradeEdges(t *testing.T) {
 		waitStats(t, e.l, func(st zmux.AdmissionStats) bool { return st == zmux.AdmissionStats{Closed: 1} })
 	})
 }
+
+// HS-19.
+func TestHeadTakeoverUpgradesBeforeHandoff(t *testing.T) {
+	ctx := testContext(t)
+	e := newDeferEnv(t, 0, 0, &zmux.Admission{Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
+		if info.Stage != zmux.StageHead || !info.Upgrade {
+			t.Error("upgrade decision repeated")
+		}
+		return zmux.Decision{Verdict: zmux.VerdictTakeover}
+	}}, func(_ context.Context, tk *zmux.Takeover) {
+		m, err := tk.Pipe().R.(zmux.MessageReader).ReadMessage(64)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err = tk.Pipe().W.(zmux.MessageWriter).WriteMessage(m); err != nil {
+			t.Error(err)
+		}
+	})
+	p, err := DialPipe(ctx, e.u+"/z", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zmux.ClosePipeIO(p)
+	if err = p.W.(zmux.MessageWriter).WriteMessage(takeMark); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := p.R.(zmux.MessageReader).ReadMessage(64)
+	if err != nil || !bytes.Equal(reply, takeMark) {
+		t.Fatalf("reply %q %v", reply, err)
+	}
+	if e.l.Stats().Admission.Takeover != 1 {
+		t.Fatal(e.l.Stats())
+	}
+}

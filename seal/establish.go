@@ -126,7 +126,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 	own := carrierio.NewCloser(p.R, p.W)
 	stop := context.AfterFunc(ctx, own.Close)
 	defer func() {
-		if !stop() && err == nil {
+		if fired := !stop(); err == nil && (fired || ctx.Err() != nil) {
 			err = context.Cause(ctx) // the bound closed p
 		}
 		if err != nil {
@@ -211,8 +211,14 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 		return q, err
 	}
 	u := &unitReader{p: p, f: f}
-	reply, err := u.frame()
+	reply, framingError, err := u.frame()
 	if err != nil {
+		if framingError {
+			return q, err
+		}
+		if f == proto.Message && errors.Is(err, zmux.ErrMessageTooLarge) {
+			return q, fmt.Errorf("%w: %w", ErrTooLarge, err)
+		}
 		if ctx.Err() != nil {
 			err = context.Cause(ctx)
 		}
@@ -310,6 +316,9 @@ func (c *ClientConfig) verify(ctx context.Context, peer *Peer, handle []byte, pl
 		return in, nil // AllowPSKOnly
 	}
 	v, pq, err := judge(ctx, c.Anchor, *in, pl.Proof, c.RequirePQAuth)
+	if errors.Is(err, ErrVerifyUnavailable) {
+		return nil, fmt.Errorf("%w: %w", ErrCredentialsFailed, err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -492,28 +501,28 @@ func (u *unitReader) fill() error {
 	return err
 }
 
-// frame returns the next Reply or Finish.
-func (u *unitReader) frame() ([]byte, error) {
+// frame returns the next Reply or Finish and identifies errors from its parser.
+func (u *unitReader) frame() (unit []byte, framingError bool, err error) {
 	if u.f == proto.Message {
 		if err := u.fill(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		unit, _, err := proto.CutFrame(u.buf, u.f)
 		u.buf = nil
-		return unit, err
+		return unit, err != nil, err
 	}
 	for {
 		unit, n, err := proto.CutFrame(u.buf, u.f)
 		if err == nil {
 			out := bytes.Clone(unit)
 			u.buf = u.buf[n:]
-			return out, nil
+			return out, false, nil
 		}
 		if !errors.Is(err, proto.ErrIncomplete) {
-			return nil, err
+			return nil, true, err
 		}
 		if err := u.fill(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 }

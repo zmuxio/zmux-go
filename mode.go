@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
@@ -24,6 +25,7 @@ import (
 // CarrierKind names a kind of carrier.
 type CarrierKind uint8
 
+//goland:noinspection GoUnusedConst // the adapter modules use their kinds
 const (
 	// CarrierWebSocket is a WebSocket (zmuxws.Candidate).
 	CarrierWebSocket CarrierKind = iota + 1
@@ -241,24 +243,25 @@ func (p *modeParams) timer(rtt time.Duration) time.Duration {
 // ready; the fields must not change once it is in use. It is safe for
 // concurrent use.
 type CarrierCache struct {
+	m map[cacheKey]*cacheEntry
 	// BackoffMin and BackoffMax bound the backoff of a failed kind (1 min,
 	// 6 h).
 	BackoffMin, BackoffMax time.Duration
 	// SuccessTTL is how long a usable kind is remembered (6 h).
 	SuccessTTL time.Duration
-
-	m       map[cacheKey]*cacheEntry
-	inserts uint64 // entries added: every 64th prunes the expired
-	mu      sync.Mutex
+	inserts    uint64 // entries added: every 64th prunes the expired
+	mu         sync.Mutex
 }
 
 type cacheKey struct {
 	key     string
-	kind    CarrierKind
 	variant string
+	kind    CarrierKind
 }
 
-func candKey(key string, c Candidate) cacheKey { return cacheKey{key, c.Kind, c.Variant} }
+func candKey(key string, c Candidate) cacheKey {
+	return cacheKey{key: key, kind: c.Kind, variant: c.Variant}
+}
 
 type cacheEntry struct {
 	goodUntil time.Time
@@ -285,7 +288,7 @@ const (
 // candidate of kind and variant under key (the CarrierChoicePolicy.Key in use),
 // in the entry DialChoice's own outcomes use. Safe for concurrent use.
 func (cc *CarrierCache) Report(key string, kind CarrierKind, variant string, o CacheOutcome) {
-	cc.update(cacheKey{key, kind, variant}, nil, o, time.Now())
+	cc.update(cacheKey{key: key, kind: kind, variant: variant}, nil, o, time.Now())
 }
 
 // prime starts cand's target at the URL the cache remembers for it.
@@ -540,7 +543,7 @@ func (cc *CarrierCache) Restore(data []byte) error {
 		if e.expired(now, hi) {
 			continue
 		}
-		k := cacheKey{se.Key, CarrierKind(i), se.Variant}
+		k := cacheKey{key: se.Key, kind: CarrierKind(i), variant: se.Variant}
 		if o := m[k]; o == nil || e.newer(o) {
 			m[k] = e
 		}
@@ -819,6 +822,17 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Carri
 	return c, res
 }
 
+// A candidate whose dial budget expires waiting for attachment capacity
+// has no transport sample. Keep this local to candidate accounting so the
+// public result remains the caller's original context error.
+type capacityWaitKey struct{}
+
+func markCapacityWait(ctx context.Context) {
+	if held, ok := ctx.Value(capacityWaitKey{}).(*atomic.Bool); ok {
+		held.Store(true)
+	}
+}
+
 // joinCandidate joins a carrier of cand to c with the options o within the
 // candidate's timer; ctx bounds the attempt, and the carriers then live
 // until the session ends. A join that the attachment cap still held when
@@ -826,6 +840,8 @@ func startCandidate(ctx context.Context, cand Candidate, cfg *Config, cred Carri
 // kind is neither failed nor reported.
 func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred CarrierCredential, p *modeParams, o PipeOptions) ([]*Pipe, CandidateResult) {
 	res := CandidateResult{Kind: cand.Kind, Variant: cand.Variant, Joined: true}
+	var held atomic.Bool
+	ctx = context.WithValue(ctx, capacityWaitKey{}, &held)
 	life, cancel, stop := candidateLife(ctx, c.cfg.joinTimeout())
 	var pipes []*Pipe
 	var err error
@@ -858,7 +874,8 @@ func joinCandidate(ctx context.Context, c *Conn, cand Candidate, cred CarrierCre
 		err = lifeErr(life, err)
 		cancel()
 		res.Err = err
-		if !errors.Is(err, errJoinHeld) {
+		budgetEnded := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrJoinTimeout)
+		if !held.Load() || !budgetEnded {
 			res.Outcome = outcomeOf(err)
 		}
 		return nil, res

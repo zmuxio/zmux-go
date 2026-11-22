@@ -19,7 +19,9 @@ func SchedulerAffinity() Scheduler { return builtin(core.PolicyAffinity) }
 // SchedulerSessionAffinity uses one active pipe per tier.
 func SchedulerSessionAffinity() Scheduler { return builtin(core.PolicySessionAffinity) }
 
-// SchedulerSpreadETA sends every chunk on the pipe with the earliest arrival.
+// SchedulerSpreadETA estimates arrival per chunk. It spreads to a later
+// pipe when the stream's ready backlog can hide the delay and receive
+// credit can hold the reordering.
 func SchedulerSpreadETA() Scheduler { return builtin(core.PolicySpreadETA) }
 
 // SchedulerSpreadRoundRobin shares chunks by the pipes' weights.

@@ -203,7 +203,7 @@ func TestRestartPreambleBlocked(t *testing.T) {
 		t.Fatal("not opened before the restart")
 	}
 	s.peerSeen = false
-	if !s.RestartEarly(CarrierInfo{}, Time(Second)) {
+	if !s.RestartEarly(CarrierInfo{}, nil, Time(Second)) {
 		t.Fatal("RestartEarly refused")
 	}
 	if k := pollKinds(t, s, p, 2); slices.Contains(k, wire.KindStream) {
@@ -309,7 +309,7 @@ func TestRestartEarlyRequeuesPriority(t *testing.T) {
 		t.Fatalf("PRIORITY_UPDATE not written: %v", k)
 	}
 	s.peerSeen = false
-	if !s.RestartEarly(CarrierInfo{}, Time(Second)) {
+	if !s.RestartEarly(CarrierInfo{}, nil, Time(Second)) {
 		t.Fatal("RestartEarly refused")
 	}
 	if st.ctl&ctlPrio == 0 {

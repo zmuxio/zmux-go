@@ -91,10 +91,6 @@ type BuffersWriter interface {
 //   - UnsentReporter on W and on a lane's writer: bytes not yet
 //     transmitted (a TCP connection, or a TLS one over it, reports the
 //     socket's where the platform has a query, Linux SIOCOUTQNSD);
-//   - RetransReporter on W: bytes retransmitted (a TCP connection, or a
-//     TLS one over it, reports the socket's: Linux tcpi_bytes_retrans,
-//     Darwin tcpi_txretransmitbytes, Windows SIO_TCP_INFO BytesRetrans,
-//     a 32-bit count widened to 64 bits).
 //
 // A half's Close must interrupt a blocked Read or Write.
 type PipeIO struct {
@@ -169,7 +165,11 @@ func (p PipeIO) validate() error {
 	if p.MaxRecord != 0 && p.MaxRecord < MinMaxRecord {
 		return fmt.Errorf("%w: PipeIO.MaxRecord %d is below %d", ErrInvalidConfig, p.MaxRecord, MinMaxRecord)
 	}
-	if lim := carrierRecordLimit(p); lim != 0 && lim < MinMaxRecord {
+	var lim int
+	if err := hostCall(nil, "MaxRecord", func() error { lim = carrierRecordLimit(p); return nil }); err != nil {
+		return err
+	}
+	if lim != 0 && lim < MinMaxRecord {
 		return fmt.Errorf("%w: the carrier's record limit %d is below %d", ErrInvalidConfig, lim, MinMaxRecord)
 	}
 	return nil
@@ -185,12 +185,12 @@ func NetPipe(c net.Conn) PipeIO { return PipeIO{R: c, W: c} }
 //
 // A transform that wraps a lower carrier (WrapPipe, a Candidate's Dial)
 // offers a lower capability only where its meaning survives the transform:
-// CloseWriter and Aborter may be forwarded; UnsentReporter and
-// RetransReporter count lower bytes, so a transform that changes lengths
-// does not forward them (or converts them); ConnectionStater is forwarded
-// only by a transparent transform (such as compression), never by one
-// that terminates its own handshake, which reports its own state or none,
-// so that TerminatedTLS and Exporter describe the innermost handshake;
+// CloseWriter and Aborter may be forwarded; UnsentReporter counts lower bytes,
+// so a transform that changes lengths does not forward it (or converts it);
+// ConnectionStater is forwarded only by a transparent transform (such as
+// compression), never by one that terminates its own handshake, which reports
+// its own state or none, so that TerminatedTLS and Exporter describe the
+// innermost handshake;
 // LaneOpener is offered only when every lane can be wrapped alike;
 // FailureReporter may be forwarded by any transform that fails when the
 // carrier below it fails.
@@ -212,7 +212,7 @@ type Handshaker interface {
 
 // NetConner is a half over a connection that it names: the connection
 // below it, as a TLS connection's NetConn. The listener measures the TCP
-// socket under a half through it (Unsent, Retransmitted).
+// socket under a half through it (Unsent).
 type NetConner interface{ NetConn() net.Conn }
 
 // CloseWriter is a sending half with a graceful end of its write side,
@@ -230,11 +230,6 @@ type Aborter interface{ Abort(cause error) }
 // false when it cannot tell. The driver queries it outside the session
 // lock before each write (PipeStats.QueuedBytes, the scheduler's Q_p).
 type UnsentReporter interface{ Unsent() (n uint64, ok bool) }
-
-// RetransReporter is a sending half that counts the bytes the carrier has
-// retransmitted; ok false when it cannot tell. Queried as Unsent is, at
-// most once a second (PipeStats.BytesRetransmitted, LossRate).
-type RetransReporter interface{ Retransmitted() (n uint64, ok bool) }
 
 // FailureReporter is a half whose carrier reports its own failure:
 // ReportsFailure true means that when the path under the carrier fails,
@@ -336,10 +331,10 @@ func (h *halfCloser) take(next func()) {
 // it (CloseCodeRecorder).
 func (h *halfCloser) recordCloseCode(code ApplicationErrorCode, reason string) {
 	if r, ok := h.io.W.(CloseCodeRecorder); ok {
-		r.RecordCloseCode(code, reason)
+		safeLog(nil, "RecordCloseCode", func() { r.RecordCloseCode(code, reason) })
 	}
 	if r, ok := h.io.R.(CloseCodeRecorder); ok && !h.same {
-		r.RecordCloseCode(code, reason)
+		safeLog(nil, "RecordCloseCode", func() { r.RecordCloseCode(code, reason) })
 	}
 }
 
@@ -351,7 +346,7 @@ func (h *halfCloser) closeRead() {
 	if h.same || h.setupClose() {
 		return // closed with the write half or by closeAll
 	}
-	h.rOnce.Do(func() { _ = h.io.R.Close() })
+	h.rOnce.Do(func() { carrierio.CloseHalf(h.io.R) })
 }
 
 // shutdownWrite ends the write side gracefully.
@@ -375,7 +370,7 @@ func (h *halfCloser) closeW() {
 	if h.setupClose() {
 		return
 	}
-	h.wClose.Do(func() { _ = h.io.W.Close() })
+	h.wClose.Do(func() { carrierio.CloseHalf(h.io.W) })
 }
 
 // closeAll closes every half; abort uses Abort where offered and closes the
@@ -383,7 +378,7 @@ func (h *halfCloser) closeW() {
 func (h *halfCloser) closeAll(abort bool, cause error) {
 	h.allOnce.Do(func() {
 		if abort {
-			h.abort(cause)
+			safeLog(nil, "carrier Abort", func() { h.abort(cause) })
 		}
 		if h.setupClose() {
 			return
@@ -392,7 +387,7 @@ func (h *halfCloser) closeAll(abort bool, cause error) {
 			h.closeW()
 		}
 		if h.io.R != nil && !h.same {
-			h.rOnce.Do(func() { _ = h.io.R.Close() })
+			h.rOnce.Do(func() { carrierio.CloseHalf(h.io.R) })
 		}
 	})
 }
@@ -514,9 +509,9 @@ func terminatedTLS(x any) (tls.ConnectionState, bool) {
 // struct holding a slice, say) counts as two halves and is closed twice.
 func ClosePipeIO(p PipeIO) {
 	if p.W != nil {
-		_ = p.W.Close()
+		carrierio.CloseHalf(p.W)
 	}
 	if p.R != nil && !carrierio.SameHalf(p.R, p.W) {
-		_ = p.R.Close()
+		carrierio.CloseHalf(p.R)
 	}
 }

@@ -1,6 +1,10 @@
 package core
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/zmuxio/zmux-go/internal/wire"
+)
 
 func targetSession() *Session {
 	cfg := DefaultConfig()
@@ -217,5 +221,58 @@ func TestHeldJoinDisplacesForMissingDirection(t *testing.T) {
 	}
 	if s.ownGoing() != s.mp.ownCap {
 		t.Fatalf("%d attachments going, cap %d", s.ownGoing(), s.mp.ownCap)
+	}
+}
+
+// A locally opened direction can have ACK evidence queued in the critical
+// section where the API observes the caller's expired deadline. A later
+// ACK still advances the retained log without republishing attachment.
+func TestJoinAbortRejectsLatePipeAck(t *testing.T) {
+	for _, queued := range []bool{false, true} {
+		s, _ := probeSession(DefaultConfig())
+		s.ack = newAckState(s)
+		lane := &outLane{pos: 2}
+		p := &Pipe{id: 2, out: &outDir{lanes: []*outLane{lane}}, mp: &attach{joinerLocal: true, out: OutActive, in: InNone}}
+		s.pipes = append(s.pipes, p)
+		ack := func(pos uint64) {
+			if err := s.mpAckEntry(wire.AckEntry{PipeID: p.id, Position: pos}, s.now); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if queued {
+			ack(1)
+		}
+		s.AbortUnconfirmed(p.id)
+		for {
+			if _, ok := s.PollEvent(); !ok {
+				break
+			}
+		}
+		ack(2)
+		if p.mp.peerAttached(p.id) || p.mp.out != OutFailed || lane.acked != 2 {
+			t.Fatalf("ACK after failure: attached %t, state %v, ack %d", p.mp.peerAttached(p.id), p.mp.out, lane.acked)
+		}
+		for {
+			ev, ok := s.PollEvent()
+			if !ok {
+				break
+			}
+			if ev.Kind == EvPipeAttached {
+				t.Fatal("late ACK published attachment")
+			}
+		}
+	}
+}
+
+func TestCloseUnconfirmedPipeSkipsAbandon(t *testing.T) {
+	s, _ := probeSession(DefaultConfig())
+	p := &Pipe{id: 2, out: &outDir{lanes: []*outLane{{}}}, mp: &attach{joinerLocal: true, out: OutActive}}
+	s.pipes = append(s.pipes, p)
+	if err := s.RemovePipe(p.id, true); err != nil {
+		t.Fatal(err)
+	}
+	if !p.mp.retired || p.mp.peer != peerDiscarded || p.mp.abandonQueued || p.mp.abandonSent {
+		t.Fatalf("unconfirmed close: retired=%t, peer=%v, abandon queued=%t, sent=%t",
+			p.mp.retired, p.mp.peer, p.mp.abandonQueued, p.mp.abandonSent)
 	}
 }

@@ -14,7 +14,7 @@ const (
 // rateEst is R_p of one outbound pipe.
 type rateEst struct {
 	samples []rateSmp
-	r       float64 // the windowed maximum; 0 before the first sample
+	r       float64 // pacing peak; 0 before the first sample
 	lo      float64 // R_lo, the limiter's rate bound; 0: none
 
 	// Round trips: a round ends when a byte sent after it began is
@@ -56,6 +56,21 @@ func (e *rateEst) value() float64 {
 	return r
 }
 
+// freshPeak is only a reference for identifying a delivery-rate collapse.
+// Unlike the pacing value, it expires even when there are no more ACKs.
+func (e *rateEst) freshPeak(now Time) float64 {
+	var peak float64
+	for _, sample := range e.samples {
+		if now.Sub(sample.at) < rateWindow {
+			peak = max(peak, sample.r)
+		}
+	}
+	if e.lo > 0 {
+		peak = min(peak, e.lo)
+	}
+	return peak
+}
+
 // blocked records that the pipe is not writable while data waits.
 func (e *rateEst) blocked() {
 	e.blockEpoch++
@@ -84,8 +99,11 @@ func (e *rateEst) advance(cum, so uint64) bool {
 // sample feeds one delivery-rate sample; proven marks a queue-proven
 // range, a bottleneck sample whatever the bubble and the epoch say.
 // It returns the sample's value when it is a bottleneck sample, else 0.
-func (e *rateEst) sample(r float64, bubble, proven bool, epoch uint64, now Time) float64 {
+func (e *rateEst) sample(r float64, bubble, proven bool, epoch uint64, now Time, q *pathQuality) float64 {
 	bottleneck := proven || !bubble && (epoch != e.blockEpoch || e.blockedNow)
+	if q != nil {
+		q.sampleRate(e, r, bottleneck, now)
+	}
 	if !bottleneck && r <= e.value() {
 		return 0
 	}

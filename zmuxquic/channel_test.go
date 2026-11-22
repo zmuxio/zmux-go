@@ -3,252 +3,158 @@ package zmuxquic
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
+	"errors"
 	"fmt"
-	"net"
+	"io"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
-	"github.com/zmuxio/zmux-go/internal/carrierio"
 )
 
-// lossyRelay forwards UDP between one client and a server with a one-way
-// delay, and drops the next client-to-server packets of at least
-// dropMin bytes when armed.
-type lossyRelay struct {
-	ln, up  *net.UDPConn
-	client  atomic.Pointer[net.UDPAddr]
-	delay   time.Duration
-	dropMin int
-	drop    atomic.Int32 // packets still to drop
-	dropped atomic.Int32
+// streamWriteGate holds the QUIC stream write carrying the test payload.
+// Its datagram channel still writes to the QUIC connection independently.
+type streamWriteGate struct {
+	*qStream
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
 }
 
-func newLossyRelay(t *testing.T, server string, delay time.Duration) *lossyRelay {
-	t.Helper()
-	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
+const gatedStreamPayload = "ordered stream bytes"
+
+func (w *streamWriteGate) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(gatedStreamPayload)) {
+		w.once.Do(func() { close(w.entered) })
+		<-w.release
 	}
-	sa, err := net.ResolveUDPAddr("udp", server)
-	if err != nil {
-		t.Fatal(err)
-	}
-	up, err := net.DialUDP("udp", nil, sa)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := &lossyRelay{ln: ln, up: up, delay: delay, dropMin: 1000}
-	var wg sync.WaitGroup
-	wg.Go(func() { r.pump(true) })
-	wg.Go(func() { r.pump(false) })
-	t.Cleanup(func() {
-		_ = ln.Close()
-		_ = up.Close()
-		wg.Wait()
-	})
-	return r
+	return w.qStream.Write(p)
 }
 
-func (r *lossyRelay) addr() string { return r.ln.LocalAddr().String() }
+func (w *streamWriteGate) WriteBuffers(p [][]byte) (int, error) { return carrier.WriteFlat(w, p) }
 
-// pump forwards one direction, each packet delay after it arrived, in order.
-func (r *lossyRelay) pump(toServer bool) {
-	type pkt struct {
-		b   []byte
-		due time.Time
-	}
-	q := make(chan pkt, 4096)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for p := range q {
-			time.Sleep(time.Until(p.due))
-			if toServer {
-				_, _ = r.up.Write(p.b)
-			} else if a := r.client.Load(); a != nil {
-				_, _ = r.ln.WriteToUDP(p.b, a)
-			}
-		}
-	}()
-	defer func() { close(q); <-done }()
-	buf := make([]byte, 65536)
-	for {
-		var n int
-		var err error
-		if toServer {
-			var a *net.UDPAddr
-			n, a, err = r.ln.ReadFromUDP(buf)
-			if err == nil {
-				r.client.Store(a)
-			}
-		} else {
-			n, err = r.up.Read(buf)
-		}
-		if err != nil {
-			return
-		}
-		if toServer && n >= r.dropMin && r.drop.Load() > 0 && r.drop.Add(-1) >= 0 {
-			r.dropped.Add(1)
-			continue
-		}
-		select {
-		case q <- pkt{bytes.Clone(buf[:n]), time.Now().Add(r.delay)}:
-		default: // queue overflow: lost
-		}
-	}
+// dropWarmup drops the warm-up datagram after it reaches the peer even when
+// delivered in a reliable QUIC stream. A zmux datagram in a record is still
+// subject to datagram queue and policy drops.
+type dropWarmup struct {
+	dropped chan struct{}
+	once    sync.Once
 }
 
-// stamp is a datagram carrying its send time.
-func stamp(seq int) []byte {
-	b := make([]byte, 100)
-	binary.BigEndian.PutUint64(b, uint64(time.Now().UnixNano()))
-	b[8] = byte(seq)
-	return b
-}
+const warmupSize = 100
 
-func latencyOf(b []byte) time.Duration {
-	return time.Since(time.Unix(0, int64(binary.BigEndian.Uint64(b))))
+func (*dropWarmup) Acquire(_ context.Context, _, n int64) (int64, error) { return n, nil }
+func (d *dropWarmup) TryAcquire(_, n int64) (int64, error) {
+	if n == warmupSize {
+		d.once.Do(func() { close(d.dropped) })
+		return 0, errors.New("drop warm-up datagram")
+	}
+	return n, nil
 }
+func (*dropWarmup) Refund(int64) {}
 
-// lossLatencies runs a session through a relay with one-way delay d,
-// writes a burst of stream data whose first large packets are lost, sends
-// datagrams right after it, and returns their latencies and the client's
-// statistics. qconf configures the client's connection; lanes is the
-// endpoints' MaxLanes (0: the default).
-func lossLatencies(t *testing.T, d time.Duration, qconf *quic.Config, lanes int) ([]time.Duration, zmux.ConnectionStats) {
-	t.Helper()
-	cfg := &zmux.Config{EnableDatagrams: true, MaxLanes: lanes}
-	e := newEnv(t, cfg)
-	r := newLossyRelay(t, e.ln.Addr().String(), d)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	qc, err := quic.DialAddr(ctx, r.addr(), e.cli, qconf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = qc.CloseWithError(0, "") })
-	c, err := Client(ctx, qc, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	s, err := e.lst.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, err := c.OpenStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.Write([]byte("warm")); err != nil {
-		t.Fatal(err)
-	}
-	in, err := s.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	read := make(chan int64, 1)
-	go func() {
-		var n int64
-		buf := make([]byte, 64<<10)
-		for {
-			m, err := in.Read(buf)
-			n += int64(m)
-			if err != nil {
-				read <- n
-				return
-			}
-		}
-	}()
-	// Warm up the RTT estimates and the channel's size.
-	for i := range 5 {
-		_ = c.SendDatagram(stamp(i))
-		if _, err := s.ReceiveDatagram(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-	time.Sleep(carrierio.DatagramSizeRefresh + 4*d)
-	r.drop.Store(2)
-	if _, err := st.Write(make([]byte, 32<<10)); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(5 * time.Millisecond) // the burst is on the wire, its head lost
-	const n = 10
-	for i := range n {
-		if err := c.SendDatagram(stamp(i)); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	var lat []time.Duration
-	for len(lat) < n {
-		rctx, rcancel := context.WithTimeout(ctx, 2*time.Second)
-		p, err := s.ReceiveDatagram(rctx)
-		rcancel()
-		if err != nil {
-			break
-		}
-		lat = append(lat, latencyOf(p))
-	}
-	if r.dropped.Load() == 0 {
-		t.Fatal("no packet lost")
-	}
-	_ = st.Close()
-	if got := <-read; got != 32<<10+4 {
-		t.Fatalf("stream delivered %d bytes", got)
-	}
-	return lat, c.ConnectionStats()
-}
-
-// Datagrams on the QUIC connection's datagram channel are not held behind
-// a lost packet of the pipe's stream; datagrams in records on the same QUIC
-// stream are.
+// Datagrams on the QUIC connection's datagram channel can pass a blocked
+// stream write. Record datagrams on that same ordered stream follow it.
 func TestChannelNotHeadOfLineBlocked(t *testing.T) {
-	const d = 40 * time.Millisecond
-	t.Run("channel", func(t *testing.T) {
-		lat, st := lossLatencies(t, d, testQUIC(nil), 0)
-		if st.DatagramsSentChannel < 10 {
-			t.Fatalf("datagrams not on the channel: %+v", st)
-		}
-		if len(lat) < 5 {
-			t.Fatalf("%d datagrams arrived", len(lat))
-		}
-		for _, l := range lat {
-			if l > 2*d {
-				t.Fatalf("channel datagram took %v (one-way delay %v): %v", l, d, lat)
+	for _, mode := range []string{"channel", "records"} {
+		t.Run(mode, func(t *testing.T) {
+			useChannel := mode == "channel"
+			ccfg := &zmux.Config{EnableDatagrams: true, MaxLanes: 1, DatagramQueueDelay: -1}
+			scfg := ccfg.Clone()
+			limiter := &dropWarmup{dropped: make(chan struct{})}
+			scfg.DatagramLimiter.Receive = limiter
+			e := newEnv(t, scfg)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			qconf := testQUIC(nil)
+			qconf.EnableDatagrams = useChannel
+			qc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, qconf)
+			if err != nil {
+				t.Fatalf("dial QUIC: %v", err)
 			}
-		}
-		t.Logf("channel: %v", lat)
-	})
-	t.Run("records", func(t *testing.T) {
-		qconf := testQUIC(nil)
-		qconf.EnableDatagrams = false // no channel: records
-		// Without lanes the stream data and the records share one QUIC
-		// stream; with them the data goes on a lane of its own once the
-		// peer has acknowledged that lane, and the records on lane 0 are
-		// not held.
-		lat, st := lossLatencies(t, d, qconf, 1)
-		if st.DatagramsSentChannel != 0 {
-			t.Fatalf("channel used: %+v", st)
-		}
-		if len(lat) != 10 {
-			t.Fatalf("%d of 10 datagrams in records arrived", len(lat))
-		}
-		// Each waits for the retransmission of the stream's lost packet:
-		// at least a round trip (2d) more than the one-way delay.
-		for _, l := range lat {
-			if l < 2*d {
-				t.Fatalf("a datagram in records was not held behind the lost packet: %v", lat)
+			t.Cleanup(func() { _ = qc.CloseWithError(0, "") })
+			p, err := ConnPipe(ctx, qc)
+			if err != nil {
+				t.Fatalf("open carrier: %v", err)
 			}
-		}
-		t.Logf("records: %v", lat)
-	})
+			gate := &streamWriteGate{qStream: p.W.(*qStream), entered: make(chan struct{}), release: make(chan struct{})}
+			p.W = gate
+			release := sync.OnceFunc(func() { close(gate.release) })
+			defer release()
+			c, err := zmux.Start(ctx, p, zmux.RoleClient, ccfg)
+			if err != nil {
+				t.Fatalf("start client: %v", err)
+			}
+			t.Cleanup(func() { _ = c.Close() })
+			server, err := e.lst.Accept(ctx)
+			if err != nil {
+				t.Fatalf("accept server: %v", err)
+			}
+			t.Cleanup(func() { _ = server.Close() })
+
+			if err := c.SendDatagram(make([]byte, warmupSize)); err != nil {
+				t.Fatalf("queue warm-up: %v", err)
+			}
+			select {
+			case <-limiter.dropped:
+			case <-ctx.Done():
+				t.Fatalf("warm-up never reached the receive limiter: %v", ctx.Err())
+			}
+			warmStats := server.ConnectionStats()
+
+			st, err := c.OpenStream()
+			if err != nil {
+				t.Fatalf("open application stream: %v", err)
+			}
+			if _, err := st.Write([]byte(gatedStreamPayload)); err != nil {
+				t.Fatalf("queue application stream data: %v", err)
+			}
+			select {
+			case <-gate.entered:
+			case <-ctx.Done():
+				t.Fatalf("application data never reached the write gate: %v", ctx.Err())
+			}
+
+			const probe = "datagram probe"
+			if err := c.SendDatagram([]byte(probe)); err != nil {
+				t.Fatalf("queue probe: %v", err)
+			}
+			if !useChannel {
+				if got := c.ConnectionStats().DatagramsSent; got != 1 {
+					t.Fatalf("record probe passed a blocked writer: sent %d, want only the warm-up", got)
+				}
+				release()
+			}
+			d, err := server.ReceiveDatagram(ctx)
+			if err != nil || string(d) != probe {
+				t.Fatalf("receive probe: %q, %v", d, err)
+			}
+			release()
+
+			in, err := server.AcceptStream(ctx)
+			if err != nil {
+				t.Fatalf("accept application stream: %v", err)
+			}
+			deadline, _ := ctx.Deadline()
+			if err := in.SetReadDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			var payload [len(gatedStreamPayload)]byte
+			if _, err := io.ReadFull(in, payload[:]); err != nil || string(payload[:]) != gatedStreamPayload {
+				t.Fatalf("receive application data: %q, %v", payload, err)
+			}
+			wantChannel := warmStats.DatagramsReceivedChannel
+			if useChannel {
+				wantChannel++
+			}
+			if stats := server.ConnectionStats(); stats.DatagramsReceived != 2 || stats.DatagramsReceivedChannel != wantChannel || stats.DatagramsDroppedLimit != 1 {
+				t.Fatalf("datagrams received %d, on channel %d, dropped by limiter %d; want 2, %d, 1", stats.DatagramsReceived, stats.DatagramsReceivedChannel, stats.DatagramsDroppedLimit, wantChannel)
+			}
+		})
+	}
 }
 
 func dialClient(t *testing.T, e *env, qc *quic.Conn, cfg *zmux.Config) (*zmux.Conn, *zmux.Conn) {

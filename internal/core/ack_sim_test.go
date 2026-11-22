@@ -348,16 +348,16 @@ func TestAckSimReport(t *testing.T) {
 
 // simModes are the traffic patterns of the matrix.
 var simModes = []struct {
-	name string
 	set  func(*simCfg)
+	name string
 }{
-	{"bulk", func(c *simCfg) { c.framing = FramingBytes }},
-	{"app-4k/10ms", func(c *simCfg) { c.framing = FramingBytes; c.appBytes, c.appEvery = 4<<10, 10*Millisecond }},
-	{"app-60k/30ms", func(c *simCfg) {
+	{name: "bulk", set: func(c *simCfg) { c.framing = FramingBytes }},
+	{name: "app-4k/10ms", set: func(c *simCfg) { c.framing = FramingBytes; c.appBytes, c.appEvery = 4<<10, 10*Millisecond }},
+	{name: "app-60k/30ms", set: func(c *simCfg) {
 		c.framing, c.maxRecord = FramingRecords, 65525
 		c.appBytes, c.appEvery = 60<<10, 30*Millisecond
 	}},
-	{"msg-64k", func(c *simCfg) { c.framing, c.maxRecord = FramingRecords, 65525 }},
+	{name: "msg-64k", set: func(c *simCfg) { c.framing, c.maxRecord = FramingRecords, 65525 }},
 }
 
 // TestAckSimMatrix sweeps link rate x RTT x traffic x carrier kind over

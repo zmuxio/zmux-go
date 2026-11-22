@@ -134,17 +134,17 @@ func TestShapingPadPlacement(t *testing.T) {
 	with := wire.StreamHeaderLen(0, 0, len(data), true) + len(data)
 	wl := func(f int) int { return wireOf(f, true, 0) }
 	for name, tc := range map[string]struct {
+		kinds []wire.Kind
 		plan  shaping.UnitPlan
 		size  int
-		kinds []wire.Kind
 		zeros int // trailing PADDING bytes
 	}{
-		"pad_to inside Length": {shaping.UnitPlan{PadTo: wl(bare + 1)}, bare + 1,
-			[]wire.Kind{wire.KindPadding, wire.KindStream}, 0},
-		"pad_to at Length end": {shaping.UnitPlan{PadTo: wl(with)}, with, []wire.Kind{wire.KindStream}, 0},
-		"pad_to beyond":        {shaping.UnitPlan{PadTo: wl(with + 10)}, with + 10, []wire.Kind{wire.KindStream, wire.KindPadding}, 10},
-		"pad only":             {shaping.UnitPlan{Pad: 5}, with + 5, []wire.Kind{wire.KindStream, wire.KindPadding}, 5},
-		"pad and pad_to":       {shaping.UnitPlan{PadTo: wl(bare + 1), Pad: 3}, with + 3, []wire.Kind{wire.KindStream, wire.KindPadding}, 3},
+		"pad_to inside Length": {plan: shaping.UnitPlan{PadTo: wl(bare + 1)}, size: bare + 1,
+			kinds: []wire.Kind{wire.KindPadding, wire.KindStream}, zeros: 0},
+		"pad_to at Length end": {plan: shaping.UnitPlan{PadTo: wl(with)}, size: with, kinds: []wire.Kind{wire.KindStream}, zeros: 0},
+		"pad_to beyond":        {plan: shaping.UnitPlan{PadTo: wl(with + 10)}, size: with + 10, kinds: []wire.Kind{wire.KindStream, wire.KindPadding}, zeros: 10},
+		"pad only":             {plan: shaping.UnitPlan{Pad: 5}, size: with + 5, kinds: []wire.Kind{wire.KindStream, wire.KindPadding}, zeros: 5},
+		"pad and pad_to":       {plan: shaping.UnitPlan{PadTo: wl(bare + 1), Pad: 3}, size: with + 3, kinds: []wire.Kind{wire.KindStream, wire.KindPadding}, zeros: 3},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := New(DefaultConfig(), 0)
@@ -264,7 +264,7 @@ func TestShapingPlansARecordOnce(t *testing.T) {
 // at any clock reading: "no delay" is no point in time a clock can precede.
 func TestShapeUndelayedPlanBeforeZero(t *testing.T) {
 	s := New(DefaultConfig(), -1000)
-	s.AttachBootstrap(CarrierInfo{}, CarrierInfo{}, NewSignal())
+	s.AttachBootstrap(CarrierInfo{}, CarrierInfo{}, nil)
 	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return &delayShaper{} })
 	b := GetBatch()
 	defer PutBatch(b)

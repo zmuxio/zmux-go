@@ -23,7 +23,9 @@ import (
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
+	"github.com/zmuxio/zmux-go/zmuxquic"
 )
 
 func tlsConfigs(t *testing.T) (*tls.Config, *tls.Config) {
@@ -112,6 +114,7 @@ func TestHTTP3RequestStream(t *testing.T) {
 	}
 	echo(t, c, s)
 	checkKind(t, zmux.CarrierHTTP3, c, s)
+	checkQUICCarrierSamples(t, c, s)
 	_ = c.Close()
 	_ = s.Close()
 	_ = c.Wait()
@@ -125,7 +128,7 @@ func TestWebTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = pc.Close() }() // a server does not close what it was given
-	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
+	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS), ConnContext: QUICConnContext,
 		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
 	webtransport.ConfigureHTTP3Server(h3)
 	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
@@ -164,6 +167,7 @@ func TestWebTransport(t *testing.T) {
 	}
 	echo(t, c, s)
 	checkKind(t, zmux.CarrierWebTransport, c, s)
+	checkQUICCarrierSamples(t, c, s)
 	// Pooled pipes: two per WebTransport session, then a new session.
 	pool := NewConnPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer pool.Shutdown()
@@ -196,14 +200,38 @@ func TestWebTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.AddPipe(ctx, p2, zmux.PipeOptions{}); err != nil {
+	joined, err := c.AddPipe(ctx, p2, zmux.PipeOptions{})
+	if err != nil {
 		t.Fatal(err)
 	}
 	echo(t, c, s)
+	checkQUICCarrierSamples(t, c, s)
+	for _, endpoint := range []*zmux.Conn{c, s} {
+		first, _ := endpoint.Pipe(0)
+		other, _ := endpoint.Pipe(joined.ID())
+		a, _ := first.Stats()
+		b, _ := other.Stats()
+		if a.CarrierSample.CarrierID != b.CarrierSample.CarrierID {
+			t.Fatal("pipes on the same WebTransport session reported different carrier IDs")
+		}
+	}
 	_ = c.Close()
 	_ = s.Close()
 	_ = c.Wait()
 	_ = s.Wait()
+}
+
+func checkQUICCarrierSamples(t *testing.T, endpoints ...*zmux.Conn) {
+	t.Helper()
+	for _, endpoint := range endpoints {
+		for _, st := range endpoint.PipeStats() {
+			sample := st.CarrierSample
+			if sample == nil || sample.Source != zmux.CarrierSourceQUICGo || sample.Counts.QUIC == nil ||
+				sample.Counts.QUIC.PacketsSent == 0 || sample.Generation != 0 {
+				t.Fatalf("pipe %d (out=%v, in=%v, failure=%v): unexpected carrier sample %+v", st.PipeID, st.Outbound, st.Inbound, st.Failure, sample)
+			}
+		}
+	}
 }
 
 // checkKind fails the test unless every pipe of each session reports
@@ -287,6 +315,12 @@ func TestServe(t *testing.T) {
 	}
 	echo(t, c, s)
 	checkKind(t, zmux.CarrierWebTransport, c, s)
+	for _, endpoint := range []*zmux.Conn{c, s} {
+		sample := endpoint.PipeStats()[0].CarrierSample
+		if sample == nil || sample.Source != zmux.CarrierSourceUnknown || sample.Counts != (zmux.CarrierCounts{}) {
+			t.Fatalf("external WebTransport session: unexpected carrier sample %+v", sample)
+		}
+	}
 	_ = c.Close()
 	_ = s.Close()
 	_ = c.Wait()
@@ -355,4 +389,113 @@ func TestBoundOverHTTP3(t *testing.T) {
 		t.Fatalf("record mode %v %v", st.RecordMode, ok)
 	}
 	echo(t, c, s)
+}
+
+// HS-13, HS-15, L06.
+func TestHTTP3TakeoverAndDelegatedTrailer(t *testing.T) {
+	t.Run("next", func(t *testing.T) { testHTTP3FallbackAndTakeover(t, true) })
+	t.Run("no-next", func(t *testing.T) { testHTTP3FallbackAndTakeover(t, false) })
+}
+
+func testHTTP3FallbackAndTakeover(t *testing.T, withNext bool) {
+	t.Helper()
+	srvTLS, cliTLS := tlsConfigs(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	l := mustNewListener(&zmux.ListenerConfig{Admission: &zmux.Admission{Peek: 4, Decide: func(_ context.Context, _ zmux.CarrierInfo, p []byte) zmux.Decision {
+		v := zmux.VerdictFallback
+		if string(p) == "TAKE" {
+			v = zmux.VerdictTakeover
+		}
+		return zmux.Decision{Verdict: v}
+	}}, Fallback: func(_ context.Context, tk *zmux.Takeover) { p := tk.Pipe(); _, _ = io.Copy(p.W, p.R) }})
+	defer func() { _ = l.Close() }()
+	opts := &zmuxhttp.Options{}
+	if withNext {
+		opts.Next = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, err := io.ReadAll(r.Body)
+			if err != nil || string(b) != "NEXTdata" || r.Trailer.Get("X-Final") != "trail" {
+				t.Errorf("body %q trailers %v err %v", b, r.Trailer, err)
+			}
+			w.WriteHeader(http.StatusTeapot)
+		})
+	}
+	h, err := zmuxhttp.NewHandler(l, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pc.Close() }()
+	srv := NewServer("", srvTLS, nil, h, opts)
+	go func() { _ = srv.Serve(pc) }()
+	defer func() { _ = srv.Close() }()
+	client, tr := HTTPClient(cliTLS, nil)
+	defer func() { _ = tr.Close() }()
+	url := "https://" + pc.LocalAddr().String() + "/"
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = pw.Write([]byte("TAKE")) }()
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK || res.ProtoMajor != 3 {
+		t.Fatal(res.Status, res.Proto)
+	}
+	go func() { _, _ = pw.Write([]byte("data")); _ = pw.Close() }()
+	b, err := io.ReadAll(res.Body)
+	if err != nil || string(b) != "TAKEdata" {
+		t.Fatalf("takeover %q %v", b, err)
+	}
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, url, io.NopCloser(bytes.NewBufferString("NEXTdata")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Trailer = http.Header{"X-Final": []string{"trail"}}
+	res, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	wantStatus := http.StatusNotFound
+	if withNext {
+		wantStatus = http.StatusTeapot
+	}
+	if res.StatusCode != wantStatus {
+		t.Fatal(res.Status)
+	}
+}
+
+func TestQUICSamplerSharedWithNativeStream(t *testing.T) {
+	serverTLS, clientTLS := tlsConfigs(t)
+	serverTLS.NextProtos = clientTLS.NextProtos
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	l, err := quic.ListenAddr("localhost:0", serverTLS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	qc, err := quic.DialAddr(ctx, l.Addr().String(), clientTLS, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = qc.CloseWithError(0, "") }()
+	p, err := zmuxquic.ConnPipe(ctx, qc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = p.W.Close() }()
+	h3 := (quicState{qc: qc}).CarrierSampler()
+	if native := carrierstats.ProviderOf(p.W); native == nil || native != h3 {
+		t.Fatal("native and HTTP/3 carriers on one QUIC connection must share a sampler")
+	}
 }

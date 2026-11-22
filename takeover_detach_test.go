@@ -49,8 +49,8 @@ func waitHandled(t *testing.T, done <-chan error) {
 	t.Helper()
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("the carrier was not handed over")
+		if err != nil {
+			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("HandlePipe did not return")
@@ -184,8 +184,8 @@ func TestTakeoverNoDetach(t *testing.T) {
 type chanMsgHalf struct {
 	in   chan []byte
 	out  chan []byte
-	once sync.Once
 	done chan struct{}
+	once sync.Once
 }
 
 func newChanMsgHalf() *chanMsgHalf {

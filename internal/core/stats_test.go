@@ -3,7 +3,6 @@ package core
 import (
 	"bytes"
 	"errors"
-	"math"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/internal/join"
@@ -13,7 +12,7 @@ import (
 // statsMP is a multipath session with pipe 0 and one more attachment.
 func statsMP() (*Session, *Pipe) {
 	s := capacityMP()
-	s.mp.bits, s.mp.pendAbandon = map[uint64]bool{}, map[uint64]uint64{}
+	s.prepareAdditional()
 	s.mp.usableGroups = []uint64{join.GroupX25519, join.GroupX25519MLKEM768}
 	p := capacityExtra(s)
 	return s, p
@@ -21,13 +20,13 @@ func statsMP() (*Session, *Pipe) {
 
 func TestStatsPenaltiesOncePerEpisode(t *testing.T) {
 	s, p := statsMP()
-	s.penalize(p)
-	s.penalize(p) // the same episode
+	s.penalize(p, true)
+	s.penalize(p, true) // the same episode
 	if got := s.SessionStats().Penalties; got != 1 {
 		t.Fatalf("Penalties = %d after one episode, want 1", got)
 	}
 	p.mp.penalized = false // the episode ended
-	s.penalize(p)
+	s.penalize(p, true)
 	if got := s.SessionStats().Penalties; got != 2 {
 		t.Fatalf("Penalties = %d after two episodes, want 2", got)
 	}
@@ -182,15 +181,16 @@ func TestStatsDuplicateReceived(t *testing.T) {
 
 func TestStatsLaneInfos(t *testing.T) {
 	s, p := statsMP()
+	s.feat.PipeAck = true
 	if pi, _ := s.PipeInfo(p.id); pi.Lanes != nil || pi.LanesOut != 1 {
 		t.Fatalf("a pipe without lanes: %+v, %d", pi.Lanes, pi.LanesOut)
 	}
-	p.out.lanes = append(p.out.lanes, &outLane{lane: 2, pos: 70, acked: 30, refused: true})
+	p.out.lanes = append(p.out.lanes, &outLane{lane: 1 << 32, pos: 1 << 40, acked: 30, refused: true})
 	p.out.lanes[0].pos, p.out.lanes[0].acked = 10, 5
-	p.in = &inDir{lanes: []*inLane{{lane: 0, pos: 40}, {lane: 1, pos: 9}}}
+	p.in = &inDir{lanes: []*inLane{{lane: 0, pos: 40}, {lane: 1, pos: 0}}}
 	pi, _ := s.PipeInfo(p.id)
-	want := []LaneInfo{{Lane: 0, PositionSent: 10, PositionAcked: 5, PositionReceived: 40, HasOut: true, HasIn: true},
-		{Lane: 1, PositionReceived: 9, HasIn: true}, {Lane: 2, PositionSent: 70, PositionAcked: 30, HasOut: true}}
+	want := []LaneInfo{{Lane: 0, PositionSent: 10, PositionAcked: 5, PositionReceived: 40, HasOut: true, HasAck: true, HasIn: true},
+		{Lane: 1, HasIn: true}, {Lane: 1 << 32, PositionSent: 1 << 40, PositionAcked: 30, HasOut: true, HasAck: true}}
 	if len(pi.Lanes) != len(want) {
 		t.Fatalf("lanes %+v", pi.Lanes)
 	}
@@ -199,8 +199,13 @@ func TestStatsLaneInfos(t *testing.T) {
 			t.Fatalf("lane %d: %+v, want %+v", i, pi.Lanes[i], want[i])
 		}
 	}
-	if pi.LanesOut != 2 || pi.LanesIn != 2 || pi.LanesRefused != 1 || pi.BytesSent != 80 {
+	if pi.LanesOut != 2 || pi.LanesIn != 2 || pi.LanesRefused != 1 || pi.BytesSent != 1<<40+10 {
 		t.Fatalf("lanes out %d in %d refused %d, sent %d", pi.LanesOut, pi.LanesIn, pi.LanesRefused, pi.BytesSent)
+	}
+	s.feat.PipeAck, s.feat.Multipath = false, false
+	pi, _ = s.PipeInfo(p.id)
+	if l := pi.Lanes[0]; !l.HasOut || l.HasAck || l.PositionAcked != 0 || !l.HasIn {
+		t.Fatalf("positions without acknowledgements: %+v", l)
 	}
 }
 
@@ -284,29 +289,6 @@ func TestStatsBytesLost(t *testing.T) {
 	}
 }
 
-func TestStatsLossRate(t *testing.T) {
-	s, p := statsMP()
-	ol := p.out.lanes[0]
-	s.SetCarrierRetransmitted(p.id, 0) // baseline
-	ol.pos += 1000
-	s.SetNow(s.now.Add(Second / 2))
-	s.SetCarrierRetransmitted(p.id, 100) // too early: no sample
-	if pi, _ := s.PipeInfo(p.id); pi.LossRate != 0 || pi.BytesRetransmitted != 100 {
-		t.Fatalf("before a sample: rate %v, %d retransmitted", pi.LossRate, pi.BytesRetransmitted)
-	}
-	s.SetNow(s.now.Add(Second / 2))
-	s.SetCarrierRetransmitted(p.id, 100)
-	if pi, _ := s.PipeInfo(p.id); pi.LossRate != 0.1 {
-		t.Fatalf("first sample: rate %v, want 0.1", pi.LossRate)
-	}
-	ol.pos += 1000
-	s.SetNow(s.now.Add(Second))
-	s.SetCarrierRetransmitted(p.id, 100) // no loss in this interval
-	if pi, _ := s.PipeInfo(p.id); math.Abs(pi.LossRate-(0.1-0.1/8)) > 1e-12 {
-		t.Fatalf("second sample: rate %v, want %v", pi.LossRate, 0.1-0.1/8)
-	}
-}
-
 var testJoinGroup, _ = join.LookupGroup(join.GroupX25519MLKEM768)
 
 // A local join's Group must be usable in the session.
@@ -368,5 +350,119 @@ func TestStreamDatagramBytes(t *testing.T) {
 	d := DefaultConfig()
 	if s, st = fill(d.DgramStreamQ, d.DgramStreamSize, 32, 9000); len(st.dg.q) != 32 || s.stats.DatagramsDroppedRecv != 0 {
 		t.Fatalf("defaults: %d kept", len(st.dg.q))
+	}
+}
+
+func TestBootstrapJoinStateAllocatedOnDemand(t *testing.T) {
+	s := capacitySession()
+	crypto := wire.SessionCrypto{Suites: []uint64{wire.RequiredSuite}, Groups: []uint64{wire.RequiredGroup}}
+	s.cfg.Local.SessionCrypto, s.peer.SessionCrypto = crypto, crypto
+	s.declared = true
+	s.peer.Locator = []byte("peer")
+	if err := s.startMultipath(); err != nil {
+		t.Fatal(err)
+	}
+	ep := s.mp.ep.join
+	if ep == nil || !s.UsableSuite(wire.RequiredSuite) || ep.keys != nil || s.mp.additionalPipes != nil {
+		t.Fatal("bootstrap initialized join-only state or lost epoch zero")
+	}
+	if _, _, err := s.AddPipe(JoinOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if s.mp.additionalPipes == nil || ep.keys[wire.RequiredSuite] == nil {
+		t.Fatal("join did not materialize negotiated keys")
+	}
+}
+
+func TestFirstAdditionalPipeAfterEpochChange(t *testing.T) {
+	s, _ := probeSession(DefaultConfig())
+	s.role = RoleResponder
+	suite, _ := join.LookupSuite(join.SuiteAES)
+	group, _ := join.LookupGroup(join.GroupX25519)
+	s.cfg.Local.SessionCrypto.Suites = []uint64{suite.ID}
+	s.peer.SessionCrypto.Suites = []uint64{suite.ID}
+	s.mp.usableGroups = []uint64{group.ID}
+	old := &epoch{secret: bytes.Repeat([]byte{1}, 32), local: []byte("old-phase"), peer: []byte("peer-loc0")}
+	s.mp.ep = epochs{list: []*epoch{old}, join: old, crypto: []byte("crypto"), last: -1}
+	if err := s.commit(nil, nil, nil, []byte("nextphase"), nil); err != nil {
+		t.Fatal(err)
+	}
+	s.useNext()
+	if s.mp.additionalPipes != nil {
+		t.Fatal("rotating epoch initialized additional pipe state")
+	}
+	hello := func(e *epoch, id uint64) join.Hello {
+		key, err := join.PSK(suite, e.secret, join.RoleInitiator, s.mp.ep.crypto)
+		if err != nil {
+			t.Fatal(err)
+		}
+		j, err := join.NewJoiner(join.JoinerConfig{Suite: suite, Group: group, PSK: key, Locator: e.local, Phase: uint8(e.n % 2), Mode: join.Sealed, Framing: join.Stream})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg, err := j.WriteHello(nil, join.HelloPayload{Pipe: join.Pipe{ID: id, Direction: 2}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, _, err := join.ParseHelloExact(msg, join.Stream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	prior := hello(old, 2)
+	current := hello(s.mp.ep.join, 4)
+	check := func(h join.Hello, want JoinResult) {
+		_, r := s.OpenHello(h, FramingBytes, nil)
+		if r != want {
+			t.Fatalf("phase %d result %v, want %v", h.Phase, r, want)
+		}
+	}
+	check(prior, JoinAccepted)
+	check(current, JoinAccepted)
+	s.deleteOld()
+	check(prior, JoinClose)
+	check(current, JoinAccepted)
+}
+
+func TestConfiguredDeadlines(t *testing.T) {
+	s := capacitySession()
+	s.cfg.KeepAlive = 0
+	s.cfg.IdleTimeout = 1500 * Microsecond
+	s.cfg.Local.MaxIdleTimeout, s.peer.MaxIdleTimeout = 2, 2
+	s.timers.lastActivity = 1
+	if at := s.sessionTimeout(); at != Time(1+1500*Microsecond) {
+		t.Fatalf("idle deadline %d", at)
+	}
+	s.peer.MaxIdleTimeout = 1
+	if at := s.sessionTimeout(); at != Time(1+Millisecond) {
+		t.Fatalf("peer-limited idle deadline %d", at)
+	}
+	s.cfg.IdleTimeout = Duration(Never)
+	s.peer.MaxIdleTimeout = 1<<62 - 1
+	if at := s.sessionTimeout(); at != Never || !s.sessionTimers(Never) {
+		t.Fatalf("overflowing idle deadline %d", at)
+	}
+	s.state = StateSuspended
+	s.timers.grace = Time(1).Add(Duration(Never))
+	if at := s.sessionTimeout(); at != Never || !s.sessionTimers(Never) {
+		t.Fatalf("overflowing resume deadline %d", at)
+	}
+}
+
+func TestPipeReplacementDeadline(t *testing.T) {
+	s := capacitySession()
+	if st, _ := s.PipeInfo(0); st.EpochKnown || st.ReplaceBy != Never {
+		t.Fatalf("non-multipath pipe: epoch known %t, replace by %d", st.EpochKnown, st.ReplaceBy)
+	}
+	s, p := statsMP()
+	p.mp.joinEpoch, p.mp.joinEpochKnown, p.mp.attachedAt = 5, true, 100
+	s.cfg.EpochPeriod = Second
+	if st, _ := s.PipeInfo(p.id); !st.EpochKnown || st.Epoch != 5 || st.ReplaceBy != Time(100+2*Second) {
+		t.Fatalf("epoch %d (known %t), replace by %d", st.Epoch, st.EpochKnown, st.ReplaceBy)
+	}
+	s.cfg.EpochPeriod = Duration(Never)
+	if st, _ := s.PipeInfo(p.id); st.ReplaceBy != Never {
+		t.Fatalf("overflowing replacement deadline %d", st.ReplaceBy)
 	}
 }

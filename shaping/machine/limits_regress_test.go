@@ -23,14 +23,14 @@ func slots(c, tm int) string {
 func TestMaxSlots(t *testing.T) {
 	for _, c := range []struct {
 		js   string
-		l    SizeLimits
 		want string
+		l    SizeLimits
 	}{
-		{slots(1<<25, 1<<25), SizeLimits{}, "limit"},
-		{slots(DefaultMaxSlots, 0), SizeLimits{}, ""},
-		{slots(DefaultMaxSlots, 1), SizeLimits{}, "limit"},
-		{slots(2, 2), SizeLimits{MaxSlots: 3}, "limit"},
-		{slots(DefaultMaxSlots, 1), SizeLimits{MaxSlots: -1}, ""},
+		{js: slots(1<<25, 1<<25), l: SizeLimits{}, want: "limit"},
+		{js: slots(DefaultMaxSlots, 0), l: SizeLimits{}, want: ""},
+		{js: slots(DefaultMaxSlots, 1), l: SizeLimits{}, want: "limit"},
+		{js: slots(2, 2), l: SizeLimits{MaxSlots: 3}, want: "limit"},
+		{js: slots(DefaultMaxSlots, 1), l: SizeLimits{MaxSlots: -1}, want: ""},
 	} {
 		if _, err := ParseCandidate([]byte(c.js), nil, c.l); limitClass(err) != c.want {
 			t.Errorf("%s %+v: %v", c.js, c.l, err)

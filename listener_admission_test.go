@@ -218,7 +218,7 @@ func TestAdmissionStats(t *testing.T) {
 		want AdmissionStats
 	}{
 		{"fallback", VerdictFallback, true, AdmissionStats{Fallback: 1}},
-		{"fallback without target", VerdictFallback, false, AdmissionStats{Fallback: 1}},
+		{"fallback without target", VerdictFallback, false, AdmissionStats{Stalled: 1}},
 		{"stall", VerdictStall, false, AdmissionStats{Stalled: 1}},
 		{"close", VerdictClose, false, AdmissionStats{Closed: 1}},
 		{"unknown", AdmissionVerdict(9), false, AdmissionStats{Closed: 1}},
@@ -352,16 +352,27 @@ func TestAdmissionFakeClock(t *testing.T) {
 	t.Run("stall", func(t *testing.T) {
 		e := newFakeEnv(t, &Admission{PeekTimeout: time.Second, StallMin: 30 * time.Second, StallMax: 30 * time.Second,
 			Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictStall} }}, 0)
-		go func() { _, _ = io.Copy(io.Discard, e.peer) }()
-		waitUntil(t, 5*time.Second, "stalled", func() bool { return e.lst.Stats().Admission.Stalled == 1 })
+		closed := make(chan struct{})
+		go func() { _, _ = io.Copy(io.Discard, e.peer); close(closed) }()
+		e.ended(t) // setup has handed the carrier to the stall worker
 		e.advance(t, 1, 30*time.Second-time.Nanosecond)
+		e.lst.pmu.Lock()
+		held := e.lst.pending.Total()
+		e.lst.pmu.Unlock()
+		if held != 1 {
+			t.Fatalf("pending while stalled: %d", held)
+		}
 		select {
-		case <-e.done:
-			t.Fatal("ended before the stall duration")
-		case <-time.After(20 * time.Millisecond):
+		case <-closed:
+			t.Fatal("carrier closed before stall deadline")
+		default:
 		}
 		e.clk.Advance(time.Nanosecond)
-		e.ended(t)
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("carrier remained open after stall deadline")
+		}
 	})
 	t.Run("first record", func(t *testing.T) {
 		e := newFakeEnv(t, nil, 3*time.Second)
@@ -403,10 +414,9 @@ func TestAdmissionDecideCancel(t *testing.T) {
 	}
 }
 
-// TestShutdownKeepsJoins checks Shutdown's graceful close: during it a new
-// session is refused while a live session still joins pipes; Close then
-// refuses every carrier.
-func TestShutdownKeepsJoins(t *testing.T) {
+// Shutdown refuses bootstrap while existing streams and joins drain.
+// HS-34.
+func TestShutdownDrainsBootstrap(t *testing.T) {
 	leakcheck.Check(t)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -450,19 +460,17 @@ func TestShutdownKeepsJoins(t *testing.T) {
 		t.Fatalf("Accept during Shutdown: %v", err)
 	}
 	// A new session is refused.
-	refused := lst.Stats().Refused
-	nc := dial()
-	ncfg := mpConfig()
-	ncfg.HandshakeTimeout = time.Second
-	if c2, err := Client(ctx, nc, ncfg); err == nil {
-		_ = c2.Wait()
+	lst.Undrain()
+	refused, err := Client(ctx, dial(), mpConfig())
+	if err == nil {
+		err = refused.Wait()
 	}
-	waitUntil(t, 5*time.Second, "a refused session", func() bool { return lst.Stats().Refused > refused })
-	// The live session joins a pipe.
+	if !errors.Is(err, ErrConnectionRefused) {
+		t.Fatalf("bootstrap during shutdown: %v", err)
+	}
 	if _, err := c.AddPipe(ctx, NetPipe(dial()), PipeOptions{}); err != nil {
-		t.Fatalf("join during Shutdown: %v", err)
+		t.Fatal(err)
 	}
-	waitUntil(t, 5*time.Second, "the join counted", func() bool { return lst.Stats().Joins == 1 })
 	// The stream ends, the session with it, and Shutdown closes the listener.
 	_ = st.Close()
 	_, _ = io.ReadAll(ss)
@@ -545,7 +553,7 @@ func TestAdmissionFallbackOnPeekTimeout(t *testing.T) {
 	t.Run("first read", func(t *testing.T) {
 		e, got := run(t, &Admission{Peek: 4, PeekTimeout: 10 * time.Second, FallbackOnPeekTimeout: true, Decide: decide}, []byte("ab"), 1)
 		replayed(t, e, got, "ab")
-		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1, Fallback: 1}) {
+		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{Fallback: 1}) {
 			t.Fatalf("stats %+v", st)
 		}
 	})
@@ -553,7 +561,7 @@ func TestAdmissionFallbackOnPeekTimeout(t *testing.T) {
 		more := seq(Decision{Verdict: VerdictMore, Need: 8})
 		e, got := run(t, &Admission{Peek: 1, MaxPeek: 8, PeekTimeout: 10 * time.Second, FallbackOnPeekTimeout: true, Decide: more}, []byte("abc"), 2)
 		replayed(t, e, got, "abc")
-		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1, Fallback: 1}) {
+		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{Fallback: 1}) {
 			t.Fatalf("stats %+v", st)
 		}
 	})
@@ -584,14 +592,11 @@ func TestKnownJoin(t *testing.T) {
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig()})
 	defer func() { _ = lst.Close() }()
 	loc := []byte("known-locator")
-	lst.regMu.Lock()
-	lst.sessions[string(loc)] = new(Conn)
-	lst.regMu.Unlock()
-	t.Cleanup(func() {
-		lst.regMu.Lock()
-		delete(lst.sessions, string(loc))
-		lst.regMu.Unlock()
-	})
+	c := new(Conn)
+	if !lst.register(c, loc) {
+		t.Fatal("registration failed")
+	}
+	t.Cleanup(func() { lst.sessionClosed(c) })
 	hello := func(suite, mode byte, locator []byte) []byte {
 		b := []byte{0x02, suite, mode, byte(len(locator))}
 		b = append(b, locator...)
@@ -627,9 +632,7 @@ func TestKnownJoin(t *testing.T) {
 			t.Errorf("%s: KnownJoin = %v, %d; want %v, %d", c.name, known, need, c.known, c.need)
 		}
 	}
-	lst.regMu.Lock()
-	delete(lst.sessions, string(loc))
-	lst.regMu.Unlock()
+	lst.sessionClosed(c)
 	if known, _ := lst.Adapter().KnownJoin(full); known {
 		t.Error("a session that ended is still known")
 	}

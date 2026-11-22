@@ -140,15 +140,15 @@ func TestDialModeProfiles(t *testing.T) {
 	e := newModeEnv(t)
 	defer e.close()
 	for _, c := range []struct {
-		name    string
 		profile *zmuxtest.Profile
+		name    string
 		want    zmux.CarrierKind
 		tries   int
 	}{
-		{"direct", nil, zmux.CarrierStream, 1},
-		{"pass-through", &zmuxtest.Profile{}, zmux.CarrierStream, 1},
-		{"nginx defaults", new(zmuxtest.NginxDefaults()), zmux.CarrierExchange, 3},
-		{"buffering cdn", new(zmuxtest.BufferingCDN(3 * time.Second)), zmux.CarrierExchange, 3},
+		{name: "direct", profile: nil, want: zmux.CarrierStream, tries: 1},
+		{name: "pass-through", profile: &zmuxtest.Profile{}, want: zmux.CarrierStream, tries: 1},
+		{name: "nginx defaults", profile: new(zmuxtest.NginxDefaults()), want: zmux.CarrierExchange, tries: 3},
+		{name: "buffering cdn", profile: new(zmuxtest.BufferingCDN(3 * time.Second)), want: zmux.CarrierExchange, tries: 3},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			url := e.srv.URL

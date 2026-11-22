@@ -13,6 +13,7 @@ import (
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
 	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
@@ -95,7 +96,9 @@ func (c *h3Channel) SendChannelDatagram(b []byte) error {
 // ReceiveChannelDatagrams receives the stream's HTTP Datagrams.
 func (c *h3Channel) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 	ctx, cancel := context.WithCancel(c.str.Context())
+	done := make(chan struct{})
 	labels.Go(context.Background(), "h3-channel", func() {
+		defer close(done)
 		for {
 			b, err := c.str.ReceiveDatagram(ctx)
 			if err != nil {
@@ -104,45 +107,71 @@ func (c *h3Channel) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 			deliver(b) // a fresh slice: deliver takes it over
 		}
 	})
-	return cancel
+	return func() { cancel(); <-done }
 }
 
 // HTTP3Handler wraps h, typically the handler of zmuxhttp.NewHandler, for
 // an HTTP/3 server with HTTP Datagrams enabled (http3.Server's
 // EnableDatagrams, as NewServer sets): a bidirectional carrier's
 // request stream offers its HTTP Datagrams as the pipe's datagram channel
-// (zmuxhttp.DatagramProvider). Other requests pass unchanged. o (nil:
+// (zmuxhttp.DatagramProvider). A response carrying zmux can report its
+// QUIC connection's statistics when ConnContext is set to QUICConnContext.
+// o (nil:
 // defaults) are the zmuxhttp.Options of the zmux handler inside h, whose pairing
 // field decides which requests are bidirectional carriers.
 func HTTP3Handler(h http.Handler, o *zmuxhttp.Options) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hs, ok := w.(http3.HTTPStreamer)
 		st, sok := w.(http3.Settingser)
-		if !ok || !sok || o.Classify(r) != zmuxhttp.ClassBidirectional {
+		class := o.Classify(r)
+		state := quicInContext(r.Context())
+		if !ok || !sok || class != zmuxhttp.ClassBidirectional {
+			if state.qc != nil && (class == zmuxhttp.ClassDownlink || class == zmuxhttp.ClassBidirectional) {
+				w = &h3CarrierWriter{ResponseWriter: w, state: state}
+			}
 			h.ServeHTTP(w, r)
 			return
 		}
-		cw := &h3ChanWriter{ResponseWriter: w, hs: hs, st: st}
+		writer := h3CarrierWriter{ResponseWriter: w, state: state}
+		cw := &h3ChanWriter{h3CarrierWriter: writer, hs: hs, st: st}
+		// The request-carrier handler keeps the stream until its halves close
+		// or the request ends. Its response writer is idle on return.
+		defer cw.tail.Finish()
+		defer cw.closeStream()
 		h.ServeHTTP(cw, r)
-		if str := cw.str; str != nil {
-			// Taken over by HTTPStream: end it as the server would.
-			str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
-			_ = str.Close()
-		}
 	})
 }
+
+type h3CarrierWriter struct {
+	http.ResponseWriter
+	state quicState
+}
+
+func (w *h3CarrierWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// CarrierSampler is for internal use by zmux modules.
+func (w *h3CarrierWriter) CarrierSampler() *carrierstats.Sampler { return w.state.CarrierSampler() }
 
 // h3ChanWriter is a response writer that provides the request stream's
 // datagram channel.
 type h3ChanWriter struct {
-	http.ResponseWriter
-	hs  http3.HTTPStreamer
-	st  http3.Settingser
-	str *http3.Stream
-	mu  sync.Mutex
+	h3CarrierWriter
+	hs   http3.HTTPStreamer
+	st   http3.Settingser
+	str  *http3.Stream
+	tail carrierio.RequestTail
+	mu   sync.Mutex
 }
 
-func (w *h3ChanWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *h3ChanWriter) closeStream() {
+	if str := w.str; str != nil {
+		// Taken over by HTTPStream: end it as the server would.
+		str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+		_ = str.Close()
+	}
+}
+
+func (w *h3ChanWriter) RequestTail() *carrierio.RequestTail { return &w.tail }
 
 // DatagramChannel takes over the stream (the response header went out) and
 // returns its channel.

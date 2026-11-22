@@ -17,11 +17,20 @@ func TestUnconfirmedEvictsAtBound(t *testing.T) {
 	if old, ok := u.Hold(pjs[2], 2, 2); !ok || old != 0 {
 		t.Fatalf("at the bound: evicted %d, %v; want the oldest, 0", old, ok)
 	}
-	u.Drop(pjs[1])
+	if u.Confirm(pjs[0]) {
+		t.Fatal("an evicted join claimed confirmation")
+	}
+	if !u.Confirm(pjs[1]) {
+		t.Fatal("registered join lost its confirmation")
+	}
 	if _, ok := u.Hold(&PeerJoin{Mode: join.Trusted}, 3, 2); ok {
 		t.Fatal("evicted after a confirmed join left room")
 	}
-	if _, ok := u.Hold(&PeerJoin{Mode: join.Bound}, 4, 2); ok || u.Len() != 2 {
+	bound := &PeerJoin{Mode: join.Bound}
+	if !u.Confirm(bound) {
+		t.Fatal("Bound confirmation required a slot")
+	}
+	if _, ok := u.Hold(bound, 4, 2); ok || u.Len() != 2 {
 		t.Fatalf("a Bound join took a place: %d held", u.Len())
 	}
 }

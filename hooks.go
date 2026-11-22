@@ -1,7 +1,7 @@
 package zmux
 
 import (
-	"fmt"
+	"context"
 	"log/slog"
 	"math"
 	"slices"
@@ -33,6 +33,9 @@ type Tracer struct {
 	// queue merges it: a JoinAuthFailed has Count 1, and every retired pipe
 	// is one EventPipesRetired.
 	Event func(id SessionID, ev Event)
+	// StreamEvents enables per-frame placement and receive-gap events in Event
+	// for multipath sessions. These events share the Tracer's drop accounting.
+	StreamEvents bool
 	// Dropped: this many of the session's events were lost since the
 	// previous call because its backlog was full. It is called where the
 	// lost events stood: before the next event the backlog accepted, or
@@ -415,25 +418,91 @@ func satDouble(d time.Duration) time.Duration {
 // the panic is contained (and logged) and comes back as an error naming
 // the callback, never ending the process from an internal goroutine.
 func hostCall(l *slog.Logger, what string, f func() error) error {
-	var err error
-	if !safeLog(l, what, func() { err = f() }) {
-		return fmt.Errorf("zmux: %s panicked", what)
-	}
-	return err
+	return poolhost.Call(l, what, f)
 }
 
 // ---- redial ----
 
-// redialer re-establishes pipes with the Redial hook while the session
-// lacks a direction: at most one call in flight per direction, cancelled
-// when the session ends; a carrier returned after the end is closed. Each
-// direction keeps its failure count, last attempt and backoff across the
-// losses of the direction, so that a wait counts from the previous
-// attempt.
+// redialer runs at most one outage attempt and one replacement attempt.
 type redialer struct {
-	state    [3]redialState
-	mu       sync.Mutex
-	inFlight [3]bool
+	outage      redialWorker
+	replacement redialWorker
+	replace     *redialRequest
+	cancel      context.CancelFunc // the current replacement attempt
+	mu          sync.Mutex
+}
+
+type redialWorker struct {
+	wake           chan struct{}
+	state          redialState // owned by its running loop
+	running, again bool
+}
+
+func (r *redialer) qualityChanged(id PipeID) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.replacement.running || r.replace == nil || r.replace.id != id {
+		return
+	}
+	select {
+	case r.replacement.wake <- struct{}{}:
+	default:
+	}
+}
+
+type redialRequest struct {
+	after   time.Time
+	id      PipeID
+	episode core.Time
+}
+
+type redialDemand struct {
+	replace *redialRequest
+	pipe    *Pipe
+	need    Direction
+}
+
+type replacingPipeKey struct{}
+
+// ReplacingPipe returns the old pipe named by a host-requested replacement
+// in a Config.Redial callback's context.
+func ReplacingPipe(ctx context.Context) (PipeID, bool) {
+	id, ok := ctx.Value(replacingPipeKey{}).(PipeID)
+	return id, ok
+}
+
+// RequestPipeReplacement asks the configured Redial hook to try an advised
+// replacement. The host calls this after reviewing EventPipePathQuality.
+// Calls for the current episode coalesce. An outstanding request can finish
+// or expire before the host submits a request for another pipe.
+func (c *Conn) RequestPipeReplacement(id PipeID) bool {
+	if c == nil || c.cfg.Redial == nil || c.closingNow() {
+		return false
+	}
+	var episode core.Time
+	var delay core.Duration
+	var ok bool
+	c.locked(func() {
+		c.s.SetNow(c.clk.now())
+		episode, delay, ok = c.s.ReplacementAdvice(uint64(id))
+	})
+	if !ok {
+		return false
+	}
+	r := c.redial
+	r.mu.Lock()
+	if r.replace != nil {
+		same := r.replace.id == id && r.replace.episode == episode
+		r.mu.Unlock()
+		return same
+	}
+	r.replace = &redialRequest{id: id, episode: episode, after: c.clk.source().Now().Add(time.Duration(delay))}
+	r.mu.Unlock()
+	c.startRedial(true)
+	return true
 }
 
 type redialState struct {
@@ -445,41 +514,120 @@ type redialState struct {
 	wait     time.Duration // the wait after lastDial, jittered
 }
 
-// maybeRedial starts redials for the directions the session lacks.
+// redialNeeded tests coverage before considering an advised replacement.
+// An unconfirmed replacement does not cover a direction lost during its join.
+func (c *Conn) redialNeeded(replacement bool) (redialDemand, bool) {
+	r := c.redial
+	r.mu.Lock()
+	req := r.replace
+	r.mu.Unlock()
+	var out, in, pending bool
+	var pipe *Pipe
+	c.locked(func() {
+		out, in = c.s.LiveDirections()
+		if out && in {
+			for id, pd := range c.pipes {
+				if o := pd.end.join; o != nil && !o.settled && o.parent != nil {
+					if _, ok := ReplacingPipe(o.parent); ok {
+						out, in = c.s.LiveDirectionsWithout(id)
+						break
+					}
+				}
+			}
+		}
+		pending = c.s.JoinPendingNow()
+		if !replacement || !out || !in || pending || req == nil {
+			return
+		}
+		c.s.SetNow(c.clk.now())
+		episode, _, ok := c.s.ReplacementAdvice(uint64(req.id))
+		if pd := c.pipes[uint64(req.id)]; ok && episode == req.episode && pd != nil {
+			pipe = &Pipe{c: c, id: uint64(req.id), end: pd.end}
+		}
+	})
+	if pending {
+		return redialDemand{}, false
+	}
+	if req != nil && (!out || !in || replacement && pipe == nil) {
+		c.clearRedialRequest(req)
+	}
+	if replacement {
+		if pipe == nil {
+			return redialDemand{}, false
+		}
+		return redialDemand{need: pipe.Options().Direction, replace: req, pipe: pipe}, true
+	}
+	switch {
+	case !out && !in:
+		return redialDemand{need: DirectionBidirectional}, true
+	case !out:
+		return redialDemand{need: DirectionSendOnly}, true
+	case !in:
+		return redialDemand{need: DirectionReceiveOnly}, true
+	default:
+		return redialDemand{}, false
+	}
+}
+
+func (c *Conn) clearRedialRequest(req *redialRequest) {
+	r := c.redial
+	r.mu.Lock()
+	var cancel context.CancelFunc
+	if r.replace == req {
+		r.replace = nil
+		cancel, r.cancel = r.cancel, nil
+	}
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (r *redialer) replacementContext(ctx context.Context, req *redialRequest) (context.Context, context.CancelFunc, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.replace != req {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithCancel(context.WithValue(ctx, replacingPipeKey{}, req.id))
+	r.cancel = cancel
+	return ctx, cancel, true
+}
+
 func (c *Conn) maybeRedial() {
+	c.startRedial(false)
+	c.startRedial(true)
+}
+
+func (c *Conn) startRedial(replacement bool) {
 	if c.cfg.Redial == nil || c.closingNow() {
 		return
 	}
-	var out, in, pending bool
-	c.locked(func() {
-		out, in = c.s.LiveDirections()
-		pending = c.s.JoinPendingNow() // EvJoinKeys asks again
-	})
-	if pending {
-		return
-	}
-	var need Direction
-	switch {
-	case out && in:
-		return
-	case !out && !in:
-		need = DirectionBidirectional
-	case !out:
-		need = DirectionSendOnly
-	default:
-		need = DirectionReceiveOnly
-	}
-	r := &c.redial
+	r := c.redial
 	r.mu.Lock()
-	if r.inFlight[need] {
+	w := &r.outage
+	if replacement {
+		if r.replace == nil {
+			r.mu.Unlock()
+			return
+		}
+		w = &r.replacement
+	}
+	if w.running {
+		w.again = true
+		select {
+		case w.wake <- struct{}{}:
+		default:
+		}
 		r.mu.Unlock()
 		return
 	}
-	r.inFlight[need] = true
+	w.running = true
+	w.wake = make(chan struct{}, 1)
 	r.mu.Unlock()
-	if !c.goSide(c.lctx, "redial", func() { c.redialLoop(need) }) {
+	if !c.goSide(c.lctx, "redial", func() { c.redialLoop(w, replacement) }) {
 		r.mu.Lock()
-		r.inFlight[need] = false
+		w.running, w.again = false, false
 		r.mu.Unlock()
 	}
 }
@@ -493,27 +641,23 @@ func (c *Conn) closingNow() bool {
 	}
 }
 
-func (c *Conn) redialLoop(need Direction) {
-	r := &c.redial
+func (c *Conn) redialLoop(worker *redialWorker, replacement bool) {
+	r := c.redial
 	clk := c.clk.source()
 	defer func() {
 		r.mu.Lock()
-		r.inFlight[need] = false
+		again := worker.again
+		worker.running, worker.again = false, false
 		r.mu.Unlock()
+		if again {
+			c.startRedial(replacement)
+		}
 	}()
-	// Only this loop touches st while inFlight[need] holds.
-	r.mu.Lock()
-	st := &r.state[need]
-	r.mu.Unlock()
 	bo := c.cfg.redialBackoff()
 	lo, hi := bo.Min, bo.Max
-	if st.backoff == 0 {
-		st.backoff = lo
-		st.wait = bo.wait(lo)
-	}
 	// delay is the wait after the previous attempt: the policy's
 	// DialAfter, else the backoff.
-	delay := func() time.Duration {
+	delay := func(st *redialState) time.Duration {
 		d := st.wait
 		pol := c.cfg.RedialPolicy
 		if pol == nil {
@@ -521,7 +665,7 @@ func (c *Conn) redialLoop(need Direction) {
 		}
 		v := &st.view
 		v.Failures, v.SinceLastDial, v.Members = st.failures, sinceDial(clk.Now(), st.lastDial), v.Members[:0]
-		for _, ps := range c.PipeStats() {
+		for _, ps := range c.pipeStatsAll(false) {
 			_, usable := pipeState(&ps)
 			v.Members = append(v.Members, PoolMember{PipeID: ps.PipeID, Age: ps.AttachedFor, Idle: ps.SinceLastTraffic,
 				Pipes: 1, BytesSent: ps.BytesSent, BytesReceived: ps.BytesReceived, Usable: usable})
@@ -535,46 +679,45 @@ func (c *Conn) redialLoop(need Direction) {
 		}
 		return d
 	}
-	for {
-		if !st.lastDial.IsZero() {
-			// The join refusal backoff a refused join started is separate:
-			// the call waits for the longer of the two.
-			if w := max(timeshim.Until(clk, st.lastDial.Add(delay())), c.refusalWait()); w > 0 {
-				t := timeshim.NewTimer(clk, w)
-				select {
-				case <-t.C:
-				case <-c.done:
-					t.Stop()
-					return
-				}
-			}
-		} else if c.cfg.RedialPolicy != nil {
-			delay() // the policy is asked before the first call
-		}
-		st.lastDial = clk.Now()
-		var p PipeIO
-		var err error
-		ok := safeLog(c.cfg.Logger, "Config.Redial", func() { p, err = c.cfg.Redial(c.ctx, need) })
-		if c.closingNow() {
-			if ok && err == nil {
-				closePipe(p)
-			}
+	for !c.closingNow() {
+		demand, needed := c.redialNeeded(replacement)
+		if !needed {
 			return
 		}
-		if ok && err == nil {
-			ctx, cancel := timeshim.WithDeadline(c.ctx, clk, clk.Now().Add(c.cfg.joinTimeout()))
-			_, err = c.AddPipe(ctx, p, st.dec.probeOptions(PipeOptions{Direction: need, ReturnOnReply: true}))
-			cancel()
-			if err == nil {
-				st.failures, st.backoff = 0, lo
-				st.wait = bo.wait(lo)
+		st := &worker.state
+		if st.backoff == 0 {
+			st.backoff, st.wait = lo, bo.wait(lo)
+		}
+		w := c.refusalWait()
+		if !st.lastDial.IsZero() {
+			w = max(w, timeshim.Until(clk, st.lastDial.Add(delay(st))))
+		} else if c.cfg.RedialPolicy != nil {
+			delay(st)
+		}
+		if demand.replace != nil {
+			w = max(w, timeshim.Until(clk, demand.replace.after))
+		}
+		if w > 0 {
+			t := timeshim.NewTimer(clk, w)
+			select {
+			case <-t.C:
+			case <-worker.wake:
+				t.Stop()
+				continue
+			case <-c.done:
+				t.Stop()
 				return
 			}
 		}
-		var out, in bool
-		c.locked(func() { out, in = c.s.LiveDirections() })
-		if out && in {
-			return
+		// Policy calls and the backoff can outlive the measured demand.
+		current, needed := c.redialNeeded(replacement)
+		if !needed || current.need != demand.need || current.replace != demand.replace {
+			continue
+		}
+		st.lastDial = clk.Now()
+		if c.redialAttempt(demand, st) {
+			st.failures, st.backoff, st.wait = 0, lo, bo.wait(lo)
+			continue
 		}
 		if st.failures > 0 {
 			st.backoff = min(satDouble(st.backoff), hi)
@@ -582,6 +725,75 @@ func (c *Conn) redialLoop(need Direction) {
 		st.failures++
 		st.wait = bo.wait(st.backoff)
 	}
+}
+
+// redialAttempt covers one dial and its attachment, outside the redial lock.
+func (c *Conn) redialAttempt(demand redialDemand, st *redialState) bool {
+	replacement := demand.replace != nil
+	ctx := c.ctx
+	if replacement {
+		replacementCtx, cancel, ok := c.redial.replacementContext(ctx, demand.replace)
+		if !ok {
+			return false
+		}
+		defer cancel()
+		ctx = replacementCtx
+	}
+	var p PipeIO
+	var err error
+	ok := safeLog(c.cfg.Logger, "Config.Redial", func() { p, err = c.cfg.Redial(ctx, demand.need) })
+	if !ok || err != nil {
+		return false
+	}
+	current, needed := c.redialNeeded(replacement)
+	if ctx.Err() != nil || c.closingNow() || !needed || current.replace != demand.replace || current.need != demand.need {
+		closePipe(p)
+		return false
+	}
+	opts := PipeOptions{Direction: demand.need, ReturnOnReply: true}
+	if demand.pipe != nil {
+		opts = demand.pipe.Options()
+		opts.ReturnOnReply = false
+		if mode, set := opts.RecordMode.get(); set && mode == RecordUnmanaged {
+			// The bootstrap mode is report-only. Let the configured join
+			// policy select the replacement carrier's protection.
+			opts.RecordMode = Change[RecordMode]{}
+		}
+	}
+	added, err := c.AddPipe(ctx, p, st.dec.probeOptions(opts))
+	if err != nil {
+		return false
+	}
+	if replacement {
+		c.finishReplacement(demand, added)
+	}
+	return true
+}
+
+// finishReplacement checks the confirmed join and retires one attachment
+// through the ordinary removal path, with the advice still current under the lock.
+func (c *Conn) finishReplacement(demand redialDemand, added *Pipe) {
+	c.locked(func() {
+		c.s.SetNow(c.clk.now())
+		out, in, ok := c.s.PipeState(added.id)
+		if !ok || (demand.need != DirectionReceiveOnly && out != core.OutActive) ||
+			(demand.need != DirectionSendOnly && in != core.InOpen) {
+			return
+		}
+		id := uint64(demand.replace.id)
+		if c.s.ReplacementEpisode(id, demand.replace.episode) && !c.s.RemovesLast(id) {
+			_ = c.s.RemovePipe(id, true)
+			return
+		}
+		// Keep a confirmed replacement if removing it could give up the
+		// only confirmed copy of a direction.
+		if old, ok := c.s.PipeInfo(id); ok && old.PeerAttached &&
+			(demand.need == DirectionReceiveOnly || old.OutState == core.OutActive || old.OutState == core.OutSuspect) &&
+			(demand.need == DirectionSendOnly || old.InState == core.InOpen) {
+			_ = c.s.RemovePipe(added.id, true)
+		}
+	})
+	c.clearRedialRequest(demand.replace)
 }
 
 // refusalWait is what remains of the join refusal backoff, which a refused

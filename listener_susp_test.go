@@ -1,6 +1,10 @@
 package zmux
 
-import "testing"
+import (
+	"testing"
+	"testing/synctest"
+	"time"
+)
 
 // The suspension list closes the oldest beyond MaxSuspended and drops any
 // member in constant time.
@@ -10,7 +14,7 @@ func TestListenerSuspendedList(t *testing.T) {
 	a, b, c, d := &Conn{}, &Conn{}, &Conn{}, &Conn{}
 	l.sessionSuspended(a)
 	l.sessionSuspended(b)
-	if over := l.sessionSuspended(c); len(over) != 1 || over[0] != a || a.inSusp {
+	if over := l.sessionSuspended(c); len(over) != 1 || over[0].c != a || a.inSusp.Load() {
 		t.Fatalf("over %v", over)
 	}
 	l.sessionResumed(b)
@@ -41,4 +45,31 @@ func BenchmarkListenerSuspendResume(b *testing.B) {
 			}
 		})
 	}
+}
+
+// HS-56.
+func TestSuspensionSnapshotCannotEvictRecoveredSession(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := mpConfig()
+		cfg.ResumeTimeout = time.Minute
+		e := newMemMPEnv(t, cfg, cfg)
+		p, _ := e.client.Pipe(0)
+		_ = p.Abort()
+		synctest.Wait()
+		candidate := e.lst.largestSuspended()
+		if candidate.c != e.server {
+			t.Fatal("missing suspended session")
+		}
+		joined := e.addPipe(t, PipeOptions{})
+		candidate.close()
+		echoOnce(t, t.Context(), e.client, e.server)
+		_ = joined.Abort()
+		synctest.Wait()
+		if next := e.lst.largestSuspended(); next.c != e.server || next.generation == candidate.generation {
+			t.Fatal("suspension generation reused")
+		}
+		candidate.close()
+		e.addPipe(t, PipeOptions{})
+		echoOnce(t, t.Context(), e.client, e.server)
+	})
 }

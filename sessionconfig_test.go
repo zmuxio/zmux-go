@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"log/slog"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,22 @@ import (
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 	"github.com/zmuxio/zmux-go/shaping"
 )
+
+func TestSessionConfigSharesListenerCopy(t *testing.T) {
+	base := &Config{MaxIncomingStreams: 8}
+	lst := mustNewListener(&ListenerConfig{Config: base})
+	defer func() { _ = lst.Close() }()
+	base.MaxIncomingStreams = 16
+	for range 2 {
+		cfg, err := lst.sessionConfig(t.Context(), PipeIO{}, nil, netip.AddrPort{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg != lst.cfg.Config || cfg.MaxIncomingStreams != 8 {
+			t.Fatal("session did not get the listener's private Config")
+		}
+	}
+}
 
 // One listener, two kinds of session chosen per carrier: PipeAuth.Exporter
 // where TLS ends here, PipeAuth.DeferredPSK otherwise, each with its own
@@ -94,19 +111,19 @@ func TestSessionConfigOutcomes(t *testing.T) {
 	leakcheck.Check(t)
 	other := timeshim.Or(nil)
 	for _, x := range []struct {
-		name string
 		f    func() (*Config, error)
+		name string
 		ok   bool
 	}{
-		{"nil", func() (*Config, error) { return nil, nil }, true}, //nolint:nilnil // the case under test: no config and no error
-		{"error", func() (*Config, error) { return nil, errors.New("no") }, false},
-		{"panic", func() (*Config, error) { panic("no") }, false},
-		{"clock", func() (*Config, error) { c := mpConfig(); c.Clock = other; return c, nil }, false},
-		{"invalid", func() (*Config, error) {
+		{name: "nil", f: func() (*Config, error) { return nil, nil }, ok: true}, //nolint:nilnil // the case under test: no config and no error
+		{name: "error", f: func() (*Config, error) { return nil, errors.New("no") }, ok: false},
+		{name: "panic", f: func() (*Config, error) { panic("no") }, ok: false},
+		{name: "clock", f: func() (*Config, error) { c := mpConfig(); c.Clock = other; return c, nil }, ok: false},
+		{name: "invalid", f: func() (*Config, error) {
 			c := mpConfig()
 			c.PipeAuth = PipeAuth{DeferredPSK: true, PSK: joinSecret}
 			return c, nil
-		}, false},
+		}, ok: false},
 	} {
 		t.Run(x.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

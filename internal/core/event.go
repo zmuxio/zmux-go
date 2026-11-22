@@ -46,30 +46,38 @@ const (
 	// EvDatagramPath reports that PathDatagramPayload of a session
 	// datagram changed (Count: the payload).
 	EvDatagramPath
+	EvStreamPlaced
+	EvStreamGapStarted
+	EvStreamGapFilled
+	EvPipePathQuality
 )
 
 // Event is one core event.
 type Event struct {
-	Pipe    uint64
-	MaxBidi uint64
-	MaxUni  uint64
-	Code    uint64
-	Count   uint64
-	RTT     Duration
-	Rate    float64
-	Err     *SessionError
-	Frame   []byte
-	Source  string // EvPipePriority: SourceLocal, SourcePeer or SourceDefault
-	Cause   error  // retirement: why the attachment failed, nil when it did not
-
-	Kind     EventKind
-	Dir      Dir
-	OutState OutState       // EvPipeState of DirOut
-	InState  InState        // EvPipeState of DirIn
-	Carrier  uint8          // EvPipeState: the pipe's carrier kind
-	Reason   JoinAuthReason // EvJoinAuthFailed
-	Role     Role
-	Features Features
+	Pipe        uint64
+	MaxBidi     uint64
+	MaxUni      uint64
+	Code        uint64
+	Count       uint64
+	Stream      uint64
+	Offset      uint64
+	At          Time
+	Wait        Duration
+	RTT         Duration
+	Rate        float64
+	Err         *SessionError
+	Frame       []byte
+	Source      string // EvPipePriority: SourceLocal, SourcePeer or SourceDefault
+	Cause       error  // retirement: why the attachment failed, nil when it did not
+	PathQuality PathQualityReason
+	Kind        EventKind
+	Dir         Dir
+	OutState    OutState       // EvPipeState of DirOut
+	InState     InState        // EvPipeState of DirIn
+	Carrier     uint8          // EvPipeState: the pipe's carrier kind
+	Reason      JoinAuthReason // EvJoinAuthFailed
+	Role        Role
+	Features    Features
 
 	Saturated bool
 	Failed    bool // retirement (EvPipeState of OutRetired): the attachment failed
@@ -85,7 +93,11 @@ const (
 )
 
 func (s *Session) emit(e Event) {
+	if e.Kind == EvPipeState || e.Kind == EvPipeAttached {
+		s.wakePrefixOnPipeState()
+	}
 	if e.Kind == EvPipeState || e.Kind == EvPipePriority {
+		s.wakePrefix()
 		s.capacityChanged()
 	}
 	s.events = append(s.events, e)

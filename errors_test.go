@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"testing"
+
+	"github.com/zmuxio/zmux-go/internal/core"
 )
 
 // TestErrorCodeRegistry checks that the exported error codes are the
@@ -92,4 +94,39 @@ func TestSessionErrorSentinels(t *testing.T) {
 	if !IsRetryable(fmt.Errorf("x: %w", &EarlyDataRejectedError{})) {
 		t.Error("a rejected early-data session is not retryable")
 	}
+}
+
+func TestErrorDataMapping(t *testing.T) {
+	for _, tc := range []struct {
+		kind core.StreamErrKind
+		want StreamErrorKind
+	}{
+		{core.StreamReset, StreamErrorReset},
+		{core.StreamStopped, StreamErrorStopped},
+	} {
+		err := apiErr(&core.StreamError{Kind: tc.kind, StreamID: 7, Code: 42, Remote: true, Reliable: 9})
+		var se *StreamError
+		if !errors.As(err, &se) || se.Kind != tc.want || se.StreamID != 7 || se.ErrorCode != 42 || !se.Remote || se.ReliableSize != 9 {
+			t.Errorf("stream error %#v", err)
+		}
+	}
+	cause := &net.OpError{Op: "join", Err: ErrJoinRefused}
+	checkCause := func(err error) {
+		t.Helper()
+		if !errors.Is(err, cause) || !errors.Is(err, ErrJoinRefused) {
+			t.Errorf("lost concrete pipe cause: %v", err)
+		}
+	}
+	resume, ok := errors.AsType[*ResumeTimeoutError](apiErr(&core.SessionError{Kind: core.CloseResumeTimeout, Cause: cause}))
+	if !ok {
+		t.Fatal("missing ResumeTimeoutError")
+	}
+	checkCause(resume.LastPipeErr)
+	checkCause(resume.Unwrap())
+	lost, ok := errors.AsType[*PipesLostError](apiErr(&core.SessionError{Kind: core.ClosePipesLost, Cause: cause}))
+	if !ok {
+		t.Fatal("missing PipesLostError")
+	}
+	checkCause(lost.LastPipeErr)
+	checkCause(lost.Unwrap())
 }

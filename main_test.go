@@ -61,5 +61,5 @@ func startServerNoListener(ctx context.Context, p PipeIO, cfg *Config) (*Conn, e
 		ClosePipeIO(p)
 		return nil, err
 	}
-	return startCore(ctx, p, cfg, cc, nil, nil)
+	return startCore(ctx, p, cfg, cc, nil, nil, nil)
 }

@@ -28,12 +28,12 @@ func TestQualityBandRatioRule(t *testing.T) {
 // and the zero QualityBand clears the session's band.
 func TestQualityDefaults(t *testing.T) {
 	for _, d := range []struct {
-		name      string
 		got, want any
+		name      string
 	}{
-		{"DefaultMaxLanes", DefaultMaxLanes, 258},
-		{"DefaultRecoveryRatio", DefaultRecoveryRatio, 1.25},
-		{"DefaultMinInterval", DefaultMinInterval, time.Second},
+		{name: "DefaultMaxLanes", got: DefaultMaxLanes, want: 258},
+		{name: "DefaultRecoveryRatio", got: DefaultRecoveryRatio, want: 1.25},
+		{name: "DefaultMinInterval", got: DefaultMinInterval, want: time.Second},
 	} {
 		if d.got != d.want {
 			t.Errorf("%s = %v, want %v", d.name, d.got, d.want)

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 )
 
 // The views zmux puts over a carrier half to replay what it read
@@ -26,7 +27,7 @@ import (
 // the capability's own terms: no TLS (a zero ConnectionState), false
 // (CarrierSecure, ReportsFailure, TLSRecords), nil (CarrierConn,
 // CarrierPeer, HandshakeContext), 0 (MaxRecord: no bound), not known
-// (Unsent, Retransmitted), errors.ErrUnsupported (CloseWrite,
+// (Unsent), errors.ErrUnsupported (CloseWrite,
 // ExportKeyingMaterial), nothing to do (RecordCloseCode, CarrierTaken).
 // Abort closes the connection (below TLS for a TLS connection), and
 // WriteBuffers and WriteMessages write one buffer or message at a time.
@@ -177,12 +178,15 @@ func (c sendCaps) Unsent() (uint64, bool) {
 	return 0, false
 }
 
-// Retransmitted is the viewed half's (RetransReporter).
-func (c sendCaps) Retransmitted() (uint64, bool) {
-	if r, ok := c.h.(RetransReporter); ok {
-		return r.Retransmitted()
+// CarrierSampler is for internal use by zmux modules.
+func (c sendCaps) CarrierSampler() *carrierstats.Sampler {
+	if sampler := carrierstats.ProviderOf(c.h); sampler != nil {
+		return sampler
 	}
-	return 0, false
+	if w, ok := c.h.(io.WriteCloser); ok {
+		return carrierstats.SocketSampler(w)
+	}
+	return nil
 }
 
 // WriteBuffers writes through the viewed half's WriteBuffers
@@ -261,6 +265,13 @@ type readOnly struct {
 
 func (r readOnly) Read(b []byte) (int, error) { return r.r.Read(b) }
 func (r readOnly) Close() error               { return nil }
+
+func (r readOnly) ReadMessage(limit int) ([]byte, error) {
+	if mr, ok := r.r.(MessageReader); ok {
+		return mr.ReadMessage(limit)
+	}
+	return noMessages{}.ReadMessage(limit)
+}
 
 // Unwrap returns the carrier's own receiving half.
 func (r readOnly) Unwrap() io.ReadCloser { return r.h.(io.ReadCloser) }
@@ -352,7 +363,7 @@ func newHalfOwner(p PipeIO) *halfOwner {
 func (o *halfOwner) closeR() {
 	o.rOnce.Do(func() {
 		if o.r != nil {
-			_ = o.r.Close()
+			carrierio.CloseHalf(o.r)
 		}
 		o.rDone.Store(true)
 	})
@@ -361,7 +372,7 @@ func (o *halfOwner) closeR() {
 func (o *halfOwner) closeW() {
 	o.wOnce.Do(func() {
 		if o.w != nil {
-			_ = o.w.Close()
+			carrierio.CloseHalf(o.w)
 		}
 		o.wDone.Store(true)
 	})

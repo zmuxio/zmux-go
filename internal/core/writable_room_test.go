@@ -64,17 +64,17 @@ func TestEndWaitWrite(t *testing.T) {
 // the wait, not the caller.
 func TestWaitWriteEndsWithPart(t *testing.T) {
 	cases := []struct {
-		name string
 		end  func(s *Session, st *Stream)
+		name string
 	}{
-		{"finish", func(s *Session, st *Stream) {
+		{name: "finish", end: func(s *Session, st *Stream) {
 			if err := s.Finish(st); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{"reset", func(s *Session, st *Stream) { s.Reset(st, 3) }},
-		{"stop", func(s *Session, st *Stream) { s.onStopSending(st, 5) }},
-		{"session", func(s *Session, _ *Stream) { s.Close(0, nil) }},
+		{name: "reset", end: func(s *Session, st *Stream) { s.Reset(st, 3) }},
+		{name: "stop", end: func(s *Session, st *Stream) { s.onStopSending(st, 5) }},
+		{name: "session", end: func(s *Session, _ *Stream) { s.Close(0, nil) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

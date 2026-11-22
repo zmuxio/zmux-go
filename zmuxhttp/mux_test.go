@@ -40,23 +40,23 @@ func TestClassifyHTTP(t *testing.T) {
 	h2ws.Proto, h2ws.ProtoMajor = "HTTP/2.0", 2
 	body := strings.NewReader("x")
 	for _, c := range []struct {
-		name string
 		r    *http.Request
+		name string
 		want Class
 	}{
-		{"websocket", req(http.MethodGet, map[string]string{"Upgrade": "WebSocket", "Connection": "Upgrade"}, nil, 0), ClassWebSocket},
-		{"extended connect websocket", h2ws, ClassWebSocket},
-		{"webtransport", h3, ClassWebTransport},
-		{"webtransport draft", h3draft, ClassWebTransport},
-		{"other webtransport-*", h3other, ClassNone},
-		{"downlink pair", req(http.MethodGet, map[string]string{HeaderPair: "x"}, nil, 0), ClassDownlink},
-		{"plain get", req(http.MethodGet, nil, nil, 0), ClassNone},
-		{"split uplink", req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, -1), ClassUplink},
-		{"split uplink with a length", req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, 1), ClassUplink},
-		{"exchange", req(http.MethodPost, nil, body, 1), ClassExchange},
-		{"bidirectional", req(http.MethodPost, nil, body, -1), ClassBidirectional},
-		{"put", req(http.MethodPut, nil, body, -1), ClassNone},
-		{"plain connect", req(http.MethodConnect, nil, nil, -1), ClassNone},
+		{name: "websocket", r: req(http.MethodGet, map[string]string{"Upgrade": "WebSocket", "Connection": "Upgrade"}, nil, 0), want: ClassWebSocket},
+		{name: "extended connect websocket", r: h2ws, want: ClassWebSocket},
+		{name: "webtransport", r: h3, want: ClassWebTransport},
+		{name: "webtransport draft", r: h3draft, want: ClassWebTransport},
+		{name: "other webtransport-*", r: h3other, want: ClassNone},
+		{name: "downlink pair", r: req(http.MethodGet, map[string]string{HeaderPair: "x"}, nil, 0), want: ClassDownlink},
+		{name: "plain get", r: req(http.MethodGet, nil, nil, 0), want: ClassNone},
+		{name: "split uplink", r: req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, -1), want: ClassUplink},
+		{name: "split uplink with a length", r: req(http.MethodPost, map[string]string{HeaderPair: "x"}, body, 1), want: ClassUplink},
+		{name: "exchange", r: req(http.MethodPost, nil, body, 1), want: ClassExchange},
+		{name: "bidirectional", r: req(http.MethodPost, nil, body, -1), want: ClassBidirectional},
+		{name: "put", r: req(http.MethodPut, nil, body, -1), want: ClassNone},
+		{name: "plain connect", r: req(http.MethodConnect, nil, nil, -1), want: ClassNone},
 	} {
 		if got := Classify(c.r); got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
@@ -281,15 +281,15 @@ func TestHTTPTrustedSource(t *testing.T) {
 	for _, c := range []struct {
 		name    string
 		trusted *zmux.TrustedProxies
-		proxy   bool // send a PROXY protocol header
 		want    string
+		proxy   bool // send a PROXY protocol header
 	}{
-		{"header trusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, Header: "X-Forwarded-For"}, false, "203.0.113.7:0"},
-		{"header untrusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{other}, Header: "X-Forwarded-For"}, false, "127.0.0.1"},
-		{"header not configured", nil, false, "127.0.0.1"},
-		{"forwarded trusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, Header: "Forwarded"}, false, "198.51.100.9:0"},
-		{"proxy protocol trusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, ProxyProtocol: true}, true, "192.0.2.4:4242"},
-		{"proxy protocol untrusted", &zmux.TrustedProxies{Prefixes: []netip.Prefix{other}, ProxyProtocol: true}, true, "bad request"},
+		{name: "header trusted", trusted: &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, Header: "X-Forwarded-For"}, proxy: false, want: "203.0.113.7:0"},
+		{name: "header untrusted", trusted: &zmux.TrustedProxies{Prefixes: []netip.Prefix{other}, Header: "X-Forwarded-For"}, proxy: false, want: "127.0.0.1"},
+		{name: "header not configured", trusted: nil, proxy: false, want: "127.0.0.1"},
+		{name: "forwarded trusted", trusted: &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, Header: "Forwarded"}, proxy: false, want: "198.51.100.9:0"},
+		{name: "proxy protocol trusted", trusted: &zmux.TrustedProxies{Prefixes: []netip.Prefix{loop}, ProxyProtocol: true}, proxy: true, want: "192.0.2.4:4242"},
+		{name: "proxy protocol untrusted", trusted: &zmux.TrustedProxies{Prefixes: []netip.Prefix{other}, ProxyProtocol: true}, proxy: true, want: "bad request"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got := make(chan string, 1)

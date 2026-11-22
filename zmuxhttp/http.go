@@ -18,8 +18,11 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/internal/httpx"
 	"github.com/zmuxio/zmux-go/internal/labels"
+	"github.com/zmuxio/zmux-go/internal/poolhost"
 )
 
 // A request body carries the up direction, a response body the down
@@ -288,11 +291,10 @@ var errUpReplay = errors.New("uplink past the replay bound")
 // again first. A replaced request's body that was waiting in the pipe when
 // it was replaced adds what it got to carry. rdMu orders reads of p.
 type upStream struct {
-	p    *bodyPipe
-	rdMu sync.Mutex
-
+	p       *bodyPipe
 	live    *httpUpBody // under mu
 	carry   []byte      // under mu
+	rdMu    sync.Mutex
 	mu      sync.Mutex
 	direct  atomic.Bool // settled and carry drained: the live body reads p only
 	pending bool        // no response other than a redirect yet (under mu)
@@ -366,7 +368,19 @@ func (b *httpUpBody) headersWritten() { b.wroteOnce.Do(func() { close(b.wrote) }
 // SetSecureConnection implements CarrierBody; a body a redirect
 // replaced declares nothing.
 func (b *httpUpBody) SetSecureConnection(c zmux.ConnectionStater) {
-	if c != nil && !b.dead.Load() {
+	if c == nil || b.dead.Load() {
+		return
+	}
+	// The transport selects this connection after creating the pipe.
+	// Sample it before publishing the sending hop to statistics readers.
+	sampler := carrierstats.ProviderOf(c)
+	if sampler == nil {
+		sampler = carrierstats.SocketSampler(c)
+	}
+	if sampler != nil {
+		carrierstats.Prime(sampler)
+	}
+	if !b.dead.Load() {
 		b.conn.Store(&c)
 	}
 }
@@ -653,6 +667,13 @@ func (w *httpReqWriter) ConnectionState() tls.ConnectionState {
 	return tls.ConnectionState{}
 }
 
+// CarrierSampler is for internal use by zmux modules.
+func (w *httpReqWriter) CarrierSampler() *carrierstats.Sampler {
+	return carrierstats.ProviderOf(w.connection())
+}
+
+func (w *httpReqWriter) CarrierSampleConn() any { return w.connection() }
+
 // HandshakeContext waits until the current hop's request headers went out
 // (or the request ended): a transport names the connection before then.
 func (w *httpReqWriter) HandshakeContext(ctx context.Context) error {
@@ -711,6 +732,8 @@ func (w *httpReqWriter) Abort(err error) {
 // takes, and the write returns once all of it was copied, so nothing is
 // retained and a batch costs one hand-over instead of one per buffer.
 type bodyPipe struct {
+	rerr error // under emu: the read side's close error
+	werr error // under emu: the write side's close error
 	wrCh chan struct{}
 	rdCh chan int // bytes copied in a turn
 	done chan struct{}
@@ -718,9 +741,6 @@ type bodyPipe struct {
 	bufs [][]byte  // what is left of the write; the reader's while it holds a turn
 	once sync.Once
 	wrMu sync.Mutex // serializes writes; guards one
-
-	rerr error // the read side's close error
-	werr error // the write side's close error
 	emu  sync.Mutex
 }
 
@@ -866,6 +886,15 @@ func (r *httpRespReader) Close() error {
 	return nil
 }
 
+type carrierConnKey struct{}
+
+// ConnContext records the accepted connection for carrier statistics. Set
+// http.Server.ConnContext to ConnContext, or call it from an existing hook,
+// to expose the TCP provider for HTTP/1.1 and HTTP/2 response carriers.
+func ConnContext(ctx context.Context, conn net.Conn) context.Context {
+	return context.WithValue(ctx, carrierConnKey{}, conn)
+}
+
 // NewHandler returns a handler that hands HTTP requests to l as
 // carriers, by their class (Classify): a downlink (the response body),
 // an uplink (the request body) or a bidirectional carrier (both, full
@@ -873,22 +902,19 @@ func (r *httpRespReader) Close() error {
 // first passes l's admission (zmux.ListenerConfig.Admission); a request forwarded from
 // early data is answered 425. Nothing is written before a carrier is
 // accepted: with an Admission, the response header goes out when it
-// accepts the request; without one, with the first downlink bytes, and an
-// uplink's once l has taken it. A response that carries a downlink is sent
+// accepts the request. Otherwise the listener commits the response when
+// classification takes the carrier or its handshake layer first writes. A response that carries a downlink is sent
 // with Cache-Control: no-store and X-Accel-Buffering: no and without a
 // Content-Length, so that intermediaries neither cache nor buffer it. A request that l does not take and
 // to which nothing was written is served by o.Next, with every body byte
 // that l read replayed in front of the rest. A carrier with a body that
-// the admission decides on its start with zmux.VerdictFallback is no
-// request for o.Next but a carrier: with a zmux.ListenerConfig.Fallback it
-// is taken over there (zmux.Takeover), its response head written (as for
-// an accepted carrier) and its Pipe the request body (with the bytes read
-// replayed) and, for a bidirectional carrier, the response body, full
-// duplex; after Takeover.Detach the handler returns once the host closed
-// every half of the pipe, or the request ended: the host must close it,
-// and only the request's context bounds the handler otherwise. The
-// handler returns when the pipe ends. o may be nil; an invalid o is an
-// zmux.ErrInvalidConfig error.
+// the admission decides on its start with zmux.VerdictFallback goes to
+// Options.Next with the complete streaming request body, or receives 404
+// when Next is nil. VerdictTakeover hands the accepted request and response
+// halves to ListenerConfig.Fallback.
+// The handler retains a detached carrier until its halves or request end.
+// Use ConnContext with the serving http.Server to expose TCP carrier samples.
+// An invalid o is a zmux.ErrInvalidConfig error.
 func NewHandler(l *zmux.Listener, o *Options) (http.Handler, error) {
 	if err := o.Validate(); err != nil {
 		return nil, err
@@ -913,7 +939,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.o.Fallback(w, r)
 		return
 	}
-	a, ok := h.l.Adapter().AdmitRequest(w, r, h.o.Trusted, http.HandlerFunc(h.o.Fallback))
+	a, ok := h.l.Adapter().AdmitRequest(w, r, h.o.Trusted, h.o.Next)
 	if !ok {
 		return
 	}
@@ -924,20 +950,16 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// client could otherwise send its next request on a connection that
 	// is about to close.
 	life := &httpLife{}
-	hw := &httpRespWriter{w: w, rc: rc, close: r.ProtoMajor == 1, life: life}
-	// After ServeHTTP returns, the response and its controller are not
-	// used again (net/http): a pipe's halves closed later leave them.
-	fellBack := false // or detached: the host closed the halves, the response ends cleanly
-	defer func() {
-		life.end()
-		if fellBack {
-			return // the halves were closed before; the connection lives on
-		}
-		_ = rc.SetWriteDeadline(time.Now()) // a blocked write returns
-		hw.mu.Lock()
-		hw.closed = true
-		hw.mu.Unlock()
-	}()
+	conn, _ := r.Context().Value(carrierConnKey{}).(net.Conn)
+	hw := &httpRespWriter{w: w, rc: rc, close: r.ProtoMajor == 1, life: life, conn: conn}
+	// A carrier closed after the request ended can no longer use its controller.
+	life.tail = new(carrierio.RequestTail)
+	if outer, ok := w.(interface{ RequestTail() *carrierio.RequestTail }); ok {
+		life.tail = outer.RequestTail()
+	} else {
+		defer life.tail.Finish()
+	}
+	defer life.end()
 	p := zmux.PipeIO{Carrier: zmux.CarrierSplit}
 	var body *httpReqBody
 	switch class {
@@ -971,20 +993,35 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.W = &httpChanWriter{httpRespWriter: hw}
 		}
 	}
+	acceptHead := func(ctx context.Context) error {
+		hw.mu.Lock()
+		defer hw.mu.Unlock()
+		if hw.closed {
+			return net.ErrClosed
+		}
+		if err := commitResponse(ctx, w, func() error { hw.start(); return nil }); err != nil {
+			return err
+		}
+		hw.openChannel()
+		return nil
+	}
 	if h.l.Adapter().HasAdmission() {
 		// Admitted: the carrier is valid, its header goes out now.
-		hw.mu.Lock()
-		hw.start()
-		hw.mu.Unlock()
-		_ = rc.Flush()
+		err := a.PrepareCarrier(r.Context(), acceptHead)
+		if err != nil {
+			a.Release()
+			panic(http.ErrAbortHandler)
+		}
+	} else {
+		life.tail.Accept = acceptHead
 	}
-	// The carrier's end as its host closes it, when the host detached a
-	// carrier it took over (zmux.Takeover.Detach): each of its halves.
-	hostEnd := make(chan struct{})
+	// The handler owns the response until the session or takeover closes
+	// every carrier half backed by this request.
+	carrierEnd := make(chan struct{})
 	halves := new(atomic.Int32)
 	halfEnded := func() {
 		if halves.Add(-1) == 0 {
-			close(hostEnd)
+			close(carrierEnd)
 		}
 	}
 	if p.W != nil {
@@ -995,20 +1032,21 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		halves.Add(1)
 		body.onClose = sync.OnceFunc(halfEnded)
 	}
-	_ = a.HandlePipe(r.Context(), p, hint)
+	setupErr := a.HandlePipe(r.Context(), p, hint)
 	if a.Detached() {
-		// The request is the carrier: it lives until the host closed both
-		// halves (the request body stays readable after the response's
-		// half was closed), or the request ended.
 		select {
-		case <-hostEnd:
-			fellBack = true
+		case <-carrierEnd:
 		case <-r.Context().Done():
+			// Exclude any host write before returning the ResponseWriter.
+			hw.stopWriting()
 		}
 		return
 	}
+	// A split request backs just its own half. Its setup context may end
+	// while the combined carrier still uses the request.
+	<-carrierEnd
 	if !hw.started() {
-		if read, ok := body.replay(); ok {
+		if read, ok := body.replay(); setupErr != nil && ok {
 			// Not taken, nothing written: the request goes to the
 			// fallback, whatever ended it (refused, malformed, the
 			// listener closed). The pipe's halves were closed with
@@ -1018,12 +1056,35 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if len(read) > 0 {
 				r.Body = httpx.ReplayBody(read, r.Body, r.Body)
 			}
-			fellBack = true
 			h.o.Fallback(w, r)
 			return
 		}
-		hw.start() // an uplink's empty response
+		// A taken carrier whose response never committed cannot be replayed.
+		panic(http.ErrAbortHandler)
 	}
+}
+
+// commitResponse joins the write interrupt before handing the response
+// to the carrier. A deadline belongs only to this HTTP request/stream.
+func commitResponse(ctx context.Context, w http.ResponseWriter, write func() error) error {
+	rc := http.NewResponseController(w)
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(done)
+		poolhost.Safe(nil, "HTTP response interrupt", func() { _ = rc.SetWriteDeadline(time.Now()) })
+	})
+	defer func() {
+		if !stop() {
+			<-done
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := write(); err != nil {
+		return err
+	}
+	return rc.Flush()
 }
 
 // httpRespWriter is the response body as the sending half of a pipe; every
@@ -1032,6 +1093,7 @@ type httpRespWriter struct {
 	w       http.ResponseWriter
 	rc      *http.ResponseController
 	life    *httpLife
+	conn    net.Conn
 	mu      sync.Mutex
 	closed  bool
 	written bool   // the response header went out
@@ -1050,12 +1112,28 @@ type httpRespWriter struct {
 	chMu    sync.Mutex
 }
 
+func (h *httpRespWriter) CarrierSampleConn() any { return h.conn }
+
+// CarrierSampler is for internal use by zmux modules.
+func (h *httpRespWriter) CarrierSampler() *carrierstats.Sampler {
+	for w := h.w; w != nil; {
+		if provider, ok := w.(carrierstats.Provider); ok {
+			return provider.CarrierSampler()
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		w = u.Unwrap()
+	}
+	return nil
+}
+
 // start writes the response header, once; under mu or after the pipe ended.
 func (h *httpRespWriter) start() {
 	if h.written {
 		return
 	}
-	defer h.openChannel()
 	h.written = true
 	hh := h.w.Header()
 	hh.Set("Content-Type", "application/octet-stream")
@@ -1113,6 +1191,15 @@ func (h *httpRespWriter) WriteBuffers(bufs [][]byte) (int, error) {
 // a write in progress, such as one blocked on a peer that does not read,
 // is interrupted.
 func (h *httpRespWriter) Close() error {
+	h.stopWriting()
+	if h.onClose != nil {
+		h.onClose()
+	}
+	return nil
+}
+
+// stopWriting waits for an interrupted write before the response can end.
+func (h *httpRespWriter) stopWriting() {
 	if !h.mu.TryLock() {
 		// A write is in progress: interrupt it.
 		h.life.do(func() { _ = h.rc.SetWriteDeadline(time.Now()) })
@@ -1120,15 +1207,12 @@ func (h *httpRespWriter) Close() error {
 	}
 	h.closed = true
 	h.mu.Unlock()
-	if h.onClose != nil {
-		h.onClose()
-	}
-	return nil
 }
 
 // httpLife is the lifetime of a carrier's ServeHTTP call: the response
 // controller is used only while it runs.
 type httpLife struct {
+	tail *carrierio.RequestTail
 	mu   sync.Mutex
 	done bool
 }
@@ -1162,16 +1246,20 @@ type httpReqBody struct {
 	// onClose tells the handler that the body was closed.
 	onClose func()
 
-	read  []byte
-	mu    sync.Mutex
-	taken bool // the listener took the carrier, or read past the bound
-	ended bool // the body hit its end: net/http now reads the connection itself
+	read   []byte
+	mu     sync.Mutex
+	taken  bool // the listener took the carrier, or read past the bound
+	closed bool // the carrier has released its view of the request body
+	ended  bool // the body hit its end: net/http now reads the connection itself
 }
 
 func (r *httpReqBody) Read(p []byte) (int, error) {
-	n, err := r.b.Read(p)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return 0, net.ErrClosed
+	}
+	n, err := r.b.Read(p)
 	r.ended = r.ended || errors.Is(err, io.EOF)
 	if n > 0 && !r.taken {
 		if len(r.read)+n > zmux.MaxUntakenRead {
@@ -1215,16 +1303,33 @@ func (r *httpReqBody) Close() error {
 	if r.onClose != nil {
 		defer r.onClose()
 	}
-	// A deadline during net/http's background read would cancel the connection's
-	// context, and with it the next request on the connection; no read of ours blocks.
-	r.mu.Lock()
-	ended := r.ended
-	r.mu.Unlock()
-	if !ended {
-		r.life.do(func() { _ = r.rc.SetReadDeadline(time.Now()) })
+	// Interrupt a carrier read in progress. An idle untaken view can be
+	// released without touching the underlying HTTP request at all.
+	bodyClosed := false
+	if !r.mu.TryLock() {
+		r.life.do(func() {
+			if err := r.rc.SetReadDeadline(time.Now()); err != nil {
+				// Request.Body supports concurrent Close to unblock Read.
+				_ = r.b.Close()
+				bodyClosed = true
+			}
+		})
+		r.mu.Lock()
 	}
-	if _, ok := r.replay(); ok {
+	defer r.mu.Unlock()
+	if bodyClosed {
+		r.taken, r.closed, r.read = true, true, nil
 		return nil
+	}
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	if !r.taken {
+		return nil
+	}
+	if !r.ended {
+		r.life.do(func() { _ = r.rc.SetReadDeadline(time.Now()) })
 	}
 	return r.b.Close()
 }
@@ -1277,6 +1382,9 @@ func (h *httpRespWriter) openChannel() {
 // stream has a datagram channel: until the response header went out, the
 // channel takes nothing.
 type httpChanWriter struct{ *httpRespWriter }
+
+func (h *httpRespWriter) RequestTail() *carrierio.RequestTail { return h.life.tail }
+func (r *httpReqBody) RequestTail() *carrierio.RequestTail    { return r.life.tail }
 
 func (h *httpChanWriter) channel() zmux.DatagramChannel {
 	if p := h.ch.Load(); p != nil {

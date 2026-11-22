@@ -34,6 +34,8 @@ func (d *ChannelDemux) Dropped() uint64 { return d.d.Dropped() }
 
 // AppendChannelDatagram appends the channel datagram of one DATAGRAM frame
 // with data, after the Pipe Stream ID id when withID.
+//
+//goland:noinspection GoUnusedExportedFunction // used by the QUIC adapter module
 func AppendChannelDatagram(b []byte, withID bool, id uint64, data []byte) []byte {
 	return wire.AppendChannelDatagram(b, withID, id, data)
 }

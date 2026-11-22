@@ -1,8 +1,9 @@
 package core
 
-import "slices"
-
-import "math"
+import (
+	"math"
+	"slices"
+)
 
 // Multipath scheduling policies: which stream data a pipe takes when it
 // can write (late binding), within the multipath sender rules.
@@ -20,9 +21,9 @@ const (
 type decision struct {
 	p         *Pipe
 	g         *gate // &gb, or nil when no pipe is usable
-	gb        gate
 	fastest   *Pipe // the eligible pipe of p's tier with the smallest ETA for a chunk
 	lv        *levelStats
+	gb        gate
 	tier      int
 	multiTier bool
 	open      bool
@@ -92,7 +93,28 @@ func (s *Session) onPipe(d *decision, st *Stream) bool {
 	if m := sp.mps; m != nil && (m.resend.len() > 0 || m.finResend) {
 		// Reinjected information goes on the eligible pipe of the tier
 		// with the earliest arrival, within the reinjection hold.
-		return d.takes && d.fastest == p && s.reinjectRoom(p)
+		if !d.takes {
+			return false
+		}
+		bypass := false
+		if m.resend.len() > 0 {
+			r := m.resend.first()
+			if m.repair.source != nil && m.repair.covers(r.lo) {
+				target, eligible := s.prefixReplacement(d.g, m.repair.source, min64(r.hi, m.repair.hi)-r.lo)
+				switch {
+				case target != nil:
+					return s.chosen(p, target)
+				case eligible:
+					_, native := s.planNativeResend(st)
+					bypass = !native
+				default:
+					s.retryPrefixTail(st)
+				}
+			}
+		}
+		if !bypass && (m.resend.len() > 0 || m.finResend) {
+			return d.fastest == p && s.reinjectRoom(p)
+		}
 	}
 	if d.takes && s.redundant(st) {
 		l := min64(max64(s.readyBytes(st), 1), uint64(s.cfg.SpreadChunk))
@@ -110,11 +132,7 @@ func (s *Session) onPipe(d *decision, st *Stream) bool {
 		if !d.takes {
 			return false
 		}
-		if s.spreadETAOK(d, st) {
-			return true
-		}
-		s.chosen(p, d.fastest)
-		return false
+		return s.chosen(p, s.spreadETATarget(d, st))
 	case PolicySpreadRoundRobin, PolicySpreadRateWeighted:
 		return d.takes && s.chosen(p, s.rrPick(d.g, d.tier, st))
 	case PolicySessionAffinity:
@@ -168,7 +186,11 @@ type rateTops struct {
 // for a caller that needs the placement rate of many pipes.
 func (s *Session) fastestOf(pr uint64) (t [2]rateTops) {
 	for _, q := range s.pipes {
-		if q.mp == nil || q.out == nil || !q.out.snd.re.measured || !s.pipeUsable(q, false) {
+		if q.mp == nil || q.out == nil || !s.pipeUsable(q, false) {
+			continue
+		}
+		e := &q.out.snd.re
+		if !e.measured || q.mp.quality != nil && !q.mp.quality.freshRate(s.now) {
 			continue
 		}
 		qp, qs := q.mp.effPrio()
@@ -176,7 +198,7 @@ func (s *Session) fastestOf(pr uint64) (t [2]rateTops) {
 			continue
 		}
 		c := &t[b2i(qs)]
-		switch r := q.out.snd.re.value(); {
+		switch r := s.recentRate(q); {
 		case c.p1 == nil || r > c.r1:
 			if c.p1 != nil {
 				c.r2 = c.r1
@@ -196,15 +218,16 @@ func b2i(b bool) int {
 	return 0
 }
 
-// placementRate is the rate the spreading policies place data with: R_p, or for
-// a usable pipe without a bottleneck sample the fastest measured pipe of its
-// tier and standby flag (tops: fastestOf p's priority), for four of its
-// round trips.
+// placementRate uses recent service. Until a usable pipe has a bottleneck
+// sample it can borrow a fresh rate from its class for four round trips,
+// bounded by the rate observation window.
 func (s *Session) placementRate(p *Pipe, tops *[2]rateTops) float64 {
 	e := &p.out.snd.re
-	own := e.value()
+	own := s.recentRate(p)
 	a := p.mp
-	if e.measured || a.placedSet && e.round >= a.placedFrom+placementRounds || !s.pipeUsable(p, false) {
+	q := a.quality
+	if q == nil || e.measured || a.penaltyEnd > 0 || q.placed && (e.round >= q.placedFrom+placementRounds || s.now.Sub(q.placedAt) >= rateWindow) ||
+		!s.pipeUsable(p, false) {
 		return own
 	}
 	_, sb := a.effPrio()
@@ -216,17 +239,95 @@ func (s *Session) placementRate(p *Pipe, tops *[2]rateTops) float64 {
 	if fastest <= own {
 		return own
 	}
-	if !a.placedSet {
-		a.placedSet, a.placedFrom = true, e.round
+	if !q.placed {
+		q.placed, q.placedFrom, q.placedAt = true, e.round, s.now
 	}
 	return fastest
 }
 
-// eta is ETA_p(L) in seconds, given owdBase and the rateTops of p's
-// priority.
-func (s *Session) eta(p *Pipe, l uint64, base Duration, tops *[2]rateTops) float64 {
-	r := max(s.placementRate(p, tops), 1)
-	return (s.queued(p)+float64(l))/r + float64(owdFrom(p.mp, base))/1e9
+// recentRate is the delivery estimate for placement, not the peak used by
+// the carrier limiter. The writer's queue already limits unmeasured paths.
+func (s *Session) recentRate(p *Pipe) float64 {
+	e := &p.out.snd.re
+	if q := p.mp.quality; q != nil {
+		return max(q.currentRate(e, s.now), 1)
+	}
+	return max(e.value(), 1)
+}
+
+// pathEstimate is a value snapshot taken under the session lock. All
+// placement and repair costs at a decision use these same quality inputs.
+type pathEstimate struct {
+	rtt, deviation Duration
+	rate, arrival  float64 // service in bytes/s and arrival overhead in seconds
+}
+
+func (e pathEstimate) eta(n uint64) float64 { return e.arrival + float64(n)/e.rate }
+
+// estimate separates propagation from delay already counted by the queue.
+func (s *Session) estimate(p *Pipe, tops *[2]rateTops, queued float64, staged uint64) pathEstimate {
+	a := p.mp
+	r := s.placementRate(p, tops)
+	q := a.quality
+	rtt := a.currentRTT(s.now)
+	forward := float64(rtt) / 2e9
+	var m Duration
+	var floorKnown bool
+	if q != nil {
+		m, floorKnown = q.floor(s.now)
+		ps := &p.out.snd
+		if floorKnown && ps.re.measured && q.freshRate(s.now) {
+			// Bytes exceeding one propagation/ACK flight are evidence of
+			// a hidden carrier backlog. Use the larger queue observation.
+			outstanding := ps.so - min64(ps.so, ps.cum)
+			inFlight := float64(outstanding - min64(outstanding, staged))
+			flight := r * float64(minD(rtt, m)+q.hold) / 1e9
+			queued = max(queued, inFlight-flight)
+		}
+	}
+	queue := queued / r
+	switch {
+	case floorKnown:
+		// Recent RTT follows the ACK estimator's adjustment. A known
+		// propagation floor separates queueing from that RTT.
+		floor := float64(minD(rtt, m)) / 2e9
+		forward = max(floor+queue, forward)
+	case q != nil && q.freshRTT(s.now):
+		// With no fresh floor the sample may already include the queue.
+		forward = max(forward, queue)
+	default:
+		forward += queue
+	}
+	if a.unacked {
+		overdue := s.now.Sub(a.tref()) - s.pto(a) - s.queueDelay(a)
+		forward = max(forward, float64(rtt)/2e9+float64(overdue)/1e9)
+	}
+	return pathEstimate{rtt: rtt, deviation: a.rtt.rttvar, rate: r, arrival: forward}
+}
+
+// gateQuality gives each usable pipe one estimate for this gate, shared
+// by selection, tier backlog, reordering and repair. Each writer and timer
+// owns its gate scratch space.
+func (s *Session) gateQuality(g *gate) {
+	if len(g.quality) == len(g.pipes) {
+		return
+	}
+	for i, tier := range g.tiers {
+		tops := s.fastestOf(tier.prio)
+		for _, p := range g.tierPipes(i) {
+			g.quality = append(g.quality, s.estimate(p, &tops, s.queued(p), 0))
+		}
+	}
+}
+
+func (g *gate) pipeQuality(p *Pipe, ti int) pathEstimate {
+	t := g.tiers[ti]
+	for i := t.lo; i < t.hi; i++ {
+		if g.pipes[i] == p {
+			return g.quality[i]
+		}
+	}
+	return pathEstimate{}
 }
 
 // fastestIn returns the pipe of tier ti with the smallest ETA for l bytes,
@@ -242,14 +343,22 @@ func (s *Session) earliestTwo(g *gate, ti int, l uint64, except *Pipe) (*Pipe, *
 	if ti < 0 || ti >= len(g.tiers) {
 		return nil, nil
 	}
+	t := g.tiers[ti]
+	if t.hi-t.lo == 1 {
+		if p := g.pipes[t.lo]; p != except {
+			return p, nil
+		}
+		return nil, nil
+	}
 	var a, b *Pipe
 	var ea, eb float64
-	base, tops := s.owdBase(), s.fastestOf(g.tiers[ti].prio)
-	for _, q := range g.tierPipes(ti) {
+	s.gateQuality(g)
+	for i := t.lo; i < t.hi; i++ {
+		q := g.pipes[i]
 		if q == except {
 			continue
 		}
-		e := s.eta(q, l, base, &tops)
+		e := g.quality[i].eta(l)
 		switch {
 		case a == nil || e < ea || e == ea && q.id < a.id:
 			b, eb = a, ea
@@ -334,7 +443,11 @@ func (lv *levelStats) cappedSum(u uint8, r uint64) uint64 {
 	return sum + uint64(len(x)-lo)*r
 }
 
-func (s *Session) spreadETAOK(d *decision, st *Stream) bool {
+// spreadETATarget chooses the current pipe if its chunk fits the ordered
+// completion and receive-credit budgets.
+// Otherwise it returns the fastest pipe for this chunk, which may be smaller
+// than the nominal SpreadChunk.
+func (s *Session) spreadETATarget(d *decision, st *Stream) *Pipe {
 	g, p := d.g, d.p
 	ready := s.readyBytes(st)
 	whole := uint64(s.cfg.SpreadChunk)
@@ -343,17 +456,16 @@ func (s *Session) spreadETAOK(d *decision, st *Stream) bool {
 	if chunk != whole {
 		f = s.fastestIn(g, d.tier, chunk, nil)
 	}
-	if f == nil {
-		return false
+	if f == nil || f == p {
+		return f
 	}
-	if f == p {
-		return true
+	qf := g.pipeQuality(f, d.tier)
+	etaP := g.pipeQuality(p, d.tier).eta(chunk)
+	if etaP <= qf.eta(chunk) {
+		return p
 	}
-	// f is of p's tier: one priority.
-	base, tops := s.owdBase(), s.fastestOf(g.tiers[d.tier].prio)
-	etaP := s.eta(p, chunk, base, &tops)
-	if etaP <= s.eta(f, chunk, base, &tops) {
-		return true
+	if ready <= chunk {
+		return f
 	}
 	// ECF with the backlog f carries before this direction's last ready byte.
 	u := st.urgency & 7
@@ -364,10 +476,8 @@ func (s *Session) spreadETAOK(d *decision, st *Stream) bool {
 	}
 	room := s.conn.sendMax - min64(s.conn.sendMax, s.conn.sent)
 	var backlog uint64
-	beta := ecfBeta
 	if u <= 2 {
 		backlog = min64(room, more)
-		beta = 0
 	} else {
 		level := lv.total[u]
 		if st.incr {
@@ -376,50 +486,53 @@ func (s *Session) spreadETAOK(d *decision, st *Stream) bool {
 		backlog = min64(room, more+level)
 		backlog -= min64(backlog, chunk)
 	}
-	if etaP > (1+beta)*s.eta(f, backlog+chunk, base, &tops) {
-		return false
+	// An ordered receiver cannot deliver past this chunk until it arrives.
+	// Compare with the faster pipe's serial finish time. Its completion
+	// margin is limited by the serialization of the stream's own ready
+	// tail: an isolated chunk cannot trade delivery time for parallelism.
+	finish := qf.eta(backlog + chunk)
+	tail := min64(backlog-min64(backlog, more), ready-min64(ready, chunk))
+	margin := min(ecfBeta*finish, float64(tail)/qf.rate)
+	if etaP > finish+margin {
+		return f
 	}
 	// BLEST: what f sends while the chunk travels must fit the credit.
-	need := s.rateOf(f) * max(0, etaP-float64(owdFrom(f.mp, base))/1e9)
-	w := min64(room, s.reorderBudget())
+	need := qf.rate * max(0, etaP-qf.eta(chunk))
+	w := min64(room, s.reorderBudget(g, chunk))
 	if need > float64(w) {
-		return false
+		return f
 	}
 	n := 1
 	if st.incr {
 		n = max(1, len(lv.incr[u]))
 	}
 	sroom := st.snd.maxData - min64(st.snd.maxData, st.snd.sent)
-	return need/float64(n) <= float64(sroom)
+	if need/float64(n) > float64(sroom) {
+		return f
+	}
+	return p
 }
 
 // reorderBudget bounds the stream data spread ahead of the slowest usable
-// pipe: twice the summed delivery rate times the one-way-delay spread of
-// the usable pipes, plus one chunk, within the connection credit left.
-func (s *Session) reorderBudget() uint64 {
+// pipe. The same arrival estimates include variation in serialization,
+// so similar RTTs cannot hide the reordering time of unequal rates.
+func (s *Session) reorderBudget(g *gate, chunk uint64) uint64 {
 	room := s.conn.sendMax - min64(s.conn.sendMax, s.conn.sent)
 	var sum float64
-	var lo, hi Duration
+	var lo, hi float64
 	first := true
-	base := s.owdBase()
-	for _, p := range s.pipes {
-		a := p.mp
-		if a == nil || p.out == nil || !a.liveOut() {
-			continue
+	for _, q := range g.quality {
+		sum += q.rate
+		o := q.eta(chunk)
+		if first || o < lo {
+			lo = o
 		}
-		sum += s.rateOf(p)
-		if s.pipeUsable(p, true) {
-			o := owdFrom(a, base)
-			if first || o < lo {
-				lo = o
-			}
-			if first || o > hi {
-				hi = o
-			}
-			first = false
+		if first || o > hi {
+			hi = o
 		}
+		first = false
 	}
-	b := 2*sum*float64(hi-lo)/1e9 + float64(s.cfg.SpreadChunk)
+	b := 2*sum*(hi-lo) + float64(s.cfg.SpreadChunk)
 	if b >= float64(math.MaxUint64) {
 		return room
 	}

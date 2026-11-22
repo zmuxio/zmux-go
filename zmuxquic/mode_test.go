@@ -96,7 +96,7 @@ func TestQUICJoinModes(t *testing.T) {
 			if n := len(c.PipeStats()); n != 2 {
 				t.Fatalf("%d pipes", n)
 			}
-			lanes := func() (n int) {
+			lanes := func() (n uint64) {
 				for _, ps := range c.PipeStats() {
 					if ps.PipeID != 0 {
 						n = max(n, ps.LanesOut)

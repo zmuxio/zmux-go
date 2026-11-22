@@ -205,6 +205,7 @@ func (s *Session) probationTimers(now Time, apply bool) Time {
 			if now >= end {
 				if apply {
 					a.prob.on = false
+					s.wakePrefix()
 					changed = true
 					h := s.hist(p)
 					h.ended, h.endAt, h.endBase = true, end, s.backoffBase(p)

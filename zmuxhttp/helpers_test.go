@@ -112,9 +112,9 @@ func siteHandler() http.Handler {
 }
 
 type siteResp struct {
-	code int
 	ct   string
 	body string
+	code int
 }
 
 func doReq(t *testing.T, c *http.Client, method, url string, body []byte) siteResp {
@@ -138,7 +138,7 @@ func doReqHeader(t *testing.T, c *http.Client, method, url string, body []byte, 
 	}
 	b, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	return siteResp{resp.StatusCode, resp.Header.Get("Content-Type"), string(b)}
+	return siteResp{code: resp.StatusCode, ct: resp.Header.Get("Content-Type"), body: string(b)}
 }
 
 // variantNamed is the per-variant count of name (zero if none).

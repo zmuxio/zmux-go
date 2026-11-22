@@ -102,6 +102,12 @@ func (e *StreamError) Error() string {
 	return fmt.Sprintf("zmux: stream %d closed locally", e.StreamID)
 }
 
+// A local abort preserves its public diagnostic and also matches a gone pipe.
+type pipeAbortedError struct{}
+
+func (pipeAbortedError) Error() string { return "zmux: pipe aborted locally" }
+func (pipeAbortedError) Unwrap() error { return ErrPipeGone }
+
 // API errors that do not end anything.
 var (
 	ErrStreamLimit    = errors.New("zmux: stream limit reached")
@@ -111,13 +117,19 @@ var (
 	ErrInvalid        = errors.New("zmux: invalid argument")
 	// ErrGroupNotUsable is a local join's Group outside the session's usable Groups.
 	ErrGroupNotUsable = errors.New("zmux: Group not usable in the session")
+	// ErrJoinRefused identifies an authenticated refusal by the peer.
+	ErrJoinRefused = errors.New("zmux: join refused")
+
+	// ErrJoinTimeout identifies expiry of a local join deadline.
+	ErrJoinTimeout = errors.New("zmux: join timeout")
 	// ErrJoinPending reports a session without join keys yet.
 	ErrJoinPending = errors.New("zmux: join pending")
 	// ErrJoinSecretSet reports that the deferred PSK was already supplied.
 	ErrJoinSecretSet = errors.New("zmux: join secret already set")
+	ErrPipeGone      = errors.New("zmux: pipe gone")
 	// ErrPipeAborted is the cause of a pipe this endpoint removed abruptly
 	// (RemovePipe, not graceful), also one it removed to make room.
-	ErrPipeAborted = errors.New("zmux: pipe aborted locally")
+	ErrPipeAborted error = pipeAbortedError{}
 )
 
 // DatagramTooLargeError reports the largest payload the peer accepts.

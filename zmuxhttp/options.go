@@ -4,19 +4,18 @@ import (
 	"net/http"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/httpx"
 )
 
 // Options configure the HTTP adapters (NewHandler, the exchange
 // handler, and HTTP upgrades such as WebSocket and WebTransport); the
 // admission they run is their listener's (zmux.ListenerConfig.Admission).
 type Options struct {
-	// Next serves the requests that are not carriers (nil:
-	// http.NotFound): requests the adapter does not take, and
-	// zmux.VerdictFallback decided on a request's head (zmux.StageHead: an
-	// upgrade's head, an exchange request, a request without a body). A
-	// request carrier decided on its body is a carrier, which a
-	// zmux.VerdictFallback hands to zmux.ListenerConfig.Fallback (Next
-	// serves it only when the listener has none).
+	// Next serves non-carrier requests and VerdictFallback on an HTTP
+	// request, including a decision on its body. It receives all headers
+	// and all body bytes before the adapter writes a carrier response.
+	// When Next is nil, HTTP Fallback responds with 404.
+	// VerdictTakeover always selects the byte-stream target.
 	// An HTTP/1.1 request with a body reaches it full duplex
 	// (http.ResponseController.EnableFullDuplex), so its response can go
 	// out while the client still streams the body.
@@ -47,28 +46,11 @@ func (o *Options) Validate() error {
 }
 
 // Fallback serves r with Next (http.NotFound without one). An HTTP/1.1
-// request with a body reaches Next full duplex (see serveFallback).
+// request with a body reaches Next full duplex .
 func (o *Options) Fallback(w http.ResponseWriter, r *http.Request) {
 	var next http.Handler
 	if o != nil {
 		next = o.Next
 	}
-	serveFallback(next, w, r)
-}
-
-// serveFallback serves r with next (http.NotFound when nil). An HTTP/1.1
-// request with a body is switched to full duplex first: net/http would
-// otherwise read the rest of the body before the response header goes
-// out, and a streaming body that the client keeps open until it sees a
-// response would stall both sides. The error of a writer that cannot
-// switch is ignored.
-func serveFallback(next http.Handler, w http.ResponseWriter, r *http.Request) {
-	if r.ProtoMajor == 1 && r.ContentLength != 0 && r.Body != nil && r.Body != http.NoBody {
-		_ = http.NewResponseController(w).EnableFullDuplex()
-	}
-	if next == nil {
-		http.NotFound(w, r)
-		return
-	}
-	next.ServeHTTP(w, r)
+	httpx.ServeFallback(next, w, r)
 }

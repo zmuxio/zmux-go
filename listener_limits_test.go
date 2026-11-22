@@ -31,12 +31,12 @@ func TestListenerSetLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	// SetLimits closes these; the stand-ins have no session to close.
-	if over := l.applyLimits(&r); len(over) != 2 || over[0] != a || over[1] != b {
+	if over := l.applyLimits(&r); len(over) != 2 || over[0].c != a || over[1].c != b {
 		t.Fatalf("over %v", over)
 	}
-	l.regMu.Lock()
+	l.suspMu.Lock()
 	n, head := l.suspN, l.suspHead
-	l.regMu.Unlock()
+	l.suspMu.Unlock()
 	if n != 1 || head != c {
 		t.Fatalf("suspended %d, head %p", n, head)
 	}

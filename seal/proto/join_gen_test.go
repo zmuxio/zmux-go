@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/mlkem"
 	"crypto/mlkem/mlkemtest"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"testing"
@@ -118,16 +119,31 @@ func (c joinCase) acceptorPSK(phase uint8) []byte {
 	return c.JoinPSK
 }
 
-// pipeView is a join.Pipe in the field order of the vector files, which the
-// production struct does not keep (it is ordered for size).
-//
-//goland:noinspection ALL
+// pipeView is the decoded view of a pipe in the join vectors.
 type pipeView struct {
 	ID        uint64
-	Direction uint8
 	FateGroup uint64
 	Priority  uint64
+	Direction uint8
 	Standby   bool
+}
+
+// MarshalJSON keeps the key order of the shared specification vectors.
+func (v pipeView) MarshalJSON() ([]byte, error) {
+	out := struct {
+		ID        uint64 `json:"ID"`
+		Direction uint64 `json:"Direction"`
+		FateGroup uint64 `json:"FateGroup"`
+		Priority  uint64 `json:"Priority"`
+		Standby   *bool  `json:"Standby"`
+	}{
+		ID:        v.ID,
+		Direction: uint64(v.Direction),
+		FateGroup: v.FateGroup,
+		Priority:  v.Priority,
+		Standby:   &v.Standby,
+	}
+	return json.Marshal(out)
 }
 
 type joinVector struct {
@@ -315,7 +331,7 @@ func (c joinCase) vector(t testing.TB, name string) joinVector {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v.Pipe = pipeView{p.Pipe.ID, p.Pipe.Direction, p.Pipe.FateGroup, p.Pipe.Priority, p.Pipe.Standby}
+	v.Pipe = pipeView{ID: p.Pipe.ID, Direction: p.Pipe.Direction, FateGroup: p.Pipe.FateGroup, Priority: p.Pipe.Priority, Standby: p.Pipe.Standby}
 	v.FirstBatch = p.FirstBatch
 	if rp, err := join.ParseReplyPayload(c.ReplyPayload, c.Group); err == nil {
 		v.ReturnBatch = rp.Frames

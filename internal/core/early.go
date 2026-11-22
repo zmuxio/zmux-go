@@ -81,13 +81,12 @@ func (s *Session) EarlyDiscarded() {
 // carrier reached the peer. It reports false, changing nothing, when the
 // session cannot restart: the peer's parameters already arrived on the
 // early carrier (a verdict that contradicts the carrier) or pipe 0 is gone.
-func (s *Session) RestartEarly(info CarrierInfo, now Time) bool {
+func (s *Session) RestartEarly(info CarrierInfo, sig *WriteSignal, now Time) bool {
 	s.SetNow(now)
 	p := s.pipe(0)
 	if p == nil || s.peerSeen || s.state >= StateClosing {
 		return false
 	}
-	sig := p.out.sig
 	p.out = &outDir{lanes: []*outLane{{info: info, confirmed: true}}, sig: sig}
 	p.out.lo.offered = info.Lanes
 	p.in = &inDir{lanes: []*inLane{{info: info, expectTP: true}}}

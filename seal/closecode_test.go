@@ -45,12 +45,12 @@ func (c *halfConn) Close() error {
 // Sealed record layer must not be closed whole by the server's write shutdown.
 func TestSealedCloseCodeDelivered(t *testing.T) {
 	for _, tc := range []struct {
+		pipe func() (net.Conn, net.Conn)
 		name string
 		mode zmux.RecordMode
-		pipe func() (net.Conn, net.Conn)
 	}{
-		{"sealed/netpipe", zmux.RecordSealed, net.Pipe},
-		{"sealed/halfpipe", zmux.RecordSealed, halfPipe},
+		{name: "sealed/netpipe", mode: zmux.RecordSealed, pipe: net.Pipe},
+		{name: "sealed/halfpipe", mode: zmux.RecordSealed, pipe: halfPipe},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

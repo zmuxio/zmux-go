@@ -19,16 +19,16 @@ import (
 // the session's close, with any code, is success; ctx ending is ctx's error.
 func TestServeReportsSessionEnd(t *testing.T) {
 	for _, c := range []struct {
-		name  string
 		close func(sess *webtransport.Session, cancel context.CancelFunc)
 		want  func(error) bool
+		name  string
 	}{
-		{"closed by the peer", func(s *webtransport.Session, _ context.CancelFunc) { _ = s.CloseWithError(0, "") },
-			func(err error) bool { return err == nil }},
-		{"closed by the peer with a code", func(s *webtransport.Session, _ context.CancelFunc) { _ = s.CloseWithError(7, "bye") },
-			func(err error) bool { return err == nil }},
-		{"stopped by ctx", func(_ *webtransport.Session, cancel context.CancelFunc) { cancel() },
-			func(err error) bool { return errors.Is(err, context.Canceled) }},
+		{name: "closed by the peer", close: func(s *webtransport.Session, _ context.CancelFunc) { _ = s.CloseWithError(0, "") },
+			want: func(err error) bool { return err == nil }},
+		{name: "closed by the peer with a code", close: func(s *webtransport.Session, _ context.CancelFunc) { _ = s.CloseWithError(7, "bye") },
+			want: func(err error) bool { return err == nil }},
+		{name: "stopped by ctx", close: func(_ *webtransport.Session, cancel context.CancelFunc) { cancel() },
+			want: func(err error) bool { return errors.Is(err, context.Canceled) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			srvTLS, cliTLS := tlsConfigs(t)

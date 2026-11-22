@@ -9,18 +9,40 @@ package labels
 import (
 	"context"
 	"runtime/pprof"
+	"sync"
 )
 
+// taskContexts holds one label set for each task name used by Go.
+var taskContexts sync.Map // map[string]context.Context
+
 // Go runs f on a new goroutine labelled "zmux"=task on top of the labels
-// of base, which it keeps (context.Background() for none; a nil one has
-// none either). Setting the labels in the new goroutine costs no
-// allocation beyond the label set itself, made once per task.
+// of base, which it keeps (context.Background() or nil for none). Without
+// base labels, goroutines share the task's label set.
 func Go(base context.Context, task string, f func()) {
-	ctx := With(base, "zmux", task)
+	ctx := taskContext(base, task)
 	go func() {
 		pprof.SetGoroutineLabels(ctx)
 		f()
 	}()
+}
+
+func taskContext(base context.Context, task string) context.Context {
+	if base != nil {
+		hasLabels := false
+		pprof.ForLabels(base, func(_, _ string) bool {
+			hasLabels = true
+			return false
+		})
+		if hasLabels {
+			return With(base, "zmux", task)
+		}
+	}
+	if ctx, ok := taskContexts.Load(task); ok {
+		return ctx.(context.Context)
+	}
+	// The goroutine only needs the labels. Avoid retaining the caller's context.
+	ctx, _ := taskContexts.LoadOrStore(task, With(context.Background(), "zmux", task))
+	return ctx.(context.Context)
 }
 
 // With adds key=value to the labels of base (nil: none).

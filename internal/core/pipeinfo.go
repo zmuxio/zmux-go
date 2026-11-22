@@ -11,7 +11,10 @@ import (
 // report: exact counts and settings, and the sender's RTT, one-way delay
 // and delivery-rate estimates.
 type PipeInfo struct {
+	ReplaceBy      Time // Never when no replacement is scheduled
+	Epoch          uint64
 	ID             uint64
+	EpochKnown     bool
 	Carrier        uint8 // SetPipeKind
 	OutState       OutState
 	InState        InState
@@ -60,13 +63,9 @@ type PipeInfo struct {
 	RecordsReceived uint64
 	BytesReinjected uint64
 	// BytesLost is the outbound bytes sent and not acknowledged when the
-	// pipe failed, RecordsLost its estimate in records;
-	// BytesRetransmitted and LossRate come from the carrier
-	// (SetCarrierRetransmitted).
+	// pipe failed. RecordsLost is its estimate in records.
 	BytesLost          uint64
 	RecordsLost        uint64
-	BytesRetransmitted uint64
-	LossRate           float64
 	BytesOpportunistic uint64
 	PingsSent          uint64
 	PingsAnswered      uint64
@@ -80,9 +79,9 @@ type PipeInfo struct {
 	SinceLastAck     Duration
 	SinceLastReceive Duration
 	SinceLastTraffic Duration
-	LanesOut         int
-	LanesIn          int
-	LanesRefused     int
+	LanesOut         uint64
+	LanesIn          uint64
+	LanesRefused     uint64
 	// Lanes are the positions of each lane, for a pipe with lanes (nil
 	// without: lane 0 is then the pipe).
 	Lanes []LaneInfo
@@ -98,13 +97,15 @@ type LaneInfo struct {
 	Lane                        uint64
 	PositionSent, PositionAcked uint64
 	PositionReceived            uint64
-	HasOut, HasIn               bool
+	HasOut, HasIn, HasAck       bool
 }
 
 // PipeIDs returns the IDs of the session's attachments.
 func (s *Session) PipeIDs(dst []uint64) []uint64 {
 	for _, p := range s.pipes {
-		dst = append(dst, p.id)
+		if p.mp == nil || p.mp.peer != peerDiscarded {
+			dst = append(dst, p.id)
+		}
 	}
 	return dst
 }
@@ -112,11 +113,12 @@ func (s *Session) PipeIDs(dst []uint64) []uint64 {
 // PipeInfo returns the snapshot of an attachment.
 func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 	p := s.pipe(id)
-	if p == nil {
+	if p == nil || p.mp != nil && p.mp.peer == peerDiscarded {
 		return PipeInfo{}, false
 	}
 	var pi PipeInfo
 	pi.ID = id
+	pi.ReplaceBy = Never
 	pi.Carrier = p.carrier
 	pi.HasOut, pi.HasIn = p.out != nil, p.in != nil
 	pi.SinceLastTraffic = s.sinceTraffic(p)
@@ -128,7 +130,7 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 		for _, l := range d.lanes {
 			pi.BytesSent += l.pos
 		}
-		pi.LanesOut = len(d.lanes)
+		pi.LanesOut = uint64(len(d.lanes))
 		for _, l := range d.lanes {
 			if l.refused {
 				pi.LanesRefused++
@@ -136,7 +138,6 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 		}
 		pi.BytesAcked = d.snd.cum
 		pi.RecordsSent = d.records
-		pi.BytesRetransmitted, pi.LossRate = d.retrans, d.lossRate
 		pi.BytesInFlight = d.snd.so - min64(d.snd.so, d.snd.cum)
 		pi.DeliveryRate = d.snd.re.value()
 		pi.QueuedBytes, _ = s.carrierUnsent(p)
@@ -154,17 +155,21 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 		}
 	}
 	if p.in != nil {
-		pi.LanesIn = len(p.in.lanes)
+		pi.LanesIn = uint64(len(p.in.lanes))
 		for _, l := range p.in.lanes {
 			pi.BytesReceived += l.pos
 			pi.RecordsReceived += l.recs
 		}
 	}
-	pi.Lanes = laneInfos(p)
+	pi.Lanes = laneInfos(p, s.feat.Acked())
 	a := p.mp
 	if a == nil {
 		pi.Local, pi.PeerAttached = s.role == RoleInitiator, true
 		return pi, true
+	}
+	pi.Epoch, pi.EpochKnown = a.joinEpoch, a.joinEpochKnown
+	if period := s.epochPeriod(); a.joinEpochKnown && period > 0 {
+		pi.ReplaceBy = a.attachedAt.Add(period).Add(period)
 	}
 	pi.Local, pi.FateGroup, pi.Failure = a.joinerLocal, a.fate, a.failCause
 	if a.group != nil {
@@ -209,7 +214,7 @@ func (s *Session) PipeInfo(id uint64) (PipeInfo, bool) {
 
 // laneInfos returns the positions of p's lanes, nil for a pipe without
 // lanes (lane 0 alone and none offered).
-func laneInfos(p *Pipe) []LaneInfo {
+func laneInfos(p *Pipe, acked bool) []LaneInfo {
 	offered := p.out != nil && (p.out.lo.offered || len(p.out.lanes) > 1) || p.in != nil && len(p.in.lanes) > 1
 	if !offered {
 		return nil
@@ -227,7 +232,10 @@ func laneInfos(p *Pipe) []LaneInfo {
 	if p.out != nil {
 		for _, l := range p.out.lanes {
 			li := at(l.lane)
-			li.HasOut, li.PositionSent, li.PositionAcked = true, l.pos, l.acked
+			li.HasOut, li.PositionSent = true, l.pos
+			if acked {
+				li.HasAck, li.PositionAcked = true, l.acked
+			}
 		}
 	}
 	if p.in != nil {

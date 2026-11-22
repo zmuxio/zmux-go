@@ -476,6 +476,7 @@ func TestPoolOnDemandDialSurvivesCount(t *testing.T) {
 	var closed []int
 	n := 0
 	release := make(chan struct{})
+	openDial := sync.OnceFunc(func() { close(release) })
 	dialCtx := make(chan context.Context, 2)
 	p := &ConnPool[int]{
 		Dial: func(ctx context.Context) (int, error) {
@@ -497,12 +498,15 @@ func TestPoolOnDemandDialSurvivesCount(t *testing.T) {
 			dialing = append(dialing, v.Dialing)
 		}),
 	}
+	defer p.Shutdown()
+	defer openDial()
 	p.MaxPipesPerConnection = 1
 	ctx := context.Background()
 	a, err := p.Get(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer a.Release()
 	p.settle()
 	type res struct {
 		l   *Lease[int]
@@ -526,36 +530,37 @@ func TestPoolOnDemandDialSurvivesCount(t *testing.T) {
 		t.Fatal("a look cancelled the dial on demand")
 	}
 	mu.Lock()
-	if len(dialing) == 0 || slices.Max(dialing) != 0 {
-		t.Fatalf("PoolView.Dialing seen %v, want 0 while the dial is on demand", dialing)
-	}
+	seenDialing := slices.Clone(dialing)
 	mu.Unlock()
-	close(release)
+	if len(seenDialing) == 0 || slices.Max(seenDialing) != 0 {
+		t.Fatalf("PoolView.Dialing seen %v, want 0 while the dial is on demand", seenDialing)
+	}
+	// Set the age order while the second dial is still gated. Inserting
+	// it can trigger a policy evaluation before the second Get returns.
+	p.mu.Lock()
+	p.conns[0].born = p.conns[0].born.Add(-time.Hour)
+	p.mu.Unlock()
+	openDial()
 	r := <-second
 	if r.err != nil || r.l.Conn != 2 {
 		t.Fatalf("second Get: %v", r.err)
 	}
-	// The shrink order breaks equal ages by the random fate group, and a
-	// coarse clock (Windows) gives both connections the same birth: make
-	// a the older one by construction.
-	p.mu.Lock()
-	p.conns[0].born = p.conns[0].born.Add(-time.Hour)
-	p.mu.Unlock()
+	defer r.l.Release()
 	p.recheckNow() // now two connections against Count 1: the younger retires
 	p.settle()
 	mu.Lock()
-	if len(closed) != 0 {
-		t.Fatalf("closed %v while both carry a pipe", closed)
-	}
+	closedBeforeRelease := slices.Clone(closed)
 	mu.Unlock()
+	if len(closedBeforeRelease) != 0 {
+		t.Fatalf("closed %v while both carry a pipe", closedBeforeRelease)
+	}
 	r.l.Release()
 	mu.Lock()
-	if !slices.Equal(closed, []int{2}) {
-		t.Fatalf("closed %v after the younger connection's pipe ended, want [2]", closed)
-	}
+	closedAfterRelease := slices.Clone(closed)
 	mu.Unlock()
-	a.Release()
-	p.Shutdown()
+	if !slices.Equal(closedAfterRelease, []int{2}) {
+		t.Fatalf("closed %v after the younger connection's pipe ended, want [2]", closedAfterRelease)
+	}
 }
 
 // Shutdown waits for the look under way: neither Decide nor

@@ -34,17 +34,23 @@ func (u *Unconfirmed[C]) Hold(pj *PeerJoin, c C, limit int) (evicted C, ok bool)
 	return evicted, ok
 }
 
-// Drop forgets the join pj once it was confirmed or failed, so that no
-// later Hello evicts it.
-func (u *Unconfirmed[C]) Drop(pj *PeerJoin) {
+// Confirm claims the registration for commit. A Bound join never held a
+// slot. For all other modes, eviction and confirmation consume the same entry.
+func (u *Unconfirmed[C]) Confirm(pj *PeerJoin) bool {
+	return pj.Mode == join.Bound || u.Drop(pj)
+}
+
+// Drop releases a registration and reports whether it was still held.
+func (u *Unconfirmed[C]) Drop(pj *PeerJoin) bool {
 	for i := range u.q {
 		if u.q[i].pj == pj {
 			copy(u.q[i:], u.q[i+1:])
 			u.q[len(u.q)-1] = unconfirmed[C]{}
 			u.q = u.q[:len(u.q)-1]
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // Len is the number of Unconfirmed carriers held.

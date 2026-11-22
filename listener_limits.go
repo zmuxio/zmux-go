@@ -130,7 +130,7 @@ func (l *Listener) SetLimits(lim ListenerLimits) error {
 
 // applyLimits stores resolved limits and returns the suspended sessions
 // beyond the new MaxSuspended, for the caller to close.
-func (l *Listener) applyLimits(r *ListenerLimits) []*Conn {
+func (l *Listener) applyLimits(r *ListenerLimits) []suspension {
 	l.pmu.Lock()
 	l.lim.Store(r)
 	l.pending.MaxTotal = r.MaxPending
@@ -145,7 +145,7 @@ func (l *Listener) applyLimits(r *ListenerLimits) []*Conn {
 	if l.served.Load() {
 		l.startWatch()
 	}
-	l.regMu.Lock()
-	defer l.regMu.Unlock()
+	l.suspMu.Lock()
+	defer l.suspMu.Unlock()
 	return l.trimSuspended()
 }

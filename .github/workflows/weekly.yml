@@ -49,8 +49,7 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: go test -race -count=1 -timeout 20m ./...
 
-  # zmuxh3 and zmuxquic share one quic-go in the workspace. zmuxh3 stays on the
-  # version of its go.mod (webtransport-go has to build against it); the
+  # zmuxh3 stays on the quic-go version of its go.mod (webtransport-go has to build against it); the
   # other dependencies move, and a second step reports whether it can move too.
   h3:
     name: latest dependencies (zmuxh3)
@@ -108,7 +107,6 @@ jobs:
           GOWORK=off go get -u ./...
           GOWORK=off go mod tidy
           git diff --stat
-          # The workspace takes this quic-go for zmuxh3 too; only zmuxquic is built.
           go vet ./...
           go test -race -count=1 -timeout 20m ./...
 
@@ -125,6 +123,7 @@ jobs:
           check-latest: true
           cache: false
 
+      - run: bash tools/ci-workspace.sh
       - run: tools/fuzz.sh 3m
 
       - name: failing inputs
@@ -154,6 +153,8 @@ jobs:
           go-version: stable
           check-latest: true
           cache: false
+
+      - run: bash tools/ci-workspace.sh
 
       - name: fetch the newest release
         id: peer

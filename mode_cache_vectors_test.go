@@ -22,10 +22,10 @@ func TestCarrierCacheVectors(t *testing.T) {
 	type expect struct {
 		Key       string `json:"key"`
 		Kind      string `json:"kind"`
+		URL       string `json:"url"`
 		Usable    bool   `json:"usable"`
 		Failed    bool   `json:"failed"`
 		BackoffMS int64  `json:"backoff_ms"`
-		URL       string `json:"url"`
 	}
 	var v struct {
 		Cases []struct {
@@ -75,7 +75,7 @@ func TestCarrierCacheVectors(t *testing.T) {
 			for _, e := range got.Entries {
 				g, _ := parseCacheTime(e.GoodUntil)
 				f, _ := parseCacheTime(e.FailUntil)
-				es = append(es, expect{e.Key, e.Kind, at.Before(g), at.Before(f), e.BackoffMS, e.URL})
+				es = append(es, expect{Key: e.Key, Kind: e.Kind, Usable: at.Before(g), Failed: at.Before(f), BackoffMS: e.BackoffMS, URL: e.URL})
 			}
 			if !slices.Equal(es, c.Expect) {
 				t.Fatalf("snapshot %s\n got %+v\nwant %+v", data, es, c.Expect)

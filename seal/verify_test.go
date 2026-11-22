@@ -94,13 +94,13 @@ func TestVerifyErrorKinds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	for _, c := range []struct {
-		name   string
 		anchor seal.Anchor
+		name   string
 		reject bool
 	}{
-		{"rejection", credAnchor{err: errors.New("revoked")}, true},
-		{"panic", panicAnchor{}, true},
-		{"unavailable", credAnchor{err: fmt.Errorf("%w: down", seal.ErrVerifyUnavailable)}, false},
+		{name: "rejection", anchor: credAnchor{err: errors.New("revoked")}, reject: true},
+		{name: "panic", anchor: panicAnchor{}, reject: true},
+		{name: "unavailable", anchor: credAnchor{err: fmt.Errorf("%w: down", seal.ErrVerifyUnavailable)}, reject: false},
 	} {
 		f := newFixture(t)
 		sc := f.server
@@ -122,6 +122,17 @@ func TestVerifyErrorKinds(t *testing.T) {
 	x, y := net.Pipe()
 	if _, _, cerr, _ := establishPair(t, ctx, &cc, &f.server, zmux.NetPipe(x), zmux.NetPipe(y)); !errors.Is(cerr, seal.ErrVerifyRejected) || !errors.Is(cerr, seal.ErrCredentialsFailed) {
 		t.Fatal(cerr)
+	}
+
+	unavailable := fmt.Errorf("%w: %w", seal.ErrVerifyUnavailable, seal.ErrAuth)
+	cc.Anchor = credAnchor{err: unavailable}
+	x, y = net.Pipe()
+	cerr, _ := establishErrs(t, ctx, &cc, &f.server, zmux.NetPipe(x), zmux.NetPipe(y))
+	class, _ := proto.ErrorClass(cerr)
+	if class != "credentials_failed" || !errors.Is(cerr, seal.ErrCredentialsFailed) ||
+		!errors.Is(cerr, seal.ErrVerifyUnavailable) || !errors.Is(cerr, unavailable) ||
+		errors.Is(cerr, seal.ErrVerifyRejected) {
+		t.Fatalf("unavailable verifier: class %s, error %v", class, cerr)
 	}
 }
 
@@ -185,13 +196,13 @@ func TestVerifyThenCancel(t *testing.T) {
 	sc.ClientAnchor = cancelAnchor{scancel}
 	x, y := net.Pipe()
 	type res struct {
-		p   zmux.PipeIO
 		err error
+		p   zmux.PipeIO
 	}
 	ch := make(chan res, 1)
 	go func() {
 		p, err := sc.WrapPipe(sctx, zmux.NetPipe(y), zmux.PipeHint{})
-		ch <- res{p, err}
+		ch <- res{p: p, err: err}
 	}()
 	go func() { _, _ = seal.Establish(ctx, zmux.NetPipe(x), &f.client) }()
 	r := <-ch

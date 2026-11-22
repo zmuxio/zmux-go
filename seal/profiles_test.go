@@ -88,14 +88,14 @@ func TestServerProfilePolicy(t *testing.T) {
 	defer cancel()
 	for _, tc := range []struct {
 		name    string
+		server  func(*seal.ServerConfig)
 		client  []proto.Profile
 		noPSK   bool
 		refused bool
-		server  func(*seal.ServerConfig)
 	}{
-		{"no-psk-off-by-default", []proto.Profile{proto.ProfileEstablish}, true, true, func(*seal.ServerConfig) {}},
-		{"no-psk-listed", []proto.Profile{proto.ProfileEstablishAES}, true, false, func(c *seal.ServerConfig) { c.AcceptedProfiles = []proto.Profile{proto.ProfileEstablishAES} }},
-		{"accepted-list", []proto.Profile{proto.ProfileEstablishPSKAES}, false, true, func(c *seal.ServerConfig) {
+		{name: "no-psk-off-by-default", client: []proto.Profile{proto.ProfileEstablish}, noPSK: true, refused: true, server: func(*seal.ServerConfig) {}},
+		{name: "no-psk-listed", client: []proto.Profile{proto.ProfileEstablishAES}, noPSK: true, refused: false, server: func(c *seal.ServerConfig) { c.AcceptedProfiles = []proto.Profile{proto.ProfileEstablishAES} }},
+		{name: "accepted-list", client: []proto.Profile{proto.ProfileEstablishPSKAES}, noPSK: false, refused: true, server: func(c *seal.ServerConfig) {
 			c.AcceptedProfiles = []proto.Profile{proto.ProfileEstablishPSK}
 		}},
 	} {

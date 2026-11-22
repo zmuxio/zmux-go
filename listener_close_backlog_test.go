@@ -12,6 +12,7 @@ import (
 // TestListenerCloseEndsBacklog: a session waiting for Accept when the
 // listener closes is ended, not left without an owner, and Accept reports
 // the close.
+// HS-35.
 func TestListenerCloseEndsBacklog(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -57,25 +58,9 @@ func (w *closeOnWrite) Write(b []byte) (int, error) {
 	return w.Conn.Write(b)
 }
 
-// TestListenerCloseInHandshakeSendsClose: Close lands while the server
-// still waits for a handshake whose flight the client already has. When
-// the cancelled wait wins (the scheduler's choice; the rounds repeat),
-// the listener aborts the session, and HandlePipe must last until that
-// CONNECTION_CLOSE went out: it returned at once, the caller (as here)
-// closed the carrier first, and the resumable client, seeing a bare
-// carrier loss, waited ResumeTimeout to resume a session that was gone.
+// HS-35. The first server write crosses the listener cutoff while the
+// bootstrap is provisional. Both paths through establishment send code zero.
 func TestListenerCloseInHandshakeSendsClose(t *testing.T) {
-	aborted := 0
-	for range 50 {
-		if listenerCloseInHandshake(t) {
-			aborted++
-		}
-	}
-	t.Logf("%d of 50 rounds aborted the handshake", aborted)
-}
-
-func listenerCloseInHandshake(t *testing.T) (aborted bool) {
-	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	l := mustNewListener(&ListenerConfig{Config: atkConfig()})
@@ -102,9 +87,9 @@ func listenerCloseInHandshake(t *testing.T) (aborted bool) {
 	}
 	var te *TransportError
 	var ae *ApplicationError
-	if !errors.As(err, &te) && !errors.As(err, &ae) {
+	zeroCode := errors.As(err, &te) && te.ErrorCode == 0 || errors.As(err, &ae) && ae.ErrorCode == 0
+	if !zeroCode {
 		t.Fatalf("the client did not get the server's close: %v", err)
 	}
 	<-returned
-	return l.Stats().Rejected > 0
 }

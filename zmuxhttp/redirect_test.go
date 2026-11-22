@@ -20,25 +20,25 @@ import (
 func TestCheckHTTPRedirect(t *testing.T) {
 	for _, c := range []struct {
 		from, method string
-		status       int
 		loc, want    string // want "": refused
+		status       int
 	}{
-		{"http://a.example/z", "POST", 308, "https://a.example/z", "https://a.example/z"},
-		{"http://a.example/z", "POST", 301, "https://a.example/z", "https://a.example/z"},
-		{"http://a.example/z?n=1", "POST", 302, "https://a.example:8443/z?n=1", "https://a.example:8443/z?n=1"},
-		{"http://a.example/z", "POST", 301, "https://a.example/y", ""},
-		{"http://a.example/z", "POST", 303, "/y", ""},
-		{"http://a.example/z", "POST", 307, "/y", "http://a.example/y"},
-		{"https://a.example/z", "POST", 308, "/z/", "https://a.example/z/"},
-		{"https://a.example/z", "GET", 301, "/y", "https://a.example/y"},
-		{"https://a.example/z", "POST", 307, "http://a.example/z", ""},
-		{"http://a.example/z", "POST", 307, "https://b.example/z", ""},
-		{"http://a.example/z", "GET", 302, "http://a.example:81/z", ""},
-		{"http://a.example/z", "GET", 302, "https://u:p@a.example/z", ""},
-		{"http://a.example/z", "GET", 302, "", ""},
-		{"ws://a.example/z", "GET", 301, "https://a.example/z", "wss://a.example/z"},
-		{"wss://a.example/z", "GET", 301, "http://a.example/z", ""},
-		{"http://A.example/z", "GET", 302, "https://a.EXAMPLE/z#f", "https://a.EXAMPLE/z"},
+		{from: "http://a.example/z", method: "POST", status: 308, loc: "https://a.example/z", want: "https://a.example/z"},
+		{from: "http://a.example/z", method: "POST", status: 301, loc: "https://a.example/z", want: "https://a.example/z"},
+		{from: "http://a.example/z?n=1", method: "POST", status: 302, loc: "https://a.example:8443/z?n=1", want: "https://a.example:8443/z?n=1"},
+		{from: "http://a.example/z", method: "POST", status: 301, loc: "https://a.example/y", want: ""},
+		{from: "http://a.example/z", method: "POST", status: 303, loc: "/y", want: ""},
+		{from: "http://a.example/z", method: "POST", status: 307, loc: "/y", want: "http://a.example/y"},
+		{from: "https://a.example/z", method: "POST", status: 308, loc: "/z/", want: "https://a.example/z/"},
+		{from: "https://a.example/z", method: "GET", status: 301, loc: "/y", want: "https://a.example/y"},
+		{from: "https://a.example/z", method: "POST", status: 307, loc: "http://a.example/z", want: ""},
+		{from: "http://a.example/z", method: "POST", status: 307, loc: "https://b.example/z", want: ""},
+		{from: "http://a.example/z", method: "GET", status: 302, loc: "http://a.example:81/z", want: ""},
+		{from: "http://a.example/z", method: "GET", status: 302, loc: "https://u:p@a.example/z", want: ""},
+		{from: "http://a.example/z", method: "GET", status: 302, loc: "", want: ""},
+		{from: "ws://a.example/z", method: "GET", status: 301, loc: "https://a.example/z", want: "wss://a.example/z"},
+		{from: "wss://a.example/z", method: "GET", status: 301, loc: "http://a.example/z", want: ""},
+		{from: "http://A.example/z", method: "GET", status: 302, loc: "https://a.EXAMPLE/z#f", want: "https://a.EXAMPLE/z"},
 	} {
 		from, _ := url.Parse(c.from)
 		got, err := CheckRedirect(from, c.method, c.status, c.loc)

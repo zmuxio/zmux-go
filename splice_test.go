@@ -109,20 +109,20 @@ func TestSpliceResetTravels(t *testing.T) {
 // session, and a cancellation.
 func TestSpliceEnds(t *testing.T) {
 	for _, c := range []struct {
-		name string
 		act  func(t *testing.T, client, server *Conn, cs, ss *Stream, cancel context.CancelFunc)
+		name string
 		want SpliceEnd // of the direction client -> server
 	}{
-		{"reset", func(_ *testing.T, _, _ *Conn, cs, _ *Stream, _ context.CancelFunc) { cs.CancelWrite(0x77) },
-			SpliceEnd{Kind: SpliceReset, Code: 0x77}},
-		{"stopped", func(_ *testing.T, _, _ *Conn, _, ss *Stream, _ context.CancelFunc) { ss.CancelRead(0x55) },
-			SpliceEnd{Kind: SpliceStopped, Code: 0x55}},
-		{"upstream lost", func(_ *testing.T, client, _ *Conn, _, _ *Stream, _ context.CancelFunc) { _ = client.Close() },
-			SpliceEnd{Kind: SpliceUpstreamLost}},
-		{"downstream lost", func(_ *testing.T, _, server *Conn, _, _ *Stream, _ context.CancelFunc) { _ = server.Close() },
-			SpliceEnd{Kind: SpliceDownstreamLost}},
-		{"cancelled", func(_ *testing.T, _, _ *Conn, _, _ *Stream, cancel context.CancelFunc) { cancel() },
-			SpliceEnd{Kind: SpliceCancelled, Code: StreamCancelled}},
+		{name: "reset", act: func(_ *testing.T, _, _ *Conn, cs, _ *Stream, _ context.CancelFunc) { cs.CancelWrite(0x77) },
+			want: SpliceEnd{Kind: SpliceReset, Code: 0x77}},
+		{name: "stopped", act: func(_ *testing.T, _, _ *Conn, _, ss *Stream, _ context.CancelFunc) { ss.CancelRead(0x55) },
+			want: SpliceEnd{Kind: SpliceStopped, Code: 0x55}},
+		{name: "upstream lost", act: func(_ *testing.T, client, _ *Conn, _, _ *Stream, _ context.CancelFunc) { _ = client.Close() },
+			want: SpliceEnd{Kind: SpliceUpstreamLost}},
+		{name: "downstream lost", act: func(_ *testing.T, _, server *Conn, _, _ *Stream, _ context.CancelFunc) { _ = server.Close() },
+			want: SpliceEnd{Kind: SpliceDownstreamLost}},
+		{name: "cancelled", act: func(_ *testing.T, _, _ *Conn, _, _ *Stream, cancel context.CancelFunc) { cancel() },
+			want: SpliceEnd{Kind: SpliceCancelled, Code: StreamCancelled}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			leakcheck.Check(t)
@@ -194,21 +194,21 @@ func TestSpliceEnds(t *testing.T) {
 // or a plain cancel ends them with 0.
 func TestSpliceCancelCause(t *testing.T) {
 	for _, f := range []struct {
-		name string
 		fn   func(context.Context, *Stream, *Stream, *SpliceOptions) (SpliceResult, error)
-	}{{"Splice", Splice}, {"SplicePackets", SplicePackets}} {
+		name string
+	}{{name: "Splice", fn: Splice}, {name: "SplicePackets", fn: SplicePackets}} {
 		for _, c := range []struct {
-			name  string
 			cause error
+			name  string
 			want  StreamErrorCode // of the reset and of SpliceEnd
 			stop  StreamErrorCode // of the stop
 		}{
-			{"code", CancelCause(0x77), 0x77, 0x77},
-			{"wrapped code", fmt.Errorf("refused: %w", CancelCause(0x77)), 0x77, 0x77},
-			{"stream error", &StreamError{ErrorCode: 0x77, Remote: true}, 0x77, 0x77},
-			{"explicit zero", CancelCause(0), 0, 0},
-			{"other cause", errors.New("shutdown"), StreamCancelled, 0},
-			{"plain cancel", nil, StreamCancelled, 0},
+			{name: "code", cause: CancelCause(0x77), want: 0x77, stop: 0x77},
+			{name: "wrapped code", cause: fmt.Errorf("refused: %w", CancelCause(0x77)), want: 0x77, stop: 0x77},
+			{name: "stream error", cause: &StreamError{ErrorCode: 0x77, Remote: true}, want: 0x77, stop: 0x77},
+			{name: "explicit zero", cause: CancelCause(0), want: 0, stop: 0},
+			{name: "other cause", cause: errors.New("shutdown"), want: StreamCancelled, stop: 0},
+			{name: "plain cancel", cause: nil, want: StreamCancelled, stop: 0},
 		} {
 			t.Run(f.name+"/"+c.name, func(t *testing.T) {
 				leakcheck.Check(t)

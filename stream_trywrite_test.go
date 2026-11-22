@@ -85,7 +85,7 @@ func TestStreamTryWrite(t *testing.T) {
 // and the carrier's resuming makes it ready again.
 func TestStreamWaitWritableIsRoomNotCredit(t *testing.T) {
 	leakcheck.Check(t)
-	a, b := tcpPair(t)
+	a, b := net.Pipe()
 	gb := &gatedConn{Conn: b}
 	scfg := &Config{InitialStreamReceiveWindow: 32 << 20, MaxStreamReceiveWindow: 32 << 20,
 		InitialConnectionReceiveWindow: 32 << 20, MaxConnectionReceiveWindow: 32 << 20}

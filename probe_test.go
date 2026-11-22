@@ -295,8 +295,8 @@ func tcpDialer(addr string) func(context.Context) (PipeIO, error) {
 
 // delayCounter delays every record and counts the plans.
 type delayCounter struct {
-	delay time.Duration
 	plans *atomic.Int64
+	delay time.Duration
 }
 
 func (d delayCounter) Capabilities() shaping.Caps { return shaping.CapPlan }
@@ -316,7 +316,7 @@ func TestProbeThroughShaperNotSuspect(t *testing.T) {
 	c.Liveness.SuspectFloor = 50 * time.Millisecond
 	e := newMPEnv(t, c, mpConfig())
 	var plans atomic.Int64
-	e.client.SetShaper(func(ShapedPipe) shaping.Shaper { return delayCounter{400 * time.Millisecond, &plans} }, nil)
+	e.client.SetShaper(func(ShapedPipe) shaping.Shaper { return delayCounter{delay: 400 * time.Millisecond, plans: &plans} }, nil)
 	p0, _ := e.client.Pipe(0)
 	base := pipeStat(t, p0).PingsSent
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)

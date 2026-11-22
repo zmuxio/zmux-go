@@ -158,7 +158,7 @@ func TestQuietSampleOutOfMinRTT(t *testing.T) {
 	if r.min != 50*Millisecond || r.smoothed >= 50*Millisecond {
 		t.Fatalf("quiet sample: min %v, smoothed %v", r.min, r.smoothed)
 	}
-	// Past 300 s a quiet sample keeps the old minimum.
+	// After expiry a quiet sample keeps the recorded minimum.
 	r.update(90*Millisecond, 0, 25*Millisecond, Time(400*Second), true)
 	if r.min != 50*Millisecond {
 		t.Fatalf("expired minimum replaced by a quiet sample: %v", r.min)
@@ -325,7 +325,7 @@ func TestProbeAcceptedJoinFirstWait(t *testing.T) {
 		s.cfg.Test.Seed = uint64(i + 1)
 		s.role, s.roleKnown = RoleInitiator, true
 		s.peerSeen, s.mp.cap = true, 16
-		s.mp.bits = map[uint64]bool{}
+		s.prepareAdditional()
 		if !acceptJoinForTest(t, s, 7) {
 			t.Fatal("join")
 		}

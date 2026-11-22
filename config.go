@@ -138,7 +138,7 @@ type Config struct {
 	// grants none; otherwise at least 4 and at most MaxStreamCredit.
 	MaxIncomingStreams int64
 	// MaxIncomingUniStreams is initial_max_streams_uni. Zero is a staged
-	// credit: 16, raised to 256 on the first AcceptUniStream; a negative
+	// credit: 16, raised to 256 on the first AcceptUniStream or HandleUniStreams; a negative
 	// value grants none; otherwise at most MaxStreamCredit.
 	MaxIncomingUniStreams int64
 
@@ -235,6 +235,14 @@ type Config struct {
 	AllowRecordMode AllowRecordMode
 	// AuthorizeJoin is an acceptor's further check of a join; nil passes all.
 	AuthorizeJoin func(c *Conn, pipe PipeID) bool
+	// JoinOutcome reports each authorized incoming join and each outgoing
+	// carrier exactly once. A nil error means peer attachment. Calls can
+	// overlap and run outside session locks on goroutines independent of
+	// Conn.Wait. NextEvent and HandleEvents release a successful pipe's
+	// events after its hook returns. Tracer may deliver earlier and drop
+	// events. A hook can close and wait for its session. Draining its own
+	// held event keys requires returning from the hook first.
+	JoinOutcome func(c *Conn, pipe PipeID, err error)
 	// JoinEarlyHello is the size of a Hello's first batch in bytes: 0 takes
 	// 8 KiB; a negative value sends no first batch. Larger batches outgrow
 	// the first congestion window and delay both the Hello and the Reply.
@@ -268,11 +276,15 @@ type Config struct {
 	CarrierCredential CarrierCredential
 	// Redial re-establishes pipes after failures (resume): it is called
 	// as soon as the session lacks a direction or suspends, delayed only
-	// by the redial backoff since its previous call for that direction,
-	// and by the join refusal backoff a refused join started (the longer
+	// by the redial backoff since its previous call and the join refusal
+	// backoff a refused join started (the longer
 	// of the two). It keeps one pipe per direction; a session that keeps
 	// several pipes is maintained with Conn.MaintainPipes and a PipePool,
 	// which also replaces failed pipes, and leaves Redial nil.
+	// A host can explicitly request one advised replacement with
+	// Conn.RequestPipeReplacement. It uses the same callback with its
+	// own backoff history. An outage cancels a pending replacement and
+	// can call Redial and RedialPolicy while the replacement unwinds.
 	Redial func(ctx context.Context, need Direction) (PipeIO, error)
 	// RedialBackoff is the backoff of Redial: after a failed call the wait,
 	// counted from the start of the previous call, starts at Min and
@@ -320,7 +332,7 @@ type SchedulerParams struct {
 	// lower tier takes data. Zero is 1 s; a negative value is invalid.
 	OverflowDelay time.Duration
 	// SpreadChunk is the unit the spreading policies split data into, in
-	// bytes. Zero is 16 KiB; a negative value is invalid.
+	// bytes. Zero is 16 KiB; explicit sizes are from 1 to 2^31 - 1.
 	SpreadChunk int64
 	// Redundancy sends the data of urgent stream directions (urgency 0
 	// to 2) and the first chunk after an idle period redundantly on a
@@ -538,6 +550,8 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	}
 	cc := core.DefaultConfig()
 	cc.Role, cc.TransportRole = role, transport
+	cc.PathAdvice = c.Redial != nil || c.Tracer != nil && c.Tracer.Event != nil
+	cc.TraceStreams = c.Tracer != nil && c.Tracer.Event != nil && c.Tracer.StreamEvents
 	l := &cc.Local
 	p := &c.SchedulerParams
 	if c.LatencyBudget < 0 || c.InitialStreamReceiveWindow < 0 || c.MaxStreamReceiveWindow < 0 ||
@@ -548,6 +562,12 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 		p.OverflowDelay < 0 ||
 		p.SpreadChunk < 0 {
 		return cc, fmt.Errorf("%w: negative Config count, size or duration", ErrInvalidConfig)
+	}
+	if p.SpreadChunk > math.MaxInt32 {
+		return cc, fmt.Errorf("%w: SpreadChunk %d above %d", ErrInvalidConfig, p.SpreadChunk, math.MaxInt32)
+	}
+	if c.ResumeTimeout > 0 && c.ResumeTimeout < time.Millisecond {
+		return cc, fmt.Errorf("%w: ResumeTimeout %v below 1 ms", ErrInvalidConfig, c.ResumeTimeout)
 	}
 	if c.JoinTimeout > time.Duration(core.MaxJoinDeadline) {
 		return cc, fmt.Errorf("%w: JoinTimeout %v above the maximum join deadline %v", ErrInvalidConfig, c.JoinTimeout, time.Duration(core.MaxJoinDeadline))
@@ -571,7 +591,8 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 		// The parameter is in milliseconds and its 0 means none.
 		return cc, fmt.Errorf("%w: MaxIdleTimeout %v below 1 ms", ErrInvalidConfig, c.MaxIdleTimeout)
 	case c.MaxIdleTimeout > 0:
-		l.MaxIdleTimeout = uint64(c.MaxIdleTimeout / time.Millisecond)
+		cc.IdleTimeout = core.Duration(c.MaxIdleTimeout)
+		l.MaxIdleTimeout = wireMilliseconds(c.MaxIdleTimeout)
 	}
 	clv, err := c.Liveness.core()
 	if err != nil {
@@ -683,7 +704,7 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	cc.OverflowDelay = dur(p.OverflowDelay, time.Second)
 	cc.Redundancy = p.Redundancy.On()
 	if p.SpreadChunk > 0 {
-		cc.SpreadChunk = int(min(p.SpreadChunk, int64(math.MaxInt32))) // a chunk above 2 GiB is no smaller unit, and fits every int
+		cc.SpreadChunk = int(p.SpreadChunk)
 	}
 	if err := checkLimits(&c.ShapingLimits); err != nil {
 		return cc, err
@@ -724,13 +745,7 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 		}
 		if cc.Resume > 0 {
 			l.Has |= wire.HasResume
-			// A fraction of a millisecond is rounded up (the unit), within
-			// the parameter's encoding (a varint below 2^62).
-			ms := cc.Resume / core.Millisecond
-			if cc.Resume%core.Millisecond != 0 {
-				ms++
-			}
-			l.ResumeGrace = min(uint64(ms), varint.MaxVarint)
+			l.ResumeGrace = wireMilliseconds(c.ResumeTimeout)
 		}
 	}
 	if role == core.RoleAuto {
@@ -764,4 +779,13 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 		cc.HoldFirstFlight = true
 	}
 	return cc, nil
+}
+
+// wireMilliseconds rounds up without adding to the configured duration.
+func wireMilliseconds(d time.Duration) uint64 {
+	ms := d / time.Millisecond
+	if d%time.Millisecond != 0 {
+		ms++
+	}
+	return min(uint64(ms), varint.MaxVarint)
 }

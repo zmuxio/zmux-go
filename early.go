@@ -142,8 +142,9 @@ func earlyCarrier(p PipeIO, e *EarlyData) (EarlyClientCarrier, bool) {
 func (c *Conn) failRestartLocked(old *pipeDrv, reason string) {
 	c.s.EarlyDiscarded()
 	c.s.FailInternal(reason)
-	if old != nil && !old.dead && c.pipes[0] == old && old.wstop {
-		c.startWriterLocked(old)
+	if old != nil && !old.dead && c.pipes[0] == old {
+		old.wstop = false
+		c.queuePipeWriterLocked(old)
 	}
 }
 
@@ -190,8 +191,11 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	var wdone chan struct{}
 	if old != nil && !old.dead {
 		old.wstop = true
-		wdone = old.wdone
-		old.wsig.Fire()
+		old.writer.wake.FireLocked()
+		if old.writer.running {
+			old.wdone = make(chan struct{})
+			wdone = old.wdone
+		}
 	}
 	c.unlock()
 	if wdone != nil {
@@ -234,37 +238,48 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	}
 	p.Carrier, p.Label, p.FateGroup, p.Variant = boot.Carrier, boot.Label, boot.FateGroup, boot.Variant
 	sameR, sameW := carrierio.SameHalf(p.R, boot.R), carrierio.SameHalf(p.W, boot.W)
+	a, err := c.preparePipe(0, p, p, 0)
+	if err != nil {
+		closePipe(p)
+		c.locked(func() { c.failRestartLocked(old, "early carrier properties") })
+		return
+	}
+	primeCarrierSample(p.W)
+	pd, info := a.pd, a.info
+	var discard bool
+	defer func() {
+		if discard {
+			closePipe(p)
+		}
+	}()
 	c.lock()
 	defer c.unlock()
-	if c.closing || old == nil || c.pipes[0] != old {
-		closePipe(p)
+	if c.closing || old == nil || old.retiring || c.pipes[0] != old {
+		discard = true
 		return
 	}
 	if sameR || sameW {
 		// The same carrier past its handshake: its reader goes on, its
 		// writer starts again on the restarted session.
-		if !sameR || !sameW || p.Framing != boot.Framing || !c.s.RestartEarly(carrierInfo(p, old.tcp, false), c.clk.now()) {
-			closePipe(p)
+		if !sameR || !sameW || p.Framing != boot.Framing || !c.s.RestartEarly(info, &old.writer.poll, c.clk.now()) {
+			discard = true
 			c.failRestartLocked(old, "early data restart failed")
 			return
 		}
-		c.startWriterLocked(old)
+		old.wstop = false
+		c.queuePipeWriterLocked(old)
 		return
 	}
-	pd := c.newPipeDrv(0, p)
-	info := carrierInfo(p, pd.tcp, false)
-	if !c.s.RestartEarly(info, c.clk.now()) {
+	if !c.s.RestartEarly(info, &pd.writer.poll, c.clk.now()) {
 		// The verdict contradicts what the early carrier delivered (the
 		// peer's parameters arrived on it): fail rather than mix carriers.
-		closePipe(p)
+		discard = true
 		c.failRestartLocked(old, "early data rejected after the peer's parameters")
 		return
 	}
 	old.dead = true  // its goroutines no longer report to the core
 	pd.end = old.end // a handle of pipe 0 follows the restart
 	pd.end.drv.Store(pd)
-	c.s.SetWriterSignal(0, pd.wsig)
-	c.startPipeLocked(pd, true, true)
-	old.wsig.Fire()   // its writer sees it is dead and ends
-	go old.closeAll() // its reader ends with its carrier
+	c.startPipeLocked(pd, true, true, a.carrier)
+	old.worker("early-close", old.closeAll) // its reader ends with its carrier
 }

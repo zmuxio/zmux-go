@@ -31,12 +31,14 @@ type tierInfo struct {
 
 // gate is the tier gate at one decision.
 type gate struct {
-	pipes  []*Pipe // usable pipes, tier by tier, in attachment order within a tier
-	tiers  []tierInfo
-	last   int // index of the least-preferred eligible tier
-	fed    int // index of the least-preferred tier offered excess data
-	cls    class
-	allSat bool
+	pipes        []*Pipe // usable pipes, tier by tier, in attachment order within a tier
+	tiers        []tierInfo
+	quality      []pathEstimate // lazy snapshot, indexed like pipes
+	last         int            // index of the least-preferred eligible tier
+	fed          int            // index of the least-preferred tier offered excess data
+	cls          class
+	allSat       bool
+	affinityOnly bool // cascade capacity is limited to the active pipe of each tier
 }
 
 func (g *gate) tierOf(p *Pipe) int {
@@ -156,6 +158,7 @@ func (s *Session) buildGate(g *gate) *gate {
 	g.cls = c
 	g.pipes = g.pipes[:0]
 	g.tiers = g.tiers[:0]
+	g.quality = g.quality[:0]
 	for _, p := range s.pipes {
 		if s.classUsable(c, p) {
 			g.pipes = append(g.pipes, p)
@@ -172,7 +175,7 @@ func (s *Session) buildGate(g *gate) *gate {
 		}
 		return 0
 	})
-	sa := s.cfg.Policy == PolicySessionAffinity
+	g.affinityOnly = s.cfg.Policy == PolicySessionAffinity
 	base := s.owdBase()
 	for lo := 0; lo < len(g.pipes); {
 		pr, _ := g.pipes[lo].mp.effPrio()
@@ -190,16 +193,7 @@ func (s *Session) buildGate(g *gate) *gate {
 			}
 			hi++
 		}
-		t := tierInfo{prio: pr, lo: lo, hi: hi, active: active}
-		if sa {
-			t.q, t.r = s.committed(active), s.rateOf(active)
-		} else {
-			for _, p := range g.pipes[lo:hi] {
-				t.q += s.committed(p)
-				t.r += s.rateOf(p)
-			}
-		}
-		g.tiers = append(g.tiers, t)
+		g.tiers = append(g.tiers, tierInfo{prio: pr, lo: lo, hi: hi, active: active})
 		lo = hi
 	}
 	// The cascade: only multi-tier gates need the
@@ -208,11 +202,28 @@ func (s *Session) buildGate(g *gate) *gate {
 	if len(g.tiers) == 1 {
 		return g
 	}
-	x, oldest, has := s.waitingData()
+	x, oldest, has, spreadETA := s.waitingData()
+	if spreadETA {
+		g.affinityOnly = false
+		s.gateQuality(g)
+	}
 	offered := float64(x)
 	d := s.cfg.OverflowDelay
 	for i := range g.tiers {
 		t := &g.tiers[i]
+		if g.affinityOnly {
+			t.q, t.r = s.committed(t.active), s.rateOf(t.active)
+		} else {
+			for j := t.lo; j < t.hi; j++ {
+				p := g.pipes[j]
+				t.q += s.committed(p)
+				if spreadETA {
+					t.r += g.quality[j].rate
+				} else {
+					t.r += s.rateOf(p)
+				}
+			}
+		}
 		t.offered = offered
 		drain := (t.q + offered) > t.r*float64(d)/1e9
 		aged := false
@@ -256,7 +267,7 @@ func (s *Session) takes(g *gate, p *Pipe) bool {
 		return true
 	}
 	for i := range ti {
-		if s.cfg.Policy == PolicySessionAffinity {
+		if g.affinityOnly {
 			if s.open(g.tiers[i].active) {
 				return false
 			}
@@ -370,7 +381,7 @@ func (s *Session) tierDeadline() Time {
 		return Never
 	}
 	next := Never
-	if _, oldest, has := s.waitingData(); has {
+	if _, oldest, has, _ := s.waitingData(); has {
 		d := s.cfg.OverflowDelay
 		next = minT(next, oldest.Add(d))
 		for _, t := range m.tierSince {
@@ -389,7 +400,8 @@ func (s *Session) tierDeadline() Time {
 // waitingData is X of the most-preferred tier and the age of its oldest
 // byte: stream data ready within stream and session credit and not yet
 // committed to a pipe, plus pending reinjection.
-func (s *Session) waitingData() (uint64, Time, bool) {
+func (s *Session) waitingData() (uint64, Time, bool, bool) {
+	spreadETA := s.cfg.Policy == PolicySpreadETA
 	var fresh, lost uint64
 	var oldest Time
 	has := false
@@ -403,6 +415,7 @@ func (s *Session) waitingData() (uint64, Time, bool) {
 		if r == 0 && (sp.mps == nil || sp.mps.resend.len() == 0) {
 			continue
 		}
+		spreadETA = spreadETA || s.policyOf(st) == PolicySpreadETA
 		fresh += r
 		w := max(sp.creditAt, st.waitStart(), s.conn.creditAt)
 		if !has || w < oldest {
@@ -410,7 +423,7 @@ func (s *Session) waitingData() (uint64, Time, bool) {
 		}
 	}
 	room := s.conn.sendMax - min64(s.conn.sendMax, s.conn.sent)
-	return min64(fresh, room) + lost, oldest, has
+	return min64(fresh, room) + lost, oldest, has, spreadETA
 }
 
 // readyBytes is a stream direction's data ready to send within its own

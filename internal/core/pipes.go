@@ -148,22 +148,13 @@ type inLane struct {
 }
 
 type outDir struct {
-	sig     *Signal
+	sig     *WriteSignal
 	lo      laneOut
 	lanes   []*outLane
 	q       pipeQuality
 	snd     pipeSend
 	records uint64 // records written
-	// The carrier's own retransmissions (SetCarrierRetransmitted) and the
-	// smoothed loss rate sampled from them.
-	retrans      uint64
-	lossRate     float64
-	lossAt       Time
-	lossSent     uint64 // BytesSent at lossAt
-	lossRetrans  uint64 // retrans at lossAt
-	retransKnown bool
-	lossHas      bool
-	failed       bool
+	failed  bool
 }
 
 type outLane struct {
@@ -179,26 +170,27 @@ type outLane struct {
 	closeSent   bool
 	closeDone   bool // the batch with CONNECTION_CLOSE was written (CloseHandedOff)
 	shut        bool
-	writing     bool       // a write call is in progress (since stallAt)
-	unsentKnown bool       // the adapter reports an unsent count for the lane
-	notWritable bool       // SetWritable reported the carrier accepts no bytes (since stallAt)
-	log         []retained // multipath retention
-	segs        []sendSeg  // unacknowledged bytes in send order
-	activity    []uint64   // end positions of records with activity frames
-	answers     []epochAck // records carrying a SESSION_EPOCH answer
-	boundSt     []*Stream  // stream directions bound to the lane
-	sig         *Signal    // wakes the lane's writer (lanes above 0; lane 0 uses the pipe's)
+	writing     bool         // a write call is in progress (since stallAt)
+	unsentKnown bool         // the adapter reports an unsent count for the lane
+	notWritable bool         // SetWritable reported the carrier accepts no bytes (since stallAt)
+	waiting     bool         // was refused data for its turn
+	log         []retained   // multipath retention
+	segs        []sendSeg    // unacknowledged bytes in send order
+	activity    []uint64     // end positions of records with activity frames
+	answers     []epochAck   // records carrying a SESSION_EPOCH answer
+	boundSt     []*Stream    // stream directions bound to the lane
+	sig         *WriteSignal // wakes the lane's writer (lanes above 0; lane 0 uses the pipe's)
 	openedAt    Time
 	laneFirst   bool // the PIPE_LANE record is still to be written
 	confirmed   bool
 	refused     bool
-	served      bool // took a data batch this round
-	waiting     bool // was refused data for its turn
+	served      bool   // took a data batch this round
+	prefixCount uint32 // retained originals eligible for prefix repair
 }
 
 // AttachBootstrap attaches pipe 0 (both directions) and returns it. The
 // driver then polls it for the first record (QX_TRANSPORT_PARAMETERS).
-func (s *Session) AttachBootstrap(in, out CarrierInfo, writer *Signal) *Pipe {
+func (s *Session) AttachBootstrap(in, out CarrierInfo, writer *WriteSignal) *Pipe {
 	p := &Pipe{id: 0}
 	s.stats.PipesAdded++
 	p.in = &inDir{lanes: []*inLane{{info: in, expectTP: true}}}
@@ -210,7 +202,7 @@ func (s *Session) AttachBootstrap(in, out CarrierInfo, writer *Signal) *Pipe {
 		// one a multipath session joins.
 		l.Has |= wire.HasCarrierDatagrams
 	}
-	s.wake(writer)
+	s.requestPoll(p.id, 0, writer)
 	return p
 }
 
@@ -242,13 +234,6 @@ func (d *inDir) lane(l uint64) *inLane {
 	return nil
 }
 
-// SetWriterSignal sets the signal that wakes the writer of an outbound pipe.
-func (s *Session) SetWriterSignal(pipe uint64, sig *Signal) {
-	if p := s.pipe(pipe); p != nil && p.out != nil {
-		p.out.sig = sig
-	}
-}
-
 // SetWritable records whether a carrier half accepts bytes now; a carrier
 // that accepts none for T_suspect makes the pipe suspect. It is the input of a
 // carrier that reports writability before a write: the package's drivers
@@ -266,6 +251,7 @@ func (s *Session) SetWritable(pipe, lane uint64, writable bool, now Time) {
 		return
 	}
 	ol.notWritable = !writable
+	s.wakePrefix()
 	if !writable && !ol.writing {
 		ol.stallAt = now
 	}

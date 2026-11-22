@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"net"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
@@ -428,8 +430,8 @@ func TestTracerNamesTheSession(t *testing.T) {
 
 // traceCalls records the calls of a Tracer.
 type traceCalls struct {
-	mu    sync.Mutex
 	calls []string
+	mu    sync.Mutex
 }
 
 func (r *traceCalls) add(s string) {
@@ -572,14 +574,14 @@ type slowHandler struct {
 	once    sync.Once
 }
 
-func (*slowHandler) Enabled(context.Context, slog.Level) bool { return true }
-func (h *slowHandler) Handle(context.Context, slog.Record) error {
+func (*slowHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (h *slowHandler) Handle(_ context.Context, _ slog.Record) error {
 	h.once.Do(func() { close(h.first); <-h.release })
 	h.n.Add(1)
 	return nil
 }
-func (h *slowHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h *slowHandler) WithGroup(string) slog.Handler      { return h }
+func (h *slowHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h *slowHandler) WithGroup(_ string) slog.Handler      { return h }
 
 // A Logger that blocks: the session queues 256 warnings, drops the ones
 // arriving at the full queue and counts them in LogLinesDropped; nothing
@@ -611,5 +613,78 @@ func TestLogLinesDropped(t *testing.T) {
 	waitUntil(t, 5*time.Second, "the queued lines", func() bool { return h.n.Load() == 1+warnQueueMax })
 	if n := c.ConnectionStats().LogLinesDropped; n != sent-warnQueueMax {
 		t.Fatalf("%d lines dropped after delivery", n)
+	}
+}
+
+func TestTracerStreamPlacement(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			cfg := mpConfig()
+			events := make(chan Event, 1)
+			done := make(chan struct{})
+			cfg.Tracer = &Tracer{
+				StreamEvents: enabled,
+				Event: func(_ SessionID, ev Event) {
+					if ev.Kind == EventStreamPlaced {
+						select {
+						case events <- ev:
+						default:
+						}
+					}
+				},
+				Closed: func(SessionID, error) { close(done) },
+			}
+			env := newMemMPEnv(t, cfg, mpConfig())
+			c, srv := env.client, env.server
+			st, err := c.OpenStreamSync(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("test data")
+			if _, err := st.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			remote, err := srv.AcceptStream(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(remote, make([]byte, len(payload))); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			select {
+			case ev := <-events:
+				if !enabled || ev.Direction != DirectionSendOnly || ev.PipeID != 0 || ev.StreamID != st.StreamID() || ev.StreamOffset != 0 ||
+					ev.StreamLength < uint64(len(payload)) || ev.StreamAt.IsZero() {
+					t.Fatalf("unexpected stream trace event %+v", ev)
+				}
+			default:
+				if enabled {
+					t.Fatal("no placement event delivered")
+				}
+			}
+		})
+	}
+}
+
+func TestTraceStreamGenerationRequiresEventCallback(t *testing.T) {
+	for _, tr := range []*Tracer{nil, {StreamEvents: true}} {
+		cfg := &Config{Tracer: tr}
+		got, err := cfg.coreConfig(core.RoleInitiator, core.RoleInitiator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.TraceStreams {
+			t.Fatal("trace-only work enabled with no callback")
+		}
 	}
 }

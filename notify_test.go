@@ -67,38 +67,38 @@ func TestNotifyReadableTriggers(t *testing.T) {
 	leakcheck.Check(t)
 	buf := make([]byte, 8)
 	cases := []struct {
-		name  string
 		event func(t *testing.T, cs, ss *Stream)
 		check func(n int, err error) bool
+		name  string
 	}{
-		{"data", func(t *testing.T, cs, _ *Stream) {
+		{name: "data", event: func(t *testing.T, cs, _ *Stream) {
 			t.Helper()
 			if _, err := cs.Write([]byte("x")); err != nil {
 				t.Fatal(err)
 			}
-		}, func(n int, err error) bool { return n == 1 && err == nil }},
-		{"fin", func(_ *testing.T, cs, _ *Stream) { _ = cs.Close() },
-			func(n int, err error) bool { return n == 0 && errors.Is(err, io.EOF) }},
-		{"reset", func(_ *testing.T, cs, _ *Stream) { cs.CancelWrite(7) },
-			func(_ int, err error) bool {
+		}, check: func(n int, err error) bool { return n == 1 && err == nil }},
+		{name: "fin", event: func(_ *testing.T, cs, _ *Stream) { _ = cs.Close() },
+			check: func(n int, err error) bool { return n == 0 && errors.Is(err, io.EOF) }},
+		{name: "reset", event: func(_ *testing.T, cs, _ *Stream) { cs.CancelWrite(7) },
+			check: func(_ int, err error) bool {
 				var se *StreamError
 				return errors.As(err, &se) && se.ErrorCode == 7
 			}},
-		{"cancel read", func(_ *testing.T, _, ss *Stream) { ss.CancelRead(3) },
-			func(n int, err error) bool { return n == 0 && err != nil && !errors.Is(err, ErrWouldBlock) }},
-		{"conn close", func(_ *testing.T, _, ss *Stream) {
+		{name: "cancel read", event: func(_ *testing.T, _, ss *Stream) { ss.CancelRead(3) },
+			check: func(n int, err error) bool { return n == 0 && err != nil && !errors.Is(err, ErrWouldBlock) }},
+		{name: "conn close", event: func(_ *testing.T, _, ss *Stream) {
 			_ = StreamConn(ss, nil, nil).Close()
-		}, func(n int, err error) bool { return n == 0 && err != nil && !errors.Is(err, ErrWouldBlock) }},
-		{"session close", func(_ *testing.T, _, ss *Stream) { _ = ss.h.c.Close() },
-			func(n int, err error) bool { return n == 0 && err != nil && !errors.Is(err, ErrWouldBlock) }},
-		{"peer session close", func(_ *testing.T, cs, _ *Stream) { _ = cs.h.c.Close() },
-			func(n int, err error) bool { return n == 0 && err != nil && !errors.Is(err, ErrWouldBlock) }},
-		{"deadline", func(_ *testing.T, _, ss *Stream) {
+		}, check: func(n int, err error) bool { return n == 0 && err != nil && !errors.Is(err, ErrWouldBlock) }},
+		{name: "session close", event: func(_ *testing.T, _, ss *Stream) { _ = ss.h.c.Close() },
+			check: func(n int, err error) bool { return n == 0 && err != nil && !errors.Is(err, ErrWouldBlock) }},
+		{name: "peer session close", event: func(_ *testing.T, cs, _ *Stream) { _ = cs.h.c.Close() },
+			check: func(n int, err error) bool { return n == 0 && err != nil && !errors.Is(err, ErrWouldBlock) }},
+		{name: "deadline", event: func(_ *testing.T, _, ss *Stream) {
 			_ = ss.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-		}, func(n int, err error) bool { return n == 0 && errors.Is(err, os.ErrDeadlineExceeded) }},
-		{"deadline passed", func(_ *testing.T, _, ss *Stream) {
+		}, check: func(n int, err error) bool { return n == 0 && errors.Is(err, os.ErrDeadlineExceeded) }},
+		{name: "deadline passed", event: func(_ *testing.T, _, ss *Stream) {
 			_ = ss.SetReadDeadline(time.Now().Add(-time.Second))
-		}, func(n int, err error) bool { return n == 0 && errors.Is(err, os.ErrDeadlineExceeded) }},
+		}, check: func(n int, err error) bool { return n == 0 && errors.Is(err, os.ErrDeadlineExceeded) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -321,8 +321,8 @@ type relayRig struct {
 }
 
 type relayResult struct {
-	aToB, bToA int64
 	err        error
+	aToB, bToA int64
 }
 
 func startRelay(t *testing.T, opts ...netx.RelayOption) *relayRig {
@@ -403,25 +403,13 @@ func TestRelayStreamBothDirections(t *testing.T) {
 	}
 }
 
-func goroutinesSettled(t *testing.T, want int) int {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		n := runtime.NumGoroutine()
-		if n <= want || time.Now().After(deadline) {
-			return n
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func streamReaders() string {
+func relayStreamReaders() string {
 	buf := make([]byte, 1<<20)
 	buf = buf[:runtime.Stack(buf, true)]
 	var found []string
 	for g := range strings.SplitSeq(string(buf), "\n\n") {
 		if strings.Contains(g, "(*Stream).Read(") || strings.Contains(g, "(*Stream).WaitReadable(") ||
-			strings.Contains(g, "(*Stream).WriteTo(") {
+			strings.Contains(g, "(*Stream).WriteTo(") || strings.Contains(g, "netx.(*notifyCopy).run(") {
 			found = append(found, g)
 		}
 	}
@@ -436,19 +424,26 @@ func TestRelayStreamIdleNoGoroutine(t *testing.T) {
 	cs, ss := idlePairT(t)
 	x, y := tcpPair(t)
 	t.Cleanup(func() { _ = x.Close(); _ = y.Close() })
-	before := runtime.NumGoroutine()
 	done := make(chan error, 1)
 	go func() {
 		_, _, err := netx.Relay(context.Background(), y, StreamConn(ss, nil, nil))
 		done <- err
 	}()
-	// The one goroutine above waits for the TCP side.
-	if n := goroutinesSettled(t, before+1); n != before+1 {
-		t.Fatalf("idle: %d goroutines, want %d", n, before+1)
+	// The stream side is idle once it has parked on a fresh notification
+	// and its last copy task has exited. The relay caller waits on TCP.
+	waitIdle := func(previous *readNote) *readNote {
+		t.Helper()
+		var armed *readNote
+		waitUntil(t, 5*time.Second, "idle relay with a pending stream notification and no reader", func() bool {
+			armed = ss.h.rnote.Load()
+			if armed == nil || armed == previous || armed.done.Load() || ss.h.readableNow() {
+				return false
+			}
+			return relayStreamReaders() == ""
+		})
+		return armed
 	}
-	if s := streamReaders(); s != "" {
-		t.Fatalf("a goroutine reads the idle stream:\n%s", s)
-	}
+	initial := waitIdle(nil)
 	// After traffic both ways the relay is idle again.
 	for range 3 {
 		msg := pattern(100<<10, 3)
@@ -466,12 +461,7 @@ func TestRelayStreamIdleNoGoroutine(t *testing.T) {
 			t.Fatal("TCP to stream", err)
 		}
 	}
-	if n := goroutinesSettled(t, before+1); n != before+1 {
-		t.Fatalf("idle after traffic: %d goroutines, want %d", n, before+1)
-	}
-	if s := streamReaders(); s != "" {
-		t.Fatalf("a goroutine reads the idle stream after traffic:\n%s", s)
-	}
+	waitIdle(initial)
 	_ = cs.Close()
 	select {
 	case err := <-done:
@@ -487,23 +477,23 @@ func TestRelayStreamIdleNoGoroutine(t *testing.T) {
 func TestRelayStreamEnds(t *testing.T) {
 	leakcheck.Check(t)
 	cases := []struct {
-		name  string
 		event func(r *relayRig)
 		check func(err error) bool
+		name  string
 	}{
-		{"peer session close", func(r *relayRig) { _ = r.cs.h.c.Close() },
-			func(err error) bool { return err != nil }},
-		{"local session close", func(r *relayRig) { _ = r.ss.h.c.Close() },
-			func(err error) bool { return err != nil }},
-		{"local stream close", func(r *relayRig) { _ = StreamConn(r.ss, nil, nil).Close() },
-			func(err error) bool { return err != nil }},
-		{"peer reset", func(r *relayRig) { r.cs.CancelWrite(7) },
-			func(err error) bool {
+		{name: "peer session close", event: func(r *relayRig) { _ = r.cs.h.c.Close() },
+			check: func(err error) bool { return err != nil }},
+		{name: "local session close", event: func(r *relayRig) { _ = r.ss.h.c.Close() },
+			check: func(err error) bool { return err != nil }},
+		{name: "local stream close", event: func(r *relayRig) { _ = StreamConn(r.ss, nil, nil).Close() },
+			check: func(err error) bool { return err != nil }},
+		{name: "peer reset", event: func(r *relayRig) { r.cs.CancelWrite(7) },
+			check: func(err error) bool {
 				var se *StreamError
 				return errors.As(err, &se) && se.ErrorCode == 7
 			}},
-		{"peer close", func(r *relayRig) { _ = r.cs.Close() },
-			func(err error) bool { return err == nil }},
+		{name: "peer close", event: func(r *relayRig) { _ = r.cs.Close() },
+			check: func(err error) bool { return err == nil }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

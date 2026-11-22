@@ -34,12 +34,12 @@ func mpConfig() *Config {
 		SchedulerParams: SchedulerParams{Probation: -1}}
 }
 
-func newMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
+func newMPEnv(t testing.TB, ccfg, scfg *Config) *mpEnv {
 	t.Helper()
 	return newMPEnvOn(t, ccfg, &ListenerConfig{Config: scfg, InstanceID: []byte("instance")})
 }
 
-func newMPEnvOn(t *testing.T, ccfg *Config, lcfg *ListenerConfig) *mpEnv {
+func newMPEnvOn(t testing.TB, ccfg *Config, lcfg *ListenerConfig) *mpEnv {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -74,7 +74,7 @@ func (e *mpEnv) pipeDialer() func(context.Context) (PipeIO, error) {
 	}
 }
 
-func startMPEnv(t *testing.T, ccfg *Config, lcfg *ListenerConfig, ln net.Listener, dial func(context.Context) (net.Conn, error)) *mpEnv {
+func startMPEnv(t testing.TB, ccfg *Config, lcfg *ListenerConfig, ln net.Listener, dial func(context.Context) (net.Conn, error)) *mpEnv {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &mpEnv{ln: ln, dial: dial, lst: mustNewListener(lcfg), cancel: cancel}
@@ -113,7 +113,7 @@ func startMPEnv(t *testing.T, ccfg *Config, lcfg *ListenerConfig, ln net.Listene
 	return e
 }
 
-func (e *mpEnv) addPipe(t *testing.T, o PipeOptions) *Pipe {
+func (e *mpEnv) addPipe(t testing.TB, o PipeOptions) *Pipe {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -394,7 +394,7 @@ func TestPipeStatsAbsentDirection(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	want := PipeStats{PipeID: peer.PipeID, Local: peer.Local, PeerAttached: peer.PeerAttached, FateGroup: peer.FateGroup, Label: peer.Label,
+	want := PipeStats{Epoch: peer.Epoch, EpochKnown: peer.EpochKnown, ReplaceBy: peer.ReplaceBy, RecordMode: peer.RecordMode, PipeID: peer.PipeID, Local: peer.Local, PeerAttached: peer.PeerAttached, FateGroup: peer.FateGroup, Label: peer.Label,
 		Carrier: peer.Carrier, Inbound: peer.Inbound, AttachedFor: peer.AttachedFor,
 		FailureCount: peer.FailureCount, Failure: peer.Failure, ReceivePriority: peer.ReceivePriority,
 		ReceiveStandby: peer.ReceiveStandby, RequestSeq: peer.RequestSeq, BytesReceived: peer.BytesReceived,

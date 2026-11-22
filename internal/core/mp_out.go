@@ -311,7 +311,7 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 			w.abandonsSent = append(w.abandonsSent, q)
 		}
 	}
-	for id, code := range m.pendAbandon {
+	for id, code := range m.owedAbandons() {
 		n := varint.SizeVarint(wire.TypePipeAbandon) + varint.SizeVarint(id) + varint.SizeVarint(code)
 		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPipeAbandon(b, id, code) }) {
 			return
@@ -442,7 +442,7 @@ func (s *Session) mpWantsWrite(p *Pipe, ol *outLane) bool {
 				return true
 			}
 		}
-		if len(s.mp.pendAbandon) > 0 {
+		if len(s.mp.owedAbandons()) > 0 {
 			return true
 		}
 		if (p == prim || prim == nil) && s.controlPending() {

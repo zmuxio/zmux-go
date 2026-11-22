@@ -61,12 +61,11 @@ type clientWriter struct {
 	c       net.Conn
 	verdict chan bool
 	r       *clientReader
+	held    [][]byte
 	nonce   [8]byte
 	key     byte
-
-	held  [][]byte
-	state int
-	mu    sync.Mutex
+	state   int
+	mu      sync.Mutex
 }
 
 func xor(b []byte, k byte) []byte {

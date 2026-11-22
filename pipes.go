@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"time"
 
 	"github.com/djylb/timeshim"
@@ -122,6 +124,10 @@ func (o *PipeOptions) join(dir Direction) (core.JoinOptions, error) {
 // is 0. It is an unsigned 62-bit value.
 type PipeID uint64
 
+// UnassignedPipeID identifies an outbound JoinOutcome whose setup failed
+// before the protocol allocated a pipe ID. It is outside the wire ID space.
+const UnassignedPipeID PipeID = 1 << 62
+
 // Pipe is one attachment of a session. Its methods are safe for concurrent
 // use; they fail with ErrPipeGone once the attachment is retired.
 type Pipe struct {
@@ -162,29 +168,40 @@ func (p *Pipe) admittedValue() any {
 // On a session that returned before establishment (EarlyData), AddPipe first waits for it.
 func (c *Conn) AddPipe(ctx context.Context, p PipeIO, o PipeOptions) (*Pipe, error) {
 	p = owned(p)
-	pp, taken, err := c.addPipeCall(ctx, p, o)
-	if err != nil && !taken {
+	if c == nil {
 		closePipe(p)
+		return nil, net.ErrClosed
 	}
-	return pp, err
+	deadline := c.clk.now().Add(core.Duration(c.cfg.joinTimeout()))
+	out := c.newJoinOutcome(ctx, UnassignedPipeID, false, c.clk.wall(deadline))
+	jctx, cancel := timeshim.WithDeadline(ctx, c.clk.source(), out.deadline)
+	defer cancel()
+	var pp *Pipe
+	err := hostCall(c.cfg.Logger, "join setup", func() error { var err error; pp, err = c.addPipeCall(jctx, p, o, out); return err })
+	if err != nil {
+		c.locked(func() { err = out.settleLocked(err) })
+		if err != nil {
+			p.own.CloseUnreleased()
+			return nil, err
+		}
+	}
+	return pp, nil
 }
 
-// addPipeCall is AddPipe; taken reports that the session took p (and
-// closes it when it fails).
-func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pipe, taken bool, err error) {
+func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions, out *joinOutcome) (*Pipe, error) {
 	dir := o.Direction
 	if p.W == nil || p.R == nil {
-		return nil, false, fmt.Errorf("%w: a join needs both directions of the carrier; pair two with PairedPipe", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: a join needs both directions of the carrier; pair two with PairedPipe", ErrInvalidConfig)
 	}
 	if err := p.validate(); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if o.FateGroup == 0 {
 		o.FateGroup = p.FateGroup
 	}
 	j, err := o.join(dir)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	mode := RecordSealed
 	rm, rmSet := o.RecordMode.get()
@@ -194,38 +211,38 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 	case c.cfg.RecordPolicy != nil:
 		pol := c.cfg.RecordPolicy
 		if !safeLog(c.cfg.Logger, "Config.RecordPolicy", func() { mode = pol(joinCarrierInfo(p, false)) }) {
-			return nil, false, fmt.Errorf("%w: Config.RecordPolicy panicked", ErrInvalidConfig)
+			return nil, fmt.Errorf("%w: Config.RecordPolicy panicked", ErrInvalidConfig)
 		}
 	}
 	if mode > RecordTrusted {
-		return nil, false, fmt.Errorf("%w: record mode %v for a join", ErrInvalidConfig, mode)
+		return nil, fmt.Errorf("%w: record mode %v for a join", ErrInvalidConfig, mode)
 	}
 	j.Mode = join.Mode(mode)
 	if mode == RecordBound {
 		if p.Carrier == CarrierSplit {
-			return nil, false, fmt.Errorf("%w: Bound on a split carrier", ErrInvalidConfig)
+			return nil, fmt.Errorf("%w: Bound on a split carrier", ErrInvalidConfig)
 		}
 		// The handshake first: a carrier may name its connection only then.
 		if handshake := pendingHandshake(p); handshake != nil {
 			if err := handshake(ctx); err != nil {
-				return nil, false, fmt.Errorf("zmux: carrier handshake: %w", err)
+				return nil, fmt.Errorf("zmux: carrier handshake: %w", err)
 			}
 		}
 		if !IsCarrierSecure(p) {
-			return nil, false, fmt.Errorf("%w: Bound on a carrier without a Secure declaration", ErrInvalidConfig)
+			return nil, fmt.Errorf("%w: Bound on a carrier without a Secure declaration", ErrInvalidConfig)
 		}
 		if j.Binding, err = joinBinding(p); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 	}
 	// A session that returned early (EarlyData) learns from the peer's
 	// parameters whether it has multipath at all.
-	if err := c.waitEstablished(ctx); err != nil {
-		return nil, false, err
+	if err := c.waitEstablished(ctx, nil); err != nil {
+		return nil, err
 	}
-	pp, pd, err := c.addPipe(p, o, j)
+	pp, pd, err := c.addPipe(p, o, j, out)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if b, ok := o.QualityBand.get(); ok {
 		cb, _ := b.core() // checked by join
@@ -233,25 +250,15 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 			_ = c.s.SetQualityBand(int64(pp.id), &cb) // join refused it on a receive-only pipe
 		})
 	}
-	jctx, cancel := timeshim.WithTimeout(ctx, c.clk.source(), c.cfg.joinTimeout())
-	defer cancel()
-	if err := c.joinCarrier(jctx, pd, p, dir); err != nil {
-		if !errors.Is(err, ErrJoinRefused) {
-			_ = pp.Abort()
-		}
-		return nil, true, err
+	if err := hostCall(c.cfg.Logger, "join handshake", func() error { return c.joinCarrier(ctx, pd, p, dir) }); err != nil {
+		return pp, err
 	}
 	if o.ReturnOnReply {
-		return pp, true, nil
+		c.locked(func() { err = out.repliedLocked() })
+	} else {
+		err = pp.WaitAttached(ctx)
 	}
-	if err := pp.WaitAttached(jctx); err != nil {
-		_ = pp.Abort()
-		if jctx.Err() != nil && c.ctx.Err() == nil {
-			return nil, true, fmt.Errorf("zmux: pipe %d not attached by the peer: %w", pp.id, err)
-		}
-		return nil, true, err
-	}
-	return pp, true, nil
+	return pp, err
 }
 
 // WaitAttached waits until the peer has attached the pipe, returning nil at once for a pipe it
@@ -263,74 +270,65 @@ func (c *Conn) addPipeCall(ctx context.Context, p PipeIO, o PipeOptions) (pp *Pi
 // ctx's error, ErrPipeGone once the pipe failed, closed or is gone before
 // it is attached, or the session's error once the session ends.
 func (p *Pipe) WaitAttached(ctx context.Context) error {
-	c := p.c
-	sig := core.NewSignal()
-	defer c.unwatchPipes(sig)
-	for {
-		var pi core.PipeInfo
-		var ok bool
-		c.locked(func() {
-			sig.Drain()
-			c.watchPipes(sig)
-			pi, ok = c.s.PipeInfo(p.id)
+	out := p.end.join
+	if out == nil { // bootstrap
+		return nil
+	}
+	select {
+	case <-out.done:
+		return out.err
+	case <-ctx.Done():
+		var err error
+		p.c.peek(func() {
+			if out.settled {
+				err = out.err
+			} else {
+				err = ctx.Err()
+			}
 		})
-		switch {
-		case c.isDone():
-			return c.closedErr()
-		case !ok:
-			return ErrPipeGone
-		case pi.PeerAttached:
-			return nil
-		case pi.HasOut && (pi.OutState == core.OutFailed || pi.OutState == core.OutClosed || pi.OutState == core.OutDraining),
-			!pi.HasOut && pi.InState == core.InEnded:
-			return ErrPipeGone
-		}
-		select {
-		case <-sig.C:
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.done:
-			return c.closedErr()
-		}
+		return err
 	}
 }
 
-func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions) (*Pipe, *pipeDrv, error) {
-	c.lock()
-	defer c.unlock()
-	if c.closing {
-		return nil, nil, c.errLocked()
-	}
-	edge, err := nestPipe(c, outerOf(p))
+func (c *Conn) addPipe(p PipeIO, o PipeOptions, j core.JoinOptions, out *joinOutcome) (*Pipe, *pipeDrv, error) {
+	a, err := c.preparePipe(0, p, p, multiLowWater)
 	if err != nil {
 		return nil, nil, err
 	}
 	if j.Mode == join.Sealed {
 		if err := sealedLimitErr(p, sealOverhead(p.Framing)); err != nil {
-			edge.drop()
 			return nil, nil, err
 		}
 	}
-	pd := c.newPipeDrv(c.s.NextPipeID(), p)
-	pd.nest = edge
-	low := pd.tcp.setLowWater(multiLowWater)
-	info := carrierInfo(p, pd.tcp, low)
+	pd, info := a.pd, a.info
 	if j.Mode == join.Sealed {
 		overhead := p.WriteOverhead + sealOverhead(p.Framing)
 		maxRec := SealedMaxRecord
 		if lim := sealedRecordLimit(p, sealOverhead(p.Framing)); lim > 0 {
 			maxRec = min(maxRec, lim)
 		}
-		info = core.CarrierInfo{Framing: core.FramingRecords, MinRTT: info.MinRTT, QueueBound: low,
+		info = core.CarrierInfo{Framing: core.FramingRecords, MinRTT: info.MinRTT, QueueBound: info.QueueBound,
 			WriteOverhead: overhead, MaxRecord: maxRec, OwnFailure: info.OwnFailure}
 		pd.opener, pd.ch = nil, nil
 	}
-	j.In, j.Out, j.OutSig, j.Kind = info, info, pd.wsig, uint8(p.Carrier)
+	j.In, j.Out, j.OutSig, j.Kind = info, info, &pd.writer.poll, uint8(p.Carrier)
+	j.Deadline = core.Time(out.deadline.Sub(c.clk.base))
+	c.lock()
+	defer c.unlock()
+	if c.closing {
+		return nil, nil, c.errLocked()
+	}
+	edge, err := nestPipe(c, a.outer)
+	if err != nil {
+		return nil, nil, err
+	}
+	pd.nest = edge
 	id, _, err := c.s.AddPipe(j)
 	if err != nil {
 		pd.nest.drop()
 		return nil, nil, apiErr(err)
 	}
+	out.holdLocked(id, pd.end)
 	pd.id = id
 	c.pipes[id] = pd
 	o.RecordMode = Set(RecordMode(j.Mode))
@@ -634,9 +632,10 @@ func (c *Conn) RevalidatePipes() error {
 	return apiErr(c.s.RevalidatePipes(0, true, c.clk.now()))
 }
 
-// Close removes the pipe gracefully: PIPE_ABANDON(NO_ERROR) and drain.
-// It does not block; the pipe's end is reported by
-// NextEvent.
+// Close removes the pipe gracefully with PIPE_ABANDON(NO_ERROR) and drain.
+// A join that is still waiting for peer confirmation closes its carrier
+// without sending PIPE_ABANDON. Close does not block. NextEvent reports
+// the pipe's end.
 func (p *Pipe) Close() error {
 	c := p.c
 	c.lock()
@@ -807,6 +806,11 @@ func (s InboundState) String() string {
 // of a direction the attachment does not have, whose state is then
 // OutboundNone or InboundNone.
 type PipeStats struct {
+	// Epoch is the epoch the pipe joined in, when EpochKnown is true.
+	Epoch uint64
+	// ReplaceBy is the scheduled make-before-break replacement time.
+	// It is zero when no replacement time is scheduled.
+	ReplaceBy  time.Time
 	PipeID     PipeID
 	FateGroup  uint64
 	Label      string
@@ -816,15 +820,16 @@ type PipeStats struct {
 	// PeerAttached reports that the peer has attached the pipe
 	// (WaitAttached); once true it stays true.
 	PeerAttached bool
+	EpochKnown   bool
 	Carrier      CarrierKind // PipeIO.Carrier
 	// Outbound and Inbound are the states of the two directions;
 	// OutboundNone and InboundNone for one the attachment lacks.
 	Outbound     OutboundState
 	Inbound      InboundState
-	AttachedFor  time.Duration
-	SuspectCount uint64 // times the outbound pipe became suspect
-	FailureCount uint64 // 0 or 1: whether the attachment failed
-	Failure      error  // why it failed, once it did
+	AttachedFor  time.Duration // gauge: time since attachment
+	SuspectCount uint64        // times the outbound pipe became suspect
+	FailureCount uint64        // 0 or 1: whether the attachment failed
+	Failure      error         // why it failed, once it did
 
 	// The effective priority and standby flag (Standby, below) of the
 	// outbound direction (lower priority preferred) and where they come
@@ -838,7 +843,7 @@ type PipeStats struct {
 	ReceivePriority uint64
 	RequestSeq      uint64
 	PeerRequest     *PeerRequest // the peer's latest request; nil before one
-	Weight          uint64
+	Weight          uint64       // gauge: outbound weight
 	// ProbationUntil is the end of the outbound pipe's probation, zero
 	// outside probation or for a base so large that it never ends.
 	ProbationUntil time.Time
@@ -884,24 +889,17 @@ type PipeStats struct {
 	// up.
 	BytesLost   uint64
 	RecordsLost uint64
-	// BytesRetransmitted is the bytes the carrier itself retransmitted, as
-	// its adapter reports them (PipeIO: Retransmitted), sampled at most once
-	// a second; 0 when it reports none. Pipes sharing one carrier
-	// connection (QUIC streams of one connection) report the connection's
-	// count, the same on each. LossRate is the smoothed carrier loss rate:
-	// an EWMA (gain 1/8) of the retransmitted bytes per byte sent between
-	// samples at least 1 s apart; 0 before the first sample.
-	BytesRetransmitted     uint64
-	LossRate               float64
+	// CarrierSample is a detached snapshot of the outbound carrier connection.
+	CarrierSample          *CarrierSample
 	BytesOpportunistic     uint64 // opportunistic copies sent on the outbound pipe
 	BytesRedundant         uint64 // redundant copies sent on the outbound pipe
 	BytesDuplicateReceived uint64 // duplicate stream bytes received on the inbound pipe
 	PingsSent              uint64
 	PingsAnswered          uint64 // PIPE_PINGs answered by an acknowledgement
 
-	SinceLastAck     time.Duration
-	SinceLastReceive time.Duration
-	// SinceLastTraffic is the time since a record carrying a traffic frame
+	SinceLastAck     time.Duration // gauge
+	SinceLastReceive time.Duration // gauge
+	// SinceLastTraffic is a gauge of the time since a record carrying a traffic frame
 	// (STREAM, RESET_STREAM, RESET_STREAM_AT, STOP_SENDING or DATAGRAM) was
 	// sent on the pipe or completely received on it, or since the pipe
 	// became live. Probes, acknowledgements, other control frames and
@@ -910,20 +908,21 @@ type PipeStats struct {
 
 	// LanesOut and LanesIn are gauges of the lanes of each direction, lane
 	// 0 included; LanesRefused counts own outbound lanes refused.
-	LanesOut, LanesIn int
+	LanesOut, LanesIn uint64
 	LanesRefused      uint64
 	// Lanes are the positions of each lane of a pipe with lanes; nil
 	// without, lane 0 then being the pipe itself.
 	Lanes []LaneStats
 }
 
-// LaneStats are the positions of one lane; a direction the lane does not
-// have reports 0.
+// LaneStats are the positions of one lane. The Known flags distinguish
+// a zero position from an unavailable position.
 type LaneStats struct {
-	Lane             uint64
-	PositionSent     uint64 // bytes written on the outbound lane, its first record included
-	PositionAcked    uint64 // the position the peer acknowledged on it
-	PositionReceived uint64 // the position of the inbound lane
+	PositionSentKnown, PositionAckedKnown, PositionReceivedKnown bool
+	Lane                                                         uint64
+	PositionSent                                                 uint64 // bytes written on the outbound lane, its first record included
+	PositionAcked                                                uint64 // the position the peer acknowledged on it
+	PositionReceived                                             uint64 // the position of the inbound lane
 }
 
 // PeerRequest is the peer's latest PIPE_STATUS request for the local
@@ -937,15 +936,48 @@ type PeerRequest struct {
 // (or the session that ended released it): a read reports the absence
 // rather than an error.
 func (p *Pipe) Stats() (PipeStats, bool) {
+	return p.stats(true)
+}
+
+func (p *Pipe) stats(sample bool) (PipeStats, bool) {
+	if p == nil || p.c == nil {
+		return PipeStats{}, false
+	}
 	c := p.c
 	c.lock()
-	defer c.unlock()
 	c.s.SetNow(c.clk.now()) // the durations since an event are current
 	pi, ok := c.s.PipeInfo(p.id)
 	if !ok {
+		c.unlock()
 		return PipeStats{}, false
 	}
-	return c.pipeStats(pi), true
+	st := c.pipeStats(pi)
+	var w io.WriteCloser
+	if sample {
+		w = c.sampleWriterLocked(st)
+	}
+	c.unlock()
+	st.CarrierSample = outboundCarrierSample(w, st.Outbound.carrierRefresh())
+	return st, true
+}
+
+func (s OutboundState) carrierRefresh() bool {
+	switch s {
+	case OutboundActive, OutboundSuspect, OutboundDraining:
+		return true
+	case OutboundNone, OutboundJoining, OutboundFailed, OutboundClosed:
+		return false
+	}
+	return false
+}
+
+func (c *Conn) sampleWriterLocked(st PipeStats) io.WriteCloser {
+	if st.Outbound != OutboundNone {
+		if pd := c.pipes[uint64(st.PipeID)]; pd != nil && pd.hc != nil {
+			return pd.hc.io.W
+		}
+	}
+	return nil
 }
 
 // endLocked is the end record of attachment id (under the lock).
@@ -973,15 +1005,33 @@ func (c *Conn) Pipes() []*Pipe {
 // PipeStats returns a snapshot of every attachment. A session without
 // multipath reports pipe 0.
 func (c *Conn) PipeStats() []PipeStats {
+	return c.pipeStatsAll(true)
+}
+
+func (c *Conn) pipeStatsAll(sample bool) []PipeStats {
+	if c == nil {
+		return nil
+	}
 	c.lock()
-	defer c.unlock()
 	c.s.SetNow(c.clk.now()) // the durations since an event are current
 	ids := c.s.PipeIDs(nil)
 	out := make([]PipeStats, 0, len(ids))
+	var writers []io.WriteCloser
+	if sample {
+		writers = make([]io.WriteCloser, 0, len(ids))
+	}
 	for _, id := range ids {
 		if pi, ok := c.s.PipeInfo(id); ok {
-			out = append(out, c.pipeStats(pi))
+			st := c.pipeStats(pi)
+			out = append(out, st)
+			if sample {
+				writers = append(writers, c.sampleWriterLocked(st))
+			}
 		}
+	}
+	c.unlock()
+	for i, w := range writers {
+		out[i].CarrierSample = outboundCarrierSample(w, out[i].Outbound.carrierRefresh())
 	}
 	return out
 }
@@ -997,7 +1047,7 @@ func (c *Conn) Pipe(id PipeID) (*Pipe, bool) {
 }
 
 func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
-	st := PipeStats{PipeID: PipeID(pi.ID), RecordMode: c.pipeModeLocked(pi.ID), Local: pi.Local, PeerAttached: pi.PeerAttached, FateGroup: pi.FateGroup, Label: c.endLocked(pi.ID).opts.Label,
+	st := PipeStats{Epoch: pi.Epoch, EpochKnown: pi.EpochKnown, PipeID: PipeID(pi.ID), RecordMode: c.pipeModeLocked(pi.ID), Local: pi.Local, PeerAttached: pi.PeerAttached, FateGroup: pi.FateGroup, Label: c.endLocked(pi.ID).opts.Label,
 		Carrier: CarrierKind(pi.Carrier), Variant: c.variantLocked(pi.ID), Outbound: OutboundState(pi.OutState), Inbound: InboundState(pi.InState),
 		AttachedFor: time.Duration(pi.AttachedFor), SuspectCount: pi.SuspectCount, FailureCount: pi.FailureCount,
 		Failure: pi.Failure, SendPriority: pi.SendPriority, SendPrioritySource: pi.PrioritySource,
@@ -1010,16 +1060,19 @@ func (c *Conn) pipeStats(pi core.PipeInfo) PipeStats {
 		DeliveryRate: rateBytes(pi.DeliveryRate), QueuedBytes: pi.QueuedBytes, BytesInFlight: pi.BytesInFlight,
 		BytesSent: pi.BytesSent, BytesReceived: pi.BytesReceived, BytesAcked: pi.BytesAcked,
 		RecordsSent: pi.RecordsSent, RecordsReceived: pi.RecordsReceived, BytesReinjected: pi.BytesReinjected,
-		RecordsLost: pi.RecordsLost, BytesLost: pi.BytesLost, BytesRetransmitted: pi.BytesRetransmitted,
-		LossRate:           pi.LossRate,
+		RecordsLost: pi.RecordsLost, BytesLost: pi.BytesLost,
 		BytesOpportunistic: pi.BytesOpportunistic, BytesRedundant: pi.BytesRedundant,
 		BytesDuplicateReceived: pi.BytesDuplicateRecv, PingsSent: pi.PingsSent, PingsAnswered: pi.PingsAnswered,
 		SinceLastAck: time.Duration(pi.SinceLastAck), SinceLastReceive: time.Duration(pi.SinceLastReceive),
 		SinceLastTraffic: time.Duration(pi.SinceLastTraffic), LanesOut: pi.LanesOut, LanesIn: pi.LanesIn,
-		LanesRefused: uint64(pi.LanesRefused)}
+		LanesRefused: pi.LanesRefused}
+	if pi.ReplaceBy != core.Never {
+		st.ReplaceBy = c.clk.wall(pi.ReplaceBy)
+	}
 	for _, l := range pi.Lanes {
 		st.Lanes = append(st.Lanes, LaneStats{Lane: l.Lane, PositionSent: l.PositionSent,
-			PositionAcked: l.PositionAcked, PositionReceived: l.PositionReceived})
+			PositionAcked: l.PositionAcked, PositionReceived: l.PositionReceived,
+			PositionSentKnown: l.HasOut, PositionAckedKnown: l.HasAck, PositionReceivedKnown: l.HasIn})
 	}
 	if pi.PeerRequest {
 		st.PeerRequest = &PeerRequest{Priority: pi.PeerPriority, Standby: pi.PeerStandby}
@@ -1053,7 +1106,7 @@ func (st *PipeStats) clearOutbound() {
 	st.QueuedBytes, st.QueueDelay, st.BytesInFlight = 0, 0, 0
 	st.BytesSent, st.BytesAcked, st.RecordsSent = 0, 0, 0
 	st.BytesReinjected, st.BytesOpportunistic, st.BytesRedundant = 0, 0, 0
-	st.RecordsLost, st.BytesLost, st.BytesRetransmitted, st.LossRate = 0, 0, 0, 0
+	st.RecordsLost, st.BytesLost = 0, 0
 	st.PingsSent, st.PingsAnswered, st.SinceLastAck = 0, 0, 0
 	st.LanesOut, st.LanesRefused = 0, 0
 }
@@ -1068,7 +1121,7 @@ func (st *PipeStats) clearInbound() {
 
 // pipeModeLocked is the record mode of an attachment.
 func (c *Conn) pipeModeLocked(id uint64) RecordMode {
-	if id == 0 && !c.cc.SecureFirstPipe {
+	if id == 0 && !c.s.Config().SecureFirstPipe {
 		return RecordUnmanaged
 	}
 	return RecordMode(c.s.PipeMode(id))

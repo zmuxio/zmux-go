@@ -99,7 +99,7 @@ func TestAdmissionMore(t *testing.T) {
 	}
 	mu.Unlock()
 	st, vs := lst.Stats().Admission, lst.VariantStats()
-	if st.Accepted != 2 || len(vs) != 2 || vs[0] != (VariantStat{Accepted: 1}) || vs[1] != (VariantStat{Name: "x", Accepted: 1}) {
+	if st.Accepted != 2 || len(vs) != 1 || vs[0] != (VariantStat{Name: "x", Accepted: 1}) {
 		t.Fatalf("stats %+v, variants %+v", st, vs)
 	}
 }
@@ -173,20 +173,20 @@ func TestAdmissionMoreBounds(t *testing.T) {
 		name    string
 		adm     *Admission
 		send    []byte
-		end     bool
 		seen    []int
+		end     bool
 		closed  uint64
 		timeout uint64
 	}{
-		{"need not above prefix", &Admission{Peek: 4, MaxPeek: 8, Decide: seq(more(4))}, make([]byte, 8), false, []int{4}, 1, 0},
-		{"need not growing", &Admission{Peek: 2, MaxPeek: 8, Decide: seq(more(4), more(4))}, make([]byte, 8), false, []int{2, 4}, 1, 0},
-		{"above MaxPeek", &Admission{Peek: 2, MaxPeek: 8, Decide: seq(more(9))}, make([]byte, 16), false, []int{2}, 1, 0},
-		{"no MaxPeek", &Admission{Peek: 2, Decide: seq(more(3))}, make([]byte, 16), false, []int{2}, 1, 0},
-		{"ended short", &Admission{Peek: 2, MaxPeek: 8, Decide: seq(more(8), more(9))}, make([]byte, 5), true, []int{2, 5}, 1, 0},
-		{"rounds", &Admission{Peek: 1, MaxPeek: 8, Decide: seq(more(3), more(8), Decision{Verdict: VerdictClose, Variant: "m"})},
-			make([]byte, 8), false, []int{1, 3, 8}, 1, 0},
-		{"timeout", &Admission{Peek: 1, MaxPeek: 8, PeekTimeout: 300 * time.Millisecond, Decide: seq(more(8))},
-			make([]byte, 2), false, []int{1}, 0, 1},
+		{name: "need not above prefix", adm: &Admission{Peek: 4, MaxPeek: 8, Decide: seq(more(4))}, send: make([]byte, 8), end: false, seen: []int{4}, closed: 1, timeout: 0},
+		{name: "need not growing", adm: &Admission{Peek: 2, MaxPeek: 8, Decide: seq(more(4), more(4))}, send: make([]byte, 8), end: false, seen: []int{2, 4}, closed: 1, timeout: 0},
+		{name: "above MaxPeek", adm: &Admission{Peek: 2, MaxPeek: 8, Decide: seq(more(9))}, send: make([]byte, 16), end: false, seen: []int{2}, closed: 1, timeout: 0},
+		{name: "no MaxPeek", adm: &Admission{Peek: 2, Decide: seq(more(3))}, send: make([]byte, 16), end: false, seen: []int{2}, closed: 1, timeout: 0},
+		{name: "ended short", adm: &Admission{Peek: 2, MaxPeek: 8, Decide: seq(more(8), more(9))}, send: make([]byte, 5), end: true, seen: []int{2, 5}, closed: 1, timeout: 0},
+		{name: "rounds", adm: &Admission{Peek: 1, MaxPeek: 8, Decide: seq(more(3), more(8), Decision{Verdict: VerdictClose, Variant: "m"})},
+			send: make([]byte, 8), end: false, seen: []int{1, 3, 8}, closed: 1, timeout: 0},
+		{name: "timeout", adm: &Admission{Peek: 1, MaxPeek: 8, PeekTimeout: 300 * time.Millisecond, Decide: seq(more(8))},
+			send: make([]byte, 2), end: false, seen: []int{1}, closed: 0, timeout: 1},
 	} {
 		var seen []int
 		adm := x.adm
@@ -280,7 +280,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 			m := newFirstMsgCarrier(msg)
 			return PipeIO{R: m, W: m, Framing: FramingRecords}, func() { _ = m.Close() }
 		}, &seen)
-		if st.Accepted != x.accepted || st.Closed+st.TooLarge != x.closed || !equalInts(seen, x.seen) {
+		if st.Accepted != x.accepted || st.Closed != x.closed || st.TooLarge != 0 || !equalInts(seen, x.seen) {
 			t.Fatalf("%s: stats %+v, Decide saw %v", x.name, st, seen)
 		}
 		var sum VariantStat
@@ -288,7 +288,7 @@ func TestAdmissionFirstMessage(t *testing.T) {
 			sum.Accepted += v.Accepted
 			sum.Closed += v.Closed
 		}
-		if sum.Accepted != st.Accepted || sum.Closed != st.Closed+st.TooLarge {
+		if sum.Accepted != st.Accepted || sum.Closed != st.Closed && x.name != "too long" {
 			t.Fatalf("%s: variants %+v do not add up", x.name, vs)
 		}
 	}
@@ -312,9 +312,13 @@ func TestAdmissionMaxPeekConfig(t *testing.T) {
 func TestAdmissionVariantBound(t *testing.T) {
 	var c admissionCounters
 	for i := MaxAdmissionVariants + 2; i > 0; i-- {
-		c.variant(fmt.Sprintf("v%03d", i), VerdictAccept)
+		c.count(Decision{Variant: fmt.Sprintf("v%03d", i), Verdict: VerdictAccept})
 	}
-	c.variant("v001", VerdictClose)
+	c.count(Decision{Variant: "v001", Verdict: VerdictClose})
+	c.count(Decision{Verdict: VerdictClose})
+	c.count(Decision{Variant: "v001", Verdict: VerdictFallback})
+	c.count(Decision{Variant: "v003", Verdict: VerdictTakeover})
+	c.stallOverflow.Add(1)
 	c.variant("v999", VerdictStall)
 	vs := c.variantStats()
 	if len(vs) != MaxAdmissionVariants+1 {
@@ -326,11 +330,24 @@ func TestAdmissionVariantBound(t *testing.T) {
 		}
 	}
 	// The first MaxAdmissionVariants seen were v066 down to v003.
-	if vs[0] != (VariantStat{Name: "v003", Accepted: 1}) {
+	if vs[0] != (VariantStat{Name: "v003", Accepted: 1, Takeover: 1}) {
 		t.Fatalf("first %+v", vs[0])
 	}
-	if o := vs[MaxAdmissionVariants]; o != (VariantStat{Overflow: true, Accepted: 2, Stalled: 1, Closed: 1}) {
+	if o := vs[MaxAdmissionVariants]; o != (VariantStat{Overflow: true, Accepted: 2, Fallback: 1, Stalled: 1, Closed: 1}) {
 		t.Fatalf("overflow %+v", o)
+	}
+	var sum VariantStat
+	for _, b := range vs {
+		sum.Accepted += b.Accepted
+		sum.Closed += b.Closed
+		sum.Fallback += b.Fallback
+		sum.Takeover += b.Takeover
+		sum.Stalled += b.Stalled
+	}
+	st := c.snapshot()
+	if st.Accepted != sum.Accepted || st.Closed != sum.Closed+1 || st.Fallback != sum.Fallback ||
+		st.Takeover != sum.Takeover || st.Stalled+st.StallOverflow != sum.Stalled {
+		t.Fatalf("totals %+v, labeled outcomes %+v", st, sum)
 	}
 	var none *Listener
 	if none.VariantStats() != nil {
@@ -356,7 +373,7 @@ func (m *limitMsgCarrier) ReadMessage(limit int) ([]byte, error) {
 
 // The first message is read with the admission's bound, MaxMessage
 // (MaxRecordSize for 0), where the carrier can bound the read: a longer
-// one is refused before Decide, counted TooLarge.
+// one is refused before Decide, counted Closed.
 func TestAdmissionFirstMessageLimit(t *testing.T) {
 	leakcheck.Check(t)
 	msg := bytes.Repeat([]byte{1}, 40)
@@ -378,7 +395,7 @@ func TestAdmissionFirstMessageLimit(t *testing.T) {
 		if want == 0 {
 			want = MaxRecordSize
 		}
-		if st.Accepted != x.accepted || st.TooLarge != x.closed || st.Closed != 0 {
+		if st.Accepted != x.accepted || st.Closed != x.closed || st.TooLarge != 0 {
 			t.Fatalf("MaxMessage %d: stats %+v", x.adm.MaxMessage, st)
 		}
 		if len(m.limits) == 0 || m.limits[0] != want {

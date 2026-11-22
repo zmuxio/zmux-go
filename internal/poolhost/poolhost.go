@@ -68,16 +68,26 @@ func Plan(growth int, ms []Member, count int) (cancel int, closing []int) {
 // Safe runs the host callback f, containing a panic (ok false), which it
 // logs as the panic of what to l (nil: not logged), outside every lock.
 func Safe(l *slog.Logger, what string, f func()) (ok bool) {
+	return Call(l, what, func() error { f(); return nil }) == nil
+}
+
+// Call isolates host code and preserves an error raised by a panic.
+func Call(l *slog.Logger, what string, f func() error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			ok = false
+			if cause, ok := r.(error); ok {
+				err = fmt.Errorf("zmux: %s panicked: %w", what, cause)
+			} else {
+				err = fmt.Errorf("zmux: %s panicked: %v", what, r)
+			}
 			if l != nil {
+				// The warning itself calls host code through the logger.
+				defer func() { _ = recover() }()
 				l.Warn("zmux: a host callback panicked; the panic was contained", "callback", what, "panic", fmt.Sprint(r))
 			}
 		}
 	}()
-	f()
-	return true
+	return f()
 }
 
 // ReportRejected hands the error of a rejected decision to a pool's

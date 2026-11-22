@@ -132,7 +132,7 @@ func bulkAndClose(t *testing.T, ctx context.Context, c *zmux.Conn, p *peerProc) 
 	for err := range errs {
 		t.Fatalf("%v; pipes %+v; session %v", err, c.PipeStats(), context.Cause(c.Context()))
 	}
-	var lanes int
+	var lanes uint64
 	for _, ps := range c.PipeStats() {
 		lanes += ps.LanesOut
 	}

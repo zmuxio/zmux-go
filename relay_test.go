@@ -147,6 +147,8 @@ func startRelayEnv(t *testing.T, ccfg, scfg *zmux.Config, viaRelay bool, e *rela
 		_ = lst.Close()
 		cancel()
 		wg.Wait()
+		<-e.client.Done()
+		<-e.server.Done()
 	})
 	artifactsOnFailure(t)
 	return e

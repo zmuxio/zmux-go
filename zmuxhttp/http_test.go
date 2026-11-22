@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,77 @@ import (
 	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
+
+func TestServerTCPCarrierSample(t *testing.T) {
+	wantSource := zmux.CarrierSourceUnknown
+	switch runtime.GOOS {
+	case "linux":
+		wantSource = zmux.CarrierSourceLinuxTCPInfo
+	case "darwin":
+		wantSource = zmux.CarrierSourceDarwinTCPConnectionInfo
+	case "windows":
+		wantSource = zmux.CarrierSourceWindowsSIOTCPInfo
+	}
+	for _, tc := range []struct {
+		name  string
+		proto int
+	}{{"HTTP/1.1", 1}, {"HTTP/2", 2}} {
+		t.Run(tc.name, func(t *testing.T) {
+			lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
+			h, err := NewHandler(lst, nil)
+			if err != nil {
+				_ = lst.Close()
+				t.Fatal(err)
+			}
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.ProtoMajor != tc.proto {
+					t.Errorf("HTTP protocol = %s, want %s", r.Proto, tc.name)
+				}
+				h.ServeHTTP(w, r)
+			}))
+			defer srv.Close()
+			defer func() { _ = lst.Close() }()
+			srv.Config.ConnContext = ConnContext
+			if tc.proto == 2 {
+				srv.EnableHTTP2 = true
+				srv.StartTLS()
+			} else {
+				srv.Start()
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			p, err := Streaming{Client: srv.Client(), URL: srv.URL}.Pipe(ctx, zmux.DirectionBidirectional)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := zmux.Start(ctx, p, zmux.RoleClient, mpConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				_ = c.Close()
+				waitDone(t, c)
+			}()
+			s, err := lst.Accept(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				_ = s.Close()
+				waitDone(t, s)
+			}()
+
+			stats := s.PipeStats()
+			if len(stats) != 1 {
+				t.Fatalf("server pipes = %d, want 1", len(stats))
+			}
+			sample := stats[0].CarrierSample
+			if sample == nil || sample.Source != wantSource || sample.SampledAt.IsZero() {
+				t.Fatalf("server carrier sample = %+v, want source %s and an attachment timestamp", sample, wantSource)
+			}
+		})
+	}
+}
 
 // TestHTTPCarriers runs sessions over HTTP request carriers admitted by
 // prefix tokens: in the body of a duplex request and a split bootstrap's
@@ -241,4 +313,60 @@ func settledCall() *httpCall {
 	c := &httpCall{done: make(chan struct{})}
 	close(c.done)
 	return c
+}
+
+// A send-only joiner can finish its downlink before the origin reads the
+// Confirm on the uplink. Cancel the GET as the origin writes its Reply.
+func TestSplitJoinDownlinkEndsBeforeConfirm(t *testing.T) {
+	lst := mustNewListener(&zmux.ListenerConfig{Config: atkConfig()})
+	defer func() { _ = lst.Close() }()
+	h, err := NewHandler(lst, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.Header.Get(HeaderPair) != "" {
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			w = cancelOnWrite{w, cancel}
+			r = r.WithContext(ctx)
+		}
+		h.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	base, err := (Streaming{Client: srv.Client(), URL: srv.URL}).Pipe(ctx, zmux.DirectionBidirectional)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := zmux.Start(ctx, base, zmux.RoleClient, atkConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close(); waitDone(t, c) }()
+	s, err := lst.Accept(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close(); waitDone(t, s) }()
+	p, err := (Split{Client: srv.Client(), URL: srv.URL}).Join(ctx, c, zmux.PipeOptions{Direction: zmux.DirectionSendOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.WaitAttached(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type cancelOnWrite struct {
+	http.ResponseWriter
+	cancel context.CancelFunc
+}
+
+func (w cancelOnWrite) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w cancelOnWrite) Write(p []byte) (int, error) {
+	w.cancel()
+	return w.ResponseWriter.Write(p)
 }

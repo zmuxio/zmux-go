@@ -159,10 +159,10 @@ func (c *Candidate) parseHandshakes(x any, t *tables) error {
 			e := &c.hs[i]
 			e.set = true
 			for _, f := range []struct {
-				k   string
 				to  *value
+				k   string
 				fam family
-			}{{"pad_to", &e.padTo, famLength}, {"pad_multiple", &e.padMul, famLength}, {"pad", &e.pad, famLength}, {"delay", &e.dly, famTime}} {
+			}{{k: "pad_to", to: &e.padTo, fam: famLength}, {k: "pad_multiple", to: &e.padMul, fam: famLength}, {k: "pad", to: &e.pad, fam: famLength}, {k: "delay", to: &e.dly, fam: famTime}} {
 				if v := u.get(f.k); v != nil {
 					if *f.to, err = parseValue(v, f.fam, t, false, f.k); err != nil {
 						return err

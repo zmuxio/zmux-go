@@ -6,16 +6,16 @@ import "sync/atomic"
 // refs is atomic because the driver drops its own reference outside the
 // session lock. Free returns it to its pool when the last reference goes.
 type Buf struct {
-	Free func(*Buf)
-	B    []byte
+	Free   func(*Buf)
+	B      []byte
+	owners []bufOwner
 	// held is the bytes of B that buffered stream pieces reference, under
 	// the lock of the one session whose pipe read B (recvBuf.pin), with
 	// the pieces that took them (owners, for compaction) and B's index in
 	// that session's pinSet while held is above 0.
-	held   uint64
-	owners []bufOwner
-	pidx   int
-	refs   atomic.Int32
+	held uint64
+	pidx int
+	refs atomic.Int32
 }
 
 // bufOwner is a piece that referenced a Buf: its recvBuf and the offset it
@@ -28,12 +28,12 @@ type bufOwner struct {
 
 // pinSet is a session's read buffers that buffered pieces reference.
 type pinSet struct {
+	bufs []*Buf
 	// extra is what the pinned buffers cost beyond the pieces' bytes: the
 	// unreferenced rest of every pinned buffer plus pieceCost per piece.
 	extra uint64
 	size  uint64 // sum of len(B) over bufs
 	held  uint64 // sum of held over bufs
-	bufs  []*Buf
 }
 
 // Compaction bounds what pinned buffers cost beyond the bytes their pieces

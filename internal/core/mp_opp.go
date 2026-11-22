@@ -81,6 +81,9 @@ func (s *Session) oppSend(w *recWriter, f *Pipe, st *Stream) bool {
 	}
 	sp := &st.snd
 	ms := sp.mpState()
+	if ms.repair.hi != 0 {
+		return true
+	}
 	// The next part of the blocking data not acknowledged and not re-sent.
 	lo := max64(e.d.off, ms.acked.prefix())
 	hi := e.d.off + e.d.n
@@ -120,7 +123,7 @@ func (s *Session) oppSend(w *recWriter, f *Pipe, st *Stream) bool {
 	s.stats.BytesReinjected += n
 	s.stats.BytesOpportunistic += n
 	f.mp.oppBytes += n
-	s.penalize(p)
+	s.penalize(p, true)
 	return true
 }
 
@@ -177,7 +180,7 @@ func (s *Session) sendsData(d *frameDesc) bool {
 
 // penalize halves R_p, discards its samples and keeps new data off p until
 // everything sent on it is acknowledged (once per episode).
-func (s *Session) penalize(p *Pipe) {
+func (s *Session) penalize(p *Pipe, migrateAffinity bool) {
 	a := p.mp
 	if a.penalized {
 		return
@@ -190,7 +193,12 @@ func (s *Session) penalize(p *Pipe) {
 	clear(e.samples)
 	e.samples = e.samples[:0]
 	e.r, e.measured = r/2, false
-	s.reinjectPenalized(p)
+	if q := a.quality; q != nil {
+		q.rate = min(q.rate, e.r)
+	}
+	if migrateAffinity {
+		s.reinjectPenalized(p)
+	}
 	s.capacityChanged()
 	s.checkTakeover()
 }

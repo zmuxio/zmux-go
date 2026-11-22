@@ -292,9 +292,9 @@ func TestCloseDeliveryByteStream(t *testing.T) {
 		"tls": func(a, b net.Conn) (net.Conn, net.Conn) { return tls.Client(a, cliTLS), tls.Server(b, srvTLS) },
 	} {
 		for _, c := range []struct {
-			code   ApplicationErrorCode
 			reason string
-		}{{0x2a, "bye"}, {0, ""}} {
+			code   ApplicationErrorCode
+		}{{code: 0x2a, reason: "bye"}, {code: 0, reason: ""}} {
 			t.Run(fmt.Sprintf("%s/%#x", name, uint64(c.code)), func(t *testing.T) {
 				a, b := wrap(tcpPair(t))
 				client, server := pair(t, a, b, nil, nil)

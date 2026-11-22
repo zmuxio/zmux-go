@@ -119,8 +119,38 @@ func (s *Session) RemovePipe(id uint64, graceful bool) error {
 		s.failPipe(p, wire.PipeFailed, ErrPipeAborted)
 		return nil
 	}
+	if id != 0 && p.mp.joinerLocal && p.mp.peer == peerPending {
+		// No peer attachment has been observed. Close this carrier without
+		// advertising a pipe the peer may never have installed.
+		p.mp.peer = peerDiscarded
+		s.unsettle(p)
+		s.retire(p, true)
+		s.checkTakeover()
+		return nil
+	}
 	s.startDrain(p)
 	return nil
+}
+
+// AbortUnconfirmed terminates the joining side's attempt, including the
+// interval after JoinFinish has opened its directions. Later ACKs may
+// retire retained bytes but cannot establish peer attachment.
+func (s *Session) AbortUnconfirmed(id uint64) {
+	if p := s.pipe(id); p != nil {
+		s.abortUnconfirmed(p, ErrPipeAborted)
+	}
+}
+
+func (s *Session) abortUnconfirmed(p *Pipe, cause error) {
+	if p.mp == nil || !p.mp.joinerLocal || p.id == 0 || p.mp.peer == peerDiscarded {
+		return
+	}
+	a := p.mp
+	a.peer = peerDiscarded
+	// A protocol failure has already queued an abort of both directions.
+	if a.abandonCode == wire.NoError && s.state != StateClosed {
+		s.failPipe(p, wire.PipeFailed, cause)
+	}
 }
 
 // startDrain begins a graceful removal.
@@ -253,9 +283,9 @@ func (s *Session) maybeRetire(p *Pipe) {
 	s.retire(p, false)
 }
 
-// retire frees the attachment's state; its ID stays used. refused: the
-// acceptor refused its join (the refusal backoff stays).
-func (s *Session) retire(p *Pipe, refused bool) {
+// retire frees the attachment's state; its ID stays used. keepBackoff preserves
+// refusal backoff when the peer's attachment was never established.
+func (s *Session) retire(p *Pipe, keepBackoff bool) {
 	a := p.mp
 	// The pipe's end, whichever path led here: what it still retains is
 	// owed again (once per frame, so an earlier reinjection is not
@@ -265,7 +295,11 @@ func (s *Session) retire(p *Pipe, refused bool) {
 	// A peer-parity ID stays used, pipe 0 of an initiator peer included:
 	// its later PIPE_ACK entries are ignored.
 	if !s.ownParity(p.id) {
-		s.mp.bits[p.id] = true
+		if p.id == 0 {
+			s.mp.bootstrapRetired = true
+		} else {
+			s.prepareAdditional().bits[p.id] = true
+		}
 	}
 	s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
 	for i, q := range s.pipes {
@@ -276,6 +310,9 @@ func (s *Session) retire(p *Pipe, refused bool) {
 			break
 		}
 	}
+	if !s.cfg.PathAdvice && len(s.pipes) == 1 {
+		s.pipes[0].mp.quality = nil
+	}
 	s.retiredPipes = append(s.retiredPipes, p.id)
 	if len(s.retiredPipes) > 64 {
 		s.retiredPipes = s.retiredPipes[1:]
@@ -285,7 +322,7 @@ func (s *Session) retire(p *Pipe, refused bool) {
 	s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirBidi, OutState: OutRetired, InState: InRetired,
 		Carrier: p.carrier, Failed: a.failures > 0, Cause: a.failCause})
 	s.checkLastPipe(nil)
-	if a.joinerLocal && !a.resLimited && !refused && !a.hs {
+	if a.joinerLocal && !a.resLimited && !keepBackoff && !a.hs {
 		// Another attachment that the acceptor had attached retired: the
 		// refusal backoff ends. A refused join, or one still in its
 		// handshake (never attached), ends nothing.
@@ -368,6 +405,21 @@ func (s *Session) RemovesLast(id uint64) bool {
 	if s.mp == nil || p == nil || p.mp == nil || p.mp.retired {
 		return false
 	}
+	out, in := s.liveDirectionsWithout(p)
+	return !out || !in
+}
+
+// LiveDirectionsWithout reports the live directions ignoring an attachment.
+// A host uses it while an unconfirmed replacement must not cover an outage.
+func (s *Session) LiveDirectionsWithout(id uint64) (out, in bool) {
+	p := s.pipe(id)
+	if s.mp == nil || p == nil || p.mp == nil || p.mp.retired {
+		return s.LiveDirections()
+	}
+	return s.liveDirectionsWithout(p)
+}
+
+func (s *Session) liveDirectionsWithout(p *Pipe) (outLive, inLive bool) {
 	out, in := s.liveCounts()
 	if p.out != nil && p.mp.liveOut() {
 		out--
@@ -375,5 +427,5 @@ func (s *Session) RemovesLast(id uint64) bool {
 	if p.in != nil && (p.mp.in == InJoining || p.mp.in == InOpen) {
 		in--
 	}
-	return out <= 0 || in <= 0
+	return out > 0, in > 0
 }

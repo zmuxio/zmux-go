@@ -32,21 +32,20 @@ import (
 // The fields are read when an adapter is set up; a TrustedProxies must not
 // be changed or copied afterwards.
 type TrustedProxies struct {
-	// Prefixes are the addresses (as /32 or /128 prefixes) and networks of
-	// the trusted intermediaries; a peer outside them is its own source.
-	Prefixes []netip.Prefix
+	set *forwarded.PrefixSet
+	res *forwarded.Resolver // nil without Header
 	// Header is the forwarding header field the trusted intermediaries set
 	// on HTTP requests: "X-Forwarded-For", "Forwarded" (RFC 7239),
 	// "X-Real-IP", or the name of another field that holds the one client
 	// address as X-Real-IP does. Empty: HTTP requests are not read.
 	Header string
+	// Prefixes are the addresses (as /32 or /128 prefixes) and networks of
+	// the trusted intermediaries; a peer outside them is its own source.
+	Prefixes []netip.Prefix
+	once     sync.Once
 	// ProxyProtocol makes Listener expect a PROXY protocol header on every
 	// connection from a trusted address.
 	ProxyProtocol bool
-
-	once sync.Once
-	set  *forwarded.PrefixSet
-	res  *forwarded.Resolver // nil without Header
 }
 
 // init builds the prefix set and the forwarding header resolver once.

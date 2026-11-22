@@ -157,7 +157,7 @@ func TestSuite1Vectors(t *testing.T) {
 			group, _ := LookupGroup(uint64(v["group"].(float64)))
 			ri, rr := vectorRand(t, v, true), vectorRand(t, v, false)
 			phase := uint8(v["mode_byte"].(float64)) >> 7
-			j, err := NewJoinerFixed(JoinerConfig{Suite: su, Group: group, Phase: phase, Mode: m, Framing: f, Locator: hx(v, "locator"), PSK: psk, Binding: binding}, Entropy{uint64(v["attempt"].(float64)), hx(v, "random_i")}, ri)
+			j, err := NewJoinerFixed(JoinerConfig{Suite: su, Group: group, Phase: phase, Mode: m, Framing: f, Locator: hx(v, "locator"), PSK: psk, Binding: binding}, Entropy{Attempt: uint64(v["attempt"].(float64)), Random: hx(v, "random_i")}, ri)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -176,7 +176,7 @@ func TestSuite1Vectors(t *testing.T) {
 			if err := a.Exchange(rr); err != nil {
 				t.Fatal(err)
 			}
-			reply, err := a.WriteReplyRaw(nil, hx(v, "reply_payload"), Entropy{uint64(v["attempt_r"].(float64)), hx(v, "random_r")})
+			reply, err := a.WriteReplyRaw(nil, hx(v, "reply_payload"), Entropy{Attempt: uint64(v["attempt_r"].(float64)), Random: hx(v, "random_r")})
 			if err != nil || !bytes.Equal(reply, hx(v, rk)) {
 				t.Fatal(v["name"], "reply", err)
 			}

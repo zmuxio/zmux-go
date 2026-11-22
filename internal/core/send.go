@@ -434,6 +434,10 @@ func (s *Session) startReset(st *Stream, code uint64, stopReply bool) {
 		return
 	}
 	sp.reset = true
+	if sp.mps != nil {
+		s.cancelPrefixTail(sp.mps)
+		s.untrackPrefix(st)
+	}
 	sp.resetCode = code
 	switch {
 	case stopReply:
@@ -525,6 +529,10 @@ func (s *Session) onSendCredit(st *Stream, v uint64) bool {
 func (s *Session) sendTerminal(st *Stream, state sendState) {
 	sp := &st.snd
 	sp.state = state
+	if sp.mps != nil {
+		s.clearPrefixRepair(sp.mps)
+		s.untrackPrefix(st)
+	}
 	if sp.sent > sp.q.base {
 		s.mp.release(sp.sent - sp.q.base)
 	}

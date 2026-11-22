@@ -10,6 +10,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/zmuxio/zmux-go/internal/core"
+
 	"github.com/djylb/timeshim"
 )
 
@@ -257,6 +259,24 @@ func TestMaintainPipesBackoffOrder(t *testing.T) {
 	} {
 		if err := e.client.MaintainPipes(context.Background(), pool); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("%v > %v: %v", pool.Backoff.Min, pool.Backoff.Max, err)
+		}
+	}
+}
+
+// The public path-quality reasons are the core's classifications, value for value.
+func TestPipePathQualityReasonsMatchCore(t *testing.T) {
+	for _, c := range []struct {
+		public PipePathQualityReason
+		core   core.PathQualityReason
+	}{
+		{PipePathQualityUnknown, core.PathQualityUnknown},
+		{PipePathQualityHealthySibling, core.PathQualityHealthySibling},
+		{PipePathQualityLocalStall, core.PathQualityLocalStall},
+		{PipePathQualityShared, core.PathQualityShared},
+		{PipePathQualityRestored, core.PathQualityRestored},
+	} {
+		if uint8(c.public) != uint8(c.core) {
+			t.Fatalf("public reason %d, core reason %d", c.public, c.core)
 		}
 	}
 }

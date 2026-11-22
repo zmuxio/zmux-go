@@ -33,11 +33,11 @@ func TestPrefixAuthVectors(t *testing.T) {
 		bind[i] = byte(i)
 	}
 	for _, x := range []struct {
-		binding []byte
 		token   string
+		binding []byte
 	}{
-		{nil, "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf3fed5e50dc8fc8fce2e962ddb13dbfae"},
-		{bind, "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf36747d163099e42de649d7159d462334"},
+		{binding: nil, token: "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf3fed5e50dc8fc8fce2e962ddb13dbfae"},
+		{binding: bind, token: "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf36747d163099e42de649d7159d462334"},
 	} {
 		tok, _ := hex.DecodeString(x.token)
 		v, err := NewPrefixAuthVerifier(a, PrefixAuthVerifierOptions{})

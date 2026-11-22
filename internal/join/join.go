@@ -116,8 +116,8 @@ func PSKLen(id uint64, epochSecret []byte, r Role, sessionCrypto []byte, n int) 
 
 // Entropy is what R takes besides its message.
 type Entropy struct {
-	Attempt uint64
 	Random  []byte
+	Attempt uint64
 }
 
 // NonceR computes R, bound to the message it goes in: header is the bytes before
@@ -141,7 +141,7 @@ func freshEntropy(s *Suite) (Entropy, error) {
 	if _, err := rand.Read(random); err != nil {
 		return Entropy{}, fmt.Errorf("%w: %w", ErrRandomFailed, err) // no fallback
 	}
-	return Entropy{attempts.Add(1), random}, nil
+	return Entropy{Attempt: attempts.Add(1), Random: random}, nil
 }
 
 // KeyShare is a key share item: a Group and the share of the sender's role.
@@ -339,6 +339,8 @@ func parseHelloPayload(b []byte, usable func(uint64) bool) (HelloPayload, error)
 }
 
 // ParseReplyPayload parses a Reply payload as a joiner whose Hello used group.
+//
+//goland:noinspection GoUnusedExportedFunction // used by the seal module
 func ParseReplyPayload(b []byte, group uint64) (ReplyPayload, error) {
 	return parseReplyPayload(b, group)
 }
@@ -599,12 +601,12 @@ func checkBinding(m Mode, binding []byte) error {
 // Mode is Sealed. The Sealed confirmation has already used n = 0 of the
 // joiner's direction.
 type Result struct {
-	Mode   Mode
 	Sealer *Sealer
 	Opener *Opener
 
 	suite *Suite
 	exp   []byte
+	Mode  Mode
 }
 
 // Export derives keying material from this Join, in every Mode.

@@ -3,11 +3,13 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"regexp"
 	"runtime/pprof"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go/internal/labels"
@@ -21,16 +23,61 @@ func TestGoroutineLabels(t *testing.T) {
 
 func testGoroutineLabels(t *testing.T) {
 	a, b := net.Pipe()
-	pair(t, a, b, &Config{Clock: timeshim.Real}, &Config{Clock: timeshim.Real})
-	var buf bytes.Buffer
-	if err := pprof.Lookup("goroutine").WriteTo(&buf, 1); err != nil {
+	gate := &writerGate{Conn: a}
+	client, server := pair(t, gate, b, &Config{Clock: timeshim.Real}, &Config{Clock: timeshim.Real})
+	synctest.Wait()
+	profile := func() bytes.Buffer {
+		var buf bytes.Buffer
+		if err := pprof.Lookup("goroutine").WriteTo(&buf, 1); err != nil {
+			t.Fatal(err)
+		}
+		return buf
+	}
+	count := func(buf bytes.Buffer, task string, want int) {
+		t.Helper()
+		re := regexp.MustCompile(`# labels: \{"zmux":"` + task + `", "zmux.pipe":"0", "zmux.role":"(initiator|responder)", "zmux.session":"[0-9]+"\}`)
+		if n := len(re.FindAll(buf.Bytes(), -1)); n != want {
+			t.Fatalf("%d %s goroutines with the session labels, want %d", n, task, want)
+		}
+	}
+	time.Sleep(2 * writerIdle) // synctest virtual time
+	synctest.Wait()
+	buf := profile()
+	count(buf, "read", 2)
+	count(buf, "write", 0)
+	gate.arm()
+	out, err := client.OpenStreamSync(t.Context())
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, task := range []string{"read", "write"} {
-		re := regexp.MustCompile(`# labels: \{"zmux":"` + task + `", "zmux.pipe":"0", "zmux.role":"(initiator|responder)", "zmux.session":"[0-9]+"\}`)
-		if n := len(re.FindAll(buf.Bytes(), -1)); n != 2 {
-			t.Errorf("%d %s goroutines with the session labels, want 2", n, task)
+	if _, err = out.Write([]byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	<-gate.entered
+	buf = profile()
+	close(gate.release)
+	count(buf, "write", 1)
+	in, err := server.AcceptStream(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 8 {
+		if i > 0 {
+			if _, err = out.Write([]byte{byte(i)}); err != nil {
+				t.Fatal(err)
+			}
 		}
+		var v [1]byte
+		if _, err = io.ReadFull(in, v[:]); err != nil || v[0] != byte(i) {
+			t.Fatalf("round %d read %v: %v", i, v, err)
+		}
+		synctest.Wait()
+		time.Sleep(2 * writerIdle)
+		synctest.Wait()
+		count(profile(), "write", 0)
+	}
+	if gate.overlap.Load() {
+		t.Fatal("concurrent writes on lane zero")
 	}
 	for _, m := range regexp.MustCompile(`# labels: \{[^}]*\}`).FindAll(buf.Bytes(), -1) {
 		if !regexp.MustCompile(`^# labels: \{("zmux(\.[a-z]+)?":"[a-z0-9-]+"(, )?)+\}$`).Match(m) {

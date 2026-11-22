@@ -98,12 +98,13 @@ func TestReplyKexRejected(t *testing.T) {
 
 // msgEnd is one end of an in-memory message carrier.
 type msgEnd struct {
-	in, out chan []byte
-	done    chan struct{}
-	once    *sync.Once
-	finish  []byte // replaces the second message written, if set
-	end     bool   // closes the carrier in place of the second message
-	n       int
+	in, out   chan []byte
+	done      chan struct{}
+	once      *sync.Once
+	finish    []byte // replaces the second message written, if set
+	n         int
+	end       bool // closes the carrier in place of the second message
+	readLimit bool
 }
 
 func msgPair() (a, b *msgEnd) {
@@ -111,9 +112,12 @@ func msgPair() (a, b *msgEnd) {
 	return &msgEnd{in: x, out: y, done: done, once: once}, &msgEnd{in: y, out: x, done: done, once: once}
 }
 
-func (m *msgEnd) ReadMessage(int) ([]byte, error) {
+func (m *msgEnd) ReadMessage(limit int) ([]byte, error) {
 	select {
 	case b := <-m.in:
+		if m.readLimit && len(b) > limit {
+			return nil, zmux.ErrMessageTooLarge
+		}
 		return b, nil
 	case <-m.done:
 		return nil, io.EOF
@@ -238,4 +242,66 @@ func (c *readCounter) Read(p []byte) (int, error) {
 	n, err := c.secureConn.Read(p)
 	c.n.Add(int64(n))
 	return n, err
+}
+
+func TestReplyFramingErrorIsNotNoReply(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		readLimit bool
+	}{
+		{name: "parser"},
+		{name: "bounded reader", readLimit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			a, b := msgPair()
+			a.readLimit = tc.readLimit
+			defer func() { _ = b.Close() }()
+			if err := b.WriteMessage(make([]byte, zmux.MaxRecordSize+1)); err != nil {
+				t.Fatal(err)
+			}
+			_, err := seal.Establish(t.Context(), a.pipe(), &f.client)
+			if !errors.Is(err, seal.ErrTooLarge) || errors.Is(err, seal.ErrNoReply) ||
+				errors.Is(err, zmux.ErrMessageTooLarge) != tc.readLimit {
+				t.Fatalf("oversized reply: %v", err)
+			}
+		})
+	}
+}
+
+func TestHelloFramingCauseReachesOnReject(t *testing.T) {
+	f := newFixture(t)
+	_, hello := helloVector(t, "bytes-after-hello")
+	got := make(chan zmux.RejectInfo, 1)
+	l, err := zmux.NewListener(&zmux.ListenerConfig{
+		WrapPipe: &f.server,
+		OnReject: func(i zmux.RejectInfo) zmux.RejectAction {
+			got <- i
+			return zmux.RejectClose
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	a, b := net.Pipe()
+	defer func() { _ = a.Close() }()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = l.HandlePipe(t.Context(), zmux.NetPipe(b), zmux.PipeHint{})
+	}()
+	_, err = a.Write(hello)
+	<-served
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case i := <-got:
+		if i.Reason != "trailing_bytes" || !errors.Is(i.Err, seal.ErrTrailing) {
+			t.Fatalf("OnReject info %+v", i)
+		}
+	default:
+		t.Fatal("no OnReject")
+	}
 }

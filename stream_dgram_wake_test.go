@@ -45,14 +45,14 @@ func bubblePair(t *testing.T, cfg func() *Config) (*Conn, *Conn) {
 // deadline, stops the receiving part, or the stream is discarded.
 func TestStreamDatagramReaderWakes(t *testing.T) {
 	cases := []struct {
-		name string
 		cut  func(st *Stream)
 		want func(err error) bool
+		name string
 	}{
-		{"deadline", func(st *Stream) { _ = st.SetReadDeadline(time.Unix(1, 0)) },
-			func(err error) bool { return errors.Is(err, os.ErrDeadlineExceeded) }},
-		{"cancel-read", func(st *Stream) { st.CancelRead(7) },
-			func(err error) bool { return errors.Is(err, io.EOF) }},
+		{name: "deadline", cut: func(st *Stream) { _ = st.SetReadDeadline(time.Unix(1, 0)) },
+			want: func(err error) bool { return errors.Is(err, os.ErrDeadlineExceeded) }},
+		{name: "cancel-read", cut: func(st *Stream) { st.CancelRead(7) },
+			want: func(err error) bool { return errors.Is(err, io.EOF) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

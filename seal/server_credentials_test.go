@@ -21,17 +21,19 @@ import (
 // fails with ErrNoReply.
 func TestServerCredentialDecisionsStayLocal(t *testing.T) {
 	missing := proto.KeyID{1}
+	revoked := errors.Join(errors.New("revoked"), seal.ErrAuth)
 	for _, c := range []struct {
-		name      string
 		anchor    seal.Anchor
+		detail    error
+		name      string
 		requirePQ bool
 		reject    bool // reaches OnReject and the statistics
 	}{
-		{"verifier rejection", credAnchor{err: errors.New("revoked")}, false, true},
-		{"verifier panic", panicAnchor{}, false, true},
-		{"proof missing", credAnchor{proof: &missing}, false, true},
-		{"post-quantum authentication required", credAnchor{}, true, true},
-		{"verifier unavailable", credAnchor{err: seal.ErrVerifyUnavailable}, false, false},
+		{name: "verifier rejection", anchor: credAnchor{err: revoked}, detail: revoked, requirePQ: false, reject: true},
+		{name: "verifier panic", anchor: panicAnchor{}, detail: seal.ErrVerifyRejected, requirePQ: false, reject: true},
+		{name: "proof missing", anchor: credAnchor{proof: &missing}, detail: seal.ErrProof, requirePQ: false, reject: true},
+		{name: "post-quantum authentication required", anchor: credAnchor{}, detail: seal.ErrPQAuthRequired, requirePQ: true, reject: true},
+		{name: "verifier unavailable", anchor: credAnchor{err: seal.ErrVerifyUnavailable}, requirePQ: false, reject: false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -74,7 +76,7 @@ func TestServerCredentialDecisionsStayLocal(t *testing.T) {
 			}
 			select {
 			case i := <-got:
-				if i.Reason == "" || i.Err == nil {
+				if i.Reason != "credentials_failed" || !errors.Is(i.Err, seal.ErrCredentialsFailed) || !errors.Is(i.Err, c.detail) {
 					t.Fatalf("OnReject info %+v", i)
 				}
 			default:
@@ -92,11 +94,11 @@ func TestServerCredentialDecisionsStayLocal(t *testing.T) {
 // ErrNoReply, not with a credentials failure.
 func TestRefusedClientGetsNoReply(t *testing.T) {
 	for _, c := range []struct {
-		name    string
 		corrupt func(*seal.ClientConfig)
+		name    string
 	}{
-		{"unknown handle", func(c *seal.ClientConfig) { c.Handle = []byte("nobody-knows-me!") }},
-		{"wrong pre-shared key", func(c *seal.ClientConfig) { c.PSK = make([]byte, 32) }},
+		{name: "unknown handle", corrupt: func(c *seal.ClientConfig) { c.Handle = []byte("nobody-knows-me!") }},
+		{name: "wrong pre-shared key", corrupt: func(c *seal.ClientConfig) { c.PSK = make([]byte, 32) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
