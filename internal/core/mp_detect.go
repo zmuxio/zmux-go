@@ -8,8 +8,8 @@ import (
 )
 
 // Failure detection and the path layer's timers: suspicion, failure, the
-// drain deadline and unilateral retirement. Every deadline is computed by mpTimers, which both
-// mpNextTimeout and mpHandleTimeout use.
+// drain deadline and unilateral retirement. Each attachment registers its
+// own absolute checks in the path clock.
 
 // pto is PTO_p (RFC 9002 6.2.1 with the peer's max_ack_delay).
 func (s *Session) pto(a *attach) Duration {
@@ -49,12 +49,29 @@ func (s *Session) setAhead(p *Pipe, snap aheadSnap) {
 	p.mp.unsentAhead, p.mp.queueD = snap.bytes, snap.delay
 }
 
+func (s *Session) stallCost(a *attach) Duration { return s.pto(a) + s.queueDelay(a) }
+
 func (s *Session) tSuspect(a *attach) Duration {
 	f, _ := s.deadParams(a)
-	return maxD(f, 2*(s.pto(a)+s.queueDelay(a)))
+	return maxD(f, MulD(s.stallCost(a), 2))
 }
 
-func (s *Session) tFail(a *attach) Duration { return maxD(2*Second, 8*(s.pto(a)+s.queueDelay(a))) }
+func (s *Session) tFail(a *attach) Duration {
+	f, _ := s.deadParams(a)
+	return failLimit(s.stallCost(a), f)
+}
+
+func (s *Session) suspectFail(a *attach) Duration {
+	f := a.suspFloor
+	if !a.suspHeld {
+		f, _ = s.deadParams(a)
+	}
+	return failLimit(s.stallCost(a), f)
+}
+
+func failLimit(d, floor Duration) Duration {
+	return max(floor, 2*Second, MulD(d, 8))
+}
 
 // deadParams are the SuspectFloor and DeadTimeout (0: derived, negative:
 // off) of a: the pipe's own; else off on a carrier that reports its own
@@ -93,7 +110,7 @@ func (s *Session) tDead(a *attach) Duration {
 	if !a.suspHeld {
 		f, dt = s.deadParams(a)
 	}
-	return s.deadLimit(s.pto(a)+s.queueDelay(a), f, dt)
+	return s.deadLimit(s.stallCost(a), f, dt)
 }
 
 // deadLimit is T_dead for PTO + queue d, suspect floor
@@ -103,7 +120,7 @@ func (s *Session) deadLimit(d, f, dt Duration) Duration {
 		return math.MaxInt64
 	}
 	if dt == 0 {
-		dt = maxD(2*Second, 8*d) // T_fail
+		dt = failLimit(d, f)
 		if !s.feat.Resume {
 			idle := s.idleTimeout()
 			if idle == 0 {
@@ -112,7 +129,7 @@ func (s *Session) deadLimit(d, f, dt Duration) Duration {
 			dt = maxD(dt, idle/2)
 		}
 	}
-	return maxD(maxD(f, 2*d), dt)
+	return maxD(maxD(f, MulD(d, 2)), dt)
 }
 
 // lastInDead is the T_dead that bounds the silence of the last live
@@ -120,16 +137,10 @@ func (s *Session) deadLimit(d, f, dt Duration) Duration {
 // largest PTO of the live outbound pipes, or the initial values when there
 // are none, under a's SuspectFloor and DeadTimeout (off: no limit).
 func (s *Session) lastInDead(a *attach) Duration {
-	var d Duration
-	for _, p := range s.pipes {
-		if p.mp != nil && !p.mp.retired && p.out != nil && p.mp.liveOut() {
-			d = maxD(d, s.pto(p.mp))
-		}
-	}
-	if d == 0 {
-		var a attach
-		a.rtt.smoothed, a.rtt.rttvar = 333*Millisecond, 166*Millisecond
-		d = s.pto(&a)
+	d := s.maxPTO()
+	if s.mp.clock.ptos.Next() == Never {
+		initial := attach{rtt: rttEst{smoothed: 333 * Millisecond, rttvar: 166 * Millisecond}}
+		d = s.pto(&initial)
 	}
 	f, dt := s.deadParams(a)
 	return s.deadLimit(d, f, dt)
@@ -165,7 +176,10 @@ func (s *Session) probeHold(p *Pipe) Duration {
 	if s.shp == nil || ps == nil || ps.sh == nil || ps.caps&shaping.CapPlan == 0 || s.shp.eff.NoPause {
 		return 0
 	}
-	return max(Duration(s.shp.eff.MaxDelay), 0)
+	if p := s.shp.eff.Profile; p != nil {
+		return Duration(p.MaxAddedDelay)
+	}
+	return 0
 }
 
 // probeWait is the current wait of p's idle-pipe probe: k_eff = max(1 s,
@@ -254,239 +268,89 @@ func (s *Session) writeStall(p *Pipe) (Time, bool) {
 	return t, ok
 }
 
-func (s *Session) otherActive(p *Pipe) bool {
-	for _, q := range s.pipes {
-		if q != p && q.mp != nil && q.out != nil && q.mp.out == OutActive {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *Session) hasLiveInbound() bool {
 	_, in := s.liveCounts()
 	return in > 0
 }
 
-// mpTimers evaluates every path-layer deadline; with apply it acts on the
-// due ones. It returns the earliest pending deadline.
-func (s *Session) mpTimers(now Time, apply bool) Time {
+func (s *Session) setMultipathDeadlines(d *deadlineSlots, withKeys bool) {
 	m := s.mp
-	next := Never
-	at := func(t Time) bool {
-		if now >= t {
-			return true
-		}
-		next = minT(next, t)
-		return false
+	s.refreshRelativeStalls(s.now)
+	d.path, d.epoch = minT(m.clock.due.Next(), m.clock.relativeCheck()), s.epochDeadline()
+	if withKeys {
+		d.pathKey = m.clock.due.Peek()
 	}
-	// due is at for a deadline whose processing changes a pipe's state:
-	// one already passed but not yet processed stays pending, so that a
-	// driver that asks for the next deadline between the moment it passed
-	// and the timer pass still arms a timer for it.
-	due := func(t Time) bool {
-		if !at(t) {
-			return false
-		}
-		if !apply {
-			next = minT(next, t)
-		}
-		return true
+	d.advice, d.prefix = s.pathQualityTimers(s.now, false), s.prefixTimers(s.now, false)
+	if m.backoffUntil != 0 {
+		d.backoff = m.backoffUntil
 	}
-	s.epochTimers(apply, due)
-	next = minT(next, s.pathQualityTimers(now, apply))
-	next = minT(next, s.prefixTimers(now, apply))
-	liveIn := s.hasLiveInbound()
-	for i := 0; i < len(s.pipes); i++ { //nolint:intrange // failing a pipe may shrink s.pipes; the bound is re-read
-		p := s.pipes[i]
-		a := p.mp
-		if a == nil || a.retired {
-			continue
-		}
-		// The join deadline runs until the peer proves attachment, even
-		// after the handshake has opened the directions.
-		if a.joinerLocal && a.peer == peerPending && a.joinDeadline != 0 && due(a.joinDeadline) && apply {
-			s.abortUnconfirmed(p, ErrJoinTimeout)
-			continue
-		}
-		ws, wstall := s.writeStall(p)
-		if p.out != nil && a.liveOut() && (a.unacked && liveIn || wstall) {
-			stall := a.tref()
-			if wstall && (!a.unacked || !liveIn || ws < stall) {
-				stall = ws
-			}
-			switch a.out {
-			case OutActive:
-				if due(stall.Add(s.tSuspect(a))) && apply {
-					s.makeSuspect(p)
-				}
-			case OutSuspect:
-				if s.stallDeathOff(a) {
-					break
-				}
-				lim := s.tDead(a)
-				if s.otherActive(p) {
-					lim = s.tFail(a)
-				}
-				if due(stall.Add(lim)) && apply {
-					s.failPipe(p, 0x296a5bf5, nil)
-					continue
-				}
-			case OutDraining:
-				if !a.drainSuspect && due(stall.Add(s.tSuspect(a))) && apply {
-					a.drainSuspect = true
-					s.reinjectPipe(p)
-				}
-			case OutJoining, OutNone, OutFailed, OutClosed, OutRetired:
-				// An unconfirmed join fails at the join timeout above, and
-				// the peer's join is not supervised before it is confirmed;
-				// liveOut excludes the others.
-			}
-		}
-		if a.out == OutDraining && due(a.drainStart.Add(s.tFail(a))) && apply {
-			s.failPipe(p, 0x296a5bf5, nil)
-			continue
-		}
-		// The end of a reinjection hold: the re-sends it held back may go,
-		// with or without the PIPE_ACK that would have ended it sooner.
-		if a.held1 && due(a.holdUntil) && apply {
-			a.held1 = false
-			s.wakePrefix()
-			s.wakeAllWriters()
-		}
-		// Idle-pipe probe.
-		if p.out != nil && (a.out == OutActive || a.out == OutSuspect) && !a.unacked && !a.needPing {
-			iv := s.probeWait(p)
-			if sp := s.cfg.StandbyProbe; sp > 0 && now < m.busyUntil && s.backup(p) && (iv == 0 || sp < iv) {
-				iv = sp
-			}
-			if iv > 0 {
-				ref := max(a.liveAt, a.lastElicit)
-				if due(ref.Add(iv)) && apply {
-					a.needPing = true
-					a.pingSince = now
-					s.wakeAllWriters()
-				}
-			}
-		}
-		// Unilateral retirement.
-		if a.abandonAcked && !a.abandonRecv && !a.unilateral {
-			if due(a.ackedAbandonAt.Add(maxD(2*Second, 3*s.maxPTO()))) && apply {
-				a.unilateral = true
-				s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
-				if p.out != nil && a.out != OutFailed {
-					a.out = OutClosed
-				}
-				if p.in != nil {
-					a.in = InEnded
-				}
-				s.maybeRetire(p)
-				continue
-			}
-		}
-		// Linger after a completed PIPE_ABANDON exchange.
-		if a.lingering && a.in == InOpen && due(a.lingerUntil) && apply {
-			a.in = InEnded
-			s.act(Action{Kind: ActClose, Pipe: p.id, Dir: DirIn})
-			s.maybeRetire(p)
-			continue
-		}
-		// Inbound silence of an attachment without a local outbound
-		// direction.
-		if p.out == nil && a.in == InOpen {
-			_, nIn := s.liveCounts()
-			lim := 15*Second + Duration(nIn)*Second/8 + maxD(2*Second, maxD(2*s.srttMaxOut(), a.maxGap-15*Second))
-			if nIn <= 1 {
-				// Losing it leaves no live inbound pipe: the patience of
-				// a stalled last outbound pipe.
-				lim = maxD(lim, s.lastInDead(a))
-			}
-			if due(a.lastRecord.Add(lim)) && apply {
-				s.failPipe(p, 0x296a5bf5, nil)
-				continue
-			}
+	if m.redundantPending {
+		d.redundant = m.redundantAt
+	}
+	if len(m.clock.ping) != 0 {
+		if next := m.pingNext(); next > s.now {
+			d.ping = next
 		}
 	}
-	if m.backoffUntil > now {
-		next = minT(next, m.backoffUntil)
-	} else if apply && m.backoffUntil != 0 {
+	if m.pickTimer {
+		d.pick = m.pickDeadline
+	}
+	if m.tierAt != 0 {
+		d.tier = m.tierAt
+	}
+}
+
+// mpHandleTimeout runs the session's due groups and consumes the indexed
+// attachment reasons, including deadlines advanced by a path transition.
+func (s *Session) mpHandleTimeout(now Time) {
+	s.SetNow(now)
+	now = s.now
+	m := s.mp
+	if s.epochDeadline() <= now {
+		s.epochProgress()
+	}
+	s.pathQualityTimers(now, true)
+	s.expirePathDeadlines(now)
+	s.prefixTimers(now, true)
+	if m.backoffUntil != 0 && m.backoffUntil <= now {
 		m.backoffUntil = 0
 		s.wakeAllWriters()
 		s.joinHoldChanged()
 	}
-	// Redundant snapshot copy.
-	if m.ackChanged && at(m.redundantAt) && apply {
+	if m.redundantPending && now >= m.redundantAt {
+		m.redundantPending = false
 		s.wakeAllWriters()
 	}
-	// PIPE_PING rate limit.
-	for _, p := range s.pipes {
-		if p.mp != nil && p.mp.needPing {
-			if t := m.pingNext(); t > now {
-				next = minT(next, t)
-			} else if apply {
-				s.wakeAllWriters()
-			}
-			break
+	if len(m.clock.ping) != 0 && m.pingAllowed(now) {
+		for _, p := range m.clock.ping {
+			s.wakePipe(p)
 		}
 	}
-	if m.pickTimer {
-		if at(m.pickDeadline) && apply {
-			m.pickTimer = false
-			s.wakeAllWriters()
-		}
+	if m.pickTimer && m.pickDeadline <= now {
+		m.pickTimer = false
+		s.wakeAllWriters()
 	}
-	next = minT(next, s.probationTimers(now, apply))
-	if apply {
-		s.refreshTiers()
+	if m.tierAt != 0 && m.tierAt <= now {
+		m.tierAt = 0
+		s.refreshTierPlacement()
 		if len(m.tierSince) > 1 {
 			s.wakeAllWriters()
 		}
 	}
-	next = minT(next, s.tierDeadline())
-	return next
 }
 
 func (s *Session) maxPTO() Duration {
-	var m Duration
-	for _, p := range s.pipes {
-		if p.mp != nil && p.out != nil && p.mp.liveOut() {
-			m = maxD(m, s.pto(p.mp))
-		}
+	if at := s.mp.clock.ptos.Next(); at != Never {
+		return -Duration(at)
 	}
-	if m == 0 {
-		m = 333*Millisecond + 4*166*Millisecond + 25*Millisecond
-	}
-	return m
+	return 333*Millisecond + 4*166*Millisecond + 25*Millisecond
 }
 
 func (s *Session) srttMaxOut() Duration {
-	var m Duration
-	for _, p := range s.pipes {
-		if p.mp != nil && p.out != nil && p.mp.liveOut() {
-			m = maxD(m, p.mp.rtt.smoothed)
-		}
+	if at := s.mp.clock.rtts.Next(); at != Never && at < 0 {
+		return -Duration(at)
 	}
-	if m == 0 {
-		m = 333 * Millisecond
-	}
-	return m
-}
-
-func (s *Session) mpNextTimeout() Time { return s.mpTimers(s.now, false) }
-
-// mpHandleTimeout acts on the due deadlines. A pipe state change in a pass
-// can make other deadlines due at once (a failure turns another pipe's
-// limit into T_dead, a suspicion whose T_dead equals T_suspect); those are
-// no longer pending for mpNextTimeout, so passes repeat until one changes
-// no pipe state.
-func (s *Session) mpHandleTimeout(now Time) {
-	for range 16 {
-		g := s.mp.stateGen
-		s.mpTimers(now, true)
-		if s.mp == nil || s.mp.stateGen == g {
-			return
-		}
-	}
+	return 333 * Millisecond
 }
 
 // ---- suspension ----
@@ -501,8 +365,17 @@ func (s *Session) suspend(cause error) {
 	s.joinHoldChanged()
 	s.suspendedAt = s.now
 	s.stats.Suspensions++
-	s.timers.grace = s.now.Add(s.graceDur())
-	s.emit(Event{Kind: EvSuspended})
+	grace := s.graceDur()
+	s.timers.grace = s.now.Add(grace)
+	s.emit(Event{Kind: EvSuspended, At: s.now, Wait: grace})
+}
+
+// RecoveryGraceDeadline returns the active suspension cutoff, or Never.
+func (s *Session) RecoveryGraceDeadline() Time {
+	if s.state == StateSuspended {
+		return s.timers.grace
+	}
+	return Never
 }
 
 // lastPipeErr is the error of the pipe loss that suspended the session.
@@ -550,7 +423,7 @@ func (s *Session) checkResumed() {
 		s.state = StateDraining
 	}
 	s.timers.grace = Never
-	s.timers.lastActivity = s.now
+	s.noteActivity(s.now)
 	s.emit(Event{Kind: EvResumed})
 	s.epochResumed()
 	s.wakeAllWriters()

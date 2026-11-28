@@ -137,6 +137,8 @@ func (s *Session) reportPathQuality(p *Pipe, reason PathQualityReason) {
 		return
 	}
 	q.advice = reason
+	q.generation++
+	s.NotifyCapacity()
 	var retry Duration
 	if reason == PathQualityHealthySibling || reason == PathQualityLocalStall {
 		retry = s.qualityBackoff(p)

@@ -1,14 +1,11 @@
 package zmux
 
 import (
-	"context"
 	"crypto/rand"
 	"fmt"
 	"log/slog"
 	"math"
 	"time"
-
-	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
@@ -38,9 +35,8 @@ const (
 	DefaultFirstRecordTimeout = time.Duration(core.DefaultFirstRecordTimeout)
 	// DefaultJoinTimeout is the default Config.JoinTimeout.
 	DefaultJoinTimeout = time.Duration(core.DefaultHandshakeTimeout)
-	// DefaultMinBackoff is the default Backoff.Min, the first wait of the
-	// redial backoff of the Redial hook (Config.RedialBackoff) and of each
-	// pool (PipePool.Backoff); each wait doubles up to the maximum.
+	// DefaultMinBackoff is the first wait for ordinary retries.
+	// Each wait doubles up to DefaultMaxBackoff.
 	DefaultMinBackoff = time.Second
 	// DefaultMaxBackoff is the default Backoff.Max, the longest wait.
 	DefaultMaxBackoff = 60 * time.Second
@@ -69,12 +65,84 @@ const DefaultMaxRecordSize = wire.DefaultMaxRecordSize
 // (ErrInvalidConfig) otherwise, and a Switch turns off a feature that is on
 // by default. A value out of range is an error, never corrected.
 type Config struct {
+	// DatagramLimiter polices datagrams in each direction: a datagram
+	// passes when TryAcquire(n, n) grants its payload of n bytes (refunded
+	// when it is then not queued); otherwise it is dropped and counted.
+	DatagramLimiter DatagramLimiter
+	// Scheduler is the session's send policy (nil: SchedulerAffinity).
+	Scheduler Scheduler
+	// ReceiveScheduler is a local preference for the receive direction
+	// (nil: SchedulerAffinity). The peer chooses how it sends.
+	ReceiveScheduler Scheduler
+	// CarrierCredential is presented on the carrier of a client session by the
+	// functions that open one with this Config: Client, Dial and DialTLS
+	// and the dialers of zmuxquic, zmuxws and zmuxh3 (nil: none). Pipes
+	// opened otherwise, for explicit Join, present theirs where they
+	// are dialed (PresentPipe, the adapters' options).
+	CarrierCredential CarrierCredential
+	// Shaping is the initial direction policy, or nil to disable shaping.
+	Shaping *ShapingPolicy
+	// RecordPolicy chooses the record mode of each carrier this endpoint joins; nil is
+	// always Sealed. PipeOptions.RecordMode wins over it.
+	RecordPolicy RecordPolicy
+	// AllowRecordMode is the acceptor's check of a Hello's mode; nil passes only Sealed.
+	AllowRecordMode AllowRecordMode
+	// JoinOutcome reports each authorized incoming join and each outgoing
+	// carrier exactly once. A nil error means peer attachment. Calls can
+	// overlap and run outside session locks on goroutines independent of
+	// Conn.Wait. NextEvent and HandleEvents release a successful pipe's
+	// events after its hook returns. Tracer may deliver earlier and drop
+	// events. A hook can close and wait for its session. Draining its own
+	// held event keys requires returning from the hook first.
+	JoinOutcome func(c *Conn, pipe PipeID, err error)
+	// Tracer receives session events on a goroutine of its own, through a
+	// backlog of 256 events per session that is not configurable.
+	Tracer *Tracer
+	// Logger receives what the application would otherwise not see: a
+	// warning when the last pipe of a direction is removed while streams
+	// are open, a warning with EventResumeUnattended, and the failures of
+	// host callbacks that zmux contains (a panic in a hook), and the pool
+	// policy decisions rejected without a DecisionRejected callback. It is called
+	// outside every lock and must not block; nil logs nothing. What the
+	// events and the Tracer report is not logged again.
+	Logger *slog.Logger
+	// AllowConnectionWindowIncrease approves session window growth.
+	AllowConnectionWindowIncrease func(delta uint64) bool
+	// ClockDomain selects the session clock and its sharing identity. The
+	// process default uses the host's monotonic clock.
+	ClockDomain *ClockDomain
+	// ShapingLimits are the application's bounds on shaping; an account field
+	// above its maximum is invalid.
+	ShapingLimits shaping.Limits
+	// PipeAuth configures the source of the session secret. Multipath
+	// (SteadyAttachments above one) and resume need one: a PSK, a deferred PSK or the
+	// exporter; on a secure first pipe the secure carrier is the source and
+	// PipeAuth sets none of them. Without a source Start fails with
+	// ErrInvalidConfig before a byte is written. A source is never dropped
+	// because the peer did not offer it: flags that differ close the
+	// session.
+	PipeAuth PipeAuth
+	// EarlyData enables early data: stream data before the peer's
+	// transport parameters arrive.
+	EarlyData EarlyData
+	// DatagramDefaults are the outgoing session defaults for each Flow.
+	DatagramDefaults DatagramSendOptions
+	// SessionPolicy is the initial capacity and authorization policy.
+	SessionPolicy SessionPolicy
+	// Liveness are the keep-alive, failure detection and probe settings
+	// of the session and the defaults of its pipes; Conn.SetLiveness
+	// replaces them while the session runs.
+	Liveness Liveness
+	// SchedulerParams tune the scheduler and failure detection.
+	SchedulerParams SchedulerParams
+	Accounting      AccountingPolicy
+	StabilityPolicy StabilityPolicy
 	// HandshakeTimeout bounds establishment: the peer's transport
 	// parameters must arrive within it. Zero is 10 s; a negative value is
 	// no timeout. It does not bound joins (JoinTimeout).
 	HandshakeTimeout time.Duration
 	// JoinTimeout is the deadline of every join: a pipe this endpoint adds
-	// (AddPipe without a context deadline, Redial, PipePool), a pipe or
+	// (a Join without a context deadline), a pipe or
 	// lane the peer adds until it is confirmed, a join held for the join
 	// keys and a carrier stalled after a rejected join. Zero is
 	// DefaultJoinTimeout (10 s); it cannot be no timeout, so a negative
@@ -90,27 +158,12 @@ type Config struct {
 	// (EpochAfterResume). Zero EpochPeriod and EpochJoins are the defaults,
 	// every hour and every 65536 joins; a negative one turns that trigger
 	// off. The two switches are on by default; SwitchOff turns theirs off.
-	EpochPeriod         time.Duration
-	EpochJoins          int
-	EpochAfterFirstPipe Switch
-	EpochAfterResume    Switch
-	// EnableDatagrams announces max_datagram_frame_size and datagram flows.
-	EnableDatagrams bool
-	// ShapingPreciseTimer meets shaping deadlines in place: the session's
-	// timer is armed ahead by the host timer's observed lateness, at most
-	// 2 ms, and its callback yields in a loop until the deadline, which costs
-	// CPU time up to that lead on one goroutine per deadline. Off: deadlines
-	// are met as the host timer allows.
-	ShapingPreciseTimer bool
+	EpochPeriod time.Duration
+	EpochJoins  int
 	// MaxIdleTimeout is max_idle_timeout, the time without inbound
 	// activity after which the session closes. Zero is 30 s; a negative
 	// value announces no idle timeout; a positive one is at least 1 ms.
 	MaxIdleTimeout time.Duration
-	// Liveness are the keep-alive, failure detection and probe settings
-	// of the session and the defaults of its pipes; Conn.SetLiveness
-	// replaces them while the session runs.
-	Liveness Liveness
-
 	// InitialStreamReceiveWindow is the initial receive window of a
 	// stream, in bytes. Zero is 256 KiB; otherwise at least 4 KiB; a
 	// negative value is invalid.
@@ -130,9 +183,10 @@ type Config struct {
 	// is automatic: a 96 MiB floor; a negative value is invalid.
 	MaxConnectionReceiveWindow int64
 	// MemoryBudget bounds the memory of a session without a listener, in
-	// bytes. Zero is 1 GiB; a negative value is unlimited.
+	// bytes. It includes reserved receive credit and in-flight I/O. Zero
+	// is 1 GiB; a negative value is unlimited. The initial window may be
+	// reduced to fit. Establishment fails if 16 KiB cannot be granted.
 	MemoryBudget int64
-
 	// MaxIncomingStreams is initial_max_streams_bidi, the bidirectional
 	// streams the peer may open at first. Zero is 256; a negative value
 	// grants none; otherwise at least 4 and at most MaxStreamCredit.
@@ -141,14 +195,24 @@ type Config struct {
 	// credit: 16, raised to 256 on the first AcceptUniStream or HandleUniStreams; a negative
 	// value grants none; otherwise at most MaxStreamCredit.
 	MaxIncomingUniStreams int64
-
 	// DatagramSendQueue, DatagramReceiveQueue, DatagramStreamQueue (per
 	// stream) and DatagramReceiveBytes size the datagram queues. Zero is
 	// 64, 128, 32 and 1 MiB (an empty queue would drop every datagram); a
 	// negative value is invalid. DatagramReceiveBytes bounds the session
 	// queue and the datagrams held for streams not opened yet, not the
 	// stream queues.
-	DatagramSendQueue    int
+	DatagramSendQueue int
+	// DatagramFrameSize caps the encoded incoming DATAGRAM frame. Zero
+	// uses the default. It applies when EnableDatagrams is set.
+	DatagramFrameSize int
+	// DatagramWindow is the receive deduplication window. Zero selects 1024.
+	DatagramWindow int
+	// DatagramCopyLimit caps the total sends of an original datagram, including
+	// replicas. Zero uses the configured default of two. One disables replicas.
+	DatagramCopyLimit int
+	// CopyBudgetPercent sets the outgoing discretionary replica budget rate.
+	// The default is 20. Explicit zero disables extra copies.
+	CopyBudgetPercent    Change[int]
 	DatagramReceiveQueue int
 	DatagramStreamQueue  int
 	DatagramReceiveBytes int64
@@ -171,7 +235,10 @@ type Config struct {
 	// bounds stay as memory bounds. Zero is 20 ms; a negative value turns
 	// the delay bound off.
 	DatagramQueueDelay time.Duration
-
+	// ReceiveLoanBudget bounds backing bytes retained by ReadChunk and
+	// writes forwarded from it. Zero uses 8 MiB. Ordinary Read does not
+	// reserve loan budget.
+	ReceiveLoanBudget int64
 	// SendBuffer starts the written-but-unreleased byte budget, in bytes.
 	// Zero is 4 MiB; a negative value is invalid. Multipath sessions grow
 	// it to the retransmit budget, within SendBufferMax.
@@ -180,141 +247,32 @@ type Config struct {
 	// SendBuffer (or its default), or a negative one, is invalid. Zero is
 	// automatic: a 64 MiB floor, above it within the memory budget.
 	SendBufferMax int64
-
-	// MaxPipes is the attachments this endpoint aims for. Zero or 1 is
-	// multipath off; 8 is recommended when multipath is used.
-	MaxPipes int
-	// PipeHeadroom is H of the attachment cap. Zero is 8.
-	PipeHeadroom int
-	// ReplayWindow is W, the join replay window. Zero is
-	// max(64, 2*(MaxPipes+H)); a window below MaxPipes+H is invalid.
-	ReplayWindow int
 	// MaxLanes is the lanes accepted per inbound pipe. Zero is
 	// DefaultMaxLanes (258); 1
 	// accepts the stream lane only.
 	MaxLanes int
-
 	// ResumeTimeout enables resume with this grace period, at least 1 ms
 	// (a fraction of a millisecond is rounded up). Zero is no resume; a
 	// negative value is invalid. Resume needs a secret source (PipeAuth),
-	// and a server session a Listener; a client should have a redial
-	// source (Redial or MaintainPipes).
+	// and a server session a Listener. The client can restore coverage with
+	// a session controller or an explicit capacity change.
 	ResumeTimeout time.Duration
-
-	// Scheduler is the session's scheduling policy (nil: SchedulerAffinity).
-	Scheduler Scheduler
-	// SchedulerParams tune the scheduler and failure detection.
-	SchedulerParams SchedulerParams
-	// ShapingLimits are the application's bounds on shaping; an account field
-	// above its maximum is invalid.
-	ShapingLimits shaping.Limits
-	// ShapingBudget gives the shaping configuration's budget, called once per
-	// session outside every lock; nil: none. It cannot widen ShapingLimits.
-	ShapingBudget func() shaping.Budget
-	// HandshakeShaper is asked for the plan of each Join message this session
-	// writes; nil: none.
-	HandshakeShaper shaping.HandshakeShaper
-	// Shaper is installed when the session is created, as by SetShaper
-	// (nil: no shaping): every outbound pipe of the session, the
-	// bootstrap pipe of an accepted session and joined pipes included, is
-	// shaped from its first record. SetShaper replaces it.
-	Shaper ShaperFactory
-
-	// PipeAuth configures the source of the session secret. Multipath
-	// (MaxPipes above 1) and resume need one: a PSK, a deferred PSK or the
-	// exporter; on a secure first pipe the secure carrier is the source and
-	// PipeAuth sets none of them. Without a source Start fails with
-	// ErrInvalidConfig before a byte is written. A source is never dropped
-	// because the peer did not offer it: flags that differ close the
-	// session.
-	PipeAuth PipeAuth
-	// RecordPolicy chooses the record mode of each carrier this endpoint joins; nil is
-	// always Sealed. PipeOptions.RecordMode wins over it.
-	RecordPolicy RecordPolicy
-	// AllowRecordMode is the acceptor's check of a Hello's mode; nil passes only Sealed.
-	AllowRecordMode AllowRecordMode
-	// AuthorizeJoin is an acceptor's further check of a join; nil passes all.
-	AuthorizeJoin func(c *Conn, pipe PipeID) bool
-	// JoinOutcome reports each authorized incoming join and each outgoing
-	// carrier exactly once. A nil error means peer attachment. Calls can
-	// overlap and run outside session locks on goroutines independent of
-	// Conn.Wait. NextEvent and HandleEvents release a successful pipe's
-	// events after its hook returns. Tracer may deliver earlier and drop
-	// events. A hook can close and wait for its session. Draining its own
-	// held event keys requires returning from the hook first.
-	JoinOutcome func(c *Conn, pipe PipeID, err error)
 	// JoinEarlyHello is the size of a Hello's first batch in bytes: 0 takes
 	// 8 KiB; a negative value sends no first batch. Larger batches outgrow
 	// the first congestion window and delay both the Hello and the Reply.
 	JoinEarlyHello int
-
-	// EarlyData enables early data: stream data before the peer's
-	// transport parameters arrive.
-	EarlyData EarlyData
-
-	// DatagramLimiter polices datagrams in each direction: a datagram
-	// passes when TryAcquire(n, n) grants its payload of n bytes (refunded
-	// when it is then not queued); otherwise it is dropped and counted.
-	DatagramLimiter DatagramLimiter
-
-	// Tracer receives session events on a goroutine of its own, through a
-	// backlog of 256 events per session that is not configurable.
-	Tracer *Tracer
-	// Logger receives what the application would otherwise not see: a
-	// warning when the last pipe of a direction is removed while streams
-	// are open, a warning with EventResumeUnattended, and the failures of
-	// host callbacks that zmux contains (a panic in a hook), and the pool
-	// policy decisions rejected without a DecisionRejected callback. It is called
-	// outside every lock and must not block; nil logs nothing. What the
-	// events and the Tracer report is not logged again.
-	Logger *slog.Logger
-	// CarrierCredential is presented on the carrier of a client session by the
-	// functions that open one with this Config: Client, Dial and DialTLS
-	// and the dialers of zmuxquic, zmuxws and zmuxh3 (nil: none). Pipes
-	// opened otherwise, for AddPipe or Redial, present theirs where they
-	// are dialed (PresentPipe, the adapters' options).
-	CarrierCredential CarrierCredential
-	// Redial re-establishes pipes after failures (resume): it is called
-	// as soon as the session lacks a direction or suspends, delayed only
-	// by the redial backoff since its previous call and the join refusal
-	// backoff a refused join started (the longer
-	// of the two). It keeps one pipe per direction; a session that keeps
-	// several pipes is maintained with Conn.MaintainPipes and a PipePool,
-	// which also replaces failed pipes, and leaves Redial nil.
-	// A host can explicitly request one advised replacement with
-	// Conn.RequestPipeReplacement. It uses the same callback with its
-	// own backoff history. An outage cancels a pending replacement and
-	// can call Redial and RedialPolicy while the replacement unwinds.
-	Redial func(ctx context.Context, need Direction) (PipeIO, error)
-	// RedialBackoff is the backoff of Redial: after a failed call the wait,
-	// counted from the start of the previous call, starts at Min and
-	// doubles up to Max, each wait reduced by a random fraction of up to
-	// Jitter. The zero value is the default (1 s, 60 s, 0.2). The pools of
-	// MaintainPipes follow the same rule with state of their own
-	// (PipePool.Backoff).
-	RedialBackoff Backoff
-	// RedialPolicy, when set, is asked before each Redial call; DialAfter
-	// is the wait from the previous call to the next (at most
-	// RedialBackoff.Max; 0: the backoff), and Liveness applies to the pipe a
-	// call yields. Count and Retire are not used. A
-	// Decide that returns an error or panics, or a decision that fails
-	// PoolDecision.Validate, is rejected: the call goes ahead as with the
-	// zero decision and the error is reported to DecisionRejected.
-	RedialPolicy PoolPolicy
-	// DecisionRejected, when set, receives the error of each look of
-	// RedialPolicy the session rejected, on the goroutine that calls Redial and outside every lock;
-	// it must not block, and a panic in it is contained. Unset, the error
-	// is logged to Logger. Redialling goes on either way.
-	DecisionRejected func(err error)
-	// AllowConnectionWindowIncrease approves session window growth.
-	AllowConnectionWindowIncrease func(delta uint64) bool
-	// Clock is the session's time source (nil: the host's monotonic
-	// clock): every session timer (handshake, idle, keep-alive, probes,
-	// resume grace, retransmission, shaping and pacing), the RTT and rate
-	// estimates, stream deadlines and the Redial and PipePool waits run on
-	// it, so a fake clock drives them deterministically. What stays on
-	// the host clock is listed in the package documentation (Time).
-	Clock timeshim.Clock
+	// ReturnBeforeEstablished returns the bootstrap handle while current peer parameters are pending.
+	ReturnBeforeEstablished bool
+	EpochAfterFirstPipe     Switch
+	EpochAfterResume        Switch
+	// EnableDatagrams announces max_datagram_frame_size for incoming datagrams.
+	EnableDatagrams bool
+	// ShapingPreciseTimer meets shaping deadlines in place: the session's
+	// timer is armed ahead by the host timer's observed lateness, at most
+	// 2 ms, and its callback yields in a loop until the deadline, which costs
+	// CPU time up to that lead on one goroutine per deadline. Off: deadlines
+	// are met as the host timer allows.
+	ShapingPreciseTimer bool
 }
 
 // DatagramLimiter holds the limiters of the two datagram directions.
@@ -340,69 +298,19 @@ type SchedulerParams struct {
 	Redundancy Switch
 }
 
-// EarlyData lets a client send stream data before the server's transport
-// parameters arrive. With either form, Start, Client and
-// Dial return at once and ConnectionState().Established stays false until
-// the parameters arrive.
-//
-// ZmuxPeer: the client knows the server is a zmux endpoint and writes its
-// first streams on the bootstrap carrier right away, within the floor
-// values every zmux endpoint grants. Nothing is replayable, unless the
-// carrier itself sends early data (its W half is an EarlyClientCarrier
-// whose SendsEarlyData is true, such as a transform whose first message
-// carries the first flight; not QUIC without 0-RTT): the
-// streams then travel in it, wait for its verdict and are sent again after
-// a rejection, as with Remembered below, and the client consents to replay
-// with Replayable (else Start fails with ErrInvalidConfig).
-//
-// Replayable with Remembered: the client sends its first streams in the
-// carrier's own early data (QUIC 0-RTT through zmuxquic.Dial), under the
-// parameters remembered from an earlier session with the same server
-// (Conn.RememberedParameters). When the carrier refuses its early data,
-// the session sends those streams again after the handshake, without
-// telling the application. Carrier early data can be replayed by an
-// attacker, so the server sets Replayable as well: its streams that
-// arrived in early data then report Stream.Replayable, and a server that
-// must not act on a replayed request calls Stream.Reject on it; the client
-// gets a *StreamError for which IsRetryable is true, and opens the stream
-// again on the same session.
-//
-// When the server cannot take the early data at all (it is not a zmux
-// endpoint, or it grants no bidirectional stream), it processes none of it
-// and the session ends with *EarlyDataRejectedError: every call on the
-// session and its streams that is waiting or comes later (Read, Write,
-// AcceptStream, Wait, ...) returns it. errors.Is(err, ErrEarlyDataRejected)
-// and IsRetryable report it; retry on a new session without EarlyData,
-// since the cause persists. Remembered parameters above what the server
-// grants now end the session with a *TransportError
-// (TransportParameterError) instead: forget them.
+// EarlyData permits STREAM frames in a carrier's plain QMux-02 resumption
+// context, under the remembered parameters of that context.
 type EarlyData struct {
-	// Remembered are the peer's parameters from an earlier session, as
-	// Conn.RememberedParameters returned them (client only). Store them per
-	// server and only with the application's consent.
+	// Remembered are parameters for this specific plain QMux resumption
+	// context. A remembered zmux block cannot authorize early data.
 	Remembered []byte
-	// ZmuxPeer declares the peer a zmux endpoint (client only; with
-	// RoleAuto, where no side is the client, it is invalid).
-	ZmuxPeer bool
-	// Replayable allows carrier early data, which the peer may see
-	// replayed (TLS 1.3, QUIC 0-RTT, a transform's first flight): on a
-	// client with Remembered, or with ZmuxPeer on a carrier with early
-	// data; on a server to accept it and mark its streams.
+	// PlainQMux declares that the carrier's resumption context is bound to
+	// plain QMux. Set it only when the carrier can prove that binding.
+	PlainQMux bool
+	// Replayable permits carrier early data to be replayed.
 	Replayable bool
-	// HoldFirstFlight keeps the bootstrap pipe's first carrier write until
-	// Conn.ReleaseFirstFlight, or until Config.HandshakeTimeout has passed
-	// since Start (ConnectionStats.FirstFlightTimeouts); the handshake
-	// timeout runs from the release. Streams opened and written before the
-	// release leave in the same write as the transport parameters, as a
-	// carrier whose first message carries the first flight wants. Client
-	// with early data only (ZmuxPeer, or Remembered with Replayable);
-	// otherwise ErrInvalidConfig.
+	// HoldFirstFlight holds the initial client write until ReleaseFirstFlight.
 	HoldFirstFlight bool
-}
-
-// clientEarly reports whether a client with e sends early data.
-func (e *EarlyData) clientEarly() bool {
-	return e.ZmuxPeer || e.Replayable && len(e.Remembered) > 0
 }
 
 // PipeAuth configures the secret sources of joins. EndToEnd is no source:
@@ -448,15 +356,12 @@ func (c *Config) Clone() *Config {
 		return &Config{}
 	}
 	cp := *c
-	return &cp
-}
-
-// clock is the configured Clock; c may be nil.
-func (c *Config) clock() timeshim.Clock {
-	if c == nil {
-		return nil
+	if c.Shaping != nil {
+		p := *c.Shaping
+		cp.Shaping = &p
 	}
-	return c.Clock
+	cp.ShapingLimits = c.ShapingLimits.Clone()
+	return &cp
 }
 
 // handshakeTimeout is the effective HandshakeTimeout; c may be nil.
@@ -474,14 +379,6 @@ func (c *Config) joinTimeout() time.Duration {
 		return DefaultJoinTimeout
 	}
 	return c.JoinTimeout
-}
-
-// redialBackoff returns the Redial backoff with the defaults filled in.
-func (c *Config) redialBackoff() Backoff {
-	if c == nil {
-		return Backoff{}.filled()
-	}
-	return c.RedialBackoff.filled()
 }
 
 func dur(d, def time.Duration) core.Duration {
@@ -525,22 +422,26 @@ func checkProbeJitter(v float64, what string) error {
 
 // checkLimits reports shaping limits outside their ranges.
 func checkLimits(l *shaping.Limits) error {
-	if a := l.Wire; a.Initial > shaping.MaxAccountInitial || a.PerMB > shaping.MaxAccountRate || a.PerSec > shaping.MaxAccountRate {
-		return fmt.Errorf("%w: ShapingLimits.Wire field above its maximum", ErrInvalidConfig)
+	if !l.Wire.Valid() || !l.Profile.Valid() {
+		return fmt.Errorf("%w: invalid shaping account or profile limits", ErrInvalidConfig)
 	}
 	return nil
 }
 
-// askBudget calls f; nil or a panic is no budget (the panic is logged to
-// l).
-func askBudget(l *slog.Logger, f func() shaping.Budget) (b shaping.Budget) {
-	if f == nil {
-		return b
+// resolve draws the direction budget before entering the session owner.
+func (p *ShapingPolicy) resolve(l *slog.Logger) (shaping.Budget, error) {
+	var b shaping.Budget
+	if p == nil {
+		return b, nil
 	}
-	if !safeLog(l, "Config.ShapingBudget", func() { b = f() }) {
-		b = shaping.Budget{}
+	if p.Budget != nil && !safeLog(l, "ShapingPolicy.Budget", func() { b = p.Budget() }) {
+		return b, fmt.Errorf("%w: shaping budget callback failed", ErrInvalidConfig)
 	}
-	return b
+	if b.Profile == nil {
+		v := shaping.Lightweight()
+		b.Profile = &v
+	}
+	return b.Clone(), nil
 }
 
 // coreConfig validates c and resolves it for the core.
@@ -550,14 +451,14 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	}
 	cc := core.DefaultConfig()
 	cc.Role, cc.TransportRole = role, transport
-	cc.PathAdvice = c.Redial != nil || c.Tracer != nil && c.Tracer.Event != nil
+	cc.PathAdvice = c.Tracer != nil && c.Tracer.Event != nil
 	cc.TraceStreams = c.Tracer != nil && c.Tracer.Event != nil && c.Tracer.StreamEvents
 	l := &cc.Local
 	p := &c.SchedulerParams
 	if c.LatencyBudget < 0 || c.InitialStreamReceiveWindow < 0 || c.MaxStreamReceiveWindow < 0 ||
-		c.InitialConnectionReceiveWindow < 0 || c.MaxConnectionReceiveWindow < 0 || c.SendBuffer < 0 || c.SendBufferMax < 0 ||
+		c.InitialConnectionReceiveWindow < 0 || c.MaxConnectionReceiveWindow < 0 || c.ReceiveLoanBudget < 0 || c.SendBuffer < 0 || c.SendBufferMax < 0 ||
 		c.DatagramSendQueue < 0 || c.DatagramReceiveQueue < 0 || c.DatagramStreamQueue < 0 || c.DatagramReceiveBytes < 0 ||
-		c.MaxPipes < 0 || c.PipeHeadroom < 0 || c.ReplayWindow < 0 || c.MaxLanes < 0 || c.ResumeTimeout < 0 ||
+		c.MaxLanes < 0 || c.ResumeTimeout < 0 ||
 		c.JoinTimeout < 0 ||
 		p.OverflowDelay < 0 ||
 		p.SpreadChunk < 0 {
@@ -572,11 +473,16 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	if c.JoinTimeout > time.Duration(core.MaxJoinDeadline) {
 		return cc, fmt.Errorf("%w: JoinTimeout %v above the maximum join deadline %v", ErrInvalidConfig, c.JoinTimeout, time.Duration(core.MaxJoinDeadline))
 	}
-	if err := c.RedialBackoff.validate("Config.RedialBackoff"); err != nil {
-		return cc, err
+	if c.Accounting.SourceLimit < 0 {
+		return cc, fmt.Errorf("%w: negative AccountingPolicy.SourceLimit", ErrInvalidConfig)
 	}
-	if c.EarlyData.ZmuxPeer && role == core.RoleAuto {
-		return cc, fmt.Errorf("%w: EarlyData.ZmuxPeer with RoleAuto", ErrInvalidConfig)
+	hold, holdSet := c.StabilityPolicy.HoldFor.get()
+	if hold < 0 {
+		return cc, fmt.Errorf("%w: negative StabilityPolicy.HoldFor", ErrInvalidConfig)
+	}
+	cc.StabilityHold = core.Duration(hold)
+	if holdSet && hold == 0 {
+		cc.StabilityHold = -1
 	}
 	cc.HandshakeTimeout = core.Duration(c.handshakeTimeout())
 	cc.JoinTimeout = core.Duration(c.joinTimeout())
@@ -606,7 +512,7 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 		l.MaxStreamDataBidiLoc, l.MaxStreamDataBidiRem, l.MaxStreamDataUni = v, v, v
 	}
 	if v := uint64(c.InitialConnectionReceiveWindow); v != 0 {
-		if v < 16384 {
+		if v < core.MinConnWindow {
 			return cc, fmt.Errorf("%w: InitialConnectionReceiveWindow below 16 KiB", ErrInvalidConfig)
 		}
 		l.InitialMaxData = v
@@ -643,16 +549,40 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	// quarter of the session window when smaller, at least 1024.
 	pre := min(uint64(core.MinStreamWindow), l.MaxStreamDataBidiRem, l.MaxStreamDataUni, l.InitialMaxData/4)
 	l.Preamble = max(pre, 1024)
+	if c.DatagramFrameSize < 0 || c.DatagramFrameSize > wire.MaxRecordSize {
+		return cc, fmt.Errorf("%w: DatagramFrameSize outside the protocol limit", ErrInvalidConfig)
+	}
+	if c.DatagramFrameSize > 0 {
+		cc.DatagramFrameCap = uint64(c.DatagramFrameSize)
+	}
 	if c.EnableDatagrams {
-		cc.Datagrams = true
-		l.Has |= wire.HasDatagram | wire.HasFlows
-		l.MaxDatagramFrameSize = 65535
+		l.Has |= wire.HasDatagram
+		l.MaxDatagramFrameSize = cc.DatagramFrameCap
 	}
 	setInt := func(dst *int, v int) {
 		if v > 0 {
 			*dst = v
 		}
 	}
+	if c.DatagramWindow != 0 && (c.DatagramWindow < 64 || c.DatagramWindow > 16384) {
+		return cc, fmt.Errorf("%w: DatagramWindow outside [64, 16384]", ErrInvalidConfig)
+	}
+	if err := c.DatagramDefaults.validate(); err != nil {
+		return cc, err
+	}
+	if c.DatagramCopyLimit < 0 {
+		return cc, fmt.Errorf("%w: negative DatagramCopyLimit", ErrInvalidConfig)
+	}
+	if c.DatagramCopyLimit > 0 {
+		cc.DatagramCopyLimit = c.DatagramCopyLimit
+	}
+	if rate, set := c.CopyBudgetPercent.get(); set {
+		if rate < 0 || rate > 100 {
+			return cc, fmt.Errorf("%w: CopyBudgetPercent outside [0, 100]", ErrInvalidConfig)
+		}
+		cc.ReplicaPercent = rate
+	}
+	setInt(&cc.DgramWindow, c.DatagramWindow)
 	setInt(&cc.DgramSendQ, c.DatagramSendQueue)
 	setInt(&cc.DgramRecvQ, c.DatagramReceiveQueue)
 	setInt(&cc.DgramStreamQ, c.DatagramStreamQueue)
@@ -671,6 +601,9 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	case c.DatagramQueueDelay > 0:
 		cc.DgramTarget = core.Duration(c.DatagramQueueDelay)
 	}
+	if c.ReceiveLoanBudget > 0 {
+		cc.ReceiveLoanBudget = c.ReceiveLoanBudget
+	}
 	if c.SendBuffer > 0 {
 		cc.SendBuffer = uint64(c.SendBuffer)
 	}
@@ -684,16 +617,11 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	if _, err := rand.Read(l.LaneKey[:]); err != nil {
 		return cc, err
 	}
-	if c.MaxPipes > 0 {
-		cc.MaxPipes = c.MaxPipes
+	policy, err := c.SessionPolicy.resolve()
+	if err != nil {
+		return cc, err
 	}
-	if c.PipeHeadroom > 0 {
-		cc.Headroom = c.PipeHeadroom
-	}
-	if c.ReplayWindow != 0 && c.ReplayWindow < max(1, cc.MaxPipes)+cc.Headroom {
-		return cc, fmt.Errorf("%w: ReplayWindow %d below MaxPipes+PipeHeadroom (%d)", ErrInvalidConfig, c.ReplayWindow, max(1, cc.MaxPipes)+cc.Headroom)
-	}
-	cc.ReplayWindow = c.ReplayWindow
+	cc.SessionPolicy = policy
 	cc.Resume = core.Duration(c.ResumeTimeout)
 	switch {
 	case p.Probation < 0:
@@ -709,8 +637,18 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	if err := checkLimits(&c.ShapingLimits); err != nil {
 		return cc, err
 	}
-	cc.ShapeLimits = c.ShapingLimits
-	cc.ShapeBudget = askBudget(c.Logger, c.ShapingBudget)
+	cc.ShapeLimits = c.ShapingLimits.Clone()
+	cc.ShapeBudget, err = c.Shaping.resolve(c.Logger)
+	if err != nil {
+		return cc, err
+	}
+	checked := cc.ShapeBudget
+	if cc.Local.Has&wire.HasPreamble != 0 {
+		checked = cc.ShapeBudget.WithPreamble(wire.MaxPreambleSize)
+	}
+	if !checked.Fits(cc.ShapeLimits) || !cc.ShapeBudget.Wire.Valid() || !cc.ShapeBudget.Profile.Valid() || cc.ShapeBudget.Boundary > shaping.BoundaryCarrierInterface {
+		return cc, fmt.Errorf("%w: invalid shaping budget", ErrInvalidConfig)
+	}
 	if c.Scheduler != nil {
 		cc.Policy = c.Scheduler.policy()
 	}
@@ -731,7 +669,7 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 		return cc, fmt.Errorf("%w: PSK shorter than 16 bytes", ErrInvalidConfig)
 	}
 	cc.PSK = a.PSK
-	if cc.MaxPipes > 1 || cc.Resume > 0 {
+	if cc.SessionPolicy.Limits.SteadyAttachments > 1 || cc.Resume > 0 {
 		l.Has |= wire.HasMultipath | wire.HasSessionCrypto
 		l.SessionCrypto = join.LocalCrypto()
 		if a.Exporter {
@@ -769,12 +707,14 @@ func (c *Config) coreConfig(role, transport core.Role) (core.Config, error) {
 	l.GreaseValue = make([]byte, int(g[2])%17)
 	_, _ = rand.Read(l.GreaseValue)
 	cc.DgramRecvLimited = c.DatagramLimiter.Receive != nil
-	cc.EarlyZmuxPeer = c.EarlyData.ZmuxPeer
-	cc.EarlyReplayable = c.EarlyData.Replayable
-	cc.EarlyRemembered = decodeRemembered(c.EarlyData.Remembered)
+	if c.EarlyData.PlainQMux && c.EarlyData.Replayable {
+		cc.EarlyPlainQMux = true
+		cc.EarlyRemembered = decodeRemembered(c.EarlyData.Remembered)
+	}
+
 	if e := &c.EarlyData; e.HoldFirstFlight {
-		if role != core.RoleInitiator || !e.clientEarly() {
-			return cc, fmt.Errorf("%w: EarlyData.HoldFirstFlight without client early data", ErrInvalidConfig)
+		if role != core.RoleInitiator {
+			return cc, fmt.Errorf("%w: EarlyData.HoldFirstFlight requires an initiator", ErrInvalidConfig)
 		}
 		cc.HoldFirstFlight = true
 	}

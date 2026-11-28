@@ -1,6 +1,15 @@
 package core
 
-import "github.com/zmuxio/zmux-go/internal/wire"
+import (
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
+	"github.com/zmuxio/zmux-go/internal/wire"
+)
+
+// PhysicalFault identifies a connection-wide event observed by an adapter.
+type PhysicalFault struct {
+	CarrierID  carrierstats.CarrierID
+	Generation uint64
+}
 
 // Framing is a carrier's record framing.
 type Framing uint8
@@ -12,12 +21,17 @@ const (
 
 // CarrierInfo describes a carrier half to the core.
 type CarrierInfo struct {
+	CarrierIdentity any    // comparable actual outbound connection identity
+	FateDomain      string // host-attested independent outbound domain
+	Liveness        PipeLiveness
 	// MaxRecord bounds the record size locally; 0: no bound.
 	MaxRecord int
 	// WriteOverhead is the fixed number of bytes each carrier write adds
 	// below the pipe (PipeIO.WriteOverhead), handed to the shaper factory.
 	WriteOverhead int
-	Framing       Framing
+	// SealPrefix and SealSuffix are encoded zmux bytes at the record handoff.
+	SealPrefix, SealSuffix int
+	Framing                Framing
 	// Channel reports that the carrier has a datagram channel for the
 	// pipe; what it takes comes with PollChannel (ChannelUse).
 	Channel bool
@@ -49,6 +63,7 @@ type CarrierInfo struct {
 // calls the host's channel, and decides where a DATAGRAM frame goes from
 // the last reading.
 type ChannelUse struct {
+	Limit int    // structural limit including the Pipe Stream ID; 0: absent, negative: pending
 	Room  int    // the largest channel datagram, Pipe Stream ID included; 0: none now
 	ID    uint64 // the Pipe Stream ID that starts the pipe's channel datagrams
 	HasID bool   // false where the channel names the pipe itself (HTTP/3)
@@ -56,15 +71,21 @@ type ChannelUse struct {
 
 // Pipe is one attachment.
 type Pipe struct {
-	conn any     // carrier connection of lane 0 (lanes)
-	mp   *attach // multipath side storage; nil outside multipath
-	in   *inDir
-	out  *outDir
-	sh   *pipeShape // nil: not shaped
+	member             *Member
+	datagramFeedback   *datagramFeedback
+	datagramCopies     []datagramCopy
+	datagramCopyExpiry Deadline[datagramExpiry]
+	datagramRecords    int     // flow heads registered on this record writer
+	conn               any     // carrier connection of lane 0 (lanes)
+	mp                 *attach // multipath side storage; nil outside multipath
+	in                 *inDir
+	out                *outDir
+	sh                 *pipeShape // nil: not shaped
 	// chSig wakes the sender of the carrier's datagram channel.
-	chSig *Signal
-	chUse ChannelUse // the channel's last reading (PollChannel)
-	id    uint64
+	chSig     *Signal
+	chUse     ChannelUse // the channel's last reading (PollChannel)
+	chBinding datagramChannelBinding
+	id        uint64
 	// lastTraffic is when a record with a traffic frame
 	// was last produced or completely received on the pipe.
 	lastTraffic Time
@@ -121,6 +142,7 @@ type inDir struct {
 	// The last PIPE_ACK sent (acked: one was), for the
 	// immediate acknowledgement of an ack-eliciting record after
 	// zmux_max_ack_delay without one.
+	elicit  uint64 // ack-eliciting record bytes since the last snapshot
 	ackedAt Time
 	acked   bool
 	ended   bool
@@ -137,8 +159,6 @@ type inLane struct {
 	pos  uint64
 	recs uint64
 	// Acknowledgement generation.
-	elicit     uint64 // ack-eliciting bytes since the last PIPE_ACK
-	elicitAt   Time   // when the first of them arrived
 	reported   uint64 // position last reported
 	posAt      Time   // when pos last advanced
 	expectLane bool   // the first record must start with PIPE_LANE
@@ -148,44 +168,50 @@ type inLane struct {
 }
 
 type outDir struct {
-	sig     *WriteSignal
-	lo      laneOut
-	lanes   []*outLane
-	q       pipeQuality
-	snd     pipeSend
-	records uint64 // records written
-	failed  bool
+	sig         *WriteSignal
+	lo          laneOut
+	lanes       []*outLane
+	tierWaiters []*outLane
+	q           pipeQuality
+	snd         pipeSend
+	records     uint64 // records written
+	failed      bool
 }
 
 type outLane struct {
-	lane        uint64
-	pos         uint64 // bytes produced for the carrier (sender's position)
-	acked       uint64
-	elicitPos   uint64 // pos after the last ack-eliciting record: what a peer acknowledges
-	info        CarrierInfo
-	handed      uint64 // bytes of the batch being written: produced, not yet taken by the carrier
-	unsent      uint64 // the carrier's own unsent count, as the adapter last reported it
-	stallAt     Time
-	tpSent      bool
-	closeSent   bool
-	closeDone   bool // the batch with CONNECTION_CLOSE was written (CloseHandedOff)
-	shut        bool
-	writing     bool         // a write call is in progress (since stallAt)
-	unsentKnown bool         // the adapter reports an unsent count for the lane
-	notWritable bool         // SetWritable reported the carrier accepts no bytes (since stallAt)
-	waiting     bool         // was refused data for its turn
-	log         []retained   // multipath retention
-	segs        []sendSeg    // unacknowledged bytes in send order
-	activity    []uint64     // end positions of records with activity frames
-	answers     []epochAck   // records carrying a SESSION_EPOCH answer
-	boundSt     []*Stream    // stream directions bound to the lane
-	sig         *WriteSignal // wakes the lane's writer (lanes above 0; lane 0 uses the pipe's)
-	openedAt    Time
-	laneFirst   bool // the PIPE_LANE record is still to be written
-	confirmed   bool
-	refused     bool
-	served      bool   // took a data batch this round
-	prefixCount uint32 // retained originals eligible for prefix repair
+	confirmTimer     Deadline[*Pipe]
+	lane             uint64
+	pos              uint64 // bytes produced for the carrier (sender's position)
+	acked            uint64
+	elicitPos        uint64 // pos after the last ack-eliciting record: what a peer acknowledges
+	info             CarrierInfo
+	handed           uint64 // bytes of the batch being written: produced, not yet taken by the carrier
+	unsent           uint64 // the carrier's own unsent count, as the adapter last reported it
+	stallAt          Time
+	tpSent           bool
+	closeSent        bool
+	closeDone        bool // the batch with CONNECTION_CLOSE was written (CloseHandedOff)
+	shut             bool
+	writing          bool // a write call is in progress (since stallAt)
+	placementWaiting bool // a different writer placed work here while this batch was in flight
+	tierWaitOwner    *Pipe
+	tierWaitOn       *Pipe
+	tierWaitIndex    int
+	unsentKnown      bool         // the adapter reports an unsent count for the lane
+	notWritable      bool         // SetWritable reported the carrier accepts no bytes (since stallAt)
+	waiting          bool         // was refused data for its turn
+	log              []retained   // multipath retention
+	segs             []sendSeg    // unacknowledged bytes in send order
+	activity         []uint64     // end positions of records with activity frames
+	answers          []epochAck   // records carrying a SESSION_EPOCH answer
+	boundSt          []*Stream    // stream directions bound to the lane
+	sig              *WriteSignal // wakes the lane's writer (lanes above 0; lane 0 uses the pipe's)
+	openedAt         Time
+	laneFirst        bool // the PIPE_LANE record is still to be written
+	confirmed        bool
+	refused          bool
+	served           bool   // took a data batch this round
+	prefixCount      uint32 // retained originals eligible for prefix repair
 }
 
 // AttachBootstrap attaches pipe 0 (both directions) and returns it. The
@@ -197,10 +223,12 @@ func (s *Session) AttachBootstrap(in, out CarrierInfo, writer *WriteSignal) *Pip
 	p.out = &outDir{lanes: []*outLane{{info: out, confirmed: true}}, sig: writer}
 	p.out.lo.offered = out.Lanes
 	s.pipes = append(s.pipes, p)
+	s.addMemberPipe(nil, p, DirectionBoth)
+	s.updateDatagramReportLimit()
 	if l := &s.cfg.Local; l.Has&wire.HasDatagram != 0 && (out.Channel || l.Has&wire.HasMultipath != 0) {
 		// A pipe carrier can have a datagram channel: the bootstrap's, or
 		// one a multipath session joins.
-		l.Has |= wire.HasCarrierDatagrams
+		l.Has |= wire.HasCarrierDatagrams | wire.HasCarrierDatagramPadding
 	}
 	s.requestPoll(p.id, 0, writer)
 	return p
@@ -217,6 +245,11 @@ func (s *Session) pipe(id uint64) *Pipe {
 }
 
 func (d *outDir) lane(l uint64) *outLane {
+	// Outbound lane IDs are issued locally in order. Keep the ID check
+	// so a sparse list can still be searched without changing its meaning.
+	if l < uint64(len(d.lanes)) && d.lanes[l].lane == l {
+		return d.lanes[l]
+	}
 	for _, x := range d.lanes {
 		if x.lane == l {
 			return x
@@ -251,6 +284,24 @@ func (s *Session) SetWritable(pipe, lane uint64, writable bool, now Time) {
 		return
 	}
 	ol.notWritable = !writable
+	if ps := p.sh; ps != nil {
+		if writable {
+			ps.resumeRecordWait(ol)
+		} else {
+			ps.laneBlocked(ol)
+		}
+		if lane == 0 && ps.delayActive {
+			ps.refreshRecordCopyDelay()
+		}
+	}
+	if !writable {
+		if sig := p.writeSignal(ol); sig != nil {
+			sig.Ready.Store(false)
+		}
+		if lane == 0 {
+			s.releaseTierWaiters(p)
+		}
+	}
 	s.wakePrefix()
 	if !writable && !ol.writing {
 		ol.stallAt = now
@@ -262,9 +313,23 @@ func (s *Session) SetWritable(pipe, lane uint64, writable bool, now Time) {
 			e.blocked()
 		}
 	}
-	if writable {
+	if p.mp != nil {
+		s.armPathDeadline(p, pathStall)
+	}
+	if s.mp != nil && s.sched.mask != 0 {
+		// Writability of this path changes which other tiers can send.
+		s.wakeAllWriters()
+	} else if writable {
 		s.wakePipe(p)
 	}
+	s.routeDatagrams()
+}
+
+func (p *Pipe) writeSignal(lane *outLane) *WriteSignal {
+	if lane.lane == 0 {
+		return p.out.sig
+	}
+	return lane.sig
 }
 
 // stalled reports a lane that has bytes to hand over but whose carrier

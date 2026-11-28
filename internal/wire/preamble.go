@@ -42,22 +42,26 @@ type Preamble struct {
 // offset 0 alone. Every violation is a
 // PROTOCOL_VIOLATION. App TLVs are appended to dst.App's storage.
 func ParsePreamble(data []byte, limit uint64, dst *Preamble) *Error {
+	return ParsePreambleParts(Parts{Head: data}, limit, dst)
+}
+
+func ParsePreambleParts(data Parts, limit uint64, dst *Preamble) *Error {
 	app := dst.App[:0]
 	*dst = Preamble{}
-	l, n := varint.ConsumeVarint(data)
+	l, n := data.Varint()
 	if n == 0 {
 		return ErrProto("preamble Length incomplete")
 	}
 	size := uint64(n) + l
-	if size > uint64(len(data)) {
+	if size > uint64(data.Len()) {
 		return ErrProto("preamble longer than its frame")
 	}
 	if size > limit {
 		return ErrProto("preamble above the limit")
 	}
 	dst.Size = int(size)
-	r := reader{b: data[n:size]}
-	for r.i < len(r.b) {
+	r := reader{data: data.Slice(n, int(size))}
+	for r.i < r.len() {
 		t := r.varint()
 		v := r.bytes(r.varint())
 		if r.bad {

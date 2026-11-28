@@ -15,7 +15,7 @@ func drainSession(t *testing.T, accept bool) (*Session, *Stream) {
 	s := capacitySession()
 	for _, id := range []uint64{1, 5} {
 		data := []byte("unread")
-		if _, err := s.onStream(&wire.Frame{Kind: wire.KindStream, StreamID: id, Data: data}, &Buf{B: data}); err != nil {
+		if err := onStreamTest(s, &wire.Frame{Kind: wire.KindStream, StreamID: id, Data: data}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -88,10 +88,10 @@ func drainEnded(t *testing.T, reset bool) (*Session, *Stream) {
 	t.Helper()
 	s := capacitySession()
 	if reset {
-		if _, err := s.onStream(&wire.Frame{Kind: wire.KindStream, StreamID: 1, Data: []byte("x")}, &Buf{B: []byte("x")}); err != nil {
+		if err := onStreamTest(s, &wire.Frame{Kind: wire.KindStream, StreamID: 1, Data: []byte("x")}); err != nil {
 			t.Fatal(err)
 		}
-	} else if _, err := s.onStream(&wire.Frame{Kind: wire.KindStream, StreamID: 1, Fin: true}, nil); err != nil {
+	} else if err := onStreamTest(s, &wire.Frame{Kind: wire.KindStream, StreamID: 1, Fin: true}); err != nil {
 		t.Fatal(err)
 	}
 	st, ok := s.AcceptStream(true)

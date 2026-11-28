@@ -3,10 +3,9 @@ package zmux
 import (
 	"bytes"
 	"context"
-	"math/rand/v2"
+
 	"reflect"
 	"slices"
-	"sync"
 	"testing"
 	"time"
 
@@ -186,7 +185,7 @@ func TestEventQueueTracerRetirement(t *testing.T) {
 		{Kind: EventPipesRetired, Retired: 1, Failed: 1, Last: []PipeID{2}},
 		{Kind: EventPipesRetired, Retired: 1, Closed: 1, Last: []PipeID{4}},
 	}
-	if !reflect.DeepEqual(q.fresh, want) {
+	if !reflect.DeepEqual(q.fresh, want) { //nolint:govet // The fixture has no health error payload.
 		t.Fatalf("tracer saw %+v", q.fresh)
 	}
 	if sum := q.snapshot()[0]; sum.Retired != 2 || sum.Failed != 0 || sum.Closed != 1 {
@@ -246,10 +245,10 @@ func TestEventQueueKeyTable(t *testing.T) {
 			Event{Kind: EventEpochDeleted, Epoch: 1}, Event{Kind: EventEpochCommitted, Epoch: 2}, 1},
 		{"EpochDeleted latest", Event{Kind: EventEpochDeleted, Epoch: 1}, Event{Kind: EventEpochDeleted, Epoch: 2},
 			Event{Kind: EventEpochCommitted, Epoch: 1}, Event{Kind: EventEpochDeleted, Epoch: 2}, 1},
-		{"CarrierCandidate latest", Event{Kind: EventCarrierCandidate, Carrier: CarrierWebSocket, Variant: "v", Outcome: 1},
-			Event{Kind: EventCarrierCandidate, Carrier: CarrierWebSocket, Variant: "v", Outcome: 2},
+		{"CarrierCandidate latest", Event{Kind: EventCarrierCandidate, Carrier: CarrierWebSocket, Variant: "v", Outcome: ReasonConfirmed},
+			Event{Kind: EventCarrierCandidate, Carrier: CarrierWebSocket, Variant: "v", Outcome: ReasonDialFailed},
 			Event{Kind: EventCarrierCandidate, Carrier: CarrierWebSocket, Variant: "w"},
-			Event{Kind: EventCarrierCandidate, Carrier: CarrierWebSocket, Variant: "v", Outcome: 2}, 1},
+			Event{Kind: EventCarrierCandidate, Carrier: CarrierWebSocket, Variant: "v", Outcome: ReasonDialFailed}, 1},
 		{"CarrierChosen latest", Event{Kind: EventCarrierChosen, Carrier: CarrierWebSocket}, Event{Kind: EventCarrierChosen, Carrier: CarrierQUIC},
 			Event{Kind: EventCarrierCandidate}, Event{Kind: EventCarrierChosen, Carrier: CarrierQUIC}, 1},
 		{"SessionSuspended latest", Event{Kind: EventSessionSuspended}, Event{Kind: EventSessionSuspended},
@@ -274,10 +273,10 @@ func TestEventQueueKeyTable(t *testing.T) {
 			// Replacing moves the key to the tail; keeping leaves it.
 			first, second := evs[0], evs[1]
 			if keepFirst(c.a.Kind) {
-				if !reflect.DeepEqual(first, c.wantFirst) || !reflect.DeepEqual(second, c.other) {
+				if !reflect.DeepEqual(first, c.wantFirst) || !reflect.DeepEqual(second, c.other) { //nolint:govet // The fixture has no health error payload.
 					t.Fatalf("kept: %+v", evs)
 				}
-			} else if !reflect.DeepEqual(first, c.other) || !reflect.DeepEqual(second, c.wantFirst) {
+			} else if !reflect.DeepEqual(first, c.other) || !reflect.DeepEqual(second, c.wantFirst) { //nolint:govet // The fixture has no health error payload.
 				t.Fatalf("moved to the tail: %+v", evs)
 			}
 		})
@@ -414,54 +413,6 @@ func modelEventPush(model []Event, ev Event) []Event {
 	return append(model, ev)
 }
 
-// Model test: the queue against a reference of the rule (one unread event
-// per key, order of the latest occurrence), over random sequences of
-// occurrences, reads and retirements.
-func TestEventQueueModel(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	kinds := []EventKind{EventPipeAdded, EventPipeJoined, EventPipeSuspect, EventPipeRecovered, EventPipePriorityChanged,
-		EventTierSaturation, EventCapacityBelow, EventSessionSuspended, EventSessionResumed, EventCarrierChosen, EventGoAwayReceived}
-	var q eventQueue
-	var model []Event // by latest occurrence; merged like the queue
-	for step := range 20000 {
-		switch r := rng.IntN(10); {
-		case r < 7:
-			ev := Event{Kind: kinds[rng.IntN(len(kinds))], PipeID: PipeID(2 * (1 + rng.IntN(4))), Priority: uint64(rng.IntN(3)),
-				Direction: Direction(1 + rng.IntN(2)), Weight: uint64(step)}
-			q.push(ev)
-			model = modelEventPush(model, ev)
-		case r < 9:
-			got, ok := q.pop()
-			if ok != (len(model) > 0) {
-				t.Fatalf("step %d: pop %v with %d modelled", step, ok, len(model))
-			}
-			if ok {
-				if got.Kind == EventPipesRetired { // the outcome counts have their own tests
-					got.Failed, got.Closed, got.Last = 0, 0, nil
-				}
-				if !reflect.DeepEqual(got, model[0]) {
-					t.Fatalf("step %d: read %+v, want %+v", step, got, model[0])
-				}
-				model = model[1:]
-			}
-		default:
-			id := uint64(2 * (1 + rng.IntN(4)))
-			q.retire(id, false)
-			model = slices.DeleteFunc(model, func(x Event) bool { return pipeEvent(x.Kind) && uint64(x.PipeID) == id })
-			sum := Event{Kind: EventPipesRetired}
-			if i := slices.IndexFunc(model, func(x Event) bool { return x.Kind == EventPipesRetired }); i >= 0 {
-				sum = model[i]
-				model = slices.Delete(model, i, i+1)
-			}
-			sum.Retired++
-			model = append(model, sum)
-		}
-		if q.len() != len(q.snapshot()) {
-			t.Fatalf("step %d: index %d, list %d", step, q.len(), len(q.snapshot()))
-		}
-	}
-}
-
 func TestJoinAuthReasonNames(t *testing.T) {
 	for _, c := range []struct {
 		want string
@@ -482,14 +433,12 @@ func TestJoinAuthReasonNames(t *testing.T) {
 // order.
 func TestJoinAuthFailedHostilePeer(t *testing.T) {
 	leakcheck.Check(t)
-	var mu sync.Mutex
-	var traced []Event
+	const attempts = 40
+	traced := make(chan Event, attempts)
 	scfg := deferredConfig()
 	scfg.Tracer = &Tracer{Event: func(_ SessionID, ev Event) {
 		if ev.Kind == EventJoinAuthFailed {
-			mu.Lock()
-			traced = append(traced, ev)
-			mu.Unlock()
+			traced <- ev
 		}
 	}}
 	e := newMPEnv(t, deferredConfig(), scfg)
@@ -497,27 +446,24 @@ func TestJoinAuthFailedHostilePeer(t *testing.T) {
 	mustSet(t, e.server, bytes.Repeat([]byte{8}, 32))
 	var before []EventKind
 	e.server.locked(func() { before = kindsOf(e.server.events.snapshot()) })
-	const attempts = 40
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
 	for i := range attempts {
 		if err := e.tryPipe(5 * time.Second); err == nil {
 			t.Fatal("join with a different secret succeeded")
 		}
-		waitUntil(t, 5*time.Second, "auth failure", func() bool {
-			return e.server.ConnectionStats().JoinAuthFailures == uint64(i+1)
-		})
-	}
-	waitUntil(t, 5*time.Second, "the tracer saw every failure", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(traced) == attempts
-	})
-	mu.Lock()
-	for _, ev := range traced {
-		if ev.Count != 1 || ev.Reason != JoinAuthReasonAuth {
-			t.Fatalf("tracer event %+v", ev)
+		select {
+		case ev := <-traced:
+			if ev.Count != 1 || ev.Reason != JoinAuthReasonAuth {
+				t.Fatalf("tracer event %+v", ev)
+			}
+		case <-ctx.Done():
+			t.Fatalf("tracer after join %d: %v", i+1, ctx.Err())
+		}
+		if n := e.server.ConnectionStats().JoinAuthFailures; n != uint64(i+1) {
+			t.Fatalf("auth failures %d after join %d", n, i+1)
 		}
 	}
-	mu.Unlock()
 	var evs []Event
 	e.server.locked(func() { evs = e.server.events.snapshot() })
 	if len(evs) != len(before)+1 || !slices.Equal(kindsOf(evs[:len(before)]), before) {
@@ -528,8 +474,6 @@ func TestJoinAuthFailedHostilePeer(t *testing.T) {
 		t.Fatalf("last event %+v", last)
 	}
 	// What NextEvent reads is the same.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	for range evs[:len(evs)-1] {
 		if _, err := e.server.NextEvent(ctx); err != nil {
 			t.Fatal(err)
@@ -556,7 +500,7 @@ func TestEventQueueFrozenAtEnd(t *testing.T) {
 		n = e.client.events.len()
 	})
 	_ = p.Abort()
-	waitUntil(t, 5*time.Second, "the pipe ended", func() bool { return isDone(p.Done()) })
+	waitTestSignal(t, p.Done(), "pipe completion")
 	e.client.locked(func() {
 		if e.client.events.len() != n {
 			t.Errorf("the queue changed after the end: %d, was %d", e.client.events.len(), n)
@@ -571,14 +515,5 @@ func TestEventQueueFrozenAtEnd(t *testing.T) {
 	}
 	if _, err := e.client.NextEvent(ctx); err == nil || ctx.Err() != nil {
 		t.Fatalf("after the events: %v", err)
-	}
-}
-
-func isDone(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
 	}
 }

@@ -22,9 +22,10 @@ func FitValue(room int) (int, bool) {
 // bytes further, within room bytes: the smallest that reaches gap, or the
 // largest that fits; false when the message gets no item.
 func ItemFor(gap, room int) (int, bool) {
-	if gap <= 0 {
+	if gap <= 0 || room < 2 {
 		return 0, false
 	}
+	gap = min(gap, room)
 	v := max(gap-2, 0)
 	for v > 0 && ItemSize(v-1) >= gap {
 		v--
@@ -85,6 +86,9 @@ func (a *Acceptor) ReplyWire(plain int) int {
 	s := a.c.suite
 	return 1 + s.NonceLen + FramingLen(a.c.f) + plain + s.TagLen()
 }
+
+// ReplyPayloadOffset returns the start of the encrypted payload in a Reply.
+func (a *Acceptor) ReplyPayloadOffset() int { return a.ReplyWire(0) - a.c.suite.TagLen() }
 
 // HelloRoom is the bytes of items a Hello with plain bytes of plaintext can
 // still take below the handshake message floor (negative: it is over).

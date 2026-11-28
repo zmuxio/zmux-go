@@ -5,7 +5,7 @@ import (
 	"net/netip"
 
 	"github.com/zmuxio/zmux-go/internal/join"
-	"github.com/zmuxio/zmux-go/varint"
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 // Carrier classification of a listener.
@@ -28,23 +28,44 @@ var lanePrefix = [4]byte{0xba, 0x05, 0xa1, 0xc9}
 // whose parser takes over; recLen stays 0. For another class recLen is the length of
 // the first record (Size field included) once it is complete.
 func Classify(b []byte, maxRecord uint64) (Class, int) {
-	if len(b) == 0 {
+	return ClassifyParts(wire.Parts{Head: b}, maxRecord)
+}
+
+// ClassifyParts classifies an owned byte prefix without gathering its body.
+func ClassifyParts(b wire.Parts, maxRecord uint64) (Class, int) {
+	if b.Len() == 0 {
 		return ClassMore, 0
 	}
-	if join.IsHello(b) {
+	if b.Byte(0) == join.ProfileJoin {
 		return ClassJoin, 0
 	}
-	size, n := varint.ConsumeVarint(b)
+	size, n := b.Varint()
 	if n == 0 {
 		return ClassMore, 0
 	}
+	c, body := classifyRecord(b.Slice(n, b.Len()), size, maxRecord)
+	if body != 0 {
+		return c, n + body
+	}
+	return c, 0
+}
+
+// ClassifyMessage classifies a complete record or Join unit with implicit Size.
+func ClassifyMessage(body []byte, maxRecord uint64) Class {
+	if join.IsHello(body) {
+		return ClassJoin
+	}
+	c, _ := classifyRecord(wire.Parts{Head: body}, uint64(len(body)), maxRecord)
+	return c
+}
+
+func classifyRecord(body wire.Parts, size, maxRecord uint64) (Class, int) {
 	if size > maxRecord {
 		return ClassReject, 0
 	}
-	body := b[n:]
 	match := func(p []byte) bool {
-		for i := 0; i < len(p) && i < len(body); i++ {
-			if body[i] != p[i] {
+		for i := 0; i < len(p) && i < body.Len(); i++ {
+			if body.Byte(i) != p[i] {
 				return false
 			}
 		}
@@ -54,21 +75,21 @@ func Classify(b []byte, maxRecord uint64) (Class, int) {
 	switch {
 	case size >= 9 && match(tpTypeBytes[:]):
 		c = ClassSession
-		if len(body) < 8 {
+		if body.Len() < 8 {
 			return ClassMore, 0
 		}
 	case size >= 22 && match(lanePrefix[:]):
 		c = ClassLane
-		if len(body) < 4 {
+		if body.Len() < 4 {
 			return ClassMore, 0
 		}
 	default:
 		return ClassReject, 0
 	}
-	if uint64(len(body)) < size {
+	if uint64(body.Len()) < size {
 		return c, 0
 	}
-	return c, n + int(size)
+	return c, int(size)
 }
 
 // Locator returns the session's own locator (joins name it).
@@ -107,7 +128,6 @@ type PendingCarriers struct {
 	stalls       list.List // of *PendingSlot, the stalled ones, oldest first
 	MaxTotal     int       // 0: DefaultMaxPending; negative: unlimited
 	MaxPerSource int       // 0: DefaultMaxPendingPerSource
-	Timeout      Duration  // 0: DefaultFirstRecordTimeout
 	total        int
 }
 
@@ -234,15 +254,6 @@ func (p *PendingCarriers) Unstall(s *PendingSlot) {
 	} else {
 		delete(p.stalledBy, s.source)
 	}
-}
-
-// Deadline is when a carrier accepted at t must have its first record.
-func (p *PendingCarriers) Deadline(t Time) Time {
-	d := p.Timeout
-	if d <= 0 {
-		d = DefaultFirstRecordTimeout
-	}
-	return t.Add(d)
 }
 
 // SplitPairing pairs the two unidirectional carriers of a split bootstrap

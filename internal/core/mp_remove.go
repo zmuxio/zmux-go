@@ -7,6 +7,10 @@ import "github.com/zmuxio/zmux-go/internal/wire"
 // failPipe fails an attachment: reinjection, carrier closed, PIPE_ABANDON
 // (unless one was sent), then the last-pipe rule.
 func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
+	s.failPipeWithEvidence(p, code, cause, nil)
+}
+
+func (s *Session) failPipeWithEvidence(p *Pipe, code uint64, cause error, fault *PhysicalFault) {
 	a := p.mp
 	if a == nil || a.retired {
 		return
@@ -15,6 +19,11 @@ func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
 		s.mp.joinFailures++ // feeds the join retry backoff
 	}
 	wasDraining := a.out == OutDraining || a.draining
+	if code == wire.PipeResourceLimit {
+		a.health.reason = HealthCanceled
+	} else if wasDraining {
+		a.health.reason = HealthPlannedDrain
+	}
 	if p.out != nil && a.out != OutFailed && a.out != OutClosed {
 		a.out = OutFailed
 		a.failures++
@@ -25,6 +34,7 @@ func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
 		a.bytesLost = sent - min64(sent, p.out.snd.cum)
 		s.stats.PipeFailures++
 		p.out.failed = true
+		s.dropDatagramCopies(p)
 		if s.shp != nil {
 			s.shapePipeDown(p)
 		}
@@ -35,17 +45,18 @@ func (s *Session) failPipe(p *Pipe, code uint64, cause error) {
 	if p.in != nil && a.in != InEnded {
 		a.in = InEnded
 		p.in.ended = true
+		s.cancelDatagramReports(p)
 	}
 	if a.failCause == nil {
-		a.failCause = cause
+		a.failCause, a.physicalFault = cause, fault
 	}
 	// A request lost with its pipe stops being outstanding (W4).
 	if s.ping.outstanding != 0 && s.ping.pipe == p.id {
 		s.pingExpired()
 	}
 	s.act(Action{Kind: ActAbort, Pipe: p.id, Dir: DirBidi})
-	if !a.abandonSent && !a.abandonQueued {
-		a.abandonQueued = true
+	if !a.abandonSent && !s.mp.abandonQ.contains(p) {
+		s.mp.abandonQ.add(p)
 		a.abandonCode = code
 	}
 	s.emitPipeState(p)
@@ -77,6 +88,7 @@ func (s *Session) fateGroupHit(p *Pipe) {
 			} else {
 				qa.needPing = true
 				qa.pingSince = s.now
+				s.armPathDeadline(q, pathProbe)
 			}
 		}
 	}
@@ -101,13 +113,22 @@ func (s *Session) makeSuspect(p *Pipe) {
 	a.needPing, a.suspPing = true, true
 	a.pingSince = s.now
 	s.emitPipeState(p)
-	if prim, _ := s.primary(); prim != nil && s.mp.ackChanged {
-		s.mp.redundantAt = s.now
+	if s.mp.ackChanged {
+		if prim, _ := s.primary(); prim != nil {
+			s.mp.redundantAt, s.mp.redundantPending = s.now, true
+		}
 	}
 }
 
 // RemovePipe removes an attachment gracefully (drain) or abruptly.
 func (s *Session) RemovePipe(id uint64, graceful bool) error {
+	if graceful {
+		return s.DrainAttachments([]uint64{id})
+	}
+	return s.removePipe(id, false)
+}
+
+func (s *Session) removePipe(id uint64, graceful bool) error {
 	if s.mp == nil {
 		return ErrNotNegotiated
 	}
@@ -170,8 +191,8 @@ func (s *Session) startDrain(p *Pipe) {
 		a.out = OutDraining
 	}
 	s.unsettle(p)
-	if !a.abandonSent && !a.abandonQueued {
-		a.abandonQueued = true
+	if !a.abandonSent && !s.mp.abandonQ.contains(p) {
+		s.mp.abandonQ.add(p)
 		a.abandonCode = wire.NoError
 	}
 	s.emitPipeState(p)
@@ -187,6 +208,9 @@ func (s *Session) peerAbandon(p *Pipe, code uint64) {
 		return
 	}
 	a.abandonRecv = true
+	s.mp.control.valid = false
+	s.mp.clock.unilateral.remove(p)
+	s.armPathDeadline(p, pathUnilateral)
 	a.abandonRecvAt = s.now
 	a.abandonCodeRecv = code
 	if a.joinerLocal && code == wire.PipeResourceLimit {
@@ -291,7 +315,26 @@ func (s *Session) retire(p *Pipe, keepBackoff bool) {
 	// owed again (once per frame, so an earlier reinjection is not
 	// repeated), or a unilateral end would drop it with the log.
 	s.reinjectPipe(p)
+	s.dropDatagramCopies(p)
+	s.clearDatagramPairs(p, false)
+	s.clearDatagramPairs(p, true)
 	a.retired = true
+	s.forgetMemberPipe(p)
+	s.cancelDatagramReports(p)
+	if ps := p.sh; ps != nil {
+		ps.stop(false)
+	}
+	s.removePathDeadlines(p)
+	s.mp.abandonQ.remove(p)
+	s.mp.statusQ.remove(p)
+	s.mp.pairAcks.remove(p)
+	if p.out != nil {
+		if pending := p.out.lo.pending; pending != nil {
+			s.laneTimers.Cancel(&pending.confirmTimer)
+		}
+		s.paceTimers.Cancel(&p.out.snd.pace)
+		s.qualityTimers.Cancel(&p.out.q.timer)
+	}
 	// A peer-parity ID stays used, pipe 0 of an initiator peer included:
 	// its later PIPE_ACK entries are ignored.
 	if !s.ownParity(p.id) {
@@ -310,7 +353,7 @@ func (s *Session) retire(p *Pipe, keepBackoff bool) {
 			break
 		}
 	}
-	if !s.cfg.PathAdvice && len(s.pipes) == 1 {
+	if !s.memberFeedback && !s.cfg.PathAdvice && len(s.pipes) == 1 {
 		s.pipes[0].mp.quality = nil
 	}
 	s.retiredPipes = append(s.retiredPipes, p.id)
@@ -318,6 +361,8 @@ func (s *Session) retire(p *Pipe, keepBackoff bool) {
 		s.retiredPipes = s.retiredPipes[1:]
 	}
 	s.mp.stateGen++
+	s.NotifyCapacity()
+	s.refreshPathTopology()
 	s.joinHoldChanged() // one attachment fewer under the cap
 	s.emit(Event{Kind: EvPipeState, Pipe: p.id, Dir: DirBidi, OutState: OutRetired, InState: InRetired,
 		Carrier: p.carrier, Failed: a.failures > 0, Cause: a.failCause})
@@ -371,7 +416,7 @@ func (s *Session) checkLastPipe(cause error) {
 }
 
 // mpInboundEnded handles the end of an inbound pipe.
-func (s *Session) mpInboundEnded(p *Pipe, graceful bool, cause error) {
+func (s *Session) mpInboundEnded(p *Pipe, graceful bool, cause error, fault *PhysicalFault) {
 	a := p.mp
 	if a == nil || a.retired {
 		return
@@ -388,13 +433,13 @@ func (s *Session) mpInboundEnded(p *Pipe, graceful bool, cause error) {
 		return
 	}
 	s.ack.immediate = true
-	s.failPipe(p, wire.PipeFailed, cause)
+	s.failPipeWithEvidence(p, wire.PipeFailed, cause, fault)
 }
 
 // mpOutboundFailed handles a failed write on an outbound pipe.
-func (s *Session) mpOutboundFailed(id uint64, err error) {
+func (s *Session) mpOutboundFailed(id uint64, err error, fault *PhysicalFault) {
 	if p := s.pipe(id); p != nil && p.mp != nil {
-		s.failPipe(p, wire.PipeFailed, err)
+		s.failPipeWithEvidence(p, wire.PipeFailed, err, fault)
 	}
 }
 

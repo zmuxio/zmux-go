@@ -1,9 +1,22 @@
 package core
 
+import "math"
+
+// prefixScheduler is allocated on the first tracked STREAM handoff.
+type prefixScheduler struct {
+	prefixStreams                     []*Stream
+	prefixGate                        gate
+	prefixBucket                      tokenBucket
+	prefixAt                          Time
+	prefixBytes, prefixPending        uint64
+	prefixWaiting, prefixStateWaiting bool
+}
+
 // prefixRepair accounts for one stream's anticipatory copy. Pending bytes
 // are in resend and sent bytes are in the ordinary carrier retention log.
 type prefixRepair struct {
 	source *Pipe
+	anchor Time
 	lo, hi uint64
 	sent   uint64 // end of the portion already passed to a carrier
 }
@@ -17,27 +30,24 @@ type prefixRef struct {
 	end    uint64
 }
 
-func (ref prefixRef) locate() (*retained, int) {
+func (ref prefixRef) locate() *retained {
 	log := ref.lane.log
 	if ref.lane.prefixCount == 0 || len(log) == 0 {
-		return nil, 0
+		return nil
 	}
 	i := ref.serial - log[0].serial
 	if i >= uint64(len(log)) || log[i].end != ref.end || log[i].confirm == 0 {
-		return nil, 0
+		return nil
 	}
-	return &log[i], int(i)
+	return &log[i]
 }
 
 // prefixTrack follows one sending direction's originals in stream order.
 // Only the first outstanding original can contain the next missing offset.
 type prefixTrack struct {
-	extentLane *outLane
-	refs       []prefixRef
-	head       int
-	active     int    // index in prefixStreams, -1 while empty
-	extent     uint64 // discovered contiguous expired range at head
-	extentNext uint64 // next lane-log serial to consider for that range
+	refs   []prefixRef
+	head   int
+	active int // index in prefixStreams, -1 while empty
 }
 
 func (s *Session) trackPrefix(st *Stream, source *Pipe, lane *outLane, r *retained) {
@@ -51,6 +61,7 @@ func (s *Session) trackPrefix(st *Stream, source *Pipe, lane *outLane, r *retain
 		s.mp.prefixStreams = append(s.mp.prefixStreams, st)
 		if r.d.off <= m.acked.prefix() {
 			s.checkPrefixAt(r.confirm)
+			s.mp.prefixWaiting = true
 		}
 	}
 	if t.head > 0 && t.head >= len(t.refs)/2 && len(t.refs) == cap(t.refs) {
@@ -74,47 +85,52 @@ func (s *Session) untrackPrefix(st *Stream) {
 	s.mp.prefixStreams = list[:last]
 	clear(t.refs)
 	t.refs, t.head, t.active = t.refs[:0], 0, -1
-	t.extent, t.extentNext, t.extentLane = 0, 0, nil
 }
 
-func (s *Session) prefixHead(st *Stream, pre uint64, examined *int) (prefixRef, *retained, int) {
+func (s *Session) prefixHead(st *Stream, pre uint64, examined *int) (prefixRef, *retained) {
 	t := st.snd.mps.prefix
 	if t == nil || t.active < 0 {
-		return prefixRef{}, nil, 0
+		return prefixRef{}, nil
 	}
 	for t.head < len(t.refs) {
 		ref := t.refs[t.head]
-		r, i := ref.locate()
+		r := ref.locate()
 		if examined != nil {
 			*examined++
 		}
 		if r != nil && pre < r.d.off+r.d.n {
-			return ref, r, i
+			return ref, r
 		}
 		t.refs[t.head] = prefixRef{}
 		t.head++
 	}
 	s.untrackPrefix(st)
-	return prefixRef{}, nil, 0
+	return prefixRef{}, nil
 }
 
 func (s *Session) schedulePrefix(st *Stream, pre uint64) {
-	_, r, _ := s.prefixHead(st, pre, nil)
+	_, r := s.prefixHead(st, pre, nil)
 	if r != nil && r.d.off <= pre {
-		s.checkPrefixAt(maxT(r.confirm, s.now))
+		s.checkPrefixAt(maxT(1, s.now))
 	}
 }
 
-func (r prefixRepair) covers(off uint64) bool { return r.lo <= off && off < r.hi }
+func (r prefixRepair) covers(off uint64) bool { return r.sent <= off && off < r.hi }
+
+func (r prefixRepair) pending(acked *rangeSet) uint64 {
+	return r.hi - r.sent - acked.covered(r.sent, r.hi)
+}
 
 func (s *Session) clearPrefixRepair(m *mpSend) {
-	r := m.repair
-	if r.hi > r.lo {
-		s.mp.prefixBytes -= r.hi - r.lo
-		s.mp.prefixPending -= r.hi - r.sent
-		m.repair = prefixRepair{}
-		s.wakePrefix()
+	if m.repair.hi == 0 {
+		return
 	}
+	pending := m.repair.pending(&m.acked)
+	s.mp.prefixBytes -= pending + m.prefixCopies.covered(m.repair.lo, m.repair.hi)
+	s.mp.prefixPending -= pending
+	m.prefixCopies = rangeSet{}
+	m.repair = prefixRepair{}
+	s.wakePrefix()
 }
 
 func (s *Session) cancelPrefixTail(m *mpSend) {
@@ -123,54 +139,72 @@ func (s *Session) cancelPrefixTail(m *mpSend) {
 	s.releasePrefixTail(m)
 }
 
-// releasePrefixTail releases only the unsent reservation. Native loss keeps
-// those bytes queued for ordinary reinjection.
+// releasePrefixTail releases only the reservation. Native loss keeps
+// those bytes in the ordinary reinjection queue.
 func (s *Session) releasePrefixTail(m *mpSend) {
 	r := &m.repair
 	if r.sent == r.hi {
 		return
 	}
-	m.oppSent.remove(r.sent, r.hi)
-	n := r.hi - r.sent
-	s.mp.prefixPending -= n
-	s.mp.prefixBytes -= n
+	pending := r.pending(&m.acked)
+	s.mp.prefixPending -= pending
+	s.mp.prefixBytes -= pending
 	r.hi = r.sent
-	if r.hi == r.lo {
-		m.repair = prefixRepair{}
-	}
+	s.finishPrefixRepair(m)
 	s.wakePrefix()
 }
 
-// retryPrefixTail releases a stale reservation and gives the original a
-// new observation window before attempting the same still-missing bytes.
+// retryPrefixTail releases a reservation whose alternatives lost eligibility.
+// The original keeps its earliest deadline and wakes on new evidence.
 func (s *Session) retryPrefixTail(st *Stream) {
-	m := st.snd.mps
-	source := m.repair.source
-	s.cancelPrefixTail(m)
-	pre := m.acked.prefix()
-	if _, r, _ := s.prefixHead(st, pre, nil); r != nil && r.d.off <= pre {
-		r.confirm = s.now.Add(maxD(Millisecond, source.mp.currentRTT(s.now)/2))
-		s.checkPrefixAt(r.confirm)
+	s.cancelPrefixTail(st.snd.mps)
+	s.mp.prefixWaiting = true
+}
+
+func (s *Session) finishPrefixRepair(m *mpSend) {
+	if m.repair != (prefixRepair{}) && m.prefixCopies.len() == 0 && m.repair.pending(&m.acked) == 0 {
+		m.repair = prefixRepair{}
+		s.wakePrefix()
 	}
 }
 
-func (s *Session) ackPrefixRepair(m *mpSend) {
-	r := m.repair
-	if r.hi > r.lo && m.acked.contains(r.lo, r.hi) {
-		s.clearPrefixRepair(m)
+// ackPrefixRepair runs before the ACK range is inserted in m.acked.
+func (s *Session) ackPrefixRepair(m *mpSend, lo, hi uint64) {
+	r := &m.repair
+	if r.hi == 0 {
+		return
+	}
+	lo, hi = max64(lo, r.sent), min64(hi, r.hi)
+	if lo < hi {
+		newly := hi - lo - m.acked.covered(lo, hi)
+		s.mp.prefixPending -= newly
+		s.mp.prefixBytes -= newly
+		if newly != 0 {
+			s.wakePrefix()
+		}
 	}
 }
 
-// commitPrefixRepair charges actual encoded STREAM payload. sent also
-// retires any pending reservations for ACKed holes passed by this fragment.
+func (s *Session) releasePrefixCopy(m *mpSend, lo, hi uint64) {
+	if n := m.prefixCopies.covered(lo, hi); n != 0 {
+		s.mp.prefixBytes -= n
+		m.prefixCopies.remove(lo, hi)
+		s.wakePrefix()
+	}
+}
+
+// commitPrefixRepair charges actual encoded STREAM payload. ACKed holes
+// between this fragment and the handoff cursor have already freed credit.
 func (s *Session) commitPrefixRepair(m *mpSend, off, n uint64) {
 	r := &m.repair
 	end := off + n
 	b := &s.mp.prefixBucket
 	b.fill(usOf(s.now))
 	b.tokens -= int64(n)
-	s.mp.prefixPending -= end - r.sent
+	s.mp.prefixPending -= n
 	r.sent = end
+	m.prefixCopies.add(off, end)
+	m.oppSent.add(off, end)
 	s.wakePrefix()
 }
 
@@ -201,14 +235,14 @@ func (s *Session) reservePrefixCredit(n uint64) bool {
 }
 
 func (s *Session) wakePrefix() {
-	if s.mp != nil && s.mp.additionalPipes != nil && s.mp.prefixWaiting && s.state < StateClosing {
+	if s.mp != nil && s.mp.clock.activeOut > 1 && s.mp.prefixScheduler != nil && s.mp.prefixWaiting && s.state < StateClosing {
 		s.checkPrefixAt(maxT(1, s.now))
 		s.mp.prefixWaiting = false
 	}
 }
 
 func (s *Session) wakePrefixOnPipeState() {
-	if s.mp != nil && s.mp.additionalPipes != nil && s.mp.prefixStateWaiting && s.state < StateClosing {
+	if s.mp != nil && s.mp.prefixScheduler != nil && s.mp.prefixStateWaiting && s.state < StateClosing {
 		s.checkPrefixAt(maxT(1, s.now))
 		s.mp.prefixStateWaiting = false
 	}
@@ -217,67 +251,72 @@ func (s *Session) wakePrefixOnPipeState() {
 // checkPrefixAt keeps one timer for the earliest outstanding check. ACKs
 // remove their retained entries; a stale timer therefore does no repair.
 func (s *Session) checkPrefixAt(at Time) {
-	if s.mp.prefixAt == 0 || at < s.mp.prefixAt {
+	if at != Never && (s.mp.prefixAt == 0 || at < s.mp.prefixAt) {
 		s.mp.prefixAt = at
 	}
 }
 
-func (s *Session) prefixDeadline(p *Pipe, ahead, length uint64) Time {
+func (s *Session) prefixDeadline(p *Pipe, ahead, handed, length uint64) Time {
 	pr, _ := p.mp.effPrio()
 	tops := s.fastestOf(pr)
-	e := s.estimate(p, &tops, float64(ahead), length)
+	e := s.estimate(p, &tops, float64(ahead), handed)
 	// One return flight and bounded variation beyond the data ETA. Keep
 	// the handover estimate even if this path slows or later loses ACKs.
-	seconds := e.eta(length) + float64(e.rtt/2+minD(e.deviation, e.rtt/2)+s.ack.peerDelay)/1e9
+	seconds := e.eta(length) + float64(p.mp.rtt.smoothed/2+minD(e.deviation, p.mp.rtt.smoothed/2)+s.ack.peerDelay)/1e9
 	if seconds >= float64(Never)/1e9 {
 		return Never
 	}
-	return s.now.Add(Duration(seconds * 1e9))
+	return s.now.Add(Duration(math.Round(seconds * 1e9)))
 }
 
-// prefixEligible evaluates evidence that a path can carry a repair. Writer
-// availability, pacing, shaping and tier admission can change between polls.
-func (s *Session) prefixEligible(p, source *Pipe) bool {
-	a := p.mp
-	return p != source && p.out != nil && !p.out.failed && a != nil &&
-		a.out == OutActive && !a.retired && a.peerAttached(p.id) &&
-		a.quality != nil && a.quality.freshRTT(s.now) && !s.qualityElevated(p) &&
-		(!a.unacked || s.now.Sub(a.tref()) <= s.pto(a)+s.queueDelay(a))
-}
-
-// prefixTarget returns the best ready path and whether a qualified path
-// remains. An unavailable writer cannot invalidate a pending reservation.
-func (s *Session) prefixTarget(g *gate, source *Pipe, n uint64) (*Pipe, float64, bool) {
+// prefixTarget selects a ready destination for precisely n bytes, using the
+// scheduler's queue forecasts and the alternative's return-flight margin.
+// Evidence can survive a temporary writer or admission gate.
+func (s *Session) prefixTarget(g *gate, source *Pipe, anchor Time, n uint64) (*Pipe, Time, bool) {
+	if source.mp.out != OutActive || !source.mp.peerAttached(source.id) || !maySend(source, false) {
+		return nil, Never, false
+	}
 	var best *Pipe
-	var eta float64
+	var bestETA float64
+	repairAt := Never
+	eligible := false
 	if g != nil {
 		s.gateQuality(g)
+		var sourceETA float64
+		if g.usable(s, source) {
+			sourceETA = g.pipeQuality(source, g.tierOf(source)).eta(n)
+		} else {
+			pr, _ := source.mp.effPrio()
+			tops := s.fastestOf(pr)
+			sourceETA = s.estimate(source, &tops, s.queued(source), 0).eta(n)
+		}
+		original := sourceETA + float64(source.mp.rtt.smoothed/2)/1e9
 		for ti := 0; ti <= g.last; ti++ {
 			t := g.tiers[ti]
 			for i := t.lo; i < t.hi; i++ {
 				p := g.pipes[i]
+				if p == source || !s.hasDelivery(p, anchor) {
+					continue
+				}
+				eta := g.quality[i].eta(n)
+				margin := maxD(50*Millisecond, p.mp.rtt.smoothed/2+s.ack.peerDelay)
+				delay := eta + float64(margin)/1e9
+				if delay >= original || delay >= float64(Never)/1e9 {
+					continue
+				}
+				eligible = true
 				a := p.mp
-				if !s.prefixEligible(p, source) || !s.open(p) || !s.takes(g, p) ||
-					!s.pipeUsable(p, false) || s.shp != nil && s.shapeHeld(p) ||
+				if !s.open(p) || !s.takes(g, p) || s.shp != nil && s.shapeHeld(p) ||
 					!s.reinjectRoom(p) || a.held1 && n > uint64(s.cfg.SpreadChunk)-a.holdSent {
 					continue
 				}
-				arrival := g.quality[i].eta(n)
-				if best == nil || arrival < eta || arrival == eta && p.id < best.id {
-					best, eta = p, arrival
+				if best == nil || eta < bestETA || eta == bestETA && p.id < best.id {
+					best, bestETA, repairAt = p, eta, anchor.Add(Duration(math.Round(delay*1e9)))
 				}
 			}
 		}
 	}
-	if best != nil {
-		return best, eta, true
-	}
-	for _, p := range s.pipes {
-		if s.prefixEligible(p, source) {
-			return nil, 0, true
-		}
-	}
-	return nil, 0, false
+	return best, repairAt, eligible
 }
 
 // prefixTimers considers only the first outstanding original of each stream.
@@ -288,7 +327,7 @@ func (s *Session) prefixTimers(now Time, apply bool) Time {
 
 func (s *Session) prefixTimersExamined(now Time, apply bool, examined *int) Time {
 	m := s.mp
-	if m.additionalPipes == nil || m.prefixAt == 0 || s.state >= StateClosing {
+	if m.prefixScheduler == nil || m.prefixAt == 0 || s.state >= StateClosing {
 		return Never
 	}
 	if !apply || now < m.prefixAt {
@@ -307,7 +346,7 @@ func (s *Session) prefixTimersExamined(now Time, apply bool, examined *int) Time
 		st := m.prefixStreams[i]
 		ms := st.snd.mps
 		lo := ms.acked.prefix()
-		ref, r, j := s.prefixHead(st, lo, examined)
+		ref, r := s.prefixHead(st, lo, examined)
 		if r == nil {
 			continue // untrackPrefix moved another direction to this index
 		}
@@ -315,11 +354,7 @@ func (s *Session) prefixTimersExamined(now Time, apply bool, examined *int) Time
 		if lo < r.d.off || ms.oppSent.covered(lo, lo+1) != 0 {
 			continue // only ACK progress can expose a new prefix
 		}
-		if r.confirm > now {
-			s.checkPrefixAt(r.confirm)
-			continue
-		}
-		p, ol := ref.source, ref.lane
+		p := ref.source
 		if p.mp.out != OutActive || !p.mp.peerAttached(p.id) {
 			m.prefixStateWaiting = true
 			continue
@@ -333,19 +368,31 @@ func (s *Session) prefixTimersExamined(now Time, apply bool, examined *int) Time
 			limit := s.copyBound()
 			room = limit - min64(limit, s.copiesOutstanding())
 		}
-		capEnd := lo + min64(room, uint64(s.cfg.SpreadChunk))
-		hi := ms.prefix.extend(ol, r, j, capEnd, now, examined)
+		capEnd := lo + uint64(s.cfg.SpreadChunk)
+		hi := r.d.off + r.d.n
 		// Stop the repair at the next already-confirmed range.
 		k := ms.acked.from(lo + 1)
 		if ms.acked.q.valid(k) {
 			hi = min64(hi, ms.acked.q.at(k).lo)
 		}
+		// Budget can restrict the range sent on this cut. Observe the cap
+		// even when reservations currently leave no room.
 		n := min64(hi, capEnd) - lo
-		if s.queuePrefixRepair(g, p, ol, r, st, lo, n) {
-			room -= n
-		} else {
-			m.prefixWaiting = true
+		if n == 0 {
+			continue
 		}
+		if room != 0 {
+			n = min64(n, room)
+		}
+		target, repairAt, _ := s.prefixTarget(g, p, r.sent, n)
+		r.confirm = minT(r.confirm, repairAt)
+		if r.confirm > now {
+			s.checkPrefixAt(r.confirm)
+		} else if target != nil && n <= room && s.queuePrefixRepair(p, r.sent, st, lo, n) {
+			room -= n
+			continue
+		}
+		m.prefixWaiting = true
 	}
 	if m.prefixAt == 0 {
 		return Never
@@ -353,86 +400,24 @@ func (s *Session) prefixTimersExamined(now Time, apply bool, examined *int) Time
 	return m.prefixAt
 }
 
-// extend coalesces adjacent expired originals on the same lane. While this
-// head remains blocked, later wakeups need only inspect the next boundary.
-func (t *prefixTrack) extend(lane *outLane, r *retained, i int, limit uint64, now Time, examined *int) uint64 {
-	// ACKs can advance the head within a span we have already discovered.
-	// Reuse that span until the new head crosses its lane or range.
-	if t.extentLane != lane || r.d.off >= t.extent || r.serial >= t.extentNext {
-		t.extent, t.extentNext = r.d.off+r.d.n, r.serial+1
-		t.extentLane = lane
-	}
-	i += int(t.extentNext - r.serial)
-	for ; t.extent < limit && i < len(lane.log); i++ {
-		more := &lane.log[i]
-		if examined != nil {
-			*examined++
-		}
-		if more.confirm == 0 || more.confirm > now || more.d.id != r.d.id || more.d.off != t.extent {
-			break
-		}
-		t.extent += more.d.n
-		t.extentNext++
-	}
-	return t.extent
-}
-
-func (s *Session) queuePrefixRepair(g *gate, source *Pipe, ol *outLane, r *retained, st *Stream, lo, n uint64) bool {
+func (s *Session) queuePrefixRepair(source *Pipe, anchor Time, st *Stream, lo, n uint64) bool {
 	sp := &st.snd
 	ms := sp.mps
-	if n == 0 || lo == 0 && n < sp.preLen || ms.repair.hi != 0 || ms.resend.len() != 0 {
+	if n == 0 || lo == 0 && n < sp.preLen {
 		return false
 	}
 	for _, existing := range s.mp.copies {
-		if existing.st == st && existing.off <= lo && lo < existing.end && s.copyLeft(existing) != 0 {
+		if existing.st == st && existing.off < lo+n && existing.end > lo && s.copyLeft(existing) != 0 {
 			return false
 		}
 	}
-	// Recent advances moving at least a chunk's worth (or the whole
-	// original range) keep a merely delayed carrier in service. A trickle
-	// below that scale does not restart the frozen deadline.
-	progress := ol.acked - min64(ol.acked, r.ackBase)
-	if progress >= r.d.n {
-		r.ackBase, r.progressAt = ol.acked, source.mp.lastAdvance
-	}
-	if r.progressAt != 0 {
-		if until := r.progressAt.Add(source.mp.currentRTT(s.now) / 2); s.now < until {
-			s.checkPrefixAt(until)
-			return false
-		}
-	}
-	if target, _ := s.prefixReplacement(g, source, n); target == nil || !s.reservePrefixCredit(n) {
+	if !s.reservePrefixCredit(n) {
 		return false
 	}
-	ms.repair = prefixRepair{source: source, lo: lo, hi: lo + n, sent: lo}
-	ms.oppSent.add(lo, lo+n)
+	ms.repair = prefixRepair{source: source, anchor: anchor, lo: lo, hi: lo + n, sent: lo}
 	s.mp.prefixBytes += n
-	s.lost(&frameDesc{kind: dStream, id: st.id, off: lo, n: n})
+	ms.resend.add(lo, lo+n)
+	s.sched.reinstate(st)
+	s.wakeAllWriters()
 	return true
-}
-
-// prefixReplacement compares the best eligible alternative with the
-// original using the same observation that the writer uses for admission.
-func (s *Session) prefixReplacement(g *gate, source *Pipe, n uint64) (*Pipe, bool) {
-	target, eta, eligible := s.prefixTarget(g, source, n)
-	if target == nil {
-		return nil, eligible
-	}
-	// A missed confirmation with no meaningful progress costs another
-	// feedback opportunity on the original path. Demand a further margin
-	// before spending bytes on an alternative.
-	var q pathEstimate
-	if g.usable(s, source) {
-		q = g.pipeQuality(source, g.tierOf(source))
-	} else {
-		pr, _ := source.mp.effPrio()
-		tops := s.fastestOf(pr)
-		q = s.estimate(source, &tops, s.queued(source), 0)
-	}
-	original := q.eta(n) + float64(q.rtt/2)/1e9
-	margin := maxD(s.ack.peerDelay, q.rtt/8)
-	if eta+float64(margin)/1e9 >= original {
-		return nil, true
-	}
-	return target, true
 }

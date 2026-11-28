@@ -19,7 +19,7 @@ import (
 )
 
 func handlerConfig() *Config {
-	return &Config{Clock: timeshim.Real, MaxIdleTimeout: -1, Liveness: Liveness{KeepAlivePeriod: -1}}
+	return &Config{ClockDomain: NewClockDomain(timeshim.Real), MaxIdleTimeout: -1, Liveness: Liveness{KeepAlivePeriod: -1}}
 }
 
 func TestHandlerRegistration(t *testing.T) {
@@ -279,7 +279,7 @@ func TestHandleEventQueueModel(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ev := <-got; !reflect.DeepEqual(ev, first) {
+		if ev := <-got; !reflect.DeepEqual(ev, first) { //nolint:govet // The fixture has no health error payload.
 			t.Fatal(ev)
 		}
 		update := Event{Kind: EventPipePriorityChanged, PipeID: 8, Priority: 1}
@@ -301,7 +301,7 @@ func TestHandleEventQueueModel(t *testing.T) {
 		c.Abort(0, "")
 		synctest.Wait()
 		for _, w := range want {
-			if ev := <-got; !reflect.DeepEqual(ev, w) {
+			if ev := <-got; !reflect.DeepEqual(ev, w) { //nolint:govet // The fixture has no health error payload.
 				t.Fatalf("got %+v want %+v", ev, w)
 			}
 		}
@@ -325,7 +325,7 @@ func TestHandleEventsAfterClose(t *testing.T) {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		if len(want) == 0 || !reflect.DeepEqual(got, want) {
+		if len(want) == 0 || !reflect.DeepEqual(got, want) { //nolint:govet // The fixture has no health error payload.
 			t.Fatalf("post-close delivery %+v want %+v", got, want)
 		}
 		for {
@@ -398,7 +398,7 @@ func TestHandleEventsGoexit(t *testing.T) {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		if len(want) < 2 || want[0].Kind != first.Kind || want[1].Kind != second.Kind || !reflect.DeepEqual(got, want) {
+		if len(want) < 2 || want[0].Kind != first.Kind || want[1].Kind != second.Kind || !reflect.DeepEqual(got, want) { //nolint:govet // The fixture has no health error payload.
 			t.Fatalf("delivered %+v, frozen backlog %+v", got, want)
 		}
 		if c.handlers.eventRunning || c.handlers.event != nil || c.events.head != nil {
@@ -488,7 +488,7 @@ func TestHandleStreamsCloseAfterClaim(t *testing.T) {
 func TestPathAdviceEventSubscriptions(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg, scfg := mpConfig(), mpConfig()
-		cfg.Clock, scfg.Clock = timeshim.Real, timeshim.Real
+		cfg.ClockDomain, scfg.ClockDomain = NewClockDomain(timeshim.Real), NewClockDomain(timeshim.Real)
 		ln := netx.NewChanListener(nil, 0)
 		shape := link{d: time.Millisecond, rate: 20e6, cap: 64 << 10}
 		env := startMPEnv(t, cfg, &ListenerConfig{Config: scfg}, &linkListener{Listener: ln, links: []link{shape}},

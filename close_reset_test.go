@@ -5,16 +5,21 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // A reset made just before a close reaches the peer: the close sends it
 // first, and returns soon after it was sent, not at its bound.
 func TestCloseSendsQueuedReset(t *testing.T) {
-	for range 20 {
+	synctest.Test(t, func(t *testing.T) {
 		a, b := net.Pipe()
-		c, s := pair(t, a, b, nil, nil)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cfg := &Config{ClockDomain: NewClockDomain(timeshim.Real)}
+		c, s := pair(t, a, b, cfg, cfg)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
 		st, err := c.OpenStreamSync(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -29,7 +34,7 @@ func TestCloseSendsQueuedReset(t *testing.T) {
 		r.CancelWrite(9)
 		start := time.Now()
 		_ = s.CloseWithError(0, "")
-		if d := time.Since(start); d > 500*time.Millisecond {
+		if d := time.Since(start); d != 0 {
 			t.Fatalf("close took %v", d)
 		}
 		_, err = st.Read(make([]byte, 16))
@@ -37,6 +42,5 @@ func TestCloseSendsQueuedReset(t *testing.T) {
 		if !errors.As(err, &se) || se.ErrorCode != 9 {
 			t.Fatalf("read after the close: %v", err)
 		}
-		cancel()
-	}
+	})
 }

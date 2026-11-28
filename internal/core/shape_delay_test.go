@@ -99,7 +99,7 @@ func TestShapingDelayHoldsControlFrames(t *testing.T) {
 	if ds.plans != len(recs)+1 && ds.plans != len(recs) {
 		t.Fatalf("%d plans for %d records", ds.plans, len(recs))
 	}
-	s.WriteDone(b, nil, due)
+	s.WriteDone(b, b.Len(), nil, due)
 
 	// CONNECTION_CLOSE goes during a delay.
 	s2, p2 := channelSession(t, nil, false)
@@ -155,7 +155,7 @@ func TestShapingPadPlacement(t *testing.T) {
 			var w recWriter
 			w.init(b, FramingBytes, 65535, 1<<20)
 			w.sh = ps
-			if !w.stream(0, 0, data, pin{}, false) {
+			if !w.stream(0, 0, data, pin{}, false, len(data)) {
 				t.Fatal("stream frame refused")
 			}
 			w.end()
@@ -254,7 +254,7 @@ func TestShapingPlansARecordOnce(t *testing.T) {
 	if n := b.Len(); n < 768 {
 		t.Fatalf("%d bytes: the record did not keep its plan's pad_to 768", n)
 	}
-	s.WriteDone(b, nil, end)
+	s.WriteDone(b, b.Len(), nil, end)
 	if len(x.seqs) == 0 || len(x.seqs) > 2 || x.seqs[0] != 0 || len(x.seqs) == 2 && x.seqs[1] != 1 {
 		t.Fatalf("Plan calls by Seq %v, want one for record 0 (then record 1)", x.seqs)
 	}

@@ -33,18 +33,16 @@ import (
 // fails it at once. Carriers already serving sessions continue: they end
 // with their sessions, as other carriers do, or all at once with Close.
 type ExchangeHandler struct {
-	ctx    context.Context
-	l      *zmux.Listener
-	cancel context.CancelFunc
-	o      Options
-	p      exParams
-	wg     sync.WaitGroup // HandlePipe goroutines
-
-	nonces *admit.ReplayFilter
-
+	ctx      context.Context
+	l        *zmux.Listener
+	cancel   context.CancelFunc
+	nonces   *admit.ReplayFilter
 	carriers map[[exCIDLen]byte]*exServer
 	gone     map[[exCIDLen]byte]*exKey
+	o        Options
 	goneQ    []exGone // in expiry order
+	p        exParams
+	wg       sync.WaitGroup // HandlePipe goroutines
 	mu       sync.Mutex
 	closed   bool
 }
@@ -198,7 +196,11 @@ func (h *ExchangeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Data and the Data MAC, within the handshake timeout.
 	buf, rest, err := h.readBody(r.Context(), a, w, r.Body, cl-authLen, h.l.Adapter().Clock().Now().Add(h.l.Adapter().HandshakeTimeout()))
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		if errors.Is(err, zmux.ErrMemoryBudget) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
 		return
 	}
 	defer buf.unref()
@@ -279,7 +281,7 @@ func (h *ExchangeHandler) readBody(ctx context.Context, a *zmux.Arrival, w http.
 	unlink := watchExchangeRead(ctx, a, w)
 	defer unlink()
 	stop := h.readDeadline(w, deadline)
-	buf, b, err := readExBody(body, n, h.p.b64)
+	buf, b, err := readExBody(body, n, h.p.b64, h.l.Adapter())
 	if !stop() && err == nil {
 		buf.unref()
 		err = errReadTimedOut
@@ -401,6 +403,9 @@ func (h *ExchangeHandler) create(w http.ResponseWriter, r *http.Request, a *zmux
 	fallback := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.fallback(w, r, h.replayed(raw[:authLen], rest))
 	})
+	if len(h.p.psk) != 0 {
+		r = httpx.WithAuthenticatedEnvelope(r)
+	}
 	if !a.DecideRequest(w, r, fallback) {
 		return nil, exAnswered
 	}
@@ -562,10 +567,19 @@ func (h *ExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exReq, f
 	hh.Set("Cache-Control", "no-store")
 	n := exRespHdr + len(data)
 	if h.p.b64 {
-		bin := getExBuf(n)
+		bin := takeExBuf(n, h.l.Adapter())
+		if bin == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return false
+		}
 		copy(bin.b, hdr[:])
 		copy(bin.b[exRespHdr:], data)
-		enc := getExBuf(b64Len(n))
+		enc := takeExBuf(b64Len(n), h.l.Adapter())
+		if enc == nil {
+			bin.unref()
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return false
+		}
 		base64.StdEncoding.Encode(enc.b, bin.b[:n])
 		bin.unref()
 		hh.Set("Content-Length", strconv.Itoa(b64Len(n)))
@@ -589,44 +603,40 @@ func (h *ExchangeHandler) respond(w http.ResponseWriter, key *exKey, q *exReq, f
 // is owned by mu. Held DOWN requests wait in their HTTP handlers, each
 // bounded by the hold time; zmux reads and writes through the halves.
 type exServer struct {
-	h   *ExchangeHandler
-	cid [exCIDLen]byte
-	key *exKey
-
-	mu       sync.Mutex
-	rc, wc   sync.Cond     // uplink reader, downlink writer
+	last     time.Time
+	curAt    time.Time
+	err      error // failure seen by zmux (nil: completed)
+	h        *ExchangeHandler
+	key      *exKey
 	assigned chan struct{} // closed and replaced when a piece is assigned
 	dead     chan struct{} // closed when the carrier ends
-	err      error         // failure seen by zmux (nil: completed)
-	last     time.Time
 	idle     *time.Timer
 	coal     *time.Timer
-	mem      int64 // charged to the listener's budget
-	ended    bool
+	upOOO    map[uint64]*exPiece  // received above upNext
+	pieces   map[uint64]*exAssign // assigned, not yet released
+	cur      *exBuf               // bytes of piece fill
+	rc, wc   sync.Cond            // uplink reader, downlink writer
+	upQ      []*exPiece           // contiguous, not yet read by zmux
+	// uplink
+	upNext uint64 // lowest number not received
+	upMax  uint64 // highest number received plus one
+	upLen  int    // bytes in upOOO and upQ, and exPieceCost per piece in upOOO
+	upFin  uint64
+	// downlink
+	ack    uint64 // highest Down Ack received
+	asgEnd uint64 // highest assigned number plus one
+	fill   uint64 // lowest unassigned number: the piece bytes go to
+	curLen int
+	nheld  int    // held DOWN requests
+	finLow uint64 // lowest FIN piece, when finOK
+	mu     sync.Mutex
+	cid    [exCIDLen]byte
+	ended  bool
 	// The flags of the uplink and the downlink, kept with ended.
 	upFinOK bool // uplink: upFin is set
 	rclosed bool // uplink: zmux closed the read side
 	wclosed bool // downlink: zmux closed the write side
 	finOK   bool // downlink: finLow is set
-
-	// uplink
-	upNext uint64              // lowest number not received
-	upMax  uint64              // highest number received plus one
-	upOOO  map[uint64]*exPiece // received above upNext
-	upQ    []*exPiece          // contiguous, not yet read by zmux
-	upLen  int                 // bytes in upOOO and upQ, and exPieceCost per piece in upOOO
-	upFin  uint64
-
-	// downlink
-	ack    uint64               // highest Down Ack received
-	pieces map[uint64]*exAssign // assigned, not yet released
-	asgEnd uint64               // highest assigned number plus one
-	fill   uint64               // lowest unassigned number: the piece bytes go to
-	cur    *exBuf               // bytes of piece fill
-	curLen int
-	curAt  time.Time
-	nheld  int    // held DOWN requests
-	finLow uint64 // lowest FIN piece, when finOK
 }
 
 // exAssign is an assigned downlink piece. pieces holds one reference to
@@ -644,11 +654,6 @@ func newExServer(h *ExchangeHandler, cid [exCIDLen]byte, key *exKey) *exServer {
 	c.rc.L, c.wc.L = &c.mu, &c.mu
 	c.idle = time.AfterFunc(h.p.idle, c.onIdle)
 	return c
-}
-
-func (c *exServer) charge(d int64) {
-	c.mem += d
-	c.h.l.Adapter().ChargeMemory(d)
 }
 
 func (c *exServer) onIdle() {
@@ -711,7 +716,6 @@ func (c *exServer) endLocked(err error) bool {
 		delete(c.pieces, n)
 	}
 	if c.cur != nil {
-		c.charge(-int64(len(c.cur.b)))
 		c.cur.unref()
 		c.cur, c.curLen = nil, 0
 	}
@@ -737,7 +741,6 @@ func (c *exServer) dropUplinkLocked() {
 
 func (c *exServer) freePieceLocked(p *exPiece) {
 	if p.buf != nil {
-		c.charge(-int64(len(p.buf.b)))
 		p.buf.unref()
 		p.buf = nil
 	}
@@ -753,9 +756,7 @@ func (c *exServer) dropPieceLocked(b *exBuf) {
 	if b == nil {
 		return
 	}
-	if size := int64(len(b.b)); b.unref() {
-		c.charge(-size)
-	}
+	b.unref()
 }
 
 // completeLocked ends a completed carrier.
@@ -876,7 +877,6 @@ func (c *exServer) upLocked(q *exReq, buf *exBuf) byte {
 	}
 	if keep {
 		p.buf, p.data = buf, q.data
-		c.charge(int64(len(buf.b)))
 	} else {
 		buf.unref()
 	}
@@ -1114,12 +1114,11 @@ func (w *exServerWriter) Write(p []byte) (int, error) {
 			continue
 		}
 		n := min(lim-c.curLen, len(p))
-		old := 0
-		if c.cur != nil {
-			old = len(c.cur.b)
+		next := exGrow(c.cur, c.curLen, c.curLen+n, lim, c.h.l.Adapter())
+		if next == nil {
+			return total, zmux.ErrMemoryBudget
 		}
-		c.cur = exGrow(c.cur, c.curLen, c.curLen+n, lim)
-		c.charge(int64(len(c.cur.b) - old))
+		c.cur = next
 		copy(c.cur.b[c.curLen:], p[:n])
 		if c.curLen == 0 {
 			c.curAt = time.Now()

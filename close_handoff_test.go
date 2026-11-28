@@ -1,12 +1,15 @@
 package zmux
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,7 +35,11 @@ func closeExitConfig() *Config {
 // timeout, ends with the application close.
 func TestCloseThenExit(t *testing.T) {
 	if addr := os.Getenv(closeExitEnv); addr != "" {
-		os.Exit(closeExitChild(addr))
+		if err := closeExitChild(addr); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 		return
 	}
 	leakcheck.Check(t)
@@ -40,69 +47,121 @@ func TestCloseThenExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := runCloseExit(t.Context(), ln, ln.Addr().String()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseThenExitChildDialFailure(t *testing.T) {
+	leakcheck.Check(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A syntactically invalid address makes the child fail before any TCP
+	// connection reaches the listener.
+	err = runCloseExit(t.Context(), ln, "missing-port")
+	if err == nil || !strings.Contains(err.Error(), "child dial:") {
+		t.Fatalf("expected the child's dial error, got %v", err)
+	}
+}
+
+func runCloseExit(parent context.Context, ln net.Listener, addr string) error {
 	defer func() { _ = ln.Close() }()
 	lst := mustNewListener(&ListenerConfig{Config: closeExitConfig(), InstanceID: []byte("instance")})
 	defer func() { _ = lst.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	wg.Go(func() {
-		c, err := ln.Accept()
-		if err == nil {
-			_ = lst.HandlePipe(ctx, NetPipe(c), PipeHint{})
-		}
-	})
+	deadline, stop := context.WithTimeout(parent, 20*time.Second)
+	defer stop()
+	ctx, cancel := context.WithCancelCause(deadline)
+	closeListener := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer closeListener()
+
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCloseThenExit$", "-test.count=1")
-	cmd.Env = append(os.Environ(), closeExitEnv+"="+ln.Addr().String())
+	cmd.Env = append(os.Environ(), closeExitEnv+"="+addr)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
+		cancel(err)
+		return fmt.Errorf("start child: %w", err)
+	}
+	childDone := make(chan struct{})
+	go func() {
+		defer close(childDone)
+		if err := cmd.Wait(); err != nil {
+			cancel(fmt.Errorf("child exit: %w: %s", err, bytes.TrimSpace(stderr.Bytes())))
+		}
+	}()
+	defer func() {
+		cancel(nil)
+		<-childDone
+	}()
+
+	nc, err := ln.Accept()
+	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		return fmt.Errorf("accept child TCP connection: %w", err)
+	}
+	if err := lst.HandlePipe(ctx, NetPipe(nc), PipeHint{}); err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		return fmt.Errorf("attach child carrier: %w", err)
 	}
 	server, err := lst.Accept(ctx)
 	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		t.Fatal(err)
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		return fmt.Errorf("accept child session: %w", err)
 	}
-	if err := cmd.Wait(); err != nil {
-		t.Fatalf("child: %v", err)
+	defer func() {
+		server.Abort(0, "")
+		<-server.Done()
+	}()
+	<-childDone
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
 	}
-	ended := make(chan error, 1)
-	go func() { ended <- server.Wait() }()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
 	select {
-	case err := <-ended:
+	case <-server.Done():
+		err := server.Wait()
+		if err == nil {
+			return errors.New("the peer ended without application close 7")
+		}
 		var ae *ApplicationError
 		if !errors.As(err, &ae) || ae.ErrorCode != 7 {
-			t.Fatalf("the peer ended with %v, not the application close", err)
+			return fmt.Errorf("want application close 7: %w", err)
 		}
-	case <-time.After(5 * time.Second):
-		_ = server.Close()
-		if err := <-ended; err == nil {
-			t.Log("the session ended without an error")
-		}
-		t.Fatal("the peer still holds the session after the closer exited")
+		return nil
+	case <-timer.C:
+		return errors.New("the peer still holds the session after the closer exited")
 	}
 }
 
 // closeExitChild opens a session, closes it (twice: a repeat is safe) and
 // exits at once.
-func closeExitChild(addr string) int {
+func closeExitChild(addr string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	nc, err := net.Dial("tcp", addr)
+	nc, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
-		return 2
+		return fmt.Errorf("child dial: %w", err)
 	}
 	c, err := Client(ctx, nc, closeExitConfig())
 	if err != nil {
-		return 3
+		return fmt.Errorf("child session: %w", err)
 	}
 	if _, err := c.Ping(ctx); err != nil {
-		return 4
+		return fmt.Errorf("child ping: %w", err)
 	}
 	_ = c.CloseWithError(7, "bye")
 	_ = c.Close()
-	return 0
+	return nil
 }
 
 // stallConn blocks its writes while stalled, until it is closed.
@@ -126,6 +185,10 @@ func (s *stallConn) Close() error {
 	return s.Conn.Close()
 }
 
+func closeTestConfig() *Config {
+	return &Config{ClockDomain: NewClockDomain(timeshim.Real)}
+}
+
 // A carrier that does not take CONNECTION_CLOSE ends Close at the limit:
 // the carriers are closed and the session ends.
 func TestCloseHandOffLimit(t *testing.T) {
@@ -134,23 +197,7 @@ func TestCloseHandOffLimit(t *testing.T) {
 		defer cancel()
 		a, b := net.Pipe()
 		sc := &stallConn{Conn: a, closed: make(chan struct{})}
-		ch := make(chan *Conn, 1)
-		go func() {
-			s, err := Server(ctx, b, &Config{Clock: timeshim.Real})
-			if err != nil {
-				s = nil
-			}
-			ch <- s
-		}()
-		client, err := Client(ctx, sc, &Config{Clock: timeshim.Real})
-		if err != nil {
-			t.Fatal(err)
-		}
-		server := <-ch
-		if server == nil {
-			t.Fatal("no server session")
-		}
-		defer func() { _ = server.Close(); _ = server.Wait() }()
+		client, _ := bubblePairOn(t, sc, b, closeTestConfig)
 		if _, err := client.Ping(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -187,23 +234,7 @@ func TestCloseAfterAbortReturnsAtOnce(t *testing.T) {
 		defer cancel()
 		a, b := net.Pipe()
 		sc := &stallConn{Conn: a, closed: make(chan struct{})}
-		ch := make(chan *Conn, 1)
-		go func() {
-			s, err := Server(ctx, b, &Config{Clock: timeshim.Real})
-			if err != nil {
-				s = nil
-			}
-			ch <- s
-		}()
-		client, err := Client(ctx, sc, &Config{Clock: timeshim.Real})
-		if err != nil {
-			t.Fatal(err)
-		}
-		server := <-ch
-		if server == nil {
-			t.Fatal("no server session")
-		}
-		defer func() { _ = server.Close(); _ = server.Wait() }()
+		client, _ := bubblePairOn(t, sc, b, closeTestConfig)
 		if _, err := client.Ping(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -223,31 +254,13 @@ func TestCloseAfterAbortReturnsAtOnce(t *testing.T) {
 // CONNECTION_CLOSE whoever closed.
 func TestIdleCloseStalledCarrierEnds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
 		a, b := net.Pipe()
 		sc := &stallConn{Conn: a, closed: make(chan struct{})}
 		cfg := func() *Config {
-			return &Config{Clock: timeshim.Real, MaxIdleTimeout: 3 * time.Second,
+			return &Config{ClockDomain: NewClockDomain(timeshim.Real), MaxIdleTimeout: 3 * time.Second,
 				Liveness: Liveness{KeepAlivePeriod: -1}}
 		}
-		ch := make(chan *Conn, 1)
-		go func() {
-			s, err := Server(ctx, b, cfg())
-			if err != nil {
-				s = nil
-			}
-			ch <- s
-		}()
-		client, err := Client(ctx, sc, cfg())
-		if err != nil {
-			t.Fatal(err)
-		}
-		server := <-ch
-		if server == nil {
-			t.Fatal("no server session")
-		}
-		defer func() { _ = server.Close(); _ = server.Wait() }()
+		client, _ := bubblePairOn(t, sc, b, cfg)
 		sc.stall.Store(true)
 		t0 := time.Now()
 		_ = client.Wait()
@@ -264,23 +277,7 @@ func TestCloseHandOffSyncCarrier(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		a, b := net.Pipe()
-		ch := make(chan *Conn, 1)
-		go func() {
-			s, err := Server(ctx, b, &Config{Clock: timeshim.Real})
-			if err != nil {
-				s = nil
-			}
-			ch <- s
-		}()
-		client, err := Client(ctx, a, &Config{Clock: timeshim.Real})
-		if err != nil {
-			t.Fatal(err)
-		}
-		server := <-ch
-		if server == nil {
-			t.Fatal("no server session")
-		}
+		client, server := bubblePair(t, closeTestConfig)
 		if _, err := client.Ping(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -327,88 +324,64 @@ func TestCloseUnderPeerWritesNoReset(t *testing.T) {
 
 func closeUnderPeerWrites(t *testing.T, round int) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ln.Close() }()
-	type res struct {
-		c  *Conn
-		nc net.Conn
-	}
-	ch := make(chan res, 1)
-	go func() {
-		nc, err := ln.Accept()
-		if err != nil {
-			ch <- res{}
-			return
-		}
-		s, err := Server(ctx, nc, nil)
-		if err != nil {
-			_ = nc.Close()
-			s = nil
-		}
-		ch <- res{s, nc}
-	}()
-	raw, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	spy := &resetSpy{Conn: raw}
-	client, err := Client(ctx, spy, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sr := <-ch
-	if sr.c == nil {
-		t.Fatal("no server session")
-	}
-	server := sr.c
+	a, b := tcpPair(t)
+	spy := &resetSpy{Conn: a}
+	client, server := pair(t, spy, b, nil, nil)
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		st, err := server.AcceptStream(ctx)
-		if err == nil {
-			_, _ = io.Copy(io.Discard, st)
-		}
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+		wg.Wait()
 	})
-	st, err := client.OpenStream()
+	st, err := client.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]byte, 64<<10)
 	wg.Go(func() {
+		buf := make([]byte, 64<<10)
 		for {
 			if _, err := st.Write(buf); err != nil {
 				return
 			}
 		}
 	})
-	time.Sleep(100 * time.Millisecond) // the peer writes at full speed
+	in, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := in.ReadChunk(ctx, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+	wg.Go(func() { _, _ = io.Copy(io.Discard, in) })
 	server.Abort(9, "bye")
-	_ = server.Wait() // the background half-close and linger
-	_ = sr.nc.Close() // then the process exits: no unread data resets
+	waitTestSignal(t, server.Done(), "server half-close and linger")
+	_ = b.Close() // the server drops its socket
+	waitTestSignal(t, client.Done(), "client session end")
 	err = client.Wait()
 	var ae *ApplicationError
 	if !errors.As(err, &ae) || ae.ErrorCode != 9 {
-		t.Fatalf("round %d: the peer ended with %v, not the close code (reset read: %v)", round, err, spy.reset.Load())
+		t.Fatalf("round %d: the peer ended with %v, want the close code (reset read: %v)", round, err, spy.reset.Load())
 	}
 	if spy.reset.Load() {
 		t.Fatalf("round %d: the peer's carrier was reset", round)
 	}
-	wg.Wait()
 }
 
 // stuckCloseWrite is a carrier whose CloseWrite blocks until it is closed,
 // like a TLS close_notify behind a full send buffer.
 type stuckCloseWrite struct {
 	net.Conn
-	closed chan struct{}
-	once   sync.Once
+	blocked chan struct{}
+	closed  chan struct{}
+	once    sync.Once
 }
 
 func (s *stuckCloseWrite) CloseWrite() error {
+	close(s.blocked)
 	<-s.closed
 	return net.ErrClosed
 }
@@ -418,85 +391,36 @@ func (s *stuckCloseWrite) Close() error {
 	return s.Conn.Close()
 }
 
-// stallReads blocks its reads while stalled, until it is closed.
-type stallReads struct {
-	net.Conn
-	closed chan struct{}
-	once   sync.Once
-	stall  atomic.Bool
-}
-
-func (s *stallReads) Read(b []byte) (int, error) {
-	if s.stall.Load() {
-		<-s.closed
-		return 0, net.ErrClosed
-	}
-	return s.Conn.Read(b)
-}
-
-func (s *stallReads) Close() error {
-	s.once.Do(func() { close(s.closed) })
-	return s.Conn.Close()
-}
-
-// A half-close that blocks (the peer does not read, as a TLS close_notify
-// behind a full send buffer) does not hold Close past its limit: the
-// carrier is aborted, which releases the writer.
+// A blocked half-close holds Close until the hand-off limit. At that
+// limit the carrier is aborted, releasing the blocked writer.
 func TestCloseBlockedHalfCloseLimit(t *testing.T) {
 	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ln.Close() }()
-	ch := make(chan *Conn, 1)
-	var peer *stallReads
-	go func() {
-		nc, err := ln.Accept()
-		if err != nil {
-			ch <- nil
-			return
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		sc := &stuckCloseWrite{Conn: a, blocked: make(chan struct{}), closed: make(chan struct{})}
+		peer := newProbe(b)
+		client, _ := closeWithFrozenClock(t, sc, peer)
+		peer.mute.Store(true)
+		defer peer.mute.Store(false)
+		closed := make(chan struct{})
+		start := time.Now()
+		go func() { defer close(closed); _ = client.Close() }()
+		waitTestSignal(t, sc.blocked, "carrier half-close")
+		synctest.Wait()
+		select {
+		case <-closed:
+			t.Fatal("Close returned with the carrier's half-close blocked")
+		default:
 		}
-		peer = &stallReads{Conn: newDelayConn(nc, 250*time.Millisecond, 1e9, 1<<20), closed: make(chan struct{})}
-		s, err := Server(ctx, peer, nil)
-		if err != nil {
-			_ = nc.Close()
-			s = nil
+		waitTestSignal(t, closed, "Close return")
+		if elapsed := time.Since(start); elapsed != closeLimit {
+			t.Fatalf("Close returned after %v, want %v", elapsed, closeLimit)
 		}
-		ch <- s
-	}()
-	raw, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 500 ms round trips: the linger timeout (3 x SRTT) outlasts Close's
-	// limit, so only the limit can end the blocked half-close.
-	sc := &stuckCloseWrite{Conn: newDelayConn(raw, 250*time.Millisecond, 1e9, 1<<20), closed: make(chan struct{})}
-	client, err := Client(ctx, sc, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := <-ch
-	if server == nil {
-		t.Fatal("no server session")
-	}
-	defer func() { _ = server.Close(); _ = server.Wait() }()
-	if _, err := client.Ping(ctx); err != nil {
-		t.Fatal(err)
-	}
-	peer.stall.Store(true)
-	t0 := time.Now()
-	_ = client.Close()
-	if d := time.Since(t0); d > closeLimit+300*time.Millisecond {
-		t.Fatalf("Close took %v with a limit of %v", d, closeLimit)
-	}
-	waited := make(chan struct{})
-	go func() { _ = client.Wait(); close(waited) }()
-	select {
-	case <-waited:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the session did not end after the limit")
-	}
+		synctest.Wait()
+		select {
+		case <-client.Done():
+		default:
+			t.Fatal("the hand-off limit did not release the blocked writer")
+		}
+	})
 }

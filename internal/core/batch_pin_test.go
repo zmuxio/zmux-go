@@ -24,7 +24,7 @@ func TestBatchPinsOnlyReferencedPieces(t *testing.T) {
 		blks = append(blks, st.snd.q.segs[0].blk)
 	}
 	big, _ := s.OpenStream(true)
-	if _, err := s.Write(big, bytes.Repeat([]byte{8}, 2*refThreshold), false); err != nil {
+	if _, err := s.Write(big, bytes.Repeat([]byte{8}, 2*inlineSendLimit), false); err != nil {
 		t.Fatal(err)
 	}
 	b := GetBatch()
@@ -39,5 +39,5 @@ func TestBatchPinsOnlyReferencedPieces(t *testing.T) {
 			t.Fatalf("stream %d block keeps %d references", i, n)
 		}
 	}
-	s.WriteDone(b, nil, now)
+	s.WriteDone(b, b.Len(), nil, now)
 }

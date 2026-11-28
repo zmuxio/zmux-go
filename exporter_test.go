@@ -9,9 +9,13 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -62,7 +66,7 @@ func kmPair(secret string) (*kmConn, *kmConn) {
 }
 
 func exporterConfig() *Config {
-	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true},
+	return &Config{SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true},
 		AllowRecordMode: func(RecordPolicyInput, RecordMode, any) bool { return true },
 		SchedulerParams: SchedulerParams{Probation: -1}}
 }
@@ -160,11 +164,16 @@ func TestExporterTLSBeforeHandshake(t *testing.T) {
 // exporter fails until the handshake completed.
 type earlyKM struct {
 	*kmConn
-	done chan struct{}
+	done    chan struct{}
+	waiting chan struct{}
+	once    sync.Once
 }
 
-func (e *earlyKM) UsedEarlyData() bool                { return true }
-func (e *earlyKM) HandshakeComplete() <-chan struct{} { return e.done }
+func (e *earlyKM) UsedEarlyData() bool { return true }
+func (e *earlyKM) HandshakeComplete() <-chan struct{} {
+	e.once.Do(func() { close(e.waiting) })
+	return e.done
+}
 func (e *earlyKM) ExportKeyingMaterial(label string, ctx []byte, n int) ([]byte, error) {
 	select {
 	case <-e.done:
@@ -178,29 +187,54 @@ func (e *earlyKM) ExportKeyingMaterial(label string, ctx []byte, n int) ([]byte,
 // handshake of a carrier that delivered it as early data completed.
 func TestExporterEarlyJoin(t *testing.T) {
 	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	lst := mustNewListener(&ListenerConfig{Config: exporterConfig()})
-	defer func() { _ = lst.Close() }()
-	ck, sk := kmPair("s0")
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, PipeHint{}) }()
-	c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, exporterConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s, err := lst.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
-	cj, sj := kmPair("j1")
-	ej := &earlyKM{kmConn: sj, done: make(chan struct{})}
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: ej, W: ej}, PipeHint{}) }()
-	time.AfterFunc(100*time.Millisecond, func() { close(ej.done) })
-	if _, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{RecordMode: Set(RecordBound)}); err != nil {
-		t.Fatalf("Bound join: %v", err)
-	}
-	waitUntil(t, 5*time.Second, "the join", func() bool { return len(s.PipeStats()) == 2 })
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		cfg := exporterConfig()
+		cfg.ClockDomain = NewClockDomain(timeshim.Real)
+		lst := mustNewListener(&ListenerConfig{Config: cfg})
+		defer func() { _ = lst.Close() }()
+		ck, sk := kmPair("s0")
+		go func() { _ = lst.HandlePipe(ctx, PipeIO{R: sk, W: sk}, PipeHint{}) }()
+		c, err := Start(ctx, PipeIO{R: ck, W: ck}, RoleClient, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := lst.Accept(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
+		cj, sj := kmPair("j1")
+		ej := &earlyKM{kmConn: sj, done: make(chan struct{}), waiting: make(chan struct{})}
+		go func() { _ = lst.HandlePipe(ctx, PipeIO{R: ej, W: ej}, PipeHint{}) }()
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.AddPipe(ctx, PipeIO{R: cj, W: cj}, PipeOptions{RecordMode: Set(RecordBound)})
+			done <- err
+		}()
+		select {
+		case <-ej.waiting:
+		case err := <-done:
+			t.Fatalf("join ended before exporter became available: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("join ended while waiting for the handshake: %v", err)
+		default:
+		}
+		close(ej.done)
+		if err := <-done; err != nil {
+			t.Fatalf("Bound join: %v", err)
+		}
+		synctest.Wait()
+		if n := len(s.PipeStats()); n != 2 {
+			t.Fatalf("server has %d pipes after the join", n)
+		}
+	})
 }
 
 // A failed exporter read closes the session with INTERNAL_ERROR.

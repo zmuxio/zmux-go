@@ -2,15 +2,9 @@ package zmux
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"errors"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,28 +12,18 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
+	"github.com/zmuxio/zmux-go/internal/testcert"
 )
 
 func selfSignedTLS(t testing.TB) (srv, cli *tls.Config) {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"},
-		DNSNames: []string{"localhost"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, _ := x509.ParseCertificate(der)
-	pool := x509.NewCertPool()
-	pool.AddCert(cert)
-	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}},
-		&tls.Config{RootCAs: pool, ServerName: "localhost"}
+	cert, trust := testcert.Local(t)
+	return &tls.Config{Certificates: []tls.Certificate{cert}},
+		&tls.Config{RootCAs: trust, ServerName: testcert.LocalName}
 }
 
 // TestStallDurationBySource checks that a stall's duration is in the
@@ -83,43 +67,48 @@ func TestStallDurationBySource(t *testing.T) {
 // a slot for a new attempt.
 func TestStallCountsPerSource(t *testing.T) {
 	leakcheck.Check(t)
-	a := &Admission{Decide: func(context.Context, CarrierInfo, []byte) Decision {
-		return Decision{Verdict: VerdictFallback, Variant: "targetless"}
-	},
-		StallMin: time.Minute, StallMax: time.Minute}
-	lst := mustNewListener(&ListenerConfig{MaxPendingPerSource: 3, Admission: a})
-	defer func() { _ = lst.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	src := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}
-	clients := make([]net.Conn, 0, 2)
-	done := make(chan struct{}, 3)
-	for range 2 {
+	synctest.Test(t, func(t *testing.T) {
+		a := &Admission{Decide: func(context.Context, CarrierInfo, []byte) Decision {
+			return Decision{Verdict: VerdictFallback, Variant: "targetless"}
+		},
+			StallMin: time.Minute, StallMax: time.Minute}
+		lst := mustNewListener(&ListenerConfig{MaxPendingPerSource: 3, Admission: a})
+		defer func() { _ = lst.Close() }()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		src := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}
+		clients := make([]net.Conn, 0, 2)
+		done := make(chan struct{}, 3)
+		for range 2 {
+			c, s := net.Pipe()
+			clients = append(clients, c)
+			go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{s, src}), PipeHint{}); done <- struct{}{} }()
+		}
+		synctest.Wait()
+		if n := lst.Stats().Admission.Stalled; n != 2 {
+			t.Fatalf("%d carriers stalled, want 2", n)
+		}
+		// The third: the source has its share of stalled carriers.
 		c, s := net.Pipe()
-		clients = append(clients, c)
 		go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{s, src}), PipeHint{}); done <- struct{}{} }()
-	}
-	waitUntil(t, 5*time.Second, "two stalled", func() bool { return lst.Stats().Admission.Stalled == 2 })
-	// The third: the source has its share of stalled carriers.
-	c, s := net.Pipe()
-	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{s, src}), PipeHint{}); done <- struct{}{} }()
-	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
-		t.Fatalf("read %v, want the end", err)
-	}
-	<-done
-	_ = c.Close()
-	if st := lst.Stats().Admission; st.StallOverflow != 1 || st.Stalled != 2 {
-		t.Fatalf("stats %+v", st)
-	}
-	if got := lst.VariantStats(); len(got) != 1 || got[0] != (VariantStat{Name: "targetless", Stalled: 3}) {
-		t.Fatalf("variants %+v", got)
-	}
-	cancel()
-	for _, c := range clients {
+		if _, err := c.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("read %v, want the end", err)
+		}
+		<-done
 		_ = c.Close()
-	}
-	<-done
-	<-done
+		if st := lst.Stats().Admission; st.StallOverflow != 1 || st.Stalled != 2 {
+			t.Fatalf("stats %+v", st)
+		}
+		if got := lst.VariantStats(); len(got) != 1 || got[0] != (VariantStat{Name: "targetless", Stalled: 3}) {
+			t.Fatalf("variants %+v", got)
+		}
+		cancel()
+		for _, c := range clients {
+			_ = c.Close()
+		}
+		<-done
+		<-done
+	})
 }
 
 // TestAdmitBeforeHandshake answers 425 to a request read before its TLS
@@ -177,44 +166,46 @@ type addrConn struct {
 func (c addrConn) RemoteAddr() net.Addr { return c.remote }
 
 // TestServeConnSource counts a carrier accepted with prefix bytes left
-// over against its own remote host: two silent carriers from two hosts
-// each hold a pending slot under MaxPendingPerSource 1.
+// over against its own remote host: two silent carriers from each of two hosts
+// fill that source's slots without limiting the other one.
 func TestServeConnSource(t *testing.T) {
 	leakcheck.Check(t)
-	a := &Admission{Peek: 2, Decide: func(context.Context, CarrierInfo, []byte) Decision {
-		return Decision{Verdict: VerdictAccept, Skip: 1}
-	}}
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1, FirstRecordTimeout: 10 * time.Second, Admission: a})
-	ctx, cancel := context.WithCancel(context.Background())
-	clients := make([]net.Conn, 0, 2)
-	done := make(chan struct{}, 2)
-	for _, host := range []string{"192.0.2.1", "192.0.2.2"} {
-		c, s := net.Pipe()
-		clients = append(clients, c)
-		go func() {
-			_ = lst.HandlePipe(ctx, NetPipe(addrConn{s, &net.TCPAddr{IP: net.ParseIP(host), Port: 1}}), PipeHint{})
-			done <- struct{}{}
-		}()
-		if _, err := c.Write([]byte{0, 0x40}); err != nil {
-			t.Fatal(err)
+	synctest.Test(t, func(t *testing.T) {
+		a := &Admission{Peek: 2, Decide: func(context.Context, CarrierInfo, []byte) Decision {
+			return Decision{Verdict: VerdictAccept, Skip: 1}
+		}}
+		lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 2, FirstRecordTimeout: 10 * time.Second, Admission: a})
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		defer func() { _ = lst.Close() }()
+		hosts := []string{"192.0.2.1", "192.0.2.1", "192.0.2.2", "192.0.2.2"}
+		done := make(chan struct{}, len(hosts))
+		for _, host := range hosts {
+			c, s := net.Pipe()
+			t.Cleanup(func() { _ = c.Close() })
+			go func() {
+				_ = lst.HandlePipe(ctx, NetPipe(addrConn{s, &net.TCPAddr{IP: net.ParseIP(host), Port: 1}}), PipeHint{})
+				done <- struct{}{}
+			}()
+			if _, err := c.Write([]byte{0, 0x40}); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	// The leftover byte starts a record; neither carrier is refused.
-	for i, c := range clients {
-		_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-		_, err := c.Read(make([]byte, 1))
-		var ne net.Error
-		if !errors.As(err, &ne) || !ne.Timeout() {
-			t.Fatalf("carrier %d: %v, want a timeout", i, err)
+		// All carriers are blocked reading the record started by the leftover byte.
+		synctest.Wait()
+		lst.pmu.Lock()
+		pending := lst.pending.Total()
+		lst.pmu.Unlock()
+		if pending != len(hosts) || len(done) != 0 {
+			t.Fatalf("pending carriers = %d, completed = %d", pending, len(done))
 		}
-	}
-	cancel()
-	_ = lst.Close()
-	for _, c := range clients {
-		_ = c.Close()
-	}
-	<-done
-	<-done
+		cancel()
+		_ = lst.Close()
+
+		for range hosts {
+			<-done
+		}
+	})
 }
 
 // TestCloseEndsFallbackStall: a carrier stalled for a fallback without
@@ -222,28 +213,27 @@ func TestServeConnSource(t *testing.T) {
 // closes.
 func TestCloseEndsFallbackStall(t *testing.T) {
 	leakcheck.Check(t)
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: 4, PeekTimeout: 5 * time.Second,
-		StallMin: time.Minute, StallMax: time.Minute,
-		Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictFallback} }}})
-	a, b := net.Pipe()
-	defer func() { _ = a.Close() }()
-	done := make(chan struct{})
-	go func() { _ = lst.HandlePipe(context.Background(), NetPipe(b), PipeHint{}); close(done) }()
-	if _, err := a.Write([]byte("abcd")); err != nil {
-		t.Fatal(err)
-	}
-	for end := time.Now().Add(5 * time.Second); lst.Stats().Admission.Stalled != 1; time.Sleep(time.Millisecond) {
-		if time.Now().After(end) {
+	synctest.Test(t, func(t *testing.T) {
+		lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{Peek: 4, PeekTimeout: 5 * time.Second,
+			StallMin: time.Minute, StallMax: time.Minute,
+			Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictFallback} }}})
+		a, b := net.Pipe()
+		defer func() { _ = a.Close() }()
+		done := make(chan struct{})
+		go func() { _ = lst.HandlePipe(context.Background(), NetPipe(b), PipeHint{}); close(done) }()
+		if _, err := a.Write([]byte("abcd")); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if lst.Stats().Admission.Stalled != 1 {
 			t.Fatalf("stats %+v", lst.Stats())
 		}
-	}
-	go func() { _, _ = io.Copy(io.Discard, a) }()
-	_ = lst.Close()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the stall outlived Listener.Close")
-	}
+		peerClosed := make(chan struct{})
+		go func() { _, _ = io.Copy(io.Discard, a); close(peerClosed) }()
+		_ = lst.Close()
+		<-done
+		<-peerClosed
+	})
 }
 
 // TestSourcePrefixes checks the source aggregation of

@@ -9,7 +9,10 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -117,7 +120,9 @@ func admitOnce(t *testing.T, adm *Admission, p func() (PipeIO, func()), seen *[]
 		mu.Unlock()
 		return decide(ctx, info, prefix)
 	}
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm})
+	cfg := mpConfig()
+	cfg.ClockDomain = NewClockDomain(timeshim.Real)
+	lst := mustNewListener(&ListenerConfig{Config: cfg, Admission: adm})
 	defer func() { _ = lst.Close() }()
 	q, peer := p()
 	defer peer()
@@ -185,22 +190,29 @@ func TestAdmissionMoreBounds(t *testing.T) {
 		{name: "ended short", adm: &Admission{Peek: 2, MaxPeek: 8, Decide: seq(more(8), more(9))}, send: make([]byte, 5), end: true, seen: []int{2, 5}, closed: 1, timeout: 0},
 		{name: "rounds", adm: &Admission{Peek: 1, MaxPeek: 8, Decide: seq(more(3), more(8), Decision{Verdict: VerdictClose, Variant: "m"})},
 			send: make([]byte, 8), end: false, seen: []int{1, 3, 8}, closed: 1, timeout: 0},
-		{name: "timeout", adm: &Admission{Peek: 1, MaxPeek: 8, PeekTimeout: 300 * time.Millisecond, Decide: seq(more(8))},
+		{name: "timeout", adm: &Admission{Peek: 1, MaxPeek: 8, PeekTimeout: 300 * time.Millisecond, Decide: func(context.Context, CarrierInfo, []byte) Decision {
+			synctest.Sleep(100 * time.Millisecond)
+			return more(8)
+		}},
 			send: make([]byte, 2), end: false, seen: []int{1}, closed: 0, timeout: 1},
 	} {
-		var seen []int
-		adm := x.adm
-		start := time.Now()
-		st, vs := admitOnce(t, adm, streamCarrier(x.send, x.end), &seen)
-		if st.Closed != x.closed || st.PeekTimedOut != x.timeout || !equalInts(seen, x.seen) {
-			t.Fatalf("%s: stats %+v, Decide saw %v", x.name, st, seen)
-		}
-		if x.closed > 0 && variantNamed(vs, "m").Closed != x.closed {
-			t.Fatalf("%s: variants %+v", x.name, vs)
-		}
-		if x.timeout > 0 && time.Since(start) > 3*time.Second {
-			t.Fatalf("%s: rounds did not share the timeout", x.name)
-		}
+		t.Run(x.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var seen []int
+				adm := x.adm
+				start := time.Now()
+				st, vs := admitOnce(t, adm, streamCarrier(x.send, x.end), &seen)
+				if st.Closed != x.closed || st.PeekTimedOut != x.timeout || !equalInts(seen, x.seen) {
+					t.Fatalf("%s: stats %+v, Decide saw %v", x.name, st, seen)
+				}
+				if x.closed > 0 && variantNamed(vs, "m").Closed != x.closed {
+					t.Fatalf("%s: variants %+v", x.name, vs)
+				}
+				if x.timeout > 0 && time.Since(start) != adm.PeekTimeout {
+					t.Fatalf("%s: rounds did not share the timeout", x.name)
+				}
+			})
+		})
 	}
 }
 
@@ -232,12 +244,12 @@ func newFirstMsgCarrier(msgs ...[]byte) *firstMsgCarrier {
 	return m
 }
 
-func (m *firstMsgCarrier) ReadMessage(int) ([]byte, error) {
+func (m *firstMsgCarrier) ReadMessage(int) (ReceivedMessage, error) {
 	select {
 	case b := <-m.msgs:
-		return b, nil
+		return OwnMessage(b), nil
 	case <-m.closed:
-		return nil, io.EOF
+		return ReceivedMessage{}, io.EOF
 	}
 }
 func (m *firstMsgCarrier) WriteMessage([]byte) error {
@@ -362,11 +374,12 @@ type limitMsgCarrier struct {
 	limits []int
 }
 
-func (m *limitMsgCarrier) ReadMessage(limit int) ([]byte, error) {
+func (m *limitMsgCarrier) ReadMessage(limit int) (ReceivedMessage, error) {
 	m.limits = append(m.limits, limit)
 	b, err := m.firstMsgCarrier.ReadMessage(limit)
-	if len(b) > limit {
-		return nil, ErrMessageTooLarge
+	if b.Len() > limit {
+		b.Release()
+		return ReceivedMessage{}, ErrMessageTooLarge
 	}
 	return b, err
 }
@@ -401,6 +414,59 @@ func TestAdmissionFirstMessageLimit(t *testing.T) {
 		if len(m.limits) == 0 || m.limits[0] != want {
 			t.Fatalf("MaxMessage %d: limits %v", x.adm.MaxMessage, m.limits)
 		}
+	}
+}
+
+func TestAdmissionOversizedFirstMessageRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		size   int
+		refuse AdmissionVerdict
+		want   AdmissionStats
+	}{
+		{"fallback", 40, VerdictFallback, AdmissionStats{Fallback: 1}},
+		{"stall", 40, VerdictStall, AdmissionStats{Stalled: 1}},
+		{"close", 40, VerdictClose, AdmissionStats{Closed: 1}},
+		{"unreplayable", MaxRecordSize + 1, VerdictFallback, AdmissionStats{Closed: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				msg := bytes.Repeat([]byte{1}, tc.size)
+				next := []byte("next message")
+				m := &limitMsgCarrier{firstMsgCarrier: newFirstMsgCarrier(msg, next)}
+				defer func() { _ = m.Close() }()
+				l := mustNewListener(&ListenerConfig{
+					Admission: &Admission{
+						Peek: 1, MaxMessage: 39, Refuse: tc.refuse,
+						StallMin: time.Second, StallMax: time.Second,
+						Decide: func(context.Context, CarrierInfo, []byte) Decision {
+							t.Error("Decide was called on an oversized message")
+							return Decision{Verdict: VerdictClose}
+						},
+					},
+					Fallback: func(_ context.Context, take *Takeover) {
+						r, _, ok := take.Messages()
+						if !ok {
+							t.Error("fallback did not receive a message carrier")
+							return
+						}
+						for _, want := range [][]byte{msg, next} {
+							got, err := r.ReadMessage(MaxRecordSize)
+							if err != nil || !bytes.Equal(got.Bytes(), want) {
+								t.Errorf("fallback read %d bytes, err %v, want %d bytes", got.Len(), err, len(want))
+							}
+							got.Release()
+						}
+					},
+				})
+				defer func() { _ = l.Close() }()
+				_ = l.HandlePipe(context.Background(), PipeIO{R: m, W: m, Framing: FramingRecords}, PipeHint{})
+				synctest.Wait()
+				if got := l.Stats().Admission; got != tc.want {
+					t.Fatalf("admission stats %+v, want %+v", got, tc.want)
+				}
+			})
+		})
 	}
 }
 

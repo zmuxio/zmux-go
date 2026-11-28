@@ -28,13 +28,13 @@ type PoolLimits struct {
 	// dialled as pipes are taken (0: a connection is dialled only when a
 	// pipe finds none with room), connections above it retire gracefully,
 	// the longest idle first, and RetireConnections retires connections by
-	// fate group. Its ProbeInterval and ProbeJitter are not used (the
-	// pool dials no pipes), but a look whose Decide returns an error or
-	// panics, or whose decision fails zmux.PoolDecision.Validate, is
-	// rejected as a whole, as by MaintainPipes: the pool goes on as with
+	// fate group. Liveness gives the defaults for pipes taken after the
+	// decision. A look whose Decide returns an error or
+	// panics, or whose decision fails ConnectionDecision.Validate, is
+	// rejected as a whole: the pool goes on as with
 	// the zero decision and reports the error to DecisionRejected, else
 	// logs it to Logger.
-	Policy zmux.PoolPolicy
+	Policy ConnectionPolicy
 	// DecisionRejected, when set, receives the error of each look of
 	// Policy the pool rejected, outside the pool's lock, on the goroutine
 	// that asked the policy; it must not block, and a panic in it is
@@ -65,28 +65,31 @@ type PoolLimits struct {
 // paths. The zero value with Dial set is ready; it is safe for concurrent
 // use.
 type ConnPool[C comparable] struct {
-	// PoolLimits bound the use of each connection; set them before the
-	// first Get.
-	PoolLimits
+	lastDial time.Time
 	// Dial opens an underlying connection.
 	Dial func(ctx context.Context) (C, error)
 	// Close closes a connection the pool retired once no pipe uses it.
 	Close func(C)
-
-	view     zmux.PoolView     // owned by the decide goroutine: what the policy is asked about
-	next     zmux.PoolDecision // owned by the decide goroutine: the decision being asked for
-	lastDial time.Time
+	// Traffic reads lifetime connection bytes for the policy view. It runs
+	// outside the pool lock and must return promptly. Nil leaves bytes unknown.
+	Traffic  func(C) (sent, received uint64)
 	recheck  *time.Timer // asks the policy again after its Recheck
+	ended    sync.Cond   // signalled under mu when the decide goroutine ends; L is mu, set by the first wait
+	observed []C
 	conns    []*pooledConn[C]
-	rejected []error // errors of rejected decisions, reported after unlocking
-	dec      zmux.PoolDecision
-	failures int
+	rejected []error     // errors of rejected decisions, reported after unlocking
 	dials    []*poolDial // dials of Get under way, oldest first; the growth dials count as connections against the decision
+	// PoolLimits bound the use of each connection; set them before the
+	// first Get.
+	PoolLimits
+	view     ConnectionView     // owned by the decide goroutine: what the policy is asked about
+	next     ConnectionDecision // owned by the decide goroutine: the decision being asked for
+	dec      ConnectionDecision
+	failures int
 	mu       sync.Mutex
 	closed   bool
-	pending  bool      // under mu: an event came that no decision looked at yet
-	asking   bool      // under mu: the decide goroutine runs
-	ended    sync.Cond // signalled under mu when the decide goroutine ends; L is mu, set by the first wait
+	pending  bool // under mu: an event came that no decision looked at yet
+	asking   bool // under mu: the decide goroutine runs
 }
 
 // poolDial is a dial of Get under way. A growth dial counts in
@@ -131,7 +134,13 @@ type Lease[C comparable] struct {
 	pc   *pooledConn[C]
 	// FateGroup is the connection's fate group (set it as the zmux.PipeIO's).
 	FateGroup uint64
-	once      sync.Once
+	// Liveness is the pool policy in force when this pipe was leased.
+	Liveness zmux.PipeLiveness
+	once     sync.Once
+}
+
+func (p *ConnPool[C]) leaseLocked(pc *pooledConn[C]) *Lease[C] {
+	return &Lease[C]{Conn: pc.c, p: p, pc: pc, FateGroup: pc.fate, Liveness: p.dec.Liveness}
 }
 
 // Release ends the lease when its pipe ended; the last lease of a retired
@@ -252,8 +261,9 @@ func (p *ConnPool[C]) dialFor(ctx context.Context, pd *poolDial) (l *Lease[C], s
 	p.mu.Unlock()
 	p.lockConsulted()
 	p.retireLocked(pc)
+	lease := p.leaseLocked(pc)
 	p.unlockReport() // a member joined: ask the policy
-	return &Lease[C]{Conn: c, FateGroup: pc.fate, p: p, pc: pc}, false, nil
+	return lease, false, nil
 }
 
 // dropDial forgets a dial that ended; under mu.
@@ -306,7 +316,7 @@ func (p *ConnPool[C]) take(ctx context.Context, mode takeMode) (*Lease[C], *pool
 		best.active++
 		best.total++
 		p.retireLocked(best)
-		lease = &Lease[C]{Conn: best.c, FateGroup: best.fate, p: p, pc: best}
+		lease = p.leaseLocked(best)
 	} else if mode != takeRoomOnly {
 		pd = &poolDial{demand: best == nil}
 		pd.ctx, pd.cancel = context.WithCancel(ctx)
@@ -538,22 +548,32 @@ func (p *ConnPool[C]) askLocked() time.Time {
 	for _, pc := range p.conns {
 		// A retired connection is reported, not usable, until it closes.
 		p.retireLocked(pc)
-		m := zmux.PoolMember{FateGroup: pc.fate, Age: now.Sub(pc.born), Pipes: pc.active,
+		m := ConnectionMember{FateGroup: pc.fate, Age: now.Sub(pc.born), Pipes: pc.active,
 			Usable: !pc.retired && pc.active < p.maxActive() && p.room(pc) > 0}
 		m.Idle = p.idleLocked(pc, now)
 		v.Members = append(v.Members, m)
+		if p.Traffic != nil {
+			p.observed = append(p.observed, pc.c)
+		}
 	}
 	p.mu.Unlock()
-	err := p.next.Ask(p.Policy, v)
+	for i, conn := range p.observed {
+		poolhost.Safe(p.Logger, "ConnPool.Traffic", func() {
+			v.Members[i].BytesSent, v.Members[i].BytesReceived = p.Traffic(conn)
+		})
+	}
+	clear(p.observed)
+	p.observed = p.observed[:0]
+	err := p.next.ask(p.Policy, v)
 	p.mu.Lock()
 	if err != nil {
-		p.next = zmux.PoolDecision{RetirePipes: p.next.RetirePipes[:0], RetireConnections: p.next.RetireConnections[:0]} // rejected, as by MaintainPipes
+		p.next = ConnectionDecision{RetireConnections: p.next.RetireConnections[:0]}
 		if p.DecisionRejected != nil || p.Logger != nil {
 			p.rejected = append(p.rejected, err)
 		}
 	}
 	p.dec, p.next = p.next, p.dec
-	if r := p.dec.RecheckAfter(); !p.closed {
+	if r := p.dec.recheckAfter(); !p.closed {
 		if p.recheck == nil {
 			p.recheck = time.AfterFunc(r, p.recheckNow)
 		} else {

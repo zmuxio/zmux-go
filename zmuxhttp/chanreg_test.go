@@ -9,9 +9,9 @@ import (
 // countChannel counts the receivers it runs.
 type countChannel struct{ running int }
 
-func (*countChannel) ChannelStreamID() (uint64, bool)  { return 0, false }
-func (*countChannel) MaxChannelDatagram() int          { return 0 }
-func (*countChannel) SendChannelDatagram([]byte) error { return nil }
+func (*countChannel) ChannelStreamID() (uint64, bool)            { return 0, false }
+func (*countChannel) ChannelDatagramCapacity() (limit, room int) { return 0, 0 }
+func (*countChannel) SendChannelDatagram([]byte) error           { return nil }
 func (c *countChannel) ReceiveChannelDatagrams(func([]byte)) func() {
 	c.running++
 	stopped := false
@@ -25,7 +25,7 @@ func (c *countChannel) ReceiveChannelDatagrams(func([]byte)) func() {
 
 type channelProvider struct{ c zmux.DatagramChannel }
 
-func (p channelProvider) DatagramChannel() zmux.DatagramChannel { return p.c }
+func (p channelProvider) DatagramChannel() (zmux.DatagramChannel, error) { return p.c, nil }
 
 // The stop of a replaced registration leaves the later receiver running,
 // both before the channel exists and after.
@@ -41,8 +41,16 @@ func TestChanWriterStaleStop(t *testing.T) {
 		stop2 := h.ReceiveChannelDatagrams(func([]byte) {})
 		stop1()
 		if early {
-			h.chp = channelProvider{c}
-			h.openChannel()
+			h.chp, h.chReady = channelProvider{c}, make(chan struct{})
+			changed := h.ChannelCapacityChanged()
+			if err := h.openChannel(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-changed:
+			default:
+				t.Fatal("opening the channel did not signal capacity")
+			}
 		}
 		if c.running != 1 {
 			t.Fatalf("early=%v: %d receivers after a stale stop, want 1", early, c.running)

@@ -10,7 +10,11 @@ import (
 	"os"
 	"runtime"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
+	"github.com/zmuxio/zmux-go/internal/teststream"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 	"github.com/zmuxio/zmux-go/internal/testscale"
@@ -18,6 +22,18 @@ import (
 
 // pair returns a client and a server session over a carrier pair.
 func pair(t testing.TB, a, b net.Conn, ccfg, scfg *Config) (*Conn, *Conn) {
+	t.Helper()
+	c, s := startTestPair(t, a, b, ccfg, scfg)
+	t.Cleanup(func() {
+		_ = c.Close()
+		_ = s.Close()
+		waitDone(t, c)
+		waitDone(t, s)
+	})
+	return c, s
+}
+
+func startTestPair(t testing.TB, a, b net.Conn, ccfg, scfg *Config) (*Conn, *Conn) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testscale.D(5*time.Second))
 	defer cancel()
@@ -32,18 +48,20 @@ func pair(t testing.TB, a, b net.Conn, ccfg, scfg *Config) (*Conn, *Conn) {
 	}()
 	c, err := Client(ctx, a, ccfg)
 	if err != nil {
+		_ = a.Close()
+		_ = b.Close()
+		if peer := <-ch; peer.c != nil {
+			waitDone(t, peer.c)
+		}
 		t.Fatal(err)
 	}
 	r := <-ch
 	if r.err != nil {
+		_ = a.Close()
+		_ = b.Close()
+		waitDone(t, c)
 		t.Fatal(r.err)
 	}
-	t.Cleanup(func() {
-		_ = c.Close()
-		_ = r.c.Close()
-		waitDone(t, c)
-		waitDone(t, r.c)
-	})
 	return c, r.c
 }
 
@@ -161,88 +179,92 @@ func TestManyStreams(t *testing.T) {
 
 func TestCloseWakesReaders(t *testing.T) {
 	leakcheck.Check(t)
-	a, b := net.Pipe()
-	c, s := pair(t, a, b, nil, nil)
-	st, _ := c.OpenStreamSync(context.Background())
-	_, _ = st.Write([]byte("x"))
-	ss, err := s.AcceptStream(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	errc := make(chan error, 1)
-	go func() {
-		buf := make([]byte, 10)
-		_, _ = ss.Read(buf)
-		_, err := ss.Read(buf)
-		errc <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	c.Abort(7, "bye")
-	select {
-	case err := <-errc:
-		var ae *ApplicationError
-		if !errors.As(err, &ae) || ae.ErrorCode != 7 || !ae.Remote {
-			t.Fatalf("read error %v", err)
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		c, s := pair(t, a, b, &Config{ClockDomain: NewClockDomain(timeshim.Real)}, &Config{ClockDomain: NewClockDomain(timeshim.Real)})
+		st, _ := c.OpenStreamSync(context.Background())
+		_, _ = st.Write([]byte("x"))
+		ss, err := s.AcceptStream(context.Background())
+		if err != nil {
+			t.Fatal(err)
 		}
-		if !errors.Is(err, net.ErrClosed) {
-			t.Fatal("not net.ErrClosed")
+		errc := make(chan error, 1)
+		go func() {
+			buf := make([]byte, 10)
+			_, _ = ss.Read(buf)
+			_, err := ss.Read(buf)
+			errc <- err
+		}()
+		synctest.Wait()
+		c.Abort(7, "bye")
+		select {
+		case err := <-errc:
+			var ae *ApplicationError
+			if !errors.As(err, &ae) || ae.ErrorCode != 7 || !ae.Remote {
+				t.Fatalf("read error %v", err)
+			}
+			if !errors.Is(err, net.ErrClosed) {
+				t.Fatal("not net.ErrClosed")
+			}
+		case <-time.After(time.Minute):
+			t.Fatal("reader not woken")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("reader not woken")
-	}
-	runtime.KeepAlive(st) // a collected handle would reset the stream first
+		runtime.KeepAlive(st) // a collected handle would reset the stream first
+	})
 }
 
 func TestDeadlines(t *testing.T) {
 	leakcheck.Check(t)
-	a, b := net.Pipe()
-	c, s := pair(t, a, b, &Config{SendBuffer: 64 << 10}, &Config{InitialStreamReceiveWindow: 4096, MaxStreamReceiveWindow: 4096})
-	st, _ := c.OpenStreamSync(context.Background())
-	_, _ = st.Write([]byte("x"))
-	ss, err := s.AcceptStream(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = ss.Read(make([]byte, 1))
-	// A deadline set while a read is blocked without one interrupts it.
-	errc := make(chan error, 1)
-	go func() {
-		_, err := ss.Read(make([]byte, 1))
-		errc <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	_ = ss.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-	select {
-	case err := <-errc:
-		if !errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("read: %v", err)
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		c, s := pair(t, a, b, &Config{ClockDomain: NewClockDomain(timeshim.Real), SendBuffer: 64 << 10}, &Config{ClockDomain: NewClockDomain(timeshim.Real), InitialStreamReceiveWindow: 4096, MaxStreamReceiveWindow: 4096})
+		st, _ := c.OpenStreamSync(context.Background())
+		_, _ = st.Write([]byte("x"))
+		ss, err := s.AcceptStream(context.Background())
+		if err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("blocked read not interrupted by a new deadline")
-	}
-	// Cleared, the stream reads again.
-	_ = ss.SetReadDeadline(time.Time{})
-	_, _ = st.Write([]byte("y"))
-	if _, err := io.ReadFull(ss, make([]byte, 1)); err != nil {
-		t.Fatal(err)
-	}
-	// A write blocked on flow control, then a deadline.
-	go func() {
-		_, err := st.Write(make([]byte, 1<<20))
-		errc <- err
-	}()
-	time.Sleep(20 * time.Millisecond)
-	_ = st.SetWriteDeadline(time.Now())
-	select {
-	case err := <-errc:
-		if !errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("write: %v", err)
+		_, _ = ss.Read(make([]byte, 1))
+		// A deadline set while a read is blocked without one interrupts it.
+		errc := make(chan error, 1)
+		go func() {
+			_, err := ss.Read(make([]byte, 1))
+			errc <- err
+		}()
+		synctest.Wait()
+		_ = ss.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+		select {
+		case err := <-errc:
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("read: %v", err)
+			}
+		case <-time.After(time.Minute):
+			t.Fatal("blocked read not interrupted by a new deadline")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("blocked write not interrupted by a new deadline")
-	}
-	runtime.KeepAlive(st)
-	runtime.KeepAlive(ss)
+		// Cleared, the stream reads again.
+		_ = ss.SetReadDeadline(time.Time{})
+		_, _ = st.Write([]byte("y"))
+		if _, err := io.ReadFull(ss, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		// A write blocked on flow control, then a deadline.
+		go func() {
+			_, err := st.Write(make([]byte, 1<<20))
+			errc <- err
+		}()
+		synctest.Wait()
+		_ = st.SetWriteDeadline(time.Now())
+		select {
+		case err := <-errc:
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("write: %v", err)
+			}
+		case <-time.After(time.Minute):
+			t.Fatal("blocked write not interrupted by a new deadline")
+		}
+		runtime.KeepAlive(st)
+		runtime.KeepAlive(ss)
+	})
 }
 
 // A panic under the session lock closes the session with a transport
@@ -266,21 +288,5 @@ func TestPanicClosesWithInternalError(t *testing.T) {
 // echoOnce echoes one message over a new stream of c served by s.
 func echoOnce(t *testing.T, ctx context.Context, c, s *Conn) {
 	t.Helper()
-	go func() {
-		st, err := s.AcceptStream(ctx)
-		if err == nil {
-			_, _ = io.Copy(st, st)
-			_ = st.Close()
-		}
-	}()
-	st, err := c.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg := bytes.Repeat([]byte("zmux"), 4096)
-	go func() { _, _ = st.Write(msg); _ = st.Close() }()
-	got, err := io.ReadAll(st)
-	if err != nil || !bytes.Equal(got, msg) {
-		t.Fatalf("echo: %d bytes, %v", len(got), err)
-	}
+	teststream.Echo(t, ctx, c.OpenStreamSync, s.AcceptStream, bytes.Repeat([]byte("zmux"), 4096))
 }

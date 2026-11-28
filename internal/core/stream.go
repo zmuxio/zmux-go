@@ -34,39 +34,34 @@ const (
 // Stream is the core state of one stream. All fields are guarded by the
 // session lock; handles in the public package wrap it.
 type Stream struct {
-	sess *Session
-	id   uint64
-
-	snd sendPart
-	rcv recvPart
-
+	dgOptions *DatagramOptions
+	sess      *Session
 	// Local preamble settings (before the first frame; nil: empty).
 	pre *wire.PreambleSpec
 	// Peer preamble (copied out of the read buffer).
 	peerPre *peerPreamble
 	// Rarely used state (priority requests, capacity waiters).
-	ext *streamExt
-
-	rsig *Signal
-	wsig *Signal
-	dsig *Signal // stream datagrams (dgramChanged)
-
-	// Scheduler and control links.
-	sch     schedLink
+	ext     *streamExt
+	rsig    *Signal
+	wsig    *Signal
+	dsig    *Signal // stream datagrams (dgramChanged)
 	ctlNext *Stream
 	ctlPrev *Stream
 	// copyNext and copyPrev link the streams whose latest MAX_STREAM_DATA
 	// rides the redundant snapshot (copyMSD; Session.copyHead).
 	copyNext, copyPrev *Stream
-
-	dg *streamDgrams
-
+	dg                 *streamDgrams
+	// Scheduler and control links.
+	sch   schedLink
+	rcv   recvPart
+	snd   sendPart
+	cnt   streamCounters
+	id    uint64
 	idSet bool
 	local bool
 	bidi  bool
 	hasS  bool // has a sending part
 	hasR  bool // has a receiving part
-
 	// Life cycle.
 	offered     bool // peer stream offered through accept
 	accepted    bool
@@ -79,20 +74,15 @@ type Stream struct {
 	opened      bool // first frame emitted (local) or opened (peer)
 	cancelled   bool // cancelled before any frame: never on the wire
 	replayable  bool
-
 	// Local scheduling priority.
 	urgency  uint8
 	incr     bool
 	forceMSD bool
 	copyMSD  bool
-
-	ctl   uint8 // pending control frame bits
-	inCtl bool
-
-	pol    uint8 // scheduling policy + 1; 0: the session's
-	redund int8  // SetRedundant: 1 on, -1 off, 0 the session default
-
-	cnt streamCounters
+	ctl      uint8 // pending control frame bits
+	inCtl    bool
+	pol      uint8 // scheduling policy + 1; 0: the session's
+	redund   int8  // SetRedundant: 1 on, -1 off, 0 the session default
 }
 
 // streamCounters are the counts of StreamStats that no other field keeps;
@@ -177,32 +167,31 @@ const (
 )
 
 type sendPart struct {
-	q        sendQ
-	unsentC  uint64 // the part's share of Session.unsent (syncUnsent)
-	sent     uint64 // every byte below was sent at least once
-	maxData  uint64 // peer's limit
-	blocked  uint64 // limit+1 at which STREAM_DATA_BLOCKED was sent
-	preLen   uint64
-	boundary uint64 // SetReliableBoundary (wire offset)
+	errState        *StreamError // terminal outcome for writes
+	mps             *mpSend      // multipath retention state (nil outside multipath)
+	res             *block       // block lent by WriteSpace until CommitWrite, with a reference
+	q               sendQ
+	unsentC         uint64 // the part's share of Session.unsent (syncUnsent)
+	sent            uint64 // every byte below was sent at least once
+	maxData         uint64 // peer's limit
+	blocked         uint64 // limit+1 at which STREAM_DATA_BLOCKED was queued
+	blockedReported uint64
+	preLen          uint64
+	boundary        uint64 // SetReliableBoundary (wire offset)
 	// Reset state.
 	resetCode  uint64
 	resetRel   uint64 // reliable size (0: RESET_STREAM)
 	stopCode   uint64
-	errState   *StreamError // terminal outcome for writes
 	bufLimit   uint64
-	lane       uint64  // lane binding (lanes without multipath)
-	lanePipe   uint64  // pipe of the bound lane
-	laneEnd    uint64  // lane position after the direction's last frame on it
-	mps        *mpSend // multipath retention state (nil outside multipath)
-	appWritten uint64  // application bytes written (excludes the preamble)
-	res        *block  // block lent by WriteSpace until CommitWrite, with a reference
-
+	lane       uint64 // lane binding (lanes without multipath)
+	lanePipe   uint64 // pipe of the bound lane
+	laneEnd    uint64 // lane position after the direction's last frame on it
+	appWritten uint64 // application bytes written (excludes the preamble)
 	// Ages for tier saturation.
 	waitAt    Time // the oldest unsent byte's write
 	wwaitAt   Time // the writer's wait for buffer space began
 	writeDone Time
 	creditAt  Time // stream credit arrived while data waited for it
-
 	state     sendState
 	finWr     bool
 	finSent   bool
@@ -214,12 +203,13 @@ type sendPart struct {
 	laneBound bool
 	wwait     bool
 	wwaitSet  bool
-	oppListed bool // in the blocked list of opportunistic reinjection
 }
 
 type recvPart struct {
-	buf       recvBuf
+	errState  *StreamError
+	tune      *tuner
 	arrived   rangeSet
+	buf       recvBuf
 	highest   uint64
 	final     uint64
 	readOff   uint64 // wire offset consumed (read, discarded or preamble)
@@ -230,19 +220,16 @@ type recvPart struct {
 	resetCode uint64
 	resetRel  uint64
 	relLo     uint64 // lowest reliable size whose gap was released
-	errState  *StreamError
 	preSize   uint64
 	blockSeen uint64 // largest STREAM_DATA_BLOCKED limit reported
-	tune      *tuner
 	maxWin    uint64 // the cap SetReceiveWindow set (0: automatic), when maxSet
-
-	state    recvState
-	maxSet   bool // SetReceiveWindow set the cap, automatic or not; else the session's
-	finKnown bool
-	stopped  bool
-	stopSent bool
-	reset    bool
-	preDone  bool
+	state     recvState
+	maxSet    bool // SetReceiveWindow set the cap, automatic or not; else the session's
+	finKnown  bool
+	stopped   bool
+	stopSent  bool
+	reset     bool
+	preDone   bool
 	// drainWait: the session waits for the application to read this
 	// part's buffered data and end before CLOSED (Session.readDrain).
 	drainWait bool
@@ -368,10 +355,13 @@ func (s *Session) wakeOpeners() {
 func (s *Session) newStream(bidi, local bool) *Stream {
 	st := &Stream{sess: s, local: local, bidi: bidi, replayable: !local && s.carrierEarlyIn}
 	st.hasS = local || bidi
+	if st.hasS {
+		st.snd.q.budget = s.sendMemory
+	}
 	st.hasR = !local || bidi
 	if st.hasR {
 		st.rcv.relLo = 1<<62 - 1
-		st.rcv.buf.pin = &s.conn.pins
+		st.rcv.buf.memory = &s.conn.rx
 	}
 	return st
 }
@@ -381,27 +371,13 @@ func (s *Session) newStream(bidi, local bool) *Stream {
 // above the peer's limit (which may have shrunk since it was set) fails
 // the stream locally instead: nothing is sent, and it returns false.
 func (s *Session) allocID(st *Stream) bool {
+	var preamble []byte
+	var owner *Buf
 	if s.feat.Preamble {
 		if lim := s.preambleMax(); uint64(st.preSize()) > lim {
 			s.failPreamble(st, lim)
 			return false
 		}
-	}
-	t := typeIndex(st.bidi)
-	idx := s.loc[t].next
-	s.loc[t].next++
-	st.id = streamID(idx, st.bidi, s.role == RoleResponder)
-	st.idSet = true
-	s.dropProvisional(st)
-	if st.bidi {
-		s.openLocalBidiRecv++
-	}
-	s.streams[st.id] = st
-	if s.shp != nil {
-		s.shapeStream(shaping.EventStreamOpen, st.id)
-	}
-	st.applyPeerParams()
-	if s.feat.Preamble {
 		var pre wire.PreambleSpec
 		if st.pre != nil {
 			pre = *st.pre
@@ -419,29 +395,52 @@ func (s *Session) allocID(st *Stream) bool {
 				s.greaseFirst = false
 			}
 		}
+		if s.sendMemory == nil {
+			preamble = make([]byte, 0, pre.Size())
+		} else {
+			owner = newBacking(s.sendMemory, pre.Size())
+			if owner == nil {
+				s.failUnopened(st, &StreamError{Kind: StreamMemoryBudget})
+				return false
+			}
+			preamble = owner.B[:0]
+		}
+		preamble = wire.AppendPreamble(preamble, &pre)
 		if pre.HasPriority {
 			x := st.x()
 			x.openPrio, x.openUrgency, x.openIncr = true, pre.Urgency, pre.Incr
 		}
-		b := wire.AppendPreamble(make([]byte, 0, pre.Size()), &pre)
-		st.snd.preLen = uint64(len(b))
+	}
+	t := typeIndex(st.bidi)
+	idx := s.loc[t].next
+	s.loc[t].next++
+	st.id = streamID(idx, st.bidi, s.role == RoleResponder)
+	st.idSet = true
+	s.dropProvisional(st)
+	if st.bidi {
+		s.openLocalBidiRecv++
+	}
+	s.streams[st.id] = st
+	if s.shp != nil {
+		s.shapeStream(shaping.EventStreamOpen, st.id)
+	}
+	st.applyPeerParams()
+	if len(preamble) != 0 {
+		st.snd.preLen = uint64(len(preamble))
 		h := s.heldEnter(st)
-		st.snd.q.prepend(b)
+		st.snd.q.prepend(preamble, owner)
 		s.heldLeave(st, h)
-		if st.snd.hasBound {
-			st.snd.boundary += st.snd.preLen
-		}
 	}
 	st.pre = nil
 	return true
 }
 
 // floorPreamble is the preamble limit every zmux endpoint advertises at
-// least (FloorParams).
+// least.
 const floorPreamble = 1024
 
 // preambleMax is the largest preamble a stream can send: the peer's
-// parameter, known or assumed for early data (remembered or the floor),
+// parameter, known or remembered for plain QMux early data,
 // else the floor, and no more than the carrier record floor less the 32-byte
 // margin for the first STREAM frame's header (EXTENSIONS.md Section 4.1).
 // Every pipe's records are at least the floor, so a preamble within this
@@ -465,7 +464,10 @@ func preambleErr(lim uint64) *StreamError {
 // failPreamble fails a stream whose preamble the peer would not accept,
 // before it is announced.
 func (s *Session) failPreamble(st *Stream, lim uint64) {
-	e := preambleErr(lim)
+	s.failUnopened(st, preambleErr(lim))
+}
+
+func (s *Session) failUnopened(st *Stream, e *StreamError) {
 	if st.hasS && st.snd.errState == nil {
 		st.snd.errState = e
 	}

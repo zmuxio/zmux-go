@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
@@ -61,37 +62,47 @@ func helloVector(t *testing.T, name string) (*ecdh.PrivateKey, []byte) {
 func TestReplyKexRejected(t *testing.T) {
 	for _, name := range []string{"low-order-initiator-ephemeral-no-psk", "encapsulation-key-coefficient-first-3329-no-psk"} {
 		t.Run(name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
 			key, hello := helloVector(t, name)
-			got := make(chan zmux.RejectInfo, 1)
-			_, addr := listen(t, ctx, &zmux.ListenerConfig{
-				Config:   &zmux.Config{HandshakeTimeout: 400 * time.Millisecond},
-				WrapPipe: &seal.ServerConfig{StaticKey: key, Gate: &gate{}, AcceptedProfiles: []proto.Profile{4}},
-				OnReject: func(i zmux.RejectInfo) zmux.RejectAction { got <- i; return zmux.RejectStall },
-			})
-			nc := dial(t, addr)
-			defer func() { _ = nc.Close() }()
-			if _, err := nc.Write(hello); err != nil {
-				t.Fatal(err)
-			}
-			start := time.Now()
-			_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
-			n, err := io.Copy(io.Discard, nc)
-			if err != nil || n != 0 {
-				t.Fatalf("carrier ended with %d bytes, %v", n, err)
-			}
-			if d := time.Since(start); d < 300*time.Millisecond {
-				t.Fatalf("closed after %v, not stalled", d)
-			}
-			select {
-			case i := <-got:
-				if i.Reason != "kex" || i.Profile != 4 {
-					t.Fatalf("%+v", i)
+			synctest.Test(t, func(t *testing.T) {
+				const stallBound = time.Second
+				got := make(chan zmux.RejectInfo, 1)
+				l, err := zmux.NewListener(&zmux.ListenerConfig{
+					Config:   &zmux.Config{HandshakeTimeout: stallBound},
+					WrapPipe: &seal.ServerConfig{StaticKey: key, Gate: &gate{}, AcceptedProfiles: []proto.Profile{4}},
+					OnReject: func(i zmux.RejectInfo) zmux.RejectAction { got <- i; return zmux.RejectStall },
+				})
+				if err != nil {
+					t.Fatal(err)
 				}
-			case <-ctx.Done():
-				t.Fatal("no OnReject")
-			}
+				defer func() { _ = l.Close() }()
+				a, b := net.Pipe()
+				defer func() { _ = a.Close() }()
+				served := make(chan struct{})
+				go func() {
+					defer close(served)
+					_ = l.HandlePipe(t.Context(), zmux.NetPipe(b), zmux.PipeHint{})
+				}()
+				start := time.Now()
+				if _, err := a.Write(hello); err != nil {
+					t.Fatal(err)
+				}
+				n, err := io.Copy(io.Discard, a)
+				if err != nil || n != 0 {
+					t.Fatalf("carrier ended with %d bytes, %v", n, err)
+				}
+				if elapsed := time.Since(start); elapsed != stallBound {
+					t.Fatalf("closed at virtual time %v, want %v", elapsed, stallBound)
+				}
+				<-served
+				select {
+				case i := <-got:
+					if i.Reason != "kex" || i.Profile != 4 {
+						t.Fatalf("%+v", i)
+					}
+				default:
+					t.Fatal("no OnReject")
+				}
+			})
 		})
 	}
 }
@@ -112,15 +123,15 @@ func msgPair() (a, b *msgEnd) {
 	return &msgEnd{in: x, out: y, done: done, once: once}, &msgEnd{in: y, out: x, done: done, once: once}
 }
 
-func (m *msgEnd) ReadMessage(limit int) ([]byte, error) {
+func (m *msgEnd) ReadMessage(limit int) (zmux.ReceivedMessage, error) {
 	select {
 	case b := <-m.in:
 		if m.readLimit && len(b) > limit {
-			return nil, zmux.ErrMessageTooLarge
+			return zmux.ReceivedMessage{}, zmux.ErrMessageTooLarge
 		}
-		return b, nil
+		return zmux.OwnMessage(b), nil
 	case <-m.done:
-		return nil, io.EOF
+		return zmux.ReceivedMessage{}, io.EOF
 	}
 }
 
@@ -176,59 +187,60 @@ func TestFinishFramingRejected(t *testing.T) {
 // without a byte, and counted as rejected.
 func TestBindingMismatch(t *testing.T) {
 	const stallBound = 1500 * time.Millisecond
-	for _, closeAtOnce := range []bool{false, true} {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		f := newFixture(t)
-		f.server.AllowRecordMode = anyMode
-		got := make(chan zmux.RejectInfo, 1)
-		lc := &zmux.ListenerConfig{WrapPipe: &f.server, Config: &zmux.Config{HandshakeTimeout: stallBound}}
-		if closeAtOnce {
-			lc.OnReject = func(i zmux.RejectInfo) zmux.RejectAction { got <- i; return zmux.RejectClose }
-		}
-		l, err := zmux.NewListener(lc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		a, b := net.Pipe()
-		srv := &secureConn{Conn: b, exp: bytes.Repeat([]byte{1}, 32)}
-		served := make(chan struct{})
-		go func() { defer close(served); _ = l.HandlePipe(ctx, zmux.PipeIO{R: srv, W: srv}, zmux.PipeHint{}) }()
-		cli := &readCounter{secureConn: secureConn{Conn: a, exp: bytes.Repeat([]byte{2}, 32)}} //nolint:modernize // embedlit: the go1.27 compiler rejects the elided form
-		cc := f.client
-		cc.RecordMode = zmux.RecordBound
-		start := time.Now()
-		if _, err := seal.Establish(ctx, zmux.PipeIO{R: cli, W: cli}, &cc); err == nil {
-			t.Fatal("a mismatching Bound Establish was accepted")
-		}
-		took := time.Since(start)
-		if closeAtOnce {
-			select {
-			case i := <-got:
-				if i.Reason != "auth" || i.RecordMode != zmux.RecordBound {
-					t.Fatalf("reject info %+v", i)
+	for _, tc := range []struct {
+		name  string
+		delay time.Duration
+	}{{"default stall", stallBound}, {"reject close", 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				f := newFixture(t)
+				f.server.AllowRecordMode = anyMode
+				got := make(chan zmux.RejectInfo, 1)
+				lc := &zmux.ListenerConfig{WrapPipe: &f.server, Config: &zmux.Config{HandshakeTimeout: stallBound}}
+				if tc.delay == 0 {
+					lc.OnReject = func(i zmux.RejectInfo) zmux.RejectAction { got <- i; return zmux.RejectClose }
 				}
-			case <-ctx.Done():
-				t.Fatal("no OnReject")
-			}
-		}
-		if n := cli.n.Load(); n != 0 {
-			t.Fatalf("close %v: the listener sent %d bytes", closeAtOnce, n)
-		}
-		switch {
-		case closeAtOnce && took > stallBound/2:
-			t.Fatalf("closed after %v, not at once", took)
-		case !closeAtOnce && (took < stallBound*2/3 || took > 3*stallBound):
-			t.Fatalf("stalled %v, bound %v", took, stallBound)
-		}
-		<-served
-		if closeAtOnce {
-			if st := l.Stats(); st.Rejected != 1 {
-				t.Fatalf("stats %+v", st)
-			}
-		}
-		_ = a.Close()
-		_ = l.Close()
-		cancel()
+				l, err := zmux.NewListener(lc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = l.Close() }()
+				a, b := net.Pipe()
+				defer func() { _ = a.Close() }()
+				srv := &secureConn{Conn: b, exp: bytes.Repeat([]byte{1}, 32)}
+				served := make(chan struct{})
+				go func() { defer close(served); _ = l.HandlePipe(ctx, zmux.NetPipe(srv), zmux.PipeHint{}) }()
+				cli := &readCounter{}
+				cli.secureConn = secureConn{Conn: a, exp: bytes.Repeat([]byte{2}, 32)}
+				cc := f.client
+				cc.RecordMode = zmux.RecordBound
+				start := time.Now()
+				if _, err := seal.Establish(ctx, zmux.NetPipe(cli), &cc); err == nil {
+					t.Fatal("a mismatching Bound Establish was accepted")
+				}
+				if elapsed := time.Since(start); elapsed != tc.delay {
+					t.Fatalf("closed at virtual time %v, want %v", elapsed, tc.delay)
+				}
+				if n := cli.n.Load(); n != 0 {
+					t.Fatalf("the listener sent %d bytes", n)
+				}
+				<-served
+				if tc.delay == 0 {
+					select {
+					case i := <-got:
+						if i.Reason != "auth" || i.RecordMode != zmux.RecordBound {
+							t.Fatalf("reject info %+v", i)
+						}
+					default:
+						t.Fatal("no OnReject")
+					}
+					if st := l.Stats(); st.Rejected != 1 {
+						t.Fatalf("stats %+v", st)
+					}
+				}
+			})
+		})
 	}
 }
 
@@ -261,7 +273,7 @@ func TestReplyFramingErrorIsNotNoReply(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, err := seal.Establish(t.Context(), a.pipe(), &f.client)
-			if !errors.Is(err, seal.ErrTooLarge) || errors.Is(err, seal.ErrNoReply) ||
+			if !errors.Is(err, proto.ErrTooLarge) || errors.Is(err, seal.ErrNoReply) ||
 				errors.Is(err, zmux.ErrMessageTooLarge) != tc.readLimit {
 				t.Fatalf("oversized reply: %v", err)
 			}
@@ -298,7 +310,7 @@ func TestHelloFramingCauseReachesOnReject(t *testing.T) {
 	}
 	select {
 	case i := <-got:
-		if i.Reason != "trailing_bytes" || !errors.Is(i.Err, seal.ErrTrailing) {
+		if i.Reason != "trailing_bytes" || !errors.Is(i.Err, proto.ErrTrailing) {
 			t.Fatalf("OnReject info %+v", i)
 		}
 	default:

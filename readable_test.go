@@ -7,7 +7,10 @@ import (
 	"net"
 	"os"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
@@ -18,6 +21,19 @@ func streamPairT(t *testing.T) (cs, ss *Stream) {
 	t.Helper()
 	a, b := tcpPair(t)
 	c, s := pair(t, a, b, nil, nil)
+	return openTestStream(t, c, s)
+}
+
+func memStreamPairT(t *testing.T) (*Stream, *Stream) {
+	t.Helper()
+	a, b := net.Pipe()
+	cfg := &Config{ClockDomain: NewClockDomain(timeshim.Real)}
+	c, s := pair(t, a, b, cfg, cfg)
+	return openTestStream(t, c, s)
+}
+
+func openTestStream(t *testing.T, c, s *Conn) (cs, ss *Stream) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cs, err := c.OpenStreamSync(ctx)
@@ -172,46 +188,48 @@ func TestWaitReadableEnds(t *testing.T) {
 // receiving part's wake slot holds one token, which each hands on.
 func TestWaitReadableManyWaiters(t *testing.T) {
 	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	b := make([]byte, 8)
-	for _, withRead := range []bool{false, true} {
-		cs, ss := streamPairT(t)
-		_, _ = ss.Read(b)
-		const n = 4
-		waited := make(chan error, n)
-		for range n {
-			go func() { waited <- ss.WaitReadable(ctx) }()
-		}
-		var read chan error
-		if withRead {
-			read = make(chan error, 1)
-			go func() {
-				one := make([]byte, 1)
-				_, err := ss.Read(one)
-				read <- err
-			}()
-		}
-		time.Sleep(50 * time.Millisecond) // let them block; the arrival is correct either way
-		if _, err := cs.Write([]byte("xy")); err != nil {
-			t.Fatal(err)
-		}
-		for range n {
-			select {
-			case err := <-waited:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-ctx.Done():
-				t.Fatalf("withRead=%v: a waiter missed the arrival", withRead)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		b := make([]byte, 8)
+		for _, withRead := range []bool{false, true} {
+			cs, ss := memStreamPairT(t)
+			_, _ = ss.Read(b)
+			const n = 4
+			waited := make(chan error, n)
+			for range n {
+				go func() { waited <- ss.WaitReadable(ctx) }()
 			}
-		}
-		if withRead {
-			if err := <-read; err != nil {
+			var read chan error
+			if withRead {
+				read = make(chan error, 1)
+				go func() {
+					one := make([]byte, 1)
+					_, err := ss.Read(one)
+					read <- err
+				}()
+			}
+			synctest.Wait()
+			if _, err := cs.Write([]byte("xy")); err != nil {
 				t.Fatal(err)
 			}
+			for range n {
+				select {
+				case err := <-waited:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-ctx.Done():
+					t.Fatalf("withRead=%v: a waiter missed the arrival", withRead)
+				}
+			}
+			if withRead {
+				if err := <-read; err != nil {
+					t.Fatal(err)
+				}
+			}
 		}
-	}
+	})
 }
 
 // A stream datagram of a stream the application released is refused, not

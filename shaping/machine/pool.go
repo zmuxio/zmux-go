@@ -2,10 +2,12 @@ package machine
 
 import (
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 )
 
 type metric uint8
@@ -162,10 +164,10 @@ func (p *poolDef) resolved(src rand.Source, shared *[]uint64) *poolDef {
 	return &q
 }
 
-// PoolPolicy returns a new pool policy of the candidate, nil without a pool:
+// ConnectionPolicy returns a new physical pool policy of the candidate, nil without a pool:
 // each pool needs its own, since a policy keeps per-member draws. Values of
 // scope pipe are kept once per member ID while the member is in the view.
-func (c *Compiled) PoolPolicy() zmux.PoolPolicy {
+func (c *Compiled) ConnectionPolicy() carrier.ConnectionPolicy {
 	if c.pool == nil {
 		return nil
 	}
@@ -193,7 +195,7 @@ type poolMember struct {
 	u     []uint64 // per rule: the jitter draw
 }
 
-func metricOf(k metric, m *zmux.PoolMember) uint64 {
+func metricOf(k metric, m *carrier.ConnectionMember) uint64 {
 	switch k {
 	case metricAge:
 		return uint64(max(m.Age, 0) / time.Microsecond)
@@ -214,24 +216,10 @@ func metricOf(k metric, m *zmux.PoolMember) uint64 {
 	return x
 }
 
-// memberKey names member m: its fate group in a carrier.ConnPool, its pipe
-// ID in a PipePool.
-func memberKey(m *zmux.PoolMember) uint64 {
-	if isConnection(m) {
-		return m.FateGroup
-	}
-	return uint64(m.PipeID)
-}
-
-// isConnection reports whether m is a connection of a carrier.ConnPool,
-// whose fate group is never 0; a PipePool member's is 0 (its PipeID may
-// be 0, the bootstrap pipe).
-func isConnection(m *zmux.PoolMember) bool { return m.FateGroup != 0 }
-
 // Decide sets d as the policy states, and d.Recheck to the earliest of the
 // time until an age or idle rule of a member not retired would hold and the
 // time until the dial wait after the last dial elapses (0: neither).
-func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) error {
+func (p *poolPolicy) Decide(v *carrier.ConnectionView, d *carrier.ConnectionDecision) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.seen == nil {
@@ -239,7 +227,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) error {
 	}
 	clear(p.seen)
 	for i := range v.Members {
-		p.seen[memberKey(&v.Members[i])] = true
+		p.seen[v.Members[i].FateGroup] = true
 	}
 	for id := range p.members {
 		if !p.seen[id] {
@@ -282,7 +270,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) error {
 	if len(s.retire) > 0 {
 		for i := range v.Members {
 			m := &v.Members[i]
-			key := memberKey(m)
+			key := m.FateGroup
 			if !p.seen[key] { // a repeated ID, retired already
 				continue
 			}
@@ -313,11 +301,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) error {
 					above = jitterWith(above, r.jitter, pm.u[j])
 				}
 				if x > above {
-					if isConnection(m) {
-						d.RetireConnections = append(d.RetireConnections, m.FateGroup)
-					} else {
-						d.RetirePipes = append(d.RetirePipes, m.PipeID)
-					}
+					d.RetireConnections = append(d.RetireConnections, m.FateGroup)
 					p.seen[key] = false
 					soon = 0
 					break
@@ -339,7 +323,7 @@ func (p *poolPolicy) Decide(v *zmux.PoolView, d *zmux.PoolDecision) error {
 // dialDraw returns the draw of the current dial wait, starting a new wait
 // when the failure count differs from the previous Decide's, when the time
 // since the last dial got shorter, or when a first dial appeared.
-func (p *poolPolicy) dialDraw(v *zmux.PoolView) uint64 {
+func (p *poolPolicy) dialDraw(v *carrier.ConnectionView) uint64 {
 	since := int64(-1)
 	if v.SinceLastDial >= 0 {
 		since = int64(v.SinceLastDial / time.Microsecond)
@@ -349,4 +333,41 @@ func (p *poolPolicy) dialDraw(v *zmux.PoolView) uint64 {
 	}
 	p.waitFails, p.waitSince = v.Failures, since
 	return p.waitU
+}
+
+// SessionGroup resolves the session portion of the pool profile into a
+// controller target. Physical connection policy is configured independently.
+func (c *Compiled) SessionGroup(id zmux.GroupID, candidates []zmux.TargetCandidate) zmux.GroupTarget {
+	g := zmux.GroupTarget{ID: id}
+	if c.pool == nil {
+		return g
+	}
+	source := c.o.source()
+	count := 1
+	if c.pool.count.set {
+		count = int(c.pool.count.drawTable(source))
+	}
+	g.Quotas = []zmux.MemberQuota{{ID: "members", Count: count, Directions: zmux.Both, Candidates: slices.Clone(candidates)}}
+	for _, rule := range c.pool.retire {
+		limit := rule.above.drawTable(source)
+		if rule.jitter != 0 {
+			limit = jitterWith(limit, rule.jitter, source.Uint64())
+		}
+		switch rule.metric {
+		case metricAge:
+			if d := micros(limit); g.Rotation.MaxAge == 0 || d < g.Rotation.MaxAge {
+				g.Rotation.MaxAge = d
+			}
+		case metricBytesSent:
+			if g.Rotation.SendBytes == 0 || limit < g.Rotation.SendBytes {
+				g.Rotation.SendBytes = limit
+			}
+		case metricBytesReceived:
+			if g.Rotation.ReceiveBytes == 0 || limit < g.Rotation.ReceiveBytes {
+				g.Rotation.ReceiveBytes = limit
+			}
+		default:
+		}
+	}
+	return g
 }

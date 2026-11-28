@@ -63,7 +63,7 @@ func TestStreamDatagramSojourn(t *testing.T) {
 	st := &Stream{bidi: true}
 	s.now = Time(Second)
 	for range 100 {
-		s.queueDatagram(st, []byte{1, 'x'})
+		s.queueDatagram(st, receivedDgram{context: 1, data: []byte{'x'}})
 		s.now = s.now.Add(Millisecond)
 	}
 	s.now = s.now.Add(200 * Millisecond)

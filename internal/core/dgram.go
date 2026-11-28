@@ -1,35 +1,58 @@
 package core
 
 import (
+	"runtime"
+
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/shaping"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
 // dgramState holds the datagram queues.
 type dgramState struct {
-	send   []outDgram
-	recv   [][]byte
-	recvAt []Time // when each of recv was queued
-	recvW  []*Signal
-	sendW  []*Signal
+	receiveDeadlines                                       DeadlineQueue[*Stream]
+	spliceTransfers, spliceBorrowPeak, spliceBorrowRefused uint64
+	flows                                                  map[*Stream]*datagramFlow
+	recvBacking                                            map[*Buf]datagramReceiveRoot
+	heldIDs                                                map[uint64]int // held datagrams per stream ID (releaseHeld)
+	reportTimers                                           DeadlineQueue[datagramReport]
+	expiry                                                 DeadlineQueue[datagramExpiry]
+	reportTimes                                            []Time
+	reportScratch                                          []datagramArrival
+	reportFrame                                            []byte
+	reportRanges                                           []byte
+	active                                                 []*datagramFlow
+	recv                                                   []receivedDgram
+	recvAt                                                 []Time // when each of recv was queued
+	recvW                                                  []*Signal
+	sendW                                                  []*Signal
 	// Received datagrams that wait for the receive limiter, which the
 	// driver runs outside the lock.
 	limited []PendingDatagram
-	heldIDs map[uint64]int // held datagrams per stream ID (releaseHeld)
 	// Received datagrams of peer streams not opened yet, in arrival order
 	// and so in the order they expire.
-	held        []heldDgram
-	recvSize    uint64 // bytes of the session queue and the held datagrams
-	limitedSize uint64 // bytes of limited, kept within DgramRecvSize
-	recvCd      codel  // the session queue's sojourn bound
-	sendCd      codel  // the send queue's
+	held                     []heldDgram
+	window                   datagramWindow
+	pathGate                 gate
+	recvCd                   codel // the session queue's sojourn bound
+	reportLimit              int
+	copyCount, copyBytes     int
+	nextSequence             uint64
+	nextAdmission            uint64
+	sendCount, sendBytes     int
+	nativeCount, nativeBytes int // original datagrams retained by channel receipts
+	recvCapacity             uint64
+	recvSize                 uint64 // bytes of the session queue and the held datagrams
+	limitedSize              uint64 // bytes of limited, kept within DgramRecvSize
+	reportWoken              bool
 }
 
 // heldDgram is a datagram held for a peer stream within the limit that
 // has not been opened yet, until its opening frame arrives or until.
 type heldDgram struct {
-	e     []byte // context-prefixed payload
+	e     receivedDgram
 	id    uint64
+	seq   uint64
 	until Time
 	ch    bool // received on a carrier datagram channel
 }
@@ -39,41 +62,124 @@ type heldDgram struct {
 // number of tiny datagrams held as well.
 const heldCost = 64
 
-func (h *heldDgram) cost() uint64 { return uint64(len(h.e)) + heldCost }
+func (h *heldDgram) cost() uint64 { return uint64(len(h.e.data)) + heldCost }
 
 // PendingDatagram is a received datagram waiting for the receive limiter.
 type PendingDatagram struct {
-	st *Stream // nil: a session datagram
-	e  []byte  // payload (a stream datagram: context-prefixed)
+	// Expires is an optional local Flow deadline for this received stream item.
+	// Zero leaves the item under the ordinary Flow lifetime.
+	Expires Time
+	st      *Stream // nil: a session datagram
+	e       receivedDgram
+	seq     uint64
 }
 
 // Len is the payload size the limiter is asked for.
-func (p *PendingDatagram) Len() int {
-	if p.st == nil {
-		return len(p.e)
+func (p *PendingDatagram) Len() int { return len(p.e.data) }
+
+// receivedDgram stores parsed Context separately. While in the source
+// session its backing is accounted once, irrespective of queue aliases.
+type receivedDgram struct {
+	expires Time
+	buf     *Buf
+	data    []byte
+	context uint64
+}
+
+type datagramReceiveRoot struct {
+	items       int
+	transferred bool
+}
+
+func (s *Session) retainReceivedDatagram(cx uint64, data []byte, buf *Buf) (receivedDgram, bool) {
+	d := s.dgState()
+	p := receivedDgram{data: data, context: cx}
+	if len(data) == 0 {
+		p.data = nil
+		return p, true
 	}
-	_, n := varint.ConsumeVarint(p.e)
-	return len(p.e) - n
+	if buf == nil || d.recvBacking[buf].items == 0 && uint64(cap(buf.B)) > s.cfg.DgramRecvSize-min64(d.recvCapacity, s.cfg.DgramRecvSize) ||
+		!buf.charge(s.datagramMemory) {
+		if s.datagramMemory == nil {
+			p.data = append([]byte(nil), data...)
+			return p, true
+		}
+		buf = copyBacking(s.datagramMemory, data)
+		if buf == nil {
+			s.dropRecv(1)
+			return receivedDgram{}, false
+		}
+		p.data = buf.B
+	} else {
+		buf.Ref()
+	}
+	p.buf = buf
+	if d.recvBacking == nil {
+		d.recvBacking = make(map[*Buf]datagramReceiveRoot)
+	}
+	root := d.recvBacking[buf]
+	if root.items == 0 {
+		d.recvCapacity += uint64(cap(buf.B))
+	}
+	root.items++
+	d.recvBacking[buf] = root
+	return p, true
+}
+
+func (s *Session) unaccountReceivedDatagram(p receivedDgram) {
+	if p.buf == nil {
+		return
+	}
+	d := s.dg
+	root := d.recvBacking[p.buf]
+	if root.items--; root.items != 0 {
+		d.recvBacking[p.buf] = root
+	} else {
+		delete(d.recvBacking, p.buf)
+		d.recvCapacity -= uint64(cap(p.buf.B))
+	}
+}
+
+func (s *Session) dropReceivedDatagram(p receivedDgram) {
+	s.unaccountReceivedDatagram(p)
+	if p.buf != nil {
+		p.buf.Unref()
+	}
+}
+
+func (p receivedDgram) relinquish() []byte {
+	if p.buf == nil {
+		return p.data
+	}
+	b := append([]byte(nil), p.data...)
+	p.buf.Unref()
+	return b
 }
 
 // outDgram is a queued datagram: its encoded data (flow prefix + payload)
 // and, for a stream datagram, its stream, whose opening frame it must not
 // overtake.
 type outDgram struct {
-	st   *Stream
-	data []byte
-	n    int  // payload bytes (data without the flow and context prefix)
-	at   Time // when it was queued (DgramTarget)
+	reserved  *pipeShape
+	st        *Stream
+	handoff   *Handoff
+	data      dgramView
+	opts      DatagramOptions
+	deadline  Time
+	delay     datagramDelay
+	admission uint64
+	n         int  // payload bytes (data without the flow and context prefix)
+	at        Time // when it was queued (DgramTarget)
 }
 
 // countSent counts a datagram handed to a carrier.
-func (s *Session) countSent(o *outDgram) {
+func (s *Session) countSent(st *Stream, n int) {
 	s.stats.DatagramsSent++
-	s.stats.DatagramBytesSent += uint64(o.n)
-	if o.st != nil {
-		c := &o.st.cnt
+	s.stats.DatagramBytesSent += uint64(n)
+	if st != nil {
+		c := &st.cnt
 		c.dgSent++
-		c.dgBytesSent += uint64(o.n)
+		c.dgBytesSent += uint64(n)
 	}
 }
 
@@ -81,9 +187,25 @@ func (s *Session) countSent(o *outDgram) {
 // Frame is sent outside the lock, Failed set when the carrier refused it,
 // and ChannelDone then counts it.
 type ChannelOut struct {
-	Frame  []byte
-	d      outDgram
-	Failed bool
+	*channelReceipt
+	Frame                    []byte
+	Deadline                 Time
+	Failed, Expired, Unknown bool
+}
+
+// A value copied by an adapter keeps the original completion identity.
+type channelReceipt struct {
+	pipe      *Pipe
+	shape     *pipeShape
+	dispatch  shapeDispatch
+	handoff   *Handoff
+	stream    *Stream
+	flow      *datagramFlow
+	payload   int
+	seq       uint64
+	charged   int64
+	queueCost int
+	replica   bool
 }
 
 // ready reports whether the datagram may go now; dead reports one of a
@@ -106,89 +228,50 @@ func (d *dgramState) wakeAll(s *Session) {
 	d.sendW = nil
 }
 
-// sendable reports queued datagrams that go in records now (or are to be
-// dropped); those for the datagram pipe's channel go by PollChannel.
-func (d *dgramState) sendable(s *Session) bool {
-	if !s.peerSeen {
-		return false
-	}
-	ch := s.channelOf(s.dgPipe())
-	for i := range d.send {
-		ok, dead := d.send[i].ready()
-		if dead || ok && (!ch.takes(len(d.send[i].data)) || s.followPipe(d.send[i].st) != nil) {
-			return true
-		}
-	}
-	return false
+// supports reports whether a datagram may use the channel when it is ready.
+func (c ChannelUse) supports(n int) bool {
+	return c.Limit < 0 || c.Limit > 0 && wire.ChannelDatagramLen(c.HasID, c.ID, n) <= c.Limit
 }
 
-// dgPipe returns the pipe that DATAGRAM frames go to now: the pipe whose
-// lane 0 carries the control frames, the primary pipe of a multipath
-// session or the session's outbound pipe;
-// nil when every pipe of a multipath session carries them.
-func (s *Session) dgPipe() *Pipe {
-	if s.mp != nil {
-		p, _ := s.primary()
-		return p
-	}
-	for _, p := range s.pipes {
-		if p.out != nil && !p.out.failed {
-			return p
-		}
-	}
-	return nil
-}
-
-// dgInRecords reports whether p's lane 0 records carry the queued
-// datagrams that follow no opening frame: every pipe of a session without
-// multipath, and the primary pipe of a multipath one (every pipe while it
-// has none).
-func (s *Session) dgInRecords(p *Pipe) bool {
-	if s.mp == nil {
-		return true
-	}
-	prim, _ := s.primary()
-	return prim == nil || prim == p
-}
-
-// followPipe returns the pipe a stream datagram follows in a multipath
-// session: the pipe of its stream's opening frame (or of the latest
-// reinjected copy) while that frame is unacknowledged and the pipe is
-// live (MULTIPATH.md S7, EXTENSIONS.md 6.4); nil when it goes by the
-// usual rule.
-func (s *Session) followPipe(st *Stream) *Pipe {
-	if s.mp == nil || st == nil || st.snd.mps == nil {
-		return nil
-	}
-	m := st.snd.mps
-	if !m.openSet || m.openAcked {
-		return nil
-	}
-	p := s.pipe(m.openPipe)
-	if p == nil || p.mp == nil || p.out == nil || p.out.failed || !p.mp.liveOut() || p.mp.retired {
-		return nil
-	}
-	return p
-}
-
-// takes reports whether a DATAGRAM frame of n bytes of data goes on the
-// channel.
+// takes reports whether a DATAGRAM fits in the current room.
 func (c ChannelUse) takes(n int) bool {
 	return c.Room > 0 && wire.ChannelDatagramLen(c.HasID, c.ID, n) <= c.Room
 }
 
-// channelOf returns how DATAGRAM frames for p may use its carrier's
-// datagram channel: when both endpoints sent
-// zmux_carrier_datagrams, the carrier has a channel, and p's records are
-// not shaped.
+// channelOf reads the attachment's latest capacity snapshot.
 func (s *Session) channelOf(p *Pipe) ChannelUse {
 	if !s.feat.CarrierDatagrams || p == nil || p.out == nil || p.out.failed {
 		return ChannelUse{}
 	}
-	if !p.out.lanes[0].info.Channel || s.shp != nil && s.shapeOf(p) != nil {
+	l := p.out.lane(0)
+	if l == nil || !l.info.Channel {
 		return ChannelUse{}
 	}
 	return p.chUse
+}
+
+// A capacity snapshot may briefly have no usable channel. Retain its last
+// resolved binding so a changed stream ID still expires the old evidence.
+type datagramChannelBinding struct {
+	id           uint64
+	hasID, known bool
+}
+
+func (s *Session) updateDatagramChannel(p *Pipe, use ChannelUse) {
+	if use.Limit <= 0 {
+		return
+	}
+	binding := datagramChannelBinding{hasID: use.HasID, known: true}
+	if use.HasID {
+		binding.id = use.ID
+	}
+	if p.chBinding.known && p.chBinding != binding {
+		if p.sh != nil {
+			p.sh.cancelNative(shaping.ReasonStaleGeneration)
+		}
+		s.expireDatagramSource(p, true)
+	}
+	p.chBinding = binding
 }
 
 // SetChannelSignal sets the signal that wakes the sender of a pipe's
@@ -196,14 +279,7 @@ func (s *Session) channelOf(p *Pipe) ChannelUse {
 func (s *Session) SetChannelSignal(pipe uint64, sig *Signal) {
 	if p := s.pipe(pipe); p != nil {
 		p.chSig = sig
-	}
-}
-
-func (s *Session) wakeChannels() {
-	for _, p := range s.pipes {
-		if p.chSig != nil {
-			s.wake(p.chSig)
-		}
+		p.chUse = ChannelUse{Limit: -1}
 	}
 }
 
@@ -213,58 +289,185 @@ func (s *Session) wakeChannels() {
 // more. use is what the channel takes now, read by the driver outside the
 // lock; the core decides with it until the next poll. ChannelDone counts
 // the datagrams once the driver tried them.
-func (s *Session) PollChannel(pipe uint64, use ChannelUse, dst []ChannelOut) (_ []ChannelOut, live bool) {
+func (s *Session) PollChannel(pipe uint64, use ChannelUse, dst []ChannelOut, now Time) (_ []ChannelOut, live bool) {
+	s.SetNow(now)
 	p := s.pipe(pipe)
-	if p == nil || p.out == nil || p.out.failed || s.state == StateClosed {
+	if p == nil || p.out == nil || p.out.failed || s.state >= StateClosing {
 		return dst, false
 	}
-	p.chUse = use
-	s.noteDatagramPath()
-	d := s.dg
-	if d == nil || len(d.send) == 0 || !s.peerSeen || s.state >= StateClosing || p != s.dgPipe() {
+	if p.chUse != use || !p.chBinding.known && use.Limit > 0 {
+		if p.sh != nil {
+			p.sh.settleNativeCopyDelay()
+		}
+		s.updateDatagramChannel(p, use)
+		p.chUse = use
+		if p.sh != nil {
+			p.sh.startNativeCopyDelay(s.channelOf(p))
+		}
+		s.noteDatagramPath()
+		s.wakeDatagramCopy(p)
+	}
+	if !s.peerSeen || !maySend(p, false) {
 		return dst, true
 	}
 	ch := s.channelOf(p)
-	if ch.Room == 0 {
+	ps := p.sh
+	if ps != nil && ps.native.pending() {
+		ps.validateNative(ch)
+	}
+	if ps != nil && ps.delayActive {
+		ps.refreshRecordCopyDelay()
+	}
+	s.pruneDatagramHeads()
+	if ch.Room <= 0 || s.dg == nil || s.dg.sendCount == 0 && len(p.datagramCopies) == 0 {
 		return dst, true
 	}
-	kept := d.send[:0]
-	for i, o := range d.send {
-		ok, dead := o.ready()
-		if dead || uint64(len(o.data)+1) > s.peerMaxDgram {
-			s.stats.DatagramsDroppedSend++
-			continue
+	if s.shp != nil {
+		ps = s.shapeOf(p)
+		if ps != nil {
+			ps.shapeEventsDue(s.now)
 		}
-		if !ok || !ch.takes(len(o.data)) || s.followPipe(o.st) != nil {
-			kept = append(kept, o)
-			continue
-		}
-		if s.sendDrop(&o, len(d.send)-i-1) {
-			continue
-		}
-		b := make([]byte, 0, wire.ChannelDatagramLen(ch.HasID, ch.ID, len(o.data)))
-		dst = append(dst, ChannelOut{Frame: wire.AppendChannelDatagram(b, ch.HasID, ch.ID, o.data), d: outDgram{st: o.st, n: o.n}})
 	}
-	s.wakeSendRoom(len(d.send) - len(kept))
-	clear(d.send[len(kept):])
-	d.send = kept
-	if len(d.send) == 0 {
-		d.send = nil
-		d.sendCd.idle()
+	for {
+		var f *datagramFlow
+		if ps != nil && ps.native.pending() {
+			f = ps.native.flow
+		} else if !s.datagramExhausted() {
+			f = s.nextDatagram(p, true, 7)
+		}
+		if f != nil {
+			if s.datagramCoDel(f) {
+				continue
+			}
+			o := &f.queue[0]
+			if !ch.takes(s.datagramDataLen(o)) {
+				break
+			}
+			if o.reserved != nil && o.reserved != ps {
+				o.reserved.clearNative()
+			}
+			pad, ready := s.nativePadding(ps, ch, s.datagramDataLen(o), f, nil, o.deadline)
+			if !ready {
+				break
+			}
+			data := s.datagramData(o)
+			out, ok := s.channelOut(p, ps, ch, data, pad, o.st, o.n, o.data.cost(), o.handoff, s.dg.nextSequence, o.deadline, f)
+			if !ok {
+				s.dropDatagram(f)
+				continue
+			}
+			dst = append(dst, out)
+			s.commitDatagram(p, o, data, true)
+			s.removeDatagram(f, true)
+		} else {
+			c := s.useDatagramCopy(p, true)
+			if c == nil {
+				break
+			}
+			pad, ready := s.nativePadding(ps, ch, c.data.len(), nil, c, c.deadline)
+			if !ready {
+				break
+			}
+			out, ok := s.channelOut(p, ps, ch, c.data, pad, c.st, c.payload, c.data.cost(), c.handoff, c.sequence, c.deadline, nil)
+			if !ok {
+				s.removeDatagramCopy(p, 0)
+				s.stats.DatagramCopyBudgetDropped++
+				continue
+			}
+			dst = append(dst, out)
+			s.countDatagramCopy(p, true)
+		}
+		// A planner observes the outcome of this dispatch before selecting the
+		// next unit. Keep the batched channel path for sessions without one.
+		if ps != nil && (ps.datagram != nil || ps.caps&shaping.CapOutbound != 0) {
+			break
+		}
 	}
 	return dst, true
 }
 
+func (s *Session) channelOut(p *Pipe, ps *pipeShape, ch ChannelUse, data dgramView, pad int, st *Stream, n, cost int, handoff *Handoff, seq uint64, deadline Time, flow *datagramFlow) (ChannelOut, bool) {
+	nBytes := int64(wire.ChannelDatagramLen(ch.HasID, ch.ID, data.len()) + pad)
+	if !s.datagramMemory.adjust(nBytes) {
+		return ChannelOut{}, false
+	}
+	dispatch := s.reserveShape(uint64(pad))
+	s.datagramDispatchPending(p, seq)
+	// Transfer the queue charge to the receipt before removing the entry.
+	if flow == nil {
+		s.dg.copyCount++
+		s.dg.copyBytes += cost
+	} else {
+		s.dg.nativeCount++
+		s.dg.nativeBytes += cost
+		flow.nativeCount++
+		flow.nativeBytes += cost
+	}
+	return ChannelOut{Frame: data.channelDatagram(ch, pad), Deadline: deadline, channelReceipt: &channelReceipt{stream: st, payload: n,
+		replica: flow == nil, flow: flow, pipe: p, seq: seq, shape: ps, dispatch: dispatch, handoff: handoff.hold(), charged: nBytes, queueCost: cost}}, true
+}
+
 // ChannelDone counts the channel datagrams of out that PollChannel
 // returned: sent, or dropped when the carrier refused them.
-func (s *Session) ChannelDone(out []ChannelOut) {
+func (s *Session) ChannelDone(out []ChannelOut, now Time) {
+	s.SetNow(now)
 	for i := range out {
-		if out[i].Failed {
-			s.stats.DatagramsDroppedSend++
+		x := &out[i]
+		if x.channelReceipt == nil || x.pipe == nil {
 			continue
 		}
-		s.countSent(&out[i].d)
-		s.stats.DatagramsSentChannel++
+		x.handoff.datagramDone(!x.Failed)
+		x.handoff = nil
+		s.datagramDispatchDone(x.pipe, x.seq, x.Failed)
+		switch {
+		case x.Failed:
+			reason := shaping.ReasonCarrierRejected
+			if x.Expired {
+				reason = shaping.ReasonApplicationExpired
+			}
+			s.shapeReason(reason)
+			if x.replica {
+				s.stats.DatagramCopyPathDropped++
+			} else {
+				s.stats.DatagramsDroppedSend++
+			}
+		case x.replica:
+			s.stats.DatagramCopiesSent++
+			s.stats.DatagramCopyBytes += uint64(x.payload)
+		default:
+			s.countSent(x.stream, x.payload)
+			s.shapingEarn(uint64(x.payload))
+		}
+		if !x.Failed {
+			extra := x.dispatch.extra
+			s.settleShape(x.dispatch, uint64(x.charged)-extra, extra)
+			if !x.replica {
+				s.outbound(x.shape, 0, len(x.Frame), shaping.NativeDatagram, true, false)
+			}
+			s.stats.DatagramsSentChannel++
+			if s.pipe(x.pipe.id) == x.pipe {
+				s.memberBytes(x.pipe, true, uint64(len(x.Frame)))
+			}
+		} else {
+			if x.Unknown {
+				s.retainUnknown(x.dispatch.second, x.dispatch.extra)
+			}
+			s.settleShape(x.dispatch, 0, 0)
+		}
+		s.datagramMemory.adjust(-x.charged)
+		if x.replica {
+			s.dg.copyCount--
+			s.dg.copyBytes -= x.queueCost
+		} else {
+			s.dg.nativeCount--
+			s.dg.nativeBytes -= x.queueCost
+			f := x.flow
+			f.nativeCount--
+			f.nativeBytes -= x.queueCost
+			s.dg.releaseDatagramFlow(f)
+			s.wakeSendRoom(1)
+		}
+		x.pipe, x.shape, x.flow = nil, nil, nil
 	}
 }
 
@@ -277,12 +480,13 @@ func (s *Session) ReceiveChannelDatagram(pipe uint64, frame []byte, now Time) {
 	if s.state >= StateClosing {
 		return
 	}
-	if s.pipe(pipe) == nil || !s.peerSeen || !s.feat.CarrierDatagrams {
+	p := s.pipe(pipe)
+	if !mayReceive(p) || !s.peerSeen || !s.feat.CarrierDatagrams {
 		s.dropRecv(1)
 		return
 	}
 	var f wire.Frame
-	if e := wire.DecodeChannelFrame(frame, &f); e != nil {
+	if e := wire.DecodeChannelFrame(frame, &f, s.feat.CarrierDatagramPadding); e != nil {
 		s.failLocal(e)
 		return
 	}
@@ -290,41 +494,44 @@ func (s *Session) ReceiveChannelDatagram(pipe uint64, frame []byte, now Time) {
 		s.failLocal(e)
 		return
 	}
-	if e := s.onDatagram(&f, true); e != nil {
+	if e := s.onDatagram(p, &f, nil, true); e != nil {
 		s.failLocal(e)
+		return
 	}
+	s.memberBytes(p, false, uint64(len(frame)))
 }
 
 type streamDgrams struct {
-	q    [][]byte // context-prefixed payloads
-	at   []Time   // when each was queued
-	size uint64   // their payload bytes (DgramStreamSize)
-	cd   codel    // the queue's sojourn bound (DgramTarget)
-}
-
-// dgPayloadLen is the payload length of a context-prefixed stream datagram.
-func dgPayloadLen(e []byte) uint64 {
-	_, n := varint.ConsumeVarint(e)
-	return uint64(len(e) - n)
+	deadlines *DeadlineQueue[*Stream]
+	expiry    Deadline[*Stream]
+	expired   uint64
+	q         []receivedDgram
+	at        []Time // when each was queued
+	size      uint64 // their payload bytes (DgramStreamSize)
+	cd        codel  // the queue's sojourn bound (DgramTarget)
+	detached  bool
 }
 
 // pop removes the oldest datagram of the queue.
-func (q *streamDgrams) pop() []byte {
+func (q *streamDgrams) pop() receivedDgram {
 	e := q.q[0]
-	q.q[0] = nil
+	q.q[0] = receivedDgram{}
 	q.q = q.q[1:]
 	q.at = q.at[1:]
-	q.size -= dgPayloadLen(e)
+	q.size -= uint64(len(e.data))
+	if q.expiry.index != 0 && e.expires == q.expiry.at {
+		q.armExpiry()
+	}
 	return e
 }
 
 // popRecv removes the oldest datagram of the session queue.
-func (d *dgramState) popRecv() []byte {
+func (d *dgramState) popRecv() receivedDgram {
 	e := d.recv[0]
-	d.recv[0] = nil
+	d.recv[0] = receivedDgram{}
 	d.recv = d.recv[1:]
 	d.recvAt = d.recvAt[1:]
-	d.recvSize -= uint64(len(e))
+	d.recvSize -= uint64(len(e.data))
 	return e
 }
 
@@ -340,57 +547,48 @@ func (s *Session) wakeSendRoom(n int) {
 
 // sendDrop decides on o, a datagram leaving the send queue with rest
 // queued after it: true drops it, counted, for its sojourn (DgramTarget).
-func (s *Session) sendDrop(o *outDgram, rest int) bool {
-	if !s.dg.sendCd.drop(o.at, s.now, s.cfg.DgramTarget, rest == 0) {
-		return false
-	}
-	s.stats.DatagramsDroppedSend++
-	return true
-}
-
 func (s *Session) dgState() *dgramState {
 	if s.dg == nil {
-		s.dg = &dgramState{}
+		s.dg = &dgramState{nextSequence: s.cfg.Test.DatagramSequence}
+		s.updateDatagramReportLimit()
 	}
 	return s.dg
 }
 
-// MaxDatagramPayload returns the largest session datagram payload the peer
-// accepts now, 0 when it accepts none.
+// MaxDatagramPayload reports the largest payload the session can admit.
 func (s *Session) MaxDatagramPayload(flowLen int) int {
-	if !s.peerSeen || s.peerMaxDgram == 0 {
+	if !s.peerSeen || s.peerMaxDgram == 0 || s.datagramExhausted() {
 		return 0
 	}
-	// What writeDatagrams can send in a record of every pipe that may
-	// carry it: the Length field is left out as the last frame of a
-	// record, except where a shaper may pad after it.
-	m := datagramDataMax(min(s.peerMaxDgram, s.dgRecordCap()), s.shp != nil)
-	if s.feat.Flows {
-		m -= flowLen
+	record, limit, _ := s.datagramCapacity(nil)
+	if record == 0 {
+		record = min(int(s.peerMaxRecord), wire.RecordFloor)
+	}
+	return s.datagramPayload(flowLen, record, limit)
+}
+
+func (s *Session) datagramPayload(flowLen, record, channel int) int {
+	if !s.peerSeen || s.peerMaxDgram == 0 || s.datagramExhausted() {
+		return 0
+	}
+	m := 0
+	if record > 0 {
+		m = datagramDataMax(min(s.peerMaxDgram, uint64(record)), false)
+	}
+	if channel > 0 {
+		m = max(m, min(channel, int(s.peerMaxDgram-1)))
+	}
+	if s.feat.DatagramFamily {
+		m -= flowLen + s.datagramSequenceWidth()
 	}
 	return max(m, 0)
 }
 
-// PathDatagramPayload returns the largest datagram payload, after a flow
-// prefix of flowLen bytes, that leaves as one datagram of the datagram
-// pipe's carrier channel (its size as the carrier last reported it), and
-// where datagrams ride records (no channel, or none now) the largest a
-// record takes (MaxDatagramPayload); 0 when the peer accepts none. A
-// larger datagram goes in a record.
+// PathDatagramPayload reports the largest payload across eligible record
+// and carrier datagram paths.
 func (s *Session) PathDatagramPayload(flowLen int) int {
-	m := s.MaxDatagramPayload(flowLen)
-	if m == 0 {
-		return 0
-	}
-	ch := s.channelOf(s.dgPipe())
-	if ch.Room == 0 {
-		return m
-	}
-	c := ch.Room - wire.ChannelDatagramLen(ch.HasID, ch.ID, 0)
-	if s.feat.Flows {
-		c -= flowLen
-	}
-	return max(min(m, c), 0)
+	record, _, channel := s.datagramCapacity(nil)
+	return s.datagramPayload(flowLen, record, channel)
 }
 
 // StreamPathDatagramPayload is PathDatagramPayload for a datagram of st
@@ -399,44 +597,22 @@ func (s *Session) StreamPathDatagramPayload(st *Stream, context uint64) int {
 	if s.StreamMaxDatagramPayload(st, context) == 0 {
 		return 0
 	}
-	idLen := 8
-	if st.idSet {
-		idLen = varint.SizeVarint(st.id + 1)
-	}
-	return s.PathDatagramPayload(idLen + varint.SizeVarint(context))
+	record, _, channel := s.datagramCapacity(st)
+	return s.datagramPayload(streamDgramPrefixLen(st, context), record, channel)
 }
 
 // noteDatagramPath reports a change of a session datagram's
 // PathDatagramPayload (EvDatagramPath).
 func (s *Session) noteDatagramPath() {
-	if !s.cfg.Datagrams || !s.peerSeen {
+	if !s.peerSeen {
 		return
 	}
-	if v := s.PathDatagramPayload(1); v != s.dgPath {
-		s.dgPath = v
-		s.emit(Event{Kind: EvDatagramPath, Count: uint64(v)})
+	s.routeDatagrams()
+	_, path, native, nativeAvailable := s.DatagramPath(nil, 0)
+	if path != s.dgPath || native != s.dgNative || nativeAvailable != s.dgNativeAvailable {
+		s.dgPath, s.dgNative, s.dgNativeAvailable = path, native, nativeAvailable
+		s.emit(Event{Kind: EvDatagramPath, Count: uint64(path), Code: uint64(native), Native: nativeAvailable})
 	}
-}
-
-// dgRecordCap returns the smallest record capacity (frames bytes) of the
-// pipes that may carry datagrams in records.
-func (s *Session) dgRecordCap() uint64 {
-	c := min(s.peerMaxRecord, wire.MaxRecordSize)
-	add := func(p *Pipe) {
-		for _, ol := range p.out.lanes {
-			c = min(c, uint64(s.recMax(ol)))
-		}
-	}
-	if p := s.dgPipe(); p != nil {
-		add(p)
-		return c
-	}
-	for _, p := range s.pipes {
-		if p.out != nil && !p.out.failed {
-			add(p)
-		}
-	}
-	return c
 }
 
 // StreamMaxDatagramPayload returns the largest datagram payload the peer
@@ -444,130 +620,349 @@ func (s *Session) dgRecordCap() uint64 {
 // there. Before st has its identifier the largest identifier encoding is
 // assumed, so the value only grows once it is assigned.
 func (s *Session) StreamMaxDatagramPayload(st *Stream, context uint64) int {
-	if !s.cfg.Datagrams || !s.peerSeen || !s.feat.Flows || !st.bidi {
+	if !s.peerSeen || !s.feat.DatagramFamily || !st.bidi || context > varint.MaxVarint {
 		return 0
 	}
+	return s.MaxDatagramPayload(streamDgramPrefixLen(st, context))
+}
+
+func streamDgramPrefixLen(st *Stream, context uint64) int {
 	idLen := 8
 	if st.idSet {
 		idLen = varint.SizeVarint(st.id + 1)
 	}
-	return s.MaxDatagramPayload(idLen + varint.SizeVarint(context))
+	return idLen + varint.SizeVarint(context)
 }
 
 // SendDatagram queues a datagram; a full queue drops its oldest entry
 // (never blocks). stream is nil for a session datagram.
 func (s *Session) SendDatagram(st *Stream, context uint64, p []byte) error {
-	if s.err != nil {
-		return s.err
+	return s.SendDatagramWith(st, context, p, DatagramOptions{}, s.now)
+}
+
+func (s *Session) SendDatagramWith(st *Stream, context uint64, p []byte, o DatagramOptions, at Time) error {
+	_, err := s.AdmitDatagram(DatagramRequest{Stream: st, Context: context, Payload: p, Options: o, At: at})
+	return err
+}
+
+// DatagramRepresentation describes the representation allowed by the host API.
+type DatagramRepresentation uint8
+
+const (
+	DatagramOnly DatagramRepresentation = iota
+	DatagramOrCapsule
+	CapsuleOnly
+)
+
+type DatagramAdmission uint8
+
+const (
+	DatagramRefused DatagramAdmission = iota
+	DatagramQueued
+	DatagramCapsule
+	DatagramWaiting
+)
+
+type DatagramDropReason string
+
+const (
+	DatagramDropDeadline          DatagramDropReason = "deadline"
+	DatagramDropNoNativePath      DatagramDropReason = "no_native_path"
+	DatagramDropLimiter           DatagramDropReason = "limiter"
+	DatagramDropQueueOverflow     DatagramDropReason = "queue_overflow"
+	DatagramDropSequenceExhausted DatagramDropReason = "sequence_exhausted"
+)
+
+type DatagramDroppedError struct{ Reason DatagramDropReason }
+
+func (e DatagramDroppedError) Error() string { return "zmux: datagram dropped: " + string(e.Reason) }
+
+func (s *Session) rejectDatagram(reason DatagramDropReason) error {
+	s.stats.DatagramsDroppedSend++
+	switch reason {
+	case DatagramDropDeadline:
+		s.stats.DatagramDeadlineDropped++
+	case DatagramDropNoNativePath:
+		s.stats.DatagramNativeDropped++
+	case DatagramDropLimiter:
+		s.stats.DatagramsDroppedLimit++
+	case DatagramDropSequenceExhausted, DatagramDropQueueOverflow:
 	}
-	if !s.cfg.Datagrams {
-		return ErrNotNegotiated
+	return DatagramDroppedError{Reason: reason}
+}
+
+// DatagramRequest contains a single hop's admission inputs.
+type DatagramRequest struct {
+	Stream         *Stream
+	Context        uint64
+	Payload        []byte
+	Backing        *Buf
+	Options        DatagramOptions
+	At             Time
+	Representation DatagramRepresentation
+	Limited, Owned bool
+	Report         func(sent, unsent int)
+	FirstDatagram  func(native bool)
+	// PayloadCopied accumulates actual send-queue payload copies during admission.
+	PayloadCopied *uint64
+	Wait          *Signal
+	WaitDeadline  *Time
+}
+
+// AdmitDatagram decides representation and queues an original in the same owner commit.
+func (s *Session) AdmitDatagram(r DatagramRequest) (DatagramAdmission, error) {
+	plan, result, err := s.planDatagram(r, len(r.Payload))
+	if result != DatagramQueued {
+		return result, err
 	}
-	var prefix []byte
-	if st != nil {
-		if st.appReleased() {
-			return &StreamError{Kind: StreamClosedLocally, StreamID: st.id} // the application is done with the stream
-		}
-		if s.peerSeen && !s.feat.Flows || !st.bidi {
-			return ErrNotNegotiated
-		}
-		if !st.idSet {
-			if _, err := s.PinID(st); err != nil {
-				return err
-			}
-		}
-		prefix = varint.AppendVarint(prefix, st.id+1)
-		prefix = varint.AppendVarint(prefix, context)
-	} else if s.feat.Flows || !s.peerSeen && s.cfg.Local.Has&wire.HasFlows != 0 {
-		prefix = []byte{0}
+	if err := s.pinDatagramStream(r.Stream); err != nil {
+		return DatagramRefused, err
 	}
-	if s.peerSeen {
-		if s.peerMaxDgram == 0 {
-			return ErrNotNegotiated
-		}
-		if m := s.MaxDatagramPayload(len(prefix)); len(p) > m {
-			return &DatagramTooLargeError{Max: m}
-		}
-	}
+	s.pruneDatagramHeads()
 	d := s.dgState()
-	data := make([]byte, 0, len(prefix)+len(p))
-	data = append(append(data, prefix...), p...)
-	if len(d.send) >= s.cfg.DgramSendQ {
-		d.send[0] = outDgram{}
-		d.send = d.send[1:]
-		s.stats.DatagramsDroppedSend++
+	data, copied, err := s.allocateDatagram(r, plan.prefix[:plan.prefixLen], d)
+	if err != nil {
+		return DatagramRefused, err
 	}
-	d.send = append(d.send, outDgram{data: data, st: st, n: len(p), at: s.now})
-	s.wakeAllWriters()
-	s.wakeChannels()
+	defer data.unref()
+	result, err = s.commitDatagramAdmission(r, plan, data, d)
+	if result == DatagramQueued && r.PayloadCopied != nil {
+		*r.PayloadCopied += uint64(copied)
+	}
+	return result, err
+}
+
+type datagramPlan struct {
+	options   DatagramOptions
+	deadline  Time
+	prefix    [24]byte
+	prefixLen int
+}
+
+func (s *Session) planDatagram(r DatagramRequest, largest int) (datagramPlan, DatagramAdmission, error) {
+	var plan datagramPlan
+	st, context := r.Stream, r.Context
+	if s.err != nil {
+		return plan, DatagramRefused, s.err
+	}
+	if st != nil && st.appReleased() {
+		return plan, DatagramRefused, &StreamError{Kind: StreamClosedLocally, StreamID: st.id}
+	}
+	if context > varint.MaxVarint {
+		return plan, DatagramRefused, ErrInvalid
+	}
+	o := s.DatagramOptions(st, r.Options)
+	strict := o.Carrier == DatagramRequireNative
+	if r.Representation == CapsuleOnly && strict {
+		return plan, DatagramRefused, ErrInvalid
+	}
+	deadline, err := o.ResolveDeadline(r.At)
+	if err != nil {
+		return plan, DatagramRefused, err
+	}
+	if deadline <= s.now {
+		return plan, DatagramRefused, s.rejectDatagram(DatagramDropDeadline)
+	}
+	if r.Representation == CapsuleOnly {
+		return plan, DatagramCapsule, nil
+	}
+	if s.datagramExhausted() {
+		return plan, DatagramRefused, s.rejectDatagram(DatagramDropSequenceExhausted)
+	}
+	if r.Representation == DatagramOrCapsule && s.canUseCapsule(st, context, largest, strict, deadline, s.now) {
+		return plan, DatagramCapsule, nil
+	}
+	if !s.peerSeen || s.peerMaxDgram == 0 || st != nil && (!s.feat.DatagramFamily || !st.bidi) {
+		return plan, DatagramRefused, ErrNotNegotiated
+	}
+	if strict && !s.feat.CarrierDatagrams {
+		return plan, DatagramRefused, s.rejectDatagram(DatagramDropNoNativePath)
+	}
+	if r.Wait != nil && s.DatagramQueueFull() {
+		r.Wait.Drain()
+		s.CancelDatagramSendWait(r.Wait)
+		s.WaitDatagramSend(r.Wait)
+		*r.WaitDeadline = deadline
+		return plan, DatagramWaiting, nil
+	}
+	if r.Limited {
+		return plan, DatagramRefused, s.rejectDatagram(DatagramDropLimiter)
+	}
+	prefix := plan.prefix[:0]
+	if s.feat.DatagramFamily {
+		prefix = plan.prefix[:8] // leading room for the sequence assigned at dispatch
+	}
+	if st != nil {
+		id := st.id
+		if !st.idSet {
+			id = streamID(s.loc[typeIndex(st.bidi)].next, st.bidi, s.role == RoleResponder)
+		}
+		if id >= varint.MaxVarint {
+			return plan, DatagramRefused, ErrStreamLimit
+		}
+		prefix = varint.AppendVarint(prefix, id+1)
+		prefix = varint.AppendVarint(prefix, context)
+	} else if s.feat.DatagramFamily {
+		prefix = append(prefix, 0)
+	}
+	flowLen := max(0, len(prefix)-8)
+	if m := s.MaxDatagramPayload(flowLen); largest > m {
+		return plan, DatagramRefused, &DatagramTooLargeError{Max: m}
+	}
+	plan.options, plan.deadline, plan.prefixLen = o, deadline, len(prefix)
+	return plan, DatagramQueued, nil
+}
+
+func (s *Session) pinDatagramStream(st *Stream) error {
+	if st != nil && !st.idSet {
+		_, err := s.PinID(st)
+		return err
+	}
 	return nil
 }
 
-// writeDatagrams puts queued datagrams into records on p, leaving those
-// for p's datagram channel to PollChannel.
-func (s *Session) writeDatagrams(w *recWriter, p *Pipe) {
-	d := s.dg
-	var ch ChannelUse
-	if p == s.dgPipe() {
-		ch = s.channelOf(p)
-	}
-	usual := s.dgInRecords(p)
-	held := d.send[:0] // in place: datagrams waiting for their stream's opening frame or the channel
-	i := 0
-	for ; i < len(d.send); i++ {
-		o := d.send[i]
-		ok, dead := o.ready()
-		if dead || uint64(len(o.data)+1) > s.peerMaxDgram {
-			s.stats.DatagramsDroppedSend++
-			continue
-		}
-		if !ok {
-			held = append(held, o)
-			continue
-		}
-		if f := s.followPipe(o.st); f != nil {
-			// While no pipe of the opening frame may carry it (SUSPECT,
-			// DRAINING), it stays queued.
-			if f != p || f.mp.out != OutActive {
-				held = append(held, o)
-				continue
+func (s *Session) allocateDatagram(r DatagramRequest, prefix []byte, d *dgramState) (dgramView, int, error) {
+	st, p, buf, owned := r.Stream, r.Payload, r.Backing, r.Owned
+	if buf != nil {
+		space := s.datagramSendRoom()
+		if s.feat.DatagramFamily {
+			flowSpace := s.cfg.DatagramFlowBytes
+			if f := d.flows[st]; f != nil {
+				flowSpace -= f.bytes + f.nativeBytes
 			}
-		} else if !usual {
-			held = append(held, o)
-			continue
-		} else if ch.takes(len(o.data)) {
-			held = append(held, o)
-			s.wake(p.chSig)
+			space = min(space, flowSpace)
+		}
+		// Share a backing when it fits. Otherwise use only the bytes
+		// needed by this view, before evicting other flows.
+		if cap(buf.B)+len(prefix) > space && len(p)+len(prefix) <= space {
+			buf, owned = nil, false
+		}
+	}
+	if buf != nil && !buf.charge(s.datagramMemory) {
+		buf, owned = nil, false
+	}
+	// A copied payload shares its allocation with the prefix.
+	n := len(prefix)
+	if !owned || buf == nil && s.datagramMemory != nil {
+		n += len(p)
+		owned = false
+	}
+	storage := newBacking(s.datagramMemory, n)
+	if storage == nil {
+		s.stats.DatagramsDroppedSend++
+		return dgramView{}, 0, ErrMemoryBudget
+	}
+	copy(storage.B, prefix)
+	copied := 0
+	if !owned {
+		p, buf = storage.B[len(prefix):], nil
+		copied = copy(p, r.Payload)
+	}
+	if buf != nil {
+		buf.Ref()
+	}
+	return dgramView{head: storage.B[:len(prefix):len(prefix)], payload: p, buf: buf, storage: storage}, copied, nil
+}
+
+func (s *Session) commitDatagramAdmission(r DatagramRequest, plan datagramPlan, data dgramView, d *dgramState) (DatagramAdmission, error) {
+	entry := s.datagramEntry(r, plan, data, d)
+	s.enqueueDatagram(entry)
+	f := d.flows[r.Stream]
+	accepted := f != nil && len(f.queue) != 0 && f.queue[len(f.queue)-1].admission == entry.admission
+	if !accepted {
+		return DatagramRefused, DatagramDroppedError{Reason: DatagramDropQueueOverflow}
+	}
+	if len(f.queue) == 1 && f.route.late {
+		s.stats.DatagramDeadlineDropped++
+		s.dropDatagram(f)
+		return DatagramRefused, DatagramDroppedError{Reason: DatagramDropDeadline}
+	}
+	s.attachDatagramHandoff(&f.queue[len(f.queue)-1], r)
+	return DatagramQueued, nil
+}
+
+func (s *Session) datagramEntry(r DatagramRequest, plan datagramPlan, data dgramView, d *dgramState) outDgram {
+	d.nextAdmission++
+	entry := outDgram{data: data, st: r.Stream, n: len(r.Payload), at: s.now, deadline: plan.deadline, opts: plan.options, admission: d.nextAdmission}
+	data.ref()
+	return entry
+}
+
+func (s *Session) attachDatagramHandoff(entry *outDgram, r DatagramRequest) {
+	if r.Report != nil && len(r.Payload) != 0 || r.FirstDatagram != nil {
+		ticket := s.newHandoff(len(r.Payload), r.Report)
+		ticket.datagram = r.FirstDatagram
+		entry.handoff = ticket
+	}
+}
+
+// closeDatagramSends releases the session's sends that will never dispatch.
+func (s *Session) closeDatagramSends() {
+	if d := s.dg; d != nil {
+		for len(d.active) != 0 {
+			s.dropDatagram(d.active[0])
+		}
+		for _, p := range s.pipes {
+			s.dropDatagramCopies(p)
+		}
+	}
+}
+
+// writeDatagram adds one eligible Flow head to the current record batch.
+func (s *Session) writeDatagram(w *recWriter, p *Pipe, urgency uint8) (sent, full bool) {
+	s.pruneDatagramHeads()
+	for f := s.nextDatagram(p, false, urgency); f != nil; f = s.nextDatagram(p, false, urgency) {
+		if s.datagramCoDel(f) {
 			continue
 		}
-		if s.sendDrop(&o, len(d.send)-i-1) {
+		o := &f.queue[0]
+		if o.reserved != nil {
+			o.reserved.clearNative()
+		}
+		data := s.datagramData(o)
+		if s.datagramExhausted() {
+			s.dropDatagram(f)
 			continue
 		}
-		sent, never := w.datagram(o.data, s.peerMaxDgram)
+		sent, never := w.datagram(data, o.handoff, s.peerMaxDgram, o.n)
 		if never {
-			// It can never fit this pipe's records: drop it rather than
-			// hold back the datagrams queued after it.
-			s.stats.DatagramsDroppedSend++
+			s.dropDatagram(f)
 			continue
 		}
 		if !sent {
-			break
+			return false, true
 		}
-		s.countSent(&o)
+		s.countSent(o.st, o.n)
+		s.commitDatagram(p, o, data, false)
+		s.removeDatagram(f, true)
+		return true, false
 	}
-	held = append(held, d.send[i:]...)
-	s.wakeSendRoom(len(d.send) - len(held))
-	clear(d.send[len(held):])
-	d.send = held
-	if len(d.send) == 0 {
-		d.send = nil
-		d.sendCd.idle()
+	if c := s.useDatagramCopy(p, false); c != nil && (c.st == nil || c.st.urgency <= urgency) {
+		sent, never := w.datagram(c.data, c.handoff, s.peerMaxDgram, -1)
+		if never {
+			s.removeDatagramCopy(p, 0)
+			s.stats.DatagramCopyPathDropped++
+			return false, false
+		}
+		if sent {
+			s.countDatagramCopy(p, false)
+		}
+		return sent, !sent
 	}
+	return false, false
 }
 
 // DatagramQueueFull reports whether the send queue is full.
 func (s *Session) DatagramQueueFull() bool {
-	return s.dg != nil && len(s.dg.send) >= s.cfg.DgramSendQ
+	return s.dg != nil && s.datagramSendSlots() <= 0
+}
+
+func (s *Session) datagramSendSlots() int {
+	return s.cfg.DgramSendQ - s.dg.sendCount - s.dg.nativeCount
+}
+
+func (s *Session) datagramSendRoom() int {
+	return s.cfg.DatagramSendBytes - s.dg.sendBytes - s.dg.nativeBytes
 }
 
 // WaitDatagramSend registers sig for room in the send queue.
@@ -597,66 +992,104 @@ func (s *Session) TakeLimitedDatagrams(dst []PendingDatagram) []PendingDatagram 
 // reports whether it was queued; drop counts one it did not pass.
 func (s *Session) DeliverDatagram(p PendingDatagram, drop bool) bool {
 	if drop {
+		s.dropReceivedDatagram(p.e)
 		s.stats.DatagramsDroppedLimit++
 		return false
 	}
-	return s.queueDatagram(p.st, p.e)
+	if s.feat.DatagramFamily && s.duplicateDatagram(p.seq) {
+		s.dropReceivedDatagram(p.e)
+		return false
+	}
+	p.e.expires = p.Expires
+	ok := s.queueDatagram(p.st, p.e)
+	if ok && s.feat.DatagramFamily {
+		s.dg.window.set(p.seq, true)
+	}
+	return ok
 }
 
 // onDatagram processes a received DATAGRAM, from a carrier datagram
 // channel when ch is set.
-func (s *Session) onDatagram(f *wire.Frame, ch bool) *wire.Error {
+func (s *Session) onDatagram(p *Pipe, f *wire.Frame, buf *Buf, ch bool) *wire.Error {
 	data := f.Data
-	s.dgState()
-	if s.feat.Flows {
-		flow, n := varint.ConsumeVarint(data)
+	d := s.dgState()
+	var seq, flow, context uint64
+	if s.feat.DatagramFamily {
+		var n int
+		seq, n = varint.ConsumeVarint(data)
 		if n == 0 {
-			return wire.ErrProto("truncated datagram flow")
+			return wire.ErrProto("truncated datagram sequence")
 		}
 		data = data[n:]
-		if flow > 0 {
-			ctx, cn := varint.ConsumeVarint(data)
-			if cn == 0 {
-				return wire.ErrProto("truncated datagram context")
-			}
-			id := flow - 1
-			if !isBidiID(id) {
-				return wire.ErrProto("datagram flow names a unidirectional stream")
-			}
-			if isLocalID(id, s.role) {
-				if id>>2 >= s.loc[0].next {
-					return wire.ErrProto("datagram flow names an unopened local stream")
-				}
-			} else if id>>2 >= s.rem[0].limit {
-				return wire.ErrProto("datagram flow beyond the stream limit")
-			}
-			st := s.streams[id]
-			if st == nil && !isLocalID(id, s.role) && id>>2 >= s.rem[0].opened {
-				// It overtook the stream's opening frame:
-				// held for at most one smoothed RTT, and
-				// counted as received once delivered.
-				s.holdDatagram(id, streamDgram(ctx, data[cn:]), ch)
+		s.expireHeld(s.now)
+		// Check the window before inspecting Flow, so a malformed duplicate
+		// cannot affect the session. Valid duplicates still feed reports.
+		duplicate := s.duplicateDatagram(seq)
+		var err *wire.Error
+		flow, context, data, err = s.parseDatagramFlow(data)
+		if err != nil {
+			if duplicate {
 				return nil
 			}
-			if st == nil || st.discarded || st.rcv.stopped {
-				s.dropRecv(1)
-				return nil
-			}
-			s.countReceived(ch)
-			s.receivedDatagram(st, streamDgram(ctx, data[cn:]))
+			return err
+		}
+		d.window.advance(seq, s.cfg.DgramWindow)
+		s.datagramArrival(p, ch, seq)
+		if duplicate {
 			return nil
 		}
 	}
-	s.countReceived(ch)
-	s.receivedDatagram(nil, append([]byte(nil), data...))
+	if flow == 0 {
+		if e, ok := s.retainReceivedDatagram(0, data, buf); ok {
+			s.countReceived(ch)
+			s.receivedDatagram(nil, seq, e)
+		}
+		return nil
+	}
+	id := flow - 1
+	st := s.streams[id]
+	if st == nil && !isLocalID(id, s.role) && id>>2 >= s.rem[0].opened {
+		if e, ok := s.retainReceivedDatagram(context, data, buf); ok {
+			s.holdDatagram(id, seq, e, ch)
+		}
+		return nil
+	}
+	if st == nil || st.discarded || st.rcv.stopped {
+		s.dropRecv(1)
+		return nil
+	}
+	if e, ok := s.retainReceivedDatagram(context, data, buf); ok {
+		s.countReceived(ch)
+		s.receivedDatagram(st, seq, e)
+	}
 	return nil
 }
 
-// streamDgram is a stream datagram as its queue holds it: the context ID,
-// then the payload.
-func streamDgram(ctx uint64, p []byte) []byte {
-	e := make([]byte, 0, varint.SizeVarint(ctx)+len(p))
-	return append(varint.AppendVarint(e, ctx), p...)
+func (s *Session) parseDatagramFlow(data []byte) (flow, context uint64, payload []byte, err *wire.Error) {
+	flow, n := varint.ConsumeVarint(data)
+	if n == 0 {
+		return 0, 0, nil, wire.ErrProto("truncated datagram flow")
+	}
+	data = data[n:]
+	if flow == 0 {
+		return flow, 0, data, nil
+	}
+	context, n = varint.ConsumeVarint(data)
+	if n == 0 {
+		return 0, 0, nil, wire.ErrProto("truncated datagram context")
+	}
+	id := flow - 1
+	if !isBidiID(id) {
+		return 0, 0, nil, wire.ErrProto("datagram flow names a unidirectional stream")
+	}
+	if isLocalID(id, s.role) {
+		if id>>2 >= s.loc[0].next {
+			return 0, 0, nil, wire.ErrProto("datagram flow names an unopened local stream")
+		}
+	} else if id>>2 >= s.rem[0].limit {
+		return 0, 0, nil, wire.ErrProto("datagram flow beyond the stream limit")
+	}
+	return flow, context, data[n:], nil
 }
 
 // countReceived counts a datagram that is delivered to a receive queue
@@ -673,13 +1106,22 @@ func (s *Session) countReceived(ch bool) {
 // within the byte limit. A datagram is held for one smoothed RTT, but not
 // past one held after it, so that the held datagrams expire in arrival
 // order.
-func (s *Session) holdDatagram(id uint64, e []byte, ch bool) {
+func (s *Session) holdDatagram(id, seq uint64, e receivedDgram, ch bool) {
 	d := s.dg
-	until := s.now.Add(s.srtt())
+	if limit := s.cfg.Test.DatagramHoldCount; limit != nil && len(d.held) >= *limit {
+		s.dropReceivedDatagram(e)
+		return
+	}
+	hold := s.srtt()
+	if v := s.cfg.Test.DatagramHoldTime; v > 0 {
+		hold = v
+	}
+	until := s.now.Add(hold)
 	if n := len(d.held); n > 0 && until < d.held[n-1].until {
 		until = d.held[n-1].until
 	}
-	d.held = append(d.held, heldDgram{id: id, e: e, until: until, ch: ch})
+	d.held = append(d.held, heldDgram{id: id, seq: seq, e: e, until: until, ch: ch})
+	d.window.set(seq, true)
 	if d.heldIDs == nil {
 		d.heldIDs = map[uint64]int{}
 	}
@@ -692,7 +1134,9 @@ func (s *Session) holdDatagram(id uint64, e []byte, ch bool) {
 func (s *Session) dropHeldHead() {
 	d := s.dg
 	d.recvSize -= d.held[0].cost()
+	d.window.set(d.held[0].seq, false)
 	d.unhold(d.held[0].id)
+	s.dropReceivedDatagram(d.held[0].e)
 	d.held[0] = heldDgram{}
 	d.held = d.held[1:]
 	s.dropRecv(1)
@@ -714,7 +1158,8 @@ func (s *Session) releaseHeld(st *Stream) {
 		}
 		d.recvSize -= h.cost()
 		s.countReceived(h.ch)
-		s.receivedDatagram(st, h.e)
+		d.window.set(h.seq, false)
+		s.receivedDatagram(st, h.seq, h.e)
 	}
 	clear(d.held[len(kept):])
 	d.held = kept
@@ -729,45 +1174,66 @@ func (d *dgramState) unhold(id uint64) {
 
 // heldDeadline is when the first held datagram expires: the oldest.
 func (s *Session) heldDeadline() Time {
-	if s.dg == nil || len(s.dg.held) == 0 {
+	if s.dg == nil {
 		return Never
 	}
-	return s.dg.held[0].until
+	at := s.dg.receiveDeadlines.Next()
+	if len(s.dg.held) > 0 {
+		at = min(at, s.dg.held[0].until)
+	}
+	return at
 }
 
 // expireHeld drops the held datagrams whose stream did not open within
 // one smoothed RTT.
 func (s *Session) expireHeld(now Time) {
 	d := s.dg
+	if d != nil {
+		for {
+			deadline := d.receiveDeadlines.PopDue(now)
+			if deadline == nil {
+				break
+			}
+			s.expireFlowItems(deadline.Value, now)
+		}
+	}
 	for d != nil && len(d.held) > 0 && d.held[0].until <= now {
 		s.dropHeldHead()
 	}
 }
 
 // receivedDatagram queues a datagram, or holds it for the receive limiter.
-func (s *Session) receivedDatagram(st *Stream, e []byte) {
+func (s *Session) receivedDatagram(st *Stream, seq uint64, e receivedDgram) {
 	d := s.dg
 	if s.cfg.DgramRecvLimited {
 		// Waiting for the limiter stays within the byte limit: the
 		// oldest go, each counted.
-		d.limited = append(d.limited, PendingDatagram{st: st, e: e})
-		d.limitedSize += uint64(len(e))
-		for d.limitedSize > s.cfg.DgramRecvSize && len(d.limited) > 1 {
-			d.limitedSize -= uint64(len(d.limited[0].e))
+		d.limited = append(d.limited, PendingDatagram{st: st, seq: seq, e: e})
+		d.limitedSize += uint64(len(e.data)) + heldCost
+		for d.limitedSize > s.cfg.DgramRecvSize {
+			d.limitedSize -= uint64(len(d.limited[0].e.data)) + heldCost
+			s.dropReceivedDatagram(d.limited[0].e)
 			d.limited[0] = PendingDatagram{}
 			d.limited = d.limited[1:]
 			s.dropRecv(1)
 		}
 		return
 	}
-	s.queueDatagram(st, e)
+	if s.queueDatagram(st, e) && s.feat.DatagramFamily {
+		d.window.set(seq, true)
+	}
 }
 
 // queueDatagram puts a datagram in its stream's or the session's queue.
-func (s *Session) queueDatagram(st *Stream, e []byte) bool {
+func (s *Session) queueDatagram(st *Stream, e receivedDgram) bool {
 	d := s.dgState()
+	if s.state >= StateClosing {
+		s.dropReceivedDatagram(e)
+		return false
+	}
 	if st != nil {
 		if st.discarded || st.rcv.stopped {
+			s.dropReceivedDatagram(e)
 			s.dropRecv(1)
 			return false
 		}
@@ -776,10 +1242,10 @@ func (s *Session) queueDatagram(st *Stream, e []byte) bool {
 		}
 		// The count, then the bytes: the oldest go, each counted; a
 		// datagram above the byte bound is kept alone.
-		n := dgPayloadLen(e)
+		n := uint64(len(e.data))
 		for len(st.dg.q) > 0 && (len(st.dg.q) >= s.cfg.DgramStreamQ ||
 			s.cfg.DgramStreamSize > 0 && st.dg.size+n > s.cfg.DgramStreamSize) {
-			st.dg.pop()
+			s.dropReceivedDatagram(st.dg.pop())
 			s.dropRecv(1)
 			st.cnt.dgDropped++
 		}
@@ -787,16 +1253,24 @@ func (s *Session) queueDatagram(st *Stream, e []byte) bool {
 		st.dg.q = append(st.dg.q, e)
 		st.dg.at = append(st.dg.at, s.now)
 		st.dg.size += n
+		if e.expires != 0 {
+			q := st.dg
+			q.deadlines = &d.receiveDeadlines
+			q.expiry.Value = st
+			if q.expiry.index == 0 || e.expires < q.expiry.at {
+				q.deadlines.Set(&q.expiry, e.expires)
+			}
+		}
 		s.dgramChanged(st)
 		return true
 	}
 	if len(d.recv) >= s.cfg.DgramRecvQ {
-		d.popRecv()
+		s.dropReceivedDatagram(d.popRecv())
 		s.dropRecv(1)
 	}
 	d.recv = append(d.recv, e)
 	d.recvAt = append(d.recvAt, s.now)
-	d.recvSize += uint64(len(e))
+	d.recvSize += uint64(len(e.data))
 	s.trimRecvBytes()
 	if len(d.recvW) > 0 {
 		s.wake(d.recvW[0])
@@ -829,7 +1303,7 @@ func (s *Session) trimRecvBytes() {
 		s.dropHeldHead()
 	}
 	for d.recvSize > s.cfg.DgramRecvSize && len(d.recv) > 0 {
-		d.popRecv()
+		s.dropReceivedDatagram(d.popRecv())
 		s.dropRecv(1)
 	}
 }
@@ -843,7 +1317,7 @@ func (s *Session) RecvDatagram() ([]byte, bool) {
 		return nil, false
 	}
 	for len(d.recv) > 0 && d.recvCd.drop(d.recvAt[0], s.now, s.cfg.DgramTarget, len(d.recv) == 1) {
-		d.popRecv()
+		s.dropReceivedDatagram(d.popRecv())
 		s.dropRecv(1)
 	}
 	if len(d.recv) == 0 {
@@ -851,8 +1325,9 @@ func (s *Session) RecvDatagram() ([]byte, bool) {
 		return nil, false
 	}
 	e := d.popRecv()
-	s.stats.DatagramBytesReceived += uint64(len(e))
-	return e, true
+	s.unaccountReceivedDatagram(e)
+	s.stats.DatagramBytesReceived += uint64(len(e.data))
+	return e.relinquish(), true
 }
 
 // WaitDatagram registers sig for a session datagram.
@@ -868,25 +1343,27 @@ func (s *Session) CancelDatagramWait(sig *Signal) {
 // RecvStreamDatagram pops a stream datagram, dropping on the way those
 // queued longer than DgramTarget allows (CoDel), counted.
 func (s *Session) RecvStreamDatagram(st *Stream) (uint64, []byte, bool) {
-	q := st.dg
+	q := s.spliceDatagramHead(st)
 	if q == nil {
 		return 0, nil, false
 	}
-	for len(q.q) > 0 && q.cd.drop(q.at[0], s.now, s.cfg.DgramTarget, len(q.q) == 1) {
-		q.pop()
-		s.dropRecv(1)
-		st.cnt.dgDropped++
-	}
-	if len(q.q) == 0 {
-		q.cd.idle()
-		return 0, nil, false
-	}
+	e := s.consumeStreamDatagram(st, q)
+	return e.context, e.relinquish(), true
+}
+
+func (s *Session) consumeStreamDatagram(st *Stream, q *streamDgrams) receivedDgram {
+	e := s.popStreamDatagram(q)
+	s.stats.DatagramBytesReceived += uint64(len(e.data))
+	st.cnt.dgBytesReceived += uint64(len(e.data))
+	return e
+}
+
+func (s *Session) popStreamDatagram(q *streamDgrams) receivedDgram {
 	e := q.pop()
-	ctx, n := varint.ConsumeVarint(e)
-	p := e[n:]
-	s.stats.DatagramBytesReceived += uint64(len(p))
-	st.cnt.dgBytesReceived += uint64(len(p))
-	return ctx, p, true
+	if !q.detached {
+		s.unaccountReceivedDatagram(e)
+	}
+	return e
 }
 
 // StreamDatagramsEnded reports whether no stream datagram can arrive any
@@ -907,18 +1384,58 @@ func (s *Session) StreamDatagramsEnded(st *Stream) (bool, error) {
 // reader running beside it does not lose them to the automatic release.
 // Datagrams arriving later are dropped and counted (queueDatagram).
 func (s *Session) endStreamDgrams(st *Stream) {
-	if st.dg != nil && len(st.dg.q) == 0 {
-		st.dg = nil
+	if q := st.dg; q != nil {
+		if len(q.q) == 0 {
+			st.dg = nil
+		} else if !q.detached {
+			// The application can drain the final queue after close.
+			// Remove the session's aliases but keep the backing charged
+			// while the handle still owns it. pop clears transferred slots.
+			for _, e := range q.q {
+				s.unaccountReceivedDatagram(e)
+			}
+			if q.deadlines != nil {
+				q.deadlines.Cancel(&q.expiry)
+				q.deadlines = nil
+				q.expiry.Value = nil
+			}
+			q.detached = true
+			runtime.AddCleanup(q, releaseDetachedDatagrams, q.q)
+		}
 	}
-	s.dgramChanged(st) // a waiter sees the end, or the queue
+	s.dgramChanged(st)
+}
+
+func releaseDetachedDatagrams(items []receivedDgram) {
+	for _, e := range items {
+		if e.buf != nil {
+			e.buf.Unref()
+		}
+	}
+}
+
+func (s *Session) closeDatagramReceives() {
+	if d := s.dg; d != nil {
+		for len(d.held) != 0 {
+			s.dropHeldHead()
+		}
+		for len(d.recv) != 0 {
+			s.dropReceivedDatagram(d.popRecv())
+		}
+		for _, p := range d.limited {
+			s.dropReceivedDatagram(p.e)
+		}
+		clear(d.limited)
+		d.limited = nil
+		d.limitedSize = 0
+	}
 }
 
 // waitsFor reports a queued datagram of st.
 func (d *dgramState) waitsFor(st *Stream) bool {
-	for i := range d.send {
-		if d.send[i].st == st {
-			return true
-		}
+	if d != nil {
+		f := d.flows[st]
+		return f != nil && len(f.queue) != 0
 	}
 	return false
 }

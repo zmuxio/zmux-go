@@ -15,6 +15,9 @@ import (
 // binds stream directions to them; the inbound side attaches the lanes the
 // peer opens, routed by the Lane Key.
 
+// pendingLaneEnd holds a binding until the batch containing its data is complete.
+const pendingLaneEnd = ^uint64(0)
+
 // laneOut is the lane state of an outbound pipe.
 type laneOut struct {
 	pending   *outLane
@@ -131,13 +134,17 @@ func (s *Session) unbindLane(st *Stream) {
 			if x != st {
 				continue
 			}
-			last := len(l.boundSt) - 1
-			l.boundSt[i] = l.boundSt[last]
-			l.boundSt[last] = nil
-			l.boundSt = l.boundSt[:last]
+			l.removeBinding(i)
 			break
 		}
 	}
+}
+
+func (l *outLane) removeBinding(i int) {
+	last := len(l.boundSt) - 1
+	l.boundSt[i] = l.boundSt[last]
+	l.boundSt[last] = nil
+	l.boundSt = l.boundSt[:last]
 }
 
 // wantLane asks the driver for a new lane when the rules allow one.
@@ -173,6 +180,8 @@ func (s *Session) LaneOpened(pipe uint64, info CarrierInfo, sig *WriteSignal) (u
 	l := &outLane{lane: lo.next, info: info, laneFirst: true, openedAt: s.now, sig: sig}
 	lo.next++
 	lo.pending = l
+	l.confirmTimer.Value = p
+	s.laneTimers.Set(&l.confirmTimer, l.openedAt.Add(s.cfg.JoinTimeout))
 	p.out.lanes = append(p.out.lanes, l)
 	s.wakePipe(p)
 	return l.lane, true
@@ -206,6 +215,7 @@ func (s *Session) laneConfirmed(p *Pipe, ol *outLane) {
 	ol.confirmed = true
 	if p.out.lo.pending == ol {
 		p.out.lo.pending = nil
+		s.laneTimers.Cancel(&ol.confirmTimer)
 	}
 	s.wakeAllWriters()
 }
@@ -216,6 +226,7 @@ func (s *Session) laneRefused(p *Pipe, ol *outLane) {
 	p.out.lo.refused = true
 	if p.out.lo.pending == ol {
 		p.out.lo.pending = nil
+		s.laneTimers.Cancel(&ol.confirmTimer)
 	}
 	s.act(Action{Kind: ActResetLane, Pipe: p.id, Lane: ol.lane})
 	s.checkLingerDone() // a close's wait no longer counts the lane
@@ -229,7 +240,8 @@ func (s *Session) lanesAcked(p *Pipe, ol *outLane) {
 	// A direction stays bound until its data on the lane is acknowledged.
 	for i := 0; i < len(ol.boundSt); {
 		if st := ol.boundSt[i]; st.snd.laneEnd <= ol.acked {
-			s.unbindLane(st)
+			st.snd.laneBound = false
+			ol.removeBinding(i)
 			continue
 		}
 		i++
@@ -288,22 +300,14 @@ func (s *Session) resendPending() bool {
 
 // ---- inbound lanes ----
 
-// laneTimeouts refuses lanes not confirmed within the join timeout.
-func (s *Session) laneTimeouts(now Time, apply bool) Time {
-	t := Never
-	for _, p := range s.pipes {
-		if p.out == nil || p.out.lo.pending == nil {
-			continue
+// expireLanes refuses lanes not confirmed within the join timeout.
+func (s *Session) expireLanes(now Time) {
+	for d := s.laneTimers.PopDue(now); d != nil; d = s.laneTimers.PopDue(now) {
+		p := d.Value
+		if p.out != nil && p.out.lo.pending != nil {
+			s.laneRefused(p, p.out.lo.pending)
 		}
-		l := p.out.lo.pending
-		d := l.openedAt.Add(s.cfg.JoinTimeout)
-		if apply && now >= d {
-			s.laneRefused(p, l)
-			continue
-		}
-		t = minT(t, d)
 	}
-	return t
 }
 
 // LaneKey returns the session's own Lane Key (what PIPE_LANE toward it
@@ -321,6 +325,9 @@ func (s *Session) LaneKeyMatches(key []byte) bool {
 // SetCarrierConn records the carrier connection of a pipe's lane 0.
 func (s *Session) SetCarrierConn(pipe uint64, conn any) {
 	if p := s.pipe(pipe); p != nil {
+		if p.conn != nil && p.conn != conn {
+			s.replaceDatagramPath(p)
+		}
 		p.conn = conn
 	}
 }

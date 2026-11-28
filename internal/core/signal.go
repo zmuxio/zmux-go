@@ -1,11 +1,13 @@
 package core
 
+import "sync/atomic"
+
 // WriteSignal coalesces a lane's requests for a transmit poll. The core
 // sets it and the driver clears it immediately before polling, under the
 // same session lock. A request made by the poll itself survives that poll.
 type WriteSignal struct {
-	Pending bool
-	queued  bool // queue membership only, including driver-requested shutdown
+	Ready  atomic.Bool
+	queued bool // queue membership only, including driver-requested shutdown
 }
 
 // PollRequest identifies a lane to check for a writer reservation.
@@ -14,9 +16,12 @@ type PollRequest struct {
 	Pipe, Lane uint64
 }
 
+// Matches rejects a reservation from a replaced attachment or lane.
+func (r PollRequest) Matches(w *WriteSignal) bool { return r.signal == w }
+
 func (s *Session) requestPoll(pipe, lane uint64, w *WriteSignal) {
-	if w != nil && !w.Pending {
-		w.Pending = true
+	if w != nil && !w.Ready.Load() {
+		w.Ready.Store(true)
 		s.QueueWriter(pipe, lane, w)
 	}
 }

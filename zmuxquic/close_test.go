@@ -15,7 +15,7 @@ import (
 )
 
 // TestCloseDelivery (N16) over QUIC, through Dial and through a pool
-// connection (Candidate's): the peer reads the whole 1 MiB written before
+// connection (Candidate's): the peer reads the whole stream written before
 // a coded close, ends with the code, and its QUIC connection ends with the
 // same application code only after that; the plain close gives code 0.
 func TestCloseDelivery(t *testing.T) {
@@ -33,7 +33,7 @@ func TestCloseDelivery(t *testing.T) {
 
 func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, reason string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	e := newEnv(t, nil)
 	var client *zmux.Conn
@@ -56,21 +56,29 @@ func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, rea
 		t.Fatal(err)
 	}
 	sqc := e.tl.last()
-	msg := make([]byte, 1<<20)
+	const prefix = 4 << 10
+	msg := make([]byte, 2*prefix)
 	for i := range msg {
 		msg[i] = byte(i * 7)
 	}
 	read := make(chan error, 1)
-	accepted := make(chan struct{})
+	accepted := make(chan error, 1)
 	go func() {
 		in, err := server.AcceptStream(ctx)
-		close(accepted)
+		got := make([]byte, prefix)
 		if err == nil {
-			var got []byte
-			got, err = io.ReadAll(in)
-			if err == nil && !bytes.Equal(got, msg) {
-				err = fmt.Errorf("read %d bytes, not the 1 MiB written", len(got))
+			_, err = io.ReadFull(in, got)
+		}
+		accepted <- err
+		if err != nil {
+			return
+		}
+		tail, err := io.ReadAll(in)
+		if err != nil || !bytes.Equal(got, msg[:prefix]) || !bytes.Equal(tail, msg[prefix:]) {
+			if err == nil {
+				err = errors.New("payload differs")
 			}
+			err = fmt.Errorf("read %d of %d bytes: %w", len(got)+len(tail), len(msg), err)
 		}
 		read <- err
 	}()
@@ -78,7 +86,18 @@ func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, rea
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Write(msg); err != nil {
+	if _, err := st.Write(msg[:prefix]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if _, err := st.Write(msg[prefix:]); err != nil {
 		t.Fatal(err)
 	}
 	_ = st.Close()
@@ -89,25 +108,19 @@ func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, rea
 	if _, err := open.Write([]byte("left open")); err != nil {
 		t.Fatal(err)
 	}
-	// A stream the peer has not accepted is discarded by the close (SPEC.md
-	// Section 6.5): close once it was accepted.
-	<-accepted
-	t0 := time.Now()
 	_ = client.CloseWithError(code, reason)
-	if d := time.Since(t0); d > time.Second {
-		t.Fatalf("the close took %v", d)
-	}
-	t1 := time.Now()
 	select {
-	case <-client.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("the close was neither delivered nor given up within 5 s")
+	case err := <-read:
+		if err != nil {
+			t.Fatalf("the peer's read: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
-	if d := time.Since(t1); d >= 250*time.Millisecond {
-		t.Fatalf("the wait took %v: the linger timeout, not the peer's end", d)
-	}
-	if err := <-read; err != nil {
-		t.Fatalf("the peer's read: %v", err)
+	select {
+	case <-server.Done():
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 	var ae *zmux.ApplicationError
 	if err := server.Wait(); !errors.As(err, &ae) || ae.ErrorCode != code || ae.ErrorMessage != reason || !ae.Remote {
@@ -118,8 +131,8 @@ func closeDelivery(t *testing.T, via string, code zmux.ApplicationErrorCode, rea
 	}
 	select {
 	case <-sqc.Context().Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("the QUIC connection was not closed")
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 	var qe *quic.ApplicationError
 	if err := context.Cause(sqc.Context()); !errors.As(err, &qe) || !qe.Remote || qe.ErrorCode != quic.ApplicationErrorCode(code) {

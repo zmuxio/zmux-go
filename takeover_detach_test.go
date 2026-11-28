@@ -195,15 +195,15 @@ func newChanMsgHalf() *chanMsgHalf {
 func (m *chanMsgHalf) Read([]byte) (int, error)  { return 0, errors.New("messages") }
 func (m *chanMsgHalf) Write([]byte) (int, error) { return 0, errors.New("messages") }
 func (m *chanMsgHalf) Close() error              { m.once.Do(func() { close(m.done) }); return nil }
-func (m *chanMsgHalf) ReadMessage(limit int) ([]byte, error) {
+func (m *chanMsgHalf) ReadMessage(limit int) (ReceivedMessage, error) {
 	select {
 	case b := <-m.in:
 		if len(b) > limit {
-			return nil, ErrMessageTooLarge
+			return ReceivedMessage{}, ErrMessageTooLarge
 		}
-		return b, nil
+		return OwnMessage(b), nil
 	case <-m.done:
-		return nil, net.ErrClosed
+		return ReceivedMessage{}, net.ErrClosed
 	}
 }
 
@@ -249,8 +249,11 @@ func TestTakeoverMessages(t *testing.T) {
 		t.Fatal("Conn on a message carrier")
 	}
 	for _, want := range []string{"first", "second"} {
-		if b, err := mr.ReadMessage(64); err != nil || string(b) != want {
-			t.Fatalf("message %q, %v; want %q", b, err, want)
+		b, err := mr.ReadMessage(64)
+		got := string(b.Bytes())
+		b.Release()
+		if err != nil || got != want {
+			t.Fatalf("message %q, %v; want %q", got, err, want)
 		}
 	}
 	if err := mw.WriteMessage([]byte("reply")); err != nil || string(<-m.out) != "reply" {

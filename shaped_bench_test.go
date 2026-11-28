@@ -5,8 +5,10 @@ import (
 	"context"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/zmuxio/zmux-go/shaping"
 )
@@ -33,7 +35,7 @@ func BenchmarkBulkShaped(b *testing.B) {
 	a, s := tcpPair(b)
 	c, srv := pair(b, a, s, nil, nil)
 	var seq int
-	c.SetShaper(func(ShapedPipe) shaping.Shaper {
+	mustSetShaper(b, c, func(ShapedPipe) shaping.Shaper {
 		return &fnShaper{caps: shaping.CapPlan, plan: func(_ *shaping.RecordView, p *shaping.RecordPlan) {
 			seq = (seq*1103515245 + 12345) & 0x7fffffff
 			p.MaxLen = 100 + seq%601
@@ -90,4 +92,38 @@ func BenchmarkBulkTCP1M(b *testing.B) {
 	}
 	_ = st.Close()
 	_, _ = io.ReadAll(st)
+}
+
+// BenchmarkShapingTimerPrecision measures the host timer's injection spacing.
+func BenchmarkShapingTimerPrecision(b *testing.B) {
+	a, peer := tcpPair(b)
+	cfg := &Config{ShapingPreciseTimer: true, ShapingLimits: shaping.Limits{
+		Wire: &shaping.Account{Ceiling: 1 << 20, Initial: 1 << 20, PerSec: 4096},
+	}}
+	c, _ := pair(b, a, peer, cfg, nil)
+	const every = 10 * time.Millisecond
+	samples := b.N + 1
+	at := make([]time.Time, 0, samples)
+	ready := make(chan struct{})
+	b.ResetTimer()
+	mustSetShaper(b, c, timedCover(every, samples, func() {
+		at = append(at, time.Now())
+		if len(at) == samples {
+			close(ready)
+		}
+	}), nil)
+	timer := time.NewTimer(max(time.Minute, 4*time.Duration(samples)*every))
+	defer timer.Stop()
+	select {
+	case <-ready:
+	case <-timer.C:
+		b.Fatal("waiting for shaping timer samples")
+	}
+	b.StopTimer()
+	gaps := make([]time.Duration, 0, samples-1)
+	for i := 1; i < len(at); i++ {
+		gaps = append(gaps, at[i].Sub(at[i-1]))
+	}
+	slices.Sort(gaps)
+	b.ReportMetric(float64(gaps[len(gaps)/2])/float64(time.Millisecond), "median-ms/gap")
 }

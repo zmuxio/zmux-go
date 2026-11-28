@@ -24,8 +24,11 @@ type compiledMachines struct {
 	caps     shaping.Caps
 }
 
-func compileMachines(defs []machineDef, src rand.Source, shared *[]uint64, o *Options) *compiledMachines {
+func compileMachines(defs []machineDef, includeControl bool, src rand.Source, shared *[]uint64, o *Options) *compiledMachines {
 	c := &compiledMachines{caps: shaping.CapPlan, o: o, ms: make([]machineDef, len(defs))}
+	if includeControl {
+		c.caps |= shaping.CapIncludeControl
+	}
 	fix := func(v *value) {
 		if !v.set {
 			return
@@ -42,11 +45,16 @@ func compileMachines(defs []machineDef, src rand.Source, shared *[]uint64, o *Op
 		c.queue++
 		for j := range d.states {
 			st := &d.states[j]
-			if st.rec != nil {
-				r := *st.rec
-				st.rec = &r
-				for _, v := range []*value{&r.target, &r.maxLen, &r.padTo, &r.padMul, &r.pad, &r.delay} {
-					fix(v)
+			if st.datagram != nil {
+				c.caps |= shaping.CapDatagramPlan
+			}
+			for _, plan := range []**record{&st.rec, &st.datagram} {
+				if *plan != nil {
+					r := **plan
+					*plan = &r
+					for _, v := range []*value{&r.target, &r.maxLen, &r.padTo, &r.padMul, &r.pad, &r.delay} {
+						fix(v)
+					}
 				}
 			}
 			st.enter = slices.Clone(st.enter)
@@ -65,11 +73,13 @@ func compileMachines(defs []machineDef, src rand.Source, shared *[]uint64, o *Op
 				fix(&t.val)
 				fix(&t.prob)
 				switch t.on {
-				case onRecordIn, onPaddingIn:
-					c.caps |= shaping.CapRecordIn
+				case onOutbound:
+					c.caps |= shaping.CapOutbound
+				case onDatagramPlan:
+					c.caps |= shaping.CapDatagramPlan
 				case onStreamOpen, onStreamEnd:
 					c.caps |= shaping.CapStreams
-				case onRecordOut, onInjected, onInjectDropped, onEnter, onTimer, onZero:
+				case onRecordPlan, onInjectionAccepted, onInjectionRejected, onEnter, onTimer, onZero:
 				}
 				if t.cond && t.what >= whatWireLeft {
 					c.caps |= shaping.CapBudget
@@ -85,7 +95,7 @@ func compileMachines(defs []machineDef, src rand.Source, shared *[]uint64, o *Op
 
 // Factory returns the zmux.ShaperFactory of the machines; nil without
 // machines. Every pipe runs them as defined, whatever its ShapedPipe says.
-func (c *Compiled) Factory() zmux.ShaperFactory {
+func (c *Compiled) factory() zmux.ShaperFactory {
 	if c.machines == nil {
 		return nil
 	}
@@ -93,21 +103,15 @@ func (c *Compiled) Factory() zmux.ShaperFactory {
 	return func(zmux.ShapedPipe) shaping.Shaper { return m.newShaper() }
 }
 
-// NewFactory parses a candidate's JSON and returns the Factory of its machines.
-func NewFactory(b []byte, o Options) (zmux.ShaperFactory, error) {
-	c, err := ParseCandidate(b, nil, SizeLimits{})
-	if err != nil {
-		return nil, err
-	}
-	return c.Compile(o).Factory(), nil
+// Policy returns the plans and their shared direction budget for atomic installation.
+func (c *Compiled) Policy() *zmux.ShapingPolicy {
+	return &zmux.ShapingPolicy{Factory: c.factory(), Handshake: c.handshake(), Budget: c.budget()}
 }
 
 type mstate struct {
 	ctr    []uint64
 	tm     []int64 // deadlines; noTime: none
 	gen    uint64
-	injAt  int64
-	injLen int64 // <0: none
 	rate   uint64
 	burst  uint64
 	cur    int32
@@ -130,31 +134,31 @@ type due struct {
 
 // shaper is the Shaper of one pipe.
 type shaper struct {
-	c    *compiledMachines
-	src  rand.Source
-	ms   []mstate
-	q    []item
-	dues []due
-	pk   []uint64
-	pset []bool
-
-	now        int64 // microseconds on the session clock
-	m          shaping.Meters
-	n          uint64
-	seq        uint64
-	pauseUntil int64
-	stopped    bool
-	surfaced   int32 // the machine whose injection is out; <0: none
-
-	lastInjAt, lastInjLen int64 // lastInjLen <0: none
-	lastWake              int64
-	lastPause             int64
-	lastRate, lastBurst   uint64
-	lastWeight            uint32
+	src                       rand.Source
+	c                         *compiledMachines
+	ms                        []mstate
+	q                         []item
+	dues                      []due
+	pk                        []uint64
+	pset                      []bool
+	m                         shaping.Meters
+	injection                 shaping.Injection
+	now                       int64 // microseconds on the session clock
+	n                         uint64
+	seq                       uint64
+	pauseUntil                int64
+	requestSeq, lastInjection uint64
+	lastWake                  int64
+	lastPause                 int64
+	lastRate, lastBurst       uint64
+	injectionOwner            int32
+	lastWeight                uint32
+	stopped                   bool
+	canInject                 bool
 }
 
 func (c *compiledMachines) newShaper() *shaper {
-	s := &shaper{c: c, surfaced: -1, lastInjLen: -1, lastWake: noTime}
+	s := &shaper{c: c, lastWake: noTime}
 	s.src = c.o.source()
 	s.ms = make([]mstate, len(c.ms))
 	ctr := make([]uint64, c.ncounter)
@@ -166,7 +170,6 @@ func (c *compiledMachines) newShaper() *shaper {
 		m := &s.ms[i]
 		d := &c.ms[i]
 		m.cur = int32(d.start)
-		m.injLen = -1
 		m.ctr, ctr = ctr[:d.counters:d.counters], ctr[d.counters:]
 		m.tm, tm = tm[:d.timers:d.timers], tm[d.timers:]
 	}
@@ -192,68 +195,83 @@ func (s *shaper) val(v *value) uint64 {
 	return v.drawTable(s.src)
 }
 
-// Plan draws the record's fields in machine order and fires record_out.
+// Plan draws the record's fields and advances its planning entrance.
 func (s *shaper) Plan(v *shaping.RecordView, p *shaping.RecordPlan) {
-	s.now = int64(v.Now / time.Microsecond)
-	s.m = v.Meters
+	s.now, s.m = int64(v.Now/time.Microsecond), v.Meters
 	for i := range s.ms {
 		r := s.c.ms[i].states[s.ms[i].cur].rec
 		if r == nil {
 			continue
 		}
-		m := 0
-		if r.target.set {
-			m = int(s.val(&r.target))
-			p.PadTo = max(p.PadTo, m)
-		} else if r.maxLen.set {
-			m = int(s.val(&r.maxLen))
-		}
+		m := s.drawUnit(r, &p.UnitPlan)
 		if m > 0 && (p.MaxLen == 0 || m < p.MaxLen) {
 			p.MaxLen = m
 		}
-		if r.padTo.set {
-			p.PadTo = max(p.PadTo, int(s.val(&r.padTo)))
-		}
-		if r.padMul.set {
-			p.PadMultiple = max(p.PadMultiple, int(s.val(&r.padMul)))
-		}
-		if r.pad.set {
-			p.Pad = min(p.Pad+int(s.val(&r.pad)), math.MaxInt32)
-		}
-		if r.delay.set {
-			p.Delay = max(p.Delay, micros(s.val(&r.delay)))
-		}
 		p.Flush = p.Flush || r.flush
 	}
-	s.fire(onRecordOut, 0, 0, -1)
+	s.fire(onRecordPlan, 0, 0, -1)
 	s.seq++
 	p.Stop = s.stopped
 	s.effects(&p.Effects)
+}
+
+func (s *shaper) PlanDatagram(v *shaping.DatagramView, p *shaping.DatagramPlan) {
+	s.now, s.m = int64(v.Now/time.Microsecond), v.Meters
+	for i := range s.ms {
+		if r := s.c.ms[i].states[s.ms[i].cur].datagram; r != nil {
+			s.drawUnit(r, &p.UnitPlan)
+		}
+	}
+	s.fire(onDatagramPlan, 0, uint64(v.Len), -1)
+	s.effects(&p.Effects)
+	if s.stopped {
+		p.Effects.Set |= shaping.EffectStop
+	}
+}
+
+func (s *shaper) drawUnit(r *record, p *shaping.UnitPlan) (target int) {
+	if r.target.set {
+		target = int(s.val(&r.target))
+		p.PadTo = max(p.PadTo, target)
+	} else if r.maxLen.set {
+		target = int(s.val(&r.maxLen))
+	}
+	if r.padTo.set {
+		p.PadTo = max(p.PadTo, int(s.val(&r.padTo)))
+	}
+	if r.padMul.set {
+		p.PadMultiple = max(p.PadMultiple, int(s.val(&r.padMul)))
+	}
+	if r.pad.set {
+		p.Pad = min(p.Pad+int(s.val(&r.pad)), math.MaxInt32)
+	}
+	if r.delay.set {
+		p.Delay = max(p.Delay, micros(s.val(&r.delay)))
+	}
+	return target
 }
 
 // OnEvent runs an event entrance.
 func (s *shaper) OnEvent(e *shaping.Event, r *shaping.Effects) {
 	s.now = int64(e.Now / time.Microsecond)
 	s.m = e.Meters
+	s.canInject = e.Kind == shaping.EventOutbound || e.Kind == shaping.EventTimer
 	switch e.Kind {
 	case shaping.EventStart:
 		for i := range s.ms {
 			s.enter(int32(i), int32(s.c.ms[i].start))
 		}
 		s.drain()
-	case shaping.EventRecordIn:
-		if e.PaddingOnly {
-			s.fire(onPaddingIn, 0, uint64(max(e.Len, 0)), -1)
-		} else {
-			s.fire(onRecordIn, 0, uint64(max(e.Len, 0)), -1)
-		}
-	case shaping.EventInjected:
-		s.clearSurfaced()
-		s.fire(onInjected, 0, uint64(max(e.Len, 0)), -1)
-	case shaping.EventInjectDropped:
-		s.clearSurfaced()
-		if i := s.surfaced; i >= 0 {
-			s.fire(onInjectDropped, 0, 0, i)
+	case shaping.EventOutbound:
+		s.fire(onOutbound, 0, uint64(e.Len), -1)
+	case shaping.EventInjectionAccepted, shaping.EventInjectionRejected:
+		if e.RequestID != 0 && e.RequestID == s.injection.ID {
+			s.injection = shaping.Injection{}
+			if e.Kind == shaping.EventInjectionAccepted {
+				s.fire(onInjectionAccepted, 0, uint64(e.Len), -1)
+			} else {
+				s.fire(onInjectionRejected, 0, 0, s.injectionOwner)
+			}
 		}
 	case shaping.EventTimer:
 		s.wake()
@@ -261,18 +279,13 @@ func (s *shaper) OnEvent(e *shaping.Event, r *shaping.Effects) {
 		s.fire(onStreamOpen, 0, 0, -1)
 	case shaping.EventStreamEnd:
 		s.fire(onStreamEnd, 0, 0, -1)
-	default: // the instance ends; no machine reacts
+	default:
 		return
 	}
+	s.canInject = false
 	s.effects(r)
 	if s.stopped {
 		r.Set |= shaping.EffectStop
-	}
-}
-
-func (s *shaper) clearSurfaced() {
-	if i := s.surfaced; i >= 0 {
-		s.ms[i].injLen = -1
 	}
 }
 
@@ -364,10 +377,10 @@ func (s *shaper) cond(m int32, tr *transition) bool {
 		x = s.m.StallLeft
 	case whatWireSpent:
 		x = s.m.WireSpent
-	case whatSentBytes:
-		x = s.m.SentBytes
+	case whatEarnedBytes:
+		x = s.m.EarnedBytes
 	case whatWirePPM:
-		x = shaping.WirePPM(s.m.WireSpent, s.m.SentBytes)
+		x = shaping.WirePPM(s.m.WireSpent, s.m.EarnedBytes)
 	}
 	y := s.val(&tr.val)
 	switch tr.cmp {
@@ -407,12 +420,15 @@ func (s *shaper) act(m int32, a *action) {
 	switch a.op {
 	case opInject:
 		if a.cancel {
-			ms.injLen = -1
-			return
+			if s.injectionOwner == m {
+				s.injection = shaping.Injection{}
+			}
+		} else if s.canInject {
+			s.requestSeq++
+			after := s.val(&a.a)
+			s.injection = shaping.Injection{ID: s.requestSeq, At: micros(uint64(s.now) + after), PadBytes: int(s.val(&a.b))}
+			s.injectionOwner = m
 		}
-		after := s.val(&a.a)
-		ms.injAt = s.now + int64(after)
-		ms.injLen = int64(s.val(&a.b))
 	case opPause:
 		s.pauseUntil = max(s.pauseUntil, s.now+int64(s.val(&a.a)))
 	case opRate:
@@ -456,23 +472,10 @@ func (s *shaper) act(m int32, a *action) {
 
 // effects sets r to what differs from the last answer.
 func (s *shaper) effects(r *shaping.Effects) {
-	best := int32(-1)
-	for i := range s.ms {
-		if s.ms[i].injLen >= 0 && (best < 0 || s.ms[i].injAt < s.ms[best].injAt) {
-			best = int32(i)
-		}
-	}
-	s.surfaced = best
-	injAt, injLen := int64(0), int64(-1)
-	if best >= 0 {
-		injAt, injLen = s.ms[best].injAt, s.ms[best].injLen
-	}
-	if injLen != s.lastInjLen || injLen >= 0 && injAt != s.lastInjAt {
-		s.lastInjAt, s.lastInjLen = injAt, injLen
+	if s.injection.ID != s.lastInjection {
+		s.lastInjection = s.injection.ID
 		r.Set |= shaping.EffectInject
-		if injLen >= 0 {
-			r.HasInject, r.InjectAt, r.InjectLen = true, micros(uint64(injAt)), int(injLen)
-		}
+		r.Injection = s.injection
 	}
 	wake := noTime
 	for i := range s.ms {

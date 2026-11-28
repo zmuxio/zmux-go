@@ -11,7 +11,7 @@ import (
 // never learns of the reset.
 func TestFlushableQueuedReset(t *testing.T) {
 	s := capacitySession()
-	if _, err := s.onStream(&wire.Frame{Kind: wire.KindStream, StreamID: 1, Data: []byte("x")}, &Buf{B: []byte("x")}); err != nil {
+	if err := onStreamTest(s, &wire.Frame{Kind: wire.KindStream, StreamID: 1, Data: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
 	st, ok := s.AcceptStream(true)

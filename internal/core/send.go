@@ -108,28 +108,58 @@ func (s *Session) admitWrite(st *Stream) error {
 // 0 with a nil error means wait (WaitWrite). With fin, FIN follows p once
 // all of p was taken.
 func (s *Session) Write(st *Stream, p []byte, fin bool) (int, error) {
+	return s.write(st, p, nil, fin, nil)
+}
+
+// write absorbs pending input before committing bytes, regardless of whether
+// the send queue will copy them or take its own reference.
+func (s *Session) write(st *Stream, p []byte, buf *Buf, fin bool, report func(sent, unsent int)) (int, error) {
 	s.pickInput()
 	if err := s.admitWrite(st); err != nil {
 		return 0, err
 	}
-	sp := &st.snd
 	n := len(p)
 	if room := s.sendRoom(st); uint64(n) > room {
 		n = int(room)
 	}
+	return s.writeAdmitted(st, p[:n], buf, fin, n == len(p), report)
+}
+
+// writeAdmitted uses a room decision already made under this session's lock.
+// Physical backing is acquired here unless the caller supplied it.
+func (s *Session) writeAdmitted(st *Stream, p []byte, buf *Buf, fin, complete bool, report func(sent, unsent int)) (int, error) {
+	sp := &st.snd
+	n := len(p)
 	h := s.heldEnter(st)
+	var failure error
 	if n > 0 {
 		if st.unsent() == 0 {
 			sp.waitAt = s.now
 		}
-		sp.q.write(p[:n])
+		switch {
+		case buf == nil && report == nil:
+			if used := sp.q.write(p[:n]); used != n {
+				n, failure = used, ErrMemoryBudget
+			}
+		case buf == nil:
+			if owned := copyBacking(s.sendMemory, p[:n]); owned != nil {
+				sp.q.writeAccounted(owned.B, owned, s.newHandoff(n, report))
+				owned.Unref()
+			} else {
+				n, failure = 0, ErrMemoryBudget
+			}
+		case !buf.charge(s.sendMemory):
+			n, failure = 0, ErrMemoryBudget
+		case report != nil:
+			sp.q.writeAccounted(p[:n], buf, s.newHandoff(n, report))
+		default:
+			sp.q.writeRef(p[:n], buf)
+		}
 		s.stats.AppBytesWritten += uint64(n)
 		st.snd.appWritten += uint64(n)
 	}
-	if fin && n == len(p) {
-		sp.finWr = true
-	}
-	if n == len(p) {
+	if complete && n == len(p) {
+		sp.finWr = sp.finWr || fin
 		sp.wwait = false
 		sp.writeDone = s.now
 	}
@@ -137,7 +167,28 @@ func (s *Session) Write(st *Stream, p []byte, fin bool) (int, error) {
 	if n > 0 || sp.finWr {
 		s.becomeSend(st)
 	}
-	return n, nil
+	return n, failure
+}
+
+// TryWriteAll queues an owned copy only if the whole write can be admitted.
+func (s *Session) TryWriteAll(st *Stream, p []byte) (bool, error) {
+	s.pickInput()
+	if err := s.admitWrite(st); err != nil {
+		return false, err
+	}
+	if uint64(len(p)) > s.sendRoom(st) {
+		return false, nil
+	}
+	if len(p) == 0 {
+		return true, nil
+	}
+	buf := copyBacking(s.sendMemory, p)
+	if buf == nil {
+		return false, ErrMemoryBudget
+	}
+	defer buf.Unref()
+	n, err := s.writeAdmitted(st, buf.B, buf, false, true, nil)
+	return n == len(p), err
 }
 
 // WriteSpace lends the caller the free tail of the part's send block, at
@@ -161,6 +212,9 @@ func (s *Session) WriteSpace(st *Stream, limit int) ([]byte, error) {
 		return nil, nil
 	}
 	blk := sp.q.lendTail()
+	if blk == nil {
+		return nil, ErrMemoryBudget
+	}
 	n := min(blockSize-blk.n, limit)
 	if uint64(n) > room {
 		n = int(room)
@@ -204,8 +258,35 @@ func (s *Session) becomeSend(st *Stream) {
 	if st.snd.state == sendReady && st.idSet {
 		st.snd.state = sendSend
 	}
+	if !st.sch.in && s.holdFreshCredit(st) {
+		return
+	}
 	s.sched.ensure(st)
 	s.wakeAllWriters()
+}
+
+// holdFreshCredit parks data at the limit that can unblock it. An
+// opening frame and queued reinjection have their own eligibility.
+func (s *Session) holdFreshCredit(st *Stream) bool {
+	if !st.idSet {
+		return false
+	}
+	sp := &st.snd
+	stream := max(sp.sent, sp.q.base) >= sp.maxData
+	conn := s.conn.sent >= s.conn.sendMax
+	if !stream && !conn || st.unsent() == 0 || !st.opened && (st.pinned || st.openWant) && sp.preLen == 0 {
+		return false
+	}
+	if m := sp.mps; m != nil && (m.resend.len() > 0 || m.finResend) {
+		return false
+	}
+	if stream {
+		s.sched.remove(st)
+	} else {
+		s.sched.waitConnectionCredit(st)
+	}
+	s.blockedOn(st, stream, conn)
+	return true
 }
 
 // smallHeld is the most a "small" stream direction holds.
@@ -260,15 +341,14 @@ func (s *Session) sendBufferLimit() uint64 {
 		return max64(n, s.cfg.SendBuffer)
 	}
 	left := ^uint64(0)
-	used := s.memUsage()
 	if b := s.cfg.Budget; b != nil {
 		if limit := b.Limit(); limit > 0 {
-			left = limit - min64(limit, b.Used())
-			growth := used - min64(used, s.charged)
-			left -= min64(left, growth)
+			// A fresh payload block needs room for its backing and
+			// descriptor. A sub-block remainder cannot admit it.
+			left = (limit - min64(limit, b.Used())) / sendBlockCharge * blockSize
 		}
 	} else if b := s.cfg.MemoryBudget; b > 0 {
-		left = b - min64(b, used)
+		left = b - min64(b, s.unsharedUsage())
 	}
 	limit := ^uint64(0)
 	if left < limit-s.conn.sendHeld {
@@ -597,38 +677,13 @@ func (s *Session) wakeCapacityWaiters() {
 // the queue takes its own reference. It returns how much it took (the send
 // buffer bounds it, as for Write).
 func (s *Session) WriteChunk(st *Stream, data []byte, buf *Buf, fin bool) (int, error) {
-	if buf == nil {
-		return s.Write(st, data, fin)
-	}
-	if err := s.admitWrite(st); err != nil {
-		return 0, err
-	}
-	sp := &st.snd
-	n := len(data)
-	if room := s.sendRoom(st); uint64(n) > room {
-		n = int(room)
-	}
-	h := s.heldEnter(st)
-	if n > 0 {
-		if st.unsent() == 0 {
-			sp.waitAt = s.now
-		}
-		sp.q.writeRef(data[:n], buf)
-		s.stats.AppBytesWritten += uint64(n)
-		sp.appWritten += uint64(n)
-	}
-	if fin && n == len(data) {
-		sp.finWr = true
-	}
-	if n == len(data) {
-		sp.wwait = false
-		sp.writeDone = s.now
-	}
-	s.heldLeave(st, h)
-	if n > 0 || sp.finWr {
-		s.becomeSend(st)
-	}
-	return n, nil
+	return s.write(st, data, buf, fin, nil)
+}
+
+// WriteSpliceChunk admits bytes and attaches their first-carrier handoff
+// accounting to the send queue, including every retained copy and retry.
+func (s *Session) WriteSpliceChunk(st *Stream, data []byte, buf *Buf, report func(sent, unsent int)) (int, error) {
+	return s.write(st, data, buf, false, report)
 }
 
 // WriteErrOf returns the error a write would get now, nil when it may
@@ -665,6 +720,7 @@ func (s *Session) WriteBatch(st *Stream, b *Batch, skip int) (int, error) {
 	room := s.sendRoom(st)
 	h := s.heldEnter(st)
 	start, taken := skip, 0
+	var failure error
 	for _, sg := range b.segs {
 		if room == 0 {
 			break
@@ -685,7 +741,11 @@ func (s *Session) WriteBatch(st *Stream, b *Batch, skip int) (int, error) {
 		if sg.ext != nil && !sg.pin.none() {
 			sp.q.writePin(d, sg.pin)
 		} else {
-			sp.q.write(d)
+			if n := sp.q.write(d); n != len(d) {
+				taken += n
+				failure = ErrMemoryBudget
+				break
+			}
 		}
 		taken += len(d)
 		room -= uint64(len(d))
@@ -700,7 +760,7 @@ func (s *Session) WriteBatch(st *Stream, b *Batch, skip int) (int, error) {
 	if taken > 0 {
 		s.becomeSend(st)
 	}
-	return taken, nil
+	return taken, failure
 }
 
 // Flushable reports whether a stream holds written data, a FIN or a

@@ -15,7 +15,7 @@ func TestJoinCallbackPanicRejects(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			e := newAtkEnv(t, atkOpts{server: func(c *Config) {
 				if name == "AuthorizeJoin" {
-					c.AuthorizeJoin = func(*Conn, PipeID) bool { panic("host bug") }
+					c.SessionPolicy.AuthorizeJoin = func(context.Context, JoinAuthorization) (JoinVerdict, error) { panic("host bug") }
 				} else {
 					c.AllowRecordMode = func(RecordPolicyInput, RecordMode, any) bool { panic("host bug") }
 				}

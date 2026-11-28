@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
@@ -20,7 +21,7 @@ func TestPoolPolicyCountAndRetire(t *testing.T) {
 	p := &ConnPool[int]{
 		Dial:  func(context.Context) (int, error) { n++; return n, nil },
 		Close: func(c int) { mu.Lock(); closed = append(closed, c); mu.Unlock() },
-		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(_ *ConnectionView, d *ConnectionDecision) {
 			d.Count = 2
 			d.RetireConnections = append(d.RetireConnections, retire...)
 		}),
@@ -52,7 +53,7 @@ func TestPoolPolicyDialAfter(t *testing.T) {
 	n := 0
 	p := &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
-		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(_ *ConnectionView, d *ConnectionDecision) {
 			d.Count, d.DialAfter = 3, time.Hour
 		}),
 	}
@@ -70,63 +71,63 @@ func TestPoolPolicyDialAfter(t *testing.T) {
 // new connection while the old one keeps its pipe, and the old one closes
 // only when that pipe ends.
 func TestPoolRecheckRetiresBusyConnection(t *testing.T) {
-	var mu sync.Mutex
-	var closed []int
-	decisions := 0
-	born := map[uint64]time.Duration{}
-	n := 0
-	p := &ConnPool[int]{
-		Dial:  func(context.Context) (int, error) { n++; return n, nil },
-		Close: func(c int) { mu.Lock(); closed = append(closed, c); mu.Unlock() },
-		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
-			decisions++
-			d.Count = 1
-			for _, m := range v.Members {
-				born[m.FateGroup] = m.Age
-				if m.Age > 100*time.Millisecond {
-					d.RetireConnections = append(d.RetireConnections, m.FateGroup)
-				} else if r := 100*time.Millisecond - m.Age + time.Millisecond; d.Recheck == 0 || r < d.Recheck {
-					d.Recheck = r
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var closed []int
+		decisions := 0
+		born := map[uint64]time.Duration{}
+		n := 0
+		p := &ConnPool[int]{
+			Dial:  func(context.Context) (int, error) { n++; return n, nil },
+			Close: func(c int) { mu.Lock(); closed = append(closed, c); mu.Unlock() },
+			Policy: policyFunc(func(v *ConnectionView, d *ConnectionDecision) {
+				decisions++
+				d.Count = 1
+				for _, m := range v.Members {
+					born[m.FateGroup] = m.Age
+					if m.Age >= 100*time.Millisecond {
+						d.RetireConnections = append(d.RetireConnections, m.FateGroup)
+					} else if r := 100*time.Millisecond - m.Age; d.Recheck == 0 || r < d.Recheck {
+						d.Recheck = r
+					}
 				}
-			}
-		}),
-	}
-	ctx := context.Background()
-	a, _ := p.Get(ctx)
-	retired := func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.conns) == 1 && p.conns[0].retired
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !retired() {
-		if time.Now().After(deadline) {
+			}),
+		}
+		ctx := context.Background()
+		a, _ := p.Get(ctx)
+		retired := func() bool {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			return len(p.conns) == 1 && p.conns[0].retired
+		}
+		synctest.Sleep(100 * time.Millisecond)
+		synctest.Wait()
+		if !retired() {
 			t.Fatal("busy connection not retired by Recheck")
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	b, _ := p.Get(ctx)
-	if b.Conn == a.Conn || n != 2 {
-		t.Fatalf("new pipe on connection %d after %d dials", b.Conn, n)
-	}
-	mu.Lock()
-	if len(closed) != 0 {
-		t.Fatalf("closed %v before its pipe ended", closed)
-	}
-	mu.Unlock()
-	a.Release()
-	mu.Lock()
-	if len(closed) != 1 || closed[0] != a.Conn {
-		t.Fatalf("closed %v", closed)
-	}
-	mu.Unlock()
-	b.Release()
-	p.Shutdown()
+		b, _ := p.Get(ctx)
+		if b.Conn == a.Conn || n != 2 {
+			t.Fatalf("new pipe on connection %d after %d dials", b.Conn, n)
+		}
+		mu.Lock()
+		if len(closed) != 0 {
+			t.Fatalf("closed %v before its pipe ended", closed)
+		}
+		mu.Unlock()
+		a.Release()
+		mu.Lock()
+		if len(closed) != 1 || closed[0] != a.Conn {
+			t.Fatalf("closed %v", closed)
+		}
+		mu.Unlock()
+		b.Release()
+		p.Shutdown()
+	})
 }
 
-type policyFunc func(*zmux.PoolView, *zmux.PoolDecision)
+type policyFunc func(*ConnectionView, *ConnectionDecision)
 
-func (f policyFunc) Decide(v *zmux.PoolView, d *zmux.PoolDecision) error { f(v, d); return nil }
+func (f policyFunc) Decide(v *ConnectionView, d *ConnectionDecision) error { f(v, d); return nil }
 
 // TestPoolPolicyCallsBack: the policy runs outside the pool's lock, so a
 // policy that calls back into the pool (here retiring a connection) does
@@ -136,7 +137,7 @@ func TestPoolPolicyCallsBack(t *testing.T) {
 	n := 0
 	p = &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
-		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(v *ConnectionView, d *ConnectionDecision) {
 			d.Count = 1
 			if len(v.Members) > 0 {
 				p.RetireConn(99) // a connection the pool does not have
@@ -170,7 +171,7 @@ func TestPoolDialFailureFallsBack(t *testing.T) {
 			}
 			return n, nil
 		},
-		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) { d.Count = 2 }),
+		Policy: policyFunc(func(_ *ConnectionView, d *ConnectionDecision) { d.Count = 2 }),
 	}
 	ctx := context.Background()
 	a, err := p.Get(ctx)
@@ -208,7 +209,7 @@ func TestPoolPolicyNeverBlocksCallers(t *testing.T) {
 	n := 0
 	p := &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
-		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(_ *ConnectionView, d *ConnectionDecision) {
 			d.Count, d.Recheck = int(count.Load()), time.Hour
 			asks.Add(1)
 			once.Do(func() {
@@ -260,7 +261,7 @@ func TestPoolDecideGoroutineEndsWhenIdle(t *testing.T) {
 	var asks atomic.Int32
 	p := &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { return 1, nil },
-		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(_ *ConnectionView, d *ConnectionDecision) {
 			asks.Add(1)
 			d.Recheck = time.Hour
 		}),
@@ -291,7 +292,7 @@ func TestPoolPolicyNegativeRecheckRejected(t *testing.T) {
 	var rejected atomic.Int32
 	p := &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { return 1, nil },
-		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(_ *ConnectionView, d *ConnectionDecision) {
 			d.Count, d.Recheck = 1, -1
 		}),
 		DecisionRejected: func(err error) {
@@ -314,97 +315,94 @@ func TestPoolPolicyNegativeRecheckRejected(t *testing.T) {
 
 // A Count below the connections and dials under way cancels the dials
 // first, the most recently started first; a Get whose dial was cancelled
-// takes a connection with room. PoolView.Dialing counts the dials.
+// takes a connection with room. ConnectionView.Dialing counts the dials.
 func TestPoolShrinkCancelsNewestDialFirst(t *testing.T) {
-	var mu sync.Mutex
-	count := 3
-	var dialing []int
-	n := 0
-	p := &ConnPool[int]{
-		Dial: func(ctx context.Context) (int, error) {
-			mu.Lock()
-			n++
-			k := n
-			mu.Unlock()
-			if k == 1 {
-				return k, nil
-			}
-			<-ctx.Done()
-			return 0, ctx.Err()
-		},
-		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
-			mu.Lock()
-			defer mu.Unlock()
-			d.Count = count
-			dialing = append(dialing, v.Dialing)
-		}),
-	}
-	ctx := context.Background()
-	a, err := p.Get(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p.settle()
-	dials := func(want int) {
-		t.Helper()
-		for deadline := time.Now().Add(5 * time.Second); ; {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		count := 3
+		var dialing []int
+		n := 0
+		p := &ConnPool[int]{
+			Dial: func(ctx context.Context) (int, error) {
+				mu.Lock()
+				n++
+				k := n
+				mu.Unlock()
+				if k == 1 {
+					return k, nil
+				}
+				<-ctx.Done()
+				return 0, ctx.Err()
+			},
+			Policy: policyFunc(func(v *ConnectionView, d *ConnectionDecision) {
+				mu.Lock()
+				defer mu.Unlock()
+				d.Count = count
+				dialing = append(dialing, v.Dialing)
+			}),
+		}
+		ctx := context.Background()
+		a, err := p.Get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.settle()
+		dials := func(want int) {
+			t.Helper()
+			synctest.Wait()
 			p.mu.Lock()
 			got := len(p.dials)
 			p.mu.Unlock()
-			if got == want {
-				return
-			}
-			if time.Now().After(deadline) {
+			if got != want {
 				t.Fatalf("%d dials under way, want %d", got, want)
 			}
-			time.Sleep(time.Millisecond)
 		}
-	}
-	type res struct {
-		l   *Lease[int]
-		err error
-	}
-	second, third := make(chan res, 1), make(chan res, 1)
-	go func() { l, err := p.Get(ctx); second <- res{l, err} }()
-	dials(1)
-	go func() { l, err := p.Get(ctx); third <- res{l, err} }()
-	dials(2)
-	mu.Lock()
-	count = 2
-	mu.Unlock()
-	p.recheckNow()
-	p.settle()
-	r := <-third // the newest dial is cancelled first
-	if r.err != nil || r.l.Conn != a.Conn {
-		t.Fatalf("third Get: %v", r.err)
-	}
-	select {
-	case r := <-second:
-		t.Fatalf("the older dial was cancelled too: %v", r.err)
-	default:
-	}
-	mu.Lock()
-	count = 1
-	mu.Unlock()
-	p.recheckNow()
-	p.settle()
-	if r := <-second; r.err != nil || r.l.Conn != a.Conn {
-		t.Fatalf("second Get: %v", r.err)
-	}
-	mu.Lock()
-	if !slices.Contains(dialing, 2) || !slices.Contains(dialing, 1) {
-		t.Fatalf("PoolView.Dialing seen %v", dialing)
-	}
-	mu.Unlock()
-	p.mu.Lock()
-	failures := p.failures
-	p.mu.Unlock()
-	if failures != 0 {
-		t.Fatal("a cancelled dial counted as a failure")
-	}
-	r.l.Release()
-	a.Release()
-	p.Shutdown()
+		type res struct {
+			l   *Lease[int]
+			err error
+		}
+		second, third := make(chan res, 1), make(chan res, 1)
+		go func() { l, err := p.Get(ctx); second <- res{l, err} }()
+		dials(1)
+		go func() { l, err := p.Get(ctx); third <- res{l, err} }()
+		dials(2)
+		mu.Lock()
+		count = 2
+		mu.Unlock()
+		p.recheckNow()
+		p.settle()
+		r := <-third // the newest dial is cancelled first
+		if r.err != nil || r.l.Conn != a.Conn {
+			t.Fatalf("third Get: %v", r.err)
+		}
+		select {
+		case r := <-second:
+			t.Fatalf("the older dial was cancelled too: %v", r.err)
+		default:
+		}
+		mu.Lock()
+		count = 1
+		mu.Unlock()
+		p.recheckNow()
+		p.settle()
+		if r := <-second; r.err != nil || r.l.Conn != a.Conn {
+			t.Fatalf("second Get: %v", r.err)
+		}
+		mu.Lock()
+		if !slices.Contains(dialing, 2) || !slices.Contains(dialing, 1) {
+			t.Fatalf("ConnectionView.Dialing seen %v", dialing)
+		}
+		mu.Unlock()
+		p.mu.Lock()
+		failures := p.failures
+		p.mu.Unlock()
+		if failures != 0 {
+			t.Fatal("a cancelled dial counted as a failure")
+		}
+		r.l.Release()
+		a.Release()
+		p.Shutdown()
+	})
 }
 
 // With equal idle times, the connection with fewer pipes is retired
@@ -413,18 +411,18 @@ func TestPoolShrinkCancelsNewestDialFirst(t *testing.T) {
 func TestPoolShrinkRetiresFewestPipes(t *testing.T) {
 	var mu sync.Mutex
 	count := 2
-	var last zmux.PoolView
+	var last ConnectionView
 	closed := map[int]bool{}
 	n := 0
 	p := &ConnPool[int]{
 		Dial:                  func(context.Context) (int, error) { n++; return n, nil },
 		Close:                 func(c int) { closed[c] = true },
 		MaxPipesPerConnection: 2,
-		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(v *ConnectionView, d *ConnectionDecision) {
 			mu.Lock()
 			defer mu.Unlock()
 			d.Count = count
-			last = zmux.PoolView{Members: slices.Clone(v.Members)}
+			last = ConnectionView{Members: slices.Clone(v.Members)}
 		}),
 	}
 	ctx := context.Background()
@@ -467,7 +465,7 @@ func TestPoolShrinkRetiresFewestPipes(t *testing.T) {
 }
 
 // A dial Get makes because no connection has room is on demand: it is not
-// in PoolView.Dialing, does not count toward Count, and a look that finds
+// in ConnectionView.Dialing, does not count toward Count, and a look that finds
 // the pool above Count never cancels it. The connection it makes serves
 // its caller and is retired by the next look, after the caller's pipe.
 func TestPoolOnDemandDialSurvivesCount(t *testing.T) {
@@ -491,7 +489,7 @@ func TestPoolOnDemandDialSurvivesCount(t *testing.T) {
 			return k, nil
 		},
 		Close: func(c int) { mu.Lock(); closed = append(closed, c); mu.Unlock() },
-		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(v *ConnectionView, d *ConnectionDecision) {
 			mu.Lock()
 			defer mu.Unlock()
 			d.Count = 1
@@ -533,7 +531,7 @@ func TestPoolOnDemandDialSurvivesCount(t *testing.T) {
 	seenDialing := slices.Clone(dialing)
 	mu.Unlock()
 	if len(seenDialing) == 0 || slices.Max(seenDialing) != 0 {
-		t.Fatalf("PoolView.Dialing seen %v, want 0 while the dial is on demand", seenDialing)
+		t.Fatalf("ConnectionView.Dialing seen %v, want 0 while the dial is on demand", seenDialing)
 	}
 	// Set the age order while the second dial is still gated. Inserting
 	// it can trigger a policy evaluation before the second Get returns.
@@ -566,39 +564,44 @@ func TestPoolOnDemandDialSurvivesCount(t *testing.T) {
 // Shutdown waits for the look under way: neither Decide nor
 // DecisionRejected runs after it returned.
 func TestPoolShutdownWaitsForLook(t *testing.T) {
-	entered := make(chan struct{})
-	gate := make(chan struct{})
-	var returned atomic.Bool
-	var late atomic.Bool
-	var once sync.Once
-	p := &ConnPool[int]{
-		Dial: func(context.Context) (int, error) { return 1, nil },
-		Policy: policyFunc(func(_ *zmux.PoolView, _ *zmux.PoolDecision) {
-			if returned.Load() {
-				late.Store(true)
-			}
-			once.Do(func() { close(entered); <-gate })
-		}),
-	}
-	l, err := p.Get(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	<-entered
-	done := make(chan struct{})
-	go func() { p.Shutdown(); returned.Store(true); close(done) }()
-	select {
-	case <-done:
-		t.Fatal("Shutdown returned while a look was under way")
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(gate)
-	<-done
-	l.Release()
-	p.settle()
-	if late.Load() {
-		t.Fatal("Decide ran after Shutdown returned")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		entered := make(chan struct{})
+		gate := make(chan struct{})
+		unhold := sync.OnceFunc(func() { close(gate) })
+		defer unhold()
+		var returned atomic.Bool
+		var late atomic.Bool
+		var once sync.Once
+		p := &ConnPool[int]{
+			Dial: func(context.Context) (int, error) { return 1, nil },
+			Policy: policyFunc(func(_ *ConnectionView, _ *ConnectionDecision) {
+				if returned.Load() {
+					late.Store(true)
+				}
+				once.Do(func() { close(entered); <-gate })
+			}),
+		}
+		l, err := p.Get(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+		done := make(chan struct{})
+		go func() { p.Shutdown(); returned.Store(true); close(done) }()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("Shutdown returned while a look was under way")
+		default:
+		}
+		unhold()
+		<-done
+		l.Release()
+		p.settle()
+		if late.Load() {
+			t.Fatal("Decide ran after Shutdown returned")
+		}
+	})
 }
 
 // A failed dial asks the policy again at once, so it sees Failures.
@@ -606,7 +609,7 @@ func TestPoolFailedDialLooksAgain(t *testing.T) {
 	var failures atomic.Int32
 	p := &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { return 0, errors.New("down") },
-		Policy: policyFunc(func(v *zmux.PoolView, _ *zmux.PoolDecision) {
+		Policy: policyFunc(func(v *ConnectionView, _ *ConnectionDecision) {
 			failures.Store(int32(v.Failures))
 		}),
 	}
@@ -617,5 +620,77 @@ func TestPoolFailedDialLooksAgain(t *testing.T) {
 	p.settle()
 	if failures.Load() != 1 {
 		t.Fatalf("the last look saw %d failures, want 1", failures.Load())
+	}
+}
+
+func TestPoolPolicyTrafficRetiresAndSetsNewLeaseLiveness(t *testing.T) {
+	cfg := zmux.PipeLiveness{ProbeInterval: 2 * time.Second, ProbeJitter: -1}
+	var sent atomic.Uint64
+	closed := make(chan int, 2)
+	dials := 0
+	p := &ConnPool[int]{
+		Dial: func(context.Context) (int, error) {
+			dials++
+			return dials, nil
+		},
+		Close: func(c int) { closed <- c },
+		Traffic: func(c int) (uint64, uint64) {
+			if c == 1 {
+				return sent.Load(), 123
+			}
+			return 0, 0
+		},
+		Policy: policyFunc(func(v *ConnectionView, d *ConnectionDecision) {
+			if len(v.Members) != 0 {
+				d.Liveness = cfg
+			}
+			for _, m := range v.Members {
+				if m.BytesSent >= 456 && m.BytesReceived == 123 {
+					d.RetireConnections = append(d.RetireConnections, m.FateGroup)
+				}
+			}
+		}),
+	}
+	t.Cleanup(p.Shutdown)
+	ctx := t.Context()
+	get := func() *Lease[int] {
+		t.Helper()
+		l, err := p.Get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(l.Release)
+		p.settle()
+		return l
+	}
+	first := get()
+	if first.Liveness != (zmux.PipeLiveness{}) {
+		t.Fatalf("first lease liveness %+v", first.Liveness)
+	}
+	reused := get()
+	if reused.Conn != first.Conn || reused.Liveness != cfg {
+		t.Fatalf("reused connection %d, liveness %+v", reused.Conn, reused.Liveness)
+	}
+	sent.Store(456)
+	p.recheckNow()
+	p.settle()
+	next := get()
+	if next.Conn == first.Conn || next.Liveness != cfg {
+		t.Fatalf("post-retirement connection %d, liveness %+v", next.Conn, next.Liveness)
+	}
+	first.Release()
+	select {
+	case c := <-closed:
+		t.Fatalf("closed active connection %d", c)
+	default:
+	}
+	reused.Release()
+	select {
+	case c := <-closed:
+		if c != first.Conn {
+			t.Fatalf("closed connection %d, want %d", c, first.Conn)
+		}
+	default:
+		t.Fatal("retired connection stayed open after its last lease")
 	}
 }

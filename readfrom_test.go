@@ -9,6 +9,7 @@ import (
 	"math"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -126,46 +127,59 @@ type panicReader struct{}
 
 func (panicReader) Read([]byte) (int, error) { panic("reader") }
 
+type gatedReadFrom struct {
+	entered chan<- struct{}
+	resume  <-chan struct{}
+}
+
+func (r gatedReadFrom) Read(b []byte) (int, error) {
+	close(r.entered)
+	<-r.resume
+	return copy(b, "lost"), io.EOF
+}
+
 // A reset, close or stop while Read blocks ends ReadFrom with that error
 // and discards the bytes of the Read in progress.
 func TestReadFromInterrupted(t *testing.T) {
 	leakcheck.Check(t)
-	for _, tc := range []struct {
-		stop func(src, dst *Stream)
-		name string
-	}{
-		{name: "cancelwrite", stop: func(src, _ *Stream) { src.CancelWrite(7) }},
-		{name: "close", stop: func(src, _ *Stream) { _ = src.Close() }},
-		{name: "stopsending", stop: func(_, dst *Stream) { dst.CancelRead(9) }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, tc := range []string{"cancelwrite", "close", "stopsending"} {
+		t.Run(tc, func(t *testing.T) {
 			src, dst := readFromPair(t, nil)
-			pr, pw := io.Pipe()
-			res := make(chan error, 1)
-			go func() {
-				_, err := src.ReadFrom(pr)
-				res <- err
-			}()
-			if _, err := pw.Write([]byte("kept")); err != nil {
-				t.Fatal(err)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			entered, resume := make(chan struct{}), make(chan struct{})
+			unhold := sync.OnceFunc(func() { close(resume) })
+			defer unhold()
+			type result struct {
+				err error
+				n   int64
 			}
-			tc.stop(src, dst)
-			deadline := time.Now().Add(5 * time.Second)
-			for {
-				// Keep feeding until a commit sees the stopped stream.
-				go func() { _, _ = pw.Write([]byte("lost")) }()
-				select {
-				case err := <-res:
-					if err == nil {
-						t.Fatal("ReadFrom returned nil")
-					}
-					_ = pr.Close()
-					return
-				case <-time.After(20 * time.Millisecond):
+			res := make(chan result, 1)
+			go func() {
+				n, err := src.ReadFrom(gatedReadFrom{entered, resume})
+				res <- result{err, n}
+			}()
+			waitTestSignal(t, entered, "ReadFrom reader")
+			switch tc {
+			case "cancelwrite":
+				src.CancelWrite(7)
+			case "close":
+				_ = src.Close()
+			case "stopsending":
+				dst.CancelRead(9)
+				var stop *StreamError
+				if err := waitStreamStop(ctx, src); !errors.As(err, &stop) || !stop.Remote || stop.ErrorCode != 9 {
+					t.Fatalf("STOP_SENDING: %v", err)
 				}
-				if time.Now().After(deadline) {
-					t.Fatal("ReadFrom did not return")
+			}
+			unhold()
+			select {
+			case got := <-res:
+				if got.err == nil || got.n != 0 {
+					t.Fatalf("ReadFrom returned %d, %v after %s", got.n, got.err, tc)
 				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
 			}
 		})
 	}

@@ -15,8 +15,9 @@ import (
 	"time"
 )
 
-// TestSessionMemory measures idle multipath sessions, with both endpoints in
-// this process. Run it on its own without the race detector for measurements.
+// Performance probe (opt-in): TestSessionMemory measures idle multipath
+// sessions with both endpoints in this process. Run it on its own without
+// the race detector for measurements.
 func TestSessionMemory(t *testing.T) {
 	if os.Getenv("ZMUX_MEM_PROBE") != "1" {
 		t.Skip("set ZMUX_MEM_PROBE=1 to run the session memory probe")

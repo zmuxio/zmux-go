@@ -43,9 +43,10 @@ func echo1(t *testing.T, cp, sp zmux.PipeIO) {
 		}
 		go func() { _ = w.WriteMessage(msg) }()
 		got, err := r.ReadMessage(zmux.MaxRecordSize)
-		if err != nil || !bytes.Equal(got, msg) {
-			t.Fatalf("read %q: %v", got, err)
+		if err != nil || !bytes.Equal(got.Bytes(), msg) {
+			t.Fatalf("read %q: %v", got.Bytes(), err)
 		}
+		got.Release()
 	}
 }
 

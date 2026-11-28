@@ -94,3 +94,19 @@ func FuzzDecodeParams(f *testing.F) {
 		}
 	})
 }
+
+func FuzzDecodeChannelFrame(f *testing.F) {
+	f.Fuzz(func(t *testing.T, b []byte, padded bool) {
+		var frame Frame
+		if DecodeChannelFrame(b, &frame, padded) != nil {
+			return
+		}
+		body := b
+		if padded {
+			body = bytes.TrimLeft(b, "\x00")
+		}
+		if len(body) == 0 || body[0] != byte(TypeDatagram) || !bytes.Equal(body[1:], frame.Data) {
+			t.Fatal("invalid successful channel decode")
+		}
+	})
+}

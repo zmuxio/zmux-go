@@ -229,7 +229,7 @@ func TestSplitSessionConfigCancellation(t *testing.T) {
 		t.Run(reason, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				cfg := mpConfig()
-				cfg.Clock = timeshim.Real
+				cfg.ClockDomain = NewClockDomain(timeshim.Real)
 				entered := make(chan struct{})
 				l := mustNewListener(&ListenerConfig{Config: cfg, SessionConfig: func(ctx context.Context, _ *CarrierInfo, _ any) (*Config, error) {
 					close(entered)
@@ -773,7 +773,7 @@ func TestLaneUsesTargetListenerCutoff(t *testing.T) {
 // HS-02. The peer receives the session owner’s CONNECTION_CLOSE after the setup context ends.
 func TestBootstrapSetupThroughPhysicalClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := &Config{Clock: timeshim.Real}
+		cfg := &Config{ClockDomain: NewClockDomain(timeshim.Real)}
 		l := mustNewListener(&ListenerConfig{Config: cfg})
 		defer func() { _ = l.Close() }()
 		ctx, stop := context.WithCancel(t.Context())
@@ -1109,7 +1109,7 @@ func TestBootstrapPublicationOrdersJoinAndLane(t *testing.T) {
 					go func() { c, _ := Start(t.Context(), clientPipe, RoleClient, cc); started <- c }()
 					owner := newAttachment(l, false)
 					defer owner.release()
-					server, err := startCore(t.Context(), serverPipe, sc, cfg, l, nil, owner)
+					server, err := startCore(t.Context(), serverPipe, sc, cfg, l, nil, nil, owner)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -1172,7 +1172,7 @@ func TestBootstrapPublicationOrdersJoinAndLane(t *testing.T) {
 					}
 					if refused {
 						err := client.Wait()
-						var se *SessionError
+						var se *TransportError
 						if !errors.Is(err, ErrConnectionRefused) || !errors.As(err, &se) || se.ErrorMessage != reason {
 							t.Fatalf("refusal: %v", err)
 						}
@@ -1218,7 +1218,7 @@ func TestTakeoverStatsWriteOnlyWithoutTarget(t *testing.T) {
 // can run, but HandlePipe cannot return the slot and deliver its result.
 func TestBootstrapCancellationAfterPublication(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := &Config{Clock: timeshim.Real}
+		cfg := &Config{ClockDomain: NewClockDomain(timeshim.Real)}
 		l := mustNewListener(&ListenerConfig{Config: cfg})
 		defer func() { _ = l.Close() }()
 		a, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
@@ -1264,7 +1264,7 @@ func TestBootstrapCancellationBeforeCommit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		cfg := &Config{Clock: timeshim.Real}
+		cfg := &Config{ClockDomain: NewClockDomain(timeshim.Real)}
 		l := mustNewListener(&ListenerConfig{Config: cfg, SessionConfig: func(context.Context, *CarrierInfo, any) (*Config, error) {
 			cancel()
 			return cfg, nil

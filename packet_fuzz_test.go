@@ -25,7 +25,7 @@ func FuzzParseCapsuleHeader(f *testing.F) {
 	f.Add([]byte{0x00, 0x00}, uint16(100))
 	f.Fuzz(func(t *testing.T, b []byte, bound uint16) {
 		limit := int(bound)
-		h, need, err := parseCapsuleHeader(b, limit)
+		h, need, err := parseCapsuleHeader(b, limit, packetUnknownLimit(limit))
 		if err != nil {
 			return
 		}
@@ -41,7 +41,7 @@ func FuzzParseCapsuleHeader(f *testing.F) {
 		if h.typ != capsuleDatagram {
 			return
 		}
-		again, need, err := parseCapsuleHeader(appendCapsuleHeader(nil, h.cx, int(h.payload)), limit)
+		again, need, err := parseCapsuleHeader(appendCapsuleHeader(nil, h.cx, int(h.payload)), limit, packetUnknownLimit(limit))
 		if err != nil || need != 0 || again.cx != h.cx || again.payload != h.payload {
 			t.Fatalf("header %+v re-encodes to %+v (need %d, %v)", h, again, need, err)
 		}

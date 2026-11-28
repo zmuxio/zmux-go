@@ -264,12 +264,12 @@ func ExampleConn_SendDatagram() {
 }
 
 // ExampleConn_AddPipe joins a second pipe to a session and follows its
-// state with NextEvent. Multipath needs MaxPipes above 1 and a join secret
+// state with NextEvent. Multipath needs SteadyAttachments above 1 and a join secret
 // on both sides, and a Listener on the server.
 func ExampleConn_AddPipe() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cfg := &zmux.Config{MaxPipes: 2, PipeAuth: zmux.PipeAuth{PSK: []byte("an example pre-shared key, 32 B"), EndToEnd: true}}
+	cfg := &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 2}}, PipeAuth: zmux.PipeAuth{PSK: []byte("an example pre-shared key, 32 B"), EndToEnd: true}}
 	l, err := zmux.NewListener(&zmux.ListenerConfig{Config: cfg})
 	if err != nil {
 		fmt.Println(err)
@@ -317,70 +317,6 @@ func ExampleConn_AddPipe() {
 	}
 	fmt.Println(len(client.Pipes()), "pipes;", st.Label, st.Outbound, "standby:", st.Standby)
 	// Output: 2 pipes; backup active standby: true
-}
-
-// ExampleEarlyData sends a request before the server's parameters arrive,
-// and retries it without early data when the server rejects it. This
-// server grants no stream before its parameters arrive, so it cannot take
-// early data; a real client meets this when its peer is not a zmux
-// endpoint.
-func ExampleEarlyData() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// First attempt: the request is sent before the server even runs.
-	a, b := net.Pipe()
-	ga := newHeldConn(a)
-	cfg := &zmux.Config{EarlyData: zmux.EarlyData{ZmuxPeer: true}}
-	client, err := zmux.Client(ctx, ga, cfg) // returns at once
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	st, err := client.OpenStreamSync(ctx)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	_, _ = st.Write([]byte("request"))
-	_ = st.Close()
-	_ = st.SetReadDeadline(time.Now().Add(5 * time.Second))
-	ga.releaseAfter(ctx, []byte("request")) // the server starts only now
-	go func() {
-		server, err := zmux.Server(ctx, b, &zmux.Config{MaxIncomingStreams: -1})
-		if err == nil {
-			_ = server.Wait()
-		}
-	}()
-	reply, err := io.ReadAll(st)
-	_ = client.Wait()
-
-	if errors.Is(err, zmux.ErrEarlyDataRejected) && zmux.IsRetryable(err) {
-		// Nothing was processed: send the request again on a new session
-		// without early data.
-		fmt.Println("early data rejected; retrying without it")
-		client, server, err := sessions(ctx, nil, nil)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		defer closeBoth(client, server)
-		go echo(ctx, server)
-		var s string
-		s, err = roundTrip(ctx, client, "request")
-		reply = []byte(s)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-	} else if err != nil {
-		fmt.Println(err)
-		return
-	}
-	fmt.Printf("%s\n", reply)
-	// Output:
-	// early data rejected; retrying without it
-	// request
 }
 
 // ExampleSplice relays a stream of one session into a stream of another,
@@ -454,14 +390,17 @@ type wsAdapter struct{ c wsConn }
 // ReadMessage returns the next binary message of at most limit bytes. A
 // library with a read limit (SetReadLimit) should be given it instead, so
 // that a longer message is never read whole.
-func (a *wsAdapter) ReadMessage(limit int) ([]byte, error) {
+func (a *wsAdapter) ReadMessage(limit int) (zmux.ReceivedMessage, error) {
 	for {
 		t, p, err := a.c.ReadMessage()
 		if err == nil && len(p) > limit {
-			return nil, zmux.ErrMessageTooLarge
+			return zmux.ReceivedMessage{}, zmux.ErrMessageTooLarge
 		}
-		if err != nil || t == wsBinary {
-			return p, err
+		if err != nil {
+			return zmux.ReceivedMessage{}, err
+		}
+		if t == wsBinary {
+			return zmux.OwnMessage(p), nil
 		}
 	}
 }
@@ -576,58 +515,4 @@ func testTLSConfigs() (server, client *tls.Config, err error) {
 		MinVersion: tls.VersionTLS13}
 	client = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}
 	return server, client, nil
-}
-
-// heldConn holds what is written to it until releaseAfter, so that an
-// example can start its server only once the client has sent something.
-type heldConn struct {
-	net.Conn
-	more    chan struct{}
-	flushed chan struct{} // closed once the held bytes were passed on
-	buf     []byte
-	mu      sync.Mutex
-	held    bool
-}
-
-func newHeldConn(c net.Conn) *heldConn {
-	return &heldConn{Conn: c, held: true, more: make(chan struct{}, 1), flushed: make(chan struct{})}
-}
-
-func (h *heldConn) Write(p []byte) (int, error) {
-	h.mu.Lock()
-	if h.held {
-		h.buf = append(h.buf, p...)
-		h.mu.Unlock()
-		select {
-		case h.more <- struct{}{}:
-		default:
-		}
-		return len(p), nil
-	}
-	h.mu.Unlock()
-	<-h.flushed
-	return h.Conn.Write(p)
-}
-
-// releaseAfter waits until marker was written, then passes the held bytes
-// and everything later through.
-func (h *heldConn) releaseAfter(ctx context.Context, marker []byte) {
-	for {
-		h.mu.Lock()
-		if bytes.Contains(h.buf, marker) || ctx.Err() != nil {
-			buf := h.buf
-			h.buf, h.held = nil, false
-			go func() {
-				_, _ = h.Conn.Write(buf) // later writes wait for it
-				close(h.flushed)
-			}()
-			h.mu.Unlock()
-			return
-		}
-		h.mu.Unlock()
-		select {
-		case <-h.more:
-		case <-ctx.Done():
-		}
-	}
 }

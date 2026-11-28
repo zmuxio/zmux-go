@@ -11,51 +11,33 @@ import (
 // report: exact counts and settings, and the sender's RTT, one-way delay
 // and delivery-rate estimates.
 type PipeInfo struct {
-	ReplaceBy      Time // Never when no replacement is scheduled
-	Epoch          uint64
-	ID             uint64
-	EpochKnown     bool
-	Carrier        uint8 // SetPipeKind
-	OutState       OutState
-	InState        InState
-	Local          bool // this endpoint joined the attachment
-	PeerAttached   bool // the peer holds the attachment too
-	HasOut         bool
-	HasIn          bool
-	Revalidating   bool
-	Standby        bool
-	ReceiveStandby bool
-	PeerRequest    bool // a peer request exists
-	PeerStandby    bool
-	InProbation    bool
-	Eligible       bool
-	HasRTT         bool
-	Writable       bool
-	Saturated      bool
-	AttachedFor    Duration
-	SuspectCount   uint64
-	FailureCount   uint64
-
+	Failure        error  // why the attachment failed, once it did
+	PrioritySource string // local, peer, default
+	StandbySource  string // local, peer, default
+	RTTSource      string // ack, kernel, ping
+	// Lanes are the positions of each lane, for a pipe with lanes (nil
+	// without: lane 0 is then the pipe).
+	Lanes           []LaneInfo
+	ReplaceBy       Time // Never when no replacement is scheduled
+	Epoch           uint64
+	ID              uint64
+	AttachedFor     Duration
+	SuspectCount    uint64
+	FailureCount    uint64
 	SendPriority    uint64
-	PrioritySource  string // local, peer, default
-	StandbySource   string // local, peer, default
 	ReceivePriority uint64
 	StatusSeq       uint64
 	PeerPriority    uint64
 	Weight          uint64
 	ProbationUntil  Time
-
-	SmoothedRTT  Duration
-	MinRTT       Duration
-	RTTVar       Duration
-	LatestRTT    Duration
-	OWD          Duration
-	DeliveryRate float64 // bytes/s
-	RTTSource    string  // ack, kernel, ping
-
-	QueuedBytes   uint64
-	BytesInFlight uint64
-
+	SmoothedRTT     Duration
+	MinRTT          Duration
+	RTTVar          Duration
+	LatestRTT       Duration
+	OWD             Duration
+	DeliveryRate    float64 // bytes/s
+	QueuedBytes     uint64
+	BytesInFlight   uint64
 	BytesSent       uint64
 	BytesReceived   uint64
 	BytesAcked      uint64
@@ -73,22 +55,34 @@ type PipeInfo struct {
 	BytesDuplicateRecv uint64
 	// ProbeInterval and ProbeJitter are the effective k and j of the
 	// outbound direction's idle probes.
-	ProbeInterval Duration
-	ProbeJitter   float64
-
+	ProbeInterval    Duration
+	ProbeJitter      float64
 	SinceLastAck     Duration
 	SinceLastReceive Duration
 	SinceLastTraffic Duration
 	LanesOut         uint64
 	LanesIn          uint64
 	LanesRefused     uint64
-	// Lanes are the positions of each lane, for a pipe with lanes (nil
-	// without: lane 0 is then the pipe).
-	Lanes []LaneInfo
-
-	FateGroup uint64
-	KeyGroup  uint64 // the key exchange group of the pipe's Join; 0 for the bootstrap pipe
-	Failure   error  // why the attachment failed, once it did
+	FateGroup        uint64
+	KeyGroup         uint64 // the key exchange group of the pipe's Join; 0 for the bootstrap pipe
+	EpochKnown       bool
+	Carrier          uint8 // SetPipeKind
+	OutState         OutState
+	InState          InState
+	Local            bool // this endpoint joined the attachment
+	PeerAttached     bool // the peer holds the attachment too
+	HasOut           bool
+	HasIn            bool
+	Revalidating     bool
+	Standby          bool
+	ReceiveStandby   bool
+	PeerRequest      bool // a peer request exists
+	PeerStandby      bool
+	InProbation      bool
+	Eligible         bool
+	HasRTT           bool
+	Writable         bool
+	Saturated        bool
 }
 
 // LaneInfo is the positions of one lane of a pipe; a direction the lane

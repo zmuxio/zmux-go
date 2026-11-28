@@ -21,6 +21,7 @@ type pingState struct {
 	lastRTT      Duration
 	fence        uint64 // seq+1 that completes the GOAWAY fence
 	pipe         uint64 // pipe that carried the outstanding request
+	nextTry      Time   // blocked by the plain QMux sliding window, or zero
 	want         bool   // a request should be sent
 	requestFirst bool   // the first record of an endpoint without a carrier RTT
 	owe          bool   // a response is owed
@@ -90,6 +91,11 @@ func (s *Session) writePingResponse(w *recWriter) {
 func (s *Session) writePingRequest(w *recWriter) {
 	p := &s.ping
 	if (p.want || p.requestFirst) && p.outstanding == 0 {
+		if !s.peerZmux && !s.noEffect.available(s.now) {
+			p.nextTry = s.noEffect.times[s.noEffect.next].Add(Second)
+			return
+		}
+		p.nextTry = 0
 		seq := p.next
 		n := 8 + varint.SizeVarint(seq)
 		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPing(b, false, seq) }) {
@@ -103,9 +109,7 @@ func (s *Session) writePingRequest(w *recWriter) {
 		p.expires = s.now.Add(maxD(Second, MulD(s.srtt(), 3)))
 		p.want, p.requestFirst = false, false
 		w.activity = true
-		if s.shp != nil {
-			s.shp.mark(s.now)
-		}
+		s.recordNoEffect()
 	}
 }
 

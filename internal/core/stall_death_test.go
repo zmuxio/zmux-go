@@ -19,6 +19,7 @@ func stallSession(cfg Config, ownFail bool, live PipeLiveness) (*Session, *Pipe)
 
 // runTo applies every deadline up to end, one timer pass at each.
 func runTo(s *Session, end Time) {
+	s.refreshPathTopology()
 	for {
 		t := s.mpNextTimeout()
 		if t > end {
@@ -71,7 +72,7 @@ func TestStallDeathOff(t *testing.T) {
 				t.Fatalf("a deadline %v is pending in the past", next)
 			}
 			// The acknowledgements arrive: the pipe is active again.
-			s.mpAdvanced(p, p.out.lanes[0], &pipeSend{}, Time(3601*Second))
+			s.mpAdvanced(p, p.out.lanes[0], &pipeSend{}, s.now.Add(Second), false)
 			if p.mp.out != OutActive {
 				t.Fatalf("still %v after the acknowledgement", p.mp.out)
 			}

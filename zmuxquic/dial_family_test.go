@@ -37,22 +37,20 @@ func TestPoolDialUsesDestinationUDPFamily(t *testing.T) {
 				t.Fatalf("wrong UDP family: local=%s remote=%s", local, qc.RemoteAddr())
 			}
 			_ = qc.CloseWithError(0, "")
+			select {
+			case <-pc.socketDone:
+			case <-ctx.Done():
+				t.Fatalf("timed out waiting for owned UDP socket to close: %v", ctx.Err())
+			}
 			network := "udp6"
 			if tc.v4 {
 				network = "udp4"
 			}
-			for {
-				socket, err := net.ListenUDP(network, local)
-				if err == nil {
-					_ = socket.Close()
-					break
-				}
-				select {
-				case <-ctx.Done():
-					t.Fatalf("owned UDP socket was not released: %v", err)
-				case <-time.After(time.Millisecond):
-				}
+			socket, err := net.ListenUDP(network, local)
+			if err != nil {
+				t.Fatalf("owned UDP socket was not released: %v", err)
 			}
+			_ = socket.Close()
 		})
 	}
 }
@@ -79,7 +77,7 @@ func TestPoolDialPreservesHostnameWithoutChangingCallerTLS(t *testing.T) {
 func TestOwnedFamilySocketSurvivesZeroRTTRejection(t *testing.T) {
 	exerciseRejectedEarlyConnection(t, dialAddr)
 }
-func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, string, *tls.Config, *quic.Config, bool) (*quic.Conn, error)) {
+func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, string, *tls.Config, *quic.Config, bool) (*quic.Conn, <-chan struct{}, error)) {
 	t.Helper()
 	serverTLS, clientTLS := tlsConfigs(t)
 	var allow atomic.Bool
@@ -98,7 +96,7 @@ func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, st
 	defer func() { _ = listener.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	warm, err := dial(ctx, listener.Addr().String(), clientTLS, QUICConfig(nil), false)
+	warm, _, err := dial(ctx, listener.Addr().String(), clientTLS, QUICConfig(nil), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,20 +106,11 @@ func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, st
 		t.Fatal(err)
 	}
 	defer func() { _ = accepted.CloseWithError(0, "") }()
-	for {
-		if _, ok := clientTLS.ClientSessionCache.Get("localhost"); ok {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("session ticket not received")
-		case <-time.After(time.Millisecond):
-		}
-	}
+	waitTicket(t, ctx, clientTLS)
 	_ = warm.CloseWithError(0, "")
 	_ = accepted.CloseWithError(0, "")
 	allow.Store(false)
-	early, err := dial(ctx, listener.Addr().String(), clientTLS, QUICConfig(nil), true)
+	early, _, err := dial(ctx, listener.Addr().String(), clientTLS, QUICConfig(nil), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +122,8 @@ func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, st
 	defer func() { _ = peer.CloseWithError(0, "") }()
 	stream, err := early.OpenStreamSync(ctx)
 	if err == nil {
-		if err = stream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		deadline, _ := ctx.Deadline()
+		if err = stream.SetReadDeadline(deadline); err != nil {
 			t.Fatal(err)
 		}
 		_, err = stream.Read(make([]byte, 1))
@@ -159,7 +149,8 @@ func exerciseRejectedEarlyConnection(t *testing.T, dial func(context.Context, st
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = received.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+	deadline, _ := ctx.Deadline()
+	if err = received.SetReadDeadline(deadline); err != nil {
 		t.Fatal(err)
 	}
 	data, err := io.ReadAll(received)

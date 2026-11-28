@@ -84,6 +84,8 @@ type ClientConfig struct {
 	AllowedProfiles []proto.Profile
 	// ShapingLimits limit those plans.
 	ShapingLimits shaping.Limits
+	// ShapingProfile is the selected handshake profile.
+	ShapingProfile *shaping.ProfileLimits
 	// MaxAppData bounds the application data of a received message; zero is
 	// proto.DefaultMaxAppData, negative no bound beyond the message.
 	MaxAppData int
@@ -188,7 +190,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 		return q, err
 	}
 	f := framingOf(p)
-	var padded uint64
+	var writes shaping.HandshakeWrites
 	first := proto.Payload{}
 	if profile.HasPSK() {
 		if first.AppData, err = askAppData(ctx, cfg.AppData, AppDataRequest{Message: 1}); err != nil {
@@ -196,7 +198,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 		}
 	}
 	hs.SetHead(proto.HelloHeaderLen(f, profile))
-	if err := shape(ctx, cfg.Shaper, &cfg.ShapingLimits, p, msgHello, hs, proto.HelloHeaderLen(f, profile), &first, &padded); err != nil {
+	if err := shape(ctx, cfg.Shaper, cfg.ShapingLimits, cfg.ShapingProfile, p, msgHello, hs, proto.HelloHeaderLen(f, profile), &first, &writes, 0); err != nil {
 		return q, err
 	}
 	msg, err := hs.WriteMessage(nil, first)
@@ -207,17 +209,20 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 	if err != nil {
 		return q, err
 	}
+	writes[0].At = time.Now()
 	if err := writeUnit(p, hello); err != nil {
 		return q, err
 	}
+	writes[0].Baseline = uint64(len(hello)) - writes[0].Extra
 	u := &unitReader{p: p, f: f}
+	defer u.message.Release()
 	reply, framingError, err := u.frame()
 	if err != nil {
 		if framingError {
 			return q, err
 		}
 		if f == proto.Message && errors.Is(err, zmux.ErrMessageTooLarge) {
-			return q, fmt.Errorf("%w: %w", ErrTooLarge, err)
+			return q, fmt.Errorf("%w: %w", proto.ErrTooLarge, err)
 		}
 		if ctx.Err() != nil {
 			err = context.Cause(ctx)
@@ -245,7 +250,7 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 		return q, err
 	}
 	hs.SetHead(proto.FrameHeaderLen(f))
-	if err := shape(ctx, cfg.Shaper, &cfg.ShapingLimits, p, msgFinish, hs, proto.FrameHeaderLen(f), &last, &padded); err != nil {
+	if err := shape(ctx, cfg.Shaper, cfg.ShapingLimits, cfg.ShapingProfile, p, msgFinish, hs, proto.FrameHeaderLen(f), &last, &writes, 1); err != nil {
 		return q, err
 	}
 	finish, err := writeProof(ctx, hs, last, cfg.Signer)
@@ -255,15 +260,17 @@ func Establish(ctx context.Context, p zmux.PipeIO, cfg *ClientConfig) (q zmux.Pi
 	if finish, err = proto.AppendFrame(nil, f, finish); err != nil {
 		return q, err
 	}
+	writes[1].At = time.Now()
 	if err := writeUnit(p, finish); err != nil {
 		return q, err
 	}
+	writes[1].Baseline = uint64(len(finish)) - writes[1].Extra
 	res, err := hs.Finish()
 	if err != nil {
 		return q, err
 	}
-	q = wrapResult(p, u.rest(), res, peer)
-	q.HandshakePadding += padded
+	q = wrapResult(p, u, res, peer)
+	q.HandshakeWrites = writes
 	return q, nil
 }
 
@@ -349,10 +356,18 @@ const (
 // shape asks for the plan of the next message, applies the limits, waits out the
 // delay and sets the padding of pl, whose message has head bytes before its
 // Noise message.
-func shape(ctx context.Context, s shaping.HandshakeShaper, l *shaping.Limits, p zmux.PipeIO, msg string, hs *proto.Handshake, head int, pl *proto.Payload, padded *uint64) error {
+func shape(ctx context.Context, s shaping.HandshakeShaper, l shaping.Limits, profile *shaping.ProfileLimits, p zmux.PipeIO, msg string, hs *proto.Handshake, head int, pl *proto.Payload, writes *shaping.HandshakeWrites, index int) error {
 	if s == nil {
 		return nil
 	}
+	if !profile.Valid() || !l.Profile.Valid() {
+		return zmux.ErrInvalidConfig
+	}
+	if profile == nil {
+		def := shaping.Lightweight()
+		profile = &def
+	}
+	l = l.With(shaping.Budget{Profile: profile})
 	kind := ""
 	if p.Carrier != 0 {
 		kind = p.Carrier.String()
@@ -361,21 +376,24 @@ func shape(ctx context.Context, s shaping.HandshakeShaper, l *shaping.Limits, p 
 	// Each handshake family has its own name: a plan made for the lengths of one
 	// is never applied to another.
 	_, _ = shaping.Ask(s, &shaping.HandshakeView{Kind: kind, Handshake: proto.HandshakeEstablish, Message: msg}, &plan)
-	shaping.ApplyLimits(&plan, l)
+	shaping.ApplyLimits(&plan, &l)
 	if plan.Delay > 0 {
 		t := time.NewTimer(plan.Delay)
 		defer t.Stop()
 		select {
 		case <-t.C:
+			writes[index].Delay = plan.Delay
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
 	noise := hs.EmptyMessageLen() + proto.PayloadLen(*pl)
 	w := head + noise + max(p.WriteOverhead, 0)
-	if v, ok := join.ItemFor(shaping.PadFor(w, &plan)-w, join.HandshakeFloor-head-noise); ok {
+	room := shaping.HandshakeRoom(w, join.HandshakeFloor-head-noise, &plan)
+	writes[index].Allowance = uint64(room)
+	if v, ok := join.FitValue(room); ok {
 		pl.Padding, pl.PadEmpty = v, v == 0
-		*padded += uint64(join.ItemSize(v))
+		writes[index].Extra = uint64(join.ItemSize(v))
 	}
 	return nil
 }
@@ -391,21 +409,14 @@ func readBinding(ctx context.Context, p zmux.PipeIO, up bool) ([]byte, error) {
 			}
 		}
 	}
-	if !zmux.IsCarrierSecure(p) {
-		return nil, fmt.Errorf("%w: Bound on a carrier without a Secure declaration", proto.ErrInvalidConfig)
-	}
 	if p.Carrier != zmux.CarrierSplit {
-		v, err := carrierExport(p)
-		if err != nil {
-			return nil, err
-		}
-		return proto.BoundExporter(v, v)
+		return zmux.ExportBoundCarrier(p, proto.BoundExporterLabel)
 	}
-	w, err := carrierExport(zmux.PipeIO{W: p.W})
+	w, err := zmux.ExportBoundCarrier(zmux.PipeIO{W: p.W}, proto.BoundExporterLabel)
 	if err != nil {
 		return nil, err
 	}
-	r, err := carrierExport(zmux.PipeIO{R: p.R})
+	r, err := zmux.ExportBoundCarrier(zmux.PipeIO{R: p.R}, proto.BoundExporterLabel)
 	if err != nil {
 		return nil, err
 	}
@@ -415,21 +426,9 @@ func readBinding(ctx context.Context, p zmux.PipeIO, up bool) ([]byte, error) {
 	return proto.BoundExporter(r, w)
 }
 
-func carrierExport(p zmux.PipeIO) ([]byte, error) {
-	e, ok := zmux.Exporter(p)
-	if !ok {
-		return nil, fmt.Errorf("%w: Bound on a carrier without an exporter", proto.ErrInvalidConfig)
-	}
-	v, err := e.ExportKeyingMaterial(proto.BoundExporterLabel, nil, proto.BoundExporterLen)
-	if err != nil {
-		return nil, fmt.Errorf("seal: carrier exporter: %w", err)
-	}
-	return v, nil
-}
-
-// wrapResult makes the carrier of a finished handshake. rest is what was read beyond it.
-func wrapResult(p zmux.PipeIO, rest []byte, res *proto.Result, peer *Peer) zmux.PipeIO {
-	lower := zmux.PrefixedPipe(p, rest)
+// wrapResult makes the carrier of a finished handshake and replays any unread input.
+func wrapResult(p zmux.PipeIO, u *unitReader, res *proto.Result, peer *Peer) zmux.PipeIO {
+	lower := u.replay()
 	exp := &resultExporter{res: res, peer: peer}
 	if peer.RecordMode == zmux.RecordSealed {
 		return zmux.SealRecords(lower, res.Sealer, res.Opener, zmux.RecordSealed, exp)
@@ -457,66 +456,82 @@ func framingOf(p zmux.PipeIO) proto.Framing {
 }
 
 func writeUnit(p zmux.PipeIO, b []byte) error {
-	if p.Framing == zmux.FramingRecords {
-		mw, ok := p.W.(zmux.MessageWriter)
-		if !ok {
-			return errors.New("seal: Records framing needs a MessageWriter")
-		}
-		return mw.WriteMessage(b)
-	}
-	_, err := p.W.Write(b)
-	return err
+	return carrierio.WriteUnit(p.W, p.Framing == zmux.FramingRecords, b)
 }
 
 // unitReader reads handshake units from a carrier and keeps what is beyond them.
 type unitReader struct {
-	buf []byte
-	p   zmux.PipeIO
-	f   proto.Framing
+	message zmux.ReceivedMessage
+	end     error
+	buf     []byte
+	p       zmux.PipeIO
+	used    int
+	f       proto.Framing
 }
-
-// readChunk is the size of a read of a byte stream during the handshake.
-const readChunk = 4096
 
 // fill reads once: a whole message on a message carrier, some bytes on a byte stream.
 func (u *unitReader) fill() error {
+	if u.end != nil {
+		return u.end
+	}
+	var err error
 	if u.f == proto.Message {
 		mr, ok := u.p.R.(zmux.MessageReader)
 		if !ok {
 			return errors.New("seal: Records framing needs a MessageReader")
 		}
-		m, err := mr.ReadMessage(zmux.MaxRecordSize)
-		if err != nil {
+		var msg zmux.ReceivedMessage
+		msg, err = mr.ReadMessage(zmux.MaxRecordSize)
+		if msg.Len() > zmux.MaxRecordSize {
+			msg.Release()
+			return proto.ErrTooLarge
+		}
+		if err != nil && !msg.Present() {
 			return err
 		}
-		u.buf = append(u.buf[:0], m...)
-		return nil
-	}
-	var tmp [readChunk]byte
-	n, err := u.p.R.Read(tmp[:])
-	u.buf = append(u.buf, tmp[:n]...)
-	if n > 0 {
-		return nil
+		u.end, err = err, nil
+		u.message.Release()
+		u.message = msg
+		u.buf = msg.Bytes()
+	} else {
+		before := len(u.buf)
+		u.buf, err = carrierio.ReadStreamUnit(u.p.R, u.buf, zmux.MaxUntakenRead+4096, 4096)
+		if len(u.buf) > before {
+			u.end, err = err, nil
+		}
 	}
 	return err
+}
+
+func (u *unitReader) replay() zmux.PipeIO {
+	if u.f == proto.Message {
+		if len(u.buf) != 0 {
+			m := u.message
+			u.message = zmux.ReceivedMessage{}
+			return zmux.PrefixedMessagePipe(u.p, m, u.end)
+		}
+		if u.end != nil {
+			return zmux.PrefixedMessagePipe(u.p, zmux.ReceivedMessage{}, u.end)
+		}
+	}
+	return zmux.PrefixedBytePipe(u.p, u.buf, u.used, u.end)
 }
 
 // frame returns the next Reply or Finish and identifies errors from its parser.
 func (u *unitReader) frame() (unit []byte, framingError bool, err error) {
 	if u.f == proto.Message {
 		if err := u.fill(); err != nil {
-			return nil, false, err
+			return nil, errors.Is(err, proto.ErrTooLarge), err
 		}
 		unit, _, err := proto.CutFrame(u.buf, u.f)
 		u.buf = nil
 		return unit, err != nil, err
 	}
 	for {
-		unit, n, err := proto.CutFrame(u.buf, u.f)
+		unit, n, err := proto.CutFrame(u.buf[u.used:], u.f)
 		if err == nil {
-			out := bytes.Clone(unit)
-			u.buf = u.buf[n:]
-			return out, false, nil
+			u.used += n
+			return unit, false, nil
 		}
 		if !errors.Is(err, proto.ErrIncomplete) {
 			return nil, true, err
@@ -526,6 +541,3 @@ func (u *unitReader) frame() (unit []byte, framingError bool, err error) {
 		}
 	}
 }
-
-// rest returns what the reader holds beyond the units it returned.
-func (u *unitReader) rest() []byte { return bytes.Clone(u.buf) }

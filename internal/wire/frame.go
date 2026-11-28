@@ -25,6 +25,7 @@ const (
 	TypeResetStreamAt     uint64 = 0x24
 	TypeDatagram          uint64 = 0x30
 	TypeDatagramLen       uint64 = 0x31
+	TypeDatagramAck       uint64 = 0x28bbd99f
 	TypeTransportParams   uint64 = 0x3f5153300d0a0d0a
 	TypePingRequest       uint64 = 0x348c67529ef8c7bd
 	TypePingResponse      uint64 = 0x348c67529ef8c7be
@@ -83,55 +84,73 @@ const (
 	KindPipeAbandon
 	KindPipeStatus
 	KindSessionEpoch
+	KindDatagramAck
 )
 
 var kindNames = [...]string{"PADDING", "STREAM", "RESET_STREAM", "RESET_STREAM_AT", "STOP_SENDING",
 	"MAX_DATA", "MAX_STREAM_DATA", "MAX_STREAMS", "DATA_BLOCKED", "STREAM_DATA_BLOCKED",
 	"STREAMS_BLOCKED", "CONNECTION_CLOSE", "DATAGRAM", "QX_TRANSPORT_PARAMETERS", "QX_PING",
 	"GOAWAY", "PRIORITY_UPDATE", "PIPE_ACK", "PIPE_LANE", "PIPE_PING",
-	"PIPE_ABANDON", "PIPE_STATUS", "SESSION_EPOCH"}
+	"PIPE_ABANDON", "PIPE_STATUS", "SESSION_EPOCH", "DATAGRAM_ACK"}
 
 func (k Kind) String() string { return kindNames[k] }
 
 // AckEliciting reports whether a frame of this kind elicits a PIPE_ACK.
 func (k Kind) AckEliciting() bool {
-	return k != KindPadding && k != KindPipeAck && k != KindClose
+	return k != KindPadding && k != KindPipeAck && k != KindDatagramAck && k != KindClose
 }
 
-// Frame is one decoded frame. Byte fields alias the decoded buffer.
+// Frame is one decoded frame. Byte fields borrow contiguous input when available.
 type Frame struct {
-	Kind      Kind
-	Fin       bool
-	HasOff    bool
-	HasLen    bool
-	Bidi      bool
-	App       bool
-	Response  bool
-	Urgency   uint8
-	Incr      bool
-	Type      uint64 // wire frame type
-	TypeLen   int    // bytes of the type field
-	StreamID  uint64
-	Offset    uint64
-	Data      []byte // STREAM, DATAGRAM data; CONNECTION_CLOSE reason; QX_TP block
-	Code      uint64
-	FinalSize uint64
-	Reliable  uint64
-	Value     uint64 // MAX_*, *_BLOCKED limit, QX_PING seq, PRIORITY_UPDATE seq
-	ErrFrame  uint64 // CONNECTION_CLOSE frame type
-	MaxBidi   uint64
-	MaxUni    uint64
-	PipeID    uint64
-	Lane      uint64
-	LaneKey   []byte
-	Seq       uint64
-	Status    uint64
-	Priority  uint64
-	Share     []byte // SESSION_EPOCH offer or answer; Status is the phase, Seq the epoch
-	Locator   []byte // SESSION_EPOCH offer or answer, empty to keep the sender's
-	Body      []byte // SESSION_EPOCH: the bytes from Phase through Locator
-	Count     int    // PADDING run length, PIPE_ACK entry count
-	Entries   []byte // PIPE_ACK entries, validated
+	Data        []byte // STREAM, DATAGRAM data; CONNECTION_CLOSE reason; QX_TP block
+	LaneKey     []byte
+	Share       []byte // SESSION_EPOCH offer or answer; Status is the phase, Seq the epoch
+	Locator     []byte // SESSION_EPOCH offer or answer, empty to keep the sender's
+	Body        []byte // SESSION_EPOCH: the bytes from Phase through Locator
+	Entries     []byte // PIPE_ACK entries, validated
+	dataParts   Parts  // split STREAM payload
+	DatagramAck DatagramAck
+	Type        uint64 // wire frame type
+	TypeLen     int    // bytes of the type field
+	StreamID    uint64
+	Offset      uint64
+	Code        uint64
+	FinalSize   uint64
+	Reliable    uint64
+	Value       uint64 // MAX_*, *_BLOCKED limit, QX_PING seq, PRIORITY_UPDATE seq
+	ErrFrame    uint64 // CONNECTION_CLOSE frame type
+	MaxBidi     uint64
+	MaxUni      uint64
+	PipeID      uint64
+	Lane        uint64
+	Seq         uint64
+	Status      uint64
+	Priority    uint64
+	Count       int // PADDING run length, PIPE_ACK entry count
+	Kind        Kind
+	Fin         bool
+	HasOff      bool
+	HasLen      bool
+	Bidi        bool
+	App         bool
+	Response    bool
+	Urgency     uint8
+	Incr        bool
+}
+
+// DataLen returns the payload length across both STREAM ranges.
+func (f *Frame) DataLen() int {
+	if f.dataParts.source != nil || len(f.dataParts.Tail) != 0 {
+		return f.dataParts.Len()
+	}
+	return len(f.Data)
+}
+
+func (f *Frame) appendData(b []byte) []byte {
+	if f.DataLen() == len(f.Data) {
+		return append(b, f.Data...)
+	}
+	return f.dataParts.AppendTo(b)
 }
 
 // AckEntry is one PIPE_ACK entry.
@@ -162,16 +181,24 @@ func (it *AckIter) Next() (AckEntry, bool) {
 }
 
 type reader struct {
-	b   []byte
-	i   int
-	bad bool
+	data Parts
+	i    int
+	bad  bool
 }
+
+func (r *reader) len() int { return r.data.Len() }
+
+func (r *reader) rangeOf(lo, hi int) Parts { return r.data.Slice(lo, hi) }
 
 func (r *reader) varint() uint64 {
 	if r.bad {
 		return 0
 	}
-	v, n := varint.ConsumeVarint(r.b[r.i:])
+	head := r.data.contiguousAt(r.i)
+	v, n := varint.ConsumeVarint(head)
+	if n == 0 && len(head) != r.len()-r.i {
+		v, n = r.rangeOf(r.i, r.len()).splitVarint()
+	}
 	if n == 0 {
 		r.bad = true
 		return 0
@@ -181,24 +208,26 @@ func (r *reader) varint() uint64 {
 }
 
 func (r *reader) byte() byte {
-	if r.bad || r.i >= len(r.b) {
+	if r.bad || r.i >= r.len() {
 		r.bad = true
 		return 0
 	}
-	c := r.b[r.i]
+	c := r.data.Byte(r.i)
 	r.i++
 	return c
 }
 
-func (r *reader) bytes(n uint64) []byte {
-	if r.bad || n > uint64(len(r.b)-r.i) {
+func (r *reader) parts(n uint64) Parts {
+	if r.bad || n > uint64(r.len()-r.i) {
 		r.bad = true
-		return nil
+		return Parts{}
 	}
-	s := r.b[r.i : r.i+int(n)]
+	s := r.rangeOf(r.i, r.i+int(n))
 	r.i += int(n)
 	return s
 }
+
+func (r *reader) bytes(n uint64) []byte { return r.parts(n).Contiguous() }
 
 const max60 = 1 << 60
 
@@ -207,19 +236,33 @@ const max60 = 1 << 60
 // reported as PROTOCOL_VIOLATION only after the frame decoded completely
 // (errors of a complete frame take precedence over feature gating).
 func DecodeFrame(b []byte, f *Frame) (int, *Error) {
+	return DecodeFrameParts(Parts{Head: b}, f)
+}
+
+// DecodeFrameParts uses the same syntax with a bounded two-block view.
+// A split STREAM keeps both parts; other byte fields remain contiguous.
+func DecodeFrameParts(p Parts, f *Frame) (int, *Error) {
 	*f = Frame{}
-	t, tn := varint.ConsumeVarint(b)
+	t, tn := p.Varint()
 	if tn == 0 {
 		return 0, ErrFrame("truncated frame type")
 	}
 	f.Type, f.TypeLen = t, tn
-	r := reader{b: b, i: tn}
+	r := reader{data: p, i: tn}
 	switch {
 	case t == TypePadding:
 		f.Kind = KindPadding
 		n := 1
-		for n < len(b) && b[n] == 0 {
-			n++
+		for n < p.Len() {
+			b := p.contiguousAt(n)
+			i := 0
+			for i < len(b) && b[i] == 0 {
+				i++
+			}
+			n += i
+			if i < len(b) {
+				break
+			}
 		}
 		f.Count = n
 		r.i = n
@@ -231,14 +274,17 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 			f.Offset = r.varint()
 		}
 		f.Fin = t&StreamBitFin != 0
+		length := uint64(r.len() - r.i)
 		if t&StreamBitLen != 0 {
 			f.HasLen = true
-			f.Data = r.bytes(r.varint())
-		} else if !r.bad {
-			f.Data = b[r.i:]
-			r.i = len(b)
+			length = r.varint()
 		}
-		if !r.bad && f.Offset+uint64(len(f.Data)) > varint.MaxVarint {
+		data := r.parts(length)
+		f.Data = data.Head
+		if data.source != nil || len(data.Tail) != 0 {
+			f.dataParts = data
+		}
+		if !r.bad && f.Offset+length > varint.MaxVarint {
 			return 0, ErrFrame("stream offset plus length above 2^62-1")
 		}
 	case t == TypeResetStream:
@@ -293,8 +339,14 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 			f.HasLen = true
 			f.Data = r.bytes(r.varint())
 		} else {
-			f.Data = b[r.i:]
-			r.i = len(b)
+			f.Data = r.bytes(uint64(r.len() - r.i))
+		}
+	case t == TypeDatagramAck:
+		f.Kind = KindDatagramAck
+		var err *Error
+		f.DatagramAck, err = decodeDatagramAck(&r)
+		if err != nil {
+			return 0, err
 		}
 	case t == TypeTransportParams:
 		f.Kind = KindTransportParams
@@ -338,7 +390,7 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 		}
 		if !r.bad {
 			f.Count = int(cnt)
-			f.Entries = b[start:r.i]
+			f.Entries = r.rangeOf(start, r.i).Contiguous()
 		}
 	case t == TypePipeLane:
 		f.Kind = KindPipeLane
@@ -366,7 +418,7 @@ func DecodeFrame(b []byte, f *Frame) (int, *Error) {
 		f.Share = r.bytes(r.varint())
 		f.Locator = r.bytes(uint64(r.byte()))
 		if !r.bad {
-			f.Body = b[start:r.i]
+			f.Body = r.rangeOf(start, r.i).Contiguous()
 		}
 	default:
 		return 0, &Error{Code: FrameEncodingError, FrameType: t, Reason: "unknown or prohibited frame type"}

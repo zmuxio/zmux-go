@@ -182,7 +182,7 @@ func TestIdleWriterConcurrentClose(t *testing.T) {
 func TestTakeWaitsForRestartedWriter(t *testing.T) {
 	leakcheck.Check(t)
 	synctest.Test(t, func(t *testing.T) {
-		l := mustNewListener(&ListenerConfig{Config: &Config{Clock: timeshim.Real}})
+		l := mustNewListener(&ListenerConfig{Config: &Config{ClockDomain: NewClockDomain(timeshim.Real)}})
 		defer func() { _ = l.Close() }()
 		a, b := net.Pipe()
 		g := &writerGate{Conn: b}
@@ -197,7 +197,7 @@ func TestTakeWaitsForRestartedWriter(t *testing.T) {
 		}
 		done := make(chan error, 1)
 		go func() { done <- run(t.Context()) }()
-		c, err := Client(t.Context(), a, &Config{Clock: timeshim.Real})
+		c, err := Client(t.Context(), a, &Config{ClockDomain: NewClockDomain(timeshim.Real)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -242,7 +242,7 @@ func TestWriterIdleDeadlineAndReuse(t *testing.T) {
 	leakcheck.Check(t)
 	synctest.Test(t, func(t *testing.T) {
 		clk := timeshim.NewFake(time.Now())
-		cfg := &Config{Clock: clk, MaxIdleTimeout: -1}
+		cfg := &Config{ClockDomain: NewClockDomain(clk), MaxIdleTimeout: -1}
 		a, b := net.Pipe()
 		client, server := pair(t, a, b, cfg, cfg)
 		out, err := client.OpenStreamSync(t.Context())
@@ -295,7 +295,7 @@ func TestWriterIdleDeadlineAndReuse(t *testing.T) {
 			if writer.idleAt <= 0 {
 				t.Fatal("writer never parked")
 			}
-			writer.expireLocked(writer.idleAt)
+			client.expireWritersLocked(writer.idleAt)
 			if n, err := client.s.Write(out.h.st, []byte{42}, false); n != 1 || err != nil {
 				t.Errorf("write at expiry: %d, %v", n, err)
 			}
@@ -357,7 +357,7 @@ func TestWriterReservationsVisitRequestedLane(t *testing.T) {
 			pd.lanes[lane] = lo
 			w := &lo.writer
 			w.ctx, w.running, w.idleAt = t.Context(), true, 1
-			w.poll.Pending = true
+			w.poll.Ready.Store(true)
 			w.wake.Make()
 		}
 	}
@@ -389,7 +389,7 @@ func TestWriterRequestAllocations(t *testing.T) {
 		allocs := testing.AllocsPerRun(100, func() {
 			for i := 1; i <= n; i++ {
 				w := &pd.lanes[uint64(i)].writer
-				w.poll.Pending = true
+				w.poll.Ready.Store(true)
 				c.s.QueueWriter(0, uint64(i), &w.poll)
 			}
 			if starts := c.reserveWritersLocked(nil); len(starts) != 0 {
@@ -406,7 +406,10 @@ func TestWriterRequestAllocations(t *testing.T) {
 func TestSessionTimerDeferredDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		clk := timeshim.NewFake(time.Now())
-		c := newConn(&Config{Clock: clk}, core.Config{HoldFirstFlight: true})
+		domain := NewClockDomain(clk)
+		cfg := core.DefaultConfig()
+		cfg.HoldFirstFlight = true
+		c := newConn(&Config{ClockDomain: domain}, cfg, newClock(domain))
 		c.handles, c.sweepAt = 1, core.Time(core.Second)
 		c.rearmLocked(core.Never)
 		defer c.timer.Stop()
@@ -417,7 +420,7 @@ func TestSessionTimerDeferredDeadline(t *testing.T) {
 		}
 		clk.Advance(time.Second)
 		synctest.Wait()
-		if c.timerArm != c.sweepAt || c.fired {
+		if c.timerArm != c.sweepAt || c.s.Now() != 0 {
 			t.Fatal("early wake ran protocol work or lost the later deadline")
 		}
 		c.sweepAt = core.Time(2 * core.Second)
@@ -446,7 +449,10 @@ func (g *preciseGateClock) Now() time.Time {
 func TestPreciseCallbackDoesNotDelayEarlierDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := timeshim.NewFake(time.Now())
-		c := newConn(&Config{Clock: f}, core.Config{HoldFirstFlight: true})
+		domain := NewClockDomain(f)
+		cfg := core.DefaultConfig()
+		cfg.HoldFirstFlight = true
+		c := newConn(&Config{ClockDomain: domain}, cfg, newClock(domain))
 		clk := &preciseGateClock{Fake: f, entered: make(chan struct{}), release: make(chan struct{})}
 		c.clk.ext = clk
 		c.handles, c.timerPrecise, c.timerArm, c.timerAt = 1, true, 0, core.Time(core.Millisecond)

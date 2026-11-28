@@ -20,9 +20,15 @@ func ChannelDatagramLen(withID bool, id uint64, n int) int {
 // AppendChannelDatagram appends a channel datagram: the Pipe Stream ID id
 // when withID, then a DATAGRAM frame of data without its Length field.
 func AppendChannelDatagram(b []byte, withID bool, id uint64, data []byte) []byte {
+	return AppendPaddedChannelDatagram(b, withID, id, data, 0)
+}
+
+// AppendPaddedChannelDatagram adds padding before the DATAGRAM type.
+func AppendPaddedChannelDatagram(b []byte, withID bool, id uint64, data []byte, pad int) []byte {
 	if withID {
 		b = varint.AppendVarint(b, id)
 	}
+	b = append(b, make([]byte, pad)...)
 	b = AppendDatagramHeader(b, len(data), false)
 	return append(b, data...)
 }
@@ -41,7 +47,17 @@ func SplitChannelDatagram(b []byte) (id uint64, frame []byte, ok bool) {
 // DecodeChannelFrame decodes the frame of a channel datagram, which must be
 // exactly one DATAGRAM frame of type 0x30; anything else is a
 // PROTOCOL_VIOLATION. f's data aliases b.
-func DecodeChannelFrame(b []byte, f *Frame) *Error {
+func DecodeChannelFrame(b []byte, f *Frame, allowPadding bool) *Error {
+	if allowPadding && len(b) != 0 && b[0] == byte(TypePadding) {
+		if len(b) > MaxRecordSize {
+			return ErrProto("padded channel datagram exceeds framing limit")
+		}
+		i := 1
+		for i < len(b) && b[i] == byte(TypePadding) {
+			i++
+		}
+		b = b[i:]
+	}
 	if len(b) == 0 || b[0] != byte(TypeDatagram) {
 		return ErrProto("channel datagram is not one DATAGRAM frame without Length")
 	}

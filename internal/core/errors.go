@@ -74,6 +74,7 @@ const (
 	StreamRejected
 	StreamGoingAway
 	StreamPreambleTooLarge // Code is the largest preamble the peer accepts
+	StreamMemoryBudget
 )
 
 // StreamError is a stream-level outcome.
@@ -97,6 +98,8 @@ func (e *StreamError) Error() string {
 		return "zmux: going away"
 	case StreamPreambleTooLarge:
 		return fmt.Sprintf("zmux: preamble too large (max %d)", e.Code)
+	case StreamMemoryBudget:
+		return ErrMemoryBudget.Error()
 	case StreamClosedLocally:
 	}
 	return fmt.Sprintf("zmux: stream %d closed locally", e.StreamID)
@@ -110,11 +113,14 @@ func (pipeAbortedError) Unwrap() error { return ErrPipeGone }
 
 // API errors that do not end anything.
 var (
-	ErrStreamLimit    = errors.New("zmux: stream limit reached")
-	ErrNotNegotiated  = errors.New("zmux: feature not negotiated")
-	ErrNotEstablished = errors.New("zmux: session not established")
-	ErrTooLate        = errors.New("zmux: setting must precede the first frame")
-	ErrInvalid        = errors.New("zmux: invalid argument")
+	ErrStreamLimit              = errors.New("zmux: stream limit reached")
+	ErrNotNegotiated            = errors.New("zmux: feature not negotiated")
+	ErrNotEstablished           = errors.New("zmux: session not established")
+	ErrTooLate                  = errors.New("zmux: setting must precede the first frame")
+	ErrInvalid                  = errors.New("zmux: invalid argument")
+	ErrPolicyConflict           = errors.New("zmux: stale session policy")
+	ErrJoinAuthorizationChanged = errors.New("zmux: join authorization_changed")
+	ErrNoDirectionCoverage      = errors.New("zmux: planned drain would leave a direction uncovered")
 	// ErrGroupNotUsable is a local join's Group outside the session's usable Groups.
 	ErrGroupNotUsable = errors.New("zmux: Group not usable in the session")
 	// ErrJoinRefused identifies an authenticated refusal by the peer.

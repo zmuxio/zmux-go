@@ -2,8 +2,9 @@ package zmuxh3
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"testing"
@@ -11,103 +12,57 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/quicvarint"
-	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
 func dgCfg() *zmux.Config {
-	return &zmux.Config{EnableDatagrams: true, PipeAuth: zmux.PipeAuth{PSK: make([]byte, 32), EndToEnd: true}}
+	// These tests exercise the carrier path, without the wall-clock CoDel policy.
+	return &zmux.Config{EnableDatagrams: true, DatagramQueueDelay: -1, PipeAuth: zmux.PipeAuth{PSK: make([]byte, 32), EndToEnd: true}}
 }
 
-// warmUp sends datagrams from a to b until one goes on the channel (the
-// first ones may go in records while the carrier negotiates its
-// datagrams).
-func warmUp(t *testing.T, a, b *zmux.Conn) {
+func waitNativeDatagrams(t *testing.T, ctx context.Context, c *zmux.Conn) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for a.ConnectionStats().DatagramsSentChannel == 0 {
-		if err := a.SendDatagram([]byte("warm")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := b.ReceiveDatagram(ctx); err != nil {
-			t.Fatalf("channel not ready: %v\nsender %+v\nreceiver %+v", err, a.ConnectionStats(), b.ConnectionStats())
+	for !c.ConnectionState().NativeDatagramAvailable {
+		if _, err := c.NextEvent(ctx); err != nil {
+			t.Fatalf("waiting for native datagrams: %v", err)
 		}
 	}
 }
 
-// roundTrip sends n datagrams each way and checks that they arrived, all
-// on the channel.
-func roundTrip(t *testing.T, c, s *zmux.Conn, tag string) {
+// Receive each datagram before sending the next. This checks routing and
+// representation without depending on queue bursts or sender-side accounting,
+// which may run after the receiver delivers the datagram.
+func roundTrip(t *testing.T, ctx context.Context, c, s *zmux.Conn, tag string) {
 	t.Helper()
-	warmUp(t, c, s)
-	warmUp(t, s, c)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cs0, ss0 := c.ConnectionStats(), s.ConnectionStats()
-	const n = 20
-	for i := range n {
-		if err := c.SendDatagramWait(ctx, fmt.Appendf(nil, "%s up %d", tag, i)); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.SendDatagramWait(ctx, fmt.Appendf(nil, "%s down %d", tag, i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, d := range []struct {
-		r   *zmux.Conn
-		dir string
-	}{{s, "up"}, {c, "down"}} {
-		seen := map[string]bool{}
-		for len(seen) < n {
-			p, err := d.r.ReceiveDatagram(ctx)
-			if err != nil {
-				t.Fatalf("%s %s: %d of %d: %v", tag, d.dir, len(seen), n, err)
-			}
-			if string(p) == "warm" {
-				continue
-			}
-			seen[string(p)] = true
-		}
+	for _, direction := range []struct {
+		from, to *zmux.Conn
+		name     string
+	}{{c, s, "up"}, {s, c, "down"}} {
+		waitNativeDatagrams(t, ctx, direction.from)
+		before := direction.to.ConnectionStats()
+		const n = 20
 		for i := range n {
-			if !seen[fmt.Sprintf("%s %s %d", tag, d.dir, i)] {
-				t.Fatalf("%s %s %d missing", tag, d.dir, i)
+			want := fmt.Sprintf("%s %s %d", tag, direction.name, i)
+			if err := direction.from.SendDatagramWaitWith(ctx, []byte(want), zmux.DatagramSendOptions{Carrier: zmux.DatagramRequireNative}); err != nil {
+				t.Fatalf("send %q: %v", want, err)
+			}
+			if got, err := direction.to.ReceiveDatagram(ctx); err != nil || string(got) != want {
+				t.Fatalf("receive %q: got %q, %v", want, got, err)
 			}
 		}
-	}
-	cs, ss := c.ConnectionStats(), s.ConnectionStats()
-	if cs.DatagramsSentChannel-cs0.DatagramsSentChannel != n || cs.DatagramsReceivedChannel-cs0.DatagramsReceivedChannel != n ||
-		ss.DatagramsSentChannel-ss0.DatagramsSentChannel != n || ss.DatagramsReceivedChannel-ss0.DatagramsReceivedChannel != n {
-		t.Fatalf("%s: client %+v\nserver %+v", tag, cs, ss)
+		if got := direction.to.ConnectionStats().DatagramsReceivedChannel - before.DatagramsReceivedChannel; got != n {
+			t.Fatalf("%s %s: received %d native datagrams, want %d", tag, direction.name, got, n)
+		}
 	}
 }
 
 func TestWebTransportChannel(t *testing.T) {
-	srvTLS, cliTLS := tlsConfigs(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: dgCfg()})
-	defer func() { _ = lst.Close() }()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = pc.Close() }() // a server does not close what it was given
-	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
-		QUICConfig: testQUIC()}
-	webtransport.ConfigureHTTP3Server(h3)
-	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
-	wh, err := NewHandler(lst, nil, ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h3.Handler = wh
-	go func() { _ = ws.Serve(pc) }()
-	defer func() { _ = ws.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(func() { _ = lst.Close() })
+	tr, url := startWTFixture(t, lst, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
-	url := "https://" + pc.LocalAddr().String() + "/zmux"
 	c, sess, err := Dial(ctx, tr, url, nil, dgCfg())
 	if err != nil {
 		t.Fatal(err)
@@ -131,8 +86,8 @@ func TestWebTransportChannel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roundTrip(t, c, s, "first")
-	roundTrip(t, c2, s2, "second")
+	roundTrip(t, ctx, c, s, "first")
+	roundTrip(t, ctx, c2, s2, "second")
 	if ChannelDropped(sess) != 0 {
 		t.Fatal("datagrams dropped")
 	}
@@ -141,154 +96,51 @@ func TestWebTransportChannel(t *testing.T) {
 	}
 }
 
-// rawH3 is a bidirectional carrier over an HTTP/3 POST written directly on
-// a QUIC connection, with the request stream's HTTP Datagrams as its
-// datagram channel: quic-go's HTTP/3 client offers no streaming POST on a
-// stream whose datagrams it exposes, and consumes the connection's QUIC
-// datagrams itself.
-type rawH3 struct {
-	qc     *quic.Conn
-	str    *quic.Stream
-	rest   uint64 // bytes left in the current DATA frame
-	header bool   // the response HEADERS frame was read
-}
-
-// dialRawH3 sends SETTINGS with SETTINGS_H3_DATAGRAM and a POST to
-// authority without a Content-Length (a bidirectional carrier).
-func dialRawH3(ctx context.Context, qc *quic.Conn, authority string) (*rawH3, error) {
-	ctl, err := qc.OpenUniStream()
-	if err != nil {
-		return nil, err
-	}
-	settings := []byte{0x33, 0x01}
-	if _, err := ctl.Write(append([]byte{0x00, 0x04, byte(len(settings))}, settings...)); err != nil {
-		return nil, err
-	}
-	str, err := qc.OpenStreamSync(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// A QPACK field section of literal field lines with literal names
-	// (RFC 9204 4.5.6), no dynamic table: prefix 0, 0.
-	block := []byte{0x00, 0x00}
-	for _, f := range [][2]string{{":method", "POST"}, {":scheme", "https"}, {":authority", authority}, {":path", "/"}} {
-		block = appendPrefixInt(block, 0x20, 3, len(f[0]))
-		block = append(block, f[0]...)
-		block = appendPrefixInt(block, 0x00, 7, len(f[1]))
-		block = append(block, f[1]...)
-	}
-	h := quicvarint.Append([]byte{0x01}, uint64(len(block)))
-	if _, err := str.Write(append(h, block...)); err != nil {
-		return nil, err
-	}
-	return &rawH3{qc: qc, str: str}, nil
-}
-
-// appendPrefixInt appends v as an integer with an n-bit prefix (RFC 7541
-// 5.1) after the bits of first.
-func appendPrefixInt(b []byte, first byte, n uint, v int) []byte {
-	m := 1<<n - 1
-	if v < m {
-		return append(b, first|byte(v))
-	}
-	b = append(b, first|byte(m))
-	for v -= m; v >= 128; v >>= 7 {
-		b = append(b, byte(v%128+128))
-	}
-	return append(b, byte(v))
-}
-
-// Write sends p as a DATA frame.
-func (r *rawH3) Write(p []byte) (int, error) {
-	f := quicvarint.Append([]byte{0x00}, uint64(len(p)))
-	if _, err := r.str.Write(append(f, p...)); err != nil {
-		return 0, err
-	}
-	return len(p), nil
-}
-
-func (r *rawH3) Close() error { return r.str.Close() }
-
-// Read returns the response's DATA, skipping its HEADERS frame.
-func (r *rawH3) Read(p []byte) (int, error) {
-	br := quicvarint.NewReader(r.str)
-	for r.rest == 0 {
-		t, err := quicvarint.Read(br)
-		if err != nil {
-			return 0, err
-		}
-		l, err := quicvarint.Read(br)
-		if err != nil {
-			return 0, err
-		}
-		if t == 0x00 {
-			r.rest = l
-			continue
-		}
-		if t == 0x01 {
-			r.header = true
-		}
-		if _, err := io.CopyN(io.Discard, r.str, int64(l)); err != nil {
-			return 0, err
-		}
-	}
-	n, err := r.str.Read(p[:min(uint64(len(p)), r.rest)])
-	r.rest -= uint64(n)
-	return n, err
-}
-
-// The request stream's HTTP Datagrams: the Quarter Stream ID, then the
-// channel datagram.
-func (r *rawH3) qsid() byte                      { return byte(r.str.StreamID() / 4) }
-func (r *rawH3) ChannelStreamID() (uint64, bool) { return 0, false }
-func (r *rawH3) MaxChannelDatagram() int         { return 1000 }
-func (r *rawH3) SendChannelDatagram(b []byte) error {
-	return r.qc.SendDatagram(append([]byte{r.qsid()}, b...))
-}
-func (r *rawH3) ReceiveChannelDatagrams(deliver func([]byte)) func() {
-	ctx, cancel := context.WithCancel(r.qc.Context())
-	go func() {
-		for {
-			b, err := r.qc.ReceiveDatagram(ctx)
-			if err != nil {
-				return
-			}
-			if len(b) > 0 && b[0] == r.qsid() {
-				deliver(b[1:])
-			}
-		}
-	}()
-	return cancel
-}
-
-func TestHTTP3Channel(t *testing.T) {
+func startHTTP3PostFixture(t *testing.T) (*zmux.Listener, string, *tls.Config) {
+	t.Helper()
 	srvTLS, cliTLS := tlsConfigs(t)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: dgCfg()})
-	defer func() { _ = lst.Close() }()
+	t.Cleanup(func() { _ = lst.Close() })
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = pc.Close() }() // a server does not close what it was given
+	t.Cleanup(func() { _ = pc.Close() })
 	hh, err := zmuxhttp.NewHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := NewServer("", srvTLS, testQUIC(), hh, nil)
-	go func() { _ = srv.Serve(pc) }()
-	defer func() { _ = srv.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(pc)
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+	return lst, pc.LocalAddr().String(), cliTLS
+}
+
+func TestNextBatchTransportHTTP3PostUsesRecords(t *testing.T) {
+	lst, address, cliTLS := startHTTP3PostFixture(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 35*time.Second)
 	defer cancel()
-	qc, err := quic.DialAddr(ctx, pc.LocalAddr().String(), cliTLS, testQUIC())
+	qc, err := quic.DialAddr(ctx, address, cliTLS, testQUIC())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = qc.CloseWithError(0, "") }()
-	rh, err := dialRawH3(ctx, qc, pc.LocalAddr().String())
+	tr, err := ClientConnTransport(&http3.Transport{EnableDatagrams: true}, qc, address)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := zmux.Start(ctx, zmux.PipeIO{R: rh, W: rh}, zmux.RoleClient, dgCfg())
+	p, err := (zmuxhttp.Streaming{Client: &http.Client{Transport: tr}, URL: "https://" + address + "/"}).Pipe(ctx, zmux.DirectionBidirectional)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := zmux.Start(ctx, p, zmux.RoleClient, dgCfg())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,10 +148,25 @@ func TestHTTP3Channel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roundTrip(t, c, s, "h3")
 	echo(t, c, s)
-	if !rh.header {
-		t.Fatal("no response header")
+	for _, pair := range [][2]*zmux.Conn{{c, s}, {s, c}} {
+		if err := pair[0].SendDatagramWait(ctx, []byte("post")); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := pair[1].ReceiveDatagram(ctx); err != nil || string(got) != "post" {
+			t.Fatalf("datagram = %q, %v", got, err)
+		}
+		err := pair[0].SendDatagramWaitWith(ctx, []byte("native"), zmux.DatagramSendOptions{Carrier: zmux.DatagramRequireNative})
+		if drop, ok := errors.AsType[zmux.DatagramDroppedError](err); !ok || drop.Reason != zmux.DatagramDropNoNativePath {
+			t.Fatalf("native-only POST datagram returned %v", err)
+		}
+		sent, received := pair[0].ConnectionStats(), pair[1].ConnectionStats()
+		if sent.DatagramNativeDropped != 1 {
+			t.Fatalf("native-only POST datagrams dropped: %d, want 1", sent.DatagramNativeDropped)
+		}
+		if received.DatagramsReceived != 1 || received.DatagramsReceivedChannel != 0 {
+			t.Fatalf("ordinary POST received %+v", received)
+		}
 	}
 	_ = c.Close()
 	_ = s.Close()
@@ -308,27 +175,13 @@ func TestHTTP3Channel(t *testing.T) {
 }
 
 // A client without the channel gets datagrams in records.
-func TestHTTP3ChannelFallback(t *testing.T) {
-	srvTLS, cliTLS := tlsConfigs(t)
-	lst := mustNewListener(&zmux.ListenerConfig{Config: dgCfg()})
-	defer func() { _ = lst.Close() }()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = pc.Close() }() // a server does not close what it was given
-	hh, err := zmuxhttp.NewHandler(lst, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := NewServer("", srvTLS, testQUIC(), hh, nil)
-	go func() { _ = srv.Serve(pc) }()
-	defer func() { _ = srv.Close() }()
+func TestNextBatchTransportHTTP3ChannelFallback(t *testing.T) {
+	lst, address, cliTLS := startHTTP3PostFixture(t)
 	client, tr := HTTPClient(cliTLS, &quic.Config{HandshakeIdleTimeout: 30 * time.Second})
 	defer func() { _ = tr.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 35*time.Second)
 	defer cancel()
-	p, err := zmuxhttp.Streaming{Client: client, URL: "https://" + pc.LocalAddr().String() + "/"}.Pipe(ctx, zmux.DirectionBidirectional)
+	p, err := zmuxhttp.Streaming{Client: client, URL: "https://" + address + "/"}.Pipe(ctx, zmux.DirectionBidirectional)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +201,7 @@ func TestHTTP3ChannelFallback(t *testing.T) {
 			t.Fatalf("%v %v", p, err)
 		}
 	}
-	if st := s.ConnectionStats(); st.DatagramsSentChannel != 0 || st.DatagramsSent != 5 {
+	if st := c.ConnectionStats(); st.DatagramsReceivedChannel != 0 || st.DatagramsReceived != 5 {
 		t.Fatalf("%+v", st)
 	}
 	_ = c.Close()

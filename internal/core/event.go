@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/zmuxio/zmux-go/internal/join"
+	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // EventKind enumerates core events delivered to the driver.
@@ -50,37 +51,41 @@ const (
 	EvStreamGapStarted
 	EvStreamGapFilled
 	EvPipePathQuality
+	EvPipeHealth
+	EvShaping
 )
 
 // Event is one core event.
 type Event struct {
-	Pipe        uint64
-	MaxBidi     uint64
-	MaxUni      uint64
-	Code        uint64
-	Count       uint64
-	Stream      uint64
-	Offset      uint64
-	At          Time
-	Wait        Duration
-	RTT         Duration
-	Rate        float64
-	Err         *SessionError
-	Frame       []byte
-	Source      string // EvPipePriority: SourceLocal, SourcePeer or SourceDefault
-	Cause       error  // retirement: why the attachment failed, nil when it did not
-	PathQuality PathQualityReason
-	Kind        EventKind
-	Dir         Dir
-	OutState    OutState       // EvPipeState of DirOut
-	InState     InState        // EvPipeState of DirIn
-	Carrier     uint8          // EvPipeState: the pipe's carrier kind
-	Reason      JoinAuthReason // EvJoinAuthFailed
-	Role        Role
-	Features    Features
-
-	Saturated bool
-	Failed    bool // retirement (EvPipeState of OutRetired): the attachment failed
+	Cause                     error // retirement: why the attachment failed, nil when it did not
+	Shape                     *shaping.Event
+	Err                       *SessionError
+	Source                    string // EvPipePriority: SourceLocal, SourcePeer or SourceDefault
+	Frame                     []byte
+	HealthBefore, HealthAfter DirectionHealth
+	Pipe                      uint64
+	MaxBidi                   uint64
+	MaxUni                    uint64
+	Code                      uint64
+	Count                     uint64
+	Stream                    uint64
+	Offset                    uint64
+	At                        Time
+	Wait                      Duration
+	RTT                       Duration
+	Rate                      float64
+	Features                  Features
+	PathQuality               PathQualityReason
+	Kind                      EventKind
+	Dir                       Dir
+	OutState                  OutState       // EvPipeState of DirOut
+	InState                   InState        // EvPipeState of DirIn
+	Carrier                   uint8          // EvPipeState: the pipe's carrier kind
+	Reason                    JoinAuthReason // EvJoinAuthFailed
+	Role                      Role
+	Native                    bool // EvDatagramPath includes zero-payload paths
+	Saturated                 bool
+	Failed                    bool // retirement (EvPipeState of OutRetired): the attachment failed
 }
 
 // Dir is a pipe direction from the local endpoint's view.

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/join"
@@ -214,40 +215,41 @@ func TestHandlePairKeepsCarrierFields(t *testing.T) {
 
 // A session's end during the wait for a Reply's plan is no authentication failure.
 func TestJoinPlanCancelIsNoReject(t *testing.T) {
-	var rejects atomic.Int32
-	gate := make(chan struct{})
-	e := newAtkEnv(t, atkOpts{
-		listener: func(l *ListenerConfig) {
-			l.OnReject = func(RejectInfo) RejectAction { rejects.Add(1); return 0 }
-		},
-		server: func(c *Config) {
-			c.ShapingLimits.MaxDelay = time.Hour
-			c.HandshakeShaper = func(_ *shaping.HandshakeView, p *shaping.UnitPlan) bool {
-				select {
-				case <-gate:
-				default:
-					close(gate)
-				}
-				p.Delay = time.Hour
-				return true
-			}
-		},
+	synctest.Test(t, func(t *testing.T) {
+		var rejects atomic.Int32
+		gate := make(chan struct{})
+		entered := sync.OnceFunc(func() { close(gate) })
+		scfg := atkConfig()
+		scfg.ShapingLimits.Profile = &shaping.ProfileLimits{WindowSeconds: 10, MaxAddedDelay: time.Hour}
+		scfg.Shaping = &ShapingPolicy{Budget: func() shaping.Budget { return shaping.Budget{Profile: scfg.ShapingLimits.Profile} }}
+		scfg.Shaping.Handshake = func(_ *shaping.HandshakeView, p *shaping.UnitPlan) bool {
+			entered()
+			p.Delay = time.Hour
+			return true
+		}
+		env := newMemMPEnvOn(t, atkConfig(), &ListenerConfig{Config: scfg,
+			OnReject: func(RejectInfo) RejectAction { rejects.Add(1); return RejectClose },
+		})
+		e := &atkEnv{c: env.client, t: t}
+		h, _ := e.forge(20, join.Sealed, nil, nil)
+		nc, err := env.dial(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = nc.Close() }()
+		if _, err := nc.Write(h); err != nil {
+			t.Fatal(err)
+		}
+		<-gate
+		synctest.Wait()
+		_ = env.server.Close()
+		if _, err := io.Copy(io.Discard, nc); err != nil {
+			t.Fatalf("carrier still open: %v", err)
+		}
+		if n := rejects.Load(); n != 0 {
+			t.Fatalf("OnReject called %d times", n)
+		}
 	})
-	h, _ := e.forge(20, join.Sealed, nil, nil)
-	nc := e.dial(e.addr)
-	if _, err := nc.Write(h); err != nil {
-		t.Fatal(err)
-	}
-	<-gate
-	time.Sleep(20 * time.Millisecond)
-	_ = e.s.Close()
-	_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.Copy(io.Discard, nc); err != nil {
-		t.Fatalf("carrier still open: %v", err)
-	}
-	if n := rejects.Load(); n != 0 {
-		t.Fatalf("OnReject called %d times", n)
-	}
 }
 
 // The bytes classification read back do not hide a half's exporter.
@@ -266,7 +268,8 @@ func TestHookZeroPlanIsPlanned(t *testing.T) {
 		want    uint64
 	}{{true, 0}, {false, 1}} {
 		e := newAtkEnv(t, atkOpts{client: func(cfg *Config) {
-			cfg.HandshakeShaper = func(v *shaping.HandshakeView, _ *shaping.UnitPlan) bool {
+			cfg.Shaping = &ShapingPolicy{}
+			cfg.Shaping.Handshake = func(v *shaping.HandshakeView, _ *shaping.UnitPlan) bool {
 				return c.planned || v.Message != "hello"
 			}
 		}})

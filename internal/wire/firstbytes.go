@@ -58,8 +58,8 @@ func ClassifyFirstBytes(b []byte, messages bool) (class, need int) {
 	if len(b) < l {
 		return FirstNeedMore, l + 1
 	}
-	size, _ := varint.ConsumeVarint(b)
-	if size < 9 || size > MaxRecordSize {
+	_, _, fits := FirstRecordSize(b, MaxRecordSize)
+	if !fits {
 		return FirstOther, 0
 	}
 	if len(b) == l {
@@ -86,12 +86,19 @@ func FirstRecordIsLane(b []byte, messages bool) (lane bool, need int) {
 	if len(b) == 0 {
 		return false, 1
 	}
-	size, n := varint.ConsumeVarint(b)
+	_, n, fits := FirstRecordSize(b, MaxRecordSize)
 	if n == 0 {
 		return false, 1 << (b[0] >> 6)
 	}
 	if len(b) <= n {
 		return false, n + 1
 	}
-	return size >= 9 && size <= MaxRecordSize && b[n] == lead, 0
+	return fits && b[n] == lead, 0
+}
+
+// FirstRecordSize reads a Size field and validates the bootstrap bounds.
+// An incomplete Size has width zero.
+func FirstRecordSize(b []byte, limit uint64) (size uint64, width int, fits bool) {
+	size, width = varint.ConsumeVarint(b)
+	return size, width, width != 0 && size >= 9 && size <= limit
 }

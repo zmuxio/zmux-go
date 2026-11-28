@@ -13,7 +13,6 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
-	"github.com/zmuxio/zmux-go/varint"
 )
 
 // The lane keys of the process's sessions: inbound
@@ -68,19 +67,15 @@ func handleLaneOn(ctx context.Context, clk timeshim.Clock, p PipeIO) error {
 		}
 		return err
 	}
-	return handleLane(ctx, nil, withPrefix(p, first), first, nil)
+	defer first.release()
+	return handleLane(ctx, nil, first.replay(p), first.laneBody, nil)
 }
 
 // handleLane attaches an inbound lane whose first record is first; l
 // counts the outcome (nil without a listener).
-func handleLane(ctx context.Context, l *Listener, p PipeIO, first []byte, wait *attachment) error {
-	body := first
-	if p.Framing == FramingByteStream {
-		_, n := varint.ConsumeVarint(first)
-		body = first[n:]
-	}
+func handleLane(ctx context.Context, l *Listener, p PipeIO, first wire.Parts, wait *attachment) error {
 	var f wire.Frame
-	if _, err := wire.DecodeFrame(body, &f); err != nil || f.Kind != wire.KindPipeLane {
+	if _, err := wire.DecodeFrameParts(first, &f); err != nil || f.Kind != wire.KindPipeLane {
 		closePipe(p)
 		l.rejectedBy(errRejected)
 		return errRejected
@@ -177,8 +172,26 @@ func (c *Conn) acceptLane(ctx context.Context, p PipeIO, conn any, pipe, lane ui
 		closePipe(p)
 		return nil, err
 	}
+	flight, err := c.reserveReceiveFlight(p.R)
+	if err != nil {
+		closePipe(p)
+		return nil, err
+	}
+	defer func() { flight.release() }()
 	c.lock()
 	pd := c.pipes[pipe]
+	var account *accountHalf
+	source := p.ReceiveSource
+	if pd != nil && source == (CarrierHalfSource{}) && pd.hc.io.LanesShareSource {
+		source = pd.hc.io.ReceiveSource
+	}
+	if pd != nil && pd.end.accounting != nil {
+		if err := pd.end.accounting.checkSources(source, CarrierHalfSource{}, true, false); err != nil {
+			c.unlock()
+			closePipe(p)
+			return nil, err
+		}
+	}
 	info := core.CarrierInfo{Framing: core.Framing(p.Framing), Lanes: true}
 	if pd == nil || pd.retiring || c.closing || c.s.Err() != nil || !wait.commitCarrier(ctx, func() bool { return c.s.AcceptLane(conn, pipe, lane, info) }) {
 		c.unlock()
@@ -189,6 +202,9 @@ func (c *Conn) acceptLane(ctx context.Context, p PipeIO, conn any, pipe, lane ui
 		return nil, errRejected
 	}
 	releasePipe(p, nil)
+	if pd.accountSegment != nil {
+		account = pd.accountSegment.startHalf(source, false, lane)
+	}
 	// The reverse half of a bidirectional stream used as a lane is
 	// unused: it ends at once.
 	r := p.R
@@ -225,11 +241,14 @@ func (c *Conn) acceptLane(ctx context.Context, p PipeIO, conn any, pipe, lane ui
 	c.side.add()
 	pd.gs.add()
 	wait.reserve()
+	held := flight
+	flight = receiveFlight{}
 	c.unlock()
 	labels.Go(pd.lctx, "lane-read", func() {
 		defer pd.gs.done()
 		defer finished()
-		c.readLoop(pd, lane, r, closeLane)
+		defer held.release()
+		c.readLoop(pd, lane, r, closeLane, account)
 	})
 	return closeLane, nil
 }

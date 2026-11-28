@@ -6,7 +6,10 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
@@ -76,7 +79,7 @@ func exporterEarlyPair(t *testing.T, ctx context.Context, cfg *Config) (*Conn, *
 		ch <- s
 	}()
 	c, err := Start(context.Background(), PipeIO{R: cc, W: cc}, RoleClient,
-		&Config{MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, EarlyData: EarlyData{ZmuxPeer: true}})
+		&Config{SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, ClockDomain: cfg.ClockDomain, ReturnBeforeEstablished: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,76 +87,80 @@ func exporterEarlyPair(t *testing.T, ctx context.Context, cfg *Config) (*Conn, *
 }
 
 func earlyServerConfig() *Config {
-	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, EarlyData: EarlyData{Replayable: true}}
+	return &Config{SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, EarlyData: EarlyData{Replayable: true}, ClockDomain: NewClockDomain(timeshim.Real)}
 }
 
 // Parameters that arrive before the handshake gives the exporter wait for
 // it; the server's own output does not (the client gets its parameters).
 func TestExporterWaitsForEarlyHandshake(t *testing.T) {
 	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	c, sc, ch := exporterEarlyPair(t, ctx, earlyServerConfig())
-	for c.RememberedParameters() == nil {
-		if ctx.Err() != nil {
-			t.Fatal("the client did not get the server's parameters")
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		c, sc, ch := exporterEarlyPair(t, ctx, earlyServerConfig())
+		if err := c.waitEstablished(ctx, nil); err != nil {
+			t.Fatalf("client parameters: %v", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
-	select {
-	case <-ch:
-		t.Fatal("established before the handshake gave the exporter")
-	case <-time.After(50 * time.Millisecond):
-	}
-	sc.completeHandshake()
-	s := <-ch
-	if s == nil {
-		t.Fatal("server start failed")
-	}
-	echoOnce(t, ctx, c, s)
-	_ = c.Close()
-	_ = s.Close()
-	waitDone(t, c)
-	waitDone(t, s)
+		synctest.Wait()
+		select {
+		case <-ch:
+			t.Fatal("established before the handshake gave the exporter")
+		default:
+		}
+		sc.completeHandshake()
+		s := <-ch
+		if s == nil {
+			t.Fatal("server start failed")
+		}
+		echoOnce(t, ctx, c, s)
+		_ = c.Close()
+		_ = s.Close()
+		waitDone(t, c)
+		waitDone(t, s)
+	})
 }
 
 // A failed handshake is a carrier failure, not an internal error of the
 // exporter.
 func TestExporterEarlyHandshakeFails(t *testing.T) {
 	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	c, sc, ch := exporterEarlyPair(t, ctx, earlyServerConfig())
-	time.Sleep(20 * time.Millisecond)
-	close(sc.failed)
-	if s := <-ch; s != nil {
-		t.Fatal("established on a failed handshake")
-	}
-	if !sc.startErrIs(errCarrierHandshakeFailed) {
-		t.Fatalf("start: %v", sc.startErr)
-	}
-	_ = c.Close()
-	_ = sc.Close()
-	waitDone(t, c)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		c, sc, ch := exporterEarlyPair(t, ctx, earlyServerConfig())
+		synctest.Wait()
+		close(sc.failed)
+		if s := <-ch; s != nil {
+			t.Fatal("established on a failed handshake")
+		}
+		if !sc.startErrIs(errCarrierHandshakeFailed) {
+			t.Fatalf("start: %v", sc.startErr)
+		}
+		_ = c.Close()
+		_ = sc.Close()
+		waitDone(t, c)
+	})
 }
 
 // Without either, the handshake timeout bounds the wait.
 func TestExporterEarlyHandshakeTimeout(t *testing.T) {
 	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cfg := earlyServerConfig()
-	cfg.HandshakeTimeout = 200 * time.Millisecond
-	c, sc, ch := exporterEarlyPair(t, ctx, cfg)
-	select {
-	case s := <-ch:
-		if s != nil {
-			t.Fatal("established without the handshake")
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		cfg := earlyServerConfig()
+		cfg.HandshakeTimeout = 200 * time.Millisecond
+		c, sc, ch := exporterEarlyPair(t, ctx, cfg)
+		select {
+		case s := <-ch:
+			if s != nil {
+				t.Fatal("established without the handshake")
+			}
+		case <-ctx.Done():
+			t.Fatal("no timeout")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("no timeout")
-	}
-	_ = c.Close()
-	_ = sc.Close()
-	waitDone(t, c)
+		_ = c.Close()
+		_ = sc.Close()
+		waitDone(t, c)
+	})
 }

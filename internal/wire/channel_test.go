@@ -17,7 +17,7 @@ func TestChannelDatagramRoundTrip(t *testing.T) {
 				t.Fatalf("split: %d %v", gid, ok)
 			}
 			var f Frame
-			if err := DecodeChannelFrame(frame, &f); err != nil {
+			if err := DecodeChannelFrame(frame, &f, false); err != nil {
 				t.Fatal(err)
 			}
 			if f.Type != TypeDatagram || !bytes.Equal(f.Data, data) {
@@ -50,7 +50,7 @@ func TestChannelDatagramMalformed(t *testing.T) {
 	}
 	for name, b := range bad {
 		var f Frame
-		err := DecodeChannelFrame(b, &f)
+		err := DecodeChannelFrame(b, &f, false)
 		if err == nil || err.Code != ProtocolViolation {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -58,7 +58,7 @@ func TestChannelDatagramMalformed(t *testing.T) {
 }
 
 func TestCarrierDatagramsParam(t *testing.T) {
-	p := Params{Has: HasCarrierDatagrams | HasDatagram, MaxDatagramFrameSize: 65535, MaxRecordSize: DefaultMaxRecordSize}
+	p := Params{Has: HasDatagramFamily | HasCarrierDatagrams | HasDatagram, MaxDatagramFrameSize: 65535, MaxRecordSize: DefaultMaxRecordSize}
 	b, _ := AppendParams(nil, &p)
 	var q Params
 	if err := DecodeParams(b, &q); err != nil {
@@ -76,7 +76,7 @@ func TestCarrierDatagramsParam(t *testing.T) {
 
 func TestPreambleParamBound(t *testing.T) {
 	ok := func(v uint64) *Error {
-		p := Params{Has: HasPreamble | HasResetAt | HasBidiRemote | HasUni, Preamble: v, MaxRecordSize: DefaultMaxRecordSize,
+		p := Params{Has: HasDatagramFamily | HasPreamble | HasResetAt | HasBidiRemote | HasUni, Preamble: v, MaxRecordSize: DefaultMaxRecordSize,
 			MaxStreamDataBidiRem: 1 << 20, MaxStreamDataUni: 1 << 20}
 		b, _ := AppendParams(nil, &p)
 		var q Params
@@ -87,5 +87,47 @@ func TestPreambleParamBound(t *testing.T) {
 	}
 	if err := ok(MaxPreambleSize + 1); err == nil {
 		t.Fatal("zmux_preamble above 8160 accepted")
+	}
+}
+
+func TestPaddedChannelFraming(t *testing.T) {
+	encoded := AppendPaddedChannelDatagram(nil, true, 0, []byte{0, 0, 'a', 0}, 2)
+	id, body, ok := SplitChannelDatagram(encoded)
+	if !ok || id != 0 {
+		t.Fatalf("split id=%d frame=%x", id, body)
+	}
+	var f Frame
+	if e := DecodeChannelFrame(body, &f, false); e == nil {
+		t.Fatal("accepted padding without negotiation")
+	}
+	if e := DecodeChannelFrame(body, &f, true); e != nil || !bytes.Equal(f.Data, []byte{0, 0, 'a', 0}) {
+		t.Fatalf("body %x error %v", f.Data, e)
+	}
+	oversized := make([]byte, MaxRecordSize+1)
+	oversized[MaxRecordSize-1] = byte(TypeDatagram)
+	valid := oversized[:MaxRecordSize]
+	for _, tc := range []struct {
+		b     []byte
+		valid bool
+	}{{valid, true}, {oversized, false}, {valid[:len(valid)-1], false}, {[]byte{0, 0x31}, false}} {
+		if ok := DecodeChannelFrame(tc.b, &f, true) == nil; ok != tc.valid {
+			t.Fatalf("decoded %d bytes: valid=%t, want %t", len(tc.b), ok, tc.valid)
+		}
+	}
+	if ParamCarrierDatagramPadding != 0x2071d4ee {
+		t.Fatal("carrier padding parameter does not match the registry")
+	}
+	block, err := AppendParams(nil, &Params{
+		Has:                  HasDatagramFamily | HasDatagram | HasCarrierDatagrams | HasCarrierDatagramPadding,
+		MaxRecordSize:        DefaultMaxRecordSize,
+		MaxDatagramFrameSize: 1200,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p Params
+	e := DecodeParams(block, &p)
+	if e != nil || p.Has&(HasCarrierDatagrams|HasCarrierDatagramPadding) != HasCarrierDatagrams|HasCarrierDatagramPadding {
+		t.Fatalf("parameters %+v, error %v", p, e)
 	}
 }

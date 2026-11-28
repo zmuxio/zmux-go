@@ -15,20 +15,25 @@ import (
 // listener, so that handshake replies to a local server return to that
 // listener itself. DialPacket owns the socket: it closes it when dial
 // fails, else once the returned connection's Context ends (after the
-// connection's last write).
-func DialPacket[C interface{ Context() context.Context }](ctx context.Context, addr string, dial func(pc net.PacketConn, dst net.Addr) (C, error)) (C, error) {
+// connection's last write). The returned channel closes after the socket
+// closes.
+func DialPacket[C interface{ Context() context.Context }](ctx context.Context, addr string, dial func(pc net.PacketConn, dst net.Addr) (C, error)) (C, <-chan struct{}, error) {
 	var zero C
 	socket, dst, err := udpSocket(ctx, addr)
 	if err != nil {
-		return zero, err
+		return zero, nil, err
 	}
 	c, err := dial(socket, dst)
 	if err != nil {
 		_ = socket.Close()
-		return zero, err
+		return zero, nil, err
 	}
-	context.AfterFunc(c.Context(), func() { _ = socket.Close() })
-	return c, nil
+	done := make(chan struct{})
+	context.AfterFunc(c.Context(), func() {
+		_ = socket.Close()
+		close(done)
+	})
+	return c, done, nil
 }
 
 // udpSocket resolves addr and opens the socket DialPacket dials over.

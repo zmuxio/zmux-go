@@ -32,10 +32,10 @@ import (
 )
 
 const (
-	alpn         = "qmux-02"
-	deadline     = 60 * time.Second
-	echoDeadline = 5 * time.Second
-	datagramSize = 100
+	loopbackEndpoint = "127.0.0.1:0"
+	alpn             = "qmux-02"
+	deadline         = 60 * time.Second
+	datagramSize     = 100
 )
 
 func main() {
@@ -45,10 +45,14 @@ func main() {
 	}
 }
 
+var runMatrix func(context.Context, io.Reader, io.Writer, string) error
+
 func run(args []string, out io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
 	switch {
+	case runMatrix != nil && len(args) == 2 && args[0] == "matrix":
+		return runMatrix(ctx, os.Stdin, out, args[1])
 	case len(args) == 3 && args[0] == "server":
 		return serve(ctx, args[1], args[2], out)
 	case len(args) == 3 && args[0] == "client":
@@ -58,7 +62,11 @@ func run(args []string, out io.Writer) error {
 		}
 		return dial(ctx, args[1], n, out)
 	}
-	return errors.New("usage: dgpeer server CERT KEY | dgpeer client ADDR N")
+	usage := "usage: dgpeer server CERT KEY | dgpeer client ADDR N"
+	if runMatrix != nil {
+		usage += " | dgpeer matrix ARTIFACT_DIR"
+	}
+	return errors.New(usage)
 }
 
 func config() *zmux.Config { return &zmux.Config{EnableDatagrams: true} }
@@ -75,7 +83,7 @@ func serve(ctx context.Context, certFile, keyFile string, out io.Writer) error {
 		return err
 	}
 	tc := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{alpn}, MinVersion: tls.VersionTLS13}
-	ln, err := quic.ListenAddrEarly("127.0.0.1:0", tc, zmuxquic.QUICConfig(nil))
+	ln, err := quic.ListenAddrEarly(loopbackEndpoint, tc, zmuxquic.QUICConfig(nil))
 	if err != nil {
 		return err
 	}
@@ -140,9 +148,7 @@ func dial(ctx context.Context, addr string, n int, out io.Writer) error {
 		if err := c.SendDatagram(d); err != nil {
 			return err
 		}
-		rctx, rcancel := context.WithTimeout(ctx, echoDeadline)
-		e, err := c.ReceiveDatagram(rctx)
-		rcancel()
+		e, err := c.ReceiveDatagram(ctx)
 		if err != nil {
 			return fmt.Errorf("echo %d: %w", i, err)
 		}

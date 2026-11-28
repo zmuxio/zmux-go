@@ -70,10 +70,11 @@ func TestCapacityFollowsProbationExpiryAndExplicitDisable(t *testing.T) {
 	measuredRate(p, 3000000)
 	p.mp.prob.on = true
 	p.mp.probOpt = 10 * Millisecond
+	s.armPathDeadline(p, pathProbationEnd)
 	s.SetCapacityFloor(CapacityFloor{Rate: 4000000, RateRatio: 1.01})
 	wantCapacity(t, s, EvCapacityBelow, 2000000)
 	s.now = Time(10 * Millisecond)
-	s.probationTimers(s.now, true)
+	s.expirePathDeadlines(s.now)
 	wantCapacity(t, s, EvCapacityRestored, 5000000)
 	p.mp.prob.on = true
 	s.checkCapacityFloor()
@@ -127,7 +128,7 @@ func TestCapacityPenaltyEntryAndLastAcknowledgementNeedNoLaterTraffic(t *testing
 	measuredRate(p, 4000000)
 	s.SetCapacityFloor(CapacityFloor{Rate: 2500000, RateRatio: 1.01})
 	p.out.snd.so = 100
-	s.penalize(p, true)
+	s.penalize(p)
 	wantCapacity(t, s, EvCapacityBelow, 1000000)
 	p.out.snd.cum = 99
 	s.penaltyAcked(p)
@@ -173,15 +174,16 @@ func TestExpiredProbationRemainsAnImmediateDeadline(t *testing.T) {
 	p := capacityExtra(s)
 	p.mp.prob.on = true
 	p.mp.probOpt = 10 * Millisecond
+	s.armPathDeadline(p, pathProbationEnd)
 	s.now = Time(20 * Millisecond)
-	next := s.probationTimers(s.now, false)
+	next := s.mp.clock.due.Next()
 	if next == Never || next > s.now {
 		t.Fatalf("expired probation omitted from next deadline: %v", next)
 	}
 	if !p.mp.prob.on {
 		t.Fatal("deadline query mutated probation")
 	}
-	s.probationTimers(s.now, true)
+	s.expirePathDeadlines(s.now)
 	if p.mp.prob.on {
 		t.Fatal("due probation was not cleared")
 	}

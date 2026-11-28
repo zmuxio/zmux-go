@@ -87,7 +87,7 @@ func (s *Session) copyLeft(c *copyRec) uint64 {
 func (s *Session) copiesOutstanding() uint64 {
 	m := s.mp
 	var sum uint64
-	if m.additionalPipes != nil {
+	if m.prefixScheduler != nil {
 		sum = m.prefixBytes
 	}
 	out := m.copies[:0]
@@ -216,13 +216,20 @@ func (s *Session) writeCopies(d *decision, w *recWriter, q *[]*copyRec) {
 			cq = cq[1:]
 			continue
 		}
-		if !w.stream(st.id, start, data, blk, fin) {
+		charged := streamApplicationBytes(st, start, n)
+		if charged > s.replicaRoom() || s.cfg.ReplicaPercent == 0 {
+			c.dead = true
+			cq = cq[1:]
+			continue
+		}
+		if !w.stream(st.id, start, data, blk, fin, -1) {
 			return
 		}
+		s.replicaBytes(charged, true)
+		sp.q.markHandoffs(w.b, start, start+n)
 		w.logFrame(frameDesc{kind: dStream, id: st.id, off: start, n: n, fin: fin})
 		w.spendData(n)
 		st.countFrame(start, n)
-		w.notEarned += uint64(wire.StreamHeaderLen(st.id, start, int(n), true)) + n
 		s.stats.BytesRedundant += n
 		p.mp.redundantBytes += n
 		if start+n >= end {
@@ -270,13 +277,17 @@ func (s *Session) startReinjectHold(p *Pipe) {
 	a := p.mp
 	a.held1, a.holdSent = true, 0
 	a.holdUntil = s.now.Add(a.rtt.smoothed)
+	s.armPathDeadline(p, pathRepairHold)
 }
 
 // reinjectRoom reports whether p may reinject now.
 func (s *Session) reinjectRoom(p *Pipe) bool {
 	a := p.mp
 	if !a.held1 || s.now >= a.holdUntil {
-		a.held1 = false
+		if a.held1 {
+			a.held1 = false
+			s.armPathDeadline(p, pathRepairHold)
+		}
 		return true
 	}
 	return a.holdSent < uint64(s.cfg.SpreadChunk)
@@ -287,6 +298,7 @@ func (s *Session) endReinjectHolds() {
 	for _, p := range s.pipes {
 		if p.mp != nil && p.mp.held1 {
 			p.mp.held1 = false
+			s.armPathDeadline(p, pathRepairHold)
 			s.wakeAllWriters()
 		}
 	}

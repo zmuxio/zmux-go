@@ -143,7 +143,7 @@ func effectivePort(u *url.URL, secure bool) string {
 
 // Target is the URL of a carrier candidate and the URL that redirects
 // last led it to: later carriers of the candidate start from the final
-// URL, and zmux.DialChoice remembers it per server in its zmux.CarrierCache. It is
+// URL during the lifetime of the candidate. It is
 // safe for concurrent use.
 type Target struct {
 	cur  atomic.Pointer[string]
@@ -187,23 +187,24 @@ func noRedirectClient(client *http.Client) *http.Client {
 	return &c
 }
 
-// errRedirectBound is the bound of hops when the client does not set one.
-var errRedirectBound = errors.New("too many redirects")
-
-// checkHop applies the client's CheckRedirect, or DefaultRedirects
-// when it has none, to the next hop req after via.
-func checkHop(client *http.Client, req *http.Request, via []*http.Request) error {
-	if client != nil && client.CheckRedirect != nil {
-		return client.CheckRedirect(req, via)
+// FollowRedirect applies the shared hop policy and budget. Zero uses
+// DefaultRedirects and a negative limit refuses every redirect.
+func FollowRedirect(from *url.URL, method string, status int, location string, followed, limit int) (*url.URL, error) {
+	next, err := CheckRedirect(from, method, status, location)
+	if err != nil {
+		return nil, err
 	}
-	if len(via) > DefaultRedirects {
-		return errRedirectBound
+	if limit == 0 {
+		limit = DefaultRedirects
 	}
-	return nil
+	if followed >= limit {
+		return nil, &RedirectError{StatusCode: status, Location: next.String(), Reason: "too many redirects"}
+	}
+	return next, nil
 }
 
 // doHTTP sends the request newReq builds for a URL, following redirects
-// by CheckRedirect and checkHop: the last response (a non-redirect)
+// by the shared redirect policy and caller callback: the last response (a non-redirect)
 // and its URL. orig is the caller's client, nc its noRedirectClient;
 // newReq builds a hop's request, and for a further hop gives up the one
 // before.
@@ -222,8 +223,8 @@ func doHTTP(ctx context.Context, orig, nc *http.Client, u string, newReq func(u 
 			}
 			return nil, nil, err
 		}
-		if len(via) > 0 {
-			if err := checkHop(orig, req, via); err != nil {
+		if len(via) > 0 && orig != nil && orig.CheckRedirect != nil {
+			if err := orig.CheckRedirect(req, via); err != nil {
 				if req.Body != nil {
 					_ = req.Body.Close()
 				}
@@ -238,7 +239,13 @@ func doHTTP(ctx context.Context, orig, nc *http.Client, u string, newReq func(u 
 		if !IsRedirect(resp.StatusCode) {
 			return resp, cur, nil
 		}
-		next, err := CheckRedirect(cur, req.Method, resp.StatusCode, resp.Header.Get("Location"))
+		loc := resp.Header.Get("Location")
+		var next *url.URL
+		if orig != nil && orig.CheckRedirect != nil {
+			next, err = CheckRedirect(cur, req.Method, resp.StatusCode, loc)
+		} else {
+			next, err = FollowRedirect(cur, req.Method, resp.StatusCode, loc, len(via), 0)
+		}
 		// The redirect's body is not the carrier's.
 		_, _ = io.CopyN(io.Discard, resp.Body, 4<<10)
 		_ = resp.Body.Close()

@@ -18,6 +18,7 @@ import (
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
+	"github.com/zmuxio/zmux-go/internal/teststream"
 )
 
 // TestClassifyHTTP checks the classification rules in order.
@@ -75,9 +76,9 @@ type unifiedEnv struct {
 	mu   sync.Mutex
 }
 
-func newUnifiedEnv(t *testing.T, adm *zmux.Admission, trusted *zmux.TrustedProxies) *unifiedEnv {
+func newUnifiedEnv(t *testing.T, cfg *zmux.Config, adm *zmux.Admission, trusted *zmux.TrustedProxies) *unifiedEnv {
 	t.Helper()
-	e := &unifiedEnv{lst: mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})}
+	e := &unifiedEnv{lst: mustNewListener(&zmux.ListenerConfig{Config: cfg, Admission: adm})}
 	host := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -124,7 +125,7 @@ func (e *unifiedEnv) hostRequests() []string {
 // body.
 func TestHTTPMux(t *testing.T) {
 	leakcheck.Check(t)
-	e := newUnifiedEnv(t, nil, nil)
+	e := newUnifiedEnv(t, mpConfig(), nil, nil)
 	defer e.close()
 	tr := &http.Transport{}
 	defer tr.CloseIdleConnections()
@@ -187,23 +188,7 @@ func TestHTTPMux(t *testing.T) {
 // echoOnce echoes one message over a new stream of c served by s.
 func echoOnce(t *testing.T, ctx context.Context, c, s *zmux.Conn) {
 	t.Helper()
-	go func() {
-		st, err := s.AcceptStream(ctx)
-		if err == nil {
-			_, _ = io.Copy(st, st)
-			_ = st.Close()
-		}
-	}()
-	st, err := c.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg := bytes.Repeat([]byte("zmux"), 4096)
-	go func() { _, _ = st.Write(msg); _ = st.Close() }()
-	got, err := io.ReadAll(st)
-	if err != nil || !bytes.Equal(got, msg) {
-		t.Fatalf("echo: %d bytes, %v", len(got), err)
-	}
+	teststream.Echo(t, ctx, c.OpenStreamSync, s.AcceptStream, bytes.Repeat([]byte("zmux"), 4096))
 }
 
 // TestHTTPEarlyData checks that a carrier request forwarded from early data
@@ -216,7 +201,7 @@ func TestHTTPEarlyData(t *testing.T) {
 		decided.Store(info.Request.Method, true)
 		return zmux.Decision{Verdict: zmux.VerdictAccept}
 	}}
-	e := newUnifiedEnv(t, adm, nil)
+	e := newUnifiedEnv(t, mpConfig(), adm, nil)
 	defer e.close()
 	tr := &http.Transport{}
 	defer tr.CloseIdleConnections()

@@ -15,7 +15,7 @@ func TestSetLivenessKeepAlive(t *testing.T) {
 	l := s.Liveness()
 	l.KeepAlive = 2 * Second
 	s.SetLiveness(l)
-	s.timers.lastActivity = Time(Second)
+	s.noteActivity(Time(Second))
 	if got := s.NextTimeout(); got != Time(3*Second) {
 		t.Fatalf("keep-alive 2 s: next timeout %v", got)
 	}
@@ -154,6 +154,7 @@ func TestInboundSilenceLimit(t *testing.T) {
 			q := &Pipe{id: 1, in: p.in, mp: &attach{out: OutNone, in: InOpen, maxGap: c.gap, lastRecord: Time(Second), weight: 1}}
 			r := &Pipe{id: 3, in: p.in, mp: &attach{out: OutNone, in: InOpen, lastRecord: Time(100 * Second), weight: 1}}
 			s.pipes = append(s.pipes, q, r)
+			s.refreshPathTopology()
 			due := Time(Second).Add(c.want)
 			if next := s.mpNextTimeout(); next > due {
 				t.Fatalf("next timeout %v after the limit %v", next, due)
@@ -181,6 +182,7 @@ func TestInboundSilenceLastPipeAtTDead(t *testing.T) {
 	q := &Pipe{id: 1, in: p.in, mp: &attach{out: OutNone, in: InOpen, lastRecord: Time(Second), weight: 1}}
 	s.pipes = append(s.pipes, q)
 	p.mp.in = InEnded
+	s.refreshPathTopology()
 	lim := s.lastInDead(q.mp)
 	if want := s.deadLimit(s.pto(p.mp), cfg.SuspectFloor, 0); lim != want || lim < 32*Second {
 		t.Fatalf("last-pipe limit %v, want %v, at least 8 x PTO", lim, want)

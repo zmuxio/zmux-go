@@ -35,6 +35,7 @@ var (
 		reflect.TypeFor[CarrierSecure](),
 		reflect.TypeFor[FailureReporter](),
 		reflect.TypeFor[CarrierConner](),
+		reflect.TypeFor[PhysicalCarrier](),
 		reflect.TypeFor[CloseCodeRecorder](),
 		reflect.TypeFor[CarrierRecordLimit](),
 		reflect.TypeFor[CarrierPeer](),
@@ -47,6 +48,7 @@ var (
 		reflect.TypeFor[Aborter](),
 		reflect.TypeFor[BuffersWriter](),
 		reflect.TypeFor[UnsentReporter](),
+		reflect.TypeFor[LaneSource](),
 		reflect.TypeFor[TLSRecordCarrier](),
 	}
 	// connOnlyCaps are the net.Conn view's (Takeover.Conn) besides.
@@ -60,12 +62,12 @@ var (
 	// notForwarded run zmux sessions on a carrier and have no neutral
 	// absence: found on a kept carrier's own sending half, reached
 	// through Unwrap on a taken-over one.
-	notForwarded = []string{"LaneOpener", "DatagramChannel", "EarlyClientCarrier", "EarlyServerCarrier",
+	notForwarded = []string{"LaneOpener", "DatagramChannel", "DatagramDeadlineSender", "DatagramCapacityNotifier", "EarlyClientCarrier", "EarlyServerCarrier",
 		"CarrierRecordMode", "RecordSealer", "RecordOpener"}
 	// notCapabilities are interfaces of the package that no carrier half
 	// implements.
-	notCapabilities = []string{"Admitted", "CarrierCredential", "CarrierTarget", "Limiter", "Pick",
-		"PipeWrapper", "PoolPolicy", "Scheduler"}
+	notCapabilities = []string{"AccountingTicket", "Admitted", "CarrierCredential", "CarrierTarget", "Limiter", "Pick",
+		"CooldownEvent", "PipeWrapper", "Scheduler", "SpliceLimiter"}
 )
 
 func TestCarrierViewCapabilities(t *testing.T) {
@@ -137,6 +139,7 @@ func (c *capHalf) ExportKeyingMaterial(string, []byte, int) ([]byte, error) { re
 func (c *capHalf) CarrierSecure() bool                                      { return true }
 func (c *capHalf) ReportsFailure() bool                                     { return true }
 func (c *capHalf) CarrierConn() any                                         { return "cc" }
+func (c *capHalf) PhysicalCarrier() any                                     { return "pc" }
 func (c *capHalf) RecordCloseCode(ApplicationErrorCode, string)             { c.rec("code") }
 func (c *capHalf) MaxRecord() int                                           { return 4096 }
 func (c *capHalf) CarrierPeer() any                                         { return "peer" }
@@ -165,6 +168,7 @@ func TestCarrierViewForwarding(t *testing.T) {
 		}
 		if v.(ConnectionStater).ConnectionState().ServerName != "cap" || !v.(CarrierSecure).CarrierSecure() ||
 			!v.(FailureReporter).ReportsFailure() || v.(CarrierConner).CarrierConn() != "cc" ||
+			v.(PhysicalCarrier).PhysicalCarrier() != "pc" ||
 			v.(CarrierRecordLimit).MaxRecord() != 4096 || v.(CarrierPeer).CarrierPeer() != "peer" {
 			t.Fatalf("%T: a value capability is not forwarded", v)
 		}
@@ -202,6 +206,7 @@ func TestCarrierViewForwarding(t *testing.T) {
 	var plain net.Conn = prefixConn(a, []byte("x"), newHalfOwner(NetPipe(a)))
 	if plain.(ConnectionStater).ConnectionState().HandshakeComplete || plain.(CarrierSecure).CarrierSecure() ||
 		plain.(FailureReporter).ReportsFailure() || plain.(CarrierConner).CarrierConn() != nil ||
+		plain.(PhysicalCarrier).PhysicalCarrier() != nil ||
 		plain.(TLSRecordCarrier).TLSRecords() || plain.(NetConner).NetConn() != a {
 		t.Fatal("absent capabilities reported present")
 	}

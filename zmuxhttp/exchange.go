@@ -202,27 +202,26 @@ func DefaultExchangePieceSize(base64 bool) int {
 
 // exParams is a resolved ExchangeConfig.
 type exParams struct {
-	psk                    []byte
-	header                 http.Header
-	instance               string
-	downURL                string
-	nonceParam             string
-	downs, ups             int
-	upPiece, downPiece     int
-	upLimit, downLimit     int // the largest piece accepted
-	reqTimeout             time.Duration
-	backoffMin, backoffMax time.Duration
-	backoffJitter          float64
-	deadline               time.Duration
-	hold, coalesce         time.Duration
-	window                 int
-	upStore                int
-	idle, goneFor          time.Duration
-	skew                   time.Duration
-	nonceCache             int
-	b64                    bool
-	cacheBust              bool
-	skipRespMAC            bool
+	header             http.Header
+	instance           string
+	downURL            string
+	nonceParam         string
+	psk                []byte
+	downs, ups         int
+	upPiece, downPiece int
+	upLimit, downLimit int // the largest piece accepted
+	reqTimeout         time.Duration
+	backoff            zmux.ResolvedBackoff
+	deadline           time.Duration
+	hold, coalesce     time.Duration
+	window             int
+	upStore            int
+	idle, goneFor      time.Duration
+	skew               time.Duration
+	nonceCache         int
+	b64                bool
+	cacheBust          bool
+	skipRespMAC        bool
 }
 
 // resolve validates the configuration of one end (cl is the client's
@@ -264,7 +263,7 @@ func (c ExchangeConfig) resolve(cl *Exchange, sv *ExchangeOptions) (exParams, er
 		}
 		return d
 	}
-	bo, err := x.Backoff.WithDefaults(zmux.Backoff{Min: 20 * time.Millisecond, Max: 2 * time.Second, Jitter: 0.5})
+	bo, err := x.Backoff.WithDefaults(zmux.Backoff{Min: 20 * time.Millisecond, Max: 2 * time.Second, Jitter: zmux.Set(0.5)})
 	if err != nil {
 		return exParams{}, fmt.Errorf("Exchange.Backoff: %w", err)
 	}
@@ -275,10 +274,10 @@ func (c ExchangeConfig) resolve(cl *Exchange, sv *ExchangeOptions) (exParams, er
 		upPiece:    size(c.UpPieceSize, DefaultExchangePieceSize(c.Base64)),
 		downPiece:  size(c.DownPieceSize, DefaultExchangePieceSize(c.Base64)),
 		reqTimeout: setting.Timeout(x.RequestTimeout, 25*time.Second),
-		backoffMin: bo.Min, backoffMax: bo.Max, backoffJitter: bo.Jitter,
-		deadline: setting.Timeout(x.Deadline, 30*time.Second),
-		hold:     setting.Timeout(o.HoldTime, 20*time.Second),
-		window:   pos(o.DownWindow, 32), upStore: size(o.UpStoreLimit, 4<<20),
+		backoff:    bo,
+		deadline:   setting.Timeout(x.Deadline, 30*time.Second),
+		hold:       setting.Timeout(o.HoldTime, 20*time.Second),
+		window:     pos(o.DownWindow, 32), upStore: size(o.UpStoreLimit, 4<<20),
 		idle: setting.Timeout(o.IdleTimeout, 60*time.Second), goneFor: dur(o.GoneMemory, 60*time.Second),
 		skipRespMAC: x.testSkipResponseMAC,
 		skew:        dur(o.MaxClockSkew, 60*time.Second), nonceCache: pos(o.NonceCacheSize, 1<<18),
@@ -299,7 +298,6 @@ func (c ExchangeConfig) resolve(cl *Exchange, sv *ExchangeOptions) (exParams, er
 	if p.nonceParam == "" {
 		p.nonceParam = "n"
 	}
-	p.backoffMax = max(p.backoffMax, p.backoffMin)
 	p.upLimit, p.downLimit = max(p.upPiece, exLimit), max(p.downPiece, exLimit)
 	p.upStore = max(p.upStore, 2*p.upLimit)
 	return p, nil
@@ -491,15 +489,19 @@ func b64Len(n int) int { return base64.StdEncoding.EncodedLen(n) }
 // readExBody reads a body of exactly cl bytes (a complete HTTP body) and
 // decodes it when b64; the result is the binary body. The buffer grows
 // with the bytes that arrive, never from cl alone, up to cl.
-func readExBody(r io.Reader, cl int, b64 bool) (*exBuf, []byte, error) {
-	raw, n, err := readExGrow(r, cl)
+func readExBody(r io.Reader, cl int, b64 bool, account *zmux.ListenerAdapter) (*exBuf, []byte, error) {
+	raw, n, err := readExGrow(r, cl, account)
 	if err != nil {
 		return nil, nil, err
 	}
 	if !b64 {
 		return raw, raw.b[:n], nil
 	}
-	dec := getExBuf(base64.StdEncoding.DecodedLen(n))
+	dec := takeExBuf(base64.StdEncoding.DecodedLen(n), account)
+	if dec == nil {
+		raw.unref()
+		return nil, nil, zmux.ErrMemoryBudget
+	}
 	m, err := base64.StdEncoding.Strict().Decode(dec.b, raw.b[:n])
 	raw.unref()
 	if err != nil {
@@ -511,20 +513,25 @@ func readExBody(r io.Reader, cl int, b64 bool) (*exBuf, []byte, error) {
 
 // readExGrow reads exactly n bytes from r into a pooled buffer that grows
 // as they arrive; on an error nothing is returned.
-func readExGrow(r io.Reader, n int) (*exBuf, int, error) {
+func readExGrow(r io.Reader, n int, account *zmux.ListenerAdapter) (*exBuf, int, error) {
 	var b *exBuf
 	got := 0
 	for got < n {
-		b = exGrow(b, got, min(got+exReadChunk, n), n)
+		next := exGrow(b, got, min(got+exReadChunk, n), n, account)
+		if next == nil {
+			if b != nil {
+				b.unref()
+			}
+			return nil, 0, zmux.ErrMemoryBudget
+		}
+		b = next
 		m, err := r.Read(b.b[got:min(len(b.b), n)])
 		got += m
 		if got == n {
 			break
 		}
 		if err != nil {
-			if b != nil {
-				b.unref()
-			}
+			b.unref()
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
@@ -532,7 +539,10 @@ func readExGrow(r io.Reader, n int) (*exBuf, int, error) {
 		}
 	}
 	if b == nil {
-		b = getExBuf(0)
+		b = takeExBuf(0, account)
+		if b == nil {
+			return nil, 0, zmux.ErrMemoryBudget
+		}
 	}
 	return b, n, nil
 }
@@ -556,10 +566,11 @@ var exPools [64]sync.Pool
 // hook, shared across sessions; this one comes in size classes with header
 // room and may have to outlive its references in an HTTP transport (keep).
 type exBuf struct {
-	b    []byte
-	refs atomic.Int32
-	kept atomic.Bool
-	cls  uint8
+	account *zmux.ListenerAdapter
+	b       []byte
+	refs    atomic.Int32
+	kept    atomic.Bool
+	cls     uint8
 }
 
 func exClass(n int) uint8 {
@@ -571,12 +582,21 @@ func exClass(n int) uint8 {
 
 // getExBuf returns a buffer of at least n bytes holding one reference.
 func getExBuf(n int) *exBuf {
+	return takeExBuf(n, nil)
+}
+
+func takeExBuf(n int, account *zmux.ListenerAdapter) *exBuf {
 	k := exClass(n)
+	size := 1<<k + exHeadroom
+	if account != nil && !account.ChargeMemory(int64(size)) {
+		return nil
+	}
 	b, _ := exPools[k].Get().(*exBuf)
 	if b == nil {
-		b = &exBuf{b: make([]byte, 1<<k+exHeadroom), cls: k}
+		b = &exBuf{b: make([]byte, size), cls: k}
 	}
 	b.refs.Store(1)
+	b.account = account
 	return b
 }
 
@@ -586,6 +606,10 @@ func (b *exBuf) ref() { b.refs.Add(1) }
 func (b *exBuf) unref() bool {
 	switch n := b.refs.Add(-1); {
 	case n == 0:
+		if a := b.account; a != nil {
+			b.account = nil
+			a.ChargeMemory(-int64(len(b.b)))
+		}
 		if !b.kept.Load() {
 			exPools[b.cls].Put(b)
 		}
@@ -603,7 +627,7 @@ func (b *exBuf) keep() { b.kept.Store(true) }
 
 // exGrow returns a buffer that holds need bytes and keeps the first used
 // bytes of b (nil: none); it at least doubles, up to limit.
-func exGrow(b *exBuf, used, need, limit int) *exBuf {
+func exGrow(b *exBuf, used, need, limit int, account *zmux.ListenerAdapter) *exBuf {
 	if b != nil && need <= len(b.b) {
 		return b
 	}
@@ -611,7 +635,10 @@ func exGrow(b *exBuf, used, need, limit int) *exBuf {
 	if b != nil {
 		size = max(size, 2*(len(b.b)-exHeadroom))
 	}
-	nb := getExBuf(min(size, limit))
+	nb := takeExBuf(min(size, limit), account)
+	if nb == nil {
+		return nil
+	}
 	if b != nil {
 		copy(nb.b, b.b[:used])
 		b.unref()

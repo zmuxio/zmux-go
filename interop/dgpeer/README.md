@@ -13,8 +13,8 @@ ALPN `qmux-02`; the client does not verify the server's certificate. The server
 echoes every session datagram and every stream (bidirectional streams are
 copied back until the peer's FIN) and prints `STATS sent=<n> sentch=<n>
 recv=<n> recvch=<n>` when its first session ends. The client sends `n`
-datagrams of 100 bytes (the index as a big-endian `u32` first), expects each
-echoed within five seconds, prints the same `STATS` line and closes. `sentch`
+datagrams of 100 bytes (the index as a big-endian `u32` first), verifies the
+echoes, prints the same `STATS` line and closes. `sentch`
 and `recvch` count the datagrams that used the QUIC datagram channel instead of
 the session's streams. A 60-second deadline ends the process.
 

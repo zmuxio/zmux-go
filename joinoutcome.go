@@ -12,14 +12,16 @@ import (
 // All competitors settle under the session lock. Hook delivery owns no
 // session worker and releases its private event keys on return.
 type joinOutcome struct {
+	deadline         time.Time
+	parent           context.Context
+	err              error
+	attempt          *Attempt
 	keys             *joinEventHold
 	c                *Conn
 	end              *pipeEnd
 	done             chan struct{}
-	deadline         time.Time
-	parent           context.Context
 	cancellation     func() error
-	err              error
+	index            int
 	id               PipeID
 	settled, inbound bool
 }
@@ -43,7 +45,18 @@ func (o *joinOutcome) holdLocked(id uint64, end *pipeEnd) {
 	o.keys = new(joinEventHold)
 	o.c.events.held[id] = o.keys
 }
+func (o *joinOutcome) deadlineAt() time.Time {
+	if o.attempt != nil {
+		return o.attempt.deadlineAt()
+	}
+	return o.deadline
+}
+
 func (o *joinOutcome) reasonLocked(err error) error {
+	return o.reasonAtLocked(err, o.c.clk.source().Now())
+}
+
+func (o *joinOutcome) reasonAtLocked(err error, now time.Time) error {
 	c := o.c
 	switch {
 	case o.inbound && c.lst != nil && c.lst.stopCtx.Err() != nil:
@@ -59,7 +72,7 @@ func (o *joinOutcome) reasonLocked(err error) error {
 	switch {
 	case o.parent != nil && o.parent.Err() != nil:
 		err = o.parent.Err()
-	case errors.Is(err, ErrJoinTimeout) || !c.clk.source().Now().Before(o.deadline):
+	case errors.Is(err, ErrJoinTimeout) || !now.Before(o.deadlineAt()):
 		err = fmt.Errorf("%w: %w", ErrJoinTimeout, context.DeadlineExceeded)
 	}
 
@@ -83,6 +96,9 @@ func (o *joinOutcome) finishLocked(err error) {
 func (o *joinOutcome) publishLocked(err error) {
 	o.settled, o.err, o.parent, o.cancellation = true, err, nil, nil
 	close(o.done)
+	if o.attempt != nil {
+		o.attempt.attachedLocked(o.index, err)
+	}
 	if o.c.cfg.JoinOutcome != nil {
 		go o.deliver()
 	}

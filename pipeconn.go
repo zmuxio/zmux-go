@@ -39,8 +39,10 @@ var errNoSendingHalf = errors.New("zmux: pipe without a sending half")
 
 type pipeConn struct {
 	mr  MessageReader
+	msg ReceivedMessage
 	mw  MessageWriter
 	buf []byte // the rest of the current message
+	end error
 	p   PipeIO
 	rmu sync.Mutex
 }
@@ -58,17 +60,29 @@ func (c *pipeConn) Read(b []byte) (int, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
 	for len(c.buf) == 0 {
+		if c.end != nil {
+			return 0, c.end
+		}
 		if len(b) == 0 {
 			return 0, nil
 		}
-		m, err := c.mr.ReadMessage(MaxRecordSize)
+		m, err := readMessage(c.p.R, MaxRecordSize)
 		if err != nil {
 			return 0, err
 		}
-		c.buf = m
+		c.msg = m
+		c.buf = m.Bytes()
+		c.end = m.end
+		if len(c.buf) == 0 {
+			c.msg.Release()
+		}
 	}
 	n := copy(b, c.buf)
 	c.buf = c.buf[n:]
+	if len(c.buf) == 0 {
+		c.msg.Release()
+		c.buf = nil
+	}
 	return n, nil
 }
 
@@ -90,6 +104,10 @@ func (c *pipeConn) Write(b []byte) (int, error) {
 
 func (c *pipeConn) Close() error {
 	c.p.own.Close()
+	c.rmu.Lock()
+	c.msg.Release()
+	c.buf = nil
+	c.rmu.Unlock()
 	return nil
 }
 

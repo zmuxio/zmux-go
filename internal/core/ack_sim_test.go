@@ -153,7 +153,7 @@ func (e *simEnd) flush(t testing.TB, now Time, sc simCfg) {
 			}
 			e.out.send(now, all)
 		}
-		e.s.WriteDone(b, nil, now)
+		e.s.WriteDone(b, b.Len(), nil, now)
 		PutBatch(b)
 	}
 	t.Fatal("writer spins")
@@ -164,9 +164,9 @@ func (e *simEnd) deliver(now Time, in *simLink, sc simCfg) {
 		m := in.q[0].data
 		in.q = in.q[1:]
 		if sc.framing == FramingRecords {
-			e.s.ReceiveMessage(0, 0, &Buf{B: m}, m, now)
+			receiveMessageTest(e.s, 0, 0, m, now)
 		} else {
-			e.s.Receive(0, 0, &Buf{B: m}, m, now)
+			receiveTest(e.s, 0, 0, m, now)
 		}
 	}
 }
@@ -282,7 +282,9 @@ func runSim(t testing.TB, sc simCfg) simResult {
 			}
 		}
 		next := now.Add(50 * Microsecond)
-		if sc.appBytes > 0 {
+		// An application write due before establishment has to wait for
+		// carrier progress. A past nextApp would reduce each step to 1 ns.
+		if sc.appBytes > 0 && nextApp > now {
 			next = minT(next, nextApp)
 		}
 		next = minT(next, c.s.NextTimeout())

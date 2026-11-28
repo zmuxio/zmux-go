@@ -51,10 +51,10 @@ func TestFlushServerFirst(t *testing.T) {
 	}
 	// Flush, then CancelRead: the STOP_SENDING carries the stream's ID.
 	st.CancelRead(7)
-	waitUntil(t, 5*time.Second, "STOP_SENDING", func() bool {
-		_, err := ss.Write([]byte("x"))
-		return err != nil
-	})
+	var stop *StreamError
+	if err := waitStreamStop(ctx, ss); !errors.As(err, &stop) || !stop.Remote || stop.ErrorCode != 7 {
+		t.Fatalf("STOP_SENDING: %v", err)
+	}
 	if err := st.Flush(); err != nil {
 		t.Fatalf("Flush after CancelRead: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestFlushEarly(t *testing.T) {
 	a, b := net.Pipe()
 	wl := &writeLog{c: a}
 	cfg := mpConfig()
-	cfg.EarlyData = EarlyData{ZmuxPeer: true}
+	cfg.ReturnBeforeEstablished = true
 	c, server := startHeld(t, ctx, PipeIO{R: a, W: wl}, NetPipe(b), cfg)
 	st, err := c.OpenStream()
 	if err != nil {
@@ -168,10 +168,10 @@ func TestFlushPeerStopsAfterSend(t *testing.T) {
 		if err := st.Flush(); err != nil {
 			t.Fatalf("iteration %d: Flush: %v", i, err)
 		}
-		waitUntil(t, 5*time.Second, "stop reported", func() bool {
-			_, err := st.Write([]byte("x"))
-			return err != nil
-		})
+		var stop *StreamError
+		if err := waitStreamStop(ctx, st); !errors.As(err, &stop) || !stop.Remote || stop.ErrorCode != 0x77 {
+			t.Fatalf("iteration %d: waiting for STOP_SENDING: %v", i, err)
+		}
 		_, err = st.Write([]byte("x"))
 		var se *StreamError
 		if !errors.As(err, &se) || se.ErrorCode != 0x77 {

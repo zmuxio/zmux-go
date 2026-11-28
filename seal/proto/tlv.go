@@ -137,6 +137,8 @@ func parsePayload(b []byte, known payloadSet, maxAppData int, refuseAppData bool
 	return p, nil
 }
 
+func validCredentialType(typ uint64) bool { return typ > 0 && typ <= varint.MaxVarint }
+
 // parseCredential reads CredType(varint) ‖ Credential: one opaque credential.
 // An empty value and CredType 0 are invalid; the credential may be empty.
 func parseCredential(b []byte) (*Credential, error) {
@@ -147,7 +149,7 @@ func parseCredential(b []byte) (*Credential, error) {
 	if err != nil {
 		return nil, err
 	}
-	if typ == 0 {
+	if !validCredentialType(typ) {
 		return nil, ErrTLVCredentials // CredType 0 is "no credential"
 	}
 	return &Credential{Type: typ, Data: b[n:]}, nil

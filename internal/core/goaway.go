@@ -8,6 +8,7 @@ type goawayState struct {
 	reason        []byte // of the final CONNECTION_CLOSE
 	sentWater     [2]uint64
 	code          uint64
+	phaseWritten  int
 	phase         int // 1: phase 1 sent, fence pending; 2: final
 	recvWater     [2]uint64
 	recvCode      uint64

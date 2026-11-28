@@ -24,95 +24,67 @@ func refill(d, per uint64, rem *uint64) uint64 {
 	return add
 }
 
-// wireAccount is the session's allowance for spontaneous actions and the meter of
-// all added wire bytes. Its level never goes below zero.
+// wireAccount owns the available cover balance and committed overhead.
 type wireAccount struct {
-	p            shaping.Account
-	on           bool
-	level        uint64 // at most math.MaxInt64
-	remMB, remS  uint64
-	lastUS, earn uint64
-	spent        uint64
+	p                         shaping.Account
+	initialized               bool
+	level, rem, lastUS, spent uint64
 }
 
-func (a *wireAccount) accrue(us, earn uint64) {
-	if a.on {
-		add := refill(earn-a.earn, a.p.PerMB, &a.remMB)
-		b := refill(us-a.lastUS, a.p.PerSec, &a.remS)
-		if sum := add + b; sum < add {
-			add = math.MaxUint64
-		} else {
-			add = sum
-		}
-		if add > math.MaxInt64-a.level {
-			a.level = math.MaxInt64
-		} else {
-			a.level += add
-		}
+func (a *wireAccount) accrue(us, own uint64) {
+	elapsed := max(us, a.lastUS) - a.lastUS
+	a.lastUS = max(us, a.lastUS)
+	if a.level >= a.p.Ceiling {
+		return
 	}
-	a.lastUS, a.earn = us, earn
+	room := a.p.Ceiling - a.level
+	add := refill(own, a.p.PerMB, &a.rem)
+	if add >= room {
+		a.level, a.rem = a.p.Ceiling, 0
+		return
+	}
+	more := refill(elapsed, a.p.PerSec, &a.rem)
+	if more >= room-add {
+		a.level, a.rem = a.p.Ceiling, 0
+		return
+	}
+	a.level += add + more
 }
 
 func (a *wireAccount) left() uint64 {
-	if !a.on {
-		return math.MaxUint64
+	if a.p.Ceiling == 0 {
+		return 0
 	}
 	return a.level
 }
 
-// spend meters an accompanying action; it never fails and takes nothing.
-func (a *wireAccount) spend(c uint64) {
-	if c > math.MaxUint64-a.spent {
-		a.spent = math.MaxUint64
-		return
-	}
-	a.spent += c
-}
+func satAdd(a, b uint64) uint64 { return a + min(b, math.MaxUint64-a) }
 
-// charge takes c for a spontaneous action if the account has it.
-func (a *wireAccount) charge(us, earn, c uint64) bool {
-	a.accrue(us, earn)
-	if a.on {
-		if c > a.level {
-			return false
-		}
-		a.level -= c
+func (a *wireAccount) spend(n uint64) { a.spent = satAdd(a.spent, n) }
+
+func (a *wireAccount) charge(us, n uint64) bool {
+	a.accrue(us, 0)
+	if n == 0 || n > a.left() {
+		return false
 	}
-	a.spend(c)
+	a.level -= n
+	a.spend(n)
 	return true
 }
 
-// set replaces the parameters; all zero: not set.
-func (a *wireAccount) set(us, earn uint64, p shaping.Account) {
-	a.accrue(us, earn)
-	switch {
-	case p == shaping.Account{}:
-		a.on, a.level, a.remMB, a.remS = false, 0, 0, 0
-	case !a.on:
-		a.on, a.level, a.remMB, a.remS = true, p.Initial, 0, 0
-	case p.Initial >= a.p.Initial:
-		if d := p.Initial - a.p.Initial; d > math.MaxInt64-a.level {
-			a.level = math.MaxInt64
-		} else {
-			a.level += d
-		}
-	default:
-		a.level -= min(a.level, a.p.Initial-p.Initial)
+func (a *wireAccount) set(us uint64, p *shaping.Account) {
+	a.accrue(us, 0)
+	if p == nil {
+		a.p, a.rem = shaping.Account{}, 0
+		return
 	}
-	a.p = p
-}
-
-// shapeRateFloor is the lowest rate a bound of md microseconds on one wait leaves;
-// md < 0: none. A rate of 0 is no gate.
-func shapeRateFloor(rate uint64, md int64) (uint64, bool) {
-	if md < 0 || rate == 0 {
-		return rate, false
+	a.p = *p
+	if !a.initialized && p.Ceiling > 0 {
+		a.initialized, a.level = true, p.Initial
 	}
-	md = max(md, 1)
-	if f := (64*1_000_000 + uint64(md) - 1) / uint64(md); rate < f {
-		return f, true
+	if a.level >= p.Ceiling {
+		a.level, a.rem = p.Ceiling, 0
 	}
-	return rate, false
 }
 
 // tokenBucket tracks byte credit on the microsecond session clock.

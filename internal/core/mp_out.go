@@ -1,6 +1,8 @@
 package core
 
 import (
+	"slices"
+
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
 )
@@ -52,23 +54,21 @@ func (a *attach) standbySource() string {
 	return SourceDefault
 }
 
-// minRTT is min_rtt_p, or the smoothed initial value before a sample.
-func (a *attach) minRTT() Duration {
-	if a.rtt.has {
-		return a.rtt.min
-	}
-	return a.rtt.smoothed
-}
-
 // owdBase is the smallest min_rtt of the live outbound pipes with an RTT
 // sample (the reference of every OWD_p; noRTT when there is none),
 // worked out once by a caller that needs the OWD of many pipes.
 func (s *Session) owdBase() Duration {
+	if s.mp != nil && s.mp.owdFloorValid {
+		return s.mp.owdFloor
+	}
 	m := noRTT
 	for _, q := range s.pipes {
 		if q.mp != nil && q.out != nil && q.mp.liveOut() && q.mp.rtt.has && q.mp.rtt.min < m {
 			m = q.mp.rtt.min
 		}
+	}
+	if s.mp != nil {
+		s.mp.owdFloor, s.mp.owdFloorValid = m, true
 	}
 	return m
 }
@@ -140,13 +140,31 @@ func controlKeyOf(p *Pipe, base Duration) controlKey {
 	return k
 }
 
+type controlOrder struct {
+	first, second *Pipe
+	valid         bool
+}
+
 // primary returns the first two live outbound pipes of the control order.
+// Path or RTT changes invalidate it. Only a control consumer refreshes it.
 func (s *Session) primary() (*Pipe, *Pipe) {
+	o := &s.mp.control
+	if !o.valid {
+		o.first, o.second = s.controlRoutes()
+		o.valid = true
+	}
+	return o.first, o.second
+}
+
+func (s *Session) controlRoutes() (*Pipe, *Pipe) {
+	if s.workProbe != nil {
+		s.workProbe.pathScans++
+	}
 	base := s.owdBase()
 	var a, b *Pipe
 	var ka, kb controlKey
 	for _, p := range s.pipes {
-		if p.mp == nil || p.out == nil || p.out.failed || !p.mp.liveOut() || p.mp.hs || p.mp.retired ||
+		if p.mp == nil || !maySend(p, true) ||
 			p.mp.out == OutDraining && p.mp.abandonSent && p.mp.abandonRecv {
 			continue
 		}
@@ -186,9 +204,8 @@ func (m *multiPath) pingNext() Time {
 
 // oldestPingWaiter reports whether p waits longest for a PIPE_PING.
 func (s *Session) oldestPingWaiter(p *Pipe) bool {
-	for _, q := range s.pipes {
-		if q.mp != nil && q != p && q.mp.needPing && !q.mp.hs && q.out != nil && !q.out.failed &&
-			q.mp.pingSince < p.mp.pingSince {
+	for _, q := range s.mp.clock.ping {
+		if q != p && q.mp.pingSince < p.mp.pingSince {
 			return false
 		}
 	}
@@ -208,49 +225,95 @@ func (s *Session) mpWrite(w *recWriter, p *Pipe, ol *outLane) {
 	if a.hs {
 		return
 	}
+	// Neither datagrams nor pipe control need a stream placement decision.
+	// Preserve the gate for pending stream, copy and prefix-repair work.
+	hasStreamWork := s.streamWorkOn(p, ol)
+	s.clearTierWait(ol)
 	if ol.lane == 0 {
-		s.refreshTiers()
-		s.mpPipeFrames(w, p)
-		prim, _ := s.primary()
-		if prim == p || prim == nil {
-			s.writeControl(w, p)
-		} else if s.dg != nil && len(s.dg.send) > 0 {
-			s.writeDatagrams(w, p) // those that follow an opening frame sent here
+		pathWork := s.pathControlOn(p)
+		control := s.controlPending()
+		if pathWork || control {
+			prim, second := s.primary()
+			if pathWork {
+				s.mpPipeFrames(w, p, prim, second)
+			}
+			if control && (prim == p || prim == nil) {
+				s.writeControl(w, p)
+			}
 		}
 	}
-	d := &s.mp.dec
-	if ol.lane == 0 {
-		s.refreshBindings(s.buildGate(&s.mp.gateBuf))
+	if !hasStreamWork {
+		s.writeData(w, p, ol)
+		return
 	}
+	d := &s.mp.dec
 	s.newDecision(d, p)
 	if ol.lane == 0 {
+		s.refreshTiers(d.g)
+		s.refreshBindings(d.g)
+	}
+	if ol.lane == 0 {
 		s.writeCopies(d, w, &a.copyQ)
-		s.opportunistic(d, w)
 	} else if ol == p.out.lo.copyLane {
 		s.writeCopies(d, w, &a.selfCopyQ)
 	}
 	s.writeData(w, p, ol)
+	if d.blockedBy != nil && s.sched.mask != 0 && w.dataSpent == 0 {
+		s.waitForTier(p, ol, d.blockedBy)
+	}
+}
+
+func (s *Session) waitForTier(p *Pipe, lane *outLane, blocker *Pipe) {
+	lane.tierWaitOwner, lane.tierWaitOn = p, blocker
+	lane.tierWaitIndex = len(blocker.out.tierWaiters)
+	blocker.out.tierWaiters = append(blocker.out.tierWaiters, lane)
+}
+
+func (s *Session) clearTierWait(lane *outLane) {
+	on := lane.tierWaitOn
+	if on == nil {
+		return
+	}
+	q, i := on.out.tierWaiters, lane.tierWaitIndex
+	last := len(q) - 1
+	q[i] = q[last]
+	q[i].tierWaitIndex = i
+	q[last] = nil
+	on.out.tierWaiters = q[:last]
+	lane.tierWaitOwner, lane.tierWaitOn = nil, nil
+}
+
+func (s *Session) releaseTierWaiters(blocker *Pipe) {
+	for _, lane := range blocker.out.tierWaiters {
+		p := lane.tierWaitOwner
+		lane.tierWaitOwner, lane.tierWaitOn = nil, nil
+		if p.out != nil && s.pipe(p.id) == p && p.out.lane(lane.lane) == lane &&
+			s.writeWorkOn(p, lane) {
+			s.wakeLaneWriter(p, lane)
+		}
+	}
+	clear(blocker.out.tierWaiters)
+	blocker.out.tierWaiters = blocker.out.tierWaiters[:0]
 }
 
 // mpPipeFrames writes PIPE_ACK, PIPE_PING, PIPE_ABANDON and
 // PIPE_STATUS for the pipe.
-func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
+func (s *Session) mpPipeFrames(w *recWriter, p, prim, second *Pipe) {
 	a := p.mp
 	m := s.mp
-	first := a.firstRecord
-	prim, second := s.primary()
+	first, pair := a.firstRecord, m.pairAcks.contains(p)
 	isPrim := p == prim || prim == nil
 	if s.ack != nil {
 		pairOnly := s.ackPairOnly()
 		switch {
-		case first || a.ackPair:
+		case first || pair:
 			// The first record's snapshot, or the answer to a PIPE_PING on
 			// its own pipe pair. Held back whole when
 			// the record is delayed.
 			if !s.ack.writeSnapshot(w, first || pairOnly || isPrim) {
 				return
 			}
-			if a.ackPair {
+			if pair {
 				s.answerPing(p)
 				if isPrim && !pairOnly {
 					s.primaryAckSent(p)
@@ -265,11 +328,13 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 			if !s.ack.writeSnapshot(w, true) {
 				return
 			}
-			m.ackChanged = false
+			m.ackChanged, m.redundantPending = false, false
 			s.writeCreditCopies(w)
 			s.returnLiveness(p)
 		}
-		a.ackPair = false
+		if pair {
+			m.pairAcks.remove(p)
+		}
 	}
 	a.firstRecord = false
 	if a.needPing && a.out != OutFailed && m.pingAllowed(s.now) && s.oldestPingWaiter(p) {
@@ -279,9 +344,6 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 			w.pingWritten = true
 			w.suspPing, a.suspPing = a.suspPing, false
 			s.drawProbe(a, p, false)
-			if s.shp != nil {
-				s.shp.mark(s.now)
-			}
 			m.pingSent(s.now)
 			if a.revalPing {
 				w.revalPing = true
@@ -290,42 +352,48 @@ func (s *Session) mpPipeFrames(w *recWriter, p *Pipe) {
 	}
 	// PIPE_ABANDON for attachments, on this pipe unless it is the one
 	// abandoned and another exists.
-	for _, q := range s.pipes {
+	for i := 0; i < len(m.abandonQ); {
+		q := m.abandonQ[i]
 		qa := q.mp
-		if qa == nil || !qa.abandonQueued || qa.retired {
-			continue
-		}
 		if !s.abandonGoesOn(q, p, prim) {
+			i++
 			continue
 		}
 		code := qa.abandonCode
 		id := q.id
 		n := varint.SizeVarint(wire.TypePipeAbandon) + varint.SizeVarint(id) + varint.SizeVarint(code)
-		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPipeAbandon(b, id, code) }) {
+		if !w.controlFrame(n, true, qa.abandonSent, func(b []byte) []byte { return wire.AppendPipeAbandon(b, id, code) }) {
 			return
 		}
 		w.logFrame(frameDesc{kind: dAbandon, id: id})
-		qa.abandonQueued = false
+		m.abandonQ.removeAt(i)
 		if !qa.abandonSent {
 			qa.abandonSent = true
+			m.control.valid = false
 			w.abandonsSent = append(w.abandonsSent, q)
 		}
 	}
-	for id, code := range m.owedAbandons() {
+	for id, pending := range m.owedAbandons() {
+		code := pending.code
 		n := varint.SizeVarint(wire.TypePipeAbandon) + varint.SizeVarint(id) + varint.SizeVarint(code)
-		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPipeAbandon(b, id, code) }) {
+		if !w.controlFrame(n, true, pending.repeated, func(b []byte) []byte { return wire.AppendPipeAbandon(b, id, code) }) {
 			return
 		}
 		w.logFrame(frameDesc{kind: dAbandonID, id: id, val: code})
 		delete(m.pendAbandon, id)
 	}
-	s.epochProgress()
 	s.writeEpoch(w, p)
 	// PIPE_STATUS requests: only for ACTIVE attachments.
-	for _, q := range s.pipes {
-		if statusReady(q, p) && !s.writeStatus(w, q) {
+	for i := 0; i < len(m.statusQ); {
+		q := m.statusQ[i]
+		if !statusReady(q, p) {
+			i++
+			continue
+		}
+		if !s.writeStatus(w, q) {
 			return
 		}
+		m.statusQ.removeAt(i)
 	}
 }
 
@@ -346,12 +414,7 @@ func (s *Session) ackPairOnly() bool {
 	if s.ack.other || s.ack.pairless || !s.quiet() {
 		return false
 	}
-	for _, q := range s.pipes {
-		if q.mp != nil && q.mp.ackPair && s.answersOnPair(q) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(s.mp.pairAcks, s.answersOnPair)
 }
 
 // answersOnPair reports whether the answer to a PIPE_PING received on p
@@ -365,7 +428,7 @@ func (s *Session) answersOnPair(p *Pipe) bool {
 // primaryAckSent follows a PIPE_ACK on the primary pipe: the redundant
 // copy is due 50 ms later, and the pipe may owe a liveness PIPE_PING.
 func (s *Session) primaryAckSent(p *Pipe) {
-	s.mp.ackChanged = true
+	s.mp.ackChanged, s.mp.redundantPending = true, true
 	s.mp.redundantAt = s.now.Add(50 * Millisecond)
 	s.returnLiveness(p)
 }
@@ -388,6 +451,7 @@ func (s *Session) idleFor(p *Pipe) bool {
 func (s *Session) answerPing(p *Pipe) {
 	if s.idleFor(p) {
 		p.mp.needPing, p.mp.pingSince = true, s.now
+		s.armPathDeadline(p, pathProbe)
 	}
 }
 
@@ -397,6 +461,7 @@ func (s *Session) answerPing(p *Pipe) {
 func (s *Session) returnLiveness(p *Pipe) {
 	if !s.quiet() && s.idleFor(p) {
 		p.mp.needPing, p.mp.pingSince = true, s.now
+		s.armPathDeadline(p, pathProbe)
 	}
 }
 
@@ -408,7 +473,7 @@ func (s *Session) carriesAck(p *Pipe) bool {
 		return true
 	}
 	a := p.mp
-	if a.firstRecord || a.ackPair {
+	if a.firstRecord || s.mp.pairAcks.contains(p) {
 		return true
 	}
 	prim, _ := s.primary()
@@ -423,29 +488,7 @@ func (s *Session) mpWantsWrite(p *Pipe, ol *outLane) bool {
 		return false
 	}
 	if ol.lane == 0 {
-		if a.firstRecord && s.ack != nil && s.ack.hasEntries() || a.ackPair {
-			return true
-		}
-		if a.needPing && s.mp.pingAllowed(s.now) && s.oldestPingWaiter(p) {
-			return true
-		}
-		prim, second := s.primary()
-		if s.ack != nil && s.ack.due(s.now) && (p == prim || prim == nil) && !s.ackPairOnly() {
-			return true
-		}
-		if s.mp.ackChanged && p == second && s.now >= s.mp.redundantAt {
-			return true
-		}
-		for _, q := range s.pipes {
-			if q.mp != nil && !q.mp.retired && (q.mp.abandonQueued && s.abandonGoesOn(q, p, prim) ||
-				statusReady(q, p)) {
-				return true
-			}
-		}
-		if len(s.mp.owedAbandons()) > 0 {
-			return true
-		}
-		if (p == prim || prim == nil) && s.controlPending() {
+		if s.pathControlOn(p) || s.sessionControlOn(p) || s.recordDatagrams(p) {
 			return true
 		}
 	}
@@ -474,6 +517,7 @@ func (s *Session) waitsFor(p *Pipe, ol *outLane) bool {
 func (s *Session) anyStreamOn(p *Pipe, ol *outLane) bool {
 	d := &s.mp.probe
 	s.newDecision(d, p)
+	d.probe = true
 	it := s.sched.iter()
 	for st := it.next(); st != nil; st = it.next() {
 		if !s.canSendNow(st) || !s.onPipe(d, st) {
@@ -511,6 +555,9 @@ func (s *Session) mpAfterBatch(w *recWriter, p *Pipe, ol *outLane, start uint64,
 		// Answered once the batch's end is acknowledged (pingsAcked).
 		w.pingWritten, w.suspPing = false, false
 		a.pingEnds = append(a.pingEnds, p.out.snd.so)
+		if d := &a.health.receive; d.running && d.proof == HealthProofNone && d.probeEnd == 0 {
+			d.probeLane, d.probeEnd = ol.lane, ol.pos
+		}
 	}
 	if w.traffic {
 		s.markBusy()
@@ -530,15 +577,7 @@ func (s *Session) abandonGoesOn(q, p, prim *Pipe) bool {
 // creditPending reports pending credit frames (a PIPE_ACK rides
 // along).
 func (s *Session) creditPending() bool {
-	if s.pend.maxData {
-		return true
-	}
-	for st := s.ctlHead; st != nil; st = st.ctlNext {
-		if st.ctl&ctlMaxStreamData != 0 {
-			return true
-		}
-	}
-	return false
+	return s.pend.maxData || s.creditStreams != 0
 }
 
 // writeCreditCopies copies the latest limits that were sent while the
@@ -546,14 +585,14 @@ func (s *Session) creditPending() bool {
 func (s *Session) writeCreditCopies(w *recWriter) {
 	if s.copyMaxData {
 		v := s.conn.adv
-		if w.frame(1+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendMaxData(b, v) }) {
+		if w.controlFrame(1+varint.SizeVarint(v), true, true, func(b []byte) []byte { return wire.AppendMaxData(b, v) }) {
 			s.copyMaxData = false
 		}
 	}
 	for st := s.copyHead; st != nil; {
 		next := st.copyNext
 		id, v := st.id, st.rcv.adv
-		if w.frame(1+varint.SizeVarint(id)+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendMaxStreamData(b, id, v) }) {
+		if w.controlFrame(1+varint.SizeVarint(id)+varint.SizeVarint(v), true, true, func(b []byte) []byte { return wire.AppendMaxStreamData(b, id, v) }) {
 			s.unlinkCopyMSD(st)
 		}
 		st = next

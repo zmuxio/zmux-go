@@ -58,9 +58,8 @@ func TestAdmittedValue(t *testing.T) {
 	if p, ok := srv.Pipe(0); !ok || p.admittedValue() != "v1" {
 		t.Fatalf("bootstrap pipe value %v", p.admittedValue())
 	}
-	waitUntil(t, 5*time.Second, "the joined pipe at the acceptor", func() bool { _, ok := srv.Pipe(cp.ID()); return ok })
-	sp, ok := srv.Pipe(cp.ID())
-	if !ok || sp.admittedValue() != "v2" {
+	sp := waitTestAttachment(t, ctx, cp, srv)
+	if sp.admittedValue() != "v2" {
 		t.Fatalf("joined pipe value %v", sp.admittedValue())
 	}
 	if cli.admittedValue() != nil || cp.admittedValue() != nil {

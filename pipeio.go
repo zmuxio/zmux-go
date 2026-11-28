@@ -12,6 +12,7 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // Framing is a carrier's record framing.
@@ -36,9 +37,12 @@ type MessageReader interface {
 	// after reading no more than limit+1 of its bytes into memory (the
 	// carrier is then unusable). limit is always positive: zmux never asks
 	// for more than MaxRecordSize, and the admission of a listener asks for
-	// its peek (Admission.Peek, MaxPeek). The caller owns the returned
-	// slice.
-	ReadMessage(limit int) ([]byte, error)
+	// its peek (Admission.Peek, MaxPeek). A successful read transfers
+	// ownership of the message and its backing to the caller. If the
+	// carrier ends together with a complete message, return the owned
+	// message and the terminal error. A failed or incomplete message
+	// returns the zero ReceivedMessage with its error.
+	ReadMessage(limit int) (ReceivedMessage, error)
 }
 
 // MessageWriter is the sending half of a message-framed carrier.
@@ -113,6 +117,12 @@ type PipeIO struct {
 	// zmux only reports it, in pipe events, PipeStats, ShapedPipe and
 	// CarrierCache keys; the host bounds the number of variants.
 	Variant string
+	// ReceiveSource and SendSource describe the actual carrier halves. A zero
+	// identity or route means the adapter cannot prove it.
+	ReceiveSource, SendSource CarrierHalfSource
+	// Liveness supplies per-pipe defaults from the carrier pool. Explicit
+	// PipeOptions.Liveness takes precedence over these defaults.
+	Liveness PipeLiveness
 	// FateGroup is the carrier's own fate group (a carrier pool's pipes on
 	// one connection share one), used when PipeOptions.FateGroup is 0.
 	FateGroup uint64
@@ -133,16 +143,25 @@ type PipeIO struct {
 	// larger value is a cap that the peer's max_record_size and the
 	// implementation's own record limit (MaxRecordSize) reduce further.
 	MaxRecord int
-	// HandshakePadding is the padding bytes a handshake run on the carrier
-	// before this PipeIO added; the session the carrier becomes part of, by
-	// starting it or by joining it, meters it once. 0: none.
-	HandshakePadding uint64
+	// HandshakeWrites transfers proved outbound Establish costs to the session.
+	HandshakeWrites shaping.HandshakeWrites
+	// LanesShareSource attests that lanes use the same physical half as lane zero.
+	LanesShareSource bool
 	Framing          Framing
 	// Carrier is the carrier's kind, which the adapters set on both ends
 	// and a Candidate's dial sets to its Kind; 0 for a carrier of no listed
 	// kind, such as raw TCP or TLS. The session reports it to its
 	// ShaperFactory, in pipe events and in PipeStats.
 	Carrier CarrierKind
+}
+
+// CarrierHalfSource is the adapter's description of one physical half.
+type CarrierHalfSource struct {
+	Route string
+	// FateDomain identifies an independent domain attested by the host.
+	FateDomain string
+	CarrierID  CarrierID
+	Kind       CarrierKind
 }
 
 // MaxWriteOverhead is the largest PipeIO.WriteOverhead.
@@ -159,6 +178,9 @@ const MinMaxRecord = wire.RecordFloor
 // MaxRecord that is neither 0 nor at least MinMaxRecord, or a limit a
 // carrier half reports (CarrierRecordLimit) below MinMaxRecord.
 func (p PipeIO) validate() error {
+	if _, err := p.Liveness.core(); err != nil {
+		return err
+	}
 	if p.WriteOverhead < 0 || p.WriteOverhead > MaxWriteOverhead {
 		return fmt.Errorf("%w: PipeIO.WriteOverhead %d outside [0, %d]", ErrInvalidConfig, p.WriteOverhead, MaxWriteOverhead)
 	}
@@ -250,6 +272,12 @@ type LaneOpener interface {
 	OpenLane(ctx context.Context) (io.WriteCloser, error)
 }
 
+// LaneSource describes the independent physical source of a writer returned
+// by LaneOpener. The source is captured once at handoff.
+type LaneSource interface {
+	LaneSource() CarrierHalfSource
+}
+
 // CarrierConner is a half that names the carrier connection it runs on
 // (comparable), so that the pipes of one connection share lane keys and
 // fate.
@@ -283,6 +311,7 @@ func owned(p PipeIO) PipeIO {
 // (halfCloser.take), the attachment closes it.
 func closePipe(p PipeIO) {
 	if p.own != nil {
+		releasePrefixes(p.R)
 		p.own.Close()
 		return
 	}

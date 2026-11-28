@@ -5,29 +5,28 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
 // Limiter lets an external limiter, budget or meter act on bytes that zmux
 // forwards itself (Splice, SplicePackets, datagrams). The model is reserve,
-// then refund: zmux takes bytes before it moves them and gives back what
-// it did not use. Units are bytes.
+// then refund. A splice charges logical bytes at their first successful
+// local carrier handoff. Session-level datagram limits are independent,
+// so attach a budget at one layer if it should be applied only once.
 //
 // Arguments: maxBytes <= 0 takes nothing and returns 0 at once; minBytes
 // < 1 is taken as 1; minBytes > maxBytes as minBytes = maxBytes. (n, n) is
-// therefore an all-or-nothing request and (1, max) a request for as much
-// as possible. A grant n satisfies min' <= n <= maxBytes, where min' is
-// minBytes, or less when the limiter can never allow minBytes at once (its
-// burst). For an atomic unit requested as (n, n), a successful grant lets
-// the whole unit pass, even when fewer bytes were returned.
+// therefore an exact atomic reservation and (1, max) can grant a prefix.
+// A positive grant is always within the normalized inclusive range. A
+// request beyond the limiter's atomic capacity returns an error immediately.
 //
-// Every method is safe for concurrent use. zmux calls them outside every
-// session lock, never from inside the session core, and never while it
-// holds a buffer of its own in Acquire.
+// Methods are concurrent and run outside session locks. Splice may hold
+// one bounded output while acquiring. Do not wait for the splice to
+// complete a command from inside a limiter method.
 type Limiter interface {
 	// Acquire waits until it can grant. When ctx ends it returns the
 	// cancellation and nothing is taken in net; an error takes nothing
@@ -43,7 +42,7 @@ type Limiter interface {
 }
 
 // guardedLimiter runs a host Limiter on the package's goroutines: a panic
-// or an invalid grant (outside [1, maxBytes]) in Acquire fails the
+// or an invalid grant (outside [minBytes, maxBytes]) in Acquire fails the
 // operation (errLimiterFailed), in TryAcquire counts as nothing taken, and
 // a panic in Refund is ignored; none ends the process. A positive invalid
 // grant is refunded.
@@ -82,9 +81,13 @@ func (g guardedLimiter) Acquire(ctx context.Context, minBytes, maxBytes int64) (
 	}()
 	n, err = g.l.Acquire(ctx, minBytes, maxBytes)
 	if err != nil {
+		if n > 0 {
+			g.Refund(n)
+			return 0, errLimiterFailed
+		}
 		return 0, err
 	}
-	if n < 1 || n > maxBytes {
+	if n < minBytes || n > maxBytes {
 		g.Refund(n)
 		return 0, errLimiterFailed
 	}
@@ -102,7 +105,7 @@ func (g guardedLimiter) TryAcquire(minBytes, maxBytes int64) (n int64, err error
 		}
 	}()
 	n, err = g.l.TryAcquire(minBytes, maxBytes)
-	if n < 0 || n > maxBytes || n > 0 && err != nil {
+	if n < 0 || n > 0 && (n < minBytes || n > maxBytes || err != nil) {
 		g.Refund(n)
 		return 0, errLimiterFailed
 	}
@@ -128,45 +131,78 @@ func (g guardedLimiter) police(n int) (int64, bool) {
 	return got, got > 0
 }
 
-// policeGuarded is police on l, which the splice entry guarded already (it
-// is wrapped here only when a caller passed it unguarded).
-func policeGuarded(l Limiter, n int) (int64, bool) {
-	g, ok := l.(guardedLimiter)
-	if !ok {
-		g = guardedLimiter{l}
+// SpliceLimiter declares the largest atomic reservation a direction can make.
+// MaxBurstBytes returns -1 for unlimited capacity. A zero or insufficient
+// maximum rejects installation before either stream is bound.
+type SpliceLimiter interface {
+	Limiter
+	MaxBurstBytes() int64
+}
+
+func validSpliceBurst(lim SpliceLimiter, required int) (valid bool) {
+	if lim == nil {
+		return true
 	}
-	return g.police(n)
+	defer func() {
+		if recover() != nil {
+			valid = false
+		}
+	}()
+	maximum := lim.MaxBurstBytes()
+	return maximum == -1 || maximum >= int64(required)
 }
 
 // SpliceOptions configure Splice.
 type SpliceOptions struct {
 	// AtoB and BtoA limit the two directions (nil: none).
-	AtoB, BtoA Limiter
-	// Chunk is the most one direction holds at once (64 KiB; a splice
-	// moves data, so 0 has no other meaning).
+	AtoB, BtoA SpliceLimiter
+	// MirrorAtoB and MirrorBtoA observe local policy and output events.
+	MirrorAtoB, MirrorBtoA *SpliceMirror
+	// Event observers run on the direction owner outside session locks.
+	// They must return promptly and must not wait for this splice.
+	// Event observers run on the direction owner. A panic detaches the observer.
+	OnEventAtoB, OnEventBtoA func(SpliceEvent)
+	// TagA and TagB are application labels for the splice endpoints.
+	TagA, TagB string
+	// Hooks are frozen when the splice starts.
+	HooksAtoB, HooksBtoA SpliceHooks
+	// DatagramAtoB and DatagramBtoA apply to their local forwarding hop.
+	DatagramAtoB, DatagramBtoA DatagramSendOptions
+	// Limits bounds the controlled splice and packet assembly.
+	Limits SpliceLimits
+	// Chunk caps each reliable stream read and byte-stream output item.
+	// Zero selects 64 KiB. Reliable capsules have their own size limit.
 	Chunk int
+	// MaxPacketPayload and MaxOpaqueValue bound packet relay input and
+	// replacements. Zero uses the ordinary packet and opaque defaults.
+	MaxPacketPayload, MaxOpaqueValue int
 }
 
 // SpliceDirection is the result of one direction of a splice.
 type SpliceDirection struct {
-	Bytes         uint64 // stream bytes forwarded
-	DatagramBytes uint64 // datagram payload bytes forwarded
-	// DatagramsDropped counts every datagram not forwarded; of them,
-	// DatagramsTooLarge were dropped for their size and DatagramsLimited
-	// were refused by the direction's Limiter or the next session's send
-	// limiter. Splice drops for its size a datagram larger than the next
-	// hop's MaxDatagramPayload. SplicePackets forwards such a datagram as
-	// a capsule instead (DatagramsAsCapsules) and drops for its size only
-	// one larger than DefaultMaxPacket; a capsule it could not write for
-	// another reason (the downstream stream ended or was reset, the splice
-	// ended) counts in DatagramsDropped alone, as does a datagram whose next
-	// session does not use stream datagrams.
-	DatagramsDropped, DatagramsTooLarge, DatagramsLimited uint64
+	// Cause is the original local or upstream error, when available.
+	Cause error
+	// Handoffs accounts for output while splice policy or a direction
+	// limiter is active. It can still settle after the direction returns.
+	Handoffs              *SpliceHandoffs
+	End                   SpliceEnd // how the direction ended
+	InputBytes, HookCalls uint64
+	WaitTime              time.Duration
+	Bytes                 uint64 // stream bytes forwarded
+	CompleteOutputBytes   uint64 // reliable bytes through the last complete output unit
+	DatagramBytes         uint64 // datagram payload bytes forwarded
+	// Drops counts one reason per locally discarded datagram group.
+	Drops                                                                            map[SpliceDropReason]uint64
+	QueuedBytes, DelayedDatagrams, FallbackGroups, GroupPeakBytes, OutputDescriptors int
+	PayloadCopyBytes, EncodeBytes, MirrorCopyBytes                                   uint64
+	SourceBatches, WaitTimers, ReservedBytes                                         uint64
+	LiveGroupRoots, DatagramCleanupInUse                                             int
 	// DatagramsAsCapsules counts the datagrams SplicePackets forwarded
 	// as DATAGRAM capsules on the stream, once written whole (their
 	// payload is in DatagramBytes); 0 for Splice.
-	DatagramsAsCapsules uint64
-	End                 SpliceEnd // how the direction ended
+	DatagramsAsCapsules                                uint64
+	InputUnits, OutputUnits, HookDropped, HookReplaced uint64
+	MirrorDropped                                      uint64
 }
 
 // SpliceEndKind is the event that ended a direction of a splice.
@@ -181,6 +217,10 @@ const (
 	SpliceDownstreamLost                      // the downstream stream's session closed or was lost
 	SpliceCancelled                           // ctx ended, with Code
 	SpliceLimiterFailed                       // the direction's Limiter failed in Acquire
+	SpliceHookReset
+	SpliceHookFailed
+	SplicePacketError
+	SpliceWaitTimeout
 )
 
 // String returns the kind's name ("finished").
@@ -193,13 +233,21 @@ func (k SpliceEndKind) String() string {
 	case SpliceStopped:
 		return "stopped"
 	case SpliceUpstreamLost:
-		return "upstream lost"
+		return "upstream_lost"
 	case SpliceDownstreamLost:
-		return "downstream lost"
+		return "downstream_lost"
 	case SpliceCancelled:
 		return "cancelled"
 	case SpliceLimiterFailed:
-		return "limiter failed"
+		return "limiter_failed"
+	case SpliceHookReset:
+		return "hook_reset"
+	case SpliceHookFailed:
+		return "hook_failed"
+	case SplicePacketError:
+		return "packet_error"
+	case SpliceWaitTimeout:
+		return "wait_timeout"
 	}
 	return "SpliceEndKind(?)"
 }
@@ -207,8 +255,8 @@ func (k SpliceEndKind) String() string {
 // SpliceEnd is how a direction of a splice ended; Code is the
 // application error code of SpliceReset and SpliceStopped, which travels
 // unchanged to the other side, that of the context's cause for
-// SpliceCancelled (ZMUX_CANCELLED, the code of the reset, for a plain cancel or
-// a deadline), and 0 for the other kinds. SpliceLimiterFailed resets the
+// SpliceCancelled (ZMUX_CANCELLED for a plain cancel or deadline), or the
+// code for SpliceHookReset and SplicePacketError. Other kinds use zero. SpliceLimiterFailed resets the
 // downstream and stops the upstream with ZMUX_CANCELLED; the other
 // direction goes on.
 type SpliceEnd struct {
@@ -219,10 +267,14 @@ type SpliceEnd struct {
 // String returns the end's kind, with its code for a reset, a stop or a
 // cancellation ("reset 0x77").
 func (e SpliceEnd) String() string {
-	if e.Kind == SpliceReset || e.Kind == SpliceStopped || e.Kind == SpliceCancelled {
+	if e.hasCode() {
 		return fmt.Sprintf("%v %#x", e.Kind, uint64(e.Code))
 	}
 	return e.Kind.String()
+}
+
+func (e SpliceEnd) hasCode() bool {
+	return e.Kind == SpliceReset || e.Kind == SpliceStopped || e.Kind == SpliceCancelled || e.Kind == SpliceHookReset
 }
 
 // isCtxErr reports whether err is the end of a context.
@@ -248,7 +300,7 @@ func spliceEnd(ctx context.Context, err error, write bool) SpliceEnd {
 	return SpliceEnd{Kind: SpliceUpstreamLost}
 }
 
-// SpliceResult is the result of Splice.
+// SpliceResult is the result of a bidirectional splice.
 type SpliceResult struct {
 	AtoB, BtoA SpliceDirection
 }
@@ -274,132 +326,139 @@ var errSpliceSelf = errors.New("zmux: cannot splice a stream into itself")
 // (StreamCancelled) and stop the upstream receiving sides with 0, and Code is
 // ZMUX_CANCELLED.
 func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResult, error) {
-	if a == nil || b == nil {
-		return SpliceResult{}, net.ErrClosed
+	if opts != nil && (!opts.HooksAtoB.empty() || !opts.HooksBtoA.empty() ||
+		opts.OnEventAtoB != nil || opts.OnEventBtoA != nil || opts.MirrorAtoB != nil || opts.MirrorBtoA != nil || opts.AtoB != nil || opts.BtoA != nil) {
+		relay, err := startSplice(ctx, a, b, opts, false, false)
+		if err != nil {
+			return SpliceResult{}, err
+		}
+		return relay.Wait(context.Background())
 	}
-	if a == b || a.h == b.h {
-		return SpliceResult{}, errSpliceSelf
+	return splice(ctx, a, b, opts)
+}
+
+// splice keeps the static byte forwarding path free of control work.
+func splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResult, error) {
+	o, err := normalizeSplice(a, b, opts)
+	if err != nil {
+		return SpliceResult{}, err
 	}
-	// The handles are used through their inner state: keep the wrappers
-	// (whose collection resets the streams) alive until the splice ends.
+	limits, err := o.Limits.defaults((spliceUnitSizes{o.Chunk, o.MaxPacketPayload, o.MaxOpaqueValue}).largest(false))
+	if err != nil {
+		return SpliceResult{}, err
+	}
+	for _, h := range [...]*handle{a.h, b.h} {
+		var resetAt bool
+		h.c.peek(func() { resetAt = h.c.s.SpliceResetAt() })
+		if !resetAt {
+			relay, err := startSplice(ctx, a, b, &o, false, false)
+			if err != nil {
+				return SpliceResult{}, err
+			}
+			return relay.Wait(context.Background())
+		}
+	}
+	if err := bindSplice(a.h, b.h); err != nil {
+		return SpliceResult{}, err
+	}
+	defer unbindSplice(a.h, b.h)
 	defer runtime.KeepAlive(a)
 	defer runtime.KeepAlive(b)
-	var o SpliceOptions
-	if opts != nil {
-		o = *opts
-	}
-	if o.Chunk < 0 {
-		return SpliceResult{}, fmt.Errorf("%w: negative SpliceOptions.Chunk", ErrInvalidConfig)
-	}
-	if o.Chunk == 0 {
-		o.Chunk = 64 << 10
-	}
-	o.AtoB, o.BtoA = guardLimiter(o.AtoB), guardLimiter(o.BtoA) // host code on the splice's goroutines
+	directions := [...]struct {
+		r, w    *Stream
+		options DatagramSendOptions
+	}{{a, b, o.DatagramAtoB}, {b, a, o.DatagramBtoA}}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var ab, ba SpliceDirection
-	var dgs SpliceResult // datagram counts, merged at the end
-	var wg sync.WaitGroup
-	wg.Go(func() { ab = spliceDir(ctx, a, b, o.Chunk, o.AtoB) })
-	wg.Go(func() { ba = spliceDir(ctx, b, a, o.Chunk, o.BtoA) })
-	dg := spliceDatagrams(ctx, a, b, &dgs, o)
-	wg.Wait()
+	var reliable, datagrams sync.WaitGroup
+	var result, dgResult [2]SpliceDirection
+	for i, direction := range directions {
+		r, w := direction.r, direction.w
+		if !r.h.c.ConnectionState().SupportsDatagrams.Local {
+			reliable.Go(func() { result[i] = spliceDir(ctx, r, w, o.Chunk) })
+			continue
+		}
+		dgCtx, stopDatagrams := context.WithCancel(ctx)
+		reliable.Go(func() {
+			result[i] = spliceDir(ctx, r, w, o.Chunk)
+			if result[i].End.Kind != SpliceFinished {
+				stopDatagrams()
+			}
+		})
+		datagrams.Go(func() {
+			defer stopDatagrams()
+			spliceDatagramDir(dgCtx, r, w, &dgResult[i], direction.options, o.MaxPacketPayload, limits.BackingBytes)
+		})
+	}
+	reliable.Wait()
 	cancel()
-	dg.Wait()
-	ab.mergeDatagrams(&dgs.AtoB)
-	ba.mergeDatagrams(&dgs.BtoA)
-	return SpliceResult{AtoB: ab, BtoA: ba}, nil
+	datagrams.Wait()
+	for i := range result {
+		result[i].mergeDatagrams(&dgResult[i])
+	}
+	return SpliceResult{AtoB: result[0], BtoA: result[1]}, nil
 }
 
 // mergeDatagrams copies the datagram counts of d into the direction.
 func (s *SpliceDirection) mergeDatagrams(d *SpliceDirection) {
-	s.DatagramBytes, s.DatagramsDropped = d.DatagramBytes, d.DatagramsDropped
-	s.DatagramsTooLarge, s.DatagramsLimited = d.DatagramsTooLarge, d.DatagramsLimited
+	s.DatagramBytes, s.Drops = d.DatagramBytes, d.Drops
 	s.DatagramsAsCapsules = d.DatagramsAsCapsules
+	s.PayloadCopyBytes += d.PayloadCopyBytes
 }
 
-// spliceDir forwards r's receiving part to w's sending part.
-func spliceDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter) SpliceDirection {
+// spliceDir is the static byte forwarding path. It probes credit before
+// borrowing a chunk and transfers that reference straight to the target.
+func spliceDir(ctx context.Context, r, w *Stream, chunk int) SpliceDirection {
 	var d SpliceDirection
 	for {
-		_, eof, stop := spliceStep(ctx, r, w, chunk, lim, 1<<62, &d)
-		if stop {
+		if err := ctx.Err(); err != nil {
+			spliceAbort(ctx, r, w, err)
+			d.Cause = err
+			d.End = spliceEnd(ctx, err, false)
 			return d
 		}
-		if eof {
-			_ = w.h.close()
-			return d
+		n, end, werr, err := r.h.waitReadable(ctx, w.h)
+		if werr == nil && err == nil && !end {
+			n, werr = w.h.waitSendCapacity(ctx, min(uint64(chunk), n, 16<<10))
 		}
-	}
-}
-
-// spliceStep forwards one chunk of at most limit bytes from r to w and
-// counts it in d. eof reports r's FIN (w is not finished); stop that the
-// direction ended otherwise, with both sides ended and d.End set.
-func spliceStep(ctx context.Context, r, w *Stream, chunk int, lim Limiter, limit uint64, d *SpliceDirection) (int, bool, bool) {
-	n, end, werr, err := r.h.waitReadable(ctx, w.h)
-	if werr != nil {
-		spliceWriteErr(ctx, r, w, werr)
-		d.End = spliceEnd(ctx, werr, true)
-		return 0, false, true
-	}
-	if err != nil {
-		spliceAbort(ctx, r, w, err)
-		d.End = spliceEnd(ctx, err, false)
-		return 0, false, true
-	}
-	var want int
-	var granted int64
-	if !end {
-		// Step 1: w's capacity for at least min(chunk, readable, 16 KiB).
-		need := min(uint64(chunk), n, 16<<10, limit)
-		capy, err := w.h.waitSendCapacity(ctx, need)
-		if err != nil {
-			spliceWriteErr(ctx, r, w, err)
-			d.End = spliceEnd(ctx, err, true)
-			return 0, false, true
-		}
-		want = int(min(capy, uint64(chunk), limit))
-		if lim != nil {
-			// Step 2: r is readable and nothing was consumed; reserve
-			// at least one byte, at most what is readable.
-			granted, err = lim.Acquire(ctx, 1, int64(min(uint64(want), n)))
-			if err != nil {
-				d.End = spliceAcquireFailed(ctx, r, w, err)
-				return 0, false, true
-			}
-			want = int(granted)
-		}
-	}
-	// Step 3: r has want bytes readable (or its end), so this does not
-	// block; at most the grant is taken.
-	ch, err := r.h.readChunk(ctx, max(want, 1))
-	// A chunk carries the bytes read before an error, as io.Reader does.
-	//goland:noinspection GoDfaErrorMayBeNotNil
-	m := len(ch.Data)
-	if lim != nil {
-		lim.Refund(granted - int64(m)) // step 4: granted and not forwarded
-	}
-	if m > 0 {
-		if werr := w.h.writeChunk(ctx, ch); werr != nil {
-			if lim != nil {
-				lim.Refund(int64(m)) // read, not forwarded
-			}
+		if werr != nil {
 			spliceWriteErr(ctx, r, w, werr)
+			d.Cause = werr
 			d.End = spliceEnd(ctx, werr, true)
-			return 0, false, true
+			return d
 		}
-		d.Bytes += uint64(m)
+		if err != nil {
+			spliceAbort(ctx, r, w, err)
+			d.Cause = err
+			d.End = spliceEnd(ctx, err, false)
+			return d
+		}
+		ch, err := r.h.readChunk(ctx, max(1, int(min(uint64(chunk), n))))
+		if len(ch.Data) != 0 {
+			wrote, werr := w.h.writeChunkProgress(ctx, ch)
+			d.Bytes += uint64(wrote)
+			if werr != nil {
+				spliceWriteErr(ctx, r, w, werr)
+				d.Cause = werr
+				d.End = spliceEnd(ctx, werr, true)
+				return d
+			}
+		}
+		switch {
+		case errors.Is(err, io.EOF):
+			if werr := w.h.close(); werr != nil {
+				spliceWriteErr(ctx, r, w, werr)
+				d.Cause = werr
+				d.End = spliceEnd(ctx, werr, true)
+			}
+			return d
+		case err != nil:
+			spliceReadErr(ctx, r, w, err)
+			d.Cause = err
+			d.End = spliceEnd(ctx, err, false)
+			return d
+		}
 	}
-	switch {
-	case errors.Is(err, io.EOF):
-		return m, true, false
-	case err != nil:
-		spliceReadErr(ctx, r, w, err)
-		d.End = spliceEnd(ctx, err, false)
-		return m, false, true
-	}
-	return m, false, false
 }
 
 // spliceReadErr ends w after r's end other than FIN.
@@ -454,20 +513,6 @@ func spliceAbort(ctx context.Context, r, w *Stream, err error) {
 	w.h.cancelWrite(code)
 }
 
-// spliceAcquireFailed ends a direction whose Limiter.Acquire returned err:
-// a cancellation of ctx as such, any other error (the limiter's own, a
-// panic or an invalid grant) with SpliceLimiterFailed, w reset and r
-// stopped with ZMUX_CANCELLED; the other direction goes on.
-func spliceAcquireFailed(ctx context.Context, r, w *Stream, err error) SpliceEnd {
-	if ctx.Err() != nil && isCtxErr(err) {
-		spliceAbort(ctx, r, w, err)
-		return SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
-	}
-	r.h.cancelRead(StreamCancelled)
-	w.h.cancelWrite(StreamCancelled)
-	return SpliceEnd{Kind: SpliceLimiterFailed}
-}
-
 // waitReadable waits until the receiving part has bytes, or its end is
 // due at once (end true); the first error is w's, the second ctx's. The
 // wait also ends at once when w, the sending part the bytes go to, can no
@@ -506,75 +551,44 @@ func (h *handle) waitReadable(ctx context.Context, w *handle) (uint64, bool, err
 	}
 }
 
-// spliceDatagrams forwards the streams' datagrams to each other when they
-// have datagram flows, through each direction's limiter (TryAcquire(n, n),
-// refunded if not sent), without a queue of its own.
-func spliceDatagrams(ctx context.Context, a, b *Stream, res *SpliceResult, o SpliceOptions) *sync.WaitGroup {
-	var wg sync.WaitGroup
-	// A direction reads the datagrams its source session can receive. One
-	// whose next session does not use stream datagrams (not in use) counts
-	// them in DatagramsDropped alone: not for their size.
-	fwd := func(r, w *Stream, d *SpliceDirection, lim Limiter) {
-		defer wg.Done()
-		if !r.h.c.ConnectionState().SupportsDatagrams.Local {
-			return
+// spliceDatagramDir transfers each owned datagram directly to the target.
+func spliceDatagramDir(ctx context.Context, r, w *Stream, d *SpliceDirection, opts DatagramSendOptions, maxPayload, backing int) {
+	for ctx.Err() == nil {
+		var in core.SpliceDatagramInput
+		err := r.h.waitDatagram(ctx, func() bool {
+			var ok bool
+			in, ok = r.h.c.s.TakeSpliceDatagram(r.h.st, maxPayload, core.SpliceReadBudget{Remaining: backing})
+			return ok
+		})
+		if err != nil {
+			break
 		}
-		for {
-			cx, p, err := r.h.receiveDatagram(ctx)
-			if err != nil {
-				return
-			}
-			switch spliceSendDatagram(w, d, lim, cx, p) {
-			case datagramSent:
-				continue
-			case datagramTooLarge:
-				d.DatagramsTooLarge++
-			case datagramLimited:
-				d.DatagramsLimited++
-			case datagramFailed:
-			}
-			d.DatagramsDropped++
+		if in.TooLarge {
+			d.countDrop(SpliceDropTooLarge)
+			continue
 		}
-	}
-	wg.Add(2)
-	go fwd(a, b, &res.AtoB, o.AtoB)
-	go fwd(b, a, &res.BtoA, o.BtoA)
-	return &wg
-}
-
-// datagramOutcome is what became of a forwarded datagram.
-type datagramOutcome uint8
-
-const (
-	datagramSent     datagramOutcome = iota
-	datagramTooLarge                 // above the next hop's MaxDatagramPayload
-	datagramLimited                  // refused by a limiter
-	datagramFailed                   // not sent for another reason
-)
-
-// spliceSendDatagram sends a forwarded datagram on w through the
-// direction's limiter, counting its bytes in d when it was sent.
-func spliceSendDatagram(w *Stream, d *SpliceDirection, lim Limiter, cx uint64, p []byte) datagramOutcome {
-	var granted int64
-	if lim != nil {
-		var ok bool
-		if granted, ok = policeGuarded(lim, len(p)); !ok {
-			return datagramLimited
+		h := w.h
+		n := len(in.Data)
+		at, options := h.c.clk.now(), h.c.clk.datagramOptions(opts)
+		if in.Expires != 0 {
+			h.c.peek(func() { options = h.c.s.DatagramOptions(h.st, options) })
+			hop, _ := options.ResolveDeadline(at)
+			options.DeadlineMode = core.DatagramDeadlineAt
+			options.Deadline = min(hop, at.Add(in.Expires.Sub(r.h.c.clk.now())))
 		}
+		d.PayloadCopyBytes += uint64(in.Copied)
+		admission, err := h.c.admitDatagram(ctx, core.DatagramRequest{
+			Stream: h.st, Context: in.Context, Payload: in.Data, Backing: in.Backing, Owned: true,
+			Options: options, At: at, PayloadCopied: &d.PayloadCopyBytes,
+		})
+		in.Lease.Release()
+		if in.Backing != nil {
+			in.Backing.Unref()
+		}
+		if admission == core.DatagramQueued {
+			d.DatagramBytes += uint64(n)
+			continue
+		}
+		d.countDrop(spliceDropFor(err))
 	}
-	limited, err := w.h.c.sendDatagramLimited(w.h.st, cx, p)
-	if lim != nil && (limited || err != nil) {
-		lim.Refund(granted) // not sent
-	}
-	var tl *DatagramTooLargeError
-	switch {
-	case limited:
-		return datagramLimited
-	case errors.As(err, &tl):
-		return datagramTooLarge
-	case err != nil:
-		return datagramFailed
-	}
-	d.DatagramBytes += uint64(len(p))
-	return datagramSent
 }

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"cmp"
 	"slices"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -15,8 +16,9 @@ import (
 // class is the usable class of one moment: failover to standby pipes,
 // and whether pipes in probation or awaiting revalidation count.
 type class struct {
-	standby bool
-	probOK  bool
+	standby       bool
+	probOK        bool
+	holdReturning bool
 }
 
 // tierInfo is one usable tier of a gate.
@@ -34,9 +36,11 @@ type gate struct {
 	pipes        []*Pipe // usable pipes, tier by tier, in attachment order within a tier
 	tiers        []tierInfo
 	quality      []pathEstimate // lazy snapshot, indexed like pipes
-	last         int            // index of the least-preferred eligible tier
-	fed          int            // index of the least-preferred tier offered excess data
+	oldest       Time
+	last         int // index of the least-preferred eligible tier
+	fed          int // index of the least-preferred tier offered excess data
 	cls          class
+	dataWaiting  bool
 	allSat       bool
 	affinityOnly bool // cascade capacity is limited to the active pipe of each tier
 }
@@ -66,13 +70,39 @@ func (g *gate) admits(s *Session, p *Pipe) bool {
 }
 
 // inProbation reports whether a pipe's probation is running.
+func (a *attach) awaitingFailback() bool {
+	return a.health.send.generation > 1 && !a.health.snapshot.Send.Settled
+}
+
 func (a *attach) inProbation() bool { return a.prob.on }
+
+// maySend is the common outbound protocol gate. Control retains its
+// existing allowance for live pre-confirmation, suspect and drain lanes.
+func maySend(p *Pipe, control bool) bool {
+	if p == nil || p.out == nil || p.out.failed {
+		return false
+	}
+	a := p.mp
+	if a == nil {
+		return true
+	}
+	return !a.hs && !a.retired && !a.topologyOut &&
+		(a.out == OutActive || control && a.liveOut())
+}
+
+func mayReceive(p *Pipe) bool {
+	if p == nil || p.in == nil || p.in.ended {
+		return false
+	}
+	a := p.mp
+	return a == nil || !a.hs && !a.retired && !a.draining && !a.topologyIn && a.in == InOpen
+}
 
 // pipeUsable reports whether an outbound pipe is usable for data; probOK
 // lets pipes in probation or awaiting revalidation count.
 func (s *Session) pipeUsable(p *Pipe, probOK bool) bool {
 	a := p.mp
-	if a == nil || p.out == nil || p.out.failed || a.out != OutActive || a.retired {
+	if a == nil || !maySend(p, false) {
 		return false
 	}
 	return !a.penalized && (probOK || !a.inProbation() && !a.reval)
@@ -83,24 +113,63 @@ func (s *Session) classUsable(c class, p *Pipe) bool {
 		return false
 	}
 	_, sb := p.mp.effPrio()
-	return sb == c.standby && s.pipeUsable(p, c.probOK)
+	return sb == c.standby && s.pipeUsable(p, c.probOK) && (!c.holdReturning || !p.mp.awaitingFailback())
 }
 
 // usableClass returns the class of this moment; ok is false when no pipe
 // is usable.
 func (s *Session) usableClass() (class, bool) {
-	hasClass := func(c class) bool {
-		for _, p := range s.pipes {
-			if s.classUsable(c, p) {
-				return true
-			}
+	var active, settled [2]bool
+	var holdReturning bool
+	for _, p := range s.pipes {
+		if p.mp != nil && p.mp.health.snapshot.Send.Settled && s.pipeUsable(p, false) {
+			holdReturning = true
+			break
 		}
-		return false
 	}
-	settled := hasClass(class{false, false}) || hasClass(class{true, false})
-	c := class{probOK: !settled}
-	c.standby = !hasClass(class{false, c.probOK})
-	return c, hasClass(c)
+	for _, p := range s.pipes {
+		if !s.pipeUsable(p, true) {
+			continue
+		}
+		_, standby := p.mp.effPrio()
+		i := b2i(standby)
+		active[i] = true
+		if !p.mp.inProbation() && !p.mp.reval && (!holdReturning || !p.mp.awaitingFailback()) {
+			if !standby {
+				return class{holdReturning: holdReturning}, true
+			}
+			settled[i] = true
+		}
+	}
+	if settled[1] {
+		return class{standby: true, holdReturning: holdReturning}, true
+	}
+	return class{standby: !active[0], probOK: true}, active[0] || active[1]
+}
+
+func (m *multiPath) invalidateCandidates() {
+	clear(m.candidateOrder)
+	m.candidateOrder = m.candidateOrder[:0]
+	m.candidatesValid = false
+}
+
+func (s *Session) orderedCandidates() []*Pipe {
+	m := s.mp
+	if m.candidatesValid && m.candidateGen == m.stateGen && len(m.candidateOrder) == len(s.pipes) {
+		return m.candidateOrder
+	}
+	m.invalidateCandidates()
+	m.candidateOrder = append(m.candidateOrder, s.pipes...)
+	slices.SortStableFunc(m.candidateOrder, func(a, b *Pipe) int {
+		if a.mp == nil || b.mp == nil {
+			return b2i(a.mp == nil) - b2i(b.mp == nil)
+		}
+		pa, _ := a.mp.effPrio()
+		pb, _ := b.mp.effPrio()
+		return cmp.Compare(pa, pb)
+	})
+	m.candidateGen, m.candidatesValid = m.stateGen, true
+	return m.candidateOrder
 }
 
 // rateOf is R_p of an outbound pipe.
@@ -151,6 +220,15 @@ func (s *Session) laneOpen(p *Pipe, ol *outLane) bool {
 // storage (a decision its own, one-shot readers the session's scratch
 // gate), so building one never changes a gate another holder still reads.
 func (s *Session) buildGate(g *gate) *gate {
+	return s.buildGateFor(g, nil, 0, 0)
+}
+
+// buildGateFor is the common tier cascade. An original datagram contributes
+// its bytes and age to the offered work, and masks pipes it cannot use.
+func (s *Session) buildGateFor(g *gate, datagram *outDgram, size int, carrier uint8) *gate {
+	if s.workProbe != nil {
+		s.workProbe.gates++
+	}
 	c, ok := s.usableClass()
 	if !ok {
 		return nil
@@ -159,23 +237,12 @@ func (s *Session) buildGate(g *gate) *gate {
 	g.pipes = g.pipes[:0]
 	g.tiers = g.tiers[:0]
 	g.quality = g.quality[:0]
-	for _, p := range s.pipes {
-		if s.classUsable(c, p) {
+	for _, p := range s.orderedCandidates() {
+		if s.classUsable(c, p) && (datagram == nil || s.datagramFitsCarrier(p, size, carrier)) {
 			g.pipes = append(g.pipes, p)
 		}
 	}
-	slices.SortStableFunc(g.pipes, func(a, b *Pipe) int {
-		pa, _ := a.mp.effPrio()
-		pb, _ := b.mp.effPrio()
-		switch {
-		case pa < pb:
-			return -1
-		case pa > pb:
-			return 1
-		}
-		return 0
-	})
-	g.affinityOnly = s.cfg.Policy == PolicySessionAffinity
+	g.affinityOnly = datagram == nil && s.cfg.Policy == PolicySessionAffinity
 	base := s.owdBase()
 	for lo := 0; lo < len(g.pipes); {
 		pr, _ := g.pipes[lo].mp.effPrio()
@@ -198,11 +265,19 @@ func (s *Session) buildGate(g *gate) *gate {
 	}
 	// The cascade: only multi-tier gates need the
 	// offered data and its age.
-	g.last, g.fed, g.allSat = 0, 0, false
+	g.last, g.fed, g.allSat, g.dataWaiting = 0, 0, false, false
 	if len(g.tiers) == 1 {
 		return g
 	}
 	x, oldest, has, spreadETA := s.waitingData()
+	g.oldest, g.dataWaiting = oldest, has
+	if datagram != nil {
+		x += uint64(size)
+		if !has || datagram.at < oldest {
+			oldest = datagram.at
+		}
+		has, spreadETA = true, true
+	}
 	if spreadETA {
 		g.affinityOnly = false
 		s.gateQuality(g)
@@ -259,25 +334,34 @@ func (s *Session) buildGate(g *gate) *gate {
 // tier that is eligible only because data waited longer than D takes data
 // only while no pipe of a more-preferred tier can take bytes.
 func (s *Session) takes(g *gate, p *Pipe) bool {
+	takes, _ := s.tierRequirement(g, p)
+	return takes
+}
+
+// tierRequirement returns the open, preferred path preventing a lower
+// tier from taking a chunk. A concrete waiter can subscribe to that path.
+func (s *Session) tierRequirement(g *gate, p *Pipe) (bool, *Pipe) {
 	if !g.admits(s, p) {
-		return false
+		return false, nil
 	}
 	ti := g.tierOf(p)
 	if ti <= g.fed {
-		return true
+		return true, nil
 	}
 	for i := range ti {
 		if g.affinityOnly {
-			if s.open(g.tiers[i].active) {
-				return false
+			if q := g.tiers[i].active; s.open(q) {
+				return false, q
 			}
 			continue
 		}
-		if slices.ContainsFunc(g.tierPipes(i), s.open) {
-			return false
+		for _, q := range g.tierPipes(i) {
+			if s.open(q) {
+				return false, q
+			}
 		}
 	}
-	return true
+	return true, nil
 }
 
 // tierMark is when a tier last became eligible.
@@ -297,9 +381,14 @@ func (m *multiPath) eligibleSince(prio uint64) (Time, bool) {
 
 // refreshTiers records since when each eligible tier is eligible and
 // reports saturation changes (at most one event per tier per second).
-func (s *Session) refreshTiers() {
+func (s *Session) refreshTierPlacement() {
+	if s.sched.mask != 0 || len(s.mp.satRep) != 0 {
+		s.refreshTiers(s.buildGate(&s.mp.gateBuf))
+	}
+}
+
+func (s *Session) refreshTiers(g *gate) {
 	m := s.mp
-	g := s.buildGate(&m.gateBuf)
 	keep := m.tierSince[:0]
 	if g != nil {
 		for i := 0; i <= g.last; i++ {
@@ -319,6 +408,7 @@ func (s *Session) refreshTiers() {
 	m.tierSince = keep
 	s.reportSaturation(g)
 	s.checkTakeover()
+	m.tierAt = s.tierDeadline(g)
 }
 
 type satReport struct {
@@ -375,13 +465,14 @@ func (s *Session) reportSaturation(g *gate) {
 }
 
 // tierDeadline is the next moment the age test can change a decision.
-func (s *Session) tierDeadline() Time {
+func (s *Session) tierDeadline(g *gate) Time {
 	m := s.mp
 	if len(m.tierSince) == 0 && len(m.satRep) == 0 {
 		return Never
 	}
 	next := Never
-	if _, oldest, has, _ := s.waitingData(); has {
+	if g != nil && g.dataWaiting {
+		oldest := g.oldest
 		d := s.cfg.OverflowDelay
 		next = minT(next, oldest.Add(d))
 		for _, t := range m.tierSince {
@@ -510,24 +601,31 @@ func (s *Session) SetPipe(id uint64, o PipeSettings) error {
 	}
 	if o.Probation != nil {
 		a.probOpt = *o.Probation
+		s.armPathDeadline(p, pathProbationEnd)
+		s.armPathDeadline(p, pathProbationProbe)
 		if s.probationBase(p) < 0 && a.prob.on {
 			a.prob.on = false
 		}
 	}
 	if o.Liveness != nil {
 		a.live = *o.Liveness
+		s.refreshPathDeadlines(p)
 	}
 	if wasProbation != a.prob.on {
+		s.syncPipeHealth(p)
 		s.capacityChanged()
 	}
 	if req {
 		s.requestStatus(p)
 	}
 	if ap, as := a.effPrio(); ap != bp || as != bs || a.weight != bw {
+		s.mp.control.valid = false
+		s.mp.invalidateCandidates()
 		s.emitPriority(p)
 		s.pickChanged()
 	}
 	s.checkTakeover()
+	s.refreshProbeDeadlines()
 	s.wakeAllWriters()
 	return nil
 }
@@ -562,8 +660,7 @@ func (s *Session) requestStatus(p *Pipe) {
 	if len(a.statusQ) >= statusOwedMax {
 		a.statusQ = a.statusQ[1:]
 	}
-	a.statusQ = append(a.statusQ, statusReq{a.statusSeq, a.recvStandby && !a.takeover, a.recvPrio})
-	s.wakeAllWriters()
+	s.queueStatus(p, a.statusSeq)
 }
 
 // statusLost re-queues the latest request after its frame was lost.
@@ -576,6 +673,14 @@ func (s *Session) statusLost(p *Pipe, seq uint64) {
 		if r.seq == seq {
 			return
 		}
+	}
+	s.queueStatus(p, seq)
+}
+
+func (s *Session) queueStatus(p *Pipe, seq uint64) {
+	a := p.mp
+	if len(a.statusQ) == 0 {
+		s.mp.statusQ.add(p)
 	}
 	a.statusQ = append(a.statusQ, statusReq{seq, a.recvStandby && !a.takeover, a.recvPrio})
 	s.wakeAllWriters()
@@ -600,9 +705,12 @@ func (s *Session) onPipeStatus(f *wire.Frame) *wire.Error {
 	a.peerSeq = f.Seq
 	a.peerPrio, a.peerStandby = f.Priority, f.Status == 1
 	if ap, as := a.effPrio(); ap != bp || as != bs {
+		m.control.valid = false
+		m.invalidateCandidates()
 		s.emitPriority(q)
 	}
 	s.checkTakeover()
+	s.refreshProbeDeadlines()
 	s.wakeAllWriters()
 	return nil
 }
@@ -642,9 +750,10 @@ func (s *Session) writeStatus(w *recWriter, q *Pipe) bool {
 			st = 1
 		}
 		n := 4 + varint.SizeVarint(id) + varint.SizeVarint(r.seq) + varint.SizeVarint(st) + varint.SizeVarint(r.prio)
-		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPipeStatus(b, id, r.seq, st, r.prio) }) {
+		if !w.controlFrame(n, true, r.seq <= qa.statusWritten, func(b []byte) []byte { return wire.AppendPipeStatus(b, id, r.seq, st, r.prio) }) {
 			return false
 		}
+		qa.statusWritten = max(qa.statusWritten, r.seq)
 		w.logFrame(frameDesc{kind: dStatus, id: id, val: r.seq})
 		qa.statusQ = qa.statusQ[1:]
 	}

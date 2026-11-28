@@ -10,7 +10,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
 )
 
@@ -19,15 +18,15 @@ import (
 // the session's close, with any code, is success; ctx ending is ctx's error.
 func TestServeReportsSessionEnd(t *testing.T) {
 	for _, c := range []struct {
-		close func(sess *webtransport.Session, cancel context.CancelFunc)
+		close func(sess *Session, cancel context.CancelFunc)
 		want  func(error) bool
 		name  string
 	}{
-		{name: "closed by the peer", close: func(s *webtransport.Session, _ context.CancelFunc) { _ = s.CloseWithError(0, "") },
+		{name: "closed by the peer", close: func(s *Session, _ context.CancelFunc) { _ = s.CloseWithError(0, "") },
 			want: func(err error) bool { return err == nil }},
-		{name: "closed by the peer with a code", close: func(s *webtransport.Session, _ context.CancelFunc) { _ = s.CloseWithError(7, "bye") },
+		{name: "closed by the peer with a code", close: func(s *Session, _ context.CancelFunc) { _ = s.CloseWithError(7, "bye") },
 			want: func(err error) bool { return err == nil }},
-		{name: "stopped by ctx", close: func(_ *webtransport.Session, cancel context.CancelFunc) { cancel() },
+		{name: "stopped by ctx", close: func(_ *Session, cancel context.CancelFunc) { cancel() },
 			want: func(err error) bool { return errors.Is(err, context.Canceled) }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -41,8 +40,7 @@ func TestServeReportsSessionEnd(t *testing.T) {
 			defer func() { _ = pc.Close() }()
 			h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
 				QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
-			webtransport.ConfigureHTTP3Server(h3)
-			ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
+			ws := &Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			sctx, scancel := context.WithCancel(ctx)
@@ -58,7 +56,8 @@ func TestServeReportsSessionEnd(t *testing.T) {
 			})
 			go func() { _ = ws.Serve(pc) }()
 			defer func() { _ = ws.Close() }()
-			tr := &webtransport.Transport{TLSClientConfig: cliTLS}
+			tr := &Transport{TLSClientConfig: cliTLS}
+			defer func() { _ = tr.Close() }()
 			sess, err := DialSession(ctx, tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -112,11 +111,10 @@ func TestSessionEnd(t *testing.T) {
 	}
 	closed := []error{
 		nil,
-		&webtransport.SessionError{ErrorCode: 0},
-		&webtransport.SessionError{ErrorCode: 7, Remote: true, Message: "bye"},
+		&SessionError{ErrorCode: 0},
+		&SessionError{ErrorCode: 7, Remote: true, Message: "bye"},
 		&quic.ApplicationError{ErrorCode: quic.ApplicationErrorCode(http3.ErrCodeNoError), Remote: true},
 		&http3.Error{ErrorCode: http3.ErrCodeNoError},
-		&http3.Error{ErrorCode: http3.ErrCodeDatagramError, ErrorMessage: "H3_NO_ERROR"},
 	}
 	for _, err := range closed {
 		if got := sessionEnd(err); got != nil {

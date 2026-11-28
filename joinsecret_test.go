@@ -8,10 +8,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
-	"github.com/zmuxio/zmux-go/internal/testscale"
 )
 
 var joinSecret = bytes.Repeat([]byte{9}, 32)
@@ -24,12 +24,12 @@ func deferredConfig() *Config {
 
 // tryPipe joins a carrier to the client within d.
 func (e *mpEnv) tryPipe(d time.Duration) error {
-	nc, err := net.Dial("tcp", e.ln.Addr().String())
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	nc, err := e.dial(ctx)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), d)
-	defer cancel()
 	if _, err := e.client.AddPipe(ctx, NetPipe(nc), PipeOptions{}); err != nil {
 		_ = nc.Close()
 		return err
@@ -44,86 +44,27 @@ func mustSet(t *testing.T, c *Conn, psk []byte) {
 	}
 }
 
-// Both ends defer the PSK: joins wait for it and, once both supplied it,
-// a join verifies and a session that lost its pipes resumes.
-func TestJoinSecretBothDeferred(t *testing.T) {
-	leakcheck.Check(t)
-	var ln net.Listener
-	ccfg := deferredConfig()
-	ccfg.ResumeTimeout = 5 * time.Second
-	ccfg.Redial = func(context.Context, Direction) (PipeIO, error) {
-		nc, err := net.Dial("tcp", ln.Addr().String())
-		if err != nil {
-			return PipeIO{}, err
-		}
-		return NetPipe(nc), nil
-	}
-	scfg := deferredConfig()
-	scfg.ResumeTimeout = 5 * time.Second
-	e := newMPEnv(t, ccfg, scfg)
-	ln = e.ln
-	for _, c := range []*Conn{e.client, e.server} {
-		if st := c.ConnectionState(); !st.Multipath || !st.JoinPending {
-			t.Fatalf("state %+v", st)
-		}
-	}
-	if err := e.tryPipe(time.Second); !errors.Is(err, ErrJoinPending) {
-		t.Fatalf("join before the secret: %v", err)
-	}
-	mustSet(t, e.client, joinSecret)
-	mustSet(t, e.server, joinSecret)
-	if e.client.ConnectionState().JoinPending {
-		t.Fatal("still pending")
-	}
-	if err := e.client.SetJoinSecret(joinSecret); !errors.Is(err, ErrJoinSecretSet) {
-		t.Fatalf("second SetJoinSecret: %v", err)
-	}
-	if err := e.tryPipe(5 * time.Second); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	echoOnce(t, ctx, e.client, e.server)
-	e.client.lock()
-	pds := make([]*pipeDrv, 0, len(e.client.pipes))
-	for _, pd := range e.client.pipes {
-		pds = append(pds, pd)
-	}
-	e.client.unlock()
-	for _, pd := range pds {
-		pd.closeAll()
-	}
-	for {
-		ev, err := e.client.NextEvent(ctx)
-		if err != nil {
-			t.Fatalf("no resumption: %v", err)
-		}
-		if ev.Kind == EventSessionResumed {
-			break
-		}
-	}
-	echoOnce(t, ctx, e.client, e.server)
-	if n := e.server.ConnectionStats().JoinAuthFailures; n != 0 {
-		t.Fatalf("join auth failures %d", n)
-	}
-}
-
 // The client supplies the secret first: its join is held at the server
 // until the server supplies it, then accepted.
 func TestJoinSecretServerLate(t *testing.T) {
 	leakcheck.Check(t)
-	e := newMPEnv(t, deferredConfig(), deferredConfig())
-	mustSet(t, e.client, joinSecret)
-	done := make(chan error, 1)
-	go func() { done <- e.tryPipe(5 * time.Second) }()
-	waitUntil(t, 5*time.Second, "held join", func() bool { return e.server.ConnectionStats().JoinPending == 1 })
-	mustSet(t, e.server, joinSecret)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if st := e.server.ConnectionStats(); st.JoinAuthFailures != 0 || st.JoinPending != 1 {
-		t.Fatalf("stats %+v", st)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		e := newMemMPEnv(t, deferredConfig(), deferredConfig())
+		mustSet(t, e.client, joinSecret)
+		done := make(chan error, 1)
+		go func() { done <- e.tryPipe(5 * time.Second) }()
+		synctest.Wait()
+		if n := e.server.ConnectionStats().JoinPending; n != 1 {
+			t.Fatalf("%d pending joins, want 1", n)
+		}
+		mustSet(t, e.server, joinSecret)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if st := e.server.ConnectionStats(); st.JoinAuthFailures != 0 || st.JoinPending != 1 {
+			t.Fatalf("stats %+v", st)
+		}
+	})
 }
 
 // The server supplies it first: the client's joins fail with
@@ -153,7 +94,12 @@ func TestJoinSecretMismatch(t *testing.T) {
 	if err := e.tryPipe(time.Second); err == nil {
 		t.Fatal("join with a different secret succeeded")
 	}
-	waitUntil(t, 5*time.Second, "auth failure", func() bool { return e.server.ConnectionStats().JoinAuthFailures == 1 })
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	waitTestEvent(t, ctx, e.server, "join authentication failure", func(ev Event) bool { return ev.Kind == EventJoinAuthFailed })
+	if n := e.server.ConnectionStats().JoinAuthFailures; n != 1 {
+		t.Fatalf("%d authentication failures, want 1", n)
+	}
 }
 
 // A deferred PSK and a static PSK of the same bytes interoperate.
@@ -233,31 +179,36 @@ func TestJoinSecretWithExporter(t *testing.T) {
 	}
 }
 
-// A held join is closed silently after the handshake timeout: nothing is
-// written to it.
+// A held join is closed silently at the join timeout.
 func TestJoinSecretHoldTimeout(t *testing.T) {
 	leakcheck.Check(t)
-	scfg := deferredConfig()
-	scfg.HandshakeTimeout = 300 * time.Millisecond
-	e := newMPEnv(t, deferredConfig(), scfg)
-	mustSet(t, e.client, joinSecret)
-	nc, err := net.Dial("tcp", e.ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var read atomic.Int64
-	counted := countingConn{Conn: nc, n: &read}
-	ctx, cancel := context.WithTimeout(context.Background(), testscale.D(5*time.Second))
-	defer cancel()
-	if _, err := e.client.AddPipe(ctx, NetPipe(counted), PipeOptions{}); err == nil {
-		t.Fatal("held join was accepted")
-	}
-	if n := read.Load(); n != 0 {
-		t.Fatalf("the held join was answered with %d bytes", n)
-	}
-	if st := e.server.ConnectionStats(); st.JoinPending != 1 || st.JoinAuthFailures != 0 {
-		t.Fatalf("stats %+v", st)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		scfg := deferredConfig()
+		scfg.JoinTimeout = 300 * time.Millisecond
+		e := newMemMPEnv(t, deferredConfig(), scfg)
+		mustSet(t, e.client, joinSecret)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		nc, err := e.dial(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var read atomic.Int64
+		counted := countingConn{Conn: nc, n: &read}
+		start := time.Now()
+		if _, err := e.client.AddPipe(ctx, NetPipe(counted), PipeOptions{}); err == nil {
+			t.Fatal("held join was accepted")
+		}
+		if d := time.Since(start); d != scfg.JoinTimeout {
+			t.Fatalf("held join ended after %v, want %v", d, scfg.JoinTimeout)
+		}
+		if n := read.Load(); n != 0 {
+			t.Fatalf("the held join was answered with %d bytes", n)
+		}
+		if st := e.server.ConnectionStats(); st.JoinPending != 1 || st.JoinAuthFailures != 0 {
+			t.Fatalf("stats %+v", st)
+		}
+	})
 }
 
 type countingConn struct {

@@ -8,7 +8,7 @@ import (
 
 func targetSession() *Session {
 	cfg := DefaultConfig()
-	cfg.MaxPipes, cfg.Headroom = 2, 8
+	cfg.SessionPolicy.Limits.SteadyAttachments, cfg.SessionPolicy.Limits.JoinHeadroom = 2, 8
 	s := New(cfg, 0)
 	s.state = StateActive
 	s.mp = &multiPath{ownCap: 10}
@@ -68,12 +68,14 @@ func TestPrimaryControlOrder(t *testing.T) {
 		t.Fatalf("primary %v %v, want pipes %d %d", a.id, b.id, ps[3].id, ps[4].id)
 	}
 	ps[4].mp.rtt.min = ps[3].mp.rtt.min // equal OWD: the lower ID first
+	s.pathRTTChanged(ps[4], true)
 	if a, b := s.primary(); a == nil || b == nil {
 		t.Fatal("no primary pair")
 	} else if a != ps[3] || b != ps[4] {
 		t.Fatalf("on a tie %v %v", a.id, b.id)
 	}
 	ps[3].mp.out, ps[4].mp.out = OutSuspect, OutSuspect
+	s.refreshPathTopology()
 	if a, b := s.primary(); a == nil || b == nil {
 		t.Fatal("no primary pair")
 	} else if a != ps[2] || b != ps[1] {
@@ -174,6 +176,7 @@ func TestRoomCandidateOrder(t *testing.T) {
 	}
 	live := add(1, OutActive, InNone, false, false)
 	live.out = &outDir{}
+	s.syncPipeHealth(live)
 	add(0, OutJoining, InJoining, false, true) // held: never displaced
 	pending := add(2, OutFailed, InEnded, false, false)
 	acked := add(3, OutFailed, InEnded, true, false)
@@ -191,8 +194,16 @@ func TestRoomCandidateOrder(t *testing.T) {
 	if got := s.roomCandidate(true, false, true); got != nil {
 		t.Fatal("a live attachment is displaced for a join that provides no missing direction")
 	}
+	if got := s.roomCandidate(true, true, false); got != nil {
+		t.Fatal("recovery displaced the last usable outbound attachment")
+	}
+	backup := add(4, OutActive, InNone, false, false)
+	backup.id = 8
+	backup.out = &outDir{}
+	backup.mp.peer = peerObserved
+	s.syncPipeHealth(backup)
 	if got := s.roomCandidate(true, true, false); got != live {
-		t.Fatal("the live attachment is displaced for a join that provides the missing inbound direction")
+		t.Fatal("the oldest redundant outbound path was not reclaimable")
 	}
 }
 
@@ -206,7 +217,9 @@ func TestHeldJoinDisplacesForMissingDirection(t *testing.T) {
 	s.state = StateSuspended
 	s.pipes = nil
 	// A live send-only attachment: the session lacks only its inbound.
-	s.pipes = append(s.pipes, &Pipe{out: &outDir{lanes: []*outLane{{}}}, mp: &attach{joinerLocal: true, out: OutActive, in: InNone}})
+	send := &Pipe{out: &outDir{lanes: []*outLane{{}}}, mp: &attach{joinerLocal: true, out: OutActive, in: InNone}}
+	s.pipes = append(s.pipes, send)
+	s.syncPipeHealth(send)
 	for len(s.pipes) < s.mp.ownCap {
 		s.pipes = append(s.pipes, &Pipe{mp: &attach{joinerLocal: true, out: OutFailed, in: InEnded}})
 	}
@@ -235,7 +248,7 @@ func TestJoinAbortRejectsLatePipeAck(t *testing.T) {
 		p := &Pipe{id: 2, out: &outDir{lanes: []*outLane{lane}}, mp: &attach{joinerLocal: true, out: OutActive, in: InNone}}
 		s.pipes = append(s.pipes, p)
 		ack := func(pos uint64) {
-			if err := s.mpAckEntry(wire.AckEntry{PipeID: p.id, Position: pos}, s.now); err != nil {
+			if err := s.mpAckEntry(wire.AckEntry{PipeID: p.id, Position: pos}, s.now, nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -265,14 +278,15 @@ func TestJoinAbortRejectsLatePipeAck(t *testing.T) {
 }
 
 func TestCloseUnconfirmedPipeSkipsAbandon(t *testing.T) {
-	s, _ := probeSession(DefaultConfig())
+	s, bootstrap := probeSession(DefaultConfig())
+	s.syncPipeHealth(bootstrap)
 	p := &Pipe{id: 2, out: &outDir{lanes: []*outLane{{}}}, mp: &attach{joinerLocal: true, out: OutActive}}
 	s.pipes = append(s.pipes, p)
 	if err := s.RemovePipe(p.id, true); err != nil {
 		t.Fatal(err)
 	}
-	if !p.mp.retired || p.mp.peer != peerDiscarded || p.mp.abandonQueued || p.mp.abandonSent {
+	if !p.mp.retired || p.mp.peer != peerDiscarded || s.mp.abandonQ.contains(p) || p.mp.abandonSent {
 		t.Fatalf("unconfirmed close: retired=%t, peer=%v, abandon queued=%t, sent=%t",
-			p.mp.retired, p.mp.peer, p.mp.abandonQueued, p.mp.abandonSent)
+			p.mp.retired, p.mp.peer, s.mp.abandonQ.contains(p), p.mp.abandonSent)
 	}
 }

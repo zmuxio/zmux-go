@@ -91,7 +91,7 @@ func TestPreambleLimitShrinks(t *testing.T) {
 		if n := sum(recordData(t, b)); n > 0 {
 			t.Fatalf("%d stream bytes sent", n)
 		}
-		s.WriteDone(b, nil, Time(Second))
+		s.WriteDone(b, b.Len(), nil, Time(Second))
 	}
 	if big.idSet {
 		t.Fatal("identifier allocated")

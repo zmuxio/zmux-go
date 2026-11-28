@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zmuxio/zmux-go/internal/testpeer"
 )
 
 // Interoperability with a plain QMux peer (no zmux parameters), a binary
@@ -17,7 +19,7 @@ import (
 
 func TestQMuxInteropClient(t *testing.T) {
 	p := startPeerEnv(t, "ZMUX_QMUX_PEER", "server", "127.0.0.1:0")
-	addr := p.expect(t, "LISTEN ")
+	addr := p.Expect(t, "LISTEN ")
 	nc, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -70,8 +72,8 @@ func uniReport(t *testing.T, ctx context.Context, c *Conn) string {
 	return string(b)
 }
 
-func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) { //nolint:thelper // scenario body, not a helper: failures point inside it
-	p.expect(t, "ESTABLISHED")
+func qmuxScript(t *testing.T, ctx context.Context, c *Conn, p *testpeer.Process) { //nolint:thelper // scenario body, not a helper: failures point inside it
+	p.Expect(t, "ESTABLISHED")
 	big := make([]byte, 8<<20)
 	for i := range big {
 		big[i] = byte(i * 7)

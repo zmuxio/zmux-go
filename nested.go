@@ -65,24 +65,90 @@ func (c *Conn) OpenPipeStream(ctx context.Context, o *PipeStreamOptions) (PipeIO
 func StreamPipe(s *Stream) PipeIO { return streamPipe(s, s.h.c) }
 
 func streamPipe(s *Stream, outer *Conn) PipeIO {
-	sp := &stPipe{s: s, outer: outer}
-	return PipeIO{R: (*stPipeR)(sp), W: (*stPipeW)(sp)}
+	pair := new(struct {
+		write stPipeW
+		read  stPipeR
+	})
+	pair.read.s, pair.read.outer = s, outer
+	pair.write.s, pair.write.read = s, &pair.read
+	return PipeIO{R: &pair.read, W: &pair.write}
 }
 
-// stPipe adapts a stream to the pipe operations of a nested carrier.
-type stPipe struct {
+type stPipeR struct {
 	s     *Stream
 	outer *Conn
-	once  sync.Once // the read half is closed once
-	wonce sync.Once // the write half is closed once
+	once  sync.Once
 }
 
-type stPipeR stPipe
-type stPipeW stPipe
+type stPipeW struct {
+	read *stPipeR
+	nestedWriter
+}
+
+type nestedWriter struct {
+	s    *Stream
+	once sync.Once
+}
+
+func (w *nestedWriter) Write(p []byte) (int, error) { return w.s.Write(p) }
+
+// WriteBatch passes nested records to the outer stream without a payload copy.
+func (w *nestedWriter) WriteBatch(b *core.Batch) (int, error) {
+	defer runtime.KeepAlive(w.s)
+	return w.s.h.writeBatch(b)
+}
+
+func (w *nestedWriter) finish(abort bool, release func()) error {
+	var err error
+	w.once.Do(func() {
+		if abort {
+			w.s.CancelWrite(StreamCarrierFailed)
+		} else {
+			err = w.s.Close()
+		}
+		if release != nil {
+			release()
+		}
+	})
+	return err
+}
 
 // Read reads the inbound pipe; FIN is its graceful end, a reset its
 // failure.
 func (r *stPipeR) Read(p []byte) (int, error) { return r.s.Read(p) }
+
+// readSpan transfers a retained range from the outer receive queue. A
+// busy application's outstanding loans cannot stop an inner control read.
+func (r *stPipeR) readSpan(limit int) (core.Span, bool, error) {
+	defer runtime.KeepAlive(r.s)
+	v, err := r.s.h.readLoan(context.Background(), limit)
+	if !errors.Is(err, ErrReceiveLoanLimit) {
+		return v, true, err
+	}
+	b := core.GetRecvBuf(limit)
+	n, err := r.s.Read(b.B[:limit])
+	if n == 0 {
+		b.Unref()
+		return core.Span{}, false, err
+	}
+	return b.Span(0, n), false, err
+}
+
+// byteSpanReader follows only views that preserve the underlying bytes.
+func byteSpanReader(r io.Reader) func(int) (core.Span, bool, error) {
+	switch v := r.(type) {
+	case *stPipeR:
+		return v.readSpan
+	case readOnly:
+		return byteSpanReader(v.r)
+	case *ownedReader:
+		return byteSpanReader(v.r)
+	case *prefixReader:
+		return byteSpanReader(v.r)
+	default:
+		return nil
+	}
+}
 
 // Close of the receiving half before its end stops it with
 // ZMUX_CARRIER_FAILED.
@@ -102,81 +168,52 @@ func (r *stPipeR) ReportsFailure() bool { return true }
 // ReportsFailure reports true, as the receiving half does for the same stream.
 func (w *stPipeW) ReportsFailure() bool { return true }
 
-func (w *stPipeW) Write(p []byte) (int, error) { return w.s.Write(p) }
-
-// WriteBatch hands a batch of the nested session to the outer stream
-// without copying its payload.
-func (w *stPipeW) WriteBatch(b *core.Batch) (int, error) {
-	defer runtime.KeepAlive(w.s)
-	return w.s.h.writeBatch(b)
-}
-
 // Close is the graceful end of the sending half (FIN).
-func (w *stPipeW) Close() error {
-	var err error
-	w.wonce.Do(func() { err = w.s.Close() })
-	return err
-}
+func (w *stPipeW) Close() error { return w.finish(false, nil) }
 
 // Abort resets the sending part with ZMUX_CARRIER_FAILED (RESET_STREAM_AT
 // with the preamble as Reliable Size on the opener's part) and stops the
 // receiving part.
-func (w *stPipeW) Abort(error) {
-	w.wonce.Do(func() { w.s.CancelWrite(StreamCarrierFailed) })
-	w.once.Do(func() { w.s.CancelRead(StreamCarrierFailed) })
+func (w *stPipeW) Abort(_ error) {
+	_ = w.finish(true, nil)
+	_ = w.read.Close()
 }
 
 // CarrierConn reports the outer session as the carrier connection.
-func (w *stPipeW) CarrierConn() any { return w.outer }
+func (w *stPipeW) CarrierConn() any { return w.read.outer }
 
 // OpenLane opens a further carrier stream of the outer session as a lane,
 // only where lanes pay off (the outer session has lanes or more than one
 // pipe) and only with stream credit that leaves the application at least
 // half of the outer peer's streams.
-func (w *stPipeW) OpenLane(context.Context) (io.WriteCloser, error) {
-	o := w.outer
+func (w *stPipeW) OpenLane(_ context.Context) (io.WriteCloser, error) {
+	o := w.read.outer
 	s, ok := o.openNestedLane()
 	if !ok {
 		return nil, errNoLane
 	}
 	_ = s.SetPipeCarrier()
 	s.CancelRead(0) // the reverse half of a lane is unused
-	return &laneStream{s: s, outer: o}, nil
+	return newLaneStream(s, o), nil
 }
 
 var errNoLane = errors.New("zmux: no lane now")
 
 // laneStream is an outbound lane over an outer stream.
 type laneStream struct {
-	s     *Stream
 	outer *Conn
-	once  sync.Once
+	nestedWriter
 }
 
-func (l *laneStream) Write(p []byte) (int, error) { return l.s.Write(p) }
-
-// WriteBatch hands a batch of the nested session to the lane without
-// copying its payload.
-func (l *laneStream) WriteBatch(b *core.Batch) (int, error) {
-	defer runtime.KeepAlive(l.s)
-	return l.s.h.writeBatch(b)
+func newLaneStream(s *Stream, outer *Conn) *laneStream {
+	lane := &laneStream{outer: outer}
+	lane.s = s
+	return lane
 }
 
-func (l *laneStream) Close() error {
-	var err error
-	l.once.Do(func() {
-		err = l.s.Close()
-		l.outer.releaseNestedLane()
-	})
-	return err
-}
+func (l *laneStream) Close() error { return l.finish(false, l.outer.releaseNestedLane) }
 
-func (l *laneStream) Abort(error) {
-	l.once.Do(func() {
-		l.s.CancelWrite(StreamCarrierFailed)
-		l.outer.releaseNestedLane()
-	})
-}
+func (l *laneStream) Abort(_ error) { _ = l.finish(true, l.outer.releaseNestedLane) }
 
 // lanesPayOff: over a single TCP pipe the outer streams share one ordered
 // byte stream and lanes would recover nothing.

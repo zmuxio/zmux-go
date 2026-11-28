@@ -32,13 +32,12 @@ type RelayOptions struct {
 // drops the bytes of chosen directions without ending the connection (a
 // black hole), refuses new connections, or cuts the current ones.
 type Relay struct {
-	o    RelayOptions
-	ln   net.Listener
-	dial func(context.Context) (net.Conn, error)
-	wg   sync.WaitGroup
-
+	ln      net.Listener
+	dial    func(context.Context) (net.Conn, error)
 	conns   map[*relayConn]struct{}
 	quit    chan struct{}
+	o       RelayOptions
+	wg      sync.WaitGroup
 	n       int
 	cuts    atomic.Int64
 	refused atomic.Int64
@@ -245,8 +244,7 @@ func (r *Relay) copy(rc *relayConn, dst, src net.Conn, up bool) {
 				return
 			}
 			if errors.Is(err, io.EOF) {
-				if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-					_ = cw.CloseWrite()
+				if cw, ok := dst.(interface{ CloseWrite() error }); ok && cw.CloseWrite() == nil {
 					if rc.halfs.Add(1) == 2 {
 						return // both directions ended: the connection ends
 					}

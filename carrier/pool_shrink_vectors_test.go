@@ -20,22 +20,22 @@ func TestPoolShrinkVectors(t *testing.T) {
 	}
 	var v struct {
 		Cases []struct {
-			Name    string `json:"name"`
+			Name   string `json:"name"`
+			Expect struct {
+				CancelDials []int    `json:"cancel_dials"`
+				Close       []uint64 `json:"close"`
+			} `json:"expect"`
 			Members []struct {
 				Key   uint64 `json:"key"`
 				Idle  int64  `json:"idle"`
 				Pipes int    `json:"pipes"`
 				Age   int64  `json:"age"`
 			} `json:"members"`
-			Dialing  int `json:"dialing"`
 			Decision struct {
-				Count  int      `json:"count"`
 				Retire []uint64 `json:"retire"`
+				Count  int      `json:"count"`
 			} `json:"decision"`
-			Expect struct {
-				CancelDials []int    `json:"cancel_dials"`
-				Close       []uint64 `json:"close"`
-			} `json:"expect"`
+			Dialing int `json:"dialing"`
 		} `json:"cases"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {

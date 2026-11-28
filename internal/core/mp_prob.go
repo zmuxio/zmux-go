@@ -149,6 +149,9 @@ func (s *Session) startProbation(p *Pipe) {
 		return
 	}
 	h := s.hist(p)
+	if !a.prob.on && a.out != OutSuspect {
+		h.decay(true, s.now)
+	}
 	k := h.nextK()
 	a.prob = probState{on: s.probationBase(p) >= 0, start: s.now, k: k,
 		upCounted: h.trouble, upSince: s.now}
@@ -158,9 +161,12 @@ func (s *Session) startProbation(p *Pipe) {
 		if !a.needPing {
 			a.needPing = true
 			a.pingSince = s.now
+			s.armPathDeadline(p, pathProbe)
 		}
 		s.wakePipe(p)
 	}
+	s.armPathDeadline(p, pathProbationEnd)
+	s.armPathDeadline(p, pathProbationProbe)
 	s.capacityChanged()
 }
 
@@ -170,6 +176,7 @@ func (s *Session) probationSuspect(p *Pipe) {
 	a.wasSuspect = true
 	inProb := a.prob.on
 	a.prob.on = false
+	s.syncPipeHealth(p)
 	counted, since := a.prob.upCounted, a.prob.upSince
 	a.prob.upCounted = false
 	if a.draining || a.resLimited {
@@ -191,86 +198,11 @@ func (s *Session) probationFailed(p *Pipe) {
 	s.hist(p).troubleAt(inProb, counted, since, s.now)
 }
 
-// probationTimers ends probations that are due, decays histories and asks
-// for the probes probation needs; it returns the next deadline.
-func (s *Session) probationTimers(now Time, apply bool) Time {
-	next := Never
-	changed := false
-	for _, p := range s.pipes {
-		a := p.mp
-		if a == nil || p.out == nil || a.retired {
-			continue
-		}
-		if end, ok := s.probationEnd(p); ok {
-			if now >= end {
-				if apply {
-					a.prob.on = false
-					s.wakePrefix()
-					changed = true
-					h := s.hist(p)
-					h.ended, h.endAt, h.endBase = true, end, s.backoffBase(p)
-					s.checkTakeover()
-					s.wakeAllWriters()
-				} else {
-					// A deadline query must retain overdue work until the
-					// timer applies it, including a zero-RTT first probation.
-					next = minT(next, end)
-				}
-			} else {
-				next = minT(next, end)
-				// Probes at least every max(srtt, 200 ms).
-				every := maxD(a.rtt.smoothed, probationProbe)
-				due := a.prob.ping.Add(every)
-				if !a.prob.pinged || now >= due {
-					if apply && a.liveOut() {
-						a.prob.ping, a.prob.pinged = now, true
-						if !a.needPing {
-							a.needPing = true
-							a.pingSince = now
-						}
-						s.wakeAllWriters()
-						next = minT(next, now.Add(every))
-					}
-				} else {
-					next = minT(next, due)
-				}
-			}
-		}
-		if a.fate == 0 && apply {
-			busy := a.prob.on || a.out == OutSuspect
-			a.hist.decay(!busy, now)
-		}
-	}
-	if apply {
-		for key, h := range s.mp.fateHist {
-			busy := false
-			used := false
-			for _, p := range s.pipes {
-				a := p.mp
-				if a != nil && a.fate == key.group && a.joinerLocal == key.local && a.out != OutFailed {
-					used = true
-					if a.prob.on || a.out == OutSuspect {
-						busy = true
-					}
-				}
-			}
-			h.decay(!busy, now)
-			if !used && h.k == 0 && !h.pending && !h.trouble && !h.recent(now) {
-				delete(s.mp.fateHist, key)
-			}
-		}
-	}
-	if changed {
-		s.capacityChanged()
-	}
-	return next
-}
-
 // ---- revalidation ----
 
 // RevalidatePipes asks for revalidation of one pipe (all == false) or of
-// every live outbound pipe: each sends a PIPE_PING at once and awaits
-// revalidation until its acknowledged position reaches it.
+// every live outbound pipe. An outbound direction probes with PIPE_PING.
+// An explicitly selected receive-only pipe waits for its next valid record.
 func (s *Session) RevalidatePipes(id uint64, all bool, now Time) error {
 	s.SetNow(now)
 	if s.mp == nil {
@@ -281,16 +213,25 @@ func (s *Session) RevalidatePipes(id uint64, all bool, now Time) error {
 	}
 	for _, p := range s.pipes {
 		a := p.mp
-		if a == nil || p.out == nil || (!all && p.id != id) || a.reval {
+		if a == nil || (!all && p.id != id) || a.reval {
+			continue
+		}
+		if p.out == nil {
+			if !all && a.in == InOpen {
+				a.reval = true
+				s.syncPipeHealth(p)
+			}
 			continue
 		}
 		if a.out != OutActive && a.out != OutJoining {
 			continue
 		}
 		a.reval, a.revalPing = true, true
+		s.syncPipeHealth(p)
 		if !a.needPing {
 			a.needPing = true
 			a.pingSince = s.now
+			s.armPathDeadline(p, pathProbe)
 		}
 	}
 	s.capacityChanged()
@@ -316,6 +257,11 @@ func (s *Session) pingsAcked(p *Pipe) {
 	}
 	if n > 0 {
 		a.pingsAnswered += uint64(n)
+		position := a.pingEnds[n-1]
+		if a.health.send.running && position > a.health.send.startPosition {
+			s.healthProof(p, DirOut)
+		}
+		a.health.proofAsked = false
 		a.pingEnds = append(a.pingEnds[:0], a.pingEnds[n:]...)
 	}
 }
@@ -325,6 +271,9 @@ func (s *Session) revalAcked(p *Pipe) {
 	a := p.mp
 	if a.reval && !a.revalPing && p.out.snd.cum >= a.revalEnd {
 		s.endRevalidation(p)
+		// The ACK covers the probe that ended revalidation. The new
+		// evidence generation starts at the current sender position.
+		s.healthProof(p, DirOut)
 	}
 }
 
@@ -334,6 +283,7 @@ func (s *Session) endRevalidation(p *Pipe) {
 		return
 	}
 	a.reval, a.revalPing = false, false
+	s.syncPipeHealth(p)
 	s.capacityChanged()
 	s.checkTakeover()
 	s.wakeAllWriters()
@@ -369,6 +319,7 @@ func (s *Session) markBusy() {
 	if !quiet || s.cfg.StandbyProbe <= 0 {
 		return
 	}
+	s.refreshProbeDeadlines()
 	for _, p := range s.pipes {
 		a := p.mp
 		if a == nil || p.out == nil || a.needPing || a.unacked || (a.out != OutActive && a.out != OutSuspect) || !s.backup(p) {
@@ -378,6 +329,7 @@ func (s *Session) markBusy() {
 		if s.now >= ref.Add(s.cfg.StandbyProbe) {
 			a.needPing = true
 			a.pingSince = s.now
+			s.armPathDeadline(p, pathProbe)
 			s.wakeAllWriters()
 		}
 	}

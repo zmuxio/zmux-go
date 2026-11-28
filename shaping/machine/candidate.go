@@ -88,10 +88,11 @@ type unitValues struct {
 // Candidate is a validated candidate of a kind: handshakes, machines, limits
 // and pool, each possibly absent. It is immutable.
 type Candidate struct {
-	budget   *budgetDef
-	pool     *poolDef
-	machines []machineDef
-	hs       [len(handshakeOrder)]unitValues
+	budget         *budgetDef
+	pool           *poolDef
+	machines       []machineDef
+	hs             [len(handshakeOrder)]unitValues
+	includeControl bool
 }
 
 // ParseCandidate reads a candidate's JSON. A member named in requires is not
@@ -106,11 +107,18 @@ func ParseCandidate(b []byte, t map[string]json.RawMessage, l SizeLimits) (*Cand
 	if err != nil {
 		return nil, err
 	}
-	o, err := members(x, "candidate", "requires", "handshakes", "machines", "budget", "pool")
+	o, err := members(x, "candidate", "requires", "handshakes", "machines", "budget", "pool", "include_control")
 	if err != nil {
 		return nil, err
 	}
 	c := &Candidate{}
+	if v := o.get("include_control"); v != nil {
+		b, ok := v.(bool)
+		if !ok {
+			return nil, fail("type", "include_control")
+		}
+		c.includeControl = b
+	}
 	if v := o.get("handshakes"); v != nil {
 		if err := c.parseHandshakes(v, tt); err != nil {
 			return nil, err
@@ -130,6 +138,9 @@ func ParseCandidate(b []byte, t map[string]json.RawMessage, l SizeLimits) (*Cand
 		if c.pool, err = parsePool(v, tt); err != nil {
 			return nil, err
 		}
+	}
+	if err := c.checkGates(); err != nil {
+		return nil, err
 	}
 	return c, nil
 }
@@ -204,7 +215,7 @@ func (c *Candidate) Compile(o Options) *Compiled {
 		cc.hs[i] = e
 	}
 	if len(c.machines) > 0 {
-		cc.machines = compileMachines(c.machines, src, &cc.shared, &o)
+		cc.machines = compileMachines(c.machines, c.includeControl, src, &cc.shared, &o)
 	}
 	if c.pool != nil {
 		cc.pool = c.pool.resolved(src, &cc.shared)
@@ -212,9 +223,9 @@ func (c *Candidate) Compile(o Options) *Compiled {
 	return cc
 }
 
-// Budget returns the function for zmux.Config.ShapingBudget, which draws the
+// Budget returns the function for the direction policy, which draws the
 // values of scope session at each call; nil without a budget.
-func (c *Compiled) Budget() func() shaping.Budget {
+func (c *Compiled) budget() func() shaping.Budget {
 	b := c.c.budget
 	if b == nil {
 		return nil
@@ -230,7 +241,7 @@ func (c *Compiled) Budget() func() shaping.Budget {
 
 // Handshake returns the shaper of handshake messages. Values of scope each
 // are drawn at each call; a message without an entry leaves the plan zero.
-func (c *Compiled) Handshake() shaping.HandshakeShaper {
+func (c *Compiled) handshake() shaping.HandshakeShaper {
 	draw := func(v *value) uint64 { return v.drawTable(runtimeSource{}) }
 	if c.o.NewSource != nil {
 		var mu sync.Mutex
@@ -258,9 +269,11 @@ func (c *Compiled) Handshake() shaping.HandshakeShaper {
 		}
 		if e.dly.set {
 			p.Delay = micros(draw(&e.dly))
-			if b := c.c.budget; b != nil && b.maxDelay > 0 {
-				p.Delay = min(p.Delay, b.maxDelay)
+			profile := shaping.Lightweight()
+			if b := c.c.budget; b != nil && b.profile != nil {
+				profile = *b.profile
 			}
+			p.Delay = min(p.Delay, profile.MaxAddedDelay)
 		}
 		return true
 	}

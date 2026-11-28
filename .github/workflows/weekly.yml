@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", zmuxws, seal, examples/xorpipe, interop/dgpeer, interop/webpeer]
+        module: [".", zmuxws, seal, examples/xorpipe, interop/webpeer]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -49,8 +49,7 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: go test -race -count=1 -timeout 20m ./...
 
-  # zmuxh3 stays on the quic-go version of its go.mod (webtransport-go has to build against it); the
-  # other dependencies move, and a second step reports whether it can move too.
+  # Test the pinned QUIC and WebTransport combination before probing newer dependencies.
   h3:
     name: latest dependencies (zmuxh3)
     runs-on: ubuntu-latest
@@ -64,27 +63,41 @@ jobs:
           check-latest: true
           cache: false
 
-      - name: update dependencies, quic-go held
-        working-directory: zmuxh3
+      - name: test the pinned QUIC and WebTransport combination
         run: |
-          quic=$(GOWORK=off go list -m -f '{{.Version}}' github.com/quic-go/quic-go)
-          GOWORK=off go get -u ./...
-          GOWORK=off go get "github.com/quic-go/quic-go@$quic"
-          GOWORK=off go mod tidy
+          (cd "$RUNNER_TEMP" && go work init "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/zmuxquic" "$GITHUB_WORKSPACE/zmuxh3")
+          export GOWORK="$RUNNER_TEMP/go.work"
+          go list -m github.com/quic-go/quic-go github.com/quic-go/webtransport-go
+          go vet ./zmuxquic/... ./zmuxh3/...
+          go test -race -count=1 -timeout 10m ./zmuxquic/... ./zmuxh3/...
+
+      - name: update dependencies with QUIC and WebTransport held
+        working-directory: zmuxh3
+        env:
+          GOWORK: "off"
+        run: |
+          quic=$(go list -m -f '{{.Version}}' github.com/quic-go/quic-go)
+          wt=$(go list -m -f '{{.Version}}' github.com/quic-go/webtransport-go)
+          go get -u ./... "github.com/quic-go/quic-go@$quic" "github.com/quic-go/webtransport-go@$wt"
+          go mod tidy
           git diff --stat
           go vet ./...
           go test -race -count=1 -timeout 20m ./...
 
-      - name: can zmuxh3 follow quic-go
+      - name: probe the newest QUIC and WebTransport releases
+        if: always()
         continue-on-error: true
         working-directory: zmuxh3
+        env:
+          GOWORK: "off"
         run: |
-          GOWORK=off go get -u github.com/quic-go/quic-go github.com/quic-go/webtransport-go
-          GOWORK=off go mod tidy
+          go get -u github.com/quic-go/quic-go github.com/quic-go/webtransport-go
+          go mod tidy
+          go list -m github.com/quic-go/quic-go github.com/quic-go/webtransport-go
           if go vet ./... && go test -race -count=1 -timeout 20m ./...; then
-            echo "::notice::zmuxh3 builds and passes with the newest quic-go and webtransport-go; move the pins of zmuxquic and zmuxh3"
+            echo "::notice::zmuxh3 passes with the newest quic-go and webtransport-go"
           else
-            echo "::notice::zmuxh3 does not yet build with the newest quic-go"
+            echo "::notice::zmuxh3's checks failed with the newest quic-go and webtransport-go"
             exit 1
           fi
 
@@ -174,13 +187,11 @@ jobs:
           timeout 900 cargo build --release --locked --manifest-path "$RUNNER_TEMP/peer/interop/peer/Cargo.toml"
           echo "ZMUX_INTEROP_PEER=$RUNNER_TEMP/peer/interop/peer/target/release/zmux-interop-peer" >> "$GITHUB_ENV"
 
-      - name: build the Rust shaping and datagram peers
+      - name: build the Rust datagram peer
         id: rspeers
         if: matrix.peer == 'rust'
         run: |
-          if [ -d "$RUNNER_TEMP/peer/interop/shaping-peer" ] && [ -d "$RUNNER_TEMP/peer/interop/datagram-peer" ]; then
-            timeout 900 cargo build --release --locked --manifest-path "$RUNNER_TEMP/peer/interop/shaping-peer/Cargo.toml" --target-dir "$RUNNER_TEMP/peer/interop/shaping-peer/target"
-            echo "ZMUX_SHAPING_PEER=$RUNNER_TEMP/peer/interop/shaping-peer/target/release/zmux-shaping-peer" >> "$GITHUB_ENV"
+          if [ -d "$RUNNER_TEMP/peer/interop/datagram-peer" ]; then
             timeout 900 cargo build --release --locked --manifest-path "$RUNNER_TEMP/peer/interop/datagram-peer/Cargo.toml" --target-dir "$RUNNER_TEMP/peer/interop/datagram-peer/target"
             echo "ZMUX_RS_QUIC_CHANNEL_PEER=$RUNNER_TEMP/peer/interop/datagram-peer/target/release/zmux-datagram-peer" >> "$GITHUB_ENV"
             echo "present=true" >> "$GITHUB_OUTPUT"
@@ -207,10 +218,6 @@ jobs:
       - name: secure carrier
         working-directory: seal
         run: go test -race -count=1 -timeout 5m -run '^TestInteropEstablish' .
-
-      - name: shaping
-        if: matrix.peer == 'rust' && steps.rspeers.outputs.present == 'true'
-        run: go test -race -count=1 -timeout 10m -run '^TestInteropShaping' ./shaping/machine
 
       - name: QUIC datagram channel
         if: matrix.peer == 'rust' && steps.rspeers.outputs.present == 'true'

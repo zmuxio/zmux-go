@@ -135,14 +135,18 @@ func TestHelloBoundsFromFile(t *testing.T) {
 
 // configVector describes a configuration and its expected result.
 type configVector struct {
-	Name    string `json:"name"`
-	Kind    string `json:"kind"`
-	Profile uint64 `json:"profile,omitempty"`
-	Suite   uint64 `json:"suite,omitempty"`
-	Handle  hexb   `json:"handle,omitempty"`
-	Static  hexb   `json:"static,omitempty"`
-	PSK     hexb   `json:"psk,omitempty"`
-	Binding hexb   `json:"binding,omitempty"`
+	// Crypto, for kind session_crypto, is a locally configured value of
+	// zmux_session_crypto.
+	Crypto  *cryptoSet `json:"crypto,omitempty"`
+	Name    string     `json:"name"`
+	Kind    string     `json:"kind"`
+	Error   string     `json:"error"`
+	Handle  hexb       `json:"handle,omitempty"`
+	Static  hexb       `json:"static,omitempty"`
+	PSK     hexb       `json:"psk,omitempty"`
+	Binding hexb       `json:"binding,omitempty"`
+	Profile uint64     `json:"profile,omitempty"`
+	Suite   uint64     `json:"suite,omitempty"`
 	// WriteType, when not zero, is a payload type put in the first message of an
 	// otherwise valid configuration, which does not know it.
 	WriteType int `json:"write_type,omitempty"`
@@ -155,10 +159,6 @@ type configVector struct {
 	// RequirePQAuth, for kind pin, requires PQ authentication of a pin that
 	// names no proof key.
 	RequirePQAuth bool `json:"require_pq_auth,omitempty"`
-	// Crypto, for kind session_crypto, is a locally configured value of
-	// zmux_session_crypto.
-	Crypto *cryptoSet `json:"crypto,omitempty"`
-	Error  string     `json:"error"`
 }
 
 // MarshalJSON keeps the key order of the shared specification vectors.

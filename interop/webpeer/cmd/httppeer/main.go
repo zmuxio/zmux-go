@@ -1,6 +1,6 @@
 // Command httppeer is a scripted HTTP streaming peer:
 // `server|client|bad KIND ADDR`, KIND stream, split, stream2 or split2
-// (2: HTTP/2 cleartext). Authentication is prefix authentication "right".
+// (2: HTTP/2, split uses TLS). Authentication is prefix authentication "right".
 //
 // KIND tls1 and tls2 are bidirectional carriers over TLS 1.3 (HTTP/1.1 and
 // HTTP/2), with multipath and no admission: the server serves both on a
@@ -48,7 +48,8 @@ func main() {
 	defer cancel()
 	var p http.Protocols
 	p.SetHTTP1(!h2)
-	p.SetUnencryptedHTTP2(h2)
+	p.SetUnencryptedHTTP2(h2 && !split)
+	p.SetHTTP2(h2 && split)
 	switch mode {
 	case "server":
 		l, err := peer.NewListener("right")
@@ -60,27 +61,41 @@ func main() {
 		go peer.Serve(ctx, l)
 		peer.Ready(os.Stdout, ln)
 		srv := &http.Server{Handler: h, Protocols: &p}
-		if h2 {
-			p.SetHTTP1(true) // h2c with prior knowledge still shares the listener
+		if split {
+			tlsConfig, err := peer.SelfSignedTLS()
+			check(err)
+			srv.TLSConfig = tlsConfig
+			check(srv.ServeTLS(ln, "", ""))
+		} else {
+			if h2 {
+				p.SetHTTP1(true) // h2c with prior knowledge still shares the listener
+			}
+			check(srv.Serve(ln))
 		}
-		check(srv.Serve(ln))
 	case "client", "bad":
 		key := "right"
 		if mode == "bad" {
 			key = "wrong"
 		}
-		client := &http.Client{Transport: &http.Transport{Protocols: &p}}
+		transport := &http.Transport{Protocols: &p}
 		url := "http://" + addr + "/zmux"
+		if split {
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // ephemeral interop fixture
+			url = "https://" + addr + "/zmux"
+		}
+		client := &http.Client{Transport: transport}
 		var cand zmux.Candidate
 		if split {
 			cand = zmuxhttp.Split{Client: client, URL: url}.Candidate()
 		} else {
 			cand = zmuxhttp.Streaming{Client: client, URL: url}.Candidate()
 		}
-		pipe, err := cand.Dial(ctx, peer.Auth(key))
+		auth, err := peer.Auth(key)
+		check(err)
+		pipes, err := cand.Open(ctx, zmux.OpenRequest{Credential: auth, Stage: zmux.OpenBootstrap, Need: zmux.Both, Lifetime: ctx})
 		var c *zmux.Conn
 		if err == nil {
-			c, err = zmux.Start(ctx, pipe, zmux.RoleClient, &zmux.Config{})
+			c, err = zmux.Start(ctx, pipes[0], zmux.RoleClient, &zmux.Config{})
 		}
 		if err == nil {
 			err = peer.Ping(ctx, c)

@@ -5,11 +5,11 @@ package machine
 type trigger uint8
 
 const (
-	onRecordOut trigger = iota
-	onRecordIn
-	onPaddingIn
-	onInjected
-	onInjectDropped
+	onRecordPlan trigger = iota
+	onDatagramPlan
+	onOutbound
+	onInjectionAccepted
+	onInjectionRejected
 	onEnter
 	onStreamOpen
 	onStreamEnd
@@ -17,8 +17,11 @@ const (
 	onZero
 )
 
-var plainTriggers = map[string]trigger{"record_out": onRecordOut, "record_in": onRecordIn, "padding_in": onPaddingIn,
-	"injected": onInjected, "inject_dropped": onInjectDropped, "enter": onEnter, "stream_open": onStreamOpen, "stream_end": onStreamEnd}
+var plainTriggers = map[string]trigger{
+	"record_plan": onRecordPlan, "datagram_plan": onDatagramPlan, "outbound": onOutbound,
+	"injection_accepted": onInjectionAccepted, "injection_rejected": onInjectionRejected,
+	"enter": onEnter, "stream_open": onStreamOpen, "stream_end": onStreamEnd,
+}
 
 type opcode uint8
 
@@ -51,7 +54,7 @@ const (
 	whatWireLeft
 	whatStallLeft
 	whatWireSpent
-	whatSentBytes
+	whatEarnedBytes
 	whatWirePPM
 )
 
@@ -86,9 +89,9 @@ type record struct {
 }
 
 type stateDef struct {
-	rec   *record
-	enter []action
-	next  []transition
+	rec, datagram *record
+	enter         []action
+	next          []transition
 }
 
 type machineDef struct {
@@ -175,12 +178,17 @@ func parseMachine(m *machineDef, x any, t *tables) error {
 }
 
 func (m *machineDef) parseState(st *stateDef, x any, t *tables, n int) error {
-	o, err := members(x, "state", "record", "enter", "next")
+	o, err := members(x, "state", "record", "datagram", "enter", "next")
 	if err != nil {
 		return err
 	}
 	if v := o.get("record"); v != nil {
-		if st.rec, err = parseRecord(v, t); err != nil {
+		if st.rec, err = parseUnit(v, t, true); err != nil {
+			return err
+		}
+	}
+	if v := o.get("datagram"); v != nil {
+		if st.datagram, err = parseUnit(v, t, false); err != nil {
 			return err
 		}
 	}
@@ -217,8 +225,14 @@ func (m *machineDef) parseState(st *stateDef, x any, t *tables, n int) error {
 	return nil
 }
 
-func parseRecord(x any, t *tables) (*record, error) {
-	o, err := members(x, "record", "target", "max_len", "pad_to", "pad_multiple", "pad", "delay", "flush")
+func parseUnit(x any, t *tables, reliable bool) (*record, error) {
+	fields := []string{"target", "pad_to", "pad_multiple", "pad", "delay"}
+	kind := "datagram"
+	if reliable {
+		kind = "record"
+		fields = append(fields, "max_len", "flush")
+	}
+	o, err := members(x, kind, fields...)
 	if err != nil {
 		return nil, err
 	}
@@ -436,9 +450,9 @@ func (m *machineDef) parseTransition(tr *transition, x any, t *tables, n int) er
 			if tr.cslot, err = slotOf(c, m.counters, "if"); err != nil {
 				return err
 			}
-		case "len", "seq", "wire_left", "stall_left", "wire_spent", "sent_bytes", "wire_ppm":
+		case "len", "seq", "wire_left", "stall_left", "wire_spent", "earned_bytes", "wire_ppm":
 			tr.what = map[any]quantity{"len": whatLen, "seq": whatSeq, "wire_left": whatWireLeft, "stall_left": whatStallLeft,
-				"wire_spent": whatWireSpent, "sent_bytes": whatSentBytes, "wire_ppm": whatWirePPM}[w]
+				"wire_spent": whatWireSpent, "earned_bytes": whatEarnedBytes, "wire_ppm": whatWirePPM}[w]
 			if c.get("slot") != nil {
 				return fail("unknown_member", "if.slot")
 			}
@@ -515,7 +529,7 @@ func (m *machineDef) structure() error {
 		}
 	}
 	wide := graph(func(t trigger) bool {
-		return t == onEnter || t == onZero || t == onInjected || t == onInjectDropped || t == onTimer
+		return t == onEnter || t == onZero || t == onInjectionAccepted || t == onInjectionRejected || t == onTimer
 	})
 	for i, c := range onCycle(wide) {
 		if !c {

@@ -27,19 +27,19 @@ const (
 // resource and release after their final access. A failed setup keeps the
 // pending slot until the last child (including refusal I/O) retires.
 type attachment struct {
-	pipe          PipeIO
+	ctx           context.Context
 	handoff       *admissionHandoff // preparation and host dispatch belong to this carrier
 	listener      *Listener
-	ctx           context.Context
 	parentsEnded  func() bool
 	stopHandshake <-chan struct{} // Shutdown interrupts a bootstrap already negotiating at the drain cutoff
-	state         atomic.Uint32
-	refs          atomic.Int32
 	slot          *core.PendingSlot
 	onEnd         func()
 	head          func(context.Context) error
 	pair          *attachment // aggregate physical lifetime after split pairing
 	done          chan struct{}
+	pipe          PipeIO
+	state         atomic.Uint32
+	refs          atomic.Int32
 }
 
 func newAttachment(l *Listener, observe bool) *attachment {

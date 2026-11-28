@@ -7,7 +7,6 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
-	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // A virtual-clock simulation of two sessions over their pipes and lanes,
@@ -99,7 +98,7 @@ func (m *cwSim) flush(i int) {
 				default:
 					l.q = append(l.q, cwMsg{data: b.Flat(), at: m.now.Add(m.delay)})
 				}
-				s.WriteDone(b, err, m.now)
+				s.WriteDone(b, 0, err, m.now)
 				PutBatch(b)
 				if err != nil {
 					break
@@ -118,12 +117,12 @@ func (m *cwSim) deliver(i int) {
 				d := l.q[0].data
 				l.q = l.q[1:]
 				if m.info.Framing == FramingRecords {
-					s.ReceiveMessage(k.pipe, k.lane, &Buf{B: d}, d, m.now)
+					receiveMessageTest(s, k.pipe, k.lane, d, m.now)
 					continue
 				}
 				l.rx = append(l.rx, d...)
-				n := s.Receive(k.pipe, k.lane, &Buf{B: l.rx}, l.rx, m.now)
-				l.rx = append(l.rx[:0], l.rx[n:]...)
+				n := receiveTest(s, k.pipe, k.lane, l.rx, m.now)
+				l.rx = append([]byte(nil), l.rx[n:]...)
 			}
 		}
 	}
@@ -191,7 +190,7 @@ func (m *cwSim) fail(id uint64) {
 		}
 	}
 	for i := range 2 {
-		m.end[i].PipeEnded(id, 0, false, false, errCWDead, m.now)
+		m.end[i].PipeEnded(id, 0, false, false, errCWDead, nil, m.now)
 	}
 }
 
@@ -251,7 +250,7 @@ func cwMPConfigs() [2]Config {
 	cfg := cwConfigs()
 	for i := range 2 {
 		c := &cfg[i]
-		c.MaxPipes = 2
+		c.SessionPolicy.Limits.SteadyAttachments = 2
 		c.PSK = []byte("an example pre-shared key, 32 B!")
 		c.Declared = true
 		c.Local.Has |= wire.HasMultipath | wire.HasSessionCrypto
@@ -274,8 +273,8 @@ func (m *cwSim) join() uint64 {
 	if _, ready, err := a.JoinPrepare(id, NewSignal()); err != nil || !ready {
 		m.t.Fatalf("JoinPrepare: %v %v", ready, err)
 	}
-	plan := &shaping.UnitPlan{}
-	hello, err := a.JoinHello(id, m.info.Framing, 0, plan)
+	plan := &JoinWrite{}
+	hello, _, err := a.JoinHello(id, m.info.Framing, 0, plan)
 	if err != nil {
 		m.t.Fatal(err)
 	}
@@ -287,7 +286,7 @@ func (m *cwSim) join() uint64 {
 	if jr != JoinAccepted {
 		m.t.Fatalf("OpenHello: %v", jr)
 	}
-	reply, jr := b.ClaimHello(pj, Carrier{HasIn: true, HasOut: true}, 0, len(hello), plan)
+	reply, jr, _ := b.ClaimHello(pj, Carrier{HasIn: true, HasOut: true}, 0, len(hello), plan)
 	if jr != JoinAccepted {
 		m.t.Fatalf("ClaimHello: %v", jr)
 	}

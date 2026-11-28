@@ -271,7 +271,7 @@ func TestHTTP2RefusalWhileUplinkIdle(t *testing.T) {
 	defer client.CloseIdleConnections()
 	for _, path := range []string{"/zmux", "/moved"} {
 		t.Run(path, func(t *testing.T) {
-			pipe, err := Streaming{Client: client, URL: srv.URL + path}.Candidate().Dial(t.Context(), nil)
+			pipe, err := Streaming{Client: client, URL: srv.URL + path}.Pipe(t.Context(), zmux.DirectionBidirectional)
 			if err != nil {
 				t.Fatal(err)
 			}

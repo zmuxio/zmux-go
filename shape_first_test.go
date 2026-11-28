@@ -41,10 +41,10 @@ func TestShapingDelayFirstRecordKeepsParametersFirst(t *testing.T) {
 		}
 		sc := make(chan res, 1)
 		go func() {
-			c, err := Server(ctx, b, &Config{Shaper: f})
+			c, err := Server(ctx, b, &Config{Shaping: &ShapingPolicy{Factory: f}})
 			sc <- res{c, err}
 		}()
-		c, err := Client(ctx, a, &Config{Shaper: f})
+		c, err := Client(ctx, a, &Config{Shaping: &ShapingPolicy{Factory: f}})
 		if err != nil {
 			t.Fatalf("all=%v: client: %v", all, err)
 		}
@@ -94,7 +94,7 @@ func TestShapingDelayedFirstRecordCloseAtOnce(t *testing.T) {
 		}
 		sc <- err
 	}()
-	c, err := Client(ctx, a, &Config{Shaper: f})
+	c, err := Client(ctx, a, &Config{Shaping: &ShapingPolicy{Factory: f}})
 	if err != nil {
 		t.Fatal(err)
 	}

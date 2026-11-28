@@ -17,6 +17,7 @@ func probeSession(cfg Config) (*Session, *Pipe) {
 	p := s.pipes[0]
 	p.mp = &attach{out: OutActive, in: InOpen, probOpt: -1, weight: 1}
 	s.drawProbe(p.mp, p, true)
+	s.refreshPathTopology()
 	return s, p
 }
 
@@ -95,13 +96,15 @@ func TestProbeWaitShapingHold(t *testing.T) {
 	}{
 		{10 * Second, 3 * Second, 0, 7 * Second},
 		{10 * Second, -1, 0, 10 * Second},
-		{10 * Second, 0, 0, 9 * Second},
+		{10 * Second, 0, 0, 10 * Second},
 		{2 * Second, 3 * Second, 0, Second},
 		{Second, 500 * Millisecond, 0, Second},
 	} {
 		cfg := DefaultConfig()
 		cfg.ProbeInterval, cfg.ProbeJitter = c.k, 0
-		cfg.ShapeLimits.MaxDelay = time.Duration(c.maxDelay)
+		if c.maxDelay >= 0 {
+			cfg.ShapeLimits.Profile = &shaping.ProfileLimits{WindowSeconds: 10, MaxAddedDelay: time.Duration(c.maxDelay)}
+		}
 		s, p := probeSession(cfg)
 		p.out = &outDir{lanes: []*outLane{{}}}
 		if w := s.probeWait(p); w != c.k {
@@ -123,7 +126,7 @@ func TestProbeWaitShapingHold(t *testing.T) {
 func TestProbeHoldAtWaitStart(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ProbeInterval, cfg.ProbeJitter = 10*Second, 0
-	cfg.ShapeLimits.MaxDelay = time.Duration(3 * Second)
+	cfg.ShapeLimits.Profile = &shaping.ProfileLimits{WindowSeconds: 10, MaxAddedDelay: 3 * time.Second}
 	s, p := probeSession(cfg)
 	p.out = &outDir{lanes: []*outLane{{}}}
 	s.SetPipeShaper(0, &delayShaper{delay: time.Second})
@@ -131,7 +134,7 @@ func TestProbeHoldAtWaitStart(t *testing.T) {
 	if w := s.probeWait(p); w != 7*Second {
 		t.Fatalf("H_p = MaxDelay: wait %v, want 7 s", w)
 	}
-	s.SetShapeLimits(shaping.Limits{MaxDelay: time.Duration(2 * Second)})
+	s.SetShapeLimits(shaping.Limits{Profile: &shaping.ProfileLimits{WindowSeconds: 10, MaxAddedDelay: 2 * time.Second}})
 	if w := s.probeWait(p); w != 7*Second {
 		t.Fatalf("H_p changed during the wait: %v", w)
 	}
@@ -139,7 +142,7 @@ func TestProbeHoldAtWaitStart(t *testing.T) {
 	if w := s.probeWait(p); w != 8*Second {
 		t.Fatalf("H_p = the new bound: wait %v, want 8 s", w)
 	}
-	s.SetShapeLimits(shaping.Limits{MaxDelay: -1})
+	s.SetShapeLimits(shaping.Limits{})
 	s.drawProbe(p.mp, p, false)
 	if w := s.probeWait(p); w != 10*Second {
 		t.Fatalf("no bound: wait %v, want k", w)
@@ -175,6 +178,7 @@ func TestKeepAliveWait(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Test.Seed = 3
 	s := New(cfg, 0)
+	s.peerSeen = true
 	if k := s.cfg.KeepAlive; k != 15*Second {
 		t.Fatalf("default keep-alive %v", k)
 	}
@@ -185,7 +189,7 @@ func TestKeepAliveWait(t *testing.T) {
 	s.cfg.ProbeJitter = 0.5
 	var low, high int
 	for i := range 1000 {
-		s.timers.lastActivity = Time(i) * Time(Second)
+		s.noteActivity(Time(i) * Time(Second))
 		at, _ := s.keepAliveAt()
 		w := at.Sub(s.timers.lastActivity)
 		if again, _ := s.keepAliveAt(); again != at {
@@ -251,16 +255,18 @@ func TestProbeDeadlineKeepsDraw(t *testing.T) {
 	a := p.mp
 	s.drawProbe(a, p, false)
 	w := s.probeWait(p)
-	if got := s.mpTimers(0, false); got != Time(w) {
+	s.armPathDeadline(p, pathProbe)
+	if got := s.mpNextTimeout(); got != Time(w) {
 		t.Fatalf("first probe at %v, want %v", got, w)
 	}
 	f := a.probeCut
 	a.lastElicit = Time(3 * Second)
-	if got := s.mpTimers(Time(3*Second), false); got != Time(3*Second).Add(w) || a.probeCut != f {
+	s.armPathDeadline(p, pathProbe)
+	if got := s.mpNextTimeout(); got != Time(3*Second).Add(w) || a.probeCut != f {
 		t.Fatalf("after a send: probe at %v (draw %v -> %v), want %v", got, f, a.probeCut, Time(3*Second).Add(w))
 	}
 	due := Time(3 * Second).Add(w)
-	s.mpTimers(due, true)
+	s.mpHandleTimeout(due)
 	if !a.needPing {
 		t.Fatal("no PIPE_PING owed at the deadline")
 	}
@@ -300,11 +306,12 @@ func TestPassedSuspicionStaysPending(t *testing.T) {
 	s, p := probeSession(DefaultConfig())
 	a := p.mp
 	a.unacked, a.oldestAt = true, 0
+	s.armPathDeadline(p, pathStall)
 	if !s.hasLiveInbound() {
 		t.Fatal("no live inbound pipe in the test session")
 	}
 	late := Time(5 * Second)
-	if got := s.mpTimers(late, false); got > Time(s.tSuspect(a)) {
+	if got := s.mpNextTimeout(); got > Time(s.tSuspect(a)) {
 		t.Fatalf("passed suspicion deadline reported as %v", got)
 	}
 	s.SetNow(late)
@@ -353,6 +360,7 @@ func TestInboundSilenceLastPipe(t *testing.T) {
 	s, p := probeSession(cfg)
 	p.out = nil
 	p.mp.out = OutNone
+	s.refreshPathTopology()
 	if next := s.mpNextTimeout(); next != Time(60*Second) {
 		t.Fatalf("last inbound pipe: deadline %v, want T_dead 60 s", next)
 	}
@@ -363,6 +371,7 @@ func TestInboundSilenceLastPipe(t *testing.T) {
 	// With another live inbound pipe the limit is L_in alone.
 	q := &Pipe{id: 1, in: p.in, mp: &attach{out: OutNone, in: InOpen}}
 	s.pipes = append(s.pipes, q)
+	s.refreshPathTopology()
 	want := Time(15*Second + 2*Second/8 + 2*Second)
 	if next := s.mpNextTimeout(); next != want {
 		t.Fatalf("two inbound pipes: deadline %v, want L_in %v", next, want)
@@ -392,7 +401,7 @@ func acceptJoinForTest(t *testing.T, s *Session, id uint64) bool {
 		return false
 	}
 	c := Carrier{HasIn: true, HasOut: true}
-	reply, res := s.ClaimHello(pj, c, 0, 1<<20, &shaping.UnitPlan{})
+	reply, res, _ := s.ClaimHello(pj, c, 0, 1<<20, &JoinWrite{})
 	if res != JoinAccepted {
 		return false
 	}
@@ -430,4 +439,10 @@ func TestAnswerPingAfterAdvance(t *testing.T) {
 	if !a.needPing {
 		t.Fatal("no PIPE_PING on a pipe unproven for longer than R_p")
 	}
+}
+
+func (s *Session) mpNextTimeout() Time {
+	d := deadlineSlots{backoff: Never, redundant: Never, ping: Never, pick: Never, tier: Never}
+	s.setMultipathDeadlines(&d, false)
+	return min(d.path, d.epoch, d.advice, d.prefix, d.backoff, d.redundant, d.ping, d.pick, d.tier)
 }

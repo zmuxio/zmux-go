@@ -82,7 +82,9 @@ func TestTakeoverDetachedWebSocket(t *testing.T) {
 				served <- err
 				return
 			}
-			if err := mw.WriteMessage(append([]byte("re:"), m...)); err != nil {
+			reply := append([]byte("re:"), m.Bytes()...)
+			m.Release()
+			if err := mw.WriteMessage(reply); err != nil {
 				served <- err
 				return
 			}
@@ -94,9 +96,10 @@ func TestTakeoverDetachedWebSocket(t *testing.T) {
 	}
 	for _, want := range []string{"re:TAKE 1", "re:second"} {
 		got, err := cli.R.(zmux.MessageReader).ReadMessage(64)
-		if err != nil || string(got) != want {
-			t.Fatalf("reply %q, %v; want %q", got, err, want)
+		if err != nil || string(got.Bytes()) != want {
+			t.Fatalf("reply %q, %v; want %q", got.Bytes(), err, want)
 		}
+		got.Release()
 	}
 	if err := <-served; err != nil {
 		t.Fatal(err)

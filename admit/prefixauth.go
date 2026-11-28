@@ -5,281 +5,460 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"math"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/djylb/timeshim"
-
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/httpx"
 )
 
-// Prefix authentication tokens: a carrier
-// starts with a token of PrefixTokenLen bytes, a random Nonce and a MAC
-// over a time slot, an optional binding to the carrier's TLS handshake
-// and the Nonce. Every byte of a token is random or a MAC output. A
-// carrier decided on its HTTP request head (WebSocket, WebTransport)
-// carries the token in a request header field instead, HeaderPrefixAuth
-// by default, as base64url without padding.
 const (
-	PrefixTokenLen = prefixNonceLen + prefixTagLen
-	prefixNonceLen = 16
-	prefixTagLen   = 16
-	// PrefixAuthExporterLabel is the TLS exporter label of the binding.
+	// PrefixTokenLen is the length of a binary ticket presentation.
+	PrefixTokenLen = 64
+	// PrefixAuthExporterLabel is the exporter label for a bound presentation.
 	PrefixAuthExporterLabel = "EXPORTER-zmux-prefix-auth"
-	// HeaderPrefixAuth is the request field of the header form.
+	// HeaderPrefixAuth is the default request field for a head presentation.
 	HeaderPrefixAuth = httpx.FieldPrefixAuth
+
+	prefixHeaderLen = 86
 )
 
-// prefixHeaderLen is the length of a token in the header form.
-var prefixHeaderLen = base64.RawURLEncoding.EncodedLen(PrefixTokenLen)
-
-var prefixLabel = []byte("zmux-prefix-auth/1")
-
-// PrefixAuth configures prefix authentication tokens: what both ends must
-// agree on (Key, Slot, BindTLS and HeaderField); the verifier's own settings
-// are PrefixAuthVerifierOptions. As a zmux.CarrierCredential it presents a
-// fresh token on every carrier.
-type PrefixAuth struct {
-	// HeaderField is the request field of the header form (empty:
-	// HeaderPrefixAuth), another name only where an intermediary strips
-	// unknown fields.
+// PrefixCarrierOptions selects the form agreed for one entry.
+type PrefixCarrierOptions struct {
+	// HeaderField replaces HeaderPrefixAuth when both peers agree on a different field.
 	HeaderField string
-	// Key is the pre-shared key (required).
-	Key []byte
-	// Slot is the length of a time slot (required, a whole number of
-	// seconds).
-	Slot time.Duration
-	// BindTLS binds tokens to the carrier's TLS handshake through the
-	// exporter (PrefixAuthBinding); tokens are then valid on that carrier
-	// only.
+	// BindTLS requires a completed TLS 1.3 or QUIC handshake on the actual connection.
 	BindTLS bool
+	// AllowCleartext permits an unbound binary presentation where a third party
+	// presenting the captured token first can cause only denial of service.
+	AllowCleartext bool
 }
 
-// headerName is the request field of the header form.
-func (a *PrefixAuth) headerName() string {
-	if a.HeaderField == "" {
-		return HeaderPrefixAuth
+func (o PrefixCarrierOptions) headerName() (string, error) {
+	f := o.HeaderField
+	if f == "" || strings.EqualFold(f, HeaderPrefixAuth) {
+		return HeaderPrefixAuth, nil
 	}
-	return http.CanonicalHeaderKey(a.HeaderField)
+	if httpx.CheckField(f) != "" || strings.EqualFold(f, httpx.FieldPair) {
+		return "", prefixConfigError("reserved or invalid prefix-authentication header")
+	}
+	return http.CanonicalHeaderKey(f), nil
 }
 
-// Prefix returns a fresh token for the current time slot, bound to
-// info.TLS with BindTLS (a carrier without TLS is then an error).
+type prefixExporter func(label string, context []byte, length int) ([]byte, error)
+
+func (o PrefixCarrierOptions) binding(info *zmux.CarrierInfo, head bool, export prefixExporter) ([]byte, error) {
+	if info == nil || info.EarlyData || zmux.EarlyRequest(info.Request) || info.TLS != nil && !info.TLS.HandshakeComplete {
+		return nil, prefixConfigError("prefix authentication needs a 1-RTT carrier")
+	}
+	if o.BindTLS {
+		if info.TLS == nil || info.TLS.Version != tls.VersionTLS13 {
+			return nil, prefixConfigError("bound prefix authentication needs TLS 1.3 or QUIC")
+		}
+		if export == nil {
+			export = info.TLS.ExportKeyingMaterial
+		}
+		b, err := export(PrefixAuthExporterLabel, []byte{}, 32)
+		if err != nil || len(b) != 32 {
+			return nil, prefixConfigError("prefix-authentication exporter unavailable")
+		}
+		return b, nil
+	}
+	if !info.Encrypted && info.TLS == nil && (head || !o.AllowCleartext) {
+		return nil, prefixConfigError("prefix authentication on this entry needs an encrypted carrier")
+	}
+	return nil, nil
+}
+
+func prefixConfigError(message string) error {
+	return fmt.Errorf("%w: %s", zmux.ErrInvalidConfig, message)
+}
+
+// PrefixCredential is issued by the ticket authority. Generate ID and Key
+// independently with cryptographic randomness and keep Key confidential.
+type PrefixCredential struct {
+	ID  [16]byte
+	Key [32]byte
+}
+
+// PrefixAuthOptions configures a presenter.
+type PrefixAuthOptions struct {
+	PrefixCarrierOptions
+	// Slot is the agreed slot length, a positive whole number of seconds.
+	Slot time.Duration
+	// Clock defaults to time.Now.
+	Clock func() time.Time
+	// Random defaults to crypto/rand.Reader. A supplied reader must provide
+	// cryptographic randomness and support concurrent use.
+	Random io.Reader
+}
+
+// PrefixAuth presents a fresh token on each carrier. It implements
+// zmux.CarrierCredential and is safe for concurrent use.
+type PrefixAuth struct {
+	opts        PrefixAuthOptions
+	ticket      PrefixCredential
+	generations []PrefixGeneration
+	header      string
+}
+
+// NewPrefixAuth builds a presenter from its ticket and the provisioned outer
+// key schedule. Each presentation uses the generation covering its issue slot.
+func NewPrefixAuth(o PrefixAuthOptions, ticket PrefixCredential, generations ...PrefixGeneration) (*PrefixAuth, error) {
+	header, err := o.headerName()
+	if err != nil {
+		return nil, err
+	}
+	if !validPrefixSlot(o.Slot) || len(generations) == 0 {
+		return nil, prefixConfigError("prefix authentication needs a whole-second slot and an outer key schedule")
+	}
+	for _, g := range generations {
+		if ticket.Key == g.Key {
+			return nil, prefixConfigError("prefix authentication needs independent keys")
+		}
+	}
+	generations, err = prefixSchedule(generations)
+	if err != nil {
+		return nil, err
+	}
+	if o.Clock == nil {
+		o.Clock = time.Now
+	}
+	if o.Random == nil {
+		o.Random = rand.Reader
+	}
+	return &PrefixAuth{opts: o, ticket: ticket, generations: generations, header: header}, nil
+}
+
+// Prefix returns the presentation for a byte stream or one binary message.
 func (a *PrefixAuth) Prefix(info *zmux.CarrierInfo) ([]byte, error) {
-	var binding []byte
-	if a.BindTLS {
-		if info == nil || info.TLS == nil {
-			return nil, errors.New("zmux: PrefixAuth.BindTLS on a carrier without TLS")
-		}
-		b, err := PrefixAuthBinding(info.TLS)
-		if err != nil {
-			return nil, err
-		}
-		binding = b
-	}
-	return a.token(binding, time.Now())
+	return a.present(info, false, nil)
 }
 
-// Header returns the header form of a fresh token: the field HeaderField
-// (HeaderPrefixAuth) with the token in base64url without padding.
+// Header returns the presentation for an encrypted request head.
 func (a *PrefixAuth) Header(info *zmux.CarrierInfo) (name, value string, err error) {
-	tok, err := a.Prefix(info)
+	b, err := a.present(info, true, nil)
 	if err != nil {
 		return "", "", err
 	}
-	return a.headerName(), base64.RawURLEncoding.EncodeToString(tok), nil
+	return a.header, base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// prefixKey derives the token key from a PrefixAuth.
-func (a *PrefixAuth) prefixKey() ([]byte, int64, error) {
-	if len(a.Key) == 0 || a.Slot < time.Second || a.Slot%time.Second != 0 {
-		return nil, 0, fmt.Errorf("%w: PrefixAuth needs a Key, and a whole-second Slot", zmux.ErrInvalidConfig)
+func (a *PrefixAuth) present(info *zmux.CarrierInfo, head bool, export prefixExporter) ([]byte, error) {
+	if a == nil || a.opts.Clock == nil {
+		return nil, prefixConfigError("missing prefix presenter")
 	}
-	if f := a.HeaderField; f != "" && !strings.EqualFold(f, HeaderPrefixAuth) {
-		// The pairing field's rules: a field no protocol uses, the
-		// pairing field itself included.
-		if httpx.CheckField(f) != "" || strings.EqualFold(f, httpx.FieldPair) {
-			return nil, 0, fmt.Errorf("%w: PrefixAuth.HeaderField %q is reserved or not a header field name", zmux.ErrInvalidConfig, f)
-		}
-	}
-	m := hmac.New(sha256.New, a.Key)
-	m.Write(prefixLabel)
-	return m.Sum(nil), int64(a.Slot / time.Second), nil
-}
-
-// prefixTag computes a token's tag with a keyed MAC state m.
-func prefixTag(m hash.Hash, slot uint64, binding, nonce []byte) (out [prefixTagLen]byte) {
-	m.Reset()
-	var hdr [9]byte
-	binary.BigEndian.PutUint64(hdr[:8], slot)
-	hdr[8] = byte(len(binding))
-	m.Write(hdr[:])
-	m.Write(binding)
-	m.Write(nonce)
-	var sum [sha256.Size]byte
-	m.Sum(sum[:0])
-	copy(out[:], sum[:])
-	return out
-}
-
-func (a *PrefixAuth) token(binding []byte, now time.Time) ([]byte, error) {
-	k, slot, err := a.prefixKey()
+	binding, err := a.opts.binding(info, head, export)
 	if err != nil {
 		return nil, err
 	}
-	if len(binding) > 255 {
-		return nil, fmt.Errorf("%w: binding over 255 bytes", zmux.ErrInvalidConfig)
+	slot, ok := prefixSlot(a.opts.Clock(), a.opts.Slot)
+	if !ok {
+		return nil, prefixConfigError("prefix-authentication clock precedes the Unix epoch")
 	}
+	for _, g := range a.generations {
+		if g.contains(slot) {
+			return a.makeToken(slot, binding, g.Key)
+		}
+	}
+	return nil, prefixConfigError("no outer key for the current issue slot")
+}
+
+func (a *PrefixAuth) makeToken(slot uint64, binding []byte, key [32]byte) ([]byte, error) {
 	b := make([]byte, PrefixTokenLen)
-	if _, err := rand.Read(b[:prefixNonceLen]); err != nil {
+	if _, err := io.ReadFull(a.opts.Random, b[:16]); err != nil {
 		return nil, err
 	}
-	tag := prefixTag(hmac.New(sha256.New, k), uint64(floorDiv(now.Unix(), slot)), binding, b[:prefixNonceLen])
-	copy(b[prefixNonceLen:], tag[:])
+	outer := hmac.New(sha256.New, key[:])
+	mask := prefixMAC(outer, 0, b[:16])
+	subtle.XORBytes(b[16:32], a.ticket.ID[:], mask[:])
+	tag := prefixMAC(outer, 1, b[:32])
+	copy(b[32:48], tag[:])
+	tag = prefixTicketTag(hmac.New(sha256.New, a.ticket.Key[:]), a.ticket.ID, b[:48], slot, binding)
+	copy(b[48:], tag[:])
 	return b, nil
 }
 
-// PrefixAuthBinding returns the binding of a carrier: 32 bytes of its
-// exporter (a *tls.ConnectionState such as zmux.CarrierInfo.TLS, or Exporter's
-// result) with PrefixAuthExporterLabel and an empty context.
-func PrefixAuthBinding(e zmux.KeyingMaterialExporter) ([]byte, error) {
-	return e.ExportKeyingMaterial(PrefixAuthExporterLabel, []byte{}, 32)
+func validPrefixSlot(slot time.Duration) bool { return slot > 0 && slot%time.Second == 0 }
+
+func prefixSlot(now time.Time, length time.Duration) (uint64, bool) {
+	seconds := now.Unix()
+	if seconds < 0 {
+		return 0, false
+	}
+	return uint64(seconds) / uint64(length/time.Second), true
 }
 
-// PrefixAuthVerifier verifies tokens and rejects each Nonce after its
-// first use. It is safe for concurrent use.
-type PrefixAuthVerifier struct {
-	pool   sync.Pool
-	cache  *ReplayFilter
-	now    func() time.Time
-	header string
-	slot   int64
-	skew   int64
-	bind   bool
+func prefixMAC(mac hash.Hash, domain byte, body []byte) [sha256.Size]byte {
+	mac.Reset()
+	mac.Write([]byte{domain})
+	mac.Write(body)
+	return prefixSum(mac)
 }
 
-// PrefixAuthVerifierOptions are the settings only a verifier reads; the zero
-// value is the default.
+func prefixTicketTag(mac hash.Hash, id [16]byte, envelope []byte, slot uint64, binding []byte) [sha256.Size]byte {
+	mac.Reset()
+	mac.Write([]byte{2})
+	mac.Write(id[:])
+	mac.Write(envelope)
+	var end [9]byte
+	binary.BigEndian.PutUint64(end[:8], slot)
+	end[8] = byte(len(binding))
+	mac.Write(end[:])
+	mac.Write(binding)
+	return prefixSum(mac)
+}
+
+func prefixSum(mac hash.Hash) (sum [sha256.Size]byte) {
+	mac.Sum(sum[:0])
+	return sum
+}
+
+// PrefixAuthVerifierOptions configures a verifier on one admission entry.
 type PrefixAuthVerifierOptions struct {
-	// Skew is the number of slots on either side of the verifier's current
-	// slot that it also accepts (0: only the current one).
-	Skew int
-	// CacheSize bounds the Nonces the verifier remembers while their slot
-	// is acceptable (0: 65536, as an empty cache would reject every
-	// token); a token that finds it full is rejected.
-	CacheSize int
-	// Clock is the verifier's time source, its replay filter's included
-	// (nil: the host clock).
-	Clock timeshim.Clock
+	PrefixCarrierOptions
+	// Store is shared by every entrance of the domain.
+	Store PrefixStore
+	// Clock defaults to time.Now.
+	Clock func() time.Time
+	// MaxSkew is the local ceiling on the store's Skew. Zero uses two slots.
+	MaxSkew int
+	// Reject selects the verdict on refusal. Zero selects zmux.VerdictClose.
+	// zmux.VerdictFallback and zmux.VerdictStall are also supported.
+	Reject zmux.AdmissionVerdict
 }
 
-// NewPrefixAuthVerifier returns a verifier for a with o's settings; an
-// invalid a or o (a negative field) is an zmux.ErrInvalidConfig error.
-func NewPrefixAuthVerifier(a *PrefixAuth, o PrefixAuthVerifierOptions) (*PrefixAuthVerifier, error) {
-	k, slot, err := a.prefixKey()
+// PrefixAuthVerifier verifies presentations against a shared ticket authority.
+type PrefixAuthVerifier struct {
+	opts   PrefixAuthVerifierOptions
+	window PrefixWindow
+	header string
+}
+
+// NewPrefixAuthVerifier configures a verifier for the store's domain.
+func NewPrefixAuthVerifier(o PrefixAuthVerifierOptions) (*PrefixAuthVerifier, error) {
+	header, err := o.headerName()
 	if err != nil {
 		return nil, err
 	}
-	if o.Skew < 0 || o.CacheSize < 0 {
-		return nil, fmt.Errorf("%w: PrefixAuthVerifierOptions with a negative field", zmux.ErrInvalidConfig)
+	if o.Store == nil {
+		return nil, prefixConfigError("prefix verifier needs a ticket authority")
 	}
-	// The acceptance window, (Skew+1) slots, must be a duration.
-	if int64(o.Skew) >= math.MaxInt64/int64(time.Second)/slot {
-		return nil, fmt.Errorf("%w: PrefixAuthVerifierOptions.Skew %d slots is beyond any duration", zmux.ErrInvalidConfig, o.Skew)
+	w := o.Store.Window()
+	if o.MaxSkew == 0 {
+		o.MaxSkew = 2
 	}
-	clk := timeshim.Or(o.Clock)
-	size := o.CacheSize
-	if size == 0 {
-		size = 1 << 16
+	if !w.valid() || w.Skew > o.MaxSkew {
+		return nil, prefixConfigError("invalid prefix slot length or skew")
 	}
-	v := &PrefixAuthVerifier{bind: a.BindTLS, header: a.headerName(), slot: slot, skew: int64(o.Skew), now: clk.Now}
-	// A token of slot s verifies while the clock is within skew slots of
-	// s: within (skew+1) slots of the slot's start.
-	v.cache, err = NewReplayFilter(ReplayConfig{Window: time.Duration(int64(o.Skew)+1) * time.Duration(slot) * time.Second,
-		Max: size, Clock: o.Clock})
-	if err != nil {
-		return nil, err
+	switch o.Reject {
+	case 0:
+		o.Reject = zmux.VerdictClose
+	case zmux.VerdictClose, zmux.VerdictFallback, zmux.VerdictStall:
+	default:
+		return nil, prefixConfigError("invalid prefix rejection verdict")
 	}
-	v.pool.New = func() any { return hmac.New(sha256.New, k) }
-	return v, nil
+	if o.Clock == nil {
+		o.Clock = time.Now
+	}
+	return &PrefixAuthVerifier{opts: o, window: w, header: header}, nil
 }
 
-// Verify reports whether token is valid for binding and its Nonce is new.
-func (v *PrefixAuthVerifier) Verify(token, binding []byte) bool {
-	if len(token) != PrefixTokenLen || len(binding) > 255 {
-		return false
+// Admission configures the listener's single admission decision and read
+// boundary. Set the desired timeout and stall settings before attaching it to
+// the listener.
+func (v *PrefixAuthVerifier) Admission() *zmux.Admission {
+	if v == nil || v.opts.Store == nil {
+		return &zmux.Admission{} // NewListener reports the missing verifier.
 	}
-	nonce, tag := token[:prefixNonceLen], token[prefixNonceLen:]
-	cur := floorDiv(v.now().Unix(), v.slot)
-	m := v.pool.Get().(hash.Hash)
-	found, at := false, int64(0)
-	for d := int64(0); d <= 2*v.skew && !found; d++ {
-		// cur, cur-1, cur+1, cur-2, ...
-		s := cur + (d+1)/2
-		if d%2 == 1 {
-			s = cur - (d+1)/2
-		}
-		want := prefixTag(m, uint64(s), binding, nonce)
-		if hmac.Equal(want[:], tag) {
-			found, at = true, s
-		}
-	}
-	v.pool.Put(m)
-	if !found {
-		return false
-	}
-	return v.cache.checkAt(nonce, at*v.slot*1000, v.now().UnixMilli()) == ReplayFresh
+	return &zmux.Admission{Peek: PrefixTokenLen, MaxMessage: PrefixTokenLen, Decide: v.Decide, Refuse: v.opts.Reject}
 }
 
-// Decide is a zmux.Admission.Decide that accepts a carrier whose prefix is a
-// valid token, without the token, and returns zmux.VerdictFallback otherwise.
-// On a carrier decided on its request head (zmux.CarrierInfo.Stage StageHead) the
-// token is the request's only HeaderField field (HeaderPrefixAuth), 43
-// characters of base64url without padding, and the decision has no
-// prefix. With BindTLS, a carrier without TLS is not accepted. The
-// Admission's Peek must be PrefixTokenLen; a carrier decided on its
-// request head reads none.
-func (v *PrefixAuthVerifier) Decide(_ context.Context, info zmux.CarrierInfo, prefix []byte) zmux.Decision {
-	no := zmux.Decision{Verdict: zmux.VerdictFallback}
-	var binding []byte
-	if v.bind {
-		if info.TLS == nil {
-			return no
-		}
-		b, err := PrefixAuthBinding(info.TLS)
-		if err != nil {
-			return no
-		}
-		binding = b
+// Decide accepts a stream prefix, a whole binary message or a request head at
+// the configured entry. A stream may have bytes after the token; they remain
+// available to the inner protocol. Configure listeners with Admission.
+func (v *PrefixAuthVerifier) Decide(ctx context.Context, info zmux.CarrierInfo, prefix []byte) zmux.Decision {
+	return v.decide(ctx, info, prefix, nil)
+}
+
+func (v *PrefixAuthVerifier) decide(ctx context.Context, info zmux.CarrierInfo, prefix []byte, export prefixExporter) zmux.Decision {
+	if v == nil || v.opts.Store == nil {
+		return zmux.Decision{Verdict: zmux.VerdictClose}
 	}
-	if info.Stage != zmux.StageHead {
-		if !v.Verify(prefix, binding) {
-			return no
+	no := zmux.Decision{Verdict: v.opts.Reject}
+	head := info.Stage == zmux.StageHead
+	if head && info.HasAuthenticatedEnvelope() && !info.EarlyData && !zmux.EarlyRequest(info.Request) && ctx.Err() == nil {
+		return zmux.Decision{Verdict: zmux.VerdictAccept}
+	}
+	token, skip := v.decode(&info, prefix, head)
+	if len(token) != PrefixTokenLen {
+		return no
+	}
+	binding, err := v.opts.binding(&info, head, export)
+	if err != nil || ctx.Err() != nil {
+		return no
+	}
+	id, ok := v.redeem(ctx, token, binding)
+	if !ok {
+		return no
+	}
+	d := zmux.Decision{Verdict: zmux.VerdictAccept, Skip: skip}
+	if v.opts.BindTLS {
+		d.Value = carrierio.BoundPrefixPrincipal(id)
+	}
+	return d
+}
+
+func (v *PrefixAuthVerifier) decode(info *zmux.CarrierInfo, prefix []byte, head bool) ([]byte, int) {
+	if !head {
+		if len(prefix) < PrefixTokenLen || info.Framing == zmux.FramingRecords && len(prefix) != PrefixTokenLen {
+			return nil, 0
 		}
-		return zmux.Decision{Verdict: zmux.VerdictAccept, Skip: PrefixTokenLen}
+		return prefix[:PrefixTokenLen], PrefixTokenLen
 	}
 	if info.Request == nil {
-		return no
+		return nil, 0
 	}
-	vals := info.Request.Header.Values(v.header)
-	if len(vals) != 1 || len(vals[0]) != prefixHeaderLen {
-		return no
+	var field string
+	for name, values := range info.Request.Header {
+		if strings.EqualFold(name, v.header) {
+			if field != "" || len(values) != 1 || len(values[0]) != prefixHeaderLen {
+				return nil, 0
+			}
+			field = values[0]
+		}
 	}
-	var tok [PrefixTokenLen]byte
-	if n, err := base64.RawURLEncoding.Strict().Decode(tok[:], []byte(vals[0])); err != nil || n != PrefixTokenLen {
-		return no
+	var token [PrefixTokenLen]byte
+	if n, err := base64.RawURLEncoding.Strict().Decode(token[:], []byte(field)); err != nil || n != PrefixTokenLen {
+		return nil, 0
 	}
-	if !v.Verify(tok[:], binding) {
-		return no
-	}
-	return zmux.Decision{Verdict: zmux.VerdictAccept}
+	return token[:], 0
 }
+
+// BoundPrincipal returns the ticket ID proven by a bound presentation on the
+// session's accepted bootstrap carrier. Both halves of a split bootstrap
+// must prove the same bound ticket ID to supply a principal.
+// Call it on a session delivered by Listener.Accept. An unbound presentation
+// supplies no principal; use the identity from an independently authenticated
+// inner credential when applicable.
+func BoundPrincipal(c *zmux.Conn) (id [16]byte, ok bool) {
+	if c == nil {
+		return id, false
+	}
+	return zmux.BootstrapAdmissionAs[carrierio.BoundPrefixPrincipal](c)
+}
+
+func (v *PrefixAuthVerifier) redeem(ctx context.Context, token, binding []byte) (id [16]byte, ok bool) {
+	store := v.opts.Store
+	local, ok := prefixSlot(v.opts.Clock(), v.window.Slot)
+	if !ok {
+		return id, false
+	}
+	schedule, hint := store.LocalSchedule()
+	if schedule == nil || ctx.Err() != nil {
+		return id, false
+	}
+	precheck := max(local, hint)
+	skew := uint64(v.window.Skew)
+	generation, ok := prefixOuterGeneration(schedule.generations, token, precheck, skew)
+	defer clear(generation.Key[:])
+	if !ok {
+		return id, false
+	}
+	floor, err := store.Floor(ctx)
+	if err != nil || ctx.Err() != nil {
+		return id, false
+	}
+	current := max(local, floor)
+	if !schedule.sameEligibleGenerations(precheck, current, skew) {
+		clear(generation.Key[:])
+		generation, ok = prefixOuterGeneration(schedule.generations, token, current, skew)
+		if !ok {
+			return id, false
+		}
+	}
+	mask := prefixMAC(hmac.New(sha256.New, generation.Key[:]), 0, token[:16])
+	subtle.XORBytes(id[:], token[16:32], mask[:])
+	ticket, live, err := store.Lookup(ctx, id)
+	defer clear(ticket.Key[:])
+	if err != nil || !live || ticket.ID != id || !ticket.liveAt(current) {
+		return id, false
+	}
+	slot, ok := matchPrefixSlot(hmac.New(sha256.New, ticket.Key[:]), id, token, binding, &generation, current, skew)
+	if !ok || ctx.Err() != nil {
+		return id, false
+	}
+	local, ok = prefixSlot(v.opts.Clock(), v.window.Slot)
+	if !ok {
+		return id, false
+	}
+	claim := PrefixClaim{ID: id, Nonce: [16]byte(token[:16]), CommitID: randomPrefixCommitID(),
+		Version: ticket.Version, Schedule: schedule.version, Generation: generation.FirstSlot, IssueSlot: slot, CheckedSlot: current, LocalSlot: local}
+	accepted, err := store.Claim(ctx, claim)
+	if err != nil {
+		resolve, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+		accepted, err = store.ResolveClaim(resolve, claim)
+	}
+	return id, accepted && err == nil && ctx.Err() == nil
+}
+
+func randomPrefixCommitID() (id [16]byte) {
+	// crypto/rand.Read always fills the buffer.
+	_, _ = rand.Read(id[:])
+	return id
+}
+
+func prefixOuterGeneration(generations []PrefixGeneration, token []byte, current, skew uint64) (selected PrefixGeneration, unique bool) {
+	var matches int
+	for i := range generations {
+		g := &generations[i]
+		if !g.intersects(current, skew) {
+			continue
+		}
+		tag := prefixMAC(hmac.New(sha256.New, g.Key[:]), 1, token[:32])
+		if hmac.Equal(tag[:16], token[32:48]) {
+			selected = *g
+			matches++
+		}
+	}
+	return selected, matches == 1
+}
+
+func matchPrefixSlot(mac hash.Hash, id [16]byte, token, binding []byte, g *PrefixGeneration, current, skew uint64) (slot uint64, matched bool) {
+	for trial := uint64(0); trial <= 2*skew; trial++ {
+		candidate, valid := prefixCandidate(current, skew, trial)
+		tag := prefixTicketTag(mac, id, token[:48], candidate, binding)
+		if hmac.Equal(tag[:16], token[48:]) && valid && g.contains(candidate) {
+			slot, matched = candidate, true
+		}
+	}
+	return slot, matched
+}
+
+func prefixCandidate(current, skew, trial uint64) (uint64, bool) {
+	if trial < skew {
+		d := skew - trial
+		if d <= current {
+			return current - d, true
+		}
+	} else {
+		d := trial - skew
+		if d <= math.MaxUint64-current {
+			return current + d, true
+		}
+	}
+	return 0, false
+}
+
+func prefixLastSlot(issue, skew uint64) uint64 { return issue + min(skew, math.MaxUint64-issue) }

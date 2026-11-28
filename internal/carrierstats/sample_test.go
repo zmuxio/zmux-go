@@ -32,8 +32,8 @@ func TestSharedObservation(t *testing.T) {
 	now = now.Add(1)
 	s.sample(clock, runQuery) // the refresh itself still returns first
 	next := s.sample(clock, runQuery)
-	if next.ID != first.ID || next.Generation != 0 || next.Lost != 2 || !next.At.After(first.At) || a.reads != 2 {
-		t.Fatalf("QUIC correction = %+v, reads = %d", next, a.reads)
+	if next.ID != first.ID || next.Generation != 0 || next.Lost != first.Lost || !next.At.Equal(first.At) || a.reads != 2 {
+		t.Fatalf("QUIC correction refreshed an interval without sends: %+v, reads = %d", next, a.reads)
 	}
 	now = now.Add(time.Second)
 	a.readout.Sent = 3
@@ -236,4 +236,25 @@ func TestPrimePanicReleasesWaiters(t *testing.T) {
 			t.Fatal("waiting attachment was not released")
 		}
 	})
+}
+
+func TestLossVersionAdvancesOnWithdrawalWithinCounterGeneration(t *testing.T) {
+	s := &Sampler{source: SourceQUICGo}
+	for i, counts := range []Readout{
+		{Known: true, Sent: 100, Lost: 1},
+		{Known: true, Sent: 200, Lost: 2},
+		{Known: true, Sent: 300, Lost: 1},
+		{Known: true, Sent: 400, Lost: 2},
+	} {
+		s.query(func() time.Time { return time.Unix(int64(i+1), 0) }, func() Readout { return counts }, SourceQUICGo)
+		if s.last.Generation != 0 {
+			t.Fatalf("step %d: changed counter generation: %+v", i, s.last)
+		}
+		if want := uint64(i / 2); s.last.LossVersion != want {
+			t.Fatalf("step %d: version = %d, want %d", i, s.last.LossVersion, want)
+		}
+		if want := i%2 == 1; (s.last.Interval > 0) != want {
+			t.Fatalf("step %d: interval = %v, want presence %v", i, s.last.Interval, want)
+		}
+	}
 }

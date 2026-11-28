@@ -1,191 +1,15 @@
 package core
 
-import "github.com/zmuxio/zmux-go/internal/wire"
-
-// Opportunistic reinjection and penalization: when the
-// peer's flow control, or a binding waiting for acknowledgements on the pipe
-// it moves from, blocks new data and the blocking data was sent on a
-// slower pipe long enough ago, it is sent again once on the eligible pipe
-// with the earliest arrival, and the slow pipe is penalized.
-
-// noteBlocked remembers a stream direction blocked by its stream credit or
-// by a binding that moves.
-func (s *Session) noteBlocked(st *Stream) {
-	if s.mp == nil || st.snd.oppListed {
-		return
-	}
-	st.snd.oppListed = true
-	s.mp.blocked = append(s.mp.blocked, st)
-}
-
-// streamBlocked reports a direction with data waiting that cannot send new
-// data: its stream credit holds it, or its binding waits for the
-// acknowledgement of its data on the pipe it moves from.
-func streamBlocked(st *Stream) bool {
-	sp := &st.snd
-	if st.discarded || !st.hasS || sp.reset || !st.idSet || sp.sendEnd() <= max64(sp.sent, sp.q.base) {
-		return false
-	}
-	return sp.sent >= sp.maxData || sp.mps != nil && sp.mps.bind.set && sp.mps.bind.moving
-}
-
-// opportunistic runs at a write opportunity of the decision's pipe when it
-// is the eligible pipe with the earliest arrival.
-func (s *Session) opportunistic(d *decision, w *recWriter) {
-	m := s.mp
-	if d.g == nil || !d.takes || d.fastest != d.p || w.dataHeld() {
-		return
-	}
-	f := d.p
-	connBlocked := s.conn.sent >= s.conn.sendMax && s.sched.mask != 0
-	keep := m.blocked[:0]
-	for _, st := range m.blocked {
-		if !streamBlocked(st) {
-			st.snd.oppListed = false
-			continue
-		}
-		keep = append(keep, st)
-	}
-	clear(m.blocked[len(keep):])
-	m.blocked = keep
-	if len(m.blocked) == 0 && !connBlocked {
-		return
-	}
-	for _, st := range m.blocked {
-		if !s.oppSend(w, f, st) {
-			return
-		}
-	}
-	if connBlocked {
-		s.oppSend(w, f, nil)
-	}
-}
-
-// oppSend re-sends one chunk of blocking data on f; st nil means the
-// session's blocking data (the unacknowledged stream data sent first). It
-// returns false when the batch is full.
-func (s *Session) oppSend(w *recWriter, f *Pipe, st *Stream) bool {
-	p, e := s.blockingFrame(f, st)
-	if e == nil {
-		return true
-	}
-	a := p.mp
-	fa := f.mp
-	pto := s.pto(a)
-	thr := maxD(2*fa.rtt.smoothed+s.ack.peerDelay, minD(pto, 2*e.due))
-	if s.now.Sub(e.sent) <= thr {
-		return true
-	}
-	if st = s.sendOf(&e.d); st == nil { // blockingFrame found it live
-		return true
-	}
-	sp := &st.snd
-	ms := sp.mpState()
-	if ms.repair.hi != 0 {
-		return true
-	}
-	// The next part of the blocking data not acknowledged and not re-sent.
-	lo := max64(e.d.off, ms.acked.prefix())
-	hi := e.d.off + e.d.n
-	ms.oppSent.each(func(r rng) {
-		if r.lo <= lo && lo < r.hi {
-			lo = r.hi
-		}
-	})
-	if lo < sp.preLen {
-		lo = 0
-	}
-	hi = min64(hi, min64(sp.q.end, lo+uint64(s.cfg.SpreadChunk)))
-	if lo >= hi {
-		return true
-	}
-	if w.gateRoom() == 0 {
-		return false // the shaping gate holds it: no record is planned for it
-	}
-	room := w.dataFit(w.room() - wire.StreamHeaderLen(st.id, lo, int(hi-lo), true))
-	if room <= 0 {
-		return false
-	}
-	n := min64(hi-lo, uint64(room))
-	data, blk := sp.q.peek(lo, int(n))
-	if len(data) == 0 {
-		return true
-	}
-	n = uint64(len(data))
-	if !w.stream(st.id, lo, data, blk, false) {
-		return false
-	}
-	w.logFrame(frameDesc{kind: dStream, id: st.id, off: lo, n: n})
-	w.spendData(n)
-	ms.oppSent.add(lo, lo+n)
-	st.countFrame(lo, n)
-	w.notEarned += uint64(wire.StreamHeaderLen(st.id, lo, int(n), true)) + n
-	s.stats.BytesReinjected += n
-	s.stats.BytesOpportunistic += n
-	f.mp.oppBytes += n
-	s.penalize(p, true)
-	return true
-}
-
-// blockingFrame finds the retained frame that carries the blocking data:
-// st's lowest unacknowledged byte, or (st nil) the oldest unacknowledged
-// stream frame; only frames on pipes other than f count.
-func (s *Session) blockingFrame(f *Pipe, st *Stream) (*Pipe, *retained) {
-	var lo uint64
-	var id uint64
-	if st != nil {
-		id = st.id
-		lo = 0
-		if ms := st.snd.mps; ms != nil {
-			lo = ms.acked.prefix()
-		}
-	}
-	var bp *Pipe
-	var best *retained
-	for _, q := range s.pipes {
-		if q.out == nil || q.mp == nil {
-			continue
-		}
-		for _, l := range q.out.lanes {
-			for i := range l.log {
-				e := &l.log[i]
-				if e.d.kind != dStream || e.d.n == 0 || e.reinjected {
-					continue
-				}
-				if st != nil && (e.d.id != id || lo < e.d.off || lo >= e.d.off+e.d.n) {
-					continue
-				}
-				if !s.sendsData(&e.d) {
-					continue // its stream ended: nothing of it blocks
-				}
-				if best == nil || e.sent < best.sent {
-					bp, best = q, e
-				}
-				break // a lane's log is in sending order: its first match is its oldest
-			}
-		}
-	}
-	if best == nil || bp == f {
-		return nil, nil
-	}
-	return bp, best
-}
-
-// sendsData reports whether a retained STREAM frame's stream still sends
-// data: not discarded, not reset, not yet terminal.
-func (s *Session) sendsData(d *frameDesc) bool {
-	st := s.sendOf(d)
-	return st != nil && !st.snd.reset && st.snd.state < sendDataRecvd
-}
-
 // penalize halves R_p, discards its samples and keeps new data off p until
 // everything sent on it is acknowledged (once per episode).
-func (s *Session) penalize(p *Pipe, migrateAffinity bool) {
+func (s *Session) penalize(p *Pipe) {
 	a := p.mp
 	if a.penalized {
 		return
 	}
 	a.penalized = true
+	s.relativeStallChanged()
+	s.wakePrefix()
 	s.stats.Penalties++
 	a.penaltyEnd = p.out.snd.so
 	e := &p.out.snd.re
@@ -196,50 +20,18 @@ func (s *Session) penalize(p *Pipe, migrateAffinity bool) {
 	if q := a.quality; q != nil {
 		q.rate = min(q.rate, e.r)
 	}
-	if migrateAffinity {
-		s.reinjectPenalized(p)
-	}
+	s.syncPipeHealth(p)
 	s.capacityChanged()
 	s.checkTakeover()
-}
-
-// reinjectPenalized re-sends, once per penalty, the unacknowledged stream
-// data on p of every affinity direction bound to p: the penalty keeps new
-// data off p, so the binding moves, and its data left on the slow pipe
-// would otherwise hold the receiver until p delivers it. A frame is re-sent
-// at most once for penalties; the copies are bounded by what p has in
-// flight and go where reinjected information goes.
-func (s *Session) reinjectPenalized(p *Pipe) {
-	if p.out == nil {
-		return
-	}
-	found := false
-	for _, ol := range p.out.lanes {
-		for i := range ol.log {
-			e := &ol.log[i]
-			if e.d.kind != dStream || e.reinjected || e.penalized {
-				continue
-			}
-			st := s.sendOf(&e.d)
-			if st == nil || s.policyOf(st) != PolicyAffinity {
-				continue
-			}
-			if m := st.snd.mps; m == nil || !m.bind.set || m.bind.pipe != p.id {
-				continue
-			}
-			e.penalized, found = true, true
-			s.lost(&e.d)
-		}
-	}
-	if found {
-		s.wakeAllWriters()
-	}
 }
 
 // penaltyAcked ends an episode once everything sent on p is acknowledged.
 func (s *Session) penaltyAcked(p *Pipe) {
 	if a := p.mp; a.penalized && p.out.snd.cum >= a.penaltyEnd {
 		a.penalized = false
+		s.relativeStallChanged()
+		s.wakePrefix()
+		s.syncPipeHealth(p)
 		s.capacityChanged()
 		s.checkTakeover()
 		s.wakeAllWriters()

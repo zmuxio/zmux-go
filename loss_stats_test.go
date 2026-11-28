@@ -2,6 +2,7 @@ package zmux_test
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -24,12 +25,25 @@ func TestPipeStatsLoss(t *testing.T) {
 	if _, err := e.client.AddPipe(ctx, zmux.NetPipe(nc), zmux.PipeOptions{SendStandby: zmux.Set(true)}); err != nil {
 		t.Fatal(err)
 	}
-	busy(t, e)
-	time.Sleep(300 * time.Millisecond)
+	go echoAll(ctx, e.server)
+	st, err := e.client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Write([]byte("traffic")); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	if got, err := io.ReadAll(st); err != nil || string(got) != "traffic" {
+		t.Fatalf("echo %q, %v", got, err)
+	}
 	p, _ := e.client.Pipe(0)
-	st, _ := p.Stats()
-	if st.BytesLost != 0 || st.RecordsLost != 0 {
-		t.Fatalf("without loss: %d bytes, %d records lost", st.BytesLost, st.RecordsLost)
+	stats, ok := p.Stats()
+	if !ok {
+		t.Fatal("bootstrap pipe retired")
+	}
+	if stats.BytesLost != 0 || stats.RecordsLost != 0 {
+		t.Fatalf("without loss: %d bytes, %d records lost", stats.BytesLost, stats.RecordsLost)
 	}
 	// A failed pipe retires at once here, so its failure figures are
 	// checked in the core (TestStatsBytesLost).

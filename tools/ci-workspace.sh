@@ -7,5 +7,5 @@ export GOWORK="$RUNNER_TEMP/go.work"
 root=$GITHUB_WORKSPACE
 go work init
 go work use "$root" "$root/zmuxquic" "$root/zmuxh3" "$root/zmuxws" "$root/seal" \
-  "$root/examples/xorpipe" "$root/interop/dgpeer" "$root/interop/webpeer"
+  "$root/examples/xorpipe" "$root/interop/webpeer"
 echo "GOWORK=$GOWORK" >> "$GITHUB_ENV"

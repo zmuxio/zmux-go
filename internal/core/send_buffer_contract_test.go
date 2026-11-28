@@ -29,21 +29,22 @@ func TestSendBufferFixedMaximumCannotUndercutInitial(t *testing.T) {
 		t.Fatalf("fixed maximum under initial: %d", b)
 	}
 }
-func TestSendBufferSharedHeadroomIncludesUnchargedGrowth(t *testing.T) {
+func TestSendBufferSharedHeadroomCountsRetainedOnce(t *testing.T) {
 	s := highBDPSendSession()
 	s.cfg.MemoryBudget = 1
 	b := NewBudget(512 << 20)
-	b.Add(400 << 20)
+	if !b.TryCharge(408 << 20) {
+		t.Fatal("initial charge failed")
+	}
 	s.cfg.Budget = b
 	s.conn.sendHeld, s.mp.retained = 8<<20, 8<<20
-	if n := s.retransmitBudget(); n != 112<<20 {
-		t.Fatalf("shared uncharged grant: %d", n)
+	const want = (8 << 20) + (104<<20)/sendBlockCharge*blockSize
+	if n := s.retransmitBudget(); n != want {
+		t.Fatalf("shared grant %d, want %d with retained data counted once", n, want)
 	}
-	s.ChargeBudget()
-	if n := s.retransmitBudget(); n != 112<<20 {
-		t.Fatalf("double counted own charge: %d", n)
+	if !b.TryCharge(64 << 20) {
+		t.Fatal("additional charge failed")
 	}
-	b.Add(64 << 20)
 	if n := s.retransmitBudget(); n != 64<<20 {
 		t.Fatalf("64 MiB floor lost: %d", n)
 	}

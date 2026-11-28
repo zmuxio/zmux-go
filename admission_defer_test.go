@@ -9,12 +9,77 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/timeshim"
 )
+
+type deferredReleaseClock struct {
+	*timeshim.Fake
+	entered chan struct{}
+	resume  chan struct{}
+	armed   atomic.Bool
+}
+
+func (c *deferredReleaseClock) Now() time.Time {
+	if c.armed.CompareAndSwap(true, false) {
+		close(c.entered)
+		<-c.resume
+	}
+	return c.Fake.Now()
+}
+
+func TestDeferredAdmitFirstCountsCloseBeforeReturn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock := &deferredReleaseClock{Fake: timeshim.NewFake(time.Unix(1, 0)),
+			entered: make(chan struct{}), resume: make(chan struct{})}
+		unhold := sync.OnceFunc(func() { close(clock.resume) })
+		defer unhold()
+		l := mustNewListener(&ListenerConfig{Config: &Config{ClockDomain: NewClockDomain(clock)},
+			Admission: &Admission{PeekTimeout: time.Minute, Decide: func(context.Context, CarrierInfo, []byte) Decision {
+				return Decision{Verdict: VerdictDefer}
+			}}})
+		t.Cleanup(func() { _ = l.Close() })
+		a, ok := l.Adapter().AdmitUpgrade(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody), nil, nil)
+		if !ok {
+			t.Fatal("upgrade was not deferred")
+		}
+		first, finish := make(chan struct{}), make(chan struct{})
+		admitted := make(chan bool, 1)
+		go func() {
+			_, ok := a.AdmitFirst(t.Context(), func(ctx context.Context) (PipeIO, error) {
+				close(first)
+				<-ctx.Done()
+				<-finish
+				return PipeIO{}, ctx.Err()
+			})
+			admitted <- ok
+		}()
+		<-first
+		clock.armed.Store(true)
+		_ = l.Close()
+		// Hold the stop callback in its time sample. The first carrier's
+		// handler takes its own error path before the callback can finish.
+		<-clock.entered
+		close(finish)
+		if <-admitted {
+			t.Fatal("first carrier admitted after listener close")
+		}
+		want := AdmissionStats{Closed: 1}
+		if got := l.Stats().Admission; got != want {
+			t.Fatalf("first carrier returned with admission stats %+v, want %+v", got, want)
+		}
+		unhold()
+		synctest.Wait()
+		if got := l.Stats().Admission; got != want {
+			t.Fatalf("both cleanup paths counted admission stats %+v, want %+v", got, want)
+		}
+	})
+}
 
 // VerdictDefer defers a decision only on an upgrade's head (AdmitUpgrade):
 // the arrival is returned unaccepted and uncounted, the head's metadata
@@ -98,7 +163,7 @@ func TestAdmissionDeferredByteStreamTimeout(t *testing.T) {
 			const timeout = time.Second
 			clk := timeshim.NewFake(time.Now())
 			cfg := mpConfig()
-			cfg.Clock = clk
+			cfg.ClockDomain = NewClockDomain(clk)
 			called := make(chan struct{}, 1)
 			lst := mustNewListener(&ListenerConfig{Config: cfg,
 				Admission: &Admission{Peek: tc.peek, MaxPeek: 4, PeekTimeout: timeout, FallbackOnPeekTimeout: true,
@@ -232,15 +297,13 @@ func TestAdmissionPeekEndsOnClose(t *testing.T) {
 		Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: VerdictAccept} }}})
 	a, b := net.Pipe()
 	defer func() { _ = b.Close() }()
+	reads := make(chan struct{}, 1)
+	carrier := &observedPeekConn{Conn: a, reads: reads}
 	done := make(chan struct{})
-	go func() { _ = lst.HandlePipe(context.Background(), NetPipe(a), PipeHint{}); close(done) }()
-	time.Sleep(20 * time.Millisecond)
+	go func() { _ = lst.HandlePipe(context.Background(), NetPipe(carrier), PipeHint{}); close(done) }()
+	waitTestSignal(t, reads, "prefix read")
 	_ = lst.Close()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the peek outlived Close")
-	}
+	waitTestSignal(t, done, "prefix read cancellation")
 	if st := lst.Stats().Admission; st != (AdmissionStats{Closed: 1}) {
 		t.Fatalf("stats %+v", st)
 	}
@@ -275,17 +338,19 @@ func TestPeekInterruptedByStop(t *testing.T) {
 	}
 	mh := &msgHalf{}
 	mp := owned(PipeIO{R: mh, Framing: FramingRecords})
-	if msg, _, failed, fired := a.peekMessage(ctx, mp, 64, deadline); msg != nil || !failed || fired {
-		t.Fatalf("message: %q, failed %v, fired %v", msg, failed, fired)
+	if msg, _, failed, fired := a.peekMessage(ctx, mp, 64, deadline); msg.span.Buf != nil || !failed || fired {
+		t.Fatalf("message: %q, failed %v, fired %v", msg.Bytes(), failed, fired)
 	}
 }
 
 // failHalf is a message-framed half whose first read fails.
 type failHalf struct{ closed atomic.Int32 }
 
-func (h *failHalf) Read([]byte) (int, error)        { return 0, io.ErrUnexpectedEOF }
-func (h *failHalf) ReadMessage(int) ([]byte, error) { return nil, io.ErrUnexpectedEOF }
-func (h *failHalf) Close() error                    { h.closed.Add(1); return nil }
+func (h *failHalf) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (h *failHalf) ReadMessage(int) (ReceivedMessage, error) {
+	return ReceivedMessage{}, io.ErrUnexpectedEOF
+}
+func (h *failHalf) Close() error { h.closed.Add(1); return nil }
 
 // A message-framed carrier without a first message to decide on (its read
 // fails: it ended, or sent a text message) is closed without a decision,
@@ -334,8 +399,12 @@ func TestAdmissionAdmitFirst(t *testing.T) {
 			return ok
 		}, want: AdmissionStats{PeekTimedOut: 1}},
 		{name: "listener closed", verdict: VerdictDefer, timeout: time.Minute, run: func(l *Listener, a *Arrival) bool {
-			go func() { time.Sleep(10 * time.Millisecond); _ = l.Close() }()
-			_, ok := a.AdmitFirst(context.Background(), blocked)
+			entered := make(chan struct{})
+			go func() { <-entered; _ = l.Close() }()
+			_, ok := a.AdmitFirst(context.Background(), func(ctx context.Context) (PipeIO, error) {
+				close(entered)
+				return blocked(ctx)
+			})
 			return ok
 		}, want: AdmissionStats{Closed: 1}},
 		{name: "upgrade failed", verdict: VerdictDefer, timeout: time.Minute, run: func(_ *Listener, a *Arrival) bool {
@@ -351,19 +420,25 @@ func TestAdmissionAdmitFirst(t *testing.T) {
 			return ok && p.R == x
 		}, want: AdmissionStats{Accepted: 1}},
 	} {
-		lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: &Admission{PeekTimeout: x.timeout,
-			Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: x.verdict} }}})
-		a, ok := lst.Adapter().AdmitUpgrade(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody), nil, nil)
-		if !ok {
-			t.Fatalf("%s: not admitted", x.name)
-		}
-		if got := x.run(lst, a); got != (x.verdict == VerdictAccept) {
-			t.Fatalf("%s: AdmitFirst %v", x.name, got)
-		}
-		a.Release() // a further release counts nothing
-		if st := lst.Stats().Admission; st != x.want {
-			t.Fatalf("%s: stats %+v", x.name, st)
-		}
-		_ = lst.Close()
+		t.Run(x.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cfg := mpConfig()
+				cfg.ClockDomain = NewClockDomain(timeshim.Real)
+				lst := mustNewListener(&ListenerConfig{Config: cfg, Admission: &Admission{PeekTimeout: x.timeout,
+					Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{Verdict: x.verdict} }}})
+				defer func() { _ = lst.Close() }()
+				a, ok := lst.Adapter().AdmitUpgrade(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody), nil, nil)
+				if !ok {
+					t.Fatalf("%s: not admitted", x.name)
+				}
+				if got := x.run(lst, a); got != (x.verdict == VerdictAccept) {
+					t.Fatalf("%s: AdmitFirst %v", x.name, got)
+				}
+				a.Release() // a further release counts nothing
+				if st := lst.Stats().Admission; st != x.want {
+					t.Fatalf("%s: stats %+v", x.name, st)
+				}
+			})
+		})
 	}
 }

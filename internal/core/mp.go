@@ -1,8 +1,6 @@
 package core
 
 import (
-	"crypto/rand"
-
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -45,76 +43,73 @@ var inStateNames = [...]string{"NONE", "JOINING", "OPEN", "ENDED", "RETIRED"}
 func (i InState) String() string { return inStateNames[i] }
 
 // additionalPipes groups join-only keys and the history of non-live pipe
-// IDs, and the prefix repair budget. Epoch negotiation and pipe zero's
+// IDs. Epoch negotiation and pipe zero's
 // scheduler work before any join.
 type additionalPipes struct {
-	qualityAt          Time        // next placement or advice refresh
-	prefixStreams      []*Stream   // directions with indexed originals for prefix repair
-	prefixAt           Time        // earliest next check of retained prefix deadlines
-	prefixBytes        uint64      // queued and in-flight prefix repairs
-	prefixPending      uint64      // reserved, not yet handed off
-	prefixBucket       tokenBucket // session allowance for extra STREAM payload
-	prefixWaiting      bool        // expired entries waiting on a relevant input
-	prefixStateWaiting bool        // a source is waiting for an attachment state change
-	prefixGate         gate        // the retained-prefix timer's
-
-	usable      []uint64          // the Suites of both sets, ascending
-	phaseKey    []byte            // a random key of the process for a key phase no epoch has
-	bits        map[uint64]bool   // replay bits of peer IDs without state
-	pendAbandon map[uint64]uint64 // PIPE_ABANDON owed for IDs without state: its code
+	bits        map[uint64]bool           // replay bits of peer IDs without state
+	pendAbandon map[uint64]pendingAbandon // PIPE_ABANDON owed for IDs without state
+	usable      []uint64                  // the Suites of both sets, ascending
+	qualityAt   Time                      // next placement or advice refresh
 }
 
 type multiPath struct {
+	suspendCause error // the pipe loss that suspended the session
 	*additionalPipes
-	gapTrace *streamGapTrace // nil until stream tracing exposes a receive gap
-
-	// ep holds the accepted epochs, their join keys and Locators, and the
-	// state of the epoch exchange.
-	ep           epochs
-	usableGroups []uint64 // the Groups of both sets, ascending; holds Group 2
-	// joinFailures counts own consecutive failed joins.
-	joinFailures uint64
+	*prefixScheduler
+	gapTrace          *streamGapTrace // nil until stream tracing exposes a receive gap
+	fateHist          map[fateKey]*history
+	openAs            *Pipe // a pipe evaluated as if its carrier took bytes (waitsFor)
+	control           controlOrder
+	candidateOrder    []*Pipe
+	abandonQ, statusQ pathControls
+	pairAcks          pathControls
+	joinReservations  []*JoinReservation
+	usableGroups      []uint64 // the Groups of both sets, ascending; holds Group 2
 	// exporter is the exporter value read at establishment, kept only
 	// while keysPending: the keys wait for the deferred PSK or the declaration.
-	exporter     []byte
-	nextID       uint64 // next own pipe ID
-	cap          int    // unretired attachments of the peer we keep
-	ownCap       int    // unretired attachments we joined ourselves
-	replayW      uint64 // W
-	h            uint64 // highest verified peer pipe ID
-	backoffUntil Time
-	backoffExp   int
-	joinW        []*Signal // local joins the cap or the backoff holds (JoinPrepare)
-	pingTimes    [8]Time   // send times of the last 8 PIPE_PINGs
-	pingIdx      int
-	pingCount    int
-	redundantAt  Time   // when the redundant snapshot copy is due
-	busyUntil    Time   // traffic frames within the busy window
-	stateGen     uint64 // counts pipe state changes (mpHandleTimeout)
-	retained     uint64 // unacknowledged stream bytes
-
-	// Scheduler.
-	gateBuf      gate     // one-shot readers' gate (bindings, tiers, picks, PipeInfo)
-	dec          decision // the writer's (mpWrite, writeData)
-	probe        decision // anyStreamOn's
-	tierSince    []tierMark
-	satRep       []satReport
-	fateHist     map[fateKey]*history
-	copies       []*copyRec
-	aff          affinityState
-	rrFill       rrFill // the session round-robin chunk being filled
-	pickGen      uint64
-	pickQ        []*Stream // directions waiting for a custom decision
-	inputEpoch   uint64
-	pickDeadline Time
-	openAs       *Pipe // a pipe evaluated as if its carrier took bytes (waitsFor)
-
-	suspendCause error // the pipe loss that suspended the session
-
-	endsBuf []uint64  // scratch of retainBatch
-	blocked []*Stream // stream directions blocked by the peer's stream credit
-
-	// Flags of the groups above, kept together.
+	exporter  []byte
+	joinW     []*Signal // local joins the cap or the backoff holds (JoinPrepare)
+	tierSince []tierMark
+	satRep    []satReport
+	copies    []*copyRec
+	pickQ     []*Stream // directions waiting for a custom decision
+	endsBuf   []uint64  // scratch of retainBatch
+	clock     pathClock
+	aff       affinityState
+	gateBuf   gate     // one-shot readers' gate (bindings, tiers, picks, PipeInfo)
+	dec       decision // the writer's (mpWrite, writeData)
+	probe     decision // anyStreamOn's
+	// ep holds the accepted epochs, their join keys and Locators, and the
+	// state of the epoch exchange.
+	ep            epochs
+	replicaBudget replicaBudget
+	pingTimes     [8]Time // send times of the last 8 PIPE_PINGs
+	rrFill        rrFill  // the session round-robin chunk being filled
+	tierAt        Time
+	owdFloor      Duration
+	candidateGen  uint64
+	reservedJoins int
+	// joinFailures counts own consecutive failed joins.
+	joinFailures     uint64
+	nextID           uint64 // next own pipe ID
+	cap              int    // unretired attachments of the peer we keep
+	ownCap           int    // unretired attachments we joined ourselves
+	replayW          uint64 // W
+	h                uint64 // highest verified peer pipe ID
+	backoffUntil     Time
+	backoffExp       int
+	pingIdx          int
+	pingCount        int
+	redundantAt      Time   // when the redundant snapshot copy is due
+	busyUntil        Time   // traffic frames within the busy window
+	stateGen         uint64 // counts pipe state changes (mpHandleTimeout)
+	retained         uint64 // unacknowledged stream bytes
+	pickGen          uint64
+	inputEpoch       uint64
+	pickDeadline     Time
+	redundantPending bool
+	owdFloorValid    bool
+	candidatesValid  bool
 	bootstrapRetired bool // pipe zero needs no replay table entry
 	keysPending      bool // the keys wait (exporter)
 	usePSK           bool // the P source is configured
@@ -135,121 +130,97 @@ const (
 // sawPeer records the evidence of the peer's attachment of a joined
 // attachment, waking the waiters on the first.
 func (s *Session) sawPeer(p *Pipe) {
-	if a := p.mp; a != nil && a.peer == peerPending {
-		a.peer = peerObserved
-		s.wakePrefix()
-		if a.joinerLocal && p.id != 0 {
-			s.emit(Event{Kind: EvPipeAttached, Pipe: p.id})
+	s.observePeer(p, false)
+}
+
+func (s *Session) observePeer(p *Pipe, receiveRecord bool) {
+	a := p.mp
+	if a == nil || a.peer == peerDiscarded {
+		return
+	}
+	if a.peer == peerObserved {
+		if receiveRecord && a.health.receive.proof == HealthProofNone {
+			s.commitPipeHealth(p, true)
 		}
+		return
+	}
+	a.peer = peerObserved
+	s.armPathDeadline(p, pathJoin)
+	s.wakePrefix()
+	s.commitPipeHealth(p, receiveRecord)
+	if a.joinerLocal && p.id != 0 {
+		s.emit(Event{Kind: EvPipeAttached, Pipe: p.id})
 	}
 }
 
 // attach is the per-attachment state of a multipath session.
 type attach struct {
-	group     *join.Group // the key exchange of the pipe's Join
-	joinEpoch uint64      // the epoch of the authenticated Hello
+	failCause          error
+	physicalFault      *PhysicalFault
+	group              *join.Group // the key exchange of the pipe's Join
+	reply              *JoinReplyReader
+	sendPrio           *uint64
+	sendStandby        *bool
+	quality            *pathQuality // optional placement and advice measurements
+	provenFrames       []byte       // the return frames of a proven Reply
+	binding            []byte
+	statusQ            []statusReq // PIPE_STATUS owed
+	copyQ              []*copyRec
+	selfCopyQ          []*copyRec // copies for p's own copy lane (a single-pipe tier)
+	pingEnds           []uint64   // outbound positions after unanswered PIPE_PINGs
+	deliveryEnds       []uint64   // send-order ends of unacknowledged ack-eliciting records
+	rttIndex, ptoIndex Deadline[*Pipe]
+	deadlines          [pathDeadlineCount]Deadline[pathDeadline]
+	health             pipeHealth
+	rtt                rttEst
+	prob               probState
+	hist               history      // fate group 0
+	live               PipeLiveness // the pipe's own liveness settings
+	joinEpoch          uint64       // the epoch of the authenticated Hello
 	// The SESSION_EPOCH frame repeated until the next phase: sent on this pipe
 	// (epochSent) at epochAt, again one probe interval later.
-	epochAt        Time
-	fate           uint64
-	attachedAt     Time
-	joinDeadline   Time
-	pingSince      Time
-	joiner         *join.Joiner
-	provenFrames   []byte // the return frames of a proven Reply
-	binding        []byte
-	joinEpochKnown bool
-	epochSent      bool
-	joinerLocal    bool
-	peer           peerEvidence
-	dir            uint8 // the pipe direction as the joiner states it: 0 up, 1 down, 2 bidi
-	out            OutState
-	in             InState
-	hs             bool // the Join handshake is running: nothing but it on the carrier
-	mode           join.Mode
-	tpSkipped      bool // the one transport parameters record before the Reply went by
-	framing        join.Framing
-	proven         bool // the Reply verified; JoinFinish is to come
-	early          bool // JoinPrepare found no usable pipe
-	held           bool
-	resLimited     bool // abandoned by the peer with ZMUX_PIPE_RESOURCE_LIMIT // a local join waits for room or the backoff
-	firstRecord    bool // our first record on the outbound direction is still due
-	ackPair        bool // a PIPE_ACK answering a PIPE_PING is owed on this pair
-
-	// Removal.
+	epochAt         Time
+	fate            uint64
+	attachedAt      Time
+	joinDeadline    Time
+	pingSince       Time
 	abandonCode     uint64
 	abandonRecvAt   Time
 	abandonCodeRecv uint64
 	lingerUntil     Time
 	ackedAbandonAt  Time
 	drainStart      Time
-	abandonSent     bool // own PIPE_ABANDON handed to a carrier
-	abandonQueued   bool
-	abandonAcked    bool
-	abandonRecv     bool
-	unilateral      bool
-	draining        bool
-	drainSuspect    bool
-	retired         bool
-
-	// Sender view (estimates, detection).
-	rtt         rttEst
-	lastAdvance Time
-	liveAt      Time
-	oldestAt    Time // send time of the oldest unacknowledged ack-eliciting byte
-	lastElicit  Time // when an ack-eliciting byte was last sent
-	suspectAt   Time
-	failCause   error
+	lastAdvance     Time
+	deliveryAt      Time     // last current-generation cumulative delivery proof
+	deliveryCost    Duration // PTO plus queue after applying that ACK
+	deliveryGen     uint64
+	measuredGen     uint64
+	relativeDue     Time
+	writeDue        Time
+	liveAt          Time
+	oldestAt        Time // send time of the oldest unacknowledged ack-eliciting byte
+	lastElicit      Time // when an ack-eliciting byte was last sent
+	suspectAt       Time
 	// unsentAhead is the failure detector's queue snapshot: Q_p when the oldest
 	// unacknowledged ack-eliciting byte was handed over (the bytes ahead
 	// of it), fixed so that a pipe that stops moving is still detected.
-	unsentAhead uint64
-	queueD      Duration // queue_p of the snapshot
-	noSampleAt  Time     // samples of bytes sent at or before this are discarded (E2)
-	suspFloor   Duration // the SuspectFloor in force when the pipe turned suspect
-	suspDead    Duration // the DeadTimeout in force then (0: derived, negative: off)
-	unacked     bool     // unacknowledged ack-eliciting bytes exist
-	lingering   bool
-	noSample    bool
-	suspPing    bool // the pending PIPE_PING is that of a suspicion
-	suspHeld    bool // suspFloor and suspDead hold: set on turning suspect
-
-	// Tiers.
-	statusHeld  bool // the owed request was changed while JOINING
-	peerStandby bool
-	recvStandby bool
-	takeover    bool
-	// The flags of the Scheduler and Reinjection hold groups sit here, so
-	// that all the flags pack into whole words.
-	wasSuspect  bool
-	reval       bool // awaiting revalidation
-	revalPing   bool // its PIPE_PING is still to be written
-	needPing    bool // a PIPE_PING is owed on this pipe
-	penalized   bool // opportunistic penalization: no new data until penaltyEnd is acknowledged
-	held1       bool
-	ownFail     bool // the carrier reports its own failure (CarrierInfo.OwnFailure)
-	sendPrio    *uint64
-	sendStandby *bool
-	peerPrio    uint64
-	peerSeq     uint64
-	recvPrio    uint64
-	statusSeq   uint64
-	statusQ     []statusReq // PIPE_STATUS owed
-	weight      uint64
-
-	// Scheduler.
-	probOpt   Duration     // per-pipe Probation; <0: the session default
-	live      PipeLiveness // the pipe's own liveness settings
-	probeH    Duration     // H_p of the current probe wait, taken when it started
-	probeCut  float64      // the current probe wait is k_eff x (1 - probeCut): in [0, j], or [0, 1] for the first wait of a bootstrap pipe
-	prob      probState
-	hist      history // fate group 0
-	revalEnd  uint64
-	rrCur     float64
-	copyQ     []*copyRec
-	selfCopyQ []*copyRec   // copies for p's own copy lane (a single-pipe tier)
-	idleArm   uint64       // bytes of the idle copy left
-	quality   *pathQuality // optional placement and advice measurements
+	unsentAhead   uint64
+	queueD        Duration // queue_p of the snapshot
+	noSampleAt    Time     // samples of bytes sent at or before this are discarded (E2)
+	suspFloor     Duration // the SuspectFloor in force when the pipe turned suspect
+	suspDead      Duration // the DeadTimeout in force then (0: derived, negative: off)
+	peerPrio      uint64
+	peerSeq       uint64
+	recvPrio      uint64
+	statusSeq     uint64
+	statusWritten uint64
+	weight        uint64
+	probOpt       Duration // per-pipe Probation; <0: the session default
+	probeH        Duration // H_p of the current probe wait, taken when it started
+	probeCut      float64  // the current probe wait is k_eff x (1 - probeCut): in [0, j], or [0, 1] for the first wait of a bootstrap pipe
+	revalEnd      uint64
+	rrCur         float64
+	idleArm       uint64 // bytes of the idle copy left
 
 	// Reinjection hold: a new pipe reinjects one chunk until
 	// the first PIPE_ACK after it became live, or one smoothed RTT.
@@ -257,15 +228,52 @@ type attach struct {
 	holdUntil  Time
 	holdSent   uint64
 
-	// Counters.
 	suspects, failures, reinjectedBytes, oppBytes, pingsSent uint64
 	redundantBytes, dupBytes, pingsAnswered                  uint64
-	bytesLost                                                uint64   // unacknowledged outbound bytes at the failure
-	pingEnds                                                 []uint64 // outbound positions after unanswered PIPE_PINGs
+	bytesLost                                                uint64 // unacknowledged outbound bytes at the failure
 
-	// Inbound silence.
 	lastRecord Time
 	maxGap     Duration
+
+	topologyOut, topologyIn bool
+	joinEpochKnown          bool
+	epochSent               bool
+	joinerLocal             bool
+	peer                    peerEvidence
+	dir                     uint8 // the pipe direction as the joiner states it: 0 up, 1 down, 2 bidi
+	out                     OutState
+	in                      InState
+	hs                      bool // the Join handshake is running: nothing but it on the carrier
+	mode                    join.Mode
+	proven                  bool // the Reply verified; JoinFinish is to come
+	early                   bool // JoinPrepare found no usable pipe
+	held                    bool // a local join waits for room or the backoff
+	resLimited              bool // abandoned by the peer with ZMUX_PIPE_RESOURCE_LIMIT
+	firstRecord             bool // our first record on the outbound direction is still due
+	abandonSent             bool // own PIPE_ABANDON handed to a carrier
+	abandonAcked            bool
+	abandonRecv             bool
+	unilateral              bool
+	draining                bool
+	drainSuspect            bool
+	retired                 bool
+	unacked                 bool // unacknowledged ack-eliciting bytes exist
+	ackWatching             bool
+	lingering               bool
+	noSample                bool
+	suspPing                bool // the pending PIPE_PING is that of a suspicion
+	suspHeld                bool // suspFloor and suspDead hold: set on turning suspect
+	statusHeld              bool // the owed request was changed while JOINING
+	peerStandby             bool
+	recvStandby             bool
+	takeover                bool
+	wasSuspect              bool
+	reval                   bool // awaiting revalidation
+	revalPing               bool // its PIPE_PING is still to be written
+	needPing                bool // a PIPE_PING is owed on this pipe
+	penalized               bool // opportunistic penalization: no new data until penaltyEnd is acknowledged
+	held1                   bool
+	ownFail                 bool // the carrier reports its own failure (CarrierInfo.OwnFailure)
 }
 
 // peerAttached reports whether the peer has attached the attachment
@@ -299,32 +307,31 @@ func (s *Session) startMultipath() *wire.Error {
 	} else if err := s.deriveKeys(); err != nil {
 		return err
 	}
-	maxPipes := max(1, s.cfg.MaxPipes)
-	m.cap = maxPipes + s.cfg.Headroom
+	envelope := s.cfg.SessionPolicy.Limits.Envelope()
+	m.cap = envelope
 	m.ownCap = m.cap
 	if s.cfg.Test.PipeCap > 0 {
 		m.cap = s.cfg.Test.PipeCap
 	}
-	m.replayW = uint64(max(64, 2*(maxPipes+s.cfg.Headroom)))
-	if s.cfg.ReplayWindow > 0 {
-		m.replayW = uint64(s.cfg.ReplayWindow) // at least maxPipes+Headroom
-	}
+	m.replayW = uint64(max(64, 2*envelope))
 	if s.role == RoleResponder {
 		// The peer is the initiator: its bootstrap pair, pipe 0, is h.
 		m.h, m.hSet = 0, true
 	}
 	m.busyUntil = s.now.Add(15 * Second)
 	for _, pp := range s.pipes {
-		a := &attach{joinEpochKnown: true, mode: s.firstPipeMode(), joinerLocal: s.role == RoleInitiator, dir: 2, out: OutActive, in: InOpen,
+		a := &attach{live: pp.out.lane(0).info.Liveness, joinEpochKnown: true, mode: s.firstPipeMode(), joinerLocal: s.role == RoleInitiator, dir: 2, out: OutActive, in: InOpen,
 			attachedAt: s.now, liveAt: s.now, lastAdvance: s.now, lastRecord: s.now, weight: 1, probOpt: -1}
 		a.rtt = s.initialRTT(pp.id)
 		a.ownFail = pp.ownFailure()
 		s.drawProbe(a, pp, true)
 		pp.mp = a
+		s.syncPipeHealth(pp)
 		if s.cfg.PathAdvice {
 			s.enablePathQuality(pp)
 		}
 	}
+	s.refreshPathTopology()
 	return nil
 }
 
@@ -335,7 +342,7 @@ func (s *Session) prepareAdditional() *additionalPipes {
 	m := s.mp
 	if m.additionalPipes == nil {
 		m.additionalPipes = &additionalPipes{
-			bits: make(map[uint64]bool), pendAbandon: make(map[uint64]uint64),
+			bits: make(map[uint64]bool), pendAbandon: make(map[uint64]pendingAbandon),
 			usable: wire.Intersect(s.cfg.Local.SessionCrypto.Suites, s.peer.SessionCrypto.Suites),
 		}
 		for _, e := range m.ep.list {
@@ -348,21 +355,16 @@ func (s *Session) prepareAdditional() *additionalPipes {
 	return m.additionalPipes
 }
 
-func (m *multiPath) owedAbandons() map[uint64]uint64 {
+type pendingAbandon struct {
+	code     uint64
+	repeated bool
+}
+
+func (m *multiPath) owedAbandons() map[uint64]pendingAbandon {
 	if m.additionalPipes == nil {
 		return nil
 	}
 	return m.pendAbandon
-}
-
-// unknownPhaseKey is the key a Hello of a key phase without an accepted epoch is
-// opened with: fresh and random, so the Hello fails as auth like any wrong key.
-func (m *multiPath) unknownPhaseKey() []byte {
-	if m.phaseKey == nil {
-		m.phaseKey = make([]byte, 64)
-		_, _ = rand.Read(m.phaseKey) // crypto/rand does not fail
-	}
-	return m.phaseKey
 }
 
 // joinKeys are join_psk of the session's initiator and responder.

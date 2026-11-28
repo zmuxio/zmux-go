@@ -39,6 +39,9 @@
 // exporter, EarlyClientCarrier for a first flight that the server may
 // refuse, with EarlyData.HoldFirstFlight and Conn.ReleaseFirstFlight);
 // admit.ReplayFilter is a single-use cache for its nonces.
+// On a message carrier, MessageReader returns a ReceivedMessage. Use
+// OwnMessage to transfer the backing or CopyMessage to adapt a short-lived
+// buffer. A RecordOpener authenticates and opens a Sealed record in place.
 //
 // The Conn and Stream methods follow quic-go: OpenStream[Sync],
 // AcceptStream, Read, Write, Close (FIN), CancelRead, CancelWrite,
@@ -66,8 +69,12 @@
 // Start, AddPipe or HandlePipe belong to zmux from then on, whether the
 // call succeeds or fails (ErrInvalidConfig, a refused or failed join, a
 // panic in a host callback included): zmux closes each half exactly once,
-// and the caller never closes it. A Chunk from ReadChunk is released exactly once, by Release or by
-// WriteChunk.
+// and the caller never closes it. ReadChunk borrows a contiguous range,
+// which can be shorter than requested. The backing remains valid across
+// session close until Release or a transfer to WriteChunk. Do not modify
+// the bytes or use them after release or transfer. If ReadChunk returns
+// ErrReceiveLoanLimit, it consumed no bytes. Read can still copy the
+// pending bytes into a caller-owned buffer.
 //
 // # Events
 //
@@ -124,18 +131,18 @@
 // SchedulerParams.Probation turns
 // probation off and a negative zmuxhttp.Exchange.Coalesce sends at once.
 // A negative value of a field without such a setting (JoinTimeout,
-// ResumeTimeout, the windows, MaxPipes) is an error. A feature that is on
+// ResumeTimeout, the windows, SteadyAttachments) is an error. A feature that is on
 // by default is turned off with a Switch field set to SwitchOff
 // (EpochAfterFirstPipe, SchedulerParams.Redundancy, ...); one that is off
 // by default is a bool named for it (EnableDatagrams, ReturnOnReply).
 // Zero values that are not a safe bound: shaping.Limits (zero is
-// unbounded; the session's other limits still apply), PipePool.Rotate
+// unbounded; the session's other limits still apply), RotationPolicy
 // (zero rotates nothing) and Config.ResumeTimeout (zero is no resume). A
 // value out of range is an error, never corrected. Errors are
 // ErrInvalidConfig, from Start, Dial, Client and Server before a byte is
 // written, and from NewListener.
 //
-// Multipath needs MaxPipes above 1 and a PipeAuth (PSK, DeferredPSK with
+// Multipath needs SteadyAttachments above 1 and a PipeAuth (PSK, DeferredPSK with
 // Conn.SetJoinSecret, or Exporter); a session whose first pipe is not on the secure
 // carrier has join keys only once its host declared that pipe end to end
 // (PipeAuth.EndToEnd or Conn.DeclareEndToEnd). Every added pipe uses the Join
@@ -145,9 +152,9 @@
 //
 // # Time
 //
-// Config.Clock (a timeshim.Clock; nil is the host's monotonic clock) is the
+// Config.ClockDomain (nil is the process default) is the
 // session's time source: its timers, deadlines, RTT and rate estimates, and
-// the Redial and MaintainPipes waits run on it, so a timeshim.Fake drives a
+// the session controller waits run on it, so a timeshim.Fake drives a
 // session deterministically. Carrier read and write deadlines of
 // net.Conn, Listener and endpoint timers (first record, pairing, carrier
 // upgrade, the exchange carrier), the bounds of a carrier's dial and of its

@@ -3,6 +3,7 @@ package zmux
 import (
 	"context"
 	"io"
+	"runtime"
 	"runtime/trace"
 	"sync"
 	"testing"
@@ -61,5 +62,51 @@ func startServerNoListener(ctx context.Context, p PipeIO, cfg *Config) (*Conn, e
 		ClosePipeIO(p)
 		return nil, err
 	}
-	return startCore(ctx, p, cfg, cc, nil, nil, nil)
+	return startCore(ctx, p, cfg, cc, nil, nil, nil, nil)
+}
+
+func waitTestSignal(t *testing.T, signal <-chan struct{}, what string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	select {
+	case <-signal:
+	case <-ctx.Done():
+		t.Fatalf("waiting for %s: %v", what, ctx.Err())
+	}
+}
+
+// waitStreamStop waits for the write-side error notification.
+func waitStreamStop(ctx context.Context, s *Stream) error {
+	defer runtime.KeepAlive(s)
+	h := s.h
+	_, err := h.waitOn(ctx, &h.wsig, nil, h.wwait, func() (bool, error) {
+		return false, h.c.s.WriteErrOf(h.st)
+	}, nil)
+	return err
+}
+
+func waitTestEvent(t *testing.T, ctx context.Context, c *Conn, what string, match func(Event) bool) Event {
+	t.Helper()
+	for {
+		ev, err := c.NextEvent(ctx)
+		if err != nil {
+			t.Fatalf("waiting for %s: %v", what, err)
+		}
+		if match(ev) {
+			return ev
+		}
+	}
+}
+
+func waitTestAttachment(t *testing.T, ctx context.Context, p *Pipe, peer *Conn) *Pipe {
+	t.Helper()
+	if err := p.WaitAttached(ctx); err != nil {
+		t.Fatal(err)
+	}
+	joined, ok := peer.Pipe(p.ID())
+	if !ok {
+		t.Fatalf("peer acknowledged pipe %d but has no handle for it", p.ID())
+	}
+	return joined
 }

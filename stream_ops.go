@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"runtime"
+	"sync/atomic"
 
 	"github.com/zmuxio/zmux-go/internal/core"
 )
@@ -33,17 +34,25 @@ type TLV struct {
 // bufio writer; WebSocket flattens once per record; a stream of an outer
 // session (nested sessions) takes them without a copy.
 type Chunk struct {
-	buf  *core.Buf
+	loan *chunkLoan
 	Data []byte
 }
 
-// Release returns the chunk's buffer; the chunk must not be used after.
+type chunkLoan struct{ buf atomic.Pointer[core.Buf] }
+
+// Release ends ownership for all copies of the Chunk.
 func (c *Chunk) Release() {
-	if c.buf != nil {
-		c.buf.Unref()
-		c.buf = nil
+	if b := c.take(); b != nil {
+		b.ReturnView()
 	}
 	c.Data = nil
+}
+
+func (c *Chunk) take() *core.Buf {
+	if c.loan == nil {
+		return nil
+	}
+	return c.loan.buf.Swap(nil)
 }
 
 // ---- handle operations ----
@@ -192,45 +201,68 @@ func (h *handle) waitSendCapacity(ctx context.Context, n uint64) (uint64, error)
 }
 
 func (h *handle) readChunk(ctx context.Context, limit int) (Chunk, error) {
+	view, err := h.readLoan(ctx, limit)
+	if err != nil {
+		return Chunk{}, err
+	}
+	ch := Chunk{Data: view.Bytes(), loan: new(chunkLoan)}
+	ch.loan.buf.Store(view.Buf)
+	return ch, nil
+}
+
+func (h *handle) readLoan(ctx context.Context, limit int) (view core.Span, err error) {
 	h.rmu.Lock()
 	defer h.rmu.Unlock()
 	c := h.c
 	if limit <= 0 {
 		limit = 1 << 20
 	}
-	var ch Chunk
 	eof := false
-	err := h.awaitRead(ctx, false, func() (bool, error) {
-		data, buf, fin, err := c.s.ReadChunk(h.st, limit)
-		if fin || err != nil {
+	err = h.awaitRead(ctx, false, func() (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		var readErr error
+		view, eof, readErr = c.s.ReadChunk(h.st, limit)
+		if eof || readErr != nil && !errors.Is(readErr, ErrReceiveLoanLimit) {
 			h.released(c.s.ReleaseRecv(h.st))
 		}
-		ch, eof = Chunk{Data: data, buf: buf}, fin
-		return len(data) > 0 || fin, err
+		return view.Len() > 0 || eof, readErr
 	})
-	switch {
-	case len(ch.Data) > 0:
-		return ch, nil
-	case eof:
-		return Chunk{}, io.EOF
+	if eof {
+		err = io.EOF
 	}
-	return Chunk{}, err
+	return view, err
 }
 
 func (h *handle) writeChunk(ctx context.Context, ch Chunk) error {
-	defer ch.Release()
+	_, err := h.writeChunkProgress(ctx, ch)
+	return err
+}
+
+func (h *handle) writeChunkProgress(ctx context.Context, ch Chunk) (int, error) {
+	buf := ch.take()
+	if buf != nil {
+		defer buf.ReturnView()
+	} else if ch.loan != nil {
+		return 0, ErrStreamClosed
+	}
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
 	c := h.c
 	p := ch.Data
 	if len(p) == 0 {
-		return nil
+		return 0, nil
 	}
-	return h.awaitWrite(ctx, true, func() (bool, error) {
-		n, err := c.s.WriteChunk(h.st, p, ch.buf, false)
+	err := h.awaitWrite(ctx, true, func() (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		n, err := c.s.WriteChunk(h.st, p, buf, false)
 		p = p[n:]
 		return len(p) == 0, err
 	})
+	return len(ch.Data) - len(p), err
 }
 
 // tryWriteAll writes all of p now or nothing (no buffer space: false).
@@ -243,11 +275,8 @@ func (h *handle) tryWriteAll(p []byte) (bool, error) {
 	c.lock()
 	defer c.unlock()
 	c.s.SetNow(c.clk.now())
-	if uint64(len(p)) > c.s.SendRoom(h.st) {
-		return false, apiErr(c.s.WriteErrOf(h.st))
-	}
-	_, err := c.s.Write(h.st, p, false)
-	return err == nil, apiErr(err)
+	ok, err := c.s.TryWriteAll(h.st, p)
+	return ok, apiErr(err)
 }
 
 // waitWritable waits until a write takes bytes now and returns how many:
@@ -292,45 +321,54 @@ func (h *handle) reject() {
 	h.released(c.s.Reject(h.st))
 }
 
-func (h *handle) sendDatagram(ctx uint64, p []byte) error { return h.c.sendDatagram(h.st, ctx, p) }
-
 func (h *handle) receiveDatagram(ctx context.Context) (uint64, []byte, error) {
+	var cx uint64
+	var data []byte
+	err := h.waitDatagram(ctx, func() bool {
+		var ok bool
+		cx, data, ok = h.c.s.RecvStreamDatagram(h.st)
+		return ok
+	})
+	return cx, data, err
+}
+
+func (h *handle) waitDatagram(ctx context.Context, read func() bool) error {
 	h.dmu.Lock()
 	defer h.dmu.Unlock()
 	c := h.c
-	var cx uint64
-	var d []byte
 	end := false
 	_, err := h.waitOn(ctx, &h.dsig, nil, h.rwait, func() (bool, error) {
-		var ok bool
-		c.s.SetNow(c.clk.now()) // sojourns are current (DatagramQueueDelay)
-		if cx, d, ok = c.s.RecvStreamDatagram(h.st); ok {
+		c.s.SetNow(c.clk.now())
+		if read() {
 			return true, nil
 		}
-		var err error
-		end, err = c.s.StreamDatagramsEnded(h.st)
-		return end, err
+		var e error
+		end, e = c.s.StreamDatagramsEnded(h.st)
+		return end, e
 	}, nil)
-	switch {
-	case err != nil:
-		return 0, nil, err
-	case end && d == nil:
-		return 0, nil, io.EOF
+	if end && err == nil {
+		err = io.EOF
 	}
-	return cx, d, nil
+	return err
 }
 
 // writeTo copies the stream to w without an intermediate buffer.
 func (h *handle) writeTo(w io.Writer) (int64, error) {
 	var n int64
 	for {
-		ch, err := h.readChunk(context.Background(), 1<<20)
-		if len(ch.Data) > 0 {
-			m, werr := w.Write(ch.Data)
+		view, err := h.readLoan(context.Background(), 1<<20)
+		data := view.Bytes()
+		if len(data) > 0 {
+			m, werr := func() (int, error) {
+				defer view.Buf.ReturnView()
+				return w.Write(data)
+			}()
 			n += int64(m)
-			ch.Release()
 			if werr != nil {
 				return n, werr
+			}
+			if m != len(data) {
+				return n, io.ErrShortWrite
 			}
 		}
 		if errors.Is(err, io.EOF) {
@@ -622,16 +660,23 @@ func (s *Stream) WaitWritable(ctx context.Context) (uint64, error) {
 }
 
 // ReadChunk returns up to n bytes without copying; release the chunk, or
-// hand it to WriteChunk, exactly once. A Chunk is a value: do not keep
-// copies of it past that.
+// hand it to WriteChunk. ErrReceiveLoanLimit leaves the data available
+// for a later call or a normal Read.
 func (s *Stream) ReadChunk(ctx context.Context, n int) (Chunk, error) {
 	defer runtime.KeepAlive(s)
+	if s == nil || s.h == nil {
+		return Chunk{}, net.ErrClosed
+	}
 	return s.h.readChunk(ctx, n)
 }
 
 // WriteChunk writes a chunk without copying and takes ownership of it.
 func (s *Stream) WriteChunk(ctx context.Context, c Chunk) error {
 	defer runtime.KeepAlive(s)
+	if s == nil || s.h == nil {
+		c.Release()
+		return net.ErrClosed
+	}
 	return s.h.writeChunk(ctx, c)
 }
 
@@ -658,8 +703,29 @@ func (s *Stream) ReadFrom(r io.Reader) (int64, error) {
 // identifier (RFC 9297 Context ID); like Conn.SendDatagram it never blocks
 // and drops the oldest queued datagram when the queue is full.
 func (s *Stream) SendDatagram(contextID uint64, p []byte) error {
+	return s.SendDatagramWith(contextID, p, DatagramSendOptions{})
+}
+
+// SendDatagramWith queues a stream datagram with options for this hop.
+func (s *Stream) SendDatagramWith(contextID uint64, p []byte, o DatagramSendOptions) error {
+	if s == nil {
+		return net.ErrClosed
+	}
 	defer runtime.KeepAlive(s)
-	return s.h.sendDatagram(contextID, p)
+	return s.h.c.sendDatagramWith(s.h.st, contextID, p, o)
+}
+
+// DatagramPath reports the current payload limits for this Flow and Context.
+func (s *Stream) DatagramPath(contextID uint64) DatagramPath {
+	if s == nil {
+		return DatagramPath{}
+	}
+	defer runtime.KeepAlive(s)
+	c := s.h.c
+	c.lock()
+	defer c.unlock()
+	admission, path, native, available := c.s.DatagramPath(s.h.st, contextID)
+	return DatagramPath{MaxPayload: admission, PathPayload: path, NativePayload: native, Native: available}
 }
 
 // MaxDatagramPayload returns the largest stream datagram payload, with
@@ -675,11 +741,12 @@ func (s *Stream) MaxDatagramPayload(contextID uint64) int {
 	return c.s.StreamMaxDatagramPayload(s.h.st, contextID)
 }
 
-// PathDatagramPayload returns the largest stream datagram payload, with
-// context identifier contextID, that leaves as one datagram of the
-// carrier instead of in a record (ConnectionState.PathDatagramPayload);
-// 0 when the peer accepts none on this stream.
+// PathDatagramPayload returns the largest stream datagram payload fitting
+// an eligible record or native path, with context identifier contextID.
 func (s *Stream) PathDatagramPayload(contextID uint64) int {
+	if s == nil || s.h == nil {
+		return 0
+	}
 	defer runtime.KeepAlive(s)
 	c := s.h.c
 	c.lock()
@@ -690,8 +757,17 @@ func (s *Stream) PathDatagramPayload(contextID uint64) int {
 // SendDatagramWait sends a stream datagram like SendDatagram, waiting for
 // room in the send queue instead of dropping its oldest entry.
 func (s *Stream) SendDatagramWait(ctx context.Context, contextID uint64, p []byte) error {
+	return s.SendDatagramWaitWith(ctx, contextID, p, DatagramSendOptions{})
+}
+
+// SendDatagramWaitWith waits for local queue room with the same options as
+// SendDatagramWith. A relative deadline starts at this hop's call.
+func (s *Stream) SendDatagramWaitWith(ctx context.Context, contextID uint64, p []byte, opts DatagramSendOptions) error {
+	if s == nil || s.h == nil {
+		return net.ErrClosed
+	}
 	defer runtime.KeepAlive(s)
-	return s.h.c.sendDatagramWait(ctx, s.h.st, contextID, p)
+	return s.h.c.sendDatagramWait(ctx, s.h.st, contextID, p, opts)
 }
 
 // ReceiveDatagram returns the next stream datagram and its context
@@ -808,6 +884,10 @@ func (s *SendStream) WaitWritable(ctx context.Context) (uint64, error) {
 // WriteChunk writes a chunk without copying and takes ownership of it.
 func (s *SendStream) WriteChunk(ctx context.Context, c Chunk) error {
 	defer runtime.KeepAlive(s)
+	if s == nil || s.h == nil {
+		c.Release()
+		return net.ErrClosed
+	}
 	return s.h.writeChunk(ctx, c)
 }
 
@@ -892,6 +972,9 @@ func (s *ReceiveStream) Replayable() bool {
 // ReadChunk returns up to n bytes without copying.
 func (s *ReceiveStream) ReadChunk(ctx context.Context, n int) (Chunk, error) {
 	defer runtime.KeepAlive(s)
+	if s == nil || s.h == nil {
+		return Chunk{}, net.ErrClosed
+	}
 	return s.h.readChunk(ctx, n)
 }
 

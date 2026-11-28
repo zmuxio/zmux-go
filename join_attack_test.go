@@ -16,14 +16,16 @@ import (
 	"math/big"
 	"net"
 	"net/netip"
-	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -115,7 +117,7 @@ func atkRelay(t *testing.T, h func(net.Conn)) string {
 }
 
 func atkConfig() *Config {
-	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: atkPSK, EndToEnd: true}, ResumeTimeout: 60 * time.Second,
+	return &Config{SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{PSK: atkPSK, EndToEnd: true}, ResumeTimeout: 60 * time.Second,
 		HandshakeTimeout: 30 * time.Second, SchedulerParams: SchedulerParams{Probation: -1},
 		AllowRecordMode: func(RecordPolicyInput, RecordMode, any) bool { return true }}
 }
@@ -218,18 +220,12 @@ func (e *atkEnv) dial(addr string) net.Conn {
 func (e *atkEnv) suspend() {
 	e.t.Helper()
 	_ = e.first.Close()
-	e.until("suspension", func() bool {
-		return e.c.ConnectionStats().PipesActive == 0 && e.s.ConnectionStats().PipesActive == 0
-	})
-}
-
-func (e *atkEnv) until(what string, f func() bool) {
-	e.t.Helper()
-	for !f() {
-		if e.ctx.Err() != nil {
-			e.t.Fatalf("%s: never happened", what)
+	for _, c := range []*Conn{e.c, e.s} {
+		if c.ConnectionStats().PipesActive != 0 {
+			waitTestEvent(e.t, e.ctx, c, "suspension", func(ev Event) bool {
+				return ev.Kind == EventSessionSuspended
+			})
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -260,8 +256,9 @@ func (a *tap) bytes() []byte {
 
 // rogue terminates TLS with the third party's certificate, reads, and answers a whole
 // Hello with answer. No origin stands behind it.
-func (e *atkEnv) rogue(answer []byte) (string, *tap) {
+func (e *atkEnv) rogue(answer []byte) (string, *tap, <-chan struct{}) {
 	a := &tap{}
+	hello := make(chan struct{})
 	return atkRelay(e.t, func(c net.Conn) {
 		in := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{e.pki.bad}, MinVersion: tls.VersionTLS13})
 		b := make([]byte, 64<<10)
@@ -270,27 +267,38 @@ func (e *atkEnv) rogue(answer []byte) (string, *tap) {
 			n, err := in.Read(b)
 			if n > 0 {
 				a.add(b[:n])
-				if _, _, perr := join.ParseHelloExact(a.bytes(), join.Stream); first && answer != nil && perr == nil {
+				if _, _, perr := join.ParseHelloExact(a.bytes(), join.Stream); first && perr == nil {
 					first = false
-					_, _ = in.Write(answer)
+					close(hello)
+					if answer != nil {
+						_, _ = in.Write(answer)
+						_ = in.CloseWrite()
+					}
 				}
 			}
 			if err != nil {
 				return
 			}
 		}
-	}), a
+	}), a, hello
 }
 
-// capture runs a real join against a party that never answers, and returns its Hello.
-func (e *atkEnv) capture(mode RecordMode) []byte {
+// capture runs a real join against a party that never answers, and returns
+// its Hello and the abandoned pipe's handle.
+func (e *atkEnv) capture(mode RecordMode) ([]byte, *Pipe) {
 	e.t.Helper()
-	a := &tap{}
+	received := make(chan []byte, 1)
 	addr := atkRelay(e.t, func(c net.Conn) {
-		b := make([]byte, 64<<10)
-		for {
-			n, err := c.Read(b)
-			a.add(b[:n])
+		var hello []byte
+		buf := make([]byte, 64<<10)
+		for len(hello) < MaxUntakenRead {
+			n, err := c.Read(buf[:min(len(buf), MaxUntakenRead-len(hello))])
+			hello = append(hello, buf[:n]...)
+			if _, _, perr := join.ParseHelloExact(hello, join.Stream); perr == nil {
+				received <- hello
+				_, _ = io.Copy(io.Discard, c) // the joiner cancels after capture
+				return
+			}
 			if err != nil {
 				return
 			}
@@ -298,22 +306,33 @@ func (e *atkEnv) capture(mode RecordMode) []byte {
 	})
 	ctx, cancel := context.WithCancel(e.ctx)
 	defer cancel()
+	nc := e.dial(addr)
 	done := make(chan error, 1)
 	go func() {
-		_, err := e.c.AddPipe(ctx, NetPipe(e.dial(addr)), PipeOptions{RecordMode: Set(mode)})
+		_, err := e.c.AddPipe(ctx, NetPipe(nc), PipeOptions{RecordMode: Set(mode)})
 		done <- err
 	}()
 	var hello []byte
-	e.until("a Hello", func() bool {
-		hello = a.bytes()
-		_, _, err := join.ParseHelloExact(hello, join.Stream)
-		return err == nil
-	})
+	select {
+	case hello = <-received:
+	case <-ctx.Done():
+		e.t.Fatalf("waiting for Hello: %v", ctx.Err())
+	}
+	var attempted *Pipe
+	for _, pipe := range e.c.Pipes() {
+		if ps, ok := pipe.Stats(); ok && ps.Local && ps.Outbound == OutboundJoining {
+			attempted = pipe
+			break
+		}
+	}
+	if attempted == nil {
+		e.t.Fatal("no joining pipe for captured Hello")
+	}
 	cancel()
 	if err := <-done; err == nil {
 		e.t.Fatal("a join succeeded without an answer")
 	}
-	return hello
+	return hello, attempted
 }
 
 var atkGroup, _ = join.LookupGroup(join.GroupX25519)
@@ -456,7 +475,7 @@ func TestJoinThirdParty(t *testing.T) {
 				if at.answer != nil {
 					answer = at.answer(uint64(st.StreamID()))
 				}
-				addr, a := e.rogue(answer)
+				addr, a, hello := e.rogue(answer)
 				ctx, cancel := context.WithCancel(e.ctx)
 				defer cancel()
 				carrier := e.dialTLS(addr)
@@ -465,14 +484,10 @@ func TestJoinThirdParty(t *testing.T) {
 					_, err := e.c.AddPipe(ctx, NetPipe(carrier), PipeOptions{RecordMode: Set(mode)})
 					added <- err
 				}()
-				// The third party has its one Hello; from here the join has
-				// a second to fail on the answer, else it is given up.
-				e.until("the Hello at the third party", func() bool {
-					_, _, err := join.ParseHelloExact(a.bytes(), join.Stream)
-					return err == nil
-				})
-				stop := time.AfterFunc(time.Second, cancel)
-				defer stop.Stop()
+				waitTestSignal(t, hello, "Hello received by the third party")
+				if answer == nil {
+					cancel()
+				}
 				err = <-added
 				if err == nil {
 					t.Fatal("a third party completed the join")
@@ -488,11 +503,9 @@ func TestJoinThirdParty(t *testing.T) {
 				if at.answer != nil && !errors.Is(err, context.Canceled) && e.c.ConnectionStats().JoinFailures == 0 {
 					t.Fatalf("join failed with %v and no JoinFailures", err)
 				}
-				_ = st.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
-				if n, _ := st.Read(make([]byte, 16)); n != 0 {
+				if n, _ := st.TryRead(make([]byte, 16)); n != 0 {
 					t.Fatal("forged data reached the application")
 				}
-				_ = st.SetReadDeadline(time.Time{})
 				e.rejoinDelivers(mode, secret)
 				e.alive(e.c)
 				runtime.KeepAlive(st)
@@ -534,26 +547,42 @@ func (e *atkEnv) tlsRelay(a *tap) string {
 // closed at once by default, not stalled.
 func TestJoinBoundRelayRefused(t *testing.T) {
 	t.Parallel()
-	e := newAtkEnv(t, atkOpts{})
+	clock := NewClockDomain(timeshim.NewFake(time.Unix(1, 0)))
+	setClock := func(c *Config) { c.ClockDomain = clock }
+	e := newAtkEnv(t, atkOpts{client: setClock, server: setClock})
 	st, err := e.c.OpenStreamSync(e.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.suspend()
+	_ = e.first.Close()
+	for _, c := range []*Conn{e.c, e.s} {
+		for {
+			event, err := c.NextEvent(e.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if event.Kind == EventSessionSuspended {
+				break
+			}
+		}
+	}
 	secret := atkSecret("bound-relay")
 	if _, err := st.Write(secret); err != nil {
 		t.Fatal(err)
 	}
 	a := &tap{}
 	addr := e.tlsRelay(a)
-	start := time.Now()
+	// Leave the protocol clock frozen. A stalled carrier could only be
+	// released by the watchdog, while the default refusal closes it here.
 	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dialTLS(addr)), PipeOptions{RecordMode: Set(RecordBound)}); err == nil {
 		t.Fatal("Bound passed a third party")
 	}
-	if took := time.Since(start); took > DefaultJoinTimeout/2 {
-		t.Fatalf("the refused join ended after %v, not at once", took)
+	if err := e.ctx.Err(); err != nil {
+		t.Fatalf("waiting for the refused carrier to close: %v", err)
 	}
-	e.until("the origin's refusal", func() bool { return e.s.ConnectionStats().JoinAuthFailures == 1 })
+	if got := e.s.ConnectionStats().JoinAuthFailures; got != 1 {
+		t.Fatalf("origin recorded %d join authentication failures, want 1", got)
+	}
 	if _, _, err := join.ParseHelloExact(a.bytes(), join.Stream); err != nil {
 		t.Fatalf("the third party read more than one Hello: %v", err)
 	}
@@ -599,7 +628,7 @@ func TestJoinSealedRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := <-outs
-	e.until("the origin's pipe", func() bool { _, ok := e.s.Pipe(p.ID()); return ok })
+	sp := waitTestAttachment(t, e.ctx, p, e.s)
 	first, _ := e.c.Pipe(0)
 	_ = first.Abort()
 	st, err := e.c.OpenStreamSync(e.ctx)
@@ -622,14 +651,11 @@ func TestJoinSealedRelay(t *testing.T) {
 	if _, err := out.Write(append([]byte{0, 40}, make([]byte, 40)...)); err != nil {
 		t.Fatal(err)
 	}
-	e.until("the injected record's pipe to end", func() bool {
-		st, ok := e.s.Pipe(p.ID())
-		if !ok {
-			return true
-		}
-		ps, ok := st.Stats()
-		return !ok || ps.Inbound != InboundOpen
-	})
+	for ps, ok := sp.Stats(); ok && ps.Inbound == InboundOpen; ps, ok = sp.Stats() {
+		waitTestEvent(t, e.ctx, e.s, "end of the injected record's pipe", func(ev Event) bool {
+			return ev.PipeID == sp.ID() || ev.Kind == EventPipesRetired
+		})
+	}
 	e.alive(e.s)
 	e.alive(e.c)
 	runtime.KeepAlive(st)
@@ -742,7 +768,7 @@ func TestSecretFlagsClearedDisableMultipath(t *testing.T) {
 		c.HandshakeTimeout = 2 * time.Second
 		return c
 	}
-	_, c, s, err := startTampered(t, cfg, func(p *wire.Params) { p.SecretFlags = 0 })
+	lst, c, s, err := startTampered(t, cfg, func(p *wire.Params) { p.SecretFlags = 0 })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,10 +782,15 @@ func TestSecretFlagsClearedDisableMultipath(t *testing.T) {
 	}
 	x, y := net.Pipe()
 	defer func() { _ = x.Close(); _ = y.Close() }()
-	jctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	jctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	if _, err := c.AddPipe(jctx, NetPipe(x), PipeOptions{}); err == nil {
-		t.Fatal("a join to an end without multipath")
+	refused := make(chan error, 1)
+	go func() { refused <- lst.HandlePipe(jctx, NetPipe(y), PipeHint{}) }()
+	if _, err := c.AddPipe(jctx, NetPipe(x), PipeOptions{}); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("join to an end without multipath: %v", err)
+	}
+	if err := <-refused; err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("handle join without multipath: %v", err)
 	}
 }
 
@@ -783,7 +814,10 @@ func TestSessionCryptoTamperFailsJoins(t *testing.T) {
 	}()
 	// The joiner hears nothing from an acceptor that failed the Hello: it
 	// is given up once the failure is counted.
-	waitUntil(t, 60*time.Second, "the auth failure", func() bool { return s.ConnectionStats().JoinAuthFailures == 1 })
+	waitTestEvent(t, ctx, s, "join authentication failure", func(ev Event) bool { return ev.Kind == EventJoinAuthFailed })
+	if n := s.ConnectionStats().JoinAuthFailures; n != 1 {
+		t.Fatalf("%d authentication failures, want 1", n)
+	}
 	cancel()
 	if err := <-added; err == nil {
 		t.Fatal("a join succeeded with a tampered zmux_session_crypto")
@@ -803,15 +837,15 @@ func TestReplayMovesNothing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			e.until("the join at the origin", func() bool { _, ok := e.s.Pipe(p.ID()); return ok })
+			waitTestAttachment(t, e.ctx, p, e.s)
 			before := e.s.PipeStats()
 			added := e.s.ConnectionStats().PipesAdded
 			// A joiner that gave up abandons its ID over the live pipe: its Hello is dropped.
-			hello := e.capture(mode)
-			e.until("the abandoned ID", func() bool {
-				_, replied := e.offer(hello)
-				return !replied && e.s.ConnectionStats().JoinReplays > 0
-			})
+			hello, attempted := e.capture(mode)
+			waitTestSignal(t, attempted.Done(), "abandoned pipe retirement")
+			if _, replied := e.offer(hello); replied || e.s.ConnectionStats().JoinReplays != 1 {
+				t.Fatalf("abandoned Hello: replied=%v, replays=%d", replied, e.s.ConnectionStats().JoinReplays)
+			}
 			// A Hello not seen yet gets a Reply, with no attachment state.
 			fresh, _ := e.forge(20, join.Mode(mode), nil, nil)
 			nc, replied := e.offer(fresh)
@@ -849,17 +883,21 @@ func TestReplayMovesNothing(t *testing.T) {
 				t.Fatal(err)
 			}
 			added := e.s.ConnectionStats().PipesAdded
-			hello := e.capture(mode)
+			hello, _ := e.capture(mode)
 			if _, replied := e.offer(hello); !replied {
 				t.Fatal("no Reply")
 			}
 			if s := e.s.ConnectionStats(); s.PipesActive != 0 || s.PipesAdded != added {
 				t.Fatalf("a replay ended the suspension: %+v", s)
 			}
-			if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{RecordMode: Set(mode)}); err != nil {
+			p, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{RecordMode: Set(mode)})
+			if err != nil {
 				t.Fatal(err)
 			}
-			e.until("the resumption", func() bool { return e.s.ConnectionStats().PipesActive == 1 })
+			waitTestAttachment(t, e.ctx, p, e.s)
+			if n := e.s.ConnectionStats().PipesActive; n != 1 {
+				t.Fatalf("%d active pipes after resumption, want 1", n)
+			}
 			runtime.KeepAlive(st)
 		})
 	}
@@ -883,7 +921,10 @@ func TestReplayBoundOtherCarrierFails(t *testing.T) {
 	if _, err := other.Write(hello); err != nil {
 		t.Fatal(err)
 	}
-	e.until("the auth failure", func() bool { return e.s.ConnectionStats().JoinAuthFailures == 1 })
+	waitTestEvent(t, e.ctx, e.s, "join authentication failure", func(ev Event) bool { return ev.Kind == EventJoinAuthFailed })
+	if n := e.s.ConnectionStats().JoinAuthFailures; n != 1 {
+		t.Fatalf("%d authentication failures, want 1", n)
+	}
 	if n, err := other.Read(make([]byte, 1)); n != 0 || err == nil {
 		t.Fatalf("answered on the other carrier: %d, %v", n, err)
 	}
@@ -943,6 +984,7 @@ func TestReplayTakesPipeID(t *testing.T) {
 func TestReplayFirstBatchDeduplicated(t *testing.T) {
 	t.Parallel()
 	e := newAtkEnv(t, atkOpts{})
+	before := e.s.ConnectionStats().StreamsOpenedRemote
 	st, err := e.c.OpenStreamSync(e.ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -953,7 +995,7 @@ func TestReplayFirstBatchDeduplicated(t *testing.T) {
 	if _, err := st.Write(msg); err != nil {
 		t.Fatal(err)
 	}
-	hello := e.capture(RecordSealed)
+	hello, _ := e.capture(RecordSealed)
 	if bytes.Contains(hello, msg[:64]) {
 		t.Fatal("plaintext in the Hello")
 	}
@@ -979,10 +1021,8 @@ func TestReplayFirstBatchDeduplicated(t *testing.T) {
 	if _, err := io.ReadFull(ss, tail); err != nil || string(tail) != "TAIL" {
 		t.Fatalf("after the batch: %q, %v", tail, err)
 	}
-	ctx, cancel := context.WithTimeout(e.ctx, 50*time.Millisecond)
-	defer cancel()
-	if x, err := e.s.AcceptStream(ctx); err == nil {
-		t.Fatalf("a replay opened stream %d", x.StreamID())
+	if opened := e.s.ConnectionStats().StreamsOpenedRemote - before; opened != 1 {
+		t.Fatalf("first batch opened %d streams, want 1", opened)
 	}
 	runtime.KeepAlive(st)
 }
@@ -993,58 +1033,51 @@ func TestReplayFirstBatchDeduplicated(t *testing.T) {
 // handshake's bound, no liveness clock runs on it. The clocks start at ACTIVE.
 func TestJoiningHasNoLiveness(t *testing.T) {
 	t.Parallel()
-	e := newAtkEnv(t, atkOpts{})
-	live := PipeOptions{Liveness: Set(PipeLiveness{SuspectFloor: 50 * time.Millisecond, DeadTimeout: time.Second})}
-	st, err := e.c.OpenStreamSync(e.ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.Write(make([]byte, 1<<10)); err != nil {
-		t.Fatal(err)
-	}
-	// The path holds the Hello for longer than DeadTimeout.
-	hold := 1500 * time.Millisecond
-	addr := atkRelay(t, func(in net.Conn) {
-		time.Sleep(hold)
-		out, err := net.Dial("tcp", e.addr)
+	synctest.Test(t, func(t *testing.T) {
+		e := newMemMPEnv(t, mpConfig(), mpConfig())
+		live := PipeOptions{Liveness: Set(PipeLiveness{SuspectFloor: 50 * time.Millisecond, DeadTimeout: time.Second})}
+		st, err := e.client.OpenStreamSync(t.Context())
 		if err != nil {
-			return
+			t.Fatal(err)
 		}
-		defer func() { _ = out.Close() }()
-		go func() { _, _ = io.Copy(in, out); _ = in.Close() }()
-		_, _ = io.Copy(out, in)
-	})
-	done := make(chan error, 1)
-	var p *Pipe
-	go func() {
-		var err error
-		p, err = e.c.AddPipe(e.ctx, NetPipe(e.dial(addr)), live)
-		done <- err
-	}()
-	deadline := time.After(hold - 100*time.Millisecond)
-watch:
-	for {
-		for _, ps := range e.c.PipeStats() {
+		if _, err := st.Write(make([]byte, 1<<10)); err != nil {
+			t.Fatal(err)
+		}
+		a, b := net.Pipe()
+		defer func() { _ = a.Close(); _ = b.Close() }()
+		type result struct {
+			p   *Pipe
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			p, err := e.client.AddPipe(t.Context(), NetPipe(a), live)
+			done <- result{p, err}
+		}()
+		synctest.Wait() // Hello cannot be handed off until the peer reads.
+		synctest.Sleep(1500 * time.Millisecond)
+		synctest.Wait()
+		for _, ps := range e.client.PipeStats() {
 			if ps.PipeID != 0 && (ps.SuspectCount != 0 || ps.FailureCount != 0 || ps.Outbound == OutboundSuspect) {
 				t.Fatalf("a JOINING pipe has liveness: %+v", ps)
 			}
 		}
 		select {
-		case <-deadline:
-			break watch
-		case err := <-done:
-			t.Fatalf("the join ended early: %v", err)
-		case <-time.After(10 * time.Millisecond):
+		case r := <-done:
+			t.Fatalf("the join ended before the peer read its Hello: %v", r.err)
+		default:
 		}
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("the join: %v", err)
-	}
-	ps, ok := p.Stats()
-	if !ok || ps.Outbound != OutboundActive || ps.FailureCount != 0 || ps.SuspectCount != 0 {
-		t.Fatalf("a pipe just ACTIVE has a stall from before: %+v", ps)
-	}
-	runtime.KeepAlive(st)
+		go func() { _ = e.lst.HandlePipe(t.Context(), NetPipe(b), PipeHint{}) }()
+		r := <-done
+		if r.err != nil {
+			t.Fatalf("the join: %v", r.err)
+		}
+		ps, ok := r.p.Stats()
+		if !ok || ps.Outbound != OutboundActive || ps.FailureCount != 0 || ps.SuspectCount != 0 {
+			t.Fatalf("a newly active pipe has a failure from before: %+v", ps)
+		}
+		runtime.KeepAlive(st)
+	})
 }
 
 // ---- first batch ----
@@ -1072,7 +1105,7 @@ func TestFirstBatchSize(t *testing.T) {
 			if _, err := st.Write(make([]byte, 64<<10)); err != nil {
 				t.Fatal(err)
 			}
-			hello := e.capture(RecordSealed)
+			hello, _ := e.capture(RecordSealed)
 			if len(hello) > 8192 {
 				t.Fatalf("Hello of %d bytes, over the handshake message floor", len(hello))
 			}
@@ -1102,7 +1135,7 @@ func TestFirstBatchNoFIN(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	hello := e.capture(RecordSealed)
+	hello, _ := e.capture(RecordSealed)
 	batch := e.openHello(hello).FirstBatch
 	if len(batch) == 0 {
 		t.Fatal("no first batch")
@@ -1129,11 +1162,10 @@ func TestFirstBatchNoFIN(t *testing.T) {
 	if _, err := io.ReadFull(ss, got); err != nil {
 		t.Fatal(err)
 	}
-	_ = ss.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	if _, err := ss.Read(make([]byte, 1)); errors.Is(err, io.EOF) {
-		t.Fatal("end of stream from a first batch")
+	var extra [1]byte
+	if n, err := ss.TryRead(extra[:]); n != 0 || !errors.Is(err, ErrWouldBlock) {
+		t.Fatalf("after the first batch: %d, %v", n, err)
 	}
-	_ = ss.SetReadDeadline(time.Time{})
 	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -1177,7 +1209,7 @@ func TestFirstBatchResetFinalSize(t *testing.T) {
 	if _, err := st.Write(make([]byte, 2048)); err != nil {
 		t.Fatal(err)
 	}
-	hello := e.capture(RecordSealed)
+	hello, _ := e.capture(RecordSealed)
 	if _, replied := e.offer(hello); !replied {
 		t.Fatal("no Reply")
 	}
@@ -1202,103 +1234,116 @@ func TestFirstBatchResetFinalSize(t *testing.T) {
 // ---- Unconfirmed carriers and the cap ----
 
 // A new authenticated Hello evicts the oldest Unconfirmed carrier and is never refused
-// for lack of room; a real join still passes. ListenerConfig.MaxPendingPerSession sets the cap (zero: 4).
+// for lack of room; a real join still passes. Config.SessionPolicy.Limits.PendingPeerJoins sets the cap (zero: 4).
 func TestUnconfirmedEviction(t *testing.T) {
-	t.Parallel()
 	for _, limit := range []int{0, 2} {
 		t.Run(strconv.Itoa(limit), func(t *testing.T) {
-			t.Parallel()
-			testUnconfirmedEviction(t, limit)
+			synctest.Test(t, func(t *testing.T) {
+				testUnconfirmedEviction(t, limit)
+			})
 		})
 	}
 }
 
-func testUnconfirmedEviction(t *testing.T, limit int) { //nolint:thelper // subtest body, not a helper: failures point inside it
-	e := newAtkEnv(t, atkOpts{listener: func(lc *ListenerConfig) { lc.MaxPendingPerSession = limit }})
+func testUnconfirmedEviction(t *testing.T, limit int) {
+	t.Helper()
+	ccfg, scfg := atkConfig(), atkConfig()
+	scfg.SessionPolicy.Limits.PendingPeerJoins = limit
+	e := newMemMPEnv(t, ccfg, scfg)
+	peer := &atkEnv{t: t, c: e.client}
 	want := limit
 	if want == 0 {
 		want = 4
 	}
-	held := make([]net.Conn, 0, want+2)
-	for i := range want + 2 {
-		hello, _ := e.forge(uint64(20+2*i), join.Sealed, nil, nil)
-		nc, replied := e.offer(hello)
-		if !replied {
-			t.Fatalf("Hello %d: refused for lack of room", i)
+	joins := make([]chan error, want+2)
+	for i := range joins {
+		a, b := net.Pipe()
+		t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+		joins[i] = make(chan error, 1)
+		go func() { joins[i] <- e.lst.HandlePipe(t.Context(), NetPipe(b), PipeHint{}) }()
+		hello, joiner := peer.forge(uint64(20+2*i), join.Sealed, nil, nil)
+		if _, err := a.Write(hello); err != nil {
+			t.Fatal(err)
 		}
-		held = append(held, nc)
+		r := unitReader{p: NetPipe(a)}
+		if err := r.more(); err != nil {
+			t.Fatal(err)
+		}
+		reply, _, err := joiner.ReadReply(r.buf)
+		if err != nil || reply.Decision != join.DecisionAccept {
+			t.Fatalf("Hello %d: reply %+v, %v", i, reply, err)
+		}
 	}
-	drained := func(nc net.Conn) bool {
-		_ = nc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		_, err := io.Copy(io.Discard, nc)
-		return err == nil
+	synctest.Wait()
+	for i, joined := range joins {
+		select {
+		case err := <-joined:
+			if i >= 2 || err == nil {
+				t.Fatalf("unexpected result for Join %d: %v", i, err)
+			}
+		default:
+			if i < 2 {
+				t.Fatalf("oldest Join %d was not evicted", i)
+			}
+		}
 	}
-	if !drained(held[0]) || !drained(held[1]) {
-		t.Fatal("the oldest Unconfirmed carriers were not closed")
+	view, err := e.server.Capacity()
+	if err != nil || view.PendingPeerJoins != want {
+		t.Fatalf("pending Joins: %+v, %v", view, err)
 	}
-	if drained(held[2]) || drained(held[len(held)-1]) {
-		t.Fatal("an Unconfirmed carrier within the cap was closed")
-	}
-	// An eviction is a limit of the session: each evicted join counts as
-	// refused, and none counts as a join (Joins is for Confirmed ones).
-	e.until("the evictions to be counted", func() bool { return e.lst.Stats().Refused == 2 })
-	if st := e.lst.Stats(); st.Rejected != 0 || st.Joins != 0 {
+	if st := e.lst.Stats(); st.Refused != 2 || st.Rejected != 0 || st.Joins != 0 {
 		t.Fatalf("stats after the evictions: %+v", st)
 	}
-	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{}); err != nil {
-		t.Fatalf("a real join among replays: %v", err)
+	p, err := e.pipeDialer()(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.client.AddPipe(t.Context(), p, PipeOptions{}); err != nil {
+		t.Fatalf("a real join among pending Joins: %v", err)
 	}
 }
 
-// The check that holds is the one at Confirmed: two joins for one free place both read
-// accept, and the later confirmation is refused with PIPE_ABANDON.
+// Two Joins can receive accepted Replies for one free slot. Their confirmations
+// compete for it under the session owner.
 func TestCapCheckedAtConfirmed(t *testing.T) {
-	t.Parallel()
-	e := newAtkEnv(t, atkOpts{server: func(c *Config) { c.MaxPipes, c.PipeHeadroom = 2, 1 }})
-	release := make(chan struct{})
-	gated := atkRelay(t, func(in net.Conn) {
-		out, err := net.Dial("tcp", e.addr)
+	synctest.Test(t, func(t *testing.T) {
+		scfg := mpConfig()
+		scfg.SessionPolicy.Limits = CapacityLimits{SteadyAttachments: 2, JoinHeadroom: new(1)}
+		e := newMemMPEnv(t, mpConfig(), scfg)
+		p, err := e.pipeDialer()(t.Context())
 		if err != nil {
-			return
+			t.Fatal(err)
 		}
-		defer func() { _ = out.Close() }()
-		go func() { _, _ = io.Copy(in, out); _ = in.Close() }()
-		b := make([]byte, 64<<10)
-		n, err := in.Read(b)
-		if err != nil {
-			return
+		if _, err := e.client.AddPipe(t.Context(), p, PipeOptions{}); err != nil {
+			t.Fatal(err)
 		}
-		_, _ = out.Write(b[:n]) // the Hello
-		<-release
-		_, _ = io.Copy(out, in)
-	})
-	if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(e.addr)), PipeOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	e.until("the second pipe", func() bool { return len(e.s.PipeStats()) == 2 })
-	for range 2 {
-		if _, err := e.c.AddPipe(e.ctx, NetPipe(e.dial(gated)), PipeOptions{ReturnOnReply: true}); err != nil {
-			close(release)
-			t.Fatalf("a prediction refused: %v", err)
-		}
-	}
-	if n := len(e.s.PipeStats()); n != 2 {
-		close(release)
-		t.Fatalf("%d pipes before any confirmation", n)
-	}
-	close(release)
-	e.until("the refused one to end", func() bool {
-		failed := 0
-		for _, ps := range e.c.PipeStats() {
-			if ps.Outbound != OutboundActive {
-				failed++
+		release := make(chan struct{})
+		pending := make([]*Pipe, 2)
+		for i := range pending {
+			a, b := net.Pipe()
+			t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+			go func() { _ = e.lst.HandlePipe(t.Context(), NetPipe(b), PipeHint{}) }()
+			pending[i], err = e.client.AddPipe(t.Context(), NetPipe(holdLaterWrites(a, release)), PipeOptions{ReturnOnReply: true})
+			if err != nil {
+				t.Fatalf("a prediction refused: %v", err)
 			}
 		}
-		return failed == 1 || len(e.c.PipeStats()) == 3
+		before, err := e.server.Capacity()
+		if err != nil || before.PeerAttachments != 2 || before.PendingPeerJoins != 2 {
+			t.Fatalf("before confirmation: %+v, %v", before, err)
+		}
+		close(release)
+		confirmed := 0
+		for _, p := range pending {
+			if err := p.WaitAttached(t.Context()); err == nil {
+				confirmed++
+			}
+		}
+		after, err := e.server.Capacity()
+		if err != nil || confirmed != 1 || after.PeerAttachments != 3 || after.PendingPeerJoins != 0 {
+			t.Fatalf("after confirmation, confirmed %d: %+v, %v", confirmed, after, err)
+		}
 	})
-	e.until("the cap", func() bool { return len(e.s.PipeStats()) == 3 })
-	e.alive(e.s)
-	e.alive(e.c)
 }
 
 // ---- session protection ----
@@ -1348,7 +1393,7 @@ func TestWeakestRecordModeUnmanaged(t *testing.T) {
 	if st, _ := p.Stats(); st.RecordMode != RecordSealed {
 		t.Fatalf("joined pipe %v", st.RecordMode)
 	}
-	e.until("the origin's pipe", func() bool { _, ok := e.s.Pipe(p.ID()); return ok })
+	waitTestAttachment(t, e.ctx, p, e.s)
 	first, _ := e.c.Pipe(0)
 	_ = first.Abort()
 	if m := e.c.WeakestRecordMode(); m != RecordUnmanaged {
@@ -1367,7 +1412,7 @@ func TestWeakestRecordModeSecure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cfg := func() *Config {
-		return &Config{MaxPipes: 4, SchedulerParams: SchedulerParams{Probation: -1},
+		return &Config{SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, SchedulerParams: SchedulerParams{Probation: -1},
 			AllowRecordMode: func(RecordPolicyInput, RecordMode, any) bool { return true }}
 	}
 	lst := mustNewListener(&ListenerConfig{Config: cfg()})
@@ -1398,9 +1443,17 @@ func TestWeakestRecordModeSecure(t *testing.T) {
 	if m := c.WeakestRecordMode(); m != RecordTrusted {
 		t.Fatalf("with a Trusted pipe: %v", m)
 	}
-	waitUntil(t, 30*time.Second, "the acceptor's view", func() bool { return s.WeakestRecordMode() == RecordTrusted })
-	_ = p.Abort()
-	waitUntil(t, 30*time.Second, "Trusted retired", func() bool { return c.WeakestRecordMode() == RecordSealed })
+	waitTestAttachment(t, ctx, p, s)
+	if m := s.WeakestRecordMode(); m != RecordTrusted {
+		t.Fatalf("acceptor with a Trusted pipe: %v", m)
+	}
+	if err := p.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	waitTestSignal(t, p.Done(), "Trusted retirement")
+	if m := c.WeakestRecordMode(); m != RecordSealed {
+		t.Fatalf("after Trusted retirement: %v", m)
+	}
 }
 
 // The acceptor takes only Sealed unless it allows more, and a refused Mode leaves the
@@ -1431,74 +1484,91 @@ func TestOnReject(t *testing.T) {
 	for _, x := range []struct {
 		name  string
 		act   RejectAction
-		stall bool
-	}{{"close", RejectClose, false}, {"stall", RejectStall, true}} {
+		stall time.Duration
+	}{{"close", RejectClose, 0}, {"stall", RejectStall, 300 * time.Millisecond}} {
 		t.Run(x.name, func(t *testing.T) {
 			t.Parallel()
-			var reasons sync.Map
-			e := newAtkEnv(t, atkOpts{
-				server: func(c *Config) { c.JoinTimeout = 300 * time.Millisecond },
-				listener: func(l *ListenerConfig) {
-					l.OnReject = func(i RejectInfo) RejectAction {
-						reasons.Store(i.Reason, i.Profile)
-						return x.act
-					}
-				},
+			synctest.Test(t, func(t *testing.T) {
+				got := make(chan RejectInfo, 1)
+				cfg := atkConfig()
+				cfg.ClockDomain = NewClockDomain(timeshim.Real)
+				cfg.JoinTimeout = x.stall
+				l := mustNewListener(&ListenerConfig{Config: cfg, OnReject: func(i RejectInfo) RejectAction {
+					got <- i
+					return x.act
+				}})
+				defer func() { _ = l.Close() }()
+				checkRejectedJoinClose(t, l, unknown, x.stall)
+				if i := <-got; i.Reason != "unknown_locator" || i.Profile != join.ProfileJoin {
+					t.Fatalf("OnReject: %+v", i)
+				}
 			})
-			nc := e.dial(e.addr)
-			if _, err := nc.Write(unknown); err != nil {
-				t.Fatal(err)
-			}
-			start := time.Now()
-			_ = nc.SetReadDeadline(time.Now().Add(60 * time.Second))
-			got, err := io.ReadAll(nc)
-			if err != nil || len(got) != 0 {
-				t.Fatalf("carrier ended with %d bytes, %v", len(got), err)
-			}
-			if d := time.Since(start); x.stall && d < 250*time.Millisecond {
-				t.Fatalf("stall ended after %v", d)
-			}
-			if p, ok := reasons.Load("unknown_locator"); !ok || p != uint64(2) {
-				t.Fatalf("OnReject reason: %v %v", p, ok)
-			}
 		})
 	}
 }
 
-// A stalled join that names a session ends at the listener's join timeout, counted
-// from the rejection, not at the session's own.
+// A stalled join that names a session uses the listener's join deadline.
 func TestJoinStallListenerTimeout(t *testing.T) {
 	t.Parallel()
-	got := make(chan string, 4)
-	e := newAtkEnv(t, atkOpts{
-		server: func(c *Config) { c.JoinTimeout = 300 * time.Millisecond },
-		listener: func(l *ListenerConfig) {
-			base := l.Config
-			l.SessionConfig = func(context.Context, *CarrierInfo, any) (*Config, error) {
-				c := base.Clone()
+	synctest.Test(t, func(t *testing.T) {
+		const stall = 300 * time.Millisecond
+		got := make(chan string, 1)
+		server := atkConfig()
+		server.JoinTimeout = stall
+		env := newMemMPEnvOn(t, atkConfig(), &ListenerConfig{Config: server,
+			SessionConfig: func(context.Context, *CarrierInfo, any) (*Config, error) {
+				c := server.Clone()
 				c.JoinTimeout = time.Minute
 				return c, nil
-			}
-			l.OnReject = func(i RejectInfo) RejectAction { got <- i.Reason; return RejectStall }
-		},
+			},
+			OnReject: func(i RejectInfo) RejectAction { got <- i.Reason; return RejectStall },
+		})
+		e := &atkEnv{t: t, c: env.client}
+		hello, _ := e.forge(40, join.Sealed, nil, nil)
+		hello[len(hello)-1] ^= 1 // fails authentication
+		checkRejectedJoinClose(t, env.lst, hello, stall)
+		if r := <-got; r != "auth" {
+			t.Fatalf("reason %q", r)
+		}
 	})
-	hello, _ := e.forge(40, join.Sealed, nil, nil)
-	hello[len(hello)-1] ^= 1 // fails authentication
-	nc := e.dial(e.addr)
-	if _, err := nc.Write(hello); err != nil {
+}
+
+// checkRejectedJoinClose runs in a synctest bubble on an in-memory carrier.
+func checkRejectedJoinClose(t *testing.T, l *Listener, hello []byte, stall time.Duration) {
+	t.Helper()
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	go func() { _ = l.HandlePipe(t.Context(), NetPipe(b), PipeHint{}) }()
+	if _, err := a.Write(hello); err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
-	_ = nc.SetReadDeadline(time.Now().Add(30 * time.Second))
-	n, err := io.Copy(io.Discard, nc)
-	if err != nil || n != 0 {
-		t.Fatalf("carrier ended with %d bytes, %v", n, err)
+	type readResult struct {
+		err error
+		n   int64
 	}
-	if d := time.Since(start); d < 250*time.Millisecond || d > 10*time.Second {
-		t.Fatalf("stall ended after %v", d)
+	done := make(chan readResult, 1)
+	go func() {
+		n, err := io.Copy(io.Discard, a)
+		done <- readResult{err, n}
+	}()
+	if stall > 0 {
+		synctest.Sleep(stall - time.Nanosecond)
+		synctest.Wait()
+		select {
+		case r := <-done:
+			t.Fatalf("carrier ended before the stall deadline: %+v", r)
+		default:
+		}
+		synctest.Sleep(time.Nanosecond)
 	}
-	if r := <-got; r != "auth" {
-		t.Fatalf("reason %q", r)
+	synctest.Wait()
+	select {
+	case r := <-done:
+		if r.err != nil || r.n != 0 {
+			t.Fatalf("carrier ended with %d bytes, %v", r.n, r.err)
+		}
+	default:
+		t.Fatal("carrier still open after rejection")
 	}
 }
 
@@ -1510,9 +1580,11 @@ func TestJoinMemoryPressureRejects(t *testing.T) {
 	e := newAtkEnv(t, atkOpts{listener: func(l *ListenerConfig) {
 		l.OnReject = func(i RejectInfo) RejectAction { got <- i.Reason; return RejectClose }
 	}})
-	full := int64(e.lst.budget.Limit())
-	e.lst.budget.Add(full)
-	defer e.lst.budget.Add(-full)
+	full := e.lst.budget.Limit() - e.lst.budget.Used() - uint64(receiveFlightSize(nil))
+	if !e.lst.budget.TryCharge(full) {
+		t.Fatal("failed to fill the listener budget")
+	}
+	defer e.lst.budget.Release(full)
 	hello, _ := e.forge(42, join.Sealed, nil, nil)
 	if _, replied := e.offer(hello); replied {
 		t.Fatal("a Reply under pressure")
@@ -1555,7 +1627,7 @@ func TestSealedRefusesLanes(t *testing.T) {
 		t.Fatal(err)
 	}
 	first, _ := e.c.Pipe(0)
-	e.until("the origin's pipe", func() bool { _, ok := e.s.Pipe(p.ID()); return ok })
+	waitTestAttachment(t, e.ctx, p, e.s)
 	_ = first.Abort()
 	ctx, cancel := context.WithTimeout(e.ctx, 60*time.Second)
 	defer cancel()
@@ -1573,24 +1645,18 @@ func TestSealedRefusesLanes(t *testing.T) {
 // finRelay carries a Sealed join from the joiner to the acceptor unit by unit, and can
 // drop whole records, then end the carrier at a record boundary.
 type finRelay struct {
-	drop, fin atomic.Bool
-	dropped   atomic.Int64
+	drop atomic.Bool
 }
 
 func (r *finRelay) serve(in, out net.Conn) {
 	var buf []byte
 	b := make([]byte, 64<<10)
 	skip := -1 // the clear part of the Hello, known once its Locator length has come
+	dropped := 0
 	for {
-		if r.fin.Load() {
-			_ = out.(*net.TCPConn).CloseWrite()
-			_, _ = io.Copy(io.Discard, in)
-			return
-		}
-		_ = in.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
 		n, err := in.Read(b)
 		buf = append(buf, b[:n]...)
-		if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		if err != nil {
 			return
 		}
 		if skip < 0 && len(buf) >= 4 {
@@ -1610,7 +1676,12 @@ func (r *finRelay) serve(in, out net.Conn) {
 				break
 			}
 			if r.drop.Load() {
-				r.dropped.Add(int64(unit))
+				dropped += unit
+				if dropped >= 2<<10 {
+					_ = out.(*net.TCPConn).CloseWrite()
+					_, _ = io.Copy(io.Discard, in)
+					return
+				}
 			} else if _, err := out.Write(buf[:unit]); err != nil {
 				return
 			}
@@ -1638,7 +1709,7 @@ func TestSealedEndAtRecordBoundaryIsAFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.until("the acceptor's pipe", func() bool { _, ok := e.s.Pipe(p.ID()); return ok })
+	sp := waitTestAttachment(t, e.ctx, p, e.s)
 	// Data must take the relayed pipe, whose round trip the default scheduler
 	// may avoid as long as the direct pipe's is shorter.
 	e.c.SetScheduler(SchedulerSpreadRoundRobin())
@@ -1646,6 +1717,9 @@ func TestSealedEndAtRecordBoundaryIsAFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// No redundant copies: a copy acknowledged on the direct pipe would leave
+	// the failed pipe nothing owed, and so nothing to reinject.
+	st.SetRedundant(false)
 	if _, err := st.Write([]byte{0}); err != nil {
 		t.Fatal(err)
 	}
@@ -1672,22 +1746,10 @@ func TestSealedEndAtRecordBoundaryIsAFailure(t *testing.T) {
 		_, _ = want.Write(chunk)
 		total += int64(len(chunk))
 	}
-	for r.dropped.Load() < 2<<10 {
-		if e.ctx.Err() != nil {
-			t.Fatal("nothing went over the relayed pipe")
-		}
+	for range 16 {
 		write()
 	}
-	r.fin.Store(true)
-	e.until("the end to fail the pipe", func() bool {
-		sp, ok := e.s.Pipe(p.ID())
-		if !ok {
-			return true
-		}
-		ps, ok := sp.Stats()
-		return !ok || ps.Inbound == InboundEnded && ps.Outbound == OutboundFailed
-	})
-	e.until("the lost data to be sent again", func() bool { return e.c.ConnectionStats().BytesReinjected > 0 })
+	waitTestSignal(t, sp.Done(), "acceptor's failed pipe")
 	select {
 	case n := <-read:
 		t.Fatalf("the stream ended after %d bytes", n)
@@ -1705,6 +1767,9 @@ func TestSealedEndAtRecordBoundaryIsAFailure(t *testing.T) {
 	case <-e.ctx.Done():
 		t.Fatal("the stream's data did not all arrive")
 	}
+	if n := e.c.ConnectionStats().BytesReinjected; n == 0 {
+		t.Fatal("no data reinjected after the pipe failed")
+	}
 	e.alive(e.s)
 	e.alive(e.c)
 }
@@ -1712,10 +1777,10 @@ func TestSealedEndAtRecordBoundaryIsAFailure(t *testing.T) {
 // A Hello in Bound on a carrier with no Binding is refused as auth and counted.
 func TestBoundHelloWithoutBinding(t *testing.T) {
 	t.Parallel()
-	var reason atomic.Value
+	reason := make(chan string, 1)
 	e := newAtkEnv(t, atkOpts{listener: func(l *ListenerConfig) {
 		l.OnReject = func(i RejectInfo) RejectAction {
-			reason.Store(i.Reason)
+			reason <- i.Reason
 			return RejectClose
 		}
 	}})
@@ -1723,7 +1788,14 @@ func TestBoundHelloWithoutBinding(t *testing.T) {
 	if _, replied := e.offer(hello); replied {
 		t.Fatal("a Reply on a carrier without a Binding")
 	}
-	e.until("the refusal", func() bool { return reason.Load() == "auth" })
+	select {
+	case got := <-reason:
+		if got != "auth" {
+			t.Fatalf("refusal reason %q, want auth", got)
+		}
+	case <-e.ctx.Done():
+		t.Fatal(e.ctx.Err())
+	}
 	if n := e.s.ConnectionStats().JoinAuthFailures; n != 1 {
 		t.Fatalf("join authentication failures: %d", n)
 	}
@@ -1788,64 +1860,59 @@ func TestJoinUnknownSuiteRejects(t *testing.T) {
 func TestPendingLimitRejects(t *testing.T) {
 	t.Parallel()
 	for _, x := range []struct {
-		name  string
-		act   RejectAction
-		stall bool
-	}{{"close", RejectClose, false}, {"stall", RejectStall, false}} {
+		name string
+		act  RejectAction
+	}{{"close", RejectClose}, {"stall", RejectStall}} {
 		t.Run(x.name, func(t *testing.T) {
 			t.Parallel()
-			got := make(chan RejectInfo, 4)
-			cfg := atkConfig()
-			cfg.HandshakeTimeout = 300 * time.Millisecond
-			lst := mustNewListener(&ListenerConfig{Config: cfg, MaxPendingPerSource: 2, FirstRecordTimeout: 30 * time.Second,
-				OnReject: func(i RejectInfo) RejectAction { got <- i; return x.act }})
-			defer func() { _ = lst.Close() }()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			src := netip.MustParseAddrPort("192.0.2.1:1000")
-			held := make([]net.Conn, 0, 2)
-			defer func() {
-				for _, a := range held {
-					_ = a.Close()
+			synctest.Test(t, func(t *testing.T) {
+				got := make(chan RejectInfo, 4)
+				cfg := atkConfig()
+				cfg.ClockDomain = NewClockDomain(timeshim.Real)
+				lst := mustNewListener(&ListenerConfig{Config: cfg, MaxPendingPerSource: 2, FirstRecordTimeout: 30 * time.Second,
+					OnReject: func(i RejectInfo) RejectAction { got <- i; return x.act }})
+				defer func() { _ = lst.Close() }()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				src := netip.MustParseAddrPort("192.0.2.1:1000")
+				held := make([]net.Conn, 0, 2)
+				defer func() {
+					for _, a := range held {
+						_ = a.Close()
+					}
+				}()
+				for range 2 { // they hold the source's slots without a first record
+					a, b := net.Pipe()
+					held = append(held, a)
+					go func() { _ = lst.HandlePipe(ctx, NetPipe(b), PipeHint{Source: src}) }()
 				}
-			}()
-			for range 2 { // they hold the source's slots without a first record
-				a, b := net.Pipe()
-				held = append(held, a)
-				go func() { _ = lst.HandlePipe(ctx, NetPipe(b), PipeHint{Source: src}) }()
-			}
-			deadline := time.Now().Add(10 * time.Second)
-			for {
+				synctest.Wait()
 				lst.pmu.Lock()
 				n := lst.pending.Held(lst.sourceKey(src))
 				lst.pmu.Unlock()
-				if n == 2 {
-					break
+				if n != 2 {
+					t.Fatalf("held %d slots, want 2", n)
 				}
-				if time.Now().After(deadline) {
-					t.Fatal("the slots were not taken")
+				a, b := net.Pipe()
+				defer func() { _ = a.Close() }()
+				start := time.Now()
+				if err := lst.HandlePipe(ctx, NetPipe(b), PipeHint{Source: src}); !errors.Is(err, errRefused) {
+					t.Fatalf("HandlePipe: %v", err)
 				}
-				time.Sleep(5 * time.Millisecond)
-			}
-			a, b := net.Pipe()
-			defer func() { _ = a.Close() }()
-			start := time.Now()
-			if err := lst.HandlePipe(ctx, NetPipe(b), PipeHint{Source: src}); !errors.Is(err, errRefused) {
-				t.Fatalf("HandlePipe: %v", err)
-			}
-			if d := time.Since(start); x.stall != (d >= 250*time.Millisecond) {
-				t.Fatalf("refusal took %v", d)
-			}
-			if _, err := a.Read(make([]byte, 1)); err == nil {
-				t.Fatal("a byte on the refused carrier")
-			}
-			i := <-got
-			if i.Reason != "pending_limit" || i.Profile != 0 || i.Src != src {
-				t.Fatalf("OnReject %+v", i)
-			}
-			if lst.Stats().Refused != 1 {
-				t.Fatalf("refused: %d", lst.Stats().Refused)
-			}
+				if d := time.Since(start); d != 0 {
+					t.Fatalf("refusal took %v", d)
+				}
+				if _, err := a.Read(make([]byte, 1)); err == nil {
+					t.Fatal("a byte on the refused carrier")
+				}
+				i := <-got
+				if i.Reason != "pending_limit" || i.Profile != 0 || i.Src != src {
+					t.Fatalf("OnReject %+v", i)
+				}
+				if lst.Stats().Refused != 1 {
+					t.Fatalf("refused: %d", lst.Stats().Refused)
+				}
+			})
 		})
 	}
 }

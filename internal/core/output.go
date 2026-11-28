@@ -2,6 +2,7 @@ package core
 
 import (
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/shaping"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
@@ -31,11 +32,11 @@ func (s *Session) recMax(ol *outLane) int {
 // a shaping gate closed. Drivers schedule polls from lane wake requests.
 func (s *Session) WantsWrite(pipe, lane uint64) bool {
 	p := s.pipe(pipe)
-	if p == nil || p.out == nil || p.out.failed || p.mp != nil && p.mp.hs {
+	if p == nil || p.out == nil || p.out.failed || p.mp != nil && (p.mp.hs || p.mp.topologyOut) {
 		return false
 	}
 	ol := p.out.lane(lane)
-	if ol == nil || ol.shut || ol.closeSent || s.state == StateClosed || s.holdsFirst(pipe) {
+	if ol == nil || ol.shut || ol.notWritable || ol.closeSent || s.state == StateClosed || s.holdsFirst(pipe) {
 		return false
 	}
 	if pipe == 0 && lane == 0 && !ol.tpSent {
@@ -67,7 +68,7 @@ func (s *Session) WantsWrite(pipe, lane uint64) bool {
 	if s.mp != nil {
 		return s.mpWantsWrite(p, ol)
 	}
-	if lane == 0 && s.controlPending() {
+	if lane == 0 && (s.controlPending() || s.nextDatagram(p, false, 7) != nil) {
 		return true
 	}
 	return s.dataPendingOn(p, ol) && !s.limHeld(p) && (s.shp == nil || !s.shapeHeld(p))
@@ -119,7 +120,7 @@ func (s *Session) controlPending() bool {
 	if s.ack != nil && s.mp == nil && s.ack.due(s.now) {
 		return true
 	}
-	return s.dg != nil && s.dg.sendable(s)
+	return s.nextDatagramReport() <= s.now
 }
 
 // canSendNow reports whether the stream could put a frame out now; it uses
@@ -254,10 +255,114 @@ func (s *Session) planNewChunk(st *Stream) chunkPlan {
 	return p
 }
 
+// ClaimWrite consumes the permission published for the driver. Stale
+// requests are rejected before sampling protocol time or leasing a batch.
+func (s *Session) ClaimWrite(pipe, lane uint64, signal *WriteSignal) bool {
+	if !signal.Ready.Load() {
+		return false
+	}
+	signal.Ready.Store(false)
+	p := s.pipe(pipe)
+	if p == nil || p.out == nil {
+		return false
+	}
+	ol := p.out.lane(lane)
+	if ol == nil {
+		return false
+	}
+	return signal == p.writeSignal(ol) && !ol.notWritable && s.writeWorkOn(p, ol)
+}
+
+// writeWorkOn reads work membership, without predicting which stream a
+// scheduler would choose or constructing a routing decision.
+func (s *Session) writeWorkOn(p *Pipe, ol *outLane) bool {
+	if s.state == StateClosed || p.out.failed || ol.shut || ol.closeSent ||
+		s.holdsFirst(p.id) || p.mp != nil && p.mp.hs {
+		return false
+	}
+	if s.closeFr.pending && !s.closeFr.waitLanes {
+		return ol.lane == 0
+	}
+	if s.shp != nil && s.shapeDelayed(p) {
+		return false
+	}
+	if p.id == 0 && ol.lane == 0 && !ol.tpSent {
+		return true
+	}
+	if ol.laneFirst {
+		return s.state < StateClosing
+	}
+	if ol.lane > 0 && !ol.confirmed || !s.transportLive() {
+		return false
+	}
+	if !s.peerSeen {
+		return s.ping.wants() || s.earlyActive() && s.earlyWants()
+	}
+	if s.streamWorkOn(p, ol) {
+		return true
+	}
+	return ol.lane == 0 && (s.sessionControlOn(p) || s.shapeWants(p, 0) ||
+		s.recordDatagrams(p) ||
+		p.mp != nil && s.pathControlOn(p))
+}
+
+func (s *Session) sessionControlOn(p *Pipe) bool {
+	if !s.controlPending() {
+		return false
+	}
+	if p.mp == nil {
+		return true
+	}
+	primary, _ := s.primary()
+	return primary == nil || primary == p
+}
+
+func (s *Session) streamWorkOn(p *Pipe, ol *outLane) bool {
+	if s.sched.mask != 0 {
+		return true
+	}
+	return p.mp != nil && (ol.lane == 0 && len(p.mp.copyQ) != 0 ||
+		ol == p.out.lo.copyLane && len(p.mp.selfCopyQ) != 0)
+}
+
+func (s *Session) pathControlOn(p *Pipe) bool {
+	a, m := p.mp, s.mp
+	if a.firstRecord || m.pairAcks.contains(p) || a.needPing && m.pingAllowed(s.now) ||
+		m.ep.frame != nil && !a.epochSent && a.out == OutActive && epochPipe(p) {
+		return true
+	}
+	primaryAck := s.ack != nil && s.ackOwed() && !s.ackPairOnly()
+	backupAck := m.ackChanged && s.now >= m.redundantAt
+	if primaryAck || backupAck || len(m.abandonQ) != 0 || len(m.owedAbandons()) != 0 {
+		primary, backup := s.primary()
+		if (primary == p || primary == nil) && (primaryAck || len(m.owedAbandons()) != 0) || backup == p && backupAck {
+			return true
+		}
+		for _, q := range m.abandonQ {
+			if s.abandonGoesOn(q, p, primary) {
+				return true
+			}
+		}
+	}
+	for _, q := range m.statusQ {
+		if statusReady(q, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // PollTransmit fills b with records for the outbound lane, at most limit
 // bytes. It returns false when nothing is due.
 func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time) bool {
 	s.SetNow(now)
+	if s.mp != nil && s.mp.prefixScheduler != nil &&
+		(s.mp.prefixPending != 0 || s.mp.prefixAt != 0 && s.mp.prefixAt <= s.now) {
+		// A writer can get the owner before its timer callback. Use the
+		// same health-before-repair order at this handoff cut.
+		s.expirePathDeadlines(s.now)
+		s.prefixTimers(s.now, true)
+	}
 	b.reset()
 	b.Pipe, b.Lane = pipe, lane
 	p := s.pipe(pipe)
@@ -265,11 +370,13 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 		return false
 	}
 	ol := p.out.lane(lane)
-	if ol == nil || ol.shut || s.holdsFirst(pipe) || p.mp != nil && p.mp.hs {
+	if ol == nil || ol.shut || ol.notWritable || s.holdsFirst(pipe) || p.mp != nil && p.mp.hs {
 		return false
 	}
 	var w recWriter
 	w.init(b, ol.info.Framing, s.recMax(ol), limit)
+	b.owner, b.provisional = ol, s.holdSends() && !s.earlyAccepted
+	b.trackProgress = p.member != nil && p.member.rotation != nil
 	if s.ack != nil && s.peerSeen {
 		w.dataRoom = s.paceRoom(p)
 		if w.dataRoom > 0 && !s.dataTurn(p, ol) {
@@ -281,8 +388,14 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 	// delayed like any other.
 	var ps *pipeShape
 	if s.shp != nil {
+		b.trackProgress = b.trackProgress || s.shp.eff.Wire != nil || s.shp.eff.Profile != nil
 		if ps = s.shapeOf(p); ps != nil {
+			ps.shapeEventsDue(s.now)
+			ps.resumeRecordWait(ol)
 			w.sh, w.gate = ps, ps
+			if ps.caps&shaping.CapOutbound != 0 {
+				b.shape = ps
+			}
 		}
 	}
 	if pipe == 0 && lane == 0 && !ol.tpSent {
@@ -308,13 +421,13 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 			s.writeEarly(&w)
 		}
 	case s.mp != nil:
-		if ps != nil && ps.injFirst {
+		if ps != nil && ps.injFirst && !s.controlPending() && (s.ack == nil || s.ack.deadline() > s.now) {
 			s.shapeInject(&w)
 		}
 		s.mpWrite(&w, p, ol)
 		s.shapeInject(&w)
 	default:
-		if ps != nil && ps.injFirst {
+		if ps != nil && ps.injFirst && !s.controlPending() && (s.ack == nil || s.ack.deadline() > s.now) {
 			s.shapeInject(&w)
 		}
 		if lane == 0 {
@@ -329,7 +442,7 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 	if w.oversize {
 		// The session fails: what the batch took is not handed to a carrier.
 		s.FailInternal("a frame exceeds the record limit")
-		w.b.release()
+		w.b.Discard()
 		w.b.reset()
 		return false
 	}
@@ -338,6 +451,7 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 	if w.dataSpent > 0 {
 		s.tookTurn(p, ol)
 	}
+	s.commitShape(&w)
 	if b.n == 0 {
 		if s.ack != nil && !ol.notWritable {
 			// A write opportunity that ends with nothing to send: an
@@ -347,6 +461,9 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 		return false
 	}
 	s.afterBatch(&w, p, ol)
+	if !w.closed && !w.delayed && (w.capped || w.controlFull) {
+		s.wakeLaneWriter(p, ol)
+	}
 	if s.ack != nil {
 		if (w.budget < 1024 || w.capped || w.dataHeld()) && s.dataPendingOn(p, ol) {
 			p.out.snd.re.blocked() // the write runs, or the limiter holds, while more data waits
@@ -355,8 +472,21 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 		}
 	}
 	ol.writing = true
+	if ps != nil {
+		ps.laneBlocked(ol)
+		if lane == 0 && ps.delayActive {
+			ps.refreshRecordFlows()
+		}
+	}
 	if !ol.notWritable {
 		ol.stallAt = now
+	}
+	if p.mp != nil {
+		if lane == 0 && len(p.out.tierWaiters) != 0 {
+			s.releaseTierWaiters(p)
+		}
+		s.armPathDeadline(p, pathStall)
+		s.armPathDeadline(p, pathProbe)
 	}
 	return true
 }
@@ -364,18 +494,23 @@ func (s *Session) PollTransmit(pipe, lane uint64, b *Batch, limit int, now Time)
 // afterBatch accounts positions and statistics of a produced batch; p and
 // its outbound direction are live (PollTransmit checked them).
 func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
-	var pos int
-	for _, r := range w.b.recs {
-		pos += recordPositionBytes(r.size)
+	// A byte-stream batch already includes each record's canonical Size.
+	// Message carriers omit Size on the wire but still count it in positions.
+	pos := w.b.n
+	if w.framing == FramingRecords {
+		for _, r := range w.b.recs {
+			pos += varint.SizeVarint(uint64(r.size))
+		}
 	}
 	start := ol.pos
 	ahead := s.snapAhead(p) // what waits ahead of this batch
 	ol.pos += uint64(pos)
 	ol.handed += uint64(pos)
 	w.b.pos = uint64(pos)
-	for _, st := range w.touched {
+	for _, st := range w.b.touched {
 		st.snd.laneEnd = ol.pos
 	}
+	w.b.clearTouched()
 	if w.anyElic {
 		// A message carrier's batch counts whole, as for the samples.
 		ol.elicitPos = ol.pos
@@ -384,24 +519,13 @@ func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
 		}
 	}
 	s.stats.BytesSent += uint64(pos)
-	// Earned are the bytes given to the carrier: a message carries no size field.
-	given := uint64(pos)
-	if w.framing == FramingRecords {
-		given = 0
-		for _, r := range w.b.recs {
-			given += uint64(r.size)
-		}
-	}
-	earned := given - min64(given, w.notEarned)
-	skip := min64(earned, s.earnSkip)
-	s.earnSkip -= skip
-	s.earnBytes += earned - skip
 	if s.ack != nil {
 		defer s.paceSent(p, uint64(pos))
 	}
 	s.stats.RecordsSent += uint64(w.recs)
 	p.out.records += uint64(w.recs)
 	if s.ack != nil {
+		w.deliveryRestricted = w.deliveryRestricted || !s.deliveryUnrestricted(p)
 		s.ack.onSent(p, ol, start, w, s.now, ahead)
 	}
 	if w.traffic {
@@ -418,7 +542,7 @@ func (s *Session) afterBatch(w *recWriter, p *Pipe, ol *outLane) {
 	// restarts the idle timer unless it carries only QX_PING requests and
 	// PADDING.
 	if !s.feat.Acked() && !w.onlyPing {
-		s.timers.lastActivity = s.now
+		s.noteActivity(s.now)
 	}
 }
 
@@ -487,25 +611,57 @@ func (s *Session) SetCarrierUnsent(pipe, lane, n uint64, now Time) {
 
 // WriteDone reports that a batch was written (or failed); it releases the
 // batch's references. n is the bytes the carrier took.
-func (s *Session) WriteDone(b *Batch, err error, now Time) {
+func (s *Session) WriteDone(b *Batch, n int, err error, now Time, physicalFault ...*PhysicalFault) {
 	s.SetNow(now)
 	s.wakePrefix()
+	p := s.pipe(b.Pipe)
+	var ol *outLane
+	if p != nil && p.out != nil {
+		ol = p.out.lane(b.Lane)
+	}
+	rotate := ol != nil && b.owner == ol && p.member != nil && p.member.rotation != nil
+	if b.owner != nil && (b.Handoffs() || rotate) {
+		bytes, records, _ := b.Tally(n, b.owner.info.Framing == FramingRecords, 0)
+		b.settleHandoffs(records)
+		if rotate {
+			s.memberBytes(p, true, bytes)
+		}
+	}
 	b.release()
-	if p := s.pipe(b.Pipe); p != nil && p.out != nil {
-		if ol := p.out.lane(b.Lane); ol != nil {
-			ol.writing = false
-			ol.handed -= min64(ol.handed, b.pos)
-			// Nothing follows CONNECTION_CLOSE on a lane, and one batch of
-			// a lane is written at a time: this write carried it.
-			ol.closeDone = ol.closeSent && err == nil
-			if ol.notWritable {
-				ol.stallAt = now
+	s.completeShape(b, n, ol)
+	if ol != nil && b.owner == ol {
+		ol.writing = false
+		if err == nil && p.sh != nil {
+			p.sh.resumeRecordWait(ol)
+			if b.Lane == 0 && p.sh.delayActive {
+				p.sh.refreshRecordCopyDelay()
+			}
+		}
+		ol.handed -= min64(ol.handed, b.pos)
+		ol.closeDone = ol.closeSent && err == nil
+		if ol.notWritable {
+			ol.stallAt = s.now
+		}
+		if p.mp != nil {
+			s.armPathDeadline(p, pathStall)
+		}
+		if ol.placementWaiting {
+			ol.placementWaiting = false
+			if err == nil && s.streamWorkOn(p, ol) {
+				s.wakePipe(p)
 			}
 		}
 	}
-	if err != nil {
-		s.pipeWriteFailed(b.Pipe, b.Lane, err)
+	if err != nil && ol != nil && b.owner == ol {
+		var fault *PhysicalFault
+		if len(physicalFault) != 0 {
+			fault = physicalFault[0]
+		}
+		s.PipeWriteFailed(b.Pipe, b.Lane, err, fault, now)
+	} else if err == nil && b.owner != nil && b.owner == ol && b.Lane == 0 {
+		s.routeDatagrams()
 	}
+	b.owner = nil
 	s.closeDonePipes()
 	s.startLinger()
 }
@@ -529,19 +685,19 @@ func (s *Session) closeDonePipes() {
 	}
 }
 
-// closePipeIfDone ends the linger of p and closes its carrier gracefully
-// once the peer's CONNECTION_CLOSE was read on it and nothing more of ours
-// follows on it (SPEC.md Section 6.5 steps 3 and 4): the peer sends
-// nothing after it, so waiting for the carrier's end or the linger timeout
-// would only delay the close.
+// closePipeIfDone closes the carrier independently of the application read
+// drain (SPEC.md Section 6.5 steps 3 and 4). Once the peer's CONNECTION_CLOSE
+// was read and our output is done, wait for the peer's end of input only
+// if the carrier supports half-close.
 func (s *Session) closePipeIfDone(p *Pipe) {
 	if s.state != StateClosing || p.in == nil || !p.in.ccRead || p.in.closed || !s.pipeOutDone(p) {
 		return
 	}
-	if l := p.in.lane(0); l == nil || l.info.HalfClose {
-		return // the peer's end follows its CONNECTION_CLOSE at once
+	if l := p.in.lane(0); l == nil || l.info.HalfClose && !p.in.ended {
+		return
 	}
 	p.in.closed, p.in.ended = true, true
+	s.cancelDatagramReports(p)
 	for _, l := range p.in.lanes {
 		l.ended = true
 	}
@@ -776,11 +932,12 @@ func (s *Session) writeControl(w *recWriter, p *Pipe) {
 		s.ack.write(w, p, s.now)
 	}
 	s.writePingResponse(w)
+	s.writeDatagramReports(w)
 	if s.pend.maxData {
 		s.tuneConnUpdate()
-		v := s.conn.rel + s.conn.win
+		v := s.nextReceiveCredit()
 		if v > s.conn.adv || s.conn.adv == 0 || s.pend.forceMaxData {
-			if !w.frame(1+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendMaxData(b, v) }) {
+			if !w.controlFrame(1+varint.SizeVarint(v), true, v <= s.conn.adv, func(b []byte) []byte { return wire.AppendMaxData(b, v) }) {
 				return
 			}
 			w.logFrame(frameDesc{kind: dMaxData})
@@ -797,14 +954,14 @@ func (s *Session) writeControl(w *recWriter, p *Pipe) {
 		s.pend.maxData = false
 	}
 	for t := range 2 {
-		if s.pend.maxStreams[t] {
-			v := s.rem[t].limit
-			if !w.frame(1+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendMaxStreams(b, t == 0, v) }) {
-				return
-			}
-			w.logFrame(frameDesc{kind: dMaxStreams, bidi: t == 0})
-			s.pend.maxStreams[t] = false
+		if !s.pend.maxStreams[t] {
+			continue
 		}
+		v := s.rem[t].limit
+		if !w.streamCountControl(dMaxStreams, t == 0, v, &s.rem[t].reported, wire.AppendMaxStreams) {
+			return
+		}
+		s.pend.maxStreams[t] = false
 	}
 	for st := s.ctlHead; st != nil; {
 		next := st.ctlNext
@@ -815,35 +972,43 @@ func (s *Session) writeControl(w *recWriter, p *Pipe) {
 	}
 	if s.dataBlockedDue() {
 		v := s.conn.sendMax
-		if !w.frame(1+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendDataBlocked(b, v) }) {
+		if !w.controlFrame(1+varint.SizeVarint(v), true, s.conn.blockedReported == v+1, func(b []byte) []byte { return wire.AppendDataBlocked(b, v) }) {
 			return
 		}
+		s.conn.blockedReported = v + 1
 		w.logFrame(frameDesc{kind: dDataBlocked})
 	}
 	s.pend.dataBlocked = false
 	for t := range 2 {
 		if s.streamsBlockedDue(t) {
 			v := s.loc[t].limit
-			if !w.frame(1+varint.SizeVarint(v), true, func(b []byte) []byte { return wire.AppendStreamsBlocked(b, t == 0, v) }) {
+			if !w.streamCountControl(dStreamsBlocked, t == 0, v, &s.loc[t].blockedReported, wire.AppendStreamsBlocked) {
 				return
 			}
-			w.logFrame(frameDesc{kind: dStreamsBlocked, bidi: t == 0})
 		}
 		s.pend.streamsBlocked[t] = false
 	}
 	if s.pend.goaway {
 		g := &s.ga
 		n := 4 + varint.SizeVarint(g.sentWater[0]) + varint.SizeVarint(g.sentWater[1]) + varint.SizeVarint(g.code)
-		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendGoAway(b, g.sentWater[0], g.sentWater[1], g.code) }) {
+		if !w.controlFrame(n, true, g.phaseWritten == g.phase, func(b []byte) []byte { return wire.AppendGoAway(b, g.sentWater[0], g.sentWater[1], g.code) }) {
 			return
 		}
+		g.phaseWritten = g.phase
 		w.logFrame(frameDesc{kind: dGoAway})
 		s.pend.goaway = false
 	}
 	s.writePing(w)
-	if s.dg != nil {
-		s.writeDatagrams(w, p)
+}
+
+func (w *recWriter) streamCountControl(kind descKind, bidi bool, count uint64, reported *uint64, appendFrame func([]byte, bool, uint64) []byte) bool {
+	if !w.controlFrame(1+varint.SizeVarint(count), true, *reported == count+1,
+		func(b []byte) []byte { return appendFrame(b, bidi, count) }) {
+		return false
 	}
+	*reported = count + 1
+	w.logFrame(frameDesc{kind: kind, bidi: bidi})
+	return true
 }
 
 // writeStreamCtl writes the pending control frames of one stream; it
@@ -862,7 +1027,7 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 		s.tuneStreamUpdate(st)
 		v := r.readOff + r.window
 		if !r.finKnown && !r.stopped && (v > r.adv || st.forceMSD) {
-			if !w.frame(1+varint.SizeVarint(id)+varint.SizeVarint(v), true,
+			if !w.controlFrame(1+varint.SizeVarint(id)+varint.SizeVarint(v), true, v <= r.adv,
 				func(b []byte) []byte { return wire.AppendMaxStreamData(b, id, v) }) {
 				return false
 			}
@@ -876,12 +1041,12 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 			r.adv = max64(r.adv, v)
 			st.forceMSD = false
 		}
-		st.ctl &^= ctlMaxStreamData
+		s.clearCtl(st, ctlMaxStreamData)
 	}
 	if st.ctl&ctlStop != 0 {
 		r := &st.rcv
 		c := r.stopCode
-		if !w.frame(1+varint.SizeVarint(id)+varint.SizeVarint(c), true,
+		if !w.controlFrame(1+varint.SizeVarint(id)+varint.SizeVarint(c), true, r.stopSent,
 			func(b []byte) []byte { return wire.AppendStopSending(b, id, c) }) {
 			return false
 		}
@@ -902,7 +1067,7 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 			if at {
 				n += varint.SizeVarint(rel)
 			}
-			if !w.frame(n, true, func(b []byte) []byte {
+			if !w.controlFrame(n, true, sp.resetSent, func(b []byte) []byte {
 				if at {
 					return wire.AppendResetStreamAt(b, id, code, final, rel)
 				}
@@ -930,7 +1095,7 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 		x := st.x()
 		seq, u, inc := x.reqSeq, x.reqUrgency, x.reqIncr
 		n := 4 + varint.SizeVarint(id) + varint.SizeVarint(seq) + 1
-		if !w.frame(n, true, func(b []byte) []byte { return wire.AppendPriorityUpdate(b, id, seq, u, inc) }) {
+		if !w.controlFrame(n, true, x.reqSent == seq, func(b []byte) []byte { return wire.AppendPriorityUpdate(b, id, seq, u, inc) }) {
 			return false
 		}
 		w.logFrame(frameDesc{kind: dPrio, id: id, val: seq})
@@ -939,15 +1104,19 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 	}
 	if st.ctl&ctlBlocked != 0 && st.snd.blocked == st.snd.maxData+1 {
 		v := st.snd.maxData
-		if !w.frame(1+varint.SizeVarint(id)+varint.SizeVarint(v), true,
+		if !w.controlFrame(1+varint.SizeVarint(id)+varint.SizeVarint(v), true, st.snd.blockedReported == v+1,
 			func(b []byte) []byte { return wire.AppendStreamDataBlocked(b, id, v) }) {
 			return false
 		}
+		st.snd.blockedReported = v + 1
 		w.logFrame(frameDesc{kind: dStreamDataBlocked, id: id})
 	}
 	st.ctl &^= ctlBlocked
 	if st.ctl == 0 {
 		s.unlinkCtl(st)
+		if st.rcv.stopSent && st.rcv.stopCode == wire.CodePacketError {
+			s.maybeDiscard(st)
+		}
 	}
 	return true
 }
@@ -963,7 +1132,9 @@ func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 	if p != nil && p.mp != nil {
 		d = &s.mp.dec // prepared by mpWrite
 	}
-	for s.sched.mask != 0 {
+	wantDatagram := p != nil && ol.lane == 0 && s.dg != nil
+	preferStream := false
+	for s.sched.mask != 0 || wantDatagram && s.recordDatagrams(p) {
 		// A record that is not open yet is planned by the chunk that
 		// opens it, once one has data to send: a plan is made only for a
 		// record that goes.
@@ -973,20 +1144,35 @@ func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 		progressed := false
 		it := s.sched.iter()
 		for st := it.next(); st != nil; st = it.next() {
-			if d != nil && (!s.canSendNow(st) || !s.onPipe(d, st)) {
+			if (d != nil || lp != nil) && !s.canSendNow(st) {
+				s.holdFreshCredit(st)
+				continue
+			}
+			if d != nil && !s.onPipe(d, st) {
 				continue
 			}
 			if lp != nil {
-				if !s.canSendNow(st) {
-					continue
-				}
-				if l, _, _ := s.laneFor(lp, st); l != ol {
+				if l := s.bindLane(lp, st); l != ol {
 					// Bound to another lane: its writer may be idle, so it
 					// is woken to take the data.
-					s.wakeLaneWriter(lp, s.bindLane(lp, st))
+					s.wakeLaneWriter(lp, l)
 					continue
 				}
-				s.bindLane(lp, st)
+			}
+			beforeFin := wantDatagram && st.snd.finWr && s.dg.waitsFor(st)
+			if wantDatagram && s.recordDatagrams(p) && (!preferStream || st.urgency > 0 || beforeFin) {
+				urgency := st.urgency
+				if preferStream && !beforeFin {
+					urgency--
+				}
+				sent, full := s.writeDatagram(w, p, urgency)
+				if full {
+					return
+				}
+				if sent {
+					progressed, preferStream = true, true
+					break
+				}
 			}
 			r := s.sendChunk(w, st, d)
 			if r == chunkFull {
@@ -997,18 +1183,26 @@ func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 				break
 			}
 			if r == chunkSent {
-				if lp != nil {
-					// Keep the physical lane while building this batch. afterBatch
-					// replaces the pending position with its final accounted end.
-					st.snd.laneEnd = ^uint64(0)
-					w.touched = append(w.touched, st)
+				if lp != nil && st.snd.laneEnd != pendingLaneEnd {
+					// Assembly is serialized by the session. Until afterBatch
+					// accounts the final end, this direction stays on this lane
+					// and needs only one entry, even across several records.
+					st.snd.laneEnd = pendingLaneEnd
+					w.b.touched = append(w.b.touched, st)
 				}
-				progressed = true
+				progressed, preferStream = true, false
 				break
 			}
 		}
 		if !progressed {
-			return
+			if !wantDatagram || !s.recordDatagrams(p) {
+				return
+			}
+			sent, _ := s.writeDatagram(w, p, 7)
+			if !sent {
+				return
+			}
+			preferStream = true
 		}
 	}
 }
@@ -1048,7 +1242,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	p := s.planChunk(st)
 	if d != nil && p.resend && p.n != 0 && sp.mps.repair.source != nil && sp.mps.repair.covers(p.off) {
 		r := &sp.mps.repair
-		target, eligible := s.prefixReplacement(d.g, r.source, min64(p.n, r.hi-p.off))
+		target, _, eligible := s.prefixTarget(d.g, r.source, r.anchor, min64(p.n, r.hi-p.off))
 		switch {
 		case !eligible:
 			s.retryPrefixTail(st)
@@ -1061,7 +1255,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 				p = s.planNewChunk(st)
 			}
 		case target != d.p:
-			s.chosen(d.p, target)
+			s.chosen(d, target)
 			return chunkSkip
 		}
 	}
@@ -1072,11 +1266,10 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		return chunkSkip
 	}
 	if p.n == 0 && !p.fin && !p.open {
-		if p.avail > 0 {
-			s.blockedOn(st, p.credit == 0, p.connCredit == 0)
-		}
-		if !st.sendable() || p.credit == 0 && p.avail > 0 {
+		if !st.sendable() {
 			s.sched.remove(st)
+		} else {
+			s.holdFreshCredit(st)
 		}
 		return chunkSkip
 	}
@@ -1137,6 +1330,12 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	var data []byte
 	var blk pin
 	want, wantFin := n, fin
+	own := func(off, n uint64) int {
+		if p.resend {
+			return -1
+		}
+		return int(n - min(n, max(off, sp.preLen)-off))
+	}
 	if n > 0 {
 		data, blk = sp.q.peek(off, int(n))
 		if uint64(len(data)) < n {
@@ -1144,9 +1343,15 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 			fin = false
 		}
 	}
-	if !w.stream(st.id, off, data, blk, fin) {
+	if !w.stream(st.id, off, data, blk, fin, own(off, n)) {
 		return chunkFull
 	}
+	if w.pipe != nil {
+		defer func() {
+			w.deliveryRestricted = w.deliveryRestricted || !s.unrestrictedDeliveryStream(w.pipe, st)
+		}()
+	}
+	sp.q.markHandoffs(w.b, off, off+n)
 	// The rest of the chunk from the following buffer segments joins the
 	// frame (the writer coalesces contiguous data of one stream).
 	for n < want {
@@ -1155,34 +1360,36 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 			break
 		}
 		f := wantFin && n+uint64(len(more)) == want
-		if !w.stream(st.id, off+n, more, mblk, f) {
+		if !w.stream(st.id, off+n, more, mblk, f, own(off+n, uint64(len(more)))) {
 			break
 		}
+		sp.q.markHandoffs(w.b, off+n, off+n+uint64(len(more)))
 		n += uint64(len(more))
 		fin = f
 	}
 	w.logFrame(frameDesc{kind: dStream, id: st.id, off: off, n: n, fin: fin,
-		fresh: d != nil && len(s.pipes) > 1 && s.mp.additionalPipes != nil &&
-			d.p.mp.peerAttached(d.p.id) && !s.cfg.Test.NoPrefixRepair && !p.resend && n > 0 && s.policyOf(st) == PolicySpreadETA, repair: repair})
+		fresh: d != nil && !s.cfg.Test.NoPrefixRepair && !p.resend && n > 0, repair: repair})
 	w.spendData(n)
 	st.countFrame(off, n)
 	if p.resend {
-		w.notEarned += uint64(wire.StreamHeaderLen(st.id, off, int(n), true)) + n
 		s.stats.BytesReinjected += n
 		if d != nil {
 			d.p.mp.holdSent += n
 		}
 		m := sp.mps
 		if repair {
-			if source := m.repair.source; source != nil {
-				s.penalize(source, false)
-			}
+			source := m.repair.source
 			s.commitPrefixRepair(m, off, n)
+			if source != nil && sp.sendEnd() > max64(sp.sent, sp.q.base) &&
+				(sp.sent >= sp.maxData || s.conn.sent >= s.conn.sendMax || m.bind.moving) {
+				s.penalize(source)
+			}
 			s.stats.BytesOpportunistic += n
 			d.p.mp.oppBytes += n
 		}
 		if off == 0 && d != nil {
 			m.openPipe, m.openSet = d.p.id, true // a reinjected copy of the opening frame
+			s.routeDatagramStream(st)
 		}
 		s.dropResend(m, off, off+n)
 		if fin {
@@ -1199,14 +1406,7 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	}
 	st.opened = true
 	s.openedCtl(st)
-	if dgWait && w.b.Lane == 0 && s.state < StateClosing {
-		if wp := s.pipe(w.b.Pipe); wp != nil {
-			s.writeDatagrams(w, wp)
-		}
-	}
-	if s.dg != nil && len(s.dg.send) > 0 {
-		s.wakeAllWriters() // its held datagrams may follow
-	}
+	s.routeDatagramStream(st)
 	if s.early != nil && !s.peerSeen {
 		s.early.sentAny = true
 	}
@@ -1223,12 +1423,6 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 		s.mp.retain(newEnd - sp.sent)
 		sp.sent = newEnd
 		s.syncUnsent(st)
-	}
-	if sp.sent >= sp.maxData && sp.sendEnd() > sp.sent {
-		// The chunk used the last of the peer's stream credit while data
-		// waits: the direction is blocked now, whichever pipe the
-		// scheduler offers it next (a binding that moves offers none).
-		s.blockedOn(st, true, s.conn.sent >= s.conn.sendMax)
 	}
 	if fin {
 		sp.finSent = true
@@ -1258,6 +1452,8 @@ func (s *Session) sendChunk(w *recWriter, st *Stream, d *decision) chunkResult {
 	}
 	if !st.sendable() {
 		s.sched.remove(st)
+	} else {
+		s.holdFreshCredit(st)
 	}
 	return chunkSent
 }
@@ -1268,12 +1464,10 @@ func (s *Session) blockedOn(st *Stream, stream, conn bool) {
 		st.snd.blocked = st.snd.maxData + 1
 		s.queueCtl(st, ctlBlocked)
 	}
-	if stream {
-		s.noteBlocked(st)
-	}
 	if conn && s.conn.blocked != s.conn.sendMax+1 {
 		s.conn.blocked = s.conn.sendMax + 1
 		s.pend.dataBlocked = true
+		s.wakeAllWriters()
 	}
 }
 

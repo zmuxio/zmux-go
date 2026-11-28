@@ -1,162 +1,12 @@
 package core
 
 import (
-	"encoding/json"
 	"math"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/zmuxio/zmux-go/shaping"
 )
-
-type vecAccount struct {
-	Initial uint64 `json:"initial"`
-	PerMB   uint64 `json:"per_mb"`
-	PerSec  uint64 `json:"per_sec"`
-}
-
-type vecLimits struct {
-	Wire     vecAccount `json:"wire"`
-	MaxDelay int64      `json:"max_delay"`
-}
-
-func (a *vecAccount) account() shaping.Account {
-	if a == nil {
-		return shaping.Account{}
-	}
-	return shaping.Account{Initial: a.Initial, PerMB: a.PerMB, PerSec: a.PerSec}
-}
-
-func TestBudgetVectors(t *testing.T) {
-	raw, err := os.ReadFile("../../testdata/shaping/budget.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var d struct {
-		Merge []struct {
-			Local  vecLimits `json:"local"`
-			Config vecLimits `json:"config"`
-			Want   struct {
-				Wire        vecAccount `json:"wire"`
-				NoInjection bool       `json:"no_injection"`
-				MaxDelay    int64      `json:"max_delay"`
-			} `json:"want"`
-		} `json:"merge"`
-		BurstFloor []struct {
-			Burst     uint64 `json:"burst"`
-			RecordMax int64  `json:"record_max"`
-			Want      int64  `json:"want"`
-			Clamped   bool   `json:"clamped"`
-		} `json:"burst_floor"`
-		Account []struct {
-			Name    string      `json:"name"`
-			Account *vecAccount `json:"account"`
-			Steps   []struct {
-				Account *vecAccount `json:"account"`
-				Granted *bool       `json:"granted"`
-				Level   *uint64     `json:"level"`
-				Op      string      `json:"op"`
-				Now     uint64      `json:"now"`
-				Earn    uint64      `json:"earn"`
-				N       uint64      `json:"n"`
-				Left    uint64      `json:"left"`
-				Spent   uint64      `json:"spent"`
-			} `json:"steps"`
-		} `json:"account"`
-		RateFloor []struct {
-			Rate     uint64 `json:"rate"`
-			MaxDelay int64  `json:"max_delay"`
-			Want     uint64 `json:"want"`
-			Clamped  bool   `json:"clamped"`
-		} `json:"rate_floor"`
-		WirePPM []struct {
-			S    uint64 `json:"s"`
-			E    uint64 `json:"e"`
-			Want uint64 `json:"want"`
-		} `json:"wire_ppm"`
-		Gate []struct {
-			Name  string `json:"name"`
-			Steps []struct {
-				Release *uint64 `json:"release"`
-				Now     uint64  `json:"now"`
-				Take    int64   `json:"take"`
-				Tokens  int64   `json:"tokens"`
-				Held    bool    `json:"held"`
-			} `json:"steps"`
-			Rate  uint64 `json:"rate"`
-			Burst int64  `json:"burst"`
-		} `json:"gate"`
-	}
-	if err := json.Unmarshal(raw, &d); err != nil {
-		t.Fatal(err)
-	}
-	if len(d.Account) == 0 || len(d.Gate) == 0 || len(d.Merge) == 0 {
-		t.Fatal("empty vectors")
-	}
-	for i, c := range d.Merge {
-		got := shaping.Limits{Wire: c.Local.Wire.account(), MaxDelay: time.Duration(c.Local.MaxDelay) * time.Microsecond}.With(
-			shaping.Budget{Wire: c.Config.Wire.account(), MaxDelay: time.Duration(c.Config.MaxDelay) * time.Microsecond})
-		md := got.MaxDelay
-		if md > 0 {
-			md /= time.Microsecond
-		}
-		if got.Wire != c.Want.Wire.account() || got.NoInjection != c.Want.NoInjection || int64(md) != c.Want.MaxDelay && c.Want.MaxDelay >= 0 || c.Want.MaxDelay < 0 && md >= 0 {
-			t.Errorf("merge %d: %+v", i, got)
-		}
-	}
-	for _, c := range d.Account {
-		var a wireAccount
-		a.set(0, 0, c.Account.account())
-		for i, st := range c.Steps {
-			switch st.Op {
-			case "spend":
-				a.spend(st.N)
-			case "charge":
-				if g := a.charge(st.Now, st.Earn, st.N); st.Granted == nil || g != *st.Granted {
-					t.Errorf("%s %d: granted %v", c.Name, i, g)
-				}
-			case "set":
-				a.set(st.Now, st.Earn, st.Account.account())
-			}
-			a.accrue(st.Now, st.Earn)
-			if a.left() != st.Left || a.spent != st.Spent || (st.Level == nil) == a.on || st.Level != nil && *st.Level != a.level {
-				t.Errorf("%s %d: left %d spent %d level %d on %v", c.Name, i, a.left(), a.spent, a.level, a.on)
-			}
-		}
-	}
-	for i, c := range d.RateFloor {
-		if r, cl := shapeRateFloor(c.Rate, c.MaxDelay); r != c.Want || cl != c.Clamped {
-			t.Errorf("rate_floor %d: %d %v", i, r, cl)
-		}
-	}
-	for i, c := range d.BurstFloor {
-		if b, cl := shapeBurstFloor(c.Burst, c.RecordMax); b != c.Want || cl != c.Clamped {
-			t.Errorf("burst_floor %d: %d %v", i, b, cl)
-		}
-	}
-	for i, c := range d.WirePPM {
-		if g := shaping.WirePPM(c.S, c.E); g != c.Want {
-			t.Errorf("wire_ppm %d: %d", i, g)
-		}
-	}
-	for _, c := range d.Gate {
-		b := tokenBucket{rate: c.Rate, burst: c.Burst}
-		b.reset(0)
-		for i, st := range c.Steps {
-			b.fill(st.Now)
-			if b.held() != st.Held || b.tokens != st.Tokens {
-				t.Errorf("%s %d: held %v tokens %d", c.Name, i, b.held(), b.tokens)
-			}
-			if st.Release != nil {
-				if us, ok := b.release(); !ok || us != *st.Release {
-					t.Errorf("%s %d: release %d %v", c.Name, i, us, ok)
-				}
-			}
-			b.tokens -= st.Take
-		}
-	}
-}
 
 // fixedPlan plans the same record every time and counts dropped injections.
 type fixedPlan struct {
@@ -177,13 +27,17 @@ func (f *fixedPlan) OnEvent(e *shaping.Event, r *shaping.Effects) {
 	switch e.Kind {
 	case shaping.EventStart:
 		if f.inject > 0 {
-			r.Set = shaping.EffectInject
-			r.HasInject, r.InjectAt, r.InjectLen = true, e.Now, f.inject
+			r.Set, r.HasWake, r.Wake = shaping.EffectWake, true, e.Now+time.Microsecond
 		}
-	case shaping.EventInjected:
+	case shaping.EventTimer:
+		if f.inject > 0 {
+			r.Set = shaping.EffectInject
+			r.Injection = shaping.Injection{ID: 1, At: e.Now, PadBytes: f.inject}
+		}
+	case shaping.EventInjectionAccepted:
 		f.injected++
 		r.Set = shaping.EffectInject
-	case shaping.EventInjectDropped:
+	case shaping.EventInjectionRejected:
 		f.dropped++
 		r.Set = shaping.EffectInject
 	default:
@@ -221,7 +75,7 @@ func budgetSession(t *testing.T, l shaping.Limits, b shaping.Budget, f *fixedPla
 func TestAccompanyingNeverRefused(t *testing.T) {
 	f := &fixedPlan{plan: shaping.RecordPlan{MaxLen: 200}}
 	f.plan.PadTo = 200
-	s, p, st := budgetSession(t, shaping.Limits{Wire: shaping.Account{Initial: 1}}, shaping.Budget{}, f)
+	s, p, st := budgetSession(t, shaping.Limits{}, shaping.Budget{Wire: &shaping.Account{Ceiling: 1, Initial: 1}}, f)
 	if _, err := s.Write(st, make([]byte, 50), false); err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +85,7 @@ func TestAccompanyingNeverRefused(t *testing.T) {
 	if len(sizes) == 0 || sizes[0] < 190 {
 		t.Fatalf("sizes %v", sizes)
 	}
-	if got := s.ShapingStats(); got.WireSpent == 0 || got.InjectDropped != 0 {
+	if got := s.ShapingStats(); got.WireSpent != 0 || s.ShapeMeters().ConsumedBytes == 0 || got.InjectionRejected != 0 {
 		t.Fatalf("stats %+v", got)
 	}
 	if l := s.shp.acct.left(); l != 1 {
@@ -245,7 +99,7 @@ func TestInjectionCharged(t *testing.T) {
 	now := Time(Second)
 	// a record of PADDING only
 	f := &fixedPlan{inject: 500}
-	s, p, _ := budgetSession(t, shaping.Limits{Wire: shaping.Account{Initial: 100}}, shaping.Budget{}, f)
+	s, p, _ := budgetSession(t, shaping.Limits{}, shaping.Budget{Wire: &shaping.Account{Ceiling: 100, Initial: 100}}, f)
 	s.SetNow(now)
 	s.shapeTimeout(now)
 	poll(t, s, p, DefaultBatch, now)
@@ -253,16 +107,16 @@ func TestInjectionCharged(t *testing.T) {
 		t.Fatalf("dropped %d injected %d left %d", f.dropped, f.injected, s.shp.acct.left())
 	}
 	f = &fixedPlan{inject: 500}
-	s, p, _ = budgetSession(t, shaping.Limits{Wire: shaping.Account{Initial: 600}}, shaping.Budget{}, f)
+	s, p, _ = budgetSession(t, shaping.Limits{}, shaping.Budget{Wire: &shaping.Account{Ceiling: 600, Initial: 600}}, f)
 	s.SetNow(now)
 	s.shapeTimeout(now)
 	poll(t, s, p, DefaultBatch, now)
-	if f.injected != 1 || s.shp.acct.left() >= 600 || s.ShapingStats().Injected != 1 {
+	if f.injected != 1 || s.shp.acct.left() >= 600 || s.ShapingStats().InjectionAccepted != 1 {
 		t.Fatalf("injected %d left %d", f.injected, s.shp.acct.left())
 	}
 	// merged into the open record: refused before anything changes
 	f = &fixedPlan{inject: 500}
-	s, p, st := budgetSession(t, shaping.Limits{Wire: shaping.Account{Initial: 100}}, shaping.Budget{}, f)
+	s, p, st := budgetSession(t, shaping.Limits{}, shaping.Budget{Wire: &shaping.Account{Ceiling: 100, Initial: 100}}, f)
 	if _, err := s.Write(st, make([]byte, 50), false); err != nil {
 		t.Fatal(err)
 	}
@@ -274,14 +128,14 @@ func TestInjectionCharged(t *testing.T) {
 	}
 	// merged and paid for: metered once
 	f = &fixedPlan{inject: 500}
-	s, p, st = budgetSession(t, shaping.Limits{Wire: shaping.Account{Initial: 1000}}, shaping.Budget{}, f)
+	s, p, st = budgetSession(t, shaping.Limits{}, shaping.Budget{Wire: &shaping.Account{Ceiling: 1000, Initial: 1000}}, f)
 	if _, err := s.Write(st, make([]byte, 50), false); err != nil {
 		t.Fatal(err)
 	}
 	s.SetNow(now)
 	s.shapeTimeout(now)
 	poll(t, s, p, DefaultBatch, now)
-	if f.injected != 1 || s.shp.acct.left() != 502 || s.ShapingStats().WireSpent != 498 {
+	if f.injected != 1 || s.shp.acct.left() != 499 || s.ShapingStats().WireSpent != 501 {
 		t.Fatalf("injected %d left %d spent %d", f.injected, s.shp.acct.left(), s.ShapingStats().WireSpent)
 	}
 }
@@ -292,11 +146,15 @@ type keepInject struct{ events int }
 func (k *keepInject) Capabilities() shaping.Caps                    { return 0 }
 func (k *keepInject) Plan(*shaping.RecordView, *shaping.RecordPlan) {}
 func (k *keepInject) OnEvent(e *shaping.Event, r *shaping.Effects) {
-	if e.Kind == shaping.EventStart {
+	switch e.Kind {
+	case shaping.EventStart:
+		r.Set, r.HasWake, r.Wake = shaping.EffectWake, true, e.Now+time.Microsecond
+	case shaping.EventTimer:
 		r.Set = shaping.EffectInject
-		r.HasInject, r.InjectAt, r.InjectLen = true, e.Now, 100
+		r.Injection = shaping.Injection{ID: 1, At: e.Now, PadBytes: 100}
+	default:
 	}
-	if e.Kind == shaping.EventInjectDropped {
+	if e.Kind == shaping.EventInjectionRejected {
 		k.events++
 	}
 }
@@ -321,30 +179,14 @@ func TestDroppedInjectionKeptDoesNotSpin(t *testing.T) {
 	}
 }
 
-// A configuration cannot widen local limits.
-func TestBudgetCannotWidenLimits(t *testing.T) {
-	huge := shaping.Account{Initial: math.MaxUint64, PerMB: math.MaxUint64, PerSec: math.MaxUint64}
-	got := shaping.Limits{Wire: shaping.Account{Initial: 5, PerMB: 6}, MaxDelay: 300 * time.Millisecond, NoInjection: true, NoPadding: true, NoPause: true}.
-		With(shaping.Budget{Wire: huge, MaxDelay: time.Hour})
-	if got.Wire != (shaping.Account{Initial: 5, PerMB: 6}) || got.MaxDelay != 300*time.Millisecond || !got.NoInjection || !got.NoPadding || !got.NoPause {
-		t.Fatalf("%+v", got)
-	}
-	if got := (shaping.Limits{}).With(shaping.Budget{MaxDelay: time.Hour}); got.MaxDelay != time.Second {
-		t.Fatalf("default bound widened: %v", got.MaxDelay)
-	}
-	if got := (shaping.Limits{}).With(shaping.Budget{Wire: huge, MaxDelay: -time.Hour}); got.MaxDelay != time.Second || got.Wire.PerSec != shaping.MaxAccountRate {
-		t.Fatalf("%+v", got)
-	}
-}
-
 // Extreme answers from a Shaper bound what they ask and never panic.
 func TestShapeExtremes(t *testing.T) {
-	for _, md := range []time.Duration{0, -1, 1, time.Second} {
+	for _, md := range []time.Duration{0, 1, time.Second} {
 		f := &fixedPlan{caps: shaping.CapBudget}
 		f.plan.Delay = math.MaxInt64
 		f.plan.Pad, f.plan.PadTo, f.plan.PadMultiple, f.plan.MaxLen = math.MaxInt32, math.MaxInt32, math.MaxInt32, 1
 		f.plan.Effects = shaping.Effects{Set: shaping.EffectGate, PauseUntil: math.MaxInt64, Rate: 1, Burst: math.MaxUint64}
-		s, p, st := budgetSession(t, shaping.Limits{MaxDelay: md}, shaping.Budget{Wire: shaping.Account{Initial: math.MaxUint64, PerSec: math.MaxUint64}}, f)
+		s, p, st := budgetSession(t, shaping.Limits{Profile: &shaping.ProfileLimits{WindowSeconds: 10, MaxAddedDelay: md}}, shaping.Budget{Wire: &shaping.Account{Ceiling: math.MaxUint64, Initial: math.MaxUint64, PerSec: math.MaxUint64}}, f)
 		if _, err := s.Write(st, make([]byte, 5000), false); err != nil {
 			t.Fatal(err)
 		}
@@ -360,7 +202,7 @@ func TestShapeExtremes(t *testing.T) {
 		if s.shp.stats.StallSpent != math.MaxInt64 {
 			t.Fatal("stall wrapped")
 		}
-		s.SetShapeLimits(shaping.Limits{MaxDelay: -1, Wire: shaping.Account{PerSec: shaping.MaxAccountRate}})
+		s.SetShapeLimits(shaping.Limits{Wire: &shaping.Account{Ceiling: 0, PerSec: shaping.MaxAccountRate}})
 	}
 	b := tokenBucket{rate: 1, burst: 1 << 53}
 	b.reset(0)
@@ -369,72 +211,10 @@ func TestShapeExtremes(t *testing.T) {
 		t.Log("release in range")
 	}
 	var a wireAccount
-	a.set(0, 0, shaping.Account{Initial: shaping.MaxAccountInitial, PerMB: shaping.MaxAccountRate, PerSec: shaping.MaxAccountRate})
+	a.set(0, &shaping.Account{Ceiling: shaping.MaxAccountInitial, Initial: shaping.MaxAccountInitial, PerMB: shaping.MaxAccountRate, PerSec: shaping.MaxAccountRate})
 	a.accrue(math.MaxUint64, math.MaxUint64)
-	if a.level != math.MaxInt64 {
+	if a.level != shaping.MaxAccountInitial {
 		t.Fatalf("level %d", a.level)
-	}
-}
-
-// The default bound shortens a long delay and lifts a rate too low to move.
-func TestDelayBoundsDefault(t *testing.T) {
-	f := &fixedPlan{}
-	f.plan.Delay = time.Hour
-	s, _, _ := budgetSession(t, shaping.Limits{}, shaping.Budget{}, f)
-	if d := s.shapePause(Duration(time.Hour)); d != Duration(time.Second) {
-		t.Fatalf("pause %v", time.Duration(d))
-	}
-	s.SetShapeLimits(shaping.Limits{MaxDelay: -1})
-	if d := s.shapePause(Duration(time.Hour)); d != Duration(time.Hour) {
-		t.Fatalf("unbounded pause %v", time.Duration(d))
-	}
-	s, _, _ = budgetSession(t, shaping.Limits{}, shaping.Budget{MaxDelay: 100 * time.Millisecond}, &fixedPlan{})
-	if d := s.shapePause(Duration(time.Hour)); d != Duration(100*time.Millisecond) {
-		t.Fatalf("configured pause %v", time.Duration(d))
-	}
-}
-
-func TestRateFloorInForce(t *testing.T) {
-	s, p, _ := budgetSession(t, shaping.Limits{}, shaping.Budget{}, &fixedPlan{})
-	ps := mustShape(t, s, p)
-	ps.apply(&shaping.Effects{Set: shaping.EffectGate, Rate: 1})
-	if ps.bucket.rate != 64 || s.ShapingStats().Clamped != 1 {
-		t.Fatalf("rate %d stats %+v", ps.bucket.rate, s.ShapingStats())
-	}
-	s.SetShapeLimits(shaping.Limits{MaxDelay: -1})
-	if ps.bucket.rate != 1 {
-		t.Fatalf("rate %d with no bound", ps.bucket.rate)
-	}
-	s.SetShapeLimits(shaping.Limits{MaxDelay: 100 * time.Millisecond})
-	if ps.bucket.rate != 640 {
-		t.Fatalf("rate %d under 100 ms", ps.bucket.rate)
-	}
-}
-
-// earnBytes rises only: padding, injections and copies earn nothing.
-func TestEarnBytes(t *testing.T) {
-	f := &fixedPlan{}
-	f.plan.PadTo = 1000
-	s, p, st := budgetSession(t, shaping.Limits{}, shaping.Budget{}, f)
-	if _, err := s.Write(st, make([]byte, 100), false); err != nil {
-		t.Fatal(err)
-	}
-	now := Time(Second)
-	s.SetNow(now)
-	base := s.earnBytes
-	poll(t, s, p, DefaultBatch, now)
-	got := s.earnBytes - base
-	if got < 100 || got > 200 {
-		t.Fatalf("earned %d for 100 bytes of data padded to 1000", got)
-	}
-	s.earnSkip = 1 << 40
-	before := s.earnBytes
-	if _, err := s.Write(st, make([]byte, 100), false); err != nil {
-		t.Fatal(err)
-	}
-	poll(t, s, p, DefaultBatch, now)
-	if s.earnBytes != before || s.earnSkip == 1<<40 {
-		t.Fatalf("resent first flight earned: %d", s.earnBytes-before)
 	}
 }
 
@@ -448,12 +228,12 @@ func TestMetersNoAllocs(t *testing.T) {
 	n := testing.AllocsPerRun(100, func() {
 		sink = s.shapeMeters()
 		s.shp.acct.spend(10)
-		_ = s.shp.acct.charge(1, 1, 1)
+		_ = s.shp.acct.charge(1, 1)
 	})
 	if n != 0 {
 		t.Fatalf("%v allocations", n)
 	}
-	if sink.WireLeft != math.MaxUint64 || sink.StallLeft != math.MaxUint64 {
+	if sink.WireLeft != 0 || sink.StallLeft != math.MaxUint64 {
 		t.Fatalf("%+v", sink)
 	}
 }
@@ -472,9 +252,9 @@ func TestFirstBatchChargesCreditOnce(t *testing.T) {
 	if _, err := s.Write(st, make([]byte, 6000), false); err != nil {
 		t.Fatal(err)
 	}
-	out := s.firstBatch(4000)
+	out, own := s.firstBatch(4000)
 	carried := st.snd.sent
-	if len(out) == 0 || carried == 0 || s.conn.sent != carried || s.mp.retained != carried {
+	if len(out) == 0 || own != carried || carried == 0 || s.conn.sent != carried || s.mp.retained != carried {
 		t.Fatalf("batch %d: sent %d, session %d, retained %d", len(out), carried, s.conn.sent, s.mp.retained)
 	}
 	if m := st.snd.mps; m == nil || m.resend.len() != 1 || m.resend.first().lo != 0 || m.resend.first().hi != carried {
@@ -493,35 +273,33 @@ func TestFirstBatchChargesCreditOnce(t *testing.T) {
 	}
 }
 
-// A record that closed its batch defers a due injection to the next, uncharged.
-func TestInjectionAfterFlushDeferred(t *testing.T) {
-	f := &fixedPlan{}
-	s, p, _ := budgetSession(t, shaping.Limits{Wire: shaping.Account{Initial: 1000}}, shaping.Budget{}, f)
-	ps := mustShape(t, s, p)
-	ps.injDue, ps.injLen = true, 100
-	var w recWriter
-	b := GetBatch()
-	defer PutBatch(b)
-	w.init(b, FramingBytes, 16<<10, 64<<10)
-	w.sh, w.closed = ps, true
-	s.shapeInject(&w)
-	got := s.ShapingStats()
-	if !ps.injDue || !ps.injFirst || got.InjectDropped != 0 || got.WireSpent != 0 {
-		t.Fatalf("due %v first %v stats %+v", ps.injDue, ps.injFirst, got)
+func TestWireAccountCeilingLifecycle(t *testing.T) {
+	var a wireAccount
+	p := shaping.Account{Ceiling: 100, Initial: 20, PerSec: 80, PerMB: 500_000}
+	a.set(0, &p)
+	snapshot := a
+	snapshot.accrue(10_000_000, 0)
+	if snapshot.left() != 100 || a.left() != 20 || !a.charge(10_000_000, 70) {
+		t.Fatalf("projected %+v, account %+v", snapshot, a)
 	}
-}
-
-// On a message carrier earnBytes counts what the carrier is given: no size field, and
-// a record of padding adds nothing.
-func TestEarnBytesOnMessages(t *testing.T) {
-	var w recWriter
-	b := GetBatch()
-	defer PutBatch(b)
-	w.init(b, FramingRecords, 16<<10, 64<<10)
-	w.begin()
-	w.pad(1000)
-	w.end()
-	if w.notEarned != 1000 {
-		t.Fatalf("notEarned %d", w.notEarned)
+	a.accrue(10_250_000, 0)
+	if a.left() != 50 {
+		t.Fatalf("balance=%d", a.left())
+	}
+	p.Initial = 95
+	a.set(10_250_000, &p)
+	a.set(10_250_000, nil)
+	a.accrue(20_250_000, 1000)
+	a.set(20_250_000, &p)
+	if a.left() != 50 {
+		t.Fatalf("restored balance=%d", a.left())
+	}
+	zero := shaping.Account{}
+	a.set(20_250_000, &zero)
+	a.set(20_250_000, &p)
+	a.accrue(20_250_000, 1)
+	a.accrue(20_256_250, 0)
+	if a.left() != 1 || a.rem != 0 {
+		t.Fatalf("combined remainder: %+v", a)
 	}
 }

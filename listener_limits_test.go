@@ -31,7 +31,7 @@ func TestListenerSetLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	// SetLimits closes these; the stand-ins have no session to close.
-	if over := l.applyLimits(&r); len(over) != 2 || over[0].c != a || over[1].c != b {
+	if over, err := l.applyLimits(&r); err != nil || len(over) != 2 || over[0].c != a || over[1].c != b {
 		t.Fatalf("over %v", over)
 	}
 	l.suspMu.Lock()
@@ -55,14 +55,17 @@ func TestListenerSetLimits(t *testing.T) {
 func TestListenerSetMemoryBudget(t *testing.T) {
 	l := mustNewListener(&ListenerConfig{})
 	defer func() { _ = l.Close() }()
-	l.budget.Add(4096)
+	if !l.budget.TryCharge(4096) {
+		t.Fatal("test budget rejected 4096 bytes")
+	}
+	original := l.Limits()
 	lim := l.Limits()
 	lim.MemoryBudget = 1024
-	if err := l.SetLimits(lim); err != nil {
-		t.Fatal(err)
+	if err := l.SetLimits(lim); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("limit below commitment: %v", err)
 	}
-	if !l.budget.Pressure() {
-		t.Fatal("no pressure below the charged sum")
+	if l.budget.Pressure() || l.Limits() != original {
+		t.Fatal("rejected limits changed the listener")
 	}
 	lim.MemoryBudget = -1
 	if err := l.SetLimits(lim); err != nil {
@@ -70,5 +73,24 @@ func TestListenerSetMemoryBudget(t *testing.T) {
 	}
 	if l.budget.Pressure() || l.Limits().MemoryBudget != -1 {
 		t.Fatalf("pressure %v, limits %+v", l.budget.Pressure(), l.Limits())
+	}
+}
+
+func TestListenerPendingPerSourceMinimum(t *testing.T) {
+	if l, err := NewListener(&ListenerConfig{MaxPendingPerSource: 1}); !errors.Is(err, ErrInvalidConfig) {
+		if l != nil {
+			_ = l.Close()
+		}
+		t.Fatalf("source limit of one: %v", err)
+	}
+	l := mustNewListener(&ListenerConfig{MaxPendingPerSource: 2})
+	defer func() { _ = l.Close() }()
+	lim := l.Limits()
+	if lim.MaxPendingPerSource != 2 {
+		t.Fatalf("minimum limit changed: %+v", lim)
+	}
+	lim.MaxPendingPerSource = 1
+	if err := l.SetLimits(lim); !errors.Is(err, ErrInvalidConfig) || l.Limits().MaxPendingPerSource != 2 {
+		t.Fatalf("lowered limit committed: %+v, %v", l.Limits(), err)
 	}
 }

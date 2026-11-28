@@ -35,7 +35,7 @@ func ErrReader(err error) io.Reader { return errReader{err} }
 
 type errReader struct{ err error }
 
-func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+func (e errReader) Read(_ []byte) (int, error) { return 0, e.err }
 
 // DelegateRequest keeps the transport's final trailers visible through the
 // request copy, including keys first declared by the terminal chunk.

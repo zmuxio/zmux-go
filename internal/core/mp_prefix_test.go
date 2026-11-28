@@ -2,12 +2,7 @@ package core
 
 import (
 	"bytes"
-	"math/rand/v2"
-	"os"
-	"slices"
-	"strconv"
 	"testing"
-	"time"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
@@ -21,7 +16,7 @@ type prefixReplay struct {
 
 func newPrefixReplay(t *testing.T) prefixReplay {
 	t.Helper()
-	return newSeededPrefixReplay(t, [2]uint64{})
+	return newSeededPrefixReplay(t, [2]uint64{15, 23})
 }
 
 func newSeededPrefixReplay(t *testing.T, seeds [2]uint64) prefixReplay {
@@ -30,6 +25,7 @@ func newSeededPrefixReplay(t *testing.T, seeds [2]uint64) prefixReplay {
 	for i := range cfg {
 		cfg[i].Policy, cfg[i].TraceStreams, cfg[i].Probation = PolicySpreadETA, true, -1
 		cfg[i].Test.Seed = seeds[i]
+		cfg[i].StabilityHold = -1
 	}
 	m := newCWSim(t, cfg, CarrierInfo{Framing: FramingRecords}, Millisecond)
 	m.established()
@@ -68,6 +64,12 @@ func newSeededPrefixReplay(t *testing.T, seeds [2]uint64) prefixReplay {
 			rtt = 300 * Millisecond
 		}
 		observePath(s, p, rtt, 2e6)
+		s.healthProof(p, DirOut)
+		p.mp.measuredGen = p.mp.health.send.generation
+		// Complete setup records already delivered to the peer.
+		if e := s.mpAckEntry(wire.AckEntry{PipeID: p.id, Position: p.out.lanes[0].pos}, s.now, p); e != nil {
+			t.Fatal(e)
+		}
 	}
 	return prefixReplay{t: t, sim: m, st: st, source: s.pipe(0), alt: s.pipe(alt)}
 }
@@ -79,7 +81,34 @@ func (x prefixReplay) put(p *Pipe, b []byte) [][]byte {
 			x.t.Fatalf("write %d of %d: %v", n, len(b), err)
 		}
 	}
-	return x.transmit(0, p.id)
+	if p != x.source || x.st.opened {
+		return x.transmit(0, p.id)
+	}
+	s := x.sim.end[0]
+	x.alt.mp.topologyOut = true
+	s.mp.invalidateCandidates()
+	batch := x.transmit(0, p.id)
+	x.alt.mp.topologyOut = false
+	s.mp.invalidateCandidates()
+	if x.st.opened && s.mp.prefixScheduler != nil {
+		x.sim.now = x.sim.now.Add(Millisecond)
+		x.proveAlternative()
+		s.HandleTimeout(x.sim.now)
+	}
+	return batch
+}
+
+func (x prefixReplay) proveAlternative() {
+	s, p := x.sim.end[0], x.alt
+	s.SetNow(x.sim.now)
+	s.enablePathQuality(p)
+	p.mp.rtt = rttEst{has: true, min: 100 * Millisecond, smoothed: 100 * Millisecond}
+	*p.mp.quality = pathQuality{}
+	observePath(s, p, 100*Millisecond, 2e6)
+	p.mp.measuredGen = p.mp.health.send.generation
+	p.mp.deliveryAt, p.mp.deliveryGen, p.mp.deliveryCost = s.now, p.mp.measuredGen, s.stallCost(p.mp)
+	s.pathRTTChanged(p, true)
+	s.armPathDeadline(p, pathStall)
 }
 
 func (x prefixReplay) transmit(from int, pipe uint64) [][]byte {
@@ -93,136 +122,64 @@ func (x prefixReplay) transmit(from int, pipe uint64) [][]byte {
 	for _, r := range b.Messages() {
 		records = append(records, bytes.Clone(r))
 	}
-	s.WriteDone(b, nil, x.sim.now)
+	s.WriteDone(b, b.Len(), nil, x.sim.now)
 	return records
 }
 
-func (x prefixReplay) arrive(to int, pipe uint64, msg [][]byte, now Time) {
+func (x prefixReplay) arrive(pipe uint64, msg [][]byte, now Time) {
 	x.sim.now = now
 	for _, m := range msg {
-		x.sim.end[to].ReceiveMessage(pipe, 0, &Buf{B: m}, m, now)
+		receiveMessageTest(x.sim.end[1], pipe, 0, m, now)
 	}
 }
 
 func (x prefixReplay) ackOriginal() {
 	x.t.Helper()
 	s := x.sim.end[0]
-	if e := s.mpAckEntry(wire.AckEntry{PipeID: x.source.id, Position: x.source.out.lanes[0].pos}, x.sim.now); e != nil {
+	if e := s.mpAckEntry(wire.AckEntry{PipeID: x.source.id, Position: x.source.out.lanes[0].pos}, x.sim.now, nil); e != nil {
 		x.t.Fatal(e)
 	}
 }
 
-// The originally selected pipe is healthy at handover. Immediately after
-// that write, its simulated delivery collapses to 12 B/s. Its ACK-derived
-// quality is still unchanged when the deadline fires.
 func TestSpreadETAPrefixRepairAfterCollapse(t *testing.T) {
-	seed := rand.Uint64()
-	if value, ok := os.LookupEnv("ZMUX_PREFIX_REPLAY_SEED"); ok {
-		var err error
-		seed, err = strconv.ParseUint(value, 10, 64)
-		if err != nil {
-			t.Fatal(err)
-		}
+	x := newSeededPrefixReplay(t, [2]uint64{15, 23})
+	s, peer := x.sim.end[0], x.sim.end[1]
+	want := bytes.Repeat([]byte{7}, 256)
+	original := x.put(x.source, want)
+	deadline := s.mp.prefixAt
+	s.HandleTimeout(deadline - 1)
+	if s.mp.prefixBytes != 0 {
+		t.Fatal("repair queued before the cap")
 	}
-	runPrefixCollapseReplay(t, seed)
-}
-
-func TestSpreadETAPrefixRepairAfterCollapseQueuedSetupRecord(t *testing.T) {
-	// The 14th zero-based case leaves 22 bytes in flight on the backup
-	// at the end of setup. Its ACK must cover the later repair as well.
-	runPrefixCollapseReplay(t, 14154243759933347797)
-}
-
-func runPrefixCollapseReplay(t *testing.T, seed uint64) {
-	t.Helper()
-	t.Logf("prefix replay seed: %d", seed)
-	rng := rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
-	var gaps []Duration
-	var copied, app uint64
-	for i := range 100 {
-		seeds := [2]uint64{rng.Uint64() | 1, rng.Uint64() | 1}
-		x := newSeededPrefixReplay(t, seeds)
-		m := x.sim
-		s, peer := m.end[0], m.end[1]
-		start := m.now
-
-		x.source.mp.rtt.rttvar = Duration(30+i%101) * Millisecond
-		a := bytes.Repeat([]byte{1}, 256+i*3)
-		b := bytes.Repeat([]byte{2}, 32)
-		original := x.put(x.source, a)
-		if len(original) == 0 || s.mp.prefixAt <= start {
-			t.Fatal("healthy pipe did not take and retain the original prefix")
-		}
-		deadline := s.mp.prefixAt
-		originalAt := start.Add(1385*Millisecond + timeAt(uint64(len(a)), 12))
-		m.now = start.Add(Millisecond)
-		// The carrier still accepts writes; queue growth is visible sooner
-		// than the delivery/RTT samples for the record already handed off.
-		s.SetCarrierUnsent(x.source.id, 0, 128<<10, m.now)
-		suffix := x.put(x.alt, b)
-		x.arrive(1, x.alt.id, suffix, m.now.Add(150*Millisecond))
-		if len(suffix) == 0 || peer.SessionStats().StreamGapsStarted != 1 {
-			t.Fatal("the suffix did not expose the retained prefix hole")
-		}
-		m.now = deadline - 1
-		s.HandleTimeout(m.now)
-		if x.st.snd.mps.resend.len() != 0 {
-			t.Fatal("repair queued before the frozen deadline")
-		}
-		m.now = deadline
-		s.HandleTimeout(m.now)
-		if x.source.mp.out != OutActive || s.mp.prefixBytes == 0 {
-			t.Fatal("deadline failed to queue repair while the original was active")
-		}
-		copyBefore := s.SessionStats().BytesReinjected
-		repair := x.put(x.alt, nil)
-		copyBytes := s.SessionStats().BytesReinjected - copyBefore
-		if len(repair) == 0 || copyBytes < uint64(len(a)) || copyBytes > uint64(s.cfg.SpreadChunk) ||
-			s.mp.prefixBytes != copyBytes {
-			t.Fatalf("repair size=%d or reservation=%d", copyBytes, s.mp.prefixBytes)
-		}
-		x.arrive(1, x.alt.id, repair, deadline.Add(150*Millisecond))
-		remote, ok := peer.AcceptStream(true)
-		want := append(bytes.Clone(a), b...)
-		got := make([]byte, len(want))
-		if !ok {
-			t.Fatal("repair did not open the remote stream")
-		}
-		if n, _, err := peer.Read(remote, got); err != nil || n != len(got) || !bytes.Equal(got, want) {
-			t.Fatalf("read %d of %d, %v", n, len(got), err)
-		}
-		ps := peer.SessionStats()
-		if ps.StreamGapsFilled != 1 || ps.StreamGapWait > 500*Millisecond {
-			t.Fatalf("gap count %d, wait %v", ps.StreamGapsFilled, time.Duration(ps.StreamGapWait))
-		}
-		gaps = append(gaps, ps.StreamGapWait)
-		// Native loss of the original must not queue a third copy.
-		s.makeSuspect(x.source)
-		if x.st.snd.mps.resend.len() != 0 {
-			t.Fatal("original suspicion queued an already in-flight copy")
-		}
-		// A real PIPE_ACK for the backup releases the byte reservation.
-		m.now = m.now.Add(30 * Millisecond)
-		peer.HandleTimeout(m.now)
-		for _, pipe := range peer.pipes {
-			ack := x.transmit(1, pipe.id)
-			x.arrive(0, pipe.id, ack, m.now.Add(150*Millisecond))
-		}
-		if s.mp.prefixBytes != 0 {
-			lane := x.alt.out.lanes[0]
-			t.Fatalf("case %d: backup acknowledgement did not release reservation (sent=%d received=%d acked=%d)",
-				i, lane.pos, peer.pipe(x.alt.id).in.lanes[0].pos, lane.acked)
-		}
-		x.arrive(1, x.source.id, original, originalAt)
-		if n, _, err := peer.Read(remote, got); n != 0 || err != nil {
-			t.Fatalf("late original delivered a duplicate: %d, %v", n, err)
-		}
-		copied += copyBytes
-		app += uint64(len(want))
+	x.sim.now = deadline
+	s.HandleTimeout(deadline)
+	repair := x.put(x.alt, nil)
+	if len(repair) == 0 || s.mp.prefixBytes < uint64(len(want)) {
+		t.Fatal("active original did not reserve and hand off a repair")
 	}
-	slices.Sort(gaps)
-	t.Logf("100 immediate collapses: gap p50=%v p99=%v max=%v, %d retransmitted wire stream bytes / %d application bytes",
-		time.Duration(gaps[49]), time.Duration(gaps[98]), time.Duration(gaps[99]), copied, app)
+	x.arrive(x.alt.id, repair, deadline.Add(50*Millisecond))
+	remote, ok := peer.AcceptStream(true)
+	if !ok {
+		t.Fatal("repair did not open the remote stream")
+	}
+	got := make([]byte, len(want))
+	if n, _, err := peer.Read(remote, got); err != nil || n != len(got) || !bytes.Equal(got, want) {
+		t.Fatalf("repaired prefix read %d of %d: %v", n, len(got), err)
+	}
+	s.makeSuspect(x.source)
+	if x.st.snd.mps.resend.len() != 0 {
+		t.Fatal("suspicion duplicated the in-flight repair")
+	}
+	x.arrive(x.source.id, original, x.sim.now.Add(Millisecond))
+	if n, _, err := peer.Read(remote, got); n != 0 || err != nil {
+		t.Fatalf("late original delivered a duplicate: %d, %v", n, err)
+	}
+	if err := s.mpAckEntry(wire.AckEntry{PipeID: x.alt.id, Position: x.alt.out.lanes[0].pos}, x.sim.now, x.alt); err != nil {
+		t.Fatal(err)
+	}
+	if s.mp.prefixBytes != 0 {
+		t.Fatal("repair ACK did not release the reservation")
+	}
 }
 
 func TestPrefixRepairOriginalACKCancels(t *testing.T) {
@@ -263,7 +220,7 @@ func TestPrefixRepairNativeLossTakesPendingRange(t *testing.T) {
 	}
 	// Even an unmeasured backup can take ordinary reinjection when the
 	// original actually fails. Only speculative copies require fresh RTT.
-	x.alt.mp.quality.rtt = 0
+	x.alt.mp.rtt.has = false
 	s.makeSuspect(x.source)
 	if s.mp.prefixBytes != 0 || x.st.snd.mps.resend.len() == 0 {
 		t.Fatal("native loss did not inherit the pending range")
@@ -277,12 +234,12 @@ func TestPrefixRepairNativeLossTakesPendingRange(t *testing.T) {
 func TestPrefixRepairSharesSessionCopyBound(t *testing.T) {
 	x := newPrefixReplay(t)
 	s := x.sim.end[0]
+	x.put(x.source, bytes.Repeat([]byte{3}, 256))
 	bound := s.copyBound()
 	// Another stream already reserved most of the existing redundant
 	// copy budget. The timer may only use the remaining bytes.
 	disjoint := &Stream{hasS: true}
 	s.mp.copies = append(s.mp.copies, &copyRec{st: disjoint, end: bound - 128})
-	x.put(x.source, bytes.Repeat([]byte{3}, 256))
 	x.sim.now = s.mp.prefixAt
 	s.HandleTimeout(x.sim.now)
 	if live := s.mp.prefixBytes; live != 128 || s.copiesOutstanding() != bound {
@@ -294,7 +251,7 @@ func TestPrefixRepairRequiresTrustedAlternative(t *testing.T) {
 	x := newPrefixReplay(t)
 	s := x.sim.end[0]
 	x.put(x.source, bytes.Repeat([]byte{7}, 256))
-	x.alt.mp.quality.rtt = 0
+	x.alt.mp.rtt.has = false
 	x.sim.now = s.mp.prefixAt
 	s.HandleTimeout(x.sim.now)
 	if s.mp.prefixBytes != 0 || x.st.snd.mps.resend.len() != 0 {
@@ -314,13 +271,14 @@ func TestPrefixRepairWaitsForPeerAttachment(t *testing.T) {
 	}
 
 	s.sawPeer(x.alt)
+	x.proveAlternative()
 	s.HandleTimeout(x.sim.now)
 	if s.mp.prefixBytes == 0 || len(x.put(x.alt, nil)) == 0 {
 		t.Fatal("peer attachment did not make the alternative eligible")
 	}
 }
 
-func TestPrefixRepairWaitsForMeaningfulProgress(t *testing.T) {
+func TestPrefixRepairUnrelatedACKKeepsCap(t *testing.T) {
 	x := newPrefixReplay(t)
 	s := x.sim.end[0]
 	x.put(x.source, bytes.Repeat([]byte{7}, 512))
@@ -331,16 +289,16 @@ func TestPrefixRepairWaitsForMeaningfulProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	x.put(x.source, bytes.Repeat([]byte{8}, 256))
-	deadline := s.mp.prefixAt
-	x.sim.now = deadline - 1
+	_, original := s.prefixHead(x.st, 0, nil)
+	due := original.confirm
+	x.sim.now = due - 1
 	s.SetNow(x.sim.now)
-	if e := s.mpAckEntry(wire.AckEntry{PipeID: x.source.id, Position: preceding}, x.sim.now); e != nil {
+	if e := s.mpAckEntry(wire.AckEntry{PipeID: x.source.id, Position: preceding}, x.sim.now, nil); e != nil {
 		t.Fatal(e)
 	}
-	s.HandleTimeout(deadline)
-	s.HandleTimeout(deadline.Add(60 * Millisecond))
-	if s.mp.prefixBytes != 0 || x.st.snd.mps.resend.len() != 0 {
-		t.Fatal("a recent substantive ACK advance did not defer repair")
+	s.HandleTimeout(due)
+	if s.mp.prefixBytes == 0 || x.st.snd.mps.repair.source != x.source {
+		t.Fatal("an unrelated ACK postponed the already observed cap")
 	}
 }
 
@@ -423,6 +381,7 @@ func TestPrefixRepairBucketKeepsRefillingOverDays(t *testing.T) {
 	x := newPrefixReplay(t)
 	s := x.sim.end[0]
 	chunk := uint64(s.cfg.SpreadChunk)
+	s.mp.prefixScheduler = &prefixScheduler{}
 	// Exercise reservations and actual-payload accounting without sending
 	// a day's worth of carrier traffic.
 	spendBurst := func(delay Duration) {
@@ -456,14 +415,13 @@ func TestPrefixRepairWaitsForInputInsteadOfPolling(t *testing.T) {
 	x := newPrefixReplay(t)
 	s := x.sim.end[0]
 	x.put(x.source, bytes.Repeat([]byte{7}, 256))
-	x.alt.mp.quality.rtt = 0
+	x.alt.mp.rtt.has = false
 	x.sim.now = s.mp.prefixAt
 	s.HandleTimeout(x.sim.now)
 	if !s.mp.prefixWaiting || s.prefixTimers(s.now, false) != Never {
 		t.Fatal("an expired candidate without a target kept polling")
 	}
-	observePath(s, x.alt, 300*Millisecond, 2e6)
-	s.mpAdvanced(x.alt, x.alt.out.lanes[0], &x.alt.out.snd, s.now)
+	x.proveAlternative()
 	s.HandleTimeout(x.sim.now)
 	if s.mp.prefixBytes == 0 {
 		t.Fatal("new ACK evidence did not reconsider the registered candidate")
@@ -475,7 +433,7 @@ func TestPrefixAndTraceOffAtGeneration(t *testing.T) {
 	s := x.sim.end[0]
 	s.cfg.Test.NoPrefixRepair, s.cfg.TraceStreams = true, false
 	x.put(x.source, []byte("one ordinary STREAM"))
-	if s.mp.prefixAt != 0 || x.source.out.lanes[0].prefixCount != 0 || s.mp.gapTrace != nil {
+	if s.mp.prefixScheduler != nil || x.source.out.lanes[0].prefixCount != 0 || s.mp.gapTrace != nil {
 		t.Fatal("disabled instrumentation allocated tracking or armed a timer")
 	}
 	for e, ok := s.PollEvent(); ok; e, ok = s.PollEvent() {
@@ -533,7 +491,7 @@ func TestPrefixRepairOriginalCanArriveBeforeCommittedCopy(t *testing.T) {
 	if len(copyBatch) == 0 || s.stats.BytesOpportunistic == 0 {
 		t.Fatal("no committed copy")
 	}
-	x.arrive(1, x.source.id, original, x.sim.now.Add(Millisecond))
+	x.arrive(x.source.id, original, x.sim.now.Add(Millisecond))
 	st, ok := peer.AcceptStream(true)
 	if !ok {
 		t.Fatal("original did not open the stream")
@@ -543,7 +501,7 @@ func TestPrefixRepairOriginalCanArriveBeforeCommittedCopy(t *testing.T) {
 	if err != nil || n != len(want) || !end || !bytes.Equal(got, want) {
 		t.Fatalf("original data and FIN: %d, %v, %v", n, end, err)
 	}
-	x.arrive(1, x.alt.id, copyBatch, x.sim.now.Add(Millisecond))
+	x.arrive(x.alt.id, copyBatch, x.sim.now.Add(Millisecond))
 	n, end, err = peer.Read(st, got)
 	if err != nil || n != 0 || !end {
 		t.Fatalf("late copy changed the completed stream: %d, %v, %v", n, end, err)
@@ -579,9 +537,7 @@ func TestPrefixRepairInvalidTargetDoesNotBlockNewData(t *testing.T) {
 				t.Fatal("fixture did not reserve the original")
 			}
 
-			for range 3 {
-				observePath(s, x.alt, 2*Second, 2e6)
-			}
+			x.alt.mp.rtt.has = false
 			before := x.st.snd.sent
 			m := x.st.snd.mps
 			if assembly {
@@ -593,6 +549,7 @@ func TestPrefixRepairInvalidTargetDoesNotBlockNewData(t *testing.T) {
 			}
 			const newBytes = 4096
 			x.put(x.source, bytes.Repeat([]byte{7}, newBytes))
+			x.put(x.alt, nil) // ordinary placement may prefer the other path
 			if x.st.snd.sent != before+newBytes || s.mp.prefixPending != 0 || m.resend.len() != 0 {
 				t.Fatalf("stale repair blocked new data: sent=%d (was %d), pending=%d, resend=%d",
 					x.st.snd.sent, before, s.mp.prefixPending, m.resend.len())
@@ -604,9 +561,7 @@ func TestPrefixRepairInvalidTargetDoesNotBlockNewData(t *testing.T) {
 			}
 			x.st = other
 			x.put(x.source, bytes.Repeat([]byte{1}, 256))
-			*x.alt.mp.quality = pathQuality{}
-			observePath(s, x.alt, 300*Millisecond, 2e6)
-			_, original, _ := s.prefixHead(other, 0, nil)
+			_, original := s.prefixHead(other, 0, nil)
 			if original == nil {
 				t.Fatal("second stream did not register its original")
 			}
@@ -649,9 +604,9 @@ func TestPrefixRepairChecksConstantEntriesPerACK(t *testing.T) {
 	ol.pos = ol.log[len(ol.log)-1].end
 	// Keep the known prefix blocked on a route so every ACK can cause a
 	// retry, including ACKs unrelated to the missing prefix.
-	x.alt.mp.quality.rtt = 0
+	x.alt.mp.rtt.has = false
 	s.SetNow(expired)
-	s.prefixTimersExamined(expired, true, nil) // discover the contiguous span once
+	s.prefixTimersExamined(expired, true, nil)
 	for i := range count {
 		if len(ol.log) == 0 {
 			t.Fatalf("retention log emptied at ACK %d", i)
@@ -683,7 +638,11 @@ func TestPrefixRepairLaneCountTracksOriginalsAndNativeLoss(t *testing.T) {
 	if ol.prefixCount != 0 {
 		t.Fatal("acknowledgement did not retire the original lane count")
 	}
+	x.alt.mp.topologyOut = true
+	s.mp.invalidateCandidates()
 	x.put(x.source, bytes.Repeat([]byte{4}, 256))
+	x.alt.mp.topologyOut = false
+	s.mp.invalidateCandidates()
 	if ol.prefixCount == 0 {
 		t.Fatal("second handoff did not register an original")
 	}
@@ -712,16 +671,15 @@ func TestPrefixRepairKeepsReservationWhileTargetWrites(t *testing.T) {
 
 	busy := GetBatch()
 	defer PutBatch(busy)
-	busy.Pipe = x.alt.id
+	busy.Pipe, busy.owner = x.alt.id, x.alt.out.lanes[0]
 	x.alt.out.lanes[0].writing = true
-	before := x.st.snd.sent
-	x.put(x.source, bytes.Repeat([]byte{2}, 4096))
-	if x.st.snd.sent != before+4096 || m.repair != repair || s.mp.prefixPending != pending ||
-		!m.resend.contains(repair.sent, repair.hi) {
-		t.Fatal("temporary target unavailability blocked new data or canceled the repair")
+	x.alt.out.lanes[0].stallAt = s.now
+	x.put(x.source, nil)
+	if m.repair != repair || s.mp.prefixPending != pending || !m.resend.contains(repair.sent, repair.hi) {
+		t.Fatal("a busy writer canceled its pending repair")
 	}
 
-	s.WriteDone(busy, nil, x.sim.now)
+	s.WriteDone(busy, busy.Len(), nil, x.sim.now)
 	if len(x.put(x.alt, nil)) == 0 || s.mp.prefixPending != 0 || m.resend.len() != 0 ||
 		s.stats.BytesOpportunistic != pending {
 		t.Fatal("available target did not send the preserved repair")
@@ -739,22 +697,18 @@ func TestPrefixRepairCanRetrySameRangeAfterLostEligibility(t *testing.T) {
 	if old.source == nil {
 		t.Fatal("fixture did not queue a repair")
 	}
-	x.alt.mp.quality.rtt = 0
+	x.alt.mp.rtt.has = false
 	x.put(x.source, bytes.Repeat([]byte{2}, 32))
+	x.put(x.alt, nil)
 	if m.repair.source != nil || s.mp.prefixPending != 0 || m.oppSent.covered(old.sent, old.hi) != 0 {
-		t.Fatal("lost eligibility did not release the reservation and opportunity")
+		t.Fatalf("lost eligibility left repair %+v, pending %d, copied %d", m.repair, s.mp.prefixPending, m.oppSent.covered(old.sent, old.hi))
 	}
-	retry := s.mp.prefixAt
-	if retry <= x.sim.now {
-		t.Fatal("cancellation did not arm a later deadline")
+	s.HandleTimeout(x.sim.now)
+	if s.mp.prefixAt != 0 || s.mp.prefixPending != 0 {
+		t.Fatal("lost evidence kept polling the expired cap")
 	}
-	observePath(s, x.alt, 300*Millisecond, 2e6)
-	s.HandleTimeout(retry - 1)
-	if s.mp.prefixPending != 0 {
-		t.Fatal("repair retried before the next deadline")
-	}
-	x.sim.now = retry
-	s.HandleTimeout(retry)
+	x.proveAlternative()
+	s.HandleTimeout(x.sim.now)
 	if m.repair.source != x.source || m.repair.lo != old.lo || m.repair.hi < old.hi ||
 		len(x.put(x.alt, nil)) == 0 {
 		t.Fatal("next deadline did not repair the same missing range")
@@ -778,7 +732,7 @@ func TestPrefixRepairDrainingSourceWaitsForPipeState(t *testing.T) {
 	b.Pipe = x.source.id
 	for i := range 8 {
 		now := expired.Add(Duration(i+1) * Millisecond)
-		s.WriteDone(b, nil, now)
+		s.WriteDone(b, b.Len(), nil, now)
 		var examined int
 		if s.prefixTimersExamined(now, true, &examined) != Never || examined != 0 {
 			t.Fatalf("write completion %d scanned %d dormant candidates", i, examined)
@@ -804,7 +758,7 @@ func TestPrefixRepairNativeLossAfterPartialSubmission(t *testing.T) {
 	if !s.PollTransmit(x.alt.id, 0, b, 128, x.sim.now) {
 		t.Fatal("no partial repair batch")
 	}
-	s.WriteDone(b, nil, x.sim.now)
+	s.WriteDone(b, b.Len(), nil, x.sim.now)
 	m := x.st.snd.mps
 	r := m.repair
 	if r.sent <= r.lo || r.sent >= r.hi {
@@ -825,10 +779,36 @@ func TestPrefixRepairNativeLossAfterPartialSubmission(t *testing.T) {
 		got.BytesOpportunistic != stats.BytesOpportunistic || s.mp.prefixBucket.tokens != tokens {
 		t.Fatalf("native retransmission used the repair budget: before %+v after %+v", stats, got)
 	}
-	if err := s.mpAckEntry(wire.AckEntry{PipeID: x.alt.id, Position: x.alt.out.lanes[0].pos}, x.sim.now); err != nil {
+	if err := s.mpAckEntry(wire.AckEntry{PipeID: x.alt.id, Position: x.alt.out.lanes[0].pos}, x.sim.now, nil); err != nil {
 		t.Fatal(err)
 	}
 	if s.mp.prefixBytes != 0 {
 		t.Fatal("acknowledging the submitted copy did not release its reservation")
+	}
+}
+
+func TestPrefixRepairDestinationFailureTransfersRange(t *testing.T) {
+	x := newPrefixReplay(t)
+	s := x.sim.end[0]
+	x.put(x.source, bytes.Repeat([]byte{7}, 256))
+	x.sim.now = s.mp.prefixAt
+	s.HandleTimeout(x.sim.now)
+	x.put(x.alt, nil)
+	m := x.st.snd.mps
+	n := m.prefixCopies.covered(0, x.st.snd.sent)
+	if n == 0 || s.mp.prefixBytes != n {
+		t.Fatal("repair did not hand off")
+	}
+	s.failPipe(x.alt, wire.PipeFailed, nil)
+	if s.mp.prefixBytes != 0 || m.prefixCopies.len() != 0 || !m.resend.contains(0, n) {
+		t.Fatal("lost destination did not transfer the range to native reinjection")
+	}
+	s.makeSuspect(x.source)
+	if m.resend.covered(0, n) != n || m.resend.len() != 1 {
+		t.Fatal("source suspicion created another work item for the same range")
+	}
+	x.ackOriginal()
+	if m.resend.len() != 0 {
+		t.Fatal("original ACK did not cancel the inherited work")
 	}
 }

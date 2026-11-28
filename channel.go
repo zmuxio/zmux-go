@@ -2,7 +2,9 @@ package zmux
 
 import (
 	"sync"
+	"time"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
@@ -23,13 +25,12 @@ type DatagramChannel interface {
 	// shared by the streams of a connection (QUIC, WebTransport); ok is
 	// false on a channel of the pipe's own stream (HTTP/3).
 	ChannelStreamID() (id uint64, ok bool)
-	// MaxChannelDatagram returns the largest channel datagram, Pipe Stream
-	// ID included, that the channel takes now; 0 while it takes none (the
-	// carrier did not negotiate datagrams, or has not yet). It is called
-	// by the pipe's channel goroutine, outside the session's lock, before
-	// each round of channel datagrams; the session places datagrams by the
-	// last answer until the next.
-	MaxChannelDatagram() int
+	// ChannelDatagramCapacity returns the structural payload limit and
+	// the room available now, both including any Pipe Stream ID. A limit
+	// of zero disables the channel. A negative limit means setup has not
+	// determined the capacity yet. Only the room changes with path MTU.
+	// The driver reads this snapshot outside the session lock.
+	ChannelDatagramCapacity() (limit, room int)
 	// SendChannelDatagram sends one channel datagram. It may block while
 	// the carrier's own queue is full: a goroutine of the pipe calls it,
 	// and the session's datagram queue drops its oldest datagrams
@@ -43,6 +44,19 @@ type DatagramChannel interface {
 	// goroutine when the pipe attaches; the pipe's first record waits for
 	// it, so it must return promptly. A panic in it fails the pipe.
 	ReceiveChannelDatagrams(deliver func(frame []byte)) (stop func())
+}
+
+// DatagramDeadlineSender lets a channel apply a deadline while waiting for
+// space to accept a datagram. The deadline uses the session's clock.
+type DatagramDeadlineSender interface {
+	carrierio.DatagramDeadlineSender
+}
+
+// DatagramCapacityNotifier optionally signals invalidation of a channel's
+// capacity snapshot. The channel returned for a generation closes when that
+// generation changes. It must return a new channel after invalidation.
+type DatagramCapacityNotifier interface {
+	carrierio.DatagramCapacityNotifier
 }
 
 // channelOf returns the datagram channel of a carrier, if a half offers
@@ -75,6 +89,13 @@ func (c *Conn) startChannel(pd *pipeDrv) {
 	pd.gs.add()
 	labels.Go(pd.lctx, "channel", func() {
 		defer pd.gs.done()
+		if pd.accountRead != nil {
+			defer func() {
+				c.chIn.mu.Lock()
+				pd.channelAccountingClosed = true
+				c.chIn.mu.Unlock()
+			}()
+		}
 		var stop func()
 		err := hostCall(c.cfg.Logger, "DatagramChannel.ReceiveChannelDatagrams", func() error {
 			stop = pd.ch.ReceiveChannelDatagrams(func(frame []byte) { c.receiveChannel(pd, frame) })
@@ -95,8 +116,10 @@ func (c *Conn) startChannel(pd *pipeDrv) {
 
 // channelUse reads what the attachment's datagram channel takes now.
 func (pd *pipeDrv) channelUse() core.ChannelUse {
-	u := core.ChannelUse{Room: pd.ch.MaxChannelDatagram()}
-	if u.Room > 0 {
+	limit, room := pd.ch.ChannelDatagramCapacity()
+	u := core.ChannelUse{Limit: limit}
+	if limit > 0 {
+		u.Room = min(max(room, 0), limit)
 		u.ID, u.HasID = pd.ch.ChannelStreamID()
 	}
 	return u
@@ -125,27 +148,46 @@ func (c *Conn) channelLoop(pd *pipeDrv) {
 		// Deferred unlocks turn a panic of the core into a closed session
 		// (Conn.unlock) instead of leaving the lock held.
 		// The channel is host code: read outside the lock.
+		changed := carrierio.ChannelCapacityChanged(pd.ch)
 		use := pd.channelUse()
 		live := false
 		func() {
 			c.lock()
 			defer c.unlock()
 			if !pd.dead {
-				out, live = c.s.PollChannel(pd.id, use, out[:0])
+				out, live = c.s.PollChannel(pd.id, use, out[:0], c.clk.now())
 			}
 		}()
 		if !live {
 			return
 		}
+		var totals RecordTotals
 		for i := range out {
-			out[i].Failed = pd.ch.SendChannelDatagram(out[i].Frame) != nil
-			out[i].Frame = nil
+			out[i].Expired = out[i].Deadline != core.Never && c.clk.now() >= out[i].Deadline
+			returned := false
+			out[i].Failed = out[i].Expired || hostCall(c.cfg.Logger, "DatagramChannel.SendChannelDatagram", func() error {
+				var deadline time.Time
+				if out[i].Deadline != core.Never {
+					deadline = c.clk.wall(out[i].Deadline)
+				}
+				err := carrierio.SendChannelDatagram(pd.ch, out[i].Frame, deadline)
+				returned = true
+				return err
+			}) != nil
+			out[i].Unknown = !out[i].Expired && !returned
+			if pd.accountWrite != nil && !out[i].Failed {
+				totals.ChannelBytes += uint64(len(out[i].Frame))
+				totals.ChannelDatagrams++
+			}
 		}
 		if len(out) > 0 {
 			func() {
 				c.lock()
 				defer c.unlock()
-				c.s.ChannelDone(out)
+				if totals.ChannelDatagrams != 0 {
+					pd.accountWrite.add(totals, false)
+				}
+				c.s.ChannelDone(out, c.clk.now())
 			}()
 			clear(out)
 		}
@@ -154,6 +196,7 @@ func (c *Conn) channelLoop(pd *pipeDrv) {
 		}
 		select {
 		case <-pd.chSig.C:
+		case <-changed:
 		case <-pd.chEnd:
 			return
 		case <-c.done:
@@ -186,6 +229,9 @@ type chInDgram struct {
 func (c *Conn) receiveChannel(pd *pipeDrv, frame []byte) {
 	in := &c.chIn
 	in.mu.Lock()
+	if pd.accountRead != nil && !pd.channelAccountingClosed {
+		pd.accountRead.add(RecordTotals{ChannelBytes: uint64(len(frame)), ChannelDatagrams: 1}, false)
+	}
 	if len(in.q) >= c.chInMax {
 		in.dropped++
 		in.mu.Unlock()

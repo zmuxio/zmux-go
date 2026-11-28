@@ -34,7 +34,12 @@ func TestGoroutineLabels(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	c, err := Dial(ctx, ln.Addr().String(), cli, nil, nil)
+	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, testQUIC(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = qc.CloseWithError(0, "") }()
+	c, err := Client(ctx, qc, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,48 +53,45 @@ func TestGoroutineLabels(t *testing.T) {
 		_ = c.Wait()
 		_ = s.Wait()
 	}()
-	dump, missing := labelled(t, ctx, []string{
+	// Both lane receivers must process a stream before inspecting their
+	// goroutine labels. The two senders observe the remote reset.
+	for _, endpoint := range []*quic.Conn{qc, tl.last()} {
+		str, err := endpoint.OpenUniStreamSync(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := str.Write([]byte{1, 0}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-str.Context().Done():
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	var buf bytes.Buffer
+	if err := pprof.Lookup("goroutine").WriteTo(&buf, 1); err != nil {
+		t.Fatal(err)
+	}
+	dump := buf.String()
+	for _, want := range []string{
 		`{"app.req":"42", "zmux":"quic-accept-pipes"}`,
 		`{"app.req":"42", "zmux":"quic-accept-lanes"}`,
 		`{"zmux":"quic-client-lanes"}`,
-	})
-	for _, want := range missing {
-		t.Errorf("no goroutine labelled %s", want)
+	} {
+		if !bytes.Contains(buf.Bytes(), []byte("# labels: "+want)) {
+			t.Errorf("no goroutine labelled %s", want)
+		}
 	}
 	// A connection is served by its two accept loops alone: no goroutine
 	// waits for its end, its handshake or its ServeConn.
-	if regexp.MustCompile(`"zmux":"quic-(conn|release|handshake)"`).Match(dump) {
+	if regexp.MustCompile(`"zmux":"quic-(conn|release|handshake)"`).MatchString(dump) {
 		t.Error("a resident goroutine per connection beyond the accept loops")
 	}
-	if regexp.MustCompile(`"app.req":"42", "zmux":"(read|write)"`).Match(dump) {
+	if regexp.MustCompile(`"app.req":"42", "zmux":"(read|write)"`).MatchString(dump) {
 		t.Error("a session goroutine took the caller's labels")
 	}
 	if t.Failed() {
 		t.Logf("%s", dump)
-	}
-}
-
-// labelled samples the goroutine profile until every label set in wants
-// is present or ctx ends, and returns the last dump and the label sets
-// still missing. A goroutine started by labels.Go sets its labels when it
-// first runs, which on a loaded machine can come after the call that
-// started it has returned.
-func labelled(t *testing.T, ctx context.Context, wants []string) ([]byte, []string) {
-	t.Helper()
-	for {
-		var buf bytes.Buffer
-		if err := pprof.Lookup("goroutine").WriteTo(&buf, 1); err != nil {
-			t.Fatal(err)
-		}
-		var missing []string
-		for _, want := range wants {
-			if !bytes.Contains(buf.Bytes(), []byte("# labels: "+want)) {
-				missing = append(missing, want)
-			}
-		}
-		if len(missing) == 0 || ctx.Err() != nil {
-			return buf.Bytes(), missing
-		}
-		time.Sleep(time.Millisecond)
 	}
 }

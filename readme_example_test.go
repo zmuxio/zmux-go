@@ -6,9 +6,10 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
-	"net/netip"
+
 	"time"
 
 	"github.com/zmuxio/zmux-go"
@@ -116,7 +117,7 @@ func Example_readmeErrors() {
 // Example_readmeMultipath is README.md "Multipath".
 func Example_readmeMultipath() {
 	_ = func(ctx context.Context, psk []byte, primaryAddr, backupAddr string) error {
-		cfg := &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: psk, EndToEnd: true}}
+		cfg := &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{PSK: psk, EndToEnd: true}}
 		conn, err := zmux.Dial(ctx, "tcp", primaryAddr, cfg)
 		if err != nil {
 			return err
@@ -149,31 +150,6 @@ func Example_readmePipeUpdate() {
 	}
 }
 
-// Example_readmeRedial is README.md "Reconnecting after an outage".
-func Example_readmeRedial() {
-	_ = func(ctx context.Context, psk []byte, addr string) (*zmux.Conn, error) {
-		cfg := &zmux.Config{
-			ResumeTimeout: 30 * time.Second,
-			PipeAuth:      zmux.PipeAuth{PSK: psk, EndToEnd: true},
-			Redial: func(ctx context.Context, _ zmux.Direction) (zmux.PipeIO, error) {
-				var d net.Dialer
-				nc, err := d.DialContext(ctx, "tcp", addr)
-				if err != nil {
-					return zmux.PipeIO{}, err
-				}
-				return zmux.NetPipe(nc), nil
-			},
-		}
-		conn, err := zmux.Dial(ctx, "tcp", addr, cfg)
-		if err != nil {
-			return nil, err
-		}
-		// The server's Listener uses the same ResumeTimeout and PipeAuth. Streams
-		// survive a carrier that fails and is redialled within 30 s.
-		return conn, nil
-	}
-}
-
 // Example_readmeHTTPExchange is README.md "HTTP exchanges".
 func Example_readmeHTTPExchange() {
 	_ = func(l *zmux.Listener, psk []byte) error {
@@ -196,38 +172,35 @@ func Example_readmeHTTPExchange() {
 	}
 }
 
-// Example_readmeProxy is README.md "Behind a reverse proxy or CDN" (the
-// parts without WebSocket; zmuxws holds the others).
-func Example_readmeProxy() {
-	trusted := &zmux.TrustedProxies{Prefixes: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")},
-		Header: "X-Forwarded-For"}
-	_ = trusted.RequestSource
-
-	_ = func(endpoint http.Handler) *http.Server {
-		srv := &http.Server{Addr: "127.0.0.1:8080", Handler: endpoint, Protocols: new(http.Protocols)}
-		srv.Protocols.SetHTTP1(true)
-		srv.Protocols.SetUnencryptedHTTP2(true)
-		return srv
-	}
-}
-
 // Example_readmeAdmission is README.md "Admission".
 func Example_readmeAdmission() {
-	_ = func(ctx context.Context, key []byte, cfg *zmux.Config, fallback func(context.Context, *zmux.Takeover),
+	_ = func(ctx context.Context, ticket admit.PrefixCredential, outer [32]byte, ticketEnd uint64, cfg *zmux.Config,
 		ln net.Listener, tlsConf *tls.Config, addr string) (*zmux.Conn, error) {
-		auth := &admit.PrefixAuth{Key: key, Slot: 30 * time.Second, BindTLS: true}
-		v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
+		window := admit.PrefixWindow{Slot: 30 * time.Second, Skew: 1}
+		generations := []admit.PrefixGeneration{{Key: outer, LastSlot: math.MaxUint64}}
+		store, err := admit.NewMemoryPrefixStore(window, generations, 0)
 		if err != nil {
 			return nil, err
 		}
-		l, err := zmux.NewListener(&zmux.ListenerConfig{Config: cfg,
-			Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide}, Fallback: fallback})
+		if err := store.AddTicket(admit.PrefixTicket{PrefixCredential: ticket, LastSlot: ticketEnd, SingleUse: true}); err != nil {
+			return nil, err
+		}
+		carrier := admit.PrefixCarrierOptions{BindTLS: true}
+		v, err := admit.NewPrefixAuthVerifier(admit.PrefixAuthVerifierOptions{PrefixCarrierOptions: carrier, Store: store})
+		if err != nil {
+			return nil, err
+		}
+		l, err := zmux.NewListener(&zmux.ListenerConfig{Config: cfg, Admission: v.Admission()})
 		if err != nil {
 			return nil, err
 		}
 		go func() { _ = l.Serve(ctx, tls.NewListener(ln, tlsConf)) }()
 
-		// client: Config.CarrierCredential is presented by the dialers
+		// Client configuration uses the ticket and outer key provisioned for its entrance.
+		auth, err := admit.NewPrefixAuth(admit.PrefixAuthOptions{PrefixCarrierOptions: carrier, Slot: window.Slot}, ticket, generations...)
+		if err != nil {
+			return nil, err
+		}
 		conn, err := zmux.DialTLS(ctx, "tcp", addr, tlsConf, &zmux.Config{CarrierCredential: auth})
 		return conn, err
 	}

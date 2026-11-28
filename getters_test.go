@@ -29,7 +29,7 @@ func TestSessionSettingGetters(t *testing.T) {
 	client.SetScheduler(SchedulerSpreadETA())
 	band := QualityBand{RTT: 40 * time.Millisecond, RateRatio: 2, MinInterval: time.Second}
 	floor := CapacityFloor{Rate: 1 << 20, RecoveryRatio: 3}
-	limits := shaping.Limits{MaxDelay: 3 * time.Second, NoPause: true}
+	limits := shaping.Limits{NoPause: true}
 	live := Liveness{KeepAlivePeriod: 20 * time.Second}
 	if err := client.SetQualityBand(band); err != nil {
 		t.Fatal(err)

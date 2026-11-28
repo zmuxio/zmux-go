@@ -51,13 +51,15 @@ func BenchmarkLifecycle100k(b *testing.B) {
 	b.Run("DeferDeadline", func(b *testing.B) {
 		cfg := &Config{}
 		clk := newClock(nil)
+		cc := core.DefaultConfig()
+		cc.HoldFirstFlight = true
 		// The core has no protocol deadline yet. The measured deadline
 		// is the session orphan sweep, moved by the application.
 		cs := make([]Conn, size)
 		for i := range cs {
 			c := &cs[i]
 			c.cfg, c.clk, c.timerAt = cfg, clk, core.Never
-			c.s = core.New(core.Config{HoldFirstFlight: true}, 0)
+			c.s = core.New(cc, 0)
 			c.handles, c.sweepAt = 1, core.Time(3600*core.Second)
 			c.rearmLocked(core.Never)
 		}

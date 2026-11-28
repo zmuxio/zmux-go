@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
@@ -15,19 +17,26 @@ import (
 )
 
 // packetRelayEnv is client -> relay -> server with datagrams on the first
-// hop; the second hop has none ("off"), runs over TCP ("tcp") or over TLS
+// hop; the second hop has none ("off"), runs in cleartext ("tcp") or over TLS
 // ("tls"), whose smaller records give it a smaller datagram bound.
 func packetRelayEnv(t *testing.T, hop2 string) (client, relayIn, relayOut, server *Conn) {
 	t.Helper()
-	cfg := &Config{EnableDatagrams: true}
-	a1, b1 := tcpPair(t)
+	return packetRelayOn(t, hop2, func() (net.Conn, net.Conn) { return tcpPair(t) })
+}
+
+func packetRelayOn(t *testing.T, hop2 string, carrier func() (net.Conn, net.Conn)) (client, relayIn, relayOut, server *Conn) {
+	t.Helper()
+	cfg := &Config{EnableDatagrams: true, DatagramQueueDelay: -1}
+	a1, b1 := carrier()
 	client, relayIn = pair(t, a1, b1, cfg, cfg)
-	a2, b2 := tcpPair(t)
+	a2, b2 := carrier()
 	if hop2 == "tls" {
 		srv, cli := selfSignedTLS(t)
 		a2, b2 = tls.Client(a2, cli), tls.Server(b2, srv)
 	}
-	relayOut, server = pair(t, a2, b2, cfg, &Config{EnableDatagrams: hop2 != "off"})
+	peer := *cfg
+	peer.EnableDatagrams = hop2 != "off"
+	relayOut, server = pair(t, a2, b2, cfg, &peer)
 	return client, relayIn, relayOut, server
 }
 
@@ -68,16 +77,17 @@ func relayStreams(t *testing.T, ctx context.Context, client, rin, rout, server *
 // and an unknown capsule type pass through unchanged.
 func TestSplicePacketsConvertsDatagrams(t *testing.T) {
 	for _, hop2 := range []string{"off", "tcp", "tls"} {
-		t.Run(hop2, func(t *testing.T) { testSplicePacketsConverts(t, hop2) })
+		t.Run(hop2, func(t *testing.T) {
+			leakcheck.Check(t)
+			synctest.Test(t, func(t *testing.T) { testSplicePacketsConverts(t, hop2) })
+		})
 	}
 }
 
 func testSplicePacketsConverts(t *testing.T, hop2 string) {
 	t.Helper()
-	leakcheck.Check(t)
-	client, rin, rout, server := packetRelayEnv(t, hop2)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	client, rin, rout, server := packetRelayOn(t, hop2, net.Pipe)
+	ctx := t.Context()
 	cs, ss, done := relayStreams(t, ctx, client, rin, rout, server,
 		func(ctx context.Context, a, b *Stream) (SpliceResult, error) { return SplicePackets(ctx, a, b, nil) })
 	// An unknown capsule (type 0x29), written as raw bytes first.
@@ -91,33 +101,37 @@ func testSplicePacketsConverts(t *testing.T, hop2 string) {
 	// bound only over TLS.
 	dg := bytes.Repeat([]byte{0x5a}, cs.MaxDatagramPayload(4))
 	bigFits := hop2 == "tcp" && len(dg) <= ss.MaxDatagramPayload(4)
-	if err := w.WritePacket(ctx, 4, dg); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.WritePacket(ctx, 5, []byte("small")); err != nil {
-		t.Fatal(err)
-	}
-	so := mustPackets(t, cs, &PacketOptions{Policy: PacketStreamOnly})
-	if err := so.WritePacket(ctx, 6, []byte("capsule")); err != nil {
-		t.Fatal(err)
-	}
-	got := map[uint64]Packet{}
-	for len(got) < 3 {
+	// Complete each datagram probe before offering more input. A pending
+	// fallback may be dropped when the source has reliable data ready.
+	read := func(id uint64, datagram bool, data []byte) {
+		t.Helper()
 		pk, err := r.ReadPacket(ctx, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		got[pk.ContextID] = pk
+		if pk.ContextID != id || pk.Datagram != datagram || !bytes.Equal(pk.Data, data) {
+			t.Fatalf("packet context=%d datagram=%v size=%d, want context=%d datagram=%v size=%d",
+				pk.ContextID, pk.Datagram, len(pk.Data), id, datagram, len(data))
+		}
 	}
-	if pk := got[4]; pk.Datagram != bigFits || !bytes.Equal(pk.Data, dg) {
-		t.Fatalf("datagram: datagram %v, %d bytes", pk.Datagram, len(pk.Data))
+	synctest.Wait() // The unknown capsule has been forwarded.
+	if err := w.WritePacket(ctx, 4, dg); err != nil {
+		t.Fatal(err)
 	}
-	if pk := got[5]; pk.Datagram != (hop2 != "off") || string(pk.Data) != "small" {
-		t.Fatalf("small datagram: %+v", pk)
+	if hop2 == "tls" {
+		synctest.Wait() // The relay drops this datagram at the TLS bound.
+	} else {
+		read(4, bigFits, dg)
 	}
-	if pk := got[6]; pk.Datagram || string(pk.Data) != "capsule" {
-		t.Fatalf("capsule: %+v", pk)
+	if err := w.WritePacket(ctx, 5, []byte("small")); err != nil {
+		t.Fatal(err)
 	}
+	read(5, hop2 != "off", []byte("small"))
+	so := mustPackets(t, cs, &PacketOptions{Policy: PacketStreamOnly})
+	if err := so.WritePacket(ctx, 6, []byte("capsule")); err != nil {
+		t.Fatal(err)
+	}
+	read(6, false, []byte("capsule"))
 	if st := r.Stats(); st.SkippedCapsules != 1 {
 		t.Fatalf("receiver stats %+v", st)
 	}
@@ -131,23 +145,33 @@ func testSplicePacketsConverts(t *testing.T, hop2 string) {
 	}
 	res := <-done
 	ab := res.AtoB
-	enc := uint64(0)
-	switch {
-	case hop2 == "off":
+	enc, dropped, sent := uint64(0), uint64(0), uint64(len(dg)+5)
+	switch hop2 {
+	case "off":
 		enc = 2
-	case !bigFits:
-		enc = 1
+	case "tls":
+		dropped, sent = 1, 5
 	}
 	if ab.End.Kind != SpliceFinished || res.BtoA.End.Kind != SpliceFinished || ab.DatagramsAsCapsules != enc ||
-		ab.DatagramBytes != uint64(len(dg)+5) || ab.DatagramsDropped != 0 {
+		ab.DatagramBytes != sent || spliceTestDropCount(ab.Drops) != dropped {
 		t.Fatalf("result %+v", res)
 	}
 }
 
-// TestSplicePacketsMalformedReachesEnd: the relay passes a truncated
-// capsule on; the receiving end fails it with ZMUX_PACKET_ERROR, and the
-// code travels back to the opener.
-func TestSplicePacketsMalformedReachesEnd(t *testing.T) {
+func TestSplicePacketFallbackYieldsToReliableSource(t *testing.T) {
+	// A prior fallback completed and the relay observed reliable input
+	// before attempting to admit the next datagram as a capsule.
+	d := spliceRelay{preferSource: true}
+	d.source.Ready = 1
+	g := spliceGroup{meta: SpliceMeta{Kind: SpliceDatagram}}
+	d.queueDatagramCapsules(t.Context(), &g)
+	if d.result.Drops[SpliceDropBlocked] != 1 || len(d.pendingReliable) != 0 {
+		t.Fatalf("fallback disposition: drops=%v pending=%d", d.result.Drops, len(d.pendingReliable))
+	}
+}
+
+// The splice reports malformed capsules on the two affected halves.
+func TestSplicePacketsMalformed(t *testing.T) {
 	leakcheck.Check(t)
 	client, rin, rout, server := packetRelayEnv(t, "tcp")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -158,22 +182,24 @@ func TestSplicePacketsMalformedReachesEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = cs.Close()
-	r := mustPackets(t, ss, nil)
-	if _, err := r.ReadPacket(ctx, nil); !errors.Is(err, ErrMalformedPacket) {
-		t.Fatalf("truncated: %v", err)
-	}
-	_, err := io.ReadAll(cs)
+	got, err := io.ReadAll(ss)
 	var se *StreamError
 	if !errors.As(err, &se) || se.ErrorCode != StreamPacketError {
-		t.Fatalf("opener: %v", err)
+		t.Fatalf("truncated: %x %v", got, err)
 	}
-	if res := <-done; res.BtoA.End != (SpliceEnd{Kind: SpliceReset, Code: StreamPacketError}) {
+	_ = ss.Close()
+	if _, err := io.ReadAll(cs); err != nil {
+		t.Fatal(err)
+	}
+	if res := <-done; res.AtoB.End != (SpliceEnd{Kind: SplicePacketError, Code: StreamPacketError}) {
 		t.Fatalf("result %+v", res)
 	}
 }
 
 // dropLimiter refuses datagrams of one size and allows everything else.
 type dropLimiter struct{ size int }
+
+func (dropLimiter) MaxBurstBytes() int64 { return -1 }
 
 func (l dropLimiter) Acquire(_ context.Context, _, maxBytes int64) (int64, error) {
 	return maxBytes, nil
@@ -218,13 +244,15 @@ func TestSpliceDatagramDropCauses(t *testing.T) {
 		t.Fatal(err)
 	}
 	ab := (<-done).AtoB
-	if ab.DatagramsLimited != 1 || ab.DatagramsDropped != 2 || ab.DatagramsTooLarge != 1 || ab.DatagramBytes != 4 {
+	if ab.Drops[SpliceDropLimiter] != 1 || spliceTestDropCount(ab.Drops) != 2 || ab.Drops[SpliceDropTooLarge] != 1 || ab.DatagramBytes != 4 {
 		t.Fatalf("AtoB %+v", ab)
 	}
 }
 
 // failLimiter fails every Acquire, as an exhausted budget does.
 type failLimiter struct{}
+
+func (failLimiter) MaxBurstBytes() int64 { return -1 }
 
 func (failLimiter) Acquire(context.Context, int64, int64) (int64, error) {
 	return 0, errors.New("budget exhausted")
@@ -251,29 +279,23 @@ func TestSpliceLimiterFailed(t *testing.T) {
 					}
 					return Splice(ctx, a, b, opts)
 				})
-			if _, err := cs.Write([]byte{0x00, 0x01, 'x'}); err != nil {
+			if _, err := cs.Write([]byte{0x00, 0x02, 0x00, 'x'}); err != nil {
 				t.Fatal(err)
 			}
 			var se *StreamError
 			if _, err := io.ReadAll(ss); !errors.As(err, &se) || se.ErrorCode != StreamCancelled {
 				t.Fatalf("downstream: %v", err)
 			}
-			for {
-				if _, err := cs.Write([]byte("more")); err != nil {
-					if !errors.As(err, &se) || se.ErrorCode != StreamCancelled {
-						t.Fatalf("upstream: %v", err)
-					}
-					break
-				}
-				time.Sleep(time.Millisecond) // until the STOP_SENDING arrives
+			if err := waitStreamStop(ctx, cs); !errors.As(err, &se) || se.ErrorCode != StreamCancelled {
+				t.Fatalf("upstream: %v", err)
 			}
 			// The other direction goes on.
-			if _, err := ss.Write([]byte{0x00, 0x04, 'b', 'a', 'c', 'k'}); err != nil {
+			if _, err := ss.Write([]byte{0x00, 0x05, 0x00, 'b', 'a', 'c', 'k'}); err != nil {
 				t.Fatal(err)
 			}
 			_ = ss.Close()
 			got, err := io.ReadAll(cs)
-			if err != nil || string(got) != "\x00\x04back" {
+			if err != nil || string(got) != "\x00\x05\x00back" {
 				t.Fatalf("other direction: %q, %v", got, err)
 			}
 			res := <-done
@@ -291,11 +313,24 @@ func TestSpliceDatagramNotInUseCountsDropped(t *testing.T) {
 	client, rin, rout, server := packetRelayEnv(t, "off")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	calls := make(chan struct{}, 2)
+	hook := func(context.Context, SpliceUnit) (SpliceDecision, error) {
+		calls <- struct{}{}
+		return SpliceDecision{}, nil
+	}
+	opts := &SpliceOptions{HooksAtoB: SpliceHooks{Datagram: []SpliceHook{hook}}}
 	cs, ss, done := relayStreams(t, ctx, client, rin, rout, server,
-		func(ctx context.Context, a, b *Stream) (SpliceResult, error) { return Splice(ctx, a, b, nil) })
+		func(ctx context.Context, a, b *Stream) (SpliceResult, error) { return Splice(ctx, a, b, opts) })
 	for _, p := range [][]byte{make([]byte, 10), make([]byte, 5000)} {
 		if err := cs.SendDatagram(0, p); err != nil {
 			t.Fatal(err)
+		}
+	}
+	for range 2 {
+		select {
+		case <-calls:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
 	}
 	_ = cs.Close()
@@ -307,7 +342,14 @@ func TestSpliceDatagramNotInUseCountsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	ab := (<-done).AtoB
-	if ab.DatagramsDropped != 2 || ab.DatagramsTooLarge != 0 || ab.DatagramsLimited != 0 || ab.DatagramBytes != 0 {
+	if spliceTestDropCount(ab.Drops) != 2 || ab.Drops[SpliceDropTooLarge] != 0 || ab.Drops[SpliceDropLimiter] != 0 || ab.DatagramBytes != 0 {
 		t.Fatalf("AtoB %+v", ab)
 	}
+}
+
+func spliceTestDropCount(counts map[SpliceDropReason]uint64) (n uint64) {
+	for _, count := range counts {
+		n += count
+	}
+	return n
 }

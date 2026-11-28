@@ -33,8 +33,8 @@ func multipathCloseOnce(t *testing.T) int {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	e := newEnv(t, &zmux.Config{MaxPipes: 8, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)}})
-	client, err := Dial(ctx, e.ln.Addr().String(), e.cli, nil, &zmux.Config{MaxPipes: 8, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)}})
+	e := newEnv(t, &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 8}}, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)}})
+	client, err := Dial(ctx, e.ln.Addr().String(), e.cli, nil, &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 8}}, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32)}})
 	if err != nil {
 		t.Fatal(err)
 	}

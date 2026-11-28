@@ -2,6 +2,7 @@ package zmux
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -69,10 +70,10 @@ func TestStreamCtlBeforeOpen(t *testing.T) {
 				if op == "CancelRead" {
 					// The STOP_SENDING reached this stream: its writer
 					// learns it.
-					waitUntil(t, 5*time.Second, "STOP_SENDING", func() bool {
-						_, err := ps.Write([]byte("x"))
-						return err != nil
-					})
+					var stop *StreamError
+					if err := waitStreamStop(ctx, ps); !errors.As(err, &stop) || !stop.Remote || stop.ErrorCode != 7 {
+						t.Fatalf("STOP_SENDING: %v", err)
+					}
 				}
 				// Stream 0 works both ways.
 				if _, err := cs.Write([]byte("again")); err != nil {

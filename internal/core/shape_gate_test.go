@@ -72,9 +72,8 @@ func recordData(t *testing.T, b *Batch) []int {
 
 // A gate set by the plan of a record in the middle of a batch bounds the
 // data of that record and of the rest of the batch, and its bucket is
-// charged only for the data written after it took effect. DATAGRAM frames
-// fill the records before the gate, one each; stream data follows in the
-// gating record.
+// charged only for the data written after it took effect. DATAGRAM and
+// STREAM frames share the records before the gate.
 func TestShapingGateMidBatch(t *testing.T) {
 	for name, gate := range map[string]gateSpec{
 		"rate":  {rate: 1_000_000, burst: 100},
@@ -107,15 +106,12 @@ func TestShapingGateMidBatch(t *testing.T) {
 				t.Fatal("nothing sent")
 			}
 			recs := recordData(t, b)
-			s.WriteDone(b, nil, now)
+			s.WriteDone(b, b.Len(), nil, now)
 			if len(recs) <= at {
 				t.Fatalf("records %v: the gating record (seq %d) not in the batch", recs, at)
 			}
 			after := 0
-			for i, n := range recs {
-				if i < at && n > 0 {
-					t.Fatalf("records %v: stream data before the gating record", recs)
-				}
+			for _, n := range recs[at:] {
 				after += n
 			}
 			ps := p.sh

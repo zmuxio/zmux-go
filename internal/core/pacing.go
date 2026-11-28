@@ -43,6 +43,7 @@ func (s *Session) heldBytes(p *Pipe) uint64 {
 func (s *Session) limiterOf(p *Pipe) *limiter {
 	if !s.paced(p) {
 		p.out.snd.lim = nil
+		s.paceTimers.Cancel(&p.out.snd.pace)
 		return nil
 	}
 	ps := &p.out.snd
@@ -93,7 +94,9 @@ func (s *Session) paceAck(p *Pipe, ev *limAck) {
 	pp := s.limParams()
 	wasHeld := l.held
 	l.onAck(s.now, ev, &ps.re, s.srttOf(p), &pp)
+	s.trackPace(p, l)
 	if wasHeld && !l.held {
+		s.routeDatagrams()
 		s.wakeAllWriters()
 	}
 }
@@ -110,6 +113,7 @@ func (s *Session) paceSent(p *Pipe, bytes uint64) {
 	l.settle(s.now, bytes, rate, srtt, &pp)
 	in := s.limInFlight(p)
 	l.refresh(s.now, in, rate, srtt, &pp)
+	s.trackPace(p, l)
 }
 
 // paceSample feeds the single pipe's first QX_PING round trip.
@@ -124,39 +128,46 @@ func (s *Session) pacePing(rtt Duration) {
 	if l := s.limiterOf(p); l != nil {
 		pp := s.limParams()
 		l.pingSample(s.now, rtt, &p.out.snd.re, s.srttOf(p), &pp)
+		s.trackPace(p, l)
 	}
 }
 
-// paceDeadline is the earliest moment a held pipe may send again.
+func (s *Session) trackPace(p *Pipe, l *limiter) {
+	d := &p.out.snd.pace
+	if l.held && l.release != Never {
+		d.Value = p
+		s.paceTimers.Set(d, l.release)
+	} else {
+		s.paceTimers.Cancel(d)
+	}
+}
+
+// paceDeadline is the earliest registered check of work stopped by pacing.
 func (s *Session) paceDeadline() Time {
-	if s.sched.mask == 0 && (s.mp == nil || s.mp.additionalPipes == nil || !s.mp.prefixWaiting) {
-		return Never // no queued write or registered repair waits for a pipe
+	if s.sched.mask == 0 && (s.mp == nil || s.mp.prefixScheduler == nil || !s.mp.prefixWaiting) &&
+		(s.dg == nil || s.dg.sendCount == 0 && s.dg.copyCount == 0) {
+		return Never
 	}
-	t := Never
-	for _, p := range s.pipes {
-		if p.out != nil && p.out.snd.lim != nil && p.out.snd.lim.held {
-			t = minT(t, p.out.snd.lim.release)
-		}
-	}
-	return t
+	return s.paceTimers.Next()
 }
 
-// paceTimeout lets held pipes go whose release time came.
 func (s *Session) paceTimeout(now Time) {
+	if s.paceTimers.Next() > now {
+		return
+	}
 	pp := s.limParams()
-	for _, p := range s.pipes {
-		if p.out == nil {
-			continue
-		}
+	for d := s.paceTimers.PopDue(now); d != nil; d = s.paceTimers.PopDue(now) {
+		p := d.Value
 		l := p.out.snd.lim
-		if l == nil || !l.held || l.release > now {
+		if l == nil || p.out.failed {
 			continue
 		}
 		in := s.limInFlight(p)
 		l.refresh(now, in, p.out.snd.re.value(), s.srttOf(p), &pp)
+		s.trackPace(p, l)
 		if !l.held {
 			s.wakePrefix()
-			s.wakePipe(p)
+			s.routeDatagrams()
 			s.wakeAllWriters()
 		}
 	}

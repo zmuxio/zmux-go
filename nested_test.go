@@ -8,6 +8,7 @@ import (
 	"io"
 	"runtime"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
@@ -120,47 +121,54 @@ func TestNestEdgeDropAfterClose(t *testing.T) {
 // streams and never credit an application opener waits for.
 func TestNestedLaneCredit(t *testing.T) {
 	leakcheck.Check(t)
-	scfg := mpConfig()
-	scfg.MaxIncomingStreams = 4
-	e := newMPEnv(t, mpConfig(), scfg)
-	e.addPipe(t, PipeOptions{}) // lanes pay off: the outer session has two pipes
-	c := e.client
-	var lanes []*Stream
-	for {
-		s, ok := c.openNestedLane()
-		if !ok {
-			break
+	synctest.Test(t, func(t *testing.T) {
+		scfg := mpConfig()
+		scfg.MaxIncomingStreams = 4
+		e := newMemMPEnv(t, mpConfig(), scfg)
+		e.addPipe(t, PipeOptions{}) // lanes pay off: the outer session has two pipes
+		c := e.client
+		var lanes []*Stream
+		for {
+			s, ok := c.openNestedLane()
+			if !ok {
+				break
+			}
+			lanes = append(lanes, s)
 		}
-		lanes = append(lanes, s)
-	}
-	if len(lanes) != 2 {
-		t.Fatalf("%d nested lanes, want 2 (half of 4)", len(lanes))
-	}
-	_ = (&laneStream{s: lanes[0], outer: c}).Close()
-	// Use the remaining credit, then wait as an application opener.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var app []*Stream
-	for {
-		s, err := c.OpenStream()
-		if err != nil {
-			break
+		if len(lanes) != 2 {
+			t.Fatalf("%d nested lanes, want 2 (half of 4)", len(lanes))
 		}
-		app = append(app, s)
-	}
-	opened := make(chan *Stream, 1)
-	go func() {
-		s, _ := c.OpenStreamSync(ctx)
-		opened <- s
-	}()
-	time.Sleep(50 * time.Millisecond)
-	if s, ok := c.openNestedLane(); ok {
-		t.Fatalf("a nested lane took credit an opener waits for: %v", s)
-	}
-	cancel()
-	<-opened
-	runtime.KeepAlive(lanes)
-	runtime.KeepAlive(app)
+		_ = newLaneStream(lanes[0], c).Close()
+		// Use the remaining credit, then wait as an application opener.
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var app []*Stream
+		for {
+			s, err := c.OpenStream()
+			if err != nil {
+				break
+			}
+			app = append(app, s)
+		}
+		opened := make(chan *Stream, 1)
+		go func() {
+			s, _ := c.OpenStreamSync(ctx)
+			opened <- s
+		}()
+		synctest.Wait()
+		var waiting bool
+		c.peek(func() { waiting = c.s.OpenersWaiting(true) })
+		if !waiting {
+			t.Fatal("stream opener did not park on credit")
+		}
+		if s, ok := c.openNestedLane(); ok {
+			t.Fatalf("a nested lane took credit an opener waits for: %v", s)
+		}
+		cancel()
+		<-opened
+		runtime.KeepAlive(lanes)
+		runtime.KeepAlive(app)
+	})
 }
 
 // TestStreamPipeLocalOpen wraps a locally opened stream that carries

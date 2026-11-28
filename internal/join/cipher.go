@@ -150,3 +150,15 @@ func (o *Opener) Open(dst, ciphertext []byte) ([]byte, error) {
 	}
 	return out, nil
 }
+
+// OpenInPlace authenticates a record before publishing the plaintext at
+// the beginning of ciphertext.
+func (o *Opener) OpenInPlace(ciphertext []byte) error {
+	out, err := o.Open(ciphertext[:0], ciphertext)
+	if err == nil && (len(out) != len(ciphertext)-o.CS.AEAD.Overhead() ||
+		len(out) > 0 && &out[0] != &ciphertext[0]) {
+		o.err = ErrAuth
+		return o.err
+	}
+	return err
+}

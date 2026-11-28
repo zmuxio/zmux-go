@@ -3,12 +3,15 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
@@ -85,11 +88,17 @@ func TestStreamTryWrite(t *testing.T) {
 // and the carrier's resuming makes it ready again.
 func TestStreamWaitWritableIsRoomNotCredit(t *testing.T) {
 	leakcheck.Check(t)
+	synctest.Test(t, testStreamWaitWritableIsRoomNotCredit)
+}
+
+func testStreamWaitWritableIsRoomNotCredit(t *testing.T) {
+	t.Helper()
 	a, b := net.Pipe()
 	gb := &gatedConn{Conn: b}
-	scfg := &Config{InitialStreamReceiveWindow: 32 << 20, MaxStreamReceiveWindow: 32 << 20,
+	domain := NewClockDomain(timeshim.Real)
+	scfg := &Config{ClockDomain: domain, InitialStreamReceiveWindow: 32 << 20, MaxStreamReceiveWindow: 32 << 20,
 		InitialConnectionReceiveWindow: 32 << 20, MaxConnectionReceiveWindow: 32 << 20}
-	client, server := pair(t, a, gb, &Config{SendBuffer: 64 << 10, SendBufferMax: 64 << 10}, scfg)
+	client, server := pair(t, a, gb, &Config{ClockDomain: domain, SendBuffer: 64 << 10, SendBufferMax: 64 << 10}, scfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	st, err := client.OpenStreamSync(ctx)
@@ -109,11 +118,34 @@ func TestStreamWaitWritableIsRoomNotCredit(t *testing.T) {
 	// takes anything for a while.
 	gb.stall()
 	defer gb.resume()
+	waitWritable := func() (uint64, error) {
+		wctx, wcancel := context.WithCancel(ctx)
+		defer wcancel()
+		type result struct {
+			err  error
+			room uint64
+		}
+		ready := make(chan result, 1)
+		go func() {
+			room, err := st.WaitWritable(wctx)
+			ready <- result{err: err, room: room}
+		}()
+		synctest.Wait()
+		select {
+		case r := <-ready:
+			return r.room, r.err
+		default:
+			wcancel()
+			r := <-ready
+			return r.room, r.err
+		}
+	}
 	for {
-		wctx, wcancel := context.WithTimeout(ctx, 100*time.Millisecond)
-		room, err := st.WaitWritable(wctx)
-		wcancel()
+		room, err := waitWritable()
 		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
 			break
 		}
 		if m, _ := st.TryWrite(big); uint64(m) < min(room, uint64(len(big))) {
@@ -124,11 +156,9 @@ func TestStreamWaitWritableIsRoomNotCredit(t *testing.T) {
 		t.Fatalf("credit should be left; written %d", st.Stats().BytesWritten)
 	}
 	for range 3 {
-		wctx, wcancel := context.WithTimeout(ctx, 10*time.Millisecond)
-		if _, err := st.WaitWritable(wctx); err == nil {
-			t.Fatal("ready with a full buffer")
+		if room, err := waitWritable(); room != 0 || !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitWritable with a full buffer: %d, %v", room, err)
 		}
-		wcancel()
 	}
 	if m, err := st.TryWrite([]byte{1}); m != 0 || err != nil {
 		t.Fatalf("full buffer took %d, %v", m, err)
@@ -151,52 +181,60 @@ func TestStreamWaitWritableIsRoomNotCredit(t *testing.T) {
 // WaitWritable that waits in another goroutine.
 func TestStreamCloseWakesWaitWritable(t *testing.T) {
 	leakcheck.Check(t)
-	a, b := tcpPair(t)
-	gb := &gatedConn{Conn: b}
-	scfg := &Config{InitialStreamReceiveWindow: 32 << 20, MaxStreamReceiveWindow: 32 << 20,
-		InitialConnectionReceiveWindow: 32 << 20, MaxConnectionReceiveWindow: 32 << 20}
-	client, server := pair(t, a, gb, &Config{SendBuffer: 64 << 10, SendBufferMax: 64 << 10}, scfg)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	st, err := client.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.Write([]byte{1}); err != nil {
-		t.Fatal(err)
-	}
-	rs, err := server.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() { _, _ = io.Copy(io.Discard, rs) }()
-	gb.stall()
-	defer gb.resume()
-	big := make([]byte, 256<<10)
-	for {
-		wctx, wcancel := context.WithTimeout(ctx, 100*time.Millisecond)
-		_, err := st.WaitWritable(wctx)
-		wcancel()
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		gb := &gatedConn{Conn: b}
+		scfg := &Config{InitialStreamReceiveWindow: 32 << 20, MaxStreamReceiveWindow: 32 << 20,
+			InitialConnectionReceiveWindow: 32 << 20, MaxConnectionReceiveWindow: 32 << 20}
+		client, server := pair(t, a, gb, &Config{SendBuffer: 64 << 10, SendBufferMax: 64 << 10}, scfg)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		st, err := client.OpenStreamSync(ctx)
 		if err != nil {
-			break
+			t.Fatal(err)
 		}
-		_, _ = st.TryWrite(big)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := st.WaitWritable(ctx)
-		done <- err
-	}()
-	time.Sleep(50 * time.Millisecond)
-	_ = st.Close()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("ready after Close")
+		if _, err := st.Write([]byte{1}); err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("Close did not wake WaitWritable")
-	}
+		rs, err := server.AcceptStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { _, _ = io.Copy(io.Discard, rs) }()
+		gb.stall()
+		defer gb.resume()
+		big := make([]byte, 256<<10)
+		for {
+			n, err := st.TryWrite(big)
+			if err != nil {
+				t.Fatal(err)
+			}
+			synctest.Wait()
+			if n == 0 {
+				break
+			}
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, err := st.WaitWritable(ctx)
+			done <- err
+		}()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("WaitWritable returned before Close: %v", err)
+		default:
+		}
+		_ = st.Close()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("ready after Close")
+			}
+		case <-ctx.Done():
+			t.Fatal("Close did not wake WaitWritable")
+		}
+	})
 }
 
 // gatedConn stalls the reads that start between stall and resume.

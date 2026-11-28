@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +20,7 @@ import (
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/internal/wire"
+	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // Role is the role argument of Start; the zero value is invalid, so a
@@ -52,90 +52,98 @@ type StreamID int64
 // an empty poll. A lane wake signals its parked writer under the lock or
 // reserves a new writer to launch after unlock.
 type Conn struct {
-	clk    clock
-	s      *core.Session // the sans-IO core (session lock)
-	cfg    *Config       // The listener's sessions may share this immutable configuration.
-	sessMu sync.Mutex    // the session lock (lock, peek): guards s and the fields marked so
-
-	// The timer and its bookkeeping (session lock).
-	timer        timeshim.Timer
-	writerIdleAt core.Time // earliest possible writer expiry, refreshed when reached
-	timerAt      core.Time
-	timerVersion atomic.Uint64 // invalidates an early precise callback
-	timerArm     core.Time     // when the timer was armed to fire
-	timerLate    time.Duration // smoothed lateness of the host timer
-
-	ctx   context.Context
-	err   error // terminal error once done
-	pipes map[uint64]*pipeDrv
-	done  chan struct{}
-	// doneOnce closes done: at the end the unlock publishes, or in a
-	// poisoned session's salvage.
-	doneOnce sync.Once
-	pools    atomic.Int32 // MaintainPipes calls running
-	cancel   context.CancelCauseFunc
-	// side counts every goroutine of the session that Wait waits for:
-	// those started in its critical sections (add) and those started
-	// outside them (goSide: redial, rejoins, channel drain, lane opens,
-	// pools). It is sealed when done is closed: no goSide starts after
-	// that, and the last goroutine to end closes Done's channel.
-	side pipeGoroutines
-
+	handshakeShaper shaping.HandshakeShaper
+	handshakeChange chan struct{}
+	timer           timeshim.Timer // fires for the session's pending work (session lock)
+	ctx             context.Context
+	err             error // terminal error once done
 	// firstTimer releases a held first flight at the handshake timeout;
 	// firstTimeouts counts that (session lock).
 	firstTimer timeshim.Timer
+	// admitted is the admission value of the bootstrap carrier (set
+	// before the session is shared, never changed).
+	bootstrapAdmission any // entry admission value, before any inner peer credential
+	admitted           any
+	lctx               context.Context // the goroutine labels of the session (labels.go)
+	s                  *core.Session   // the sans-IO core (session lock)
+	cfg                *Config         // The listener's sessions may share this immutable configuration.
+	authorizeJoin      JoinAuthorizer  // callback for the core's authorization generation (session lock)
+	bindingGeneration  uint64
+	nextCapacityBatch  uint64
+	control            *SessionControl
+	pipes              map[uint64]*pipeDrv
+	done               chan struct{}
+	cancel             context.CancelCauseFunc
 	// exp is the late exporter of PipeAuth.Exporter, nil without it.
 	exp *lateExporter
 	// boot holds the bootstrap carrier's exporters (ExportKeyingMaterial),
 	// nil when it has none; set before the session is shared.
 	boot *lateExporter
-	// bootIO is the bootstrap carrier, for ConnectionState's TLS state and
-	// application protocol; set before the session is shared.
-	bootIO        PipeIO
-	firstTimeouts uint64
-
 	// verdictDone closes once the carrier's early-data verdict has been
 	// applied; nil without one (set before the session is shared).
 	verdictDone chan struct{}
-
-	// admitted is the admission value of the bootstrap carrier (set
-	// before the session is shared, never changed).
-	admitted any
-
-	lctx context.Context // the goroutine labels of the session (labels.go)
-	id   SessionID
 	// orphans are the handles collected unclosed (cleanupHandle); handles
 	// counts those not released, and while there are any the timer also
 	// fires at sweepAt to release orphans (session lock).
-	orphans orphanQueue
-	handles int
-	// shapeFaults are the shaper panics already logged (session lock).
-	shapeFaults uint64
-	sweepAt     core.Time
-
-	handlers    *connHandlers // allocated on first registration, guarded by sessMu
+	orphans            orphanQueue
+	handlers           *connHandlers // allocated on first registration, guarded by sessMu
+	publication        chan struct{} // lazy, only when setup races bootstrap publication
+	lst                *Listener     // the listener that accepted the session
+	suspPrev, suspNext *Conn         // under the session registry membership shard
+	hk                 *hooks        // application hooks (nil: none)
+	receiveScheduler   Scheduler     // local receive preference (session lock)
+	// ending is closed when the first Close or Abort has returned; nil
+	// before either. closeSig, while Close waits, is woken at every
+	// unlock.
+	ending     chan struct{}
+	closeSig   *core.Signal
+	clk        clock
+	closeMsg   string
+	changes    []*CapacityChange // active batches in reservation order
+	writerIdle core.DeadlineQueue[*laneWriter]
+	// The Locators lst knows the session by (at most two, MULTIPATH.md
+	// 10.7), under the session registry membership shard.
+	lstLocs     []string
+	retiredIDs  []uint64 // pipes retired in this critical section
+	retiredDone []uint64 // pipes retired in the previous one
 	events      eventQueue
-	pipeWaiters []*core.Signal // AddPipe waiting for a join (woken on pipe state changes)
-
-	publication chan struct{} // lazy, only when setup races bootstrap publication
-	lst         *Listener     // the listener that accepted the session
-	// Under the session registry membership shard: the Locators lst knows the session by (at most two,
-	// MULTIPATH.md 10.7), and its links in lst's suspension list.
-	lstLocs            []string
-	suspGeneration     uint64 // advanced under session and suspension locks
-	suspPrev, suspNext *Conn
-	hk                 *hooks // application hooks (nil: none)
-	// carrierVariant is the chosen candidate's Variant.
-	carrierVariant string
-	unconfirmed    core.Unconfirmed[*heldJoin] // carriers Unconfirmed at the acceptor
-	retiredIDs     []uint64                    // pipes retired in this critical section
-	retiredDone    []uint64                    // pipes retired in the previous one
-	redial         *redialer
-	nestedLanes    int         // lanes that nested pipes hold on this session
-	dialed         Endpoint    // who dialed the bootstrap carrier; 0: unknown
-	carrier        CarrierKind // the kind DialChoice chose
+	// side counts every goroutine of the session that Wait waits for:
+	// those started in its critical sections (add) and those started
+	// outside them (goSide: rejoins, channel drain and lane opens).
+	// It is sealed when done is closed: no goSide starts after
+	// that, and the last goroutine to end closes Done's channel.
+	side pipeGoroutines
+	chIn chIn // received channel datagrams for the session
+	// bootIO is the bootstrap carrier, for ConnectionState's TLS state and
+	// application protocol; set before the session is shared.
+	bootIO        PipeIO
+	nextAttempt   AttemptID // session owner
+	coreTimerAt   core.Time // deadline computed by the core at the last session mutation
+	timerAt       core.Time
+	timerVersion  atomic.Uint64 // invalidates an early precise callback
+	timerArm      core.Time     // when the timer was armed to fire
+	timerLate     time.Duration // smoothed lateness of the host timer
+	firstTimeouts uint64
+	id            SessionID
+	handles       int
+	// shapeFaults are the shaper panics already logged (session lock).
+	shapeFaults    uint64
+	sweepAt        core.Time
+	suspGeneration uint64 // advanced under session and suspension locks
+	nestedLanes    int    // lanes that nested pipes hold on this session
+	// closeCode and closeMsg are the first Close's, which an Abort during
+	// its flush sends instead of its own (the first call decides).
+	closeCode ApplicationErrorCode
+	chInMax   int // capacity of the datagram receive queue
+	// doneOnce closes done: at the end the unlock publishes, or in a
+	// poisoned session's salvage.
+	doneOnce   sync.Once
+	unregister sync.Once
+	sessMu     sync.Mutex  // the session lock (lock, peek): guards s and the fields marked so
+	inSusp     atomic.Bool // membership in the listener suspension list
+	dialed     Endpoint    // who dialed the bootstrap carrier; 0: unknown
+	carrier    CarrierKind // kind of the bootstrap carrier
 	// The small flags sit together, so that they pack into one word.
-	fired            bool // the timeout ran: rearm no earlier than G
 	closing          bool // CLOSED: no new goroutines
 	aborted          bool // Abort was called
 	listenerAccepted bool // guarded by the listener stop cutoff until its final snapshot
@@ -145,24 +153,6 @@ type Conn struct {
 	// it, by the host timer's observed lateness, and the callback waits
 	// for the deadline itself.
 	timerPrecise bool
-	needRedial   bool        // a direction may have been lost (under the lock)
-	inSusp       atomic.Bool // membership in the listener suspension list
-	unregister   sync.Once
-
-	// ending is closed when the first Close or Abort has returned; nil
-	// before either. closeSig, while Close waits, is woken at every
-	// unlock.
-	ending   chan struct{}
-	closeSig *core.Signal
-	closeMsg string
-	// closeCode and closeMsg are the first Close's, which an Abort during
-	// its flush sends instead of its own (the first call decides).
-	closeCode ApplicationErrorCode
-
-	chIn    chIn // received channel datagrams for the session
-	chInMax int  // the hand-off's length: the datagram receive queue's
-
-	carrierTries []CandidateResult // DialChoice's tries, in order
 }
 
 // poisonState is how far a panic under the lock got the session.
@@ -234,6 +224,13 @@ func (c *Conn) unlockWith(r any) {
 		if c.s.SettlePending() {
 			c.settle()
 		}
+		// Logical close withdraws outstanding capacity changes. The
+		// protocol and the held opener can finish their I/O independently.
+		if len(c.changes) != 0 && c.s.State() >= core.StateClosing {
+			for len(c.changes) != 0 {
+				c.changes[0].cancelLocked()
+			}
+		}
 	}
 	var deliveries []func()
 	if c.handlers != nil && r == nil && !c.closing {
@@ -275,13 +272,8 @@ func (c *Conn) unlockWith(r any) {
 	startEvents := c.prepareEventsLocked()
 	hk := c.hk
 	hk.note(c.s.HasWindowProposal(), c.s.WantsPick())
-	redial := c.needRedial && !c.closing
-	c.needRedial = false
-	if r == nil {
-		c.s.ChargeBudget()
-	}
 	if !c.closing {
-		c.rearmLocked(c.writerIdleAt)
+		c.rearmLocked(c.writerIdle.Next())
 	} else {
 		if c.timer != nil {
 			c.timer.Stop()
@@ -292,6 +284,7 @@ func (c *Conn) unlockWith(r any) {
 			c.firstTimer = nil
 		}
 	}
+	handoffs := c.s.TakeHandoffEvents()
 	c.sessMu.Unlock()
 	released = true
 	for _, start := range starts {
@@ -314,6 +307,9 @@ func (c *Conn) unlockWith(r any) {
 		}
 	}
 	core.FireAll(ws)
+	for _, handoff := range handoffs {
+		handoff.Deliver()
+	}
 	clear(ws)
 	*wp = ws[:0]
 	sigPool.Put(wp)
@@ -324,9 +320,6 @@ func (c *Conn) unlockWith(r any) {
 	*pp = pend[:0]
 	pendPool.Put(pp)
 	hk.start()
-	if redial {
-		c.maybeRedial()
-	}
 	if r != nil {
 		// The session is closed; the panic is not propagated to the caller,
 		// which gets the session error.
@@ -339,6 +332,7 @@ func (c *Conn) unlockWith(r any) {
 // every attachment to abort: its core queued no carrier command for them.
 func (c *Conn) recordEndLocked() []*pipeDrv {
 	c.closing = true
+	c.s.NotifyCapacity()
 	if c.handlers != nil {
 		c.handlers.bidi.call = nil
 		c.handlers.uni.call = nil
@@ -349,7 +343,6 @@ func (c *Conn) recordEndLocked() []*pipeDrv {
 		c.err = &TransportError{ErrorCode: TransportInternalError, ErrorMessage: "internal error"}
 	}
 	c.hk.trace(traceItem{closed: true, err: c.err})
-	c.firePipeWaiters() // every wait on pipe changes sees the end (closing)
 	for _, pd := range c.pipes {
 		if o := pd.end.join; o != nil && !o.settled {
 			o.publishLocked(c.err)
@@ -474,7 +467,12 @@ func (c *Conn) releaseOrphans() {
 }
 
 func (c *Conn) rearmLocked(idleAt core.Time) {
-	t := min(c.s.NextTimeout(), idleAt)
+	c.coreTimerAt = c.s.NextTimeout()
+	c.rearmDriverLocked(idleAt)
+}
+
+func (c *Conn) rearmDriverLocked(idleAt core.Time) {
+	t := min(c.coreTimerAt, idleAt)
 	switch {
 	case c.handles == 0:
 		c.sweepAt = 0
@@ -483,14 +481,6 @@ func (c *Conn) rearmLocked(idleAt core.Time) {
 		fallthrough
 	default:
 		t = min(t, c.sweepAt)
-	}
-	if c.fired {
-		// A deadline the timeout just handled did not move: never fire
-		// again at once (a busy loop), but G later.
-		c.fired = false
-		if now := c.clk.now(); t <= now {
-			t = now.Add(core.Millisecond)
-		}
 	}
 	if t == c.timerAt {
 		return
@@ -584,32 +574,36 @@ func (c *Conn) onTimer() {
 		c.unlockPeek()
 		return
 	}
-	defer c.unlock()
+	driverOnly := false
+	defer func() {
+		if driverOnly {
+			c.unlockPeek()
+		} else {
+			c.unlockWith(recover())
+		}
+	}()
 	c.timerAt = -1
-	c.fired = true
-	if c.sweepAt != 0 && now >= c.sweepAt {
+	sweep := c.sweepAt != 0 && now >= c.sweepAt
+	if sweep {
 		c.sweepAt = 0 // the orphans are released in unlock; rearm moves it
 	}
-	if now >= c.writerIdleAt {
-		c.writerIdleAt = core.Never
-		for _, pd := range c.pipes {
-			c.writerIdleAt = min(c.writerIdleAt, pd.writer.expireLocked(now))
-			for _, lo := range pd.lanes {
-				c.writerIdleAt = min(c.writerIdleAt, lo.writer.expireLocked(now))
-			}
-		}
+	c.expireWritersLocked(now)
+	if !sweep && now < c.coreTimerAt {
+		// Expiring a parked writer changes only driver state. Reuse the
+		// core deadline, which every session mutation republishes under
+		// this lock, and leave protocol timer work to that deadline.
+		c.rearmDriverLocked(c.writerIdle.Next())
+		driverOnly = true
+		return
 	}
-	// A driver-only deadline must not trigger the core's timeout work:
-	// it can request another transmit poll even on an idle multipath lane.
-	if now >= c.s.NextTimeout() {
+	if now >= c.coreTimerAt {
 		c.s.HandleTimeout(now)
 	}
 }
 
 // Start establishes a session over any carrier with an explicit role. It
 // returns once the peer's transport parameters were processed, or at once
-// when the session may send early data (EarlyData.ZmuxPeer, or
-// EarlyData.Replayable with Remembered parameters); ConnectionState's
+// when the bootstrap returns before establishment; ConnectionState's
 // Established is false until the parameters arrive.
 //
 // The carrier belongs to zmux from the call on, whether Start succeeds or
@@ -619,7 +613,7 @@ func (c *Conn) onTimer() {
 // not inherit ctx.
 //
 // A session in the server or auto role started here has no Listener, so
-// it cannot take joins: MaxPipes above 1 or ResumeTimeout is
+// it cannot take joins: SteadyAttachments above one or ResumeTimeout is
 // ErrInvalidConfig (serve such sessions with a Listener).
 func Start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error) {
 	p = owned(p)
@@ -655,18 +649,14 @@ func start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := earlyCarrier(p, &cfg.EarlyData); ok && role == RoleClient {
-		if !cfg.EarlyData.Replayable {
-			// The carrier's early data can be replayed: the client
-			// consents with Replayable.
-			return nil, fmt.Errorf("%w: EarlyData.ZmuxPeer on a carrier with early data needs Replayable", ErrInvalidConfig)
-		}
-		cc.EarlyCarrier = true
+	if role == RoleClient {
+		_, cc.EarlyCarrier = earlyCarrier(p, &cfg.EarlyData)
 	}
-	if role != RoleClient && (cc.MaxPipes > 1 || cc.Resume > 0) {
-		return nil, fmt.Errorf("%w: a session without a Listener cannot take joins: MaxPipes above 1 or ResumeTimeout in the server or auto role", ErrInvalidConfig)
+
+	if role != RoleClient && (cc.SessionPolicy.Limits.SteadyAttachments > 1 || cc.Resume > 0) {
+		return nil, fmt.Errorf("%w: a session without a Listener cannot take joins: SteadyAttachments above one or ResumeTimeout in the server or auto role", ErrInvalidConfig)
 	}
-	return setupCore(ctx, p, cfg, cc, nil, nil, nil)
+	return setupCore(ctx, p, cfg, cc, nil, nil, nil, nil)
 }
 
 // startCore starts a session from a resolved core configuration; lst is
@@ -674,9 +664,9 @@ func start(ctx context.Context, p PipeIO, role Role, cfg *Config) (*Conn, error)
 // its bootstrap carrier. On an error it closes p, or, when the session
 // already owned p, returns the session too: it is ending and closes p
 // itself once its CONNECTION_CLOSE is out. The caller never closes p.
-func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted any, wait *attachment) (*Conn, error) {
+func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted, entry any, wait *attachment) (*Conn, error) {
 	p = owned(p)
-	c, err := setupCore(ctx, p, cfg, cc, lst, admitted, wait)
+	c, err := setupCore(ctx, p, cfg, cc, lst, admitted, entry, wait)
 	if err != nil {
 		p.own.CloseUnreleased()
 	}
@@ -685,7 +675,10 @@ func startCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 
 // setupCore is startCore without the close: a Conn returned with an error
 // owns the close of its carrier, which may still be in progress.
-func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted any, wait *attachment) (*Conn, error) {
+func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *Listener, admitted, entry any, wait *attachment) (*Conn, error) {
+	if !p.HandshakeWrites.Fits(cc.ShapeBudget.Profile, cc.ShapeLimits.Profile) {
+		return nil, fmt.Errorf("%w: Establish exceeds shaping profile", ErrInvalidConfig)
+	}
 	boot := bootExporters(p, lst == nil && cc.TransportRole == core.RoleInitiator)
 	var exp *lateExporter
 	mode, secure := secureFirstMode(p)
@@ -720,12 +713,26 @@ func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 	if exp != nil && len(exp.early) != 0 {
 		exp.setupEnded = make(chan struct{})
 	}
+	clk := newClock(cfg.ClockDomain)
+	cc.DatagramOptions = clk.datagramOptions(cfg.DatagramDefaults)
+	if _, err := cc.DatagramOptions.ResolveDeadline(clk.now()); err != nil {
+		return nil, apiErr(err)
+	}
+	cc.InitBudget()
+	flight, err := reserveReceiveFlight(cc.Budget, p.R)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { flight.release() }()
+	if err := cc.ReserveReceive(); err != nil {
+		return nil, err
+	}
 	//goland:noinspection GoResourceLeak // every error path below aborts c or hands it back to the caller, which owns its close
-	c := newConn(cfg, cc)
+	c := newConn(cfg, cc, clk)
 	c.exp, c.boot = exp, boot
 	c.bootIO = PipeIO{R: p.R, W: p.W, Carrier: p.Carrier, Protocol: p.Protocol}
 	c.lst, c.provisional = lst, lst != nil
-	c.admitted = admitted
+	c.admitted, c.bootstrapAdmission = admitted, entry
 	switch {
 	case lst != nil || cc.TransportRole == core.RoleResponder:
 		c.dialed = EndpointPeer
@@ -737,15 +744,18 @@ func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 		c.Abort(0, "carrier properties")
 		return nil, err
 	}
+	if !c.s.CanAcquireCarriers(attachment.pd.physical) {
+		c.Abort(0, "carrier capacity")
+		return nil, ErrCarrierCapacity
+	}
 	var earlyServer, earlyClient bool
 	if !safeLog(cfg.Logger, "early carrier", func() {
-		_, earlyServer = earlyIn(p, &c.cfg.EarlyData)
+		_, earlyServer = earlyIn(p)
 		_, earlyClient = earlyCarrier(p, &c.cfg.EarlyData)
 	}) {
 		c.Abort(0, "early carrier")
 		return nil, errRejected
 	}
-	primeCarrierSample(p.W)
 	registerLaneKey(c)
 	var setupErr error
 	var early bool
@@ -770,11 +780,11 @@ func setupCore(ctx context.Context, p PipeIO, cfg *Config, cc core.Config, lst *
 		if earlyClient {
 			c.verdictDone = make(chan struct{})
 		}
-		c.addBootstrap(attachment, wait)
+		c.addBootstrap(attachment, wait, &flight)
 		if cc.HoldFirstFlight {
 			c.firstTimer = c.clk.source().AfterFunc(cfg.handshakeTimeout(), func() { c.releaseFirst(true) })
 		}
-		early = cc.EarlyZmuxPeer || cc.EarlyRemembered != nil && cc.EarlyReplayable
+		early = cfg.ReturnBeforeEstablished || cc.HoldFirstFlight || cc.EarlyCarrier
 	})
 	if setupErr != nil {
 		closePipe(p)
@@ -966,24 +976,24 @@ func Client(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
 // Server starts a single-pipe server session on an accepted connection,
 // like tls.Server. For multipath, resume or pipe joins use a Listener
 // (Listener.Serve accepts sessions and joins on a net.Listener): Server
-// rejects Config.MaxPipes above 1 and ResumeTimeout with ErrInvalidConfig.
+// rejects SteadyAttachments above one and ResumeTimeout with ErrInvalidConfig.
 // zmux owns c from then on, whether Server succeeds or fails (as Start).
 func Server(ctx context.Context, c net.Conn, cfg *Config) (*Conn, error) {
 	return Start(ctx, NetPipe(c), RoleServer, cfg)
 }
 
-func newConn(cfg *Config, cc core.Config) *Conn {
-	c := &Conn{cfg: cfg, clk: newClock(cfg.clock()), pipes: make(map[uint64]*pipeDrv, 1), done: make(chan struct{}),
-		writerIdleAt: core.Never, timerAt: core.Never}
+func newConn(cfg *Config, cc core.Config, clk clock) *Conn {
+	c := &Conn{cfg: cfg, clk: clk, pipes: make(map[uint64]*pipeDrv, 1), done: make(chan struct{}),
+		coreTimerAt: core.Never, timerAt: core.Never}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
-	if cfg != nil && cfg.Redial != nil {
-		c.redial = new(redialer)
-	}
+	c.authorizeJoin = cfg.SessionPolicy.AuthorizeJoin
+	c.receiveScheduler = cfg.ReceiveScheduler
 	c.id = nextSessionID()
 	c.lctx = sessionLabels(c.id, cc.TransportRole)
 	c.s = core.New(cc, c.clk.now())
-	if cfg != nil && cfg.Shaper != nil {
-		c.s.SetShaper(c.coreFactory(cfg.Shaper))
+	if cfg.Shaping != nil {
+		c.handshakeShaper = cfg.Shaping.Handshake
+		c.s.ConfigureShaper(c.coreFactory(cfg.Shaping.Factory), cc.ShapeBudget)
 	}
 	c.chInMax = c.s.Config().DgramRecvQ
 	c.hk = newHooks(c, nil)
@@ -1332,12 +1342,38 @@ const QMuxVersion = "draft-02"
 
 // ConnectionState reports the negotiation results.
 type ConnectionState struct {
-	Role        Role
-	Established bool
+	// TLS is the state of the TLS (or QUIC) handshake this process ran for
+	// the bootstrap carrier (TerminatedTLS); nil where TLS ended outside
+	// the process or the carrier has none.
+	TLS *tls.ConnectionState
+	// PeerGoAway holds the watermarks of the GOAWAY frames received (the
+	// minimum per stream type) and the latest error code; nil while none
+	// was received. EventGoAwayReceived reports each one.
+	PeerGoAway *GoAway
+	// QMuxVersion is the QMux version in use (QMuxVersion, the only one).
+	QMuxVersion string
+	// ApplicationProtocol is the application protocol the bootstrap carrier
+	// negotiated: PipeIO.Protocol (a WebSocket subprotocol, for example),
+	// else, for a raw TLS or QUIC carrier, the ALPN of the handshake this
+	// process ran for it; empty when neither gives one.
+	ApplicationProtocol string
+	// MaxDatagramPayload is the largest session datagram payload the peer
+	// accepts now, 0 when it accepts none; Stream.MaxDatagramPayload gives
+	// the one of a stream.
+	MaxDatagramPayload int
+	// PathDatagramPayload is the largest payload currently fitting an
+	// eligible record or native path. EventDatagramPathChanged reports
+	// changes to these limits.
+	PathDatagramPayload int
+	// NativeDatagramPayload is the largest payload fitting a native channel.
+	NativeDatagramPayload   int
+	NativeDatagramAvailable bool
+	SupportsDatagrams       struct{ Local, Remote bool }
+	SupportsResetAt         struct{ Local, Remote bool }
+	Role                    Role
+	Established             bool
 	// Suspended: the session has no pipe and waits for one (resume).
 	Suspended          bool
-	SupportsDatagrams  struct{ Local, Remote bool }
-	SupportsResetAt    struct{ Local, Remote bool }
 	Multipath          bool
 	PipeAck            bool
 	Resume             bool
@@ -1348,33 +1384,6 @@ type ConnectionState struct {
 	// WeakestRecordMode is the mode of the session's weakest pipe.
 	WeakestRecordMode RecordMode
 	PeerIsZmux        bool
-	// QMuxVersion is the QMux version in use (QMuxVersion, the only one).
-	QMuxVersion string
-	// ApplicationProtocol is the application protocol the bootstrap carrier
-	// negotiated: PipeIO.Protocol (a WebSocket subprotocol, for example),
-	// else, for a raw TLS or QUIC carrier, the ALPN of the handshake this
-	// process ran for it; empty when neither gives one.
-	ApplicationProtocol string
-	// TLS is the state of the TLS (or QUIC) handshake this process ran for
-	// the bootstrap carrier (TerminatedTLS); nil where TLS ended outside
-	// the process or the carrier has none.
-	TLS *tls.ConnectionState
-	// PeerGoAway holds the watermarks of the GOAWAY frames received (the
-	// minimum per stream type) and the latest error code; nil while none
-	// was received. EventGoAwayReceived reports each one.
-	PeerGoAway *GoAway
-	// MaxDatagramPayload is the largest session datagram payload the peer
-	// accepts now, 0 when it accepts none; Stream.MaxDatagramPayload gives
-	// the one of a stream.
-	MaxDatagramPayload int
-	// PathDatagramPayload is the largest session datagram payload that
-	// leaves as one datagram of the carrier (a QUIC DATAGRAM, its size as
-	// the carrier last reported it, path MTU discovery included) instead
-	// of in a record; on a carrier without datagrams it is
-	// MaxDatagramPayload, since every datagram rides the records there.
-	// Stream.PathDatagramPayload gives the one of a stream;
-	// EventDatagramPathChanged reports changes.
-	PathDatagramPayload int
 }
 
 // GoAway are the watermarks of a received GOAWAY:
@@ -1493,7 +1502,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 		st.PeerIsZmux = p.IsZmux()
 	}
 	st.MaxDatagramPayload = c.s.MaxDatagramPayload(1)
-	st.PathDatagramPayload = c.s.PathDatagramPayload(1)
+	_, st.PathDatagramPayload, st.NativeDatagramPayload, st.NativeDatagramAvailable = c.s.DatagramPath(nil, 0)
 	if g, ok := c.s.PeerGoAway(); ok {
 		st.PeerGoAway = &GoAway{MaxBidi: g.MaxBidi, MaxUni: g.MaxUni, ErrorCode: ApplicationErrorCode(g.Code)}
 	}
@@ -1507,13 +1516,12 @@ func (c *Conn) ConnectionState() ConnectionState {
 // the fields marked gauge are current values. A duration or RTT that is
 // absent (before the first sample) is 0.
 type ConnectionStats struct {
-	// Carrier is the carrier kind a carrier mode chose (DialChoice), the
+	// Carrier is the selected bootstrap carrier kind, the
 	// latest after a switch; 0 for a session not dialed in a mode. The
 	// chosen candidate's Variant is its pipe's PipeStats.Variant.
 	Carrier CarrierKind
 	// CarrierCandidates are the tries of the mode's candidates in order,
 	// joins of preferred kinds included: the latest 64.
-	CarrierCandidates []CandidateResult
 
 	// BytesSent and BytesReceived count every byte of the records passed
 	// to and received from the carriers (framing, frames of every kind,
@@ -1545,6 +1553,10 @@ type ConnectionStats struct {
 	// or closed stream, the byte limit), DatagramsDroppedLimit those a
 	// datagram limiter dropped, either way.
 	DatagramsDroppedSend, DatagramsDroppedRecv, DatagramsDroppedLimit uint64
+	DatagramDuplicatesDropped, DatagramStaleDropped                   uint64
+	DatagramDeadlineDropped, DatagramNativeDropped                    uint64
+	DatagramCopiesSent, DatagramCopyBytes                             uint64
+	DatagramCopyBudgetDropped, DatagramCopyPathDropped                uint64
 
 	// LogLinesDropped counts the warnings not delivered to Config.Logger
 	// because the session's queue of 256 lines was full (the Logger blocked
@@ -1602,7 +1614,7 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 	defer c.unlock()
 	c.s.SetNow(c.clk.now()) // SuspendedTime is current
 	s, g := c.s.SessionStats(), c.s.Gauges()
-	return ConnectionStats{Carrier: c.carrier, CarrierCandidates: slices.Clone(c.carrierTries),
+	return ConnectionStats{Carrier: c.carrier,
 		BytesSent: s.BytesSent, BytesReceived: s.BytesReceived, RecordsSent: s.RecordsSent,
 		RecordsReceived: s.RecordsReceived, BytesWritten: s.AppBytesWritten, BytesRead: s.AppBytesRead,
 		DatagramBytesSent: s.DatagramBytesSent, DatagramBytesReceived: s.DatagramBytesReceived,
@@ -1611,6 +1623,10 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		DatagramsSent: s.DatagramsSent, DatagramsReceived: s.DatagramsReceived,
 		DatagramsSentChannel: s.DatagramsSentChannel, DatagramsReceivedChannel: s.DatagramsReceivedChannel,
 		DatagramsDroppedSend: s.DatagramsDroppedSend, DatagramsDroppedRecv: s.DatagramsDroppedRecv,
+		DatagramDuplicatesDropped: s.DatagramDuplicatesDropped, DatagramStaleDropped: s.DatagramStaleDropped,
+		DatagramDeadlineDropped: s.DatagramDeadlineDropped, DatagramNativeDropped: s.DatagramNativeDropped,
+		DatagramCopiesSent: s.DatagramCopiesSent, DatagramCopyBytes: s.DatagramCopyBytes,
+		DatagramCopyBudgetDropped: s.DatagramCopyBudgetDropped, DatagramCopyPathDropped: s.DatagramCopyPathDropped,
 		DatagramsDroppedLimit: s.DatagramsDroppedLimit, NoEffectBudget: c.s.BudgetTokens(),
 		SmoothedRTT: time.Duration(g.SmoothedRTT), MinRTT: time.Duration(g.MinRTT),
 		LatestRTT: time.Duration(g.LatestRTT), MeanDeviation: time.Duration(g.MeanDeviation),
@@ -1671,6 +1687,16 @@ func AdmittedAs[T any](a Admitted) (v T, ok bool) {
 	return v, ok
 }
 
+// BootstrapAdmissionAs returns the entry admission value of a session
+// delivered by a listener. An inner carrier credential can supply a separate
+// peer value, which AdmittedAs continues to return.
+func BootstrapAdmissionAs[T any](c *Conn) (v T, ok bool) {
+	if c != nil {
+		v, ok = c.bootstrapAdmission.(T)
+	}
+	return v, ok
+}
+
 // LocalAddr returns the local address of pipe 0 when its carrier has one.
 func (c *Conn) LocalAddr() net.Addr {
 	if nc := c.pipe0Conn(); nc != nil {
@@ -1706,75 +1732,139 @@ func (c *Conn) RemoteAddr() net.Addr {
 
 // SendDatagram queues a session datagram; it never blocks: a full queue
 // drops its oldest datagram. p is copied.
-func (c *Conn) SendDatagram(p []byte) error { return c.sendDatagram(nil, 0, p) }
+func (c *Conn) SendDatagram(p []byte) error { return c.SendDatagramWith(p, DatagramSendOptions{}) }
 
-// sendDatagram queues a session (st nil) or stream datagram through the
-// send limiter, which runs outside the lock.
-func (c *Conn) sendDatagram(st *core.Stream, cx uint64, p []byte) error {
-	_, err := c.sendDatagramLimited(st, cx, p)
+// SendDatagramWith queues a datagram with options for this hop.
+func (c *Conn) SendDatagramWith(p []byte, o DatagramSendOptions) error {
+	return c.sendDatagramWith(nil, 0, p, o)
+}
+
+// DatagramPath reports the current session datagram payload limits.
+func (c *Conn) DatagramPath() DatagramPath {
+	if c == nil {
+		return DatagramPath{}
+	}
+	c.lock()
+	defer c.unlock()
+	admission, path, native, available := c.s.DatagramPath(nil, 0)
+	return DatagramPath{MaxPayload: admission, PathPayload: path, NativePayload: native, Native: available}
+}
+
+func (c *Conn) sendDatagramWith(st *core.Stream, cx uint64, p []byte, opts DatagramSendOptions) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	if err := opts.validate(); err != nil {
+		return err
+	}
+	_, err := c.admitDatagram(context.Background(), core.DatagramRequest{
+		Stream: st, Context: cx, Payload: p, Options: c.clk.datagramOptions(opts), At: c.clk.now(),
+	})
 	return err
 }
 
-// sendDatagramLimited is sendDatagram that also reports a drop by the
-// send limiter (limited true, err nil).
-func (c *Conn) sendDatagramLimited(st *core.Stream, cx uint64, p []byte) (bool, error) {
-	l := c.cfg.DatagramLimiter.Send
-	lim := guardedLimiter{l} // concrete: no allocation per datagram
-	var granted int64
-	if l != nil {
-		// Asked before the lock is taken: a limiter is host code.
+// admitDatagram keeps the optional host limiter outside the owner lock.
+// A reservation is charged only when the owner queues a datagram.
+func (c *Conn) admitDatagram(ctx context.Context, req core.DatagramRequest) (core.DatagramAdmission, error) {
+	return c.admitDatagramBatch(ctx, req, nil, len(req.Payload), nil, false)
+}
+
+func (c *Conn) admitDatagramBatch(ctx context.Context, req core.DatagramRequest, members []core.DatagramGroupMember, total int, tally *SpliceHandoffs, requireWritable bool) (core.DatagramAdmission, error) {
+	lim := guardedLimiter{c.cfg.DatagramLimiter.Send}
+	var grant int64
+	if lim.l != nil && !req.Limited && req.Representation != core.CapsuleOnly {
 		var ok bool
-		if granted, ok = lim.police(len(p)); !ok {
-			c.locked(func() {
-				c.s.DeliverDatagram(core.PendingDatagram{}, true)
-			})
-			return true, nil
-		}
+		grant, ok = lim.police(total)
+		req.Limited = !ok
 	}
+	var result core.DatagramAdmission
 	var err error
 	c.locked(func() {
-		c.s.SetNow(c.clk.now()) // the datagram's queueing time (DatagramQueueDelay)
-		err = c.s.SendDatagram(st, cx, p)
+		if err = ctx.Err(); err != nil {
+			return
+		}
+		if requireWritable {
+			if err = c.s.WriteErrOf(req.Stream); err != nil {
+				return
+			}
+		}
+		c.s.SetNow(c.clk.now())
+		if len(members) == 0 {
+			result, err = c.s.AdmitDatagram(req)
+			if result == core.DatagramQueued {
+				grant = 0
+			}
+			return
+		}
+		result, err = c.s.AdmitDatagramGroup(req, members)
+		for _, m := range members {
+			if m.Queued {
+				grant -= int64(len(m.Payload))
+				if tally != nil {
+					tally.accept(len(m.Payload))
+				}
+			}
+		}
 	})
-	if err != nil && l != nil {
-		lim.Refund(granted) // not queued; refunded after the lock
+	if grant > 0 {
+		lim.Refund(grant)
 	}
-	return false, apiErr(err)
+	return result, apiErr(err)
 }
 
 // SendDatagramWait queues a session datagram, waiting for room in the send
 // queue instead of dropping its oldest entry.
 func (c *Conn) SendDatagramWait(ctx context.Context, p []byte) error {
-	return c.sendDatagramWait(ctx, nil, 0, p)
+	return c.SendDatagramWaitWith(ctx, p, DatagramSendOptions{})
+}
+
+// SendDatagramWaitWith waits for local queue room with the same options as
+// SendDatagramWith. A relative deadline starts at this hop's call.
+func (c *Conn) SendDatagramWaitWith(ctx context.Context, p []byte, opts DatagramSendOptions) error {
+	return c.sendDatagramWait(ctx, nil, 0, p, opts)
 }
 
 // sendDatagramWait waits for room in the send queue, then queues a session
 // (st nil) or stream datagram.
-func (c *Conn) sendDatagramWait(ctx context.Context, st *core.Stream, cx uint64, p []byte) error {
+func (c *Conn) sendDatagramWait(ctx context.Context, st *core.Stream, cx uint64, p []byte, opts DatagramSendOptions) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := opts.validate(); err != nil {
+		return err
+	}
 	sig := core.NewSignal()
-	defer func() {
-		c.locked(func() {
-			c.s.CancelDatagramSendWait(sig)
-		})
-	}()
+	var deadline core.Time
+	req := core.DatagramRequest{Stream: st, Context: cx, Payload: p, Options: c.clk.datagramOptions(opts),
+		At: c.clk.now(), Wait: sig, WaitDeadline: &deadline}
+	defer func() { c.locked(func() { c.s.CancelDatagramSendWait(sig) }) }()
 	for {
-		full := false
-		c.locked(func() {
-			if full = c.s.DatagramQueueFull() && c.s.Err() == nil; full {
-				sig.Drain()
-				c.s.CancelDatagramSendWait(sig)
-				c.s.WaitDatagramSend(sig)
-			}
-		})
-		if !full {
-			return c.sendDatagram(st, cx, p)
+		admission, err := c.admitDatagram(ctx, req)
+		if admission != core.DatagramWaiting {
+			return err
+		}
+		var timer timeshim.Timer
+		if deadline != core.Never {
+			timer = c.clk.afterFunc(c.clk.until(deadline), sig.Fire)
 		}
 		select {
 		case <-sig.C:
 		case <-ctx.Done():
-			return ctx.Err()
+		case <-c.done:
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
 		case <-c.done:
 			return c.closedErr()
+		default:
 		}
 	}
 }
@@ -1999,4 +2089,10 @@ func (c *Conn) accept(ctx context.Context, bidi bool) (*handle, error) {
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// closingNow reports whether the session stopped ordinary protocol work.
+func (c *Conn) closingNow() (closing bool) {
+	c.peek(func() { closing = c.closing || c.s.State() >= core.StateClosing })
+	return closing
 }

@@ -9,19 +9,13 @@ import (
 )
 
 // A listener that refuses a new session by policy, while draining or with
-// its backlog full, sends CONNECTION_REFUSED after its own parameters
-// as under memory pressure. TCP, not net.Pipe:
-// the refusal must reach a client still writing its first records.
+// its backlog full, sends CONNECTION_REFUSED after its own parameters.
+// The refusal must reach a client still writing its first records.
 func TestListenerRefusesWithConnectionRefused(t *testing.T) {
 	for _, tc := range []struct {
 		setup func(*Listener) func()
 		name  string
 	}{
-		{name: "memory", setup: func(l *Listener) func() {
-			limit := int64(l.budget.Limit())
-			l.Adapter().ChargeMemory(limit)
-			return func() { l.Adapter().ChargeMemory(-limit) }
-		}},
 		{name: "draining", setup: func(l *Listener) func() {
 			l.Drain("draining")
 			return func() {}
@@ -142,7 +136,7 @@ func TestDrainPolicyAtClassification(t *testing.T) {
 		}
 		err := <-peer
 		if refuse {
-			var se *SessionError
+			var se *TransportError
 			if !errors.Is(err, ErrConnectionRefused) || !errors.As(err, &se) || se.ErrorMessage != msg {
 				t.Fatalf("refusal %v", err)
 			}

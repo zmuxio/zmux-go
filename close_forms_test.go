@@ -15,6 +15,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/djylb/netx/memnet"
 	"github.com/djylb/timeshim"
 )
 
@@ -28,13 +29,13 @@ func closeFormsPair(t *testing.T, a, b net.Conn) (client, server *Conn) {
 	defer cancel()
 	ch := make(chan *Conn, 1)
 	go func() {
-		s, err := Server(ctx, b, &Config{Clock: timeshim.Real, InitialStreamReceiveWindow: 64 << 10, MaxStreamReceiveWindow: 64 << 10})
+		s, err := Server(ctx, b, &Config{ClockDomain: NewClockDomain(timeshim.Real), InitialStreamReceiveWindow: 64 << 10, MaxStreamReceiveWindow: 64 << 10})
 		if err != nil {
 			s = nil
 		}
 		ch <- s
 	}()
-	client, err := Client(ctx, a, &Config{Clock: timeshim.Real})
+	client, err := Client(ctx, a, &Config{ClockDomain: NewClockDomain(timeshim.Real)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,14 +77,23 @@ func TestCloseForms(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			a, b := net.Pipe()
 			client, server := closeFormsPair(t, a, b)
+			closed := make(chan struct{})
 			go func() {
-				time.Sleep(100 * time.Millisecond)
-				client.Abort(5, "abort")
+				defer close(closed)
+				_ = client.CloseWithError(0x2a, "bye")
 			}()
-			t0 := time.Now()
-			_ = client.CloseWithError(0x2a, "bye")
-			if d := time.Since(t0); d != 100*time.Millisecond {
-				t.Fatalf("the close returned after %v, not at the abort", d)
+			synctest.Wait()
+			select {
+			case <-closed:
+				t.Fatal("the close returned with data still waiting for credit")
+			default:
+			}
+			client.Abort(5, "abort")
+			synctest.Wait()
+			select {
+			case <-closed:
+			default:
+				t.Fatal("the abort did not release the close")
 			}
 			wantAppClose(t, "the peer", server.Wait(), 0x2a, "bye", true)
 			wantAppClose(t, "the closer", client.Wait(), 0x2a, "bye", false)
@@ -130,22 +140,7 @@ func TestDone(t *testing.T) {
 		defer cancel()
 		a, b := net.Pipe()
 		sr := &holdReads{Conn: b, closed: make(chan struct{})}
-		ch := make(chan *Conn, 1)
-		go func() {
-			s, err := Server(ctx, sr, &Config{Clock: timeshim.Real})
-			if err != nil {
-				s = nil
-			}
-			ch <- s
-		}()
-		client, err := Client(ctx, a, &Config{Clock: timeshim.Real})
-		if err != nil {
-			t.Fatal(err)
-		}
-		server := <-ch
-		if server == nil {
-			t.Fatal("no server session")
-		}
+		client, server := bubblePairOn(t, a, sr, closeTestConfig)
 		if _, err := client.Ping(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -160,10 +155,11 @@ func TestDone(t *testing.T) {
 		}
 		sr.stall.Store(true) // the peer reads nothing more
 		_ = client.CloseWithError(0x2a, "bye")
+		synctest.Wait()
 		select {
 		case <-done:
 			t.Fatal("Done closed though the peer has not read the close")
-		case <-time.After(50 * time.Millisecond):
+		default:
 		}
 		if err := context.Cause(server.Context()); err != nil {
 			t.Fatalf("the peer's session changed: %v", err)
@@ -208,27 +204,50 @@ func (h *holdReads) Close() error {
 	return h.Conn.Close()
 }
 
-// closeDelivery runs N16 on a session pair: the client writes 1 MiB on a
-// stream (with FIN) and a few bytes on a second it leaves open, closes
-// with code and reason and waits for the whole end within 5 s. The peer
-// reads the whole 1 MiB in order and ends with the code; the close
-// returned within 1 s; the wait ended before the shortest linger timeout,
-// so the peer read the close; the open stream failed with the session's
-// error. With readDelay the peer starts reading only after the close
-// arrived, and still gets everything within the linger timeout.
-func closeDelivery(t *testing.T, client, server *Conn, code ApplicationErrorCode, reason string, readDelay time.Duration) {
+// closeReceived signals when the server acts on the peer's close and
+// preserves half-close for both TCP and TLS.
+type closeReceived struct {
+	net.Conn
+	received chan struct{}
+	once     sync.Once
+}
+
+func (c *closeReceived) CloseWrite() error {
+	return c.Conn.(interface{ CloseWrite() error }).CloseWrite()
+}
+
+func (c *closeReceived) TLSRecords() bool { return tlsRecords(c.Conn) }
+
+func (c *closeReceived) RecordCloseCode(ApplicationErrorCode, string) {
+	c.once.Do(func() { close(c.received) })
+}
+
+// closeDelivery runs N16 on a session pair. The peer reads 1 MiB with FIN
+// and ends with the close code. The open stream fails with the session's
+// error. If readAfterClose is set, the peer takes the data from the read
+// drain after receiving CONNECTION_CLOSE.
+func closeDelivery(t *testing.T, client, server *Conn, code ApplicationErrorCode, reason string, readAfterClose <-chan struct{}) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	msg := make([]byte, 1<<20)
 	for i := range msg {
 		msg[i] = byte(i * 7)
 	}
 	read := make(chan error, 1)
+	accepted := make(chan struct{})
 	go func() {
 		in, err := server.AcceptStream(ctx)
+		close(accepted)
 		if err == nil {
-			time.Sleep(readDelay) // a slow reader: the close arrives first
+			if readAfterClose != nil {
+				select {
+				case <-readAfterClose:
+				case <-ctx.Done():
+					read <- ctx.Err()
+					return
+				}
+			}
 			var got []byte
 			got, err = io.ReadAll(in)
 			if err != nil {
@@ -257,23 +276,18 @@ func closeDelivery(t *testing.T, client, server *Conn, code ApplicationErrorCode
 	if _, err := open.Write([]byte("left open")); err != nil {
 		t.Fatal(err)
 	}
-	t0 := time.Now()
+	waitTestSignal(t, accepted, "server stream acceptance")
 	_ = client.CloseWithError(code, reason)
-	if d := time.Since(t0); d > closeLimit {
-		t.Fatalf("the close took %v", d)
-	}
-	t1 := time.Now()
 	select {
-	case <-client.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("the close was neither delivered nor given up within 5 s")
+	case err := <-read:
+		if err != nil {
+			t.Fatalf("the peer's read: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("waiting for the peer's read: %v", ctx.Err())
 	}
-	if d := time.Since(t1); d >= 250*time.Millisecond {
-		t.Fatalf("the wait took %v: the linger timeout, not the peer's end", d)
-	}
-	if err := <-read; err != nil {
-		t.Fatalf("the peer's read: %v", err)
-	}
+	waitTestSignal(t, client.Done(), "client session end")
+	waitTestSignal(t, server.Done(), "server session end")
 	wantAppClose(t, "the peer", server.Wait(), code, reason, true)
 	wantAppClose(t, "the closer", client.Wait(), code, reason, false)
 	if _, err := open.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
@@ -283,28 +297,49 @@ func closeDelivery(t *testing.T, client, server *Conn, code ApplicationErrorCode
 	}
 }
 
-// TestCloseDeliveryByteStream (N16) over TCP and TLS, with a coded close
-// and with the plain one.
+// TestCloseDeliveryByteStream (N16) over a half-closeable byte stream,
+// with and without TLS and a close code.
 func TestCloseDeliveryByteStream(t *testing.T) {
-	srvTLS, cliTLS := selfSignedTLS(t)
-	for name, wrap := range map[string]func(a, b net.Conn) (net.Conn, net.Conn){
-		"tcp": func(a, b net.Conn) (net.Conn, net.Conn) { return a, b },
-		"tls": func(a, b net.Conn) (net.Conn, net.Conn) { return tls.Client(a, cliTLS), tls.Server(b, srvTLS) },
-	} {
+	// The slow reader must be able to buffer the entire stream before
+	// reading it. The connection also needs credit for the second stream.
+	window := &Config{
+		InitialStreamReceiveWindow:     1 << 20,
+		MaxStreamReceiveWindow:         1 << 20,
+		InitialConnectionReceiveWindow: 2 << 20,
+		MaxConnectionReceiveWindow:     2 << 20,
+	}
+	for _, name := range []string{"plain", "tls"} {
 		for _, c := range []struct {
 			reason string
 			code   ApplicationErrorCode
 		}{{code: 0x2a, reason: "bye"}, {code: 0, reason: ""}} {
-			t.Run(fmt.Sprintf("%s/%#x", name, uint64(c.code)), func(t *testing.T) {
-				a, b := wrap(tcpPair(t))
-				client, server := pair(t, a, b, nil, nil)
-				closeDelivery(t, client, server, c.code, c.reason, 0)
-			})
-			t.Run(fmt.Sprintf("%s/%#x/slow-reader", name, uint64(c.code)), func(t *testing.T) {
-				a, b := wrap(tcpPair(t))
-				client, server := pair(t, a, b, nil, nil)
-				closeDelivery(t, client, server, c.code, c.reason, 100*time.Millisecond)
-			})
+			for _, slow := range []bool{false, true} {
+				testName := fmt.Sprintf("%s/%#x", name, uint64(c.code))
+				if slow {
+					testName += "/slow-reader"
+				}
+				t.Run(testName, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						a, b := memnet.Pipe()
+						if name == "tls" {
+							srvTLS, cliTLS := selfSignedTLS(t)
+							a, b = tls.Client(a, cliTLS), tls.Server(b, srvTLS)
+						}
+						var received <-chan struct{}
+						if slow {
+							peer := &closeReceived{Conn: b, received: make(chan struct{})}
+							b, received = peer, peer.received
+						}
+						// The virtual clock also refills the carrier's pacing
+						// budget while Close waits for the finished stream.
+						domain := NewClockDomain(timeshim.Real)
+						scfg := window.Clone()
+						scfg.ClockDomain = domain
+						client, server := pair(t, a, b, &Config{ClockDomain: domain}, scfg)
+						closeDelivery(t, client, server, c.code, c.reason, received)
+					})
+				})
+			}
 		}
 	}
 }

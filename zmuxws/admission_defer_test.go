@@ -3,6 +3,7 @@ package zmuxws
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/djylb/netx/wsconn"
+	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
@@ -35,6 +37,7 @@ type deferEnv struct {
 	taken    chan taken
 	perSrc   map[netip.Prefix]int
 	firstMsg chan []byte
+	finished chan struct{}
 	u        string
 	mu       sync.Mutex
 	heads    atomic.Int32
@@ -42,9 +45,14 @@ type deferEnv struct {
 	badInfo  atomic.Int32
 }
 
-func newDeferEnv(t *testing.T, limit, perSource int, adm *zmux.Admission, fallback func(context.Context, *zmux.Takeover)) *deferEnv {
+func newDeferEnv(t *testing.T, limit, maxPending int, adm *zmux.Admission, fallback func(context.Context, *zmux.Takeover)) *deferEnv {
 	t.Helper()
-	e := &deferEnv{perSrc: map[netip.Prefix]int{}, taken: make(chan taken, 1), firstMsg: make(chan []byte, 4)}
+	return newDeferEnvOn(t, mpConfig(), limit, maxPending, adm, fallback)
+}
+
+func newDeferEnvOn(t *testing.T, cfg *zmux.Config, limit, maxPending int, adm *zmux.Admission, fallback func(context.Context, *zmux.Takeover)) *deferEnv {
+	t.Helper()
+	e := &deferEnv{perSrc: map[netip.Prefix]int{}, taken: make(chan taken, 1), firstMsg: make(chan []byte, 4), finished: make(chan struct{}, 1)}
 	if adm == nil {
 		adm = &zmux.Admission{}
 	}
@@ -89,14 +97,26 @@ func newDeferEnv(t *testing.T, limit, perSource int, adm *zmux.Admission, fallba
 				if err != nil {
 					break
 				}
-				got.msgs = append(got.msgs, m)
+				got.msgs = append(got.msgs, m.TakeBytes())
 			}
 			_ = p.W.(zmux.MessageWriter).WriteMessage([]byte("reply"))
 			e.taken <- got
 		}
 	}
-	e.l = mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm, Fallback: fallback, MaxPendingPerSource: perSource})
-	e.u = server(t, e.l, &zmuxhttp.Options{Next: next})
+	e.l = mustNewListener(&zmux.ListenerConfig{Config: cfg, Admission: adm, Fallback: fallback, MaxPending: maxPending})
+	h, err := NewHandler(e.l, &zmuxhttp.Options{Next: next})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.u = wsTestServer(t, e.l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			select {
+			case e.finished <- struct{}{}:
+			default:
+			}
+		}()
+		h.ServeHTTP(w, r)
+	}))
 	return e
 }
 
@@ -127,7 +147,7 @@ func readEnd(p zmux.PipeIO, d time.Duration) bool {
 // it, and the fallback's replies reach the peer.
 func TestAdmissionDeferredUpgrade(t *testing.T) {
 	ctx := testContext(t)
-	// One slot per source: each carrier must give it back for the next.
+	// One pending slot in total: each carrier must give it back for the next.
 	e := newDeferEnv(t, 1, 1, nil, nil)
 
 	// Back to zmux.
@@ -172,8 +192,10 @@ func TestAdmissionDeferredUpgrade(t *testing.T) {
 			t.Fatalf("message %d: %d bytes", i, len(tk.msgs[i]))
 		}
 	}
-	if got, err := cli.R.(zmux.MessageReader).ReadMessage(64); err != nil || string(got) != "reply" {
-		t.Fatalf("reply %q, %v", got, err)
+	got, err := cli.R.(zmux.MessageReader).ReadMessage(64)
+	defer got.Release()
+	if err != nil || string(got.Bytes()) != "reply" {
+		t.Fatalf("reply %q, %v", got.Bytes(), err)
 	}
 	// zmux closed the carrier when the takeover returned.
 	if !readEnd(cli, 5*time.Second) {
@@ -186,7 +208,7 @@ func TestAdmissionDeferredUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() { _, _ = zmux.Start(ctx, p, zmux.RoleClient, mpConfig()) }()
-	waitStats(t, e.l, func(st zmux.AdmissionStats) bool { return st.Closed == 1 })
+	waitStats(t, ctx, e, func(st zmux.AdmissionStats) bool { return st.Closed == 1 })
 
 	st := e.l.Stats().Admission
 	if st.Accepted != 1 || st.Fallback != 1 || st.Closed != 1 || st.PeekTimedOut != 0 || e.heads.Load() != 3 ||
@@ -198,14 +220,15 @@ func TestAdmissionDeferredUpgrade(t *testing.T) {
 	}
 }
 
-// waitStats waits until the admission stats of l satisfy ok.
-func waitStats(t *testing.T, l *zmux.Listener, ok func(zmux.AdmissionStats) bool) {
+// waitStats observes the stats once a request finishes.
+func waitStats(t *testing.T, ctx context.Context, e *deferEnv, ok func(zmux.AdmissionStats) bool) {
 	t.Helper()
-	for end := time.Now().Add(10 * time.Second); !ok(l.Stats().Admission); {
-		if time.Now().After(end) {
-			t.Fatalf("stats %+v", l.Stats().Admission)
+	for !ok(e.l.Stats().Admission) {
+		select {
+		case <-e.finished:
+		case <-ctx.Done():
+			t.Fatalf("stats %+v: %v", e.l.Stats().Admission, ctx.Err())
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -236,11 +259,20 @@ func TestAdmissionDeferredUpgradeEdges(t *testing.T) {
 		if !readEnd(p, within) {
 			t.Fatal("the carrier did not end")
 		}
-		waitStats(t, e.l, func(st zmux.AdmissionStats) bool { return st == want })
+		waitStats(t, ctx, e, func(st zmux.AdmissionStats) bool { return st == want })
 	}
 	t.Run("timeout", func(t *testing.T) {
-		e := newDeferEnv(t, 9, 0, &zmux.Admission{PeekTimeout: 200 * time.Millisecond}, nil)
-		check(t, e, silent(t, e), 5*time.Second, zmux.AdmissionStats{PeekTimedOut: 1})
+		const peek = time.Second
+		cfg := mpConfig()
+		clk := timeshim.NewFake(time.Now())
+		cfg.ClockDomain = zmux.NewClockDomain(clk)
+		e := newDeferEnvOn(t, cfg, 9, 0, &zmux.Admission{PeekTimeout: peek}, nil)
+		p := silent(t, e)
+		if err := clk.WaitDeadline(ctx, clk.Now().Add(peek)); err != nil {
+			t.Fatal(err)
+		}
+		clk.Advance(peek)
+		check(t, e, p, 5*time.Second, zmux.AdmissionStats{PeekTimedOut: 1})
 	})
 	t.Run("too large", func(t *testing.T) {
 		e := newDeferEnv(t, 9, 0, &zmux.Admission{MaxMessage: 16}, nil)
@@ -265,18 +297,23 @@ func TestAdmissionDeferredUpgradeEdges(t *testing.T) {
 		check(t, e, send(t, e, takeMark), 5*time.Second, zmux.AdmissionStats{Fallback: 1})
 	})
 	t.Run("stall", func(t *testing.T) {
-		e := newDeferEnv(t, 9, 0, &zmux.Admission{StallMin: 200 * time.Millisecond, StallMax: 300 * time.Millisecond,
+		const hold = time.Second
+		cfg := mpConfig()
+		clk := timeshim.NewFake(time.Now())
+		cfg.ClockDomain = zmux.NewClockDomain(clk)
+		e := newDeferEnvOn(t, cfg, 9, 0, &zmux.Admission{StallMin: hold, StallMax: hold,
 			Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
 				if info.Stage == zmux.StageHead {
 					return zmux.Decision{Verdict: zmux.VerdictDefer}
 				}
 				return zmux.Decision{Verdict: zmux.VerdictStall}
 			}}, nil)
-		start := time.Now()
-		check(t, e, send(t, e, []byte("x")), 5*time.Second, zmux.AdmissionStats{Stalled: 1})
-		if d := time.Since(start); d < 200*time.Millisecond {
-			t.Fatalf("stall ended after %v", d)
+		p := send(t, e, []byte("x"))
+		if err := clk.WaitDeadline(ctx, clk.Now().Add(hold)); err != nil {
+			t.Fatal(err)
 		}
+		clk.Advance(hold)
+		check(t, e, p, 5*time.Second, zmux.AdmissionStats{Stalled: 1})
 	})
 	t.Run("text first message", func(t *testing.T) {
 		e := newDeferEnv(t, 9, 0, nil, nil)
@@ -302,14 +339,10 @@ func TestAdmissionDeferredUpgradeEdges(t *testing.T) {
 		e := newDeferEnv(t, 9, 0, &zmux.Admission{PeekTimeout: time.Minute}, nil)
 		p := silent(t, e)
 		_ = e.l.Close()
-		start := time.Now()
 		if !readEnd(p, 5*time.Second) {
 			t.Fatal("Close left the carrier waiting for its first message")
 		}
-		if d := time.Since(start); d > 2*time.Second {
-			t.Fatalf("ended after %v", d)
-		}
-		waitStats(t, e.l, func(st zmux.AdmissionStats) bool { return st == zmux.AdmissionStats{Closed: 1} })
+		waitStats(t, ctx, e, func(st zmux.AdmissionStats) bool { return st == zmux.AdmissionStats{Closed: 1} })
 	})
 }
 
@@ -327,7 +360,8 @@ func TestHeadTakeoverUpgradesBeforeHandoff(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if err = tk.Pipe().W.(zmux.MessageWriter).WriteMessage(m); err != nil {
+		defer m.Release()
+		if err = tk.Pipe().W.(zmux.MessageWriter).WriteMessage(m.Bytes()); err != nil {
 			t.Error(err)
 		}
 	})
@@ -340,8 +374,9 @@ func TestHeadTakeoverUpgradesBeforeHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	reply, err := p.R.(zmux.MessageReader).ReadMessage(64)
-	if err != nil || !bytes.Equal(reply, takeMark) {
-		t.Fatalf("reply %q %v", reply, err)
+	defer reply.Release()
+	if err != nil || !bytes.Equal(reply.Bytes(), takeMark) {
+		t.Fatalf("reply %q %v", reply.Bytes(), err)
 	}
 	if e.l.Stats().Admission.Takeover != 1 {
 		t.Fatal(e.l.Stats())

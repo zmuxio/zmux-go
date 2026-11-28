@@ -10,7 +10,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
 )
@@ -28,11 +27,10 @@ func TestPoolCloseCode(t *testing.T) {
 	defer func() { _ = pc.Close() }()
 	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
 		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
-	webtransport.ConfigureHTTP3Server(h3)
-	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
+	ws := &Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	sessions := make(chan *webtransport.Session, 1)
+	sessions := make(chan *Session, 1)
 	h3.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sess, err := ws.Upgrade(w, r)
 		if err != nil {
@@ -43,7 +41,8 @@ func TestPoolCloseCode(t *testing.T) {
 	})
 	go func() { _ = ws.Serve(pc) }()
 	defer func() { _ = ws.Close() }()
-	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
+	tr := &Transport{TLSClientConfig: cliTLS}
+	defer func() { _ = tr.Close() }()
 	pool := NewConnPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, nil, carrier.PoolLimits{MaxPipesPerConnectionLifetime: 1})
 	defer pool.Shutdown()
 	p, err := pool.OpenPipe(ctx)
@@ -70,11 +69,8 @@ func TestPoolCloseCode(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("the pooled WebTransport session was not closed")
 	}
-	// webtransport-go may end the server's side on its CONNECT stream
-	// before it reads the close capsule; a session close it did read
-	// carries the code.
-	var se *webtransport.SessionError
-	if err := closeError(srvSess); errors.As(err, &se) && (!se.Remote || se.ErrorCode != 0x2a || se.Message != "bye") {
+	var se *SessionError
+	if err := context.Cause(srvSess.Context()); !errors.As(err, &se) || !se.Remote || se.ErrorCode != 0x2a || se.Message != "bye" {
 		t.Fatalf("the WebTransport session ended with %#v", err)
 	}
 	_ = c.Wait()
@@ -84,7 +80,7 @@ func TestSessionCloseCode(t *testing.T) {
 	for _, c := range []struct {
 		err  error
 		msg  string
-		code webtransport.SessionErrorCode
+		code SessionErrorCode
 	}{
 		{err: &zmux.ApplicationError{ErrorCode: 0x2a, ErrorMessage: "bye"}, code: 0x2a, msg: "bye"},
 		{err: &zmux.ApplicationError{ErrorCode: 1 << 40, ErrorMessage: "big"}, code: 0, msg: ""},
@@ -93,67 +89,6 @@ func TestSessionCloseCode(t *testing.T) {
 	} {
 		if code, msg := SessionCloseCode(c.err); code != c.code || msg != c.msg {
 			t.Fatalf("%v: %#x %q", c.err, code, msg)
-		}
-	}
-}
-
-// closeError on a session that is still open does not take a stream from
-// it without ending it: a unidirectional stream it takes is reset.
-func TestCloseErrorResetsTakenStream(t *testing.T) {
-	srvTLS, cliTLS := tlsConfigs(t)
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = pc.Close() }()
-	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
-		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
-	webtransport.ConfigureHTTP3Server(h3)
-	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	reset := make(chan error, 1)
-	h3.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sess, err := ws.Upgrade(w, r)
-		if err != nil {
-			reset <- err
-			return
-		}
-		defer func() { _ = sess.CloseWithError(0, "") }()
-		s, err := sess.OpenUniStreamSync(ctx)
-		if err != nil {
-			reset <- err
-			return
-		}
-		for {
-			if _, err := s.Write([]byte("x")); err != nil {
-				reset <- err
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	})
-	go func() { _ = ws.Serve(pc) }()
-	defer func() { _ = ws.Close() }()
-	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
-	sess, err := DialSession(ctx, tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = sess.CloseWithError(0, "") }()
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		_ = closeError(sess)
-		select {
-		case err := <-reset:
-			if _, ok := errors.AsType[*webtransport.StreamError](err); !ok {
-				t.Fatalf("the sender ended with %v, not a reset", err)
-			}
-			return
-		case <-tick.C:
-		case <-ctx.Done():
-			t.Fatal("the taken stream was not reset")
 		}
 	}
 }

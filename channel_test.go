@@ -7,12 +7,14 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go/internal/carrierio"
-	"github.com/zmuxio/zmux-go/internal/testscale"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/shaping"
 )
@@ -25,15 +27,18 @@ type chanConn struct {
 	peer  *chanConn
 	demux carrierio.ChannelDemux
 	id    uint64
+	limit int
 	max   atomic.Int64
 	sent  atomic.Int64
 	drop  atomic.Bool // lose every channel datagram
 }
 
 func (c *chanConn) ChannelStreamID() (uint64, bool) { return c.id, true }
-func (c *chanConn) MaxChannelDatagram() int         { return int(c.max.Load()) }
+func (c *chanConn) ChannelDatagramCapacity() (limit, room int) {
+	return c.limit, int(c.max.Load())
+}
 func (c *chanConn) SendChannelDatagram(b []byte) error {
-	if len(b) > c.MaxChannelDatagram() {
+	if len(b) > int(c.max.Load()) {
 		return errors.New("too large")
 	}
 	c.sent.Add(1)
@@ -49,9 +54,13 @@ func (c *chanConn) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 // chanPair returns two connected chanConns of channel size 1200.
 func chanPair(t *testing.T) (*chanConn, *chanConn) {
 	t.Helper()
-	const maxSize = 1200
 	a, b := tcpPair(t)
-	ca, cb := &chanConn{Conn: a, id: 4}, &chanConn{Conn: b, id: 4}
+	return newChanPair(a, b)
+}
+
+func newChanPair(a, b net.Conn) (*chanConn, *chanConn) {
+	const maxSize = 1200
+	ca, cb := &chanConn{Conn: a, id: 4, limit: maxSize}, &chanConn{Conn: b, id: 4, limit: maxSize}
 	ca.peer, cb.peer = cb, ca
 	ca.max.Store(int64(maxSize))
 	cb.max.Store(int64(maxSize))
@@ -86,84 +95,90 @@ func exchangeDatagrams(t *testing.T, c, s *Conn, n, size int) int {
 	return got
 }
 
-// sentStats waits until c has counted sent datagrams in all and returns
-// its statistics. The driver counts a channel datagram once the carrier
-// took it, outside the session's lock and so possibly after the peer
-// already received it; a datagram the peer received is counted on its
-// sender eventually, not before the peer sees it.
-func sentStats(t *testing.T, c *Conn, sent uint64) ConnectionStats {
-	t.Helper()
-	for {
-		cs := c.ConnectionStats()
-		if cs.DatagramsSent >= sent {
-			return cs
-		}
-		select {
-		case <-t.Context().Done():
-			t.Fatalf("sent datagrams not counted: %+v", cs)
-		case <-time.After(time.Millisecond):
-		}
-	}
-}
-
 func TestChannelDatagrams(t *testing.T) {
-	a, b := chanPair(t)
-	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-	if got := exchangeDatagrams(t, c, s, 50, 100); got != 50 {
-		t.Fatalf("%d of 50 datagrams", got)
-	}
-	cs, ss := sentStats(t, c, 50), s.ConnectionStats()
-	if cs.DatagramsSentChannel != 50 || cs.DatagramsSent != 50 || ss.DatagramsReceivedChannel != 50 || ss.DatagramsReceived != 50 {
-		t.Fatalf("client %+v\nserver %+v", cs, ss)
-	}
-	if a.sent.Load() != 50 {
-		t.Fatalf("%d channel datagrams sent", a.sent.Load())
-	}
-	// Both directions.
-	if got := exchangeDatagrams(t, s, c, 10, 1000); got != 10 || sentStats(t, s, 10).DatagramsSentChannel != 10 {
-		t.Fatalf("server to client: %d", got)
-	}
-	// Above the channel's maximum: in records.
-	if got := exchangeDatagrams(t, c, s, 5, 1500); got != 5 {
-		t.Fatalf("%d of 5 large datagrams", got)
-	}
-	if cs := sentStats(t, c, 55); cs.DatagramsSentChannel != 50 || cs.DatagramsSent != 55 {
-		t.Fatalf("large datagrams: %+v", cs)
-	}
-	// Stream datagrams use the channel too.
-	st, err := c.OpenStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.Write([]byte("open")); err != nil {
-		t.Fatal(err)
-	}
-	in, err := s.AcceptStream(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.SendDatagram(7, []byte("flow")); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-	cx, p, err := in.ReceiveDatagram(ctx)
-	if err != nil || cx != 7 || string(p) != "flow" {
-		t.Fatalf("stream datagram %d %q %v", cx, p, err)
-	}
-	if cs := sentStats(t, c, 56); cs.DatagramsSentChannel != 51 || cs.DatagramsSent != 56 {
-		t.Fatalf("stream datagram not on the channel: %+v", cs)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		ca, cb := newChanPair(a, b)
+		cfg := dgramCfg()
+		cfg.ClockDomain = NewClockDomain(timeshim.Real)
+		c, s := pair(t, ca, cb, cfg, cfg)
+		if got := exchangeDatagrams(t, c, s, 50, 100); got != 50 {
+			t.Fatalf("%d of 50 datagrams", got)
+		}
+		synctest.Wait()
+		cs, ss := c.ConnectionStats(), s.ConnectionStats()
+		if cs.DatagramsSentChannel != 50 || cs.DatagramsSent != 50 || ss.DatagramsReceivedChannel != 50 || ss.DatagramsReceived != 50 {
+			t.Fatalf("client %+v\nserver %+v", cs, ss)
+		}
+		if ca.sent.Load() != 50 {
+			t.Fatalf("%d channel datagrams sent", ca.sent.Load())
+		}
+		// Both directions.
+		if got := exchangeDatagrams(t, s, c, 10, 1000); got != 10 {
+			t.Fatalf("server to client: %d", got)
+		}
+		synctest.Wait()
+		if n := s.ConnectionStats().DatagramsSentChannel; n != 10 {
+			t.Fatalf("server sent %d native datagrams, want 10", n)
+		}
+		// Above the channel's maximum: in records.
+		if got := exchangeDatagrams(t, c, s, 5, 1500); got != 5 {
+			t.Fatalf("%d of 5 large datagrams", got)
+		}
+		synctest.Wait()
+		if cs := c.ConnectionStats(); cs.DatagramsSentChannel != 50 || cs.DatagramsSent != 55 {
+			t.Fatalf("large datagrams: %+v", cs)
+		}
+		// Stream datagrams use the channel too.
+		st, err := c.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Write([]byte("open")); err != nil {
+			t.Fatal(err)
+		}
+		in, err := s.AcceptStream(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SendDatagram(7, []byte("flow")); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		cx, p, err := in.ReceiveDatagram(ctx)
+		if err != nil || cx != 7 || string(p) != "flow" {
+			t.Fatalf("stream datagram %d %q %v", cx, p, err)
+		}
+		synctest.Wait()
+		if cs := c.ConnectionStats(); cs.DatagramsSentChannel != 51 || cs.DatagramsSent != 56 {
+			t.Fatalf("stream datagram not on the channel: %+v", cs)
+		}
+	})
 }
 
 // A lost channel datagram is lost: it is not resent in a record.
 func TestChannelDatagramsLost(t *testing.T) {
-	a, b := chanPair(t)
-	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-	a.drop.Store(true)
-	if got := exchangeDatagrams(t, c, s, 5, 100); got != 0 {
-		t.Fatalf("%d lost datagrams arrived", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		ca, cb := newChanPair(a, b)
+		cfg := dgramCfg()
+		cfg.ClockDomain = NewClockDomain(timeshim.Real)
+		c, s := pair(t, ca, cb, cfg, cfg)
+		ca.drop.Store(true)
+		for range 5 {
+			if err := c.SendDatagramWait(t.Context(), []byte("lost")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		synctest.Wait()
+		if n := ca.sent.Load(); n != 5 {
+			t.Fatalf("carrier took %d datagrams, want 5", n)
+		}
+		if got := s.ConnectionStats().DatagramsReceived; got != 0 {
+			t.Fatalf("%d lost datagrams arrived", got)
+		}
+	})
 }
 
 // Without the parameter on one side the channel is not used.
@@ -205,12 +220,21 @@ func TestChannelDatagramsNegotiation(t *testing.T) {
 func TestChannelDatagramsShaped(t *testing.T) {
 	a, b := chanPair(t)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-	c.SetShaper(planShaper(func(p *shaping.RecordPlan) { p.Pad = 1 }), nil)
-	if got := exchangeDatagrams(t, c, s, 5, 100); got != 5 {
-		t.Fatalf("%d of 5", got)
+	mustSetShaper(t, c, planShaper(func(p *shaping.RecordPlan) { p.Pad = 1 }), nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	want := []byte{'x', 0}
+	for range 5 {
+		if err := c.SendDatagramWaitWith(ctx, want, DatagramSendOptions{Carrier: DatagramRequireNative}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.ReceiveDatagram(ctx)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("datagram %x, error %v", got, err)
+		}
 	}
-	if a.sent.Load() != 0 {
-		t.Fatal("shaped pipe used its channel")
+	if a.sent.Load() != 5 {
+		t.Fatal("shaped datagrams did not use the native channel")
 	}
 }
 
@@ -228,9 +252,9 @@ func TestChannelDatagramsReceiveErrors(t *testing.T) {
 		}
 	})
 	for name, frame := range map[string][]byte{
-		"with Length": {0x31, 0x02, 0, 'x'},
-		"padding":     {0x00, 0x30, 0, 'x'},
-		"empty":       {},
+		"with Length":  {0x31, 0x02, 0, 'x'},
+		"padding only": {0x00, 0x00},
+		"empty":        {},
 	} {
 		t.Run(name, func(t *testing.T) {
 			a, b := chanPair(t)
@@ -284,121 +308,74 @@ func TestChannelDemuxSessions(t *testing.T) {
 	stops[2]()
 }
 
-// A stream datagram sent on the channel right after the stream's opening
-// frame may overtake it; the receiver holds it until the stream opens, for
-// at most one smoothed RTT (EXTENSIONS 6.8): on a loaded host the opening
-// may come later than that, and the datagram is then dropped and counted,
-// never lost unaccounted.
+// A channel datagram that overtakes the opening record is delivered once
+// the stream opens within the hold period.
 func TestChannelStreamDatagramOvertakesOpening(t *testing.T) {
-	a, b := chanPair(t)
-	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-	ctx, cancel := context.WithTimeout(t.Context(), testscale.D(10*time.Second))
-	defer cancel()
-	const n = 20
-	delivered := 0
-	for i := range n {
-		st, err := c.OpenStream()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := st.Write([]byte{byte(i)}); err != nil {
-			t.Fatal(err)
-		}
-		if st.SendDatagram(0, []byte{byte(i)}) != nil {
-			t.Fatal("stream datagram refused")
-		}
-		in, err := s.AcceptStream(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// The datagram arrives, or its drop is counted.
-		for dropped := uint64(i - delivered); ; {
-			wctx, wcancel := context.WithTimeout(ctx, 10*time.Millisecond)
-			_, p, err := in.ReceiveDatagram(wctx)
-			wcancel()
-			if err == nil {
-				if len(p) != 1 || p[0] != byte(i) {
-					t.Fatalf("stream %d: datagram %v", i, p)
-				}
-				delivered++
-				break
-			}
-			if ctx.Err() != nil {
-				t.Fatalf("stream %d: datagram neither delivered nor dropped", i)
-			}
-			if s.ConnectionStats().DatagramsDroppedRecv > dropped {
-				break
-			}
-		}
-		_ = st.Close()
-	}
-	st := s.ConnectionStats()
-	if delivered == 0 || st.DatagramsReceivedChannel != uint64(delivered) || st.DatagramsDroppedRecv != uint64(n-delivered) ||
-		st.DatagramsReceivedChannel > st.DatagramsReceived {
-		t.Fatalf("delivered %d: %+v", delivered, st)
-	}
+	synctest.Test(t, func(t *testing.T) { testChannelDatagramBeforeOpen(t, false) })
 }
 
 // TestChannelHandOff hands a received channel datagram to a session
 // without waiting for its lock, so that a connection's receive loop shared
 // by several sessions is not held up by one of them.
 func TestChannelHandOff(t *testing.T) {
-	a, b := chanPair(t)
-	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-	// Capture what c sends on the channel instead of delivering it.
-	capture := &chanConn{}
-	got := make(chan []byte, 1)
-	capture.demux.Register(4, func(f []byte) { got <- append([]byte{4}, f...) })
-	a.peer = capture
-	if err := c.SendDatagram([]byte("held up")); err != nil {
-		t.Fatal(err)
-	}
-	var raw []byte
-	select {
-	case raw = <-got:
-	case <-time.After(5 * time.Second):
-		t.Fatal("nothing sent on the channel")
-	}
-	s.lock()
-	done := make(chan struct{})
-	go func() { b.demux.Deliver(raw); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		s.unlock()
-		<-done
-		t.Fatal("delivery waited for the session's lock")
-	}
-	s.unlock()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	p, err := s.ReceiveDatagram(ctx)
-	if err != nil || string(p) != "held up" {
-		t.Fatalf("%q, %v", p, err)
-	}
-	// The hand-off is bounded: beyond it, datagrams are dropped and
-	// counted. A drainer may take the queue (and its drop count) once
-	// before it blocks on the lock, so of 3 x chInMax datagrams at least
-	// chInMax are dropped; the count reaches the session's statistics
-	// once the drainer gets the lock.
-	s.lock()
-	for range 3 * s.chInMax {
-		b.demux.Deliver(bytes.Clone(raw))
-	}
-	s.chIn.mu.Lock()
-	n := len(s.chIn.q)
-	s.chIn.mu.Unlock()
-	s.unlock()
-	if n > s.chInMax {
-		t.Fatalf("%d queued, over %d", n, s.chInMax)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for s.ConnectionStats().DatagramsDroppedRecv < uint64(s.chInMax) {
-		if time.Now().After(deadline) {
-			t.Fatalf("%d dropped, want at least %d", s.ConnectionStats().DatagramsDroppedRecv, s.chInMax)
+	synctest.Test(t, func(t *testing.T) {
+		x, y := net.Pipe()
+		a, b := newChanPair(x, y)
+		// Capture what c sends on the channel instead of delivering it.
+		capture := &chanConn{}
+		got := make(chan []byte, 1)
+		capture.demux.Register(4, func(f []byte) { got <- append([]byte{4}, f...) })
+		a.peer = capture
+		cfg := dgramCfg()
+		cfg.ClockDomain = NewClockDomain(timeshim.Real)
+		c, s := pair(t, a, b, cfg, cfg)
+		if err := c.SendDatagram([]byte("held up")); err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		var raw []byte
+		select {
+		case raw = <-got:
+		case <-time.After(time.Minute):
+			t.Fatal("nothing sent on the channel")
+		}
+		s.lock()
+		done := make(chan struct{})
+		go func() { b.demux.Deliver(raw); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Minute):
+			s.unlock()
+			<-done
+			t.Fatal("delivery waited for the session's lock")
+		}
+		s.unlock()
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		p, err := s.ReceiveDatagram(ctx)
+		if err != nil || string(p) != "held up" {
+			t.Fatalf("%q, %v", p, err)
+		}
+		// The hand-off is bounded: beyond it, datagrams are dropped and
+		// counted. A drainer may take the queue (and its drop count) once
+		// before it blocks on the lock, so of 3 x chInMax datagrams at least
+		// chInMax are dropped; the count reaches the session's statistics
+		// once the drainer gets the lock.
+		s.lock()
+		for range 3 * s.chInMax {
+			b.demux.Deliver(bytes.Clone(raw))
+		}
+		s.chIn.mu.Lock()
+		n := len(s.chIn.q)
+		s.chIn.mu.Unlock()
+		s.unlock()
+		if n > s.chInMax {
+			t.Fatalf("%d queued, over %d", n, s.chInMax)
+		}
+		synctest.Wait()
+		if got := s.ConnectionStats().DatagramsDroppedRecv; got < uint64(s.chInMax) {
+			t.Fatalf("%d dropped, want at least %d", got, s.chInMax)
+		}
+	})
 }
 
 // The channel of a read half stays visible behind the bytes classification
@@ -441,115 +418,159 @@ func TestChannelRegistrationPanicFailsPipe(t *testing.T) {
 	}
 }
 
-// readGate is a chanConn whose reliable stream reads, once they have read,
-// wait while its gate is closed before they return; its channel datagrams
-// do not.
-type readGate struct {
+// openingWriteGate takes reliable writes while holding, without delivering
+// them to the peer. Native datagrams still go directly to the peer.
+type openingWriteGate struct {
 	*chanConn
-	gate atomic.Pointer[chan struct{}] // nil: reads return at once
+	pending [][]byte
+	mu      sync.Mutex
+	holding bool
 }
 
-func (g *readGate) Read(p []byte) (int, error) {
-	n, err := g.chanConn.Read(p)
-	if ch := g.gate.Load(); ch != nil {
-		<-*ch
+func (g *openingWriteGate) Write(p []byte) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.holding {
+		g.pending = append(g.pending, bytes.Clone(p))
+		return len(p), nil
 	}
-	return n, err
+	return g.chanConn.Write(p)
 }
 
-// TestChannelHeldDatagramExpires forces the ordering that drops a held
-// stream datagram: the stream's opening record reaches the receiver later
-// than one smoothed RTT after the datagram that overtook it. The datagram
-// is dropped and counted (EXTENSIONS 6.8); the stream itself opens.
+func (g *openingWriteGate) release() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.holding = false
+	for _, p := range g.pending {
+		if _, err := g.chanConn.Write(p); err != nil {
+			return err
+		}
+	}
+	g.pending = nil
+	return nil
+}
+
+// A held datagram is dropped if the opening record arrives after the hold
+// period. The stream itself still opens.
 func TestChannelHeldDatagramExpires(t *testing.T) {
-	a, b := chanPair(t)
-	gb := &readGate{chanConn: b}
-	c, s := pair(t, a, gb, dgramCfg(), dgramCfg())
-	if got := exchangeDatagrams(t, c, s, 1, 10); got != 1 { // a measured, small RTT
-		t.Fatal("warm-up datagram lost")
-	}
-	gate := make(chan struct{})
-	gb.gate.Store(&gate)
+	synctest.Test(t, func(t *testing.T) { testChannelDatagramBeforeOpen(t, true) })
+}
+
+func testChannelDatagramBeforeOpen(t *testing.T, expire bool) {
+	t.Helper()
+	x, y := net.Pipe()
+	a, b := newChanPair(x, y)
+	gate := &openingWriteGate{chanConn: a}
+	cfg := dgramCfg()
+	cfg.ClockDomain = NewClockDomain(timeshim.Real)
+	c, s := pair(t, gate, b, cfg, cfg)
+	gate.mu.Lock()
+	gate.holding = true
+	gate.mu.Unlock()
+	t.Cleanup(func() { _ = x.Close(); _ = y.Close() })
 	st, err := c.OpenStream()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = st.Close() }()
 	if _, err := st.Write([]byte{1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SendDatagram(0, []byte{1}); err != nil {
+	if err := st.SendDatagram(0, []byte("early")); err != nil {
 		t.Fatal(err)
 	}
-	// The record, read, waits behind the gate while the datagram that
-	// overtook it is held, until the hold (one smoothed RTT, the initial
-	// RTT before one is measured) expires and drops it.
-	for s.ConnectionStats().DatagramsDroppedRecv == 0 {
-		select {
-		case <-t.Context().Done():
-			t.Fatal("the held datagram never expired")
-		case <-time.After(time.Millisecond):
+	synctest.Wait()
+	if sent := a.sent.Load(); sent != 1 {
+		t.Fatalf("%d native sends while the opening record was held", sent)
+	}
+	if got := s.ConnectionStats(); got.DatagramsReceived != 0 || got.DatagramsDroppedRecv != 0 {
+		t.Fatalf("datagram settled before the opening record: %+v", got)
+	}
+	if expire {
+		// With no elapsed virtual time before the datagram, one second
+		// exceeds the initial 333 ms RTT and any measured RTT.
+		synctest.Sleep(time.Second)
+		synctest.Wait()
+		if got := s.ConnectionStats().DatagramsDroppedRecv; got != 1 {
+			t.Fatalf("dropped %d datagrams before the stream opened, want 1", got)
 		}
 	}
-	gb.gate.Store(nil)
-	close(gate)
-	ctx, cancel := context.WithTimeout(t.Context(), testscale.D(5*time.Second))
-	defer cancel()
-	in, err := s.AcceptStream(ctx)
+	if err := gate.release(); err != nil {
+		t.Fatal(err)
+	}
+	in, err := s.AcceptStream(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	wctx, wcancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer wcancel()
-	if _, p, err := in.ReceiveDatagram(wctx); err == nil {
-		t.Fatalf("a datagram held past its RTT was delivered: %v", p)
-	}
-	if d := s.ConnectionStats().DatagramsDroppedRecv; d != 1 {
-		t.Fatalf("dropped %d, want 1", d)
+	synctest.Wait()
+	var payload []byte
+	var ok bool
+	s.locked(func() { _, payload, ok = s.s.RecvStreamDatagram(in.h.st) })
+	stats := s.ConnectionStats()
+	if expire {
+		if ok || stats.DatagramsDroppedRecv != 1 || stats.DatagramsReceivedChannel != 0 {
+			t.Fatalf("expired datagram received %q, stats %+v", payload, stats)
+		}
+	} else if !ok || string(payload) != "early" || stats.DatagramsDroppedRecv != 0 || stats.DatagramsReceivedChannel != 1 {
+		t.Fatalf("held datagram received %q, stats %+v", payload, stats)
 	}
 }
 
 // PathDatagramPayload is what fits one channel datagram: a datagram of
 // it goes on the channel, one byte more in a record; a smaller channel
 // lowers it and EventDatagramPathChanged reports it.
-func TestChannelPathDatagramPayload(t *testing.T) {
+func TestNextBatchE2NativePathDatagramPayload(t *testing.T) {
 	a, b := chanPair(t)
 	c, s := pair(t, a, b, dgramCfg(), dgramCfg())
-	if got := exchangeDatagrams(t, c, s, 1, 10); got != 1 {
+	exchange := func(n int) int {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		if err := c.SendDatagramWait(ctx, make([]byte, n)); err != nil {
+			t.Fatal(err)
+		}
+		p, err := s.ReceiveDatagram(ctx)
+		if err != nil || len(p) != n {
+			t.Fatalf("received %d bytes, wanted %d: %v", len(p), n, err)
+		}
+		return 1
+	}
+	if got := exchange(10); got != 1 {
 		t.Fatal("no datagram")
 	}
 	st := c.ConnectionState()
-	if st.PathDatagramPayload <= 0 || st.PathDatagramPayload >= st.MaxDatagramPayload || st.PathDatagramPayload > 1200 {
-		t.Fatalf("path %d, max %d", st.PathDatagramPayload, st.MaxDatagramPayload)
+	if st.NativeDatagramPayload <= 0 || st.NativeDatagramPayload >= st.MaxDatagramPayload || st.NativeDatagramPayload > 1200 {
+		t.Fatalf("path %d, max %d", st.NativeDatagramPayload, st.MaxDatagramPayload)
 	}
-	path := st.PathDatagramPayload
-	if got := exchangeDatagrams(t, c, s, 1, path); got != 1 {
+	path := st.NativeDatagramPayload
+	if got := exchange(path); got != 1 {
 		t.Fatal("no datagram of the path size")
 	}
-	if cs := sentStats(t, c, 2); cs.DatagramsSentChannel != 2 {
-		t.Fatalf("the path size not on the channel: %+v", cs)
+	if sent := a.sent.Load(); sent != 2 {
+		t.Fatalf("channel sends = %d, want 2", sent)
 	}
-	if got := exchangeDatagrams(t, c, s, 1, path+1); got != 1 {
+	if got := exchange(path + 1); got != 1 {
 		t.Fatal("no datagram above the path size")
 	}
-	if cs := sentStats(t, c, 3); cs.DatagramsSentChannel != 2 {
-		t.Fatalf("above the path size on the channel: %+v", cs)
+	if sent := a.sent.Load(); sent != 2 {
+		t.Fatalf("oversized packet reached channel, sends = %d", sent)
 	}
 	a.max.Store(800)
-	if got := exchangeDatagrams(t, c, s, 1, 10); got != 1 {
+	if got := exchange(10); got != 1 {
 		t.Fatal("no datagram after the change")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	for {
 		ev, err := c.NextEvent(ctx)
 		if err != nil {
 			t.Fatalf("no EventDatagramPathChanged: %v", err)
 		}
-		if ev.Kind == EventDatagramPathChanged && ev.DatagramPayload == path-400 {
+		if ev.Kind == EventDatagramPathChanged && ev.NativeDatagramPayload == path-400 {
 			break
 		}
 	}
-	if got := c.ConnectionState().PathDatagramPayload; got != path-400 {
+	if got := c.ConnectionState().NativeDatagramPayload; got != path-400 {
 		t.Fatalf("path %d after the change, want %d", got, path-400)
 	}
 }

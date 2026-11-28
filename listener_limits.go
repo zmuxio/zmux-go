@@ -40,33 +40,23 @@ type ListenerLimits struct {
 	// carrier to be stalled beyond that being closed. A source is a client
 	// address aggregated to its source prefix (SourcePrefixV4,
 	// SourcePrefixV6); deployments behind a carrier-grade NAT raise it.
-	// Each half of a split bootstrap holds a slot until the pair is
-	// complete, so split bootstraps need at least 2.
+	// The minimum is 2. Each half of a split bootstrap holds a slot
+	// until the pair is complete.
 	MaxPendingPerSource int
-	// MaxPendingPerSession bounds the Unconfirmed carriers of one session:
-	// joins that passed authentication and wait for the joiner's
-	// confirmation (a join in Bound Mode is confirmed by its verification
-	// and holds no place). Zero is 4. A new authenticated Hello is never
-	// refused for lack of room: once the bound is reached, the carrier
-	// that has been Unconfirmed longest is closed first, as a failed join;
-	// below it, none is.
-	MaxPendingPerSession int
 	// FirstRecordTimeout closes a carrier whose first record does not
 	// arrive in time. Zero is 2 s; a negative value is no timeout.
 	FirstRecordTimeout time.Duration
-	// MemoryBudget bounds the sum over the listener's sessions of buffered
-	// receive data, retained data and session window growth. Zero is
-	// 1 GiB; a negative value is unlimited. It replaces the sessions' own
-	// Config.MemoryBudget. Above it sessions grant no new credit, refuse
-	// new peer streams, new sessions and pipes are refused, and suspended
-	// sessions are closed, the largest first; normal operation resumes
-	// below three quarters of it.
+	// MemoryBudget bounds the listener's reserved receive credit, in-flight
+	// I/O and retained storage. Zero is 1 GiB; a negative value is unlimited.
+	// It replaces the sessions' Config.MemoryBudget. The initial connection
+	// window may be reduced to fit. Establishment fails if 16 KiB cannot be
+	// granted. SetLimits rejects any limit below existing commitments.
 	MemoryBudget int64
 }
 
 // resolve validates the limits and fills in the defaults.
 func (r ListenerLimits) resolve() (ListenerLimits, error) {
-	if r.MaxSuspended < 0 || r.MaxPendingPerSource < 0 || r.MaxPendingPerSession < 0 {
+	if r.MaxSuspended < 0 {
 		return r, fmt.Errorf("%w: negative ListenerConfig count", ErrInvalidConfig)
 	}
 	if r.MaxSuspended == 0 {
@@ -79,9 +69,8 @@ func (r ListenerLimits) resolve() (ListenerLimits, error) {
 	}
 	if r.MaxPendingPerSource == 0 {
 		r.MaxPendingPerSource = core.DefaultMaxPendingPerSource
-	}
-	if r.MaxPendingPerSession == 0 {
-		r.MaxPendingPerSession = core.DefaultMaxUnconfirmed
+	} else if r.MaxPendingPerSource < 2 {
+		return r, fmt.Errorf("%w: MaxPendingPerSource must be at least 2", ErrInvalidConfig)
 	}
 	if r.FirstRecordTimeout == 0 {
 		r.FirstRecordTimeout = DefaultFirstRecordTimeout
@@ -110,19 +99,21 @@ func (l *Listener) Limits() ListenerLimits { return *l.lim.Load() }
 // and return an error wrapping ErrInvalidConfig. New carriers and the next
 // decisions on held ones use them at once: lowered pending bounds refuse or
 // displace new carriers until the count is below them, but close no
-// carrier already held; a lowered MaxPendingPerSession applies to the
-// next join of a session; a lowered MaxSuspended closes the
+// carrier already held; a lowered MaxSuspended closes the
 // longest-suspended sessions beyond it with ZMUX_RESUME_TIMEOUT; a changed
 // FirstRecordTimeout applies to carriers that arrive after the call; a
-// changed MemoryBudget starts or ends memory pressure at once, as if the
-// charged sum had crossed the new bounds (OnMemoryPressure, suspended
-// sessions closed the largest first).
+// MemoryBudget below already committed memory rejects the entire update.
+// Otherwise the new budget applies to subsequent charges immediately.
 func (l *Listener) SetLimits(lim ListenerLimits) error {
 	r, err := lim.resolve()
 	if err != nil {
 		return err
 	}
-	if over := l.applyLimits(&r); len(over) > 0 {
+	over, err := l.applyLimits(&r)
+	if err != nil {
+		return err
+	}
+	if len(over) > 0 {
 		go closeSuspended(over)
 	}
 	return nil
@@ -130,22 +121,28 @@ func (l *Listener) SetLimits(lim ListenerLimits) error {
 
 // applyLimits stores resolved limits and returns the suspended sessions
 // beyond the new MaxSuspended, for the caller to close.
-func (l *Listener) applyLimits(r *ListenerLimits) []suspension {
+func (l *Listener) applyLimits(r *ListenerLimits) ([]suspension, error) {
 	l.pmu.Lock()
-	l.lim.Store(r)
-	l.pending.MaxTotal = r.MaxPending
-	l.pending.MaxPerSource = r.MaxPendingPerSource
-	l.pending.Timeout = core.Duration(r.firstRecord())
-	l.pmu.Unlock()
 	var mem uint64 // unlimited
 	if r.MemoryBudget > 0 {
 		mem = uint64(r.MemoryBudget)
 	}
-	l.budget.SetLimit(mem)
+	if !l.budget.SetLimit(mem) {
+		l.pmu.Unlock()
+		return nil, fmt.Errorf("%w: MemoryBudget below committed memory", ErrInvalidConfig)
+	}
+	l.storeAdmissionLimits(r)
+	l.pmu.Unlock()
 	if l.served.Load() {
 		l.startWatch()
 	}
 	l.suspMu.Lock()
 	defer l.suspMu.Unlock()
-	return l.trimSuspended()
+	return l.trimSuspended(), nil
+}
+
+// storeAdmissionLimits is used during construction and under pmu thereafter.
+func (l *Listener) storeAdmissionLimits(r *ListenerLimits) {
+	l.lim.Store(r)
+	l.pending.MaxTotal, l.pending.MaxPerSource = r.MaxPending, r.MaxPendingPerSource
 }

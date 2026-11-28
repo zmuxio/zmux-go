@@ -1,144 +1,24 @@
 package zmuxh3
 
 import (
-	"context"
-	"errors"
 	"net/http"
-	"sync"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/quicvarint"
-	"github.com/quic-go/webtransport-go"
-	"github.com/zmuxio/zmux-go"
-	"github.com/zmuxio/zmux-go/carrier"
-	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/carrierstats"
-	"github.com/zmuxio/zmux-go/internal/labels"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
+	"github.com/zmuxio/zmux-go/zmuxquic/streamio"
 )
 
-// Datagram channels: the HTTP Datagrams (RFC 9297) of
-// an HTTP/3 request stream that is a pipe, the frame alone; and the
-// datagrams of a WebTransport session, each starting with the Pipe Stream
-// ID of a stream of the session, routed by one receive loop per session.
-
-// sizeProbe is larger than any QUIC datagram: sending it is always refused
-// with the connection's current maximum, and nothing is sent.
-var sizeProbe = make([]byte, 1<<16)
-
-// tooLarge returns the maximum a send refused for size reports, less
-// overhead.
-func tooLarge(err error, overhead int) (int64, bool) {
-	tl, ok := errors.AsType[*quic.DatagramTooLargeError](err)
-	if !ok {
-		return 0, false
-	}
-	return tl.MaxDatagramPayloadSize - int64(overhead), true
-}
-
-// ---- HTTP/3 request streams ----
-
-// h3Stream is an HTTP/3 request stream with HTTP Datagrams (a server's
-// *http3.Stream or a client's *http3.RequestStream).
-type h3Stream interface {
-	SendDatagram(b []byte) error
-	ReceiveDatagram(ctx context.Context) ([]byte, error)
-	StreamID() quic.StreamID
-	Context() context.Context
-}
-
-// h3Channel is the datagram channel of an HTTP/3 request stream: usable
-// once the peer's SETTINGS enabled HTTP Datagrams.
-type h3Channel struct {
-	str      h3Stream
-	settings http3.Settingser
-	size     carrierio.DatagramSize
-}
-
-// newH3Channel returns the channel of str, whose HTTP/3 connection's
-// settings are s.
-func newH3Channel(str h3Stream, s http3.Settingser) *h3Channel {
-	return &h3Channel{str: str, settings: s}
-}
-
-// ChannelStreamID reports no stream ID: the HTTP Datagram names the
-// request stream itself.
-func (c *h3Channel) ChannelStreamID() (uint64, bool) { return 0, false }
-
-// MaxChannelDatagram is the largest HTTP Datagram payload the stream takes,
-// refreshed at most once per carrierio.DatagramSizeRefresh by an oversized
-// send the connection refuses without sending it.
-func (c *h3Channel) MaxChannelDatagram() int {
-	select {
-	case <-c.settings.ReceivedSettings():
-	default:
-		return 0
-	}
-	if !c.settings.Settings().EnableDatagrams {
-		return 0
-	}
-	return c.size.Get(func() (int64, bool) { return tooLarge(c.str.SendDatagram(sizeProbe), c.overhead()) })
-}
-
-// overhead is the Quarter Stream ID before the payload.
-func (c *h3Channel) overhead() int { return quicvarint.Len(uint64(c.str.StreamID()) / 4) }
-
-// SendChannelDatagram sends an HTTP Datagram of the stream.
-func (c *h3Channel) SendChannelDatagram(b []byte) error {
-	err := c.str.SendDatagram(b)
-	if n, ok := tooLarge(err, c.overhead()); ok {
-		c.size.Set(n)
-	}
-	return err
-}
-
-// ReceiveChannelDatagrams receives the stream's HTTP Datagrams.
-func (c *h3Channel) ReceiveChannelDatagrams(deliver func([]byte)) func() {
-	ctx, cancel := context.WithCancel(c.str.Context())
-	done := make(chan struct{})
-	labels.Go(context.Background(), "h3-channel", func() {
-		defer close(done)
-		for {
-			b, err := c.str.ReceiveDatagram(ctx)
-			if err != nil {
-				return
-			}
-			deliver(b) // a fresh slice: deliver takes it over
-		}
-	})
-	return func() { cancel(); <-done }
-}
-
-// HTTP3Handler wraps h, typically the handler of zmuxhttp.NewHandler, for
-// an HTTP/3 server with HTTP Datagrams enabled (http3.Server's
-// EnableDatagrams, as NewServer sets): a bidirectional carrier's
-// request stream offers its HTTP Datagrams as the pipe's datagram channel
-// (zmuxhttp.DatagramProvider). A response carrying zmux can report its
-// QUIC connection's statistics when ConnContext is set to QUICConnContext.
-// o (nil:
-// defaults) are the zmuxhttp.Options of the zmux handler inside h, whose pairing
-// field decides which requests are bidirectional carriers.
+// HTTP3Handler publishes the connection's carrier statistics for streaming
+// requests. The server must set ConnContext to QUICConnContext. The
+// classification uses the options of the wrapped zmuxhttp handler.
 func HTTP3Handler(h http.Handler, o *zmuxhttp.Options) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hs, ok := w.(http3.HTTPStreamer)
-		st, sok := w.(http3.Settingser)
-		class := o.Classify(r)
 		state := quicInContext(r.Context())
-		if !ok || !sok || class != zmuxhttp.ClassBidirectional {
-			if state.qc != nil && (class == zmuxhttp.ClassDownlink || class == zmuxhttp.ClassBidirectional) {
-				w = &h3CarrierWriter{ResponseWriter: w, state: state}
-			}
-			h.ServeHTTP(w, r)
-			return
+		if class := o.Classify(r); state.qc != nil &&
+			(class == zmuxhttp.ClassDownlink || class == zmuxhttp.ClassUplink || class == zmuxhttp.ClassBidirectional) {
+			w = &h3CarrierWriter{ResponseWriter: w, state: state}
 		}
-		writer := h3CarrierWriter{ResponseWriter: w, state: state}
-		cw := &h3ChanWriter{h3CarrierWriter: writer, hs: hs, st: st}
-		// The request-carrier handler keeps the stream until its halves close
-		// or the request ends. Its response writer is idle on return.
-		defer cw.tail.Finish()
-		defer cw.closeStream()
-		h.ServeHTTP(cw, r)
+		h.ServeHTTP(w, r)
 	})
 }
 
@@ -148,121 +28,46 @@ type h3CarrierWriter struct {
 }
 
 func (w *h3CarrierWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *h3CarrierWriter) PhysicalCarrier() any {
+	if w.state.qc != nil {
+		return w.state.qc
+	}
+	return nil
+}
 
 // CarrierSampler is for internal use by zmux modules.
 func (w *h3CarrierWriter) CarrierSampler() *carrierstats.Sampler { return w.state.CarrierSampler() }
 
-// h3ChanWriter is a response writer that provides the request stream's
-// datagram channel.
-type h3ChanWriter struct {
-	h3CarrierWriter
-	hs   http3.HTTPStreamer
-	st   http3.Settingser
-	str  *http3.Stream
-	tail carrierio.RequestTail
-	mu   sync.Mutex
-}
-
-func (w *h3ChanWriter) closeStream() {
-	if str := w.str; str != nil {
-		// Taken over by HTTPStream: end it as the server would.
-		str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
-		_ = str.Close()
-	}
-}
-
-func (w *h3ChanWriter) RequestTail() *carrierio.RequestTail { return &w.tail }
-
-// DatagramChannel takes over the stream (the response header went out) and
-// returns its channel.
-func (w *h3ChanWriter) DatagramChannel() zmux.DatagramChannel {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.str == nil {
-		w.str = w.hs.HTTPStream()
-	}
-	return newH3Channel(w.str, w.st)
-}
-
 // ---- WebTransport ----
 
-// wtChannel is the datagram channel of one WebTransport session.
-type wtChannel struct {
-	sess     *webtransport.Session
-	demux    carrier.ChannelDemux
-	recvOnce sync.Once
-	size     carrierio.DatagramSize
-}
-
-var wtChannels sync.Map // *webtransport.Session -> *wtChannel
-
-func wtChannelOf(sess *webtransport.Session) *wtChannel {
-	if c, ok := wtChannels.Load(sess); ok {
-		return c.(*wtChannel)
-	}
-	c, loaded := wtChannels.LoadOrStore(sess, &wtChannel{sess: sess})
-	if !loaded {
-		context.AfterFunc(sess.Context(), func() { wtChannels.Delete(sess) })
-	}
-	return c.(*wtChannel)
-}
-
-// wtOverhead bounds the Quarter Stream ID of the session's CONNECT stream
-// that precedes each of its datagrams.
-const wtOverhead = 8
-
-// maxDatagram is the largest datagram payload the session takes,
-// refreshed as an HTTP/3 channel's is.
-func (c *wtChannel) maxDatagram() int {
-	st := c.sess.SessionState().ConnectionState
-	if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
-		return 0
-	}
-	return c.size.Get(func() (int64, bool) { return tooLarge(c.sess.SendDatagram(sizeProbe), wtOverhead) })
-}
-
-func (c *wtChannel) send(b []byte) error {
-	err := c.sess.SendDatagram(b)
-	if n, ok := tooLarge(err, wtOverhead); ok {
-		c.size.Set(n)
-	}
-	return err
-}
-
-func (c *wtChannel) register(id uint64, deliver func([]byte)) func() {
-	c.recvOnce.Do(func() {
-		labels.Go(context.Background(), "wt-channel", func() {
-			for {
-				b, err := c.sess.ReceiveDatagram(c.sess.Context())
-				if err != nil {
-					return
-				}
-				c.demux.Deliver(b) // a fresh slice: the demux takes it over
-			}
-		})
-	})
-	return c.demux.Register(id, deliver)
-}
+// Session.SendDatagram reports capacity after HTTP/3 framing overhead.
+var wtChannels = streamio.NewDatagramRegistry(0, "wt-channel", func(sess *Session) bool {
+	return sess.Context().Err() == nil && streamio.SupportsDatagrams(sess.state)
+})
 
 // ChannelStreamID is the stream's ID within its QUIC connection.
 func (w *wtStream) ChannelStreamID() (uint64, bool) { return uint64(w.s.StreamID()), true }
 
-// MaxChannelDatagram is the session's current largest datagram.
-func (w *wtStream) MaxChannelDatagram() int { return wtChannelOf(w.sess).maxDatagram() }
+// ChannelDatagramCapacity returns the session's limit and current room.
+func (w *wtStream) ChannelDatagramCapacity() (limit, room int) {
+	return wtChannels.Channel(w.sess).Capacity()
+}
+
+// ChannelCapacityChanged wakes writers sharing a WebTransport MTU.
+func (w *wtStream) ChannelCapacityChanged() <-chan struct{} {
+	return wtChannels.Channel(w.sess).Changed()
+}
 
 // SendChannelDatagram sends a datagram of the session.
-func (w *wtStream) SendChannelDatagram(b []byte) error { return wtChannelOf(w.sess).send(b) }
+func (w *wtStream) SendChannelDatagram(b []byte) error { return wtChannels.Channel(w.sess).Send(b) }
 
 // ReceiveChannelDatagrams receives the session's datagrams for the pipe.
 func (w *wtStream) ReceiveChannelDatagrams(deliver func([]byte)) func() {
-	return wtChannelOf(w.sess).register(uint64(w.s.StreamID()), deliver)
+	return wtChannels.Channel(w.sess).Register(uint64(w.s.StreamID()), deliver)
 }
 
 // ChannelDropped returns the datagrams received on sess that
 // named no pipe attached to a session.
-func ChannelDropped(sess *webtransport.Session) uint64 {
-	if c, ok := wtChannels.Load(sess); ok {
-		return c.(*wtChannel).demux.Dropped()
-	}
-	return 0
+func ChannelDropped(sess *Session) uint64 {
+	return wtChannels.Dropped(sess)
 }

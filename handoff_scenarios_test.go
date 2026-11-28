@@ -102,7 +102,7 @@ func TestListenerCancelExporterWait(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cfg := earlyServerConfig()
 		cfg.EarlyData.Replayable = false // only the exporter waits for the transport handshake
-		cfg.Clock = timeshim.Real
+		cfg.ClockDomain = NewClockDomain(timeshim.Real)
 		l := mustNewListener(&ListenerConfig{Config: cfg})
 		defer func() { _ = l.Close() }()
 		ctx, cancel := context.WithCancel(t.Context())
@@ -122,7 +122,7 @@ func TestListenerCancelExporterWait(t *testing.T) {
 		client := make(chan struct{})
 		go func() {
 			defer close(client)
-			c, _ := Start(t.Context(), PipeIO{R: cc, W: cc}, RoleClient, &Config{Clock: timeshim.Real, MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, EarlyData: EarlyData{ZmuxPeer: true}})
+			c, _ := Start(t.Context(), PipeIO{R: cc, W: cc}, RoleClient, &Config{ClockDomain: NewClockDomain(timeshim.Real), SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, ReturnBeforeEstablished: true})
 			if c != nil {
 				<-c.Done()
 			}
@@ -290,7 +290,7 @@ func TestShutdownBacklogCloseCode(t *testing.T) {
 func TestSplitHalfWithdrawal(t *testing.T) {
 	for _, expire := range []bool{false, true} {
 		synctest.Test(t, func(t *testing.T) {
-			l := mustNewListener(&ListenerConfig{Config: &Config{HandshakeTimeout: time.Second, Clock: timeshim.Real}})
+			l := mustNewListener(&ListenerConfig{Config: &Config{HandshakeTimeout: time.Second, ClockDomain: NewClockDomain(timeshim.Real)}})
 			defer func() { _ = l.Close() }()
 			const token = "AAAAAAAAAAAAAAAAAAAAAA"
 			for _, up := range []bool{true, false} {
@@ -405,7 +405,7 @@ func TestPairedSetupSurvivesOneWithdrawal(t *testing.T) {
 	for _, cancelUp := range []bool{false, true} {
 		synctest.Test(t, func(t *testing.T) {
 			cfg := mpConfig()
-			cfg.Clock = timeshim.Real
+			cfg.ClockDomain = NewClockDomain(timeshim.Real)
 			entered, release := make(chan struct{}), make(chan struct{})
 			l := mustNewListener(&ListenerConfig{Config: cfg, SessionConfig: func(context.Context, *CarrierInfo, any) (*Config, error) { close(entered); <-release; return cfg, nil }})
 			defer func() { _ = l.Close() }()
@@ -561,7 +561,7 @@ func TestShutdownInterruptsProvisionalHandshake(t *testing.T) {
 	setup := make(chan error, 1)
 	go func() {
 		defer owner.release()
-		setup <- e.lst.startSession(ctx, NetPipe(c), nil, netip.AddrPort{}, owner)
+		setup <- e.lst.startSession(ctx, NetPipe(c), nil, nil, netip.AddrPort{}, owner)
 	}()
 	peer, err := Client(ctx, x, mpConfig())
 	if err != nil {

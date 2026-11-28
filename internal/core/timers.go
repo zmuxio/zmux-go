@@ -8,7 +8,6 @@ type timers struct {
 	linger       Time
 	lastActivity Time // last event that restarted the idle timer
 	lastKeepRef  Time
-	keepDrawn    Time    // the lastActivity the keep-alive wait was drawn for
 	keepCut      float64 // that wait is k x (1 - keepCut), keepCut in [0, j]
 	keepHas      bool
 	laneWait     Time // CONNECTION_CLOSE waits for lanes until then
@@ -19,46 +18,87 @@ type timers struct {
 	writeLost Time
 }
 
-// NextTimeout returns the earliest deadline, Never when none.
-func (s *Session) NextTimeout() Time {
-	if s.state == StateClosed {
-		return Never
+// deadlineSlots gathers direct owner deadlines and indexed queue minima.
+// Keeping their individual values lets a same-instant dispatch recognize a
+// newly due cause even when the minimum stays the same.
+type deadlineSlots struct {
+	pathKey                                         *Deadline[pathDeadline]
+	shapeKey                                        *Deadline[*pipeShape]
+	handshake, linger, writeLost, laneWait, session Time
+	ack, epoch, advice, prefix, backoff, redundant  Time
+	ping, pick, tier, pace, quality, shape          Time
+	path, lane, held, datagram, report              Time
+}
+
+func (d *deadlineSlots) next() Time {
+	return min(d.handshake, d.linger, d.writeLost, d.laneWait, d.session,
+		d.ack, d.epoch, d.advice, d.prefix, d.backoff, d.redundant, d.ping,
+		d.pick, d.tier, d.pace, d.quality, d.shape, d.path, d.lane, d.held, d.datagram, d.report)
+}
+
+func (s *Session) deadlines(withKeys bool) deadlineSlots {
+	d := deadlineSlots{
+		handshake: Never, linger: Never, writeLost: Never, laneWait: Never, session: Never,
+		ack: Never, epoch: Never, advice: Never, prefix: Never, backoff: Never, redundant: Never,
+		ping: Never, pick: Never, tier: Never, pace: Never, quality: Never, shape: Never,
+		path: Never, lane: Never, held: Never, datagram: Never, report: Never,
 	}
-	t := Never
-	t = minT(t, s.timers.handshake)
-	t = minT(t, s.timers.linger)
-	t = minT(t, s.timers.writeLost)
+	if s.state == StateClosed {
+		return d
+	}
+	d.handshake, d.linger, d.writeLost = s.timers.handshake, s.timers.linger, s.timers.writeLost
 	if s.closeFr.waitLanes {
-		t = minT(t, s.timers.laneWait)
+		d.laneWait = s.timers.laneWait
 	}
 	if !s.transportLive() {
-		return t
+		return d
 	}
 	if s.state < StateClosing {
-		t = minT(t, s.sessionTimeout())
+		d.session = s.sessionTimeout()
 	}
-	t = minT(t, s.laneTimeouts(0, false))
+	d.lane, d.held = s.laneTimers.Next(), s.heldDeadline()
 	if s.ack != nil {
-		t = minT(t, s.ack.nextTimeout())
+		d.ack = s.ack.nextTimeout()
+		d.pace, d.quality = s.paceDeadline(), s.qualityTimers.Next()
 	}
 	if s.mp != nil {
-		t = minT(t, s.mpNextTimeout())
+		s.setMultipathDeadlines(&d, withKeys)
 	}
-	if s.shp != nil {
-		t = minT(t, s.shapeDeadline())
+	if sh := s.shp; sh != nil {
+		d.shape = sh.timers.Next()
+		if withKeys {
+			d.shapeKey = sh.timers.Peek()
+		}
 	}
-	t = minT(t, s.heldDeadline())
-	if s.ack != nil {
-		t = minT(t, s.paceDeadline())
-		t = minT(t, s.qualityTimers(s.now, false))
+	if s.dg != nil {
+		d.datagram, d.report = s.dg.expiry.Next(), s.datagramReportWake()
 	}
-	return t
+	return d
+}
+
+// NextTimeout returns the earliest owner deadline, Never when none.
+func (s *Session) NextTimeout() Time {
+	d := s.deadlines(false)
+	return d.next()
 }
 
 // HandleTimeout runs every timer that is due at now.
 func (s *Session) HandleTimeout(now Time) {
 	s.SetNow(now)
+	now = s.now
 	s.pickInput()
+	s.handleDue(now)
+	for pending := s.deadlines(true); pending.next() <= now; {
+		s.handleDue(now)
+		after := s.deadlines(true)
+		if after == pending {
+			panic("zmux: deadline did not advance")
+		}
+		pending = after
+	}
+}
+
+func (s *Session) handleDue(now Time) {
 	if s.state == StateClosed {
 		return
 	}
@@ -95,7 +135,7 @@ func (s *Session) HandleTimeout(now Time) {
 	}
 	// The session's own deadlines end with CLOSING; the transport's run
 	// on while the close waits for PIPE_ACK coverage.
-	s.laneTimeouts(now, true)
+	s.expireLanes(now)
 	if s.state < StateClosing && !s.sessionTimers(now) {
 		return
 	}
@@ -105,17 +145,15 @@ func (s *Session) HandleTimeout(now Time) {
 	if s.mp != nil {
 		s.mpHandleTimeout(now)
 	}
-	if s.shp != nil {
-		due := s.shapeDeadline() <= now
-		s.shapeTimeout(now)
-		if due {
-			s.wakePrefix()
-		}
+	s.expireDatagramSends(now)
+	if s.shp != nil && s.shapeTimeout(now) {
+		s.wakePrefix()
 	}
 	s.expireHeld(now)
+	s.datagramReportTimeout(now)
 	if s.ack != nil {
 		s.paceTimeout(now)
-		s.qualityTimers(now, true)
+		s.expireQuality(now)
 	}
 }
 
@@ -137,6 +175,9 @@ func (s *Session) sessionTimeout() Time {
 	if s.ping.outstanding != 0 {
 		t = minT(t, s.ping.expires)
 	}
+	if s.ping.nextTry != 0 {
+		t = minT(t, s.ping.nextTry)
+	}
 	return t
 }
 
@@ -150,6 +191,10 @@ func (s *Session) sessionTimers(now Time) bool {
 		s.closeWith(&SessionError{Kind: CloseResumeTimeout, Cause: s.lastPipeErr()},
 			&closeFrame{code: wire.ResumeTimeout})
 		return false
+	}
+	if s.ping.nextTry != 0 && s.ping.nextTry <= now {
+		s.ping.nextTry = 0
+		s.wakeAllWriters()
 	}
 	if s.ping.outstanding != 0 && now >= s.ping.expires {
 		s.pingExpired()
@@ -171,6 +216,20 @@ func (s *Session) sessionTimers(now Time) bool {
 	return true
 }
 
+// noteActivity owns the keep-alive jitter draw. Reading a deadline never
+// mutates the clock or consumes the session's random sequence.
+func (s *Session) noteActivity(at Time) {
+	tm := &s.timers
+	if tm.lastActivity == at && tm.keepHas {
+		return
+	}
+	tm.lastActivity, tm.keepCut = at, 0
+	tm.keepHas = s.peerSeen && s.cfg.KeepAlive > 0
+	if tm.keepHas && s.cfg.ProbeJitter > 0 {
+		tm.keepCut = s.cfg.ProbeJitter * s.rand().Float64()
+	}
+}
+
 // keepAliveAt returns when the next keep-alive falls due:
 // the period k is KeepAlive capped at half the effective idle timeout, and
 // each restart of the timer draws its wait from [k x (1 - j), k] with the
@@ -184,12 +243,6 @@ func (s *Session) keepAliveAt() (Time, bool) {
 		k = min(k, d/2)
 	}
 	tm := &s.timers
-	if !tm.keepHas || tm.keepDrawn != tm.lastActivity {
-		tm.keepHas, tm.keepDrawn, tm.keepCut = true, tm.lastActivity, 0
-		if j := s.cfg.ProbeJitter; j > 0 {
-			tm.keepCut = j * s.rand().Float64()
-		}
-	}
 	if c := tm.keepCut; c > 0 {
 		k = Duration(float64(k) * (1 - c))
 	}

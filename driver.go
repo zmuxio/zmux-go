@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/carrierio"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/labels"
 )
@@ -20,29 +21,24 @@ import (
 // goroutine owns its half (the write token) and its batch; halves are
 // closed through hc (lane 0) or their laneOut exactly once each.
 type pipeDrv struct {
-	c      *Conn
-	id     uint64
-	hc     *halfCloser
-	writer laneWriter      // lane zero
-	opener LaneOpener      // nil: the carrier offers no lanes
-	maxRec int             // the pipe's local record limit (carrierRecordLimit), applied to every lane
-	tcp    tcpInfo         // the TCP socket under the carrier, if any
-	nest   *nestEdge       // the nesting edge of a stream-backed carrier (nil: none)
-	gs     pipeGoroutines  // the attachment's goroutines (Pipe.Done waits for them)
-	lctx   context.Context // the goroutine labels of the pipe (labels.go)
-
-	admitted any // the admission value of the carrier that joined it (set once, under the session lock)
-
+	physical core.CarrierKeys
+	tcp      tcpInfo         // the TCP socket under the carrier, if any
+	opener   LaneOpener      // nil: the carrier offers no lanes
+	lctx     context.Context // the goroutine labels of the pipe (labels.go)
+	admitted any             // the admission value of the carrier that joined it (set once, under the session lock)
 	// Guarded by the session lock.
 	openCtx  context.Context
 	stopOpen context.CancelFunc
 	lanes    map[uint64]*laneOut       // outbound lanes above 0
 	inLanes  map[*inboundLane]struct{} // inbound lanes above 0
-
 	// The carrier's datagram channel (nil: none) and its sender.
-	ch    DatagramChannel
-	chSig *core.Signal
-	chEnd chan struct{}
+	ch      DatagramChannel
+	sampler *carrierstats.Sampler
+	c       *Conn
+	hc      *halfCloser
+	nest    *nestEdge // the nesting edge of a stream-backed carrier (nil: none)
+	chSig   *core.Signal
+	chEnd   chan struct{}
 	// chReady is closed once the channel's receiver is registered: the
 	// first record waits for it.
 	chReady chan struct{}
@@ -51,16 +47,24 @@ type pipeDrv struct {
 	graceT  *time.Timer
 	graceAb func()
 	wdone   chan struct{} // closed when a stopped lane-0 writer releases its half
-
 	// The end of the attachment (Pipe.Wait, Pipe.Done); a handle keeps it
 	// after the session has forgotten the attachment.
-	end    *pipeEnd
-	chOnce sync.Once
-
-	retiring bool // under the session lock: the carrier close has claimed the lanes.
-	shutReq  bool // under the session lock: lane 0's shutdown was requested (sticky)
-	framing  Framing
-	dead     bool // guarded by the session lock: replaced (early-data restart), its goroutines report nothing
+	end                       *pipeEnd
+	accountSegment            *accountSegment
+	accountRead, accountWrite *accountHalf
+	gs                        pipeGoroutines // the attachment's goroutines (Pipe.Done waits for them)
+	writer                    laneWriter     // lane zero
+	sendCarrier, recvCarrier  CarrierID
+	id                        uint64
+	maxRec                    int // the pipe's local record limit (carrierRecordLimit), applied to every lane
+	chOnce                    sync.Once
+	channelAccountingClosed   bool // guarded by Conn.chIn.mu
+	hasCarrierSlot            bool
+	physicalReserved          bool
+	retiring                  bool // under the session lock: the carrier close has claimed the lanes.
+	shutReq                   bool // under the session lock: lane 0's shutdown was requested (sticky)
+	framing                   Framing
+	dead                      bool // guarded by the session lock: replaced (early-data restart), its goroutines report nothing
 	// wstop (session lock): the lane-0 writer stops before writing again
 	// (an early-data restart on the same halves).
 	wstop    bool
@@ -71,10 +75,11 @@ type pipeDrv struct {
 // retires it (err, guarded by the session lock, is set before),
 // waited when, besides, its goroutines ended.
 type pipeEnd struct {
-	join    *joinOutcome // on additional pipes, persists through retirement
-	err     error
-	drv     atomic.Pointer[pipeDrv] // the current driver (an early-data restart replaces pipe 0's)
-	retired chan struct{}
+	accounting *pipeAccounting // published under the session lock at carrier handoff
+	join       *joinOutcome    // on additional pipes, persists through retirement
+	err        error
+	drv        atomic.Pointer[pipeDrv] // the current driver (an early-data restart replaces pipe 0's)
+	retired    chan struct{}
 	// waited is Pipe.Done's channel, made on demand; ended is set once
 	// the pipe was retired and its goroutines ended, or the session ended.
 	waited chan struct{}
@@ -119,6 +124,7 @@ var goneEnd = &pipeEnd{retired: closedChan, waited: closedChan, ended: true}
 // laneOut is the writer side of one outbound lane above 0.
 type laneOut struct {
 	w         io.WriteCloser
+	account   *accountHalf
 	writer    laneWriter
 	lane      uint64
 	once      sync.Once
@@ -134,6 +140,7 @@ func (l *laneOut) abort() {
 }
 
 func (l *laneOut) close(abort bool) {
+	l.account.retire()
 	if abort {
 		l.abort()
 	}
@@ -147,13 +154,15 @@ type pipeGoroutines struct {
 	// whichever of the two comes last; made on demand (finished).
 	fin chan struct{}
 	// onFin, when set before finish, runs (under mu) when fin would close.
-	afterIO func() // Runs outside mu once the carrier closed and no worker remains.
-	onFin   func()
-	n       int
-	mu      sync.Mutex
-	sealed  bool // seal: no goroutine joins any more
-	final   bool // finish: the owner ended
-	fired   bool // the owner ended and no goroutine ran since
+	afterIO      func() // Runs outside mu once the carrier closed and no worker remains.
+	onFin        func()
+	onAccounting func()
+	n            int
+	mu           sync.Mutex
+	closed       bool // physical close returned; the last worker may release ownership
+	sealed       bool // seal: no goroutine joins any more
+	final        bool // finish: the owner ended
+	fired        bool // the owner ended and no goroutine ran since
 }
 
 func (g *pipeGoroutines) add() {
@@ -183,11 +192,9 @@ func (g *pipeGoroutines) seal() {
 
 func (g *pipeGoroutines) done() {
 	g.mu.Lock()
-	var after func()
-	if g.n--; g.n == 0 {
-		g.closeFinLocked()
-		after, g.afterIO = g.afterIO, nil
-	}
+	g.n--
+	g.closeFinLocked()
+	after := g.takeAfterIOLocked()
 	g.mu.Unlock()
 	if after != nil {
 		after()
@@ -197,6 +204,11 @@ func (g *pipeGoroutines) done() {
 // finishThen is finish, with f run once no goroutine runs.
 func (g *pipeGoroutines) finishThen(f func()) {
 	g.mu.Lock()
+	if g.fired {
+		g.mu.Unlock()
+		f()
+		return
+	}
 	g.onFin = f
 	g.final = true
 	g.closeFinLocked()
@@ -207,9 +219,22 @@ func (g *pipeGoroutines) finishThen(f func()) {
 // goroutine runs, at once when none does.
 func (g *pipeGoroutines) finish() {
 	g.mu.Lock()
-	g.final = true
+	g.final, g.closed = true, true
 	g.closeFinLocked()
+	after := g.takeAfterIOLocked()
 	g.mu.Unlock()
+	if after != nil {
+		after()
+	}
+}
+
+func (g *pipeGoroutines) takeAfterIOLocked() func() {
+	if !g.closed || g.n != 0 {
+		return nil
+	}
+	after := g.afterIO
+	g.afterIO = nil
+	return after
 }
 
 func (g *pipeGoroutines) closeFinLocked() {
@@ -217,6 +242,10 @@ func (g *pipeGoroutines) closeFinLocked() {
 		return
 	}
 	g.fired = true
+	if g.onAccounting != nil {
+		g.onAccounting()
+		g.onAccounting = nil
+	}
 	if g.fin != nil {
 		close(g.fin)
 	}
@@ -254,6 +283,12 @@ func carrierInfo(p PipeIO, tcp tcpInfo, lowWater bool) core.CarrierInfo {
 	half = half || p.R == nil || p.W == nil || !carrierio.SameHalf(p.R, p.W)
 	info := core.CarrierInfo{HalfClose: half, Framing: core.Framing(p.Framing), TLS: isTLS, MinRTT: tcp.hasMinRTT(),
 		Lanes: lanes, QueueBound: lowWater, WriteOverhead: p.WriteOverhead, MaxRecord: carrierRecordLimit(p)}
+	if sealed, ok := unprefixed(p.W).(*sealedWriter); ok {
+		info.SealSuffix = sealTag
+		if !sealed.msgs {
+			info.SealPrefix = sealedLen
+		}
+	}
 	info.Channel = channelOf(p) != nil
 	info.OwnFailure = reportsFailure(p)
 	return info
@@ -284,10 +319,40 @@ type preparedPipe struct {
 func (c *Conn) preparePipe(id uint64, p, raw PipeIO, lowWater int) (a preparedPipe, err error) {
 	err = hostCall(c.cfg.Logger, "carrier properties", func() error {
 		a.pd = c.newPipeDrv(id, p)
+		a.pd.physical = physicalCarrierKeys(raw)
+		policy := c.cfg.Accounting
+		if policy.Enabled && policy.Strict {
+			if err := checkAccountingSources(nil, policy.sourceLimit(), p.ReceiveSource, p.SendSource, p.R != nil, p.W != nil); err != nil {
+				return err
+			}
+		}
 		a.pd.tcp = tcpOf(raw.W)
+		a.pd.sampler = primeCarrierSample(p.W)
 		a.carrier, a.outer = carrierIdentity(p)
 		low := lowWater > 0 && a.pd.tcp.setLowWater(lowWater)
 		a.info = carrierInfo(p, a.pd.tcp, low)
+		liveness, err := p.Liveness.core()
+		if err != nil {
+			return err
+		}
+		a.info.Liveness = liveness
+		a.info.FateDomain = p.SendSource.FateDomain
+		if p.SendSource.CarrierID != (CarrierID{}) {
+			a.info.CarrierIdentity = p.SendSource.CarrierID
+		} else if a.pd.sampler != nil {
+			a.info.CarrierIdentity = carrierstats.Cached(a.pd.sampler).ID
+		}
+		a.pd.sendCarrier, a.pd.recvCarrier = p.SendSource.CarrierID, p.ReceiveSource.CarrierID
+		if id, ok := a.info.CarrierIdentity.(CarrierID); ok {
+			a.pd.sendCarrier = id
+		}
+		if p.R != nil && a.pd.recvCarrier == (CarrierID{}) {
+			if carrierio.SameHalf(p.R, p.W) {
+				a.pd.recvCarrier = a.pd.sendCarrier
+			} else if receiver := samplerOf(p.R); receiver != nil {
+				a.pd.recvCarrier = carrierstats.Cached(receiver).ID
+			}
+		}
 		a.pd.maxRec = a.info.MaxRecord
 		return nil
 	})
@@ -313,11 +378,35 @@ func (c *Conn) newPipeDrv(id uint64, p PipeIO) *pipeDrv {
 // Every PipeIO that becomes part of a session starts here once, so this is
 // where the padding of the handshake run on it is metered: an attachment
 // that fails before (a join not confirmed) spends nothing.
-func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool, carrier any) {
+func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool, carrier any, held *receiveFlight) {
+	c.bindCarrierLocked(pd)
 	pd.lctx = c.pipeLabels(pd.id)
-	c.s.ShapeSpendHandshake(pd.hc.io.HandshakePadding)
 	pd.hc.take(pd.closeAll)
 	c.pipes[pd.id] = pd
+	c.s.SetNow(c.clk.now())
+	if !c.s.AdmitHandshake(pd.hc.io.HandshakeWrites, c.clk.wall(c.s.Now())) {
+		c.s.FailInternal("carrier handshake exceeds shaping profile")
+		return
+	}
+	if c.cfg.Accounting.Enabled {
+		p := pd.hc.io
+		a := pd.end.accounting
+		if a == nil {
+			a = newPipeAccounting(pd.id, c.cfg.Accounting)
+			pd.end.accounting = a
+		}
+		pd.accountSegment = a.startSegment()
+		if read && p.R != nil {
+			pd.accountRead = pd.accountSegment.startHalf(p.ReceiveSource, false, 0)
+		}
+		if write && p.W != nil {
+			pd.accountWrite = pd.accountSegment.startHalf(p.SendSource, true, 0)
+		}
+		pd.gs.onAccounting = pd.accountSegment.finish
+		if out := pd.end.join; out != nil && out.attempt != nil {
+			out.attempt.view.Attachments[out.index].Ticket = a
+		}
+	}
 	c.s.SetCarrierConn(pd.id, carrier)
 	if !read || !write {
 		pd.worker("pipe-unused", func() {
@@ -330,11 +419,14 @@ func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool, carrier any) {
 	}
 	c.startChannel(pd) // its receiver before the first record
 	if read && pd.hc.io.R != nil {
+		flight := *held
+		*held = receiveFlight{}
 		c.side.add()
 		pd.gs.add()
 		labels.Go(pd.lctx, "read", func() {
 			defer pd.gs.done()
-			c.readLoop(pd, 0, pd.hc.io.R, pd.hc.closeRead)
+			defer flight.release()
+			c.readLoop(pd, 0, pd.hc.io.R, pd.hc.closeRead, pd.accountRead)
 		})
 	}
 	if write && pd.hc.io.W != nil {
@@ -343,10 +435,32 @@ func (c *Conn) startPipeLocked(pd *pipeDrv, read, write bool, carrier any) {
 	}
 }
 
+// bindCarrierLocked transfers a real carrier slot to a driver after admission.
+func (c *Conn) bindCarrierLocked(pd *pipeDrv) {
+	if pd.hasCarrierSlot {
+		return
+	}
+	pd.hasCarrierSlot = true
+	if !pd.hasOwner {
+		pd.hasOwner = true
+		pd.gs.add() // retained until physical close returns
+	}
+	if !pd.physicalReserved {
+		c.s.AcquireCarriers(pd.physical)
+	}
+	releaseSetup := pd.gs.afterIO
+	pd.gs.afterIO = func() {
+		c.locked(func() { c.s.ReleaseCarriers(pd.physical) })
+		if releaseSetup != nil {
+			releaseSetup()
+		}
+	}
+}
+
 // queuePipeWriterLocked rechecks work received before handover or
 // while the early-data writer was stopped.
 func (c *Conn) queuePipeWriterLocked(pd *pipeDrv) {
-	if pd.writer.poll.Pending || pd.writer.shutdown != nil {
+	if pd.writer.poll.Ready.Load() || pd.writer.shutdown != nil {
 		c.s.QueueWriter(pd.id, 0, &pd.writer.poll)
 	}
 }
@@ -369,24 +483,27 @@ const writerExpired core.Time = -1
 
 // laneWriter serializes output on one carrier half. sessMu guards its state.
 type laneWriter struct {
-	wake     core.Signal
-	idleAt   core.Time // zero while active
-	starts   uint64    // reservations over this lane
 	ctx      context.Context
 	shutdown <-chan struct{} // pending half-close, ready after the close code is recorded
+	wake     core.Signal
+	idle     core.Deadline[*laneWriter]
+	idleAt   core.Time // zero while active
+	starts   uint64    // reservations over this lane
 	poll     core.WriteSignal
 	running  bool
 }
 
-func (w *laneWriter) expireLocked(now core.Time) core.Time {
-	if w.idleAt > now {
-		return w.idleAt
+func (c *Conn) expireWritersLocked(now core.Time) {
+	first := c.writerIdle.PopDue(now)
+	if first == nil {
+		return
 	}
-	if w.idleAt > 0 {
+	c.s.TrimSendReserve()
+	for d := first; d != nil; d = c.writerIdle.PopDue(now) {
+		w := d.Value
 		w.idleAt = writerExpired
 		w.wake.FireLocked()
 	}
-	return core.Never
 }
 
 type writerStart struct {
@@ -409,10 +526,10 @@ func (c *Conn) reserveWritersLocked(starts []writerStart) []writerStart {
 		default:
 		}
 		if req.Lane == 0 {
-			if !pd.wstop {
+			if !pd.wstop && req.Matches(&pd.writer.poll) {
 				starts = c.reserveWriterLocked(starts, pd, nil, &pd.writer, 0)
 			}
-		} else if lo := pd.lanes[req.Lane]; lo != nil {
+		} else if lo := pd.lanes[req.Lane]; lo != nil && req.Matches(&lo.writer.poll) {
 			starts = c.reserveWriterLocked(starts, pd, lo, &lo.writer, req.Lane)
 		}
 	}
@@ -421,7 +538,7 @@ func (c *Conn) reserveWritersLocked(starts []writerStart) []writerStart {
 }
 
 func (c *Conn) reserveWriterLocked(starts []writerStart, pd *pipeDrv, lo *laneOut, w *laneWriter, lane uint64) []writerStart {
-	if w.ctx == nil || w.shutdown == nil && !w.poll.Pending {
+	if w.ctx == nil || w.shutdown == nil && !w.poll.Ready.Load() {
 		return starts
 	}
 	if w.running {
@@ -441,6 +558,7 @@ func (c *Conn) reserveWriterLocked(starts []writerStart, pd *pipeDrv, lo *laneOu
 // releaseLocked ends ownership of the carrier half before the epilogue can
 // reserve it again. The worker counts cover the remaining lock-free epilogue.
 func (s writerStart) releaseLocked() {
+	s.pd.c.writerIdle.Cancel(&s.writer.idle)
 	s.writer.idleAt = 0
 	s.writer.running = false
 	if s.lo == nil && s.pd.wdone != nil {
@@ -460,16 +578,66 @@ func (s writerStart) run() {
 }
 
 // addBootstrap attaches pipe 0 and starts its goroutines (under the lock).
-func (c *Conn) addBootstrap(a preparedPipe, wait *attachment) {
+func (c *Conn) addBootstrap(a preparedPipe, wait *attachment, held *receiveFlight) {
 	pd := a.pd
 	pd.nest, _ = nestPipe(c, a.outer) // a new session cannot form a loop
 	c.s.AttachBootstrap(a.info, a.info, &pd.writer.poll)
+	if p := pd.hc.io.Liveness; p != (PipeLiveness{}) {
+		pd.end.opts.Liveness = Set(p)
+	}
 	c.s.SetPipeKind(0, uint8(pd.hc.io.Carrier)) // before its first record
 	if d, ok := pd.tcp.minRTT(); ok {
 		c.s.SetCarrierMinRTT(core.Duration(d))
 	}
 	wait.attach(pd)
-	c.startPipeLocked(pd, true, true, a.carrier)
+	c.startPipeLocked(pd, true, true, a.carrier, held)
+}
+
+// receiveFlight owns the space in which one reader may complete a record.
+// A nested reader may retain one range descriptor per byte of a record;
+// the underlying payload is already owned by the source's lease.
+type receiveFlight struct {
+	ledger *core.Budget
+	owner  *core.Session
+	bytes  int64
+}
+
+func reserveReceiveFlight(b *core.Budget, r io.Reader) (receiveFlight, error) {
+	if b == nil || r == nil {
+		return receiveFlight{}, nil
+	}
+	n := receiveFlightSize(r)
+	if !b.TryCharge(uint64(n)) {
+		return receiveFlight{}, ErrMemoryBudget
+	}
+	return receiveFlight{ledger: b, bytes: n}, nil
+}
+
+func receiveFlightSize(r io.Reader) int64 {
+	n := int64(3 * core.RecvBlockSize)
+	if byteSpanReader(r) != nil {
+		n += MaxRecordSize * 2 * 32 // descriptor capacity during geometric growth
+	}
+	return n
+}
+
+func (c *Conn) reserveReceiveFlight(r io.Reader) (receiveFlight, error) {
+	if r == nil {
+		return receiveFlight{}, nil
+	}
+	n := receiveFlightSize(r)
+	if !c.s.ReserveFlight(n) {
+		return receiveFlight{}, ErrMemoryBudget
+	}
+	return receiveFlight{owner: c.s, bytes: n}, nil
+}
+
+func (f receiveFlight) release() {
+	if f.owner != nil {
+		f.owner.ReleaseFlight(f.bytes)
+	} else if f.ledger != nil {
+		f.ledger.Release(uint64(f.bytes))
+	}
 }
 
 // bootstrapExporter is the late exporter that the reader of lane 0 of the
@@ -482,13 +650,8 @@ func (c *Conn) bootstrapExporter(pd *pipeDrv, lane uint64) *lateExporter {
 	return c.exp
 }
 
-// readLoop feeds what a carrier half delivers into the core: the bytes of
-// a byte stream, or the messages of a message carrier (FramingRecords),
-// each of at most MaxRecordSize bytes. It never waits for anything but the
-// carrier (its handshake, its early-data verdict), so reads never wait
-// behind writes. A quiet byte stream blocks on a small buffer and holds no
-// pooled read buffer.
-func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader, closeRead func()) {
+// readLoop delivers owned, bounded input without waiting for the writer.
+func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader, closeRead func(), account *accountHalf) {
 	defer c.side.done()
 	defer func() {
 		if p := recover(); p != nil {
@@ -498,157 +661,171 @@ func (c *Conn) readLoop(pd *pipeDrv, lane uint64, r io.Reader, closeRead func())
 	if lane != 0 {
 		defer closeRead() // A replaced driver or a failed reader also releases its lane.
 	}
-	var mr MessageReader
-	if pd.framing == FramingRecords {
-		var ok bool
-		if mr, ok = r.(MessageReader); !ok {
-			mr = noMessages{}
-		}
+	if account != nil {
+		defer account.retire()
+	}
+	messages := pd.framing == FramingRecords
+	limit := MaxRecordSize
+	if pd.maxRec > 0 {
+		limit = min(limit, pd.maxRec)
 	}
 	exp := c.bootstrapExporter(pd, lane)
 	first := true
-	var small [idleBufSize]byte
-	var buf *core.Buf
-	var msg []byte
-	used := 0
+	var br byteReadState
+	defer br.release()
+	var record ReceivedMessage
+	defer record.Release()
 	reads := 0
 	for {
+		var input core.Input
 		var n int
 		var err error
 		switch {
-		case mr != nil:
-			msg, err = mr.ReadMessage(MaxRecordSize)
-		case buf == nil:
-			n, err = r.Read(small[:])
-			if n > 0 {
-				buf = getReadBuf()
-				copy(buf.B, small[:n])
-				used = n
-			}
+		case messages:
+			record, err = readMessage(r, limit)
 		default:
-			n, err = r.Read(buf.B[used:])
-			used += n
+			n, input, err = br.read(r)
 		}
-		got := n > 0 || mr != nil && err == nil
+		got := n > 0 || messages && err == nil
+		if messages && got {
+			err = record.end
+		}
 		if first && got {
 			first = false
 			c.awaitVerdict(pd, lane)
 		}
 		if exp != nil && got {
 			if lerr := exp.load(c.done); lerr != nil {
-				// What was read waited for a handshake that failed.
-				err, used, msg = lerr, 0, nil
+				err, input, got = lerr, core.Input{}, false
 			}
 			exp = nil
 		}
+		var fault *core.PhysicalFault
+		var graceful bool
+		if err != nil {
+			fault = carrierFaultEvidence(err)
+			graceful = fault == nil && errors.Is(err, io.EOF)
+		}
+		var tally RecordTotals
+		if account != nil {
+			switch {
+			case messages:
+				tally = accountMessageRead(&record, err, graceful)
+			default:
+				tally = tallyStreamRead(input.Bytes())
+			}
+		}
 		consumed, dead := 0, false
-		// A deferred unlock turns a panic of the core into a closed
-		// session (Conn.unlock) instead of leaving the lock held.
 		func() {
 			c.lock()
 			defer c.unlock()
-			if pd.dead { // replaced (an early-data restart): its ID is another pipe's now
+			if pd.dead { // replaced: its ID may already belong to another attachment
 				dead = true
+				if account != nil {
+					account.add(tally, true)
+				}
 				return
 			}
 			now := c.clk.now()
 			switch {
-			case mr != nil && err == nil:
-				c.s.ReceiveMessage(pd.id, lane, &core.Buf{B: msg}, msg, now)
-			case used > 0:
-				consumed = c.s.Receive(pd.id, lane, buf, buf.B[:used], now)
+			case messages && got:
+				switch c.s.ReceiveMessage(pd.id, lane, record.span, now) {
+				case core.RecordValid:
+					tally.Valid = 1
+				case core.RecordProtocolInvalid:
+					tally.ProtocolInvalid = 1
+				case core.RecordUnclassified:
+				}
+			case input.Len() > 0 && account != nil:
+				var validation core.RecordValidations
+				consumed = c.s.ReceiveTracked(pd.id, lane, input, now, &validation)
+				tally.Valid, tally.ProtocolInvalid = validation.Valid, validation.ProtocolInvalid
+			case input.Len() > 0:
+				consumed = c.s.Receive(pd.id, lane, input, now)
+			}
+			if account != nil {
+				if err == nil && consumed < input.Len() {
+					tally.PartialBytes = 0 // The reader keeps the unfinished suffix for the next batch.
+				}
+				account.add(tally, err != nil)
 			}
 			if err != nil {
-				graceful := errors.Is(err, io.EOF)
-				var cause error
-				if !graceful {
-					cause = err
+				cause := err
+				// Multipath decides whether the end was expected from the
+				// attachment's drain and close state.
+				if graceful && !c.s.Features().Multipath {
+					cause = nil
 				}
-				c.s.PipeEnded(pd.id, lane, graceful, used > consumed, cause, now)
+				c.s.PipeEnded(pd.id, lane, graceful, input.Len() > consumed, cause, fault, now)
 			}
 			if reads++; reads&63 == 0 && pd.id == 0 && lane == 0 {
-				// The carrier's own minimum RTT feeds auto-tuning.
 				if d, ok := pd.tcp.minRTT(); ok {
 					c.s.SetCarrierMinRTT(core.Duration(d))
 				}
 			}
 		}()
-		msg = nil
+		record.Release()
 		if dead {
-			if buf != nil {
-				buf.Unref()
-			}
 			return
 		}
 		c.passDatagrams()
 		if err != nil {
-			if buf != nil {
-				buf.Unref()
-			}
 			if lane == 0 {
 				closeRead()
 			}
 			return
 		}
-		rest := used - consumed
-		switch {
-		case buf == nil:
-		case rest == 0:
-			// No partial record: give the buffer back and wait on the small
-			// one, unless the read filled it (bulk keeps its buffer).
-			if used < len(buf.B) || buf.Refs() > 1 {
-				buf.Unref()
-				buf, used = nil, 0
-			} else {
-				used = 0
-			}
-		case consumed > 0:
-			if buf.Refs() == 1 {
-				copy(buf.B, buf.B[consumed:used])
-			} else {
-				nb := getReadBuf()
-				copy(nb.B, buf.B[consumed:used])
-				buf.Unref()
-				buf = nb
-			}
-			used = rest
+		if !messages {
+			br.advance(consumed)
 		}
 	}
-}
-
-// noMessages is the message source of a Records carrier whose receiving
-// half reads no messages: it fails the pipe.
-type noMessages struct{}
-
-func (noMessages) ReadMessage(int) ([]byte, error) {
-	return nil, errors.New("zmux: Records framing needs a MessageReader")
 }
 
 // writeLoop produces batches for one outbound lane and writes them. It owns
 // the lane's write side: no other goroutine writes to it.
 func (c *Conn) writeLoop(start writerStart) {
 	pd, lane, lo := start.pd, start.lane, start.lo
-	defer func() {
-		if p := recover(); p != nil {
-			c.locked(func() {
-				// A panicking carrier cannot accept another batch.
-				start.writer.ctx = nil
-				start.releaseLocked()
-				c.poison(p)
-			})
-		}
-	}()
-	var w io.Writer = pd.hc.io.W
-	if lo != nil {
-		w = lo.w
-	}
-	var b *core.Batch // held while the lane has something to send
+	var b *core.Batch
+	var gather net.Buffers
+	var written int
+	var werr error
+	var fault *core.PhysicalFault
 	var reported bool // b was written and WriteDone is owed
 	defer func() {
-		if b != nil && !reported {
+		panicValue := recover()
+		if panicValue != nil || reported || b != nil && b.Handoffs() {
+			c.locked(func() {
+				if reported {
+					c.s.WriteDone(b, written, werr, c.clk.now(), fault)
+				} else if b != nil && b.Handoffs() {
+					b.Discard()
+				}
+				if panicValue != nil {
+					if b != nil {
+						c.s.ShapeWriteUnknown(b, b.EncodedLen())
+					}
+					// A panicking carrier cannot accept another batch.
+					start.writer.ctx = nil
+					start.releaseLocked()
+					c.poison(panicValue)
+				}
+			})
+		}
+		if b != nil {
 			core.PutBatch(b)
 		}
 	}()
+	var w io.Writer = pd.hc.io.W
+	account := pd.accountWrite
+	if lo != nil {
+		w, account = lo.w, lo.account
+	}
+	sealedOverhead := 0
+	if account != nil {
+		if sealed, ok := unprefixed(w).(*sealedWriter); ok {
+			sealedOverhead = sealed.framedOverhead()
+		}
+	}
 	// The carrier's unsent count: the half's own, else the TCP socket's.
 	var unsentOf func() (uint64, bool)
 	if u, ok := w.(UnsentReporter); ok {
@@ -657,20 +834,31 @@ func (c *Conn) writeLoop(start writerStart) {
 		unsentOf = pd.tcp.unsent
 	}
 
-	var werr error
 	var ending bool
 
 	for {
-		// Read outside the session lock.
+		// A carrier with a backlog reporter samples outside the session
+		// lock. Without one (including QUIC), the claim can consume a
+		// request published up to the point of the claim under the lock.
+		requested := unsentOf != nil && start.writer.poll.Ready.Load()
 		var unsent uint64
 		var unsentOK bool
-		if unsentOf != nil {
+		if requested && werr == nil {
 			unsent, unsentOK = unsentOf()
 		}
 		var shutdown <-chan struct{}
 		produced, stop, wait := false, false, false
 		func() {
 			c.lock()
+			if !requested && !reported && !ending && !pd.dead && !pd.wstop && !pd.retiring && !c.closing &&
+				start.writer.idleAt > 0 && !start.writer.poll.Ready.Load() && start.writer.shutdown == nil {
+				// The timer still owns this parked writer. A stale token
+				// changes neither protocol state nor its expiry.
+				start.writer.wake.Drain()
+				wait = true
+				c.unlockPeek()
+				return
+			}
 			defer c.unlock()
 			defer func() {
 				if stop {
@@ -679,38 +867,39 @@ func (c *Conn) writeLoop(start writerStart) {
 			}()
 			if pd.dead || lo == nil && pd.wstop {
 				if reported {
-					b.Discard()
 					reported = false
+					c.s.WriteDone(b, written, werr, c.clk.now(), fault)
 				}
 				stop = true
 				return
 			}
-			if start.writer.idleAt == writerExpired && !start.writer.poll.Pending && start.writer.shutdown == nil {
+			if start.writer.idleAt == writerExpired && !start.writer.poll.Ready.Load() && start.writer.shutdown == nil {
 				stop = true
 				return
 			}
+			c.writerIdle.Cancel(&start.writer.idle)
 			start.writer.idleAt = 0
 			now := c.clk.now()
 			if unsentOK {
 				c.s.SetCarrierUnsent(pd.id, lane, unsent, now)
 			}
 			if reported {
-				c.s.WriteDone(b, werr, now)
 				reported = false
+				c.s.WriteDone(b, written, werr, now, fault)
 			}
 			shutdown = start.writer.shutdown
 			start.writer.shutdown = nil
-			if shutdown == nil && werr == nil {
+			if shutdown == nil && werr == nil && (unsentOf == nil || requested) && c.s.ClaimWrite(pd.id, lane, &start.writer.poll) {
 				if b == nil {
 					b = core.GetBatch()
 				}
-				start.writer.poll.Pending = false
 				produced = c.s.PollTransmit(pd.id, lane, b, core.DefaultBatch, now)
 			}
 			stop = !produced && shutdown == nil && (werr != nil || c.closing || pd.retiring || ending)
-			if !stop && !produced && shutdown == nil && !start.writer.poll.Pending {
+			if !stop && !produced && shutdown == nil && !start.writer.poll.Ready.Load() {
 				start.writer.idleAt = now.Add(core.Duration(writerIdle))
-				c.writerIdleAt = min(c.writerIdleAt, start.writer.idleAt)
+				start.writer.idle.Value = start.writer
+				c.writerIdle.Set(&start.writer.idle, start.writer.idleAt)
 				start.writer.wake.Drain()
 				wait = true
 			}
@@ -719,8 +908,10 @@ func (c *Conn) writeLoop(start writerStart) {
 			return
 		}
 		if wait {
-			core.PutBatch(b)
-			b = nil
+			if b != nil {
+				core.PutBatch(b)
+				b = nil
+			}
 			select {
 			case <-start.writer.wake.C:
 			case <-pd.end.retired:
@@ -731,8 +922,36 @@ func (c *Conn) writeLoop(start writerStart) {
 			continue
 		}
 		if produced {
-			_, werr = writeBatch(w, pd.framing, b)
+			if account != nil {
+				b.RequireProgress()
+			}
+			var progress func(int)
+			if b.TracksShapeProgress() {
+				progress = func(n int) { c.locked(func() { c.s.ShapeWriteProgress(b, n, c.clk.now()) }) }
+			}
+			written, werr = writeBatch(w, pd.framing, b, &gather, progress)
+			if pd.framing != FramingRecords && werr == nil && written != b.Len() {
+				werr = io.ErrShortWrite
+			}
+			if werr != nil {
+				if e, ok := errors.AsType[*unknownWriteError](werr); ok {
+					c.locked(func() { c.s.SetNow(c.clk.now()); c.s.ShapeWriteUnknown(b, e.end) })
+				}
+				fault = carrierFaultEvidence(werr)
+			}
 			reported = true
+			if account != nil {
+				framed := pd.framing == FramingRecords
+				bytes, records, partial := b.Tally(written, framed, sealedOverhead)
+				imprecise := werr != nil && framed
+				if progress, ok := errors.AsType[*recordWriteError](werr); ok {
+					imprecise = false
+					if !progress.complete {
+						partial = progress.bytes
+					}
+				}
+				account.add(RecordTotals{Bytes: bytes, Records: records, PartialBytes: partial, Imprecise: imprecise}, werr != nil)
+			}
 			if b.Shutdown {
 				shutdown = closedChan
 			}
@@ -740,6 +959,7 @@ func (c *Conn) writeLoop(start writerStart) {
 		if shutdown != nil {
 			<-shutdown
 			if lo == nil {
+				account.retire()
 				pd.hc.shutdownWrite()
 			} else {
 				lo.close(false)
@@ -754,16 +974,40 @@ type batchWriter interface {
 	WriteBatch(b *core.Batch) (int, error)
 }
 
+// unknownWriteError marks a terminal carrier result with an unidentified accepted
+// prefix. end is the encoded end of the attempted unit within the batch.
+type unknownWriteError struct {
+	cause error
+	end   int
+}
+
+func (e *unknownWriteError) Error() string { return e.cause.Error() }
+func (e *unknownWriteError) Unwrap() error { return e.cause }
+
+// observeWrite distinguishes a carrier refusal from a lost acceptance report.
+func observeWrite(write func() error) error {
+	returned := false
+	err := hostCall(nil, "carrier write", func() error {
+		err := write()
+		returned = true
+		return err
+	})
+	if !returned {
+		return &unknownWriteError{cause: err}
+	}
+	return err
+}
+
 // writeBatch hands a batch to the carrier in one call (gather write on a
 // net.Conn or a BuffersWriter).
-func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
+func writeBatch(w io.Writer, framing Framing, b *core.Batch, gather *net.Buffers, progress func(int)) (int, error) {
 	if bw, ok := w.(batchWriter); ok && framing == FramingByteStream {
 		return bw.WriteBatch(b)
 	}
 	if framing == FramingRecords {
 		msgs := b.Messages()
 		n := 0
-		if bw, ok := w.(MessageBatchWriter); ok {
+		if bw, ok := w.(MessageBatchWriter); ok && !b.NeedsProgress() {
 			for _, m := range msgs {
 				n += len(m)
 			}
@@ -776,13 +1020,46 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 		if !ok {
 			return 0, errors.New("zmux: Records framing needs a MessageWriter")
 		}
-		for _, m := range msgs {
-			if err := mw.WriteMessage(m); err != nil {
+		write := mw.WriteMessage
+		if b.NeedsProgress() {
+			write = func(m []byte) error {
+				return observeWrite(func() error { return mw.WriteMessage(m) })
+			}
+		}
+		for i, m := range msgs {
+			var err error
+			if sealed, ok := unprefixed(w).(*sealedWriter); ok && progress != nil && !sealed.msgs {
+				err = sealed.writeMessages([][]byte{m}, func(prefix int) { progress(n + i*b.EnvelopeSize() + prefix) })
+			} else {
+				err = write(m)
+			}
+			if err != nil {
+				if unknown, ok := errors.AsType[*unknownWriteError](err); ok {
+					return n, &unknownWriteError{cause: unknown.cause, end: n + len(m) + (i+1)*b.EnvelopeSize()}
+				}
+				if progress, ok := errors.AsType[*recordWriteError](err); ok && progress.complete {
+					n += len(m)
+				}
 				return n, err
 			}
 			n += len(m)
+			if progress != nil {
+				progress(n + (i+1)*b.EnvelopeSize())
+			}
 		}
 		return n, nil
+	}
+	if progress != nil {
+		// Keep the immutable layout until every short-write suffix is submitted.
+		if bufs := b.Bufs(); len(bufs) == 1 {
+			return writeSuffix(w, bufs[0], progress)
+		}
+		return writeSuffix(w, b.Flat(), progress)
+	}
+	if _, ok := w.(interface{ PreferFlatWrite() }); ok {
+		// These byte-stream carriers take one contiguous slice. Reuse the
+		// batch's scratch for exactly as long as the carrier owns the write.
+		return w.Write(b.FlatView())
 	}
 	bufs := b.Bufs()
 	if len(bufs) == 1 {
@@ -793,8 +1070,9 @@ func writeBatch(w io.Writer, framing Framing, b *core.Batch) (int, error) {
 		return carrierio.WriteFlat(w, bufs)
 	}
 	if nc, ok := w.(net.Conn); ok {
-		nb := net.Buffers(bufs)
-		n, err := nb.WriteTo(nc)
+		*gather = bufs
+		n, err := gather.WriteTo(nc)
+		*gather = nil
 		return int(n), err
 	}
 	if bw, ok := w.(BuffersWriter); ok {
@@ -821,6 +1099,15 @@ func (c *Conn) openLane(pd *pipeDrv) {
 			safeLog(c.cfg.Logger, "lane close", func() { _ = w.Close() })
 		}
 	}()
+	var source CarrierHalfSource
+	if pd.end.accounting != nil && err == nil && w != nil {
+		if named, ok := w.(LaneSource); ok {
+			err = hostCall(c.cfg.Logger, "LaneSource", func() error { source = named.LaneSource(); return nil })
+		}
+		if source == (CarrierHalfSource{}) && pd.hc.io.LanesShareSource {
+			source = pd.hc.io.SendSource
+		}
+	}
 	c.lock()
 	defer c.unlock()
 	if pd.retiring || pd.dead || c.pipes[pd.id] != pd {
@@ -830,11 +1117,20 @@ func (c *Conn) openLane(pd *pipeDrv) {
 		c.s.LaneOpenFailed(pd.id)
 		return
 	}
+	if a := pd.end.accounting; a != nil {
+		if a.checkSources(CarrierHalfSource{}, source, false, true) != nil {
+			c.s.LaneOpenFailed(pd.id)
+			return
+		}
+	}
 	lo := &laneOut{w: w, writer: laneWriter{ctx: labels.With(pd.lctx, "zmux", "lane-write")}}
 	info := core.CarrierInfo{Framing: core.Framing(pd.framing), Lanes: true, MaxRecord: pd.maxRec}
 	lane, ok := c.s.LaneOpened(pd.id, info, &lo.writer.poll)
 	if !ok {
 		return
+	}
+	if pd.accountSegment != nil {
+		lo.account = pd.accountSegment.startHalf(source, true, lane)
 	}
 	w = nil // The lane now owns its writer.
 	lo.lane = lane
@@ -854,10 +1150,10 @@ func (c *Conn) openLane(pd *pipeDrv) {
 type pendingAct struct {
 	pd            *pipeDrv
 	lo            *laneOut
+	shutdownReady chan struct{}
 	reason        string
 	a             core.Action
 	code          ApplicationErrorCode
-	shutdownReady chan struct{}
 	reserved      bool // action may touch the carrier until doAction returns
 	start         bool
 	// coded: the session has ended, with an application close of code and
@@ -993,6 +1289,7 @@ func (pd *pipeDrv) closeHalves(abort bool, bound time.Duration) {
 		}
 		owner = true
 		pd.retiring = true
+		pd.accountSegment.retire()
 		pd.writer.wake.FireLocked()
 		for _, lo := range pd.lanes {
 			lo.writer.wake.FireLocked()
@@ -1050,6 +1347,7 @@ func (pd *pipeDrv) closeHalves(abort bool, bound time.Duration) {
 	if pd.hasOwner {
 		pd.gs.done()
 	}
+	pd.gs.finish()
 }
 
 // fail closes the session after a panic outside the lock.
@@ -1093,4 +1391,22 @@ func (c *Conn) releaseOrphansLocked() {
 		h.released(c.s.Release(h.st))
 		h = next
 	}
+}
+
+// addAfterIO registers an independent lifetime release after physical close.
+func (g *pipeGoroutines) addAfterIO(done func()) {
+	g.mu.Lock()
+	if g.closed && g.n == 0 {
+		g.mu.Unlock()
+		done()
+		return
+	}
+	prior := g.afterIO
+	g.afterIO = func() {
+		if prior != nil {
+			prior()
+		}
+		done()
+	}
+	g.mu.Unlock()
 }

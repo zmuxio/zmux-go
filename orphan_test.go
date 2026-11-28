@@ -3,7 +3,6 @@ package zmux
 import (
 	"context"
 	"errors"
-	"net"
 	"runtime"
 	"testing"
 	"testing/synctest"
@@ -21,26 +20,9 @@ func TestOrphanReleasedInBubble(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
 		cfg := func() *Config {
-			return &Config{Clock: timeshim.Real, Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1}
+			return &Config{ClockDomain: NewClockDomain(timeshim.Real), Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1}
 		}
-		a, b := net.Pipe()
-		ch := make(chan *Conn, 1)
-		go func() {
-			s, err := Server(ctx, b, cfg())
-			if err != nil {
-				s = nil
-			}
-			ch <- s
-		}()
-		client, err := Client(ctx, a, cfg())
-		if err != nil {
-			t.Fatal(err)
-		}
-		server := <-ch
-		if server == nil {
-			t.Fatal("no server session")
-		}
-		defer func() { _ = client.Close(); _ = server.Close(); _ = client.Wait(); _ = server.Wait() }()
+		client, server := bubblePair(t, cfg)
 		func() {
 			st, err := client.OpenStreamSync(ctx)
 			if err != nil {

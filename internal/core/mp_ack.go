@@ -3,7 +3,7 @@ package core
 import "github.com/zmuxio/zmux-go/internal/wire"
 
 // mpAckEntry processes one PIPE_ACK entry of a multipath session.
-func (s *Session) mpAckEntry(e wire.AckEntry, now Time) *wire.Error {
+func (s *Session) mpAckEntry(e wire.AckEntry, now Time, received *Pipe) *wire.Error {
 	m := s.mp
 	p := s.pipe(e.PipeID)
 	if p == nil {
@@ -32,6 +32,12 @@ func (s *Session) mpAckEntry(e wire.AckEntry, now Time) *wire.Error {
 	if e.Position > ol.pos {
 		return s.ackBeyondSent(e)
 	}
+	if received == p {
+		d := &a.health.receive
+		if d.running && d.proof == HealthProofNone && d.probeEnd != 0 && e.Lane == d.probeLane && e.Position >= d.probeEnd {
+			s.healthProof(p, DirIn)
+		}
+	}
 	if e.Position <= ol.acked {
 		return nil
 	}
@@ -54,7 +60,7 @@ func (s *Session) ackBeyondSent(e wire.AckEntry) *wire.Error {
 
 // mpAdvanced updates the pipe after its acknowledged position advanced.
 // mpAdvanced runs when the pipe's cumulative acknowledgement point moved.
-func (s *Session) mpAdvanced(p *Pipe, ol *outLane, ps *pipeSend, now Time) {
+func (s *Session) mpAdvanced(p *Pipe, ol *outLane, ps *pipeSend, now Time, delivered bool) {
 	a := p.mp
 	a.lastAdvance = now
 	if len(ps.samples) == 0 {
@@ -63,6 +69,9 @@ func (s *Session) mpAdvanced(p *Pipe, ol *outLane, ps *pipeSend, now Time) {
 	} else {
 		a.unacked, a.oldestAt = true, ps.samples[0].sent
 		s.setAhead(p, ps.samples[0].ahead)
+	}
+	if delivered && a.health.send.running {
+		a.deliveryAt, a.deliveryGen, a.deliveryCost = now, a.health.send.generation, s.stallCost(a)
 	}
 	switch a.out {
 	case OutSuspect:
@@ -80,6 +89,9 @@ func (s *Session) mpAdvanced(p *Pipe, ol *outLane, ps *pipeSend, now Time) {
 	s.revalAcked(p)
 	s.pingsAcked(p)
 	s.penaltyAcked(p)
+	s.armPathDeadline(p, pathStall)
+	s.armPathDeadline(p, pathDrain)
+	s.armPathDeadline(p, pathProbe)
 	s.mpLaneAdvanced(p, ol)
 }
 
@@ -116,7 +128,7 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 		s.charge() // every PIPE_PING
 		s.ack.immediate = true
 		if p.mp != nil && s.answersOnPair(p) {
-			p.mp.ackPair = true
+			m.pairAcks.add(p)
 		} else {
 			s.ack.pairless = true
 		}
@@ -132,7 +144,7 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 			}
 			if m.inWindow(f.PipeID) && !m.idRetired(f.PipeID) {
 				s.prepareAdditional().bits[f.PipeID] = true
-				m.pendAbandon[f.PipeID] = wire.PipeFailed
+				m.pendAbandon[f.PipeID] = pendingAbandon{code: wire.PipeFailed}
 				s.wakeAllWriters()
 			}
 			return nil
@@ -143,7 +155,7 @@ func (s *Session) onPipeFrame(p *Pipe, f *wire.Frame) *wire.Error {
 	case wire.KindPadding, wire.KindStream, wire.KindResetStream, wire.KindResetStreamAt,
 		wire.KindStopSending, wire.KindMaxData, wire.KindMaxStreamData, wire.KindMaxStreams,
 		wire.KindDataBlocked, wire.KindStreamDataBlocked, wire.KindStreamsBlocked, wire.KindClose,
-		wire.KindDatagram, wire.KindTransportParams, wire.KindPing, wire.KindGoAway,
+		wire.KindDatagram, wire.KindDatagramAck, wire.KindTransportParams, wire.KindPing, wire.KindGoAway,
 		wire.KindPriorityUpdate, wire.KindPipeAck, wire.KindPipeLane, wire.KindSessionEpoch:
 		// Not a pipe frame; dispatch routes only the three above here.
 	}

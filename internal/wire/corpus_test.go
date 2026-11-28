@@ -7,21 +7,31 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/varint"
 )
 
 type corpusEntry struct {
-	Limits        map[string]uint64 `json:"limits"`
-	ID            string            `json:"id"`
-	Kind          string            `json:"kind"`
-	Hex           string            `json:"hex"`
-	Error         string            `json:"error"`
-	Gates         []string          `json:"gates"`
-	Messages      []string          `json:"messages"`
-	MaxRecordSize uint64            `json:"max_record_size"`
-	NonMinimal    bool              `json:"non_minimal"`
+	Limits       map[string]uint64 `json:"limits"`
+	PipeStreamID *uint64           `json:"pipe_stream_id"`
+	ID           string            `json:"id"`
+	Kind         string            `json:"kind"`
+	Hex          string            `json:"hex"`
+	Error        string            `json:"error"`
+	Frame        struct {
+		Data string `json:"data"`
+	} `json:"frame"`
+	Gates    []string `json:"gates"`
+	Messages []string `json:"messages"`
+	ZeroFill struct {
+		Offset int `json:"offset"`
+		Count  int `json:"count"`
+	} `json:"zero_fill"`
+	MaxRecordSize uint64 `json:"max_record_size"`
+	Padding       int    `json:"padding"`
+	NonMinimal    bool   `json:"non_minimal"`
 }
 
 func loadCorpus(t testing.TB, name string) []corpusEntry {
@@ -46,12 +56,15 @@ func loadCorpus(t testing.TB, name string) []corpusEntry {
 
 func (e *corpusEntry) gates() Gates {
 	var g Gates
+	family := false
 	for _, n := range e.Gates {
 		switch n {
 		case "max_datagram_frame_size":
 			g.MaxDatagram = varint.MaxVarint
 		case "reset_stream_at":
 			g.ResetStreamAt = true
+		case "zmux_datagram_family":
+			family = true
 		case "zmux_goaway":
 			g.GoAway = true
 		case "zmux_priority":
@@ -68,6 +81,7 @@ func (e *corpusEntry) gates() Gates {
 		g.MaxDatagram = v
 	}
 	g.Lanes = g.Lanes && (g.Multipath || g.PipeAck)
+	g.DatagramAck = family && g.MaxDatagram > 0
 	return g
 }
 
@@ -147,32 +161,75 @@ func processEntry(e *corpusEntry) *Error {
 				return err
 			}
 		}
+	case "channel_datagram":
+		return e.processChannelDatagram(&g)
+	default:
+		return ErrFrame("unknown corpus entry kind")
+	}
+	return nil
+}
+
+func (e *corpusEntry) processChannelDatagram(g *Gates) *Error {
+	var f Frame
+	b, err := hex.DecodeString(e.Hex)
+	if err != nil || e.ZeroFill.Offset < 0 || e.ZeroFill.Offset > len(b) ||
+		e.ZeroFill.Count < 0 || e.ZeroFill.Count > MaxRecordSize {
+		return ErrFrame("invalid channel fixture encoding")
+	}
+	b = slices.Insert(b, e.ZeroFill.Offset, make([]byte, e.ZeroFill.Count)...)
+	if e.PipeStreamID != nil {
+		id, frame, ok := SplitChannelDatagram(b)
+		if !ok || id != *e.PipeStreamID {
+			return ErrProto("wrong Pipe Stream ID")
+		}
+		b = frame
+	}
+	if err := DecodeChannelFrame(b, &f, slices.Contains(e.Gates, "zmux_carrier_datagram_padding")); err != nil {
+		return err
+	}
+	if err := CheckGate(&f, g); err != nil {
+		return err
+	}
+	// A family DATAGRAM contains Sequence, Flow and a Context ID for a stream Flow.
+	if g.DatagramAck {
+		_, sequenceSize := varint.ConsumeVarint(f.Data)
+		flow, flowSize := varint.ConsumeVarint(f.Data[sequenceSize:])
+		_, contextSize := varint.ConsumeVarint(f.Data[sequenceSize+flowSize:])
+		if sequenceSize == 0 || flowSize == 0 || flow != 0 && contextSize == 0 {
+			return ErrProto("truncated channel datagram envelope")
+		}
+	}
+	if e.Error == "" && (len(b)-1-len(f.Data) != e.Padding || hex.EncodeToString(f.Data) != e.Frame.Data) {
+		return ErrFrame("wrong channel datagram payload or padding")
 	}
 	return nil
 }
 
 func TestCorpusValid(t *testing.T) {
 	for _, e := range loadCorpus(t, "valid.ndjson") {
-		if err := processEntry(&e); err != nil {
-			t.Errorf("%s: unexpected %v", e.ID, err)
-		}
-		if e.Kind == "frame" {
-			b, _ := hex.DecodeString(e.Hex)
-			checkRoundTrip(t, e.ID, b, !e.NonMinimal)
-		}
+		t.Run(e.ID, func(t *testing.T) {
+			if err := processEntry(&e); err != nil {
+				t.Errorf("unexpected %v", err)
+			}
+			if e.Kind == "frame" {
+				b, _ := hex.DecodeString(e.Hex)
+				checkRoundTrip(t, e.ID, b, !e.NonMinimal)
+			}
+		})
 	}
 }
 
 func TestCorpusInvalid(t *testing.T) {
 	for _, e := range loadCorpus(t, "invalid.ndjson") {
-		err := processEntry(&e)
-		if err == nil {
-			t.Errorf("%s: accepted, want %s", e.ID, e.Error)
-			continue
-		}
-		if got := TransportErrorName(err.Code); got != e.Error {
-			t.Errorf("%s: got %s (%v), want %s", e.ID, got, err, e.Error)
-		}
+		t.Run(e.ID, func(t *testing.T) {
+			err := processEntry(&e)
+			if err == nil {
+				t.Fatalf("accepted, want %s", e.Error)
+			}
+			if got := TransportErrorName(err.Code); got != e.Error {
+				t.Errorf("got %s (%v), want %s", got, err, e.Error)
+			}
+		})
 	}
 }
 

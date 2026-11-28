@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
@@ -63,12 +64,14 @@ func TestPool(t *testing.T) {
 		t.Fatal("Get after Shutdown")
 	}
 	// Age: an old connection takes no new pipe.
-	p2 := &ConnPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Millisecond}
-	x, _ := p2.Get(ctx)
-	time.Sleep(2 * time.Millisecond)
-	if y, _ := p2.Get(ctx); y.Conn == x.Conn {
-		t.Fatal("aged connection reused")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		p2 := &ConnPool[int]{Dial: func(context.Context) (int, error) { n++; return n, nil }, MaxConnectionAge: time.Millisecond}
+		x, _ := p2.Get(ctx)
+		synctest.Sleep(time.Millisecond)
+		if y, _ := p2.Get(ctx); y.Conn == x.Conn {
+			t.Fatal("aged connection reused")
+		}
+	})
 }
 
 func TestPoolFateFitsTheWireWithoutChangingItsValue(t *testing.T) {
@@ -143,7 +146,7 @@ func TestPoolCancelledFailedDialTakesNoLease(t *testing.T) {
 			cancel()
 			return 0, ctx.Err()
 		},
-		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) { d.Count = 2 }),
+		Policy: policyFunc(func(_ *ConnectionView, d *ConnectionDecision) { d.Count = 2 }),
 	}
 	defer p.Shutdown()
 	a, err := p.Get(ctx)
@@ -216,7 +219,7 @@ func TestPoolRejectsAndReportsInvalidDecision(t *testing.T) {
 	var reported []error
 	p = &ConnPool[int]{
 		Dial: func(context.Context) (int, error) { n++; return n, nil },
-		Policy: policyFunc(func(_ *zmux.PoolView, d *zmux.PoolDecision) {
+		Policy: policyFunc(func(_ *ConnectionView, d *ConnectionDecision) {
 			d.Count, d.Liveness.ProbeInterval = 3, 500*time.Millisecond
 		}),
 		DecisionRejected: func(err error) {
@@ -284,7 +287,10 @@ func TestPoolRejectedLookLogged(t *testing.T) {
 // rejectPolicy sets a decision and rejects the look.
 type rejectPolicy struct{ err error }
 
-func (p rejectPolicy) Decide(_ *zmux.PoolView, d *zmux.PoolDecision) error { d.Count = 3; return p.err }
+func (p rejectPolicy) Decide(_ *ConnectionView, d *ConnectionDecision) error {
+	d.Count = 3
+	return p.err
+}
 
 // TestPoolCountDropRetiresIdlest: a policy's Count below the open
 // connections retires the surplus, the longest idle first, which closes
@@ -293,7 +299,7 @@ func TestPoolCountDropRetiresIdlest(t *testing.T) {
 	n := 0
 	closed := map[int]bool{}
 	count := 2
-	var views []zmux.PoolView
+	var views []ConnectionView
 	// Get asks the policy when it counts its dial, before the connection
 	// exists, and again when the member joins; the first dial waits for the
 	// first look so that both orders of the two are fixed, not left to the
@@ -303,8 +309,8 @@ func TestPoolCountDropRetiresIdlest(t *testing.T) {
 	p := &ConnPool[int]{
 		Dial:  func(context.Context) (int, error) { <-looked; n++; return n, nil },
 		Close: func(c int) { closed[c] = true },
-		Policy: policyFunc(func(v *zmux.PoolView, d *zmux.PoolDecision) {
-			views = append(views, zmux.PoolView{SinceLastDial: v.SinceLastDial, Members: append([]zmux.PoolMember(nil), v.Members...)})
+		Policy: policyFunc(func(v *ConnectionView, d *ConnectionDecision) {
+			views = append(views, ConnectionView{SinceLastDial: v.SinceLastDial, Members: append([]ConnectionMember(nil), v.Members...)})
 			d.Count = count
 			once.Do(func() { close(looked) })
 		}),

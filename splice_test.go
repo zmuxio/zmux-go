@@ -213,7 +213,7 @@ func TestSpliceCancelCause(t *testing.T) {
 			t.Run(f.name+"/"+c.name, func(t *testing.T) {
 				leakcheck.Check(t)
 				client, rin, rout, server := packetRelayEnv(t, "tcp")
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 				defer cancel()
 				sctx, scancel := context.WithCancelCause(ctx)
 				defer scancel(nil)
@@ -238,11 +238,7 @@ func TestSpliceCancelCause(t *testing.T) {
 					if !errors.As(rerr, &se) || se.ErrorCode != c.want {
 						t.Errorf("%s read: %v, want code %#x", name, rerr, uint64(c.want))
 					}
-					waitUntil(t, 5*time.Second, name+" stop", func() bool {
-						_, err := s.Write([]byte("x"))
-						return err != nil
-					})
-					_, werr := s.Write([]byte("x"))
+					werr := waitStreamStop(ctx, s)
 					if !errors.As(werr, &se) || se.ErrorCode != c.stop {
 						t.Errorf("%s write: %v, want code %#x", name, werr, uint64(c.stop))
 					}

@@ -20,6 +20,7 @@ import (
 // write call, a WriteBuffers call as one.
 type writeLog struct {
 	c      net.Conn
+	first  chan struct{}
 	writes [][]byte
 	mu     sync.Mutex
 }
@@ -27,6 +28,9 @@ type writeLog struct {
 func (w *writeLog) Write(b []byte) (int, error) {
 	w.mu.Lock()
 	w.writes = append(w.writes, bytes.Clone(b))
+	if len(w.writes) == 1 && w.first != nil {
+		close(w.first)
+	}
 	w.mu.Unlock()
 	return w.c.Write(b)
 }
@@ -43,9 +47,28 @@ func (w *writeLog) log() [][]byte {
 	return append([][]byte(nil), w.writes...)
 }
 
+type firstFlightReader struct {
+	io.ReadCloser
+	wrote <-chan struct{}
+}
+
+func (r firstFlightReader) Read(p []byte) (int, error) {
+	<-r.wrote
+	return r.ReadCloser.Read(p)
+}
+
+type firstFlightMessageReader struct {
+	firstFlightReader
+}
+
+func (r firstFlightMessageReader) ReadMessage(limit int) (ReceivedMessage, error) {
+	<-r.wrote
+	return r.ReadCloser.(MessageReader).ReadMessage(limit)
+}
+
 func holdConfig() *Config {
 	cfg := mpConfig()
-	cfg.EarlyData = EarlyData{ZmuxPeer: true, HoldFirstFlight: true}
+	cfg.EarlyData = EarlyData{HoldFirstFlight: true}
 	return cfg
 }
 
@@ -68,15 +91,15 @@ func startHeld(t *testing.T, ctx context.Context, p, peer PipeIO, cfg *Config) (
 }
 
 // The held first flight: nothing is written before ReleaseFirstFlight,
-// then the parameters and the stream written before leave in one write;
-// further calls do nothing.
+// then the parameters leave while the peer parameters are gated. Early
+// stream bytes stay queued until the peer parameters arrive.
 func TestHoldFirstFlight(t *testing.T) {
 	leakcheck.Check(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	a, b := net.Pipe()
-	wl := &writeLog{c: a}
-	c, server := startHeld(t, ctx, PipeIO{R: a, W: wl}, NetPipe(b), holdConfig())
+	wl := &writeLog{c: a, first: make(chan struct{})}
+	c, server := startHeld(t, ctx, PipeIO{R: firstFlightReader{ReadCloser: a, wrote: wl.first}, W: wl}, NetPipe(b), holdConfig())
 	hello := []byte("HELLO, first flight")
 	st, err := c.OpenStream()
 	if err != nil {
@@ -85,7 +108,6 @@ func TestHoldFirstFlight(t *testing.T) {
 	if _, err := st.Write(hello); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
 	if n := len(wl.log()); n != 0 {
 		t.Fatalf("%d writes before the release", n)
 	}
@@ -98,7 +120,7 @@ func TestHoldFirstFlight(t *testing.T) {
 	}
 	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
 	first := wl.log()[0]
-	if cls, _ := wire.ClassifyFirstBytes(first, false); cls != wire.FirstRecord || !bytes.Contains(first, hello) {
+	if cls, _ := wire.ClassifyFirstBytes(first, false); cls != wire.FirstRecord || bytes.Contains(first, hello) {
 		t.Fatalf("first write %x", first)
 	}
 	ss, err := s.AcceptStream(ctx)
@@ -123,8 +145,9 @@ func TestHoldFirstFlightMessages(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	x, y := msgCarriers()
-	bx := &batchCarrier{msgCarrier: x}
-	c, server := startHeld(t, ctx, PipeIO{R: bx, W: bx, Framing: FramingRecords},
+	bx := &batchCarrier{msgCarrier: x, wrote: make(chan struct{})}
+	r := firstFlightMessageReader{firstFlightReader{ReadCloser: bx, wrote: bx.wrote}}
+	c, server := startHeld(t, ctx, PipeIO{R: r, W: bx, Framing: FramingRecords},
 		PipeIO{R: y, W: y, Framing: FramingRecords}, holdConfig())
 	st, err := c.OpenStream()
 	if err != nil {
@@ -133,7 +156,6 @@ func TestHoldFirstFlightMessages(t *testing.T) {
 	if _, err := st.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(20 * time.Millisecond)
 	if bx.batches.Load() != 0 {
 		t.Fatal("written before the release")
 	}
@@ -148,8 +170,8 @@ func TestHoldFirstFlightMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 	echoOnce(t, ctx, c, s)
-	if f := bx.first.Load(); f == nil || !bytes.Contains(*f, []byte("hello")) || bx.single.Load() != 0 {
-		t.Fatalf("first batch of %d messages without the stream, %d single writes", bx.firstBatch.Load(), bx.single.Load())
+	if f := bx.first.Load(); f == nil || bytes.Contains(*f, []byte("hello")) || bx.single.Load() != 0 {
+		t.Fatalf("first batch of %d messages unexpectedly contained early application bytes, %d single writes", bx.firstBatch.Load(), bx.single.Load())
 	}
 	runtime.KeepAlive(st)
 }
@@ -176,18 +198,8 @@ func TestHoldFirstFlightTimeout(t *testing.T) {
 	}
 }
 
-// HoldFirstFlight needs client early data.
+// Only the bootstrap initiator can hold its first flight.
 func TestHoldFirstFlightConfig(t *testing.T) {
-	for _, e := range []EarlyData{{HoldFirstFlight: true}, {HoldFirstFlight: true, Remembered: []byte{1}}} {
-		a, b := net.Pipe()
-		cfg := mpConfig()
-		cfg.EarlyData = e
-		if _, err := Start(context.Background(), NetPipe(a), RoleClient, cfg); !errors.Is(err, ErrInvalidConfig) {
-			t.Fatalf("%+v: %v", e, err)
-		}
-		_ = a.Close()
-		_ = b.Close()
-	}
 	a, b := net.Pipe()
 	defer func() { _ = a.Close(); _ = b.Close() }()
 	if _, err := startServerNoListener(context.Background(), NetPipe(a), holdConfig()); !errors.Is(err, ErrInvalidConfig) {

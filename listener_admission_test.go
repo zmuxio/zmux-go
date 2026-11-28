@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/timeshim"
@@ -57,7 +58,9 @@ func TestAdmissionEveryEntry(t *testing.T) {
 	expect := func(what string) {
 		t.Helper()
 		want++
-		waitUntil(t, 5*time.Second, what, func() bool { return decided.Load() == want })
+		if got := decided.Load(); got != want {
+			t.Fatalf("%s: %d decisions, want %d", what, got, want)
+		}
 	}
 	// TCP and TLS.
 	nc, err := net.Dial("tcp", serve(false))
@@ -101,7 +104,7 @@ func TestAdmissionSource(t *testing.T) {
 		}
 		return Decision{Verdict: VerdictClose}
 	}}
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, MaxPendingPerSource: 1})
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: adm, MaxPendingPerSource: 2})
 	defer func() { _ = lst.Close() }()
 	ctx := context.Background()
 	src := netip.MustParseAddrPort("203.0.113.7:0")
@@ -113,11 +116,18 @@ func TestAdmissionSource(t *testing.T) {
 	if info.Source != src || info.Peer != netip.MustParseAddrPort("192.0.2.1:1000") {
 		t.Fatalf("source %v, peer %v", info.Source, info.Peer)
 	}
-	// Another peer, the same source: refused at once, undecided.
-	c, d := net.Pipe()
+	// A second carrier consumes the last slot, even with a different peer.
 	other := &net.TCPAddr{IP: net.ParseIP("198.51.100.1"), Port: 1}
+	x, y := net.Pipe()
+	held := make(chan struct{})
+	go func() { _ = lst.HandlePipe(ctx, NetPipe(addrConn{x, other}), PipeHint{Source: src}); close(held) }()
+	if info := <-infos; info.Source != src {
+		t.Fatalf("second carrier source %v", info.Source)
+	}
+	// A third carrier's source is full, so it is refused before admission.
+	c, d := net.Pipe()
 	if err := lst.HandlePipe(ctx, NetPipe(addrConn{c, other}), PipeHint{Source: netip.MustParseAddrPort("203.0.113.7:9")}); err == nil {
-		t.Fatal("a second carrier of a full source was taken")
+		t.Fatal("a third carrier of a full source was taken")
 	}
 	if _, err := d.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("refused carrier: %v", err)
@@ -131,11 +141,13 @@ func TestAdmissionSource(t *testing.T) {
 	}
 	close(release)
 	<-done
+	<-held
 	<-done2
 	_ = b.Close()
+	_ = y.Close()
 	_ = d.Close()
 	_ = f.Close()
-	if st := lst.Stats(); st.Refused != 1 || st.Admission.Closed != 2 {
+	if st := lst.Stats(); st.Refused != 1 || st.Admission.Closed != 3 {
 		t.Fatalf("stats %+v", st)
 	}
 }
@@ -146,42 +158,46 @@ func TestAdmissionSource(t *testing.T) {
 // closed without a handshake, while another source is served.
 func TestAdmissionSlotBeforeHandshake(t *testing.T) {
 	leakcheck.Check(t)
-	srvTLS, _ := selfSignedTLS(t)
-	var decided atomic.Int32
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: decideWith(VerdictClose, &decided), MaxPendingPerSource: 2})
-	defer func() { _ = lst.Close() }()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	src := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}
-	var wg sync.WaitGroup
-	clients := make([]net.Conn, 0, 2)
-	for range 2 { // silent clients: their handshakes never finish
-		a, b := net.Pipe()
-		clients = append(clients, b)
-		wg.Go(func() {
-			_ = lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), PipeHint{})
-		})
-	}
-	waitUntil(t, 5*time.Second, "two slots", func() bool {
+	synctest.Test(t, func(t *testing.T) {
+		srvTLS, _ := selfSignedTLS(t)
+		var decided atomic.Int32
+		lst := mustNewListener(&ListenerConfig{Config: mpConfig(), Admission: decideWith(VerdictClose, &decided), MaxPendingPerSource: 2})
+		defer func() { _ = lst.Close() }()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		src := &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 1}
+		var wg sync.WaitGroup
+		clients := make([]net.Conn, 0, 2)
+		for range 2 { // silent clients: their handshakes never finish
+			a, b := net.Pipe()
+			clients = append(clients, b)
+			wg.Go(func() {
+				_ = lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), PipeHint{})
+			})
+		}
+		synctest.Wait()
 		lst.pmu.Lock()
-		defer lst.pmu.Unlock()
-		return lst.pending.Held(lst.sourceKey(netip.MustParseAddrPort("192.0.2.1:1"))) == 2
+		held := lst.pending.Held(lst.sourceKey(netip.MustParseAddrPort("192.0.2.1:1")))
+		lst.pmu.Unlock()
+		if held != 2 {
+			t.Fatalf("%d slots held before TLS completed, want 2", held)
+		}
+		a, b := net.Pipe()
+		if err := lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), PipeHint{}); err == nil {
+			t.Fatal("a third carrier of the source was taken")
+		}
+		if _, err := b.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("refused carrier: %v", err)
+		}
+		cancel()
+		for _, c := range clients {
+			_ = c.Close()
+		}
+		wg.Wait()
+		if st := lst.Stats(); st.Refused != 1 || st.Admission.HandshakeFailed != 2 || st.SetupFailures != 0 || decided.Load() != 0 {
+			t.Fatalf("stats %+v, %d decisions", st, decided.Load())
+		}
 	})
-	a, b := net.Pipe()
-	if err := lst.HandlePipe(ctx, NetPipe(tls.Server(addrConn{a, src}, srvTLS)), PipeHint{}); err == nil {
-		t.Fatal("a third carrier of the source was taken")
-	}
-	if _, err := b.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
-		t.Fatalf("refused carrier: %v", err)
-	}
-	cancel()
-	for _, c := range clients {
-		_ = c.Close()
-	}
-	wg.Wait()
-	if st := lst.Stats(); st.Refused != 1 || st.Admission.HandshakeFailed != 2 || st.SetupFailures != 0 || decided.Load() != 0 {
-		t.Fatalf("stats %+v, %d decisions", st, decided.Load())
-	}
 }
 
 // TestAdmissionStats checks each AdmissionStats count, and that the
@@ -266,7 +282,7 @@ func newFakeEnv(t *testing.T, adm *Admission, firstRecord time.Duration) *fakeEn
 	t.Helper()
 	clk := timeshim.NewFake(time.Unix(1767225600, 0))
 	cfg := mpConfig()
-	cfg.Clock = clk
+	cfg.ClockDomain = NewClockDomain(clk)
 	e := &fakeEnv{clk: clk, lst: mustNewListener(&ListenerConfig{Config: cfg, Admission: adm, FirstRecordTimeout: firstRecord}),
 		done: make(chan struct{})}
 	a, b := net.Pipe()
@@ -304,20 +320,23 @@ func (e *fakeEnv) ended(t *testing.T) {
 func TestAdmissionFakeClock(t *testing.T) {
 	leakcheck.Check(t)
 	t.Run("peek", func(t *testing.T) {
-		e := newFakeEnv(t, &Admission{Peek: 4, PeekTimeout: 10 * time.Second,
-			Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{} }}, 0)
-		_, _ = e.peer.Write([]byte{1})
-		e.advance(t, 1, 10*time.Second-time.Nanosecond)
-		select {
-		case <-e.done:
-			t.Fatal("ended before the peek timeout")
-		case <-time.After(20 * time.Millisecond):
-		}
-		e.clk.Advance(time.Nanosecond)
-		e.ended(t)
-		if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1}) {
-			t.Fatalf("stats %+v", st)
-		}
+		synctest.Test(t, func(t *testing.T) {
+			e := newFakeEnv(t, &Admission{Peek: 4, PeekTimeout: 10 * time.Second,
+				Decide: func(context.Context, CarrierInfo, []byte) Decision { return Decision{} }}, 0)
+			_, _ = e.peer.Write([]byte{1})
+			e.advance(t, 1, 10*time.Second-time.Nanosecond)
+			synctest.Wait()
+			select {
+			case <-e.done:
+				t.Fatal("ended before the peek timeout")
+			default:
+			}
+			e.clk.Advance(time.Nanosecond)
+			e.ended(t)
+			if st := e.lst.Stats().Admission; !eqAdm(st, AdmissionStats{PeekTimedOut: 1}) {
+				t.Fatalf("stats %+v", st)
+			}
+		})
 	})
 	t.Run("decision deadline", func(t *testing.T) {
 		entered, dls := make(chan struct{}), make(chan time.Time, 1)
@@ -506,7 +525,7 @@ func TestAdmissionFallbackOnPeekTimeout(t *testing.T) {
 		t.Helper()
 		clk := timeshim.NewFake(time.Unix(1767225600, 0))
 		cfg := mpConfig()
-		cfg.Clock = clk
+		cfg.ClockDomain = NewClockDomain(clk)
 		got := make(chan net.Conn, 1)
 		hold := make(chan struct{}) // the carrier is the fallback's while it runs
 		e := &fakeEnv{clk: clk, done: make(chan struct{}),

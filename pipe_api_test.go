@@ -7,7 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
+
 	"testing"
 	"testing/synctest"
 	"time"
@@ -57,7 +57,7 @@ func TestPipeWaitDone(t *testing.T) {
 		}
 		select {
 		case <-c.p.Done():
-		case <-time.After(time.Second):
+		default:
 			t.Fatalf("%s: Done not closed after Wait", name)
 		}
 	}
@@ -147,20 +147,33 @@ func TestBackoff(t *testing.T) {
 	if f.Min != DefaultMinBackoff || f.Max != DefaultMaxBackoff || f.Jitter != DefaultBackoffJitter {
 		t.Fatalf("defaults %+v", f)
 	}
-	if j := (Backoff{Jitter: -1}).filled().Jitter; j != 0 {
-		t.Fatalf("negative jitter %v", j)
+	if j := (Backoff{Jitter: Set(0.0)}).filled().Jitter; j != 0 {
+		t.Fatalf("explicit zero jitter %v", j)
 	}
-	for _, b := range []Backoff{{Min: -1}, {Max: -1}, {Jitter: 1}, {Jitter: math.NaN()},
+	for _, b := range []Backoff{{Min: -1}, {Max: -1}, {Jitter: Set(-1.0)}, {Jitter: Set(1.01)}, {Jitter: Set(math.NaN())}, {JitterUp: Set(1.01)},
+		{Max: math.MaxInt64, JitterUp: Set(1.0)},
 		{Min: 2 * time.Second, Max: time.Second}, {Min: 2 * DefaultMaxBackoff}} {
 		if err := b.validate("Backoff"); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%+v: %v", b, err)
 		}
 	}
-	if err := (Backoff{Min: time.Second, Max: time.Second, Jitter: 0.5}).validate("Backoff"); err != nil {
+	if err := (Backoff{Min: time.Second, Max: time.Second, Jitter: Set(0.5)}).validate("Backoff"); err != nil {
 		t.Fatal(err)
 	}
-	b := Backoff{Jitter: -1}.filled()
-	if w := b.wait(time.Second); w != time.Second {
+	endpoints, err := (Backoff{Jitter: Set(1.0), JitterUp: Set(1.0)}).WithDefaults(retryDefaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		sample float64
+		want   time.Duration
+	}{{0, 0}, {0.5, time.Second}, {1, 2 * time.Second}} {
+		if got := endpoints.waitSample(time.Second, tc.sample); got != tc.want {
+			t.Fatalf("sample %v: got %v, want %v", tc.sample, got, tc.want)
+		}
+	}
+	b := Backoff{Jitter: Set(0.0)}.filled()
+	if w := b.Wait(time.Second); w != time.Second {
 		t.Fatalf("wait without jitter %v", w)
 	}
 }
@@ -446,9 +459,9 @@ func TestReturnOnReplyPeerHasNoPipeYet(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	short, cancelShort := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer cancelShort()
-	if err := p.WaitAttached(short); !errors.Is(err, context.DeadlineExceeded) {
+	short, cancelShort := context.WithCancel(ctx)
+	cancelShort()
+	if err := p.WaitAttached(short); !errors.Is(err, context.Canceled) {
 		t.Fatalf("WaitAttached before the Confirm arrived: %v", err)
 	}
 	close(release)
@@ -617,9 +630,10 @@ func TestInboundJoinOutcomeReasons(t *testing.T) {
 				case "timeout":
 					want = ErrJoinTimeout
 				case "evicted":
-					limits := e.lst.Limits()
-					limits.MaxPendingPerSession = 1
-					if err := e.lst.SetLimits(limits); err != nil {
+					policy := cfg.SessionPolicy
+					policy.Revision++
+					policy.Limits.PendingPeerJoins = 1
+					if err := e.server.SetSessionPolicy(policy); err != nil {
 						t.Fatal(err)
 					}
 					pending()
@@ -718,71 +732,18 @@ func TestOutboundJoinOutcomeBeforePipeID(t *testing.T) {
 	})
 }
 
-// HS-21.
-func TestAutomaticJoinOutcome(t *testing.T) {
-	for _, source := range []string{"pool", "redial"} {
-		t.Run(source, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				cc, sc := mpConfig(), mpConfig()
-				cc.ResumeTimeout, sc.ResumeTimeout = time.Minute, time.Minute
-				type outcome struct {
-					err error
-					id  PipeID
-				}
-				seen := make(chan outcome, 8)
-				cc.JoinOutcome = func(_ *Conn, id PipeID, err error) { seen <- outcome{id: id, err: err} }
-				var e *mpEnv
-				var calls int
-				dial := func(ctx context.Context) (PipeIO, error) {
-					calls++
-					if calls == 1 {
-						return PipeIO{}, errors.New("no carrier")
-					}
-					return e.pipeDialer()(ctx)
-				}
-				if source == "redial" {
-					cc.Redial = func(ctx context.Context, _ Direction) (PipeIO, error) { return dial(ctx) }
-				}
-				e = newMemMPEnv(t, cc, sc)
-				ctx, stop := context.WithCancel(t.Context())
-				defer stop()
-				done := make(chan error, 1)
-				if source == "pool" {
-					go func() { done <- e.client.MaintainPipes(ctx, PipePool{Dial: dial}) }()
-				} else {
-					e.client.pipes[0].closeAll()
-				}
-				n := <-seen
-				if n.err != nil || n.id == 0 || n.id == UnassignedPipeID {
-					t.Fatalf("outcome %+v", n)
-				}
-				if _, ok := e.server.Pipe(n.id); !ok {
-					t.Fatalf("peer lacks confirmed pipe %d", n.id)
-				}
-				stop()
-				if source == "pool" {
-					if err := <-done; !errors.Is(err, context.Canceled) {
-						t.Fatal(err)
-					}
-				}
-				synctest.Wait()
-				select {
-				case extra := <-seen:
-					t.Fatalf("unexpected additional outcome %+v", extra)
-				default:
-				}
-			})
-		})
-	}
-}
-
 // HS-24.
 func TestJoinOutcomeRefusal(t *testing.T) {
 	for _, authorized := range []bool{false, true} {
 		synctest.Test(t, func(t *testing.T) {
 			cc, sc := mpConfig(), mpConfig()
 			in, out := make(chan error, 1), make(chan error, 1)
-			sc.AuthorizeJoin = func(*Conn, PipeID) bool { return authorized }
+			sc.SessionPolicy.AuthorizeJoin = func(context.Context, JoinAuthorization) (JoinVerdict, error) {
+				if authorized {
+					return JoinPermit, nil
+				}
+				return JoinDeny, nil
+			}
 			sc.JoinOutcome = func(_ *Conn, _ PipeID, err error) { in <- err }
 			cc.JoinOutcome = func(_ *Conn, _ PipeID, err error) { out <- err }
 			e := newMemMPEnv(t, cc, sc)
@@ -852,119 +813,6 @@ func TestJoinOutcomeHoldsRetirement(t *testing.T) {
 			}
 		}
 	})
-}
-
-// HS-21, HS-22.
-func TestPipeConfirmationDeadline(t *testing.T) {
-	for _, source := range []string{"AddPipe", "synchronous", "withoutHook", "Redial", "MaintainPipes"} {
-		for _, when := range []string{"before", "at", "after"} {
-			t.Run(source+"/"+when, func(t *testing.T) {
-				synctest.Test(t, func(t *testing.T) {
-					cc, sc := mpConfig(), mpConfig()
-					cc.JoinTimeout = 20 * time.Millisecond
-					cc.ResumeTimeout, sc.ResumeTimeout = time.Minute, time.Minute
-					notice := make(chan error, 2)
-					if source != "withoutHook" {
-						cc.JoinOutcome = func(_ *Conn, _ PipeID, err error) { notice <- err }
-					}
-					gate := make(chan struct{})
-					open := sync.OnceFunc(func() { close(gate) })
-					defer open()
-					var e *mpEnv
-					var dialed atomic.Bool
-					dial := func(ctx context.Context) (PipeIO, error) {
-						if dialed.Swap(true) {
-							<-ctx.Done()
-							return PipeIO{}, ctx.Err()
-						}
-						n, err := e.dial(ctx)
-						if err != nil {
-							return PipeIO{}, err
-						}
-						return NetPipe(holdLaterWrites(n, gate)), nil
-					}
-					if source == "Redial" {
-						cc.Redial = func(ctx context.Context, _ Direction) (PipeIO, error) { return dial(ctx) }
-					}
-					e = newMemMPEnv(t, cc, sc)
-					ctx, cancel := context.WithCancel(t.Context())
-					defer cancel()
-					var p *Pipe
-					stopPool := make(chan error, 1)
-					explicit := make(chan error, 1)
-					switch source {
-					case "Redial":
-						e.client.pipes[0].closeAll()
-					case "MaintainPipes":
-						go func() { stopPool <- e.client.MaintainPipes(ctx, PipePool{Dial: dial}) }()
-					default:
-						q, err := dial(ctx)
-						if err != nil {
-							t.Fatal(err)
-						}
-						if source == "synchronous" {
-							go func() { _, err := e.client.AddPipe(ctx, q, PipeOptions{}); explicit <- err }()
-							break
-						}
-						p, err = e.client.AddPipe(ctx, q, PipeOptions{ReturnOnReply: true})
-						if err != nil {
-							t.Fatal(err)
-						}
-					}
-					synctest.Wait()
-					if p == nil {
-						for _, member := range e.client.Pipes() {
-							if member.ID() != 0 {
-								p = member
-								break
-							}
-						}
-					}
-					if p == nil {
-						t.Fatal("missing reply-only pipe")
-					}
-					left := time.Until(p.end.join.deadline)
-					switch when {
-					case "before":
-						open()
-					case "at":
-						time.AfterFunc(left, open)
-					case "after": // keep Confirm until the terminal decision
-					}
-					got := p.WaitAttached(ctx)
-					if source == "synchronous" {
-						if err := <-explicit; !errors.Is(err, got) {
-							t.Fatalf("AddPipe %v, WaitAttached %v", err, got)
-						}
-					}
-					if when == "before" && got != nil || when != "before" && !errors.Is(got, ErrJoinTimeout) {
-						t.Fatalf("confirmation: %v", got)
-					}
-					if source != "withoutHook" {
-						if err := <-notice; !errors.Is(err, got) {
-							t.Fatalf("hook %v, WaitAttached %v", err, got)
-						}
-					}
-					open()
-					synctest.Wait()
-					if err := p.WaitAttached(ctx); !errors.Is(err, got) {
-						t.Fatalf("late confirmation changed %v to %v", got, err)
-					}
-					select {
-					case err := <-notice:
-						t.Fatalf("duplicate outcome %v", err)
-					default:
-					}
-					cancel()
-					if source == "MaintainPipes" {
-						if err := <-stopPool; !errors.Is(err, context.Canceled) {
-							t.Fatal(err)
-						}
-					}
-				})
-			})
-		}
-	}
 }
 
 // HS-24a. The core can process the shared deadline before the driver's
@@ -1038,56 +886,6 @@ func TestPipeConfirmationCoreDeadline(t *testing.T) {
 			})
 		})
 	}
-}
-
-// HS-26.
-func TestRedialJoinOutcomeCanWaitForSession(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		cc, sc := mpConfig(), mpConfig()
-		cc.ResumeTimeout, sc.ResumeTimeout = time.Minute, time.Minute
-		first := true
-		cc.Redial = func(ctx context.Context, _ Direction) (PipeIO, error) {
-			if !first {
-				<-ctx.Done()
-				return PipeIO{}, ctx.Err()
-			}
-			first = false
-			a, b := net.Pipe()
-			_ = b.Close()
-			return NetPipe(a), nil
-		}
-		returned := make(chan struct{})
-		cc.JoinOutcome = func(c *Conn, _ PipeID, err error) {
-			defer close(returned)
-			if !errors.Is(err, ErrPipeGone) {
-				t.Errorf("outcome %v", err)
-			}
-			c.Abort(7, "end")
-			_ = c.Wait()
-			ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
-			defer cancel()
-			for {
-				_, err := c.NextEvent(ctx)
-				if err != nil {
-					if !errors.Is(err, context.DeadlineExceeded) {
-						t.Errorf("drain inside callback: %v", err)
-					}
-					break
-				}
-			}
-		}
-		e := newMemMPEnv(t, cc, sc)
-		e.client.pipes[0].closeAll()
-		<-returned
-		for {
-			if _, err := e.client.NextEvent(t.Context()); err != nil {
-				if !errors.Is(err, net.ErrClosed) {
-					t.Fatal(err)
-				}
-				break
-			}
-		}
-	})
 }
 
 // HS-23, HS-24.

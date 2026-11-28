@@ -189,10 +189,6 @@ func ParseHelloExact(b []byte, f Framing) (Hello, int, error) {
 	return h, n, err
 }
 
-// IsHelloFirstByte reports whether b can begin a Hello. No such byte can begin
-// a zmux first record, on either framing, so a host can dispatch on it.
-func IsHelloFirstByte(b byte) bool { return b >= 1 && b <= profileEscape }
-
 // AppendFrame appends a Reply, a Finish or a sealed record.
 func AppendFrame(dst []byte, f Framing, unit []byte) ([]byte, error) {
 	if len(unit) > maxMessage {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"crypto/rand"
 	"errors"
 	"slices"
 
@@ -11,6 +12,8 @@ import (
 
 // JoinOptions are the options of a local join.
 type JoinOptions struct {
+	Member       *Member
+	Reservation  *JoinReservation
 	SendPriority *uint64
 	SendStandby  *bool
 	Probation    *Duration // nil: the session default; 0 disables
@@ -23,6 +26,7 @@ type JoinOptions struct {
 	Weight       uint64
 	Group        uint64 // 0: the default Group of the session
 	Deadline     Time   // absolute join deadline; 0 uses the core default
+	WeightSet    bool
 	Mode         join.Mode
 	Dir          uint8 // pipe direction: 0 up, 1 down, 2 bidi (joiner's view)
 	RecvStandby  bool
@@ -60,8 +64,8 @@ func (s *Session) joinAllowedFor(p *Pipe) bool {
 	if s.now < s.mp.backoffUntil {
 		return false
 	}
-	if s.ownGoing() >= s.mp.ownCap &&
-		(s.state != StateSuspended || !s.makeRoom(true, p.in != nil, p.out != nil) || s.ownGoing() >= s.mp.ownCap) {
+	if s.ownGoing()+s.mp.reservedJoins >= s.joinCap(true) &&
+		(s.state != StateSuspended || !s.makeRoom(true, p.in != nil, p.out != nil) || s.ownGoing()+s.mp.reservedJoins >= s.joinCap(true)) {
 		return false
 	}
 	a.held = false
@@ -87,7 +91,7 @@ func (s *Session) joinAllowed() bool {
 	if s.now < m.backoffUntil {
 		return false
 	}
-	return s.ownAttachments() < m.ownCap
+	return s.ownAttachments()+m.reservedJoins < s.joinCap(true)
 }
 
 // ownAttachments counts this endpoint's own unretired joins.
@@ -126,6 +130,16 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 		}
 		group = g
 	}
+	if r := o.Reservation; r != nil {
+		if r.owner != m || r.remaining == 0 {
+			return 0, 0, ErrInvalid
+		}
+		r.remaining--
+		m.reservedJoins--
+		if r.remaining == 0 {
+			m.forgetJoinReservation(r)
+		}
+	}
 	id := m.nextID
 	m.nextID += 2
 	p := &Pipe{id: id, carrier: o.Kind}
@@ -139,8 +153,9 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	if o.Probation != nil {
 		a.probOpt = *o.Probation
 	}
-	if o.Weight > 0 {
-		a.weight = o.Weight
+	a.weight = o.Weight
+	if o.Weight == 0 && !o.WeightSet {
+		a.weight = 1
 	}
 	a.rtt = s.initialRTT(id)
 	a.live = o.Live
@@ -166,6 +181,7 @@ func (s *Session) AddPipe(o JoinOptions) (uint64, AddPipeResult, error) {
 	}
 	s.enableJoinedPathQuality(p)
 	s.pipes = append(s.pipes, p)
+	s.addMemberPipe(o.Member, p, directionsOf(p.in != nil, p.out != nil))
 	s.emitPipeState(p)
 	return id, res, nil
 }
@@ -224,6 +240,7 @@ func (s *Session) CancelJoinWait(sig *Signal) {
 // cap's count, the backoff, a suspension that lets one displace another)
 // changed.
 func (s *Session) joinHoldChanged() {
+	s.NotifyCapacity()
 	for _, w := range s.mp.joinW {
 		s.wake(w)
 	}
@@ -246,16 +263,17 @@ func firstBatchLimit(limit, padTo, base int) int {
 
 // JoinHello writes the Hello JoinPrepare held the place of, under plan, on a
 // carrier that adds over bytes to a write.
-func (s *Session) JoinHello(id uint64, f Framing, over int, plan *shaping.UnitPlan) ([]byte, error) {
+func (s *Session) JoinHello(id uint64, f Framing, over int, plan *JoinWrite) ([]byte, uint64, error) {
+	plan.recheck()
 	p := s.pipe(id)
 	if p == nil || p.mp == nil || !p.mp.joining() || s.isClosing() {
-		return nil, ErrInvalid
+		return nil, 0, ErrInvalid
 	}
 	a, m := p.mp, s.mp
 	suite := join.Preferred(m.usable)
 	k, ok := m.suiteKeys(suite.ID)
 	if !ok {
-		return nil, s.joinPendingErr()
+		return nil, 0, s.joinPendingErr()
 	}
 	psk := k.r
 	if s.role == RoleInitiator {
@@ -268,7 +286,7 @@ func (s *Session) JoinHello(id uint64, f Framing, over int, plan *shaping.UnitPl
 	ep := m.ep.join
 	j, err := join.NewJoiner(join.JoinerConfig{Suite: suite, Group: a.group, Phase: uint8(ep.n & 1), Mode: a.mode, Framing: jf, Locator: ep.peer, PSK: psk, Binding: a.binding})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	a.joinEpoch, a.joinEpochKnown = ep.n, true
 	pl := join.HelloPayload{Pipe: join.Pipe{ID: id, Direction: a.dir, FateGroup: a.fate, Priority: a.recvPrio, Standby: a.recvStandby}, KeyShare: j.KeyShare()}
@@ -277,10 +295,15 @@ func (s *Session) JoinHello(id uint64, f Framing, over int, plan *shaping.UnitPl
 	}
 	plain, err := join.HelloPlainLen(pl)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	var own uint64
 	if a.early && p.out != nil && s.ack != nil {
-		lim := firstBatchLimit(s.cfg.JoinEarlyHello, plan.PadTo, j.HelloWire(plain)+over)
+		target := 0
+		if plan != nil && s.ShapeLimitsInForce().Profile == nil {
+			target = plan.PadTo
+		}
+		lim := firstBatchLimit(s.cfg.JoinEarlyHello, target, j.HelloWire(plain)+over)
 		// The frames item stays within what the Hello's ciphertext holds.
 		if v, ok := join.FitValue(j.HelloRoom(plain)); ok {
 			lim = min(lim, v)
@@ -288,23 +311,29 @@ func (s *Session) JoinHello(id uint64, f Framing, over int, plan *shaping.UnitPl
 			lim = 0
 		}
 		if lim > 0 {
-			pl.FirstBatch = s.firstBatch(lim)
+			pl.FirstBatch, own = s.firstBatch(lim)
 			if plain, err = join.HelloPlainLen(pl); err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 		}
 	}
 	w := j.HelloWire(plain) + over
-	if v, ok := join.ItemFor(shaping.PadFor(w, plan)-w, j.HelloRoom(plain)); ok {
-		pl.Padding, pl.PadEmpty = v, v == 0
-		s.shapeSpend(join.ItemSize(v))
+	padding := 0
+	if plan != nil {
+		room := shaping.HandshakeRoom(w, j.HelloRoom(plain), &plan.UnitPlan)
+		if v, ok := join.FitValue(room); ok {
+			pl.Padding, pl.PadEmpty = v, v == 0
+			padding = join.ItemSize(v)
+		}
 	}
+	plan.prepare(s, padding, j.HelloWire(0)-suite.TagLen())
 	hello, err := j.WriteHello(nil, pl)
 	if err != nil {
-		return nil, err
+		plan.Complete(0, false)
+		return nil, 0, err
 	}
-	a.joiner, a.framing = j, jf
-	return hello, nil
+	a.reply = &JoinReplyReader{joiner: j, framing: jf}
+	return hello, own, nil
 }
 
 // JoinUnplanned counts a Join message a handshake shaper had no plan for.
@@ -329,8 +358,9 @@ func (s *Session) noUsablePipe(p *Pipe) bool {
 // since the batch counts in no position, all it carries goes again as reinjected
 // information and the receiver deduplicates. A new stream's ID is allocated here and
 // not cancelled afterwards.
-func (s *Session) firstBatch(limit int) []byte {
+func (s *Session) firstBatch(limit int) ([]byte, uint64) {
 	var out []byte
+	var own uint64
 	for i := range s.sched.head {
 		for st := s.sched.head[i]; st != nil; {
 			n := st.sch.next
@@ -362,7 +392,7 @@ func (s *Session) firstBatch(limit int) []byte {
 			old = min64(sp.sent-off, want)
 		}
 		room := s.capRetained(s.conn.sendMax - min64(s.conn.sendMax, s.conn.sent))
-		want = min64(want, old+room)
+		want = sp.q.untrackedPrefix(off, min64(want, old+room))
 		// One frame over the queue's chunks, as far as they are contiguous.
 		var have uint64
 		for have < want {
@@ -383,6 +413,7 @@ func (s *Session) firstBatch(limit int) []byte {
 			n += uint64(len(c))
 		}
 		if newEnd := off + have; newEnd > sp.sent {
+			own += newEnd - min(newEnd, max(sp.sent, sp.preLen))
 			s.conn.sent += newEnd - sp.sent
 			s.mp.retain(newEnd - sp.sent)
 			sp.sent = newEnd
@@ -396,13 +427,19 @@ func (s *Session) firstBatch(limit int) []byte {
 		}
 		s.lost(&frameDesc{kind: dStream, id: st.id, off: off, n: have})
 	}
-	return out
+	return out, own
 }
 
 // applyBatch applies frames of a verified Hello or Reply: STREAM without FIN only. A
 // frame in error is dropped and counted and never closes the session, because a batch
 // can be a replay; it counts no position and acknowledges nothing.
 func (s *Session) applyBatch(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	buf := NewBuf(b)
+	defer buf.Unref()
+	start := 0
 	var f wire.Frame
 	s.rxPipe = nil
 	for len(b) > 0 {
@@ -412,11 +449,12 @@ func (s *Session) applyBatch(b []byte) {
 			return
 		}
 		b = b[n:]
+		start += n
 		if f.Kind != wire.KindStream || f.Fin {
 			s.stats.JoinBatchDropped++
 			continue
 		}
-		if _, e := s.onStream(&f, nil); e != nil {
+		if _, e := s.onStream(&f, Input{First: buf.Span(start-len(f.Data), start)}); e != nil {
 			s.stats.JoinBatchDropped++
 		}
 	}
@@ -458,35 +496,76 @@ const joinReadBound = 2*wire.MaxRecordSize + 64
 func (s *Session) VerifyReply(id uint64, b []byte, now Time) JoinStep {
 	s.SetNow(now)
 	p := s.pipe(id)
-	if p == nil || p.mp == nil || !p.mp.joining() || p.mp.joiner == nil {
+	if p == nil || p.mp == nil || !p.mp.joining() || p.mp.reply == nil {
 		return JoinStep{Status: JoinFailedStep}
 	}
 	a := p.mp
-	fail := func(err error) JoinStep {
+	step, frames, err := a.reply.read(b)
+	if err != nil {
 		s.failPipe(p, wire.PipeFailed, err)
+	}
+	if step.Status != JoinDeclined && step.Status != JoinProven {
+		return step
+	}
+	s.mp.joinFailures = 0
+	if step.Status == JoinDeclined {
+		s.joinRefused()
+		a.out, a.in = OutFailed, InEnded
+		a.abandonSent, a.abandonAcked = true, true
+		a.hs = false
+		s.retire(p, true) // its EvPipeState reports the retirement
+		return step
+	}
+	a.proven, a.provenFrames = true, slices.Clone(frames)
+	return step
+}
+
+// JoinReplyReader holds only the original framing and handshake transcript.
+// An in-flight read can authenticate a Reply after its pipe is retired.
+type JoinReplyReader struct {
+	joiner    *join.Joiner
+	framing   join.Framing
+	tpSkipped bool
+}
+
+func (s *Session) JoinReplyReader(id uint64) *JoinReplyReader {
+	if p := s.pipe(id); p != nil && p.mp != nil {
+		return p.mp.reply
+	}
+	return nil
+}
+
+// Observe authenticates a late Reply without committing session state.
+func (a *JoinReplyReader) Observe(b []byte) JoinStep {
+	if a == nil {
 		return JoinStep{Status: JoinFailedStep}
 	}
+	step, _, _ := a.read(b)
+	return step
+}
+
+func (a *JoinReplyReader) read(b []byte) (JoinStep, []byte, error) {
 	if len(b) > joinReadBound {
-		return fail(join.ErrTooLarge)
+		return JoinStep{Status: JoinFailedStep}, nil, join.ErrTooLarge
 	}
 	skip := 0
 	if len(b) > 0 && b[0] != join.ReplyType {
 		if a.tpSkipped {
-			return fail(join.ErrMalformed)
+			return JoinStep{Status: JoinFailedStep}, nil, join.ErrMalformed
 		}
 		if a.framing == join.Message {
 			if len(b) < 8 || [8]byte(b[:8]) != tpTypeBytes {
-				return fail(join.ErrMalformed)
+				return JoinStep{Status: JoinFailedStep}, nil, join.ErrMalformed
 			}
 			a.tpSkipped = true
-			return JoinStep{Status: JoinMore, N: len(b)}
+			return JoinStep{Status: JoinMore, N: len(b)}, nil, nil
 		}
 		cls, rl := Classify(b, wire.MaxRecordSize)
 		switch {
 		case cls == ClassMore, cls == ClassSession && rl == 0:
-			return JoinStep{Status: JoinMore, Need: len(b) + 1}
+			return JoinStep{Status: JoinMore, Need: len(b) + 1}, nil, nil
 		case cls != ClassSession:
-			return fail(join.ErrMalformed)
+			return JoinStep{Status: JoinFailedStep}, nil, join.ErrMalformed
 		}
 		a.tpSkipped = true
 		skip = rl
@@ -494,27 +573,21 @@ func (s *Session) VerifyReply(id uint64, b []byte, now Time) JoinStep {
 	}
 	pl, n, err := a.joiner.ReadReply(b)
 	if errors.Is(err, join.ErrIncomplete) {
-		return JoinStep{Status: JoinMore, N: skip, Need: n}
+		return JoinStep{Status: JoinMore, N: skip, Need: n}, nil, nil
 	}
 	if err != nil {
-		return fail(err)
+		return JoinStep{Status: JoinFailedStep}, nil, err
 	}
-	s.mp.joinFailures = 0
 	if pl.Decision == join.DecisionRefuse {
-		s.joinRefused()
-		a.out, a.in = OutFailed, InEnded
-		a.abandonSent, a.abandonAcked = true, true
-		a.hs = false
-		s.retire(p, true) // its EvPipeState reports the retirement
-		return JoinStep{Status: JoinDeclined, N: skip + n}
+		return JoinStep{Status: JoinDeclined, N: skip + n}, nil, nil
 	}
-	a.proven, a.provenFrames = true, slices.Clone(pl.Frames)
-	return JoinStep{Status: JoinProven, N: skip + n}
+	return JoinStep{Status: JoinProven, N: skip + n}, pl.Frames, nil
 }
 
 // JoinFinish makes the Confirm of a verified Reply under plan, on a carrier
 // that adds over bytes to a write, and activates the pipe. The plan may be nil.
-func (s *Session) JoinFinish(id uint64, over int, plan *shaping.UnitPlan) (confirm []byte, res *join.Result, err error) {
+func (s *Session) JoinFinish(id uint64, over int, plan *JoinWrite) (confirm []byte, res *join.Result, err error) {
+	plan.recheck()
 	p := s.pipe(id)
 	if p == nil || p.mp == nil || !p.mp.joining() || !p.mp.proven || s.isClosing() {
 		return nil, nil, ErrInvalid
@@ -526,20 +599,26 @@ func (s *Session) JoinFinish(id uint64, over int, plan *shaping.UnitPlan) (confi
 	}
 	zeros := 0
 	if plan != nil && a.mode != join.Bound {
-		w, room := a.joiner.ConfirmWire()
+		w, room := a.reply.joiner.ConfirmWire()
 		w += over
-		zeros = join.RawFill(shaping.PadFor(w, plan)-w, room)
-		s.shapeSpend(zeros)
+		zeros = shaping.HandshakeRoom(w, room, &plan.UnitPlan)
 	}
-	if confirm, err = a.joiner.WriteConfirm(nil, zeros); err != nil {
+	prefix := join.FramingLen(a.reply.framing)
+	if a.mode == join.Trusted {
+		prefix, _ = a.reply.joiner.ConfirmWire()
+	}
+	plan.prepare(s, zeros, prefix)
+	if confirm, err = a.reply.joiner.WriteConfirm(nil, zeros); err != nil {
+		plan.Complete(0, false)
 		return fail(err)
 	}
-	if res, err = a.joiner.Finish(); err != nil {
+	if res, err = a.reply.joiner.Finish(); err != nil {
+		plan.Complete(0, false)
 		return fail(err)
 	}
 	frames := a.provenFrames
 	a.proven, a.provenFrames = false, nil
-	a.hs, a.joiner, a.binding = false, nil, nil
+	a.hs, a.reply, a.binding = false, nil, nil
 	a.lastAdvance, a.lastRecord, a.liveAt = s.now, s.now, s.now
 	if p.in != nil {
 		a.in = InOpen
@@ -578,10 +657,13 @@ const (
 	// JoinUnknownSuite is JoinClose for a Suite outside the session's set
 	// (unknown_suite), refused before any AEAD.
 	JoinUnknownSuite
+	// JoinAuthorizationChanged rejects a Hello authorized by an older policy.
+	JoinAuthorizationChanged
 )
 
 // Carrier describes the carrier of a peer join to the acceptor.
 type Carrier struct {
+	Handoff       any          // opaque cleanup token returned if the Join is evicted
 	OutSig        *WriteSignal // wakes the outbound writer
 	In, Out       CarrierInfo
 	HasIn, HasOut bool  // the directions the carrier provides to the acceptor
@@ -593,12 +675,48 @@ type Carrier struct {
 // PeerJoin is an authenticated Hello: Unconfirmed once Claim has set its bit. It
 // holds no session state.
 type PeerJoin struct {
-	acc   *join.Acceptor
-	h     *join.Suite
-	pl    join.HelloPayload
-	epoch uint64
-	Pipe  join.Pipe
-	Mode  join.Mode
+	handoff        any
+	acc            *join.Acceptor
+	owner          *Session
+	pl             join.HelloPayload
+	Pipe           join.Pipe
+	epoch          uint64
+	authGeneration uint64
+	Mode           join.Mode
+	authorizing    bool
+	accepted       bool
+}
+
+func (pj *PeerJoin) Epoch() uint64 { return pj.epoch }
+
+func (pj *PeerJoin) AuthGeneration() uint64 { return pj.authGeneration }
+
+// FirstBatchInfo describes the authenticated batch's structure and eligible
+// STREAM frames. Flow control and stream state are checked at application.
+type FirstBatchInfo struct {
+	EncodedBytes, StreamFrames, StreamBytes int
+	Malformed                               bool
+}
+
+func (pj *PeerJoin) FirstBatchInfo() (info FirstBatchInfo) {
+	b := pj.pl.FirstBatch
+	info.EncodedBytes = len(b)
+	var f wire.Frame
+	for len(b) > 0 {
+		n, err := wire.DecodeFrame(b, &f)
+		if err != nil {
+			info.Malformed = true
+			break
+		}
+		if f.Kind == wire.KindStream && !f.Fin {
+			info.StreamFrames++
+			info.StreamBytes += len(f.Data)
+		} else {
+			info.Malformed = true
+		}
+		b = b[n:]
+	}
+	return info
 }
 
 // HelloWithoutBinding records a Hello in Bound refused because its carrier has no Binding.
@@ -627,34 +745,23 @@ func (s *Session) OpenHello(h join.Hello, f Framing, binding []byte) (*PeerJoin,
 	if !s.UsableSuite(h.Suite.ID) {
 		return nil, JoinUnknownSuite // before any AEAD
 	}
-	s.prepareAdditional()
-	var psk []byte
 	e := m.ep.byPhase(h.Phase)
 	if e != nil {
-		// The key of the joiner's role, which is the peer's, never inferred from the ID.
-		psk = e.keys[h.Suite.ID].i
-		if s.role == RoleInitiator {
-			psk = e.keys[h.Suite.ID].r
-		}
-	} else {
-		// No accepted epoch of this phase: a key no joiner has, so the Hello
-		// fails as auth like any wrong key.
-		psk = m.unknownPhaseKey()
+		e = m.ep.joinEpoch(e.n, s.now)
+	}
+	psk, err := s.peerJoinKey(e, h.Suite)
+	if err != nil {
+		return nil, JoinClose
 	}
 	jf := join.Stream
 	if f == FramingRecords {
 		jf = join.Message
 	}
 	acc, pl, err := join.Accept(h, jf, psk, binding, func(g uint64) bool { return slices.Contains(m.usableGroups, g) })
-	if err != nil {
+	if err != nil || e == nil {
 		s.stats.JoinAuthFailures++
 		s.emit(Event{Kind: EvJoinAuthFailed, Reason: joinAuthReason(err)})
 		return nil, JoinClose
-	}
-	var joinEpoch uint64
-	if e != nil {
-		joinEpoch = e.n
-		s.epochPeerJoined(e.n) // a verified join of d+1: A uses d+1 too
 	}
 	id := pl.Pipe.ID
 	if s.ownParity(id) {
@@ -665,7 +772,28 @@ func (s *Session) OpenHello(h join.Hello, f Framing, binding []byte) (*PeerJoin,
 		s.stats.JoinReplays++
 		return nil, JoinClose
 	}
-	return &PeerJoin{epoch: joinEpoch, Pipe: pl.Pipe, Mode: h.Mode, acc: acc, pl: pl, h: h.Suite}, JoinAccepted
+	return &PeerJoin{owner: s, epoch: e.n, authGeneration: s.policy.AuthGeneration, Pipe: pl.Pipe, Mode: h.Mode, acc: acc, pl: pl}, JoinAccepted
+}
+
+// peerJoinKey can authenticate the first Hello without preparing attachment
+// state. A phase with no epoch takes the same authentication path.
+func (s *Session) peerJoinKey(e *epoch, suite *join.Suite) ([]byte, error) {
+	if e == nil {
+		key := make([]byte, suite.Hash.Size())
+		_, _ = rand.Read(key)
+		return key, nil
+	}
+	peer := join.RoleInitiator
+	if s.role == RoleInitiator {
+		peer = join.RoleResponder
+	}
+	if keys := e.keys[suite.ID]; keys != nil {
+		if peer == join.RoleResponder {
+			return keys.r, nil
+		}
+		return keys.i, nil
+	}
+	return join.PSK(suite, e.secret, peer, s.mp.ep.crypto)
 }
 
 // replyRoom bounds what a Reply may add to its base wire length before the
@@ -692,11 +820,22 @@ func replyRoom(mode join.Mode, received, base, wantFrames int) (framesLimit, pad
 // batch and writes the Reply with its read-only decision, under plan, on a carrier
 // that adds over bytes to a write and has taken in received bytes. It changes no
 // pipe, cap or suspension.
-func (s *Session) ClaimHello(pj *PeerJoin, c Carrier, over, received int, plan *shaping.UnitPlan) (reply []byte, res JoinResult) {
+func (s *Session) ClaimHello(pj *PeerJoin, c Carrier, over, received int, plan *JoinWrite) (reply []byte, res JoinResult, evicted []any) {
+	plan.recheck()
+	if pj.owner != s {
+		return nil, JoinClose, nil
+	}
+	s.EndPeerAuthorization(pj)
+	if pj.authGeneration != s.policy.AuthGeneration {
+		return nil, JoinAuthorizationChanged, nil
+	}
 	m := s.mp
-	if s.isClosing() || m == nil || s.pipe(pj.Pipe.ID) != nil || m.idRetired(pj.Pipe.ID) {
+	if s.isClosing() || m == nil || m.ep.joinEpoch(pj.epoch, s.now) == nil {
+		return nil, JoinClose, nil
+	}
+	if s.pipe(pj.Pipe.ID) != nil || m.idRetired(pj.Pipe.ID) {
 		s.stats.JoinReplays++
-		return nil, JoinClose
+		return nil, JoinClose, nil
 	}
 	id := pj.Pipe.ID
 	s.prepareAdditional().bits[id] = true
@@ -705,8 +844,9 @@ func (s *Session) ClaimHello(pj *PeerJoin, c Carrier, over, received int, plan *
 	if err := pj.acc.Exchange(nil); err != nil {
 		s.stats.JoinAuthFailures++
 		s.emit(Event{Kind: EvJoinAuthFailed, Reason: joinAuthReason(err)})
-		return nil, JoinClose
+		return nil, JoinClose, nil
 	}
+	s.epochPeerJoined(pj.epoch)
 	s.applyBatch(pj.pl.FirstBatch)
 	needIn, needOut := pj.Pipe.Direction != 1, pj.Pipe.Direction != 0
 	dec := join.DecisionAccept
@@ -716,30 +856,44 @@ func (s *Session) ClaimHello(pj *PeerJoin, c Carrier, over, received int, plan *
 	rp := join.ReplyPayload{Decision: dec, KeyShare: pj.acc.KeyShare()}
 	plain, err := join.ReplyPlainLen(rp)
 	if err != nil {
-		return nil, JoinClose
+		return nil, JoinClose, nil
 	}
 	w := pj.acc.ReplyWire(plain) + over
 	room := pj.acc.ReplyRoom(plain)
 	if _, padRoom, bounded := replyRoom(pj.Mode, received, w, 0); bounded {
 		room = min(room, padRoom)
 	}
-	if v, ok := join.ItemFor(shaping.PadFor(w, plan)-w, room); ok {
-		rp.Padding, rp.PadEmpty = v, v == 0
-		s.shapeSpend(join.ItemSize(v))
+	padding := 0
+	if plan != nil {
+		room = shaping.HandshakeRoom(w, room, &plan.UnitPlan)
+		if v, ok := join.FitValue(room); ok {
+			rp.Padding, rp.PadEmpty = v, v == 0
+			padding = join.ItemSize(v)
+		}
 	}
+	plan.prepare(s, padding, pj.acc.ReplyPayloadOffset())
 	reply, err = pj.acc.WriteReply(nil, rp)
 	if err != nil {
-		return nil, JoinClose
+		plan.Complete(0, false)
+		return nil, JoinClose, nil
 	}
 	if dec == join.DecisionRefuse {
-		return reply, JoinRefused
+		return reply, JoinRefused, nil
 	}
-	return reply, JoinAccepted
+	return reply, JoinAccepted, s.holdPeerJoin(pj, c.Handoff)
+}
+
+func (s *Session) joinCap(local bool) int {
+	maximum := s.mp.cap
+	if local {
+		maximum = s.mp.ownCap
+	}
+	return min(maximum, s.policy.Limits.Envelope())
 }
 
 // capRoom predicts the attachment cap check of a confirmed join without changing anything.
 func (s *Session) capRoom(needIn, needOut bool) bool {
-	if s.peerAttachments() < s.mp.cap {
+	if s.peerAttachments() < s.joinCap(false) {
 		return true
 	}
 	return s.state == StateSuspended && s.roomCandidate(false, needIn, needOut) != nil
@@ -767,14 +921,20 @@ func (pj *PeerJoin) Result() (*join.Result, error) { return pj.acc.Finish() }
 // ConfirmJoin confirms a verified peer join: the only place where a peer join moves a
 // pipe, the cap or a suspension.
 func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
-	if s.isClosing() {
+	if !s.DropPeerJoin(pj) {
 		return JoinClose
 	}
-	m := s.mp
+	if pj.authGeneration != s.policy.AuthGeneration {
+		return JoinAuthorizationChanged
+	}
+	if s.isClosing() || s.mp == nil || s.mp.ep.joinEpoch(pj.epoch, s.now) == nil {
+		return JoinClose
+	}
 	id, j := pj.Pipe.ID, pj.Pipe
 	needIn, needOut := j.Direction != 1, j.Direction != 0
-	if c.Refuse || s.peerAttachments() >= m.cap && (s.state != StateSuspended || !s.makeRoom(false, needIn, needOut)) {
-		s.prepareAdditional().pendAbandon[id] = wire.PipeResourceLimit
+	if c.Refuse || needIn && !c.HasIn || needOut && !c.HasOut ||
+		s.peerAttachments() >= s.joinCap(false) && (s.state != StateSuspended || !s.makeRoom(false, needIn, needOut)) {
+		s.prepareAdditional().pendAbandon[id] = pendingAbandon{code: wire.PipeResourceLimit}
 		s.wakeAllWriters()
 		return JoinRefused
 	}
@@ -786,6 +946,11 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 	a.group, _ = join.LookupGroup(pj.pl.KeyShare.Group)
 	a.rtt = s.initialRTT(id)
 	a.ownFail = c.HasOut && c.Out.OwnFailure || c.HasIn && c.In.OwnFailure
+	if c.HasOut {
+		a.live = c.Out.Liveness
+	} else {
+		a.live = c.In.Liveness
+	}
 	s.drawProbe(a, nil, false)
 	p.mp = a
 	if needIn {
@@ -802,6 +967,10 @@ func (s *Session) ConfirmJoin(pj *PeerJoin, c Carrier) JoinResult {
 	}
 	s.enableJoinedPathQuality(p)
 	s.pipes = append(s.pipes, p)
+	s.addMemberPipe(nil, p, directionsOf(needIn, needOut))
+	if p.member != nil {
+		p.member.peer, p.member.generation = true, pj.authGeneration
+	}
 	if p.out != nil {
 		s.startProbation(p)
 		s.startReinjectHold(p)
@@ -828,7 +997,16 @@ func (s *Session) peerAttachments() int {
 }
 
 func (s *Session) emitPipeState(p *Pipe) {
+	s.NotifyCapacity()
+	if p.out != nil && p.mp.out != OutActive {
+		s.releaseTierWaiters(p)
+		for _, lane := range p.out.lanes {
+			s.clearTierWait(lane)
+		}
+	}
+	s.syncPipeHealth(p)
 	s.mp.stateGen++
+	s.refreshPathTopology()
 	s.pickChanged()
 	s.noteDatagramPath() // the primary pipe may have changed
 	o, i, _ := s.PipeState(p.id)
@@ -855,17 +1033,21 @@ func (s *Session) AttachedPipes(dst []uint64) []uint64 {
 	return dst
 }
 
-// roomCandidate is the attachment of one joiner (local: this endpoint's
-// own) that the cap displaces while the session is suspended for a join
-// that provides a missing direction (provideIn: the local endpoint reads
-// on it, provideOut: it writes), in this order: the oldest failed
-// attachment whose own PIPE_ABANDON was acknowledged, else the oldest
-// failed one whose PIPE_ABANDON was not, and only when none has failed,
-// the live attachment with the oldest last progress. A join that provides
-// no missing direction displaces nothing, and local joins that the cap
-// holds back are never displaced. nil: none.
+// roomCandidate finds a protocol slot for a recovery Join that supplies
+// a missing direction. Failed attachments go first. A live attachment can
+// be reclaimed only if other confirmed paths cover every direction it serves.
 func (s *Session) roomCandidate(local, provideIn, provideOut bool) *Pipe {
-	if !s.lacks(provideIn, provideOut) {
+	var sends, receives int
+	for _, p := range s.pipes {
+		d, _ := s.directionCoverage(p)
+		if d&DirectionSend != 0 {
+			sends++
+		}
+		if d&DirectionReceive != 0 {
+			receives++
+		}
+	}
+	if (receives != 0 || !provideIn) && (sends != 0 || !provideOut) {
 		return nil
 	}
 	var acked, pending *Pipe
@@ -894,6 +1076,10 @@ func (s *Session) roomCandidate(local, provideIn, provideOut bool) *Pipe {
 		if a == nil || a.retired || a.held || a.joinerLocal != local {
 			continue
 		}
+		d, _ := s.directionCoverage(p)
+		if d&DirectionSend != 0 && sends == 1 || d&DirectionReceive != 0 && receives == 1 {
+			continue
+		}
 		if oldest == nil || a.progress() < oldest.mp.progress() {
 			oldest = p
 		}
@@ -903,22 +1089,6 @@ func (s *Session) roomCandidate(local, provideIn, provideOut bool) *Pipe {
 
 // alive reports an attachment with a direction that has not failed or ended.
 func (a *attach) alive() bool { return a.liveOut() || a.in == InOpen || a.in == InJoining }
-
-// lacks reports whether a join that provides the directions provideIn and
-// provideOut provides one that no live attachment has. Joins the cap holds
-// back provide nothing yet: each would otherwise find its own direction.
-func (s *Session) lacks(provideIn, provideOut bool) bool {
-	in, out := false, false
-	for _, p := range s.pipes {
-		a := p.mp
-		if a == nil || a.retired || a.held {
-			continue
-		}
-		out = out || p.out != nil && a.liveOut()
-		in = in || p.in != nil && (a.in == InJoining || a.in == InOpen)
-	}
-	return provideOut && !out || provideIn && !in
-}
 
 // makeRoom displaces the roomCandidate, if any: a failed attachment is
 // retired locally, dropping its state and any PIPE_ABANDON still pending
@@ -934,7 +1104,6 @@ func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 		a.abandonSent = true // displaced without PIPE_ABANDON
 		s.failPipe(oldest, wire.PipeFailed, ErrPipeAborted)
 	}
-	a.abandonQueued = false
 	s.retire(oldest, false)
 	return true
 }
@@ -942,24 +1111,78 @@ func (s *Session) makeRoom(local, provideIn, provideOut bool) bool {
 // progress is the attachment's last progress: acknowledgement or record.
 func (a *attach) progress() Time { return maxT(a.lastAdvance, a.lastRecord) }
 
-// JoinReady reports whether maintenance has target room and a local join
-// may start now. Failed attachments retain physical headroom until retirement.
-func (s *Session) JoinReady() bool {
-	if s.isClosing() || s.mp == nil || s.mp.keysPending || s.now < s.mp.backoffUntil {
-		return false
+// JoinReservation owns pending local attachment capacity for one batch.
+type JoinReservation struct {
+	owner     *multiPath
+	remaining int
+}
+
+// JoinSlots is the current maintenance room, after commitments and
+// outstanding reservations. A suspended session may also use reclamation
+// through JoinReady; migrations only reserve free capacity.
+func (s *Session) JoinSlots() int {
+	m := s.mp
+	if s.isClosing() || m == nil || m.keysPending || s.now < m.backoffUntil {
+		return 0
 	}
-	if s.ownAttachments() >= s.mp.ownCap && (s.state != StateSuspended || s.roomCandidate(true, true, true) == nil) {
-		return false
-	}
+	return max(0, min(s.joinCap(true)-s.ownAttachments(), s.maintenanceJoinRoom())-m.reservedJoins)
+}
+
+func (s *Session) maintenanceJoinRoom() int {
 	n := 0
 	for _, p := range s.pipes {
 		a := p.mp
-		if a == nil || !a.joinerLocal || a.retired || a.out == OutFailed || a.out == OutNone && a.in == InEnded {
-			continue
+		if a != nil && a.joinerLocal && !a.retired && a.out != OutFailed && (a.out != OutNone || a.in != InEnded) {
+			n++
 		}
-		n++
 	}
-	return n < max(1, s.cfg.MaxPipes)
+	return s.policy.Limits.SteadyAttachments - n
+}
+
+func (s *Session) ReserveJoins(n int) *JoinReservation {
+	if n <= 0 || n > s.JoinSlots() {
+		return nil
+	}
+	return s.reserveJoins(n)
+}
+
+func (s *Session) reserveJoins(n int) *JoinReservation {
+	m := s.mp
+	r := &JoinReservation{owner: m, remaining: n}
+	m.reservedJoins += n
+	m.joinReservations = append(m.joinReservations, r)
+	s.NotifyCapacity()
+	return r
+}
+
+func (s *Session) ReleaseJoins(r *JoinReservation) {
+	if r == nil || r.owner != s.mp || r.remaining == 0 {
+		return
+	}
+	s.mp.reservedJoins -= r.remaining
+	s.NotifyCapacity()
+	r.remaining = 0
+	s.mp.forgetJoinReservation(r)
+	s.joinHoldChanged()
+}
+
+func (m *multiPath) forgetJoinReservation(r *JoinReservation) {
+	i := slices.Index(m.joinReservations, r)
+	m.joinReservations = slices.Delete(m.joinReservations, i, i+1)
+}
+
+func (s *Session) trimJoinReservations() {
+	m := s.mp
+	room := max(0, min(s.joinCap(true)-s.ownAttachments(), s.maintenanceJoinRoom()))
+	for m.reservedJoins > room {
+		s.ReleaseJoins(m.joinReservations[len(m.joinReservations)-1])
+	}
+}
+
+// JoinReady reports whether a pool or recovery can begin a local join.
+func (s *Session) JoinReady() bool {
+	return s.JoinSlots() > 0 || s.state == StateSuspended && s.mp != nil && !s.mp.keysPending &&
+		s.now >= s.mp.backoffUntil && s.maintenanceJoinRoom() > s.mp.reservedJoins && s.roomCandidate(true, true, true) != nil
 }
 
 // firstPipeMode is the record mode of pipe 0. An Unmanaged pipe has raw records.

@@ -3,6 +3,7 @@ package core
 import (
 	"sync"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/wire"
 	"github.com/zmuxio/zmux-go/varint"
 )
@@ -12,19 +13,32 @@ import (
 // The driver writes Bufs and then reports the write with WriteDone, which
 // releases the referenced blocks. A Batch is reused across polls.
 type Batch struct {
-	arena []byte
-	segs  []bseg
-	recs  []recMark
-	pins  []pin
-	bufs  [][]byte
-	msgs  [][]byte // Messages' result, reused
-	mbuf  []byte   // Messages' storage, reused
-	n     int
-	pos   uint64 // the lane position bytes of the batch, owed to WriteDone
-
+	shapePrefix, coverOffset     int
+	shapeRecords, shapeRecordEnd int
+	owner                        *outLane
+	shape                        *pipeShape
+	arena                        []byte
+	segs                         []bseg
+	recs                         []recMark
+	handoffs                     []batchHandoff
+	pins                         []pin
+	touched                      []*Stream   // scratch for lane position accounting during assembly
+	pieces                       []pendPiece // scratch for the frame currently being assembled
+	descs                        []recDesc   // scratch for the frames retained by multipath
+	bufs                         [][]byte
+	msgs                         [][]byte             // Messages' result, reused
+	mbuf                         carrierio.FlatBuffer // message and flat-write storage, reused
+	cover                        coverResult
+	extraSpans                   [][2]int // encoded byte ranges introduced by shaping
+	dispatch                     shapeDispatch
+	n                            int
+	pos                          uint64 // the lane position bytes of the batch, owed to WriteDone
 	// Pipe and Lane the batch was produced for.
-	Pipe uint64
-	Lane uint64
+	Pipe          uint64
+	Lane          uint64
+	provisional   bool
+	trackProgress bool
+	shapeProgress bool
 	// Shutdown asks the driver to end the write side gracefully after
 	// writing the batch (after CONNECTION_CLOSE, a drained pipe).
 	Shutdown bool
@@ -37,9 +51,13 @@ type bseg struct {
 }
 
 type recMark struct {
-	firstSeg int // the Size segment (byte framing) or the first frame segment
-	endSeg   int
-	size     int // frames bytes
+	firstSeg             int // the Size segment (byte framing) or the first frame segment
+	endSeg               int
+	size                 int    // frames bytes
+	own                  uint32 // confirmed own bytes earned by this complete record
+	coverStart, coverLen uint16 // frame-relative padding range
+	data, control        bool
+	eliciting            bool
 }
 
 // batchPool holds the storage of idle writers' batches: a writer takes one
@@ -65,15 +83,56 @@ func PutBatch(b *Batch) {
 // Len returns the number of bytes in the batch.
 func (b *Batch) Len() int { return b.n }
 
+// Tally counts complete records in the bytes the carrier accepted. For
+// message framing the transport reports message sizes; protocol accounting
+// uses the canonical Size width in both framing modes.
+func (b *Batch) Tally(written int, framed bool, sealedOverhead int) (bytes, records, partial uint64) {
+	for _, rec := range b.recs {
+		size := rec.size + varint.SizeVarint(uint64(rec.size))
+		onCarrier := size
+		if framed {
+			onCarrier = rec.size
+		}
+		if written < onCarrier {
+			return bytes, records, uint64(max(written, 0))
+		}
+		written -= onCarrier
+		if sealedOverhead != 0 {
+			size = rec.size + sealedOverhead
+		}
+		bytes += uint64(size)
+		records++
+	}
+	return bytes, records, 0
+}
+
+// RequireProgress asks message carriers to preserve the completed record prefix.
+func (b *Batch) RequireProgress() { b.trackProgress = true }
+
 // reset empties the batch for reuse; it must have been released.
 func (b *Batch) reset() {
 	b.arena = b.arena[:0]
+	b.clearTouched()
+	clear(b.pieces)
+	b.pieces = b.pieces[:0]
+	b.descs = b.descs[:0]
 	clear(b.segs)
 	b.segs = b.segs[:0]
+	b.shapePrefix, b.coverOffset = 0, 0
+	b.shapeRecords, b.shapeRecordEnd, b.shapeProgress = 0, 0, false
+	b.extraSpans = b.extraSpans[:0]
 	b.recs = b.recs[:0]
 	b.n = 0
 	b.pos = 0
+	b.owner, b.shape, b.cover, b.provisional = nil, nil, coverResult{}, false
+	b.dispatch = shapeDispatch{}
+	b.trackProgress = false
 	b.Shutdown = false
+}
+
+func (b *Batch) clearTouched() {
+	clear(b.touched)
+	b.touched = b.touched[:0]
 }
 
 // Bufs returns the batch as iovecs (byte framing).
@@ -95,10 +154,7 @@ func (b *Batch) seg(sg bseg) []byte {
 // Messages returns one flat message per record (message framing). The messages share storage that the batch reuses: they are valid
 // until the next call or PutBatch, and a carrier must not retain them.
 func (b *Batch) Messages() [][]byte {
-	if cap(b.mbuf) < b.n {
-		b.mbuf = make([]byte, 0, b.n)
-	}
-	buf := b.mbuf[:0]
+	buf := b.mbuf.Reserve(b.n)
 	b.msgs = b.msgs[:0]
 	for _, r := range b.recs {
 		start := len(buf)
@@ -107,13 +163,25 @@ func (b *Batch) Messages() [][]byte {
 		}
 		b.msgs = append(b.msgs, buf[start:len(buf):len(buf)])
 	}
-	b.mbuf = buf[:0]
 	return b.msgs
 }
 
-// Flat returns the batch as one buffer (tests).
+// Flat returns an owned copy of the complete encoded batch.
 func (b *Batch) Flat() []byte {
-	out := make([]byte, 0, b.n)
+	return b.appendFlat(make([]byte, 0, b.n))
+}
+
+// FlatView returns the encoded byte-stream batch for one synchronous write.
+// The writer must stop using it before the driver polls again or pools the
+// Batch. Parking a lane returns this storage with the batch.
+func (b *Batch) FlatView() []byte {
+	if len(b.segs) == 1 {
+		return b.seg(b.segs[0])
+	}
+	return b.appendFlat(b.mbuf.Reserve(b.n))
+}
+
+func (b *Batch) appendFlat(out []byte) []byte {
 	for _, sg := range b.segs {
 		out = append(out, b.seg(sg)...)
 	}
@@ -122,12 +190,17 @@ func (b *Batch) Flat() []byte {
 
 // Discard drops a batch whose write is never reported (its pipe was
 // replaced); under the session lock.
-func (b *Batch) Discard() { b.release() }
+func (b *Batch) Discard() {
+	b.settleHandoffs(0)
+	b.release()
+}
 
 // release drops the block references of a written batch.
 func (b *Batch) release() {
+	var returned blockReturns
+	defer returned.settle()
 	for i, p := range b.pins {
-		p.unref()
+		returned.release(p)
 		b.pins[i] = pin{}
 	}
 	b.pins = b.pins[:0]
@@ -135,57 +208,66 @@ func (b *Batch) release() {
 
 // recWriter builds records into a batch.
 type recWriter struct {
-	b           *Batch
-	recMax      int // largest Size (frames bytes) of a record
-	budget      int // bytes left in the batch
-	sizeSeg     int
-	recBytes    int
-	recs        int
-	elicEnd     int // batch bytes up to the end of the last ack-eliciting record
-	framing     Framing
-	open        bool
-	delayed     bool   // the next record waits for its shaping delay
-	elicit      bool   // the open record has an ack-eliciting frame
-	anyElic     bool   // the batch has an ack-eliciting byte
-	activity    bool   // an activity frame was written
-	traffic     bool   // a traffic frame: an activity frame but QX_PING
-	onlyPing    bool   // records so far carry only QX_PING requests and PADDING
-	epochAnswer uint64 // the epoch of a SESSION_EPOCH answer written, 0: none
-	pend        pendStream
+	b         *Batch
+	stopShape *pipeShape
+	pipe      *Pipe // the pipe of the batch (multipath retention)
+	sh        *pipeShape
+	// The shaping gate of the batch's pipe, read live: a gate that a
+	// record's plan sets in the middle of the batch applies to the data
+	// written after it.
+	gate         *pipeShape
+	abandonsSent []*Pipe
+	descs        []recDesc
+	pend         pendStream
+	recMax       int // largest Size (frames bytes) of a record
+	budget       int // bytes left in the batch
+	sizeSeg      int
+	recBytes     int
+	recs         int
+	elicEnd      int    // batch bytes up to the end of the last ack-eliciting record
+	epochAnswer  uint64 // the epoch of a SESSION_EPOCH answer written, 0: none
 	// The batch pins from pendPins on are the pending frame's, in piece
 	// order: pieces are pinned when added (their stream may release its
 	// bytes before the frame is encoded) and flushPend releases the pins
 	// of those it copies.
-	pendPins    int
-	closed      bool // nothing else: CONNECTION_CLOSE written, or laneOnly
-	laneOnly    bool // the first record of a lane: PIPE_LANE only
-	retain      bool
-	newData     bool // new stream data was written (idle copy)
-	revalPing   bool // the PIPE_PING of a revalidation was written
-	pingWritten bool // a PIPE_PING was written
-	suspPing    bool // it is the PIPE_PING of a suspicion
-	capped      bool // nextRecord stopped at recBound while data may wait
+	pendPins int
 	// Stream data opens no further record once the batch holds this many
 	// bytes (nextRecord); 0: one record.
-	recBound     int
-	touched      []*Stream
-	abandonsSent []*Pipe
-	descs        []recDesc
-	dataSpent    uint64 // stream data bytes charged to the room
-	notEarned    uint64 // padding, injections and copies in the batch (earnBytes)
-	dataRoom     int64  // stream data the limiter lets through; <0: no limit
-	pipe         *Pipe  // the pipe of the batch (multipath retention)
-	sh           *pipeShape
-	cut          int // largest frames bytes of the open record when below recMax; 0: none
-	// The shaping gate of the batch's pipe, read live: a gate that a
-	// record's plan sets in the middle of the batch applies to the data
-	// written after it.
-	gate     *pipeShape
-	gateGen  uint64 // gate generation the batch follows
-	gateBase uint64 // dataSpent when that gate took effect in the batch
-	gateShut bool   // that gate holds stream data for the rest of the batch
-	gateOn   bool   // gateGen and gateBase are set
-	oversize bool   // an unsplittable frame was longer than recMax: it could never be written
+	recBound                                             int
+	dataSpent                                            uint64 // stream data bytes charged to the room
+	baseFrames, padStart, padLen, lengthStart, lengthLen int
+	added                                                uint64
+	coverStart, coverLen                                 int
+	dataRoom                                             int64  // stream data the limiter lets through; <0: no limit
+	cut                                                  int    // largest frames bytes of the open record when below recMax; 0: none
+	gateGen                                              uint64 // gate generation the batch follows
+	gateBase                                             uint64 // dataSpent when that gate took effect in the batch
+	recordOwn                                            uint32
+	framing                                              Framing
+	open                                                 bool
+	delayed                                              bool // the next record waits for its shaping delay
+	datagramPlanning                                     bool // a DATAGRAM is opening the next record
+	elicit                                               bool // the open record has an ack-eliciting frame
+	anyElic                                              bool // the batch has an ack-eliciting byte
+	activity                                             bool // an activity frame was written
+	traffic                                              bool // a traffic frame: an activity frame but QX_PING
+	onlyPing                                             bool // records so far carry only QX_PING requests and PADDING
+	closed                                               bool // nothing else: CONNECTION_CLOSE written, or laneOnly
+	laneOnly                                             bool // the first record of a lane: PIPE_LANE only
+	retain                                               bool
+	newData                                              bool // new stream data was written (idle copy)
+	revalPing                                            bool // the PIPE_PING of a revalidation was written
+	pingWritten                                          bool // a PIPE_PING was written
+	suspPing                                             bool // it is the PIPE_PING of a suspicion
+	controlFull                                          bool // a queued control frame needs another batch
+	capped                                               bool // nextRecord stopped at recBound while data may wait
+	dataOut, controlOut, setup                           bool
+	mergeCover                                           bool
+	gateShut                                             bool // that gate holds stream data for the rest of the batch
+	gateOn                                               bool // gateGen and gateBase are set
+	gateWaiting                                          bool // data encountered a shaping gate during this batch
+	oversize                                             bool // an unsplittable frame was longer than recMax: it could never be written
+	deliveryRestricted                                   bool
 }
 
 // batchRecBound is the bytes after which stream data opens no further
@@ -224,15 +306,16 @@ type pendPiece struct {
 }
 
 type pendStream struct {
-	pin  pin
-	data []byte
-	more []pendPiece // further contiguous segments of the same STREAM frame
-	id   uint64
-	off  uint64
-	n    int // total data bytes (data and more)
-	on   bool
-	fin  bool
-	dg   bool // a DATAGRAM instead of STREAM
+	pin     pin
+	data    []byte
+	id      uint64
+	off     uint64
+	n       int // total data bytes across all pieces
+	on      bool
+	fin     bool
+	dg      bool // a DATAGRAM instead of STREAM
+	dgNoLen bool
+	finOnly bool
 }
 
 // blocked reports a batch that can take no record now: the record it
@@ -245,8 +328,8 @@ func (w *recWriter) blocked() bool {
 }
 
 func (w *recWriter) init(b *Batch, framing Framing, recMax, budget int) {
-	*w = recWriter{b: b, framing: framing, recMax: recMax, budget: budget, onlyPing: true, touched: w.touched[:0],
-		descs: w.descs[:0], dataRoom: -1, recBound: batchRecBound}
+	*w = recWriter{b: b, framing: framing, recMax: recMax, budget: budget, onlyPing: true,
+		descs: b.descs[:0], dataRoom: -1, recBound: batchRecBound}
 }
 
 // sizeCost returns the bytes a new record's Size field costs.
@@ -282,9 +365,9 @@ func (w *recWriter) pendLen(withLen bool) int {
 		return 0
 	}
 	if w.pend.dg {
-		l := 1 + len(w.pend.data)
-		if withLen {
-			l += varint.SizeVarint(uint64(len(w.pend.data)))
+		l := 1 + w.pend.n
+		if withLen && !w.pend.dgNoLen {
+			l += varint.SizeVarint(uint64(w.pend.n))
 		}
 		return l
 	}
@@ -338,6 +421,12 @@ func (w *recWriter) openCost() int {
 
 // frame appends frame bytes built by f to the open record.
 func (w *recWriter) frame(n int, elicit bool, f func([]byte) []byte) bool {
+	return w.controlFrame(n, elicit, false, f)
+}
+
+// controlFrame appends a control frame, with repeated protocol information
+// excluded from original-byte and outbound-activity attribution.
+func (w *recWriter) controlFrame(n int, elicit, repeated bool, f func([]byte) []byte) bool {
 	if n > w.recMax {
 		// No record holds it (the carrier record floor, SPEC.md Section
 		// 3.2, keeps every such frame within recMax): not a wait the
@@ -347,10 +436,12 @@ func (w *recWriter) frame(n int, elicit bool, f func([]byte) []byte) bool {
 	}
 	if !w.fits(n) {
 		if !w.open || !w.newRecordFits(n) {
+			w.controlFull = !w.delayed && !w.closed
 			return false
 		}
 		w.end()
 		if !w.fits(n) {
+			w.controlFull = !w.delayed && !w.closed
 			return false
 		}
 	}
@@ -366,24 +457,36 @@ func (w *recWriter) frame(n int, elicit bool, f func([]byte) []byte) bool {
 	if elicit {
 		w.elicit = true
 	}
+	if !repeated {
+		t, _ := varint.ConsumeVarint(w.b.arena[a0:])
+		switch t {
+		case wire.TypeTransportParams, wire.TypePipeLane, wire.TypeCloseTransport, wire.TypeCloseApp:
+			w.setup = true
+		case wire.TypePadding:
+		default:
+			w.recordOwn += uint32(l)
+			w.controlOut = true
+		}
+	}
 	return true
 }
 
 // stream adds a STREAM frame; its header is decided when the record ends
 // or the next frame follows (LEN elided on the last frame).
-func (w *recWriter) stream(id, off uint64, data []byte, pn pin, fin bool) bool {
+func (w *recWriter) stream(id, off uint64, data []byte, pn pin, fin bool, own int) bool {
 	if pd := &w.pend; w.open && pd.on && !pd.dg && !pd.fin && pd.id == id && pd.off+uint64(pd.n) == off && len(data) > 0 {
 		// A contiguous continuation joins the pending frame.
 		grow := wire.StreamHeaderLen(id, pd.off, pd.n+len(data), true) + len(data) -
 			wire.StreamHeaderLen(id, pd.off, pd.n, true)
 		if w.recBytes+w.pendLen(true)+grow <= w.max() && w.pendLen(true)+grow <= w.budget {
-			pd.more = append(pd.more, pendPiece{data: data, pin: pn})
+			w.b.pieces = append(w.b.pieces, pendPiece{data: data, pin: pn})
 			pd.n += len(data)
 			pd.fin = fin
 			if !pn.none() {
 				pn.ref()
 				w.b.pins = append(w.b.pins, pn)
 			}
+			w.streamActivity(own, fin)
 			return true
 		}
 	}
@@ -399,7 +502,7 @@ func (w *recWriter) stream(id, off uint64, data []byte, pn pin, fin bool) bool {
 	}
 	w.begin()
 	w.flushPend(true)
-	w.pend = pendStream{on: true, id: id, off: off, data: data, pin: pn, fin: fin, more: w.pend.more[:0], n: len(data)}
+	w.pend = pendStream{on: true, id: id, off: off, data: data, pin: pn, fin: fin, n: len(data)}
 	w.pendPins = len(w.b.pins)
 	if !pn.none() {
 		// Pinned now: the stream may release its bytes before the frame is
@@ -411,18 +514,31 @@ func (w *recWriter) stream(id, off uint64, data []byte, pn pin, fin bool) bool {
 	w.elicit = true
 	w.activity, w.traffic = true, true
 	w.onlyPing = false
+	w.streamActivity(own, fin)
 	return true
 }
 
+func (w *recWriter) streamActivity(own int, fin bool) {
+	if own > 0 {
+		w.recordOwn += uint32(own)
+		w.dataOut = true
+	} else if own == 0 && fin {
+		w.controlOut = true
+		w.pend.finOnly = true
+	}
+}
+
 // datagram adds a DATAGRAM frame (LEN elided when last).
-func (w *recWriter) datagram(data []byte, frameMax uint64) (ok, never bool) {
+func (w *recWriter) datagram(data dgramView, handoff *Handoff, frameMax uint64, own int) (ok, never bool) {
+	w.datagramPlanning = true
+	defer func() { w.datagramPlanning = false }()
 	capy := min(uint64(w.recMax), frameMax)
-	n := datagramFrameLen(len(data), true)
+	n := datagramFrameLen(data.len(), true)
 	if uint64(n) > capy {
 		// Only without its Length field, as the last frame of a record,
-		// and never in a shaped record (padding may follow it).
-		last := datagramFrameLen(len(data), false)
-		if uint64(last) > capy || w.sh != nil {
+		// with optional padding preceding it.
+		last := datagramFrameLen(data.len(), false)
+		if uint64(last) > capy {
 			return false, true
 		}
 		if w.open {
@@ -434,7 +550,8 @@ func (w *recWriter) datagram(data []byte, frameMax uint64) (ok, never bool) {
 		if !w.newRecordFits(last) {
 			return false, false
 		}
-		w.addDatagram(data)
+		w.addDatagram(data, handoff, own)
+		w.pend.dgNoLen = true
 		w.end()
 		return true, false
 	}
@@ -447,18 +564,43 @@ func (w *recWriter) datagram(data []byte, frameMax uint64) (ok, never bool) {
 			return false, false
 		}
 	}
-	w.addDatagram(data)
+	w.addDatagram(data, handoff, own)
 	return true, false
 }
 
 // addDatagram makes data the pending DATAGRAM frame of the open record.
-func (w *recWriter) addDatagram(data []byte) {
+func (w *recWriter) addDatagram(data dgramView, handoff *Handoff, own int) {
 	w.begin()
 	w.flushPend(true)
-	w.pend = pendStream{on: true, data: data, dg: true, more: w.pend.more[:0], n: len(data)}
+	w.pend = pendStream{on: true, data: data.head, dg: true, n: data.len()}
+	w.pendPins = len(w.b.pins)
+	if data.storage != nil {
+		pn := pin{rb: data.storage, raw: true}
+		pn.ref()
+		w.b.pins = append(w.b.pins, pn)
+		w.pend.pin = pn
+	}
+	if len(data.payload) != 0 {
+		pn := w.pend.pin
+		if data.buf != nil {
+			pn = pin{rb: data.buf, raw: true}
+		}
+		if !pn.none() {
+			pn.ref()
+			w.b.pins = append(w.b.pins, pn)
+		}
+		w.b.pieces = append(w.b.pieces, pendPiece{data: data.payload, pin: pn})
+	}
+	if handoff != nil {
+		w.b.addHandoff(handoff, 0, handoff.size)
+	}
 	w.elicit = true
 	w.activity, w.traffic = true, true
 	w.onlyPing = false
+	if own >= 0 {
+		w.recordOwn += uint32(own)
+		w.dataOut = true
+	}
 }
 
 // datagramFrameLen returns the bytes of a DATAGRAM frame with n bytes of
@@ -486,20 +628,32 @@ func datagramDataMax(capy uint64, withLen bool) int {
 	return int(best)
 }
 
+// Coalesce ordinary small send blocks into the encoded header. A borrowed
+// receive view already has an independent lifetime and stays a view.
+func inlinePayload(d []byte, pn pin) bool {
+	return pn.none() || pn.blk != nil && len(d) < inlineSendLimit
+}
+
+const inlineSendLimit = 4096
+
 func (w *recWriter) flushPend(withLen bool) {
 	if !w.pend.on {
 		return
 	}
 	p := w.pend
-	w.pend = pendStream{more: p.more[:0]}
+	w.pend = pendStream{}
+	pieces := w.b.pieces
 	a0 := len(w.b.arena)
 	if p.dg {
-		w.b.arena = wire.AppendDatagramHeader(w.b.arena, len(p.data), withLen)
+		w.b.arena = wire.AppendDatagramHeader(w.b.arena, p.n, withLen && !p.dgNoLen)
 	} else {
 		w.b.arena = wire.AppendStreamHeader(w.b.arena, p.id, p.off, p.n, p.fin, withLen)
 	}
 	hl := len(w.b.arena) - a0
-	if len(p.more) == 0 && (len(p.data) < refThreshold || p.pin.none()) {
+	if p.finOnly {
+		w.recordOwn += uint32(hl)
+	}
+	if len(pieces) == 0 && inlinePayload(p.data, p.pin) {
 		w.b.arena = append(w.b.arena, p.data...)
 		w.b.segs = append(w.b.segs, bseg{a0: a0, a1: len(w.b.arena)})
 		if !p.pin.none() {
@@ -512,12 +666,12 @@ func (w *recWriter) flushPend(withLen bool) {
 	} else {
 		kept := w.pendPins
 		w.b.segs = append(w.b.segs, bseg{a0: a0, a1: a0 + hl})
-		for i := -1; i < len(p.more); i++ {
+		for i := -1; i < len(pieces); i++ {
 			d, pn := p.data, p.pin
 			if i >= 0 {
-				d, pn = p.more[i].data, p.more[i].pin
+				d, pn = pieces[i].data, pieces[i].pin
 			}
-			if len(d) < refThreshold || pn.none() {
+			if inlinePayload(d, pn) {
 				// Small pieces are copied: they extend the arena segment
 				// and need their block no longer.
 				b0 := len(w.b.arena)
@@ -536,12 +690,13 @@ func (w *recWriter) flushPend(withLen bool) {
 			kept++
 			w.b.segs = append(w.b.segs, bseg{ext: d, pin: pn})
 		}
-		clear(p.more)
 		if kept != len(w.b.pins) {
 			clear(w.b.pins[kept:])
 			w.b.pins = w.b.pins[:kept]
 		}
 	}
+	clear(pieces)
+	w.b.pieces = pieces[:0]
 	l := hl + p.n
 	w.recBytes += l
 	w.budget -= l
@@ -575,7 +730,12 @@ func (w *recWriter) end() {
 		w.budget -= l
 		w.b.n += l
 	}
-	w.b.recs = append(w.b.recs, recMark{firstSeg: first, endSeg: len(w.b.segs), size: w.recBytes})
+	w.markShapeSpans()
+	w.b.recs = append(w.b.recs, recMark{firstSeg: first, endSeg: len(w.b.segs), size: w.recBytes, own: w.recordOwn,
+		data: w.dataOut && !w.setup, control: w.controlOut && !w.setup, eliciting: w.elicit,
+		coverStart: uint16(w.coverStart), coverLen: uint16(w.coverLen)})
+	w.recordOwn, w.coverStart, w.coverLen = 0, 0, 0
+	w.dataOut, w.controlOut, w.setup = false, false, false
 	w.recs++
 	if w.elicit {
 		w.anyElic = true

@@ -50,7 +50,7 @@ func drainLent(t *testing.T, s *Session, p *Pipe, b *Batch, out []byte) []byte {
 		for _, r := range recordData(t, b) {
 			out = append(out, make([]byte, r)...)
 		}
-		s.WriteDone(b, nil, now)
+		s.WriteDone(b, b.Len(), nil, now)
 	}
 	return out
 }
@@ -145,6 +145,9 @@ func TestWriteSpaceNoAlloc(t *testing.T) {
 	if israce.On {
 		t.Skip("the race detector allocates")
 	}
+	// Keep the warm-up and the measured fills on the same pool shard.
+	old := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(old) })
 	s, p, st := lentSession(t)
 	b := GetBatch()
 	defer PutBatch(b)

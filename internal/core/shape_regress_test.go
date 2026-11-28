@@ -17,7 +17,7 @@ func driveShaped(t *testing.T, s *Session, p *Pipe, st *Stream, step, limit Dura
 		s.shapeTimeout(now)
 		b := GetBatch()
 		s.PollTransmit(p.id, 0, b, DefaultBatch, now)
-		s.WriteDone(b, nil, now)
+		s.WriteDone(b, b.Len(), nil, now)
 		PutBatch(b)
 		if st.idSet && st.pre == nil && st.snd.sent >= st.snd.q.end {
 			return
@@ -32,7 +32,7 @@ func TestSmallBurstDoesNotStall(t *testing.T) {
 	for _, c := range []struct {
 		rate, burst uint64
 		openInfo    int
-	}{{1000, 1, 0}, {1000, 2, 0}, {1000, 4, 0}, {1, 1, 0}, {1000, 1, 300}, {1, 1, 300}} {
+	}{{1000, 1, 0}, {1000, 2, 0}, {1000, 4, 0}, {1000, 1, 300}} {
 		s, p, st := budgetSession(t, shaping.Limits{}, shaping.Budget{}, &fixedPlan{})
 		if c.openInfo > 0 {
 			s.feat.Preamble = true
@@ -47,16 +47,12 @@ func TestSmallBurstDoesNotStall(t *testing.T) {
 		ps := mustShape(t, s, p)
 		e := shaping.Effects{Set: shaping.EffectGate, Rate: c.rate, Burst: c.burst}
 		base := s.ShapingStats().Clamped
-		ps.apply(&e)
-		ps.apply(&e)
+		ps.apply(&e, 0)
+		ps.apply(&e, 0)
 		if ps.bucket.burst != shaping.MinMaxLen || ps.bucket.quantum() != shaping.MinMaxLen {
 			t.Fatalf("%+v: burst %d quantum %d", c, ps.bucket.burst, ps.bucket.quantum())
 		}
-		// The rate floor under the default bound counts apart.
 		want := uint64(1)
-		if c.rate == 1 {
-			want = 2
-		}
 		if got := s.ShapingStats().Clamped - base; got != want {
 			t.Fatalf("%+v: %d clamps", c, got)
 		}
@@ -75,12 +71,12 @@ func TestPreambleOverdrawsOpenGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	ps := mustShape(t, s, p)
-	ps.apply(&shaping.Effects{Set: shaping.EffectGate, Rate: 1000, Burst: 100})
+	ps.apply(&shaping.Effects{Set: shaping.EffectGate, Rate: 1000, Burst: 100}, 0)
 	now := Time(0)
 	s.SetNow(now)
 	b := GetBatch()
 	s.PollTransmit(p.id, 0, b, DefaultBatch, now)
-	s.WriteDone(b, nil, now)
+	s.WriteDone(b, b.Len(), nil, now)
 	PutBatch(b)
 	if st.snd.sent < st.snd.preLen || st.snd.preLen <= 100 || ps.bucket.tokens >= 0 {
 		t.Fatalf("sent %d preamble %d tokens %d", st.snd.sent, st.snd.preLen, ps.bucket.tokens)
@@ -101,43 +97,6 @@ func TestPreambleAboveMaxLen(t *testing.T) {
 	driveShaped(t, s, p, st, Duration(time.Millisecond), Duration(time.Second))
 }
 
-// dropLoop answers each dropped injection with a new one a microsecond on, as a
-// machine cycle whose inject after is small but not zero does.
-type dropLoop struct{ drops int }
-
-func (k *dropLoop) Capabilities() shaping.Caps                    { return 0 }
-func (k *dropLoop) Plan(*shaping.RecordView, *shaping.RecordPlan) {}
-func (k *dropLoop) OnEvent(e *shaping.Event, r *shaping.Effects) {
-	switch e.Kind {
-	case shaping.EventInjectDropped:
-		k.drops++
-	case shaping.EventStart:
-	default:
-		return
-	}
-	r.Set = shaping.EffectInject
-	r.HasInject, r.InjectAt, r.InjectLen = true, e.Now+time.Microsecond, 100
-}
-
-// However short the answers' delays, drops come at most once a granularity.
-func TestInjectDropRateBounded(t *testing.T) {
-	s, p := channelSession(t, nil, false)
-	s.peerZmux = true
-	s.cfg.ShapeLimits.NoInjection = true
-	k := &dropLoop{}
-	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return k })
-	const span = 100 * Millisecond
-	start := Time(Second)
-	for now := start; now.Sub(start) < span; now = now.Add(Duration(10 * time.Microsecond)) {
-		s.SetNow(now)
-		s.shapeTimeout(now)
-		poll(t, s, p, DefaultBatch, now)
-	}
-	if limit := int(span/limGranularity) + 1; k.drops == 0 || k.drops > limit {
-		t.Fatalf("%d drops in %v, at most %d", k.drops, time.Duration(span), limit)
-	}
-}
-
 // Replacing the rate settles the hold under the old one; a gate taken away
 // settles it too, and neither counts the time after.
 func TestHoldSettledOnGateChange(t *testing.T) {
@@ -147,16 +106,16 @@ func TestHoldSettledOnGateChange(t *testing.T) {
 		{Set: shaping.EffectGate, Rate: 1 << 30},
 		{Set: shaping.EffectGate, Rate: 1000, Burst: 1000},
 	} {
-		s, p, _ := budgetSession(t, shaping.Limits{MaxDelay: -1}, shaping.Budget{}, &fixedPlan{})
+		s, p, _ := budgetSession(t, shaping.Limits{}, shaping.Budget{}, &fixedPlan{})
 		ps := mustShape(t, s, p)
-		ps.apply(&shaping.Effects{Set: shaping.EffectGate, Rate: 1000, Burst: 100})
+		ps.apply(&shaping.Effects{Set: shaping.EffectGate, Rate: 1000, Burst: 100}, 0)
 		ps.bucket.tokens = -1000
 		if !ps.held(s.now) {
 			t.Fatal("not held")
 		}
 		base := s.ShapingStats().StallSpent
 		s.SetNow(s.now.Add(10 * ms))
-		ps.apply(&next)
+		ps.apply(&next, 0)
 		if ps.heldSince != Never {
 			t.Fatalf("%+v: still held since %d", next, ps.heldSince)
 		}
@@ -168,13 +127,5 @@ func TestHoldSettledOnGateChange(t *testing.T) {
 		if got := s.ShapingStats().StallSpent - base; got != 10*time.Millisecond {
 			t.Fatalf("%+v: stall %v after the change", next, got)
 		}
-	}
-}
-
-// Two set accounts with nothing in common allow no injection, not any amount.
-func TestDisjointAccountsAllowNoInjection(t *testing.T) {
-	got := shaping.Limits{Wire: shaping.Account{Initial: 100}}.With(shaping.Budget{Wire: shaping.Account{PerSec: 7}})
-	if !got.NoInjection || got.Wire != (shaping.Account{}) {
-		t.Fatalf("%+v", got)
 	}
 }

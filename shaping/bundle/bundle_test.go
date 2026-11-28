@@ -14,7 +14,7 @@ import (
 const (
 	defA    = `[{"start":0,"states":[{"record":{"pad":32}}]}]`
 	defB    = `[{"start":0,"states":[{"record":{"pad":{"t":[[1,0,64]]}}}]}]`
-	session = `{"wire":{"initial":1000,"per_mb":100000},"max_delay":5000}`
+	session = `{"wire":{"ceiling":2000,"initial":1000,"per_mb":100000},"profile":{"extra_bytes_ppm":50000,"floor_bytes":0,"window_seconds":10,"max_added_delay":5000}}`
 	pool    = `{"count":2,"dial_after":[1000000,5000000],"dial_jitter":100000,` +
 		`"retire":[{"metric":"age","above":600000000,"jitter":200000}],"probe_interval":15000000,"probe_jitter":250000}`
 )
@@ -24,11 +24,11 @@ func bundleJSON(next string) string {
 	if next != "" {
 		n = `"` + next + `"`
 	}
-	return fmt.Sprintf(`{"generated_at":"2026-01-01T00:00:00Z","next_change":%s,"kinds":{`+
+	return fmt.Sprintf(`{"schema":2,"generated_at":"2026-01-01T00:00:00Z","next_change":%s,"kinds":{`+
 		`"websocket":[{"machines":%s,"budget":%s,"pool":%s}],`+
 		`"quic":[{"machines":%s}],`+
 		`"split":[{}],`+
-		`"default":[{"machines":%s,"budget":{"wire":{}}}]}}`, n, defA, session, pool, defB, defB)
+		`"default":[{"machines":%s,"budget":{"wire":{"ceiling":0}}}]}}`, n, defA, session, pool, defB, defB)
 }
 
 func TestParseValid(t *testing.T) {
@@ -49,7 +49,7 @@ func TestParseValid(t *testing.T) {
 	if ws == nil || !ws.Candidate.HasMachines() || !ws.Candidate.HasPool() {
 		t.Fatalf("websocket entry %+v", ws)
 	}
-	if ws.Candidate.Compile(machine.Options{}).Budget() == nil {
+	if ws.Candidate.Compile(machine.Options{}).Policy().Budget == nil {
 		t.Error("no budget")
 	}
 	if e := b.Entry(zmux.CarrierSplit); e == nil || e.Candidate.HasMachines() || e.Candidate.HasPool() {
@@ -59,7 +59,7 @@ func TestParseValid(t *testing.T) {
 	if b.Entry(zmux.CarrierHTTP3) != def || b.Entry(0) != def || def == nil {
 		t.Error("default fallback")
 	}
-	if def.Candidate.Compile(machine.Options{}).Budget() == nil {
+	if def.Candidate.Compile(machine.Options{}).Policy().Budget == nil {
 		t.Error("default budget")
 	}
 	if _, ok := b.Lookup(zmux.CarrierHTTP3); ok {
@@ -93,7 +93,7 @@ func TestParseBounds(t *testing.T) {
 	if _, err := Parse(in, ParseOptions{Size: machine.SizeLimits{MaxBytes: 10}}); err == nil {
 		t.Error("candidate MaxBytes not applied")
 	}
-	big := `{"kinds":{"default":[{"pool":{"count":{"t":[[1,1,1],[1,2,2],[1,3,3]]}}}]}}`
+	big := `{"schema":2,"kinds":{"default":[{"pool":{"count":{"t":[[1,1,1],[1,2,2],[1,3,3]]}}}]}}`
 	if _, err := Parse([]byte(big), ParseOptions{Size: machine.SizeLimits{MaxSegments: 2}}); err == nil {
 		t.Error("MaxSegments not applied")
 	}
@@ -101,8 +101,8 @@ func TestParseBounds(t *testing.T) {
 
 func FuzzParse(f *testing.F) {
 	f.Add([]byte(bundleJSON("2026-01-02T00:00:00Z")))
-	f.Add([]byte(`{"generated_at":"2026-01-01T00:00:00Z","kinds":{"default":[{}]}}`))
-	f.Add([]byte(`{"kinds":{"quic":null,"default":[{"budget":null}]}}`))
+	f.Add([]byte(`{"schema":2,"generated_at":"2026-01-01T00:00:00Z","kinds":{"default":[{}]}}`))
+	f.Add([]byte(`{"schema":2,"kinds":{"quic":null,"default":[{"budget":null}]}}`))
 	f.Fuzz(func(t *testing.T, in []byte) {
 		b, err := Parse(in, ParseOptions{})
 		if err != nil {

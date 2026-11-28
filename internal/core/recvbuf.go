@@ -1,277 +1,633 @@
 package core
 
-import "sync/atomic"
-
-// Buf is a read buffer of a pipe. Pieces of stream data may reference it;
-// refs is atomic because the driver drops its own reference outside the
-// session lock. Free returns it to its pool when the last reference goes.
-type Buf struct {
-	Free   func(*Buf)
-	B      []byte
-	owners []bufOwner
-	// held is the bytes of B that buffered stream pieces reference, under
-	// the lock of the one session whose pipe read B (recvBuf.pin), with
-	// the pieces that took them (owners, for compaction) and B's index in
-	// that session's pinSet while held is above 0.
-	held uint64
-	pidx int
-	refs atomic.Int32
-}
-
-// bufOwner is a piece that referenced a Buf: its recvBuf and the offset it
-// started at. The piece may since have been cut, truncated, compacted or
-// dropped; compaction looks it up by offset.
-type bufOwner struct {
-	rb  *recvBuf
-	off uint64
-}
-
-// pinSet is a session's read buffers that buffered pieces reference.
-type pinSet struct {
-	bufs []*Buf
-	// extra is what the pinned buffers cost beyond the pieces' bytes: the
-	// unreferenced rest of every pinned buffer plus pieceCost per piece.
-	extra uint64
-	size  uint64 // sum of len(B) over bufs
-	held  uint64 // sum of held over bufs
-}
-
-// Compaction bounds what pinned buffers cost beyond the bytes their pieces
-// reference: once that waste passes pinSlack and pinSparse times the
-// referenced bytes (a slow reader of streams whose pieces each kept a
-// mostly read or mostly empty buffer), the pieces of every buffer less
-// than 1/pinSparse referenced are copied out and the buffers released.
-// Afterwards each pinned buffer but the one being received into is at
-// least 1/pinSparse referenced, so the waste is at most pinSparse-1 times
-// the referenced bytes plus one buffer, below the trigger: the next
-// compaction waits for at least pinSlack of new waste, and each byte is
-// copied at most once. Bulk reading, whose buffers stay referenced in full
-// until read, never reaches it and stays zero-copy.
-const (
-	pinSlack  = 1 << 20
-	pinSparse = 4
+import (
+	"errors"
+	"sync"
+	"sync/atomic"
 )
 
-// compactPins copies out the pieces of every sparsely referenced read
-// buffer but cur (the one being received into) once the waste of the
-// pinned buffers passed its bound.
-func (s *Session) compactPins(cur *Buf) {
-	ps := &s.conn.pins
-	if w := ps.size - ps.held; w <= pinSlack || w <= pinSparse*ps.held {
+// Buf owns a receive allocation. The producer writes only unpublished
+// ranges. Consumers retain immutable views; Free returns the allocation
+// to its allocator and must perform only internal bookkeeping.
+type Buf struct {
+	Free     func(*Buf)
+	account  atomic.Pointer[recvAccount]
+	pool     *recvBin
+	poolNext *Buf
+	memory   atomic.Pointer[budgetAllowance]
+	B        []byte
+	// The low word counts driver and receive-queue references. The high
+	// word counts loans, including their references in forwarded writes.
+	// Keep this first for 64-bit atomic alignment on 32-bit hosts.
+	refs    uint64
+	message atomic.Uint64
+}
+
+func NewBuf(data []byte) *Buf {
+	return &Buf{B: data, refs: 1}
+}
+
+// Reuse takes the initial reference after an exclusive checkout from the
+// allocator. The previous lifetime ended before the block entered the pool.
+func (b *Buf) Reuse() {
+	b.refs = 1
+}
+
+// Span is an immutable published range in an owned backing.
+type Span struct {
+	Buf        *Buf
+	Start, End int
+}
+
+func (v Span) Len() int { return v.End - v.Start }
+
+func (v Span) Bytes() []byte {
+	if v.Buf == nil {
+		return nil
+	}
+	return v.Buf.B[v.Start:v.End:v.End]
+}
+
+func (b *Buf) Span(start, end int) Span { return Span{b, start, end} }
+
+// BeginMessage reads the generation for the unique producer's message.
+// EndMessage advances it before the corresponding reference is released.
+func (b *Buf) BeginMessage() uint64 {
+	return b.message.Load()
+}
+
+// EndMessage consumes the producer's ownership of the given generation.
+func (b *Buf) EndMessage(token uint64) bool {
+	return b.message.CompareAndSwap(token, token+1)
+}
+
+// Ref adds an independent owner, such as the receive queue.
+func (b *Buf) Ref() { atomic.AddUint64(&b.refs, 1) }
+
+// Unref releases an independent owner.
+func (b *Buf) Unref() {
+	if atomic.LoadUint64(&b.refs) == 1 {
+		// The remaining owner has exclusive access until recycle publishes
+		// the block to the allocator. No other holder can add a reference.
+		b.refs = 0
+		b.recycle()
 		return
 	}
-	for i := 0; i < len(ps.bufs); {
-		b := ps.bufs[i]
-		if b == cur || b.held*pinSparse >= uint64(len(b.B)) {
-			i++
+	switch n := atomic.AddUint64(&b.refs, ^uint64(0)); {
+	case n&(loanRef-1) == loanRef-1:
+		panic("zmux: receive buffer released twice")
+	case n == 0:
+		b.recycle()
+	}
+}
+
+// Refs returns the total number of independent owners.
+func (b *Buf) Refs() int32 {
+	n := atomic.LoadUint64(&b.refs)
+	return int32(uint32(n) + uint32(n>>32))
+}
+
+// charge assigns the physical storage to one ledger, even if the view
+// subsequently crosses a session or changes from a receive to a send.
+func (b *Buf) charge(memory *budgetAllowance) bool {
+	if memory == nil || b.memory.Load() != nil {
+		return true
+	}
+	n := int64(cap(b.B))
+	if !memory.adjust(n) {
+		return b.memory.Load() != nil
+	}
+	if !b.memory.CompareAndSwap(nil, memory) {
+		memory.adjust(-n)
+	}
+	return true
+}
+
+func (b *Buf) recycle() {
+	n := int64(cap(b.B))
+	if a := b.account.Swap(nil); a != nil {
+		a.bytes.Add(-n)
+	}
+	if a := b.memory.Swap(nil); a != nil {
+		a.adjust(-n)
+	}
+	if b.Free != nil {
+		b.Free(b)
+	}
+}
+
+const loanRef = uint64(1) << 32
+
+func (b *Buf) borrow() bool {
+	a := b.account.Load()
+	if !a.reserveView() {
+		return false
+	}
+	n := int64(cap(b.B))
+	for refs := atomic.LoadUint64(&b.refs); ; refs = atomic.LoadUint64(&b.refs) {
+		if refs >= loanRef {
+			if atomic.CompareAndSwapUint64(&b.refs, refs, refs+loanRef) {
+				return true
+			}
 			continue
 		}
-		b.release()
-		// b left ps.bufs: bufs[i] is now another buffer.
+		if !a.reserveLoan(n) {
+			a.releaseView()
+			return false
+		}
+		if atomic.CompareAndSwapUint64(&b.refs, refs, refs+loanRef) {
+			return true
+		}
+		a.releaseLoan(n)
 	}
 }
 
-// release copies out every piece that references b, which leaves ps.
-func (b *Buf) release() {
-	for j := range len(b.owners) {
-		o := b.owners[j]
-		rb := o.rb
-		// The piece, if still there, is the first one ending above where
-		// it started (pieces are disjoint and sorted, and only shrink).
-		// Should a change break that, the owner's pieces are scanned for
-		// it: a piece of b is never skipped, or b would stay pinned.
-		k := rb.after(o.off)
-		if !rb.ps.valid(k) || rb.ps.at(k).buf != b {
-			k = rb.find(b)
-			if !rb.ps.valid(k) {
-				continue
+// tryRefLoan retains an existing loan while keeping its charge live.
+func (b *Buf) tryRefLoan() bool {
+	for n := atomic.LoadUint64(&b.refs); n >= loanRef; n = atomic.LoadUint64(&b.refs) {
+		if atomic.CompareAndSwapUint64(&b.refs, n, n+loanRef) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Buf) refLoan() { atomic.AddUint64(&b.refs, loanRef) }
+
+// ReleaseLoan releases a borrowed view, including one taken by a write.
+func (b *Buf) ReleaseLoan() {
+	a, n := b.account.Load(), int64(cap(b.B))
+	switch refs := atomic.AddUint64(&b.refs, ^(loanRef - 1)); {
+	case refs>>32 == uint64(^uint32(0)):
+		panic("zmux: receive loan released twice")
+	case refs < loanRef:
+		a.releaseLoan(n)
+		if refs == 0 {
+			b.recycle()
+		}
+	}
+}
+
+// ReturnView releases a lease issued by ReadChunk. Send queues and other
+// holders that retain that lease account for their own descriptors.
+func (b *Buf) ReturnView() {
+	b.account.Load().releaseView()
+	b.ReleaseLoan()
+}
+
+// recvAccount can outlive the session while an application or a forwarded
+// write still holds its input. Account for each root capacity until recycle.
+type recvAccount struct {
+	spliceMu   sync.Mutex
+	splicePins map[*Buf]int
+	memory     *budgetAllowance
+	bytes      atomic.Int64
+	loaned     atomic.Int64
+	leases     atomic.Int64
+	loanCap    int64
+	loanMu     sync.Mutex
+}
+
+// Descriptor count has its own quota even when the views share one root.
+func (a *recvAccount) leaseLimit() int64 { return max(4, a.loanCap/compactSlot) }
+
+func (a *recvAccount) reserveView() bool {
+	limit := a.leaseLimit()
+	for n := a.leases.Load(); n < limit; n = a.leases.Load() {
+		if a.leases.CompareAndSwap(n, n+1) {
+			if !a.memory.adjust(pieceCost) {
+				a.leases.Add(-1)
+				return false
 			}
-		}
-		p := rb.ps.at(k)
-		c := make([]byte, len(p.b))
-		copy(c, p.b)
-		p.b, p.buf = c, nil
-		last := b.held == uint64(len(c))
-		rb.unhold(b, uint64(len(c)))
-		b.Unref()
-		if last {
-			return // b may be in its pool already
+			return true
 		}
 	}
-	panic("zmux: pinned read buffer without its pieces")
+	return false
 }
 
-// Ref adds a reference.
-func (b *Buf) Ref() { b.refs.Add(1) }
-
-// Unref drops a reference.
-func (b *Buf) Unref() {
-	if n := b.refs.Add(-1); n == 0 && b.Free != nil {
-		b.Free(b)
-	} else if n < 0 {
-		panic("zmux: read buffer released twice")
-	}
+func (a *recvAccount) releaseView() {
+	a.leases.Add(-1)
+	a.memory.adjust(-pieceCost)
 }
 
-// refThreshold: pieces of at least this size reference the read buffer;
-// smaller ones are copied.
-const refThreshold = 4096
+func (a *recvAccount) reserveLoan(n int64) bool { return a.changeLoan(n) }
 
-type rpiece struct {
-	buf *Buf // nil: owned copy
-	b   []byte
-	off uint64
-}
+func (a *recvAccount) releaseLoan(n int64) { a.changeLoan(-n) }
 
-// recvBuf holds received, unread stream data as disjoint pieces sorted by
-// offset.
-type recvBuf struct {
-	// pin is the session's count of read-buffer bytes that referenced
-	// pieces keep from their pool beyond the pieces' own bytes: a piece
-	// pins its whole buffer, so the session's memory and credit see
-	// len(B) for every buffer a piece still references, not just the
-	// piece's bytes (a peer would otherwise pin many buffers per byte it
-	// is charged).
-	pin   *pinSet
-	ps    seq[rpiece]
-	bytes uint64
-}
+const loanCountLocked = -1
 
-// pieceCost is what a piece costs beyond its bytes (its entry and, for a
-// copy, its allocation), charged with the pinned bytes (pin): a peer that
-// splits its data into tiny pieces pays for them in the session's memory
-// and credit, not just their bytes.
-const pieceCost = 64
-
-// hold accounts n more bytes of b referenced by a new piece at off.
-func (rb *recvBuf) hold(b *Buf, n, off uint64) {
-	ps := rb.pin
-	if b.held == 0 {
-		ps.extra += uint64(len(b.B))
-		ps.size += uint64(len(b.B))
-		b.pidx = len(ps.bufs)
-		ps.bufs = append(ps.bufs, b)
-	}
-	b.held += n
-	ps.held += n
-	ps.extra -= n
-	b.owners = append(b.owners, bufOwner{rb: rb, off: off})
-}
-
-// unhold accounts n bytes of b no longer referenced by a piece.
-func (rb *recvBuf) unhold(b *Buf, n uint64) {
-	ps := rb.pin
-	b.held -= n
-	ps.held -= n
-	ps.extra += n
-	if b.held == 0 {
-		ps.extra -= uint64(len(b.B))
-		ps.size -= uint64(len(b.B))
-		last := len(ps.bufs) - 1
-		ps.bufs[b.pidx] = ps.bufs[last]
-		ps.bufs[b.pidx].pidx = b.pidx
-		ps.bufs[last] = nil
-		ps.bufs = ps.bufs[:last]
-		clear(b.owners)
-		b.owners = b.owners[:0]
-	}
-}
-
-// cut drops the first n bytes of a piece.
-func (rb *recvBuf) cut(p *rpiece, n uint64) {
-	if p.buf != nil {
-		rb.unhold(p.buf, n)
-	}
-	p.b = p.b[n:]
-	p.off += n
-}
-
-// after returns the position of the first piece ending above off.
-func (rb *recvBuf) after(off uint64) seqPos {
-	q := &rb.ps
-	if q.n == 0 || q.first().end() > off {
-		return q.begin()
-	}
-	return q.search(func(p *rpiece) bool { return p.end() > off })
-}
-
-// find returns the position of the first piece that references b (the end
-// if none): a linear scan, for release when the owner's offset misses.
-func (rb *recvBuf) find(b *Buf) seqPos {
-	q := &rb.ps
-	i := q.begin()
-	for ; q.valid(i); i = q.next(i) {
-		if q.at(i).buf == b {
+func (a *recvAccount) changeLoan(d int64) bool {
+	for n := a.loaned.Load(); n >= 0; n = a.loaned.Load() {
+		if d > a.loanCap-n {
+			return false
+		}
+		next := n + d
+		if a.memory != nil && max(next, n) > receiveLoanFloor {
 			break
 		}
+		if a.loaned.CompareAndSwap(n, next) {
+			return true
+		}
 	}
-	return i
+	a.loanMu.Lock()
+	defer a.loanMu.Unlock()
+	n := a.loaned.Swap(loanCountLocked)
+	if d > a.loanCap-n {
+		a.loaned.Store(n)
+		return false
+	}
+	next := n + d
+	change := max(next-receiveLoanFloor, 0) - max(n-receiveLoanFloor, 0)
+	if change != 0 && !a.memory.changeLoanFloor(change) {
+		a.loaned.Store(n)
+		return false
+	}
+	a.loaned.Store(next)
+	return true
 }
 
-func (p *rpiece) end() uint64 { return p.off + uint64(len(p.b)) }
+// recvRoot belongs to a single session, even when the backing is flowing
+// through another session. Its references can be found without taking
+// any other session's lock.
+type recvRoot struct {
+	buf        *Buf
+	first      *recvPiece
+	prev, next *recvRoot
+	live       uint64
+	borrowed   bool
+	loan       bool
+}
 
-// insert stores the parts of [off, off+len(d)) not already present and
-// returns the number of new bytes.
-func (rb *recvBuf) insert(off uint64, d []byte, buf *Buf) uint64 {
-	end := off + uint64(len(d))
-	q := &rb.ps
-	if q.n == 0 || off >= q.last().end() {
-		rb.appendPiece(off, d, buf)
-		return uint64(len(d))
+type recvMemory struct {
+	account     *recvAccount
+	roots       map[*Buf]*recvRoot
+	first       *recvRoot
+	last        *recvRoot // the last backing seen by insert
+	compactNext *recvRoot
+	free        *recvPiece
+	rootFree    *recvRoot
+	live        uint64
+	queued      uint64 // capacities of local and forwarded backings in the queue
+	foreign     uint64 // forwarded capacity reserved in the originating ledger
+	compacted   uint64 // bytes moved to compact pages
+	nodes       uint64
+	nfree       int
+	nrootFree   int
+	refused     bool
+}
+
+func (m *recvMemory) resident() uint64 {
+	if m.account == nil {
+		return 0
 	}
-	// Out of order: insert the gaps one by one.
+	return uint64(m.account.bytes.Load()+m.account.leases.Load()*pieceCost) + m.foreign + m.metadata()
+}
+
+func (m *recvMemory) metadata() uint64 {
+	return (m.nodes+uint64(m.nfree))*pieceCost + uint64(len(m.roots)+m.nrootFree)*rootCost
+}
+
+// accountFor charges each physical allocation in exactly one ledger.
+func (m *recvMemory) accountFor(b *Buf) *recvAccount {
+	if a := b.account.Load(); a != nil {
+		return a
+	}
+	if m.account == nil {
+		m.account = &recvAccount{loanCap: defaultLoanCap}
+	}
+	if !b.charge(m.account.memory) {
+		return nil
+	}
+	if b.account.CompareAndSwap(nil, m.account) {
+		m.account.bytes.Add(int64(cap(b.B)))
+	}
+	return b.account.Load()
+}
+
+func (m *recvMemory) root(b *Buf) *recvRoot {
+	if m.last != nil && m.last.buf == b {
+		return m.last
+	}
+	r := m.roots[b]
+	if r == nil {
+		a := m.accountFor(b)
+		if a == nil {
+			return nil
+		}
+		r = m.rootFree
+		if r == nil {
+			if !m.account.memory.adjust(rootCost) {
+				return nil
+			}
+			r = new(recvRoot)
+		} else {
+			m.rootFree = r.next
+			m.nrootFree--
+		}
+		*r = recvRoot{buf: b, next: m.first, borrowed: a != m.account}
+		if r.borrowed {
+			m.foreign += uint64(cap(b.B))
+			r.loan = b.tryRefLoan()
+		}
+		if !r.loan {
+			b.Ref()
+		}
+		m.queued += uint64(cap(b.B))
+		if m.first != nil {
+			m.first.prev = r
+		}
+		m.first = r
+		if m.roots == nil {
+			m.roots = make(map[*Buf]*recvRoot)
+		}
+		m.roots[b] = r
+	}
+	m.last = r
+	return r
+}
+
+const (
+	// Two default send buffers leave room for backing slack during a relay
+	// while bounding retention by an application that holds its views.
+	defaultLoanCap = 8 << 20
+	pieceCost      = 64
+	rootCost       = 64
+	compactSlot    = 256
+)
+
+func (m *recvMemory) link(p *recvPiece, r *recvRoot, n uint64) {
+	p.root = r
+	if r.first != nil {
+		r.first.prev = p
+	}
+	p.next, r.first = r.first, p
+	r.live += n
+	m.live += n
+}
+
+func (m *recvMemory) resize(p *recvPiece, n uint64) {
+	p.root.live -= n
+	m.live -= n
+}
+
+func (m *recvMemory) unlink(p *recvPiece) {
+	r := p.root
+	m.resize(p, uint64(p.n))
+	if p.prev == nil {
+		r.first = p.next
+	} else {
+		p.prev.next = p.next
+	}
+	if p.next != nil {
+		p.next.prev = p.prev
+	}
+	p.prev, p.next = nil, nil
+	if r.first != nil {
+		return
+	}
+	if r.prev == nil {
+		m.first = r.next
+	} else {
+		r.prev.next = r.next
+	}
+	if r.next != nil {
+		r.next.prev = r.prev
+	}
+	if m.last == r {
+		m.last = nil
+	}
+	if m.compactNext == r {
+		m.compactNext = r.next
+	}
+	b := r.buf
+	m.queued -= uint64(cap(b.B))
+	delete(m.roots, b)
+	if r.borrowed {
+		m.foreign -= uint64(cap(b.B))
+	}
+	if r.loan {
+		b.ReleaseLoan()
+	} else {
+		b.Unref()
+	}
+	*r = recvRoot{}
+	if m.nrootFree < seqChunk {
+		r.next = m.rootFree
+		m.rootFree = r
+		m.nrootFree++
+	} else {
+		m.account.memory.adjust(-rootCost)
+	}
+}
+
+func (m *recvMemory) alloc() *recvPiece {
+	p := m.free
+	if p == nil {
+		if !m.account.memory.adjust(pieceCost) {
+			return nil
+		}
+		m.nodes++
+		return new(recvPiece)
+	}
+	m.free = p.next
+	m.nfree--
+	m.nodes++
+	*p = recvPiece{}
+	return p
+}
+
+func (m *recvMemory) put(p *recvPiece) {
+	m.nodes--
+	*p = recvPiece{}
+	if m.nfree < seqChunk {
+		p.next = m.free
+		m.free = p
+		m.nfree++
+	} else {
+		m.account.memory.adjust(-pieceCost)
+	}
+}
+
+// compact packs sparse, exclusively held roots when physical backing is
+// more than twice the logical data. One pass copies at most one allocator
+// block and reuses the interval nodes. At least one slot must be reclaimed.
+func (m *recvMemory) compact(current *Buf) {
+	if m.first == nil || m.queued <= 2*m.live || m.queued-m.live < compactSlot ||
+		m.first.next == nil && m.first.buf == current {
+		return
+	}
+	first := m.compactNext
+	if first == nil {
+		first = m.first
+	}
+	// In one pass examine at most as many roots as a receive block can
+	// contain allocator slots. Resume at the next root if there are more.
+	const scanLimit = RecvBlockSize / compactSlot
+	var copied, reclaimed, scanned int
+	r := first
+	for ; r != nil && scanned < scanLimit && copied < RecvBlockSize; r = r.next {
+		scanned++
+		if r.compactable(current) && r.live <= uint64(RecvBlockSize-copied) {
+			copied += int(r.live)
+			reclaimed += cap(r.buf.B)
+		}
+	}
+	m.compactNext = r
+	if copied == 0 || reclaimed-recvClass(copied).size < compactSlot {
+		return
+	}
+	if !m.account.memory.adjust(int64(recvClass(copied).size)) {
+		return
+	}
+	b := GetRecvBuf(copied)
+	b.memory.Store(m.account.memory)
+	defer b.Unref()
+	dest := m.root(b)
+	if dest == nil {
+		return
+	}
+	pos := 0
+	for r := first; scanned > 0 && pos < copied; scanned-- {
+		next := r.next
+		if r.compactable(current) && r.live <= uint64(copied-pos) {
+			for piece := r.first; piece != nil; {
+				nextPiece := piece.next
+				n := copy(b.B[pos:], piece.data())
+				m.unlink(piece)
+				piece.start = pos
+				m.link(piece, dest, uint64(n))
+				pos += n
+				piece = nextPiece
+			}
+		}
+		r = next
+	}
+	m.compacted += uint64(pos)
+}
+
+func (r *recvRoot) compactable(current *Buf) bool {
+	return r.buf != current && !r.borrowed && r.live > 0 &&
+		r.live < uint64(cap(r.buf.B))/2 && atomic.LoadUint64(&r.buf.refs) == 1
+}
+
+type recvPiece struct {
+	root       *recvRoot
+	prev, next *recvPiece // reverse membership on buf
+	off        uint64
+	start, n   int
+}
+
+func (p *recvPiece) end() uint64 { return p.off + uint64(p.n) }
+
+func (p *recvPiece) data() []byte {
+	end := p.start + p.n
+	return p.root.buf.B[p.start:end:end]
+}
+
+// recvBuf is the ordered set of unread intervals. The sequence moves
+// pointers, so the backing's reverse links stay valid during reassembly.
+type recvBuf struct {
+	memory *recvMemory
+	seed   []*recvPiece
+	ps     seq[*recvPiece]
+	bytes  uint64
+}
+
+func (rb *recvBuf) after(off uint64) seqPos {
+	q := &rb.ps
+	if q.n == 0 || (*q.first()).end() > off {
+		return q.begin()
+	}
+	return q.search(func(p **recvPiece) bool { return (*p).end() > off })
+}
+
+// insert saves the previously unseen parts of a range. start refers to
+// the validated bytes in buf; the producer never overwrites those bytes.
+func (rb *recvBuf) insert(off uint64, buf *Buf, start, n int) uint64 {
+	end := off + uint64(n)
+	q := &rb.ps
+	if q.n == 0 || off >= (*q.last()).end() {
+		if q.n != 0 {
+			last := *q.last()
+			if last.root.buf == buf && last.start+last.n == start && last.end() == off {
+				last.n += n
+				last.root.live += uint64(n)
+				rb.memory.live += uint64(n)
+				rb.bytes += uint64(n)
+				return uint64(n)
+			}
+		}
+		if rb.put(q.end(), off, buf, start, n) {
+			return uint64(n)
+		}
+		return 0
+	}
 	var added uint64
-	cur := off
-	for cur < end {
+	for cur := off; cur < end; {
 		i := rb.after(cur)
 		gapEnd := end
 		if q.valid(i) {
-			p := q.at(i)
+			p := *q.at(i)
 			if p.off <= cur {
 				cur = p.end()
 				continue
 			}
-			gapEnd = min64(end, p.off)
+			gapEnd = min(end, p.off)
 		}
-		part := d[cur-off : gapEnd-off]
-		rb.bytes += uint64(len(part))
-		q.insert(i, rb.newPiece(cur, part, buf))
-		rb.pin.extra += pieceCost
-		added += uint64(len(part))
+		if !rb.put(i, cur, buf, start+int(cur-off), int(gapEnd-cur)) {
+			break
+		}
+		added += gapEnd - cur
 		cur = gapEnd
 	}
 	return added
 }
 
-func (rb *recvBuf) newPiece(off uint64, d []byte, buf *Buf) rpiece {
-	if len(d) >= refThreshold && buf != nil {
-		buf.Ref()
-		rb.hold(buf, uint64(len(d)), off)
-		return rpiece{off: off, b: d, buf: buf}
+func (rb *recvBuf) put(i seqPos, off uint64, buf *Buf, start, n int) bool {
+	m := rb.memory
+	if m.account == nil {
+		m.account = &recvAccount{loanCap: defaultLoanCap}
 	}
-	c := make([]byte, len(d))
-	copy(c, d)
-	return rpiece{off: off, b: c}
-}
-
-func (rb *recvBuf) appendPiece(off uint64, d []byte, buf *Buf) {
-	rb.bytes += uint64(len(d))
-	if rb.ps.n > 0 && (len(d) < refThreshold || buf == nil) {
-		last := rb.ps.last()
-		if last.buf == nil && last.end() == off && len(last.b)+len(d) <= refThreshold {
-			last.b = append(last.b, d...)
-			return
+	p := m.alloc()
+	if p == nil {
+		m.refused = true
+		return false
+	}
+	r := m.root(buf)
+	if r == nil && n < cap(buf.B) {
+		// The input backing belongs to the transient reader reservation.
+		// Retain only what this new interval actually needs.
+		if packed := copyBacking(m.account.memory, buf.B[start:start+n]); packed != nil {
+			r = m.root(packed)
+			packed.Unref()
+			start = 0
 		}
 	}
-	rb.ps.push(rb.newPiece(off, d, buf))
-	rb.pin.extra += pieceCost
+	if r == nil {
+		m.put(p)
+		m.refused = true
+		return false
+	}
+	*p = recvPiece{off: off, start: start, n: n}
+	m.link(p, r, uint64(n))
+	rb.bytes += uint64(n)
+	if rb.ps.n == 0 {
+		if rb.seed == nil {
+			rb.seed = make([]*recvPiece, 1, 8)
+		}
+		rb.seed[0] = p
+		rb.ps.cs = append(rb.ps.cs, rb.seed)
+		rb.ps.n = 1
+	} else {
+		rb.ps.insert(i, p)
+	}
+	return true
 }
 
-// contiguous returns the end of data contiguous from off.
 func (rb *recvBuf) contiguous(off uint64) uint64 {
 	q := &rb.ps
 	for i := rb.after(off); q.valid(i); i = q.next(i) {
-		p := q.at(i)
+		p := *q.at(i)
 		if p.off > off {
 			break
 		}
@@ -280,138 +636,93 @@ func (rb *recvBuf) contiguous(off uint64) uint64 {
 	return off
 }
 
-// read copies contiguous data starting at off into dst and consumes it.
-func (rb *recvBuf) read(off uint64, dst []byte) int {
+var ErrReceiveLoanLimit = errors.New("zmux: receive chunk loan budget exhausted")
+
+// consume takes the available leading data. With a destination it copies
+// into that destination, otherwise it lends a single immutable view.
+func (rb *recvBuf) consume(off uint64, dst []byte, limit int, loan bool) (int, Span, error) {
 	n := 0
-	for rb.ps.n > 0 && n < len(dst) {
-		p := rb.ps.first()
-		if p.off > off+uint64(n) {
+	for rb.ps.n > 0 && n < limit {
+		p := *rb.ps.first()
+		if p.off != off+uint64(n) {
 			break
 		}
-		skip := off + uint64(n) - p.off
-		c := copy(dst[n:], p.b[skip:])
-		n += c
-		if skip+uint64(c) == uint64(len(p.b)) {
-			rb.dropFirst()
-		} else {
-			rb.cut(p, skip+uint64(c))
+		take := min(p.n, limit-n)
+		if loan {
+			if !p.root.buf.borrow() {
+				return 0, Span{}, ErrReceiveLoanLimit
+			}
+			data := p.root.buf.Span(p.start, p.start+take)
+			rb.consumeFirst(p, take)
+			return take, data, nil
 		}
+		copy(dst[n:], p.data()[:take])
+		rb.consumeFirst(p, take)
+		n += take
 	}
+	return n, Span{}, nil
+}
+
+func (rb *recvBuf) consumeFirst(p *recvPiece, n int) {
 	rb.bytes -= uint64(n)
-	return n
-}
-
-// drop releases what piece p holds.
-func (rb *recvBuf) drop(p *rpiece) {
-	rb.pin.extra -= pieceCost
-	if p.buf != nil {
-		rb.unhold(p.buf, uint64(len(p.b)))
-		p.buf.Unref()
+	if n == p.n {
+		rb.ps.popFirst()
+		rb.drop(p)
+		return
 	}
+	rb.memory.resize(p, uint64(n))
+	p.start += n
+	p.n -= n
+	p.off += uint64(n)
 }
 
-func (rb *recvBuf) dropFirst() {
-	rb.drop(rb.ps.first())
-	rb.ps.popFirst()
+func (rb *recvBuf) drop(p *recvPiece) {
+	rb.memory.unlink(p)
+	rb.memory.put(p)
 }
 
-// discard drops everything below off and returns the bytes dropped.
 func (rb *recvBuf) discard(off uint64) uint64 {
-	var d uint64
+	before := rb.bytes
 	for rb.ps.n > 0 {
-		p := rb.ps.first()
+		p := *rb.ps.first()
 		if p.off >= off {
 			break
 		}
-		if p.end() <= off {
-			d += uint64(len(p.b))
-			rb.dropFirst()
-			continue
-		}
-		cut := off - p.off
-		d += cut
-		rb.cut(p, cut)
-		break
+		rb.consumeFirst(p, int(min(off-p.off, uint64(p.n))))
 	}
-	rb.bytes -= d
-	return d
+	return before - rb.bytes
 }
 
-// discardFrom drops everything at or above off and returns the bytes dropped.
 func (rb *recvBuf) discardFrom(off uint64) uint64 {
-	var d uint64
+	before := rb.bytes
 	for rb.ps.n > 0 {
-		p := rb.ps.last()
-		pe := p.end()
-		if pe <= off {
+		p := *rb.ps.last()
+		if p.end() <= off {
 			break
 		}
 		if p.off >= off {
-			d += uint64(len(p.b))
-			rb.drop(p)
+			rb.bytes -= uint64(p.n)
 			rb.ps.popLast()
+			rb.drop(p)
 			continue
 		}
-		d += pe - off
-		if p.buf != nil {
-			rb.unhold(p.buf, pe-off)
-		}
-		p.b = p.b[:off-p.off]
-		break
+		n := p.end() - off
+		rb.memory.resize(p, n)
+		rb.bytes -= n
+		p.n -= int(n)
 	}
-	rb.bytes -= d
-	return d
+	return before - rb.bytes
 }
 
-// clear drops everything.
 func (rb *recvBuf) clear() uint64 {
 	d := rb.bytes
 	for _, c := range rb.ps.cs {
-		for i := range c {
-			rb.drop(&c[i])
+		for _, p := range c {
+			rb.drop(p)
 		}
 	}
-	rb.ps = seq[rpiece]{}
-	rb.bytes = 0
+	clear(rb.seed[:cap(rb.seed)])
+	rb.ps = seq[*recvPiece]{}
+	rb.seed, rb.bytes = nil, 0
 	return d
-}
-
-// Refs returns the current reference count.
-func (b *Buf) Refs() int32 { return b.refs.Load() }
-
-// take consumes up to limit contiguous bytes at off without copying: the
-// slice of the first piece and, when it references a read buffer, a new
-// reference of that buffer for the caller.
-func (rb *recvBuf) take(off uint64, limit int) ([]byte, *Buf) {
-	if rb.ps.n == 0 || limit <= 0 {
-		return nil, nil
-	}
-	p := rb.ps.first()
-	if p.off > off {
-		return nil, nil
-	}
-	skip := off - p.off
-	d := p.b[skip:]
-	if len(d) > limit {
-		d = d[:limit]
-	}
-	buf := p.buf
-	if buf != nil {
-		buf.Ref()
-	}
-	n := uint64(len(d))
-	if skip+n == uint64(len(p.b)) {
-		if buf == nil {
-			p.buf = nil // ownership of the copy passes to the caller
-		}
-		rb.dropFirst()
-	} else {
-		if buf == nil {
-			// The caller gets its own copy; the rest stays.
-			d = append([]byte(nil), d...)
-		}
-		rb.cut(p, skip+n)
-	}
-	rb.bytes -= n
-	return d, buf
 }

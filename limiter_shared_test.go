@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -15,6 +16,7 @@ import (
 // the test if the pool ever goes negative or more is refunded than taken.
 // It counts the Acquire calls in progress.
 type poolLimiter struct {
+	need      chan struct{}
 	t         *testing.T
 	more      chan struct{}
 	pool      int64
@@ -23,6 +25,8 @@ type poolLimiter struct {
 	acquiring int   // Acquire calls waiting
 	mu        sync.Mutex
 }
+
+func (l *poolLimiter) MaxBurstBytes() int64 { return l.burst }
 
 func newPoolLimiter(t *testing.T, burst int64) *poolLimiter {
 	t.Helper()
@@ -59,6 +63,10 @@ func (l *poolLimiter) Acquire(ctx context.Context, minBytes, maxBytes int64) (in
 		l.mu.Unlock()
 		if n > 0 || maxBytes <= 0 {
 			return n, nil
+		}
+		select {
+		case l.need <- struct{}{}:
+		default:
 		}
 		select {
 		case <-more:
@@ -107,14 +115,16 @@ func TestSpliceSharedLimiterNeverOverGrants(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	lim := newPoolLimiter(t, 8<<10)
-	stop := make(chan struct{})
-	defer close(stop)
+	lim.need = make(chan struct{}, 1)
+	stop, pumpDone := make(chan struct{}), make(chan struct{})
+	defer func() { close(stop); <-pumpDone }()
 	go func() {
+		defer close(pumpDone)
 		for {
 			select {
 			case <-stop:
 				return
-			case <-time.After(time.Millisecond):
+			case <-lim.need:
 				lim.refill()
 			}
 		}
@@ -132,7 +142,7 @@ func TestSpliceSharedLimiterNeverOverGrants(t *testing.T) {
 				return
 			}
 			go func() {
-				r, _ := Splice(ctx, in, out, &SpliceOptions{AtoB: lim, BtoA: lim})
+				r, _ := Splice(ctx, in, out, &SpliceOptions{AtoB: lim, BtoA: lim, Chunk: 8192, MaxPacketPayload: 8192, Limits: SpliceLimits{OutputBytes: 8192}})
 				results <- r
 			}()
 		}
@@ -263,17 +273,16 @@ func TestLimiterContract(t *testing.T) {
 		t.Fatal("an empty datagram was refused")
 	}
 	g.Refund(10)
-	// A unit above the burst passes on the burst (no debt here).
-	if n, ok := g.police(25); !ok || n != 10 {
+	// A short grant is refunded, even when the limiter hits its burst.
+	if n, ok := g.police(25); ok || n != 0 || p.netOut != 0 {
 		t.Fatalf("police above the burst: %d %v", n, ok)
 	}
-	g.Refund(10)
 	p.mu.Lock()
 	p.pool = 0
 	p.mu.Unlock()
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
-	defer cancel()
-	if n, err := g.Acquire(cctx, 1, 5); n != 0 || !errors.Is(err, context.DeadlineExceeded) || p.netOut != 0 {
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if n, err := g.Acquire(cctx, 1, 5); n != 0 || !errors.Is(err, context.Canceled) || p.netOut != 0 {
 		t.Fatalf("cancelled Acquire: %d %v, kept %d", n, err, p.netOut)
 	}
 }
@@ -281,53 +290,22 @@ func TestLimiterContract(t *testing.T) {
 // TestSpliceHoldsNoGrantWhileIdle: a direction whose source has nothing
 // to read waits without a grant and without an Acquire in progress.
 func TestSpliceHoldsNoGrantWhileIdle(t *testing.T) {
-	client, rin, rout, server := relayEnv(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	lim := newPoolLimiter(t, 1<<20)
-	done := make(chan SpliceResult, 1)
-	go func() {
-		in, err := rin.AcceptStream(ctx)
-		if err != nil {
-			return
+	synctest.Test(t, func(t *testing.T) {
+		lim := newPoolLimiter(t, 1<<20)
+		cs, ss, c := controlledRelay(t, nil, &SpliceOptions{AtoB: lim, BtoA: lim}, false)
+		if _, err := cs.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
 		}
-		out, err := rout.OpenStreamSync(ctx)
-		if err != nil {
-			return
+		readSpliceTest(t, ss, "hello")
+		synctest.Wait()
+		lim.mu.Lock()
+		out, acq := lim.netOut, lim.acquiring
+		lim.mu.Unlock()
+		if out != 5 || acq != 0 {
+			t.Fatalf("idle splice keeps %d (forwarded 5), %d Acquire calls waiting", out, acq)
 		}
-		r, _ := Splice(ctx, in, out, &SpliceOptions{AtoB: lim, BtoA: lim})
-		done <- r
-	}()
-	s, err := client.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Write([]byte("hello")); err != nil {
-		t.Fatal(err)
-	}
-	srv, err := server.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 5)
-	if _, err := io.ReadFull(srv, buf); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond) // both directions idle
-	lim.mu.Lock()
-	out, acq := lim.netOut, lim.acquiring
-	lim.mu.Unlock()
-	if out != 5 || acq != 0 {
-		t.Fatalf("idle splice keeps %d (forwarded 5), %d Acquire calls waiting", out, acq)
-	}
-	_ = s.Close()
-	_ = srv.Close()
-	select {
-	case r := <-done:
-		if r.AtoB.Bytes != 5 {
-			t.Fatalf("result %+v", r)
+		if r := finishSpliceTest(t, cs, ss, c); r.AtoB.Bytes != 5 || r.AtoB.Handoffs.Stats().FirstSent != 5 {
+			t.Fatalf("result %+v, handoffs %+v", r, r.AtoB.Handoffs.Stats())
 		}
-	case <-ctx.Done():
-		t.Fatal("splice did not end")
-	}
+	})
 }

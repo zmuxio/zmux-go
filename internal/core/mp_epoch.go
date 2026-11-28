@@ -61,18 +61,19 @@ type epochs struct {
 	join *epoch // the epoch new local joins use
 	// The exchange: the private values of an offer, the bodies, the frame
 	// repeated until the next phase and the last phase of d+1 processed or sent.
-	offer       *join.Offer
-	list        []*epoch // the accepted epochs, ascending
-	crypto      []byte   // session_crypto
-	offerBody   []byte
-	frame       []byte
-	nextLocal   []byte // the local Locator announced for d+1, nil to keep
-	d           uint64
-	last        int
-	dropAt      Time // Retaining: when d is deleted
-	stableSince Time
-	joins       uint64 // joins since the last Stable
-	st          epochState
+	offer        *join.Offer
+	list         []*epoch // the accepted epochs, ascending
+	crypto       []byte   // session_crypto
+	offerBody    []byte
+	frame        []byte
+	nextLocal    []byte // the local Locator announced for d+1, nil to keep
+	d            uint64
+	last         int
+	dropAt       Time // Retaining: when d is deleted
+	stableSince  Time
+	joins        uint64 // joins since the last Stable
+	frameWritten bool
+	st           epochState
 	// Policy: an exchange asked for (AdvanceEpoch) or due.
 	advance   bool
 	firstPipe bool // the first Sealed or Bound pipe was seen
@@ -86,6 +87,15 @@ func (ep *epochs) byPhase(phase uint8) *epoch {
 		}
 	}
 	return nil
+}
+
+// joinEpoch returns the epoch still eligible to complete the indicated join.
+func (ep *epochs) joinEpoch(n uint64, now Time) *epoch {
+	e := ep.byPhase(uint8(n & 1))
+	if e == nil || e.n != n || ep.st == epRetaining && n == ep.d && now >= ep.dropAt {
+		return nil
+	}
+	return e
 }
 
 // AcceptsLocator reports whether a Hello naming loc is for this session: the
@@ -150,10 +160,11 @@ func (s *Session) newLocator(n uint64) []byte {
 }
 
 func (s *Session) setFrame(b []byte) {
-	s.mp.ep.frame = b
+	s.mp.ep.frame, s.mp.ep.frameWritten = b, false
 	for _, p := range s.pipes {
 		if p.mp != nil {
 			p.mp.epochSent = false
+			s.armPathDeadline(p, pathEpochRepeat)
 		}
 	}
 	s.wakeAllWriters()
@@ -241,6 +252,7 @@ func (s *Session) enterStable() {
 
 // useNext makes new joins use d+1 and starts the retention of d.
 func (s *Session) useNext() {
+	s.NotifyCapacity()
 	ep := &s.mp.ep
 	ep.join, ep.st = ep.list[len(ep.list)-1], epRetaining
 	ep.dropAt = s.now.Add(EpochRetention)
@@ -261,7 +273,7 @@ func (s *Session) epochAnswerAcked(n uint64) {
 	}
 }
 
-// epochPeerJoined is A's switch when a join of epoch n from the peer verifies.
+// epochPeerJoined is A's switch when an authorized join of epoch n passes key exchange.
 func (s *Session) epochPeerJoined(n uint64) {
 	if m := s.mp; m != nil && m.ep.st == epAnswered && n == m.ep.d+1 {
 		s.useNext()
@@ -333,6 +345,7 @@ func (s *Session) epochResumed() {
 func (s *Session) epochJoined() {
 	if s.mp != nil {
 		s.mp.ep.joins++
+		s.epochProgress()
 	}
 }
 
@@ -440,10 +453,12 @@ func (s *Session) writeEpoch(w *recWriter, p *Pipe) {
 	ep := &m.ep
 	if ep.frame != nil && !a.epochSent {
 		f := ep.frame
-		if !w.frame(len(f), true, func(b []byte) []byte { return append(b, f...) }) {
+		if !w.controlFrame(len(f), true, ep.frameWritten, func(b []byte) []byte { return append(b, f...) }) {
 			return
 		}
+		ep.frameWritten = true
 		a.epochSent, a.epochAt = true, s.now.Add(s.epochRepeat(p))
+		s.armPathDeadline(p, pathEpochRepeat)
 		// A answers until a record carrying the answer is acknowledged, also
 		// after a peer join of d+1 switched it (Retaining); O's frame is gone
 		// by then.
@@ -461,34 +476,22 @@ func (s *Session) epochRepeat(p *Pipe) Duration {
 	return 15 * Second
 }
 
-// epochTimers re-arms the repeat of each pipe and finds the policy deadlines.
-func (s *Session) epochTimers(apply bool, at func(Time) bool) {
+// epochDeadline is the policy deadline for the session's epoch. Each
+// pipe's repeat is independently registered.
+func (s *Session) epochDeadline() Time {
 	m := s.mp
-	// A closing session starts no exchange (epochProgress): its timers
-	// would stay due while the close waits for PIPE_ACK coverage.
 	if m == nil || m.keysPending || len(m.ep.list) == 0 || s.isClosing() {
-		return
+		return Never
 	}
 	ep := &m.ep
-	if ep.frame != nil {
-		for _, p := range s.pipes {
-			if a := p.mp; a != nil && a.epochSent && epochPipe(p) && at(a.epochAt) && apply {
-				a.epochSent = false
-				s.wakeAllWriters()
-			}
-		}
-	}
 	switch ep.st {
 	case epRetaining:
-		if at(ep.dropAt) && apply {
-			s.epochProgress()
-		}
+		return ep.dropAt
 	case epStable:
-		if d := s.epochPeriod(); d >= 0 && at(ep.stableSince.Add(d)) && apply {
-			s.epochProgress()
+		if d := s.epochPeriod(); d >= 0 {
+			return ep.stableSince.Add(d)
 		}
 	case epOffering, epAnswered:
-		// No deadline: the peer's frames move these on, and the repeat
-		// above sends the EPOCH frame again until they do.
 	}
+	return Never
 }

@@ -13,12 +13,12 @@ type panicChan struct {
 	armed chan struct{}
 }
 
-func (c *panicChan) MaxChannelDatagram() int {
+func (c *panicChan) ChannelDatagramCapacity() (limit, room int) {
 	select {
 	case <-c.armed:
 		panic("test: channel size")
 	default:
-		return c.chanConn.MaxChannelDatagram()
+		return c.chanConn.ChannelDatagramCapacity()
 	}
 }
 

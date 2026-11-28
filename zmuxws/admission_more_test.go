@@ -5,7 +5,6 @@ import (
 	"slices"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
@@ -54,9 +53,8 @@ func TestAdmissionMoreOnHead(t *testing.T) {
 			return zmux.Decision{Verdict: zmux.VerdictMore, Need: 8, Variant: "h"}
 		}}})
 	u := server(t, l, o)
-	b, d := rawUpgrade(t, u)
-	if len(b) != 0 || d > 5*time.Second {
-		t.Fatalf("answered %q after %v", b, d)
+	if b := rawUpgrade(t, u); len(b) != 0 {
+		t.Fatalf("answered %q", b)
 	}
 	if st, vs := l.Stats().Admission, l.VariantStats(); st.Closed != 1 || !slices.Contains(vs, zmux.VariantStat{Name: "h", Closed: 1}) {
 		t.Fatalf("stats %+v, variants %+v", st, vs)

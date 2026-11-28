@@ -8,7 +8,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
-	"time"
+	"testing/synctest"
 
 	"github.com/djylb/netx/wsconn"
 	"github.com/zmuxio/zmux-go"
@@ -78,27 +78,14 @@ func frames(t *testing.T, b []byte) [][]byte {
 func countedPair(t *testing.T) (srv, cli zmux.PipeIO, cc *countConn) {
 	t.Helper()
 	ctx := testContext(t)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ln.Close() }()
+	nc, peer := net.Pipe()
 	ch := make(chan *wsconn.Conn, 1)
 	go func() {
-		nc, err := ln.Accept()
-		if err != nil {
-			ch <- nil
-			return
-		}
-		c, _ := wsconn.Accept(ctx, nc, &wsconn.ServerOptions{Options: options})
+		c, _ := wsconn.Accept(ctx, peer, &wsconn.ServerOptions{Options: options})
 		ch <- c
 	}()
-	nc, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
 	cc = &countConn{Conn: nc}
-	c, _, err := wsconn.Client(ctx, cc, "ws://"+ln.Addr().String(), &wsconn.ClientOptions{Options: options})
+	c, _, err := wsconn.Client(ctx, cc, "ws://"+nc.LocalAddr().Network(), &wsconn.ClientOptions{Options: options})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,17 +105,21 @@ func countedPair(t *testing.T) (srv, cli zmux.PipeIO, cc *countConn) {
 func TestWriteMessages(t *testing.T) {
 	srv, cli, cc := countedPair(t)
 	msgs := [][]byte{[]byte("one"), {}, bytes.Repeat([]byte{9}, zmux.MaxRecordSize), []byte("four")}
-	if err := cli.W.(zmux.MessageBatchWriter).WriteMessages(msgs); err != nil {
+	written := make(chan error, 1)
+	go func() { written <- cli.W.(zmux.MessageBatchWriter).WriteMessages(msgs) }()
+	r := srv.R.(zmux.MessageReader)
+	for _, m := range msgs {
+		got, err := r.ReadMessage(zmux.MaxRecordSize)
+		if err != nil || !bytes.Equal(got.Bytes(), m) {
+			t.Fatalf("read %d bytes, %v", got.Len(), err)
+		}
+		got.Release()
+	}
+	if err := <-written; err != nil {
 		t.Fatal(err)
 	}
 	if w := cc.log(); len(w) != 1 || len(frames(t, w[0])) != len(msgs) {
 		t.Fatalf("%d writes", len(w))
-	}
-	r := srv.R.(zmux.MessageReader)
-	for _, m := range msgs {
-		if got, err := r.ReadMessage(zmux.MaxRecordSize); err != nil || !bytes.Equal(got, m) {
-			t.Fatalf("read %d bytes, %v", len(got), err)
-		}
 	}
 }
 
@@ -136,56 +127,58 @@ func TestWriteMessages(t *testing.T) {
 // the records that follow them, and the stream written before the release
 // arrives.
 func TestHoldFirstFlightWebSocket(t *testing.T) {
-	ctx := testContext(t)
-	srv, cli, cc := countedPair(t)
-	cfg := mpConfig()
-	cfg.EarlyData = zmux.EarlyData{ZmuxPeer: true, HoldFirstFlight: true}
-	c, err := zmux.Start(ctx, cli, zmux.RoleClient, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sch := make(chan *zmux.Conn, 1)
-	go func() {
-		s, err := zmux.Start(ctx, srv, zmux.RoleServer, singlePipe(mpConfig()))
+	synctest.Test(t, func(t *testing.T) {
+		ctx := testContext(t)
+		srv, cli, cc := countedPair(t)
+		cfg := mpConfig()
+		cfg.EarlyData = zmux.EarlyData{PlainQMux: true, HoldFirstFlight: true}
+		c, err := zmux.Start(ctx, cli, zmux.RoleClient, cfg)
 		if err != nil {
-			t.Error(err)
+			t.Fatal(err)
 		}
-		sch <- s
-	}()
-	st, err := c.OpenStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The handle stays reachable until the peer has read: a collected
-	// unclosed Stream resets its stream, which then never opens.
-	defer runtime.KeepAlive(st)
-	if _, err := st.Write([]byte("hello")); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	if n := len(cc.log()); n != 0 {
-		t.Fatalf("%d writes before the release", n)
-	}
-	c.ReleaseFirstFlight()
-	s := <-sch
-	if s == nil {
-		_ = c.Close()
-		return
-	}
-	defer closeBoth(c, s)
-	ss, err := s.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, 5)
-	if _, err := ss.Read(got); err != nil || string(got) != "hello" {
-		t.Fatalf("read %q, %v", got, err)
-	}
-	// The first write carries the parameters, HELLO and the stream.
-	w := cc.log()
-	if len(w) == 0 || !bytes.Contains(bytes.Join(frames(t, w[0]), nil), []byte("hello")) {
-		t.Fatalf("the stream is not in the first of %d writes", len(w))
-	}
+		sch := make(chan *zmux.Conn, 1)
+		go func() {
+			s, err := zmux.Start(ctx, srv, zmux.RoleServer, singlePipe(mpConfig()))
+			if err != nil {
+				t.Error(err)
+			}
+			sch <- s
+		}()
+		st, err := c.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The handle stays reachable until the peer has read: a collected
+		// unclosed Stream resets its stream, which then never opens.
+		defer runtime.KeepAlive(st)
+		if _, err := st.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if n := len(cc.log()); n != 0 {
+			t.Fatalf("%d writes before the release", n)
+		}
+		c.ReleaseFirstFlight()
+		s := <-sch
+		if s == nil {
+			_ = c.Close()
+			return
+		}
+		defer closeBoth(c, s)
+		ss, err := s.AcceptStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 5)
+		if _, err := ss.Read(got); err != nil || string(got) != "hello" {
+			t.Fatalf("read %q, %v", got, err)
+		}
+		// The first write carries the parameters, HELLO and the stream.
+		w := cc.log()
+		if len(w) == 0 || !bytes.Contains(bytes.Join(frames(t, w[0]), nil), []byte("hello")) {
+			t.Fatalf("the stream is not in the first of %d writes", len(w))
+		}
+	})
 }
 
 // plainCarrier hides WriteMessages: a carrier written one message at a
@@ -239,6 +232,6 @@ func TestBatchInterop(t *testing.T) {
 // singlePipe is cfg for a server session without a Listener, which takes
 // no joins: no multipath and no resume.
 func singlePipe(cfg *zmux.Config) *zmux.Config {
-	cfg.MaxPipes, cfg.ResumeTimeout = 0, 0
+	cfg.SessionPolicy.Limits.SteadyAttachments, cfg.ResumeTimeout = 0, 0
 	return cfg
 }

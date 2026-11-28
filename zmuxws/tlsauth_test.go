@@ -12,7 +12,7 @@ import (
 )
 
 func tlsAuthConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true},
+	return &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true},
 		AllowRecordMode: func(zmux.RecordPolicyInput, zmux.RecordMode, any) bool { return true }}
 }
 

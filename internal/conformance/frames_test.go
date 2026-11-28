@@ -22,14 +22,16 @@ var paramIDs = map[string]uint64{
 	"reset_stream_at": wire.ParamResetStreamAt, "max_datagram_frame_size": wire.ParamMaxDatagramFrameSize,
 	"max_record_size": wire.ParamMaxRecordSize, "zmux_role": wire.ParamRole, "zmux_goaway": wire.ParamGoAway,
 	"zmux_preamble": wire.ParamPreamble, "zmux_priority": wire.ParamPriority,
-	"zmux_datagram_flows": wire.ParamDatagramFlows, "zmux_multipath": wire.ParamMultipath,
-	"zmux_ack_threshold": wire.ParamAckThreshold, "zmux_pipe_ack": wire.ParamPipeAck,
-	"zmux_max_ack_delay": wire.ParamMaxAckDelay, "zmux_max_lanes": wire.ParamMaxLanes,
+	"zmux_datagram_family": wire.ParamDatagramFamily, "zmux_datagram_flows": wire.ParamRetiredDatagramFlows, "zmux_multipath": wire.ParamMultipath,
+	"zmux_ack_threshold": wire.ParamAckThreshold, "zmux_pipe_ack": wire.ParamPipeAck, "zmux_carrier_datagrams": wire.ParamCarrierDatagrams,
+	"zmux_carrier_datagram_padding": wire.ParamCarrierDatagramPadding,
+	"zmux_max_ack_delay":            wire.ParamMaxAckDelay, "zmux_max_lanes": wire.ParamMaxLanes,
 	"zmux_resume": wire.ParamResume, "zmux_session_crypto": wire.ParamSessionCrypto,
 }
 
 var emptyParams = map[string]bool{"reset_stream_at": true, "zmux_goaway": true, "zmux_priority": true,
-	"zmux_datagram_flows": true, "zmux_pipe_ack": true}
+	"zmux_datagram_flows": true, "zmux_datagram_family": true, "zmux_pipe_ack": true, "zmux_carrier_datagrams": true,
+	"zmux_carrier_datagram_padding": true}
 
 func hexb(v any) []byte {
 	s, _ := v.(string)
@@ -156,8 +158,12 @@ func paramsFromMap(tp map[string]any) wire.Params {
 			p.Preamble = num(v)
 		case "zmux_priority":
 			p.Has |= wire.HasPriority
-		case "zmux_datagram_flows":
-			p.Has |= wire.HasFlows
+		case "zmux_datagram_family":
+			p.Has |= wire.HasDatagramFamily
+		case "zmux_carrier_datagrams":
+			p.Has |= wire.HasCarrierDatagrams
+		case "zmux_carrier_datagram_padding":
+			p.Has |= wire.HasCarrierDatagramPadding
 		case "zmux_multipath":
 			m := v.(map[string]any)
 			p.Has |= wire.HasMultipath
@@ -306,6 +312,18 @@ func (c *encodeCtx) encodeFrame(b []byte, f map[string]any) []byte {
 			reason = hexb(r)
 		}
 		return wire.AppendClose(b, getB(f, "app"), getU(f, "code"), getU(f, "frame_type"), reason)
+	case "DATAGRAM_ACK":
+		ack := wire.DatagramAck{PipeID: getU(f, "pipe"), Largest: getU(f, "largest"),
+			Delay: getU(f, "delay"), FirstRange: getU(f, "first_range"), Channel: uint8(getU(f, "channel"))}
+		if ranges, ok := f["ranges"].([]any); ok {
+			ack.RangeCount = len(ranges)
+			for _, raw := range ranges {
+				ar := raw.(map[string]any)
+				ack.Ranges = varint.AppendVarint(ack.Ranges, getU(ar, "gap"))
+				ack.Ranges = varint.AppendVarint(ack.Ranges, getU(ar, "length"))
+			}
+		}
+		return wire.AppendDatagramAck(b, ack)
 	case "DATAGRAM":
 		data := hexb(f["data"])
 		hasLen := true
@@ -434,6 +452,9 @@ func frameObj(f *wire.Frame) map[string]any {
 		if !f.App {
 			o["frame_type"] = f.ErrFrame
 		}
+	case wire.KindDatagramAck:
+		a := f.DatagramAck
+		o["pipe"], o["channel"], o["largest"], o["delay"], o["first_range"] = a.PipeID, uint64(a.Channel), a.Largest, a.Delay, a.FirstRange
 	case wire.KindDatagram:
 		o["data"], o["has_len"] = hex.EncodeToString(f.Data), f.HasLen
 	case wire.KindTransportParams:

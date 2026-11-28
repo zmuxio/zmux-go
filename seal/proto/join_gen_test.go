@@ -736,8 +736,8 @@ func genJoinNegatives(t testing.TB) []joinNegative {
 	add("confirm-sealed-flip", c, "acceptor", "stream", "auth", hello(h), wr, confirm(flip(cf, len(cf)-1)))
 	add("confirm-sealed-cut", c, "acceptor", "stream", "incomplete", hello(h), wr, joinStep{Op: "confirm", Wire: cf[:len(cf)-1], Need: len(cf)})
 	add("confirm-sealed-under-tag", c, "acceptor", "stream", "auth", hello(h), wr, confirm([]byte{0, 15, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}))
-	add("confirm-sealed-nonzero", c, "acceptor", "stream", "bad_confirm", hello(h), wr, confirm(sealedConfirm(t, c, []byte{0, 1, 0})))
-	add("confirm-sealed-under-reply-direction", c, "acceptor", "stream", "auth", hello(h), wr, confirm(sealedReverse(t, c)))
+	add("confirm-sealed-nonzero", c, "acceptor", "stream", "bad_confirm", hello(h), wr, confirm(sealedConfirm(t, c, []byte{0, 1, 0}, false)))
+	add("confirm-sealed-under-reply-direction", c, "acceptor", "stream", "auth", hello(h), wr, confirm(sealedConfirm(t, c, nil, true)))
 	tr := joinDefaults(join.SuiteAES, Trusted, "i", join.GroupX25519, 0)
 	htr := tr.helloOf(t, Stream, tr.HelloPayload)
 	tc := tr.honestConfirm(t, Stream)
@@ -765,7 +765,7 @@ func genJoinNegatives(t testing.TB) []joinNegative {
 }
 
 // sealedConfirm seals plain as the joiner's first record of an honest Join of c.
-func sealedConfirm(t testing.TB, c joinCase, plain []byte) []byte {
+func sealedConfirm(t testing.TB, c joinCase, plain []byte, reverse bool) []byte {
 	t.Helper()
 	j, _ := c.joiner(t, Stream)
 	w, _ := j.WriteHelloRaw(nil, c.HelloPayload)
@@ -775,25 +775,12 @@ func sealedConfirm(t testing.TB, c joinCase, plain []byte) []byte {
 	if _, _, err := j.ReadReply(r); err != nil {
 		t.Fatal(err)
 	}
-	ct, err := join.NewSealer(joinSuite(t, c.Suite).AEAD, j.Secrets().I2R).Seal(nil, plain)
-	if err != nil {
-		t.Fatal(err)
+	secrets := j.Secrets()
+	key := secrets.I2R
+	if reverse {
+		key = secrets.R2I
 	}
-	return append([]byte{byte(len(ct) >> 8), byte(len(ct))}, ct...)
-}
-
-// sealedReverse is an empty Confirm sealed under the acceptor's direction.
-func sealedReverse(t testing.TB, c joinCase) []byte {
-	t.Helper()
-	j, _ := c.joiner(t, Stream)
-	w, _ := j.WriteHelloRaw(nil, c.HelloPayload)
-	a, _, _ := c.accept(w, Stream)
-	_ = a.Exchange(c.randR())
-	r, _ := a.WriteReplyRaw(nil, c.ReplyPayload, c.entropyR())
-	if _, _, err := j.ReadReply(r); err != nil {
-		t.Fatal(err)
-	}
-	ct, err := join.NewSealer(joinSuite(t, c.Suite).AEAD, j.Secrets().R2I).Seal(nil, nil)
+	ct, err := join.NewSealer(joinSuite(t, c.Suite).AEAD, key).Seal(nil, plain)
 	if err != nil {
 		t.Fatal(err)
 	}

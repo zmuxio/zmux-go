@@ -5,28 +5,31 @@ import (
 	"context"
 	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
 )
 
-type lockedBuf struct {
-	b  bytes.Buffer
-	mu sync.Mutex
+type outputLines chan string
+
+func (l outputLines) Write(p []byte) (int, error) {
+	l <- string(p)
+	return len(p), nil
 }
 
-func (l *lockedBuf) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.Write(p)
-}
-
-func (l *lockedBuf) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.String()
+func (l outputLines) expect(t *testing.T, ctx context.Context, prefix string) {
+	t.Helper()
+	for {
+		select {
+		case line := <-l:
+			if strings.HasPrefix(line, prefix) {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("waiting for %q: %v", prefix, ctx.Err())
+		}
+	}
 }
 
 // TestServeEchoReportsLateJoin joins a pipe after the last echoed stream:
@@ -34,14 +37,17 @@ func (l *lockedBuf) String() string {
 func TestServeEchoReportsLateJoin(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cfg := &zmux.Config{MaxPipes: 2, PipeAuth: zmux.PipeAuth{PSK: []byte("an example pre-shared key, 32 B"), EndToEnd: true}}
+	cfg := &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 2}}, PipeAuth: zmux.PipeAuth{PSK: []byte("an example pre-shared key, 32 B"), EndToEnd: true}}
 	l, err := zmux.NewListener(&zmux.ListenerConfig{Config: cfg})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = l.Close() }()
-	var out lockedBuf
-	go serveEcho(ctx, l, &out)
+	out := make(outputLines, 4)
+	done := make(chan struct{})
+	go func() { serveEcho(ctx, l, out); close(done) }()
+	defer func() { cancel(); <-done }()
+
 	a0, b0 := net.Pipe()
 	a1, b1 := net.Pipe()
 	go func() { _ = l.HandlePipe(ctx, zmux.NetPipe(b0), zmux.PipeHint{}) }()
@@ -57,21 +63,11 @@ func TestServeEchoReportsLateJoin(t *testing.T) {
 	}
 	_, _ = st.Write([]byte("ping"))
 	_ = st.Close()
-	for !strings.Contains(out.String(), "SESSION ping") {
-		time.Sleep(5 * time.Millisecond)
-		if ctx.Err() != nil {
-			t.Fatal("no SESSION")
-		}
-	}
+	out.expect(t, ctx, "SESSION ping")
 	if _, err := c.AddPipe(ctx, zmux.NetPipe(a1), zmux.PipeOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	for !strings.Contains(out.String(), "MODE ") {
-		time.Sleep(5 * time.Millisecond)
-		if ctx.Err() != nil {
-			t.Fatalf("no MODE after late join: %q", out.String())
-		}
-	}
+	out.expect(t, ctx, "MODE ")
 }
 
 func TestReadyReportsBoundAddress(t *testing.T) {
@@ -80,7 +76,7 @@ func TestReadyReportsBoundAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
-	var out lockedBuf
+	var out bytes.Buffer
 	Ready(&out, ln)
 	if want := "READY " + ln.Addr().String() + "\n"; out.String() != want || strings.HasSuffix(ln.Addr().String(), ":0") {
 		t.Fatalf("ready line %q, want %q", out.String(), want)

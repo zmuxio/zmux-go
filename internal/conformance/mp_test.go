@@ -14,7 +14,6 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/join"
 	"github.com/zmuxio/zmux-go/internal/wire"
-	"github.com/zmuxio/zmux-go/shaping"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
@@ -93,7 +92,7 @@ func (r *runner) peerRole() join.Role {
 // listenerUp delivers a carrier through the local endpoint's listener.
 func (r *runner) listenerUp(st map[string]any) error {
 	name := st["carrier"].(string)
-	c := &rcarrier{name: name, via: "listener", dir: st["dir"].(string)}
+	c := &rcarrier{name: name, via: "listener", dir: st["dir"].(string), channel: getB(st, "channel")}
 	if f, _ := st["framing"].(string); f == "records" {
 		c.framing = core.FramingRecords
 	}
@@ -133,13 +132,13 @@ func (r *runner) listenerUp(st map[string]any) error {
 			c.rejected = true
 			return nil
 		}
-		c.slot, c.deadline = slot, r.pending.Deadline(r.now)
+		c.slot, c.deadline = slot, r.now.Add(core.DefaultFirstRecordTimeout)
 	}
 	return nil
 }
 
 func (r *runner) carrierInfo(c *rcarrier) core.CarrierInfo {
-	return core.CarrierInfo{QueueBound: true, Framing: c.framing, MinRTT: true, Lanes: c.conn != ""}
+	return core.CarrierInfo{QueueBound: true, Framing: c.framing, MinRTT: true, Lanes: c.conn != "", Channel: c.channel}
 }
 
 func (r *runner) coreCarrier(c *rcarrier) core.Carrier {
@@ -150,8 +149,12 @@ func (r *runner) coreCarrier(c *rcarrier) core.Carrier {
 // closeCarrier ends a carrier of the listener.
 func (r *runner) closeCarrier(c *rcarrier, outcome string) {
 	c.rejected, c.outcome = true, outcome
+	if c.pendingAuthorization != nil {
+		r.s.EndPeerAuthorization(c.pendingAuthorization)
+		c.pendingAuthorization = nil
+	}
 	if c.pj != nil {
-		r.unconfirmed.Drop(c.pj)
+		r.s.DropPeerJoin(c.pj)
 	}
 	c.buf, c.msgs, c.heldHello, c.pj = nil, nil, nil, nil
 	r.pending.Leave(c.slot)
@@ -188,14 +191,28 @@ func (r *runner) offerHello(c *rcarrier, h *join.Hello) {
 		r.closeCarrier(c, "reject") // local policy: the Pipe ID's bit stays clear
 		return
 	}
-	reply, res := r.s.ClaimHello(pj, r.coreCarrier(c), 0, 1<<20, &shaping.UnitPlan{})
+	if c.holdAuthorization {
+		if !r.s.BeginPeerAuthorization(pj) {
+			r.closeCarrier(c, "reject")
+			return
+		}
+		c.pendingAuthorization = pj
+		return
+	}
+	r.claimHello(c, pj)
+}
+
+func (r *runner) claimHello(c *rcarrier, pj *core.PeerJoin) {
+	carrier := r.coreCarrier(c)
+	carrier.Handoff = c
+	reply, res, evicted := r.s.ClaimHello(pj, carrier, 0, 1<<20, &core.JoinWrite{})
 	r.drainEvents()
 	switch res {
 	case core.JoinAccepted:
 		c.reply, c.pj, c.outcome = reply, pj, "accept"
 		c.pipe = pj.Pipe.ID
-		if old, ok := r.unconfirmed.Hold(pj, c, r.unconfirmedCap); ok {
-			r.closeCarrier(old, "accept") // a failed join; its outcome stays the accepted join's
+		for _, old := range evicted {
+			r.closeCarrier(old.(*rcarrier), "accept") // its outcome stays the accepted Join's
 		}
 		r.peerReadsReply(c)
 		if c.joiner != nil && c.confirm {
@@ -243,7 +260,6 @@ func (r *runner) readConfirm(c *rcarrier, b []byte) {
 		return
 	}
 	pj := c.pj
-	r.unconfirmed.Drop(pj)
 	res := r.s.ConfirmJoin(pj, r.coreCarrier(c))
 	r.drainEvents()
 	if res != core.JoinAccepted {
@@ -254,7 +270,7 @@ func (r *runner) readConfirm(c *rcarrier, b []byte) {
 	r.pending.Leave(c.slot)
 	c.slot = nil
 	cc := r.coreCarrier(c)
-	p := &rpipe{id: pj.Pipe.ID, lanes: map[uint64]*rlane{}, writable: true, framing: c.framing}
+	p := &rpipe{id: pj.Pipe.ID, lanes: map[uint64]*rlane{}, writable: true, framing: c.framing, channel: c.channel}
 	p.in, p.out = cc.HasIn && pj.Pipe.Direction != 1, cc.HasOut && pj.Pipe.Direction != 0
 	r.pipes[p.id] = p
 	if c.conn != "" {
@@ -286,15 +302,15 @@ func (r *runner) feedCarrier(c *rcarrier) {
 		return
 	}
 	for _, m := range c.msgs {
-		r.s.ReceiveMessage(c.pipe, 0, &core.Buf{B: m}, m, r.now)
+		receiveMessageTest(r.s, c.pipe, 0, m, r.now)
 		r.drainEvents()
 	}
 	c.msgs = nil
 	if len(c.buf) == 0 {
 		return
 	}
-	buf := &core.Buf{B: c.buf}
-	n := r.s.Receive(c.pipe, c.lane, buf, c.buf, r.now)
+
+	n := receiveTest(r.s, c.pipe, c.lane, c.buf, r.now)
 	c.buf = append([]byte(nil), c.buf[n:]...)
 	r.drainEvents()
 }
@@ -353,6 +369,7 @@ func (r *runner) peerJoin(st map[string]any) error {
 		return err
 	}
 	c.joiner, c.confirm = j, true
+	c.holdAuthorization = st["hold"] == "authorization"
 	if v, ok := st["confirm"].(bool); ok {
 		c.confirm = v
 	}
@@ -364,6 +381,12 @@ func (r *runner) peerJoin(st map[string]any) error {
 		return err
 	}
 	r.offerHello(c, &h)
+	if c.holdAuthorization {
+		if c.pendingAuthorization == nil {
+			return fmt.Errorf("carrier %s: the join did not reach authorization", c.name)
+		}
+		return nil
+	}
 	if getB(st, "hold") {
 		if c.heldHello == nil {
 			return fmt.Errorf("carrier %s: the join was not held", c.name)
@@ -398,7 +421,20 @@ func (r *runner) peerJoinFinish(st map[string]any) error {
 	if c == nil {
 		return errors.New("unknown carrier")
 	}
-	r.retryHeld()
+	if pj := c.pendingAuthorization; pj != nil {
+		approved, ok := st["authorized"].(bool)
+		if !ok {
+			return fmt.Errorf("carrier %s: missing authorization decision", c.name)
+		}
+		if approved {
+			c.pendingAuthorization = nil
+			r.claimHello(c, pj)
+		} else {
+			r.closeCarrier(c, "reject")
+		}
+	} else {
+		r.retryHeld()
+	}
 	if c.heldHello != nil {
 		return fmt.Errorf("carrier %s: the join is still held", c.name)
 	}
@@ -424,7 +460,7 @@ func (r *runner) writeHellos() {
 		_, ready, err := r.s.JoinPrepare(p.id, nil)
 		var hello []byte
 		if err == nil && ready {
-			hello, err = r.s.JoinHello(p.id, p.framing, 0, &shaping.UnitPlan{})
+			hello, _, err = r.s.JoinHello(p.id, p.framing, 0, &core.JoinWrite{})
 		}
 		r.drainEvents()
 		if err != nil {
@@ -574,7 +610,7 @@ func (r *runner) joinerFeed(p *rpipe, data []byte) error {
 				return nil
 			}
 		case core.JoinProven:
-			confirm, _, err := r.s.JoinFinish(p.id, 0, &shaping.UnitPlan{})
+			confirm, _, err := r.s.JoinFinish(p.id, 0, &core.JoinWrite{})
 			r.drainEvents()
 			if err != nil {
 				return fmt.Errorf("pipe %d: finish: %w", p.id, err)
@@ -590,7 +626,7 @@ func (r *runner) joinerFeed(p *rpipe, data []byte) error {
 				p.replyIn = nil
 				l := p.lane(0)
 				l.in = append(l.in, rest...)
-				n := r.s.Receive(p.id, 0, &core.Buf{B: l.in}, l.in, r.now)
+				n := receiveTest(r.s, p.id, 0, l.in, r.now)
 				l.in = append([]byte(nil), l.in[n:]...)
 				r.drainEvents()
 			}
@@ -621,7 +657,7 @@ func (r *runner) listenerSend(c *rcarrier, st map[string]any) error {
 				return nil
 			}
 			if c.attached {
-				r.s.ReceiveMessage(c.pipe, 0, &core.Buf{B: m}, m, r.now)
+				receiveMessageTest(r.s, c.pipe, 0, m, r.now)
 				r.drainEvents()
 				continue
 			}

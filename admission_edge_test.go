@@ -5,8 +5,10 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/timeshim"
@@ -14,7 +16,11 @@ import (
 
 // lateClock is the host's clock, except that an armed AfterFunc has
 // already fired when it is stopped and calls its function only later.
-type lateClock struct{ armed atomic.Bool }
+type lateClock struct {
+	resume   <-chan struct{}
+	stopping chan<- struct{}
+	armed    atomic.Bool
+}
 
 func (c *lateClock) Now() time.Time { return time.Now() }
 
@@ -22,47 +28,70 @@ func (c *lateClock) AfterFunc(d time.Duration, f func()) timeshim.Timer {
 	if !c.armed.CompareAndSwap(true, false) {
 		return time.AfterFunc(d, f)
 	}
-	go func() {
-		time.Sleep(50 * time.Millisecond)
+	return lateTimer{stopping: c.stopping, run: func() {
+		<-c.resume
 		f()
-	}()
-	return lateTimer{}
+	}}
 }
 
-type lateTimer struct{}
+type lateTimer struct {
+	stopping chan<- struct{}
+	run      func()
+}
 
-func (lateTimer) Stop() bool               { return false }
+func (t lateTimer) Stop() bool             { close(t.stopping); go t.run(); return false }
 func (lateTimer) Reset(time.Duration) bool { return false }
 
 // msgHalf is a message-framed half that holds one message and counts
 // its closes.
 type msgHalf struct{ closed atomic.Int32 }
 
-func (h *msgHalf) Read([]byte) (int, error)        { return 0, nil }
-func (h *msgHalf) ReadMessage(int) ([]byte, error) { return []byte("m"), nil }
-func (h *msgHalf) Close() error                    { h.closed.Add(1); return nil }
+func (h *msgHalf) Read([]byte) (int, error)                 { return 0, nil }
+func (h *msgHalf) ReadMessage(int) (ReceivedMessage, error) { return OwnMessage([]byte("m")), nil }
+func (h *msgHalf) Close() error                             { h.closed.Add(1); return nil }
 
-// TestPeekMessageLateTimer reads a first message while the peek timer
-// fires: the peek reports the timeout only after the timer's interruption
-// ran, never a message on a carrier the timer then closes.
+// TestPeekMessageLateTimer forces the timer's Stop to report that the
+// timer already fired while its interruption is still held.
 func TestPeekMessageLateTimer(t *testing.T) {
-	clk := &lateClock{}
-	cfg := mpConfig()
-	cfg.Clock = clk
-	lst := mustNewListener(&ListenerConfig{Config: cfg})
-	defer func() { _ = lst.Close() }()
-	src := netip.MustParseAddrPort("192.0.2.1:1")
-	a, err := lst.Adapter().Arrive(src, src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer a.Release()
-	h := &msgHalf{}
-	clk.armed.Store(true)
-	msg, _, _, fired := a.peekMessage(context.Background(), PipeIO{R: h}, 64, time.Now().Add(time.Hour))
-	if !fired || msg != nil || h.closed.Load() != 1 {
-		t.Fatalf("message %q, fired %v, closed %d times", msg, fired, h.closed.Load())
-	}
+	synctest.Test(t, func(t *testing.T) {
+		stopping, resume := make(chan struct{}), make(chan struct{})
+		unhold := sync.OnceFunc(func() { close(resume) })
+		defer unhold()
+		clk := &lateClock{stopping: stopping, resume: resume}
+		cfg := mpConfig()
+		cfg.ClockDomain = NewClockDomain(clk)
+		lst := mustNewListener(&ListenerConfig{Config: cfg})
+		defer func() { _ = lst.Close() }()
+		a, err := lst.Adapter().Arrive(loop, loop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer a.Release()
+		h := &msgHalf{}
+		clk.armed.Store(true)
+		type result struct {
+			msg   ReceivedMessage
+			fired bool
+		}
+		done := make(chan result, 1)
+		go func() {
+			msg, _, _, fired := a.peekMessage(t.Context(), PipeIO{R: h}, 64, clk.Now().Add(time.Hour))
+			done <- result{msg, fired}
+		}()
+		<-stopping
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("peek returned before the timer interrupted the carrier")
+		default:
+		}
+		unhold()
+		got := <-done
+		defer got.msg.Release()
+		if !got.fired || got.msg.span.Buf != nil || h.closed.Load() != 1 {
+			t.Fatalf("message %q, fired %v, closed %d times", got.msg.Bytes(), got.fired, h.closed.Load())
+		}
+	})
 }
 
 // TestTakePendingLimitRejects refuses a further carrier of an accepted
@@ -70,7 +99,7 @@ func TestPeekMessageLateTimer(t *testing.T) {
 // through the reject policy, as pending_limit.
 func TestTakePendingLimitRejects(t *testing.T) {
 	got := make(chan RejectInfo, 1)
-	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 1,
+	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 2,
 		OnReject: func(i RejectInfo) RejectAction { got <- i; return RejectClose }})
 	defer func() { _ = lst.Close() }()
 	src := netip.MustParseAddrPort("192.0.2.1:1")
@@ -79,18 +108,30 @@ func TestTakePendingLimitRejects(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Release()
-	// The first carrier takes the source's one slot; a further one finds none.
+	// Keep both source slots occupied until the refusal is observed.
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	c1, c2 := net.Pipe()
-	defer func() { _ = c1.Close() }()
-	run, err := a.Take(ctx, NetPipe(c2), PipeHint{})
-	if err != nil {
-		t.Fatal(err)
+	var running []chan struct{}
+	var peers []net.Conn
+	defer func() {
+		cancel()
+		for _, peer := range peers {
+			_ = peer.Close()
+		}
+		for _, done := range running {
+			<-done
+		}
+	}()
+	for range 2 {
+		c1, c2 := net.Pipe()
+		peers = append(peers, c1)
+		run, err := a.Take(ctx, NetPipe(c2), PipeHint{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		running = append(running, done)
+		go func() { defer close(done); _ = run(ctx) }()
 	}
-	ran := make(chan struct{})
-	go func() { defer close(ran); _ = run(ctx) }()
-	defer func() { cancel(); <-ran }()
 	h := &msgHalf{}
 	if _, err := a.Take(context.Background(), PipeIO{R: h}, PipeHint{}); !errors.Is(err, errRefused) {
 		t.Fatalf("Take: %v", err)
@@ -111,10 +152,10 @@ func TestTakePendingLimitRejects(t *testing.T) {
 // emptyMsgHalf is a message-framed half whose first message is empty.
 type emptyMsgHalf struct{ closed atomic.Int32 }
 
-func (h *emptyMsgHalf) Read([]byte) (int, error)        { return 0, nil }
-func (h *emptyMsgHalf) ReadMessage(int) ([]byte, error) { return []byte{}, nil }
-func (h *emptyMsgHalf) Write(p []byte) (int, error)     { return len(p), nil }
-func (h *emptyMsgHalf) Close() error                    { h.closed.Add(1); return nil }
+func (h *emptyMsgHalf) Read([]byte) (int, error)                 { return 0, nil }
+func (h *emptyMsgHalf) ReadMessage(int) (ReceivedMessage, error) { return OwnMessage(nil), nil }
+func (h *emptyMsgHalf) Write(p []byte) (int, error)              { return len(p), nil }
+func (h *emptyMsgHalf) Close() error                             { h.closed.Add(1); return nil }
 
 // TestAdmitEmptyFirstMessageCloses closes a message-framed carrier whose
 // first message is empty without calling Decide: a takeover could not

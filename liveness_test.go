@@ -3,7 +3,9 @@ package zmux
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -79,7 +81,7 @@ func TestSetLivenessKeepAliveRuns(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		a, b := net.Pipe()
 		cc := &countConn{Conn: a}
-		c, _ := pair(t, cc, b, &Config{Liveness: Liveness{KeepAlivePeriod: -1}, Clock: timeshim.Real}, &Config{Liveness: Liveness{KeepAlivePeriod: -1}, Clock: timeshim.Real})
+		c, _ := pair(t, cc, b, &Config{Liveness: Liveness{KeepAlivePeriod: -1}, ClockDomain: NewClockDomain(timeshim.Real)}, &Config{Liveness: Liveness{KeepAlivePeriod: -1}, ClockDomain: NewClockDomain(timeshim.Real)})
 		synctest.Sleep(200 * time.Millisecond)
 		cc.n.Store(0)
 		synctest.Sleep(1200 * time.Millisecond)
@@ -107,39 +109,34 @@ func TestPipeSetLiveness(t *testing.T) {
 			t.Fatalf("%+v: %v", bad, err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
+	received := make(chan error, 1)
 	go func() {
 		st, err := e.server.AcceptStream(ctx)
 		if err == nil {
-			buf := make([]byte, 32<<10)
-			for {
-				if _, err := st.Read(buf); err != nil {
-					return
-				}
-			}
+			_, err = io.Copy(io.Discard, st)
 		}
+		received <- err
 	}()
 	st, err := e.client.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
-	stop := make(chan struct{})
+	start := make(chan struct{})
 	wg.Go(func() {
+		<-start
 		buf := make([]byte, 16<<10)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
+		for range 64 {
 			if _, err := st.Write(buf); err != nil {
+				t.Error(err)
 				return
 			}
 		}
 	})
 	wg.Go(func() {
+		<-start
 		for i := range 200 {
 			l := Liveness{ProbeInterval: time.Duration(1+i%5) * time.Second, DeadTimeout: time.Duration(1+i%3) * time.Second}
 			if err := e.client.SetLiveness(l); err != nil {
@@ -150,6 +147,7 @@ func TestPipeSetLiveness(t *testing.T) {
 		}
 	})
 	wg.Go(func() {
+		<-start
 		for i := range 200 {
 			var err error
 			if i%2 == 0 {
@@ -164,17 +162,21 @@ func TestPipeSetLiveness(t *testing.T) {
 			_ = e.server.RaiseIncomingStreams(int64(300+i), 0)
 		}
 	})
-	time.Sleep(300 * time.Millisecond)
-	close(stop)
+	close(start)
 	wg.Wait()
 	_ = st.Close()
+	select {
+	case err := <-received:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for p.Update(PipeUpdate{Liveness: Set(PipeLiveness{})}) == nil && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitTestSignal(t, p.Done(), "pipe retirement")
 	if err := p.Update(PipeUpdate{Liveness: Set(PipeLiveness{})}); !errors.Is(err, ErrPipeGone) {
 		t.Fatalf("retired pipe: %v", err)
 	}
@@ -184,42 +186,50 @@ func TestPipeSetLiveness(t *testing.T) {
 // application has authenticated its peer, say) raises the limit later:
 // the ninth stream waits until then.
 func TestRaiseIncomingStreams(t *testing.T) {
-	a, b := tcpPair(t)
-	c, s := pair(t, a, b, nil, &Config{MaxIncomingStreams: 8})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for range 8 {
-		st, err := c.OpenStreamSync(ctx)
-		if err != nil {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		domain := NewClockDomain(timeshim.Real)
+		c, s := pair(t, a, b, &Config{ClockDomain: domain}, &Config{ClockDomain: domain, MaxIncomingStreams: 8})
+		ctx := t.Context()
+		var streams [8]*Stream
+		for i := range streams {
+			st, err := c.OpenStreamSync(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.Write([]byte{1}); err != nil {
+				t.Fatal(err)
+			}
+			streams[i] = st
+		}
+		opened := make(chan error, 1)
+		go func() { _, err := c.OpenStreamSync(ctx); opened <- err }()
+		synctest.Wait()
+		select {
+		case err := <-opened:
+			t.Fatalf("ninth stream returned before the raise: %v", err)
+		default:
+		}
+		for _, bad := range [][2]int64{{-1, 0}, {0, -1}, {MaxStreamCredit + 1, 0}, {0, MaxStreamCredit + 1}} {
+			if err := s.RaiseIncomingStreams(bad[0], bad[1]); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("%v: %v", bad, err)
+			}
+		}
+		if err := s.RaiseIncomingStreams(4, 0); err != nil { // below: no-op
 			t.Fatal(err)
 		}
-		if _, err := st.Write([]byte{1}); err != nil {
+		if err := s.RaiseIncomingStreams(16, 0); err != nil {
 			t.Fatal(err)
 		}
-	}
-	short, scancel := context.WithTimeout(ctx, 300*time.Millisecond)
-	_, err := c.OpenStreamSync(short)
-	scancel()
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("ninth stream: %v", err)
-	}
-	for _, bad := range [][2]int64{{-1, 0}, {0, -1}, {MaxStreamCredit + 1, 0}, {0, MaxStreamCredit + 1}} {
-		if err := s.RaiseIncomingStreams(bad[0], bad[1]); !errors.Is(err, ErrInvalidConfig) {
-			t.Fatalf("%v: %v", bad, err)
+		if err := <-opened; err != nil {
+			t.Fatalf("after the raise: %v", err)
 		}
-	}
-	if err := s.RaiseIncomingStreams(4, 0); err != nil { // below: no-op
-		t.Fatal(err)
-	}
-	if err := s.RaiseIncomingStreams(16, 0); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.OpenStreamSync(ctx); err != nil {
-		t.Fatalf("after the raise: %v", err)
-	}
-	if err := s.RaiseIncomingStreams(MaxStreamCredit, MaxStreamCredit); err != nil {
-		t.Fatalf("a raise to MaxStreamCredit: %v", err)
-	}
+		// Keep the original streams alive until the ninth opens.
+		runtime.KeepAlive(streams)
+		if err := s.RaiseIncomingStreams(MaxStreamCredit, MaxStreamCredit); err != nil {
+			t.Fatalf("a raise to MaxStreamCredit: %v", err)
+		}
+	})
 }
 
 // MaxStreamCredit is 2^60: a constant index outside the array fails to compile.
@@ -246,20 +256,6 @@ func TestMaxStreamCredit(t *testing.T) {
 	c.unlock()
 	if !ok || bidi != 1<<60 || uni != 1<<60 {
 		t.Fatalf("advertised %d, %d (%v)", bidi, uni, ok)
-	}
-}
-
-// A Backoff.Min above Backoff.Max is invalid, the defaults filled in.
-func TestMaintainPipesBackoffOrder(t *testing.T) {
-	e := newMPEnv(t, mpConfig(), mpConfig())
-	dial := func(context.Context) (PipeIO, error) { return PipeIO{}, errors.New("unused") }
-	for _, pool := range []PipePool{
-		{Backoff: Backoff{Min: 2 * time.Second, Max: time.Second}, Dial: dial},
-		{Backoff: Backoff{Min: 2 * DefaultMaxBackoff}, Dial: dial},
-	} {
-		if err := e.client.MaintainPipes(context.Background(), pool); !errors.Is(err, ErrInvalidConfig) {
-			t.Fatalf("%v > %v: %v", pool.Backoff.Min, pool.Backoff.Max, err)
-		}
 	}
 }
 

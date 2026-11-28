@@ -89,8 +89,8 @@ func shapeTrace(t *testing.T, d *diffShaper) string {
 }
 
 // With no limit set, record lengths and times follow the plans alone.
-func TestShapeTraceUnchanged(t *testing.T) {
-	want := map[string]uint64{"plain": 0x1daa17b290d9266f, "gate": 0x814ea95a88dff94c}
+func TestShapeTrace(t *testing.T) {
+	want := map[string]uint64{"plain": 0x22fdc63a1772dd04, "gate": 0x7c0a81970eb02500}
 	for name, gate := range map[string]bool{"plain": false, "gate": true} {
 		tr := shapeTrace(t, &diffShaper{x: 42, gate: gate})
 		if f := os.Getenv("ZMUX_SHAPE_TRACE"); f != "" {

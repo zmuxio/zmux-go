@@ -1,7 +1,6 @@
 package zmux
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -13,12 +12,12 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"runtime"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/zmuxio/zmux-go/internal/testpeer"
 )
 
 // Interoperability with another implementation's scripted peer, a binary
@@ -26,112 +25,21 @@ import (
 // or "client addr", prints "ESTABLISHED", and answers the commands carried
 // in the open info of the streams this side opens.
 
-type peerProc struct {
-	cmd   *exec.Cmd
-	lines chan string
-	held  []string
-}
-
-func startPeer(t *testing.T, args ...string) *peerProc {
+func startPeer(t *testing.T, args ...string) *testpeer.Process {
 	t.Helper()
 	return startPeerEnv(t, "ZMUX_INTEROP_PEER", args...)
 }
 
-func startPeerEnv(t *testing.T, env string, args ...string) *peerProc {
+func startPeerEnv(t *testing.T, env string, args ...string) *testpeer.Process {
 	t.Helper()
-	bin := os.Getenv(env)
-	if bin == "" {
-		t.Skip(env + " not set")
-	}
-	cmd := exec.Command(bin, args...)
-	cmd.Stderr = os.Stderr
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	p := &peerProc{cmd: cmd, lines: make(chan string, 16)}
-	done := make(chan error, 1)
-	go func() {
-		sc := bufio.NewScanner(out)
-		var outputErr error
-		for sc.Scan() {
-			select {
-			case p.lines <- sc.Text():
-			default:
-				outputErr = errors.New("peer output queue exceeded its bound")
-				_ = cmd.Process.Kill()
-			}
-			if outputErr != nil {
-				break
-			}
-		}
-		if outputErr == nil {
-			outputErr = sc.Err()
-		}
-		close(p.lines)
-		waitErr := cmd.Wait()
-		if outputErr != nil {
-			done <- outputErr
-		} else {
-			done <- waitErr
-		}
-	}()
-	t.Cleanup(func() {
-		select {
-		case err := <-done:
-			if err != nil && env == "ZMUX_INTEROP_PEER" && !t.Failed() {
-				t.Errorf("peer failed: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
-			err := <-done
-			if env == "ZMUX_INTEROP_PEER" && !t.Failed() {
-				t.Errorf("peer did not terminate before cleanup: %v", err)
-			}
-		}
-	})
-	return p
-}
-
-// expect consumes the first line with prefix, in whatever order the peer
-// printed it relative to its other reports: the peer prints some of them
-// from concurrent tasks ("KEYS" may come before "ESTABLISHED"), so a line
-// expect passes over is held for a later expect, never dropped. The root,
-// seal and zmuxws interop tests keep identical copies of this helper (the
-// submodules require a published root version, so they cannot share one).
-func (p *peerProc) expect(t *testing.T, prefix string) string {
-	t.Helper()
-	for i, l := range p.held {
-		if rest, ok := strings.CutPrefix(l, prefix); ok {
-			p.held = append(p.held[:i], p.held[i+1:]...)
-			return strings.TrimSpace(rest)
-		}
-	}
-	deadline := time.After(15 * time.Second)
-	for {
-		select {
-		case l, ok := <-p.lines:
-			if !ok {
-				t.Fatalf("peer exited before %q (held %q)", prefix, p.held)
-			}
-			if rest, ok := strings.CutPrefix(l, prefix); ok {
-				return strings.TrimSpace(rest)
-			}
-			p.held = append(p.held, l)
-		case <-deadline:
-			t.Fatalf("peer: no %q (held %q)", prefix, p.held)
-		}
-	}
+	return testpeer.Start(t, testpeer.Command(t, env, args...), env == "ZMUX_INTEROP_PEER")
 }
 
 func interopConfig() *Config { return &Config{EnableDatagrams: true} }
 
 func TestInteropClient(t *testing.T) {
 	p := startPeer(t, "server")
-	addr := p.expect(t, "LISTEN ")
+	addr := p.Expect(t, "LISTEN ")
 	nc, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +50,7 @@ func TestInteropClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.expect(t, "ESTABLISHED")
+	p.Expect(t, "ESTABLISHED")
 	interopScript(t, ctx, c, p)
 }
 
@@ -166,7 +74,7 @@ func TestInteropServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.expect(t, "ESTABLISHED")
+	p.Expect(t, "ESTABLISHED")
 	interopScript(t, ctx, c, p)
 }
 
@@ -191,7 +99,7 @@ func command(t *testing.T, ctx context.Context, c *Conn, cmd string, body []byte
 	return string(b)
 }
 
-func interopScript(t *testing.T, ctx context.Context, c *Conn, p *peerProc) { //nolint:thelper // scenario body, not a helper: failures point inside it
+func interopScript(t *testing.T, ctx context.Context, c *Conn, p *testpeer.Process) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	interopSteps(t, ctx, c)
 	interopPeerClose(t, ctx, c, p)
 }
@@ -335,7 +243,7 @@ func interopSteps(t *testing.T, ctx context.Context, c *Conn) { //nolint:thelper
 }
 
 // interopPeerClose has the peer close with a code and reason.
-func interopPeerClose(t *testing.T, ctx context.Context, c *Conn, p *peerProc) { //nolint:thelper // scenario body, not a helper: failures point inside it
+func interopPeerClose(t *testing.T, ctx context.Context, c *Conn, p *testpeer.Process) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	closeStream, err := c.OpenStreamSync(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -351,7 +259,7 @@ func interopPeerClose(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	if !errors.As(err, &ae) || ae.ErrorCode != 42 || ae.ErrorMessage != "bye" || !ae.Remote {
 		t.Fatalf("close: %v", err)
 	}
-	p.expect(t, "CLOSED")
+	p.Expect(t, "CLOSED")
 }
 
 var interopPSK = []byte("zmux interop pre-shared key 0123")
@@ -359,34 +267,26 @@ var interopPSK = []byte("zmux interop pre-shared key 0123")
 func interopAnyMode(RecordPolicyInput, RecordMode, any) bool { return true }
 
 func interopMPConfig() *Config {
-	return &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{PSK: interopPSK, EndToEnd: true}, AllowRecordMode: interopAnyMode}
+	return &Config{EnableDatagrams: true, SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{PSK: interopPSK, EndToEnd: true}, AllowRecordMode: interopAnyMode}
 }
 
 // spreadCheck sends bulk with round-robin spreading and checks that every
 // pipe carried part of it.
 func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 	t.Helper()
-	// Every pipe usable first (a join may still be in probation).
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	// Attachment and probation change the pipe's health and wake NextEvent.
+	for {
 		ps := c.PipeStats()
-		ok := len(ps) >= 2
+		ready := len(ps) >= 2
 		for _, p := range ps {
-			ok = ok && p.Eligible
+			ready = ready && p.Eligible
 		}
-		if ok {
+		if ready {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	ready := c.PipeStats()
-	if len(ready) < 2 {
-		t.Fatalf("pipes not ready: %+v", ready)
-	}
-	for _, p := range ready {
-		if !p.Eligible {
-			t.Fatalf("pipe not eligible before spreading: %+v", ready)
-		}
+		waitTestEvent(t, ctx, c, "eligible interop pipes", func(ev Event) bool {
+			return ev.Kind == EventPipeHealthChanged
+		})
 	}
 	c.SetScheduler(SchedulerSpreadRoundRobin())
 	before := map[uint64]uint64{}
@@ -412,7 +312,7 @@ func spreadCheck(t *testing.T, ctx context.Context, c *Conn) {
 
 func TestInteropMultipathClient(t *testing.T) {
 	p := startPeer(t, "mp-server")
-	addr := p.expect(t, "LISTEN ")
+	addr := p.Expect(t, "LISTEN ")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	nc, err := net.Dial("tcp", addr)
@@ -423,7 +323,7 @@ func TestInteropMultipathClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.expect(t, "ESTABLISHED")
+	p.Expect(t, "ESTABLISHED")
 	nc2, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -463,11 +363,7 @@ func TestInteropMultipathServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.expect(t, "ESTABLISHED")
-	deadline := time.Now().Add(10 * time.Second)
-	for len(c.PipeStats()) < 2 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
+	p.Expect(t, "ESTABLISHED")
 	spreadCheck(t, ctx, c)
 	interopSteps(t, ctx, c)
 	interopCloseTail(t, ctx, c, p)
@@ -479,7 +375,7 @@ const interopTail = 256 << 10
 
 // interopPeerCloseTail has the peer write interopTail bytes on a stream it
 // opens and close with a code at once; every byte must arrive first.
-func interopPeerCloseTail(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
+func interopPeerCloseTail(t *testing.T, ctx context.Context, c *Conn, p *testpeer.Process) {
 	t.Helper()
 	cmd, err := c.OpenStreamSync(ctx)
 	if err != nil {
@@ -503,12 +399,12 @@ func interopPeerCloseTail(t *testing.T, ctx context.Context, c *Conn, p *peerPro
 	if err := c.Wait(); !errors.As(err, &ae) || ae.ErrorCode != 42 || !ae.Remote {
 		t.Fatalf("close: %v", err)
 	}
-	p.expect(t, "CLOSED")
+	p.Expect(t, "CLOSED")
 }
 
 // interopCloseTail writes interopTail bytes on a stream and closes with a
 // code at once; the peer reports how many bytes it read.
-func interopCloseTail(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
+func interopCloseTail(t *testing.T, ctx context.Context, c *Conn, p *testpeer.Process) {
 	t.Helper()
 	st, err := c.OpenStreamSync(ctx)
 	if err != nil {
@@ -526,7 +422,7 @@ func interopCloseTail(t *testing.T, ctx context.Context, c *Conn, p *peerProc) {
 	if err := c.CloseWithError(42, "bye"); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.expect(t, "TAIL "); got != strconv.Itoa(interopTail) {
+	if got := p.Expect(t, "TAIL "); got != strconv.Itoa(interopTail) {
 		t.Fatalf("tail: peer read %s of %d", got, interopTail)
 	}
 	runtime.KeepAlive(st)
@@ -550,10 +446,10 @@ func interopTLSConfig() *Config {
 		}
 		return RecordSealed
 	}
-	return &Config{EnableDatagrams: true, MaxPipes: 4, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, AllowRecordMode: interopAnyMode, RecordPolicy: bound}
+	return &Config{EnableDatagrams: true, SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{Exporter: true, EndToEnd: true}, AllowRecordMode: interopAnyMode, RecordPolicy: bound}
 }
 
-func interopKeys(t *testing.T, c *Conn, p *peerProc, wantLen int) {
+func interopKeys(t *testing.T, c *Conn, p *testpeer.Process, wantLen int) {
 	t.Helper()
 	got, err := c.ExportKeyingMaterial(interopAppLabel, nil, 16)
 	if err != nil {
@@ -562,7 +458,7 @@ func interopKeys(t *testing.T, c *Conn, p *peerProc, wantLen int) {
 	if len(got) != wantLen {
 		t.Fatalf("exporter value of %d bytes, want %d", len(got), wantLen)
 	}
-	if peer := p.expect(t, "KEYS "); peer != hex.EncodeToString(got) {
+	if peer := p.Expect(t, "KEYS "); peer != hex.EncodeToString(got) {
 		t.Fatalf("exporter values differ: peer %s, here %x", peer, got)
 	}
 }
@@ -570,7 +466,7 @@ func interopKeys(t *testing.T, c *Conn, p *peerProc, wantLen int) {
 func interopTLSClient(t *testing.T, split bool) {
 	t.Helper()
 	p := startPeer(t, "tls-server")
-	addr := p.expect(t, "LISTEN ")
+	addr := p.Expect(t, "LISTEN ")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	dial := func(kind byte) *tls.Conn {
@@ -596,7 +492,7 @@ func interopTLSClient(t *testing.T, split bool) {
 		t.Fatal(err)
 	}
 	interopKeys(t, c, p, wantLen)
-	p.expect(t, "ESTABLISHED")
+	p.Expect(t, "ESTABLISHED")
 	if _, err := c.AddPipe(ctx, NetPipe(dial('J')), PipeOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -650,11 +546,7 @@ func interopTLSServer(t *testing.T, mode string, wantLen int) {
 		t.Fatal(err)
 	}
 	interopKeys(t, c, p, wantLen)
-	p.expect(t, "ESTABLISHED")
-	deadline := time.Now().Add(10 * time.Second)
-	for len(c.PipeStats()) < 2 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
+	p.Expect(t, "ESTABLISHED")
 	spreadCheck(t, ctx, c)
 	interopScript(t, ctx, c, p)
 }
@@ -666,13 +558,3 @@ func TestInteropTLSExporterSplitServer(t *testing.T) { interopTLSServer(t, "tls-
 
 // The peer prints some reports from concurrent tasks; expect must hold the
 // line it passes over for the next expect.
-func TestInteropExpectOutOfOrder(t *testing.T) {
-	p := &peerProc{lines: make(chan string, 4)}
-	p.lines <- "KEYS 00ff"
-	p.lines <- "ESTABLISHED"
-	close(p.lines)
-	p.expect(t, "ESTABLISHED")
-	if got := p.expect(t, "KEYS "); got != "00ff" {
-		t.Fatalf("KEYS %q", got)
-	}
-}

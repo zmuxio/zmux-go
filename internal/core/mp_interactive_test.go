@@ -2,12 +2,14 @@ package core
 
 import (
 	"bytes"
+	"cmp"
 	"slices"
 	"testing"
 	"time"
 )
 
 type rrArrival struct {
+	to   *Session
 	data []byte
 	pipe uint64
 	at   Time
@@ -16,15 +18,16 @@ type rrArrival struct {
 // TestSpreadETAInteractive replays write opportunities on actual core
 // sessions. It seeds the estimates at the start of each exchange to replay
 // the same short observation window after a collapse. The carrier clock
-// models data delivery independently of those estimates. Liveness and ACK
-// timers are outside this replay so they cannot mask the placement decision.
+// models data delivery independently of those estimates. The replay does not
+// drive timer callbacks between write opportunities.
 func TestSpreadETAInteractive(t *testing.T) {
 	cfg := cwMPConfigs()
 	for i := range cfg {
-		cfg[i].MaxPipes = 12
+		cfg[i].SessionPolicy.Limits.SteadyAttachments = 12
 		cfg[i].Policy = PolicySpreadETA
 		cfg[i].TraceStreams = true
 		cfg[i].Probation = -1
+		cfg[i].Test.Seed = uint64(i + 1)
 	}
 	m := newCWSim(t, cfg, CarrierInfo{Framing: FramingRecords}, Millisecond)
 	m.established()
@@ -36,26 +39,30 @@ func TestSpreadETAInteractive(t *testing.T) {
 	high, impaired := ids[6], ids[7]
 	m.run(500*Millisecond, func() bool { return false })
 
-	transmit := func(s *Session, id uint64, delay Duration, rate uint64) []rrArrival {
+	var arrivals []rrArrival
+	transmit := func(s, to *Session, id uint64, delay Duration, rate uint64) {
 		b := GetBatch()
 		defer PutBatch(b)
 		if !s.PollTransmit(id, 0, b, DefaultBatch, m.now) {
-			return nil
+			return
 		}
-		var msgs []rrArrival
 		at := m.now.Add(delay)
 		for _, rec := range b.Messages() {
 			if rate > 0 {
 				at = at.Add(timeAt(uint64(len(rec)), float64(rate)))
 			}
-			msgs = append(msgs, rrArrival{pipe: id, at: at, data: bytes.Clone(rec)})
+			arrivals = append(arrivals, rrArrival{to: to, pipe: id, at: at, data: bytes.Clone(rec)})
 		}
-		s.WriteDone(b, nil, m.now)
-		return msgs
+		s.WriteDone(b, b.Len(), nil, m.now)
+		slices.SortStableFunc(arrivals, func(a, b rrArrival) int { return cmp.Compare(a.at, b.at) })
 	}
-	deliver := func(s *Session, a rrArrival) {
+	deliver := func() *Session {
+		a := arrivals[0]
+		arrivals[0] = rrArrival{}
+		arrivals = arrivals[1:]
 		m.now = a.at
-		s.ReceiveMessage(a.pipe, 0, &Buf{B: a.data}, a.data, a.at)
+		receiveMessageTest(a.to, a.pipe, 0, a.data, a.at)
+		return a.to
 	}
 	drain := func(s *Session, kind EventKind, id, offset uint64) (Event, bool) {
 		var found Event
@@ -106,8 +113,9 @@ func TestSpreadETAInteractive(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(fast, st, []byte{1})
-	for _, a := range transmit(fast, 0, 138500*Microsecond, 0) {
-		deliver(peer, a)
+	transmit(fast, peer, 0, 138500*Microsecond, 0)
+	for len(arrivals) != 0 {
+		deliver()
 	}
 	remote, ok := peer.AcceptStream(true)
 	if !ok || read(peer, remote, make([]byte, 1)) != 1 {
@@ -131,31 +139,29 @@ func TestSpreadETAInteractive(t *testing.T) {
 			request[j] = byte(i + j)
 		}
 		write(fast, st, request[:n])
-		var arrivals []rrArrival
 		if i%16 == 15 {
 			// The high-RTT pipe also gets an opportunity but is never due
 			// this prefix, with its current minimum RTT correctly estimated.
-			arrivals = append(arrivals, transmit(fast, high, 485*Millisecond, 0)...)
-			arrivals = append(arrivals, transmit(fast, impaired, 1385*Millisecond, 12)...)
+			transmit(fast, peer, high, 485*Millisecond, 0)
+			transmit(fast, peer, impaired, 1385*Millisecond, 12)
 		}
 		placement, placed := drain(fast, EvStreamPlaced, id, off)
-		m.now = m.now.Add(Millisecond)
+		secondWrite := start.Add(Millisecond)
+		for len(arrivals) != 0 && arrivals[0].at <= secondWrite {
+			deliver()
+		}
+		m.now = secondWrite
 		write(fast, st, request[n:])
-		arrivals = append(arrivals, transmit(fast, 0, 138500*Microsecond, 0)...)
-		slices.SortStableFunc(arrivals, func(a, b rrArrival) int {
-			if a.at < b.at {
-				return -1
-			}
-			if a.at > b.at {
-				return 1
-			}
-			return 0
-		})
+		transmit(fast, peer, 0, 138500*Microsecond, 0)
 		got := make([]byte, len(request))
 		var gotN int
 		var exposed Event
-		for _, a := range arrivals {
-			deliver(peer, a)
+		// Reply when the stream is readable in full. Control records still
+		// in flight stay on the carrier while the exchange continues.
+		for gotN < len(got) && len(arrivals) != 0 {
+			if deliver() != peer {
+				continue
+			}
 			gotN += read(peer, remote, got[gotN:])
 			for e, ok := peer.PollEvent(); ok; e, ok = peer.PollEvent() {
 				if e.Stream != id || e.Offset != off {
@@ -182,10 +188,14 @@ func TestSpreadETAInteractive(t *testing.T) {
 			t.Fatalf("request %d: got %d of %d ordered bytes", i, gotN, len(request))
 		}
 		write(peer, remote, got)
-		for _, a := range transmit(peer, 0, 138500*Microsecond, 0) {
-			deliver(fast, a)
+		transmit(peer, fast, 0, 138500*Microsecond, 0)
+		gotN = 0
+		for gotN < len(got) && len(arrivals) != 0 {
+			if deliver() == fast {
+				gotN += read(fast, st, got[gotN:])
+			}
 		}
-		if read(fast, st, got) != len(got) || !bytes.Equal(got, request) {
+		if gotN != len(got) || !bytes.Equal(got, request) {
 			t.Fatalf("echo %d: invalid response", i)
 		}
 		drain(fast, 0, 0, 0)
@@ -259,6 +269,7 @@ func TestSpreadETAAckStall(t *testing.T) {
 		p.mp.rtt = rttEst{has: true, min: rtt, smoothed: rtt}
 		measuredRate(p, 1e6)
 	}
+	s.refreshPathTopology()
 	a := impaired.mp
 	if etaOf(s, impaired) >= etaOf(s, fast) {
 		t.Fatal("before ACK delay, the initially faster pipe has a worse ETA")

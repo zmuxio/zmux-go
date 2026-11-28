@@ -2,13 +2,10 @@ package core
 
 import "github.com/zmuxio/zmux-go/internal/wire"
 
-// earlyState is early data under an assumed parameter set:
-// the zmux floor, or parameters remembered for carrier early data.
+// earlyState holds data sent under remembered plain QMux parameters.
 type earlyState struct {
-	assumed   wire.Params
-	floor     bool // assumed set is the zmux floor
-	fenceSent bool
-	sentAny   bool // early STREAM frames were sent
+	assumed wire.Params
+	sentAny bool // early STREAM frames were sent
 	// carrier: the early streams travel in carrier early data (TLS 1.3 or
 	// QUIC 0-RTT); every send stays provisional, and its data retained,
 	// until the carrier accepted it or it was re-issued after the peer's
@@ -33,6 +30,9 @@ type earlyHold struct {
 // sends are final.
 func (s *Session) CarrierEarlyAccepted() {
 	s.earlyHold, s.earlyAccepted = nil, true
+	s.shapingEarn(s.earlyEarn)
+	s.finishEarlyShape(true)
+	s.earlyEarn = 0
 	if s.early != nil {
 		s.early.carrier = false
 	}
@@ -65,6 +65,8 @@ func (s *Session) releaseProvisional() {
 // one the peer can read. Nothing changes once the peer's parameters
 // arrived (the peer saw the flight).
 func (s *Session) EarlyDiscarded() {
+	s.earlyEarn = 0
+	s.finishEarlyShape(false)
 	p := s.pipe(0)
 	if p == nil || s.peerSeen || p.out == nil {
 		return
@@ -81,16 +83,26 @@ func (s *Session) EarlyDiscarded() {
 // carrier reached the peer. It reports false, changing nothing, when the
 // session cannot restart: the peer's parameters already arrived on the
 // early carrier (a verdict that contradicts the carrier) or pipe 0 is gone.
-func (s *Session) RestartEarly(info CarrierInfo, sig *WriteSignal, now Time) bool {
+func (s *Session) RestartEarly(info CarrierInfo, sig *WriteSignal, replaced bool, now Time) bool {
 	s.SetNow(now)
 	p := s.pipe(0)
 	if p == nil || s.peerSeen || s.state >= StateClosing {
 		return false
 	}
+	if replaced {
+		p.conn, p.chSig = nil, nil
+		s.replaceDatagramPath(p)
+	} else if p.out != nil {
+		old := p.out.lane(0).info.CarrierIdentity
+		if old != nil && info.CarrierIdentity != nil && old != info.CarrierIdentity {
+			s.replaceDatagramPath(p)
+		}
+	}
 	p.out = &outDir{lanes: []*outLane{{info: info, confirmed: true}}, sig: sig}
 	p.out.lo.offered = info.Lanes
 	p.in = &inDir{lanes: []*inLane{{info: info, expectTP: true}}}
-	s.earnSkip = s.earnBytes // nothing of it reached the peer; it goes again
+	s.earlyEarn = 0
+	s.finishEarlyShape(false)
 	s.conn.sent = 0
 	// The early sends are re-issued after the peer's parameters, with the
 	// identifiers and preambles they took under the assumed set.
@@ -143,19 +155,6 @@ func (s *Session) RestartEarly(info CarrierInfo, sig *WriteSignal, now Time) boo
 	return true
 }
 
-// FloorParams is the zmux floor every zmux endpoint advertises at least.
-func FloorParams() wire.Params {
-	return wire.Params{
-		Has: wire.HasMaxData | wire.HasStreamsBidi | wire.HasBidiRemote | wire.HasPreamble |
-			wire.HasPipeAck | wire.HasResetAt,
-		InitialMaxData:       16384,
-		MaxStreamsBidi:       4,
-		MaxStreamDataBidiRem: 4096,
-		Preamble:             floorPreamble,
-		MaxRecordSize:        wire.DefaultMaxRecordSize,
-	}
-}
-
 // earlyAllowed: the role must not depend on the peer.
 func (s *Session) earlyAllowed() bool {
 	l := &s.cfg.Local
@@ -163,15 +162,11 @@ func (s *Session) earlyAllowed() bool {
 }
 
 // startEarly installs the assumed set before establishment.
-func (s *Session) startEarly(assumed wire.Params, floor bool) {
-	s.early = &earlyState{assumed: assumed, floor: floor}
+func (s *Session) startEarly(assumed wire.Params) {
+	s.early = &earlyState{assumed: assumed, carrier: true}
 	s.peer = assumed
-	s.feat.Preamble = s.cfg.Local.Has&wire.HasPreamble != 0 && assumed.Has&wire.HasPreamble != 0
 	s.conn.sendMax = assumed.InitialMaxData
-	s.loc[0].limit = assumed.MaxStreamsBidi
-	if !floor {
-		s.loc[1].limit = assumed.MaxStreamsUni
-	}
+	s.loc[0].limit, s.loc[1].limit = assumed.MaxStreamsBidi, assumed.MaxStreamsUni
 }
 
 // earlyActive reports whether early data may be sent now.
@@ -179,23 +174,8 @@ func (s *Session) earlyActive() bool { return s.early != nil && !s.peerSeen }
 
 func (s *Session) earlyWants() bool { return s.dataPendingOn(nil, nil) }
 
-// writeEarly writes the fence and the early STREAM frames.
-func (s *Session) writeEarly(w *recWriter) {
-	if !s.dataPendingOn(nil, nil) {
-		return
-	}
-	e := s.early
-	if !e.fenceSent && e.assumed.IsZmux() {
-		if !w.frame(9, false, func(b []byte) []byte {
-			b = wire.AppendPipeAckHeader(b, 1)
-			return wire.AppendAckEntry(b, wire.AckEntry{})
-		}) {
-			return
-		}
-		e.fenceSent = true
-	}
-	s.writeData(w, nil, nil)
-}
+// writeEarly writes the plain QMux STREAM data in a carrier's 0-RTT.
+func (s *Session) writeEarly(w *recWriter) { s.writeData(w, nil, nil) }
 
 // earlyOutcome decides the fate of early data when the peer's parameters
 // arrive.
@@ -206,7 +186,7 @@ func (s *Session) earlyOutcome() *wire.Error {
 		// Re-issued after a rejection: what follows the peer's
 		// parameters is final, once they admit what the sends assumed.
 		s.earlyHold = nil
-		if h.check && assumedBelow(&h.assumed, p) {
+		if h.check && (p.IsZmux() || assumedBelow(&h.assumed, p)) {
 			return wire.ErrParam("peer parameters below the assumed set")
 		}
 		s.earlyAdopt()
@@ -228,11 +208,8 @@ func (s *Session) earlyOutcome() *wire.Error {
 		s.earlyAdopt()
 		return nil
 	}
-	acked := s.feat.Acked()
-	if e.assumed.IsZmux() && !acked || e.floor && p.MaxStreamsBidi == 0 {
-		s.early = nil
-		s.closeWith(&SessionError{Kind: CloseEarlyRejected}, &closeFrame{code: wire.NoError})
-		return nil
+	if p.IsZmux() {
+		return wire.ErrParam("plain QMux early data sent to a zmux peer")
 	}
 	s.early = nil
 	if assumedBelow(&e.assumed, p) {
@@ -246,7 +223,8 @@ func (s *Session) earlyOutcome() *wire.Error {
 // set a the early sends assumed.
 func assumedBelow(a, p *wire.Params) bool {
 	below := p.InitialMaxData < a.InitialMaxData || p.MaxStreamsBidi < a.MaxStreamsBidi ||
-		p.MaxStreamDataBidiRem < a.MaxStreamDataBidiRem || p.MaxRecordSize < a.MaxRecordSize
+		p.MaxStreamDataBidiRem < a.MaxStreamDataBidiRem || p.MaxRecordSize < a.MaxRecordSize ||
+		p.MaxStreamsUni < a.MaxStreamsUni || p.MaxStreamDataUni < a.MaxStreamDataUni
 	if a.Has&wire.HasPreamble != 0 && (p.Has&wire.HasPreamble == 0 || p.Preamble < a.Preamble) {
 		below = true
 	}

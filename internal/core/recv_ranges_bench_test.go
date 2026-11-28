@@ -31,7 +31,7 @@ func BenchmarkRecvReorderAtCap(b *testing.B) {
 				b.StartTimer()
 				for off := uint64(2 * lim); off > 0; off -= 2 {
 					f.Offset = off
-					if _, err := s.onStream(f, nil); err != nil {
+					if err := onStreamTest(s, f); err != nil {
 						b.Fatal(err)
 					}
 				}

@@ -44,7 +44,7 @@ func (s *Session) lookupStream(id uint64, opens bool) (*Stream, *wire.Error) {
 		}
 		st.applyPeerParams()
 		s.stats.StreamsOpenedRemote++
-		if s.ga.sent && i >= s.ga.sentWater[t] || s.underPressure() {
+		if s.ga.sent && i >= s.ga.sentWater[t] || s.cfg.receiveHold == 0 && s.underPressure() {
 			s.stackRejectStream(st)
 		} else if !s.feat.Preamble {
 			s.offer(st)
@@ -150,7 +150,7 @@ func (s *Session) unstageUni() {
 
 // onStream processes a STREAM frame. It returns whether the frame had an
 // effect (for the no-effect budget, NE-5).
-func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
+func (s *Session) onStream(f *wire.Frame, payload Input) (bool, *wire.Error) {
 	st, err := s.lookupStream(f.StreamID, true)
 	if err != nil {
 		return false, err
@@ -163,21 +163,21 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 	}
 	r := &st.rcv
 	off := f.Offset
-	end := off + uint64(len(f.Data))
+	end := off + uint64(f.DataLen())
 	if r.finKnown && (end > r.final || f.Fin && end != r.final) {
 		return false, wire.NewError(wire.FinalSizeError, "data beyond the final size", "stream", st.id,
-			"offset", off, "length", len(f.Data), "limit", r.final)
+			"offset", off, "length", f.DataLen(), "limit", r.final)
 	}
 	if f.Fin && end < r.highest {
 		return false, wire.NewError(wire.FinalSizeError, "final size below received data", "stream", st.id)
 	}
 	if end > r.adv {
 		return false, wire.NewError(wire.FlowControlError, "stream data beyond the limit", "stream", st.id,
-			"offset", off, "length", len(f.Data), "limit", r.adv)
+			"offset", off, "length", f.DataLen(), "limit", r.adv)
 	}
 	if !s.feat.Multipath && off != r.highest && (!r.reset || off < r.highest) {
 		return false, wire.NewError(wire.ProtocolViolation, "out-of-order stream data", "stream", st.id,
-			"offset", off, "length", len(f.Data))
+			"offset", off, "length", f.DataLen())
 	}
 	top := r.highest
 	if r.finKnown {
@@ -205,10 +205,9 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		s.tuneData(st)
 	}
 	// Preamble of a peer stream.
-	data := f.Data
 	if !st.local && s.feat.Preamble && !r.preDone && off == 0 {
 		var pre wire.Preamble
-		if e := wire.ParsePreamble(data, s.cfg.Local.Preamble, &pre); e != nil {
+		if e := wire.ParsePreambleParts(payload.Bytes(), s.cfg.Local.Preamble, &pre); e != nil {
 			return false, e
 		}
 		effect = true
@@ -229,13 +228,13 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		r.arrived.add(0, uint64(pre.Size))
 		s.releaseUnbuffered(newPre)
 		r.readOff = max64(r.readOff, r.preSize)
-		data = data[pre.Size:]
+		payload = payload.Slice(pre.Size, payload.Len())
 		off = uint64(pre.Size)
 		if !r.stopped {
 			s.offer(st)
 		}
 	}
-	if len(data) > 0 {
+	if payload.Len() > 0 {
 		lo := max64(off, r.readOff)
 		hi := end
 		if r.reset {
@@ -253,10 +252,18 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 			if r.stopped || st.stackReject {
 				s.releaseUnbuffered(nb)
 			} else if nb > 0 {
-				part := data[lo-off : hi-off]
-				stored := r.buf.insert(lo, part, buf)
-				s.compactPins(buf)
+				views := payload.Slice(int(lo-off), int(hi-off))
+				var stored uint64
+				for start := 0; start < views.Len(); {
+					v := views.spanAt(start)
+					stored += r.buf.insert(lo+uint64(start), v.Buf, v.Start, v.Len())
+					start += v.Len()
+				}
+				s.compactReceives(views.spanAt(0).Buf)
 				s.bufAdd(stored)
+				if s.conn.rx.refused {
+					return false, wire.NewError(wire.ExcessiveLoad, "receive backing budget exhausted")
+				}
 				if stored < nb {
 					s.releaseUnbuffered(nb - stored)
 				}
@@ -275,7 +282,7 @@ func (s *Session) onStream(f *wire.Frame, buf *Buf) (bool, *wire.Error) {
 		s.traceStreamGap(st, f)
 	}
 	s.recvProgress(st)
-	if !effect && (len(f.Data) > 0 || !f.Fin) && !s.feat.Multipath {
+	if !effect && (f.DataLen() > 0 || !f.Fin) && !s.feat.Multipath {
 		return false, nil
 	}
 	return effect || st.opened, nil
@@ -426,19 +433,36 @@ func (s *Session) onReset(f *wire.Frame, at bool) (bool, *wire.Error) {
 // Read copies contiguous data into p. It returns (0, false, nil) when the
 // caller waits for its read slot (recvChanged).
 func (s *Session) Read(st *Stream, p []byte) (int, bool, error) {
+	n, _, fin, err := s.consume(st, p, len(p), false, nil)
+	return n, fin, err
+}
+
+// consume commits both copied and loaned reads. A failed loan reservation
+// leaves the queue, stream offset and credit intact.
+func (s *Session) consume(st *Stream, dst []byte, limit int, loan bool, splice *spliceRead) (int, Span, bool, error) {
 	if !st.hasR {
-		return 0, false, ErrInvalid
+		return 0, Span{}, false, ErrInvalid
 	}
 	r := &st.rcv
 	if r.stopped {
-		return 0, false, &StreamError{Kind: StreamClosedLocally, StreamID: st.id, Code: r.stopCode}
+		return 0, Span{}, false, &StreamError{Kind: StreamClosedLocally, StreamID: st.id, Code: r.stopCode}
 	}
 	if r.state == recvDataRead {
-		return 0, true, nil
+		return 0, Span{}, true, nil
 	}
-	n := 0
-	if len(p) > 0 {
-		n = r.buf.read(r.readOff, p)
+	if r.reset {
+		limit = int(min(uint64(limit), r.resetRel-min(r.resetRel, r.readOff)))
+	}
+	var n int
+	var data Span
+	var err error
+	if splice != nil {
+		n, data, err = r.buf.takeSplice(r.readOff, limit, splice)
+	} else {
+		n, data, err = r.buf.consume(r.readOff, dst, limit, loan)
+	}
+	if err != nil {
+		return 0, Span{}, false, err
 	}
 	if n > 0 {
 		r.readOff += uint64(n)
@@ -450,26 +474,26 @@ func (s *Session) Read(st *Stream, p []byte) (int, bool, error) {
 		if r.drainWait {
 			s.drainRead(st)
 		}
-	}
-	if r.reset && r.readOff >= r.resetRel && r.buf.contiguous(r.readOff) == r.readOff {
-		if n > 0 {
-			return n, false, nil
+		if loan || r.reset {
+			return n, data, false, nil
 		}
+	}
+	if r.reset && r.readOff >= r.resetRel {
 		r.state = recvResetRead
 		s.maybeDiscard(st)
 		s.drainRead(st)
-		return 0, false, r.errState
+		return 0, Span{}, false, r.errState
 	}
 	if r.finKnown && r.readOff == r.final && !r.reset {
 		r.state = recvDataRead
 		s.maybeDiscard(st)
 		s.drainRead(st)
-		return n, true, nil
+		return n, Span{}, true, nil
 	}
 	if n == 0 && s.err != nil {
-		return 0, false, s.err
+		return 0, Span{}, false, s.err
 	}
-	return n, false, nil
+	return n, Span{}, false, nil
 }
 
 // Readable reports how many bytes a Read would return now.
@@ -485,6 +509,19 @@ func (s *Session) Stop(st *Stream, code uint64) {
 	}
 	s.stopRecv(st, code)
 	s.maybeDiscard(st)
+}
+
+// StopInvalidPacket reports packet framing failure even when FIN made the
+// last invalid bytes visible during the final read.
+func (s *Session) StopInvalidPacket(st *Stream) {
+	r := &st.rcv
+	if st.idSet && st.hasR && !st.discarded && !st.cancelled && !r.stopped && (r.state == recvDataRead || r.state == recvDataRecvd) {
+		s.stopRecv(st, wire.CodePacketError)
+		r.stopped, r.stopCode = true, wire.CodePacketError
+		s.queueCtl(st, ctlStop)
+		return
+	}
+	s.Stop(st, wire.CodePacketError)
 }
 
 func (s *Session) stopRecv(st *Stream, code uint64) {
@@ -602,6 +639,9 @@ func (s *Session) maybeDiscard(st *Stream) {
 	if !sendDone || !recvDone || !released {
 		return
 	}
+	if st.ctl&ctlStop != 0 && st.rcv.stopCode == wire.CodePacketError {
+		return
+	}
 	st.discarded = true
 	s.syncUnsent(st)
 	delete(s.streams, st.id)
@@ -649,7 +689,7 @@ func (s *Session) unlinkCtl(st *Stream) {
 	if !st.inCtl {
 		return
 	}
-	st.ctl = 0
+	s.clearCtl(st, st.ctl)
 	st.inCtl = false
 	if st.ctlPrev == nil {
 		s.ctlHead = st.ctlNext
@@ -702,9 +742,12 @@ func (s *Session) failAllStreams() {
 
 // releaseAll drops every buffer of the session (CLOSED).
 func (s *Session) releaseAll() {
+	s.closeDatagramSends()
+	s.closeDatagramReceives()
 	// Each stream leaves the scheduler and the control list through their
 	// own exits, so its links never claim a membership the lists dropped.
 	drop := func(st *Stream) {
+		s.endStreamDgrams(st)
 		if st.hasR {
 			st.rcv.buf.clear()
 		}
@@ -723,7 +766,10 @@ func (s *Session) releaseAll() {
 		drop(st)
 	}
 	s.conn.buffered, s.conn.sendHeld, s.conn.smallHeld, s.conn.bigCount = 0, 0, 0, 0
-	s.conn.pins = pinSet{}
+	s.conn.rx.account.memory.adjust(-int64(s.conn.rx.metadata()))
+	s.conn.rx.free, s.conn.rx.nfree = nil, 0
+	s.conn.rx.rootFree, s.conn.rx.nrootFree = nil, 0
+	s.conn.rx.roots = nil
 	s.sched = scheduler{}
 	s.ctlHead, s.ctlTail, s.copyHead = nil, nil, nil
 	s.unsent = 0
@@ -789,6 +835,9 @@ func (s *Session) ReceiveWindow(st *Stream) (initial, limit uint64) {
 // the configured one, and of what SetReceiveWindow takes.
 const MinStreamWindow = 4096
 
+// MinConnWindow is the smallest configurable initial connection receive window.
+const MinConnWindow = 16 << 10
+
 // SetReceiveWindow sets a receiving part's window: initial is advertised at
 // once when it is above the window in force, limit caps auto-tuning (0: no
 // cap but the session's memory allowance, whatever the session's configured
@@ -813,52 +862,10 @@ func (s *Session) SetReceiveWindow(st *Stream, initial, limit uint64) error {
 	return nil
 }
 
-// ReadChunk consumes up to max contiguous bytes without copying. buf, when not
-// nil, holds a reference the caller releases (Unref) once it no longer needs
-// data.
-func (s *Session) ReadChunk(st *Stream, limit int) (data []byte, buf *Buf, fin bool, err error) {
-	if !st.hasR {
-		return nil, nil, false, ErrInvalid
-	}
-	r := &st.rcv
-	if r.stopped {
-		return nil, nil, false, &StreamError{Kind: StreamClosedLocally, StreamID: st.id, Code: r.stopCode}
-	}
-	if r.state == recvDataRead {
-		return nil, nil, true, nil
-	}
-	if r.reset && r.readOff+uint64(limit) > r.resetRel {
-		limit = int(r.resetRel - min64(r.resetRel, r.readOff))
-	}
-	data, buf = r.buf.take(r.readOff, limit)
-	if n := uint64(len(data)); n > 0 {
-		r.readOff += n
-		s.stats.AppBytesRead += n
-		st.cnt.appRead += n
-		s.bufSub(n)
-		s.streamCreditChanged(st)
-		s.tuneConsume()
-		if r.drainWait {
-			s.drainRead(st)
-		}
-		return data, buf, false, nil
-	}
-	if r.reset && r.readOff >= r.resetRel {
-		r.state = recvResetRead
-		s.maybeDiscard(st)
-		s.drainRead(st)
-		return nil, nil, false, r.errState
-	}
-	if r.finKnown && r.readOff == r.final && !r.reset {
-		r.state = recvDataRead
-		s.maybeDiscard(st)
-		s.drainRead(st)
-		return nil, nil, true, nil
-	}
-	if s.err != nil {
-		return nil, nil, false, s.err
-	}
-	return nil, nil, false, nil
+// ReadChunk loans a contiguous view. ReleaseLoan ends the caller's ownership.
+func (s *Session) ReadChunk(st *Stream, limit int) (Span, bool, error) {
+	_, data, fin, err := s.consume(st, nil, max(limit, 0), true, nil)
+	return data, fin, err
 }
 
 // ReadReady reports the bytes a read would return now and whether, with

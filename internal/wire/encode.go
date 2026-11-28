@@ -211,11 +211,12 @@ func AppendFrame(b []byte, f *Frame) []byte {
 			b = varint.AppendVarint(append(b, byte(t)), f.StreamID)
 			b = append(b, 0)
 			if f.HasLen {
-				b = varint.AppendVarint(b, uint64(len(f.Data)))
+				b = varint.AppendVarint(b, uint64(f.DataLen()))
 			}
-			return append(b, f.Data...)
+			return f.appendData(b)
 		}
-		return append(AppendStreamHeader(b, f.StreamID, f.Offset, len(f.Data), f.Fin, f.HasLen), f.Data...)
+		b = AppendStreamHeader(b, f.StreamID, f.Offset, f.DataLen(), f.Fin, f.HasLen)
+		return f.appendData(b)
 	case KindResetStream:
 		return AppendResetStream(b, f.StreamID, f.Code, f.FinalSize)
 	case KindResetStreamAt:
@@ -238,6 +239,8 @@ func AppendFrame(b []byte, f *Frame) []byte {
 		return AppendClose(b, f.App, f.Code, f.ErrFrame, f.Data)
 	case KindDatagram:
 		return append(AppendDatagramHeader(b, len(f.Data), f.HasLen), f.Data...)
+	case KindDatagramAck:
+		return AppendDatagramAck(b, f.DatagramAck)
 	case KindTransportParams:
 		return AppendTransportParams(b, f.Data)
 	case KindPing:

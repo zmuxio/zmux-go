@@ -8,7 +8,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
@@ -37,8 +40,9 @@ func (p *probeConn) Close() error {
 	if p.mute.Load() {
 		return nil
 	}
+	err := p.Conn.Close()
 	p.once.Do(func() { close(p.closed) })
-	return p.Conn.Close()
+	return err
 }
 
 // halfProbe is a probeConn over TCP that offers the half-close.
@@ -64,34 +68,39 @@ func probes(t *testing.T, kind string) (a, b net.Conn, pa, pb *probeConn) {
 	}
 }
 
-func waitClosed(t *testing.T, who string, p *probeConn, within time.Duration) {
+// closeWithFrozenClock keeps the session's linger timeout from expiring
+// while the test waits for the peer to end its side of a real carrier.
+func closeWithFrozenClock(t *testing.T, a, b net.Conn) (*Conn, *Conn) {
 	t.Helper()
-	select {
-	case <-p.closed:
-	case <-time.After(within):
-		t.Fatalf("%s: the carrier was not closed within %v", who, within)
-	}
+	clock := timeshim.NewFake(time.Now())
+	client, server := pair(t, a, b, &Config{ClockDomain: NewClockDomain(clock)}, &Config{ClockDomain: NewClockDomain(clock)})
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+		clock.Advance(time.Minute)
+	})
+	return client, server
 }
+
+const initialCloseLinger = 3 * 333 * time.Millisecond // no round-trip samples
 
 // The peer's CONNECTION_CLOSE read on a pipe ends that pipe's linger at
 // once (SPEC.md Section 6.5 step 3), also on carriers without half-close:
-// both carriers close well under the linger timeout and the code arrives.
+// both carriers close with the linger clock still frozen.
 func TestCloseEndsLingerOnPeerClose(t *testing.T) {
 	for _, kind := range []string{"pipe", "tcp-nohalf", "tcp"} {
 		t.Run(kind+"/both", func(t *testing.T) {
 			leakcheck.Check(t)
 			a, b, pa, pb := probes(t, kind)
-			client, server := pair(t, a, b, nil, nil)
-			t0 := time.Now()
-			go func() { _ = server.CloseWithError(8, "s") }()
+			client, server := closeWithFrozenClock(t, a, b)
+			closed := make(chan struct{})
+			go func() { defer close(closed); _ = server.CloseWithError(8, "s") }()
 			_ = client.CloseWithError(7, "c")
-			waitClosed(t, "client", pa, 100*time.Millisecond)
-			waitClosed(t, "server", pb, 100*time.Millisecond)
-			<-client.Done()
-			<-server.Done()
-			if d := time.Since(t0); d >= 100*time.Millisecond {
-				t.Fatalf("both ends took %v", d)
-			}
+			waitTestSignal(t, closed, "server CloseWithError")
+			waitTestSignal(t, pa.closed, "client carrier close")
+			waitTestSignal(t, pb.closed, "server carrier close")
+			waitTestSignal(t, client.Done(), "client session end")
+			waitTestSignal(t, server.Done(), "server session end")
 			ce, se := client.Wait(), server.Wait()
 			if ce == nil || se == nil {
 				t.Fatal("no close error")
@@ -100,16 +109,12 @@ func TestCloseEndsLingerOnPeerClose(t *testing.T) {
 		t.Run(kind+"/reply", func(t *testing.T) {
 			leakcheck.Check(t)
 			a, b, pa, pb := probes(t, kind)
-			client, server := pair(t, a, b, nil, nil)
-			t0 := time.Now()
+			client, server := closeWithFrozenClock(t, a, b)
 			_ = client.CloseWithError(7, "c")
-			waitClosed(t, "client", pa, 100*time.Millisecond)
-			waitClosed(t, "server", pb, 100*time.Millisecond)
-			<-client.Done()
-			<-server.Done()
-			if d := time.Since(t0); d >= 100*time.Millisecond {
-				t.Fatalf("the close took %v", d)
-			}
+			waitTestSignal(t, pa.closed, "client carrier close")
+			waitTestSignal(t, pb.closed, "server carrier close")
+			waitTestSignal(t, client.Done(), "client session end")
+			waitTestSignal(t, server.Done(), "server session end")
 			wantAppClose(t, "the closer", client.Wait(), 7, "c", false)
 			wantAppClose(t, "the peer", server.Wait(), 7, "c", true)
 		})
@@ -120,16 +125,25 @@ func TestCloseEndsLingerOnPeerClose(t *testing.T) {
 // for the linger timeout, no longer.
 func TestCloseLingerBoundsSilentPeer(t *testing.T) {
 	leakcheck.Check(t)
-	a, b, pa, pb := probes(t, "pipe")
-	client, server := pair(t, a, b, nil, nil)
-	pb.mute.Store(true)
-	defer func() { pb.mute.Store(false); _ = server.Close() }()
-	t0 := time.Now()
-	_ = client.CloseWithError(7, "c")
-	waitClosed(t, "client", pa, 5*time.Second)
-	if d := time.Since(t0); d < 200*time.Millisecond || d > 3*time.Second {
-		t.Fatalf("the linger of a silent peer took %v", d)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		a, b, pa, pb := probes(t, "pipe")
+		cfg := &Config{ClockDomain: NewClockDomain(timeshim.Real)}
+		client, _ := pair(t, a, b, cfg, cfg)
+		pb.mute.Store(true)
+		defer pb.mute.Store(false)
+		start := time.Now()
+		_ = client.CloseWithError(7, "c")
+		synctest.Wait()
+		select {
+		case <-pa.closed:
+			t.Fatal("the carrier closed before the silent peer's linger expired")
+		default:
+		}
+		waitTestSignal(t, pa.closed, "client carrier close")
+		if elapsed := time.Since(start); elapsed != initialCloseLinger {
+			t.Fatalf("the silent peer's linger = %v, want %v", elapsed, initialCloseLinger)
+		}
+	})
 }
 
 // abortProbe is a probeConn that records an Abort.
@@ -146,22 +160,61 @@ func (p *abortProbe) Abort(error) { p.once.Do(func() { close(p.aborted) }) }
 // whose graceful close leaves work running ends in bounded time.
 func TestCloseGracefulAbortBound(t *testing.T) {
 	leakcheck.Check(t)
-	x, y := net.Pipe()
-	pa := &abortProbe{probeConn: newProbe(x), aborted: make(chan struct{})}
-	client, server := pair(t, pa, newProbe(y), nil, nil)
-	t0 := time.Now()
-	_ = client.CloseWithError(7, "c")
-	waitClosed(t, "client", pa.probeConn, 100*time.Millisecond)
-	<-client.Done()
-	<-server.Done()
+	synctest.Test(t, func(t *testing.T) {
+		x, y := net.Pipe()
+		pa := &abortProbe{probeConn: newProbe(x), aborted: make(chan struct{})}
+		cfg := &Config{ClockDomain: NewClockDomain(timeshim.Real)}
+		client, _ := pair(t, pa, newProbe(y), cfg, cfg)
+		start := time.Now()
+		_ = client.CloseWithError(7, "c")
+		waitTestSignal(t, pa.closed, "graceful carrier close")
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Fatalf("the graceful close waited %v", elapsed)
+		}
+		waitTestSignal(t, pa.aborted, "carrier abort")
+		if elapsed := time.Since(start); elapsed != initialCloseLinger {
+			t.Fatalf("the carrier aborted after %v, want %v", elapsed, initialCloseLinger)
+		}
+	})
+}
+
+func TestCloseReadDrainReleasesTCPAfterEOF(t *testing.T) {
+	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	a, b, pa, _ := probes(t, "tcp")
+	client, server := closeWithFrozenClock(t, a, b)
+	send, err := server.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const payload = "still readable"
+	if _, err := send.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	recv, err := client.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The peer sends CONNECTION_CLOSE and a TCP FIN while the stream is unread.
+	_ = server.CloseWithError(0x2a, "bye")
 	select {
-	case <-pa.aborted:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the gracefully closed carrier was never aborted")
+	case <-pa.closed:
+	case <-ctx.Done():
+		t.Fatalf("waiting for TCP close before reading the stream: %v", ctx.Err())
 	}
-	if d := time.Since(t0); d < 200*time.Millisecond {
-		t.Fatalf("aborted %v after the close, before the linger bound", d)
+	select {
+	case <-client.Done():
+		t.Fatal("the session ended before the stream was read")
+	default:
 	}
+	buf := make([]byte, len(payload))
+	if n, err := recv.TryRead(buf); n != len(payload) || string(buf[:n]) != payload || err != nil {
+		t.Fatalf("after TCP close, read %q, %v", buf[:n], err)
+	}
+	waitTestSignal(t, client.Done(), "client session end after the read drain")
+	wantAppClose(t, "the peer", client.Wait(), 0x2a, "bye", true)
 }
 
 // The read drain keeps a stream's end, not only its bytes (SPEC.md Section
@@ -176,68 +229,55 @@ func TestCloseReadDrainKeepsReceivedEnd(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			leakcheck.Check(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			a, b := net.Pipe()
-			ch := make(chan *Conn, 1)
-			go func() {
-				s, err := Server(ctx, b, nil)
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+				defer cancel()
+				a, b, pa, _ := probes(t, "pipe")
+				cfg := &Config{ClockDomain: NewClockDomain(timeshim.Real)}
+				client, server := pair(t, a, b, cfg, cfg)
+				cs, err := client.OpenStreamSync(ctx)
 				if err != nil {
-					s = nil
+					t.Fatal(err)
 				}
-				ch <- s
-			}()
-			client, err := Client(ctx, a, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			server := <-ch
-			if server == nil {
-				t.Fatal("no server session")
-			}
-			cs, err := client.OpenStreamSync(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := cs.Write([]byte{7}); err != nil {
-				t.Fatal(err)
-			}
-			ss, err := server.AcceptStream(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// The end alone: the client's stream never receives a byte.
-			if reset {
-				ss.CancelWrite(9)
-			} else if err := ss.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := client.Ping(ctx); err != nil { // the end reached the client
-				t.Fatal(err)
-			}
-			_ = server.CloseWithError(0x2a, "bye")
-			_ = server.Wait()
-			// The read drain lasts at most the linger timeout, 250 ms on
-			// this link, which runs from the client's own close: check
-			// well inside it.
-			select {
-			case <-client.Done():
-				t.Fatal("the unread end did not hold the closing session")
-			case <-time.After(100 * time.Millisecond):
-			}
-			n, err := cs.Read(make([]byte, 16))
-			var se *StreamError
-			switch {
-			case reset && (n != 0 || !errors.As(err, &se) || se.ErrorCode != 9):
-				t.Fatalf("reset: read = %d, %v", n, err)
-			case !reset && (n != 0 || !errors.Is(err, io.EOF)):
-				t.Fatalf("fin: read = %d, %v", n, err)
-			}
-			select {
-			case <-client.Done():
-			case <-time.After(5 * time.Second):
-				t.Fatal("the session did not end once the end was read")
-			}
+				if _, err := cs.Write([]byte{7}); err != nil {
+					t.Fatal(err)
+				}
+				ss, err := server.AcceptStream(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// The end alone: the client's stream never receives a byte.
+				if reset {
+					ss.CancelWrite(9)
+				} else if err := ss.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := client.Ping(ctx); err != nil { // the end reached the client
+					t.Fatal(err)
+				}
+				_ = server.CloseWithError(0x2a, "bye")
+				waitTestSignal(t, pa.closed, "client carrier close")
+				synctest.Wait()
+				select {
+				case <-client.Done():
+					t.Fatal("the unread end did not hold the closing session")
+				default:
+				}
+				n, err := cs.Read(make([]byte, 16))
+				var se *StreamError
+				switch {
+				case reset && (n != 0 || !errors.As(err, &se) || se.ErrorCode != 9):
+					t.Fatalf("reset: read = %d, %v", n, err)
+				case !reset && (n != 0 || !errors.Is(err, io.EOF)):
+					t.Fatalf("fin: read = %d, %v", n, err)
+				}
+				synctest.Wait()
+				select {
+				case <-client.Done():
+				default:
+					t.Fatal("the session did not end once the end was read")
+				}
+			})
 		})
 	}
 }

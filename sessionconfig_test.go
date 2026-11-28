@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func TestSessionConfigMixed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	scfg, ccfg := selfSignedTLS(t)
-	tlsLim, plainLim := shaping.Limits{Wire: shaping.Account{Initial: 1}}, shaping.Limits{Wire: shaping.Account{Initial: 2}}
+	tlsLim, plainLim := shaping.Limits{Wire: &shaping.Account{Ceiling: 1, Initial: 1}}, shaping.Limits{Wire: &shaping.Account{Ceiling: 2, Initial: 2}}
 	lst := mustNewListener(&ListenerConfig{Config: mpConfig(), SessionConfig: func(_ context.Context, info *CarrierInfo, _ any) (*Config, error) {
 		if info.TLS != nil {
 			c := exporterConfig()
@@ -83,7 +84,7 @@ func TestSessionConfigMixed(t *testing.T) {
 	}
 	defer func() { _ = cd.Close(); _ = sd.Close(); waitDone(t, cd); waitDone(t, sd) }()
 	echoOnce(t, ctx, cd, sd)
-	if se.ShapingLimits() != tlsLim || sd.ShapingLimits() != plainLim {
+	if !reflect.DeepEqual(se.ShapingLimits(), tlsLim) || !reflect.DeepEqual(sd.ShapingLimits(), plainLim) {
 		t.Fatalf("limits %+v, %+v", se.ShapingLimits(), sd.ShapingLimits())
 	}
 	if se.ConnectionState().JoinPending || !sd.ConnectionState().JoinPending {
@@ -118,7 +119,7 @@ func TestSessionConfigOutcomes(t *testing.T) {
 		{name: "nil", f: func() (*Config, error) { return nil, nil }, ok: true}, //nolint:nilnil // the case under test: no config and no error
 		{name: "error", f: func() (*Config, error) { return nil, errors.New("no") }, ok: false},
 		{name: "panic", f: func() (*Config, error) { panic("no") }, ok: false},
-		{name: "clock", f: func() (*Config, error) { c := mpConfig(); c.Clock = other; return c, nil }, ok: false},
+		{name: "clock", f: func() (*Config, error) { c := mpConfig(); c.ClockDomain = NewClockDomain(other); return c, nil }, ok: false},
 		{name: "invalid", f: func() (*Config, error) {
 			c := mpConfig()
 			c.PipeAuth = PipeAuth{DeferredPSK: true, PSK: joinSecret}

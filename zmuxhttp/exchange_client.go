@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -138,50 +137,47 @@ func (t *exTarget) build(nonce []byte) string {
 // attempt in flight (at most DownRequests+UpRequests, plus a final CLOSE)
 // performs it and applies its result under mu.
 type exClient struct {
-	setup      func() bool // stops ctx from ending the carrier (context.AfterFunc)
-	p          exParams
-	hc         *http.Client // the caller's client (nil: the default)
-	nc         *http.Client // hc returning redirects
-	ht         *Target      // the candidate's target, if any
-	cid        [exCIDLen]byte
-	key        *exKey
-	target     exTarget // UP and CLOSE requests
+	openAt time.Time // first byte of the open piece
+	ctx    context.Context
+	err    error        // the carrier failed
+	setup  func() bool  // stops ctx from ending the carrier (context.AfterFunc)
+	hc     *http.Client // the caller's client (nil: the default)
+	nc     *http.Client // hc returning redirects
+	ht     *Target      // the candidate's target, if any
+	key    *exKey
+	cancel context.CancelFunc
+	wake   chan struct{} // capacity 1: run has something to do
+	// uplink
+	open       *exBuf                 // the piece being filled (nil: none)
+	held       map[uint64]*exPiece    // received, not yet given to the reader
+	downs      map[uint64]*exReqState // outstanding DOWN numbers
+	rbuf       *exBuf                 // the piece the reader is consuming
+	rc, wc     sync.Cond              // Read and Write waiters
+	target     exTarget               // UP and CLOSE requests
 	downTarget exTarget
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wake       chan struct{} // capacity 1: run has something to do
-
-	mu      sync.Mutex
-	rc, wc  sync.Cond // Read and Write waiters
-	err     error     // the carrier failed
-	ended   bool      // run has stopped: no more requests
-	sentAny bool
-	gone    bool // the server answered GONE
+	ups        []*exUp // sealed pieces not yet processed, by number
+	rdata      []byte
+	p          exParams
+	openLen    int
+	upSeq      uint64 // number of the next sealed piece
+	upFlight   int
+	upLimit    int
+	// downlink
+	ack       uint64 // smallest downlink number not received
+	deliv     uint64 // next piece to give to the reader
+	fin       uint64 // lowest FIN piece, when finKnown
+	dnFlight  int
+	downLimit int
+	mu        sync.Mutex
+	cid       [exCIDLen]byte
+	ended     bool // run has stopped: no more requests
+	sentAny   bool
+	gone      bool // the server answered GONE
 	// The flags of the uplink and the downlink, kept with the others.
 	wclosed  bool // uplink: zmux closed the write side
 	finSeal  bool // uplink: the FIN piece is sealed
 	finKnown bool // downlink: fin is set
 	rclosed  bool // downlink: zmux closed the read side
-
-	// uplink
-	open     *exBuf // the piece being filled (nil: none)
-	openLen  int
-	openAt   time.Time // first byte of the open piece
-	upSeq    uint64    // number of the next sealed piece
-	ups      []*exUp   // sealed pieces not yet processed, by number
-	upFlight int
-	upLimit  int
-
-	// downlink
-	ack       uint64                 // smallest downlink number not received
-	deliv     uint64                 // next piece to give to the reader
-	held      map[uint64]*exPiece    // received, not yet given to the reader
-	fin       uint64                 // lowest FIN piece, when finKnown
-	downs     map[uint64]*exReqState // outstanding DOWN numbers
-	dnFlight  int
-	downLimit int
-	rbuf      *exBuf // the piece the reader is consuming
-	rdata     []byte
 }
 
 // exReqState is one request number's retry state.
@@ -339,7 +335,7 @@ func (c *exClient) stepLocked(now time.Time, launch *[]*exAttempt) (next time.Ti
 			last = n
 			s := c.downs[n]
 			if s == nil {
-				s = &exReqState{backoff: c.p.backoffMin}
+				s = &exReqState{backoff: c.p.backoff.Min}
 				c.downs[n] = s
 			}
 			if s.inflight {
@@ -374,7 +370,7 @@ func (c *exClient) sealLocked(now time.Time) {
 		return
 	}
 	u := &exUp{seq: c.upSeq, fin: c.wclosed}
-	u.backoff = c.p.backoffMin
+	u.backoff = c.p.backoff.Min
 	if c.openLen > 0 {
 		u.buf, u.data = c.open, c.open.b[:c.openLen]
 		c.open, c.openLen = nil, 0
@@ -558,7 +554,7 @@ func (c *exClient) exchange(a *exAttempt) (res exResult) {
 		res.ok, res.bad = true, true
 		return res
 	}
-	buf, b, err := readExBody(resp.Body, int(resp.ContentLength), c.p.b64)
+	buf, b, err := readExBody(resp.Body, int(resp.ContentLength), c.p.b64, nil)
 	if err != nil {
 		return res
 	}
@@ -614,9 +610,9 @@ func (c *exClient) applyLocked(a *exAttempt, r exResult, now time.Time) {
 			c.failLocked(net.ErrClosed)
 			return
 		}
-		d := time.Duration(float64(st.backoff) * (1 - c.p.backoffJitter*mrand.Float64())) //nolint:gosec // G404: jitter needs no unpredictability
+		d := c.p.backoff.Wait(st.backoff)
 		st.retryAt = now.Add(d)
-		st.backoff = min(2*st.backoff, c.p.backoffMax)
+		st.backoff = c.p.backoff.NextNominal(st.backoff)
 	}
 	switch {
 	case !r.ok:
@@ -643,7 +639,7 @@ func (c *exClient) applyLocked(a *exAttempt, r exResult, now time.Time) {
 		}
 		return
 	}
-	st.backoff = c.p.backoffMin
+	st.backoff = c.p.backoff.Min
 	if a.kind == exKindUp {
 		c.upLimit = min(c.p.ups, c.upLimit+1)
 		for i, u := range c.ups {
@@ -846,7 +842,7 @@ func (w *exClientWriter) Write(p []byte) (int, error) {
 			c.openAt = time.Now()
 			c.poke()
 		}
-		c.open = exGrow(c.open, c.openLen, c.openLen+n, c.p.upPiece)
+		c.open = exGrow(c.open, c.openLen, c.openLen+n, c.p.upPiece, nil)
 		copy(c.open.b[c.openLen:], p[:n])
 		c.openLen += n
 		total += n

@@ -9,6 +9,7 @@ import (
 	"net"
 	"reflect"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ type mpEnv struct {
 }
 
 func mpConfig() *Config {
-	return &Config{MaxPipes: 4, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true},
+	return &Config{SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true},
 		SchedulerParams: SchedulerParams{Probation: -1}}
 }
 
@@ -51,19 +52,27 @@ func newMPEnvOn(t testing.TB, ccfg *Config, lcfg *ListenerConfig) *mpEnv {
 	})
 }
 
-// newMemMPEnv is newMPEnv over in-memory pipes; both configurations take
-// the host clock as Config.Clock, which the bubble's fake clock drives on
-// every platform (the session's own monotonic source on Windows is
-// outside it).
+// newMemMPEnv is newMPEnv over in-memory pipes. Configs without a clock
+// use timeshim.Real so that synctest also drives the session on Windows.
 func newMemMPEnv(t *testing.T, ccfg, scfg *Config) *mpEnv {
 	t.Helper()
-	ccfg.Clock, scfg.Clock = timeshim.Real, timeshim.Real
+	return newMemMPEnvOn(t, ccfg, &ListenerConfig{Config: scfg, InstanceID: []byte("instance")})
+}
+
+func newMemMPEnvOn(t *testing.T, ccfg *Config, lcfg *ListenerConfig) *mpEnv {
+	t.Helper()
+	if ccfg.ClockDomain == nil {
+		ccfg.ClockDomain = NewClockDomain(timeshim.Real)
+	}
+	if lcfg.Config.ClockDomain == nil {
+		lcfg.Config.ClockDomain = ccfg.ClockDomain
+	}
 	ln := netx.NewChanListener(nil, 0)
-	return startMPEnv(t, ccfg, &ListenerConfig{Config: scfg, InstanceID: []byte("instance")}, ln,
+	return startMPEnv(t, ccfg, lcfg, ln,
 		func(ctx context.Context) (net.Conn, error) { return ln.Dial(ctx, nil) })
 }
 
-// pipeDialer is a PipePool.Dial to e's listener.
+// pipeDialer opens an attachment to e's listener.
 func (e *mpEnv) pipeDialer() func(context.Context) (PipeIO, error) {
 	return func(ctx context.Context) (PipeIO, error) {
 		nc, err := e.dial(ctx)
@@ -130,7 +139,19 @@ func (e *mpEnv) addPipe(t testing.TB, o PipeOptions) *Pipe {
 
 func TestMultipathTransferAndFailover(t *testing.T) {
 	leakcheck.Check(t)
-	e := newMPEnv(t, mpConfig(), mpConfig())
+	placed := make(chan struct{})
+	signalPlaced := sync.OnceFunc(func() { close(placed) })
+	var secondBytes uint64 // only the tracer callback updates it
+	cfg := mpConfig()
+	cfg.Tracer = &Tracer{StreamEvents: true, Event: func(_ SessionID, ev Event) {
+		if ev.Kind == EventStreamPlaced && ev.PipeID != 0 {
+			secondBytes += ev.StreamLength
+			if secondBytes >= 1<<16 {
+				signalPlaced()
+			}
+		}
+	}}
+	e := newMPEnv(t, cfg, mpConfig())
 	if st := e.client.ConnectionState(); !st.Multipath {
 		t.Fatal("multipath not negotiated")
 	}
@@ -161,10 +182,7 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 	}
 	// Both pipes carry data; then the added pipe fails in the middle and
 	// its unacknowledged data is reinjected.
-	waitUntil(t, 60*time.Second, "data on pipe 2", func() bool {
-		st, ok := p2.Stats()
-		return ok && st.BytesSent >= 1<<16
-	})
+	waitTestSignal(t, placed, "data placed on the joined pipe")
 	if err := p2.Abort(); err != nil {
 		t.Fatal(err)
 	}
@@ -192,8 +210,8 @@ func TestMultipathTransferAndFailover(t *testing.T) {
 		t.Fatalf("added %d, failures %d, reinjections %d", cs.PipesAdded, cs.PipeFailures, cs.Reinjections)
 	}
 	// What went again earned nothing the second time.
-	if m := e.client.ShapingMeters(); m.SentBytes == 0 || m.SentBytes+cs.BytesReinjected+cs.BytesRedundant > cs.BytesSent {
-		t.Fatalf("earned %d of %d sent, %d again, %d copies", m.SentBytes, cs.BytesSent, cs.BytesReinjected, cs.BytesRedundant)
+	if m := e.client.ShapingMeters(); m.EarnedBytes == 0 || m.EarnedBytes+cs.BytesReinjected+cs.BytesRedundant > cs.BytesSent {
+		t.Fatalf("earned %d of %d sent, %d again, %d copies", m.EarnedBytes, cs.BytesSent, cs.BytesReinjected, cs.BytesRedundant)
 	}
 	if st, ok := p2.Stats(); ok && (st.FailureCount != 1 || st.Failure == nil) {
 		t.Fatalf("the failed pipe: %+v", st)
@@ -228,11 +246,18 @@ func TestMultipathEventsAndStats(t *testing.T) {
 	if !st.Local || st.LanesOut != 1 || st.LanesIn != 1 || st.Lanes != nil {
 		t.Fatalf("own attachment without lanes: %+v", st)
 	}
-	// The joined pipe's first PIPE_PING is answered by an acknowledgement.
-	waitUntil(t, 5*time.Second, "an answered PIPE_PING", func() bool {
-		st, ok := p.Stats()
-		return ok && st.PingsSent > 0 && st.PingsAnswered > 0 && st.PingsAnswered <= st.PingsSent
-	})
+	// Revalidation completes when the acknowledgement covers its PIPE_PING.
+	if err := p.Revalidate(); err != nil {
+		t.Fatal(err)
+	}
+	for st := pipeStat(t, p); st.Revalidating; st = pipeStat(t, p) {
+		waitTestEvent(t, ctx, e.client, "acknowledged pipe probe", func(ev Event) bool {
+			return ev.Kind == EventPipeHealthChanged && ev.PipeID == p.ID() && ev.Direction == DirectionSendOnly
+		})
+	}
+	if st := pipeStat(t, p); st.PingsSent == 0 || st.PingsAnswered == 0 || st.PingsAnswered > st.PingsSent {
+		t.Fatalf("probe counters: %+v", st)
+	}
 	if cs := e.client.ConnectionStats(); cs.PipesActive != 2 || cs.PipesAdded != 2 {
 		t.Fatalf("pipes active %d, added %d, want 2, 2", cs.PipesActive, cs.PipesAdded)
 	}
@@ -290,14 +315,15 @@ func TestStreamPipeBound(t *testing.T) {
 	if _, err := s.Write([]byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	for st := s.Stats(); !st.PipeBound; st = s.Stats() {
-		if ctx.Err() != nil {
-			t.Fatalf("never bound: %+v", st)
-		}
-		time.Sleep(time.Millisecond)
+	peer, err := e.server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if st := s.Stats(); st.PipeID != 0 {
-		t.Fatalf("bound to pipe %d, want the only pipe 0", st.PipeID)
+	if _, err := io.ReadFull(peer, make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if st := s.Stats(); !st.PipeBound || st.PipeID != 0 {
+		t.Fatalf("binding after delivery: %+v", st)
 	}
 	s.CancelWrite(0)
 }
@@ -376,7 +402,7 @@ func TestPipeStatsAbsentDirection(t *testing.T) {
 	leakcheck.Check(t)
 	e := newMPEnv(t, mpConfig(), mpConfig())
 	p := e.addPipe(t, PipeOptions{Direction: DirectionSendOnly})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	var peer PipeStats
 	for {
@@ -389,12 +415,11 @@ func TestPipeStatsAbsentDirection(t *testing.T) {
 		if found {
 			break
 		}
-		if ctx.Err() != nil {
-			t.Fatalf("the peer never saw pipe %d open: %+v", p.ID(), e.server.PipeStats())
+		if _, err := e.server.NextEvent(ctx); err != nil {
+			t.Fatalf("the peer never saw pipe %d open: %v", p.ID(), err)
 		}
-		time.Sleep(time.Millisecond)
 	}
-	want := PipeStats{Epoch: peer.Epoch, EpochKnown: peer.EpochKnown, ReplaceBy: peer.ReplaceBy, RecordMode: peer.RecordMode, PipeID: peer.PipeID, Local: peer.Local, PeerAttached: peer.PeerAttached, FateGroup: peer.FateGroup, Label: peer.Label,
+	want := PipeStats{Health: peer.Health, Epoch: peer.Epoch, EpochKnown: peer.EpochKnown, ReplaceBy: peer.ReplaceBy, RecordMode: peer.RecordMode, PipeID: peer.PipeID, Local: peer.Local, PeerAttached: peer.PeerAttached, FateGroup: peer.FateGroup, Label: peer.Label,
 		Carrier: peer.Carrier, Inbound: peer.Inbound, AttachedFor: peer.AttachedFor,
 		FailureCount: peer.FailureCount, Failure: peer.Failure, ReceivePriority: peer.ReceivePriority,
 		ReceiveStandby: peer.ReceiveStandby, RequestSeq: peer.RequestSeq, BytesReceived: peer.BytesReceived,
@@ -403,6 +428,9 @@ func TestPipeStatsAbsentDirection(t *testing.T) {
 		Lanes: peer.Lanes}
 	if !reflect.DeepEqual(peer, want) { //nolint:govet // want copies peer.Failure as is; only the send-side fields must be zero
 		t.Fatalf("receive-only pipe at the peer: %+v", peer)
+	}
+	if peer.Health.Send != (DirectionHealth{}) {
+		t.Fatal("receive-only pipe has send health")
 	}
 	if peer.BytesReceived == 0 || peer.LanesIn == 0 {
 		t.Fatalf("the present inbound direction reads 0: %+v", peer)
@@ -432,7 +460,10 @@ func TestRetiredPipeHandle(t *testing.T) {
 	if err := p.Abort(); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, 5*time.Second, "the pipe retired", func() bool { _, ok := p.Stats(); return !ok })
+	waitTestSignal(t, p.Done(), "pipe retirement")
+	if _, ok := p.Stats(); ok {
+		t.Fatal("completed pipe still in session")
+	}
 	for name, err := range map[string]error{"SetWeight": p.Update(PipeUpdate{Weight: Set[uint64](2)}), "SetSendPriority": p.Update(PipeUpdate{SendPriority: Set[uint64](1)}),
 		"Revalidate": p.Revalidate(), "Close": p.Close(), "Abort": p.Abort()} {
 		if !errors.Is(err, ErrPipeGone) {
@@ -452,8 +483,11 @@ func TestPipesRetiredEvent(t *testing.T) {
 	if err := p.Abort(); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, 5*time.Second, "the pipe retired", func() bool { _, ok := p.Stats(); return !ok })
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	waitTestSignal(t, p.Done(), "pipe retirement")
+	if _, ok := p.Stats(); ok {
+		t.Fatal("completed pipe still in session")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	var sum *Event
 	for {

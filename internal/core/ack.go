@@ -14,13 +14,15 @@ type ackState struct {
 	threshold uint64   // own zmux_ack_threshold
 	delay     Duration // own zmux_max_ack_delay
 	peerDelay Duration // peer's zmux_max_ack_delay
-	immediate bool     // a PIPE_PING asked for an immediate PIPE_ACK
+	at        Time
+	positions bool // a lane advanced after the last discharged snapshot
+	immediate bool // a PIPE_PING asked for an immediate PIPE_ACK
 	// An ack-eliciting record arrived on an inbound pipe without a
 	// PIPE_ACK during the preceding zmux_max_ack_delay: acknowledged at
 	// once, so that a sparse record is not held back by the delay and
 	// the RTT samples stay free of it.
 	prompt bool
-	woken  bool // the delay expired and the writers were woken
+	woken  ackWake
 	// Since the last PIPE_ACK that discharged the acknowledgement: an
 	// ack-eliciting frame other than PIPE_PING arrived (other), and a
 	// PIPE_PING arrived on a pipe pair without a usable outbound direction
@@ -29,14 +31,24 @@ type ackState struct {
 	other, pairless bool
 }
 
+type ackWake uint8
+
+const (
+	ackWaiting ackWake = iota
+	ackPrompt
+	ackDeadline
+)
+
 // pipeSend is the sender's view of an outbound pipe as a whole, counted
 // in send order across its lanes: estimates and
 // detection use its cumulative acknowledgement point.
 type pipeSend struct {
-	lim     *limiter // carrier queue limiter; nil when not paced
-	samples []sample // per ack-eliciting batch in flight (ends in send order)
-	re      rateEst
-	rtt     rttEst // single-pipe sessions; multipath uses the attachment's
+	deliveryRestrictedThrough uint64
+	pace                      Deadline[*Pipe]
+	lim                       *limiter // carrier queue limiter; nil when not paced
+	samples                   []sample // per ack-eliciting batch in flight (ends in send order)
+	re                        rateEst
+	rtt                       rttEst // single-pipe sessions; multipath uses the attachment's
 	// The send time of the last batch an earlier advance acknowledged, and
 	// when that advance arrived (paced).
 	prevSent, prevAckAt Time
@@ -112,7 +124,7 @@ func (r *rttEst) update(sample, ackDelay, maxAckDelay Duration, now Time, quiet 
 }
 
 func newAckState(s *Session) *ackState {
-	a := &ackState{s: s, threshold: 65536, delay: 25 * Millisecond, peerDelay: 25 * Millisecond}
+	a := &ackState{s: s, threshold: 65536, delay: 25 * Millisecond, peerDelay: 25 * Millisecond, at: Never}
 	if l := &s.cfg.Local; l.Has&wire.HasAckThreshold != 0 {
 		a.threshold = l.AckThreshold
 	}
@@ -140,13 +152,14 @@ func (a *ackState) srttMax() Duration {
 }
 
 // onRecord accounts a processed inbound record of pipe p.
-func (a *ackState) onRecord(p *Pipe, il *inLane, n uint64, f recordFacts, now Time) {
+func (a *ackState) onRecord(p *Pipe, n uint64, f recordFacts, now Time) {
+	a.positions = true
 	if f.elicit {
-		if il.elicit == 0 {
-			il.elicitAt = now
+		if p.in.elicit == 0 {
+			a.at = minT(a.at, now.Add(a.delay))
 		}
-		il.elicit += n
-		if !p.in.acked || now.Sub(p.in.ackedAt) >= a.delay {
+		p.in.elicit += n
+		if !p.in.acked || now.Sub(p.in.ackedAt) >= a.delay || p.in.elicit >= a.threshold {
 			a.prompt = true
 		}
 	}
@@ -154,36 +167,19 @@ func (a *ackState) onRecord(p *Pipe, il *inLane, n uint64, f recordFacts, now Ti
 		a.immediate = true
 	}
 	a.other = a.other || f.other
-	if a.due(now) {
-		a.s.wakeAllWriters()
+	a.handleTimeout(now)
+}
+
+func (a *ackState) laneEnded(il *inLane) {
+	if il.pos > il.reported {
+		a.immediate = true
+		a.wakeWriters(a.s.now)
 	}
 }
 
-// due reports whether a PIPE_ACK must be sent now.
+// due reports whether the registered acknowledgement can be sent now.
 func (a *ackState) due(now Time) bool {
-	if a.immediate || a.prompt {
-		return true
-	}
-	for _, p := range a.s.pipes {
-		if p.in == nil {
-			continue
-		}
-		var sum uint64
-		first := Never
-		for _, il := range p.in.lanes {
-			if il.elicit > 0 {
-				sum += il.elicit
-				first = minT(first, il.elicitAt)
-			}
-			if il.ended && il.pos > il.reported {
-				return true
-			}
-		}
-		if sum >= a.threshold || sum > 0 && now >= first.Add(a.delay) {
-			return true
-		}
-	}
-	return false
+	return a.immediate || a.prompt || now >= a.at
 }
 
 // paced reports whether the acknowledgement arriving now of the sample
@@ -205,45 +201,28 @@ func (ps *pipeSend) paced(i int, now Time) bool {
 // own zmux_max_ack_delay after the first ack-eliciting byte it covers
 // (MULTIPATH.md Section 6.3), the one bound that a shaping delay of the
 // record carrying it never passes; Never when none is pending.
-func (a *ackState) deadline() Time {
-	t := Never
-	for _, p := range a.s.pipes {
-		if p.in == nil {
-			continue
-		}
-		for _, il := range p.in.lanes {
-			if il.elicit > 0 {
-				t = minT(t, il.elicitAt.Add(a.delay))
-			}
-		}
-	}
-	return t
-}
+func (a *ackState) deadline() Time { return a.at }
 
 // nextTimeout is the earliest acknowledgement delay deadline.
 func (a *ackState) nextTimeout() Time {
-	if a.woken {
-		return Never // the writers were woken for it: no timer until it is sent
+	if a.woken == ackWaiting || a.woken == ackPrompt && a.s.hasShapingDelay() {
+		return a.deadline()
 	}
-	t := Never
-	for _, p := range a.s.pipes {
-		if p.in == nil {
-			continue
-		}
-		for _, il := range p.in.lanes {
-			if il.elicit > 0 {
-				t = minT(t, il.elicitAt.Add(a.delay))
-			}
-		}
-	}
-	return t
+	return Never
 }
 
 func (a *ackState) handleTimeout(now Time) {
-	if a.due(now) {
-		a.woken = true
-		a.s.wakeAllWriters()
+	if (a.woken == ackWaiting || a.woken == ackPrompt && now >= a.at) && a.due(now) {
+		a.wakeWriters(now)
 	}
+}
+
+func (a *ackState) wakeWriters(now Time) {
+	a.woken = ackPrompt
+	if now >= a.at {
+		a.woken = ackDeadline
+	}
+	a.s.wakeAllWriters()
 }
 
 // write adds a PIPE_ACK snapshot when one is due, or when unreported
@@ -278,7 +257,7 @@ func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 	}
 	if len(es) == 0 {
 		if discharge {
-			a.immediate, a.prompt, a.other, a.pairless = false, false, false, false
+			a.discharge()
 		}
 		return true
 	}
@@ -297,7 +276,9 @@ func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 			k = (k + 1) / 2
 		}
 		part := es[:k]
-		if !w.frame(n, false, func(b []byte) []byte {
+		// A position snapshot is feedback. It contributes to the encoded
+		// profile baseline but earns no cover credit or outbound activity.
+		if !w.controlFrame(n, false, true, func(b []byte) []byte {
 			b = wire.AppendPipeAckHeader(b, len(part))
 			for _, e := range part {
 				b = wire.AppendAckEntry(b, e)
@@ -316,17 +297,22 @@ func (a *ackState) writeSnapshot(w *recWriter, discharge bool) bool {
 	if !discharge {
 		return true
 	}
-	a.immediate, a.prompt, a.woken, a.other, a.pairless = false, false, false, false, false
+	a.discharge()
+	return true
+}
+
+func (a *ackState) discharge() {
+	a.immediate, a.prompt, a.woken, a.other, a.pairless = false, false, ackWaiting, false, false
+	a.at, a.positions = Never, false
 	for _, p := range a.s.pipes {
 		if p.in == nil {
 			continue
 		}
+		p.in.elicit = 0
 		for _, il := range p.in.lanes {
-			il.elicit = 0
 			il.reported = il.pos
 		}
 	}
-	return true
 }
 
 // hasAckEntry reports whether a snapshot holds an entry of p: an inbound
@@ -391,7 +377,13 @@ func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now 
 		ol.segs = append(ol.segs, sendSeg{pos: start, end: ol.pos, so: so})
 	}
 	ps.so += n
+	if n != 0 && (w.deliveryRestricted) {
+		ps.deliveryRestrictedThrough = ps.so
+	}
 	if w.anyElic {
+		if p.mp != nil {
+			p.mp.sentDeliveryRecords(so, w.b.recs)
+		}
 		// Send order up to the end of the last ack-eliciting record.
 		end := so + uint64(w.elicEnd)
 		if w.framing == FramingRecords {
@@ -438,7 +430,7 @@ func cumPoint(d *outDir, ol *outLane) uint64 {
 }
 
 // onPipeAck processes a PIPE_ACK.
-func (a *ackState) onPipeAck(f *wire.Frame, now Time) *wire.Error {
+func (a *ackState) onPipeAck(f *wire.Frame, now Time, received *Pipe) *wire.Error {
 	s := a.s
 	if s.mp != nil {
 		s.endReinjectHolds()
@@ -446,7 +438,7 @@ func (a *ackState) onPipeAck(f *wire.Frame, now Time) *wire.Error {
 	it := f.Iter()
 	for e, ok := it.Next(); ok; e, ok = it.Next() {
 		if s.mp != nil {
-			if err := s.mpAckEntry(e, now); err != nil {
+			if err := s.mpAckEntry(e, now, received); err != nil {
 				return err
 			}
 			continue
@@ -491,7 +483,7 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 	}
 	if j > 0 {
 		ol.activity = append(ol.activity[:0], ol.activity[j:]...)
-		s.timers.lastActivity = now
+		s.noteActivity(now)
 	}
 	k := 0
 	for k < len(ol.answers) && ol.answers[k].pos <= e.Position {
@@ -529,9 +521,19 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 			late := ad > a.peerDelay && ps.rttAt != 0 && now.Sub(ps.rttAt) < Second
 			if !late && (p.sampleOK(last.sent) || last.probe && ps.paced(i, now)) {
 				quiet := p.mp != nil && s.quiet()
+				minBefore, hadRTT := r.min, r.has
 				ev.rtt = r.update(rtt, minD(ad, a.peerDelay), a.peerDelay, now, quiet)
+				if p.mp != nil {
+					d := &p.mp.health.send
+					if d.running && last.end > d.startPosition {
+						p.mp.measuredGen = d.generation
+					}
+				}
+				s.pathRTTChanged(p, !hadRTT || r.min != minBefore)
 				if quality != nil {
 					quality.sampleRTT(rtt, minD(ad, a.peerDelay), now, quiet)
+					s.RecordProtocolRTT(p.id, quality.rtt, now, now.Add(measurementWindow))
+					s.RecordMinimumRTT(p.id, r.min, r.minAt, r.minAt.Add(300*Second))
 				}
 				ev.rttSentAt = last.sent
 				ps.rttAt = now
@@ -544,7 +546,11 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 			iv := maxD(last.sent.Sub(last.firstSentAt), now.Sub(last.deliveredAt))
 			proven := r.has && r.min > 0 && rtt-minD(ad, a.peerDelay)-r.min >= 4*r.min
 			if iv > 0 && (proven || p.sampleOK(last.sent)) {
-				ev.rate = ps.re.sample(float64(ps.delivered-last.delivered)*1e9/float64(iv), last.bubble, proven, last.epoch, now, quality)
+				rate := float64(ps.delivered-last.delivered) * 1e9 / float64(iv)
+				ev.rate = ps.re.sample(rate, last.bubble, proven, last.epoch, now, quality)
+			}
+			if quality != nil && ps.prevOK {
+				s.RecordDelivery(p.id, ps.deliveredAt, now, newly, now.Add(rateWindow), last.bubble)
 			}
 			ps.firstSentAt = last.sent
 		}
@@ -558,7 +564,7 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 			s.qualitySample(p)
 		}
 		if p.mp != nil {
-			s.mpAdvanced(p, ol, ps, now)
+			s.mpAdvanced(p, ol, ps, now, p.mp.ackedDeliveryRecords(cum))
 		}
 	} else if p.mp != nil {
 		s.mpLaneAdvanced(p, ol)
@@ -566,32 +572,5 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 	s.lanesAcked(p, ol)
 }
 
-// hasEntries reports whether a snapshot would have an entry.
-func (a *ackState) hasEntries() bool {
-	for _, p := range a.s.pipes {
-		if p.in == nil || p.retired() {
-			continue
-		}
-		for _, il := range p.in.lanes {
-			if il.pos > 0 {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // unreported reports positions not yet in a PIPE_ACK.
-func (a *ackState) unreported() bool {
-	for _, p := range a.s.pipes {
-		if p.in == nil {
-			continue
-		}
-		for _, il := range p.in.lanes {
-			if il.pos > il.reported {
-				return true
-			}
-		}
-	}
-	return false
-}
+func (a *ackState) unreported() bool { return a.positions }

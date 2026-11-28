@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	mrand "math/rand/v2"
 	"slices"
+	"time"
 
+	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
@@ -27,7 +29,7 @@ func (s State) String() string { return stateNames[s] }
 
 // Features are the features in use.
 type Features struct {
-	Role, GoAway, Preamble, Priority, Flows, Multipath, PipeAck, Resume bool
+	Role, GoAway, Preamble, Priority, DatagramFamily, Multipath, PipeAck, Resume bool
 	// LanesOut: lanes available toward the peer (we may open them).
 	LanesOut bool
 	// LanesIn: lanes available toward us (the peer may open them).
@@ -37,93 +39,119 @@ type Features struct {
 	JoinSecurityUnavailable bool
 	// CarrierDatagrams: DATAGRAM frames may go on the datagram channels of
 	// pipe carriers.
-	CarrierDatagrams bool
+	CarrierDatagrams       bool
+	CarrierDatagramPadding bool
 }
 
 // Acked reports whether the session is a session with acknowledgement.
 func (f *Features) Acked() bool { return f.Multipath || f.PipeAck }
 
+// workProbe is used by deterministic core work traces.
+type workProbe struct {
+	gates, pathScans int
+}
+
 // Session is the sans-IO state of one zmux session.
 type Session struct {
-	cfg   Config
-	now   Time
-	start Time
-	state State
-
-	role      Role // resolved role (initiator/responder)
-	roleKnown bool
-	// Flags of the session, kept together.
-	secretSet      bool // SetJoinSecret supplied the deferred PSK
-	declared       bool // pipe 0 is known end to end
-	greaseFirst    bool
-	closedEmitted  bool
-	preSuspend     State // the state before the suspension, restored at its end
-	firstHeld      bool  // pipe 0 writes nothing until ReleaseFirstFlight
-	earlyAccepted  bool
-	carrierEarlyIn bool // the bootstrap carrier delivers early data not yet confirmed by its handshake
-	copyMaxData    bool
-
-	peer     wire.Params
-	peerSeen bool
-	feat     Features
-	peerZmux bool
-	gates    wire.Gates
-
+	writeLostErr     error // the write failure that armed timers.writeLost
+	carriers         map[any]int
+	capacityWatch    chan struct{}
+	workProbe        *workProbe
+	streams          map[uint64]*Stream
+	ctlHead          *Stream
+	ctlTail          *Stream
+	copyHead         *Stream // streams with copyMSD set
+	noEffect         *noEffectWindow
+	rng              *mrand.Rand // rand
+	dg               *dgramState
+	early            *earlyState
+	earlyHold        *earlyHold // provisional sends held after the early flight (holdSends)
+	mp               *multiPath // nil unless multipath is in use
+	ack              *ackState
+	err              *SessionError
+	bcast            *Signal // session-level broadcast for waits that watch state
+	rxPipe           *Pipe   // the pipe of the record being processed
+	sendMemory       *budgetAllowance
+	flightMemory     *budgetAllowance
+	datagramMemory   *budgetAllowance
+	shp              *shapeSess // nil until a Shaper is set
+	sched            scheduler
+	q                sessQuality
+	acceptW          [2][]*Signal
+	openW            [2][]*Signal
+	handoffEvents    []HandoffEvent
+	pendingPeers     []*PeerJoin
+	members          []*Member
+	memberChanges    []MemberHealthChange
+	qualityUpdates   []QualityObservation
+	provisional      []*Stream // locally opened, not yet given an ID
+	pipes            []*Pipe   // pipe 0 first
+	laneTimers       DeadlineQueue[*Pipe]
+	qualityTimers    DeadlineQueue[*Pipe]
+	paceTimers       DeadlineQueue[*Pipe]
+	events           []Event
+	pollRequests     []PollRequest
+	wakes            []*Signal
+	actions          []Action
+	estW             []*Signal
+	keyW             []*Signal // joins held until the deferred PSK derives the join keys
+	retiredPipes     []uint64
+	capWaiters       []*Stream
+	acceptQ          [2]streamFIFO
+	closeFr          closeFrame
+	policy           SessionPolicy
+	ga               goawayState
+	ping             pingState
+	peer             wire.Params
+	conn             connFlow
+	cfg              Config
+	stats            sessionCounters
+	rem              [2]remoteCount
+	loc              [2]localCount // [bidi, uni]
+	timers           timers
+	tn               tuneState
+	gates            wire.Gates
+	budget           budget
+	drain            readDrainState
+	healthSeq        uint64
+	authorizingPeers int
+	memberID         MemberID
+	openers          int
+	capacitySeq      uint64
+	now              Time
+	start            Time
 	// Peer limits for sending.
-	peerMaxRecord uint64
-	peerMaxDgram  uint64
-	dgPath        int // the last PathDatagramPayload reported (EvDatagramPath)
-
-	streams           map[uint64]*Stream
-	loc               [2]localCount // [bidi, uni]
-	rem               [2]remoteCount
-	acceptQ           [2]streamFIFO
-	acceptW           [2][]*Signal
-	openW             [2][]*Signal
-	provisional       []*Stream // locally opened, not yet given an ID
-	sched             scheduler
-	ctlHead           *Stream
-	ctlTail           *Stream
-	copyHead          *Stream // streams with copyMSD set
-	unsent            uint64  // sum of the streams' unsentPayload (syncUnsent): SessionGauges.SendBuffered
-	conn              connFlow
-	pend              pendingCtl
-	ping              pingState
-	rng               *mrand.Rand // rand
-	ga                goawayState
-	dg                *dgramState
-	budget            budget
-	early             *earlyState
-	earlyHold         *earlyHold // provisional sends held after the early flight (holdSends)
-	pipes             []*Pipe    // pipe 0 first
-	mp                *multiPath // nil unless multipath is in use
-	ack               *ackState
-	timers            timers
-	writeLostErr      error // the write failure that armed timers.writeLost
-	err               *SessionError
-	closeFr           closeFrame
-	drain             readDrainState
-	events            []Event
+	peerMaxRecord     uint64
+	peerMaxDgram      uint64
+	dgPath, dgNative  int    // previous outgoing payload sizing snapshot
+	creditStreams     int    // queued MAX_STREAM_DATA controls
+	unsent            uint64 // sum of the streams' unsentPayload (syncUnsent): SessionGauges.SendBuffered
 	evHead            int
-	pollRequests      []PollRequest
-	wakes             []*Signal
-	actions           []Action
-	estW              []*Signal
-	keyW              []*Signal // joins held until the deferred PSK derives the join keys
-	bcast             *Signal   // session-level broadcast for waits that watch state
-	stats             sessionCounters
-	earnBytes         uint64 // own bytes sent: no padding, injections or copies
-	earnSkip          uint64 // bytes earned on a discarded first flight, not earned twice
+	earnBytes         uint64 // own bytes confirmed by the carrier
+	shapeLedger       shapeLedger
+	earlyEarn         uint64 // confirmed provisional bytes awaiting the carrier verdict
 	openLocalBidiRecv uint64
-	retiredPipes      []uint64
-	tn                tuneState
-	rxPipe            *Pipe  // the pipe of the record being processed
 	initConnWin       uint64 // the initial session window
-	charged           uint64 // the charge on cfg.Budget
-	capWaiters        []*Stream
-	q                 sessQuality
-	shp               *shapeSess // nil until a Shaper is set
-	suspendedAt       Time       // when the current suspension began
+	suspendedAt       Time   // when the current suspension began
+	feat              Features
+	pend              pendingCtl
+	memberFeedback    bool
+	state             State
+	role              Role // resolved role (initiator/responder)
+	roleKnown         bool
+	// Flags of the session, kept together.
+	dgNativeAvailable bool
+	secretSet         bool // SetJoinSecret supplied the deferred PSK
+	declared          bool // pipe 0 is known end to end
+	greaseFirst       bool
+	closedEmitted     bool
+	preSuspend        State // the state before the suspension, restored at its end
+	firstHeld         bool  // pipe 0 writes nothing until ReleaseFirstFlight
+	earlyAccepted     bool
+	carrierEarlyIn    bool // the bootstrap carrier delivers early data not yet confirmed by its handshake
+	copyMaxData       bool
+	peerSeen          bool
+	peerZmux          bool
 }
 
 // Stats are exact counters of the session.
@@ -135,19 +163,25 @@ type Stats struct {
 
 // sessionCounters are the counters kept inline on every session.
 type sessionCounters struct {
-	BytesSent, BytesReceived     uint64
-	RecordsSent, RecordsReceived uint64
-	StreamsOpenedLocal           uint64
-	StreamsOpenedRemote          uint64
-	DatagramsSent                uint64
-	DatagramsReceived            uint64
-	DatagramsDroppedSend         uint64
-	DatagramsDroppedRecv         uint64
-	AppBytesWritten              uint64
-	AppBytesRead                 uint64
-	BytesRedundant               uint64
-	BytesOpportunistic           uint64
-	DatagramsDroppedLimit        uint64
+	BytesSent, BytesReceived                           uint64
+	RecordsSent, RecordsReceived                       uint64
+	StreamsOpenedLocal                                 uint64
+	StreamsOpenedRemote                                uint64
+	DatagramsSent                                      uint64
+	DatagramsReceived                                  uint64
+	DatagramsDroppedSend                               uint64
+	DatagramsDroppedRecv                               uint64
+	DatagramDuplicatesDropped                          uint64
+	DatagramStaleDropped                               uint64
+	DatagramDeadlineDropped                            uint64
+	DatagramNativeDropped                              uint64
+	DatagramCopiesSent, DatagramCopyBytes              uint64
+	DatagramCopyBudgetDropped, DatagramCopyPathDropped uint64
+	AppBytesWritten                                    uint64
+	AppBytesRead                                       uint64
+	BytesRedundant                                     uint64
+	BytesOpportunistic                                 uint64
+	DatagramsDroppedLimit                              uint64
 	// Datagrams sent and received on carrier datagram channels, also
 	// counted in DatagramsSent and DatagramsReceived.
 	DatagramsSentChannel     uint64
@@ -179,10 +213,11 @@ type sessionCounters struct {
 }
 
 type localCount struct {
-	next     uint64 // next stream index to allocate
-	reserved uint64 // streams opened by the application (credit reserved)
-	limit    uint64 // peer's MAX_STREAMS
-	blocked  uint64 // limit at which STREAMS_BLOCKED was sent (+1)
+	next            uint64 // next stream index to allocate
+	reserved        uint64 // streams opened by the application (credit reserved)
+	limit           uint64 // peer's MAX_STREAMS
+	blocked         uint64 // limit at which STREAMS_BLOCKED was queued (+1)
+	blockedReported uint64
 }
 
 type remoteCount struct {
@@ -192,6 +227,7 @@ type remoteCount struct {
 	discarded   uint64
 	staged      bool // uni credit not yet raised past the initial limit
 	blockedSeen uint64
+	reported    uint64 // last MAX_STREAMS encoded, plus one
 }
 
 type pendingCtl struct {
@@ -228,7 +264,13 @@ type closeFrame struct {
 
 // New creates a session. The bootstrap pipe is attached with AttachBootstrap.
 func New(cfg Config, now Time) *Session {
-	s := &Session{cfg: cfg, now: now, start: now, streams: make(map[uint64]*Stream), declared: cfg.Declared}
+	if cfg.DatagramCopyLimit < 1 {
+		panic("zmux: core requires a positive DatagramCopyLimit")
+	}
+	s := &Session{cfg: cfg, policy: cfg.SessionPolicy, now: now, start: now, streams: make(map[uint64]*Stream), declared: cfg.Declared}
+	if cfg.ShapeLimits.Wire != nil || cfg.ShapeBudget.Wire != nil || cfg.ShapeLimits.Profile != nil || cfg.ShapeBudget.Profile != nil {
+		s.shapeSess()
+	}
 	if s.cfg.Local.MaxRecordSize == 0 {
 		s.cfg.Local.MaxRecordSize = wire.DefaultMaxRecordSize
 	}
@@ -237,6 +279,18 @@ func New(cfg Config, now Time) *Session {
 	s.rem[0] = remoteCount{limit: l.MaxStreamsBidi, initial: l.MaxStreamsBidi}
 	s.rem[1] = remoteCount{limit: l.MaxStreamsUni, initial: l.MaxStreamsUni, staged: cfg.StagedUni}
 	s.conn.initRecv(l.InitialMaxData)
+	loanCap := cfg.ReceiveLoanBudget
+	if loanCap == 0 {
+		loanCap = defaultLoanCap
+	}
+	s.conn.rx.account = &recvAccount{loanCap: loanCap}
+	if cfg.receiveHold != 0 {
+		s.conn.rx.account.memory = newBudgetAllowance(cfg.Budget, int64(cfg.receiveHold-cfg.joinHold-sendWorkingSpace), 0)
+		sendCache := min(cfg.SendBuffer, cfg.Local.InitialMaxData*4)
+		s.sendMemory = newBudgetAllowance(cfg.Budget, sendWorkingSpace, int64(sendCache))
+		s.flightMemory = newBudgetAllowance(cfg.Budget, int64(cfg.joinHold), 0)
+		s.datagramMemory = newBudgetAllowance(cfg.Budget, 0, 0)
+	}
 	s.initConnWin = l.InitialMaxData
 	if cfg.Role != RoleAuto {
 		s.role, s.roleKnown = cfg.Role, true
@@ -256,14 +310,11 @@ func New(cfg Config, now Time) *Session {
 	s.budget.tokens = budgetCap
 	s.budget.last = now
 	s.timers = timers{handshake: now.Add(cfg.HandshakeTimeout), linger: Never, grace: Never, writeLost: Never}
-	switch {
-	case cfg.EarlyRemembered != nil && cfg.EarlyReplayable && s.earlyAllowed():
-		s.startEarly(*cfg.EarlyRemembered, false)
-		s.early.carrier = true
-	case cfg.EarlyZmuxPeer && s.earlyAllowed():
-		s.startEarly(FloorParams(), true)
-		s.early.carrier = cfg.EarlyCarrier
+	if cfg.EarlyCarrier && cfg.EarlyPlainQMux && cfg.EarlyRemembered != nil &&
+		!cfg.EarlyRemembered.IsZmux() && s.earlyAllowed() {
+		s.startEarly(*cfg.EarlyRemembered)
 	}
+
 	if s.firstHeld = cfg.HoldFirstFlight; s.firstHeld {
 		s.timers.handshake = Never // it runs from the release
 	}
@@ -407,8 +458,9 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	f.GoAway = both(wire.HasGoAway)
 	f.Preamble = both(wire.HasPreamble)
 	f.Priority = both(wire.HasPriority)
-	f.Flows = both(wire.HasFlows) && l.Has&wire.HasDatagram != 0
+	f.DatagramFamily = both(wire.HasDatagramFamily)
 	f.CarrierDatagrams = both(wire.HasCarrierDatagrams) && l.Has&wire.HasDatagram != 0
+	f.CarrierDatagramPadding = f.CarrierDatagrams && both(wire.HasCarrierDatagramPadding)
 	if both(wire.HasMultipath) {
 		const sources = wire.SecretExporter | wire.SecretPSK
 		lf, pf := l.SecretFlags&sources, p.SecretFlags&sources
@@ -438,8 +490,10 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 	if p.Has&wire.HasDatagram != 0 {
 		s.peerMaxDgram = p.MaxDatagramFrameSize
 	}
+	s.gates.DatagramAck = f.DatagramFamily && s.peerMaxDgram > 0
 	// Flow control from the peer.
 	s.conn.sendMax = p.InitialMaxData
+	s.sched.releaseConnectionCredit()
 	s.loc[0].limit = p.MaxStreamsBidi
 	s.loc[1].limit = p.MaxStreamsUni
 	if err := s.earlyOutcome(); err != nil {
@@ -466,7 +520,7 @@ func (s *Session) processPeerParams(p *wire.Params) *wire.Error {
 		s.state = StateActive
 	}
 	s.timers.handshake = Never
-	s.timers.lastActivity = s.now
+	s.noteActivity(s.now)
 	s.timers.lastKeepRef = -1
 	s.emit(Event{Kind: EvEstablished, Features: *f, Role: s.role})
 	s.noteDatagramPath()
@@ -524,7 +578,7 @@ const CloseLimit = Second
 
 // lingerTimeout is min(2 s, max(250 ms, 3 x SRTT)).
 func (s *Session) lingerTimeout() Duration {
-	return minD(2*Second, maxD(250*Millisecond, MulD(s.srtt(), 3)))
+	return Duration(carrierio.Linger(time.Duration(s.srtt())))
 }
 
 // closeWith enters CLOSING and queues CONNECTION_CLOSE fr on every live
@@ -537,6 +591,7 @@ func (s *Session) closeWith(e *SessionError, fr *closeFrame) {
 	s.err = e
 	s.endSuspension()
 	s.state = StateClosing
+	s.cancelShaping()
 	s.failAllStreams()
 	s.wakeAll()
 	s.discardAcceptQueues()
@@ -618,6 +673,7 @@ func (s *Session) closeSilently(e *SessionError, graceful bool) {
 	s.err = e
 	s.endSuspension()
 	s.state = StateClosing
+	s.cancelShaping()
 	s.failAllStreams()
 	s.wakeAll()
 	if graceful {
@@ -649,6 +705,25 @@ func (s *Session) finishClose() {
 	}
 	s.endSuspension()
 	s.state = StateClosed
+	s.cancelShaping()
+	s.laneTimers.Clear()
+	s.paceTimers.Clear()
+	s.qualityTimers.Clear()
+	if s.shp != nil {
+		s.shp.timers.Clear()
+		s.shp.delayed = 0
+	}
+	if s.dg != nil {
+		s.dg.reportTimers.Clear()
+		s.dg.expiry.Clear()
+	}
+	if s.mp != nil {
+		c := &s.mp.clock
+		c.due.Clear()
+		c.rtts.Clear()
+		c.ptos.Clear()
+		c.ping, c.inOnly, c.unilateral = nil, nil, nil
+	}
 	for _, p := range s.pipes {
 		switch {
 		case p.in != nil && p.in.closed:
@@ -665,6 +740,9 @@ func (s *Session) finishClose() {
 	s.timers = timers{handshake: Never, linger: Never, grace: Never, writeLost: Never}
 	s.emitClosedEvent()
 	s.releaseAll()
+	s.conn.rx.account.memory.close()
+	s.flightMemory.close()
+	s.sendMemory.close()
 	s.wakeAll()
 }
 
@@ -749,21 +827,28 @@ func (s *Session) wakeAllWriters() {
 	}
 }
 
-// wakePipe wakes the writers of every lane of an outbound pipe.
+// wakePipe publishes output permissions for the pipe's eligible lanes.
 func (s *Session) wakePipe(p *Pipe) {
-	s.requestPoll(p.id, 0, p.out.sig)
-	for _, l := range p.out.lanes[1:] {
-		s.requestPoll(p.id, l.lane, l.sig)
+	blocked := false
+	for _, l := range p.out.lanes {
+		if s.writeWorkOn(p, l) {
+			if l.notWritable {
+				blocked = true
+			} else {
+				s.wakeLaneWriter(p, l)
+			}
+		}
+	}
+	if blocked && p.mp != nil {
+		s.armPathDeadline(p, pathStall)
 	}
 }
 
 // wakeLaneWriter wakes the writer of lane l of the outbound pipe p.
 func (s *Session) wakeLaneWriter(p *Pipe, l *outLane) {
-	if l.lane == 0 {
-		s.requestPoll(p.id, 0, p.out.sig)
-		return
+	if !l.notWritable {
+		s.requestPoll(p.id, l.lane, p.writeSignal(l))
 	}
-	s.requestPoll(p.id, l.lane, l.sig)
 }
 
 // StreamByID returns a live stream by identifier.

@@ -1,21 +1,12 @@
-// Package xorpipe is an example of a carrier transform built on the public
-// zmux API alone: a header that admission tells apart from a zmux first
-// record, a first flight that carries the client's first streams in the
-// carrier's first write, a server verdict on that flight (a replayed
-// header is refused, and the session sends its streams again), and a byte
-// transform (XOR with a key byte) on everything after the header.
+// Package xorpipe demonstrates a carrier transform built on the public
+// zmux API: distinguish a carrier header in Admission, wrap the byte stream
+// in ListenerConfig.WrapPipe, and release a held first write.
 //
-// XOR is no protection: the package shows the hooks a transform uses
-// (EarlyClientCarrier, Admission with VerdictMore and Variant,
-// ListenerConfig.WrapPipe, admit.ReplayFilter, EarlyData.HoldFirstFlight), not a
-// transform to deploy.
+// XOR is no protection. The example illustrates carrier composition only.
 //
-// Wire format, client to server: a 20-byte header (0x01, 20, the first
-// flight's length as a big-endian uint16, the Unix time in milliseconds
-// as a big-endian uint64, an 8-byte nonce), then the XORed byte stream,
-// whose first flight bytes are those of the client's first write. Server
-// to client: one verdict byte (1: the flight is accepted, 0: dropped),
-// then the XORed byte stream.
+// The client sends a header with a lead byte, header length, timestamp in
+// milliseconds (big endian uint64) and an eight-byte nonce, followed by
+// the transformed zmux byte stream. The server rejects a repeated nonce.
 package xorpipe
 
 import (
@@ -24,7 +15,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
@@ -35,149 +25,42 @@ import (
 const Variant = "xor"
 
 // HeaderLen is the length of the client's header.
-const HeaderLen = 20
+const HeaderLen = 18
 
 const lead = 0x01 // admit.ClassifyFirstBytes judges a byte stream starting so Other
 
-// Client returns the client pipe of the transform over c, with key and
-// nonce (draw it at random for each carrier; a repeated nonce is
-// refused as a replay). Its first write becomes the header and the first
-// flight: use it with zmux.EarlyData{ZmuxPeer, Replayable, HoldFirstFlight}.
+// Client returns the client pipe over c. Its first write prefixes the
+// carrier header. Draw a fresh nonce for each carrier.
 func Client(c net.Conn, key byte, nonce [8]byte) zmux.PipeIO {
-	w := &clientWriter{c: c, key: key, nonce: nonce, verdict: make(chan bool, 1)}
-	w.r = &clientReader{c: c, key: key, w: w}
-	return zmux.PipeIO{R: w.r, W: w, Variant: Variant}
+	return zmux.PipeIO{
+		R:       &xorReader{r: c, key: key},
+		W:       &clientWriter{w: c, key: key, nonce: nonce},
+		Variant: Variant,
+	}
 }
-
-// clientWriter states.
-const (
-	stFirst   = iota // the next write is the first flight
-	stHolding        // writes wait for the verdict
-	stPassing
-	stDropping // the flight was refused: writes are dropped until the restart
-)
 
 type clientWriter struct {
-	c       net.Conn
-	verdict chan bool
-	r       *clientReader
-	held    [][]byte
-	nonce   [8]byte
-	key     byte
-	state   int
-	mu      sync.Mutex
-}
-
-func xor(b []byte, k byte) []byte {
-	out := make([]byte, len(b))
-	for i, x := range b {
-		out[i] = x ^ k
-	}
-	return out
+	xorWriter
+	nonce [8]byte
+	sent  bool
 }
 
 func (w *clientWriter) Write(b []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	switch w.state {
-	case stFirst:
-		if len(b) > 0xffff {
-			return 0, errors.New("xorpipe: first flight over 64 KiB")
-		}
-		h := make([]byte, HeaderLen, HeaderLen+len(b))
-		h[0], h[1] = lead, HeaderLen
-		binary.BigEndian.PutUint16(h[2:], uint16(len(b)))
-		binary.BigEndian.PutUint64(h[4:], uint64(time.Now().UnixMilli()))
-		copy(h[12:], w.nonce[:])
-		w.state = stHolding
-		if _, err := w.c.Write(append(h, xor(b, w.key)...)); err != nil {
-			return 0, err
-		}
-		return len(b), nil
-	case stHolding:
-		w.held = append(w.held, xor(b, w.key))
-		return len(b), nil
-	case stDropping:
-		return len(b), nil
-	case stPassing:
+	if w.sent {
+		return w.xorWriter.Write(b)
 	}
-	return w.c.Write(xor(b, w.key))
-}
-
-// decided applies the server's verdict.
-func (w *clientWriter) decided(ok bool) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	held := w.held
-	w.held = nil
-	if !ok {
-		w.state = stDropping
-		return nil
+	w.sent = true
+	frame := make([]byte, HeaderLen+len(b))
+	frame[0], frame[1] = lead, HeaderLen
+	binary.BigEndian.PutUint64(frame[2:], uint64(time.Now().UnixMilli()))
+	copy(frame[10:HeaderLen], w.nonce[:])
+	xorInto(frame[HeaderLen:], b, w.key)
+	n, err := w.w.Write(frame)
+	if err == nil && n != len(frame) {
+		err = io.ErrShortWrite
 	}
-	w.state = stPassing
-	for _, b := range held {
-		if _, err := w.c.Write(b); err != nil {
-			return err
-		}
-	}
-	return nil
+	return max(0, n-HeaderLen), err
 }
-
-func (w *clientWriter) Close() error { return w.c.Close() }
-
-// SendsEarlyData reports the first flight, which the server may refuse
-// (zmux.EarlyClientCarrier).
-func (w *clientWriter) SendsEarlyData() bool { return true }
-
-// EarlyAccepted reports the server's verdict on the first flight
-// (zmux.EarlyClientCarrier).
-func (w *clientWriter) EarlyAccepted(ctx context.Context) (bool, error) {
-	select {
-	case ok := <-w.verdict:
-		return ok, nil
-	case <-ctx.Done():
-		return false, ctx.Err()
-	}
-}
-
-// RestartEarly returns the same halves, the writer now passing writes
-// (zmux.EarlyClientCarrier): the session sends its parameters and
-// streams again on them.
-func (w *clientWriter) RestartEarly(context.Context) (zmux.PipeIO, error) {
-	w.mu.Lock()
-	w.state = stPassing
-	w.mu.Unlock()
-	return zmux.PipeIO{R: w.r, W: w}, nil
-}
-
-type clientReader struct {
-	c    net.Conn
-	w    *clientWriter
-	key  byte
-	once bool
-}
-
-func (r *clientReader) Read(b []byte) (int, error) {
-	if !r.once {
-		r.once = true
-		var v [1]byte
-		if _, err := io.ReadFull(r.c, v[:]); err != nil {
-			return 0, err
-		}
-		ok := v[0] == 1
-		if err := r.w.decided(ok); err != nil {
-			return 0, err
-		}
-		r.w.verdict <- ok
-	}
-	n, err := r.c.Read(b)
-	for i := range b[:n] {
-		b[i] ^= r.key
-	}
-	return n, err
-}
-
-func (r *clientReader) Close() error { return r.c.Close() }
 
 // Admission tells zmux first records ("" variant, accepted as they are)
 // from carriers of the transform (Variant, accepted past their header,
@@ -201,32 +84,20 @@ func Admission() *zmux.Admission {
 		}}
 }
 
-// WrapPipe is the server side (zmux.ListenerConfig.WrapPipe): for a carrier
-// of the transform it checks the header against filter, answers the
-// verdict, drops a refused flight and returns the XOR pipe; other carriers
-// pass as they are.
+// WrapPipe checks the carrier header with filter and installs the byte
+// transform. Carriers admitted without such a header pass through.
 func WrapPipe(filter *admit.ReplayFilter, key byte) zmux.WrapPipeFunc {
 	return func(_ context.Context, p zmux.PipeIO, hint zmux.PipeHint) (zmux.PipeIO, error) {
 		h, ok := hint.Admitted.([HeaderLen]byte)
 		if !ok {
 			return p, nil
 		}
-		flight := int64(binary.BigEndian.Uint16(h[2:]))
-		t := int64(binary.BigEndian.Uint64(h[4:]))
-		fresh := filter.Check(h[12:], t) == admit.ReplayFresh
-		v := []byte{0}
-		if fresh {
-			v[0] = 1
+		t := int64(binary.BigEndian.Uint64(h[2:]))
+		if filter.Check(h[10:], t) != admit.ReplayFresh {
+			return zmux.PipeIO{}, errors.New("xorpipe: stale or repeated carrier header")
 		}
-		if _, err := p.W.Write(v); err != nil {
-			return zmux.PipeIO{}, err
-		}
-		if !fresh {
-			if _, err := io.CopyN(io.Discard, p.R, flight); err != nil {
-				return zmux.PipeIO{}, err
-			}
-		}
-		return zmux.PipeIO{R: &xorReader{r: p.R, key: key}, W: &xorWriter{w: p.W, key: key}}, nil
+		p.R, p.W = &xorReader{r: p.R, key: key}, &xorWriter{w: p.W, key: key}
+		return p, nil
 	}
 }
 
@@ -237,9 +108,7 @@ type xorReader struct {
 
 func (x *xorReader) Read(b []byte) (int, error) {
 	n, err := x.r.Read(b)
-	for i := range b[:n] {
-		b[i] ^= x.key
-	}
+	xorInto(b[:n], b[:n], x.key)
 	return n, err
 }
 
@@ -250,5 +119,15 @@ type xorWriter struct {
 	key byte
 }
 
-func (x *xorWriter) Write(b []byte) (int, error) { return x.w.Write(xor(b, x.key)) }
-func (x *xorWriter) Close() error                { return x.w.Close() }
+func (x *xorWriter) Write(b []byte) (int, error) {
+	encoded := make([]byte, len(b))
+	xorInto(encoded, b, x.key)
+	return x.w.Write(encoded)
+}
+func (x *xorWriter) Close() error { return x.w.Close() }
+
+func xorInto(dst, src []byte, key byte) {
+	for i, v := range src {
+		dst[i] = v ^ key
+	}
+}

@@ -8,22 +8,51 @@ import (
 	"github.com/zmuxio/zmux-go/internal/core"
 )
 
-// clock maps the session's clock to core.Time: the host's monotonic clock
-// (QueryPerformanceCounter on Windows) when Config.Clock is nil, the
-// configured clock otherwise.
-//
-// A session's time starts at 0 and is never negative.
+// ClockDomain identifies a clock shared by sessions and controller state.
+// A nil domain uses the process-wide default and the host monotonic clock.
+type ClockDomain struct {
+	tick   time.Duration
+	source timeshim.Clock
+}
+
+var defaultClockDomain ClockDomain
+
+// NewClockDomain creates a distinct domain. A nil source uses the host clock.
+// A clock implementing Resolution() time.Duration supplies the tick used for
+// strict grace deadlines and recovery jitter. The default is one nanosecond.
+func NewClockDomain(source timeshim.Clock) *ClockDomain {
+	domain := &ClockDomain{source: source}
+	if r, ok := source.(interface{ Resolution() time.Duration }); ok {
+		domain.tick = max(time.Nanosecond, r.Resolution())
+	}
+	return domain
+}
+
+func (d *ClockDomain) resolved() *ClockDomain {
+	if d == nil {
+		return &defaultClockDomain
+	}
+	return d
+}
+
+func (d *ClockDomain) resolution() time.Duration { return max(time.Nanosecond, d.resolved().tick) }
+
+func (d *ClockDomain) clockSource() timeshim.Clock { return timeshim.Or(d.resolved().source) }
+
+// clock maps a domain to the session-relative protocol time.
 type clock struct {
 	base   time.Time
+	domain *ClockDomain
 	ext    timeshim.Clock // nil: the host clock
 	origin int64          // monoNow at base (the host clock)
 }
 
-func newClock(ext timeshim.Clock) clock {
-	if ext == nil {
-		return clock{base: time.Now(), origin: monoNow()}
+func newClock(domain *ClockDomain) clock {
+	domain = domain.resolved()
+	if domain.source == nil {
+		return clock{base: time.Now(), origin: monoNow(), domain: domain}
 	}
-	return clock{base: ext.Now(), ext: ext}
+	return clock{base: domain.source.Now(), ext: domain.source, domain: domain}
 }
 
 func (c clock) now() core.Time {

@@ -10,10 +10,8 @@ import (
 	"github.com/zmuxio/zmux-go/internal/poolhost"
 )
 
-// TestPoolShrinkVectors runs the shrink order cases of testdata/pool-shrink
-// shared by every implementation against a PipePool's order of closing. A
-// PipePool runs its dials inside its looks and reports no growth dial, so
-// only the cases without one apply.
+// TestPoolShrinkVectors checks physical pool close order against the
+// shared cases in testdata/pool-shrink that have no growth dial.
 func TestPoolShrinkVectors(t *testing.T) {
 	raw, err := os.ReadFile("testdata/pool-shrink/vectors.json")
 	if err != nil {
@@ -28,14 +26,14 @@ func TestPoolShrinkVectors(t *testing.T) {
 				Pipes int    `json:"pipes"`
 				Age   int64  `json:"age"`
 			} `json:"members"`
-			Dialing  int `json:"dialing"`
-			Decision struct {
-				Count  int      `json:"count"`
-				Retire []PipeID `json:"retire"`
-			} `json:"decision"`
 			Expect struct {
 				Close []PipeID `json:"close"`
 			} `json:"expect"`
+			Decision struct {
+				Retire []PipeID `json:"retire"`
+				Count  int      `json:"count"`
+			} `json:"decision"`
+			Dialing int `json:"dialing"`
 		} `json:"cases"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {

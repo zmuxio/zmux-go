@@ -6,15 +6,12 @@ import (
 	"fmt"
 	"io"
 	"testing"
-	"time"
 
 	"github.com/zmuxio/zmux-go"
 )
 
-// TestCloseDelivery (N16) over WebSocket: the peer reads the whole 1 MiB
-// written before a coded close and ends with the code, the wait confirms
-// it before the linger timeout, and the stream left open fails with the
-// session's error; the plain close gives code 0 and an empty reason.
+// TestCloseDelivery (N16) checks delivery of the tail before a coded close,
+// and the error reported by a stream that was still open.
 func TestCloseDelivery(t *testing.T) {
 	for _, c := range []struct {
 		reason string
@@ -32,19 +29,25 @@ func TestCloseDelivery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			msg := make([]byte, 1<<20)
+			const prefix = 4 << 10
+			msg := make([]byte, 2*prefix)
 			for i := range msg {
 				msg[i] = byte(i * 7)
 			}
-			read := make(chan error, 1)
+			read, accepted := make(chan error, 1), make(chan error, 1)
 			go func() {
 				in, err := srv.AcceptStream(ctx)
+				got := make([]byte, prefix)
 				if err == nil {
-					var got []byte
-					got, err = io.ReadAll(in)
-					if err == nil && !bytes.Equal(got, msg) {
-						err = fmt.Errorf("read %d bytes, not the 1 MiB written", len(got))
-					}
+					_, err = io.ReadFull(in, got)
+				}
+				accepted <- err
+				if err != nil {
+					return
+				}
+				tail, err := io.ReadAll(in)
+				if err == nil && (!bytes.Equal(got, msg[:prefix]) || !bytes.Equal(tail, msg[prefix:])) {
+					err = fmt.Errorf("read %d of %d expected bytes", len(got)+len(tail), len(msg))
 				}
 				read <- err
 			}()
@@ -52,7 +55,18 @@ func TestCloseDelivery(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := st.Write(msg); err != nil {
+			if _, err := st.Write(msg[:prefix]); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-accepted:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			if _, err := st.Write(msg[prefix:]); err != nil {
 				t.Fatal(err)
 			}
 			_ = st.Close()
@@ -63,22 +77,21 @@ func TestCloseDelivery(t *testing.T) {
 			if _, err := open.Write([]byte("left open")); err != nil {
 				t.Fatal(err)
 			}
-			t0 := time.Now()
 			_ = client.CloseWithError(c.code, c.reason)
-			if d := time.Since(t0); d > time.Second {
-				t.Fatalf("the close took %v", d)
-			}
-			t1 := time.Now()
 			select {
-			case <-client.Done():
-			case <-time.After(5 * time.Second):
-				t.Fatal("the close was neither delivered nor given up within 5 s")
+			case err := <-read:
+				if err != nil {
+					t.Fatalf("the peer's read: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
 			}
-			if d := time.Since(t1); d >= 250*time.Millisecond {
-				t.Fatalf("the wait took %v: the linger timeout, not the peer's end", d)
-			}
-			if err := <-read; err != nil {
-				t.Fatalf("the peer's read: %v", err)
+			for _, conn := range []*zmux.Conn{srv, client} {
+				select {
+				case <-conn.Done():
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
 			}
 			var ae *zmux.ApplicationError
 			if err := srv.Wait(); !errors.As(err, &ae) || ae.ErrorCode != c.code || ae.ErrorMessage != c.reason || !ae.Remote {

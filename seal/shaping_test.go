@@ -35,6 +35,11 @@ func (c *writesConn) writes() []int {
 	return append([]int(nil), c.n...)
 }
 
+func testHandshakeBudget() shaping.Budget {
+	light := shaping.Lightweight()
+	return shaping.Budget{Profile: &light}
+}
+
 func byName(want map[string]int) shaping.HandshakeShaper {
 	return func(v *shaping.HandshakeView, p *shaping.UnitPlan) bool {
 		p.PadTo = want[v.Handshake+"/"+v.Message]
@@ -59,6 +64,8 @@ func TestEstablishWireLengths(t *testing.T) {
 	} {
 		f := newFixture(t)
 		f.client.AllowedProfiles = []proto.Profile{tc.profile}
+		f.client.ShapingProfile = testHandshakeBudget().Profile
+		f.server.ShapingProfile = f.client.ShapingProfile
 		f.client.Shaper, f.server.Shaper = sh, sh
 		a, b := net.Pipe()
 		ca, cb := &writesConn{Conn: a}, &writesConn{Conn: b}
@@ -66,8 +73,8 @@ func TestEstablishWireLengths(t *testing.T) {
 		if cerr != nil || serr != nil {
 			t.Fatal(tc.profile, cerr, serr)
 		}
-		if cp.HandshakePadding == 0 || sp.HandshakePadding == 0 {
-			t.Fatalf("%v: padding reported: client %d, server %d", tc.profile, cp.HandshakePadding, sp.HandshakePadding)
+		if cp.HandshakeWrites[0].Extra == 0 || sp.HandshakeWrites[0].Extra == 0 {
+			t.Fatalf("%v: padding reported: client %d, server %d", tc.profile, cp.HandshakeWrites[0].Extra, sp.HandshakeWrites[0].Extra)
 		}
 		_ = cp.W.Close()
 		_ = sp.W.Close()
@@ -104,8 +111,8 @@ func TestEstablishHandshakeName(t *testing.T) {
 	}
 	_ = cp.W.Close()
 	_ = sp.W.Close()
-	if cp.HandshakePadding != 0 || sp.HandshakePadding != 0 {
-		t.Fatalf("padded: client %d, server %d", cp.HandshakePadding, sp.HandshakePadding)
+	if cp.HandshakeWrites[0].Extra != 0 || sp.HandshakeWrites[0].Extra != 0 {
+		t.Fatalf("padded: client %d, server %d", cp.HandshakeWrites[0].Extra, sp.HandshakeWrites[0].Extra)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -194,7 +201,7 @@ func TestJoinWireLengths(t *testing.T) {
 				return f.server.WrapPipe(ctx, wrapConn(wc), h)
 			}
 			l, addr := listen(t, ctx, &zmux.ListenerConfig{
-				Config:   &zmux.Config{MaxPipes: 4, AllowRecordMode: anyMode, HandshakeShaper: sh},
+				Config:   &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, AllowRecordMode: anyMode, Shaping: &zmux.ShapingPolicy{Budget: testHandshakeBudget, Handshake: sh}},
 				WrapPipe: zmux.WrapPipeFunc(wrap),
 			})
 			cc := f.client
@@ -203,7 +210,7 @@ func TestJoinWireLengths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4, HandshakeShaper: sh,
+			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, Shaping: &zmux.ShapingPolicy{Budget: testHandshakeBudget, Handshake: sh},
 				RecordPolicy: func(zmux.RecordPolicyInput) zmux.RecordMode { return tc.mode }})
 			if err != nil {
 				t.Fatal(err)
@@ -239,7 +246,7 @@ func TestJoinWireLengths(t *testing.T) {
 			if tc.mode != zmux.RecordBound && (len(cw) < 2 || cw[1] != 800) {
 				t.Fatalf("confirm: client %v", cw)
 			}
-			if st := c.ShapingStats(); st.WireSpent == 0 {
+			if st := c.ShapingMeters(); st.Handshake.ConsumedBytes == 0 || st.ConsumedBytes != 0 || st.WireSpent != 0 {
 				t.Fatalf("stats %+v", st)
 			}
 		})
@@ -257,6 +264,8 @@ func TestEstablishShapingHidesAppData(t *testing.T) {
 	var first []int
 	for _, n := range []int{0, 1, 100, 256} {
 		f := newFixture(t)
+		f.client.ShapingProfile = testHandshakeBudget().Profile
+		f.server.ShapingProfile = testHandshakeBudget().Profile
 		f.client.Shaper, f.server.Shaper = sh, sh
 		data := func(context.Context, seal.AppDataRequest) ([]byte, error) { return bytes.Repeat([]byte{1}, n), nil }
 		f.client.AppData, f.server.AppData = data, data

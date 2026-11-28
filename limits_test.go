@@ -16,9 +16,9 @@ import (
 // below 1 ms are configuration errors, not corrected.
 func TestConfigLimitsValidation(t *testing.T) {
 	bad := []Config{
-		{ShapingLimits: shaping.Limits{Wire: shaping.Account{Initial: shaping.MaxAccountInitial + 1}}},
-		{ShapingLimits: shaping.Limits{Wire: shaping.Account{PerMB: shaping.MaxAccountRate + 1}}},
-		{ShapingLimits: shaping.Limits{Wire: shaping.Account{PerSec: math.MaxUint64}}},
+		{ShapingLimits: shaping.Limits{Wire: &shaping.Account{Ceiling: shaping.MaxAccountInitial + 1, Initial: shaping.MaxAccountInitial + 1}}},
+		{ShapingLimits: shaping.Limits{Wire: &shaping.Account{Ceiling: 0, PerMB: shaping.MaxAccountRate + 1}}},
+		{ShapingLimits: shaping.Limits{Wire: &shaping.Account{Ceiling: 0, PerSec: math.MaxUint64}}},
 		{Liveness: Liveness{ProbeInterval: time.Nanosecond}},
 		{Liveness: Liveness{ProbeInterval: 999 * time.Millisecond}},
 		{Liveness: Liveness{StandbyProbe: 500 * time.Millisecond}},
@@ -35,8 +35,8 @@ func TestConfigLimitsValidation(t *testing.T) {
 		}
 	}
 	good := []Config{
-		{ShapingLimits: shaping.Limits{Wire: shaping.Account{Initial: shaping.MaxAccountInitial, PerMB: shaping.MaxAccountRate, PerSec: shaping.MaxAccountRate}, MaxDelay: time.Second}},
-		{ShapingLimits: shaping.Limits{MaxDelay: -1}},
+		{ShapingLimits: shaping.Limits{Wire: &shaping.Account{Ceiling: shaping.MaxAccountInitial, Initial: shaping.MaxAccountInitial, PerMB: shaping.MaxAccountRate, PerSec: shaping.MaxAccountRate}, Profile: &shaping.ProfileLimits{WindowSeconds: 10, MaxAddedDelay: time.Second}}},
+
 		{Liveness: Liveness{ProbeInterval: time.Second}},
 		{Liveness: Liveness{KeepAlivePeriod: time.Second}, MaxIdleTimeout: time.Millisecond},
 		{Liveness: Liveness{ProbeInterval: -1, StandbyProbe: -1, ProbeJitter: -1}},
@@ -74,7 +74,7 @@ func TestExportedDefaults(t *testing.T) {
 		{name: "DefaultProbeJitter", got: DefaultProbeJitter, want: 0.25},
 		{name: "probe jitter in effect", got: cc.ProbeJitter, want: DefaultProbeJitter},
 		{name: "DefaultMaxRecordSize", got: DefaultMaxRecordSize, want: 16382},
-		{name: "shaping.DefaultMaxDelay", got: shaping.DefaultMaxDelay, want: time.Second},
+
 		{name: "shaping.MinMaxLen", got: shaping.MinMaxLen, want: 64},
 		{name: "DefaultMinBackoff", got: DefaultMinBackoff, want: time.Second},
 		{name: "DefaultMaxBackoff", got: DefaultMaxBackoff, want: 60 * time.Second},

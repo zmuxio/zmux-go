@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"time"
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
@@ -51,7 +52,7 @@ type CommitRequest struct {
 // ServerConfig is the server's side of Establish. A *ServerConfig is a
 // zmux.PipeWrapper for ListenerConfig.WrapPipe, and zmux.NewListener calls its
 // Validate. Refusals go to ListenerConfig.OnReject, whose default stalls them;
-// nothing is ever sent to report one.
+// nothing is ever sent to report one. Do not copy a ServerConfig after use.
 type ServerConfig struct {
 	// Gate is the host's decision on clients; required.
 	Gate Gate
@@ -59,8 +60,7 @@ type ServerConfig struct {
 	// nil: clients are not authenticated beyond the pre-shared key.
 	ClientAnchor Anchor
 	// Signer, when set, signs the transcript in message 2, for clients whose
-	// Anchor asks for it. In Profiles 4 and 5 anyone can ask for a signature:
-	// limit their rate in the Signer.
+	// Anchor asks for it. An accepted anonymous Hello can request a signature.
 	Signer Signer
 	// LocalContext is passed to Gate.Credential, AppData and the ClientAnchor.
 	LocalContext any
@@ -92,12 +92,20 @@ type ServerConfig struct {
 	AcceptedProfiles []proto.Profile
 	// ShapingLimits limit those plans.
 	ShapingLimits shaping.Limits
+	// ShapingProfile is the selected handshake profile.
+	ShapingProfile *shaping.ProfileLimits
+	// HandshakeLimits limits concurrent reply construction. Nil uses a limit
+	// for this configuration of max(GOMAXPROCS, 2). Half the total, rounded
+	// up, is available for anonymous Hellos, leaving at least one permit for PSK.
+	HandshakeLimits *HandshakeLimits
 	// MaxAppData bounds the application data of a received message; zero is
 	// proto.DefaultMaxAppData, negative no bound beyond the message.
 	MaxAppData int
 	// RequirePQAuth fails a client that is not authenticated by a post-quantum
 	// transcript signature; it needs ClientAnchor.
 	RequirePQAuth bool
+
+	defaultHandshakeLimits *HandshakeLimits
 }
 
 // WrapPipe runs the server's side of Establish on a new carrier. A carrier whose first
@@ -127,6 +135,7 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 	}
 	f := framingOf(p)
 	u := &unitReader{p: p, f: f}
+	defer u.message.Release()
 	for {
 		if f == proto.Message || len(u.buf) == 0 {
 			if err := u.fill(); err != nil {
@@ -137,7 +146,7 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 		case join.ClassIncomplete:
 			continue
 		case join.ClassJoin:
-			return zmux.PrefixedPipe(p, u.rest()), nil
+			return u.replay(), nil
 		case join.ClassEstablish:
 		default:
 			fr := zmux.FramingByteStream
@@ -152,7 +161,7 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 				continue
 			}
 			if lane {
-				return zmux.PrefixedPipe(p, u.rest()), nil
+				return u.replay(), nil
 			}
 			return zmux.PipeIO{}, &zmux.RejectError{Reason: "unknown_profile"}
 		}
@@ -172,6 +181,10 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 			return zmux.PipeIO{}, err
 		}
 	}
+	// The parsed Hello aliases its input through the final gate commit.
+	hello := u.message
+	u.message = zmux.ReceivedMessage{}
+	defer hello.Release()
 	mode := zmux.RecordMode(h.Mode)
 	reject := func(err error) (zmux.PipeIO, error) {
 		if ctx.Err() != nil {
@@ -220,31 +233,22 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 	if err != nil {
 		return reject(err)
 	}
+	if err := hs.CheckReplyKey(); err != nil {
+		return reject(err)
+	}
 	early := appData(1, first.AppData)
-	cred, err := c.Gate.Credential(ctx, CredentialRequest{Handle: h.Handle, Profile: h.Profile, Source: src, LocalContext: c.LocalContext})
+	msg, writes, err := c.buildReply(ctx, hs, p, h, src, early)
 	if err != nil {
-		return reject(fmt.Errorf("%w: %w", errGate, err))
+		return reject(err)
 	}
-	second := proto.Payload{Credential: cred, Proof: proofPlaceholder(c.Signer)}
-	known := &VerifyInput{Role: zmux.RoleClient, Profile: h.Profile, PSKIdentity: h.Handle, PeerAppData: early, LocalContext: c.LocalContext}
-	if second.AppData, err = askAppData(ctx, c.AppData, AppDataRequest{Message: 2, Peer: known}); err != nil {
-		return reject(fmt.Errorf("%w: %w", errGate, err))
-	}
-	var padded uint64
-	hs.SetHead(proto.FrameHeaderLen(f))
-	if err := shape(ctx, c.Shaper, &c.ShapingLimits, p, msgReply, hs, proto.FrameHeaderLen(f), &second, &padded); err != nil {
+	if err := ctx.Err(); err != nil {
 		return zmux.PipeIO{}, err
 	}
-	msg, err := writeProof(ctx, hs, second, c.Signer)
-	if err != nil {
-		return reject(err) // the key exchange with the Hello's keys failed (kex)
-	}
-	if msg, err = proto.AppendFrame(nil, f, msg); err != nil {
-		return zmux.PipeIO{}, err
-	}
+	writes[0].At = time.Now()
 	if err := writeUnit(p, msg); err != nil {
 		return zmux.PipeIO{}, err
 	}
+	writes[0].Baseline = uint64(len(msg)) - writes[0].Extra
 	u.buf = nil
 	finish, _, err := u.frame()
 	if err != nil {
@@ -269,9 +273,6 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 			// caller closes the carrier, as on every other failure).
 			return zmux.PipeIO{}, e
 		}
-		if errors.Is(err, ErrVerifyUnavailable) {
-			return zmux.PipeIO{}, err // closes the carrier; not a refusal
-		}
 		if err != nil {
 			return reject(err)
 		}
@@ -288,25 +289,61 @@ func (c *ServerConfig) wrapPipe(ctx context.Context, p zmux.PipeIO, hint zmux.Pi
 	if err != nil {
 		return reject(err)
 	}
-	q := wrapResult(p, u.rest(), res, peer)
-	q.HandshakePadding += padded
+	q := wrapResult(p, u, res, peer)
+	q.HandshakeWrites = writes
 	return q, nil
+}
+
+// buildReply holds one execution permit through the last host callback and
+// the completion of message 2. Sending it and waiting for message 3 hold none.
+func (c *ServerConfig) buildReply(ctx context.Context, hs *proto.Handshake, p zmux.PipeIO, h proto.Hello,
+	src netip.AddrPort, early []AppData) (msg []byte, writes shaping.HandshakeWrites, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, writes, err
+	}
+	limits := c.handshakeLimits()
+	anon := !h.Profile.HasPSK()
+	if !limits.acquire(anon) {
+		return nil, writes, errHandshakeCapacity
+	}
+	defer limits.release(anon)
+	cred, err := c.Gate.Credential(ctx, CredentialRequest{Handle: h.Handle, Profile: h.Profile, Source: src, LocalContext: c.LocalContext})
+	if err != nil {
+		return nil, writes, fmt.Errorf("%w: %w", errGate, err)
+	}
+	second := proto.Payload{Credential: cred, Proof: proofPlaceholder(c.Signer)}
+	known := &VerifyInput{Role: zmux.RoleClient, Profile: h.Profile, PSKIdentity: h.Handle, PeerAppData: early, LocalContext: c.LocalContext}
+	if second.AppData, err = askAppData(ctx, c.AppData, AppDataRequest{Message: 2, Peer: known}); err != nil {
+		return nil, writes, fmt.Errorf("%w: %w", errGate, err)
+	}
+	f := framingOf(p)
+	hs.SetHead(proto.FrameHeaderLen(f))
+	if err := shape(ctx, c.Shaper, c.ShapingLimits, c.ShapingProfile, p, msgReply, hs, proto.FrameHeaderLen(f), &second, &writes, 0); err != nil {
+		return nil, writes, err
+	}
+	msg, err = writeProof(ctx, hs, second, c.Signer)
+	if err != nil {
+		return nil, writes, err
+	}
+	msg, err = proto.AppendFrame(nil, f, msg)
+	return msg, writes, err
 }
 
 // Reasons of a refusal that has no error class in the protocol.
 var (
-	errProfile = errors.New("profile_disabled")
-	errMode    = errors.New("record_mode")
-	errEarly   = errors.New("early_data")
-	errBinding = errors.New("binding_unavailable")
-	errHandle  = errors.New("unknown_handle")
-	errGate    = errors.New("gate_error")
-	errCommit  = errors.New("commit")
+	errProfile           = errors.New("profile_disabled")
+	errMode              = errors.New("record_mode")
+	errEarly             = errors.New("early_data")
+	errBinding           = errors.New("binding_unavailable")
+	errHandle            = errors.New("unknown_handle")
+	errGate              = errors.New("gate_error")
+	errCommit            = errors.New("commit")
+	errHandshakeCapacity = errors.New("handshake_capacity")
 )
 
 func supported(p proto.Profile) bool { return p.Supported() }
 
-// Validate reports a configuration that cannot serve (ErrInvalidConfig): a
+// Validate reports a configuration that cannot serve (proto.ErrInvalidConfig): a
 // missing StaticKey or Gate, or an unknown or reserved Profile among
 // AcceptedProfiles. zmux.NewListener calls it for a ServerConfig in
 // ListenerConfig.WrapPipe.
@@ -322,6 +359,8 @@ func (c *ServerConfig) accepted() ([]proto.Profile, error) {
 		return nil, fmt.Errorf("%w: ServerConfig without a StaticKey", proto.ErrInvalidConfig)
 	case c.Gate == nil:
 		return nil, fmt.Errorf("%w: ServerConfig without a Gate", proto.ErrInvalidConfig)
+	case c.HandshakeLimits != nil && c.HandshakeLimits.totalLimit == 0:
+		return nil, fmt.Errorf("%w: uninitialized Establish handshake limits", proto.ErrInvalidConfig)
 	case c.RequirePQAuth && c.ClientAnchor == nil:
 		return nil, fmt.Errorf("%w: RequirePQAuth without a ClientAnchor", proto.ErrInvalidConfig)
 	}
@@ -347,6 +386,9 @@ func carrierInfo(p zmux.PipeIO) zmux.RecordPolicyInput {
 // reasonOf is the local reject reason of a failure: the error class of
 // the protocol, or a finer local reason.
 func reasonOf(err error) string {
+	if errors.Is(err, ErrVerifyUnavailable) {
+		return "verify_unavailable"
+	}
 	if n, ok := proto.ErrorClass(err); ok {
 		return n // the one table of the handshake's error classes
 	}
@@ -356,7 +398,7 @@ func reasonOf(err error) string {
 	}{
 		{errProfile, "profile_disabled"}, {errMode, "record_mode"},
 		{errEarly, "early_data"}, {errBinding, "binding_unavailable"}, {errHandle, "unknown_handle"},
-		{errGate, "gate_error"}, {errCommit, "commit"},
+		{errGate, "gate_error"}, {errCommit, "commit"}, {errHandshakeCapacity, "handshake_capacity"},
 	} {
 		if errors.Is(err, c.err) {
 			return c.name

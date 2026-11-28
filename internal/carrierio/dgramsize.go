@@ -1,6 +1,7 @@
 package carrierio
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -20,8 +21,10 @@ var sizeEpoch = time.Now()
 // from the carrier's refusals. It is safe for concurrent use; the zero
 // value knows none.
 type DatagramSize struct {
+	changed  chan struct{}
 	max      atomic.Int64
 	probedAt atomic.Int64 // monotonic nanoseconds of the last probe, 0: none yet
+	mu       sync.Mutex
 }
 
 // Get returns the maximum, asking probe at most once per
@@ -36,11 +39,32 @@ func (d *DatagramSize) Get(probe func() (n int64, ok bool)) int {
 	if !ok {
 		n = 0
 	}
-	d.max.Store(max(n, 0))
+	d.Set(n)
 	// After the result: a concurrent caller that sees a recent probe reads it.
 	d.probedAt.Store(now)
 	return int(d.max.Load())
 }
 
 // Set records a maximum a refused send reported.
-func (d *DatagramSize) Set(n int64) { d.max.Store(max(n, 0)) }
+func (d *DatagramSize) Set(n int64) {
+	n = max(n, 0)
+	if d.max.Swap(n) == n {
+		return
+	}
+	d.mu.Lock()
+	if d.changed != nil {
+		close(d.changed)
+		d.changed = nil
+	}
+	d.mu.Unlock()
+}
+
+// Changed signals the next observed change to the cached limit.
+func (d *DatagramSize) Changed() <-chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.changed == nil {
+		d.changed = make(chan struct{})
+	}
+	return d.changed
+}

@@ -48,6 +48,8 @@ func (s *Session) Liveness() Liveness { return s.cfg.Liveness() }
 // Pipes joined later have the new settings, as every pipe without its own.
 func (s *Session) SetLiveness(l Liveness) {
 	s.cfg.SetLiveness(l)
+	s.noteActivity(s.timers.lastActivity)
+	s.refreshPathTopology()
 	s.wakeAllWriters()
 }
 

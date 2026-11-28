@@ -147,15 +147,8 @@ func TestTryReadNoAlloc(t *testing.T) {
 	if err := cs.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	ready := func() (n uint64) {
-		ss.h.c.locked(func() { n, _ = ss.h.c.s.ReadReady(ss.h.st) })
-		return n
-	}
-	for ready() < 4096 {
-		if err := ss.WaitReadable(ctx); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(time.Millisecond) // the rest of the data is on its way
+	if err := ss.WaitReadable(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if n := testing.AllocsPerRun(100, func() { _, _ = ss.TryRead(buf) }); n != 0 {
 		t.Fatalf("data readable: %v allocations", n)

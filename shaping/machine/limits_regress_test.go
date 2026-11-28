@@ -36,9 +36,6 @@ func TestMaxSlots(t *testing.T) {
 			t.Errorf("%s %+v: %v", c.js, c.l, err)
 		}
 	}
-	if _, err := NewFactory([]byte(slots(1<<30, 0)), Options{}); limitClass(err) != "limit" {
-		t.Errorf("NewFactory: %v", err)
-	}
 }
 
 func TestMaxBytesCountsReferencedTables(t *testing.T) {

@@ -75,18 +75,29 @@ func TestBatchKeepsDirectionOnItsPhysicalLane(t *testing.T) {
 	defer b.Discard()
 	s.writeData(&w, p, p.out.lanes[1])
 	w.end()
-	if len(w.touched) == 0 {
-		t.Fatal("batch did not send stream data")
+	if len(b.touched) != 1 || b.touched[0] != st {
+		t.Fatal("batch did not account the stream direction exactly once")
 	}
 	if st.snd.lane != 1 {
 		t.Fatalf("batch rebound its direction to lane %d, want 1", st.snd.lane)
 	}
-	s.afterBatch(&w, p, p.out.lanes[1])
-	if st.snd.laneEnd <= p.out.lanes[1].acked {
-		t.Fatal("batch already covered by old acknowledgement")
+	ol := p.out.lanes[1]
+	s.afterBatch(&w, p, ol)
+	if len(b.touched) != 0 || b.touched[:1][0] != nil {
+		t.Fatal("batch scratch retained a stream direction")
 	}
-	if got, _, _ := s.laneFor(p, st); got != p.out.lanes[1] {
+	if st.snd.laneEnd != uint64(b.Len()) || st.snd.laneEnd != ol.pos {
+		t.Fatal("direction's end did not include the batch's complete byte-stream position")
+	}
+	ol.acked = ol.pos - 1
+	s.lanesAcked(p, ol)
+	if got, keep, _ := s.laneFor(p, st); got != ol || !keep {
 		t.Fatal("direction moved before its batch was acknowledged")
+	}
+	ol.acked = ol.pos
+	s.lanesAcked(p, ol)
+	if st.snd.laneBound || len(ol.boundSt) != 0 {
+		t.Fatal("acknowledged direction stayed bound")
 	}
 	s.Release(st)
 }

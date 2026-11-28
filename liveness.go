@@ -147,10 +147,9 @@ func (c *Conn) SetLiveness(l Liveness) error {
 	return nil
 }
 
-// PipeLiveness are a pipe's own liveness settings (PipeOptions.Liveness,
-// PipeUpdate.Liveness, PoolDecision.Liveness), the Liveness fields that
-// apply to one pipe with their meanings and bounds; a zero field follows
-// the session's.
+// PipeLiveness holds the Liveness fields that can be set for one pipe
+// with PipeOptions.Liveness or PipeUpdate.Liveness. A zero field follows
+// the session's liveness settings.
 type PipeLiveness struct {
 	// SuspectFloor is at least 50 ms.
 	SuspectFloor time.Duration
@@ -169,9 +168,25 @@ type PipeLiveness struct {
 	ProbeJitter float64
 }
 
+func (l PipeLiveness) withOverride(override PipeLiveness) PipeLiveness {
+	if override.SuspectFloor != 0 {
+		l.SuspectFloor = override.SuspectFloor
+	}
+	if override.DeadTimeout != 0 {
+		l.DeadTimeout = override.DeadTimeout
+	}
+	if override.ProbeInterval != 0 {
+		l.ProbeInterval = override.ProbeInterval
+	}
+	if override.ProbeJitter != 0 {
+		l.ProbeJitter = override.ProbeJitter
+	}
+	return l
+}
+
 // core validates l and resolves it for the core: 0 the session's, a
 // negative interval or DeadTimeout off (-1), a negative jitter 0.
-func (l *PipeLiveness) core() (core.PipeLiveness, error) {
+func (l PipeLiveness) core() (core.PipeLiveness, error) {
 	var cl core.PipeLiveness
 	if l.SuspectFloor < 0 {
 		return cl, fmt.Errorf("%w: negative SuspectFloor", ErrInvalidConfig)
@@ -230,3 +245,9 @@ const (
 	// PipePathQualityRestored reports that recent measurements cleared the deterioration.
 	PipePathQualityRestored = PipePathQualityReason(core.PathQualityRestored)
 )
+
+// Validate checks the liveness settings of a proposed carrier.
+func (l PipeLiveness) Validate() error {
+	_, err := l.core()
+	return err
+}

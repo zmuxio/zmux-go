@@ -10,25 +10,10 @@ import (
 	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
-// Carrier early data (TLS 1.3 early data, QUIC 0-RTT, a transform's first
-// flight). A client with early data (EarlyData.ZmuxPeer, or
-// Remembered with Replayable) whose bootstrap carrier can tell whether the
-// server accepted its early data sends its first streams in it; the
-// carrier reports the verdict, and on rejection the session restarts the
-// bootstrap pipe on the pipe the carrier's restart hook returns.
-
-// EarlyClientCarrier is the optional capability of a client carrier that
-// may send early data, on the W half of the bootstrap PipeIO. When
-// SendsEarlyData reports true, the session's early sends stay provisional
-// until EarlyAccepted returns.
+// EarlyClientCarrier is a carrier that reports the verdict on its 0-RTT
+// attempt, and can restart the bootstrap if the carrier rejected it.
 type EarlyClientCarrier interface {
-	// SendsEarlyData reports whether this pipe's initial bytes go out as
-	// carrier early data, which the server may refuse or see replayed; it
-	// must not change for the pipe. A carrier that sends them only after
-	// its handshake (QUIC without 0-RTT) returns false: floor early data
-	// (EarlyData.ZmuxPeer) then neither waits for a verdict nor needs
-	// Replayable. Remembered parameters with Replayable wait for
-	// EarlyAccepted either way.
+	// SendsEarlyData reports whether the initial bytes go out as carrier 0-RTT.
 	SendsEarlyData() bool
 	// EarlyAccepted waits for the carrier handshake's verdict for this pipe's
 	// initial bytes. Return true if they remain usable, including bytes sent
@@ -61,14 +46,16 @@ type EarlyServerCarrier interface {
 	HandshakeComplete() <-chan struct{}
 }
 
-// RememberedParameters returns the peer's transport parameters for a later
-// session's carrier early data (EarlyData.Remembered); store them only with
-// the application's consent, per peer.
+// RememberedParameters returns the plain QMux peer's parameters for a
+// later carrier resumption. Store them with that resumption context.
 func (c *Conn) RememberedParameters() []byte {
+	if c == nil {
+		return nil
+	}
 	c.lock()
 	defer c.unlock()
 	p, ok := c.s.PeerParams()
-	if !ok {
+	if !ok || p.IsZmux() {
 		return nil
 	}
 	b, err := wire.AppendParams(nil, p)
@@ -83,7 +70,7 @@ func decodeRemembered(b []byte) *wire.Params {
 		return nil
 	}
 	var p wire.Params
-	if wire.DecodeParams(b, &p) != nil {
+	if wire.DecodeParams(b, &p) != nil || p.IsZmux() {
 		return nil
 	}
 	return &p
@@ -95,7 +82,7 @@ func (c *Conn) watchEarly(p PipeIO) {
 		c.side.add()
 		labels.Go(c.lctx, "early-verdict", func() { c.earlyVerdict(ec, p) })
 	}
-	if es, ok := earlyIn(p, &c.cfg.EarlyData); ok {
+	if es, ok := earlyIn(p); ok {
 		c.side.add()
 		labels.Go(c.lctx, "early-watch", func() {
 			defer c.side.done()
@@ -113,27 +100,15 @@ func (c *Conn) watchEarly(p PipeIO) {
 // earlyIn is the bootstrap carrier of a server whose streams arriving in
 // carrier early data are replayable. The session is marked (CarrierEarlyIn)
 // before the bootstrap reader starts, so no early stream is missed.
-func earlyIn(p PipeIO, e *EarlyData) (EarlyServerCarrier, bool) {
+func earlyIn(p PipeIO) (EarlyServerCarrier, bool) {
 	es, ok := p.W.(EarlyServerCarrier)
-	return es, ok && e.Replayable && es.UsedEarlyData()
+	return es, ok && es.UsedEarlyData()
 }
 
-// earlyCarrier is the bootstrap carrier's verdict hook when the session's
-// early data waits for it, on a carrier with EarlyClientCarrier: a client
-// with Remembered parameters and Replayable (carrier early data by
-// definition), or with floor early data on a carrier that sends early data
-// this time. The order is the core's (Remembered first).
+// earlyCarrier returns the verdict source for a plain QMux 0-RTT attempt.
 func earlyCarrier(p PipeIO, e *EarlyData) (EarlyClientCarrier, bool) {
 	ec, ok := p.W.(EarlyClientCarrier)
-	switch {
-	case !ok:
-		return nil, false
-	case e.Replayable && len(e.Remembered) > 0:
-		return ec, true
-	case e.ZmuxPeer && ec.SendsEarlyData():
-		return ec, true
-	}
-	return nil, false
+	return ec, ok && e.PlainQMux && e.Replayable && ec.SendsEarlyData() && decodeRemembered(e.Remembered) != nil
 }
 
 // failRestartLocked closes the session after a failed early-data restart
@@ -244,8 +219,14 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 		c.locked(func() { c.failRestartLocked(old, "early carrier properties") })
 		return
 	}
-	primeCarrierSample(p.W)
 	pd, info := a.pd, a.info
+	flight, err := c.reserveReceiveFlight(p.R)
+	if err != nil {
+		closePipe(p)
+		c.locked(func() { c.failRestartLocked(old, "early carrier memory") })
+		return
+	}
+	defer func() { flight.release() }()
 	var discard bool
 	defer func() {
 		if discard {
@@ -261,7 +242,7 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 	if sameR || sameW {
 		// The same carrier past its handshake: its reader goes on, its
 		// writer starts again on the restarted session.
-		if !sameR || !sameW || p.Framing != boot.Framing || !c.s.RestartEarly(info, &old.writer.poll, c.clk.now()) {
+		if !sameR || !sameW || p.Framing != boot.Framing || !c.s.RestartEarly(info, &old.writer.poll, false, c.clk.now()) {
 			discard = true
 			c.failRestartLocked(old, "early data restart failed")
 			return
@@ -270,16 +251,27 @@ func (c *Conn) earlyVerdict(ec EarlyClientCarrier, boot PipeIO) {
 		c.queuePipeWriterLocked(old)
 		return
 	}
-	if !c.s.RestartEarly(info, &pd.writer.poll, c.clk.now()) {
+	if acct := old.end.accounting; acct != nil && acct.checkSources(p.ReceiveSource, p.SendSource, true, true) != nil {
+		discard = true
+		c.failRestartLocked(old, "early carrier accounting sources")
+		return
+	}
+	if !c.s.CanAcquireCarriers(pd.physical) {
+		discard = true
+		c.failRestartLocked(old, "early carrier capacity exhausted")
+		return
+	}
+	if !c.s.RestartEarly(info, &pd.writer.poll, true, c.clk.now()) {
 		// The verdict contradicts what the early carrier delivered (the
 		// peer's parameters arrived on it): fail rather than mix carriers.
 		discard = true
 		c.failRestartLocked(old, "early data rejected after the peer's parameters")
 		return
 	}
-	old.dead = true  // its goroutines no longer report to the core
+	old.dead = true // its goroutines no longer report to the core
+	old.accountSegment.retire()
 	pd.end = old.end // a handle of pipe 0 follows the restart
 	pd.end.drv.Store(pd)
-	c.startPipeLocked(pd, true, true, a.carrier)
+	c.startPipeLocked(pd, true, true, a.carrier, &flight)
 	old.worker("early-close", old.closeAll) // its reader ends with its carrier
 }

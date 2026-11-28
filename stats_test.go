@@ -3,10 +3,12 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
@@ -20,7 +22,7 @@ func TestStreamAndSessionStats(t *testing.T) {
 	a, b := tcpPair(t)
 	cfg := &Config{EnableDatagrams: true}
 	c, s := pair(t, a, b, cfg, cfg)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 
 	cs, err := c.OpenStreamSync(ctx)
@@ -42,6 +44,9 @@ func TestStreamAndSessionStats(t *testing.T) {
 	if _, err := io.ReadFull(ss, half); err != nil {
 		t.Fatal(err)
 	}
+	if err := cs.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if err := cs.SendDatagram(9, []byte("abcdef")); err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +59,11 @@ func TestStreamAndSessionStats(t *testing.T) {
 	if p, err := s.ReceiveDatagram(ctx); err != nil || string(p) != "1234" {
 		t.Fatalf("session datagram %q %v", p, err)
 	}
-	waitUntil(t, 5*time.Second, "the rest of the data", func() bool { return ss.Stats().BytesReceived == 10000 })
+	// One writer serves this carrier. Its ping follows the datagram
+	// handoffs and confirms that the send-side accounting has caught up.
+	if _, err := c.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	// The preamble is not payload: every count is in payload bytes.
 	got := ss.Stats()
@@ -87,7 +96,13 @@ func TestStreamAndSessionStats(t *testing.T) {
 	}
 	_ = ss.Close()
 	ss.CancelRead(0)
-	waitUntil(t, 5*time.Second, "the stream's release", func() bool { return s.ConnectionStats().StreamsActive == 0 })
+	// The peer processes the FIN and STOP before responding on its writer.
+	if _, err := s.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.ConnectionStats().StreamsActive; n != 0 {
+		t.Fatalf("%d active streams after release", n)
+	}
 	if got := ss.Stats(); got.BytesRead != 10000 || got.BytesReceived != 10000 || got.RecvBuffered != 0 {
 		t.Fatalf("released receiver %+v", got)
 	}
@@ -107,24 +122,32 @@ func TestStreamAndSessionStats(t *testing.T) {
 // TestStreamCreditWaits counts an open that had to wait for stream credit.
 func TestStreamCreditWaits(t *testing.T) {
 	leakcheck.Check(t)
-	a, b := tcpPair(t)
-	c, _ := pair(t, a, b, nil, &Config{MaxIncomingStreams: -1})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := c.OpenStream(); err == nil {
-		t.Fatal("an open without credit succeeded")
-	}
-	if got := c.ConnectionStats().StreamCreditWaits; got != 0 {
-		t.Fatalf("StreamCreditWaits = %d after an open that did not wait", got)
-	}
-	wctx, wcancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer wcancel()
-	if _, err := c.OpenStreamSync(wctx); err == nil {
-		t.Fatal("an open without credit succeeded")
-	}
-	if got := c.ConnectionStats().StreamCreditWaits; got != 1 {
-		t.Fatalf("StreamCreditWaits = %d, want 1", got)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		client, _ := bubblePair(t, func() *Config { return &Config{MaxIncomingStreams: -1} })
+		if _, err := client.OpenStream(); err == nil {
+			t.Fatal("an open without credit succeeded")
+		}
+		if got := client.ConnectionStats().StreamCreditWaits; got != 0 {
+			t.Fatalf("StreamCreditWaits = %d after an open that did not wait", got)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		opened := make(chan error, 1)
+		go func() { _, err := client.OpenStreamSync(ctx); opened <- err }()
+		synctest.Wait()
+		select {
+		case err := <-opened:
+			t.Fatalf("an open without credit returned: %v", err)
+		default:
+		}
+		if got := client.ConnectionStats().StreamCreditWaits; got != 1 {
+			t.Fatalf("StreamCreditWaits = %d, want 1", got)
+		}
+		cancel()
+		if err := <-opened; !errors.Is(err, context.Canceled) {
+			t.Fatalf("open without credit: %v", err)
+		}
+	})
 }
 
 // TestDirectionStateNames checks that the two direction state types name
@@ -180,9 +203,11 @@ func TestCarrierUnsentCapability(t *testing.T) {
 	if _, err := st.Write([]byte("x")); err != nil { // a write: the driver queries the count
 		t.Fatal(err)
 	}
-	waitUntil(t, 5*time.Second, "the unsent count", func() bool {
-		ps := c.PipeStats()
-		return len(ps) == 1 && ps[0].QueuedBytes == 777
-	})
+	if _, err := c.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ps := c.PipeStats(); len(ps) != 1 || ps[0].QueuedBytes != 777 {
+		t.Fatalf("pipe stats after write: %+v", ps)
+	}
 	st.CancelWrite(0)
 }

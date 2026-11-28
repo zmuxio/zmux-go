@@ -25,10 +25,7 @@ import (
 // localDirs, when present, hold traces kept in the development repository
 // only: the specification's traces of the local sender policy and this
 // repository's own traces of local behaviour. A missing one is skipped.
-const (
-	specDir    = "../../testdata/spec/fixtures"
-	specTraces = 381
-)
+const specDir = "../../testdata/spec/fixtures"
 
 var localDirs = []string{"../../testdata/local/spec-traces", "../../testdata/local/traces"}
 
@@ -85,8 +82,18 @@ func traceFiles(dir string) []string {
 func TestTraces(t *testing.T) {
 	profiles := loadProfiles(t)
 	files := traceFiles(filepath.Join(specDir, "traces"))
-	if len(files) != specTraces {
-		t.Errorf("found %d specification traces, want %d", len(files), specTraces)
+	index, err := os.ReadFile(filepath.Join(specDir, "traces", "index.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inventory struct {
+		Traces []json.RawMessage `json:"traces"`
+	}
+	if err := decodeJSON(index, &inventory); err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != len(inventory.Traces) || len(files) == 0 {
+		t.Fatalf("found %d specification traces, want %d from index", len(files), len(inventory.Traces))
 	}
 	for _, dir := range localDirs {
 		if _, err := os.Stat(dir); err != nil {
@@ -156,6 +163,7 @@ type rpipe struct {
 	in, out  bool
 	framing  core.Framing
 	writable bool
+	channel  bool
 	// A local join: joining until the Reply; hello holds what JoinHello wrote and
 	// acc reads it as the peer (Hello last read).
 	joining bool
@@ -169,52 +177,52 @@ func (p *rpipe) lane(l uint64) *rlane {
 }
 
 type rcarrier struct {
-	name     string
-	via      string
-	dir      string
-	binding  []byte
-	conn     string
-	buf      []byte
-	pipe     uint64
-	lane     uint64
-	slot     *core.PendingSlot // listener slot held until the first record
-	deadline core.Time
-	framing  core.Framing
-	attached bool
-	rejected bool
-	// The listener's handshake.
-	confirm    bool // write the confirmation once the Reply came
-	decision   join.Decision
-	heldHello  *join.Hello
-	pj         *core.PeerJoin
-	joiner     *join.Joiner // the scripted peer
-	reply      []byte
-	outcome    string // what the handshake came to: accept, refuse, reject, fatal, or "" while it runs
-	hsDeadline core.Time
-	msgs       [][]byte // units held until Confirmed
+	slot                 *core.PendingSlot // listener slot held until the first record
+	heldHello            *join.Hello
+	pendingAuthorization *core.PeerJoin
+	pj                   *core.PeerJoin
+	joiner               *join.Joiner // the scripted peer
+	name                 string
+	via                  string
+	dir                  string
+	conn                 string
+	outcome              string // what the handshake came to: accept, refuse, reject, fatal, or "" while it runs
+	binding              []byte
+	buf                  []byte
+	reply                []byte
+	msgs                 [][]byte // units held until Confirmed
+	pipe                 uint64
+	lane                 uint64
+	deadline             core.Time
+	hsDeadline           core.Time
+	framing              core.Framing
+	attached             bool
+	channel              bool
+	rejected             bool
+	confirm              bool // write the confirmation once the Reply came
+	decision             join.Decision
+	holdAuthorization    bool
 }
 
 type runner struct {
-	pending        core.PendingCarriers
-	unconfirmed    core.Unconfirmed[*rcarrier] // the listener's Unconfirmed carriers (MULTIPATH.md 5.4 step 7)
-	unconfirmedCap int                         // their bound (MULTIPATH.md 5.6)
-	pairing        core.SplitPairing
-	carriers       map[string]*rcarrier
-	t              *testing.T
-	h              header
-	s              *core.Session
-	now            core.Time
-	streams        map[string]*core.Stream
-	pipes          map[uint64]*rpipe
-	events         []core.Event
-	evSeen         map[string]int
-	closeCovered   bool
-	closesSent     []map[string]any
-	b              core.Batch
-	enc            encodeCtx
-	stepNo         any
-	modes          map[string]bool // AllowRecordMode; nil accepts every mode
-	ep             runnerEpochs
+	ep           runnerEpochs
+	pairing      core.SplitPairing
+	stepNo       any
+	carriers     map[string]*rcarrier
+	t            *testing.T
+	s            *core.Session
+	streams      map[string]*core.Stream
+	pipes        map[uint64]*rpipe
+	evSeen       map[string]int
+	enc          encodeCtx
+	modes        map[string]bool // AllowRecordMode; nil accepts every mode
+	h            header
+	events       []core.Event
+	closesSent   []map[string]any
+	pending      core.PendingCarriers
+	b            core.Batch
+	now          core.Time
+	closeCovered bool
 }
 
 func merge(dst, src map[string]any) map[string]any {
@@ -247,6 +255,11 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	}
 	th := merge(p.Test, h.Overrides.Test)
 	cfg := core.DefaultConfig()
+	unconfirmedCap := core.DefaultMaxUnconfirmed
+	if v, ok := th["unconfirmed_cap"]; ok {
+		unconfirmedCap = int(num(v))
+	}
+	cfg.SessionPolicy.Limits.PendingPeerJoins = unconfirmedCap
 	cfg.Local = paramsFromMap(tp)
 	cfg.Test.Enabled = true
 	// A profile's sessions: pipe 0 is end to end by declaration.
@@ -274,10 +287,7 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	if v, ok := th["pipe_cap"]; ok {
 		cfg.Test.PipeCap = int(num(v))
 	}
-	unconfirmedCap := core.DefaultMaxUnconfirmed
-	if v, ok := th["unconfirmed_cap"]; ok {
-		unconfirmedCap = int(num(v))
-	}
+
 	if v, ok := th["role_nonce"]; ok {
 		cfg.Local.RoleNonce = num(v)
 	}
@@ -297,6 +307,25 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 	} else {
 		cfg.Role, cfg.TransportRole = core.RoleInitiator, core.RoleInitiator
 	}
+	if m, ok := th["datagram"].(map[string]any); ok {
+		if n := getU(m, "window"); n != 0 {
+			cfg.DgramWindow = int(n)
+		}
+		cfg.Test.DatagramSequence = getU(m, "next_sequence")
+		if n, ok := m["hold_packets"]; ok {
+			count := int(num(n))
+			cfg.Test.DatagramHoldCount = &count
+		}
+		if n, ok := m["hold_ms"]; ok {
+			cfg.Test.DatagramHoldTime = ms(n)
+		}
+		if n := getU(m, "copies"); n > 1 {
+			cfg.DatagramOptions.Copy, cfg.DatagramOptions.Copies = core.DatagramDuplicate, int(n)
+		}
+		if n, ok := m["ttl_ms"]; ok {
+			cfg.DatagramOptions.DeadlineMode, cfg.DatagramOptions.TTL = core.DatagramDeadlineAfter, ms(n)
+		}
+	}
 	var modes map[string]bool
 	for k, v := range cf {
 		switch k {
@@ -306,13 +335,11 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 			cfg.HandshakeTimeout = ms(v)
 		case "max_incoming_uni_streams":
 			cfg.StagedUni = v == nil
-		case "enable_datagrams":
-			cfg.Datagrams = v.(bool)
 		case "role":
 			cfg.Role = map[string]core.Role{"auto": core.RoleAuto, "initiator": core.RoleInitiator,
 				"responder": core.RoleResponder}[v.(string)]
 		case "max_pipes":
-			cfg.MaxPipes = int(num(v))
+			cfg.SessionPolicy.Limits.SteadyAttachments = int(num(v))
 		case "resume_timeout":
 			cfg.Resume = ms(v)
 		case "probation":
@@ -365,12 +392,11 @@ func newRunner(t *testing.T, h header, profiles map[string]profile) *runner {
 			}
 		case "early_data":
 			m := v.(map[string]any)
-			cfg.EarlyZmuxPeer, _ = m["zmux_peer"].(bool)
-			cfg.EarlyReplayable, _ = m["replayable"].(bool)
+			cfg.EarlyPlainQMux, _ = m["plain_qmux"].(bool)
 		}
 	}
 	r := &runner{t: t, h: h, streams: map[string]*core.Stream{}, pipes: map[uint64]*rpipe{}, evSeen: map[string]int{},
-		carriers: map[string]*rcarrier{}, modes: modes, unconfirmedCap: unconfirmedCap}
+		carriers: map[string]*rcarrier{}, modes: modes}
 	r.s = core.New(cfg, 0)
 	r.enc.sent = func(pipe, lane uint64) uint64 {
 		if p := r.pipes[pipe]; p != nil {
@@ -399,7 +425,14 @@ func (r *runner) step(st map[string]any) error {
 		}
 		return nil
 	case "peer_send":
+		if getB(st, "carrier_early") {
+			r.s.CarrierEarlyIn()
+			defer r.s.CarrierHandshakeDone()
+		}
 		return r.peerSend(st)
+	case "peer_datagram":
+		r.s.ReceiveChannelDatagram(num(st["pipe"]), hexb(st["hex"]), r.now)
+		return nil
 	case "api":
 		return r.api(st)
 	case "advance":
@@ -463,15 +496,26 @@ func (r *runner) pipeUp(st map[string]any) error {
 		return fmt.Errorf("pipe_up via %s", via)
 	}
 	id := num(st["pipe"])
-	p := &rpipe{id: id, lanes: map[uint64]*rlane{}, writable: true}
+	p := &rpipe{id: id, lanes: map[uint64]*rlane{}, writable: true, channel: getB(st, "channel")}
 	if f, _ := st["framing"].(string); f == "records" {
 		p.framing = core.FramingRecords
 	}
 	dir := st["dir"].(string)
 	p.in, p.out = dir != "out", dir != "in"
 	r.pipes[id] = p
-	ci := core.CarrierInfo{QueueBound: true, Framing: p.framing, MinRTT: true, Lanes: conn != ""}
+	ci := core.CarrierInfo{QueueBound: true, Framing: p.framing, MinRTT: true, Lanes: conn != "", Channel: p.channel}
+	if raw, ok := st["remembered_plain"].(map[string]any); ok {
+		cfg := *r.s.Config()
+		remembered := paramsFromMap(raw)
+		cfg.EarlyCarrier, cfg.EarlyPlainQMux, cfg.EarlyRemembered = true, true, &remembered
+		r.s = core.New(cfg, r.now)
+	}
+	local := r.s.LocalParams()
+	padding := local.Has & wire.HasCarrierDatagramPadding
 	r.s.AttachBootstrap(ci, ci, nil)
+	if local.Has&wire.HasCarrierDatagrams != 0 {
+		local.Has = local.Has&^wire.HasCarrierDatagramPadding | padding
+	}
 	if conn != "" {
 		r.s.SetCarrierConn(id, conn)
 	}
@@ -485,7 +529,7 @@ func (r *runner) pipeDown(st map[string]any) error {
 		if c == nil || !c.attached {
 			return nil
 		}
-		r.s.PipeEnded(c.pipe, c.lane, st["how"].(string) == "eof", len(c.buf) > 0, nil, r.now)
+		r.s.PipeEnded(c.pipe, c.lane, st["how"].(string) == "eof", len(c.buf) > 0, nil, nil, r.now)
 		r.drainEvents()
 		return nil
 	}
@@ -496,10 +540,10 @@ func (r *runner) pipeDown(st map[string]any) error {
 	if dir == "in" || dir == "bidi" {
 		l := r.pipes[id].lane(lane)
 		partial := len(l.in) > 0
-		r.s.PipeEnded(id, lane, how == "eof", partial, nil, r.now)
+		r.s.PipeEnded(id, lane, how == "eof", partial, nil, nil, r.now)
 	}
 	if dir == "out" || dir == "bidi" {
-		r.s.WriteDone(&core.Batch{Pipe: id, Lane: lane}, errors.New("carrier failed"), r.now)
+		r.s.PipeWriteFailed(id, lane, errors.New("carrier failed"), nil, r.now)
 	}
 	r.drainEvents()
 	return nil
@@ -533,8 +577,7 @@ func (r *runner) peerSend(st map[string]any) error {
 			}
 		}
 		for _, m := range list {
-			b := &core.Buf{B: m}
-			r.s.ReceiveMessage(id, 0, b, m, r.now)
+			receiveMessageTest(r.s, id, 0, m, r.now)
 		}
 		r.drainEvents()
 		return nil
@@ -560,16 +603,15 @@ func (r *runner) peerSend(st map[string]any) error {
 		}
 		l.in = append(l.in, data[:c]...)
 		data = data[c:]
-		buf := &core.Buf{B: l.in}
-		buf.Ref()
-		n := r.s.Receive(id, 0, buf, l.in, r.now)
+
+		n := receiveTest(r.s, id, 0, l.in, r.now)
 		l.in = append([]byte(nil), l.in[n:]...)
 		r.drainEvents()
 	}
 	if len(data) > 0 {
 		l.in = append(l.in, data...)
-		buf := &core.Buf{B: l.in}
-		n := r.s.Receive(id, 0, buf, l.in, r.now)
+
+		n := receiveTest(r.s, id, 0, l.in, r.now)
 		l.in = append([]byte(nil), l.in[n:]...)
 		r.drainEvents()
 	}
@@ -671,6 +713,21 @@ func (r *runner) flush() {
 			if !p.out || !p.writable {
 				continue
 			}
+			if p.channel {
+				out, _ := r.s.PollChannel(id, core.ChannelUse{Limit: 1200, Room: 1200}, nil, r.now)
+				for _, d := range out {
+					var f wire.Frame
+					if err := wire.DecodeChannelFrame(d.Frame, &f, false); err != nil {
+						r.t.Fatal(err)
+					}
+					l := p.lane(0)
+					obj := frameObj(&f)
+					obj["channel"] = true
+					l.frames = append(l.frames, obj)
+				}
+				r.s.ChannelDone(out, r.now)
+				matched = matched || len(out) > 0
+			}
 			lanes = r.s.OutLanes(id, lanes[:0])
 			for _, ln := range lanes {
 				for r.s.PollTransmit(id, ln, &r.b, core.DefaultBatch, r.now) {
@@ -684,7 +741,7 @@ func (r *runner) flush() {
 					if shut && l.closed == "" {
 						l.closed = "graceful"
 					}
-					r.s.WriteDone(&r.b, nil, r.now)
+					r.s.WriteDone(&r.b, r.b.Len(), nil, r.now)
 					r.drainEvents()
 				}
 			}
@@ -1177,13 +1234,13 @@ func (r *runner) expectState(st map[string]any) error {
 	return nil
 }
 
-var featureNames = []string{"role", "goaway", "preamble", "priority", "datagram_flows", "multipath", "pipe_ack", "resume"}
+var featureNames = []string{"role", "goaway", "preamble", "priority", "multipath", "pipe_ack", "resume"}
 
 func eventObj(e core.Event) (string, map[string]any) {
 	switch e.Kind {
 	case core.EvEstablished:
 		f := e.Features
-		on := []bool{f.Role, f.GoAway, f.Preamble, f.Priority, f.Flows, f.Multipath, f.PipeAck, f.Resume}
+		on := []bool{f.Role, f.GoAway, f.Preamble, f.Priority, f.Multipath, f.PipeAck, f.Resume}
 		var fs []any
 		for i, n := range featureNames {
 			if on[i] {
@@ -1216,7 +1273,7 @@ func eventObj(e core.Event) (string, map[string]any) {
 	case core.EvTierSaturation, core.EvPipePriority, core.EvPipeQuality,
 		core.EvCapacityBelow, core.EvCapacityRestored, core.EvJoinKeys, core.EvPipeAttached,
 		core.EvEpochCommitted, core.EvEpochDeleted, core.EvLocatorAdded, core.EvLocatorRemoved, core.EvDatagramPath,
-		core.EvStreamPlaced, core.EvStreamGapStarted, core.EvStreamGapFilled, core.EvPipePathQuality:
+		core.EvStreamPlaced, core.EvStreamGapStarted, core.EvStreamGapFilled, core.EvPipePathQuality, core.EvPipeHealth, core.EvShaping:
 		// Not in the trace vocabulary.
 	}
 	return "other", nil
@@ -1344,9 +1401,21 @@ func (r *runner) carrierSend(c *rcarrier, st map[string]any) error {
 		}
 		c.attached, c.pipe, c.lane = true, f.PipeID, f.Lane
 	}
-	buf := &core.Buf{B: c.buf}
-	n := r.s.Receive(c.pipe, c.lane, buf, c.buf, r.now)
+
+	n := receiveTest(r.s, c.pipe, c.lane, c.buf, r.now)
 	c.buf = append([]byte(nil), c.buf[n:]...)
 	r.drainEvents()
 	return nil
+}
+
+func receiveTest(s *core.Session, pipe, lane uint64, data []byte, now core.Time) int {
+	buf := core.NewBuf(data)
+	defer buf.Unref()
+	return s.Receive(pipe, lane, core.Input{First: buf.Span(0, len(data))}, now)
+}
+
+func receiveMessageTest(s *core.Session, pipe, lane uint64, data []byte, now core.Time) {
+	buf := core.NewBuf(data)
+	defer buf.Unref()
+	s.ReceiveMessage(pipe, lane, buf.Span(0, len(data)), now)
 }

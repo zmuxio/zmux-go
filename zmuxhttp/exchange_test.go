@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/timeshim"
@@ -420,57 +421,53 @@ func envOr(k, d string) string {
 // carrier instead of aborting it.
 func TestHTTPExchangeCompletion(t *testing.T) {
 	leakcheck.Check(t)
-	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
-	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, nil, &exCfg{HoldTime: time.Second, AllowInsecure: true})
-	defer func() { _ = h.Close() }()
-	var cid [exCIDLen]byte
-	_, _ = rand.Read(cid[:])
-	key := newExKey(nil, cid[:])
-	send := func(kind, flags byte, seq, ack uint64, data []byte) byte {
-		var nonce [exNonceLen]byte
-		_, _ = rand.Read(nonce[:])
-		b := exRequest(key, &cid, kind, flags, seq, ack, uint32(time.Now().Unix()), &nonce, data)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b)))
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status %d", rec.Code)
+	synctest.Test(t, func(t *testing.T) {
+		lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
+		defer func() { _ = lst.Close() }()
+		h := newExHandler(t, lst, nil, &exCfg{HoldTime: time.Second, AllowInsecure: true})
+		defer func() { _ = h.Close() }()
+		var cid [exCIDLen]byte
+		_, _ = rand.Read(cid[:])
+		key := newExKey(nil, cid[:])
+		send := func(kind, flags byte, seq, ack uint64, data []byte) byte {
+			var nonce [exNonceLen]byte
+			_, _ = rand.Read(nonce[:])
+			b := exRequest(key, &cid, kind, flags, seq, ack, uint32(time.Now().Unix()), &nonce, data)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d", rec.Code)
+			}
+			return rec.Body.Bytes()[exMACLen]
 		}
-		return rec.Body.Bytes()[exMACLen]
-	}
-	// Not a zmux record: the listener rejects the carrier and closes both
-	// halves gracefully, which ends the downlink with FIN.
-	if f := send(exKindUp, exFlagFin, 0, 0, []byte{0xff}); f != 0 {
-		t.Fatalf("UP FIN: flags %#x", f)
-	}
-	h.mu.Lock()
-	c := h.carriers[cid]
-	h.mu.Unlock()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+		// Not a zmux record: the listener rejects the carrier and closes both
+		// halves gracefully, which ends the downlink with FIN.
+		if f := send(exKindUp, exFlagFin, 0, 0, []byte{0xff}); f != 0 {
+			t.Fatalf("UP FIN: flags %#x", f)
+		}
+		h.mu.Lock()
+		c := h.carriers[cid]
+		h.mu.Unlock()
+		synctest.Wait()
 		c.mu.Lock()
-		w := c.wclosed
+		wclosed := c.wclosed
 		c.mu.Unlock()
-		if w {
-			break
-		}
-		if time.Now().After(deadline) {
+		if !wclosed {
 			t.Fatal("the downlink did not end")
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if f := send(exKindDown, 0, 0, 0, nil); f != exFlagFin {
-		t.Fatalf("DOWN 0: flags %#x, want FIN", f)
-	}
-	if f := send(exKindClose, 0, 0, 1, nil); f != 0 {
-		t.Fatalf("final CLOSE: flags %#x", f)
-	}
-	c.mu.Lock()
-	ended, err := c.ended, c.err
-	c.mu.Unlock()
-	if !ended || err != nil {
-		t.Fatalf("carrier ended %v with %v, want completion", ended, err)
-	}
+		if f := send(exKindDown, 0, 0, 0, nil); f != exFlagFin {
+			t.Fatalf("DOWN 0: flags %#x, want FIN", f)
+		}
+		if f := send(exKindClose, 0, 0, 1, nil); f != 0 {
+			t.Fatalf("final CLOSE: flags %#x", f)
+		}
+		c.mu.Lock()
+		ended, err := c.ended, c.err
+		c.mu.Unlock()
+		if !ended || err != nil {
+			t.Fatalf("carrier ended %v with %v, want completion", ended, err)
+		}
+	})
 }
 
 // TestHTTPExchangeListenerClosed checks that a closed listener's handler
@@ -770,54 +767,50 @@ func TestHTTPExchangeOutOfOrderCost(t *testing.T) {
 // anything is read and leaves no state, a request that creates a carrier
 // keeps its slot, and the slot is free again once that carrier ends.
 func TestHTTPExchangePendingShare(t *testing.T) {
-	leakcheck.Check(t)
-	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 2, FirstRecordTimeout: 10 * time.Second})
-	defer func() { _ = lst.Close() }()
-	h := newExHandler(t, lst, nil, &exCfg{PSK: []byte("k")})
-	defer func() { _ = h.Close() }()
-	send := func(cid *[exCIDLen]byte, kind byte, seq uint64) (int, byte) {
-		key := newExKey([]byte("k"), cid[:])
-		var nonce [exNonceLen]byte
-		_, _ = rand.Read(nonce[:])
-		b := exRequest(key, cid, kind, 0, seq, 0, uint32(time.Now().Unix()), &nonce, nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b)))
-		if rec.Code != http.StatusOK {
-			return rec.Code, 0
+	synctest.Test(t, func(t *testing.T) {
+		leakcheck.Check(t)
+		lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), MaxPendingPerSource: 2, FirstRecordTimeout: 10 * time.Second})
+		defer func() { _ = lst.Close() }()
+		h := newExHandler(t, lst, nil, &exCfg{PSK: []byte("k")})
+		defer func() { _ = h.Close() }()
+		send := func(cid *[exCIDLen]byte, kind byte, seq uint64) (int, byte) {
+			key := newExKey([]byte("k"), cid[:])
+			var nonce [exNonceLen]byte
+			_, _ = rand.Read(nonce[:])
+			b := exRequest(key, cid, kind, 0, seq, 0, uint32(time.Now().Unix()), &nonce, nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b)))
+			if rec.Code != http.StatusOK {
+				return rec.Code, 0
+			}
+			return rec.Code, rec.Body.Bytes()[exMACLen]
 		}
-		return rec.Code, rec.Body.Bytes()[exMACLen]
-	}
-	state := func(cid *[exCIDLen]byte) (c *exServer, gone bool) {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		c = h.carriers[*cid]
-		_, gone = h.gone[*cid]
-		return c, gone
-	}
-	c1, c2, c3 := &[exCIDLen]byte{1}, &[exCIDLen]byte{2}, &[exCIDLen]byte{3}
-	for _, c := range []*[exCIDLen]byte{c1, c2} {
-		if code, f := send(c, exKindUp, 1); code != http.StatusOK || f != 0 {
-			t.Fatalf("carrier %d: status %d, flags %#x", c[0], code, f)
+		state := func(cid *[exCIDLen]byte) (c *exServer, gone bool) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			c = h.carriers[*cid]
+			_, gone = h.gone[*cid]
+			return c, gone
 		}
-	}
-	if code, _ := send(c3, exKindUp, 1); code != http.StatusServiceUnavailable {
-		t.Fatalf("beyond the share: status %d", code)
-	}
-	if c, gone := state(c3); c != nil || gone {
-		t.Fatalf("refused carrier left state: live %v, gone %v", c != nil, gone)
-	}
-	c, _ := state(c1)
-	c.fail(errExchangeClosed)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if code, f := send(c3, exKindUp, 1); code == http.StatusOK && f == 0 {
-			break
+		c1, c2, c3 := &[exCIDLen]byte{1}, &[exCIDLen]byte{2}, &[exCIDLen]byte{3}
+		for _, c := range []*[exCIDLen]byte{c1, c2} {
+			if code, f := send(c, exKindUp, 1); code != http.StatusOK || f != 0 {
+				t.Fatalf("carrier %d: status %d, flags %#x", c[0], code, f)
+			}
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the freed share was not given to the refused carrier")
+		if code, _ := send(c3, exKindUp, 1); code != http.StatusServiceUnavailable {
+			t.Fatalf("beyond the share: status %d", code)
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		if c, gone := state(c3); c != nil || gone {
+			t.Fatalf("refused carrier left state: live %v, gone %v", c != nil, gone)
+		}
+		c, _ := state(c1)
+		c.fail(errExchangeClosed)
+		synctest.Wait()
+		if code, flags := send(c3, exKindUp, 1); code != http.StatusOK || flags != 0 {
+			t.Fatalf("carrier using the freed slot: status %d, flags %#x", code, flags)
+		}
+	})
 }
 
 // parseExRequest parses a whole binary request body; ok reports one whose
@@ -897,7 +890,11 @@ func TestHTTPExchangeRefusedLeavesNoGone(t *testing.T) {
 
 // lateClock is the host's clock, except that an armed AfterFunc has
 // already fired when it is stopped and calls its function only later.
-type lateClock struct{ armed atomic.Bool }
+type lateClock struct {
+	stopping chan struct{}
+	release  chan struct{}
+	armed    atomic.Bool
+}
 
 func (c *lateClock) Now() time.Time { return time.Now() }
 
@@ -906,15 +903,18 @@ func (c *lateClock) AfterFunc(d time.Duration, f func()) timeshim.Timer {
 		return time.AfterFunc(d, f)
 	}
 	go func() {
-		time.Sleep(50 * time.Millisecond)
+		<-c.release
 		f()
 	}()
-	return lateTimer{}
+	return lateTimer{stopping: c.stopping}
 }
 
-type lateTimer struct{}
+type lateTimer struct{ stopping chan struct{} }
 
-func (lateTimer) Stop() bool               { return false }
+func (t lateTimer) Stop() bool {
+	close(t.stopping)
+	return false
+}
 func (lateTimer) Reset(time.Duration) bool { return false }
 
 // deadlineWriter records the read deadlines set on a response.
@@ -936,19 +936,23 @@ func (w *deadlineWriter) SetReadDeadline(t time.Time) error {
 // none is left on the connection for its next request.
 func TestHTTPExchangeReadDeadlineLateTimer(t *testing.T) {
 	leakcheck.Check(t)
-	clk := &lateClock{}
+	clk := &lateClock{stopping: make(chan struct{}), release: make(chan struct{})}
 	cfg := mpConfig()
-	cfg.Clock = clk
+	cfg.ClockDomain = zmux.NewClockDomain(clk)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: cfg})
 	defer func() { _ = lst.Close() }()
 	h := newExHandler(t, lst, nil, &exCfg{PSK: make([]byte, 32)})
 	defer func() { _ = h.Close() }()
 	w := &deadlineWriter{ResponseWriter: httptest.NewRecorder()}
 	clk.armed.Store(true)
-	if h.readDeadline(w, time.Now().Add(time.Hour))() {
+	stop := h.readDeadline(w, clk.Now().Add(time.Hour))
+	stopped := make(chan bool, 1)
+	go func() { stopped <- stop() }()
+	<-clk.stopping
+	close(clk.release)
+	if <-stopped {
 		t.Fatal("a fired deadline reported as stopped in time")
 	}
-	time.Sleep(100 * time.Millisecond)
 	w.mu.Lock()
 	last := w.last
 	w.mu.Unlock()
@@ -969,7 +973,7 @@ func TestExchangeBackoffChecked(t *testing.T) {
 		{zmux.Backoff{Min: 3 * time.Second}, false}, // above the 2 s default Max
 		{zmux.Backoff{Min: time.Second, Max: time.Millisecond}, false},
 		{zmux.Backoff{Max: -1}, false},
-		{zmux.Backoff{Jitter: 1}, false},
+		{zmux.Backoff{Jitter: zmux.Set(1.0)}, true},
 	} {
 		_, err := ExchangeConfig{AllowInsecure: true}.resolve(&Exchange{Backoff: c.b}, nil)
 		if (err == nil) != c.ok || err != nil && !errors.Is(err, zmux.ErrInvalidConfig) {
@@ -984,33 +988,34 @@ func TestExchangeBackoffChecked(t *testing.T) {
 // the carrier's goroutines end at once.
 func TestHTTPExchangeClosedEndsUnreachable(t *testing.T) {
 	leakcheck.Check(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	answered := make(chan struct{})
+	answer := sync.OnceFunc(func() { close(answered) })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusBadGateway)
+		answer()
 	}))
 	defer srv.Close()
-	p, err := Exchange{URL: srv.URL, Config: ExchangeConfig{AllowInsecure: true}, Deadline: -1}.Pipe(context.Background())
+	p, err := Exchange{URL: srv.URL, Config: ExchangeConfig{AllowInsecure: true}, Deadline: -1}.Pipe(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.W.Write([]byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond) // pieces fail and wait to be repeated
+	select {
+	case <-answered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
 	_ = p.W.Close()
 	_ = p.R.Close()
 	c := p.W.(*exClientWriter).c
-	deadline := time.Now().Add(time.Second)
-	for {
-		c.mu.Lock()
-		ended := c.ended
-		c.mu.Unlock()
-		if ended {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("a closed carrier keeps repeating its final pieces")
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-c.ctx.Done():
+	case <-ctx.Done():
+		t.Fatal("a closed carrier keeps repeating its final pieces")
 	}
 }

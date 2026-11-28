@@ -23,10 +23,10 @@ func BenchmarkRecvRefPieces(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(buf.B)))
 	for b.Loop() {
-		buf.refs.Store(1)
+		buf.Reuse()
 		for i := 0; i < len(buf.B); i += piece {
 			f := &wire.Frame{Kind: wire.KindStream, StreamID: 1, Offset: off, Data: buf.B[i : i+piece]}
-			if _, err := s.onStream(f, buf); err != nil {
+			if _, err := s.onStream(f, Input{First: buf.Span(i, i+len(f.Data))}); err != nil {
 				b.Fatal(err)
 			}
 			off += piece

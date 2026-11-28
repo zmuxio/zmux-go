@@ -88,30 +88,29 @@ func TestVerifyAndTranscriptSignature(t *testing.T) {
 	}
 }
 
-// A rejection goes to the reject policy; a verifier that is unavailable closes
-// the carrier without a refusal; a panic is a rejection.
+// Every server verification failure goes to its rejection policy. A caller
+// using WrapPipe directly can inspect the local error detail.
 func TestVerifyErrorKinds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	for _, c := range []struct {
-		anchor seal.Anchor
-		name   string
-		reject bool
+		anchor      seal.Anchor
+		name        string
+		unavailable bool
 	}{
-		{name: "rejection", anchor: credAnchor{err: errors.New("revoked")}, reject: true},
-		{name: "panic", anchor: panicAnchor{}, reject: true},
-		{name: "unavailable", anchor: credAnchor{err: fmt.Errorf("%w: down", seal.ErrVerifyUnavailable)}, reject: false},
+		{name: "rejection", anchor: credAnchor{err: errors.New("revoked")}, unavailable: false},
+		{name: "panic", anchor: panicAnchor{}, unavailable: false},
+		{name: "unavailable", anchor: credAnchor{err: fmt.Errorf("%w: down", seal.ErrVerifyUnavailable)}, unavailable: true},
 	} {
 		f := newFixture(t)
 		sc := f.server
 		sc.ClientAnchor = c.anchor
 		x, y := net.Pipe()
 		_, serr := establishErrs(t, ctx, &f.client, &sc, zmux.NetPipe(x), zmux.NetPipe(y))
-		var re *zmux.RejectError
-		if errors.As(serr, &re) != c.reject {
+		if _, ok := errors.AsType[*zmux.RejectError](serr); !ok {
 			t.Errorf("%s: %v", c.name, serr)
 		}
-		if !c.reject && !errors.Is(serr, seal.ErrVerifyUnavailable) {
+		if errors.Is(serr, seal.ErrVerifyUnavailable) != c.unavailable {
 			t.Errorf("%s: %v", c.name, serr)
 		}
 	}
@@ -124,7 +123,7 @@ func TestVerifyErrorKinds(t *testing.T) {
 		t.Fatal(cerr)
 	}
 
-	unavailable := fmt.Errorf("%w: %w", seal.ErrVerifyUnavailable, seal.ErrAuth)
+	unavailable := fmt.Errorf("%w: %w", seal.ErrVerifyUnavailable, proto.ErrAuth)
 	cc.Anchor = credAnchor{err: unavailable}
 	x, y = net.Pipe()
 	cerr, _ := establishErrs(t, ctx, &cc, &f.server, zmux.NetPipe(x), zmux.NetPipe(y))

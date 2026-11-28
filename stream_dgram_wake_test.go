@@ -17,9 +17,15 @@ import (
 // calling synctest bubble, closed and waited for at the end of the test.
 func bubblePair(t *testing.T, cfg func() *Config) (*Conn, *Conn) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
 	a, b := net.Pipe()
+	return bubblePairOn(t, a, b, cfg)
+}
+
+func bubblePairOn(t *testing.T, a, b net.Conn, cfg func() *Config) (*Conn, *Conn) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
 	ch := make(chan *Conn, 1)
 	go func() {
 		s, err := Server(ctx, b, cfg())
@@ -58,7 +64,7 @@ func TestStreamDatagramReaderWakes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				client, _ := bubblePair(t, func() *Config {
-					return &Config{Clock: timeshim.Real, EnableDatagrams: true, Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1}
+					return &Config{ClockDomain: NewClockDomain(timeshim.Real), EnableDatagrams: true, Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1}
 				})
 				st, err := client.OpenStream()
 				if err != nil {
@@ -92,7 +98,7 @@ func TestStreamDatagramReaderWakes(t *testing.T) {
 func TestStreamDatagramsSurviveAutoRelease(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		client, server := bubblePair(t, func() *Config {
-			return &Config{Clock: timeshim.Real, EnableDatagrams: true, Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1}
+			return &Config{ClockDomain: NewClockDomain(timeshim.Real), EnableDatagrams: true, Liveness: Liveness{KeepAlivePeriod: -1}, MaxIdleTimeout: -1}
 		})
 		ctx := context.Background()
 		st, err := client.OpenStream()

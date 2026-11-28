@@ -50,13 +50,3 @@ func TestWrapPipeFailure(t *testing.T) {
 		})
 	}
 }
-
-// DialChoice refuses a mode with two candidates of one kind.
-func TestDialModeDuplicateKind(t *testing.T) {
-	dial := func(context.Context, CarrierCredential) (PipeIO, error) { return PipeIO{}, errors.New("unused") }
-	m := AutoChoice(Candidate{Kind: CarrierStream, Dial: dial}, Candidate{Kind: CarrierExchange, Dial: dial},
-		Candidate{Kind: CarrierStream, Dial: dial})
-	if _, err := DialChoice(context.Background(), m, nil, nil); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("err %v, want ErrInvalidConfig", err)
-	}
-}

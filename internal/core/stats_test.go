@@ -20,13 +20,13 @@ func statsMP() (*Session, *Pipe) {
 
 func TestStatsPenaltiesOncePerEpisode(t *testing.T) {
 	s, p := statsMP()
-	s.penalize(p, true)
-	s.penalize(p, true) // the same episode
+	s.penalize(p)
+	s.penalize(p) // the same episode
 	if got := s.SessionStats().Penalties; got != 1 {
 		t.Fatalf("Penalties = %d after one episode, want 1", got)
 	}
 	p.mp.penalized = false // the episode ended
-	s.penalize(p, true)
+	s.penalize(p)
 	if got := s.SessionStats().Penalties; got != 2 {
 		t.Fatalf("Penalties = %d after two episodes, want 2", got)
 	}
@@ -241,8 +241,8 @@ func TestStatsStreamInfo(t *testing.T) {
 	st := s.newStream(true, false)
 	st.id, st.idSet = 1, true
 	// Two datagrams for a queue of one: the oldest is dropped.
-	s.queueDatagram(st, streamDgram(0, []byte("ab")))
-	s.queueDatagram(st, streamDgram(0, []byte("cde")))
+	s.queueDatagram(st, receivedDgram{data: []byte("ab")})
+	s.queueDatagram(st, receivedDgram{data: []byte("cde")})
 	if _, p, ok := s.RecvStreamDatagram(st); !ok || string(p) != "cde" {
 		t.Fatalf("datagram %q %v", p, ok)
 	}
@@ -322,7 +322,7 @@ func TestStreamDatagramBytes(t *testing.T) {
 		for i := range n {
 			p := make([]byte, each)
 			p[0] = byte(i)
-			s.queueDatagram(st, streamDgram(0, p))
+			s.queueDatagram(st, receivedDgram{data: p})
 		}
 		return s, st
 	}

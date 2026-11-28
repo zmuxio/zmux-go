@@ -12,28 +12,23 @@ import (
 	"github.com/zmuxio/zmux-go/seal/proto"
 )
 
-// ErrCredentialsFailed is raised only on the side that judged the peer: a
-// server that refuses a client's credentials (the verifier's rejection or
-// panic, a proof that fails, a post-quantum authentication it requires) hands
-// the carrier to OnReject, counts it and returns nothing of that class to its
-// application; a verifier that is unavailable closes the carrier without a
-// refusal. The client whose handshake the server refuses before its reply
-// fails with ErrNoReply.
+// Credential failures and unavailable verifiers go through the same listener
+// rejection policy. Local diagnostics retain the distinction.
 func TestServerCredentialDecisionsStayLocal(t *testing.T) {
 	missing := proto.KeyID{1}
-	revoked := errors.Join(errors.New("revoked"), seal.ErrAuth)
+	revoked := errors.Join(errors.New("revoked"), proto.ErrAuth)
 	for _, c := range []struct {
 		anchor    seal.Anchor
 		detail    error
 		name      string
 		requirePQ bool
-		reject    bool // reaches OnReject and the statistics
+		reason    string
 	}{
-		{name: "verifier rejection", anchor: credAnchor{err: revoked}, detail: revoked, requirePQ: false, reject: true},
-		{name: "verifier panic", anchor: panicAnchor{}, detail: seal.ErrVerifyRejected, requirePQ: false, reject: true},
-		{name: "proof missing", anchor: credAnchor{proof: &missing}, detail: seal.ErrProof, requirePQ: false, reject: true},
-		{name: "post-quantum authentication required", anchor: credAnchor{}, detail: seal.ErrPQAuthRequired, requirePQ: true, reject: true},
-		{name: "verifier unavailable", anchor: credAnchor{err: seal.ErrVerifyUnavailable}, requirePQ: false, reject: false},
+		{name: "verifier rejection", anchor: credAnchor{err: revoked}, detail: revoked, requirePQ: false, reason: "credentials_failed"},
+		{name: "verifier panic", anchor: panicAnchor{}, detail: seal.ErrVerifyRejected, requirePQ: false, reason: "credentials_failed"},
+		{name: "proof missing", anchor: credAnchor{proof: &missing}, detail: seal.ErrProof, requirePQ: false, reason: "credentials_failed"},
+		{name: "post-quantum authentication required", anchor: credAnchor{}, detail: seal.ErrPQAuthRequired, requirePQ: true, reason: "credentials_failed"},
+		{name: "verifier unavailable", anchor: credAnchor{err: seal.ErrVerifyUnavailable}, detail: seal.ErrVerifyUnavailable, requirePQ: false, reason: "verify_unavailable"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -63,20 +58,9 @@ func TestServerCredentialDecisionsStayLocal(t *testing.T) {
 				t.Fatalf("HandlePipe returned %v to the application", err)
 			}
 			st := l.Stats()
-			if !c.reject {
-				if !errors.Is(err, seal.ErrVerifyUnavailable) || st.Rejected != 0 {
-					t.Fatalf("unavailable verifier: %v, %+v", err, st)
-				}
-				select {
-				case i := <-got:
-					t.Fatalf("an unavailable verifier reached OnReject: %+v", i)
-				default:
-				}
-				return
-			}
 			select {
 			case i := <-got:
-				if i.Reason != "credentials_failed" || !errors.Is(i.Err, seal.ErrCredentialsFailed) || !errors.Is(i.Err, c.detail) {
+				if i.Reason != c.reason || !errors.Is(i.Err, c.detail) {
 					t.Fatalf("OnReject info %+v", i)
 				}
 			default:

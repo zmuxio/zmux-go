@@ -8,64 +8,86 @@ import (
 	"testing"
 	"time"
 
+	"github.com/djylb/timeshim"
+
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
 // TestListenerStats checks each outcome count of a listener.
 func TestListenerStats(t *testing.T) {
 	leakcheck.Check(t)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	lst := mustNewListener(&ListenerConfig{FirstRecordTimeout: 100 * time.Millisecond, Config: mpConfig()})
-	done := make(chan struct{})
-	go func() { _ = lst.Serve(ctx, ln); close(done) }()
-	defer func() { cancel(); _ = lst.Close(); <-done }()
-	dial := func() net.Conn {
-		nc, err := net.Dial("tcp", ln.Addr().String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		return nc
+	clock := timeshim.NewFake(time.Now())
+	cfg := mpConfig()
+	cfg.ClockDomain = NewClockDomain(clock)
+	const firstTimeout = time.Second
+	lst := mustNewListener(&ListenerConfig{FirstRecordTimeout: firstTimeout, Config: cfg})
+	defer func() { _ = lst.Close() }()
+
+	handle := func(nc net.Conn) <-chan error {
+		done := make(chan error, 1)
+		go func() { done <- lst.HandlePipe(ctx, NetPipe(nc), PipeHint{}) }()
+		return done
 	}
-	waitStats := func(what string, ok func(ListenerStats) bool) {
+	check := func(done <-chan error, wantOK bool) {
 		t.Helper()
-		waitUntil(t, 5*time.Second, what, func() bool { return ok(lst.Stats()) })
+		select {
+		case err := <-done:
+			if (err == nil) != wantOK {
+				t.Fatalf("HandlePipe returned %v, want success %v", err, wantOK)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
 	}
 
 	// A session.
-	dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
-	defer dcancel()
-	c, err := Client(dctx, dial(), mpConfig())
+	a, b := tcpPair(t)
+	done := handle(b)
+	c, err := Client(ctx, a, mpConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	sc, err := lst.Accept(dctx)
+	sc, err := lst.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = c.Close(); _ = sc.Close(); waitDone(t, c); waitDone(t, sc) }()
-	waitStats("a session", func(s ListenerStats) bool { return s.Sessions == 1 })
+	defer func() {
+		c.Abort(0, "")
+		sc.Abort(0, "")
+		_ = a.Close()
+		_ = b.Close()
+		waitDone(t, c)
+		waitDone(t, sc)
+	}()
+	check(done, true)
 
 	// A join.
-	if _, err := c.AddPipe(dctx, NetPipe(dial()), PipeOptions{}); err != nil {
+	jc, js := tcpPair(t)
+	done = handle(js)
+	if _, err := c.AddPipe(ctx, NetPipe(jc), PipeOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	waitStats("a join", func(s ListenerStats) bool { return s.Joins == 1 })
+	check(done, true)
 
 	// Not zmux at all.
-	nc := dial()
-	_, _ = nc.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
-	waitStats("a rejection", func(s ListenerStats) bool { return s.Rejected == 1 })
-	_ = nc.Close()
+	bad, rejected := tcpPair(t)
+	defer func() { _ = bad.Close() }()
+	done = handle(rejected)
+	if _, err := bad.Write([]byte("GET / HTTP/1.1\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	check(done, false)
 
-	// No first record.
-	nc = dial()
-	waitStats("a timeout", func(s ListenerStats) bool { return s.TimedOut == 1 })
-	_ = nc.Close()
+	// No first record. Read entry follows registration of the deadline.
+	idle, pending := tcpPair(t)
+	defer func() { _ = idle.Close() }()
+	watched := &firstReadConn{Conn: pending, reading: make(chan struct{})}
+	done = handle(watched)
+	waitTestSignal(t, watched.reading, "first-record read")
+	clock.Advance(firstTimeout)
+	check(done, false)
 
 	// A TLS handshake that fails.
 	srvTLS, _ := selfSignedTLS(t)
@@ -75,7 +97,6 @@ func TestListenerStats(t *testing.T) {
 	_, _ = a1.Write([]byte("not a client hello"))
 	_ = a1.Close()
 	<-served
-	waitStats("a setup failure", func(s ListenerStats) bool { return s.SetupFailures == 1 })
 
 	// After Close every carrier is refused.
 	_ = lst.Close()
@@ -89,6 +110,17 @@ func TestListenerStats(t *testing.T) {
 	if got != want {
 		t.Fatalf("stats %+v, want %+v", got, want)
 	}
+}
+
+type firstReadConn struct {
+	net.Conn
+	reading chan struct{}
+	once    sync.Once
+}
+
+func (c *firstReadConn) Read(p []byte) (int, error) {
+	c.once.Do(func() { close(c.reading) })
+	return c.Conn.Read(p)
 }
 
 // earlyHalf is a server carrier half that took early data and whose

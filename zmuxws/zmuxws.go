@@ -42,6 +42,7 @@ import (
 	"github.com/djylb/netx/wsconn"
 	"github.com/djylb/netx/wsconn/wshttp"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/carrierstats"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 )
 
@@ -57,47 +58,44 @@ var options = wsconn.Options{ReadLimit: zmux.MaxRecordSize + 1 + 64}
 // DialOptions.Protocols sends none. The pipe's Protocol is then "".
 const NoSubprotocol = ""
 
-// accepted returns the subprotocols a server accepts, by preference: each
-// identifier followed by its alias, so that the first identifier offered
-// in either form is chosen; none reports NoSubprotocol among protocols.
-func accepted(protocols []string) (out []string, none bool) {
+// accepted lists each server preference followed by its alias.
+func accepted(protocols []string) ([]string, bool) {
+	return subprotocols(protocols, true)
+}
+
+// offered advertises the named preferences before any aliases.
+func offered(protocols []string) ([]string, error) {
+	out, none := subprotocols(protocols, false)
+	if none {
+		if len(protocols) != 1 {
+			return nil, fmt.Errorf("%w: zmuxws.NoSubprotocol cannot be offered with other protocols", zmux.ErrInvalidConfig)
+		}
+		return nil, nil
+	}
+	return out, nil
+}
+
+func subprotocols(protocols []string, interleave bool) (out []string, none bool) {
 	if len(protocols) == 0 {
 		protocols = []string{zmux.DefaultALPN}
 	}
 	out = make([]string, 0, 2*len(protocols))
+	var aliases []string
 	for _, p := range protocols {
 		if p == NoSubprotocol {
 			none = true
 			continue
 		}
 		out = append(out, p)
-		if a, ok := zmux.ALPNAlias(p); ok {
-			out = append(out, a)
+		if alias, ok := zmux.ALPNAlias(p); ok {
+			if interleave {
+				out = append(out, alias)
+			} else {
+				aliases = append(aliases, alias)
+			}
 		}
 	}
-	return out, none
-}
-
-// offered returns the subprotocols a client offers: the identifiers, then
-// their aliases; NoSubprotocol alone offers none, and mixed with others it
-// is zmux.ErrInvalidConfig.
-func offered(protocols []string) ([]string, error) {
-	if len(protocols) == 0 {
-		protocols = []string{zmux.DefaultALPN}
-	}
-	if slices.Contains(protocols, NoSubprotocol) {
-		if len(protocols) > 1 {
-			return nil, fmt.Errorf("%w: zmuxws.NoSubprotocol cannot be offered with other protocols", zmux.ErrInvalidConfig)
-		}
-		return nil, nil
-	}
-	out := append(make([]string, 0, 2*len(protocols)), protocols...)
-	for _, p := range protocols {
-		if a, ok := zmux.ALPNAlias(p); ok {
-			out = append(out, a)
-		}
-	}
-	return out, nil
+	return append(out, aliases...), none
 }
 
 // ---- server ----
@@ -291,13 +289,6 @@ func dialPipe(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Carr
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	bound := o.MaxRedirects
-	switch {
-	case bound < 0:
-		bound = 0
-	case bound == 0:
-		bound = zmuxhttp.DefaultRedirects
-	}
 	for hops := 0; ; hops++ {
 		p, err := dialOnce(ctx, rawURL, o, cred)
 		var he *wsconn.HandshakeError
@@ -309,10 +300,7 @@ func dialPipe(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Carr
 			return p, rawURL, err
 		}
 		loc := he.Response.Header.Get("Location")
-		next, rerr := zmuxhttp.CheckRedirect(from, http.MethodGet, he.Status, loc)
-		if rerr == nil && hops >= bound {
-			rerr = &zmuxhttp.RedirectError{StatusCode: he.Status, Location: loc, Reason: "too many redirects"}
-		}
+		next, rerr := zmuxhttp.FollowRedirect(from, http.MethodGet, he.Status, loc, hops, o.MaxRedirects)
 		if rerr != nil {
 			return zmux.PipeIO{}, rawURL, rerr
 		}
@@ -370,60 +358,25 @@ func dialOnce(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Carr
 	if err != nil {
 		return zmux.PipeIO{}, err
 	}
-	var credErr error
 	if cred != nil {
 		peer, _ := netip.ParseAddrPort(nc.RemoteAddr().String())
-		info := &zmux.CarrierInfo{Peer: peer, Stage: zmux.StageHead}
-		if tc, ok := nc.(*tls.Conn); ok {
-			cs := tc.ConnectionState()
-			info.TLS = &cs
-		}
-		name, value, err := cred.Header(info)
-		switch {
-		case err == nil:
-			co.Header = append(co.Header, httphead.Field{Name: name, Value: value})
-		case info.TLS != nil:
+		info := &zmux.CarrierInfo{Peer: peer, Stage: zmux.StageHead, Encrypted: secure, TLS: tlsState(nc)}
+		name, value, err := zmuxhttp.CredentialHeader(cred, info, o.Header)
+		if err != nil {
 			_ = nc.Close()
 			return zmux.PipeIO{}, err
-		default:
-			// A credential bound to TLS on a plain connection: the
-			// request goes without it, as far as a redirect to wss, and
-			// fails with credErr otherwise.
-			credErr = err
 		}
+		co.Header = append(co.Header, httphead.Field{Name: name, Value: value})
 	}
-	return handshake(ctx, nc, rawURL, &co, credErr)
+	return handshake(ctx, nc, rawURL, &co)
 }
 
-// handshake runs the client handshake over nc and returns the carrier,
-// which then owns the connection; on every error the connection is closed
-// (wsconn.Client closes nc itself when the handshake fails).
-func handshake(ctx context.Context, nc net.Conn, rawURL string, co *wsconn.ClientOptions, credErr error) (p zmux.PipeIO, err error) {
+func handshake(ctx context.Context, nc net.Conn, rawURL string, co *wsconn.ClientOptions) (zmux.PipeIO, error) {
 	c, _, err := wsconn.Client(ctx, nc, rawURL, co)
 	if err != nil {
-		_ = nc.Close()
-		return zmux.PipeIO{}, handshakeErr(err, credErr)
-	}
-	defer func() {
-		if err != nil {
-			_ = c.Close()
-		}
-	}()
-	if credErr != nil {
-		return zmux.PipeIO{}, credErr
+		return zmux.PipeIO{}, err
 	}
 	return pipe(c, tlsState(nc)), nil
-}
-
-// handshakeErr is the error of a failed handshake: credErr, the credential
-// left out of the request, unless the server redirected, which the caller
-// follows.
-func handshakeErr(err, credErr error) error {
-	var he *wsconn.HandshakeError
-	if credErr != nil && (!errors.As(err, &he) || !zmuxhttp.IsRedirect(he.Status)) {
-		return credErr
-	}
-	return err
 }
 
 // tlsDialer dials TLS over forward (a net.Dialer when nil).
@@ -518,12 +471,15 @@ var errMessageCarrier = errors.New("zmuxws: a message carrier has no byte stream
 // zmux.ErrMessageTooLarge. The peer's close frame is the end of the pipe
 // (io.EOF); a connection that ends without one, and a text message, fail
 // it.
-func (p *carrier) ReadMessage(limit int) ([]byte, error) {
+func (p *carrier) ReadMessage(limit int) (zmux.ReceivedMessage, error) {
 	m, err := p.message(p.c.ReadMessageLimit(int64(max(limit, 0))))
 	if errors.Is(err, wsconn.ErrMessageTooLarge) {
-		return nil, zmux.ErrMessageTooLarge
+		return zmux.ReceivedMessage{}, zmux.ErrMessageTooLarge
 	}
-	return m, err
+	if err != nil {
+		return zmux.ReceivedMessage{}, err
+	}
+	return zmux.OwnMessage(m), nil
 }
 
 // message maps a read of the connection to the carrier's result.
@@ -553,12 +509,16 @@ func (p *carrier) WriteMessages(msgs [][]byte) error {
 
 var _ zmux.MessageBatchWriter = (*carrier)(nil)
 
-func (p *carrier) Read([]byte) (int, error) { return 0, errMessageCarrier }
+func (p *carrier) Read(_ []byte) (int, error) { return 0, errMessageCarrier }
 
 // CarrierConn identifies the connection shared by the WebSocket's halves.
 func (p *carrier) CarrierConn() any { return p.c.NetConn() }
 
-func (p *carrier) Write([]byte) (int, error) { return 0, errMessageCarrier }
+func (p *carrier) CarrierSampler() *carrierstats.Sampler {
+	return carrierstats.SocketSampler(p.c.NetConn())
+}
+
+func (p *carrier) Write(_ []byte) (int, error) { return 0, errMessageCarrier }
 
 // CloseWrite sends a close frame: the graceful end of the pipe.
 func (p *carrier) CloseWrite() error { return p.c.CloseWrite() }
@@ -568,7 +528,7 @@ func (p *carrier) Close() error { return p.c.Close() }
 
 // Abort closes the connection beneath (the TCP connection under TLS)
 // without a close frame.
-func (p *carrier) Abort(error) {
+func (p *carrier) Abort(_ error) {
 	nc := p.c.NetConn()
 	if tc, ok := nc.(zmux.NetConner); ok {
 		nc = tc.NetConn()
@@ -579,26 +539,28 @@ func (p *carrier) Abort(error) {
 // SetReadDeadline bounds reads, as zmux.Admission.AdmitPipe needs.
 func (p *carrier) SetReadDeadline(t time.Time) error { return p.c.SetReadDeadline(t) }
 
-// Candidate is a WebSocket to rawURL for zmux.DialChoice, dialed as DialPipe
+// Candidate is a WebSocket to rawURL for the session controller, dialed as DialPipe
 // does with o (nil: the zero DialOptions) and the session's credential in
 // place of o.CarrierCredential. A refused upgrade is reported as a
-// *zmuxhttp.StatusError, so that the mode reports the candidate refused.
+// *zmuxhttp.StatusError, so that the controller observes the refusal.
 func Candidate(rawURL string, o *DialOptions) zmux.Candidate {
 	var opts DialOptions
 	if o != nil {
 		opts = *o
 	}
 	t := zmuxhttp.NewTarget(rawURL)
-	return zmux.Candidate{Kind: zmux.CarrierWebSocket, Target: t, Dial: func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
-		p, final, err := dialPipe(ctx, t.URL(), &opts, cred)
+	return zmux.Candidate{Kind: zmux.CarrierWebSocket, CanStart: true, Attachments: []zmux.AttachmentSpec{{Directions: zmux.Both}}, Open: func(ctx context.Context, req zmux.OpenRequest) ([]zmux.PipeIO, error) {
+		p, final, err := dialPipe(ctx, t.URL(), &opts, req.Credential)
 		if err == nil {
 			t.Redirected(final)
+		} else {
+			t.Reset()
 		}
 		var he *wsconn.HandshakeError
 		if errors.As(err, &he) && he.Status != 0 {
-			return p, fmt.Errorf("%w: %w", &zmuxhttp.StatusError{StatusCode: he.Status,
+			return []zmux.PipeIO{p}, fmt.Errorf("%w: %w", &zmuxhttp.StatusError{StatusCode: he.Status,
 				Status: strconv.Itoa(he.Status) + " " + http.StatusText(he.Status)}, err)
 		}
-		return p, err
+		return []zmux.PipeIO{p}, err
 	}}
 }

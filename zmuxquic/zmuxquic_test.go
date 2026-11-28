@@ -3,14 +3,9 @@ package zmuxquic
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"io"
-	"math/big"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -20,32 +15,43 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/testcert"
+	"github.com/zmuxio/zmux-go/internal/teststream"
 )
 
 func tlsConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"},
-		DNSNames: []string{"localhost"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, _ := x509.ParseCertificate(der)
-	pool := x509.NewCertPool()
-	pool.AddCert(cert)
-	srv := &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-		NextProtos: []string{"zmux"}}
-	cli := &tls.Config{RootCAs: pool, ServerName: "localhost", NextProtos: []string{"zmux"},
-		ClientSessionCache: tls.NewLRUClientSessionCache(4)}
+	cert, trust := testcert.Local(t)
+	srv := &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"zmux"}}
+	cli := &tls.Config{RootCAs: trust, ServerName: testcert.LocalName, NextProtos: []string{"zmux"},
+		ClientSessionCache: &ticketCache{ClientSessionCache: tls.NewLRUClientSessionCache(4), ready: make(chan struct{})}}
 	return srv, cli
 }
 
+type ticketCache struct {
+	tls.ClientSessionCache
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (c *ticketCache) Put(key string, state *tls.ClientSessionState) {
+	c.ClientSessionCache.Put(key, state)
+	if state != nil {
+		c.once.Do(func() { close(c.ready) })
+	}
+}
+
+func waitTicket(t *testing.T, ctx context.Context, cfg *tls.Config) {
+	t.Helper()
+	select {
+	case <-cfg.ClientSessionCache.(*ticketCache).ready:
+	case <-ctx.Done():
+		t.Fatal("session ticket not received")
+	}
+}
+
 func mpConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true}}
+	return &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true}}
 }
 
 type env struct {
@@ -76,19 +82,23 @@ func newEnvQUIC(t testing.TB, address string, scfg *zmux.Config, qconf *quic.Con
 	e := &env{ln: ln, lst: mustNewListener(&zmux.ListenerConfig{Config: scfg}), cli: cli, cancel: cancel}
 	tl := &trackedListener{ConnListener: ln}
 	e.tl = tl
-	go func() { _ = Serve(ctx, e.lst, tl) }()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = Serve(ctx, e.lst, tl)
+	}()
 	t.Cleanup(func() {
 		cancel()
 		_ = ln.Close()
 		_ = e.lst.Close()
+		<-served
 		tl.closeAll()
 	})
 	return e
 }
 
 // trackedListener remembers what it accepted: closing a QUIC listener
-// leaves established connections alone, and a client's close may never
-// arrive (a test's relay drops it).
+// leaves established connections alone.
 type trackedListener struct {
 	ConnListener
 	conns []*quic.Conn
@@ -122,26 +132,9 @@ func (l *trackedListener) closeAll() {
 
 func echo(t *testing.T, c, s *zmux.Conn, n int) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go func() {
-		st, err := s.AcceptStream(ctx)
-		if err == nil {
-			_, _ = io.Copy(st, st)
-			_ = st.Close()
-		}
-	}()
-	st, err := c.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
 	msg := make([]byte, n)
 	_, _ = rand.Read(msg)
-	go func() { _, _ = st.Write(msg); _ = st.Close() }()
-	got, err := io.ReadAll(st)
-	if err != nil || !bytes.Equal(got, msg) {
-		t.Fatalf("echo: %d of %d bytes, %v", len(got), n, err)
-	}
+	teststream.Echo(t, t.Context(), c.OpenStreamSync, s.AcceptStream, msg)
 }
 
 func TestQUICPipeAndLanes(t *testing.T) {
@@ -197,7 +190,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 	t.Helper()
 	withAuth := func(cfg *zmux.Config) *zmux.Config {
 		if exporter {
-			cfg.MaxPipes, cfg.PipeAuth = 4, zmux.PipeAuth{Exporter: true, EndToEnd: true}
+			cfg.SessionPolicy.Limits.SteadyAttachments, cfg.PipeAuth = 4, zmux.PipeAuth{Exporter: true, EndToEnd: true}
 		}
 		return cfg
 	}
@@ -234,16 +227,7 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 	_ = s.Close()
 	_ = c.Wait()
 	_ = s.Wait()
-	for {
-		if _, ok := e.cli.ClientSessionCache.Get("localhost"); ok {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("session ticket not received")
-		case <-time.After(time.Millisecond):
-		}
-	}
+	waitTicket(t, ctx, e.cli)
 	allow.Store(allowSecond)
 	secondTLS := e.cli.Clone()
 	if !useTicket {
@@ -286,7 +270,11 @@ func exerciseReplayableResumedDial(t *testing.T, allowSecond, useTicket, exporte
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c2.AddPipe(ctx, pio, zmux.PipeOptions{}); err != nil {
+		joined, err := c2.AddPipe(ctx, pio, zmux.PipeOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := joined.WaitAttached(ctx); err != nil {
 			t.Fatal(err)
 		}
 		echo(t, c2, s2, 1<<10)
@@ -307,7 +295,7 @@ func TestQUICDialZmuxPeer(t *testing.T) {
 		e := newEnv(t, mpConfig())
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		cfg := mpConfig()
-		cfg.EarlyData = zmux.EarlyData{ZmuxPeer: true, Replayable: replayable}
+		cfg.EarlyData = zmux.EarlyData{PlainQMux: true, Replayable: replayable}
 		c, err := Dial(ctx, e.ln.Addr().String(), e.cli, nil, cfg)
 		if err != nil {
 			cancel()
@@ -358,7 +346,11 @@ func TestQUICPool(t *testing.T) {
 			t.Fatal(err)
 		}
 		fates = append(fates, pio.FateGroup)
-		if _, err := c.AddPipe(ctx, pio, zmux.PipeOptions{}); err != nil {
+		joined, err := c.AddPipe(ctx, pio, zmux.PipeOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := joined.WaitAttached(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -385,63 +377,147 @@ func TestQUICPool(t *testing.T) {
 	}
 }
 
-// TestQUICCopyLane: on a session's only pipe with lanes, urgent data is
-// copied to the copy lane.
+// copyLaneReader signals when the pipe reader asks for more data, after
+// processing the preceding records. Once armed, it withholds ACKs so the
+// primary copy cannot retire an urgent write before the lane runs.
+type copyLaneReader struct {
+	*qReader
+	progress chan struct{}
+	release  chan struct{}
+	holdACK  atomic.Bool
+}
+
+func (r *copyLaneReader) Read(p []byte) (int, error) {
+	select {
+	case r.progress <- struct{}{}:
+	default:
+	}
+	n, err := r.qReader.Read(p)
+	if r.holdACK.Load() {
+		<-r.release
+	}
+	return n, err
+}
+
+type copyLaneOpener struct {
+	*qStream
+	written chan struct{}
+}
+
+func (o *copyLaneOpener) OpenLane(ctx context.Context) (io.WriteCloser, error) {
+	w, err := o.qStream.OpenLane(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &observedCopyLane{laneWriter: w.(*laneWriter), written: o.written}, nil
+}
+
+type observedCopyLane struct {
+	*laneWriter
+	written chan struct{}
+	header  bool
+}
+
+func (w *observedCopyLane) Write(p []byte) (int, error) {
+	n, err := w.laneWriter.Write(p)
+	if err == nil && w.header {
+		select {
+		case w.written <- struct{}{}:
+		default:
+		}
+	}
+	w.header = true
+	return n, err
+}
+
+func (w *observedCopyLane) WriteBuffers(p [][]byte) (int, error) { return carrier.WriteFlat(w, p) }
+
+func waitLaneAck(t *testing.T, ctx context.Context, pipe *zmux.Pipe, progress <-chan struct{}, lane uint64) {
+	t.Helper()
+	for {
+		stats, _ := pipe.Stats()
+		for _, got := range stats.Lanes {
+			if got.Lane == lane && got.PositionAcked > 0 {
+				return
+			}
+		}
+		select {
+		case <-progress:
+		case <-ctx.Done():
+			t.Fatalf("no acknowledgement on lane %d: %v", lane, ctx.Err())
+		}
+	}
+}
+
+// TestQUICCopyLane checks redundant urgent data on the single pipe's copy
+// lane, after the peer acknowledges both the primary and the lane header.
 func TestQUICCopyLane(t *testing.T) {
-	e := newEnv(t, mpConfig())
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	conf := mpConfig()
+	conf.MaxLanes = 2
+	conf.CopyBudgetPercent = zmux.Set(100)
+	e := newEnv(t, conf)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	c, err := Dial(ctx, e.ln.Addr().String(), e.cli, nil, mpConfig())
+	qc, err := quic.DialAddr(ctx, e.ln.Addr().String(), e.cli, testQUIC(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = qc.CloseWithError(0, "") }()
+	p, err := ConnPipe(ctx, qc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &copyLaneReader{qReader: p.R.(*qReader), progress: make(chan struct{}, 1), release: make(chan struct{})}
+	writer := &copyLaneOpener{qStream: p.W.(*qStream), written: make(chan struct{}, 1)}
+	p.R, p.W = reader, writer
+	c, err := zmux.Start(ctx, p, zmux.RoleClient, conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(); _ = c.Wait() })
+	defer close(reader.release)
 	s, err := e.lst.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		_ = c.Close()
-		_ = s.Close()
-		_ = c.Wait()
-		_ = s.Wait()
-	}()
-	go func() {
-		for {
-			st, err := s.AcceptStream(ctx)
-			if err != nil {
-				return
+	t.Cleanup(func() { _ = s.Close(); _ = s.Wait() })
+	pipe, _ := c.Pipe(0)
+
+	sendUrgent := func(tag byte) {
+		t.Helper()
+		teststream.Echo(t, ctx, func(ctx context.Context) (*zmux.Stream, error) {
+			st, err := c.OpenStreamSync(ctx)
+			if err == nil {
+				st.SetRedundant(true)
 			}
-			go func() { _, _ = io.Copy(st, st); _ = st.Close() }()
-		}
-	}()
-	for i := range 200 {
-		time.Sleep(5 * time.Millisecond) // the copy lane is usable once confirmed
-		st, err := c.OpenStreamSync(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		st.SetPriority(0, false)
-		msg := bytes.Repeat([]byte{byte(i)}, 4096)
-		_, _ = st.Write(msg)
-		_ = st.Close()
-		got, err := io.ReadAll(st)
-		if err != nil || !bytes.Equal(got, msg) {
-			t.Fatalf("urgent echo %d: %v", i, err)
-		}
-		if r := c.ConnectionStats().BytesRedundant; r > 0 {
-			// The session count is the sum of the pipes' (taken later:
-			// at least as large).
-			var pipes uint64
-			for _, ps := range c.PipeStats() {
-				pipes += ps.BytesRedundant
-			}
-			if pipes < r {
-				t.Fatalf("pipes count %d redundant bytes, the session %d", pipes, r)
-			}
-			return
-		}
+			return st, err
+		}, s.AcceptStream, bytes.Repeat([]byte{tag}, 4096))
 	}
-	t.Fatalf("no copy on the copy lane: %+v", c.PipeStats())
+	sendUrgent(1)
+	waitLaneAck(t, ctx, pipe, reader.progress, 0)
+	sendUrgent(2)
+	waitLaneAck(t, ctx, pipe, reader.progress, 1)
+
+	reader.holdACK.Store(true)
+	st, err := c.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.SetRedundant(true)
+	if _, err := st.Write(make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	select {
+	case <-writer.written:
+	case <-ctx.Done():
+		t.Fatalf("copy lane did not carry redundant data: %v", ctx.Err())
+	}
+	session := c.ConnectionStats().BytesRedundant
+	stats, _ := pipe.Stats()
+	if session == 0 || stats.BytesRedundant < session {
+		t.Fatalf("redundant bytes: session %d, pipe %d", session, stats.BytesRedundant)
+	}
 }
 
 // testQUIC is QUICConfig(base) with a handshake timeout that tolerates a
@@ -486,23 +562,56 @@ func TestQUICHandshakeFailureCounted(t *testing.T) {
 	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig()})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	served := make(chan struct{})
-	go func() { _ = Serve(ctx, lst, ln); close(served) }()
-	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-served }()
-	if qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, testQUIC(nil)); err == nil {
-		// The client finishes first; the server's verdict closes the
-		// connection.
+	defer func() { _ = ln.Close() }()
+	defer func() { _ = lst.Close() }()
+	allowCert := make(chan struct{})
+	release := sync.OnceFunc(func() { close(allowCert) })
+	defer release()
+	cli.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 		select {
-		case <-qc.Context().Done():
+		case <-allowCert:
+			return &tls.Certificate{}, nil // the server requires a credential
 		case <-ctx.Done():
-			t.Fatal("the handshake succeeded")
+			return nil, ctx.Err()
 		}
 	}
-	for lst.Stats().SetupFailures != 1 {
-		if ctx.Err() != nil {
-			t.Fatalf("stats %+v", lst.Stats())
+	type adopted struct {
+		svc *ConnService
+		err error
+	}
+	service := make(chan adopted, 1)
+	go func() {
+		peer, err := ln.Accept(ctx)
+		if err != nil {
+			service <- adopted{err: err}
+			return
 		}
-		time.Sleep(5 * time.Millisecond)
+		svc, err := AdoptConn(ctx, lst, peer)
+		service <- adopted{svc: svc, err: err}
+	}()
+	dialDone := make(chan struct{})
+	go func() {
+		defer close(dialDone)
+		if qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, testQUIC(nil)); err == nil {
+			select {
+			case <-qc.Context().Done():
+			case <-ctx.Done():
+				_ = qc.CloseWithError(0, "")
+			}
+		}
+	}()
+	defer func() { release(); cancel(); <-dialDone }()
+	select {
+	case r := <-service:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		release()
+		if err := r.svc.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 	if st := lst.Stats(); !reflect.DeepEqual(st, zmux.ListenerStats{SetupFailures: 1}) {
 		t.Fatalf("stats %+v", st)

@@ -16,8 +16,8 @@ import (
 	"github.com/djylb/timeshim"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/carrier"
 )
 
 // A WebTransport session whose head decision is deferred is decided on the
@@ -26,16 +26,6 @@ import (
 // the bytes read replayed and the QUIC connection reachable, and the
 // session is closed once the fallback returned.
 func TestWebTransportDeferred(t *testing.T) {
-	srvTLS, cliTLS := tlsConfigs(t)
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = pc.Close() }()
-	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
-		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
-	webtransport.ConfigureHTTP3Server(h3)
-	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
 	taken := make(chan []byte, 1)
 	lst := mustNewListener(&zmux.ListenerConfig{Config: cfg(),
 		Admission: &zmux.Admission{Peek: 4, Decide: func(_ context.Context, info zmux.CarrierInfo, prefix []byte) zmux.Decision {
@@ -65,17 +55,9 @@ func TestWebTransportDeferred(t *testing.T) {
 			taken <- b
 		}})
 	defer func() { _ = lst.Close() }()
-	wh, err := NewHandler(lst, nil, ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h3.Handler = wh
-	go func() { _ = ws.Serve(pc) }()
-	defer func() { _ = ws.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	tr, u := startWTFixture(t, lst, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
-	u := "https://" + pc.LocalAddr().String() + "/zmux"
 
 	c, sess, err := Dial(ctx, tr, u, nil, cfg())
 	if err != nil {
@@ -117,73 +99,241 @@ func TestWebTransportDeferred(t *testing.T) {
 	}
 }
 
-// wtDeferEnv serves WebTransport sessions whose head defers to their
-// first stream, which is then accepted, under admission adm.
-func wtDeferEnv(t *testing.T, timeout time.Duration, perSource int) (*zmux.Listener, *webtransport.Transport, string) {
-	t.Helper()
-	return wtSetupEnv(t, timeout, perSource, nil, nil)
+func TestWebTransportDetachedTakeoverOwnsSession(t *testing.T) {
+	detached := make(chan zmux.PipeIO, 1)
+	handled := make(chan struct{})
+	lst := mustNewListener(&zmux.ListenerConfig{Config: cfg(),
+		Admission: &zmux.Admission{Peek: 4, Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
+			if info.Stage == zmux.StageHead {
+				return zmux.Decision{Verdict: zmux.VerdictDefer}
+			}
+			return zmux.Decision{Verdict: zmux.VerdictTakeover}
+		}},
+		Fallback: func(_ context.Context, tk *zmux.Takeover) {
+			if err := tk.Detach(); err != nil {
+				t.Error(err)
+				return
+			}
+			detached <- tk.Pipe()
+		}})
+	defer func() { _ = lst.Close() }()
+	tr, endpoint := startWTFixture(t, lst, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer close(handled)
+			next.ServeHTTP(w, r)
+		})
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	client, err := DialSession(ctx, tr, endpoint, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.CloseWithError(0, "") }()
+	stream, err := client.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline, _ := ctx.Deadline()
+	_ = stream.SetDeadline(deadline)
+	if _, err := stream.Write([]byte("host")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handled:
+	case <-ctx.Done():
+		t.Fatal("CONNECT did not return after detaching")
+	}
+	select {
+	case pipe := <-detached:
+		owner := pipe.W.(zmux.CarrierConner).CarrierConn().(*Session)
+		defer func() { _ = owner.CloseWithError(0, "") }()
+		var request [4]byte
+		if _, err := io.ReadFull(pipe.R, request[:]); err != nil || string(request[:]) != "host" {
+			t.Fatalf("detached request %q, %v", request, err)
+		}
+		if _, err := pipe.W.Write([]byte("ok")); err != nil {
+			t.Fatal(err)
+		}
+		checkDetachedWTChannel(t, ctx, pipe, client, stream.StreamID())
+	default:
+		t.Fatal("CONNECT finished without handing over the stream")
+	}
+	var reply [2]byte
+	if _, err := io.ReadFull(stream, reply[:]); err != nil || string(reply[:]) != "ok" {
+		t.Fatalf("detached response %q, %v", reply, err)
+	}
 }
 
-func wtSetupEnv(t *testing.T, timeout time.Duration, perSource int, wrap zmux.PipeWrapper, middleware func(http.Handler) http.Handler) (*zmux.Listener, *webtransport.Transport, string) {
+func checkDetachedWTChannel(t *testing.T, ctx context.Context, pipe zmux.PipeIO, client *Session, streamID quic.StreamID) {
 	t.Helper()
-	return wtSetupConfig(t, &zmux.ListenerConfig{Config: cfg(), WrapPipe: wrap, MaxPendingPerSource: perSource,
+	if _, ok := pipe.W.(zmux.DatagramChannel); ok {
+		t.Fatal("the replay view unexpectedly exposes the native channel")
+	}
+	unwrap, ok := pipe.W.(interface{ Unwrap() io.WriteCloser })
+	if !ok {
+		t.Fatal("cannot reach the underlying WebTransport writer")
+	}
+	channel, ok := unwrap.Unwrap().(zmux.DatagramChannel)
+	if !ok {
+		t.Fatal("the original WebTransport pipe lacks its native channel")
+	}
+	id, ok := channel.ChannelStreamID()
+	if !ok || id != uint64(streamID) {
+		t.Fatalf("native channel id %d, want %d", id, streamID)
+	}
+	received := make(chan []byte, 1)
+	stop := channel.ReceiveChannelDatagrams(func(frame []byte) {
+		select {
+		case received <- frame:
+		default:
+		}
+	})
+	defer stop()
+	payload := []byte("native")
+	wire := carrier.AppendChannelDatagram(nil, true, id, payload)
+	if err := client.SendDatagram(wire); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-received:
+		if !bytes.Equal(frame, carrier.AppendChannelDatagram(nil, false, 0, payload)) {
+			t.Fatalf("host received %x", frame)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := channel.SendChannelDatagram(wire); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := client.ReceiveDatagram(ctx); err != nil || !bytes.Equal(got, wire) {
+		t.Fatalf("client received %x, %v", got, err)
+	}
+}
+
+func TestWebTransportRejectsForwardedEarlyData(t *testing.T) {
+	lst := mustNewListener(&zmux.ListenerConfig{Config: cfg()})
+	defer func() { _ = lst.Close() }()
+	tr, endpoint := startWTFixture(t, lst, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	session, err := DialSession(ctx, tr, endpoint, http.Header{"Early-Data": {"1"}}, nil)
+	if session != nil {
+		_ = session.CloseWithError(0, "")
+		t.Fatal("early CONNECT opened a session")
+	}
+	if e, ok := errors.AsType[*ConnectError](err); !ok || e.StatusCode != http.StatusTooEarly {
+		t.Fatalf("early CONNECT: %v", err)
+	}
+	if stats := lst.Stats(); stats.SetupFailures != 1 {
+		t.Fatalf("early CONNECT setup failures: %d, want 1", stats.SetupFailures)
+	}
+}
+
+// wtDeferEnv serves WebTransport sessions whose head defers to their
+// first stream, which is then accepted, under admission adm.
+func wtDeferEnv(t *testing.T, timeout time.Duration, perSource int) (*zmux.Listener, *Transport, string, *timeshim.Fake, <-chan struct{}) {
+	t.Helper()
+	clk := timeshim.NewFake(time.Now())
+	c := cfg()
+	c.ClockDomain = zmux.NewClockDomain(clk)
+	finished := make(chan struct{})
+	end := sync.OnceFunc(func() { close(finished) })
+	l, tr, u := wtSetupConfig(t, wtDeferredConfig(c, timeout, perSource, nil), func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer end()
+			h.ServeHTTP(w, r)
+		})
+	})
+	return l, tr, u, clk, finished
+}
+
+func wtDeferredConfig(cfg *zmux.Config, timeout time.Duration, perSource int, wrap zmux.PipeWrapper) *zmux.ListenerConfig {
+	return &zmux.ListenerConfig{Config: cfg, WrapPipe: wrap, MaxPendingPerSource: perSource,
 		Admission: &zmux.Admission{Peek: 4, PeekTimeout: timeout, Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
 			if info.Stage == zmux.StageHead {
 				return zmux.Decision{Verdict: zmux.VerdictDefer}
 			}
 			return zmux.Decision{Verdict: zmux.VerdictAccept}
-		}}}, middleware)
+		}}}
 }
 
-func wtSetupConfig(t *testing.T, config *zmux.ListenerConfig, middleware func(http.Handler) http.Handler) (*zmux.Listener, *webtransport.Transport, string) {
+func wtSetupConfig(t *testing.T, config *zmux.ListenerConfig, middleware func(http.Handler) http.Handler) (*zmux.Listener, *Transport, string) {
+	t.Helper()
+	lst := mustNewListener(config)
+	t.Cleanup(func() { _ = lst.Close() })
+	tr, endpoint := startWTFixture(t, lst, middleware)
+	return lst, tr, endpoint
+}
+
+func startWTFixture(t *testing.T, lst *zmux.Listener, middleware func(http.Handler) http.Handler) (*Transport, string) {
 	t.Helper()
 	srvTLS, cliTLS := tlsConfigs(t)
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = pc.Close() })
-	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
-		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
-	webtransport.ConfigureHTTP3Server(h3)
-	flow := &webtransport.Config{MaxIncomingStreams: 8, MaxIncomingUniStreams: 8, MaxIncomingData: 4 << 20}
-	ws := &webtransport.Server{H3: h3, Config: flow, CheckOrigin: func(*http.Request) bool { return true }}
-	lst := mustNewListener(config)
-	t.Cleanup(func() { _ = lst.Close() })
-	wh, err := NewHandler(lst, nil, ws)
+	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS), QUICConfig: testQUIC(), ConnContext: QUICConnContext}
+	server := &Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
+	tr := &Transport{TLSClientConfig: cliTLS}
+	var done chan struct{}
+	t.Cleanup(func() {
+		_ = tr.Close()
+		_ = server.Close()
+		_ = pc.Close()
+		if done != nil {
+			<-done
+		}
+	})
+	handler, err := NewHandler(lst, nil, server)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if middleware != nil {
-		wh = middleware(wh)
+		handler = middleware(handler)
 	}
-	h3.Handler = wh
-	go func() { _ = ws.Serve(pc) }()
-	t.Cleanup(func() { _ = ws.Close() })
-	return lst, &webtransport.Transport{TLSClientConfig: cliTLS, Config: flow}, "https://" + pc.LocalAddr().String() + "/zmux"
+	h3.Handler = handler
+	done = make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = server.Serve(pc)
+	}()
+	return tr, "https://" + pc.LocalAddr().String() + "/zmux"
 }
 
 // A deferred session that opens no stream is closed at PeekTimeout,
-// counted PeekTimedOut, and gives its source slot back (one slot per
-// source: the next session gets it).
+// counted PeekTimedOut, and gives its source slot back. Both slots are
+// held initially, so a replacement requires that release.
 func TestWebTransportDeferredNoStream(t *testing.T) {
-	lst, tr, u := wtDeferEnv(t, 300*time.Millisecond, 1)
+	const peek = time.Second
+	lst, tr, u, clk, finished := wtDeferEnv(t, peek, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	hs, err := DialSession(ctx, tr, u, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := time.Now()
+	t.Cleanup(func() { _ = hs.CloseWithError(0, "") })
+	firstDeadline := clk.Now().Add(peek)
+	if err := clk.WaitDeadline(ctx, firstDeadline); err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(time.Nanosecond)
+	other, err := DialSession(ctx, tr, u, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.CloseWithError(0, "") })
+	if err := clk.WaitDeadline(ctx, clk.Now().Add(peek)); err != nil {
+		t.Fatal(err)
+	}
+	clk.Advance(firstDeadline.Sub(clk.Now()))
 	select {
 	case <-hs.Context().Done():
 	case <-ctx.Done():
-		t.Fatal("the session outlived PeekTimeout")
+		t.Fatal(ctx.Err())
 	}
-	if d := time.Since(start); d > 5*time.Second {
-		t.Fatalf("closed after %v", d)
-	}
-	waitAdm(t, lst, zmux.AdmissionStats{PeekTimedOut: 1})
+	checkFinishedAdmission(t, ctx, finished, lst, zmux.AdmissionStats{PeekTimedOut: 1})
 	c, sess, err := Dial(ctx, tr, u, nil, cfg())
 	if err != nil {
 		t.Fatal(err)
@@ -193,15 +343,17 @@ func TestWebTransportDeferredNoStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	echo(t, c, s)
 	_ = c.Close()
 	_ = s.Close()
+	if got, want := lst.Stats().Admission, (zmux.AdmissionStats{Accepted: 1, PeekTimedOut: 1}); got != want {
+		t.Fatalf("admission after replacing the expired session %+v, want %+v", got, want)
+	}
 }
 
 // Listener.Close ends the wait for a deferred session's first stream: the
 // session is closed at once, counted Closed.
 func TestWebTransportDeferredListenerClose(t *testing.T) {
-	lst, tr, u := wtDeferEnv(t, time.Minute, 0)
+	lst, tr, u, _, finished := wtDeferEnv(t, time.Minute, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	hs, err := DialSession(ctx, tr, u, nil, nil)
@@ -212,18 +364,20 @@ func TestWebTransportDeferredListenerClose(t *testing.T) {
 	select {
 	case <-hs.Context().Done():
 	case <-ctx.Done():
-		t.Fatal("Close left the session waiting")
+		t.Fatal(ctx.Err())
 	}
-	waitAdm(t, lst, zmux.AdmissionStats{Closed: 1})
+	checkFinishedAdmission(t, ctx, finished, lst, zmux.AdmissionStats{Closed: 1})
 }
 
-// waitAdm waits until l's admission stats are want.
-func waitAdm(t *testing.T, l *zmux.Listener, want zmux.AdmissionStats) {
+func checkFinishedAdmission(t *testing.T, ctx context.Context, finished <-chan struct{}, l *zmux.Listener, want zmux.AdmissionStats) {
 	t.Helper()
-	for end := time.Now().Add(5 * time.Second); l.Stats().Admission != want; time.Sleep(5 * time.Millisecond) {
-		if time.Now().After(end) {
-			t.Fatalf("stats %+v, want %+v", l.Stats().Admission, want)
-		}
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if got := l.Stats().Admission; got != want {
+		t.Fatalf("stats %+v, want %+v", got, want)
 	}
 }
 
@@ -248,7 +402,7 @@ func TestWebTransportFirstStreamSetupCancellation(t *testing.T) {
 		ended <- setup.Err()
 		return zmux.PipeIO{}, setup.Err()
 	})
-	_, tr, u := wtSetupEnv(t, time.Minute, 1, wrap, middleware)
+	_, tr, u := wtSetupConfig(t, wtDeferredConfig(cfg(), time.Minute, 0, wrap), middleware)
 	sess, err := DialSession(ctx, tr, u, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -284,14 +438,49 @@ func TestWebTransportFirstStreamSetupCancellation(t *testing.T) {
 // A gated CONNECT delays either SETTINGS delivery or the final response
 // flush. A write deadline interrupts only this request.
 type gatedUpgradeWriter struct {
+	entered, interrupt chan struct{}
+	phase              string
+	observedH3Response
+	once sync.Once
+}
+
+type observedH3Response struct {
 	http.ResponseWriter
 	http3.Settingser
 	http3.HTTPStreamer
-	entered, interrupt chan struct{}
-	phase              string
-	once               sync.Once
-	acceptedHead       bool
+	ownership h3ResponseOwnership
 }
+
+type h3ResponseOwnership struct {
+	taken, committed, bodyAfterTake bool
+	finalHeaders                    int
+}
+
+func (w *observedH3Response) HTTPStream() *http3.Stream {
+	str := w.HTTPStreamer.HTTPStream()
+	w.ownership.taken = str != nil
+	return str
+}
+
+func (w *observedH3Response) WriteHeader(status int) {
+	if status >= 200 {
+		w.ownership.finalHeaders++
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *observedH3Response) Write(p []byte) (int, error) {
+	w.ownership.bodyAfterTake = w.ownership.bodyAfterTake || w.ownership.taken
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *observedH3Response) FlushError() error {
+	err := http.NewResponseController(w.ResponseWriter).Flush()
+	w.ownership.committed = w.ownership.committed || err == nil
+	return err
+}
+
+func (w *observedH3Response) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *gatedUpgradeWriter) ReceivedSettings() <-chan struct{} {
 	if w.phase == "settings" {
@@ -300,69 +489,53 @@ func (w *gatedUpgradeWriter) ReceivedSettings() <-chan struct{} {
 	}
 	return w.Settingser.ReceivedSettings()
 }
-func (w *gatedUpgradeWriter) WriteHeader(status int) {
-	w.ResponseWriter.WriteHeader(status)
-	w.acceptedHead = status == http.StatusOK
-}
-func (w *gatedUpgradeWriter) Flush() {
-	if w.phase == "flush" {
-		w.once.Do(func() { close(w.entered) })
-		<-w.interrupt
-		return
-	}
-	w.ResponseWriter.(http.Flusher).Flush()
-	if w.phase == "first-stream" && w.acceptedHead {
-		w.once.Do(func() { close(w.entered) })
-	}
-}
 func (w *gatedUpgradeWriter) FlushError() error {
-	if w.phase == "flush-error" {
+	switch w.phase {
+	case "flush-error":
 		w.once.Do(func() { close(w.entered) })
 		return io.ErrClosedPipe
+	case "flush":
+		w.once.Do(func() { close(w.entered) })
+		<-w.interrupt
+		return io.ErrClosedPipe
+	default:
+		err := w.observedH3Response.FlushError()
+		w.once.Do(func() { close(w.entered) })
+		if w.phase == "flushed" {
+			<-w.interrupt
+		}
+		return err
 	}
-	w.Flush()
-	return nil
 }
 func (w *gatedUpgradeWriter) SetWriteDeadline(d time.Time) error {
 	close(w.interrupt)
 	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(d)
 }
-func (w *gatedUpgradeWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-
-// reserveUpgradeSlot waits for the warm carrier's setup to give back the
-// listener's sole pending slot. Accept publishes the session before that.
-func reserveUpgradeSlot(t *testing.T, ctx context.Context, l *zmux.Listener) *zmux.Arrival {
-	t.Helper()
-	timer := time.NewTicker(time.Millisecond)
-	defer timer.Stop()
-	for {
-		a, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
-		if err == nil {
-			return a
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("warm carrier did not release its pending slot: %v", err)
-		case <-timer.C:
-		}
-	}
-}
 
 // HS-57.
 func TestWebTransportUpgradeStopScope(t *testing.T) {
 	for _, end := range []string{"listener", "accept-timeout", "takeover-timeout", "defer-timeout", "write-error"} {
-		phases := []string{"settings", "flush", "first-stream"}
+		phases := []string{"settings", "flush", "flushed", "first-stream"}
 		if end == "write-error" {
 			phases = []string{"flush-error"}
 		}
 		for _, phase := range phases {
 			t.Run(end+"/"+phase, func(t *testing.T) {
-				entered, ended := make(chan struct{}), make(chan struct{})
+				entered := make(chan struct{})
+				ended := make(chan h3ResponseOwnership, 1)
+				warmDone := make(chan struct{})
 				middleware := func(h http.Handler) http.Handler {
 					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						if r.Header.Get("X-Gate") != "" && r.Header.Get("X-Quota-Probe") == "" {
-							defer close(ended)
-							w = &gatedUpgradeWriter{ResponseWriter: w, Settingser: w.(http3.Settingser), HTTPStreamer: w.(http3.HTTPStreamer), phase: phase, entered: entered, interrupt: make(chan struct{})}
+						switch {
+						case r.Header.Get("X-Warm") != "":
+							defer close(warmDone)
+						case r.Header.Get("X-Gate") != "" && r.Header.Get("X-Quota-Probe") == "":
+							gate := &gatedUpgradeWriter{
+								ResponseWriter: w, Settingser: w.(http3.Settingser), HTTPStreamer: w.(http3.HTTPStreamer),
+								phase: phase, entered: entered, interrupt: make(chan struct{}),
+							}
+							defer func() { ended <- gate.ownership }()
+							w = gate
 						}
 						h.ServeHTTP(w, r)
 					})
@@ -370,9 +543,12 @@ func TestWebTransportUpgradeStopScope(t *testing.T) {
 				clk := timeshim.NewFake(time.Now())
 				sc := cfg()
 				sc.HandshakeTimeout = time.Second
-				sc.Clock = clk
+				sc.MaxLanes = 1
+				sc.ClockDomain = zmux.NewClockDomain(clk)
 				called := make(chan struct{}, 1)
-				policy := &zmux.ListenerConfig{Config: sc, MaxPending: 1, Admission: &zmux.Admission{PeekTimeout: time.Second / 4, Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
+				// Allow the warm setup and the gated upgrade to overlap on separate connections.
+				const slots = 2
+				policy := &zmux.ListenerConfig{Config: sc, MaxPending: slots, Admission: &zmux.Admission{PeekTimeout: time.Second / 4, Decide: func(_ context.Context, info zmux.CarrierInfo, _ []byte) zmux.Decision {
 					v := zmux.VerdictAccept
 					if info.Stage == zmux.StageHead && info.Request.Header.Get("X-Gate") != "" {
 						switch end {
@@ -409,10 +585,46 @@ func TestWebTransportUpgradeStopScope(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				rsp, first, err := cc.Dial(ctx, u, nil)
-				if rsp != nil {
-					defer func() { _ = rsp.Body.Close() }()
+				holdSlots := func() func() {
+					t.Helper()
+					var held []*zmux.Arrival
+					release := func() {
+						for _, a := range held {
+							a.Release()
+						}
+					}
+					t.Cleanup(release)
+					for range slots {
+						a, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
+						if err != nil {
+							t.Fatalf("pending slot: %v", err)
+						}
+						held = append(held, a)
+					}
+					return release
 				}
+				if end == "defer-timeout" && phase == "flush" {
+					func() {
+						defer holdSlots()()
+						before := l.Stats()
+						rsp, session, dialErr := cc.Dial(ctx, u, http.Header{
+							"X-Gate": []string{phase}, "X-Quota-Probe": []string{"1"},
+						})
+						if rsp != nil {
+							defer func() { _ = rsp.Body.Close() }()
+						}
+						if session != nil {
+							_ = session.CloseWithError(0, "")
+						}
+						if dialErr == nil || rsp == nil || rsp.StatusCode != http.StatusNotFound {
+							t.Fatalf("CONNECT with full pending quota: response %v, error %v", rsp, dialErr)
+						}
+						if after := l.Stats(); after.Rejected != before.Rejected+1 || after.Admission != before.Admission {
+							t.Fatalf("full pending quota changed admission: before %+v, after %+v", before, after)
+						}
+					}()
+				}
+				first, err := DialSession(ctx, tr, u, http.Header{"X-Warm": []string{"1"}}, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -431,32 +643,6 @@ func TestWebTransportUpgradeStopScope(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer func() { _ = server.Close() }()
-				slot := reserveUpgradeSlot(t, ctx, l)
-				if end == "defer-timeout" && phase == "flush" {
-					// Pin the same quota state as a warm carrier that has
-					// been published but has not left setup yet.
-					func() {
-						defer slot.Release()
-						before := l.Stats()
-						rsp, session, dialErr := cc.Dial(ctx, u, http.Header{
-							"X-Gate": []string{phase}, "X-Quota-Probe": []string{"1"},
-						})
-						if rsp != nil {
-							defer func() { _ = rsp.Body.Close() }()
-						}
-						if session != nil {
-							_ = session.CloseWithError(0, "")
-						}
-						if dialErr == nil || rsp == nil || rsp.StatusCode != http.StatusNotFound {
-							t.Fatalf("CONNECT with a held pending slot: response %v, error %v", rsp, dialErr)
-						}
-						if after := l.Stats(); after.Rejected != before.Rejected+1 || after.Admission != before.Admission {
-							t.Fatalf("held slot changed admission: before %+v, after %+v", before, after)
-						}
-					}()
-				} else {
-					slot.Release()
-				}
 				dialed = make(chan struct{})
 				dialFailed := make(chan error, 1)
 				go func() {
@@ -473,13 +659,14 @@ func TestWebTransportUpgradeStopScope(t *testing.T) {
 						_ = s.CloseWithError(0, "")
 					}
 				}()
+				var dialErr error
 				select {
 				case <-entered:
-				case err := <-dialFailed:
+				case dialErr = <-dialFailed:
 					select {
 					case <-entered: // flush-error can complete the dial after signaling the gate
 					default:
-						t.Fatalf("CONNECT ended before the upgrade gate: %v", err)
+						t.Fatalf("CONNECT ended before the upgrade gate: %v", dialErr)
 					}
 				case <-ctx.Done():
 					t.Fatal("upgrade did not reach gate")
@@ -494,22 +681,33 @@ func TestWebTransportUpgradeStopScope(t *testing.T) {
 					clk.Advance(sc.HandshakeTimeout)
 				}
 				select {
-				case <-ended:
+				case ownership := <-ended:
+					want := h3ResponseOwnership{taken: phase != "settings", committed: phase == "flushed" || phase == "first-stream"}
+					if want.taken {
+						want.finalHeaders = 1
+					}
+					if ownership != want {
+						t.Fatalf("HTTP/3 response at gate %s: %+v, want %+v", phase, ownership, want)
+					}
 				case <-ctx.Done():
 					t.Fatal("listener stop did not interrupt upgrade")
+				}
+				if end == "write-error" && dialErr == nil {
+					select {
+					case err := <-dialFailed:
+						dialErr = err
+					case <-ctx.Done():
+						t.Fatal("failed response flush did not fail the CONNECT")
+					}
+				}
+				if end == "write-error" && (dialErr == nil || ctx.Err() != nil) {
+					t.Fatalf("failed response flush: CONNECT error %v, watchdog %v", dialErr, ctx.Err())
 				}
 				if end == "defer-timeout" {
 					want := zmux.AdmissionStats{Accepted: 1, PeekTimedOut: 1}
 					if got := l.Stats().Admission; got != want {
 						t.Fatalf("admission after fake clock expiry: %+v, want %+v", got, want)
 					}
-				}
-				if end != "listener" {
-					a, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
-					if err != nil {
-						t.Fatalf("pending slot: %v", err)
-					}
-					a.Release()
 				}
 				select {
 				case <-called:
@@ -533,6 +731,15 @@ func TestWebTransportUpgradeStopScope(t *testing.T) {
 				}
 				_ = stream.Close()
 				_ = received.Close()
+				if end != "listener" {
+					_ = first.CloseWithError(0, "")
+					select {
+					case <-warmDone:
+					case <-ctx.Done():
+						t.Fatal("warm CONNECT did not end")
+					}
+					holdSlots()()
+				}
 			})
 		}
 	}

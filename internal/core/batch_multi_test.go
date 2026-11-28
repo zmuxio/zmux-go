@@ -77,13 +77,13 @@ func TestBatchManyRecordsUnshaped(t *testing.T) {
 		}
 	}
 	got := sum(recs)
-	s.WriteDone(b, nil, now)
+	s.WriteDone(b, b.Len(), nil, now)
 	for got < total {
 		if !s.PollTransmit(p.id, 0, b, DefaultBatch, now) {
 			t.Fatalf("stalled at %d of %d", got, total)
 		}
 		got += sum(recordData(t, b))
-		s.WriteDone(b, nil, now)
+		s.WriteDone(b, b.Len(), nil, now)
 	}
 	if got != total {
 		t.Fatalf("%d bytes sent, want %d", got, total)
@@ -144,7 +144,7 @@ func TestBatchDelayedRecordEndsBatch(t *testing.T) {
 	if n := len(b.recs); n != at {
 		t.Fatalf("%d records before the delayed one, want %d", n, at)
 	}
-	s.WriteDone(b, nil, now)
+	s.WriteDone(b, b.Len(), nil, now)
 	if s.PollTransmit(p.id, 0, b, DefaultBatch, now) {
 		t.Fatal("the delayed record went early")
 	}

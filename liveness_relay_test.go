@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go"
-	"github.com/zmuxio/zmux-go/zmuxtest"
 )
 
 // Rows of the liveness bound measured through a relay
@@ -19,35 +18,19 @@ import (
 // to report pipe id suspect, at most limit.
 func suspectAfter(t *testing.T, e *relayEnv, id uint64, limit time.Duration) time.Duration {
 	t.Helper()
-	ev := watchEvents(t, e.client)
-	time.Sleep(50 * time.Millisecond) // the watcher runs
-	e.relay.Blackhole(true, true)
+	ctx, cancel := context.WithTimeout(t.Context(), limit)
+	defer cancel()
 	start := time.Now()
-	var at time.Time
-	defer func() {
-		if at.IsZero() {
-			ev.mu.Lock()
-			for i, x := range ev.got {
-				t.Logf("%v %v pipe %d", ev.at[i].Sub(start), x.Kind, x.PipeID)
-			}
-			ev.mu.Unlock()
-			for _, st := range e.client.PipeStats() {
-				t.Logf("pipe %d %+v", st.PipeID, st)
-			}
+	e.relay.Blackhole(true, true)
+	for {
+		ev, err := e.client.NextEvent(ctx)
+		if err != nil {
+			t.Fatalf("waiting for pipe %d suspicion: %v; pipes %+v", id, err, e.client.PipeStats())
 		}
-	}()
-	poll(t, limit, "suspicion", func() bool {
-		ev.mu.Lock()
-		defer ev.mu.Unlock()
-		for i, x := range ev.got {
-			if x.Kind == zmux.EventPipeSuspect && uint64(x.PipeID) == id && ev.at[i].After(start) {
-				at = ev.at[i]
-				return true
-			}
+		if ev.Kind == zmux.EventPipeSuspect && uint64(ev.PipeID) == id {
+			return time.Since(start)
 		}
-		return false
-	})
-	return at.Sub(start)
+	}
 }
 
 // busy keeps a stream of the client writing until the test ends.
@@ -91,7 +74,7 @@ func busy(t *testing.T, e *relayEnv) {
 func TestLivenessDataPipe(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		e := newMemRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, true)
+		e := newMemRelayEnv(t, relayConfig(0), relayConfig(0), true)
 		busy(t, e)
 		time.Sleep(300 * time.Millisecond)
 		if d := suspectAfter(t, e, 0, 5*time.Second); d > 2*time.Second {
@@ -105,7 +88,7 @@ func TestLivenessDataPipe(t *testing.T) {
 func TestLivenessStandbyBusy(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
-		e := newMemRelayEnv(t, relayConfig(0), relayConfig(0), zmuxtest.RelayOptions{}, false)
+		e := newMemRelayEnv(t, relayConfig(0), relayConfig(0), false)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		nc, err := e.dialRelay(ctx)
@@ -131,7 +114,7 @@ func TestLivenessSingleKeepAlive(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		cfg := func() *zmux.Config { return &zmux.Config{MaxIdleTimeout: 2 * time.Second} }
-		e := newMemRelayEnv(t, cfg(), cfg(), zmuxtest.RelayOptions{}, true)
+		e := newMemRelayEnv(t, cfg(), cfg(), true)
 		done := make(chan error, 1)
 		go func() { done <- e.client.Wait() }()
 		select {
@@ -163,7 +146,7 @@ func TestRelaySetLivenessDeadTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := relayConfig(0)
 		c.Liveness.ProbeInterval = time.Second
-		e := newMemRelayEnv(t, c, relayConfig(0), zmuxtest.RelayOptions{}, true)
+		e := newMemRelayEnv(t, c, relayConfig(0), true)
 		if err := e.client.SetLiveness(zmux.Liveness{ProbeInterval: time.Second, DeadTimeout: time.Second}); err != nil {
 			t.Fatal(err)
 		}

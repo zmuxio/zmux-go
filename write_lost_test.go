@@ -15,8 +15,8 @@ import (
 // that are still on their way in.
 type gatedCarrier struct {
 	c      net.Conn
-	armed  atomic.Bool
 	failed chan struct{}
+	armed  atomic.Bool
 	once   atomic.Bool
 }
 

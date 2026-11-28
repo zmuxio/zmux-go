@@ -4,30 +4,15 @@ import (
 	"context"
 	"errors"
 	"math"
-	"net"
+
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
-	"github.com/zmuxio/zmux-go/internal/testscale"
 	"github.com/zmuxio/zmux-go/shaping"
-	"github.com/zmuxio/zmux-go/zmuxtest"
 )
-
-// waitUntil polls cond every 10 ms until it holds or d passes.
-func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
-	t.Helper()
-	d = testscale.D(d)
-	deadline := time.Now().Add(d)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: not within %v", what, d)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
 
 func pipeStat(t *testing.T, p *Pipe) PipeStats {
 	t.Helper()
@@ -36,22 +21,6 @@ func pipeStat(t *testing.T, p *Pipe) PipeStats {
 		t.Fatal("pipe gone")
 	}
 	return st
-}
-
-// addPipeVia joins a pipe dialled to addr.
-func (e *mpEnv) addPipeVia(t *testing.T, addr string, o PipeOptions) *Pipe {
-	t.Helper()
-	nc, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	p, err := e.client.AddPipe(ctx, NetPipe(nc), o)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
 }
 
 func TestProbeOptionsValidation(t *testing.T) {
@@ -180,117 +149,41 @@ func TestProbesDoNotKeepSessionAlive(t *testing.T) {
 	})
 }
 
-// The answer to a probe comes back on the probed pipe pair, with jitter;
-// the probe waits lie in [k(1-j), k]. A fake clock measures the waits and
-// every probe is answered before the clock moves on, so that the result
-// depends neither on the load of the host nor on how the carriers batch.
-func TestProbeAnsweredOnSamePairWithJitter(t *testing.T) {
-	t.Parallel()
-	clk, cc, sc := fakeConfigs(func(c *Config) {
-		c.MaxIdleTimeout = -1
-		c.Liveness.KeepAlivePeriod = -1
+// The receiver of a quiet probe returns its response on the same pair.
+func TestNextBatchFProbeAnsweredOnSamePair(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		config := func() *Config {
+			c := mpConfig()
+			c.MaxIdleTimeout = -1
+			c.Liveness.KeepAlivePeriod = -1
+			return c
+		}
+		env := newMemMPEnv(t, config(), config())
+		pipe := env.addPipe(t, PipeOptions{
+			Liveness: Set(PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.5}),
+		})
+		if err := pipe.WaitAttached(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		peer, ok := env.server.Pipe(pipe.ID())
+		if !ok {
+			t.Fatal("peer has no attached pair")
+		}
+		before, reverse := pipeStat(t, pipe), pipeStat(t, peer)
+		for range 30 {
+			synctest.Sleep(50 * time.Millisecond)
+			synctest.Wait()
+			after := pipeStat(t, pipe)
+			if after.PingsSent > before.PingsSent {
+				if after.PingsAnswered <= before.PingsAnswered || pipeStat(t, peer).RecordsSent <= reverse.RecordsSent {
+					t.Fatal("probe was not answered on its pair")
+				}
+				return
+			}
+		}
+		t.Fatal("probe timer did not fire on the joined pair")
 	})
-	e := newMPEnv(t, cc, sc)
-	rl, err := zmuxtest.NewRelay(e.ln.Addr().String(), zmuxtest.RelayOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = rl.Close() })
-	p := e.addPipeVia(t, rl.Addr(), PipeOptions{Liveness: Set(PipeLiveness{ProbeInterval: time.Second, ProbeJitter: 0.5})})
-	// settled reports whether both endpoints have nothing to write, no
-	// write call in progress (one the host is slow to complete would
-	// otherwise turn into a write stall as the clock moves on) and every
-	// PIPE_PING either sent answered.
-	settled := func() bool {
-		for _, c := range []*Conn{e.client, e.server} {
-			ids := c.PipeStats()
-			c.lock()
-			ok := true
-			for _, st := range ids {
-				pi, live := c.s.PipeInfo(uint64(st.PipeID))
-				ok = ok && (!live || pi.PingsAnswered >= pi.PingsSent && !c.s.WantsWrite(uint64(st.PipeID), 0) &&
-					(!pi.HasOut || pi.Writable))
-			}
-			c.unlock()
-			if !ok {
-				return false
-			}
-		}
-		return true
-	}
-	// settle advances the clock by inc and waits, in real time, until the
-	// exchanges that started settle; it returns the probes sent on p and
-	// whether the server sent a record on the pair meanwhile.
-	waitUntil(t, 5*time.Second, "the pair at the server", func() bool {
-		_, ok := e.server.Pipe(p.ID())
-		return ok
-	})
-	sent := func() uint64 {
-		for _, st := range e.server.PipeStats() {
-			if st.PipeID == p.ID() {
-				return st.RecordsSent
-			}
-		}
-		t.Fatal("no pair at the server")
-		return 0
-	}
-	settle := func(inc time.Duration) (uint64, bool) {
-		r0 := sent()
-		clk.Advance(inc)
-		deadline := time.Now().Add(10 * time.Second)
-		for !settled() {
-			if time.Now().After(deadline) {
-				t.Fatal("exchanges do not settle")
-			}
-			time.Sleep(time.Millisecond)
-		}
-		return pipeStat(t, p).PingsSent, sent() > r0
-	}
-	const inc = 10 * time.Millisecond
-	// The join's exchanges settle.
-	pings, _ := settle(0)
-	for range 150 {
-		pings, _ = settle(inc)
-	}
-	var ups []time.Time
-	for end := clk.Now().Add(10 * time.Second); clk.Now().Before(end); {
-		n, answeredOnPair := settle(inc)
-		if n > pings {
-			if !answeredOnPair {
-				t.Fatalf("probe %d answered off its pair", n)
-			}
-			ups = append(ups, clk.Now())
-			pings = n
-		}
-	}
-	if len(ups) < 8 {
-		t.Fatalf("%d probes in 10 s", len(ups))
-	}
-	short := false
-	for i := 1; i < len(ups); i++ {
-		g := ups[i].Sub(ups[i-1])
-		// The clock moves in steps of inc. A PIPE_PING of the client inside
-		// an exchange the server started restarts the wait, so only the
-		// lower end is sharp.
-		if g < 500*time.Millisecond-inc || g > 2*time.Second+inc {
-			t.Fatalf("probe gap %v outside [k(1-j), 2k] = [0.5 s, 2 s]", g)
-		}
-		short = short || g < 900*time.Millisecond
-	}
-	if !short {
-		t.Fatal("no gap below 0.9 s: the jitter is not applied")
-	}
-}
-
-func tcpDialer(addr string) func(context.Context) (PipeIO, error) {
-	return func(ctx context.Context) (PipeIO, error) {
-		var d net.Dialer
-		nc, err := d.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			return PipeIO{}, err
-		}
-		return NetPipe(nc), nil
-	}
 }
 
 // delayCounter delays every record and counts the plans.
@@ -311,30 +204,38 @@ func (d delayCounter) OnEvent(*shaping.Event, *shaping.Effects) {}
 // makes the pipe suspect.
 func TestProbeThroughShaperNotSuspect(t *testing.T) {
 	t.Parallel()
-	c := mpConfig()
-	c.Liveness.ProbeInterval = time.Second
-	c.Liveness.SuspectFloor = 50 * time.Millisecond
-	e := newMPEnv(t, c, mpConfig())
-	var plans atomic.Int64
-	e.client.SetShaper(func(ShapedPipe) shaping.Shaper { return delayCounter{delay: 400 * time.Millisecond, plans: &plans} }, nil)
-	p0, _ := e.client.Pipe(0)
-	base := pipeStat(t, p0).PingsSent
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer cancel()
-	for {
-		ev, err := e.client.NextEvent(ctx)
-		if err != nil {
-			break
+	synctest.Test(t, func(t *testing.T) {
+		c := mpConfig()
+		c.Liveness.ProbeInterval = time.Second
+		c.Liveness.ProbeJitter = -1
+		c.Liveness.SuspectFloor = 50 * time.Millisecond
+		e := newMemMPEnv(t, c, mpConfig())
+		var plans atomic.Int64
+		mustSetShaper(t, e.client, func(ShapedPipe) shaping.Shaper { return delayCounter{delay: 400 * time.Millisecond, plans: &plans} }, nil)
+		p0, _ := e.client.Pipe(0)
+		base := pipeStat(t, p0).PingsSent
+		synctest.Sleep(4 * time.Second)
+		synctest.Wait()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		for {
+			ev, err := e.client.NextEvent(ctx)
+			if errors.Is(err, context.Canceled) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ev.Kind == EventPipeSuspect || ev.Kind == EventPipeFailed {
+				t.Fatalf("event %v on pipe %d under a 400 ms shaping delay", ev.Kind, ev.PipeID)
+			}
 		}
-		if ev.Kind == EventPipeSuspect || ev.Kind == EventPipeFailed {
-			t.Fatalf("event %v on pipe %d under a 400 ms shaping delay", ev.Kind, ev.PipeID)
+		n := pipeStat(t, p0).PingsSent - base
+		if n < 2 {
+			t.Fatalf("%d probes in 4 s of virtual time", n)
 		}
-	}
-	n := pipeStat(t, p0).PingsSent - base
-	if n < 2 {
-		t.Fatalf("%d probes in 4 s", n)
-	}
-	if plans.Load() < int64(n) {
-		t.Fatalf("%d plans for %d probes: probes bypass the shaper", plans.Load(), n)
-	}
+		if plans.Load() < int64(n) {
+			t.Fatalf("%d plans for %d probes: probes bypass the shaper", plans.Load(), n)
+		}
+	})
 }

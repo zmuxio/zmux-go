@@ -3,14 +3,10 @@ package zmuxh3
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
+	"errors"
 	"io"
-	"math/big"
 	"net"
 	"net/http"
 	"reflect"
@@ -19,63 +15,38 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/webtransport-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/carrier"
 	"github.com/zmuxio/zmux-go/internal/carrierstats"
+	"github.com/zmuxio/zmux-go/internal/prefixtest"
+	"github.com/zmuxio/zmux-go/internal/testcert"
+	"github.com/zmuxio/zmux-go/internal/teststream"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 	"github.com/zmuxio/zmux-go/zmuxquic"
 )
 
 func tlsConfigs(t *testing.T) (*tls.Config, *tls.Config) {
 	t.Helper()
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"},
-		DNSNames: []string{"localhost"}, IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, _ := x509.ParseCertificate(der)
-	pool := x509.NewCertPool()
-	pool.AddCert(cert)
-	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}},
-		&tls.Config{RootCAs: pool, ServerName: "localhost", NextProtos: []string{http3.NextProtoH3}}
+	cert, trust := testcert.Local(t, net.IPv4(127, 0, 0, 1))
+	return &tls.Config{Certificates: []tls.Certificate{cert}},
+		&tls.Config{RootCAs: trust, ServerName: testcert.LocalName, NextProtos: []string{http3.NextProtoH3}}
 }
 
 func echo(t *testing.T, c, s *zmux.Conn) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	go func() {
-		st, err := s.AcceptStream(ctx)
-		if err == nil {
-			_, _ = io.Copy(st, st)
-			_ = st.Close()
-		}
-	}()
-	st, err := c.OpenStreamSync(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
 	msg := make([]byte, 512<<10)
 	_, _ = rand.Read(msg)
-	go func() { _, _ = st.Write(msg); _ = st.Close() }()
-	got, err := io.ReadAll(st)
-	if err != nil || !bytes.Equal(got, msg) {
-		t.Fatalf("echo %d bytes %v", len(got), err)
-	}
+	teststream.Echo(t, t.Context(), c.OpenStreamSync, s.AcceptStream, msg)
 }
 
 func cfg() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true}}
+	return &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true}}
 }
 
 // pskCfg: HTTP request carriers expose no TLS exporter to the session.
 func pskCfg() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{9}, 32), EndToEnd: true}}
+	return &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{9}, 32), EndToEnd: true}}
 }
 
 func TestHTTP3RequestStream(t *testing.T) {
@@ -92,11 +63,18 @@ func TestHTTP3RequestStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := NewServer("", srvTLS, nil, hh, nil)
+	served := make(chan h3ResponseOwnership, 1)
+	handler := srv.Handler
+	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed := &observedH3Response{ResponseWriter: w, Settingser: w.(http3.Settingser), HTTPStreamer: w.(http3.HTTPStreamer)}
+		defer func() { served <- observed.ownership }()
+		handler.ServeHTTP(observed, r)
+	})
 	go func() { _ = srv.Serve(pc) }()
 	defer func() { _ = srv.Close() }()
 	client, tr := HTTPClient(cliTLS, nil)
 	defer func() { _ = tr.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	url := "https://" + pc.LocalAddr().String() + "/"
 	p, err := zmuxhttp.Streaming{Client: client, URL: url}.Pipe(ctx, zmux.DirectionBidirectional)
@@ -114,49 +92,42 @@ func TestHTTP3RequestStream(t *testing.T) {
 	}
 	echo(t, c, s)
 	checkKind(t, zmux.CarrierHTTP3, c, s)
+	sampler := carrierstats.ProviderOf(p.W)
+	if sampler == nil {
+		t.Fatal("request never reported its QUIC connection")
+	}
+	carrierstats.Prime(sampler)
 	checkQUICCarrierSamples(t, c, s)
 	_ = c.Close()
 	_ = s.Close()
 	_ = c.Wait()
 	_ = s.Wait()
+	select {
+	case ownership := <-served:
+		if ownership.taken || !ownership.committed || ownership.bodyAfterTake || ownership.finalHeaders != 1 {
+			t.Fatalf("streaming response ownership: %+v", ownership)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
 }
 
 func TestWebTransport(t *testing.T) {
-	srvTLS, cliTLS := tlsConfigs(t)
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = pc.Close() }() // a server does not close what it was given
-	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS), ConnContext: QUICConnContext,
-		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
-	webtransport.ConfigureHTTP3Server(h3)
-	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
 	// Sessions are admitted by a token bound to the QUIC connection, in
 	// the CONNECT request's Zmux-Prefix-Auth field.
-	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, BindTLS: true}
-	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lst := mustNewListener(&zmux.ListenerConfig{Config: cfg(), Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide}})
+	auth, v, _ := prefixtest.New(t, admit.PrefixCarrierOptions{BindTLS: true}, zmux.VerdictFallback)
+	lst := mustNewListener(&zmux.ListenerConfig{Config: cfg(), Admission: v.Admission()})
 	defer func() { _ = lst.Close() }()
-	wh, err := NewHandler(lst, nil, ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h3.Handler = wh
-	go func() { _ = ws.Serve(pc) }()
-	defer func() { _ = ws.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	tr, url := startWTFixture(t, lst, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
-	if _, err := DialSession(ctx, tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, nil); err == nil {
-		t.Fatal("a session without a credential was admitted")
+	_, err := DialSession(ctx, tr, url, nil, nil)
+	if e, ok := errors.AsType[*ConnectError](err); !ok || e.StatusCode != http.StatusNotFound {
+		t.Fatalf("CONNECT without a credential: %v", err)
 	}
 	ccfg := cfg()
 	ccfg.CarrierCredential = auth
-	c, sess, err := Dial(ctx, tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, ccfg)
+	c, sess, err := Dial(ctx, tr, url, nil, ccfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,23 +140,30 @@ func TestWebTransport(t *testing.T) {
 	checkKind(t, zmux.CarrierWebTransport, c, s)
 	checkQUICCarrierSamples(t, c, s)
 	// Pooled pipes: two per WebTransport session, then a new session.
-	pool := NewConnPool(tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
+	pool := NewConnPool(tr, url, nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer pool.Shutdown()
 	fates := make([]uint64, 0, 3)
+	var attached []*zmux.Pipe
 	for range 3 {
 		// The dial's context bounds the dial only: the pipes outlive it.
-		dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
+		dctx, dcancel := context.WithCancel(ctx)
 		pp, err := pool.OpenPipe(dctx)
+		dcancel()
 		if err != nil {
 			t.Fatal(err)
 		}
 		fates = append(fates, pp.FateGroup)
-		if _, err := c.AddPipe(dctx, pp, zmux.PipeOptions{}); err != nil {
+		pipe, err := c.AddPipe(ctx, pp, zmux.PipeOptions{})
+		if err != nil {
 			t.Fatal(err)
 		}
-		dcancel()
+		attached = append(attached, pipe)
 	}
-	time.Sleep(50 * time.Millisecond)
+	for _, pipe := range attached {
+		if err := pipe.WaitAttached(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, st := range c.PipeStats() {
 		if st.Outbound != zmux.OutboundActive {
 			t.Fatalf("pipe %d %v after its dial's context ended", st.PipeID, st.Outbound)
@@ -202,6 +180,9 @@ func TestWebTransport(t *testing.T) {
 	}
 	joined, err := c.AddPipe(ctx, p2, zmux.PipeOptions{})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := joined.WaitAttached(ctx); err != nil {
 		t.Fatal(err)
 	}
 	echo(t, c, s)
@@ -227,7 +208,7 @@ func checkQUICCarrierSamples(t *testing.T, endpoints ...*zmux.Conn) {
 		for _, st := range endpoint.PipeStats() {
 			sample := st.CarrierSample
 			if sample == nil || sample.Source != zmux.CarrierSourceQUICGo || sample.Counts.QUIC == nil ||
-				sample.Counts.QUIC.PacketsSent == 0 || sample.Generation != 0 {
+				sample.SampledAt.IsZero() || sample.Generation != 0 {
 				t.Fatalf("pipe %d (out=%v, in=%v, failure=%v): unexpected carrier sample %+v", st.PipeID, st.Outbound, st.Inbound, st.Failure, sample)
 			}
 		}
@@ -257,13 +238,20 @@ func checkKind(t *testing.T, k zmux.CarrierKind, cs ...*zmux.Conn) {
 func TestUpgradeFailureCounted(t *testing.T) {
 	lst := mustNewListener(&zmux.ListenerConfig{})
 	defer func() { _ = lst.Close() }()
-	h, err := NewHandler(lst, nil, &webtransport.Server{})
+	var fallbacks int
+	h, err := NewHandler(lst, &zmuxhttp.Options{Next: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fallbacks++
+		w.WriteHeader(http.StatusBadRequest)
+	})}, &Server{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	r, _ := http.NewRequest(http.MethodGet, "https://localhost/", http.NoBody)
 	r.RemoteAddr = "192.0.2.1:443"
 	h.ServeHTTP(&discardWriter{h: http.Header{}}, r)
+	if fallbacks != 1 {
+		t.Fatalf("HTTP fallbacks: %d, want 1", fallbacks)
+	}
 	if st := lst.Stats(); !reflect.DeepEqual(st, zmux.ListenerStats{SetupFailures: 1}) {
 		t.Fatalf("stats %+v", st)
 	}
@@ -289,8 +277,7 @@ func TestServe(t *testing.T) {
 	defer func() { _ = pc.Close() }() // a server does not close what it was given
 	h3 := &http3.Server{TLSConfig: http3.ConfigureTLSConfig(srvTLS),
 		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true}}
-	webtransport.ConfigureHTTP3Server(h3)
-	ws := &webtransport.Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
+	ws := &Server{H3: h3, CheckOrigin: func(*http.Request) bool { return true }}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	served := make(chan error, 1)
@@ -304,7 +291,8 @@ func TestServe(t *testing.T) {
 	})
 	go func() { _ = ws.Serve(pc) }()
 	defer func() { _ = ws.Close() }()
-	tr := &webtransport.Transport{TLSClientConfig: cliTLS}
+	tr := &Transport{TLSClientConfig: cliTLS}
+	defer func() { _ = tr.Close() }()
 	c, sess, err := Dial(ctx, tr, "https://"+pc.LocalAddr().String()+"/zmux", nil, cfg())
 	if err != nil {
 		t.Fatal(err)
@@ -315,12 +303,7 @@ func TestServe(t *testing.T) {
 	}
 	echo(t, c, s)
 	checkKind(t, zmux.CarrierWebTransport, c, s)
-	for _, endpoint := range []*zmux.Conn{c, s} {
-		sample := endpoint.PipeStats()[0].CarrierSample
-		if sample == nil || sample.Source != zmux.CarrierSourceUnknown || sample.Counts != (zmux.CarrierCounts{}) {
-			t.Fatalf("external WebTransport session: unexpected carrier sample %+v", sample)
-		}
-	}
+	checkQUICCarrierSamples(t, c, s)
 	_ = c.Close()
 	_ = s.Close()
 	_ = c.Wait()

@@ -3,16 +3,8 @@ package zmuxhttp
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/hex"
 	"io"
-	"math/big"
-	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -22,12 +14,13 @@ import (
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/internal/testscale"
+	"github.com/zmuxio/zmux-go/internal/testsession"
 )
 
 // Helpers of the root package's tests that these tests share.
 
 func mpConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true},
+	return &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true},
 		SchedulerParams: zmux.SchedulerParams{Probation: -1}}
 }
 
@@ -49,56 +42,6 @@ func waitDone(t testing.TB, c *zmux.Conn) {
 	case <-time.After(testscale.D(10 * time.Second)):
 		t.Fatal("session did not end")
 	}
-}
-
-// waitUntil polls cond every 10 ms until it holds or d passes.
-func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
-	t.Helper()
-	d = testscale.D(d)
-	deadline := time.Now().Add(d)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: not within %v", what, d)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// tlsWrapConfig is a session config whose join secret is pipe 0's TLS
-// exporter: a session starts only when both ends see the same TLS.
-func tlsWrapConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{Exporter: true, EndToEnd: true},
-		SchedulerParams: zmux.SchedulerParams{Probation: -1}}
-}
-
-// serverTLSWrap is a WrapPipe that runs a TLS server over every carrier.
-func serverTLSWrap(cfg *tls.Config) func(context.Context, zmux.PipeIO, zmux.PipeHint) (zmux.PipeIO, error) {
-	return func(ctx context.Context, p zmux.PipeIO, _ zmux.PipeHint) (zmux.PipeIO, error) {
-		tc := tls.Server(zmux.PipeConn(p), cfg)
-		if err := tc.HandshakeContext(ctx); err != nil {
-			_ = tc.Close()
-			return zmux.PipeIO{}, err
-		}
-		return zmux.NetPipe(tc), nil
-	}
-}
-
-// clientTLSWrap wraps a Candidate's carriers in TLS.
-func clientTLSWrap(c zmux.Candidate, cfg *tls.Config) zmux.Candidate {
-	dial := c.Dial
-	c.Dial = func(ctx context.Context, cred zmux.CarrierCredential) (zmux.PipeIO, error) {
-		p, err := dial(ctx, cred)
-		if err != nil {
-			return zmux.PipeIO{}, err
-		}
-		tc := tls.Client(zmux.PipeConn(p), cfg)
-		if err := tc.HandshakeContext(ctx); err != nil {
-			_ = tc.Close()
-			return zmux.PipeIO{}, err
-		}
-		return zmux.NetPipe(tc), nil
-	}
-	return c
 }
 
 // siteHandler is a host's own handler: every response it gives.
@@ -180,48 +123,10 @@ func classifyingAdmission(calls *sync.Map) *zmux.Admission {
 		}}
 }
 
-func selfSignedTLS(t testing.TB) (srv, cli *tls.Config) {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"},
-		DNSNames: []string{"localhost"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, _ := x509.ParseCertificate(der)
-	pool := x509.NewCertPool()
-	pool.AddCert(cert)
-	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}},
-		&tls.Config{RootCAs: pool, ServerName: "localhost"}
-}
-
 // firstRecord returns the bytes a client session sends first on a carrier.
 func firstRecord(t *testing.T) []byte {
 	t.Helper()
-	c, s := net.Pipe()
-	defer func() { _ = s.Close() }()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		conn, err := zmux.Start(ctx, zmux.NetPipe(c), zmux.RoleClient, mpConfig())
-		if err == nil {
-			defer func() { _ = conn.Close(); _ = conn.Wait() }()
-		}
-		<-ctx.Done()
-	}()
-	b := make([]byte, 4096)
-	_ = s.SetReadDeadline(time.Now().Add(5 * time.Second))
-	n, err := s.Read(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	_ = c.Close()
-	return b[:n]
+	return testsession.FirstRecord(t, mpConfig())
 }
 
 // eqAdm compares admission totals.
@@ -237,7 +142,7 @@ func decideWith(v zmux.AdmissionVerdict, n *atomic.Int32) *zmux.Admission {
 }
 
 func atkConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: atkPSK, EndToEnd: true}, ResumeTimeout: 60 * time.Second,
+	return &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{PSK: atkPSK, EndToEnd: true}, ResumeTimeout: 60 * time.Second,
 		HandshakeTimeout: 30 * time.Second, SchedulerParams: zmux.SchedulerParams{Probation: -1},
 		AllowRecordMode: func(zmux.RecordPolicyInput, zmux.RecordMode, any) bool { return true }}
 }

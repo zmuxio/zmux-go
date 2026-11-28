@@ -86,7 +86,11 @@ func TestServeConnDialled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.AddPipe(ctx, pio, zmux.PipeOptions{}); err != nil {
+	joined, err := c.AddPipe(ctx, pio, zmux.PipeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := joined.WaitAttached(ctx); err != nil {
 		t.Fatal(err)
 	}
 	echo(t, c, s, 1<<16)
@@ -174,55 +178,53 @@ func TestQUICFirstReservationEndsWithServeScope(t *testing.T) {
 	defer func() { _ = ln.Close() }()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = qc.CloseWithError(0, "") }()
-	peer, err := ln.Accept(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = peer.CloseWithError(0, "") }()
 	for _, end := range []string{"context", "listener", "deadline", "connection"} {
-		clk := timeshim.NewFake(time.Now())
-		l := mustNewListener(&zmux.ListenerConfig{MaxPending: 1, Config: &zmux.Config{Clock: clk, HandshakeTimeout: time.Second}})
-		setup, stop := context.WithCancel(ctx)
-		a, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		done := make(chan struct{})
-		go func() { defer close(done); serveArrival(setup, peer, a) }()
-		if err := clk.WaitDeadline(ctx, clk.Now().Add(time.Second)); err != nil {
-			t.Fatal(err)
-		}
-		switch end {
-		case "listener":
-			_ = l.Close()
-		case "deadline":
-			clk.Advance(time.Second)
-		case "connection":
-			_ = qc.CloseWithError(0, "")
-		default:
-			stop()
-		}
-		select {
-		case <-done:
-		case <-ctx.Done():
-			t.Fatal("accept loops outlived setup")
-		}
-		if end != "connection" && qc.Context().Err() != nil {
-			t.Fatal("accept stopped the connection")
-		}
-		if end != "listener" {
-			next, err := l.Adapter().Arrive(netip.AddrPort{}, netip.AddrPort{})
+		t.Run(end, func(t *testing.T) {
+			qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
 			if err != nil {
 				t.Fatal(err)
 			}
-			next.Release()
-		}
-		stop()
-		_ = l.Close()
+			defer func() { _ = qc.CloseWithError(0, "") }()
+			peer, err := ln.Accept(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = peer.CloseWithError(0, "") }()
+			clk := timeshim.NewFake(time.Now())
+			l := mustNewListener(&zmux.ListenerConfig{MaxPending: 1, Config: &zmux.Config{ClockDomain: zmux.NewClockDomain(clk), HandshakeTimeout: time.Second}})
+			setup, stop := context.WithCancel(ctx)
+			service, err := AdoptConn(setup, l, peer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := clk.WaitDeadline(ctx, clk.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			switch end {
+			case "listener":
+				_ = l.Close()
+			case "deadline":
+				clk.Advance(time.Second)
+			case "connection":
+				_ = qc.CloseWithError(0, "")
+			default:
+				stop()
+			}
+			if err := service.Wait(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if end != "connection" && qc.Context().Err() != nil {
+				t.Fatal("accept stopped the connection")
+			}
+			if end != "listener" {
+				next, err := l.Adapter().Arrive(netip.AddrPort{}, addrPort(peer.RemoteAddr()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				next.Release()
+			}
+			stop()
+			_ = l.Close()
+		})
 	}
 }

@@ -48,28 +48,31 @@ const pingStormLimit = 10 // per minute: 8 and the window's edges
 // about once a second.
 func TestShapingDelayKeepsAcknowledgementsInTime(t *testing.T) {
 	t.Parallel()
-	clk, cc, sc := fakeConfigs(pingStormConfig)
-	sc.Liveness.ProbeInterval = time.Hour
-	e := newMPEnv(t, cc, sc)
-	var plans atomic.Int64
-	shp := func(ShapedPipe) shaping.Shaper { return delayCounter{delay: 2 * time.Second, plans: &plans} }
-	e.client.SetShaper(shp, nil)
-	e.server.SetShaper(shp, nil)
-	const inc = 20 * time.Millisecond
-	step(clk, 20*time.Second, inc)
-	p0, _ := probeTraffic(e)
-	step(clk, time.Minute, inc)
-	p1, _ := probeTraffic(e)
-	if n := p1 - p0; n > pingStormLimit {
-		t.Fatalf("%d PIPE_PING in a minute of idle probing", n)
-	}
-	for _, c := range []*Conn{e.client, e.server} {
-		for _, st := range c.PipeStats() {
-			if st.Outbound != OutboundActive {
-				t.Fatalf("pipe %d %v under a 2 s shaping delay", st.PipeID, st.Outbound)
+	synctest.Test(t, func(t *testing.T) {
+		cc, sc := mpConfig(), mpConfig()
+		pingStormConfig(cc)
+		pingStormConfig(sc)
+		sc.Liveness.ProbeInterval = time.Hour
+		e := newMemMPEnv(t, cc, sc)
+		var plans atomic.Int64
+		shp := func(ShapedPipe) shaping.Shaper { return delayCounter{delay: 2 * time.Second, plans: &plans} }
+		mustSetShaper(t, e.client, shp, nil)
+		mustSetShaper(t, e.server, shp, nil)
+		time.Sleep(20 * time.Second)
+		p0, _ := probeTraffic(e)
+		time.Sleep(time.Minute)
+		p1, _ := probeTraffic(e)
+		if n := p1 - p0; n > pingStormLimit {
+			t.Fatalf("%d PIPE_PING in a minute of idle probing", n)
+		}
+		for _, c := range []*Conn{e.client, e.server} {
+			for _, st := range c.PipeStats() {
+				if st.Outbound != OutboundActive {
+					t.Fatalf("pipe %d %v under a 2 s shaping delay", st.PipeID, st.Outbound)
+				}
 			}
 		}
-	}
+	})
 }
 
 // A path with a 4 s round trip, above the T_suspect of the initial
@@ -87,7 +90,7 @@ func TestLongRoundTripLearnedDespiteSuspicion(t *testing.T) {
 		pingStormConfig(sc)
 		sc.Liveness.ProbeInterval = time.Hour
 		// The bubble's clock: the Windows default reads QueryPerformanceCounter.
-		cc.Clock, sc.Clock = timeshim.Real, timeshim.Real
+		cc.ClockDomain, sc.ClockDomain = NewClockDomain(timeshim.Real), NewClockDomain(timeshim.Real)
 		ln := netx.NewChanListener(nil, 0)
 		k := link{2 * time.Second, 1e9, 1 << 30}
 		// The first record arrives a round trip after the carrier: above

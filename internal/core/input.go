@@ -7,60 +7,110 @@ import (
 
 var tpTypeBytes = [8]byte{0xff, 0x51, 0x53, 0x30, 0x0d, 0x0a, 0x0d, 0x0a}
 
-// Receive processes the complete records at the start of data, read from an
-// inbound lane, and returns how many bytes it consumed; the caller keeps the
-// rest (a partial record) for the next call. buf owns data; pieces of stream
-// data may keep a reference to it.
-func (s *Session) Receive(pipe, lane uint64, buf *Buf, data []byte, now Time) int {
+// Receive processes complete byte-framed records and returns the number
+// of bytes consumed. The caller retains the unconsumed ranges.
+func (s *Session) Receive(pipe, lane uint64, input Input, now Time) int {
+	return s.ReceiveTracked(pipe, lane, input, now, nil)
+}
+
+// RecordValidation identifies the disposition of a complete framed record.
+type RecordValidation uint8
+
+const (
+	RecordUnclassified RecordValidation = iota
+	RecordValid
+	RecordProtocolInvalid
+)
+
+// RecordValidations holds the classifications made by the protocol owner.
+type RecordValidations struct {
+	Valid, ProtocolInvalid uint64
+}
+
+func (v *RecordValidations) add(result RecordValidation) {
+	switch result {
+	case RecordValid:
+		v.Valid++
+	case RecordProtocolInvalid:
+		v.ProtocolInvalid++
+	case RecordUnclassified:
+	}
+}
+
+// ReceiveTracked also observes its complete records when validation is enabled.
+func (s *Session) ReceiveTracked(pipe, lane uint64, input Input, now Time, validation *RecordValidations) int {
 	s.SetNow(now)
 	s.pickInput()
-	p := s.pipe(pipe)
-	if p == nil || p.in == nil {
-		return len(data)
-	}
-	if p.mp != nil && p.mp.hs {
-		return len(data) // nothing read before Proven reaches the session
-	}
-	il := p.in.lane(lane)
-	if il == nil || il.ended {
-		return len(data)
-	}
-	switch s.inputMode() {
-	case inputProcess:
-	case inputDrop:
-		return len(data)
-	case inputScan:
-		// Lingering: discard without processing, but look for the peer's
-		// CONNECTION_CLOSE on lane 0.
-		return s.lingerScan(p, il, data)
+	p, il := s.receiveLane(pipe, lane)
+	total := input.Len()
+	if il == nil {
+		return total
 	}
 	consumed := 0
-	for consumed < len(data) && s.inputMode() == inputProcess {
-		rest := data[consumed:]
-		if il.expectTP {
-			if e := s.checkFirstRecord(rest); e != nil {
+	for consumed < total {
+		mode := s.inputMode()
+		if mode == inputDrop || mode == inputScan && (lane != 0 || p.in.ccRead || il.noScan) {
+			return total
+		}
+		rest := input.Slice(consumed, total)
+		data := rest.Bytes()
+		if il.expectTP && mode == inputProcess {
+			if e := s.checkFirstRecord(data); e != nil {
+				if validation != nil {
+					size, n := data.Varint()
+					if n != 0 && size > 0 && size <= s.cfg.Local.MaxRecordSize && size <= uint64(data.Len()-n) {
+						validation.add(RecordProtocolInvalid)
+					}
+				}
 				s.failLocal(e)
-				return len(data)
+				return total
 			}
 		}
-		size, n := varint.ConsumeVarint(rest)
+		size, n := data.Varint()
 		if n == 0 {
 			break
 		}
 		limit := s.cfg.Local.MaxRecordSize
 		if size == 0 || size > limit {
-			s.failLocal(wire.NewError(wire.FrameEncodingError, "record size", "value", size, "limit", limit,
-				"pipe", pipe, "pos", il.pos))
-			return len(data)
+			if mode == inputScan {
+				il.noScan = true
+			} else {
+				s.failLocal(wire.NewError(wire.FrameEncodingError, "record size", "value", size, "limit", limit,
+					"pipe", pipe, "pos", il.pos))
+			}
+			return total
 		}
-		if uint64(len(rest)-n) < size {
+		if size > uint64(rest.Len()-n) {
 			break
 		}
-		rec := rest[n : n+int(size)]
-		consumed += n + int(size)
-		s.processRecord(p, il, buf, rec, uint64(n)+size)
+		end := n + int(size)
+		rec := rest.Slice(n, end)
+		consumed += end
+		if mode == inputScan {
+			if recordHasClose(rec.Bytes()) {
+				s.peerCloseRead(p)
+				return total
+			}
+		} else {
+			result := s.processRecord(p, il, rec, uint64(end))
+			if validation != nil {
+				validation.add(result)
+			}
+		}
 	}
 	return consumed
+}
+
+func (s *Session) receiveLane(pipe, lane uint64) (*Pipe, *inLane) {
+	p := s.pipe(pipe)
+	if p == nil || p.in == nil || p.mp != nil && p.mp.hs {
+		return nil, nil
+	}
+	il := p.in.lane(lane)
+	if il == nil || il.ended {
+		return nil, nil
+	}
+	return p, il
 }
 
 // inputMode is how input is taken now, the one rule of both entries
@@ -88,57 +138,52 @@ const (
 
 // ReceiveMessage processes one message of a message-framed carrier:
 // the message is one record's Frames field.
-func (s *Session) ReceiveMessage(pipe, lane uint64, buf *Buf, msg []byte, now Time) {
+func (s *Session) ReceiveMessage(pipe, lane uint64, input Span, now Time) RecordValidation {
 	s.SetNow(now)
-	p := s.pipe(pipe)
+	s.pickInput()
+	p, il := s.receiveLane(pipe, lane)
 	mode := s.inputMode()
-	if p == nil || p.in == nil || mode == inputDrop {
-		return
+	if il == nil || mode == inputDrop {
+		return RecordUnclassified
 	}
-	if p.mp != nil && p.mp.hs {
-		return // nothing read before Proven reaches the session
-	}
-	il := p.in.lane(lane)
-	if il == nil || il.ended {
-		return
-	}
+	msg := input.Bytes()
 	if mode == inputScan {
-		if lane == 0 && !p.in.ccRead && !il.noScan && recordHasClose(msg) {
+		if lane == 0 && !p.in.ccRead && !il.noScan && recordHasClose(wire.Parts{Head: msg}) {
 			s.peerCloseRead(p)
 		}
-		return
+		return RecordUnclassified
 	}
 	if uint64(len(msg)) > s.cfg.Local.MaxRecordSize {
 		s.failLocal(wire.ErrFrame("message above max_record_size"))
-		return
+		return RecordProtocolInvalid
 	}
-	if il.expectTP {
-		if len(msg) < 9 || [8]byte(msg[:8]) != tpTypeBytes {
-			s.failLocal(wire.ErrProto("first message is not QX_TRANSPORT_PARAMETERS"))
-			return
-		}
+	if il.expectTP && (len(msg) < 9 || [8]byte(msg[:8]) != tpTypeBytes) {
+		s.failLocal(wire.ErrProto("first message is not QX_TRANSPORT_PARAMETERS"))
+		return RecordProtocolInvalid
 	}
 	posBytes := uint64(varint.SizeVarint(uint64(len(msg))) + len(msg))
-	s.processRecord(p, il, buf, msg, posBytes)
+	return s.processRecord(p, il, Input{First: input}, posBytes)
 }
 
 // checkFirstRecord validates the prefix of the first record of a bootstrap
 // pipe byte by byte.
-func (s *Session) checkFirstRecord(b []byte) *wire.Error {
-	if len(b) == 0 {
-		return nil
+func (s *Session) checkFirstRecord(b wire.Parts) *wire.Error {
+	// Only the record Size and frame type are needed to classify it.
+	const prefixSize = 16
+	var scratch [prefixSize]byte
+	prefix := b.Head
+	if len(prefix) < prefixSize && len(prefix) < b.Len() {
+		prefix = b.Slice(0, min(prefixSize, b.Len())).AppendTo(scratch[:0])
 	}
-	size, n := varint.ConsumeVarint(b)
+	size, n, fits := wire.FirstRecordSize(prefix, s.cfg.Local.MaxRecordSize)
 	if n == 0 {
-		// Size incomplete: its first byte alone cannot reject except an
-		// impossible length class; wait.
 		return nil
 	}
-	if size < 9 || size > s.cfg.Local.MaxRecordSize {
+	if !fits {
 		return wire.NewError(wire.ProtocolViolation, "not a zmux or QMux peer", "value", size)
 	}
-	for i := 0; i < 8 && n+i < len(b); i++ {
-		if b[n+i] != tpTypeBytes[i] {
+	for i := 0; i < 8 && n+i < len(prefix); i++ {
+		if prefix[n+i] != tpTypeBytes[i] {
 			return wire.ErrProto("not a zmux or QMux peer")
 		}
 	}
@@ -157,15 +202,14 @@ type recordFacts struct {
 
 // processRecord applies every frame of one complete record, then counts it
 // into the lane's position.
-func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBytes uint64) {
+func (s *Session) processRecord(p *Pipe, il *inLane, rec Input, posBytes uint64) RecordValidation {
 	s.rxPipe = p
 	first := il.expectTP
-	size := len(rec)
 	facts := recordFacts{onlyPad: true}
 	var f wire.Frame
 	idx := 0
-	for len(rec) > 0 {
-		n, e := wire.DecodeFrame(rec, &f)
+	for rec.Len() > 0 {
+		n, e := wire.DecodeFrameParts(rec.Bytes(), &f)
 		if e == nil && f.Kind == wire.KindTransportParams && (!first || idx != 0) {
 			var tp wire.Params
 			if pe := wire.DecodeParams(f.Data, &tp); pe != nil {
@@ -177,51 +221,65 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 		if e != nil {
 			e.FrameType = f.Type
 			s.failLocal(e)
-			return
+			return RecordProtocolInvalid
 		}
 		if il.expectLane && idx == 0 {
 			if f.Kind != wire.KindPipeLane {
 				s.failLocal(wire.ErrProto("lane does not start with PIPE_LANE"))
-				return
+				return RecordProtocolInvalid
 			}
 			facts.onlyPad = false
 			facts.elicit, facts.other = true, true
-			rec = rec[n:]
+			rec = rec.Slice(n, rec.Len())
 			idx++
 			continue
 		}
 		if il.expectLane && f.Kind != wire.KindPadding {
 			s.failLocal(wire.ErrProto("a lane's first record holds a frame other than PIPE_LANE"))
-			return
+			return RecordProtocolInvalid
 		}
 		if first && idx == 0 {
 			if f.Kind != wire.KindTransportParams {
 				s.failLocal(wire.ErrProto("first frame is not QX_TRANSPORT_PARAMETERS"))
-				return
+				return RecordProtocolInvalid
 			}
 			var tp wire.Params
 			if pe := wire.DecodeParams(f.Data, &tp); pe != nil {
 				s.failLocal(pe)
-				return
+				return RecordProtocolInvalid
 			}
 			il.expectTP = false
 			if pe := s.processPeerParams(&tp); pe != nil {
 				s.failLocal(pe)
-				return
+				return RecordProtocolInvalid
 			}
 			facts.onlyPad = false
 			facts.elicit, facts.other = true, true
-			rec = rec[n:]
+			rec = rec.Slice(n, rec.Len())
 			idx++
 			continue
 		}
 		if !s.peerSeen {
 			s.failLocal(wire.ErrProto("frame before transport parameters"))
-			return
+			return RecordProtocolInvalid
+		}
+		if s.carrierEarlyIn {
+			switch f.Kind {
+			case wire.KindStream:
+				if s.peerZmux {
+					s.failLocal(wire.ErrProto("application data outside a plain QMux resumption context"))
+					return RecordProtocolInvalid
+				}
+			case wire.KindDatagram, wire.KindDatagramAck:
+				s.failLocal(wire.ErrProto("datagram in carrier early data"))
+				return RecordProtocolInvalid
+			default:
+				// Control frames retain their normal checks.
+			}
 		}
 		if ge := wire.CheckGate(&f, &s.gates); ge != nil {
 			s.failLocal(ge)
-			return
+			return RecordProtocolInvalid
 		}
 		if f.Kind != wire.KindPadding {
 			facts.onlyPad = false
@@ -240,14 +298,14 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 		case wire.KindPadding, wire.KindMaxData, wire.KindMaxStreamData, wire.KindMaxStreams,
 			wire.KindDataBlocked, wire.KindStreamDataBlocked, wire.KindStreamsBlocked, wire.KindClose,
 			wire.KindTransportParams, wire.KindGoAway, wire.KindPriorityUpdate,
-			wire.KindPipeAck, wire.KindPipeLane, wire.KindPipeAbandon, wire.KindPipeStatus, wire.KindSessionEpoch:
+			wire.KindPipeAck, wire.KindPipeLane, wire.KindPipeAbandon, wire.KindPipeStatus, wire.KindSessionEpoch, wire.KindDatagramAck:
 			// Neither activity nor a PIPE_PING.
 		}
 		if s.state >= StateClosing && (!s.closeFr.waitLanes || !closeWaitFrame(f.Kind)) {
 			// Closing: acknowledgements and the peer's close still matter
 			// (the close waits for no more once the peer's arrives).
 			if f.Kind == wire.KindPipeAck {
-				_ = s.ack.onPipeAck(&f, s.now)
+				_ = s.ack.onPipeAck(&f, s.now, p)
 			}
 			if f.Kind == wire.KindClose {
 				s.endLaneWait()
@@ -255,31 +313,33 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 					s.peerCloseRead(p)
 				}
 			}
-			rec = rec[n:]
+			rec = rec.Slice(n, rec.Len())
 			idx++
 			continue
 		}
-		if pe := s.dispatch(p, &f, buf); pe != nil {
-			s.failLocal(pe)
-			return
+		var payload Input
+		if (f.Kind == wire.KindStream || f.Kind == wire.KindDatagram) && f.DataLen() > 0 {
+			payload = rec.Slice(n-f.DataLen(), n)
 		}
-		rec = rec[n:]
+		if pe := s.dispatch(p, &f, payload); pe != nil {
+			s.failLocal(pe)
+			return RecordProtocolInvalid
+		}
+		rec = rec.Slice(n, rec.Len())
 		idx++
 	}
 	il.expectLane = false
 	il.pos += posBytes
 	il.recs++
 	if p.out == nil {
-		s.sawPeer(p) // an inbound-only attachment
+		s.observePeer(p, true) // A valid record confirms and proves an independent receive half.
 	}
 	il.posAt = s.now
 	s.stats.BytesReceived += posBytes
+	s.memberBytes(p, false, posBytes)
 	s.stats.RecordsReceived++
-	if s.shp != nil {
-		s.shapeRecordIn(p, il.lane, size, facts.onlyPad)
-	}
 	if s.ack != nil {
-		s.ack.onRecord(p, il, posBytes, facts, s.now)
+		s.ack.onRecord(p, posBytes, facts, s.now)
 	}
 	if facts.traffic {
 		p.lastTraffic = s.now
@@ -297,8 +357,9 @@ func (s *Session) processRecord(p *Pipe, il *inLane, buf *Buf, rec []byte, posBy
 		}
 	}
 	if !s.feat.Acked() || facts.activity {
-		s.timers.lastActivity = s.now
+		s.noteActivity(s.now)
 	}
+	return RecordValid
 }
 
 // closeWaitFrame reports a frame that is still applied while a graceful
@@ -313,19 +374,19 @@ func closeWaitFrame(k wire.Kind) bool {
 	case wire.KindPadding, wire.KindStream, wire.KindResetStream, wire.KindResetStreamAt,
 		wire.KindStopSending, wire.KindMaxStreams, wire.KindDataBlocked, wire.KindStreamDataBlocked,
 		wire.KindStreamsBlocked, wire.KindClose, wire.KindDatagram, wire.KindTransportParams,
-		wire.KindPing, wire.KindGoAway, wire.KindPriorityUpdate, wire.KindPipeLane, wire.KindSessionEpoch:
+		wire.KindPing, wire.KindGoAway, wire.KindPriorityUpdate, wire.KindPipeLane, wire.KindSessionEpoch, wire.KindDatagramAck:
 	}
 	return false
 }
 
 // dispatch applies one decoded frame.
-func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
+func (s *Session) dispatch(p *Pipe, f *wire.Frame, payload Input) *wire.Error {
 	switch f.Kind {
 	case wire.KindPadding, wire.KindTransportParams:
 		// Padding carries nothing; TRANSPORT_PARAMETERS is only the first
 		// frame of the first record, consumed before dispatch.
 	case wire.KindStream:
-		eff, e := s.onStream(f, buf)
+		eff, e := s.onStream(f, payload)
 		if e != nil {
 			return e
 		}
@@ -361,6 +422,7 @@ func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
 				s.conn.creditAt = s.now
 			}
 			s.conn.sendMax = f.Value
+			s.sched.releaseConnectionCredit()
 			s.wakeAllWriters()
 			s.wakeCapacityWaiters()
 		} else if !s.feat.Multipath {
@@ -442,7 +504,13 @@ func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
 	case wire.KindClose:
 		s.onClose(f)
 	case wire.KindDatagram:
-		return s.onDatagram(f, false)
+		var buf *Buf
+		if payload.First.Len() == len(f.Data) {
+			buf = payload.First.Buf
+		}
+		return s.onDatagram(p, f, buf, false)
+	case wire.KindDatagramAck:
+		s.onDatagramAck(&f.DatagramAck)
 	case wire.KindPing:
 		return s.onPing(f)
 	case wire.KindGoAway:
@@ -450,7 +518,7 @@ func (s *Session) dispatch(p *Pipe, f *wire.Frame, buf *Buf) *wire.Error {
 	case wire.KindPriorityUpdate:
 		return s.onPriorityUpdate(f)
 	case wire.KindPipeAck:
-		return s.ack.onPipeAck(f, s.now)
+		return s.ack.onPipeAck(f, s.now, p)
 	case wire.KindPipeLane:
 		return wire.ErrProto("PIPE_LANE out of place")
 	case wire.KindPipePing, wire.KindPipeAbandon, wire.KindPipeStatus:
@@ -488,45 +556,18 @@ func (s *Session) onClose(f *wire.Frame) {
 // is closing, and returns how many it consumed: whole records of lane 0
 // are looked through for the peer's CONNECTION_CLOSE (SPEC.md Section 6.5
 // step 3), the rest of a partial record is kept for the next call.
-func (s *Session) lingerScan(p *Pipe, il *inLane, data []byte) int {
-	if il.lane != 0 || p.in.ccRead || il.noScan {
-		return len(data)
-	}
-	consumed := 0
-	for {
-		rest := data[consumed:]
-		size, n := varint.ConsumeVarint(rest)
-		if n == 0 {
-			return consumed
-		}
-		if size == 0 || size > s.cfg.Local.MaxRecordSize {
-			il.noScan = true
-			return len(data)
-		}
-		if uint64(len(rest)-n) < size {
-			return consumed
-		}
-		consumed += n + int(size)
-		if recordHasClose(rest[n : n+int(size)]) {
-			s.peerCloseRead(p)
-			return len(data)
-		}
-	}
-}
-
-// recordHasClose reports whether the record holds a CONNECTION_CLOSE; a
-// record that does not decode holds none.
-func recordHasClose(rec []byte) bool {
+// recordHasClose reports whether a complete record decodes to a close.
+func recordHasClose(rec wire.Parts) bool {
 	var f wire.Frame
-	for len(rec) > 0 {
-		n, e := wire.DecodeFrame(rec, &f)
+	for rec.Len() > 0 {
+		n, e := wire.DecodeFrameParts(rec, &f)
 		if e != nil {
 			return false
 		}
 		if f.Kind == wire.KindClose {
 			return true
 		}
-		rec = rec[n:]
+		rec = rec.Slice(n, rec.Len())
 	}
 	return false
 }
@@ -544,7 +585,7 @@ func splitDetails(r string) (string, string) {
 // PipeEnded reports the end of an inbound lane: graceful (eof) or failed
 // with cause (the read error, if any). The driver calls it after feeding
 // every complete record it read.
-func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause error, now Time) {
+func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause error, fault *PhysicalFault, now Time) {
 	s.SetNow(now)
 	p := s.pipe(pipe)
 	if p == nil || p.in == nil {
@@ -555,6 +596,9 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause err
 		return
 	}
 	il.ended = true
+	if s.ack != nil {
+		s.ack.laneEnded(il)
+	}
 	// A lane that ends before its second record is no event.
 	early := il.lane > 0 && il.recs <= 1
 	allEnded := true
@@ -565,18 +609,22 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause err
 	}
 	if allEnded {
 		p.in.ended = true
+		s.cancelDatagramReports(p)
 	}
 	failed := (!graceful || partial) && !early
 	if s.feat.Multipath && s.transportLive() {
 		// While a close waits for coverage the pipe's loss reinjects
 		// what it carried, as before CLOSING.
 		if failed || allEnded {
-			s.mpInboundEnded(p, !failed, cause)
+			s.mpInboundEnded(p, !failed, cause, fault)
 		}
 		s.checkLingerDone()
 		return
 	}
 	if s.state >= StateClosing {
+		if allEnded {
+			s.closePipeIfDone(p)
+		}
 		s.checkLingerDone()
 		return
 	}
@@ -598,8 +646,10 @@ func (s *Session) PipeEnded(pipe, lane uint64, graceful, partial bool, cause err
 	s.closeWith(&SessionError{Kind: ClosePipesLost, Cause: cause}, nil)
 }
 
-// PipeWriteFailed reports a failed write on an outbound lane.
-func (s *Session) pipeWriteFailed(pipe, lane uint64, err error) {
+// PipeWriteFailed reports that the current outbound lane failed even if
+// it has no outstanding batch.
+func (s *Session) PipeWriteFailed(pipe, lane uint64, err error, fault *PhysicalFault, now Time) {
+	s.SetNow(now)
 	if p := s.pipe(pipe); s.shp != nil && lane == 0 && p != nil {
 		s.shapePipeDown(p)
 	}
@@ -621,7 +671,7 @@ func (s *Session) pipeWriteFailed(pipe, lane uint64, err error) {
 		}
 	}
 	if s.feat.Multipath {
-		s.mpOutboundFailed(pipe, err)
+		s.mpOutboundFailed(pipe, err, fault)
 		return
 	}
 	if p := s.pipe(pipe); lane == 0 && p != nil && p.out != nil && p.in != nil && !p.in.ended {

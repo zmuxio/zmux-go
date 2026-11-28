@@ -1,6 +1,11 @@
 package zmux
 
-import "github.com/zmuxio/zmux-go/shaping"
+import (
+	"fmt"
+	"net"
+
+	"github.com/zmuxio/zmux-go/shaping"
+)
 
 // ShapedPipe is the outbound pipe a ShaperFactory makes a Shaper for.
 type ShapedPipe struct {
@@ -43,41 +48,71 @@ func (c *Conn) variantLocked(id uint64) string {
 	return ""
 }
 
-// SetShaper installs f on every outbound pipe of the session, replacing
-// earlier instances; nil: no shaping. budget gives the configuration's budget,
-// called once here outside the lock; nil replaces an earlier budget with none, so
-// that only ShapingLimits apply. The account's spending carries over.
-func (c *Conn) SetShaper(f ShaperFactory, budget func() shaping.Budget) {
-	b := askBudget(c.cfg.Logger, budget)
-	c.lock()
-	defer c.unlock()
-	c.s.SetShapeBudget(b)
-	c.s.SetShaper(c.coreFactory(f))
+// ShapingPolicy selects all shaping behavior for one outbound direction.
+// Factory can select machines by carrier or pipe. Budget is drawn once per
+// installation outside the session lock.
+type ShapingPolicy struct {
+	Factory   ShaperFactory
+	Handshake shaping.HandshakeShaper
+	Budget    func() shaping.Budget
 }
 
-// SetPipeShaper installs s on one outbound pipe until the next SetShaper;
-// nil: the pipe is not shaped. It reports whether the pipe exists.
-func (c *Conn) SetPipeShaper(pipe PipeID, s shaping.Shaper) bool {
+// SetShaper replaces the entire direction policy. Nil disables it.
+func (c *Conn) SetShaper(policy *ShapingPolicy) error {
+	if c == nil {
+		return net.ErrClosed
+	}
+	b, err := policy.resolve(c.cfg.Logger)
+	if err != nil {
+		return err
+	}
+	var next ShapingPolicy
+	if policy != nil {
+		next = *policy
+	}
 	c.lock()
 	defer c.unlock()
-	return c.s.SetPipeShaper(uint64(pipe), s)
+	c.s.SetNow(c.clk.now())
+	if !c.s.ConfigureShaper(c.coreFactory(next.Factory), b) {
+		return fmt.Errorf("%w: invalid shaping policy", ErrInvalidConfig)
+	}
+	c.handshakeShaper = next.Handshake
+	c.invalidateHandshakePlans()
+	return nil
+}
+
+func (c *Conn) invalidateHandshakePlans() {
+	if c.handshakeChange != nil {
+		close(c.handshakeChange)
+		c.handshakeChange = nil
+	}
 }
 
 // SetShapingLimits replaces the session's Config.ShapingLimits, tighter or
 // looser; they are never sent. The account's spending carries over. An invalid
 // l fails with ErrInvalidConfig and changes nothing.
 func (c *Conn) SetShapingLimits(l shaping.Limits) error {
+	if c == nil {
+		return net.ErrClosed
+	}
 	if err := checkLimits(&l); err != nil {
 		return err
 	}
 	c.lock()
 	defer c.unlock()
-	c.s.SetShapeLimits(l)
+	c.s.SetNow(c.clk.now())
+	if !c.s.SetShapeLimits(l) {
+		return fmt.Errorf("%w: invalid shaping limits", ErrInvalidConfig)
+	}
+	c.invalidateHandshakePlans()
 	return nil
 }
 
 // ShapingLimits returns the session's shaping limits.
 func (c *Conn) ShapingLimits() shaping.Limits {
+	if c == nil {
+		return shaping.Limits{}
+	}
 	c.lock()
 	defer c.unlock()
 	return c.s.ShapeLimits()
@@ -85,14 +120,22 @@ func (c *Conn) ShapingLimits() shaping.Limits {
 
 // ShapingMeters returns the session's shaping readings.
 func (c *Conn) ShapingMeters() shaping.Meters {
+	if c == nil {
+		return shaping.Meters{}
+	}
 	c.lock()
 	defer c.unlock()
+	c.s.SetNow(c.clk.now())
 	return c.s.ShapeMeters()
 }
 
 // ShapingStats returns the shaping counters.
 func (c *Conn) ShapingStats() shaping.Stats {
+	if c == nil {
+		return shaping.Stats{}
+	}
 	c.lock()
 	defer c.unlock()
+	c.s.SetNow(c.clk.now())
 	return c.s.ShapingStats()
 }

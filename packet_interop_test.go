@@ -19,18 +19,21 @@ func TestInteropPackets(t *testing.T) {
 	for _, datagrams := range []bool{true, false} {
 		t.Run(fmt.Sprintf("datagrams=%v", datagrams), func(t *testing.T) {
 			p := startPeer(t, "server")
-			addr := p.expect(t, "LISTEN ")
+			addr := p.Expect(t, "LISTEN ")
 			nc, err := net.Dial("tcp", addr)
 			if err != nil {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
-			c, err := Client(ctx, nc, &Config{EnableDatagrams: datagrams})
+			c, err := Client(ctx, nc, &Config{EnableDatagrams: datagrams, DatagramQueueDelay: -1})
 			if err != nil {
 				t.Fatal(err)
 			}
-			p.expect(t, "ESTABLISHED")
+			p.Expect(t, "ESTABLISHED")
+			if got := c.ConnectionState().SupportsDatagrams; got.Local != datagrams || !got.Remote {
+				t.Fatalf("datagram negotiation: %+v", got)
+			}
 			interopPacketEcho(t, ctx, c, datagrams)
 			interopPacketStreamOnly(t, ctx, c)
 			interopPacketMalformed(t, ctx, c)
@@ -47,7 +50,7 @@ func TestInteropPackets(t *testing.T) {
 			if err := c.Wait(); !errors.As(err, &ae) || ae.ErrorCode != 42 {
 				t.Fatalf("close: %v", err)
 			}
-			p.expect(t, "CLOSED")
+			p.Expect(t, "CLOSED")
 		})
 	}
 }
@@ -93,69 +96,49 @@ func readPackets(t *testing.T, ctx context.Context, ps *PacketStream) []Packet {
 	}
 }
 
-// interopPacketEcho sends small packets (datagrams when the session has
-// them), and two above MaxDatagramPayload (capsules), with Context IDs 0
-// and 5. Capsules must all come back; datagrams at least one of them.
+// interopPacketEcho sends small datagrams and two packets above the datagram
+// bound. The peer echoes the small packets using the client's advertised
+// receive capability. An echo also synchronizes with each datagram handoff.
 func interopPacketEcho(t *testing.T, ctx context.Context, c *Conn, datagrams bool) { //nolint:thelper // scenario body, not a helper: failures point inside it
 	st, ps := openPacketStream(t, ctx, c, "packets", PacketPreferDatagram)
 	maxDgram := st.MaxDatagramPayload(5)
-	if datagrams && maxDgram <= 0 || !datagrams && maxDgram != 0 {
-		t.Fatalf("MaxDatagramPayload %d with datagrams %v", maxDgram, datagrams)
+	if maxDgram <= 0 {
+		t.Fatalf("peer's MaxDatagramPayload = %d", maxDgram)
 	}
 	large := maxDgram + 100
 	if large+16 > interopMaxPacket {
 		t.Fatalf("MaxDatagramPayload %d leaves no room for a capsule-only packet", maxDgram)
 	}
-	small, big := map[interopPacket]bool{}, map[interopPacket]bool{}
 	for i := range 8 {
 		k := interopPacket{cx: uint64(5 * (i % 2)), data: fmt.Sprintf("small-%d", i)}
-		small[k] = true
+		if err := ps.WritePacket(ctx, k.cx, []byte(k.data)); err != nil {
+			t.Fatal(err)
+		}
+		pk, err := ps.ReadPacket(ctx, nil)
+		if err != nil || pk.ContextID != k.cx || string(pk.Data) != k.data || pk.Datagram != datagrams {
+			t.Fatalf("small packet %d: %+v, %v", i, pk, err)
+		}
 	}
+	big := make([]interopPacket, 0, 2)
 	for i, cx := range []uint64{0, 5} {
-		b := bytes.Repeat([]byte{byte('A' + i)}, large+i)
-		big[interopPacket{cx: cx, data: string(b)}] = true
-	}
-	for k := range small {
+		k := interopPacket{cx: cx, data: string(bytes.Repeat([]byte{byte('A' + i)}, large+i))}
+		big = append(big, k)
 		if err := ps.WritePacket(ctx, k.cx, []byte(k.data)); err != nil {
 			t.Fatal(err)
 		}
-	}
-	for k := range big {
-		if err := ps.WritePacket(ctx, k.cx, []byte(k.data)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if s := ps.Stats(); s.SentCapsules < 2 || datagrams && s.SentDatagrams != 8 || !datagrams && s.SentCapsules != 10 {
-		t.Fatalf("sent: %+v", s)
 	}
 	_ = ps.Close()
-	var smallGot, smallDgram int
-	for _, pk := range readPackets(t, ctx, ps) {
-		k := interopPacket{cx: pk.ContextID, data: string(pk.Data)}
-		switch {
-		case big[k]:
-			if pk.Datagram {
-				t.Fatal("a packet above MaxDatagramPayload came back as a datagram")
-			}
-			delete(big, k)
-		case small[k]:
-			if pk.Datagram {
-				smallDgram++
-			}
-			if pk.Datagram && !datagrams {
-				t.Fatal("a datagram without datagrams")
-			}
-			delete(small, k)
-			smallGot++
-		default:
-			t.Fatalf("unexpected packet: context %d, %d bytes", pk.ContextID, len(pk.Data))
+	got := readPackets(t, ctx, ps)
+	if len(got) != len(big) {
+		t.Fatalf("received %d large packets, want %d", len(got), len(big))
+	}
+	for i, pk := range got {
+		if pk.Datagram || pk.ContextID != big[i].cx || string(pk.Data) != big[i].data {
+			t.Fatalf("large packet %d: context %d, %d bytes, datagram %t", i, pk.ContextID, len(pk.Data), pk.Datagram)
 		}
 	}
-	if len(big) != 0 {
-		t.Fatalf("%d capsule packets lost", len(big))
-	}
-	if !datagrams && smallGot != 8 || datagrams && smallDgram < 1 {
-		t.Fatalf("small packets: %d back, %d as datagrams", smallGot, smallDgram)
+	if s := ps.Stats(); s.SentCapsules != 2 || s.SentDatagrams != 8 {
+		t.Fatalf("sent after peer echo: %+v", s)
 	}
 }
 

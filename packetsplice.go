@@ -3,294 +3,249 @@ package zmux
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"net"
-	"runtime"
-	"sync"
 
+	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
-// SplicePackets forwards two packet streams (EXTENSIONS.md Section 12)
-// into each other like Splice, with the same ends, limiters, bounds and
-// result, keeping capsule boundaries: capsules are passed through as they
-// are, their values a chunk at a time without copying, so capsules of any
-// type, unknown ones included, reach the other side unchanged. A datagram
-// is forwarded as a datagram when it fits the other stream's
-// MaxDatagramPayload, and otherwise inserted between two capsules as a
-// DATAGRAM capsule (counted in DatagramsAsCapsules). Capsules are never
-// turned into datagrams: a packet sent reliably stays reliable. The
-// helper does not check the capsules it forwards; the receiving end does.
-// A ctx cancelled with a cause made by CancelCause ends both
-// streams in both directions with that code, as in Splice; a plain cancel
-// or a deadline resets with ZMUX_CANCELLED and stops with 0.
+// SplicePackets forwards two streams whose endpoints use packet mode.
+// It checks bounds and preserves capsule order and unknown types. Hooks
+// for reliable capsules see the complete value before any is forwarded.
+// Eligible stream datagrams can be converted to DATAGRAM capsules.
 func SplicePackets(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResult, error) {
-	if a == nil || b == nil {
-		return SpliceResult{}, net.ErrClosed
-	}
-	if a == b || a.h == b.h {
-		return SpliceResult{}, errSpliceSelf
-	}
-	defer runtime.KeepAlive(a)
-	defer runtime.KeepAlive(b)
-	var o SpliceOptions
-	if opts != nil {
-		o = *opts
-	}
-	if o.Chunk < 0 {
-		return SpliceResult{}, fmt.Errorf("%w: negative SpliceOptions.Chunk", ErrInvalidConfig)
-	}
-	if o.Chunk == 0 {
-		o.Chunk = 64 << 10
-	}
-	o.AtoB, o.BtoA = guardLimiter(o.AtoB), guardLimiter(o.BtoA) // host code on the splice's goroutines
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	toB, toA := newCapsuleGate(), newCapsuleGate()
-	var ab, ba, dab, dba SpliceDirection
-	var wg, dg sync.WaitGroup
-	wg.Go(func() { ab = splicePacketDir(ctx, a, b, o.Chunk, o.AtoB, toB) })
-	wg.Go(func() { ba = splicePacketDir(ctx, b, a, o.Chunk, o.BtoA, toA) })
-	if a.h.c.ConnectionState().SupportsDatagrams.Local {
-		dg.Go(func() { splicePacketDatagrams(ctx, a, b, o.AtoB, toB, &dab) })
-	}
-	if b.h.c.ConnectionState().SupportsDatagrams.Local {
-		dg.Go(func() { splicePacketDatagrams(ctx, b, a, o.BtoA, toA, &dba) })
-	}
-	wg.Wait()
-	cancel()
-	dg.Wait()
-	ab.mergeDatagrams(&dab)
-	ba.mergeDatagrams(&dba)
-	return SpliceResult{AtoB: ab, BtoA: ba}, nil
-}
-
-// capsuleGate serializes the writers of one direction's stream at capsule
-// boundaries: the capsule forwarder holds it from a capsule's first byte to
-// its last, a datagram written as a capsule holds it for that capsule.
-type capsuleGate struct {
-	ch     chan struct{}
-	closed bool // the stream was finished or ended (under the gate)
-}
-
-func newCapsuleGate() *capsuleGate { return &capsuleGate{ch: make(chan struct{}, 1)} }
-
-func (g *capsuleGate) lock(ctx context.Context) error {
-	select {
-	case g.ch <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (g *capsuleGate) unlock() { <-g.ch }
-
-// splicePacketDir forwards r's capsules to w.
-func splicePacketDir(ctx context.Context, r, w *Stream, chunk int, lim Limiter, g *capsuleGate) SpliceDirection {
-	var d SpliceDirection
-	var hdr [3 * 8]byte
-	for {
-		// Wait for the next capsule without holding the gate, so that
-		// datagrams can be inserted while the stream is idle.
-		_, _, werr, err := r.h.waitReadable(ctx, w.h)
-		if werr != nil {
-			spliceWriteErr(ctx, r, w, werr)
-			d.End = spliceEnd(ctx, werr, true)
-			return d
-		}
-		if err != nil {
-			spliceAbort(ctx, r, w, err)
-			d.End = spliceEnd(ctx, err, false)
-			return d
-		}
-		if err := g.lock(ctx); err != nil {
-			spliceAbort(ctx, r, w, err)
-			d.End = SpliceEnd{Kind: SpliceCancelled, Code: spliceAbortCode(ctx, err)}
-			return d
-		}
-		end, done := splicePacketCapsule(ctx, r, w, chunk, lim, &hdr, &d)
-		if end && !done {
-			_ = w.h.close()
-		}
-		if end || done {
-			g.closed = true
-		}
-		g.unlock()
-		if end || done {
-			return d
-		}
-	}
-}
-
-// splicePacketCapsule forwards one capsule: its header as it is, then its
-// value through spliceStep. The whole capsule is taken from lim with
-// Acquire(n, n) once its header is read, before any of it is forwarded,
-// and what is not forwarded is refunded. end reports r's FIN (also inside
-// the capsule: the bytes so far are forwarded and the receiver sees the
-// truncation); done that the direction ended otherwise.
-func splicePacketCapsule(ctx context.Context, r, w *Stream, chunk int, lim Limiter, hdr *[3 * 8]byte, d *SpliceDirection) (end, done bool) {
-	hn := 0
-	var length uint64
-	for {
-		need := capsuleHeaderNeed(hdr[:hn])
-		if need == 0 {
-			_, k1 := varint.ConsumeVarint(hdr[:hn])
-			length, _ = varint.ConsumeVarint(hdr[k1:hn])
-			break
-		}
-		ch, err := r.h.readChunk(ctx, need)
-		// A chunk carries the bytes read before an error, as io.Reader does.
-		//goland:noinspection GoDfaErrorMayBeNotNil
-		hn += copy(hdr[hn:], ch.Data)
-		ch.Release()
-		if errors.Is(err, io.EOF) {
-			// A truncated header: forwarded as it is, as a unit.
-			granted, ok := splicePacketAcquire(ctx, r, w, lim, uint64(hn), d)
-			if !ok {
-				return true, true
-			}
-			return true, !splicePacketWrite(ctx, r, w, lim, granted, hdr[:hn], d)
-		}
-		if err != nil {
-			spliceReadErr(ctx, r, w, err)
-			d.End = spliceEnd(ctx, err, false)
-			return false, true
-		}
-	}
-	// A Length beyond what a stream can carry is clamped: the limiter is
-	// asked for the whole unit, and the stream ends long before.
-	granted, ok := splicePacketAcquire(ctx, r, w, lim, uint64(hn)+min(length, 1<<62), d)
-	if !ok {
-		return false, true
-	}
-	if !splicePacketWrite(ctx, r, w, lim, granted, hdr[:hn], d) {
-		return false, true
-	}
-	granted = max(granted-int64(hn), 0)
-	for length > 0 {
-		m, eof, stop := spliceStep(ctx, r, w, chunk, nil, length, d)
-		granted = max(granted-int64(m), 0)
-		if stop || eof {
-			if lim != nil {
-				lim.Refund(granted) // the rest of the capsule never came
-			}
-			return eof, stop
-		}
-		length -= uint64(m)
-	}
-	return false, false
-}
-
-// splicePacketAcquire takes a capsule of n bytes from lim with
-// Acquire(n, n) and returns the grant; false when the direction ended.
-func splicePacketAcquire(ctx context.Context, r, w *Stream, lim Limiter, n uint64, d *SpliceDirection) (int64, bool) {
-	if lim == nil || n == 0 {
-		return 0, true
-	}
-	granted, err := lim.Acquire(ctx, int64(n), int64(n))
+	relay, err := startSplice(ctx, a, b, opts, true, false)
 	if err != nil {
-		d.End = spliceAcquireFailed(ctx, r, w, err)
-		return 0, false
+		return SpliceResult{}, err
 	}
-	return granted, true
+	return relay.Wait(context.Background())
 }
 
-// splicePacketWrite writes b (a capsule header) on w; false when the
-// direction ended, with the capsule's grant refunded.
-func splicePacketWrite(ctx context.Context, r, w *Stream, lim Limiter, granted int64, b []byte, d *SpliceDirection) bool {
-	if len(b) == 0 {
-		return true
-	}
-	if _, err := w.h.write(ctx, b); err != nil {
-		if lim != nil {
-			lim.Refund(granted)
+type spliceCapsule struct {
+	pins            map[*core.Buf]struct{}
+	parts           []spliceChunk
+	compact         []byte
+	staging         [1]spliceChunk
+	header          capsuleHeader
+	n               int
+	left            int
+	pos             int
+	backing         int
+	raw             [24]byte
+	parsed, collect bool
+	eof             bool
+}
+
+func (p *spliceCapsule) reset() {
+	releaseSpliceChunks(p.parts)
+	*p = spliceCapsule{}
+}
+
+// readCapsule consumes at most one fragment. The first fragment has
+// already reserved a position in the reliable sequence.
+func (d *spliceRelay) readCapsule(ctx context.Context, ready uint64, end bool) bool {
+	p, g := &d.capsule, d.current
+	if !p.parsed {
+		h, need, err := parseCapsuleHeader(p.raw[:p.n], d.sizes.packet, uint64(d.sizes.opaque))
+		switch {
+		case err != nil:
+			d.badCapsule(ctx, err)
+			return true
+		case need != 0:
+			if p.eof {
+				d.badCapsule(ctx, errCapsuleTruncated)
+				return true
+			}
+			ch, err := d.read(ctx, min(need, d.sizes.chunk), ready, end)
+			p.n += len(ch.Data)
+			n := len(ch.Data)
+			ch.Release()
+			if errors.Is(err, io.EOF) {
+				p.eof = true
+			} else if err != nil {
+				d.capsuleReadEnd(ctx, err)
+			}
+			return n > 0 || err != nil
 		}
-		spliceWriteErr(ctx, r, w, err)
-		d.End = spliceEnd(ctx, err, true)
-		return false
+		g.meta.Type, g.meta.ContextID = h.typ, h.cx
+		p.header, p.left, p.parsed = h, int(h.payload), true
+		if p.eof && p.left != 0 {
+			d.badCapsule(ctx, errCapsuleTruncated)
+			return true
+		}
+		if p.eof {
+			d.fin = true
+		}
+		g.raw = p.raw[:p.n]
+		g.sourceEnd = g.meta.Offset + uint64(h.n) + h.payload
+		if !p.collect {
+			p.staging[0] = spliceChunk{Data: p.raw[:p.n]}
+			d.directMember[0] = spliceMember{n: p.left, wire: p.n + p.left, parts: p.staging[:]}
+			g.parts = d.directMember[:]
+			g.streaming = true
+			d.currentReady = true
+			return true
+		}
 	}
-	d.Bytes += uint64(len(b))
+	if p.left > 0 {
+		ch, err := d.read(ctx, min(p.left, d.sizes.chunk), ready, end)
+		n := len(ch.Data)
+		if n > 0 {
+			p.left -= n
+			if p.collect {
+				if p.compact != nil {
+					p.pos += n
+				} else {
+					p.retain(ch)
+				}
+			} else {
+				p.staging[0] = ch
+				g.parts[0].parts = p.staging[:]
+			}
+		}
+		if errors.Is(err, io.EOF) && p.left == 0 {
+			d.fin = true
+		} else if err != nil {
+			d.capsuleReadEnd(ctx, err)
+			return true
+		}
+		if p.left != 0 || !p.collect {
+			return n > 0
+		}
+	}
+	if p.collect {
+		p.finish(g)
+		g.expiry = core.Never
+		d.currentReady = d.decide(ctx, g)
+		if !d.currentReady && d.current == g {
+			d.discard(g, nil)
+			d.capsule.reset()
+			d.current = nil
+		}
+	}
 	return true
 }
 
-// capsuleHeaderNeed returns the bytes still missing from the Type and
-// Length at the start of b (0: both complete).
-func capsuleHeaderNeed(b []byte) int {
-	_, i := varint.ConsumeVarint(b)
-	if i == 0 {
-		return varintNeed(b)
+func (p *spliceCapsule) retain(ch spliceChunk) {
+	if p.pins == nil {
+		p.pins = make(map[*core.Buf]struct{})
 	}
-	if _, k := varint.ConsumeVarint(b[i:]); k == 0 {
-		return varintNeed(b[i:])
+	if _, ok := p.pins[ch.buf]; !ok {
+		p.pins[ch.buf] = struct{}{}
+		p.backing += cap(ch.buf.B)
 	}
-	return 0
+	p.parts = append(p.parts, ch)
 }
 
-// splicePacketDatagrams forwards r's datagrams to w: as datagrams when
-// they fit, otherwise as DATAGRAM capsules at a capsule boundary of w.
-func splicePacketDatagrams(ctx context.Context, r, w *Stream, lim Limiter, g *capsuleGate, d *SpliceDirection) {
-	var hdr []byte
-	for {
-		cx, p, err := r.h.receiveDatagram(ctx)
-		if err != nil {
-			return
-		}
-		if len(p) <= w.MaxDatagramPayload(cx) {
-			switch spliceSendDatagram(w, d, lim, cx, p) {
-			case datagramSent:
-				continue
-			case datagramLimited:
-				d.DatagramsLimited++
-				d.DatagramsDropped++
-				continue
-			case datagramFailed:
-				d.DatagramsDropped++
-				continue
-			case datagramTooLarge:
-				// The bound shrank since it was read: send it as a capsule.
-			}
-		}
-		if len(p) > DefaultMaxPacket {
-			d.DatagramsTooLarge++ // larger than any packet a capsule carries
-			d.DatagramsDropped++
-			continue
-		}
-		var granted int64
-		if lim != nil {
-			var ok bool
-			if granted, ok = policeGuarded(lim, len(p)); !ok {
-				d.DatagramsLimited++
-				d.DatagramsDropped++
-				continue
-			}
-		}
-		if g.lock(ctx) != nil {
-			if lim != nil {
-				lim.Refund(granted)
-			}
-			d.DatagramsDropped++ // the splice ended before the capsule was written
-			return
-		}
-		ok := !g.closed
-		if ok {
-			hdr = appendCapsuleHeader(hdr[:0], cx, len(p))
-			_, err = w.h.write(ctx, hdr)
-			if err == nil {
-				_, err = w.h.write(ctx, p)
-			}
-			ok = err == nil
-		}
-		g.unlock()
-		if !ok {
-			if lim != nil {
-				lim.Refund(granted)
-			}
-			d.DatagramsDropped++ // the capsule could not be written
-			continue
-		}
-		d.DatagramsAsCapsules++
-		d.DatagramBytes += uint64(len(p))
+// compactPayload reserves the final buffer while every previous fragment
+// is still live. Subsequent ordinary reads land directly in this buffer.
+func (p *spliceCapsule) compactPayload(limit int) (int, error) {
+	if p.compact != nil {
+		return 0, nil
 	}
+	if int(p.header.payload) > limit-p.backing {
+		return 0, ErrSpliceBudget
+	}
+	p.compact = make([]byte, int(p.header.payload))
+	for _, previous := range p.parts {
+		p.pos += copy(p.compact[p.pos:], previous.Data)
+	}
+	releaseSpliceChunks(p.parts)
+	p.parts, p.pins = nil, nil
+	p.backing = cap(p.compact)
+	return p.pos, nil
+}
+
+func (p *spliceCapsule) finish(g *spliceGroup) {
+	if p.compact != nil {
+		p.parts = []spliceChunk{ownedSpliceChunk(p.compact)}
+		p.compact = nil
+	}
+	g.parts = []spliceMember{{parts: p.parts, n: int(p.header.payload)}}
+	p.parts, p.pins = nil, nil
+}
+
+func (d *spliceRelay) capsuleReadEnd(ctx context.Context, err error) {
+	if errors.Is(err, ErrSpliceBudget) {
+		d.result.Cause = err
+		d.end(ctx, SpliceEnd{Kind: SpliceHookFailed})
+		return
+	}
+	if errors.Is(err, io.EOF) {
+		d.badCapsule(ctx, errCapsuleTruncated)
+		return
+	}
+	d.readEnd(ctx, err)
+}
+
+func (d *spliceRelay) badCapsule(ctx context.Context, err error) {
+	d.result.Cause = err
+	d.resetAfterPrefix(ctx, SpliceEnd{Kind: SplicePacketError, Code: StreamPacketError})
+}
+
+func encodeSpliceCapsule(dst []byte, typ, cx uint64, n int) []byte {
+	if typ == capsuleDatagram {
+		return appendCapsuleHeader(dst, cx, n)
+	}
+	h := varint.AppendVarint(dst, typ)
+	return varint.AppendVarint(h, uint64(n))
+}
+
+func spliceCapsuleCost(g *spliceGroup, limits SpliceLimits) (total, backing int, err error) {
+	backing, segments := spliceGroupCost(g.parts)
+	if len(g.parts) > limits.OutputItems || segments > limits.Segments-len(g.parts) {
+		return 0, 0, ErrSpliceBudget
+	}
+	for _, m := range g.parts {
+		header := spliceCapsuleHeaderLen(g, m.n)
+		if header > limits.BackingBytes-backing || header > limits.OutputBytes-total || m.n > limits.OutputBytes-total-header {
+			return 0, 0, ErrSpliceBudget
+		}
+		backing += header
+		total += header + m.n
+	}
+	return total, backing, nil
+}
+
+func (d *spliceRelay) prepareCapsules(g *spliceGroup) error {
+	_, backing, err := spliceCapsuleCost(g, d.limits)
+	if err != nil {
+		return err
+	}
+	if g.queued && backing-g.backing > d.limits.QueueBytes-d.queuedBytes {
+		return errSpliceQueueFull
+	}
+	for i := range g.parts {
+		m := &g.parts[i]
+		h := g.raw
+		if h == nil {
+			h = encodeSpliceCapsule(make([]byte, 0, spliceCapsuleHeaderLen(g, m.n)), g.meta.Type, g.meta.ContextID, m.n)
+		}
+		m.wire = len(h) + m.n
+		if g.raw != nil {
+			saved := make([]byte, len(h))
+			copy(saved, h)
+			h = saved
+		}
+		header := ownedSpliceChunk(h)
+		m.parts = append([]spliceChunk{header}, m.parts...)
+		d.result.EncodeBytes += uint64(len(h))
+		if g.queued {
+			d.chargeRoot(header.buf)
+		}
+	}
+	g.encoded = true
+	g.backing = backing
+	return nil
+}
+
+func spliceCapsuleHeaderLen(g *spliceGroup, n int) int {
+	if g.raw != nil {
+		return len(g.raw)
+	}
+	contextSize := 0
+	if g.meta.Type == capsuleDatagram {
+		contextSize = varint.SizeVarint(g.meta.ContextID)
+	}
+	return varint.SizeVarint(g.meta.Type) + varint.SizeVarint(uint64(n+contextSize)) + contextSize
 }

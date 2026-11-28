@@ -7,108 +7,32 @@ package zmuxws_test
 // label EXPORTER-interop-app (16 bytes).
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/hex"
 	"io"
-	"math/big"
 	"net/http"
 	"os"
-	"os/exec"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/testcert"
+	"github.com/zmuxio/zmux-go/internal/testpeer"
 	"github.com/zmuxio/zmux-go/zmuxws"
 )
 
 const wssAppLabel = "EXPORTER-interop-app"
 
-type wssPeer struct {
-	lines chan string
-	held  []string
-}
-
-func startWSSPeer(t *testing.T, args ...string) *wssPeer {
+func startWSSPeer(t *testing.T, args ...string) *testpeer.Process {
 	t.Helper()
-	bin := os.Getenv("ZMUX_INTEROP_PEER")
-	if bin == "" {
-		t.Skip("ZMUX_INTEROP_PEER not set")
-	}
-	cmd := exec.Command(bin, args...)
-	cmd.Stderr = os.Stderr
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	p := &wssPeer{lines: make(chan string, 16)}
-	done := make(chan error, 1)
-	go func() {
-		sc := bufio.NewScanner(out)
-		for sc.Scan() {
-			p.lines <- sc.Text()
-		}
-		close(p.lines)
-		done <- cmd.Wait()
-	}()
-	t.Cleanup(func() {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("peer: %v", err)
-			}
-		case <-time.After(10 * time.Second):
-			_ = cmd.Process.Kill()
-			t.Error("peer did not exit")
-		}
-	})
-	return p
-}
-
-// expect consumes the first line with prefix, in whatever order the peer
-// printed it relative to its other reports: the peer prints some of them
-// from concurrent tasks ("KEYS" may come before "ESTABLISHED"), so a line
-// expect passes over is held for a later expect, never dropped. The root,
-// seal and zmuxws interop tests keep identical copies of this helper (the
-// submodules require a published root version, so they cannot share one).
-func (p *wssPeer) expect(t *testing.T, prefix string) string {
-	t.Helper()
-	for i, l := range p.held {
-		if rest, ok := strings.CutPrefix(l, prefix); ok {
-			p.held = append(p.held[:i], p.held[i+1:]...)
-			return strings.TrimSpace(rest)
-		}
-	}
-	deadline := time.After(15 * time.Second)
-	for {
-		select {
-		case l, ok := <-p.lines:
-			if !ok {
-				t.Fatalf("peer exited before %q (held %q)", prefix, p.held)
-			}
-			if rest, ok := strings.CutPrefix(l, prefix); ok {
-				return strings.TrimSpace(rest)
-			}
-			p.held = append(p.held, l)
-		case <-deadline:
-			t.Fatalf("peer: no %q (held %q)", prefix, p.held)
-		}
-	}
+	return testpeer.Start(t, testpeer.Command(t, "ZMUX_INTEROP_PEER", args...), true)
 }
 
 func wssConfig() *zmux.Config {
-	return &zmux.Config{EnableDatagrams: true, MaxPipes: 4,
+	return &zmux.Config{EnableDatagrams: true, SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}},
 		PipeAuth:        zmux.PipeAuth{Exporter: true, EndToEnd: true},
 		AllowRecordMode: func(zmux.RecordPolicyInput, zmux.RecordMode, any) bool { return true },
 		// A join on a carrier declared secure (a WebSocket on a TLS
@@ -123,35 +47,26 @@ func wssConfig() *zmux.Config {
 
 func wssCert(t *testing.T) *tls.Config {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "localhost"},
-		DNSNames: []string{"localhost"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-		MinVersion: tls.VersionTLS13, NextProtos: []string{"http/1.1"}}
+	cert, _ := testcert.Local(t)
+	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13, NextProtos: []string{"http/1.1"}}
 }
 
 // wssCheck compares the exporter values, waits for the join, echoes and
 // closes the session.
-func wssCheck(t *testing.T, ctx context.Context, c *zmux.Conn, p *wssPeer) {
+func wssCheck(t *testing.T, ctx context.Context, c *zmux.Conn, p *testpeer.Process) {
 	t.Helper()
 	got, err := c.ExportKeyingMaterial(wssAppLabel, nil, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if peer := p.expect(t, "KEYS "); peer != hex.EncodeToString(got) {
+	if peer := p.Expect(t, "KEYS "); peer != hex.EncodeToString(got) {
 		t.Fatalf("exporter values differ: peer %s, here %x", peer, got)
 	}
-	p.expect(t, "ESTABLISHED")
-	deadline := time.Now().Add(10 * time.Second)
-	for len(c.PipeStats()) < 2 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	p.Expect(t, "ESTABLISHED")
+	for len(c.PipeStats()) < 2 {
+		if _, err := c.NextEvent(ctx); err != nil {
+			t.Fatalf("the peer's joined pipe did not arrive: %v", err)
+		}
 	}
 	ps := c.PipeStats()
 	if len(ps) < 2 {
@@ -175,12 +90,12 @@ func wssCheck(t *testing.T, ctx context.Context, c *zmux.Conn, p *wssPeer) {
 		t.Fatalf("echo: %v", err)
 	}
 	_ = c.Close()
-	p.expect(t, "CLOSED")
+	p.Expect(t, "CLOSED")
 }
 
 func TestInteropWSSClient(t *testing.T) {
 	p := startWSSPeer(t, "wss-server")
-	addr := p.expect(t, "LISTEN ")
+	addr := p.Expect(t, "LISTEN ")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	o := &zmuxws.DialOptions{TLSConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}}
@@ -231,13 +146,3 @@ func TestInteropWSSServer(t *testing.T) {
 
 // The peer prints some reports from concurrent tasks; expect must hold the
 // line it passes over for the next expect.
-func TestInteropExpectOutOfOrder(t *testing.T) {
-	p := &wssPeer{lines: make(chan string, 4)}
-	p.lines <- "KEYS 00ff"
-	p.lines <- "ESTABLISHED"
-	close(p.lines)
-	p.expect(t, "ESTABLISHED")
-	if got := p.expect(t, "KEYS "); got != "00ff" {
-		t.Fatalf("KEYS %q", got)
-	}
-}

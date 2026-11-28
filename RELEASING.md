@@ -9,7 +9,7 @@ Create a local workspace from the repository root to build all modules
 against the checkout.
 
 ```bash
-go work init . ./zmuxquic ./zmuxh3 ./zmuxws ./seal ./examples/xorpipe ./interop/dgpeer ./interop/webpeer
+go work init . ./zmuxquic ./zmuxh3 ./zmuxws ./seal ./examples/xorpipe ./interop/webpeer
 ```
 
 CI creates its workspace in a temporary directory. The examples and

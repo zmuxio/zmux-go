@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/djylb/timeshim"
-	"github.com/quic-go/quic-go/http3"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/zmuxhttp"
 	"golang.org/x/net/http2"
@@ -58,12 +57,13 @@ func TestHTTP2UpgradeFallbackReadInterrupted(t *testing.T) {
 		protocols.SetUnencryptedHTTP2(true)
 		srv.Config.Protocols = &protocols
 		srv.Start()
-		nc, err := net.DialTimeout("tcp", srv.Listener.Addr().String(), time.Second)
+		nc, err := (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = nc.Close(); srv.Close(); _ = l.Close() })
-		_ = nc.SetDeadline(time.Now().Add(5 * time.Second))
+		deadline, _ := ctx.Deadline()
+		_ = nc.SetDeadline(deadline)
 		fr := http2.NewFramer(nc, nc)
 		if _, err = io.WriteString(nc, http2.ClientPreface); err != nil {
 			t.Fatal(err)
@@ -129,7 +129,7 @@ func TestStreamingTakeoverWriteInterrupt(t *testing.T) {
 					ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
 					defer cancel()
 					clk := timeshim.NewFake(time.Now())
-					l := mustNewListener(&zmux.ListenerConfig{Config: &zmux.Config{Clock: clk, HandshakeTimeout: time.Second}, MaxPending: 1,
+					l := mustNewListener(&zmux.ListenerConfig{Config: &zmux.Config{ClockDomain: zmux.NewClockDomain(clk), HandshakeTimeout: time.Second}, MaxPending: 1,
 						Admission: &zmux.Admission{Peek: 5, Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 							return zmux.Decision{Verdict: zmux.VerdictTakeover}
 						}},
@@ -176,7 +176,7 @@ func TestStreamingTakeoverWriteInterrupt(t *testing.T) {
 						srv := NewServer("", srvTLS, nil, handler, nil)
 						go func() { _ = srv.Serve(pc) }()
 						defer func() { _ = srv.Close() }()
-						var tr *http3.Transport
+						var tr *ClientTransport
 						client, tr = HTTPClient(cliTLS, nil)
 						defer func() { _ = tr.Close() }()
 						target = "https://" + pc.LocalAddr().String() + "/"

@@ -9,18 +9,24 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/djylb/timeshim"
+
+	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
+	"github.com/zmuxio/zmux-go/internal/wire"
 )
 
 // earlyLayer is a client carrier layer with a first flight: what is
-// written before the verdict is held, sent on acceptance and dropped on
+// written before the verdict is held and then dropped on
 // rejection, with whatever comes until RestartEarly (the server never sees
 // it), as a transform whose first message the server may refuse does.
 type earlyLayer struct {
 	net.Conn
 	verdict  chan bool
+	first    chan struct{}
 	held     [][]byte
 	state    int // 0 holding, 1 passing, 2 dropping
 	dropped  atomic.Int64
@@ -37,6 +43,9 @@ func (l *earlyLayer) Write(b []byte) (int, error) {
 	defer l.mu.Unlock()
 	switch l.state {
 	case 0:
+		if l.first != nil && len(l.held) == 0 {
+			close(l.first)
+		}
 		l.held = append(l.held, bytes.Clone(b))
 		return len(b), nil
 	case 2:
@@ -46,23 +55,16 @@ func (l *earlyLayer) Write(b []byte) (int, error) {
 	return l.Conn.Write(b)
 }
 
-// decide is the server's verdict on the first flight.
-func (l *earlyLayer) decide(accept bool) {
+// reject discards the flight and any writes before the restart.
+func (l *earlyLayer) reject() {
 	l.mu.Lock()
 	for _, b := range l.held {
-		if accept {
-			_, _ = l.Conn.Write(b)
-		} else {
-			l.dropped.Add(int64(len(b)))
-		}
+		l.dropped.Add(int64(len(b)))
 	}
 	l.held = nil
 	l.state = 2
-	if accept {
-		l.state = 1
-	}
 	l.mu.Unlock()
-	l.verdict <- accept
+	l.verdict <- false
 }
 
 func (l *earlyLayer) EarlyAccepted(ctx context.Context) (bool, error) {
@@ -85,284 +87,96 @@ func (l *earlyLayer) RestartEarly(context.Context) (PipeIO, error) {
 	return PipeIO{R: l.Conn, W: l}, nil
 }
 
-func earlyFloorConfig() *Config {
-	cfg := mpConfig()
-	cfg.EarlyData = EarlyData{ZmuxPeer: true, Replayable: true}
+func plainEarlyConfig() *Config {
+	cfg := &Config{}
+	params := plainEarlyParams()
+	block, err := wire.AppendParams(nil, &params)
+	if err != nil {
+		panic(err)
+	}
+	cfg.EarlyData = EarlyData{Remembered: block, PlainQMux: true, Replayable: true}
 	return cfg
 }
 
-// Floor early data waits for the carrier's verdict: accepted, the first
-// flight stands; rejected, nothing of it reached the peer, the pipe
-// restarts on what RestartEarly returned, and the early stream's data is
-// sent again from offset 0 after the parameters, without failing.
-func TestEarlyCarrierFloor(t *testing.T) {
-	for _, accept := range []bool{true, false} {
-		t.Run(map[bool]string{true: "accepted", false: "rejected"}[accept], func(t *testing.T) {
-			leakcheck.Check(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			a, b := net.Pipe()
-			layer := &earlyLayer{Conn: a, verdict: make(chan bool, 1)}
-			type res struct {
-				c   *Conn
-				err error
-			}
-			ch := make(chan res, 1)
-			c, err := Start(ctx, PipeIO{R: a, W: layer}, RoleClient, earlyFloorConfig())
-			if err != nil {
-				t.Fatal(err)
-			}
-			msg := []byte("early request")
-			st, err := c.OpenStream()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := st.Write(msg); err != nil {
-				t.Fatal(err)
-			}
-			_ = st.Close()
-			waitUntil(t, 5*time.Second, "the first flight", func() bool {
-				layer.mu.Lock()
-				defer layer.mu.Unlock()
-				return len(layer.held) > 0
-			})
-			// The server speaks only once the carrier decided, as one
-			// behind such a carrier does.
-			if !accept {
-				layer.decide(false)
-				waitUntil(t, 5*time.Second, "the restart", func() bool { return layer.restarts.Load() == 1 })
-			}
-			go func() {
-				s, err := startServerNoListener(ctx, NetPipe(b), mpConfig())
-				ch <- res{s, err}
-			}()
-			if accept {
-				go layer.decide(true)
-			}
-			r := <-ch
-			if r.err != nil {
-				t.Fatal(r.err)
-			}
-			s := r.c
-			defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
-			ss, err := s.AcceptStream(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := io.ReadAll(ss)
-			if err != nil || !bytes.Equal(got, msg) {
-				t.Fatalf("server read %q, %v", got, err)
-			}
-			if accept != (layer.restarts.Load() == 0) || accept != (layer.dropped.Load() == 0) {
-				t.Fatalf("restarts %d, dropped %d", layer.restarts.Load(), layer.dropped.Load())
-			}
-			echoOnce(t, ctx, c, s)
-		})
-	}
+func plainEarlyParams() wire.Params {
+	p := core.DefaultConfig().Local
+	p.Has &^= wire.HasAnyZmux
+	return p
 }
 
-// Floor early data on a carrier with early data needs the client's consent
-// to replay.
-func TestEarlyCarrierNeedsReplayable(t *testing.T) {
-	a, b := net.Pipe()
-	defer func() { _ = a.Close(); _ = b.Close() }()
-	cfg := mpConfig()
-	cfg.EarlyData = EarlyData{ZmuxPeer: true}
-	_, err := Start(context.Background(), PipeIO{R: a, W: &earlyLayer{Conn: a}}, RoleClient, cfg)
-	if !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("error %v", err)
-	}
-}
-
-// Floor early data and the carrier's own early data in each combination:
-// the verdict is awaited, and Replayable required, only when the carrier
-// sends early data this time; a carrier with the capability that sends
-// nothing early (QUIC without 0-RTT) behaves as one without it.
-func TestEarlyCarrierFloorCombinations(t *testing.T) {
-	for _, x := range []struct {
-		name               string
-		carrier            int // 0 none, 1 capable but not early, 2 early
-		replayable, refuse bool
-		waits              int32
-	}{
-		{"plain", 0, false, false, 0},
-		{"plain replayable", 0, true, false, 0},
-		{"not early", 1, false, false, 0},
-		{"not early replayable", 1, true, false, 0},
-		{"early", 2, false, true, 0},
-		{"early replayable", 2, true, false, 1},
-	} {
-		t.Run(x.name, func(t *testing.T) {
-			leakcheck.Check(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			a, b := net.Pipe()
-			cp := NetPipe(a)
-			var layer *earlyLayer
-			if x.carrier > 0 {
-				layer = &earlyLayer{Conn: a, verdict: make(chan bool, 1), late: x.carrier == 1}
-				if layer.late {
-					layer.state = 1
-				}
-				cp = PipeIO{R: a, W: layer}
-			}
-			cfg := mpConfig()
-			cfg.EarlyData = EarlyData{ZmuxPeer: true, Replayable: x.replayable}
-			c, err := Start(ctx, cp, RoleClient, cfg)
-			if x.refuse {
-				_ = a.Close()
-				_ = b.Close()
-				if !errors.Is(err, ErrInvalidConfig) {
-					t.Fatalf("error %v", err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			ch := make(chan *Conn, 1)
-			go func() {
-				s, err := startServerNoListener(ctx, NetPipe(b), mpConfig())
-				if err != nil {
-					t.Error(err)
-				}
-				ch <- s
-			}()
-			if layer != nil && !layer.late {
-				go layer.decide(true)
-			}
-			s := <-ch
-			if s == nil {
-				_ = c.Close()
-				return
-			}
-			defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
-			echoOnce(t, ctx, c, s)
-			if x.waits > 0 {
-				waitUntil(t, 5*time.Second, "the verdict", func() bool { return layer.waits.Load() == x.waits })
-			}
-			if layer != nil && (layer.waits.Load() != x.waits || layer.restarts.Load() != 0) {
-				t.Fatalf("waits %d, restarts %d", layer.waits.Load(), layer.restarts.Load())
-			}
-		})
-	}
-}
-
-// earlyServer is a server carrier that received early data.
-type earlyServer struct {
-	net.Conn
-	done chan struct{}
-}
-
-func (e *earlyServer) UsedEarlyData() bool                { return true }
-func (e *earlyServer) HandshakeComplete() <-chan struct{} { return e.done }
-
-// On a server with Replayable, streams opened before the carrier's
-// handshake completed are replayable, later ones are not.
-func TestEarlyServerReplayable(t *testing.T) {
-	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	a, b := net.Pipe()
-	es := &earlyServer{Conn: b, done: make(chan struct{})}
-	scfg := mpConfig()
-	scfg.EarlyData.Replayable = true
-	ch := make(chan *Conn, 1)
-	go func() {
-		s, err := startServerNoListener(ctx, PipeIO{R: b, W: es}, scfg)
-		if err != nil {
-			t.Error(err)
-		}
-		ch <- s
-	}()
-	c, err := Start(ctx, NetPipe(a), RoleClient, earlyFloorConfig())
+func startPlainServer(ctx context.Context, p PipeIO) (*Conn, error) {
+	cfg := &Config{}
+	cc, err := cfg.coreConfig(core.RoleResponder, core.RoleResponder)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	s := <-ch
-	if s == nil {
-		_ = c.Close()
-		return
-	}
-	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
-	open := func() *Stream {
-		st, err := c.OpenStream()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := st.Write([]byte("x")); err != nil {
-			t.Fatal(err)
-		}
-		ss, err := s.AcceptStream(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return ss
-	}
-	if !open().Replayable() {
-		t.Fatal("stream before the handshake is not replayable")
-	}
-	close(es.done)
-	waitUntil(t, 5*time.Second, "handshake done", func() bool { return !open().Replayable() })
+	cc.Local = plainEarlyParams()
+	return startCore(ctx, p, cfg, cc, nil, nil, nil, nil)
 }
 
 // A STOP_SENDING and a window update sent in rejected carrier early data
 // go again after the restart, behind the re-issued opening STREAM frame.
 func TestEarlyCarrierRejectedStop(t *testing.T) {
 	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	a, b := net.Pipe()
-	layer := &earlyLayer{Conn: a, verdict: make(chan bool, 1)}
-	c, err := Start(ctx, PipeIO{R: a, W: layer}, RoleClient, earlyFloorConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	msg := []byte("early request")
-	st, err := c.OpenStream()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.Write(msg); err != nil {
-		t.Fatal(err)
-	}
-	_ = st.Close()
-	waitUntil(t, 5*time.Second, "the first flight", func() bool {
-		layer.mu.Lock()
-		defer layer.mu.Unlock()
-		return len(layer.held) > 0
-	})
-	_ = st.SetReceiveWindow(1<<22, 1<<22)
-	st.CancelRead(5)
-	time.Sleep(20 * time.Millisecond) // let the frames join the held flight
-	layer.decide(false)
-	waitUntil(t, 5*time.Second, "the restart", func() bool { return layer.restarts.Load() == 1 })
-	ch := make(chan *Conn, 1)
-	go func() {
-		s, err := startServerNoListener(ctx, NetPipe(b), mpConfig())
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		a, b := net.Pipe()
+		layer := &earlyLayer{Conn: a, verdict: make(chan bool, 1)}
+		cfg := plainEarlyConfig()
+		cfg.ClockDomain = NewClockDomain(timeshim.Real)
+		c, err := Start(ctx, PipeIO{R: a, W: layer}, RoleClient, cfg)
 		if err != nil {
-			t.Error(err)
+			t.Fatal(err)
 		}
-		ch <- s
-	}()
-	s := <-ch
-	if s == nil {
-		_ = c.Close()
-		return
-	}
-	defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
-	ss, err := s.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, err := io.ReadAll(ss); err != nil || !bytes.Equal(got, msg) {
-		t.Fatalf("server read %q, %v", got, err)
-	}
-	waitUntil(t, 5*time.Second, "STOP_SENDING", func() bool {
-		_, err := ss.Write([]byte("x"))
-		return err != nil
+		msg := []byte("early request")
+		st, err := c.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		_ = st.Close()
+		synctest.Wait()
+		if len(layer.held) == 0 {
+			t.Fatal("the first flight was not handed to the carrier")
+		}
+		_ = st.SetReceiveWindow(1<<22, 1<<22)
+		st.CancelRead(5)
+		synctest.Wait() // let the frames join the held flight
+		layer.reject()
+		synctest.Wait()
+		if n := layer.restarts.Load(); n != 1 {
+			t.Fatalf("%d restarts, want 1", n)
+		}
+		ch := make(chan *Conn, 1)
+		go func() {
+			s, err := startPlainServer(ctx, NetPipe(b))
+			if err != nil {
+				t.Error(err)
+			}
+			ch <- s
+		}()
+		s := <-ch
+		if s == nil {
+			_ = c.Close()
+			return
+		}
+		defer func() { _ = c.Close(); _ = s.Close(); waitDone(t, c); waitDone(t, s) }()
+		ss, err := s.AcceptStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := io.ReadAll(ss); err != nil || !bytes.Equal(got, msg) {
+			t.Fatalf("server read %q, %v", got, err)
+		}
+		var stop *StreamError
+		if err := waitStreamStop(ctx, ss); !errors.As(err, &stop) || !stop.Remote || stop.ErrorCode != 5 {
+			t.Fatalf("STOP_SENDING: %v", err)
+		}
+		echoOnce(t, ctx, c, s)
 	})
-	echoOnce(t, ctx, c, s)
 }
 
 // failingRestart is an earlyLayer whose RestartEarly fails, the carrier
@@ -394,8 +208,8 @@ func TestEarlyCarrierRestartFailsClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	a, b := net.Pipe()
-	layer := failingRestart{&earlyLayer{Conn: a, verdict: make(chan bool, 1)}}
-	c, err := Start(ctx, PipeIO{R: a, W: layer}, RoleClient, earlyFloorConfig())
+	layer := failingRestart{&earlyLayer{Conn: a, verdict: make(chan bool, 1), first: make(chan struct{})}}
+	c, err := Start(ctx, PipeIO{R: a, W: layer}, RoleClient, plainEarlyConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,21 +220,17 @@ func TestEarlyCarrierRestartFailsClose(t *testing.T) {
 	if _, err := st.Write([]byte("early")); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, 5*time.Second, "the first flight", func() bool {
-		layer.mu.Lock()
-		defer layer.mu.Unlock()
-		return len(layer.held) > 0
-	})
+	waitTestSignal(t, layer.first, "the first flight")
 	ch := make(chan error, 1)
 	go func() {
-		s, err := startServerNoListener(ctx, PipeIO{R: b, W: deafWriter{b}}, mpConfig())
+		s, err := startPlainServer(ctx, PipeIO{R: b, W: deafWriter{b}})
 		if err != nil {
 			ch <- err
 			return
 		}
 		ch <- s.Wait()
 	}()
-	layer.decide(false)
+	layer.reject()
 	select {
 	case err := <-ch:
 		var te *TransportError
@@ -435,15 +245,18 @@ func TestEarlyCarrierRestartFailsClose(t *testing.T) {
 	_ = st
 }
 
-// peerBytesSeen counts what a carrier's read half delivered.
+// peerBytesSeen signals the first delivery from the carrier's read half.
 type peerBytesSeen struct {
 	net.Conn
-	n atomic.Int64
+	seen chan struct{}
+	once sync.Once
 }
 
 func (r *peerBytesSeen) Read(b []byte) (int, error) {
 	n, err := r.Conn.Read(b)
-	r.n.Add(int64(n))
+	if n > 0 {
+		r.once.Do(func() { close(r.seen) })
+	}
 	return n, err
 }
 
@@ -457,9 +270,9 @@ func TestEarlyCarrierPeerBytesBeforeVerdict(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		a, b := net.Pipe()
-		r := &peerBytesSeen{Conn: a}
+		r := &peerBytesSeen{Conn: a, seen: make(chan struct{})}
 		layer := &earlyLayer{Conn: r, verdict: make(chan bool, 1)}
-		c, err := Start(ctx, PipeIO{R: r, W: layer}, RoleClient, earlyFloorConfig())
+		c, err := Start(ctx, PipeIO{R: r, W: layer}, RoleClient, plainEarlyConfig())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -474,14 +287,14 @@ func TestEarlyCarrierPeerBytesBeforeVerdict(t *testing.T) {
 		_ = st.Close()
 		ch := make(chan *Conn, 1)
 		go func() {
-			s, err := startServerNoListener(ctx, NetPipe(b), mpConfig())
+			s, err := startPlainServer(ctx, NetPipe(b))
 			if err != nil {
 				t.Error(err)
 			}
 			ch <- s
 		}()
-		waitUntil(t, 5*time.Second, "the peer's bytes", func() bool { return r.n.Load() > 0 })
-		layer.decide(false)
+		waitTestSignal(t, r.seen, "the peer's bytes")
+		layer.reject()
 		s := <-ch
 		if s == nil {
 			_ = c.Close()
@@ -504,22 +317,22 @@ func TestEarlyCarrierPeerBytesBeforeVerdict(t *testing.T) {
 		defer cancel()
 		a, b := net.Pipe()
 		layer := failingRestart{&earlyLayer{Conn: a, verdict: make(chan bool, 1)}}
-		r := &peerBytesSeen{Conn: a}
-		c, err := Start(ctx, PipeIO{R: r, W: layer}, RoleClient, earlyFloorConfig())
+		r := &peerBytesSeen{Conn: a, seen: make(chan struct{})}
+		c, err := Start(ctx, PipeIO{R: r, W: layer}, RoleClient, plainEarlyConfig())
 		if err != nil {
 			t.Fatal(err)
 		}
 		ch := make(chan error, 1)
 		go func() {
-			s, err := startServerNoListener(ctx, PipeIO{R: b, W: deafWriter{b}}, mpConfig())
+			s, err := startPlainServer(ctx, PipeIO{R: b, W: deafWriter{b}})
 			if err != nil {
 				ch <- err
 				return
 			}
 			ch <- s.Wait()
 		}()
-		waitUntil(t, 5*time.Second, "the peer's bytes", func() bool { return r.n.Load() > 0 })
-		layer.decide(false)
+		waitTestSignal(t, r.seen, "the peer's bytes")
+		layer.reject()
 		select {
 		case err := <-ch:
 			var te *TransportError
@@ -538,26 +351,48 @@ func TestEarlyCarrierPeerBytesBeforeVerdict(t *testing.T) {
 // ErrNotNegotiated: multipath is decided only by them.
 func TestAddPipeBeforeEstablishment(t *testing.T) {
 	leakcheck.Check(t)
+	synctest.Test(t, testAddPipeBeforeEstablishment)
+}
+
+func testAddPipeBeforeEstablishment(t *testing.T) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	l := mustNewListener(&ListenerConfig{Config: mpConfig()})
+	cfg := mpConfig()
+	cfg.ClockDomain = NewClockDomain(timeshim.Real)
+	l := mustNewListener(&ListenerConfig{Config: cfg})
 	defer func() { _ = l.Close() }()
 	a0, b0 := net.Pipe()
-	c, err := Start(ctx, NetPipe(a0), RoleClient, earlyFloorConfig())
+	defer func() { _ = b0.Close() }()
+	ccfg := *cfg
+	ccfg.ReturnBeforeEstablished = true
+	c, err := Start(ctx, NetPipe(a0), RoleClient, &ccfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = c.Close(); waitDone(t, c) }()
-	if c.s.Established() {
+	synctest.Wait()
+	if c.ConnectionState().Established {
 		t.Fatal("established without a peer")
 	}
 	// No peer yet: the call waits until its context ends.
-	short, cancelShort := context.WithTimeout(ctx, 20*time.Millisecond)
 	ap, bp := net.Pipe()
-	_, err = c.AddPipe(short, NetPipe(ap), PipeOptions{})
-	cancelShort()
-	_ = bp.Close()
-	if !errors.Is(err, context.DeadlineExceeded) {
+	defer func() { _ = bp.Close() }()
+	openCtx, cancelOpen := context.WithCancel(ctx)
+	defer cancelOpen()
+	opened := make(chan error, 1)
+	go func() {
+		_, err := c.AddPipe(openCtx, NetPipe(ap), PipeOptions{})
+		opened <- err
+	}()
+	synctest.Wait()
+	select {
+	case err := <-opened:
+		t.Fatalf("AddPipe returned before establishment or cancellation: %v", err)
+	default:
+	}
+	cancelOpen()
+	if err := <-opened; !errors.Is(err, context.Canceled) {
 		t.Fatalf("AddPipe before establishment: %v, want the context's error", err)
 	}
 	a1, b1 := net.Pipe()

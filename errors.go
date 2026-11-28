@@ -40,7 +40,7 @@ const (
 	StreamCancelled     StreamErrorCode = 0x5a4d0001
 	StreamRejected      StreamErrorCode = 0x5a4d0002
 	StreamCarrierFailed StreamErrorCode = 0x5a4d0003
-	StreamPacketError   StreamErrorCode = 0x5a4d0004
+	StreamPacketError                   = StreamErrorCode(wire.CodePacketError)
 )
 
 // Transport error codes.
@@ -90,10 +90,6 @@ type TransportError struct {
 	FrameType uint64
 	Remote    bool
 }
-
-// SessionError is the transport close reported by a session. ErrorMessage
-// contains the peer's reason, including the reason supplied to Listener.Drain.
-type SessionError = TransportError
 
 // Error describes the close.
 func (e *TransportError) Error() string {
@@ -325,6 +321,13 @@ type wouldBlockError struct{}
 func (wouldBlockError) Error() string    { return "zmux: read would block" }
 func (wouldBlockError) WouldBlock() bool { return true }
 
+// ErrReceiveLoanLimit reports that retaining the next receive backing would
+// exceed the session's chunk budget. A normal Read can still consume the data.
+var ErrReceiveLoanLimit = core.ErrReceiveLoanLimit
+
+// ErrMemoryBudget reports that the physical memory budget cannot admit work.
+var ErrMemoryBudget = core.ErrMemoryBudget
+
 // Errors of individual calls.
 var (
 	// ErrStreamClosed is returned for operations on a direction the
@@ -362,6 +365,21 @@ var (
 	ErrJoinTimeout = core.ErrJoinTimeout
 	// ErrJoinEvicted identifies an authorized join displaced before confirmation.
 	ErrJoinEvicted = errors.New("zmux: unconfirmed join evicted")
+	// ErrJoinAuthorizationChanged is recorded when an authenticated Join
+	// reaches Claim or confirmation under a different authorization generation.
+	ErrJoinAuthorizationChanged = core.ErrJoinAuthorizationChanged
+	// ErrSessionPolicyConflict reports a stale policy revision or generation.
+	ErrSessionPolicyConflict = core.ErrPolicyConflict
+	// ErrClockDomainMismatch reports an attempted bind across distinct domains.
+	ErrClockDomainMismatch = errors.New("zmux: clock domain mismatch")
+	// ErrCarrierCapacity reports exhaustion of the local carrier resource limit.
+	ErrCarrierCapacity = errors.New("zmux: local carrier capacity exhausted")
+	// ErrNoDirectionCoverage means a planned drain would leave either
+	// direction without a confirmed attachment.
+	ErrNoDirectionCoverage = core.ErrNoDirectionCoverage
+
+	// ErrTopologyExcluded reports a carrier direction excluded by host topology.
+	ErrTopologyExcluded = errors.New("zmux: carrier direction temporarily excluded")
 	// ErrJoinRefused is returned by AddPipe when the peer's Reply refused the join.
 	ErrJoinRefused = core.ErrJoinRefused
 	// ErrCarrierRefused matches an error by which the server or an
@@ -454,6 +472,8 @@ func apiErr(err error) error {
 			return ErrGoingAway
 		case core.StreamPreambleTooLarge:
 			return &PreambleTooLargeError{Max: int64(st.Code)}
+		case core.StreamMemoryBudget:
+			return ErrMemoryBudget
 		case core.StreamClosedLocally:
 		}
 		return ErrStreamClosed

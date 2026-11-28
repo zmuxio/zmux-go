@@ -11,11 +11,13 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
+	"github.com/zmuxio/zmux-go/internal/prefixtest"
 )
 
 func TestServerTCPCarrierSample(t *testing.T) {
@@ -95,18 +97,17 @@ func TestServerTCPCarrierSample(t *testing.T) {
 // of a downlink joined out of band.
 func TestHTTPCarriers(t *testing.T) {
 	leakcheck.Check(t)
-	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second}
-	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, Decide: v.Decide,
-		PeekTimeout: 2 * time.Second, StallMax: 100 * time.Millisecond}})
+	auth, v, _ := prefixtest.New(t, admit.PrefixCarrierOptions{}, zmux.VerdictClose)
+	admission := v.Admission()
+	admission.PeekTimeout, admission.StallMax = 2*time.Second, 100*time.Millisecond
+	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: admission})
 	hh, err := NewHandler(lst, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(hh)
+	srv := httptest.NewUnstartedServer(hh)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
 	defer srv.Close()
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -225,21 +226,28 @@ func TestBodyPipe(t *testing.T) {
 		t.Fatalf("got %q, %v", got, err)
 	}
 
-	// The reader gives up: a blocked write fails with its error.
-	p = newBodyPipe()
-	w = &httpReqWriter{p: p, call: settledCall(), cancel: func() {}}
-	stop := errors.New("refused")
-	go func() { time.Sleep(10 * time.Millisecond); p.closeRead(stop) }()
-	if _, err := w.WriteBuffers([][]byte{[]byte("x")}); !errors.Is(err, stop) {
-		t.Fatalf("write after the reader closed: %v", err)
-	}
-	// The writer aborts: a blocked read fails with its error.
-	p = newBodyPipe()
-	w = &httpReqWriter{p: p, call: settledCall(), cancel: func() {}}
-	go func() { time.Sleep(10 * time.Millisecond); w.Abort(stop) }()
-	if _, err := p.read(buf, nil); !errors.Is(err, stop) {
-		t.Fatalf("read after the writer aborted: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		stop := errors.New("refused")
+		p := newBodyPipe()
+		w := &httpReqWriter{p: p, call: settledCall(), cancel: func() {}}
+		written := make(chan error, 1)
+		go func() { _, err := w.WriteBuffers([][]byte{[]byte("x")}); written <- err }()
+		synctest.Wait()
+		p.closeRead(stop)
+		if err := <-written; !errors.Is(err, stop) {
+			t.Fatalf("write after the reader closed: %v", err)
+		}
+
+		p = newBodyPipe()
+		w = &httpReqWriter{p: p, call: settledCall(), cancel: func() {}}
+		read := make(chan error, 1)
+		go func() { _, err := p.read(make([]byte, 1), nil); read <- err }()
+		synctest.Wait()
+		w.Abort(stop)
+		if err := <-read; !errors.Is(err, stop) {
+			t.Fatalf("read after the writer aborted: %v", err)
+		}
+	})
 }
 
 // A Join runs across a pair of requests, and the pipe does not live by the context of
@@ -288,7 +296,12 @@ func TestSplitJoinHandlerLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, 30*time.Second, "the origin's pipe", func() bool { _, ok := s.Pipe(p.ID()); return ok })
+	if err := p.WaitAttached(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Pipe(p.ID()); !ok {
+		t.Fatalf("origin acknowledged pipe %d without installing it", p.ID())
+	}
 	mu.Lock()
 	second := cancels[len(cancels)-1]
 	if len(cancels) != before+2 {

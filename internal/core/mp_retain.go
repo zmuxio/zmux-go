@@ -29,7 +29,7 @@ type frameDesc struct {
 	kind   descKind
 	bidi   bool
 	fin    bool
-	fresh  bool   // original application data under spread ETA
+	fresh  bool   // original STREAM range eligible for tracking
 	repair bool   // an anticipatory prefix copy on a different pipe
 	id     uint64 // stream ID, or pipe ID for PIPE_STATUS / PIPE_ABANDON
 	off    uint64
@@ -41,34 +41,29 @@ type retained struct {
 	end        uint64 // lane position after the record carrying the frame
 	d          frameDesc
 	reinjected bool
-	// penalized: re-sent once because a penalty of its pipe moved the
-	// binding of its stream direction away.
-	penalized  bool
-	sent       Time     // when the batch was handed to the carrier
-	due        Duration // E: the acknowledgement time expected at sending, for penalization
-	confirm    Time     // frozen prefix repair deadline, 0 for other entries
-	ackBase    uint64   // lane ACK point when handed to the carrier
-	progressAt Time     // last checkpoint with meaningful ACK progress
-	serial     uint64   // stable lane-log index while its entries are retained
+	sent       Time   // when the batch was handed to the carrier
+	confirm    Time   // frozen prefix repair deadline, 0 for other entries
+	serial     uint64 // stable lane-log index while its entries are retained
 }
 
 // mpSend is the multipath side storage of a sending part.
 type mpSend struct {
-	acked      rangeSet // acknowledged byte ranges
-	resend     rangeSet // ranges to send again
-	rr         []rrVal  // own round-robin values
-	rrFill     rrFill   // the own round-robin chunk being filled
-	oppSent    rangeSet // bytes re-sent opportunistically (once each)
-	repair     prefixRepair
-	prefix     *prefixTrack
-	pick       pickAnswer // custom policy answer
-	bind       binding    // affinity
-	openPipe   uint64     // the pipe of the opening frame or of its latest reinjected copy, when openSet
-	openSet    bool
-	openAcked  bool // the opening frame was acknowledged
-	finAcked   bool
-	finResend  bool
-	pickQueued bool
+	prefix       *prefixTrack
+	rr           []rrVal  // own round-robin values
+	acked        rangeSet // acknowledged byte ranges
+	resend       rangeSet // ranges to send again
+	oppSent      rangeSet // bytes handed off opportunistically (once each)
+	prefixCopies rangeSet // outstanding payload already handed to repair destinations
+	repair       prefixRepair
+	pick         pickAnswer // custom policy answer
+	bind         binding    // affinity
+	rrFill       rrFill     // the own round-robin chunk being filled
+	openPipe     uint64     // the pipe of the opening frame or of its latest reinjected copy, when openSet
+	openSet      bool
+	openAcked    bool // the opening frame was acknowledged
+	finAcked     bool
+	finResend    bool
+	pickQueued   bool
 }
 
 func (sp *sendPart) mpState() *mpSend {
@@ -104,13 +99,6 @@ func (s *Session) retainBatch(w *recWriter, ol *outLane, start, ahead uint64) {
 		ends = append(ends, pos)
 	}
 	m.endsBuf = ends
-	// E = (unsent_ahead + L) / R_p + min_rtt_p + peer max_ack_delay,
-	// fixed at sending so that a pipe that slows down cannot raise it.
-	var due Duration
-	if p := w.pipe; p != nil && p.mp != nil {
-		due = timeAt(ahead+(pos-start), s.rateOf(p)) + p.mp.minRTT() + s.ack.peerDelay
-	}
-	var confirm Time
 	var serial uint64
 	if len(ol.log) > 0 {
 		serial = ol.log[len(ol.log)-1].serial + 1
@@ -121,17 +109,17 @@ func (s *Session) retainBatch(w *recWriter, ol *outLane, start, ahead uint64) {
 		if rd.rec < len(ends) {
 			e = ends[rd.rec]
 		}
-		if rd.d.fresh && confirm == 0 {
-			confirm = s.prefixDeadline(w.pipe, ahead, pos-start)
-		}
-		r := retained{end: e, d: rd.d, sent: s.now, due: due, serial: serial}
+		r := retained{end: e, d: rd.d, sent: s.now, serial: serial}
 		serial++
-		if rd.d.fresh && confirm != Never && ol.prefixCount < ^uint32(0) {
+		if rd.d.fresh && ol.prefixCount < ^uint32(0) {
 			if st == nil || st.id != rd.d.id {
 				st = s.sendOf(&rd.d)
 			}
 			if st != nil {
-				r.confirm, r.ackBase = confirm, ol.acked
+				if m.prefixScheduler == nil {
+					m.prefixScheduler = &prefixScheduler{}
+				}
+				r.confirm = s.prefixDeadline(w.pipe, ahead, pos-start, rd.d.n)
 				ol.prefixCount++
 				s.trackPrefix(st, w.pipe, ol, &r)
 			}
@@ -147,6 +135,7 @@ func (s *Session) retainBatch(w *recWriter, ol *outLane, start, ahead uint64) {
 		}
 	}
 	w.descs = w.descs[:0]
+	w.b.descs = w.descs
 }
 
 // ackLog pops the entries a lane acknowledgement covers.
@@ -231,17 +220,17 @@ func (s *Session) acked(d *frameDesc) {
 		sp := &st.snd
 		m := sp.mpState()
 		if d.n > 0 {
+			s.ackPrefixRepair(m, d.off, d.off+d.n)
+			s.releasePrefixCopy(m, d.off, d.off+d.n)
 			m.acked.add(d.off, d.off+d.n)
 			if m.resend.len() != 0 {
 				m.resend.remove(d.off, d.off+d.n)
 			}
-			s.ackPrefixRepair(m)
+			s.finishPrefixRepair(m)
 		}
 		if d.off == 0 && !m.openAcked {
 			m.openAcked = true
-			if s.dg != nil && len(s.dg.send) > 0 {
-				s.wakeAllWriters() // its datagrams go by the usual rule now
-			}
+			s.routeDatagramStream(st)
 		}
 		if d.fin {
 			m.finAcked, m.finResend = true, false
@@ -263,6 +252,7 @@ func (s *Session) acked(d *frameDesc) {
 			p.mp.abandonAcked = true
 			p.mp.ackedAbandonAt = s.now
 			s.maybeRetire(p)
+			s.refreshPathTopology()
 		}
 	case dStop, dMaxData, dMaxStreamData, dMaxStreams, dDataBlocked, dStreamDataBlocked,
 		dStreamsBlocked, dGoAway, dStatus, dAbandonID:
@@ -313,27 +303,19 @@ func (s *Session) lost(d *frameDesc) {
 		if sp.reset {
 			hi = min64(hi, sp.resetRel)
 		}
-		if d.repair && m.repair.covers(d.off) {
-			// A failed copy is itself retained on its carrier. Its loss
-			// hands the range back to ordinary reinjection.
-			s.clearPrefixRepair(m)
+		if d.repair {
+			s.releasePrefixCopy(m, lo, hi)
+			s.finishPrefixRepair(m)
 		}
-		// The original's loss must leave a live repair copy alone.
-		// Unsent repair bytes and any remaining tail use the same queue.
-		repaired := m.repair
-		queue := func(a, b uint64) {
+		// A live optional copy covers the same STREAM bytes. An unsent
+		// tail is ordinary reinjection once its source is lost.
+		m.prefixCopies.gaps(lo, hi, func(a, b uint64) {
 			m.acked.gaps(a, b, func(x, y uint64) { m.resend.add(x, y) })
-		}
-		if repaired.sent > repaired.lo && lo < repaired.sent && hi > repaired.lo {
-			queue(lo, min64(hi, repaired.lo))
-			queue(max64(lo, repaired.sent), hi)
-		} else {
-			queue(lo, hi)
-		}
+		})
 		if d.fin && !m.finAcked && !sp.reset {
 			m.finResend = true
 		}
-		s.sched.ensure(st)
+		s.sched.reinstate(st)
 	case dReset:
 		if st := s.streamOf(d); st != nil && st.hasS && st.snd.reset && st.snd.state != sendResetRecvd {
 			s.queueCtl(st, ctlReset)
@@ -381,13 +363,13 @@ func (s *Session) lost(d *frameDesc) {
 		}
 	case dAbandon:
 		if p := s.pipe(d.id); p != nil && p.mp != nil && !p.mp.abandonAcked {
-			p.mp.abandonQueued = true
+			s.mp.abandonQ.add(p)
 		}
 	case dAbandonID:
 		// The same frame until acknowledged (MULTIPATH.md Section 7.4),
 		// while the ID is still in the replay window.
 		if m := s.mp; s.pipe(d.id) == nil && !m.stale(d.id) {
-			s.prepareAdditional().pendAbandon[d.id] = d.val
+			s.prepareAdditional().pendAbandon[d.id] = pendingAbandon{code: d.val, repeated: true}
 		}
 	}
 	s.wakeAllWriters()

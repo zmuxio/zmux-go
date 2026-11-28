@@ -77,7 +77,7 @@ func TestDatagramsQueuedBeforeOpeningPrecedeStreamData(t *testing.T) {
 	if got := batchFrameOrder(t, b); got != "SGGF" {
 		t.Fatalf("frame order %q, want SGGF", got)
 	}
-	s.WriteDone(b, nil, Time(Second))
+	s.WriteDone(b, b.Len(), nil, Time(Second))
 }
 
 // While a stream's opening frame is unacknowledged, its datagrams follow
@@ -89,7 +89,7 @@ func TestStreamDatagramsFollowUnackedOpening(t *testing.T) {
 	s, _ := statsMP()
 	s.peerSeen, s.state = true, StateActive
 	s.peerMaxDgram, s.peerMaxRecord = 65535, 65535
-	s.feat = Features{Flows: true, Multipath: true}
+	s.feat = Features{DatagramFamily: true, Multipath: true}
 	prim, _ := s.primary()
 	var open *Pipe
 	for _, p := range s.pipes {
@@ -98,21 +98,31 @@ func TestStreamDatagramsFollowUnackedOpening(t *testing.T) {
 		}
 	}
 	if open == nil {
-		t.Fatal("statsMP has no pipe besides the primary")
+		t.Error("statsMP has no pipe besides the primary")
+		return
 	}
+	open.out.lanes[0].confirmed = true
+	prim.out.lanes[0].confirmed = true
 	st := &Stream{id: 4, idSet: true, bidi: true, local: true, opened: true, hasS: true}
 	s.streams[st.id] = st
 	m := st.snd.mpState()
 	m.openPipe, m.openSet = open.id, true
-	s.dg = &dgramState{}
-	s.dg.send = []outDgram{{st: st, data: []byte{5, 0, 'a'}, n: 1}, {data: []byte{0, 'b'}, n: 1}}
+	enqueue := func(st *Stream, data ...byte) {
+		s.enqueueDatagram(outDgram{st: st, data: dgramView{head: append(make([]byte, 8), data[:len(data)-1]...), payload: data[len(data)-1:]}, n: 1, deadline: Never})
+	}
+	enqueue(st, 5, 0, 'a')
+	enqueue(nil, 0, 'b')
 	write := func(p *Pipe) string {
 		t.Helper()
 		b := GetBatch()
 		defer PutBatch(b)
 		var w recWriter
 		w.init(b, FramingBytes, 65535, DefaultBatch)
-		s.writeDatagrams(&w, p)
+		for {
+			if sent, _ := s.writeDatagram(&w, p, 7); !sent {
+				break
+			}
+		}
 		w.end()
 		var got strings.Builder
 		var all []byte
@@ -138,18 +148,20 @@ func TestStreamDatagramsFollowUnackedOpening(t *testing.T) {
 		return got.String()
 	}
 	open.mp.out = OutSuspect
+	s.noteDatagramPath()
 	if got := write(open) + write(prim); got != "b" {
 		t.Fatalf("with the opening's pipe SUSPECT: %q, want only the session datagram", got)
 	}
 	open.mp.out = OutActive
+	s.noteDatagramPath()
 	if got := write(prim); got != "" {
 		t.Fatalf("the control pipe sent %q", got)
 	}
-	s.dg.send = append(s.dg.send, outDgram{st: st, data: []byte{5, 0, 'c'}, n: 1})
+	enqueue(st, 5, 0, 'c')
 	if got := write(open); got != "ac" {
 		t.Fatalf("the opening's pipe sent %q, want ac", got)
 	}
-	s.dg.send = append(s.dg.send, outDgram{st: st, data: []byte{5, 0, 'd'}, n: 1})
+	enqueue(st, 5, 0, 'd')
 	s.acked(&frameDesc{kind: dStream, id: st.id})
 	if got := write(open); got != "" {
 		t.Fatalf("after the opening's acknowledgement the opening's pipe sent %q", got)

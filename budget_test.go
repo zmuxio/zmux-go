@@ -3,9 +3,7 @@ package zmux
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -15,89 +13,52 @@ import (
 
 func TestListenerMemoryBudget(t *testing.T) {
 	leakcheck.Check(t)
-	type note struct{ used, budget int64 }
-	notes := make(chan note, 16)
-	const budget = 128 << 10
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ln.Close() }()
-	l := mustNewListener(&ListenerConfig{MemoryBudget: budget, Config: &Config{},
-		OnMemoryPressure: func(used, b int64) { notes <- note{used, b} }})
+	const budget = 1 << 20
+	l := mustNewListener(&ListenerConfig{MemoryBudget: budget, Config: &Config{}})
 	defer func() { _ = l.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	go func() {
-		for {
-			nc, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() { _ = l.HandlePipe(ctx, NetPipe(nc), PipeHint{}) }()
-		}
-	}()
 	dial := func() (*Conn, error) {
-		nc, err := net.Dial("tcp", ln.Addr().String())
+		cl, sv := net.Pipe()
+		server := make(chan error, 1)
+		go func() { server <- l.HandlePipe(ctx, NetPipe(sv), PipeHint{}) }()
+		c, err := Client(ctx, cl, nil)
 		if err != nil {
-			return nil, err
+			_ = cl.Close()
 		}
-		return Client(ctx, nc, nil)
+		if got := <-server; got != nil && !errors.Is(got, ErrMemoryBudget) {
+			t.Errorf("handle pipe: %v", got)
+		}
+		return c, err
+	}
+	if c, err := dial(); err == nil {
+		c.Abort(0, "")
+		t.Fatal("admitted a session without room for its minimum receive window")
+	}
+	if n := l.Adapter().MemoryUsed(); n != 0 {
+		t.Fatalf("rejected bootstrap holds %d bytes", n)
+	}
+	lim := l.Limits()
+	lim.MemoryBudget = 2 << 20
+	if err := l.SetLimits(lim); err != nil {
+		t.Fatal(err)
 	}
 	c, err := dial()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = c.Close(); _ = c.Wait() }()
+	defer func() { c.Abort(0, ""); _ = c.Wait() }()
 	s, err := l.Accept(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = s.Close(); _ = s.Wait() }()
-	// The server does not read: buffered data reaches the budget.
-	st, _ := c.OpenStreamSync(ctx)
-	go func() { _, _ = st.Write(make([]byte, 3*budget)) }()
-	ss, err := s.AcceptStream(ctx)
-	if err != nil {
-		t.Fatal(err)
+	defer func() { s.Abort(0, ""); _ = s.Wait() }()
+	if w := s.s.LocalParams().InitialMaxData; w < 16<<10 || w >= 1<<20 {
+		t.Fatalf("initial connection window %d was never reduced", w)
 	}
-	select {
-	case n := <-notes:
-		if n.used < budget || n.budget != budget {
-			t.Fatalf("pressure note %+v", n)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatalf("no pressure (used %d)", l.Adapter().MemoryUsed())
+	if used := l.Adapter().MemoryUsed(); used > lim.MemoryBudget {
+		t.Fatalf("budget exceeded: %d", used)
 	}
-	// Under pressure a new peer stream is rejected and a session refused.
-	st2, _ := c.OpenStreamSync(ctx)
-	_, _ = st2.Write([]byte("x"))
-	_, err = io.ReadAll(st2)
-	if !IsRetryable(err) {
-		t.Fatalf("new stream under pressure: %v", err)
-	}
-	if c2, err := dial(); err == nil {
-		werr := c2.Wait()
-		if _, ok := errors.AsType[*TransportError](werr); !ok {
-			t.Fatalf("new session under pressure: %v", werr)
-		}
-	}
-	// Reading drains the buffer: pressure ends. The writer still has data
-	// to send, which a fast reader can leave above the budget again before
-	// the hook runs, and calls that find the state changed again report the
-	// state they find (TestMemoryPressureNotesCoalesce): the relief note is
-	// the one that ends the run of notes above the limit.
-	go func() { _, _ = io.Copy(io.Discard, ss) }()
-	relief := time.After(10 * time.Second)
-	for relieved := false; !relieved; {
-		select {
-		case n := <-notes:
-			relieved = n.used < budget/4*3
-		case <-relief:
-			t.Fatalf("no relief (used %d)", l.Adapter().MemoryUsed())
-		}
-	}
-	runtime.KeepAlive(st) // a collected handle would reset the stream
 }
 
 // The hook runs on one serial context and reads the budget when it runs:

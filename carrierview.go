@@ -11,6 +11,7 @@ import (
 
 	"github.com/zmuxio/zmux-go/internal/carrierio"
 	"github.com/zmuxio/zmux-go/internal/carrierstats"
+	"github.com/zmuxio/zmux-go/internal/core"
 )
 
 // The views zmux puts over a carrier half to replay what it read
@@ -25,15 +26,16 @@ import (
 // A view implements every capability of its set whether or not the half it
 // views does; where that half lacks one, the method reports the absence in
 // the capability's own terms: no TLS (a zero ConnectionState), false
-// (CarrierSecure, ReportsFailure, TLSRecords), nil (CarrierConn,
+// (CarrierSecure, ReportsFailure, TLSRecords), nil (CarrierConn, PhysicalCarrier,
 // CarrierPeer, HandshakeContext), 0 (MaxRecord: no bound), not known
 // (Unsent), errors.ErrUnsupported (CloseWrite,
-// ExportKeyingMaterial), nothing to do (RecordCloseCode, CarrierTaken).
+// ExportKeyingMaterial), a zero CarrierHalfSource (LaneSource), nothing to
+// do (RecordCloseCode, CarrierTaken).
 // Abort closes the connection (below TLS for a TLS connection), and
 // WriteBuffers and WriteMessages write one buffer or message at a time.
 // The framing capabilities (MessageReader, MessageWriter) are a view's
 // own, by the carrier's framing. Capabilities that run zmux sessions on
-// a carrier and have no neutral absence (LaneOpener, DatagramChannel,
+// a carrier (LaneOpener, DatagramChannel and its optional capabilities,
 // EarlyClientCarrier, EarlyServerCarrier, CarrierRecordMode, RecordSealer,
 // RecordOpener) are not forwarded: a replayed carrier that zmux goes on
 // with has its own sending half, where they are found, and a taken-over one
@@ -108,6 +110,14 @@ func (c halfCaps) CarrierConn() any {
 	return nil
 }
 
+// PhysicalCarrier forwards the viewed half's physical connection identity.
+func (c halfCaps) PhysicalCarrier() any {
+	if physical, ok := c.h.(PhysicalCarrier); ok {
+		return physical.PhysicalCarrier()
+	}
+	return nil
+}
+
 // RecordCloseCode passes the code to the viewed half (CloseCodeRecorder).
 func (c halfCaps) RecordCloseCode(code ApplicationErrorCode, reason string) {
 	if r, ok := c.h.(CloseCodeRecorder); ok {
@@ -144,6 +154,13 @@ func (c halfCaps) CarrierTaken() {
 type sendCaps struct{ halfCaps }
 
 func (c sendCaps) writer() io.Writer { return c.h.(io.Writer) }
+
+func (c sendCaps) LaneSource() CarrierHalfSource {
+	if source, ok := c.h.(LaneSource); ok {
+		return source.LaneSource()
+	}
+	return CarrierHalfSource{}
+}
 
 // CloseWrite half-closes the viewed half (CloseWriter).
 func (c sendCaps) CloseWrite() error {
@@ -215,20 +232,65 @@ func (c sendCaps) WriteBuffers(bufs [][]byte) (int, error) {
 // prefixReader returns pre before the rest of r.
 type prefixReader struct {
 	halfCaps
-	r   io.ReadCloser
-	pre []byte
+	r     io.ReadCloser
+	first atomic.Pointer[bytePrefix]
+	mu    sync.Mutex
+}
+
+type bytePrefix struct {
+	end  error
+	next *bytePrefix
+	view core.Span
 }
 
 func (p *prefixReader) Read(b []byte) (int, error) {
-	if len(p.pre) > 0 {
-		n := copy(b, p.pre)
-		p.pre = p.pre[n:]
-		return n, nil
+	if p.first.Load() != nil {
+		p.mu.Lock()
+		if first := p.first.Load(); first != nil {
+			n := copy(b, first.view.Bytes())
+			first.view.Start += n
+			if first.view.Len() != 0 {
+				p.mu.Unlock()
+				return n, nil
+			}
+			p.first.Store(first.next)
+			first.next = nil
+			p.mu.Unlock()
+			first.release()
+			return n, first.end
+		}
+		p.mu.Unlock()
 	}
 	return p.r.Read(b)
 }
 
-func (p *prefixReader) Close() error { return p.r.Close() }
+func (p *prefixReader) take(whole bool) *bytePrefix {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if first := p.first.Load(); first != nil {
+		if whole {
+			p.first.Store(nil)
+		} else {
+			p.first.Store(first.next)
+			first.next = nil
+		}
+		return first
+	}
+	return nil
+}
+
+func (p *bytePrefix) release() {
+	for node := p; node != nil; node = node.next {
+		if node.view.Buf != nil {
+			node.view.Buf.Unref()
+		}
+	}
+}
+
+func (p *prefixReader) Close() error {
+	releasePrefixes(p)
+	return p.r.Close()
+}
 
 // Unwrap returns the carrier's own receiving half.
 func (p *prefixReader) Unwrap() io.ReadCloser { return p.h.(io.ReadCloser) }
@@ -237,21 +299,60 @@ func (p *prefixReader) Unwrap() io.ReadCloser { return p.h.(io.ReadCloser) }
 type prefixMessages struct {
 	halfCaps
 	r     io.ReadCloser
-	first []byte
+	first atomic.Pointer[ReceivedMessage]
 }
 
-func (p *prefixMessages) Read([]byte) (int, error) { return 0, errors.New("zmux: message carrier") }
-func (p *prefixMessages) Close() error             { return p.r.Close() }
-func (p *prefixMessages) ReadMessage(limit int) ([]byte, error) {
-	if p.first != nil {
-		m := p.first
-		p.first = nil
-		if len(m) > limit {
-			return nil, ErrMessageTooLarge
+func (p *prefixMessages) Read(_ []byte) (int, error) { return 0, errors.New("zmux: message carrier") }
+func (p *prefixMessages) Close() error {
+	releasePrefixes(p)
+	return p.r.Close()
+}
+
+func releasePrefixes(r io.Reader) {
+	switch p := r.(type) {
+	case *prefixReader:
+		p.take(true).release()
+		releasePrefixes(p.r)
+	case *prefixMessages:
+		if first := p.first.Swap(nil); first != nil {
+			first.Release()
 		}
-		return m, nil
+		releasePrefixes(p.r)
+	case readOnly:
+		releasePrefixes(p.r)
+	case *ownedReader:
+		releasePrefixes(p.r)
+	case *ownedMessages:
+		releasePrefixes(p.h.(io.ReadCloser))
 	}
-	return p.r.(MessageReader).ReadMessage(limit)
+}
+
+// takeBytePrefix follows the transparent byte views until it finds a
+// stored range. Read transformations still consume it through Read.
+func takeBytePrefix(r io.Reader) *bytePrefix {
+	switch p := r.(type) {
+	case *prefixReader:
+		if first := p.take(false); first != nil {
+			return first
+		}
+		return takeBytePrefix(p.r)
+	case readOnly:
+		return takeBytePrefix(p.r)
+	case *ownedReader:
+		return takeBytePrefix(p.r)
+	}
+	return nil
+}
+func (p *prefixMessages) ReadMessage(limit int) (ReceivedMessage, error) {
+	if m := p.first.Swap(nil); m != nil {
+		if m.Len() > limit {
+			m.Release()
+			return ReceivedMessage{}, ErrMessageTooLarge
+		}
+		return m.delivery(nil)
+	}
+	m, err := readMessage(p.r, limit)
+	return m.delivery(err)
 }
 
 // Unwrap returns the carrier's own receiving half.
@@ -266,11 +367,9 @@ type readOnly struct {
 func (r readOnly) Read(b []byte) (int, error) { return r.r.Read(b) }
 func (r readOnly) Close() error               { return nil }
 
-func (r readOnly) ReadMessage(limit int) ([]byte, error) {
-	if mr, ok := r.r.(MessageReader); ok {
-		return mr.ReadMessage(limit)
-	}
-	return noMessages{}.ReadMessage(limit)
+func (r readOnly) ReadMessage(limit int) (ReceivedMessage, error) {
+	m, err := readMessage(r.r, limit)
+	return m.delivery(err)
 }
 
 // Unwrap returns the carrier's own receiving half.
@@ -407,9 +506,9 @@ type ownedMessages struct {
 	o *halfOwner
 }
 
-func (r *ownedMessages) Read([]byte) (int, error) { return 0, errors.New("zmux: message carrier") }
-func (r *ownedMessages) Close() error             { r.o.closeR(); return nil }
-func (r *ownedMessages) ReadMessage(limit int) ([]byte, error) {
+func (r *ownedMessages) Read(_ []byte) (int, error) { return 0, errors.New("zmux: message carrier") }
+func (r *ownedMessages) Close() error               { r.o.closeR(); return nil }
+func (r *ownedMessages) ReadMessage(limit int) (ReceivedMessage, error) {
 	return r.h.(MessageReader).ReadMessage(limit)
 }
 
@@ -434,7 +533,7 @@ type ownedMessageWriter struct {
 	o *halfOwner
 }
 
-func (w *ownedMessageWriter) Write([]byte) (int, error) {
+func (w *ownedMessageWriter) Write(_ []byte) (int, error) {
 	return 0, errors.New("zmux: message carrier")
 }
 func (w *ownedMessageWriter) Close() error { w.o.closeW(); return nil }

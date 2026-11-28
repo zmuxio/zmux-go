@@ -36,7 +36,7 @@ func (s *Session) traceStreamGap(st *Stream, f *wire.Frame) {
 			delete(trace.gaps, st.id)
 		}
 	}
-	if len(f.Data) == 0 && !f.Fin {
+	if f.DataLen() == 0 && !f.Fin {
 		return // empty non-FIN frames cannot expose a hole
 	}
 	if (r.arrived.len() == 0 || r.arrived.q.last().hi <= off) && (!r.finKnown || r.final <= off) {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/core"
+	"github.com/zmuxio/zmux-go/shaping"
 )
 
 // EventKind is the kind of a session event. The comment of each kind
@@ -54,12 +55,11 @@ const (
 	EventGoAwayReceived
 	// EventResumeUnattended follows EventSessionSuspended when nothing in
 	// the library will dial for the session: it can rejoin (the peer gave
-	// a Session Locator) but has neither a Config.Redial hook nor a running
-	// MaintainPipes pool, so it ends at its resume timeout unless the
-	// application adds a pipe (no fields). It is also logged as a warning
-	// (Config.Logger). An application that resumes with its own AddPipe
-	// calls reacts to EventSessionSuspended and can ignore it. An unread
-	// one leaves the queue when EventSessionResumed occurs.
+	// a Session Locator) with no session controller. It ends at its resume
+	// timeout unless the application adds a pipe (no fields). It is also
+	// logged as a warning (Config.Logger). Applications that resume with
+	// AddPipe can react to EventSessionSuspended. An unread event leaves
+	// the queue when EventSessionResumed occurs.
 	EventResumeUnattended
 	// EventPipeQualityChanged reports that an outbound pipe left its
 	// QualityBand (Pipe, SmoothedRTT, DeliveryRate).
@@ -70,10 +70,10 @@ const (
 	// EventCapacityRestored reports that the outbound capacity is back above
 	// the CapacityFloor (DeliveryRate: the capacity).
 	EventCapacityRestored
-	// EventCarrierCandidate reports a try of a candidate of DialChoice
+	// EventCarrierCandidate reports a carrier candidate observation
 	// (Carrier, Outcome).
 	EventCarrierCandidate
-	// EventCarrierChosen reports the carrier kind DialChoice chose, and every
+	// EventCarrierChosen reports the selected bootstrap kind, and every
 	// later switch to another kind (Carrier).
 	EventCarrierChosen
 	// EventPipesRetired is the one report of retirement (Retired, Failed,
@@ -105,13 +105,30 @@ const (
 	// EventPipePathQuality reports evidence for local replacement or shared
 	// path deterioration, and when the observed deterioration clears.
 	EventPipePathQuality
+	// EventPipeHealthChanged carries a direction transition in Health.
+	EventPipeHealthChanged
+	// EventShaping is a tracing event for a committed or completed cover request.
+	EventShaping
+	// EventTargetChanged reports a committed controller revision.
+	EventTargetChanged
+	// EventBatchReserved reports a capacity reservation.
+	EventBatchReserved
+	// EventDrainCommitted reports a committed member drain.
+	EventDrainCommitted
+	// EventBatchRolledBack reports a canceled capacity reservation.
+	EventBatchRolledBack
+	// EventRedialCalled reports an actual Join opener invocation.
+	EventRedialCalled
+	// EventRedialFinished reports the terminal outcome of that invocation.
+	EventRedialFinished
 )
 
 var pipeEventNames = [...]string{"", "PipeAdded", "PipeJoined", "PipeSuspect", "PipeRecovered", "PipeFailed",
 	"PipeClosed", "PipePriorityChanged", "TierSaturation", "JoinAuthFailed", "SessionSuspended",
 	"SessionResumed", "GoAwayReceived", "ResumeUnattended", "PipeQualityChanged", "CapacityBelow",
 	"CapacityRestored", "CarrierCandidate", "CarrierChosen", "PipesRetired", "EpochCommitted", "EpochDeleted",
-	"DatagramPathChanged", "StreamPlaced", "StreamGapStarted", "StreamGapFilled", "PipePathQuality"}
+	"DatagramPathChanged", "StreamPlaced", "StreamGapStarted", "StreamGapFilled", "PipePathQuality", "PipeHealthChanged", "Shaping",
+	"TargetChanged", "BatchReserved", "DrainCommitted", "BatchRolledBack", "RedialCalled", "RedialFinished"}
 
 func (k EventKind) String() string {
 	if int(k) < len(pipeEventNames) {
@@ -144,32 +161,31 @@ func (r JoinAuthReason) String() string { return core.JoinAuthReason(r).String()
 // says which of the other fields are set (see EventKind). Stream events
 // are delivered through Tracer.Event when Tracer.StreamEvents is enabled.
 type Event struct {
-	Kind EventKind
-	// Direction of a pipe event, from the local endpoint.
-	Direction Direction
-	// Standby (EventPipePriorityChanged) and Saturated
-	// (EventTierSaturation).
-	Standby   bool
-	Saturated bool
-	// Reason of EventJoinAuthFailed.
-	Reason JoinAuthReason
-	// Carrier is the pipe's carrier kind (PipeIO.Carrier) of a pipe event,
-	// the candidate's of EventCarrierCandidate and EventCarrierChosen;
-	// Outcome that of EventCarrierCandidate.
-	Carrier CarrierKind
-	Outcome CandidateOutcome
-	// PathQuality is the reason for EventPipePathQuality.
-	PathQuality PipePathQualityReason
+	StreamAt time.Time
+	Shaping  *shaping.Event // EventShaping
+	Health   *PipeHealthChange
+	// GoAway of EventGoAwayReceived.
+	GoAway  *GoAway
+	Outcome AttemptReason
+	// Variant is the PipeIO.Variant of a pipe event's carrier while the
+	// pipe has one, and the candidate's of EventCarrierCandidate and
+	// EventCarrierChosen.
+	Variant string
+	Source  string
+	Last    []PipeID
+	// Batch, Attempt, Member and Revision identify controller commits.
+	BindingGeneration, PreviousGeneration uint64
+	BindingCause                          BindingCause
+	Batch                                 uint64
+	Attempt                               AttemptID
+	Member                                MemberID
+	Revision                              uint64
 	// Epoch of EventEpochCommitted and EventEpochDeleted.
 	Epoch uint64
 	// Count of EventJoinAuthFailed: the failures with its Reason since the
 	// event was last read, at least 1 (a Tracer gets one event per
 	// failure, with Count 1).
 	Count uint64
-	// Variant is the PipeIO.Variant of a pipe event's carrier while the
-	// pipe has one, and the candidate's of EventCarrierCandidate and
-	// EventCarrierChosen.
-	Variant string
 	// PipeID is the pipe ID of a pipe event.
 	PipeID PipeID
 	// Stream events are opt-in through Tracer.StreamEvents. Offsets and
@@ -177,7 +193,6 @@ type Event struct {
 	// set for placements. StreamAt is the event time on the session clock.
 	StreamID                   StreamID
 	StreamOffset, StreamLength uint64
-	StreamAt                   time.Time
 	GapWait                    time.Duration
 	// Priority is the tier (EventPipePriorityChanged,
 	// EventTierSaturation); Weight the pipe's weight
@@ -186,9 +201,6 @@ type Event struct {
 	// endpoint), "peer" (the peer's request) or "default".
 	Priority uint64
 	Weight   uint64
-	Source   string
-	// GoAway of EventGoAwayReceived.
-	GoAway *GoAway
 	// SmoothedRTT and DeliveryRate (bytes per second) of
 	// EventPipeQualityChanged;
 	// DeliveryRate is also the capacity of EventCapacityBelow and
@@ -203,15 +215,33 @@ type Event struct {
 	// one event per retired pipe (Retired 1, Last that pipe, Failed 1 if
 	// the pipe failed, else Closed 1).
 	Retired, Failed, Closed uint64
-	Last                    []PipeID
 	// DatagramPayload of EventDatagramPathChanged: the new
 	// PathDatagramPayload of a session datagram.
 	DatagramPayload int
+	// NativeDatagramPayload is the event's carrier-channel limit.
+	NativeDatagramPayload int
 	// FateGroup and QueuedBytes are set for EventPipePathQuality,
 	// together with the recent SmoothedRTT and DeliveryRate estimates.
 	// RetryAfter is a replacement delay suggestion; zero means no redial.
 	FateGroup, QueuedBytes uint64
 	RetryAfter             time.Duration
+	Kind                   EventKind
+	// Direction of a pipe event, from the local endpoint.
+	Direction Direction
+	// Standby (EventPipePriorityChanged) and Saturated
+	// (EventTierSaturation).
+	Standby   bool
+	Saturated bool
+	// NativeDatagramAvailable reports whether the event's path has a carrier datagram channel.
+	NativeDatagramAvailable bool
+	// Reason of EventJoinAuthFailed.
+	Reason JoinAuthReason
+	// Carrier is the pipe's carrier kind (PipeIO.Carrier) of a pipe event,
+	// the candidate's of EventCarrierCandidate and EventCarrierChosen;
+	// Outcome that of EventCarrierCandidate.
+	Carrier CarrierKind
+	// PathQuality is the reason for EventPipePathQuality.
+	PathQuality PipePathQualityReason
 }
 
 // retiredLast is the number of IDs EventPipesRetired keeps.
@@ -224,13 +254,14 @@ func terminal(k EventKind) bool { return k == EventPipeFailed || k == EventPipeC
 // table): the kind plus what distinguishes the occurrences of the
 // kind. Fields a kind does not use are zero.
 type eventKey struct {
-	variant string // CarrierCandidate
-	pipe    uint64 // the pipe events
-	prio    uint64 // TierSaturation
-	kind    EventKind
-	dir     Direction // Suspect, Recovered, Failed, Closed
-	carrier CarrierKind
-	reason  JoinAuthReason
+	variant    string // CarrierCandidate
+	pipe       uint64 // the pipe events
+	prio       uint64 // TierSaturation
+	kind       EventKind
+	dir        Direction // Suspect, Recovered, Failed, Closed
+	carrier    CarrierKind
+	reason     JoinAuthReason
+	controller uint8 // slot of a recent controller event
 }
 
 // pipeKeys lists the events keyed by pipe, and whether their key holds the
@@ -241,7 +272,7 @@ var pipeKeys = [...]struct {
 }{
 	{EventPipeAdded, false}, {EventPipeJoined, false}, {EventPipePriorityChanged, false},
 	{EventPipeQualityChanged, false}, {EventPipePathQuality, false}, {EventPipeSuspect, true}, {EventPipeRecovered, true},
-	{EventPipeFailed, true}, {EventPipeClosed, true},
+	{EventPipeFailed, true}, {EventPipeClosed, true}, {EventPipeHealthChanged, true},
 }
 
 // pipeEvent reports whether events of kind k belong to a pipe (Pipe set).
@@ -277,7 +308,8 @@ func keyOf(ev *Event) eventKey {
 		EventPipePriorityChanged, EventPipeQualityChanged, EventSessionSuspended, EventSessionResumed,
 		EventGoAwayReceived, EventResumeUnattended, EventCapacityBelow, EventCapacityRestored, EventCarrierChosen,
 		EventPipesRetired, EventEpochCommitted, EventEpochDeleted, EventDatagramPathChanged,
-		EventStreamPlaced, EventStreamGapStarted, EventStreamGapFilled, EventPipePathQuality:
+		EventStreamPlaced, EventStreamGapStarted, EventStreamGapFilled, EventPipePathQuality, EventPipeHealthChanged, EventShaping,
+		EventTargetChanged, EventBatchReserved, EventDrainCommitted, EventBatchRolledBack, EventRedialCalled, EventRedialFinished:
 		// Keyed by the kind alone (the pipe events above by their entry in pipeKeys).
 	}
 	return k
@@ -303,15 +335,16 @@ type eventNode struct {
 // size is bounded by what the session holds (pipes, tiers, carrier
 // candidates) plus a fixed number of keys; a retired pipe's keys leave it.
 type eventQueue struct {
-	held       map[uint64]*joinEventHold
-	idx        map[eventKey]*eventNode
-	seenOut    map[uint64]core.OutState
-	dirs       map[uint64]uint8 // per pipe: dirInEnded, dirOutEnded
-	head, tail *eventNode
-	waiters    []*core.Signal
-	fresh      []Event // occurrences in this drain, for the tracer and the waiters
-	frozen     bool    // the session is CLOSED: nothing more enters
-	pollAdvice bool    // NextEvent enabled advice; StopEvents releases it
+	held           map[uint64]*joinEventHold
+	idx            map[eventKey]*eventNode
+	seenOut        map[uint64]core.OutState
+	dirs           map[uint64]uint8 // per pipe: dirInEnded, dirOutEnded
+	head, tail     *eventNode
+	waiters        []*core.Signal
+	fresh          []Event // occurrences in this drain, for the tracer and the waiters
+	frozen         bool    // the session is CLOSED: nothing more enters
+	controllerNext uint8
+	pollAdvice     bool // NextEvent enabled advice; StopEvents releases it
 }
 
 // Bits of eventQueue.dirs: the terminal event of a direction entered the
@@ -412,7 +445,14 @@ func (e *eventQueue) push(ev Event) {
 	if ev.Kind == EventSessionResumed {
 		e.remove(eventKey{kind: EventResumeUnattended}) // stale once resumed
 	}
-	k := keyOf(&ev)
+	var k eventKey
+	switch ev.Kind {
+	case EventTargetChanged, EventBatchReserved, EventDrainCommitted, EventBatchRolledBack, EventRedialCalled, EventRedialFinished:
+		k = eventKey{kind: EventTargetChanged, controller: e.controllerNext}
+		e.controllerNext++
+	default:
+		k = keyOf(&ev)
+	}
 	if h := e.held[k.pipe]; h != nil {
 		h.queue.merge(k, ev)
 	} else {
@@ -528,6 +568,7 @@ func (c *Conn) endPipeLocked(id uint64, failed bool, cause error) {
 	if e.join != nil {
 		_ = e.join.settleLocked(ErrPipeGone)
 	}
+	pd.accountSegment.retire()
 	close(e.retired)
 	// Pipe.Done closes once the driver's goroutines have ended too.
 	e.drv.Load().gs.finishThen(e.end)
@@ -559,13 +600,6 @@ func (c *Conn) drainEventsLocked() (wakeWaiters bool) {
 		case core.EvStreamGapFilled:
 			c.traceStream(e, EventStreamGapFilled, DirectionReceiveOnly)
 		case core.EvPipeState:
-			// A replacement join still counts as live in the core during
-			// its handshake. A directional loss can need recovery even
-			// when that pending join suppresses EvSuspended.
-			if c.redial != nil && (e.Dir == core.DirOut && (e.OutState == core.OutFailed || e.OutState == core.OutClosed) ||
-				e.Dir == core.DirIn && e.InState == core.InEnded) {
-				c.needRedial = true
-			}
 			if pd := c.pipes[e.Pipe]; pd != nil && pd.end.join != nil && !pd.end.join.settled {
 				switch {
 				case errors.Is(e.Cause, core.ErrJoinTimeout):
@@ -578,17 +612,26 @@ func (c *Conn) drainEventsLocked() (wakeWaiters bool) {
 				}
 			}
 			c.pipeStateEvent(e)
+		case core.EvPipeHealth:
+			dir := DirectionSendOnly
+			if e.Dir == core.DirIn {
+				dir = DirectionReceiveOnly
+			}
+			change := PipeHealthChange{Seq: e.Count, PipeID: PipeID(e.Pipe), Dir: dir,
+				Before: c.directionHealth(e.HealthBefore), After: c.directionHealth(e.HealthAfter),
+				Reason: e.HealthAfter.Reason, At: c.clk.wall(e.At), SinceJoin: time.Duration(e.Wait), Err: e.Cause}
+
+			q.push(Event{Kind: EventPipeHealthChanged, PipeID: change.PipeID, Direction: dir, Health: &change})
 		case core.EvJoinAuthFailed:
 			q.push(Event{Kind: EventJoinAuthFailed, Reason: JoinAuthReason(e.Reason), Count: 1})
 		case core.EvEstablished:
 			c.hk.trace(traceItem{est: true})
 		case core.EvSuspended:
-			c.needRedial = true
-			c.firePipeWaiters()
+			c.tightenAttemptDeadlinesLocked(e.At.Add(e.Wait))
 			q.push(Event{Kind: EventSessionSuspended})
 			if c.unattendedLocked() {
 				q.push(Event{Kind: EventResumeUnattended})
-				c.hk.warn("zmux: session suspended without a redial source (Config.Redial or MaintainPipes): it ends at its resume timeout unless the application adds a pipe")
+				c.hk.warn("zmux: session suspended without a redial source (session controller): it ends at its resume timeout unless the application adds a pipe")
 			}
 			if c.lst != nil {
 				if over := c.lst.sessionSuspended(c); len(over) > 0 {
@@ -606,7 +649,6 @@ func (c *Conn) drainEventsLocked() (wakeWaiters bool) {
 		case core.EvTierSaturation:
 			q.push(Event{Kind: EventTierSaturation, Priority: e.Code, Saturated: e.Saturated})
 		case core.EvPipePathQuality:
-			c.redial.qualityChanged(PipeID(e.Pipe))
 			q.push(Event{Kind: EventPipePathQuality, PipeID: PipeID(e.Pipe), Direction: DirectionSendOnly,
 				PathQuality: PipePathQualityReason(e.PathQuality), FateGroup: e.Code, QueuedBytes: e.Count,
 				SmoothedRTT: time.Duration(e.RTT), DeliveryRate: rateBytes(e.Rate), RetryAfter: time.Duration(e.Wait)})
@@ -618,7 +660,7 @@ func (c *Conn) drainEventsLocked() (wakeWaiters bool) {
 		case core.EvCapacityRestored:
 			q.push(Event{Kind: EventCapacityRestored, DeliveryRate: rateBytes(e.Rate)})
 		case core.EvDatagramPath:
-			q.push(Event{Kind: EventDatagramPathChanged, DatagramPayload: int(e.Count)})
+			q.push(Event{Kind: EventDatagramPathChanged, DatagramPayload: int(e.Count), NativeDatagramPayload: int(e.Code), NativeDatagramAvailable: e.Native})
 		case core.EvPipePriority:
 			q.push(Event{Kind: EventPipePriorityChanged, PipeID: PipeID(e.Pipe), Priority: e.Code, Standby: e.Saturated,
 				Weight: e.Count, Source: e.Source, Carrier: CarrierKind(c.s.PipeKind(e.Pipe))})
@@ -628,14 +670,13 @@ func (c *Conn) drainEventsLocked() (wakeWaiters bool) {
 					_ = o.settleLocked(nil)
 				}
 			}
-			c.firePipeWaiters() // WaitAttached and the pool
+
 		case core.EvJoinKeys:
-			// Joins are possible: maintenance and redial go on.
-			c.needRedial = true
-			c.firePipeWaiters()
+			c.s.NotifyCapacity()
+
 		case core.EvEpochCommitted:
 			q.push(Event{Kind: EventEpochCommitted, Epoch: e.Code})
-			c.firePipeWaiters()
+
 		case core.EvEpochDeleted:
 			q.push(Event{Kind: EventEpochDeleted, Epoch: e.Code})
 		case core.EvLocatorAdded:
@@ -646,10 +687,16 @@ func (c *Conn) drainEventsLocked() (wakeWaiters bool) {
 			if c.lst != nil {
 				c.lst.removeLocator(c, e.Frame)
 			}
+		case core.EvShaping:
+			c.hk.trace(traceItem{ev: Event{Kind: EventShaping, PipeID: PipeID(e.Pipe), Shaping: e.Shape}})
 		case core.EvClosed, core.EvDatagramDropped:
 			// The end surfaces through Wait and the drops through the
 			// statistics; neither is a pipe event.
 		}
+	}
+	if c.control != nil {
+		c.control.observeQualityLocked()
+		c.control.observeMembersLocked(c.s.TakeMemberChanges())
 	}
 	if c.hk != nil {
 		for _, ev := range q.fresh {
@@ -657,9 +704,6 @@ func (c *Conn) drainEventsLocked() (wakeWaiters bool) {
 		}
 	}
 	// New events and registration of an exclusive consumer wake NextEvent.
-	// firePipeWaiters wakes AddPipe and
-	// the pool, whose long-lived waiter would otherwise keep NextEvent
-	// spinning.
 	wakeWaiters = len(q.fresh) > 0 || (c.handlers != nil && c.handlers.eventsRegistered)
 	// Pushed since the last drain, inside it or by another critical
 	// section (reportCarrier): each traced and woken for once, here.
@@ -685,19 +729,9 @@ func (c *Conn) wakeEventWaitersLocked(wakes []*core.Signal) []*core.Signal {
 	return wakes
 }
 
-// firePipeWaiters wakes the waiters of pipe state changes.
-func (c *Conn) firePipeWaiters() {
-	for _, w := range c.pipeWaiters {
-		w.Fire()
-	}
-	c.pipeWaiters = c.pipeWaiters[:0]
-}
-
-// pipeStateEvent maps a state change of one direction onto the API's
-// events and wakes the waiters of AddPipe.
 func (c *Conn) pipeStateEvent(e core.Event) {
 	q := &c.events
-	c.firePipeWaiters()
+
 	if e.Dir != core.DirOut {
 		switch e.InState {
 		case core.InRetired:

@@ -10,12 +10,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -32,19 +34,43 @@ func Ready(w io.Writer, ln net.Listener) {
 	_, _ = fmt.Fprintf(w, "READY %s\n", ln.Addr())
 }
 
-// Auth is the prefix authentication of key: 30 s slots, no TLS binding; the listener accepts one slot of skew.
-func Auth(key string) *admit.PrefixAuth {
-	return &admit.PrefixAuth{Key: []byte(key), Slot: 30 * time.Second}
+const ticketSlot = 30 * time.Second
+
+func fixtureTicket(key string) (admit.PrefixCredential, [32]byte) {
+	id := sha256.Sum256([]byte("interop ticket id " + key))
+	ticket := admit.PrefixCredential{ID: [16]byte(id[:16]), Key: sha256.Sum256([]byte("interop ticket key " + key))}
+	return ticket, sha256.Sum256([]byte("interop outer key " + key))
+}
+
+// Auth is the scripted client's reusable unbound presentation.
+func Auth(key string) (*admit.PrefixAuth, error) {
+	ticket, outer := fixtureTicket(key)
+	carrier := admit.PrefixCarrierOptions{AllowCleartext: true}
+	return admit.NewPrefixAuth(admit.PrefixAuthOptions{PrefixCarrierOptions: carrier, Slot: ticketSlot}, ticket,
+		admit.PrefixGeneration{Key: outer, LastSlot: math.MaxUint64})
 }
 
 // NewListener returns a listener that admits carriers presenting Auth(key).
 func NewListener(key string) (*zmux.Listener, error) {
-	v, err := admit.NewPrefixAuthVerifier(Auth(key), admit.PrefixAuthVerifierOptions{Skew: 1})
+	ticket, outer := fixtureTicket(key)
+	store, err := admit.NewMemoryPrefixStore(admit.PrefixWindow{Slot: ticketSlot, Skew: 1},
+		[]admit.PrefixGeneration{{Key: outer, LastSlot: math.MaxUint64}}, 0)
 	if err != nil {
 		return nil, err
 	}
-	return zmux.NewListener(&zmux.ListenerConfig{Config: &zmux.Config{},
-		Admission: &zmux.Admission{Peek: admit.PrefixTokenLen, PeekTimeout: 5 * time.Second, Decide: v.Decide, StallMax: time.Second}})
+	if err := store.AddTicket(admit.PrefixTicket{PrefixCredential: ticket, LastSlot: math.MaxUint64}); err != nil {
+		return nil, err
+	}
+	carrier := admit.PrefixCarrierOptions{AllowCleartext: true}
+	v, err := admit.NewPrefixAuthVerifier(admit.PrefixAuthVerifierOptions{
+		PrefixCarrierOptions: carrier, Store: store, Reject: zmux.VerdictFallback,
+	})
+	if err != nil {
+		return nil, err
+	}
+	a := v.Admission()
+	a.PeekTimeout, a.StallMax = 5*time.Second, time.Second
+	return zmux.NewListener(&zmux.ListenerConfig{Config: &zmux.Config{}, Admission: a})
 }
 
 // Teapot answers every request 418 and prints FALLBACK with its target.
@@ -109,7 +135,7 @@ var JoinPSK = bytes.Repeat([]byte{7}, 32)
 // MPConfig is the session configuration of the TLS peers: multipath with
 // JoinPSK, and joins in Bound only on a carrier that declares the contract.
 func MPConfig() *zmux.Config {
-	return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: JoinPSK, EndToEnd: true},
+	return &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{PSK: JoinPSK, EndToEnd: true},
 		AllowRecordMode: func(in zmux.RecordPolicyInput, m zmux.RecordMode, _ any) bool {
 			return m == zmux.RecordSealed || m == zmux.RecordBound && in.Secure && in.HasExporter
 		}}

@@ -135,7 +135,7 @@ func (c *Conn) HandleEvents(f func(Event)) error {
 // StopEvents unregisters HandleEvents and releases the advice subscription
 // established by NextEvent. A dispatched callback may finish, and the keyed
 // queue remains available. A new NextEvent or HandleEvents call subscribes again.
-// Independently configured Redial and Tracer callbacks keep receiving advice.
+// An independently configured tracer keeps receiving advice.
 func (c *Conn) StopEvents() error {
 	if c == nil {
 		return net.ErrClosed
@@ -146,7 +146,7 @@ func (c *Conn) StopEvents() error {
 	if h := c.handlers; h != nil {
 		h.event, h.eventsRegistered = nil, false
 	}
-	if c.cfg.Redial == nil && (c.cfg.Tracer == nil || c.cfg.Tracer.Event == nil) {
+	if c.cfg.Tracer == nil || c.cfg.Tracer.Event == nil {
 		c.s.DisablePathAdvice()
 	}
 	return nil

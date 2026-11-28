@@ -12,6 +12,7 @@ type Gates struct {
 	Multipath     bool
 	PipeAck       bool
 	Lanes         bool // lanes available toward the receiver
+	DatagramAck   bool // the peer can report this endpoint's datagrams
 }
 
 // CheckGate returns the error for a decoded frame whose feature is not in use:
@@ -48,6 +49,8 @@ func CheckGate(f *Frame, g *Gates) *Error {
 		ok = g.Multipath || g.PipeAck
 	case KindPipeLane:
 		ok = g.Lanes
+	case KindDatagramAck:
+		ok = g.DatagramAck
 	}
 	if !ok {
 		return &Error{Code: FrameEncodingError, FrameType: f.Type, Reason: f.Kind.String() + " not in use"}

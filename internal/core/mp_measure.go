@@ -10,6 +10,9 @@ const (
 // consumer. The protocol observations used for liveness and pacing stay in
 // rttEst and rateEst.
 type pathQuality struct {
+	generation        uint64
+	measured          MeasuredQuality
+	witness           backlogWitness
 	unsentAt          map[uint64]Time
 	rtt, hold, minRTT Duration
 	rttAt, minAt      Time

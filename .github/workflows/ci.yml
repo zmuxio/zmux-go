@@ -35,8 +35,6 @@ jobs:
             path: seal
           - name: examples
             path: examples/xorpipe
-          - name: dgpeer
-            path: interop/dgpeer
           - name: webpeer
             path: interop/webpeer
     defaults:
@@ -71,9 +69,16 @@ jobs:
         # The JSON log keeps every test's output, also of a failure at the
         # end of a package (a leak check after its last test); the console
         # shows the results and what failed.
+        env:
+          # Keep Windows race binaries at a low, fixed image base for TSan.
+          RACE_LDFLAGS: ${{ runner.os == 'Windows' && '-linkmode=external -extldflags=-Wl,--image-base,0x400000,--disable-dynamicbase,--disable-high-entropy-va' || '' }}
         run: |
+          race_link=()
+          if [[ -n "$RACE_LDFLAGS" ]]; then
+            race_link+=("-ldflags=$RACE_LDFLAGS")
+          fi
           status=0
-          go test -race -count=1 -json ./... > "$RUNNER_TEMP/test.json" || status=$?
+          go test -race "${race_link[@]}" -count=1 -json ./... > "$RUNNER_TEMP/test.json" || status=$?
           jq -rj 'select(.Action == "output" and (.Test == null or (.Output | test("^(ok|FAIL|--- FAIL|panic:|    |\\t)")))) | .Output' "$RUNNER_TEMP/test.json"
           exit $status
 
@@ -112,7 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [".", zmuxquic, zmuxh3, zmuxws, seal, examples/xorpipe, interop/dgpeer, interop/webpeer]
+        module: [".", zmuxquic, zmuxh3, zmuxws, seal, examples/xorpipe, interop/webpeer]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

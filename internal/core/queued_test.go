@@ -15,7 +15,7 @@ func TestQueuedOnSlowCarrier(t *testing.T) {
 	// A batch produced and not yet taken by a slow carrier.
 	b := GetBatch()
 	defer PutBatch(b)
-	b.Pipe, b.pos = p.id, 3000
+	b.Pipe, b.pos, b.owner = p.id, 3000, ol
 	ol.handed += b.pos
 	ol.writing = true
 	s.SetCarrierUnsent(p.id, 0, 500, s.now)
@@ -44,7 +44,7 @@ func TestQueuedOnSlowCarrier(t *testing.T) {
 	if pi, _ := s.PipeInfo(p.id); pi.QueuedBytes != 500 {
 		t.Fatalf("QueuedBytes %d, want the carrier's 500", pi.QueuedBytes)
 	}
-	s.WriteDone(b, nil, s.now) // the carrier took the batch
+	s.WriteDone(b, b.Len(), nil, s.now) // the carrier took the batch
 	if q := s.queuedOn(p); q != 500 {
 		t.Fatalf("Q_p after the write %d, want 500", q)
 	}
@@ -74,7 +74,7 @@ func TestUnsentAheadInSuspectTimer(t *testing.T) {
 	// is the oldest now.
 	ps := &p.out.snd
 	ps.samples = []sample{{end: 1, ahead: aheadSnap{400_000, 400 * Millisecond}}}
-	s.mpAdvanced(p, p.out.lanes[0], ps, s.now)
+	s.mpAdvanced(p, p.out.lanes[0], ps, s.now, false)
 	if a.unsentAhead != 400_000 {
 		t.Fatalf("unsent_ahead %d, want 400000", a.unsentAhead)
 	}
@@ -82,12 +82,12 @@ func TestUnsentAheadInSuspectTimer(t *testing.T) {
 		t.Fatalf("T_suspect %v, want %v", got, want)
 	}
 	ps.samples = []sample{{end: 2, ahead: aheadSnap{50_000_000, Second}}}
-	s.mpAdvanced(p, p.out.lanes[0], ps, s.now)
+	s.mpAdvanced(p, p.out.lanes[0], ps, s.now, false)
 	if got := s.queueDelay(a); got != Second {
 		t.Fatalf("queue_p %v, want the 1 s cap", got)
 	}
 	ps.samples = nil
-	s.mpAdvanced(p, p.out.lanes[0], ps, s.now)
+	s.mpAdvanced(p, p.out.lanes[0], ps, s.now, false)
 	if a.unsentAhead != 0 || s.tSuspect(a) != base {
 		t.Fatal("the snapshot outlived the unacknowledged bytes")
 	}
@@ -107,7 +107,7 @@ func TestQueueDelaySnapshotsRate(t *testing.T) {
 	ps := &p.out.snd
 	ps.samples = []sample{{end: 1, ahead: snap}}
 	measuredRate(p, 1e5) // the rate falls before the oldest moves to it
-	s.mpAdvanced(p, ol, ps, s.now)
+	s.mpAdvanced(p, ol, ps, s.now, false)
 	if got := s.queueDelay(p.mp); got != 200*Millisecond {
 		t.Fatalf("queue_p %v, want the 200 ms of the handover", got)
 	}

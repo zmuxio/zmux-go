@@ -204,6 +204,13 @@ func (t *tuner) sent(oldLimit uint64, now Time, blocked bool) {
 // the current window plus what the budget has left.
 func (s *Session) connAllowance() uint64 {
 	c := &s.conn
+	if s.cfg.receiveHold != 0 {
+		b := s.cfg.Budget
+		if limit := b.Limit(); limit != 0 {
+			return c.win + (limit-min64(limit, b.Used()))/receiveCreditCost
+		}
+		return ^uint64(0)
+	}
 	if sb := s.cfg.Budget; sb != nil {
 		limit := sb.Limit()
 		if limit == 0 {
@@ -309,8 +316,7 @@ func (s *Session) growConnWindow(w uint64) {
 		}
 		return
 	}
-	c.win = w
-	s.connCreditChanged()
+	s.applyConnWindow(w)
 }
 
 // WindowProposal returns a pending session window growth for the
@@ -331,10 +337,24 @@ func (s *Session) ApplyWindowProposal(w uint64, ok bool) {
 		return // superseded: asked again with the newer proposal
 	}
 	s.tn.proposal = 0
-	if ok && w > s.conn.win {
-		s.conn.win = w
-		s.connCreditChanged()
+	if ok {
+		s.applyConnWindow(w)
 	}
+}
+
+func (s *Session) applyConnWindow(w uint64) {
+	c := &s.conn
+	if w <= c.win || s.state >= StateClosing {
+		return
+	}
+	if s.cfg.receiveHold != 0 {
+		w = c.win + c.rx.account.memory.grow(w-c.win)
+		if w == c.win {
+			return
+		}
+	}
+	c.win = w
+	s.connCreditChanged()
 }
 
 // HasWindowProposal reports a session window growth awaiting the predicate.

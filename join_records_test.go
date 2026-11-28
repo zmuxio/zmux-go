@@ -15,7 +15,7 @@ func TestJoinOverMessages(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cfg := func() *zmux.Config {
-		return &zmux.Config{MaxPipes: 4, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true}}
+		return &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, PipeAuth: zmux.PipeAuth{PSK: bytes.Repeat([]byte{7}, 32), EndToEnd: true}}
 	}
 	l := mustNewListener(&zmux.ListenerConfig{Config: cfg()})
 	defer func() { _ = l.Close() }()

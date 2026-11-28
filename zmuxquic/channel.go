@@ -1,14 +1,8 @@
 package zmuxquic
 
 import (
-	"context"
-	"errors"
-	"sync"
-
 	"github.com/quic-go/quic-go"
-	"github.com/zmuxio/zmux-go/carrier"
-	"github.com/zmuxio/zmux-go/internal/carrierio"
-	"github.com/zmuxio/zmux-go/internal/labels"
+	"github.com/zmuxio/zmux-go/zmuxquic/streamio"
 )
 
 // The datagram channel of QUIC stream pipes: QUIC
@@ -17,85 +11,9 @@ import (
 // routes them to the pipes on it, which may belong to several sessions;
 // lanes are not pipes and have no channel.
 
-// sizeProbe is larger than any QUIC datagram: sending it is always refused
-// with the connection's current maximum, and nothing is sent.
-var sizeProbe = make([]byte, 1<<16)
-
-// connChannel is the datagram channel of one QUIC connection.
-type connChannel struct {
-	qc       *quic.Conn
-	demux    carrier.ChannelDemux
-	recvOnce sync.Once
-	size     carrierio.DatagramSize // largest QUIC datagram payload; 0: none
-}
-
-var connChannels sync.Map // *quic.Conn -> *connChannel
-
-// channelOf returns the datagram channel of qc, created on first use and
-// forgotten when qc ends.
-func channelOf(qc *quic.Conn) *connChannel {
-	if c, ok := connChannels.Load(qc); ok {
-		return c.(*connChannel)
-	}
-	c, loaded := connChannels.LoadOrStore(qc, &connChannel{qc: qc})
-	if !loaded {
-		context.AfterFunc(qc.Context(), func() { connChannels.Delete(qc) })
-	}
-	return c.(*connChannel)
-}
-
-// maxDatagram returns the largest QUIC datagram payload the connection
-// takes now, 0 while datagrams are not negotiated, refreshed at most once
-// per carrierio.DatagramSizeRefresh. A probe does not block and sends
-// nothing.
-func (c *connChannel) maxDatagram() int {
-	return c.size.Get(func() (int64, bool) {
-		st := c.qc.ConnectionState()
-		if !st.SupportsDatagrams.Local || !st.SupportsDatagrams.Remote {
-			return 0, false
-		}
-		return tooLarge(c.qc.SendDatagram(sizeProbe))
-	})
-}
-
-// tooLarge returns the maximum a datagram refused for size reports.
-func tooLarge(err error) (int64, bool) {
-	tl, ok := errors.AsType[*quic.DatagramTooLargeError](err)
-	if !ok {
-		return 0, false
-	}
-	return tl.MaxDatagramPayloadSize, true
-}
-
-// send sends one QUIC datagram; it blocks while the connection's datagram
-// queue is full.
-func (c *connChannel) send(b []byte) error {
-	err := c.qc.SendDatagram(b)
-	if n, ok := tooLarge(err); ok {
-		c.size.Set(n)
-	}
-	return err
-}
-
-// register routes the datagrams for the stream id to deliver, starting the
-// connection's receive loop on first use.
-func (c *connChannel) register(id uint64, deliver func([]byte)) func() {
-	c.recvOnce.Do(func() {
-		if !c.qc.ConnectionState().SupportsDatagrams.Local {
-			return
-		}
-		labels.Go(context.Background(), "quic-channel", func() {
-			for {
-				b, err := c.qc.ReceiveDatagram(c.qc.Context())
-				if err != nil {
-					return
-				}
-				c.demux.Deliver(b) // a fresh slice: the demux takes it over
-			}
-		})
-	})
-	return c.demux.Register(id, deliver)
-}
+var connChannels = streamio.NewDatagramRegistry(0, "quic-channel", func(qc *quic.Conn) bool {
+	return streamio.SupportsDatagrams(qc.ConnectionState())
+})
 
 // ChannelStreamID is the pipe's QUIC stream ID (zmux.DatagramChannel).
 func (q *qStream) ChannelStreamID() (uint64, bool) {
@@ -103,29 +21,32 @@ func (q *qStream) ChannelStreamID() (uint64, bool) {
 	return uint64(s.StreamID()), true
 }
 
-// MaxChannelDatagram is the connection's current largest datagram.
-func (q *qStream) MaxChannelDatagram() int {
+// ChannelDatagramCapacity returns the connection's limit and current room.
+func (q *qStream) ChannelDatagramCapacity() (limit, room int) {
 	qc, _ := q.cur()
-	return channelOf(qc).maxDatagram()
+	return connChannels.Channel(qc).Capacity()
+}
+
+// ChannelCapacityChanged wakes pipe writers sharing an updated MTU.
+func (q *qStream) ChannelCapacityChanged() <-chan struct{} {
+	qc, _ := q.cur()
+	return connChannels.Channel(qc).Changed()
 }
 
 // SendChannelDatagram sends a QUIC datagram of the connection.
 func (q *qStream) SendChannelDatagram(b []byte) error {
 	qc, _ := q.cur()
-	return channelOf(qc).send(b)
+	return connChannels.Channel(qc).Send(b)
 }
 
 // ReceiveChannelDatagrams receives the connection's datagrams for the pipe.
 func (q *qStream) ReceiveChannelDatagrams(deliver func([]byte)) func() {
 	qc, s := q.cur()
-	return channelOf(qc).register(uint64(s.StreamID()), deliver)
+	return connChannels.Channel(qc).Register(uint64(s.StreamID()), deliver)
 }
 
 // ChannelDropped returns the datagrams received on qc that named no pipe
 // attached to a session (an unknown, not yet attached or closed one).
 func ChannelDropped(qc *quic.Conn) uint64 {
-	if c, ok := connChannels.Load(qc); ok {
-		return c.(*connChannel).demux.Dropped()
-	}
-	return 0
+	return connChannels.Dropped(qc)
 }

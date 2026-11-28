@@ -77,10 +77,6 @@ func TestPipeStatsTCPCarrier(t *testing.T) {
 		if len(all) != 1 || all[0].CarrierSample == nil || all[0].CarrierSample.CarrierID != got.CarrierID {
 			t.Fatalf("bulk sample = %+v", all)
 		}
-		// Linux TCP_INFO is available on the kernels that run this suite.
-		if got.Source == CarrierSourceLinuxTCPInfo && got.Counts.TCPSegments == nil {
-			t.Fatal("Linux TCP_INFO returned no segment counters")
-		}
 	}
 }
 

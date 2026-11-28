@@ -3,6 +3,7 @@ package zmux
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"regexp"
@@ -24,7 +25,7 @@ func TestGoroutineLabels(t *testing.T) {
 func testGoroutineLabels(t *testing.T) {
 	a, b := net.Pipe()
 	gate := &writerGate{Conn: a}
-	client, server := pair(t, gate, b, &Config{Clock: timeshim.Real}, &Config{Clock: timeshim.Real})
+	client, server := pair(t, gate, b, &Config{ClockDomain: NewClockDomain(timeshim.Real)}, &Config{ClockDomain: NewClockDomain(timeshim.Real)})
 	synctest.Wait()
 	profile := func() bytes.Buffer {
 		var buf bytes.Buffer
@@ -35,7 +36,8 @@ func testGoroutineLabels(t *testing.T) {
 	}
 	count := func(buf bytes.Buffer, task string, want int) {
 		t.Helper()
-		re := regexp.MustCompile(`# labels: \{"zmux":"` + task + `", "zmux.pipe":"0", "zmux.role":"(initiator|responder)", "zmux.session":"[0-9]+"\}`)
+		re := regexp.MustCompile(fmt.Sprintf(`# labels: \{"zmux":%q, "zmux.pipe":"0", "zmux.role":"(initiator|responder)", "zmux.session":"(%d|%d)"\}`,
+			task, client.id, server.id))
 		if n := len(re.FindAll(buf.Bytes(), -1)); n != want {
 			t.Fatalf("%d %s goroutines with the session labels, want %d", n, task, want)
 		}
@@ -79,8 +81,9 @@ func testGoroutineLabels(t *testing.T) {
 	if gate.overlap.Load() {
 		t.Fatal("concurrent writes on lane zero")
 	}
-	for _, m := range regexp.MustCompile(`# labels: \{[^}]*\}`).FindAll(buf.Bytes(), -1) {
-		if !regexp.MustCompile(`^# labels: \{("zmux(\.[a-z]+)?":"[a-z0-9-]+"(, )?)+\}$`).Match(m) {
+	testSession := regexp.MustCompile(fmt.Sprintf(`# labels: \{[^}]*"zmux.session":"(%d|%d)"[^}]*}`, client.id, server.id))
+	for _, m := range testSession.FindAll(buf.Bytes(), -1) {
+		if !regexp.MustCompile(`^# labels: \{("zmux(\.[a-z]+)?":"[a-z0-9-]+"(, )?)+}$`).Match(m) {
 			t.Errorf("unexpected labels %s", m)
 		}
 	}

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/internal/wire"
@@ -27,7 +28,7 @@ func TestDatagramMaxPayloadIsSendable(t *testing.T) {
 		name string
 		tls  bool
 		max  int
-	}{{"tcp", false, 65535 - 2}, {"tls", true, wire.DefaultMaxRecordSize - 2}} {
+	}{{"tcp", false, 65535 - 3}, {"tls", true, wire.DefaultMaxRecordSize - 3}} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, p := channelSession(t, nil, false)
 			p.out.lanes[0].info.TLS = tc.tls
@@ -49,7 +50,7 @@ func TestDatagramMaxPayloadIsSendable(t *testing.T) {
 			// Queued before the peer's limits were known, too large for
 			// any record: dropped, and the next one still goes.
 			s.peerSeen = false
-			if err := s.SendDatagram(nil, 0, make([]byte, 70000)); err != nil {
+			if err := s.SendDatagram(nil, 0, make([]byte, 70000)); !errors.Is(err, ErrNotNegotiated) {
 				t.Fatal(err)
 			}
 			s.peerSeen = true
@@ -59,7 +60,7 @@ func TestDatagramMaxPayloadIsSendable(t *testing.T) {
 			if n := datagramFrames(t, s, p); n != 1 {
 				t.Fatalf("%d DATAGRAM frames after a too-large one, want 1", n)
 			}
-			if st := s.SessionStats(); st.DatagramsDroppedSend != 1 {
+			if st := s.SessionStats(); st.DatagramsDroppedSend != 0 {
 				t.Fatalf("DatagramsDroppedSend %d", st.DatagramsDroppedSend)
 			}
 		})
@@ -86,8 +87,8 @@ func TestDatagramAtRecordFloor(t *testing.T) {
 	s, p := channelSession(t, nil, false)
 	p.out.lanes[0].info.MaxRecord = 8192
 	m := s.MaxDatagramPayload(1)
-	if m != 8192-2 {
-		t.Fatalf("MaxDatagramPayload %d, want %d", m, 8192-2)
+	if m != 8192-3 {
+		t.Fatalf("MaxDatagramPayload %d, want %d", m, 8192-3)
 	}
 	if err := s.SendDatagram(nil, 0, make([]byte, m+1)); err == nil {
 		t.Fatal("one byte above the maximum was accepted")
@@ -99,7 +100,7 @@ func TestDatagramAtRecordFloor(t *testing.T) {
 		t.Fatalf("%d DATAGRAM frames sent, want 1", n)
 	}
 	s.peerSeen = false
-	if err := s.SendDatagram(nil, 0, make([]byte, 9000)); err != nil {
+	if err := s.SendDatagram(nil, 0, make([]byte, 9000)); !errors.Is(err, ErrNotNegotiated) {
 		t.Fatal(err)
 	}
 	s.peerSeen = true
@@ -109,15 +110,15 @@ func TestDatagramAtRecordFloor(t *testing.T) {
 	if n := datagramFrames(t, s, p); n != 1 {
 		t.Fatalf("%d DATAGRAM frames after a too-large one, want 1", n)
 	}
-	if st := s.SessionStats(); st.DatagramsDroppedSend != 1 {
+	if st := s.SessionStats(); st.DatagramsDroppedSend != 0 {
 		t.Fatalf("DatagramsDroppedSend %d", st.DatagramsDroppedSend)
 	}
-	// A lane of the pipe carries the pipe's cap: it lowers the bound too.
+	// Datagrams use lane zero, so a narrower alternate lane does not lower the bound.
 	s.peerMaxRecord = 65535
 	p.out.lanes[0].info.MaxRecord = 0
 	l := &outLane{lane: 1, info: CarrierInfo{MaxRecord: 8192}}
 	p.out.lanes = append(p.out.lanes, l)
-	if m := s.MaxDatagramPayload(1); m != 8192-2 {
+	if m := s.MaxDatagramPayload(1); m != 65535-3 {
 		t.Fatalf("with a capped lane: %d", m)
 	}
 }

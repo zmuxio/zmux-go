@@ -1,7 +1,6 @@
 package seal_test
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdh"
@@ -11,13 +10,12 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/zmuxio/zmux-go"
+	"github.com/zmuxio/zmux-go/internal/testpeer"
 	"github.com/zmuxio/zmux-go/seal"
 	"github.com/zmuxio/zmux-go/seal/proto"
 )
@@ -49,108 +47,20 @@ func interopKeys(t *testing.T) (handle, psk []byte) {
 	return h, p
 }
 
-type interopPeer struct {
-	lines chan string
-	held  []string
-}
-
-// startInteropPeer runs the peer; it must exit within five seconds of the
-// test's end, or it is killed.
-func startInteropPeer(t *testing.T, args ...string) *interopPeer {
+func startInteropPeer(t *testing.T, args ...string) *testpeer.Process {
 	t.Helper()
-	bin := os.Getenv("ZMUX_INTEROP_PEER")
-	if bin == "" {
-		t.Skip("ZMUX_INTEROP_PEER not set")
-	}
-	cmd := exec.Command(bin, args...)
-	cmd.Stderr = os.Stderr
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	p := &interopPeer{lines: make(chan string, 16)}
-	done := make(chan error, 1)
-	go func() {
-		sc := bufio.NewScanner(out)
-		var outErr error
-		for sc.Scan() {
-			select {
-			case p.lines <- sc.Text():
-			default:
-				outErr = errors.New("peer output queue exceeded its bound")
-				_ = cmd.Process.Kill()
-			}
-			if outErr != nil {
-				break
-			}
-		}
-		close(p.lines)
-		_, _ = io.Copy(io.Discard, out)
-		if err := cmd.Wait(); outErr == nil {
-			outErr = err
-		}
-		done <- outErr
-	}()
-	t.Cleanup(func() {
-		select {
-		case err := <-done:
-			if err != nil && !t.Failed() {
-				t.Errorf("peer failed: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
-			err := <-done
-			if !t.Failed() {
-				t.Errorf("peer did not exit: %v", err)
-			}
-		}
-	})
-	return p
-}
-
-// expect consumes the first line with prefix, in whatever order the peer
-// printed it relative to its other reports: the peer prints some of them
-// from concurrent tasks ("KEYS" may come before "ESTABLISHED"), so a line
-// expect passes over is held for a later expect, never dropped. The root,
-// seal and zmuxws interop tests keep identical copies of this helper (the
-// submodules require a published root version, so they cannot share one).
-func (p *interopPeer) expect(t *testing.T, prefix string) string {
-	t.Helper()
-	for i, l := range p.held {
-		if rest, ok := strings.CutPrefix(l, prefix); ok {
-			p.held = append(p.held[:i], p.held[i+1:]...)
-			return strings.TrimSpace(rest)
-		}
-	}
-	deadline := time.After(15 * time.Second)
-	for {
-		select {
-		case l, ok := <-p.lines:
-			if !ok {
-				t.Fatalf("peer exited before %q (held %q)", prefix, p.held)
-			}
-			if rest, ok := strings.CutPrefix(l, prefix); ok {
-				return strings.TrimSpace(rest)
-			}
-			p.held = append(p.held, l)
-		case <-deadline:
-			t.Fatalf("peer: no %q (held %q)", prefix, p.held)
-		}
-	}
+	return testpeer.Start(t, testpeer.Command(t, "ZMUX_INTEROP_PEER", args...), true)
 }
 
 // interopScript compares the exporters, echoes 1 MiB, and has the peer close
 // the session with an application error.
-func interopScript(t *testing.T, ctx context.Context, c *zmux.Conn, p *interopPeer) {
+func interopScript(t *testing.T, ctx context.Context, c *zmux.Conn, p *testpeer.Process) {
 	t.Helper()
 	got, err := c.ExportKeyingMaterial("EXPORTER-interop-app", nil, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if theirs := p.expect(t, "KEYS "); theirs != hex.EncodeToString(got) {
+	if theirs := p.Expect(t, "KEYS "); theirs != hex.EncodeToString(got) {
 		t.Fatalf("exporters differ: peer %s, here %x", theirs, got)
 	}
 	msg := make([]byte, 1<<20)
@@ -175,7 +85,7 @@ func interopScript(t *testing.T, ctx context.Context, c *zmux.Conn, p *interopPe
 	if !errors.As(err, &ae) || ae.ErrorCode != 7 || ae.ErrorMessage != "bye" || !ae.Remote {
 		t.Fatalf("close: %v", err)
 	}
-	p.expect(t, "CLOSED")
+	p.Expect(t, "CLOSED")
 }
 
 func interopConfig() *zmux.Config { return &zmux.Config{EnableDatagrams: true} }
@@ -184,7 +94,7 @@ func TestInteropEstablishClient(t *testing.T) {
 	for _, pr := range interopProfiles {
 		t.Run(strconv.FormatUint(uint64(pr), 10), func(t *testing.T) {
 			p := startInteropPeer(t, "seal-server", strconv.FormatUint(uint64(pr), 10))
-			addr := p.expect(t, "LISTEN ")
+			addr := p.Expect(t, "LISTEN ")
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			nc, err := net.Dial("tcp", addr)
@@ -211,7 +121,7 @@ func TestInteropEstablishClient(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = c.Close() }()
-			p.expect(t, "ESTABLISHED")
+			p.Expect(t, "ESTABLISHED")
 			interopScript(t, ctx, c, p)
 		})
 	}
@@ -244,14 +154,14 @@ func TestInteropEstablishServer(t *testing.T) {
 			go func() { defer close(served); _ = l.Serve(ctx, ln) }()
 			defer func() { cancel(); _ = ln.Close(); <-served }()
 			p := startInteropPeer(t, "seal-client", ln.Addr().String(), strconv.FormatUint(uint64(pr), 10))
-			if got := p.expect(t, "PROFILE "); got != strconv.FormatUint(uint64(pr), 10) {
+			if got := p.Expect(t, "PROFILE "); got != strconv.FormatUint(uint64(pr), 10) {
 				t.Fatalf("profile %s", got)
 			}
 			c, err := l.Accept(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
-			p.expect(t, "ESTABLISHED")
+			p.Expect(t, "ESTABLISHED")
 			interopScript(t, ctx, c, p)
 		})
 	}
@@ -259,13 +169,3 @@ func TestInteropEstablishServer(t *testing.T) {
 
 // The peer prints some reports from concurrent tasks; expect must hold the
 // line it passes over for the next expect.
-func TestInteropExpectOutOfOrder(t *testing.T) {
-	p := &interopPeer{lines: make(chan string, 4)}
-	p.lines <- "KEYS 00ff"
-	p.lines <- "ESTABLISHED"
-	close(p.lines)
-	p.expect(t, "ESTABLISHED")
-	if got := p.expect(t, "KEYS "); got != "00ff" {
-		t.Fatalf("KEYS %q", got)
-	}
-}

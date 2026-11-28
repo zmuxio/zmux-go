@@ -222,15 +222,13 @@ type exportVector struct {
 }
 
 type handshakeVector struct {
-	Name string `json:"name"`
 	parties
-	// PQConfidential is the Profile's PQ confidentiality.
-	PQConfidential  bool `json:"pq_confidential"`
-	RecordsUseSplit bool `json:"records_use_split"`
 	// VerifyServer is the client's verification of message 2, VerifyClient
 	// the server's of message 3, when the vector has one.
 	VerifyServer   *verifyVector `json:"verify_server,omitempty"`
 	VerifyClient   *verifyVector `json:"verify_client,omitempty"`
+	Exporter       exportVector  `json:"exporter"`
+	Name           string        `json:"name"`
 	NoiseName      string        `json:"noise_name"`
 	Prologue       hexb          `json:"prologue"`
 	Messages       []msgVector   `json:"messages"`
@@ -239,7 +237,9 @@ type handshakeVector struct {
 	SplitC1        hexb          `json:"split_c1"`
 	SplitC2        hexb          `json:"split_c2"`
 	ExporterSecret hexb          `json:"exporter_secret"`
-	Exporter       exportVector  `json:"exporter"`
+	// PQConfidential is the Profile's PQ confidentiality.
+	PQConfidential  bool `json:"pq_confidential"`
+	RecordsUseSplit bool `json:"records_use_split"`
 }
 
 // MarshalJSON keeps the key order of the shared specification vectors.
@@ -1245,9 +1245,6 @@ func TestDispatchVectors(t *testing.T) {
 		c, _ := admit.ClassifyFirstBytes(v.Bytes, f)
 		if (c == admit.FirstBytesRecord) != v.Record || (v.Hello && c != admit.FirstBytesOther) {
 			t.Errorf("% x on %s: classified %v", []byte(v.Bytes), v.Framing, c)
-		}
-		if len(v.Bytes) > 0 && IsHelloFirstByte(v.Bytes[0]) != v.Hello {
-			t.Errorf("% x on %s: Hello test", []byte(v.Bytes), v.Framing)
 		}
 		if class, need := dispatchClass(v.Bytes, framingOf(v.Framing)); class != v.Class || need != v.Need {
 			t.Errorf("% x on %s: %s %d, want %s %d", []byte(v.Bytes), v.Framing, class, need, v.Class, v.Need)

@@ -19,7 +19,22 @@ const (
 	SourceQUICGo                  Source = "quic_go"
 )
 
-type CarrierID struct{ serial uint64 }
+type carrierIdentity struct{ _ [3]uintptr }
+
+type CarrierID struct{ identity *carrierIdentity }
+
+func NewCarrierID() CarrierID { return CarrierID{identity: new(carrierIdentity)} }
+
+type WeakCarrierID struct{ identity weak.Pointer[carrierIdentity] }
+
+func Weaken(id CarrierID) WeakCarrierID {
+	return WeakCarrierID{identity: weak.Make(id.identity)}
+}
+
+func OnCarrierRelease[T any](id CarrierID, cleanup func(T), arg T) {
+	runtime.AddCleanup(id.identity, cleanup, arg)
+}
+
 type Direction string
 
 const Outbound Direction = "outbound"
@@ -33,25 +48,28 @@ type Observation struct {
 	At     time.Time
 	Source Source
 	Readout
-	ID         CarrierID
-	Generation uint64
+	Interval             time.Duration
+	DeltaSent, DeltaLost uint64
+	ID                   CarrierID
+	Generation           uint64
+	LossVersion          uint64
 }
 
 // Sampler serializes native reads and publishes the pair with its metadata.
 type Sampler struct {
-	mu        sync.Mutex
+	queriedAt time.Time
 	read      func() Readout
+	firstDone chan struct{}
+	source    Source
 	last      Observation
 	baseline  Readout
-	source    Source
+	mu        sync.Mutex
 	inFlight  bool
-	firstDone chan struct{}
 }
 
 var registry struct {
 	caches map[weak.Pointer[byte]]cacheEntry
 	sync.Mutex
-	next uint64
 }
 
 type cacheEntry struct {
@@ -69,6 +87,7 @@ func cache(conn *byte, source Source, makeRead func() func() Readout) *Sampler {
 			entry.sampler.read = makeRead()
 			entry.sampler.source = source
 			entry.sampler.last = Observation{ID: entry.sampler.last.ID, Source: source}
+			entry.sampler.queriedAt, entry.sampler.baseline = time.Time{}, Readout{}
 			entry.sampler.mu.Unlock()
 			registry.caches[key] = cacheEntry{entry.sampler, source}
 		}
@@ -77,9 +96,8 @@ func cache(conn *byte, source Source, makeRead func() func() Readout) *Sampler {
 	if registry.caches == nil {
 		registry.caches = make(map[weak.Pointer[byte]]cacheEntry)
 	}
-	registry.next++
 	sampler := &Sampler{read: makeRead(), source: source, last: Observation{
-		ID: CarrierID{serial: registry.next}, Source: source,
+		ID: NewCarrierID(), Source: source,
 	}}
 	registry.caches[key] = cacheEntry{sampler, source}
 	runtime.AddCleanup(conn, func(key weak.Pointer[byte]) {
@@ -169,8 +187,8 @@ func Sample(s *Sampler) Observation {
 func (s *Sampler) sample(now func() time.Time, start func(func())) Observation {
 	s.mu.Lock()
 	last := s.last
-	if s.inFlight || !last.At.IsZero() && (s.source == SourceWindowsSIOTCPInfo ||
-		s.source == SourceUnknown || now().Sub(last.At) < time.Second) {
+	if s.inFlight || !s.queriedAt.IsZero() && (s.source == SourceWindowsSIOTCPInfo ||
+		s.source == SourceUnknown || now().Sub(s.queriedAt) < time.Second) {
 		s.mu.Unlock()
 		return last
 	}
@@ -198,6 +216,8 @@ func (s *Sampler) query(now func() time.Time, read func() Readout, source Source
 	if source != s.source {
 		return // The provider was superseded during the query.
 	}
+	s.queriedAt = at
+	previous := s.last
 	s.last.Source = source
 	if next.Known {
 		raw := next
@@ -221,6 +241,18 @@ func (s *Sampler) query(now func() time.Time, read func() Readout, source Source
 			}
 		}
 		s.baseline = next
+	}
+	if !previous.At.IsZero() && (!next.Known || previous.Generation == s.last.Generation && next.Sent == previous.Sent) {
+		return
+	}
+	s.last.Interval, s.last.DeltaSent, s.last.DeltaLost = 0, 0, 0
+	if previous.Known && next.Known && previous.Generation == s.last.Generation &&
+		next.Sent > previous.Sent && next.Lost >= previous.Lost && at.After(previous.At) {
+		s.last.Interval = at.Sub(previous.At)
+		s.last.DeltaSent, s.last.DeltaLost = next.Sent-previous.Sent, next.Lost-previous.Lost
+	}
+	if previous.Interval > 0 && s.last.Interval == 0 {
+		s.last.LossVersion++
 	}
 	s.last.At, s.last.Readout = at, next
 }

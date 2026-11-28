@@ -32,6 +32,9 @@ const (
 // CodeCancelled is ZMUX_CANCELLED, the code of a stream released unfinished.
 const CodeCancelled uint64 = 0x5a4d0001
 
+// CodePacketError is ZMUX_PACKET_ERROR, the code for malformed capsules.
+const CodePacketError uint64 = 0x5a4d0004
+
 // CodeRejected is ZMUX_REJECTED, an application-level stream refusal.
 const CodeRejected uint64 = 0x5a4d0002
 

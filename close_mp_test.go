@@ -4,62 +4,47 @@ import (
 	"context"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
-// twoPipeSession returns a client and server session with a standby pipe
-// joined to pipe 0.
-func twoPipeSession() (*Conn, *Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cfg := &Config{MaxPipes: 2, PipeAuth: PipeAuth{PSK: []byte("an example pre-shared key, 32 B"), EndToEnd: true}}
-	l := mustNewListener(&ListenerConfig{Config: cfg})
-	defer func() { _ = l.Close() }()
-	a0, b0 := net.Pipe()
-	a1, b1 := net.Pipe()
-	go func() { _ = l.HandlePipe(ctx, NetPipe(b0), PipeHint{}) }()
-	go func() { _ = l.HandlePipe(ctx, NetPipe(b1), PipeHint{}) }()
-	client, err := Client(ctx, a0, cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-	server, err := l.Accept(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	p, err := client.AddPipe(ctx, NetPipe(a1), PipeOptions{Label: "backup", SendStandby: Set(true)})
-	if err != nil {
-		return client, server, err
-	}
-	for {
-		ev, err := client.NextEvent(ctx)
-		if err != nil {
-			return client, server, err
-		}
-		if ev.Kind == EventPipeJoined && ev.PipeID == p.ID() {
-			break
-		}
-	}
-	return client, server, nil
-}
-
-// TestCloseWhileJoinedPipeFails closes both ends of a two-pipe session at
-// once, many times: a pipe that fails before it carried CONNECTION_CLOSE
-// must not leave the other end CLOSING for ever.
+// A failed close write on a joined pipe must not keep the session in
+// CLOSING. The peer still receives the close on the healthy pipe.
 func TestCloseWhileJoinedPipeFails(t *testing.T) {
-	for i := range 200 {
-		c, s, err := twoPipeSession()
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		e := newMemMPEnv(t, mpConfig(), mpConfig())
+		nc, err := e.dial(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = c.Close()
-		_ = s.Close()
-		done := make(chan struct{})
-		go func() { _ = c.Wait(); _ = s.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("run %d: a session did not end after Close", i)
+		carrier := &failCloseWrite{Conn: nc}
+		if _, err := e.client.AddPipe(ctx, NetPipe(carrier), PipeOptions{SendStandby: Set(true)}); err != nil {
+			t.Fatal(err)
 		}
+		synctest.Wait()
+		carrier.armed = true
+		_ = e.client.CloseWithError(7, "bye")
+		synctest.Wait()
+		if !carrier.failed {
+			t.Fatal("the joined carrier did not attempt its close write")
+		}
+		waitTestSignal(t, e.client.Done(), "client session end")
+		waitTestSignal(t, e.server.Done(), "server session end")
+		wantAppClose(t, "the peer", e.server.Wait(), 7, "bye", true)
+	})
+}
+
+type failCloseWrite struct {
+	net.Conn
+	armed, failed bool // accessed between synctest quiescence points
+}
+
+func (c *failCloseWrite) Write(b []byte) (int, error) {
+	if c.armed {
+		c.failed = true
+		return 0, net.ErrClosed
 	}
+	return c.Conn.Write(b)
 }

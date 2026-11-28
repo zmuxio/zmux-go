@@ -157,15 +157,22 @@ func TestMultipathAtRecordFloor(t *testing.T) {
 		_ = ln.Close()
 		_ = lst.Close()
 	}()
-	for range 2 {
-		if _, err := cli.AddPipe(ctx, capped(dial(), sealedFloorCap), PipeOptions{}); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := cli.AddPipe(ctx, capped(dial(), sealedFloorCap), PipeOptions{}); err != nil {
+		t.Fatal(err)
 	}
 	if err := cli.AdvanceEpoch(); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, 30*time.Second, "epoch 1 at both ends", func() bool { return cli.Epoch() == 1 && srv.Epoch() == 1 })
+	waitEpochCommit(t, cli, srv)
+	// Receiving a Join in the new epoch also selects it for the responder.
+	joined, err := cli.AddPipe(ctx, capped(dial(), sealedFloorCap), PipeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitTestAttachment(t, ctx, joined, srv)
+	if cli.Epoch() != 1 || srv.Epoch() != 1 {
+		t.Fatalf("committed epochs: client %d, server %d", cli.Epoch(), srv.Epoch())
+	}
 	cli.SetScheduler(SchedulerSpreadRoundRobin())
 	for _, pair := range [][2]*Conn{{cli, srv}, {srv, cli}} {
 		from, to := pair[0], pair[1]

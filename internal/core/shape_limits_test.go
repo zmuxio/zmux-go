@@ -16,7 +16,7 @@ func TestDisableShapingWithoutShaper(t *testing.T) {
 	}
 }
 
-// injectShaper asks for one injection of n frame bytes when installed.
+// injectShaper asks for one injection on its start timer.
 type injectShaper struct {
 	injected []int
 	n        int
@@ -27,12 +27,14 @@ func (x *injectShaper) Plan(*shaping.RecordView, *shaping.RecordPlan) {}
 func (x *injectShaper) OnEvent(e *shaping.Event, r *shaping.Effects) {
 	switch e.Kind {
 	case shaping.EventStart:
+		r.Set, r.HasWake, r.Wake = shaping.EffectWake, true, e.Now+1
+	case shaping.EventTimer:
 		r.Set = shaping.EffectInject
-		r.HasInject, r.InjectAt, r.InjectLen = true, e.Now, wireOf(x.n, true, 0)
-	case shaping.EventInjected:
+		r.Injection = shaping.Injection{ID: 1, At: e.Now, PadBytes: x.n}
+	case shaping.EventInjectionAccepted:
 		x.injected = append(x.injected, e.Len)
 		r.Set = shaping.EffectInject
-	case shaping.EventInjectDropped:
+	case shaping.EventInjectionRejected:
 		r.Set = shaping.EffectInject
 	default: // the other events need no reply
 	}
@@ -58,6 +60,7 @@ func injectSession(t *testing.T, lim shaping.Limits, n int) (*Session, *Pipe, *i
 	s, p := channelSession(t, nil, false)
 	s.peerZmux = true
 	s.cfg.ShapeLimits = lim
+	s.cfg.ShapeBudget.Wire = lim.Wire
 	sh := &injectShaper{n: n}
 	s.SetShaper(func(uint64, uint8, int) shaping.Shaper { return sh })
 	return s, p, sh
@@ -71,7 +74,7 @@ func poll(t *testing.T, s *Session, p *Pipe, limit int, now Time) []int {
 		return nil
 	}
 	sizes := recordSizes(b)
-	s.WriteDone(b, nil, now)
+	s.WriteDone(b, b.Len(), nil, now)
 	return sizes
 }
 
@@ -80,7 +83,7 @@ func TestShapingNoInjection(t *testing.T) {
 	for _, lim := range []shaping.Limits{{NoInjection: true}, {NoPadding: true}} {
 		s, p, sh := injectSession(t, lim, 1000)
 		now := Time(Second)
-		s.shapeTimeout(now)
+		s.HandleTimeout(now)
 		poll(t, s, p, DefaultBatch, now)
 		if len(sh.injected) != 0 {
 			t.Fatalf("%+v: injected %v", lim, sh.injected)
@@ -91,7 +94,7 @@ func TestShapingNoInjection(t *testing.T) {
 // An injection that does not fit the room left in a batch that already
 // holds records waits for the next batch, which it leads at full length.
 func TestShapingInjectWaitsForBatchRoom(t *testing.T) {
-	s, p, sh := injectSession(t, shaping.Limits{}, 4000)
+	s, p, sh := injectSession(t, shaping.Limits{Wire: &shaping.Account{Ceiling: 5000, Initial: 5000}}, 4000)
 	s.peer.MaxStreamDataBidiRem = 1 << 20
 	s.loc[0].limit = 10
 	s.conn.sendMax = 1 << 20
@@ -103,7 +106,7 @@ func TestShapingInjectWaitsForBatchRoom(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := Time(Second)
-	s.shapeTimeout(now)
+	s.HandleTimeout(now)
 	poll(t, s, p, 6000, now)
 	if len(sh.injected) != 0 {
 		t.Fatalf("injected %v in a batch without room", sh.injected)
@@ -119,14 +122,14 @@ func TestShapingInjectWaitsForBatchRoom(t *testing.T) {
 
 // SetShapeLimits carries the account over: what was spent stays spent.
 func TestShapingSetLimitsRuntime(t *testing.T) {
-	s, _, _ := injectSession(t, shaping.Limits{Wire: shaping.Account{Initial: 1000}}, 0)
+	s, _, _ := injectSession(t, shaping.Limits{Wire: &shaping.Account{Ceiling: 1000, Initial: 1000}}, 0)
 	s.shp.acct.spend(500)
-	s.SetShapeLimits(shaping.Limits{Wire: shaping.Account{Initial: 100}})
+	s.SetShapeLimits(shaping.Limits{Wire: &shaping.Account{Ceiling: 100, Initial: 100}})
 	if l := s.shp.acct.left(); l != 100 {
 		t.Fatalf("left %d", l)
 	}
-	s.SetShapeLimits(shaping.Limits{Wire: shaping.Account{Initial: 300}})
-	if l := s.shp.acct.left(); l != 300 || s.shp.acct.spent != 500 {
+	s.SetShapeLimits(shaping.Limits{Wire: &shaping.Account{Ceiling: 300, Initial: 300}})
+	if l := s.shp.acct.left(); l != 100 || s.shp.acct.spent != 500 {
 		t.Fatalf("left %d spent %d", l, s.shp.acct.spent)
 	}
 }

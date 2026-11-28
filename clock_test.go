@@ -3,135 +3,134 @@ package zmux
 import (
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/timeshim"
 )
 
-// Tests of Config.Clock: a fake clock drives the session timers, so hours
-// of session time pass in well under a second of real time.
-
 // fakeConfigs returns two multipath configs sharing a fake clock.
 func fakeConfigs(edit func(*Config)) (*timeshim.Fake, *Config, *Config) {
-	clk := timeshim.NewFake(time.Unix(1_000_000, 0))
+	clk := timeshim.NewFake(time.Now())
+	domain := NewClockDomain(clk)
 	mk := func() *Config {
 		c := mpConfig()
-		c.Clock = clk
+		c.ClockDomain = domain
 		edit(c)
 		return c
 	}
 	return clk, mk(), mk()
 }
 
-// step advances clk by d in increments of inc, letting the drivers process
-// what each increment sent before the next.
-func step(clk *timeshim.Fake, d, inc time.Duration) {
-	for end := clk.Now().Add(d); clk.Now().Before(end); {
-		clk.Advance(min(inc, end.Sub(clk.Now())))
-		time.Sleep(time.Millisecond)
-	}
-}
-
-// waitErr waits up to wall for c to end while it keeps clk moving in
-// steps of a second. A Fake calls a timer armed for a time already past at
-// its next Advance, not on its own: a driver that lags behind step and
-// arms the deadline it computed after the last step's Advance would
-// otherwise wait for an Advance that never comes.
-func waitErr(t *testing.T, clk *timeshim.Fake, c *Conn, wall time.Duration) error {
-	t.Helper()
-	done := make(chan error, 1)
-	go func() { done <- c.Wait() }()
-	stop := time.After(wall)
-	tick := time.NewTicker(time.Millisecond)
-	defer tick.Stop()
+// advanceClock runs the scheduled deadlines in order, allowing each to
+// finish its I/O and schedule new work before advancing to the next.
+func advanceClock(clk *timeshim.Fake, d time.Duration) {
+	end := clk.Now().Add(d)
 	for {
-		select {
-		case err := <-done:
-			return err
-		case <-tick.C:
-			clk.Advance(time.Second)
-		case <-stop:
-			t.Fatal("session did not end")
-			return nil
+		synctest.Wait()
+		next, ok := clk.Next()
+		if !ok || next.After(end) {
+			clk.AdvanceTo(end)
+			synctest.Wait()
+			return
 		}
+		clk.AdvanceTo(next)
 	}
 }
 
 func TestFakeClockIdleTimeout(t *testing.T) {
 	t.Parallel()
-	clk, cc, sc := fakeConfigs(func(c *Config) {
-		c.MaxIdleTimeout = time.Hour
-		c.Liveness.KeepAlivePeriod = -1
+	synctest.Test(t, func(t *testing.T) {
+		clk, cc, sc := fakeConfigs(func(c *Config) {
+			c.MaxIdleTimeout = time.Hour
+			c.Liveness.KeepAlivePeriod = -1
+		})
+		e := newMemMPEnv(t, cc, sc)
+		cleanupFakeMPEnv(t, e, clk)
+		advanceClock(clk, 59*time.Minute)
+		if e.client.closingNow() {
+			t.Fatalf("closed before the idle timeout: %v", e.client.closedErr())
+		}
+		advanceClock(clk, 2*time.Minute)
+		waitTestSignal(t, e.client.Done(), "client idle timeout")
+		waitTestSignal(t, e.server.Done(), "server idle timeout")
+		// The first end to time out can also close the other end's carrier.
+		if !errors.Is(e.client.closedErr(), ErrIdleTimeout) && !errors.Is(e.server.closedErr(), ErrIdleTimeout) {
+			t.Fatalf("client ended with %v, server with %v", e.client.closedErr(), e.server.closedErr())
+		}
 	})
-	e := newMPEnv(t, cc, sc)
-	start := time.Now()
-	step(clk, 59*time.Minute, time.Minute)
-	if e.client.closingNow() {
-		t.Fatalf("closed before the idle timeout: %v", e.client.closedErr())
-	}
-	step(clk, 2*time.Minute, time.Minute)
-	// Both ends hold the same timeout: the one whose timer fires first ends
-	// with it and closes its carrier, which the other sees as lost pipes.
-	if err := waitErr(t, clk, e.client, 5*time.Second); !errors.Is(err, ErrIdleTimeout) &&
-		!errors.Is(e.server.closedErr(), ErrIdleTimeout) {
-		t.Fatalf("session ended with %v (server: %v)", err, e.server.closedErr())
-	}
-	if el := time.Since(start); el > 10*time.Second {
-		t.Fatalf("an hour of fake time took %v", el)
-	}
 }
 
 func TestFakeClockKeepAliveAndProbes(t *testing.T) {
 	t.Parallel()
-	clk, cc, sc := fakeConfigs(func(c *Config) {
-		c.MaxIdleTimeout = time.Minute
-		c.Liveness.KeepAlivePeriod = 10 * time.Second
-		c.Liveness.ProbeInterval = 5 * time.Second
-	})
-	e := newMPEnv(t, cc, sc)
-	pings := func() (n uint64) {
-		for _, st := range e.client.PipeStats() {
-			n += st.PingsSent
+	synctest.Test(t, func(t *testing.T) {
+		clk, cc, sc := fakeConfigs(func(c *Config) {
+			c.MaxIdleTimeout = time.Minute
+			c.Liveness.KeepAlivePeriod = 10 * time.Second
+			c.Liveness.ProbeInterval = 5 * time.Second
+		})
+		e := newMemMPEnv(t, cc, sc)
+		cleanupFakeMPEnv(t, e, clk)
+		pings := func() (n uint64) {
+			for _, st := range e.client.PipeStats() {
+				n += st.PingsSent
+			}
+			return n
 		}
-		return n
-	}
-	base := pings()
-	// Ten idle timeouts pass: keep-alive holds the session open.
-	step(clk, 10*time.Minute, 250*time.Millisecond)
-	if e.client.closingNow() || e.server.closingNow() {
-		t.Fatalf("session closed with keep-alive: %v", e.client.closedErr())
-	}
-	// Probes (5 s interval) and keep-alive pings ran on the fake clock:
-	// at least one per keep-alive period.
-	if n := pings() - base; n < 60 {
-		t.Fatalf("%d probes in 10 min of fake time", n)
-	}
+		base := pings()
+		// Ten idle timeouts pass: keep-alive holds the session open.
+		advanceClock(clk, 10*time.Minute)
+		if e.client.closingNow() || e.server.closingNow() {
+			t.Fatalf("session closed with keep-alive: %v", e.client.closedErr())
+		}
+		if n := pings() - base; n < 60 {
+			t.Fatalf("%d probes in 10 min of fake time", n)
+		}
+	})
 }
 
 func TestFakeClockResumeGrace(t *testing.T) {
 	t.Parallel()
-	clk, cc, sc := fakeConfigs(func(c *Config) {
-		c.MaxIdleTimeout = -1
-		c.Liveness.KeepAlivePeriod = -1
-		c.ResumeTimeout = 10 * time.Minute
+	synctest.Test(t, func(t *testing.T) {
+		clk, cc, sc := fakeConfigs(func(c *Config) {
+			c.MaxIdleTimeout = -1
+			c.Liveness.KeepAlivePeriod = -1
+			c.ResumeTimeout = 10 * time.Minute
+		})
+		e := newMemMPEnv(t, cc, sc)
+		cleanupFakeMPEnv(t, e, clk)
+		ps := e.client.Pipes()
+		if len(ps) != 1 {
+			t.Fatalf("%d pipes", len(ps))
+		}
+		if err := ps[0].Abort(); err != nil {
+			t.Fatal(err)
+		}
+		advanceClock(clk, 9*time.Minute)
+		if e.client.closingNow() {
+			t.Fatalf("closed within the grace period: %v", e.client.closedErr())
+		}
+		if !e.client.ConnectionState().Suspended {
+			t.Fatal("session did not suspend")
+		}
+		advanceClock(clk, 2*time.Minute)
+		waitTestSignal(t, e.client.Done(), "resume timeout")
+		if err := e.client.Wait(); !errors.Is(err, ErrResumeTimeout) {
+			t.Fatalf("session ended with %v", err)
+		}
 	})
-	e := newMPEnv(t, cc, sc)
-	ps := e.client.Pipes()
-	if len(ps) != 1 {
-		t.Fatalf("%d pipes", len(ps))
-	}
-	_ = ps[0].Close()
-	step(clk, 9*time.Minute, 10*time.Second)
-	if e.client.closingNow() {
-		t.Fatalf("closed within the grace period: %v", e.client.closedErr())
-	}
-	if !e.client.ConnectionState().Resume {
-		t.Fatal("resume not in use")
-	}
-	step(clk, 2*time.Minute, 10*time.Second)
-	if err := waitErr(t, clk, e.client, 5*time.Second); !errors.Is(err, ErrResumeTimeout) {
-		t.Fatalf("session ended with %v", err)
-	}
+}
+
+func cleanupFakeMPEnv(t *testing.T, e *mpEnv, clk *timeshim.Fake) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, c := range []*Conn{e.client, e.server} {
+			for _, p := range c.Pipes() {
+				_ = p.Abort()
+			}
+		}
+		advanceClock(clk, time.Hour)
+	})
 }
 
 // backwardClock reads earlier than the reading a session starts from.
@@ -153,7 +152,7 @@ func TestClockNeverNegative(t *testing.T) {
 			t.Fatalf("host clock read %d right after its start", now)
 		}
 	}
-	c := newClock(&backwardClock{Fake: timeshim.NewFake(time.Unix(1_000_000, 0))})
+	c := newClock(NewClockDomain(&backwardClock{Fake: timeshim.NewFake(time.Unix(1_000_000, 0))}))
 	if now := c.now(); now != 0 {
 		t.Fatalf("configured clock stepped back: read %d", now)
 	}

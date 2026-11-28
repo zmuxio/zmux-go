@@ -2,45 +2,56 @@ package zmuxquic
 
 import (
 	"context"
-	"io"
+	"crypto/tls"
+	"errors"
+	"os"
 	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/djylb/timeshim"
 	"github.com/quic-go/quic-go"
 	"github.com/zmuxio/zmux-go"
 	"github.com/zmuxio/zmux-go/admit"
 	"github.com/zmuxio/zmux-go/carrier"
+	"github.com/zmuxio/zmux-go/internal/prefixtest"
 )
 
-// TestServeAdmission admits connections whose first stream starts with a
-// valid prefix token, from Dial and a ConnPool with a CarrierCredential, and closes
-// one whose first stream does not.
-func TestServeAdmission(t *testing.T) {
+func serveAdmissionFixture(t *testing.T, cfg *zmux.Config, adm *zmux.Admission) (*zmux.Listener, string, *tls.Config, context.Context) {
+	t.Helper()
 	srv, cli := tlsConfigs(t)
 	ln, err := quic.ListenAddr("127.0.0.1:0", srv, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	auth := &admit.PrefixAuth{Key: []byte("k"), Slot: 30 * time.Second, BindTLS: true}
-	v, err := admit.NewPrefixAuthVerifier(auth, admit.PrefixAuthVerifierOptions{Skew: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	adm := &zmux.Admission{Peek: admit.PrefixTokenLen, PeekTimeout: time.Second, Decide: v.Decide,
-		StallMin: 10 * time.Millisecond, StallMax: 20 * time.Millisecond}
-	lst := mustNewListener(&zmux.ListenerConfig{Config: mpConfig(), Admission: adm})
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	lst := mustNewListener(&zmux.ListenerConfig{Config: cfg, Admission: adm})
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	listener := &trackedListener{ConnListener: ln}
 	done := make(chan struct{})
-	go func() { _ = Serve(ctx, lst, ln); close(done) }()
-	defer func() { cancel(); _ = ln.Close(); _ = lst.Close(); <-done }()
+	go func() { _ = Serve(ctx, lst, listener); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		_ = ln.Close()
+		_ = lst.Close()
+		<-done
+		listener.closeAll()
+	})
+	return lst, ln.Addr().String(), cli, ctx
+}
+
+// TestServeAdmission admits connections whose first stream starts with a
+// valid prefix token, from Dial and a ConnPool with a CarrierCredential.
+func TestServeAdmission(t *testing.T) {
+	auth, v, _ := prefixtest.New(t, admit.PrefixCarrierOptions{BindTLS: true}, zmux.VerdictClose)
+	adm := v.Admission()
+	adm.PeekTimeout = -1
+	lst, addr, cli, ctx := serveAdmissionFixture(t, mpConfig(), adm)
 
 	// A valid carrier: Dial presents the credential on its first stream.
 	cfg := mpConfig()
 	cfg.CarrierCredential = auth
-	c, err := Dial(ctx, ln.Addr().String(), cli, nil, cfg)
+	c, err := Dial(ctx, addr, cli, nil, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +67,7 @@ func TestServeAdmission(t *testing.T) {
 
 	// A pool presents it on the first stream of each connection: a
 	// bootstrap, a join on its connection, a join on a second connection.
-	pool := NewConnPool(ln.Addr().String(), cli, nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
+	pool := NewConnPool(addr, cli, nil, auth, carrier.PoolLimits{MaxPipesPerConnection: 2})
 	defer pool.Shutdown()
 	first, err := pool.OpenPipe(ctx)
 	if err != nil {
@@ -73,7 +84,11 @@ func TestServeAdmission(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.AddPipe(ctx, pio, zmux.PipeOptions{}); err != nil {
+		joined, err := c.AddPipe(ctx, pio, zmux.PipeOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := joined.WaitAttached(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -85,12 +100,23 @@ func TestServeAdmission(t *testing.T) {
 	_ = s.Close()
 	_ = c.Wait()
 	_ = s.Wait()
+}
 
-	// A first stream without a token.
-	qc, err := quic.DialAddr(ctx, ln.Addr().String(), cli, QUICConfig(nil))
+func TestServeAdmissionInvalidTokenStalls(t *testing.T) {
+	_, v, _ := prefixtest.New(t, admit.PrefixCarrierOptions{BindTLS: true}, zmux.VerdictStall)
+	clk := timeshim.NewFake(time.Now())
+	conf := mpConfig()
+	conf.ClockDomain = zmux.NewClockDomain(clk)
+	const stall = 20 * time.Millisecond
+	adm := v.Admission()
+	adm.PeekTimeout, adm.StallMin, adm.StallMax = -1, stall, stall
+	lst, addr, cli, ctx := serveAdmissionFixture(t, conf, adm)
+
+	qc, err := quic.DialAddr(ctx, addr, cli, QUICConfig(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = qc.CloseWithError(0, "") }()
 	p, err := ConnPipe(ctx, qc)
 	if err != nil {
 		t.Fatal(err)
@@ -98,13 +124,29 @@ func TestServeAdmission(t *testing.T) {
 	if _, err := p.W.Write(make([]byte, admit.PrefixTokenLen)); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := io.ReadAll(p.R); len(n) != 0 {
-		t.Fatalf("read %d bytes", len(n))
+	if err := clk.WaitDeadline(ctx, clk.Now().Add(stall)); err != nil {
+		t.Fatalf("rejected carrier did not stall: %v", err)
+	}
+	clk.Advance(stall)
+	deadline, _ := ctx.Deadline()
+	r := p.R.(*qReader)
+	if err := r.SetReadDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.Read(make([]byte, 1)); n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("rejected carrier read %d bytes, %v", n, err)
 	}
 	select {
 	case <-qc.Context().Done():
+		cause := context.Cause(qc.Context())
+		if err, ok := errors.AsType[*quic.ApplicationError](cause); !ok || !err.Remote {
+			t.Fatalf("rejected carrier closed for %v", cause)
+		}
 	case <-ctx.Done():
 		t.Fatal("the connection was not closed")
+	}
+	if got := lst.Stats().Admission.Stalled; got != 1 {
+		t.Fatalf("stalled carriers = %d, want 1", got)
 	}
 }
 
@@ -119,7 +161,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 		t.Fatal(err)
 	}
 	var decided atomic.Int32
-	adm := &zmux.Admission{Peek: 4, PeekTimeout: time.Second,
+	adm := &zmux.Admission{Peek: 4, PeekTimeout: -1,
 		Decide: func(context.Context, zmux.CarrierInfo, []byte) zmux.Decision {
 			decided.Add(1)
 			return zmux.Decision{Verdict: zmux.VerdictAccept}
@@ -135,16 +177,7 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for {
-		if _, ok := cli.ClientSessionCache.Get("localhost"); ok {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("session ticket not received")
-		case <-time.After(time.Millisecond):
-		}
-	}
+	waitTicket(t, ctx, cli)
 	_ = warm.CloseWithError(0, "")
 
 	early, err := quic.DialAddrEarly(ctx, ln.Addr().String(), cli, QUICConfig(nil))
@@ -161,6 +194,10 @@ func TestServeAdmissionRejectsEarlyData(t *testing.T) {
 	}
 	select {
 	case <-early.Context().Done():
+		err, ok := errors.AsType[*quic.ApplicationError](context.Cause(early.Context()))
+		if !ok || !err.Remote {
+			t.Fatalf("first stream rejected with %v", context.Cause(early.Context()))
+		}
 	case <-ctx.Done():
 		t.Fatal("the connection was not closed")
 	}
@@ -181,7 +218,7 @@ func TestServeAdmissionMore(t *testing.T) {
 		t.Fatal(err)
 	}
 	header := append([]byte{0x01, 20}, make([]byte, 18)...)
-	adm := &zmux.Admission{Peek: 2, MaxPeek: 64, PeekTimeout: 5 * time.Second,
+	adm := &zmux.Admission{Peek: 2, MaxPeek: 64, PeekTimeout: -1,
 		Decide: func(_ context.Context, _ zmux.CarrierInfo, prefix []byte) zmux.Decision {
 			if c, _ := admit.ClassifyFirstBytes(prefix, zmux.FramingByteStream); c != admit.FirstBytesOther || prefix[0] != 0x01 {
 				return zmux.Decision{Verdict: zmux.VerdictClose}

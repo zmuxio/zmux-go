@@ -21,7 +21,7 @@ func pollKinds(t *testing.T, s *Session, p *Pipe, rounds int) []wire.Kind {
 		for _, r := range batchFrames(t, b) {
 			all = append(all, r...)
 		}
-		s.WriteDone(b, nil, now)
+		s.WriteDone(b, b.Len(), nil, now)
 		PutBatch(b)
 	}
 	return all
@@ -79,7 +79,7 @@ func TestJoinSecretEarlyNotSelected(t *testing.T) {
 		t.Fatal(err)
 	}
 	held := s.cfg.PSK
-	peer := FloorParams()
+	peer := DefaultConfig().Local
 	if err := s.processPeerParams(&peer); err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func pollStream(t *testing.T, s *Session, p *Pipe) []wire.Frame {
 	now := Time(Second)
 	s.PollTransmit(p.id, 0, b, DefaultBatch, now)
 	fs := streamFrames(t, b)
-	s.WriteDone(b, nil, now)
+	s.WriteDone(b, b.Len(), nil, now)
 	return fs
 }
 
@@ -177,7 +177,7 @@ func TestFlushFrames(t *testing.T) {
 		if _, err := wire.DecodeFrame(rec, &f); err != nil || f.Kind != wire.KindStopSending || f.StreamID != st.id {
 			t.Fatalf("frame %+v, stream %d, %v", f, st.id, err)
 		}
-		s.WriteDone(b, nil, Time(Second))
+		s.WriteDone(b, b.Len(), nil, Time(Second))
 		PutBatch(b)
 	}
 }
@@ -203,7 +203,7 @@ func TestRestartPreambleBlocked(t *testing.T) {
 		t.Fatal("not opened before the restart")
 	}
 	s.peerSeen = false
-	if !s.RestartEarly(CarrierInfo{}, nil, Time(Second)) {
+	if !s.RestartEarly(CarrierInfo{}, nil, false, Time(Second)) {
 		t.Fatal("RestartEarly refused")
 	}
 	if k := pollKinds(t, s, p, 2); slices.Contains(k, wire.KindStream) {
@@ -213,7 +213,7 @@ func TestRestartPreambleBlocked(t *testing.T) {
 	peer.Preamble = 16
 	peer.MaxStreamDataBidiRem = 16
 	record := func(f []byte) {
-		s.Receive(p.id, 0, nil, append(varint.AppendVarint(nil, uint64(len(f))), f...), Time(Second))
+		receiveTest(s, p.id, 0, append(varint.AppendVarint(nil, uint64(len(f))), f...), Time(Second))
 	}
 	enc, _ := wire.AppendParams(nil, &peer)
 	record(wire.AppendTransportParams(nil, enc))
@@ -309,7 +309,7 @@ func TestRestartEarlyRequeuesPriority(t *testing.T) {
 		t.Fatalf("PRIORITY_UPDATE not written: %v", k)
 	}
 	s.peerSeen = false
-	if !s.RestartEarly(CarrierInfo{}, nil, Time(Second)) {
+	if !s.RestartEarly(CarrierInfo{}, nil, false, Time(Second)) {
 		t.Fatal("RestartEarly refused")
 	}
 	if st.ctl&ctlPrio == 0 {

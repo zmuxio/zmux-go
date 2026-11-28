@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
@@ -84,7 +86,7 @@ func TestCapsuleVectors(t *testing.T) {
 		var got []capsulePacket
 		skipped, errName := 0, ""
 		for len(b) > 0 {
-			h, need, err := parseCapsuleHeader(b, c.MaxPayload)
+			h, need, err := parseCapsuleHeader(b, c.MaxPayload, packetUnknownLimit(c.MaxPayload))
 			if err == nil && need > 0 {
 				err = errCapsuleTruncated // the stream ends here
 			}
@@ -222,9 +224,14 @@ func TestPacketStreamVectorsOnWire(t *testing.T) {
 // context IDs on both paths, DatagramOnly failures, MaxPacket.
 func TestPacketStreamPolicies(t *testing.T) {
 	leakcheck.Check(t)
-	client, server := packetEnv(t, true)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	synctest.Test(t, testPacketStreamPolicies)
+}
+
+func testPacketStreamPolicies(t *testing.T) {
+	a, b := net.Pipe()
+	cfg := &Config{EnableDatagrams: true}
+	client, server := pair(t, a, b, cfg, cfg)
+	ctx := t.Context()
 	cs, ss := openPackets(t, ctx, client, server)
 	w := mustPackets(t, cs, nil)
 	r := mustPackets(t, ss, nil)
@@ -276,6 +283,7 @@ func TestPacketStreamPolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 	read(small, 3, true)
+	synctest.Wait() // Complete the sender's I/O callback before reading its stats.
 	if st := do.Stats(); st.DroppedTooLarge != 1 || st.SentDatagrams != 1 {
 		t.Fatalf("DatagramOnly stats %+v", st)
 	}
@@ -331,33 +339,48 @@ func TestPacketStreamWithoutDatagrams(t *testing.T) {
 // with another buffer.
 func TestPacketStreamResumesInterruptedRead(t *testing.T) {
 	leakcheck.Check(t)
-	client, server := packetEnv(t, false)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cs, ss := openPackets(t, ctx, client, server)
-	r := mustPackets(t, ss, nil)
-	payload := []byte("0123456789")
-	full := append(appendCapsuleHeader(nil, 9, len(payload)), payload...)
-	if _, err := cs.Write(full[:6]); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 64)
-	short, scancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	_, err := r.ReadPacket(short, buf)
-	scancel()
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("interrupted read: %v", err)
-	}
-	clear(buf)
-	if _, err := cs.Write(full[6:]); err != nil {
-		t.Fatal(err)
-	}
-	pk, err := r.ReadPacket(ctx, nil)
-	if err != nil || pk.ContextID != 9 || !bytes.Equal(pk.Data, payload) {
-		t.Fatalf("resumed read: %+v %v", pk, err)
-	}
-	_ = cs.Close()
-	_ = ss.Close()
+	synctest.Test(t, func(t *testing.T) {
+		client, server := bubblePair(t, func() *Config { return &Config{} })
+		ctx := t.Context()
+		cs, ss := openPackets(t, ctx, client, server)
+		r := mustPackets(t, ss, nil)
+		payload := []byte("0123456789")
+		full := append(appendCapsuleHeader(nil, 9, len(payload)), payload...)
+		if _, err := cs.Write(full[:6]); err != nil {
+			t.Fatal(err)
+		}
+		if err := cs.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 64)
+		readCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		read := make(chan error, 1)
+		go func() { _, err := r.ReadPacket(readCtx, buf); read <- err }()
+		synctest.Wait()
+		select {
+		case err := <-read:
+			t.Fatalf("incomplete capsule returned: %v", err)
+		default:
+		}
+		if got := ss.Stats().BytesRead; got != 6 {
+			t.Fatalf("read %d bytes before cancellation, want the six-byte prefix", got)
+		}
+		cancel()
+		if err := <-read; !errors.Is(err, context.Canceled) {
+			t.Fatalf("interrupted read: %v", err)
+		}
+		clear(buf)
+		if _, err := cs.Write(full[6:]); err != nil {
+			t.Fatal(err)
+		}
+		pk, err := r.ReadPacket(ctx, nil)
+		if err != nil || pk.ContextID != 9 || !bytes.Equal(pk.Data, payload) {
+			t.Fatalf("resumed read: %+v %v", pk, err)
+		}
+		_ = cs.Close()
+		_ = ss.Close()
+	})
 }
 
 // TestPacketStreamConcurrentReadWrite runs one reader and one writer on
@@ -432,10 +455,11 @@ func TestPacketStreamCancelledWriteSendsNothing(t *testing.T) {
 	if err != nil || pk.ContextID != 2 || string(pk.Data) != "kept" {
 		t.Fatalf("first packet %+v %v", pk, err)
 	}
-	short, c2 := context.WithTimeout(ctx, 100*time.Millisecond)
-	defer c2()
-	if pk, err := r.ReadPacket(short, nil); err == nil {
-		t.Fatalf("a cancelled write was sent: %+v", pk)
+	if err := cs.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if pk, err := r.ReadPacket(ctx, nil); !errors.Is(err, io.EOF) {
+		t.Fatalf("after the only packet: %+v, %v", pk, err)
 	}
 }
 

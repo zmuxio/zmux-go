@@ -7,4 +7,4 @@ set -eu
 cd "$(dirname "$0")"
 out=${1:-${OUT:-$PWD/out}}
 mkdir -p "$out"
-GOWORK=off timeout 300 go build -o "$out/dgpeer" .
+GOMAXPROCS=4 GOWORK=off timeout -k 5s 120s go build -p 4 -o "$out/dgpeer" .

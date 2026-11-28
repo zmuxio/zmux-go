@@ -14,24 +14,23 @@ import (
 // dialAddr keeps the destination's UDP family instead of binding a dual-stack
 // wildcard. In particular, Darwin may assign that wildcard an IPv4 listener's
 // port, causing local handshake replies to return to the listener itself.
-func dialAddr(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config, early bool) (*quic.Conn, error) {
-	qc, err := dialNative(ctx, addr, tlsConf, conf, early)
+func dialAddr(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config, early bool) (*quic.Conn, <-chan struct{}, error) {
+	qc, socketDone, err := dialNative(ctx, addr, tlsConf, conf, early)
 	if err != nil || !early {
-		return qc, err
+		return qc, socketDone, err
 	}
 	if err = handshakeReady(ctx, qc); err != nil {
 		_ = qc.CloseWithError(0, "")
-		return nil, err
+		return nil, nil, err
 	}
-	return qc, nil
+	return qc, socketDone, nil
 }
 
 // dialNative dials over a socket that carrierio.DialPacket owns. Production
-// stream users enter through dialAddr/ConnPipe, which apply the temporary
-// handshake barrier.
-func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config, early bool) (*quic.Conn, error) {
+// stream users enter through dialAddr/ConnPipe, which apply the handshake barrier.
+func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *quic.Config, early bool) (*quic.Conn, <-chan struct{}, error) {
 	if tlsConf == nil {
-		return nil, errors.New("zmuxquic: TLS config required")
+		return nil, nil, errors.New("zmuxquic: TLS config required")
 	}
 	if tlsConf.ServerName == "" {
 		tlsConf = tlsConf.Clone()
@@ -49,9 +48,9 @@ func dialNative(ctx context.Context, addr string, tlsConf *tls.Config, conf *qui
 	})
 }
 
-// handshakeReady is a temporary quic-go v0.64.1 boundary: opening native streams
-// during 0-RTT can race peer transport-parameter updates. Remove this barrier
-// only after the preserved upstream rejection reproducer passes under -race:
+// handshakeReady keeps outgoing streams in 1-RTT. Opening native streams
+// during 0-RTT has raced peer transport-parameter updates. Before restoring
+// native early streams, run the preserved upstream reproducer under -race:
 //
 //	go test -race -tags=quicgo_upstream_repro ./zmuxquic -run TestQuicGoUpstreamEarlyStreamRejection -count=20
 //

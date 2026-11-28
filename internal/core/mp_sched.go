@@ -22,6 +22,7 @@ type decision struct {
 	p         *Pipe
 	g         *gate // &gb, or nil when no pipe is usable
 	fastest   *Pipe // the eligible pipe of p's tier with the smallest ETA for a chunk
+	blockedBy *Pipe // the preferred open path, when a lower tier is held
 	lv        *levelStats
 	gb        gate
 	tier      int
@@ -29,6 +30,7 @@ type decision struct {
 	open      bool
 	usable    bool
 	takes     bool
+	probe     bool // a diagnostic decision never registers or moves work
 }
 
 // newDecision prepares the decision for pipe p now.
@@ -41,7 +43,7 @@ func (s *Session) newDecision(d *decision, p *Pipe) {
 	}
 	d.multiTier = len(d.g.tiers) > 1
 	d.usable = d.g.usable(s, p)
-	d.takes = s.takes(d.g, p)
+	d.takes, d.blockedBy = s.tierRequirement(d.g, p)
 	d.tier = d.g.tierOf(p)
 	if d.tier >= 0 {
 		d.fastest = s.fastestIn(d.g, d.tier, uint64(s.cfg.SpreadChunk), nil)
@@ -100,15 +102,17 @@ func (s *Session) onPipe(d *decision, st *Stream) bool {
 		if m.resend.len() > 0 {
 			r := m.resend.first()
 			if m.repair.source != nil && m.repair.covers(r.lo) {
-				target, eligible := s.prefixReplacement(d.g, m.repair.source, min64(r.hi, m.repair.hi)-r.lo)
+				target, _, eligible := s.prefixTarget(d.g, m.repair.source, m.repair.anchor, min64(r.hi, m.repair.hi)-r.lo)
 				switch {
 				case target != nil:
-					return s.chosen(p, target)
+					return s.chosen(d, target)
 				case eligible:
 					_, native := s.planNativeResend(st)
 					bypass = !native
 				default:
-					s.retryPrefixTail(st)
+					if !d.probe {
+						s.retryPrefixTail(st)
+					}
 				}
 			}
 		}
@@ -125,30 +129,34 @@ func (s *Session) onPipe(d *decision, st *Stream) bool {
 	}
 	switch s.policyOf(st) {
 	case PolicyAffinity:
-		return d.usable && s.chosen(p, s.affinityTarget(d, st))
+		return d.usable && s.chosen(d, s.affinityTarget(d, st))
 	case PolicyCustom:
 		return s.customOK(d, st)
 	case PolicySpreadETA:
 		if !d.takes {
 			return false
 		}
-		return s.chosen(p, s.spreadETATarget(d, st))
+		return s.chosen(d, s.spreadETATarget(d, st))
 	case PolicySpreadRoundRobin, PolicySpreadRateWeighted:
-		return d.takes && s.chosen(p, s.rrPick(d.g, d.tier, st))
+		return d.takes && s.chosen(d, s.rrPick(d.g, d.tier, st))
 	case PolicySessionAffinity:
-		return d.takes && s.chosen(p, d.g.tiers[d.tier].active)
+		return d.takes && s.chosen(d, d.g.tiers[d.tier].active)
 	}
 	return false
 }
 
 // chosen reports whether the policy chose p; when it chose another pipe,
 // that pipe's writer is woken to take the chunk.
-func (s *Session) chosen(p, q *Pipe) bool {
-	if q == p {
+func (s *Session) chosen(d *decision, q *Pipe) bool {
+	if q == d.p {
 		return true
 	}
-	if q != nil && q.out != nil {
-		s.wakePipe(q)
+	if !d.probe && q != nil && q.out != nil {
+		if ol := q.out.lane(0); ol != nil && ol.writing {
+			ol.placementWaiting = true
+		} else {
+			s.wakePipe(q)
+		}
 	}
 	return false
 }
@@ -156,6 +164,7 @@ func (s *Session) chosen(p, q *Pipe) bool {
 // chunkSent runs after new stream data of st, [off, off+n), went on p.
 func (s *Session) chunkSent(d *decision, w *recWriter, st *Stream, off, n uint64, fin bool) {
 	p := d.p
+	s.replicaBytes(streamApplicationBytes(st, off, n), false)
 	switch s.policyOf(st) {
 	case PolicyAffinity:
 		s.bindOnSend(d, st)
@@ -171,6 +180,10 @@ func (s *Session) chunkSent(d *decision, w *recWriter, st *Stream, off, n uint64
 	if d.g != nil {
 		s.copyChunk(d, w, st, off, n, fin)
 	}
+}
+
+func streamApplicationBytes(st *Stream, off, n uint64) uint64 {
+	return n - min(n, st.snd.preLen-min(st.snd.preLen, off))
 }
 
 // ---- estimates ----
@@ -882,6 +895,9 @@ func (s *Session) bindOnSend(d *decision, st *Stream) {
 	if m.bind.set && m.bind.pipe == p.id && !m.bind.moving {
 		return
 	}
+	if m.bind.set {
+		s.invalidateDeliveryBinding(m.bind.pipe)
+	}
 	sampled := d.g != nil && s.allSampled(d.g)
 	m.bind = binding{pipe: p.id, set: true, provisional: !sampled, epoch: s.mp.aff.epoch}
 	if !sampled {
@@ -992,9 +1008,9 @@ func (s *Session) refreshBindings(g *gate) {
 		if target != nil && target.id != b.pipe {
 			e := s.expectedBytes(st)
 			af.load[b.pipe] -= min64(af.load[b.pipe], e)
+			s.invalidateDeliveryBinding(b.pipe)
 			b.moving, b.moveTo = true, target.id
 			af.load[target.id] += e
-			s.noteBlocked(st)
 		}
 	}
 }
@@ -1010,18 +1026,25 @@ func containsU64(x []uint64, v uint64) bool {
 // waits for it up to pickWait, then takes the affinity choice for the
 // chunk (a miss, counted).
 func (s *Session) customOK(d *decision, st *Stream) bool {
+	if d.probe && st.snd.mps == nil {
+		return false
+	}
 	m := st.snd.mpState()
 	mp := s.mp
 	a := m.pick
 	if a.set && a.gen == mp.pickGen {
 		if !a.wait {
-			return a.pipe == d.p.id && s.pipeTakesAny(d.p)
+			q := s.pipe(a.pipe)
+			return q != nil && s.pipeTakesAny(q) && s.chosen(d, q)
 		}
 		if a.epoch == mp.inputEpoch {
 			return false
 		}
 	}
 	if !a.asked || a.gen != mp.pickGen {
+		if d.probe {
+			return false
+		}
 		m.pick = pickAnswer{asked: true, gen: mp.pickGen, askedAt: s.now}
 		if !mp.pickTimer || s.now.Add(pickWait) < mp.pickDeadline {
 			mp.pickTimer, mp.pickDeadline = true, s.now.Add(pickWait)
@@ -1036,8 +1059,10 @@ func (s *Session) customOK(d *decision, st *Stream) bool {
 	if s.now.Sub(a.askedAt) < pickWait {
 		return false
 	}
-	s.stats.SchedulerFallbacks++
-	return d.usable && s.affinityTarget(d, st) == d.p
+	if !d.probe {
+		s.stats.SchedulerFallbacks++
+	}
+	return d.usable && s.chosen(d, s.affinityTarget(d, st))
 }
 
 // pickWait is how long a direction waits for the policy's answer.

@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
 
+	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/varint"
 )
 
@@ -171,6 +173,17 @@ func NewPacketStream(st *Stream, opts *PacketOptions) (*PacketStream, error) {
 // unusable for packets: its sending part is reset with ZMUX_CANCELLED and
 // later writes fail.
 func (p *PacketStream) WritePacket(ctx context.Context, contextID uint64, b []byte) error {
+	return p.WritePacketWith(ctx, contextID, b, DatagramSendOptions{})
+}
+
+// WritePacketWith applies the datagram options for one hop.
+func (p *PacketStream) WritePacketWith(ctx context.Context, contextID uint64, b []byte, o DatagramSendOptions) error {
+	if p == nil || p.st == nil {
+		return net.ErrClosed
+	}
+	if err := o.validate(); err != nil {
+		return err
+	}
 	defer runtime.KeepAlive(p.st)
 	if len(b) > p.max {
 		return ErrPacketTooLarge
@@ -182,30 +195,31 @@ func (p *PacketStream) WritePacket(ctx context.Context, contextID uint64, b []by
 		return fmt.Errorf("%w: Context ID above 2^62-1", ErrInvalidConfig)
 	}
 	h := p.st.h
-	if p.policy != PacketStreamOnly {
-		if p.policy == PacketPreferDatagram && len(b) > p.st.MaxDatagramPayload(contextID) {
-			return p.writeCapsule(ctx, contextID, b)
-		}
-		limited, err := h.c.sendDatagramLimited(h.st, contextID, b)
-		var tl *DatagramTooLargeError
-		switch {
-		case limited:
-			p.cnt.limited.Add(1)
-			return nil
-		case err == nil:
-			p.cnt.sentDgram.Add(1)
-			return nil
-		case p.policy == PacketPreferDatagram && (errors.As(err, &tl) || errors.Is(err, ErrNotNegotiated)):
-			// The bound shrank since it was read.
-		case errors.As(err, &tl):
-			p.cnt.tooLarge.Add(1)
-			return err
-		default:
-			return err
-		}
+	representation := core.DatagramOnly
+	switch p.policy {
+	case PacketStreamOnly:
+		representation = core.CapsuleOnly
+	case PacketPreferDatagram:
+		representation = core.DatagramOrCapsule
+	case PacketDatagramOnly:
 	}
-	return p.writeCapsule(ctx, contextID, b)
+	admission, err := h.c.admitDatagram(ctx, core.DatagramRequest{
+		Stream: h.st, Context: contextID, Payload: b, Options: h.c.clk.datagramOptions(o), At: h.c.clk.now(),
+		Representation: representation, FirstDatagram: p.countSentDatagram,
+	})
+	if admission == core.DatagramCapsule {
+		return p.writeCapsule(ctx, contextID, b)
+	}
+	if drop, ok := errors.AsType[DatagramDroppedError](err); ok && drop.Reason == DatagramDropLimiter {
+		p.cnt.limited.Add(1)
+	}
+	if _, ok := errors.AsType[*DatagramTooLargeError](err); ok {
+		p.cnt.tooLarge.Add(1)
+	}
+	return err
 }
+
+func (p *PacketStream) countSentDatagram(_ bool) { p.cnt.sentDgram.Add(1) }
 
 func (p *PacketStream) writeCapsule(ctx context.Context, cx uint64, b []byte) error {
 	p.wmu.Lock()
@@ -325,7 +339,7 @@ func (p *PacketStream) ReadPacket(ctx context.Context, buf []byte) (Packet, erro
 // is complete (inValue) or the chunk is used up.
 func (p *PacketStream) readHeader() error {
 	for {
-		h, need, err := parseCapsuleHeader(p.hdr[:p.hn], p.max)
+		h, need, err := parseCapsuleHeader(p.hdr[:p.hn], p.max, packetUnknownLimit(p.max))
 		if err != nil {
 			return err
 		}
@@ -428,12 +442,14 @@ func varintNeed(b []byte) int {
 	return 1<<(b[0]>>6) - len(b)
 }
 
+func packetUnknownLimit(maxPayload int) uint64 { return min(MaxRecordSize, uint64(maxPayload)+8) }
+
 // parseCapsuleHeader parses a capsule header (Type, Length, and for
 // DATAGRAM the Context ID) at the start of b with a receive bound of limit
 // payload bytes; need is the bytes still missing (0: complete). A Length
-// above limit + 8 (any type), a DATAGRAM payload above limit, and a DATAGRAM
+// above maxUnknown for an unknown type, a DATAGRAM payload above limit, and a DATAGRAM
 // Value too short for its Context ID are errors.
-func parseCapsuleHeader(b []byte, limit int) (h capsuleHeader, need int, err error) {
+func parseCapsuleHeader(b []byte, limit int, maxUnknown uint64) (h capsuleHeader, need int, err error) {
 	typ, i := varint.ConsumeVarint(b)
 	if i == 0 {
 		return h, varintNeed(b), nil
@@ -443,13 +459,16 @@ func parseCapsuleHeader(b []byte, limit int) (h capsuleHeader, need int, err err
 		return h, varintNeed(b[i:]), nil
 	}
 	i += k
-	if ln > uint64(limit)+8 {
-		return h, 0, errCapsuleOversized
-	}
 	h.typ = typ
 	if typ != capsuleDatagram {
+		if ln > maxUnknown {
+			return h, 0, errCapsuleOversized
+		}
 		h.payload, h.n = ln, i
 		return h, 0, nil
+	}
+	if ln > uint64(limit)+8 {
+		return h, 0, errCapsuleOversized
 	}
 	if ln == 0 {
 		return h, 0, errCapsuleTruncated

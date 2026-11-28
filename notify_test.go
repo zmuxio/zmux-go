@@ -13,9 +13,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/djylb/netx"
+	"github.com/djylb/timeshim"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
 
@@ -23,7 +25,7 @@ import (
 // is readable on ss.
 func idlePairT(t *testing.T) (cs, ss *Stream) {
 	t.Helper()
-	cs, ss = streamPairT(t)
+	cs, ss = memStreamPairT(t)
 	if n, err := ss.Read(make([]byte, 1)); n != 1 || err != nil {
 		t.Fatal(n, err)
 	}
@@ -54,10 +56,11 @@ func mustFire(t *testing.T, ch <-chan struct{}, what string) {
 
 func mustNotFire(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
+	synctest.Wait()
 	select {
 	case <-ch:
 		t.Fatalf("%s: notified", what)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 }
 
@@ -102,24 +105,26 @@ func TestNotifyReadableTriggers(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cs, ss := idlePairT(t)
-			if n, err := ss.TryRead(buf); n != 0 || !errors.Is(err, ErrWouldBlock) {
-				t.Fatalf("idle: %d %v", n, err)
-			}
-			ch, calls, stop := note(ss)
-			mustNotFire(t, ch, "idle")
-			tc.event(t, cs, ss)
-			mustFire(t, ch, tc.name)
-			if n, err := ss.TryRead(buf); !tc.check(n, err) {
-				t.Fatalf("TryRead after %s: %d %v", tc.name, n, err)
-			}
-			if stop() {
-				t.Fatal("stop after the call returned true")
-			}
-			time.Sleep(10 * time.Millisecond)
-			if c := calls.Load(); c != 1 {
-				t.Fatalf("%d calls", c)
-			}
+			synctest.Test(t, func(t *testing.T) {
+				cs, ss := idlePairT(t)
+				if n, err := ss.TryRead(buf); n != 0 || !errors.Is(err, ErrWouldBlock) {
+					t.Fatalf("idle: %d %v", n, err)
+				}
+				ch, calls, stop := note(ss)
+				mustNotFire(t, ch, "idle")
+				tc.event(t, cs, ss)
+				mustFire(t, ch, tc.name)
+				if n, err := ss.TryRead(buf); !tc.check(n, err) {
+					t.Fatalf("TryRead after %s: %d %v", tc.name, n, err)
+				}
+				if stop() {
+					t.Fatal("stop after the call returned true")
+				}
+				synctest.Wait()
+				if c := calls.Load(); c != 1 {
+					t.Fatalf("%d calls", c)
+				}
+			})
 		})
 	}
 }
@@ -128,21 +133,24 @@ func TestNotifyReadableTriggers(t *testing.T) {
 // passes, not the old one; a deadline cleared calls nothing.
 func TestNotifyReadableDeadlineMoved(t *testing.T) {
 	leakcheck.Check(t)
-	_, ss := idlePairT(t)
-	_ = ss.SetReadDeadline(time.Now().Add(time.Hour))
-	ch, _, _ := note(ss)
-	_ = ss.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
-	mustFire(t, ch, "moved earlier")
+	synctest.Test(t, func(t *testing.T) {
+		_, ss := idlePairT(t)
+		_ = ss.SetReadDeadline(time.Now().Add(time.Hour))
+		ch, _, _ := note(ss)
+		_ = ss.SetReadDeadline(time.Now().Add(30 * time.Millisecond))
+		mustFire(t, ch, "moved earlier")
 
-	_ = ss.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-	ch, _, stop := note(ss)
-	_ = ss.SetReadDeadline(time.Time{})
-	mustNotFire(t, ch, "cleared")
-	_ = ss.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-	mustFire(t, ch, "set again")
-	if stop() {
-		t.Fatal("stop after the call returned true")
-	}
+		_ = ss.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+		ch, _, stop := note(ss)
+		_ = ss.SetReadDeadline(time.Time{})
+		synctest.Sleep(20 * time.Millisecond)
+		mustNotFire(t, ch, "cleared")
+		_ = ss.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+		mustFire(t, ch, "set again")
+		if stop() {
+			t.Fatal("stop after the call returned true")
+		}
+	})
 }
 
 // A readable stream calls f before NotifyReadable returns.
@@ -162,101 +170,108 @@ func TestNotifyReadableAtRegistration(t *testing.T) {
 // stop before the event keeps f from running; a later registration works.
 func TestNotifyReadableStop(t *testing.T) {
 	leakcheck.Check(t)
-	cs, ss := idlePairT(t)
-	ch, _, stop := note(ss)
-	if !stop() {
-		t.Fatal("stop of a pending call returned false")
-	}
-	if stop() {
-		t.Fatal("second stop returned true")
-	}
-	if _, err := cs.Write([]byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	mustNotFire(t, ch, "stopped")
-	ch2, _, _ := note(ss) // readable now: called at once
-	mustFire(t, ch2, "after stop")
+	synctest.Test(t, func(t *testing.T) {
+		cs, ss := idlePairT(t)
+		ch, _, stop := note(ss)
+		if !stop() {
+			t.Fatal("stop of a pending call returned false")
+		}
+		if stop() {
+			t.Fatal("second stop returned true")
+		}
+		if _, err := cs.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		mustNotFire(t, ch, "stopped")
+		ch2, _, _ := note(ss) // readable now: called at once
+		mustFire(t, ch2, "after stop")
+	})
 }
 
 // f may register again from inside f; a second registration while one is
 // pending panics.
 func TestNotifyReadableReRegister(t *testing.T) {
 	leakcheck.Check(t)
-	cs, ss := idlePairT(t)
-	var got []byte
-	done := make(chan struct{})
-	buf := make([]byte, 4)
-	var f func()
-	f = func() {
-		for {
-			n, err := ss.TryRead(buf)
-			got = append(got, buf[:n]...)
-			switch {
-			case errors.Is(err, ErrWouldBlock):
-				ss.NotifyReadable(f)
-				return
-			case err != nil:
-				close(done)
-				return
+	synctest.Test(t, func(t *testing.T) {
+		cs, ss := idlePairT(t)
+		var got []byte
+		done := make(chan struct{})
+		buf := make([]byte, 4)
+		var f func()
+		f = func() {
+			for {
+				n, err := ss.TryRead(buf)
+				got = append(got, buf[:n]...)
+				switch {
+				case errors.Is(err, ErrWouldBlock):
+					ss.NotifyReadable(f)
+					return
+				case err != nil:
+					close(done)
+					return
+				}
 			}
 		}
-	}
-	ss.NotifyReadable(f)
-	func() {
-		defer func() {
-			if recover() == nil {
-				t.Error("second pending registration did not panic")
-			}
+		ss.NotifyReadable(f)
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Error("second pending registration did not panic")
+				}
+			}()
+			ss.NotifyReadable(func() {})
 		}()
-		ss.NotifyReadable(func() {})
-	}()
-	for _, s := range []string{"ab", "cdefg", "h"} {
-		if _, err := cs.Write([]byte(s)); err != nil {
-			t.Fatal(err)
+		for _, s := range []string{"ab", "cdefg", "h"} {
+			if _, err := cs.Write([]byte(s)); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Wait()
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	_ = cs.Close()
-	mustFire(t, done, "end")
-	if string(got) != "abcdefgh" {
-		t.Fatalf("read %q", got)
-	}
+		_ = cs.Close()
+		mustFire(t, done, "end")
+		if string(got) != "abcdefgh" {
+			t.Fatalf("read %q", got)
+		}
+	})
 }
 
 // Close, which finishes the sending part, and stream datagrams leave the
 // receiving part unreadable.
 func TestNotifyReadableNotTriggered(t *testing.T) {
-	leakcheck.Check(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, ss := idlePairT(t)
-	ch, _, stop := note(ss)
-	_ = ss.Close()
-	mustNotFire(t, ch, "local Close")
-	if !stop() {
-		t.Fatal("stop returned false")
-	}
-
-	a, b := tcpPair(t)
-	cfg := &Config{EnableDatagrams: true}
-	client, server := pair(t, a, b, cfg, cfg)
-	cs, ss2 := openPackets(t, ctx, client, server)
-	ch, _, stop = note(ss2)
-	if _, err := ss2.TryRead(make([]byte, 64)); !errors.Is(err, ErrWouldBlock) {
-		// The preamble is not data; a registration made while it was
-		// pending may already have been called by its arrival.
-		t.Logf("TryRead: %v", err)
-	}
-	if err := cs.SendDatagram(0, []byte("d")); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := ss2.ReceiveDatagram(ctx); err != nil {
-		t.Fatal(err)
-	}
-	mustNotFire(t, ch, "datagram")
-	if !stop() {
-		t.Fatal("stop returned false")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		cfg := &Config{EnableDatagrams: true, ClockDomain: NewClockDomain(timeshim.Real)}
+		client, server := pair(t, a, b, cfg, cfg)
+		cs, ss := openPackets(t, t.Context(), client, server)
+		// The byte follows the preamble on the same stream. The read
+		// synchronizes preamble processing before registering the callback.
+		if _, err := cs.Write([]byte("a")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(ss, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		ch, _, stop := note(ss)
+		defer stop()
+		if err := ss.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := cs.SendDatagram(0, []byte("d")); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := ss.ReceiveDatagram(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		select {
+		case <-ch:
+			t.Fatal("local Close or datagram triggered readability")
+		default:
+		}
+		if !stop() {
+			t.Fatal("stop returned false")
+		}
+	})
 }
 
 // ErrWouldBlock is recognised by its WouldBlock method, without this
@@ -275,38 +290,41 @@ func TestErrWouldBlockMethod(t *testing.T) {
 // when stop lost.
 func TestNotifyReadableStopRace(t *testing.T) {
 	leakcheck.Check(t)
-	cs, ss := idlePairT(t)
-	buf := make([]byte, 64)
-	deadline := time.Now().Add(2 * time.Second)
-	for i := 0; i < 300 && time.Now().Before(deadline); i++ {
-		var calls atomic.Int32
-		stop := ss.NotifyReadable(func() { calls.Add(1) })
-		var wg sync.WaitGroup
-		wg.Go(func() { _, _ = cs.Write([]byte("x")) })
-		if i%2 == 0 {
-			time.Sleep(time.Duration(i%7) * 10 * time.Microsecond)
-		}
-		stopped := stop()
-		wg.Wait()
-		// Let the arrival be delivered, then drain it.
-		for {
-			if n, _ := ss.TryRead(buf); n > 0 {
-				break
-			}
-			if err := ss.WaitReadable(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-		}
-		time.Sleep(time.Millisecond)
-		c := calls.Load()
-		if stopped && c != 0 || !stopped && c != 1 {
-			t.Fatalf("round %d: stop %v, %d calls", i, stopped, c)
-		}
-		for {
-			if _, err := ss.TryRead(buf); errors.Is(err, ErrWouldBlock) {
-				break
-			}
-		}
+	for _, order := range []string{"stop first", "arrival first", "concurrent"} {
+		t.Run(order, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cs, ss := idlePairT(t)
+				ch, calls, stop := note(ss)
+				var stopped bool
+				if order == "stop first" {
+					stopped = stop()
+				}
+				sent := make(chan error, 1)
+				go func() {
+					_, err := cs.Write([]byte("x"))
+					sent <- err
+				}()
+				if order == "arrival first" {
+					<-ch
+				}
+				if order != "stop first" {
+					stopped = stop()
+				}
+				if err := <-sent; err != nil {
+					t.Fatal(err)
+				}
+				if _, err := io.ReadFull(ss, make([]byte, 1)); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				if c := calls.Load(); stopped && c != 0 || !stopped && c != 1 {
+					t.Fatalf("stop %v, %d calls", stopped, c)
+				}
+				if order == "stop first" && !stopped || order == "arrival first" && stopped {
+					t.Fatalf("stop returned %v", stopped)
+				}
+			})
+		})
 	}
 }
 
@@ -420,57 +438,59 @@ func relayStreamReaders() string {
 // Relay waits, on the TCP side, and the stream is read by short tasks that
 // the notification starts, which end again when TryRead would block.
 func TestRelayStreamIdleNoGoroutine(t *testing.T) {
-	leakcheck.Check(t)
-	cs, ss := idlePairT(t)
-	x, y := tcpPair(t)
-	t.Cleanup(func() { _ = x.Close(); _ = y.Close() })
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := netx.Relay(context.Background(), y, StreamConn(ss, nil, nil))
-		done <- err
-	}()
-	// The stream side is idle once it has parked on a fresh notification
-	// and its last copy task has exited. The relay caller waits on TCP.
-	waitIdle := func(previous *readNote) *readNote {
-		t.Helper()
-		var armed *readNote
-		waitUntil(t, 5*time.Second, "idle relay with a pending stream notification and no reader", func() bool {
-			armed = ss.h.rnote.Load()
+	synctest.Test(t, func(t *testing.T) {
+		leakcheck.Check(t)
+		cs, ss := idlePairT(t)
+		x, y := net.Pipe()
+		t.Cleanup(func() { _ = x.Close(); _ = y.Close() })
+		done := make(chan error, 1)
+		go func() {
+			_, _, err := netx.Relay(context.Background(), y, StreamConn(ss, nil, nil))
+			done <- err
+		}()
+		// The stream side is idle once it has parked on a fresh notification
+		// and its last copy task has exited. The relay caller waits on the other side.
+		waitIdle := func(previous *readNote) *readNote {
+			t.Helper()
+			synctest.Wait()
+			armed := ss.h.rnote.Load()
 			if armed == nil || armed == previous || armed.done.Load() || ss.h.readableNow() {
-				return false
+				t.Fatal("idle relay did not park on a fresh notification")
 			}
-			return relayStreamReaders() == ""
-		})
-		return armed
-	}
-	initial := waitIdle(nil)
-	// After traffic both ways the relay is idle again.
-	for range 3 {
-		msg := pattern(100<<10, 3)
-		if _, err := cs.Write(msg); err != nil {
-			t.Fatal(err)
+			if got := relayStreamReaders(); got != "" {
+				t.Fatalf("idle stream copy tasks:\n%s", got)
+			}
+			return armed
 		}
-		got := make([]byte, len(msg))
-		if _, err := io.ReadFull(x, got); err != nil || !bytes.Equal(got, msg) {
-			t.Fatal("stream to TCP", err)
+		initial := waitIdle(nil)
+		// After traffic both ways the relay is idle again.
+		for range 3 {
+			msg := pattern(100<<10, 3)
+			if _, err := cs.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(msg))
+			if _, err := io.ReadFull(x, got); err != nil || !bytes.Equal(got, msg) {
+				t.Fatal("stream to carrier", err)
+			}
+			if _, err := x.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(cs, got); err != nil || !bytes.Equal(got, msg) {
+				t.Fatal("carrier to stream", err)
+			}
 		}
-		if _, err := x.Write(msg); err != nil {
-			t.Fatal(err)
+		waitIdle(initial)
+		_ = cs.Close()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("relay did not end")
 		}
-		if _, err := io.ReadFull(cs, got); err != nil || !bytes.Equal(got, msg) {
-			t.Fatal("TCP to stream", err)
-		}
-	}
-	waitIdle(initial)
-	_ = cs.Close()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("relay did not end")
-	}
+	})
 }
 
 // Whatever ends the stream ends the relay and closes the TCP side.
@@ -498,7 +518,13 @@ func TestRelayStreamEnds(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := startRelay(t)
-			time.Sleep(20 * time.Millisecond) // the relay is idle
+			// Confirm that the relay handled traffic before ending it.
+			if _, err := r.x.Write([]byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(r.cs, make([]byte, 1)); err != nil {
+				t.Fatal(err)
+			}
 			tc.event(r)
 			res := r.wait(t, tc.name)
 			if !tc.check(res.err) {

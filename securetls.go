@@ -49,4 +49,4 @@ func BoundTLS(st tls.ConnectionState) bool {
 func (c *secureTLSConn) TLSRecords() bool { return true }
 
 // Abort closes the connection below TLS, which interrupts a blocked write.
-func (c *secureTLSConn) Abort(error) { _ = c.NetConn().Close() }
+func (c *secureTLSConn) Abort(_ error) { _ = c.NetConn().Close() }

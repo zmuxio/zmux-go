@@ -4,8 +4,8 @@ package zmuxquic
 
 import "testing"
 
-// Explicit dependency reproducer. It intentionally bypasses the adapter's
-// temporary handshake barrier; run under -race before removing that barrier.
+// This dependency reproducer intentionally bypasses the handshake barrier.
+// Run it under -race.
 func TestQuicGoUpstreamEarlyStreamRejection(t *testing.T) {
 	exerciseRejectedEarlyConnection(t, dialNative)
 }

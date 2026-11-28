@@ -105,10 +105,10 @@ func (r *rawReader) SetReadDeadline(t time.Time) error {
 }
 
 // ReadMessage reads a message of a message carrier.
-func (r *rawReader) ReadMessage(limit int) ([]byte, error) {
+func (r *rawReader) ReadMessage(limit int) (zmux.ReceivedMessage, error) {
 	mr, ok := r.ReadCloser.(zmux.MessageReader)
 	if !ok {
-		return nil, errNotMessages
+		return zmux.ReceivedMessage{}, errNotMessages
 	}
 	return mr.ReadMessage(limit)
 }
@@ -134,6 +134,14 @@ func (r *rawReader) ReportsFailure() bool {
 type channelReader struct {
 	*rawReader
 	zmux.DatagramChannel
+}
+
+func (r *channelReader) ChannelCapacityChanged() <-chan struct{} {
+	return carrierio.ChannelCapacityChanged(r.DatagramChannel)
+}
+
+func (r *channelReader) SendChannelDatagramUntil(b []byte, deadline time.Time) error {
+	return carrierio.SendChannelDatagram(r.DatagramChannel, b, deadline)
 }
 
 // rawWriter offers what every carrier can answer. The driver falls back to the TCP socket

@@ -123,8 +123,8 @@ func TestChannelNotHeadOfLineBlocked(t *testing.T) {
 				t.Fatalf("queue probe: %v", err)
 			}
 			if !useChannel {
-				if got := c.ConnectionStats().DatagramsSent; got != 1 {
-					t.Fatalf("record probe passed a blocked writer: sent %d, want only the warm-up", got)
+				if got := server.ConnectionStats().DatagramsReceived; got != 1 {
+					t.Fatalf("record probe passed a blocked writer: received %d, want only the warm-up", got)
 				}
 				release()
 			}
@@ -177,7 +177,7 @@ func dialClient(t *testing.T, e *env, qc *quic.Conn, cfg *zmux.Config) (*zmux.Co
 // Several sessions on one QUIC connection each receive their own
 // datagrams.
 func TestChannelSessionsShareConnection(t *testing.T) {
-	cfg := &zmux.Config{EnableDatagrams: true}
+	cfg := &zmux.Config{EnableDatagrams: true, DatagramQueueDelay: -1}
 	e := newEnv(t, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -192,66 +192,41 @@ func TestChannelSessionsShareConnection(t *testing.T) {
 		c, s := dialClient(t, e, qc, cfg)
 		ps = append(ps, pair{c, s})
 	}
-	// Each server session must know its client: tag by the first datagram.
-	for i, p := range ps {
-		for j := range 20 {
-			if err := p.c.SendDatagramWait(ctx, fmt.Appendf(nil, "%d/%d", i, j)); err != nil {
-				t.Fatal(err)
-			}
-			if err := p.s.SendDatagramWait(ctx, fmt.Appendf(nil, "back %d/%d", i, j)); err != nil {
-				t.Fatal(err)
+	// Keep one datagram outstanding per direction. Distinct payloads still
+	// verify demultiplexing across sessions sharing the connection.
+	for j := range 20 {
+		for i, p := range ps {
+			for _, direction := range []struct {
+				from, to *zmux.Conn
+				prefix   string
+			}{{p.c, p.s, "up"}, {p.s, p.c, "down"}} {
+				want := fmt.Sprintf("%s %d/%d", direction.prefix, i, j)
+				if err := direction.from.SendDatagramWaitWith(ctx, []byte(want), zmux.DatagramSendOptions{Carrier: zmux.DatagramRequireNative}); err != nil {
+					t.Fatalf("send %q: %v", want, err)
+				}
+				if got, err := direction.to.ReceiveDatagram(ctx); err != nil || string(got) != want {
+					t.Fatalf("receive %q: got %q, %v", want, got, err)
+				}
 			}
 		}
 	}
 	for i, p := range ps {
-		for j := range 20 {
-			want := fmt.Sprintf("%d/%d", i, j)
-			got, err := p.s.ReceiveDatagram(ctx)
-			if err != nil || string(got) != want {
-				t.Fatalf("session %d: %q %v, want %q", i, got, err, want)
-			}
-			want = fmt.Sprintf("back %d/%d", i, j)
-			got, err = p.c.ReceiveDatagram(ctx)
-			if err != nil || string(got) != want {
-				t.Fatalf("session %d back: %q %v, want %q", i, got, err, want)
-			}
-		}
-		if cs, ss := p.c.ConnectionStats(), p.s.ConnectionStats(); cs.DatagramsSentChannel != 20 ||
-			ss.DatagramsReceivedChannel != 20 || ss.DatagramsSentChannel != 20 || cs.DatagramsReceivedChannel != 20 {
+		if cs, ss := p.c.ConnectionStats(), p.s.ConnectionStats(); cs.DatagramsReceivedChannel != 20 || ss.DatagramsReceivedChannel != 20 {
 			t.Fatalf("session %d: client %+v server %+v", i, cs, ss)
 		}
 	}
 	if ChannelDropped(qc) != 0 {
 		t.Fatalf("%d dropped", ChannelDropped(qc))
 	}
-	// A datagram naming no pipe is dropped and counted.
-	if err := qc.SendDatagram(carrier.AppendChannelDatagram(nil, true, 1<<20, []byte{0, 'x'})); err != nil {
-		t.Fatal(err)
-	}
-	// The server side counts it; the client's connection object is ours.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		var n uint64
-		connChannels.Range(func(k, v any) bool {
-			if k.(*quic.Conn) != qc {
-				n += v.(*connChannel).demux.Dropped()
-			}
-			return true
-		})
-		if n == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("dropped %d", n)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if dropped := ChannelDropped(e.tl.last()); dropped != 0 {
+		t.Fatalf("server dropped %d valid datagrams", dropped)
 	}
 }
 
 // Datagrams larger than the connection's QUIC datagrams go in records;
 // a peer without QUIC datagrams gets them in records.
 func TestChannelFallback(t *testing.T) {
-	cfg := &zmux.Config{EnableDatagrams: true}
+	cfg := &zmux.Config{EnableDatagrams: true, DatagramQueueDelay: -1}
 	for name, qconf := range map[string]*quic.Config{
 		"too large":    testQUIC(nil),
 		"no datagrams": {EnableDatagrams: false, HandshakeIdleTimeout: 30 * time.Second},
@@ -274,14 +249,12 @@ func TestChannelFallback(t *testing.T) {
 				if err := c.SendDatagramWait(ctx, bytes.Repeat([]byte{byte(i)}, size)); err != nil {
 					t.Fatal(err)
 				}
-			}
-			for range 5 {
 				p, err := s.ReceiveDatagram(ctx)
-				if err != nil || len(p) != size {
-					t.Fatalf("%d bytes, %v", len(p), err)
+				if err != nil || !bytes.Equal(p, bytes.Repeat([]byte{byte(i)}, size)) {
+					t.Fatalf("datagram %d: %d bytes, %v", i, len(p), err)
 				}
 			}
-			if st := c.ConnectionStats(); st.DatagramsSentChannel != 0 || st.DatagramsSent != 5 {
+			if st := s.ConnectionStats(); st.DatagramsReceivedChannel != 0 || st.DatagramsReceived != 5 {
 				t.Fatalf("%+v", st)
 			}
 		})

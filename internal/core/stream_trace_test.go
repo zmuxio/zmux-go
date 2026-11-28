@@ -12,7 +12,7 @@ func TestStreamGapTracingUsesInitializedPathState(t *testing.T) {
 	s.feat.Multipath = true // negotiated, before the path layer starts
 	s.rxPipe = s.pipes[0]
 	f := &wire.Frame{Kind: wire.KindStream, StreamID: 1, Offset: 1, Data: []byte{1}}
-	if _, err := s.onStream(f, &Buf{B: f.Data}); err != nil {
+	if err := onStreamTest(s, f); err != nil {
 		t.Fatal(err)
 	}
 	st := s.streams[f.StreamID]
@@ -41,7 +41,7 @@ func TestStreamGapStatisticsMonotonic(t *testing.T) {
 	input := func(off uint64) {
 		t.Helper()
 		f := &wire.Frame{Kind: wire.KindStream, StreamID: 1, Offset: off, Data: []byte{1}}
-		if _, err := s.onStream(f, &Buf{B: f.Data}); err != nil {
+		if err := onStreamTest(s, f); err != nil {
 			t.Fatal(err)
 		}
 	}

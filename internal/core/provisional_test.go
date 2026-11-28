@@ -23,9 +23,9 @@ func TestCancelUnopenedEndsReceiveAndWakesCapacity(t *testing.T) {
 	if !seenRead || !seenCapacity {
 		t.Fatalf("cancelled provisional waiter not woken: read=%v capacity=%v", seenRead, seenCapacity)
 	}
-	_, buf, fin, err := s.ReadChunk(st, 1)
-	if buf != nil {
-		buf.Unref()
+	view, fin, err := s.ReadChunk(st, 1)
+	if view.Buf != nil {
+		view.Buf.ReturnView()
 	}
 	if err != nil || !fin {
 		t.Fatalf("unopened receive did not end: fin=%v err=%v", fin, err)

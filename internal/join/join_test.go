@@ -314,7 +314,8 @@ func TestStateMisuseAndIncomplete(t *testing.T) {
 	}
 }
 
-func TestBoundIsConfirmedAtAccept(t *testing.T) {
+func testBoundHello(t *testing.T) (Hello, []byte, []byte) {
+	t.Helper()
 	su, _ := LookupSuite(SuiteAES)
 	psk, _ := PSK(su, bytes.Repeat([]byte{1}, 32), RoleResponder, testSuites)
 	b := bytes.Repeat([]byte{7}, BindingLen)
@@ -324,6 +325,11 @@ func TestBoundIsConfirmedAtAccept(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, _, _ := ParseHello(w, Message)
+	return h, psk, b
+}
+
+func TestBoundIsConfirmedAtAccept(t *testing.T) {
+	h, psk, b := testBoundHello(t)
 	a, _, err := Accept(h, Message, psk, b, anyGroup)
 	if err != nil || !a.Confirmed() {
 		t.Fatal(err)
@@ -364,15 +370,7 @@ func TestReservedTypeFourSkipped(t *testing.T) {
 // length is a configuration error, while a missing one in Bound fails the
 // Hello as ErrAuth.
 func TestAcceptBindingLength(t *testing.T) {
-	su, _ := LookupSuite(SuiteAES)
-	psk, _ := PSK(su, bytes.Repeat([]byte{1}, 32), RoleResponder, testSuites)
-	b := bytes.Repeat([]byte{7}, BindingLen)
-	j, _ := NewJoiner(JoinerConfig{Suite: su, Group: testGroup, Mode: Bound, Framing: Message, Locator: []byte("l"), PSK: psk, Binding: b})
-	w, err := j.WriteHello(nil, HelloPayload{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h, _, _ := ParseHello(w, Message)
+	h, psk, b := testBoundHello(t)
 	for _, n := range []int{1, BindingLen - 1, BindingLen + 1} {
 		if _, _, err := Accept(h, Message, psk, b[:min(n, BindingLen)], anyGroup); n > BindingLen {
 			_, _, err = Accept(h, Message, psk, append(bytes.Clone(b), 0), anyGroup)

@@ -9,30 +9,32 @@ import (
 
 // Transport parameter identifiers.
 const (
-	ParamMaxIdleTimeout       uint64 = 0x01
-	ParamInitialMaxData       uint64 = 0x04
-	ParamMaxStreamDataBidiLoc uint64 = 0x05
-	ParamMaxStreamDataBidiRem uint64 = 0x06
-	ParamMaxStreamDataUni     uint64 = 0x07
-	ParamMaxStreamsBidi       uint64 = 0x08
-	ParamMaxStreamsUni        uint64 = 0x09
-	ParamResetStreamAt        uint64 = 0x1d
-	ParamMaxDatagramFrameSize uint64 = 0x20
-	ParamMaxRecordSize        uint64 = 0x0571c59429cd0845
-	ParamRole                 uint64 = 0x17240207
-	ParamGoAway               uint64 = 0x04528a5f
-	ParamPreamble             uint64 = 0x0439e07a
-	ParamPriority             uint64 = 0x31e7139d
-	ParamDatagramFlows        uint64 = 0x0af391ed
-	ParamMultipath            uint64 = 0x30dc2978
-	ParamSessionCrypto        uint64 = 0x026f24b5
-	ParamAckThreshold         uint64 = 0x2762c7e5
-	ParamPipeAck              uint64 = 0x34b47621
-	ParamMaxAckDelay          uint64 = 0x17fa1ed6
-	ParamMaxLanes             uint64 = 0x27856ef0
-	ParamResume               uint64 = 0x0d5778ce
-	ParamCarrierDatagrams     uint64 = 0x3d274c5f
-	ParamAppProtocols         uint64 = 0x3d4f9c2a8b1e6075 // the qmux crate's hook
+	ParamMaxIdleTimeout         uint64 = 0x01
+	ParamInitialMaxData         uint64 = 0x04
+	ParamMaxStreamDataBidiLoc   uint64 = 0x05
+	ParamMaxStreamDataBidiRem   uint64 = 0x06
+	ParamMaxStreamDataUni       uint64 = 0x07
+	ParamMaxStreamsBidi         uint64 = 0x08
+	ParamMaxStreamsUni          uint64 = 0x09
+	ParamResetStreamAt          uint64 = 0x1d
+	ParamMaxDatagramFrameSize   uint64 = 0x20
+	ParamMaxRecordSize          uint64 = 0x0571c59429cd0845
+	ParamRole                   uint64 = 0x17240207
+	ParamGoAway                 uint64 = 0x04528a5f
+	ParamPreamble               uint64 = 0x0439e07a
+	ParamPriority               uint64 = 0x31e7139d
+	ParamRetiredDatagramFlows   uint64 = 0x0af391ed
+	ParamDatagramFamily         uint64 = 0x27e7a042
+	ParamMultipath              uint64 = 0x30dc2978
+	ParamSessionCrypto          uint64 = 0x026f24b5
+	ParamAckThreshold           uint64 = 0x2762c7e5
+	ParamPipeAck                uint64 = 0x34b47621
+	ParamMaxAckDelay            uint64 = 0x17fa1ed6
+	ParamMaxLanes               uint64 = 0x27856ef0
+	ParamResume                 uint64 = 0x0d5778ce
+	ParamCarrierDatagrams       uint64 = 0x3d274c5f
+	ParamCarrierDatagramPadding uint64 = 0x2071d4ee
+	ParamAppProtocols           uint64 = 0x3d4f9c2a8b1e6075 // the qmux crate's hook
 )
 
 // RecordFloor is the carrier record floor: every carrier takes records of
@@ -80,7 +82,7 @@ const (
 	HasGoAway
 	HasPreamble
 	HasPriority
-	HasFlows
+	HasDatagramFamily
 	HasMultipath
 	HasAckThreshold
 	HasPipeAck
@@ -90,19 +92,20 @@ const (
 	HasAppProtocols
 	HasCarrierDatagrams
 	HasSessionCrypto
+	HasCarrierDatagramPadding
 )
 
 // HasAnyZmux are the zmux parameters whose presence identifies a zmux peer.
-const HasAnyZmux = HasRole | HasGoAway | HasPreamble | HasPriority | HasFlows | HasMultipath |
-	HasAckThreshold | HasPipeAck | HasAckDelay | HasLanes | HasResume | HasCarrierDatagrams
+const HasAnyZmux = HasRole | HasGoAway | HasPreamble | HasPriority | HasDatagramFamily | HasMultipath |
+	HasAckThreshold | HasPipeAck | HasAckDelay | HasLanes | HasResume | HasCarrierDatagrams | HasSessionCrypto | HasCarrierDatagramPadding
 
 // Params is a set of transport parameters.
 type Params struct {
-	Has         uint32
-	SecretFlags uint8
 	// SessionCrypto is zmux_session_crypto: the Join Suites and Groups.
 	SessionCrypto        SessionCrypto
-	SessionNonce         [16]byte
+	Locator              []byte
+	AppProtocols         [][]byte
+	GreaseValue          []byte
 	MaxIdleTimeout       uint64 // ms
 	InitialMaxData       uint64
 	MaxStreamDataBidiLoc uint64
@@ -115,18 +118,17 @@ type Params struct {
 	Role                 uint64
 	RoleNonce            uint64
 	Preamble             uint64
-	Locator              []byte
 	AckThreshold         uint64
 	MaxAckDelay          uint64 // ms
 	MaxLanes             uint64
-	LaneKey              [16]byte
 	ResumeGrace          uint64 // ms
-	AppProtocols         [][]byte
-
 	// GREASE parameter to send (encoding only); GreaseID 0: none (a
 	// GREASE ID is never 0).
-	GreaseID    uint64
-	GreaseValue []byte
+	GreaseID     uint64
+	Has          uint32
+	SessionNonce [16]byte
+	LaneKey      [16]byte
+	SecretFlags  uint8
 }
 
 // IsZmux reports whether the parameters identify a zmux endpoint.
@@ -141,10 +143,11 @@ var paramBits = map[uint64]uint32{
 	ParamMaxStreamDataBidiRem: HasBidiRemote, ParamMaxStreamDataUni: HasUni, ParamMaxStreamsBidi: HasStreamsBidi,
 	ParamMaxStreamsUni: HasStreamsUni, ParamResetStreamAt: HasResetAt, ParamMaxDatagramFrameSize: HasDatagram,
 	ParamMaxRecordSize: HasRecordSize, ParamRole: HasRole, ParamGoAway: HasGoAway, ParamPreamble: HasPreamble,
-	ParamPriority: HasPriority, ParamDatagramFlows: HasFlows, ParamMultipath: HasMultipath, ParamSessionCrypto: HasSessionCrypto,
+	ParamPriority: HasPriority, ParamDatagramFamily: HasDatagramFamily, ParamMultipath: HasMultipath, ParamSessionCrypto: HasSessionCrypto,
 	ParamAckThreshold: HasAckThreshold, ParamPipeAck: HasPipeAck, ParamMaxAckDelay: HasAckDelay,
 	ParamMaxLanes: HasLanes, ParamResume: HasResume, ParamAppProtocols: HasAppProtocols,
-	ParamCarrierDatagrams: HasCarrierDatagrams,
+	ParamCarrierDatagrams:       HasCarrierDatagrams,
+	ParamCarrierDatagramPadding: HasCarrierDatagramPadding,
 }
 
 // DecodeParams decodes and validates a parameter block, those of
@@ -154,13 +157,16 @@ func DecodeParams(b []byte, p *Params) *Error {
 	// Duplicate detection: known parameters use the Has bits; unknown ones
 	// are collected and checked once sorted (n log n: a block of thousands
 	// of distinct unknown IDs costs no quadratic scan).
-	r := reader{b: b}
+	r := reader{data: Parts{Head: b}}
 	var seenUnknown []uint64
 	for r.i < len(b) {
 		id := r.varint()
 		v := r.bytes(r.varint())
 		if r.bad {
 			return ErrParam("truncated parameter block")
+		}
+		if id == ParamRetiredDatagramFlows {
+			return ErrParam("retired zmux_datagram_flows")
 		}
 		if isProhibited(id) {
 			return ErrParam("prohibited QUIC parameter")
@@ -198,7 +204,7 @@ func varintValue(v []byte) (uint64, *Error) {
 func (p *Params) decodeOne(id uint64, v []byte) *Error {
 	var err *Error
 	switch id {
-	case ParamResetStreamAt, ParamGoAway, ParamPriority, ParamDatagramFlows, ParamPipeAck, ParamCarrierDatagrams:
+	case ParamResetStreamAt, ParamGoAway, ParamPriority, ParamDatagramFamily, ParamPipeAck, ParamCarrierDatagrams, ParamCarrierDatagramPadding:
 		if len(v) != 0 {
 			return ErrParam("non-empty flag parameter")
 		}
@@ -309,6 +315,9 @@ func (p *Params) decodeOne(id uint64, v []byte) *Error {
 }
 
 func (p *Params) validate() *Error {
+	if p.IsZmux() && p.Has&HasDatagramFamily == 0 {
+		return ErrParam("zmux evidence without zmux_datagram_family")
+	}
 	ackish := p.Has&(HasMultipath|HasPipeAck) != 0
 	if p.Has&(HasAckThreshold|HasAckDelay|HasLanes) != 0 && !ackish {
 		return ErrParam("companion parameter without zmux_multipath or zmux_pipe_ack")
@@ -318,6 +327,9 @@ func (p *Params) validate() *Error {
 	}
 	if p.Has&HasResume != 0 && p.Has&HasMultipath == 0 {
 		return ErrParam("zmux_resume without zmux_multipath")
+	}
+	if p.Has&HasCarrierDatagramPadding != 0 && (p.Has&HasCarrierDatagrams == 0 || p.MaxDatagramFrameSize == 0) {
+		return ErrParam("zmux_carrier_datagram_padding requires carrier datagrams and a positive max_datagram_frame_size")
 	}
 	if p.Has&HasPreamble != 0 {
 		if p.Has&HasResetAt == 0 {
@@ -398,11 +410,14 @@ func AppendParams(b []byte, p *Params) ([]byte, *Error) {
 	if h&HasPriority != 0 {
 		b = appendParam(b, ParamPriority, nil)
 	}
-	if h&HasFlows != 0 {
-		b = appendParam(b, ParamDatagramFlows, nil)
+	if h&HasDatagramFamily != 0 {
+		b = appendParam(b, ParamDatagramFamily, nil)
 	}
 	if h&HasCarrierDatagrams != 0 {
 		b = appendParam(b, ParamCarrierDatagrams, nil)
+	}
+	if h&HasCarrierDatagramPadding != 0 {
+		b = appendParam(b, ParamCarrierDatagramPadding, nil)
 	}
 	if h&HasMultipath != 0 {
 		v := make([]byte, 0, 18+len(p.Locator))

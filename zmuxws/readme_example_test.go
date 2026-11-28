@@ -29,34 +29,3 @@ func Example_readmeWebSocket() {
 		return conn, err
 	}
 }
-
-// Example_readmeProxy is README.md "Behind a reverse proxy or CDN".
-func Example_readmeProxy() {
-	_ = func(l *zmux.Listener, site http.Handler, trusted *zmux.TrustedProxies, psk []byte) error {
-		o := &zmuxhttp.Options{Next: site, Trusted: trusted}
-		stream, err := zmuxhttp.NewHandler(l, o)
-		if err != nil {
-			return err
-		}
-		ex, err := zmuxhttp.NewExchangeHandler(l, &zmuxhttp.ExchangeOptions{Options: *o}, zmuxhttp.ExchangeConfig{PSK: psk})
-		if err != nil {
-			return err
-		}
-		ws, err := zmuxws.NewHandler(l, o)
-		if err != nil {
-			return err
-		}
-		http.Handle("/zmux", &zmuxhttp.Mux{Options: o, Stream: stream, Exchange: ex, WebSocket: ws})
-		return nil
-	}
-	_ = func(ctx context.Context, client *http.Client, psk []byte, cfg *zmux.Config,
-		cache *zmux.CarrierCache, network string) (*zmux.Conn, error) {
-		conn, err := zmux.DialChoice(ctx, zmux.AutoChoice(
-			zmuxws.Candidate("wss://example.com/zmux", nil),
-			zmuxhttp.Streaming{Client: client, URL: "https://example.com/zmux"}.Candidate(),
-			zmuxhttp.Split{Client: client, URL: "https://example.com/zmux"}.Candidate(),
-			zmuxhttp.Exchange{Client: client, URL: "https://example.com/zmux", Config: zmuxhttp.ExchangeConfig{PSK: psk}}.Candidate(),
-		), cfg, &zmux.CarrierChoicePolicy{Cache: cache, Key: "example.com|" + network})
-		return conn, err
-	}
-}

@@ -21,13 +21,12 @@ type CapacityFloor struct {
 
 // pipeQuality is a pipe's band state.
 type pipeQuality struct {
-	band     *QualityBand // nil: the session's default
-	rtt      Duration
-	rate     float64
-	lastAt   Time
-	pendTime Time
-	has      bool // a first report exists
-	pending  bool
+	band   *QualityBand // nil: the session's default
+	timer  Deadline[*Pipe]
+	rtt    Duration
+	rate   float64
+	lastAt Time
+	has    bool // a first report exists
 }
 
 type sessQuality struct {
@@ -105,7 +104,8 @@ func (s *Session) qualitySample(p *Pipe) {
 					mi = DefaultMinInterval
 				}
 				if mi > 0 && s.now < q.lastAt.Add(mi) {
-					q.pending, q.pendTime = true, q.lastAt.Add(mi)
+					q.timer.Value = p
+					s.qualityTimers.Set(&q.timer, q.lastAt.Add(mi))
 				} else {
 					s.reportQuality(p, rtt, rate)
 				}
@@ -134,31 +134,20 @@ func (s *Session) pipeEstimates(p *Pipe) (Duration, float64, bool) {
 
 func (s *Session) reportQuality(p *Pipe, rtt Duration, rate float64) {
 	q := &p.out.q
-	q.rtt, q.rate, q.lastAt, q.pending = rtt, rate, s.now, false
+	q.rtt, q.rate, q.lastAt = rtt, rate, s.now
+	s.qualityTimers.Cancel(&q.timer)
 	s.emit(Event{Kind: EvPipeQuality, Pipe: p.id, RTT: rtt, Rate: rate})
 }
 
-// qualityTimers emits the reports held back by MinInterval.
-func (s *Session) qualityTimers(now Time, apply bool) Time {
-	next := Never
-	for _, p := range s.pipes {
-		if p.out == nil || !p.out.q.pending {
-			continue
-		}
-		q := &p.out.q
-		if now >= q.pendTime {
-			if apply {
-				if rtt, rate, ok := s.pipeEstimates(p); ok {
-					s.reportQuality(p, rtt, rate)
-				} else {
-					q.pending = false
-				}
+// expireQuality emits the reports held back by MinInterval.
+func (s *Session) expireQuality(now Time) {
+	for d := s.qualityTimers.PopDue(now); d != nil; d = s.qualityTimers.PopDue(now) {
+		if p := d.Value; p.out != nil && !p.out.failed {
+			if rtt, rate, ok := s.pipeEstimates(p); ok {
+				s.reportQuality(p, rtt, rate)
 			}
-		} else {
-			next = minT(next, q.pendTime)
 		}
 	}
-	return next
 }
 
 // checkCapacityFloor compares the measured rates of the usable,

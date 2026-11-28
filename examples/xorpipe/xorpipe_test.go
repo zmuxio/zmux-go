@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
 	"os/exec"
@@ -71,7 +72,7 @@ func newServer(t *testing.T) *server {
 }
 
 func clientConfig() *zmux.Config {
-	return &zmux.Config{EarlyData: zmux.EarlyData{ZmuxPeer: true, Replayable: true, HoldFirstFlight: true}}
+	return &zmux.Config{EarlyData: zmux.EarlyData{HoldFirstFlight: true}}
 }
 
 // session dials the server through the transform with nonce, sends hello
@@ -88,6 +89,7 @@ func session(t *testing.T, ctx context.Context, s *server, nonce [8]byte, hello 
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = c.Close(); _ = c.Wait() })
 	st, err := c.OpenStream()
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +103,7 @@ func session(t *testing.T, ctx context.Context, s *server, nonce [8]byte, hello 
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = sc.Close(); _ = sc.Wait() })
 	ss, err := sc.AcceptStream(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +112,6 @@ func session(t *testing.T, ctx context.Context, s *server, nonce [8]byte, hello 
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = c.Close(); _ = sc.Close(); _ = c.Wait(); _ = sc.Wait() })
 	return c, sc, rc, got
 }
 
@@ -121,10 +123,10 @@ func xorBytes(b []byte) []byte {
 	return out
 }
 
-// The first carrier write holds the header and the first flight with the
-// stream's data; the session works; the admission counted the variant.
+// The first carrier write holds the header and the session parameters.
+// The stream queued before release arrives after establishment.
 func TestFirstFlight(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	s := newServer(t)
 	var nonce [8]byte
@@ -135,8 +137,11 @@ func TestFirstFlight(t *testing.T) {
 		t.Fatalf("server read %q", got)
 	}
 	first := rc.first()
-	if len(first) <= xorpipe.HeaderLen || !bytes.Contains(xorBytes(first[xorpipe.HeaderLen:]), hello) {
-		t.Fatalf("first write of %d bytes lacks the stream data", len(first))
+	if len(first) <= xorpipe.HeaderLen {
+		t.Fatalf("first write of %d bytes lacks the parameters", len(first))
+	}
+	if bytes.Contains(xorBytes(first[xorpipe.HeaderLen:]), hello) {
+		t.Fatal("stream data was sent before the peer's parameters")
 	}
 	if cls, _ := admit.ClassifyFirstBytes(first, zmux.FramingByteStream); cls != admit.FirstBytesOther {
 		t.Fatalf("the header is classified %v", cls)
@@ -147,27 +152,32 @@ func TestFirstFlight(t *testing.T) {
 	}
 }
 
-// A replayed header has its first flight dropped: the session sends its
-// parameters and the stream again, which arrives whole.
-func TestFirstFlightRefused(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func TestReplayRejected(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	s := newServer(t)
 	var nonce [8]byte
 	_, _ = rand.Read(nonce[:])
 	session(t, ctx, s, nonce, []byte("first"))
-	hello := []byte("HELLO sent again after a refused flight")
-	c, sc, _, got := session(t, ctx, s, nonce, hello)
-	if !bytes.Equal(got, hello) {
-		t.Fatalf("server read %q", got)
+	var d net.Dialer
+	nc, err := d.DialContext(ctx, "tcp", s.addr)
+	if err != nil {
+		t.Fatal(err)
 	}
-	echo(t, ctx, c, sc)
+	c, err := zmux.Start(ctx, xorpipe.Client(nc, key, nonce), zmux.RoleClient, nil)
+	if c != nil {
+		_ = c.Close()
+		t.Fatal("the server accepted a repeated carrier header")
+	}
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("repeated carrier header returned %v", err)
+	}
 }
 
 // A plain zmux client on the same listener is told apart by its first
 // record and counted without a variant.
 func TestPlainNextToTransform(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	s := newServer(t)
 	nc, err := net.Dial("tcp", s.addr)

@@ -82,7 +82,7 @@ type laneConn struct{ secureConn }
 
 func (*laneConn) OpenLane(context.Context) (io.WriteCloser, error) { return nil, errors.New("no") }
 func (*laneConn) ChannelStreamID() (uint64, bool)                  { return 0, false }
-func (*laneConn) MaxChannelDatagram() int                          { return 0 }
+func (*laneConn) ChannelDatagramCapacity() (limit, room int)       { return 0, 0 }
 func (*laneConn) SendChannelDatagram([]byte) error                 { return nil }
 func (*laneConn) ReceiveChannelDatagrams(func([]byte)) (stop func()) {
 	return func() {}
@@ -180,7 +180,7 @@ func TestModesAndJoin(t *testing.T) {
 				return f.server.WrapPipe(ctx, p, h)
 			}
 			l, addr := listen(t, ctx, &zmux.ListenerConfig{
-				Config:   &zmux.Config{MaxPipes: 4, AllowRecordMode: anyMode},
+				Config:   &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, AllowRecordMode: anyMode},
 				WrapPipe: zmux.WrapPipeFunc(wrap),
 			})
 			carrier := func() zmux.PipeIO {
@@ -202,7 +202,7 @@ func TestModesAndJoin(t *testing.T) {
 			if mode == zmux.RecordTrusted && carrierstats.ProviderOf(p.W) == nil {
 				t.Fatal("raw writer did not forward the TCP sampler")
 			}
-			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4, RecordPolicy: func(zmux.RecordPolicyInput) zmux.RecordMode { return zmux.RecordTrusted }})
+			c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, RecordPolicy: func(zmux.RecordPolicyInput) zmux.RecordMode { return zmux.RecordTrusted }})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -425,7 +425,7 @@ func TestLaneThroughWrapPipe(t *testing.T) {
 	f := newFixture(t)
 	f.server.AllowRecordMode = anyMode
 	l, err := zmux.NewListener(&zmux.ListenerConfig{
-		Config:   &zmux.Config{MaxPipes: 4, AllowRecordMode: anyMode},
+		Config:   &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}, AllowRecordMode: anyMode},
 		WrapPipe: &f.server,
 	})
 	if err != nil {
@@ -463,7 +463,7 @@ func TestLaneThroughWrapPipe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{MaxPipes: 4})
+	c, err := zmux.Start(ctx, p, zmux.RoleClient, &zmux.Config{SessionPolicy: zmux.SessionPolicy{Limits: zmux.CapacityLimits{SteadyAttachments: 4}}})
 	if err != nil {
 		t.Fatal(err)
 	}

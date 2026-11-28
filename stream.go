@@ -26,12 +26,13 @@ type handle struct {
 	rsig       core.Signal               // lazy: its channel is made by the first wait
 	wsig       core.Signal
 	// rnote is the pending NotifyReadable call, nil while there is none.
-	rnote    atomic.Pointer[readNote]
-	dsig     core.Signal // the stream's datagrams
-	dmu      sync.Mutex  // serialises datagram reads (lock level L0, after rmu)
-	rmu      sync.Mutex
-	wmu      sync.Mutex
-	rwaiters atomic.Int32 // WaitReadable calls and the reads inside their wait, for passing the wake on
+	rnote       atomic.Pointer[readNote]
+	dsig        core.Signal // the stream's datagrams
+	dmu         sync.Mutex  // serialises datagram reads (lock level L0, after rmu)
+	rmu         sync.Mutex
+	wmu         sync.Mutex
+	spliceOwned bool         // under spliceOwners
+	rwaiters    atomic.Int32 // WaitReadable calls and the reads inside their wait, for passing the wake on
 }
 
 // newHandle makes the handle of st (under the lock).
@@ -378,7 +379,11 @@ func (h *handle) cancelRead(code StreamErrorCode) {
 	c := h.c
 	c.lock()
 	defer c.unlock()
-	c.s.Stop(h.st, uint64(code))
+	if code == StreamPacketError {
+		c.s.StopInvalidPacket(h.st)
+	} else {
+		c.s.Stop(h.st, uint64(code))
+	}
 	h.released(c.s.ReleaseRecv(h.st))
 }
 

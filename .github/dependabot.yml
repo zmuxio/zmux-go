@@ -28,8 +28,7 @@ updates:
       - dependency-name: github.com/quic-go/quic-go
       - dependency-name: github.com/quic-go/webtransport-go
 
-  # The modules that build on quic-go: it stays pinned until webtransport-go
-  # follows (the weekly workflow tests zmuxquic against the latest quic-go).
+  # Upgrade the QUIC and WebTransport pins together after their weekly checks.
   - package-ecosystem: gomod
     directories:
       - /zmuxquic

@@ -32,31 +32,31 @@ type Config struct {
 // Handshake is the state machine of one handshake, driven by the pattern of
 // its profile. It is not safe for concurrent use.
 type Handshake struct {
-	pat       *pattern
-	cfg       Config
-	initiator bool
-	finished  bool
-	ss        symmetricState
-	genKey    func() (keypair, error)
-	s, e      keypair
-	rs, re    []byte
+	err    error
+	pat    *pattern
+	genKey func() (keypair, error)
+	genKEM func() (keypair, error)
+	encaps func(ek []byte) (ct, ss []byte, err error)
+	s, e   keypair
 	// e1 is this initiator's KEM key pair and re1 the encapsulation key a
 	// responder received; each lives for one token pair. genKEM and encaps
 	// are the KEM's, replaceable by tests.
 	e1     keypair
+	rs, re []byte
 	re1    []byte
-	genKEM func() (keypair, error)
-	encaps func(ek []byte) (ct, ss []byte, err error)
-	idx    int
+	// hp is h_p of the last message read.
+	hp  []byte
+	ss  symmetricState
+	cfg Config
+	idx int
 	// head is the bytes the unit of the message carries before its Noise
 	// message (SetHead).
 	head int
 	// sendMax is the largest message written, HandshakeFloor when 0; the
 	// vector generator raises it to produce messages only receivers meet.
-	sendMax int
-	// hp is h_p of the last message read.
-	hp  []byte
-	err error
+	sendMax   int
+	initiator bool
+	finished  bool
 }
 
 // NewInitiator starts the client's side with a fresh ephemeral key.
@@ -137,17 +137,8 @@ func (hs *Handshake) dropKEM() {
 
 // WriteMessage appends the next Noise message, without framing, to dst.
 func (hs *Handshake) WriteMessage(dst []byte, p Payload) ([]byte, error) {
-	if err := hs.ready(true); err != nil {
+	if err := hs.preparePayload(&p, false); err != nil {
 		return nil, err
-	}
-	if p.known()&^hs.pat.known[hs.idx] != 0 {
-		return nil, hs.fail(fmt.Errorf("%w: payload type not allowed in this message", ErrInvalidConfig))
-	}
-	if err := hs.fit(&p); err != nil {
-		return nil, hs.fail(err)
-	}
-	if p.Credential != nil && p.Credential.Type == 0 {
-		return nil, hs.fail(fmt.Errorf("%w: CredType 0 is no credential", ErrInvalidConfig))
 	}
 	plain, err := appendPayload(p, !hs.nextKeyed())
 	if err != nil {
@@ -262,14 +253,11 @@ func ProofMessage(idx int, hp []byte) []byte {
 // before the payload is encrypted. The signature must have the KeyAlg's length,
 // so that the message length is known before it is signed.
 func (hs *Handshake) WriteMessageProof(dst []byte, p Payload, sign func(m []byte) ([]byte, error)) ([]byte, error) {
-	if err := hs.ready(true); err != nil {
+	if err := hs.preparePayload(&p, true); err != nil {
 		return nil, err
 	}
-	if p.Proof == nil || p.known()&^hs.pat.known[hs.idx] != 0 {
-		return nil, hs.fail(fmt.Errorf("%w: payload type not allowed in this message", ErrInvalidConfig))
-	}
-	if err := hs.fit(&p); err != nil {
-		return nil, hs.fail(err)
+	if sign == nil {
+		return nil, hs.fail(fmt.Errorf("%w: missing proof signer", ErrInvalidConfig))
 	}
 	random := !hs.nextKeyed()
 	idx := hs.idx
@@ -287,6 +275,22 @@ func (hs *Handshake) WriteMessageProof(dst []byte, p Payload, sign func(m []byte
 		q.Proof = &pr
 		return appendPayload(q, random)
 	})
+}
+
+func (hs *Handshake) preparePayload(p *Payload, signProof bool) error {
+	if err := hs.ready(true); err != nil {
+		return err
+	}
+	if signProof && p.Proof == nil || p.known()&^hs.pat.known[hs.idx] != 0 {
+		return hs.fail(fmt.Errorf("%w: payload type not allowed in this message", ErrInvalidConfig))
+	}
+	if p.Credential != nil && !validCredentialType(p.Credential.Type) {
+		return hs.fail(fmt.Errorf("%w: credential type outside [1, 2^62-1]", ErrInvalidConfig))
+	}
+	if err := hs.fit(p); err != nil {
+		return hs.fail(err)
+	}
+	return nil
 }
 
 // nextKeyed reports whether the next message's payload is encrypted.
@@ -406,6 +410,18 @@ func (hs *Handshake) ReadMessage(msg []byte) (Payload, error) {
 		p.Proof.Message = ProofMessage(idx, hs.hp)
 	}
 	return p, nil
+}
+
+// CheckReplyKey checks the initiator's encapsulation key after message 1,
+// before allocating execution capacity for the responder's message 2.
+func (hs *Handshake) CheckReplyKey() error {
+	if hs == nil || hs.initiator || hs.idx != 1 || hs.err != nil {
+		return ErrInvalidConfig
+	}
+	if !join.CheckEncapsulationKey(hs.re1) {
+		return ErrKex
+	}
+	return nil
 }
 
 func (hs *Handshake) readRaw(msg []byte) ([]byte, error) {

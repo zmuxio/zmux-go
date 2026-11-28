@@ -1,36 +1,39 @@
 package core
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/zmuxio/zmux-go/internal/join"
 )
 
 func TestUnconfirmedEvictsAtBound(t *testing.T) {
-	var u Unconfirmed[int]
-	pjs := []*PeerJoin{{Mode: join.Trusted}, {Mode: join.Trusted}, {Mode: join.Trusted}}
+	cfg := DefaultConfig()
+	cfg.SessionPolicy.Limits.PendingPeerJoins = 2
+	s := New(cfg, 0)
+	pjs := []*PeerJoin{{owner: s, Mode: join.Trusted}, {owner: s, Mode: join.Trusted}, {owner: s, Mode: join.Trusted}}
 	for i, pj := range pjs[:2] {
-		if _, ok := u.Hold(pj, i, 2); ok {
+		if got := s.holdPeerJoin(pj, i); len(got) != 0 {
 			t.Fatalf("join %d evicted below the bound", i)
 		}
 	}
-	if old, ok := u.Hold(pjs[2], 2, 2); !ok || old != 0 {
-		t.Fatalf("at the bound: evicted %d, %v; want the oldest, 0", old, ok)
+	if got := s.holdPeerJoin(pjs[2], 2); !slices.Equal(got, []any{0}) {
+		t.Fatalf("at the bound: evicted %v, want the oldest, 0", got)
 	}
-	if u.Confirm(pjs[0]) {
+	if s.DropPeerJoin(pjs[0]) {
 		t.Fatal("an evicted join claimed confirmation")
 	}
-	if !u.Confirm(pjs[1]) {
+	if !s.DropPeerJoin(pjs[1]) {
 		t.Fatal("registered join lost its confirmation")
 	}
-	if _, ok := u.Hold(&PeerJoin{Mode: join.Trusted}, 3, 2); ok {
+	if got := s.holdPeerJoin(&PeerJoin{owner: s, Mode: join.Trusted}, 3); len(got) != 0 {
 		t.Fatal("evicted after a confirmed join left room")
 	}
-	bound := &PeerJoin{Mode: join.Bound}
-	if !u.Confirm(bound) {
-		t.Fatal("Bound confirmation required a slot")
+	bound := &PeerJoin{owner: s, Mode: join.Bound}
+	if got := s.holdPeerJoin(bound, 4); len(got) != 0 || s.PendingPeerJoins() != 2 {
+		t.Fatalf("a Bound join took a place: %d held", s.PendingPeerJoins())
 	}
-	if _, ok := u.Hold(bound, 4, 2); ok || u.Len() != 2 {
-		t.Fatalf("a Bound join took a place: %d held", u.Len())
+	if !s.DropPeerJoin(bound) {
+		t.Fatal("Bound confirmation required a slot")
 	}
 }

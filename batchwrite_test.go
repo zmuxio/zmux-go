@@ -12,15 +12,67 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zmuxio/zmux-go/internal/core"
 	"github.com/zmuxio/zmux-go/internal/leakcheck"
 )
+
+type contiguousTestWriter struct {
+	t     *testing.T
+	want  []byte
+	first *byte
+	calls int
+}
+
+func (*contiguousTestWriter) PreferFlatWrite() {}
+
+func (w *contiguousTestWriter) WriteBuffers([][]byte) (int, error) {
+	w.t.Error("carrier was given scatter buffers")
+	return 0, io.ErrUnexpectedEOF
+}
+
+func (w *contiguousTestWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if !bytes.Equal(p, w.want) {
+		w.t.Errorf("written bytes %x, want %x", p, w.want)
+	}
+	if len(p) == 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	if w.first == nil {
+		w.first = &p[0]
+	} else if w.first != &p[0] {
+		w.t.Error("second write did not reuse batch capacity")
+	}
+	return len(p) - 1, io.ErrClosedPipe
+}
+
+func TestContiguousBatchWriteKeepsPartialResult(t *testing.T) {
+	s := core.New(core.DefaultConfig(), 0)
+	s.AttachBootstrap(core.CarrierInfo{}, core.CarrierInfo{}, nil)
+	var b core.Batch
+	defer b.Discard()
+	if !s.PollTransmit(0, 0, &b, core.DefaultBatch, 0) || len(b.Bufs()) < 2 {
+		t.Fatal("initial batch needs multiple buffers")
+	}
+	w := &contiguousTestWriter{t: t, want: b.Flat()}
+	for range 2 {
+		n, err := writeBatch(w, FramingByteStream, &b, nil, nil)
+		if n != b.Len()-1 || !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("write result = (%d, %v), want (%d, %v)", n, err, b.Len()-1, io.ErrClosedPipe)
+		}
+	}
+	if w.calls != 2 {
+		t.Fatalf("%d carrier writes for two batches", w.calls)
+	}
+}
 
 // batchCarrier is a message carrier with WriteMessages, counting calls.
 type batchCarrier struct {
 	*msgCarrier
 	first                 atomic.Pointer[[]byte] // their concatenation
+	wrote                 chan struct{}          // messages in the first call
 	batches, msgs, single atomic.Int64
-	firstBatch            atomic.Int64 // messages in the first call
+	firstBatch            atomic.Int64
 }
 
 func (b *batchCarrier) WriteMessages(msgs [][]byte) error {
@@ -28,6 +80,9 @@ func (b *batchCarrier) WriteMessages(msgs [][]byte) error {
 		b.firstBatch.Store(int64(len(msgs)))
 		cat := bytes.Join(msgs, nil)
 		b.first.Store(&cat)
+		if b.wrote != nil {
+			close(b.wrote)
+		}
 	}
 	b.msgs.Add(int64(len(msgs)))
 	for _, m := range msgs {
@@ -89,7 +144,7 @@ func msgCarriers() (*msgCarrier, *msgCarrier) {
 	return &msgCarrier{in: x, out: y, once: once, done: done}, &msgCarrier{in: y, out: x, once: once, done: done}
 }
 
-func (m *msgCarrier) ReadMessage(limit int) ([]byte, error) {
+func (m *msgCarrier) ReadMessage(limit int) (ReceivedMessage, error) {
 	var b []byte
 	select {
 	case b = <-m.in:
@@ -97,13 +152,13 @@ func (m *msgCarrier) ReadMessage(limit int) ([]byte, error) {
 		select {
 		case b = <-m.in:
 		default:
-			return nil, io.EOF
+			return ReceivedMessage{}, io.EOF
 		}
 	}
 	if len(b) > limit {
-		return nil, ErrMessageTooLarge
+		return ReceivedMessage{}, ErrMessageTooLarge
 	}
-	return b, nil
+	return OwnMessage(b), nil
 }
 
 func (m *msgCarrier) WriteMessage(p []byte) error {

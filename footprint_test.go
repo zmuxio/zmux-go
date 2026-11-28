@@ -9,10 +9,13 @@ import (
 	"runtime/pprof"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
-// Idle footprint: the live heap of idle sessions,
+// Performance gate (opt-in): the live heap of idle sessions,
 // streams and multipath sessions, both ends in this process over
 // in-memory pipes, after a warm-up, without idle timeout or keep-alive,
 // once the idle pipes gave their buffers back. Bounds: 17 408 B per
@@ -50,7 +53,7 @@ func heapNow() uint64 {
 func fpConfig() *Config { return &Config{MaxIdleTimeout: -1, Liveness: Liveness{KeepAlivePeriod: -1}} }
 
 func fpMPConfig() *Config {
-	return &Config{MaxIdleTimeout: -1, Liveness: Liveness{KeepAlivePeriod: -1}, MaxPipes: 4, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes...."), EndToEnd: true}}
+	return &Config{MaxIdleTimeout: -1, Liveness: Liveness{KeepAlivePeriod: -1}, SessionPolicy: SessionPolicy{Limits: CapacityLimits{SteadyAttachments: 4}}, PipeAuth: PipeAuth{PSK: []byte("a pre-shared key of 32 bytes...."), EndToEnd: true}}
 }
 
 func fpPairs(t *testing.T, n int) [][2]*Conn {
@@ -270,18 +273,22 @@ func TestFootprint(t *testing.T) {
 // sessions (no idle timeout, no keep-alive) arm no timer, and settling
 // takes a few timer callbacks, not a busy loop.
 func TestQuietSessionsFireNoTimer(t *testing.T) {
-	const n = 100
-	f0 := timerFires.Load()
-	v := fpPairs(t, n)
-	defer closePairs(v)
-	time.Sleep(time.Second + writerIdle)
-	settle := timerFires.Load() - f0
-	if settle > 10*2*n {
-		t.Fatalf("%d timer callbacks while %d sessions settled", settle, 2*n)
-	}
-	f1 := timerFires.Load()
-	time.Sleep(2 * time.Second)
-	if d := timerFires.Load() - f1; d != 0 {
-		t.Fatalf("%d timer callbacks in quiet sessions", d)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		before := timerFires.Load()
+		a, b := net.Pipe()
+		cfg := fpConfig()
+		cfg.ClockDomain = NewClockDomain(timeshim.Real)
+		pair(t, a, b, cfg, cfg)
+		time.Sleep(time.Second + writerIdle)
+		synctest.Wait()
+		after := timerFires.Load()
+		if n := after - before; n > 20 {
+			t.Fatalf("%d timer callbacks while the session pair settled", n)
+		}
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if d := timerFires.Load() - after; d != 0 {
+			t.Fatalf("%d timer callbacks in quiet sessions", d)
+		}
+	})
 }
