@@ -129,6 +129,12 @@ func TestAutotuneGrowsWithIdleReverseOnLowWaterCarrier(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Read the FIN: after the peer's close the receiver's session ends only
+	// once its received data is read or the linger timeout passes, and the
+	// receiver's fake clock no longer advances.
+	if _, err := io.Copy(io.Discard, as); err != nil {
+		t.Fatal(err)
+	}
 	if w := as.Stats().RecvWindow; w <= 256<<10 {
 		t.Fatalf("receive window stayed at %d; pipes %+v", w, s.PipeStats())
 	}

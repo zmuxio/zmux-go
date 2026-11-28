@@ -140,11 +140,11 @@ func (s *Session) unbindLane(st *Stream) {
 	}
 }
 
-func (l *outLane) removeBinding(i int) {
-	last := len(l.boundSt) - 1
-	l.boundSt[i] = l.boundSt[last]
-	l.boundSt[last] = nil
-	l.boundSt = l.boundSt[:last]
+func (ol *outLane) removeBinding(i int) {
+	last := len(ol.boundSt) - 1
+	ol.boundSt[i] = ol.boundSt[last]
+	ol.boundSt[last] = nil
+	ol.boundSt = ol.boundSt[:last]
 }
 
 // wantLane asks the driver for a new lane when the rules allow one.

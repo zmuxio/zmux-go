@@ -400,10 +400,10 @@ func splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResul
 }
 
 // mergeDatagrams copies the datagram counts of d into the direction.
-func (s *SpliceDirection) mergeDatagrams(d *SpliceDirection) {
-	s.DatagramBytes, s.Drops = d.DatagramBytes, d.Drops
-	s.DatagramsAsCapsules = d.DatagramsAsCapsules
-	s.PayloadCopyBytes += d.PayloadCopyBytes
+func (d *SpliceDirection) mergeDatagrams(from *SpliceDirection) {
+	d.DatagramBytes, d.Drops = from.DatagramBytes, from.Drops
+	d.DatagramsAsCapsules = from.DatagramsAsCapsules
+	d.PayloadCopyBytes += from.PayloadCopyBytes
 }
 
 // spliceDir is the static byte forwarding path. It probes credit before
