@@ -164,10 +164,6 @@ func Parse(b []byte, o ParseOptions) (*Bundle, error) {
 	if err := json.Unmarshal(b, &top); err != nil || top == nil {
 		return nil, bad("type", "bundle")
 	}
-	var schema int
-	if v := top["schema"]; json.Unmarshal(v, &schema) != nil || schema != machine.Schema {
-		return nil, bad("schema", "expected shaping schema %d", machine.Schema)
-	}
 	bu := &Bundle{raw: bytes.Clone(b), byKind: map[zmux.CarrierKind]*Entry{}}
 	for k, v := range top {
 		switch k {
@@ -188,7 +184,7 @@ func Parse(b []byte, o ParseOptions) (*Bundle, error) {
 			} else {
 				bu.nextChange = t
 			}
-		case "schema", "tables", "kinds":
+		case "tables", "kinds":
 		default:
 			return nil, bad("unknown_member", "%s", k)
 		}

@@ -9,9 +9,6 @@ import (
 	"github.com/zmuxio/zmux-go/shaping"
 )
 
-// Schema is the version of the shaping bundle contract.
-const Schema = 2
-
 type budgetDef struct {
 	requiredWait time.Duration
 	minRate      uint64

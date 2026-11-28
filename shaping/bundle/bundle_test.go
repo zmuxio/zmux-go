@@ -24,7 +24,7 @@ func bundleJSON(next string) string {
 	if next != "" {
 		n = `"` + next + `"`
 	}
-	return fmt.Sprintf(`{"schema":2,"generated_at":"2026-01-01T00:00:00Z","next_change":%s,"kinds":{`+
+	return fmt.Sprintf(`{"generated_at":"2026-01-01T00:00:00Z","next_change":%s,"kinds":{`+
 		`"websocket":[{"machines":%s,"budget":%s,"pool":%s}],`+
 		`"quic":[{"machines":%s}],`+
 		`"split":[{}],`+
@@ -93,7 +93,7 @@ func TestParseBounds(t *testing.T) {
 	if _, err := Parse(in, ParseOptions{Size: machine.SizeLimits{MaxBytes: 10}}); err == nil {
 		t.Error("candidate MaxBytes not applied")
 	}
-	big := `{"schema":2,"kinds":{"default":[{"pool":{"count":{"t":[[1,1,1],[1,2,2],[1,3,3]]}}}]}}`
+	big := `{"kinds":{"default":[{"pool":{"count":{"t":[[1,1,1],[1,2,2],[1,3,3]]}}}]}}`
 	if _, err := Parse([]byte(big), ParseOptions{Size: machine.SizeLimits{MaxSegments: 2}}); err == nil {
 		t.Error("MaxSegments not applied")
 	}
@@ -101,8 +101,8 @@ func TestParseBounds(t *testing.T) {
 
 func FuzzParse(f *testing.F) {
 	f.Add([]byte(bundleJSON("2026-01-02T00:00:00Z")))
-	f.Add([]byte(`{"schema":2,"generated_at":"2026-01-01T00:00:00Z","kinds":{"default":[{}]}}`))
-	f.Add([]byte(`{"schema":2,"kinds":{"quic":null,"default":[{"budget":null}]}}`))
+	f.Add([]byte(`{"generated_at":"2026-01-01T00:00:00Z","kinds":{"default":[{}]}}`))
+	f.Add([]byte(`{"kinds":{"quic":null,"default":[{"budget":null}]}}`))
 	f.Fuzz(func(t *testing.T, in []byte) {
 		b, err := Parse(in, ParseOptions{})
 		if err != nil {
