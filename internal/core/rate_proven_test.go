@@ -13,8 +13,9 @@ type rateFeeder struct {
 	a   *ackState
 	p   *Pipe
 	end uint64
-	// lone sends each range with nothing of the pipe unacknowledged ahead
-	lone bool
+	// backlog is the pipe's bytes unacknowledged ahead of each range: a
+	// deep buffer's by default
+	backlog uint64
 }
 
 // ack acknowledges n more bytes sent at sent, now, with a 100 ms delivery
@@ -28,7 +29,7 @@ func (f *rateFeeder) ack(sent, now Time, n uint64) {
 	ol.pos, ol.acked, ps.so = f.end, f.end, f.end
 	ol.segs = []sendSeg{{pos: start, end: f.end, so: start}}
 	ps.samples = []sample{{end: f.end, sent: sent, firstSentAt: sent, delivered: ps.delivered,
-		deliveredAt: now.Add(-iv), bubble: true, queued: !f.lone}}
+		deliveredAt: now.Add(-iv), bubble: true, backlog: f.backlog}}
 	ps.deliveredAt = now.Add(-iv)
 	f.a.advanced(f.p, ol, wire.AckEntry{Position: f.end}, now)
 }
@@ -38,7 +39,7 @@ func (f *rateFeeder) ack(sent, now Time, n uint64) {
 // lets R_p converge to the path rate.
 func TestRateConvergesOnDeepBuffer(t *testing.T) {
 	s := capacitySession()
-	f := &rateFeeder{a: newAckState(s), p: s.pipes[0]}
+	f := &rateFeeder{a: newAckState(s), p: s.pipes[0], backlog: 1 << 20}
 	e := &f.p.out.snd.re
 	f.ack(0, Time(20*Millisecond), 3000) // min_rtt 20 ms, no queue
 	if e.measured || e.value() != initialRate {
@@ -62,7 +63,7 @@ func TestRateConvergesOnDeepBuffer(t *testing.T) {
 // instead of keeping it for want of samples.
 func TestRateLeavesOldMaximumAfterSuspect(t *testing.T) {
 	s := capacityMP()
-	f := &rateFeeder{a: newAckState(s), p: s.pipes[0]}
+	f := &rateFeeder{a: newAckState(s), p: s.pipes[0], backlog: 1 << 20}
 	e := &f.p.out.snd.re
 	f.ack(0, Time(20*Millisecond), 3000)
 	measuredRate(f.p, 2e6)
@@ -90,32 +91,35 @@ func TestRateLeavesOldMaximumAfterSuspect(t *testing.T) {
 	}
 }
 
-// A rise of the propagation delay delays a lone range as much as a queue
-// would: with nothing of its own ahead it proves no queue, so its sample,
-// which spans the idle time before it, stays application-limited and
-// cannot pull R_p down to the small message's rate.
-func TestRateIgnoresLoneRangeAfterDelayRise(t *testing.T) {
-	s := capacitySession()
-	f := &rateFeeder{a: newAckState(s), p: s.pipes[0]}
-	e := &f.p.out.snd.re
-	f.ack(0, Time(50*Millisecond), 3000) // min_rtt 50 ms
-	measuredRate(f.p, 2e6)
-	f.lone = true
-	at := Time(Second)
-	for range 20 {
-		f.ack(at, at.Add(400*Millisecond), 36) // the path's delay is now 400 ms
-		at = at.Add(Second)
-	}
-	if e.value() != 2e6 {
-		t.Fatalf("R_p %v after lone ranges on a slower path, want the measured 2 MB/s", e.value())
-	}
-	// The same delay behind a backlog of the pipe is queue-proven.
-	f.lone = false
-	for range 20 {
-		f.ack(at, at.Add(400*Millisecond), 3000)
-		at = at.Add(100 * Millisecond)
-	}
-	if e.value() != 3e4 {
-		t.Fatalf("R_p %v behind a backlog, want 30 kB/s", e.value())
+// A rise of the propagation delay delays a range as much as a queue would:
+// a backlog of the pipe that R_p drains well within the delay (none, or a
+// few control bytes ahead) does not explain it, so the sample, a few bytes
+// over the idle time before them, stays application-limited and cannot pull
+// R_p down to the small message's rate.
+func TestRateIgnoresSmallBacklogAfterDelayRise(t *testing.T) {
+	for _, backlog := range []uint64{0, 36} {
+		s := capacitySession()
+		f := &rateFeeder{a: newAckState(s), p: s.pipes[0]}
+		e := &f.p.out.snd.re
+		f.ack(0, Time(50*Millisecond), 3000) // min_rtt 50 ms
+		measuredRate(f.p, 2e6)
+		f.backlog = backlog
+		at := Time(Second)
+		for range 20 {
+			f.ack(at, at.Add(400*Millisecond), 36) // the path's delay is now 400 ms
+			at = at.Add(Second)
+		}
+		if e.value() != 2e6 {
+			t.Fatalf("backlog %d: R_p %v on a slower path, want the measured 2 MB/s", backlog, e.value())
+		}
+		// The same delay behind a backlog that takes it at R_p is queue-proven.
+		f.backlog = 1 << 20
+		for range 20 {
+			f.ack(at, at.Add(400*Millisecond), 3000)
+			at = at.Add(100 * Millisecond)
+		}
+		if e.value() != 3e4 {
+			t.Fatalf("backlog %d: R_p %v behind a backlog, want 30 kB/s", backlog, e.value())
+		}
 	}
 }
