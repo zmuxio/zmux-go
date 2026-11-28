@@ -2,7 +2,7 @@ module github.com/zmuxio/zmux-go/examples/xorpipe
 
 go 1.27
 
-require github.com/zmuxio/zmux-go v1.5.7
+require github.com/zmuxio/zmux-go v1.6.0
 
 require (
 	github.com/djylb/netx v0.0.0-20261128085858-ea2b7e348ba2 // indirect

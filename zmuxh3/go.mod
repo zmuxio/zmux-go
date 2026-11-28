@@ -6,8 +6,8 @@ require (
 	github.com/djylb/timeshim v0.0.0-20261127195401-343d87836828
 	github.com/quic-go/qpack v0.6.0
 	github.com/quic-go/quic-go v0.66.0
-	github.com/zmuxio/zmux-go v1.5.7
-	github.com/zmuxio/zmux-go/zmuxquic v1.5.7
+	github.com/zmuxio/zmux-go v1.6.0
+	github.com/zmuxio/zmux-go/zmuxquic v1.6.0
 	golang.org/x/net v0.63.0
 )
 

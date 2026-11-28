@@ -6,10 +6,10 @@ require (
 	github.com/djylb/timeshim v0.0.0-20261127195401-343d87836828
 	github.com/quic-go/quic-go v0.66.0
 	github.com/quic-go/webtransport-go v0.13.0
-	github.com/zmuxio/zmux-go v1.5.7
-	github.com/zmuxio/zmux-go/zmuxh3 v1.5.7
-	github.com/zmuxio/zmux-go/zmuxquic v1.5.7
-	github.com/zmuxio/zmux-go/zmuxws v1.5.7
+	github.com/zmuxio/zmux-go v1.6.0
+	github.com/zmuxio/zmux-go/zmuxh3 v1.6.0
+	github.com/zmuxio/zmux-go/zmuxquic v1.6.0
+	github.com/zmuxio/zmux-go/zmuxws v1.6.0
 )
 
 require (
