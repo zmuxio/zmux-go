@@ -13,7 +13,7 @@ require (
 )
 
 require (
-	github.com/djylb/netx v0.0.0-20261128041904-a1937dc2039d // indirect
+	github.com/djylb/netx v0.0.0-20261128085858-ea2b7e348ba2 // indirect
 	github.com/dunglas/httpsfv v1.1.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	golang.org/x/crypto v0.59.0 // indirect
