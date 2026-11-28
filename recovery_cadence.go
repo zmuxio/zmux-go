@@ -16,6 +16,16 @@ type RecoveryCadence struct {
 	Advances         uint64
 }
 
+// gate is the recovery time gate for a session whose latest useful start
+// is cutoff. The cap applies only to a wait drawn before the cutoff, so the
+// session gets one start at the cutoff and later failures keep the cadence.
+func (r RecoveryCadence) gate(cutoff time.Time) time.Time {
+	if !cutoff.IsZero() && cutoff.Before(r.RetryAt) && cutoff.After(r.RetryAt.Add(-r.Sampled)) {
+		return cutoff
+	}
+	return r.RetryAt
+}
+
 var recoveryBackoff = ResolvedBackoff{Min: time.Second, Max: time.Minute, Jitter: 1}
 
 func (cc *CarrierCache) signalLocked() {
@@ -58,18 +68,28 @@ func (cc *CarrierCache) setRecoveryDemand(c *Conn, key CarrierCacheKey, live boo
 	}
 }
 
-func (cc *CarrierCache) advanceRecovery(key CarrierCacheKey) {
+func (cc *CarrierCache) advanceRecovery(key CarrierCacheKey, journal *outageJournal) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	e := cc.m[key]
 	if e == nil || len(e.demands) == 0 {
 		return
 	}
+	var undo *outageUndo
+	if journal != nil {
+		undo = journal.undo(key)
+		if !undo.recovered {
+			undo.recovered, undo.priorRecovery = true, e.recovery
+		}
+	}
 	nominal := recoveryBackoff.NextNominal(e.recovery.Nominal)
 	sampled := sampleWait(cc.config().recoverySamples, recoveryBackoff, nominal)
 	sampled = sampled.Truncate(cc.clockDomain.resolution())
 	e.recovery = RecoveryCadence{Advances: e.recovery.Advances, Nominal: nominal, Sampled: sampled, RetryAt: cc.nowLocked().Add(sampled)}
 	incrementRetryCount(&e.recovery.Advances)
+	if undo != nil {
+		undo.recovery = e.recovery
+	}
 	cc.signalLocked()
 }
 

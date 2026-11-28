@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -59,7 +57,7 @@ func TestSharedDirectionDemandAcrossTakeover(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		failure := AttemptSnapshot{Candidate: out.ID, Cause: AttemptRecovery, Result: AttemptResult{Reason: ReasonDialFailed, Attribution: AttributionCarrier}}
+		failure := AttemptSnapshot{Candidate: out.ID, Cause: AttemptRecovery, Started: clk.Now(), Result: AttemptResult{Reason: ReasonDialFailed, Attribution: AttributionCarrier}}
 		env.client.locked(func() { old.observeAttemptLocked(failure, 0) })
 		score := func() RecoveryCadence { return cache.Score(key.Key, key.Kind, key.Variant).Recovery }
 		initial := score()
@@ -153,91 +151,86 @@ func TestRecoveryOrderScoresAndRegistrationTies(t *testing.T) {
 	}
 }
 
-func TestUnattributedRoundWaitsForChange(t *testing.T) {
-	for _, wake := range []string{"capacity", "domain", "cache", "demand"} {
-		t.Run(wake, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				clk, cc, server := fakeConfigs(func(cfg *Config) {
-					cfg.MaxIdleTimeout = -1
-					cfg.ResumeTimeout = time.Minute
-				})
-				env := newMemMPEnv(t, cc, server)
-				cleanupFakeMPEnv(t, env, clk)
-				dropBootstrapSend(t, env)
-				synctest.Wait()
-				cache := testCarrierCache(t, CarrierCacheOptions{ClockDomain: cc.ClockDomain})
-				candidates := []Candidate{recoveryTestCandidate("one", "k", Send), recoveryTestCandidate("two", "k", Send)}
-				var starts atomic.Int32
-				x, y := net.Pipe()
-				defer func() { _ = y.Close() }()
-				late := &blockedCloseConn{Conn: x, entered: make(chan struct{}), gate: make(chan struct{})}
-				release := sync.OnceFunc(func() { close(late.gate) })
-				defer release()
-				opened := make(chan CandidateID, len(candidates))
-				for i := range candidates {
-					id := candidates[i].ID
-					candidates[i].Open = func(ctx context.Context, _ OpenRequest) ([]PipeIO, error) {
-						n := starts.Add(1)
-						if n > 2 {
-							<-ctx.Done()
-							return nil, ctx.Err()
-						}
-						opened <- id
-						if n == 2 {
-							return []PipeIO{{W: late}}, ErrInvalidConfig
-						}
-						return nil, ErrInvalidConfig
-					}
-				}
-				ctl := newRecoveryTestController(t, ControllerOptions{Domain: t.Name(), ClockDomain: cc.ClockDomain, Cache: cache, Candidates: candidates})
-				sc, err := ctl.Manage(env.client, SessionTarget{})
-				if err != nil {
-					t.Fatal(err)
-				}
-				synctest.Wait()
-				checkIdle := func() {
-					t.Helper()
-					v, err := sc.Snapshot()
-					if err != nil {
-						t.Fatal(err)
-					}
-					if starts.Load() != 2 || !errors.Is(v.Block, ErrInvalidConfig) || !v.NextRetry.IsZero() || cache.Score("k", CarrierRaw, "").Recovery.Advances != 0 {
-						t.Fatalf("exhausted round: starts %d, blocker %v, next retry %v", starts.Load(), v.Block, v.NextRetry)
-					}
-				}
-				checkIdle()
-				if first, second := <-opened, <-opened; first != "one" || second != "two" {
-					t.Fatalf("round tried %q, %q", first, second)
-				}
-				<-late.entered
-				release()
-				synctest.Wait()
-				checkIdle()
-				advanceClock(clk, 3*controllerStagger)
-				checkIdle()
-				switch wake {
-				case "capacity":
-					env.client.locked(env.client.s.NotifyCapacity)
-				case "domain":
-					ctl.mu.Lock()
-					ctl.signalLocked()
-					ctl.mu.Unlock()
-				case "cache":
-					cache.mu.Lock()
-					cache.signalLocked()
-					cache.mu.Unlock()
-				case "demand":
-					if err := sc.SetTarget(SessionTarget{Revision: 1}); err != nil {
-						t.Fatal(err)
-					}
-				}
-				synctest.Wait()
-				if got := starts.Load(); got != 3 {
-					t.Fatalf("starts after %s change = %d", wake, got)
-				}
-			})
+// An unattributed failure (here a plain error that is not a carrier fault)
+// must still schedule the next recovery on the cadence. Before the fix the
+// round parked with no timer and the session waited for its grace to expire.
+func TestUnattributedRecoveryFailureSchedulesRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk, cc, server := fakeConfigs(func(cfg *Config) {
+			cfg.MaxIdleTimeout = -1
+			cfg.ResumeTimeout = time.Hour
 		})
-	}
+		env := newMemMPEnv(t, cc, server)
+		cleanupFakeMPEnv(t, env, clk)
+		dropBootstrapSend(t, env)
+		synctest.Wait()
+		draws := make(chan float64, 8)
+		for range 8 {
+			draws <- 1
+		}
+		cache := testCarrierCache(t, CarrierCacheOptions{ClockDomain: cc.ClockDomain, RecoverySamples: draws})
+		c := recoveryTestCandidate("one", "k", Send)
+		var starts atomic.Int32
+		c.Open = func(context.Context, OpenRequest) ([]PipeIO, error) {
+			starts.Add(1)
+			return nil, ErrInvalidConfig
+		}
+		ctl := newRecoveryTestController(t, ControllerOptions{Domain: t.Name(), ClockDomain: cc.ClockDomain, Cache: cache, Candidates: []Candidate{c}})
+		sc, err := ctl.Manage(env.client, SessionTarget{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, wait := range []time.Duration{time.Second, 2 * time.Second, 4 * time.Second} {
+			synctest.Wait()
+			v, err := sc.Snapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := starts.Load(); got != int32(i+1) || v.NextRetry.IsZero() || !errors.Is(v.Block, ErrInvalidConfig) {
+				t.Fatalf("after %d failures: starts %d, next %v, block %v", i+1, got, v.NextRetry, v.Block)
+			}
+			if got := cache.Score("k", CarrierRaw, ""); got.CooldownLevel != 0 || got.Recovery.Nominal != wait {
+				t.Fatalf("unattributed failure: %+v", got)
+			}
+			advanceClock(clk, wait)
+		}
+	})
+}
+
+// A zero draw puts the retry at the failure's own commit time. The round
+// must still wake for it rather than wait for an unrelated change.
+func TestZeroDrawRecoveryRetriesAtOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk, cc, server := fakeConfigs(func(cfg *Config) {
+			cfg.MaxIdleTimeout = -1
+			cfg.ResumeTimeout = time.Hour
+		})
+		env := newMemMPEnv(t, cc, server)
+		cleanupFakeMPEnv(t, env, clk)
+		dropBootstrapSend(t, env)
+		synctest.Wait()
+		draws := make(chan float64, 4)
+		draws <- 0
+		for range 3 {
+			draws <- 1
+		}
+		cache := testCarrierCache(t, CarrierCacheOptions{ClockDomain: cc.ClockDomain, RecoverySamples: draws})
+		c := recoveryTestCandidate("one", "k", Send)
+		var starts atomic.Int32
+		c.Open = func(context.Context, OpenRequest) ([]PipeIO, error) {
+			starts.Add(1)
+			return nil, ErrInvalidConfig
+		}
+		ctl := newRecoveryTestController(t, ControllerOptions{Domain: t.Name(), ClockDomain: cc.ClockDomain, Cache: cache, Candidates: []Candidate{c}})
+		if _, err := ctl.Manage(env.client, SessionTarget{}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		// The first failure drew zero; the second waits its 2 s draw.
+		if got := starts.Load(); got != 2 {
+			t.Fatalf("starts after a zero draw: %d", got)
+		}
+	})
 }
 
 func TestStaleRetrySuppression(t *testing.T) {
@@ -374,6 +367,47 @@ func TestRecoveryWaitsForAttachmentCapacity(t *testing.T) {
 		case <-opened:
 		default:
 			t.Fatal("recovery did not wake after attachment capacity became available")
+		}
+	})
+}
+
+// A failed recovery candidate leaves no member behind in the capacity view.
+func TestFailedRecoveryCandidateLeavesNoMember(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clk, cc, server := fakeConfigs(func(cfg *Config) {
+			cfg.MaxIdleTimeout = -1
+			cfg.ResumeTimeout = time.Hour
+		})
+		env := newMemMPEnv(t, cc, server)
+		cleanupFakeMPEnv(t, env, clk)
+		dropBootstrapSend(t, env)
+		synctest.Wait()
+		cache := testCarrierCache(t, CarrierCacheOptions{ClockDomain: cc.ClockDomain})
+		c := recoveryTestCandidate("fail", "fail", Send)
+		var starts atomic.Int32
+		c.Open = func(ctx context.Context, req OpenRequest) ([]PipeIO, error) {
+			starts.Add(1)
+			// One carrier opened before the host reports a failure.
+			pipes, _ := testMemberOpener(env)(ctx, req)
+			return pipes, ErrInvalidConfig
+		}
+		ctl := newRecoveryTestController(t, ControllerOptions{Domain: t.Name(), ClockDomain: cc.ClockDomain, Cache: cache, Candidates: []Candidate{c}})
+		sc, err := ctl.Manage(env.client, SessionTarget{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if starts.Load() == 0 {
+			t.Fatal("no recovery started")
+		}
+		v, err := sc.Snapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range v.Capacity.Members {
+			if m.Candidate == c.ID {
+				t.Fatalf("failed candidate left a member: %+v", m)
+			}
 		}
 	})
 }

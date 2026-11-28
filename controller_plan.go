@@ -245,8 +245,8 @@ func (sc *SessionControl) choose(p reconcilePlan, round *recoveryRound) (Candida
 			case sc.ctx != nil && !sc.currentLocked(p.revision):
 				err = ErrStaleBinding
 				return
-			case intent == AttemptRecovery && sc.c.clk.source().Now().Before(sc.ctl.cache.Score(c.CacheKey, c.Kind, c.Variant).Recovery.RetryAt):
-				err, next = ErrRecoveryWait, sc.ctl.recoveryWake(c)
+			case intent == AttemptRecovery && sc.c.clk.source().Now().Before(sc.recoveryWakeAt(c, sc.recoveryCutoffLocked())):
+				err, next = ErrRecoveryWait, sc.recoveryWakeAt(c, sc.recoveryCutoffLocked())
 				if after.After(next) {
 					next = after
 				}
@@ -255,7 +255,11 @@ func (sc *SessionControl) choose(p reconcilePlan, round *recoveryRound) (Candida
 			case sc.c.clk.source().Now().Before(after):
 				err, next = ErrControllerDialAfter, after
 			default:
-				work, next, err = sc.ctl.acquire(c, intent, &sc.demand, len(c.Attachments))
+				var cutoff time.Time
+				if intent == AttemptRecovery {
+					cutoff = sc.recoveryCutoffLocked()
+				}
+				work, next, err = sc.ctl.acquire(c, intent, &sc.demand, len(c.Attachments), cutoff)
 				if work != nil {
 					work.round = round
 				}
@@ -516,11 +520,15 @@ func (sc *SessionControl) reconcile(revision uint64, capacity CapacitySnapshot, 
 		if !errors.Is(err, ErrChangePending) && !errors.Is(err, ErrControllerCleanup) && !errors.Is(err, ErrStaleDecision) {
 			return time.Time{}, err
 		}
+		// SetTarget can renew the batch under a newer revision; the wait
+		// then belongs to that revision and must withdraw its demand.
+		var current uint64
+		sc.c.peek(func() { current = tx.targetRevision })
 		if !sharedControllerBlock(err) {
-			sc.dropDemand(revision)
+			sc.dropDemand(current)
 			domain = sc.ctl.watch()
 		}
-		sc.setProgress(revision, p.deficit, tx.deadline, err)
+		sc.setProgress(current, p.deficit, tx.deadline, err)
 		select {
 		case <-tx.ctx.Done():
 			return time.Time{}, tx.ctx.Err()

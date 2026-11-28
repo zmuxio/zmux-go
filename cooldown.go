@@ -62,6 +62,22 @@ type CooldownReset struct {
 func (e CooldownReset) CandidateKey() CarrierCacheKey { return e.Key }
 func (CooldownReset) cooldownEvent()                  {}
 
+// CooldownRetracted reports that a provisional cooldown round was withdrawn:
+// when its session's outage began (an onset drop) or when the session
+// reconnected. Level is the restored level; RetryAt is the restored retry
+// time, zero when no wait remains.
+type CooldownRetracted struct {
+	Key         CarrierCacheKey
+	Episode     uint64
+	Level       int64
+	RetractedAt time.Time
+	RetryAt     time.Time
+}
+
+// CandidateKey returns the key whose retry state changed.
+func (e CooldownRetracted) CandidateKey() CarrierCacheKey { return e.Key }
+func (CooldownRetracted) cooldownEvent()                  {}
+
 // CooldownSubscription observes future local cooldown commits in commit order.
 type CooldownSubscription struct {
 	cache   *CarrierCache
@@ -326,3 +342,51 @@ func (cc *CarrierCache) resetCooldownLocked(key CarrierCacheKey, e *cacheEntry, 
 }
 
 func (c cacheCooling) committed() bool { return c.Level != 0 || c.nominal != 0 }
+
+// ResetCooldown clears the key's ordinary cooldown (level, backoff, retry time
+// and short-drop marks) and its recovery cadence, as a health reset does,
+// without waiting for the health interval. Scoring history, peer retry
+// deadlines and in-flight attempts are kept. Hosts call it when they learn
+// that the network changed. It reports whether there was anything to clear.
+func (cc *CarrierCache) ResetCooldown(key string, kind CarrierKind, variant string) bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	k := CarrierCacheKey{Key: key, Kind: kind, Variant: variant}
+	e := cc.m[k]
+	if e == nil {
+		return false
+	}
+	cleared := cc.clearCooldownLocked(k, e, cc.nowLocked())
+	if cleared {
+		cc.signalLocked()
+	}
+	return cleared
+}
+
+// ResetCooldowns applies ResetCooldown to every key and returns how many
+// keys had state to clear.
+func (cc *CarrierCache) ResetCooldowns() int {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	now := cc.nowLocked()
+	n := 0
+	for k, e := range cc.m {
+		if cc.clearCooldownLocked(k, e, now) {
+			n++
+		}
+	}
+	if n != 0 {
+		cc.signalLocked()
+	}
+	return n
+}
+
+func (cc *CarrierCache) clearCooldownLocked(k CarrierCacheKey, e *cacheEntry, now time.Time) bool {
+	cleared := e.cooling.committed()
+	cc.resetCooldownLocked(k, e, now)
+	if e.recovery != (RecoveryCadence{}) {
+		e.recovery = RecoveryCadence{}
+		cleared = true
+	}
+	return cleared
+}

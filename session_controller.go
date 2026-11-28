@@ -432,7 +432,9 @@ func (ctl *SessionController) order(allowed []CandidateID, boot bool) []Candidat
 	return list
 }
 
-func (ctl *SessionController) acquire(c Candidate, intent AttemptCause, demand *controllerDemand, attachments int) (*controllerWork, time.Time, error) {
+// acquire reserves a key. A nonzero cutoff is the latest recovery start the
+// session can still use before its grace expires.
+func (ctl *SessionController) acquire(c Candidate, intent AttemptCause, demand *controllerDemand, attachments int, cutoff time.Time) (*controllerWork, time.Time, error) {
 	ctl.mu.Lock()
 	defer ctl.mu.Unlock()
 	key := candKey(c.CacheKey, c)
@@ -441,7 +443,7 @@ func (ctl *SessionController) acquire(c Candidate, intent AttemptCause, demand *
 		return nil, time.Time{}, net.ErrClosed
 	}
 	var reservedAt time.Time
-	token, next, err := ctl.cache.admitChecked(key, intent, demand.session, func() error {
+	token, next, err := ctl.cache.admitChecked(key, intent, demand.session, cutoff, func() error {
 		if err := ctl.grantPermitsLocked(demand, controllerPermits{opener: true, cleanup: attachments}); err != nil {
 			return err
 		}
@@ -585,7 +587,11 @@ type SessionControl struct {
 	done          chan struct{}
 	preferences   map[MemberID]installedPreference
 	feedback      map[MemberID]*memberFeedback
-	batch         *CapacityChange
+	// onset journals drops since the last pipe gain and, while inOutage,
+	// every failure committed with no usable pipe.
+	onset    *outageJournal
+	inOutage bool
+	batch    *CapacityChange
 	// The connection owner guards the target and current batch.
 	target       SessionTarget
 	view         ControllerSnapshot

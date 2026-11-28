@@ -204,7 +204,7 @@ func TestControllerHonorsAuthenticatedPeerRetry(t *testing.T) {
 		}
 		var demand controllerDemand
 		defer ctl.dropDemand(&demand)
-		work, next, err := ctl.acquire(candidate, AttemptRecovery, &demand, len(candidate.Attachments))
+		work, next, err := ctl.acquire(candidate, AttemptRecovery, &demand, len(candidate.Attachments), time.Time{})
 		if work != nil {
 			work.releaseWork()
 			work.releaseKey()
@@ -247,7 +247,7 @@ func TestCooldownMetricsAndResetFromAlreadyHealthyMember(t *testing.T) {
 		if err := cache.update(key, CacheLateDrop, CarrierObservation{}); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := cache.admitChecked(key, AttemptGrowth, nil, nil); !errors.Is(err, ErrCarrierCooling) {
+		if _, _, err := cache.admitChecked(key, AttemptGrowth, nil, time.Time{}, nil); !errors.Is(err, ErrCarrierCooling) {
 			t.Fatalf("ordinary admission during cooldown: %v", err)
 		}
 		select {
@@ -263,7 +263,7 @@ func TestCooldownMetricsAndResetFromAlreadyHealthyMember(t *testing.T) {
 		}
 		const elapsed = 5 * time.Second
 		advanceClock(clock, elapsed)
-		r, _, err := cache.admitChecked(key, AttemptRecovery, nil, nil)
+		r, _, err := cache.admitChecked(key, AttemptRecovery, nil, time.Time{}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

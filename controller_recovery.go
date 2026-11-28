@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/djylb/timeshim"
+	"github.com/zmuxio/zmux-go/internal/core"
 )
 
 var errRecoveryNoLongerNeeded = errors.New("zmux: recovery direction already covered")
@@ -85,10 +86,7 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 			default:
 				failed |= a.member.Expected
 				round.lastFailure = v.Result.Err
-				if v.Result.Attribution == AttributionCarrier {
-					round.carrierFailure = true
-					round.noteRetry(sc.c.clk.source().Now(), sc.ctl.recoveryWake(sc.ctl.candidate(v.Candidate)))
-				}
+				round.noteFailure(sc.c.clk.source().Now(), sc.recoveryWake(sc.ctl.candidate(v.Candidate)))
 			}
 		}
 		clear(active[len(keep):])
@@ -114,7 +112,7 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 					work.releaseKey()
 					work.releaseWork()
 					work.releaseCleanup()
-					retry := sc.ctl.recoveryWake(candidate)
+					retry := sc.recoveryWake(candidate)
 					sc.suppressCurrentStart(revision, candidate, retry, err)
 					if errors.Is(err, errRecoveryNoLongerNeeded) {
 						continue
@@ -149,12 +147,11 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 				return time.Time{}, nil
 			}
 			if errors.Is(blocked, ErrNoEligibleCandidate) && round.lastFailure != nil {
-				if !round.carrierFailure {
-					sc.parkRecoveryRound(tx, p, round, time.Time{}, round.lastFailure)
-					tx = nil
-					return time.Time{}, nil
-				}
-				blocked = round.lastFailure
+				// Every failure advanced the cadence, so the round waits
+				// for the earliest retry, or sooner for a change.
+				sc.parkRecoveryRound(tx, p, round, earliest(next, round.retryAt), round.lastFailure)
+				tx = nil
+				return time.Time{}, nil
 			}
 			if len(round.tried) != 0 {
 				// All capable alternatives have either run or hit a gate. Re-enter
@@ -180,8 +177,18 @@ type recoveryRound struct {
 	startRefusal   error
 	refusalWatch   <-chan struct{}
 	retryAt        time.Time
-	carrierFailure bool
 	cleanupSignals uint64 // guarded by the controller lock
+}
+
+// noteFailure keeps the retry a failure drew even when it has already
+// passed, so the parked round wakes at once instead of waiting for a change.
+// A failure with no retry (a reset cleared it, or the key had no demand when
+// it committed) is due now.
+func (r *recoveryRound) noteFailure(now, retry time.Time) {
+	if retry.IsZero() {
+		retry = now
+	}
+	r.retryAt = earliest(r.retryAt, retry)
 }
 
 func (r *recoveryRound) noteRetry(now, retry time.Time) {
@@ -249,12 +256,29 @@ func (sc *SessionControl) parkRecoveryRound(tx *CapacityChange, p reconcilePlan,
 	}
 }
 
-func (ctl *SessionController) recoveryWake(candidate Candidate) time.Time {
-	s := ctl.cache.Score(candidate.CacheKey, candidate.Kind, candidate.Variant)
-	if s.PeerRetryUntil.After(s.Recovery.RetryAt) {
+// recoveryWake is this session's next recovery opportunity for the key.
+func (sc *SessionControl) recoveryWake(candidate Candidate) time.Time {
+	var cutoff time.Time
+	sc.c.peek(func() { cutoff = sc.recoveryCutoffLocked() })
+	return sc.recoveryWakeAt(candidate, cutoff)
+}
+
+func (sc *SessionControl) recoveryWakeAt(candidate Candidate, cutoff time.Time) time.Time {
+	s := sc.ctl.cache.Score(candidate.CacheKey, candidate.Kind, candidate.Variant)
+	retry := s.Recovery.gate(cutoff)
+	if s.PeerRetryUntil.After(retry) {
 		return s.PeerRetryUntil
 	}
-	return s.Recovery.RetryAt
+	return retry
+}
+
+// recoveryCutoff is the latest start that still leaves a full attempt
+// before a suspended session's grace expires, or zero.
+func (sc *SessionControl) recoveryCutoffLocked() time.Time {
+	if grace := sc.c.s.RecoveryGraceDeadline(); grace != core.Never {
+		return sc.c.clk.wall(grace).Add(-sc.ctl.opts.Limits.AttemptTimeout)
+	}
+	return time.Time{}
 }
 
 func (sc *SessionControl) startRecovery(revision uint64, capacity CapacitySnapshot, candidate Candidate, work *controllerWork, current **CapacityChange) (*Attempt, error) {

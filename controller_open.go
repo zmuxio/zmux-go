@@ -163,7 +163,7 @@ func (ctl *SessionController) openBootstrap(ctx context.Context, cfg *Config) (*
 					next = earliest(next, after)
 					continue
 				}
-				work, at, err := ctl.acquire(c, AttemptBootstrap, &demand, 1)
+				work, at, err := ctl.acquire(c, AttemptBootstrap, &demand, 1, time.Time{})
 				if err != nil {
 					next = earliest(next, at)
 					if sharedControllerBlock(err) {

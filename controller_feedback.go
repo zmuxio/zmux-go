@@ -22,17 +22,25 @@ func (sc *SessionControl) observeAttemptLocked(a AttemptSnapshot, peerRetry time
 	}
 	candidate := sc.ctl.opts.Candidates[i]
 	key := candKey(candidate.CacheKey, candidate)
+	journal := sc.provisionalLocked()
 	if a.Result.Attribution == AttributionCarrier {
-		_ = sc.ctl.cache.applyFeedback(key, CacheFailed, CarrierObservation{}, cacheFeedback{retry: peerRetry, settledHandshake: a.HandshakeSucceeded})
-		if a.Cause == AttemptRecovery {
-			if sc.c.control == sc {
-				sc.updateRecoveryLocked()
-			}
-			sc.ctl.cache.advanceRecovery(key)
+		_ = sc.ctl.cache.applyFeedback(key, CacheFailed, CarrierObservation{}, cacheFeedback{retry: peerRetry, settledHandshake: a.HandshakeSucceeded, journal: journal})
+	}
+	// Pacing is independent of attribution: every started recovery that
+	// failed schedules the next one while the session still lacks a pipe.
+	if a.Cause == AttemptRecovery && !a.Started.IsZero() && recoveryFailed(a.Result.Reason) {
+		if sc.c.control == sc {
+			sc.updateRecoveryLocked()
 		}
+		sc.ctl.cache.advanceRecovery(key, journal)
 	}
 	if a.Result.Reason == ReasonConfirmed {
 		sc.ctl.cache.confirmRecovery(key)
+		// A superseded binding's confirmation on the same cache still ends the
+		// current binding's outage, whose journal the takeover carried.
+		if owner := sc.c.control; owner != nil && owner.ctl.cache == sc.ctl.cache {
+			owner.connectivityLocked()
+		}
 		if sc.c.control != sc {
 			return
 		}
@@ -43,6 +51,18 @@ func (sc *SessionControl) observeAttemptLocked(a AttemptSnapshot, peerRetry time
 			}
 		}
 	}
+}
+
+// recoveryFailed reports whether a terminal reason leaves the need unmet
+// because the attempt itself did not deliver.
+func recoveryFailed(r AttemptReason) bool {
+	switch r {
+	case ReasonConfirmed, ReasonNoLongerNeeded, ReasonCancelled, ReasonSessionClosed:
+		return false
+	case ReasonDialFailed, ReasonHookFailed, ReasonDeadline, ReasonJoinRefused, ReasonConfirmationFailed:
+		return true
+	}
+	return true
 }
 
 func (sc *SessionControl) trackMemberLocked(id MemberID, candidate CandidateID, expected, covered, stable Directions) {
@@ -88,13 +108,19 @@ func (sc *SessionControl) observeMembersLocked(edges []core.MemberHealthChange) 
 				outcome = CacheShortDrop
 				f.window = time.Time{}
 			}
-			_ = sc.ctl.cache.applyFeedback(f.key, outcome, CarrierObservation{At: at}, cacheFeedback{fault: edge.PhysicalFault})
+			// A drop stays retractable until the session regains a pipe
+			// without an outage in between.
+			if sc.onset == nil {
+				sc.onset = newOutageJournal(sc.ctl.cache)
+			}
+			_ = sc.ctl.cache.applyFeedback(f.key, outcome, CarrierObservation{At: at}, cacheFeedback{fault: edge.PhysicalFault, journal: sc.onset})
 		}
 		if !f.stable && stable {
 			if f.window.IsZero() {
 				f.risk = at
 			}
 			sc.ctl.cache.observeHealthyMember(f, at, true)
+			sc.connectivityLocked()
 		}
 		if stable {
 			f.failedRound = false
@@ -102,6 +128,15 @@ func (sc *SessionControl) observeMembersLocked(edges []core.MemberHealthChange) 
 		f.stable = stable
 		if edge.Retired {
 			delete(sc.feedback, edge.ID)
+		}
+	}
+	if sc.c.control == sc {
+		// Coverage changes reach the owner through this hook. A pipe that
+		// carries again ends the outage as a success.
+		if sc.outageLocked() {
+			sc.enterOutageLocked()
+		} else if sc.inOutage {
+			sc.connectivityLocked()
 		}
 	}
 	if len(edges) != 0 {
@@ -170,6 +205,8 @@ func (sc *SessionControl) stopFeedbackLocked() {
 		}
 	}
 	clear(sc.feedback)
+	// Without a success the provisional failures become final.
+	sc.finalizeOutageLocked()
 }
 
 func (sc *SessionControl) transferFeedbackLocked(next *SessionControl) {
@@ -205,5 +242,11 @@ func (sc *SessionControl) transferFeedbackLocked(next *SessionControl) {
 		next.feedback[m.ID] = f
 	}
 	clear(sc.feedback)
+	if sc.ctl.cache == next.ctl.cache {
+		next.onset, next.inOutage = sc.onset, sc.inOutage
+		sc.onset, sc.inOutage = nil, false
+	} else {
+		sc.finalizeOutageLocked()
+	}
 	next.armFeedbackLocked()
 }

@@ -288,6 +288,7 @@ type cacheFeedback struct {
 	source           *carrierReportState
 	applied          *bool
 	fault            *core.PhysicalFault
+	journal          *outageJournal
 	retry            time.Duration
 	sequence         uint64
 }
@@ -432,6 +433,7 @@ type keyReservation struct {
 	entry   *cacheEntry
 	token   uint64
 	intent  AttemptCause
+	cutoff  time.Time
 }
 
 func (p keyReservation) start() error {
@@ -441,7 +443,7 @@ func (p keyReservation) start() error {
 	if !e.inFlight || p.token != e.token || e.started {
 		return errControllerStaleStart
 	}
-	if _, err := e.admission(p.cache.nowLocked(), p.intent, p.token); err != nil {
+	if _, err := e.admission(p.cache.nowLocked(), p.intent, p.token, p.cutoff); err != nil {
 		return err
 	}
 	e.started = true
@@ -581,6 +583,11 @@ func (cc *CarrierCache) updateWithWait(k CarrierCacheKey, o CacheOutcome, ob Car
 		e.history.cachePoint = cachePoint{At: now}
 	}
 	w := decayAge(now.Sub(ob.At), p.halfLife)
+	var undo *outageUndo
+	if j := feedback.journal; j != nil && o >= CacheFailed && o <= CacheLateDrop && o != CacheSurvived {
+		undo = j.undo(k)
+		undo.addHistory(now, p.halfLife, o, w, !feedback.settledHandshake)
+	}
 	switch o {
 	case CacheUsable:
 		e.history.Attempts++
@@ -590,7 +597,7 @@ func (cc *CarrierCache) updateWithWait(k CarrierCacheKey, o CacheOutcome, ob Car
 			e.history.Attempts++
 			e.history.Failure += w
 		}
-		cc.coolLocked(k, e, p, now, o, wait)
+		cc.coolOrDeferLocked(k, e, p, now, o, wait, undo, feedback.journal)
 	case CacheSurvived:
 		e.history.Survived += w
 	case CacheShortDrop, CacheLateDrop:
@@ -600,7 +607,7 @@ func (cc *CarrierCache) updateWithWait(k CarrierCacheKey, o CacheOutcome, ob Car
 			e.history.LateDrop += w
 		}
 		if cc.newPhysicalFaultLocked(k, feedback.fault) {
-			cc.coolLocked(k, e, p, now, o, wait)
+			cc.coolOrDeferLocked(k, e, p, now, o, wait, undo, feedback.journal)
 		}
 	case CacheLifetime:
 		lambda := math.Ln2 / p.halfLife.Seconds()
@@ -620,8 +627,21 @@ func (cc *CarrierCache) updateWithWait(k CarrierCacheKey, o CacheOutcome, ob Car
 	return nil
 }
 
-func (cc *CarrierCache) coolLocked(key CarrierCacheKey, e *cacheEntry, p *cacheParams, now time.Time, o CacheOutcome, wait func(ResolvedBackoff, time.Duration) time.Duration) {
+// coolOrDeferLocked defers the round of a fault committed during an outage.
+func (cc *CarrierCache) coolOrDeferLocked(key CarrierCacheKey, e *cacheEntry, p *cacheParams, now time.Time, o CacheOutcome, wait func(ResolvedBackoff, time.Duration) time.Duration, undo *outageUndo, journal *outageJournal) {
+	if undo != nil && journal.active {
+		undo.deferOnce(o)
+		return
+	}
+	cc.coolLocked(key, e, p, now, o, wait, undo)
+}
+
+func (cc *CarrierCache) coolLocked(key CarrierCacheKey, e *cacheEntry, p *cacheParams, now time.Time, o CacheOutcome, wait func(ResolvedBackoff, time.Duration) time.Duration, undo *outageUndo) {
 	cc.resetCooldownIfDueLocked(key, e, now)
+	if undo != nil {
+		undo.captureCooling(e)
+		undo.rounds = append(undo.rounds, o)
+	}
 	c := &e.cooling
 	if c.Level < math.MaxInt64 {
 		c.Level++
@@ -661,6 +681,9 @@ func (cc *CarrierCache) coolLocked(key CarrierCacheKey, e *cacheEntry, p *cacheP
 		reason = CooldownAttempt
 	}
 	c.reason = reason
+	if undo != nil {
+		undo.episode = e.episode
+	}
 	cc.publishCooldownLocked(CooldownStarted{Key: key, Episode: e.episode, Level: c.Level, Reason: reason,
 		StartedAt: now, RetryAt: c.until, NominalWait: nominal, SampledWait: sampled})
 	cc.armCooldownResetLocked(key, e, now)
@@ -796,13 +819,13 @@ func (s *cacheSnapshotEntry) valid(bo ResolvedBackoff) bool {
 }
 
 // admitChecked reserves a key and its domain permits at a single cut.
-func (cc *CarrierCache) admitChecked(key CarrierCacheKey, intent AttemptCause, session *Conn, grant func() error) (keyReservation, time.Time, error) {
+func (cc *CarrierCache) admitChecked(key CarrierCacheKey, intent AttemptCause, session *Conn, cutoff time.Time, grant func() error) (keyReservation, time.Time, error) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	now := cc.nowLocked()
 	e := cc.entry(key)
 	cc.resetCooldownIfDueLocked(key, e, now)
-	wake, err := e.admission(now, intent, 0)
+	wake, err := e.admission(now, intent, 0, cutoff)
 	if intent == AttemptRecovery && session != nil {
 		if e.inFlight || len(e.waiters) > 0 {
 			if !slices.Contains(e.waiters, session) {
@@ -827,13 +850,13 @@ func (cc *CarrierCache) admitChecked(key CarrierCacheKey, intent AttemptCause, s
 	}
 	e.token++
 	e.inFlight = true
-	return keyReservation{cache: cc, session: session, entry: e, token: e.token, intent: intent}, time.Time{}, nil
+	return keyReservation{cache: cc, session: session, entry: e, token: e.token, intent: intent, cutoff: cutoff}, time.Time{}, nil
 }
 
-func (e *cacheEntry) admission(now time.Time, intent AttemptCause, token uint64) (time.Time, error) {
+func (e *cacheEntry) admission(now time.Time, intent AttemptCause, token uint64, cutoff time.Time) (time.Time, error) {
 	gate, reason := e.cooling.until, ErrCarrierCooling
 	if intent == AttemptRecovery {
-		gate, reason = e.recovery.RetryAt, ErrRecoveryWait
+		gate, reason = e.recovery.gate(cutoff), ErrRecoveryWait
 	}
 	if !e.peerRetry.Before(gate) {
 		gate, reason = e.peerRetry, ErrPeerRetry
