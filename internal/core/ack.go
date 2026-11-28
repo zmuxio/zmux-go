@@ -80,6 +80,9 @@ type sample struct {
 	probe bool
 	// sent while an application-limited bubble was in flight
 	bubble bool
+	// sent behind unacknowledged bytes of its own pipe: only such a range
+	// can be queue-proven (a lone range has no backlog to wait behind)
+	queued bool
 }
 
 // rttEst is RFC 9002 Section 5 with a 300 s minimum filter.
@@ -395,7 +398,7 @@ func (a *ackState) onSent(p *Pipe, ol *outLane, start uint64, w *recWriter, now 
 		ps.elicitEnd = max64(ps.elicitEnd, end)
 		bubble, epoch := ps.re.sendFlags(ps.cum)
 		smp := sample{end: end, sent: now, delivered: ps.delivered,
-			deliveredAt: ps.deliveredAt, firstSentAt: ps.firstSentAt, epoch: epoch, bubble: bubble, ahead: ahead, probe: w.suspPing}
+			deliveredAt: ps.deliveredAt, firstSentAt: ps.firstSentAt, epoch: epoch, bubble: bubble, queued: ps.cum < so, ahead: ahead, probe: w.suspPing}
 		if k := len(ps.samples); k >= ackKeepMany {
 			ps.samples[k-1] = smp // as for activity: a coarser sample, not more memory
 		} else {
@@ -539,12 +542,16 @@ func (a *ackState) advanced(p *Pipe, ol *outLane, e wire.AckEntry, now Time) {
 				ps.rttAt = now
 				s.tuneAckSample(r.min)
 			}
-			// Delivery rate sample. A queue-proven range (its corrected RTT
-			// at least 4 x min_rtt_p above min_rtt_p) waited behind a busy
-			// FIFO path: its sample is a bottleneck sample, also inside a
-			// bubble and also for bytes sent before the pipe turned suspect.
+			// Delivery rate sample. A queue-proven range (sent behind
+			// unacknowledged bytes of the pipe, its corrected RTT at least
+			// 4 x min_rtt_p above min_rtt_p) waited behind a busy FIFO
+			// path: its sample is a bottleneck sample, also inside a bubble
+			// and also for bytes sent before the pipe turned suspect. A
+			// range with nothing of its own ahead proves no queue: a rise
+			// of the propagation delay alone delays it as much, and its
+			// interval spans the idle time before it.
 			iv := maxD(last.sent.Sub(last.firstSentAt), now.Sub(last.deliveredAt))
-			proven := r.has && r.min > 0 && rtt-minD(ad, a.peerDelay)-r.min >= 4*r.min
+			proven := last.queued && r.has && r.min > 0 && rtt-minD(ad, a.peerDelay)-r.min >= 4*r.min
 			if iv > 0 && (proven || p.sampleOK(last.sent)) {
 				rate := float64(ps.delivered-last.delivered) * 1e9 / float64(iv)
 				ev.rate = ps.re.sample(rate, last.bubble, proven, last.epoch, now, quality)

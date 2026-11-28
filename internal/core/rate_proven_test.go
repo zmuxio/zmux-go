@@ -13,6 +13,8 @@ type rateFeeder struct {
 	a   *ackState
 	p   *Pipe
 	end uint64
+	// lone sends each range with nothing of the pipe unacknowledged ahead
+	lone bool
 }
 
 // ack acknowledges n more bytes sent at sent, now, with a 100 ms delivery
@@ -26,7 +28,7 @@ func (f *rateFeeder) ack(sent, now Time, n uint64) {
 	ol.pos, ol.acked, ps.so = f.end, f.end, f.end
 	ol.segs = []sendSeg{{pos: start, end: f.end, so: start}}
 	ps.samples = []sample{{end: f.end, sent: sent, firstSentAt: sent, delivered: ps.delivered,
-		deliveredAt: now.Add(-iv), bubble: true}}
+		deliveredAt: now.Add(-iv), bubble: true, queued: !f.lone}}
 	ps.deliveredAt = now.Add(-iv)
 	f.a.advanced(f.p, ol, wire.AckEntry{Position: f.end}, now)
 }
@@ -85,5 +87,35 @@ func TestRateLeavesOldMaximumAfterSuspect(t *testing.T) {
 	f.ack(suspectAt.Add(-Second), suspectAt.Add(-Second+20*Millisecond), 30000)
 	if len(e.samples) != n {
 		t.Fatal("an unqueued range sent before the suspicion gave a rate sample")
+	}
+}
+
+// A rise of the propagation delay delays a lone range as much as a queue
+// would: with nothing of its own ahead it proves no queue, so its sample,
+// which spans the idle time before it, stays application-limited and
+// cannot pull R_p down to the small message's rate.
+func TestRateIgnoresLoneRangeAfterDelayRise(t *testing.T) {
+	s := capacitySession()
+	f := &rateFeeder{a: newAckState(s), p: s.pipes[0]}
+	e := &f.p.out.snd.re
+	f.ack(0, Time(50*Millisecond), 3000) // min_rtt 50 ms
+	measuredRate(f.p, 2e6)
+	f.lone = true
+	at := Time(Second)
+	for range 20 {
+		f.ack(at, at.Add(400*Millisecond), 36) // the path's delay is now 400 ms
+		at = at.Add(Second)
+	}
+	if e.value() != 2e6 {
+		t.Fatalf("R_p %v after lone ranges on a slower path, want the measured 2 MB/s", e.value())
+	}
+	// The same delay behind a backlog of the pipe is queue-proven.
+	f.lone = false
+	for range 20 {
+		f.ack(at, at.Add(400*Millisecond), 3000)
+		at = at.Add(100 * Millisecond)
+	}
+	if e.value() != 3e4 {
+		t.Fatalf("R_p %v behind a backlog, want 30 kB/s", e.value())
 	}
 }
