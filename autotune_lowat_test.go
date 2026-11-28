@@ -68,6 +68,10 @@ func TestAutotuneGrowsWithIdleReverseOnLowWaterCarrier(t *testing.T) {
 			}
 		}
 		closeCarrier()
+		// The receiver's session clock is fake: a close that waits on it
+		// (CONNECTION_CLOSE still to go out, or the linger after the
+		// peer's) ends only once the test moves it past those bounds.
+		clock.Advance(time.Minute)
 		for _, conn := range []*Conn{c, r.conn} {
 			if conn != nil {
 				waitDone(t, conn)

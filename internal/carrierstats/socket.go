@@ -1,23 +1,35 @@
 package carrierstats
 
 import (
-	"crypto/tls"
 	"encoding/binary"
 	"net"
 )
 
-// TCPConnOf finds the TCP socket under a carrier half (a TCP connection, or a
-// TLS connection over one).
+// TCPConnOf finds the TCP socket under a carrier half: a TCP connection, or
+// any stack of NetConn layers (TLS, wrappers) over one.
 func TCPConnOf(x any) *net.TCPConn {
-	if nc, ok := x.(interface{ NetConn() net.Conn }); ok {
-		x = nc.NetConn() // TLS, or a transform's half over a connection
-		if tc, ok := x.(*tls.Conn); ok {
-			x = tc.NetConn()
+	// Each NetConn layer (TLS, a host's wrapper, a transform's half over a
+	// connection) names the connection beneath it; a bound stops a wrapper
+	// that names itself.
+	for range maxConnLayers {
+		if c, ok := x.(*net.TCPConn); ok {
+			return c
 		}
+		nc, ok := x.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil
+		}
+		next := nc.NetConn()
+		if next == nil || next == x {
+			return nil
+		}
+		x = next
 	}
-	c, _ := x.(*net.TCPConn)
-	return c
+	return nil
 }
+
+// maxConnLayers bounds the NetConn layers TCPConnOf goes through.
+const maxConnLayers = 16
 
 // SocketSampler resolves the connection beneath a sending half.
 func SocketSampler(w any) *Sampler {
