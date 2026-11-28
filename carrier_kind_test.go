@@ -54,9 +54,14 @@ func TestShaperFromFirstRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	transfer(t, c, s, 1000)
-	sizes, _ := rs.records(false)
-	if len(sizes) == 0 || wireLen(sizes[0]) >= 700 {
-		t.Fatalf("first record cannot fund its own padding: %v", sizes)
+	// The first record is shaped, its padding paid by the profile's floor
+	// allowance alone: no baseline precedes it. The trailing zero count also
+	// takes the zero bytes the frames themselves may end with (a varint
+	// field of zero), at most a few.
+	sizes, zeros := rs.records(false)
+	floor := shaping.Lightweight().FloorBytes
+	if len(sizes) == 0 || zeros[0] == 0 || uint64(zeros[0]) > floor+4 {
+		t.Fatalf("first record %v with %v padding bytes, want some and at most the %d floor", sizes, zeros, floor)
 	}
 	if got := k.seen(); len(got) == 0 || got[0] != (ShapedPipe{PipeID: 0, Carrier: CarrierStream}) {
 		t.Fatalf("factory saw %v", got)
