@@ -1644,6 +1644,22 @@ func TestSealedRefusesLanes(t *testing.T) {
 
 // finRelay carries a Sealed join from the joiner to the acceptor unit by unit, and can
 // drop whole records, then end the carrier at a record boundary.
+// preferPipe answers every request with pipe id while it is there, else
+// with the first pipe.
+type preferPipe PipeID
+
+func (id preferPipe) Pick(reqs []PickRequest, pipes []PickPipe, out []PickAnswer) {
+	at := 0
+	for i, p := range pipes {
+		if p.PipeID == PipeID(id) {
+			at = i
+		}
+	}
+	for i := range reqs {
+		out[i] = PickAnswer{Index: at}
+	}
+}
+
 type finRelay struct {
 	drop atomic.Bool
 }
@@ -1710,9 +1726,10 @@ func TestSealedEndAtRecordBoundaryIsAFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	sp := waitTestAttachment(t, e.ctx, p, e.s)
-	// Data must take the relayed pipe, whose round trip the default scheduler
-	// may avoid as long as the direct pipe's is shorter.
-	e.c.SetScheduler(SchedulerSpreadRoundRobin())
+	// Data must take the relayed pipe: a built-in policy may keep a new or
+	// slower pipe out of the data (it then fails with nothing owed, and
+	// nothing is reinjected). Once it is gone, the direct pipe takes all.
+	e.c.SetScheduler(SchedulerCustom(preferPipe(p.ID())))
 	st, err := e.c.OpenStreamSync(e.ctx)
 	if err != nil {
 		t.Fatal(err)
