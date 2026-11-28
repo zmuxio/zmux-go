@@ -71,7 +71,7 @@ func streamPipe(s *Stream, outer *Conn) PipeIO {
 	})
 	pair.read.s, pair.read.outer = s, outer
 	pair.write.s, pair.write.read = s, &pair.read
-	return PipeIO{R: &pair.read, W: &pair.write}
+	return PipeIO{R: &pair.read, W: &pair.write, Carrier: CarrierRaw}
 }
 
 type stPipeR struct {

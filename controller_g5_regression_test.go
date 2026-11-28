@@ -88,8 +88,8 @@ func TestControllerSuppressionFollowsActualCandidateStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := CarrierCacheKey{Key: "first", Kind: CarrierStream}
-	other := CarrierCacheKey{Key: "second", Kind: CarrierStream}
+	key := CarrierCacheKey{Key: "first", Kind: CarrierRaw}
+	other := CarrierCacheKey{Key: "second", Kind: CarrierRaw}
 	starts := dueStarts{}
 	block := func() { starts.suppress(cache, key, time.Time{}, ErrControllerDialAfter) }
 	block()
@@ -125,9 +125,9 @@ func TestControllerLossReferenceDoesNotReviveAfterWithdrawal(t *testing.T) {
 func TestControllerOpenSkipsIncompatibleBootstrapLayout(t *testing.T) {
 	opener := func(context.Context, OpenRequest) ([]PipeIO, error) { panic("test orders candidates without dialing") }
 	ctl, err := NewSessionController(ControllerOptions{Domain: t.Name(), Candidates: []Candidate{
-		{ID: "split", CacheKey: "split", Kind: CarrierStream, CanStart: true, Open: opener,
+		{ID: "split", CacheKey: "split", Kind: CarrierRaw, CanStart: true, Open: opener,
 			Attachments: []AttachmentSpec{{Directions: Send}, {Directions: Receive}}},
-		{ID: "duplex", CacheKey: "duplex", Kind: CarrierStream, CanStart: true, Open: opener},
+		{ID: "duplex", CacheKey: "duplex", Kind: CarrierRaw, CanStart: true, Open: opener},
 	}})
 	if err != nil {
 		t.Fatal(err)

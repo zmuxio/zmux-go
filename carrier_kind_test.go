@@ -44,8 +44,8 @@ func TestShaperFromFirstRecord(t *testing.T) {
 	defer func() { _ = lst.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: rs, W: rs, Carrier: CarrierStream}, PipeHint{}) }()
-	c, err := Start(ctx, PipeIO{R: a, W: a, Carrier: CarrierStream}, RoleClient, nil)
+	go func() { _ = lst.HandlePipe(ctx, PipeIO{R: rs, W: rs, Carrier: CarrierRaw}, PipeHint{}) }()
+	c, err := Start(ctx, PipeIO{R: a, W: a, Carrier: CarrierRaw}, RoleClient, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,11 +63,11 @@ func TestShaperFromFirstRecord(t *testing.T) {
 	if len(sizes) == 0 || zeros[0] == 0 || uint64(zeros[0]) > floor+4 {
 		t.Fatalf("first record %v with %v padding bytes, want some and at most the %d floor", sizes, zeros, floor)
 	}
-	if got := k.seen(); len(got) == 0 || got[0] != (ShapedPipe{PipeID: 0, Carrier: CarrierStream}) {
+	if got := k.seen(); len(got) == 0 || got[0] != (ShapedPipe{PipeID: 0, Carrier: CarrierRaw}) {
 		t.Fatalf("factory saw %v", got)
 	}
 	for _, x := range []*Conn{c, s} {
-		if st := x.PipeStats(); len(st) != 1 || st[0].Carrier != CarrierStream {
+		if st := x.PipeStats(); len(st) != 1 || st[0].Carrier != CarrierRaw {
 			t.Fatalf("pipe stats %+v", st)
 		}
 	}

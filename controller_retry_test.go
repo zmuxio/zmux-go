@@ -20,7 +20,7 @@ func TestRecoverySuppressionCountsDueStartOnce(t *testing.T) {
 		cleanupFakeMPEnv(t, env, fake)
 		const id = "repair"
 		opened := make(chan struct{}, 1)
-		candidate := Candidate{ID: id, CacheKey: id, Kind: CarrierStream,
+		candidate := Candidate{ID: id, CacheKey: id, Kind: CarrierRaw,
 			Attachments: testMemberSpec(id, Send).Attachments, Open: func(ctx context.Context, _ OpenRequest) ([]PipeIO, error) {
 				opened <- struct{}{}
 				<-ctx.Done()
@@ -50,7 +50,7 @@ func TestRecoverySuppressionCountsDueStartOnce(t *testing.T) {
 			ctl.mu.Unlock()
 			synctest.Wait()
 		}
-		if m := cache.RetryMetrics(id, CarrierStream, ""); m.Suppressions[RetryDialAfter] != 1 || m.AttemptedStarts != 0 {
+		if m := cache.RetryMetrics(id, CarrierRaw, ""); m.Suppressions[RetryDialAfter] != 1 || m.AttemptedStarts != 0 {
 			t.Fatalf("suppression charged on rescan: %+v", m)
 		}
 		advanceClock(fake, time.Second)
@@ -59,7 +59,7 @@ func TestRecoverySuppressionCountsDueStartOnce(t *testing.T) {
 		default:
 			t.Fatal("scheduled retry did not start")
 		}
-		if m := cache.RetryMetrics(id, CarrierStream, ""); m.Suppressions[RetryDialAfter] != 1 || m.AttemptedStarts != 1 {
+		if m := cache.RetryMetrics(id, CarrierRaw, ""); m.Suppressions[RetryDialAfter] != 1 || m.AttemptedStarts != 1 {
 			t.Fatalf("after cooldown expiry: %+v", m)
 		}
 	})
@@ -72,7 +72,7 @@ func TestBootstrapSuppressionCountsScheduleOnce(t *testing.T) {
 		const id = "bootstrap"
 		cache := testCarrierCache(t, CarrierCacheOptions{ClockDomain: domain})
 		opened := make(chan struct{}, 1)
-		candidate := Candidate{ID: id, CacheKey: id, Kind: CarrierStream, CanStart: true,
+		candidate := Candidate{ID: id, CacheKey: id, Kind: CarrierRaw, CanStart: true,
 			Open: func(ctx context.Context, _ OpenRequest) ([]PipeIO, error) {
 				opened <- struct{}{}
 				<-ctx.Done()
@@ -95,7 +95,7 @@ func TestBootstrapSuppressionCountsScheduleOnce(t *testing.T) {
 			ctl.mu.Unlock()
 			synctest.Wait()
 		}
-		if m := cache.RetryMetrics(id, CarrierStream, ""); m.Suppressions[RetryDialAfter] != 1 || m.AttemptedStarts != 0 {
+		if m := cache.RetryMetrics(id, CarrierRaw, ""); m.Suppressions[RetryDialAfter] != 1 || m.AttemptedStarts != 0 {
 			t.Fatalf("suppression charged on wake: %+v", m)
 		}
 		advanceClock(fake, time.Second)

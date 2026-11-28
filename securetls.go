@@ -27,7 +27,7 @@ func tlsRecords(w io.Writer) bool {
 // or TLS 1.2 that did not resume, and a missing extended master secret fails the export.
 func SecureTLS(c *tls.Conn) PipeIO {
 	s := &secureTLSConn{Conn: c}
-	return PipeIO{R: s, W: s}
+	return PipeIO{R: s, W: s, Carrier: CarrierRaw}
 }
 
 type secureTLSConn struct{ *tls.Conn }

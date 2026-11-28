@@ -1468,7 +1468,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 	// The carrier's state is read outside the session lock.
 	if ts, ok := TerminatedTLS(c.bootIO); ok {
 		st.TLS = &ts
-		if k := c.bootIO.Carrier; k == 0 || k == CarrierQUIC {
+		if k := c.bootIO.Carrier; k == 0 || k == CarrierRaw || k == CarrierQUIC {
 			// Over HTTP the ALPN names the HTTP version.
 			st.ApplicationProtocol = ts.NegotiatedProtocol
 		}

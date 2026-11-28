@@ -26,7 +26,7 @@ func (sc *SessionControl) memberRead(t *testing.T, member MemberID) MemberSnapsh
 func newTestController(t *testing.T, name string, env *mpEnv, cache *CarrierCache) *SessionController {
 	t.Helper()
 	opts := ControllerOptions{Domain: name, ClockDomain: env.client.clk.domain, Candidates: []Candidate{
-		{ID: "repair", CacheKey: "repair", Attachments: testMemberSpec("", Both).Attachments, Kind: CarrierStream, Open: testMemberOpener(env)},
+		{ID: "repair", CacheKey: "repair", Attachments: testMemberSpec("", Both).Attachments, Kind: CarrierRaw, Open: testMemberOpener(env)},
 	}, Cache: cache}
 	ctl, err := NewSessionController(opts)
 	if err != nil {
@@ -40,7 +40,7 @@ func installTestController(t *testing.T, name string, env *mpEnv, cache *Carrier
 	t.Helper()
 	ctl := newTestController(t, name, env, cache)
 	// The Join environment supplies the scripted carrier kind at handoff.
-	env.client.peek(func() { env.client.pipes[0].hc.io.Carrier = CarrierStream })
+	env.client.peek(func() { env.client.pipes[0].hc.io.Carrier = CarrierRaw })
 	sc, err := ctl.Manage(env.client, SessionTarget{}, ManageOptions{BootstrapCandidate: "repair"})
 	if err != nil {
 		t.Fatal(err)

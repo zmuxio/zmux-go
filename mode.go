@@ -25,12 +25,16 @@ const (
 	// CarrierWebTransport is a WebTransport stream
 	// (zmuxh3.WebTransportCandidate), direct only.
 	CarrierWebTransport
+	// CarrierRaw is a reliable ordered byte connection that carries the
+	// records itself, with no carrier framing of its own: TCP, TLS, a Unix
+	// socket, a stream of another session (NetPipe, SecureTLS, StreamPipe).
+	CarrierRaw
 )
 
-var carrierKindNames = [...]string{"", "websocket", "streaming", "split", "exchange", "quic", "http3", "webtransport"}
+var carrierKindNames = [...]string{"", "websocket", "streaming", "split", "exchange", "quic", "http3", "webtransport", "raw"}
 
 // String returns the kind's name: "websocket", "streaming", "split",
-// "exchange", "quic", "http3" or "webtransport".
+// "exchange", "quic", "http3", "webtransport" or "raw".
 func (k CarrierKind) String() string {
 	if int(k) < len(carrierKindNames) && k != 0 {
 		return carrierKindNames[k]

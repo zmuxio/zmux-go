@@ -151,12 +151,12 @@ func TestControllerBootstrapStagger(t *testing.T) {
 		}()
 		firstStarted, secondStarted, late := make(chan struct{}), make(chan struct{}), newCountingCarrier()
 		ctl, err := NewSessionController(ControllerOptions{Domain: t.Name(), ClockDomain: domain, Candidates: []Candidate{
-			{ID: "first", CacheKey: "first", Kind: CarrierStream, CanStart: true, Open: func(ctx context.Context, _ OpenRequest) ([]PipeIO, error) {
+			{ID: "first", CacheKey: "first", Kind: CarrierRaw, CanStart: true, Open: func(ctx context.Context, _ OpenRequest) ([]PipeIO, error) {
 				close(firstStarted)
 				<-ctx.Done()
 				return []PipeIO{{R: late, W: late}}, nil
 			}},
-			{ID: "second", CacheKey: "second", Kind: CarrierStream, CanStart: true, Open: func(ctx context.Context, req OpenRequest) ([]PipeIO, error) {
+			{ID: "second", CacheKey: "second", Kind: CarrierRaw, CanStart: true, Open: func(ctx context.Context, req OpenRequest) ([]PipeIO, error) {
 				close(secondStarted)
 				if req.Stage != OpenBootstrap || len(req.Layout) != 1 || req.Layout[0].Directions != Both {
 					return nil, errors.New("wrong bootstrap layout")
@@ -242,13 +242,13 @@ func TestControllerRecoveryRacesAlternativesInOneBatch(t *testing.T) {
 		first, second := make(chan OpenRequest, 1), make(chan OpenRequest, 1)
 		permitWinner := make(chan struct{})
 		candidates := []Candidate{
-			{ID: "first", CacheKey: "first", Kind: CarrierStream, Attachments: []AttachmentSpec{{Directions: Send}},
+			{ID: "first", CacheKey: "first", Kind: CarrierRaw, Attachments: []AttachmentSpec{{Directions: Send}},
 				Open: func(ctx context.Context, r OpenRequest) ([]PipeIO, error) {
 					first <- r
 					<-ctx.Done()
 					return nil, ctx.Err()
 				}},
-			{ID: "standby", CacheKey: "standby", Kind: CarrierStream, Standby: true, Attachments: []AttachmentSpec{{Directions: Send}},
+			{ID: "standby", CacheKey: "standby", Kind: CarrierRaw, Standby: true, Attachments: []AttachmentSpec{{Directions: Send}},
 				Open: func(ctx context.Context, r OpenRequest) ([]PipeIO, error) {
 					second <- r
 					select {
@@ -324,7 +324,7 @@ func TestControllerRecoveryWithdrawnWhenExternalCarrierFillsNeed(t *testing.T) {
 		started, release := make(chan struct{}), make(chan struct{})
 		unblock := sync.OnceFunc(func() { close(release) })
 		late := newCountingCarrier()
-		candidate := Candidate{ID: "repair", CacheKey: "repair", Kind: CarrierStream,
+		candidate := Candidate{ID: "repair", CacheKey: "repair", Kind: CarrierRaw,
 			Attachments: []AttachmentSpec{{Directions: Send}},
 			Open: func(context.Context, OpenRequest) ([]PipeIO, error) {
 				close(started)

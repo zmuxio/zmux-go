@@ -56,7 +56,7 @@ func TestPhysicalFaultOneCooldownForTwoMembers(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		choice := Candidate{ID: id, CacheKey: string(id), Kind: CarrierStream, Open: testMemberOpener(e)}
+		choice := Candidate{ID: id, CacheKey: string(id), Kind: CarrierRaw, Open: testMemberOpener(e)}
 		cache := testCarrierCache(t, CarrierCacheOptions{ClockDomain: cc.ClockDomain, Backoff: Backoff{Min: 30 * time.Second, Max: time.Hour, Jitter: Set(0.0)}})
 		subscription := cache.CooldownEvents()
 		defer subscription.Close()
@@ -109,11 +109,11 @@ func TestCooldownLevelSurvivesRestartAndClearsOnHealthReset(t *testing.T) {
 		if len(observations) != 0 {
 			sample = observations[0]
 		}
-		if err := cache.update(CarrierCacheKey{Key: "candidate", Kind: CarrierStream}, outcome, sample); err != nil {
+		if err := cache.update(CarrierCacheKey{Key: "candidate", Kind: CarrierRaw}, outcome, sample); err != nil {
 			t.Fatal(err)
 		}
 	}
-	score := func() CarrierScore { return cache.Score("candidate", CarrierStream, "") }
+	score := func() CarrierScore { return cache.Score("candidate", CarrierRaw, "") }
 	for range 3 {
 		report(CacheFailed)
 		clk.Advance(backoff.Max)
@@ -152,7 +152,7 @@ func TestPhysicalFaultGenerationsCanArriveOutOfOrder(t *testing.T) {
 	clk, cc, _ := fakeConfigs(func(*Config) {})
 	cache := testCarrierCache(t, CarrierCacheOptions{ClockDomain: cc.ClockDomain, Backoff: Backoff{Min: time.Second, Max: time.Minute, Jitter: Set(0.0)}})
 	a, b := NewCarrierID(), NewCarrierID()
-	key := CarrierCacheKey{Key: "shared", Kind: CarrierStream}
+	key := CarrierCacheKey{Key: "shared", Kind: CarrierRaw}
 	for _, fault := range []core.PhysicalFault{{CarrierID: a, Generation: 3}, {CarrierID: a, Generation: 2},
 		{CarrierID: a, Generation: 3}, {CarrierID: b, Generation: 3}} {
 		if err := cache.applyFeedback(key, CacheLateDrop, CarrierObservation{}, cacheFeedback{fault: &fault}); err != nil {
@@ -173,7 +173,7 @@ func TestControllerHonorsAuthenticatedPeerRetry(t *testing.T) {
 		start := clk.Now()
 		starts := make(chan time.Time, 4)
 		first := true // the reservation serializes openers on this key
-		candidate := Candidate{ID: "candidate", CacheKey: "key", Kind: CarrierStream, Attachments: []AttachmentSpec{{Directions: Both}},
+		candidate := Candidate{ID: "candidate", CacheKey: "key", Kind: CarrierRaw, Attachments: []AttachmentSpec{{Directions: Both}},
 			Open: func(ctx context.Context, req OpenRequest) ([]PipeIO, error) {
 				starts <- clk.Now()
 				if first {
@@ -234,7 +234,7 @@ func TestCooldownMetricsAndResetFromAlreadyHealthyMember(t *testing.T) {
 		const reset = time.Minute
 		cache := testCarrierCache(t, CarrierCacheOptions{ClockDomain: NewClockDomain(clock),
 			Backoff: Backoff{Min: 10 * time.Second, Max: 20 * time.Second, Jitter: Set(0.0)}, HealthReset: reset})
-		key := CarrierCacheKey{Key: "candidate", Kind: CarrierStream, Variant: "v"}
+		key := CarrierCacheKey{Key: "candidate", Kind: CarrierRaw, Variant: "v"}
 		subscription := cache.CooldownEvents()
 		defer subscription.Close()
 		events := subscription.Events()
@@ -299,7 +299,7 @@ func TestCooldownDropsAreLocalToSubscription(t *testing.T) {
 	slow, fast := cache.CooldownEvents(), cache.CooldownEvents()
 	defer slow.Close()
 	defer fast.Close()
-	key := CarrierCacheKey{Key: "candidate", Kind: CarrierStream}
+	key := CarrierCacheKey{Key: "candidate", Kind: CarrierRaw}
 	for range cap(slow.Events()) + 2 {
 		if err := cache.update(key, CacheFailed, CarrierObservation{}); err != nil {
 			t.Fatal(err)

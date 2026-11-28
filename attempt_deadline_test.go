@@ -109,7 +109,7 @@ func TestBootstrapOpenerAndHandshakeShareAttemptDeadline(t *testing.T) {
 		release := make(chan struct{})
 		left, right := net.Pipe() // the peer deliberately never handshakes
 		defer func() { _ = left.Close(); _ = right.Close() }()
-		candidate := Candidate{ID: "bootstrap", CacheKey: "bootstrap", Kind: CarrierStream, CanStart: true,
+		candidate := Candidate{ID: "bootstrap", CacheKey: "bootstrap", Kind: CarrierRaw, CanStart: true,
 			Open: func(ctx context.Context, _ OpenRequest) ([]PipeIO, error) {
 				deadline, _ := ctx.Deadline()
 				entered <- deadline

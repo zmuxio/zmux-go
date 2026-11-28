@@ -148,10 +148,11 @@ type PipeIO struct {
 	// LanesShareSource attests that lanes use the same physical half as lane zero.
 	LanesShareSource bool
 	Framing          Framing
-	// Carrier is the carrier's kind, which the adapters set on both ends
-	// and a Candidate's dial sets to its Kind; 0 for a carrier of no listed
-	// kind, such as raw TCP or TLS. The session reports it to its
-	// ShaperFactory, in pipe events and in PipeStats.
+	// Carrier is the carrier's kind, which the adapters and NetPipe,
+	// SecureTLS and StreamPipe set on both ends and a Candidate's dial sets
+	// to its Kind (CarrierRaw for raw TCP or TLS); 0 when nothing set it.
+	// The session reports it to its ShaperFactory, in pipe events and in
+	// PipeStats.
 	Carrier CarrierKind
 }
 
@@ -198,8 +199,9 @@ func (p PipeIO) validate() error {
 }
 
 // NetPipe returns the PipeIO of a bidirectional net.Conn (TCP, TLS, Unix,
-// or any net.Conn view such as a WebSocket library's).
-func NetPipe(c net.Conn) PipeIO { return PipeIO{R: c, W: c} }
+// or any net.Conn view such as a WebSocket library's), of kind CarrierRaw:
+// set Carrier for a view of a carrier of another kind.
+func NetPipe(c net.Conn) PipeIO { return PipeIO{R: c, W: c, Carrier: CarrierRaw} }
 
 // The optional capabilities of a PipeIO half. zmux looks for them on the
 // halves it is given and never unwraps a half. Their methods may be called

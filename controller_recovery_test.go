@@ -18,7 +18,7 @@ import (
 
 func recoveryTestCandidate(id CandidateID, key string, dir Directions) Candidate {
 	return Candidate{
-		ID: id, CacheKey: key, Kind: CarrierStream,
+		ID: id, CacheKey: key, Kind: CarrierRaw,
 		Attachments: []AttachmentSpec{{Directions: dir}},
 		Open:        func(context.Context, OpenRequest) ([]PipeIO, error) { return nil, ErrInvalidConfig },
 	}
@@ -123,13 +123,13 @@ func TestFeedbackTransferSplitsRiskAtKeyChange(t *testing.T) {
 				t.Fatalf("transferred feedback: %+v", f)
 			}
 		})
-		before := cache.Score("repair", CarrierStream, "").ExposureSeconds
-		if before <= 1.99 || cache.Score("destination", CarrierStream, "").ExposureSeconds != 0 {
+		before := cache.Score("repair", CarrierRaw, "").ExposureSeconds
+		if before <= 1.99 || cache.Score("destination", CarrierRaw, "").ExposureSeconds != 0 {
 			t.Fatal("pre-cut risk charged to wrong key")
 		}
 		advanceClock(clk, time.Second)
 		env.client.locked(next.stopFeedbackLocked)
-		if got := cache.Score("destination", CarrierStream, "").ExposureSeconds; got < 0.99 || got > 1 {
+		if got := cache.Score("destination", CarrierRaw, "").ExposureSeconds; got < 0.99 || got > 1 {
 			t.Fatalf("post-cut exposure %v", got)
 		}
 	})
@@ -201,7 +201,7 @@ func TestUnattributedRoundWaitsForChange(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					if starts.Load() != 2 || !errors.Is(v.Block, ErrInvalidConfig) || !v.NextRetry.IsZero() || cache.Score("k", CarrierStream, "").Recovery.Advances != 0 {
+					if starts.Load() != 2 || !errors.Is(v.Block, ErrInvalidConfig) || !v.NextRetry.IsZero() || cache.Score("k", CarrierRaw, "").Recovery.Advances != 0 {
 						t.Fatalf("exhausted round: starts %d, blocker %v, next retry %v", starts.Load(), v.Block, v.NextRetry)
 					}
 				}
