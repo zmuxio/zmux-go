@@ -372,6 +372,7 @@ func dialOnce(ctx context.Context, rawURL string, o *DialOptions, cred zmux.Carr
 }
 
 func handshake(ctx context.Context, nc net.Conn, rawURL string, co *wsconn.ClientOptions) (zmux.PipeIO, error) {
+	//goland:noinspection GoResourceLeak // Client closes nc on failure; the returned PipeIO owns c on success.
 	c, _, err := wsconn.Client(ctx, nc, rawURL, co)
 	if err != nil {
 		return zmux.PipeIO{}, err

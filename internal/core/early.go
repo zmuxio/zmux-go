@@ -93,9 +93,11 @@ func (s *Session) RestartEarly(info CarrierInfo, sig *WriteSignal, replaced bool
 		p.conn, p.chSig = nil, nil
 		s.replaceDatagramPath(p)
 	} else if p.out != nil {
-		old := p.out.lane(0).info.CarrierIdentity
-		if old != nil && info.CarrierIdentity != nil && old != info.CarrierIdentity {
-			s.replaceDatagramPath(p)
+		if lane := p.out.lane(0); lane != nil {
+			old := lane.info.CarrierIdentity
+			if old != nil && info.CarrierIdentity != nil && old != info.CarrierIdentity {
+				s.replaceDatagramPath(p)
+			}
 		}
 	}
 	p.out = &outDir{lanes: []*outLane{{info: info, confirmed: true}}, sig: sig}
@@ -172,10 +174,10 @@ func (s *Session) startEarly(assumed wire.Params) {
 // earlyActive reports whether early data may be sent now.
 func (s *Session) earlyActive() bool { return s.early != nil && !s.peerSeen }
 
-func (s *Session) earlyWants() bool { return s.dataPendingOn(nil, nil) }
+func (s *Session) earlyWants() bool { return s.dataPending(nil, nil) }
 
 // writeEarly writes the plain QMux STREAM data in a carrier's 0-RTT.
-func (s *Session) writeEarly(w *recWriter) { s.writeData(w, nil, nil) }
+func (s *Session) writeEarly(w *recWriter) { s.writeScheduledData(w, nil, nil, nil, nil) }
 
 // earlyOutcome decides the fate of early data when the peer's parameters
 // arrive.

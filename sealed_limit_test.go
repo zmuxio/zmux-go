@@ -29,8 +29,10 @@ func TestSealedReaderLimit(t *testing.T) {
 	}{{limit - 1, false}, {limit, false}, {limit + 1, true}} {
 		m := &limitMsgCarrier{firstMsgCarrier: newFirstMsgCarrier(make([]byte, c.plain+sealTag))}
 		p := SealRecords(PipeIO{R: m, W: m, Framing: FramingRecords}, tagSealer{}, tagOpener{}, RecordMode(0), nil)
-		msg, err := p.R.(MessageReader).ReadMessage(limit)
-		msg.Release()
+		msg, err := readMessage(p.R, limit)
+		if err == nil {
+			msg.Release()
+		}
 		if got := errors.Is(err, ErrMessageTooLarge); got != c.tooLong || (err != nil) != c.tooLong {
 			t.Fatalf("%d bytes: err %v", c.plain, err)
 		}
@@ -52,8 +54,10 @@ func TestSealedReaderLimitStream(t *testing.T) {
 	}{{limit, false}, {limit + 1, true}} {
 		src := frame(c.plain + sealTag)
 		p := SealRecords(PipeIO{R: readerOnly{src}, Framing: FramingByteStream}, tagSealer{}, tagOpener{}, RecordMode(0), nil)
-		msg, err := p.R.(MessageReader).ReadMessage(limit)
-		msg.Release()
+		msg, err := readMessage(p.R, limit)
+		if err == nil {
+			msg.Release()
+		}
 		if errors.Is(err, ErrMessageTooLarge) != c.tooLong {
 			t.Fatalf("%d bytes: err %v", c.plain, err)
 		}

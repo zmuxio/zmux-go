@@ -56,16 +56,16 @@ func (d *spliceRelay) readCapsule(ctx context.Context, ready uint64, end bool) b
 				d.badCapsule(ctx, errCapsuleTruncated)
 				return true
 			}
-			ch, err := d.read(ctx, min(need, d.sizes.chunk), ready, end)
-			p.n += len(ch.Data)
-			n := len(ch.Data)
-			ch.Release()
-			if errors.Is(err, io.EOF) {
+			r := d.read(ctx, min(need, d.sizes.chunk), ready, end)
+			n := len(r.chunk.Data)
+			p.n += n
+			r.chunk.Release()
+			if errors.Is(r.end, io.EOF) {
 				p.eof = true
-			} else if err != nil {
-				d.capsuleReadEnd(ctx, err)
+			} else if r.end != nil {
+				d.capsuleReadEnd(ctx, r.end)
 			}
-			return n > 0 || err != nil
+			return n > 0 || r.end != nil
 		}
 		g.meta.Type, g.meta.ContextID = h.typ, h.cx
 		p.header, p.left, p.parsed = h, int(h.payload), true
@@ -88,7 +88,8 @@ func (d *spliceRelay) readCapsule(ctx context.Context, ready uint64, end bool) b
 		}
 	}
 	if p.left > 0 {
-		ch, err := d.read(ctx, min(p.left, d.sizes.chunk), ready, end)
+		r := d.read(ctx, min(p.left, d.sizes.chunk), ready, end)
+		ch := r.chunk
 		n := len(ch.Data)
 		if n > 0 {
 			p.left -= n
@@ -103,10 +104,10 @@ func (d *spliceRelay) readCapsule(ctx context.Context, ready uint64, end bool) b
 				g.parts[0].parts = p.staging[:]
 			}
 		}
-		if errors.Is(err, io.EOF) && p.left == 0 {
+		if errors.Is(r.end, io.EOF) && p.left == 0 {
 			d.fin = true
-		} else if err != nil {
-			d.capsuleReadEnd(ctx, err)
+		} else if r.end != nil {
+			d.capsuleReadEnd(ctx, r.end)
 			return true
 		}
 		if p.left != 0 || !p.collect {

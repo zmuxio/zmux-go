@@ -214,6 +214,8 @@ func candidateDirections(c Candidate) Directions {
 
 // choose considers ordinary maintenance offers, or ordinary-ready, ordinary-cooling and
 // standby offers for recovery. A recovery transaction supplies its tried set.
+// choose returns a candidate and its reservation on success. On failure,
+// the wake time may identify the next opportunity to retry arbitration.
 func (sc *SessionControl) choose(p reconcilePlan, round *recoveryRound) (Candidate, *controllerWork, time.Time, error) {
 	sc.demand.starts.prepare(p)
 	candidates := sc.ctl.order(p.layouts(), false)

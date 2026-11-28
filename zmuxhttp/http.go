@@ -394,6 +394,7 @@ type httpHop struct {
 func (h *httpHop) sampler() *carrierstats.Sampler {
 	if h != nil {
 		if c := h.conn.Load(); c != nil {
+			//goland:noinspection GoResourceLeak // TCPConnOf only borrows the HTTP transport's connection.
 			if tcp := carrierstats.TCPConnOf(*c); tcp != nil {
 				return carrierstats.SocketSampler(tcp)
 			}

@@ -23,6 +23,8 @@ func WriteUnit(w io.Writer, messages bool, b []byte) error {
 
 // ReadStreamUnit appends one bounded chunk. The parser owns the unit
 // framing, maximum size, and unconsumed bytes.
+// If the read returns bytes and an error, the returned buffer includes those
+// bytes and the error is the terminal read status.
 func ReadStreamUnit(r io.Reader, buf []byte, limit, batch int) ([]byte, error) {
 	size := min(limit-len(buf), batch)
 	if size <= 0 {

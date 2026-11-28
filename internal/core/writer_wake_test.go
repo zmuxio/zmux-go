@@ -178,6 +178,9 @@ func TestCrossPathPlacementWaitsForCurrentCompletion(t *testing.T) {
 	}
 	s.TakePollRequests()
 	lane := b.out.lane(0)
+	if lane == nil {
+		t.Fatal("second pipe has no outbound lane zero")
+	}
 	lane.writing, lane.handed = true, 1
 	d := decision{p: a}
 	for range 4 {

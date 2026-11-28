@@ -135,6 +135,7 @@ func (r *stPipeR) readSpan(limit int) (core.Span, bool, error) {
 }
 
 // byteSpanReader follows only views that preserve the underlying bytes.
+// A returned span contains the bytes read before any accompanying error.
 func byteSpanReader(r io.Reader) func(int) (core.Span, bool, error) {
 	switch v := r.(type) {
 	case *stPipeR:

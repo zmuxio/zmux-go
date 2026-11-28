@@ -140,19 +140,19 @@ func (s *Session) AdmitDatagramGroup(r DatagramRequest, members []DatagramGroupM
 		return DatagramRefused, s.rejectDatagram(DatagramDropQueueOverflow)
 	}
 	var copied uint64
-	views := make([]dgramView, len(members))
+	views := make([]dgramView, 0, len(members))
 	defer func() {
 		for _, view := range views {
 			view.unref()
 		}
 	}()
-	for i, member := range members {
+	for _, member := range members {
 		r.Payload, r.Backing = member.Payload, member.Backing
 		view, n, err := s.allocateDatagram(r, plan.prefix[:plan.prefixLen], d)
 		if err != nil {
 			return DatagramRefused, err
 		}
-		views[i] = view
+		views = append(views, view)
 		copied += uint64(n)
 		room -= view.cost()
 		if room < 0 {
@@ -162,8 +162,9 @@ func (s *Session) AdmitDatagramGroup(r DatagramRequest, members []DatagramGroupM
 	if err := s.pinDatagramStream(r.Stream); err != nil {
 		return DatagramRefused, err
 	}
-	for i, member := range members {
-		candidate := outDgram{data: views[i], st: r.Stream, n: len(member.Payload), opts: plan.options, deadline: plan.deadline, at: s.now}
+	for i, view := range views {
+		member := members[i]
+		candidate := outDgram{data: view, st: r.Stream, n: len(member.Payload), opts: plan.options, deadline: plan.deadline, at: s.now}
 		if ready, _ := candidate.ready(); ready && s.datagramPathFor(&candidate, true).late {
 			return DatagramRefused, s.rejectDatagram(DatagramDropDeadline)
 		}

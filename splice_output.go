@@ -439,11 +439,13 @@ func (d *spliceRelay) queueDatagramCapsules(ctx context.Context, g *spliceGroup)
 		return
 	}
 	if g == &d.directDG {
-		retained := *g
-		retained.parts = []spliceMember{{parts: slices.Clone(g.parts[0].parts), n: g.parts[0].n}}
+		retained := d.directDG
+		member := d.directDGMember[0]
+		member.parts = slices.Clone(d.directDGPart[:])
+		retained.parts = []spliceMember{member}
 		d.directDGPart[0] = spliceChunk{}
 		d.directDGMember[0] = spliceMember{}
-		*g = spliceGroup{}
+		d.directDG = spliceGroup{}
 		g = &retained
 	}
 	if err := d.prepareCapsules(g); err != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"runtime"
 	"sync"
 	"time"
@@ -339,7 +340,10 @@ func Splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResul
 
 // splice keeps the static byte forwarding path free of control work.
 func splice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (SpliceResult, error) {
-	o, err := normalizeSplice(a, b, opts)
+	if a == nil || b == nil || a.h == nil || b.h == nil {
+		return SpliceResult{}, net.ErrClosed
+	}
+	o, err := normalizeSplice(a.h, b.h, opts)
 	if err != nil {
 		return SpliceResult{}, err
 	}

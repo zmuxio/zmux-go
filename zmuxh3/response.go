@@ -19,6 +19,7 @@ type upgradeState struct {
 
 // upgradeWithin reports whether this handler owns the CONNECT stream,
 // so admission can fall back only while the response is still untouched.
+// On failure it returns a nil session and the response state reached so far.
 func upgradeWithin(ctx context.Context, s *Server, w http.ResponseWriter, r *http.Request) (*Session, upgradeState, error) {
 	var state upgradeState
 	c, _ := r.Context().Value(wtConnKey{}).(*wtConn)

@@ -67,9 +67,12 @@ func TestReceiveAcrossEveryBlockBoundary(t *testing.T) {
 		var last *Buf
 		for off < len(payload) {
 			view, _, err := s.ReadChunk(st, len(payload))
-			data, root := view.Bytes(), view.Buf
-			if err != nil || len(data) == 0 {
+			if err != nil {
 				t.Fatalf("split %d at %d: %v", split, off, err)
+			}
+			data, root := view.Bytes(), view.Buf
+			if len(data) == 0 || root == nil {
+				t.Fatalf("split %d at %d: missing receive view", split, off)
 			}
 			index := payloadAt + off
 			want := second
@@ -90,6 +93,9 @@ func TestReceiveAcrossEveryBlockBoundary(t *testing.T) {
 		}
 		if released != 1 {
 			t.Fatalf("split %d: released %d roots before final loan ended", split, released)
+		}
+		if last == nil {
+			t.Fatal("missing final receive loan")
 		}
 		last.ReturnView()
 		if released != 2 || s.conn.rx.account.bytes.Load() != 0 {

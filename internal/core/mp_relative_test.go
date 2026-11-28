@@ -170,6 +170,9 @@ func (r *relativeReplay) handoffControl(p *Pipe, lane uint64) uint64 {
 	b := GetBatch()
 	defer PutBatch(b)
 	ol := p.out.lane(lane)
+	if ol == nil {
+		r.t.Fatalf("no outbound lane %d on pipe %d", lane, p.id)
+	}
 	b.Pipe, b.Lane, b.owner = p.id, lane, ol
 	var w recWriter
 	w.init(b, ol.info.Framing, s.recMax(ol), DefaultBatch)

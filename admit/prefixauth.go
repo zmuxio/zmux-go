@@ -390,8 +390,11 @@ func (v *PrefixAuthVerifier) redeem(ctx context.Context, token, binding []byte) 
 	mask := prefixMAC(hmac.New(sha256.New, generation.Key[:]), 0, token[:16])
 	subtle.XORBytes(id[:], token[16:32], mask[:])
 	ticket, live, err := store.Lookup(ctx, id)
+	if err != nil {
+		return id, false
+	}
 	defer clear(ticket.Key[:])
-	if err != nil || !live || ticket.ID != id || !ticket.liveAt(current) {
+	if !live || ticket.ID != id || !ticket.liveAt(current) {
 		return id, false
 	}
 	slot, ok := matchPrefixSlot(hmac.New(sha256.New, ticket.Key[:]), id, token, binding, &generation, current, skew)

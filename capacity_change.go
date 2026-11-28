@@ -448,6 +448,10 @@ func (tx *CapacityChange) startAttempt(index int, plan MemberSpec, alt core.Chan
 		a, err = tx.startLocked(index, len(plan.Attachments), alt, reservedAt)
 		if a != nil {
 			a.work = work
+		} else if work != nil && work.round != nil && work.round.refusalWatch == nil && !errors.Is(err, errRecoveryNoLongerNeeded) {
+			// Observe capacity at the refusal, before the controller refunds
+			// its reservations and parks the recovery round.
+			_, work.round.refusalWatch = tx.c.s.WatchCapacity()
 		}
 	})
 	if err != nil {

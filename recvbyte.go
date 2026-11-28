@@ -68,8 +68,10 @@ func (r *byteReadState) read(src io.Reader) (int, core.Input, error) {
 	}
 	if r.nested != nil {
 		r.staged = true
-		v, borrowed, err := r.nested(core.RecvBlockSize)
-		return v.Len(), r.spans.Append(v, borrowed), err
+		v, borrowed, end := r.nested(core.RecvBlockSize)
+		n := v.Len()
+		added := r.spans.Append(v, borrowed)
+		return n, added, end
 	}
 	if r.spans.Len() == 0 {
 		r.staged = false

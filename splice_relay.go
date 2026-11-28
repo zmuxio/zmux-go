@@ -230,8 +230,8 @@ func (d *spliceRelay) sealReliableForReset(ctx context.Context) {
 		return
 	}
 	if d.source.End && d.current == nil {
-		_, err := d.read(ctx, 1, 0, true)
-		d.readEnd(ctx, err)
+		r := d.read(ctx, 1, 0, true)
+		d.readEnd(ctx, r.end)
 	}
 }
 
@@ -849,12 +849,19 @@ func (d *spliceRelay) resetAfterPrefix(ctx context.Context, e SpliceEnd) {
 	d.fin = true
 }
 
-func (d *spliceRelay) read(ctx context.Context, n int, ready uint64, end bool) (spliceChunk, error) {
+type spliceReadResult struct {
+	chunk spliceChunk
+	end   error
+}
+
+// read returns the bytes consumed and their terminal status. A final
+// fragment may carry data together with EOF.
+func (d *spliceRelay) read(ctx context.Context, n int, ready uint64, end bool) spliceReadResult {
 	if ready == 0 && !end {
-		return spliceChunk{}, nil
+		return spliceReadResult{}
 	}
 	if ctx.Err() != nil {
-		return spliceChunk{}, ctx.Err()
+		return spliceReadResult{end: ctx.Err()}
 	}
 	if ready > 0 && d.control != nil {
 		d.startBatch()
@@ -923,7 +930,7 @@ func (d *spliceRelay) read(ctx context.Context, n int, ready uint64, end bool) (
 			err = io.EOF
 		}
 	})
-	return out, err
+	return spliceReadResult{chunk: out, end: err}
 }
 
 func (d *spliceRelay) reliableStep(ctx context.Context) bool {
@@ -986,9 +993,9 @@ func (d *spliceRelay) reliableStep(ctx context.Context) bool {
 		return true
 	}
 	if d.source.End {
-		_, err := d.read(ctx, 1, 0, true)
-		d.readEnd(ctx, err)
-		return err != nil
+		r := d.read(ctx, 1, 0, true)
+		d.readEnd(ctx, r.end)
+		return r.end != nil
 	}
 	if d.pause != nil || d.source.Ready == 0 {
 		return false
@@ -1027,13 +1034,14 @@ func (d *spliceRelay) streamStep(ctx context.Context) bool {
 			return false
 		}
 	}
-	ch, err := d.read(ctx, int(n), d.source.Ready, d.source.End)
-	if err != nil && len(ch.Data) == 0 {
-		d.readEnd(ctx, err)
-		return true
-	}
+	r := d.read(ctx, int(n), d.source.Ready, d.source.End)
+	ch := r.chunk
 	if len(ch.Data) == 0 {
 		ch.Release()
+		if r.end != nil {
+			d.readEnd(ctx, r.end)
+			return true
+		}
 		return false
 	}
 	var g *spliceGroup

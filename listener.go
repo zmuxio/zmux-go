@@ -951,7 +951,6 @@ func (l *Listener) classify(ctx context.Context, hint PipeHint, wait *attachment
 	}
 	wait.pipe = p
 	first, cls, err := l.readFirst(ctx, p)
-	defer first.release()
 	if err != nil {
 		closePipe(p)
 		if tlsSetupFailed(p) {
@@ -961,6 +960,7 @@ func (l *Listener) classify(ctx context.Context, hint PipeHint, wait *attachment
 		}
 		return err
 	}
+	defer first.release()
 	stop := wait.watch(ctx, p)
 	defer stop()
 	if (cls == core.ClassSession || cls == core.ClassJoin) && (p.R == nil || p.W == nil) {
@@ -1024,10 +1024,13 @@ func readFirstWithin(ctx, stop context.Context, clk timeshim.Clock, d time.Durat
 	abandoned := true
 	once.Do(func() { abandoned = false }) // waits for an abandon under way
 	if abandoned {
-		b.release()
-		return firstInput{}, core.ClassReject, why
+		err = why
 	}
-	return b, cls, err
+	if err != nil {
+		b.release()
+		return firstInput{}, core.ClassReject, err
+	}
+	return b, cls, nil
 }
 
 type firstInput struct {

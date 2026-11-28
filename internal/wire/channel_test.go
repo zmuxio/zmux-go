@@ -114,9 +114,6 @@ func TestPaddedChannelFraming(t *testing.T) {
 			t.Fatalf("decoded %d bytes: valid=%t, want %t", len(tc.b), ok, tc.valid)
 		}
 	}
-	if ParamCarrierDatagramPadding != 0x2071d4ee {
-		t.Fatal("carrier padding parameter does not match the registry")
-	}
 	block, err := AppendParams(nil, &Params{
 		Has:                  HasDatagramFamily | HasDatagram | HasCarrierDatagrams | HasCarrierDatagramPadding,
 		MaxRecordSize:        DefaultMaxRecordSize,
@@ -124,6 +121,10 @@ func TestPaddedChannelFraming(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The registered ID encodes as a four-byte varint followed by an empty value.
+	if !bytes.Contains(block, []byte{0xa0, 0x71, 0xd4, 0xee, 0}) {
+		t.Fatalf("carrier padding parameter missing from %x", block)
 	}
 	var p Params
 	e := DecodeParams(block, &p)

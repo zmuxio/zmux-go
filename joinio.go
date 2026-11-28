@@ -246,18 +246,19 @@ func (u *unitReader) more() error {
 	if u.end != nil {
 		return u.end
 	}
-	var err error
 	if u.p.Framing == FramingRecords {
-		var msg ReceivedMessage
-		msg, err = readMessage(u.p.R, MaxRecordSize)
+		msg, err := readMessage(u.p.R, MaxRecordSize)
+		if err != nil {
+			return err
+		}
 		u.end = msg.end
 		u.buf = msg.TakeBytes()
-	} else {
-		before := len(u.buf)
-		u.buf, err = carrierio.ReadStreamUnit(u.p.R, u.buf, 2*MaxUntakenRead, 4096)
-		if len(u.buf) > before {
-			u.end, err = err, nil
-		}
+		return nil
+	}
+	buf, err := carrierio.ReadStreamUnit(u.p.R, u.buf, 2*MaxUntakenRead, 4096)
+	if len(buf) > len(u.buf) {
+		u.buf, u.end = buf, err
+		return nil
 	}
 	return err
 }
@@ -1000,6 +1001,8 @@ func (r *sealedReader) Close() error {
 }
 
 // ReadMessage authenticates a complete record in its final backing.
+// A complete authenticated record can accompany a terminal carrier error.
+// All other errors return an empty message.
 func (r *sealedReader) ReadMessage(limit int) (ReceivedMessage, error) {
 	if r.err != nil {
 		return ReceivedMessage{}, r.err

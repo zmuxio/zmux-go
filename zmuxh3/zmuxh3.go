@@ -379,6 +379,7 @@ func (p *ConnPool) OpenPipe(ctx context.Context) (zmux.PipeIO, error) {
 	}
 	// The lease ends once both halves of the pipe have ended, after its
 	// inbound side ended or lingered out, or with the session.
+	//goland:noinspection GoResourceLeak // PipeIO owns both stream halves and releases the lease when they end.
 	ws := newWTStream(l.Conn.sess, s)
 	ws.rec = &l.Conn.rec
 	ws.lease = carrierio.NewHalfLease(l.Conn.sess.Context(), l.Release)
@@ -400,6 +401,7 @@ func SessionPipe(ctx context.Context, sess *Session) (zmux.PipeIO, error) {
 // StreamPipe adapts a bidirectional stream of a WebTransport session
 // to a pipe input (with lanes on the session's unidirectional streams).
 func StreamPipe(sess *Session, s *Stream) zmux.PipeIO {
+	//goland:noinspection GoResourceLeak // The returned PipeIO owns both stream halves.
 	return newWTStream(sess, s).pipe()
 }
 

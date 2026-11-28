@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 var errRecoveryNoLongerNeeded = errors.New("zmux: recovery direction already covered")
@@ -74,6 +76,7 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 				continue
 			}
 			a.work.releaseKey()
+			round.refusalWatch = nil // this attempt changed capacity
 			switch v.Result.Reason {
 			case ReasonConfirmed:
 				winner = true
@@ -82,7 +85,10 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 			default:
 				failed |= a.member.Expected
 				round.lastFailure = v.Result.Err
-				round.carrierFailure = round.carrierFailure || v.Result.Attribution == AttributionCarrier
+				if v.Result.Attribution == AttributionCarrier {
+					round.carrierFailure = true
+					round.noteRetry(sc.c.clk.source().Now(), sc.ctl.recoveryWake(sc.ctl.candidate(v.Candidate)))
+				}
 			}
 		}
 		clear(active[len(keep):])
@@ -100,15 +106,11 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 		var blocked error
 		if !sc.c.clk.source().Now().Before(stagger) {
 			candidate, work, wake, err := sc.choose(p, round)
-			next, blocked = wake, err
-			if work != nil {
+			if err != nil {
+				next, blocked = wake, err
+			} else {
 				a, err := sc.startRecovery(revision, capacity, candidate, work, &tx)
-				if err == nil {
-					active = append(active, recoveryAttempt{Attempt: a, work: work})
-					round.tried[candidate.ID] = true
-					stagger = a.Snapshot().Started.Add(controllerStagger)
-					next = stagger
-				} else {
+				if err != nil {
 					work.releaseKey()
 					work.releaseWork()
 					work.releaseCleanup()
@@ -117,11 +119,20 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 					if errors.Is(err, errRecoveryNoLongerNeeded) {
 						continue
 					}
-					blocked = err
 					sc.recordRefusal(revision, err)
-					next = earliest(next, retry)
-					domain = sc.ctl.watch()
+					// Refunding the reservation wakes the cache and controller.
+					// Exhaust the other alternatives before watching for changes
+					// so that the refund cannot immediately retry this layout.
+					round.tried[candidate.ID] = true
+					round.startRefusal = err
+					round.noteRetry(sc.c.clk.source().Now(), retry)
+					continue
 				}
+				round.refusalWatch = nil // starting the attempt changed capacity
+				active = append(active, recoveryAttempt{Attempt: a, work: work})
+				round.tried[candidate.ID] = true
+				stagger = a.Snapshot().Started.Add(controllerStagger)
+				next = stagger
 			}
 		}
 		if !sharedControllerBlock(blocked) && !errors.Is(blocked, ErrControllerQueueFull) {
@@ -129,9 +140,17 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 			domain = sc.ctl.watch()
 		}
 		if len(active) == 0 && blocked != nil {
+			if round.startRefusal != nil {
+				if errors.Is(blocked, ErrNoEligibleCandidate) {
+					blocked = round.startRefusal
+				}
+				sc.parkRecoveryRound(tx, p, round, earliest(next, round.retryAt), blocked)
+				tx = nil
+				return time.Time{}, nil
+			}
 			if errors.Is(blocked, ErrNoEligibleCandidate) && round.lastFailure != nil {
 				if !round.carrierFailure {
-					sc.parkRecoveryRound(tx, p, round)
+					sc.parkRecoveryRound(tx, p, round, time.Time{}, round.lastFailure)
 					tx = nil
 					return time.Time{}, nil
 				}
@@ -158,8 +177,17 @@ func (sc *SessionControl) recover(revision uint64, p reconcilePlan) (time.Time, 
 type recoveryRound struct {
 	tried          map[CandidateID]bool
 	lastFailure    error
+	startRefusal   error
+	refusalWatch   <-chan struct{}
+	retryAt        time.Time
 	carrierFailure bool
 	cleanupSignals uint64 // guarded by the controller lock
+}
+
+func (r *recoveryRound) noteRetry(now, retry time.Time) {
+	if retry.After(now) {
+		r.retryAt = earliest(r.retryAt, retry)
+	}
 }
 
 func (r *recoveryRound) watch(ctl *SessionController) (<-chan struct{}, uint64) {
@@ -168,12 +196,21 @@ func (r *recoveryRound) watch(ctl *SessionController) (<-chan struct{}, uint64) 
 	return ctl.changed, ctl.changeSequence - r.cleanupSignals
 }
 
-func (sc *SessionControl) parkRecoveryRound(tx *CapacityChange, p reconcilePlan, round *recoveryRound) {
+func (sc *SessionControl) parkRecoveryRound(tx *CapacityChange, p reconcilePlan, round *recoveryRound, next time.Time, blocked error) {
 	var capacity, domain, cache <-chan struct{}
 	var seq uint64
 	sc.c.locked(func() {
-		tx.cancelLocked()
-		if sc.c.control != sc || sc.target.Revision != p.revision {
+		// Check the watch before rolling back our own batch.
+		var changed bool
+		select {
+		case <-round.refusalWatch:
+			changed = true
+		default:
+		}
+		if tx != nil {
+			tx.cancelLocked()
+		}
+		if changed || sc.c.control != sc || sc.target.Revision != p.revision {
 			return
 		}
 		covered, _ := sc.c.s.Coverage(nil)
@@ -183,8 +220,15 @@ func (sc *SessionControl) parkRecoveryRound(tx *CapacityChange, p reconcilePlan,
 		_, capacity = sc.c.s.WatchCapacity()
 		domain, seq = round.watch(sc.ctl)
 		cache = sc.ctl.cache.watch()
-		sc.view.Unfilled, sc.view.NextRetry, sc.view.Block = p.deficit, time.Time{}, round.lastFailure
+		sc.view.Unfilled, sc.view.NextRetry, sc.view.Block = p.deficit, next, blocked
 	})
+	var tick <-chan time.Time
+	if capacity != nil && !next.IsZero() {
+		clk := sc.c.clk.source()
+		timer := timeshim.NewTimer(clk, max(next.Sub(clk.Now()), 0))
+		defer timer.Stop()
+		tick = timer.C
+	}
 	for capacity != nil {
 		select {
 		case <-capacity:
@@ -192,6 +236,8 @@ func (sc *SessionControl) parkRecoveryRound(tx *CapacityChange, p reconcilePlan,
 		case <-cache:
 			return
 		case <-sc.ctx.Done():
+			return
+		case <-tick:
 			return
 		case <-domain:
 			var current uint64

@@ -86,21 +86,23 @@ func (m *ReceivedMessage) delivery(err error) (ReceivedMessage, error) {
 	return *m, err
 }
 
+// readMessage puts the terminal status of a complete message in its end field.
+// An error return carries no message ownership.
 func readMessage(r io.Reader, limit int) (ReceivedMessage, error) {
 	mr, ok := r.(MessageReader)
 	if !ok {
 		return ReceivedMessage{}, errors.New("zmux: Records framing needs a MessageReader")
 	}
-	m, err := mr.ReadMessage(limit)
+	m, end := mr.ReadMessage(limit)
+	if end != nil && !m.Present() {
+		return ReceivedMessage{}, end
+	}
 	if m.Len() > limit {
 		m.Release()
 		return ReceivedMessage{}, ErrMessageTooLarge
 	}
-	if err != nil {
-		if !m.Present() {
-			return ReceivedMessage{}, err
-		}
-		m.end = err
+	if end != nil {
+		m.end = end
 	}
 	return m, nil
 }

@@ -288,3 +288,92 @@ func TestLossReferenceExpiresOnSessionClock(t *testing.T) {
 		runtime.KeepAlive(counts)
 	})
 }
+
+func TestRecoveryWaitsAtStrictGraceDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const grace = time.Second
+		clock, client, server := fakeConfigs(func(c *Config) {
+			c.MaxIdleTimeout = -1
+			c.ResumeTimeout = grace
+		})
+		env := newMemMPEnv(t, client, server)
+		cleanupFakeMPEnv(t, env, clock)
+		dropBootstrapSend(t, env)
+		if !env.client.ConnectionState().Suspended {
+			t.Fatal("session did not suspend")
+		}
+		candidate := recoveryTestCandidate("repair", "repair", Send)
+		fence := clock.Now().Add(grace - time.Nanosecond)
+		ctl := newRecoveryTestController(t, ControllerOptions{
+			Domain: t.Name(), ClockDomain: client.ClockDomain, Candidates: []Candidate{candidate},
+			DialAfter: map[CandidateID]time.Time{candidate.ID: fence},
+		})
+		if _, err := ctl.Manage(env.client, SessionTarget{}); err != nil {
+			t.Fatal(err)
+		}
+		advanceClock(clock, grace)
+		select {
+		case <-env.client.Done():
+		default:
+			t.Fatal("session remained open after recovery grace expired")
+		}
+	})
+}
+
+func TestRecoveryWaitsForAttachmentCapacity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		clock, client, server := fakeConfigs(func(c *Config) {
+			c.MaxIdleTimeout = -1
+			c.ResumeTimeout = time.Minute
+		})
+		env := newMemMPEnv(t, client, server)
+		cleanupFakeMPEnv(t, env, clock)
+		dropBootstrapSend(t, env)
+		synctest.Wait()
+
+		policy := client.SessionPolicy
+		policy.Revision++
+		policy.Limits.SteadyAttachments = 2
+		policy.Limits.JoinHeadroom = new(int)
+		if err := env.client.SetSessionPolicy(policy); err != nil {
+			t.Fatal(err)
+		}
+		candidate := recoveryTestCandidate("repair", "repair", Send)
+		candidate.Attachments = []AttachmentSpec{{Directions: Send}, {Directions: Receive}, {Directions: Send}}
+		opened := make(chan struct{}, 1)
+		candidate.Open = func(ctx context.Context, _ OpenRequest) ([]PipeIO, error) {
+			opened <- struct{}{}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		ctl := newRecoveryTestController(t, ControllerOptions{
+			Domain: t.Name(), ClockDomain: client.ClockDomain, Candidates: []Candidate{candidate},
+		})
+		sc, err := ctl.Manage(env.client, SessionTarget{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		view, err := sc.Snapshot()
+		if err != nil || !errors.Is(view.Block, ErrCapacityBlocked) {
+			t.Fatalf("expected recovery to wait for attachment capacity, got %v (%v)", view.Block, err)
+		}
+		select {
+		case <-opened:
+			t.Fatal("opened a carrier while attachment capacity was exhausted")
+		default:
+		}
+
+		policy.Revision++
+		policy.Limits = client.SessionPolicy.Limits
+		if err := env.client.SetSessionPolicy(policy); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		select {
+		case <-opened:
+		default:
+			t.Fatal("recovery did not wake after attachment capacity became available")
+		}
+	})
+}

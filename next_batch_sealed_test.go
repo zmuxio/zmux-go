@@ -23,29 +23,32 @@ func TestNextBatchFSealedRecordReferences(t *testing.T) {
 	source := bytes.NewReader(frame)
 	r := &sealedReader{lower: PipeIO{R: readerOnly{source}}, o: tagOpener{}}
 	msg, err := r.ReadMessage(1200)
-	owner, body := msg.span.Buf, msg.Bytes()
-	if err != nil || len(body) != 1200 || len(owner.B) < len(body) || owner.Refs() != 1 {
-		t.Fatalf("owned record length %d, err %v", len(body), err)
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer msg.Release()
+	owner, body := msg.span.Buf, msg.Bytes()
+	if len(body) != 1200 || owner == nil || len(owner.B) < len(body) || owner.Refs() != 1 {
+		t.Fatalf("unexpected owned record length %d", len(body))
+	}
 	frame[2] = 2
 	source.Reset(frame)
 	second, err := r.ReadMessage(1200)
-	body2 := second.Bytes()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer second.Release()
+	body2 := second.Bytes()
 	if body[0] != 1 || body2[0] != 2 {
 		t.Fatal("an owned record was reused while referenced")
 	}
 	source.Reset(frame[:len(frame)-1])
-	if leaked, err := r.ReadMessage(1200); leaked.span.Buf != nil || !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("short record returned a reference or wrong error: %v", err)
+	if _, err := readMessage(r, 1200); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("short record returned %v", err)
 	}
 	r = &sealedReader{lower: PipeIO{R: readerOnly{source}}, o: rejectedRecord{}}
 	source.Reset(frame)
-	if leaked, err := r.ReadMessage(1200); leaked.span.Buf != nil || err == nil {
+	if _, err := readMessage(r, 1200); err == nil {
 		t.Fatal("authentication failure returned a record")
 	}
 	pos := source.Len()
@@ -183,13 +186,16 @@ func TestSealedReceiveTerminalRecord(t *testing.T) {
 			input.Reset(frame[2:])
 		}
 		r := &sealedReader{lower: PipeIO{R: input}, o: tagOpener{}, msgs: messages}
-		m, err := r.ReadMessage(1)
-		if !bytes.Equal(m.Bytes(), []byte{7}) || !errors.Is(err, io.EOF) {
-			t.Fatalf("messages=%t: record %v, err %v", messages, m.Bytes(), err)
+		m, err := readMessage(r, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(m.Bytes(), []byte{7}) || !errors.Is(m.end, io.EOF) {
+			t.Fatalf("messages=%t: record %v, end %v", messages, m.Bytes(), m.end)
 		}
 		m.Release()
 		reads := input.reads
-		if m, err := r.ReadMessage(1); m.Present() || !errors.Is(err, io.EOF) || input.reads != reads {
+		if _, err := readMessage(r, 1); !errors.Is(err, io.EOF) || input.reads != reads {
 			t.Fatalf("messages=%t: terminal read produced a record or read past EOF; err %v", messages, err)
 		}
 	}

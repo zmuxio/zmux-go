@@ -186,9 +186,12 @@ func (s *Server) originAllowed(r *http.Request) bool {
 // owns the session and may dispatch it with Serve.
 func (s *Server) Upgrade(w http.ResponseWriter, r *http.Request) (*Session, error) {
 	sess, state, err := upgradeWithin(r.Context(), s, w, r)
-	if err != nil && !state.started && state.taken == nil && r.Context().Err() == nil {
+	if err == nil {
+		return sess, nil
+	}
+	if !state.started && state.taken == nil && r.Context().Err() == nil {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return nil, err
 	}
-	return sess, err
+	return nil, err
 }

@@ -507,8 +507,7 @@ func (ps *pipeShape) apply(r *shaping.Effects, origin shaping.EventKind) {
 			ps.injDue, ps.injFirst = at <= s.now, false
 			if ps.injDue {
 				at = Never
-			} else if s.coverEligible(ps.p) && !s.shp.eff.NoPadding && !s.shp.eff.NoInjection {
-				ol := ps.p.out.lane(0)
+			} else if ol := s.coverLane(ps.p); ol != nil && !s.shp.eff.NoPadding && !s.shp.eff.NoInjection {
 				cost := uint64(wireOf(min(req.PadBytes, s.recMax(ol)), ol.info.Framing == FramingBytes, ol.info.SealPrefix+ol.info.SealSuffix))
 				if cost <= s.shapeRoom() {
 					ps.injReservation = s.reserveShape(cost)
@@ -1087,11 +1086,18 @@ func (ps *pipeShape) releaseInjectionReservation() {
 }
 
 func (s *Session) coverEligible(p *Pipe) bool {
+	return s.coverLane(p) != nil
+}
+
+func (s *Session) coverLane(p *Pipe) *outLane {
 	if !s.peerSeen || s.holdSends() || s.state >= StateClosing || !maySend(p, false) {
-		return false
+		return nil
 	}
 	lane := p.out.lane(0)
-	return lane != nil && lane.confirmed && !lane.shut && !lane.laneFirst && (p.id != 0 || lane.tpSent)
+	if lane == nil || !lane.confirmed || lane.shut || lane.laneFirst || p.id == 0 && !lane.tpSent {
+		return nil
+	}
+	return lane
 }
 
 // shapeInject prepares a due standalone injection after ordinary work. An

@@ -612,8 +612,11 @@ func TestSpliceSharedQueueAndMirrorRoots(t *testing.T) {
 	d.release(second, nil)
 	d.release(excess, nil)
 	sample, err := m.Next(t.Context())
-	if err != nil || string(sample.Data) != "a" || d.queuedBytes != 0 || m.held != 192 {
-		t.Fatalf("after dequeue: sample %q, error %v, direction %d, mirror %d", sample.Data, err, d.queuedBytes, m.held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(sample.Data) != "a" || d.queuedBytes != 0 || m.held != 192 {
+		t.Fatalf("after dequeue: sample %q, direction %d, mirror %d", sample.Data, d.queuedBytes, m.held)
 	}
 	m.Close()
 	if root.Refs() != 1 || other.Refs() != 1 || m.items != 0 || m.held != 0 {

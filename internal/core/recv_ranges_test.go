@@ -92,9 +92,12 @@ func TestReceiveLoansShareBackingAndFailBeforeConsume(t *testing.T) {
 	}
 	for i := range 2 {
 		n, view, err := rb.consume(uint64(i*16), nil, 16, true)
+		if err != nil {
+			t.Fatal(err)
+		}
 		d, root := view.Bytes(), view.Buf
-		if err != nil || root != a || n != 16 || cap(d) != n {
-			t.Fatalf("view %d: %d bytes, %v", i, n, err)
+		if root != a || n != 16 || cap(d) != n {
+			t.Fatalf("unexpected view %d: %d bytes", i, n)
 		}
 	}
 	if m.account.loaned.Load() != 256 || a.Refs() != 2 {

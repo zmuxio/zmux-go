@@ -76,6 +76,14 @@ func (s *Session) WantsWrite(pipe, lane uint64) bool {
 
 // dataPendingOn reports stream data that would go on the lane now.
 func (s *Session) dataPendingOn(p *Pipe, ol *outLane) bool {
+	if !p.out.lo.offered {
+		return s.dataPending(nil, nil)
+	}
+	return s.dataPending(p, ol)
+}
+
+// dataPending uses an optional lane binding. Early data has no binding.
+func (s *Session) dataPending(binding *Pipe, ol *outLane) bool {
 	if s.sched.mask == 0 {
 		return false
 	}
@@ -84,10 +92,10 @@ func (s *Session) dataPendingOn(p *Pipe, ol *outLane) bool {
 		if !s.canSendNow(st) {
 			continue
 		}
-		if p == nil || !p.out.lo.offered {
+		if binding == nil {
 			return true
 		}
-		if l, _, _ := s.laneFor(p, st); l == ol {
+		if l, _, _ := s.laneFor(binding, st); l == ol {
 			return true
 		}
 	}
@@ -1125,16 +1133,25 @@ func (s *Session) writeStreamCtl(w *recWriter, st *Stream) bool {
 // directions bound to ol.
 func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 	var lp *Pipe // the pipe whose lanes streams bind to; nil without lanes
-	if p != nil && p.out.lo.offered {
+	if p.out.lo.offered {
 		lp = p
 	}
 	var d *decision
-	if p != nil && p.mp != nil {
+	if p.mp != nil {
 		d = &s.mp.dec // prepared by mpWrite
 	}
-	wantDatagram := p != nil && ol.lane == 0 && s.dg != nil
+	var dgPipe *Pipe
+	if ol.lane == 0 && s.dg != nil {
+		dgPipe = p
+	}
+	s.writeScheduledData(w, lp, ol, d, dgPipe)
+}
+
+// writeScheduledData shares stream scheduling with early data. Only an
+// established, datagram-capable lane zero supplies dgPipe.
+func (s *Session) writeScheduledData(w *recWriter, lp *Pipe, ol *outLane, d *decision, dgPipe *Pipe) {
 	preferStream := false
-	for s.sched.mask != 0 || wantDatagram && s.recordDatagrams(p) {
+	for s.sched.mask != 0 || dgPipe != nil && s.recordDatagrams(dgPipe) {
 		// A record that is not open yet is planned by the chunk that
 		// opens it, once one has data to send: a plan is made only for a
 		// record that goes.
@@ -1159,13 +1176,13 @@ func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 					continue
 				}
 			}
-			beforeFin := wantDatagram && st.snd.finWr && s.dg.waitsFor(st)
-			if wantDatagram && s.recordDatagrams(p) && (!preferStream || st.urgency > 0 || beforeFin) {
+			beforeFin := dgPipe != nil && st.snd.finWr && s.dg.waitsFor(st)
+			if dgPipe != nil && s.recordDatagrams(dgPipe) && (!preferStream || st.urgency > 0 || beforeFin) {
 				urgency := st.urgency
 				if preferStream && !beforeFin {
 					urgency--
 				}
-				sent, full := s.writeDatagram(w, p, urgency)
+				sent, full := s.writeDatagram(w, dgPipe, urgency)
 				if full {
 					return
 				}
@@ -1195,10 +1212,10 @@ func (s *Session) writeData(w *recWriter, p *Pipe, ol *outLane) {
 			}
 		}
 		if !progressed {
-			if !wantDatagram || !s.recordDatagrams(p) {
+			if dgPipe == nil || !s.recordDatagrams(dgPipe) {
 				return
 			}
-			sent, _ := s.writeDatagram(w, p, 7)
+			sent, _ := s.writeDatagram(w, dgPipe, 7)
 			if !sent {
 				return
 			}

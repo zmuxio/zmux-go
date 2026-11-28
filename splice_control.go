@@ -168,7 +168,10 @@ func (s *SpliceControl) ReplaceHooks(ctx context.Context, hooks SpliceHooks) (ui
 		return 0, err
 	}
 	out, err := s.run(ctx, &spliceCommand{kind: spliceAttach, hooks: h})
-	return out.generation, err
+	if err != nil {
+		return 0, err
+	}
+	return out.generation, nil
 }
 
 // SplicePause identifies one pause generation. It can be used to wait for
@@ -228,7 +231,10 @@ func (s *SpliceControl) Stats(ctx context.Context) (SpliceDirection, error) {
 // calling these methods.
 func (s *SpliceControl) Pause(ctx context.Context) (*SplicePause, error) {
 	r, err := s.run(ctx, &spliceCommand{kind: splicePause})
-	return r.pause, err
+	if err != nil {
+		return nil, err
+	}
+	return r.pause, nil
 }
 
 // Resume releases this pause generation. An earlier token is harmless.
@@ -278,7 +284,10 @@ func StartPacketSplice(ctx context.Context, a, b *Stream, opts *SpliceOptions) (
 }
 
 func startSplice(ctx context.Context, a, b *Stream, opts *SpliceOptions, packet, controlled bool) (*SpliceController, error) {
-	o, err := normalizeSplice(a, b, opts)
+	if a == nil || b == nil || a.h == nil || b.h == nil {
+		return nil, net.ErrClosed
+	}
+	o, err := normalizeSplice(a.h, b.h, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -380,15 +389,12 @@ func unbindSplice(a, b *handle) {
 	spliceOwners.Unlock()
 }
 
-func normalizeSplice(a, b *Stream, opts *SpliceOptions) (SpliceOptions, error) {
+func normalizeSplice(a, b *handle, opts *SpliceOptions) (SpliceOptions, error) {
 	var o SpliceOptions
-	if a == nil || b == nil || a.h == nil || b.h == nil {
-		return o, net.ErrClosed
-	}
-	if a.h == b.h {
+	if a == b {
 		return o, errSpliceSelf
 	}
-	if !a.h.st.Bidi() || !b.h.st.Bidi() {
+	if !a.st.Bidi() || !b.st.Bidi() {
 		return o, ErrInvalidConfig
 	}
 	if opts != nil {

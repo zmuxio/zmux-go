@@ -377,11 +377,14 @@ type limitMsgCarrier struct {
 func (m *limitMsgCarrier) ReadMessage(limit int) (ReceivedMessage, error) {
 	m.limits = append(m.limits, limit)
 	b, err := m.firstMsgCarrier.ReadMessage(limit)
+	if err != nil {
+		return ReceivedMessage{}, err
+	}
 	if b.Len() > limit {
 		b.Release()
 		return ReceivedMessage{}, ErrMessageTooLarge
 	}
-	return b, err
+	return b, nil
 }
 
 // The first message is read with the admission's bound, MaxMessage
