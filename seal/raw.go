@@ -178,6 +178,17 @@ func (w *rawWriter) ReportsFailure() bool {
 	return ok && f.ReportsFailure()
 }
 
+// CarrierConn names the carrier's connection, nil without one (a WebSocket
+// carrier names its connection this way, not by NetConn).
+func (w *rawWriter) CarrierConn() any {
+	for _, x := range []any{w.WriteCloser, w.base.W, w.base.R} {
+		if c, ok := x.(zmux.CarrierConner); ok {
+			return c.CarrierConn()
+		}
+	}
+	return nil
+}
+
 // NetConn is the connection below a TLS or TCP carrier, for the socket's statistics.
 func (w *rawWriter) NetConn() net.Conn {
 	switch c := w.WriteCloser.(type) {

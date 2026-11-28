@@ -10,6 +10,16 @@ type layer struct{ net.Conn }
 
 func (l layer) NetConn() net.Conn { return l.Conn }
 
+// named is a carrier half that names its connection by CarrierConn, as a
+// WebSocket carrier does, under a wrapper whose NetConn is nil.
+type named struct{ c net.Conn }
+
+func (n named) CarrierConn() any { return n.c }
+
+type nilConn struct{ named }
+
+func (nilConn) NetConn() net.Conn { return nil }
+
 // self is a wrapper that names itself.
 type self struct{ net.Conn }
 
@@ -31,6 +41,9 @@ func TestTCPConnOfLayers(t *testing.T) {
 	tcp := c.(*net.TCPConn)
 	if got := TCPConnOf(layer{layer{layer{tcp}}}); got != tcp {
 		t.Fatalf("three layers: %v", got)
+	}
+	if got := TCPConnOf(nilConn{named{layer{tcp}}}); got != tcp {
+		t.Fatalf("a CarrierConn under a nil NetConn: %v", got)
 	}
 	if got := TCPConnOf(&self{tcp}); got != nil {
 		t.Fatalf("a self-naming layer: %v", got)

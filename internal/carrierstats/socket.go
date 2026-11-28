@@ -6,24 +6,38 @@ import (
 )
 
 // TCPConnOf finds the TCP socket under a carrier half: a TCP connection, or
-// any stack of NetConn layers (TLS, wrappers) over one.
+// any stack of layers over one that name the connection beneath them, by
+// NetConn (TLS, a host's wrapper) or CarrierConn (a WebSocket carrier, a
+// secure carrier over one).
 func TCPConnOf(x any) *net.TCPConn {
-	// Each NetConn layer (TLS, a host's wrapper, a transform's half over a
-	// connection) names the connection beneath it; a bound stops a wrapper
-	// that names itself.
+	// A bound stops a layer that names itself.
 	for range maxConnLayers {
 		if c, ok := x.(*net.TCPConn); ok {
 			return c
 		}
-		nc, ok := x.(interface{ NetConn() net.Conn })
-		if !ok {
-			return nil
-		}
-		next := nc.NetConn()
+		next := beneath(x)
 		if next == nil || next == x {
 			return nil
 		}
 		x = next
+	}
+	return nil
+}
+
+// beneath is the connection a layer names beneath it, nil when none.
+func beneath(x any) any {
+	if nc, ok := x.(interface{ NetConn() net.Conn }); ok {
+		if c := nc.NetConn(); c != nil {
+			return c
+		}
+	}
+	if cc, ok := x.(interface{ CarrierSampleConn() any }); ok {
+		if c := cc.CarrierSampleConn(); c != nil {
+			return c
+		}
+	}
+	if cc, ok := x.(interface{ CarrierConn() any }); ok {
+		return cc.CarrierConn()
 	}
 	return nil
 }

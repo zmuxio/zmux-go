@@ -936,7 +936,10 @@ func failureAttribution(outcome, stage AttemptReason, err error) Attribution {
 	case ReasonDialFailed:
 		return AttributionCarrier
 	case ReasonJoinRefused, ReasonConfirmationFailed:
-		if transport || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		// A carrier closed under the join (its connection ended, or a
+		// pipe of an HTTP streaming carrier was closed) is its failure.
+		if transport || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) ||
+			errors.Is(err, io.ErrClosedPipe) {
 			return AttributionCarrier
 		}
 	case ReasonHookFailed, ReasonCancelled, ReasonNoLongerNeeded, ReasonSessionClosed, ReasonConfirmed:
